@@ -1,0 +1,87 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: transparent;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  user-select: none;
+}
+
+#app {
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+}
+
+.overlay-bg {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 15, 0.55);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+}
+
+.cards-container {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 40px;
+}
+
+.card {
+  width: 160px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.08);
+  border: 2px solid transparent;
+  transition: transform 150ms, border-color 150ms;
+  cursor: pointer;
+}
+
+.card:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.card--selected {
+  border-color: rgba(255, 255, 255, 0.7);
+  transform: scale(1.05);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.app-icon {
+  width: 64px;
+  height: 64px;
+  display: block;
+  margin: 20px auto 8px;
+}
+
+.app-name {
+  display: block;
+  text-align: center;
+  color: white;
+  font-size: 12px;
+  padding: 0 8px 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selected-title {
+  position: fixed;
+  bottom: 40px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 14px;
+}

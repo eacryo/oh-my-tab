@@ -1,6 +1,3 @@
-[package]
-name = "oh-my-tab"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
+[workspace]
+members = ["src-tauri"]
+resolver = "2"

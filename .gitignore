@@ -1,4 +1,6 @@
 /target
 .idea/
+.ai/
 .DS_Store
-/.ai/mcp/mcp.json
+node_modules/
+dist/
