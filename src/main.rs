@@ -8,7 +8,7 @@ use objc2::runtime::{AnyObject, Sel};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::transmute;
-use window_collector::{MruMap, WindowInfo, ensure_icon_cache_dir, extract_icon_to_cache};
+use window_collector::{MruMap, WindowInfo, ensure_icon_cache_dir, extract_icon_to_cache, raise_ax_window};
 use event_monitor::{GlobalEvent, start as start_event_monitor};
 
 struct TabState {
@@ -199,6 +199,7 @@ fn main() {
                                 GlobalEvent::OptionReleased => {
                                     if state.visible {
                                         if let Some(w) = state.windows.get(state.selected) {
+                                            raise_ax_window(w.pid, &w.window_title);
                                             activate_pid(w.pid);
                                         }
                                         state.visible = false;

@@ -14,7 +14,7 @@ pub struct WindowInfo {
     pub is_active: bool,
 }
 
-pub type MruMap = HashMap<i32, Instant>;
+pub type MruMap = HashMap<u32, Instant>;
 
 const ICON_CACHE_DIR: &str = "/tmp/oh-my-tab-icons";
 const ICON_CACHE_TTL_SECS: u64 = 3600;
@@ -59,6 +59,7 @@ extern "C" {
         attribute: *const c_void,
         value: *mut *const c_void,
     ) -> AXError;
+    fn AXUIElementPerformAction(element: AXUIElementRef, action: *const c_void) -> AXError;
 }
 
 fn cf_string_new(s: &str) -> *const c_void {
@@ -146,6 +147,44 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
     }
 }
 
+pub fn raise_ax_window(pid: i32, window_title: &str) {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() { return; }
+
+        let windows_key = cf_string_new("AXWindows");
+        let mut windows_array: *const c_void = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
+        CFRelease(windows_key);
+        if err != K_AX_SUCCESS || windows_array.is_null() { CFRelease(app); return; }
+
+        let count = CFArrayGetCount(windows_array);
+        let title_key = cf_string_new("AXTitle");
+        let raise_key = cf_string_new("AXRaise");
+
+        for i in 0..count {
+            let element = CFArrayGetValueAtIndex(windows_array, i);
+            if element.is_null() { continue; }
+            let mut title_value: *const c_void = std::ptr::null();
+            let err = AXUIElementCopyAttributeValue(element, title_key, &mut title_value);
+            if err == K_AX_SUCCESS && !title_value.is_null() {
+                if let Some(t) = cf_to_rust_string(title_value) {
+                    if t == window_title {
+                        AXUIElementPerformAction(element, raise_key);
+                        CFRelease(title_value);
+                        break;
+                    }
+                }
+                CFRelease(title_value);
+            }
+        }
+        CFRelease(title_key);
+        CFRelease(raise_key);
+        CFRelease(windows_array);
+        CFRelease(app);
+    }
+}
+
 fn get_ax_titles_for_pid(pid: i32) -> Vec<String> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
@@ -228,7 +267,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             }
         }
 
-        mru.entry(owner_pid).or_insert(now);
+        mru.entry(window_id).or_insert(now);
         let icon_path = check_icon_cache(owner_pid);
         windows.push(WindowInfo { pid: owner_pid, window_id, app_name: owner_name, window_title, icon_path, is_active: false });
     }
@@ -236,9 +275,9 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     unsafe { CFRelease(array) };
 
     windows.sort_by(|a, b| {
-        let ta = mru.get(&a.pid).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
-        let tb = mru.get(&b.pid).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
-        ta.cmp(&tb)
+        let ta = mru.get(&a.window_id).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
+        let tb = mru.get(&b.window_id).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
+        tb.cmp(&ta)
     });
 
     if let Some(first) = windows.first_mut() { first.is_active = true; }
