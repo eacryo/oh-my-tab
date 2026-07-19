@@ -3,7 +3,10 @@ mod event_monitor;
 
 use flume;
 use gpui::*;
+use objc2::{class, msg_send, sel};
+use objc2::runtime::{AnyObject, Sel};
 use std::collections::HashSet;
+use std::ffi::c_void;
 use window_collector::{MruMap, WindowInfo, ensure_icon_cache_dir, extract_icon_to_cache};
 use event_monitor::{GlobalEvent, start as start_event_monitor};
 
@@ -54,15 +57,17 @@ fn has_accessibility_permission() -> bool {
 }
 
 fn activate_pid(pid: i32) {
-    let script = format!(
-        "tell application \"System Events\" to set frontmost of first process whose unix id is {} to true",
-        pid
-    );
-    std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .spawn()
-        .ok();
+    unsafe {
+        let cls = class!(NSRunningApplication);
+        let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
+        if !app.is_null() {
+            let selector = sel!(activateWithOptions:);
+            extern "C" {
+                fn objc_msgSend(obj: *mut c_void, sel: Sel, opts: isize);
+            }
+            objc_msgSend(app as *mut c_void, selector, 1);
+        }
+    }
 }
 
 impl Render for OverlayView {
@@ -92,7 +97,7 @@ impl Render for OverlayView {
             let init = w.app_name.chars().next().unwrap_or('?').to_string();
             let icon_div: Div = if let Some(ref icon_path) = w.icon_path {
                 div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
-                    .child(img(std::path::PathBuf::from(icon_path.clone())).w(px(48.)).h(px(48.)))
+                    .child(img(std::path::PathBuf::from(icon_path.clone())))
             } else {
                 div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
                     .child(div().w(px(40.)).h(px(40.)).rounded_md().bg(rgb(0x3a3a5a)).flex().items_center().justify_center()
