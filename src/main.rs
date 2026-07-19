@@ -52,10 +52,14 @@ fn has_accessibility_permission() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
-fn activate_app(name: &str) {
-    std::process::Command::new("open")
-        .arg("-a")
-        .arg(name)
+fn activate_pid(pid: i32) {
+    let script = format!(
+        "tell application \"System Events\" to set frontmost of first process whose unix id is {} to true",
+        pid
+    );
+    std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
         .spawn()
         .ok();
 }
@@ -151,7 +155,7 @@ fn main() {
                                 GlobalEvent::OptionReleased => {
                                     if state.visible {
                                         if let Some(w) = state.windows.get(state.selected) {
-                                            activate_app(&w.app_name);
+                                            activate_pid(w.pid);
                                         }
                                         state.visible = false;
                                     }
@@ -186,7 +190,7 @@ fn main() {
                     }
                     "enter" => {
                         if let Some(w) = state.windows.get(state.selected) {
-                            activate_app(&w.app_name);
+                            activate_pid(w.pid);
                         }
                         state.visible = false;
                     }
