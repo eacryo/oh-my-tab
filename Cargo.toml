@@ -1,3 +1,8 @@
-[workspace]
-members = ["src-tauri"]
-resolver = "2"
+[package]
+name = "oh-my-tab"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui = "0.2.2"
+objc2 = "0.6"
