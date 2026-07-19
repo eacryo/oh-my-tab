@@ -1,9 +1,10 @@
 mod window_collector;
+mod event_monitor;
 
+use flume;
 use gpui::*;
-use std::cell::RefCell;
-use std::rc::Rc;
 use window_collector::{MruMap, WindowInfo};
+use event_monitor::{GlobalEvent, start as start_event_monitor};
 
 struct TabState {
     windows: Vec<WindowInfo>,
@@ -38,7 +39,8 @@ impl TabState {
 }
 
 struct OverlayView {
-    state: Rc<RefCell<TabState>>,
+    state: Entity<TabState>,
+    _observer: Subscription,
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -59,11 +61,10 @@ fn activate_app(name: &str) {
 }
 
 impl Render for OverlayView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let state = self.state.borrow();
-        let state_ref = &*state;
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state.read(cx);
 
-        if !state_ref.visible {
+        if !state.visible {
             let hint: &str = if has_accessibility_permission() { "Hold Option + Tab to switch" } else { "Need Accessibility permission" };
             return div()
                 .size_full().flex().flex_col().items_center().justify_center().gap(px(4.))
@@ -73,8 +74,8 @@ impl Render for OverlayView {
                 .into_any();
         }
 
-        let selected = state_ref.selected;
-        let windows = state_ref.windows.clone();
+        let selected = state.selected;
+        let windows = state.windows.clone();
         let status = match windows.get(selected) {
             Some(w) if !w.window_title.is_empty() => format!("{} — {}", w.app_name, w.window_title),
             Some(w) => w.app_name.clone(),
@@ -106,46 +107,97 @@ impl Render for OverlayView {
 }
 
 fn main() {
-    let state = Rc::new(RefCell::new(TabState::new()));
+    let (event_tx, event_rx) = flume::unbounded();
+    let _monitor = start_event_monitor(event_tx);
 
     Application::new().run(move |cx: &mut App| {
+        let state_entity = cx.new(|_cx| TabState::new());
+
         let bounds = Bounds::centered(None, size(px(900.), px(250.)), cx);
-        cx.open_window(
+        let _window_handle = cx.open_window(
             WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), focus: true, ..Default::default() },
-            |_window, cx| cx.new(|_cx| OverlayView { state: state.clone() }),
+            |_window, cx| {
+                let se = state_entity.clone();
+                cx.new(|cx| {
+                    let state = se.clone();
+                    let observer = cx.observe(&state, |_: &mut OverlayView, _: Entity<TabState>, cx: &mut Context<OverlayView>| {
+                        cx.notify();
+                    });
+                    OverlayView { state, _observer: observer }
+                })
+            },
         ).unwrap();
 
-        let s = state.clone();
-        let _sub = Box::leak(Box::new(cx.observe_keystrokes(move |event: &KeystrokeEvent, _window: &mut Window, _app: &mut App| {
-            let mut state = s.borrow_mut();
-            let keystroke = &event.keystroke;
-            let key = keystroke.key.as_str();
-            let alt = keystroke.modifiers.alt;
-
-            eprintln!("[KEYSTROKE] key={}, alt={}", key, alt);
-
-            if alt && key == "tab" {
-                if !state.visible {
-                    state.refresh();
-                    state.visible = true;
-                    state.selected = if state.windows.len() > 1 { 1 } else { 0 };
-                } else {
-                    state.selected = (state.selected + 1) % state.windows.len().max(1);
+        {
+            let se = state_entity.clone();
+            let async_app = cx.to_async();
+            let _task = Box::leak(Box::new(cx.spawn(move |_: &mut AsyncApp| async move {
+                while let Ok(event) = event_rx.recv_async().await {
+                    let se = se.clone();
+                    let _ = async_app.update(move |app_cx| {
+                        let mut should_activate = false;
+                        se.update(app_cx, |state, cx| {
+                            match event {
+                                GlobalEvent::OptionTabPressed => {
+                                    if !state.visible {
+                                        state.refresh();
+                                        state.visible = true;
+                                        state.selected = if state.windows.len() > 1 { 1 } else { 0 };
+                                        should_activate = true;
+                                    } else {
+                                        state.selected = (state.selected + 1) % state.windows.len().max(1);
+                                    }
+                                }
+                                GlobalEvent::OptionReleased => {
+                                    if state.visible {
+                                        if let Some(w) = state.windows.get(state.selected) {
+                                            activate_app(&w.app_name);
+                                        }
+                                        state.visible = false;
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        });
+                        if should_activate {
+                            let _ = app_cx.activate(true);
+                        }
+                    });
                 }
-                _window.refresh();
-            } else if !alt && state.visible {
+        })));
+        }
+
+        let se = state_entity.clone();
+        let _sub = Box::leak(Box::new(cx.observe_keystrokes(move |event: &KeystrokeEvent, _window: &mut Window, _app: &mut App| {
+            let key = event.keystroke.key.as_str();
+
+            se.update(_app, |state, cx| {
+                if !state.visible { return; }
                 match key {
-                    "tab" | "right" => { if !state.windows.is_empty() { state.selected = (state.selected + 1) % state.windows.len(); _window.refresh(); } }
-                    "left" => { if !state.windows.is_empty() { state.selected = if state.selected == 0 { state.windows.len() - 1 } else { state.selected - 1 }; _window.refresh(); } }
-                    "enter" => {
-                        if let Some(w) = state.windows.get(state.selected) { activate_app(&w.app_name); }
-                        state.visible = false;
-                        _window.refresh();
+                    "tab" | "right" => {
+                        if !state.windows.is_empty() {
+                            state.selected = (state.selected + 1) % state.windows.len();
+                        }
                     }
-                    "escape" => { state.visible = false; _window.refresh(); }
+                    "left" => {
+                        if !state.windows.is_empty() {
+                            state.selected = if state.selected == 0 { state.windows.len() - 1 } else { state.selected - 1 };
+                        }
+                    }
+                    "enter" => {
+                        if let Some(w) = state.windows.get(state.selected) {
+                            activate_app(&w.app_name);
+                        }
+                        state.visible = false;
+                    }
+                    "escape" => {
+                        state.visible = false;
+                    }
                     _ => {}
                 }
-            }
+                cx.notify();
+            });
+            _window.refresh();
         })));
 
         cx.activate(true);

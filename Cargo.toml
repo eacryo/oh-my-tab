@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 gpui = "0.2.2"
 objc2 = "0.6"
+flume = "0.11"
