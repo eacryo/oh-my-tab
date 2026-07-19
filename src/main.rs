@@ -24,7 +24,8 @@ impl TabState {
             println!("[oh-my-tab] WARNING: No accessibility permission.");
             println!("[oh-my-tab] Go to System Settings → Privacy & Security → Accessibility");
         }
-        TabState { windows, selected: 0, visible: false, mru }
+        let win_count = windows.len();
+        TabState { windows, selected: if win_count > 1 { 1 } else { 0 }, visible: true, mru }
     }
 
     fn refresh(&mut self) {
