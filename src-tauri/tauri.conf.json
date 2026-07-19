@@ -10,20 +10,18 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "withGlobalTauri": false,
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "overlay",
         "title": "",
-        "width": 800,
-        "height": 600,
+        "fullscreen": true,
         "decorations": false,
-        "transparent": true,
+        "transparent": false,
         "alwaysOnTop": true,
         "visibleOnAllWorkspaces": true,
         "skipTaskbar": true,
-        "focus": true,
-        "center": true
+        "focus": true
       }
     ],
     "security": {

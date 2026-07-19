@@ -2,11 +2,6 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::time::Instant;
 
-use base64::Engine;
-use objc2::msg_send;
-use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use parking_lot::Mutex;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,47 +96,7 @@ fn cf_dict_get_u32(dict: *const c_void, key: &str) -> Option<u32> {
     if ok { Some(num as u32) } else { None }
 }
 
-pub fn get_app_icon_base64(pid: i32) -> String {
-    let cls = objc2::class!(NSRunningApplication);
-    let app: Option<Retained<AnyObject>> = unsafe {
-        msg_send![cls, runningApplicationWithProcessIdentifier: pid]
-    };
-    let Some(app) = app else {
-        return String::new();
-    };
-
-    let icon: Option<Retained<AnyObject>> = unsafe { msg_send![&app, icon] };
-    let Some(icon) = icon else {
-        return String::new();
-    };
-
-    let tiff_data: Option<Retained<AnyObject>> = unsafe { msg_send![&icon, TIFFRepresentation] };
-    let Some(tiff_data) = tiff_data else {
-        return String::new();
-    };
-
-    let bmp_cls = objc2::class!(NSBitmapImageRep);
-    let rep: Option<Retained<AnyObject>> =
-        unsafe { msg_send![bmp_cls, imageRepWithData: &*tiff_data] };
-    let Some(rep) = rep else {
-        return String::new();
-    };
-
-    let png_data: Option<Retained<AnyObject>> = unsafe {
-        msg_send![&rep, representationUsingType: 4u64, properties: std::ptr::null::<c_void>()]
-    };
-    let Some(png_data) = png_data else {
-        return String::new();
-    };
-
-    let len: usize = unsafe { msg_send![&png_data, length] };
-    let bytes: *const u8 = unsafe { msg_send![&png_data, bytes] };
-    let buf = unsafe { std::slice::from_raw_parts(bytes, len) };
-
-    base64::engine::general_purpose::STANDARD.encode(buf)
-}
-
-pub fn collect_windows(mru: &MruMap) -> Vec<WindowInfo> {
+pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     let array = unsafe { CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ON_SCREEN_ONLY, 0) };
     if array.is_null() {
         return vec![];
@@ -150,6 +105,7 @@ pub fn collect_windows(mru: &MruMap) -> Vec<WindowInfo> {
     let self_pid = std::process::id() as i32;
     let mut windows: Vec<WindowInfo> = Vec::new();
     let count = unsafe { CFArrayGetCount(array) };
+    let now = Instant::now();
 
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
@@ -174,6 +130,8 @@ pub fn collect_windows(mru: &MruMap) -> Vec<WindowInfo> {
 
         let window_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
         let window_id = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+
+        mru.entry(owner_pid).or_insert(now);
 
         windows.push(WindowInfo {
             pid: owner_pid,
@@ -203,31 +161,5 @@ pub fn collect_windows(mru: &MruMap) -> Vec<WindowInfo> {
         first.is_active = true;
     }
 
-    for w in &mut windows {
-        w.icon_base64 = get_app_icon_base64(w.pid);
-    }
-
     windows
-}
-
-pub fn start_mru_poller(mru: std::sync::Arc<Mutex<MruMap>>) {
-    std::thread::spawn(move || {
-        let cls = objc2::class!(NSWorkspace);
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let workspace: Option<Retained<AnyObject>> = unsafe { msg_send![cls, sharedWorkspace] };
-            let Some(workspace) = workspace else {
-                continue;
-            };
-            let front_app: Option<Retained<AnyObject>> =
-                unsafe { msg_send![&workspace, frontmostApplication] };
-            let Some(front_app) = front_app else {
-                continue;
-            };
-            let pid: i32 = unsafe { msg_send![&front_app, processIdentifier] };
-            if pid > 0 {
-                mru.lock().insert(pid, Instant::now());
-            }
-        }
-    });
 }

@@ -1,55 +1,105 @@
 #![allow(dead_code)]
 
 mod permissions;
-mod event_monitor;
 mod window_collector;
 mod switcher;
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tauri::{Emitter, Manager};
-
 use window_collector::{MruMap, WindowInfo};
+
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        eprint!("[LOG] ");
+        eprintln!($($arg)*);
+        std::io::stderr().flush().ok();
+    }};
+}
+
+const CMD_KEY: u32 = 91; // Meta key (Command on macOS)
 
 pub struct AppState {
     pub mru: Arc<Mutex<MruMap>>,
+    pub cached_windows: Arc<Mutex<Vec<WindowInfo>>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         AppState {
             mru: Arc::new(Mutex::new(HashMap::new())),
+            cached_windows: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
 
 #[tauri::command]
 fn get_windows(state: tauri::State<AppState>) -> Vec<WindowInfo> {
-    let mru = state.mru.lock();
-    window_collector::collect_windows(&mru)
+    state.cached_windows.lock().clone()
+}
+
+#[tauri::command]
+fn activate_window(pid: i32) -> Result<bool, String> {
+    let cls = objc2::class!(NSRunningApplication);
+    let app: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> =
+        unsafe { objc2::msg_send![cls, runningApplicationWithProcessIdentifier: pid] };
+    let Some(app) = app else {
+        return Ok(false);
+    };
+    let opts: u64 = 1;
+    unsafe {
+        let _: () = objc2::msg_send![&app, activateWithOptions: opts];
+    }
+    Ok(true)
+}
+
+#[tauri::command]
+fn dismiss_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    app.emit("hide-overlay", ()).map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("!!! PANIC: {}", info);
+        if let Some(loc) = info.location() {
+            eprintln!("!!! at {}:{}:{}", loc.file(), loc.line(), loc.column());
+        }
+        std::io::stderr().flush().ok();
+    }));
+
+    log!("run() start");
+
     tauri::Builder::default()
         .setup(|app| {
+            log!("setup start");
             permissions::check_accessibility_permission();
-            println!("[setup] Permissions OK, starting MRU poller...");
 
             let mru = Arc::new(Mutex::new(MruMap::new()));
-            window_collector::start_mru_poller(mru.clone());
+            let cached = Arc::new(Mutex::new(Vec::<WindowInfo>::new()));
 
-            app.manage(AppState { mru });
+            let wins = window_collector::collect_windows(&mut *mru.lock());
+            *cached.lock() = wins;
+            log!("initial scan: {} windows", cached.lock().len());
 
-            let app_handle = app.handle().clone();
-            app_handle.emit("app-ready", ()).ok();
-            println!("[setup] Oh My Tab ready");
+            app.manage(AppState {
+                mru: mru.clone(),
+                cached_windows: cached.clone(),
+            });
+
+            log!("(CGEventTap skipped - using frontend keyboard handling)");
+            log!("setup complete, Oh My Tab ready");
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_windows])
+        .invoke_handler(tauri::generate_handler![
+            get_windows,
+            activate_window,
+            dismiss_overlay
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

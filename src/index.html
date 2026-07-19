@@ -1,17 +1,95 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Oh My Tab</title>
-  <link rel="stylesheet" href="styles.css" />
+<head><meta charset="UTF-8" /><title>Oh My Tab</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0c0c1a;color:#fff;font-family:-apple-system,sans-serif;overflow:hidden}
+h1{font-size:32px;margin:40px 60px 20px}
+#status{color:rgba(255,255,255,0.5);font-size:13px;margin:0 60px 20px}
+#list{list-style:none;display:flex;gap:14px;flex-wrap:wrap;padding:0 60px;justify-content:center}
+.card{width:200px;background:rgba(255,255,255,0.06);border-radius:10px;overflow:hidden;border:2px solid transparent;flex-shrink:0}
+.card:hover{background:rgba(255,255,255,0.10)}
+.card--selected{border-color:rgba(255,255,255,0.5);background:rgba(255,255,255,0.12);transform:scale(1.05)}
+.icon-wrap{aspect-ratio:16/10;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,0.03)}
+.icon-placeholder{width:48px;height:48px;border-radius:8px;background:rgba(255,255,255,0.1);display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:600;color:rgba(255,255,255,0.5)}
+.info{padding:10px 12px 14px}
+.app-name{font-size:13px;font-weight:500;margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.win-title{font-size:11px;color:rgba(255,255,255,0.5);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bottom{position:fixed;bottom:0;left:0;right:0;height:52px;background:rgba(0,0,0,0.4);display:flex;align-items:center;justify-content:center;font-size:14px;color:rgba(255,255,255,0.8)}
+</style>
 </head>
 <body>
-  <div id="app" style="display:none">
-    <div class="overlay-bg"></div>
-    <div class="cards-container" id="cards"></div>
-    <div class="selected-title" id="title"></div>
-  </div>
-  <script type="module" src="main.ts"></script>
+<h1>Oh My Tab</h1>
+<div id="status">Initializing...</div>
+<div id="list"></div>
+<div class="bottom" id="title"></div>
+<script>
+var statusEl = document.getElementById("status");
+var listEl = document.getElementById("list");
+var titleEl = document.getElementById("title");
+var windows = [];
+var selected = 0;
+
+function status(msg) {
+  statusEl.textContent = msg;
+  console.log(msg);
+}
+
+function render(wins) {
+  windows = wins;
+  listEl.innerHTML = "";
+  wins.forEach(function(w, i) {
+    var card = document.createElement("div");
+    card.className = "card";
+    card.dataset.index = i;
+    var c = w.app_name.charAt(0).toUpperCase();
+    card.innerHTML =
+      '<div class="icon-wrap"><div class="icon-placeholder">' + c + '</div></div>' +
+      '<div class="info"><div class="app-name">' + w.app_name + '</div>' +
+      '<div class="win-title">' + (w.window_title || "") + '</div></div>';
+    card.addEventListener("click", function() {
+      window.__TAURI_INTERNALS__.invoke("activate_window", { pid: w.pid });
+    });
+    listEl.appendChild(card);
+  });
+  if (wins.length > 1) selected = 1; else selected = 0;
+  select(selected);
+}
+
+function select(idx) {
+  if (windows.length === 0) return;
+  selected = ((idx % windows.length) + windows.length) % windows.length;
+  document.querySelectorAll(".card").forEach(function(c) { c.classList.remove("card--selected"); });
+  var card = document.querySelector('.card[data-index="' + selected + '"]');
+  if (card) {
+    card.classList.add("card--selected");
+    card.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    var w = windows[selected];
+    titleEl.textContent = (w.window_title ? w.app_name + " — " + w.window_title : w.app_name);
+  }
+}
+
+if (window.__TAURI_INTERNALS__) {
+  status("Tauri API found, loading windows...");
+  window.__TAURI_INTERNALS__.invoke("get_windows").then(function(wins) {
+    status("Loaded " + wins.length + " windows");
+    render(wins);
+  }).catch(function(e) {
+    status("Error loading windows: " + JSON.stringify(e));
+  });
+} else {
+  status("No Tauri API. __TAURI_INTERNALS__=" + typeof window.__TAURI_INTERNALS__ + " __TAURI__=" + typeof window.__TAURI__);
+}
+
+document.addEventListener("keydown", function(e) {
+  if (windows.length === 0) return;
+  switch(e.key) {
+    case "ArrowRight": case "Tab": e.preventDefault(); select(selected + 1); break;
+    case "ArrowLeft": e.preventDefault(); select(selected - 1); break;
+    case "Enter": e.preventDefault(); if (windows[selected]) window.__TAURI_INTERNALS__.invoke("activate_window", { pid: windows[selected].pid }); break;
+    case "Escape": e.preventDefault(); break;
+  }
+});
+</script>
 </body>
 </html>
