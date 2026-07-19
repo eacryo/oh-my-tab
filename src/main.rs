@@ -3,7 +3,8 @@ mod event_monitor;
 
 use flume;
 use gpui::*;
-use window_collector::{MruMap, WindowInfo};
+use std::collections::HashSet;
+use window_collector::{MruMap, WindowInfo, ensure_icon_cache_dir, extract_icon_to_cache};
 use event_monitor::{GlobalEvent, start as start_event_monitor};
 
 struct TabState {
@@ -89,13 +90,19 @@ impl Render for OverlayView {
         let cards: Vec<AnyElement> = windows.iter().enumerate().map(|(i, w)| {
             let is_sel = i == selected;
             let init = w.app_name.chars().next().unwrap_or('?').to_string();
+            let icon_div: Div = if let Some(ref icon_path) = w.icon_path {
+                div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
+                    .child(img(std::path::PathBuf::from(icon_path.clone())).w(px(48.)).h(px(48.)))
+            } else {
+                div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
+                    .child(div().w(px(40.)).h(px(40.)).rounded_md().bg(rgb(0x3a3a5a)).flex().items_center().justify_center()
+                        .text_lg().font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xaaaacc)).child(init.clone()))
+            };
             div().w(px(160.)).rounded_md().border_2()
                 .border_color(if is_sel { rgb(0x5a5a8a) } else { rgba(0x00000000) })
                 .bg(if is_sel { rgb(0x3a3a5a) } else { rgb(0x2a2a3a) })
                 .flex().flex_col().overflow_hidden()
-                .child(div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
-                    .child(div().w(px(40.)).h(px(40.)).rounded_md().bg(rgb(0x3a3a5a)).flex().items_center().justify_center()
-                        .text_lg().font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xaaaacc)).child(init)))
+                .child(icon_div)
                 .child(div().px(px(10.)).py(px(8.))
                     .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(rgb(0xdddddd)).overflow_hidden().whitespace_nowrap().child(w.app_name.clone()))
                     .child(div().text_xs().text_color(rgb(0x888888)).mt(px(2.)).overflow_hidden().whitespace_nowrap().child(w.window_title.clone())))
@@ -121,6 +128,7 @@ fn main() {
     let _monitor = start_event_monitor(event_tx);
 
     Application::new().run(move |cx: &mut App| {
+        ensure_icon_cache_dir();
         let state_entity = cx.new(|_cx| TabState::new());
 
         let bounds = Bounds::centered(None, size(px(900.), px(250.)), cx);
@@ -144,10 +152,30 @@ fn main() {
             let se = state_entity.clone();
             let async_app = cx.to_async();
             let wh = window_handle;
+            let (icon_tx, icon_rx) = flume::unbounded::<(i32, String)>();
+
+            let icon_se = state_entity.clone();
+            let icon_app = cx.to_async();
+            let _icon_task = Box::leak(Box::new(cx.spawn(move |_: &mut AsyncApp| async move {
+                while let Ok((pid, path)) = icon_rx.recv_async().await {
+                    let _ = icon_app.update(|app_cx| {
+                        icon_se.update(app_cx, |state, cx| {
+                            for w in &mut state.windows {
+                                if w.pid == pid && w.icon_path.is_none() {
+                                    w.icon_path = Some(path.clone());
+                                }
+                            }
+                            cx.notify();
+                        });
+                    });
+                }
+            })));
+
             let _task = Box::leak(Box::new(cx.spawn(move |_: &mut AsyncApp| async move {
                 while let Ok(event) = event_rx.recv_async().await {
                     let se = se.clone();
                     let wh = wh;
+                    let icon_tx = icon_tx.clone();
                     let _ = async_app.update(move |app_cx| {
                         let mut should_activate = false;
                         se.update(app_cx, |state, cx| {
@@ -176,6 +204,20 @@ fn main() {
                         if should_activate {
                             let count = se.read(app_cx).windows.len();
                             let _ = wh.update(app_cx, |_, window: &mut Window, _| window.resize(size(px(900.), window_height(count))));
+                            let uncached: Vec<i32> = se.read(app_cx).windows.iter()
+                                .filter(|w| w.icon_path.is_none())
+                                .map(|w| w.pid)
+                                .collect::<HashSet<_>>()
+                                .into_iter()
+                                .collect();
+                            for pid in uncached {
+                                let tx = icon_tx.clone();
+                                std::thread::spawn(move || {
+                                    if let Some(path) = extract_icon_to_cache(pid) {
+                                        let _ = tx.send((pid, path));
+                                    }
+                                });
+                            }
                             let _ = app_cx.activate(true);
                         }
                     });

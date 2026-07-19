@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::time::Instant;
+use objc2::msg_send;
+use objc2::runtime::AnyObject;
 
 #[derive(Debug, Clone)]
 pub struct WindowInfo {
@@ -8,10 +10,14 @@ pub struct WindowInfo {
     pub window_id: u32,
     pub app_name: String,
     pub window_title: String,
+    pub icon_path: Option<String>,
     pub is_active: bool,
 }
 
 pub type MruMap = HashMap<i32, Instant>;
+
+const ICON_CACHE_DIR: &str = "/tmp/oh-my-tab-icons";
+const ICON_CACHE_TTL_SECS: u64 = 3600;
 
 const K_C_G_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
 
@@ -86,6 +92,53 @@ fn cf_dict_get_u32(dict: *const c_void, key: &str) -> Option<u32> {
     let mut num: i32 = 0;
     let ok = unsafe { CFNumberGetValue(value, 3, &mut num as *mut i32 as *mut c_void) };
     if ok { Some(num as u32) } else { None }
+}
+
+pub fn ensure_icon_cache_dir() {
+    let _ = std::fs::create_dir_all(ICON_CACHE_DIR);
+}
+
+pub fn check_icon_cache(pid: i32) -> Option<String> {
+    let path = format!("{}/{}.png", ICON_CACHE_DIR, pid);
+    let meta = std::fs::metadata(&path).ok()?;
+    let age = meta.modified().ok()?.elapsed().ok()?;
+    if age.as_secs() < ICON_CACHE_TTL_SECS {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
+    if let Some(path) = check_icon_cache(pid) {
+        return Some(path);
+    }
+    unsafe {
+        let cls = objc2::class!(NSRunningApplication);
+        let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
+        if app.is_null() { return None; }
+
+        let icon: *mut AnyObject = msg_send![app, icon];
+        if icon.is_null() { return None; }
+
+        let tiff: *mut AnyObject = msg_send![icon, TIFFRepresentation];
+        if tiff.is_null() { return None; }
+
+        let rep_cls = objc2::class!(NSBitmapImageRep);
+        let rep: *mut AnyObject = msg_send![rep_cls, imageRepWithData: tiff];
+        if rep.is_null() { return None; }
+
+        let png: *mut AnyObject = msg_send![rep, representationUsingType: 4u64, properties: std::ptr::null::<AnyObject>()];
+        if png.is_null() { return None; }
+
+        let path = format!("{}/{}.png", ICON_CACHE_DIR, pid);
+        let path_cstr = std::ffi::CString::new(&*path).unwrap();
+        let cf_path = CFStringCreateWithCString(std::ptr::null(), path_cstr.as_ptr(), 0x08000100);
+        let ok: bool = msg_send![png, writeToFile: cf_path as *mut AnyObject, atomically: false];
+        CFRelease(cf_path as *const c_void);
+
+        if ok { Some(path) } else { None }
+    }
 }
 
 fn get_ax_titles_for_pid(pid: i32) -> Vec<String> {
@@ -171,7 +224,8 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         }
 
         mru.entry(owner_pid).or_insert(now);
-        windows.push(WindowInfo { pid: owner_pid, window_id, app_name: owner_name, window_title, is_active: false });
+        let icon_path = check_icon_cache(owner_pid);
+        windows.push(WindowInfo { pid: owner_pid, window_id, app_name: owner_name, window_title, icon_path, is_active: false });
     }
 
     unsafe { CFRelease(array) };
