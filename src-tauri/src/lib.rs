@@ -64,9 +64,19 @@ fn dismiss_overlay(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn resize_overlay(app: tauri::AppHandle, width: f64, height: f64) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("overlay") {
-        use tauri::LogicalSize;
+        use tauri::{LogicalPosition, LogicalSize};
         w.set_size(LogicalSize::new(width, height)).map_err(|e| e.to_string())?;
-        w.center().map_err(|e| e.to_string())?;
+        if let Ok(Some(monitor)) = app.primary_monitor() {
+            let s = monitor.size();
+            let scale = monitor.scale_factor();
+            let sw = s.width as f64 / scale;
+            let sh = s.height as f64 / scale;
+            let x = (sw - width) / 2.0;
+            let y = (sh - height) / 2.0;
+            if x >= 0.0 && y >= 0.0 {
+                w.set_position(LogicalPosition::new(x, y)).map_err(|e| e.to_string())?;
+            }
+        }
     }
     Ok(())
 }
@@ -99,6 +109,23 @@ pub fn run() {
                 mru: mru.clone(),
                 cached_windows: cached.clone(),
             });
+
+            if let Some(w) = app.get_webview_window("overlay") {
+                use objc2::msg_send;
+                use objc2::rc::Retained;
+                use objc2::runtime::AnyObject;
+                let ns_win = w.ns_window().expect("ns_window failed");
+                let ns_win = unsafe { &*(ns_win as *const AnyObject) };
+                unsafe {
+                    let _: () = msg_send![ns_win, setHasShadow: true];
+                    let content_view: Retained<AnyObject> = msg_send![ns_win, contentView];
+                    let _: () = msg_send![&content_view, setWantsLayer: true];
+                    let layer: Retained<AnyObject> = msg_send![&content_view, layer];
+                    let _: () = msg_send![&layer, setCornerRadius: 14.0f64];
+                    let _: () = msg_send![&layer, setMasksToBounds: true];
+                }
+                log!("rounded corners applied to overlay window");
+            }
 
             log!("(CGEventTap skipped - using frontend keyboard handling)");
             log!("setup complete, Oh My Tab ready");
