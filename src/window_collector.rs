@@ -60,6 +60,11 @@ extern "C" {
         value: *mut *const c_void,
     ) -> AXError;
     fn AXUIElementPerformAction(element: AXUIElementRef, action: *const c_void) -> AXError;
+    fn AXUIElementSetAttributeValue(
+        element: AXUIElementRef,
+        attribute: *const c_void,
+        value: *const c_void,
+    ) -> AXError;
 }
 
 fn cf_string_new(s: &str) -> *const c_void {
@@ -170,6 +175,9 @@ pub fn raise_ax_window(pid: i32, window_title: &str) {
             if err == K_AX_SUCCESS && !title_value.is_null() {
                 if let Some(t) = cf_to_rust_string(title_value) {
                     if t == window_title {
+                        let focused_key = cf_string_new("AXFocusedWindow");
+                        AXUIElementSetAttributeValue(app, focused_key, element);
+                        CFRelease(focused_key);
                         AXUIElementPerformAction(element, raise_key);
                         CFRelease(title_value);
                         break;

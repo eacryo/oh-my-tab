@@ -31,7 +31,7 @@ impl TabState {
             println!("[oh-my-tab] Go to System Settings → Privacy & Security → Accessibility");
         }
         let win_count = windows.len();
-        TabState { windows, selected: if win_count > 1 { 1 } else { 0 }, visible: true, mru }
+        TabState { windows, selected: if win_count > 1 { 1 } else { 0 }, visible: false, mru }
     }
 
     fn refresh(&mut self) {
@@ -55,6 +55,38 @@ extern "C" {
 
 fn has_accessibility_permission() -> bool {
     unsafe { AXIsProcessTrusted() }
+}
+
+fn hide_window() {
+    unsafe {
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let windows: *mut AnyObject = msg_send![nsapp, windows];
+        if windows.is_null() { return; }
+        let count: usize = msg_send![windows, count];
+        if count == 0 { return; }
+        let window: *mut AnyObject = msg_send![windows, objectAtIndex: 0u64];
+        let selector = sel!(orderOut:);
+        extern "C" { fn objc_msgSend(); }
+        type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
+        let f: F = transmute(objc_msgSend as *const ());
+        f(window as *mut c_void, selector, nsapp as *mut c_void);
+    }
+}
+
+fn show_window() {
+    unsafe {
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let windows: *mut AnyObject = msg_send![nsapp, windows];
+        if windows.is_null() { return; }
+        let count: usize = msg_send![windows, count];
+        if count == 0 { return; }
+        let window: *mut AnyObject = msg_send![windows, objectAtIndex: 0u64];
+        let selector = sel!(orderFront:);
+        extern "C" { fn objc_msgSend(); }
+        type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
+        let f: F = transmute(objc_msgSend as *const ());
+        f(window as *mut c_void, selector, nsapp as *mut c_void);
+    }
 }
 
 fn activate_pid(pid: i32) {
@@ -152,6 +184,7 @@ fn main() {
                 })
             },
         ).unwrap();
+        hide_window();
 
         {
             let se = state_entity.clone();
@@ -199,7 +232,7 @@ fn main() {
                                     if state.visible {
                                         if let Some(w) = state.windows.get(state.selected) {
                                             raise_ax_window(w.pid, &w.window_title);
-                                            activate_pid(w.pid);
+                                            hide_window();
                                         }
                                         state.visible = false;
                                     }
@@ -208,6 +241,7 @@ fn main() {
                             cx.notify();
                         });
                         if should_activate {
+                            show_window();
                             let count = se.read(app_cx).windows.len();
                             let _ = wh.update(app_cx, |_, window: &mut Window, _| window.resize(size(px(900.), window_height(count))));
                             let uncached: Vec<i32> = se.read(app_cx).windows.iter()
@@ -253,9 +287,11 @@ fn main() {
                             activate_pid(w.pid);
                         }
                         state.visible = false;
+                        hide_window();
                     }
                     "escape" => {
                         state.visible = false;
+                        hide_window();
                     }
                     _ => {}
                 }
@@ -264,6 +300,5 @@ fn main() {
             _window.refresh();
         })));
 
-        cx.activate(true);
     });
 }
