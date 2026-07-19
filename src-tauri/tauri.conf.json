@@ -15,13 +15,16 @@
       {
         "label": "overlay",
         "title": "",
-        "fullscreen": true,
+        "width": 1400,
+        "height": 400,
         "decorations": false,
         "transparent": false,
         "alwaysOnTop": true,
         "visibleOnAllWorkspaces": true,
         "skipTaskbar": true,
-        "focus": true
+        "focus": true,
+        "center": true,
+        "resizable": false
       }
     ],
     "security": {
