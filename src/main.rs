@@ -137,7 +137,8 @@ fn main() {
         ensure_icon_cache_dir();
         let state_entity = cx.new(|_cx| TabState::new());
 
-        let bounds = Bounds::centered(None, size(px(900.), px(250.)), cx);
+        let init_count = state_entity.read(cx).windows.len();
+        let bounds = Bounds::centered(None, size(px(900.), window_height(init_count)), cx);
         let window_handle = cx.open_window(
             WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), focus: true, ..Default::default() },
             |_window, cx| {
@@ -151,8 +152,6 @@ fn main() {
                 })
             },
         ).unwrap();
-        let init_count = state_entity.read(cx).windows.len();
-        let _ = window_handle.update(cx, |_, window: &mut Window, _| window.resize(size(px(900.), window_height(init_count))));
 
         {
             let se = state_entity.clone();
