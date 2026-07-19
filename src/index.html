@@ -4,11 +4,13 @@
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{
-  background:#1c1c1e;
-  color:#fff;
+  background:rgba(255,255,255,0.35);
+  color:#1a1a1a;
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;
   overflow:hidden;
-  border-radius:14px
+  border-radius:14px;
+  backdrop-filter:blur(40px) saturate(200%);
+  -webkit-backdrop-filter:blur(40px) saturate(200%)
 }
 .overlay-panel{
   min-height:100vh;
@@ -19,37 +21,37 @@ card-list{
 }
 .card{
   width:160px;
-  background:rgba(255,255,255,0.06);
+  background:rgba(0,0,0,0.05);
   border-radius:10px;overflow:hidden;
-  border:2px solid transparent;flex-shrink:0;
+  border:1.5px solid rgba(0,0,0,0.06);flex-shrink:0;
   cursor:default;
   transition:transform .12s,border-color .12s,background .12s
 }
-.card:hover{background:rgba(255,255,255,0.10)}
+.card:hover{background:rgba(0,0,0,0.08)}
 .card--selected{
-  border-color:rgba(255,255,255,0.5);
+  border-color:rgba(0,0,0,0.25);
   transform:scale(1.06);
-  background:rgba(255,255,255,0.12);
-  box-shadow:0 0 20px rgba(255,255,255,0.05)
+  background:rgba(0,0,0,0.10);
+  box-shadow:0 0 24px rgba(0,0,0,0.06)
 }
 .icon-wrap{
   height:80px;display:flex;align-items:center;justify-content:center;
-  background:rgba(255,255,255,0.03)
+  background:rgba(0,0,0,0.03)
 }
 .icon-placeholder{
   width:40px;height:40px;border-radius:9px;
-  background:linear-gradient(135deg,rgba(255,255,255,0.15),rgba(255,255,255,0.06));
+  background:linear-gradient(135deg,rgba(0,0,0,0.10),rgba(0,0,0,0.04));
   display:flex;align-items:center;justify-content:center;
-  font-size:18px;font-weight:600;color:rgba(255,255,255,0.7)
+  font-size:18px;font-weight:600;color:rgba(0,0,0,0.5)
 }
 .info{padding:8px 10px 10px}
 .app-name{font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.win-title{font-size:10px;color:rgba(255,255,255,0.45);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
+.win-title{font-size:10px;color:rgba(0,0,0,0.4);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
 .bottom-bar{
   margin-top:6px;height:32px;
-  background:rgba(255,255,255,0.04);
+  background:rgba(0,0,0,0.04);
   display:flex;align-items:center;justify-content:center;
-  font-size:12px;color:rgba(255,255,255,0.6);flex-shrink:0
+  font-size:12px;color:rgba(0,0,0,0.5);flex-shrink:0
 }
 </style>
 </head>
