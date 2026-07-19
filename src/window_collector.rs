@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::time::Instant;
-use objc2::msg_send;
+use objc2::{class, msg_send};
 use objc2::runtime::AnyObject;
 
 #[derive(Debug, Clone)]
@@ -109,12 +109,23 @@ pub fn check_icon_cache(pid: i32) -> Option<String> {
     }
 }
 
+fn write_png_to_cache(png: *mut AnyObject, pid: i32) -> Option<String> {
+    unsafe {
+        let path = format!("{}/{}.png", ICON_CACHE_DIR, pid);
+        let path_cstr = std::ffi::CString::new(&*path).unwrap();
+        let cf_path = CFStringCreateWithCString(std::ptr::null(), path_cstr.as_ptr(), 0x08000100);
+        let ok: bool = msg_send![png, writeToFile: cf_path as *mut AnyObject, atomically: false];
+        CFRelease(cf_path as *const c_void);
+        if ok { Some(path) } else { None }
+    }
+}
+
 pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
     if let Some(path) = check_icon_cache(pid) {
         return Some(path);
     }
     unsafe {
-        let cls = objc2::class!(NSRunningApplication);
+        let cls = class!(NSRunningApplication);
         let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
         if app.is_null() { return None; }
 
@@ -124,20 +135,14 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
         let tiff: *mut AnyObject = msg_send![icon, TIFFRepresentation];
         if tiff.is_null() { return None; }
 
-        let rep_cls = objc2::class!(NSBitmapImageRep);
+        let rep_cls = class!(NSBitmapImageRep);
         let rep: *mut AnyObject = msg_send![rep_cls, imageRepWithData: tiff];
         if rep.is_null() { return None; }
 
         let png: *mut AnyObject = msg_send![rep, representationUsingType: 4u64, properties: std::ptr::null::<AnyObject>()];
         if png.is_null() { return None; }
 
-        let path = format!("{}/{}.png", ICON_CACHE_DIR, pid);
-        let path_cstr = std::ffi::CString::new(&*path).unwrap();
-        let cf_path = CFStringCreateWithCString(std::ptr::null(), path_cstr.as_ptr(), 0x08000100);
-        let ok: bool = msg_send![png, writeToFile: cf_path as *mut AnyObject, atomically: false];
-        CFRelease(cf_path as *const c_void);
-
-        if ok { Some(path) } else { None }
+        write_png_to_cache(png, pid)
     }
 }
 

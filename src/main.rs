@@ -7,6 +7,7 @@ use objc2::{class, msg_send, sel};
 use objc2::runtime::{AnyObject, Sel};
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::mem::transmute;
 use window_collector::{MruMap, WindowInfo, ensure_icon_cache_dir, extract_icon_to_cache};
 use event_monitor::{GlobalEvent, start as start_event_monitor};
 
@@ -62,10 +63,10 @@ fn activate_pid(pid: i32) {
         let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
         if !app.is_null() {
             let selector = sel!(activateWithOptions:);
-            extern "C" {
-                fn objc_msgSend(obj: *mut c_void, sel: Sel, opts: isize);
-            }
-            objc_msgSend(app as *mut c_void, selector, 1);
+            extern "C" { fn objc_msgSend(); }
+            type F = unsafe extern "C" fn(*mut c_void, Sel, isize);
+            let f: F = transmute(objc_msgSend as *const ());
+            f(app as *mut c_void, selector, 1);
         }
     }
 }
@@ -97,7 +98,7 @@ impl Render for OverlayView {
             let init = w.app_name.chars().next().unwrap_or('?').to_string();
             let icon_div: Div = if let Some(ref icon_path) = w.icon_path {
                 div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
-                    .child(img(std::path::PathBuf::from(icon_path.clone())))
+                    .child(img(std::path::PathBuf::from(icon_path.clone())).max_w(px(64.)).max_h(px(64.)))
             } else {
                 div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
                     .child(div().w(px(40.)).h(px(40.)).rounded_md().bg(rgb(0x3a3a5a)).flex().items_center().justify_center()
