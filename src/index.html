@@ -10,10 +10,11 @@ body{
   overflow:hidden;
   border-radius:14px;
   backdrop-filter:blur(40px) saturate(200%);
-  -webkit-backdrop-filter:blur(40px) saturate(200%)
+  -webkit-backdrop-filter:blur(40px) saturate(200%);
+  display:flex;align-items:center;justify-content:center
 }
 .overlay-panel{
-  min-height:100vh;
+  width:100%;
   display:flex;flex-direction:column;justify-content:center;padding:10px 0
 }
 card-list{
@@ -56,13 +57,20 @@ card-list{
 </style>
 </head>
 <body>
-<div class="overlay-panel">
+<div class="overlay-panel" id="panel" style="display:none">
   <card-list id="list"></card-list>
-  <div class="bottom-bar" id="title">Loading...</div>
+  <div class="bottom-bar" id="title"></div>
 </div>
+<div id="idle-hint" style="height:100%;display:flex;align-items:center;justify-content:center;color:rgba(0,0,0,0.35);font-size:13px">Hold Option + Tab to switch</div>
 <script>
 var listEl=document.getElementById("list"),titleEl=document.getElementById("title");
-var windows=[],selected=0;
+var panel=document.getElementById("panel"),hint=document.getElementById("idle-hint");
+var windows=[],selected=0,overlayShown=false,optionHeld=false;
+
+function showPanel(){panel.style.display="flex";hint.style.display="none";overlayShown=true}
+function hidePanel(){panel.style.display="none";hint.style.display="flex";overlayShown=false;shrinkToIdle()}
+
+function shrinkToIdle(){window.__TAURI_INTERNALS__.invoke("resize_overlay",{width:280,height:60})}
 
 function resizeToFit(){
   var listH=listEl.scrollHeight;
@@ -82,7 +90,7 @@ function render(wins){
     card.innerHTML='<div class="icon-wrap"><div class="icon-placeholder">'+w.app_name.charAt(0).toUpperCase()+'</div></div>'
       +'<div class="info"><div class="app-name">'+w.app_name+'</div>'
       +'<div class="win-title">'+(w.window_title||"")+'</div></div>';
-    card.addEventListener("click",function(){window.__TAURI_INTERNALS__.invoke("activate_window",{pid:w.pid})});
+    card.addEventListener("click",function(){window.__TAURI_INTERNALS__.invoke("activate_window",{pid:w.pid});hidePanel()});
     listEl.appendChild(card);
   });
   selected=wins.length>1?1:0;select(selected);
@@ -99,16 +107,42 @@ function select(idx){
     titleEl.textContent=windows[selected].app_name+(windows[selected].window_title?" — "+windows[selected].window_title:"");
   }
 }
-if(window.__TAURI_INTERNALS__){window.__TAURI_INTERNALS__.invoke("get_windows").then(function(wins){render(wins)})}
-else{titleEl.textContent="No Tauri API"}
+if(!window.__TAURI_INTERNALS__)titleEl.textContent="No Tauri API"
+
 document.addEventListener("keydown",function(e){
-  if(windows.length===0)return;
+  // Option+Tab: show overlay / cycle next
+  if(e.altKey&&e.key==="Tab"){
+    e.preventDefault();
+    if(!overlayShown){
+      window.__TAURI_INTERNALS__.invoke("get_windows").then(function(wins){render(wins)});
+      showPanel();
+    }else{
+      select(selected+1);
+    }
+    return;
+  }
+  // Option+Shift+Tab: cycle previous
+  if(e.altKey&&e.shiftKey&&e.key==="Tab"){
+    e.preventDefault();
+    if(overlayShown)select(selected-1);
+    return;
+  }
+  if(!overlayShown)return;
   switch(e.key){
-    case"ArrowRight":case"Tab":e.preventDefault();select(selected+1);break;
+    case"Escape":e.preventDefault();hidePanel();break;
+    case"Enter":e.preventDefault();if(windows[selected]){window.__TAURI_INTERNALS__.invoke("activate_window",{pid:windows[selected].pid});hidePanel()}break;
+    case"ArrowRight":e.preventDefault();select(selected+1);break;
     case"ArrowLeft":e.preventDefault();select(selected-1);break;
-    case"Enter":e.preventDefault();if(windows[selected])window.__TAURI_INTERNALS__.invoke("activate_window",{pid:windows[selected].pid});break;
   }
 });
+
+document.addEventListener("keyup",function(e){
+  if(e.key==="Alt"&&overlayShown){
+    if(windows[selected])window.__TAURI_INTERNALS__.invoke("activate_window",{pid:windows[selected].pid});
+    hidePanel();
+  }
+});
+
 window.addEventListener("resize",function(){resizeToFit()});
 </script>
 </body>
