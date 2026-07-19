@@ -110,6 +110,12 @@ impl Render for OverlayView {
     }
 }
 
+fn window_height(count: usize) -> Pixels {
+    let cards_per_row: usize = 5;
+    let rows = (count.max(1) + cards_per_row - 1) / cards_per_row;
+    px(40.0 + rows as f32 * 160.0 + 36.0)
+}
+
 fn main() {
     let (event_tx, event_rx) = flume::unbounded();
     let _monitor = start_event_monitor(event_tx);
@@ -118,7 +124,7 @@ fn main() {
         let state_entity = cx.new(|_cx| TabState::new());
 
         let bounds = Bounds::centered(None, size(px(900.), px(250.)), cx);
-        let _window_handle = cx.open_window(
+        let window_handle = cx.open_window(
             WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), focus: true, ..Default::default() },
             |_window, cx| {
                 let se = state_entity.clone();
@@ -131,13 +137,17 @@ fn main() {
                 })
             },
         ).unwrap();
+        let init_count = state_entity.read(cx).windows.len();
+        let _ = window_handle.update(cx, |_, window: &mut Window, _| window.resize(size(px(900.), window_height(init_count))));
 
         {
             let se = state_entity.clone();
             let async_app = cx.to_async();
+            let wh = window_handle;
             let _task = Box::leak(Box::new(cx.spawn(move |_: &mut AsyncApp| async move {
                 while let Ok(event) = event_rx.recv_async().await {
                     let se = se.clone();
+                    let wh = wh;
                     let _ = async_app.update(move |app_cx| {
                         let mut should_activate = false;
                         se.update(app_cx, |state, cx| {
@@ -164,6 +174,8 @@ fn main() {
                             cx.notify();
                         });
                         if should_activate {
+                            let count = se.read(app_cx).windows.len();
+                            let _ = wh.update(app_cx, |_, window: &mut Window, _| window.resize(size(px(900.), window_height(count))));
                             let _ = app_cx.activate(true);
                         }
                     });
