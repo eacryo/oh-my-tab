@@ -73,6 +73,20 @@ fn hide_window() {
     }
 }
 
+fn configure_borderless() {
+    unsafe {
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let windows: *mut AnyObject = msg_send![nsapp, windows];
+        if windows.is_null() { return; }
+        let count: usize = msg_send![windows, count];
+        if count == 0 { return; }
+        let window: *mut AnyObject = msg_send![windows, objectAtIndex: 0u64];
+        let current_style: usize = msg_send![window, styleMask];
+        let new_style = (current_style & !(1usize | (1 << 1) | (1 << 2))) | (1 << 15);
+        let _: () = msg_send![window, setStyleMask: new_style];
+    }
+}
+
 fn show_window() {
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
@@ -184,6 +198,7 @@ fn main() {
                 })
             },
         ).unwrap();
+        configure_borderless();
         hide_window();
 
         {
