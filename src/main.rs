@@ -232,6 +232,7 @@ fn main() {
                                     if state.visible {
                                         if let Some(w) = state.windows.get(state.selected) {
                                             raise_ax_window(w.pid, &w.window_title);
+                                            activate_pid(w.pid);
                                             hide_window();
                                         }
                                         state.visible = false;
