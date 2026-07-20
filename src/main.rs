@@ -117,6 +117,13 @@ fn activate_pid(pid: i32) {
     }
 }
 
+fn init_app() {
+    unsafe {
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: bool = msg_send![nsapp, setActivationPolicy: 1isize]; // NSApplicationActivationPolicyAccessory
+    }
+}
+
 impl Render for OverlayView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
@@ -199,6 +206,7 @@ fn main() {
             },
         ).unwrap();
         configure_borderless();
+        init_app();
         hide_window();
 
         {
