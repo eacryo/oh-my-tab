@@ -6,6 +6,7 @@ use std::thread;
 pub enum GlobalEvent {
     OptionTabPressed,
     OptionReleased,
+    StatusBarClicked,
 }
 
 type CGEventRef = *mut c_void;

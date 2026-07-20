@@ -6,10 +6,96 @@ use gpui::*;
 use objc2::{class, msg_send, sel};
 use objc2::runtime::{AnyObject, Sel};
 use std::collections::HashSet;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CString};
 use std::mem::transmute;
+use std::sync::OnceLock;
 use window_collector::{MruMap, WindowInfo, ensure_icon_cache_dir, extract_icon_to_cache, raise_ax_window};
 use event_monitor::{GlobalEvent, start as start_event_monitor};
+
+static STATUS_EVENT_TX: OnceLock<flume::Sender<GlobalEvent>> = OnceLock::new();
+
+#[link(name = "objc", kind = "dylib")]
+extern "C" {
+    fn objc_allocateClassPair(superclass: *mut AnyObject, name: *const c_char, extra_bytes: usize) -> *mut AnyObject;
+    fn objc_registerClassPair(cls: *mut AnyObject);
+    fn class_addMethod(cls: *mut AnyObject, name: Sel, imp: *mut c_void, types: *const c_char) -> bool;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFStringCreateWithCString(alloc: *const c_void, c_str: *const c_char, encoding: u32) -> *const c_void;
+    fn CFRelease(cf: *const c_void);
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: u8) -> i32;
+    static kCFRunLoopDefaultMode: *mut c_void;
+}
+
+fn make_nsstring(s: &str) -> *mut AnyObject {
+    unsafe {
+        let c_str = CString::new(s).unwrap();
+        let cf = CFStringCreateWithCString(std::ptr::null(), c_str.as_ptr(), 0x08000100u32); // kCFStringEncodingUTF8
+        if cf.is_null() {
+            eprintln!("[oh-my-tab] ERROR: CFStringCreateWithCString failed for '{}'", s);
+        }
+        cf as *mut AnyObject // toll-free bridged CFString <-> NSString
+    }
+}
+
+extern "C" fn status_bar_clicked(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    if let Some(tx) = STATUS_EVENT_TX.get() {
+        let _ = tx.send(GlobalEvent::StatusBarClicked);
+    }
+}
+
+fn setup_status_bar() {
+    unsafe {
+        let cls = {
+            let name = CString::new("OhMyTabStatusTarget").unwrap();
+            let superclass: *const objc2::runtime::AnyClass = class!(NSObject);
+            let cls = objc_allocateClassPair(superclass as *mut AnyObject, name.as_ptr(), 0);
+            if cls.is_null() {
+                eprintln!("[oh-my-tab] ERROR: Failed to allocate ObjC class for status bar.");
+                return;
+            }
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(cls, sel!(handleClick:), status_bar_clicked as *mut c_void, types.as_ptr());
+            objc_registerClassPair(cls);
+            cls
+        };
+
+        let target: *mut AnyObject = msg_send![cls as *const AnyObject, new];
+        let _: *mut AnyObject = msg_send![target, retain];
+
+        let status_bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
+        let status_item: *mut AnyObject = msg_send![status_bar, statusItemWithLength: 30.0f64];
+        let _: *mut AnyObject = msg_send![status_item, retain];
+
+        let button: *mut AnyObject = msg_send![status_item, button];
+        let _: () = msg_send![button, setTarget: target];
+        let _: () = msg_send![button, setAction: sel!(handleClick:)];
+
+        let ns_name = make_nsstring("square.on.square");
+        let image: *mut AnyObject = msg_send![class!(NSImage), imageWithSystemSymbolName: ns_name, accessibilityDescription: std::ptr::null::<AnyObject>()];
+        if !image.is_null() {
+            let is_template: bool = true;
+            let _: () = msg_send![image, setTemplate: is_template];
+            let _: () = msg_send![button, setImage: image];
+            let _: () = msg_send![button, setImagePosition: 1usize]; // NSImageOnly
+        } else {
+            let ns_title = make_nsstring("Tab");
+            let _: () = msg_send![button, setTitle: ns_title];
+            CFRelease(ns_title as *const c_void);
+        }
+        CFRelease(ns_name as *const c_void);
+
+        let _: () = msg_send![button, sizeToFit];
+        let _: () = msg_send![button, setNeedsDisplay: true];
+
+        // Pump run loop to allow NSStatusBar to connect to SystemUIServer
+        for _ in 0..10 {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, 1u8);
+        }
+    }
+}
 
 struct TabState {
     windows: Vec<WindowInfo>,
@@ -184,7 +270,7 @@ fn window_height(count: usize) -> Pixels {
 
 fn main() {
     let (event_tx, event_rx) = flume::unbounded();
-    let _monitor = start_event_monitor(event_tx);
+    let _monitor = start_event_monitor(event_tx.clone());
 
     Application::new().run(move |cx: &mut App| {
         ensure_icon_cache_dir();
@@ -208,6 +294,8 @@ fn main() {
         configure_borderless();
         init_app();
         hide_window();
+        STATUS_EVENT_TX.set(event_tx.clone()).ok();
+        setup_status_bar();
 
         {
             let se = state_entity.clone();
@@ -259,6 +347,17 @@ fn main() {
                                             hide_window();
                                         }
                                         state.visible = false;
+                                    }
+                                }
+                                GlobalEvent::StatusBarClicked => {
+                                    if state.visible {
+                                        state.visible = false;
+                                        hide_window();
+                                    } else {
+                                        state.refresh();
+                                        state.visible = true;
+                                        state.selected = if state.windows.len() > 1 { 1 } else { 0 };
+                                        should_activate = true;
                                     }
                                 }
                             }
