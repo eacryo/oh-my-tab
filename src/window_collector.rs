@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::time::Instant;
 use objc2::{class, msg_send};
@@ -216,7 +216,7 @@ pub fn raise_ax_window(pid: i32, window_title: &str) {
     }
 }
 
-fn get_ax_titles_for_pid(pid: i32) -> Vec<String> {
+fn get_ax_windows_for_pid(pid: i32) -> Vec<String> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() { return vec![]; }
@@ -230,23 +230,41 @@ fn get_ax_titles_for_pid(pid: i32) -> Vec<String> {
 
         let count = CFArrayGetCount(windows_array);
         let title_key = cf_string_new("AXTitle");
-        let mut titles = Vec::with_capacity(count as usize);
+        let subrole_key = cf_string_new("AXSubrole");
+        let mut results = Vec::with_capacity(count as usize);
 
         for i in 0..count {
             let element = CFArrayGetValueAtIndex(windows_array, i);
             if element.is_null() { continue; }
+
+            // 只保留标准窗口（AXStandardWindow），过滤弹出面板/下拉菜单等非标准窗口
+            // Only keep AXStandardWindow, filtering out popups/panels/dropdowns
+            let mut subrole_value: *const c_void = std::ptr::null();
+            let is_standard = if AXUIElementCopyAttributeValue(element, subrole_key, &mut subrole_value) == K_AX_SUCCESS && !subrole_value.is_null() {
+                let s = cf_to_rust_string(subrole_value);
+                CFRelease(subrole_value);
+                s.map_or(true, |sr| sr == "AXStandardWindow")
+            } else {
+                // 无 subrole → 视为标准窗口（部分 App 不设置此属性）
+                // No subrole means standard window for apps that don't set it
+                true
+            };
+            if !is_standard { continue; }
+
             let mut title_value: *const c_void = std::ptr::null();
-            let err = AXUIElementCopyAttributeValue(element, title_key, &mut title_value);
-            if err == K_AX_SUCCESS && !title_value.is_null() {
-                if let Some(s) = cf_to_rust_string(title_value) {
-                    titles.push(s);
-                }
+            let title = if AXUIElementCopyAttributeValue(element, title_key, &mut title_value) == K_AX_SUCCESS && !title_value.is_null() {
+                let t = cf_to_rust_string(title_value);
                 CFRelease(title_value);
-            }
+                t.unwrap_or_default()
+            } else {
+                String::new()
+            };
+            results.push(title);
         }
         CFRelease(title_key);
+        CFRelease(subrole_key);
         CFRelease(windows_array);
-        titles
+        results
     }
 }
 
@@ -269,8 +287,32 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     let mut windows: Vec<WindowInfo> = Vec::new();
     let count = unsafe { CFArrayGetCount(array) };
     let now = Instant::now();
-    let mut ax_cache: HashMap<i32, (Vec<String>, usize)> = HashMap::new();
     let mut insertion_order: u32 = 0;
+
+    // 第一遍遍历：收集所有 PID，用于批量查询 AX 窗口
+    // First pass: collect all PIDs to batch query AX windows
+    let mut pids: HashSet<i32> = HashSet::new();
+    for i in 0..count {
+        let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
+        if dict.is_null() { continue; }
+        let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
+        if layer != 0 { continue; }
+        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+        if owner_pid <= 0 || owner_pid == self_pid { continue; }
+        let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
+        if owner_name.is_empty() || owner_name == "Dock" { continue; }
+        pids.insert(owner_pid);
+    }
+
+    // 以 AX 窗口列表为主数据源（macOS App Switcher 的做法）
+    // Use AX window list as primary source (same as macOS App Switcher)
+    let mut ax_by_pid: HashMap<i32, Vec<String>> = HashMap::new();
+    for &pid in &pids {
+        let ax_wins = get_ax_windows_for_pid(pid);
+        if !ax_wins.is_empty() {
+            ax_by_pid.insert(pid, ax_wins);
+        }
+    }
 
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
@@ -285,18 +327,42 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
         if owner_name.is_empty() || owner_name == "Dock" { continue; }
 
-        let mut window_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
+        let cg_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
         let window_id = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
 
-        if window_title.is_empty() {
-            let entry = ax_cache.entry(owner_pid).or_insert_with(|| {
-                (get_ax_titles_for_pid(owner_pid), 0)
-            });
-            let (ref titles, ref mut idx) = *entry;
-            if *idx < titles.len() {
-                window_title = titles[*idx].clone();
-                *idx += 1;
+        // AX 为权威数据源：CG 窗口必须匹配 AX 窗口才保留
+        // AX is authoritative: CG windows must match an AX window to be included
+        let window_title = if let Some(ax_wins) = ax_by_pid.get(&owner_pid) {
+            if cg_title.is_empty() {
+                // CG 标题为空 → 分配第一个未使用的 AX 标题
+                // Empty CG title → assign first unused AX title
+                let mut found: Option<String> = None;
+                for ax_title in ax_wins {
+                    if !ax_title.is_empty() && !windows.iter().any(|w: &WindowInfo| w.pid == owner_pid && w.window_title == *ax_title) {
+                        found = Some(ax_title.clone());
+                        break;
+                    }
+                }
+                found.unwrap_or_default()
+            } else {
+                // CG 标题必须在 AX 列表中存在，否则是弹出面板/下拉菜单
+                // CG title must exist in AX list; otherwise it's a popup/panel
+                if ax_wins.iter().any(|t| *t == cg_title) {
+                    cg_title
+                } else {
+                    continue; // CG 窗口不在 AX 中 → 弹出面板，跳过
+                              // CG window not in AX → popup/panel, skip
+                }
             }
+        } else {
+            // No AX data for this app → fall back to CG title
+            cg_title
+        };
+
+        if window_title.is_empty() && !ax_by_pid.contains_key(&owner_pid) {
+            // Keep windows from apps without AX support even if title is empty
+        } else if window_title.is_empty() {
+            continue; // empty title only valid for non-AX apps
         }
 
         let ordered_ts = now.checked_sub(std::time::Duration::from_millis(insertion_order as u64)).unwrap_or(now);
