@@ -8,11 +8,6 @@ use objc2::runtime::{AnyObject, Sel};
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CString};
 use std::mem::transmute;
-use std::sync::OnceLock;
-use window_collector::{MruMap, WindowInfo, ensure_icon_cache_dir, extract_icon_to_cache, raise_ax_window};
-use event_monitor::{GlobalEvent, start as start_event_monitor};
-
-static STATUS_EVENT_TX: OnceLock<flume::Sender<GlobalEvent>> = OnceLock::new();
 
 #[link(name = "objc", kind = "dylib")]
 extern "C" {
@@ -20,6 +15,9 @@ extern "C" {
     fn objc_registerClassPair(cls: *mut AnyObject);
     fn class_addMethod(cls: *mut AnyObject, name: Sel, imp: *mut c_void, types: *const c_char) -> bool;
 }
+use window_collector::{MruMap, WindowInfo, ensure_icon_cache_dir, extract_icon_to_cache, raise_ax_window};
+use event_monitor::{GlobalEvent, start as start_event_monitor};
+
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
@@ -40,38 +38,21 @@ fn make_nsstring(s: &str) -> *mut AnyObject {
     }
 }
 
-extern "C" fn status_bar_clicked(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    if let Some(tx) = STATUS_EVENT_TX.get() {
-        let _ = tx.send(GlobalEvent::StatusBarClicked);
+extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    println!("[oh-my-tab] User quit via menu bar.");
+    unsafe {
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![nsapp, terminate: std::ptr::null::<AnyObject>()];
     }
 }
 
 fn setup_status_bar() {
     unsafe {
-        let cls = {
-            let name = CString::new("OhMyTabStatusTarget").unwrap();
-            let superclass: *const objc2::runtime::AnyClass = class!(NSObject);
-            let cls = objc_allocateClassPair(superclass as *mut AnyObject, name.as_ptr(), 0);
-            if cls.is_null() {
-                eprintln!("[oh-my-tab] ERROR: Failed to allocate ObjC class for status bar.");
-                return;
-            }
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(cls, sel!(handleClick:), status_bar_clicked as *mut c_void, types.as_ptr());
-            objc_registerClassPair(cls);
-            cls
-        };
-
-        let target: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-        let _: *mut AnyObject = msg_send![target, retain];
-
         let status_bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
         let status_item: *mut AnyObject = msg_send![status_bar, statusItemWithLength: 30.0f64];
         let _: *mut AnyObject = msg_send![status_item, retain];
 
         let button: *mut AnyObject = msg_send![status_item, button];
-        let _: () = msg_send![button, setTarget: target];
-        let _: () = msg_send![button, setAction: sel!(handleClick:)];
 
         let ns_name = make_nsstring("square.on.square");
         let image: *mut AnyObject = msg_send![class!(NSImage), imageWithSystemSymbolName: ns_name, accessibilityDescription: std::ptr::null::<AnyObject>()];
@@ -89,6 +70,39 @@ fn setup_status_bar() {
 
         let _: () = msg_send![button, sizeToFit];
         let _: () = msg_send![button, setNeedsDisplay: true];
+
+        // Build menu with Quit item
+        let menu_title = make_nsstring("");
+        let menu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+        let menu: *mut AnyObject = msg_send![menu, initWithTitle: menu_title];
+        CFRelease(menu_title as *const c_void);
+
+        // Create quit action target class
+        let quit_cls = {
+            let name = CString::new("OhMyTabQuitTarget").unwrap();
+            let superclass: *const objc2::runtime::AnyClass = class!(NSObject);
+            let cls = objc_allocateClassPair(superclass as *mut AnyObject, name.as_ptr(), 0);
+            if cls.is_null() {
+                eprintln!("[oh-my-tab] ERROR: Failed to allocate ObjC class for quit target.");
+                return;
+            }
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(cls, sel!(handleQuit:), handle_quit as *mut c_void, types.as_ptr());
+            objc_registerClassPair(cls);
+            cls
+        };
+        let quit_target: *mut AnyObject = msg_send![quit_cls as *const AnyObject, new];
+
+        let quit_title = make_nsstring("Quit");
+        let quit_key = make_nsstring("");
+        let quit_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let quit_item: *mut AnyObject = msg_send![quit_item, initWithTitle: quit_title, action: sel!(handleQuit:), keyEquivalent: quit_key];
+        CFRelease(quit_title as *const c_void);
+        CFRelease(quit_key as *const c_void);
+        let _: () = msg_send![quit_item, setTarget: quit_target];
+        let _: () = msg_send![menu, addItem: quit_item];
+
+        let _: () = msg_send![status_item, setMenu: menu];
 
         // Pump run loop to allow NSStatusBar to connect to SystemUIServer
         for _ in 0..10 {
@@ -360,7 +374,6 @@ fn main() {
         configure_borderless();
         init_app();
         hide_window();
-        STATUS_EVENT_TX.set(event_tx.clone()).ok();
         setup_status_bar();
 
         {
@@ -417,17 +430,6 @@ fn main() {
                                             state.mru.insert(wid, std::time::Instant::now());
                                         }
                                         state.visible = false;
-                                    }
-                                }
-                                GlobalEvent::StatusBarClicked => {
-                                    if state.visible {
-                                        state.visible = false;
-                                        hide_window();
-                                    } else {
-                                        state.refresh();
-                                        state.visible = true;
-                                        state.selected = if state.windows.len() > 1 { 1 } else { 0 };
-                                        should_activate = true;
                                     }
                                 }
                             }
