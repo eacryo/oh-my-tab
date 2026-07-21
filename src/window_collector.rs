@@ -131,6 +131,8 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
         return Some(path);
     }
     unsafe {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
         let cls = class!(NSRunningApplication);
         let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
         if app.is_null() { return None; }
@@ -138,13 +140,34 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
         let icon: *mut AnyObject = msg_send![app, icon];
         if icon.is_null() { return None; }
 
-        let tiff: *mut AnyObject = msg_send![icon, TIFFRepresentation];
+        // Render at Retina resolution: 64pt display → 128px (2x) or 64px (1x)
+        let scale: f64 = {
+            let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+            if screen.is_null() { 2.0 }
+            else { msg_send![screen, backingScaleFactor] }
+        };
+        let px = 64.0 * scale;
+
+        let target_img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let target_img: *mut AnyObject = msg_send![target_img, initWithSize: NSSize::new(px, px)];
+
+        // Draw icon into target with high-quality interpolation (NSImageInterpolationHigh)
+        let _: () = msg_send![target_img, lockFocus];
+        let dst = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(px, px));
+        let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+        let op: usize = 1; // NSCompositingOperationCopy
+        let _: () = msg_send![icon, drawInRect: dst, fromRect: src, operation: op, fraction: 1.0f64];
+        let _: () = msg_send![target_img, unlockFocus];
+
+        // Convert to PNG at target size
+        let tiff: *mut AnyObject = msg_send![target_img, TIFFRepresentation];
         if tiff.is_null() { return None; }
 
         let rep_cls = class!(NSBitmapImageRep);
         let rep: *mut AnyObject = msg_send![rep_cls, imageRepWithData: tiff];
         if rep.is_null() { return None; }
 
+        // NSBitmapImageFileTypePNG = 4
         let png: *mut AnyObject = msg_send![rep, representationUsingType: 4u64, properties: std::ptr::null::<AnyObject>()];
         if png.is_null() { return None; }
 
