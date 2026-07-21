@@ -247,6 +247,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     let count = unsafe { CFArrayGetCount(array) };
     let now = Instant::now();
     let mut ax_cache: HashMap<i32, (Vec<String>, usize)> = HashMap::new();
+    let mut insertion_order: u32 = 0;
 
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
@@ -275,7 +276,9 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             }
         }
 
-        mru.entry(window_id).or_insert(now);
+        let ordered_ts = now.checked_sub(std::time::Duration::from_millis(insertion_order as u64)).unwrap_or(now);
+        mru.entry(window_id).or_insert(ordered_ts);
+        insertion_order += 1;
         let icon_path = check_icon_cache(owner_pid);
         windows.push(WindowInfo { pid: owner_pid, window_id, app_name: owner_name, window_title, icon_path, is_active: false });
     }
@@ -285,7 +288,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     windows.sort_by(|a, b| {
         let ta = mru.get(&a.window_id).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
         let tb = mru.get(&b.window_id).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
-        tb.cmp(&ta)
+        ta.cmp(&tb)
     });
 
     if let Some(first) = windows.first_mut() { first.is_active = true; }

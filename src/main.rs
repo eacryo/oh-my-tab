@@ -210,6 +210,29 @@ fn init_app() {
     }
 }
 
+fn hit_test_card(mx: f32, my: f32, total_cards: usize) -> Option<usize> {
+    let cards_per_row: usize = 5;
+    let card_w: f32 = 160.0;
+    let row_h: f32 = 160.0;
+    let gap: f32 = 10.0;
+    let pad: f32 = 20.0;
+
+    let cols = cards_per_row.min(total_cards);
+    let row_width = cols as f32 * card_w + cols.saturating_sub(1) as f32 * gap;
+    let start_x = (900.0 - row_width) / 2.0;
+
+    let col = ((mx - start_x) / (card_w + gap)).floor() as isize;
+    let row = ((my - pad) / row_h).floor() as isize;
+    if col < 0 || col >= cards_per_row as isize || row < 0 { return None; }
+
+    let card_left = start_x + col as f32 * (card_w + gap);
+    if mx < card_left || mx > card_left + card_w { return None; }
+
+    let idx = row as usize * cards_per_row + col as usize;
+    if idx >= total_cards { return None; }
+    Some(idx)
+}
+
 impl Render for OverlayView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
@@ -232,31 +255,64 @@ impl Render for OverlayView {
             None => String::new(),
         };
 
-        let cards: Vec<AnyElement> = windows.iter().enumerate().map(|(i, w)| {
-            let is_sel = i == selected;
-            let init = w.app_name.chars().next().unwrap_or('?').to_string();
-            let icon_div: Div = if let Some(ref icon_path) = w.icon_path {
-                div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
-                    .child(img(std::path::PathBuf::from(icon_path.clone())).max_w(px(64.)).max_h(px(64.)))
-            } else {
-                div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
-                    .child(div().w(px(40.)).h(px(40.)).rounded_md().bg(rgb(0x3a3a5a)).flex().items_center().justify_center()
-                        .text_lg().font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xaaaacc)).child(init.clone()))
-            };
-            div().w(px(160.)).rounded_md().border_2()
-                .border_color(if is_sel { rgb(0x5a5a8a) } else { rgba(0x00000000) })
-                .bg(if is_sel { rgb(0x3a3a5a) } else { rgb(0x2a2a3a) })
-                .flex().flex_col().overflow_hidden()
-                .child(icon_div)
-                .child(div().px(px(10.)).py(px(8.))
-                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(rgb(0xdddddd)).overflow_hidden().whitespace_nowrap().child(w.app_name.clone()))
-                    .child(div().text_xs().text_color(rgb(0x888888)).mt(px(2.)).overflow_hidden().whitespace_nowrap().child(w.window_title.clone())))
-                .into_any()
-        }).collect();
+        let cards: Vec<AnyElement> = {
+            let state_entity = self.state.clone();
+            windows.iter().enumerate().map(|(i, w)| {
+                let is_sel = i == selected;
+                let init = w.app_name.chars().next().unwrap_or('?').to_string();
+                let pid = w.pid;
+                let window_id = w.window_id;
+                let window_title = w.window_title.clone();
+                let icon_div: Div = if let Some(ref icon_path) = w.icon_path {
+                    div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
+                        .child(img(std::path::PathBuf::from(icon_path.clone())).max_w(px(64.)).max_h(px(64.)))
+                } else {
+                    div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
+                        .child(div().w(px(40.)).h(px(40.)).rounded_md().bg(rgb(0x3a3a5a)).flex().items_center().justify_center()
+                            .text_lg().font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xaaaacc)).child(init.clone()))
+                };
+                div().w(px(160.)).rounded_md().border_2()
+                    .border_color(if is_sel { rgb(0x5a5a8a) } else { rgba(0x00000000) })
+                    .bg(if is_sel { rgb(0x3a3a5a) } else { rgb(0x2a2a3a) })
+                    .flex().flex_col().overflow_hidden().flex_shrink_0()
+                    .id(i)
+                    .on_hover({
+                        let se = state_entity.clone();
+                        move |hovered: &bool, _window: &mut Window, app: &mut App| {
+                            if *hovered {
+                                se.update(app, |state, cx| {
+                                    state.selected = i;
+                                    cx.notify();
+                                });
+                                _window.refresh();
+                            }
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Left, {
+                        let se = state_entity.clone();
+                        let wt = window_title.clone();
+                        move |_event: &MouseDownEvent, _window: &mut Window, app: &mut App| {
+                            se.update(app, |state, cx| {
+                                raise_ax_window(pid, &wt);
+                                activate_pid(pid);
+                                hide_window();
+                                state.visible = false;
+                                state.mru.insert(window_id, std::time::Instant::now());
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .child(icon_div)
+                    .child(div().px(px(10.)).py(px(8.))
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(rgb(0xdddddd)).overflow_hidden().whitespace_nowrap().child(w.app_name.clone()))
+                        .child(div().text_xs().text_color(rgb(0x888888)).mt(px(2.)).overflow_hidden().whitespace_nowrap().child(w.window_title.clone())))
+                    .into_any()
+            }).collect()
+        };
 
         div()
             .size_full().flex().flex_col().bg(rgb(0x1e1e2e))
-            .child(div().flex().flex_row().flex_wrap().justify_center().items_center().gap(px(10.)).p(px(20.)).size_full().children(cards))
+            .child(div().grid().grid_cols(5).justify_center().gap(px(10.)).p(px(20.)).size_full().children(cards))
             .child(div().h(px(36.)).w_full().bg(rgb(0x161622)).flex().items_center().justify_center().text_sm().text_color(rgb(0x999999)).child(status))
             .into_any()
     }
@@ -279,7 +335,7 @@ fn main() {
         let init_count = state_entity.read(cx).windows.len();
         let bounds = Bounds::centered(None, size(px(900.), window_height(init_count)), cx);
         let window_handle = cx.open_window(
-            WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), focus: true, ..Default::default() },
+            WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), focus: true, kind: WindowKind::PopUp, ..Default::default() },
             |_window, cx| {
                 let se = state_entity.clone();
                 cx.new(|cx| {
@@ -342,9 +398,13 @@ fn main() {
                                 GlobalEvent::OptionReleased => {
                                     if state.visible {
                                         if let Some(w) = state.windows.get(state.selected) {
-                                            raise_ax_window(w.pid, &w.window_title);
-                                            activate_pid(w.pid);
+                                            let wid = w.window_id;
+                                            let pw = w.pid;
+                                            let wt = w.window_title.clone();
+                                            raise_ax_window(pw, &wt);
+                                            activate_pid(pw);
                                             hide_window();
+                                            state.mru.insert(wid, std::time::Instant::now());
                                         }
                                         state.visible = false;
                                     }
