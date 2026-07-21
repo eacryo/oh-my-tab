@@ -146,7 +146,7 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
             if screen.is_null() { 2.0 }
             else { msg_send![screen, backingScaleFactor] }
         };
-        let px = 64.0 * scale;
+        let px = 128.0 * scale;
 
         let target_img: *mut AnyObject = msg_send![class!(NSImage), alloc];
         let target_img: *mut AnyObject = msg_send![target_img, initWithSize: NSSize::new(px, px)];

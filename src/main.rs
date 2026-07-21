@@ -351,15 +351,15 @@ fn current_colors() -> Colors {
 }
 
 fn hit_test_card(mx: f32, my: f32, total_cards: usize) -> Option<usize> {
-    let cards_per_row: usize = 5;
+    let cards_per_row: usize = 6;
     let card_w: f32 = 160.0;
-    let row_h: f32 = 160.0;
+    let row_h: f32 = 200.0;
     let gap: f32 = 10.0;
     let pad: f32 = 20.0;
 
     let cols = cards_per_row.min(total_cards);
     let row_width = cols as f32 * card_w + cols.saturating_sub(1) as f32 * gap;
-    let start_x = (900.0 - row_width) / 2.0;
+    let start_x = (1050.0 - row_width) / 2.0;
 
     let col = ((mx - start_x) / (card_w + gap)).floor() as isize;
     let row = ((my - pad) / row_h).floor() as isize;
@@ -373,13 +373,35 @@ fn hit_test_card(mx: f32, my: f32, total_cards: usize) -> Option<usize> {
     Some(idx)
 }
 
+fn truncate_text(text: &str, max_width: usize) -> String {
+    let mut width: usize = 0;
+    for (i, c) in text.char_indices() {
+        let w = if c.is_ascii() { 1 } else { 2 };
+        if width + w > max_width {
+            let t: String = text[..i].chars().collect();
+            return format!("{}…", t);
+        }
+        width += w;
+    }
+    text.to_string()
+}
+
+fn icon_area_size(count: usize) -> f32 {
+    match count {
+        0..=6 => 144.0,
+        7..=12 => 132.0,
+        13..=18 => 120.0,
+        _ => 112.0,
+    }
+}
+
 impl Render for OverlayView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let c = current_colors();
 
         if !state.visible {
-            let hint: &str = if has_accessibility_permission() { "Hold Option + Tab to switch" } else { "Need Accessibility permission" };
+            let hint: &str = if has_accessibility_permission() { "Hold Command + Tab to switch" } else { "Need Accessibility permission" };
             return div()
                 .size_full().flex().flex_col().items_center().justify_center().gap(px(4.))
                 .bg(c.hint_bg).text_color(c.hint_text).text_sm()
@@ -390,9 +412,14 @@ impl Render for OverlayView {
 
         let selected = state.selected;
         let windows = state.windows.clone();
+        let count = windows.len();
+        let icon_sz = icon_area_size(count);
+        let img_sz = 128.0;
+        let letter_sq = 64.0;
+
         let status = match windows.get(selected) {
-            Some(w) if !w.window_title.is_empty() => format!("{} — {}", w.app_name, w.window_title),
-            Some(w) => w.app_name.clone(),
+            Some(w) if !w.window_title.is_empty() => truncate_text(&format!("{} — {}", w.app_name, w.window_title), 126),
+            Some(w) => truncate_text(&w.app_name, 126),
             None => String::new(),
         };
 
@@ -405,17 +432,19 @@ impl Render for OverlayView {
                 let window_id = w.window_id;
                 let window_title = w.window_title.clone();
                 let icon_div: Div = if let Some(ref icon_path) = w.icon_path {
-                    div().h(px(80.)).flex().items_center().justify_center().bg(c.icon_bg)
-                        .child(img(std::path::PathBuf::from(icon_path.clone())).max_w(px(64.)).max_h(px(64.)))
+                    div().w(px(icon_sz)).h(px(icon_sz)).rounded_md().bg(c.icon_bg)
+                        .flex().items_center().justify_center()
+                        .child(img(std::path::PathBuf::from(icon_path.clone())).max_w(px(img_sz)).max_h(px(img_sz)))
                 } else {
-                    div().h(px(80.)).flex().items_center().justify_center().bg(c.icon_bg)
-                        .child(div().w(px(40.)).h(px(40.)).rounded_md().bg(c.icon_inner_bg).flex().items_center().justify_center()
+                    div().w(px(icon_sz)).h(px(icon_sz)).rounded_md().bg(c.icon_bg)
+                        .flex().items_center().justify_center()
+                        .child(div().w(px(letter_sq)).h(px(letter_sq)).rounded_md().bg(c.icon_inner_bg).flex().items_center().justify_center()
                             .text_lg().font_weight(FontWeight::SEMIBOLD).text_color(c.icon_text).child(init.clone()))
                 };
                 div().w(px(160.)).rounded_md().border_2()
                     .border_color(if is_sel { c.card_border_sel } else { c.card_border })
                     .bg(if is_sel { c.card_bg_sel } else { c.card_bg })
-                    .flex().flex_col().overflow_hidden().flex_shrink_0()
+                    .flex().flex_col().items_center().gap(px(6.)).pt(px(8.)).pb(px(6.)).overflow_hidden().flex_shrink_0()
                     .id(i)
                     .on_hover({
                         let se = state_entity.clone();
@@ -444,25 +473,27 @@ impl Render for OverlayView {
                         }
                     })
                     .child(icon_div)
-                    .child(div().px(px(10.)).py(px(8.))
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(c.app_name).overflow_hidden().whitespace_nowrap().child(w.app_name.clone()))
-                        .child(div().text_xs().text_color(c.win_title).mt(px(2.)).overflow_hidden().whitespace_nowrap().child(w.window_title.clone())))
+                    .child(div().w_full().flex().flex_col().items_center().px(px(8.))
+                        .child(div().w_full().text_sm().font_weight(FontWeight::MEDIUM).text_center().text_color(c.app_name).whitespace_nowrap().child(truncate_text(&w.app_name, 17)))
+                        .child(div().w_full().text_xs().text_center().text_color(c.win_title).mt(px(2.)).whitespace_nowrap().child(truncate_text(&w.window_title, 19))))
                     .into_any()
             }).collect()
         };
 
         div()
             .size_full().flex().flex_col().bg(c.page_bg)
-            .child(div().grid().grid_cols(5).justify_center().gap(px(10.)).p(px(20.)).size_full().children(cards))
-            .child(div().h(px(36.)).w_full().bg(c.status_bar_bg).flex().items_center().justify_center().text_sm().text_color(c.status_bar_text).child(status))
+            .child(div().grid().grid_cols(6).justify_center().gap(px(10.)).py(px(16.)).size_full().children(cards))
+            .child(div().h(px(36.)).w_full().bg(c.status_bar_bg).flex().items_center().px(px(12.))
+                .child(div().w_full().text_sm().text_center().text_color(c.status_bar_text).whitespace_nowrap().child(status)))
             .into_any()
     }
 }
 
 fn window_height(count: usize) -> Pixels {
-    let cards_per_row: usize = 5;
+    let cards_per_row: usize = 6;
     let rows = (count.max(1) + cards_per_row - 1) / cards_per_row;
-    px(40.0 + rows as f32 * 160.0 + 36.0)
+    let card_h = icon_area_size(count) + 60.0;
+    px(32.0 + rows as f32 * card_h + 36.0)
 }
 
 fn main() {
@@ -474,7 +505,7 @@ fn main() {
         let state_entity = cx.new(|_cx| TabState::new());
 
         let init_count = state_entity.read(cx).windows.len();
-        let bounds = Bounds::centered(None, size(px(900.), window_height(init_count)), cx);
+        let bounds = Bounds::centered(None, size(px(1050.), window_height(init_count)), cx);
         let window_handle = cx.open_window(
             WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), focus: true, kind: WindowKind::PopUp, ..Default::default() },
             |_window, cx| {
@@ -526,7 +557,7 @@ fn main() {
                         let mut should_activate = false;
                         se.update(app_cx, |state, cx| {
                             match event {
-                                GlobalEvent::OptionTabPressed => {
+                                GlobalEvent::CmdTabPressed => {
                                     if !state.visible {
                                         state.refresh();
                                         state.visible = true;
@@ -536,7 +567,7 @@ fn main() {
                                         state.selected = (state.selected + 1) % state.windows.len().max(1);
                                     }
                                 }
-                                GlobalEvent::OptionReleased => {
+                                GlobalEvent::CmdReleased => {
                                     if state.visible {
                                         if let Some(w) = state.windows.get(state.selected) {
                                             let wid = w.window_id;
@@ -559,7 +590,7 @@ fn main() {
                         if should_activate {
                             show_window();
                             let count = se.read(app_cx).windows.len();
-                            let _ = wh.update(app_cx, |_, window: &mut Window, _| window.resize(size(px(900.), window_height(count))));
+                            let _ = wh.update(app_cx, |_, window: &mut Window, _| window.resize(size(px(1050.), window_height(count))));
                             let uncached: Vec<i32> = se.read(app_cx).windows.iter()
                                 .filter(|w| w.icon_path.is_none())
                                 .map(|w| w.pid)
@@ -574,7 +605,6 @@ fn main() {
                                     }
                                 });
                             }
-                            let _ = app_cx.activate(true);
                         }
                     });
                 }

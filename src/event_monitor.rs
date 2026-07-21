@@ -4,8 +4,8 @@ use std::thread;
 
 #[derive(Debug, Clone, Copy)]
 pub enum GlobalEvent {
-    OptionTabPressed,
-    OptionReleased,
+    CmdTabPressed,
+    CmdReleased,
     ThemeToggled,
 }
 
@@ -23,7 +23,7 @@ type CGEventMask = u64;
 const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
 const K_CG_EVENT_FLAGS_CHANGED: CGEventType = 12;
 const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
-const K_CG_EVENT_FLAG_MASK_ALTERNATE: CGEventFlags = 0x00080000;
+const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = 0x00100000;
 const K_VK_TAB: u16 = 48;
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -79,15 +79,15 @@ unsafe extern "C" fn event_tap_callback(
                 CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) as u16;
             let flags = CGEventGetFlags(event);
 
-            if keycode == K_VK_TAB && (flags & K_CG_EVENT_FLAG_MASK_ALTERNATE) != 0 {
-                let _ = sender.send(GlobalEvent::OptionTabPressed);
+            if keycode == K_VK_TAB && (flags & K_CG_EVENT_FLAG_MASK_COMMAND) != 0 {
+                let _ = sender.send(GlobalEvent::CmdTabPressed);
                 return std::ptr::null_mut();
             }
         }
         K_CG_EVENT_FLAGS_CHANGED => {
             let flags = CGEventGetFlags(event);
-            if (flags & K_CG_EVENT_FLAG_MASK_ALTERNATE) == 0 {
-                let _ = sender.send(GlobalEvent::OptionReleased);
+            if (flags & K_CG_EVENT_FLAG_MASK_COMMAND) == 0 {
+                let _ = sender.send(GlobalEvent::CmdReleased);
             }
         }
         _ => {}
@@ -118,7 +118,7 @@ pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
         CGEventTapEnable(tap, true);
 
-        eprintln!("[oh-my-tab] Event monitor started. Listening for Option+Tab globally.");
+        eprintln!("[oh-my-tab] Event monitor started. Listening for Command+Tab globally.");
         CFRunLoopRun();
     })
 }
