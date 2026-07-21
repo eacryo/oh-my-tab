@@ -170,6 +170,16 @@ fn configure_borderless() {
         let current_style: usize = msg_send![window, styleMask];
         let new_style = (current_style & !(1usize | (1 << 1) | (1 << 2))) | (1 << 15);
         let _: () = msg_send![window, setStyleMask: new_style];
+
+        // Rounded corners
+        let _: () = msg_send![window, setOpaque: false];
+        let clear_color: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+        let _: () = msg_send![window, setBackgroundColor: clear_color];
+        let content_view: *mut AnyObject = msg_send![window, contentView];
+        let _: () = msg_send![content_view, setWantsLayer: true];
+        let layer: *mut AnyObject = msg_send![content_view, layer];
+        let _: () = msg_send![layer, setCornerRadius: 12.0f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
     }
 }
 
