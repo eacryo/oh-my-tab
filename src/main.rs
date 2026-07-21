@@ -475,7 +475,7 @@ impl Render for OverlayView {
                     .child(icon_div)
                     .child(div().w_full().flex().flex_col().items_center().px(px(8.))
                         .child(div().w_full().text_sm().font_weight(FontWeight::MEDIUM).text_center().text_color(c.app_name).whitespace_nowrap().child(truncate_text(&w.app_name, 17)))
-                        .child(div().w_full().text_xs().text_center().text_color(c.win_title).mt(px(2.)).whitespace_nowrap().child(truncate_text(&w.window_title, 19))))
+                        .child(div().w_full().text_xs().text_center().text_color(c.win_title).mt(px(2.)).whitespace_nowrap().child(truncate_text(&w.window_title, 20))))
                     .into_any()
             }).collect()
         };
