@@ -8,6 +8,17 @@ use objc2::runtime::{AnyObject, Sel};
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CString};
 use std::mem::transmute;
+use std::sync::Mutex;
+
+struct MenuState {
+    item: *mut AnyObject,
+    is_dark: bool,
+}
+unsafe impl Send for MenuState {}
+unsafe impl Sync for MenuState {}
+
+static THEME_STATE: Mutex<Option<MenuState>> = Mutex::new(None);
+static STATUS_EVENT_TX: std::sync::OnceLock<flume::Sender<GlobalEvent>> = std::sync::OnceLock::new();
 
 #[link(name = "objc", kind = "dylib")]
 extern "C" {
@@ -46,6 +57,26 @@ extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     }
 }
 
+extern "C" fn handle_toggle_theme(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    let mut state = THEME_STATE.lock().unwrap();
+    if let Some(ref mut s) = *state {
+        s.is_dark = !s.is_dark;
+        let new_label = if s.is_dark { "切换浅色" } else { "切换深色" };
+        println!(
+            "[oh-my-tab] Toggled theme to {}",
+            if s.is_dark { "dark" } else { "light" }
+        );
+        unsafe {
+            let ns_title = make_nsstring(new_label);
+            let _: () = msg_send![s.item, setTitle: ns_title];
+            CFRelease(ns_title as *const c_void);
+        }
+    }
+    if let Some(tx) = STATUS_EVENT_TX.get() {
+        let _ = tx.send(GlobalEvent::ThemeToggled);
+    }
+}
+
 fn setup_status_bar() {
     unsafe {
         let status_bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
@@ -77,30 +108,49 @@ fn setup_status_bar() {
         let menu: *mut AnyObject = msg_send![menu, initWithTitle: menu_title];
         CFRelease(menu_title as *const c_void);
 
-        // Create quit action target class
-        let quit_cls = {
-            let name = CString::new("OhMyTabQuitTarget").unwrap();
+        // Create menu action target class
+        let action_cls = {
+            let name = CString::new("OhMyTabMenuTarget").unwrap();
             let superclass: *const objc2::runtime::AnyClass = class!(NSObject);
             let cls = objc_allocateClassPair(superclass as *mut AnyObject, name.as_ptr(), 0);
             if cls.is_null() {
-                eprintln!("[oh-my-tab] ERROR: Failed to allocate ObjC class for quit target.");
+                eprintln!("[oh-my-tab] ERROR: Failed to allocate ObjC class for menu target.");
                 return;
             }
             let types = CString::new("v@:@").unwrap();
             class_addMethod(cls, sel!(handleQuit:), handle_quit as *mut c_void, types.as_ptr());
+            class_addMethod(cls, sel!(handleToggleTheme:), handle_toggle_theme as *mut c_void, types.as_ptr());
             objc_registerClassPair(cls);
             cls
         };
-        let quit_target: *mut AnyObject = msg_send![quit_cls as *const AnyObject, new];
+        let menu_target: *mut AnyObject = msg_send![action_cls as *const AnyObject, new];
 
+        // Toggle theme item
+        let toggle_title = make_nsstring("切换浅色");
+        let toggle_key = make_nsstring("");
+        let toggle_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let toggle_item: *mut AnyObject = msg_send![toggle_item, initWithTitle: toggle_title, action: sel!(handleToggleTheme:), keyEquivalent: toggle_key];
+        CFRelease(toggle_title as *const c_void);
+        CFRelease(toggle_key as *const c_void);
+        let _: () = msg_send![toggle_item, setTarget: menu_target];
+        let _: () = msg_send![menu, addItem: toggle_item];
+
+        // Separator
+        let sep_item: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![menu, addItem: sep_item];
+
+        // Quit item
         let quit_title = make_nsstring("Quit");
         let quit_key = make_nsstring("");
         let quit_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let quit_item: *mut AnyObject = msg_send![quit_item, initWithTitle: quit_title, action: sel!(handleQuit:), keyEquivalent: quit_key];
         CFRelease(quit_title as *const c_void);
         CFRelease(quit_key as *const c_void);
-        let _: () = msg_send![quit_item, setTarget: quit_target];
+        let _: () = msg_send![quit_item, setTarget: menu_target];
         let _: () = msg_send![menu, addItem: quit_item];
+
+        // Store toggle item for title updates
+        *THEME_STATE.lock().unwrap() = Some(MenuState { item: toggle_item, is_dark: true });
 
         let _: () = msg_send![status_item, setMenu: menu];
 
@@ -234,6 +284,72 @@ fn init_app() {
     }
 }
 
+fn c(hex: u32) -> Hsla { rgb(hex).into() }
+fn ca(hex: u32) -> Hsla { rgba(hex).into() }
+
+struct Colors {
+    page_bg: Hsla,
+    hint_bg: Hsla,
+    hint_text: Hsla,
+    hint_subtext: Hsla,
+    status_bar_bg: Hsla,
+    status_bar_text: Hsla,
+    card_bg: Hsla,
+    card_bg_sel: Hsla,
+    card_border_sel: Hsla,
+    card_border: Hsla,
+    icon_bg: Hsla,
+    icon_inner_bg: Hsla,
+    icon_text: Hsla,
+    app_name: Hsla,
+    win_title: Hsla,
+}
+
+fn dark_colors() -> Colors {
+    Colors {
+        page_bg: c(0x1e1e2e),
+        hint_bg: c(0x1c1c1e),
+        hint_text: c(0x888888),
+        hint_subtext: c(0x666666),
+        status_bar_bg: c(0x161622),
+        status_bar_text: c(0x999999),
+        card_bg: c(0x2a2a3a),
+        card_bg_sel: c(0x3a3a5a),
+        card_border_sel: c(0x5a5a8a),
+        card_border: ca(0x00000000),
+        icon_bg: c(0x222233),
+        icon_inner_bg: c(0x3a3a5a),
+        icon_text: c(0xaaaacc),
+        app_name: c(0xdddddd),
+        win_title: c(0x888888),
+    }
+}
+
+fn light_colors() -> Colors {
+    Colors {
+        page_bg: c(0xf0f0f5),
+        hint_bg: c(0xe8e8ed),
+        hint_text: c(0x666666),
+        hint_subtext: c(0x999999),
+        status_bar_bg: c(0xd8d8e0),
+        status_bar_text: c(0x555555),
+        card_bg: c(0xffffff),
+        card_bg_sel: c(0xd0d8f0),
+        card_border_sel: c(0x5577bb),
+        card_border: ca(0x00000000),
+        icon_bg: c(0xececf2),
+        icon_inner_bg: c(0xd0d0e8),
+        icon_text: c(0x7777aa),
+        app_name: c(0x222222),
+        win_title: c(0x666666),
+    }
+}
+
+fn current_colors() -> Colors {
+    let is_dark = THEME_STATE.lock().unwrap().as_ref().map_or(true, |s| s.is_dark);
+    if is_dark { dark_colors() } else { light_colors() }
+}
+
 fn hit_test_card(mx: f32, my: f32, total_cards: usize) -> Option<usize> {
     let cards_per_row: usize = 5;
     let card_w: f32 = 160.0;
@@ -260,14 +376,15 @@ fn hit_test_card(mx: f32, my: f32, total_cards: usize) -> Option<usize> {
 impl Render for OverlayView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
+        let c = current_colors();
 
         if !state.visible {
             let hint: &str = if has_accessibility_permission() { "Hold Option + Tab to switch" } else { "Need Accessibility permission" };
             return div()
                 .size_full().flex().flex_col().items_center().justify_center().gap(px(4.))
-                .bg(rgb(0x1c1c1e)).text_color(rgb(0x888888)).text_sm()
+                .bg(c.hint_bg).text_color(c.hint_text).text_sm()
                 .child(hint)
-                .child(div().text_xs().text_color(rgb(0x666666)).child(format!("PID: {} | Perm: {}", std::process::id(), has_accessibility_permission())))
+                .child(div().text_xs().text_color(c.hint_subtext).child(format!("PID: {} | Perm: {}", std::process::id(), has_accessibility_permission())))
                 .into_any();
         }
 
@@ -288,16 +405,16 @@ impl Render for OverlayView {
                 let window_id = w.window_id;
                 let window_title = w.window_title.clone();
                 let icon_div: Div = if let Some(ref icon_path) = w.icon_path {
-                    div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
+                    div().h(px(80.)).flex().items_center().justify_center().bg(c.icon_bg)
                         .child(img(std::path::PathBuf::from(icon_path.clone())).max_w(px(64.)).max_h(px(64.)))
                 } else {
-                    div().h(px(80.)).flex().items_center().justify_center().bg(rgb(0x222233))
-                        .child(div().w(px(40.)).h(px(40.)).rounded_md().bg(rgb(0x3a3a5a)).flex().items_center().justify_center()
-                            .text_lg().font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xaaaacc)).child(init.clone()))
+                    div().h(px(80.)).flex().items_center().justify_center().bg(c.icon_bg)
+                        .child(div().w(px(40.)).h(px(40.)).rounded_md().bg(c.icon_inner_bg).flex().items_center().justify_center()
+                            .text_lg().font_weight(FontWeight::SEMIBOLD).text_color(c.icon_text).child(init.clone()))
                 };
                 div().w(px(160.)).rounded_md().border_2()
-                    .border_color(if is_sel { rgb(0x5a5a8a) } else { rgba(0x00000000) })
-                    .bg(if is_sel { rgb(0x3a3a5a) } else { rgb(0x2a2a3a) })
+                    .border_color(if is_sel { c.card_border_sel } else { c.card_border })
+                    .bg(if is_sel { c.card_bg_sel } else { c.card_bg })
                     .flex().flex_col().overflow_hidden().flex_shrink_0()
                     .id(i)
                     .on_hover({
@@ -328,16 +445,16 @@ impl Render for OverlayView {
                     })
                     .child(icon_div)
                     .child(div().px(px(10.)).py(px(8.))
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(rgb(0xdddddd)).overflow_hidden().whitespace_nowrap().child(w.app_name.clone()))
-                        .child(div().text_xs().text_color(rgb(0x888888)).mt(px(2.)).overflow_hidden().whitespace_nowrap().child(w.window_title.clone())))
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(c.app_name).overflow_hidden().whitespace_nowrap().child(w.app_name.clone()))
+                        .child(div().text_xs().text_color(c.win_title).mt(px(2.)).overflow_hidden().whitespace_nowrap().child(w.window_title.clone())))
                     .into_any()
             }).collect()
         };
 
         div()
-            .size_full().flex().flex_col().bg(rgb(0x1e1e2e))
+            .size_full().flex().flex_col().bg(c.page_bg)
             .child(div().grid().grid_cols(5).justify_center().gap(px(10.)).p(px(20.)).size_full().children(cards))
-            .child(div().h(px(36.)).w_full().bg(rgb(0x161622)).flex().items_center().justify_center().text_sm().text_color(rgb(0x999999)).child(status))
+            .child(div().h(px(36.)).w_full().bg(c.status_bar_bg).flex().items_center().justify_center().text_sm().text_color(c.status_bar_text).child(status))
             .into_any()
     }
 }
@@ -374,6 +491,7 @@ fn main() {
         configure_borderless();
         init_app();
         hide_window();
+        STATUS_EVENT_TX.set(event_tx.clone()).ok();
         setup_status_bar();
 
         {
@@ -431,6 +549,9 @@ fn main() {
                                         }
                                         state.visible = false;
                                     }
+                                }
+                                GlobalEvent::ThemeToggled => {
+                                    // theme state already updated, just need re-render
                                 }
                             }
                             cx.notify();
