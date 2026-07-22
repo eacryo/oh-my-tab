@@ -16,8 +16,12 @@ pub struct WindowInfo {
 
 pub type MruMap = HashMap<u32, Instant>;
 
-const ICON_CACHE_DIR: &str = "/tmp/oh-my-tab-icons";
 const ICON_CACHE_TTL_SECS: u64 = 3600;
+
+fn icon_cache_dir() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    format!("{}/Library/Caches/oh-my-tab-icons", home)
+}
 
 const K_C_G_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
 
@@ -101,11 +105,11 @@ fn cf_dict_get_u32(dict: *const c_void, key: &str) -> Option<u32> {
 }
 
 pub fn ensure_icon_cache_dir() {
-    let _ = std::fs::create_dir_all(ICON_CACHE_DIR);
+    let _ = std::fs::create_dir_all(icon_cache_dir());
 }
 
 pub fn check_icon_cache(pid: i32) -> Option<String> {
-    let path = format!("{}/{}.png", ICON_CACHE_DIR, pid);
+    let path = format!("{}/{}.png", icon_cache_dir(), pid);
     let meta = std::fs::metadata(&path).ok()?;
     let age = meta.modified().ok()?.elapsed().ok()?;
     if age.as_secs() < ICON_CACHE_TTL_SECS {
@@ -117,7 +121,7 @@ pub fn check_icon_cache(pid: i32) -> Option<String> {
 
 fn write_png_to_cache(png: *mut AnyObject, pid: i32) -> Option<String> {
     unsafe {
-        let path = format!("{}/{}.png", ICON_CACHE_DIR, pid);
+        let path = format!("{}/{}.png", icon_cache_dir(), pid);
         let path_cstr = std::ffi::CString::new(&*path).unwrap();
         let cf_path = CFStringCreateWithCString(std::ptr::null(), path_cstr.as_ptr(), 0x08000100);
         let ok: bool = msg_send![png, writeToFile: cf_path as *mut AnyObject, atomically: false];
