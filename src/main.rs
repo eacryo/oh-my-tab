@@ -61,7 +61,7 @@ extern "C" fn handle_toggle_theme(_self: *mut c_void, _cmd: Sel, _sender: *mut c
     let mut state = THEME_STATE.lock().unwrap();
     if let Some(ref mut s) = *state {
         s.is_dark = !s.is_dark;
-        let new_label = if s.is_dark { "切换浅色" } else { "切换深色" };
+        let new_label = if s.is_dark { "切换浅色" } else { "切换深色" }; // dark→浅色, light→深色
         println!(
             "[oh-my-tab] Toggled theme to {}",
             if s.is_dark { "dark" } else { "light" }
@@ -125,8 +125,8 @@ fn setup_status_bar() {
         };
         let menu_target: *mut AnyObject = msg_send![action_cls as *const AnyObject, new];
 
-        // Toggle theme item
-        let toggle_title = make_nsstring("切换浅色");
+        // Toggle theme item (light by default)
+        let toggle_title = make_nsstring("切换深色");
         let toggle_key = make_nsstring("");
         let toggle_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let toggle_item: *mut AnyObject = msg_send![toggle_item, initWithTitle: toggle_title, action: sel!(handleToggleTheme:), keyEquivalent: toggle_key];
@@ -150,7 +150,7 @@ fn setup_status_bar() {
         let _: () = msg_send![menu, addItem: quit_item];
 
         // Store toggle item for title updates
-        *THEME_STATE.lock().unwrap() = Some(MenuState { item: toggle_item, is_dark: true });
+        *THEME_STATE.lock().unwrap() = Some(MenuState { item: toggle_item, is_dark: false });
 
         let _: () = msg_send![status_item, setMenu: menu];
 
@@ -231,21 +231,29 @@ fn configure_borderless() {
         let count: usize = msg_send![windows, count];
         if count == 0 { return; }
         let window: *mut AnyObject = msg_send![windows, objectAtIndex: 0u64];
+
+        // Borderless + full size content
         let current_style: usize = msg_send![window, styleMask];
         let new_style = (current_style & !(1usize | (1 << 1) | (1 << 2))) | (1 << 15);
         let _: () = msg_send![window, setStyleMask: new_style];
 
-        // Rounded corners
+        // Clear background for blur
         let _: () = msg_send![window, setOpaque: false];
         let clear_color: *mut AnyObject = msg_send![class!(NSColor), clearColor];
         let _: () = msg_send![window, setBackgroundColor: clear_color];
+
+        // Rounded corners + non-opaque layer for transparency
         let content_view: *mut AnyObject = msg_send![window, contentView];
         let _: () = msg_send![content_view, setWantsLayer: true];
         let layer: *mut AnyObject = msg_send![content_view, layer];
+        let _: () = msg_send![layer, setOpaque: false];
         let _: () = msg_send![layer, setCornerRadius: 12.0f64];
         let _: () = msg_send![layer, setMasksToBounds: true];
     }
 }
+
+// 存 NSVisualEffectView 指针，用于复用时检查
+static mut EFFECT_VIEW: *mut AnyObject = std::ptr::null_mut();
 
 fn show_window() {
     unsafe {
@@ -255,6 +263,41 @@ fn show_window() {
         let count: usize = msg_send![windows, count];
         if count == 0 { return; }
         let window: *mut AnyObject = msg_send![windows, objectAtIndex: 0u64];
+
+        // NSVisualEffectView for liquid glass blur, behind GPUI content
+        let content_view: *mut AnyObject = msg_send![window, contentView];
+        if EFFECT_VIEW.is_null() {
+            let vis_effect: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+            let frame: objc2_foundation::NSRect = msg_send![content_view, bounds];
+            let vis_effect: *mut AnyObject = msg_send![vis_effect, initWithFrame: frame];
+            let _: () = msg_send![vis_effect, setAutoresizingMask: 3usize];
+            let _: () = msg_send![vis_effect, setMaterial: 5usize]; // NSVisualEffectMaterialMenu
+            let _: () = msg_send![vis_effect, setBlendingMode: 0usize]; // BehindWindow
+            let _: () = msg_send![vis_effect, setState: 1usize]; // Active
+            let _: () = msg_send![content_view, addSubview: vis_effect];
+            EFFECT_VIEW = vis_effect;
+        }
+        // Re-send to back so it stays behind GPUI views
+        if !EFFECT_VIEW.is_null() {
+            let _: () = msg_send![content_view, addSubview: EFFECT_VIEW, positioned: -1isize, relativeTo: std::ptr::null::<AnyObject>()];
+        }
+
+        // Ensure all subviews render with alpha for blur to show through
+        let subviews: *mut AnyObject = msg_send![content_view, subviews];
+        if !subviews.is_null() {
+            let sv_count: usize = msg_send![subviews, count];
+            for i in 0..sv_count {
+                let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
+                if !sv.is_null() {
+                    let _: () = msg_send![sv, setWantsLayer: true];
+                    let sv_layer: *mut AnyObject = msg_send![sv, layer];
+                    if !sv_layer.is_null() {
+                        let _: () = msg_send![sv_layer, setOpaque: false];
+                    }
+                }
+            }
+        }
+
         let selector = sel!(orderFront:);
         extern "C" { fn objc_msgSend(); }
         type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
@@ -268,11 +311,10 @@ fn activate_pid(pid: i32) {
         let cls = class!(NSRunningApplication);
         let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
         if !app.is_null() {
-            let selector = sel!(activateWithOptions:);
-            extern "C" { fn objc_msgSend(); }
-            type F = unsafe extern "C" fn(*mut c_void, Sel, isize);
-            let f: F = transmute(objc_msgSend as *const ());
-            f(app as *mut c_void, selector, 1);
+            // NSApplicationActivateIgnoringOtherApps = 1
+            let _: bool = msg_send![app, activateWithOptions: 1usize];
+        } else {
+            eprintln!("[oh-my-tab] activate_pid: no running app for pid {}", pid);
         }
     }
 }
@@ -306,19 +348,20 @@ struct Colors {
 }
 
 fn dark_colors() -> Colors {
+    // 深色主题：~70% 不透明度，让模糊透过来
     Colors {
-        page_bg: c(0x1e1e2e),
-        hint_bg: c(0x1c1c1e),
+        page_bg: rgba(0x1e1e2eb3).into(),
+        hint_bg: rgba(0x1c1c1eb3).into(),
         hint_text: c(0x888888),
         hint_subtext: c(0x666666),
-        status_bar_bg: c(0x161622),
+        status_bar_bg: rgba(0x161622b3).into(),
         status_bar_text: c(0x999999),
-        card_bg: c(0x2a2a3a),
-        card_bg_sel: c(0x3a3a5a),
+        card_bg: rgba(0x2a2a3ab3).into(),
+        card_bg_sel: rgba(0x3a3a5ab3).into(),
         card_border_sel: c(0x5a5a8a),
         card_border: ca(0x00000000),
-        icon_bg: c(0x222233),
-        icon_inner_bg: c(0x3a3a5a),
+        icon_bg: rgba(0x222233b3).into(),
+        icon_inner_bg: rgba(0x3a3a5ab3).into(),
         icon_text: c(0xaaaacc),
         app_name: c(0xdddddd),
         win_title: c(0x888888),
@@ -326,27 +369,28 @@ fn dark_colors() -> Colors {
 }
 
 fn light_colors() -> Colors {
+    // 浅色主题：~70% 不透明度，匹配原生 Command+Tab 的毛玻璃质感
     Colors {
-        page_bg: c(0xf0f0f5),
-        hint_bg: c(0xe8e8ed),
+        page_bg: rgba(0xe8e8edb3).into(),
+        hint_bg: rgba(0xe0e0e5b3).into(),
         hint_text: c(0x666666),
         hint_subtext: c(0x999999),
-        status_bar_bg: c(0xd8d8e0),
+        status_bar_bg: rgba(0xd8d8e0b3).into(),
         status_bar_text: c(0x555555),
-        card_bg: c(0xffffff),
-        card_bg_sel: c(0xd0d8f0),
-        card_border_sel: c(0x5577bb),
+        card_bg: rgba(0xfafafab3).into(),
+        card_bg_sel: rgba(0xffffffb3).into(),
+        card_border_sel: c(0x8888bb),
         card_border: ca(0x00000000),
-        icon_bg: c(0xececf2),
-        icon_inner_bg: c(0xd0d0e8),
-        icon_text: c(0x7777aa),
+        icon_bg: rgba(0xe0e0e8b3).into(),
+        icon_inner_bg: rgba(0xc8c8d8b3).into(),
+        icon_text: c(0x666688),
         app_name: c(0x222222),
         win_title: c(0x666666),
     }
 }
 
 fn current_colors() -> Colors {
-    let is_dark = THEME_STATE.lock().unwrap().as_ref().map_or(true, |s| s.is_dark);
+    let is_dark = THEME_STATE.lock().unwrap().as_ref().map_or(false, |s| s.is_dark);
     if is_dark { dark_colors() } else { light_colors() }
 }
 
@@ -507,7 +551,7 @@ fn main() {
         let init_count = state_entity.read(cx).windows.len();
         let bounds = Bounds::centered(None, size(px(1050.), window_height(init_count)), cx);
         let window_handle = cx.open_window(
-            WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), focus: true, kind: WindowKind::PopUp, ..Default::default() },
+            WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), focus: true, kind: WindowKind::PopUp, window_background: WindowBackgroundAppearance::Transparent, ..Default::default() },
             |_window, cx| {
                 let se = state_entity.clone();
                 cx.new(|cx| {
@@ -573,10 +617,13 @@ fn main() {
                                             let wid = w.window_id;
                                             let pw = w.pid;
                                             let wt = w.window_title.clone();
+                                            println!("[oh-my-tab] CmdReleased: switching to '{}' (pid={})", w.app_name, pw);
                                             raise_ax_window(pw, &wt);
                                             activate_pid(pw);
                                             hide_window();
                                             state.mru.insert(wid, std::time::Instant::now());
+                                        } else {
+                                            eprintln!("[oh-my-tab] CmdReleased: selected index {} out of bounds (windows={})", state.selected, state.windows.len());
                                         }
                                         state.visible = false;
                                     }

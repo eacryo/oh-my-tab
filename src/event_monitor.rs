@@ -1,5 +1,6 @@
 use flume::Sender;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 #[derive(Debug, Clone, Copy)]
@@ -56,7 +57,11 @@ extern "C" {
     static kCFRunLoopDefaultMode: CFStringRef;
 }
 
-type CGEventTapCallBack = Option<
+// 标记是否已经发送过 CmdTabPressed，防止修饰键变化时误发 CmdReleased
+// Tracks whether CmdTabPressed was sent, to avoid spurious CmdReleased
+static TAB_PRESSED: AtomicBool = AtomicBool::new(false);
+
+type CGEventTapCallBack =Option<
     unsafe extern "C" fn(
         proxy: CGEventTapProxy,
         event_type: CGEventType,
@@ -80,13 +85,14 @@ unsafe extern "C" fn event_tap_callback(
             let flags = CGEventGetFlags(event);
 
             if keycode == K_VK_TAB && (flags & K_CG_EVENT_FLAG_MASK_COMMAND) != 0 {
+                TAB_PRESSED.store(true, Ordering::SeqCst);
                 let _ = sender.send(GlobalEvent::CmdTabPressed);
                 return std::ptr::null_mut();
             }
         }
         K_CG_EVENT_FLAGS_CHANGED => {
             let flags = CGEventGetFlags(event);
-            if (flags & K_CG_EVENT_FLAG_MASK_COMMAND) == 0 {
+            if (flags & K_CG_EVENT_FLAG_MASK_COMMAND) == 0 && TAB_PRESSED.swap(false, Ordering::SeqCst) {
                 let _ = sender.send(GlobalEvent::CmdReleased);
             }
         }
