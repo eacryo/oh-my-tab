@@ -8,7 +8,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CString};
 use std::sync::{LazyLock, Mutex};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use window_collector::{
@@ -177,6 +177,9 @@ static THEME_STATE: Mutex<Option<MenuState>> = Mutex::new(None);
 static SHORTCUT_ITEM: Mutex<Option<ShortcutState>> = Mutex::new(None);
 static STATUS_EVENT_TX: std::sync::OnceLock<flume::Sender<GlobalEvent>> =
     std::sync::OnceLock::new();
+/// Prevents hover-selection on the card under the cursor when the window first
+/// opens. Set to false in show_overlay(), flipped to true on first mouseMoved:.
+static MOUSE_MOVED: AtomicBool = AtomicBool::new(false);
 
 // ========== Helper Functions ==========
 
@@ -432,6 +435,11 @@ extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void
 }
 
 extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    // Ignore hover until the user has moved the mouse at least once.
+    // Prevents selecting the card under the cursor when the window first opens.
+    if !MOUSE_MOVED.load(Ordering::Relaxed) {
+        return;
+    }
     let idx = get_card_index(_self as *mut AnyObject);
     let mut state_opt = TAB_STATE.lock().unwrap();
     let state = state_opt.as_mut().unwrap();
@@ -501,6 +509,10 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
 
 extern "C" fn container_accepts_first_responder(_self: *mut c_void, _cmd: Sel) -> bool {
     true
+}
+
+extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    MOUSE_MOVED.store(true, Ordering::Relaxed);
 }
 
 // ========== Status Bar Menu Handlers ==========
@@ -909,6 +921,11 @@ fn show_overlay() {
         // window frame changes. Just update the container explicitly.
         let _: () = msg_send![container, setFrameSize: NSSize::new(WINDOW_W, h)];
 
+        // Ignore initial mouse position — require a real mouse movement before
+        // hover-selection kicks in (matches native Cmd+Tab behaviour).
+        MOUSE_MOVED.store(false, Ordering::Relaxed);
+        let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
+
         // Activate and show window
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
@@ -1066,6 +1083,12 @@ fn create_overlay_window() -> *mut AnyObject {
                 sel!(acceptsFirstResponder),
                 container_accepts_first_responder as *mut c_void,
                 types_bool.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseMoved:),
+                container_mouse_moved as *mut c_void,
+                types_v_obj.as_ptr(),
             );
             objc_registerClassPair(cls);
             cls
