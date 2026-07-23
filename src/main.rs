@@ -64,16 +64,16 @@ const KEY_RETURN: u16 = 36;
 
 // ========== Layout Constants ==========
 
-const CARD_W: f64 = 160.0;
-const CARD_H: f64 = 200.0;
-const CARD_GAP: f64 = 10.0;
+const CARD_W: f64 = 140.0;
+const CARD_H: f64 = 180.0;
+const CARD_GAP: f64 = 0.0;
 const CARDS_PER_ROW: usize = 6;
 const STATUS_H: f64 = 36.0;
-const WINDOW_W: f64 = 1050.0;
+const H_PADDING: f64 = 32.0; // horizontal padding inside the window
 //窗口圆角
 const CORNER_RADIUS: f64 = 64.0;
-const IMG_SIZE: f64 = 128.0;
-const LETTER_SIZE: f64 = 64.0;
+const IMG_SIZE: f64 = 110.0;
+const LETTER_SIZE: f64 = 55.0;
 
 // ========== Types ==========
 
@@ -295,6 +295,12 @@ fn current_colors() -> Colors {
 fn window_height(count: usize) -> f64 {
     let rows = (count.max(1) + CARDS_PER_ROW - 1) / CARDS_PER_ROW;
     32.0 + rows as f64 * CARD_H + STATUS_H
+}
+
+fn window_width(cards_in_row: usize) -> f64 {
+    cards_in_row as f64 * CARD_W
+        + (cards_in_row.saturating_sub(1)) as f64 * CARD_GAP
+        + H_PADDING * 2.0
 }
 
 /// Read the card index from the card index map (keyed by view pointer).
@@ -617,7 +623,13 @@ fn update_status_label() {
         let _: () = msg_send![status_label, sizeToFit];
         let fitted: NSRect = msg_send![status_label, frame];
         let stat_w = fitted.size.width;
-        let stat_x = ((WINDOW_W - stat_w) / 2.0).max(0.0);
+        let container_w = {
+            let container = CONTAINER.lock().unwrap();
+            let c = container.unwrap().0;
+            let f: NSRect = msg_send![c, frame];
+            f.size.width
+        };
+        let stat_x = ((container_w - stat_w) / 2.0).max(0.0);
         let _: () = msg_send![status_label, setFrame: NSRect::new(NSPoint::new(stat_x, 0.0), NSSize::new(stat_w, STATUS_H))];
     }
 }
@@ -881,9 +893,10 @@ fn show_overlay() {
         clear_card_indices();
         let h = window_height(count);
         let cards_in_row = CARDS_PER_ROW.min(count);
+        let w = window_width(cards_in_row);
         let row_width = cards_in_row as f64 * CARD_W
             + (cards_in_row.saturating_sub(1)) as f64 * CARD_GAP;
-        let start_x = (WINDOW_W - row_width) / 2.0;
+        let start_x = (w - row_width) / 2.0;
 
         for (idx, w) in windows.iter().enumerate() {
             let card = create_card_view(w, idx);
@@ -908,18 +921,18 @@ fn show_overlay() {
         // Resize window (h computed above)
         let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
         let screen_frame: NSRect = msg_send![screen, frame];
-        let x = (screen_frame.size.width - WINDOW_W) / 2.0 + screen_frame.origin.x;
+        let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
         let new_frame = NSRect::new(
             NSPoint::new(x, y),
-            NSSize::new(WINDOW_W, h),
+            NSSize::new(w, h),
         );
         let _: () = msg_send![window, setFrame: new_frame, display: true];
 
         // wrapper / VFX view / container all have autoresizingMask = 18
         // (width + height sizable), so they resize automatically when the
         // window frame changes. Just update the container explicitly.
-        let _: () = msg_send![container, setFrameSize: NSSize::new(WINDOW_W, h)];
+        let _: () = msg_send![container, setFrameSize: NSSize::new(w, h)];
 
         // Ignore initial mouse position — require a real mouse movement before
         // hover-selection kicks in (matches native Cmd+Tab behaviour).
@@ -971,11 +984,12 @@ fn create_overlay_window() -> *mut AnyObject {
         let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
         let screen_frame: NSRect = msg_send![screen, frame];
         let h = window_height(6); // initial reasonable default
-        let x = (screen_frame.size.width - WINDOW_W) / 2.0 + screen_frame.origin.x;
+        let w = window_width(CARDS_PER_ROW); // max possible width
+        let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
         let frame = NSRect::new(
             NSPoint::new(x, y),
-            NSSize::new(WINDOW_W, h),
+            NSSize::new(w, h),
         );
 
         // Use standard NSWindow with hidden title bar (avoids dynamic-subclass
@@ -1027,7 +1041,7 @@ fn create_overlay_window() -> *mut AnyObject {
         if is_macos_26 {
             let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
             let glass: *mut AnyObject = msg_send![glass_cls, alloc];
-            let glass: *mut AnyObject = msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, h))];
+            let glass: *mut AnyObject = msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
             // (4) Corner radius — native NSGlassEffectView property, no layer hacks.
             let _: () = msg_send![glass, setCornerRadius: CORNER_RADIUS];
             // (5) Glass style — controls the visual weight / opacity of the glass.
@@ -1047,14 +1061,14 @@ fn create_overlay_window() -> *mut AnyObject {
             let _: () = msg_send![window, setContentView: glass];
             // NSGlassEffectView.contentView may be nil initially — create our own.
             let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
-            let inner: *mut AnyObject = msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, h))];
+            let inner: *mut AnyObject = msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
             let _: () = msg_send![inner, setAutoresizingMask: 18u64];
             let _: () = msg_send![glass, setContentView: inner];
             content_parent = inner;
         } else {
             let content: *mut AnyObject = msg_send![window, contentView];
             let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-            let ve: *mut AnyObject = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, h))];
+            let ve: *mut AnyObject = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
             // withinWindow blending + Dark material (same as the GPUI version used)
             let _: () = msg_send![ve, setBlendingMode: 1u64];  // WithinWindow
             let _: () = msg_send![ve, setMaterial: 12u64];      // Dark
@@ -1095,7 +1109,7 @@ fn create_overlay_window() -> *mut AnyObject {
         };
 
         let container: *mut AnyObject = msg_send![container_cls, alloc];
-        let container: *mut AnyObject = msg_send![container, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, h))];
+        let container: *mut AnyObject = msg_send![container, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
         let _: () = msg_send![container, setAutoresizingMask: 18u64];
         let _: () = msg_send![content_parent, addSubview: container];
         *CONTAINER.lock().unwrap() = Some(ObjPtr(container));
@@ -1104,7 +1118,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let status_font: *mut AnyObject =
             msg_send![class!(NSFont), systemFontOfSize: 13.0f64, weight: 0.23f64];
         let status_color = hex_to_ns_color(0x999999ff);
-        let status_label = make_centered_label("", status_font, status_color, 0.0, WINDOW_W, STATUS_H);
+        let status_label = make_centered_label("", status_font, status_color, 0.0, w, STATUS_H);
         let _: () = msg_send![container, addSubview: status_label];
         *STATUS_LABEL.lock().unwrap() = Some(ObjPtr(status_label));
 
