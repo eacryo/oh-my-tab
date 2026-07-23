@@ -586,10 +586,7 @@ fn update_status_label() {
         let selected = state.selected;
         // status_text 是窗口下面那一行长的应用名称
         let status_text = match state.windows.get(selected) {
-            Some(w) if !w.window_title.is_empty() => {
-                truncate_text(&format!("{} — {}", w.app_name, w.window_title), 126)
-            }
-            Some(w) => truncate_text(&w.app_name, 126),
+            Some(w) => truncate_text(&w.window_title, 126),
             None => String::new(),
         };
         drop(state_opt);
