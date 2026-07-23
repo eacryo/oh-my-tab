@@ -3,7 +3,7 @@ mod event_monitor;
 
 use flume;
 use objc2::{class, msg_send, sel};
-use objc2::runtime::{AnyObject, Sel};
+use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CString};
@@ -70,7 +70,8 @@ const CARD_GAP: f64 = 10.0;
 const CARDS_PER_ROW: usize = 6;
 const STATUS_H: f64 = 36.0;
 const WINDOW_W: f64 = 1050.0;
-const CORNER_RADIUS: f64 = 28.0;
+//窗口圆角
+const CORNER_RADIUS: f64 = 64.0;
 const IMG_SIZE: f64 = 128.0;
 const LETTER_SIZE: f64 = 64.0;
 
@@ -264,14 +265,14 @@ fn light_colors() -> Colors {
         hint_text: 0x666666ff,
         hint_subtext: 0x999999ff,
         status_bar_bg: 0x00000000,
-        status_bar_text: 0x555555ff,
+        status_bar_text: 0x333333ff,
         card_bg: 0x00000000,
         card_bg_sel: 0xffffff66,
         card_border_sel: 0x5577ccff,
         icon_inner_bg: 0xd0d0e066,
         icon_text: 0x666688ff,
         app_name: 0x1a1a1aff,
-        win_title: 0x555555ff,
+        win_title: 0x333333ff,
     }
 }
 
@@ -593,7 +594,7 @@ fn update_status_label() {
 
         let colors = current_colors();
         let status_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+            msg_send![class!(NSFont), systemFontOfSize: 13.0f64, weight: 0.23f64];
         let status_color = hex_to_ns_color(colors.status_bar_text);
         let ns_stat = make_nsstring(&status_text);
         let _: () = msg_send![status_label, setStringValue: ns_stat];
@@ -816,7 +817,7 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
         let _: () = msg_send![view, addSubview: name_label];
 
         // --- Window title label ---
-        let title_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
+        let title_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64, weight: 0.23f64];
         let win_color = hex_to_ns_color(colors.win_title);
         let title_label = make_centered_label(
             &truncate_text(&w.window_title, 20), title_font, win_color,
@@ -903,13 +904,9 @@ fn show_overlay() {
         );
         let _: () = msg_send![window, setFrame: new_frame, display: true];
 
-        // Update visual effect view to fill window
-        let content: *mut AnyObject = msg_send![window, contentView];
-        let content_sv: *mut AnyObject = msg_send![content, subviews];
-        let ve: *mut AnyObject = msg_send![content_sv, objectAtIndex: 0u64];
-        let _: () = msg_send![ve, setFrameSize: NSSize::new(WINDOW_W, h)];
-
-        // Update container frame
+        // wrapper / VFX view / container all have autoresizingMask = 18
+        // (width + height sizable), so they resize automatically when the
+        // window frame changes. Just update the container explicitly.
         let _: () = msg_send![container, setFrameSize: NSSize::new(WINDOW_W, h)];
 
         // Activate and show window
@@ -979,35 +976,76 @@ fn create_overlay_window() -> *mut AnyObject {
 
         // NSFloatingWindowLevel = 3 (should be above normal windows during app switch)
         let _: () = msg_send![window, setLevel: 3u64];
+
+        // ========== Window transparency / Liquid Glass settings ==========
+        //
+        // (1) Window must be non-opaque so the compositor allows content
+        //     behind the window to show through.
         let _: () = msg_send![window, setOpaque: false];
+        //
+        // (2) Window background must be clear, otherwise NSThemeFrame draws
+        //     a solid color that blocks everything behind it.
+        let clear_color: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+        let _: () = msg_send![window, setBackgroundColor: clear_color];
+        //
+        // (3) Window shadow — setting hasShadow true with a non-opaque
+        //     window gives the floating glass look.
         let _: () = msg_send![window, setHasShadow: true];
+        // =================================================================
+
         let _: () = msg_send![window, setReleasedWhenClosed: false];
         // Don't let the window hide on deactivate (we manage show/hide)
         let _: () = msg_send![window, setHidesOnDeactivate: false];
 
-        // Transparent background
-        let clear_color: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-        let _: () = msg_send![window, setBackgroundColor: clear_color];
+        // --- Liquid Glass ---
+        // macOS 26+  → NSGlassEffectView  (new public API, built-in blur)
+        // macOS <26 → NSVisualEffectView  (withinWindow + Dark material)
+        let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
 
-        // Content view: rounded corners + masksToBounds
-        let content: *mut AnyObject = msg_send![window, contentView];
-        let _: () = msg_send![content, setWantsLayer: true];
-        let cl: *mut AnyObject = msg_send![content, layer];
-        let _: () = msg_send![cl, setCornerRadius: CORNER_RADIUS];
-        let _: () = msg_send![cl, setMasksToBounds: true];
+        // The view that will contain the card container.
+        // On macOS 26 this is the glass view's inner contentView;
+        // on older macOS it's the NSVisualEffectView itself.
+        let content_parent: *mut AnyObject;
 
-        // --- NSVisualEffectView for liquid glass blur ---
-        let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-        let ve: *mut AnyObject = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, h))];
-        // blendingMode = 0: NSVisualEffectBlendingModeBehindWindow
-        let _: () = msg_send![ve, setBlendingMode: 0u64];
-        // material = 4: NSVisualEffectMaterialFullScreenUI (vibrant liquid glass)
-        let _: () = msg_send![ve, setMaterial: 4u64];
-        // state = 1: NSVisualEffectStateActive
-        let _: () = msg_send![ve, setState: 1u64];
-        // Autoresizing: width + height
-        let _: () = msg_send![ve, setAutoresizingMask: 18u64];
-        let _: () = msg_send![content, addSubview: ve];
+        if is_macos_26 {
+            let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
+            let glass: *mut AnyObject = msg_send![glass_cls, alloc];
+            let glass: *mut AnyObject = msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, h))];
+            // (4) Corner radius — native NSGlassEffectView property, no layer hacks.
+            let _: () = msg_send![glass, setCornerRadius: CORNER_RADIUS];
+            // (5) Glass style — controls the visual weight / opacity of the glass.
+            //     0 = Regular (default). Higher values = lighter / more transparent.
+            //     Try 1-3 for progressively more transparent variants.
+            // 设置透明度 1全透明 0透明度很低，这在NSGlassEffectView内部是一个枚举值，只有这两个值可选
+            // 已有人研究过，可以调用私有API https://www.reddit.com/r/SwiftUI/comments/1l86rue/macos_new_nsglasseffectview_in_macos_260_beta_way/
+            let _: () = msg_send![glass, setStyle: 1i64];
+            // (6) Tint color — overlays a subtle color on the glass.
+            //     Very low alpha = more transparent; higher alpha = more solid.
+            //     Currently: nearly-clear tint for maximum transparency.
+            // 设置背景颜色
+            let tint = hex_to_ns_color(0xeeeeee66);
+            let _: () = msg_send![glass, setTintColor: tint];
+            // (7) Autoresizing so the glass view fills the window on resize.
+            let _: () = msg_send![glass, setAutoresizingMask: 18u64];
+            let _: () = msg_send![window, setContentView: glass];
+            // NSGlassEffectView.contentView may be nil initially — create our own.
+            let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let inner: *mut AnyObject = msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, h))];
+            let _: () = msg_send![inner, setAutoresizingMask: 18u64];
+            let _: () = msg_send![glass, setContentView: inner];
+            content_parent = inner;
+        } else {
+            let content: *mut AnyObject = msg_send![window, contentView];
+            let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+            let ve: *mut AnyObject = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, h))];
+            // withinWindow blending + Dark material (same as the GPUI version used)
+            let _: () = msg_send![ve, setBlendingMode: 1u64];  // WithinWindow
+            let _: () = msg_send![ve, setMaterial: 12u64];      // Dark
+            let _: () = msg_send![ve, setState: 1u64];           // Active
+            let _: () = msg_send![ve, setAutoresizingMask: 18u64];
+            let _: () = msg_send![content, addSubview: ve];
+            content_parent = ve;
+        }
 
         // --- Container view for cards ---
         // Register OhMyTabContainerView : NSView
@@ -1036,12 +1074,12 @@ fn create_overlay_window() -> *mut AnyObject {
         let container: *mut AnyObject = msg_send![container_cls, alloc];
         let container: *mut AnyObject = msg_send![container, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, h))];
         let _: () = msg_send![container, setAutoresizingMask: 18u64];
-        let _: () = msg_send![content, addSubview: container];
+        let _: () = msg_send![content_parent, addSubview: container];
         *CONTAINER.lock().unwrap() = Some(ObjPtr(container));
 
         // --- Status label at bottom (standard coords: y=0 is bottom) ---
         let status_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+            msg_send![class!(NSFont), systemFontOfSize: 13.0f64, weight: 0.23f64];
         let status_color = hex_to_ns_color(0x999999ff);
         let status_label = make_centered_label("", status_font, status_color, 0.0, WINDOW_W, STATUS_H);
         let _: () = msg_send![container, addSubview: status_label];
