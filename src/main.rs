@@ -59,6 +59,8 @@ extern "C" {
 const KEY_TAB: u16 = 48;
 const KEY_LEFT: u16 = 123;
 const KEY_RIGHT: u16 = 124;
+const KEY_DOWN: u16 = 125;
+const KEY_UP: u16 = 126;
 const KEY_ESCAPE: u16 = 53;
 const KEY_RETURN: u16 = 36;
 
@@ -489,6 +491,29 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                     drop(state_opt);
                     refresh_highlight();
                     update_status_label();
+                    return;
+                }
+            }
+            KEY_UP => {
+                if !state.windows.is_empty() {
+                    if state.selected >= CARDS_PER_ROW {
+                        state.selected -= CARDS_PER_ROW;
+                        drop(state_opt);
+                        refresh_highlight();
+                        update_status_label();
+                    }
+                    return;
+                }
+            }
+            KEY_DOWN => {
+                if !state.windows.is_empty() {
+                    let new_idx = state.selected + CARDS_PER_ROW;
+                    if new_idx < state.windows.len() {
+                        state.selected = new_idx;
+                        drop(state_opt);
+                        refresh_highlight();
+                        update_status_label();
+                    }
                     return;
                 }
             }
