@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CString};
 use std::mem::transmute;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 struct MenuState {
     item: *mut AnyObject,
@@ -18,6 +19,13 @@ unsafe impl Send for MenuState {}
 unsafe impl Sync for MenuState {}
 
 static THEME_STATE: Mutex<Option<MenuState>> = Mutex::new(None);
+struct ShortcutState {
+    item: *mut AnyObject,
+}
+unsafe impl Send for ShortcutState {}
+unsafe impl Sync for ShortcutState {}
+
+static SHORTCUT_ITEM: Mutex<Option<ShortcutState>> = Mutex::new(None);
 static STATUS_EVENT_TX: std::sync::OnceLock<flume::Sender<GlobalEvent>> = std::sync::OnceLock::new();
 
 #[link(name = "objc", kind = "dylib")]
@@ -54,6 +62,21 @@ extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![nsapp, terminate: std::ptr::null::<AnyObject>()];
+    }
+}
+
+extern "C" fn handle_toggle_shortcut(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    let old = event_monitor::SHORTCUT_IS_CMD.load(Ordering::SeqCst);
+    let is_cmd = !old;
+    event_monitor::SHORTCUT_IS_CMD.store(is_cmd, Ordering::SeqCst);
+    let new_label = if is_cmd { "切换opt+tab" } else { "切换cmd+tab" };
+    println!("[oh-my-tab] Shortcut: {}", if is_cmd { "Cmd+Tab" } else { "Opt+Tab" });
+    if let Some(ref s) = *SHORTCUT_ITEM.lock().unwrap() {
+        unsafe {
+            let ns_title = make_nsstring(new_label);
+            let _: () = msg_send![s.item, setTitle: ns_title];
+            CFRelease(ns_title as *const c_void);
+        }
     }
 }
 
@@ -120,6 +143,7 @@ fn setup_status_bar() {
             let types = CString::new("v@:@").unwrap();
             class_addMethod(cls, sel!(handleQuit:), handle_quit as *mut c_void, types.as_ptr());
             class_addMethod(cls, sel!(handleToggleTheme:), handle_toggle_theme as *mut c_void, types.as_ptr());
+            class_addMethod(cls, sel!(handleToggleShortcut:), handle_toggle_shortcut as *mut c_void, types.as_ptr());
             objc_registerClassPair(cls);
             cls
         };
@@ -134,6 +158,17 @@ fn setup_status_bar() {
         CFRelease(toggle_key as *const c_void);
         let _: () = msg_send![toggle_item, setTarget: menu_target];
         let _: () = msg_send![menu, addItem: toggle_item];
+
+        // Shortcut toggle item (default: Opt+Tab)
+        let shortcut_title = make_nsstring("切换cmd+tab");
+        let shortcut_key = make_nsstring("");
+        let shortcut_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let shortcut_item: *mut AnyObject = msg_send![shortcut_item, initWithTitle: shortcut_title, action: sel!(handleToggleShortcut:), keyEquivalent: shortcut_key];
+        CFRelease(shortcut_title as *const c_void);
+        CFRelease(shortcut_key as *const c_void);
+        let _: () = msg_send![shortcut_item, setTarget: menu_target];
+        let _: () = msg_send![menu, addItem: shortcut_item];
+        *SHORTCUT_ITEM.lock().unwrap() = Some(ShortcutState { item: shortcut_item });
 
         // Separator
         let sep_item: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
@@ -247,13 +282,10 @@ fn configure_borderless() {
         let _: () = msg_send![content_view, setWantsLayer: true];
         let layer: *mut AnyObject = msg_send![content_view, layer];
         let _: () = msg_send![layer, setOpaque: false];
-        let _: () = msg_send![layer, setCornerRadius: 12.0f64];
+        let _: () = msg_send![layer, setCornerRadius: 28.0f64];
         let _: () = msg_send![layer, setMasksToBounds: true];
     }
 }
-
-// 存 NSVisualEffectView 指针，用于复用时检查
-static mut EFFECT_VIEW: *mut AnyObject = std::ptr::null_mut();
 
 fn show_window() {
     unsafe {
@@ -264,38 +296,12 @@ fn show_window() {
         if count == 0 { return; }
         let window: *mut AnyObject = msg_send![windows, objectAtIndex: 0u64];
 
-        // NSVisualEffectView for liquid glass blur, behind GPUI content
+        // 确保 contentView layer 圆角裁剪
         let content_view: *mut AnyObject = msg_send![window, contentView];
-        if EFFECT_VIEW.is_null() {
-            let vis_effect: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-            let frame: objc2_foundation::NSRect = msg_send![content_view, bounds];
-            let vis_effect: *mut AnyObject = msg_send![vis_effect, initWithFrame: frame];
-            let _: () = msg_send![vis_effect, setAutoresizingMask: 3usize];
-            let _: () = msg_send![vis_effect, setMaterial: 5usize]; // NSVisualEffectMaterialMenu
-            let _: () = msg_send![vis_effect, setBlendingMode: 0usize]; // BehindWindow
-            let _: () = msg_send![vis_effect, setState: 1usize]; // Active
-            let _: () = msg_send![content_view, addSubview: vis_effect];
-            EFFECT_VIEW = vis_effect;
-        }
-        // Re-send to back so it stays behind GPUI views
-        if !EFFECT_VIEW.is_null() {
-            let _: () = msg_send![content_view, addSubview: EFFECT_VIEW, positioned: -1isize, relativeTo: std::ptr::null::<AnyObject>()];
-        }
-
-        // Ensure all subviews render with alpha for blur to show through
-        let subviews: *mut AnyObject = msg_send![content_view, subviews];
-        if !subviews.is_null() {
-            let sv_count: usize = msg_send![subviews, count];
-            for i in 0..sv_count {
-                let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-                if !sv.is_null() {
-                    let _: () = msg_send![sv, setWantsLayer: true];
-                    let sv_layer: *mut AnyObject = msg_send![sv, layer];
-                    if !sv_layer.is_null() {
-                        let _: () = msg_send![sv_layer, setOpaque: false];
-                    }
-                }
-            }
+        let cv_layer: *mut AnyObject = msg_send![content_view, layer];
+        if !cv_layer.is_null() {
+            let _: () = msg_send![cv_layer, setCornerRadius: 28.0f64];
+            let _: () = msg_send![cv_layer, setMasksToBounds: true];
         }
 
         let selector = sel!(orderFront:);
@@ -339,8 +345,6 @@ struct Colors {
     card_bg: Hsla,
     card_bg_sel: Hsla,
     card_border_sel: Hsla,
-    card_border: Hsla,
-    icon_bg: Hsla,
     icon_inner_bg: Hsla,
     icon_text: Hsla,
     app_name: Hsla,
@@ -348,44 +352,40 @@ struct Colors {
 }
 
 fn dark_colors() -> Colors {
-    // 深色主题：~70% 不透明度，让模糊透过来
+    // 深色主题：完全透明背景，靠 CGS 模糊提供视觉效果
     Colors {
-        page_bg: rgba(0x1e1e2eb3).into(),
-        hint_bg: rgba(0x1c1c1eb3).into(),
+        page_bg: rgba(0x00000000).into(),
+        hint_bg: rgba(0x00000000).into(),
         hint_text: c(0x888888),
         hint_subtext: c(0x666666),
-        status_bar_bg: rgba(0x161622b3).into(),
+        status_bar_bg: rgba(0x00000000).into(),
         status_bar_text: c(0x999999),
-        card_bg: rgba(0x2a2a3ab3).into(),
-        card_bg_sel: rgba(0x3a3a5ab3).into(),
-        card_border_sel: c(0x5a5a8a),
-        card_border: ca(0x00000000),
-        icon_bg: rgba(0x222233b3).into(),
-        icon_inner_bg: rgba(0x3a3a5ab3).into(),
-        icon_text: c(0xaaaacc),
+        card_bg: rgba(0x00000000).into(),
+        card_bg_sel: rgba(0x22224444).into(),
+        card_border_sel: c(0x5577cc),
+        icon_inner_bg: rgba(0x22224444).into(),
+        icon_text: c(0x9999bb),
         app_name: c(0xdddddd),
         win_title: c(0x888888),
     }
 }
 
 fn light_colors() -> Colors {
-    // 浅色主题：~70% 不透明度，匹配原生 Command+Tab 的毛玻璃质感
+    // 浅色主题：完全透明背景，靠 CGS 模糊提供视觉效果
     Colors {
-        page_bg: rgba(0xe8e8edb3).into(),
-        hint_bg: rgba(0xe0e0e5b3).into(),
+        page_bg: rgba(0x00000000).into(),
+        hint_bg: rgba(0x00000000).into(),
         hint_text: c(0x666666),
         hint_subtext: c(0x999999),
-        status_bar_bg: rgba(0xd8d8e0b3).into(),
+        status_bar_bg: rgba(0x00000000).into(),
         status_bar_text: c(0x555555),
-        card_bg: rgba(0xfafafab3).into(),
-        card_bg_sel: rgba(0xffffffb3).into(),
-        card_border_sel: c(0x8888bb),
-        card_border: ca(0x00000000),
-        icon_bg: rgba(0xe0e0e8b3).into(),
-        icon_inner_bg: rgba(0xc8c8d8b3).into(),
+        card_bg: rgba(0x00000000).into(),
+        card_bg_sel: rgba(0xffffff66).into(),
+        card_border_sel: c(0x5577cc),
+        icon_inner_bg: rgba(0xd0d0e066).into(),
         icon_text: c(0x666688),
-        app_name: c(0x222222),
-        win_title: c(0x666666),
+        app_name: c(0x1a1a1a),
+        win_title: c(0x555555),
     }
 }
 
@@ -430,14 +430,6 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     text.to_string()
 }
 
-fn icon_area_size(count: usize) -> f32 {
-    match count {
-        0..=6 => 144.0,
-        7..=12 => 132.0,
-        13..=18 => 120.0,
-        _ => 112.0,
-    }
-}
 
 impl Render for OverlayView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -445,7 +437,7 @@ impl Render for OverlayView {
         let c = current_colors();
 
         if !state.visible {
-            let hint: &str = if has_accessibility_permission() { "Hold Command + Tab to switch" } else { "Need Accessibility permission" };
+            let hint: &str = if has_accessibility_permission() { "Hold Option + Tab to switch" } else { "Need Accessibility permission" };
             return div()
                 .size_full().flex().flex_col().items_center().justify_center().gap(px(4.))
                 .bg(c.hint_bg).text_color(c.hint_text).text_sm()
@@ -456,8 +448,6 @@ impl Render for OverlayView {
 
         let selected = state.selected;
         let windows = state.windows.clone();
-        let count = windows.len();
-        let icon_sz = icon_area_size(count);
         let img_sz = 128.0;
         let letter_sq = 64.0;
 
@@ -467,6 +457,7 @@ impl Render for OverlayView {
             None => String::new(),
         };
 
+        // ---- 卡片区域 ----
         let cards: Vec<AnyElement> = {
             let state_entity = self.state.clone();
             windows.iter().enumerate().map(|(i, w)| {
@@ -475,20 +466,19 @@ impl Render for OverlayView {
                 let pid = w.pid;
                 let window_id = w.window_id;
                 let window_title = w.window_title.clone();
+                // 图标 / 首字母
                 let icon_div: Div = if let Some(ref icon_path) = w.icon_path {
-                    div().w(px(icon_sz)).h(px(icon_sz)).rounded_md().bg(c.icon_bg)
-                        .flex().items_center().justify_center()
+                    div().flex().items_center().justify_center()
                         .child(img(std::path::PathBuf::from(icon_path.clone())).max_w(px(img_sz)).max_h(px(img_sz)))
                 } else {
-                    div().w(px(icon_sz)).h(px(icon_sz)).rounded_md().bg(c.icon_bg)
-                        .flex().items_center().justify_center()
-                        .child(div().w(px(letter_sq)).h(px(letter_sq)).rounded_md().bg(c.icon_inner_bg).flex().items_center().justify_center()
+                    div().flex().items_center().justify_center()
+                        .child(div().w(px(letter_sq)).h(px(letter_sq)).rounded_xl().bg(c.icon_inner_bg).flex().items_center().justify_center()
                             .text_lg().font_weight(FontWeight::SEMIBOLD).text_color(c.icon_text).child(init.clone()))
                 };
-                div().w(px(160.)).rounded_md().border_2()
-                    .border_color(if is_sel { c.card_border_sel } else { c.card_border })
-                    .bg(if is_sel { c.card_bg_sel } else { c.card_bg })
-                    .flex().flex_col().items_center().gap(px(6.)).pt(px(8.)).pb(px(6.)).overflow_hidden().flex_shrink_0()
+                // 卡片：外层 wrapper 提供外边框 + 内层容器放内容
+                // 不设 bg，让页面背景透过来，避免半透明叠加
+                let inner = div().w(px(160.)).rounded_3xl()
+                    .flex().flex_col().items_center().gap(px(6.)).pt(px(8.)).pb(px(8.)).overflow_hidden().flex_shrink_0()
                     .id(i)
                     .on_hover({
                         let se = state_entity.clone();
@@ -507,9 +497,9 @@ impl Render for OverlayView {
                         let wt = window_title.clone();
                         move |_event: &MouseDownEvent, _window: &mut Window, app: &mut App| {
                             se.update(app, |state, cx| {
-                                raise_ax_window(pid, &wt);
-                                activate_pid(pid);
                                 hide_window();
+                                activate_pid(pid);
+                                raise_ax_window(pid, &wt);
                                 state.visible = false;
                                 state.mru.insert(window_id, std::time::Instant::now());
                                 cx.notify();
@@ -519,14 +509,19 @@ impl Render for OverlayView {
                     .child(icon_div)
                     .child(div().w_full().flex().flex_col().items_center().px(px(8.))
                         .child(div().w_full().text_sm().font_weight(FontWeight::MEDIUM).text_center().text_color(c.app_name).whitespace_nowrap().child(truncate_text(&w.app_name, 17)))
-                        .child(div().w_full().text_xs().text_center().text_color(c.win_title).mt(px(2.)).whitespace_nowrap().child(truncate_text(&w.window_title, 20))))
+                        .child(div().w_full().text_xs().text_center().text_color(c.win_title).mt(px(2.)).whitespace_nowrap().child(truncate_text(&w.window_title, 20))));
+                div().rounded_3xl().p(px(3.))
+                    .bg(if is_sel { c.card_border_sel } else { rgba(0x00000000).into() })
+                    .child(inner)
                     .into_any()
             }).collect()
         };
 
+        // ---- 整体布局：顶部高光 + 卡片网格 + 底部状态栏 ----
         div()
             .size_full().flex().flex_col().bg(c.page_bg)
             .child(div().grid().grid_cols(6).justify_center().gap(px(10.)).py(px(16.)).size_full().children(cards))
+            // 底部状态栏
             .child(div().h(px(36.)).w_full().bg(c.status_bar_bg).flex().items_center().px(px(12.))
                 .child(div().w_full().text_sm().text_center().text_color(c.status_bar_text).whitespace_nowrap().child(status)))
             .into_any()
@@ -536,7 +531,7 @@ impl Render for OverlayView {
 fn window_height(count: usize) -> Pixels {
     let cards_per_row: usize = 6;
     let rows = (count.max(1) + cards_per_row - 1) / cards_per_row;
-    let card_h = icon_area_size(count) + 60.0;
+    let card_h = 200.0; // 图标 ~128px + 文字 ~36px + 间距
     px(32.0 + rows as f32 * card_h + 36.0)
 }
 
@@ -551,7 +546,7 @@ fn main() {
         let init_count = state_entity.read(cx).windows.len();
         let bounds = Bounds::centered(None, size(px(1050.), window_height(init_count)), cx);
         let window_handle = cx.open_window(
-            WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), focus: true, kind: WindowKind::PopUp, window_background: WindowBackgroundAppearance::Transparent, ..Default::default() },
+            WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), focus: true, kind: WindowKind::PopUp, window_background: WindowBackgroundAppearance::Blurred, ..Default::default() },
             |_window, cx| {
                 let se = state_entity.clone();
                 cx.new(|cx| {
@@ -618,9 +613,9 @@ fn main() {
                                             let pw = w.pid;
                                             let wt = w.window_title.clone();
                                             println!("[oh-my-tab] CmdReleased: switching to '{}' (pid={})", w.app_name, pw);
-                                            raise_ax_window(pw, &wt);
-                                            activate_pid(pw);
                                             hide_window();
+                                            activate_pid(pw);
+                                            raise_ax_window(pw, &wt);
                                             state.mru.insert(wid, std::time::Instant::now());
                                         } else {
                                             eprintln!("[oh-my-tab] CmdReleased: selected index {} out of bounds (windows={})", state.selected, state.windows.len());

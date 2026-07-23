@@ -25,6 +25,7 @@ const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
 const K_CG_EVENT_FLAGS_CHANGED: CGEventType = 12;
 const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
 const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = 0x00100000;
+const K_CG_EVENT_FLAG_MASK_ALTERNATE: CGEventFlags = 0x00080000;
 const K_VK_TAB: u16 = 48;
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -61,6 +62,10 @@ extern "C" {
 // Tracks whether CmdTabPressed was sent, to avoid spurious CmdReleased
 static TAB_PRESSED: AtomicBool = AtomicBool::new(false);
 
+// 当前快捷键模式：true = Command+Tab, false = Option+Tab
+// Shortcut mode: true = Command+Tab, false = Option+Tab
+pub static SHORTCUT_IS_CMD: AtomicBool = AtomicBool::new(false);
+
 type CGEventTapCallBack =Option<
     unsafe extern "C" fn(
         proxy: CGEventTapProxy,
@@ -84,15 +89,27 @@ unsafe extern "C" fn event_tap_callback(
                 CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) as u16;
             let flags = CGEventGetFlags(event);
 
-            if keycode == K_VK_TAB && (flags & K_CG_EVENT_FLAG_MASK_COMMAND) != 0 {
-                TAB_PRESSED.store(true, Ordering::SeqCst);
-                let _ = sender.send(GlobalEvent::CmdTabPressed);
-                return std::ptr::null_mut();
+            if keycode == K_VK_TAB {
+                let mod_mask = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
+                    K_CG_EVENT_FLAG_MASK_COMMAND
+                } else {
+                    K_CG_EVENT_FLAG_MASK_ALTERNATE
+                };
+                if (flags & mod_mask) != 0 {
+                    TAB_PRESSED.store(true, Ordering::SeqCst);
+                    let _ = sender.send(GlobalEvent::CmdTabPressed);
+                    return std::ptr::null_mut();
+                }
             }
         }
         K_CG_EVENT_FLAGS_CHANGED => {
             let flags = CGEventGetFlags(event);
-            if (flags & K_CG_EVENT_FLAG_MASK_COMMAND) == 0 && TAB_PRESSED.swap(false, Ordering::SeqCst) {
+            let mod_mask = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
+                K_CG_EVENT_FLAG_MASK_COMMAND
+            } else {
+                K_CG_EVENT_FLAG_MASK_ALTERNATE
+            };
+            if (flags & mod_mask) == 0 && TAB_PRESSED.swap(false, Ordering::SeqCst) {
                 let _ = sender.send(GlobalEvent::CmdReleased);
             }
         }
