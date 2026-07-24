@@ -3,7 +3,7 @@ use std::sync::RwLock;
 
 // ========== Structs ==========
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub appearance: Appearance,
@@ -13,7 +13,7 @@ pub struct Config {
     pub keyboard: Keyboard,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Appearance {
     pub theme: String,
@@ -22,7 +22,7 @@ pub struct Appearance {
     pub corner_radius: f64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Layout {
     pub cards_per_row: usize,
@@ -32,14 +32,14 @@ pub struct Layout {
     pub icon_size: f64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ColorsSection {
     pub dark: ThemeColors,
     pub light: ThemeColors,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ThemeColors {
     pub status_bar_text: String,
@@ -51,7 +51,7 @@ pub struct ThemeColors {
     pub card_border_sel: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Fonts {
     pub status_bar_size: f64,
@@ -62,7 +62,7 @@ pub struct Fonts {
     pub app_name_weight: f64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Keyboard {
     pub modifier: String,
@@ -430,6 +430,15 @@ pub fn parse_hex8(s: &str) -> u32 {
 }
 
 impl Config {
+    /// 把当前配置序列化为 TOML 写回 `~/.config/oh-my-tab/config.toml`。
+    /// Serialize this config to TOML and write it back to the config file.
+    pub fn save(&self) -> Result<(), String> {
+        let toml_str = toml::to_string_pretty(self).map_err(|e| format!("serialize config: {}", e))?;
+        let path = config_path();
+        std::fs::write(&path, toml_str).map_err(|e| format!("write {}: {}", path.display(), e))?;
+        Ok(())
+    }
+
     pub fn load_or_default() -> (Self, Vec<String>) {
         let path = config_path();
         match std::fs::read_to_string(&path) {
