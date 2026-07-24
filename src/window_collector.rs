@@ -149,12 +149,25 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
     unsafe {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
+        // 包一个 autorelease 池：app/icon/tiff/rep/png 都是 autoreleased（+0）。
+        // 启动早期在 NSApp run 之前调用时主线程还没有池子，这些对象（尤其源 icon，可达数 MB）
+        // 会整体泄漏——这是启动 ~40MB 的主因。
+        // Wrap in an autorelease pool: app/icon/tiff/rep/png are autoreleased (+0). At startup
+        // this runs before NSApp run (no pool yet), so they'd all leak - the ~40MB startup cause.
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+
         let cls = class!(NSRunningApplication);
         let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
-        if app.is_null() { return None; }
+        if app.is_null() {
+            let _: () = msg_send![pool, drain];
+            return None;
+        }
 
         let icon: *mut AnyObject = msg_send![app, icon];
-        if icon.is_null() { return None; }
+        if icon.is_null() {
+            let _: () = msg_send![pool, drain];
+            return None;
+        }
 
         // Render at Retina resolution: 64pt display → 128px (2x) or 64px (1x)
         let scale: f64 = {
@@ -177,17 +190,29 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
 
         // Convert to PNG at target size
         let tiff: *mut AnyObject = msg_send![target_img, TIFFRepresentation];
-        if tiff.is_null() { return None; }
+        let _: () = msg_send![target_img, release]; // target_img 是 alloc 出来的 +1，池子接不住，手动 release
+        if tiff.is_null() {
+            let _: () = msg_send![pool, drain];
+            return None;
+        }
 
         let rep_cls = class!(NSBitmapImageRep);
         let rep: *mut AnyObject = msg_send![rep_cls, imageRepWithData: tiff];
-        if rep.is_null() { return None; }
+        if rep.is_null() {
+            let _: () = msg_send![pool, drain];
+            return None;
+        }
 
         // NSBitmapImageFileTypePNG = 4
         let png: *mut AnyObject = msg_send![rep, representationUsingType: 4u64, properties: std::ptr::null::<AnyObject>()];
-        if png.is_null() { return None; }
+        if png.is_null() {
+            let _: () = msg_send![pool, drain];
+            return None;
+        }
 
-        write_png_to_cache(png, pid)
+        let result = write_png_to_cache(png, pid);
+        let _: () = msg_send![pool, drain];
+        result
     }
 }
 
@@ -429,6 +454,11 @@ pub fn cache_running_app_icons() {
     let mut cached: Vec<String> = Vec::new();
     let mut skipped: usize = 0;
     unsafe {
+        // 本函数在 NSApp run 之前调用，主线程还没有 autorelease 池；
+        // runningApplications / localizedName 都是 autoreleased，套个池子及时回收。
+        // This runs before NSApp run, when the main thread has no autorelease pool yet;
+        // runningApplications / localizedName are autoreleased, so wrap in a pool to drain them.
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
         let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         let running: *mut AnyObject = msg_send![workspace, runningApplications];
         let count: usize = msg_send![running, count];
@@ -450,6 +480,7 @@ pub fn cache_running_app_icons() {
                 skipped += 1;
             }
         }
+        let _: () = msg_send![pool, drain];
     }
     println!(
         "[oh-my-tab] icon cache done: {} cached, {} skipped (already fresh)",

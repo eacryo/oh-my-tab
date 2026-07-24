@@ -191,6 +191,19 @@ fn make_nsstring(s: &str) -> *mut AnyObject {
     }
 }
 
+/// 释放 alloc 出来的 +1 对象。objc2 的 msg_send! 是裸 MRC（无 ARC）：
+/// alloc/init 返回 +1，必须手动 release；addSubview:/setImage:/addTrackingArea:
+/// 只是再加自己的 retain，不会抵消 alloc 的那 +1。交给父视图/子视图持有后即可 release。
+/// Release a +1 object obtained via alloc. objc2's msg_send! is raw MRC (no ARC):
+/// alloc/init return +1 and must be released; addSubview:/setImage:/addTrackingArea:
+/// only add their own retain and don't balance the alloc +1. Once the owning view
+/// retains it, we drop our alloc +1.
+unsafe fn release_obj(obj: *mut AnyObject) {
+    if !obj.is_null() {
+        let _: () = msg_send![obj, release];
+    }
+}
+
 fn has_accessibility_permission() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
@@ -904,6 +917,7 @@ fn rebuild_cards(indices: &[usize]) {
                 let _: () = msg_send![new_card, setFrame: frame];
                 let _: () = msg_send![old_view, removeFromSuperview];
                 let _: () = msg_send![container, addSubview: new_card];
+                release_obj(new_card); // container owns the card; drop create_card_view's alloc +1
             }
         }
 
@@ -982,9 +996,11 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
                 let img_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
                 let img_view: *mut AnyObject = msg_send![img_view, initWithFrame: img_frame];
                 let _: () = msg_send![img_view, setImage: ns_image];
+                release_obj(ns_image); // img_view owns the image now; drop our alloc +1
                 // NSImageScaleProportionallyUpOrDown = 3
                 let _: () = msg_send![img_view, setImageScaling: 3u64];
                 let _: () = msg_send![view, addSubview: img_view];
+                release_obj(img_view); // view owns the image view now; drop our alloc +1
             }
         } else {
             // Letter icon: rounded square with first letter
@@ -1017,7 +1033,9 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
             let text_color = hex_to_ns_color(colors.icon_text);
             let label = make_centered_label(&init, font, text_color, 0.0, letter_sq, letter_sq);
             let _: () = msg_send![letter_view, addSubview: label];
+            release_obj(label); // letter_view owns the label; drop our alloc +1
             let _: () = msg_send![view, addSubview: letter_view];
+            release_obj(letter_view); // view owns the letter view; drop our alloc +1
         }
 
         // Gap below icon before text starts
@@ -1039,6 +1057,7 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
             name_bottom, card_w(), 18.0,
         );
         let _: () = msg_send![view, addSubview: name_label];
+        release_obj(name_label); // view owns the label; drop our alloc +1
 
         // --- Window title label ---
         let title_font: *mut AnyObject = {
@@ -1051,6 +1070,7 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
             title_bottom, card_w(), 16.0,
         );
         let _: () = msg_send![view, addSubview: title_label];
+        release_obj(title_label); // view owns the label; drop our alloc +1
 
         // --- Tracking area for hover ---
         // NSTrackingMouseEnteredAndExited | NSTrackingActiveInActiveApp
@@ -1062,6 +1082,7 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
         );
         let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds, options: opts, owner: view, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![view, addTrackingArea: ta];
+        release_obj(ta); // view owns the tracking area; drop our alloc +1
 
         view
     }
@@ -1117,6 +1138,7 @@ fn show_overlay() {
             let _: () = msg_send![card, setFrame: card_frame];
 
             let _: () = msg_send![container, addSubview: card];
+            release_obj(card); // container owns the card; drop create_card_view's alloc +1
         }
 
         update_status_label();
