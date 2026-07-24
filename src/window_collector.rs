@@ -321,9 +321,18 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // 以 AX 窗口列表为主数据源（macOS App Switcher 的做法）
     // Use AX window list as primary source (same as macOS App Switcher)
     let mut ax_by_pid: HashMap<i32, Vec<String>> = HashMap::new();
+    // AX 窗口「全部」为空标题的 App（如 Microsoft To Do：自绘标题栏 -> AXTitle 为空）。
+    // 这类 App 的空标题窗口是真实主窗口，不能被当作弹出面板丢弃。
+    // Apps whose AX windows are ALL untitled (e.g. Microsoft To Do, which has a
+    // custom title bar and an empty AXTitle). Their titleless windows are real
+    // main windows and must not be dropped as popups.
+    let mut titleless_pids: HashSet<i32> = HashSet::new();
     for &pid in &pids {
         let ax_wins = get_ax_windows_for_pid(pid);
         if !ax_wins.is_empty() {
+            if ax_wins.iter().all(|t| t.is_empty()) {
+                titleless_pids.insert(pid);
+            }
             ax_by_pid.insert(pid, ax_wins);
         }
     }
@@ -373,10 +382,16 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             cg_title
         };
 
-        if window_title.is_empty() && !ax_by_pid.contains_key(&owner_pid) {
-            // Keep windows from apps without AX support even if title is empty
+        if window_title.is_empty()
+            && (!ax_by_pid.contains_key(&owner_pid) || titleless_pids.contains(&owner_pid))
+        {
+            // 空标题窗口仅对「无 AX 支持」或「AX 窗口全部无标题」的 App 保留
+            // Keep titleless windows for apps with no AX support, or apps whose
+            // AX windows are all untitled (e.g. Microsoft To Do).
         } else if window_title.is_empty() {
-            continue; // empty title only valid for non-AX apps
+            // 有标题窗口的 App 出现空标题 -> 视为弹出面板/下拉菜单，跳过
+            // Empty title on an app that has titled windows -> popup/panel, skip
+            continue;
         }
 
         let ordered_ts = now.checked_sub(std::time::Duration::from_millis(insertion_order as u64)).unwrap_or(now);

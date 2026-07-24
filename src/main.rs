@@ -362,6 +362,21 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     text.to_string()
 }
 
+/// 占位符：窗口没有标题时（如 Microsoft To Do，AXTitle 为空）显示一个短横线。
+/// 注意：仅用于显示。内部 `window_title` 仍保持空串，这样 raise_ax_window 仍能
+/// 按空标题匹配到对应的 AX 窗口并聚焦。
+/// Placeholder shown for windows that expose no title (e.g. Microsoft To Do,
+/// whose custom title bar yields an empty AXTitle). Display-only: the internal
+/// `window_title` stays empty so raise_ax_window can still match the AX window
+/// by its empty title.
+fn display_title(title: &str) -> String {
+    if title.is_empty() {
+        "-".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
 // ========== ObjC Method Implementations ==========
 
 // --- Controller ---
@@ -682,7 +697,7 @@ fn update_status_label() {
         let selected = state.selected;
         // status_text 是窗口下面那一行长的应用名称
         let status_text = match state.windows.get(selected) {
-            Some(w) => truncate_text(&w.window_title, 126),
+            Some(w) => truncate_text(&display_title(&w.window_title), 126),
             None => String::new(),
         };
         drop(state_opt);
@@ -930,7 +945,7 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
 };
         let win_color = hex_to_ns_color(colors.win_title);
         let title_label = make_centered_label(
-            &truncate_text(&w.window_title, 20), title_font, win_color,
+            &truncate_text(&display_title(&w.window_title), 20), title_font, win_color,
             title_bottom, card_w(), 16.0,
         );
         let _: () = msg_send![view, addSubview: title_label];
