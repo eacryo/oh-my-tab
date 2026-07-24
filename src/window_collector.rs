@@ -26,8 +26,6 @@ pub fn note_app_activated(pid: i32) {
     LAST_ACTIVATED.lock().unwrap().insert(pid, Instant::now());
 }
 
-const ICON_CACHE_TTL_SECS: u64 = 3600;
-
 fn icon_cache_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     format!("{}/Library/Caches/oh-my-tab-icons", home)
@@ -118,15 +116,16 @@ pub fn ensure_icon_cache_dir() {
     let _ = std::fs::create_dir_all(icon_cache_dir());
 }
 
+/// 图标缓存「文件存在即有效」，不设过期时间。
+/// 缓存按 PID 索引：App 更新必然重启 -> 新 PID -> 自动重新提取，因此无需靠 TTL
+/// 刷新；运行时改图标的 App（日历日期 / Dock 角标）会冻结到该 App 重启。
+/// Icon cache is valid as long as the file exists - no expiry. The cache is keyed
+/// by PID: an app update always relaunches with a new PID, which forces a
+/// re-extract, so no TTL is needed. Apps that change their icon at runtime
+/// (Calendar date, dock badge) stay frozen until that app is restarted.
 pub fn check_icon_cache(pid: i32) -> Option<String> {
     let path = format!("{}/{}.png", icon_cache_dir(), pid);
-    let meta = std::fs::metadata(&path).ok()?;
-    let age = meta.modified().ok()?.elapsed().ok()?;
-    if age.as_secs() < ICON_CACHE_TTL_SECS {
-        Some(path)
-    } else {
-        None
-    }
+    std::fs::metadata(&path).ok().map(|_| path)
 }
 
 fn write_png_to_cache(png: *mut AnyObject, pid: i32) -> Option<String> {
@@ -134,7 +133,10 @@ fn write_png_to_cache(png: *mut AnyObject, pid: i32) -> Option<String> {
         let path = format!("{}/{}.png", icon_cache_dir(), pid);
         let path_cstr = std::ffi::CString::new(&*path).unwrap();
         let cf_path = CFStringCreateWithCString(std::ptr::null(), path_cstr.as_ptr(), 0x08000100);
-        let ok: bool = msg_send![png, writeToFile: cf_path as *mut AnyObject, atomically: false];
+        // 原子写入：先写临时文件再重命名，避免写一半崩溃留下半截 PNG。
+        // Atomic write: write to a temp file then rename, so a mid-write crash
+        // can't leave a half-written PNG that "file exists = valid" would trust.
+        let ok: bool = msg_send![png, writeToFile: cf_path as *mut AnyObject, atomically: true];
         CFRelease(cf_path as *const c_void);
         if ok { Some(path) } else { None }
     }

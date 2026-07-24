@@ -312,6 +312,11 @@ fn set_card_index(view: *mut AnyObject, idx: usize) {
     map.insert(view as usize, idx);
 }
 
+fn remove_card_index(view: *mut AnyObject) {
+    let mut map = CARD_INDEX_MAP.lock().unwrap();
+    map.remove(&(view as usize));
+}
+
 fn clear_card_indices() {
     let mut map = CARD_INDEX_MAP.lock().unwrap();
     map.clear();
@@ -444,6 +449,28 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
         let pid: i32 = msg_send![app, processIdentifier];
         note_app_activated(pid);
     }
+}
+
+extern "C" fn on_app_launched(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
+    // Pre-cache the launched app's icon so it's on disk before the user summons
+    // the switcher. Run off the main thread (with an autorelease pool) so the
+    // launch notification doesn't block the UI; extract_icon_to_cache is
+    // defensive (null-safe) and a failure simply leaves the letter-icon fallback.
+    let pid: i32 = unsafe {
+        let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
+        if user_info.is_null() { return; }
+        let key = make_nsstring("NSWorkspaceApplicationKey");
+        let app: *mut AnyObject = msg_send![user_info, objectForKey: key];
+        CFRelease(key as *const c_void);
+        if app.is_null() { return; }
+        msg_send![app, processIdentifier]
+    };
+    if pid <= 0 { return; }
+    thread::spawn(move || unsafe {
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        let _ = extract_icon_to_cache(pid);
+        let _: () = msg_send![pool, drain];
+    });
 }
 
 // --- Card View ---
@@ -795,18 +822,93 @@ fn extract_uncached_icons() {
         }
     };
 
+    // Record which window indices got a freshly cached icon so we can re-render
+    // just those cards in place (otherwise the on-screen letter icons wouldn't
+    // update until the next summon).
+    let mut updated_indices: Vec<usize> = Vec::new();
     for pid in uncached {
         if let Some(ref path) = extract_icon_to_cache(pid) {
             let path = path.clone();
             let mut state_opt = TAB_STATE.lock().unwrap();
             if let Some(ref mut state) = *state_opt {
-                for w in &mut state.windows {
+                for (i, w) in state.windows.iter_mut().enumerate() {
                     if w.pid == pid && w.icon_path.is_none() {
                         w.icon_path = Some(path.clone());
+                        updated_indices.push(i);
                     }
                 }
             }
         }
+    }
+
+    if !updated_indices.is_empty() {
+        rebuild_cards(&updated_indices);
+    }
+}
+
+/// Rebuild the card views for the given window indices in place, so newly
+/// extracted icons appear immediately without re-summoning. Each affected card
+/// is replaced by a fresh one built from the updated `WindowInfo` (which now has
+/// an icon_path), preserving its frame and card index.
+fn rebuild_cards(indices: &[usize]) {
+    if indices.is_empty() {
+        return;
+    }
+    let affected: HashSet<usize> = indices.iter().copied().collect();
+    let to_rebuild: HashMap<usize, WindowInfo> = {
+        let state_opt = TAB_STATE.lock().unwrap();
+        let state = match state_opt.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        if !state.visible {
+            return;
+        }
+        affected
+            .iter()
+            .filter_map(|&i| state.windows.get(i).map(|w| (i, w.clone())))
+            .collect()
+    };
+    if to_rebuild.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let container = match *CONTAINER.lock().unwrap() {
+            Some(c) => c.0,
+            None => return,
+        };
+        let subviews: *mut AnyObject = msg_send![container, subviews];
+        let sv_count: usize = msg_send![subviews, count];
+
+        // Collect affected card views + their frames first; don't mutate the
+        // subview array while iterating it.
+        let mut replacements: Vec<(*mut AnyObject, NSRect, usize)> = Vec::new();
+        for i in 0..sv_count {
+            let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
+            let is_label: bool = msg_send![sv, isKindOfClass: class!(NSTextField)];
+            if is_label {
+                continue;
+            }
+            let idx = get_card_index(sv);
+            if to_rebuild.contains_key(&idx) {
+                let frame: NSRect = msg_send![sv, frame];
+                replacements.push((sv, frame, idx));
+            }
+        }
+
+        for (old_view, frame, idx) in replacements {
+            if let Some(w) = to_rebuild.get(&idx) {
+                remove_card_index(old_view);
+                let new_card = create_card_view(w, idx);
+                let _: () = msg_send![new_card, setFrame: frame];
+                let _: () = msg_send![old_view, removeFromSuperview];
+                let _: () = msg_send![container, addSubview: new_card];
+            }
+        }
+
+        // New card views have no selection border; re-apply the highlight.
+        refresh_highlight();
     }
 }
 
@@ -1258,6 +1360,12 @@ fn create_controller() -> *mut AnyObject {
             on_app_activated as *mut c_void,
             types_v_obj.as_ptr(),
         );
+        class_addMethod(
+            cls,
+            sel!(handleAppLaunch:),
+            on_app_launched as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
         objc_registerClassPair(cls);
         msg_send![cls as *mut AnyObject, new]
     }
@@ -1467,6 +1575,18 @@ fn main() {
             object: std::ptr::null::<AnyObject>(),
         ];
         CFRelease(name as *const c_void);
+
+        // Pre-cache icons for apps launched after startup so they're ready
+        // before the user summons the switcher (fixes missing icons for apps
+        // opened while oh-my-tab is already running).
+        let launch_name = make_nsstring("NSWorkspaceDidLaunchApplicationNotification");
+        let _: () = msg_send![nc,
+            addObserver: controller,
+            selector: sel!(handleAppLaunch:),
+            name: launch_name,
+            object: std::ptr::null::<AnyObject>(),
+        ];
+        CFRelease(launch_name as *const c_void);
     }
 
     // 7. Start event monitor + bridge thread
