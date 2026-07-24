@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CStr};
 use std::time::Instant;
 use objc2::{class, msg_send};
 use objc2::runtime::AnyObject;
@@ -386,4 +386,39 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
     if let Some(first) = windows.first_mut() { first.is_active = true; }
     windows
+}
+
+/// Pre‑cache icons for every currently‑running application.
+/// Called once at startup so the overlay never shows a missing icon.
+pub fn cache_running_app_icons() {
+    let mut cached: Vec<String> = Vec::new();
+    let mut skipped: usize = 0;
+    unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let running: *mut AnyObject = msg_send![workspace, runningApplications];
+        let count: usize = msg_send![running, count];
+        for i in 0..count {
+            let app: *mut AnyObject = msg_send![running, objectAtIndex: i];
+            let pid: i32 = msg_send![app, processIdentifier];
+            if check_icon_cache(pid).is_none() {
+                let name: *mut AnyObject = msg_send![app, localizedName];
+                let utf8: *const c_char = msg_send![name, UTF8String];
+                let name_str = if utf8.is_null() {
+                    "?".to_string()
+                } else {
+                    CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                };
+                println!("[oh-my-tab] cached icon: {} (pid {})", name_str, pid);
+                cached.push(name_str);
+                extract_icon_to_cache(pid);
+            } else {
+                skipped += 1;
+            }
+        }
+    }
+    println!(
+        "[oh-my-tab] icon cache done: {} cached, {} skipped (already fresh)",
+        cached.len(),
+        skipped,
+    );
 }

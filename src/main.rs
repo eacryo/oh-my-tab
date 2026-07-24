@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use window_collector::{
-    MruMap, WindowInfo, ensure_icon_cache_dir, extract_icon_to_cache, raise_ax_window,
+    MruMap, WindowInfo, cache_running_app_icons, ensure_icon_cache_dir,
+    extract_icon_to_cache, raise_ax_window,
 };
 use event_monitor::{GlobalEvent, start as start_event_monitor};
 
@@ -1324,6 +1325,7 @@ fn main() {
 
     // 4. Initialize state
     ensure_icon_cache_dir();
+    cache_running_app_icons(); // pre-warm icon cache for all running apps
     *TAB_STATE.lock().unwrap() = Some(AppState::new());
 
     // 5. Create overlay window (hidden initially)
