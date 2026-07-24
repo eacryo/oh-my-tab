@@ -432,15 +432,28 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
     let la = LAST_ACTIVATED.lock().unwrap();
     windows.sort_by(|a, b| {
-        let ta = mru.get(&a.window_id)
-            .or_else(|| la.get(&a.pid))
+        // 主键：App 级激活时间 LAST_ACTIVATED[pid]。外部激活（点窗口 / Dock /
+        // 系统 Cmd+Tab）都会更新它，这样排序才反映外部切换，对齐原生 Cmd+Tab。
+        // Primary: app-level activation time. External activations update this, so the
+        // order reflects external switches too, matching native Cmd+Tab.
+        let pa = la.get(&a.pid)
             .map(|t| t.elapsed())
             .unwrap_or(std::time::Duration::from_secs(999));
-        let tb = mru.get(&b.window_id)
-            .or_else(|| la.get(&b.pid))
+        let pb = la.get(&b.pid)
             .map(|t| t.elapsed())
             .unwrap_or(std::time::Duration::from_secs(999));
-        ta.cmp(&tb)
+        // 次键：同 App 多窗口时，按 oh-my-tab 上次切到该窗口的时间排序。
+        // Secondary (tiebreaker): for multiple windows of the same app, order by when
+        // oh-my-tab last switched to that specific window.
+        pa.cmp(&pb).then_with(|| {
+            let wa = mru.get(&a.window_id)
+                .map(|t| t.elapsed())
+                .unwrap_or(std::time::Duration::from_secs(999));
+            let wb = mru.get(&b.window_id)
+                .map(|t| t.elapsed())
+                .unwrap_or(std::time::Duration::from_secs(999));
+            wa.cmp(&wb)
+        })
     });
     drop(la);
 
