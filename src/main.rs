@@ -13,7 +13,7 @@ use std::thread;
 
 use window_collector::{
     MruMap, WindowInfo, cache_running_app_icons, ensure_icon_cache_dir,
-    extract_icon_to_cache, raise_ax_window,
+    extract_icon_to_cache, note_app_activated, raise_ax_window,
 };
 use event_monitor::{GlobalEvent, start as start_event_monitor};
 
@@ -423,6 +423,19 @@ extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) 
 
 extern "C" fn on_theme_toggled(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     apply_theme();
+}
+
+extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
+    unsafe {
+        let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
+        if user_info.is_null() { return; }
+        let key = make_nsstring("NSWorkspaceApplicationKey");
+        let app: *mut AnyObject = msg_send![user_info, objectForKey: key];
+        CFRelease(key as *const c_void);
+        if app.is_null() { return; }
+        let pid: i32 = msg_send![app, processIdentifier];
+        note_app_activated(pid);
+    }
 }
 
 // --- Card View ---
@@ -1176,6 +1189,12 @@ fn create_controller() -> *mut AnyObject {
             on_theme_toggled as *mut c_void,
             types_v_obj.as_ptr(),
         );
+        class_addMethod(
+            cls,
+            sel!(handleAppActivation:),
+            on_app_activated as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
         objc_registerClassPair(cls);
         msg_send![cls as *mut AnyObject, new]
     }
@@ -1337,6 +1356,21 @@ fn main() {
     // 6. Create controller object
     let controller = create_controller();
     *CONTROLLER.lock().unwrap() = Some(ObjPtr(controller));
+
+    // 6b. Listen for system app activation so MRU stays in sync
+    // when the user switches apps via Dock, Cmd+Tab, etc.
+    unsafe {
+        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let nc: *mut AnyObject = msg_send![ws, notificationCenter];
+        let name = make_nsstring("NSWorkspaceDidActivateApplicationNotification");
+        let _: () = msg_send![nc,
+            addObserver: controller,
+            selector: sel!(handleAppActivation:),
+            name: name,
+            object: std::ptr::null::<AnyObject>(),
+        ];
+        CFRelease(name as *const c_void);
+    }
 
     // 7. Start event monitor + bridge thread
     let (event_tx, event_rx) = flume::unbounded();

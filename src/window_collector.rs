@@ -16,6 +16,16 @@ pub struct WindowInfo {
 
 pub type MruMap = HashMap<u32, Instant>;
 
+/// PID → last time the app was activated (via system notification).
+/// Used in sorting so external app switches are reflected in the MRU order.
+static LAST_ACTIVATED: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Called from the NSWorkspaceDidActivateApplicationNotification handler.
+pub fn note_app_activated(pid: i32) {
+    LAST_ACTIVATED.lock().unwrap().insert(pid, Instant::now());
+}
+
 const ICON_CACHE_TTL_SECS: u64 = 3600;
 
 fn icon_cache_dir() -> String {
@@ -378,11 +388,19 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
     unsafe { CFRelease(array) };
 
+    let la = LAST_ACTIVATED.lock().unwrap();
     windows.sort_by(|a, b| {
-        let ta = mru.get(&a.window_id).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
-        let tb = mru.get(&b.window_id).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
+        let ta = mru.get(&a.window_id)
+            .or_else(|| la.get(&a.pid))
+            .map(|t| t.elapsed())
+            .unwrap_or(std::time::Duration::from_secs(999));
+        let tb = mru.get(&b.window_id)
+            .or_else(|| la.get(&b.pid))
+            .map(|t| t.elapsed())
+            .unwrap_or(std::time::Duration::from_secs(999));
         ta.cmp(&tb)
     });
+    drop(la);
 
     if let Some(first) = windows.first_mut() { first.is_active = true; }
     windows
