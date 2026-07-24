@@ -1,6 +1,8 @@
 mod window_collector;
 mod event_monitor;
+mod config;
 
+use config::{reload_config, CONFIG};
 use flume;
 use objc2::{class, msg_send, sel};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
@@ -67,16 +69,8 @@ const KEY_RETURN: u16 = 36;
 
 // ========== Layout Constants ==========
 
-const CARD_W: f64 = 140.0;
-const CARD_H: f64 = 180.0;
-const CARD_GAP: f64 = 0.0;
-const CARDS_PER_ROW: usize = 6;
 const STATUS_H: f64 = 36.0;
 const H_PADDING: f64 = 32.0; // horizontal padding inside the window
-//窗口圆角
-const CORNER_RADIUS: f64 = 64.0;
-const IMG_SIZE: f64 = 110.0;
-const LETTER_SIZE: f64 = 55.0;
 
 // ========== Types ==========
 
@@ -246,63 +240,62 @@ unsafe fn layer_set_border(layer: *mut AnyObject, cg: *mut c_void) {
     f(layer as *mut c_void, sel, cg);
 }
 
-fn dark_colors() -> Colors {
+fn colors_from_config(dark: bool) -> Colors {
+    let cfg = CONFIG.read().unwrap();
+    let c = if dark { &cfg.colors.dark } else { &cfg.colors.light };
     Colors {
         page_bg: 0x00000000,
         hint_bg: 0x00000000,
         hint_text: 0x888888ff,
         hint_subtext: 0x666666ff,
         status_bar_bg: 0x00000000,
-        status_bar_text: 0x999999ff,
+        status_bar_text: config::parse_hex8(&c.status_bar_text),
         card_bg: 0x00000000,
-        card_bg_sel: 0x22224444,
-        card_border_sel: 0x5577ccff,
-        icon_inner_bg: 0x22224444,
-        icon_text: 0x9999bbff,
-        app_name: 0xddddddff,
-        win_title: 0x888888ff,
+        card_bg_sel: config::parse_hex8(&c.card_bg_sel),
+        card_border_sel: config::parse_hex8(&c.card_border_sel),
+        icon_inner_bg: config::parse_hex8(&c.icon_inner_bg),
+        icon_text: config::parse_hex8(&c.icon_text),
+        app_name: config::parse_hex8(&c.app_name),
+        win_title: config::parse_hex8(&c.win_title),
     }
 }
 
-fn light_colors() -> Colors {
-    Colors {
-        page_bg: 0x00000000,
-        hint_bg: 0x00000000,
-        hint_text: 0x666666ff,
-        hint_subtext: 0x999999ff,
-        status_bar_bg: 0x00000000,
-        status_bar_text: 0x333333ff,
-        card_bg: 0x00000000,
-        card_bg_sel: 0xffffff66,
-        card_border_sel: 0x5577ccff,
-        icon_inner_bg: 0xd0d0e066,
-        icon_text: 0x666688ff,
-        app_name: 0x1a1a1aff,
-        win_title: 0x333333ff,
+fn system_dark_mode() -> bool {
+    unsafe {
+        let key = make_nsstring("AppleInterfaceStyle");
+        let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let style: *mut AnyObject = msg_send![defaults, stringForKey: key];
+        CFRelease(key as *const c_void);
+        !style.is_null()
     }
 }
 
 fn current_colors() -> Colors {
-    let is_dark = THEME_STATE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map_or(false, |s| s.is_dark);
-    if is_dark {
-        dark_colors()
-    } else {
-        light_colors()
-    }
+    let is_dark = match CONFIG.read().unwrap().appearance.theme.as_str() {
+        "light" => false,
+        "dark" => true,
+        _ => system_dark_mode(),
+    };
+    colors_from_config(is_dark)
 }
 
+// Layout helpers that read from CONFIG at runtime.
+fn cards_per_row() -> usize { CONFIG.read().unwrap().layout.cards_per_row }
+fn card_w() -> f64 { CONFIG.read().unwrap().layout.card_width }
+fn card_h() -> f64 { CONFIG.read().unwrap().layout.card_height }
+fn card_gap() -> f64 { CONFIG.read().unwrap().layout.card_gap }
+fn icon_px() -> f64 { CONFIG.read().unwrap().layout.icon_size }
+fn letter_px() -> f64 { icon_px() * 0.5 }
+
 fn window_height(count: usize) -> f64 {
-    let rows = (count.max(1) + CARDS_PER_ROW - 1) / CARDS_PER_ROW;
-    32.0 + rows as f64 * CARD_H + STATUS_H
+    let cpr = cards_per_row();
+    let rows = (count.max(1) + cpr - 1) / cpr;
+    32.0 + rows as f64 * card_h() + STATUS_H
 }
 
 fn window_width(cards_in_row: usize) -> f64 {
-    cards_in_row as f64 * CARD_W
-        + (cards_in_row.saturating_sub(1)) as f64 * CARD_GAP
+    cards_in_row as f64 * card_w()
+        + (cards_in_row.saturating_sub(1)) as f64 * card_gap()
         + H_PADDING * 2.0
 }
 
@@ -510,8 +503,8 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
             }
             KEY_UP => {
                 if !state.windows.is_empty() {
-                    if state.selected >= CARDS_PER_ROW {
-                        state.selected -= CARDS_PER_ROW;
+                    if state.selected >= cards_per_row() {
+                        state.selected -= cards_per_row();
                         drop(state_opt);
                         refresh_highlight();
                         update_status_label();
@@ -521,7 +514,7 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
             }
             KEY_DOWN => {
                 if !state.windows.is_empty() {
-                    let new_idx = state.selected + CARDS_PER_ROW;
+                    let new_idx = state.selected + cards_per_row();
                     if new_idx < state.windows.len() {
                         state.selected = new_idx;
                         drop(state_opt);
@@ -593,27 +586,72 @@ extern "C" fn handle_toggle_shortcut(_self: *mut c_void, _cmd: Sel, _sender: *mu
 }
 
 extern "C" fn handle_toggle_theme(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    // Flip theme in CONFIG and persist to file so menu ↔ config are linked.
+    let new_theme = match CONFIG.read().unwrap().appearance.theme.as_str() {
+        "dark" => "light",
+        _ => "dark",
+    };
+    {
+        let mut cfg = CONFIG.write().unwrap();
+        cfg.appearance.theme = new_theme.to_string();
+        // Save to file
+        let path = {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            std::path::PathBuf::from(home).join(".config/oh-my-tab/config.toml")
+        };
+        if let Ok(toml_str) = toml::to_string_pretty(&*cfg) {
+            let _ = std::fs::write(&path, toml_str);
+        }
+    }
+    let is_dark = new_theme == "dark";
+    let new_label = if is_dark { "切换浅色" } else { "切换深色" };
+    println!(
+        "[oh-my-tab] Toggled theme to {}",
+        if is_dark { "dark" } else { "light" }
+    );
+    // Update menu item title
     let mut state = THEME_STATE.lock().unwrap();
     if let Some(ref mut s) = *state {
-        s.is_dark = !s.is_dark;
-        let new_label = if s.is_dark {
-            "切换浅色"
-        } else {
-            "切换深色"
-        };
-        println!(
-            "[oh-my-tab] Toggled theme to {}",
-            if s.is_dark { "dark" } else { "light" }
-        );
+        s.is_dark = is_dark;
         unsafe {
             let ns_title = make_nsstring(new_label);
             let _: () = msg_send![s.item, setTitle: ns_title];
             CFRelease(ns_title as *const c_void);
         }
     }
+    drop(state);
     if let Some(tx) = STATUS_EVENT_TX.get() {
         let _ = tx.send(GlobalEvent::ThemeToggled);
     }
+}
+
+extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    let errs = reload_config();
+    if errs.is_empty() {
+        println!("[oh-my-tab] Config reloaded successfully.");
+    } else {
+        eprintln!("[oh-my-tab] Config reload: {} error(s):", errs.len());
+        for e in &errs {
+            eprintln!("[oh-my-tab]   • {}", e);
+        }
+    }
+    // Sync menu label with new config theme
+    let is_dark = CONFIG.read().unwrap().appearance.theme.as_str() != "light";
+    let new_label = if is_dark { "切换浅色" } else { "切换深色" };
+    let mut state = THEME_STATE.lock().unwrap();
+    if let Some(ref mut s) = *state {
+        s.is_dark = is_dark;
+        unsafe {
+            let ns_title = make_nsstring(new_label);
+            let _: () = msg_send![s.item, setTitle: ns_title];
+            CFRelease(ns_title as *const c_void);
+        }
+    }
+    drop(state);
+    // Apply immediately
+    apply_theme();
+    refresh_highlight();
+    update_status_label();
 }
 
 // ========== UI Functions ==========
@@ -651,7 +689,10 @@ fn update_status_label() {
 
         let colors = current_colors();
         let status_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 13.0f64, weight: 0.23f64];
+            {
+    let cfg = CONFIG.read().unwrap();
+    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
+};
         let status_color = hex_to_ns_color(colors.status_bar_text);
         let ns_stat = make_nsstring(&status_text);
         let _: () = msg_send![status_label, setStringValue: ns_stat];
@@ -788,7 +829,7 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
 
         let frame = NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(CARD_W, CARD_H),
+            NSSize::new(card_w(), card_h()),
         );
         let view: *mut AnyObject = msg_send![card_cls_ptr, alloc];
         let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
@@ -803,10 +844,10 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
         set_card_index(view, index);
 
         let colors = current_colors();
-        let icon_x = (CARD_W - IMG_SIZE) / 2.0; // 16.0
+        let icon_x = (card_w() - icon_px()) / 2.0; // 16.0
         // Standard coords: y=0 at bottom, y=200 at top.
         // Icon: 8px from top → y = 200 - 8 - 128 = 64
-        let icon_bottom = CARD_H - 8.0 - IMG_SIZE; // 64.0
+        let icon_bottom = card_h() - 8.0 - icon_px(); // 64.0
 
         // --- Icon ---
         if let Some(ref icon_path) = w.icon_path {
@@ -819,7 +860,7 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
             if !ns_image.is_null() {
                 let img_frame = NSRect::new(
                     NSPoint::new(icon_x, icon_bottom),
-                    NSSize::new(IMG_SIZE, IMG_SIZE),
+                    NSSize::new(icon_px(), icon_px()),
                 );
                 let img_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
                 let img_view: *mut AnyObject = msg_send![img_view, initWithFrame: img_frame];
@@ -830,10 +871,10 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
             }
         } else {
             // Letter icon: rounded square with first letter
-            let letter_sq = LETTER_SIZE;
-            let letter_x = icon_x + (IMG_SIZE - letter_sq) / 2.0;
+            let letter_sq = letter_px();
+            let letter_x = icon_x + (icon_px() - letter_sq) / 2.0;
             // Center the 64x64 square within the 128x128 icon area
-            let letter_y = icon_bottom + (IMG_SIZE - letter_sq) / 2.0;
+            let letter_y = icon_bottom + (icon_px() - letter_sq) / 2.0;
             let letter_frame = NSRect::new(
                 NSPoint::new(letter_x, letter_y),
                 NSSize::new(letter_sq, letter_sq),
@@ -871,20 +912,26 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
 
         // --- App name label ---
         let name_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 13.0f64, weight: 0.5f64];
+            {
+    let cfg = CONFIG.read().unwrap();
+    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.app_name_size, weight: cfg.fonts.app_name_weight]
+};
         let name_color = hex_to_ns_color(colors.app_name);
         let name_label = make_centered_label(
             &truncate_text(&w.app_name, 17), name_font, name_color,
-            name_bottom, CARD_W, 18.0,
+            name_bottom, card_w(), 18.0,
         );
         let _: () = msg_send![view, addSubview: name_label];
 
         // --- Window title label ---
-        let title_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64, weight: 0.23f64];
+        let title_font: *mut AnyObject = {
+    let cfg = CONFIG.read().unwrap();
+    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
+};
         let win_color = hex_to_ns_color(colors.win_title);
         let title_label = make_centered_label(
             &truncate_text(&w.window_title, 20), title_font, win_color,
-            title_bottom, CARD_W, 16.0,
+            title_bottom, card_w(), 16.0,
         );
         let _: () = msg_send![view, addSubview: title_label];
 
@@ -894,7 +941,7 @@ fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
         let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
         let bounds = NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(CARD_W, CARD_H),
+            NSSize::new(card_w(), card_h()),
         );
         let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds, options: opts, owner: view, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![view, addTrackingArea: ta];
@@ -931,24 +978,24 @@ fn show_overlay() {
         // Clear old card index mappings, then create new card views
         clear_card_indices();
         let h = window_height(count);
-        let cards_in_row = CARDS_PER_ROW.min(count);
+        let cards_in_row = cards_per_row().min(count);
         let w = window_width(cards_in_row);
-        let row_width = cards_in_row as f64 * CARD_W
-            + (cards_in_row.saturating_sub(1)) as f64 * CARD_GAP;
+        let row_width = cards_in_row as f64 * card_w()
+            + (cards_in_row.saturating_sub(1)) as f64 * card_gap();
         let start_x = (w - row_width) / 2.0;
 
         for (idx, w) in windows.iter().enumerate() {
             let card = create_card_view(w, idx);
 
             // Standard coords: y=0 at bottom. Cards stack from top down.
-            let col = idx % CARDS_PER_ROW;
-            let row = idx / CARDS_PER_ROW;
-            let card_x = start_x + col as f64 * (CARD_W + CARD_GAP);
-            // topmost card origin_y = H - 32 - CARD_H (32 = top padding area)
-            let card_y = h - 32.0 - (row + 1) as f64 * CARD_H;
+            let col = idx % cards_per_row();
+            let row = idx / cards_per_row();
+            let card_x = start_x + col as f64 * (card_w() + card_gap());
+            // topmost card origin_y = h - 32.0 - card_h() (32 = top padding area)
+            let card_y = h - 32.0 - (row + 1) as f64 * card_h();
             let card_frame = NSRect::new(
                 NSPoint::new(card_x, card_y),
-                NSSize::new(CARD_W, CARD_H),
+                NSSize::new(card_w(), card_h()),
             );
             let _: () = msg_send![card, setFrame: card_frame];
 
@@ -1023,7 +1070,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
         let screen_frame: NSRect = msg_send![screen, frame];
         let h = window_height(6); // initial reasonable default
-        let w = window_width(CARDS_PER_ROW); // max possible width
+        let w = window_width(cards_per_row()); // max possible width
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
         let frame = NSRect::new(
@@ -1081,19 +1128,17 @@ fn create_overlay_window() -> *mut AnyObject {
             let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
             let glass: *mut AnyObject = msg_send![glass_cls, alloc];
             let glass: *mut AnyObject = msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-            // (4) Corner radius — native NSGlassEffectView property, no layer hacks.
-            let _: () = msg_send![glass, setCornerRadius: CORNER_RADIUS];
-            // (5) Glass style — controls the visual weight / opacity of the glass.
-            //     0 = Regular (default). Higher values = lighter / more transparent.
-            //     Try 1-3 for progressively more transparent variants.
-            // 设置透明度 1全透明 0透明度很低，这在NSGlassEffectView内部是一个枚举值，只有这两个值可选
-            // 已有人研究过，可以调用私有API https://www.reddit.com/r/SwiftUI/comments/1l86rue/macos_new_nsglasseffectview_in_macos_260_beta_way/
-            let _: () = msg_send![glass, setStyle: 1i64];
-            // (6) Tint color — overlays a subtle color on the glass.
-            //     Very low alpha = more transparent; higher alpha = more solid.
-            //     Currently: nearly-clear tint for maximum transparency.
-            // 设置背景颜色
-            let tint = hex_to_ns_color(0xeeeeee66);
+            // (4) Corner radius — native NSGlassEffectView property, from config.
+            let _: () = msg_send![glass, setCornerRadius: CONFIG.read().unwrap().appearance.corner_radius];
+            // (5) Glass style — "regular" (0) or "clear" (1), from config.
+            let style: i64 = match CONFIG.read().unwrap().appearance.glass_style.as_str() {
+                "clear" => 1,
+                _ => 0, // regular (default)
+            };
+            let _: () = msg_send![glass, setStyle: style];
+            // (6) Tint color — hex RRGGBBAA from config.
+            let tint_hex = config::parse_hex8(&CONFIG.read().unwrap().appearance.glass_tint);
+            let tint = hex_to_ns_color(tint_hex);
             let _: () = msg_send![glass, setTintColor: tint];
             // (7) Autoresizing so the glass view fills the window on resize.
             let _: () = msg_send![glass, setAutoresizingMask: 18u64];
@@ -1155,7 +1200,10 @@ fn create_overlay_window() -> *mut AnyObject {
 
         // --- Status label at bottom (standard coords: y=0 is bottom) ---
         let status_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 13.0f64, weight: 0.23f64];
+            {
+    let cfg = CONFIG.read().unwrap();
+    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
+};
         let status_color = hex_to_ns_color(0x999999ff);
         let status_label = make_centered_label("", status_font, status_color, 0.0, w, STATUS_H);
         let _: () = msg_send![container, addSubview: status_label];
@@ -1273,6 +1321,12 @@ fn setup_status_bar() {
                 handle_toggle_shortcut as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(handleReloadConfig:),
+                handle_reload_config as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };
@@ -1300,6 +1354,16 @@ fn setup_status_bar() {
         *SHORTCUT_ITEM.lock().unwrap() = Some(ShortcutState {
             item: shortcut_item,
         });
+
+        // Reload Config item
+        let reload_title = make_nsstring("Reload Config");
+        let reload_key = make_nsstring("");
+        let reload_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let reload_item: *mut AnyObject = msg_send![reload_item, initWithTitle: reload_title, action: sel!(handleReloadConfig:), keyEquivalent: reload_key];
+        CFRelease(reload_title as *const c_void);
+        CFRelease(reload_key as *const c_void);
+        let _: () = msg_send![reload_item, setTarget: menu_target];
+        let _: () = msg_send![menu, addItem: reload_item];
 
         // Separator
         let sep_item: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
@@ -1345,6 +1409,24 @@ fn main() {
     // 4. Initialize state
     ensure_icon_cache_dir();
     cache_running_app_icons(); // pre-warm icon cache for all running apps
+
+    // 4b. Force CONFIG to initialise and report any validation errors
+    {
+        let cfg = CONFIG.read().unwrap();
+        // First load already happened via LazyLock; re-run validate to report problems
+        let errs = cfg.validate();
+        if !errs.is_empty() {
+            eprintln!(
+                "[oh-my-tab] Config errors in ~/.config/oh-my-tab/config.toml ({} issue(s)):",
+                errs.len()
+            );
+            for e in &errs {
+                eprintln!("[oh-my-tab]   • {}", e);
+            }
+            eprintln!("[oh-my-tab] Using defaults for invalid fields.");
+        }
+    }
+
     *TAB_STATE.lock().unwrap() = Some(AppState::new());
 
     // 5. Create overlay window (hidden initially)
