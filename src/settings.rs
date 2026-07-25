@@ -438,7 +438,12 @@ fn create_settings_window() {
         y -= 14.0 + 24.0;
         add_header(content, &t("settings.header_keyboard"), 12.0, y, view_w - 24.0);
         y -= 8.0 + row_h;
-        ui.modifier = add_row(content, label_x, y, label_w, row_h, &t("settings.row_modifier"), make_popup(ctrl_x, y, ctrl_w, row_h, &["option", "command"], 0));
+        // 修饰键下拉项:显示 Option+Tab / Command+Tab(快捷键名,各 locale 保持原文);值由索引映射到 option/command。
+        // Modifier popup items: show Option+Tab / Command+Tab (shortcut names, kept verbatim across locales);
+        // the value is mapped from the index to option/command.
+        let mod_labels = [t("settings.modifier_option"), t("settings.modifier_command")];
+        let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
+        ui.modifier = add_row(content, label_x, y, label_w, row_h, &t("settings.row_modifier"), make_popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0));
 
         // --- 语言 Language ---
         y -= 14.0 + 24.0;
