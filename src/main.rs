@@ -1,8 +1,10 @@
 mod window_collector;
 mod event_monitor;
 mod config;
+mod i18n;
 
 use config::{Config, reload_config, CONFIG};
+use i18n::{t, tf};
 use flume;
 use objc2::{class, msg_send, sel};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
@@ -175,6 +177,17 @@ static CARD_INDEX_MAP: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static THEME_STATE: Mutex<Option<MenuState>> = Mutex::new(None);
 static SHORTCUT_ITEM: Mutex<Option<ShortcutState>> = Mutex::new(None);
+
+// 固定标题的菜单项(settings / reload / quit)。locale 变更时由 refresh_menu_titles 批量重设标题。
+// Fixed-title menu items (settings / reload / quit); re-titled in bulk by refresh_menu_titles on locale change.
+struct FixedMenuItems {
+    settings: *mut AnyObject,
+    reload: *mut AnyObject,
+    quit: *mut AnyObject,
+}
+unsafe impl Send for FixedMenuItems {}
+unsafe impl Sync for FixedMenuItems {}
+static FIXED_MENU_ITEMS: Mutex<Option<FixedMenuItems>> = Mutex::new(None);
 
 // 设置窗口的控件指针集合（非模态窗口，复用，隐藏而非销毁）。
 // Holds pointers to the settings window's controls (non-modal, reused, hidden not destroyed).
@@ -497,12 +510,67 @@ unsafe fn add_row(
 /// Set shortcut mode (Cmd / Opt), syncing runtime SHORTCUT_IS_CMD and the menu label.
 fn set_shortcut_mode(is_cmd: bool) {
     event_monitor::SHORTCUT_IS_CMD.store(is_cmd, Ordering::SeqCst);
-    let new_label = if is_cmd { "切换opt+tab" } else { "切换cmd+tab" };
+    let key = if is_cmd { "menu.toggle_shortcut.opt" } else { "menu.toggle_shortcut.cmd" };
     if let Some(ref s) = *SHORTCUT_ITEM.lock().unwrap() {
         unsafe {
-            let ns_title = make_nsstring(new_label);
+            let ns_title = make_nsstring(&t(key));
             let _: () = msg_send![s.item, setTitle: ns_title];
             CFRelease(ns_title as *const c_void);
+        }
+    }
+}
+
+/// 用当前 locale 与状态重设全部菜单项标题。用于 locale 变更(reload)与启动时修正初始标签。
+/// Re-title all menu items from the current locale and state. Used on locale change (reload)
+/// and at startup to fix the initial labels.
+fn refresh_menu_titles() {
+    unsafe {
+        // theme item:标题取决于当前主题(点一下要切到另一边)
+        // theme item: label depends on current theme (clicking switches to the other)
+        let is_dark = CONFIG.read().unwrap().appearance.theme.as_str() != "light";
+        let theme_key = if is_dark { "menu.toggle_theme.light" } else { "menu.toggle_theme.dark" };
+        if let Some(ref mut s) = *THEME_STATE.lock().unwrap() {
+            s.is_dark = is_dark;
+            let ns_title = make_nsstring(&t(theme_key));
+            let _: () = msg_send![s.item, setTitle: ns_title];
+            CFRelease(ns_title as *const c_void);
+        }
+        // shortcut item
+        let is_cmd = event_monitor::SHORTCUT_IS_CMD.load(Ordering::SeqCst);
+        let sc_key = if is_cmd { "menu.toggle_shortcut.opt" } else { "menu.toggle_shortcut.cmd" };
+        if let Some(ref s) = *SHORTCUT_ITEM.lock().unwrap() {
+            let ns_title = make_nsstring(&t(sc_key));
+            let _: () = msg_send![s.item, setTitle: ns_title];
+            CFRelease(ns_title as *const c_void);
+        }
+        // 固定标题项 / fixed-title items
+        if let Some(ref items) = *FIXED_MENU_ITEMS.lock().unwrap() {
+            for (item, key) in [
+                (items.settings, "menu.settings"),
+                (items.reload, "menu.reload_config"),
+                (items.quit, "menu.quit"),
+            ] {
+                let ns_title = make_nsstring(&t(key));
+                let _: () = msg_send![item, setTitle: ns_title];
+                CFRelease(ns_title as *const c_void);
+            }
+        }
+    }
+}
+
+/// 作废缓存的设置窗口(释放并置 None),下次打开时按当前 locale 重建。
+/// Invalidate the cached settings window (release + set None) so it is rebuilt with the
+/// current locale on next open. 用于 locale 变更后让设置窗口标签换语言。
+fn invalidate_settings_window() {
+    unsafe {
+        let mut ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.take() {
+            // 窗口 alloc 是 +1且 setReleasedWhenClosed:false,需手动 release 一次;
+            // 其子控件已由父视图持有,随窗口 dealloc 释放。
+            // The window is alloc +1 with setReleasedWhenClosed:false, so release once manually;
+            // its subviews are retained by the parent view and dealloc with the window.
+            let _: () = msg_send![u.window, orderOut: std::ptr::null::<AnyObject>()];
+            release_obj(u.window);
         }
     }
 }
@@ -642,6 +710,34 @@ extern "C" fn on_app_launched(_self: *mut c_void, _cmd: Sel, notification: *mut 
         let _ = extract_icon_to_cache(pid);
         let _: () = msg_send![pool, drain];
     });
+}
+
+extern "C" fn on_locale_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    unsafe {
+        // 通知投递线程不保证是主线程,而刷新 UI 必须在主线程;非主线程时转到主线程重入本方法。
+        // Notification delivery thread isn't guaranteed to be main, but UI refresh must run on
+        // main; when off main, hop to main and re-enter this method.
+        let is_main: bool = msg_send![class!(NSThread), isMainThread];
+        if !is_main {
+            let _: () = msg_send![_self as *mut AnyObject,
+                performSelectorOnMainThread: sel!(handleLocaleChanged:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+            return;
+        }
+    }
+    // 系统语言变更(NSLocaleCurrentLocaleDidChangeNotification)。
+    // 仅当 locale 为 auto(系统派生)时 apply_config_locale 会真正改变解析结果;显式 locale 下短路。
+    // 重新解析后刷新菜单标题、作废设置窗口待下次按新 locale 重建。
+    // System language changed (NSLocaleCurrentLocaleDidChangeNotification).
+    // apply_config_locale only re-resolves when locale is auto (system-derived); it short-circuits
+    // for an explicit locale. After re-resolving, refresh menu titles and invalidate the settings
+    // window so it rebuilds with the new locale on next open.
+    let locale_cfg = CONFIG.read().unwrap().i18n.locale.clone();
+    i18n::apply_config_locale(&locale_cfg);
+    refresh_menu_titles();
+    invalidate_settings_window();
 }
 
 // --- Card View ---
@@ -800,7 +896,7 @@ extern "C" fn handle_toggle_theme(_self: *mut c_void, _cmd: Sel, _sender: *mut c
         }
     }
     let is_dark = new_theme == "dark";
-    let new_label = if is_dark { "切换浅色" } else { "切换深色" };
+    let new_label = if is_dark { t("menu.toggle_theme.light") } else { t("menu.toggle_theme.dark") };
     println!(
         "[oh-my-tab] Toggled theme to {}",
         if is_dark { "dark" } else { "light" }
@@ -810,7 +906,7 @@ extern "C" fn handle_toggle_theme(_self: *mut c_void, _cmd: Sel, _sender: *mut c
     if let Some(ref mut s) = *state {
         s.is_dark = is_dark;
         unsafe {
-            let ns_title = make_nsstring(new_label);
+            let ns_title = make_nsstring(&new_label);
             let _: () = msg_send![s.item, setTitle: ns_title];
             CFRelease(ns_title as *const c_void);
         }
@@ -831,19 +927,11 @@ extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _sender: *mut 
             eprintln!("[oh-my-tab]   • {}", e);
         }
     }
-    // Sync menu label with new config theme
-    let is_dark = CONFIG.read().unwrap().appearance.theme.as_str() != "light";
-    let new_label = if is_dark { "切换浅色" } else { "切换深色" };
-    let mut state = THEME_STATE.lock().unwrap();
-    if let Some(ref mut s) = *state {
-        s.is_dark = is_dark;
-        unsafe {
-            let ns_title = make_nsstring(new_label);
-            let _: () = msg_send![s.item, setTitle: ns_title];
-            CFRelease(ns_title as *const c_void);
-        }
-    }
-    drop(state);
+    // locale 可能随 reload 改变:重设全部菜单标题 + 作废设置窗口待下次按新 locale 重建
+    // locale may change on reload: re-title all menus + invalidate the settings window
+    // so it rebuilds with the new locale on next open
+    refresh_menu_titles();
+    invalidate_settings_window();
     // Apply immediately
     apply_theme();
     refresh_highlight();
@@ -859,11 +947,11 @@ extern "C" fn on_settings_open(_self: *mut c_void, _cmd: Sel, _sender: *mut c_vo
 extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     let (cfg, errs) = collect_settings_config();
     if !errs.is_empty() {
-        show_alert("配置有误", &errs.join("\n"));
+        show_alert(&t("alert.config_error_title"), &errs.join("\n"));
         return;
     }
     if let Err(e) = cfg.save() {
-        show_alert("保存失败", &e);
+        show_alert(&t("alert.save_failed_title"), &e);
         return;
     }
     let _ = reload_config();
@@ -877,20 +965,10 @@ extern "C" fn on_settings_cancel(_self: *mut c_void, _cmd: Sel, _sender: *mut c_
 }
 
 /// 同步主题菜单标签并立即应用配置（主题/浮窗）。
-/// Sync the theme menu label and apply the config immediately (theme / overlay).
+/// Sync menu labels and apply the config immediately (theme / overlay).
 fn apply_config_refresh() {
-    let is_dark = CONFIG.read().unwrap().appearance.theme.as_str() != "light";
-    let new_label = if is_dark { "切换浅色" } else { "切换深色" };
-    let mut state = THEME_STATE.lock().unwrap();
-    if let Some(ref mut s) = *state {
-        s.is_dark = is_dark;
-        unsafe {
-            let ns_title = make_nsstring(new_label);
-            let _: () = msg_send![s.item, setTitle: ns_title];
-            CFRelease(ns_title as *const c_void);
-        }
-    }
-    drop(state);
+    refresh_menu_titles();
+    invalidate_settings_window();
     apply_theme();
     refresh_highlight();
     update_status_label();
@@ -935,7 +1013,7 @@ fn show_alert(title: &str, msg: &str) {
         let ns2 = make_nsstring(msg);
         let _: () = msg_send![alert, setInformativeText: ns2];
         CFRelease(ns2 as *const c_void);
-        let ns3 = make_nsstring("OK");
+        let ns3 = make_nsstring(&t("alert.btn_ok"));
         let _: () = msg_send![alert, addButtonWithTitle: ns3];
         CFRelease(ns3 as *const c_void);
         let _resp: isize = msg_send![alert, runModal];
@@ -986,27 +1064,27 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         cfg.appearance.glass_tint = nsstring_to_rust(msg_send![ui.glass_tint, stringValue]);
         match parse_f64(&nsstring_to_rust(msg_send![ui.corner_radius, stringValue])) {
             Ok(v) => cfg.appearance.corner_radius = v,
-            Err(_) => errs.push("appearance.corner_radius: 不是数字 / not a number".into()),
+            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "appearance.corner_radius")])),
         }
         match parse_usize(&nsstring_to_rust(msg_send![ui.cards_per_row, stringValue])) {
             Ok(v) => cfg.layout.cards_per_row = v,
-            Err(_) => errs.push("layout.cards_per_row: 不是整数 / not an integer".into()),
+            Err(_) => errs.push(tf("errors.not_an_integer", &[("field", "layout.cards_per_row")])),
         }
         match parse_f64(&nsstring_to_rust(msg_send![ui.card_width, stringValue])) {
             Ok(v) => cfg.layout.card_width = v,
-            Err(_) => errs.push("layout.card_width: 不是数字 / not a number".into()),
+            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "layout.card_width")])),
         }
         match parse_f64(&nsstring_to_rust(msg_send![ui.card_height, stringValue])) {
             Ok(v) => cfg.layout.card_height = v,
-            Err(_) => errs.push("layout.card_height: 不是数字 / not a number".into()),
+            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "layout.card_height")])),
         }
         match parse_f64(&nsstring_to_rust(msg_send![ui.card_gap, stringValue])) {
             Ok(v) => cfg.layout.card_gap = v,
-            Err(_) => errs.push("layout.card_gap: 不是数字 / not a number".into()),
+            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "layout.card_gap")])),
         }
         match parse_f64(&nsstring_to_rust(msg_send![ui.icon_size, stringValue])) {
             Ok(v) => cfg.layout.icon_size = v,
-            Err(_) => errs.push("layout.icon_size: 不是数字 / not a number".into()),
+            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "layout.icon_size")])),
         }
         let mod_idx: isize = msg_send![ui.modifier, indexOfSelectedItem];
         cfg.keyboard.modifier = if mod_idx == 1 { "command".into() } else { "option".into() };
@@ -1026,7 +1104,7 @@ fn create_settings_window() {
         let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 500.0));
         let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
-        let ns_title = make_nsstring("oh-my-tab 设置");
+        let ns_title = make_nsstring(&t("settings.window_title"));
         let _: () = msg_send![window, setTitle: ns_title];
         CFRelease(ns_title as *const c_void);
         let _: () = msg_send![window, setReleasedWhenClosed: false];
@@ -1060,37 +1138,37 @@ fn create_settings_window() {
 
         // --- 外观 Appearance ---
         y -= 24.0;
-        add_header(content, "外观 Appearance", 12.0, y, view_w - 24.0);
+        add_header(content, &t("settings.header_appearance"), 12.0, y, view_w - 24.0);
         y -= 8.0 + row_h;
-        ui.theme = add_row(content, label_x, y, label_w, row_h, "主题 theme", make_popup(ctrl_x, y, ctrl_w, row_h, &["dark", "light", "auto"], 0));
+        ui.theme = add_row(content, label_x, y, label_w, row_h, &t("settings.row_theme"), make_popup(ctrl_x, y, ctrl_w, row_h, &["dark", "light", "auto"], 0));
         y -= row_pitch;
-        ui.glass_style = add_row(content, label_x, y, label_w, row_h, "玻璃样式 glass_style", make_popup(ctrl_x, y, ctrl_w, row_h, &["regular", "clear"], 0));
+        ui.glass_style = add_row(content, label_x, y, label_w, row_h, &t("settings.row_glass_style"), make_popup(ctrl_x, y, ctrl_w, row_h, &["regular", "clear"], 0));
         y -= row_pitch;
         // TODO: glass_tint 改用 NSColorWell（系统取色器）替代 hex 文本框，体验更好。
         // TODO: replace glass_tint's hex text field with NSColorWell (system color picker).
-        ui.glass_tint = add_row(content, label_x, y, label_w, row_h, "玻璃 tint (RRGGBBAA)", make_text_input(ctrl_x, y, ctrl_w, row_h, "eeeeee66"));
+        ui.glass_tint = add_row(content, label_x, y, label_w, row_h, &t("settings.row_glass_tint"), make_text_input(ctrl_x, y, ctrl_w, row_h, "eeeeee66"));
         y -= row_pitch;
-        ui.corner_radius = add_row(content, label_x, y, label_w, row_h, "圆角 corner_radius", make_text_input(ctrl_x, y, ctrl_w, row_h, "64"));
+        ui.corner_radius = add_row(content, label_x, y, label_w, row_h, &t("settings.row_corner_radius"), make_text_input(ctrl_x, y, ctrl_w, row_h, "64"));
 
         // --- 布局 Layout ---
         y -= 14.0 + 24.0;
-        add_header(content, "布局 Layout", 12.0, y, view_w - 24.0);
+        add_header(content, &t("settings.header_layout"), 12.0, y, view_w - 24.0);
         y -= 8.0 + row_h;
-        ui.cards_per_row = add_row(content, label_x, y, label_w, row_h, "每行卡片数 cards_per_row", make_text_input(ctrl_x, y, ctrl_w, row_h, "6"));
+        ui.cards_per_row = add_row(content, label_x, y, label_w, row_h, &t("settings.row_cards_per_row"), make_text_input(ctrl_x, y, ctrl_w, row_h, "6"));
         y -= row_pitch;
-        ui.card_width = add_row(content, label_x, y, label_w, row_h, "卡片宽 card_width", make_text_input(ctrl_x, y, ctrl_w, row_h, "140"));
+        ui.card_width = add_row(content, label_x, y, label_w, row_h, &t("settings.row_card_width"), make_text_input(ctrl_x, y, ctrl_w, row_h, "140"));
         y -= row_pitch;
-        ui.card_height = add_row(content, label_x, y, label_w, row_h, "卡片高 card_height", make_text_input(ctrl_x, y, ctrl_w, row_h, "180"));
+        ui.card_height = add_row(content, label_x, y, label_w, row_h, &t("settings.row_card_height"), make_text_input(ctrl_x, y, ctrl_w, row_h, "180"));
         y -= row_pitch;
-        ui.card_gap = add_row(content, label_x, y, label_w, row_h, "卡片间距 card_gap", make_text_input(ctrl_x, y, ctrl_w, row_h, "0"));
+        ui.card_gap = add_row(content, label_x, y, label_w, row_h, &t("settings.row_card_gap"), make_text_input(ctrl_x, y, ctrl_w, row_h, "0"));
         y -= row_pitch;
-        ui.icon_size = add_row(content, label_x, y, label_w, row_h, "图标尺寸 icon_size", make_text_input(ctrl_x, y, ctrl_w, row_h, "110"));
+        ui.icon_size = add_row(content, label_x, y, label_w, row_h, &t("settings.row_icon_size"), make_text_input(ctrl_x, y, ctrl_w, row_h, "110"));
 
         // --- 键盘 Keyboard ---
         y -= 14.0 + 24.0;
-        add_header(content, "键盘 Keyboard", 12.0, y, view_w - 24.0);
+        add_header(content, &t("settings.header_keyboard"), 12.0, y, view_w - 24.0);
         y -= 8.0 + row_h;
-        ui.modifier = add_row(content, label_x, y, label_w, row_h, "修饰键 modifier", make_popup(ctrl_x, y, ctrl_w, row_h, &["option", "command"], 0));
+        ui.modifier = add_row(content, label_x, y, label_w, row_h, &t("settings.row_modifier"), make_popup(ctrl_x, y, ctrl_w, row_h, &["option", "command"], 0));
 
         // --- 确认 / 取消 ---
         let target = match *MENU_TARGET.lock().unwrap() {
@@ -1099,7 +1177,7 @@ fn create_settings_window() {
         };
         let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
         let cancel: *mut AnyObject = msg_send![cancel, initWithFrame: NSRect::new(NSPoint::new(view_w - 200.0, 14.0), NSSize::new(80.0, 28.0))];
-        set_control_title(cancel, "取消");
+        set_control_title(cancel, &t("settings.btn_cancel"));
         let _: () = msg_send![cancel, setBezelStyle: 1isize];
         let _: () = msg_send![cancel, setTarget: target];
         let _: () = msg_send![cancel, setAction: sel!(handleSettingsCancel:)];
@@ -1108,7 +1186,7 @@ fn create_settings_window() {
 
         let ok: *mut AnyObject = msg_send![class!(NSButton), alloc];
         let ok: *mut AnyObject = msg_send![ok, initWithFrame: NSRect::new(NSPoint::new(view_w - 110.0, 14.0), NSSize::new(90.0, 28.0))];
-        set_control_title(ok, "确认");
+        set_control_title(ok, &t("settings.btn_ok"));
         let _: () = msg_send![ok, setBezelStyle: 1isize];
         let _: () = msg_send![ok, setTarget: target];
         let _: () = msg_send![ok, setAction: sel!(handleSettingsOk:)];
@@ -1838,6 +1916,12 @@ fn create_controller() -> *mut AnyObject {
             on_app_launched as *mut c_void,
             types_v_obj.as_ptr(),
         );
+        class_addMethod(
+            cls,
+            sel!(handleLocaleChanged:),
+            on_locale_changed as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
         objc_registerClassPair(cls);
         msg_send![cls as *mut AnyObject, new]
     }
@@ -1947,7 +2031,7 @@ fn setup_status_bar() {
         *MENU_TARGET.lock().unwrap() = Some(ObjPtr(menu_target));
 
         // Toggle theme item
-        let toggle_title = make_nsstring("切换深色");
+        let toggle_title = make_nsstring(&t("menu.toggle_theme.dark"));
         let toggle_key = make_nsstring("");
         let toggle_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let toggle_item: *mut AnyObject = msg_send![toggle_item, initWithTitle: toggle_title, action: sel!(handleToggleTheme:), keyEquivalent: toggle_key];
@@ -1957,7 +2041,7 @@ fn setup_status_bar() {
         let _: () = msg_send![menu, addItem: toggle_item];
 
         // Shortcut toggle item
-        let shortcut_title = make_nsstring("切换cmd+tab");
+        let shortcut_title = make_nsstring(&t("menu.toggle_shortcut.cmd"));
         let shortcut_key = make_nsstring("");
         let shortcut_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let shortcut_item: *mut AnyObject = msg_send![shortcut_item, initWithTitle: shortcut_title, action: sel!(handleToggleShortcut:), keyEquivalent: shortcut_key];
@@ -1970,7 +2054,7 @@ fn setup_status_bar() {
         });
 
         // 设置... item (opens the settings window)
-        let settings_title = make_nsstring("设置...");
+        let settings_title = make_nsstring(&t("menu.settings"));
         let settings_key = make_nsstring("");
         let settings_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let settings_item: *mut AnyObject = msg_send![settings_item, initWithTitle: settings_title, action: sel!(handleSettings:), keyEquivalent: settings_key];
@@ -1980,7 +2064,7 @@ fn setup_status_bar() {
         let _: () = msg_send![menu, addItem: settings_item];
 
         // Reload Config item
-        let reload_title = make_nsstring("Reload Config");
+        let reload_title = make_nsstring(&t("menu.reload_config"));
         let reload_key = make_nsstring("");
         let reload_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let reload_item: *mut AnyObject = msg_send![reload_item, initWithTitle: reload_title, action: sel!(handleReloadConfig:), keyEquivalent: reload_key];
@@ -1994,7 +2078,7 @@ fn setup_status_bar() {
         let _: () = msg_send![menu, addItem: sep_item];
 
         // Quit item
-        let quit_title = make_nsstring("Quit");
+        let quit_title = make_nsstring(&t("menu.quit"));
         let quit_key = make_nsstring("");
         let quit_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let quit_item: *mut AnyObject = msg_send![quit_item, initWithTitle: quit_title, action: sel!(handleQuit:), keyEquivalent: quit_key];
@@ -2002,6 +2086,13 @@ fn setup_status_bar() {
         CFRelease(quit_key as *const c_void);
         let _: () = msg_send![quit_item, setTarget: menu_target];
         let _: () = msg_send![menu, addItem: quit_item];
+
+        // 登记固定标题项,供热重载 locale 时批量重设标题 / register fixed-title items for locale hot-reload
+        *FIXED_MENU_ITEMS.lock().unwrap() = Some(FixedMenuItems {
+            settings: settings_item,
+            reload: reload_item,
+            quit: quit_item,
+        });
 
         // Store toggle item reference for title updates
         *THEME_STATE.lock().unwrap() = Some(MenuState {
@@ -2027,8 +2118,23 @@ fn main() {
     // 2. Register custom ObjC classes
     register_classes();
 
+    // 2b. 强制 CONFIG 初始化(顺带应用 i18n locale),保证菜单按配置 locale 构建。
+    //     CONFIG 的 LazyLock 初始化会调用 i18n::apply_config_locale,无循环依赖。
+    // Force CONFIG init (also applies i18n locale) so the menu is built with the configured
+    // locale. CONFIG's LazyLock init calls i18n::apply_config_locale; no cycle (see i18n.rs).
+    drop(CONFIG.read().unwrap());
+
     // 3. Setup status bar menu
     setup_status_bar();
+
+    // 3b. 按实际主题修正初始菜单标签。setup_status_bar 用占位标题(is_dark=false +
+    //     "切换深色");若 config 主题为 dark/auto,这里修正为正确的 toggle 标签。
+    //     locale 已在 2b 应用,菜单文本本身已正确,此处只修正 toggle 方向。
+    // Fix initial menu labels against the real theme. setup_status_bar used a placeholder
+    // (is_dark=false + "switch to dark"); if the config theme is dark/auto this corrects the
+    // toggle direction. Locale was applied in 2b so text is already correct; this only fixes
+    // the toggle direction.
+    refresh_menu_titles();
 
     // 4. Initialize state
     ensure_icon_cache_dir();
@@ -2088,6 +2194,21 @@ fn main() {
             object: std::ptr::null::<AnyObject>(),
         ];
         CFRelease(launch_name as *const c_void);
+
+        // 监听系统语言变更,locale 为 auto 时实时跟随。NSLocaleCurrentLocaleDidChangeNotification
+        // 投递在默认通知中心(不是 workspace 中心),故用 NSNotificationCenter defaultCenter。
+        // Listen for system language changes to live-follow when locale is auto.
+        // NSLocaleCurrentLocaleDidChangeNotification is posted to the default notification center
+        // (not the workspace center), so use NSNotificationCenter defaultCenter.
+        let default_nc: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let locale_name = make_nsstring("NSLocaleCurrentLocaleDidChangeNotification");
+        let _: () = msg_send![default_nc,
+            addObserver: controller,
+            selector: sel!(handleLocaleChanged:),
+            name: locale_name,
+            object: std::ptr::null::<AnyObject>(),
+        ];
+        CFRelease(locale_name as *const c_void);
     }
 
     // 7. Start event monitor + bridge thread

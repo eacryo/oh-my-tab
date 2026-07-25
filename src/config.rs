@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 
+use crate::i18n::{self, tf};
+
 // ========== Structs ==========
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -11,6 +13,7 @@ pub struct Config {
     pub colors: ColorsSection,
     pub fonts: Fonts,
     pub keyboard: Keyboard,
+    pub i18n: I18nSection,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -68,6 +71,12 @@ pub struct Keyboard {
     pub modifier: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct I18nSection {
+    pub locale: String,
+}
+
 // ========== Default implementations (hard-coded fallback values) ==========
 
 impl Default for Config {
@@ -78,6 +87,7 @@ impl Default for Config {
             colors: ColorsSection::default(),
             fonts: Fonts::default(),
             keyboard: Keyboard::default(),
+            i18n: I18nSection::default(),
         }
     }
 }
@@ -167,6 +177,14 @@ impl Default for Keyboard {
     }
 }
 
+impl Default for I18nSection {
+    fn default() -> Self {
+        I18nSection {
+            locale: "auto".into(), // 跟随系统语言 / follow system language
+        }
+    }
+}
+
 // ========== Validation ==========
 
 fn is_hex8(s: &str) -> bool {
@@ -179,59 +197,59 @@ impl Config {
 
         // --- appearance ---
         if !["dark", "light", "auto"].contains(&self.appearance.theme.as_str()) {
-            errs.push(format!(
-                "appearance.theme: \"{}\" is not one of dark, light, auto",
-                self.appearance.theme
+            errs.push(tf(
+                "errors.appearance_theme_invalid",
+                &[("value", &self.appearance.theme)],
             ));
         }
         if !["regular", "clear"].contains(&self.appearance.glass_style.as_str()) {
-            errs.push(format!(
-                "appearance.glass_style: \"{}\" is not one of regular, clear",
-                self.appearance.glass_style
+            errs.push(tf(
+                "errors.appearance_glass_style_invalid",
+                &[("value", &self.appearance.glass_style)],
             ));
         }
         if !is_hex8(&self.appearance.glass_tint) {
-            errs.push(format!(
-                "appearance.glass_tint: \"{}\" must be 8 hex digits (RRGGBBAA)",
-                self.appearance.glass_tint
+            errs.push(tf(
+                "errors.appearance_glass_tint_invalid",
+                &[("value", &self.appearance.glass_tint)],
             ));
         }
         if self.appearance.corner_radius < 0.0 {
-            errs.push(format!(
-                "appearance.corner_radius: {} must be >= 0",
-                self.appearance.corner_radius
+            errs.push(tf(
+                "errors.appearance_corner_radius_invalid",
+                &[("value", &self.appearance.corner_radius.to_string())],
             ));
         }
 
         // --- layout ---
         if self.layout.cards_per_row < 1 || self.layout.cards_per_row > 10 {
-            errs.push(format!(
-                "layout.cards_per_row: {} must be 1..=10",
-                self.layout.cards_per_row
+            errs.push(tf(
+                "errors.layout_cards_per_row_invalid",
+                &[("value", &self.layout.cards_per_row.to_string())],
             ));
         }
         if self.layout.card_width < 80.0 {
-            errs.push(format!(
-                "layout.card_width: {} must be >= 80",
-                self.layout.card_width
+            errs.push(tf(
+                "errors.layout_card_width_invalid",
+                &[("value", &self.layout.card_width.to_string())],
             ));
         }
         if self.layout.card_height < 100.0 {
-            errs.push(format!(
-                "layout.card_height: {} must be >= 100",
-                self.layout.card_height
+            errs.push(tf(
+                "errors.layout_card_height_invalid",
+                &[("value", &self.layout.card_height.to_string())],
             ));
         }
         if self.layout.card_gap < 0.0 {
-            errs.push(format!(
-                "layout.card_gap: {} must be >= 0",
-                self.layout.card_gap
+            errs.push(tf(
+                "errors.layout_card_gap_invalid",
+                &[("value", &self.layout.card_gap.to_string())],
             ));
         }
         if self.layout.icon_size < 32.0 {
-            errs.push(format!(
-                "layout.icon_size: {} must be >= 32",
-                self.layout.icon_size
+            errs.push(tf(
+                "errors.layout_icon_size_invalid",
+                &[("value", &self.layout.icon_size.to_string())],
             ));
         }
 
@@ -239,53 +257,61 @@ impl Config {
         for (theme, colors) in [("dark", &self.colors.dark), ("light", &self.colors.light)] {
             let prefix = format!("colors.{theme}");
             if !is_hex8(&colors.status_bar_text) {
-                errs.push(format!("{prefix}.status_bar_text: must be 8 hex digits"));
+                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.status_bar_text"))]));
             }
             if !is_hex8(&colors.app_name) {
-                errs.push(format!("{prefix}.app_name: must be 8 hex digits"));
+                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.app_name"))]));
             }
             if !is_hex8(&colors.win_title) {
-                errs.push(format!("{prefix}.win_title: must be 8 hex digits"));
+                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.win_title"))]));
             }
             if !is_hex8(&colors.icon_inner_bg) {
-                errs.push(format!("{prefix}.icon_inner_bg: must be 8 hex digits"));
+                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.icon_inner_bg"))]));
             }
             if !is_hex8(&colors.icon_text) {
-                errs.push(format!("{prefix}.icon_text: must be 8 hex digits"));
+                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.icon_text"))]));
             }
             if !is_hex8(&colors.card_bg_sel) {
-                errs.push(format!("{prefix}.card_bg_sel: must be 8 hex digits"));
+                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.card_bg_sel"))]));
             }
             if !is_hex8(&colors.card_border_sel) {
-                errs.push(format!("{prefix}.card_border_sel: must be 8 hex digits"));
+                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.card_border_sel"))]));
             }
         }
 
         // --- fonts ---
         if self.fonts.status_bar_size < 8.0 {
-            errs.push(format!("fonts.status_bar_size: {} must be >= 8", self.fonts.status_bar_size));
+            errs.push(tf("errors.fonts_size_invalid", &[("field", "fonts.status_bar_size"), ("value", &self.fonts.status_bar_size.to_string())]));
         }
         if self.fonts.status_bar_weight < 0.0 || self.fonts.status_bar_weight > 1.0 {
-            errs.push(format!("fonts.status_bar_weight: {} must be 0.0..=1.0", self.fonts.status_bar_weight));
+            errs.push(tf("errors.fonts_weight_invalid", &[("field", "fonts.status_bar_weight"), ("value", &self.fonts.status_bar_weight.to_string())]));
         }
         if self.fonts.title_size < 8.0 {
-            errs.push(format!("fonts.title_size: {} must be >= 8", self.fonts.title_size));
+            errs.push(tf("errors.fonts_size_invalid", &[("field", "fonts.title_size"), ("value", &self.fonts.title_size.to_string())]));
         }
         if self.fonts.title_weight < 0.0 || self.fonts.title_weight > 1.0 {
-            errs.push(format!("fonts.title_weight: {} must be 0.0..=1.0", self.fonts.title_weight));
+            errs.push(tf("errors.fonts_weight_invalid", &[("field", "fonts.title_weight"), ("value", &self.fonts.title_weight.to_string())]));
         }
         if self.fonts.app_name_size < 8.0 {
-            errs.push(format!("fonts.app_name_size: {} must be >= 8", self.fonts.app_name_size));
+            errs.push(tf("errors.fonts_size_invalid", &[("field", "fonts.app_name_size"), ("value", &self.fonts.app_name_size.to_string())]));
         }
         if self.fonts.app_name_weight < 0.0 || self.fonts.app_name_weight > 1.0 {
-            errs.push(format!("fonts.app_name_weight: {} must be 0.0..=1.0", self.fonts.app_name_weight));
+            errs.push(tf("errors.fonts_weight_invalid", &[("field", "fonts.app_name_weight"), ("value", &self.fonts.app_name_weight.to_string())]));
         }
 
         // --- keyboard ---
         if !["option", "command"].contains(&self.keyboard.modifier.as_str()) {
-            errs.push(format!(
-                "keyboard.modifier: \"{}\" is not one of option, command",
-                self.keyboard.modifier
+            errs.push(tf(
+                "errors.keyboard_modifier_invalid",
+                &[("value", &self.keyboard.modifier)],
+            ));
+        }
+
+        // --- i18n ---
+        if !["auto", "en", "zh-Hans", "zh-Hant"].contains(&self.i18n.locale.as_str()) {
+            errs.push(tf(
+                "errors.i18n_locale_invalid",
+                &[("value", &self.i18n.locale)],
             ));
         }
 
@@ -387,6 +413,15 @@ impl Config {
                 self.keyboard.modifier = other.keyboard.modifier;
             }
         }
+
+        // i18n
+        if !has_error("i18n.") {
+            self.i18n = other.i18n;
+        } else {
+            if !errs.iter().any(|e| e.starts_with("i18n.locale")) {
+                self.i18n.locale = other.i18n.locale;
+            }
+        }
     }
 
     fn merge_colors(ours: &mut ThemeColors, theirs: &ThemeColors, theme: &str, errs: &[String]) {
@@ -481,7 +516,7 @@ impl Config {
             }
             Err(e) => {
                 let defaults = Config::default();
-                (defaults, vec![format!("cannot read config: {}", e)])
+                (defaults, vec![tf("errors.config_read_failed", &[("error", &e.to_string())])])
             }
         }
     }
@@ -492,14 +527,22 @@ impl Config {
 pub static CONFIG: std::sync::LazyLock<RwLock<Config>> =
     std::sync::LazyLock::new(|| {
         let (cfg, _errs) = Config::load_or_default();
+        // 应用 config 里的 locale 覆盖(I18N 初始化时只用了系统语言)。
+        // 无循环:I18N 不读 CONFIG,见 i18n.rs 文件头说明。
+        // Apply the locale from config (I18N init only used the system locale).
+        // No cycle: I18N does not read CONFIG; see the note at the top of i18n.rs.
+        i18n::apply_config_locale(&cfg.i18n.locale);
         RwLock::new(cfg)
     });
 
 /// Reload config from disk and apply. Returns validation errors (empty = success).
 pub fn reload_config() -> Vec<String> {
     let (new_cfg, errs) = Config::reload();
+    let locale = new_cfg.i18n.locale.clone();
     if let Ok(mut cfg) = CONFIG.write() {
         *cfg = new_cfg;
     }
+    // locale 可能随 reload 改变,重新应用 / locale may change on reload, re-apply
+    i18n::apply_config_locale(&locale);
     errs
 }

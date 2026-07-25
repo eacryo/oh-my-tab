@@ -1,0 +1,55 @@
+# 简体中文 locale。加载时 key 会被扁平化成点号连接(如 menu.toggle_theme.dark)。
+# 各 locale 文件的 key 必须一致,仅值不同。
+# Simplified Chinese locale. Keys are flattened with dot separators at load time.
+# Keys must match across locale files; only values differ.
+
+[menu]
+toggle_theme.dark = "切换深色"
+toggle_theme.light = "切换浅色"
+toggle_shortcut.opt = "切换opt+tab"
+toggle_shortcut.cmd = "切换cmd+tab"
+settings = "设置..."
+reload_config = "重新加载配置"
+quit = "退出"
+
+[settings]
+window_title = "oh-my-tab 设置"
+header_appearance = "外观 Appearance"
+header_layout = "布局 Layout"
+header_keyboard = "键盘 Keyboard"
+row_theme = "主题 theme"
+row_glass_style = "玻璃样式 glass_style"
+row_glass_tint = "玻璃 tint (RRGGBBAA)"
+row_corner_radius = "圆角 corner_radius"
+row_cards_per_row = "每行卡片数 cards_per_row"
+row_card_width = "卡片宽 card_width"
+row_card_height = "卡片高 card_height"
+row_card_gap = "卡片间距 card_gap"
+row_icon_size = "图标尺寸 icon_size"
+row_modifier = "修饰键 modifier"
+btn_cancel = "取消"
+btn_ok = "确认"
+
+[alert]
+config_error_title = "配置有误"
+save_failed_title = "保存失败"
+btn_ok = "OK"
+
+[errors]
+not_a_number = "{field}: 不是数字"
+not_an_integer = "{field}: 不是整数"
+appearance_theme_invalid = 'appearance.theme: "{value}" 不是 dark、light、auto 之一'
+appearance_glass_style_invalid = 'appearance.glass_style: "{value}" 不是 regular、clear 之一'
+appearance_glass_tint_invalid = 'appearance.glass_tint: "{value}" 必须是 8 位十六进制 (RRGGBBAA)'
+appearance_corner_radius_invalid = "appearance.corner_radius: {value} 必须 >= 0"
+layout_cards_per_row_invalid = "layout.cards_per_row: {value} 必须 1..=10"
+layout_card_width_invalid = "layout.card_width: {value} 必须 >= 80"
+layout_card_height_invalid = "layout.card_height: {value} 必须 >= 100"
+layout_card_gap_invalid = "layout.card_gap: {value} 必须 >= 0"
+layout_icon_size_invalid = "layout.icon_size: {value} 必须 >= 32"
+colors_not_hex8 = "{field}: 必须是 8 位十六进制"
+fonts_size_invalid = "{field}: {value} 必须 >= 8"
+fonts_weight_invalid = "{field}: {value} 必须 0.0..=1.0"
+keyboard_modifier_invalid = 'keyboard.modifier: "{value}" 不是 option、command 之一'
+i18n_locale_invalid = 'i18n.locale: "{value}" 不是 auto、en、zh-Hans、zh-Hant 之一'
+config_read_failed = "无法读取配置: {error}"

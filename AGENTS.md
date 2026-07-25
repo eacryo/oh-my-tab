@@ -26,7 +26,7 @@ There are **no tests** in the project.
 
 ## Architecture
 
-Four modules. The tricky parts span several files, so the breakdown below is load-bearing.
+Five modules. The tricky parts span several files, so the breakdown below is load-bearing.
 
 ### Event flow & threading (spans all files)
 1. `event_monitor::start` spawns a **dedicated thread** running a `CGEventTap` + `CFRunLoop`. It detects Tab+modifier-down (`CmdTabPressed`) and modifier-release (`CmdReleased`), and sends `GlobalEvent`s over a `flume` channel. The active shortcut (Cmd vs Opt) is the `SHORTCUT_IS_CMD` atomic, toggleable from the menu.
@@ -56,6 +56,16 @@ Shared state is global `static`s guarded by `Mutex`/`RwLock`: `TAB_STATE` (the w
 - Reloadable at runtime via the menu ("Reload Config" → `reload_config`), which also re-applies theme and refreshes the overlay.
 - Color fields are 8-hex-digit `RRGGBBAA` strings; `parse_hex8` converts them. Many layout/font values are read live from `CONFIG` inside the UI helpers (e.g. `card_w()`, `current_colors()`), so config changes take effect on the next render.
 
+### `i18n.rs` - internationalization (handcrafted TOML, zero deps)
+- A handcrafted TOML-based i18n system, deliberately DIY (not `rust-i18n`/`fluent`) to keep dependencies minimal and stay isomorphic with `config.rs`. Translation files are embedded at compile time via `include_str!` from `locales/{en,zh-Hans,zh-Hant}.toml` (no runtime file IO, no missing-file risk).
+- **Locale flow**: driven by `config.i18n.locale` (`"auto"` | `"en"` | `"zh-Hans"` | `"zh-Hant"`, default `"auto"`). Resolution priority: config value (non-`auto` & supported) > first matching entry in the system `NSLocale preferredLanguages` list (scanned **in order**, so a supported language lower in the user's preference beats the default - e.g. `[ja, zh-Hans, en]` -> `zh-Hans`) > `"en"`. Chinese tags split by script/region: `Hant` / `TW` / `HK` / `MO` -> `zh-Hant`; everything else (incl. bare `zh`, `CN`, `SG`) -> `zh-Hans`.
+- **API**: `t(key) -> String` (current locale -> en fallback -> key itself) and `tf(key, &[("name","value")])` for templates with `{name}` placeholders. Locale TOML uses `[section]` groups, flattened at load to dot keys (e.g. `[menu]` `settings` -> `menu.settings`). Keys: `[menu]` / `[settings]` / `[alert]` / `[errors]`.
+- **Hot-reload**: `config.rs::reload_config()` and the `CONFIG` LazyLock init both call `i18n::apply_config_locale()`. `main.rs::refresh_menu_titles()` re-titles all 5 menu items (theme + shortcut labels are state-dependent; settings/reload/quit are static, stored in `FIXED_MENU_ITEMS`); `invalidate_settings_window()` releases the cached settings window so it rebuilds with the new locale on next open. Both run from `handle_reload_config`, `apply_config_refresh`, and `on_locale_changed`.
+- **Live system-language follow**: `on_locale_changed` observes `NSLocaleCurrentLocaleDidChangeNotification` on the default `NSNotificationCenter`; when the system language changes and `config.i18n.locale` is `auto`, it re-resolves and refreshes the UI (explicit locales short-circuit). It self-marshals to the main thread via `performSelectorOnMainThread` since the notification's delivery thread isn't guaranteed.
+- **No-cycle constraint (load-bearing)**: `i18n.rs` NEVER reads `CONFIG` (only `NSLocale`). This is required because `CONFIG`'s LazyLock init calls `validate()` -> `tf()` -> `I18N` init; if `I18N` read `CONFIG` it would deadlock. Do not break this.
+- **Add a language**: create `locales/xx.toml` (same keys), register it in `i18n::locale_raw()`, add it to the `validate()` allow-list in `config.rs`, and extend `map_tag_to_supported()` if `auto` should map a system tag to it.
+- Validation errors from `config.rs::validate()` are themselves localized via `tf()` (they surface in `show_alert`).
+
 
 ## Commit Messages
 
@@ -75,3 +85,10 @@ Add comments at key locations: non-obvious logic, important design decisions, FF
 // 只保留标准窗口，过滤弹出面板/下拉菜单等非标准窗口
 // Only keep AXStandardWindow, filtering out popups/panels/dropdowns
 ```
+
+## Internationalization
+
+- **All user-visible strings go through `t()` / `tf()`** in `i18n.rs` - never hardcode Chinese or English literals in UI code (menu titles, settings window labels, alert titles/buttons, validation errors). Add the key to **both** `locales/en.toml` and `locales/zh-Hans.toml` and reference it via `t("section.key")` (or `tf("section.key", &[("name","value")])` when interpolation is needed).
+- **Do NOT localize**: `println!`/`eprintln!` log lines (developer-facing, stay English) and `status_text` (the dynamic app/window title shown under the overlay - that's data, not UI chrome).
+- UI strings are single-language per locale. The zh settings labels intentionally keep the English config-key as a hint (e.g. `"主题 theme"`) since it helps users edit `config.toml`; en uses plain friendly names. This is a per-locale wording choice captured in the TOML, not a code concern.
+- Comments stay bilingual Chinese-first then English (see Code Comments above); that convention is about code comments, separate from UI-string localization.
