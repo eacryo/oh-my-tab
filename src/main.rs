@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use window_collector::{
-    MruMap, WindowInfo, cache_running_app_icons, ensure_icon_cache_dir,
-    extract_icon_to_cache, note_app_activated, raise_ax_window,
+    MruMap, WindowInfo, bump_window_mru, cache_running_app_icons, ensure_icon_cache_dir,
+    extract_icon_to_cache, focused_window_cgwid, note_app_activated, raise_ax_window,
 };
 use event_monitor::{GlobalEvent, start as start_event_monitor};
 
@@ -567,16 +567,16 @@ extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) 
 
     if let Some(w) = state.windows.get(state.selected) {
         let pid = w.pid;
-        let wid = w.window_id;
+        let cgwid = w.window_id;
         let wt = w.window_title.clone();
         println!(
             "[oh-my-tab] Switching to '{}' (pid={})",
             w.app_name, pid
         );
         hide_overlay();
-        activate_pid(pid);
-        raise_ax_window(pid, &wt);
-        state.mru.insert(wid, std::time::Instant::now());
+        activate_and_raise(pid, cgwid);
+        bump_window_mru(&mut state.mru, pid, cgwid);
+        eprintln!("[oh-my-tab] commit: pid={} cgwid={} title=\"{}\" selected={}", pid, cgwid, wt, state.selected);
     } else {
         eprintln!(
             "[oh-my-tab] CmdReleased: selected index {} out of bounds (windows={})",
@@ -600,7 +600,25 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
         CFRelease(key as *const c_void);
         if app.is_null() { return; }
         let pid: i32 = msg_send![app, processIdentifier];
+        // 更新 App 级激活时间（仅用于诊断，不参与排序）
+        // Update app-level activation time (diagnostics only, not used in sorting)
         note_app_activated(pid);
+        // 后台线程解析焦点窗口的 CGWindowID 并 bump 窗口级 MRU。
+        // 系统 Cmd+Tab / Dock 点击等外部焦点切换通过此路径反馈到窗口排序中。
+        // kAXFocusedWindow 的 AX 查询可能阻塞最高 50ms（目标 App 无响应时），
+        // 必须放到后台线程避免卡住主线程 UI。
+        // Resolve the focused window's CGWindowID off-main and bump window MRU.
+        // External focus switches (system Cmd+Tab, Dock clicks) feed into window
+        // ordering through this path. The kAXFocusedWindow AX query can block up
+        // to 50ms (target app unresponsive), so it must run off the main thread.
+        thread::spawn(move || {
+            if let Some(cgwid) = focused_window_cgwid(pid) {
+                let mut state_opt = TAB_STATE.lock().unwrap();
+                if let Some(ref mut state) = *state_opt {
+                    bump_window_mru(&mut state.mru, pid, cgwid);
+                }
+            }
+        });
     }
 }
 
@@ -634,12 +652,10 @@ extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void
     let state = state_opt.as_mut().unwrap();
     if let Some(w) = state.windows.get(idx) {
         let pid = w.pid;
-        let wid = w.window_id;
-        let wt = w.window_title.clone();
+        let cgwid = w.window_id;
         hide_overlay();
-        activate_pid(pid);
-        raise_ax_window(pid, &wt);
-        state.mru.insert(wid, std::time::Instant::now());
+        activate_and_raise(pid, cgwid);
+        bump_window_mru(&mut state.mru, pid, cgwid);
         state.visible = false;
     }
 }
@@ -722,12 +738,10 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
             KEY_RETURN => {
                 if let Some(w) = state.windows.get(state.selected) {
                     let pid = w.pid;
-                    let wid = w.window_id;
-                    let wt = w.window_title.clone();
+                    let cgwid = w.window_id;
                     hide_overlay();
-                    activate_pid(pid);
-                    raise_ax_window(pid, &wt);
-                    state.mru.insert(wid, std::time::Instant::now());
+                    activate_and_raise(pid, cgwid);
+                    bump_window_mru(&mut state.mru, pid, cgwid);
                 }
                 state.visible = false;
             }
@@ -1112,11 +1126,26 @@ fn activate_pid(pid: i32) {
         let app: *mut AnyObject =
             msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
         if !app.is_null() {
-            let _: bool = msg_send![app, activateWithOptions: 1usize];
+            // 激活该 App 但不抬起它所有窗口（不用 AllWindows）--只由 raise_ax_window 里的
+            // SLPS 抬起目标那一个窗口，避免"同 App 多窗口全被拉到前面"。activate 仍触发
+            // 激活通知、更新 LAST_ACTIVATED，MRU 不受影响。
+            // Activate the app without raising all its windows (no AllWindows) -- only
+            // raise_ax_window's SLPS call raises the single target window, avoiding "all
+            // same-app windows jump forward". activate still fires the activation notification
+            // and updates LAST_ACTIVATED, so MRU ordering is unaffected.
+            let _: bool = msg_send![app, activateWithOptions: 0usize];
         } else {
             eprintln!("[oh-my-tab] activate_pid: no running app for pid {}", pid);
         }
     }
+}
+
+/// 激活 App 并把指定窗口抬到最前（用 CGWindowID 精确定位 + SLPS 只抬一个窗口）。
+/// Activate the app and raise the target window (located by CGWindowID + raised
+/// individually via SLPS, not all-windows).
+fn activate_and_raise(pid: i32, cgwid: u32) {
+    activate_pid(pid);
+    raise_ax_window(pid, cgwid);
 }
 
 fn update_status_label() {

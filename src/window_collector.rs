@@ -7,23 +7,50 @@ use objc2::runtime::AnyObject;
 #[derive(Debug, Clone)]
 pub struct WindowInfo {
     pub pid: i32,
-    pub window_id: u32,
+    pub window_id: u32, // CGWindowID，用于精确 raise（SLPS）/配对
     pub app_name: String,
     pub window_title: String,
     pub icon_path: Option<String>,
     pub is_active: bool,
 }
 
-pub type MruMap = HashMap<u32, Instant>;
+/// 窗口级 MRU 时间戳，按 (pid, CGWindowID) 索引。
+/// 每个窗口独立追踪最后被激活/选中的时间，不与其他窗口共享。
+/// 排序时按 elapsed 升序——最近使用的窗口排在前面。
+/// Window-level MRU timestamps, keyed by (pid, CGWindowID).
+/// Each window is tracked independently — no app-level grouping.
+/// Sorted by elapsed ascending — most recently used windows come first.
+pub type MruMap = HashMap<(i32, u32), Instant>;
 
-/// PID → last time the app was activated (via system notification).
-/// Used in sorting so external app switches are reflected in the MRU order.
+/// PID → 最后一次 App 激活时间（通过 NSWorkspace 通知）。
+/// 仅用于诊断输出，不参与排序。排序已改为纯窗口级 MRU。
+/// PID → last app activation time (via NSWorkspace notification).
+/// Diagnostics only — sorting is now purely window-level MRU.
 static LAST_ACTIVATED: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, Instant>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-/// Called from the NSWorkspaceDidActivateApplicationNotification handler.
+/// 通过 NSWorkspaceDidActivateApplicationNotification 发送，由 main.rs 调用。
+/// 保留用于诊断——排序不再依赖此数据。
+/// Called from the NSWorkspaceDidActivateApplicationNotification handler in main.rs.
+/// Kept for diagnostics — sorting no longer depends on this data.
 pub fn note_app_activated(pid: i32) {
     LAST_ACTIVATED.lock().unwrap().insert(pid, Instant::now());
+}
+
+/// 将指定窗口的 MRU 时间戳更新为当前时间。
+/// 由三个路径调用：
+/// 1. oh-my-tab 内选中窗口（on_cmd_released / card_mouse_down / KEY_RETURN）
+/// 2. NSWorkspace 激活通知 → on_app_activated 后台线程解析焦点窗口后回主线程调用
+///    这是让系统 Cmd+Tab / Dock 点击等外部焦点切换也反映在窗口排序中的关键。
+/// Bump the MRU timestamp of a specific window to now. Called from three paths:
+/// 1. Window selected inside oh-my-tab (on_cmd_released / card_mouse_down / KEY_RETURN)
+/// 2. NSWorkspace activation notification → on_app_activated resolves the focused
+///    window on a background thread, then calls this on the main thread — this is how
+///    external focus switches (system Cmd+Tab, Dock clicks) feed into window ordering.
+pub fn bump_window_mru(mru: &mut MruMap, pid: i32, cgwid: u32) {
+    if cgwid != 0 {
+        mru.insert((pid, cgwid), Instant::now());
+    }
 }
 
 fn icon_cache_dir() -> String {
@@ -77,6 +104,107 @@ extern "C" {
         attribute: *const c_void,
         value: *const c_void,
     ) -> AXError;
+    fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: f64) -> AXError;
+}
+
+// ========== 私有 API（dlsym 运行时解析，和 BetterCmdTab 一致）==========
+// Private APIs (resolved at runtime via dlsym, same as BetterCmdTab).
+// 用来按 CGWindowID 精确配对 AX/CG 窗口、并在 WindowServer 层只抬起一个窗口。
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcessSerialNumber {
+    high_long_of_psn: u32,
+    low_long_of_psn: u32,
+}
+
+extern "C" {
+    fn dlopen(filename: *const c_char, mode: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+const RTLD_NOW: i32 = 2;
+
+/// dlopen 一个框架路径，返回句柄（失败返回 null）。
+/// dlopen a framework path, returning the handle (null on failure).
+unsafe fn dlopen_path(path: &str) -> *mut c_void {
+    let c = std::ffi::CString::new(path).unwrap();
+    dlopen(c.as_ptr(), RTLD_NOW)
+}
+
+type AxGetWindowFn = unsafe extern "C" fn(AXUIElementRef, *mut u32) -> AXError;
+type GetProcessForPIDFn = unsafe extern "C" fn(i32, *mut ProcessSerialNumber) -> i32;
+type SlpSetFrontFn = unsafe extern "C" fn(*mut ProcessSerialNumber, u32, i32) -> i32;
+
+static AX_GET_WINDOW: std::sync::LazyLock<Option<AxGetWindowFn>> = std::sync::LazyLock::new(|| unsafe {
+    // _AXUIElementGetWindow 是 HIServices 里的私有符号，dlopen 后 dlsym。
+    let name = b"_AXUIElementGetWindow\0";
+    let h = dlopen_path("/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices");
+    if h.is_null() { return None; }
+    let p = dlsym(h, name.as_ptr() as *const c_char);
+    if p.is_null() { None } else { Some(std::mem::transmute(p)) }
+});
+static GET_PROCESS_FOR_PID: std::sync::LazyLock<Option<GetProcessForPIDFn>> = std::sync::LazyLock::new(|| unsafe {
+    // GetProcessForPID 也在 HIServices，dlopen 后 dlsym。
+    let name = b"GetProcessForPID\0";
+    let h = dlopen_path("/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices");
+    if h.is_null() { return None; }
+    let p = dlsym(h, name.as_ptr() as *const c_char);
+    if p.is_null() { None } else { Some(std::mem::transmute(p)) }
+});
+static SLP_SET_FRONT: std::sync::LazyLock<Option<SlpSetFrontFn>> = std::sync::LazyLock::new(|| unsafe {
+    // SkyLight 是私有框架，必须先 dlopen 才能查到符号。
+    let name = b"_SLPSSetFrontProcessWithOptions\0";
+    let h = dlopen_path("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight");
+    if h.is_null() { return None; }
+    let p = dlsym(h, name.as_ptr() as *const c_char);
+    if p.is_null() { None } else { Some(std::mem::transmute(p)) }
+});
+
+/// 取一个 AX 窗口的 CGWindowID（私有 API _AXUIElementGetWindow）。
+/// 用它把 AX 窗口和 CG 窗口按 CGWindowID 精确配对，不再靠顺序/标题猜
+/// （Edge 等 CG 无窗口名的 App 之前会配错，导致 mru/raise 跟错窗口）。
+/// Get a CGWindowID for an AX window (private API _AXUIElementGetWindow).
+/// Used to pair AX windows with CG windows by CGWindowID instead of guessing
+/// by order/title (apps like Edge with no CG window name used to mismatch,
+/// corrupting mru/raise targeting).
+unsafe fn ax_window_cgwid(element: AXUIElementRef) -> Option<u32> {
+    let f = (*AX_GET_WINDOW)?;
+    let mut wid: u32 = 0;
+    if f(element, &mut wid) == K_AX_SUCCESS && wid != 0 { Some(wid) } else { None }
+}
+
+/// 查某 App 当前聚焦窗口的 CGWindowID（kAXFocusedWindow -> _AXUIElementGetWindow）。
+/// 比 AX[0] 可靠：AX 窗口数组顺序不一定是最前在前，但 kAXFocusedWindow 是明确聚焦的窗口。
+/// Get the CGWindowID of an app's currently focused window (kAXFocusedWindow ->
+/// _AXUIElementGetWindow). More reliable than AX[0]: the AX window array order
+/// isn't always frontmost-first, but kAXFocusedWindow is the explicitly focused window.
+pub(crate) unsafe fn focused_window_cgwid(pid: i32) -> Option<u32> {
+    let app = AXUIElementCreateApplication(pid);
+    if app.is_null() { return None; }
+    AXUIElementSetMessagingTimeout(app, 0.05); // 50ms 超时，避免卡死在无响应的 App 上。
+    let focused_key = cf_string_new("AXFocusedWindow");
+    let mut focused: *const c_void = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(app, focused_key, &mut focused);
+    CFRelease(focused_key);
+    CFRelease(app);
+    if err != K_AX_SUCCESS || focused.is_null() { return None; }
+    let wid = ax_window_cgwid(focused);
+    CFRelease(focused);
+    wid
+}
+
+/// 用 SkyLight 私有 API _SLPSSetFrontProcessWithOptions 在 WindowServer 层
+/// 只抬起指定 CGWindowID 的那一个窗口（不抬该 App 的所有窗口）。
+/// Raise only one window (by CGWindowID) at the WindowServer level via the
+/// SkyLight private API _SLPSSetFrontProcessWithOptions -- does NOT raise all
+/// of the app's windows the way activate(AllWindows) does.
+unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
+    let get_psn = match *GET_PROCESS_FOR_PID { Some(f) => f, None => return false };
+    let set_front = match *SLP_SET_FRONT { Some(f) => f, None => return false };
+    let mut psn = ProcessSerialNumber { high_long_of_psn: 0, low_long_of_psn: 0 };
+    if get_psn(pid, &mut psn) != 0 { return false; }
+    // mode 2 = userGenerated（BetterCmdTab 的取值）。
+    set_front(&mut psn, wid, 2) == 0 // CGError success == 0
 }
 
 fn cf_string_new(s: &str) -> *const c_void {
@@ -216,8 +344,18 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
     }
 }
 
-pub fn raise_ax_window(pid: i32, window_title: &str) {
+pub fn raise_ax_window(pid: i32, cgwid: u32) {
+    if cgwid == 0 { return; }
     unsafe {
+        // 1. WindowServer 层只抬这一个窗口（SkyLight 私有 API _SLPSSetFrontProcessWithOptions），
+        //    避免 activate(AllWindows) 把该 App 的所有窗口都抬到前面。
+        //    Raise only this one window at the WindowServer level (SkyLight private API),
+        //    avoiding activate(AllWindows) raising every window of the app.
+        let slps_ok = raise_window_slps(pid, cgwid);
+
+        // 2. AX 层聚焦该窗口：找到 CGWindowID 对应的 AX 窗口，setFocusedWindow + AXRaise。
+        //    Focus the window via AX: find the AX window with this CGWindowID, then
+        //    setFocusedWindow + AXRaise.
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() { return; }
 
@@ -228,36 +366,32 @@ pub fn raise_ax_window(pid: i32, window_title: &str) {
         if err != K_AX_SUCCESS || windows_array.is_null() { CFRelease(app); return; }
 
         let count = CFArrayGetCount(windows_array);
-        let title_key = cf_string_new("AXTitle");
         let raise_key = cf_string_new("AXRaise");
+        let focused_key = cf_string_new("AXFocusedWindow");
+        let mut matched = false;
 
         for i in 0..count {
             let element = CFArrayGetValueAtIndex(windows_array, i);
             if element.is_null() { continue; }
-            let mut title_value: *const c_void = std::ptr::null();
-            let err = AXUIElementCopyAttributeValue(element, title_key, &mut title_value);
-            if err == K_AX_SUCCESS && !title_value.is_null() {
-                if let Some(t) = cf_to_rust_string(title_value) {
-                    if t == window_title {
-                        let focused_key = cf_string_new("AXFocusedWindow");
-                        AXUIElementSetAttributeValue(app, focused_key, element);
-                        CFRelease(focused_key);
-                        AXUIElementPerformAction(element, raise_key);
-                        CFRelease(title_value);
-                        break;
-                    }
-                }
-                CFRelease(title_value);
+            if ax_window_cgwid(element) == Some(cgwid) {
+                AXUIElementSetAttributeValue(app, focused_key, element);
+                AXUIElementPerformAction(element, raise_key);
+                matched = true;
+                eprintln!("[oh-my-tab] raise_ax_window: matched cgwid={} (slps={}), raised", cgwid, slps_ok);
+                break;
             }
         }
-        CFRelease(title_key);
+        if !matched {
+            eprintln!("[oh-my-tab] raise_ax_window: NO MATCH for pid={} cgwid={} (ax_windows={}, slps={})", pid, cgwid, count, slps_ok);
+        }
         CFRelease(raise_key);
+        CFRelease(focused_key);
         CFRelease(windows_array);
         CFRelease(app);
     }
 }
 
-fn get_ax_windows_for_pid(pid: i32) -> Vec<String> {
+fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String)> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() { return vec![]; }
@@ -300,7 +434,9 @@ fn get_ax_windows_for_pid(pid: i32) -> Vec<String> {
             } else {
                 String::new()
             };
-            results.push(title);
+            // 取该 AX 窗口的 CGWindowID（私有 API），用于和 CG 窗口精确配对。
+            let cgwid = ax_window_cgwid(element).unwrap_or(0);
+            results.push((cgwid, title));
         }
         CFRelease(title_key);
         CFRelease(subrole_key);
@@ -348,6 +484,10 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // 以 AX 窗口列表为主数据源（macOS App Switcher 的做法）
     // Use AX window list as primary source (same as macOS App Switcher)
     let mut ax_by_pid: HashMap<i32, Vec<String>> = HashMap::new();
+    // pid -> (CGWindowID -> AX 标题)，用于按 CGWindowID 精确配对 CG 窗口（不再按顺序/标题猜）。
+    // pid -> (CGWindowID -> AX title), to pair CG windows by CGWindowID (no more
+    // order/title guessing).
+    let mut ax_wid_to_title: HashMap<i32, HashMap<u32, String>> = HashMap::new();
     // AX 窗口「全部」为空标题的 App（如 Microsoft To Do：自绘标题栏 -> AXTitle 为空）。
     // 这类 App 的空标题窗口是真实主窗口，不能被当作弹出面板丢弃。
     // Apps whose AX windows are ALL untitled (e.g. Microsoft To Do, which has a
@@ -357,10 +497,15 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     for &pid in &pids {
         let ax_wins = get_ax_windows_for_pid(pid);
         if !ax_wins.is_empty() {
-            if ax_wins.iter().all(|t| t.is_empty()) {
+            if ax_wins.iter().all(|(_, t)| t.is_empty()) {
                 titleless_pids.insert(pid);
             }
-            ax_by_pid.insert(pid, ax_wins);
+            ax_by_pid.insert(pid, ax_wins.iter().map(|(_, t)| t.clone()).collect());
+            let mut wid_map: HashMap<u32, String> = HashMap::new();
+            for (cgwid, title) in &ax_wins {
+                if *cgwid != 0 { wid_map.insert(*cgwid, title.clone()); }
+            }
+            ax_wid_to_title.insert(pid, wid_map);
         }
     }
 
@@ -378,34 +523,20 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         if owner_name.is_empty() || owner_name == "Dock" { continue; }
 
         let cg_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
-        let window_id = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
 
-        // AX 为权威数据源：CG 窗口必须匹配 AX 窗口才保留
-        // AX is authoritative: CG windows must match an AX window to be included
-        let window_title = if let Some(ax_wins) = ax_by_pid.get(&owner_pid) {
-            if cg_title.is_empty() {
-                // CG 标题为空 → 分配第一个未使用的 AX 标题
-                // Empty CG title → assign first unused AX title
-                let mut found: Option<String> = None;
-                for ax_title in ax_wins {
-                    if !ax_title.is_empty() && !windows.iter().any(|w: &WindowInfo| w.pid == owner_pid && w.window_title == *ax_title) {
-                        found = Some(ax_title.clone());
-                        break;
-                    }
-                }
-                found.unwrap_or_default()
-            } else {
-                // CG 标题必须在 AX 列表中存在，否则是弹出面板/下拉菜单
-                // CG title must exist in AX list; otherwise it's a popup/panel
-                if ax_wins.iter().any(|t| *t == cg_title) {
-                    cg_title
-                } else {
-                    continue; // CG 窗口不在 AX 中 → 弹出面板，跳过
-                              // CG window not in AX → popup/panel, skip
-                }
+        // 按 CGWindowID 精确配对 AX 标题（不再按顺序/字符串猜）。
+        // AX 为权威数据源：CG 窗口必须能在 AX 里按 CGWindowID 找到才保留。
+        // Pair the AX title by CGWindowID (no more order/string guessing).
+        // AX is authoritative: a CG window is kept only if AX has a window with
+        // the same CGWindowID.
+        let window_title = if let Some(wid_map) = ax_wid_to_title.get(&owner_pid) {
+            match wid_map.get(&cgwid) {
+                Some(t) => t.clone(),
+                None => continue, // CG 窗口在 AX 里没有 -> 弹出面板，跳过 / popup, skip
             }
         } else {
-            // No AX data for this app → fall back to CG title
+            // 该 App 无 AX 数据 -> 退回 CG 标题。 / No AX data -> fall back to CG title.
             cg_title
         };
 
@@ -421,41 +552,45 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             continue;
         }
 
-        let ordered_ts = now.checked_sub(std::time::Duration::from_millis(insertion_order as u64)).unwrap_or(now);
-        mru.entry(window_id).or_insert(ordered_ts);
+        // 使用极旧的时间戳作为回退值，确保真实 MRU 条目（用户曾选中过的窗口）永远排在前面。
+        // ordeded_ts 在 CG 枚举顺序上递减，作为"无 MRU 记录"的窗口之间的稳定排序依据。
+        // Use very old timestamps as fallback so real MRU entries (windows the user has
+        // explicitly selected) always sort first. ordered_ts decreasing within CG enumeration
+        // order serves as a stable tiebreaker among "no MRU record" windows.
+        let ancient_base = now.checked_sub(std::time::Duration::from_secs(86_400)).unwrap_or(now);
+        let ordered_ts = ancient_base.checked_sub(std::time::Duration::from_millis(insertion_order as u64)).unwrap_or(ancient_base);
+        // mru 按 (pid, CGWindowID) 索引——CGWindowID 在窗口生命周期内稳定不变，
+        // 比 title 更可靠（title 会随浏览器标签页切换而变）。
+        // Key mru by (pid, CGWindowID) — CGWindowID is stable for the window's
+        // lifetime, more reliable than title (which changes with browser tabs).
+        mru.entry((owner_pid, cgwid)).or_insert(ordered_ts);
         insertion_order += 1;
         let icon_path = check_icon_cache(owner_pid);
-        windows.push(WindowInfo { pid: owner_pid, window_id, app_name: owner_name, window_title, icon_path, is_active: false });
+        windows.push(WindowInfo { pid: owner_pid, window_id: cgwid, app_name: owner_name, window_title, icon_path, is_active: false });
     }
 
     unsafe { CFRelease(array) };
 
-    let la = LAST_ACTIVATED.lock().unwrap();
+    // 纯窗口级 MRU 排序：每个窗口独立按最后被激活的时间排序。
+    // 不再使用 App 级 LAST_ACTIVATED——避免从 App C 切到浏览器的窗口 A 时，
+    // 浏览器的另一个窗口 B 也"搭便车"排到 C 前面。
+    // Pure window-level MRU sort: each window is sorted independently by
+    // when it was last activated. No app-level LAST_ACTIVATED grouping —
+    // prevents browser window B from riding A's coattails when switching
+    // from app C to browser window A.
     windows.sort_by(|a, b| {
-        // 主键：App 级激活时间 LAST_ACTIVATED[pid]。外部激活（点窗口 / Dock /
-        // 系统 Cmd+Tab）都会更新它，这样排序才反映外部切换，对齐原生 Cmd+Tab。
-        // Primary: app-level activation time. External activations update this, so the
-        // order reflects external switches too, matching native Cmd+Tab.
-        let pa = la.get(&a.pid)
-            .map(|t| t.elapsed())
-            .unwrap_or(std::time::Duration::from_secs(999));
-        let pb = la.get(&b.pid)
-            .map(|t| t.elapsed())
-            .unwrap_or(std::time::Duration::from_secs(999));
-        // 次键：同 App 多窗口时，按 oh-my-tab 上次切到该窗口的时间排序。
-        // Secondary (tiebreaker): for multiple windows of the same app, order by when
-        // oh-my-tab last switched to that specific window.
-        pa.cmp(&pb).then_with(|| {
-            let wa = mru.get(&a.window_id)
-                .map(|t| t.elapsed())
-                .unwrap_or(std::time::Duration::from_secs(999));
-            let wb = mru.get(&b.window_id)
-                .map(|t| t.elapsed())
-                .unwrap_or(std::time::Duration::from_secs(999));
-            wa.cmp(&wb)
-        })
+        let wa = mru.get(&(a.pid, a.window_id)).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
+        let wb = mru.get(&(b.pid, b.window_id)).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
+        wa.cmp(&wb)
     });
-    drop(la);
+
+    // [诊断] 打印排序后的顺序（= 实际显示顺序），含 mru 年龄。
+    // Diagnostic: print sorted order (= display order) with MRU age.
+    eprintln!("[oh-my-tab] sorted: {} windows", windows.len());
+    for w in &windows {
+        let mru_ms = mru.get(&(w.pid, w.window_id)).map(|t| t.elapsed().as_millis());
+        eprintln!("[oh-my-tab]   pid={} cgwid={} title=\"{}\" mru_ms={:?}", w.pid, w.window_id, w.window_title, mru_ms);
+    }
 
     if let Some(first) = windows.first_mut() { first.is_active = true; }
     windows
