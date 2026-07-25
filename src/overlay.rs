@@ -1,0 +1,823 @@
+//! 切换器浮窗与卡片 UI:浮窗/容器/状态栏的 static、卡片↔索引映射、键盘/鼠标回调,
+//! 以及浮窗的显示/隐藏/刷新/卡片构建/主题应用等渲染逻辑。activate_and_raise 负责
+//! 激活 App 并抬起目标窗口。KEY_* 为键盘导航键码。
+//!
+//! Switcher overlay & card UI: statics for the overlay/container/status bar, the card<->index
+//! map, keyboard/mouse callbacks, and the overlay's show/hide/refresh/card-build/theme-apply
+//! rendering. activate_and_raise activates the app and raises the target window. KEY_* are
+//! keyboard-navigation key codes.
+
+use objc2::runtime::{AnyObject, Sel};
+use objc2::{class, msg_send};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
+use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
+
+use crate::config::{self, CONFIG};
+use crate::ffi::*;
+use crate::theme::*;
+use crate::window_collector::{WindowInfo, bump_window_mru, extract_icon_to_cache, raise_ax_window};
+// 跨模块共享状态(由 main.rs 持有,这里读写)/ cross-module shared state (owned by main.rs)
+use crate::{TAB_STATE, THEME_STATE};
+
+// ========== 键盘键码 / keyboard key codes ==========
+
+pub(crate) const KEY_TAB: u16 = 48;
+pub(crate) const KEY_LEFT: u16 = 123;
+pub(crate) const KEY_RIGHT: u16 = 124;
+pub(crate) const KEY_DOWN: u16 = 125;
+pub(crate) const KEY_UP: u16 = 126;
+pub(crate) const KEY_ESCAPE: u16 = 53;
+pub(crate) const KEY_RETURN: u16 = 36;
+
+// ========== 浮窗相关全局状态 / overlay global state ==========
+
+pub(crate) static OVERLAY_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+pub(crate) static CONTAINER: Mutex<Option<ObjPtr>> = Mutex::new(None);
+pub(crate) static STATUS_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// macOS 26+ 的 NSGlassEffectView 指针(用于设置热重载时重新应用玻璃属性)。
+/// Pointer to the NSGlassEffectView on macOS 26+ (used to re-apply glass properties on hot reload).
+pub(crate) static GLASS_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+pub(crate) static CARD_CLASS: Mutex<Option<ObjClassPtr>> = Mutex::new(None);
+/// Maps card view pointer (as usize) -> card index, avoiding property accessor
+/// msg_send! issues on dynamically-registered ObjC classes.
+pub(crate) static CARD_INDEX_MAP: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Prevents hover-selection on the card under the cursor when the window first
+/// opens. Set to false in show_overlay(), flipped to true on first mouseMoved:.
+pub(crate) static MOUSE_MOVED: AtomicBool = AtomicBool::new(false);
+
+// ========== 卡片 ↔ 索引映射 / card <-> index map ==========
+
+/// Read the card index from the card index map (keyed by view pointer).
+/// This avoids msg_send! encoding issues with property accessors on
+/// dynamically-registered ObjC classes.
+pub(crate) fn get_card_index(view: *mut AnyObject) -> usize {
+    let map = CARD_INDEX_MAP.lock().unwrap();
+    map.get(&(view as usize)).copied().unwrap_or(0)
+}
+
+pub(crate) fn set_card_index(view: *mut AnyObject, idx: usize) {
+    let mut map = CARD_INDEX_MAP.lock().unwrap();
+    map.insert(view as usize, idx);
+}
+
+pub(crate) fn remove_card_index(view: *mut AnyObject) {
+    let mut map = CARD_INDEX_MAP.lock().unwrap();
+    map.remove(&(view as usize));
+}
+
+pub(crate) fn clear_card_indices() {
+    let mut map = CARD_INDEX_MAP.lock().unwrap();
+    map.clear();
+}
+
+// ========== 文本 helper / text helpers ==========
+
+/// 截断文本到指定显示宽度(ASCII 计 1、其余计 2),超出加省略号。
+/// Truncate text to a display width (ASCII=1, others=2), appending an ellipsis if exceeded.
+fn truncate_text(text: &str, max_width: usize) -> String {
+    let mut width: usize = 0;
+    for (i, c) in text.char_indices() {
+        let w = if c.is_ascii() { 1 } else { 2 };
+        if width + w > max_width {
+            let t: String = text[..i].chars().collect();
+            return format!("{}…", t);
+        }
+        width += w;
+    }
+    text.to_string()
+}
+
+/// 占位符:窗口没有标题时(如 Microsoft To Do,AXTitle 为空)显示一个短横线。
+/// 注意:仅用于显示。内部 `window_title` 仍保持空串,这样 raise_ax_window 仍能
+/// 按空标题匹配到对应的 AX 窗口并聚焦。
+/// Placeholder shown for windows that expose no title (e.g. Microsoft To Do,
+/// whose custom title bar yields an empty AXTitle). Display-only: the internal
+/// `window_title` stays empty so raise_ax_window can still match the AX window
+/// by its empty title.
+fn display_title(title: &str) -> String {
+    if title.is_empty() {
+        "-".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+// ========== 通用控件 helper / generic control helper ==========
+
+/// 创建一个简单(非 attributed)NSTextField 标签,sizeToFit 后在 container_width 内水平居中。
+/// 被 create_card_view 与 main 的 create_overlay_window(状态栏)共用。
+/// Create a simple (non-attributed) NSTextField label, size it to fit text,
+/// then center it horizontally within `container_width`. Shared by create_card_view
+/// and main's create_overlay_window (status bar).
+pub(crate) unsafe fn make_centered_label(
+    text: &str,
+    font: *mut AnyObject,
+    color: *mut AnyObject,
+    y: f64,
+    container_width: f64,
+    height: f64,
+) -> *mut AnyObject {
+    let ns_str = make_nsstring(text);
+    // Create with a wide enough frame
+    let init_frame = NSRect::new(NSPoint::new(0.0, y), NSSize::new(container_width, height));
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: init_frame];
+    let _: () = msg_send![label, setStringValue: ns_str];
+    CFRelease(ns_str as *const c_void);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setTextColor: color];
+    // Size to fit content, then center horizontally
+    let _: () = msg_send![label, sizeToFit];
+    let fitted: NSRect = msg_send![label, frame];
+    let text_w = fitted.size.width;
+    let center_x = ((container_width - text_w) / 2.0).max(0.0);
+    let _: () = msg_send![label, setFrame: NSRect::new(NSPoint::new(center_x, y), NSSize::new(text_w, height))];
+    label
+}
+
+// ========== ObjC 回调实现 / ObjC callback implementations ==========
+
+pub(crate) extern "C" fn on_cmd_tab_pressed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    let mut state_opt = TAB_STATE.lock().unwrap();
+    let state = state_opt.as_mut().unwrap();
+
+    if !state.visible {
+        state.refresh();
+        state.visible = true;
+        state.selected = if state.windows.len() > 1 { 1 } else { 0 };
+        drop(state_opt);
+        show_overlay();
+    } else {
+        state.selected = (state.selected + 1) % state.windows.len().max(1);
+        drop(state_opt);
+        refresh_highlight();
+        update_status_label();
+        extract_uncached_icons();
+    }
+}
+
+pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    let mut state_opt = TAB_STATE.lock().unwrap();
+    let state = state_opt.as_mut().unwrap();
+    if !state.visible {
+        return;
+    }
+
+    if let Some(w) = state.windows.get(state.selected) {
+        let pid = w.pid;
+        let cgwid = w.window_id;
+        let wt = w.window_title.clone();
+        println!(
+            "[oh-my-tab] Switching to '{}' (pid={})",
+            w.app_name, pid
+        );
+        hide_overlay();
+        activate_and_raise(pid, cgwid);
+        bump_window_mru(&mut state.mru, pid, cgwid);
+        eprintln!("[oh-my-tab] commit: pid={} cgwid={} title=\"{}\" selected={}", pid, cgwid, wt, state.selected);
+    } else {
+        eprintln!(
+            "[oh-my-tab] CmdReleased: selected index {} out of bounds (windows={})",
+            state.selected,
+            state.windows.len()
+        );
+    }
+    state.visible = false;
+}
+
+pub(crate) extern "C" fn on_theme_toggled(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    apply_theme();
+}
+
+// --- Card View ---
+
+pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    let idx = get_card_index(_self as *mut AnyObject);
+    let mut state_opt = TAB_STATE.lock().unwrap();
+    let state = state_opt.as_mut().unwrap();
+    if let Some(w) = state.windows.get(idx) {
+        let pid = w.pid;
+        let cgwid = w.window_id;
+        hide_overlay();
+        activate_and_raise(pid, cgwid);
+        bump_window_mru(&mut state.mru, pid, cgwid);
+        state.visible = false;
+    }
+}
+
+pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    // Ignore hover until the user has moved the mouse at least once.
+    // Prevents selecting the card under the cursor when the window first opens.
+    if !MOUSE_MOVED.load(Ordering::Relaxed) {
+        return;
+    }
+    let idx = get_card_index(_self as *mut AnyObject);
+    let mut state_opt = TAB_STATE.lock().unwrap();
+    let state = state_opt.as_mut().unwrap();
+    if state.selected != idx {
+        state.selected = idx;
+        drop(state_opt);
+        refresh_highlight();
+        update_status_label();
+    }
+}
+
+// --- Container View ---
+
+pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    unsafe {
+        let key_code: u16 = msg_send![event as *mut AnyObject, keyCode];
+        let mut state_opt = TAB_STATE.lock().unwrap();
+        let state = state_opt.as_mut().unwrap();
+
+        if !state.visible {
+            return;
+        }
+
+        match key_code {
+            KEY_TAB | KEY_RIGHT => {
+                if !state.windows.is_empty() {
+                    state.selected = (state.selected + 1) % state.windows.len();
+                    drop(state_opt);
+                    refresh_highlight();
+                    update_status_label();
+                    return;
+                }
+            }
+            KEY_LEFT => {
+                if !state.windows.is_empty() {
+                    state.selected = if state.selected == 0 {
+                        state.windows.len() - 1
+                    } else {
+                        state.selected - 1
+                    };
+                    drop(state_opt);
+                    refresh_highlight();
+                    update_status_label();
+                    return;
+                }
+            }
+            KEY_UP => {
+                if !state.windows.is_empty() {
+                    if state.selected >= cards_per_row() {
+                        state.selected -= cards_per_row();
+                        drop(state_opt);
+                        refresh_highlight();
+                        update_status_label();
+                    }
+                    return;
+                }
+            }
+            KEY_DOWN => {
+                if !state.windows.is_empty() {
+                    let new_idx = state.selected + cards_per_row();
+                    if new_idx < state.windows.len() {
+                        state.selected = new_idx;
+                        drop(state_opt);
+                        refresh_highlight();
+                        update_status_label();
+                    }
+                    return;
+                }
+            }
+            KEY_RETURN => {
+                if let Some(w) = state.windows.get(state.selected) {
+                    let pid = w.pid;
+                    let cgwid = w.window_id;
+                    hide_overlay();
+                    activate_and_raise(pid, cgwid);
+                    bump_window_mru(&mut state.mru, pid, cgwid);
+                }
+                state.visible = false;
+            }
+            KEY_ESCAPE => {
+                state.visible = false;
+                hide_overlay();
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(crate) extern "C" fn container_accepts_first_responder(_self: *mut c_void, _cmd: Sel) -> bool {
+    true
+}
+
+pub(crate) extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    MOUSE_MOVED.store(true, Ordering::Relaxed);
+}
+
+// ========== 窗口激活 / window activation ==========
+
+pub(crate) fn activate_pid(pid: i32) {
+    unsafe {
+        let app: *mut AnyObject =
+            msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+        if !app.is_null() {
+            // 激活该 App 但不抬起它所有窗口(不用 AllWindows)--只由 raise_ax_window 里的
+            // SLPS 抬起目标那一个窗口,避免"同 App 多窗口全被拉到前面"。activate 仍触发
+            // 激活通知、更新 LAST_ACTIVATED,MRU 不受影响。
+            // Activate the app without raising all its windows (no AllWindows) -- only
+            // raise_ax_window's SLPS call raises the single target window, avoiding "all
+            // same-app windows jump forward". activate still fires the activation notification
+            // and updates LAST_ACTIVATED, so MRU ordering is unaffected.
+            let _: bool = msg_send![app, activateWithOptions: 0usize];
+        } else {
+            eprintln!("[oh-my-tab] activate_pid: no running app for pid {}", pid);
+        }
+    }
+}
+
+/// 激活 App 并把指定窗口抬到最前(用 CGWindowID 精确定位 + SLPS 只抬一个窗口)。
+/// Activate the app and raise the target window (located by CGWindowID + raised
+/// individually via SLPS, not all-windows).
+pub(crate) fn activate_and_raise(pid: i32, cgwid: u32) {
+    activate_pid(pid);
+    raise_ax_window(pid, cgwid);
+}
+
+// ========== 浮窗渲染 / overlay rendering ==========
+
+pub(crate) fn update_status_label() {
+    unsafe {
+        let status_label = match *STATUS_LABEL.lock().unwrap() {
+            Some(l) => l.0,
+            None => return,
+        };
+        let state_opt = TAB_STATE.lock().unwrap();
+        let state = match state_opt.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let selected = state.selected;
+        // status_text 是窗口下面那一行长的应用名称
+        let status_text = match state.windows.get(selected) {
+            Some(w) => truncate_text(&display_title(&w.window_title), 126),
+            None => String::new(),
+        };
+        drop(state_opt);
+
+        let colors = current_colors();
+        let status_font: *mut AnyObject =
+            {
+    let cfg = CONFIG.read().unwrap();
+    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
+};
+        let status_color = hex_to_ns_color(colors.status_bar_text);
+        let ns_stat = make_nsstring(&status_text);
+        let _: () = msg_send![status_label, setStringValue: ns_stat];
+        CFRelease(ns_stat as *const c_void);
+        let _: () = msg_send![status_label, setFont: status_font];
+        let _: () = msg_send![status_label, setTextColor: status_color];
+        // Size to fit + recenter horizontally
+        let _: () = msg_send![status_label, sizeToFit];
+        let fitted: NSRect = msg_send![status_label, frame];
+        let stat_w = fitted.size.width;
+        let container_w = {
+            let container = CONTAINER.lock().unwrap();
+            let c = container.unwrap().0;
+            let f: NSRect = msg_send![c, frame];
+            f.size.width
+        };
+        let stat_x = ((container_w - stat_w) / 2.0).max(0.0);
+        let _: () = msg_send![status_label, setFrame: NSRect::new(NSPoint::new(stat_x, 0.0), NSSize::new(stat_w, STATUS_H))];
+    }
+}
+
+pub(crate) fn hide_overlay() {
+    unsafe {
+        if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
+            let _: () = msg_send![window.0, orderOut: std::ptr::null::<AnyObject>()];
+        }
+    }
+}
+
+pub(crate) fn refresh_highlight() {
+    unsafe {
+        let container = match *CONTAINER.lock().unwrap() {
+            Some(c) => c.0,
+            None => return,
+        };
+        let state_opt = TAB_STATE.lock().unwrap();
+        let state = match state_opt.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        if !state.visible {
+            return;
+        }
+        let selected = state.selected;
+        let colors = current_colors();
+        let sel_color = hex_to_cg_color(colors.card_border_sel);
+
+        let subviews: *mut AnyObject = msg_send![container, subviews];
+        let sv_count: usize = msg_send![subviews, count];
+
+        for i in 0..sv_count {
+            let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
+            // Only operate on card views (skip status label which is NSTextField)
+            let is_nstextfield: bool = msg_send![sv, isKindOfClass: class!(NSTextField)];
+            if is_nstextfield {
+                continue;
+            }
+            let layer: *mut AnyObject = msg_send![sv, layer];
+            let tag = get_card_index(sv);
+            if tag == selected {
+                let _: () = msg_send![layer, setBorderWidth: 3.0f64];
+                layer_set_border(layer, sel_color);
+            } else {
+                let _: () = msg_send![layer, setBorderWidth: 0.0f64];
+                layer_set_border(layer, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+pub(crate) fn extract_uncached_icons() {
+    let uncached: Vec<i32> = {
+        let state_opt = TAB_STATE.lock().unwrap();
+        if let Some(ref state) = *state_opt {
+            state
+                .windows
+                .iter()
+                .filter(|w| w.icon_path.is_none())
+                .map(|w| w.pid)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect()
+        } else {
+            return;
+        }
+    };
+
+    // Record which window indices got a freshly cached icon so we can re-render
+    // just those cards in place (otherwise the on-screen letter icons wouldn't
+    // update until the next summon).
+    let mut updated_indices: Vec<usize> = Vec::new();
+    for pid in uncached {
+        if let Some(ref path) = extract_icon_to_cache(pid) {
+            let path = path.clone();
+            let mut state_opt = TAB_STATE.lock().unwrap();
+            if let Some(ref mut state) = *state_opt {
+                for (i, w) in state.windows.iter_mut().enumerate() {
+                    if w.pid == pid && w.icon_path.is_none() {
+                        w.icon_path = Some(path.clone());
+                        updated_indices.push(i);
+                    }
+                }
+            }
+        }
+    }
+
+    if !updated_indices.is_empty() {
+        rebuild_cards(&updated_indices);
+    }
+}
+
+/// Rebuild the card views for the given window indices in place, so newly
+/// extracted icons appear immediately without re-summoning. Each affected card
+/// is replaced by a fresh one built from the updated `WindowInfo` (which now has
+/// an icon_path), preserving its frame and card index.
+pub(crate) fn rebuild_cards(indices: &[usize]) {
+    if indices.is_empty() {
+        return;
+    }
+    let affected: HashSet<usize> = indices.iter().copied().collect();
+    let to_rebuild: HashMap<usize, WindowInfo> = {
+        let state_opt = TAB_STATE.lock().unwrap();
+        let state = match state_opt.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        if !state.visible {
+            return;
+        }
+        affected
+            .iter()
+            .filter_map(|&i| state.windows.get(i).map(|w| (i, w.clone())))
+            .collect()
+    };
+    if to_rebuild.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let container = match *CONTAINER.lock().unwrap() {
+            Some(c) => c.0,
+            None => return,
+        };
+        let subviews: *mut AnyObject = msg_send![container, subviews];
+        let sv_count: usize = msg_send![subviews, count];
+
+        // Collect affected card views + their frames first; don't mutate the
+        // subview array while iterating it.
+        let mut replacements: Vec<(*mut AnyObject, NSRect, usize)> = Vec::new();
+        for i in 0..sv_count {
+            let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
+            let is_label: bool = msg_send![sv, isKindOfClass: class!(NSTextField)];
+            if is_label {
+                continue;
+            }
+            let idx = get_card_index(sv);
+            if to_rebuild.contains_key(&idx) {
+                let frame: NSRect = msg_send![sv, frame];
+                replacements.push((sv, frame, idx));
+            }
+        }
+
+        for (old_view, frame, idx) in replacements {
+            if let Some(w) = to_rebuild.get(&idx) {
+                remove_card_index(old_view);
+                let new_card = create_card_view(w, idx);
+                let _: () = msg_send![new_card, setFrame: frame];
+                let _: () = msg_send![old_view, removeFromSuperview];
+                let _: () = msg_send![container, addSubview: new_card];
+                release_obj(new_card); // container owns the card; drop create_card_view's alloc +1
+            }
+        }
+
+        // New card views have no selection border; re-apply the highlight.
+        refresh_highlight();
+    }
+}
+
+/// 把 CONFIG 里的玻璃属性(style/tint/cornerRadius)重新应用到已存在的 NSGlassEffectView,
+/// 用于设置热重载。仅 macOS 26+ 且玻璃视图已创建时生效;否则空操作。
+/// Re-apply glass properties (style/tint/cornerRadius) from CONFIG to the existing
+/// NSGlassEffectView, for hot reload. Only effective on macOS 26+ once the glass view
+/// exists; otherwise a no-op.
+pub(crate) unsafe fn apply_glass_properties() {
+    let glass = match *GLASS_VIEW.lock().unwrap() {
+        Some(g) => g.0,
+        None => return,
+    };
+    if glass.is_null() { return; }
+    let cfg = CONFIG.read().unwrap();
+    let _: () = msg_send![glass, setCornerRadius: cfg.appearance.corner_radius];
+    let style: i64 = match cfg.appearance.glass_style.as_str() {
+        "clear" => 1,
+        _ => 0, // regular
+    };
+    let _: () = msg_send![glass, setStyle: style];
+    let tint_hex = config::parse_hex8(&cfg.appearance.glass_tint);
+    let tint = hex_to_ns_color(tint_hex);
+    let _: () = msg_send![glass, setTintColor: tint];
+}
+
+pub(crate) fn apply_theme() {
+    unsafe {
+        let is_dark = THEME_STATE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(false, |s| s.is_dark);
+
+        // Update window appearance for blur material tint
+        if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
+            let appearance_name = if is_dark {
+                make_nsstring("NSAppearanceNameDarkAqua")
+            } else {
+                make_nsstring("NSAppearanceNameAqua")
+            };
+            let appearance: *mut AnyObject =
+                msg_send![class!(NSAppearance), appearanceNamed: appearance_name];
+            CFRelease(appearance_name as *const c_void);
+            if !appearance.is_null() {
+                let _: () = msg_send![window.0, setAppearance: appearance];
+            }
+        }
+
+        apply_glass_properties();
+        refresh_highlight();
+    }
+}
+
+pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
+    unsafe {
+        let card_cls = CARD_CLASS.lock().unwrap().unwrap();
+        let card_cls_ptr = card_cls.0 as *mut AnyObject;
+
+        let frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(card_w(), card_h()),
+        );
+        let view: *mut AnyObject = msg_send![card_cls_ptr, alloc];
+        let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
+
+        // Enable layer for selection border
+        let _: () = msg_send![view, setWantsLayer: true];
+        let layer: *mut AnyObject = msg_send![view, layer];
+        let _: () = msg_send![layer, setCornerRadius: 24.0f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+
+        // Store card index in side map (avoids msg_send! issues on dynamic classes)
+        set_card_index(view, index);
+
+        let colors = current_colors();
+        let icon_x = (card_w() - icon_px()) / 2.0; // 16.0
+        // Standard coords: y=0 at bottom, y=200 at top.
+        // Icon: 8px from top -> y = 200 - 8 - 128 = 64
+        let icon_bottom = card_h() - 8.0 - icon_px(); // 64.0
+
+        // --- Icon ---
+        if let Some(ref icon_path) = w.icon_path {
+            let ns_path = make_nsstring(icon_path);
+            let ns_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+            let ns_image: *mut AnyObject =
+                msg_send![ns_image, initWithContentsOfFile: ns_path];
+            CFRelease(ns_path as *const c_void);
+
+            if !ns_image.is_null() {
+                let img_frame = NSRect::new(
+                    NSPoint::new(icon_x, icon_bottom),
+                    NSSize::new(icon_px(), icon_px()),
+                );
+                let img_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+                let img_view: *mut AnyObject = msg_send![img_view, initWithFrame: img_frame];
+                let _: () = msg_send![img_view, setImage: ns_image];
+                release_obj(ns_image); // img_view owns the image now; drop our alloc +1
+                // NSImageScaleProportionallyUpOrDown = 3
+                let _: () = msg_send![img_view, setImageScaling: 3u64];
+                let _: () = msg_send![view, addSubview: img_view];
+                release_obj(img_view); // view owns the image view now; drop our alloc +1
+            }
+        } else {
+            // Letter icon: rounded square with first letter
+            let letter_sq = letter_px();
+            let letter_x = icon_x + (icon_px() - letter_sq) / 2.0;
+            // Center the 64x64 square within the 128x128 icon area
+            let letter_y = icon_bottom + (icon_px() - letter_sq) / 2.0;
+            let letter_frame = NSRect::new(
+                NSPoint::new(letter_x, letter_y),
+                NSSize::new(letter_sq, letter_sq),
+            );
+
+            let letter_view: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let letter_view: *mut AnyObject = msg_send![letter_view, initWithFrame: letter_frame];
+            let _: () = msg_send![letter_view, setWantsLayer: true];
+            let ll: *mut AnyObject = msg_send![letter_view, layer];
+            let _: () = msg_send![ll, setCornerRadius: 14.0f64];
+            let _: () = msg_send![ll, setMasksToBounds: true];
+            let bg_color = hex_to_cg_color(colors.icon_inner_bg);
+            layer_set_background(ll, bg_color);
+
+            let init = w
+                .app_name
+                .chars()
+                .next()
+                .unwrap_or('?')
+                .to_string();
+            let font: *mut AnyObject =
+                msg_send![class!(NSFont), systemFontOfSize: 28.0f64, weight: 0.4f64];
+            let text_color = hex_to_ns_color(colors.icon_text);
+            let label = make_centered_label(&init, font, text_color, 0.0, letter_sq, letter_sq);
+            let _: () = msg_send![letter_view, addSubview: label];
+            release_obj(label); // letter_view owns the label; drop our alloc +1
+            let _: () = msg_send![view, addSubview: letter_view];
+            release_obj(letter_view); // view owns the letter view; drop our alloc +1
+        }
+
+        // Gap below icon before text starts
+        let text_gap: f64 = 6.0;
+        // App name: 18px tall, 2px above window title
+        let name_bottom = icon_bottom - text_gap - 18.0; // 64 - 6 - 18 = 40
+        // Window title: 16px tall, sits at bottom
+        let title_bottom = name_bottom - 2.0 - 16.0; // 40 - 2 - 16 = 22
+
+        // --- App name label ---
+        let name_font: *mut AnyObject =
+            {
+    let cfg = CONFIG.read().unwrap();
+    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.app_name_size, weight: cfg.fonts.app_name_weight]
+};
+        let name_color = hex_to_ns_color(colors.app_name);
+        let name_label = make_centered_label(
+            &truncate_text(&w.app_name, 17), name_font, name_color,
+            name_bottom, card_w(), 18.0,
+        );
+        let _: () = msg_send![view, addSubview: name_label];
+        release_obj(name_label); // view owns the label; drop our alloc +1
+
+        // --- Window title label ---
+        let title_font: *mut AnyObject = {
+    let cfg = CONFIG.read().unwrap();
+    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
+};
+        let win_color = hex_to_ns_color(colors.win_title);
+        let title_label = make_centered_label(
+            &truncate_text(&display_title(&w.window_title), 20), title_font, win_color,
+            title_bottom, card_w(), 16.0,
+        );
+        let _: () = msg_send![view, addSubview: title_label];
+        release_obj(title_label); // view owns the label; drop our alloc +1
+
+        // --- Tracking area for hover ---
+        // NSTrackingMouseEnteredAndExited | NSTrackingActiveInActiveApp
+        let opts: u64 = 0x01 | 0x40;
+        let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+        let bounds = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(card_w(), card_h()),
+        );
+        let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds, options: opts, owner: view, userInfo: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![view, addTrackingArea: ta];
+        release_obj(ta); // view owns the tracking area; drop our alloc +1
+
+        view
+    }
+}
+
+pub(crate) fn show_overlay() {
+    unsafe {
+        let state_opt = TAB_STATE.lock().unwrap();
+        let state = state_opt.as_ref().unwrap();
+        let count = state.windows.len();
+        let windows = state.windows.clone();
+        drop(state_opt);
+
+        let window = OVERLAY_WINDOW.lock().unwrap().unwrap().0;
+        let container = CONTAINER.lock().unwrap().unwrap().0;
+
+        // Remove old card subviews (keep status label)
+        let subviews: *mut AnyObject = msg_send![container, subviews];
+        let sv_count: usize = msg_send![subviews, count];
+        // Iterate in reverse since we're removing from the array
+        let mut i = sv_count;
+        while i > 0 {
+            i -= 1;
+            let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
+            let is_label: bool = msg_send![sv, isKindOfClass: class!(NSTextField)];
+            if !is_label {
+                let _: () = msg_send![sv, removeFromSuperview];
+            }
+        }
+
+        // Clear old card index mappings, then create new card views
+        clear_card_indices();
+        let h = window_height(count);
+        let cards_in_row = cards_per_row().min(count);
+        let w = window_width(cards_in_row);
+        let row_width = cards_in_row as f64 * card_w()
+            + (cards_in_row.saturating_sub(1)) as f64 * card_gap();
+        let start_x = (w - row_width) / 2.0;
+
+        for (idx, w) in windows.iter().enumerate() {
+            let card = create_card_view(w, idx);
+
+            // Standard coords: y=0 at bottom. Cards stack from top down.
+            let col = idx % cards_per_row();
+            let row = idx / cards_per_row();
+            let card_x = start_x + col as f64 * (card_w() + card_gap());
+            // topmost card origin_y = h - 32.0 - card_h() (32 = top padding area)
+            let card_y = h - 32.0 - (row + 1) as f64 * card_h();
+            let card_frame = NSRect::new(
+                NSPoint::new(card_x, card_y),
+                NSSize::new(card_w(), card_h()),
+            );
+            let _: () = msg_send![card, setFrame: card_frame];
+
+            let _: () = msg_send![container, addSubview: card];
+            release_obj(card); // container owns the card; drop create_card_view's alloc +1
+        }
+
+        update_status_label();
+
+        // Resize window (h computed above)
+        let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+        let screen_frame: NSRect = msg_send![screen, frame];
+        let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
+        let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
+        let new_frame = NSRect::new(
+            NSPoint::new(x, y),
+            NSSize::new(w, h),
+        );
+        let _: () = msg_send![window, setFrame: new_frame, display: true];
+
+        // wrapper / VFX view / container all have autoresizingMask = 18
+        // (width + height sizable), so they resize automatically when the
+        // window frame changes. Just update the container explicitly.
+        let _: () = msg_send![container, setFrameSize: NSSize::new(w, h)];
+
+        // Ignore initial mouse position - require a real mouse movement before
+        // hover-selection kicks in (matches native Cmd+Tab behaviour).
+        MOUSE_MOVED.store(false, Ordering::Relaxed);
+        let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
+
+        // Activate and show window
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
+        let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+        let _: bool = msg_send![window, makeFirstResponder: container];
+
+        // Highlight selected card
+        refresh_highlight();
+    }
+}

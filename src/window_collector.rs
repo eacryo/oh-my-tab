@@ -244,6 +244,19 @@ pub fn ensure_icon_cache_dir() {
     let _ = std::fs::create_dir_all(icon_cache_dir());
 }
 
+/// 清空图标缓存目录(删除所有 {pid}.png),然后重建空目录。
+/// 内存里 WindowInfo.icon_path 不会自动失效,调用方需自行将其置 None 并触发重提取。
+///
+/// Clear the icon cache directory (remove all {pid}.png), then recreate it empty.
+/// In-memory WindowInfo.icon_path is NOT invalidated here; the caller must reset it to None
+/// and trigger re-extraction.
+pub fn clear_icon_cache() {
+    let dir = icon_cache_dir();
+    // remove_dir_all 在目录不存在时会报错,忽略即可 / errors if the dir doesn't exist; ignore
+    let _ = std::fs::remove_dir_all(&dir);
+    ensure_icon_cache_dir();
+}
+
 /// 图标缓存「文件存在即有效」，不设过期时间。
 /// 缓存按 PID 索引：App 更新必然重启 -> 新 PID -> 自动重新提取，因此无需靠 TTL
 /// 刷新；运行时改图标的 App（日历日期 / Dock 角标）会冻结到该 App 重启。
