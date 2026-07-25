@@ -14,6 +14,7 @@ pub struct Config {
     pub fonts: Fonts,
     pub keyboard: Keyboard,
     pub i18n: I18nSection,
+    pub windows: WindowsSection,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -77,6 +78,15 @@ pub struct I18nSection {
     pub locale: String,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WindowsSection {
+    // 默认 false(不显示最小化窗口,与历史行为一致);bool::default() 即 false,故 Default 可直接派生。
+    // Defaults to false (hide minimized windows, matching prior behavior); bool::default() is
+    // false, so Default can be derived directly.
+    pub show_minimized: bool,
+}
+
 // ========== Default implementations (hard-coded fallback values) ==========
 
 impl Default for Config {
@@ -88,6 +98,7 @@ impl Default for Config {
             fonts: Fonts::default(),
             keyboard: Keyboard::default(),
             i18n: I18nSection::default(),
+            windows: WindowsSection::default(),
         }
     }
 }
@@ -422,6 +433,10 @@ impl Config {
                 self.i18n.locale = other.i18n.locale;
             }
         }
+
+        // windows (bool 字段无需校验,恒有效)
+        // windows (bool field needs no validation, always valid)
+        self.windows = other.windows;
     }
 
     fn merge_colors(ours: &mut ThemeColors, theirs: &ThemeColors, theme: &str, errs: &[String]) {

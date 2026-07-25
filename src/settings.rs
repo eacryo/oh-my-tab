@@ -45,6 +45,7 @@ struct SettingsUi {
     icon_size: *mut AnyObject,
     modifier: *mut AnyObject,      // NSPopUpButton: option / command
     locale: *mut AnyObject,        // NSPopUpButton: auto / en / zh-Hans / zh-Hant
+    show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
 }
 unsafe impl Send for SettingsUi {}
 unsafe impl Sync for SettingsUi {}
@@ -265,6 +266,12 @@ fn load_settings_values() {
             .map(|i| i as isize)
             .unwrap_or(0);
         let _: () = msg_send![ui.locale, selectItemAtIndex: loc_idx];
+        // show_minimized:按 CONFIG.windows.show_minimized 设复选框状态。
+        // show_minimized: set the checkbox state from CONFIG.windows.show_minimized.
+        // show_minimized:下拉框 index 0 = 不显示(false), 1 = 显示(true)。
+        // show_minimized: popup index 0 = hide (false), 1 = show (true).
+        let sm_idx = if cfg.windows.show_minimized { 1 } else { 0 };
+        let _: () = msg_send![ui.show_minimized, selectItemAtIndex: sm_idx as isize];
     }
 }
 
@@ -322,6 +329,12 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             .get(loc_idx as usize)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "auto".into());
+        // show_minimized:复选框 state(1=on / 0=off)。
+        // show_minimized: checkbox state (1=on / 0=off).
+        // show_minimized:下拉框 index 0 = 不显示(false), 1 = 显示(true)。
+        // show_minimized: popup index 0 = hide (false), 1 = show (true).
+        let sm_idx: isize = msg_send![ui.show_minimized, indexOfSelectedItem];
+        cfg.windows.show_minimized = sm_idx == 1;
     }
     for e in cfg.validate() {
         errs.push(e);
@@ -336,9 +349,10 @@ fn create_settings_window() {
         let view_w = 420.0;
         let style: u64 = (1 << 0) | (1 << 1); // titled + closable
         // 窗口高度:加语言区段后从 500 调到 570,避免最后一行与底部按钮重叠。
-        // Window height: bumped from 500 to 570 for the Language section so the last row
-        // doesn't overlap the bottom buttons.
-        let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 570.0));
+        // 再加窗口区段(checkbox)后调到 640。
+        // Window height: 500 -> 570 for the Language section, -> 640 for the Window section,
+        // so the last row doesn't overlap the bottom buttons.
+        let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 640.0));
         let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
         let ns_title = make_nsstring(&t("settings.window_title"));
@@ -364,6 +378,7 @@ fn create_settings_window() {
             icon_size: std::ptr::null_mut(),
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
+            show_minimized: std::ptr::null_mut(),
         };
 
         let label_x = 12.0;
@@ -413,6 +428,16 @@ fn create_settings_window() {
         add_header(content, &t("settings.header_language"), 12.0, y, view_w - 24.0);
         y -= 8.0 + row_h;
         ui.locale = add_row(content, label_x, y, label_w, row_h, &t("settings.row_locale"), make_popup(ctrl_x, y, ctrl_w, row_h, &LOCALE_LABELS, 0));
+
+        // --- 窗口 Window ---
+        y -= 14.0 + 24.0;
+        add_header(content, &t("settings.header_windows"), 12.0, y, view_w - 24.0);
+        y -= 8.0 + row_h;
+        // show_minimized 下拉框:项 = [不显示, 显示];默认 index 0(不显示)。
+        // show_minimized popup: items = [Hide, Show]; default index 0 (hide).
+        let sm_labels = [t("settings.show_minimized_hide"), t("settings.show_minimized_show")];
+        let sm_label_refs: Vec<&str> = sm_labels.iter().map(|s| s.as_str()).collect();
+        ui.show_minimized = add_row(content, label_x, y, label_w, row_h, &t("settings.row_show_minimized"), make_popup(ctrl_x, y, ctrl_w, row_h, &sm_label_refs, 0));
 
         // --- 确认 / 取消 ---
         let target = match *MENU_TARGET.lock().unwrap() {

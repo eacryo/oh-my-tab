@@ -600,6 +600,30 @@ pub(crate) fn apply_theme() {
     }
 }
 
+/// 把图标烘焙成灰度版:在原图上以 NSCompositeSourceAtop 叠浅灰,灰只落在图标的 alpha
+/// 区域,不会在透明边缘形成方框。用于最小化窗口的图标视觉变灰。
+/// Bake a grayed version: composite a light gray over the original with NSCompositeSourceAtop,
+/// so the gray is confined to the icon's alpha and doesn't form a box on transparent edges.
+/// Used to gray out minimized windows' icons.
+unsafe fn grayed_image(orig: *mut AnyObject, size: NSSize) -> *mut AnyObject {
+    let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let img: *mut AnyObject = msg_send![img, initWithSize: size];
+    let _: () = msg_send![img, lockFocus];
+    let rect = NSRect::new(NSPoint::new(0.0, 0.0), size);
+    // 先画原图(NSCompositeSourceOver = 2)。
+    let zero_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+    let _: () = msg_send![orig, drawInRect: rect, fromRect: zero_rect, operation: 2isize, fraction: 1.0f64];
+    // 再以 SourceAtop(=5)叠浅灰:只在已有 alpha 的地方着色,不超出图标范围。
+    let ctx: *mut AnyObject = msg_send![class!(NSGraphicsContext), currentContext];
+    let _: () = msg_send![ctx, setCompositingOperation: 5isize];
+    let gray = hex_to_ns_color(0x808080AA);
+    let _: () = msg_send![gray, setFill];
+    let _: () = msg_send![class!(NSBezierPath), fillRect: rect];
+    let _: () = msg_send![ctx, setCompositingOperation: 2isize]; // 恢复 SourceOver / restore
+    let _: () = msg_send![img, unlockFocus];
+    img
+}
+
 pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
     unsafe {
         let card_cls = CARD_CLASS.lock().unwrap().unwrap();
@@ -642,8 +666,17 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
                 );
                 let img_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
                 let img_view: *mut AnyObject = msg_send![img_view, initWithFrame: img_frame];
-                let _: () = msg_send![img_view, setImage: ns_image];
-                release_obj(ns_image); // img_view owns the image now; drop our alloc +1
+                // 最小化:把图标烘焙成灰度版(灰只落在图标 alpha 区域,不形成方框);否则用原图。
+                // Minimized: bake a grayed version (gray confined to the icon's alpha, no box); else original.
+                let image_to_show: *mut AnyObject = if w.minimized {
+                    let g = grayed_image(ns_image, NSSize::new(icon_px(), icon_px()));
+                    release_obj(ns_image); // 原图用完释放 / original no longer needed
+                    g
+                } else {
+                    ns_image
+                };
+                let _: () = msg_send![img_view, setImage: image_to_show];
+                release_obj(image_to_show); // img_view owns the image now; drop our alloc +1
                 // NSImageScaleProportionallyUpOrDown = 3
                 let _: () = msg_send![img_view, setImageScaling: 3u64];
                 let _: () = msg_send![view, addSubview: img_view];
@@ -683,6 +716,19 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
             release_obj(label); // letter_view owns the label; drop our alloc +1
             let _: () = msg_send![view, addSubview: letter_view];
             release_obj(letter_view); // view owns the letter view; drop our alloc +1
+            if w.minimized {
+                // 最小化窗口:在字母图标上叠浅灰半透明遮罩(圆角与字母背景一致)。
+                // Minimized window: overlay a light wash on the letter icon (radius matches the bg).
+                let dim: *mut AnyObject = msg_send![class!(NSView), alloc];
+                let dim: *mut AnyObject = msg_send![dim, initWithFrame: letter_frame];
+                let _: () = msg_send![dim, setWantsLayer: true];
+                let dl: *mut AnyObject = msg_send![dim, layer];
+                let _: () = msg_send![dl, setCornerRadius: 14.0f64];
+                let _: () = msg_send![dl, setMasksToBounds: true];
+                layer_set_background(dl, hex_to_cg_color(0x808080AA));
+                let _: () = msg_send![view, addSubview: dim];
+                release_obj(dim);
+            }
         }
 
         // Gap below icon before text starts

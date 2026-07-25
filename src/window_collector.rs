@@ -4,6 +4,8 @@ use std::time::Instant;
 use objc2::{class, msg_send};
 use objc2::runtime::AnyObject;
 
+use crate::config::CONFIG;
+
 #[derive(Debug, Clone)]
 pub struct WindowInfo {
     pub pid: i32,
@@ -12,6 +14,7 @@ pub struct WindowInfo {
     pub window_title: String,
     pub icon_path: Option<String>,
     pub is_active: bool,
+    pub minimized: bool, // 最小化窗口(show_minimized 打开时才收集)/ minimized (collected only when show_minimized is on)
 }
 
 /// 窗口级 MRU 时间戳，按 (pid, CGWindowID) 索引。
@@ -59,6 +62,7 @@ fn icon_cache_dir() -> String {
 }
 
 const K_C_G_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
+const K_C_G_WINDOW_LIST_OPTION_ALL: u32 = 0; // 含离屏窗口(最小化等)/ includes off-screen windows (minimized, etc.)
 
 // AX types
 type AXUIElementRef = *const c_void;
@@ -81,6 +85,7 @@ extern "C" {
         encoding: u32,
     ) -> *const c_void;
     fn CFNumberGetValue(number: *const c_void, the_type: isize, value: *mut c_void) -> bool;
+    fn CFBooleanGetValue(boolean: *const c_void) -> bool;
     fn CFStringGetCString(
         string: *const c_void,
         buffer: *mut i8,
@@ -88,6 +93,7 @@ extern "C" {
         encoding: u32,
     ) -> bool;
     fn CFRelease(cf: *const c_void);
+    static kCFBooleanFalse: *const c_void;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -240,6 +246,15 @@ fn cf_dict_get_u32(dict: *const c_void, key: &str) -> Option<u32> {
     if ok { Some(num as u32) } else { None }
 }
 
+// 读 CG dict 里的 CFBoolean(如 kCGWindowIsOnscreen)。/ Read a CFBoolean from a CG dict (e.g. kCGWindowIsOnscreen).
+fn cf_dict_get_bool(dict: *const c_void, key: &str) -> Option<bool> {
+    let cf_key = cf_string_new(key);
+    let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
+    unsafe { CFRelease(cf_key) };
+    if value.is_null() { return None; }
+    Some(unsafe { CFBooleanGetValue(value) })
+}
+
 pub fn ensure_icon_cache_dir() {
     let _ = std::fs::create_dir_all(icon_cache_dir());
 }
@@ -381,12 +396,17 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
         let count = CFArrayGetCount(windows_array);
         let raise_key = cf_string_new("AXRaise");
         let focused_key = cf_string_new("AXFocusedWindow");
+        let minimized_key = cf_string_new("AXMinimized");
         let mut matched = false;
 
         for i in 0..count {
             let element = CFArrayGetValueAtIndex(windows_array, i);
             if element.is_null() { continue; }
             if ax_window_cgwid(element) == Some(cgwid) {
+                // 先还原最小化(若已最小化),否则 AXRaise 可能只是带到前面而仍停在 Dock。
+                // Un-minimize first (if minimized); otherwise AXRaise may bring it forward
+                // without restoring from the Dock. Setting false on a non-minimized window is a no-op.
+                AXUIElementSetAttributeValue(element, minimized_key, kCFBooleanFalse);
                 AXUIElementSetAttributeValue(app, focused_key, element);
                 AXUIElementPerformAction(element, raise_key);
                 matched = true;
@@ -399,12 +419,13 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
         }
         CFRelease(raise_key);
         CFRelease(focused_key);
+        CFRelease(minimized_key);
         CFRelease(windows_array);
         CFRelease(app);
     }
 }
 
-fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String)> {
+fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String, bool)> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() { return vec![]; }
@@ -419,6 +440,7 @@ fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String)> {
         let count = CFArrayGetCount(windows_array);
         let title_key = cf_string_new("AXTitle");
         let subrole_key = cf_string_new("AXSubrole");
+        let minimized_key = cf_string_new("AXMinimized");
         let mut results = Vec::with_capacity(count as usize);
 
         for i in 0..count {
@@ -447,12 +469,25 @@ fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String)> {
             } else {
                 String::new()
             };
+            // AXMinimized:窗口是否最小化。无此属性(部分 App)按 false 处理。
+            // AXMinimized: whether the window is minimized. Absent attribute (some apps) -> false.
+            let minimized = {
+                let mut min_value: *const c_void = std::ptr::null();
+                if AXUIElementCopyAttributeValue(element, minimized_key, &mut min_value) == K_AX_SUCCESS && !min_value.is_null() {
+                    let m = CFBooleanGetValue(min_value);
+                    CFRelease(min_value);
+                    m
+                } else {
+                    false
+                }
+            };
             // 取该 AX 窗口的 CGWindowID（私有 API），用于和 CG 窗口精确配对。
             let cgwid = ax_window_cgwid(element).unwrap_or(0);
-            results.push((cgwid, title));
+            results.push((cgwid, title, minimized));
         }
         CFRelease(title_key);
         CFRelease(subrole_key);
+        CFRelease(minimized_key);
         CFRelease(windows_array);
         results
     }
@@ -470,7 +505,15 @@ fn cf_to_rust_string(cf_string: *const c_void) -> Option<String> {
 }
 
 pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
-    let array = unsafe { CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ON_SCREEN_ONLY, 0) };
+    let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
+    // show_minimized 打开时用 All(含离屏最小化窗口),否则 OnScreenOnly(原行为)。
+    // When show_minimized is on, use All (includes off-screen minimized windows); else OnScreenOnly (original behavior).
+    let cg_option = if show_minimized {
+        K_C_G_WINDOW_LIST_OPTION_ALL
+    } else {
+        K_C_G_WINDOW_LIST_OPTION_ON_SCREEN_ONLY
+    };
+    let array = unsafe { CGWindowListCopyWindowInfo(cg_option, 0) };
     if array.is_null() { return vec![]; }
 
     let self_pid = std::process::id() as i32;
@@ -497,10 +540,9 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // 以 AX 窗口列表为主数据源（macOS App Switcher 的做法）
     // Use AX window list as primary source (same as macOS App Switcher)
     let mut ax_by_pid: HashMap<i32, Vec<String>> = HashMap::new();
-    // pid -> (CGWindowID -> AX 标题)，用于按 CGWindowID 精确配对 CG 窗口（不再按顺序/标题猜）。
-    // pid -> (CGWindowID -> AX title), to pair CG windows by CGWindowID (no more
-    // order/title guessing).
-    let mut ax_wid_to_title: HashMap<i32, HashMap<u32, String>> = HashMap::new();
+    // pid -> (CGWindowID -> (AX 标题, 是否最小化)),用于按 CGWindowID 精确配对 CG 窗口。
+    // pid -> (CGWindowID -> (AX title, minimized)), to pair CG windows by CGWindowID.
+    let mut ax_wid_to_info: HashMap<i32, HashMap<u32, (String, bool)>> = HashMap::new();
     // AX 窗口「全部」为空标题的 App（如 Microsoft To Do：自绘标题栏 -> AXTitle 为空）。
     // 这类 App 的空标题窗口是真实主窗口，不能被当作弹出面板丢弃。
     // Apps whose AX windows are ALL untitled (e.g. Microsoft To Do, which has a
@@ -510,15 +552,15 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     for &pid in &pids {
         let ax_wins = get_ax_windows_for_pid(pid);
         if !ax_wins.is_empty() {
-            if ax_wins.iter().all(|(_, t)| t.is_empty()) {
+            if ax_wins.iter().all(|(_, t, _)| t.is_empty()) {
                 titleless_pids.insert(pid);
             }
-            ax_by_pid.insert(pid, ax_wins.iter().map(|(_, t)| t.clone()).collect());
-            let mut wid_map: HashMap<u32, String> = HashMap::new();
-            for (cgwid, title) in &ax_wins {
-                if *cgwid != 0 { wid_map.insert(*cgwid, title.clone()); }
+            ax_by_pid.insert(pid, ax_wins.iter().map(|(_, t, _)| t.clone()).collect());
+            let mut wid_map: HashMap<u32, (String, bool)> = HashMap::new();
+            for (cgwid, title, minimized) in &ax_wins {
+                if *cgwid != 0 { wid_map.insert(*cgwid, (title.clone(), *minimized)); }
             }
-            ax_wid_to_title.insert(pid, wid_map);
+            ax_wid_to_info.insert(pid, wid_map);
         }
     }
 
@@ -543,15 +585,27 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         // Pair the AX title by CGWindowID (no more order/string guessing).
         // AX is authoritative: a CG window is kept only if AX has a window with
         // the same CGWindowID.
-        let window_title = if let Some(wid_map) = ax_wid_to_title.get(&owner_pid) {
+        let (window_title, minimized) = if let Some(wid_map) = ax_wid_to_info.get(&owner_pid) {
             match wid_map.get(&cgwid) {
-                Some(t) => t.clone(),
+                Some((t, m)) => (t.clone(), *m),
                 None => continue, // CG 窗口在 AX 里没有 -> 弹出面板，跳过 / popup, skip
             }
         } else {
-            // 该 App 无 AX 数据 -> 退回 CG 标题。 / No AX data -> fall back to CG title.
-            cg_title
+            // 该 App 无 AX 数据 -> 退回 CG 标题,最小化状态未知按 false。
+            // No AX data -> fall back to CG title; minimized status unknown, assume false.
+            (cg_title, false)
         };
+
+        // show_minimized 打开时(用 CG All 枚举):保留在屏窗口 或 最小化窗口;
+        // 其它离屏窗口(别的 Space、隐藏)跳过。关闭时走 OnScreenOnly,此过滤恒通过。
+        // When show_minimized is on (CG All): keep on-screen OR minimized windows; skip other
+        // off-screen windows (other Spaces, hidden). When off (OnScreenOnly), always passes.
+        if show_minimized {
+            let is_onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false);
+            if !is_onscreen && !minimized {
+                continue;
+            }
+        }
 
         if window_title.is_empty()
             && (!ax_by_pid.contains_key(&owner_pid) || titleless_pids.contains(&owner_pid))
@@ -579,24 +633,52 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         mru.entry((owner_pid, cgwid)).or_insert(ordered_ts);
         insertion_order += 1;
         let icon_path = check_icon_cache(owner_pid);
-        windows.push(WindowInfo { pid: owner_pid, window_id: cgwid, app_name: owner_name, window_title, icon_path, is_active: false });
+        windows.push(WindowInfo { pid: owner_pid, window_id: cgwid, app_name: owner_name, window_title, icon_path, is_active: false, minimized });
     }
 
     unsafe { CFRelease(array) };
 
-    // summon 时刷新前台聚焦窗口(= CG 顺序首个真实窗口)的 MRU 为 now。
+    // summon 时刷新前台聚焦窗口的 MRU 为 now。
     // 焦点变化若不触发 App 激活通知(如终端切 tab、或前台 App 从未被系统激活过),
     // 当前窗口的 MRU 会停在 ancient 回退值,排序退化成 CG 枚举顺序。每次 summon 把
     // "用户正看的窗口"刷成最新即可纠正。
-    // Refresh the MRU of the frontmost focused window (= first real window in CG order) to now
-    // on summon. Focus changes that don't fire an app-activation notification (e.g. switching
-    // terminal tabs, or a frontmost app never system-activated) leave the current window's MRU
-    // at the ancient fallback, degrading sort to CG enumeration order. Bumping the window the
-    // user is looking at, on every summon, corrects this.
-    if let Some(w) = windows.first() {
-        mru.insert((w.pid, w.window_id), now);
+    // 前台窗口的识别不依赖 CG 枚举顺序（show_minimized 开启时 CG ALL 枚举顺序不保证
+    // z-order），改用系统级 API NSWorkspace.frontmostApplication + focused_window_cgwid
+    // 精确定位。获取失败时回退到 CG 枚举中首个非最小化窗口。
+    // Refresh the MRU of the frontmost focused window to now on summon. Focus changes that
+    // don't fire an app-activation notification (e.g. switching terminal tabs, or a frontmost
+    // app never system-activated) leave the current window's MRU at the ancient fallback,
+    // degrading sort to CG enumeration order. Bumping the window the user is looking at on
+    // every summon corrects this. The frontmost window is identified via system APIs
+    // (NSWorkspace.frontmostApplication + focused_window_cgwid) rather than CG enumeration
+    // order, because CG's "All" option doesn't guarantee z-order when show_minimized is on.
+    // Fall back to the first non-minimized window in CG enumeration if the system API fails.
+    let frontmost: Option<(i32, u32)> = unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let front_app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+        if !front_app.is_null() {
+            let front_pid: i32 = msg_send![front_app, processIdentifier];
+            focused_window_cgwid(front_pid).map(|cgwid| (front_pid, cgwid))
+        } else {
+            None
+        }
+    };
+    if let Some((pid, cgwid)) = frontmost {
+        mru.insert((pid, cgwid), now);
+        let w = windows.iter().find(|w| w.pid == pid && w.window_id == cgwid);
         eprintln!(
             "[oh-my-tab] summon-bump frontmost: pid={} app=\"{}\" cgwid={} title=\"{}\"",
+            pid,
+            w.map_or("?", |w| w.app_name.as_str()),
+            cgwid,
+            w.map_or("?", |w| w.window_title.as_str()),
+        );
+    } else if let Some(w) = windows.iter().find(|w| !w.minimized) {
+        // 回退：系统 API 获取失败时，取 CG 枚举中首个非最小化窗口
+        // Fallback: when the system API fails, use the first non-minimized window in CG enumeration
+        mru.insert((w.pid, w.window_id), now);
+        eprintln!(
+            "[oh-my-tab] summon-bump frontmost (fallback): pid={} app=\"{}\" cgwid={} title=\"{}\"",
             w.pid, w.app_name, w.window_id, w.window_title
         );
     }
