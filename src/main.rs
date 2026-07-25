@@ -668,6 +668,14 @@ fn main() {
     // 3. Setup status bar menu
     setup_status_bar();
 
+    // 3a. 按配置初始化快捷键模式:SHORTCUT_IS_CMD 默认 false(Option),启动时必须从 config 读回,
+    //     否则设置里改的 modifier 重启后会丢失。放在 refresh_menu_titles 之前,让菜单标题刷新时
+    //     读到的已是正确值。
+    // Initialize shortcut mode from config: SHORTCUT_IS_CMD defaults to false (Option) and must be
+    // read back at startup, otherwise the modifier chosen in Settings is lost on restart. Runs
+    // before refresh_menu_titles so the label refresh sees the correct value.
+    set_shortcut_mode(CONFIG.read().unwrap().keyboard.modifier == "command");
+
     // 3b. 按实际主题修正初始菜单标签。setup_status_bar 用占位标题(is_dark=false +
     //     "切换深色");若 config 主题为 dark/auto,这里修正为正确的 toggle 标签。
     //     locale 已在 2b 应用,菜单文本本身已正确,此处只修正 toggle 方向。

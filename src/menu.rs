@@ -110,6 +110,13 @@ pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mu
 
 pub(crate) extern "C" fn handle_toggle_shortcut(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     let is_cmd = !SHORTCUT_IS_CMD.load(Ordering::SeqCst);
+    // 持久化到 config(与主题切换一致,重启后保留用户选择)。
+    // Persist to config (matches theme toggle, so the choice survives restart).
+    {
+        let mut cfg = CONFIG.write().unwrap();
+        cfg.keyboard.modifier = if is_cmd { "command".to_string() } else { "option".to_string() };
+        let _ = cfg.save();
+    }
     set_shortcut_mode(is_cmd);
     log_info!(
         "Shortcut: {}",
@@ -167,6 +174,11 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
             log_warn!("  • {}", e);
         }
     }
+    // 同步快捷键模式:手动改 config 的 keyboard.modifier 后 Reload 也要生效。必须在
+    // refresh_menu_titles 之前,让菜单标题刷新时读到正确值。
+    // Sync shortcut mode: a manual edit of config.keyboard.modifier must take effect on Reload.
+    // Must run before refresh_menu_titles so the label refresh sees the correct value.
+    set_shortcut_mode(CONFIG.read().unwrap().keyboard.modifier == "command");
     // locale 可能随 reload 改变:重设全部菜单标题 + 作废设置窗口待下次按新 locale 重建
     // locale may change on reload: re-title all menus + invalidate the settings window
     // so it rebuilds with the new locale on next open

@@ -142,7 +142,10 @@ pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
         CGEventTapEnable(tap, true);
 
-        log_info!("Event monitor started. Listening for Command+Tab globally.");
+        // 快捷键可能被菜单/设置切换,按当前 SHORTCUT_IS_CMD 打印实际监听的组合键。
+        // The shortcut can be toggled via menu/settings; print the actual combo from SHORTCUT_IS_CMD.
+        let shortcut = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) { "Command+Tab" } else { "Option+Tab" };
+        log_info!("Event monitor started. Listening for {} globally.", shortcut);
         CFRunLoopRun();
     })
 }
