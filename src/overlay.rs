@@ -21,6 +21,7 @@ use crate::theme::*;
 use crate::window_collector::{WindowInfo, bump_window_mru, extract_icon_to_cache, raise_ax_window};
 // 跨模块共享状态(由 main.rs 持有,这里读写)/ cross-module shared state (owned by main.rs)
 use crate::{TAB_STATE, THEME_STATE};
+use crate::{log_error, log_info};
 
 // ========== 键盘键码 / keyboard key codes ==========
 
@@ -175,17 +176,17 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         let pid = w.pid;
         let cgwid = w.window_id;
         let wt = w.window_title.clone();
-        println!(
-            "[oh-my-tab] Switching to '{}' (pid={})",
-            w.app_name, pid
+        log_info!(
+            "Switching to '{}' (pid={} cgwid={})",
+            w.app_name, pid, cgwid
         );
         hide_overlay();
         activate_and_raise(pid, cgwid);
         bump_window_mru(&mut state.mru, pid, cgwid);
-        eprintln!("[oh-my-tab] commit: pid={} app=\"{}\" cgwid={} title=\"{}\" selected={}", pid, w.app_name, cgwid, wt, state.selected);
+        log_info!("commit: pid={} app=\"{}\" cgwid={} title=\"{}\" selected={}", pid, w.app_name, cgwid, wt, state.selected);
     } else {
-        eprintln!(
-            "[oh-my-tab] CmdReleased: selected index {} out of bounds (windows={})",
+        log_error!(
+            "CmdReleased: selected index {} out of bounds (windows={})",
             state.selected,
             state.windows.len()
         );
@@ -331,7 +332,7 @@ pub(crate) fn activate_pid(pid: i32) {
             // and updates LAST_ACTIVATED, so MRU ordering is unaffected.
             let _: bool = msg_send![app, activateWithOptions: 0usize];
         } else {
-            eprintln!("[oh-my-tab] activate_pid: no running app for pid {}", pid);
+            log_error!("activate_pid: no running app for pid {}", pid);
         }
     }
 }

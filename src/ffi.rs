@@ -7,6 +7,7 @@
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use std::ffi::{c_char, c_void, CString};
+use crate::log_error;
 
 // ========== FFI 外部函数声明 / FFI extern declarations ==========
 
@@ -80,7 +81,7 @@ pub(crate) fn make_nsstring(s: &str) -> *mut AnyObject {
         let c_str = CString::new(s).unwrap();
         let cf = CFStringCreateWithCString(std::ptr::null(), c_str.as_ptr(), 0x08000100u32);
         if cf.is_null() {
-            eprintln!("[oh-my-tab] ERROR: CFStringCreateWithCString failed for '{}'", s);
+            log_error!("CFStringCreateWithCString failed for '{}'", s);
         }
         cf as *mut AnyObject
     }

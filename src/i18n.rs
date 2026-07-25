@@ -18,6 +18,7 @@ use objc2::{class, msg_send};
 use std::collections::HashMap;
 use std::ffi::c_char;
 use std::sync::{LazyLock, RwLock};
+use crate::log_error;
 
 // 翻译文件编译期内嵌,避免运行时缺文件 / 读取失败。
 // Locale files embedded at compile time to avoid runtime file-missing / read failures.
@@ -74,7 +75,7 @@ fn load_messages(locale: &str) -> HashMap<String, String> {
             map
         }
         Err(e) => {
-            eprintln!("[oh-my-tab] i18n: failed to parse locale '{locale}': {e}");
+            log_error!("i18n: failed to parse locale '{}': {}", locale, e);
             HashMap::new()
         }
     }

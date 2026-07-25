@@ -2,6 +2,7 @@ use flume::Sender;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use crate::{log_error, log_info};
 
 #[derive(Debug, Clone, Copy)]
 pub enum GlobalEvent {
@@ -129,8 +130,8 @@ pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
         let tap = CGEventTapCreate(0, 0, 0, mask, Some(event_tap_callback), sender_ptr);
 
         if tap.is_null() {
-            eprintln!(
-                "[oh-my-tab] ERROR: Failed to create CGEventTap. \
+            log_error!(
+                "Failed to create CGEventTap. \
                  Make sure the app has Accessibility permission."
             );
             let _ = Box::from_raw(sender_ptr as *mut Sender<GlobalEvent>);
@@ -141,7 +142,7 @@ pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
         CGEventTapEnable(tap, true);
 
-        eprintln!("[oh-my-tab] Event monitor started. Listening for Command+Tab globally.");
+        log_info!("Event monitor started. Listening for Command+Tab globally.");
         CFRunLoopRun();
     })
 }

@@ -15,6 +15,7 @@ pub struct Config {
     pub keyboard: Keyboard,
     pub i18n: I18nSection,
     pub windows: WindowsSection,
+    pub logging: LoggingSection,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -87,6 +88,17 @@ pub struct WindowsSection {
     pub show_minimized: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LoggingSection {
+    // 日志级别:"trace","debug","info","warn","error";默认 "info"。
+    // Log level; default "info".
+    pub level: String,
+    // 日志文件路径;空=使用默认路径 ~/Library/Logs/oh-my-tab/oh-my-tab.log。
+    // Log file path; empty = use default.
+    pub file_path: String,
+}
+
 // ========== Default implementations (hard-coded fallback values) ==========
 
 impl Default for Config {
@@ -99,6 +111,7 @@ impl Default for Config {
             keyboard: Keyboard::default(),
             i18n: I18nSection::default(),
             windows: WindowsSection::default(),
+            logging: LoggingSection::default(),
         }
     }
 }
@@ -192,6 +205,15 @@ impl Default for I18nSection {
     fn default() -> Self {
         I18nSection {
             locale: "auto".into(), // 跟随系统语言 / follow system language
+        }
+    }
+}
+
+impl Default for LoggingSection {
+    fn default() -> Self {
+        LoggingSection {
+            level: "info".into(),
+            file_path: String::new(),
         }
     }
 }
@@ -326,6 +348,14 @@ impl Config {
             ));
         }
 
+        // --- logging ---
+        if !["info", "warn", "error"].contains(&self.logging.level.as_str()) {
+            errs.push(tf(
+                "errors.logging_level_invalid",
+                &[("value", &self.logging.level)],
+            ));
+        }
+
         errs
     }
 
@@ -437,6 +467,17 @@ impl Config {
         // windows (bool 字段无需校验,恒有效)
         // windows (bool field needs no validation, always valid)
         self.windows = other.windows;
+
+        // logging
+        if !has_error("logging.") {
+            self.logging = other.logging;
+        } else {
+            if !errs.iter().any(|e| e.starts_with("logging.level")) {
+                self.logging.level = other.logging.level;
+            }
+            // file_path 无校验,恒有效 / file_path has no validation, always valid
+            self.logging.file_path = other.logging.file_path;
+        }
     }
 
     fn merge_colors(ours: &mut ThemeColors, theirs: &ThemeColors, theme: &str, errs: &[String]) {
@@ -554,10 +595,18 @@ pub static CONFIG: std::sync::LazyLock<RwLock<Config>> =
 pub fn reload_config() -> Vec<String> {
     let (new_cfg, errs) = Config::reload();
     let locale = new_cfg.i18n.locale.clone();
+    let log_level = new_cfg.logging.level.clone();
     if let Ok(mut cfg) = CONFIG.write() {
         *cfg = new_cfg;
     }
     // locale 可能随 reload 改变,重新应用 / locale may change on reload, re-apply
     i18n::apply_config_locale(&locale);
+    // 热更新日志级别 / hot-reload log level
+    let lvl = match log_level.as_str() {
+        "warn" => crate::logger::LogLevel::Warn,
+        "error" => crate::logger::LogLevel::Error,
+        _ => crate::logger::LogLevel::Info,
+    };
+    crate::logger::reconfigure(lvl);
     errs
 }

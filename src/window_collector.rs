@@ -5,6 +5,7 @@ use objc2::{class, msg_send};
 use objc2::runtime::AnyObject;
 
 use crate::config::CONFIG;
+use crate::{log_info, log_warn};
 
 #[derive(Debug, Clone)]
 pub struct WindowInfo {
@@ -410,12 +411,12 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
                 AXUIElementSetAttributeValue(app, focused_key, element);
                 AXUIElementPerformAction(element, raise_key);
                 matched = true;
-                eprintln!("[oh-my-tab] raise_ax_window: matched cgwid={} (slps={}), raised", cgwid, slps_ok);
+                log_info!("raise_ax_window: matched cgwid={} (slps={}), raised", cgwid, slps_ok);
                 break;
             }
         }
         if !matched {
-            eprintln!("[oh-my-tab] raise_ax_window: NO MATCH for pid={} cgwid={} (ax_windows={}, slps={})", pid, cgwid, count, slps_ok);
+            log_warn!("raise_ax_window: NO MATCH for pid={} cgwid={} (ax_windows={}, slps={})", pid, cgwid, count, slps_ok);
         }
         CFRelease(raise_key);
         CFRelease(focused_key);
@@ -666,8 +667,8 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     if let Some((pid, cgwid)) = frontmost {
         mru.insert((pid, cgwid), now);
         let w = windows.iter().find(|w| w.pid == pid && w.window_id == cgwid);
-        eprintln!(
-            "[oh-my-tab] summon-bump frontmost: pid={} app=\"{}\" cgwid={} title=\"{}\"",
+        log_info!(
+            "summon-bump frontmost: pid={} app=\"{}\" cgwid={} title=\"{}\"",
             pid,
             w.map_or("?", |w| w.app_name.as_str()),
             cgwid,
@@ -677,8 +678,8 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         // 回退：系统 API 获取失败时，取 CG 枚举中首个非最小化窗口
         // Fallback: when the system API fails, use the first non-minimized window in CG enumeration
         mru.insert((w.pid, w.window_id), now);
-        eprintln!(
-            "[oh-my-tab] summon-bump frontmost (fallback): pid={} app=\"{}\" cgwid={} title=\"{}\"",
+        log_info!(
+            "summon-bump frontmost (fallback): pid={} app=\"{}\" cgwid={} title=\"{}\"",
             w.pid, w.app_name, w.window_id, w.window_title
         );
     }
@@ -696,13 +697,13 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         wa.cmp(&wb)
     });
 
-    // [诊断] 打印排序后的顺序（= 实际显示顺序），含 mru 年龄。`*` 标记第 0 个(当前/前台窗口)。
-    // Diagnostic: print sorted order (= display order) with MRU age. `*` marks index 0 (current/frontmost).
-    eprintln!("[oh-my-tab] sorted: {} windows", windows.len());
+    // 每次 summon 时打印排序后的窗口列表（= 实际显示顺序），含 mru 年龄。`*` 标记第 0 个(当前/前台窗口)。
+    // Print the sorted window list on every summon (= display order), with MRU age. `*` marks index 0 (current/frontmost).
+    log_info!("sorted: {} windows", windows.len());
     for (i, w) in windows.iter().enumerate() {
         let mru_ms = mru.get(&(w.pid, w.window_id)).map(|t| t.elapsed().as_millis());
         let mark = if i == 0 { "*" } else { " " };
-        eprintln!("[oh-my-tab]   {} pid={} app=\"{}\" cgwid={} title=\"{}\" mru_ms={:?}", mark, w.pid, w.app_name, w.window_id, w.window_title, mru_ms);
+        log_info!("  {} pid={} app=\"{}\" cgwid={} title=\"{}\" mru_ms={:?}", mark, w.pid, w.app_name, w.window_id, w.window_title, mru_ms);
     }
 
     if let Some(first) = windows.first_mut() { first.is_active = true; }
@@ -734,7 +735,7 @@ pub fn cache_running_app_icons() {
                 } else {
                     CStr::from_ptr(utf8).to_string_lossy().into_owned()
                 };
-                println!("[oh-my-tab] cached icon: {} (pid {})", name_str, pid);
+                log_info!("cached icon: {} (pid {})", name_str, pid);
                 cached.push(name_str);
                 extract_icon_to_cache(pid);
             } else {
@@ -743,8 +744,8 @@ pub fn cache_running_app_icons() {
         }
         let _: () = msg_send![pool, drain];
     }
-    println!(
-        "[oh-my-tab] icon cache done: {} cached, {} skipped (already fresh)",
+    log_info!(
+        "icon cache done: {} cached, {} skipped (already fresh)",
         cached.len(),
         skipped,
     );

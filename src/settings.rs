@@ -46,6 +46,7 @@ struct SettingsUi {
     modifier: *mut AnyObject,      // NSPopUpButton: option / command
     locale: *mut AnyObject,        // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
+    log_level: *mut AnyObject,     // NSPopUpButton: trace / debug / info / warn / error
 }
 unsafe impl Send for SettingsUi {}
 unsafe impl Sync for SettingsUi {}
@@ -272,6 +273,14 @@ fn load_settings_values() {
         // show_minimized: popup index 0 = hide (false), 1 = show (true).
         let sm_idx = if cfg.windows.show_minimized { 1 } else { 0 };
         let _: () = msg_send![ui.show_minimized, selectItemAtIndex: sm_idx as isize];
+        // log_level:下拉框 index 0..2 对应 info,warn,error;默认 index 0(info)。
+        // log_level: popup index 0..2 = info, warn, error; default index 0 (info).
+        let ll_idx = match cfg.logging.level.as_str() {
+            "warn" => 1,
+            "error" => 2,
+            _ => 0, // "info" (default)
+        };
+        let _: () = msg_send![ui.log_level, selectItemAtIndex: ll_idx as isize];
     }
 }
 
@@ -335,6 +344,13 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // show_minimized: popup index 0 = hide (false), 1 = show (true).
         let sm_idx: isize = msg_send![ui.show_minimized, indexOfSelectedItem];
         cfg.windows.show_minimized = sm_idx == 1;
+        // log_level:下拉框 index 0..2 对应 info,warn,error。
+        // log_level: popup index 0..2 = info, warn, error.
+        let ll_idx: isize = msg_send![ui.log_level, indexOfSelectedItem];
+        cfg.logging.level = match ll_idx {
+            1 => "warn", 2 => "error",
+            _ => "info", // index 0 or out-of-range
+        }.into();
     }
     for e in cfg.validate() {
         errs.push(e);
@@ -349,10 +365,10 @@ fn create_settings_window() {
         let view_w = 420.0;
         let style: u64 = (1 << 0) | (1 << 1); // titled + closable
         // 窗口高度:加语言区段后从 500 调到 570,避免最后一行与底部按钮重叠。
-        // 再加窗口区段(checkbox)后调到 640。
+        // 再加窗口区段(checkbox)后调到 640,加日志区段后调到 680。
         // Window height: 500 -> 570 for the Language section, -> 640 for the Window section,
-        // so the last row doesn't overlap the bottom buttons.
-        let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 640.0));
+        // -> 680 for the Logging section, so the last row doesn't overlap the bottom buttons.
+        let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 680.0));
         let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
         let ns_title = make_nsstring(&t("settings.window_title"));
@@ -379,6 +395,7 @@ fn create_settings_window() {
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
             show_minimized: std::ptr::null_mut(),
+            log_level: std::ptr::null_mut(),
         };
 
         let label_x = 12.0;
@@ -438,6 +455,15 @@ fn create_settings_window() {
         let sm_labels = [t("settings.show_minimized_hide"), t("settings.show_minimized_show")];
         let sm_label_refs: Vec<&str> = sm_labels.iter().map(|s| s.as_str()).collect();
         ui.show_minimized = add_row(content, label_x, y, label_w, row_h, &t("settings.row_show_minimized"), make_popup(ctrl_x, y, ctrl_w, row_h, &sm_label_refs, 0));
+
+        // --- 日志 Logging ---
+        y -= 14.0 + 24.0;
+        add_header(content, &t("settings.header_logging"), 12.0, y, view_w - 24.0);
+        y -= 8.0 + row_h;
+        // 日志级别下拉框:项 = [info, warn, error];默认 index 0(info)。
+        // Log level popup: items = [info, warn, error]; default index 0 (info).
+        let log_levels: [&str; 3] = ["info", "warn", "error"];
+        ui.log_level = add_row(content, label_x, y, label_w, row_h, &t("settings.row_log_level"), make_popup(ctrl_x, y, ctrl_w, row_h, &log_levels, 0));
 
         // --- 确认 / 取消 ---
         let target = match *MENU_TARGET.lock().unwrap() {

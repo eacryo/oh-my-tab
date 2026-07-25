@@ -22,6 +22,7 @@ use crate::settings::invalidate_settings_window;
 use crate::window_collector::clear_icon_cache;
 // 跨模块共享状态(由 main.rs 持有)/ cross-module shared state (owned by main.rs)
 use crate::{STATUS_EVENT_TX, TAB_STATE, THEME_STATE};
+use crate::{log_info, log_warn};
 
 // ========== 菜单项状态 / menu-item state ==========
 
@@ -100,7 +101,7 @@ pub(crate) fn refresh_menu_titles() {
 }
 
 pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    println!("[oh-my-tab] User quit via menu bar.");
+    log_info!("User quit via menu bar.");
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![nsapp, terminate: std::ptr::null::<AnyObject>()];
@@ -110,8 +111,8 @@ pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mu
 pub(crate) extern "C" fn handle_toggle_shortcut(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     let is_cmd = !SHORTCUT_IS_CMD.load(Ordering::SeqCst);
     set_shortcut_mode(is_cmd);
-    println!(
-        "[oh-my-tab] Shortcut: {}",
+    log_info!(
+        "Shortcut: {}",
         if is_cmd { "Cmd+Tab" } else { "Opt+Tab" }
     );
 }
@@ -136,8 +137,8 @@ pub(crate) extern "C" fn handle_toggle_theme(_self: *mut c_void, _cmd: Sel, _sen
     }
     let is_dark = new_theme == "dark";
     let new_label = if is_dark { t("menu.toggle_theme.light") } else { t("menu.toggle_theme.dark") };
-    println!(
-        "[oh-my-tab] Toggled theme to {}",
+    log_info!(
+        "Toggled theme to {}",
         if is_dark { "dark" } else { "light" }
     );
     // Update menu item title
@@ -159,11 +160,11 @@ pub(crate) extern "C" fn handle_toggle_theme(_self: *mut c_void, _cmd: Sel, _sen
 pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     let errs = reload_config();
     if errs.is_empty() {
-        println!("[oh-my-tab] Config reloaded successfully.");
+        log_info!("Config reloaded successfully.");
     } else {
-        eprintln!("[oh-my-tab] Config reload: {} error(s):", errs.len());
+        log_warn!("Config reload: {} error(s):", errs.len());
         for e in &errs {
-            eprintln!("[oh-my-tab]   • {}", e);
+            log_warn!("  • {}", e);
         }
     }
     // locale 可能随 reload 改变:重设全部菜单标题 + 作废设置窗口待下次按新 locale 重建
@@ -198,5 +199,5 @@ pub(crate) extern "C" fn handle_clear_icon_cache(_self: *mut c_void, _cmd: Sel, 
     // 立即重新提取当前窗口的图标(仅当前已收集的窗口,非全部运行中 App)。
     // Re-extract icons for currently-collected windows only (not all running apps).
     extract_uncached_icons();
-    println!("[oh-my-tab] Icon cache cleared.");
+    log_info!("Icon cache cleared.");
 }

@@ -7,6 +7,7 @@ mod theme;
 mod overlay;
 mod menu;
 mod settings;
+mod logger;
 
 use config::CONFIG;
 use i18n::t;
@@ -72,8 +73,8 @@ impl AppState {
             Vec::new()
         };
         if !has_accessibility_permission() {
-            println!("[oh-my-tab] WARNING: No accessibility permission.");
-            println!("[oh-my-tab] Go to System Settings → Privacy & Security → Accessibility");
+            log_warn!("No accessibility permission.");
+            log_warn!("Go to System Settings → Privacy & Security → Accessibility");
         }
         let win_count = windows.len();
         AppState {
@@ -153,10 +154,10 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
                 let mut state_opt = TAB_STATE.lock().unwrap();
                 if let Some(ref mut state) = *state_opt {
                     bump_window_mru(&mut state.mru, pid, cgwid);
-                    eprintln!("[oh-my-tab] app-activated bump: pid={} cgwid={}", pid, cgwid);
+                    log_info!("app-activated bump: pid={} cgwid={}", pid, cgwid);
                 }
             } else {
-                eprintln!("[oh-my-tab] app-activated bump: pid={} (no focused window / AX timeout)", pid);
+                log_info!("app-activated bump: pid={} (no focused window / AX timeout)", pid);
             }
         });
     }
@@ -486,9 +487,7 @@ fn setup_status_bar() {
             let cls =
                 objc_allocateClassPair(superclass as *mut AnyObject, name.as_ptr(), 0);
             if cls.is_null() {
-                eprintln!(
-                    "[oh-my-tab] ERROR: Failed to allocate ObjC class for menu target."
-                );
+                log_error!("Failed to allocate ObjC class for menu target.");
                 return;
             }
             let types = CString::new("v@:@").unwrap();
@@ -642,6 +641,21 @@ fn main() {
     // 1. Init NSApplication as accessory (no dock icon)
     init_app();
 
+    // 1b. 初始化 logger:早于一切,从 CONFIG 读日志级别,根据 cargo run / .app 决定输出目标。
+    //     Init logger: before everything else, read log level from CONFIG, auto-detect dev/prod.
+    {
+        let cfg = CONFIG.read().unwrap(); // 触发 LazyLock 初始化和 config 加载 / triggers LazyLock init + config load
+        let level = match cfg.logging.level.as_str() {
+            "warn" => logger::LogLevel::Warn,
+            "error" => logger::LogLevel::Error,
+            _ => logger::LogLevel::Info,
+        };
+        let is_dev = std::env::current_exe()
+            .map(|p| p.to_string_lossy().contains("target/"))
+            .unwrap_or(false);
+        logger::init(&logger::LogConfig { level, file_path: cfg.logging.file_path.clone() }, is_dev);
+    }
+
     // 2. Register custom ObjC classes
     register_classes();
 
@@ -673,14 +687,14 @@ fn main() {
         // First load already happened via LazyLock; re-run validate to report problems
         let errs = cfg.validate();
         if !errs.is_empty() {
-            eprintln!(
-                "[oh-my-tab] Config errors in ~/.config/oh-my-tab/config.toml ({} issue(s)):",
+            log_warn!(
+                "Config errors in ~/.config/oh-my-tab/config.toml ({} issue(s)):",
                 errs.len()
             );
             for e in &errs {
-                eprintln!("[oh-my-tab]   • {}", e);
+                log_warn!("  • {}", e);
             }
-            eprintln!("[oh-my-tab] Using defaults for invalid fields.");
+            log_warn!("Using defaults for invalid fields.");
         }
     }
 
@@ -761,7 +775,7 @@ fn main() {
                 ];
             }
         }
-        println!("[oh-my-tab] Bridge thread exiting.");
+        log_info!("Bridge thread exiting.");
     });
 
     // 8. Run the main event loop (blocks until [NSApp terminate:])
