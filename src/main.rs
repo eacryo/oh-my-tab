@@ -145,11 +145,18 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
         // ordering through this path. The kAXFocusedWindow AX query can block up
         // to 50ms (target app unresponsive), so it must run off the main thread.
         thread::spawn(move || {
+            // 日志用于诊断 MRU 是否被正确 bump:成功打印 pid+cgwid;失败(AX 查询超时/无聚焦窗口)
+            // 也打印,便于排查"所有窗口 mru 都停在 ancient 回退值"这类问题。
+            // Log to diagnose MRU bumping: print pid+cgwid on success; also log on failure
+            // (AX timeout / no focused window) to investigate "all windows stuck at ancient fallback".
             if let Some(cgwid) = focused_window_cgwid(pid) {
                 let mut state_opt = TAB_STATE.lock().unwrap();
                 if let Some(ref mut state) = *state_opt {
                     bump_window_mru(&mut state.mru, pid, cgwid);
+                    eprintln!("[oh-my-tab] app-activated bump: pid={} cgwid={}", pid, cgwid);
                 }
+            } else {
+                eprintln!("[oh-my-tab] app-activated bump: pid={} (no focused window / AX timeout)", pid);
             }
         });
     }

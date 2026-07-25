@@ -182,7 +182,7 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         hide_overlay();
         activate_and_raise(pid, cgwid);
         bump_window_mru(&mut state.mru, pid, cgwid);
-        eprintln!("[oh-my-tab] commit: pid={} cgwid={} title=\"{}\" selected={}", pid, cgwid, wt, state.selected);
+        eprintln!("[oh-my-tab] commit: pid={} app=\"{}\" cgwid={} title=\"{}\" selected={}", pid, w.app_name, cgwid, wt, state.selected);
     } else {
         eprintln!(
             "[oh-my-tab] CmdReleased: selected index {} out of bounds (windows={})",

@@ -584,6 +584,23 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
     unsafe { CFRelease(array) };
 
+    // summon 时刷新前台聚焦窗口(= CG 顺序首个真实窗口)的 MRU 为 now。
+    // 焦点变化若不触发 App 激活通知(如终端切 tab、或前台 App 从未被系统激活过),
+    // 当前窗口的 MRU 会停在 ancient 回退值,排序退化成 CG 枚举顺序。每次 summon 把
+    // "用户正看的窗口"刷成最新即可纠正。
+    // Refresh the MRU of the frontmost focused window (= first real window in CG order) to now
+    // on summon. Focus changes that don't fire an app-activation notification (e.g. switching
+    // terminal tabs, or a frontmost app never system-activated) leave the current window's MRU
+    // at the ancient fallback, degrading sort to CG enumeration order. Bumping the window the
+    // user is looking at, on every summon, corrects this.
+    if let Some(w) = windows.first() {
+        mru.insert((w.pid, w.window_id), now);
+        eprintln!(
+            "[oh-my-tab] summon-bump frontmost: pid={} app=\"{}\" cgwid={} title=\"{}\"",
+            w.pid, w.app_name, w.window_id, w.window_title
+        );
+    }
+
     // 纯窗口级 MRU 排序：每个窗口独立按最后被激活的时间排序。
     // 不再使用 App 级 LAST_ACTIVATED——避免从 App C 切到浏览器的窗口 A 时，
     // 浏览器的另一个窗口 B 也"搭便车"排到 C 前面。
@@ -597,12 +614,13 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         wa.cmp(&wb)
     });
 
-    // [诊断] 打印排序后的顺序（= 实际显示顺序），含 mru 年龄。
-    // Diagnostic: print sorted order (= display order) with MRU age.
+    // [诊断] 打印排序后的顺序（= 实际显示顺序），含 mru 年龄。`*` 标记第 0 个(当前/前台窗口)。
+    // Diagnostic: print sorted order (= display order) with MRU age. `*` marks index 0 (current/frontmost).
     eprintln!("[oh-my-tab] sorted: {} windows", windows.len());
-    for w in &windows {
+    for (i, w) in windows.iter().enumerate() {
         let mru_ms = mru.get(&(w.pid, w.window_id)).map(|t| t.elapsed().as_millis());
-        eprintln!("[oh-my-tab]   pid={} cgwid={} title=\"{}\" mru_ms={:?}", w.pid, w.window_id, w.window_title, mru_ms);
+        let mark = if i == 0 { "*" } else { " " };
+        eprintln!("[oh-my-tab]   {} pid={} app=\"{}\" cgwid={} title=\"{}\" mru_ms={:?}", mark, w.pid, w.app_name, w.window_id, w.window_title, mru_ms);
     }
 
     if let Some(first) = windows.first_mut() { first.is_active = true; }
