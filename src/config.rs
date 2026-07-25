@@ -94,8 +94,8 @@ pub struct LoggingSection {
     // 日志级别:"trace","debug","info","warn","error";默认 "info"。
     // Log level; default "info".
     pub level: String,
-    // 日志文件路径;空=使用默认路径 ~/Library/Logs/oh-my-tab/oh-my-tab.log。
-    // Log file path; empty = use default.
+    // 日志文件路径;空=使用默认路径 ~/Library/Logs/oh-my-tab/oh-my-tab-<时间戳>.log。
+    // Log file path; empty = use the default (timestamped file under ~/Library/Logs/oh-my-tab/).
     pub file_path: String,
 }
 
