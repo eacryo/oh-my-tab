@@ -36,14 +36,15 @@ cargo clippy      # available, not wired into CI
 
 `cargo run` launches the raw binary in **dev mode**: logs go to stdout (no log file) and launch-at-login is inactive (SMAppService needs a `.app` bundle). There are **no tests** in the project.
 
-### Release `.app`
+### Release `.app` + `.dmg`
 
 ```sh
-sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc sign
-open dist/oh-my-tab.app
+sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc sign -> dist/oh-my-tab.dmg
+open dist/oh-my-tab.dmg     # install: drag Oh My Tab into Applications
+open dist/oh-my-tab.app     # dev-run (SMAppService needs a .app, not cargo run)
 ```
 
-`bundle.sh` assembles `dist/oh-my-tab.app` (binary + `Info.plist`) and ad-hoc signs it. The output lives in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running as a `.app` is required for launch-at-login (SMAppService) and for file logging.
+`bundle.sh` assembles `dist/oh-my-tab.app` (binary + `Info.plist`), ad-hoc signs it, then packages it into `dist/oh-my-tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution.
 
 Re-run `sh scripts/bundle.sh` after code changes (the bundle copies the release binary at build time). The script self-locates the repo root, so it can be run from anywhere; it references `assets/Info.plist` and writes to `dist/`. A binary at a new path must be **re-granted Accessibility** permission.
 

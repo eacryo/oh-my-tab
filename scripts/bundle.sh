@@ -1,20 +1,22 @@
 #!/bin/sh
-# 打包 release .app:编译 -> 组装 bundle -> ad-hoc 签名。
+# 打包 release .app 并打成 .dmg:编译 -> 组装 bundle -> ad-hoc 签名 -> DMG。
 # 产物输出到 dist/(已 gitignore),放在 target/ 之外以保持 logger 的 is_dev=false(走文件日志)。
 #
-# Bundle the release .app: build -> assemble bundle -> ad-hoc sign.
+# Build the release .app and package it as .dmg: build -> assemble bundle -> ad-hoc sign -> DMG.
 # Output goes to dist/ (gitignored), outside target/ so the logger's is_dev stays false (file logging).
 set -e
 
-# 失败提示:set -e 触发非零退出时打印;成功走到末尾退出码为 0,静默。
-# Failure notice: printed on non-zero exit (triggered by set -e); silent on success (exit 0).
-trap 'code=$?; [ "$code" -ne 0 ] && echo "❌ Build failed (exit $code)" >&2' EXIT
+# 失败提示:set -e 触发非零退出时打印 + 清理 DMG 临时目录;成功走到末尾退出码为 0,静默。
+# Failure notice + DMG staging cleanup on non-zero exit (set -e); silent on success (exit 0).
+STAGING=""
+trap 'code=$?; [ -n "$STAGING" ] && rm -rf "$STAGING"; [ "$code" -ne 0 ] && echo "❌ Build failed (exit $code)" >&2' EXIT
 
 # 脚本在 scripts/ 下,先切到仓库根再引用相对路径。
 # Script lives in scripts/; cd to the repo root before using relative paths.
 cd "$(dirname "$0")/.."
 
 APP="dist/oh-my-tab.app"
+DMG="dist/oh-my-tab.dmg"
 
 cargo build --release
 BIN="target/release/oh-my-tab"
@@ -42,5 +44,15 @@ cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 # one-time approval in System Settings > General > Login Items & Extensions.
 codesign --force --sign - "$APP"
 
-echo "✅ Build success: $APP"
-echo "Launch with: open $APP   (SMAppService only works when launched as a .app, not via cargo run)"
+# 打 DMG(hdiutil 自带,无额外依赖):staging 里放 .app + Applications 软链,挂载后拖拽安装。
+# Build DMG via hdiutil (no extra deps): staging holds .app + Applications symlink for drag-to-install.
+STAGING="$(mktemp -d)"
+cp -R "$APP" "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
+rm -f "$DMG"
+hdiutil create -volname "Oh My Tab" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
+rm -rf "$STAGING"; STAGING=""
+
+echo "✅ Build success: $DMG (contains $APP)"
+echo "Install: open $DMG   then drag Oh My Tab to Applications"
+echo "Dev-run: open $APP   (SMAppService only works when launched as a .app, not via cargo run)"

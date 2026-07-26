@@ -36,14 +36,15 @@ cargo clippy      # 可用,未接入 CI
 
 `cargo run` 以**开发模式**跑裸二进制:日志输出到 stdout(不写文件),开机自启不生效(SMAppService 需要 `.app` bundle)。项目**没有测试**。
 
-### Release `.app`
+### Release `.app` + `.dmg`
 
 ```sh
-sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc 签名
-open dist/oh-my-tab.app
+sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc 签名 -> dist/oh-my-tab.dmg
+open dist/oh-my-tab.dmg     # 安装:把 Oh My Tab 拖到 Applications
+open dist/oh-my-tab.app     # 开发自启(SMAppService 需要 .app,不能 cargo run)
 ```
 
-`bundle.sh` 组装 `dist/oh-my-tab.app`(二进制 + `Info.plist`)并做 ad-hoc 签名。产物在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。以 `.app` 方式运行是开机自启(SMAppService)和文件日志的前提。
+`bundle.sh` 组装 `dist/oh-my-tab.app`(二进制 + `Info.plist`)、做 ad-hoc 签名,再打成 `dist/oh-my-tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。
 
 代码改动后需要**重新跑 `sh scripts/bundle.sh`**(bundle 在构建时拷贝 release 二进制)。脚本会自定位仓库根,可从任意目录运行;它引用 `assets/Info.plist`、写入 `dist/`。新路径下的二进制必须**重新授予辅助功能**权限。
 
