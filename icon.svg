@@ -1,0 +1,42 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- 1. 暗色背景渐变(铺满整个画布,贴合 macOS Big Sur+ 全出血 squircle 规范) -->
+    <!-- Dark background gradient filling the full canvas to match the macOS Big Sur+ full-bleed squircle spec -->
+    <linearGradient id="bg-grad" x1="256" y1="0" x2="256" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+
+    <!-- 2. 左上方框渐变（底层） -->
+    <linearGradient id="box-left-grad" x1="140" y1="140" x2="300" y2="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#A855F7"/>
+    </linearGradient>
+
+    <!-- 3. 右下方框渐变（顶层） -->
+    <linearGradient id="box-right-grad" x1="210" y1="210" x2="370" y2="370" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+
+    <!-- 4. 顶层方框叠加阴影（增强立体重叠感,属于图标内部内容,保留） -->
+    <!-- Overlay shadow on the front box for depth; internal icon content, kept -->
+    <filter id="box-shadow" x="190" y="190" width="200" height="200" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="-4" dy="-4" stdDeviation="8" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- 全出血 squircle 底座:铺满 512 画布,圆角半径 ≈ 22.37% (macOS Big Sur+ 规范);不烘焙外阴影(Launchpad 等场景由系统处理)。 -->
+  <!-- Full-bleed squircle base: fills the 512 canvas, corner radius ≈ 22.37% (macOS Big Sur+ spec); no baked outer shadow (system handles it in Launchpad etc.). -->
+  <rect x="0" y="0" width="512" height="512" rx="114" fill="url(#bg-grad)"/>
+
+  <!-- 顶部微弱反光高光边缘(内缩 1px,圆角随之外缩 1px 以保持同心) -->
+  <!-- Subtle top highlight edge (1px inset; corner radius reduced by 1px to stay concentric) -->
+  <rect x="1" y="1" width="510" height="510" rx="113" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="2"/>
+
+  <!-- 左上方框 (Back Layer) -->
+  <rect x="140" y="140" width="160" height="160" rx="28" fill="none" stroke="url(#box-left-grad)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- 右下方框 (Front Layer, 带有层次投影) -->
+  <rect x="210" y="210" width="160" height="160" rx="28" fill="none" stroke="url(#box-right-grad)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round" filter="url(#box-shadow)"/>
+</svg>

@@ -16,6 +16,18 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$BIN" "$APP/Contents/MacOS/oh-my-tab"
 cp Info.plist "$APP/Contents/Info.plist"
 
+# 应用图标:从 assets/AppIcon.icns 拷入 Contents/Resources/(放在 codesign 之前,纳入签名)。
+# 该 icns 由 build-icon.sh 从 icon.svg 生成并提交进 git;缺失则提示先跑 build-icon.sh。
+# App icon: copy assets/AppIcon.icns into Contents/Resources/ (before codesign so it is covered by the signature).
+# The icns is generated from icon.svg by build-icon.sh and committed; if missing, hint to run build-icon.sh first.
+ICON="assets/AppIcon.icns"
+if [ ! -f "$ICON" ]; then
+  echo "error: $ICON not found. Run ./build-icon.sh first." >&2
+  exit 1
+fi
+mkdir -p "$APP/Contents/Resources"
+cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
+
 # ad-hoc 签名:本地足够让 SMAppService 注册(未用 Developer ID 签名的应用,
 # 可能需要用户在 系统设置 > 通用 > 登录项与扩展 里手动批准一次)。
 # Ad-hoc sign: enough for SMAppService locally. Apps not signed with a Developer ID may require a

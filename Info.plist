@@ -8,6 +8,10 @@
     <string>Oh My Tab</string>
     <key>CFBundleExecutable</key>
     <string>oh-my-tab</string>
+    <!-- 应用图标(不带扩展名,macOS 自动找 .icns)。由 build-icon.sh 从 icon.svg 生成,打包进 Contents/Resources/。 -->
+    <!-- App icon (no extension; macOS appends .icns). Generated from icon.svg by build-icon.sh and bundled into Contents/Resources/. -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
