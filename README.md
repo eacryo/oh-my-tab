@@ -24,7 +24,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 
 ## Build & run
 
-**Prerequisites:** Rust stable toolchain, macOS 13+. Accessibility permission is required at runtime (see Permissions below).
+**Prerequisites:** Rust stable toolchain, Xcode Command Line Tools (`xcode-select --install`), macOS 13+. Accessibility permission is required at runtime (see Permissions below).
 
 ### Development
 
@@ -45,7 +45,7 @@ open dist/oh-my-tab.app
 
 `bundle.sh` assembles `dist/oh-my-tab.app` (binary + `Info.plist`) and ad-hoc signs it. The output lives in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running as a `.app` is required for launch-at-login (SMAppService) and for file logging.
 
-Re-run `sh bundle.sh` after code changes (the bundle copies the release binary at build time). A binary at a new path must be **re-granted Accessibility** permission.
+Re-run `sh bundle.sh` after code changes (the bundle copies the release binary at build time). Run it from the **repo root** — it references `Info.plist` and writes to `dist/` by relative path. A binary at a new path must be **re-granted Accessibility** permission.
 
 ## Permissions & runtime caveats
 

@@ -41,7 +41,7 @@ header_startup = "Startup"
 row_launch_at_login = "Launch at login"
 sidebar_general = "General"
 sidebar_experimental = "Experimental"
-experimental_note = "These options are experimental and may change in future versions."
+experimental_note = "Experimental options - no guarantee of availability; may be removed in future versions."
 btn_cancel = "Cancel"
 btn_ok = "OK"
 

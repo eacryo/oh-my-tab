@@ -24,7 +24,7 @@
 
 ## 构建与运行
 
-**前置条件:** Rust 稳定版工具链,macOS 13+。运行时需要辅助功能权限(见下方「权限与运行须知」)。
+**前置条件:** Rust 稳定版工具链、Xcode Command Line Tools(`xcode-select --install`)、macOS 13+。运行时需要辅助功能权限(见下方「权限与运行须知」)。
 
 ### 开发
 
@@ -45,7 +45,7 @@ open dist/oh-my-tab.app
 
 `bundle.sh` 组装 `dist/oh-my-tab.app`(二进制 + `Info.plist`)并做 ad-hoc 签名。产物在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。以 `.app` 方式运行是开机自启(SMAppService)和文件日志的前提。
 
-代码改动后需要**重新跑 `sh bundle.sh`**(bundle 在构建时拷贝 release 二进制)。新路径下的二进制必须**重新授予辅助功能**权限。
+代码改动后需要**重新跑 `sh bundle.sh`**(bundle 在构建时拷贝 release 二进制)。在**仓库根目录**运行--`bundle.sh` 用相对路径引用 `Info.plist`、写入 `dist/`。新路径下的二进制必须**重新授予辅助功能**权限。
 
 ## 权限与运行须知
 

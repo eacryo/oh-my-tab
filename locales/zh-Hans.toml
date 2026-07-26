@@ -42,7 +42,7 @@ header_startup = "启动 Startup"
 row_launch_at_login = "开机自启 launch_at_login"
 sidebar_general = "通用 General"
 sidebar_experimental = "实验性功能 Experimental"
-experimental_note = "以下为实验性选项，后续版本可能调整。"
+experimental_note = "实验性选项，不保证可用性，后续版本可能移除。"
 btn_cancel = "取消"
 btn_ok = "确认"
 
