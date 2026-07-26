@@ -2,24 +2,35 @@
 
 > [简体中文](README-ZH.md) | English
 
-A macOS window switcher — an alternative to the system Cmd+Tab. It runs as a **menu-bar accessory** app (no Dock icon), intercepts a global shortcut (**Option+Tab** by default, toggleable to Cmd+Tab), shows a floating **Liquid Glass** overlay of cards for currently-open windows, and raises the selected window on release using the Accessibility (AX) API.
+A macOS window switcher — an alternative to the system Cmd+Tab. It runs as a **menu-bar accessory** app (no Dock icon), intercepts a global shortcut (**Command+Tab** by default, toggleable to Option+Tab), shows a floating **Liquid Glass** overlay of cards for currently-open windows, and raises the selected window on release using the Accessibility (AX) API.
 
 It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly through `objc2` FFI — there is no Swift bridge and no Rust UI framework.
 
 ## Features
 
-- Floating Liquid Glass overlay (`NSGlassEffectView` on macOS 26+, `NSVisualEffectView` fallback on older macOS).
+- Enhances the native window switcher: shows the app name and window title (shown as '-' when untitled); when an app has multiple windows open, they appear as separate cards in the switcher.
+- After pressing Command or Option, navigate the selected window with Tab, arrow keys, or the mouse.
+- Pure Rust calling macOS APIs directly — no Electron, no Tauri — resulting in a ~1.5 MB binary and ~60 MB memory footprint.
+- Floating Liquid Glass overlay (tested only on macOS 26; lower versions not guaranteed to work).
 - **Window-level** MRU ordering — each window is tracked independently by `(pid, CGWindowID)`, so switching to one window of an app doesn't drag the app's other windows forward.
-- Raises **exactly one window** (located by `CGWindowID`) via the SkyLight private API `_SLPSSetFrontProcessWithOptions` + `AXRaise`, instead of `activate(AllWindows)` which would yank every window of the app to the front.
-- Popups / panels / dropdowns are filtered out — a CG window must correspond to an AX `AXStandardWindow` to be kept (AX is authoritative).
-- Minimized windows can optionally be shown (greyed out).
+- Optionally show or hide minimized windows in the switcher; when shown, minimized windows' icons are greyed out.
 - TOML configuration, validated and **hot-reloadable** from the menu.
 - Handcrafted, zero-dependency i18n (English, Simplified Chinese, Traditional Chinese) with automatic locale detection and live system-language follow.
 - Per-launch log files with automatic 30-day retention (see [Logging](#logging)).
 
+## Screenshots
+
+![Main window](docs/pictures/main_window.png)
+
+![Settings](docs/pictures/settings.png)
+
+## Known Issues
+
+If windows are already open when the app starts, their ordering differs from the native Cmd+Tab order. This is because there is no initial window-ordering data; oh-my-tab builds it by continuously observing window changes after launch.
+
 ## Requirements
 
-- macOS (developed on macOS 26; older versions supported via the `NSVisualEffectView` fallback).
+- macOS (developed on macOS 26; older versions supported via the `NSVisualEffectView` fallback, but availability is not guaranteed).
 - **Accessibility** permission granted to the app.
 
 ## Build & run
@@ -41,7 +52,6 @@ cargo clippy      # available, not wired into CI
 ```sh
 sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc sign -> dist/oh-my-tab.dmg
 open dist/oh-my-tab.dmg     # install: drag Oh My Tab into Applications
-open dist/oh-my-tab.app     # dev-run (SMAppService needs a .app, not cargo run)
 ```
 
 `bundle.sh` assembles `dist/oh-my-tab.app` (binary + `Info.plist`), ad-hoc signs it, then packages it into `dist/oh-my-tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution.
@@ -195,12 +205,6 @@ The app deliberately **never writes extra files into, and never deletes any file
 ## Icon cache
 
 `~/Library/Caches/oh-my-tab-icons/{pid}.png` — keyed by **PID** and "file exists = valid" (no TTL): an app update always relaunches with a new PID, which forces a re-extract. Icons are pre-cached at startup and on `NSWorkspaceDidLaunchApplicationNotification`. The cache can be cleared from the menu (*Clear Icon Cache*).
-
-## Known limitations
-
-- If the active shortcut is also intercepted by another `CGEventTap`-based app that is ahead of ours in the tap chain, pressing the shortcut may silently do nothing — there is no detection or fallback for this. (Apps using Carbon global hot keys are overridden by our filter tap; the risk is other filter-tap apps.) Secure Input also bypasses event taps entirely, with the same silent symptom.
-- The active shortcut is a single toggle — only Option+Tab *or* Cmd+Tab is intercepted at any given moment.
-- No test suite.
 
 ## Repository
 

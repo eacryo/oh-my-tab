@@ -2,24 +2,35 @@
 
 > 简体中文 | [English](README.md)
 
-一个 macOS 窗口切换器 -- 系统 Cmd+Tab 的替代品。它以**菜单栏辅助应用**方式运行(无 Dock 图标),拦截全局快捷键(默认 **Option+Tab**,可切换为 Cmd+Tab),弹出一个 **Liquid Glass** 风格的浮层,以卡片形式展示当前打开的窗口,松开快捷键时通过辅助功能(Accessibility,AX)API 把选中的窗口抬到最前。
+一个 macOS 窗口切换器 -- 系统 Cmd+Tab 的替代品。它以**菜单栏辅助应用**方式运行(无 Dock 图标),拦截全局快捷键(默认 **Command+Tab**,可切换为 Option+Tab),弹出一个 **Liquid Glass** 风格的浮层,以卡片形式展示当前打开的窗口,松开快捷键时通过辅助功能(Accessibility,AX)API 把选中的窗口抬到最前。
 
 它是纯 Rust 通过 `objc2` FFI 直接调用 AppKit / CoreGraphics / ApplicationServices -- 没有 Swift 桥接,也没有 Rust UI 框架。
 
 ## 功能特性
 
-- 浮层 Liquid Glass 效果(macOS 26+ 用 `NSGlassEffectView`,旧版 macOS 回退到 `NSVisualEffectView`)。
+- 对于系统原生窗口切换的增强，可以显示应用名称和窗口标题（无标题时使用-显示）同一个应用打开多个窗口时，可以分列在窗口切换界面
+- 按下Command或Option后，可以通过Tab键以及上下左右方向键和鼠标指针移动选中窗口
+- 纯Rust调用MacOS api，没有Electron，没有Tauri，带来了仅1.5MB的体积大小和60MB的内存占用
+- 浮层 Liquid Glass 效果，因此只在MacOS 26上测试过，更低版本不保证可用性。
 - **窗口级** MRU 排序 -- 每个窗口按 `(pid, CGWindowID)` 独立追踪,切到某 App 的一个窗口时不会把该 App 的其它窗口一起带到前面。
-- 通过 SkyLight 私有 API `_SLPSSetFrontProcessWithOptions` + `AXRaise` **只抬起一个窗口**(按 `CGWindowID` 定位),而不是用 `activate(AllWindows)` 把该 App 的所有窗口都拉到前面。
-- 过滤弹出面板/下拉菜单等 -- CG 窗口必须能在 AX 里对应到 `AXStandardWindow` 才保留(AX 为权威数据源)。
-- 可选显示最小化窗口(灰显)。
+- 窗口切换界面支持显示最小化窗口和和隐藏最小化窗口，开启时置灰最小化窗口的图标
 - TOML 配置,校验后可从菜单**热重载**。
 - 手写、零依赖的国际化(英文、简体中文、繁体中文),自动检测系统语言并实时跟随。
 - 每次启动一个日志文件,自动保留 30 天(见[日志](#日志))。
 
+## 截图
+
+![主界面](docs/pictures/main_window.png)
+
+![设置](docs/pictures/settings.png)
+
+## 已知问题
+如果应用启动时已经有窗口存在，此时窗口排序与原生的Command加Tab排序不同，
+这是由于没有初始的窗口排序数据导致的，oh-my-tab启动后会持续监听窗口的变化
+
 ## 环境要求
 
-- macOS(在 macOS 26 上开发;旧版本通过 `NSVisualEffectView` 回退支持)。
+- macOS(在 macOS 26 上开发;旧版本通过 `NSVisualEffectView` 回退支持，但不保证其可用性)。
 - 已授予应用 **辅助功能** 权限。
 
 ## 构建与运行
@@ -41,7 +52,6 @@ cargo clippy      # 可用,未接入 CI
 ```sh
 sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc 签名 -> dist/oh-my-tab.dmg
 open dist/oh-my-tab.dmg     # 安装:把 Oh My Tab 拖到 Applications
-open dist/oh-my-tab.app     # 开发自启(SMAppService 需要 .app,不能 cargo run)
 ```
 
 `bundle.sh` 组装 `dist/oh-my-tab.app`(二进制 + `Info.plist`)、做 ad-hoc 签名,再打成 `dist/oh-my-tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。
@@ -196,11 +206,6 @@ launch_at_login = false  # 开机自启(需以 .app 方式运行;macOS 13+)
 
 `~/Library/Caches/oh-my-tab-icons/{pid}.png` -- 按 **PID** 索引,"文件存在即有效"(无 TTL):App 更新必然以新 PID 重启,从而强制重新提取。启动时预缓存,并在 `NSWorkspaceDidLaunchApplicationNotification` 时补提取。可从菜单(*Clear Icon Cache*)清空。
 
-## 已知限制
-
-- 如果当前激活的快捷键也被另一个基于 `CGEventTap` 的应用拦截,且对方的 tap 排在我们前面,按下快捷键可能静默失效 -- 代码没有对此做检测或回退。(走 Carbon 全局热键的应用会被我们的 filter tap 压过;真正的风险来自其它 filter-tap 应用。)Secure Input 也会整体绕过事件 tap,症状同样静默。
-- 激活的快捷键是单选开关 -- 同一时刻只拦截 Option+Tab *或* Cmd+Tab 中的一个。
-- 没有测试套件。
 
 ## 仓库
 
