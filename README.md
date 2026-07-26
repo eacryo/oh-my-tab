@@ -47,6 +47,18 @@ open dist/oh-my-tab.app
 
 Re-run `sh bundle.sh` after code changes (the bundle copies the release binary at build time). Run it from the **repo root** — it references `Info.plist` and writes to `dist/` by relative path. A binary at a new path must be **re-granted Accessibility** permission.
 
+## App icon
+
+The app icon (`AppIcon.icns`) is generated from `icon.svg` and bundled into `Contents/Resources/`. The committed `assets/AppIcon.icns` is used directly by `bundle.sh`, so contributors need no extra tooling to build the `.app`.
+
+To regenerate it after editing `icon.svg`:
+
+```sh
+./build-icon.sh        # SVG -> 10 .iconset PNGs (tools/svg2png.swift) -> assets/AppIcon.icns
+```
+
+Requires `swift` (Xcode or the Swift toolchain) and `iconutil` (Xcode CLT). `qlmanage` is intentionally avoided -- it composites SVG onto an opaque white background, leaving white corners outside the rounded squircle. `tools/svg2png.swift` rasterizes via `NSImage`/WebKit at each target size, preserving the transparent corners. Then commit the regenerated `assets/AppIcon.icns` alongside the `icon.svg` change.
+
 ## Permissions & runtime caveats
 
 - The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary at a new path must be re-granted.

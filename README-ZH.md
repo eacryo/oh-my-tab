@@ -47,6 +47,18 @@ open dist/oh-my-tab.app
 
 代码改动后需要**重新跑 `sh bundle.sh`**(bundle 在构建时拷贝 release 二进制)。在**仓库根目录**运行--`bundle.sh` 用相对路径引用 `Info.plist`、写入 `dist/`。新路径下的二进制必须**重新授予辅助功能**权限。
 
+## 应用图标
+
+应用图标(`AppIcon.icns`)由 `icon.svg` 生成,打包进 `Contents/Resources/`。`assets/AppIcon.icns` 已提交进仓库,`bundle.sh` 直接使用它,因此贡献者构建 `.app` 时无需任何额外工具。
+
+编辑 `icon.svg` 后重新生成:
+
+```sh
+./build-icon.sh        # SVG -> 10 张 .iconset PNG(tools/svg2png.swift) -> assets/AppIcon.icns
+```
+
+需要 `swift`(Xcode 或 Swift 工具链)+ `iconutil`(Xcode CLT)。刻意不用 `qlmanage` -- 它会把 SVG 合成到不透明白底上,导致圆角 squircle 外出现白边。`tools/svg2png.swift` 用 `NSImage`/WebKit 在每个目标尺寸原生光栅化,保留透明圆角。生成后把新的 `assets/AppIcon.icns` 连同 `icon.svg` 改动一起提交。
+
 ## 权限与运行须知
 
 - 应用需要 **辅助功能** 权限(`AXIsProcessTrusted`),全局按键事件 tap 和 AX 窗口查询都依赖它。在 *系统设置 -> 隐私与安全性 -> 辅助功能* 中授予。新路径下重新编译出的二进制需要重新授权。
