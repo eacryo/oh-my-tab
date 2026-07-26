@@ -123,6 +123,32 @@ unsafe fn make_checkbox(x: f64, y: f64, w: f64, h: f64, title: &str, checked: bo
     cb
 }
 
+/// 设侧边栏按钮标题为带 labelColor 的 attributed title(selected=true 用粗体)。
+/// Set the sidebar button's title as an attributed title with labelColor (bold when selected).
+unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selected: bool) {
+    let font: *mut AnyObject = if selected {
+        msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64]
+    } else {
+        msg_send![class!(NSFont), messageFontOfSize: 13.0f64]
+    };
+    let color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
+    let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let attrs: *mut AnyObject = msg_send![attrs, init];
+    let k_font = make_nsstring("NSFont");
+    let _: () = msg_send![attrs, setObject: font, forKey: k_font];
+    CFRelease(k_font as *const c_void);
+    let k_color = make_nsstring("NSColor");
+    let _: () = msg_send![attrs, setObject: color, forKey: k_color];
+    CFRelease(k_color as *const c_void);
+    let title_ns = make_nsstring(title);
+    let attr_str: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let attr_str: *mut AnyObject = msg_send![attr_str, initWithString: title_ns, attributes: attrs];
+    let _: () = msg_send![btn, setAttributedTitle: attr_str];
+    CFRelease(title_ns as *const c_void);
+    release_obj(attr_str);
+    release_obj(attrs);
+}
+
 /// 侧边栏按钮(borderless NSButton,tag 区分页,点击触发 handleSettingsSidebar:)。
 /// Sidebar button (borderless NSButton; tag selects the page; click triggers handleSettingsSidebar:).
 /// 高度固定 28(与行高一致);alloc +1,加入父视图后由调用方 release。
@@ -143,8 +169,7 @@ unsafe fn make_sidebar_button(
     let _: () = msg_send![btn, setBordered: false];
     let _: () = msg_send![btn, setTag: tag];
     set_control_title(btn, title);
-    let font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.0f64];
-    let _: () = msg_send![btn, setFont: font];
+    set_sidebar_title(btn, title, false);
     let _: () = msg_send![btn, setTarget: target];
     let _: () = msg_send![btn, setAction: sel!(handleSettingsSidebar:)];
     let _: () = msg_send![parent, addSubview: btn];
@@ -248,14 +273,11 @@ fn select_sidebar(idx: usize) {
         // 高亮背景对齐到选中按钮的 frame / align the highlight to the selected button's frame
         let frame: NSRect = msg_send![buttons[idx], frame];
         let _: () = msg_send![ui.sidebar_highlight, setFrame: frame];
-        // 选中项粗体,另一项常规 / bold the selected item, regular for the other
+        // 选中项粗体,另一项常规;都用 labelColor,颜色与 section 标题一致。
+        // Bold the selected, regular for the other; both use labelColor to match section headers.
+        let titles = [t("settings.sidebar_general"), t("settings.sidebar_experimental")];
         for (i, &b) in buttons.iter().enumerate() {
-            let font: *mut AnyObject = if i == idx {
-                msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64]
-            } else {
-                msg_send![class!(NSFont), messageFontOfSize: 13.0f64]
-            };
-            let _: () = msg_send![b, setFont: font];
+            set_sidebar_title(b, &titles[i], i == idx);
         }
         // 切换两页显隐 / toggle the two pages' visibility
         for (i, &v) in views.iter().enumerate() {
@@ -293,6 +315,9 @@ fn show_settings() {
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
             let _: () = msg_send![u.window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+            // 清掉默认 first responder,避免打开时光标落在 Glass color 文本框。
+            // Clear the default first responder so the cursor doesn't land in the Glass color field on open.
+            let _: bool = msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
         }
     }
 }
