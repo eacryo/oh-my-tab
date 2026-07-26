@@ -6,6 +6,10 @@
 # Output goes to dist/ (gitignored), outside target/ so the logger's is_dev stays false (file logging).
 set -e
 
+# 失败提示:set -e 触发非零退出时打印;成功走到末尾退出码为 0,静默。
+# Failure notice: printed on non-zero exit (triggered by set -e); silent on success (exit 0).
+trap 'code=$?; [ "$code" -ne 0 ] && echo "❌ Build failed (exit $code)" >&2' EXIT
+
 # 脚本在 scripts/ 下,先切到仓库根再引用相对路径。
 # Script lives in scripts/; cd to the repo root before using relative paths.
 cd "$(dirname "$0")/.."
@@ -38,5 +42,5 @@ cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 # one-time approval in System Settings > General > Login Items & Extensions.
 codesign --force --sign - "$APP"
 
-echo "Built $APP"
+echo "✅ Build success: $APP"
 echo "Launch with: open $APP   (SMAppService only works when launched as a .app, not via cargo run)"

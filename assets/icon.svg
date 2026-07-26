@@ -8,20 +8,20 @@
     </linearGradient>
 
     <!-- 2. 左上方框渐变（底层） -->
-    <linearGradient id="box-left-grad" x1="140" y1="140" x2="300" y2="300" gradientUnits="userSpaceOnUse">
+    <linearGradient id="box-left-grad" x1="112" y1="112" x2="312" y2="312" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#6366F1"/>
       <stop offset="100%" stop-color="#A855F7"/>
     </linearGradient>
 
     <!-- 3. 右下方框渐变（顶层） -->
-    <linearGradient id="box-right-grad" x1="210" y1="210" x2="370" y2="370" gradientUnits="userSpaceOnUse">
+    <linearGradient id="box-right-grad" x1="200" y1="200" x2="400" y2="400" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#38BDF8"/>
       <stop offset="100%" stop-color="#2563EB"/>
     </linearGradient>
 
     <!-- 4. 顶层方框叠加阴影（增强立体重叠感,属于图标内部内容,保留） -->
     <!-- Overlay shadow on the front box for depth; internal icon content, kept -->
-    <filter id="box-shadow" x="190" y="190" width="200" height="200" filterUnits="userSpaceOnUse">
+    <filter id="box-shadow" x="170" y="170" width="255" height="255" filterUnits="userSpaceOnUse">
       <feDropShadow dx="-4" dy="-4" stdDeviation="8" flood-color="#000000" flood-opacity="0.3"/>
     </filter>
   </defs>
@@ -35,8 +35,8 @@
   <rect x="1" y="1" width="510" height="510" rx="113" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="2"/>
 
   <!-- 左上方框 (Back Layer) -->
-  <rect x="140" y="140" width="160" height="160" rx="28" fill="none" stroke="url(#box-left-grad)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="112" y="112" width="200" height="200" rx="35" fill="none" stroke="url(#box-left-grad)" stroke-width="25" stroke-linecap="round" stroke-linejoin="round"/>
 
   <!-- 右下方框 (Front Layer, 带有层次投影) -->
-  <rect x="210" y="210" width="160" height="160" rx="28" fill="none" stroke="url(#box-right-grad)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round" filter="url(#box-shadow)"/>
+  <rect x="200" y="200" width="200" height="200" rx="35" fill="none" stroke="url(#box-right-grad)" stroke-width="25" stroke-linecap="round" stroke-linejoin="round" filter="url(#box-shadow)"/>
 </svg>
