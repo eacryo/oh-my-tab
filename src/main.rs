@@ -1,14 +1,14 @@
-mod window_collector;
-mod event_monitor;
-mod config;
-mod i18n;
-mod ffi;
-mod theme;
-mod overlay;
-mod menu;
-mod settings;
-mod logger;
 mod autostart;
+mod config;
+mod event_monitor;
+mod ffi;
+mod i18n;
+mod logger;
+mod menu;
+mod overlay;
+mod settings;
+mod theme;
+mod window_collector;
 
 use config::CONFIG;
 use i18n::t;
@@ -26,20 +26,19 @@ use overlay::*;
 use menu::*;
 // 设置窗口(控件构造/窗口构建显示收集/校验告警/配置热应用)集中在 settings.rs
 // Settings window (control builders/window build-show-collect/validation alerts/hot config apply) live in settings.rs
-use settings::*;
-use flume;
-use objc2::{class, msg_send, sel};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
+use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
+use settings::*;
 use std::ffi::{c_void, CString};
 use std::sync::Mutex;
 use std::thread;
 
+use event_monitor::{start as start_event_monitor, GlobalEvent};
 use window_collector::{
-    MruMap, WindowInfo, bump_window_mru, cache_running_app_icons, ensure_icon_cache_dir,
-    extract_icon_to_cache, focused_window_cgwid, note_app_activated,
+    bump_window_mru, cache_running_app_icons, ensure_icon_cache_dir, extract_icon_to_cache,
+    focused_window_cgwid, note_app_activated, MruMap, WindowInfo,
 };
-use event_monitor::{GlobalEvent, start as start_event_monitor};
 
 // FFI 声明与 ObjC 桥接基础工具已移至 `ffi.rs` / FFI declarations and ObjC bridging primitives moved to `ffi.rs`
 
@@ -129,11 +128,15 @@ pub(crate) static STATUS_EVENT_TX: std::sync::OnceLock<flume::Sender<GlobalEvent
 extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
     unsafe {
         let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
-        if user_info.is_null() { return; }
+        if user_info.is_null() {
+            return;
+        }
         let key = make_nsstring("NSWorkspaceApplicationKey");
         let app: *mut AnyObject = msg_send![user_info, objectForKey: key];
         CFRelease(key as *const c_void);
-        if app.is_null() { return; }
+        if app.is_null() {
+            return;
+        }
         let pid: i32 = msg_send![app, processIdentifier];
         // 更新 App 级激活时间（仅用于诊断，不参与排序）
         // Update app-level activation time (diagnostics only, not used in sorting)
@@ -158,7 +161,10 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
                     log_info!("app-activated bump: pid={} cgwid={}", pid, cgwid);
                 }
             } else {
-                log_info!("app-activated bump: pid={} (no focused window / AX timeout)", pid);
+                log_info!(
+                    "app-activated bump: pid={} (no focused window / AX timeout)",
+                    pid
+                );
             }
         });
     }
@@ -171,14 +177,20 @@ extern "C" fn on_app_launched(_self: *mut c_void, _cmd: Sel, notification: *mut 
     // defensive (null-safe) and a failure simply leaves the letter-icon fallback.
     let pid: i32 = unsafe {
         let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
-        if user_info.is_null() { return; }
+        if user_info.is_null() {
+            return;
+        }
         let key = make_nsstring("NSWorkspaceApplicationKey");
         let app: *mut AnyObject = msg_send![user_info, objectForKey: key];
         CFRelease(key as *const c_void);
-        if app.is_null() { return; }
+        if app.is_null() {
+            return;
+        }
         msg_send![app, processIdentifier]
     };
-    if pid <= 0 { return; }
+    if pid <= 0 {
+        return;
+    }
     thread::spawn(move || unsafe {
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
         let _ = extract_icon_to_cache(pid);
@@ -239,7 +251,8 @@ fn register_classes() {
             objc_registerClassPair(cls);
             cls
         };
-        *CARD_CLASS.lock().unwrap() = Some(ObjClassPtr(card_cls as *const objc2::runtime::AnyClass));
+        *CARD_CLASS.lock().unwrap() =
+            Some(ObjClassPtr(card_cls as *const objc2::runtime::AnyClass));
     }
 }
 
@@ -251,10 +264,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let w = window_width(cards_per_row()); // max possible width
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
-        let frame = NSRect::new(
-            NSPoint::new(x, y),
-            NSSize::new(w, h),
-        );
+        let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
 
         // Use standard NSWindow with hidden title bar (avoids dynamic-subclass
         // msg_send! issues). NSTitledWindowMask allows the window to become key
@@ -307,8 +317,9 @@ fn create_overlay_window() -> *mut AnyObject {
             let glass: *mut AnyObject = msg_send![glass_cls, alloc];
             let glass: *mut AnyObject = msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
             *GLASS_VIEW.lock().unwrap() = Some(ObjPtr(glass)); // 保存指针，供热重载重新应用 / save for hot reload
-            // (4) Corner radius — native NSGlassEffectView property, from config.
-            let _: () = msg_send![glass, setCornerRadius: CONFIG.read().unwrap().appearance.corner_radius];
+                                                               // (4) Corner radius — native NSGlassEffectView property, from config.
+            let _: () =
+                msg_send![glass, setCornerRadius: CONFIG.read().unwrap().appearance.corner_radius];
             // (5) Glass style — "regular" (0) or "clear" (1), from config.
             let style: i64 = match CONFIG.read().unwrap().appearance.glass_style.as_str() {
                 "clear" => 1,
@@ -333,9 +344,9 @@ fn create_overlay_window() -> *mut AnyObject {
             let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
             let ve: *mut AnyObject = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
             // withinWindow blending + Dark material (same as the GPUI version used)
-            let _: () = msg_send![ve, setBlendingMode: 1u64];  // WithinWindow
-            let _: () = msg_send![ve, setMaterial: 12u64];      // Dark
-            let _: () = msg_send![ve, setState: 1u64];           // Active
+            let _: () = msg_send![ve, setBlendingMode: 1u64]; // WithinWindow
+            let _: () = msg_send![ve, setMaterial: 12u64]; // Dark
+            let _: () = msg_send![ve, setState: 1u64]; // Active
             let _: () = msg_send![ve, setAutoresizingMask: 18u64];
             let _: () = msg_send![content, addSubview: ve];
             content_parent = ve;
@@ -378,11 +389,10 @@ fn create_overlay_window() -> *mut AnyObject {
         *CONTAINER.lock().unwrap() = Some(ObjPtr(container));
 
         // --- Status label at bottom (standard coords: y=0 is bottom) ---
-        let status_font: *mut AnyObject =
-            {
-    let cfg = CONFIG.read().unwrap();
-    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
-};
+        let status_font: *mut AnyObject = {
+            let cfg = CONFIG.read().unwrap();
+            msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
+        };
         let status_color = hex_to_ns_color(0x999999ff);
         let status_label = make_centered_label("", status_font, status_color, 0.0, w, STATUS_H);
         let _: () = msg_send![container, addSubview: status_label];
@@ -435,7 +445,7 @@ fn create_controller() -> *mut AnyObject {
             types_v_obj.as_ptr(),
         );
         objc_registerClassPair(cls);
-        msg_send![cls as *mut AnyObject, new]
+        msg_send![cls, new]
     }
 }
 
@@ -450,8 +460,7 @@ fn init_app() {
 fn setup_status_bar() {
     unsafe {
         let status_bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
-        let status_item: *mut AnyObject =
-            msg_send![status_bar, statusItemWithLength: 30.0f64];
+        let status_item: *mut AnyObject = msg_send![status_bar, statusItemWithLength: 30.0f64];
         let _: *mut AnyObject = msg_send![status_item, retain];
 
         let button: *mut AnyObject = msg_send![status_item, button];
@@ -485,8 +494,7 @@ fn setup_status_bar() {
         let action_cls = {
             let name = CString::new("OhMyTabMenuTarget2").unwrap();
             let superclass: *const objc2::runtime::AnyClass = class!(NSObject);
-            let cls =
-                objc_allocateClassPair(superclass as *mut AnyObject, name.as_ptr(), 0);
+            let cls = objc_allocateClassPair(superclass as *mut AnyObject, name.as_ptr(), 0);
             if cls.is_null() {
                 log_error!("Failed to allocate ObjC class for menu target.");
                 return;
@@ -666,7 +674,13 @@ fn main() {
         let is_dev = std::env::current_exe()
             .map(|p| p.to_string_lossy().contains("target/"))
             .unwrap_or(false);
-        logger::init(&logger::LogConfig { level, file_path: cfg.logging.file_path.clone() }, is_dev);
+        logger::init(
+            &logger::LogConfig {
+                level,
+                file_path: cfg.logging.file_path.clone(),
+            },
+            is_dev,
+        );
     }
 
     // 2. Register custom ObjC classes

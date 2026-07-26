@@ -1,10 +1,10 @@
+use flume::{Receiver, Sender};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
-use flume::{Receiver, Sender};
 
 // ========== 日志级别 / log level ==========
 

@@ -28,7 +28,8 @@ unsafe fn cls_id(name: &str) -> *mut AnyObject {
     extern "C" {
         fn objc_getClass(name: *const c_char) -> *mut AnyObject;
     }
-    objc_getClass(CString::new(name).unwrap().as_ptr())
+    let c_name = CString::new(name).unwrap();
+    objc_getClass(c_name.as_ptr())
 }
 
 /// 裸发一个无参消息(返回 id),绕过 objc2 msg_send! 校验。
@@ -129,7 +130,11 @@ pub fn sync(enabled: bool) {
     if ok {
         log_info!(
             "autostart: {} (status={})",
-            if enabled { "registered" } else { "unregistered" },
+            if enabled {
+                "registered"
+            } else {
+                "unregistered"
+            },
             if is_enabled() { "enabled" } else { "disabled" },
         );
     } else {

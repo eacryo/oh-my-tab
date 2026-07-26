@@ -1,8 +1,8 @@
+use objc2::runtime::AnyObject;
+use objc2::{class, msg_send};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
 use std::time::Instant;
-use objc2::{class, msg_send};
-use objc2::runtime::AnyObject;
 
 use crate::config::CONFIG;
 use crate::{log_info, log_warn};
@@ -46,6 +46,7 @@ pub fn note_app_activated(pid: i32) {
 /// 1. oh-my-tab 内选中窗口（on_cmd_released / card_mouse_down / KEY_RETURN）
 /// 2. NSWorkspace 激活通知 → on_app_activated 后台线程解析焦点窗口后回主线程调用
 ///    这是让系统 Cmd+Tab / Dock 点击等外部焦点切换也反映在窗口排序中的关键。
+///
 /// Bump the MRU timestamp of a specific window to now. Called from three paths:
 /// 1. Window selected inside oh-my-tab (on_cmd_released / card_mouse_down / KEY_RETURN)
 /// 2. NSWorkspace activation notification → on_app_activated resolves the focused
@@ -142,30 +143,52 @@ type AxGetWindowFn = unsafe extern "C" fn(AXUIElementRef, *mut u32) -> AXError;
 type GetProcessForPIDFn = unsafe extern "C" fn(i32, *mut ProcessSerialNumber) -> i32;
 type SlpSetFrontFn = unsafe extern "C" fn(*mut ProcessSerialNumber, u32, i32) -> i32;
 
-static AX_GET_WINDOW: std::sync::LazyLock<Option<AxGetWindowFn>> = std::sync::LazyLock::new(|| unsafe {
-    // _AXUIElementGetWindow 是 HIServices 里的私有符号，dlopen 后 dlsym。
-    let name = b"_AXUIElementGetWindow\0";
-    let h = dlopen_path("/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices");
-    if h.is_null() { return None; }
-    let p = dlsym(h, name.as_ptr() as *const c_char);
-    if p.is_null() { None } else { Some(std::mem::transmute(p)) }
-});
-static GET_PROCESS_FOR_PID: std::sync::LazyLock<Option<GetProcessForPIDFn>> = std::sync::LazyLock::new(|| unsafe {
-    // GetProcessForPID 也在 HIServices，dlopen 后 dlsym。
-    let name = b"GetProcessForPID\0";
-    let h = dlopen_path("/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices");
-    if h.is_null() { return None; }
-    let p = dlsym(h, name.as_ptr() as *const c_char);
-    if p.is_null() { None } else { Some(std::mem::transmute(p)) }
-});
-static SLP_SET_FRONT: std::sync::LazyLock<Option<SlpSetFrontFn>> = std::sync::LazyLock::new(|| unsafe {
-    // SkyLight 是私有框架，必须先 dlopen 才能查到符号。
-    let name = b"_SLPSSetFrontProcessWithOptions\0";
-    let h = dlopen_path("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight");
-    if h.is_null() { return None; }
-    let p = dlsym(h, name.as_ptr() as *const c_char);
-    if p.is_null() { None } else { Some(std::mem::transmute(p)) }
-});
+static AX_GET_WINDOW: std::sync::LazyLock<Option<AxGetWindowFn>> = std::sync::LazyLock::new(
+    || unsafe {
+        // _AXUIElementGetWindow 是 HIServices 里的私有符号，dlopen 后 dlsym。
+        let name = b"_AXUIElementGetWindow\0";
+        let h = dlopen_path("/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices");
+        if h.is_null() {
+            return None;
+        }
+        let p = dlsym(h, name.as_ptr() as *const c_char);
+        if p.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, AxGetWindowFn>(p))
+        }
+    },
+);
+static GET_PROCESS_FOR_PID: std::sync::LazyLock<Option<GetProcessForPIDFn>> =
+    std::sync::LazyLock::new(|| unsafe {
+        // GetProcessForPID 也在 HIServices，dlopen 后 dlsym。
+        let name = b"GetProcessForPID\0";
+        let h = dlopen_path("/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices");
+        if h.is_null() {
+            return None;
+        }
+        let p = dlsym(h, name.as_ptr() as *const c_char);
+        if p.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, GetProcessForPIDFn>(p))
+        }
+    });
+static SLP_SET_FRONT: std::sync::LazyLock<Option<SlpSetFrontFn>> =
+    std::sync::LazyLock::new(|| unsafe {
+        // SkyLight 是私有框架，必须先 dlopen 才能查到符号。
+        let name = b"_SLPSSetFrontProcessWithOptions\0";
+        let h = dlopen_path("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight");
+        if h.is_null() {
+            return None;
+        }
+        let p = dlsym(h, name.as_ptr() as *const c_char);
+        if p.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, SlpSetFrontFn>(p))
+        }
+    });
 
 /// 取一个 AX 窗口的 CGWindowID（私有 API _AXUIElementGetWindow）。
 /// 用它把 AX 窗口和 CG 窗口按 CGWindowID 精确配对，不再靠顺序/标题猜
@@ -177,7 +200,11 @@ static SLP_SET_FRONT: std::sync::LazyLock<Option<SlpSetFrontFn>> = std::sync::La
 unsafe fn ax_window_cgwid(element: AXUIElementRef) -> Option<u32> {
     let f = (*AX_GET_WINDOW)?;
     let mut wid: u32 = 0;
-    if f(element, &mut wid) == K_AX_SUCCESS && wid != 0 { Some(wid) } else { None }
+    if f(element, &mut wid) == K_AX_SUCCESS && wid != 0 {
+        Some(wid)
+    } else {
+        None
+    }
 }
 
 /// 查某 App 当前聚焦窗口的 CGWindowID（kAXFocusedWindow -> _AXUIElementGetWindow）。
@@ -187,14 +214,18 @@ unsafe fn ax_window_cgwid(element: AXUIElementRef) -> Option<u32> {
 /// isn't always frontmost-first, but kAXFocusedWindow is the explicitly focused window.
 pub(crate) unsafe fn focused_window_cgwid(pid: i32) -> Option<u32> {
     let app = AXUIElementCreateApplication(pid);
-    if app.is_null() { return None; }
+    if app.is_null() {
+        return None;
+    }
     AXUIElementSetMessagingTimeout(app, 0.05); // 50ms 超时，避免卡死在无响应的 App 上。
     let focused_key = cf_string_new("AXFocusedWindow");
     let mut focused: *const c_void = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(app, focused_key, &mut focused);
     CFRelease(focused_key);
     CFRelease(app);
-    if err != K_AX_SUCCESS || focused.is_null() { return None; }
+    if err != K_AX_SUCCESS || focused.is_null() {
+        return None;
+    }
     let wid = ax_window_cgwid(focused);
     CFRelease(focused);
     wid
@@ -206,10 +237,21 @@ pub(crate) unsafe fn focused_window_cgwid(pid: i32) -> Option<u32> {
 /// SkyLight private API _SLPSSetFrontProcessWithOptions -- does NOT raise all
 /// of the app's windows the way activate(AllWindows) does.
 unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
-    let get_psn = match *GET_PROCESS_FOR_PID { Some(f) => f, None => return false };
-    let set_front = match *SLP_SET_FRONT { Some(f) => f, None => return false };
-    let mut psn = ProcessSerialNumber { high_long_of_psn: 0, low_long_of_psn: 0 };
-    if get_psn(pid, &mut psn) != 0 { return false; }
+    let get_psn = match *GET_PROCESS_FOR_PID {
+        Some(f) => f,
+        None => return false,
+    };
+    let set_front = match *SLP_SET_FRONT {
+        Some(f) => f,
+        None => return false,
+    };
+    let mut psn = ProcessSerialNumber {
+        high_long_of_psn: 0,
+        low_long_of_psn: 0,
+    };
+    if get_psn(pid, &mut psn) != 0 {
+        return false;
+    }
     // mode 2 = userGenerated（BetterCmdTab 的取值）。
     set_front(&mut psn, wid, 2) == 0 // CGError success == 0
 }
@@ -223,7 +265,9 @@ fn cf_dict_get_string(dict: *const c_void, key: &str) -> Option<String> {
     let cf_key = cf_string_new(key);
     let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
     unsafe { CFRelease(cf_key) };
-    if value.is_null() { return None; }
+    if value.is_null() {
+        return None;
+    }
     cf_to_rust_string(value)
 }
 
@@ -231,20 +275,32 @@ fn cf_dict_get_i32(dict: *const c_void, key: &str) -> Option<i32> {
     let cf_key = cf_string_new(key);
     let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
     unsafe { CFRelease(cf_key) };
-    if value.is_null() { return None; }
+    if value.is_null() {
+        return None;
+    }
     let mut num: i32 = 0;
     let ok = unsafe { CFNumberGetValue(value, 3, &mut num as *mut i32 as *mut c_void) };
-    if ok { Some(num) } else { None }
+    if ok {
+        Some(num)
+    } else {
+        None
+    }
 }
 
 fn cf_dict_get_u32(dict: *const c_void, key: &str) -> Option<u32> {
     let cf_key = cf_string_new(key);
     let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
     unsafe { CFRelease(cf_key) };
-    if value.is_null() { return None; }
+    if value.is_null() {
+        return None;
+    }
     let mut num: i32 = 0;
     let ok = unsafe { CFNumberGetValue(value, 3, &mut num as *mut i32 as *mut c_void) };
-    if ok { Some(num as u32) } else { None }
+    if ok {
+        Some(num as u32)
+    } else {
+        None
+    }
 }
 
 // 读 CG dict 里的 CFBoolean(如 kCGWindowIsOnscreen)。/ Read a CFBoolean from a CG dict (e.g. kCGWindowIsOnscreen).
@@ -252,7 +308,9 @@ fn cf_dict_get_bool(dict: *const c_void, key: &str) -> Option<bool> {
     let cf_key = cf_string_new(key);
     let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
     unsafe { CFRelease(cf_key) };
-    if value.is_null() { return None; }
+    if value.is_null() {
+        return None;
+    }
     Some(unsafe { CFBooleanGetValue(value) })
 }
 
@@ -294,8 +352,12 @@ fn write_png_to_cache(png: *mut AnyObject, pid: i32) -> Option<String> {
         // Atomic write: write to a temp file then rename, so a mid-write crash
         // can't leave a half-written PNG that "file exists = valid" would trust.
         let ok: bool = msg_send![png, writeToFile: cf_path as *mut AnyObject, atomically: true];
-        CFRelease(cf_path as *const c_void);
-        if ok { Some(path) } else { None }
+        CFRelease(cf_path);
+        if ok {
+            Some(path)
+        } else {
+            None
+        }
     }
 }
 
@@ -329,8 +391,11 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
         // Render at Retina resolution: 64pt display → 128px (2x) or 64px (1x)
         let scale: f64 = {
             let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-            if screen.is_null() { 2.0 }
-            else { msg_send![screen, backingScaleFactor] }
+            if screen.is_null() {
+                2.0
+            } else {
+                msg_send![screen, backingScaleFactor]
+            }
         };
         let px = 128.0 * scale;
 
@@ -342,7 +407,8 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
         let dst = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(px, px));
         let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
         let op: usize = 1; // NSCompositingOperationCopy
-        let _: () = msg_send![icon, drawInRect: dst, fromRect: src, operation: op, fraction: 1.0f64];
+        let _: () =
+            msg_send![icon, drawInRect: dst, fromRect: src, operation: op, fraction: 1.0f64];
         let _: () = msg_send![target_img, unlockFocus];
 
         // Convert to PNG at target size
@@ -374,7 +440,9 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
 }
 
 pub fn raise_ax_window(pid: i32, cgwid: u32) {
-    if cgwid == 0 { return; }
+    if cgwid == 0 {
+        return;
+    }
     unsafe {
         // 1. WindowServer 层只抬这一个窗口（SkyLight 私有 API _SLPSSetFrontProcessWithOptions），
         //    避免 activate(AllWindows) 把该 App 的所有窗口都抬到前面。
@@ -386,13 +454,18 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
         //    Focus the window via AX: find the AX window with this CGWindowID, then
         //    setFocusedWindow + AXRaise.
         let app = AXUIElementCreateApplication(pid);
-        if app.is_null() { return; }
+        if app.is_null() {
+            return;
+        }
 
         let windows_key = cf_string_new("AXWindows");
         let mut windows_array: *const c_void = std::ptr::null();
         let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
         CFRelease(windows_key);
-        if err != K_AX_SUCCESS || windows_array.is_null() { CFRelease(app); return; }
+        if err != K_AX_SUCCESS || windows_array.is_null() {
+            CFRelease(app);
+            return;
+        }
 
         let count = CFArrayGetCount(windows_array);
         let raise_key = cf_string_new("AXRaise");
@@ -402,7 +475,9 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
 
         for i in 0..count {
             let element = CFArrayGetValueAtIndex(windows_array, i);
-            if element.is_null() { continue; }
+            if element.is_null() {
+                continue;
+            }
             if ax_window_cgwid(element) == Some(cgwid) {
                 // 先还原最小化(若已最小化),否则 AXRaise 可能只是带到前面而仍停在 Dock。
                 // Un-minimize first (if minimized); otherwise AXRaise may bring it forward
@@ -411,12 +486,22 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
                 AXUIElementSetAttributeValue(app, focused_key, element);
                 AXUIElementPerformAction(element, raise_key);
                 matched = true;
-                log_info!("raise_ax_window: matched cgwid={} (slps={}), raised", cgwid, slps_ok);
+                log_info!(
+                    "raise_ax_window: matched cgwid={} (slps={}), raised",
+                    cgwid,
+                    slps_ok
+                );
                 break;
             }
         }
         if !matched {
-            log_warn!("raise_ax_window: NO MATCH for pid={} cgwid={} (ax_windows={}, slps={})", pid, cgwid, count, slps_ok);
+            log_warn!(
+                "raise_ax_window: NO MATCH for pid={} cgwid={} (ax_windows={}, slps={})",
+                pid,
+                cgwid,
+                count,
+                slps_ok
+            );
         }
         CFRelease(raise_key);
         CFRelease(focused_key);
@@ -429,14 +514,18 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
 fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String, bool)> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
-        if app.is_null() { return vec![]; }
+        if app.is_null() {
+            return vec![];
+        }
 
         let windows_key = cf_string_new("AXWindows");
         let mut windows_array: *const c_void = std::ptr::null();
         let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
         CFRelease(windows_key);
         CFRelease(app);
-        if err != K_AX_SUCCESS || windows_array.is_null() { return vec![]; }
+        if err != K_AX_SUCCESS || windows_array.is_null() {
+            return vec![];
+        }
 
         let count = CFArrayGetCount(windows_array);
         let title_key = cf_string_new("AXTitle");
@@ -446,24 +535,35 @@ fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String, bool)> {
 
         for i in 0..count {
             let element = CFArrayGetValueAtIndex(windows_array, i);
-            if element.is_null() { continue; }
+            if element.is_null() {
+                continue;
+            }
 
             // 只保留标准窗口（AXStandardWindow），过滤弹出面板/下拉菜单等非标准窗口
             // Only keep AXStandardWindow, filtering out popups/panels/dropdowns
             let mut subrole_value: *const c_void = std::ptr::null();
-            let is_standard = if AXUIElementCopyAttributeValue(element, subrole_key, &mut subrole_value) == K_AX_SUCCESS && !subrole_value.is_null() {
-                let s = cf_to_rust_string(subrole_value);
-                CFRelease(subrole_value);
-                s.map_or(true, |sr| sr == "AXStandardWindow")
-            } else {
-                // 无 subrole → 视为标准窗口（部分 App 不设置此属性）
-                // No subrole means standard window for apps that don't set it
-                true
-            };
-            if !is_standard { continue; }
+            let is_standard =
+                if AXUIElementCopyAttributeValue(element, subrole_key, &mut subrole_value)
+                    == K_AX_SUCCESS
+                    && !subrole_value.is_null()
+                {
+                    let s = cf_to_rust_string(subrole_value);
+                    CFRelease(subrole_value);
+                    s.is_none_or(|sr| sr == "AXStandardWindow")
+                } else {
+                    // 无 subrole → 视为标准窗口（部分 App 不设置此属性）
+                    // No subrole means standard window for apps that don't set it
+                    true
+                };
+            if !is_standard {
+                continue;
+            }
 
             let mut title_value: *const c_void = std::ptr::null();
-            let title = if AXUIElementCopyAttributeValue(element, title_key, &mut title_value) == K_AX_SUCCESS && !title_value.is_null() {
+            let title = if AXUIElementCopyAttributeValue(element, title_key, &mut title_value)
+                == K_AX_SUCCESS
+                && !title_value.is_null()
+            {
                 let t = cf_to_rust_string(title_value);
                 CFRelease(title_value);
                 t.unwrap_or_default()
@@ -474,7 +574,10 @@ fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String, bool)> {
             // AXMinimized: whether the window is minimized. Absent attribute (some apps) -> false.
             let minimized = {
                 let mut min_value: *const c_void = std::ptr::null();
-                if AXUIElementCopyAttributeValue(element, minimized_key, &mut min_value) == K_AX_SUCCESS && !min_value.is_null() {
+                if AXUIElementCopyAttributeValue(element, minimized_key, &mut min_value)
+                    == K_AX_SUCCESS
+                    && !min_value.is_null()
+                {
                     let m = CFBooleanGetValue(min_value);
                     CFRelease(min_value);
                     m
@@ -496,7 +599,14 @@ fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String, bool)> {
 
 fn cf_to_rust_string(cf_string: *const c_void) -> Option<String> {
     let mut buf = vec![0u8; 1024];
-    let ok = unsafe { CFStringGetCString(cf_string, buf.as_mut_ptr() as *mut i8, buf.len() as isize, 0x08000100) };
+    let ok = unsafe {
+        CFStringGetCString(
+            cf_string,
+            buf.as_mut_ptr() as *mut i8,
+            buf.len() as isize,
+            0x08000100,
+        )
+    };
     if ok {
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         Some(String::from_utf8_lossy(&buf[..end]).to_string())
@@ -515,7 +625,9 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         K_C_G_WINDOW_LIST_OPTION_ON_SCREEN_ONLY
     };
     let array = unsafe { CGWindowListCopyWindowInfo(cg_option, 0) };
-    if array.is_null() { return vec![]; }
+    if array.is_null() {
+        return vec![];
+    }
 
     let self_pid = std::process::id() as i32;
     let mut windows: Vec<WindowInfo> = Vec::new();
@@ -528,13 +640,21 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     let mut pids: HashSet<i32> = HashSet::new();
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
-        if dict.is_null() { continue; }
+        if dict.is_null() {
+            continue;
+        }
         let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
-        if layer != 0 { continue; }
+        if layer != 0 {
+            continue;
+        }
         let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
-        if owner_pid <= 0 || owner_pid == self_pid { continue; }
+        if owner_pid <= 0 || owner_pid == self_pid {
+            continue;
+        }
         let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
-        if owner_name.is_empty() || owner_name == "Dock" { continue; }
+        if owner_name.is_empty() || owner_name == "Dock" {
+            continue;
+        }
         pids.insert(owner_pid);
     }
 
@@ -559,7 +679,9 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             ax_by_pid.insert(pid, ax_wins.iter().map(|(_, t, _)| t.clone()).collect());
             let mut wid_map: HashMap<u32, (String, bool)> = HashMap::new();
             for (cgwid, title, minimized) in &ax_wins {
-                if *cgwid != 0 { wid_map.insert(*cgwid, (title.clone(), *minimized)); }
+                if *cgwid != 0 {
+                    wid_map.insert(*cgwid, (title.clone(), *minimized));
+                }
             }
             ax_wid_to_info.insert(pid, wid_map);
         }
@@ -567,16 +689,24 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
-        if dict.is_null() { continue; }
+        if dict.is_null() {
+            continue;
+        }
 
         let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
-        if layer != 0 { continue; }
+        if layer != 0 {
+            continue;
+        }
 
         let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
-        if owner_pid <= 0 || owner_pid == self_pid { continue; }
+        if owner_pid <= 0 || owner_pid == self_pid {
+            continue;
+        }
 
         let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
-        if owner_name.is_empty() || owner_name == "Dock" { continue; }
+        if owner_name.is_empty() || owner_name == "Dock" {
+            continue;
+        }
 
         let cg_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
         let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
@@ -621,12 +751,16 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         }
 
         // 使用极旧的时间戳作为回退值，确保真实 MRU 条目（用户曾选中过的窗口）永远排在前面。
-        // ordeded_ts 在 CG 枚举顺序上递减，作为"无 MRU 记录"的窗口之间的稳定排序依据。
+        // ordeded_ts 在 CG 枚举顺序上递减，作为无 MRU 记录的窗口之间的稳定排序依据。
         // Use very old timestamps as fallback so real MRU entries (windows the user has
         // explicitly selected) always sort first. ordered_ts decreasing within CG enumeration
         // order serves as a stable tiebreaker among "no MRU record" windows.
-        let ancient_base = now.checked_sub(std::time::Duration::from_secs(86_400)).unwrap_or(now);
-        let ordered_ts = ancient_base.checked_sub(std::time::Duration::from_millis(insertion_order as u64)).unwrap_or(ancient_base);
+        let ancient_base = now
+            .checked_sub(std::time::Duration::from_secs(86_400))
+            .unwrap_or(now);
+        let ordered_ts = ancient_base
+            .checked_sub(std::time::Duration::from_millis(insertion_order as u64))
+            .unwrap_or(ancient_base);
         // mru 按 (pid, CGWindowID) 索引——CGWindowID 在窗口生命周期内稳定不变，
         // 比 title 更可靠（title 会随浏览器标签页切换而变）。
         // Key mru by (pid, CGWindowID) — CGWindowID is stable for the window's
@@ -634,7 +768,15 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         mru.entry((owner_pid, cgwid)).or_insert(ordered_ts);
         insertion_order += 1;
         let icon_path = check_icon_cache(owner_pid);
-        windows.push(WindowInfo { pid: owner_pid, window_id: cgwid, app_name: owner_name, window_title, icon_path, is_active: false, minimized });
+        windows.push(WindowInfo {
+            pid: owner_pid,
+            window_id: cgwid,
+            app_name: owner_name,
+            window_title,
+            icon_path,
+            is_active: false,
+            minimized,
+        });
     }
 
     unsafe { CFRelease(array) };
@@ -666,7 +808,9 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     };
     if let Some((pid, cgwid)) = frontmost {
         mru.insert((pid, cgwid), now);
-        let w = windows.iter().find(|w| w.pid == pid && w.window_id == cgwid);
+        let w = windows
+            .iter()
+            .find(|w| w.pid == pid && w.window_id == cgwid);
         log_info!(
             "summon-bump frontmost: pid={} app=\"{}\" cgwid={} title=\"{}\"",
             pid,
@@ -680,20 +824,29 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         mru.insert((w.pid, w.window_id), now);
         log_info!(
             "summon-bump frontmost (fallback): pid={} app=\"{}\" cgwid={} title=\"{}\"",
-            w.pid, w.app_name, w.window_id, w.window_title
+            w.pid,
+            w.app_name,
+            w.window_id,
+            w.window_title
         );
     }
 
     // 纯窗口级 MRU 排序：每个窗口独立按最后被激活的时间排序。
     // 不再使用 App 级 LAST_ACTIVATED——避免从 App C 切到浏览器的窗口 A 时，
-    // 浏览器的另一个窗口 B 也"搭便车"排到 C 前面。
+    // 浏览器的另一个窗口 B 也搭便车排到 C 前面。
     // Pure window-level MRU sort: each window is sorted independently by
     // when it was last activated. No app-level LAST_ACTIVATED grouping —
     // prevents browser window B from riding A's coattails when switching
     // from app C to browser window A.
     windows.sort_by(|a, b| {
-        let wa = mru.get(&(a.pid, a.window_id)).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
-        let wb = mru.get(&(b.pid, b.window_id)).map(|t| t.elapsed()).unwrap_or(std::time::Duration::from_secs(999));
+        let wa = mru
+            .get(&(a.pid, a.window_id))
+            .map(|t| t.elapsed())
+            .unwrap_or(std::time::Duration::from_secs(999));
+        let wb = mru
+            .get(&(b.pid, b.window_id))
+            .map(|t| t.elapsed())
+            .unwrap_or(std::time::Duration::from_secs(999));
         wa.cmp(&wb)
     });
 
@@ -701,12 +854,24 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // Print the sorted window list on every summon (= display order), with MRU age. `*` marks index 0 (current/frontmost).
     log_info!("sorted: {} windows", windows.len());
     for (i, w) in windows.iter().enumerate() {
-        let mru_ms = mru.get(&(w.pid, w.window_id)).map(|t| t.elapsed().as_millis());
+        let mru_ms = mru
+            .get(&(w.pid, w.window_id))
+            .map(|t| t.elapsed().as_millis());
         let mark = if i == 0 { "*" } else { " " };
-        log_info!("  {} pid={} app=\"{}\" cgwid={} title=\"{}\" mru_ms={:?}", mark, w.pid, w.app_name, w.window_id, w.window_title, mru_ms);
+        log_info!(
+            "  {} pid={} app=\"{}\" cgwid={} title=\"{}\" mru_ms={:?}",
+            mark,
+            w.pid,
+            w.app_name,
+            w.window_id,
+            w.window_title,
+            mru_ms
+        );
     }
 
-    if let Some(first) = windows.first_mut() { first.is_active = true; }
+    if let Some(first) = windows.first_mut() {
+        first.is_active = true;
+    }
     windows
 }
 

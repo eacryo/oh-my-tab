@@ -18,10 +18,12 @@ use std::sync::{LazyLock, Mutex};
 use crate::config::{self, CONFIG};
 use crate::ffi::*;
 use crate::theme::*;
-use crate::window_collector::{WindowInfo, bump_window_mru, extract_icon_to_cache, raise_ax_window};
+use crate::window_collector::{
+    bump_window_mru, extract_icon_to_cache, raise_ax_window, WindowInfo,
+};
 // 跨模块共享状态(由 main.rs 持有,这里读写)/ cross-module shared state (owned by main.rs)
-use crate::{TAB_STATE, THEME_STATE};
 use crate::{log_error, log_info};
+use crate::{TAB_STATE, THEME_STATE};
 
 // ========== 键盘键码 / keyboard key codes ==========
 
@@ -178,12 +180,21 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         let wt = w.window_title.clone();
         log_info!(
             "Switching to '{}' (pid={} cgwid={})",
-            w.app_name, pid, cgwid
+            w.app_name,
+            pid,
+            cgwid
         );
         hide_overlay();
         activate_and_raise(pid, cgwid);
         bump_window_mru(&mut state.mru, pid, cgwid);
-        log_info!("commit: pid={} app=\"{}\" cgwid={} title=\"{}\" selected={}", pid, w.app_name, cgwid, wt, state.selected);
+        log_info!(
+            "commit: pid={} app=\"{}\" cgwid={} title=\"{}\" selected={}",
+            pid,
+            w.app_name,
+            cgwid,
+            wt,
+            state.selected
+        );
     } else {
         log_error!(
             "CmdReleased: selected index {} out of bounds (windows={})",
@@ -250,7 +261,6 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                     drop(state_opt);
                     refresh_highlight();
                     update_status_label();
-                    return;
                 }
             }
             KEY_LEFT => {
@@ -263,18 +273,14 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                     drop(state_opt);
                     refresh_highlight();
                     update_status_label();
-                    return;
                 }
             }
             KEY_UP => {
-                if !state.windows.is_empty() {
-                    if state.selected >= cards_per_row() {
-                        state.selected -= cards_per_row();
-                        drop(state_opt);
-                        refresh_highlight();
-                        update_status_label();
-                    }
-                    return;
+                if !state.windows.is_empty() && state.selected >= cards_per_row() {
+                    state.selected -= cards_per_row();
+                    drop(state_opt);
+                    refresh_highlight();
+                    update_status_label();
                 }
             }
             KEY_DOWN => {
@@ -286,7 +292,6 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                         refresh_highlight();
                         update_status_label();
                     }
-                    return;
                 }
             }
             KEY_RETURN => {
@@ -367,11 +372,10 @@ pub(crate) fn update_status_label() {
         drop(state_opt);
 
         let colors = current_colors();
-        let status_font: *mut AnyObject =
-            {
-    let cfg = CONFIG.read().unwrap();
-    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
-};
+        let status_font: *mut AnyObject = {
+            let cfg = CONFIG.read().unwrap();
+            msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
+        };
         let status_color = hex_to_ns_color(colors.status_bar_text);
         let ns_stat = make_nsstring(&status_text);
         let _: () = msg_send![status_label, setStringValue: ns_stat];
@@ -560,7 +564,9 @@ pub(crate) unsafe fn apply_glass_properties() {
         Some(g) => g.0,
         None => return,
     };
-    if glass.is_null() { return; }
+    if glass.is_null() {
+        return;
+    }
     let cfg = CONFIG.read().unwrap();
     let _: () = msg_send![glass, setCornerRadius: cfg.appearance.corner_radius];
     let style: i64 = match cfg.appearance.glass_style.as_str() {
@@ -579,7 +585,7 @@ pub(crate) fn apply_theme() {
             .lock()
             .unwrap()
             .as_ref()
-            .map_or(false, |s| s.is_dark);
+            .is_some_and(|s| s.is_dark);
 
         // Update window appearance for blur material tint
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
@@ -613,7 +619,8 @@ unsafe fn grayed_image(orig: *mut AnyObject, size: NSSize) -> *mut AnyObject {
     let rect = NSRect::new(NSPoint::new(0.0, 0.0), size);
     // 先画原图(NSCompositeSourceOver = 2)。
     let zero_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
-    let _: () = msg_send![orig, drawInRect: rect, fromRect: zero_rect, operation: 2isize, fraction: 1.0f64];
+    let _: () =
+        msg_send![orig, drawInRect: rect, fromRect: zero_rect, operation: 2isize, fraction: 1.0f64];
     // 再以 SourceAtop(=5)叠浅灰:只在已有 alpha 的地方着色,不超出图标范围。
     let ctx: *mut AnyObject = msg_send![class!(NSGraphicsContext), currentContext];
     let _: () = msg_send![ctx, setCompositingOperation: 5isize];
@@ -630,10 +637,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
         let card_cls = CARD_CLASS.lock().unwrap().unwrap();
         let card_cls_ptr = card_cls.0 as *mut AnyObject;
 
-        let frame = NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(card_w(), card_h()),
-        );
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_w(), card_h()));
         let view: *mut AnyObject = msg_send![card_cls_ptr, alloc];
         let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
 
@@ -648,16 +652,15 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
 
         let colors = current_colors();
         let icon_x = (card_w() - icon_px()) / 2.0; // 16.0
-        // Standard coords: y=0 at bottom, y=200 at top.
-        // Icon: 8px from top -> y = 200 - 8 - 128 = 64
+                                                   // Standard coords: y=0 at bottom, y=200 at top.
+                                                   // Icon: 8px from top -> y = 200 - 8 - 128 = 64
         let icon_bottom = card_h() - 8.0 - icon_px(); // 64.0
 
         // --- Icon ---
         if let Some(ref icon_path) = w.icon_path {
             let ns_path = make_nsstring(icon_path);
             let ns_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-            let ns_image: *mut AnyObject =
-                msg_send![ns_image, initWithContentsOfFile: ns_path];
+            let ns_image: *mut AnyObject = msg_send![ns_image, initWithContentsOfFile: ns_path];
             CFRelease(ns_path as *const c_void);
 
             if !ns_image.is_null() {
@@ -678,7 +681,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
                 };
                 let _: () = msg_send![img_view, setImage: image_to_show];
                 release_obj(image_to_show); // img_view owns the image now; drop our alloc +1
-                // NSImageScaleProportionallyUpOrDown = 3
+                                            // NSImageScaleProportionallyUpOrDown = 3
                 let _: () = msg_send![img_view, setImageScaling: 3u64];
                 let _: () = msg_send![view, addSubview: img_view];
                 release_obj(img_view); // view owns the image view now; drop our alloc +1
@@ -703,12 +706,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
             let bg_color = hex_to_cg_color(colors.icon_inner_bg);
             layer_set_background(ll, bg_color);
 
-            let init = w
-                .app_name
-                .chars()
-                .next()
-                .unwrap_or('?')
-                .to_string();
+            let init = w.app_name.chars().next().unwrap_or('?').to_string();
             let font: *mut AnyObject =
                 msg_send![class!(NSFont), systemFontOfSize: 28.0f64, weight: 0.4f64];
             let text_color = hex_to_ns_color(colors.icon_text);
@@ -736,32 +734,39 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
         let text_gap: f64 = 6.0;
         // App name: 18px tall, 2px above window title
         let name_bottom = icon_bottom - text_gap - 18.0; // 64 - 6 - 18 = 40
-        // Window title: 16px tall, sits at bottom
+                                                         // Window title: 16px tall, sits at bottom
         let title_bottom = name_bottom - 2.0 - 16.0; // 40 - 2 - 16 = 22
 
         // --- App name label ---
-        let name_font: *mut AnyObject =
-            {
-    let cfg = CONFIG.read().unwrap();
-    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.app_name_size, weight: cfg.fonts.app_name_weight]
-};
+        let name_font: *mut AnyObject = {
+            let cfg = CONFIG.read().unwrap();
+            msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.app_name_size, weight: cfg.fonts.app_name_weight]
+        };
         let name_color = hex_to_ns_color(colors.app_name);
         let name_label = make_centered_label(
-            &truncate_text(&w.app_name, 17), name_font, name_color,
-            name_bottom, card_w(), 18.0,
+            &truncate_text(&w.app_name, 17),
+            name_font,
+            name_color,
+            name_bottom,
+            card_w(),
+            18.0,
         );
         let _: () = msg_send![view, addSubview: name_label];
         release_obj(name_label); // view owns the label; drop our alloc +1
 
         // --- Window title label ---
         let title_font: *mut AnyObject = {
-    let cfg = CONFIG.read().unwrap();
-    msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
-};
+            let cfg = CONFIG.read().unwrap();
+            msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
+        };
         let win_color = hex_to_ns_color(colors.win_title);
         let title_label = make_centered_label(
-            &truncate_text(&display_title(&w.window_title), 20), title_font, win_color,
-            title_bottom, card_w(), 16.0,
+            &truncate_text(&display_title(&w.window_title), 20),
+            title_font,
+            win_color,
+            title_bottom,
+            card_w(),
+            16.0,
         );
         let _: () = msg_send![view, addSubview: title_label];
         release_obj(title_label); // view owns the label; drop our alloc +1
@@ -770,10 +775,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
         // NSTrackingMouseEnteredAndExited | NSTrackingActiveInActiveApp
         let opts: u64 = 0x01 | 0x40;
         let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        let bounds = NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(card_w(), card_h()),
-        );
+        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_w(), card_h()));
         let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds, options: opts, owner: view, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![view, addTrackingArea: ta];
         release_obj(ta); // view owns the tracking area; drop our alloc +1
@@ -812,8 +814,8 @@ pub(crate) fn show_overlay() {
         let h = window_height(count);
         let cards_in_row = cards_per_row().min(count);
         let w = window_width(cards_in_row);
-        let row_width = cards_in_row as f64 * card_w()
-            + (cards_in_row.saturating_sub(1)) as f64 * card_gap();
+        let row_width =
+            cards_in_row as f64 * card_w() + (cards_in_row.saturating_sub(1)) as f64 * card_gap();
         let start_x = (w - row_width) / 2.0;
 
         for (idx, w) in windows.iter().enumerate() {
@@ -842,10 +844,7 @@ pub(crate) fn show_overlay() {
         let screen_frame: NSRect = msg_send![screen, frame];
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
-        let new_frame = NSRect::new(
-            NSPoint::new(x, y),
-            NSSize::new(w, h),
-        );
+        let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
         let _: () = msg_send![window, setFrame: new_frame, display: true];
 
         // wrapper / VFX view / container all have autoresizingMask = 18

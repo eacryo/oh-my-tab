@@ -7,6 +7,7 @@ use crate::i18n::{self, tf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub appearance: Appearance,
     pub layout: Layout,
@@ -109,22 +110,6 @@ pub struct StartupSection {
 }
 
 // ========== Default implementations (hard-coded fallback values) ==========
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            appearance: Appearance::default(),
-            layout: Layout::default(),
-            colors: ColorsSection::default(),
-            fonts: Fonts::default(),
-            keyboard: Keyboard::default(),
-            i18n: I18nSection::default(),
-            windows: WindowsSection::default(),
-            logging: LoggingSection::default(),
-            startup: StartupSection::default(),
-        }
-    }
-}
 
 impl Default for Appearance {
     fn default() -> Self {
@@ -302,46 +287,103 @@ impl Config {
         for (theme, colors) in [("dark", &self.colors.dark), ("light", &self.colors.light)] {
             let prefix = format!("colors.{theme}");
             if !is_hex8(&colors.status_bar_text) {
-                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.status_bar_text"))]));
+                errs.push(tf(
+                    "errors.colors_not_hex8",
+                    &[("field", &format!("{prefix}.status_bar_text"))],
+                ));
             }
             if !is_hex8(&colors.app_name) {
-                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.app_name"))]));
+                errs.push(tf(
+                    "errors.colors_not_hex8",
+                    &[("field", &format!("{prefix}.app_name"))],
+                ));
             }
             if !is_hex8(&colors.win_title) {
-                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.win_title"))]));
+                errs.push(tf(
+                    "errors.colors_not_hex8",
+                    &[("field", &format!("{prefix}.win_title"))],
+                ));
             }
             if !is_hex8(&colors.icon_inner_bg) {
-                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.icon_inner_bg"))]));
+                errs.push(tf(
+                    "errors.colors_not_hex8",
+                    &[("field", &format!("{prefix}.icon_inner_bg"))],
+                ));
             }
             if !is_hex8(&colors.icon_text) {
-                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.icon_text"))]));
+                errs.push(tf(
+                    "errors.colors_not_hex8",
+                    &[("field", &format!("{prefix}.icon_text"))],
+                ));
             }
             if !is_hex8(&colors.card_bg_sel) {
-                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.card_bg_sel"))]));
+                errs.push(tf(
+                    "errors.colors_not_hex8",
+                    &[("field", &format!("{prefix}.card_bg_sel"))],
+                ));
             }
             if !is_hex8(&colors.card_border_sel) {
-                errs.push(tf("errors.colors_not_hex8", &[("field", &format!("{prefix}.card_border_sel"))]));
+                errs.push(tf(
+                    "errors.colors_not_hex8",
+                    &[("field", &format!("{prefix}.card_border_sel"))],
+                ));
             }
         }
 
         // --- fonts ---
         if self.fonts.status_bar_size < 8.0 {
-            errs.push(tf("errors.fonts_size_invalid", &[("field", "fonts.status_bar_size"), ("value", &self.fonts.status_bar_size.to_string())]));
+            errs.push(tf(
+                "errors.fonts_size_invalid",
+                &[
+                    ("field", "fonts.status_bar_size"),
+                    ("value", &self.fonts.status_bar_size.to_string()),
+                ],
+            ));
         }
         if self.fonts.status_bar_weight < 0.0 || self.fonts.status_bar_weight > 1.0 {
-            errs.push(tf("errors.fonts_weight_invalid", &[("field", "fonts.status_bar_weight"), ("value", &self.fonts.status_bar_weight.to_string())]));
+            errs.push(tf(
+                "errors.fonts_weight_invalid",
+                &[
+                    ("field", "fonts.status_bar_weight"),
+                    ("value", &self.fonts.status_bar_weight.to_string()),
+                ],
+            ));
         }
         if self.fonts.title_size < 8.0 {
-            errs.push(tf("errors.fonts_size_invalid", &[("field", "fonts.title_size"), ("value", &self.fonts.title_size.to_string())]));
+            errs.push(tf(
+                "errors.fonts_size_invalid",
+                &[
+                    ("field", "fonts.title_size"),
+                    ("value", &self.fonts.title_size.to_string()),
+                ],
+            ));
         }
         if self.fonts.title_weight < 0.0 || self.fonts.title_weight > 1.0 {
-            errs.push(tf("errors.fonts_weight_invalid", &[("field", "fonts.title_weight"), ("value", &self.fonts.title_weight.to_string())]));
+            errs.push(tf(
+                "errors.fonts_weight_invalid",
+                &[
+                    ("field", "fonts.title_weight"),
+                    ("value", &self.fonts.title_weight.to_string()),
+                ],
+            ));
         }
         if self.fonts.app_name_size < 8.0 {
-            errs.push(tf("errors.fonts_size_invalid", &[("field", "fonts.app_name_size"), ("value", &self.fonts.app_name_size.to_string())]));
+            errs.push(tf(
+                "errors.fonts_size_invalid",
+                &[
+                    ("field", "fonts.app_name_size"),
+                    ("value", &self.fonts.app_name_size.to_string()),
+                ],
+            ));
         }
         if self.fonts.app_name_weight < 0.0 || self.fonts.app_name_weight > 1.0 {
-            errs.push(tf("errors.fonts_weight_invalid", &[("field", "fonts.app_name_weight"), ("value", &self.fonts.app_name_weight.to_string())]));
+            errs.push(tf(
+                "errors.fonts_weight_invalid",
+                &[
+                    ("field", "fonts.app_name_weight"),
+                    ("value", &self.fonts.app_name_weight.to_string()),
+                ],
+            ));
         }
 
         // --- keyboard ---
@@ -395,7 +437,10 @@ impl Config {
             if !errs.iter().any(|e| e.starts_with("appearance.glass_tint")) {
                 self.appearance.glass_tint = other.appearance.glass_tint;
             }
-            if !errs.iter().any(|e| e.starts_with("appearance.corner_radius")) {
+            if !errs
+                .iter()
+                .any(|e| e.starts_with("appearance.corner_radius"))
+            {
                 self.appearance.corner_radius = other.appearance.corner_radius;
             }
         }
@@ -441,7 +486,10 @@ impl Config {
             if !errs.iter().any(|e| e.starts_with("fonts.status_bar_size")) {
                 self.fonts.status_bar_size = other.fonts.status_bar_size;
             }
-            if !errs.iter().any(|e| e.starts_with("fonts.status_bar_weight")) {
+            if !errs
+                .iter()
+                .any(|e| e.starts_with("fonts.status_bar_weight"))
+            {
                 self.fonts.status_bar_weight = other.fonts.status_bar_weight;
             }
             if !errs.iter().any(|e| e.starts_with("fonts.title_size")) {
@@ -498,25 +546,43 @@ impl Config {
 
     fn merge_colors(ours: &mut ThemeColors, theirs: &ThemeColors, theme: &str, errs: &[String]) {
         let p = format!("colors.{theme}");
-        if !errs.iter().any(|e| e.starts_with(&format!("{p}.status_bar_text"))) {
+        if !errs
+            .iter()
+            .any(|e| e.starts_with(&format!("{p}.status_bar_text")))
+        {
             ours.status_bar_text = theirs.status_bar_text.clone();
         }
         if !errs.iter().any(|e| e.starts_with(&format!("{p}.app_name"))) {
             ours.app_name = theirs.app_name.clone();
         }
-        if !errs.iter().any(|e| e.starts_with(&format!("{p}.win_title"))) {
+        if !errs
+            .iter()
+            .any(|e| e.starts_with(&format!("{p}.win_title")))
+        {
             ours.win_title = theirs.win_title.clone();
         }
-        if !errs.iter().any(|e| e.starts_with(&format!("{p}.icon_inner_bg"))) {
+        if !errs
+            .iter()
+            .any(|e| e.starts_with(&format!("{p}.icon_inner_bg")))
+        {
             ours.icon_inner_bg = theirs.icon_inner_bg.clone();
         }
-        if !errs.iter().any(|e| e.starts_with(&format!("{p}.icon_text"))) {
+        if !errs
+            .iter()
+            .any(|e| e.starts_with(&format!("{p}.icon_text")))
+        {
             ours.icon_text = theirs.icon_text.clone();
         }
-        if !errs.iter().any(|e| e.starts_with(&format!("{p}.card_bg_sel"))) {
+        if !errs
+            .iter()
+            .any(|e| e.starts_with(&format!("{p}.card_bg_sel")))
+        {
             ours.card_bg_sel = theirs.card_bg_sel.clone();
         }
-        if !errs.iter().any(|e| e.starts_with(&format!("{p}.card_border_sel"))) {
+        if !errs
+            .iter()
+            .any(|e| e.starts_with(&format!("{p}.card_border_sel")))
+        {
             ours.card_border_sel = theirs.card_border_sel.clone();
         }
     }
@@ -540,7 +606,8 @@ impl Config {
     /// 把当前配置序列化为 TOML 写回 `~/.config/oh-my-tab/config.toml`。
     /// Serialize this config to TOML and write it back to the config file.
     pub fn save(&self) -> Result<(), String> {
-        let toml_str = toml::to_string_pretty(self).map_err(|e| format!("serialize config: {}", e))?;
+        let toml_str =
+            toml::to_string_pretty(self).map_err(|e| format!("serialize config: {}", e))?;
         let path = config_path();
         std::fs::write(&path, toml_str).map_err(|e| format!("write {}: {}", path.display(), e))?;
         Ok(())
@@ -588,7 +655,13 @@ impl Config {
             }
             Err(e) => {
                 let defaults = Config::default();
-                (defaults, vec![tf("errors.config_read_failed", &[("error", &e.to_string())])])
+                (
+                    defaults,
+                    vec![tf(
+                        "errors.config_read_failed",
+                        &[("error", &e.to_string())],
+                    )],
+                )
             }
         }
     }
@@ -596,16 +669,15 @@ impl Config {
 
 // ========== Global singleton ==========
 
-pub static CONFIG: std::sync::LazyLock<RwLock<Config>> =
-    std::sync::LazyLock::new(|| {
-        let (cfg, _errs) = Config::load_or_default();
-        // 应用 config 里的 locale 覆盖(I18N 初始化时只用了系统语言)。
-        // 无循环:I18N 不读 CONFIG,见 i18n.rs 文件头说明。
-        // Apply the locale from config (I18N init only used the system locale).
-        // No cycle: I18N does not read CONFIG; see the note at the top of i18n.rs.
-        i18n::apply_config_locale(&cfg.i18n.locale);
-        RwLock::new(cfg)
-    });
+pub static CONFIG: std::sync::LazyLock<RwLock<Config>> = std::sync::LazyLock::new(|| {
+    let (cfg, _errs) = Config::load_or_default();
+    // 应用 config 里的 locale 覆盖(I18N 初始化时只用了系统语言)。
+    // 无循环:I18N 不读 CONFIG,见 i18n.rs 文件头说明。
+    // Apply the locale from config (I18N init only used the system locale).
+    // No cycle: I18N does not read CONFIG; see the note at the top of i18n.rs.
+    i18n::apply_config_locale(&cfg.i18n.locale);
+    RwLock::new(cfg)
+});
 
 /// Reload config from disk and apply. Returns validation errors (empty = success).
 pub fn reload_config() -> Vec<String> {

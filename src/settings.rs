@@ -10,8 +10,8 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
 use crate::config::{reload_config, Config, CONFIG};
 use crate::event_monitor::SHORTCUT_IS_CMD;
@@ -35,24 +35,24 @@ const LOCALE_VALUES: [&str; 4] = ["auto", "en", "zh-Hans", "zh-Hant"];
 // Holds pointers to the settings window's controls (non-modal, reused, hidden not destroyed).
 struct SettingsUi {
     window: *mut AnyObject,
-    sidebar_general: *mut AnyObject,      // NSButton: 通用 / General (tag=0)
+    sidebar_general: *mut AnyObject, // NSButton: 通用 / General (tag=0)
     sidebar_experimental: *mut AnyObject, // NSButton: 实验性功能 / Experimental (tag=1)
-    sidebar_highlight: *mut AnyObject,    // NSView: 选中行高亮背景 (layer-backed)
-    general_view: *mut AnyObject,         // NSView: 通用页容器 / General page container
-    experimental_view: *mut AnyObject,    // NSView: 实验性页容器 / Experimental page container
-    theme: *mut AnyObject,         // NSPopUpButton: dark / light / auto
-    glass_style: *mut AnyObject,   // NSPopUpButton: regular / clear
-    glass_tint: *mut AnyObject,    // NSTextField: RRGGBBAA hex
-    corner_radius: *mut AnyObject, // NSTextField
+    sidebar_highlight: *mut AnyObject, // NSView: 选中行高亮背景 (layer-backed)
+    general_view: *mut AnyObject,    // NSView: 通用页容器 / General page container
+    experimental_view: *mut AnyObject, // NSView: 实验性页容器 / Experimental page container
+    theme: *mut AnyObject,           // NSPopUpButton: dark / light / auto
+    glass_style: *mut AnyObject,     // NSPopUpButton: regular / clear
+    glass_tint: *mut AnyObject,      // NSTextField: RRGGBBAA hex
+    corner_radius: *mut AnyObject,   // NSTextField
     cards_per_row: *mut AnyObject,
     card_width: *mut AnyObject,
     card_height: *mut AnyObject,
     card_gap: *mut AnyObject,
     icon_size: *mut AnyObject,
-    modifier: *mut AnyObject,      // NSPopUpButton: option / command
-    locale: *mut AnyObject,        // NSPopUpButton: auto / en / zh-Hans / zh-Hant
+    modifier: *mut AnyObject,        // NSPopUpButton: option / command
+    locale: *mut AnyObject,          // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
-    log_level: *mut AnyObject,     // NSPopUpButton: trace / debug / info / warn / error
+    log_level: *mut AnyObject,      // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // NSButton (checkbox): 开机自启 / launch at login
 }
 unsafe impl Send for SettingsUi {}
@@ -89,7 +89,8 @@ unsafe fn set_field(field: *mut AnyObject, val: impl std::fmt::Display) {
 /// Editable text field (alloc +1; caller owns or releases after adding to a parent).
 unsafe fn make_text_input(x: f64, y: f64, w: f64, h: f64, value: &str) -> *mut AnyObject {
     let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let field: *mut AnyObject = msg_send![field, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
+    let field: *mut AnyObject =
+        msg_send![field, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
     let ns = make_nsstring(value);
     let _: () = msg_send![field, setStringValue: ns];
     CFRelease(ns as *const c_void);
@@ -98,7 +99,14 @@ unsafe fn make_text_input(x: f64, y: f64, w: f64, h: f64, value: &str) -> *mut A
 
 /// 下拉选择控件(alloc +1)。
 /// Pop-up button (alloc +1).
-unsafe fn make_popup(x: f64, y: f64, w: f64, h: f64, items: &[&str], selected: usize) -> *mut AnyObject {
+unsafe fn make_popup(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    items: &[&str],
+    selected: usize,
+) -> *mut AnyObject {
     let popup: *mut AnyObject = msg_send![class!(NSPopUpButton), alloc];
     let popup: *mut AnyObject = msg_send![popup, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)), pullsDown: false];
     for &item in items {
@@ -112,9 +120,17 @@ unsafe fn make_popup(x: f64, y: f64, w: f64, h: f64, items: &[&str], selected: u
 
 /// 勾选框(NSButton, NSSwitchButton=3)。alloc +1,加入父视图后由调用方 release。
 /// Checkbox (NSButton, NSSwitchButton=3). alloc +1; caller releases after adding to parent.
-unsafe fn make_checkbox(x: f64, y: f64, w: f64, h: f64, title: &str, checked: bool) -> *mut AnyObject {
+unsafe fn make_checkbox(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    title: &str,
+    checked: bool,
+) -> *mut AnyObject {
     let cb: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let cb: *mut AnyObject = msg_send![cb, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
+    let cb: *mut AnyObject =
+        msg_send![cb, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
     let _: () = msg_send![cb, setButtonType: 3isize]; // NSSwitchButton
     let ns = make_nsstring(title);
     let _: () = msg_send![cb, setTitle: ns];
@@ -164,7 +180,8 @@ unsafe fn make_sidebar_button(
 ) -> *mut AnyObject {
     let h = 28.0;
     let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let btn: *mut AnyObject = msg_send![btn, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
+    let btn: *mut AnyObject =
+        msg_send![btn, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
     let _: () = msg_send![btn, setButtonType: 0isize]; // NSPushInPushButton
     let _: () = msg_send![btn, setBordered: false];
     let _: () = msg_send![btn, setTag: tag];
@@ -181,7 +198,8 @@ unsafe fn make_sidebar_button(
 /// Bold section header label; released after being added to the parent.
 unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: f64) {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 20.0))];
+    let label: *mut AnyObject =
+        msg_send![label, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 20.0))];
     let ns = make_nsstring(text);
     let _: () = msg_send![label, setStringValue: ns];
     CFRelease(ns as *const c_void);
@@ -275,7 +293,10 @@ fn select_sidebar(idx: usize) {
         let _: () = msg_send![ui.sidebar_highlight, setFrame: frame];
         // 选中项粗体,另一项常规;都用 labelColor,颜色与 section 标题一致。
         // Bold the selected, regular for the other; both use labelColor to match section headers.
-        let titles = [t("settings.sidebar_general"), t("settings.sidebar_experimental")];
+        let titles = [
+            t("settings.sidebar_general"),
+            t("settings.sidebar_experimental"),
+        ];
         for (i, &b) in buttons.iter().enumerate() {
             set_sidebar_title(b, &titles[i], i == idx);
         }
@@ -377,7 +398,11 @@ fn confirm_alert(title: &str, msg: &str, confirm_label: &str, cancel_label: &str
 
 /// 恢复默认设置:确认 -> 把代码默认值写回 config.toml -> 重载 + 刷新 UI + 重填设置界面。
 /// Restore defaults: confirm -> write code defaults to config.toml -> reload + refresh UI + repopulate settings.
-pub(crate) extern "C" fn handle_restore_defaults(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+pub(crate) extern "C" fn handle_restore_defaults(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
     if !confirm_alert(
         &t("alert.restore_title"),
         &t("alert.restore_msg"),
@@ -429,7 +454,11 @@ fn load_settings_values() {
             _ => 2,
         };
         let _: () = msg_send![ui.theme, selectItemAtIndex: theme_idx];
-        let gs_idx: isize = if cfg.appearance.glass_style == "clear" { 1 } else { 0 };
+        let gs_idx: isize = if cfg.appearance.glass_style == "clear" {
+            1
+        } else {
+            0
+        };
         let _: () = msg_send![ui.glass_style, selectItemAtIndex: gs_idx];
         set_field(ui.glass_tint, &cfg.appearance.glass_tint);
         set_field(ui.corner_radius, cfg.appearance.corner_radius);
@@ -487,15 +516,25 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             _ => "auto".into(),
         };
         let gs_idx: isize = msg_send![ui.glass_style, indexOfSelectedItem];
-        cfg.appearance.glass_style = if gs_idx == 1 { "clear".into() } else { "regular".into() };
+        cfg.appearance.glass_style = if gs_idx == 1 {
+            "clear".into()
+        } else {
+            "regular".into()
+        };
         cfg.appearance.glass_tint = nsstring_to_rust(msg_send![ui.glass_tint, stringValue]);
         match parse_f64(&nsstring_to_rust(msg_send![ui.corner_radius, stringValue])) {
             Ok(v) => cfg.appearance.corner_radius = v,
-            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "appearance.corner_radius")])),
+            Err(_) => errs.push(tf(
+                "errors.not_a_number",
+                &[("field", "appearance.corner_radius")],
+            )),
         }
         match parse_usize(&nsstring_to_rust(msg_send![ui.cards_per_row, stringValue])) {
             Ok(v) => cfg.layout.cards_per_row = v,
-            Err(_) => errs.push(tf("errors.not_an_integer", &[("field", "layout.cards_per_row")])),
+            Err(_) => errs.push(tf(
+                "errors.not_an_integer",
+                &[("field", "layout.cards_per_row")],
+            )),
         }
         match parse_f64(&nsstring_to_rust(msg_send![ui.card_width, stringValue])) {
             Ok(v) => cfg.layout.card_width = v,
@@ -503,7 +542,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         }
         match parse_f64(&nsstring_to_rust(msg_send![ui.card_height, stringValue])) {
             Ok(v) => cfg.layout.card_height = v,
-            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "layout.card_height")])),
+            Err(_) => errs.push(tf(
+                "errors.not_a_number",
+                &[("field", "layout.card_height")],
+            )),
         }
         match parse_f64(&nsstring_to_rust(msg_send![ui.card_gap, stringValue])) {
             Ok(v) => cfg.layout.card_gap = v,
@@ -514,7 +556,11 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             Err(_) => errs.push(tf("errors.not_a_number", &[("field", "layout.icon_size")])),
         }
         let mod_idx: isize = msg_send![ui.modifier, indexOfSelectedItem];
-        cfg.keyboard.modifier = if mod_idx == 1 { "command".into() } else { "option".into() };
+        cfg.keyboard.modifier = if mod_idx == 1 {
+            "command".into()
+        } else {
+            "option".into()
+        };
         // locale:下拉项顺序与 LOCALE_VALUES 对应;越界回退 auto。
         // locale: popup order matches LOCALE_VALUES; out-of-range falls back to auto.
         let loc_idx: isize = msg_send![ui.locale, indexOfSelectedItem];
@@ -532,9 +578,11 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // log_level: popup index 0..2 = info, warn, error.
         let ll_idx: isize = msg_send![ui.log_level, indexOfSelectedItem];
         cfg.logging.level = match ll_idx {
-            1 => "warn", 2 => "error",
+            1 => "warn",
+            2 => "error",
             _ => "info", // index 0 or out-of-range
-        }.into();
+        }
+        .into();
         // launch_at_login:勾选框 state(1=on / 0=off)。
         // launch_at_login: checkbox state (1=on / 0=off).
         let la_state: isize = msg_send![ui.launch_at_login, state];
@@ -553,11 +601,11 @@ fn create_settings_window() {
         let view_w = 580.0;
         let sidebar_w = 150.0;
         let style: u64 = (1 << 0) | (1 << 1); // titled + closable
-        // 窗口加左侧侧边栏后:宽 420 -> 580(侧边栏 150 + 1pt 分隔 + 内容 429)。
-        // 内容拆成「通用 / 实验性」两页后,通用页(6 段 9 行)最高,高 748 -> 600 足够。
-        // Window widened for the left sidebar: 420 -> 580 (sidebar 150 + 1pt divider + 429 content).
-        // Content is now paged (General / Experimental); the General page (6 sections, 9 rows) is the
-        // tallest, so height 748 -> 600 is enough.
+                                              // 窗口加左侧侧边栏后:宽 420 -> 580(侧边栏 150 + 1pt 分隔 + 内容 429)。
+                                              // 内容拆成「通用 / 实验性」两页后,通用页(6 段 9 行)最高,高 748 -> 600 足够。
+                                              // Window widened for the left sidebar: 420 -> 580 (sidebar 150 + 1pt divider + 429 content).
+                                              // Content is now paged (General / Experimental); the General page (6 sections, 9 rows) is the
+                                              // tallest, so height 748 -> 600 is enough.
         let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 600.0));
         let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
@@ -622,7 +670,8 @@ fn create_settings_window() {
         let divider: *mut AnyObject = msg_send![divider, initWithFrame: NSRect::new(NSPoint::new(sidebar_w, 0.0), NSSize::new(1.0, content_h))];
         let _: () = msg_send![divider, setWantsLayer: true];
         let div_layer: *mut AnyObject = msg_send![divider, layer];
-        let sep_color: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedWhite: 0.0f64, alpha: 0.15f64];
+        let sep_color: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithCalibratedWhite: 0.0f64, alpha: 0.15f64];
         layer_set_background(div_layer, ns_color_to_cg(sep_color));
         let _: () = msg_send![content, addSubview: divider];
         release_obj(divider);
@@ -646,8 +695,24 @@ fn create_settings_window() {
 
         // 两个侧边栏按钮(borderless,tag 0/1,点击触发 handleSettingsSidebar:)。
         // Two sidebar buttons (borderless, tag 0/1; click triggers handleSettingsSidebar:).
-        ui.sidebar_general = make_sidebar_button(sidebar_view, target, &t("settings.sidebar_general"), 0, 12.0, btn_y0, btn_w);
-        ui.sidebar_experimental = make_sidebar_button(sidebar_view, target, &t("settings.sidebar_experimental"), 1, 12.0, btn_y0 - 34.0, btn_w);
+        ui.sidebar_general = make_sidebar_button(
+            sidebar_view,
+            target,
+            &t("settings.sidebar_general"),
+            0,
+            12.0,
+            btn_y0,
+            btn_w,
+        );
+        ui.sidebar_experimental = make_sidebar_button(
+            sidebar_view,
+            target,
+            &t("settings.sidebar_experimental"),
+            1,
+            12.0,
+            btn_y0 - 34.0,
+            btn_w,
+        );
 
         // --- 通用页容器 general page container ---
         let general_view: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -669,61 +734,175 @@ fn create_settings_window() {
 
         // --- 外观 Appearance ---
         y -= 24.0;
-        add_header(general_view, &t("settings.header_appearance"), 12.0, y, content_w - 24.0);
+        add_header(
+            general_view,
+            &t("settings.header_appearance"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
         y -= 8.0 + row_h;
-        ui.theme = add_row(general_view, label_x, y, label_w, row_h, &t("settings.row_theme"), make_popup(ctrl_x, y, ctrl_w, row_h, &["dark", "light", "auto"], 0));
+        ui.theme = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_theme"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &["dark", "light", "auto"], 0),
+        );
         y -= row_pitch;
-        ui.glass_style = add_row(general_view, label_x, y, label_w, row_h, &t("settings.row_glass_style"), make_popup(ctrl_x, y, ctrl_w, row_h, &["regular", "clear"], 0));
+        ui.glass_style = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_glass_style"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &["regular", "clear"], 0),
+        );
         y -= row_pitch;
         // TODO: glass_tint 改用 NSColorWell(系统取色器)替代 hex 文本框,体验更好。
         // TODO: replace glass_tint's hex text field with NSColorWell (system color picker).
-        ui.glass_tint = add_row(general_view, label_x, y, label_w, row_h, &t("settings.row_glass_tint"), make_text_input(ctrl_x, y, ctrl_w, row_h, "eeeeee66"));
+        ui.glass_tint = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_glass_tint"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "eeeeee66"),
+        );
         y -= row_pitch;
-        ui.corner_radius = add_row(general_view, label_x, y, label_w, row_h, &t("settings.row_corner_radius"), make_text_input(ctrl_x, y, ctrl_w, row_h, "64"));
+        ui.corner_radius = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_corner_radius"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "64"),
+        );
 
         // --- 键盘 Keyboard ---
         y -= 14.0 + 24.0;
-        add_header(general_view, &t("settings.header_keyboard"), 12.0, y, content_w - 24.0);
+        add_header(
+            general_view,
+            &t("settings.header_keyboard"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
         y -= 8.0 + row_h;
         // 修饰键下拉项:显示 Option+Tab / Command+Tab(快捷键名,各 locale 保持原文);值由索引映射到 option/command。
         // Modifier popup items: show Option+Tab / Command+Tab (shortcut names, kept verbatim across locales);
         // the value is mapped from the index to option/command.
-        let mod_labels = [t("settings.modifier_option"), t("settings.modifier_command")];
+        let mod_labels = [
+            t("settings.modifier_option"),
+            t("settings.modifier_command"),
+        ];
         let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
-        ui.modifier = add_row(general_view, label_x, y, label_w, row_h, &t("settings.row_modifier"), make_popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0));
+        ui.modifier = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_modifier"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0),
+        );
 
         // --- 语言 Language ---
         y -= 14.0 + 24.0;
-        add_header(general_view, &t("settings.header_language"), 12.0, y, content_w - 24.0);
+        add_header(
+            general_view,
+            &t("settings.header_language"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
         y -= 8.0 + row_h;
-        ui.locale = add_row(general_view, label_x, y, label_w, row_h, &t("settings.row_locale"), make_popup(ctrl_x, y, ctrl_w, row_h, &LOCALE_LABELS, 0));
+        ui.locale = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_locale"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &LOCALE_LABELS, 0),
+        );
 
         // --- 窗口 Window ---
         y -= 14.0 + 24.0;
-        add_header(general_view, &t("settings.header_windows"), 12.0, y, content_w - 24.0);
+        add_header(
+            general_view,
+            &t("settings.header_windows"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
         y -= 8.0 + row_h;
         // show_minimized 下拉框:项 = [不显示, 显示];默认 index 0(不显示)。
         // show_minimized popup: items = [Hide, Show]; default index 0 (hide).
-        let sm_labels = [t("settings.show_minimized_hide"), t("settings.show_minimized_show")];
+        let sm_labels = [
+            t("settings.show_minimized_hide"),
+            t("settings.show_minimized_show"),
+        ];
         let sm_label_refs: Vec<&str> = sm_labels.iter().map(|s| s.as_str()).collect();
-        ui.show_minimized = add_row(general_view, label_x, y, label_w, row_h, &t("settings.row_show_minimized"), make_popup(ctrl_x, y, ctrl_w, row_h, &sm_label_refs, 0));
+        ui.show_minimized = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_show_minimized"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &sm_label_refs, 0),
+        );
 
         // --- 日志 Logging ---
         y -= 14.0 + 24.0;
-        add_header(general_view, &t("settings.header_logging"), 12.0, y, content_w - 24.0);
+        add_header(
+            general_view,
+            &t("settings.header_logging"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
         y -= 8.0 + row_h;
         // 日志级别下拉框:项 = [info, warn, error];默认 index 0(info)。
         // Log level popup: items = [info, warn, error]; default index 0 (info).
         let log_levels: [&str; 3] = ["info", "warn", "error"];
-        ui.log_level = add_row(general_view, label_x, y, label_w, row_h, &t("settings.row_log_level"), make_popup(ctrl_x, y, ctrl_w, row_h, &log_levels, 0));
+        ui.log_level = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_log_level"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &log_levels, 0),
+        );
 
         // --- 启动 Startup ---
         y -= 14.0 + 24.0;
-        add_header(general_view, &t("settings.header_startup"), 12.0, y, content_w - 24.0);
+        add_header(
+            general_view,
+            &t("settings.header_startup"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
         y -= 8.0 + row_h;
         // 开机自启勾选框:标题留空(左侧 row label 已说明),仅放一个开关。
         // Launch-at-login checkbox: empty title (the row label on the left already describes it).
-        ui.launch_at_login = add_row(general_view, label_x, y, label_w, row_h, &t("settings.row_launch_at_login"), make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false));
+        ui.launch_at_login = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_launch_at_login"),
+            make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
+        );
 
         // ===== 实验性页内容 experimental page content =====
         let mut y = content_h - 12.0;
@@ -751,17 +930,63 @@ fn create_settings_window() {
 
         // --- 布局 Layout ---
         y -= 14.0 + 24.0;
-        add_header(experimental_view, &t("settings.header_layout"), 12.0, y, content_w - 24.0);
+        add_header(
+            experimental_view,
+            &t("settings.header_layout"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
         y -= 8.0 + row_h;
-        ui.cards_per_row = add_row(experimental_view, label_x, y, label_w, row_h, &t("settings.row_cards_per_row"), make_text_input(ctrl_x, y, ctrl_w, row_h, "6"));
+        ui.cards_per_row = add_row(
+            experimental_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_cards_per_row"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "6"),
+        );
         y -= row_pitch;
-        ui.card_width = add_row(experimental_view, label_x, y, label_w, row_h, &t("settings.row_card_width"), make_text_input(ctrl_x, y, ctrl_w, row_h, "140"));
+        ui.card_width = add_row(
+            experimental_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_card_width"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "140"),
+        );
         y -= row_pitch;
-        ui.card_height = add_row(experimental_view, label_x, y, label_w, row_h, &t("settings.row_card_height"), make_text_input(ctrl_x, y, ctrl_w, row_h, "180"));
+        ui.card_height = add_row(
+            experimental_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_card_height"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "180"),
+        );
         y -= row_pitch;
-        ui.card_gap = add_row(experimental_view, label_x, y, label_w, row_h, &t("settings.row_card_gap"), make_text_input(ctrl_x, y, ctrl_w, row_h, "0"));
+        ui.card_gap = add_row(
+            experimental_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_card_gap"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "0"),
+        );
         y -= row_pitch;
-        ui.icon_size = add_row(experimental_view, label_x, y, label_w, row_h, &t("settings.row_icon_size"), make_text_input(ctrl_x, y, ctrl_w, row_h, "110"));
+        ui.icon_size = add_row(
+            experimental_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_icon_size"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "110"),
+        );
 
         // --- 确认 / 取消(加在 contentView 上,两页都可见)---
         // Restore Defaults 按钮(左下角),与 OK/Cancel 同在 contentView,两页都可见。

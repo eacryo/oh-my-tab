@@ -53,6 +53,6 @@ rm -f "$DMG"
 hdiutil create -volname "Oh My Tab" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGING"; STAGING=""
 
-echo "✅ Build success: $DMG (contains $APP)"
 echo "Install: open $DMG   then drag Oh My Tab to Applications"
 echo "Dev-run: open $APP   (SMAppService only works when launched as a .app, not via cargo run)"
+echo "✅ Build success: $DMG (contains $APP)"

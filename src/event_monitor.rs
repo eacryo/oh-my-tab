@@ -1,8 +1,8 @@
+use crate::{log_error, log_info};
 use flume::Sender;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use crate::{log_error, log_info};
 
 #[derive(Debug, Clone, Copy)]
 pub enum GlobalEvent {
@@ -30,7 +30,6 @@ const K_CG_EVENT_FLAG_MASK_ALTERNATE: CGEventFlags = 0x00080000;
 const K_VK_TAB: u16 = 48;
 
 #[link(name = "CoreGraphics", kind = "framework")]
-#[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CGEventTapCreate(
         tap: i32,
@@ -54,7 +53,6 @@ extern "C" {
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopRun();
-    fn CFRelease(cf: *const c_void);
 
     static kCFRunLoopDefaultMode: CFStringRef;
 }
@@ -67,7 +65,7 @@ static TAB_PRESSED: AtomicBool = AtomicBool::new(false);
 // Shortcut mode: true = Command+Tab, false = Option+Tab
 pub static SHORTCUT_IS_CMD: AtomicBool = AtomicBool::new(false);
 
-type CGEventTapCallBack =Option<
+type CGEventTapCallBack = Option<
     unsafe extern "C" fn(
         proxy: CGEventTapProxy,
         event_type: CGEventType,
@@ -86,8 +84,7 @@ unsafe extern "C" fn event_tap_callback(
 
     match event_type {
         K_CG_EVENT_KEY_DOWN => {
-            let keycode =
-                CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) as u16;
+            let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) as u16;
             let flags = CGEventGetFlags(event);
 
             if keycode == K_VK_TAB {
@@ -124,8 +121,7 @@ pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
     thread::spawn(move || unsafe {
         let sender_ptr = Box::into_raw(Box::new(sender)) as *mut c_void;
 
-        let mask: CGEventMask =
-            (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
+        let mask: CGEventMask = (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
 
         let tap = CGEventTapCreate(0, 0, 0, mask, Some(event_tap_callback), sender_ptr);
 
@@ -144,8 +140,15 @@ pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
 
         // 快捷键可能被菜单/设置切换,按当前 SHORTCUT_IS_CMD 打印实际监听的组合键。
         // The shortcut can be toggled via menu/settings; print the actual combo from SHORTCUT_IS_CMD.
-        let shortcut = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) { "Command+Tab" } else { "Option+Tab" };
-        log_info!("Event monitor started. Listening for {} globally.", shortcut);
+        let shortcut = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
+            "Command+Tab"
+        } else {
+            "Option+Tab"
+        };
+        log_info!(
+            "Event monitor started. Listening for {} globally.",
+            shortcut
+        );
         CFRunLoopRun();
     })
 }

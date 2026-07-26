@@ -44,7 +44,11 @@ pub(crate) struct Colors {
 /// to transparent / placeholder for now.
 pub(crate) fn colors_from_config(dark: bool) -> Colors {
     let cfg = CONFIG.read().unwrap();
-    let c = if dark { &cfg.colors.dark } else { &cfg.colors.light };
+    let c = if dark {
+        &cfg.colors.dark
+    } else {
+        &cfg.colors.light
+    };
     Colors {
         page_bg: 0x00000000,
         hint_bg: 0x00000000,
@@ -110,7 +114,7 @@ pub(crate) fn letter_px() -> f64 {
 /// Overlay height = top 32 + rows * card height + status bar height.
 pub(crate) fn window_height(count: usize) -> f64 {
     let cpr = cards_per_row();
-    let rows = (count.max(1) + cpr - 1) / cpr;
+    let rows = count.max(1).div_ceil(cpr);
     32.0 + rows as f64 * card_h() + STATUS_H
 }
 

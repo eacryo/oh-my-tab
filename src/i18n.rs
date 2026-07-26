@@ -13,12 +13,12 @@
 // CONFIG's LazyLock init calls validate() -> t() -> I18N init, there is no deadlock.
 // config.rs calls apply_config_locale() one-way after CONFIG init and after reload.
 
+use crate::log_error;
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use std::collections::HashMap;
 use std::ffi::c_char;
 use std::sync::{LazyLock, RwLock};
-use crate::log_error;
 
 // 翻译文件编译期内嵌,避免运行时缺文件 / 读取失败。
 // Locale files embedded at compile time to avoid runtime file-missing / read failures.
@@ -86,7 +86,7 @@ fn load_messages(locale: &str) -> HashMap<String, String> {
 static EN_MESSAGES: LazyLock<HashMap<String, String>> = LazyLock::new(|| load_messages("en"));
 
 struct I18nState {
-    locale: String,                   // 已解析的实际 locale,如 "zh-Hans"
+    locale: String,                    // 已解析的实际 locale,如 "zh-Hans"
     messages: HashMap<String, String>, // 当前 locale 的扁平 key->string(locale=="en" 时与 EN_MESSAGES 相同)
 }
 
@@ -174,7 +174,11 @@ fn resolve_locale(locale_cfg: Option<&str>) -> String {
 fn map_tag_to_supported(tag: &str) -> Option<&'static str> {
     let lower = tag.to_lowercase();
     if lower.starts_with("zh") {
-        if lower.contains("hant") || lower.contains("tw") || lower.contains("hk") || lower.contains("mo") {
+        if lower.contains("hant")
+            || lower.contains("tw")
+            || lower.contains("hk")
+            || lower.contains("mo")
+        {
             Some("zh-Hant")
         } else {
             Some("zh-Hans")
