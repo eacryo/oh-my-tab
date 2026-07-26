@@ -318,7 +318,7 @@ fn show_alert(title: &str, msg: &str) {
         let _: () = msg_send![alert, setInformativeText: ns2];
         CFRelease(ns2 as *const c_void);
         let ns3 = make_nsstring(&t("alert.btn_ok"));
-        let _: () = msg_send![alert, addButtonWithTitle: ns3];
+        let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: ns3];
         CFRelease(ns3 as *const c_void);
         let _resp: isize = msg_send![alert, runModal];
         release_obj(alert);
@@ -339,10 +339,10 @@ fn confirm_alert(title: &str, msg: &str, confirm_label: &str, cancel_label: &str
         // 第一个按钮为默认(右,回车);确认在前,取消在后。
         // First button is the default (rightmost, Return); confirm first, cancel second.
         let n_confirm = make_nsstring(confirm_label);
-        let _: () = msg_send![alert, addButtonWithTitle: n_confirm];
+        let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: n_confirm];
         CFRelease(n_confirm as *const c_void);
         let n_cancel = make_nsstring(cancel_label);
-        let _: () = msg_send![alert, addButtonWithTitle: n_cancel];
+        let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: n_cancel];
         CFRelease(n_cancel as *const c_void);
         let resp: isize = msg_send![alert, runModal];
         release_obj(alert);
