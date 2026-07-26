@@ -75,7 +75,7 @@ Format: `type: description`
 
 Types: feat, fix, docs, style, refactor, perf, test, chore, ci, build
 
-Example: `feat(ui): implement compact floating window selector with auto-resize`
+Example: `feat: implement compact floating window selector with auto-resize`
 
 ## Code Comments
 

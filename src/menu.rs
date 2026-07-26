@@ -179,6 +179,9 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
     // Sync shortcut mode: a manual edit of config.keyboard.modifier must take effect on Reload.
     // Must run before refresh_menu_titles so the label refresh sees the correct value.
     set_shortcut_mode(CONFIG.read().unwrap().keyboard.modifier == "command");
+    // 同步开机自启:手动改 config 的 [startup] launch_at_login 后 Reload 也要生效。
+    // Sync launch-at-login: a manual edit of [startup] launch_at_login must take effect on Reload.
+    crate::autostart::sync(CONFIG.read().unwrap().startup.launch_at_login);
     // locale 可能随 reload 改变:重设全部菜单标题 + 作废设置窗口待下次按新 locale 重建
     // locale may change on reload: re-title all menus + invalidate the settings window
     // so it rebuilds with the new locale on next open

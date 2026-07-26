@@ -24,13 +24,28 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 
 ## Build & run
 
+**Prerequisites:** Rust stable toolchain, macOS 13+. Accessibility permission is required at runtime (see Permissions below).
+
+### Development
+
 ```sh
-cargo build        # or cargo check for a fast type-check
-cargo run          # build + run (takes over the global shortcut)
-cargo clippy       # available, not wired into CI
+cargo check       # fast type-check
+cargo run         # build + run (takes over the global shortcut)
+cargo clippy      # available, not wired into CI
 ```
 
-There are **no tests** in the project.
+`cargo run` launches the raw binary in **dev mode**: logs go to stdout (no log file) and launch-at-login is inactive (SMAppService needs a `.app` bundle). There are **no tests** in the project.
+
+### Release `.app`
+
+```sh
+sh bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc sign
+open dist/oh-my-tab.app
+```
+
+`bundle.sh` assembles `dist/oh-my-tab.app` (binary + `Info.plist`) and ad-hoc signs it. The output lives in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running as a `.app` is required for launch-at-login (SMAppService) and for file logging.
+
+Re-run `sh bundle.sh` after code changes (the bundle copies the release binary at build time). A binary at a new path must be **re-granted Accessibility** permission.
 
 ## Permissions & runtime caveats
 
@@ -131,6 +146,9 @@ show_minimized = false   # show minimized windows in the overlay
 [logging]
 level = "info"           # "info" | "warn" | "error"
 file_path = ""           # empty = default timestamped path; see Logging below
+
+[startup]
+launch_at_login = false  # launch at login (requires running as a .app bundle; macOS 13+)
 ```
 
 ## Logging

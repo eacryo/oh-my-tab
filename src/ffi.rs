@@ -133,19 +133,22 @@ pub(crate) fn hex_to_ns_color(hex: u32) -> *mut AnyObject {
     unsafe { msg_send![class!(NSColor), colorWithRed: r, green: g, blue: b, alpha: a] }
 }
 
+/// NSColor* -> CGColorRef。用 raw objc_msgSend,因为 objc2 的 msg_send! 无法编码 CF/CG 类型。
+/// NSColor* -> CGColorRef. Uses raw objc_msgSend because objc2's msg_send! can't encode CF/CG types.
+pub(crate) unsafe fn ns_color_to_cg(ns: *mut AnyObject) -> *mut c_void {
+    let sel = sel!(CGColor);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel) -> *mut c_void;
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(ns as *mut c_void, sel)
+}
+
 /// Convert hex u32 -> CGColorRef for use with CALayer.setBackgroundColor / setBorderColor.
-/// Uses raw objc_msgSend because objc2's msg_send! doesn't handle CF/CG types.
 pub(crate) fn hex_to_cg_color(hex: u32) -> *mut c_void {
     let ns = hex_to_ns_color(hex);
-    unsafe {
-        let sel = sel!(CGColor);
-        extern "C" {
-            fn objc_msgSend();
-        }
-        type F = unsafe extern "C" fn(*mut c_void, Sel) -> *mut c_void;
-        let f: F = std::mem::transmute(objc_msgSend as *const ());
-        f(ns as *mut c_void, sel)
-    }
+    unsafe { ns_color_to_cg(ns) }
 }
 
 /// Set CALayer.backgroundColor using raw objc_msgSend (CGColorRef, not NSColor*).

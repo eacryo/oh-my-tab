@@ -24,13 +24,28 @@
 
 ## 构建与运行
 
+**前置条件:** Rust 稳定版工具链,macOS 13+。运行时需要辅助功能权限(见下方「权限与运行须知」)。
+
+### 开发
+
 ```sh
-cargo build        # 或 cargo check 做快速类型检查
-cargo run          # 构建并运行(会接管全局快捷键)
-cargo clippy       # 可用,未接入 CI
+cargo check       # 快速类型检查
+cargo run         # 构建并运行(会接管全局快捷键)
+cargo clippy      # 可用,未接入 CI
 ```
 
-项目**没有测试**。
+`cargo run` 以**开发模式**跑裸二进制:日志输出到 stdout(不写文件),开机自启不生效(SMAppService 需要 `.app` bundle)。项目**没有测试**。
+
+### Release `.app`
+
+```sh
+sh bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc 签名
+open dist/oh-my-tab.app
+```
+
+`bundle.sh` 组装 `dist/oh-my-tab.app`(二进制 + `Info.plist`)并做 ad-hoc 签名。产物在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。以 `.app` 方式运行是开机自启(SMAppService)和文件日志的前提。
+
+代码改动后需要**重新跑 `sh bundle.sh`**(bundle 在构建时拷贝 release 二进制)。新路径下的二进制必须**重新授予辅助功能**权限。
 
 ## 权限与运行须知
 
@@ -131,6 +146,9 @@ show_minimized = false   # 在浮层中显示最小化窗口
 [logging]
 level = "info"           # "info" | "warn" | "error"
 file_path = ""           # 空 = 默认带时间戳路径;见下方「日志」
+
+[startup]
+launch_at_login = false  # 开机自启(需以 .app 方式运行;macOS 13+)
 ```
 
 ## 日志

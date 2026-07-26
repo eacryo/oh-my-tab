@@ -16,6 +16,7 @@ pub struct Config {
     pub i18n: I18nSection,
     pub windows: WindowsSection,
     pub logging: LoggingSection,
+    pub startup: StartupSection,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -99,6 +100,14 @@ pub struct LoggingSection {
     pub file_path: String,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct StartupSection {
+    // 开机自启;默认 false,bool::default() 即 false,故 Default 可直接派生。
+    // Launch at login; defaults to false (bool::default() is false, so Default derives directly).
+    pub launch_at_login: bool,
+}
+
 // ========== Default implementations (hard-coded fallback values) ==========
 
 impl Default for Config {
@@ -112,6 +121,7 @@ impl Default for Config {
             i18n: I18nSection::default(),
             windows: WindowsSection::default(),
             logging: LoggingSection::default(),
+            startup: StartupSection::default(),
         }
     }
 }
@@ -478,6 +488,10 @@ impl Config {
             // file_path 无校验,恒有效 / file_path has no validation, always valid
             self.logging.file_path = other.logging.file_path;
         }
+
+        // startup (bool 字段无需校验,恒有效)
+        // startup (bool field needs no validation, always valid)
+        self.startup = other.startup;
     }
 
     fn merge_colors(ours: &mut ThemeColors, theirs: &ThemeColors, theme: &str, errs: &[String]) {

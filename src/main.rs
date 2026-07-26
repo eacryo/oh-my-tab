@@ -8,6 +8,7 @@ mod overlay;
 mod menu;
 mod settings;
 mod logger;
+mod autostart;
 
 use config::CONFIG;
 use i18n::t;
@@ -539,6 +540,12 @@ fn setup_status_bar() {
                 on_settings_cancel as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(handleSettingsSidebar:),
+                on_sidebar_select as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };
@@ -675,6 +682,12 @@ fn main() {
     // read back at startup, otherwise the modifier chosen in Settings is lost on restart. Runs
     // before refresh_menu_titles so the label refresh sees the correct value.
     set_shortcut_mode(CONFIG.read().unwrap().keyboard.modifier == "command");
+
+    // 同步开机自启(SMAppService):TOML [startup] launch_at_login 为唯一事实源。
+    // 仅以 .app 方式启动时生效(cargo run 裸二进制下 mainApp 不可用,会记 warn,不影响其它功能)。
+    // Sync launch-at-login (SMAppService): TOML's [startup] launch_at_login is the source of truth.
+    // Only effective when launched as a .app (raw `cargo run` has no main bundle -> logs a warn, no other impact).
+    autostart::sync(CONFIG.read().unwrap().startup.launch_at_login);
 
     // 3b. 按实际主题修正初始菜单标签。setup_status_bar 用占位标题(is_dark=false +
     //     "切换深色");若 config 主题为 dark/auto,这里修正为正确的 toggle 标签。
