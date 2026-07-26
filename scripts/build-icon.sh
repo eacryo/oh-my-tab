@@ -1,20 +1,20 @@
 #!/bin/sh
-# 从 icon.svg 生成 macOS 应用图标 AppIcon.icns。
-# 管线:SVG -> 10 张标准 .iconset PNG(tools/svg2png.swift,NSImage/WebKit,保留 alpha) -> .icns(iconutil)。
+# 从 assets/icon.svg 生成 macOS 应用图标 AppIcon.icns。
+# 管线:SVG -> 10 张标准 .iconset PNG(scripts/svg2png.swift,NSImage/WebKit,保留 alpha) -> .icns(iconutil)。
 # 产物 assets/AppIcon.icns 提交进 git;bundle.sh 打包时直接拷入 Contents/Resources/,因此贡献者无需重新生成。
-# 改图标流程:编辑 icon.svg -> 跑本脚本 -> 把新生成的 assets/AppIcon.icns 一起提交。
+# 改图标流程:编辑 assets/icon.svg -> 跑本脚本 -> 把新生成的 assets/AppIcon.icns 一起提交。
 # 前置:swift(Xcode 或 Swift 工具链)+ iconutil(Xcode CLT)。
 #
-# Generate the macOS app icon AppIcon.icns from icon.svg.
-# Pipeline: SVG -> 10 standard .iconset PNGs (tools/svg2png.swift, NSImage/WebKit, alpha preserved) -> .icns (iconutil).
+# Generate the macOS app icon AppIcon.icns from assets/icon.svg.
+# Pipeline: SVG -> 10 standard .iconset PNGs (scripts/svg2png.swift, NSImage/WebKit, alpha preserved) -> .icns (iconutil).
 # Output assets/AppIcon.icns is committed; bundle.sh copies it into Contents/Resources/, so contributors need not regenerate.
-# To change the icon: edit icon.svg -> run this script -> commit the regenerated assets/AppIcon.icns.
+# To change the icon: edit assets/icon.svg -> run this script -> commit the regenerated assets/AppIcon.icns.
 # Requires: swift (Xcode or the Swift toolchain) + iconutil (Xcode CLT).
 set -e
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
-SRC="icon.svg"
+SRC="assets/icon.svg"
 OUT_DIR="assets"
 OUT="$OUT_DIR/AppIcon.icns"
 
@@ -28,7 +28,7 @@ ICONSET="$WORK/AppIcon.iconset"
 
 # 1. SVG -> 10 张 .iconset PNG(各尺寸原生光栅化,保留透明圆角)。
 # 1. SVG -> 10 .iconset PNGs (native rasterization per size, transparent corners preserved).
-swift tools/svg2png.swift "$SRC" "$ICONSET" >/dev/null
+swift scripts/svg2png.swift "$SRC" "$ICONSET" >/dev/null
 
 # 2. .iconset -> .icns。
 # 2. .iconset -> .icns.

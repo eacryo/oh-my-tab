@@ -39,25 +39,25 @@ cargo clippy      # available, not wired into CI
 ### Release `.app`
 
 ```sh
-sh bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc sign
+sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc sign
 open dist/oh-my-tab.app
 ```
 
 `bundle.sh` assembles `dist/oh-my-tab.app` (binary + `Info.plist`) and ad-hoc signs it. The output lives in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running as a `.app` is required for launch-at-login (SMAppService) and for file logging.
 
-Re-run `sh bundle.sh` after code changes (the bundle copies the release binary at build time). Run it from the **repo root** — it references `Info.plist` and writes to `dist/` by relative path. A binary at a new path must be **re-granted Accessibility** permission.
+Re-run `sh scripts/bundle.sh` after code changes (the bundle copies the release binary at build time). The script self-locates the repo root, so it can be run from anywhere; it references `assets/Info.plist` and writes to `dist/`. A binary at a new path must be **re-granted Accessibility** permission.
 
 ## App icon
 
-The app icon (`AppIcon.icns`) is generated from `icon.svg` and bundled into `Contents/Resources/`. The committed `assets/AppIcon.icns` is used directly by `bundle.sh`, so contributors need no extra tooling to build the `.app`.
+The app icon (`AppIcon.icns`) is generated from `assets/icon.svg` and bundled into `Contents/Resources/`. The committed `assets/AppIcon.icns` is used directly by `bundle.sh`, so contributors need no extra tooling to build the `.app`.
 
-To regenerate it after editing `icon.svg`:
+To regenerate it after editing `assets/icon.svg`:
 
 ```sh
-./build-icon.sh        # SVG -> 10 .iconset PNGs (tools/svg2png.swift) -> assets/AppIcon.icns
+./scripts/build-icon.sh        # SVG -> 10 .iconset PNGs (scripts/svg2png.swift) -> assets/AppIcon.icns
 ```
 
-Requires `swift` (Xcode or the Swift toolchain) and `iconutil` (Xcode CLT). `qlmanage` is intentionally avoided -- it composites SVG onto an opaque white background, leaving white corners outside the rounded squircle. `tools/svg2png.swift` rasterizes via `NSImage`/WebKit at each target size, preserving the transparent corners. Then commit the regenerated `assets/AppIcon.icns` alongside the `icon.svg` change.
+Requires `swift` (Xcode or the Swift toolchain) and `iconutil` (Xcode CLT). `qlmanage` is intentionally avoided -- it composites SVG onto an opaque white background, leaving white corners outside the rounded squircle. `scripts/svg2png.swift` rasterizes via `NSImage`/WebKit at each target size, preserving the transparent corners. Then commit the regenerated `assets/AppIcon.icns` alongside the `assets/icon.svg` change.
 
 ## Permissions & runtime caveats
 

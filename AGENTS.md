@@ -69,6 +69,8 @@ Shared state is global `static`s guarded by `Mutex`/`RwLock`: `TAB_STATE` (the w
 
 ## Commit Messages
 
+**Never commit or push.** Do not run `git commit`, `git push`, or any command that creates commits, rewrites history, or pushes to a remote - the user handles all git write operations themselves. When asked, only *generate the commit message text*; never stage (`git add`) or execute it on the user's behalf.
+
 When asked for a commit message, always follow the [Conventional Commits](https://www.conventionalcommits.org/) specification and keep it to a single line. No body, no bullet points, no footers.
 
 Format: `type: description`
