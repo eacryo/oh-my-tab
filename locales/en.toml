@@ -44,11 +44,16 @@ sidebar_experimental = "Experimental"
 experimental_note = "Experimental options - no guarantee of availability; may be removed in future versions."
 btn_cancel = "Cancel"
 btn_ok = "OK"
+btn_restore_defaults = "Restore Defaults"
 
 [alert]
 config_error_title = "Configuration Error"
 save_failed_title = "Save Failed"
 btn_ok = "OK"
+restore_title = "Restore Defaults?"
+restore_msg = "This will reset all settings to their defaults. Your current configuration will be overwritten."
+btn_restore = "Restore"
+btn_cancel = "Cancel"
 
 [errors]
 not_a_number = "{field}: not a number"

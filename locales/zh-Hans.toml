@@ -45,11 +45,16 @@ sidebar_experimental = "实验性功能 Experimental"
 experimental_note = "实验性选项，不保证可用性，后续版本可能移除。"
 btn_cancel = "取消"
 btn_ok = "确认"
+btn_restore_defaults = "恢复默认设置"
 
 [alert]
 config_error_title = "配置有误"
 save_failed_title = "保存失败"
 btn_ok = "OK"
+restore_title = "恢复默认设置？"
+restore_msg = "将把所有设置重置为默认值，当前配置会被覆盖。"
+btn_restore = "恢复"
+btn_cancel = "取消"
 
 [errors]
 not_a_number = "{field}: 不是数字"

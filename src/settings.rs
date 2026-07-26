@@ -17,6 +17,7 @@ use crate::config::{reload_config, Config, CONFIG};
 use crate::event_monitor::SHORTCUT_IS_CMD;
 use crate::ffi::*;
 use crate::i18n::{t, tf};
+use crate::log_info;
 use crate::menu::{refresh_menu_titles, set_shortcut_mode};
 use crate::overlay::{apply_theme, refresh_highlight, update_status_label};
 // 跨模块共享状态(由 main.rs 持有)/ cross-module shared state (owned by main.rs)
@@ -322,6 +323,68 @@ fn show_alert(title: &str, msg: &str) {
         let _resp: isize = msg_send![alert, runModal];
         release_obj(alert);
     }
+}
+
+/// 确认弹窗(两个按钮)。返回 true = 用户点了确认按钮。
+/// Confirm dialog (two buttons). Returns true if the user clicked the confirm button.
+fn confirm_alert(title: &str, msg: &str, confirm_label: &str, cancel_label: &str) -> bool {
+    unsafe {
+        let alert: *mut AnyObject = msg_send![class!(NSAlert), new];
+        let ns1 = make_nsstring(title);
+        let _: () = msg_send![alert, setMessageText: ns1];
+        CFRelease(ns1 as *const c_void);
+        let ns2 = make_nsstring(msg);
+        let _: () = msg_send![alert, setInformativeText: ns2];
+        CFRelease(ns2 as *const c_void);
+        // 第一个按钮为默认(右,回车);确认在前,取消在后。
+        // First button is the default (rightmost, Return); confirm first, cancel second.
+        let n_confirm = make_nsstring(confirm_label);
+        let _: () = msg_send![alert, addButtonWithTitle: n_confirm];
+        CFRelease(n_confirm as *const c_void);
+        let n_cancel = make_nsstring(cancel_label);
+        let _: () = msg_send![alert, addButtonWithTitle: n_cancel];
+        CFRelease(n_cancel as *const c_void);
+        let resp: isize = msg_send![alert, runModal];
+        release_obj(alert);
+        resp == 1000 // NSAlertFirstButtonReturn = 确认 / confirm
+    }
+}
+
+/// 恢复默认设置:确认 -> 把代码默认值写回 config.toml -> 重载 + 刷新 UI + 重填设置界面。
+/// Restore defaults: confirm -> write code defaults to config.toml -> reload + refresh UI + repopulate settings.
+pub(crate) extern "C" fn handle_restore_defaults(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    if !confirm_alert(
+        &t("alert.restore_title"),
+        &t("alert.restore_msg"),
+        &t("alert.btn_restore"),
+        &t("alert.btn_cancel"),
+    ) {
+        return;
+    }
+    // 把代码里的默认值(Config::default)序列化写回 config.toml,覆盖用户配置。
+    // Write code defaults (Config::default) to config.toml, overwriting the user's config.
+    if let Err(e) = Config::default().save() {
+        show_alert(&t("alert.save_failed_title"), &e);
+        return;
+    }
+    // 重读(现在是默认值)+ 应用 locale/logger。
+    // Reload (now defaults) + apply locale/logger.
+    let _ = reload_config();
+    // 同步快捷键模式 + 开机自启(默认值:command / false)。
+    // Sync shortcut mode + launch-at-login (defaults: command / false).
+    set_shortcut_mode(CONFIG.read().unwrap().keyboard.modifier == "command");
+    crate::autostart::sync(CONFIG.read().unwrap().startup.launch_at_login);
+    // 刷新 UI,但保留正在显示的设置窗口(不调 invalidate_settings_window,否则会关闭并释放它)。
+    // Refresh UI but keep the open settings window (skip invalidate_settings_window, which would close+release it).
+    refresh_menu_titles();
+    apply_theme();
+    refresh_highlight();
+    update_status_label();
+    // 设置窗口正打开:重填控件为默认值 + 复位到通用页。
+    // Settings window is open: repopulate controls with defaults + reset to General page.
+    load_settings_values();
+    select_sidebar(0);
+    log_info!("Config restored to defaults.");
 }
 
 /// 用当前 CONFIG 填充设置控件(每次打开都刷新,反映外部编辑 + Reload)。
@@ -676,6 +739,17 @@ fn create_settings_window() {
         ui.icon_size = add_row(experimental_view, label_x, y, label_w, row_h, &t("settings.row_icon_size"), make_text_input(ctrl_x, y, ctrl_w, row_h, "110"));
 
         // --- 确认 / 取消(加在 contentView 上,两页都可见)---
+        // Restore Defaults 按钮(左下角),与 OK/Cancel 同在 contentView,两页都可见。
+        // Restore Defaults button (bottom-left), on contentView like OK/Cancel, visible on both pages.
+        let restore: *mut AnyObject = msg_send![class!(NSButton), alloc];
+        let restore: *mut AnyObject = msg_send![restore, initWithFrame: NSRect::new(NSPoint::new(12.0, 14.0), NSSize::new(140.0, 28.0))];
+        set_control_title(restore, &t("settings.btn_restore_defaults"));
+        let _: () = msg_send![restore, setBezelStyle: 1isize];
+        let _: () = msg_send![restore, setTarget: target];
+        let _: () = msg_send![restore, setAction: sel!(handleRestoreDefaults:)];
+        let _: () = msg_send![content, addSubview: restore];
+        release_obj(restore);
+
         // OK / Cancel on contentView so they stay visible on both pages.
         let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
         let cancel: *mut AnyObject = msg_send![cancel, initWithFrame: NSRect::new(NSPoint::new(view_w - 200.0, 14.0), NSSize::new(80.0, 28.0))];

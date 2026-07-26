@@ -206,7 +206,9 @@ impl Default for Fonts {
 impl Default for Keyboard {
     fn default() -> Self {
         Keyboard {
-            modifier: "option".into(),
+            // 默认 Cmd+Tab;用户可在设置里切回 Option+Tab。
+            // Default Cmd+Tab; users can switch back to Option+Tab in Settings.
+            modifier: "command".into(),
         }
     }
 }

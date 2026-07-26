@@ -546,6 +546,12 @@ fn setup_status_bar() {
                 on_sidebar_select as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(handleRestoreDefaults:),
+                handle_restore_defaults as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };
