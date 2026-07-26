@@ -45,11 +45,18 @@ unsafe fn send_id(recv: *mut AnyObject, cmd: Sel) -> *mut AnyObject {
 }
 
 /// 是否以 .app bundle 方式运行(主 bundle 有 bundleIdentifier)。
-/// SMAppService.mainApp 在无主 bundle(裸二进制 cargo run)时会抛 ObjC 异常,Rust 捕获不了会
-/// abort,所以必须先探测、没 bundle 就根本不碰 mainApp。
+/// cargo run 跑裸二进制时无主 bundle,也就没有可注册的 app:此时 mainAppService 返回的是
+/// status=notFound 的服务,register/unregister 只会失败。所以先探测,没 bundle 就直接返回 nil,
+/// 让上层走 null 分支记一条 warn,不做无意义的 SMAppService 调用。
+/// 注意:这并非为了防止抛异常--用对 selector 时 mainAppService 不会抛 ObjC 异常;
+/// 真正会 abort 的是发错 selector(如曾经的 +mainApp),与有无 bundle 无关。
 /// Whether we're running as a .app bundle (main bundle has a bundleIdentifier).
-/// SMAppService.mainApp throws an ObjC exception when there's no main bundle (raw-binary cargo run);
-/// Rust can't catch it and would abort, so we must probe first and never touch mainApp without a bundle.
+/// Under `cargo run` (raw binary) there's no main bundle and thus no app to register:
+/// mainAppService returns a service with status=notFound, and register/unregister would just fail.
+/// So we probe first and return nil when there's no bundle, letting the caller take the null branch
+/// and log a warn instead of making pointless SMAppService calls.
+/// Note: this is NOT to prevent an exception - with the correct selector, mainAppService does not
+/// throw; what would abort is sending a wrong selector (e.g. the former +mainApp), independent of bundle.
 unsafe fn has_main_bundle() -> bool {
     let cls = cls_id("NSBundle");
     if cls.is_null() {
@@ -77,7 +84,11 @@ unsafe fn main_app() -> *mut AnyObject {
     if cls.is_null() {
         return std::ptr::null_mut();
     }
-    send_id(cls, sel!(mainApp))
+    // Swift 的 SMAppService.mainApp 桥接到 ObjC 的类方法名是 +mainAppService
+    // (不是 +mainApp--后者会触发 unrecognized selector 异常,Rust 捕获不了会 abort)。
+    // Swift's SMAppService.mainApp bridges to the ObjC class method +mainAppService
+    // (not +mainApp - that raises an unrecognized-selector exception Rust can't catch and aborts).
+    send_id(cls, sel!(mainAppService))
 }
 
 /// 当前是否已注册为登录项(读 SMAppService.status == registered)。
@@ -108,10 +119,16 @@ unsafe fn set_registered(enabled: bool) -> bool {
     extern "C" {
         fn objc_msgSend();
     }
+    // Swift 的 register()/unregister() 桥接到 ObjC 是 -registerAndReturnError: /
+    // -unregisterAndReturnError:(NSError** 出参),不是 registerWithError: / unregisterWithError:
+    // (后两者不是真实 selector,会触发 unrecognized selector 异常导致 abort)。
+    // Swift's register()/unregister() bridge to ObjC as -registerAndReturnError: /
+    // -unregisterAndReturnError: (NSError** out-param), not registerWithError: / unregisterWithError:
+    // (the latter are not real selectors and raise an unrecognized-selector exception that aborts).
     let sel = if enabled {
-        sel!(registerWithError:)
+        sel!(registerAndReturnError:)
     } else {
-        sel!(unregisterWithError:)
+        sel!(unregisterAndReturnError:)
     };
     type F = unsafe extern "C" fn(*mut AnyObject, Sel, *mut *mut AnyObject) -> bool;
     let f: F = std::mem::transmute(objc_msgSend as *const ());
