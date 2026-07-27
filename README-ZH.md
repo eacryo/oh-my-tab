@@ -33,6 +33,19 @@
 - macOS(在 macOS 26 上开发;旧版本通过 `NSVisualEffectView` 回退支持，但不保证其可用性)。
 - 已授予应用 **辅助功能** 权限。
 
+## 通过 Homebrew 安装
+
+如果只是使用、不需要从源码构建,可以通过 Homebrew Cask 安装预编译版本:
+
+```sh
+brew install --cask eacryo/tap/oh-my-tab
+```
+
+这会自动添加 [homebrew-tap](https://github.com/eacryo/homebrew-tap) 仓库,把 `Oh-My-Tab.app` 装进 `/Applications`。需要 macOS 13+ 的 Apple Silicon 机型。
+
+- 更新:`brew upgrade --cask oh-my-tab`
+- 卸载:`brew uninstall --cask oh-my-tab`
+
 ## 构建与运行
 
 **前置条件:** Rust 稳定版工具链、Xcode Command Line Tools(`xcode-select --install`)、macOS 13+。运行时需要辅助功能权限(见下方「权限与运行须知」)。

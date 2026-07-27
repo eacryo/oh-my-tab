@@ -33,6 +33,19 @@ If windows are already open when the app starts, their ordering differs from the
 - macOS (developed on macOS 26; older versions supported via the `NSVisualEffectView` fallback, but availability is not guaranteed).
 - **Accessibility** permission granted to the app.
 
+## Install via Homebrew
+
+If you just want to use the app (no need to build from source), install the prebuilt release via Homebrew Cask:
+
+```sh
+brew install --cask eacryo/tap/oh-my-tab
+```
+
+This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and installs `Oh-My-Tab.app` into `/Applications`. Requires macOS 13+ on Apple Silicon.
+
+- Update: `brew upgrade --cask oh-my-tab`
+- Uninstall: `brew uninstall --cask oh-my-tab`
+
 ## Build & run
 
 **Prerequisites:** Rust stable toolchain, Xcode Command Line Tools (`xcode-select --install`), macOS 13+. Accessibility permission is required at runtime (see Permissions below).
