@@ -460,26 +460,47 @@ fn init_app() {
 fn setup_status_bar() {
     unsafe {
         let status_bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
-        let status_item: *mut AnyObject = msg_send![status_bar, statusItemWithLength: 30.0f64];
+        // NSVariableStatusItemLength = -1.0:槽位按 button 内容自适应,sizeToFit 后贴合图标,
+        // 不留多余边距。固定长度(曾经的 30.0)不会被 sizeToFit 缩小,槽位恒为 30pt,而图标只有
+        // ~17pt,居中/靠左后两侧留空,看着和邻居图标之间有很大间距。
+        // NSVariableStatusItemLength = -1.0: the slot auto-sizes to the button's content, so after
+        // sizeToFit it hugs the icon with no extra padding. A fixed length (the former 30.0) is not
+        // shrunk by sizeToFit, so the slot stays 30pt while the icon is ~17pt, leaving visible gaps
+        // around the icon.
+        let status_item: *mut AnyObject = msg_send![status_bar, statusItemWithLength: -1.0f64];
         let _: *mut AnyObject = msg_send![status_item, retain];
 
         let button: *mut AnyObject = msg_send![status_item, button];
 
-        // Status bar icon
-        let ns_name = make_nsstring("square.on.square");
-        let image: *mut AnyObject = msg_send![class!(NSImage), imageWithSystemSymbolName: ns_name, accessibilityDescription: std::ptr::null::<AnyObject>()];
+        // Status bar icon: 单色 template PNG(两个矩形叠放,assets/statusbar-icon.png 嵌入二进制)。
+        // setTemplate:YES 让系统按菜单栏前景色渲染(浅/深色 menu bar 都清晰);sizeToFit 让 button 贴合 image。
+        // Status bar icon: monochrome template PNG (two overlapped rects, assets/statusbar-icon.png embedded
+        // in the binary). setTemplate:YES makes the system render it in the menu bar foreground color
+        // (clear on both light/dark menu bars); sizeToFit hugs the image.
+        let png_bytes: &[u8] = include_bytes!("../assets/statusbar-icon.png");
+        let nsdata: *mut AnyObject = msg_send![
+            class!(NSData),
+            dataWithBytes: png_bytes.as_ptr() as *const c_void,
+            length: png_bytes.len()
+        ];
+        let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let image: *mut AnyObject = msg_send![image, initWithData: nsdata];
         if !image.is_null() {
+            // PNG 128px,设 size 为 status bar 厚度,让 sizeToFit 后 button 匹配 menu bar 图标尺寸
+            // PNG is 128px; set its size to the status bar thickness so sizeToFit matches menu-bar icon size
+            let icon_size: f64 = msg_send![status_bar, thickness];
+            let _: () = msg_send![image, setSize: NSSize::new(icon_size, icon_size)];
             let is_template: bool = true;
             let _: () = msg_send![image, setTemplate: is_template];
             let _: () = msg_send![button, setImage: image];
             // NSImageOnly = 1
             let _: () = msg_send![button, setImagePosition: 1usize];
+            let _: () = msg_send![image, release]; // button retained it; drop our alloc +1
         } else {
             let ns_title = make_nsstring("Tab");
             let _: () = msg_send![button, setTitle: ns_title];
             CFRelease(ns_title as *const c_void);
         }
-        CFRelease(ns_name as *const c_void);
 
         let _: () = msg_send![button, sizeToFit];
         let _: () = msg_send![button, setNeedsDisplay: true];

@@ -1,0 +1,10 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- menu bar status item 单色 template 图标:两个圆角矩形描边叠放,无背景/渐变/阴影。
+       几何沿用 app icon(左上 112,112;右下 200,200;200x200;圆角 35);stroke 加粗到 50,
+       以便在 ~20pt 的 menu bar 尺寸下清晰。配合 NSImage setTemplate:true,系统按菜单栏前景色渲染。
+       Monochrome template icon for the menu bar status item: two stroked rounded rects overlapped,
+       no background/gradient/shadow. Geometry matches the app icon; stroke widened to 50 for clarity
+       at ~20pt. Used with NSImage setTemplate:YES so the system renders it in the menu bar foreground color. -->
+  <rect x="112" y="112" width="200" height="200" rx="35" fill="none" stroke="#000000" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="200" y="200" width="200" height="200" rx="35" fill="none" stroke="#000000" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

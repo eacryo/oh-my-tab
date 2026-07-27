@@ -35,8 +35,8 @@
   <rect x="1" y="1" width="510" height="510" rx="113" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="2"/>
 
   <!-- 左上方框 (Back Layer) -->
-  <rect x="112" y="112" width="200" height="200" rx="35" fill="none" stroke="url(#box-left-grad)" stroke-width="25" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="112" y="112" width="200" height="200" rx="35" fill="none" stroke="url(#box-left-grad)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
 
   <!-- 右下方框 (Front Layer, 带有层次投影) -->
-  <rect x="200" y="200" width="200" height="200" rx="35" fill="none" stroke="url(#box-right-grad)" stroke-width="25" stroke-linecap="round" stroke-linejoin="round" filter="url(#box-shadow)"/>
+  <rect x="200" y="200" width="200" height="200" rx="35" fill="none" stroke="url(#box-right-grad)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" filter="url(#box-shadow)"/>
 </svg>
