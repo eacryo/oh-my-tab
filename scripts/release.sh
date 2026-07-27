@@ -1,13 +1,13 @@
 #!/bin/sh
 # Release 打包:先跑 bundle.sh(构建 .app + .dmg + 签名),再生成 Homebrew cask 文件
 # dist/oh-my-tab.rb(算 dmg 的 sha256 + 从 Cargo.toml 读 version 填模板,带 zap 清理)。
-# 只支持 macOS 13+ Apple Silicon(arm64):cask 用 depends_on macos: ">= 13" + depends_on arch: :arm64
+# 只支持 macOS 13+ Apple Silicon(arm64):cask 用 depends_on macos: ">= :ventura" + depends_on arch: :arm64
 # 限制,Linux(cask 本身不支持)/ Intel Mac / macOS < 13 装都会报错。
 # 把它拷到你的 homebrew tap 仓库的 Casks/ 目录,push 即可。
 #
 # Release packaging: runs bundle.sh (build .app + .dmg + sign) first, then generates the Homebrew
 # cask file dist/oh-my-tab.rb (sha256 of the dmg + version from Cargo.toml filled into a template,
-# with zap cleanup). macOS 13+ Apple Silicon (arm64) only: the cask uses depends_on macos: ">= 13"
+# with zap cleanup). macOS 13+ Apple Silicon (arm64) only: the cask uses depends_on macos: ">= :ventura"
 # + depends_on arch: :arm64, so Linux / Intel Mac / macOS < 13 are rejected at install.
 # Copy it into your homebrew tap repo's Casks/ directory and push.
 set -e
@@ -43,7 +43,7 @@ SHA=$(shasum -a 256 "$DMG" | awk '{print $1}')
 #    and left intact.
 cat > "$OUT" <<EOF
 cask "oh-my-tab" do
-  depends_on macos: ">= 13"
+  depends_on macos: ">= :ventura"
   depends_on arch: :arm64
   version "$VERSION"
   sha256 "$SHA"
