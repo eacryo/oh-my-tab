@@ -91,6 +91,27 @@ tccutil reset Accessibility com.eacryo.oh-my-tab
 
 **Caveat:** a self-signed cert only stabilises TCC identity -- it does **not** satisfy Gatekeeper for other users (they still see "unidentified developer" and must right-click -> Open). For friction-free distribution you need a paid Apple **Developer ID Application** certificate; if you have one, set `SIGN_IDENTITY` in `scripts/bundle.sh` to its name.
 
+### Homebrew cask release
+
+`scripts/release.sh` is the full release pipeline: it runs `bundle.sh` first, then generates `dist/oh-my-tab.rb` -- a Homebrew cask file with the dmg's `sha256` and the `version` read from `Cargo.toml`, plus a `zap trash:` block so `brew uninstall --cask` also removes the icon cache, logs, and config.
+
+```sh
+sh scripts/release.sh        # bundle.sh -> dist/Oh-My-Tab.dmg + dist/oh-my-tab.rb
+```
+
+The cask pins `depends_on macos: ">= :ventura"` + `depends_on arch: :arm64`, so it installs only on macOS 13+ Apple Silicon -- the same restriction noted under [Install via Homebrew](#install-via-homebrew). Its `url` points at `https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg`, so the dmg must be published to a GitHub release tagged `v<version>` (matching the `Cargo.toml` version).
+
+To publish a new version:
+
+1. Bump `version` in `Cargo.toml`.
+2. Run `sh scripts/release.sh` -> produces `dist/Oh-My-Tab.dmg` and `dist/oh-my-tab.rb`.
+3. Create a GitHub release tagged `v<version>` and upload `dist/Oh-My-Tab.dmg` to it.
+4. Copy `dist/oh-my-tab.rb` into the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo's `Casks/` directory and push.
+
+After step 4, `brew install --cask eacryo/tap/oh-my-tab` (or `brew upgrade --cask`) picks up the new version.
+
+`brew install --cask` actually reads the committed copy in the tap repo: [`Casks/oh-my-tab.rb`](https://github.com/eacryo/homebrew-tap/blob/main/Casks/oh-my-tab.rb) in `eacryo/homebrew-tap`. `release.sh` only regenerates it locally so you can copy the new version over.
+
 ## App icon
 
 The app icon (`AppIcon.icns`) is generated from `assets/icon.svg` and bundled into `Contents/Resources/`. The committed `assets/AppIcon.icns` is used directly by `bundle.sh`, so contributors need no extra tooling to build the `.app`.
@@ -242,3 +263,7 @@ The app deliberately **never writes extra files into, and never deletes any file
 ## Repository
 
 https://github.com/eacryo/oh-my-tab
+
+## License
+
+This project is open-sourced under the [MIT License](LICENSE).

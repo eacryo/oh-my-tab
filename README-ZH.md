@@ -91,6 +91,27 @@ tccutil reset Accessibility com.eacryo.oh-my-tab
 
 **注意:** 自签名证书只稳定 TCC 身份,**不**满足 Gatekeeper 分发 -- 别人装仍是「未识别开发者」,需右键打开。要彻底解决分发得用付费的 Apple **Developer ID Application** 证书;有的话把 `scripts/bundle.sh` 里的 `SIGN_IDENTITY` 改成那个名字。
 
+### Homebrew cask 发布
+
+`scripts/release.sh` 是完整的发布流水线:先跑 `bundle.sh`,再生成 `dist/oh-my-tab.rb` -- 一个 Homebrew cask 文件,内含 dmg 的 `sha256`、从 `Cargo.toml` 读出的 `version`,以及 `zap trash:` 块(这样 `brew uninstall --cask` 会一并清理图标缓存、日志和配置)。
+
+```sh
+sh scripts/release.sh        # bundle.sh -> dist/Oh-My-Tab.dmg + dist/oh-my-tab.rb
+```
+
+cask 里硬编码了 `depends_on macos: ">= :ventura"` + `depends_on arch: :arm64`,所以只能在 macOS 13+ 的 Apple Silicon 上安装 -- 与上方[通过 Homebrew 安装](#通过-homebrew-安装)的限制一致。它的 `url` 指向 `https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg`,因此 dmg 必须传到一个 tag 为 `v<version>` 的 GitHub release(与 `Cargo.toml` 的 version 一致)。
+
+发布新版本流程:
+
+1. 改 `Cargo.toml` 里的 `version`。
+2. 跑 `sh scripts/release.sh` -> 产出 `dist/Oh-My-Tab.dmg` 和 `dist/oh-my-tab.rb`。
+3. 建一个 tag 为 `v<version>` 的 GitHub release,把 `dist/Oh-My-Tab.dmg` 传上去。
+4. 把 `dist/oh-my-tab.rb` 拷到 [homebrew-tap](https://github.com/eacryo/homebrew-tap) 仓库的 `Casks/` 目录,push。
+
+第 4 步完成后,`brew install --cask eacryo/tap/oh-my-tab`(或 `brew upgrade --cask`)就能拉到新版本。
+
+`brew install --cask` 实际读取的是 tap 仓库里已提交的那份:`eacryo/homebrew-tap` 下的 [`Casks/oh-my-tab.rb`](https://github.com/eacryo/homebrew-tap/blob/main/Casks/oh-my-tab.rb)。`release.sh` 只是在本地重新生成它,方便你把新版本拷过去。
+
 ## 应用图标
 
 应用图标(`AppIcon.icns`)由 `assets/icon.svg` 生成,打包进 `Contents/Resources/`。`assets/AppIcon.icns` 已提交进仓库,`bundle.sh` 直接使用它,因此贡献者构建 `.app` 时无需任何额外工具。
@@ -243,3 +264,7 @@ launch_at_login = false  # 开机自启(需以 .app 方式运行;macOS 13+)
 ## 仓库
 
 https://github.com/eacryo/oh-my-tab
+
+## 开源协议
+
+本项目以 [MIT 协议](LICENSE)开源。
