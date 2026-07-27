@@ -47,6 +47,7 @@ btn_ok = "OK"
 btn_restore_defaults = "Restore Defaults"
 accessibility_warning = "Accessibility permission not granted - the shortcut won't work. Enable Oh My Tab under Privacy & Security -> Accessibility."
 btn_open_privacy = "Open Privacy & Security..."
+version_label = "Version {version}"
 
 [alert]
 config_error_title = "Configuration Error"

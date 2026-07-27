@@ -26,6 +26,14 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$BIN" "$APP/Contents/MacOS/oh-my-tab"
 cp assets/Info.plist "$APP/Contents/Info.plist"
 
+# 从 Cargo.toml 读 version(唯一事实源),写入 .app 的 Info.plist CFBundleShortVersionString,
+# 让 app 显示版本与 Cargo.toml 一致(不用手动同步 Info.plist)。
+# Read version from Cargo.toml (single source of truth) and write it into the .app's
+# Info.plist CFBundleShortVersionString so the displayed version matches Cargo.toml
+# (no manual Info.plist sync needed).
+VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+
 # 应用图标:从 assets/AppIcon.icns 拷入 Contents/Resources/(放在 codesign 之前,纳入签名)。
 # 该 icns 由 build-icon.sh 从 assets/icon.svg 生成并提交进 git;缺失则提示先跑 build-icon.sh。
 # App icon: copy assets/AppIcon.icns into Contents/Resources/ (before codesign so it is covered by the signature).

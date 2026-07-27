@@ -1054,16 +1054,38 @@ fn create_settings_window() {
         );
 
         // --- 确认 / 取消(加在 contentView 上,两页都可见)---
-        // Restore Defaults 按钮(左下角),与 OK/Cancel 同在 contentView,两页都可见。
-        // Restore Defaults button (bottom-left), on contentView like OK/Cancel, visible on both pages.
+        // Restore Defaults 按钮(左侧偏上,版本号在其下方),与 OK/Cancel 同在 contentView,两页都可见。
+        // 宽度限制在 sidebar 内,避免右边跨过 sidebar 分隔线(x=sidebar_w=150)。
+        // Restore Defaults button (left, raised; version label below it), on contentView like
+        // OK/Cancel, visible on both pages. Width kept within the sidebar so the right edge
+        // doesn't cross the sidebar divider (x=sidebar_w=150).
         let restore: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let restore: *mut AnyObject = msg_send![restore, initWithFrame: NSRect::new(NSPoint::new(12.0, 14.0), NSSize::new(140.0, 28.0))];
+        let restore: *mut AnyObject = msg_send![restore, initWithFrame: NSRect::new(NSPoint::new(12.0, 44.0), NSSize::new(126.0, 28.0))];
         set_control_title(restore, &t("settings.btn_restore_defaults"));
         let _: () = msg_send![restore, setBezelStyle: 1isize];
         let _: () = msg_send![restore, setTarget: target];
         let _: () = msg_send![restore, setAction: sel!(handleRestoreDefaults:)];
         let _: () = msg_send![content, addSubview: restore];
         release_obj(restore);
+
+        // 版本号(Restore Defaults 下方,左下角),数据来自 Cargo.toml version(编译期 env! 嵌入)。
+        // 版本号本身是数据不本地化,只本地化「版本」标签。
+        // Version label (below Restore Defaults, bottom-left); version data from Cargo.toml via
+        // compile-time env!. The version number itself is data (not localized), only the label is.
+        let version_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let version_label: *mut AnyObject = msg_send![version_label, initWithFrame: NSRect::new(NSPoint::new(12.0, 14.0), NSSize::new(126.0, 20.0))];
+        let version_text = tf("settings.version_label", &[("version", env!("CARGO_PKG_VERSION"))]);
+        let version_ns = make_nsstring(&version_text);
+        let _: () = msg_send![version_label, setStringValue: version_ns];
+        CFRelease(version_ns as *const c_void);
+        let _: () = msg_send![version_label, setBezeled: false];
+        let _: () = msg_send![version_label, setDrawsBackground: false];
+        let _: () = msg_send![version_label, setEditable: false];
+        let _: () = msg_send![version_label, setAlignment: 0isize]; // NSTextAlignmentLeft
+        let version_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
+        let _: () = msg_send![version_label, setFont: version_font];
+        let _: () = msg_send![content, addSubview: version_label];
+        release_obj(version_label);
 
         // OK / Cancel on contentView so they stay visible on both pages.
         let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
