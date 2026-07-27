@@ -5,7 +5,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.eacryo.oh-my-tab</string>
     <key>CFBundleName</key>
-    <string>Oh My Tab</string>
+    <string>Oh-My-Tab</string>
+    <key>CFBundleDisplayName</key>
+    <string>Oh-My-Tab</string>
     <key>CFBundleExecutable</key>
     <string>oh-my-tab</string>
     <!-- 应用图标(不带扩展名,macOS 自动找 .icns)。由 build-icon.sh 从 icon.svg 生成,打包进 Contents/Resources/。 -->

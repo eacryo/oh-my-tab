@@ -50,11 +50,11 @@ cargo clippy      # available, not wired into CI
 ### Release `.app` + `.dmg`
 
 ```sh
-sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> sign -> dist/oh-my-tab.dmg
-open dist/oh-my-tab.dmg     # install: drag Oh My Tab into Applications
+sh scripts/bundle.sh        # cargo build --release -> dist/Oh-My-Tab.app -> sign -> dist/Oh-My-Tab.dmg
+open dist/Oh-My-Tab.dmg     # install: drag Oh-My-Tab into Applications
 ```
 
-`bundle.sh` assembles `dist/oh-my-tab.app` (binary + `Info.plist`), signs it, then packages it into `dist/oh-my-tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution.
+`bundle.sh` assembles `dist/Oh-My-Tab.app` (binary + `Info.plist`), signs it, then packages it into `dist/Oh-My-Tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution.
 
 Re-run `sh scripts/bundle.sh` after code changes (the bundle copies the release binary at build time). The script self-locates the repo root, so it can be run from anywhere; it references `assets/Info.plist` and writes to `dist/`.
 

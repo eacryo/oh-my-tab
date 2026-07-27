@@ -50,11 +50,11 @@ cargo clippy      # 可用,未接入 CI
 ### Release `.app` + `.dmg`
 
 ```sh
-sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> 签名 -> dist/oh-my-tab.dmg
-open dist/oh-my-tab.dmg     # 安装:把 Oh My Tab 拖到 Applications
+sh scripts/bundle.sh        # cargo build --release -> dist/Oh-My-Tab.app -> 签名 -> dist/Oh-My-Tab.dmg
+open dist/Oh-My-Tab.dmg     # 安装:把 Oh-My-Tab 拖到 Applications
 ```
 
-`bundle.sh` 组装 `dist/oh-my-tab.app`(二进制 + `Info.plist`)、做签名,再打成 `dist/oh-my-tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。
+`bundle.sh` 组装 `dist/Oh-My-Tab.app`(二进制 + `Info.plist`)、做签名,再打成 `dist/Oh-My-Tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。
 
 代码改动后需要**重新跑 `sh scripts/bundle.sh`**(bundle 在构建时拷贝 release 二进制)。脚本会自定位仓库根,可从任意目录运行;它引用 `assets/Info.plist`、写入 `dist/`。
 

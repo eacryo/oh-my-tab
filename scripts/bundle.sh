@@ -15,8 +15,8 @@ trap 'code=$?; [ -n "$STAGING" ] && rm -rf "$STAGING"; [ "$code" -ne 0 ] && echo
 # Script lives in scripts/; cd to the repo root before using relative paths.
 cd "$(dirname "$0")/.."
 
-APP="dist/oh-my-tab.app"
-DMG="dist/oh-my-tab.dmg"
+APP="dist/Oh-My-Tab.app"
+DMG="dist/Oh-My-Tab.dmg"
 
 cargo build --release
 BIN="target/release/oh-my-tab"
@@ -67,9 +67,9 @@ STAGING="$(mktemp -d)"
 cp -R "$APP" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
 rm -f "$DMG"
-hdiutil create -volname "Oh My Tab" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
+hdiutil create -volname "Oh-My-Tab" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGING"; STAGING=""
 
-echo "Install: open $DMG   then drag Oh My Tab to Applications"
+echo "Install: open $DMG   then drag Oh-My-Tab to Applications"
 echo "Dev-run: open $APP   (SMAppService only works when launched as a .app, not via cargo run)"
 echo "✅ Build success: $DMG (contains $APP)"
