@@ -120,6 +120,12 @@ pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mu
     }
 }
 
+// 设置里「缺权限」警告条的「打开隐私与安全性」按钮回调。
+// Handler for the "Open Privacy & Security" button on the settings permission-warning banner.
+pub(crate) extern "C" fn handle_open_privacy(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    crate::open_privacy_accessibility();
+}
+
 pub(crate) extern "C" fn handle_toggle_shortcut(
     _self: *mut c_void,
     _cmd: Sel,

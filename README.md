@@ -10,7 +10,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 
 - Enhances the native window switcher: shows the app name and window title (shown as '-' when untitled); when an app has multiple windows open, they appear as separate cards in the switcher.
 - After pressing Command or Option, navigate the selected window with Tab, arrow keys, or the mouse.
-- Pure Rust calling macOS APIs directly — no Electron, no Tauri — resulting in a ~1.5 MB binary and ~60 MB memory footprint.
+- Pure Rust calling macOS APIs directly — no Electron, no Tauri — resulting in a 1.5 MB binary and 35 MB memory footprint.
 - Floating Liquid Glass overlay (tested only on macOS 26; lower versions not guaranteed to work).
 - **Window-level** MRU ordering — each window is tracked independently by `(pid, CGWindowID)`, so switching to one window of an app doesn't drag the app's other windows forward.
 - Optionally show or hide minimized windows in the switcher; when shown, minimized windows' icons are greyed out.
@@ -50,13 +50,33 @@ cargo clippy      # available, not wired into CI
 ### Release `.app` + `.dmg`
 
 ```sh
-sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc sign -> dist/oh-my-tab.dmg
+sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> sign -> dist/oh-my-tab.dmg
 open dist/oh-my-tab.dmg     # install: drag Oh My Tab into Applications
 ```
 
-`bundle.sh` assembles `dist/oh-my-tab.app` (binary + `Info.plist`), ad-hoc signs it, then packages it into `dist/oh-my-tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution.
+`bundle.sh` assembles `dist/oh-my-tab.app` (binary + `Info.plist`), signs it, then packages it into `dist/oh-my-tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution.
 
-Re-run `sh scripts/bundle.sh` after code changes (the bundle copies the release binary at build time). The script self-locates the repo root, so it can be run from anywhere; it references `assets/Info.plist` and writes to `dist/`. A binary at a new path must be **re-granted Accessibility** permission.
+Re-run `sh scripts/bundle.sh` after code changes (the bundle copies the release binary at build time). The script self-locates the repo root, so it can be run from anywhere; it references `assets/Info.plist` and writes to `dist/`.
+
+### Code signing
+
+`bundle.sh` signs with the self-signed identity **`oh-my-tab-sign`** when present, falling back to ad-hoc (`codesign -s -`) if not. Creating this cert once is **strongly recommended** -- it keeps the Accessibility grant stable across rebuilds.
+
+**Why:** an ad-hoc-signed app's designated requirement is just the bare CDHash, which changes on every rebuild. macOS TCC keys the Accessibility grant to that CDHash, so each rebuild invalidates the grant (TCC logs `Failed to match existing code requirement` / `errSecCSReqFailed`), and stale entries from previous installs make it worse. A self-signed cert makes the designated requirement cert-based (`certificate leaf = H"..."`), stable across rebuilds, so the grant persists.
+
+**Create the cert once** (Keychain Access):
+
+1. *Keychain Access -> Certificate Assistant -> Create a Certificate...*
+2. Name: `oh-my-tab-sign`, Identity Type: **Self Signed Root**, Certificate Type: **Code Signing**.
+3. Create. (The first `bundle.sh` run may prompt for keychain access -- click *Always Allow*.)
+
+Then rebuild, reinstall, and grant Accessibility once. From then on, rebuilds keep the same cert identity, so **no re-granting is needed**. If grants ever go stale (e.g. left over from old ad-hoc installs), clear them:
+
+```sh
+tccutil reset Accessibility com.eacryo.oh-my-tab
+```
+
+**Caveat:** a self-signed cert only stabilises TCC identity -- it does **not** satisfy Gatekeeper for other users (they still see "unidentified developer" and must right-click -> Open). For friction-free distribution you need a paid Apple **Developer ID Application** certificate; if you have one, set `SIGN_IDENTITY` in `scripts/bundle.sh` to its name.
 
 ## App icon
 
@@ -72,7 +92,7 @@ Requires `swift` (Xcode or the Swift toolchain) and `iconutil` (Xcode CLT). `qlm
 
 ## Permissions & runtime caveats
 
-- The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary at a new path must be re-granted.
+- The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary must be re-granted -- unless you sign with a stable identity (see [Code signing](#code-signing)), in which case the grant persists across rebuilds.
 - If the event tap fails to create, the app prints an error and the shortcut silently does nothing — almost always a missing Accessibility grant.
 - Runtime config: `~/.config/oh-my-tab/config.toml` (auto-created with defaults on first run).
 - Icon cache: `~/Library/Caches/oh-my-tab-icons/{pid}.png`.

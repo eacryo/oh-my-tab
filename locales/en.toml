@@ -45,6 +45,8 @@ experimental_note = "Experimental options - no guarantee of availability; may be
 btn_cancel = "Cancel"
 btn_ok = "OK"
 btn_restore_defaults = "Restore Defaults"
+accessibility_warning = "Accessibility permission not granted - the shortcut won't work. Enable Oh My Tab under Privacy & Security -> Accessibility."
+btn_open_privacy = "Open Privacy & Security..."
 
 [alert]
 config_error_title = "Configuration Error"
@@ -54,6 +56,10 @@ restore_title = "Restore Defaults?"
 restore_msg = "This will reset all settings to their defaults. Your current configuration will be overwritten."
 btn_restore = "Restore"
 btn_cancel = "Cancel"
+accessibility_title = "Accessibility Permission Required"
+accessibility_msg = "Oh My Tab needs Accessibility to intercept the global shortcut and list your windows. Enable it for Oh My Tab under Privacy & Security -> Accessibility; the shortcut will start working automatically once granted."
+accessibility_open = "Open Privacy & Security"
+accessibility_later = "Later"
 
 [errors]
 not_a_number = "{field}: not a number"

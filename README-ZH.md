@@ -10,7 +10,7 @@
 
 - 对于系统原生窗口切换的增强，可以显示应用名称和窗口标题（无标题时使用-显示）同一个应用打开多个窗口时，可以分列在窗口切换界面
 - 按下Command或Option后，可以通过Tab键以及上下左右方向键和鼠标指针移动选中窗口
-- 纯Rust调用MacOS api，没有Electron，没有Tauri，带来了仅1.5MB的体积大小和60MB的内存占用
+- 纯Rust调用MacOS api，没有Electron，没有Tauri，带来了仅1.5MB的体积大小和35MB的内存占用
 - 浮层 Liquid Glass 效果，因此只在MacOS 26上测试过，更低版本不保证可用性。
 - **窗口级** MRU 排序 -- 每个窗口按 `(pid, CGWindowID)` 独立追踪,切到某 App 的一个窗口时不会把该 App 的其它窗口一起带到前面。
 - 窗口切换界面支持显示最小化窗口和和隐藏最小化窗口，开启时置灰最小化窗口的图标
@@ -50,13 +50,33 @@ cargo clippy      # 可用,未接入 CI
 ### Release `.app` + `.dmg`
 
 ```sh
-sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> ad-hoc 签名 -> dist/oh-my-tab.dmg
+sh scripts/bundle.sh        # cargo build --release -> dist/oh-my-tab.app -> 签名 -> dist/oh-my-tab.dmg
 open dist/oh-my-tab.dmg     # 安装:把 Oh My Tab 拖到 Applications
 ```
 
-`bundle.sh` 组装 `dist/oh-my-tab.app`(二进制 + `Info.plist`)、做 ad-hoc 签名,再打成 `dist/oh-my-tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。
+`bundle.sh` 组装 `dist/oh-my-tab.app`(二进制 + `Info.plist`)、做签名,再打成 `dist/oh-my-tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。
 
-代码改动后需要**重新跑 `sh scripts/bundle.sh`**(bundle 在构建时拷贝 release 二进制)。脚本会自定位仓库根,可从任意目录运行;它引用 `assets/Info.plist`、写入 `dist/`。新路径下的二进制必须**重新授予辅助功能**权限。
+代码改动后需要**重新跑 `sh scripts/bundle.sh`**(bundle 在构建时拷贝 release 二进制)。脚本会自定位仓库根,可从任意目录运行;它引用 `assets/Info.plist`、写入 `dist/`。
+
+### 代码签名
+
+`bundle.sh` 优先用自签名身份 **`oh-my-tab-sign`** 签名,没有该证书时退回 ad-hoc(`codesign -s -`)。**强烈建议**一次性创建该证书 -- 它能让辅助功能授权在反复 rebuild 后仍然稳定。
+
+**原因:** ad-hoc 签名应用的指定要求只是裸 CDHash,每次 rebuild 都变。macOS TCC 按该 CDHash 记辅助功能授权,所以每次 rebuild 都会让授权失效(TCC 日志报 `Failed to match existing code requirement` / `errSecCSReqFailed`),旧安装残留的条目还会雪上加霜。自签名证书让指定要求变成证书型(`certificate leaf = H"..."`),rebuild 不变,授权就稳了。
+
+**一次性创建证书**(钥匙串访问):
+
+1. *钥匙串访问 -> 证书助理 -> 创建证书…*
+2. 名称:`oh-my-tab-sign`,身份类型:**自签名根**,证书类型:**代码签名**。
+3. 创建。(首次跑 `bundle.sh` 可能弹钥匙串访问提示 -- 点「始终允许」。)
+
+然后重新打包、重装、授予辅助功能一次。之后每次 rebuild 用的是同一个证书身份,**无需再重新授权**。若授权变陈旧(比如旧 ad-hoc 安装残留),清除:
+
+```sh
+tccutil reset Accessibility com.eacryo.oh-my-tab
+```
+
+**注意:** 自签名证书只稳定 TCC 身份,**不**满足 Gatekeeper 分发 -- 别人装仍是「未识别开发者」,需右键打开。要彻底解决分发得用付费的 Apple **Developer ID Application** 证书;有的话把 `scripts/bundle.sh` 里的 `SIGN_IDENTITY` 改成那个名字。
 
 ## 应用图标
 
@@ -72,7 +92,7 @@ open dist/oh-my-tab.dmg     # 安装:把 Oh My Tab 拖到 Applications
 
 ## 权限与运行须知
 
-- 应用需要 **辅助功能** 权限(`AXIsProcessTrusted`),全局按键事件 tap 和 AX 窗口查询都依赖它。在 *系统设置 -> 隐私与安全性 -> 辅助功能* 中授予。新路径下重新编译出的二进制需要重新授权。
+- 应用需要 **辅助功能** 权限(`AXIsProcessTrusted`),全局按键事件 tap 和 AX 窗口查询都依赖它。在 *系统设置 -> 隐私与安全性 -> 辅助功能* 中授予。重新编译出的二进制需要重新授权 -- 除非用稳定身份签名(见[代码签名](#代码签名)),此时授权跨 rebuild 持续有效。
 - 如果事件 tap 创建失败,应用会打印一条错误,快捷键静默失效 -- 几乎总是辅助功能权限没给。
 - 运行时配置:`~/.config/oh-my-tab/config.toml`(首次运行自动按默认值创建)。
 - 图标缓存:`~/Library/Caches/oh-my-tab-icons/{pid}.png`。

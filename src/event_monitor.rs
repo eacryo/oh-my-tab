@@ -1,8 +1,10 @@
-use crate::{log_error, log_info};
+use crate::ffi::has_accessibility_permission;
+use crate::{log_error, log_info, log_warn};
 use flume::Sender;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub enum GlobalEvent {
@@ -117,21 +119,56 @@ unsafe extern "C" fn event_tap_callback(
     event
 }
 
+// 缺 Accessibility 权限时,event tap 创建会失败。每隔 RETRY_INTERVAL 重试一次,最多 RETRY_MAX 次
+// (约 2 分钟),期间用户可在系统设置里授权;超过上限就记日志放弃(快捷键在重启前失效,下次启动再试)。
+// 设上限是为了避免无限轮询;用户授权后下次重试即建成,无需重启。
+// When Accessibility permission is missing, CGEventTapCreate fails. Retry every RETRY_INTERVAL up to
+// RETRY_MAX times (~2 min), during which the user can grant permission in System Settings; once the
+// limit is exhausted, log and give up (the shortcut stays dead until restart; next launch retries).
+// The cap avoids infinite polling; once granted, the next retry succeeds - no restart needed.
+const RETRY_INTERVAL: Duration = Duration::from_secs(3);
+const RETRY_MAX: u32 = 40;
+
 pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
     thread::spawn(move || unsafe {
         let sender_ptr = Box::into_raw(Box::new(sender)) as *mut c_void;
 
         let mask: CGEventMask = (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
 
-        let tap = CGEventTapCreate(0, 0, 0, mask, Some(event_tap_callback), sender_ptr);
+        let mut tap = CGEventTapCreate(0, 0, 0, mask, Some(event_tap_callback), sender_ptr);
 
+        // 首次创建失败(通常是缺 Accessibility 权限):有限次重试,给用户时间去系统设置授权。
+        // First creation failed (usually missing Accessibility): retry a bounded number of times
+        // to give the user time to grant permission in System Settings.
         if tap.is_null() {
-            log_error!(
-                "Failed to create CGEventTap. \
-                 Make sure the app has Accessibility permission."
+            log_warn!(
+                "No Accessibility permission yet; event tap will retry every {:?} up to {} times (~{}s).",
+                RETRY_INTERVAL,
+                RETRY_MAX,
+                RETRY_INTERVAL.as_secs() * RETRY_MAX as u64
             );
-            let _ = Box::from_raw(sender_ptr as *mut Sender<GlobalEvent>);
-            return;
+            let mut granted = false;
+            for _ in 0..RETRY_MAX {
+                std::thread::sleep(RETRY_INTERVAL);
+                if has_accessibility_permission() {
+                    tap = CGEventTapCreate(0, 0, 0, mask, Some(event_tap_callback), sender_ptr);
+                    if !tap.is_null() {
+                        granted = true;
+                        break;
+                    }
+                }
+            }
+            if granted {
+                log_info!("Accessibility permission granted; event tap created.");
+            } else {
+                log_error!(
+                    "Event tap retry exhausted ({}x). Shortcut disabled until restart. \
+                     Grant Accessibility in System Settings and relaunch.",
+                    RETRY_MAX
+                );
+                let _ = Box::from_raw(sender_ptr as *mut Sender<GlobalEvent>);
+                return;
+            }
         }
 
         let source = CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);

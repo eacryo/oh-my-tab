@@ -38,11 +38,28 @@ fi
 mkdir -p "$APP/Contents/Resources"
 cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 
-# ad-hoc 签名:本地足够让 SMAppService 注册(未用 Developer ID 签名的应用,
-# 可能需要用户在 系统设置 > 通用 > 登录项与扩展 里手动批准一次)。
-# Ad-hoc sign: enough for SMAppService locally. Apps not signed with a Developer ID may require a
-# one-time approval in System Settings > General > Login Items & Extensions.
-codesign --force --sign - "$APP"
+# 签名:优先用自签名证书 "oh-my-tab-sign"(让 TCC 身份稳定,Accessibility 授权不会因 rebuild 失效);
+# 签名失败(证书缺失 / 钥匙串拒绝)时退回 ad-hoc(TCC 授权随 CDHash 变化失效,仅适合临时本机调试)。
+# 注意:security find-identity 对未设信任的自签名证书会漏报(返回 0),所以这里直接试签、失败再回退。
+# 建证书(一次性):钥匙串访问 -> 证书助理 -> 创建证书 ->
+#   名称 "oh-my-tab-sign",身份类型「自签名根」,证书类型「代码签名」。
+# Sign: prefer the self-signed "oh-my-tab-sign" identity so the TCC identity stays stable across
+# rebuilds (Accessibility grants won't break when the CDHash changes); fall back to ad-hoc (grants
+# break on every rebuild - local debugging only) when the cert is absent or signing fails.
+# Note: `security find-identity` under-reports untrusted self-signed certs (returns 0), so we just
+# attempt to sign and fall back on failure.
+# Create the cert (one-time): Keychain Access > Certificate Assistant > Create a Certificate >
+#   name "oh-my-tab-sign", Identity Type "Self Signed Root", Certificate Type "Code Signing".
+SIGN_IDENTITY="oh-my-tab-sign"
+SIGN_ERR="$(mktemp)"
+if codesign --force --sign "$SIGN_IDENTITY" "$APP" 2>"$SIGN_ERR"; then
+  :
+else
+  echo "warning: signing with '$SIGN_IDENTITY' failed; falling back to ad-hoc (TCC grants won't persist):" >&2
+  sed 's/^/         /' "$SIGN_ERR" >&2
+  codesign --force --sign - "$APP"
+fi
+rm -f "$SIGN_ERR"
 
 # 打 DMG(hdiutil 自带,无额外依赖):staging 里放 .app + Applications 软链,挂载后拖拽安装。
 # Build DMG via hdiutil (no extra deps): staging holds .app + Applications symlink for drag-to-install.

@@ -54,6 +54,7 @@ struct SettingsUi {
     show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
     log_level: *mut AnyObject,      // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // NSButton (checkbox): 开机自启 / launch at login
+    accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
 }
 unsafe impl Send for SettingsUi {}
 unsafe impl Sync for SettingsUi {}
@@ -339,6 +340,8 @@ fn show_settings() {
             // 清掉默认 first responder,避免打开时光标落在 Glass color 文本框。
             // Clear the default first responder so the cursor doesn't land in the Glass color field on open.
             let _: bool = msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
+            // 按当前权限刷新警告条显隐(有权限就隐藏)/ refresh banner visibility by current permission
+            let _: () = msg_send![u.accessibility_warning_view, setHidden: has_accessibility_permission()];
         }
     }
 }
@@ -373,7 +376,7 @@ fn show_alert(title: &str, msg: &str) {
 
 /// 确认弹窗(两个按钮)。返回 true = 用户点了确认按钮。
 /// Confirm dialog (two buttons). Returns true if the user clicked the confirm button.
-fn confirm_alert(title: &str, msg: &str, confirm_label: &str, cancel_label: &str) -> bool {
+pub(crate) fn confirm_alert(title: &str, msg: &str, confirm_label: &str, cancel_label: &str) -> bool {
     unsafe {
         let alert: *mut AnyObject = msg_send![class!(NSAlert), new];
         let ns1 = make_nsstring(title);
@@ -602,11 +605,13 @@ fn create_settings_window() {
         let sidebar_w = 150.0;
         let style: u64 = (1 << 0) | (1 << 1); // titled + closable
                                               // 窗口加左侧侧边栏后:宽 420 -> 580(侧边栏 150 + 1pt 分隔 + 内容 429)。
-                                              // 内容拆成「通用 / 实验性」两页后,通用页(6 段 9 行)最高,高 748 -> 600 足够。
+                                              // 内容拆成「通用 / 实验性」两页后,通用页(6 段 9 行)最高,高 748 -> 600 足够;
+                                              // 通用页顶部预留 Accessibility 权限警告条,窗口再加 60 -> 660。
                                               // Window widened for the left sidebar: 420 -> 580 (sidebar 150 + 1pt divider + 429 content).
                                               // Content is now paged (General / Experimental); the General page (6 sections, 9 rows) is the
-                                              // tallest, so height 748 -> 600 is enough.
-        let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 600.0));
+                                              // tallest, so height 748 -> 600 is enough; +60 -> 660 to reserve room for the
+                                              // Accessibility permission warning banner at the top of the General page.
+        let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 660.0));
         let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
         let ns_title = make_nsstring(&t("settings.window_title"));
@@ -640,6 +645,7 @@ fn create_settings_window() {
             show_minimized: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
+            accessibility_warning_view: std::ptr::null_mut(),
         };
 
         // 内容区 x(侧边栏右、1pt 分隔线右)、宽 / content area x (right of sidebar + divider) and width
@@ -731,6 +737,65 @@ fn create_settings_window() {
 
         // ===== 通用页内容 general page content =====
         let mut y = content_h - 12.0; // 顶部光标:下一个元素的底边 y / top cursor (bottom y of next element)
+
+        // --- Accessibility 权限警告条(通用页顶部;仅缺权限时显示,show_settings 里按 setHidden 切换) ---
+        // --- Accessibility permission warning banner (top of General page; shown only when permission
+        //  is missing, toggled via setHidden in show_settings) ---
+        let banner_h = 48.0;
+        let banner: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let banner: *mut AnyObject = msg_send![
+            banner,
+            initWithFrame: NSRect::new(
+                NSPoint::new(0.0, y - banner_h),
+                NSSize::new(content_w, banner_h)
+            )
+        ];
+        let _: () = msg_send![general_view, addSubview: banner];
+        release_obj(banner);
+        ui.accessibility_warning_view = banner;
+
+        // 警告文字:多行换行,系统红色 / warning text: word-wrapped, system red
+        let warning_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let warning_label: *mut AnyObject = msg_send![
+            warning_label,
+            initWithFrame: NSRect::new(
+                NSPoint::new(12.0, 6.0),
+                NSSize::new(content_w - 160.0, banner_h - 12.0)
+            )
+        ];
+        let wl = make_nsstring(&t("settings.accessibility_warning"));
+        let _: () = msg_send![warning_label, setStringValue: wl];
+        CFRelease(wl as *const c_void);
+        let _: () = msg_send![warning_label, setEditable: false];
+        let _: () = msg_send![warning_label, setBezeled: false];
+        let _: () = msg_send![warning_label, setDrawsBackground: false];
+        let _: () = msg_send![warning_label, setUsesSingleLineMode: false];
+        let _: () = msg_send![warning_label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+        let red: *mut AnyObject = msg_send![class!(NSColor), systemRedColor];
+        let _: () = msg_send![warning_label, setTextColor: red];
+        let _: () = msg_send![banner, addSubview: warning_label];
+        release_obj(warning_label);
+
+        // 「打开隐私与安全性」按钮 / "Open Privacy & Security" button
+        let open_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+        let open_btn: *mut AnyObject = msg_send![
+            open_btn,
+            initWithFrame: NSRect::new(
+                NSPoint::new(content_w - 150.0, (banner_h - 28.0) / 2.0),
+                NSSize::new(140.0, 28.0)
+            )
+        ];
+        set_control_title(open_btn, &t("settings.btn_open_privacy"));
+        let _: () = msg_send![open_btn, setBezelStyle: 1isize];
+        let _: () = msg_send![open_btn, setTarget: target];
+        let _: () = msg_send![open_btn, setAction: sel!(handleOpenPrivacy:)];
+        let _: () = msg_send![banner, addSubview: open_btn];
+        release_obj(open_btn);
+
+        // 默认按当前权限显隐(有权限就隐藏)/ initial visibility: hidden when permission is already granted
+        let _: () = msg_send![banner, setHidden: has_accessibility_permission()];
+
+        y -= banner_h + 12.0;
 
         // --- 外观 Appearance ---
         y -= 24.0;

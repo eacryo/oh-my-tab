@@ -560,6 +560,12 @@ fn setup_status_bar() {
                 handle_restore_defaults as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(handleOpenPrivacy:),
+                handle_open_privacy as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };
@@ -657,6 +663,52 @@ fn setup_status_bar() {
 }
 
 // ========== Main ==========
+
+/// 打开「系统设置 -> 隐私与安全性 -> 辅助功能」面板(深链)。
+/// 供启动告警框与设置里的警告条按钮共用。
+/// Open System Settings -> Privacy & Security -> Accessibility (deep link).
+/// Shared by the startup alert and the settings warning banner's button.
+pub(crate) fn open_privacy_accessibility() {
+    unsafe {
+        let url_str = make_nsstring(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        );
+        let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_str];
+        CFRelease(url_str as *const c_void);
+        if !url.is_null() {
+            let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let _: bool = msg_send![ws, openURL: url];
+        }
+    }
+}
+
+/// 启动时若缺 Accessibility 权限,弹自定义告警框引导用户去授权。
+/// 事件监听线程已在后台有限次重试,用户授权后 tap 会自动建成,无需重启。
+/// Prompts the user with a custom alert at launch if Accessibility permission is missing.
+/// The event-monitor thread is already retrying in the background; once the user grants
+/// permission the tap is created automatically - no restart needed.
+fn prompt_accessibility_if_needed() {
+    if has_accessibility_permission() {
+        return;
+    }
+    // AppState::new 已记过 "No accessibility permission." 日志,这里只负责弹框,不重复记。
+    // AppState::new already logged "No accessibility permission."; this only shows the alert.
+    // 辅助应用无 Dock 图标,主动激活以免告警框被其它窗口遮挡。
+    // Accessory apps have no Dock icon; activate so the alert isn't hidden behind other windows.
+    unsafe {
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
+    }
+    let open = confirm_alert(
+        &t("alert.accessibility_title"),
+        &t("alert.accessibility_msg"),
+        &t("alert.accessibility_open"),
+        &t("alert.accessibility_later"),
+    );
+    if open {
+        open_privacy_accessibility();
+    }
+}
 
 fn main() {
     // 1. Init NSApplication as accessory (no dock icon)
@@ -823,6 +875,9 @@ fn main() {
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![nsapp, finishLaunching];
+        // 启动后若缺 Accessibility 权限,弹告警框引导授权(事件监听线程已在后台有限次重试)。
+        // Prompt for Accessibility if missing (the event-monitor thread is already retrying in the background).
+        prompt_accessibility_if_needed();
         let _: () = msg_send![nsapp, run];
     }
 }

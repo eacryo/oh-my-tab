@@ -46,6 +46,8 @@ experimental_note = "实验性选项，不保证可用性，后续版本可能�
 btn_cancel = "取消"
 btn_ok = "确认"
 btn_restore_defaults = "恢复默认设置"
+accessibility_warning = "未获得辅助功能权限，快捷键将无法使用。请在「隐私与安全性 -> 辅助功能」中为 Oh My Tab 开启。"
+btn_open_privacy = "打开隐私与安全性…"
 
 [alert]
 config_error_title = "配置有误"
@@ -55,6 +57,10 @@ restore_title = "恢复默认设置？"
 restore_msg = "将把所有设置重置为默认值，当前配置会被覆盖。"
 btn_restore = "恢复"
 btn_cancel = "取消"
+accessibility_title = "需要辅助功能权限"
+accessibility_msg = "Oh My Tab 需要辅助功能权限来拦截全局快捷键并枚举窗口。请在「隐私与安全性 -> 辅助功能」中为 Oh My Tab 开启，开启后快捷键会自动生效。"
+accessibility_open = "打开隐私与安全性"
+accessibility_later = "以后再说"
 
 [errors]
 not_a_number = "{field}: 不是数字"
