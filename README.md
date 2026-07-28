@@ -99,7 +99,7 @@ tccutil reset Accessibility com.eacryo.oh-my-tab
 sh scripts/release.sh        # bundle.sh -> dist/Oh-My-Tab.dmg + dist/oh-my-tab.rb
 ```
 
-The cask pins `depends_on macos: ">= :ventura"` + `depends_on arch: :arm64`, so it installs only on macOS 13+ Apple Silicon -- the same restriction noted under [Install via Homebrew](#install-via-homebrew). Its `url` points at `https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg`, so the dmg must be published to a GitHub release tagged `v<version>` (matching the `Cargo.toml` version).
+The cask pins `depends_on macos: :ventura` + `depends_on arch: :arm64`, so it installs only on macOS 13+ Apple Silicon -- the same restriction noted under [Install via Homebrew](#install-via-homebrew). Its `url` points at `https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg`, so the dmg must be published to a GitHub release tagged `v<version>` (matching the `Cargo.toml` version).
 
 To publish a new version:
 

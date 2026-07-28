@@ -99,7 +99,7 @@ tccutil reset Accessibility com.eacryo.oh-my-tab
 sh scripts/release.sh        # bundle.sh -> dist/Oh-My-Tab.dmg + dist/oh-my-tab.rb
 ```
 
-cask 里硬编码了 `depends_on macos: ">= :ventura"` + `depends_on arch: :arm64`,所以只能在 macOS 13+ 的 Apple Silicon 上安装 -- 与上方[通过 Homebrew 安装](#通过-homebrew-安装)的限制一致。它的 `url` 指向 `https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg`,因此 dmg 必须传到一个 tag 为 `v<version>` 的 GitHub release(与 `Cargo.toml` 的 version 一致)。
+cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,所以只能在 macOS 13+ 的 Apple Silicon 上安装 -- 与上方[通过 Homebrew 安装](#通过-homebrew-安装)的限制一致。它的 `url` 指向 `https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg`,因此 dmg 必须传到一个 tag 为 `v<version>` 的 GitHub release(与 `Cargo.toml` 的 version 一致)。
 
 发布新版本流程:
 
