@@ -266,18 +266,43 @@ fn create_overlay_window() -> *mut AnyObject {
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
         let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
 
-        // Use standard NSWindow with hidden title bar (avoids dynamic-subclass
-        // msg_send! issues). NSTitledWindowMask allows the window to become key
-        // without needing a custom subclass with canBecomeKeyWindow override.
-        // NSTitledWindowMask = 1 << 0, NSFullSizeContentViewWindowMask = 1 << 15
-        let style: u64 = 1 | (1 << 15);
+        // Borderless 窗口(styleMask = 0):无标题栏 -> 窗口可见形状 = 玻璃的圆角 alpha,
+        // 消除"圆角玻璃 + 方角窗口"在四角留下的透明突出,且四角对称。
+        // borderless 默认不能成为 key 窗口(收不到键盘),所以用自定义 NSWindow 子类
+        // 重写 canBecomeKeyWindow -> YES。原先用 titled + 透明标题栏绕开此子类,代价就是
+        // 四角不对称的透明突出(Regular 下尤为明显)。
+        //
+        // Borderless window (styleMask = 0): no title bar -> the window's visible shape equals
+        // the glass's rounded alpha, eliminating the transparent protrusions left at the corners by
+        // a rounded glass inside a square window, and keeping all four corners symmetric. A borderless
+        // window can't become key by default (no keyboard input), so a custom NSWindow subclass
+        // overrides canBecomeKeyWindow -> YES. The earlier titled + transparent-titlebar approach
+        // avoided this subclass at the cost of those asymmetric transparent corners (especially
+        // visible under the Regular glass style).
+        let style: u64 = 0; // NSWindowStyleMaskBorderless
 
-        let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+        // 注册自定义窗口子类 OhMyTabOverlayWindow : NSWindow(仅重写 canBecomeKeyWindow)。
+        // 仿 OhMyTabContainerView 的 inline 注册;create_overlay_window 只调用一次,无重复注册风险。
+        // Register the custom window subclass OhMyTabOverlayWindow : NSWindow (only overrides
+        // canBecomeKeyWindow). Inline, like OhMyTabContainerView; create_overlay_window is called
+        // once, so no double-registration.
+        let window_cls = {
+            let name = CString::new("OhMyTabOverlayWindow").unwrap();
+            let superclass = class!(NSWindow) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types_bool = CString::new("B@:").unwrap();
+            class_addMethod(
+                cls,
+                sel!(canBecomeKeyWindow),
+                overlay_window_can_become_key as *mut c_void,
+                types_bool.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            cls
+        };
+
+        let window: *mut AnyObject = msg_send![window_cls, alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
-
-        // Hide the title bar completely
-        let _: () = msg_send![window, setTitlebarAppearsTransparent: true];
-        let _: () = msg_send![window, setTitleVisibility: 1u64]; // NSWindowTitleHidden = 1
 
         // NSFloatingWindowLevel = 3 (should be above normal windows during app switch)
         let _: () = msg_send![window, setLevel: 3u64];
@@ -293,9 +318,19 @@ fn create_overlay_window() -> *mut AnyObject {
         let clear_color: *mut AnyObject = msg_send![class!(NSColor), clearColor];
         let _: () = msg_send![window, setBackgroundColor: clear_color];
         //
-        // (3) Window shadow — setting hasShadow true with a non-opaque
-        //     window gives the floating glass look.
-        let _: () = msg_send![window, setHasShadow: true];
+        // (3) 关闭窗口阴影:NSGlassEffectView 自带 Liquid Glass 深度,窗口阴影是多余的。
+        //     其强度随内容 alpha 变化(Regular 玻璃不透明 -> 强阴影圈;Clear 近透明 -> 无),
+        //     会在 Regular 下沿玻璃边缘形成一圈多余暗环;且投影向下偏移,底角与顶角不一致
+        //     (这正是 borderless 后"边上还有一圈、底角形状不同"的来源)。关掉后只留玻璃自身
+        //     深度,边缘干净、四角一致。
+        // (3) Disable the window shadow: NSGlassEffectView already provides Liquid Glass depth, so
+        //     the window shadow is redundant. Its strength scales with content alpha (Regular's
+        //     opaque glass -> a strong shadow ring; Clear's near-transparent glass -> none), which
+        //     shows up under Regular as an unwanted dark ring along the glass edge; the drop shadow
+        //     is also offset downward, so the bottom corners differ from the top (this is the "ring
+        //     still on the edge, bottom corners shaped differently" seen after going borderless).
+        //     With it off, only the glass's own depth remains -- clean edges, symmetric corners.
+        let _: () = msg_send![window, setHasShadow: false];
         // =================================================================
 
         let _: () = msg_send![window, setReleasedWhenClosed: false];
@@ -333,11 +368,29 @@ fn create_overlay_window() -> *mut AnyObject {
             // (7) Autoresizing so the glass view fills the window on resize.
             let _: () = msg_send![glass, setAutoresizingMask: 18u64];
             let _: () = msg_send![window, setContentView: glass];
-            // NSGlassEffectView.contentView may be nil initially — create our own.
+            // NSGlassEffectView.contentView may be nil initially - create our own.
             let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
             let inner: *mut AnyObject = msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
             let _: () = msg_send![inner, setAutoresizingMask: 18u64];
             let _: () = msg_send![glass, setContentView: inner];
+            // (6.5) 硬裁剪背景模糊:NSGlassEffectView 的 cornerRadius 属性只圆了着色/外观,背景模糊
+            //       仍填满方角。给 layer 设 masksToBounds + cornerRadius 把模糊也裁进圆角(对
+            //       NSVisualEffectView 是公认有效的做法,NSGlassEffectView 待验证)。
+            //       放在 setContentView 之后 + 显式 setWantsLayer,确保 layer 已落实(非 nil),
+            //       masksToBounds 真正生效;并打日志确认。
+            // (6.5) Hard-clip the backdrop blur: NSGlassEffectView's cornerRadius property only rounds
+            //       the tint/appearance, not the backdrop blur. Setting masksToBounds + cornerRadius on
+            //       the layer clips the blur into the round (the standard trick for NSVisualEffectView;
+            //       unverified for NSGlassEffectView). Done after setContentView + an explicit
+            //       setWantsLayer so the layer is realized (non-nil) and masksToBounds actually takes
+            //       effect; logged to confirm.
+            let radius = CONFIG.read().unwrap().appearance.corner_radius;
+            let _: () = msg_send![glass, setWantsLayer: true];
+            let glass_layer: *mut AnyObject = msg_send![glass, layer];
+            if !glass_layer.is_null() {
+                let _: () = msg_send![glass_layer, setCornerRadius: radius];
+                let _: () = msg_send![glass_layer, setMasksToBounds: true];
+            }
             content_parent = inner;
         } else {
             let content: *mut AnyObject = msg_send![window, contentView];

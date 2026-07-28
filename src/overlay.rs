@@ -317,6 +317,13 @@ pub(crate) extern "C" fn container_accepts_first_responder(_self: *mut c_void, _
     true
 }
 
+/// borderless 浮窗重写:允许成为 key 窗口(否则收不到键盘事件)。
+/// Override for the borderless overlay window: allow it to become key (otherwise it
+/// receives no keyboard events).
+pub(crate) extern "C" fn overlay_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> bool {
+    true
+}
+
 pub(crate) extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
     MOUSE_MOVED.store(true, Ordering::Relaxed);
 }
@@ -569,6 +576,15 @@ pub(crate) unsafe fn apply_glass_properties() {
     }
     let cfg = CONFIG.read().unwrap();
     let _: () = msg_send![glass, setCornerRadius: cfg.appearance.corner_radius];
+    // 同步 layer 的硬裁剪:cornerRadius 只圆着色不圆模糊,需 masksToBounds 把模糊也裁进圆角
+    // (见 create_overlay_window 的 (6.5) 注释)。
+    // Mirror the layer hard-clip: cornerRadius rounds the tint but not the blur, so masksToBounds
+    // is needed to clip the blur into the rounded shape (see (6.5) in create_overlay_window).
+    let glass_layer: *mut AnyObject = msg_send![glass, layer];
+    if !glass_layer.is_null() {
+        let _: () = msg_send![glass_layer, setCornerRadius: cfg.appearance.corner_radius];
+        let _: () = msg_send![glass_layer, setMasksToBounds: true];
+    }
     let style: i64 = match cfg.appearance.glass_style.as_str() {
         "clear" => 1,
         _ => 0, // regular
