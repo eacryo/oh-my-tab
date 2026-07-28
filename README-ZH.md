@@ -129,7 +129,7 @@ cask 里硬编码了 `depends_on macos: ">= :ventura"` + `depends_on arch: :arm6
 - 应用需要 **辅助功能** 权限(`AXIsProcessTrusted`),全局按键事件 tap 和 AX 窗口查询都依赖它。在 *系统设置 -> 隐私与安全性 -> 辅助功能* 中授予。重新编译出的二进制需要重新授权 -- 除非用稳定身份签名(见[代码签名](#代码签名)),此时授权跨 rebuild 持续有效。
 - 如果事件 tap 创建失败,应用会打印一条错误,快捷键静默失效 -- 几乎总是辅助功能权限没给。
 - 运行时配置:`~/.config/oh-my-tab/config.toml`(首次运行自动按默认值创建)。
-- 图标缓存:`~/Library/Caches/oh-my-tab-icons/{pid}.png`。
+- 图标缓存:`~/Library/Caches/oh-my-tab-icons/{bundle-id}.png`(按应用 bundle id 索引,配 `.meta` mtime sidecar)。
 
 ## 架构
 
@@ -258,7 +258,16 @@ launch_at_login = false  # 开机自启(需以 .app 方式运行;macOS 13+)
 
 ## 图标缓存
 
-`~/Library/Caches/oh-my-tab-icons/{pid}.png` -- 按 **PID** 索引,"文件存在即有效"(无 TTL):App 更新必然以新 PID 重启,从而强制重新提取。启动时预缓存,并在 `NSWorkspaceDidLaunchApplicationNotification` 时补提取。可从菜单(*Clear Icon Cache*)清空。
+`~/Library/Caches/oh-my-tab-icons/` -- 按**应用 bundle id**(如 `com.microsoft.edgemac`)索引,不再按 PID。每个 App 存成一对文件:
+
+- `{bundle-id}.png`:渲染好的图标图片,浮窗卡片直接读取显示。
+- `{bundle-id}.meta`:一个很小的文本文件,存该 App 可执行文件的修改时间(mtime,自 1970 年起的秒数)。
+
+`.meta` sidecar 是**更新信号**。bundle id 在 App 更新前后不变,所以靠 mtime 来判断 App 是否被更新或重装:命中缓存时把存的 mtime 和当前可执行文件的 mtime 比一下,对不上就让 `.png` 失效、重新提取。没有它的话,App 在更新里换了图标也会一直显示旧的,直到手动清缓存。
+
+按 bundle id 索引意味着 **PID 复用永远不会读到别的 App 的旧图标** -- 旧的 `{pid}.png` 设计正好会出这个问题:复用的 PID 会命中别的 App 残留的文件。同时缓存也能跨 oh-my-tab 重启复用。非 bundle 应用(无 bundle id)回退到可执行文件路径的哈希作键;旧版的 `{pid}.png` 文件会在启动时被一次性清理掉。
+
+启动时预缓存,并在 `NSWorkspaceDidLaunchApplicationNotification` 时补提取。可从菜单(*Clear Icon Cache*)清空。
 
 
 ## 仓库

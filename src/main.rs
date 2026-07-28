@@ -37,7 +37,7 @@ use std::thread;
 use event_monitor::{start as start_event_monitor, GlobalEvent};
 use window_collector::{
     bump_window_mru, cache_running_app_icons, ensure_icon_cache_dir, extract_icon_to_cache,
-    focused_window_cgwid, note_app_activated, MruMap, WindowInfo,
+    focused_window_cgwid, migrate_legacy_cache, note_app_activated, MruMap, WindowInfo,
 };
 
 // FFI 声明与 ObjC 桥接基础工具已移至 `ffi.rs` / FFI declarations and ObjC bridging primitives moved to `ffi.rs`
@@ -793,6 +793,10 @@ fn main() {
 
     // 4. Initialize state
     ensure_icon_cache_dir();
+    // 一次性清理旧版按 PID 命名的缓存文件(纯数字 stem 的 .png),它们对新版无用、只会占地方。
+    // One-shot cleanup of legacy PID-named cache files (purely-numeric-stem .png); useless to
+    // the new version and just take up space.
+    migrate_legacy_cache();
     cache_running_app_icons(); // pre-warm icon cache for all running apps
 
     // 4b. Force CONFIG to initialise and report any validation errors

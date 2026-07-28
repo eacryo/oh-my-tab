@@ -220,12 +220,12 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
     update_status_label();
 }
 
-/// 清空图标缓存:删除缓存目录里所有 {pid}.png,失效内存里的 icon_path,
+/// 清空图标缓存:删除缓存目录里所有缓存文件({key}.png + {key}.meta),失效内存里的 icon_path,
 /// 并立即重新提取当前窗口的图标(浮窗可见时 rebuild_cards 会就地刷新卡片)。
 ///
-/// Clear the icon cache: remove all {pid}.png from the cache dir, invalidate in-memory
-/// icon_path, and re-extract icons for current windows immediately (rebuild_cards refreshes
-/// the cards in place if the overlay is visible).
+/// Clear the icon cache: remove all cached files ({key}.png + {key}.meta) from the cache dir,
+/// invalidate in-memory icon_path, and re-extract icons for current windows immediately
+/// (rebuild_cards refreshes the cards in place if the overlay is visible).
 pub(crate) extern "C" fn handle_clear_icon_cache(
     _self: *mut c_void,
     _cmd: Sel,

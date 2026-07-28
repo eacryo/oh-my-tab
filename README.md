@@ -129,7 +129,7 @@ Requires `swift` (Xcode or the Swift toolchain) and `iconutil` (Xcode CLT). `qlm
 - The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary must be re-granted -- unless you sign with a stable identity (see [Code signing](#code-signing)), in which case the grant persists across rebuilds.
 - If the event tap fails to create, the app prints an error and the shortcut silently does nothing — almost always a missing Accessibility grant.
 - Runtime config: `~/.config/oh-my-tab/config.toml` (auto-created with defaults on first run).
-- Icon cache: `~/Library/Caches/oh-my-tab-icons/{pid}.png`.
+- Icon cache: `~/Library/Caches/oh-my-tab-icons/{bundle-id}.png` (keyed by bundle id, with a `.meta` mtime sidecar).
 
 ## Architecture
 
@@ -258,7 +258,16 @@ The app deliberately **never writes extra files into, and never deletes any file
 
 ## Icon cache
 
-`~/Library/Caches/oh-my-tab-icons/{pid}.png` — keyed by **PID** and "file exists = valid" (no TTL): an app update always relaunches with a new PID, which forces a re-extract. Icons are pre-cached at startup and on `NSWorkspaceDidLaunchApplicationNotification`. The cache can be cleared from the menu (*Clear Icon Cache*).
+`~/Library/Caches/oh-my-tab-icons/` — keyed by the app's **bundle identifier** (e.g. `com.microsoft.edgemac`), not by PID. Each app is stored as a pair of files:
+
+- `{bundle-id}.png`: the rendered icon image, read directly by the overlay cards.
+- `{bundle-id}.meta`: a tiny text file holding the app executable's modification time (mtime, seconds since the UNIX epoch).
+
+The `.meta` sidecar is the **update signal**. A bundle id stays the same across app updates, so the mtime is what tells us the app was updated or reinstalled: on a cache hit the stored mtime is compared against the executable's current mtime, and a mismatch invalidates the `.png` and forces a re-extract. Without it, an app that changed its icon in an update would keep showing the old one until the cache was cleared manually.
+
+Keying by bundle id means **PID recycling can never serve another app's stale icon** — the old `{pid}.png` design did exactly that, where a recycled PID would hit a leftover file from a different app. It also means the cache survives oh-my-tab restarts. Non-bundle apps (no bundle id) fall back to a hash of the executable path as the key, and legacy `{pid}.png` files from older versions are migrated away once at startup.
+
+Icons are pre-cached at startup and on `NSWorkspaceDidLaunchApplicationNotification`. The cache can be cleared from the menu (*Clear Icon Cache*).
 
 ## Repository
 

@@ -314,14 +314,150 @@ fn cf_dict_get_bool(dict: *const c_void, key: &str) -> Option<bool> {
     Some(unsafe { CFBooleanGetValue(value) })
 }
 
+/// 一个运行中 App 的缓存身份:`key` 用作缓存文件名,`fingerprint` 用于检测 App 更新。
+/// A running app's cache identity: `key` is the cache filename, `fingerprint` detects updates.
+struct AppIdentity {
+    key: String,
+    /// 可执行文件 mtime(自 UNIX epoch 的秒数)。None 表示无法校验,退化为「文件存在即有效」。
+    /// Executable mtime (seconds since UNIX epoch). None means unverified -> "file exists = valid".
+    fingerprint: Option<String>,
+}
+
+/// 读一个 NSString 到 Rust String(nil -> None)。对象是 autoreleased,调用方需在池内。
+/// Read an NSString into a Rust String (nil -> None). The object is autoreleased; caller must be in a pool.
+unsafe fn read_nsstring(obj: *mut AnyObject) -> Option<String> {
+    if obj.is_null() {
+        return None;
+    }
+    let utf8: *const c_char = msg_send![obj, UTF8String];
+    if utf8.is_null() {
+        return None;
+    }
+    Some(CStr::from_ptr(utf8).to_string_lossy().into_owned())
+}
+
+/// FNV-1a 64-bit -> 十六进制。给非 bundle 应用的可执行文件路径做确定性短键,
+/// 避免路径里的 `/` 撞文件名空间。
+/// FNV-1a 64-bit -> hex. Gives non-bundle apps a deterministic short key from their
+/// exec path, avoiding the `/` in paths colliding with the filename namespace.
+fn fnv1a_hex(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in s.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", h)
+}
+
+/// 解析一个 PID 对应 App 的缓存身份。
+/// 键优先级:bundleIdentifier(reverse-DNS,文件名安全)> 可执行文件路径哈希 > `pid_{pid}` 兜底。
+/// 指纹取可执行文件 mtime;App 更新会换新 mtime -> 触发重提。
+///
+/// Resolve a PID's cache identity. Key priority: bundleIdentifier (reverse-DNS,
+/// filename-safe) > hashed executable path > `pid_{pid}` fallback. Fingerprint is the
+/// executable mtime; an app update gets a new mtime -> forces re-extract.
+unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
+    let app: *mut AnyObject =
+        msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+    if app.is_null() {
+        // PID 已失效(App 刚退出)-> 回退到 pid 键,无指纹(无法校验)。
+        // PID stale (app just quit) -> fall back to pid key, no fingerprint (can't verify).
+        return AppIdentity {
+            key: format!("pid_{}", pid),
+            fingerprint: None,
+        };
+    }
+
+    let bid_obj: *mut AnyObject = msg_send![app, bundleIdentifier];
+    let bundle_id = read_nsstring(bid_obj);
+
+    let exec_url: *mut AnyObject = msg_send![app, executableURL];
+    let exec_path = if exec_url.is_null() {
+        None
+    } else {
+        let path_obj: *mut AnyObject = msg_send![exec_url, path];
+        read_nsstring(path_obj)
+    };
+
+    // 指纹 = 可执行文件 mtime(秒)。取不到(路径为空 / stat 失败)-> None,退化为不校验。
+    // Fingerprint = exec mtime (seconds). Unavailable (empty path / stat fail) -> None, no verification.
+    let fingerprint = exec_path.as_ref().and_then(|p| {
+        std::fs::metadata(p)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().to_string())
+    });
+
+    let key = if let Some(bid) = bundle_id {
+        bid
+    } else if let Some(p) = exec_path {
+        format!("exec_{}", fnv1a_hex(&p))
+    } else {
+        format!("pid_{}", pid)
+    };
+
+    AppIdentity { key, fingerprint }
+}
+
+fn cache_path_for_key(key: &str) -> String {
+    format!("{}/{}.png", icon_cache_dir(), key)
+}
+
+fn meta_path_for_key(key: &str) -> String {
+    format!("{}/{}.meta", icon_cache_dir(), key)
+}
+
+/// 校验缓存是否有效:PNG 存在,且(若有指纹)sidecar 指纹与当前一致。
+/// App 更新会换 mtime -> 指纹不符 -> 返回 None,触发重提。
+///
+/// Validate the cache: PNG exists, and (when a fingerprint is present) the sidecar
+/// matches. An app update changes the mtime -> fingerprint mismatch -> None -> re-extract.
+fn check_cache_for_identity(id: &AppIdentity) -> Option<String> {
+    let png = cache_path_for_key(&id.key);
+    if std::fs::metadata(&png).is_err() {
+        return None;
+    }
+    match &id.fingerprint {
+        Some(fp) => match std::fs::read_to_string(meta_path_for_key(&id.key)) {
+            Ok(stored) if stored.trim() == *fp => Some(png),
+            _ => None,
+        },
+        None => Some(png), // 无指纹(极端兜底)-> 文件存在即有效 / no fingerprint -> file exists = valid
+    }
+}
+
 pub fn ensure_icon_cache_dir() {
     let _ = std::fs::create_dir_all(icon_cache_dir());
 }
 
-/// 清空图标缓存目录(删除所有 {pid}.png),然后重建空目录。
+/// 一次性迁移:删除旧版按 PID 命名的缓存文件(文件名 stem 纯数字)。
+/// 新版键为 bundle id(含字母/点)或 `exec_`/`pid_` 前缀,绝不会是纯数字,故不会误删。
+/// One-shot migration: remove legacy PID-named cache files (purely-numeric filename stem).
+/// New keys are bundle ids (letters/dots) or `exec_`/`pid_`-prefixed, never purely numeric,
+/// so nothing legitimate is touched.
+pub fn migrate_legacy_cache() {
+    let Ok(entries) = std::fs::read_dir(icon_cache_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // 只删 .png 且 stem 纯数字的旧 PID 文件。
+        // Only remove .png files whose stem is purely numeric (legacy PID files).
+        if path.extension().and_then(|e| e.to_str()) == Some("png") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+}
+
+/// 清空图标缓存目录(删除所有 {key}.png + {key}.meta),然后重建空目录。
 /// 内存里 WindowInfo.icon_path 不会自动失效,调用方需自行将其置 None 并触发重提取。
 ///
-/// Clear the icon cache directory (remove all {pid}.png), then recreate it empty.
+/// Clear the icon cache directory (remove all {key}.png + {key}.meta), then recreate it empty.
 /// In-memory WindowInfo.icon_path is NOT invalidated here; the caller must reset it to None
 /// and trigger re-extraction.
 pub fn clear_icon_cache() {
@@ -331,21 +467,25 @@ pub fn clear_icon_cache() {
     ensure_icon_cache_dir();
 }
 
-/// 图标缓存「文件存在即有效」，不设过期时间。
-/// 缓存按 PID 索引：App 更新必然重启 -> 新 PID -> 自动重新提取，因此无需靠 TTL
-/// 刷新；运行时改图标的 App（日历日期 / Dock 角标）会冻结到该 App 重启。
-/// Icon cache is valid as long as the file exists - no expiry. The cache is keyed
-/// by PID: an app update always relaunches with a new PID, which forces a
-/// re-extract, so no TTL is needed. Apps that change their icon at runtime
-/// (Calendar date, dock badge) stay frozen until that app is restarted.
+/// 图标缓存按应用 bundle id 索引(非 bundle 应用回退到可执行文件路径),不再按 PID:
+/// PID 复用不会再读到别的 App 的旧图标。每个条目配一个 `.meta` sidecar 存可执行文件
+/// mtime,App 更新/重装会换 mtime -> 校验不符 -> 重新提取,因此无需 TTL。运行时改图标
+/// 的 App(日历日期 / Dock 角标)仍会冻结到下次清缓存--这是已接受的次要限制。
+///
+/// The icon cache is keyed by the app's bundle id (falling back to the executable path for
+/// non-bundle apps), NOT by PID: PID recycling can never serve another app's stale icon. Each
+/// entry has a `.meta` sidecar storing the executable mtime; an app update/reinstall changes
+/// the mtime -> verification fails -> re-extract, so no TTL is needed. Apps that change their
+/// icon at runtime (Calendar date, dock badge) still freeze until the cache is cleared - an
+/// accepted minor limitation.
 pub fn check_icon_cache(pid: i32) -> Option<String> {
-    let path = format!("{}/{}.png", icon_cache_dir(), pid);
-    std::fs::metadata(&path).ok().map(|_| path)
+    let id = unsafe { resolve_app_identity(pid) };
+    check_cache_for_identity(&id)
 }
 
-fn write_png_to_cache(png: *mut AnyObject, pid: i32) -> Option<String> {
+fn write_png_to_cache(png: *mut AnyObject, key: &str) -> Option<String> {
     unsafe {
-        let path = format!("{}/{}.png", icon_cache_dir(), pid);
+        let path = cache_path_for_key(key);
         let path_cstr = std::ffi::CString::new(&*path).unwrap();
         let cf_path = CFStringCreateWithCString(std::ptr::null(), path_cstr.as_ptr(), 0x08000100);
         // 原子写入：先写临时文件再重命名，避免写一半崩溃留下半截 PNG。
@@ -362,9 +502,6 @@ fn write_png_to_cache(png: *mut AnyObject, pid: i32) -> Option<String> {
 }
 
 pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
-    if let Some(path) = check_icon_cache(pid) {
-        return Some(path);
-    }
     unsafe {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -374,6 +511,14 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
         // Wrap in an autorelease pool: app/icon/tiff/rep/png are autoreleased (+0). At startup
         // this runs before NSApp run (no pool yet), so they'd all leak - the ~40MB startup cause.
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+
+        let id = resolve_app_identity(pid);
+        // 命中既有且有效的缓存(含 mtime 校验)-> 跳过提取。
+        // Hit an existing valid cache (mtime-verified) -> skip extraction.
+        if let Some(path) = check_cache_for_identity(&id) {
+            let _: () = msg_send![pool, drain];
+            return Some(path);
+        }
 
         let cls = class!(NSRunningApplication);
         let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
@@ -433,7 +578,16 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
             return None;
         }
 
-        let result = write_png_to_cache(png, pid);
+        let result = write_png_to_cache(png, &id.key);
+        // 写 mtime sidecar:下次命中时据此判断 App 是否更新过(mtime 变 -> 重提)。
+        // 仅在 PNG 写成功时写,避免留下无 PNG 的孤儿 meta。
+        // Write the mtime sidecar: next hit checks it to detect app updates (mtime change ->
+        // re-extract). Only written when the PNG succeeds, so no orphan meta is left behind.
+        if result.is_some() {
+            if let Some(fp) = &id.fingerprint {
+                let _ = std::fs::write(meta_path_for_key(&id.key), fp);
+            }
+        }
         let _: () = msg_send![pool, drain];
         result
     }
@@ -670,7 +824,14 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // custom title bar and an empty AXTitle). Their titleless windows are real
     // main windows and must not be dropped as popups.
     let mut titleless_pids: HashSet<i32> = HashSet::new();
+    // pid -> 缓存身份(bundle id + mtime)。在此 AX 循环里按 pid 解析一次,供第二遍按窗口查缓存,
+    // 避免每个窗口都做一次 NSRunningApplication 查找(一个 App 多窗口时尤其浪费)。
+    // pid -> cache identity (bundle id + mtime). Resolved once per pid in this AX loop so the
+    // second pass can look up the cache per-window without an NSRunningApplication call each time
+    // (wasteful when one app has many windows).
+    let mut icon_ids: HashMap<i32, AppIdentity> = HashMap::new();
     for &pid in &pids {
+        icon_ids.insert(pid, unsafe { resolve_app_identity(pid) });
         let ax_wins = get_ax_windows_for_pid(pid);
         if !ax_wins.is_empty() {
             if ax_wins.iter().all(|(_, t, _)| t.is_empty()) {
@@ -767,7 +928,9 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         // lifetime, more reliable than title (which changes with browser tabs).
         mru.entry((owner_pid, cgwid)).or_insert(ordered_ts);
         insertion_order += 1;
-        let icon_path = check_icon_cache(owner_pid);
+        let icon_path = icon_ids
+            .get(&owner_pid)
+            .and_then(check_cache_for_identity);
         windows.push(WindowInfo {
             pid: owner_pid,
             window_id: cgwid,
