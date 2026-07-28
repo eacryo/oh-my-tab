@@ -30,6 +30,14 @@ const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
 const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = 0x00100000;
 const K_CG_EVENT_FLAG_MASK_ALTERNATE: CGEventFlags = 0x00080000;
 const K_VK_TAB: u16 = 48;
+// kCGSessionEventTap = 1:tap 建在 session 层(而非 HID 层 kCGHIDEventTap=0)。session 层既能看到
+// 真实硬件事件(它们从 HID 往上流过来),也能看到鼠标映射软件在 session 层合成的 Cmd+Tab--
+// HID 层 tap 看不到 session 层注入的合成事件,会导致侧键映射的 Cmd+Tab 漏过、只触发原生切换器。
+// kCGSessionEventTap = 1: tap at the session level (not HID level kCGHIDEventTap=0). The session level
+// sees real hardware events (which flow up from HID) AND synthetic Cmd+Tab posted at the session level
+// by mouse-remapper software - a HID-level tap can't see session-posted synthetic events, so a
+// side-button-mapped Cmd+Tab would slip past it and only trigger the native switcher.
+const K_C_G_SESSION_EVENT_TAP: i32 = 1;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -135,7 +143,7 @@ pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
 
         let mask: CGEventMask = (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
 
-        let mut tap = CGEventTapCreate(0, 0, 0, mask, Some(event_tap_callback), sender_ptr);
+        let mut tap = CGEventTapCreate(K_C_G_SESSION_EVENT_TAP, 0, 0, mask, Some(event_tap_callback), sender_ptr);
 
         // 首次创建失败(通常是缺 Accessibility 权限):有限次重试,给用户时间去系统设置授权。
         // First creation failed (usually missing Accessibility): retry a bounded number of times
@@ -151,7 +159,7 @@ pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
             for _ in 0..RETRY_MAX {
                 std::thread::sleep(RETRY_INTERVAL);
                 if has_accessibility_permission() {
-                    tap = CGEventTapCreate(0, 0, 0, mask, Some(event_tap_callback), sender_ptr);
+                    tap = CGEventTapCreate(K_C_G_SESSION_EVENT_TAP, 0, 0, mask, Some(event_tap_callback), sender_ptr);
                     if !tap.is_null() {
                         granted = true;
                         break;
