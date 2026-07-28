@@ -414,17 +414,23 @@ pub(crate) extern "C" fn handle_restore_defaults(
     ) {
         return;
     }
-    // 把代码里的默认值(Config::default)序列化写回 config.toml,覆盖用户配置。
-    // Write code defaults (Config::default) to config.toml, overwriting the user's config.
-    if let Err(e) = Config::default().save() {
+    // 把代码里的默认值写回 config.toml,但保留 launch_at_login--它是系统级登录项开关,
+    // 不属于外观/布局/快捷键这类设置,不该被恢复默认重置(否则会注销用户已勾选的登录项)。
+    // Write code defaults to config.toml, but preserve launch_at_login -- it's a system-level
+    // login-item toggle, not an appearance/layout/shortcut setting, so Restore Defaults must not
+    // reset it (otherwise it unregisters a login item the user explicitly enabled).
+    let preserved_launch_at_login = CONFIG.read().unwrap().startup.launch_at_login;
+    let mut defaults = Config::default();
+    defaults.startup.launch_at_login = preserved_launch_at_login;
+    if let Err(e) = defaults.save() {
         show_alert(&t("alert.save_failed_title"), &e);
         return;
     }
     // 重读(现在是默认值)+ 应用 locale/logger。
     // Reload (now defaults) + apply locale/logger.
     let _ = reload_config();
-    // 同步快捷键模式 + 开机自启(默认值:command / false)。
-    // Sync shortcut mode + launch-at-login (defaults: command / false).
+    // 同步快捷键模式(默认 command)+ 开机自启(保留用户原值,不重置)。
+    // Sync shortcut mode (default command) + launch-at-login (preserved user value, not reset).
     set_shortcut_mode(CONFIG.read().unwrap().keyboard.modifier == "command");
     crate::autostart::sync(CONFIG.read().unwrap().startup.launch_at_login);
     // 刷新 UI,但保留正在显示的设置窗口(不调 invalidate_settings_window,否则会关闭并释放它)。
