@@ -114,15 +114,17 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 
 ## 应用图标
 
-应用图标(`AppIcon.icns`)由 `assets/icon.svg` 生成,打包进 `Contents/Resources/`。`assets/AppIcon.icns` 已提交进仓库,`bundle.sh` 直接使用它,因此贡献者构建 `.app` 时无需任何额外工具。
+应用图标(`AppIcon.icns`)由 `assets/Icon-Default-1024x1024@1x.png` 生成,打包进 `Contents/Resources/`。`assets/AppIcon.icns` 已提交进仓库,`bundle.sh` 直接使用它,因此贡献者构建 `.app` 时无需任何额外工具。
 
-编辑 `assets/icon.svg` 后重新生成:
+替换源 PNG 后重新生成:
 
 ```sh
-./scripts/build-icon.sh        # SVG -> 10 张 .iconset PNG(scripts/svg2png.swift) -> assets/AppIcon.icns
+./scripts/build-icon-from-png.sh   # 1024x1024 PNG -> 10 张 .iconset 尺寸(sips) -> assets/AppIcon.icns
 ```
 
-需要 `swift`(Xcode 或 Swift 工具链)+ `iconutil`(Xcode CLT)。刻意不用 `qlmanage` -- 它会把 SVG 合成到不透明白底上,导致圆角 squircle 外出现白边。`scripts/svg2png.swift` 用 `NSImage`/WebKit 在每个目标尺寸原生光栅化,保留透明圆角。生成后把新的 `assets/AppIcon.icns` 连同 `assets/icon.svg` 改动一起提交。
+只需 `iconutil`(Xcode CLT);`sips` macOS 自带。生成后把新的 `assets/AppIcon.icns` 连同 `assets/Icon-Default-1024x1024@1x.png` 改动一起提交。
+
+若存在 `assets/AppIcon.icon`(目录),`bundle.sh` 还会把它拷进 `Contents/Resources/`,用于 macOS 26+ 的 Liquid Glass 图标格式(系统优先于 `.icns`)。
 
 ## 权限与运行须知
 

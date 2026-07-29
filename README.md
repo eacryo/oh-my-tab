@@ -114,15 +114,17 @@ After step 4, `brew install --cask eacryo/tap/oh-my-tab` (or `brew upgrade --cas
 
 ## App icon
 
-The app icon (`AppIcon.icns`) is generated from `assets/icon.svg` and bundled into `Contents/Resources/`. The committed `assets/AppIcon.icns` is used directly by `bundle.sh`, so contributors need no extra tooling to build the `.app`.
+The app icon (`AppIcon.icns`) is generated from `assets/Icon-Default-1024x1024@1x.png` and bundled into `Contents/Resources/`. The committed `assets/AppIcon.icns` is used directly by `bundle.sh`, so contributors need no extra tooling to build the `.app`.
 
-To regenerate it after editing `assets/icon.svg`:
+To regenerate it after replacing the source PNG:
 
 ```sh
-./scripts/build-icon.sh        # SVG -> 10 .iconset PNGs (scripts/svg2png.swift) -> assets/AppIcon.icns
+./scripts/build-icon-from-png.sh   # 1024x1024 PNG -> 10 .iconset sizes (sips) -> assets/AppIcon.icns
 ```
 
-Requires `swift` (Xcode or the Swift toolchain) and `iconutil` (Xcode CLT). `qlmanage` is intentionally avoided -- it composites SVG onto an opaque white background, leaving white corners outside the rounded squircle. `scripts/svg2png.swift` rasterizes via `NSImage`/WebKit at each target size, preserving the transparent corners. Then commit the regenerated `assets/AppIcon.icns` alongside the `assets/icon.svg` change.
+Requires `iconutil` (Xcode CLT); `sips` ships with macOS. Then commit the regenerated `assets/AppIcon.icns` alongside the `assets/Icon-Default-1024x1024@1x.png` change.
+
+If `assets/AppIcon.icon` (a directory) is present, `bundle.sh` also bundles it into `Contents/Resources/` for the macOS 26+ Liquid Glass icon format, which macOS prefers over `.icns`.
 
 ## Permissions & runtime caveats
 
