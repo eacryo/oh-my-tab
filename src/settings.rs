@@ -10,7 +10,7 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::ffi::c_void;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::config::{reload_config, Config, CONFIG};
@@ -59,6 +59,12 @@ struct SettingsUi {
 unsafe impl Send for SettingsUi {}
 unsafe impl Sync for SettingsUi {}
 static SETTINGS_UI: Mutex<Option<SettingsUi>> = Mutex::new(None);
+
+// summon 期间是否临时藏起了设置窗口(orderOut),避免它贴在浮窗后面露出来。
+// stash 时置 true,restore 时 swap 回 false。
+// Whether the settings window was temporarily orderOut'd during summon so it doesn't
+// peek out behind the overlay. Set true on stash, swapped back to false on restore.
+static SETTINGS_HIDDEN_FOR_SUMMON: AtomicBool = AtomicBool::new(false);
 
 // ========== 控件构造 helper / control-builder helpers ==========
 
@@ -351,6 +357,48 @@ fn hide_settings() {
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
             let _: () = msg_send![u.window, orderOut: std::ptr::null::<AnyObject>()];
+        }
+    }
+}
+
+/// 浮窗显示前调用:若设置窗口正打开可见,临时 orderOut 藏起来并置标志。
+/// 设置窗口已被 collect 收为卡片,这里只藏其实体,避免它贴在浮窗后面露出来。
+///
+/// Called before the overlay is shown: if the settings window is open and visible,
+/// orderOut it temporarily and set a flag. The settings window is already collected
+/// as a card, so this only hides its body -- preventing it from peeking out behind
+/// the overlay.
+pub(crate) fn stash_settings_for_summon() {
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        let Some(u) = ui.as_ref() else {
+            return;
+        };
+        let visible: bool = msg_send![u.window, isVisible];
+        if !visible {
+            return;
+        }
+        let _: () = msg_send![u.window, orderOut: std::ptr::null::<AnyObject>()];
+        SETTINGS_HIDDEN_FOR_SUMMON.store(true, Ordering::SeqCst);
+    }
+}
+
+/// 浮窗隐藏时调用:若 stash 过设置窗口,orderFront 恢复它。
+/// 由 hide_overlay 在 activate_and_raise 之前调用--这样若选中的是别的窗口,它会
+/// 盖到设置窗口前面;若选中的是设置窗口本身,随后的 raise 会把它抬到最前。
+///
+/// Called when the overlay hides: if the settings window was stashed, orderFront it.
+/// Invoked from hide_overlay before activate_and_raise -- so a different selected window
+/// lands above the settings window, while selecting the settings window itself leaves the
+/// subsequent raise to bring it to the front.
+pub(crate) fn restore_settings_after_summon() {
+    if !SETTINGS_HIDDEN_FOR_SUMMON.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            let _: () = msg_send![u.window, orderFront: std::ptr::null::<AnyObject>()];
         }
     }
 }

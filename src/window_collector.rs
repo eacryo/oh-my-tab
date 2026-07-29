@@ -520,14 +520,40 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
             return Some(path);
         }
 
-        let cls = class!(NSRunningApplication);
-        let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
-        if app.is_null() {
-            let _: () = msg_send![pool, drain];
-            return None;
-        }
-
-        let icon: *mut AnyObject = msg_send![app, icon];
+        // 源图标:自身进程用编译期嵌入的 AppIcon.icns--cargo run 是裸 exec 无 bundle,
+        // NSRunningApplication.icon 会返回通用 exec 图标(带 EXEC 字样);这里强制用我们
+        // 自己的图标,开发与打包表现一致。其他进程仍走 NSRunningApplication.icon。
+        //
+        // Source icon: for our own process use the compile-time-embedded AppIcon.icns --
+        // cargo run is a bare exec with no bundle, so NSRunningApplication.icon returns the
+        // generic exec icon (the "EXEC" placeholder); this forces our own icon so dev and
+        // bundled builds match. Other processes still go through NSRunningApplication.icon.
+        let icon: *mut AnyObject = if pid == std::process::id() as i32 {
+            let icns_bytes: &[u8] = include_bytes!("../assets/AppIcon.icns");
+            let nsdata: *mut AnyObject = msg_send![
+                class!(NSData),
+                dataWithBytes: icns_bytes.as_ptr() as *const c_void,
+                length: icns_bytes.len()
+            ];
+            // NSImage 没有 +imageWithData: 类方法,用 alloc + initWithData:(+1)再 autorelease,
+            // 让它和下面的 app.icon 一样由池子回收,无需手动 release。
+            // NSImage has no +imageWithData: class method; use alloc + initWithData: (+1) then
+            // autorelease so it's pool-managed like app.icon below, with no manual release.
+            let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+            let img: *mut AnyObject = msg_send![img, initWithData: nsdata];
+            if !img.is_null() {
+                let _: *mut AnyObject = msg_send![img, autorelease];
+            }
+            img
+        } else {
+            let cls = class!(NSRunningApplication);
+            let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
+            if app.is_null() {
+                let _: () = msg_send![pool, drain];
+                return None;
+            }
+            msg_send![app, icon]
+        };
         if icon.is_null() {
             let _: () = msg_send![pool, drain];
             return None;
@@ -783,7 +809,19 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         return vec![];
     }
 
-    let self_pid = std::process::id() as i32;
+    // 不再按 PID 排除本应用(own-PID)窗口:设置窗口也是 own-PID,排除它会导致设置
+    // 开着时切不到它。浮窗自己不需要靠 PID 排除--它 setLevel:3(floating,
+    // kCGWindowLayer != 0)已被下面的 layer 过滤挡掉,且 summon 时 collect 先于
+    // show_overlay 调用、浮窗尚离屏,OnScreenOnly 也不会枚举到。设置窗口关着时走
+    // orderOut 离屏,OnScreenOnly 自然排除,故"开->显示为卡片、关->不显示"自动成立。
+    //
+    // Own-PID windows are no longer excluded by PID: the settings window is own-PID too, and
+    // excluding it would make it unswitchable while open. The overlay itself needs no PID
+    // exclusion -- it's setLevel:3 (floating, kCGWindowLayer != 0), already dropped by the
+    // layer check below, and collect runs before show_overlay so the overlay is still off-screen
+    // and OnScreenOnly won't enumerate it either. The settings window, when closed, is
+    // orderOut'd (off-screen) so OnScreenOnly excludes it -- "open -> shown as a card, closed
+    // -> hidden" holds automatically.
     let mut windows: Vec<WindowInfo> = Vec::new();
     let count = unsafe { CFArrayGetCount(array) };
     let now = Instant::now();
@@ -802,7 +840,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             continue;
         }
         let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
-        if owner_pid <= 0 || owner_pid == self_pid {
+        if owner_pid <= 0 {
             continue;
         }
         let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
@@ -860,7 +898,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         }
 
         let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
-        if owner_pid <= 0 || owner_pid == self_pid {
+        if owner_pid <= 0 {
             continue;
         }
 

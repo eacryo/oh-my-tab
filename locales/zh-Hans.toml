@@ -14,7 +14,7 @@ clear_icon_cache = "清空图标缓存"
 quit = "退出"
 
 [settings]
-window_title = "oh-my-tab 设置"
+window_title = "设置"
 header_appearance = "外观"
 header_layout = "布局"
 header_keyboard = "键盘"

@@ -13,7 +13,7 @@ clear_icon_cache = "Clear Icon Cache"
 quit = "Quit"
 
 [settings]
-window_title = "oh-my-tab Settings"
+window_title = "Settings"
 header_appearance = "Appearance"
 header_layout = "Layout"
 header_keyboard = "Keyboard"

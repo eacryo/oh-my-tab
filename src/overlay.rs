@@ -410,6 +410,12 @@ pub(crate) fn hide_overlay() {
             let _: () = msg_send![window.0, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
+    // 恢复 summon 期间临时藏起的设置窗口(若有)。在 activate_and_raise 之前执行,
+    // 这样选中的别的窗口会盖到它前面;选中的是设置窗口则由随后的 raise 抬到最前。
+    // Restore the settings window stashed during summon (if any). Runs before
+    // activate_and_raise so a different selected window lands above it; if the settings
+    // window itself was selected, the subsequent raise brings it to the front.
+    crate::settings::restore_settings_after_summon();
 }
 
 pub(crate) fn refresh_highlight() {
@@ -881,5 +887,10 @@ pub(crate) fn show_overlay() {
 
         // Highlight selected card
         refresh_highlight();
+
+        // 设置窗口若开着,临时藏起:它已被收为卡片,这里只藏实体,避免贴在浮窗后面露出。
+        // If the settings window is open, stash it: it's already a card, this just hides its
+        // body so it doesn't peek out behind the overlay.
+        crate::settings::stash_settings_for_summon();
     }
 }
