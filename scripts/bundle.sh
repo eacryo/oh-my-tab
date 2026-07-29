@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # 打包 release .app 并打成 .dmg:编译 -> 组装 bundle -> ad-hoc 签名 -> DMG。
 # 产物输出到 dist/(已 gitignore),放在 target/ 之外以保持 logger 的 is_dev=false(走文件日志)。
 #
@@ -35,16 +35,23 @@ VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
 
 # 应用图标:从 assets/AppIcon.icns 拷入 Contents/Resources/(放在 codesign 之前,纳入签名)。
-# 该 icns 由 build-icon.sh 从 assets/icon.svg 生成并提交进 git;缺失则提示先跑 build-icon.sh。
+# 该 icns 由 build-icon-from-png.sh 从 Icon-Default-1024x1024@1x.png 生成并提交进 git;缺失则提示先跑该脚本。
 # App icon: copy assets/AppIcon.icns into Contents/Resources/ (before codesign so it is covered by the signature).
-# The icns is generated from assets/icon.svg by build-icon.sh and committed; if missing, hint to run build-icon.sh first.
+# The icns is generated from Icon-Default-1024x1024@1x.png by build-icon-from-png.sh and committed; if missing, hint to run that script first.
 ICON="assets/AppIcon.icns"
 if [ ! -f "$ICON" ]; then
-  echo "error: $ICON not found. Run ./scripts/build-icon.sh first." >&2
+  echo "error: $ICON not found. Run ./scripts/build-icon-from-png.sh first." >&2
   exit 1
 fi
 mkdir -p "$APP/Contents/Resources"
 cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
+
+# macOS 26+ Liquid Glass 图标(目录格式):macOS 自动优先使用 .icon,找不到时回落 .icns。
+# macOS 26+ Liquid Glass icon (directory format); macOS auto-prefers .icon, falls back to .icns.
+ICON_DIR="assets/AppIcon.icon"
+if [ -d "$ICON_DIR" ]; then
+  cp -R "$ICON_DIR" "$APP/Contents/Resources/AppIcon.icon"
+fi
 
 # 签名:优先用自签名证书 "oh-my-tab-sign"(让 TCC 身份稳定,Accessibility 授权不会因 rebuild 失效);
 # 签名失败(证书缺失 / 钥匙串拒绝)时退回 ad-hoc(TCC 授权随 CDHash 变化失效,仅适合临时本机调试)。
