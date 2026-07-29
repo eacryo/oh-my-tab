@@ -143,7 +143,14 @@ pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
 
         let mask: CGEventMask = (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
 
-        let mut tap = CGEventTapCreate(K_C_G_SESSION_EVENT_TAP, 0, 0, mask, Some(event_tap_callback), sender_ptr);
+        let mut tap = CGEventTapCreate(
+            K_C_G_SESSION_EVENT_TAP,
+            0,
+            0,
+            mask,
+            Some(event_tap_callback),
+            sender_ptr,
+        );
 
         // 首次创建失败(通常是缺 Accessibility 权限):有限次重试,给用户时间去系统设置授权。
         // First creation failed (usually missing Accessibility): retry a bounded number of times
@@ -159,7 +166,14 @@ pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
             for _ in 0..RETRY_MAX {
                 std::thread::sleep(RETRY_INTERVAL);
                 if has_accessibility_permission() {
-                    tap = CGEventTapCreate(K_C_G_SESSION_EVENT_TAP, 0, 0, mask, Some(event_tap_callback), sender_ptr);
+                    tap = CGEventTapCreate(
+                        K_C_G_SESSION_EVENT_TAP,
+                        0,
+                        0,
+                        mask,
+                        Some(event_tap_callback),
+                        sender_ptr,
+                    );
                     if !tap.is_null() {
                         granted = true;
                         break;

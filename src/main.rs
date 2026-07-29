@@ -510,6 +510,22 @@ fn init_app() {
     }
 }
 
+/// 切换应用激活策略。设置窗口打开时切 .regular(进 Dock / 系统 Cmd+Tab / 调度中心图标),
+/// 关闭时切回 .accessory(纯菜单栏)。LSUIElement 默认 .accessory,设置窗口需要 .regular
+/// 才能在系统切换器里正常显示(对齐 LinearMouse 等菜单栏应用的做法)。
+/// Switch the app activation policy: .regular while the settings window is open (so it shows in
+/// the Dock / system Cmd+Tab / Mission Control icon), .accessory when closed (pure menu-bar).
+/// LSUIElement defaults to .accessory; the settings window needs .regular to appear in system
+/// switchers (matching menu-bar apps like LinearMouse).
+pub(crate) fn set_settings_activation_policy(regular: bool) {
+    unsafe {
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        // NSApplicationActivationPolicyRegular = 0, .Accessory = 1
+        let policy: isize = if regular { 0 } else { 1 };
+        let _: bool = msg_send![nsapp, setActivationPolicy: policy];
+    }
+}
+
 fn setup_status_bar() {
     unsafe {
         let status_bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];

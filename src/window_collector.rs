@@ -966,9 +966,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         // lifetime, more reliable than title (which changes with browser tabs).
         mru.entry((owner_pid, cgwid)).or_insert(ordered_ts);
         insertion_order += 1;
-        let icon_path = icon_ids
-            .get(&owner_pid)
-            .and_then(check_cache_for_identity);
+        let icon_path = icon_ids.get(&owner_pid).and_then(check_cache_for_identity);
         windows.push(WindowInfo {
             pid: owner_pid,
             window_id: cgwid,

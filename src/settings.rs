@@ -9,9 +9,9 @@
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use std::ffi::c_void;
+use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::config::{reload_config, Config, CONFIG};
 use crate::event_monitor::SHORTCUT_IS_CMD;
@@ -194,6 +194,8 @@ unsafe fn make_sidebar_button(
     let _: () = msg_send![btn, setTag: tag];
     set_control_title(btn, title);
     set_sidebar_title(btn, title, false);
+    // 自适应:贴顶、贴左、固定尺寸 / adaptive: top- and left-anchored, fixed size
+    let _: () = msg_send![btn, setAutoresizingMask: 12u64];
     let _: () = msg_send![btn, setTarget: target];
     let _: () = msg_send![btn, setAction: sel!(handleSettingsSidebar:)];
     let _: () = msg_send![parent, addSubview: btn];
@@ -215,6 +217,9 @@ unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: f64)
     let _: () = msg_send![label, setEditable: false];
     let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64];
     let _: () = msg_send![label, setFont: font];
+    // 自适应:宽度随父视图拉伸、顶部锚定(MinYMargin)。autoresizing = WidthSizable | MinYMargin = 2|8 = 10。
+    // Adaptive: stretch width with the parent, stay top-anchored (MinYMargin).
+    let _: () = msg_send![label, setAutoresizingMask: 10u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
 }
@@ -240,8 +245,14 @@ unsafe fn add_row(
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
     let _: () = msg_send![label, setAlignment: 1isize]; // NSTextAlignmentRight
+                                                        // 自适应:标签固定宽、顶部+左侧锚定(MinYMargin|MaxXMargin = 8|4 = 12)。
+                                                        // Adaptive: label keeps fixed width, stays top- and left-anchored.
+    let _: () = msg_send![label, setAutoresizingMask: 12u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
+    // 自适应:控件宽度随父视图拉伸、顶部锚定(WidthSizable|MinYMargin = 2|8 = 10)。
+    // Adaptive: control stretches its width with the parent, stays top-anchored.
+    let _: () = msg_send![control, setAutoresizingMask: 10u64];
     let _: () = msg_send![parent, addSubview: control];
     release_obj(control);
     control
@@ -340,6 +351,9 @@ fn show_settings() {
         select_sidebar(0);
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
+            // 切到 .regular:让设置窗口进系统 Cmd+Tab / 调度中心图标(对齐 LinearMouse 等菜单栏应用)。
+            // Switch to .regular so the settings window shows in system Cmd+Tab / Mission Control icon.
+            crate::set_settings_activation_policy(true);
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
             let _: () = msg_send![u.window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
@@ -347,7 +361,8 @@ fn show_settings() {
             // Clear the default first responder so the cursor doesn't land in the Glass color field on open.
             let _: bool = msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
             // 按当前权限刷新警告条显隐(有权限就隐藏)/ refresh banner visibility by current permission
-            let _: () = msg_send![u.accessibility_warning_view, setHidden: has_accessibility_permission()];
+            let _: () =
+                msg_send![u.accessibility_warning_view, setHidden: has_accessibility_permission()];
         }
     }
 }
@@ -359,6 +374,9 @@ fn hide_settings() {
             let _: () = msg_send![u.window, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
+    // 切回 .accessory:设置窗口关闭,回到纯菜单栏(无 Dock 图标)。
+    // Switch back to .accessory: the settings window is closed, return to pure menu-bar (no Dock icon).
+    crate::set_settings_activation_policy(false);
 }
 
 /// 浮窗显示前调用:若设置窗口正打开可见,临时 orderOut 藏起来并置标志。
@@ -424,7 +442,12 @@ fn show_alert(title: &str, msg: &str) {
 
 /// 确认弹窗(两个按钮)。返回 true = 用户点了确认按钮。
 /// Confirm dialog (two buttons). Returns true if the user clicked the confirm button.
-pub(crate) fn confirm_alert(title: &str, msg: &str, confirm_label: &str, cancel_label: &str) -> bool {
+pub(crate) fn confirm_alert(
+    title: &str,
+    msg: &str,
+    confirm_label: &str,
+    cancel_label: &str,
+) -> bool {
     unsafe {
         let alert: *mut AnyObject = msg_send![class!(NSAlert), new];
         let ns1 = make_nsstring(title);
@@ -653,25 +676,71 @@ fn collect_settings_config() -> (Config, Vec<String>) {
 
 /// 构建设置窗口(只建一次,存入 SETTINGS_UI,之后复用、隐藏而非销毁)。
 /// Build the settings window once, store it in SETTINGS_UI, then reuse (hide, not destroy).
+// 设置窗口自定义子类 OhMyTabSettingsWindow:重写 performClose:,让红色关闭按钮走 hide_settings
+// (会切回 .accessory),而不是默认的 orderOut(那样不会触发激活策略切换,导致 Dock 图标残留)。
+// create_settings_window 在 invalidate 后可能被再次调用,故用 OnceLock 守卫只注册一次。
+// Custom settings window subclass overriding performClose: so the red close button routes through
+// hide_settings (which flips activation policy back to .accessory), instead of the default orderOut
+// (which wouldn't trigger the policy switch, leaving the Dock icon around). create_settings_window
+// can be called again after invalidate_settings_window, so registration is guarded with OnceLock.
+extern "C" fn settings_window_perform_close(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    hide_settings();
+}
+
+struct SettingsWindowClass(*mut AnyObject);
+unsafe impl Send for SettingsWindowClass {}
+unsafe impl Sync for SettingsWindowClass {}
+
+static SETTINGS_WINDOW_CLS: OnceLock<SettingsWindowClass> = OnceLock::new();
+
+fn settings_window_class() -> *mut AnyObject {
+    SETTINGS_WINDOW_CLS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabSettingsWindow").unwrap();
+            let superclass = class!(NSWindow) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:@").unwrap(); // -performClose:(id)sender -> void
+            class_addMethod(
+                cls,
+                sel!(performClose:),
+                settings_window_perform_close as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            SettingsWindowClass(cls)
+        })
+        .0
+}
+
 fn create_settings_window() {
     unsafe {
         let view_w = 580.0;
         let sidebar_w = 150.0;
-        let style: u64 = (1 << 0) | (1 << 1); // titled + closable
-                                              // 窗口加左侧侧边栏后:宽 420 -> 580(侧边栏 150 + 1pt 分隔 + 内容 429)。
-                                              // 内容拆成「通用 / 实验性」两页后,通用页(6 段 9 行)最高,高 748 -> 600 足够;
-                                              // 通用页顶部预留 Accessibility 权限警告条,窗口再加 60 -> 660。
-                                              // Window widened for the left sidebar: 420 -> 580 (sidebar 150 + 1pt divider + 429 content).
-                                              // Content is now paged (General / Experimental); the General page (6 sections, 9 rows) is the
-                                              // tallest, so height 748 -> 600 is enough; +60 -> 660 to reserve room for the
-                                              // Accessibility permission warning banner at the top of the General page.
+        let style: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+        // titled + closable + miniaturizable + resizable(三个红绿灯齐全)。resizable 是绿色 zoom
+        // 按钮出现的必要条件;布局是绝对定位不随缩放,故下方用 min=max 固定窗口尺寸。
+        // titled + closable + miniaturizable + resizable (all three traffic lights). resizable is
+        // required for the green zoom button to appear; the layout is absolute-positioned and
+        // doesn't adapt, so the window size is fixed below via min=max.
+        // 窗口加左侧侧边栏后:宽 420 -> 580(侧边栏 150 + 1pt 分隔 + 内容 429)。
+        // 内容拆成「通用 / 实验性」两页后,通用页(6 段 9 行)最高,高 748 -> 600 足够;
+        // 通用页顶部预留 Accessibility 权限警告条,窗口再加 60 -> 660。
+        // Window widened for the left sidebar: 420 -> 580 (sidebar 150 + 1pt divider + 429 content).
+        // Content is now paged (General / Experimental); the General page (6 sections, 9 rows) is the
+        // tallest, so height 748 -> 600 is enough; +60 -> 660 to reserve room for the
+        // Accessibility permission warning banner at the top of the General page.
         let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 660.0));
-        let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+        let window: *mut AnyObject = msg_send![settings_window_class(), alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
         let ns_title = make_nsstring(&t("settings.window_title"));
         let _: () = msg_send![window, setTitle: ns_title];
         CFRelease(ns_title as *const c_void);
         let _: () = msg_send![window, setReleasedWhenClosed: false];
+        // 自适应:窗口可缩放,行已设 autoresizing masks,内容随窗口调整。
+        // 设最小尺寸避免缩太小导致控件重叠。
+        // Adaptive: the window is resizable; rows already have autoresizing masks set,
+        // so content adjusts with the window. Set a minimum size to avoid overlap.
+        let _: () = msg_send![window, setMinSize: NSSize::new(450.0, 400.0)];
         let content: *mut AnyObject = msg_send![window, contentView];
         // 用 contentView 的实际高度做布局(标题栏会占掉一部分,不能直接用窗口高度)。
         // Layout against the contentView's real height (the title bar eats part of it).
@@ -720,6 +789,9 @@ fn create_settings_window() {
         // --- 侧边栏 sidebar ---
         let sidebar_view: *mut AnyObject = msg_send![class!(NSView), alloc];
         let sidebar_view: *mut AnyObject = msg_send![sidebar_view, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(sidebar_w, content_h))];
+        // 自适应:左侧锚定、高度随窗口拉伸(HeightSizable|MaxXMargin = 16|4 = 20)。
+        // Adaptive: left-anchored, height stretches with the window.
+        let _: () = msg_send![sidebar_view, setAutoresizingMask: 20u64];
         let _: () = msg_send![content, addSubview: sidebar_view];
         release_obj(sidebar_view);
 
@@ -728,6 +800,7 @@ fn create_settings_window() {
         // light/dark; uses an old API so it's safe across macOS versions).
         let divider: *mut AnyObject = msg_send![class!(NSView), alloc];
         let divider: *mut AnyObject = msg_send![divider, initWithFrame: NSRect::new(NSPoint::new(sidebar_w, 0.0), NSSize::new(1.0, content_h))];
+        let _: () = msg_send![divider, setAutoresizingMask: 20u64]; // 同 sidebar:左侧锚定、高度拉伸
         let _: () = msg_send![divider, setWantsLayer: true];
         let div_layer: *mut AnyObject = msg_send![divider, layer];
         let sep_color: *mut AnyObject =
@@ -744,6 +817,7 @@ fn create_settings_window() {
         let btn_y0 = content_h - 12.0 - 30.0;
         let highlight: *mut AnyObject = msg_send![class!(NSView), alloc];
         let highlight: *mut AnyObject = msg_send![highlight, initWithFrame: NSRect::new(NSPoint::new(12.0, btn_y0), NSSize::new(btn_w, btn_h))];
+        let _: () = msg_send![highlight, setAutoresizingMask: 12u64]; // 贴顶、贴左 / top- and left-anchored
         let _: () = msg_send![highlight, setWantsLayer: true];
         let hl_layer: *mut AnyObject = msg_send![highlight, layer];
         let _: () = msg_send![hl_layer, setCornerRadius: 6.0f64];
@@ -777,6 +851,8 @@ fn create_settings_window() {
         // --- 通用页容器 general page container ---
         let general_view: *mut AnyObject = msg_send![class!(NSView), alloc];
         let general_view: *mut AnyObject = msg_send![general_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
+        // 自适应:宽高随窗口拉伸(WidthSizable|HeightSizable = 2|16 = 18)。
+        let _: () = msg_send![general_view, setAutoresizingMask: 18u64];
         let _: () = msg_send![content, addSubview: general_view];
         release_obj(general_view);
         ui.general_view = general_view;
@@ -785,6 +861,7 @@ fn create_settings_window() {
         let experimental_view: *mut AnyObject = msg_send![class!(NSView), alloc];
         let experimental_view: *mut AnyObject = msg_send![experimental_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
         let _: () = msg_send![experimental_view, setHidden: true];
+        let _: () = msg_send![experimental_view, setAutoresizingMask: 18u64]; // 同 general_view:宽高拉伸
         let _: () = msg_send![content, addSubview: experimental_view];
         release_obj(experimental_view);
         ui.experimental_view = experimental_view;
@@ -804,6 +881,8 @@ fn create_settings_window() {
                 NSSize::new(content_w, banner_h)
             )
         ];
+        // 自适应:宽度拉伸、顶部锚定(WidthSizable|MinYMargin = 10)。
+        let _: () = msg_send![banner, setAutoresizingMask: 10u64];
         let _: () = msg_send![general_view, addSubview: banner];
         release_obj(banner);
         ui.accessibility_warning_view = banner;
@@ -827,6 +906,8 @@ fn create_settings_window() {
         let _: () = msg_send![warning_label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
         let red: *mut AnyObject = msg_send![class!(NSColor), systemRedColor];
         let _: () = msg_send![warning_label, setTextColor: red];
+        // 自适应:宽度随 banner 拉伸、左锚定(WidthSizable = 2)。
+        let _: () = msg_send![warning_label, setAutoresizingMask: 2u64];
         let _: () = msg_send![banner, addSubview: warning_label];
         release_obj(warning_label);
 
@@ -1031,6 +1112,8 @@ fn create_settings_window() {
         y -= 30.0;
         let note: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let note: *mut AnyObject = msg_send![note, initWithFrame: NSRect::new(NSPoint::new(12.0, y), NSSize::new(content_w - 24.0, 30.0))];
+        // 自适应:贴顶、宽度拉伸 / adaptive: top-anchored, width sizable
+        let _: () = msg_send![note, setAutoresizingMask: 10u64];
         let note_ns = make_nsstring(&t("settings.experimental_note"));
         let _: () = msg_send![note, setStringValue: note_ns];
         CFRelease(note_ns as *const c_void);
@@ -1115,6 +1198,7 @@ fn create_settings_window() {
         // doesn't cross the sidebar divider (x=sidebar_w=150).
         let restore: *mut AnyObject = msg_send![class!(NSButton), alloc];
         let restore: *mut AnyObject = msg_send![restore, initWithFrame: NSRect::new(NSPoint::new(12.0, 44.0), NSSize::new(126.0, 28.0))];
+        let _: () = msg_send![restore, setAutoresizingMask: 36u64]; // 贴底、贴左 / bottom- and left-anchored
         set_control_title(restore, &t("settings.btn_restore_defaults"));
         let _: () = msg_send![restore, setBezelStyle: 1isize];
         let _: () = msg_send![restore, setTarget: target];
@@ -1128,7 +1212,11 @@ fn create_settings_window() {
         // compile-time env!. The version number itself is data (not localized), only the label is.
         let version_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let version_label: *mut AnyObject = msg_send![version_label, initWithFrame: NSRect::new(NSPoint::new(12.0, 14.0), NSSize::new(126.0, 20.0))];
-        let version_text = tf("settings.version_label", &[("version", env!("CARGO_PKG_VERSION"))]);
+        let _: () = msg_send![version_label, setAutoresizingMask: 36u64]; // 贴底、贴左
+        let version_text = tf(
+            "settings.version_label",
+            &[("version", env!("CARGO_PKG_VERSION"))],
+        );
         let version_ns = make_nsstring(&version_text);
         let _: () = msg_send![version_label, setStringValue: version_ns];
         CFRelease(version_ns as *const c_void);
@@ -1144,6 +1232,7 @@ fn create_settings_window() {
         // OK / Cancel on contentView so they stay visible on both pages.
         let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
         let cancel: *mut AnyObject = msg_send![cancel, initWithFrame: NSRect::new(NSPoint::new(view_w - 200.0, 14.0), NSSize::new(80.0, 28.0))];
+        let _: () = msg_send![cancel, setAutoresizingMask: 33u64]; // 贴底、贴右 / bottom- and right-anchored
         set_control_title(cancel, &t("settings.btn_cancel"));
         let _: () = msg_send![cancel, setBezelStyle: 1isize];
         let _: () = msg_send![cancel, setTarget: target];
@@ -1153,6 +1242,7 @@ fn create_settings_window() {
 
         let ok: *mut AnyObject = msg_send![class!(NSButton), alloc];
         let ok: *mut AnyObject = msg_send![ok, initWithFrame: NSRect::new(NSPoint::new(view_w - 110.0, 14.0), NSSize::new(90.0, 28.0))];
+        let _: () = msg_send![ok, setAutoresizingMask: 33u64]; // 贴底、贴右
         set_control_title(ok, &t("settings.btn_ok"));
         let _: () = msg_send![ok, setBezelStyle: 1isize];
         let _: () = msg_send![ok, setTarget: target];
@@ -1177,6 +1267,10 @@ pub(crate) fn invalidate_settings_window() {
             // its subviews are retained by the parent view and dealloc with the window.
             let _: () = msg_send![u.window, orderOut: std::ptr::null::<AnyObject>()];
             release_obj(u.window);
+            // 窗口被作废(销毁),切回 .accessory(可能 locale 变更时设置正开着)。
+            // The window is invalidated/destroyed; flip back to .accessory (it may have been open
+            // during a locale change).
+            crate::set_settings_activation_policy(false);
         }
     }
 }
