@@ -1,42 +1,57 @@
 <svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <!-- 1. 暗色背景渐变(铺满整个画布,贴合 macOS Big Sur+ 全出血 squircle 规范) -->
-    <!-- Dark background gradient filling the full canvas to match the macOS Big Sur+ full-bleed squircle spec -->
-    <linearGradient id="bg-grad" x1="256" y1="0" x2="256" y2="512" gradientUnits="userSpaceOnUse">
+    <!-- 1. 暗色背景渐变(铺满 squircle 底座)。objectBoundingBox:随 squircle 自身 bbox 走。 -->
+    <!-- Dark background gradient over the squircle base. objectBoundingBox: follows the squircle's own bbox. -->
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#1E293B"/>
       <stop offset="100%" stop-color="#0F172A"/>
     </linearGradient>
 
-    <!-- 2. 左上方框渐变（底层） -->
-    <linearGradient id="box-left-grad" x1="112" y1="112" x2="312" y2="312" gradientUnits="userSpaceOnUse">
+    <!-- 2. 左上方框渐变（底层,对角） -->
+    <!-- Left-top box gradient (back layer, diagonal) -->
+    <linearGradient id="box-left-grad" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#6366F1"/>
       <stop offset="100%" stop-color="#A855F7"/>
     </linearGradient>
 
-    <!-- 3. 右下方框渐变（顶层） -->
-    <linearGradient id="box-right-grad" x1="200" y1="200" x2="400" y2="400" gradientUnits="userSpaceOnUse">
+    <!-- 3. 右下方框渐变（顶层,对角） -->
+    <!-- Right-bottom box gradient (front layer, diagonal) -->
+    <linearGradient id="box-right-grad" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#38BDF8"/>
       <stop offset="100%" stop-color="#2563EB"/>
     </linearGradient>
 
-    <!-- 4. 顶层方框叠加阴影（增强立体重叠感,属于图标内部内容,保留） -->
-    <!-- Overlay shadow on the front box for depth; internal icon content, kept -->
-    <filter id="box-shadow" x="170" y="170" width="255" height="255" filterUnits="userSpaceOnUse">
-      <feDropShadow dx="-4" dy="-4" stdDeviation="8" flood-color="#000000" flood-opacity="0.3"/>
+    <!-- 4. 顶层方框叠加阴影。投影参数按 412/512 等比缩小:stdDev 8->6.4,dx/dy -4->-3.2。
+         feDropShadow 在 svg2png(NSImage/WebKit)里若处于 <g transform> 下会异常(缩小被滤元素),
+         所以本图标整体不进 transform,直接画在 viewBox 坐标。 -->
+    <!-- Overlay shadow on the front box. Shadow params scaled by 412/512: stdDev 8->6.4, dx/dy -4->-3.2.
+         feDropShadow renders incorrectly in svg2png (NSImage/WebKit) inside a <g transform> (shrinks the
+         filtered element), so this icon is drawn directly in viewBox coords with no transform. -->
+    <filter id="box-shadow" x="170" y="170" width="245" height="245" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="-3.2" dy="-3.2" stdDeviation="6.4" flood-color="#000000" flood-opacity="0.3"/>
     </filter>
   </defs>
 
-  <!-- 全出血 squircle 底座:铺满 512 画布,圆角半径 ≈ 22.37% (macOS Big Sur+ 规范);不烘焙外阴影(Launchpad 等场景由系统处理)。 -->
-  <!-- Full-bleed squircle base: fills the 512 canvas, corner radius ≈ 22.37% (macOS Big Sur+ spec); no baked outer shadow (system handles it in Launchpad etc.). -->
-  <rect x="0" y="0" width="512" height="512" rx="114" fill="url(#bg-grad)"/>
+  <!-- squircle:flat-edged squircle(平直边 + 超椭圆角),匹配 macOS 应用图标外形。Apple 图标不是纯超椭圆
+       (纯超椭圆的边会内收),而是平直边 + 连续曲率的超椭圆角。这里用 4 条平直边 + 4 个角的立方贝塞尔
+       (每个角一段,k=0.640 拟合超椭圆 n≈2.3)实现:角的延伸 r=106(顶边 412-2×106=200,与 Apple 一致),
+       角的丰满度与 Apple 实测吻合(角曲线 0.175 vs Apple 0.170)。中心 (256,256),半宽 206(80.5%,
+       对齐系统图标的可见边界)。 -->
+  <!-- Squircle: a flat-edged squircle (flat edges + superellipse corners) matching the macOS app icon shape.
+       Apple's icon is not a pure superellipse (a pure one has inward-curving edges); it has flat edges plus
+       continuous-curvature superellipse corners. Implemented as 4 flat edges + 4 cubic-Bezier corners (one
+       Bezier per corner, k=0.640 fitting superellipse n≈2.3): corner extent r=106 (top edge 412-2×106=200,
+       matching Apple), corner fullness matching Apple's measured curve (0.175 vs Apple's 0.170). Centered at
+       (256,256), half-width 206 (80.5%, aligned to the system icon's visible edge). -->
+  <path d="M 156.00 50.00 L 356.00 50.00 C 423.84 50.00 462.00 88.16 462.00 156.00 L 462.00 356.00 C 462.00 423.84 423.84 462.00 356.00 462.00 L 156.00 462.00 C 88.16 462.00 50.00 423.84 50.00 356.00 L 50.00 156.00 C 50.00 88.16 88.16 50.00 156.00 50.00 Z" fill="url(#bg-grad)"/>
 
-  <!-- 顶部微弱反光高光边缘(内缩 1px,圆角随之外缩 1px 以保持同心) -->
-  <!-- Subtle top highlight edge (1px inset; corner radius reduced by 1px to stay concentric) -->
-  <rect x="1" y="1" width="510" height="510" rx="113" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="2"/>
+  <!-- 顶部微弱反光高光边缘(内缩 0.8,同样 flat-edged squircle,r=105.2) -->
+  <!-- Subtle top highlight edge (0.8px inset, same flat-edged squircle, r=105.2) -->
+  <path d="M 156.00 50.80 L 356.00 50.80 C 423.33 50.80 461.20 88.67 461.20 156.00 L 461.20 356.00 C 461.20 423.33 423.33 461.20 356.00 461.20 L 156.00 461.20 C 88.67 461.20 50.80 423.33 50.80 356.00 L 50.80 156.00 C 50.80 88.67 88.67 50.80 156.00 50.80 Z" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="1.6"/>
 
   <!-- 左上方框 (Back Layer) -->
-  <rect x="112" y="112" width="200" height="200" rx="35" fill="none" stroke="url(#box-left-grad)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="140.1" y="140.1" width="160.9" height="160.9" rx="28.2" fill="none" stroke="url(#box-left-grad)" stroke-width="24.1" stroke-linecap="round" stroke-linejoin="round"/>
 
   <!-- 右下方框 (Front Layer, 带有层次投影) -->
-  <rect x="200" y="200" width="200" height="200" rx="35" fill="none" stroke="url(#box-right-grad)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" filter="url(#box-shadow)"/>
+  <rect x="210.9" y="210.9" width="160.9" height="160.9" rx="28.2" fill="none" stroke="url(#box-right-grad)" stroke-width="24.1" stroke-linecap="round" stroke-linejoin="round" filter="url(#box-shadow)"/>
 </svg>
