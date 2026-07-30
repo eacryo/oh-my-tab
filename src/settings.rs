@@ -56,7 +56,7 @@ struct SettingsUi {
     show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
     log_level: *mut AnyObject,      // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // NSButton (checkbox): 开机自启 / launch at login
-    natural_scroll: *mut AnyObject,  // NSButton (checkbox): 自然滚动 / natural scrolling
+    reverse_scroll: *mut AnyObject,  // NSButton (checkbox): 自然滚动 / natural scrolling
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
 }
 unsafe impl Send for SettingsUi {}
@@ -578,9 +578,9 @@ fn load_settings_values() {
         // launch_at_login:按 CONFIG.startup.launch_at_login 设勾选框状态。
         // launch_at_login: set the checkbox state from CONFIG.startup.launch_at_login.
         let _: () = msg_send![ui.launch_at_login, setState: if cfg.startup.launch_at_login { 1isize } else { 0isize }];
-        // natural_scroll:按 CONFIG.mouse.natural_scroll 设勾选框状态。
-        // natural_scroll: set the checkbox state from CONFIG.mouse.natural_scroll.
-        let _: () = msg_send![ui.natural_scroll, setState: if cfg.mouse.natural_scroll { 1isize } else { 0isize }];
+        // reverse_scroll:按 CONFIG.mouse.reverse_scroll 设勾选框状态。
+        // reverse_scroll: set the checkbox state from CONFIG.mouse.reverse_scroll.
+        let _: () = msg_send![ui.reverse_scroll, setState: if cfg.mouse.reverse_scroll { 1isize } else { 0isize }];
     }
 }
 
@@ -674,10 +674,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // launch_at_login: checkbox state (1=on / 0=off).
         let la_state: isize = msg_send![ui.launch_at_login, state];
         cfg.startup.launch_at_login = la_state == 1;
-        // natural_scroll:勾选框 state(1=on / 0=off)。
-        // natural_scroll: checkbox state (1=on / 0=off).
-        let ns_state: isize = msg_send![ui.natural_scroll, state];
-        cfg.mouse.natural_scroll = ns_state == 1;
+        // reverse_scroll:勾选框 state(1=on / 0=off)。
+        // reverse_scroll: checkbox state (1=on / 0=off).
+        let ns_state: isize = msg_send![ui.reverse_scroll, state];
+        cfg.mouse.reverse_scroll = ns_state == 1;
     }
     for e in cfg.validate() {
         errs.push(e);
@@ -781,7 +781,7 @@ fn create_settings_window() {
             show_minimized: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
-            natural_scroll: std::ptr::null_mut(),
+            reverse_scroll: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
         };
 
@@ -1235,15 +1235,15 @@ fn create_settings_window() {
             content_w - 24.0,
         );
         y -= 8.0 + row_h;
-        // natural_scroll 勾选框:标题留空(左侧 row label 已说明),仅放一个开关。
-        // natural_scroll checkbox: empty title (the row label on the left already describes it).
-        ui.natural_scroll = add_row(
+        // reverse_scroll 勾选框:标题留空(左侧 row label 已说明),仅放一个开关。
+        // reverse_scroll checkbox: empty title (the row label on the left already describes it).
+        ui.reverse_scroll = add_row(
             mouse_view,
             label_x,
             y,
             label_w,
             row_h,
-            &t("settings.row_natural_scroll"),
+            &t("settings.row_reverse_scroll"),
             make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
         );
 

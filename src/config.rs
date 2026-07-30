@@ -113,11 +113,9 @@ pub struct StartupSection {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MouseSection {
-    // 自然滚动:反转鼠标滚轮方向,使其与触控板一致(滚轮下=界面上)。
-    // 默认 false = 传统/Windows 风格(滚轮下=界面下)。仅影响鼠标滚轮,与触控板无关。
-    // Natural scrolling: reverse mouse wheel direction to match trackpad (wheel down = content up).
-    // Defaults to false = traditional/Windows style (wheel down = content down). Mouse only, not trackpad.
-    pub natural_scroll: bool,
+    // 反转鼠标滚轮方向。默认 false = 跟随系统行为,true = 额外反转。
+    // Reverse mouse scroll wheel direction. Default false = follow system, true = reverse.
+    pub reverse_scroll: bool,
 }
 
 // ========== Default implementations (hard-coded fallback values) ==========

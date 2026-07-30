@@ -146,18 +146,18 @@ unsafe extern "C" fn mouse_event_tap_callback(
         let dy = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
         let dx = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
 
-        // 读配置:natural_scroll 默认 false(传统/Windows 风格)。
-        // Read config: natural_scroll defaults to false (traditional/Windows style).
-        let natural = CONFIG
+        // 读配置:reverse_scroll 默认 false(跟随系统行为,不反转)。
+        // Read config: reverse_scroll defaults to false (follow system, no reversal).
+        let reverse = CONFIG
             .read()
-            .map(|cfg| cfg.mouse.natural_scroll)
+            .map(|cfg| cfg.mouse.reverse_scroll)
             .unwrap_or(false);
 
-        if natural {
+        if reverse {
             // 合成事件方案:丢弃原事件(返回 null),合成反转事件 post 到 session 层。
             // Synthetic-event approach: drop original (return null), post reversed event to session level.
             post_reversed_scroll(event, dy, dx);
-            log_info!("[mouse] scroll dy={} dx={} flags=0x{:x} (natural, synthetic)", dy, dx, flags);
+            log_info!("[mouse] scroll dy={} dx={} flags=0x{:x} (reversed, synthetic)", dy, dx, flags);
             // 返回 null 丢弃原始事件,由合成事件替代。
             // Return null to drop the original; the synthetic event replaces it.
             std::ptr::null_mut()
