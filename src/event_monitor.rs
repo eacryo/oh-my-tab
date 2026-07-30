@@ -1,10 +1,16 @@
-use crate::ffi::has_accessibility_permission;
-use crate::{log_error, log_info, log_warn};
+//! 窗口切换专用的事件监听:CGEventTap 拦截 Cmd/Opt+Tab 全局快捷键。
+//! 通用 CGEventTap 基础设施(类型/FFI/启动流程)已抽至 `event_tap.rs`,本模块只保留
+//! 键盘快捷键的匹配逻辑与 GlobalEvent 枚举。
+//!
+//! Window-switcher-specific event monitoring: CGEventTap intercepts the Cmd/Opt+Tab global shortcut.
+//! Common CGEventTap infrastructure (types/FFI/start helper) has been extracted to `event_tap.rs`;
+//! this module keeps only the keyboard-shortcut matching logic and the GlobalEvent enum.
+
+use crate::event_tap::{self, tap_location, tap_options, tap_placement};
+use crate::log_info;
 use flume::Sender;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub enum GlobalEvent {
@@ -13,59 +19,13 @@ pub enum GlobalEvent {
     ThemeToggled,
 }
 
-type CGEventRef = *mut c_void;
-type CGEventTapProxy = *mut c_void;
-type CFMachPortRef = *mut c_void;
-type CFRunLoopSourceRef = *mut c_void;
-type CFRunLoopRef = *mut c_void;
-type CFStringRef = *mut c_void;
-type CFAllocatorRef = *mut c_void;
-type CGEventType = u32;
-type CGEventFlags = u64;
-type CGEventMask = u64;
-
-const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
-const K_CG_EVENT_FLAGS_CHANGED: CGEventType = 12;
+// 窗口切换专用常量 / window-switcher-specific constants
+const K_CG_EVENT_KEY_DOWN: crate::event_tap::CGEventType = 10;
+const K_CG_EVENT_FLAGS_CHANGED: crate::event_tap::CGEventType = 12;
 const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
-const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = 0x00100000;
-const K_CG_EVENT_FLAG_MASK_ALTERNATE: CGEventFlags = 0x00080000;
+const K_CG_EVENT_FLAG_MASK_COMMAND: crate::event_tap::CGEventFlags = 0x00100000;
+const K_CG_EVENT_FLAG_MASK_ALTERNATE: crate::event_tap::CGEventFlags = 0x00080000;
 const K_VK_TAB: u16 = 48;
-// kCGSessionEventTap = 1:tap 建在 session 层(而非 HID 层 kCGHIDEventTap=0)。session 层既能看到
-// 真实硬件事件(它们从 HID 往上流过来),也能看到鼠标映射软件在 session 层合成的 Cmd+Tab--
-// HID 层 tap 看不到 session 层注入的合成事件,会导致侧键映射的 Cmd+Tab 漏过、只触发原生切换器。
-// kCGSessionEventTap = 1: tap at the session level (not HID level kCGHIDEventTap=0). The session level
-// sees real hardware events (which flow up from HID) AND synthetic Cmd+Tab posted at the session level
-// by mouse-remapper software - a HID-level tap can't see session-posted synthetic events, so a
-// side-button-mapped Cmd+Tab would slip past it and only trigger the native switcher.
-const K_C_G_SESSION_EVENT_TAP: i32 = 1;
-
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGEventTapCreate(
-        tap: i32,
-        place: i32,
-        options: u32,
-        events_of_interest: CGEventMask,
-        callback: CGEventTapCallBack,
-        user_info: *mut c_void,
-    ) -> CFMachPortRef;
-
-    fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
-    fn CGEventGetIntegerValueField(event: CGEventRef, field: i32) -> i64;
-    fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
-
-    fn CFMachPortCreateRunLoopSource(
-        allocator: CFAllocatorRef,
-        port: CFMachPortRef,
-        order: i64,
-    ) -> CFRunLoopSourceRef;
-
-    fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
-    fn CFRunLoopGetCurrent() -> CFRunLoopRef;
-    fn CFRunLoopRun();
-
-    static kCFRunLoopDefaultMode: CFStringRef;
-}
 
 // 标记是否已经发送过 CmdTabPressed，防止修饰键变化时误发 CmdReleased
 // Tracks whether CmdTabPressed was sent, to avoid spurious CmdReleased
@@ -75,27 +35,20 @@ static TAB_PRESSED: AtomicBool = AtomicBool::new(false);
 // Shortcut mode: true = Command+Tab, false = Option+Tab
 pub static SHORTCUT_IS_CMD: AtomicBool = AtomicBool::new(false);
 
-type CGEventTapCallBack = Option<
-    unsafe extern "C" fn(
-        proxy: CGEventTapProxy,
-        event_type: CGEventType,
-        event: CGEventRef,
-        user_info: *mut c_void,
-    ) -> CGEventRef,
->;
-
 unsafe extern "C" fn event_tap_callback(
-    _proxy: CGEventTapProxy,
-    event_type: CGEventType,
-    event: CGEventRef,
+    _proxy: crate::event_tap::CGEventTapProxy,
+    event_type: crate::event_tap::CGEventType,
+    event: crate::event_tap::CGEventRef,
     user_info: *mut c_void,
-) -> CGEventRef {
+) -> crate::event_tap::CGEventRef {
     let sender = &*(user_info as *const Sender<GlobalEvent>);
 
     match event_type {
         K_CG_EVENT_KEY_DOWN => {
-            let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) as u16;
-            let flags = CGEventGetFlags(event);
+            let keycode =
+                crate::event_tap::CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE)
+                    as u16;
+            let flags = crate::event_tap::CGEventGetFlags(event);
 
             if keycode == K_VK_TAB {
                 let mod_mask = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
@@ -111,7 +64,7 @@ unsafe extern "C" fn event_tap_callback(
             }
         }
         K_CG_EVENT_FLAGS_CHANGED => {
-            let flags = CGEventGetFlags(event);
+            let flags = crate::event_tap::CGEventGetFlags(event);
             let mod_mask = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
                 K_CG_EVENT_FLAG_MASK_COMMAND
             } else {
@@ -127,87 +80,40 @@ unsafe extern "C" fn event_tap_callback(
     event
 }
 
-// 缺 Accessibility 权限时,event tap 创建会失败。每隔 RETRY_INTERVAL 重试一次,最多 RETRY_MAX 次
-// (约 2 分钟),期间用户可在系统设置里授权;超过上限就记日志放弃(快捷键在重启前失效,下次启动再试)。
-// 设上限是为了避免无限轮询;用户授权后下次重试即建成,无需重启。
-// When Accessibility permission is missing, CGEventTapCreate fails. Retry every RETRY_INTERVAL up to
-// RETRY_MAX times (~2 min), during which the user can grant permission in System Settings; once the
-// limit is exhausted, log and give up (the shortcut stays dead until restart; next launch retries).
-// The cap avoids infinite polling; once granted, the next retry succeeds - no restart needed.
-const RETRY_INTERVAL: Duration = Duration::from_secs(3);
-const RETRY_MAX: u32 = 40;
+pub fn start(sender: Sender<GlobalEvent>) -> std::thread::JoinHandle<()> {
+    let sender_ptr = Box::into_raw(Box::new(sender)) as *mut c_void;
 
-pub fn start(sender: Sender<GlobalEvent>) -> thread::JoinHandle<()> {
-    thread::spawn(move || unsafe {
-        let sender_ptr = Box::into_raw(Box::new(sender)) as *mut c_void;
+    let mask: crate::event_tap::CGEventMask =
+        (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
 
-        let mask: CGEventMask = (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
-
-        let mut tap = CGEventTapCreate(
-            K_C_G_SESSION_EVENT_TAP,
-            0,
-            0,
-            mask,
-            Some(event_tap_callback),
-            sender_ptr,
-        );
-
-        // 首次创建失败(通常是缺 Accessibility 权限):有限次重试,给用户时间去系统设置授权。
-        // First creation failed (usually missing Accessibility): retry a bounded number of times
-        // to give the user time to grant permission in System Settings.
-        if tap.is_null() {
-            log_warn!(
-                "No Accessibility permission yet; event tap will retry every {:?} up to {} times (~{}s).",
-                RETRY_INTERVAL,
-                RETRY_MAX,
-                RETRY_INTERVAL.as_secs() * RETRY_MAX as u64
-            );
-            let mut granted = false;
-            for _ in 0..RETRY_MAX {
-                std::thread::sleep(RETRY_INTERVAL);
-                if has_accessibility_permission() {
-                    tap = CGEventTapCreate(
-                        K_C_G_SESSION_EVENT_TAP,
-                        0,
-                        0,
-                        mask,
-                        Some(event_tap_callback),
-                        sender_ptr,
-                    );
-                    if !tap.is_null() {
-                        granted = true;
-                        break;
-                    }
-                }
-            }
-            if granted {
-                log_info!("Accessibility permission granted; event tap created.");
+    // 窗口切换 tap 建在 session 层:既能看到真实硬件事件,也能看到鼠标映射软件在 session 层
+    // 合成的 Cmd+Tab(HID 层 tap 看不到 session 层注入的合成事件,会导致侧键映射的 Cmd+Tab 漏过)。
+    // options 传 DEFAULT_TAP:需要能吞掉 Cmd+Tab 事件(返回 null),所以必须可改。
+    //
+    // The switcher tap sits at the session level: sees real hardware events AND session-synthesized
+    // Cmd+Tab from mouse-remapper software (a HID-level tap can't see session-posted synthetic events,
+    // so a side-button-mapped Cmd+Tab would slip past). options = DEFAULT_TAP: must be able to swallow
+    // the Cmd+Tab event (return null), so a mutable tap is required.
+    event_tap::start_event_tap_thread(
+        tap_location::SESSION_EVENT_TAP,
+        tap_placement::HEAD_INSERT,
+        tap_options::DEFAULT_TAP,
+        mask,
+        Some(event_tap_callback),
+        sender_ptr as usize,
+        "kbd",
+        || {
+            // 快捷键可能被菜单/设置切换,按当前 SHORTCUT_IS_CMD 打印实际监听的组合键。
+            // The shortcut can be toggled via menu/settings; print the actual combo from SHORTCUT_IS_CMD.
+            let shortcut = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
+                "Command+Tab"
             } else {
-                log_error!(
-                    "Event tap retry exhausted ({}x). Shortcut disabled until restart. \
-                     Grant Accessibility in System Settings and relaunch.",
-                    RETRY_MAX
-                );
-                let _ = Box::from_raw(sender_ptr as *mut Sender<GlobalEvent>);
-                return;
-            }
-        }
-
-        let source = CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
-        CGEventTapEnable(tap, true);
-
-        // 快捷键可能被菜单/设置切换,按当前 SHORTCUT_IS_CMD 打印实际监听的组合键。
-        // The shortcut can be toggled via menu/settings; print the actual combo from SHORTCUT_IS_CMD.
-        let shortcut = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
-            "Command+Tab"
-        } else {
-            "Option+Tab"
-        };
-        log_info!(
-            "Event monitor started. Listening for {} globally.",
-            shortcut
-        );
-        CFRunLoopRun();
-    })
+                "Option+Tab"
+            };
+            log_info!(
+                "Event monitor started. Listening for {} globally.",
+                shortcut
+            );
+        },
+    )
 }

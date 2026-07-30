@@ -1,10 +1,12 @@
 mod autostart;
 mod config;
 mod event_monitor;
+mod event_tap;
 mod ffi;
 mod i18n;
 mod logger;
 mod menu;
+mod mouse;
 mod overlay;
 mod settings;
 mod theme;
@@ -943,6 +945,10 @@ fn main() {
     let (event_tx, event_rx) = flume::unbounded();
     let _monitor = start_event_monitor(event_tx.clone());
     STATUS_EVENT_TX.set(event_tx).ok();
+
+    // 7b. Start the mouse event tap (minimal verification: logs button/scroll events).
+    // 鼠标事件 tap(最小验证:仅日志输出按键/滚轮事件)。
+    let _mouse_monitor = mouse::start();
 
     // Bridge thread: flume events → main thread via performSelectorOnMainThread
     thread::spawn(move || {
