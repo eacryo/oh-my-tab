@@ -37,9 +37,11 @@ struct SettingsUi {
     window: *mut AnyObject,
     sidebar_general: *mut AnyObject, // NSButton: 通用 / General (tag=0)
     sidebar_experimental: *mut AnyObject, // NSButton: 实验性功能 / Experimental (tag=1)
+    sidebar_mouse: *mut AnyObject,    // NSButton: 鼠标控制 / Mouse (tag=2)
     sidebar_highlight: *mut AnyObject, // NSView: 选中行高亮背景 (layer-backed)
     general_view: *mut AnyObject,    // NSView: 通用页容器 / General page container
     experimental_view: *mut AnyObject, // NSView: 实验性页容器 / Experimental page container
+    mouse_view: *mut AnyObject,       // NSView: 鼠标页容器 / Mouse page container
     theme: *mut AnyObject,           // NSPopUpButton: dark / light / auto
     glass_style: *mut AnyObject,     // NSPopUpButton: regular / clear
     glass_tint: *mut AnyObject,      // NSTextField: RRGGBBAA hex
@@ -54,6 +56,7 @@ struct SettingsUi {
     show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
     log_level: *mut AnyObject,      // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // NSButton (checkbox): 开机自启 / launch at login
+    natural_scroll: *mut AnyObject,  // NSButton (checkbox): 自然滚动 / natural scrolling
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
 }
 unsafe impl Send for SettingsUi {}
@@ -292,20 +295,20 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
     select_sidebar(tag as usize);
 }
 
-/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换两个内容视图显隐、选中项粗体。
-/// Switch the active settings page: align the highlight to the selected button, toggle the two
+/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换三个内容视图显隐、选中项粗体。
+/// Switch the active settings page: align the highlight to the selected button, toggle the three
 /// content views' visibility, and bold the selected item's label.
 fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
-    let idx = if idx > 1 { 0 } else { idx };
+    let idx = if idx > 2 { 0 } else { idx };
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         let ui = match ui.as_ref() {
             Some(u) => u,
             None => return,
         };
-        let buttons = [ui.sidebar_general, ui.sidebar_experimental];
-        let views = [ui.general_view, ui.experimental_view];
+        let buttons = [ui.sidebar_general, ui.sidebar_experimental, ui.sidebar_mouse];
+        let views = [ui.general_view, ui.experimental_view, ui.mouse_view];
         // 高亮背景对齐到选中按钮的 frame / align the highlight to the selected button's frame
         let frame: NSRect = msg_send![buttons[idx], frame];
         let _: () = msg_send![ui.sidebar_highlight, setFrame: frame];
@@ -314,11 +317,12 @@ fn select_sidebar(idx: usize) {
         let titles = [
             t("settings.sidebar_general"),
             t("settings.sidebar_experimental"),
+            t("settings.sidebar_mouse"),
         ];
         for (i, &b) in buttons.iter().enumerate() {
             set_sidebar_title(b, &titles[i], i == idx);
         }
-        // 切换两页显隐 / toggle the two pages' visibility
+        // 切换三页显隐 / toggle the three pages' visibility
         for (i, &v) in views.iter().enumerate() {
             let _: () = msg_send![v, setHidden: i != idx];
         }
@@ -574,6 +578,9 @@ fn load_settings_values() {
         // launch_at_login:按 CONFIG.startup.launch_at_login 设勾选框状态。
         // launch_at_login: set the checkbox state from CONFIG.startup.launch_at_login.
         let _: () = msg_send![ui.launch_at_login, setState: if cfg.startup.launch_at_login { 1isize } else { 0isize }];
+        // natural_scroll:按 CONFIG.mouse.natural_scroll 设勾选框状态。
+        // natural_scroll: set the checkbox state from CONFIG.mouse.natural_scroll.
+        let _: () = msg_send![ui.natural_scroll, setState: if cfg.mouse.natural_scroll { 1isize } else { 0isize }];
     }
 }
 
@@ -667,6 +674,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // launch_at_login: checkbox state (1=on / 0=off).
         let la_state: isize = msg_send![ui.launch_at_login, state];
         cfg.startup.launch_at_login = la_state == 1;
+        // natural_scroll:勾选框 state(1=on / 0=off)。
+        // natural_scroll: checkbox state (1=on / 0=off).
+        let ns_state: isize = msg_send![ui.natural_scroll, state];
+        cfg.mouse.natural_scroll = ns_state == 1;
     }
     for e in cfg.validate() {
         errs.push(e);
@@ -751,9 +762,11 @@ fn create_settings_window() {
             window,
             sidebar_general: std::ptr::null_mut(),
             sidebar_experimental: std::ptr::null_mut(),
+            sidebar_mouse: std::ptr::null_mut(),
             sidebar_highlight: std::ptr::null_mut(),
             general_view: std::ptr::null_mut(),
             experimental_view: std::ptr::null_mut(),
+            mouse_view: std::ptr::null_mut(),
             theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             glass_tint: std::ptr::null_mut(),
@@ -768,6 +781,7 @@ fn create_settings_window() {
             show_minimized: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
+            natural_scroll: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
         };
 
@@ -847,6 +861,15 @@ fn create_settings_window() {
             btn_y0 - 34.0,
             btn_w,
         );
+        ui.sidebar_mouse = make_sidebar_button(
+            sidebar_view,
+            target,
+            &t("settings.sidebar_mouse"),
+            2,
+            12.0,
+            btn_y0 - 68.0,
+            btn_w,
+        );
 
         // --- 通用页容器 general page container ---
         let general_view: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -865,6 +888,15 @@ fn create_settings_window() {
         let _: () = msg_send![content, addSubview: experimental_view];
         release_obj(experimental_view);
         ui.experimental_view = experimental_view;
+
+        // --- 鼠标页容器 mouse page container(初始隐藏 / initially hidden)---
+        let mouse_view: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let mouse_view: *mut AnyObject = msg_send![mouse_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
+        let _: () = msg_send![mouse_view, setHidden: true];
+        let _: () = msg_send![mouse_view, setAutoresizingMask: 18u64]; // 同 general_view:宽高拉伸
+        let _: () = msg_send![content, addSubview: mouse_view];
+        release_obj(mouse_view);
+        ui.mouse_view = mouse_view;
 
         // ===== 通用页内容 general page content =====
         let mut y = content_h - 12.0; // 顶部光标:下一个元素的底边 y / top cursor (bottom y of next element)
@@ -1190,7 +1222,32 @@ fn create_settings_window() {
             make_text_input(ctrl_x, y, ctrl_w, row_h, "110"),
         );
 
-        // --- 确认 / 取消(加在 contentView 上,两页都可见)---
+        // ===== 鼠标页内容 mouse page content =====
+        let mut y = content_h - 12.0;
+
+        // --- 滚动 Scrolling ---
+        y -= 14.0 + 24.0;
+        add_header(
+            mouse_view,
+            &t("settings.header_mouse_scrolling"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
+        y -= 8.0 + row_h;
+        // natural_scroll 勾选框:标题留空(左侧 row label 已说明),仅放一个开关。
+        // natural_scroll checkbox: empty title (the row label on the left already describes it).
+        ui.natural_scroll = add_row(
+            mouse_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_natural_scroll"),
+            make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
+        );
+
+        // --- 确认 / 取消(加在 contentView 上,三页都可见)---
         // Restore Defaults 按钮(左侧偏上,版本号在其下方),与 OK/Cancel 同在 contentView,两页都可见。
         // 宽度限制在 sidebar 内,避免右边跨过 sidebar 分隔线(x=sidebar_w=150)。
         // Restore Defaults button (left, raised; version label below it), on contentView like

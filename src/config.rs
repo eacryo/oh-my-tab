@@ -18,6 +18,7 @@ pub struct Config {
     pub windows: WindowsSection,
     pub logging: LoggingSection,
     pub startup: StartupSection,
+    pub mouse: MouseSection,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -107,6 +108,16 @@ pub struct StartupSection {
     // 开机自启;默认 false,bool::default() 即 false,故 Default 可直接派生。
     // Launch at login; defaults to false (bool::default() is false, so Default derives directly).
     pub launch_at_login: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MouseSection {
+    // 自然滚动:反转鼠标滚轮方向,使其与触控板一致(滚轮下=界面上)。
+    // 默认 false = 传统/Windows 风格(滚轮下=界面下)。仅影响鼠标滚轮,与触控板无关。
+    // Natural scrolling: reverse mouse wheel direction to match trackpad (wheel down = content up).
+    // Defaults to false = traditional/Windows style (wheel down = content down). Mouse only, not trackpad.
+    pub natural_scroll: bool,
 }
 
 // ========== Default implementations (hard-coded fallback values) ==========
@@ -542,6 +553,10 @@ impl Config {
         // startup (bool 字段无需校验,恒有效)
         // startup (bool field needs no validation, always valid)
         self.startup = other.startup;
+
+        // mouse (bool 字段无需校验,恒有效)
+        // mouse (bool field needs no validation, always valid)
+        self.mouse = other.mouse;
     }
 
     fn merge_colors(ours: &mut ThemeColors, theirs: &ThemeColors, theme: &str, errs: &[String]) {

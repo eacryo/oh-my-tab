@@ -92,7 +92,53 @@ extern "C" {
 
     pub(crate) fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     pub(crate) fn CGEventGetIntegerValueField(event: CGEventRef, field: i32) -> i64;
+    pub(crate) fn CGEventSetIntegerValueField(event: CGEventRef, field: i32, value: i64);
+    #[allow(dead_code)]
+    pub(crate) fn CGEventGetDoubleValueField(event: CGEventRef, field: i32) -> f64;
+    #[allow(dead_code)]
+    pub(crate) fn CGEventSetDoubleValueField(event: CGEventRef, field: i32, value: f64);
     pub(crate) fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
+    pub(crate) fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
+    // 从 CGEvent 提取底层 IOHIDEvent(私有 API)。
+    // 当前合成事件方案未使用,未来平滑滚动(需修改底层 IOHIDEvent)会复用。
+    // Extract the underlying IOHIDEvent from a CGEvent (private API).
+    // Unused by the current synthetic approach; reserved for future smoothed scrolling.
+    #[allow(dead_code)]
+    pub(crate) fn CGEventCopyIOHIDEvent(event: CGEventRef) -> *mut c_void;
+
+    // 合成全新的滚轮事件(未来平滑滚动复用此 API)。
+    // source 传 null 表示用默认 source;wheelCount 通常为 2(wheel1=垂直,wheel2=水平)。
+    // Create a brand-new scroll wheel event (reused by future smoothed scrolling).
+    // source=null for default source; wheelCount typically 2 (wheel1=vertical, wheel2=horizontal).
+    pub(crate) fn CGEventCreateScrollWheelEvent2(
+        source: *const c_void,
+        units: u32,
+        wheel_count: u32,
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
+    ) -> CGEventRef;
+
+    // 将事件投递到指定 tap 层级。kCGSessionEventTap=1 投递到 session 层,
+    // 不经过 HID 层 tap,绕过系统自然滚动的 HID 层覆盖。
+    // Post an event to a tap level. kCGSessionEventTap=1 posts to the session level,
+    // bypassing HID-level taps and thus the system's natural-scroll override at the HID layer.
+    pub(crate) fn CGEventPost(tap: i32, event: CGEventRef);
+}
+
+// IOKit 私有 API:读写 IOHIDEvent 的浮点字段。
+// 当前合成事件方案未使用,但未来平滑滚动(需要修改底层 IOHIDEvent)会复用。
+// IOKit private API: read/write float fields of an IOHIDEvent.
+// Unused by the current synthetic-event approach, but reserved for future smoothed scrolling.
+#[allow(dead_code)]
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    /// 读 IOHIDEvent 的浮点字段。
+    /// Read a float field from an IOHIDEvent.
+    pub(crate) fn IOHIDEventGetFloatValue(event: *mut c_void, field: u32) -> f64;
+    /// 写 IOHIDEvent 的浮点字段。
+    /// Write a float field to an IOHIDEvent.
+    pub(crate) fn IOHIDEventSetFloatValue(event: *mut c_void, field: u32, value: f64);
 }
 
 // CFRunLoop 相关函数链接 CoreFoundation(与 event_monitor 原声明一致)。
@@ -238,3 +284,73 @@ pub(crate) fn start_event_tap_thread(
         CFRunLoopRun();
     })
 }
+
+// ========== 滚轮事件字段常量 / scroll wheel event field constants ==========
+// 见 CGEventTypes.h。反转滚轮需要翻转 4 组字段,覆盖所有类型的消费者。
+// See CGEventTypes.h. Scroll reversal flips 4 field groups to cover all consumer types.
+
+/// 垂直滚动量(整数,行级)。field 11。
+/// Vertical scroll delta (integer, line-level). field 11.
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1: i32 = 11;
+/// 水平滚动量(整数,行级)。field 12。
+/// Horizontal scroll delta (integer, line-level). field 12.
+#[allow(dead_code)]
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2: i32 = 12;
+
+/// 垂直滚动量(定点浮点,16.16 格式)。field 93。未来平滑滚动复用。
+/// Vertical scroll delta (fixed-point, 16.16 format). field 93. Reserved for future smoothed scrolling.
+#[allow(dead_code)]
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1: i32 = 93;
+/// 水平滚动量(定点浮点,16.16 格式)。field 94。
+/// Horizontal scroll delta (fixed-point, 16.16 format). field 94.
+#[allow(dead_code)]
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2: i32 = 94;
+
+/// 垂直滚动量(像素级,用于平滑滚动)。field 96。未来平滑滚动复用。
+/// Vertical scroll delta (pixel-level, for smooth scrolling). field 96. Reserved for future.
+#[allow(dead_code)]
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1: i32 = 96;
+/// 水平滚动量(像素级,用于平滑滚动)。field 97。
+/// Horizontal scroll delta (pixel-level, for smooth scrolling). field 97.
+#[allow(dead_code)]
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2: i32 = 97;
+
+/// 是否为连续(像素级)滚动事件。field 88。0=离散(行级),1=连续(触控板式)。
+/// Whether the event is continuous (pixel-level) scroll. field 88. 0=discrete (line), 1=continuous (trackpad).
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS: i32 = 88;
+
+// IOHIDEvent 层的滚轮字段(私有 API)。kIOHIDEventTypeScroll=6,字段 = (type<<16)|offset。
+// X(offset 0)= 393216, Y(offset 1)= 393217。
+// IOHIDEvent-level scroll fields (private API). kIOHIDEventTypeScroll=6, field = (type<<16)|offset.
+/// IOHIDEvent 垂直滚动字段。
+/// IOHIDEvent vertical scroll field.
+#[allow(dead_code)]
+pub(crate) const K_IOHID_EVENT_FIELD_SCROLL_X: u32 = 6 << 16;
+/// IOHIDEvent 水平滚动字段。未来平滑滚动复用。
+/// IOHIDEvent horizontal scroll field. Reserved for future smoothed scrolling.
+#[allow(dead_code)]
+pub(crate) const K_IOHID_EVENT_FIELD_SCROLL_Y: u32 = (6 << 16) | 1;
+
+// ========== 事件合成相关常量 / synthetic event constants ==========
+
+/// CGEventPost 的 tap location:kCGSessionEventTap=1。
+/// 合成事件 post 到 session 层,不经过 HID 层 tap,绕过系统自然滚动覆盖。
+/// CGEventPost tap location: kCGSessionEventTap=1.
+/// Synthetic events posted at session level bypass HID-level taps, avoiding the system's
+/// natural-scroll override at the HID layer.
+pub(crate) const K_CG_SESSION_EVENT_TAP: i32 = 1;
+
+/// CGEventCreateScrollWheelEvent2 的 units:kCGScrollEventUnitLine=1(行级,离散滚动)。
+/// CGEventCreateScrollWheelEvent2 units: kCGScrollEventUnitLine=1 (line-level, discrete scroll).
+pub(crate) const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
+
+/// eventSourceUserData 字段(field 42)。用于在合成事件上打标记,防止自己的 tap 无限循环。
+/// eventSourceUserData field (field 42). Used to tag synthetic events so our own tap can
+/// recognize and skip them, preventing infinite loops.
+pub(crate) const K_CG_EVENT_SOURCE_USER_DATA: i32 = 42;
+
+/// 合成事件标记魔数(ASCII "OMTSCRL")。写入 eventSourceUserData,我们的 tap 据此跳过。
+/// Synthetic-event marker magic (ASCII "OMTSCRL"). Written to eventSourceUserData so our tap
+/// can recognize and skip our own synthetic events.
+#[allow(clippy::unusual_byte_groupings)]
+pub(crate) const SYNTHETIC_MARKER: i64 = 0x4F4D_5453_4352_4C;
