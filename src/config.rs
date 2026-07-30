@@ -113,6 +113,9 @@ pub struct StartupSection {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MouseSection {
+    // 启用鼠标控制功能,包括滚轮反转等。默认 false(不启用,不创建 event tap)。
+    // Enable mouse control features, including scroll reversal. Default false.
+    pub enabled: bool,
     // 反转鼠标滚轮方向。默认 false = 跟随系统行为,true = 额外反转。
     // Reverse mouse scroll wheel direction. Default false = follow system, true = reverse.
     pub reverse_scroll: bool,

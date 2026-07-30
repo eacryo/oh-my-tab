@@ -658,6 +658,12 @@ fn setup_status_bar() {
                 handle_open_privacy as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(handleEnableMouseToggle:),
+                handle_enable_mouse_toggle as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };
@@ -946,9 +952,17 @@ fn main() {
     let _monitor = start_event_monitor(event_tx.clone());
     STATUS_EVENT_TX.set(event_tx).ok();
 
-    // 7b. Start the mouse event tap (minimal verification: logs button/scroll events).
-    // 鼠标事件 tap(最小验证:仅日志输出按键/滚轮事件)。
-    let _mouse_monitor = mouse::start();
+    // 7b. Start the mouse event tap only if enabled in config.
+    // 鼠标事件 tap:仅在配置启用时启动。
+    let mouse_enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
+    let _mouse_monitor = if mouse_enabled {
+        let monitor = mouse::start();
+        log_info!("Mouse control enabled.");
+        Some(monitor)
+    } else {
+        log_info!("Mouse control disabled.");
+        None
+    };
 
     // Bridge thread: flume events → main thread via performSelectorOnMainThread
     thread::spawn(move || {

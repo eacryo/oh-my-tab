@@ -56,7 +56,9 @@ struct SettingsUi {
     show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
     log_level: *mut AnyObject,      // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // NSButton (checkbox): 开机自启 / launch at login
-    reverse_scroll: *mut AnyObject,  // NSButton (checkbox): 自然滚动 / natural scrolling
+    reverse_scroll: *mut AnyObject,  // NSButton (checkbox): 反转滚动 / reverse scrolling
+    enable_mouse: *mut AnyObject,     // NSButton (checkbox): 启用鼠标控制 / enable mouse control
+    ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
 }
 unsafe impl Send for SettingsUi {}
@@ -273,6 +275,14 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
         show_alert(&t("alert.config_error_title"), &errs.join("\n"));
         return;
     }
+
+    // 检查是否需要重启:对比新旧 mouse.enabled。按钮标题已在勾选框 toggle 时实时更新。
+    // Check if restart needed: button title already updated in real time when checkbox toggled.
+    let needs_restart = {
+        let old_cfg = CONFIG.read().unwrap();
+        old_cfg.mouse.enabled != cfg.mouse.enabled
+    };
+
     if let Err(e) = cfg.save() {
         show_alert(&t("alert.save_failed_title"), &e);
         return;
@@ -281,6 +291,42 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
     set_shortcut_mode(cfg.keyboard.modifier == "command");
     apply_config_refresh();
     hide_settings();
+
+    if needs_restart {
+        // 新进程读取已保存的配置,自动启用/停用鼠标 event tap。
+        // The new process reads the saved config and auto-stops/starts the mouse tap.
+        let exe = std::env::current_exe().expect("failed to get executable path");
+        let _ = std::process::Command::new(exe).spawn();
+        std::process::exit(0);
+    }
+}
+
+/// 检查 enable_mouse 勾选框状态与已保存配置是否一致,不一致时将 OK 按钮改为"确认并重启"。
+/// Check if the enable_mouse checkbox state matches the saved config; if not, change OK to
+/// "OK && Restart".
+unsafe fn update_ok_button_title(ui: &SettingsUi) {
+    let state: isize = msg_send![ui.enable_mouse, state];
+    let saved = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
+    if (state == 1) != saved {
+        set_control_title(ui.ok_button, &t("settings.btn_ok_restart"));
+    } else {
+        set_control_title(ui.ok_button, &t("settings.btn_ok"));
+    }
+}
+
+/// enable_mouse 勾选框 toggle 回调:实时更新 OK 按钮标题。
+/// Callback when the enable_mouse checkbox is toggled: update the OK button title in real time.
+pub(crate) extern "C" fn handle_enable_mouse_toggle(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            update_ok_button_title(u);
+        }
+    }
 }
 
 pub(crate) extern "C" fn on_settings_cancel(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
@@ -495,6 +541,7 @@ pub(crate) extern "C" fn handle_restore_defaults(
     // login-item toggle, not an appearance/layout/shortcut setting, so Restore Defaults must not
     // reset it (otherwise it unregisters a login item the user explicitly enabled).
     let preserved_launch_at_login = CONFIG.read().unwrap().startup.launch_at_login;
+    let old_enabled = CONFIG.read().unwrap().mouse.enabled;
     let mut defaults = Config::default();
     defaults.startup.launch_at_login = preserved_launch_at_login;
     if let Err(e) = defaults.save() {
@@ -518,6 +565,19 @@ pub(crate) extern "C" fn handle_restore_defaults(
     // Settings window is open: repopulate controls with defaults + reset to General page.
     load_settings_values();
     select_sidebar(0);
+    // 恢复默认后可能改变了 mouse.enabled,刷新 OK 按钮标题。
+    // Restore defaults may have changed mouse.enabled; refresh the OK button title.
+    unsafe {
+        if let Some(ui) = SETTINGS_UI.lock().unwrap().as_ref() {
+            update_ok_button_title(ui);
+            // 若 mouse.enabled 发生了实际变化,update_ok_button_title 无法感知(勾选框与 CONFIG 一致),
+            // 手动修正按钮为"确认并重启"。
+            let new_enabled = CONFIG.read().unwrap().mouse.enabled;
+            if old_enabled != new_enabled {
+                set_control_title(ui.ok_button, &t("settings.btn_ok_restart"));
+            }
+        }
+    }
     log_info!("Config restored to defaults.");
 }
 
@@ -581,6 +641,13 @@ fn load_settings_values() {
         // reverse_scroll:按 CONFIG.mouse.reverse_scroll 设勾选框状态。
         // reverse_scroll: set the checkbox state from CONFIG.mouse.reverse_scroll.
         let _: () = msg_send![ui.reverse_scroll, setState: if cfg.mouse.reverse_scroll { 1isize } else { 0isize }];
+        // enable_mouse:按 CONFIG.mouse.enabled 设勾选框状态。
+        // enable_mouse: set the checkbox state from CONFIG.mouse.enabled.
+        let _: () = msg_send![ui.enable_mouse, setState: if cfg.mouse.enabled { 1isize } else { 0isize }];
+
+        // 每次打开设置时,同步 OK 按钮标题(可能因配置变化而需要重启)。
+        // Sync OK button title on each settings open (config changes may require restart).
+        update_ok_button_title(ui);
     }
 }
 
@@ -678,6 +745,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // reverse_scroll: checkbox state (1=on / 0=off).
         let ns_state: isize = msg_send![ui.reverse_scroll, state];
         cfg.mouse.reverse_scroll = ns_state == 1;
+        // enable_mouse:勾选框 state(1=on / 0=off)。
+        // enable_mouse: checkbox state (1=on / 0=off).
+        let em_state: isize = msg_send![ui.enable_mouse, state];
+        cfg.mouse.enabled = em_state == 1;
     }
     for e in cfg.validate() {
         errs.push(e);
@@ -782,6 +853,8 @@ fn create_settings_window() {
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
+            enable_mouse: std::ptr::null_mut(),
+            ok_button: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
         };
 
@@ -1225,7 +1298,24 @@ fn create_settings_window() {
         // ===== 鼠标页内容 mouse page content =====
         let mut y = content_h - 12.0;
 
+        // --- 启用鼠标控制(总开关) / Enable mouse control ---
+        y -= 8.0 + row_h;
+        ui.enable_mouse = add_row(
+            mouse_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_enable_mouse"),
+            make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
+        );
+        // 勾选框 toggle 时实时更新 OK 按钮标题(确认 vs 确认并重启)。
+        // Update OK button title in real time when checkbox toggles (OK vs OK && Restart).
+        let _: () = msg_send![ui.enable_mouse, setTarget: target];
+        let _: () = msg_send![ui.enable_mouse, setAction: sel!(handleEnableMouseToggle:)];
+
         // --- 滚动 Scrolling ---
+        y -= 14.0 + 24.0;
         y -= 14.0 + 24.0;
         add_header(
             mouse_view,
@@ -1305,6 +1395,7 @@ fn create_settings_window() {
         let _: () = msg_send![ok, setTarget: target];
         let _: () = msg_send![ok, setAction: sel!(handleSettingsOk:)];
         let _: () = msg_send![content, addSubview: ok];
+        ui.ok_button = ok;
         release_obj(ok);
 
         *SETTINGS_UI.lock().unwrap() = Some(ui);
