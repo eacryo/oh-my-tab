@@ -303,6 +303,26 @@ fn cf_dict_get_u32(dict: *const c_void, key: &str) -> Option<u32> {
     }
 }
 
+/// 读 CG dict 里的 CFNumber double(如 kCGWindowAlpha)。CFNumberGetValue type 13 =
+/// kCFNumberDoubleType。
+/// Read a CFNumber double from a CG dict (e.g. kCGWindowAlpha). CFNumberGetValue type 13 =
+/// kCFNumberDoubleType.
+fn cf_dict_get_f64(dict: *const c_void, key: &str) -> Option<f64> {
+    let cf_key = cf_string_new(key);
+    let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
+    unsafe { CFRelease(cf_key) };
+    if value.is_null() {
+        return None;
+    }
+    let mut num: f64 = 0.0;
+    let ok = unsafe { CFNumberGetValue(value, 13, &mut num as *mut f64 as *mut c_void) };
+    if ok {
+        Some(num)
+    } else {
+        None
+    }
+}
+
 // 读 CG dict 里的 CFBoolean(如 kCGWindowIsOnscreen)。/ Read a CFBoolean from a CG dict (e.g. kCGWindowIsOnscreen).
 fn cf_dict_get_bool(dict: *const c_void, key: &str) -> Option<bool> {
     let cf_key = cf_string_new(key);
@@ -691,12 +711,27 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
     }
 }
 
-fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String, bool)> {
+/// 查一个 PID 的 AX 标准窗口列表。
+/// 返回 None = AX 查询失败(该 App 无 AX 数据,可走 CG 回退);
+/// Some(vec) = 查询成功,subrole 过滤后可能为空(无标准窗口 = 调度中心不显示它,直接跳过)。
+///
+/// Query an app's AX standard-window list.
+/// None = AX query failed (app has no AX data; CG fallback allowed);
+/// Some(vec) = query succeeded, possibly empty after subrole filtering (no standard windows =
+/// Mission Control won't show it; skip entirely).
+fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)>> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
-            return vec![];
+            return None;
         }
+
+        // 设 50ms 消息超时:慢/无响应 App 的 AX 查询会快速失败,而不是卡默认 10s 超时
+        // (后者会让该 App 整体走 CG 回退,混入隐形窗口)。
+        // Set a 50ms messaging timeout: AX queries on slow/unresponsive apps fail fast instead
+        // of hitting the default 10s timeout (which would push the app to the CG fallback path
+        // and let invisible windows through).
+        AXUIElementSetMessagingTimeout(app, 0.05);
 
         let windows_key = cf_string_new("AXWindows");
         let mut windows_array: *const c_void = std::ptr::null();
@@ -704,7 +739,7 @@ fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String, bool)> {
         CFRelease(windows_key);
         CFRelease(app);
         if err != K_AX_SUCCESS || windows_array.is_null() {
-            return vec![];
+            return None;
         }
 
         let count = CFArrayGetCount(windows_array);
@@ -773,7 +808,7 @@ fn get_ax_windows_for_pid(pid: i32) -> Vec<(u32, String, bool)> {
         CFRelease(subrole_key);
         CFRelease(minimized_key);
         CFRelease(windows_array);
-        results
+        Some(results)
     }
 }
 
@@ -852,7 +887,14 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
     // 以 AX 窗口列表为主数据源（macOS App Switcher 的做法）
     // Use AX window list as primary source (same as macOS App Switcher)
-    let mut ax_by_pid: HashMap<i32, Vec<String>> = HashMap::new();
+    // AX 查询「成功」的 pid 集合:成功但无标准窗口的 App 应整体跳过(调度中心不显示它),
+    // 只有查询失败(None)才允许走 CG 回退。这是 BetterDisplay 隐形窗口 bug 的根因修复:
+    // AX 成功但 subrole 过滤后为空,不能等同于「无 AX 数据」。
+    // Pids whose AX query SUCCEEDED: an app with a successful query but no standard windows
+    // must be skipped entirely (Mission Control doesn't show it); only a failed query (None)
+    // allows the CG fallback. This fixes the BetterDisplay invisible-window bug: an AX query
+    // that succeeds but yields no standard windows must not be treated as "no AX data".
+    let mut ax_queried_pids: HashSet<i32> = HashSet::new();
     // pid -> (CGWindowID -> (AX 标题, 是否最小化)),用于按 CGWindowID 精确配对 CG 窗口。
     // pid -> (CGWindowID -> (AX title, minimized)), to pair CG windows by CGWindowID.
     let mut ax_wid_to_info: HashMap<i32, HashMap<u32, (String, bool)>> = HashMap::new();
@@ -871,18 +913,29 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     for &pid in &pids {
         icon_ids.insert(pid, unsafe { resolve_app_identity(pid) });
         let ax_wins = get_ax_windows_for_pid(pid);
-        if !ax_wins.is_empty() {
-            if ax_wins.iter().all(|(_, t, _)| t.is_empty()) {
-                titleless_pids.insert(pid);
-            }
-            ax_by_pid.insert(pid, ax_wins.iter().map(|(_, t, _)| t.clone()).collect());
-            let mut wid_map: HashMap<u32, (String, bool)> = HashMap::new();
-            for (cgwid, title, minimized) in &ax_wins {
-                if *cgwid != 0 {
-                    wid_map.insert(*cgwid, (title.clone(), *minimized));
+        match ax_wins {
+            Some(wins) if !wins.is_empty() => {
+                ax_queried_pids.insert(pid);
+                if wins.iter().all(|(_, t, _)| t.is_empty()) {
+                    titleless_pids.insert(pid);
                 }
+                let mut wid_map: HashMap<u32, (String, bool)> = HashMap::new();
+                for (cgwid, title, minimized) in &wins {
+                    if *cgwid != 0 {
+                        wid_map.insert(*cgwid, (title.clone(), *minimized));
+                    }
+                }
+                ax_wid_to_info.insert(pid, wid_map);
             }
-            ax_wid_to_info.insert(pid, wid_map);
+            // AX 查询成功但无标准窗口:该 App 没有调度中心可见的窗口,后续直接跳过。
+            // AX query succeeded but no standard windows: the app has no Mission-Control-visible
+            // windows; skip all its CG windows in the second pass.
+            Some(_) => {
+                ax_queried_pids.insert(pid);
+            }
+            // AX 查询失败(无 AX 数据):保留 CG 回退路径。
+            // AX query failed (no AX data): keep the CG fallback path.
+            None => {}
         }
     }
 
@@ -894,6 +947,13 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
         let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
         if layer != 0 {
+            continue;
+        }
+
+        // 全透明窗口(alpha=0)不可见,调度中心不显示,跳过。
+        // Fully transparent windows (alpha=0) are invisible; Mission Control doesn't show them.
+        let alpha = cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0);
+        if alpha <= 0.0 {
             continue;
         }
 
@@ -920,6 +980,13 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
                 Some((t, m)) => (t.clone(), *m),
                 None => continue, // CG 窗口在 AX 里没有 -> 弹出面板，跳过 / popup, skip
             }
+        } else if ax_queried_pids.contains(&owner_pid) {
+            // AX 查询成功但该 App 无标准窗口(如 BetterDisplay 的隐形锚点窗口):
+            // 调度中心不显示它,这里也整体跳过,不回退到 CG。
+            // AX query succeeded but the app has no standard windows (e.g. BetterDisplay's
+            // invisible anchor window): Mission Control doesn't show it, skip entirely —
+            // no CG fallback.
+            continue;
         } else {
             // 该 App 无 AX 数据 -> 退回 CG 标题,最小化状态未知按 false。
             // No AX data -> fall back to CG title; minimized status unknown, assume false.
@@ -937,15 +1004,12 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             }
         }
 
-        if window_title.is_empty()
-            && (!ax_by_pid.contains_key(&owner_pid) || titleless_pids.contains(&owner_pid))
-        {
-            // 空标题窗口仅对「无 AX 支持」或「AX 窗口全部无标题」的 App 保留
-            // Keep titleless windows for apps with no AX support, or apps whose
-            // AX windows are all untitled (e.g. Microsoft To Do).
-        } else if window_title.is_empty() {
-            // 有标题窗口的 App 出现空标题 -> 视为弹出面板/下拉菜单，跳过
-            // Empty title on an app that has titled windows -> popup/panel, skip
+        // 空标题窗口仅对「AX 确认过全部窗口无标题」的 App(titleless_pids)保留;
+        // AX 查询失败回退的 App 不再享受空标题豁免(无法确认其窗口身份)。
+        // Titleless windows are kept only for apps AX confirmed as all-untitled
+        // (titleless_pids); the AX-failed fallback no longer exempts empty titles
+        // (window identity can't be verified there).
+        if window_title.is_empty() && !titleless_pids.contains(&owner_pid) {
             continue;
         }
 
