@@ -964,6 +964,10 @@ fn main() {
         None
     };
 
+    // 7c. Apply pointer settings (disable system acceleration if configured).
+    // 指针设置(配置了禁用系统加速时立即生效)。
+    mouse::pointer::apply();
+
     // Bridge thread: flume events → main thread via performSelectorOnMainThread
     thread::spawn(move || {
         while let Ok(event) = event_rx.recv() {

@@ -75,10 +75,11 @@ struct SettingsUi {
     launch_at_login: *mut AnyObject, // NSButton (checkbox): 开机自启 / launch at login
     reverse_scroll: *mut AnyObject, // NSButton (checkbox): 反转滚动 / reverse scrolling
     enable_mouse: *mut AnyObject,   // NSButton (checkbox): 启用鼠标控制 / enable mouse control
-    scroll_mode: *mut AnyObject,    // NSPopUpButton: default/line/smooth
-    line_count: *mut AnyObject,     // NSTextField: line count input
-    smooth_preset: *mut AnyObject,  // NSPopUpButton: smooth preset
-    ok_button: *mut AnyObject,      // NSButton: 确认按钮 / OK button
+    scroll_mode: *mut AnyObject,      // NSPopUpButton: default/line/smooth
+    line_count: *mut AnyObject,       // NSTextField: line count input
+    smooth_preset: *mut AnyObject,    // NSPopUpButton: smooth preset
+    disable_pointer_accel: *mut AnyObject, // NSButton (checkbox): 禁用指针加速 / disable pointer acceleration
+    ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
 }
 unsafe impl Send for SettingsUi {}
@@ -308,6 +309,9 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
         return;
     }
     let _ = reload_config();
+    // 指针加速设置(禁用/恢复)实时生效,无需重启。
+    // Pointer acceleration settings take effect immediately, no restart needed.
+    crate::mouse::pointer::apply();
     set_shortcut_mode(cfg.keyboard.modifier == "command");
     apply_config_refresh();
     hide_settings();
@@ -575,6 +579,9 @@ pub(crate) extern "C" fn handle_restore_defaults(
     // 重读(现在是默认值)+ 应用 locale/logger。
     // Reload (now defaults) + apply locale/logger.
     let _ = reload_config();
+    // 恢复默认后指针加速设置随之恢复/应用。
+    // Pointer acceleration settings follow the restored defaults.
+    crate::mouse::pointer::apply();
     // 同步快捷键模式(默认 command)+ 开机自启(保留用户原值,不重置)。
     // Sync shortcut mode (default command) + launch-at-login (preserved user value, not reset).
     set_shortcut_mode(CONFIG.read().unwrap().keyboard.modifier == "command");
@@ -669,6 +676,9 @@ fn load_settings_values() {
         // enable_mouse: set the checkbox state from CONFIG.mouse.enabled.
         let _: () =
             msg_send![ui.enable_mouse, setState: if cfg.mouse.enabled { 1isize } else { 0isize }];
+        // disable_pointer_accel:按 CONFIG.mouse.pointer.disable_acceleration 设勾选框状态。
+        // disable_pointer_accel: set the checkbox state from CONFIG.mouse.pointer.disable_acceleration.
+        let _: () = msg_send![ui.disable_pointer_accel, setState: if cfg.mouse.pointer.disable_acceleration { 1isize } else { 0isize }];
         // scroll_mode:按 CONFIG.mouse.scroll_mode 选中对应项。
         // scroll_mode: select item matching CONFIG.mouse.scroll_mode.
         let sm_idx: isize = SCROLL_MODE_VALUES
@@ -793,6 +803,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // enable_mouse: checkbox state (1=on / 0=off).
         let em_state: isize = msg_send![ui.enable_mouse, state];
         cfg.mouse.enabled = em_state == 1;
+        // disable_pointer_accel:勾选框 state(1=on / 0=off)。
+        // disable_pointer_accel: checkbox state (1=on / 0=off).
+        let dpa_state: isize = msg_send![ui.disable_pointer_accel, state];
+        cfg.mouse.pointer.disable_acceleration = dpa_state == 1;
         // scroll_mode:下拉框 index 对应 SCROLL_MODE_VALUES。
         // scroll_mode: popup index matches SCROLL_MODE_VALUES.
         let sm_idx: isize = msg_send![ui.scroll_mode, indexOfSelectedItem];
@@ -921,6 +935,7 @@ fn create_settings_window() {
             scroll_mode: std::ptr::null_mut(),
             line_count: std::ptr::null_mut(),
             smooth_preset: std::ptr::null_mut(),
+            disable_pointer_accel: std::ptr::null_mut(),
             ok_button: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
         };
@@ -1437,6 +1452,29 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_reverse_scroll"),
+            make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
+        );
+
+        // --- 指针 Pointer ---
+        y -= 14.0 + 24.0;
+        add_header(
+            mouse_view,
+            &t("settings.header_mouse_pointer"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
+        y -= 8.0 + row_h;
+        // disable_pointer_accel 勾选框:禁用系统鼠标加速,光标 1:1 线性跟踪。
+        // disable_pointer_accel checkbox: disable system pointer acceleration for 1:1 linear
+        // cursor tracking.
+        ui.disable_pointer_accel = add_row(
+            mouse_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_disable_pointer_accel"),
             make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
         );
 

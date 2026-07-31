@@ -110,6 +110,14 @@ pub struct StartupSection {
     pub launch_at_login: bool,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PointerSection {
+    // 禁用系统鼠标加速,光标 1:1 线性跟踪。默认 false。
+    // Disable system pointer acceleration for 1:1 linear cursor tracking. Default false.
+    pub disable_acceleration: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MouseSection {
@@ -128,6 +136,9 @@ pub struct MouseSection {
     // 平滑滚动预设(13 种)。默认 "easeInOut"。
     // Smooth scrolling preset. Default "easeInOut".
     pub smooth_preset: String,
+    // 指针设置(禁用系统加速等)。
+    // Pointer settings (e.g. disabling system acceleration).
+    pub pointer: PointerSection,
 }
 
 impl Default for MouseSection {
@@ -138,6 +149,7 @@ impl Default for MouseSection {
             scroll_mode: "default".into(),
             line_count: 3,
             smooth_preset: "easeInOut".into(),
+            pointer: PointerSection::default(),
         }
     }
 }
@@ -621,6 +633,7 @@ impl Config {
         } else {
             self.mouse.enabled = other.mouse.enabled;
             self.mouse.reverse_scroll = other.mouse.reverse_scroll;
+            self.mouse.pointer = other.mouse.pointer;
             if !errs.iter().any(|e| e.starts_with("mouse.scroll_mode")) {
                 self.mouse.scroll_mode = other.mouse.scroll_mode;
             }

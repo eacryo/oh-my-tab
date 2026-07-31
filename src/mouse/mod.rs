@@ -6,6 +6,8 @@
 //! count), and Smooth (physics engine + inertia).
 
 pub(crate) mod event_tap;
+pub(crate) mod ffi;
+pub(crate) mod pointer;
 pub(crate) mod scrolling;
 
 pub(crate) use event_tap::start;

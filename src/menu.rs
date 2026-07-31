@@ -114,6 +114,10 @@ pub(crate) fn refresh_menu_titles() {
 
 pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     log_info!("User quit via menu bar.");
+    // 退出前恢复指针加速设置(否则系统鼠标保持线性,直到用户手动重置)。
+    // Restore pointer acceleration settings before quitting (otherwise the mouse stays
+    // linear until the user resets it manually).
+    crate::mouse::pointer::restore();
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![nsapp, terminate: std::ptr::null::<AnyObject>()];
@@ -218,6 +222,9 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
     apply_theme();
     refresh_highlight();
     update_status_label();
+    // 重新应用指针加速设置(reload 后配置可能变化)。
+    // Re-apply pointer acceleration settings (config may have changed on reload).
+    crate::mouse::pointer::apply();
 }
 
 /// 清空图标缓存:删除缓存目录里所有缓存文件({key}.png + {key}.meta),失效内存里的 icon_path,
