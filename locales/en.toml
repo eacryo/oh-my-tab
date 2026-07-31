@@ -45,6 +45,9 @@ sidebar_mouse = "Mouse"
 header_mouse_scrolling = "Scrolling"
 row_reverse_scroll = "Reverse scrolling"
 row_enable_mouse = "Enable mouse control"
+row_scroll_mode = "Scroll mode"
+row_line_count = "Lines per tick"
+row_smooth_preset = "Smooth preset"
 experimental_note = "Experimental options - no guarantee of availability; may be removed in future versions."
 btn_cancel = "Cancel"
 btn_ok = "OK"
@@ -86,3 +89,6 @@ keyboard_modifier_invalid = 'keyboard.modifier: "{value}" is not one of option, 
 i18n_locale_invalid = 'i18n.locale: "{value}" is not one of auto, en, zh-Hans, zh-Hant'
 logging_level_invalid = "logging.level: '{value}' is invalid (expect: info, warn, error)"
 config_read_failed = "cannot read config: {error}"
+mouse_scroll_mode_invalid = 'mouse.scroll_mode: "{value}" is not one of default, line, smooth'
+mouse_line_count_invalid = "mouse.line_count: {value} must be 1..=10"
+mouse_smooth_preset_invalid = 'mouse.smooth_preset: "{value}" is not a valid preset name'

@@ -18,8 +18,23 @@ pub(crate) type CGEventTapProxy = *mut c_void;
 pub(crate) type CFMachPortRef = *mut c_void;
 pub(crate) type CFRunLoopSourceRef = *mut c_void;
 pub(crate) type CFRunLoopRef = *mut c_void;
+pub(crate) type CFRunLoopTimerRef = *mut c_void;
 pub(crate) type CFStringRef = *mut c_void;
 pub(crate) type CFAllocatorRef = *mut c_void;
+pub(crate) type CFOptionFlags = u64;
+pub(crate) type CFIndex = isize;
+
+pub(crate) type CFRunLoopTimerCallBack =
+    Option<unsafe extern "C" fn(timer: CFRunLoopTimerRef, info: *mut c_void)>;
+
+#[repr(C)]
+pub(crate) struct CFRunLoopTimerContext {
+    pub(crate) version: CFIndex,
+    pub(crate) info: *mut c_void,
+    pub(crate) retain: Option<unsafe extern "C" fn(info: *mut c_void) -> *mut c_void>,
+    pub(crate) release: Option<unsafe extern "C" fn(info: *mut c_void)>,
+    pub(crate) copy_description: Option<unsafe extern "C" fn(info: *mut c_void) -> CFStringRef>,
+}
 pub(crate) type CGEventType = u32;
 pub(crate) type CGEventFlags = u64;
 pub(crate) type CGEventMask = u64;
@@ -141,8 +156,8 @@ extern "C" {
     pub(crate) fn IOHIDEventSetFloatValue(event: *mut c_void, field: u32, value: f64);
 }
 
-// CFRunLoop 相关函数链接 CoreFoundation(与 event_monitor 原声明一致)。
-// CFRunLoop functions link against CoreFoundation (matching event_monitor's original declaration).
+// CFRunLoop 相关函数 + 定时器,链接 CoreFoundation。
+// CFRunLoop functions + timer, linking CoreFoundation.
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     pub(crate) fn CFMachPortCreateRunLoopSource(
@@ -158,6 +173,23 @@ extern "C" {
     );
     pub(crate) fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     pub(crate) fn CFRunLoopRun();
+
+    pub(crate) fn CFAbsoluteTimeGetCurrent() -> f64;
+
+    pub(crate) fn CFRunLoopTimerCreate(
+        allocator: CFAllocatorRef,
+        fire_date: f64,
+        interval: f64,
+        flags: CFOptionFlags,
+        order: CFIndex,
+        callout: CFRunLoopTimerCallBack,
+        context: *mut CFRunLoopTimerContext,
+    ) -> CFRunLoopTimerRef;
+
+    pub(crate) fn CFRunLoopAddTimer(rl: CFRunLoopRef, timer: CFRunLoopTimerRef, mode: CFStringRef);
+
+    #[allow(dead_code)]
+    pub(crate) fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
 
     pub(crate) static kCFRunLoopDefaultMode: CFStringRef;
 }
@@ -184,7 +216,7 @@ const RETRY_MAX: u32 = 40;
 /// # Safety
 /// 调用方必须在专用线程上调用(后续 CFRunLoopRun 会阻塞该线程)。
 /// Caller must invoke on a dedicated thread (CFRunLoopRun will block it afterwards).
-unsafe fn create_tap_with_retry(
+pub(crate) unsafe fn create_tap_with_retry(
     location: i32,
     placement: i32,
     options: u32,
@@ -354,3 +386,28 @@ pub(crate) const K_CG_EVENT_SOURCE_USER_DATA: i32 = 42;
 /// can recognize and skip our own synthetic events.
 #[allow(clippy::unusual_byte_groupings)]
 pub(crate) const SYNTHETIC_MARKER: i64 = 0x4F4D_5453_4352_4C;
+
+/// CGEventCreateScrollWheelEvent2 的 units:kCGScrollEventUnitPixel=0(像素级,连续滚动)。
+/// CGEventCreateScrollWheelEvent2 units: kCGScrollEventUnitPixel=0 (pixel-level, continuous scroll).
+pub(crate) const K_CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
+
+// ========== 平滑滚动相位常量 / Smooth scroll phase constants ==========
+
+/// kCGScrollWheelEventScrollPhase field (field 99): scroll phase.
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_SCROLL_PHASE: i32 = 99;
+/// kCGScrollWheelEventMomentumPhase field (field 123): momentum phase.
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: i32 = 123;
+
+#[allow(dead_code)]
+pub(crate) const SCROLL_PHASE_BEGAN: i64 = 1;
+#[allow(dead_code)]
+pub(crate) const SCROLL_PHASE_CHANGED: i64 = 2;
+#[allow(dead_code)]
+pub(crate) const SCROLL_PHASE_ENDED: i64 = 4;
+
+#[allow(dead_code)]
+pub(crate) const MOMENTUM_PHASE_BEGAN: i64 = 1;
+#[allow(dead_code)]
+pub(crate) const MOMENTUM_PHASE_CHANGED: i64 = 2;
+#[allow(dead_code)]
+pub(crate) const MOMENTUM_PHASE_ENDED: i64 = 3;

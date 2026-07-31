@@ -110,7 +110,7 @@ pub struct StartupSection {
     pub launch_at_login: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MouseSection {
     // 启用鼠标控制功能,包括滚轮反转等。默认 false(不启用,不创建 event tap)。
@@ -119,6 +119,27 @@ pub struct MouseSection {
     // 反转鼠标滚轮方向。默认 false = 跟随系统行为,true = 额外反转。
     // Reverse mouse scroll wheel direction. Default false = follow system, true = reverse.
     pub reverse_scroll: bool,
+    // 滚轮滚动模式:"default" | "line" | "smooth"。默认 "default"。
+    // Scroll mode. Default "default".
+    pub scroll_mode: String,
+    // 按行模式下的行数(1..=10)。默认 3。
+    // Line count in line mode (1..=10). Default 3.
+    pub line_count: u32,
+    // 平滑滚动预设(13 种)。默认 "easeInOut"。
+    // Smooth scrolling preset. Default "easeInOut".
+    pub smooth_preset: String,
+}
+
+impl Default for MouseSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reverse_scroll: false,
+            scroll_mode: "default".into(),
+            line_count: 3,
+            smooth_preset: "easeInOut".into(),
+        }
+    }
 }
 
 // ========== Default implementations (hard-coded fallback values) ==========
@@ -127,7 +148,7 @@ impl Default for Appearance {
     fn default() -> Self {
         Appearance {
             theme: "light".into(),
-            glass_style: "clear".into(),
+            glass_style: "regular".into(),
             glass_tint: "eeeeee66".into(),
             corner_radius: 64.0,
         }
@@ -422,6 +443,44 @@ impl Config {
             ));
         }
 
+        // --- mouse.scroll_mode ---
+        if !["default", "line", "smooth"].contains(&self.mouse.scroll_mode.as_str()) {
+            errs.push(tf(
+                "errors.mouse_scroll_mode_invalid",
+                &[("value", &self.mouse.scroll_mode)],
+            ));
+        }
+        // --- mouse.line_count ---
+        if self.mouse.line_count < 1 || self.mouse.line_count > 10 {
+            errs.push(tf(
+                "errors.mouse_line_count_invalid",
+                &[("value", &self.mouse.line_count.to_string())],
+            ));
+        }
+        // --- mouse.smooth_preset ---
+        if ![
+            "custom",
+            "linear",
+            "easeIn",
+            "easeOut",
+            "easeInOut",
+            "quadratic",
+            "cubic",
+            "quartic",
+            "easeOutCubic",
+            "easeInOutCubic",
+            "easeOutQuartic",
+            "easeInOutQuartic",
+            "smooth",
+        ]
+        .contains(&self.mouse.smooth_preset.as_str())
+        {
+            errs.push(tf(
+                "errors.mouse_smooth_preset_invalid",
+                &[("value", &self.mouse.smooth_preset)],
+            ));
+        }
+
         errs
     }
 
@@ -557,7 +616,21 @@ impl Config {
 
         // mouse (bool 字段无需校验,恒有效)
         // mouse (bool field needs no validation, always valid)
-        self.mouse = other.mouse;
+        if !has_error("mouse.") {
+            self.mouse = other.mouse;
+        } else {
+            self.mouse.enabled = other.mouse.enabled;
+            self.mouse.reverse_scroll = other.mouse.reverse_scroll;
+            if !errs.iter().any(|e| e.starts_with("mouse.scroll_mode")) {
+                self.mouse.scroll_mode = other.mouse.scroll_mode;
+            }
+            if !errs.iter().any(|e| e.starts_with("mouse.line_count")) {
+                self.mouse.line_count = other.mouse.line_count;
+            }
+            if !errs.iter().any(|e| e.starts_with("mouse.smooth_preset")) {
+                self.mouse.smooth_preset = other.mouse.smooth_preset;
+            }
+        }
     }
 
     fn merge_colors(ours: &mut ThemeColors, theirs: &ThemeColors, theme: &str, errs: &[String]) {

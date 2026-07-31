@@ -27,6 +27,23 @@ use crate::MENU_TARGET;
 // Locale popup items: displayed in each language's own script (convention for language pickers);
 // values map to config.i18n.locale.
 const LOCALE_LABELS: [&str; 4] = ["Auto", "English", "简体中文", "繁體中文"];
+const SCROLL_MODE_LABELS: [&str; 3] = ["Default", "Line", "Smooth"];
+const SCROLL_MODE_VALUES: [&str; 3] = ["default", "line", "smooth"];
+const SMOOTH_PRESET_LABELS: [&str; 13] = [
+    "easeInOut",
+    "easeIn",
+    "easeOut",
+    "linear",
+    "quadratic",
+    "cubic",
+    "easeOutCubic",
+    "easeInOutCubic",
+    "quartic",
+    "easeOutQuartic",
+    "easeInOutQuartic",
+    "smooth",
+    "custom",
+];
 const LOCALE_VALUES: [&str; 4] = ["auto", "en", "zh-Hans", "zh-Hant"];
 
 // ========== 设置窗口状态 / settings window state ==========
@@ -37,11 +54,11 @@ struct SettingsUi {
     window: *mut AnyObject,
     sidebar_general: *mut AnyObject, // NSButton: 通用 / General (tag=0)
     sidebar_experimental: *mut AnyObject, // NSButton: 实验性功能 / Experimental (tag=1)
-    sidebar_mouse: *mut AnyObject,    // NSButton: 鼠标控制 / Mouse (tag=2)
+    sidebar_mouse: *mut AnyObject,   // NSButton: 鼠标控制 / Mouse (tag=2)
     sidebar_highlight: *mut AnyObject, // NSView: 选中行高亮背景 (layer-backed)
     general_view: *mut AnyObject,    // NSView: 通用页容器 / General page container
     experimental_view: *mut AnyObject, // NSView: 实验性页容器 / Experimental page container
-    mouse_view: *mut AnyObject,       // NSView: 鼠标页容器 / Mouse page container
+    mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
     theme: *mut AnyObject,           // NSPopUpButton: dark / light / auto
     glass_style: *mut AnyObject,     // NSPopUpButton: regular / clear
     glass_tint: *mut AnyObject,      // NSTextField: RRGGBBAA hex
@@ -56,9 +73,12 @@ struct SettingsUi {
     show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
     log_level: *mut AnyObject,      // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // NSButton (checkbox): 开机自启 / launch at login
-    reverse_scroll: *mut AnyObject,  // NSButton (checkbox): 反转滚动 / reverse scrolling
-    enable_mouse: *mut AnyObject,     // NSButton (checkbox): 启用鼠标控制 / enable mouse control
-    ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
+    reverse_scroll: *mut AnyObject, // NSButton (checkbox): 反转滚动 / reverse scrolling
+    enable_mouse: *mut AnyObject,   // NSButton (checkbox): 启用鼠标控制 / enable mouse control
+    scroll_mode: *mut AnyObject,    // NSPopUpButton: default/line/smooth
+    line_count: *mut AnyObject,     // NSTextField: line count input
+    smooth_preset: *mut AnyObject,  // NSPopUpButton: smooth preset
+    ok_button: *mut AnyObject,      // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
 }
 unsafe impl Send for SettingsUi {}
@@ -353,7 +373,11 @@ fn select_sidebar(idx: usize) {
             Some(u) => u,
             None => return,
         };
-        let buttons = [ui.sidebar_general, ui.sidebar_experimental, ui.sidebar_mouse];
+        let buttons = [
+            ui.sidebar_general,
+            ui.sidebar_experimental,
+            ui.sidebar_mouse,
+        ];
         let views = [ui.general_view, ui.experimental_view, ui.mouse_view];
         // 高亮背景对齐到选中按钮的 frame / align the highlight to the selected button's frame
         let frame: NSRect = msg_send![buttons[idx], frame];
@@ -643,7 +667,27 @@ fn load_settings_values() {
         let _: () = msg_send![ui.reverse_scroll, setState: if cfg.mouse.reverse_scroll { 1isize } else { 0isize }];
         // enable_mouse:按 CONFIG.mouse.enabled 设勾选框状态。
         // enable_mouse: set the checkbox state from CONFIG.mouse.enabled.
-        let _: () = msg_send![ui.enable_mouse, setState: if cfg.mouse.enabled { 1isize } else { 0isize }];
+        let _: () =
+            msg_send![ui.enable_mouse, setState: if cfg.mouse.enabled { 1isize } else { 0isize }];
+        // scroll_mode:按 CONFIG.mouse.scroll_mode 选中对应项。
+        // scroll_mode: select item matching CONFIG.mouse.scroll_mode.
+        let sm_idx: isize = SCROLL_MODE_VALUES
+            .iter()
+            .position(|v| *v == cfg.mouse.scroll_mode.as_str())
+            .map(|i| i as isize)
+            .unwrap_or(0);
+        let _: () = msg_send![ui.scroll_mode, selectItemAtIndex: sm_idx];
+        // line_count:按 CONFIG.mouse.line_count 填文本。
+        // line_count: fill text from CONFIG.mouse.line_count.
+        set_field(ui.line_count, cfg.mouse.line_count);
+        // smooth_preset:按 CONFIG.mouse.smooth_preset 选中对应项。
+        // smooth_preset: select item matching CONFIG.mouse.smooth_preset.
+        let sp_idx: isize = SMOOTH_PRESET_LABELS
+            .iter()
+            .position(|v| *v == cfg.mouse.smooth_preset.as_str())
+            .map(|i| i as isize)
+            .unwrap_or(0);
+        let _: () = msg_send![ui.smooth_preset, selectItemAtIndex: sp_idx];
 
         // 每次打开设置时,同步 OK 按钮标题(可能因配置变化而需要重启)。
         // Sync OK button title on each settings open (config changes may require restart).
@@ -749,6 +793,26 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // enable_mouse: checkbox state (1=on / 0=off).
         let em_state: isize = msg_send![ui.enable_mouse, state];
         cfg.mouse.enabled = em_state == 1;
+        // scroll_mode:下拉框 index 对应 SCROLL_MODE_VALUES。
+        // scroll_mode: popup index matches SCROLL_MODE_VALUES.
+        let sm_idx: isize = msg_send![ui.scroll_mode, indexOfSelectedItem];
+        cfg.mouse.scroll_mode = SCROLL_MODE_VALUES
+            .get(sm_idx as usize)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "default".into());
+        // line_count:文本输入。
+        // line_count: text input.
+        match parse_usize(&nsstring_to_rust(msg_send![ui.line_count, stringValue])) {
+            Ok(v) => cfg.mouse.line_count = v.clamp(1, 10) as u32,
+            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "mouse.line_count")])),
+        }
+        // smooth_preset:下拉框 index 对应 SMOOTH_PRESET_LABELS。
+        // smooth_preset: popup index matches SMOOTH_PRESET_LABELS.
+        let sp_idx: isize = msg_send![ui.smooth_preset, indexOfSelectedItem];
+        cfg.mouse.smooth_preset = SMOOTH_PRESET_LABELS
+            .get(sp_idx as usize)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "easeInOut".into());
     }
     for e in cfg.validate() {
         errs.push(e);
@@ -854,6 +918,9 @@ fn create_settings_window() {
             launch_at_login: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
             enable_mouse: std::ptr::null_mut(),
+            scroll_mode: std::ptr::null_mut(),
+            line_count: std::ptr::null_mut(),
+            smooth_preset: std::ptr::null_mut(),
             ok_button: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
         };
@@ -1313,6 +1380,42 @@ fn create_settings_window() {
         // Update OK button title in real time when checkbox toggles (OK vs OK && Restart).
         let _: () = msg_send![ui.enable_mouse, setTarget: target];
         let _: () = msg_send![ui.enable_mouse, setAction: sel!(handleEnableMouseToggle:)];
+
+        // --- 滚动模式 / Scroll mode ---
+        y -= 8.0 + row_h;
+        ui.scroll_mode = add_row(
+            mouse_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_scroll_mode"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &SCROLL_MODE_LABELS, 0),
+        );
+
+        // --- 行数(按行模式) / Line count (line mode) ---
+        y -= 8.0 + row_h;
+        ui.line_count = add_row(
+            mouse_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_line_count"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "3"),
+        );
+
+        // --- 平滑预设 / Smooth preset ---
+        y -= 8.0 + row_h;
+        ui.smooth_preset = add_row(
+            mouse_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_smooth_preset"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &SMOOTH_PRESET_LABELS, 0),
+        );
 
         // --- 滚动 Scrolling ---
         y -= 14.0 + 24.0;
