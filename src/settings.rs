@@ -551,11 +551,52 @@ pub(crate) extern "C" fn on_settings_cancel(_self: *mut c_void, _cmd: Sel, _send
 /// rebuild_device_popup runs. Contains only concrete devices; no "All Mice" wildcard entry.
 static DEVICE_POPUP_KEYS: Mutex<Vec<crate::mouse::device::DeviceKey>> = Mutex::new(Vec::new());
 
+/// 基于当前已连接设备列表初始化/校准 SELECTED_DEVICE。
+/// 必须在 resolve_selected() 之前调用,保证 resolve 拿到的是有效设备:
+/// - 未初始化(首次打开设置)-> 选中第一个设备(若有)
+/// - 已初始化但所选设备已被拔出 -> 回退到第一个设备
+/// - 所选设备仍在列表 -> 保持
+///
+/// 无设备连接时清空选中(编辑"所有鼠标"基础层)。
+/// 每次打开设置都重新校准,天然处理热插拔(设备增减)。
+///
+/// Initialize/calibrate SELECTED_DEVICE against the current connected-device list. Must run
+/// before resolve_selected() so resolution always gets a valid device:
+/// - uninitialized (first settings open) -> select the first device (if any)
+/// - initialized but the selected device was unplugged -> fall back to the first device
+/// - selected device still present -> keep it
+///
+/// With no devices connected, clears the selection (edits the "All Mice" base layer).
+/// Recalibrated on every settings open, so hot-plug (device add/remove) is handled naturally.
+fn ensure_selected_device() {
+    let connected = crate::mouse::device::connected_devices();
+    let cur = current_selected_device();
+
+    if connected.is_empty() {
+        // 无设备连接:清空选中状态(编辑"所有鼠标"基础层)。
+        // No device connected: clear the selection (edits the "All Mice" base layer).
+        *SELECTED_DEVICE.lock().unwrap() = Some(None);
+        return;
+    }
+
+    // 当前设备仍在列表 -> 保持;否则(未初始化或被拔出)回退到第一个设备。
+    // Keep the current device if it's still connected; otherwise (uninitialized or unplugged)
+    // fall back to the first device.
+    let still_connected = cur.map(|c| connected.iter().any(|d| d.vendor_id == c.0 && d.product_id == c.1)).unwrap_or(false);
+    if !still_connected {
+        let first = &connected[0];
+        *SELECTED_DEVICE.lock().unwrap() = Some(Some((first.vendor_id, first.product_id)));
+    }
+}
+
 /// 重建设备下拉框的选项:仅各已连接设备(无"所有鼠标"通配项)。
+/// 只负责 UI(items + 选中项);SELECTED_DEVICE 的状态校准由 ensure_selected_device 负责。
 /// 由 load_settings_values 调用(每次打开设置时刷新,反映热插拔)。
 ///
 /// Rebuild the device popup's items: only each connected device (no "All Mice" wildcard entry).
-/// Called by load_settings_values (refreshed on each settings open to reflect hot-plug changes).
+/// UI only (items + selection); SELECTED_DEVICE state calibration is handled by
+/// ensure_selected_device. Called by load_settings_values (refreshed on each settings open to
+/// reflect hot-plug changes).
 unsafe fn rebuild_device_popup(ui: &SettingsUi) {
     let connected = crate::mouse::device::connected_devices();
     let cur = current_selected_device();
@@ -578,27 +619,13 @@ unsafe fn rebuild_device_popup(ui: &SettingsUi) {
         CFRelease(ns as *const c_void);
     }
 
-    // 选中当前设备对应的项;若已拔出(不在列表里)或未选择,回退到第一个设备。
-    // Select the item matching the current device; if it's gone (unplugged) or unset, fall back
-    // to the first device.
-    let cur_in_list = cur.map(|c| keys.contains(&c)).unwrap_or(false);
-    let sel_idx = if cur_in_list {
-        keys.iter().position(|k| *k == cur.unwrap()).unwrap_or(0)
-    } else {
-        0
-    };
+    // 选中当前设备对应的项;若已不在列表,选中第一个。
+    // Select the item matching the current device; if it's gone, select the first.
+    let sel_idx = cur
+        .and_then(|c| keys.iter().position(|k| *k == c))
+        .unwrap_or(0);
     if !keys.is_empty() {
         let _: () = msg_send![ui.device_indicator, selectItemAtIndex: sel_idx as isize];
-        // 若原设备已不在列表(被拔出)或未选择,同步 SELECTED_DEVICE 为回退值(第一个设备)。
-        // If the original device is no longer listed (unplugged) or unset, sync SELECTED_DEVICE
-        // to the fallback (first device).
-        if !cur_in_list {
-            *SELECTED_DEVICE.lock().unwrap() = Some(Some(keys[sel_idx]));
-        }
-    } else {
-        // 无设备连接:清空选中状态(编辑"所有鼠标"基础层)。
-        // No device connected: clear the selection (edits the "All Mice" base layer).
-        *SELECTED_DEVICE.lock().unwrap() = Some(None);
     }
 
     *DEVICE_POPUP_KEYS.lock().unwrap() = keys;
@@ -922,6 +949,14 @@ fn load_settings_values_impl(rebuild_device: bool) {
         // ===== 鼠标页:按当前选中设备的有效配置(合并"所有鼠标"+该设备)填充控件 =====
         // Mouse page: populate controls from the effective config of the selected device
         // (merging "All Mice" + this device).
+        // 先校准 SELECTED_DEVICE(基于当前设备列表;未初始化/被拔出时回退到第一个设备),
+        // 再 resolve,保证显示的是实际生效设备的配置(修复首次打开显示错误档位的问题)。
+        // Calibrate SELECTED_DEVICE first (against the current device list; falls back to the
+        // first device when uninitialized/unplugged), then resolve, so the UI shows the actually
+        // effective device's config (fixes the wrong-profile display on first open).
+        if rebuild_device {
+            ensure_selected_device();
+        }
         let resolved = resolve_selected();
         // enable_mouse(总开关)始终读全局。
         // enable_mouse (master switch) always reads the global flag.
@@ -1263,6 +1298,19 @@ fn create_settings_window() {
         // --- 侧边栏 sidebar ---
         let sidebar_view: *mut AnyObject = msg_send![class!(NSView), alloc];
         let sidebar_view: *mut AnyObject = msg_send![sidebar_view, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(sidebar_w, content_h))];
+        // 侧边栏底色比内容区略深一档(controlBackgroundColor,系统语义色,深浅色自适应)。
+        // 不用 underPageBackgroundColor:它在浅色模式下渲染偏深,与内容区(纯白)对比过强,
+        // 形成"深灰 vs 亮白"的刺眼效果。controlBackgroundColor 只比 windowBackground 深
+        // 一个温和档位,贴近系统设置与 BetterCmdTab 的观感。
+        // Sidebar background is one gentle shade darker than the content area
+        // (controlBackgroundColor, a system semantic color that adapts to light/dark).
+        // Not underPageBackgroundColor: it renders too dark in light mode, making the
+        // "dark grey vs bright white" contrast harsh. controlBackgroundColor is only one
+        // subtle step darker than windowBackground, closer to System Settings / BetterCmdTab.
+        let _: () = msg_send![sidebar_view, setWantsLayer: true];
+        let sb_layer: *mut AnyObject = msg_send![sidebar_view, layer];
+        let sb_color: *mut AnyObject = msg_send![class!(NSColor), controlBackgroundColor];
+        layer_set_background(sb_layer, ns_color_to_cg(sb_color));
         // 自适应:左侧锚定、高度随窗口拉伸(HeightSizable|MaxXMargin = 16|4 = 20)。
         // Adaptive: left-anchored, height stretches with the window.
         let _: () = msg_send![sidebar_view, setAutoresizingMask: 20u64];
