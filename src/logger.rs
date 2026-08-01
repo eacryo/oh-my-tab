@@ -92,7 +92,7 @@ pub fn init(config: &LogConfig, is_dev: bool) {
     LOG_TX.set(tx).ok();
     LOG_LEVEL.store(config.level as usize, Ordering::Relaxed);
 
-    let file_path = resolve_file_path(config, is_dev);
+    let file_path = resolve_file_path(config);
     std::thread::spawn(move || writer_loop(rx, is_dev, file_path));
 }
 
@@ -131,10 +131,12 @@ fn writer_loop(rx: Receiver<String>, is_dev: bool, file_path: Option<String>) {
     }
 }
 
-fn resolve_file_path(config: &LogConfig, is_dev: bool) -> Option<String> {
-    if is_dev {
-        return None;
-    }
+fn resolve_file_path(config: &LogConfig) -> Option<String> {
+    // dev 模式也写文件:writer_loop 在 is_dev 时同时输出到 stdout 与文件,
+    // 便于开发时日志持久化(终端关闭不丢)。30 天清理同样作用于 dev 日志。
+    // Dev mode also writes to a file: writer_loop prints to stdout AND the file when is_dev,
+    // so dev logs persist (not lost when the terminal closes). The 30-day cleanup applies
+    // to dev logs too.
     // 用户自定义路径:原样使用(append 模式,不加时间戳、不做清理,由用户自行管理轮转)。
     // 我们不会往用户指定的位置写入额外文件,也不会删除其中的任何文件。
     // User-supplied path: use verbatim (append mode, no timestamp, no cleanup - the user
