@@ -105,7 +105,7 @@ impl AppState {
 // ========== Global State ==========
 
 pub(crate) static TAB_STATE: Mutex<Option<AppState>> = Mutex::new(None);
-static CONTROLLER: Mutex<Option<ObjPtr>> = Mutex::new(None);
+pub(crate) static CONTROLLER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 pub(crate) static THEME_STATE: Mutex<Option<MenuState>> = Mutex::new(None);
 
 /// 菜单项与设置按钮共用的 ObjC target 对象（OhMyTabMenuTarget2 实例）。
@@ -506,6 +506,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleLocaleChanged:),
             on_locale_changed as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleDelayedOrderOut:),
+            on_delayed_order_out as *mut c_void,
             types_v_obj.as_ptr(),
         );
         objc_registerClassPair(cls);

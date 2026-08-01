@@ -8,7 +8,7 @@
 //! keyboard-navigation key codes.
 
 use objc2::runtime::{AnyObject, Sel};
-use objc2::{class, msg_send};
+use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -184,7 +184,14 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
             pid,
             cgwid
         );
-        hide_overlay();
+        // 先视觉隐藏(不 orderOut),再激活目标窗口,最后延迟 orderOut。
+        // 先 orderOut 会干扰 WindowServer 焦点路由,导致目标窗口的 first-responder 未确立
+        // (光标停止闪烁等)。对齐 BetterCmdTab 的 vanish() -> activate() -> dismiss() 时序。
+        // Vanish first (no orderOut), then activate the target, then delay orderOut.
+        // Ordering out first disrupts WindowServer focus routing, leaving the target's
+        // first-responder unset (caret stops blinking, etc.). Mirrors BetterCmdTab's
+        // vanish() -> activate() -> dismiss() sequence.
+        vanish_overlay();
         // 设置窗口无需特殊处理:浮窗是 nonactivating 面板,召唤时 app 未激活,设置窗口
         // 从未被抬升(从别的 App 召唤时被其窗口盖住;从设置召唤时透过玻璃可见),切走后
         // 留在原位。与 BetterCmdTab 行为一致,无 stash/restore 机制。
@@ -194,6 +201,7 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         // summoning from settings). It stays put after the switch. Matches BetterCmdTab --
         // no stash/restore machinery.
         activate_and_raise(pid, cgwid);
+        schedule_delayed_order_out();
         bump_window_mru(&mut state.mru, pid, cgwid);
         log_info!(
             "commit: pid={} app=\"{}\" cgwid={} title=\"{}\" selected={}",
@@ -226,10 +234,11 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
     if let Some(w) = state.windows.get(idx) {
         let pid = w.pid;
         let cgwid = w.window_id;
-        hide_overlay();
+        vanish_overlay();
         // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释)。
         // Same as on_cmd_released: no settings-window handling needed (see comment there).
         activate_and_raise(pid, cgwid);
+        schedule_delayed_order_out();
         bump_window_mru(&mut state.mru, pid, cgwid);
         state.visible = false;
     }
@@ -308,10 +317,11 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 if let Some(w) = state.windows.get(state.selected) {
                     let pid = w.pid;
                     let cgwid = w.window_id;
-                    hide_overlay();
+                    vanish_overlay();
                     // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释)。
                     // Same as on_cmd_released: no settings-window handling needed.
                     activate_and_raise(pid, cgwid);
+                    schedule_delayed_order_out();
                     bump_window_mru(&mut state.mru, pid, cgwid);
                 }
                 state.visible = false;
@@ -430,6 +440,75 @@ pub(crate) fn hide_overlay() {
     // The settings window is never stashed/restored: the nonactivating panel never activates
     // the app, so the settings window stays at its natural z-order throughout the summon;
     // the switcher only collects it as a card and raises the target window.
+}
+
+/// 视觉隐藏浮窗但**不 orderOut**(窗口保持 ordered)。
+/// 切换窗口时不能先 orderOut 再激活目标:面板 orderOut 后 WindowServer 可能把焦点路由到
+/// 错误窗口,导致目标窗口的 key-window / first-responder 未被正确确立(光标停止闪烁等)。
+/// 对齐 BetterCmdTab 的 vanish() -> activate() -> dismiss() 时序。
+///
+/// Visually hide the overlay **without orderOut** (the window stays ordered).
+/// Ordering out before activating the target lets WindowServer route focus to the wrong window,
+/// leaving the target's key-window / first-responder unset (caret stops blinking, etc.).
+/// Mirrors BetterCmdTab's vanish() -> activate() -> dismiss() sequence.
+pub(crate) fn vanish_overlay() {
+    unsafe {
+        if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
+            // alphaValue=0 + contentView hidden:即时视觉消失,但窗口保持 ordered。
+            // alphaValue=0 + contentView hidden: instant visual hide, window stays ordered.
+            let _: () = msg_send![window.0, setAlphaValue: 0.0f64];
+            if let Some(container) = *CONTAINER.lock().unwrap() {
+                let _: () = msg_send![container.0, setHidden: true];
+            }
+            // 忽略鼠标事件,防止隐形面板吞点击(直到 delayed orderOut 真正移除它)。
+            // Ignore mouse events so the invisible panel doesn't swallow clicks (until the
+            // delayed orderOut actually removes it).
+            let _: () = msg_send![window.0, setIgnoresMouseEvents: true];
+        }
+    }
+}
+
+/// 延迟 orderOut 回调:vanish_overlay 之后由 performSelector:withObject:afterDelay: 调用,
+/// 在目标窗口激活完成后真正移除浮窗。此时 WindowServer 焦点路由已稳定,orderOut 不会干扰。
+///
+/// Delayed orderOut callback: called via performSelector:withObject:afterDelay: after
+/// vanish_overlay, removing the overlay for real once the target window's activation has
+/// settled and WindowServer focus routing is stable.
+pub(crate) extern "C" fn on_delayed_order_out(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    hide_overlay();
+    // 恢复浮窗的 alphaValue / contentView 可见性 / 鼠标事件,下次 show_overlay 时正常显示。
+    // Restore the overlay's alphaValue / contentView visibility / mouse events for the next
+    // show_overlay call.
+    unsafe {
+        if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
+            let _: () = msg_send![window.0, setAlphaValue: 1.0f64];
+            let _: () = msg_send![window.0, setIgnoresMouseEvents: false];
+        }
+        if let Some(container) = *CONTAINER.lock().unwrap() {
+            let _: () = msg_send![container.0, setHidden: false];
+        }
+    }
+}
+
+/// 在主线程上延迟 0.2s 执行 orderOut(通过 controller 的 handleDelayedOrderOut:)。
+/// vanish_overlay() 之后调用此函数:目标窗口的激活会在 0.2s 内完成,之后才真正移除浮窗,
+/// 避免 orderOut 干扰 WindowServer 焦点路由。
+///
+/// Schedule a delayed orderOut on the main thread (via the controller's handleDelayedOrderOut:).
+/// Called after vanish_overlay(): the target window's activation completes within 0.2s, after
+/// which the overlay is removed for real, avoiding orderOut interfering with WindowServer focus.
+fn schedule_delayed_order_out() {
+    unsafe {
+        let ctrl = crate::CONTROLLER.lock().unwrap().unwrap().0;
+        // performSelector:withObject:afterDelay: 在主线程 RunLoop 上延迟调度。
+        // performSelector:withObject:afterDelay: schedules on the main thread's RunLoop.
+        let _: () = msg_send![
+            ctrl,
+            performSelector: sel!(handleDelayedOrderOut:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: 0.2f64
+        ];
+    }
 }
 
 pub(crate) fn refresh_highlight() {
