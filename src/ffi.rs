@@ -19,6 +19,14 @@ extern "C" {
         encoding: u32,
     ) -> *const c_void;
     pub(crate) fn CFRelease(cf: *const c_void);
+    // CFEqual:比较两个 CF 对象是否"相等"。IOHIDServiceClient 的相等语义由系统定义
+    // (通常按底层对象身份),而非裸指针地址——CopyServiceForRegistryID 返回的对象与
+    // CopyServices 枚举出的可能不是同一实例地址,必须用 CFEqual 判断。
+    // CFEqual: compares two CF objects for equality. IOHIDServiceClient equality is defined
+    // by the system (typically by underlying object identity), not by raw pointer address --
+    // the object returned by CopyServiceForRegistryID may not be the same instance as the one
+    // enumerated by CopyServices, so CFEqual must be used.
+    pub(crate) fn CFEqual(cf1: *const c_void, cf2: *const c_void) -> bool;
     pub(crate) fn CFRunLoopRunInMode(
         mode: *const c_void,
         seconds: f64,

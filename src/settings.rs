@@ -77,7 +77,9 @@ struct SettingsUi {
     enable_mouse: *mut AnyObject,   // NSButton (checkbox): 启用鼠标控制 / enable mouse control
     scroll_mode: *mut AnyObject,      // NSPopUpButton: default/line/smooth
     line_count: *mut AnyObject,       // NSTextField: line count input
+    line_count_label: *mut AnyObject, // NSTextField: line count row 的 label / the row's label
     smooth_preset: *mut AnyObject,    // NSPopUpButton: smooth preset
+    smooth_preset_label: *mut AnyObject, // NSTextField: smooth preset row 的 label / the row's label
     disable_pointer_accel: *mut AnyObject, // NSButton (checkbox): 禁用指针加速 / disable pointer acceleration
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
@@ -226,6 +228,22 @@ unsafe fn make_checkbox(
     cb
 }
 
+/// 整数滑块(NSSlider, min..=max, step 1)。alloc +1,加入父视图后由调用方 release。
+/// Integer slider (NSSlider, min..=max, step 1). alloc +1; caller releases after adding to parent.
+unsafe fn make_slider(x: f64, y: f64, w: f64, h: f64, min: i64, max: i64, value: i64) -> *mut AnyObject {
+    let slider: *mut AnyObject = msg_send![class!(NSSlider), alloc];
+    let slider: *mut AnyObject =
+        msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
+    let _: () = msg_send![slider, setMinValue: min as f64];
+    let _: () = msg_send![slider, setMaxValue: max as f64];
+    // 整数步进:1 格 = 1 个单位(线性 Mouse By Lines 滑块同款:0...10 step 1)。
+    // Integer steps: 1 tick = 1 unit (same as LinearMouse's By Lines slider: 0...10 step 1).
+    let _: () = msg_send![slider, setNumberOfTickMarks: (max - min + 1) as isize];
+    let _: () = msg_send![slider, setAllowsTickMarkValuesOnly: true];
+    let _: () = msg_send![slider, setIntegerValue: value];
+    slider
+}
+
 /// 设侧边栏按钮标题为带 labelColor 的 attributed title(selected=true 用粗体)。
 /// Set the sidebar button's title as an attributed title with labelColor (bold when selected).
 unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selected: bool) {
@@ -316,6 +334,26 @@ unsafe fn add_row(
     label_text: &str,
     control: *mut AnyObject,
 ) -> *mut AnyObject {
+    add_row_with_label(parent, label_x, y, label_w, h, label_text, control).1
+}
+
+/// 同 add_row,但额外返回 label 指针(供条件显隐等需要隐藏整行的场景)。
+/// label/control 加入父视图后由父视图持有,release 后指针仍有效(与 add_row 返回 control
+/// 的约定一致)。
+///
+/// Same as add_row, but also returns the label pointer (for cases that need to hide the whole
+/// row, e.g. conditional visibility). The label/control are retained by the parent view after
+/// addSubview, so the pointers remain valid after release (same convention as add_row's
+/// returned control).
+unsafe fn add_row_with_label(
+    parent: *mut AnyObject,
+    label_x: f64,
+    y: f64,
+    label_w: f64,
+    h: f64,
+    label_text: &str,
+    control: *mut AnyObject,
+) -> (*mut AnyObject, *mut AnyObject) {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(label_x, y), NSSize::new(label_w, h))];
     let ns = make_nsstring(label_text);
@@ -335,7 +373,7 @@ unsafe fn add_row(
     let _: () = msg_send![control, setAutoresizingMask: 10u64];
     let _: () = msg_send![parent, addSubview: control];
     release_obj(control);
-    control
+    (label, control)
 }
 
 // ========== 设置窗口逻辑 / settings window logic ==========
@@ -412,6 +450,53 @@ unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
         ui.disable_pointer_accel,
     ] {
         let _: () = msg_send![ctrl, setEnabled: on];
+    }
+}
+
+/// 根据当前滚动模式(Default/Line/Smooth)刷新"行数 / 平滑预设"行的条件显隐:
+/// - Line:只显示"每 tick 行数"行
+/// - Smooth:只显示"平滑预设"行
+/// - Default:两者都隐藏
+///
+/// 由 load_settings_values 与 handle_scroll_mode_changed 调用。
+///
+/// Refresh the conditional visibility of the "lines per tick" / "smooth preset" rows based on
+/// the current scroll mode (Default/Line/Smooth):
+/// - Line: only the "lines per tick" row is shown
+/// - Smooth: only the "smooth preset" row is shown
+/// - Default: both are hidden
+///
+/// Called by load_settings_values and handle_scroll_mode_changed.
+unsafe fn update_mode_dependent_visibility(ui: &SettingsUi) {
+    let idx: isize = msg_send![ui.scroll_mode, indexOfSelectedItem];
+    let mode = SCROLL_MODE_VALUES
+        .get(idx as usize)
+        .copied()
+        .unwrap_or("default");
+    let show_line = mode == "line";
+    let show_smooth = mode == "smooth";
+    for &(label, ctrl, show) in &[
+        (ui.line_count_label, ui.line_count, show_line),
+        (ui.smooth_preset_label, ui.smooth_preset, show_smooth),
+    ] {
+        let _: () = msg_send![label, setHidden: !show];
+        let _: () = msg_send![ctrl, setHidden: !show];
+    }
+}
+
+/// scroll_mode 下拉框切换回调:即时刷新行数/平滑预设行的条件显隐。
+/// Scroll-mode popup changed callback: refresh the conditional visibility of the
+/// lines-per-tick / smooth-preset rows immediately.
+pub(crate) extern "C" fn handle_scroll_mode_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            update_mode_dependent_visibility(u);
+        }
     }
 }
 
@@ -835,9 +920,9 @@ fn load_settings_values_impl(rebuild_device: bool) {
             .map(|i| i as isize)
             .unwrap_or(0);
         let _: () = msg_send![ui.scroll_mode, selectItemAtIndex: sm_idx];
-        // line_count:用有效值。
-        // line_count: effective value.
-        set_field(ui.line_count, resolved.line_count);
+        // line_count:用有效值(滑块)。
+        // line_count: effective value (slider).
+        let _: () = msg_send![ui.line_count, setIntegerValue: resolved.line_count as isize];
         // smooth_preset:用有效值。
         // smooth_preset: effective value.
         let sp_idx: isize = SMOOTH_PRESET_LABELS
@@ -861,6 +946,9 @@ fn load_settings_values_impl(rebuild_device: bool) {
         // 根据 enable_mouse 状态冻结/解冻下方控件。
         // Freeze/unfreeze the controls below based on the enable_mouse state.
         update_mouse_controls_enabled(ui);
+        // 根据滚动模式刷新行数/平滑预设行的条件显隐。
+        // Refresh the conditional visibility of lines-per-tick / smooth-preset rows by mode.
+        update_mode_dependent_visibility(ui);
     }
 }
 
@@ -1003,12 +1091,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "default".into()),
         );
-        // line_count:文本输入。
-        // line_count: text input.
-        match parse_usize(&nsstring_to_rust(msg_send![ui.line_count, stringValue])) {
-            Ok(v) => p.line_count = Some(v.clamp(1, 10) as u32),
-            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "mouse.line_count")])),
-        }
+        // line_count:滑块(整数,天然在 1..=10 内,无需 clamp/解析)。
+        // line_count: slider (integer, naturally within 1..=10; no clamp/parse needed).
+        let lc_val: isize = msg_send![ui.line_count, integerValue];
+        p.line_count = Some(lc_val.clamp(1, 10) as u32);
         // smooth_preset:下拉框 index 对应 SMOOTH_PRESET_LABELS。
         // smooth_preset: popup index matches SMOOTH_PRESET_LABELS.
         let sp_idx: isize = msg_send![ui.smooth_preset, indexOfSelectedItem];
@@ -1125,7 +1211,9 @@ fn create_settings_window() {
             enable_mouse: std::ptr::null_mut(),
             scroll_mode: std::ptr::null_mut(),
             line_count: std::ptr::null_mut(),
+            line_count_label: std::ptr::null_mut(),
             smooth_preset: std::ptr::null_mut(),
+            smooth_preset_label: std::ptr::null_mut(),
             disable_pointer_accel: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
             ok_button: std::ptr::null_mut(),
@@ -1629,22 +1717,31 @@ fn create_settings_window() {
             &t("settings.row_scroll_mode"),
             make_popup(ctrl_x, y, ctrl_w, row_h, &SCROLL_MODE_LABELS, 0),
         );
+        // 滚动模式切换时即时刷新"行数 / 平滑预设"的条件显隐。
+        // Refresh the conditional visibility of "lines per tick / smooth preset" on mode switch.
+        let _: () = msg_send![ui.scroll_mode, setTarget: target];
+        let _: () = msg_send![ui.scroll_mode, setAction: sel!(handleScrollModeChanged:)];
 
         // --- 行数(按行模式) / Line count (line mode) ---
         y -= 8.0 + row_h;
-        ui.line_count = add_row(
+        let (line_label, line_ctrl) = add_row_with_label(
             mouse_view,
             label_x,
             y,
             label_w,
             row_h,
             &t("settings.row_line_count"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "3"),
+            // 整数滑块 1..=10(与 config 校验一致;对齐 LinearMouse By Lines 的滑块交互)。
+            // Integer slider 1..=10 (matches config validation; mirrors LinearMouse's
+            // By Lines slider interaction).
+            make_slider(ctrl_x, y, ctrl_w, row_h, 1, 10, 3),
         );
+        ui.line_count = line_ctrl;
+        ui.line_count_label = line_label;
 
         // --- 平滑预设 / Smooth preset ---
         y -= 8.0 + row_h;
-        ui.smooth_preset = add_row(
+        let (sp_label, sp_ctrl) = add_row_with_label(
             mouse_view,
             label_x,
             y,
@@ -1653,6 +1750,8 @@ fn create_settings_window() {
             &t("settings.row_smooth_preset"),
             make_popup(ctrl_x, y, ctrl_w, row_h, &SMOOTH_PRESET_LABELS, 0),
         );
+        ui.smooth_preset = sp_ctrl;
+        ui.smooth_preset_label = sp_label;
 
         // --- 滚动 Scrolling ---
         y -= 14.0 + 24.0;

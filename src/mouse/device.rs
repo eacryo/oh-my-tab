@@ -46,11 +46,9 @@ pub(crate) struct DeviceIdentity {
 pub(crate) struct Device {
     pub(crate) id: u32,
     pub(crate) identity: DeviceIdentity,
-    /// IORegistry entry ID;与 IOHIDEventGetSenderID 返回值匹配,是归因链的桥接键。
-    /// IORegistry entry ID; matches IOHIDEventGetSenderID's return, bridging the attribution chain.
-    #[allow(dead_code)]
-    pub(crate) registry_id: u64,
-    #[allow(dead_code)]
+    /// 枚举时的 IOHIDServiceClient 指针(由 services 数组保活;用于归因时的 CFEqual 比对)。
+    /// The IOHIDServiceClient pointer from enumeration (kept alive by the services array;
+    /// used for CFEqual comparison during attribution).
     service_client: *mut c_void,
 }
 
@@ -77,7 +75,6 @@ struct DeviceRegistry {
     /// Holds the services CFArray (keeping its IOHIDServiceClients alive).
     services: *mut c_void,
     devices: Vec<Device>,
-    by_registry_id: std::collections::HashMap<u64, usize>,
 }
 
 unsafe impl Send for DeviceRegistry {}
@@ -96,7 +93,6 @@ fn registry() -> &'static Mutex<DeviceRegistry> {
         client: std::ptr::null_mut(),
         services: std::ptr::null_mut(),
         devices: Vec::new(),
-        by_registry_id: std::collections::HashMap::new(),
     }))
 }
 
@@ -129,22 +125,6 @@ unsafe fn prop_string(service: *mut c_void, key: &str) -> String {
     let s = nsstring_to_rust(v as *mut AnyObject);
     CFRelease(v as *const c_void);
     s
-}
-
-// 读取设备的 IORegistry entry ID(用于归因匹配)。
-// 私有 SPI:IOHIDServiceClientGetRegistryID(LinearMouse 的 IOHIDServiceClient+Service 同款)。
-// Read the device's IORegistry entry ID (used for attribution matching).
-// Private SPI IOHIDServiceClientGetRegistryID (LinearMouse uses the same via
-// IOHIDServiceClient+Service).
-#[link(name = "IOKit", kind = "framework")]
-extern "C" {
-    fn IOHIDServiceClientGetRegistryID(service: *mut c_void) -> u64;
-}
-
-/// 读取一个 service client 的 registry ID。
-/// Read a service client's registry ID.
-unsafe fn registry_id_of(service: *mut c_void) -> u64 {
-    IOHIDServiceClientGetRegistryID(service)
 }
 
 // ========== 枚举 / enumeration ==========
@@ -183,13 +163,11 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry) {
     if services.is_null() {
         log_warn!("[device] no services returned");
         reg.devices.clear();
-        reg.by_registry_id.clear();
         return;
     }
     reg.services = services;
 
     reg.devices.clear();
-    reg.by_registry_id.clear();
 
     let count = CFArrayGetCount(services);
     for i in 0..count {
@@ -209,7 +187,6 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry) {
         let pid = prop_int(service, KEY_PRODUCT_ID).unwrap_or(0) as u32;
         let name = prop_string(service, KEY_PRODUCT);
         let transport = prop_string(service, KEY_TRANSPORT);
-        let registry_id = registry_id_of(service);
 
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let dev = Device {
@@ -220,10 +197,8 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry) {
                 name,
                 transport,
             },
-            registry_id,
             service_client: service,
         };
-        reg.by_registry_id.insert(registry_id, reg.devices.len());
         reg.devices.push(dev);
     }
 
@@ -261,12 +236,45 @@ pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
 
 // ========== 归因 / attribution ==========
 
+/// 用 senderID 反查设备索引。
+/// 链路:IOHIDEventSystemClientCopyServiceForRegistryID(client, senderID) 得到 IOHIDServiceClient,
+/// 再用 CFEqual 与枚举列表逐项比对(Swift 字典对 CF key 也用 CFEqual,而非裸指针地址——
+/// Copy 返回的对象与枚举出的可能不是同一实例地址)。
+///
+/// Look up the device index by sender ID. The chain:
+/// IOHIDEventSystemClientCopyServiceForRegistryID(client, senderID) yields an IOHIDServiceClient,
+/// then CFEqual matches it against the enumerated list (Swift dictionaries also compare CF keys
+/// with CFEqual, not raw pointer addresses -- the Copy-returned object may not be the same
+/// instance address as the enumerated one).
+unsafe fn lookup_service_index(reg: &DeviceRegistry, sender: u64) -> Option<usize> {
+    if reg.client.is_null() {
+        return None;
+    }
+    let svc = IOHIDEventSystemClientCopyServiceForRegistryID(reg.client, sender);
+    if svc.is_null() {
+        return None;
+    }
+    // 设备数极少(鼠标/触控板几个),线性 CFEqual 遍历足够快。
+    // Device count is tiny (a few mice/trackpads); a linear CFEqual scan is fast enough.
+    let idx = reg
+        .devices
+        .iter()
+        .position(|d| crate::ffi::CFEqual(d.service_client, svc));
+    // Copy 返回 +1,立即释放(索引已取出,设备由 services 数组保活)。
+    // Copy returns +1; release immediately (the index is already taken; devices are kept
+    // alive by the services array).
+    CFRelease(svc as *const c_void);
+    idx
+}
+
 /// 从 CGEvent 找到产生它的设备。
-/// 归因链:CGEventCopyIOHIDEvent -> IOHIDEventGetSenderID -> by_registry_id 查表。
+/// 归因链:CGEventCopyIOHIDEvent -> IOHIDEventGetSenderID ->
+/// IOHIDEventSystemClientCopyServiceForRegistryID -> CFEqual 匹配枚举列表。
 /// 失败时惰性重枚举一次再查;仍失败返回 last_active(若无则 None,调用方用"所有鼠标"档)。
 ///
 /// Find the device that produced a CGEvent.
-/// Chain: CGEventCopyIOHIDEvent -> IOHIDEventGetSenderID -> by_registry_id lookup.
+/// Chain: CGEventCopyIOHIDEvent -> IOHIDEventGetSenderID ->
+/// IOHIDEventSystemClientCopyServiceForRegistryID -> CFEqual against the enumerated list.
 /// On failure, lazily re-enumerate once and retry; if still failing, return last_active
 /// (or None if there is none, in which case the caller uses the "All Mice" profile).
 pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Option<DeviceKey> {
@@ -284,7 +292,7 @@ pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Opt
         // First lookup.
         {
             let reg = registry().lock().unwrap();
-            if let Some(&idx) = reg.by_registry_id.get(&sender) {
+            if let Some(idx) = lookup_service_index(&reg, sender) {
                 let dev = &reg.devices[idx];
                 *LAST_ACTIVE_ID.lock().unwrap() = Some(dev.id);
                 return Some(dev.key());
@@ -295,7 +303,7 @@ pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Opt
         {
             let mut reg = registry().lock().unwrap();
             enumerate_locked(&mut reg);
-            if let Some(&idx) = reg.by_registry_id.get(&sender) {
+            if let Some(idx) = lookup_service_index(&reg, sender) {
                 let dev = &reg.devices[idx];
                 *LAST_ACTIVE_ID.lock().unwrap() = Some(dev.id);
                 return Some(dev.key());

@@ -148,6 +148,11 @@ pub struct MouseProfile {
     /// Device matcher; None = matches all mice (serves as the default layer).
     #[serde(flatten)]
     pub device: DeviceMatcher,
+    // 反转滚动方向。true = 相对系统当前方向取反(与 LinearMouse 一致,不读自然滚动设置:
+    // HID tap 事件已含系统自然滚动翻转,合成事件不再被翻转,见 scrolling.rs 的 should_flip)。
+    // Reverse scroll direction. true = flip relative to the system's current direction (same as
+    // LinearMouse; no natural-scroll setting is read: HID-tap events already carry the system
+    // natural-scroll flip and synthetic events aren't flipped again, see should_flip in scrolling.rs).
     pub reverse_scroll: Option<bool>,
     pub scroll_mode: Option<String>,
     pub line_count: Option<u32>,

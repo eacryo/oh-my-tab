@@ -15,6 +15,17 @@ extern "C" {
     // 返回 CFArrayRef(IOHIDServiceClient 列表),调用方持有 +1。
     // Returns a CFArrayRef of IOHIDServiceClient (+1 owned by caller).
     pub(crate) fn IOHIDEventSystemClientCopyServices(client: *mut c_void) -> *mut c_void;
+    // 按 senderID 反查 IOHIDServiceClient(+1 owned,调用方 CFRelease)。
+    // 这是归因链的关键:IOHIDEventGetSenderID 的返回值传给此函数,得到的 IOHIDServiceClient
+    // 与枚举列表(CopyServices)中的对象是同一实例(指针可比对)。LinearMouse 同款链路。
+    // Look up an IOHIDServiceClient by sender ID (+1 owned, caller CFReleases). This is the key
+    // link of the attribution chain: the IOHIDEventGetSenderID result feeds this function, and
+    // the returned IOHIDServiceClient is the same instance as in the enumerated list (pointer
+    // comparison works). Same chain as LinearMouse.
+    pub(crate) fn IOHIDEventSystemClientCopyServiceForRegistryID(
+        client: *mut c_void,
+        registry_id: u64,
+    ) -> *mut c_void;
 }
 
 // ========== 事件归因:IOHIDEvent sender ID(私有 SPI)/ Event attribution ==========

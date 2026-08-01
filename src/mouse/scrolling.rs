@@ -1,12 +1,37 @@
 //! 滚轮滚动模式:默认(透传+可反转)/按行(固定行数)/平滑(物理引擎+惯性)。
 //! 平滑引擎是三态状态机(Idle → Active → Momentum),被 120Hz CFRunLoopTimer 驱动。
 //!
+//! 方向语义:HID 层 event tap 看到的事件已包含系统"自然滚动"的翻转(自然滚动在 HID 事件
+//! 生成时已应用),合成事件 post 到 session 层后不会再被系统翻转。因此方向处理只需按
+//! 用户反转开关取反即可(见 should_flip),与 LinearMouse 一致——不读自然滚动设置。
+//!
 //! Scroll modes: Default (passthrough + optional reverse) / Line (fixed line count) / Smooth
 //! (physics engine + inertia). The smooth engine is a three-state machine (Idle → Active →
 //! Momentum) driven by a 120Hz CFRunLoopTimer.
+//!
+//! Direction semantics: events seen by the HID-level tap already include the system's natural-scroll
+//! flip (applied when HID events are generated), and synthetic events posted to the session layer
+//! are not flipped again by the system. Direction handling therefore only needs the user's reverse
+//! toggle (see should_flip), matching LinearMouse -- no natural-scroll setting is read.
 
 use std::sync::Mutex;
 use std::time::Instant;
+
+// ========== 方向处理 / direction handling ==========
+
+/// 是否应对滚动 delta 取反:直接取用户反转开关。
+/// HID tap 看到的事件已含系统自然滚动翻转,合成事件不再被翻转,所以:
+/// - 反转关 -> 不取反(透传系统方向,含自然滚动)
+/// - 反转开 -> 取反(相对系统的反转)
+///
+/// Whether to flip the scroll delta: directly the user's reverse toggle.
+/// HID-tap events already carry the system natural-scroll flip and synthetic events aren't flipped
+/// again, so:
+/// - reverse off -> no flip (passthrough, including natural scrolling)
+/// - reverse on  -> flip (reversed relative to the system)
+pub(crate) fn should_flip(user_reverse: bool) -> bool {
+    user_reverse
+}
 
 // ========== 滚动模式 / Scroll mode ==========
 
@@ -613,7 +638,7 @@ pub(crate) fn purge_stale_engines(active: &[crate::mouse::device::DeviceKey]) {
 /// Handles reversal + line-mode normalization.
 pub(crate) fn compute_delta(dy: i64, dx: i64, r: &crate::mouse::resolve::ResolvedMouse) -> (i32, i32) {
     let mode = r.scroll_mode;
-    let reverse = r.reverse_scroll;
+    let flip = should_flip(r.reverse_scroll);
 
     let (mut ndy, mut ndx) = match mode {
         ScrollMode::Default => (dy as i32, dx as i32),
@@ -624,16 +649,29 @@ pub(crate) fn compute_delta(dy: i64, dx: i64, r: &crate::mouse::resolve::Resolve
             ((sign_y * line_count) as i32, (sign_x * line_count) as i32)
         }
         ScrollMode::Smooth => {
-            // 平滑模式不在此 compute;由 post_scroll_smooth 处理
-            // Smooth mode is handled separately; not computed here.
+            // 平滑模式不在此 compute;由 feed_engine 前的方向处理负责。
+            // Smooth mode is handled separately; direction is applied before feed_engine.
             return (0, 0);
         }
     };
 
-    if reverse {
+    if flip {
         ndy = -ndy;
         ndx = -ndx;
     }
 
     (ndy, ndx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_flip;
+
+    #[test]
+    fn flip_equals_user_reverse() {
+        // 反转关 -> 不取反(透传系统方向,含自然滚动)。
+        assert!(!should_flip(false));
+        // 反转开 -> 取反(相对系统的反转)。
+        assert!(should_flip(true));
+    }
 }

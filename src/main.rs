@@ -684,6 +684,12 @@ fn setup_status_bar() {
                 handle_device_changed as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(handleScrollModeChanged:),
+                handle_scroll_mode_changed as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };

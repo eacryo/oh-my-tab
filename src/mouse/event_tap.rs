@@ -185,21 +185,24 @@ unsafe extern "C" fn mouse_event_tap_callback(
         // Resolve the effective config for this device (merging "All Mice" + per-device profiles).
         let resolved = resolve::resolve(dev_key);
 
-        log_info!(
-            "[mouse] scroll dy={} dx={} flags=0x{:x} dev={:?} mode={:?} reverse={}",
-            dy,
-            dx,
-            flags,
-            dev_key,
-            resolved.scroll_mode,
-            resolved.reverse_scroll
-        );
+        log_info!("[mouse] scroll dy={} dx={} flags=0x{:x}", dy, dx, flags);
 
         match resolved.scroll_mode {
             ScrollMode::Smooth => {
+                // 平滑模式方向处理:喂引擎前按用户反转开关取反(与 compute_delta 一致)。
+                // HID tap 事件已含系统自然滚动翻转,合成事件不再被翻转,故只需用户反转。
+                // Direction for smooth mode: flip before feeding per the user's reverse toggle
+                // (same as compute_delta). HID-tap events already carry the system natural-scroll
+                // flip and synthetic events aren't flipped again, so only the user toggle matters.
+                let flip = crate::mouse::scrolling::should_flip(resolved.reverse_scroll);
+                let (fy, fx) = if flip {
+                    (-dy, -dx)
+                } else {
+                    (dy, dx)
+                };
                 // 喂入 per-device 平滑引擎,引擎在 120Hz 定时器内发射连续事件。
                 // Feed the per-device smooth engine; the 120Hz timer emits continuous events.
-                feed_engine(dev_key, dy as f64, dx as f64, resolved.smooth_preset);
+                feed_engine(dev_key, fy as f64, fx as f64, resolved.smooth_preset);
                 // 丢弃原始离散事件(由引擎的合成连续事件替代)。
                 // Drop the original discrete event (replaced by the engine's synthetic continuous events).
                 std::ptr::null_mut()
