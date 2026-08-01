@@ -147,15 +147,15 @@ fn find_profile_index(
     })
 }
 
-/// 读取当前选中设备的有效值(合并"所有鼠标"档 + 该设备档后的结果)。
-/// 用于在 UI 上显示当前实际生效的配置(方案 A 的简化:直接显示有效值)。
+/// 读取当前选中设备的有效值(合并"所有鼠标"档 + 该设备档后的结果),基于给定 Config 解析。
+/// 用于在 UI 上显示当前实际生效的配置,以及恢复默认预览(传 Config::default())。
 ///
-/// Read the effective value for the currently-selected device (after merging the "All Mice"
-/// profile + the device profile). Used to show the actually-effective config in the UI
-/// (Option A simplification: show effective values directly).
-fn resolve_selected() -> crate::mouse::resolve::ResolvedMouse {
+/// Read the effective value for the currently-selected device (merging the "All Mice" profile +
+/// the device profile), resolved from a given Config. Used to show the effective config in the
+/// UI, and for the restore-defaults preview (passing Config::default()).
+fn resolve_selected_from(cfg: &Config) -> crate::mouse::resolve::ResolvedMouse {
     let dev = current_selected_device();
-    crate::mouse::resolve::resolve(dev)
+    crate::mouse::resolve::resolve_from_config(cfg, dev)
 }
 
 /// 设置控件标题并释放临时 NSString。
@@ -804,8 +804,13 @@ pub(crate) fn confirm_alert(
     }
 }
 
-/// 恢复默认设置:确认 -> 把代码默认值写回 config.toml -> 重载 + 刷新 UI + 重填设置界面。
-/// Restore defaults: confirm -> write code defaults to config.toml -> reload + refresh UI + repopulate settings.
+/// 恢复默认设置:确认 -> 只把表单控件重填为代码默认值(不写盘)。
+/// 用户点"确认(并重启)"时经 on_settings_ok 统一保存 + 应用;点"取消"则关窗,
+/// 磁盘配置未被改动,天然撤销。
+///
+/// Restore defaults: confirm -> only repopulate the form controls with code defaults (no write).
+/// The user then clicks OK (or OK && Restart) which saves + applies via on_settings_ok; clicking
+/// Cancel just closes the window with the on-disk config untouched, i.e. a natural undo.
 pub(crate) extern "C" fn handle_restore_defaults(
     _self: *mut c_void,
     _cmd: Sel,
@@ -819,56 +824,36 @@ pub(crate) extern "C" fn handle_restore_defaults(
     ) {
         return;
     }
-    // 把代码里的默认值写回 config.toml,但保留 launch_at_login--它是系统级登录项开关,
-    // 不属于外观/布局/快捷键这类设置,不该被恢复默认重置(否则会注销用户已勾选的登录项)。
-    // Write code defaults to config.toml, but preserve launch_at_login -- it's a system-level
-    // login-item toggle, not an appearance/layout/shortcut setting, so Restore Defaults must not
-    // reset it (otherwise it unregisters a login item the user explicitly enabled).
+    // 构造默认配置,但保留 launch_at_login -- 它是系统级登录项开关,不属于外观/布局/
+    // 快捷键这类设置,不该被恢复默认重置(否则会注销用户已勾选的登录项)。
+    // 这里不写盘:仅用于预览填充;实际写盘在用户点 OK 后由 on_settings_ok 完成。
+    // Build defaults, preserving launch_at_login -- it's a system-level login-item toggle, not
+    // an appearance/layout/shortcut setting, so Restore Defaults must not reset it. Not saved
+    // here: only used to preview-fill the form; the real save happens in on_settings_ok.
     let preserved_launch_at_login = CONFIG.read().unwrap().startup.launch_at_login;
     let old_enabled = CONFIG.read().unwrap().mouse.enabled;
     let mut defaults = Config::default();
     defaults.startup.launch_at_login = preserved_launch_at_login;
-    if let Err(e) = defaults.save() {
-        show_alert(&t("alert.save_failed_title"), &e);
-        return;
-    }
-    // 重读(现在是默认值)+ 应用 locale/logger。
-    // Reload (now defaults) + apply locale/logger.
-    let _ = reload_config();
-    // 恢复默认后指针加速设置随之恢复/应用。
-    // Pointer acceleration settings follow the restored defaults.
-    crate::mouse::pointer::apply();
-    // 同步快捷键模式(默认 command)+ 开机自启(保留用户原值,不重置)。
-    // Sync shortcut mode (default command) + launch-at-login (preserved user value, not reset).
-    set_shortcut_mode(CONFIG.read().unwrap().keyboard.modifier == "command");
-    crate::autostart::sync(CONFIG.read().unwrap().startup.launch_at_login);
-    // 刷新 UI,但保留正在显示的设置窗口(不调 invalidate_settings_window,否则会关闭并释放它)。
-    // Refresh UI but keep the open settings window (skip invalidate_settings_window, which would close+release it).
-    refresh_menu_titles();
-    apply_theme();
-    refresh_highlight();
-    update_status_label();
-    // 设置窗口正打开:重填控件为默认值 + 复位到通用页。
-    // Settings window is open: repopulate controls with defaults + reset to General page.
-    // 恢复默认时把鼠标页的设备选择复位到"所有鼠标"。
-    // Restore the mouse-page device selection to "All Mice" on restore-defaults.
-    *SELECTED_DEVICE.lock().unwrap() = Some(None);
-    load_settings_values();
-    select_sidebar(0);
-    // 恢复默认后可能改变了 mouse.enabled,刷新 OK 按钮标题。
-    // Restore defaults may have changed mouse.enabled; refresh the OK button title.
+
+    // 鼠标页设备选择复位(有设备则回退第一个;无设备则清空),再重填表单。
+    // Reset the mouse-page device selection (first device if any; clear if none), then refill.
+    *SELECTED_DEVICE.lock().unwrap() = None;
+    load_settings_from(&defaults, true);
+
+    // 若默认 mouse.enabled 与当前不同,表单会显示为默认值,需要重启才生效 -> OK 改"确认并重启"。
+    // If the default mouse.enabled differs from the current one, the form now shows the default
+    // and a restart is needed -> OK becomes "OK && Restart".
+    let new_enabled = defaults.mouse.enabled;
     unsafe {
         if let Some(ui) = SETTINGS_UI.lock().unwrap().as_ref() {
-            update_ok_button_title(ui);
-            // 若 mouse.enabled 发生了实际变化,update_ok_button_title 无法感知(勾选框与 CONFIG 一致),
-            // 手动修正按钮为"确认并重启"。
-            let new_enabled = CONFIG.read().unwrap().mouse.enabled;
             if old_enabled != new_enabled {
                 set_control_title(ui.ok_button, &t("settings.btn_ok_restart"));
+            } else {
+                update_ok_button_title(ui);
             }
         }
     }
-    log_info!("Config restored to defaults.");
+    log_info!("Config form reset to defaults (not saved until OK).");
 }
 
 /// 用当前 CONFIG 填充设置控件(每次打开都刷新,反映外部编辑 + Reload)。
@@ -892,6 +877,16 @@ fn load_settings_values_no_device_popup() {
 
 fn load_settings_values_impl(rebuild_device: bool) {
     let cfg = CONFIG.read().unwrap().clone();
+    load_settings_from(&cfg, rebuild_device);
+}
+
+/// 用指定配置填充设置控件(rebuild_device 控制是否重建设备下拉框)。
+/// 供正常打开(读 CONFIG)与恢复默认预览(传 Config::default())共用。
+///
+/// Populate settings controls from a given config (rebuild_device controls whether the device
+/// popup is rebuilt). Shared by normal open (reads CONFIG) and restore-defaults preview
+/// (passes Config::default()).
+fn load_settings_from(cfg: &Config, rebuild_device: bool) {
     let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
@@ -957,7 +952,10 @@ fn load_settings_values_impl(rebuild_device: bool) {
         if rebuild_device {
             ensure_selected_device();
         }
-        let resolved = resolve_selected();
+        // 基于传入 cfg 解析选中设备的有效配置(恢复默认预览时 cfg = Config::default())。
+        // Resolve the selected device's effective config from the given cfg (Config::default()
+        // during the restore-defaults preview).
+        let resolved = resolve_selected_from(cfg);
         // enable_mouse(总开关)始终读全局。
         // enable_mouse (master switch) always reads the global flag.
         let _: () =
@@ -1409,22 +1407,27 @@ fn create_settings_window() {
         // ===== 通用页内容 general page content =====
         let mut y = content_h - 12.0; // 顶部光标:下一个元素的底边 y / top cursor (bottom y of next element)
 
-        // --- Accessibility 权限警告条(通用页顶部;仅缺权限时显示,show_settings 里按 setHidden 切换) ---
-        // --- Accessibility permission warning banner (top of General page; shown only when permission
-        //  is missing, toggled via setHidden in show_settings) ---
+        // --- Accessibility 权限警告条(通用页顶部覆盖;仅缺权限时显示,show_settings 里按 setHidden 切换) ---
+        // --- Accessibility permission warning banner (floats at the top of General; shown only
+        //  when permission is missing, toggled via setHidden in show_settings) ---
+        // banner 不占用布局空间(通用页内容紧贴顶部),而是在内容构建完后作为最后一个
+        // subview 添加,覆盖在顶部。frame 固定定位,不随 y 布局游标变化。
+        // The banner does not reserve layout space (General content starts at the top); it is
+        // added as the last subview after the content, floating over the top. Its frame is fixed
+        // and independent of the y layout cursor.
         let banner_h = 48.0;
         let banner: *mut AnyObject = msg_send![class!(NSView), alloc];
         let banner: *mut AnyObject = msg_send![
             banner,
             initWithFrame: NSRect::new(
-                NSPoint::new(0.0, y - banner_h),
+                NSPoint::new(0.0, content_h - 12.0 - banner_h),
                 NSSize::new(content_w, banner_h)
             )
         ];
         // 自适应:宽度拉伸、顶部锚定(WidthSizable|MinYMargin = 10)。
+        // 注意:这里不 addSubview;在通用页内容构建完后统一添加(保证在最上层)。
+        // Note: not added here; added after the General content build so it stays on top.
         let _: () = msg_send![banner, setAutoresizingMask: 10u64];
-        let _: () = msg_send![general_view, addSubview: banner];
-        release_obj(banner);
         ui.accessibility_warning_view = banner;
 
         // 警告文字:多行换行,系统红色 / warning text: word-wrapped, system red
@@ -1470,10 +1473,8 @@ fn create_settings_window() {
         // 默认按当前权限显隐(有权限就隐藏)/ initial visibility: hidden when permission is already granted
         let _: () = msg_send![banner, setHidden: has_accessibility_permission()];
 
-        y -= banner_h + 12.0;
-
         // --- 外观 Appearance ---
-        y -= 24.0;
+        y -= 12.0;
         add_header(
             general_view,
             &t("settings.header_appearance"),
@@ -1733,6 +1734,22 @@ fn create_settings_window() {
         // ===== 鼠标页内容 mouse page content =====
         let mut y = content_h - 12.0;
 
+        // --- 启用鼠标控制(总开关,置于最顶) / Enable mouse control (topmost) ---
+        y -= 8.0 + row_h;
+        ui.enable_mouse = add_row(
+            mouse_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_enable_mouse"),
+            make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
+        );
+        // 勾选框 toggle 时实时更新 OK 按钮标题(确认 vs 确认并重启)。
+        // Update OK button title in real time when checkbox toggles (OK vs OK && Restart).
+        let _: () = msg_send![ui.enable_mouse, setTarget: target];
+        let _: () = msg_send![ui.enable_mouse, setAction: sel!(handleEnableMouseToggle:)];
+
         // --- 设备选择器(内嵌下拉框,切换即时刷新其余控件) / Device picker (inline popup) ---
         y -= 14.0 + 24.0;
         add_header(
@@ -1762,22 +1779,6 @@ fn create_settings_window() {
             &t("settings.header_mouse_device"),
             dev_popup,
         );
-
-        // --- 启用鼠标控制(总开关) / Enable mouse control ---
-        y -= 8.0 + row_h;
-        ui.enable_mouse = add_row(
-            mouse_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_enable_mouse"),
-            make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
-        );
-        // 勾选框 toggle 时实时更新 OK 按钮标题(确认 vs 确认并重启)。
-        // Update OK button title in real time when checkbox toggles (OK vs OK && Restart).
-        let _: () = msg_send![ui.enable_mouse, setTarget: target];
-        let _: () = msg_send![ui.enable_mouse, setAction: sel!(handleEnableMouseToggle:)];
 
         // --- 滚动模式 / Scroll mode ---
         y -= 8.0 + row_h;
@@ -1889,6 +1890,12 @@ fn create_settings_window() {
             &t("settings.row_disable_pointer_accel"),
             make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
         );
+
+        // banner 最后添加:作为 general_view 的最后一个 subview,保证在内容之上(缺权限时覆盖顶部)。
+        // Added last: as general_view's final subview so it floats above the content (when
+        // permission is missing). It occupies no layout space, so no top gap when hidden.
+        let _: () = msg_send![general_view, addSubview: banner];
+        release_obj(banner);
 
         // --- 确认 / 取消(加在 contentView 上,三页都可见)---
         // Restore Defaults 按钮(左侧偏上,版本号在其下方),与 OK/Cancel 同在 contentView,两页都可见。

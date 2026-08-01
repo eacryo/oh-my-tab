@@ -93,6 +93,16 @@ pub(crate) fn resolve(device: Option<DeviceKey>) -> ResolvedMouse {
     r
 }
 
+/// 从给定 Config 解析某设备的生效配置(供设置预览等非 CONFIG 场景)。
+/// Resolve a device's effective config from a given Config (for non-CONFIG contexts like the
+/// restore-defaults preview).
+pub(crate) fn resolve_from_config(
+    cfg: &crate::config::Config,
+    device: Option<DeviceKey>,
+) -> ResolvedMouse {
+    resolve_from(cfg, device)
+}
+
 /// 从给定 Config 解析(供测试与无 CONFIG 的场景)。
 /// Resolve from a given Config (for tests and CONFIG-free scenarios).
 fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
