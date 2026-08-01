@@ -1,4 +1,8 @@
-# oh-my-tab
+<p align="center">
+  <img src="assets/Icon-512x512.png" width="256" height="256" alt="oh-my-tab icon">
+</p>
+
+<p align="center"><strong>oh-my-tab</strong></p>
 
 > [简体中文](README-ZH.md) | English
 
