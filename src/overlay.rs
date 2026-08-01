@@ -185,6 +185,16 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
             cgwid
         );
         hide_overlay();
+        // 选中的是自己(设置窗口):先恢复可见,随后的 raise 会把它抬到最前;
+        // 选中的是别的 App:设置窗口 orderBack 沉底(在屏、不抬到目标窗口前面)。
+        // Selecting our own window (settings): restore it first so the subsequent raise
+        // brings it to the front; selecting another app: push the settings window to the
+        // very back (on-screen, not raised in front of the target window).
+        if pid == std::process::id() as i32 {
+            crate::settings::restore_settings_after_summon();
+        } else {
+            crate::settings::push_settings_to_back();
+        }
         activate_and_raise(pid, cgwid);
         bump_window_mru(&mut state.mru, pid, cgwid);
         log_info!(
@@ -219,6 +229,14 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
         let pid = w.pid;
         let cgwid = w.window_id;
         hide_overlay();
+        // 同 on_cmd_released:选中自己则恢复设置窗口,切到别的 App 则沉底。
+        // Same as on_cmd_released: restore the settings window when selecting our own,
+        // push it to the back when switching to another app.
+        if pid == std::process::id() as i32 {
+            crate::settings::restore_settings_after_summon();
+        } else {
+            crate::settings::push_settings_to_back();
+        }
         activate_and_raise(pid, cgwid);
         bump_window_mru(&mut state.mru, pid, cgwid);
         state.visible = false;
@@ -299,6 +317,14 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                     let pid = w.pid;
                     let cgwid = w.window_id;
                     hide_overlay();
+                    // 同 on_cmd_released:选中自己则恢复设置窗口,切到别的 App 则沉底。
+                    // Same as on_cmd_released: restore the settings window when selecting
+                    // our own, push it to the back when switching to another app.
+                    if pid == std::process::id() as i32 {
+                        crate::settings::restore_settings_after_summon();
+                    } else {
+                        crate::settings::push_settings_to_back();
+                    }
                     activate_and_raise(pid, cgwid);
                     bump_window_mru(&mut state.mru, pid, cgwid);
                 }
@@ -307,6 +333,9 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
             KEY_ESCAPE => {
                 state.visible = false;
                 hide_overlay();
+                // 取消:没有切换目标,恢复 summon 期间藏起的设置窗口。
+                // Cancelled: no target was selected, restore the stashed settings window.
+                crate::settings::restore_settings_after_summon();
             }
             _ => {}
         }
@@ -410,12 +439,14 @@ pub(crate) fn hide_overlay() {
             let _: () = msg_send![window.0, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
-    // 恢复 summon 期间临时藏起的设置窗口(若有)。在 activate_and_raise 之前执行,
-    // 这样选中的别的窗口会盖到它前面;选中的是设置窗口则由随后的 raise 抬到最前。
-    // Restore the settings window stashed during summon (if any). Runs before
-    // activate_and_raise so a different selected window lands above it; if the settings
-    // window itself was selected, the subsequent raise brings it to the front.
-    crate::settings::restore_settings_after_summon();
+    // 设置窗口的恢复由各调用方决定:选中自己/取消 -> restore_settings_after_summon();
+    // 切到别的 App -> push_settings_to_back()(orderBack 沉底)。不在 hide_overlay 里
+    // 无条件处理——切到别的 App 时设置窗口应沉底而不是被 orderFront 抬到目标窗口前面。
+    // The settings-window restore is decided by each caller: selecting our own window or
+    // cancelling -> restore_settings_after_summon(); switching to another app ->
+    // push_settings_to_back() (orderBack to the back). No unconditional handling here --
+    // switching to another app must sink the settings window instead of orderFront-ing it
+    // in front of the target window.
 }
 
 pub(crate) fn refresh_highlight() {
@@ -889,8 +920,10 @@ pub(crate) fn show_overlay() {
         refresh_highlight();
 
         // 设置窗口若开着,临时藏起:它已被收为卡片,这里只藏实体,避免贴在浮窗后面露出。
+        // 切走后由调用方决定恢复(orderFront)或沉底(orderBack)。
         // If the settings window is open, stash it: it's already a card, this just hides its
-        // body so it doesn't peek out behind the overlay.
+        // body so it doesn't peek out behind the overlay. After the switch, callers either
+        // restore it (orderFront) or sink it (orderBack).
         crate::settings::stash_settings_for_summon();
     }
 }
