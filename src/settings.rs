@@ -544,29 +544,29 @@ pub(crate) extern "C" fn on_settings_cancel(_self: *mut c_void, _cmd: Sel, _send
 
 /// 设备下拉框的项与 DeviceKey 的映射(与 popup items 一一对应),供 handle_device_changed
 /// 按 indexOfSelectedItem 反查。每次 rebuild_device_popup 重建。
+/// 只有具体设备项,无"所有鼠标"通配项。
 ///
 /// Mapping from popup-item index to DeviceKey (1:1 with popup items), used by
 /// handle_device_changed to look up the selected device by indexOfSelectedItem. Rebuilt each time
-/// rebuild_device_popup runs.
-static DEVICE_POPUP_KEYS: Mutex<Vec<Option<crate::mouse::device::DeviceKey>>> = Mutex::new(Vec::new());
+/// rebuild_device_popup runs. Contains only concrete devices; no "All Mice" wildcard entry.
+static DEVICE_POPUP_KEYS: Mutex<Vec<crate::mouse::device::DeviceKey>> = Mutex::new(Vec::new());
 
-/// 重建设备下拉框的选项:"所有鼠标" + 各已连接设备,并选中当前设备对应的项。
+/// 重建设备下拉框的选项:仅各已连接设备(无"所有鼠标"通配项)。
 /// 由 load_settings_values 调用(每次打开设置时刷新,反映热插拔)。
 ///
-/// Rebuild the device popup's items: "All Mice" + each connected device, selecting the item
-/// matching the current device. Called by load_settings_values (refreshed on each settings open
-/// to reflect hot-plug changes).
+/// Rebuild the device popup's items: only each connected device (no "All Mice" wildcard entry).
+/// Called by load_settings_values (refreshed on each settings open to reflect hot-plug changes).
 unsafe fn rebuild_device_popup(ui: &SettingsUi) {
     let connected = crate::mouse::device::connected_devices();
     let cur = current_selected_device();
 
-    // 构建下拉项与 key 映射。
-    // Build the popup items and the key mapping.
-    let mut items: Vec<String> = vec![t("settings.mouse_device_all_mice")];
-    let mut keys: Vec<Option<crate::mouse::device::DeviceKey>> = vec![None];
+    // 构建下拉项与 key 映射:仅设备。
+    // Build the popup items and the key mapping: devices only.
+    let mut items: Vec<String> = Vec::new();
+    let mut keys: Vec<crate::mouse::device::DeviceKey> = Vec::new();
     for d in &connected {
         items.push(format!("{} ({:#x}:{:#x})", d.name, d.vendor_id, d.product_id));
-        keys.push(Some((d.vendor_id, d.product_id)));
+        keys.push((d.vendor_id, d.product_id));
     }
 
     // 清空旧项,填入新项。
@@ -578,21 +578,27 @@ unsafe fn rebuild_device_popup(ui: &SettingsUi) {
         CFRelease(ns as *const c_void);
     }
 
-    // 选中当前设备对应的项;若已拔出(不在列表里)则回退到"所有鼠标"(index 0)。
-    // Select the item matching the current device; if it's gone (unplugged), fall back to
-    // "All Mice" (index 0).
-    let cur_in_list = keys.contains(&cur);
+    // 选中当前设备对应的项;若已拔出(不在列表里)或未选择,回退到第一个设备。
+    // Select the item matching the current device; if it's gone (unplugged) or unset, fall back
+    // to the first device.
+    let cur_in_list = cur.map(|c| keys.contains(&c)).unwrap_or(false);
     let sel_idx = if cur_in_list {
-        keys.iter().position(|k| *k == cur).unwrap_or(0)
+        keys.iter().position(|k| *k == cur.unwrap()).unwrap_or(0)
     } else {
         0
     };
-    let _: () = msg_send![ui.device_indicator, selectItemAtIndex: sel_idx as isize];
-
-    // 若原设备已不在列表(被拔出),同步 SELECTED_DEVICE 为回退值。
-    // If the original device is no longer listed (unplugged), sync SELECTED_DEVICE to the fallback.
-    if !cur_in_list {
-        *SELECTED_DEVICE.lock().unwrap() = Some(keys[sel_idx]);
+    if !keys.is_empty() {
+        let _: () = msg_send![ui.device_indicator, selectItemAtIndex: sel_idx as isize];
+        // 若原设备已不在列表(被拔出)或未选择,同步 SELECTED_DEVICE 为回退值(第一个设备)。
+        // If the original device is no longer listed (unplugged) or unset, sync SELECTED_DEVICE
+        // to the fallback (first device).
+        if !cur_in_list {
+            *SELECTED_DEVICE.lock().unwrap() = Some(Some(keys[sel_idx]));
+        }
+    } else {
+        // 无设备连接:清空选中状态(编辑"所有鼠标"基础层)。
+        // No device connected: clear the selection (edits the "All Mice" base layer).
+        *SELECTED_DEVICE.lock().unwrap() = Some(None);
     }
 
     *DEVICE_POPUP_KEYS.lock().unwrap() = keys;
@@ -609,16 +615,10 @@ pub(crate) extern "C" fn handle_device_changed(
     unsafe {
         let popup = sender as *mut AnyObject;
         let idx: isize = msg_send![popup, indexOfSelectedItem];
-        // DEVICE_POPUP_KEYS: Vec<Option<DeviceKey>>;取选中项对应的 key。
-        // None = "所有鼠标",Some((vid,pid)) = 某款鼠标。
-        // DEVICE_POPUP_KEYS: Vec<Option<DeviceKey>>; get the key for the selected item.
-        // None = "All Mice", Some((vid,pid)) = a specific mouse.
-        let new_dev = DEVICE_POPUP_KEYS
-            .lock()
-            .unwrap()
-            .get(idx as usize)
-            .copied()
-            .flatten();
+        // DEVICE_POPUP_KEYS: Vec<DeviceKey>;取选中项对应的 key(均为具体设备,无通配项)。
+        // DEVICE_POPUP_KEYS: Vec<DeviceKey>; get the key for the selected item (all concrete
+        // devices; no wildcard entry).
+        let new_dev = DEVICE_POPUP_KEYS.lock().unwrap().get(idx as usize).copied();
         *SELECTED_DEVICE.lock().unwrap() = Some(new_dev);
         // 刷新其余控件为新设备的有效值(不重建 popup 本身,避免循环)。
         // Refresh the other controls with the new device's effective values (don't rebuild the
