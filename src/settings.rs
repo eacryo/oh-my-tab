@@ -76,8 +76,9 @@ struct SettingsUi {
     reverse_scroll: *mut AnyObject, // NSButton (checkbox): 反转滚动 / reverse scrolling
     enable_mouse: *mut AnyObject,   // NSButton (checkbox): 启用鼠标控制 / enable mouse control
     scroll_mode: *mut AnyObject,      // NSPopUpButton: default/line/smooth
-    line_count: *mut AnyObject,       // NSTextField: line count input
+    line_count: *mut AnyObject,       // NSSlider: line count slider
     line_count_label: *mut AnyObject, // NSTextField: line count row 的 label / the row's label
+    line_count_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
     smooth_preset: *mut AnyObject,    // NSPopUpButton: smooth preset
     smooth_preset_label: *mut AnyObject, // NSTextField: smooth preset row 的 label / the row's label
     disable_pointer_accel: *mut AnyObject, // NSButton (checkbox): 禁用指针加速 / disable pointer acceleration
@@ -482,6 +483,9 @@ unsafe fn update_mode_dependent_visibility(ui: &SettingsUi) {
         let _: () = msg_send![label, setHidden: !show];
         let _: () = msg_send![ctrl, setHidden: !show];
     }
+    // 行数滑块右侧的数值 label 随滑块一起显隐。
+    // The line-count slider's value label hides with the slider.
+    let _: () = msg_send![ui.line_count_value_label, setHidden: !show_line];
 }
 
 /// scroll_mode 下拉框切换回调:即时刷新行数/平滑预设行的条件显隐。
@@ -496,6 +500,23 @@ pub(crate) extern "C" fn handle_scroll_mode_changed(
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
             update_mode_dependent_visibility(u);
+        }
+    }
+}
+
+/// line_count 滑块拖动回调:实时刷新右侧数值 label。
+/// Line-count slider drag callback: refresh the value label on the right live.
+pub(crate) extern "C" fn handle_line_count_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    unsafe {
+        let slider = sender as *mut AnyObject;
+        let val: isize = msg_send![slider, integerValue];
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            set_field(u.line_count_value_label, val);
         }
     }
 }
@@ -923,6 +944,9 @@ fn load_settings_values_impl(rebuild_device: bool) {
         // line_count:用有效值(滑块)。
         // line_count: effective value (slider).
         let _: () = msg_send![ui.line_count, setIntegerValue: resolved.line_count as isize];
+        // 同步滑块右侧数值 label。
+        // Sync the slider's value label.
+        set_field(ui.line_count_value_label, resolved.line_count);
         // smooth_preset:用有效值。
         // smooth_preset: effective value.
         let sp_idx: isize = SMOOTH_PRESET_LABELS
@@ -1212,6 +1236,7 @@ fn create_settings_window() {
             scroll_mode: std::ptr::null_mut(),
             line_count: std::ptr::null_mut(),
             line_count_label: std::ptr::null_mut(),
+            line_count_value_label: std::ptr::null_mut(),
             smooth_preset: std::ptr::null_mut(),
             smooth_preset_label: std::ptr::null_mut(),
             disable_pointer_accel: std::ptr::null_mut(),
@@ -1732,12 +1757,30 @@ fn create_settings_window() {
             row_h,
             &t("settings.row_line_count"),
             // 整数滑块 1..=10(与 config 校验一致;对齐 LinearMouse By Lines 的滑块交互)。
+            // 右侧留 ~40pt 放只读数值 label 显示当前值。
             // Integer slider 1..=10 (matches config validation; mirrors LinearMouse's
-            // By Lines slider interaction).
-            make_slider(ctrl_x, y, ctrl_w, row_h, 1, 10, 3),
+            // By Lines slider interaction). ~40pt on the right holds a read-only value label.
+            make_slider(ctrl_x, y, ctrl_w - 40.0, row_h, 1, 10, 3),
         );
         ui.line_count = line_ctrl;
         ui.line_count_label = line_label;
+        // 滑块右侧的只读数值 label:显示当前行数,拖动滑块时实时刷新。
+        // Read-only value label right of the slider: shows the current line count, refreshed
+        // live as the slider moves.
+        let value_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let value_label: *mut AnyObject = msg_send![value_label, initWithFrame: NSRect::new(NSPoint::new(ctrl_x + ctrl_w - 34.0, y), NSSize::new(30.0, row_h))];
+        set_field(value_label, 3);
+        let _: () = msg_send![value_label, setBezeled: false];
+        let _: () = msg_send![value_label, setDrawsBackground: false];
+        let _: () = msg_send![value_label, setEditable: false];
+        let _: () = msg_send![value_label, setAlignment: 1isize]; // NSTextAlignmentRight
+        let _: () = msg_send![mouse_view, addSubview: value_label];
+        release_obj(value_label);
+        ui.line_count_value_label = value_label;
+        // 滑块拖动时实时刷新数值 label。
+        // Refresh the value label live as the slider is dragged.
+        let _: () = msg_send![ui.line_count, setTarget: target];
+        let _: () = msg_send![ui.line_count, setAction: sel!(handleLineCountChanged:)];
 
         // --- 平滑预设 / Smooth preset ---
         y -= 8.0 + row_h;

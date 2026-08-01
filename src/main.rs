@@ -690,6 +690,12 @@ fn setup_status_bar() {
                 handle_scroll_mode_changed as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(handleLineCountChanged:),
+                handle_line_count_changed as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };
