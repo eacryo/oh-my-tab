@@ -185,16 +185,14 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
             cgwid
         );
         hide_overlay();
-        // 选中的是自己(设置窗口):先恢复可见,随后的 raise 会把它抬到最前;
-        // 选中的是别的 App:设置窗口 orderBack 沉底(在屏、不抬到目标窗口前面)。
-        // Selecting our own window (settings): restore it first so the subsequent raise
-        // brings it to the front; selecting another app: push the settings window to the
-        // very back (on-screen, not raised in front of the target window).
-        if pid == std::process::id() as i32 {
-            crate::settings::restore_settings_after_summon();
-        } else {
-            crate::settings::push_settings_to_back();
-        }
+        // 设置窗口无需特殊处理:浮窗是 nonactivating 面板,召唤时 app 未激活,设置窗口
+        // 从未被抬升(从别的 App 召唤时被其窗口盖住;从设置召唤时透过玻璃可见),切走后
+        // 留在原位。与 BetterCmdTab 行为一致,无 stash/restore 机制。
+        // No settings-window handling needed: the overlay is a nonactivating panel, so the app
+        // stays inactive during summon and the settings window is never raised (covered by the
+        // active app's windows when summoning from elsewhere; visible through the glass when
+        // summoning from settings). It stays put after the switch. Matches BetterCmdTab --
+        // no stash/restore machinery.
         activate_and_raise(pid, cgwid);
         bump_window_mru(&mut state.mru, pid, cgwid);
         log_info!(
@@ -229,14 +227,8 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
         let pid = w.pid;
         let cgwid = w.window_id;
         hide_overlay();
-        // 同 on_cmd_released:选中自己则恢复设置窗口,切到别的 App 则沉底。
-        // Same as on_cmd_released: restore the settings window when selecting our own,
-        // push it to the back when switching to another app.
-        if pid == std::process::id() as i32 {
-            crate::settings::restore_settings_after_summon();
-        } else {
-            crate::settings::push_settings_to_back();
-        }
+        // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释)。
+        // Same as on_cmd_released: no settings-window handling needed (see comment there).
         activate_and_raise(pid, cgwid);
         bump_window_mru(&mut state.mru, pid, cgwid);
         state.visible = false;
@@ -317,14 +309,8 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                     let pid = w.pid;
                     let cgwid = w.window_id;
                     hide_overlay();
-                    // 同 on_cmd_released:选中自己则恢复设置窗口,切到别的 App 则沉底。
-                    // Same as on_cmd_released: restore the settings window when selecting
-                    // our own, push it to the back when switching to another app.
-                    if pid == std::process::id() as i32 {
-                        crate::settings::restore_settings_after_summon();
-                    } else {
-                        crate::settings::push_settings_to_back();
-                    }
+                    // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释)。
+                    // Same as on_cmd_released: no settings-window handling needed.
                     activate_and_raise(pid, cgwid);
                     bump_window_mru(&mut state.mru, pid, cgwid);
                 }
@@ -333,9 +319,9 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
             KEY_ESCAPE => {
                 state.visible = false;
                 hide_overlay();
-                // 取消:没有切换目标,恢复 summon 期间藏起的设置窗口。
-                // Cancelled: no target was selected, restore the stashed settings window.
-                crate::settings::restore_settings_after_summon();
+                // 取消:设置窗口从未被触碰(nonactivating 面板不激活 app),无需恢复。
+                // Cancelled: the settings window was never touched (the nonactivating panel
+                // never activated the app), so nothing to restore.
             }
             _ => {}
         }
@@ -439,14 +425,11 @@ pub(crate) fn hide_overlay() {
             let _: () = msg_send![window.0, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
-    // 设置窗口的恢复由各调用方决定:选中自己/取消 -> restore_settings_after_summon();
-    // 切到别的 App -> push_settings_to_back()(orderBack 沉底)。不在 hide_overlay 里
-    // 无条件处理——切到别的 App 时设置窗口应沉底而不是被 orderFront 抬到目标窗口前面。
-    // The settings-window restore is decided by each caller: selecting our own window or
-    // cancelling -> restore_settings_after_summon(); switching to another app ->
-    // push_settings_to_back() (orderBack to the back). No unconditional handling here --
-    // switching to another app must sink the settings window instead of orderFront-ing it
-    // in front of the target window.
+    // 设置窗口从不被 stash/restore:nonactivating 面板不激活 app,设置窗口全程留在
+    // 原位(z-order 不受召唤影响),切换器只负责收它作卡片与抬起目标窗口。
+    // The settings window is never stashed/restored: the nonactivating panel never activates
+    // the app, so the settings window stays at its natural z-order throughout the summon;
+    // the switcher only collects it as a card and raises the target window.
 }
 
 pub(crate) fn refresh_highlight() {
@@ -825,8 +808,10 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
         release_obj(title_label); // view owns the label; drop our alloc +1
 
         // --- Tracking area for hover ---
-        // NSTrackingMouseEnteredAndExited | NSTrackingActiveInActiveApp
-        let opts: u64 = 0x01 | 0x40;
+        // NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
+        // activeAlways:召唤时 app 未激活(nonactivating 面板),必须用 activeAlways 才能收
+        // mouseEntered 悬停事件。activeInActiveApp(0x40) 在 app 非激活时不投递。
+        let opts: u64 = 0x01 | 0x80;
         let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
         let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_w(), card_h()));
         let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds, options: opts, owner: view, userInfo: std::ptr::null::<AnyObject>()];
@@ -910,20 +895,39 @@ pub(crate) fn show_overlay() {
         MOUSE_MOVED.store(false, Ordering::Relaxed);
         let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
 
-        // Activate and show window
-        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-        let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
+        // Show window. NSPanel + nonactivatingPanel: the panel becomes key (keyboard works)
+        // WITHOUT activating our app -- do NOT call activateIgnoringOtherApps, or the settings
+        // window would be raised above the active app again. App stays inactive during the
+        // whole summon, so the settings window is never raised (and no stash is needed).
         let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
         let _: bool = msg_send![window, makeFirstResponder: container];
 
+        // App 未激活时 NSView 的 mouseMoved: 可能不投递(即使面板是 key),所以给容器加一个
+        // activeAlways 的 tracking area(mouseMoved|activeAlways|inVisibleRect)兜底,保证
+        // MOUSE_MOVED 标志能置位——否则悬停门控永远不开启。对齐 BetterCmdTab 的做法
+        // (SwitcherView 用 .mouseMoved + .activeAlways)。
+        // When the app is inactive, NSView mouseMoved: may not be delivered even to the key
+        // panel, so add an activeAlways tracking area (mouseMoved|activeAlways|inVisibleRect)
+        // to the container to guarantee the MOUSE_MOVED gate flips -- otherwise hover selection
+        // never enables. Same approach as BetterCmdTab's SwitcherView (.mouseMoved + .activeAlways).
+        // App 未激活时 NSView 的 mouseMoved: 可能不投递(即使面板是 key),所以给容器加一个
+        // activeAlways 的 tracking area(mouseMoved|activeAlways|inVisibleRect)兜底,保证
+        // MOUSE_MOVED 标志能置位——否则悬停门控永远不开启。对齐 BetterCmdTab 的做法
+        // (SwitcherView 用 .mouseMoved + .activeAlways)。
+        // When the app is inactive, NSView mouseMoved: may not be delivered even to the key
+        // panel, so add an activeAlways tracking area (mouseMoved|activeAlways|inVisibleRect)
+        // to the container to guarantee the MOUSE_MOVED gate flips -- otherwise hover selection
+        // never enables. Same approach as BetterCmdTab's SwitcherView (.mouseMoved + .activeAlways).
+        let mm_ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+        // NSTrackingMouseMoved=0x02 | NSTrackingActiveAlways=0x80 | NSTrackingInVisibleRect=0x200。
+        // 注意激活模式(NSTrackingActive*)只能指定一个,多指定会抛 NSInvalidArgumentException。
+        let mm_opts: u64 = 0x02 | 0x80 | 0x200;
+        let container_bounds: NSRect = msg_send![container, bounds];
+        let mm_ta: *mut AnyObject = msg_send![mm_ta, initWithRect: container_bounds, options: mm_opts, owner: container, userInfo: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![container, addTrackingArea: mm_ta];
+        release_obj(mm_ta); // container owns the tracking area; drop our alloc +1
+
         // Highlight selected card
         refresh_highlight();
-
-        // 设置窗口若开着,临时藏起:它已被收为卡片,这里只藏实体,避免贴在浮窗后面露出。
-        // 切走后由调用方决定恢复(orderFront)或沉底(orderBack)。
-        // If the settings window is open, stash it: it's already a card, this just hides its
-        // body so it doesn't peek out behind the overlay. After the switch, callers either
-        // restore it (orderFront) or sink it (orderBack).
-        crate::settings::stash_settings_for_summon();
     }
 }

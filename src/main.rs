@@ -270,27 +270,36 @@ fn create_overlay_window() -> *mut AnyObject {
 
         // Borderless 窗口(styleMask = 0):无标题栏 -> 窗口可见形状 = 玻璃的圆角 alpha,
         // 消除"圆角玻璃 + 方角窗口"在四角留下的透明突出,且四角对称。
-        // borderless 默认不能成为 key 窗口(收不到键盘),所以用自定义 NSWindow 子类
+        // borderless 默认不能成为 key 窗口(收不到键盘),所以用自定义 NSPanel 子类
         // 重写 canBecomeKeyWindow -> YES。原先用 titled + 透明标题栏绕开此子类,代价就是
         // 四角不对称的透明突出(Regular 下尤为明显)。
+        //
+        // 关键:NSPanel + NSWindowStyleMaskNonactivatingPanel(1<<7) —— 面板成为 key 窗口时
+        // **不激活所属 app**(BetterCmdTab 面板同款)。召唤时 app 保持非激活,设置窗口就不会
+        // 被抬到活动 App 前面,切换器因此不再需要 stash/orderBack 机制。
         //
         // Borderless window (styleMask = 0): no title bar -> the window's visible shape equals
         // the glass's rounded alpha, eliminating the transparent protrusions left at the corners by
         // a rounded glass inside a square window, and keeping all four corners symmetric. A borderless
-        // window can't become key by default (no keyboard input), so a custom NSWindow subclass
+        // window can't become key by default (no keyboard input), so a custom NSPanel subclass
         // overrides canBecomeKeyWindow -> YES. The earlier titled + transparent-titlebar approach
         // avoided this subclass at the cost of those asymmetric transparent corners (especially
         // visible under the Regular glass style).
-        let style: u64 = 0; // NSWindowStyleMaskBorderless
+        //
+        // Key: NSPanel + NSWindowStyleMaskNonactivatingPanel (1<<7) -- the panel becomes key
+        // WITHOUT activating the owning app (same as BetterCmdTab's panel). While the app stays
+        // inactive during summon, the settings window is never raised above the active app, so
+        // the switcher no longer needs the stash/orderBack machinery.
+        let style: u64 = 1 << 7; // NSWindowStyleMaskBorderless(0) | NSWindowStyleMaskNonactivatingPanel
 
-        // 注册自定义窗口子类 OhMyTabOverlayWindow : NSWindow(仅重写 canBecomeKeyWindow)。
+        // 注册自定义窗口子类 OhMyTabOverlayWindow : NSPanel(仅重写 canBecomeKeyWindow)。
         // 仿 OhMyTabContainerView 的 inline 注册;create_overlay_window 只调用一次,无重复注册风险。
-        // Register the custom window subclass OhMyTabOverlayWindow : NSWindow (only overrides
+        // Register the custom window subclass OhMyTabOverlayWindow : NSPanel (only overrides
         // canBecomeKeyWindow). Inline, like OhMyTabContainerView; create_overlay_window is called
         // once, so no double-registration.
         let window_cls = {
             let name = CString::new("OhMyTabOverlayWindow").unwrap();
-            let superclass = class!(NSWindow) as *const _ as *mut AnyObject;
+            let superclass = class!(NSPanel) as *const _ as *mut AnyObject;
             let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
             let types_bool = CString::new("B@:").unwrap();
             class_addMethod(

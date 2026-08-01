@@ -10,7 +10,7 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use crate::config::{reload_config, Config, CONFIG};
@@ -85,13 +85,6 @@ struct SettingsUi {
 unsafe impl Send for SettingsUi {}
 unsafe impl Sync for SettingsUi {}
 static SETTINGS_UI: Mutex<Option<SettingsUi>> = Mutex::new(None);
-
-// summon 期间是否临时藏起了设置窗口(orderOut),避免它贴在浮窗后面露出来。
-// stash 时置 true;restore/push_settings_to_back 时 swap 回 false。
-// Whether the settings window was temporarily orderOut'd during summon so it doesn't
-// peek out behind the overlay. Set true on stash, swapped back to false on restore /
-// push_settings_to_back.
-static SETTINGS_HIDDEN_FOR_SUMMON: AtomicBool = AtomicBool::new(false);
 
 // ========== 控件构造 helper / control-builder helpers ==========
 
@@ -457,80 +450,6 @@ fn hide_settings() {
     // 切回 .accessory:设置窗口关闭,回到纯菜单栏(无 Dock 图标)。
     // Switch back to .accessory: the settings window is closed, return to pure menu-bar (no Dock icon).
     crate::set_settings_activation_policy(false);
-    // 关闭 ≠ 「打开但隐藏」:清掉 stash 标志,防止 collect 为已关闭的设置窗口合成卡片。
-    // Closing is not "open but hidden": clear the stash flag so collect never synthesizes
-    // a card for a closed settings window.
-    SETTINGS_HIDDEN_FOR_SUMMON.store(false, Ordering::SeqCst);
-}
-
-/// 浮窗显示时调用:若设置窗口正打开可见,临时 orderOut 藏起来并置标志。
-/// 设置窗口已被 collect 收为卡片,这里只藏其实体,避免它贴在浮窗后面露出来。
-/// 恢复由调用方决定:选中自己/取消 -> restore_settings_after_summon(),
-/// 切到别的 App -> push_settings_to_back()(orderBack 沉底,在屏但不抬到最前)。
-///
-/// Called when the overlay is shown: if the settings window is open and visible,
-/// orderOut it temporarily and set a flag. It was already collected as a card, so only
-/// its body is hidden -- preventing it from peeking out behind the overlay. Restore is
-/// decided by callers: selecting our own window or cancelling ->
-/// restore_settings_after_summon(); switching to another app -> push_settings_to_back()
-/// (orderBack to the very back, on-screen but not raised to the front).
-pub(crate) fn stash_settings_for_summon() {
-    unsafe {
-        let ui = SETTINGS_UI.lock().unwrap();
-        let Some(u) = ui.as_ref() else {
-            return;
-        };
-        let visible: bool = msg_send![u.window, isVisible];
-        if !visible {
-            return;
-        }
-        let _: () = msg_send![u.window, orderOut: std::ptr::null::<AnyObject>()];
-        SETTINGS_HIDDEN_FOR_SUMMON.store(true, Ordering::SeqCst);
-    }
-}
-
-/// 选中自己的设置窗口或取消召唤时调用:若 stash 过设置窗口,orderFront 恢复它。
-/// 调用方需在 activate_and_raise 之前调用——orderOut 的窗口无法被 AXRaise 抬升,
-/// 必须先恢复可见,随后的 raise 才能把它抬到最前。
-///
-/// Called when selecting our own settings window or cancelling the summon: if the settings
-/// window was stashed, orderFront it. Callers must invoke this before activate_and_raise --
-/// an orderOut'd window can't be raised via AXRaise; it must be made visible first so the
-/// subsequent raise can bring it to the front.
-pub(crate) fn restore_settings_after_summon() {
-    if !SETTINGS_HIDDEN_FOR_SUMMON.swap(false, Ordering::SeqCst) {
-        return;
-    }
-    unsafe {
-        let ui = SETTINGS_UI.lock().unwrap();
-        if let Some(u) = ui.as_ref() {
-            let _: () = msg_send![u.window, orderFront: std::ptr::null::<AnyObject>()];
-        }
-    }
-}
-
-/// 切换到「别的 App」后调用:把设置窗口沉到所有窗口最底层(orderBack)。
-/// 保持可见(调度中心/我们的切换器仍能显示它),但不会被抬到目标窗口前面,
-/// 也不会像 orderFront 那样贴在目标窗口正下方——对齐「切走时不参与」的语义。
-/// 仅当 summon 期间 stash 过(设置窗口当时可见)才 orderBack;已关闭时 no-op,
-/// 避免把已关闭的设置窗口重新显示出来。
-///
-/// Called after switching to a DIFFERENT app: push the settings window to the very back
-/// of the z-order (orderBack). It stays visible (so Mission Control and our switcher still
-/// show it) but is neither raised in front of the target window nor stacked right below it
-/// the way orderFront would -- matching the "stays out of the way when switching away"
-/// semantics. Only acts when the window was stashed during this summon (i.e. it was
-/// visible); a closed settings window is never resurrected.
-pub(crate) fn push_settings_to_back() {
-    if !SETTINGS_HIDDEN_FOR_SUMMON.swap(false, Ordering::SeqCst) {
-        return;
-    }
-    unsafe {
-        let ui = SETTINGS_UI.lock().unwrap();
-        if let Some(u) = ui.as_ref() {
-            let _: () = msg_send![u.window, orderBack: std::ptr::null::<AnyObject>()];
-        }
-    }
 }
 
 /// 弹一个简单的告警框(app 模态),用于显示校验/保存错误。
