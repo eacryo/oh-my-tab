@@ -571,10 +571,16 @@ fn setup_status_bar() {
         let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
         let image: *mut AnyObject = msg_send![image, initWithData: nsdata];
         if !image.is_null() {
-            // PNG 128px,设 size 为 status bar 厚度,让 sizeToFit 后 button 匹配 menu bar 图标尺寸
-            // PNG is 128px; set its size to the status bar thickness so sizeToFit matches menu-bar icon size
+            // statusbar-icon.png 是 162x128(横向留白更宽,让图标与邻居间距更舒展)。
+            // 设高度为 status bar 厚度、宽度按 PNG 纵横比等比缩放,保持图形像素大小不变、
+            // 只放大左右空隙。强制方形(icon_size x icon_size)会压扁非方形 PNG。
+            // statusbar-icon.png is 162x128 (wider horizontal margins so the icon sits looser
+            // from its neighbors). Set the height to the status-bar thickness and scale the width
+            // by the PNG aspect ratio, keeping the glyph pixel size while widening the gaps.
+            // Forcing a square (icon_size x icon_size) would squash the non-square PNG.
             let icon_size: f64 = msg_send![status_bar, thickness];
-            let _: () = msg_send![image, setSize: NSSize::new(icon_size, icon_size)];
+            let aspect: f64 = 162.0 / 128.0; // statusbar-icon.png 纵横比 / PNG aspect ratio
+            let _: () = msg_send![image, setSize: NSSize::new(icon_size * aspect, icon_size)];
             let is_template: bool = true;
             let _: () = msg_send![image, setTemplate: is_template];
             let _: () = msg_send![button, setImage: image];
