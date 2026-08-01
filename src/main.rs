@@ -674,8 +674,8 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
-                sel!(handleDevicePicker:),
-                handle_device_picker as *mut c_void,
+                sel!(handleDeviceChanged:),
+                handle_device_changed as *mut c_void,
                 types.as_ptr(),
             );
             objc_registerClassPair(cls);

@@ -243,8 +243,18 @@ pub(crate) fn ensure_enumerated() {
 }
 
 /// 当前已连接设备列表的快照(VID/PID/名称),供设置 UI 的设备选择器使用。
+/// 若 registry 为空,先触发一次枚举(即使 mouse.enabled=false 也能拿到设备列表)。
+///
 /// Snapshot of currently-connected devices (VID/PID/name) for the settings device picker.
+/// Triggers enumeration if the registry is empty (works even when mouse.enabled=false).
 pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
+    {
+        let reg = registry().lock().unwrap();
+        if reg.client.is_null() || reg.devices.is_empty() {
+            drop(reg);
+            ensure_enumerated();
+        }
+    }
     let reg = registry().lock().unwrap();
     reg.devices.iter().map(|d| d.identity.clone()).collect()
 }

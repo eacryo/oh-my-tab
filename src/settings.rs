@@ -392,8 +392,32 @@ unsafe fn update_ok_button_title(ui: &SettingsUi) {
     }
 }
 
-/// enable_mouse 勾选框 toggle 回调:实时更新 OK 按钮标题。
-/// Callback when the enable_mouse checkbox is toggled: update the OK button title in real time.
+/// 根据 enable_mouse 勾选框状态,冻结或解冻其下方的所有鼠标控件。
+/// 未启用时控件灰显且不可交互(AppKit 自动处理灰显),避免用户修改无效配置。
+///
+/// Freeze or unfreeze all mouse controls below the enable_mouse checkbox based on its state.
+/// When disabled, controls are greyed out and non-interactive (AppKit handles greying), preventing
+/// users from editing config that won't take effect.
+unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
+    let state: isize = msg_send![ui.enable_mouse, state];
+    let on = state == 1;
+    // 冻结 enable_mouse 以下的所有控件(含设备下拉框)。
+    // Freeze everything below enable_mouse (including the device popup).
+    for &ctrl in &[
+        ui.device_indicator,
+        ui.scroll_mode,
+        ui.line_count,
+        ui.smooth_preset,
+        ui.reverse_scroll,
+        ui.disable_pointer_accel,
+    ] {
+        let _: () = msg_send![ctrl, setEnabled: on];
+    }
+}
+
+/// enable_mouse 勾选框 toggle 回调:实时更新 OK 按钮标题 + 冻结/解冻下方控件。
+/// Callback when the enable_mouse checkbox is toggled: update OK button title + freeze/unfreeze
+/// the controls below.
 pub(crate) extern "C" fn handle_enable_mouse_toggle(
     _self: *mut c_void,
     _cmd: Sel,
@@ -403,6 +427,7 @@ pub(crate) extern "C" fn handle_enable_mouse_toggle(
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
             update_ok_button_title(u);
+            update_mouse_controls_enabled(u);
         }
     }
 }
@@ -411,93 +436,88 @@ pub(crate) extern "C" fn on_settings_cancel(_self: *mut c_void, _cmd: Sel, _send
     hide_settings();
 }
 
-/// 更新设备指示器按钮的标题,反映当前选中范围。
-/// Update the device-indicator button's title to reflect the current selection.
-unsafe fn update_device_indicator_title(ui: &SettingsUi) {
-    let dev = current_selected_device();
-    let title = match dev {
-        None => t("settings.mouse_device_all_mice"),
-        Some((vid, pid)) => {
-            // 在已连接设备里找匹配的名称;找不到就用 VID:PID。
-            // Find a matching name among connected devices; fall back to VID:PID.
-            let connected = crate::mouse::device::connected_devices();
-            connected
-                .iter()
-                .find(|d| d.vendor_id == vid && d.product_id == pid)
-                .map(|d| d.name.clone())
-                .unwrap_or_else(|| format!("{:#x}:{:#x}", vid, pid))
-        }
+/// 设备下拉框的项与 DeviceKey 的映射(与 popup items 一一对应),供 handle_device_changed
+/// 按 indexOfSelectedItem 反查。每次 rebuild_device_popup 重建。
+///
+/// Mapping from popup-item index to DeviceKey (1:1 with popup items), used by
+/// handle_device_changed to look up the selected device by indexOfSelectedItem. Rebuilt each time
+/// rebuild_device_popup runs.
+static DEVICE_POPUP_KEYS: Mutex<Vec<Option<crate::mouse::device::DeviceKey>>> = Mutex::new(Vec::new());
+
+/// 重建设备下拉框的选项:"所有鼠标" + 各已连接设备,并选中当前设备对应的项。
+/// 由 load_settings_values 调用(每次打开设置时刷新,反映热插拔)。
+///
+/// Rebuild the device popup's items: "All Mice" + each connected device, selecting the item
+/// matching the current device. Called by load_settings_values (refreshed on each settings open
+/// to reflect hot-plug changes).
+unsafe fn rebuild_device_popup(ui: &SettingsUi) {
+    let connected = crate::mouse::device::connected_devices();
+    let cur = current_selected_device();
+
+    // 构建下拉项与 key 映射。
+    // Build the popup items and the key mapping.
+    let mut items: Vec<String> = vec![t("settings.mouse_device_all_mice")];
+    let mut keys: Vec<Option<crate::mouse::device::DeviceKey>> = vec![None];
+    for d in &connected {
+        items.push(format!("{} ({:#x}:{:#x})", d.name, d.vendor_id, d.product_id));
+        keys.push(Some((d.vendor_id, d.product_id)));
+    }
+
+    // 清空旧项,填入新项。
+    // Clear old items and fill in the new ones.
+    let _: () = msg_send![ui.device_indicator, removeAllItems];
+    for s in &items {
+        let ns = make_nsstring(s);
+        let _: () = msg_send![ui.device_indicator, addItemWithTitle: ns];
+        CFRelease(ns as *const c_void);
+    }
+
+    // 选中当前设备对应的项;若已拔出(不在列表里)则回退到"所有鼠标"(index 0)。
+    // Select the item matching the current device; if it's gone (unplugged), fall back to
+    // "All Mice" (index 0).
+    let cur_in_list = keys.contains(&cur);
+    let sel_idx = if cur_in_list {
+        keys.iter().position(|k| *k == cur).unwrap_or(0)
+    } else {
+        0
     };
-    set_control_title(ui.device_indicator, &title);
+    let _: () = msg_send![ui.device_indicator, selectItemAtIndex: sel_idx as isize];
+
+    // 若原设备已不在列表(被拔出),同步 SELECTED_DEVICE 为回退值。
+    // If the original device is no longer listed (unplugged), sync SELECTED_DEVICE to the fallback.
+    if !cur_in_list {
+        *SELECTED_DEVICE.lock().unwrap() = Some(keys[sel_idx]);
+    }
+
+    *DEVICE_POPUP_KEYS.lock().unwrap() = keys;
 }
 
-/// 设备选择器:构建一个含"所有鼠标"+ 各已连接设备的弹窗,供用户选择当前编辑范围。
-/// Device picker: builds an alert-style sheet with "All Mice" + each connected device, letting
-/// the user choose which scope to edit.
-pub(crate) extern "C" fn handle_device_picker(
+/// 设备下拉框切换回调:更新 SELECTED_DEVICE 并即时刷新其余控件为新设备的有效值。
+/// Device-popup selection-changed callback: update SELECTED_DEVICE and immediately refresh the
+/// other controls with the newly-selected device's effective values.
+pub(crate) extern "C" fn handle_device_changed(
     _self: *mut c_void,
     _cmd: Sel,
-    _sender: *mut c_void,
+    sender: *mut c_void,
 ) {
     unsafe {
-        let connected = crate::mouse::device::connected_devices();
-        let cur = current_selected_device();
-
-        // 用 NSAlert 的下拉(supplementary view)太复杂;改用按钮式选择:为每个选项弹一个
-        // 简单的 confirm_alert 风格列表不现实。这里用 NSPopUpButton 在一个小窗口里选择。
-        // 简化:用单次 NSAlert + accessoryView(NSPopUpButton) 实现选择。
-        //
-        // Using an NSAlert with an NSPopUpButton accessory view for the selection.
-        let alert: *mut AnyObject = msg_send![class!(NSAlert), new];
-        let title_ns = make_nsstring(&t("settings.mouse_device_select"));
-        let _: () = msg_send![alert, setMessageText: title_ns];
-        CFRelease(title_ns as *const c_void);
-
-        // 构建下拉项:"所有鼠标" + 各设备名。
-        // Build popup items: "All Mice" + each device name.
-        let mut items: Vec<String> = vec![t("settings.mouse_device_all_mice")];
-        let mut keys: Vec<Option<crate::mouse::device::DeviceKey>> = vec![None];
-        for d in &connected {
-            items.push(format!("{} ({:#x}:{:#x})", d.name, d.vendor_id, d.product_id));
-            keys.push(Some((d.vendor_id, d.product_id)));
-        }
-        if connected.is_empty() {
-            items.push(t("settings.mouse_device_none_connected"));
-            keys.push(None); // 占位,不会被选中(只有一项) / placeholder, won't be selected
-        }
-
-        let popup: *mut AnyObject = msg_send![class!(NSPopUpButton), alloc];
-        let popup: *mut AnyObject = msg_send![popup, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(300.0, 26.0)), pullsDown: false];
-        for s in &items {
-            let ns = make_nsstring(s);
-            let _: () = msg_send![popup, addItemWithTitle: ns];
-            CFRelease(ns as *const c_void);
-        }
-        // 选中当前设备对应的项。
-        // Select the item matching the current device.
-        let sel_idx = keys.iter().position(|k| *k == cur).unwrap_or(0);
-        let _: () = msg_send![popup, selectItemAtIndex: sel_idx as isize];
-        let _: () = msg_send![alert, setAccessoryView: popup];
-        release_obj(popup);
-
-        let ok_ns = make_nsstring(&t("alert.btn_ok"));
-        let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: ok_ns];
-        CFRelease(ok_ns as *const c_void);
-        let cancel_ns = make_nsstring(&t("alert.btn_cancel"));
-        let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: cancel_ns];
-        CFRelease(cancel_ns as *const c_void);
-
-        let resp: isize = msg_send![alert, runModal];
-        if resp == 1000 {
-            // NSAlertFirstButtonReturn = 确认 / confirm
-            let idx: isize = msg_send![popup, indexOfSelectedItem];
-            let new_dev = keys.get(idx as usize).copied().unwrap_or(None);
-            *SELECTED_DEVICE.lock().unwrap() = Some(new_dev);
-            // 选中后刷新鼠标页控件为新范围的有效值。
-            // After selection, refresh the mouse-page controls with the new scope's effective values.
-            load_settings_values();
-        }
-        release_obj(alert);
+        let popup = sender as *mut AnyObject;
+        let idx: isize = msg_send![popup, indexOfSelectedItem];
+        // DEVICE_POPUP_KEYS: Vec<Option<DeviceKey>>;取选中项对应的 key。
+        // None = "所有鼠标",Some((vid,pid)) = 某款鼠标。
+        // DEVICE_POPUP_KEYS: Vec<Option<DeviceKey>>; get the key for the selected item.
+        // None = "All Mice", Some((vid,pid)) = a specific mouse.
+        let new_dev = DEVICE_POPUP_KEYS
+            .lock()
+            .unwrap()
+            .get(idx as usize)
+            .copied()
+            .flatten();
+        *SELECTED_DEVICE.lock().unwrap() = Some(new_dev);
+        // 刷新其余控件为新设备的有效值(不重建 popup 本身,避免循环)。
+        // Refresh the other controls with the new device's effective values (don't rebuild the
+        // popup itself, avoiding a cycle).
+        load_settings_values_no_device_popup();
     }
 }
 
@@ -719,8 +739,25 @@ pub(crate) extern "C" fn handle_restore_defaults(
 }
 
 /// 用当前 CONFIG 填充设置控件(每次打开都刷新,反映外部编辑 + Reload)。
-/// Populate settings controls from current CONFIG (refreshed on each open).
+/// 重建设备下拉框(反映热插拔)。
+///
+/// Populate settings controls from current CONFIG (refreshed on each open). Rebuilds the device
+/// popup to reflect hot-plug changes.
 fn load_settings_values() {
+    load_settings_values_impl(true);
+}
+
+/// 同 load_settings_values 但不重建设备下拉框。
+/// 供 handle_device_changed 调用:切换设备后刷新其余控件,避免重建 popup 触发循环。
+///
+/// Same as load_settings_values but skips rebuilding the device popup. Called by
+/// handle_device_changed to refresh the other controls after a device switch, avoiding a
+/// popup-rebuild cycle.
+fn load_settings_values_no_device_popup() {
+    load_settings_values_impl(false);
+}
+
+fn load_settings_values_impl(rebuild_device: bool) {
     let cfg = CONFIG.read().unwrap().clone();
     let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
     unsafe {
@@ -810,13 +847,20 @@ fn load_settings_values() {
             .unwrap_or(0);
         let _: () = msg_send![ui.smooth_preset, selectItemAtIndex: sp_idx];
 
-        // 更新设备指示器按钮标题。
-        // Update the device-indicator button title.
-        update_device_indicator_title(ui);
+        // 重建设备下拉框(每次打开设置时刷新,反映热插拔)。
+        // 由 handle_device_changed 调用时跳过,避免循环。
+        // Rebuild the device popup (refreshed on each settings open to reflect hot-plug).
+        // Skipped when called from handle_device_changed to avoid a cycle.
+        if rebuild_device {
+            rebuild_device_popup(ui);
+        }
 
         // 每次打开设置时,同步 OK 按钮标题(可能因配置变化而需要重启)。
         // Sync OK button title on each settings open (config changes may require restart).
         update_ok_button_title(ui);
+        // 根据 enable_mouse 状态冻结/解冻下方控件。
+        // Freeze/unfreeze the controls below based on the enable_mouse state.
+        update_mouse_controls_enabled(ui);
     }
 }
 
@@ -1528,7 +1572,7 @@ fn create_settings_window() {
         // ===== 鼠标页内容 mouse page content =====
         let mut y = content_h - 12.0;
 
-        // --- 设备选择器(指示器按钮,点击打开 sheet) / Device picker (indicator button) ---
+        // --- 设备选择器(内嵌下拉框,切换即时刷新其余控件) / Device picker (inline popup) ---
         y -= 14.0 + 24.0;
         add_header(
             mouse_view,
@@ -1538,29 +1582,25 @@ fn create_settings_window() {
             content_w - 24.0,
         );
         y -= 8.0 + row_h;
-        // 指示器按钮:显示当前选中范围("所有鼠标" / 设备名),点击打开选择器 sheet。
-        // Indicator button: shows the current scope ("All Mice" / device name); opens the picker sheet.
-        let indicator: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let indicator: *mut AnyObject = msg_send![indicator, initWithFrame: NSRect::new(NSPoint::new(ctrl_x, y), NSSize::new(ctrl_w, row_h))];
-        let _: () = msg_send![indicator, setBezelStyle: 1isize]; // NSRoundedBezelStyle
-        let _: () = msg_send![indicator, setTarget: target];
-        let _: () = msg_send![indicator, setAction: sel!(handleDevicePicker:)];
-        let _: () = msg_send![mouse_view, addSubview: indicator];
-        ui.device_indicator = indicator;
-        release_obj(indicator);
-        // 在标签列放一个说明 label。
-        // A descriptive label on the label column.
-        let dev_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let dev_label: *mut AnyObject = msg_send![dev_label, initWithFrame: NSRect::new(NSPoint::new(label_x, y), NSSize::new(label_w, row_h))];
-        let dl_ns = make_nsstring(&t("settings.header_mouse_device"));
-        let _: () = msg_send![dev_label, setStringValue: dl_ns];
-        CFRelease(dl_ns as *const c_void);
-        let _: () = msg_send![dev_label, setBezeled: false];
-        let _: () = msg_send![dev_label, setDrawsBackground: false];
-        let _: () = msg_send![dev_label, setEditable: false];
-        let _: () = msg_send![dev_label, setAlignment: 1isize]; // right
-        let _: () = msg_send![mouse_view, addSubview: dev_label];
-        release_obj(dev_label);
+        // 下拉框:items 在 load_settings_values 里动态重建(设备列表可变)。
+        // 首次创建放一个占位项,真正的内容在 load_settings_values -> rebuild_device_popup 填入。
+        // Popup: items are rebuilt dynamically in load_settings_values (device list is mutable).
+        // A placeholder is inserted here; the real items are filled by rebuild_device_popup.
+        let dev_popup = make_popup(ctrl_x, y, ctrl_w, row_h, &[""], 0);
+        // 绑定 target/action:选择变化时即时刷新其余控件为该设备的有效值。
+        // Bind target/action: on selection change, immediately refresh the other controls with
+        // the selected device's effective values.
+        let _: () = msg_send![dev_popup, setTarget: target];
+        let _: () = msg_send![dev_popup, setAction: sel!(handleDeviceChanged:)];
+        ui.device_indicator = add_row(
+            mouse_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.header_mouse_device"),
+            dev_popup,
+        );
 
         // --- 启用鼠标控制(总开关) / Enable mouse control ---
         y -= 8.0 + row_h;
