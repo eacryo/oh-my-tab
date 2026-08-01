@@ -17,6 +17,7 @@
 - TOML 配置,校验后可从菜单**热重载**。
 - 手写、零依赖的国际化(英文、简体中文、繁体中文),自动检测系统语言并实时跟随。
 - 每次启动一个日志文件,自动保留 30 天(见[日志](#日志))。
+- **鼠标控制**(可选,默认关闭):反向滚动、滚动模式(默认 / 按行(每 tick 行数)/ 平滑(13 种物理预设))、禁用指针加速 -- 且**按鼠标设备分别配置**(见[配置](#配置))。
 
 ## 截图
 
@@ -27,6 +28,8 @@
 ## 已知问题
 如果应用启动时已经有窗口存在，此时窗口排序与原生的Command加Tab排序不同，
 这是由于没有初始的窗口排序数据导致的，oh-my-tab启动后会持续监听窗口的变化
+
+**开发模式下图标可能不正确**：用 `cargo run` 跑裸二进制时,浮层偶尔会把 oh-my-tab 自己的卡片显示成首字母占位块而不是应用图标,而且可能一直持续到手动清空图标缓存。图标缓存按 bundle id 索引,以可执行文件的 **mtime** 作为失效指纹;开发模式下每次构建都会重链接二进制、改变 mtime,导致运行中实例的缓存条目失效。打包后的 `.app` 不受影响(安装后二进制 mtime 稳定)。开发中遇到此问题,可从菜单 *Clear Icon Cache* 清空,或删除 `~/Library/Caches/oh-my-tab-icons/`。
 
 ## 环境要求
 
@@ -156,6 +159,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 | `config.rs` | TOML 配置,校验,逐字段容错,可热重载。 |
 | `i18n.rs` | 手写 TOML 国际化,编译期内嵌,自动检测语言。 |
 | `settings.rs` | 设置窗口(控件、校验告警、配置热应用)。 |
+| `mouse/` | 鼠标控制:第二个 HID 层 `CGEventTap` 拦截滚轮/按键事件,滚动模式(默认/按行/平滑)、平滑滚动物理引擎、指针加速控制、按设备匹配(`device.rs` / `resolve.rs`)。 |
 | `menu.rs` | 状态栏菜单及动作回调。 |
 | `logger.rs` | 异步日志(有界通道、后台 writer 线程)。 |
 | `ffi.rs` / `theme.rs` | FFI 基础工具(CF/CG/NSString helper、`Send`/`Sync` 包装)与主题/布局访问器。 |
@@ -228,7 +232,36 @@ file_path = ""           # 空 = 默认带时间戳路径;见下方「日志」
 
 [startup]
 launch_at_login = false  # 开机自启(需以 .app 方式运行;macOS 13+)
+
+[mouse]
+enabled = true           # 鼠标控制总开关(控制 event tap)
+
+# 第一个不含 device_* 字段的档是默认层(所有鼠标)。
+# 后续带 device_* 的档按 VID/PID 匹配具体设备,逐字段覆盖默认层。
+# 生效配置 = 默认层合并匹配到的设备层。
+[[mouse.profiles]]
+reverse_scroll = false   # 相对系统方向反转滚动
+scroll_mode = "default"  # "default" | "line"(每 tick 固定行数)| "smooth"(物理引擎 + 惯性)
+line_count = 3           # "line" 模式每 tick 行数(1..=10)
+smooth_preset = "easeInOut"  # 13 种平滑预设(仅 "smooth" 模式使用)
+
+[mouse.profiles.pointer]
+disable_acceleration = false  # 禁用系统指针加速(线性移动)
+
+# 按设备覆盖示例(Logitech MCHOSE G3 V2):
+[[mouse.profiles]]
+device_vendor_id = 10007
+device_product_id = 12976
+reverse_scroll = true
+scroll_mode = "line"
+line_count = 3
+smooth_preset = "easeInOut"
+
+[mouse.profiles.pointer]
+disable_acceleration = true
 ```
+
+鼠标设置也可以在设置窗口中调整(用**设备下拉框**选中某款已连接的鼠标,编辑它那一层)。开启 `mouse.enabled` 需要重启应用(OK 按钮会提示)。
 
 ## 日志
 

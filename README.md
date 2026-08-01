@@ -17,6 +17,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 - TOML configuration, validated and **hot-reloadable** from the menu.
 - Handcrafted, zero-dependency i18n (English, Simplified Chinese, Traditional Chinese) with automatic locale detection and live system-language follow.
 - Per-launch log files with automatic 30-day retention (see [Logging](#logging)).
+- **Mouse control** (optional, off by default): scroll reversal, scroll modes (Default / Line with a per-tick line count / Smooth with 13 physics presets), and disabling pointer acceleration — all configurable **per mouse device** (see [Configuration](#configuration)).
 
 ## Screenshots
 
@@ -27,6 +28,8 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 ## Known Issues
 
 If windows are already open when the app starts, their ordering differs from the native Cmd+Tab order. This is because there is no initial window-ordering data; oh-my-tab builds it by continuously observing window changes after launch.
+
+**Dev-mode icon staleness**: when running the raw binary via `cargo run`, the overlay may occasionally show oh-my-tab's own card with the letter placeholder instead of the app icon, and it can persist until the icon cache is cleared. The icon cache is keyed by bundle id with the executable's **mtime** as a staleness fingerprint; in dev mode the binary is relinked on every build, changing its mtime mid-session, which invalidates the cached entry for the running instance. Packaged `.app` builds are unaffected (the binary mtime is stable after install). If you hit this in dev, use *Clear Icon Cache* from the menu or delete `~/Library/Caches/oh-my-tab-icons/`.
 
 ## Requirements
 
@@ -156,6 +159,7 @@ Shared state lives in global `static`s guarded by `Mutex` / `RwLock`: `TAB_STATE
 | `config.rs` | TOML config, validated, per-field resilient, hot-reloadable. |
 | `i18n.rs` | Handcrafted TOML i18n, embedded at compile time, auto locale detection. |
 | `settings.rs` | Settings window (controls, validation alerts, hot config application). |
+| `mouse/` | Mouse control: a second HID-level `CGEventTap` for scroll/button events, scroll modes (default/line/smooth), smooth-scroll physics engine, pointer acceleration control, and per-device matching (`device.rs` / `resolve.rs`). |
 | `menu.rs` | Status-bar menu and action callbacks. |
 | `logger.rs` | Async logging (bounded channel, background writer). |
 | `ffi.rs` / `theme.rs` | FFI primitives (CF/CG/NSString helpers, `Send`/`Sync` wrappers) and theme/layout accessors. |
@@ -228,7 +232,36 @@ file_path = ""           # empty = default timestamped path; see Logging below
 
 [startup]
 launch_at_login = false  # launch at login (requires running as a .app bundle; macOS 13+)
+
+[mouse]
+enabled = true           # master switch for the mouse-control event tap
+
+# The first profile without device_* fields is the default ("all mice") layer.
+# Additional profiles match a specific device by VID/PID and override the default
+# per-field. Effective config = default layer merged with the matching device layer.
+[[mouse.profiles]]
+reverse_scroll = false   # flip scroll direction relative to the system
+scroll_mode = "default"  # "default" | "line" (fixed lines per tick) | "smooth" (physics + inertia)
+line_count = 3           # lines per tick in "line" mode (1..=10)
+smooth_preset = "easeInOut"  # 13 smooth presets (only used in "smooth" mode)
+
+[mouse.profiles.pointer]
+disable_acceleration = false  # disable system pointer acceleration (linear tracking)
+
+# Example per-device override layer (Logitech MCHOSE G3 V2):
+[[mouse.profiles]]
+device_vendor_id = 10007
+device_product_id = 12976
+reverse_scroll = true
+scroll_mode = "line"
+line_count = 3
+smooth_preset = "easeInOut"
+
+[mouse.profiles.pointer]
+disable_acceleration = true
 ```
+
+Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). Enabling `mouse.enabled` requires an app restart (the OK button reflects this).
 
 ## Logging
 
