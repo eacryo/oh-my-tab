@@ -118,26 +118,67 @@ pub struct PointerSection {
     pub disable_acceleration: bool,
 }
 
+/// 设备匹配器(None = 通配,即"所有鼠标")。配置按 VID+PID 匹配设备。
+/// Device matcher (None = wildcard, i.e. "All Mice"). Config matches devices by VID+PID.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DeviceMatcher {
+    // 扁平序列化为 device_vendor_id / device_product_id(顶层标量,便于手写 TOML)。
+    // Flattened as device_vendor_id / device_product_id (top-level scalars for hand-written TOML).
+    #[serde(rename = "device_vendor_id", skip_serializing_if = "Option::is_none")]
+    pub vendor_id: Option<u32>,
+    #[serde(rename = "device_product_id", skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<u32>,
+}
+
+/// 指针覆盖(部分字段,None = 继承下层档)。
+/// Pointer override (partial; None = inherit from the lower layer).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PartialPointerSection {
+    pub disable_acceleration: Option<bool>,
+}
+
+/// 单个配置档。device = None 即"所有鼠标"档(默认层)。
+/// A single profile. device = None is the "All Mice" profile (the default layer).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MouseProfile {
+    /// 设备匹配器;None = 匹配所有鼠标(作为默认层)。
+    /// Device matcher; None = matches all mice (serves as the default layer).
+    #[serde(flatten)]
+    pub device: DeviceMatcher,
+    pub reverse_scroll: Option<bool>,
+    pub scroll_mode: Option<String>,
+    pub line_count: Option<u32>,
+    pub smooth_preset: Option<String>,
+    pub pointer: Option<PartialPointerSection>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MouseSection {
-    // 启用鼠标控制功能,包括滚轮反转等。默认 false(不启用,不创建 event tap)。
-    // Enable mouse control features, including scroll reversal. Default false.
+    // 启用鼠标控制功能(总开关)。默认 false(不启用,不创建 event tap)。
+    // Enable mouse control features (master switch). Default false.
     pub enabled: bool,
-    // 反转鼠标滚轮方向。默认 false = 跟随系统行为,true = 额外反转。
-    // Reverse mouse scroll wheel direction. Default false = follow system, true = reverse.
+    // 配置档列表:第一个无 device 字段的档是"所有鼠标"默认层;其后可加 per-device 档,
+    // 后者覆盖前者。合并语义:遍历所有匹配档,后者优先。
+    // Profile list: the first profile without a device field is the "All Mice" default layer;
+    // subsequent per-device profiles override it. Merge semantics: all matching profiles are
+    // traversed, later ones win.
+    pub profiles: Vec<MouseProfile>,
+
+    // ---- 旧字段(仅用于迁移读取,序列化时跳过)----
+    // ---- Legacy fields (read for migration only, skipped on serialize) ----
+    #[serde(skip_serializing)]
     pub reverse_scroll: bool,
-    // 滚轮滚动模式:"default" | "line" | "smooth"。默认 "default"。
-    // Scroll mode. Default "default".
+    #[serde(skip_serializing)]
     pub scroll_mode: String,
-    // 按行模式下的行数(1..=10)。默认 3。
-    // Line count in line mode (1..=10). Default 3.
+    #[serde(skip_serializing)]
     pub line_count: u32,
-    // 平滑滚动预设(13 种)。默认 "easeInOut"。
-    // Smooth scrolling preset. Default "easeInOut".
+    #[serde(skip_serializing)]
     pub smooth_preset: String,
-    // 指针设置(禁用系统加速等)。
-    // Pointer settings (e.g. disabling system acceleration).
+    #[serde(skip_serializing)]
     pub pointer: PointerSection,
 }
 
@@ -145,12 +186,102 @@ impl Default for MouseSection {
     fn default() -> Self {
         Self {
             enabled: false,
+            // 默认含一个"所有鼠标"档,与旧默认值一致(reverse_scroll=false, default 模式, 3 行, easeInOut)。
+            // Default includes an "All Mice" profile matching the old defaults.
+            profiles: vec![MouseProfile {
+                reverse_scroll: Some(false),
+                scroll_mode: Some("default".into()),
+                line_count: Some(3),
+                smooth_preset: Some("easeInOut".into()),
+                pointer: Some(PartialPointerSection {
+                    disable_acceleration: Some(false),
+                }),
+                ..Default::default()
+            }],
             reverse_scroll: false,
             scroll_mode: "default".into(),
             line_count: 3,
             smooth_preset: "easeInOut".into(),
             pointer: PointerSection::default(),
         }
+    }
+}
+
+impl MouseSection {
+    /// 若旧字段被填充(profiles 为空或缺少默认档),把旧字段迁移成一个"所有鼠标"档。
+    /// 迁移是幂等的:已迁移的配置(无旧字段、有默认档)不会重复迁移。
+    ///
+    /// Migrate legacy flat fields into an "All Mice" profile. Idempotent: an already-migrated
+    /// config (no legacy fields, has a default profile) is left untouched.
+    pub(crate) fn migrate_legacy(&mut self) {
+        // 判断旧字段是否"有内容"(与代码默认不同,或 scroll_mode 非空)。
+        // Detect whether legacy fields carry meaningful content (differ from code defaults, or
+        // scroll_mode is non-empty).
+        let defaults = MouseSection::default();
+        let has_legacy = self.reverse_scroll != defaults.reverse_scroll
+            || self.scroll_mode != defaults.scroll_mode
+            || self.line_count != defaults.line_count
+            || self.smooth_preset != defaults.smooth_preset
+            || self.pointer.disable_acceleration != defaults.pointer.disable_acceleration
+            || !self.scroll_mode.is_empty()
+            || !self.smooth_preset.is_empty();
+
+        if !has_legacy {
+            // 无旧字段(全新配置或已迁移):确保至少有一个默认"所有鼠标"档。
+            // No legacy content (fresh or already migrated): ensure a default "All Mice" profile exists.
+            let has_default = self
+                .profiles
+                .iter()
+                .any(|p| p.device.vendor_id.is_none() && p.device.product_id.is_none());
+            if !has_default {
+                self.profiles.insert(0, defaults.profiles[0].clone());
+            }
+            return;
+        }
+
+        // 有旧字段:把它们并入(或新建)一个"所有鼠标"档。
+        // Legacy fields present: fold them into (or create) an "All Mice" profile.
+        let legacy_profile = MouseProfile {
+            reverse_scroll: Some(self.reverse_scroll),
+            scroll_mode: Some(if self.scroll_mode.is_empty() {
+                "default".into()
+            } else {
+                self.scroll_mode.clone()
+            }),
+            line_count: Some(if self.line_count == 0 { 3 } else { self.line_count }),
+            smooth_preset: Some(if self.smooth_preset.is_empty() {
+                "easeInOut".into()
+            } else {
+                self.smooth_preset.clone()
+            }),
+            pointer: Some(PartialPointerSection {
+                disable_acceleration: Some(self.pointer.disable_acceleration),
+            }),
+            ..Default::default()
+        };
+
+        // 若已有"所有鼠标"档,用旧字段值覆盖其字段(旧字段是用户真实意图)。
+        // If an "All Mice" profile already exists, overwrite its fields with the legacy values
+        // (the legacy fields are the user's true intent).
+        if let Some(idx) = self
+            .profiles
+            .iter()
+            .position(|p| p.device.vendor_id.is_none() && p.device.product_id.is_none())
+        {
+            self.profiles[idx] = legacy_profile;
+        } else {
+            // 无"所有鼠标"档:在队首插入(确保默认档在前,per-device 档在后)。
+            // No "All Mice" profile: insert at the front (default first, per-device after).
+            self.profiles.insert(0, legacy_profile);
+        }
+
+        // 清掉旧字段(防止下次再迁移;序列化本就跳过它们)。
+        // Clear legacy fields (prevents re-migration; serialization skips them anyway).
+        self.reverse_scroll = false;
+        self.scroll_mode = String::new();
+        self.line_count = 0;
+        self.smooth_preset = String::new();
+        self.pointer = PointerSection::default();
     }
 }
 
@@ -455,42 +586,56 @@ impl Config {
             ));
         }
 
-        // --- mouse.scroll_mode ---
-        if !["default", "line", "smooth"].contains(&self.mouse.scroll_mode.as_str()) {
-            errs.push(tf(
-                "errors.mouse_scroll_mode_invalid",
-                &[("value", &self.mouse.scroll_mode)],
-            ));
-        }
-        // --- mouse.line_count ---
-        if self.mouse.line_count < 1 || self.mouse.line_count > 10 {
-            errs.push(tf(
-                "errors.mouse_line_count_invalid",
-                &[("value", &self.mouse.line_count.to_string())],
-            ));
-        }
-        // --- mouse.smooth_preset ---
-        if ![
-            "custom",
-            "linear",
-            "easeIn",
-            "easeOut",
-            "easeInOut",
-            "quadratic",
-            "cubic",
-            "quartic",
-            "easeOutCubic",
-            "easeInOutCubic",
-            "easeOutQuartic",
-            "easeInOutQuartic",
-            "smooth",
-        ]
-        .contains(&self.mouse.smooth_preset.as_str())
-        {
-            errs.push(tf(
-                "errors.mouse_smooth_preset_invalid",
-                &[("value", &self.mouse.smooth_preset)],
-            ));
+        // --- mouse profiles ---
+        for (i, p) in self.mouse.profiles.iter().enumerate() {
+            let prefix = format!("mouse.profiles[{i}]");
+            if let Some(ref mode) = p.scroll_mode {
+                if !["default", "line", "smooth"].contains(&mode.as_str()) {
+                    errs.push(tf(
+                        "errors.mouse_scroll_mode_invalid",
+                        &[("value", mode)],
+                    ));
+                    // 用 prefix 区分哪个档出错,便于定位。
+                    // Use the prefix to indicate which profile failed.
+                    if let Some(last) = errs.last_mut() {
+                        *last = format!("{prefix}.scroll_mode: {last}");
+                    }
+                }
+            }
+            if let Some(lc) = p.line_count {
+                if !(1..=10).contains(&lc) {
+                    let msg = tf(
+                        "errors.mouse_line_count_invalid",
+                        &[("value", &lc.to_string())],
+                    );
+                    errs.push(format!("{prefix}.line_count: {msg}"));
+                }
+            }
+            if let Some(ref sp) = p.smooth_preset {
+                if ![
+                    "custom",
+                    "linear",
+                    "easeIn",
+                    "easeOut",
+                    "easeInOut",
+                    "quadratic",
+                    "cubic",
+                    "quartic",
+                    "easeOutCubic",
+                    "easeInOutCubic",
+                    "easeOutQuartic",
+                    "easeInOutQuartic",
+                    "smooth",
+                ]
+                .contains(&sp.as_str())
+                {
+                    let msg = tf(
+                        "errors.mouse_smooth_preset_invalid",
+                        &[("value", sp)],
+                    );
+                    errs.push(format!("{prefix}.smooth_preset: {msg}"));
+                }
+            }
         }
 
         errs
@@ -626,24 +771,59 @@ impl Config {
         // startup (bool field needs no validation, always valid)
         self.startup = other.startup;
 
-        // mouse (bool 字段无需校验,恒有效)
-        // mouse (bool field needs no validation, always valid)
-        if !has_error("mouse.") {
-            self.mouse = other.mouse;
-        } else {
-            self.mouse.enabled = other.mouse.enabled;
-            self.mouse.reverse_scroll = other.mouse.reverse_scroll;
-            self.mouse.pointer = other.mouse.pointer;
-            if !errs.iter().any(|e| e.starts_with("mouse.scroll_mode")) {
-                self.mouse.scroll_mode = other.mouse.scroll_mode;
+        // mouse:profiles 逐档逐字段合并(沿用 per-field resilient 模式)。
+        // enabled 与 bool 字段恒有效;profiles 的每个档按字段校验结果保留或丢弃。
+        // mouse: per-profile, per-field merge (continuing the per-field resilient pattern).
+        // enabled and bool fields are always valid; each profile's fields are kept or dropped
+        // based on per-field validation results.
+        self.mouse.enabled = other.mouse.enabled;
+        // 先迁移 other 的旧字段(若有),再合并。
+        // Migrate other's legacy fields (if any) before merging.
+        let mut other_mouse = other.mouse;
+        other_mouse.migrate_legacy();
+        self.mouse.profiles = Vec::new();
+        for (i, p) in other_mouse.profiles.iter().enumerate() {
+            let prefix = format!("mouse.profiles[{i}]");
+            let mut merged_p = MouseProfile {
+                device: p.device.clone(),
+                ..Default::default()
+            };
+            // bool 字段恒有效。
+            // Bool fields are always valid.
+            merged_p.reverse_scroll = p.reverse_scroll;
+            if p.scroll_mode.is_some()
+                && !errs
+                    .iter()
+                    .any(|e| e.starts_with(&format!("{prefix}.scroll_mode")))
+            {
+                merged_p.scroll_mode = p.scroll_mode.clone();
             }
-            if !errs.iter().any(|e| e.starts_with("mouse.line_count")) {
-                self.mouse.line_count = other.mouse.line_count;
+            if p.line_count.is_some()
+                && !errs
+                    .iter()
+                    .any(|e| e.starts_with(&format!("{prefix}.line_count")))
+            {
+                merged_p.line_count = p.line_count;
             }
-            if !errs.iter().any(|e| e.starts_with("mouse.smooth_preset")) {
-                self.mouse.smooth_preset = other.mouse.smooth_preset;
+            if p.smooth_preset.is_some()
+                && !errs
+                    .iter()
+                    .any(|e| e.starts_with(&format!("{prefix}.smooth_preset")))
+            {
+                merged_p.smooth_preset = p.smooth_preset.clone();
             }
+            // pointer.disable_acceleration 是 bool,恒有效。
+            // pointer.disable_acceleration is a bool, always valid.
+            merged_p.pointer = p.pointer.clone();
+            self.mouse.profiles.push(merged_p);
         }
+        // 迁移完后清掉自身的旧字段(防止序列化出冗余)。
+        // After merge, clear our own legacy fields (avoid serializing cruft).
+        self.mouse.reverse_scroll = false;
+        self.mouse.scroll_mode = String::new();
+        self.mouse.line_count = 0;
+        self.mouse.smooth_preset = String::new();
+        self.mouse.pointer = PointerSection::default();
     }
 
     fn merge_colors(ours: &mut ThemeColors, theirs: &ThemeColors, theme: &str, errs: &[String]) {
@@ -719,14 +899,29 @@ impl Config {
         let path = config_path();
         match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let loaded: Config = toml::from_str(&content).unwrap_or_default();
+                let mut loaded: Config = toml::from_str(&content).unwrap_or_default();
+                // 迁移旧 [mouse] 扁平字段为 profiles(幂等);若发生了迁移,稍后写回磁盘。
+                // Migrate legacy flat [mouse] fields into profiles (idempotent); persist later if changed.
+                let needs_persist = !loaded.mouse.profiles.iter().any(|p| {
+                    p.device.vendor_id.is_none() && p.device.product_id.is_none()
+                }) || loaded.mouse.reverse_scroll
+                    || !loaded.mouse.scroll_mode.is_empty()
+                    || loaded.mouse.line_count != 0
+                    || !loaded.mouse.smooth_preset.is_empty();
+                loaded.mouse.migrate_legacy();
                 let errs = loaded.validate();
                 if !errs.is_empty() {
                     // Start from defaults, merge only valid fields
                     let mut merged = Config::default();
                     merged.merge_valid(loaded, &errs);
+                    let _ = merged.save();
                     (merged, errs)
                 } else {
+                    // 迁移后写回磁盘(一次性,之后 migrate_legacy 不再改动)。
+                    // Persist the migrated config (one-time; migrate_legacy is a no-op afterwards).
+                    if needs_persist {
+                        let _ = loaded.save();
+                    }
                     (loaded, Vec::new())
                 }
             }
@@ -745,13 +940,24 @@ impl Config {
         let path = config_path();
         match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let loaded: Config = toml::from_str(&content).unwrap_or_default();
+                let mut loaded: Config = toml::from_str(&content).unwrap_or_default();
+                let needs_persist = !loaded.mouse.profiles.iter().any(|p| {
+                    p.device.vendor_id.is_none() && p.device.product_id.is_none()
+                }) || loaded.mouse.reverse_scroll
+                    || !loaded.mouse.scroll_mode.is_empty()
+                    || loaded.mouse.line_count != 0
+                    || !loaded.mouse.smooth_preset.is_empty();
+                loaded.mouse.migrate_legacy();
                 let errs = loaded.validate();
                 if !errs.is_empty() {
                     let mut merged = Config::default();
                     merged.merge_valid(loaded, &errs);
+                    let _ = merged.save();
                     (merged, errs)
                 } else {
+                    if needs_persist {
+                        let _ = loaded.save();
+                    }
                     (loaded, Vec::new())
                 }
             }
@@ -798,5 +1004,8 @@ pub fn reload_config() -> Vec<String> {
         _ => crate::logger::LogLevel::Info,
     };
     crate::logger::reconfigure(lvl);
+    // 配置变更:失效 per-device 解析缓存(下次 resolve 重新合并 profiles)。
+    // Config changed: invalidate the per-device resolve cache (next resolve re-merges profiles).
+    crate::mouse::resolve::invalidate_cache();
     errs
 }

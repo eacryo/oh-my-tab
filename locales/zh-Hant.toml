@@ -51,6 +51,12 @@ row_line_count = "每 tick 行數"
 row_smooth_preset = "平滑預設"
 header_mouse_pointer = "指標"
 row_disable_pointer_accel = "停用指標加速（線性移動）"
+header_mouse_device = "裝置"
+mouse_device_all_mice = "所有滑鼠"
+mouse_device_select = "選擇裝置..."
+mouse_device_auto_switch = "自動切換到活躍裝置"
+mouse_device_active = "活躍"
+mouse_device_none_connected = "無滑鼠連接"
 experimental_note = "實驗性選項，不保證可用性，後續版本可能移除。"
 btn_cancel = "取消"
 btn_ok = "確認"
@@ -92,6 +98,6 @@ keyboard_modifier_invalid = 'keyboard.modifier: "{value}" 不是 option、comman
 i18n_locale_invalid = 'i18n.locale: "{value}" 不是 auto、en、zh-Hans、zh-Hant 之一'
 logging_level_invalid = "logging.level: '{value}' 無效（期望: info, warn, error）"
 config_read_failed = "無法讀取設定: {error}"
-mouse_scroll_mode_invalid = 'mouse.scroll_mode: "{value}" 不是 default、line、smooth 之一'
-mouse_line_count_invalid = "mouse.line_count: {value} 必須 1..=10"
-mouse_smooth_preset_invalid = 'mouse.smooth_preset: "{value}" 不是有效預設名稱'
+mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line、smooth 之一'
+mouse_line_count_invalid = "line_count: {value} 必須 1..=10"
+mouse_smooth_preset_invalid = 'smooth_preset: "{value}" 不是有效預設名稱'

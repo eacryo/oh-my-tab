@@ -79,12 +79,24 @@ struct SettingsUi {
     line_count: *mut AnyObject,       // NSTextField: line count input
     smooth_preset: *mut AnyObject,    // NSPopUpButton: smooth preset
     disable_pointer_accel: *mut AnyObject, // NSButton (checkbox): 禁用指针加速 / disable pointer acceleration
+    device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
 }
 unsafe impl Send for SettingsUi {}
 unsafe impl Sync for SettingsUi {}
 static SETTINGS_UI: Mutex<Option<SettingsUi>> = Mutex::new(None);
+
+/// 当前在鼠标页选中的设备范围。None = "所有鼠标";Some((vid,pid)) = 某款具体鼠标。
+/// The currently-selected device scope on the Mouse page. None = "All Mice";
+/// Some((vid,pid)) = a specific mouse.
+static SELECTED_DEVICE: Mutex<Option<Option<crate::mouse::device::DeviceKey>>> = Mutex::new(None);
+
+/// "自动切换到活跃设备"开关(内存态,不入配置)。
+/// "Auto switch to active device" toggle (in-memory, not persisted to config).
+#[allow(dead_code)]
+static AUTO_SWITCH_DEVICE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 // ========== 控件构造 helper / control-builder helpers ==========
 
@@ -93,6 +105,54 @@ fn parse_f64(s: &str) -> Result<f64, ()> {
 }
 fn parse_usize(s: &str) -> Result<usize, ()> {
     s.trim().parse::<usize>().map_err(|_| ())
+}
+
+// ========== 鼠标 profile 读写 helper / mouse profile read/write helpers ==========
+
+use crate::config::{DeviceMatcher, MouseProfile, PartialPointerSection};
+
+/// 当前在鼠标页选中的设备范围(读 SELECTED_DEVICE;未初始化时默认 None="所有鼠标")。
+/// The currently-selected device scope on the Mouse page (reads SELECTED_DEVICE; defaults to
+/// None = "All Mice" when uninitialized).
+fn current_selected_device() -> Option<crate::mouse::device::DeviceKey> {
+    // SELECTED_DEVICE:外层 Option 表示"是否初始化过";内层 None = "所有鼠标"。
+    // SELECTED_DEVICE: outer Option = "initialized?"; inner None = "All Mice".
+    SELECTED_DEVICE
+        .lock()
+        .unwrap()
+        .unwrap_or(None) // 未初始化 -> None("所有鼠标") / uninitialized -> None (All Mice)
+}
+
+/// 在 CONFIG 中查找匹配设备(VID,PID)的 profile 索引。None = 查找"所有鼠标"档。
+/// Find the index of the profile matching (VID,PID) in CONFIG. None = find "All Mice".
+fn find_profile_index(
+    cfg: &Config,
+    device: Option<crate::mouse::device::DeviceKey>,
+) -> Option<usize> {
+    cfg.mouse.profiles.iter().position(|p| {
+        let vid_ok = p
+            .device
+            .vendor_id
+            .map(|v| Some(v) == device.map(|(vid, _)| vid))
+            .unwrap_or(device.is_none());
+        let pid_ok = p
+            .device
+            .product_id
+            .map(|p| Some(p) == device.map(|(_, pid)| pid))
+            .unwrap_or(device.is_none());
+        vid_ok && pid_ok
+    })
+}
+
+/// 读取当前选中设备的有效值(合并"所有鼠标"档 + 该设备档后的结果)。
+/// 用于在 UI 上显示当前实际生效的配置(方案 A 的简化:直接显示有效值)。
+///
+/// Read the effective value for the currently-selected device (after merging the "All Mice"
+/// profile + the device profile). Used to show the actually-effective config in the UI
+/// (Option A simplification: show effective values directly).
+fn resolve_selected() -> crate::mouse::resolve::ResolvedMouse {
+    let dev = current_selected_device();
+    crate::mouse::resolve::resolve(dev)
 }
 
 /// 设置控件标题并释放临时 NSString。
@@ -351,6 +411,96 @@ pub(crate) extern "C" fn on_settings_cancel(_self: *mut c_void, _cmd: Sel, _send
     hide_settings();
 }
 
+/// 更新设备指示器按钮的标题,反映当前选中范围。
+/// Update the device-indicator button's title to reflect the current selection.
+unsafe fn update_device_indicator_title(ui: &SettingsUi) {
+    let dev = current_selected_device();
+    let title = match dev {
+        None => t("settings.mouse_device_all_mice"),
+        Some((vid, pid)) => {
+            // 在已连接设备里找匹配的名称;找不到就用 VID:PID。
+            // Find a matching name among connected devices; fall back to VID:PID.
+            let connected = crate::mouse::device::connected_devices();
+            connected
+                .iter()
+                .find(|d| d.vendor_id == vid && d.product_id == pid)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| format!("{:#x}:{:#x}", vid, pid))
+        }
+    };
+    set_control_title(ui.device_indicator, &title);
+}
+
+/// 设备选择器:构建一个含"所有鼠标"+ 各已连接设备的弹窗,供用户选择当前编辑范围。
+/// Device picker: builds an alert-style sheet with "All Mice" + each connected device, letting
+/// the user choose which scope to edit.
+pub(crate) extern "C" fn handle_device_picker(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    unsafe {
+        let connected = crate::mouse::device::connected_devices();
+        let cur = current_selected_device();
+
+        // 用 NSAlert 的下拉(supplementary view)太复杂;改用按钮式选择:为每个选项弹一个
+        // 简单的 confirm_alert 风格列表不现实。这里用 NSPopUpButton 在一个小窗口里选择。
+        // 简化:用单次 NSAlert + accessoryView(NSPopUpButton) 实现选择。
+        //
+        // Using an NSAlert with an NSPopUpButton accessory view for the selection.
+        let alert: *mut AnyObject = msg_send![class!(NSAlert), new];
+        let title_ns = make_nsstring(&t("settings.mouse_device_select"));
+        let _: () = msg_send![alert, setMessageText: title_ns];
+        CFRelease(title_ns as *const c_void);
+
+        // 构建下拉项:"所有鼠标" + 各设备名。
+        // Build popup items: "All Mice" + each device name.
+        let mut items: Vec<String> = vec![t("settings.mouse_device_all_mice")];
+        let mut keys: Vec<Option<crate::mouse::device::DeviceKey>> = vec![None];
+        for d in &connected {
+            items.push(format!("{} ({:#x}:{:#x})", d.name, d.vendor_id, d.product_id));
+            keys.push(Some((d.vendor_id, d.product_id)));
+        }
+        if connected.is_empty() {
+            items.push(t("settings.mouse_device_none_connected"));
+            keys.push(None); // 占位,不会被选中(只有一项) / placeholder, won't be selected
+        }
+
+        let popup: *mut AnyObject = msg_send![class!(NSPopUpButton), alloc];
+        let popup: *mut AnyObject = msg_send![popup, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(300.0, 26.0)), pullsDown: false];
+        for s in &items {
+            let ns = make_nsstring(s);
+            let _: () = msg_send![popup, addItemWithTitle: ns];
+            CFRelease(ns as *const c_void);
+        }
+        // 选中当前设备对应的项。
+        // Select the item matching the current device.
+        let sel_idx = keys.iter().position(|k| *k == cur).unwrap_or(0);
+        let _: () = msg_send![popup, selectItemAtIndex: sel_idx as isize];
+        let _: () = msg_send![alert, setAccessoryView: popup];
+        release_obj(popup);
+
+        let ok_ns = make_nsstring(&t("alert.btn_ok"));
+        let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: ok_ns];
+        CFRelease(ok_ns as *const c_void);
+        let cancel_ns = make_nsstring(&t("alert.btn_cancel"));
+        let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: cancel_ns];
+        CFRelease(cancel_ns as *const c_void);
+
+        let resp: isize = msg_send![alert, runModal];
+        if resp == 1000 {
+            // NSAlertFirstButtonReturn = 确认 / confirm
+            let idx: isize = msg_send![popup, indexOfSelectedItem];
+            let new_dev = keys.get(idx as usize).copied().unwrap_or(None);
+            *SELECTED_DEVICE.lock().unwrap() = Some(new_dev);
+            // 选中后刷新鼠标页控件为新范围的有效值。
+            // After selection, refresh the mouse-page controls with the new scope's effective values.
+            load_settings_values();
+        }
+        release_obj(alert);
+    }
+}
+
 /// 侧边栏点击回调:读 sender 的 tag,切换到对应页。
 /// Sidebar click callback: read the sender's tag and switch to that page.
 pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
@@ -547,6 +697,9 @@ pub(crate) extern "C" fn handle_restore_defaults(
     update_status_label();
     // 设置窗口正打开:重填控件为默认值 + 复位到通用页。
     // Settings window is open: repopulate controls with defaults + reset to General page.
+    // 恢复默认时把鼠标页的设备选择复位到"所有鼠标"。
+    // Restore the mouse-page device selection to "All Mice" on restore-defaults.
+    *SELECTED_DEVICE.lock().unwrap() = Some(None);
     load_settings_values();
     select_sidebar(0);
     // 恢复默认后可能改变了 mouse.enabled,刷新 OK 按钮标题。
@@ -622,35 +775,44 @@ fn load_settings_values() {
         // launch_at_login:按 CONFIG.startup.launch_at_login 设勾选框状态。
         // launch_at_login: set the checkbox state from CONFIG.startup.launch_at_login.
         let _: () = msg_send![ui.launch_at_login, setState: if cfg.startup.launch_at_login { 1isize } else { 0isize }];
-        // reverse_scroll:按 CONFIG.mouse.reverse_scroll 设勾选框状态。
-        // reverse_scroll: set the checkbox state from CONFIG.mouse.reverse_scroll.
-        let _: () = msg_send![ui.reverse_scroll, setState: if cfg.mouse.reverse_scroll { 1isize } else { 0isize }];
-        // enable_mouse:按 CONFIG.mouse.enabled 设勾选框状态。
-        // enable_mouse: set the checkbox state from CONFIG.mouse.enabled.
+
+        // ===== 鼠标页:按当前选中设备的有效配置(合并"所有鼠标"+该设备)填充控件 =====
+        // Mouse page: populate controls from the effective config of the selected device
+        // (merging "All Mice" + this device).
+        let resolved = resolve_selected();
+        // enable_mouse(总开关)始终读全局。
+        // enable_mouse (master switch) always reads the global flag.
         let _: () =
             msg_send![ui.enable_mouse, setState: if cfg.mouse.enabled { 1isize } else { 0isize }];
-        // disable_pointer_accel:按 CONFIG.mouse.pointer.disable_acceleration 设勾选框状态。
-        // disable_pointer_accel: set the checkbox state from CONFIG.mouse.pointer.disable_acceleration.
-        let _: () = msg_send![ui.disable_pointer_accel, setState: if cfg.mouse.pointer.disable_acceleration { 1isize } else { 0isize }];
-        // scroll_mode:按 CONFIG.mouse.scroll_mode 选中对应项。
-        // scroll_mode: select item matching CONFIG.mouse.scroll_mode.
+        // reverse_scroll:用有效值。
+        // reverse_scroll: effective value.
+        let _: () = msg_send![ui.reverse_scroll, setState: if resolved.reverse_scroll { 1isize } else { 0isize }];
+        // disable_pointer_accel:用有效值。
+        // disable_pointer_accel: effective value.
+        let _: () = msg_send![ui.disable_pointer_accel, setState: if resolved.disable_acceleration { 1isize } else { 0isize }];
+        // scroll_mode:用有效值。
+        // scroll_mode: effective value.
         let sm_idx: isize = SCROLL_MODE_VALUES
             .iter()
-            .position(|v| *v == cfg.mouse.scroll_mode.as_str())
+            .position(|v| *v == resolved.scroll_mode.as_str())
             .map(|i| i as isize)
             .unwrap_or(0);
         let _: () = msg_send![ui.scroll_mode, selectItemAtIndex: sm_idx];
-        // line_count:按 CONFIG.mouse.line_count 填文本。
-        // line_count: fill text from CONFIG.mouse.line_count.
-        set_field(ui.line_count, cfg.mouse.line_count);
-        // smooth_preset:按 CONFIG.mouse.smooth_preset 选中对应项。
-        // smooth_preset: select item matching CONFIG.mouse.smooth_preset.
+        // line_count:用有效值。
+        // line_count: effective value.
+        set_field(ui.line_count, resolved.line_count);
+        // smooth_preset:用有效值。
+        // smooth_preset: effective value.
         let sp_idx: isize = SMOOTH_PRESET_LABELS
             .iter()
-            .position(|v| *v == cfg.mouse.smooth_preset.as_str())
+            .position(|v| *v == resolved.smooth_preset.as_str())
             .map(|i| i as isize)
             .unwrap_or(0);
         let _: () = msg_send![ui.smooth_preset, selectItemAtIndex: sp_idx];
+
+        // 更新设备指示器按钮标题。
+        // Update the device-indicator button title.
+        update_device_indicator_title(ui);
 
         // 每次打开设置时,同步 OK 按钮标题(可能因配置变化而需要重启)。
         // Sync OK button title on each settings open (config changes may require restart).
@@ -748,38 +910,70 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // launch_at_login: checkbox state (1=on / 0=off).
         let la_state: isize = msg_send![ui.launch_at_login, state];
         cfg.startup.launch_at_login = la_state == 1;
+
+        // ===== 鼠标页:把控件值写回当前选中设备的 profile =====
+        // Mouse page: write control values back to the selected device's profile.
+        // enable_mouse(总开关)始终写全局。
+        // enable_mouse (master switch) always writes the global flag.
+        let em_state: isize = msg_send![ui.enable_mouse, state];
+        cfg.mouse.enabled = em_state == 1;
+
+        // 其余字段写入选中设备的 profile(不存在则创建)。
+        // The remaining fields go into the selected device's profile (creating it if absent).
+        let dev = current_selected_device();
+        let idx = find_profile_index(&cfg, dev);
+        // 若 profile 不存在,新建一个并插入。
+        // If the profile doesn't exist, create and insert one.
+        if idx.is_none() {
+            let new_p = MouseProfile {
+                device: match dev {
+                    Some((vid, pid)) => DeviceMatcher {
+                        vendor_id: Some(vid),
+                        product_id: Some(pid),
+                    },
+                    None => DeviceMatcher::default(),
+                },
+                ..Default::default()
+            };
+            cfg.mouse.profiles.push(new_p);
+        }
+        let idx = idx.unwrap_or(cfg.mouse.profiles.len() - 1);
+        let p = &mut cfg.mouse.profiles[idx];
+
         // reverse_scroll:勾选框 state(1=on / 0=off)。
         // reverse_scroll: checkbox state (1=on / 0=off).
         let ns_state: isize = msg_send![ui.reverse_scroll, state];
-        cfg.mouse.reverse_scroll = ns_state == 1;
-        // enable_mouse:勾选框 state(1=on / 0=off)。
-        // enable_mouse: checkbox state (1=on / 0=off).
-        let em_state: isize = msg_send![ui.enable_mouse, state];
-        cfg.mouse.enabled = em_state == 1;
+        p.reverse_scroll = Some(ns_state == 1);
         // disable_pointer_accel:勾选框 state(1=on / 0=off)。
         // disable_pointer_accel: checkbox state (1=on / 0=off).
         let dpa_state: isize = msg_send![ui.disable_pointer_accel, state];
-        cfg.mouse.pointer.disable_acceleration = dpa_state == 1;
+        p.pointer = Some(PartialPointerSection {
+            disable_acceleration: Some(dpa_state == 1),
+        });
         // scroll_mode:下拉框 index 对应 SCROLL_MODE_VALUES。
         // scroll_mode: popup index matches SCROLL_MODE_VALUES.
         let sm_idx: isize = msg_send![ui.scroll_mode, indexOfSelectedItem];
-        cfg.mouse.scroll_mode = SCROLL_MODE_VALUES
-            .get(sm_idx as usize)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "default".into());
+        p.scroll_mode = Some(
+            SCROLL_MODE_VALUES
+                .get(sm_idx as usize)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "default".into()),
+        );
         // line_count:文本输入。
         // line_count: text input.
         match parse_usize(&nsstring_to_rust(msg_send![ui.line_count, stringValue])) {
-            Ok(v) => cfg.mouse.line_count = v.clamp(1, 10) as u32,
+            Ok(v) => p.line_count = Some(v.clamp(1, 10) as u32),
             Err(_) => errs.push(tf("errors.not_a_number", &[("field", "mouse.line_count")])),
         }
         // smooth_preset:下拉框 index 对应 SMOOTH_PRESET_LABELS。
         // smooth_preset: popup index matches SMOOTH_PRESET_LABELS.
         let sp_idx: isize = msg_send![ui.smooth_preset, indexOfSelectedItem];
-        cfg.mouse.smooth_preset = SMOOTH_PRESET_LABELS
-            .get(sp_idx as usize)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "easeInOut".into());
+        p.smooth_preset = Some(
+            SMOOTH_PRESET_LABELS
+                .get(sp_idx as usize)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "easeInOut".into()),
+        );
     }
     for e in cfg.validate() {
         errs.push(e);
@@ -889,6 +1083,7 @@ fn create_settings_window() {
             line_count: std::ptr::null_mut(),
             smooth_preset: std::ptr::null_mut(),
             disable_pointer_accel: std::ptr::null_mut(),
+            device_indicator: std::ptr::null_mut(),
             ok_button: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
         };
@@ -1332,6 +1527,40 @@ fn create_settings_window() {
 
         // ===== 鼠标页内容 mouse page content =====
         let mut y = content_h - 12.0;
+
+        // --- 设备选择器(指示器按钮,点击打开 sheet) / Device picker (indicator button) ---
+        y -= 14.0 + 24.0;
+        add_header(
+            mouse_view,
+            &t("settings.header_mouse_device"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
+        y -= 8.0 + row_h;
+        // 指示器按钮:显示当前选中范围("所有鼠标" / 设备名),点击打开选择器 sheet。
+        // Indicator button: shows the current scope ("All Mice" / device name); opens the picker sheet.
+        let indicator: *mut AnyObject = msg_send![class!(NSButton), alloc];
+        let indicator: *mut AnyObject = msg_send![indicator, initWithFrame: NSRect::new(NSPoint::new(ctrl_x, y), NSSize::new(ctrl_w, row_h))];
+        let _: () = msg_send![indicator, setBezelStyle: 1isize]; // NSRoundedBezelStyle
+        let _: () = msg_send![indicator, setTarget: target];
+        let _: () = msg_send![indicator, setAction: sel!(handleDevicePicker:)];
+        let _: () = msg_send![mouse_view, addSubview: indicator];
+        ui.device_indicator = indicator;
+        release_obj(indicator);
+        // 在标签列放一个说明 label。
+        // A descriptive label on the label column.
+        let dev_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let dev_label: *mut AnyObject = msg_send![dev_label, initWithFrame: NSRect::new(NSPoint::new(label_x, y), NSSize::new(label_w, row_h))];
+        let dl_ns = make_nsstring(&t("settings.header_mouse_device"));
+        let _: () = msg_send![dev_label, setStringValue: dl_ns];
+        CFRelease(dl_ns as *const c_void);
+        let _: () = msg_send![dev_label, setBezeled: false];
+        let _: () = msg_send![dev_label, setDrawsBackground: false];
+        let _: () = msg_send![dev_label, setEditable: false];
+        let _: () = msg_send![dev_label, setAlignment: 1isize]; // right
+        let _: () = msg_send![mouse_view, addSubview: dev_label];
+        release_obj(dev_label);
 
         // --- 启用鼠标控制(总开关) / Enable mouse control ---
         y -= 8.0 + row_h;

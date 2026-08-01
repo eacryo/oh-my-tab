@@ -11,7 +11,6 @@
 //! inertia). All three modes use the synthetic-event approach: drop the original, post a new
 //! event to the session level, bypassing the system natural-scroll override at the HID layer.
 
-use crate::config::CONFIG;
 use crate::event_tap::{
     self, tap_location, tap_options, tap_placement, CFAbsoluteTimeGetCurrent, CFIndex,
     CFOptionFlags, CFRunLoopAddTimer, CFRunLoopGetCurrent, CFRunLoopTimerCreate, CFRunLoopTimerRef,
@@ -23,9 +22,9 @@ use crate::event_tap::{
     K_CG_SCROLL_WHEEL_EVENT_MOMENTUM_PHASE, K_CG_SCROLL_WHEEL_EVENT_SCROLL_PHASE,
     K_CG_SESSION_EVENT_TAP, SYNTHETIC_MARKER,
 };
-use crate::mouse::scrolling::{
-    advance_engine, compute_delta, feed_engine, init_engine, ScrollMode,
-};
+use crate::mouse::device;
+use crate::mouse::resolve;
+use crate::mouse::scrolling::{compute_delta, feed_engine, advance_engine, ScrollMode};
 use crate::{log_info, log_warn};
 use std::ffi::c_void;
 use std::thread;
@@ -178,22 +177,37 @@ unsafe extern "C" fn mouse_event_tap_callback(
         let dy = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
         let dx = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
 
-        log_info!("[mouse] scroll dy={} dx={} flags=0x{:x}", dy, dx, flags);
+        // 归因:CGEvent -> 产生事件的设备 -> (VID,PID)。失败返回 None(回退"所有鼠标"档)。
+        // Attribution: CGEvent -> producing device -> (VID, PID). None on failure (falls back to
+        // the "All Mice" profile).
+        let dev_key = device::device_from_cgevent(event);
+        // 解析该设备的生效配置(合并"所有鼠标"档 + per-device 档)。
+        // Resolve the effective config for this device (merging "All Mice" + per-device profiles).
+        let resolved = resolve::resolve(dev_key);
 
-        let mode = ScrollMode::current();
-        match mode {
+        log_info!(
+            "[mouse] scroll dy={} dx={} flags=0x{:x} dev={:?} mode={:?} reverse={}",
+            dy,
+            dx,
+            flags,
+            dev_key,
+            resolved.scroll_mode,
+            resolved.reverse_scroll
+        );
+
+        match resolved.scroll_mode {
             ScrollMode::Smooth => {
-                // 喂入平滑引擎,引擎在 120Hz 定时器内发射连续事件。
-                // Feed the smooth engine; the 120Hz timer will emit continuous events.
-                feed_engine(dy as f64, dx as f64);
+                // 喂入 per-device 平滑引擎,引擎在 120Hz 定时器内发射连续事件。
+                // Feed the per-device smooth engine; the 120Hz timer emits continuous events.
+                feed_engine(dev_key, dy as f64, dx as f64, resolved.smooth_preset);
                 // 丢弃原始离散事件(由引擎的合成连续事件替代)。
                 // Drop the original discrete event (replaced by the engine's synthetic continuous events).
                 std::ptr::null_mut()
             }
             _ => {
-                // Default / Line:计算 delta + 反转 → post 合成事件 → 丢弃原 event。
-                // Default / Line: compute delta + reverse → post synthetic event → drop original.
-                let (ndy, ndx) = compute_delta(dy, dx);
+                // Default / Line:计算 delta + 反转 -> post 合成事件 -> 丢弃原 event。
+                // Default / Line: compute delta + reverse -> post synthetic event -> drop original.
+                let (ndy, ndx) = compute_delta(dy, dx, &resolved);
                 post_scroll_event(ndy, ndx, flags, false, 0, 0);
                 std::ptr::null_mut()
             }
@@ -226,14 +240,9 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         | (1u64 << K_CG_EVENT_SCROLL_WHEEL);
 
     thread::spawn(move || unsafe {
-        // 初始化平滑引擎(确保 SMOOTH_ENGINE 已创建,即使当前不是 smooth 模式)。
-        // Initialize the smooth engine so it is ready even if the current mode isn't Smooth.
-        init_engine(
-            &CONFIG
-                .read()
-                .map(|c| c.mouse.smooth_preset.clone())
-                .unwrap_or_else(|_| "easeInOut".into()),
-        );
+        // 启动时枚举一次已连接设备(惰性:归因失败时也会重枚举)。
+        // Enumerate connected devices once at startup (also lazily re-done on attribution failure).
+        device::ensure_enumerated();
 
         // 创建 event tap(HID 层,可修改/丢弃事件)。
         // Create event tap (HID level, mutable).

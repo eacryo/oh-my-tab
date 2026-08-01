@@ -5,9 +5,11 @@
 //! Provides three scroll modes: Default (passthrough + optional reverse), Line (fixed line
 //! count), and Smooth (physics engine + inertia).
 
+pub(crate) mod device;
 pub(crate) mod event_tap;
 pub(crate) mod ffi;
 pub(crate) mod pointer;
+pub(crate) mod resolve;
 pub(crate) mod scrolling;
 
 pub(crate) use event_tap::start;

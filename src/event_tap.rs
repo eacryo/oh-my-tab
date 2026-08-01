@@ -114,11 +114,9 @@ extern "C" {
     pub(crate) fn CGEventSetDoubleValueField(event: CGEventRef, field: i32, value: f64);
     pub(crate) fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
     pub(crate) fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
-    // 从 CGEvent 提取底层 IOHIDEvent(私有 API)。
-    // 当前合成事件方案未使用,未来平滑滚动(需修改底层 IOHIDEvent)会复用。
-    // Extract the underlying IOHIDEvent from a CGEvent (private API).
-    // Unused by the current synthetic approach; reserved for future smoothed scrolling.
-    #[allow(dead_code)]
+    // 从 CGEvent 提取底层 IOHIDEvent(公开 API);用于事件归因(按设备匹配配置)。
+    // Extract the underlying IOHIDEvent from a CGEvent (public API); used for event attribution
+    // (matching events to the producing device for per-device config).
     pub(crate) fn CGEventCopyIOHIDEvent(event: CGEventRef) -> *mut c_void;
 
     // 合成全新的滚轮事件(未来平滑滚动复用此 API)。

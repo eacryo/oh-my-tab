@@ -672,6 +672,12 @@ fn setup_status_bar() {
                 handle_enable_mouse_toggle as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(handleDevicePicker:),
+                handle_device_picker as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };

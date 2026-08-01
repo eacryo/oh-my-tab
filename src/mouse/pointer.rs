@@ -19,6 +19,7 @@
 use crate::config::CONFIG;
 use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
 use crate::mouse::ffi::*;
+use crate::mouse::resolve;
 use crate::{log_info, log_warn};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
@@ -177,6 +178,18 @@ unsafe fn disable() {
         }
         let name = device_name(service);
 
+        // 读取 VID/PID,解析该设备是否需要禁用加速(per-device 配置)。
+        // Read VID/PID and resolve whether this device should have acceleration disabled.
+        let vid = prop_int(service, KEY_VENDOR_ID) as u32;
+        let pid = prop_int(service, KEY_PRODUCT_ID) as u32;
+        let resolved = resolve::resolve(Some((vid, pid)));
+        if !resolved.disable_acceleration {
+            // 该设备的配置未要求禁用加速,跳过(保留系统默认)。
+            // This device's config doesn't ask to disable acceleration; skip (keep system default).
+            log_info!("[pointer] {}: keeping acceleration (vid={:#x} pid={:#x})", name, vid, pid);
+            continue;
+        }
+
         // macOS 14+ (Sonoma):线性缩放开关。
         // macOS 14+ (Sonoma): the linear-scaling switch.
         if prop_exists(service, KEY_LINEAR_SCALING) {
@@ -270,13 +283,21 @@ pub(crate) fn restore() {
 }
 
 /// 根据当前配置应用或恢复指针设置。
-/// Apply or restore pointer settings based on the current config.
+/// 启用时,disable() 内部按 per-device 解析结果决定哪些设备禁用加速;
+/// 若所有已连接设备的解析结果都不要求禁用,则等同 restore(不改动任何设备)。
+///
+/// Apply or restore pointer settings based on the current config. When enabled, disable()
+/// resolves per-device whether to disable acceleration; if no connected device asks for it,
+/// this is equivalent to restore (no device is touched).
 pub(crate) fn apply() {
-    let want = CONFIG
+    let enabled = CONFIG
         .read()
-        .map(|c| c.mouse.enabled && c.mouse.pointer.disable_acceleration)
+        .map(|c| c.mouse.enabled)
         .unwrap_or(false);
-    if want {
+    if enabled {
+        // 先 restore 已保存的原值,再 disable(让 per-device 决策从干净状态开始)。
+        // Restore saved originals first, then disable (so per-device decisions start clean).
+        restore();
         unsafe { disable() }
     } else {
         restore();

@@ -17,6 +17,19 @@ extern "C" {
     pub(crate) fn IOHIDEventSystemClientCopyServices(client: *mut c_void) -> *mut c_void;
 }
 
+// ========== 事件归因:IOHIDEvent sender ID(私有 SPI)/ Event attribution ==========
+// CGEventCopyIOHIDEvent 是公开 CoreGraphics 函数(在 event_tap.rs 声明),取出 CGEvent
+// 内层 IOHIDEvent。以下两个是私有 SPI,用来从 IOHIDEvent 读 senderID 并映射回设备。
+// CGEventCopyIOHIDEvent is a public CoreGraphics function (declared in event_tap.rs) that
+// extracts the IOHIDEvent inside a CGEvent. The two below are private SPI for reading the
+// sender ID from the IOHIDEvent and mapping it back to a device.
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    /// 读 IOHIDEvent 的 sender ID(= 产生该事件的 IORegistry entry ID)。
+    /// Read the sender ID of an IOHIDEvent (= the IORegistry entry ID of the producing device).
+    pub(crate) fn IOHIDEventGetSenderID(event: *mut c_void) -> u64;
+}
+
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
     // IOHIDServiceClient 属性读写(私有 SPI,多年未变,LinearMouse 依赖)。
@@ -69,6 +82,15 @@ pub(crate) const KEY_PRIMARY_USAGE: &str = "PrimaryUsage";
 /// 设备产品名(日志用)。
 /// Device product name (for logs).
 pub(crate) const KEY_PRODUCT: &str = "Product";
+/// 设备厂商 ID(USB VID)。
+/// Device vendor ID (USB VID).
+pub(crate) const KEY_VENDOR_ID: &str = "VendorID";
+/// 设备产品 ID(USB PID)。
+/// Device product ID (USB PID).
+pub(crate) const KEY_PRODUCT_ID: &str = "ProductID";
+/// 设备连接方式(USB/Bluetooth/BLE)。
+/// Device transport (USB/Bluetooth/BLE).
+pub(crate) const KEY_TRANSPORT: &str = "Transport";
 
 // HID 用途常量 / HID usage constants
 /// kHIDPage_GenericDesktop = 0x01

@@ -277,6 +277,22 @@ reset_on_mouse_up = false
 
 ### 6.2 覆盖规则(首个匹配胜出)
 
+> **注**:本节描述的 `[[mouse.overrides]]` 设计已被 **配置档模型** 取代(见
+> `src/config.rs` 的 `MouseProfile` + `src/mouse/resolve.rs`)。实际实现采用
+> `[[mouse.profiles]]`:无 device 字段的档 = "所有鼠标"默认层,有 device 字段的档 =
+> per-device 覆盖;合并语义为"遍历所有匹配档,后者优先"(非首个匹配胜出)。
+> 设备身份按 VID+PID 匹配;事件归因链见 `src/mouse/device.rs`
+> (`CGEventCopyIOHIDEvent` -> `IOHIDEventGetSenderID` -> registry ID 查表)。
+> 以下为历史设计记录,保留供参考。
+>
+> **Note**: the `[[mouse.overrides]]` design below has been superseded by the **profile model**
+> (see `MouseProfile` in `src/config.rs` + `src/mouse/resolve.rs`). The actual implementation uses
+> `[[mouse.profiles]]`: a profile without a device field = the "All Mice" default layer, one with
+> device fields = a per-device override; merge semantics are "iterate all matching profiles, later
+> wins" (not first-match-wins). Device identity matches on VID+PID; the event-attribution chain is
+> in `src/mouse/device.rs` (`CGEventCopyIOHIDEvent` -> `IOHIDEventGetSenderID` -> registry-ID
+> lookup). The text below is the historical design, kept for reference.
+
 per-device / per-app 覆盖解决"不同场景下鼠标行为不同"的需求。例如:
 - 不同鼠标不同设置(游戏鼠标关加速度,普通鼠标保留)
 - 特定 App 下改滚动方向(Terminal 反转)

@@ -50,6 +50,12 @@ row_line_count = "Lines per tick"
 row_smooth_preset = "Smooth preset"
 header_mouse_pointer = "Pointer"
 row_disable_pointer_accel = "Disable pointer acceleration (linear movement)"
+header_mouse_device = "Device"
+mouse_device_all_mice = "All Mice"
+mouse_device_select = "Select Device..."
+mouse_device_auto_switch = "Auto switch to active device"
+mouse_device_active = "active"
+mouse_device_none_connected = "No mouse connected"
 experimental_note = "Experimental options - no guarantee of availability; may be removed in future versions."
 btn_cancel = "Cancel"
 btn_ok = "OK"
@@ -91,6 +97,6 @@ keyboard_modifier_invalid = 'keyboard.modifier: "{value}" is not one of option, 
 i18n_locale_invalid = 'i18n.locale: "{value}" is not one of auto, en, zh-Hans, zh-Hant'
 logging_level_invalid = "logging.level: '{value}' is invalid (expect: info, warn, error)"
 config_read_failed = "cannot read config: {error}"
-mouse_scroll_mode_invalid = 'mouse.scroll_mode: "{value}" is not one of default, line, smooth'
-mouse_line_count_invalid = "mouse.line_count: {value} must be 1..=10"
-mouse_smooth_preset_invalid = 'mouse.smooth_preset: "{value}" is not a valid preset name'
+mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line, smooth'
+mouse_line_count_invalid = "line_count: {value} must be 1..=10"
+mouse_smooth_preset_invalid = 'smooth_preset: "{value}" is not a valid preset name'

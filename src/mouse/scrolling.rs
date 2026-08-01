@@ -5,7 +5,6 @@
 //! (physics engine + inertia). The smooth engine is a three-state machine (Idle → Active →
 //! Momentum) driven by a 120Hz CFRunLoopTimer.
 
-use crate::config::CONFIG;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -36,12 +35,12 @@ impl ScrollMode {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn current() -> Self {
-        let mode = CONFIG
-            .read()
-            .map(|c| c.mouse.scroll_mode.clone())
-            .unwrap_or_default();
-        Self::from_str(&mode)
+        // 兼容旧路径(无设备上下文):用"所有鼠标"解析。
+        // Legacy path (no device context): resolve with the "All Mice" profile.
+        let r = crate::mouse::resolve::resolve(None);
+        r.scroll_mode
     }
 
     #[allow(dead_code)]
@@ -311,6 +310,7 @@ impl SmoothedEngine {
     }
 
     /// Reset engine to idle (e.g. on mode switch).
+    #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
         self.phase = EnginePhase::Idle;
         self.velocity_x = 0.0;
@@ -546,62 +546,79 @@ impl SmoothedEngine {
     }
 }
 
-// ========== 全局引擎 / Global engine singleton ==========
+// ========== 全局引擎(per-device)/ Global engine (per-device) ==========
 
-/// 全局平滑引擎(由 event_tap 线程独占访问,Mutex 仅用于安全,无竞争)。
-/// Global smooth engine (accessed exclusively by the event tap thread; Mutex is for safety,
-/// no contention).
-pub(crate) static SMOOTH_ENGINE: Mutex<Option<SmoothedEngine>> = Mutex::new(None);
+/// per-device 平滑引擎映射。key = (VID, PID);None 键 = 归因失败回退(共用一个引擎)。
+/// 由 event_tap 线程独占访问,Mutex 仅用于安全,无竞争。
+///
+/// Per-device smooth-engine map. Key = (VID, PID); the None key = attribution-failure fallback
+/// (shares one engine). Accessed exclusively by the event tap thread; Mutex is for safety.
+pub(crate) static SMOOTH_ENGINES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<Option<crate::mouse::device::DeviceKey>, SmoothedEngine>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// 初始化/重置引擎(在模式切换或配置重载时调用)。
-/// Initialize/reset the engine (called on mode switch or config reload).
-pub(crate) fn init_engine(preset_str: &str) {
-    let preset = SmoothPreset::from_str(preset_str);
-    if let Ok(mut engine) = SMOOTH_ENGINE.lock() {
-        if let Some(ref mut e) = *engine {
-            e.reset();
-            e.set_preset(preset);
-        } else {
-            *engine = Some(SmoothedEngine::new(preset));
-        }
+/// 取/建指定设备的引擎,并喂入输入。
+/// Get-or-create the engine for the given device and feed it input.
+pub(crate) fn feed_engine(
+    device: Option<crate::mouse::device::DeviceKey>,
+    dy: f64,
+    dx: f64,
+    preset: SmoothPreset,
+) {
+    if let Ok(mut engines) = SMOOTH_ENGINES.lock() {
+        let e = engines.entry(device).or_insert_with(|| SmoothedEngine::new(preset));
+        // 预设可能随配置变化,确保引擎用的是当前预设。
+        // The preset may change with config; keep the engine on the current preset.
+        e.set_preset(preset);
+        e.feed(dy, dx);
     }
 }
 
-/// 喂入离散滚轮输入。
-/// Feed discrete wheel input into the engine.
-pub(crate) fn feed_engine(dy: f64, dx: f64) {
-    if let Ok(mut engine) = SMOOTH_ENGINE.lock() {
-        if let Some(ref mut e) = *engine {
-            e.feed(dy, dx);
-        }
-    }
-}
-
-/// 推进引擎一次(由 120Hz 定时器调用),返回需要 post 的事件(如果有)。
-/// Advance the engine by one tick (called by the 120Hz timer); returns an emission if any.
+/// 推进所有活跃引擎一次(由 120Hz 定时器调用),返回需要 post 的事件(如果有)。
+/// 当前策略:推进 last-fed 的引擎(简化:同一时刻通常只有一个设备在滚)。
+///
+/// Advance all active engines by one tick (called by the 120Hz timer); returns an emission if any.
+/// Current strategy: advance the most-recently-fed engine (simplification: typically only one
+/// device scrolls at a time).
 pub(crate) fn advance_engine() -> Option<TickEmission> {
-    if let Ok(mut engine) = SMOOTH_ENGINE.lock() {
-        if let Some(ref mut e) = *engine {
-            return e.advance();
+    if let Ok(mut engines) = SMOOTH_ENGINES.lock() {
+        // 推进所有引擎,取第一个有发射的。
+        // Advance all engines, return the first emission.
+        for e in engines.values_mut() {
+            if let Some(em) = e.advance() {
+                return Some(em);
+            }
         }
     }
     None
 }
 
-/// 根据当前配置计算要 post 的滚动 delta (非平滑模式用)。
+/// 清理已断开设备的引擎条目(重枚举时调用)。
+/// Purge engine entries for disconnected devices (called on re-enumeration).
+#[allow(dead_code)]
+pub(crate) fn purge_stale_engines(active: &[crate::mouse::device::DeviceKey]) {
+    if let Ok(mut engines) = SMOOTH_ENGINES.lock() {
+        engines.retain(|k, _| {
+            k.is_none()
+                || k.and_then(|key| active.iter().find(|a| **a == key).copied())
+                    .is_some()
+        });
+    }
+}
+
+/// 根据解析后的配置计算要 post 的滚动 delta (非平滑模式用)。
 /// 处理反转 + 行模式的行数归一化。结果形参供 post_scroll_event 使用。
 ///
-/// Compute the scroll delta to post (non-smooth modes).
+/// Compute the scroll delta to post (non-smooth modes) from the resolved config.
 /// Handles reversal + line-mode normalization.
-pub(crate) fn compute_delta(dy: i64, dx: i64) -> (i32, i32) {
-    let cfg = CONFIG.read().unwrap();
-    let mode = ScrollMode::from_str(&cfg.mouse.scroll_mode);
-    let reverse = cfg.mouse.reverse_scroll;
+pub(crate) fn compute_delta(dy: i64, dx: i64, r: &crate::mouse::resolve::ResolvedMouse) -> (i32, i32) {
+    let mode = r.scroll_mode;
+    let reverse = r.reverse_scroll;
 
     let (mut ndy, mut ndx) = match mode {
         ScrollMode::Default => (dy as i32, dx as i32),
         ScrollMode::Line => {
-            let line_count = cfg.mouse.line_count.clamp(1, 10) as i64;
+            let line_count = r.line_count.clamp(1, 10) as i64;
             let sign_y = if dy != 0 { dy.signum() } else { 0 };
             let sign_x = if dx != 0 { dx.signum() } else { 0 };
             ((sign_y * line_count) as i32, (sign_x * line_count) as i32)
