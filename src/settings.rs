@@ -71,6 +71,7 @@ struct SettingsUi {
     modifier: *mut AnyObject,        // NSPopUpButton: option / command
     locale: *mut AnyObject,          // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
+    overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
     log_level: *mut AnyObject,      // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // NSButton (checkbox): 开机自启 / launch at login
     reverse_scroll: *mut AnyObject, // NSButton (checkbox): 反转滚动 / reverse scrolling
@@ -929,6 +930,13 @@ fn load_settings_from(cfg: &Config, rebuild_device: bool) {
         // show_minimized: popup index 0 = hide (false), 1 = show (true).
         let sm_idx = if cfg.windows.show_minimized { 1 } else { 0 };
         let _: () = msg_send![ui.show_minimized, selectItemAtIndex: sm_idx as isize];
+        // overlay_position:下拉框 index 0 = 跟随激活窗口(active_window), 1 = 主屏幕(main)。
+        // overlay_position: popup index 0 = follow active window (active_window), 1 = main (main).
+        let op_idx = match cfg.windows.overlay_position.as_str() {
+            "main" => 1,
+            _ => 0, // "active_window" (default)
+        };
+        let _: () = msg_send![ui.overlay_position, selectItemAtIndex: op_idx as isize];
         // log_level:下拉框 index 0..2 对应 info,warn,error;默认 index 0(info)。
         // log_level: popup index 0..2 = info, warn, error; default index 0 (info).
         let ll_idx = match cfg.logging.level.as_str() {
@@ -1086,6 +1094,14 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // show_minimized: popup index 0 = hide (false), 1 = show (true).
         let sm_idx: isize = msg_send![ui.show_minimized, indexOfSelectedItem];
         cfg.windows.show_minimized = sm_idx == 1;
+        // overlay_position:下拉框 index 0 = 跟随激活窗口, 1 = 主屏幕。
+        // overlay_position: popup index 0 = follow active window, 1 = main.
+        let op_idx: isize = msg_send![ui.overlay_position, indexOfSelectedItem];
+        cfg.windows.overlay_position = match op_idx {
+            1 => "main",
+            _ => "active_window", // index 0 or out-of-range
+        }
+        .into();
         // log_level:下拉框 index 0..2 对应 info,warn,error。
         // log_level: popup index 0..2 = info, warn, error.
         let ll_idx: isize = msg_send![ui.log_level, indexOfSelectedItem];
@@ -1217,13 +1233,12 @@ fn create_settings_window() {
         // required for the green zoom button to appear; the layout is absolute-positioned and
         // doesn't adapt, so the window size is fixed below via min=max.
         // 窗口加左侧侧边栏后:宽 420 -> 580(侧边栏 150 + 1pt 分隔 + 内容 429)。
-        // 内容拆成「通用 / 实验性」两页后,通用页(6 段 9 行)最高,高 748 -> 600 足够;
-        // 通用页顶部预留 Accessibility 权限警告条,窗口再加 60 -> 660。
-        // Window widened for the left sidebar: 420 -> 580 (sidebar 150 + 1pt divider + 429 content).
-        // Content is now paged (General / Experimental); the General page (6 sections, 9 rows) is the
-        // tallest, so height 748 -> 600 is enough; +60 -> 660 to reserve room for the
-        // Accessibility permission warning banner at the top of the General page.
-        let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 660.0));
+        // 内容拆成「通用 / 实验性」两页后,通用页(6 段 10 行)最高,高 768 -> 600 不够;
+        // 通用页顶部预留 Accessibility 权限警告条,再加 60 -> 660;多出的窗口显示位置行再 +30 -> 690。
+        // Content is now paged (General / Experimental); the General page (6 sections, 10 rows)
+        // is the tallest, so 600 doesn't fit; +60 -> 660 reserves the Accessibility permission
+        // warning banner at the top, and the overlay-position row adds +30 -> 690.
+        let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 690.0));
         let window: *mut AnyObject = msg_send![settings_window_class(), alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
         let ns_title = make_nsstring(&t("settings.window_title"));
@@ -1262,6 +1277,7 @@ fn create_settings_window() {
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
             show_minimized: std::ptr::null_mut(),
+            overlay_position: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
@@ -1598,6 +1614,23 @@ fn create_settings_window() {
             row_h,
             &t("settings.row_show_minimized"),
             make_popup(ctrl_x, y, ctrl_w, row_h, &sm_label_refs, 0),
+        );
+        y -= 8.0 + row_h;
+        // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0(跟随激活窗口)。
+        // overlay_position popup: items = [Follow Active Window, Always on Main Screen]; default index 0.
+        let op_labels = [
+            t("settings.overlay_position_follow_active"),
+            t("settings.overlay_position_main_screen"),
+        ];
+        let op_label_refs: Vec<&str> = op_labels.iter().map(|s| s.as_str()).collect();
+        ui.overlay_position = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_overlay_position"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &op_label_refs, 0),
         );
 
         // --- 日志 Logging ---

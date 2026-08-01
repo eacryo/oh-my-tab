@@ -36,6 +36,9 @@ row_locale = "Language"
 row_show_minimized = "Show minimized windows on switch"
 show_minimized_hide = "Hide"
 show_minimized_show = "Show"
+row_overlay_position = "Overlay Position"
+overlay_position_follow_active = "Follow Active Window"
+overlay_position_main_screen = "Always on Main Screen"
 row_log_level = "Log level"
 header_startup = "Startup options"
 row_launch_at_login = "Launch at login"
@@ -95,3 +98,4 @@ config_read_failed = "cannot read config: {error}"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line, smooth'
 mouse_line_count_invalid = "line_count: {value} must be 1..=10"
 mouse_smooth_preset_invalid = 'smooth_preset: "{value}" is not a valid preset name'
+windows_overlay_position_invalid = 'windows.overlay_position: "{value}" is not one of active_window, main'

@@ -901,6 +901,58 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
     }
 }
 
+/// 按配置选择浮窗目标屏幕的 frame(全局坐标系)。
+/// - "main":始终主屏幕(NSScreen mainScreen,历史行为)。
+/// - "active_window":跟随激活窗口——取激活窗口 bounds 中心点所在的屏幕;激活窗口
+///   bounds 不可用(全 0 / 无窗口)或中心不在任何屏幕上时,回退主屏幕。
+///
+/// Pick the target screen frame for the overlay (global coords) per config:
+/// - "main": always the main screen (NSScreen mainScreen, historical behavior).
+/// - "active_window": follow the active window -- the screen containing the center of the
+///   active window's bounds; falls back to the main screen when the bounds are unavailable
+///   (all zeros / no windows) or the center isn't on any screen.
+fn overlay_target_screen(windows: &[WindowInfo]) -> NSRect {
+    unsafe {
+        let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+        let main_frame: NSRect = msg_send![main, frame];
+        let pos = CONFIG.read().unwrap().windows.overlay_position.clone();
+        if pos != "active_window" {
+            return main_frame;
+        }
+        // 激活窗口:collect_windows 排序后 index 0 = 当前前台窗口(is_active 已置位)。
+        // The active window: after collect_windows' sort, index 0 is the frontmost (is_active set).
+        let Some(active) = windows.iter().find(|w| w.is_active) else {
+            return main_frame;
+        };
+        let (bx, by, bw, bh) = active.bounds;
+        // bounds 全 0 = 未获取到,无法定位,回退主屏。
+        // All-zero bounds = unavailable, can't locate, fall back to the main screen.
+        if bw <= 0.0 || bh <= 0.0 {
+            return main_frame;
+        }
+        let cx = bx + bw / 2.0;
+        let cy = by + bh / 2.0;
+        // 遍历所有屏幕,找包含激活窗口中心的那个。
+        // Iterate all screens, find the one containing the active window's center.
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        let count: usize = msg_send![screens, count];
+        let mut i = 0usize;
+        while i < count {
+            let s: *mut AnyObject = msg_send![screens, objectAtIndex: i];
+            let f: NSRect = msg_send![s, frame];
+            if cx >= f.origin.x
+                && cx <= f.origin.x + f.size.width
+                && cy >= f.origin.y
+                && cy <= f.origin.y + f.size.height
+            {
+                return f;
+            }
+            i += 1;
+        }
+        main_frame
+    }
+}
+
 pub(crate) fn show_overlay() {
     unsafe {
         let state_opt = TAB_STATE.lock().unwrap();
@@ -956,9 +1008,8 @@ pub(crate) fn show_overlay() {
 
         update_status_label();
 
-        // Resize window (h computed above)
-        let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-        let screen_frame: NSRect = msg_send![screen, frame];
+        // Resize window (h computed above). Target screen per config (follow active window / main).
+        let screen_frame = overlay_target_screen(&windows);
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
         let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));

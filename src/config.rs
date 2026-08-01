@@ -82,13 +82,27 @@ pub struct I18nSection {
     pub locale: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WindowsSection {
     // 默认 false(不显示最小化窗口,与历史行为一致);bool::default() 即 false,故 Default 可直接派生。
     // Defaults to false (hide minimized windows, matching prior behavior); bool::default() is
     // false, so Default can be derived directly.
     pub show_minimized: bool,
+    // 浮窗显示位置:"active_window" = 跟随激活窗口所在屏幕,"main" = 始终显示在主屏幕。
+    // 默认跟随激活窗口(多显示器用户开箱即得新体验)。
+    // Overlay display position: "active_window" = follow the active window's screen,
+    // "main" = always on the main screen. Defaults to following the active window.
+    pub overlay_position: String,
+}
+
+impl Default for WindowsSection {
+    fn default() -> Self {
+        Self {
+            show_minimized: false,
+            overlay_position: "active_window".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -591,6 +605,16 @@ impl Config {
             ));
         }
 
+        // --- windows ---
+        if !["active_window", "main"]
+            .contains(&self.windows.overlay_position.as_str())
+        {
+            errs.push(tf(
+                "errors.windows_overlay_position_invalid",
+                &[("value", &self.windows.overlay_position)],
+            ));
+        }
+
         // --- mouse profiles ---
         for (i, p) in self.mouse.profiles.iter().enumerate() {
             let prefix = format!("mouse.profiles[{i}]");
@@ -757,9 +781,20 @@ impl Config {
             }
         }
 
-        // windows (bool 字段无需校验,恒有效)
-        // windows (bool field needs no validation, always valid)
-        self.windows = other.windows;
+        // windows
+        if !has_error("windows.") {
+            self.windows = other.windows;
+        } else {
+            if !errs.iter().any(|e| e.starts_with("windows.show_minimized")) {
+                self.windows.show_minimized = other.windows.show_minimized;
+            }
+            if !errs
+                .iter()
+                .any(|e| e.starts_with("windows.overlay_position"))
+            {
+                self.windows.overlay_position = other.windows.overlay_position;
+            }
+        }
 
         // logging
         if !has_error("logging.") {

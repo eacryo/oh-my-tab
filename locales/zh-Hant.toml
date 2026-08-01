@@ -37,6 +37,9 @@ row_locale = "語言"
 row_show_minimized = "切換時顯示最小化視窗"
 show_minimized_hide = "不顯示"
 show_minimized_show = "顯示"
+row_overlay_position = "視窗顯示位置"
+overlay_position_follow_active = "跟隨啟用中的視窗"
+overlay_position_main_screen = "始終顯示在主螢幕"
 row_log_level = "日誌級別"
 header_startup = "啟動選項"
 row_launch_at_login = "開機自啟"
@@ -96,3 +99,4 @@ config_read_failed = "無法讀取設定: {error}"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line、smooth 之一'
 mouse_line_count_invalid = "line_count: {value} 必須 1..=10"
 mouse_smooth_preset_invalid = 'smooth_preset: "{value}" 不是有效預設名稱'
+windows_overlay_position_invalid = 'windows.overlay_position: "{value}" 不是 active_window、main 之一'

@@ -16,6 +16,9 @@ pub struct WindowInfo {
     pub icon_path: Option<String>,
     pub is_active: bool,
     pub minimized: bool, // 最小化窗口(show_minimized 打开时才收集)/ minimized (collected only when show_minimized is on)
+    // CG 窗口 bounds (x, y, w, h),用于确定激活窗口所在屏幕。全 0 表示未获取到。
+    // CG window bounds (x, y, w, h), used to locate the active window's screen. All zeros = unavailable.
+    pub bounds: (f64, f64, f64, f64),
 }
 
 /// 窗口级 MRU 时间戳，按 (pid, CGWindowID) 索引。
@@ -332,6 +335,25 @@ fn cf_dict_get_bool(dict: *const c_void, key: &str) -> Option<bool> {
         return None;
     }
     Some(unsafe { CFBooleanGetValue(value) })
+}
+
+/// 读 CG dict 里的 kCGWindowBounds(嵌套 dict:X/Y/Width/Height),返回 (x, y, w, h)。
+/// 用于确定激活窗口所在屏幕(overlay 的"跟随激活窗口"定位)。
+///
+/// Read kCGWindowBounds (a nested dict: X/Y/Width/Height) from a CG dict, returning (x, y, w, h).
+/// Used to determine the active window's screen (the overlay's "follow active window" placement).
+fn cf_dict_get_bounds(dict: *const c_void, key: &str) -> Option<(f64, f64, f64, f64)> {
+    let cf_key = cf_string_new(key);
+    let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
+    unsafe { CFRelease(cf_key) };
+    if value.is_null() {
+        return None;
+    }
+    let x = cf_dict_get_f64(value, "X")?;
+    let y = cf_dict_get_f64(value, "Y")?;
+    let w = cf_dict_get_f64(value, "Width")?;
+    let h = cf_dict_get_f64(value, "Height")?;
+    Some((x, y, w, h))
 }
 
 /// 一个运行中 App 的缓存身份:`key` 用作缓存文件名,`fingerprint` 用于检测 App 更新。
@@ -969,6 +991,9 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
         let cg_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
         let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        // bounds (x, y, w, h);解析失败时全 0,调用方会回退到主屏幕。
+        // bounds (x, y, w, h); all zeros on parse failure, caller falls back to the main screen.
+        let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or((0.0, 0.0, 0.0, 0.0));
 
         // 按 CGWindowID 精确配对 AX 标题（不再按顺序/字符串猜）。
         // AX 为权威数据源：CG 窗口必须能在 AX 里按 CGWindowID 找到才保留。
@@ -1039,6 +1064,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             icon_path,
             is_active: false,
             minimized,
+            bounds,
         });
     }
 
