@@ -6,7 +6,7 @@
 //! build/show/collect, validation alerts, and hot config application (apply_config_refresh).
 //! invalidate_settings_window drops the cached window so it rebuilds after a locale change.
 
-use objc2::runtime::{AnyObject, Sel};
+use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::ffi::{c_void, CString};
@@ -237,15 +237,25 @@ unsafe fn make_slider(x: f64, y: f64, w: f64, h: f64, min: i64, max: i64, value:
     slider
 }
 
-/// 设侧边栏按钮标题为带 labelColor 的 attributed title(selected=true 用粗体)。
-/// Set the sidebar button's title as an attributed title with labelColor (bold when selected).
+/// 设侧边栏按钮标题为 attributed title:未选中用 labelColor(系统文本色),选中用纯白
+/// (whiteColor,与蓝色选中高亮搭配,原生 source-list 选中行文字观感同款)。
+/// 注意:alternateSelectedControlTextColor 虽语义正确,但在 attributed title 里会被
+/// macOS 26 解析成深色(实测渲染为 0,61,127),不能用;纯白渲染正常。
+/// Set the sidebar button's title as an attributed title: labelColor when unselected, plain
+/// white when selected (matches the accent-blue highlight; same look as native source-list
+/// selection text). Note: alternateSelectedControlTextColor looks right semantically but macOS 26
+/// resolves it to a dark color (measured 0,61,127) inside attributed titles, so plain white is used.
 unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selected: bool) {
     let font: *mut AnyObject = if selected {
         msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64]
     } else {
         msg_send![class!(NSFont), messageFontOfSize: 13.0f64]
     };
-    let color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
+    let color: *mut AnyObject = if selected {
+        msg_send![class!(NSColor), whiteColor]
+    } else {
+        msg_send![class!(NSColor), labelColor]
+    };
     let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let attrs: *mut AnyObject = msg_send![attrs, init];
     let k_font = make_nsstring("NSFont");
@@ -676,8 +686,8 @@ fn select_sidebar(idx: usize) {
         // 高亮背景对齐到选中按钮的 frame / align the highlight to the selected button's frame
         let frame: NSRect = msg_send![buttons[idx], frame];
         let _: () = msg_send![ui.sidebar_highlight, setFrame: frame];
-        // 选中项粗体,另一项常规;都用 labelColor,颜色与 section 标题一致。
-        // Bold the selected, regular for the other; both use labelColor to match section headers.
+        // 选中项粗体 + 白字(whiteColor),未选中项常规 labelColor。
+        // Bold + white text when selected; regular labelColor otherwise.
         let titles = [
             t("settings.sidebar_general"),
             t("settings.sidebar_experimental"),
@@ -703,6 +713,46 @@ fn apply_config_refresh() {
     update_status_label();
 }
 
+/// 红绿灯偏移常量:把系统红绿灯往右下挪一点,与左侧玻璃卡片对齐。
+/// 窗口坐标 y 向上,右下 = x 增大 / y 减小。
+/// Traffic-light offset: nudge the standard buttons down-right to align with the glass card.
+/// Window coordinates point up, so down-right = x+ / y-.
+const TRAFFIC_LIGHT_DX: f64 = 8.0;
+const TRAFFIC_LIGHT_DY: f64 = -6.0;
+
+/// 把三个红绿灯按钮往右下偏移:通过公开 API standardWindowButton: 拿到按钮视图直接改 frame
+/// (没有公开 API 直接设红绿灯位置,旧私有 API setTrafficLightPosition: 等在 macOS 26 已移除,
+/// 实测这是唯一可靠的做法)。
+/// 注意:两参的 +standardWindowButton:forStyleMask: 是类方法,发给实例会被 objc2 的方法
+/// 检查拦截崩掉(此前踩过的坑);必须用一参的实例方法 -standardWindowButton:。
+/// 必须在窗口完成首次布局之后调用 —— 布局前移动会被 AppKit 重置;resize 也会重置,
+/// 所以每次 show 和 resize 后都要重放(见 show_settings 与 resizeSubviewsWithOldSize:)。
+/// 按钮为 nil 时静默跳过,旧版 macOS 同样适用。
+///
+/// Nudge the three traffic-light buttons down-right: grab the button views via the public
+/// -standardWindowButton: and move their frames (no public API sets the traffic light position;
+/// the old private setTrafficLightPosition: etc. are gone on macOS 26, and this is the only
+/// reliable way -- verified on this machine). Note: the two-arg +standardWindowButton:forStyleMask:
+/// is a CLASS method; sending it to an instance trips objc2's method check and panics (a pitfall
+/// we hit) -- the one-arg instance method -standardWindowButton: must be used. Must run after the
+/// window's first layout pass: moves before layout are reset by AppKit, and resize also resets
+/// them, so the offset is re-applied on every show and resize (see show_settings and
+/// resizeSubviewsWithOldSize:). Skips silently when a button is nil; works on older macOS too.
+unsafe fn reposition_traffic_lights(window: *mut AnyObject) {
+    // NSWindowButton: Close=0, Miniaturize=1, Zoom=2
+    for tag in 0..3isize {
+        let btn: *mut AnyObject = msg_send![window, standardWindowButton: tag];
+        if btn.is_null() {
+            continue;
+        }
+        let f: NSRect = msg_send![btn, frame];
+        let _: () = msg_send![
+            btn,
+            setFrameOrigin: NSPoint::new(f.origin.x + TRAFFIC_LIGHT_DX, f.origin.y + TRAFFIC_LIGHT_DY)
+        ];
+    }
+}
+
 fn show_settings() {
     unsafe {
         {
@@ -726,6 +776,11 @@ fn show_settings() {
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
             let _: () = msg_send![u.window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+            // 红绿灯偏移:必须等窗口完成首次布局后再移动,否则会被 AppKit 重置。
+            // Offset the traffic lights only after the window's first layout pass, or AppKit
+            // resets them.
+            let _: () = msg_send![u.window, layoutIfNeeded];
+            reposition_traffic_lights(u.window);
             // 清掉默认 first responder,避免打开时光标落在 Glass color 文本框。
             // Clear the default first responder so the cursor doesn't land in the Glass color field on open.
             let _: bool = msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
@@ -1185,6 +1240,21 @@ extern "C" fn settings_window_perform_key_equivalent(
     }
 }
 
+// 窗口 resize 会把红绿灯位置重置回默认(实测),重写 resizeSubviewsWithOldSize: 在
+// super 布局之后重放偏移。位置重放是幂等的(每次设同样的 frame),不会引发布局循环。
+// Resize resets the traffic lights to their default positions (verified), so override
+// resizeSubviewsWithOldSize: to re-apply the offset after super's layout. The re-apply is
+// idempotent (same frames each time) and cannot cause a layout loop.
+extern "C" fn settings_window_resize_subviews(_self: *mut c_void, _cmd: Sel, old_size: NSSize) {
+    unsafe {
+        let _: () = msg_send![
+            super(_self as *mut AnyObject, objc2::runtime::AnyClass::get(c"NSWindow").unwrap()),
+            resizeSubviewsWithOldSize: old_size
+        ];
+        reposition_traffic_lights(_self as *mut AnyObject);
+    }
+}
+
 struct SettingsWindowClass(*mut AnyObject);
 unsafe impl Send for SettingsWindowClass {}
 unsafe impl Sync for SettingsWindowClass {}
@@ -1211,6 +1281,13 @@ fn settings_window_class() -> *mut AnyObject {
                 settings_window_perform_key_equivalent as *mut c_void,
                 types_key.as_ptr(),
             );
+            let types_resize = CString::new("v@:{CGSize=dd}").unwrap(); // -resizeSubviewsWithOldSize:(NSSize) -> void
+            class_addMethod(
+                cls,
+                sel!(resizeSubviewsWithOldSize:),
+                settings_window_resize_subviews as *mut c_void,
+                types_resize.as_ptr(),
+            );
             objc_registerClassPair(cls);
             SettingsWindowClass(cls)
         })
@@ -1219,15 +1296,32 @@ fn settings_window_class() -> *mut AnyObject {
 
 fn create_settings_window() {
     unsafe {
-        let view_w = 580.0;
-        let sidebar_w = 150.0;
+        // 窗口宽:玻璃卡片 195(260 的 75%)+ 10 间隙 + 内容 429 + 右缘 12 = 656。
+        // Window width: 195 glass card (75% of 260) + 10pt gap + 429 content + 12pt right
+        // margin = 656.
+        let view_w = 656.0;
+        let card_margin = 10.0;
+        let card_w = 195.0;
+        // 圆角分两档:窗口外框大圆角 26(unified 工具栏把主题帧圆角从 16 提到 26,见工具栏
+        // 代码),侧边栏玻璃卡片圆角当前取 16(试调值;LinearMouse 原生是 8,窗口是 26)。
+        // contentView 裁剪必须用 window_clip_radius(与窗口形状一致),否则 8~26 之间会露出
+        // 透明角。
+        // Corner radius comes in two tiers: the window frame is big (26, raised from 16 by the
+        // unified toolbar -- see the toolbar code), while the sidebar glass card currently uses
+        // 16 (a tuning value; LinearMouse's native proportions are 8 for the sidebar and 26 for
+        // the window). The contentView clip must use window_clip_radius to match the window
+        // shape, or the gap between the two radii would show through as transparent corners.
+        let window_clip_radius = 26.0;
+        let card_radius = 16.0;
         let style: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
         // titled + closable + miniaturizable + resizable(三个红绿灯齐全)。resizable 是绿色 zoom
         // 按钮出现的必要条件;布局是绝对定位不随缩放,故下方用 min=max 固定窗口尺寸。
         // titled + closable + miniaturizable + resizable (all three traffic lights). resizable is
         // required for the green zoom button to appear; the layout is absolute-positioned and
         // doesn't adapt, so the window size is fixed below via min=max.
-        // 窗口加左侧侧边栏后:宽 420 -> 580(侧边栏 150 + 1pt 分隔 + 内容 429)。
+        // 窗口加左侧玻璃卡片后:宽 420 -> 580(旧侧边栏 150 + 1pt 分隔 + 内容 429),
+        // 卡片加宽后 -> 721(卡片 260 + 10 间隙 + 内容 429 + 右缘 12),卡片回调后 -> 656
+        // (卡片 195 + 10 间隙 + 内容 429 + 右缘 12)。
         // 内容拆成「通用 / 实验性」两页后,通用页(6 段 10 行)最高,高 768 -> 600 不够;
         // 通用页顶部预留 Accessibility 权限警告条,再加 60 -> 660;多出的窗口显示位置行再 +30 -> 690。
         // Content is now paged (General / Experimental); the General page (6 sections, 10 rows)
@@ -1266,11 +1360,31 @@ fn create_settings_window() {
         let _: () = msg_send![window, setTitle: ns_title];
         CFRelease(ns_title as *const c_void);
         let _: () = msg_send![window, setReleasedWhenClosed: false];
-        // 自适应:窗口可缩放,行已设 autoresizing masks,内容随窗口调整。
-        // 设最小尺寸避免缩太小导致控件重叠。
-        // Adaptive: the window is resizable; rows already have autoresizing masks set,
-        // so content adjusts with the window. Set a minimum size to avoid overlap.
-        let _: () = msg_send![window, setMinSize: NSSize::new(450.0, 400.0)];
+        // 固定宽度:min/max 宽都等于设计宽度,高度可调 —— 系统设置同款(宽度不能左右调整)。
+        // Fixed width: min and max width both equal the designed width, height stays adjustable --
+        // same as System Settings (the width cannot be dragged).
+        let _: () = msg_send![window, setMinSize: NSSize::new(view_w, 400.0)];
+        let _: () = msg_send![window, setMaxSize: NSSize::new(view_w, 10000.0)];
+
+        // 空 unified 工具栏:unified 工具栏(NSWindowToolbarStyleUnified=3)会把窗口主题帧
+        // 圆角从 16 提到 26(实测;LinearMouse 的设置窗口就是这么做的),顶部条带随之变为
+        // 玻璃材质条带、红绿灯在其中垂直居中。空工具栏不加入任何响应者,不影响
+        // performKeyEquivalent:(Cmd+Q)与页面切换。必须在 contentLayoutRect 测量之前设置,
+        // 布局高度会自动减去工具栏条带(658 -> 624)。
+        // Empty unified toolbar: NSWindowToolbarStyleUnified (3) raises the theme frame's corner
+        // radius from 16 to 26 (measured; that's how LinearMouse's settings window does it), and
+        // the top strip becomes a glass material strip with the traffic lights centered in it.
+        // An empty toolbar adds no responders, so performKeyEquivalent: (Cmd+Q) and page switching
+        // are unaffected. Must be set before measuring contentLayoutRect, which then automatically
+        // accounts for the toolbar strip (658 -> 624).
+        let tb: *mut AnyObject = msg_send![class!(NSToolbar), alloc];
+        let tb_id = make_nsstring("OhMyTabSettingsToolbar");
+        let tb: *mut AnyObject = msg_send![tb, initWithIdentifier: tb_id];
+        CFRelease(tb_id as *const c_void);
+        let _: () = msg_send![window, setToolbar: tb];
+        let _: () = msg_send![window, setToolbarStyle: 3isize]; // NSWindowToolbarStyleUnified
+        release_obj(tb);
+
         let content: *mut AnyObject = msg_send![window, contentView];
         // content_h 只用于容器视图的满高尺寸(翻转 mask 后覆盖整个窗口);
         // 顶部锚定行的有效高度在翻转后用 layout_h 取(见下)。
@@ -1297,6 +1411,30 @@ fn create_settings_window() {
         let _: () = msg_send![window, setTitleVisibility: 1isize]; // NSWindowTitleHidden
         let layout_rect: NSRect = msg_send![window, contentLayoutRect];
         let layout_h = layout_rect.size.height.min(content_h);
+
+        // 窗口圆角:窗口自绘的 opaque 背景(系统默认小圆角)会盖住 contentView 的裁剪,
+        // 单靠 layer cornerRadius 圆角出不来。做法:setOpaque:NO 关掉窗口自绘背景,由
+        // contentView 的 layer 自己铺 windowBackgroundColor(深浅色语义色)并裁成
+        // window_clip_radius(26,与窗口形状一致)圆角。主题切换会 invalidate 重建窗口,
+        // 背景色随重建重取,不会在深浅色切换后过时。红绿灯是窗口 chrome、不在
+        // contentView 内,不受裁剪;卡片 10pt 留白与版本号也都在圆角区之外。
+        // Window corners: the window's own opaque background (system-default small rounding)
+        // paints over contentView's clipping, so layer cornerRadius alone didn't round the window.
+        // Fix: setOpaque:NO turns off the window-drawn background, and contentView's layer paints
+        // windowBackgroundColor itself (a semantic color) clipped to window_clip_radius (26,
+        // matching the window shape). Theme switches invalidate and rebuild the window, so the
+        // color is re-captured and never goes stale across light/dark changes. The traffic lights
+        // are window chrome outside contentView (not clipped); the card's 10pt margin and the
+        // version label stay clear of the corner zone.
+        let _: () = msg_send![window, setOpaque: false];
+        let _: () = msg_send![content, setWantsLayer: true];
+        let cv_layer: *mut AnyObject = msg_send![content, layer];
+        if !cv_layer.is_null() {
+            let bg_ns: *mut AnyObject = msg_send![class!(NSColor), windowBackgroundColor];
+            layer_set_background(cv_layer, ns_color_to_cg(bg_ns));
+            let _: () = msg_send![cv_layer, setCornerRadius: window_clip_radius];
+            let _: () = msg_send![cv_layer, setMasksToBounds: true];
+        }
 
         let mut ui = SettingsUi {
             window,
@@ -1334,9 +1472,9 @@ fn create_settings_window() {
             accessibility_warning_view: std::ptr::null_mut(),
         };
 
-        // 内容区 x(侧边栏右、1pt 分隔线右)、宽 / content area x (right of sidebar + divider) and width
-        let content_x = sidebar_w + 1.0;
-        let content_w = view_w - content_x; // 580 - 151 = 429
+        // 内容区 x(卡片右缘 + 10pt 间隙)、宽 / content area x (card right edge + 10pt gap) and width
+        let content_x = card_margin + card_w + card_margin; // 10 + 260 + 10 = 280
+        let content_w = view_w - content_x - 12.0; // 721 - 280 - 12 = 429
         let label_x = 12.0;
         let label_w = 150.0;
         let ctrl_x = 170.0;
@@ -1349,55 +1487,78 @@ fn create_settings_window() {
             None => return,
         };
 
-        // --- 侧边栏 sidebar ---
-        let sidebar_view: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let sidebar_view: *mut AnyObject = msg_send![sidebar_view, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(sidebar_w, content_h))];
-        // 侧边栏底色比内容区略深一档(controlBackgroundColor,系统语义色,深浅色自适应)。
-        // 不用 underPageBackgroundColor:它在浅色模式下渲染偏深,与内容区(纯白)对比过强,
-        // 形成"深灰 vs 亮白"的刺眼效果。controlBackgroundColor 只比 windowBackground 深
-        // 一个温和档位,贴近系统设置与 BetterCmdTab 的观感。
-        // Sidebar background is one gentle shade darker than the content area
-        // (controlBackgroundColor, a system semantic color that adapts to light/dark).
-        // Not underPageBackgroundColor: it renders too dark in light mode, making the
-        // "dark grey vs bright white" contrast harsh. controlBackgroundColor is only one
-        // subtle step darker than windowBackground, closer to System Settings / BetterCmdTab.
-        let _: () = msg_send![sidebar_view, setWantsLayer: true];
-        let sb_layer: *mut AnyObject = msg_send![sidebar_view, layer];
-        let sb_color: *mut AnyObject = msg_send![class!(NSColor), controlBackgroundColor];
-        layer_set_background(sb_layer, ns_color_to_cg(sb_color));
+        // --- 侧边栏 sidebar(悬浮玻璃卡片,系统设置同款观感)---
+        // macOS 26+ 用 NSGlassEffectView(Liquid Glass,不设 tint 用系统默认);
+        // 旧版用 NSVisualEffectView + sidebar 材质(经典磨砂侧边栏)。
+        // 卡片宽 195、四周统一 10pt 留白(顶部与底部一致,不顶到窗口边框)、四角圆角 16
+        // (当前试调值,见 card_radius 常量注释)。
+        // 玻璃材质自带视觉边界,原来的 1pt 分隔线随之删除。
+        // --- Sidebar: a floating glass card, same look as System Settings ---
+        // macOS 26+ uses NSGlassEffectView (Liquid Glass, system default tint);
+        // older macOS uses NSVisualEffectView with the sidebar material (classic frosted look).
+        // The card is 195 wide with a uniform 10pt margin all around (top matches the bottom,
+        // not flush with the window frame) and a 16pt corner radius (current tuning value; see
+        // the card_radius constant's comment). The glass material carries its own edge, so the
+        // old 1pt divider is removed.
+        let card_h = content_h - card_margin * 2.0;
+        let sidebar_view: *mut AnyObject = if AnyClass::get(c"NSGlassEffectView").is_some() {
+            let cls = AnyClass::get(c"NSGlassEffectView").unwrap();
+            let g: *mut AnyObject = msg_send![cls, alloc];
+            let g: *mut AnyObject = msg_send![g, initWithFrame: NSRect::new(NSPoint::new(card_margin, card_margin), NSSize::new(card_w, card_h))];
+            let _: () = msg_send![g, setStyle: 0i64]; // NSGlassEffectViewStyleRegular
+            let _: () = msg_send![g, setCornerRadius: card_radius];
+            // cornerRadius 属性只圆了着色/外观,背景模糊需 layer masksToBounds 一并裁剪
+            // (与 main.rs 的 overlay 同款做法)。
+            // The cornerRadius property only rounds the tint/appearance; the layer must also
+            // clip the backdrop blur via masksToBounds (same trick as the overlay in main.rs).
+            let _: () = msg_send![g, setWantsLayer: true];
+            let g_layer: *mut AnyObject = msg_send![g, layer];
+            if !g_layer.is_null() {
+                let _: () = msg_send![g_layer, setCornerRadius: card_radius];
+                let _: () = msg_send![g_layer, setMasksToBounds: true];
+            }
+            g
+        } else {
+            let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+            let ve: *mut AnyObject = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(card_margin, card_margin), NSSize::new(card_w, card_h))];
+            let _: () = msg_send![ve, setMaterial: 8u64]; // NSVisualEffectMaterialSidebar
+            let _: () = msg_send![ve, setBlendingMode: 0u64]; // BehindWindow
+            let _: () = msg_send![ve, setState: 1u64]; // Active
+            let _: () = msg_send![ve, setWantsLayer: true];
+            let ve_layer: *mut AnyObject = msg_send![ve, layer];
+            if !ve_layer.is_null() {
+                let _: () = msg_send![ve_layer, setCornerRadius: card_radius];
+                let _: () = msg_send![ve_layer, setMasksToBounds: true];
+            }
+            ve
+        };
         // 自适应:左侧锚定、高度随窗口拉伸(HeightSizable|MaxXMargin = 16|4 = 20)。
         // Adaptive: left-anchored, height stretches with the window.
         let _: () = msg_send![sidebar_view, setAutoresizingMask: 20u64];
         let _: () = msg_send![content, addSubview: sidebar_view];
         release_obj(sidebar_view);
 
-        // 侧边栏与内容间的 1pt 分隔线(layer 填半透明黑,深浅色模式下都可见,旧 API 安全)。
-        // 1pt divider between sidebar and content (layer-filled semi-transparent black; visible in both
-        // light/dark; uses an old API so it's safe across macOS versions).
-        let divider: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let divider: *mut AnyObject = msg_send![divider, initWithFrame: NSRect::new(NSPoint::new(sidebar_w, 0.0), NSSize::new(1.0, content_h))];
-        let _: () = msg_send![divider, setAutoresizingMask: 20u64]; // 同 sidebar:左侧锚定、高度拉伸
-        let _: () = msg_send![divider, setWantsLayer: true];
-        let div_layer: *mut AnyObject = msg_send![divider, layer];
-        let sep_color: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithCalibratedWhite: 0.0f64, alpha: 0.15f64];
-        layer_set_background(div_layer, ns_color_to_cg(sep_color));
-        let _: () = msg_send![content, addSubview: divider];
-        release_obj(divider);
-
         // 侧边栏选中行的高亮背景(layer-backed NSView,theme 感知色),先于按钮加入以便按钮文字叠在上层。
         // Highlight background for the selected sidebar row (layer-backed NSView, theme-aware color);
         // added before the buttons so button titles draw on top of it.
-        let btn_w = sidebar_w - 24.0;
+        // 卡片内布局:内边距 12;按钮顶边放在 layout_h(条带底)下方 6pt,靠近红绿灯
+        // (btn_y0 为卡片坐标系)。
+        // Card-local layout: 12pt inner margins. The buttons' top edge sits 6pt below layout_h
+        // (the strip's bottom) so they stay close to the traffic lights. btn_y0 is in card coords.
+        let btn_w = card_w - 24.0;
         let btn_h = 28.0;
-        let btn_y0 = layout_h - 12.0 - 30.0;
+        let btn_y0 = layout_h - card_margin - 6.0 - btn_h;
         let highlight: *mut AnyObject = msg_send![class!(NSView), alloc];
         let highlight: *mut AnyObject = msg_send![highlight, initWithFrame: NSRect::new(NSPoint::new(12.0, btn_y0), NSSize::new(btn_w, btn_h))];
         let _: () = msg_send![highlight, setAutoresizingMask: 12u64]; // 贴顶、贴左 / top- and left-anchored
         let _: () = msg_send![highlight, setWantsLayer: true];
         let hl_layer: *mut AnyObject = msg_send![highlight, layer];
         let _: () = msg_send![hl_layer, setCornerRadius: 6.0f64];
-        let sel_color: *mut AnyObject = msg_send![class!(NSColor), selectedControlColor];
+        // 选中高亮用系统强调色(controlAccentColor),与 NSSwitch 开启的蓝色一致
+        // (LinearMouse 侧边栏选中高亮同款)。
+        // Selection highlight uses the system accent color (controlAccentColor), matching the
+        // NSSwitch's on-state blue (same as LinearMouse's sidebar selection highlight).
+        let sel_color: *mut AnyObject = msg_send![class!(NSColor), controlAccentColor];
         layer_set_background(hl_layer, ns_color_to_cg(sel_color));
         let _: () = msg_send![sidebar_view, addSubview: highlight];
         release_obj(highlight);
@@ -1956,11 +2117,11 @@ fn create_settings_window() {
         release_obj(banner);
 
         // --- 确认 / 取消(加在 contentView 上,三页都可见)---
-        // Restore Defaults 按钮(左侧偏上,版本号在其下方),与 OK/Cancel 同在 contentView,两页都可见。
-        // 宽度限制在 sidebar 内,避免右边跨过 sidebar 分隔线(x=sidebar_w=150)。
-        // Restore Defaults button (left, raised; version label below it), on contentView like
-        // OK/Cancel, visible on both pages. Width kept within the sidebar so the right edge
-        // doesn't cross the sidebar divider (x=sidebar_w=150).
+        // Restore Defaults 按钮(玻璃卡片底部内侧,版本号在其下方),与 OK/Cancel 同在
+        // contentView,两页都可见。宽度限制在卡片内(x=12..138,卡片右缘 x=205)。
+        // Restore Defaults button (inside the glass card's bottom, version label below it),
+        // on contentView like OK/Cancel, visible on both pages. Width kept within the card
+        // (x=12..138, card right edge x=205).
         let restore: *mut AnyObject = msg_send![class!(NSButton), alloc];
         let restore: *mut AnyObject = msg_send![restore, initWithFrame: NSRect::new(NSPoint::new(12.0, 44.0), NSSize::new(126.0, 28.0))];
         let _: () = msg_send![restore, setAutoresizingMask: 36u64]; // 贴底、贴左 / bottom- and left-anchored
@@ -1971,12 +2132,12 @@ fn create_settings_window() {
         let _: () = msg_send![content, addSubview: restore];
         release_obj(restore);
 
-        // 版本号(Restore Defaults 下方,左下角),数据来自 Cargo.toml version(编译期 env! 嵌入)。
-        // 版本号本身是数据不本地化,只本地化「版本」标签。
-        // Version label (below Restore Defaults, bottom-left); version data from Cargo.toml via
-        // compile-time env!. The version number itself is data (not localized), only the label is.
+        // 版本号(Restore Defaults 下方,玻璃卡片底部内侧)。
+        // x=20 避开卡片左下圆角区(卡片 x=10、圆角 12)。
+        // Version label (below Restore Defaults, inside the glass card's bottom).
+        // x=20 clears the card's bottom-left rounded corner (card x=10, radius 12).
         let version_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let version_label: *mut AnyObject = msg_send![version_label, initWithFrame: NSRect::new(NSPoint::new(12.0, 14.0), NSSize::new(126.0, 20.0))];
+        let version_label: *mut AnyObject = msg_send![version_label, initWithFrame: NSRect::new(NSPoint::new(20.0, 14.0), NSSize::new(126.0, 20.0))];
         let _: () = msg_send![version_label, setAutoresizingMask: 36u64]; // 贴底、贴左
         let version_text = tf(
             "settings.version_label",
