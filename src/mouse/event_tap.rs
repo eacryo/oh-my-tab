@@ -246,7 +246,6 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         // 启动时枚举一次已连接设备(惰性:归因失败时也会重枚举)。
         // Enumerate connected devices once at startup (also lazily re-done on attribution failure).
         device::ensure_enumerated();
-
         // 创建 event tap(HID 层,可修改/丢弃事件)。
         // Create event tap (HID level, mutable).
         let tap = event_tap::create_tap_with_retry(
@@ -268,6 +267,13 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         let source = event_tap::CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
         event_tap::CFRunLoopAddSource(rl, source, event_tap::kCFRunLoopDefaultMode);
         event_tap::CGEventTapEnable(tap, true);
+
+        // 设备插拔监听:蓝牙断连重连时事件驱动地重建注册表(避免旧 client 缓存过期
+        // 导致归因链失效,滚动方向/档位错乱)。回调与 event tap 同线程,安全。
+        // Device plug/unplug monitor: event-driven registry rebuild on Bluetooth disconnect/
+        // reconnect (avoids the stale-client attribution failure that breaks scroll direction
+        // / profile matching). Callbacks run on this same thread, safe.
+        device::start_plug_monitor(rl);
 
         // 创建 120Hz 定时器(约 8.3ms),驱动平滑引擎 advance。
         // Create 120Hz timer (~8.3ms) to drive the smooth engine advance.

@@ -43,8 +43,39 @@ extern "C" {
 
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
-    // IOHIDServiceClient 属性读写(私有 SPI,多年未变,LinearMouse 依赖)。
-    // IOHIDServiceClient property read/write (private SPI, stable for years; relied on by LinearMouse).
+    /// IOHIDManager:设备插拔通知(公开 API)。用 IOHIDManager 监听鼠标/触控板接入/移除,
+    /// 触发注册表重建——蓝牙设备休眠断连重连等场景下,事件驱动地刷新归因链,避免
+    /// 旧 IOHIDEventSystemClient 缓存过期导致归因持续失败。
+    ///
+    /// IOHIDManager: device plug/unplug notifications (public API). Used to rebuild the registry
+    /// on mouse/trackpad attach/detach -- event-driven refresh of the attribution chain for cases
+    /// like Bluetooth disconnect/reconnect, where the stale IOHIDEventSystemClient cache would
+    /// otherwise keep attribution failing.
+    pub(crate) fn IOHIDManagerCreate(allocator: *const c_void, options: u32) -> *mut c_void;
+    pub(crate) fn IOHIDManagerSetDeviceMatchingMultiple(
+        manager: *mut c_void,
+        multiple: *const c_void,
+    );
+    // IOHIDDeviceCallback: void (*)(void *context, IOReturn result, void *sender, IOHIDDeviceCallbackRef callback)
+    pub(crate) fn IOHIDManagerRegisterDeviceMatchingCallback(
+        manager: *mut c_void,
+        callback: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)>,
+        context: *mut c_void,
+    );
+    pub(crate) fn IOHIDManagerRegisterDeviceRemovalCallback(
+        manager: *mut c_void,
+        callback: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)>,
+        context: *mut c_void,
+    );
+    pub(crate) fn IOHIDManagerScheduleWithRunLoop(
+        manager: *mut c_void,
+        runloop: *const c_void,
+        mode: *const c_void,
+    );
+}
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
     // CopyProperty 返回 +1 CFTypeRef,调用方负责 CFRelease。
     // CopyProperty returns +1 CFTypeRef; caller must CFRelease.
     pub(crate) fn IOHIDServiceClientCopyProperty(
