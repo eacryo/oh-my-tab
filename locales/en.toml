@@ -93,7 +93,7 @@ fonts_size_invalid = "{field}: {value} must be >= 8"
 fonts_weight_invalid = "{field}: {value} must be 0.0..=1.0"
 keyboard_modifier_invalid = 'keyboard.modifier: "{value}" is not one of option, command'
 i18n_locale_invalid = 'i18n.locale: "{value}" is not one of auto, en, zh-Hans, zh-Hant'
-logging_level_invalid = "logging.level: '{value}' is invalid (expect: info, warn, error)"
+logging_level_invalid = "logging.level: '{value}' is invalid (expect: debug, info)"
 config_read_failed = "cannot read config: {error}"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line, smooth'
 mouse_line_count_invalid = "line_count: {value} must be 1..=10"

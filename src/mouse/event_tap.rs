@@ -25,7 +25,7 @@ use crate::event_tap::{
 use crate::mouse::device;
 use crate::mouse::resolve;
 use crate::mouse::scrolling::{compute_delta, feed_engine, advance_engine, ScrollMode};
-use crate::{log_info, log_warn};
+use crate::{log_debug, log_info};
 use std::ffi::c_void;
 use std::thread;
 
@@ -65,7 +65,7 @@ unsafe fn post_scroll_event(
     let synthetic = CGEventCreateScrollWheelEvent2(std::ptr::null(), units, 2, dy, dx, 0);
 
     if synthetic.is_null() {
-        log_warn!("[mouse] failed to synthesize scroll event");
+        log_info!("[mouse] failed to synthesize scroll event");
         return;
     }
 
@@ -185,7 +185,7 @@ unsafe extern "C" fn mouse_event_tap_callback(
         // Resolve the effective config for this device (merging "All Mice" + per-device profiles).
         let resolved = resolve::resolve(dev_key);
 
-        log_info!("[mouse] scroll dy={} dx={} flags=0x{:x}", dy, dx, flags);
+        log_debug!("[mouse] scroll dy={} dx={} flags=0x{:x}", dy, dx, flags);
 
         match resolved.scroll_mode {
             ScrollMode::Smooth => {
@@ -217,7 +217,7 @@ unsafe extern "C" fn mouse_event_tap_callback(
         }
     } else {
         let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
-        log_info!(
+        log_debug!(
             "[mouse] {} button={}({}) flags=0x{:x}",
             event_type_name(event_type),
             button,

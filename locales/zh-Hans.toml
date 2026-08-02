@@ -94,7 +94,7 @@ fonts_size_invalid = "{field}: {value} 必须 >= 8"
 fonts_weight_invalid = "{field}: {value} 必须 0.0..=1.0"
 keyboard_modifier_invalid = 'keyboard.modifier: "{value}" 不是 option、command 之一'
 i18n_locale_invalid = 'i18n.locale: "{value}" 不是 auto、en、zh-Hans、zh-Hant 之一'
-logging_level_invalid = "logging.level: '{value}' 无效（期望: info, warn, error）"
+logging_level_invalid = "logging.level: '{value}' 无效（期望: debug, info）"
 config_read_failed = "无法读取配置: {error}"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line、smooth 之一'
 mouse_line_count_invalid = "line_count: {value} 必须 1..=10"

@@ -937,12 +937,11 @@ fn load_settings_from(cfg: &Config, rebuild_device: bool) {
             _ => 0, // "active_window" (default)
         };
         let _: () = msg_send![ui.overlay_position, selectItemAtIndex: op_idx as isize];
-        // log_level:下拉框 index 0..2 对应 info,warn,error;默认 index 0(info)。
-        // log_level: popup index 0..2 = info, warn, error; default index 0 (info).
+        // log_level:下拉框 index 0..1 对应 debug,info;默认 index 1(info)。
+        // log_level: popup index 0..1 = debug, info; default index 1 (info).
         let ll_idx = match cfg.logging.level.as_str() {
-            "warn" => 1,
-            "error" => 2,
-            _ => 0, // "info" (default)
+            "debug" => 0,
+            _ => 1, // "info" (default)
         };
         let _: () = msg_send![ui.log_level, selectItemAtIndex: ll_idx as isize];
         // launch_at_login:按 CONFIG.startup.launch_at_login 设勾选框状态。
@@ -1102,13 +1101,12 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             _ => "active_window", // index 0 or out-of-range
         }
         .into();
-        // log_level:下拉框 index 0..2 对应 info,warn,error。
-        // log_level: popup index 0..2 = info, warn, error.
+        // log_level:下拉框 index 0..1 对应 debug,info。
+        // log_level: popup index 0..1 = debug, info.
         let ll_idx: isize = msg_send![ui.log_level, indexOfSelectedItem];
         cfg.logging.level = match ll_idx {
-            1 => "warn",
-            2 => "error",
-            _ => "info", // index 0 or out-of-range
+            0 => "debug",
+            _ => "info", // index 1 or out-of-range
         }
         .into();
         // launch_at_login:勾选框 state(1=on / 0=off)。
@@ -1643,9 +1641,9 @@ fn create_settings_window() {
             content_w - 24.0,
         );
         y -= 8.0 + row_h;
-        // 日志级别下拉框:项 = [info, warn, error];默认 index 0(info)。
-        // Log level popup: items = [info, warn, error]; default index 0 (info).
-        let log_levels: [&str; 3] = ["info", "warn", "error"];
+        // 日志级别下拉框:项 = [debug, info];默认 index 1(info)。
+        // Log level popup: items = [debug, info]; default index 1 (info).
+        let log_levels: [&str; 2] = ["debug", "info"];
         ui.log_level = add_row(
             general_view,
             label_x,
@@ -1653,7 +1651,7 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_log_level"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &log_levels, 0),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &log_levels, 1),
         );
 
         // --- 启动 Startup ---

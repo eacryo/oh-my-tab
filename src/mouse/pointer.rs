@@ -20,7 +20,7 @@ use crate::config::CONFIG;
 use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
 use crate::mouse::ffi::*;
 use crate::mouse::resolve;
-use crate::{log_info, log_warn};
+use crate::{log_debug, log_info};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use std::ffi::c_void;
@@ -134,7 +134,7 @@ unsafe fn disable() {
     // filtered by usage below).
     let client = IOHIDEventSystemClientCreate(std::ptr::null());
     if client.is_null() {
-        log_warn!("[pointer] failed to create IOHIDEventSystemClient");
+        log_info!("[pointer] failed to create IOHIDEventSystemClient");
         return;
     }
     let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
@@ -151,7 +151,7 @@ unsafe fn disable() {
 
     let services = IOHIDEventSystemClientCopyServices(client);
     if services.is_null() {
-        log_warn!("[pointer] no services returned by IOHIDEventSystemClient");
+        log_info!("[pointer] no services returned by IOHIDEventSystemClient");
         CFRelease(client as *const c_void);
         return;
     }
@@ -186,7 +186,7 @@ unsafe fn disable() {
         if !resolved.disable_acceleration {
             // 该设备的配置未要求禁用加速,跳过(保留系统默认)。
             // This device's config doesn't ask to disable acceleration; skip (keep system default).
-            log_info!("[pointer] {}: keeping acceleration (vid={:#x} pid={:#x})", name, vid, pid);
+            log_debug!("[pointer] {}: keeping acceleration (vid={:#x} pid={:#x})", name, vid, pid);
             continue;
         }
 
@@ -195,7 +195,7 @@ unsafe fn disable() {
         if prop_exists(service, KEY_LINEAR_SCALING) {
             let original = copy_prop(service, KEY_LINEAR_SCALING).unwrap();
             let ok = set_prop_int(service, KEY_LINEAR_SCALING, 1);
-            log_info!(
+            log_debug!(
                 "[pointer] {}: linear scaling ON (original saved, ok={})",
                 name,
                 ok
@@ -219,7 +219,7 @@ unsafe fn disable() {
         };
         let original = copy_prop(service, accel_key);
         let ok = set_prop_int(service, accel_key, -65536);
-        log_info!(
+        log_debug!(
             "[pointer] {}: acceleration -> -1 via {} (ok={})",
             name,
             accel_key,
@@ -233,13 +233,13 @@ unsafe fn disable() {
     }
 
     if saved.is_empty() {
-        log_warn!("[pointer] no mouse/trackpad devices found; nothing applied");
+        log_info!("[pointer] no mouse/trackpad devices found; nothing applied");
         CFRelease(services as *const c_void);
         CFRelease(client as *const c_void);
         return;
     }
 
-    log_info!(
+    log_debug!(
         "[pointer] disabled acceleration on {} device(s).",
         saved.len()
     );
@@ -263,7 +263,7 @@ pub(crate) fn restore() {
             match sp.original {
                 Some(orig) => {
                     let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, orig);
-                    log_info!("[pointer] restored original property (ok={})", ok);
+                    log_debug!("[pointer] restored original property (ok={})", ok);
                     CFRelease(orig as *const c_void);
                 }
                 None => {
@@ -279,7 +279,7 @@ pub(crate) fn restore() {
         CFRelease(state.services as *const c_void);
         CFRelease(state.client as *const c_void);
     }
-    log_info!("[pointer] restored original acceleration settings.");
+    log_debug!("[pointer] restored original acceleration settings.");
 }
 
 /// 根据当前配置应用或恢复指针设置。

@@ -21,7 +21,7 @@ use crate::overlay::{apply_theme, extract_uncached_icons, refresh_highlight, upd
 use crate::settings::invalidate_settings_window;
 use crate::window_collector::clear_icon_cache;
 // 跨模块共享状态(由 main.rs 持有)/ cross-module shared state (owned by main.rs)
-use crate::{log_info, log_warn};
+use crate::log_info;
 use crate::{STATUS_EVENT_TX, TAB_STATE, THEME_STATE};
 
 // ========== 菜单项状态 / menu-item state ==========
@@ -200,9 +200,9 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
     if errs.is_empty() {
         log_info!("Config reloaded successfully.");
     } else {
-        log_warn!("Config reload: {} error(s):", errs.len());
+        log_info!("Config reload: {} error(s):", errs.len());
         for e in &errs {
-            log_warn!("  • {}", e);
+            log_info!("  • {}", e);
         }
     }
     // 同步快捷键模式:手动改 config 的 keyboard.modifier 后 Reload 也要生效。必须在

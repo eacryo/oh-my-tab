@@ -13,7 +13,7 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{msg_send, sel};
 use std::ffi::{c_char, CString};
 
-use crate::{log_info, log_warn};
+use crate::log_info;
 
 #[link(name = "ServiceManagement", kind = "framework")]
 extern "C" {}
@@ -161,7 +161,7 @@ pub fn sync(enabled: bool) {
             if is_enabled() { "enabled" } else { "disabled" },
         );
     } else {
-        log_warn!(
+        log_info!(
             "autostart: {} failed — run as .app? (ad-hoc signed apps may need a one-time approval \
              in System Settings > Login Items)",
             if enabled { "register" } else { "unregister" },

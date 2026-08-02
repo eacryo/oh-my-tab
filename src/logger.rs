@@ -8,20 +8,23 @@ use std::time::{Duration, SystemTime};
 
 // ========== 日志级别 / log level ==========
 
+/// 只有两档:Debug(调试细节)/ Info(常规运行信息)。
+/// 错误/警告统一走 log_info!(内容保留,不再单独分级)。
+///
+/// Only two levels: Debug (diagnostic detail) / Info (normal runtime info).
+/// Errors/warnings all go through log_info! (content preserved, no separate tiers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
 pub enum LogLevel {
-    Info = 0,
-    Warn = 1,
-    Error = 2,
+    Debug = 0,
+    Info = 1,
 }
 
 impl LogLevel {
     fn as_str(&self) -> &'static str {
         match self {
+            LogLevel::Debug => "DEBUG",
             LogLevel::Info => "INFO ",
-            LogLevel::Warn => "WARN ",
-            LogLevel::Error => "ERROR",
         }
     }
 }
@@ -45,22 +48,20 @@ const LOG_CHANNEL_CAPACITY: usize = 512;
 
 // ========== 宏（调用侧接口） / macros (caller API) ==========
 
+/// 调试细节(每次事件/枚举/排序等),仅 Debug 档输出。
+/// Diagnostic detail (per-event / enumeration / sorting), emitted only at the Debug tier.
+#[macro_export]
+macro_rules! log_debug {
+    ($($arg:tt)*) => {
+        $crate::logger::_log($crate::logger::LogLevel::Debug, format_args!($($arg)*))
+    };
+}
+/// 常规运行信息(启动/开关/菜单/错误提示等),Debug 与 Info 档均输出。
+/// Normal runtime info (startup / toggles / menu / error notices), emitted at both tiers.
 #[macro_export]
 macro_rules! log_info {
     ($($arg:tt)*) => {
         $crate::logger::_log($crate::logger::LogLevel::Info, format_args!($($arg)*))
-    };
-}
-#[macro_export]
-macro_rules! log_warn {
-    ($($arg:tt)*) => {
-        $crate::logger::_log($crate::logger::LogLevel::Warn, format_args!($($arg)*))
-    };
-}
-#[macro_export]
-macro_rules! log_error {
-    ($($arg:tt)*) => {
-        $crate::logger::_log($crate::logger::LogLevel::Error, format_args!($($arg)*))
     };
 }
 

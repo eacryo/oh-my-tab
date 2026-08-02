@@ -4,7 +4,7 @@
 //! FFI and ObjC-bridging primitives: CF/CG function declarations, Send/Sync wrappers for raw
 //! pointers, NSString conversion, and color/layer helpers. A leaf module depended on by all UI modules.
 
-use crate::log_error;
+use crate::log_info;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use std::ffi::{c_char, c_void, CString};
@@ -89,7 +89,7 @@ pub(crate) fn make_nsstring(s: &str) -> *mut AnyObject {
         let c_str = CString::new(s).unwrap();
         let cf = CFStringCreateWithCString(std::ptr::null(), c_str.as_ptr(), 0x08000100u32);
         if cf.is_null() {
-            log_error!("CFStringCreateWithCString failed for '{}'", s);
+            log_info!("CFStringCreateWithCString failed for '{}'", s);
         }
         cf as *mut AnyObject
     }

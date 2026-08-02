@@ -6,7 +6,7 @@
 //! and the mouse enhancement (mouse::event_tap) modules. A leaf module.
 
 use crate::ffi::has_accessibility_permission;
-use crate::{log_error, log_info, log_warn};
+use crate::log_info;
 use std::ffi::c_void;
 use std::thread;
 use std::time::Duration;
@@ -229,7 +229,7 @@ pub(crate) unsafe fn create_tap_with_retry(
     // First creation failed (usually missing Accessibility): retry a bounded number of times
     // to give the user time to grant permission in System Settings.
     if tap.is_null() {
-        log_warn!(
+        log_info!(
             "[{}] No Accessibility permission yet; event tap will retry every {:?} up to {} times (~{}s).",
             log_name,
             RETRY_INTERVAL,
@@ -253,7 +253,7 @@ pub(crate) unsafe fn create_tap_with_retry(
                 log_name
             );
         } else {
-            log_error!(
+            log_info!(
                 "[{}] Event tap retry exhausted ({}x). Disabled until restart. \
                  Grant Accessibility in System Settings and relaunch.",
                 log_name,

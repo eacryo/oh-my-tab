@@ -5,7 +5,7 @@ use std::ffi::{c_char, c_void, CStr};
 use std::time::Instant;
 
 use crate::config::CONFIG;
-use crate::{log_info, log_warn};
+use crate::{log_debug, log_info};
 
 #[derive(Debug, Clone)]
 pub struct WindowInfo {
@@ -717,7 +717,7 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
             }
         }
         if !matched {
-            log_warn!(
+            log_info!(
                 "raise_ax_window: NO MATCH for pid={} cgwid={} (ax_windows={}, slps={})",
                 pid,
                 cgwid,
@@ -1100,7 +1100,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         let w = windows
             .iter()
             .find(|w| w.pid == pid && w.window_id == cgwid);
-        log_info!(
+        log_debug!(
             "summon-bump frontmost: pid={} app=\"{}\" cgwid={} title=\"{}\"",
             pid,
             w.map_or("?", |w| w.app_name.as_str()),
@@ -1111,7 +1111,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         // 回退：系统 API 获取失败时，取 CG 枚举中首个非最小化窗口
         // Fallback: when the system API fails, use the first non-minimized window in CG enumeration
         mru.insert((w.pid, w.window_id), now);
-        log_info!(
+        log_debug!(
             "summon-bump frontmost (fallback): pid={} app=\"{}\" cgwid={} title=\"{}\"",
             w.pid,
             w.app_name,
@@ -1141,13 +1141,13 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
     // 每次 summon 时打印排序后的窗口列表（= 实际显示顺序），含 mru 年龄。`*` 标记第 0 个(当前/前台窗口)。
     // Print the sorted window list on every summon (= display order), with MRU age. `*` marks index 0 (current/frontmost).
-    log_info!("sorted: {} windows", windows.len());
+    log_debug!("sorted: {} windows", windows.len());
     for (i, w) in windows.iter().enumerate() {
         let mru_ms = mru
             .get(&(w.pid, w.window_id))
             .map(|t| t.elapsed().as_millis());
         let mark = if i == 0 { "*" } else { " " };
-        log_info!(
+        log_debug!(
             "  {} pid={} app=\"{}\" cgwid={} title=\"{}\" mru_ms={:?}",
             mark,
             w.pid,
@@ -1189,7 +1189,7 @@ pub fn cache_running_app_icons() {
                 } else {
                     CStr::from_ptr(utf8).to_string_lossy().into_owned()
                 };
-                log_info!("cached icon: {} (pid {})", name_str, pid);
+                log_debug!("cached icon: {} (pid {})", name_str, pid);
                 cached.push(name_str);
                 extract_icon_to_cache(pid);
             } else {
@@ -1198,7 +1198,7 @@ pub fn cache_running_app_icons() {
         }
         let _: () = msg_send![pool, drain];
     }
-    log_info!(
+    log_debug!(
         "icon cache done: {} cached, {} skipped (already fresh)",
         cached.len(),
         skipped,

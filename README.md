@@ -231,7 +231,7 @@ locale = "auto"          # "auto" | "en" | "zh-Hans" | "zh-Hant"
 show_minimized = false   # show minimized windows in the overlay
 
 [logging]
-level = "info"           # "info" | "warn" | "error"
+level = "info"           # "debug" | "info"
 file_path = ""           # empty = default timestamped path; see Logging below
 
 [startup]
@@ -271,7 +271,7 @@ Mouse settings are also exposed in the Settings window (a **device picker** list
 
 Logging is asynchronous and designed to **never block the UI / event loop**.
 
-- **Async pipeline**: the `log_info!` / `log_warn!` / `log_error!` macros format a line and send it over a **bounded** `flume` channel (capacity 512) to a background writer thread. The caller never blocks — if the channel is full (e.g. disk writes stall), the **newest** entries are dropped (drop-newest) rather than stalling the caller. Normal load never triggers drops.
+- **Async pipeline**: the `log_debug!` / `log_info!` macros format a line and send it over a **bounded** `flume` channel (capacity 512) to a background writer thread. The caller never blocks — if the channel is full (e.g. disk writes stall), the **newest** entries are dropped (drop-newest) rather than stalling the caller. Normal load never triggers drops.
 - **Destination**: `cargo run` (dev) → stdout only; a packaged `.app` (prod) → file.
 - **Default file path**: `~/Library/Logs/oh-my-tab/oh-my-tab-<startup-timestamp>.log` — one file **per app launch**, where the timestamp is the process start time in a filename-safe form (e.g. `oh-my-tab-2026-07-25_17-08-30.log`).
 - **Automatic 30-day cleanup**: at startup, the default log directory is scanned and any `oh-my-tab-*.log` whose modification time is older than 30 days is deleted. The current run's file is never pruned (its mtime keeps updating as it is written). Cleanup matches only the `oh-my-tab-*.log` pattern, so unrelated files in the same directory are left alone.

@@ -108,8 +108,8 @@ impl Default for WindowsSection {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LoggingSection {
-    // 日志级别:"trace","debug","info","warn","error";默认 "info"。
-    // Log level; default "info".
+    // 日志级别:"debug","info";默认 "info"(常规档,不刷屏;debug 输出全量调试细节)。
+    // Log level: "debug" | "info"; default "info" (normal tier, no spam; debug emits all detail).
     pub level: String,
     // 日志文件路径;空=使用默认路径 ~/Library/Logs/oh-my-tab/oh-my-tab-<时间戳>.log。
     // Log file path; empty = use the default (timestamped file under ~/Library/Logs/oh-my-tab/).
@@ -598,7 +598,7 @@ impl Config {
         }
 
         // --- logging ---
-        if !["info", "warn", "error"].contains(&self.logging.level.as_str()) {
+        if !["debug", "info"].contains(&self.logging.level.as_str()) {
             errs.push(tf(
                 "errors.logging_level_invalid",
                 &[("value", &self.logging.level)],
@@ -1039,8 +1039,7 @@ pub fn reload_config() -> Vec<String> {
     i18n::apply_config_locale(&locale);
     // 热更新日志级别 / hot-reload log level
     let lvl = match log_level.as_str() {
-        "warn" => crate::logger::LogLevel::Warn,
-        "error" => crate::logger::LogLevel::Error,
+        "debug" => crate::logger::LogLevel::Debug,
         _ => crate::logger::LogLevel::Info,
     };
     crate::logger::reconfigure(lvl);

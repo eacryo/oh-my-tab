@@ -231,7 +231,7 @@ locale = "auto"          # "auto" | "en" | "zh-Hans" | "zh-Hant"
 show_minimized = false   # 在浮层中显示最小化窗口
 
 [logging]
-level = "info"           # "info" | "warn" | "error"
+level = "info"           # "debug" | "info"
 file_path = ""           # 空 = 默认带时间戳路径;见下方「日志」
 
 [startup]
@@ -271,7 +271,7 @@ disable_acceleration = true
 
 日志是异步的,设计上**绝不阻塞 UI / 事件循环**。
 
-- **异步管线**:`log_info!` / `log_warn!` / `log_error!` 宏格式化一行后,通过**有界** `flume` 通道(容量 512)发给后台 writer 线程。调用方永不阻塞 -- 通道满时(例如落盘卡顿)丢弃**最新**的日志(drop-newest),而不是拖住调用方。正常负载下不会触发丢弃。
+- **异步管线**:`log_debug!` / `log_info!` 宏格式化一行后,通过**有界** `flume` 通道(容量 512)发给后台 writer 线程。调用方永不阻塞 -- 通道满时(例如落盘卡顿)丢弃**最新**的日志(drop-newest),而不是拖住调用方。正常负载下不会触发丢弃。
 - **输出目标**:`cargo run`(开发态)-> 只输出到 stdout;打包的 `.app`(生产态)-> 写文件。
 - **默认文件路径**:`~/Library/Logs/oh-my-tab/oh-my-tab-<启动时间戳>.log` -- **每次启动一个文件**,时间戳取进程启动时刻、文件名安全格式(如 `oh-my-tab-2026-07-25_17-08-30.log`)。
 - **自动清理 30 天前日志**:启动时扫描默认日志目录,删除任何 mtime 超过 30 天的 `oh-my-tab-*.log`。当前运行的文件不会被误删(它一直在写,mtime 持续更新)。清理只匹配 `oh-my-tab-*.log` 模式,同目录下的无关文件不受影响。

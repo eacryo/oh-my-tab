@@ -13,7 +13,7 @@
 // CONFIG's LazyLock init calls validate() -> t() -> I18N init, there is no deadlock.
 // config.rs calls apply_config_locale() one-way after CONFIG init and after reload.
 
-use crate::log_error;
+use crate::log_info;
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use std::collections::HashMap;
@@ -75,7 +75,7 @@ fn load_messages(locale: &str) -> HashMap<String, String> {
             map
         }
         Err(e) => {
-            log_error!("i18n: failed to parse locale '{}': {}", locale, e);
+            log_info!("i18n: failed to parse locale '{}': {}", locale, e);
             HashMap::new()
         }
     }

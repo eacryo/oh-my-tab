@@ -17,7 +17,7 @@
 
 use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
 use crate::mouse::ffi::*;
-use crate::{log_info, log_warn};
+use crate::{log_debug, log_info};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use std::ffi::c_void;
@@ -159,7 +159,7 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
     if reg.client.is_null() {
         reg.client = IOHIDEventSystemClientCreate(std::ptr::null());
         if reg.client.is_null() {
-            log_warn!("[device] failed to create IOHIDEventSystemClient");
+            log_info!("[device] failed to create IOHIDEventSystemClient");
             return;
         }
         // 匹配 Generic Desktop 页(后续按 usage 过滤)。
@@ -176,7 +176,7 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
 
     let services = IOHIDEventSystemClientCopyServices(reg.client);
     if services.is_null() {
-        log_warn!("[device] no services returned");
+        log_info!("[device] no services returned");
         reg.devices.clear();
         return;
     }
@@ -215,7 +215,7 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
         reg.devices.push(dev);
     }
 
-    log_info!(
+    log_debug!(
         "[device] enumerated {} pointer device(s).",
         reg.devices.len()
     );
@@ -279,7 +279,7 @@ unsafe extern "C" fn device_change_callback(
 ) {
     let mut reg = registry().lock().unwrap();
     enumerate_locked(&mut reg, true);
-    log_info!("[device] plug/unplug event: re-enumerated {} device(s).", reg.devices.len());
+    log_debug!("[device] plug/unplug event: re-enumerated {} device(s).", reg.devices.len());
 }
 
 /// 启动设备插拔监听:创建 IOHIDManager,注册接入/移除回调,挂到指定 RunLoop。
@@ -298,7 +298,7 @@ pub(crate) unsafe fn start_plug_monitor(runloop: crate::event_tap::CFRunLoopRef)
     }
     let manager_obj = IOHIDManagerCreate(std::ptr::null(), 0);
     if manager_obj.is_null() {
-        log_warn!("[device] failed to create IOHIDManager");
+        log_info!("[device] failed to create IOHIDManager");
         return;
     }
     // matching:PrimaryUsagePage=Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad}。

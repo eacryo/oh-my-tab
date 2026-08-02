@@ -75,8 +75,8 @@ impl AppState {
             Vec::new()
         };
         if !has_accessibility_permission() {
-            log_warn!("No accessibility permission.");
-            log_warn!("Go to System Settings → Privacy & Security → Accessibility");
+            log_info!("No accessibility permission.");
+            log_info!("Go to System Settings → Privacy & Security → Accessibility");
         }
         let win_count = windows.len();
         AppState {
@@ -160,10 +160,10 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
                 let mut state_opt = TAB_STATE.lock().unwrap();
                 if let Some(ref mut state) = *state_opt {
                     bump_window_mru(&mut state.mru, pid, cgwid);
-                    log_info!("app-activated bump: pid={} cgwid={}", pid, cgwid);
+                    log_debug!("app-activated bump: pid={} cgwid={}", pid, cgwid);
                 }
             } else {
-                log_info!(
+                log_debug!(
                     "app-activated bump: pid={} (no focused window / AX timeout)",
                     pid
                 );
@@ -608,7 +608,7 @@ fn setup_status_bar() {
             let superclass: *const objc2::runtime::AnyClass = class!(NSObject);
             let cls = objc_allocateClassPair(superclass as *mut AnyObject, name.as_ptr(), 0);
             if cls.is_null() {
-                log_error!("Failed to allocate ObjC class for menu target.");
+                log_info!("Failed to allocate ObjC class for menu target.");
                 return;
             }
             let types = CString::new("v@:@").unwrap();
@@ -855,8 +855,7 @@ fn main() {
     {
         let cfg = CONFIG.read().unwrap(); // 触发 LazyLock 初始化和 config 加载 / triggers LazyLock init + config load
         let level = match cfg.logging.level.as_str() {
-            "warn" => logger::LogLevel::Warn,
-            "error" => logger::LogLevel::Error,
+            "debug" => logger::LogLevel::Debug,
             _ => logger::LogLevel::Info,
         };
         let is_dev = std::env::current_exe()
@@ -920,14 +919,14 @@ fn main() {
         // First load already happened via LazyLock; re-run validate to report problems
         let errs = cfg.validate();
         if !errs.is_empty() {
-            log_warn!(
+            log_info!(
                 "Config errors in ~/.config/oh-my-tab/config.toml ({} issue(s)):",
                 errs.len()
             );
             for e in &errs {
-                log_warn!("  • {}", e);
+                log_info!("  • {}", e);
             }
-            log_warn!("Using defaults for invalid fields.");
+            log_info!("Using defaults for invalid fields.");
         }
     }
 
