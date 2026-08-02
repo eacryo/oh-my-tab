@@ -187,7 +187,7 @@ static STOP_REQUESTED: std::sync::atomic::AtomicBool =
 ///
 /// Stop the mouse event thread at runtime: set the cancel flag + CFRunLoopStop, the thread
 /// exits naturally. Idempotent: no-op when not running. Called by settings.rs when the
-/// "Enable mouse control" checkbox is turned off.
+/// "Enable mouse control" switch is turned off.
 pub(crate) fn stop() {
     // 先置位标志再停 RunLoop:重试窗口内线程醒来即可见(不依赖 RunLoop)。
     // Set the flag first, then stop the RunLoop: during the retry window the thread sees the

@@ -58,14 +58,14 @@ struct SettingsUi {
     show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
     log_level: *mut AnyObject,      // NSPopUpButton: trace / debug / info / warn / error
-    launch_at_login: *mut AnyObject, // NSButton (checkbox): 开机自启 / launch at login
-    reverse_scroll: *mut AnyObject, // NSButton (checkbox): 反转滚动 / reverse scrolling
-    enable_mouse: *mut AnyObject,   // NSButton (checkbox): 启用鼠标控制 / enable mouse control
+    launch_at_login: *mut AnyObject, // NSSwitch: 开机自启 / launch at login
+    reverse_scroll: *mut AnyObject, // NSSwitch: 反转滚动 / reverse scrolling
+    enable_mouse: *mut AnyObject,   // NSSwitch: 启用鼠标控制 / enable mouse control
     scroll_mode: *mut AnyObject,      // NSPopUpButton: default/line
     line_count: *mut AnyObject,       // NSSlider: line count slider
     line_count_label: *mut AnyObject, // NSTextField: line count row 的 label / the row's label
     line_count_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
-    disable_pointer_accel: *mut AnyObject, // NSButton (checkbox): 禁用指针加速 / disable pointer acceleration
+    disable_pointer_accel: *mut AnyObject, // NSSwitch: 禁用指针加速 / disable pointer acceleration
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
@@ -192,25 +192,33 @@ unsafe fn make_popup(
     popup
 }
 
-/// 勾选框(NSButton, NSSwitchButton=3)。alloc +1,加入父视图后由调用方 release。
-/// Checkbox (NSButton, NSSwitchButton=3). alloc +1; caller releases after adding to parent.
-unsafe fn make_checkbox(
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    title: &str,
-    checked: bool,
-) -> *mut AnyObject {
-    let cb: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let cb: *mut AnyObject =
-        msg_send![cb, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
-    let _: () = msg_send![cb, setButtonType: 3isize]; // NSSwitchButton
-    let ns = make_nsstring(title);
-    let _: () = msg_send![cb, setTitle: ns];
-    CFRelease(ns as *const c_void);
-    let _: () = msg_send![cb, setState: if checked { 1isize } else { 0isize }];
-    cb
+/// 原生 toggle switch(NSSwitch,开启蓝色/关闭灰色,系统设置同款)。
+/// alloc +1,加入父视图后由调用方 release。
+/// Native toggle switch (NSSwitch: blue when on, grey when off; same as System Settings).
+/// alloc +1; caller releases after adding to parent.
+unsafe fn make_switch(x: f64, y: f64, h: f64, checked: bool) -> *mut AnyObject {
+    let sw: *mut AnyObject = msg_send![class!(NSSwitch), alloc];
+    let sw: *mut AnyObject =
+        msg_send![sw, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(0.0, 0.0))];
+    // 用 setControlSize: 调小一档(small,regular 约 38x22,small 约 30x19),与设置行更协调。
+    // setControlSize: shrinks the switch by one step (regular ~38x22, small ~30x19) so it fits
+    // the settings rows better. fittingSize 再拿该档位的固有尺寸并垂直居中于行。
+    let _: () = msg_send![sw, setControlSize: 1isize]; // NSControlSizeSmall
+    let fs: NSSize = msg_send![sw, fittingSize];
+    let (sw_w, sw_h) = if fs.width > 0.0 {
+        (fs.width, fs.height)
+    } else {
+        (30.0, 19.0)
+    };
+    let _: () = msg_send![
+        sw,
+        setFrame: NSRect::new(
+            NSPoint::new(x, y + (h - sw_h) / 2.0),
+            NSSize::new(sw_w, sw_h)
+        )
+    ];
+    let _: () = msg_send![sw, setState: if checked { 1isize } else { 0isize }];
+    sw
 }
 
 /// 整数滑块(NSSlider, min..=max, step 1)。alloc +1,加入父视图后由调用方 release。
@@ -374,8 +382,8 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
         return;
     }
 
-    // 检查是否需要重启:对比新旧 mouse.enabled。按钮标题已在勾选框 toggle 时实时更新。
-    // Check if restart needed: button title already updated in real time when checkbox toggled.
+    // 检查是否需要重启:对比新旧 mouse.enabled。按钮标题已在 switch toggle 时实时更新。
+    // Check if restart needed: button title already updated in real time when the switch toggled.
     let needs_restart = {
         let old_cfg = CONFIG.read().unwrap();
         old_cfg.mouse.enabled != cfg.mouse.enabled
@@ -404,10 +412,10 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
     }
 }
 
-/// 根据 enable_mouse 勾选框状态,冻结或解冻其下方的所有鼠标控件。
+/// 根据 enable_mouse switch 状态,冻结或解冻其下方的所有鼠标控件。
 /// 未启用时控件灰显且不可交互(AppKit 自动处理灰显),避免用户修改无效配置。
 ///
-/// Freeze or unfreeze all mouse controls below the enable_mouse checkbox based on its state.
+/// Freeze or unfreeze all mouse controls below the enable_mouse switch based on its state.
 /// When disabled, controls are greyed out and non-interactive (AppKit handles greying), preventing
 /// users from editing config that won't take effect.
 unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
@@ -495,8 +503,8 @@ pub(crate) extern "C" fn handle_line_count_changed(
     }
 }
 
-/// enable_mouse 勾选框 toggle 回调:冻结/解冻下方控件。
-/// Callback when the enable_mouse checkbox is toggled: freeze/unfreeze the controls below.
+/// enable_mouse switch toggle 回调:冻结/解冻下方控件。
+/// Callback when the enable_mouse switch is toggled: freeze/unfreeze the controls below.
 pub(crate) extern "C" fn handle_enable_mouse_toggle(
     _self: *mut c_void,
     _cmd: Sel,
@@ -619,10 +627,10 @@ pub(crate) extern "C" fn handle_device_changed(
     let new_dev = DEVICE_POPUP_KEYS.lock().unwrap().get(idx as usize).copied();
     *SELECTED_DEVICE.lock().unwrap() = Some(new_dev);
     // 只刷新鼠标页的 per-device 控件,不能走完整 load_settings_from——那会把
-    // enable_mouse 勾选框重置为已保存的 cfg.mouse.enabled,冲掉用户刚勾选
+    // enable_mouse switch 重置为已保存的 cfg.mouse.enabled,冲掉用户刚勾选
     // 但尚未点 OK 的修改(启用鼠标控制是全局设置,切换设备不应动它)。
     // Only refresh the mouse page's per-device controls -- a full load_settings_from would
-    // reset the enable_mouse checkbox to the saved cfg.mouse.enabled, wiping the user's
+    // reset the enable_mouse switch to the saved cfg.mouse.enabled, wiping the user's
     // unsaved toggle (enable mouse control is a global setting; device switches must not
     // touch it).
     let cfg = CONFIG.read().unwrap().clone();
@@ -878,8 +886,6 @@ fn load_settings_from(cfg: &Config) {
             .map(|i| i as isize)
             .unwrap_or(0);
         let _: () = msg_send![ui.locale, selectItemAtIndex: loc_idx];
-        // show_minimized:按 CONFIG.windows.show_minimized 设复选框状态。
-        // show_minimized: set the checkbox state from CONFIG.windows.show_minimized.
         // show_minimized:下拉框 index 0 = 不显示(false), 1 = 显示(true)。
         // show_minimized: popup index 0 = hide (false), 1 = show (true).
         let sm_idx = if cfg.windows.show_minimized { 1 } else { 0 };
@@ -898,8 +904,8 @@ fn load_settings_from(cfg: &Config) {
             _ => 1, // "info" (default)
         };
         let _: () = msg_send![ui.log_level, selectItemAtIndex: ll_idx as isize];
-        // launch_at_login:按 CONFIG.startup.launch_at_login 设勾选框状态。
-        // launch_at_login: set the checkbox state from CONFIG.startup.launch_at_login.
+        // launch_at_login:按 CONFIG.startup.launch_at_login 设 switch 状态。
+        // launch_at_login: set the switch state from CONFIG.startup.launch_at_login.
         let _: () = msg_send![ui.launch_at_login, setState: if cfg.startup.launch_at_login { 1isize } else { 0isize }];
 
         // ===== 鼠标页:按当前选中设备的有效配置(合并"所有鼠标"+该设备)填充控件 =====
@@ -1039,8 +1045,6 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             .get(loc_idx as usize)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "auto".into());
-        // show_minimized:复选框 state(1=on / 0=off)。
-        // show_minimized: checkbox state (1=on / 0=off).
         // show_minimized:下拉框 index 0 = 不显示(false), 1 = 显示(true)。
         // show_minimized: popup index 0 = hide (false), 1 = show (true).
         let sm_idx: isize = msg_send![ui.show_minimized, indexOfSelectedItem];
@@ -1061,8 +1065,8 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             _ => "info", // index 1 or out-of-range
         }
         .into();
-        // launch_at_login:勾选框 state(1=on / 0=off)。
-        // launch_at_login: checkbox state (1=on / 0=off).
+        // launch_at_login:switch state(1=on / 0=off)。
+        // launch_at_login: switch state (1=on / 0=off).
         let la_state: isize = msg_send![ui.launch_at_login, state];
         cfg.startup.launch_at_login = la_state == 1;
 
@@ -1095,12 +1099,12 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         let idx = idx.unwrap_or(cfg.mouse.profiles.len() - 1);
         let p = &mut cfg.mouse.profiles[idx];
 
-        // reverse_scroll:勾选框 state(1=on / 0=off)。
-        // reverse_scroll: checkbox state (1=on / 0=off).
+        // reverse_scroll:switch state(1=on / 0=off)。
+        // reverse_scroll: switch state (1=on / 0=off).
         let ns_state: isize = msg_send![ui.reverse_scroll, state];
         p.reverse_scroll = Some(ns_state == 1);
-        // disable_pointer_accel:勾选框 state(1=on / 0=off)。
-        // disable_pointer_accel: checkbox state (1=on / 0=off).
+        // disable_pointer_accel:switch state(1=on / 0=off)。
+        // disable_pointer_accel: switch state (1=on / 0=off).
         let dpa_state: isize = msg_send![ui.disable_pointer_accel, state];
         p.pointer = Some(PartialPointerSection {
             disable_acceleration: Some(dpa_state == 1),
@@ -1268,10 +1272,31 @@ fn create_settings_window() {
         // so content adjusts with the window. Set a minimum size to avoid overlap.
         let _: () = msg_send![window, setMinSize: NSSize::new(450.0, 400.0)];
         let content: *mut AnyObject = msg_send![window, contentView];
-        // 用 contentView 的实际高度做布局(标题栏会占掉一部分,不能直接用窗口高度)。
-        // Layout against the contentView's real height (the title bar eats part of it).
+        // content_h 只用于容器视图的满高尺寸(翻转 mask 后覆盖整个窗口);
+        // 顶部锚定行的有效高度在翻转后用 layout_h 取(见下)。
+        // content_h is only used for full-height containers (they cover the whole window after
+        // the mask flip); top-anchored rows use layout_h measured after the flip (see below).
         let content_frame: NSRect = msg_send![content, frame];
         let content_h = content_frame.size.height;
+
+        // 去掉红绿灯下方的标题栏分隔线:切到 fullSizeContentView + 透明标题栏后,
+        // 内容区延伸到标题栏,AppKit 不再绘制那条 hairline;隐藏标题文字(系统设置同款观感)。
+        // 注意:翻转 mask 前 contentView 可能尚未排版(未显示时返回全窗高度,实测 macOS 26
+        // 上就是 690),所以不能在翻转前量有效高度。翻转后用 contentLayoutRect 量
+        // 「红绿灯条带以下的内容可用区」(macOS 11+,部署目标 11.0 直接可用;min 兜底)。
+        // 顶部锚定的行全部以 layout_h 定位,避免内容顶进红绿灯条带。
+        // Remove the hairline under the traffic lights: with fullSizeContentView + a transparent
+        // title bar the content extends into the title bar and AppKit stops drawing the separator;
+        // the title text is hidden (System Settings look). The contentView must NOT be measured
+        // before the flip -- an unlaid-out window reports the full height (690 on macOS 26 in
+        // practice). After the flip, contentLayoutRect (macOS 11+; min target is 11.0) gives the
+        // real layout area below the traffic-light strip; .min() guards a degenerate result.
+        // All top-anchored rows are laid out against layout_h so nothing collides with the lights.
+        let _: () = msg_send![window, setTitlebarAppearsTransparent: true];
+        let _: () = msg_send![window, setStyleMask: style | (1 << 15)]; // NSWindowStyleMaskFullSizeContentView
+        let _: () = msg_send![window, setTitleVisibility: 1isize]; // NSWindowTitleHidden
+        let layout_rect: NSRect = msg_send![window, contentLayoutRect];
+        let layout_h = layout_rect.size.height.min(content_h);
 
         let mut ui = SettingsUi {
             window,
@@ -1365,7 +1390,7 @@ fn create_settings_window() {
         // added before the buttons so button titles draw on top of it.
         let btn_w = sidebar_w - 24.0;
         let btn_h = 28.0;
-        let btn_y0 = content_h - 12.0 - 30.0;
+        let btn_y0 = layout_h - 12.0 - 30.0;
         let highlight: *mut AnyObject = msg_send![class!(NSView), alloc];
         let highlight: *mut AnyObject = msg_send![highlight, initWithFrame: NSRect::new(NSPoint::new(12.0, btn_y0), NSSize::new(btn_w, btn_h))];
         let _: () = msg_send![highlight, setAutoresizingMask: 12u64]; // 贴顶、贴左 / top- and left-anchored
@@ -1436,7 +1461,7 @@ fn create_settings_window() {
         ui.mouse_view = mouse_view;
 
         // ===== 通用页内容 general page content =====
-        let mut y = content_h - 12.0; // 顶部光标:下一个元素的底边 y / top cursor (bottom y of next element)
+        let mut y = layout_h - 12.0; // 顶部光标:下一个元素的底边 y / top cursor (bottom y of next element)
 
         // --- Accessibility 权限警告条(通用页顶部覆盖;仅缺权限时显示,show_settings 里按 setHidden 切换) ---
         // --- Accessibility permission warning banner (floats at the top of General; shown only
@@ -1451,7 +1476,7 @@ fn create_settings_window() {
         let banner: *mut AnyObject = msg_send![
             banner,
             initWithFrame: NSRect::new(
-                NSPoint::new(0.0, content_h - 12.0 - banner_h),
+                NSPoint::new(0.0, layout_h - 12.0 - banner_h),
                 NSSize::new(content_w, banner_h)
             )
         ];
@@ -1681,8 +1706,8 @@ fn create_settings_window() {
             content_w - 24.0,
         );
         y -= 8.0 + row_h;
-        // 开机自启勾选框:标题留空(左侧 row label 已说明),仅放一个开关。
-        // Launch-at-login checkbox: empty title (the row label on the left already describes it).
+        // 开机自启开关:标题留空(左侧 row label 已说明),仅放一个 switch。
+        // Launch-at-login switch: no title (the row label on the left already describes it).
         ui.launch_at_login = add_row(
             general_view,
             label_x,
@@ -1690,11 +1715,11 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_launch_at_login"),
-            make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
+            make_switch(ctrl_x, y, row_h, false),
         );
 
         // ===== 实验性页内容 experimental page content =====
-        let mut y = content_h - 12.0;
+        let mut y = layout_h - 12.0;
 
         // 顶部说明文字(次级标签色、小字号、自动换行)。
         // Top note (secondary label color, small font, word-wrapping).
@@ -1780,7 +1805,7 @@ fn create_settings_window() {
         );
 
         // ===== 鼠标页内容 mouse page content =====
-        let mut y = content_h - 12.0;
+        let mut y = layout_h - 12.0;
 
         // --- 启用鼠标控制(总开关,置于最顶) / Enable mouse control (topmost) ---
         y -= 8.0 + row_h;
@@ -1791,10 +1816,10 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_enable_mouse"),
-            make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
+            make_switch(ctrl_x, y, row_h, false),
         );
-        // 勾选框 toggle 时实时更新 OK 按钮标题(确认 vs 确认并重启)。
-        // Update OK button title in real time when checkbox toggles (OK vs OK && Restart).
+        // switch toggle 时实时更新 OK 按钮标题(确认 vs 确认并重启)。
+        // Update OK button title in real time when the switch toggles (OK vs OK && Restart).
         let _: () = msg_send![ui.enable_mouse, setTarget: target];
         let _: () = msg_send![ui.enable_mouse, setAction: sel!(handleEnableMouseToggle:)];
 
@@ -1889,8 +1914,8 @@ fn create_settings_window() {
             content_w - 24.0,
         );
         y -= 8.0 + row_h;
-        // reverse_scroll 勾选框:标题留空(左侧 row label 已说明),仅放一个开关。
-        // reverse_scroll checkbox: empty title (the row label on the left already describes it).
+        // reverse_scroll 开关:标题留空(左侧 row label 已说明),仅放一个 switch。
+        // reverse_scroll switch: no title (the row label on the left already describes it).
         ui.reverse_scroll = add_row(
             mouse_view,
             label_x,
@@ -1898,7 +1923,7 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_reverse_scroll"),
-            make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
+            make_switch(ctrl_x, y, row_h, false),
         );
 
         // --- 指针 Pointer ---
@@ -1911,8 +1936,8 @@ fn create_settings_window() {
             content_w - 24.0,
         );
         y -= 8.0 + row_h;
-        // disable_pointer_accel 勾选框:禁用系统鼠标加速,光标 1:1 线性跟踪。
-        // disable_pointer_accel checkbox: disable system pointer acceleration for 1:1 linear
+        // disable_pointer_accel 开关:禁用系统鼠标加速,光标 1:1 线性跟踪。
+        // disable_pointer_accel switch: disable system pointer acceleration for 1:1 linear
         // cursor tracking.
         ui.disable_pointer_accel = add_row(
             mouse_view,
@@ -1921,7 +1946,7 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_disable_pointer_accel"),
-            make_checkbox(ctrl_x, y, ctrl_w, row_h, "", false),
+            make_switch(ctrl_x, y, row_h, false),
         );
 
         // banner 最后添加:作为 general_view 的最后一个 subview,保证在内容之上(缺权限时覆盖顶部)。
