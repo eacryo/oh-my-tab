@@ -1005,16 +1005,12 @@ fn main() {
     STATUS_EVENT_TX.set(event_tx).ok();
 
     // 7b. Start the mouse event tap only if enabled in config.
-    // 鼠标事件 tap:仅在配置启用时启动。
+    // 鼠标事件 tap:仅在配置启用时启动(start 幂等,日志在 mouse::start 内)。
+    // Mouse event tap: start only if enabled (start is idempotent; logging lives inside).
     let mouse_enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
-    let _mouse_monitor = if mouse_enabled {
-        let monitor = mouse::start();
-        log_info!("Mouse control enabled.");
-        Some(monitor)
-    } else {
-        log_info!("Mouse control disabled.");
-        None
-    };
+    if mouse_enabled {
+        mouse::start();
+    }
 
     // 7c. Apply pointer settings (disable system acceleration if configured).
     // 指针设置(配置了禁用系统加速时立即生效)。

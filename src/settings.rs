@@ -394,24 +394,13 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
     hide_settings();
 
     if needs_restart {
-        // 新进程读取已保存的配置,自动启用/停用鼠标 event tap。
-        // The new process reads the saved config and auto-stops/starts the mouse tap.
-        let exe = std::env::current_exe().expect("failed to get executable path");
-        let _ = std::process::Command::new(exe).spawn();
-        std::process::exit(0);
-    }
-}
-
-/// 检查 enable_mouse 勾选框状态与已保存配置是否一致,不一致时将 OK 按钮改为"确认并重启"。
-/// Check if the enable_mouse checkbox state matches the saved config; if not, change OK to
-/// "OK && Restart".
-unsafe fn update_ok_button_title(ui: &SettingsUi) {
-    let state: isize = msg_send![ui.enable_mouse, state];
-    let saved = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
-    if (state == 1) != saved {
-        set_control_title(ui.ok_button, &t("settings.btn_ok_restart"));
-    } else {
-        set_control_title(ui.ok_button, &t("settings.btn_ok"));
+        // 运行时热切换鼠标 event tap,不再 spawn 新进程(避免孤儿进程)。
+        // Hot-switch the mouse event tap at runtime; no more process spawn (avoids orphans).
+        if cfg.mouse.enabled {
+            crate::mouse::start();
+        } else {
+            crate::mouse::stop();
+        }
     }
 }
 
@@ -506,9 +495,8 @@ pub(crate) extern "C" fn handle_line_count_changed(
     }
 }
 
-/// enable_mouse 勾选框 toggle 回调:实时更新 OK 按钮标题 + 冻结/解冻下方控件。
-/// Callback when the enable_mouse checkbox is toggled: update OK button title + freeze/unfreeze
-/// the controls below.
+/// enable_mouse 勾选框 toggle 回调:冻结/解冻下方控件。
+/// Callback when the enable_mouse checkbox is toggled: freeze/unfreeze the controls below.
 pub(crate) extern "C" fn handle_enable_mouse_toggle(
     _self: *mut c_void,
     _cmd: Sel,
@@ -517,7 +505,6 @@ pub(crate) extern "C" fn handle_enable_mouse_toggle(
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
-            update_ok_button_title(u);
             update_mouse_controls_enabled(u);
         }
     }
@@ -829,7 +816,6 @@ pub(crate) extern "C" fn handle_restore_defaults(
     // an appearance/layout/shortcut setting, so Restore Defaults must not reset it. Not saved
     // here: only used to preview-fill the form; the real save happens in on_settings_ok.
     let preserved_launch_at_login = CONFIG.read().unwrap().startup.launch_at_login;
-    let old_enabled = CONFIG.read().unwrap().mouse.enabled;
     let mut defaults = Config::default();
     defaults.startup.launch_at_login = preserved_launch_at_login;
 
@@ -837,20 +823,6 @@ pub(crate) extern "C" fn handle_restore_defaults(
     // Reset the mouse-page device selection (first device if any; clear if none), then refill.
     *SELECTED_DEVICE.lock().unwrap() = None;
     load_settings_from(&defaults);
-
-    // 若默认 mouse.enabled 与当前不同,表单会显示为默认值,需要重启才生效 -> OK 改"确认并重启"。
-    // If the default mouse.enabled differs from the current one, the form now shows the default
-    // and a restart is needed -> OK becomes "OK && Restart".
-    let new_enabled = defaults.mouse.enabled;
-    unsafe {
-        if let Some(ui) = SETTINGS_UI.lock().unwrap().as_ref() {
-            if old_enabled != new_enabled {
-                set_control_title(ui.ok_button, &t("settings.btn_ok_restart"));
-            } else {
-                update_ok_button_title(ui);
-            }
-        }
-    }
     log_info!("Config form reset to defaults (not saved until OK).");
 }
 
@@ -955,9 +927,6 @@ fn load_settings_from(cfg: &Config) {
         // Rebuild the device popup (refreshed on each settings open to reflect hot-plug).
         rebuild_device_popup(ui);
 
-        // 每次打开设置时,同步 OK 按钮标题(可能因配置变化而需要重启)。
-        // Sync OK button title on each settings open (config changes may require restart).
-        update_ok_button_title(ui);
         // 根据 enable_mouse 状态冻结/解冻下方控件。
         // Freeze/unfreeze the controls below based on the enable_mouse state.
         update_mouse_controls_enabled(ui);

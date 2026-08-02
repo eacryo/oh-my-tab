@@ -156,6 +156,7 @@ extern "C" {
     );
     pub(crate) fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     pub(crate) fn CFRunLoopRun();
+    pub(crate) fn CFRunLoopStop(rl: CFRunLoopRef);
 
     pub(crate) static kCFRunLoopDefaultMode: CFStringRef;
 }
@@ -182,6 +183,15 @@ const RETRY_MAX: u32 = 40;
 /// # Safety
 /// 调用方必须在专用线程上调用(后续 CFRunLoopRun 会阻塞该线程)。
 /// Caller must invoke on a dedicated thread (CFRunLoopRun will block it afterwards).
+///
+/// `cancel` 为可选取消标志:置位时重试循环提前退出(用于运行时停用鼠标 tap,
+/// 避免重试期间 join 阻塞调用线程)。None 表示不取消(如键盘 tap,App 生命周期内常驻)。
+///
+/// `cancel` is an optional cancellation flag: when set, the retry loop bails out early
+/// (used when stopping the mouse tap at runtime so join() doesn't block the caller during
+/// the retry window). None means never cancel (e.g. the keyboard tap, resident for the app's
+/// lifetime).
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn create_tap_with_retry(
     location: i32,
     placement: i32,
@@ -190,6 +200,7 @@ pub(crate) unsafe fn create_tap_with_retry(
     callback: CGEventTapCallBack,
     user_info: *mut c_void,
     log_name: &str,
+    cancel: Option<&'static std::sync::atomic::AtomicBool>,
 ) -> Option<CFMachPortRef> {
     let mut tap = CGEventTapCreate(location, placement, options, mask, callback, user_info);
 
@@ -207,6 +218,12 @@ pub(crate) unsafe fn create_tap_with_retry(
         let mut granted = false;
         for _ in 0..RETRY_MAX {
             std::thread::sleep(RETRY_INTERVAL);
+            // 取消请求(运行时停用):立即放弃,线程正常结束。
+            // Stop requested (runtime disable): bail out so the thread exits promptly.
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                log_info!("[{}] Event tap cancelled by stop request.", log_name);
+                return None;
+            }
             if has_accessibility_permission() {
                 tap = CGEventTapCreate(location, placement, options, mask, callback, user_info);
                 if !tap.is_null() {
@@ -272,6 +289,9 @@ pub(crate) fn start_event_tap_thread(
             callback,
             user_info as *mut c_void,
             log_name,
+            // 键盘 tap 常驻,不取消(App 退出才停)。
+            // Keyboard tap is resident; never cancelled (only app exit stops it).
+            None,
         );
 
         if tap.is_none() {
