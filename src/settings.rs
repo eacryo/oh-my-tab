@@ -1142,6 +1142,45 @@ extern "C" fn settings_window_perform_close(_self: *mut c_void, _cmd: Sel, _send
     hide_settings();
 }
 
+// Cmd+Q 退出的常量:NSEventModifierFlagCommand = 1 << 20,ANSI Q 的 keyCode = 12。
+// Constants for Cmd+Q handling: NSEventModifierFlagCommand = 1 << 20, ANSI Q keyCode = 12.
+const NSEVENT_MODIFIER_FLAG_COMMAND: u64 = 1 << 20;
+const KEYCODE_Q: u16 = 12;
+
+/// 设置窗口的 performKeyEquivalent: 重写:key window 时拦截 Cmd+Q 退出 app。
+/// 组合键(Cmd+...)的分发走 performKeyEquivalent: 链路(key window responder chain 先于
+/// mainMenu)。设置窗口打开时 app 激活且窗口是 key window,Cmd+Q 必然到达这里——
+/// 不依赖 mainMenu 分发(accessory app 的 mainMenu 对状态栏菜单不生效,这是之前的坑)。
+/// 非 Cmd+Q 的组合键透传给 super,保证文本编辑等默认行为不受影响。
+///
+/// Override of performKeyEquivalent: on the settings window: intercept Cmd+Q while this
+/// window is key. Command-combo dispatch goes through performKeyEquivalent: (key-window
+/// responder chain before mainMenu). With the settings window open the app is active and the
+/// window is key, so Cmd+Q is guaranteed to land here -- no reliance on mainMenu dispatch
+/// (which doesn't work for status-bar menus on accessory apps, the earlier pitfall).
+/// Other command combos fall through to super so text editing etc. keeps working.
+extern "C" fn settings_window_perform_key_equivalent(
+    _self: *mut c_void,
+    _cmd: Sel,
+    event: *mut AnyObject,
+) -> bool {
+    unsafe {
+        let keycode: u16 = msg_send![event, keyCode];
+        let flags: u64 = msg_send![event, modifierFlags];
+        if keycode == KEYCODE_Q && (flags & NSEVENT_MODIFIER_FLAG_COMMAND) != 0 {
+            // 与菜单 Quit 同路径:恢复指针加速 + terminate。sender 传 null 即可。
+            // Same path as the menu Quit item: restore pointer acceleration + terminate.
+            crate::menu::handle_quit(_self, sel!(handleQuit:), std::ptr::null_mut());
+            return true;
+        }
+        let handled: bool = msg_send![
+            super(_self as *mut AnyObject, objc2::runtime::AnyClass::get(c"NSWindow").unwrap()),
+            performKeyEquivalent: event
+        ];
+        handled
+    }
+}
+
 struct SettingsWindowClass(*mut AnyObject);
 unsafe impl Send for SettingsWindowClass {}
 unsafe impl Sync for SettingsWindowClass {}
@@ -1160,6 +1199,13 @@ fn settings_window_class() -> *mut AnyObject {
                 sel!(performClose:),
                 settings_window_perform_close as *mut c_void,
                 types.as_ptr(),
+            );
+            let types_key = CString::new("B@:@").unwrap(); // -performKeyEquivalent:(NSEvent*) -> BOOL
+            class_addMethod(
+                cls,
+                sel!(performKeyEquivalent:),
+                settings_window_perform_key_equivalent as *mut c_void,
+                types_key.as_ptr(),
             );
             objc_registerClassPair(cls);
             SettingsWindowClass(cls)

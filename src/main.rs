@@ -782,7 +782,11 @@ fn setup_status_bar() {
 
         // Quit item
         let quit_title = make_nsstring(&t("menu.quit"));
-        let quit_key = make_nsstring("");
+        // 绑定 Cmd+Q:仅在本 app 为前台(如设置窗口打开)时生效——菜单栏常驻 app
+        // 在后台时 Cmd+Q 由当前前台 app 处理,这是 macOS 语义。
+        // Bind Cmd+Q: only effective while this app is frontmost (e.g. settings window open) --
+        // when it's a background menu-bar app, Cmd+Q goes to the frontmost app per macOS semantics.
+        let quit_key = make_nsstring("q");
         let quit_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let quit_item: *mut AnyObject = msg_send![quit_item, initWithTitle: quit_title, action: sel!(handleQuit:), keyEquivalent: quit_key];
         CFRelease(quit_title as *const c_void);
@@ -805,6 +809,16 @@ fn setup_status_bar() {
         });
 
         let _: () = msg_send![status_item, setMenu: menu];
+
+        // 同时设为 mainMenu:让 AppKit 的 Cmd+Q keyEquivalent 分发能找到 Quit 项
+        // (accessory app 的 mainMenu 不会显示在菜单栏最左侧——那里只显示 regular app
+        // 的菜单,但快捷键路由仍生效,同 LinearMouse 的 storyboard mainMenu 机制)。
+        // Also set as mainMenu so AppKit's Cmd+Q keyEquivalent dispatch can find the Quit item.
+        // An accessory app's mainMenu is NOT shown in the menu bar's app area (that only shows
+        // regular apps' menus), but key-equivalent routing still works -- same mechanism as
+        // LinearMouse's storyboard mainMenu.
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![nsapp, setMainMenu: menu];
 
         // Pump run loop to let SystemUIServer connect
         for _ in 0..10 {
