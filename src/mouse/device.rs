@@ -266,20 +266,34 @@ fn manager_static() -> &'static Mutex<*mut c_void> {
 
 /// IOHIDManager 回调:设备接入/移除时,强制重建注册表(重建 IOHIDEventSystemClient)。
 /// 蓝牙鼠标休眠断连重连正是走这里——重连触发 removal+matching 回调,重建后归因链恢复,
-/// 不必等下一次归因失败才自愈。
+/// 不必等下一次归因失败才自愈。重建后还要重新应用指针加速设置:加速度属性写在旧的
+/// IOHIDServiceClient 实例上,断连后随实例消失,新实例恢复默认(加速度重新生效),必须
+/// 在重连时重新 apply,否则"禁用指针加速"失效,只能靠用户进设置手动点一次恢复。
 ///
 /// IOHIDManager callback: on device attach/detach, force-rebuild the registry (recreate the
 /// IOHIDEventSystemClient). A Bluetooth disconnect/reconnect fires these callbacks; the rebuild
-/// restores the attribution chain without waiting for the next failed attribution.
+/// restores the attribution chain without waiting for the next failed attribution. Pointer
+/// acceleration must also be re-applied: the acceleration properties live on the old
+/// IOHIDServiceClient instance, which disappears on disconnect; the new instance reverts to
+/// defaults (acceleration back on). Without re-applying on reconnect, "disable pointer
+/// acceleration" silently breaks until the user re-toggles it in Settings.
 unsafe extern "C" fn device_change_callback(
     _context: *mut c_void,
     _result: i32,
     _sender: *mut c_void,
     _callback: *mut c_void,
 ) {
-    let mut reg = registry().lock().unwrap();
-    enumerate_locked(&mut reg, true);
-    log_debug!("[device] plug/unplug event: re-enumerated {} device(s).", reg.devices.len());
+    {
+        let mut reg = registry().lock().unwrap();
+        enumerate_locked(&mut reg, true);
+        log_debug!("[device] plug/unplug event: re-enumerated {} device(s).", reg.devices.len());
+    }
+    // 释放 REGISTRY 锁后再 apply(pointer::apply 自建 client、不锁 REGISTRY,但避免
+    // 持锁期间做重活)。apply 内部检查 mouse.enabled,未启用时自动跳过;幂等可重复调用。
+    // Drop the REGISTRY lock before applying (pointer::apply creates its own client and never
+    // locks REGISTRY, but avoid doing heavy work while holding the lock). apply checks
+    // mouse.enabled internally and skips when disabled; idempotent, safe to call repeatedly.
+    crate::mouse::pointer::apply();
 }
 
 /// 启动设备插拔监听:创建 IOHIDManager,注册接入/移除回调,挂到指定 RunLoop。
