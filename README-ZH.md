@@ -21,7 +21,7 @@
 - TOML 配置,校验后可从菜单**热重载**。
 - 手写、零依赖的国际化(英文、简体中文、繁体中文),自动检测系统语言并实时跟随。
 - 每次启动一个日志文件,自动保留 30 天(见[日志](#日志))。
-- **鼠标控制**(可选,默认关闭):反向滚动、滚动模式(默认 / 按行(每 tick 行数)/ 平滑(13 种物理预设))、禁用指针加速 -- 且**按鼠标设备分别配置**(见[配置](#配置))。
+- **鼠标控制**(可选,默认关闭):反向滚动、滚动模式(默认 / 按行(每 tick 行数)/ 平滑(13 种物理预设))、禁用指针加速 -- 且**按鼠标设备分别配置**(见[配置](#配置))。此功能参考并借鉴了 [LinearMouse](https://github.com/linearmouse/linearmouse),用纯 Rust 从零重写实现(见[致谢](#致谢))。
 
 ## 截图
 
@@ -267,6 +267,17 @@ disable_acceleration = true
 
 鼠标设置也可以在设置窗口中调整(用**设备下拉框**选中某款已连接的鼠标,编辑它那一层)。开启 `mouse.enabled` 需要重启应用(OK 按钮会提示)。
 
+### 设备识别逻辑(以及可能遇到的问题)
+
+判断某设备是否为鼠标/触控板:看它是否符合 Generic Desktop 页的 Pointer(1,1)、Mouse(1,2) 或 Trackpad(1,5) 用途 —— 用公开 API `IOHIDServiceClientConformsTo` 检查,它遍历设备完整的 `DeviceUsagePairs`,而不是单个 `PrimaryUsage` 值。
+
+这很关键,因为有些真实鼠标的主用途会被系统报错:例如 **ATK A9 SE**(Nearlink/星闪鼠标)在系统里 `PrimaryUsage = 6(Keyboard)`,系统设置会把它显示为键盘——但它的 `DeviceUsagePairs` 里同时声明了 Mouse(1,2),`ConformsTo` 能识别出来。如果只看 `PrimaryUsage`,这类设备会被静默丢弃,它们的事件会被错误地套到"最近使用"的档位上。
+
+已知的副作用(与 LinearMouse 行为一致):
+
+- **少数键盘的 HID 描述符也声明了多余的 Mouse/Pointer 用途**(如 Kzzi-i75),它们也会出现在设备下拉框里。这纯粹是显示层面:事件归因按精确的 sender ID 匹配(`CGEvent → IOHIDEvent → sender ID → IOHIDServiceClient`),键盘事件永远不会被解析到鼠标档位。
+- 设备下拉框在每次打开设置窗口时刷新;热插拔的设备会在下次打开时出现。
+
 ## 日志
 
 日志是异步的,设计上**绝不阻塞 UI / 事件循环**。
@@ -308,6 +319,10 @@ disable_acceleration = true
 
 启动时预缓存,并在 `NSWorkspaceDidLaunchApplicationNotification` 时补提取。可从菜单(*Clear Icon Cache*)清空。
 
+
+## 致谢
+
+**鼠标控制**功能(反向滚动、滚动模式、平滑滚动物理引擎、按设备配置、禁用指针加速)参考并借鉴了 [LinearMouse](https://github.com/linearmouse/linearmouse)。我们用纯 Rust(通过 `objc2` FFI 直接调 AppKit,无 Swift 桥接)从零重写了它的核心功能,并将其融入 oh-my-tab 的配置模型。衷心感谢原作者以及 LinearMouse 项目做出的优秀工作。
 
 ## 仓库
 

@@ -195,7 +195,22 @@ extern "C" fn on_app_launched(_self: *mut c_void, _cmd: Sel, notification: *mut 
     }
     thread::spawn(move || unsafe {
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-        let _ = extract_icon_to_cache(pid);
+        match extract_icon_to_cache(pid) {
+            Some(_) => log_debug!("app-launch icon cached: pid={}", pid),
+            None => {
+                // 刚启动瞬间 AppKit 的 icon 可能尚未就绪(app.icon 返回 nil),导致
+                // 提取失败且无缓存留下——之后浮窗显示字母占位。延迟 ~1s 重试一次。
+                // The icon may not be ready the instant the app launches (app.icon nil),
+                // silently failing the extract and leaving the letter placeholder in the
+                // switcher. Retry once after ~1s.
+                log_debug!(
+                    "app-launch icon extract failed for pid={}, retrying in 1s",
+                    pid
+                );
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let _ = extract_icon_to_cache(pid);
+            }
+        }
         let _: () = msg_send![pool, drain];
     });
 }

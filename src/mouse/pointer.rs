@@ -165,15 +165,16 @@ unsafe fn disable() {
 
     for i in 0..count {
         let service = CFArrayGetValueAtIndex(services, i) as *mut c_void;
-        let page = prop_int(service, KEY_PRIMARY_USAGE_PAGE);
-        let usage = prop_int(service, KEY_PRIMARY_USAGE);
-        // 只处理指针/鼠标/触控板,跳过键盘等其他 Generic Desktop 设备。
-        // Only handle pointer/mouse/trackpad; skip keyboards and other Generic Desktop devices.
-        if page != USAGE_PAGE_GENERIC_DESKTOP
-            || !(usage == USAGE_GD_POINTER
-                || usage == USAGE_GD_MOUSE
-                || usage == USAGE_GD_TRACKPAD)
-        {
+        // 与 device.rs 的枚举判定保持一致:用 ConformsTo 而不是 PrimaryUsage 单值。
+        // 有些真实鼠标(如 ATK A9 SE 这类 Nearlink/星闪设备)PrimaryUsage 被报成 Keyboard,
+        // 白名单 {1,2,5} 会漏掉它们;ConformsTo 检查整个 DeviceUsagePairs。
+        // Same pointer-mouse-trackpad test as device.rs enumeration: use ConformsTo, not the
+        // PrimaryUsage scalar -- some real mice (e.g. ATK A9 SE Nearlink) report PrimaryUsage =
+        // Keyboard, which a {1,2,5} whitelist would drop; ConformsTo inspects DeviceUsagePairs.
+        let is_pointer = IOHIDServiceClientConformsTo(service, 1, USAGE_GD_POINTER as u32) != 0
+            || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_MOUSE as u32) != 0
+            || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_TRACKPAD as u32) != 0;
+        if !is_pointer {
             continue;
         }
         let name = device_name(service);

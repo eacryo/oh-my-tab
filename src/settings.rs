@@ -640,18 +640,31 @@ pub(crate) extern "C" fn handle_device_changed(
     _cmd: Sel,
     sender: *mut c_void,
 ) {
+    let popup = sender as *mut AnyObject;
+    let idx: isize = unsafe { msg_send![popup, indexOfSelectedItem] };
+    // DEVICE_POPUP_KEYS: Vec<DeviceKey>;取选中项对应的 key(均为具体设备,无通配项)。
+    // DEVICE_POPUP_KEYS: Vec<DeviceKey>; get the key for the selected item (all concrete
+    // devices; no wildcard entry).
+    let new_dev = DEVICE_POPUP_KEYS.lock().unwrap().get(idx as usize).copied();
+    *SELECTED_DEVICE.lock().unwrap() = Some(new_dev);
+    // 只刷新鼠标页的 per-device 控件,不能走完整 load_settings_from——那会把
+    // enable_mouse 勾选框重置为已保存的 cfg.mouse.enabled,冲掉用户刚勾选
+    // 但尚未点 OK 的修改(启用鼠标控制是全局设置,切换设备不应动它)。
+    // Only refresh the mouse page's per-device controls -- a full load_settings_from would
+    // reset the enable_mouse checkbox to the saved cfg.mouse.enabled, wiping the user's
+    // unsaved toggle (enable mouse control is a global setting; device switches must not
+    // touch it).
+    let cfg = CONFIG.read().unwrap().clone();
+    let resolved = resolve_selected_from(&cfg);
     unsafe {
-        let popup = sender as *mut AnyObject;
-        let idx: isize = msg_send![popup, indexOfSelectedItem];
-        // DEVICE_POPUP_KEYS: Vec<DeviceKey>;取选中项对应的 key(均为具体设备,无通配项)。
-        // DEVICE_POPUP_KEYS: Vec<DeviceKey>; get the key for the selected item (all concrete
-        // devices; no wildcard entry).
-        let new_dev = DEVICE_POPUP_KEYS.lock().unwrap().get(idx as usize).copied();
-        *SELECTED_DEVICE.lock().unwrap() = Some(new_dev);
-        // 刷新其余控件为新设备的有效值(不重建 popup 本身,避免循环)。
-        // Refresh the other controls with the new device's effective values (don't rebuild the
-        // popup itself, avoiding a cycle).
-        load_settings_values_no_device_popup();
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            fill_mouse_device_controls(u, &resolved);
+            // enable_mouse 勾选状态保持用户当前值;只重算冻结与条件显隐。
+            // Keep the user's current enable_mouse state; only recompute freeze + visibility.
+            update_mouse_controls_enabled(u);
+            update_mode_dependent_visibility(u);
+        }
     }
 }
 
@@ -839,7 +852,7 @@ pub(crate) extern "C" fn handle_restore_defaults(
     // 鼠标页设备选择复位(有设备则回退第一个;无设备则清空),再重填表单。
     // Reset the mouse-page device selection (first device if any; clear if none), then refill.
     *SELECTED_DEVICE.lock().unwrap() = None;
-    load_settings_from(&defaults, true);
+    load_settings_from(&defaults);
 
     // 若默认 mouse.enabled 与当前不同,表单会显示为默认值,需要重启才生效 -> OK 改"确认并重启"。
     // If the default mouse.enabled differs from the current one, the form now shows the default
@@ -863,31 +876,16 @@ pub(crate) extern "C" fn handle_restore_defaults(
 /// Populate settings controls from current CONFIG (refreshed on each open). Rebuilds the device
 /// popup to reflect hot-plug changes.
 fn load_settings_values() {
-    load_settings_values_impl(true);
-}
-
-/// 同 load_settings_values 但不重建设备下拉框。
-/// 供 handle_device_changed 调用:切换设备后刷新其余控件,避免重建 popup 触发循环。
-///
-/// Same as load_settings_values but skips rebuilding the device popup. Called by
-/// handle_device_changed to refresh the other controls after a device switch, avoiding a
-/// popup-rebuild cycle.
-fn load_settings_values_no_device_popup() {
-    load_settings_values_impl(false);
-}
-
-fn load_settings_values_impl(rebuild_device: bool) {
     let cfg = CONFIG.read().unwrap().clone();
-    load_settings_from(&cfg, rebuild_device);
+    load_settings_from(&cfg);
 }
 
-/// 用指定配置填充设置控件(rebuild_device 控制是否重建设备下拉框)。
+/// 用指定配置填充设置控件。
 /// 供正常打开(读 CONFIG)与恢复默认预览(传 Config::default())共用。
 ///
-/// Populate settings controls from a given config (rebuild_device controls whether the device
-/// popup is rebuilt). Shared by normal open (reads CONFIG) and restore-defaults preview
-/// (passes Config::default()).
-fn load_settings_from(cfg: &Config, rebuild_device: bool) {
+/// Populate settings controls from a given config. Shared by normal open (reads CONFIG) and
+/// restore-defaults preview (passes Config::default()).
+fn load_settings_from(cfg: &Config) {
     let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
@@ -956,9 +954,7 @@ fn load_settings_from(cfg: &Config, rebuild_device: bool) {
         // Calibrate SELECTED_DEVICE first (against the current device list; falls back to the
         // first device when uninitialized/unplugged), then resolve, so the UI shows the actually
         // effective device's config (fixes the wrong-profile display on first open).
-        if rebuild_device {
-            ensure_selected_device();
-        }
+        ensure_selected_device();
         // 基于传入 cfg 解析选中设备的有效配置(恢复默认预览时 cfg = Config::default())。
         // Resolve the selected device's effective config from the given cfg (Config::default()
         // during the restore-defaults preview).
@@ -967,42 +963,13 @@ fn load_settings_from(cfg: &Config, rebuild_device: bool) {
         // enable_mouse (master switch) always reads the global flag.
         let _: () =
             msg_send![ui.enable_mouse, setState: if cfg.mouse.enabled { 1isize } else { 0isize }];
-        // reverse_scroll:用有效值。
-        // reverse_scroll: effective value.
-        let _: () = msg_send![ui.reverse_scroll, setState: if resolved.reverse_scroll { 1isize } else { 0isize }];
-        // disable_pointer_accel:用有效值。
-        // disable_pointer_accel: effective value.
-        let _: () = msg_send![ui.disable_pointer_accel, setState: if resolved.disable_acceleration { 1isize } else { 0isize }];
-        // scroll_mode:用有效值。
-        // scroll_mode: effective value.
-        let sm_idx: isize = SCROLL_MODE_VALUES
-            .iter()
-            .position(|v| *v == resolved.scroll_mode.as_str())
-            .map(|i| i as isize)
-            .unwrap_or(0);
-        let _: () = msg_send![ui.scroll_mode, selectItemAtIndex: sm_idx];
-        // line_count:用有效值(滑块)。
-        // line_count: effective value (slider).
-        let _: () = msg_send![ui.line_count, setIntegerValue: resolved.line_count as isize];
-        // 同步滑块右侧数值 label。
-        // Sync the slider's value label.
-        set_field(ui.line_count_value_label, resolved.line_count);
-        // smooth_preset:用有效值。
-        // smooth_preset: effective value.
-        let sp_idx: isize = SMOOTH_PRESET_LABELS
-            .iter()
-            .position(|v| *v == resolved.smooth_preset.as_str())
-            .map(|i| i as isize)
-            .unwrap_or(0);
-        let _: () = msg_send![ui.smooth_preset, selectItemAtIndex: sp_idx];
+        // 填充鼠标页设备相关控件(反转/加速/模式/行数/平滑预设)。
+        // Fill the mouse page's per-device controls (reverse/accel/mode/line count/preset).
+        fill_mouse_device_controls(ui, &resolved);
 
         // 重建设备下拉框(每次打开设置时刷新,反映热插拔)。
-        // 由 handle_device_changed 调用时跳过,避免循环。
         // Rebuild the device popup (refreshed on each settings open to reflect hot-plug).
-        // Skipped when called from handle_device_changed to avoid a cycle.
-        if rebuild_device {
-            rebuild_device_popup(ui);
-        }
+        rebuild_device_popup(ui);
 
         // 每次打开设置时,同步 OK 按钮标题(可能因配置变化而需要重启)。
         // Sync OK button title on each settings open (config changes may require restart).
@@ -1014,6 +981,46 @@ fn load_settings_from(cfg: &Config, rebuild_device: bool) {
         // Refresh the conditional visibility of lines-per-tick / smooth-preset rows by mode.
         update_mode_dependent_visibility(ui);
     }
+}
+
+/// 填充鼠标页的 per-device 控件(反转/禁用加速/模式/行数/平滑预设)。
+/// 供 load_settings_from 与 handle_device_changed 共用。
+///
+/// Fill the mouse page's per-device controls (reverse/disable-accel/mode/line-count/preset).
+/// Shared by load_settings_from and handle_device_changed.
+unsafe fn fill_mouse_device_controls(
+    ui: &SettingsUi,
+    resolved: &crate::mouse::resolve::ResolvedMouse,
+) {
+    // reverse_scroll:用有效值。
+    // reverse_scroll: effective value.
+    let _: () =
+        msg_send![ui.reverse_scroll, setState: if resolved.reverse_scroll { 1isize } else { 0isize }];
+    // disable_pointer_accel:用有效值。
+    // disable_pointer_accel: effective value.
+    let _: () = msg_send![ui.disable_pointer_accel, setState: if resolved.disable_acceleration { 1isize } else { 0isize }];
+    // scroll_mode:用有效值。
+    // scroll_mode: effective value.
+    let sm_idx: isize = SCROLL_MODE_VALUES
+        .iter()
+        .position(|v| *v == resolved.scroll_mode.as_str())
+        .map(|i| i as isize)
+        .unwrap_or(0);
+    let _: () = msg_send![ui.scroll_mode, selectItemAtIndex: sm_idx];
+    // line_count:用有效值(滑块)。
+    // line_count: effective value (slider).
+    let _: () = msg_send![ui.line_count, setIntegerValue: resolved.line_count as isize];
+    // 同步滑块右侧数值 label。
+    // Sync the slider's value label.
+    set_field(ui.line_count_value_label, resolved.line_count);
+    // smooth_preset:用有效值。
+    // smooth_preset: effective value.
+    let sp_idx: isize = SMOOTH_PRESET_LABELS
+        .iter()
+        .position(|v| *v == resolved.smooth_preset.as_str())
+        .map(|i| i as isize)
+        .unwrap_or(0);
+    let _: () = msg_send![ui.smooth_preset, selectItemAtIndex: sp_idx];
 }
 
 /// 从控件收集成 Config(克隆当前 CONFIG,只覆盖表单内字段),并收集错误。
@@ -1236,7 +1243,33 @@ fn create_settings_window() {
         // Content is now paged (General / Experimental); the General page (6 sections, 10 rows)
         // is the tallest, so 600 doesn't fit; +60 -> 660 reserves the Accessibility permission
         // warning banner at the top, and the overlay-position row adds +30 -> 690.
-        let frame = NSRect::new(NSPoint::new(220.0, 180.0), NSSize::new(view_w, 690.0));
+        // 初始位置:主显示器(screens[0])居中。不要用 NSScreen mainScreen(其语义是跟随
+        // 键盘焦点窗口的屏幕,不是主屏,见 overlay_target_screen 的注释)。
+        // Initial position: centered on the primary display (screens[0]). Don't use
+        // NSScreen.mainScreen (it follows the key window, not the primary display; see
+        // overlay_target_screen's note).
+        let win_w = view_w;
+        let win_h = 690.0;
+        let (win_x, win_y) = {
+            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+            let count: usize = msg_send![screens, count];
+            if count > 0 {
+                // objectAtIndex: 的参数编码是 'q'(signed long),必须传 isize。
+                // objectAtIndex: expects 'q' (signed long); pass isize.
+                let s: *mut AnyObject = msg_send![screens, objectAtIndex: 0isize];
+                let f: NSRect = msg_send![s, frame];
+                (
+                    f.origin.x + (f.size.width - win_w) / 2.0,
+                    f.origin.y + (f.size.height - win_h) / 2.0,
+                )
+            } else {
+                (220.0, 180.0)
+            }
+        };
+        let frame = NSRect::new(
+            NSPoint::new(win_x, win_y),
+            NSSize::new(win_w, win_h),
+        );
         let window: *mut AnyObject = msg_send![settings_window_class(), alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
         let ns_title = make_nsstring(&t("settings.window_title"));

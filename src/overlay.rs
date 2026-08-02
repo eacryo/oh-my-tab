@@ -1088,4 +1088,12 @@ pub(crate) fn show_overlay() {
         // Highlight selected card
         refresh_highlight();
     }
+    // 补提取缺失图标(启动时未缓存/启动通知提取失败的应用,如刚启动 icon 未就绪的
+    // LinearMouse)。每次召唤都触发,而不是只在浮窗已可见时连按 Tab——否则这些 app
+    // 会一直显示字母占位,直到用户碰巧连续按 Tab。提取成功会 rebuild_cards 就地刷新。
+    // Backfill missing icons (apps not cached at startup / whose launch-notification extract
+    // failed, e.g. LinearMouse when its icon wasn't ready yet). Runs on every summon instead of
+    // only on repeated Tab while visible -- otherwise such apps show the letter placeholder
+    // until the user happens to press Tab again. Successful extracts rebuild cards in place.
+    extract_uncached_icons();
 }

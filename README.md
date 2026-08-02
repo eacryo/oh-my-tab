@@ -21,7 +21,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 - TOML configuration, validated and **hot-reloadable** from the menu.
 - Handcrafted, zero-dependency i18n (English, Simplified Chinese, Traditional Chinese) with automatic locale detection and live system-language follow.
 - Per-launch log files with automatic 30-day retention (see [Logging](#logging)).
-- **Mouse control** (optional, off by default): scroll reversal, scroll modes (Default / Line with a per-tick line count / Smooth with 13 physics presets), and disabling pointer acceleration — all configurable **per mouse device** (see [Configuration](#configuration)).
+- **Mouse control** (optional, off by default): scroll reversal, scroll modes (Default / Line with a per-tick line count / Smooth with 13 physics presets), and disabling pointer acceleration — all configurable **per mouse device** (see [Configuration](#configuration)). This feature is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse), re-implemented from scratch in pure Rust (see [Credits](#credits)).
 
 ## Screenshots
 
@@ -267,6 +267,17 @@ disable_acceleration = true
 
 Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). Enabling `mouse.enabled` requires an app restart (the OK button reflects this).
 
+### How devices are recognized (and its caveats)
+
+A device is treated as a mouse/trackpad when it **conforms to** the Pointer (1,1), Mouse (1,2), or Trackpad (1,5) usage on the Generic Desktop page — checked via the public `IOHIDServiceClientConformsTo` API, which inspects the device's full `DeviceUsagePairs` rather than a single `PrimaryUsage` value.
+
+This matters because some real mice report an unexpected primary usage: for example, **ATK A9 SE** (a Nearlink/星闪 device) exposes `PrimaryUsage = 6 (Keyboard)`, so macOS shows it as a keyboard in System Settings — but it also declares Mouse (1,2) in its `DeviceUsagePairs`, and `ConformsTo` catches it. Using `PrimaryUsage` alone would silently drop such devices from the picker and force their events onto the "last active" profile.
+
+Known caveats (same behavior as LinearMouse):
+
+- **Some keyboards also declare extra Mouse/Pointer usages** in their HID descriptor (e.g. Kzzi-i75), so they appear in the device picker too. This is cosmetic: event attribution matches by the exact sender ID (`CGEvent → IOHIDEvent → sender ID → IOHIDServiceClient`), so keyboard events never resolve to a mouse profile.
+- The device picker refreshes on every settings-window open; hot-plug is picked up on the next open.
+
 ## Logging
 
 Logging is asynchronous and designed to **never block the UI / event loop**.
@@ -307,6 +318,10 @@ The `.meta` sidecar is the **update signal**. A bundle id stays the same across 
 Keying by bundle id means **PID recycling can never serve another app's stale icon** — the old `{pid}.png` design did exactly that, where a recycled PID would hit a leftover file from a different app. It also means the cache survives oh-my-tab restarts. Non-bundle apps (no bundle id) fall back to a hash of the executable path as the key, and legacy `{pid}.png` files from older versions are migrated away once at startup.
 
 Icons are pre-cached at startup and on `NSWorkspaceDidLaunchApplicationNotification`. The cache can be cleared from the menu (*Clear Icon Cache*).
+
+## Credits
+
+The **mouse control** feature (scroll reversal, scroll modes, smooth-scrolling physics engine, per-device configuration, and pointer-acceleration control) is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse). We re-implemented its core features from scratch in pure Rust (via `objc2` FFI, no Swift bridge) and integrated them into oh-my-tab's configuration model. Many thanks to the original author and the LinearMouse project for the excellent work.
 
 ## Repository
 

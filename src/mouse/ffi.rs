@@ -87,6 +87,23 @@ extern "C" {
         key: *const c_void,
         value: *mut c_void,
     ) -> bool;
+    // 判断 HID service 是否符合某 (usage page, usage) 对(公开 API,系统 SDK 自带)。
+    // 比读 PrimaryUsage 单值可靠:有些真实鼠标(如 ATK A9 SE 这类 Nearlink/星闪设备)
+    // 的 PrimaryUsage 被系统报成 Keyboard(6),但它的 DeviceUsagePairs 声明了 Mouse(1,2),
+    // ConformsTo 能识别真实用途;反之有些键盘也声明了多余的 Mouse 用途,会被一并纳入
+    // (与 LinearMouse 行为一致,归因靠 senderID 精确匹配不受影响)。
+    //
+    // Check whether a HID service conforms to a (usage page, usage) pair (public API from the
+    // system SDK). More reliable than reading PrimaryUsage alone: some real mice (e.g. ATK A9 SE
+    // Nearlink devices) report PrimaryUsage = Keyboard(6), yet declare Mouse(1,2) in their
+    // DeviceUsagePairs, which ConformsTo sees; conversely some keyboards declare extra Mouse
+    // usages and get included too (same behavior as LinearMouse; attribution uses exact senderID
+    // matching, so this doesn't affect correctness).
+    pub(crate) fn IOHIDServiceClientConformsTo(
+        client: *mut c_void,
+        usage_page: u32,
+        usage: u32,
+    ) -> i32;
 }
 
 // ========== CFArray 遍历 / CFArray iteration ==========
@@ -115,12 +132,10 @@ pub(crate) const KEY_POINTER_ACCEL: &str = "HIDPointerAcceleration";
 /// 鼠标加速类型键(旧系统回退)。
 /// Mouse acceleration type key (legacy fallback).
 pub(crate) const KEY_MOUSE_ACCEL: &str = "HIDMouseAcceleration";
-/// 设备主用途页(用于过滤鼠标/触控板)。
-/// Device primary usage page (for filtering mice/trackpads).
+/// 设备主用途页(matching 用:按 Generic Desktop 页过滤后,再用 ConformsTo 判定指针设备)。
+/// Device primary usage page (for matching: filter to the Generic Desktop page, then decide
+/// pointer devices via ConformsTo).
 pub(crate) const KEY_PRIMARY_USAGE_PAGE: &str = "PrimaryUsagePage";
-/// 设备主用途。
-/// Device primary usage.
-pub(crate) const KEY_PRIMARY_USAGE: &str = "PrimaryUsage";
 /// 设备产品名(日志用)。
 /// Device product name (for logs).
 pub(crate) const KEY_PRODUCT: &str = "Product";

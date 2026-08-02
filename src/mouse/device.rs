@@ -187,15 +187,23 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
     let count = CFArrayGetCount(services);
     for i in 0..count {
         let service = CFArrayGetValueAtIndex(services, i) as *mut c_void;
-        let page = prop_int(service, KEY_PRIMARY_USAGE_PAGE).unwrap_or(0);
-        let usage = prop_int(service, KEY_PRIMARY_USAGE).unwrap_or(0);
-        // 只处理指针/鼠标/触控板,跳过键盘等其他 Generic Desktop 设备。
-        // Only handle pointer/mouse/trackpad; skip keyboards and other Generic Desktop devices.
-        if page != USAGE_PAGE_GENERIC_DESKTOP
-            || !(usage == USAGE_GD_POINTER
-                || usage == USAGE_GD_MOUSE
-                || usage == USAGE_GD_TRACKPAD)
-        {
+        // 用 ConformsTo 判断是否指针/鼠标/触控板,不读 PrimaryUsage 单值。
+        // 原因:有些真实鼠标(如 ATK A9 SE 这类 Nearlink/星闪设备)的 PrimaryUsage 被
+        // 系统报成 Keyboard(6),白名单 {1,2,5} 会把它剔除;ConformsTo 检查整个
+        // DeviceUsagePairs,能识别它声明过的 Mouse(1,2)/Pointer(1,1)/Trackpad(1,5)。
+        // 副作用:少数键盘也声明了多余的 Mouse 用途(与 LinearMouse 行为一致),会一并
+        // 纳入;归因靠 senderID 精确匹配,不影响功能正确性。
+        //
+        // Determine pointer/mouse/trackpad via ConformsTo instead of the PrimaryUsage scalar.
+        // Some real mice (e.g. ATK A9 SE Nearlink devices) report PrimaryUsage = Keyboard(6),
+        // and a {1,2,5} whitelist would drop them; ConformsTo inspects the full DeviceUsagePairs
+        // and sees the Mouse(1,2)/Pointer(1,1)/Trackpad(1,5) usages they declare. Side effect:
+        // a few keyboards also declare extra Mouse usages (same as LinearMouse) and get included;
+        // attribution uses exact senderID matching, so this never affects correctness.
+        let is_pointer = IOHIDServiceClientConformsTo(service, 1, USAGE_GD_POINTER as u32) != 0
+            || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_MOUSE as u32) != 0
+            || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_TRACKPAD as u32) != 0;
+        if !is_pointer {
             continue;
         }
         let vid = prop_int(service, KEY_VENDOR_ID).unwrap_or(0) as u32;
