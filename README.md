@@ -29,11 +29,18 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 
 ![Settings](docs/pictures/settings.png)
 
+![Mouse control](docs/pictures/mouse_control.png)
+
 ## Known Issues
 
 If windows are already open when the app starts, their ordering differs from the native Cmd+Tab order. This is because there is no initial window-ordering data; oh-my-tab builds it by continuously observing window changes after launch.
 
 **Dev-mode icon staleness**: when running the raw binary via `cargo run`, the overlay may occasionally show oh-my-tab's own card with the letter placeholder instead of the app icon, and it can persist until the icon cache is cleared. The icon cache is keyed by bundle id with the executable's **mtime** as a staleness fingerprint; in dev mode the binary is relinked on every build, changing its mtime mid-session, which invalidates the cached entry for the running instance. Packaged `.app` builds are unaffected (the binary mtime is stable after install). If you hit this in dev, use *Clear Icon Cache* from the menu or delete `~/Library/Caches/oh-my-tab-icons/`.
+
+**Device recognition caveats**: a device is treated as a mouse/trackpad when it **conforms to** the Pointer (1,1), Mouse (1,2), or Trackpad (1,5) usage on the Generic Desktop page — checked via the public `IOHIDServiceClientConformsTo` API, which inspects the device's full `DeviceUsagePairs` rather than a single `PrimaryUsage` value. This is needed because some real mice report an unexpected primary usage: for example, **ATK A9 SE** (a Nearlink/星闪 device) exposes `PrimaryUsage = 6 (Keyboard)`, so macOS shows it as a keyboard in System Settings — but it also declares Mouse (1,2) in its `DeviceUsagePairs`, and `ConformsTo` catches it. Using `PrimaryUsage` alone would silently drop such devices from the picker and force their events onto the "last active" profile. Known caveats (same behavior as LinearMouse):
+
+- **Some keyboards also declare extra Mouse/Pointer usages** in their HID descriptor (e.g. Kzzi-i75), so they appear in the device picker too. This is cosmetic: event attribution matches by the exact sender ID (`CGEvent → IOHIDEvent → sender ID → IOHIDServiceClient`), so keyboard events never resolve to a mouse profile.
+- The device picker refreshes on every settings-window open; hot-plug is picked up on the next open.
 
 ## Requirements
 
@@ -65,7 +72,7 @@ cargo run         # build + run (takes over the global shortcut)
 cargo clippy      # available, not wired into CI
 ```
 
-`cargo run` launches the raw binary in **dev mode**: logs go to stdout (no log file) and launch-at-login is inactive (SMAppService needs a `.app` bundle). There are **no tests** in the project.
+`cargo run` launches the raw binary in **dev mode**: logs go to both stdout and the log file, and launch-at-login is inactive (SMAppService needs a `.app` bundle). There are **no tests** in the project.
 
 ### Release `.app` + `.dmg`
 
@@ -267,23 +274,12 @@ disable_acceleration = true
 
 Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). Enabling `mouse.enabled` requires an app restart (the OK button reflects this).
 
-### How devices are recognized (and its caveats)
-
-A device is treated as a mouse/trackpad when it **conforms to** the Pointer (1,1), Mouse (1,2), or Trackpad (1,5) usage on the Generic Desktop page — checked via the public `IOHIDServiceClientConformsTo` API, which inspects the device's full `DeviceUsagePairs` rather than a single `PrimaryUsage` value.
-
-This matters because some real mice report an unexpected primary usage: for example, **ATK A9 SE** (a Nearlink/星闪 device) exposes `PrimaryUsage = 6 (Keyboard)`, so macOS shows it as a keyboard in System Settings — but it also declares Mouse (1,2) in its `DeviceUsagePairs`, and `ConformsTo` catches it. Using `PrimaryUsage` alone would silently drop such devices from the picker and force their events onto the "last active" profile.
-
-Known caveats (same behavior as LinearMouse):
-
-- **Some keyboards also declare extra Mouse/Pointer usages** in their HID descriptor (e.g. Kzzi-i75), so they appear in the device picker too. This is cosmetic: event attribution matches by the exact sender ID (`CGEvent → IOHIDEvent → sender ID → IOHIDServiceClient`), so keyboard events never resolve to a mouse profile.
-- The device picker refreshes on every settings-window open; hot-plug is picked up on the next open.
-
 ## Logging
 
 Logging is asynchronous and designed to **never block the UI / event loop**.
 
 - **Async pipeline**: the `log_debug!` / `log_info!` macros format a line and send it over a **bounded** `flume` channel (capacity 512) to a background writer thread. The caller never blocks — if the channel is full (e.g. disk writes stall), the **newest** entries are dropped (drop-newest) rather than stalling the caller. Normal load never triggers drops.
-- **Destination**: `cargo run` (dev) → stdout only; a packaged `.app` (prod) → file.
+- **Destination**: `cargo run` (dev) → both stdout **and** the log file; a packaged `.app` (prod) → log file only.
 - **Default file path**: `~/Library/Logs/oh-my-tab/oh-my-tab-<startup-timestamp>.log` — one file **per app launch**, where the timestamp is the process start time in a filename-safe form (e.g. `oh-my-tab-2026-07-25_17-08-30.log`).
 - **Automatic 30-day cleanup**: at startup, the default log directory is scanned and any `oh-my-tab-*.log` whose modification time is older than 30 days is deleted. The current run's file is never pruned (its mtime keeps updating as it is written). Cleanup matches only the `oh-my-tab-*.log` pattern, so unrelated files in the same directory are left alone.
 - **Within a single long run** the file still grows — there is no size-based rotation. The 30-day cleanup is cross-run, by mtime.

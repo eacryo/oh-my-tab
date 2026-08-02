@@ -29,11 +29,18 @@
 
 ![设置](docs/pictures/settings.png)
 
+![鼠标控制](docs/pictures/mouse_control.png)
+
 ## 已知问题
 如果应用启动时已经有窗口存在，此时窗口排序与原生的Command加Tab排序不同，
 这是由于没有初始的窗口排序数据导致的，oh-my-tab启动后会持续监听窗口的变化
 
 **开发模式下图标可能不正确**：用 `cargo run` 跑裸二进制时,浮层偶尔会把 oh-my-tab 自己的卡片显示成首字母占位块而不是应用图标,而且可能一直持续到手动清空图标缓存。图标缓存按 bundle id 索引,以可执行文件的 **mtime** 作为失效指纹;开发模式下每次构建都会重链接二进制、改变 mtime,导致运行中实例的缓存条目失效。打包后的 `.app` 不受影响(安装后二进制 mtime 稳定)。开发中遇到此问题,可从菜单 *Clear Icon Cache* 清空,或删除 `~/Library/Caches/oh-my-tab-icons/`。
+
+**设备识别的问题**：判断某设备是否为鼠标/触控板,看它是否符合 Generic Desktop 页的 Pointer(1,1)、Mouse(1,2) 或 Trackpad(1,5) 用途 —— 用公开 API `IOHIDServiceClientConformsTo` 检查,它遍历设备完整的 `DeviceUsagePairs`,而不是单个 `PrimaryUsage` 值。这是必要的,因为有些真实鼠标的主用途会被系统报错:例如 **ATK A9 SE**(Nearlink/星闪鼠标)在系统里 `PrimaryUsage = 6(Keyboard)`,系统设置会把它显示为键盘——但它的 `DeviceUsagePairs` 里同时声明了 Mouse(1,2),`ConformsTo` 能识别出来。如果只看 `PrimaryUsage`,这类设备会被静默丢弃,它们的事件会被错误地套到"最近使用"的档位上。已知的副作用(与 LinearMouse 行为一致):
+
+- **少数键盘的 HID 描述符也声明了多余的 Mouse/Pointer 用途**(如 Kzzi-i75),它们也会出现在设备下拉框里。这纯粹是显示层面:事件归因按精确的 sender ID 匹配(`CGEvent → IOHIDEvent → sender ID → IOHIDServiceClient`),键盘事件永远不会被解析到鼠标档位。
+- 设备下拉框在每次打开设置窗口时刷新;热插拔的设备会在下次打开时出现。
 
 ## 环境要求
 
@@ -65,7 +72,7 @@ cargo run         # 构建并运行(会接管全局快捷键)
 cargo clippy      # 可用,未接入 CI
 ```
 
-`cargo run` 以**开发模式**跑裸二进制:日志输出到 stdout(不写文件),开机自启不生效(SMAppService 需要 `.app` bundle)。项目**没有测试**。
+`cargo run` 以**开发模式**跑裸二进制:日志同时输出到 stdout 和日志文件,开机自启不生效(SMAppService 需要 `.app` bundle)。项目**没有测试**。
 
 ### Release `.app` + `.dmg`
 
@@ -267,23 +274,12 @@ disable_acceleration = true
 
 鼠标设置也可以在设置窗口中调整(用**设备下拉框**选中某款已连接的鼠标,编辑它那一层)。开启 `mouse.enabled` 需要重启应用(OK 按钮会提示)。
 
-### 设备识别逻辑(以及可能遇到的问题)
-
-判断某设备是否为鼠标/触控板:看它是否符合 Generic Desktop 页的 Pointer(1,1)、Mouse(1,2) 或 Trackpad(1,5) 用途 —— 用公开 API `IOHIDServiceClientConformsTo` 检查,它遍历设备完整的 `DeviceUsagePairs`,而不是单个 `PrimaryUsage` 值。
-
-这很关键,因为有些真实鼠标的主用途会被系统报错:例如 **ATK A9 SE**(Nearlink/星闪鼠标)在系统里 `PrimaryUsage = 6(Keyboard)`,系统设置会把它显示为键盘——但它的 `DeviceUsagePairs` 里同时声明了 Mouse(1,2),`ConformsTo` 能识别出来。如果只看 `PrimaryUsage`,这类设备会被静默丢弃,它们的事件会被错误地套到"最近使用"的档位上。
-
-已知的副作用(与 LinearMouse 行为一致):
-
-- **少数键盘的 HID 描述符也声明了多余的 Mouse/Pointer 用途**(如 Kzzi-i75),它们也会出现在设备下拉框里。这纯粹是显示层面:事件归因按精确的 sender ID 匹配(`CGEvent → IOHIDEvent → sender ID → IOHIDServiceClient`),键盘事件永远不会被解析到鼠标档位。
-- 设备下拉框在每次打开设置窗口时刷新;热插拔的设备会在下次打开时出现。
-
 ## 日志
 
 日志是异步的,设计上**绝不阻塞 UI / 事件循环**。
 
 - **异步管线**:`log_debug!` / `log_info!` 宏格式化一行后,通过**有界** `flume` 通道(容量 512)发给后台 writer 线程。调用方永不阻塞 -- 通道满时(例如落盘卡顿)丢弃**最新**的日志(drop-newest),而不是拖住调用方。正常负载下不会触发丢弃。
-- **输出目标**:`cargo run`(开发态)-> 只输出到 stdout;打包的 `.app`(生产态)-> 写文件。
+- **输出目标**:`cargo run`(开发态)-> 同时输出到 stdout **和**日志文件;打包的 `.app`(生产态)-> 只写日志文件。
 - **默认文件路径**:`~/Library/Logs/oh-my-tab/oh-my-tab-<启动时间戳>.log` -- **每次启动一个文件**,时间戳取进程启动时刻、文件名安全格式(如 `oh-my-tab-2026-07-25_17-08-30.log`)。
 - **自动清理 30 天前日志**:启动时扫描默认日志目录,删除任何 mtime 超过 30 天的 `oh-my-tab-*.log`。当前运行的文件不会被误删(它一直在写,mtime 持续更新)。清理只匹配 `oh-my-tab-*.log` 模式,同目录下的无关文件不受影响。
 - **单次长时间运行内**文件仍会增长 -- 没有按大小轮转。30 天清理是跨运行、按 mtime 进行的。
