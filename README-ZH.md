@@ -21,7 +21,7 @@
 - TOML 配置,校验后可从菜单**热重载**。
 - 手写、零依赖的国际化(英文、简体中文、繁体中文),自动检测系统语言并实时跟随。
 - 每次启动一个日志文件,自动保留 30 天(见[日志](#日志))。
-- **鼠标控制**(可选,默认关闭):反向滚动、滚动模式(默认 / 按行(每 tick 行数)/ 平滑(13 种物理预设))、禁用指针加速 -- 且**按鼠标设备分别配置**(见[配置](#配置))。此功能参考并借鉴了 [LinearMouse](https://github.com/linearmouse/linearmouse),用纯 Rust 从零重写实现(见[致谢](#致谢))。
+- **鼠标控制**(可选,默认关闭):反向滚动、滚动模式(默认 / 按行(每 tick 行数))、禁用指针加速 -- 且**按鼠标设备分别配置**(见[配置](#配置))。此功能参考并借鉴了 [LinearMouse](https://github.com/linearmouse/linearmouse),用纯 Rust 从零重写实现(见[致谢](#致谢))。
 
 ## 截图
 
@@ -170,7 +170,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 | `config.rs` | TOML 配置,校验,逐字段容错,可热重载。 |
 | `i18n.rs` | 手写 TOML 国际化,编译期内嵌,自动检测语言。 |
 | `settings.rs` | 设置窗口(控件、校验告警、配置热应用)。 |
-| `mouse/` | 鼠标控制:第二个 HID 层 `CGEventTap` 拦截滚轮/按键事件,滚动模式(默认/按行/平滑)、平滑滚动物理引擎、指针加速控制、按设备匹配(`device.rs` / `resolve.rs`)。 |
+| `mouse/` | 鼠标控制:第二个 HID 层 `CGEventTap` 拦截滚轮/按键事件,滚动模式(默认/按行)、指针加速控制、按设备匹配(`device.rs` / `resolve.rs`)。 |
 | `menu.rs` | 状态栏菜单及动作回调。 |
 | `logger.rs` | 异步日志(有界通道、后台 writer 线程)。 |
 | `ffi.rs` / `theme.rs` | FFI 基础工具(CF/CG/NSString helper、`Send`/`Sync` 包装)与主题/布局访问器。 |
@@ -252,9 +252,8 @@ enabled = true           # 鼠标控制总开关(控制 event tap)
 # 生效配置 = 默认层合并匹配到的设备层。
 [[mouse.profiles]]
 reverse_scroll = false   # 相对系统方向反转滚动
-scroll_mode = "default"  # "default" | "line"(每 tick 固定行数)| "smooth"(物理引擎 + 惯性)
+scroll_mode = "default"  # "default" | "line"(每 tick 固定行数)
 line_count = 3           # "line" 模式每 tick 行数(1..=10)
-smooth_preset = "easeInOut"  # 13 种平滑预设(仅 "smooth" 模式使用)
 
 [mouse.profiles.pointer]
 disable_acceleration = false  # 禁用系统指针加速(线性移动)
@@ -266,7 +265,6 @@ device_product_id = 12976
 reverse_scroll = true
 scroll_mode = "line"
 line_count = 3
-smooth_preset = "easeInOut"
 
 [mouse.profiles.pointer]
 disable_acceleration = true
@@ -318,7 +316,7 @@ disable_acceleration = true
 
 ## 致谢
 
-**鼠标控制**功能(反向滚动、滚动模式、平滑滚动物理引擎、按设备配置、禁用指针加速)参考并借鉴了 [LinearMouse](https://github.com/linearmouse/linearmouse)。我们用纯 Rust(通过 `objc2` FFI 直接调 AppKit,无 Swift 桥接)从零重写了它的核心功能,并将其融入 oh-my-tab 的配置模型。衷心感谢原作者以及 LinearMouse 项目做出的优秀工作。
+**鼠标控制**功能(反向滚动、滚动模式、按设备配置、禁用指针加速)参考并借鉴了 [LinearMouse](https://github.com/linearmouse/linearmouse)。我们用纯 Rust(通过 `objc2` FFI 直接调 AppKit,无 Swift 桥接)从零重写了它的核心功能,并将其融入 oh-my-tab 的配置模型。衷心感谢原作者以及 LinearMouse 项目做出的优秀工作。
 
 ## 仓库
 

@@ -51,7 +51,6 @@ row_reverse_scroll = "反向滾動"
 row_enable_mouse = "啟用滑鼠控制"
 row_scroll_mode = "滾動模式"
 row_line_count = "每 tick 行數"
-row_smooth_preset = "平滑預設"
 header_mouse_pointer = "指標"
 row_disable_pointer_accel = "停用指標加速（線性移動）"
 header_mouse_device = "裝置"
@@ -96,7 +95,6 @@ keyboard_modifier_invalid = 'keyboard.modifier: "{value}" 不是 option、comman
 i18n_locale_invalid = 'i18n.locale: "{value}" 不是 auto、en、zh-Hans、zh-Hant 之一'
 logging_level_invalid = "logging.level: '{value}' 無效（期望: debug, info）"
 config_read_failed = "無法讀取設定: {error}"
-mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line、smooth 之一'
+mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line 之一'
 mouse_line_count_invalid = "line_count: {value} 必須 1..=10"
-mouse_smooth_preset_invalid = 'smooth_preset: "{value}" 不是有效預設名稱'
 windows_overlay_position_invalid = 'windows.overlay_position: "{value}" 不是 active_window、main 之一'

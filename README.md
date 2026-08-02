@@ -21,7 +21,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 - TOML configuration, validated and **hot-reloadable** from the menu.
 - Handcrafted, zero-dependency i18n (English, Simplified Chinese, Traditional Chinese) with automatic locale detection and live system-language follow.
 - Per-launch log files with automatic 30-day retention (see [Logging](#logging)).
-- **Mouse control** (optional, off by default): scroll reversal, scroll modes (Default / Line with a per-tick line count / Smooth with 13 physics presets), and disabling pointer acceleration — all configurable **per mouse device** (see [Configuration](#configuration)). This feature is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse), re-implemented from scratch in pure Rust (see [Credits](#credits)).
+- **Mouse control** (optional, off by default): scroll reversal, scroll modes (Default / Line with a per-tick line count), and disabling pointer acceleration — all configurable **per mouse device** (see [Configuration](#configuration)). This feature is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse), re-implemented from scratch in pure Rust (see [Credits](#credits)).
 
 ## Screenshots
 
@@ -170,7 +170,7 @@ Shared state lives in global `static`s guarded by `Mutex` / `RwLock`: `TAB_STATE
 | `config.rs` | TOML config, validated, per-field resilient, hot-reloadable. |
 | `i18n.rs` | Handcrafted TOML i18n, embedded at compile time, auto locale detection. |
 | `settings.rs` | Settings window (controls, validation alerts, hot config application). |
-| `mouse/` | Mouse control: a second HID-level `CGEventTap` for scroll/button events, scroll modes (default/line/smooth), smooth-scroll physics engine, pointer acceleration control, and per-device matching (`device.rs` / `resolve.rs`). |
+| `mouse/` | Mouse control: a second HID-level `CGEventTap` for scroll/button events, scroll modes (default/line), pointer acceleration control, and per-device matching (`device.rs` / `resolve.rs`). |
 | `menu.rs` | Status-bar menu and action callbacks. |
 | `logger.rs` | Async logging (bounded channel, background writer). |
 | `ffi.rs` / `theme.rs` | FFI primitives (CF/CG/NSString helpers, `Send`/`Sync` wrappers) and theme/layout accessors. |
@@ -252,9 +252,8 @@ enabled = true           # master switch for the mouse-control event tap
 # per-field. Effective config = default layer merged with the matching device layer.
 [[mouse.profiles]]
 reverse_scroll = false   # flip scroll direction relative to the system
-scroll_mode = "default"  # "default" | "line" (fixed lines per tick) | "smooth" (physics + inertia)
+scroll_mode = "default"  # "default" | "line" (fixed lines per tick)
 line_count = 3           # lines per tick in "line" mode (1..=10)
-smooth_preset = "easeInOut"  # 13 smooth presets (only used in "smooth" mode)
 
 [mouse.profiles.pointer]
 disable_acceleration = false  # disable system pointer acceleration (linear tracking)
@@ -266,7 +265,6 @@ device_product_id = 12976
 reverse_scroll = true
 scroll_mode = "line"
 line_count = 3
-smooth_preset = "easeInOut"
 
 [mouse.profiles.pointer]
 disable_acceleration = true
@@ -317,7 +315,7 @@ Icons are pre-cached at startup and on `NSWorkspaceDidLaunchApplicationNotificat
 
 ## Credits
 
-The **mouse control** feature (scroll reversal, scroll modes, smooth-scrolling physics engine, per-device configuration, and pointer-acceleration control) is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse). We re-implemented its core features from scratch in pure Rust (via `objc2` FFI, no Swift bridge) and integrated them into oh-my-tab's configuration model. Many thanks to the original author and the LinearMouse project for the excellent work.
+The **mouse control** feature (scroll reversal, scroll modes, per-device configuration, and pointer-acceleration control) is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse). We re-implemented its core features from scratch in pure Rust (via `objc2` FFI, no Swift bridge) and integrated them into oh-my-tab's configuration model. Many thanks to the original author and the LinearMouse project for the excellent work.
 
 ## Repository
 

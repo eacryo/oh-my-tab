@@ -169,8 +169,9 @@ pub struct MouseProfile {
     // natural-scroll flip and synthetic events aren't flipped again, see should_flip in scrolling.rs).
     pub reverse_scroll: Option<bool>,
     pub scroll_mode: Option<String>,
+    // Line 模式每格行数(1..=10)。
+    // Line mode lines per notch (1..=10).
     pub line_count: Option<u32>,
-    pub smooth_preset: Option<String>,
     pub pointer: Option<PartialPointerSection>,
 }
 
@@ -196,8 +197,6 @@ pub struct MouseSection {
     #[serde(skip_serializing)]
     pub line_count: u32,
     #[serde(skip_serializing)]
-    pub smooth_preset: String,
-    #[serde(skip_serializing)]
     pub pointer: PointerSection,
 }
 
@@ -205,13 +204,12 @@ impl Default for MouseSection {
     fn default() -> Self {
         Self {
             enabled: false,
-            // 默认含一个"所有鼠标"档,与旧默认值一致(reverse_scroll=false, default 模式, 3 行, easeInOut)。
+            // 默认含一个"所有鼠标"档,与旧默认值一致(reverse_scroll=false, default 模式, 3 行)。
             // Default includes an "All Mice" profile matching the old defaults.
             profiles: vec![MouseProfile {
                 reverse_scroll: Some(false),
                 scroll_mode: Some("default".into()),
                 line_count: Some(3),
-                smooth_preset: Some("easeInOut".into()),
                 pointer: Some(PartialPointerSection {
                     disable_acceleration: Some(false),
                 }),
@@ -220,7 +218,6 @@ impl Default for MouseSection {
             reverse_scroll: false,
             scroll_mode: "default".into(),
             line_count: 3,
-            smooth_preset: "easeInOut".into(),
             pointer: PointerSection::default(),
         }
     }
@@ -240,10 +237,8 @@ impl MouseSection {
         let has_legacy = self.reverse_scroll != defaults.reverse_scroll
             || self.scroll_mode != defaults.scroll_mode
             || self.line_count != defaults.line_count
-            || self.smooth_preset != defaults.smooth_preset
             || self.pointer.disable_acceleration != defaults.pointer.disable_acceleration
-            || !self.scroll_mode.is_empty()
-            || !self.smooth_preset.is_empty();
+            || !self.scroll_mode.is_empty();
 
         if !has_legacy {
             // 无旧字段(全新配置或已迁移):确保至少有一个默认"所有鼠标"档。
@@ -268,11 +263,6 @@ impl MouseSection {
                 self.scroll_mode.clone()
             }),
             line_count: Some(if self.line_count == 0 { 3 } else { self.line_count }),
-            smooth_preset: Some(if self.smooth_preset.is_empty() {
-                "easeInOut".into()
-            } else {
-                self.smooth_preset.clone()
-            }),
             pointer: Some(PartialPointerSection {
                 disable_acceleration: Some(self.pointer.disable_acceleration),
             }),
@@ -299,7 +289,6 @@ impl MouseSection {
         self.reverse_scroll = false;
         self.scroll_mode = String::new();
         self.line_count = 0;
-        self.smooth_preset = String::new();
         self.pointer = PointerSection::default();
     }
 }
@@ -619,7 +608,7 @@ impl Config {
         for (i, p) in self.mouse.profiles.iter().enumerate() {
             let prefix = format!("mouse.profiles[{i}]");
             if let Some(ref mode) = p.scroll_mode {
-                if !["default", "line", "smooth"].contains(&mode.as_str()) {
+                if !["default", "line"].contains(&mode.as_str()) {
                     errs.push(tf(
                         "errors.mouse_scroll_mode_invalid",
                         &[("value", mode)],
@@ -638,31 +627,6 @@ impl Config {
                         &[("value", &lc.to_string())],
                     );
                     errs.push(format!("{prefix}.line_count: {msg}"));
-                }
-            }
-            if let Some(ref sp) = p.smooth_preset {
-                if ![
-                    "custom",
-                    "linear",
-                    "easeIn",
-                    "easeOut",
-                    "easeInOut",
-                    "quadratic",
-                    "cubic",
-                    "quartic",
-                    "easeOutCubic",
-                    "easeInOutCubic",
-                    "easeOutQuartic",
-                    "easeInOutQuartic",
-                    "smooth",
-                ]
-                .contains(&sp.as_str())
-                {
-                    let msg = tf(
-                        "errors.mouse_smooth_preset_invalid",
-                        &[("value", sp)],
-                    );
-                    errs.push(format!("{prefix}.smooth_preset: {msg}"));
                 }
             }
         }
@@ -845,13 +809,6 @@ impl Config {
             {
                 merged_p.line_count = p.line_count;
             }
-            if p.smooth_preset.is_some()
-                && !errs
-                    .iter()
-                    .any(|e| e.starts_with(&format!("{prefix}.smooth_preset")))
-            {
-                merged_p.smooth_preset = p.smooth_preset.clone();
-            }
             // pointer.disable_acceleration 是 bool,恒有效。
             // pointer.disable_acceleration is a bool, always valid.
             merged_p.pointer = p.pointer.clone();
@@ -862,7 +819,6 @@ impl Config {
         self.mouse.reverse_scroll = false;
         self.mouse.scroll_mode = String::new();
         self.mouse.line_count = 0;
-        self.mouse.smooth_preset = String::new();
         self.mouse.pointer = PointerSection::default();
     }
 
@@ -946,8 +902,8 @@ impl Config {
                     p.device.vendor_id.is_none() && p.device.product_id.is_none()
                 }) || loaded.mouse.reverse_scroll
                     || !loaded.mouse.scroll_mode.is_empty()
-                    || loaded.mouse.line_count != 0
-                    || !loaded.mouse.smooth_preset.is_empty();
+                    || loaded.mouse.line_count != 0;
+
                 loaded.mouse.migrate_legacy();
                 let errs = loaded.validate();
                 if !errs.is_empty() {
@@ -985,8 +941,8 @@ impl Config {
                     p.device.vendor_id.is_none() && p.device.product_id.is_none()
                 }) || loaded.mouse.reverse_scroll
                     || !loaded.mouse.scroll_mode.is_empty()
-                    || loaded.mouse.line_count != 0
-                    || !loaded.mouse.smooth_preset.is_empty();
+                    || loaded.mouse.line_count != 0;
+
                 loaded.mouse.migrate_legacy();
                 let errs = loaded.validate();
                 if !errs.is_empty() {

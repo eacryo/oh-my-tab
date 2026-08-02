@@ -10,7 +10,7 @@
 
 use crate::config::{Config, MouseProfile, CONFIG};
 use crate::mouse::device::DeviceKey;
-use crate::mouse::scrolling::{ScrollMode, SmoothPreset};
+use crate::mouse::scrolling::ScrollMode;
 use std::sync::Mutex;
 
 /// 解析后的具体生效配置(非 Option,所有字段已定)。
@@ -20,7 +20,6 @@ pub(crate) struct ResolvedMouse {
     pub reverse_scroll: bool,
     pub scroll_mode: ScrollMode,
     pub line_count: u32,
-    pub smooth_preset: SmoothPreset,
     pub disable_acceleration: bool,
 }
 
@@ -30,7 +29,6 @@ impl Default for ResolvedMouse {
             reverse_scroll: false,
             scroll_mode: ScrollMode::Default,
             line_count: 3,
-            smooth_preset: SmoothPreset::EaseInOut,
             disable_acceleration: false,
         }
     }
@@ -114,7 +112,6 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
     r.reverse_scroll = defaults.reverse_scroll;
     r.scroll_mode = defaults.scroll_mode;
     r.line_count = defaults.line_count;
-    r.smooth_preset = defaults.smooth_preset;
     r.disable_acceleration = defaults.disable_acceleration;
 
     // 遍历 profiles,合并所有匹配档(后者优先)。
@@ -131,9 +128,6 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
         }
         if let Some(lc) = p.line_count {
             r.line_count = lc.clamp(1, 10);
-        }
-        if let Some(ref sp) = p.smooth_preset {
-            r.smooth_preset = SmoothPreset::from_str(sp);
         }
         if let Some(ref ptr) = p.pointer {
             if let Some(da) = ptr.disable_acceleration {
@@ -217,9 +211,8 @@ mod tests {
         cfg.mouse.profiles.clear();
         cfg.mouse.profiles.push(MouseProfile {
             reverse_scroll: Some(true),
-            scroll_mode: Some("smooth".into()),
+            scroll_mode: Some("line".into()),
             line_count: Some(7),
-            smooth_preset: Some("linear".into()),
             pointer: Some(PartialPointerSection {
                 disable_acceleration: Some(true),
             }),
@@ -248,7 +241,7 @@ mod tests {
         // Resolution should match the original.
         let r = resolve_from(&parsed, Some((0xC548, 0x4444)));
         assert!(!r.reverse_scroll); // 设备档覆盖通配档
-        assert_eq!(r.line_count, 7); // 来自通配档
+        assert_eq!(r.line_count, 7); // 来自通配档(line_count)
         assert!(r.disable_acceleration); // 来自通配档
     }
 
@@ -260,7 +253,6 @@ enabled = true
 reverse_scroll = true
 scroll_mode = "line"
 line_count = 5
-smooth_preset = "cubic"
 [mouse.pointer]
 disable_acceleration = true
 "#;
@@ -273,7 +265,6 @@ disable_acceleration = true
         assert_eq!(p.reverse_scroll, Some(true));
         assert_eq!(p.scroll_mode.as_deref(), Some("line"));
         assert_eq!(p.line_count, Some(5));
-        assert_eq!(p.smooth_preset.as_deref(), Some("cubic"));
         assert_eq!(
             p.pointer.as_ref().and_then(|x| x.disable_acceleration),
             Some(true)

@@ -53,8 +53,8 @@ pub(crate) struct Device {
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
-/// (VID, PID) 组合,用作解析缓存与平滑引擎 per-device 状态的键。
-/// (VID, PID) pair, used as the key for the resolve cache and per-device smooth-engine state.
+/// (VID, PID) 组合,用作解析缓存与 per-device 状态的键。
+/// (VID, PID) pair, used as the key for the resolve cache and per-device state.
 pub(crate) type DeviceKey = (u32, u32);
 
 impl Device {

@@ -50,7 +50,6 @@ row_reverse_scroll = "Reverse scrolling"
 row_enable_mouse = "Enable mouse control"
 row_scroll_mode = "Scroll mode"
 row_line_count = "Lines per tick"
-row_smooth_preset = "Smooth preset"
 header_mouse_pointer = "Pointer"
 row_disable_pointer_accel = "Disable pointer acceleration (linear movement)"
 header_mouse_device = "Device"
@@ -95,7 +94,6 @@ keyboard_modifier_invalid = 'keyboard.modifier: "{value}" is not one of option, 
 i18n_locale_invalid = 'i18n.locale: "{value}" is not one of auto, en, zh-Hans, zh-Hant'
 logging_level_invalid = "logging.level: '{value}' is invalid (expect: debug, info)"
 config_read_failed = "cannot read config: {error}"
-mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line, smooth'
+mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line'
 mouse_line_count_invalid = "line_count: {value} must be 1..=10"
-mouse_smooth_preset_invalid = 'smooth_preset: "{value}" is not a valid preset name'
 windows_overlay_position_invalid = 'windows.overlay_position: "{value}" is not one of active_window, main'

@@ -1,30 +1,27 @@
 //! 鼠标事件 event tap。
 //! 在独立线程上建一个 default-tap 的 CGEventTap(HID 层),监听鼠标按键与滚轮事件。
-//! 滚轮事件根据配置分三种模式处理:默认(透传+反转)、按行(固定行数)、平滑(物理状态机+惯性)。
-//! 三种模式统一使用合成事件方案:丢弃原始事件,合成新事件 post 到 session 层,
+//! 滚轮事件根据配置分两种模式处理:默认(透传+反转)、按行(固定行数)。
+//! 两种模式统一使用合成事件方案:丢弃原始事件,合成新事件 post 到 session 层,
 //! 绕过系统自然滚动在 HID 层的覆盖。
 //!
 //! Mouse event tap.
 //! Spawns a default-tap CGEventTap (HID level) on a dedicated thread that listens for mouse
-//! button and scroll events. Scroll events are processed in one of three modes: Default
-//! (passthrough + optional reverse), Line (fixed line count), or Smooth (physics engine +
-//! inertia). All three modes use the synthetic-event approach: drop the original, post a new
-//! event to the session level, bypassing the system natural-scroll override at the HID layer.
+//! button and scroll events. Scroll events are processed in one of two modes: Default
+//! (passthrough + optional reverse) or Line (fixed line count). Both use the synthetic-event
+//! approach: drop the original, post a new event to the session level, bypassing the system
+//! natural-scroll override at the HID layer.
 
 use crate::event_tap::{
-    self, tap_location, tap_options, tap_placement, CFAbsoluteTimeGetCurrent, CFIndex,
-    CFOptionFlags, CFRunLoopAddTimer, CFRunLoopGetCurrent, CFRunLoopTimerCreate, CFRunLoopTimerRef,
+    self, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent,
     CGEventCreateScrollWheelEvent2, CGEventFlags, CGEventGetFlags, CGEventGetIntegerValueField,
     CGEventMask, CGEventPost, CGEventRef, CGEventSetFlags, CGEventSetIntegerValueField,
     CGEventTapProxy, CGEventType, K_CG_EVENT_SOURCE_USER_DATA, K_CG_SCROLL_EVENT_UNIT_LINE,
-    K_CG_SCROLL_EVENT_UNIT_PIXEL, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
-    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS,
-    K_CG_SCROLL_WHEEL_EVENT_MOMENTUM_PHASE, K_CG_SCROLL_WHEEL_EVENT_SCROLL_PHASE,
-    K_CG_SESSION_EVENT_TAP, SYNTHETIC_MARKER,
+    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
+    K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, K_CG_SESSION_EVENT_TAP, SYNTHETIC_MARKER,
 };
 use crate::mouse::device;
 use crate::mouse::resolve;
-use crate::mouse::scrolling::{compute_delta, feed_engine, advance_engine, ScrollMode};
+use crate::mouse::scrolling::compute_delta;
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
 use std::thread;
@@ -45,24 +42,19 @@ const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
 const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 0;
 
 /// 合成一个滚轮事件并 post 到 session 层。
-/// 三种模式统一走此函数:dy/dx 由各模式按需计算后传入。
+/// 行模式按"行"单位 post;默认模式透传原 delta。
 ///
 /// Synthesize a scroll event and post it to the session level.
-/// All three modes share this function: dy/dx are pre-computed per mode.
-unsafe fn post_scroll_event(
-    dy: i32,
-    dx: i32,
-    flags: CGEventFlags,
-    continuous: bool,
-    scroll_phase: i64,
-    momentum_phase: i64,
-) {
-    let units = if continuous {
-        K_CG_SCROLL_EVENT_UNIT_PIXEL
-    } else {
-        K_CG_SCROLL_EVENT_UNIT_LINE
-    };
-    let synthetic = CGEventCreateScrollWheelEvent2(std::ptr::null(), units, 2, dy, dx, 0);
+/// Line mode posts in "line" units; Default mode passes the raw delta through.
+unsafe fn post_scroll_event(dy: i32, dx: i32, flags: CGEventFlags) {
+    let synthetic = CGEventCreateScrollWheelEvent2(
+        std::ptr::null(),
+        K_CG_SCROLL_EVENT_UNIT_LINE,
+        2,
+        dy,
+        dx,
+        0,
+    );
 
     if synthetic.is_null() {
         log_info!("[mouse] failed to synthesize scroll event");
@@ -71,25 +63,6 @@ unsafe fn post_scroll_event(
 
     CGEventSetFlags(synthetic, flags);
     CGEventSetIntegerValueField(synthetic, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
-    CGEventSetIntegerValueField(
-        synthetic,
-        K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS,
-        continuous as i64,
-    );
-    if scroll_phase != 0 {
-        CGEventSetIntegerValueField(
-            synthetic,
-            K_CG_SCROLL_WHEEL_EVENT_SCROLL_PHASE,
-            scroll_phase,
-        );
-    }
-    if momentum_phase != 0 {
-        CGEventSetIntegerValueField(
-            synthetic,
-            K_CG_SCROLL_WHEEL_EVENT_MOMENTUM_PHASE,
-            momentum_phase,
-        );
-    }
 
     CGEventPost(K_CG_SESSION_EVENT_TAP, synthetic);
 }
@@ -123,30 +96,6 @@ fn button_name(button: i64) -> String {
     }
 }
 
-/// 120Hz 定时器回调:推进平滑引擎一次,若有发射值则 post 合成事件。
-/// 120Hz timer callback: advance the smooth engine once; post synthetic event if there is an
-/// emission.
-unsafe extern "C" fn smooth_scroll_timer_callback(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
-    if let Some(emission) = advance_engine() {
-        let flags: CGEventFlags = 0;
-        // 将浮点 delta 转 i32(像素级)。用四舍五入避免微小值累积为 0。
-        // Convert float delta to i32 (pixel level). Round to avoid near-zero accumulation.
-        let dy = (emission.delta_y.round()) as i32;
-        let dx = (emission.delta_x.round()) as i32;
-        if dy == 0 && dx == 0 && emission.momentum_phase == 0 && emission.scroll_phase == 0 {
-            return;
-        }
-        post_scroll_event(
-            dy,
-            dx,
-            flags,
-            true,
-            emission.scroll_phase as i64,
-            emission.momentum_phase as i64,
-        );
-    }
-}
-
 unsafe extern "C" fn mouse_event_tap_callback(
     _proxy: CGEventTapProxy,
     event_type: CGEventType,
@@ -164,9 +113,9 @@ unsafe extern "C" fn mouse_event_tap_callback(
         }
 
         // continuous=1 表示连续(像素级)滚动事件,来自触摸板/Magic Mouse。
-        // 我们的三种模式只处理鼠标滚轮(离散事件),触摸板跳过。
+        // 我们的两种模式只处理鼠标滚轮(离散事件),触摸板跳过。
         // continuous=1 means a continuous (pixel-level) scroll event from a trackpad / Magic Mouse.
-        // All three modes handle only discrete mouse wheel events; trackpad is skipped.
+        // Both modes handle only discrete mouse wheel events; trackpad is skipped.
         let continuous = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS);
         if continuous != 0 {
             return event;
@@ -187,34 +136,12 @@ unsafe extern "C" fn mouse_event_tap_callback(
 
         log_debug!("[mouse] scroll dy={} dx={} flags=0x{:x}", dy, dx, flags);
 
-        match resolved.scroll_mode {
-            ScrollMode::Smooth => {
-                // 平滑模式方向处理:喂引擎前按用户反转开关取反(与 compute_delta 一致)。
-                // HID tap 事件已含系统自然滚动翻转,合成事件不再被翻转,故只需用户反转。
-                // Direction for smooth mode: flip before feeding per the user's reverse toggle
-                // (same as compute_delta). HID-tap events already carry the system natural-scroll
-                // flip and synthetic events aren't flipped again, so only the user toggle matters.
-                let flip = crate::mouse::scrolling::should_flip(resolved.reverse_scroll);
-                let (fy, fx) = if flip {
-                    (-dy, -dx)
-                } else {
-                    (dy, dx)
-                };
-                // 喂入 per-device 平滑引擎,引擎在 120Hz 定时器内发射连续事件。
-                // Feed the per-device smooth engine; the 120Hz timer emits continuous events.
-                feed_engine(dev_key, fy as f64, fx as f64, resolved.smooth_preset);
-                // 丢弃原始离散事件(由引擎的合成连续事件替代)。
-                // Drop the original discrete event (replaced by the engine's synthetic continuous events).
-                std::ptr::null_mut()
-            }
-            _ => {
-                // Default / Line:计算 delta + 反转 -> post 合成事件 -> 丢弃原 event。
-                // Default / Line: compute delta + reverse -> post synthetic event -> drop original.
-                let (ndy, ndx) = compute_delta(dy, dx, &resolved);
-                post_scroll_event(ndy, ndx, flags, false, 0, 0);
-                std::ptr::null_mut()
-            }
-        }
+        // Default / Line:计算 delta(透传或行数归一化 + 反转)-> post 合成事件 -> 丢弃原 event。
+        // Default / Line: compute delta (passthrough or line-count normalization + reverse) ->
+        // post synthetic event -> drop the original.
+        let (ndy, ndx) = compute_delta(dy, dx, &resolved);
+        post_scroll_event(ndy, ndx, flags);
+        std::ptr::null_mut()
     } else {
         let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
         log_debug!(
@@ -228,9 +155,8 @@ unsafe extern "C" fn mouse_event_tap_callback(
     }
 }
 
-/// 启动鼠标事件监听线程 + 120Hz 平滑定时器。由 main.rs 在启用鼠标时调用。
-/// Start the mouse event listener thread + 120Hz smooth timer. Called by main.rs when mouse
-/// control is enabled.
+/// 启动鼠标事件监听线程。由 main.rs 在启用鼠标时调用。
+/// Start the mouse event listener thread. Called by main.rs when mouse control is enabled.
 pub(crate) fn start() -> thread::JoinHandle<()> {
     // 监听掩码:左/右/其他按键 down/up + 滚轮。暂不含 mouseMoved(日志会爆炸)。
     // Listen mask: left/right/other button down/up + scroll wheel. Excludes mouseMoved.
@@ -275,23 +201,7 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         // / profile matching). Callbacks run on this same thread, safe.
         device::start_plug_monitor(rl);
 
-        // 创建 120Hz 定时器(约 8.3ms),驱动平滑引擎 advance。
-        // Create 120Hz timer (~8.3ms) to drive the smooth engine advance.
-        let timer = CFRunLoopTimerCreate(
-            std::ptr::null_mut(),                     // allocator
-            CFAbsoluteTimeGetCurrent() + 1.0 / 120.0, // fire date: ~8ms from now
-            1.0 / 120.0,                              // interval: ~8.3ms
-            0 as CFOptionFlags,                       // flags
-            0 as CFIndex,                             // order
-            Some(
-                smooth_scroll_timer_callback
-                    as unsafe extern "C" fn(CFRunLoopTimerRef, *mut c_void),
-            ),
-            std::ptr::null_mut(),
-        );
-        CFRunLoopAddTimer(rl, timer, event_tap::kCFRunLoopDefaultMode);
-
-        log_info!("Mouse event tap + 120Hz smooth timer started.");
+        log_info!("Mouse event tap started.");
 
         // 阻塞运行 RunLoop,直到线程被终止。
         // Block on the RunLoop until the thread is terminated.

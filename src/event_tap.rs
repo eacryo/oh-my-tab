@@ -18,23 +18,8 @@ pub(crate) type CGEventTapProxy = *mut c_void;
 pub(crate) type CFMachPortRef = *mut c_void;
 pub(crate) type CFRunLoopSourceRef = *mut c_void;
 pub(crate) type CFRunLoopRef = *mut c_void;
-pub(crate) type CFRunLoopTimerRef = *mut c_void;
 pub(crate) type CFStringRef = *mut c_void;
 pub(crate) type CFAllocatorRef = *mut c_void;
-pub(crate) type CFOptionFlags = u64;
-pub(crate) type CFIndex = isize;
-
-pub(crate) type CFRunLoopTimerCallBack =
-    Option<unsafe extern "C" fn(timer: CFRunLoopTimerRef, info: *mut c_void)>;
-
-#[repr(C)]
-pub(crate) struct CFRunLoopTimerContext {
-    pub(crate) version: CFIndex,
-    pub(crate) info: *mut c_void,
-    pub(crate) retain: Option<unsafe extern "C" fn(info: *mut c_void) -> *mut c_void>,
-    pub(crate) release: Option<unsafe extern "C" fn(info: *mut c_void)>,
-    pub(crate) copy_description: Option<unsafe extern "C" fn(info: *mut c_void) -> CFStringRef>,
-}
 pub(crate) type CGEventType = u32;
 pub(crate) type CGEventFlags = u64;
 pub(crate) type CGEventMask = u64;
@@ -119,9 +104,9 @@ extern "C" {
     // (matching events to the producing device for per-device config).
     pub(crate) fn CGEventCopyIOHIDEvent(event: CGEventRef) -> *mut c_void;
 
-    // 合成全新的滚轮事件(未来平滑滚动复用此 API)。
+    // 合成全新的滚轮事件。
     // source 传 null 表示用默认 source;wheelCount 通常为 2(wheel1=垂直,wheel2=水平)。
-    // Create a brand-new scroll wheel event (reused by future smoothed scrolling).
+    // Create a brand-new scroll wheel event.
     // source=null for default source; wheelCount typically 2 (wheel1=vertical, wheel2=horizontal).
     pub(crate) fn CGEventCreateScrollWheelEvent2(
         source: *const c_void,
@@ -140,9 +125,9 @@ extern "C" {
 }
 
 // IOKit 私有 API:读写 IOHIDEvent 的浮点字段。
-// 当前合成事件方案未使用,但未来平滑滚动(需要修改底层 IOHIDEvent)会复用。
+// 当前合成事件方案未使用(保留以备用)。
 // IOKit private API: read/write float fields of an IOHIDEvent.
-// Unused by the current synthetic-event approach, but reserved for future smoothed scrolling.
+// Unused by the current synthetic-event approach (kept for potential future use).
 #[allow(dead_code)]
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
@@ -171,23 +156,6 @@ extern "C" {
     );
     pub(crate) fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     pub(crate) fn CFRunLoopRun();
-
-    pub(crate) fn CFAbsoluteTimeGetCurrent() -> f64;
-
-    pub(crate) fn CFRunLoopTimerCreate(
-        allocator: CFAllocatorRef,
-        fire_date: f64,
-        interval: f64,
-        flags: CFOptionFlags,
-        order: CFIndex,
-        callout: CFRunLoopTimerCallBack,
-        context: *mut CFRunLoopTimerContext,
-    ) -> CFRunLoopTimerRef;
-
-    pub(crate) fn CFRunLoopAddTimer(rl: CFRunLoopRef, timer: CFRunLoopTimerRef, mode: CFStringRef);
-
-    #[allow(dead_code)]
-    pub(crate) fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
 
     pub(crate) static kCFRunLoopDefaultMode: CFStringRef;
 }
@@ -327,8 +295,8 @@ pub(crate) const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1: i32 = 11;
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2: i32 = 12;
 
-/// 垂直滚动量(定点浮点,16.16 格式)。field 93。未来平滑滚动复用。
-/// Vertical scroll delta (fixed-point, 16.16 format). field 93. Reserved for future smoothed scrolling.
+/// 垂直滚动量(定点浮点,16.16 格式)。field 93。
+/// Vertical scroll delta (fixed-point, 16.16 format). field 93.
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1: i32 = 93;
 /// 水平滚动量(定点浮点,16.16 格式)。field 94。
@@ -336,12 +304,12 @@ pub(crate) const K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1: i32 = 93;
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2: i32 = 94;
 
-/// 垂直滚动量(像素级,用于平滑滚动)。field 96。未来平滑滚动复用。
-/// Vertical scroll delta (pixel-level, for smooth scrolling). field 96. Reserved for future.
+/// 垂直滚动量(像素级)。field 96。
+/// Vertical scroll delta (pixel-level). field 96.
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1: i32 = 96;
-/// 水平滚动量(像素级,用于平滑滚动)。field 97。
-/// Horizontal scroll delta (pixel-level, for smooth scrolling). field 97.
+/// 水平滚动量(像素级)。field 97。
+/// Horizontal scroll delta (pixel-level). field 97.
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2: i32 = 97;
 
@@ -356,8 +324,8 @@ pub(crate) const K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS: i32 = 88;
 /// IOHIDEvent vertical scroll field.
 #[allow(dead_code)]
 pub(crate) const K_IOHID_EVENT_FIELD_SCROLL_X: u32 = 6 << 16;
-/// IOHIDEvent 水平滚动字段。未来平滑滚动复用。
-/// IOHIDEvent horizontal scroll field. Reserved for future smoothed scrolling.
+/// IOHIDEvent 水平滚动字段。
+/// IOHIDEvent horizontal scroll field.
 #[allow(dead_code)]
 pub(crate) const K_IOHID_EVENT_FIELD_SCROLL_Y: u32 = (6 << 16) | 1;
 
@@ -384,28 +352,3 @@ pub(crate) const K_CG_EVENT_SOURCE_USER_DATA: i32 = 42;
 /// can recognize and skip our own synthetic events.
 #[allow(clippy::unusual_byte_groupings)]
 pub(crate) const SYNTHETIC_MARKER: i64 = 0x4F4D_5453_4352_4C;
-
-/// CGEventCreateScrollWheelEvent2 的 units:kCGScrollEventUnitPixel=0(像素级,连续滚动)。
-/// CGEventCreateScrollWheelEvent2 units: kCGScrollEventUnitPixel=0 (pixel-level, continuous scroll).
-pub(crate) const K_CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
-
-// ========== 平滑滚动相位常量 / Smooth scroll phase constants ==========
-
-/// kCGScrollWheelEventScrollPhase field (field 99): scroll phase.
-pub(crate) const K_CG_SCROLL_WHEEL_EVENT_SCROLL_PHASE: i32 = 99;
-/// kCGScrollWheelEventMomentumPhase field (field 123): momentum phase.
-pub(crate) const K_CG_SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: i32 = 123;
-
-#[allow(dead_code)]
-pub(crate) const SCROLL_PHASE_BEGAN: i64 = 1;
-#[allow(dead_code)]
-pub(crate) const SCROLL_PHASE_CHANGED: i64 = 2;
-#[allow(dead_code)]
-pub(crate) const SCROLL_PHASE_ENDED: i64 = 4;
-
-#[allow(dead_code)]
-pub(crate) const MOMENTUM_PHASE_BEGAN: i64 = 1;
-#[allow(dead_code)]
-pub(crate) const MOMENTUM_PHASE_CHANGED: i64 = 2;
-#[allow(dead_code)]
-pub(crate) const MOMENTUM_PHASE_ENDED: i64 = 3;
