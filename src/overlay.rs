@@ -902,20 +902,46 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
 }
 
 /// 按配置选择浮窗目标屏幕的 frame(全局坐标系)。
-/// - "main":始终主屏幕(NSScreen mainScreen,历史行为)。
+/// - "main":始终主显示器(NSScreen.screens 的 index 0,系统保证首屏带菜单栏)。
 /// - "active_window":跟随激活窗口——取激活窗口 bounds 中心点所在的屏幕;激活窗口
-///   bounds 不可用(全 0 / 无窗口)或中心不在任何屏幕上时,回退主屏幕。
+///   bounds 不可用(全 0 / 无窗口)或中心不在任何屏幕上时,回退主显示器。
+///
+/// 注意不能用 NSScreen.mainScreen 当"主屏":它的语义是"包含键盘焦点窗口的屏幕",
+/// 召唤浮窗时焦点在激活应用上,若激活应用在副屏,mainScreen 返回副屏,"始终主屏"
+/// 就会表现成跟随激活窗口。主显示器 = screens[0]。
 ///
 /// Pick the target screen frame for the overlay (global coords) per config:
-/// - "main": always the main screen (NSScreen mainScreen, historical behavior).
+/// - "main": always the primary display (index 0 of NSScreen.screens; the first entry is
+///   guaranteed to host the menu bar).
 /// - "active_window": follow the active window -- the screen containing the center of the
-///   active window's bounds; falls back to the main screen when the bounds are unavailable
+///   active window's bounds; falls back to the primary display when the bounds are unavailable
 ///   (all zeros / no windows) or the center isn't on any screen.
+///
+/// Note: NSScreen.mainScreen must NOT be used as "the primary screen" -- it returns the screen
+/// containing the key window, so summoning while the active app sits on a secondary display
+/// would resolve to that display, making "always on main screen" behave like "follow active
+/// window". The primary display is screens[0].
 fn overlay_target_screen(windows: &[WindowInfo]) -> NSRect {
     unsafe {
-        let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-        let main_frame: NSRect = msg_send![main, frame];
         let pos = CONFIG.read().unwrap().windows.overlay_position.clone();
+        // 主显示器 = screens[0](系统保证首屏带菜单栏);screens 为空时回退 mainScreen。
+        // Primary display = screens[0] (first entry hosts the menu bar); fall back to
+        // mainScreen if the screens array is somehow empty.
+        let main_frame: NSRect = {
+            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+            let count: usize = msg_send![screens, count];
+            if count > 0 {
+                // objectAtIndex: 的参数编码是 'q'(signed long),必须传 isize/i64;
+                // 传整数字面量会被推断为 i32('i'),objc2 运行时校验会 panic。
+                // objectAtIndex: expects a 'q' (signed long) argument; pass isize/i64 or
+                // objc2's runtime encoding check panics on an i32 literal.
+                let s: *mut AnyObject = msg_send![screens, objectAtIndex: 0isize];
+                msg_send![s, frame]
+            } else {
+                let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+                msg_send![main, frame]
+            }
+        };
         if pos != "active_window" {
             return main_frame;
         }
@@ -938,7 +964,9 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> NSRect {
         let count: usize = msg_send![screens, count];
         let mut i = 0usize;
         while i < count {
-            let s: *mut AnyObject = msg_send![screens, objectAtIndex: i];
+            // 同 934 行:objectAtIndex: 参数编码 'q',传 isize(usize 编码 'Q' 也会校验失败)。
+            // Same as line 934: objectAtIndex: wants 'q'; usize ('Q') would fail the check too.
+            let s: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
             let f: NSRect = msg_send![s, frame];
             if cx >= f.origin.x
                 && cx <= f.origin.x + f.size.width
