@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "oh-my-tab"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "flume",
  "objc2",
