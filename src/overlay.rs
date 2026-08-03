@@ -464,6 +464,16 @@ pub(crate) fn vanish_overlay() {
             // Ignore mouse events so the invisible panel doesn't swallow clicks (until the
             // delayed orderOut actually removes it).
             let _: () = msg_send![window.0, setIgnoresMouseEvents: true];
+            // 释放面板的 key window 状态:否则 0.2s 后 orderOut 时 AppKit 会把 key 提升给
+            // 我们 app 的下一个可见窗口(设置窗口),重新激活我们,把目标窗口的焦点抢走
+            // (目标红绿灯变灰,日志里可见切换后我们 app 的激活通知反复出现)。
+            // 先释放 key 再激活目标,目标才能干净地拿到 key 焦点。
+            // Resign the panel's key-window state: otherwise, when orderOut fires 0.2s later,
+            // AppKit promotes the key to our app's next visible window (the settings window),
+            // re-activating us and stealing focus from the target (grey traffic lights; the log
+            // shows our app's activation notification repeatedly following switches). Resigning
+            // key before activating the target lets the target take key focus cleanly.
+            let _: () = msg_send![window.0, resignKeyWindow];
         }
     }
 }

@@ -145,6 +145,7 @@ unsafe fn dlopen_path(path: &str) -> *mut c_void {
 type AxGetWindowFn = unsafe extern "C" fn(AXUIElementRef, *mut u32) -> AXError;
 type GetProcessForPIDFn = unsafe extern "C" fn(i32, *mut ProcessSerialNumber) -> i32;
 type SlpSetFrontFn = unsafe extern "C" fn(*mut ProcessSerialNumber, u32, i32) -> i32;
+type SlpsPostEventRecordFn = unsafe extern "C" fn(*mut ProcessSerialNumber, *mut u8) -> i32;
 
 static AX_GET_WINDOW: std::sync::LazyLock<Option<AxGetWindowFn>> = std::sync::LazyLock::new(
     || unsafe {
@@ -190,6 +191,23 @@ static SLP_SET_FRONT: std::sync::LazyLock<Option<SlpSetFrontFn>> =
             None
         } else {
             Some(std::mem::transmute::<*mut c_void, SlpSetFrontFn>(p))
+        }
+    });
+static SLPS_POST_EVENT_RECORD: std::sync::LazyLock<Option<SlpsPostEventRecordFn>> =
+    std::sync::LazyLock::new(|| unsafe {
+        // make_key_window 的合成鼠标事件也走 SkyLight 的 SLPSPostEventRecordTo。
+        // Synthetic mouse events for make_key_window go through SkyLight's
+        // SLPSPostEventRecordTo as well.
+        let name = b"SLPSPostEventRecordTo\0";
+        let h = dlopen_path("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight");
+        if h.is_null() {
+            return None;
+        }
+        let p = dlsym(h, name.as_ptr() as *const c_char);
+        if p.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, SlpsPostEventRecordFn>(p))
         }
     });
 
@@ -239,6 +257,16 @@ pub(crate) unsafe fn focused_window_cgwid(pid: i32) -> Option<u32> {
 /// Raise only one window (by CGWindowID) at the WindowServer level via the
 /// SkyLight private API _SLPSSetFrontProcessWithOptions -- does NOT raise all
 /// of the app's windows the way activate(AllWindows) does.
+///
+/// mode 用 0x200(kCPSUserGenerated,yabai kCPS* 定义,AltTab 同款):把这次切换标记为
+/// 「用户发起」。macOS 14+ 对非用户发起的程序化前台切换会抑制输入焦点转移(目标窗口
+/// 变灰红绿灯,需要点击才能获得焦点),0x200 是绕过该抑制的关键。旧代码传的 2 不是
+/// 有效标志位,正是灰红绿灯的根因之一。
+/// The mode is 0x200 (kCPSUserGenerated, from yabai's kCPS* constants, same as AltTab):
+/// it marks this front-switch as user-initiated. macOS 14+ suppresses input-focus transfer
+/// for non-user-initiated programmatic front-switches (the target window's traffic lights go
+/// grey until a click); 0x200 is what bypasses that suppression. The old code passed 2, which
+/// is not a valid flag -- one root cause of the grey traffic lights.
 unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
     let get_psn = match *GET_PROCESS_FOR_PID {
         Some(f) => f,
@@ -255,8 +283,67 @@ unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
     if get_psn(pid, &mut psn) != 0 {
         return false;
     }
-    // mode 2 = userGenerated（BetterCmdTab 的取值）。
-    set_front(&mut psn, wid, 2) == 0 // CGError success == 0
+    set_front(&mut psn, wid, 0x200) == 0 // kCPSUserGenerated; CGError success == 0
+}
+
+/// 用 SkyLight 私有 API SLPSPostEventRecordTo 向目标窗口投递一对合成鼠标按下/抬起事件，
+/// 使该窗口成为其 App 的 key window（红绿灯变彩色）。macOS 14+ 把 NSRunningApplication
+/// activate 降级为「建议性请求」，跨 App 转移 key 焦点只剩这条可靠路径；0x200 的
+/// userGenerated 前台切换只解决「抬到前面」，key 状态必须靠这个合成点击确立。
+/// 点击点取窗口外缘 (-1,-1)：按下仍会使窗口变 key，但命中不到任何内容（不会误点控件，
+/// 也避开 #5381 类全屏 UI 误触）。事件按 CGWindowID 定向投递，与坐标无关。
+/// 字节布局来自 AltTab 对 CGSInternal/CGSEvent.h 的反向工程；缓冲必须 ≥0x100 并清零，
+/// 否则 macOS 14.7.4+ 的 CGSEncodeEventRecord 会越界读取导致 SIGABRT（paneru#123）。
+///
+/// Make the window `wid` the key window of its app by posting a synthetic left-click
+/// (down then up) to the WindowServer via the SkyLight private API SLPSPostEventRecordTo.
+/// macOS 14+ downgraded NSRunningApplication.activate to an advisory "request"; posting
+/// this click is the only reliable way left to move key focus across apps. The 0x200
+/// userGenerated front-switch only fronts the window -- the key state needs this click.
+/// The click is aimed just outside the window at (-1,-1): the press still makes the window
+/// key, but it hit-tests to no view (nothing is clicked; avoids fullscreen-UI edge hits).
+/// The event is delivered to the window by CGWindowID, not by the click point. The byte
+/// layout is AltTab's reverse-engineering of CGSInternal/CGSEvent.h; the buffer must be
+/// at least 0x100 bytes and zeroed, or CGSEncodeEventRecord reads past it on macOS 14.7.4+
+/// and SIGABRTs (paneru issue 123).
+unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
+    let get_psn = match *GET_PROCESS_FOR_PID {
+        Some(f) => f,
+        None => return false,
+    };
+    let post = match *SLPS_POST_EVENT_RECORD {
+        Some(f) => f,
+        None => return false,
+    };
+    let mut psn = ProcessSerialNumber {
+        high_long_of_psn: 0,
+        low_long_of_psn: 0,
+    };
+    if get_psn(pid, &mut psn) != 0 {
+        return false;
+    }
+    // 0x100 字节清零缓冲:记录本身声明长度 0xf8(offset 0x04),多分配防止越界读崩溃。
+    // Zeroed 0x100-byte buffer: the record declares 0xf8 (offset 0x04); the extra space
+    // prevents the out-of-bounds read crash.
+    let mut bytes = vec![0u8; 0x100];
+    bytes[0x04] = 0xf8; // 记录长度 / record length
+    bytes[0x3a] = 0x10; // 未公开标志(yabai/Hammerspoon 同款)/ undocumented flag (as yabai/Hammerspoon)
+    // 目标 CGWindowID @ 0x3c(4 字节,小端)/ target CGWindowID @ 0x3c (4 bytes, LE)
+    bytes[0x3c..0x40].copy_from_slice(&wid.to_le_bytes());
+    // 窗口相对点击点 @ 0x20(16 字节 = CGPoint 两个 f64)/ window-relative click point @ 0x20
+    bytes[0x20..0x28].copy_from_slice(&(-1.0f64).to_le_bytes());
+    bytes[0x28..0x30].copy_from_slice(&(-1.0f64).to_le_bytes());
+    // 0x08 = CGSEventType:先按下一(0x01)再抬起(0x02),一对合成点击使窗口变 key。
+    // 0x08 = CGSEventType: post a left-mouse-down (0x01) then -up (0x02); the pair makes
+    // the window key.
+    bytes[0x08] = 0x01;
+    let ok1 = post(&mut psn, bytes.as_mut_ptr()) == 0;
+    bytes[0x08] = 0x02;
+    let ok2 = post(&mut psn, bytes.as_mut_ptr()) == 0;
+    if !ok1 || !ok2 {
+        log_info!("make_key_window: SLPSPostEventRecordTo failed (down={} up={})", ok1, ok2);
+    }
+    ok1 && ok2
 }
 
 fn cf_string_new(s: &str) -> *const c_void {
@@ -666,11 +753,20 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
         return;
     }
     unsafe {
-        // 1. WindowServer 层只抬这一个窗口（SkyLight 私有 API _SLPSSetFrontProcessWithOptions），
-        //    避免 activate(AllWindows) 把该 App 的所有窗口都抬到前面。
-        //    Raise only this one window at the WindowServer level (SkyLight private API),
-        //    avoiding activate(AllWindows) raising every window of the app.
+        // 1. WindowServer 层只抬这一个窗口（SkyLight 私有 API _SLPSSetFrontProcessWithOptions，
+        //    mode=0x200 userGenerated），避免 activate(AllWindows) 把该 App 的所有窗口都抬到前面。
+        //    Raise only this one window at the WindowServer level (SkyLight private API,
+        //    mode=0x200 userGenerated), avoiding activate(AllWindows) raising every window.
         let slps_ok = raise_window_slps(pid, cgwid);
+
+        // 1.5 合成鼠标点击确立 key window：SLPS 只负责「抬到前面 + 设为前台进程」，key 状态
+        //    必须由这个合成点击授予（macOS 14+ 无公开 API 可跨 App 转移 key 焦点）。
+        //    顺序对齐 AltTab：SLPS → makeKeyWindow → AXRaise。失败不影响窗口抬起，仅记日志。
+        //    The synthetic click establishes the key window: SLPS only fronts the window and
+        //    process; the key state is granted by this click (macOS 14+ has no public API to
+        //    move key focus across apps). Order mirrors AltTab: SLPS → makeKeyWindow → AXRaise.
+        //    Failure doesn't stop the raise, it is only logged.
+        let _ = make_key_window(pid, cgwid);
 
         // 2. AX 层聚焦该窗口：找到 CGWindowID 对应的 AX 窗口，setFocusedWindow + AXRaise。
         //    Focus the window via AX: find the AX window with this CGWindowID, then
