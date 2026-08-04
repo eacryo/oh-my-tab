@@ -13,6 +13,9 @@ reload_config = "重新加载配置"
 clear_icon_cache = "清空图标缓存"
 quit = "退出"
 
+[overlay]
+no_windows = "没有可切换的窗口"
+
 [settings]
 window_title = "设置"
 header_appearance = "外观"

@@ -12,6 +12,9 @@ reload_config = "Reload Config"
 clear_icon_cache = "Clear Icon Cache"
 quit = "Quit"
 
+[overlay]
+no_windows = "No windows to switch"
+
 [settings]
 window_title = "Settings"
 header_appearance = "Appearance"

@@ -17,6 +17,7 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::config::{self, CONFIG};
 use crate::ffi::*;
+use crate::i18n::t;
 use crate::theme::*;
 use crate::window_collector::{
     bump_window_mru, extract_icon_to_cache, raise_ax_window, WindowInfo,
@@ -212,11 +213,15 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
             state.selected
         );
     } else {
+        // 空窗口/选中越界:没有可切换的目标,直接收起浮窗(否则会停留在桌面上)。
+        // Empty list / out-of-range selection: no switchable target, dismiss the overlay
+        // (otherwise it would stay stuck on the desktop).
         log_info!(
             "CmdReleased: selected index {} out of bounds (windows={})",
             state.selected,
             state.windows.len()
         );
+        hide_overlay();
     }
     state.visible = false;
 }
@@ -240,6 +245,12 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
         activate_and_raise(pid, cgwid);
         schedule_delayed_order_out();
         bump_window_mru(&mut state.mru, pid, cgwid);
+        state.visible = false;
+    } else {
+        // 空窗口时无卡片可点,理论上不可达;防御性收起浮窗(与 on_cmd_released 一致)。
+        // Unreachable in practice (no cards when the list is empty); defensive dismiss,
+        // same as on_cmd_released.
+        hide_overlay();
         state.visible = false;
     }
 }
@@ -323,6 +334,11 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                     activate_and_raise(pid, cgwid);
                     schedule_delayed_order_out();
                     bump_window_mru(&mut state.mru, pid, cgwid);
+                } else {
+                    // 空窗口/选中越界:无目标,直接收起浮窗(防御,与 on_cmd_released 一致)。
+                    // Empty list / out-of-range: no target, dismiss the overlay (defensive,
+                    // same as on_cmd_released).
+                    hide_overlay();
                 }
                 state.visible = false;
             }
@@ -396,10 +412,17 @@ pub(crate) fn update_status_label() {
             None => return,
         };
         let selected = state.selected;
-        // status_text 是窗口下面那一行长的应用名称
-        let status_text = match state.windows.get(selected) {
-            Some(w) => truncate_text(&display_title(&w.window_title), 126),
-            None => String::new(),
+        // status_text 是窗口下面那一行长的应用名称;窗口列表为空时显示"没有可切换的窗口"提示
+        // (召唤空窗口态,见 show_overlay)。
+        // status_text is the long app/window title line below the cards; with an empty window
+        // list it shows the "no windows to switch" hint (the empty-overlay state, see show_overlay).
+        let status_text = if state.windows.is_empty() {
+            t("overlay.no_windows")
+        } else {
+            match state.windows.get(selected) {
+                Some(w) => truncate_text(&display_title(&w.window_title), 126),
+                None => String::new(),
+            }
         };
         drop(state_opt);
 
@@ -657,7 +680,10 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
         for (old_view, frame, idx) in replacements {
             if let Some(w) = to_rebuild.get(&idx) {
                 remove_card_index(old_view);
-                let new_card = create_card_view(w, idx);
+                // 沿用旧卡 frame 的宽(图标异步加载后原位替换,卡宽可能已是拉伸值)。
+                // Reuse the old card frame's width (in-place icon replacement after async
+                // extraction; the width may already be a stretched value).
+                let new_card = create_card_view(w, idx, frame.size.width);
                 let _: () = msg_send![new_card, setFrame: frame];
                 let _: () = msg_send![old_view, removeFromSuperview];
                 let _: () = msg_send![container, addSubview: new_card];
@@ -757,12 +783,17 @@ unsafe fn grayed_image(orig: *mut AnyObject, size: NSSize) -> *mut AnyObject {
     img
 }
 
-pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
+pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) -> *mut AnyObject {
     unsafe {
         let card_cls = CARD_CLASS.lock().unwrap().unwrap();
         let card_cls_ptr = card_cls.0 as *mut AnyObject;
 
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_w(), card_h()));
+        // 卡宽由调用方传入:正常态 = 配置 card_w();卡片不足一行时拉伸填满(见 show_overlay)。
+        // 内部元素(图标/标签)全部按实际卡宽居中,拉伸后不会偏左。
+        // The card width comes from the caller: config card_w() normally, stretched to fill the
+        // row when fewer cards than slots (see show_overlay). All inner elements (icon/labels)
+        // are centered against the actual width, so a stretched card stays balanced.
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h()));
         let view: *mut AnyObject = msg_send![card_cls_ptr, alloc];
         let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
 
@@ -776,9 +807,9 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
         set_card_index(view, index);
 
         let colors = current_colors();
-        let icon_x = (card_w() - icon_px()) / 2.0; // 16.0
-                                                   // Standard coords: y=0 at bottom, y=200 at top.
-                                                   // Icon: 8px from top -> y = 200 - 8 - 128 = 64
+        let icon_x = (card_width - icon_px()) / 2.0; // 16.0
+                                                     // Standard coords: y=0 at bottom, y=200 at top.
+                                                     // Icon: 8px from top -> y = 200 - 8 - 128 = 64
         let icon_bottom = card_h() - 8.0 - icon_px(); // 64.0
 
         // --- Icon ---
@@ -873,7 +904,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
             name_font,
             name_color,
             name_bottom,
-            card_w(),
+            card_width,
             18.0,
         );
         let _: () = msg_send![view, addSubview: name_label];
@@ -890,7 +921,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
             title_font,
             win_color,
             title_bottom,
-            card_w(),
+            card_width,
             16.0,
         );
         let _: () = msg_send![view, addSubview: title_label];
@@ -902,7 +933,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize) -> *mut AnyObject {
         // mouseEntered 悬停事件。activeInActiveApp(0x40) 在 app 非激活时不投递。
         let opts: u64 = 0x01 | 0x80;
         let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_w(), card_h()));
+        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h()));
         let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds, options: opts, owner: view, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![view, addTrackingArea: ta];
         release_obj(ta); // view owns the tracking area; drop our alloc +1
@@ -1019,24 +1050,38 @@ pub(crate) fn show_overlay() {
         // Clear old card index mappings, then create new card views
         clear_card_indices();
         let h = window_height(count);
-        let cards_in_row = cards_per_row().min(count);
-        let w = window_width(cards_in_row);
-        let row_width =
-            cards_in_row as f64 * card_w() + (cards_in_row.saturating_sub(1)) as f64 * card_gap();
-        let start_x = (w - row_width) / 2.0;
+        // 窗口宽按「槽位」计算:最少 3 个槽位(count<3 时也保持三卡宽,空窗口态同样)。
+        // 槽位 = min(每行卡数配置, max(3, count))。
+        // The window width is based on "slots": at least 3 (count<3 and the empty state keep
+        // the three-card width). slots = min(cards-per-row config, max(3, count)).
+        let slots = cards_per_row().min(count.max(3));
+        let w = window_width(slots);
+        // 卡片不足槽位(1-2 卡)时拉伸填满整行,不留右空白;卡片内部元素按实际卡宽居中
+        // (见 create_card_view 的 card_width 参数)。其余情况用配置卡宽、行内居中。
+        // With fewer cards than slots (1-2), cards stretch to fill the row -- no right-side
+        // blank; inner elements center on the actual card width (see create_card_view's
+        // card_width). Otherwise the configured width applies and the row is centered.
+        let (card_w_eff, pitch, start_x) = if count > 0 && count < slots {
+            let inner = w - H_PADDING * 2.0;
+            let cw = (inner - (count as f64 - 1.0) * card_gap()) / count as f64;
+            (cw, cw + card_gap(), H_PADDING)
+        } else {
+            let row_width = slots as f64 * card_w() + (slots.saturating_sub(1)) as f64 * card_gap();
+            (card_w(), card_w() + card_gap(), (w - row_width) / 2.0)
+        };
 
         for (idx, w) in windows.iter().enumerate() {
-            let card = create_card_view(w, idx);
+            let card = create_card_view(w, idx, card_w_eff);
 
             // Standard coords: y=0 at bottom. Cards stack from top down.
             let col = idx % cards_per_row();
             let row = idx / cards_per_row();
-            let card_x = start_x + col as f64 * (card_w() + card_gap());
+            let card_x = start_x + col as f64 * pitch;
             // topmost card origin_y = h - 32.0 - card_h() (32 = top padding area)
             let card_y = h - 32.0 - (row + 1) as f64 * card_h();
             let card_frame = NSRect::new(
                 NSPoint::new(card_x, card_y),
-                NSSize::new(card_w(), card_h()),
+                NSSize::new(card_w_eff, card_h()),
             );
             let _: () = msg_send![card, setFrame: card_frame];
 

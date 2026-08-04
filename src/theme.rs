@@ -119,9 +119,12 @@ pub(crate) fn window_height(count: usize) -> f64 {
 }
 
 /// 浮窗宽度 = 卡片数 * 卡片宽 + 间距 + 两侧内边距。
+/// 下限为单卡宽度(cards_in_row.max(1)):任何情况下都不允许出现细条状窗口
+/// (空窗口态由 show_overlay 单独取三卡宽度,这里是兜底)。
 /// Overlay width = cards * card width + gaps + padding on both sides.
+/// Floor is one card's width (cards_in_row.max(1)): the overlay must never degenerate into a
+/// thin strip (the empty state takes the three-card width in show_overlay; this is the floor).
 pub(crate) fn window_width(cards_in_row: usize) -> f64 {
-    cards_in_row as f64 * card_w()
-        + (cards_in_row.saturating_sub(1)) as f64 * card_gap()
-        + H_PADDING * 2.0
+    let n = cards_in_row.max(1);
+    n as f64 * card_w() + (n - 1) as f64 * card_gap() + H_PADDING * 2.0
 }
