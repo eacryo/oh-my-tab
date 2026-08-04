@@ -26,6 +26,16 @@ extern "C" {
         client: *mut c_void,
         registry_id: u64,
     ) -> *mut c_void;
+    // 把 client 调度到 runloop:未调度的 client 匹配/registry-ID 映射不完整,归因用的
+    // CopyServiceForRegistryID 会持续失败(实测)。调度后匹配常驻,归因可靠。
+    // Schedule the client on a runloop: an unscheduled client's matching / registry-ID map is
+    // incomplete and CopyServiceForRegistryID keeps failing (measured). Scheduling keeps the
+    // matching live and makes attribution reliable.
+    pub(crate) fn IOHIDEventSystemClientScheduleWithRunLoop(
+        client: *mut c_void,
+        runloop: crate::event_tap::CFRunLoopRef,
+        mode: *const c_void,
+    );
 }
 
 // ========== 事件归因:IOHIDEvent sender ID(私有 SPI)/ Event attribution ==========

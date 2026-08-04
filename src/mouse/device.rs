@@ -80,6 +80,23 @@ unsafe impl Sync for DeviceRegistry {}
 
 static REGISTRY: OnceLock<Mutex<DeviceRegistry>> = OnceLock::new();
 
+/// 鼠标线程的 CFRunLoop(由 start_plug_monitor 记录)。注册表 client 要调度到这个
+/// runloop 匹配才会常驻(见 enumerate_locked);enumeration 可能先于插拔监听执行,
+/// 故用运行时读取而非启动时一次性传入。裸指针用 Send+Sync 包装(与 ManagerMutex 同款)。
+/// The mouse thread's CFRunLoop (recorded by start_plug_monitor). The registry client must be
+/// scheduled on it for matching to stay live (see enumerate_locked); enumeration can run before
+/// the plug monitor starts, so the value is read at runtime, not passed in once at startup.
+/// The raw pointer is wrapped with Send+Sync (same pattern as ManagerMutex).
+struct RunloopMutex(Mutex<Option<crate::event_tap::CFRunLoopRef>>);
+unsafe impl Send for RunloopMutex {}
+unsafe impl Sync for RunloopMutex {}
+
+static MOUSE_RUNLOOP: OnceLock<RunloopMutex> = OnceLock::new();
+
+fn mouse_runloop_static() -> &'static Mutex<Option<crate::event_tap::CFRunLoopRef>> {
+    &MOUSE_RUNLOOP.get_or_init(|| RunloopMutex(Mutex::new(None))).0
+}
+
 /// last_active 的设备 (VID, PID)(归因失败时的回退)。由 event_tap 回调在每次成功归因后更新。
 /// 存硬件身份而非进程内 id:设备重枚举后 id 会漂移(NEXT_ID 单调递增),而 VID/PID 稳定
 /// (蓝牙断连重连后不变),按硬件身份兜底才可靠。
@@ -180,6 +197,23 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
         // lets matching settle; only the fresh-client path has this race, so the hot
         // attribution path (reusing an old client) is unaffected.
         std::thread::sleep(std::time::Duration::from_millis(30));
+        // 调度到鼠标线程 runloop:未调度的 client 的 registry-ID 映射不完整,归因用的
+        // CopyServiceForRegistryID 会持续返回 nil(实测),滚动事件归因失败后回退到
+        // "所有鼠标"档 —— per-device 设置(如反转滚动)在启动后不生效,直到重新枚举
+        // 出可用的 client。调度后匹配常驻,归因可靠(LinearMouse 同款做法)。
+        // Schedule the client on the mouse thread's runloop: an unscheduled client's
+        // registry-ID map is incomplete and CopyServiceForRegistryID keeps returning nil
+        // (measured), so scroll attribution fails and falls back to the "All Mice" profile --
+        // per-device settings (e.g. reverse scrolling) don't apply after startup until a
+        // working client is re-enumerated. Scheduling keeps the matching live and makes
+        // attribution reliable (same approach as LinearMouse).
+        if let Some(rl) = *mouse_runloop_static().lock().unwrap() {
+            IOHIDEventSystemClientScheduleWithRunLoop(
+                reg.client,
+                rl,
+                crate::event_tap::kCFRunLoopDefaultMode,
+            );
+        }
     }
 
     let services = IOHIDEventSystemClientCopyServices(reg.client);
@@ -357,6 +391,10 @@ pub(crate) unsafe fn start_plug_monitor(runloop: crate::event_tap::CFRunLoopRef)
     if !m.is_null() {
         return;
     }
+    // 记录鼠标线程 runloop,供 enumerate_locked 调度注册表 client(归因可靠性)。
+    // Record the mouse thread's runloop for enumerate_locked to schedule the registry client
+    // (attribution reliability).
+    *mouse_runloop_static().lock().unwrap() = Some(runloop);
     let manager_obj = IOHIDManagerCreate(std::ptr::null(), 0);
     if manager_obj.is_null() {
         log_info!("[device] failed to create IOHIDManager");

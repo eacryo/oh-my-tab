@@ -135,7 +135,17 @@ unsafe extern "C" fn mouse_event_tap_callback(
         // Resolve the effective config for this device (merging "All Mice" + per-device profiles).
         let resolved = resolve::resolve(dev_key);
 
-        log_debug!("[mouse] scroll dy={} dx={} flags=0x{:x}", dy, dx, flags);
+        // 归因诊断放最前,与普通滚动日志区分开,便于排查 per-device 设置不生效。
+        // Attribution diagnostics lead the line, distinguishing it from plain scroll logs so
+        // per-device settings not applying is easy to spot.
+        log_debug!(
+            "[mouse] scroll dev={:?} dy={} dx={} flags=0x{:x} reverse={}",
+            dev_key,
+            dy,
+            dx,
+            flags,
+            resolved.reverse_scroll
+        );
 
         // Default / Line:计算 delta(透传或行数归一化 + 反转)-> post 合成事件 -> 丢弃原 event。
         // Default / Line: compute delta (passthrough or line-count normalization + reverse) ->
