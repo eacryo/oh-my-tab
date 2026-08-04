@@ -55,7 +55,7 @@ struct SettingsUi {
     icon_size: *mut AnyObject,
     modifier: *mut AnyObject,        // NSPopUpButton: option / command
     locale: *mut AnyObject,          // NSPopUpButton: auto / en / zh-Hans / zh-Hant
-    show_minimized: *mut AnyObject, // NSPopUpButton: 不显示 / 显示 / show minimized windows (hide / show)
+    show_minimized: *mut AnyObject, // NSSwitch: 显示最小化窗口 / show minimized windows
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
     log_level: *mut AnyObject,      // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // NSSwitch: 开机自启 / launch at login
@@ -196,10 +196,14 @@ unsafe fn make_popup(
 /// alloc +1,加入父视图后由调用方 release。
 /// Native toggle switch (NSSwitch: blue when on, grey when off; same as System Settings).
 /// alloc +1; caller releases after adding to parent.
-unsafe fn make_switch(x: f64, y: f64, h: f64, checked: bool) -> *mut AnyObject {
+/// 参数 right_x = 开关的右边界:所有开关右对齐到该边界,与下拉框(popup)的右缘
+/// (ctrl_x + ctrl_w)保持一致,开关行不再左对齐。
+/// The right_x parameter is the switch's RIGHT edge: every switch right-aligns to it, matching
+/// the popups' right edge (ctrl_x + ctrl_w), so switch rows no longer left-align.
+unsafe fn make_switch(right_x: f64, y: f64, h: f64, checked: bool) -> *mut AnyObject {
     let sw: *mut AnyObject = msg_send![class!(NSSwitch), alloc];
     let sw: *mut AnyObject =
-        msg_send![sw, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(0.0, 0.0))];
+        msg_send![sw, initWithFrame: NSRect::new(NSPoint::new(right_x, y), NSSize::new(0.0, 0.0))];
     // 用 setControlSize: 调小一档(small,regular 约 38x22,small 约 30x19),与设置行更协调。
     // setControlSize: shrinks the switch by one step (regular ~38x22, small ~30x19) so it fits
     // the settings rows better. fittingSize 再拿该档位的固有尺寸并垂直居中于行。
@@ -213,7 +217,7 @@ unsafe fn make_switch(x: f64, y: f64, h: f64, checked: bool) -> *mut AnyObject {
     let _: () = msg_send![
         sw,
         setFrame: NSRect::new(
-            NSPoint::new(x, y + (h - sw_h) / 2.0),
+            NSPoint::new(right_x - sw_w, y + (h - sw_h) / 2.0),
             NSSize::new(sw_w, sw_h)
         )
     ];
@@ -964,10 +968,10 @@ fn load_settings_from(cfg: &Config) {
             .map(|i| i as isize)
             .unwrap_or(0);
         let _: () = msg_send![ui.locale, selectItemAtIndex: loc_idx];
-        // show_minimized:下拉框 index 0 = 不显示(false), 1 = 显示(true)。
-        // show_minimized: popup index 0 = hide (false), 1 = show (true).
-        let sm_idx = if cfg.windows.show_minimized { 1 } else { 0 };
-        let _: () = msg_send![ui.show_minimized, selectItemAtIndex: sm_idx as isize];
+        // show_minimized:switch state(1=on / 0=off)。
+        // show_minimized: switch state (1=on / 0=off).
+        let sm_state = if cfg.windows.show_minimized { 1isize } else { 0isize };
+        let _: () = msg_send![ui.show_minimized, setState: sm_state];
         // overlay_position:下拉框 index 0 = 跟随激活窗口(active_window), 1 = 主屏幕(main)。
         // overlay_position: popup index 0 = follow active window (active_window), 1 = main (main).
         let op_idx = match cfg.windows.overlay_position.as_str() {
@@ -1123,10 +1127,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             .get(loc_idx as usize)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "auto".into());
-        // show_minimized:下拉框 index 0 = 不显示(false), 1 = 显示(true)。
-        // show_minimized: popup index 0 = hide (false), 1 = show (true).
-        let sm_idx: isize = msg_send![ui.show_minimized, indexOfSelectedItem];
-        cfg.windows.show_minimized = sm_idx == 1;
+        // show_minimized:switch state(1=on / 0=off)。
+        // show_minimized: switch state (1=on / 0=off).
+        let sm_state: isize = msg_send![ui.show_minimized, state];
+        cfg.windows.show_minimized = sm_state == 1;
         // overlay_position:下拉框 index 0 = 跟随激活窗口, 1 = 主屏幕。
         // overlay_position: popup index 0 = follow active window, 1 = main.
         let op_idx: isize = msg_send![ui.overlay_position, indexOfSelectedItem];
@@ -1823,21 +1827,21 @@ fn create_settings_window() {
             content_w - 24.0,
         );
         y -= 8.0 + row_h;
-        // show_minimized 下拉框:项 = [不显示, 显示];默认 index 0(不显示)。
-        // show_minimized popup: items = [Hide, Show]; default index 0 (hide).
-        let sm_labels = [
-            t("settings.show_minimized_hide"),
-            t("settings.show_minimized_show"),
-        ];
-        let sm_label_refs: Vec<&str> = sm_labels.iter().map(|s| s.as_str()).collect();
+        // show_minimized 开关(切换器语义本就只有显/隐两态,用 Toggle 比下拉更直观)。
+        // 英文标签 "Show minimized windows on switch"(215pt)超出默认 label_w=150,
+        // 该行标签加宽到 225;开关与所有开关行一样右对齐到 popup 右缘(ctrl_x + ctrl_w)。
+        // show_minimized as a switch (the option is inherently two-state, so a toggle is more
+        // intuitive than a popup). The English label (215pt) exceeds the default label_w=150,
+        // so this row widens its label to 225; the switch right-aligns to the popups' right
+        // edge (ctrl_x + ctrl_w), like every other switch row.
         ui.show_minimized = add_row(
             general_view,
             label_x,
             y,
-            label_w,
+            225.0,
             row_h,
             &t("settings.row_show_minimized"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &sm_label_refs, 0),
+            make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
         y -= 8.0 + row_h;
         // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0(跟随激活窗口)。
@@ -1899,7 +1903,7 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_launch_at_login"),
-            make_switch(ctrl_x, y, row_h, false),
+            make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
 
         // ===== 实验性页内容 experimental page content =====
@@ -2000,7 +2004,7 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_enable_mouse"),
-            make_switch(ctrl_x, y, row_h, false),
+            make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
         // switch toggle 时实时更新 OK 按钮标题(确认 vs 确认并重启)。
         // Update OK button title in real time when the switch toggles (OK vs OK && Restart).
@@ -2107,7 +2111,7 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_reverse_scroll"),
-            make_switch(ctrl_x, y, row_h, false),
+            make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
 
         // --- 指针 Pointer ---
@@ -2121,16 +2125,21 @@ fn create_settings_window() {
         );
         y -= 8.0 + row_h;
         // disable_pointer_accel 开关:禁用系统鼠标加速,光标 1:1 线性跟踪。
+        // 英文标签 "Disable pointer acceleration (linear tracking)"(269pt)超出默认
+        // label_w=150 会被截断;该行标签加宽到 285。开关与所有开关行一样右对齐到
+        // popup 右缘(ctrl_x + ctrl_w)。
         // disable_pointer_accel switch: disable system pointer acceleration for 1:1 linear
-        // cursor tracking.
+        // cursor tracking. The English label (269pt) exceeds the default label_w=150 and would
+        // truncate; this row widens its label to 285. The switch right-aligns to the popups'
+        // right edge (ctrl_x + ctrl_w), like every other switch row.
         ui.disable_pointer_accel = add_row(
             mouse_view,
             label_x,
             y,
-            label_w,
+            285.0,
             row_h,
             &t("settings.row_disable_pointer_accel"),
-            make_switch(ctrl_x, y, row_h, false),
+            make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
 
         // banner 最后添加:作为 general_view 的最后一个 subview,保证在内容之上(缺权限时覆盖顶部)。
