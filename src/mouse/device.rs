@@ -333,6 +333,22 @@ fn manager_static() -> &'static Mutex<*mut c_void> {
     &MANAGER.get_or_init(|| ManagerMutex(Mutex::new(std::ptr::null_mut()))).0
 }
 
+/// 插拔回调防抖:启动时 IOHIDManager 会对在场设备触发一连串 matching 回调,而每次处理
+/// (重建 client + 指针重应用)又会反向触发下一次回调,形成 6-7 连发的反馈循环 —— 既
+/// 刷日志噪音,又拉长启动繁忙窗口(macOS 对繁忙期未及时服务的 tap 会自动禁用,见
+/// event_tap.rs 的看门狗)。500ms 内只处理第一次,后续回调直接跳过,循环随之断开。
+/// 真实的重插拔周期远大于 500ms,不会误合并。
+///
+/// Plug-callback debounce: at startup IOHIDManager fires a burst of matching callbacks for
+/// on-screen devices, and each handling (client rebuild + pointer re-apply) triggers the next
+/// callback -- a 6-7 round feedback loop that spams the log and lengthens the busy startup
+/// window (macOS auto-disables taps that don't service events during that window; see the
+/// watchdog in event_tap.rs). Only the first callback within 500ms is processed; the rest are
+/// skipped, breaking the loop. Real re-plug cycles are far longer than 500ms, so no legitimate
+/// event gets merged away.
+static LAST_PLUG_HANDLE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+const PLUG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// IOHIDManager 回调:设备接入/移除时,强制重建注册表(重建 IOHIDEventSystemClient)。
 /// 蓝牙鼠标休眠断连重连正是走这里——重连触发 removal+matching 回调,重建后归因链恢复,
 /// 不必等下一次归因失败才自愈。重建后还要重新应用指针加速设置:加速度属性写在旧的
@@ -352,6 +368,15 @@ unsafe extern "C" fn device_change_callback(
     _sender: *mut c_void,
     _callback: *mut c_void,
 ) {
+    // 防抖(见 LAST_PLUG_HANDLE 注释):500ms 内的重复插拔回调只处理第一次。
+    // Debounce (see LAST_PLUG_HANDLE): only the first plug callback within 500ms is handled.
+    {
+        let mut last = LAST_PLUG_HANDLE.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < PLUG_DEBOUNCE) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
     {
         let mut reg = registry().lock().unwrap();
         enumerate_locked(&mut reg, true);

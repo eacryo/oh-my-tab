@@ -17,6 +17,7 @@ pub(crate) type CGEventRef = *mut c_void;
 pub(crate) type CGEventTapProxy = *mut c_void;
 pub(crate) type CFMachPortRef = *mut c_void;
 pub(crate) type CFRunLoopSourceRef = *mut c_void;
+pub(crate) type CFRunLoopTimerRef = *mut c_void;
 pub(crate) type CFRunLoopRef = *mut c_void;
 pub(crate) type CFStringRef = *mut c_void;
 pub(crate) type CFAllocatorRef = *mut c_void;
@@ -32,6 +33,11 @@ pub(crate) type CGEventTapCallBack = Option<
         user_info: *mut c_void,
     ) -> CGEventRef,
 >;
+
+/// CFRunLoopTimer 回调:参数为 (timer, info)。
+/// CFRunLoopTimer callout: (timer, info).
+pub(crate) type CFRunLoopTimerCallBack =
+    Option<unsafe extern "C" fn(CFRunLoopTimerRef, *mut c_void)>;
 
 // ========== CGEventTap 语义常量 / semantic constants ==========
 // 用语义化枚举替代裸数字,降低各调用方硬编码出错概率。
@@ -91,6 +97,9 @@ extern "C" {
     ) -> CFMachPortRef;
 
     pub(crate) fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+    // 查询 tap 是否被系统启用(看门狗用)。
+    // Query whether the tap is enabled system-side (used by the watchdog).
+    pub(crate) fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
     pub(crate) fn CGEventGetIntegerValueField(event: CGEventRef, field: i32) -> i64;
     pub(crate) fn CGEventSetIntegerValueField(event: CGEventRef, field: i32, value: i64);
     #[allow(dead_code)]
@@ -157,6 +166,27 @@ extern "C" {
     pub(crate) fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     pub(crate) fn CFRunLoopRun();
     pub(crate) fn CFRunLoopStop(rl: CFRunLoopRef);
+
+    // 定时器(看门狗用)。fireDate 传 0 表示下一个 runloop 周期立即触发一次,interval 为周期(秒)。
+    // 注意 context 参数是指向 CFRunLoopTimerContext 结构体的指针,Create 会拷贝其内容,
+    // info 字段在回调时原样传回 —— 这里 info 就是 tap 指针。
+    // Timer (for the watchdog). fireDate=0 fires on the next runloop pass, interval is the period
+    // in seconds. The context argument points to a CFRunLoopTimerContext struct which Create copies;
+    // its info field is passed back to the callback -- here info is the tap pointer.
+    pub(crate) fn CFRunLoopTimerCreate(
+        allocator: CFAllocatorRef,
+        fire_date: f64,
+        interval: f64,
+        flags: u32,
+        order: i64,
+        callback: CFRunLoopTimerCallBack,
+        context: *mut c_void,
+    ) -> CFRunLoopTimerRef;
+    pub(crate) fn CFRunLoopAddTimer(
+        rl: CFRunLoopRef,
+        timer: CFRunLoopTimerRef,
+        mode: CFStringRef,
+    );
 
     pub(crate) static kCFRunLoopDefaultMode: CFStringRef;
 }
@@ -254,6 +284,66 @@ pub(crate) unsafe fn create_tap_with_retry(
     Some(tap)
 }
 
+// ========== tap 看门狗 / tap watchdog ==========
+
+/// CFRunLoopTimerCreate 的 context 结构体(version=0,info 在回调时原样传回)。
+/// Context struct for CFRunLoopTimerCreate (version=0; info is passed back to the callback).
+#[repr(C)]
+struct CFRunLoopTimerContext {
+    version: isize,
+    info: *mut c_void,
+    retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
+    release: Option<unsafe extern "C" fn(*const c_void)>,
+    copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
+}
+
+/// 看门狗回调:周期性检查 tap 是否被系统禁用,禁用则重新启用(自愈)。
+/// macOS 会对「启动期繁忙/调试器附着时未及时服务事件」的 tap 自动禁用 —— 禁用后
+/// tap 线程仍在 runloop 里等待,但事件再也不送达(快捷键静默失效,表现为
+/// "Event monitor started" 打过后按键无任何反应)。每 3s 检查一次,发现被禁用就
+/// CGEventTapEnable 重新启用并打日志,无论禁用机制如何都能恢复。
+///
+/// Watchdog callback: periodically checks whether the system disabled the tap and re-enables it.
+/// macOS auto-disables taps that fail to service events promptly (busy startup / debugger attach);
+/// after that the tap thread keeps waiting in its runloop but events stop arriving (the shortcut
+/// silently dies -- "Event monitor started" was logged yet keys do nothing). Checks every 3s and
+/// re-enables via CGEventTapEnable when disabled, logging the recovery -- self-healing regardless
+/// of what caused the disable.
+unsafe extern "C" fn tap_watchdog_callback(_timer: CFRunLoopTimerRef, info: *mut c_void) {
+    let tap = info as CFMachPortRef;
+    if tap.is_null() {
+        return;
+    }
+    if !CGEventTapIsEnabled(tap) {
+        CGEventTapEnable(tap, true);
+        log_info!("[tap] event tap was disabled by the system; re-enabled.");
+    }
+}
+
+/// 在 tap 所在线程挂一个 3s 周期的看门狗定时器(info = tap 指针)。
+/// Attach a 3s-period watchdog timer to the tap's thread (info = the tap pointer).
+unsafe fn start_tap_watchdog(tap: CFMachPortRef) {
+    let ctx = CFRunLoopTimerContext {
+        version: 0,
+        info: tap,
+        retain: None,
+        release: None,
+        copy_description: None,
+    };
+    let timer = CFRunLoopTimerCreate(
+        std::ptr::null_mut(),
+        0.0, // 下一个 runloop 周期立即检查一次 / fire on the next runloop pass
+        3.0, // 之后每 3s / then every 3s
+        0,
+        0,
+        Some(tap_watchdog_callback),
+        &ctx as *const CFRunLoopTimerContext as *mut c_void,
+    );
+    if !timer.is_null() {
+        CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+    }
+}
+
 /// 在专用线程上启动一个 CGEventTap + CFRunLoop。
 /// 封装通用的"起线程 -> 建 tap(带重试) -> 加 RunLoop source -> 阻塞"流程。
 ///
@@ -298,6 +388,10 @@ pub(crate) fn start_event_tap_thread(
             return;
         }
 
+        // 看门狗:系统可能在启动期/调试器下禁用 tap,挂定时器定期检查并自愈。
+        // Watchdog: the system may disable the tap during busy startup or under a debugger;
+        // attach a periodic check that self-heals it.
+        start_tap_watchdog(tap.unwrap());
         on_started();
         CFRunLoopRun();
     })

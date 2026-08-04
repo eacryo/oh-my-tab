@@ -7,7 +7,7 @@
 //! this module keeps only the keyboard-shortcut matching logic and the GlobalEvent enum.
 
 use crate::event_tap::{self, tap_location, tap_options, tap_placement};
-use crate::log_info;
+use crate::{log_debug, log_info};
 use flume::Sender;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +49,18 @@ unsafe extern "C" fn event_tap_callback(
                 crate::event_tap::CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE)
                     as u16;
             let flags = crate::event_tap::CGEventGetFlags(event);
+
+            // 诊断日志(debug 档):每次 keyDown 都打,用于判断键盘 tap 是否收到事件。
+            // 复现"快捷键失效"时看这条 —— 完全没日志 = tap 被系统层拦截/禁用;
+            // 有日志但没召唤 = 下游(bridge/主线程)问题。
+            // Diagnostic log (debug tier): logged on every keyDown to tell whether the keyboard
+            // tap receives events. When "shortcut dead" reproduces: no lines at all = the tap is
+            // being blocked/disabled system-side; lines but no summon = downstream (bridge/main).
+            log_debug!(
+                "[kbd] keyDown keycode={} flags=0x{:x}",
+                keycode,
+                flags
+            );
 
             if keycode == K_VK_TAB {
                 let mod_mask = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
