@@ -621,6 +621,29 @@ unsafe fn rebuild_device_popup(ui: &SettingsUi) {
     *DEVICE_POPUP_KEYS.lock().unwrap() = keys;
 }
 
+/// 设置窗口开着时即时刷新设备下拉框(由插拔事件经主线程调用)。
+/// 设备列表是外部实时状态(硬件插拔),不属于 OK/Cancel 门控范围——重连后应立即显示,
+/// 无需点确定或重开设置。重建下拉用内存态 SELECTED_DEVICE 恢复选中,不会重置用户
+/// 未保存的选择。窗口未打开时无操作(下次打开时 load_settings_values 仍会重建)。
+///
+/// Refresh the device popup live while the settings window is open (called on the main
+/// thread from device plug/unplug events). The device list is external live state (hardware
+/// attach/detach), not part of the OK/Cancel-gated preferences -- a reconnect should show
+/// immediately without OK or reopening. The rebuild restores the selection from the in-memory
+/// SELECTED_DEVICE, so unsaved choices survive. No-op when the window isn't open (it is
+/// rebuilt on next open via load_settings_values anyway).
+pub(crate) fn refresh_device_popup_if_open() {
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            let visible: bool = msg_send![u.window, isVisible];
+            if visible {
+                rebuild_device_popup(u);
+            }
+        }
+    }
+}
+
 /// 设备下拉框切换回调:更新 SELECTED_DEVICE 并即时刷新其余控件为新设备的有效值。
 /// Device-popup selection-changed callback: update SELECTED_DEVICE and immediately refresh the
 /// other controls with the newly-selected device's effective values.

@@ -243,6 +243,26 @@ extern "C" fn on_locale_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void
     invalidate_settings_window();
 }
 
+/// 鼠标插拔回调(在鼠标线程执行)经 performSelectorOnMainThread 转到主线程后的重入点:
+/// 设置窗口开着时即时刷新设备下拉框(重连后立即显示,无需点确定/重开)。
+/// Re-entry point after the mouse-thread plug/unplug callback hops to the main thread via
+/// performSelectorOnMainThread: refresh the settings device popup live (a reconnect shows
+/// immediately, no OK/reopen needed).
+extern "C" fn on_devices_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    unsafe {
+        let is_main: bool = msg_send![class!(NSThread), isMainThread];
+        if !is_main {
+            let _: () = msg_send![_self as *mut AnyObject,
+                performSelectorOnMainThread: sel!(handleDevicesChanged:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+            return;
+        }
+    }
+    crate::settings::refresh_device_popup_if_open();
+}
+
 // ========== Class Registration ==========
 
 fn register_classes() {
@@ -527,6 +547,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleDelayedOrderOut:),
             on_delayed_order_out as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleDevicesChanged:),
+            on_devices_changed as *mut c_void,
             types_v_obj.as_ptr(),
         );
         objc_registerClassPair(cls);

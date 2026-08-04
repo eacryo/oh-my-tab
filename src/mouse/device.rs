@@ -19,7 +19,7 @@ use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
 use crate::mouse::ffi::*;
 use crate::{log_debug, log_info};
 use objc2::runtime::AnyObject;
-use objc2::{class, msg_send};
+use objc2::{class, msg_send, sel};
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
@@ -172,6 +172,14 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
         let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
         IOHIDEventSystemClientSetMatchingMultiple(reg.client, arr as *const c_void);
         CFRelease(page_key as *const c_void);
+        // IOHIDEventSystemClient 的匹配是异步的:刚创建/重建后立刻 CopyServices 可能拿到
+        // 空列表(实测枚举结果在 0/1 间摇摆)。等 ~30ms 让匹配完成,枚举才可靠。
+        // 该竞态只在新建 client 的路径出现,复用旧 client 的热路径(事件归因)不受影响。
+        // Matching on IOHIDEventSystemClient is asynchronous: CopyServices right after
+        // creation/rebuild can return an empty list (measured 0/1 flapping). Waiting ~30ms
+        // lets matching settle; only the fresh-client path has this race, so the hot
+        // attribution path (reusing an old client) is unaffected.
+        std::thread::sleep(std::time::Duration::from_millis(30));
     }
 
     let services = IOHIDEventSystemClientCopyServices(reg.client);
@@ -251,6 +259,25 @@ pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
             ensure_enumerated();
         }
     }
+    {
+        let reg = registry().lock().unwrap();
+        if reg.devices.is_empty() {
+            // 枚举返回 0 但设备可能在场(陈旧 client / 异步匹配竞态):重建 client 重试,
+            // 重建路径自带 30ms settle(见 enumerate_locked)。重试仍为空才认作真无设备。
+            // Enumeration came back empty while devices may be present (stale client or the
+            // async-matching race): retry with a rebuilt client (which carries the 30ms settle
+            // in enumerate_locked). Only give up after the retries still return empty.
+            drop(reg);
+            for _ in 0..2 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let mut reg = registry().lock().unwrap();
+                unsafe { enumerate_locked(&mut reg, true) };
+                if !reg.devices.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
     let reg = registry().lock().unwrap();
     reg.devices.iter().map(|d| d.identity.clone()).collect()
 }
@@ -302,6 +329,18 @@ unsafe extern "C" fn device_change_callback(
     // locks REGISTRY, but avoid doing heavy work while holding the lock). apply checks
     // mouse.enabled internally and skips when disabled; idempotent, safe to call repeatedly.
     crate::mouse::pointer::apply();
+    // 设置窗口开着时即时刷新设备下拉:回调在鼠标线程,经 controller 的
+    // handleDevicesChanged: 转到主线程执行(见 main.rs 的 on_devices_changed)。
+    // Refresh the settings device popup live when the window is open: this callback runs on
+    // the mouse thread, so hop to main via the controller's handleDevicesChanged:
+    // (see on_devices_changed in main.rs).
+    if let Some(ctrl) = crate::CONTROLLER.lock().unwrap().map(|c| c.0) {
+        let _: () = msg_send![ctrl,
+            performSelectorOnMainThread: sel!(handleDevicesChanged:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
 }
 
 /// 启动设备插拔监听:创建 IOHIDManager,注册接入/移除回调,挂到指定 RunLoop。

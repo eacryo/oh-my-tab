@@ -148,6 +148,12 @@ unsafe fn disable() {
     let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
     IOHIDEventSystemClientSetMatchingMultiple(client, arr as *const c_void);
     CFRelease(page_key as *const c_void);
+    // 与 device.rs 同款竞态:新建 client 后立即 CopyServices 可能拿到空列表
+    // (日志出现过"no devices found"但设备在场)。等 ~30ms 让异步匹配完成。
+    // Same race as device.rs: CopyServices right after creating the client can return an
+    // empty list (the log shows "no devices found" while the device was present). Wait
+    // ~30ms for the asynchronous matching to settle.
+    std::thread::sleep(std::time::Duration::from_millis(30));
 
     let services = IOHIDEventSystemClientCopyServices(client);
     if services.is_null() {
