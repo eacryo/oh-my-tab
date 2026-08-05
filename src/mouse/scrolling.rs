@@ -70,7 +70,11 @@ impl ScrollMode {
 ///
 /// Compute the scroll delta to post from the resolved config.
 /// Handles reversal + line-mode normalization.
-pub(crate) fn compute_delta(dy: i64, dx: i64, r: &crate::mouse::resolve::ResolvedMouse) -> (i32, i32) {
+pub(crate) fn compute_delta(
+    dy: i64,
+    dx: i64,
+    r: &crate::mouse::resolve::ResolvedMouse,
+) -> (i32, i32) {
     let mode = r.scroll_mode;
     let flip = should_flip(r.reverse_scroll);
 

@@ -96,7 +96,9 @@ unsafe impl Sync for RunloopMutex {}
 static MOUSE_RUNLOOP: OnceLock<RunloopMutex> = OnceLock::new();
 
 fn mouse_runloop_static() -> &'static Mutex<Option<crate::event_tap::CFRunLoopRef>> {
-    &MOUSE_RUNLOOP.get_or_init(|| RunloopMutex(Mutex::new(None))).0
+    &MOUSE_RUNLOOP
+        .get_or_init(|| RunloopMutex(Mutex::new(None)))
+        .0
 }
 
 /// last_active 的设备 (VID, PID)(归因失败时的回退)。由 event_tap 回调在每次成功归因后更新。
@@ -110,11 +112,13 @@ fn mouse_runloop_static() -> &'static Mutex<Option<crate::event_tap::CFRunLoopRe
 static LAST_ACTIVE_KEY: Mutex<Option<DeviceKey>> = Mutex::new(None);
 
 fn registry() -> &'static Mutex<DeviceRegistry> {
-    REGISTRY.get_or_init(|| Mutex::new(DeviceRegistry {
-        client: std::ptr::null_mut(),
-        services: std::ptr::null_mut(),
-        devices: Vec::new(),
-    }))
+    REGISTRY.get_or_init(|| {
+        Mutex::new(DeviceRegistry {
+            client: std::ptr::null_mut(),
+            services: std::ptr::null_mut(),
+            devices: Vec::new(),
+        })
+    })
 }
 
 // ========== 属性读取 helper / property-read helpers ==========
@@ -457,7 +461,9 @@ unsafe impl Sync for ManagerMutex {}
 static MANAGER: OnceLock<ManagerMutex> = OnceLock::new();
 
 fn manager_static() -> &'static Mutex<*mut c_void> {
-    &MANAGER.get_or_init(|| ManagerMutex(Mutex::new(std::ptr::null_mut()))).0
+    &MANAGER
+        .get_or_init(|| ManagerMutex(Mutex::new(std::ptr::null_mut())))
+        .0
 }
 
 /// 插拔回调防抖:启动时 IOHIDManager 会对在场设备触发一连串 matching 回调,而每次处理
@@ -663,7 +669,10 @@ unsafe extern "C" fn device_change_callback(
     {
         let mut reg = registry().lock().unwrap();
         enumerate_locked(&mut reg, true);
-        log_debug!("[device] plug/unplug event: re-enumerated {} device(s).", reg.devices.len());
+        log_debug!(
+            "[device] plug/unplug event: re-enumerated {} device(s).",
+            reg.devices.len()
+        );
     }
     // 释放 REGISTRY 锁后再 apply(pointer::apply 自建 client、不锁 REGISTRY,但避免
     // 持锁期间做重活)。apply 内部检查 mouse.enabled,未启用时自动跳过;幂等可重复调用。
@@ -753,12 +762,20 @@ pub(crate) unsafe fn start_plug_monitor(runloop: crate::event_tap::CFRunLoopRef)
     // event right after a removal is a BLE reconnect; if debounced it forces a full
     // rebuild, see LAST_PROCESSED_REMOVAL and schedule_recheck).
     let matching_cb: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)> =
-        Some(device_matching_callback as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void));
-    let removal_cb: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)> =
-        Some(device_removal_callback as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void));
+        Some(
+            device_matching_callback
+                as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void),
+        );
+    let removal_cb: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)> = Some(
+        device_removal_callback as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void),
+    );
     IOHIDManagerRegisterDeviceMatchingCallback(manager_obj, matching_cb, std::ptr::null_mut());
     IOHIDManagerRegisterDeviceRemovalCallback(manager_obj, removal_cb, std::ptr::null_mut());
-    IOHIDManagerScheduleWithRunLoop(manager_obj, runloop, crate::event_tap::kCFRunLoopDefaultMode);
+    IOHIDManagerScheduleWithRunLoop(
+        manager_obj,
+        runloop,
+        crate::event_tap::kCFRunLoopDefaultMode,
+    );
     *m = manager_obj;
     log_info!("[device] plug/unplug monitor started.");
 }
@@ -875,9 +892,6 @@ fn last_active_key() -> Option<DeviceKey> {
     let key = *LAST_ACTIVE_KEY.lock().unwrap();
     key.and_then(|k| {
         let reg = registry().lock().unwrap();
-        reg.devices
-            .iter()
-            .find(|d| d.key() == k)
-            .map(|d| d.key())
+        reg.devices.iter().find(|d| d.key() == k).map(|d| d.key())
     })
 }

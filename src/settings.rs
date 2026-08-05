@@ -53,19 +53,19 @@ struct SettingsUi {
     card_height: *mut AnyObject,
     card_gap: *mut AnyObject,
     icon_size: *mut AnyObject,
-    modifier: *mut AnyObject,        // NSPopUpButton: option / command
-    locale: *mut AnyObject,          // NSPopUpButton: auto / en / zh-Hans / zh-Hant
-    show_minimized: *mut AnyObject, // NSSwitch: 显示最小化窗口 / show minimized windows
+    modifier: *mut AnyObject,         // NSPopUpButton: option / command
+    locale: *mut AnyObject,           // NSPopUpButton: auto / en / zh-Hans / zh-Hant
+    show_minimized: *mut AnyObject,   // NSSwitch: 显示最小化窗口 / show minimized windows
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
-    log_level: *mut AnyObject,      // NSPopUpButton: trace / debug / info / warn / error
-    launch_at_login: *mut AnyObject, // NSSwitch: 开机自启 / launch at login
-    reverse_scroll: *mut AnyObject, // NSSwitch: 反转滚动 / reverse scrolling
-    enable_mouse: *mut AnyObject,   // NSSwitch: 启用鼠标控制 / enable mouse control
+    log_level: *mut AnyObject,        // NSPopUpButton: trace / debug / info / warn / error
+    launch_at_login: *mut AnyObject,  // NSSwitch: 开机自启 / launch at login
+    reverse_scroll: *mut AnyObject,   // NSSwitch: 反转滚动 / reverse scrolling
+    enable_mouse: *mut AnyObject,     // NSSwitch: 启用鼠标控制 / enable mouse control
     scroll_mode: *mut AnyObject,      // NSPopUpButton: default/line
     line_count: *mut AnyObject,       // NSSlider: line count slider
     line_count_label: *mut AnyObject, // NSTextField: line count row 的 label / the row's label
     line_count_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
-    disable_pointer_accel: *mut AnyObject, // NSSwitch: 禁用指针加速 / disable pointer acceleration
+    disable_pointer_accel: *mut AnyObject,  // NSSwitch: 禁用指针加速 / disable pointer acceleration
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
@@ -82,8 +82,7 @@ static SELECTED_DEVICE: Mutex<Option<Option<crate::mouse::device::DeviceKey>>> =
 /// "自动切换到活跃设备"开关(内存态,不入配置)。
 /// "Auto switch to active device" toggle (in-memory, not persisted to config).
 #[allow(dead_code)]
-static AUTO_SWITCH_DEVICE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+static AUTO_SWITCH_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 // ========== 控件构造 helper / control-builder helpers ==========
 
@@ -104,10 +103,7 @@ use crate::config::{DeviceMatcher, MouseProfile, PartialPointerSection};
 fn current_selected_device() -> Option<crate::mouse::device::DeviceKey> {
     // SELECTED_DEVICE:外层 Option 表示"是否初始化过";内层 None = "所有鼠标"。
     // SELECTED_DEVICE: outer Option = "initialized?"; inner None = "All Mice".
-    SELECTED_DEVICE
-        .lock()
-        .unwrap()
-        .unwrap_or(None) // 未初始化 -> None("所有鼠标") / uninitialized -> None (All Mice)
+    SELECTED_DEVICE.lock().unwrap().unwrap_or(None) // 未初始化 -> None("所有鼠标") / uninitialized -> None (All Mice)
 }
 
 /// 在 CONFIG 中查找匹配设备(VID,PID)的 profile 索引。None = 查找"所有鼠标"档。
@@ -227,7 +223,15 @@ unsafe fn make_switch(right_x: f64, y: f64, h: f64, checked: bool) -> *mut AnyOb
 
 /// 整数滑块(NSSlider, min..=max, step 1)。alloc +1,加入父视图后由调用方 release。
 /// Integer slider (NSSlider, min..=max, step 1). alloc +1; caller releases after adding to parent.
-unsafe fn make_slider(x: f64, y: f64, w: f64, h: f64, min: i64, max: i64, value: i64) -> *mut AnyObject {
+unsafe fn make_slider(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    min: i64,
+    max: i64,
+    value: i64,
+) -> *mut AnyObject {
     let slider: *mut AnyObject = msg_send![class!(NSSlider), alloc];
     let slider: *mut AnyObject =
         msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
@@ -576,7 +580,13 @@ fn ensure_selected_device() {
     // 当前设备仍在列表 -> 保持;否则(未初始化或被拔出)回退到第一个设备。
     // Keep the current device if it's still connected; otherwise (uninitialized or unplugged)
     // fall back to the first device.
-    let still_connected = cur.map(|c| connected.iter().any(|d| d.vendor_id == c.0 && d.product_id == c.1)).unwrap_or(false);
+    let still_connected = cur
+        .map(|c| {
+            connected
+                .iter()
+                .any(|d| d.vendor_id == c.0 && d.product_id == c.1)
+        })
+        .unwrap_or(false);
     if !still_connected {
         let first = &connected[0];
         *SELECTED_DEVICE.lock().unwrap() = Some(Some((first.vendor_id, first.product_id)));
@@ -600,7 +610,10 @@ unsafe fn rebuild_device_popup(ui: &SettingsUi) {
     let mut items: Vec<String> = Vec::new();
     let mut keys: Vec<crate::mouse::device::DeviceKey> = Vec::new();
     for d in &connected {
-        items.push(format!("{} ({:#x}:{:#x})", d.name, d.vendor_id, d.product_id));
+        items.push(format!(
+            "{} ({:#x}:{:#x})",
+            d.name, d.vendor_id, d.product_id
+        ));
         keys.push((d.vendor_id, d.product_id));
     }
 
@@ -651,11 +664,7 @@ pub(crate) fn refresh_device_popup_if_open() {
 /// 设备下拉框切换回调:更新 SELECTED_DEVICE 并即时刷新其余控件为新设备的有效值。
 /// Device-popup selection-changed callback: update SELECTED_DEVICE and immediately refresh the
 /// other controls with the newly-selected device's effective values.
-pub(crate) extern "C" fn handle_device_changed(
-    _self: *mut c_void,
-    _cmd: Sel,
-    sender: *mut c_void,
-) {
+pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     let popup = sender as *mut AnyObject;
     let idx: isize = unsafe { msg_send![popup, indexOfSelectedItem] };
     // DEVICE_POPUP_KEYS: Vec<DeviceKey>;取选中项对应的 key(均为具体设备,无通配项)。
@@ -970,7 +979,11 @@ fn load_settings_from(cfg: &Config) {
         let _: () = msg_send![ui.locale, selectItemAtIndex: loc_idx];
         // show_minimized:switch state(1=on / 0=off)。
         // show_minimized: switch state (1=on / 0=off).
-        let sm_state = if cfg.windows.show_minimized { 1isize } else { 0isize };
+        let sm_state = if cfg.windows.show_minimized {
+            1isize
+        } else {
+            0isize
+        };
         let _: () = msg_send![ui.show_minimized, setState: sm_state];
         // overlay_position:下拉框 index 0 = 跟随激活窗口(active_window), 1 = 主屏幕(main)。
         // overlay_position: popup index 0 = follow active window (active_window), 1 = main (main).
@@ -1035,8 +1048,7 @@ unsafe fn fill_mouse_device_controls(
 ) {
     // reverse_scroll:用有效值。
     // reverse_scroll: effective value.
-    let _: () =
-        msg_send![ui.reverse_scroll, setState: if resolved.reverse_scroll { 1isize } else { 0isize }];
+    let _: () = msg_send![ui.reverse_scroll, setState: if resolved.reverse_scroll { 1isize } else { 0isize }];
     // disable_pointer_accel:用有效值。
     // disable_pointer_accel: effective value.
     let _: () = msg_send![ui.disable_pointer_accel, setState: if resolved.disable_acceleration { 1isize } else { 0isize }];
@@ -1377,10 +1389,7 @@ fn create_settings_window() {
                 (220.0, 180.0)
             }
         };
-        let frame = NSRect::new(
-            NSPoint::new(win_x, win_y),
-            NSSize::new(win_w, win_h),
-        );
+        let frame = NSRect::new(NSPoint::new(win_x, win_y), NSSize::new(win_w, win_h));
         let window: *mut AnyObject = msg_send![settings_window_class(), alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
         let ns_title = make_nsstring(&t("settings.window_title"));

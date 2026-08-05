@@ -182,11 +182,7 @@ extern "C" {
         callback: CFRunLoopTimerCallBack,
         context: *mut c_void,
     ) -> CFRunLoopTimerRef;
-    pub(crate) fn CFRunLoopAddTimer(
-        rl: CFRunLoopRef,
-        timer: CFRunLoopTimerRef,
-        mode: CFStringRef,
-    );
+    pub(crate) fn CFRunLoopAddTimer(rl: CFRunLoopRef, timer: CFRunLoopTimerRef, mode: CFStringRef);
 
     pub(crate) static kCFRunLoopDefaultMode: CFStringRef;
 }

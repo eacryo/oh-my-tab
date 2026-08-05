@@ -262,7 +262,11 @@ impl MouseSection {
             } else {
                 self.scroll_mode.clone()
             }),
-            line_count: Some(if self.line_count == 0 { 3 } else { self.line_count }),
+            line_count: Some(if self.line_count == 0 {
+                3
+            } else {
+                self.line_count
+            }),
             pointer: Some(PartialPointerSection {
                 disable_acceleration: Some(self.pointer.disable_acceleration),
             }),
@@ -595,9 +599,7 @@ impl Config {
         }
 
         // --- windows ---
-        if !["active_window", "main"]
-            .contains(&self.windows.overlay_position.as_str())
-        {
+        if !["active_window", "main"].contains(&self.windows.overlay_position.as_str()) {
             errs.push(tf(
                 "errors.windows_overlay_position_invalid",
                 &[("value", &self.windows.overlay_position)],
@@ -609,10 +611,7 @@ impl Config {
             let prefix = format!("mouse.profiles[{i}]");
             if let Some(ref mode) = p.scroll_mode {
                 if !["default", "line"].contains(&mode.as_str()) {
-                    errs.push(tf(
-                        "errors.mouse_scroll_mode_invalid",
-                        &[("value", mode)],
-                    ));
+                    errs.push(tf("errors.mouse_scroll_mode_invalid", &[("value", mode)]));
                     // 用 prefix 区分哪个档出错,便于定位。
                     // Use the prefix to indicate which profile failed.
                     if let Some(last) = errs.last_mut() {
@@ -898,9 +897,12 @@ impl Config {
                 let mut loaded: Config = toml::from_str(&content).unwrap_or_default();
                 // 迁移旧 [mouse] 扁平字段为 profiles(幂等);若发生了迁移,稍后写回磁盘。
                 // Migrate legacy flat [mouse] fields into profiles (idempotent); persist later if changed.
-                let needs_persist = !loaded.mouse.profiles.iter().any(|p| {
-                    p.device.vendor_id.is_none() && p.device.product_id.is_none()
-                }) || loaded.mouse.reverse_scroll
+                let needs_persist = !loaded
+                    .mouse
+                    .profiles
+                    .iter()
+                    .any(|p| p.device.vendor_id.is_none() && p.device.product_id.is_none())
+                    || loaded.mouse.reverse_scroll
                     || !loaded.mouse.scroll_mode.is_empty()
                     || loaded.mouse.line_count != 0;
 
@@ -937,9 +939,12 @@ impl Config {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let mut loaded: Config = toml::from_str(&content).unwrap_or_default();
-                let needs_persist = !loaded.mouse.profiles.iter().any(|p| {
-                    p.device.vendor_id.is_none() && p.device.product_id.is_none()
-                }) || loaded.mouse.reverse_scroll
+                let needs_persist = !loaded
+                    .mouse
+                    .profiles
+                    .iter()
+                    .any(|p| p.device.vendor_id.is_none() && p.device.product_id.is_none())
+                    || loaded.mouse.reverse_scroll
                     || !loaded.mouse.scroll_mode.is_empty()
                     || loaded.mouse.line_count != 0;
 

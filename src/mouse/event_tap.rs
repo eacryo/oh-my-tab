@@ -48,14 +48,8 @@ const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 0;
 /// Synthesize a scroll event and post it to the session level.
 /// Line mode posts in "line" units; Default mode passes the raw delta through.
 unsafe fn post_scroll_event(dy: i32, dx: i32, flags: CGEventFlags) {
-    let synthetic = CGEventCreateScrollWheelEvent2(
-        std::ptr::null(),
-        K_CG_SCROLL_EVENT_UNIT_LINE,
-        2,
-        dy,
-        dx,
-        0,
-    );
+    let synthetic =
+        CGEventCreateScrollWheelEvent2(std::ptr::null(), K_CG_SCROLL_EVENT_UNIT_LINE, 2, dy, dx, 0);
 
     if synthetic.is_null() {
         log_info!("[mouse] failed to synthesize scroll event");
@@ -189,8 +183,7 @@ fn runloop_static() -> &'static Mutex<Option<event_tap::CFRunLoopRef>> {
 /// Runtime stop request flag: once set by stop(), the retry loop (blocked in thread::sleep)
 /// bails out on wake-up, so stop()'s join() never blocks the caller during the missing-
 /// permission retry window.
-static STOP_REQUESTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 运行时停止鼠标事件线程:置位取消标志 + CFRunLoopStop,线程自然结束。
 /// 幂等:未运行时无操作。由 settings.rs 在取消"启用鼠标控制"时调用。

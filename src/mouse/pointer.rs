@@ -1,4 +1,4 @@
-//! 指针设置:禁用系统鼠标加速,让光标 1:1 线性跟踪(对应 docs/mouse-architecture.md §4.6)。
+//! 指针设置:禁用系统鼠标加速,让光标 1:1 线性跟踪。
 //! 参考 LinearMouse DeviceManager.updatePointerSpeed:
 //!
 //! - macOS 14+ (Sonoma):设 HIDUseLinearScalingMouseAcceleration = 1
@@ -193,7 +193,12 @@ unsafe fn disable() {
         if !resolved.disable_acceleration {
             // 该设备的配置未要求禁用加速,跳过(保留系统默认)。
             // This device's config doesn't ask to disable acceleration; skip (keep system default).
-            log_debug!("[pointer] {}: keeping acceleration (vid={:#x} pid={:#x})", name, vid, pid);
+            log_debug!(
+                "[pointer] {}: keeping acceleration (vid={:#x} pid={:#x})",
+                name,
+                vid,
+                pid
+            );
             continue;
         }
 
@@ -297,10 +302,7 @@ pub(crate) fn restore() {
 /// resolves per-device whether to disable acceleration; if no connected device asks for it,
 /// this is equivalent to restore (no device is touched).
 pub(crate) fn apply() {
-    let enabled = CONFIG
-        .read()
-        .map(|c| c.mouse.enabled)
-        .unwrap_or(false);
+    let enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
     if enabled {
         // 先 restore 已保存的原值,再 disable(让 per-device 决策从干净状态开始)。
         // Restore saved originals first, then disable (so per-device decisions start clean).

@@ -1,5 +1,5 @@
-//! 鼠标模块的 IOKit 私有 SPI FFI 声明(集中管理,对应 docs/mouse-architecture.md §7)。
-//! IOKit private SPI FFI declarations for the mouse module (centralized per §7).
+//! 鼠标模块的 IOKit 私有 SPI FFI 声明(集中管理)。
+//! IOKit private SPI FFI declarations for the mouse module (centralized).
 
 use std::ffi::c_void;
 
@@ -7,7 +7,10 @@ use std::ffi::c_void;
 extern "C" {
     // IORegistryEntryFromPath 返回 +1,用完 IOObjectRelease。
     // IORegistryEntryFromPath returns +1; release with IOObjectRelease.
-    pub(crate) fn IORegistryEntryFromPath(main_port: u32, path: *const std::ffi::c_char) -> *mut c_void;
+    pub(crate) fn IORegistryEntryFromPath(
+        main_port: u32,
+        path: *const std::ffi::c_char,
+    ) -> *mut c_void;
     // properties 返回 +1(CFMutableDictionaryRef)。
     // properties comes back +1 (CFMutableDictionaryRef).
     pub(crate) fn IORegistryEntryCreateCFProperties(
@@ -143,7 +146,10 @@ extern "C" {
     pub(crate) fn CFArrayGetValueAtIndex(the_array: *const c_void, idx: isize) -> *const c_void;
     /// CFDictionary 取键值(借用,不持有)。
     /// Dictionary lookup (borrowed, not owned).
-    pub(crate) fn CFDictionaryGetValue(the_dict: *const c_void, key: *const c_void) -> *const c_void;
+    pub(crate) fn CFDictionaryGetValue(
+        the_dict: *const c_void,
+        key: *const c_void,
+    ) -> *const c_void;
     /// CFData 长度与字节指针(借用,随 CFData 存活)。
     /// CFData length and byte pointer (borrowed; valid while the CFData lives).
     pub(crate) fn CFDataGetLength(data: *const c_void) -> isize;

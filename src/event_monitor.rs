@@ -56,11 +56,7 @@ unsafe extern "C" fn event_tap_callback(
             // Diagnostic log (debug tier): logged on every keyDown to tell whether the keyboard
             // tap receives events. When "shortcut dead" reproduces: no lines at all = the tap is
             // being blocked/disabled system-side; lines but no summon = downstream (bridge/main).
-            log_debug!(
-                "[kbd] keyDown keycode={} flags=0x{:x}",
-                keycode,
-                flags
-            );
+            log_debug!("[kbd] keyDown keycode={} flags=0x{:x}", keycode, flags);
 
             if keycode == K_VK_TAB {
                 let mod_mask = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {

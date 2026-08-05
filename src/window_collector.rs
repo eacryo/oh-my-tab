@@ -328,7 +328,7 @@ unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
     let mut bytes = vec![0u8; 0x100];
     bytes[0x04] = 0xf8; // 记录长度 / record length
     bytes[0x3a] = 0x10; // 未公开标志(yabai/Hammerspoon 同款)/ undocumented flag (as yabai/Hammerspoon)
-    // 目标 CGWindowID @ 0x3c(4 字节,小端)/ target CGWindowID @ 0x3c (4 bytes, LE)
+                        // 目标 CGWindowID @ 0x3c(4 字节,小端)/ target CGWindowID @ 0x3c (4 bytes, LE)
     bytes[0x3c..0x40].copy_from_slice(&wid.to_le_bytes());
     // 窗口相对点击点 @ 0x20(16 字节 = CGPoint 两个 f64)/ window-relative click point @ 0x20
     bytes[0x20..0x28].copy_from_slice(&(-1.0f64).to_le_bytes());
@@ -341,7 +341,11 @@ unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
     bytes[0x08] = 0x02;
     let ok2 = post(&mut psn, bytes.as_mut_ptr()) == 0;
     if !ok1 || !ok2 {
-        log_info!("make_key_window: SLPSPostEventRecordTo failed (down={} up={})", ok1, ok2);
+        log_info!(
+            "make_key_window: SLPSPostEventRecordTo failed (down={} up={})",
+            ok1,
+            ok2
+        );
     }
     ok1 && ok2
 }

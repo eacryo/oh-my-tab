@@ -37,8 +37,9 @@ impl Default for ResolvedMouse {
 /// 解析缓存:key = (VID,PID),None 键 = "无设备/所有鼠标"。在 reload_config / 设备变更时失效。
 /// Resolve cache: key = (VID, PID); the None key = "no device / All Mice". Invalidated on
 /// reload_config and device changes.
-static CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<Option<DeviceKey>, ResolvedMouse>>> =
-    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static CACHE: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<Option<DeviceKey>, ResolvedMouse>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// 使缓存失效(配置重载或设备变更时调用)。
 /// Invalidate the cache (called on config reload or device changes).
@@ -57,16 +58,8 @@ fn matches(profile: &MouseProfile, device: Option<DeviceKey>) -> bool {
         // No device (attribution-failure fallback): match only wildcard profiles.
         return profile.device.vendor_id.is_none() && profile.device.product_id.is_none();
     };
-    let vid_ok = profile
-        .device
-        .vendor_id
-        .map(|v| v == vid)
-        .unwrap_or(true);
-    let pid_ok = profile
-        .device
-        .product_id
-        .map(|p| p == pid)
-        .unwrap_or(true);
+    let vid_ok = profile.device.vendor_id.map(|v| v == vid).unwrap_or(true);
+    let pid_ok = profile.device.product_id.map(|p| p == pid).unwrap_or(true);
     vid_ok && pid_ok
 }
 
@@ -232,10 +225,7 @@ mod tests {
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.mouse.profiles.len(), 2);
         assert!(parsed.mouse.profiles[0].device.vendor_id.is_none());
-        assert_eq!(
-            parsed.mouse.profiles[1].device.vendor_id,
-            Some(0xC548)
-        );
+        assert_eq!(parsed.mouse.profiles[1].device.vendor_id, Some(0xC548));
         assert_eq!(parsed.mouse.profiles[1].reverse_scroll, Some(false));
         // 解析结果应与原配置一致。
         // Resolution should match the original.

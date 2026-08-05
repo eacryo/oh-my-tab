@@ -2,6 +2,7 @@ use flume::{Receiver, Sender};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
+use std::os::raw::c_int;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
@@ -95,6 +96,12 @@ pub fn init(config: &LogConfig, is_dev: bool) {
 
     let file_path = resolve_file_path(config);
     std::thread::spawn(move || writer_loop(rx, is_dev, file_path));
+    // stderr 重定向到日志管线:NSLog/AppKit 警告(如 Menu_Tracking 内部消息)、
+    // panic 等系统输出都走 stderr,不捕获就会漏掉(只出现在终端/统一日志里)。
+    // Redirect stderr into the log pipeline: system output like NSLog/AppKit warnings
+    // (e.g. Menu_Tracking internals) and panics go through stderr; without capture they
+    // are invisible in our log (only the terminal / unified log sees them).
+    capture_stderr();
 }
 
 /// 运行时调整日志级别（reload_config 触发）。
@@ -130,6 +137,92 @@ fn writer_loop(rx: Receiver<String>, is_dev: bool, file_path: Option<String>) {
             let _ = f.flush();
         }
     }
+}
+
+// ========== stderr 捕获(NSLog/AppKit 系统输出) / stderr capture ==========
+
+extern "C" {
+    fn pipe(fds: *mut c_int) -> c_int;
+    fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
+    fn read(fd: c_int, buf: *mut std::ffi::c_void, count: usize) -> isize;
+    fn close(fd: c_int) -> c_int;
+}
+
+/// 把进程的 stderr(fd 2)重定向到管道,读线程按行转交给日志管线(Info 级)。
+/// NSLog 的可见输出、AppKit 内部警告、Rust panic 都写 stderr;重定向后这些消息
+/// 带 `[stderr]` 前缀进入正常日志格式(时间戳 + INFO),与自家宏统一,不再只
+/// 出现在终端。dev 模式下 writer_loop 仍会打到 stdout,终端照常可见。
+///
+/// Redirect the process's stderr (fd 2) to a pipe; a reader thread hands each line to
+/// the log pipeline at Info level. NSLog's visible output, AppKit internal warnings and
+/// Rust panics all write to stderr; after redirection they appear in the normal log
+/// format (timestamp + INFO) with a `[stderr]` prefix, instead of only in the terminal.
+/// In dev mode the writer loop still prints to stdout, so the terminal keeps showing them.
+fn capture_stderr() {
+    unsafe {
+        let mut fds: [c_int; 2] = [0; 2];
+        if pipe(fds.as_mut_ptr()) != 0 {
+            return;
+        }
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        if dup2(write_fd, 2) < 0 {
+            let _ = close(read_fd);
+            let _ = close(write_fd);
+            return;
+        }
+        let _ = close(write_fd);
+        std::thread::spawn(move || stderr_reader(read_fd));
+    }
+}
+
+/// 读线程:阻塞读管道,按 \n 切行(半行缓冲),每行去尾 \r 后以 Info 级输出。
+/// 管道写满时线程阻塞在 read,writer 线程持续排空,不会撑爆内存。
+///
+/// Reader thread: blocks on the pipe, splits lines on \n (buffering partial lines),
+/// strips trailing \r, and emits each line at Info level. If the pipe fills, this
+/// thread blocks in read while the writer thread keeps draining; memory stays bounded.
+fn stderr_reader(fd: c_int) {
+    let mut buf = vec![0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
+    unsafe {
+        loop {
+            let n = read(fd, buf.as_mut_ptr() as *mut std::ffi::c_void, buf.len());
+            if n <= 0 {
+                break;
+            }
+            let mut start = 0usize;
+            for i in 0..n as usize {
+                if buf[i] == b'\n' {
+                    pending.extend_from_slice(&buf[start..i]);
+                    let line = std::mem::take(&mut pending);
+                    emit_stderr_line(&line);
+                    start = i + 1;
+                }
+            }
+            pending.extend_from_slice(&buf[start..n as usize]);
+        }
+    }
+    // EOF(进程退出前理论上到不了):冲刷残留的半行。
+    // EOF (unreachable before process exit in practice): flush any trailing partial line.
+    if !pending.is_empty() {
+        emit_stderr_line(&pending);
+    }
+    unsafe {
+        let _ = close(fd);
+    }
+}
+
+fn emit_stderr_line(line: &[u8]) {
+    // NSLog 行尾可能是 \r(老式行尾),只去掉 \r,保留其余内容。
+    // NSLog lines can end with \r (legacy line ending); strip only the \r.
+    let trimmed = if line.last() == Some(&b'\r') {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    let s = String::from_utf8_lossy(trimmed).into_owned();
+    _log(LogLevel::Info, format_args!("[stderr] {}", s));
 }
 
 fn resolve_file_path(config: &LogConfig) -> Option<String> {
