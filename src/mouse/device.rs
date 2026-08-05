@@ -22,6 +22,7 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // ========== 设备身份与运行时表示 / device identity & runtime handle ==========
@@ -462,24 +463,165 @@ fn manager_static() -> &'static Mutex<*mut c_void> {
 /// 插拔回调防抖:启动时 IOHIDManager 会对在场设备触发一连串 matching 回调,而每次处理
 /// (重建 client + 指针重应用)又会反向触发下一次回调,形成 6-7 连发的反馈循环 —— 既
 /// 刷日志噪音,又拉长启动繁忙窗口(macOS 对繁忙期未及时服务的 tap 会自动禁用,见
-/// event_tap.rs 的看门狗)。500ms 内只处理第一次,后续回调直接跳过,循环随之断开。
-/// 真实的重插拔周期远大于 500ms,不会误合并。
+/// event_tap.rs 的看门狗)。500ms 内只处理第一次;被跳过的回调不会直接丢弃,而是
+/// 调度一次延迟重查(schedule_recheck),保证 BLE 快速休眠-唤醒(断连与重连的间隔
+/// 常常小于 500ms)不会被永久吞掉——设备移除能及时反映,重连却丢了就是这个问题。
 ///
 /// Plug-callback debounce: at startup IOHIDManager fires a burst of matching callbacks for
 /// on-screen devices, and each handling (client rebuild + pointer re-apply) triggers the next
 /// callback -- a 6-7 round feedback loop that spams the log and lengthens the busy startup
 /// window (macOS auto-disables taps that don't service events during that window; see the
-/// watchdog in event_tap.rs). Only the first callback within 500ms is processed; the rest are
-/// skipped, breaking the loop. Real re-plug cycles are far longer than 500ms, so no legitimate
-/// event gets merged away.
+/// watchdog in event_tap.rs). Only the first callback within 500ms is processed; the skipped
+/// ones are not dropped -- they schedule a delayed recheck (schedule_recheck), so fast BLE
+/// sleep-wake cycles (often well under 500ms between disconnect and reconnect) are never
+/// permanently swallowed -- a device removal shows up promptly while its re-add was being
+/// lost, which is exactly this bug.
 static LAST_PLUG_HANDLE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 const PLUG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// 最近一次已处理的插拔事件是否为 removal。removal 后紧跟的 matching 事件是 BLE
+/// 休眠重连的典型模式:此时旧 client 的缓存已随连接失效(见 device_from_cgevent 的
+/// 失败路径),便宜 diff 不可靠,必须强制完整重建。
+/// Whether the last processed plug event was a removal. A matching event right after a
+/// removal is the typical BLE sleep-wake pattern: the old client's cache is dead by then
+/// (see the failure path in device_from_cgevent), so the cheap diff is unreliable and a
+/// full rebuild must be forced.
+static LAST_PROCESSED_REMOVAL: Mutex<bool> = Mutex::new(false);
+
+/// 延迟重查的一次性调度状态:至多一个重查线程在途;force 标记"removal 后紧跟
+/// matching"事件被防抖吞掉时强制完整重建(见 run_recheck)。
+/// One-shot scheduling state for the delayed recheck: at most one recheck thread in flight;
+/// the force flag demands a full rebuild when a removal-followed-by-matching pair was
+/// swallowed by the debounce (see run_recheck).
+static DEFERRED_RECHECK_PENDING: AtomicBool = AtomicBool::new(false);
+static DEFERRED_RECHECK_FORCE: AtomicBool = AtomicBool::new(false);
+/// 延迟窗口:被防抖吞掉的事件在 700ms 后复查,此时 BLE HID 服务通常已完成重注册。
+/// Delayed window: debounced events are re-checked after 700ms, by which time the BLE HID
+/// service has usually finished re-registering.
+const RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// 通知设置界面刷新设备下拉:经 controller 的 handleDevicesChanged: 转到主线程执行
+/// (见 main.rs 的 on_devices_changed)。插拔回调、延迟重查、归因自愈三处共用。
+/// 窗口未打开时该通知是 no-op(下次打开时 load_settings_values 仍会重建)。
+///
+/// Notify the settings UI to refresh the device popup: hop to the main thread via the
+/// controller's handleDevicesChanged: (see on_devices_changed in main.rs). Shared by the
+/// plug callback, the delayed recheck, and the attribution self-heal. No-op when the
+/// window is closed (it is rebuilt on next open via load_settings_values anyway).
+fn notify_devices_changed() {
+    if let Some(ctrl) = crate::CONTROLLER.lock().unwrap().map(|c| c.0) {
+        unsafe {
+            let _: () = msg_send![ctrl,
+                performSelectorOnMainThread: sel!(handleDevicesChanged:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
+    }
+}
+
+/// 调度延迟重查:合并防抖窗口内的多次事件,至多一个重查线程在途。
+/// force_rebuild = true 时,即使便宜 diff 显示设备集未变也强制完整重建。
+///
+/// Schedule the delayed recheck: coalesce multiple events inside the debounce window, at
+/// most one recheck thread in flight. With force_rebuild = true the recheck rebuilds fully
+/// even if the cheap diff shows an unchanged device set.
+fn schedule_recheck(force_rebuild: bool) {
+    if force_rebuild {
+        DEFERRED_RECHECK_FORCE.store(true, Ordering::SeqCst);
+    }
+    if !DEFERRED_RECHECK_PENDING.swap(true, Ordering::SeqCst) {
+        std::thread::spawn(|| {
+            std::thread::sleep(RECHECK_DELAY);
+            DEFERRED_RECHECK_PENDING.store(false, Ordering::SeqCst);
+            let force = DEFERRED_RECHECK_FORCE.swap(false, Ordering::SeqCst);
+            run_recheck(force);
+        });
+    }
+}
+
+/// 用现有 client 廉价枚举当前设备集(不重建、不等待匹配),仅供重查 diff 使用。
+/// 不做蓝牙键盘排除(NVRAM 读取成本高,且 diff 只关心集合是否变化——键盘重连
+/// 触发一次重建是安全的,enumerate_locked 仍会把它排除)。
+///
+/// Cheaply enumerate the current device set with the existing client (no rebuild, no
+/// matching wait); used only by the recheck diff. Bluetooth keyboard exclusion is skipped
+/// (NVRAM read is costly, and the diff only cares whether the set changed -- a keyboard
+/// reconnect triggering one rebuild is harmless, enumerate_locked still excludes it).
+unsafe fn enumerate_keys(client: *mut c_void) -> Vec<DeviceKey> {
+    let mut keys = Vec::new();
+    if client.is_null() {
+        return keys;
+    }
+    let services = IOHIDEventSystemClientCopyServices(client);
+    if services.is_null() {
+        return keys;
+    }
+    let count = CFArrayGetCount(services);
+    for i in 0..count {
+        let service = CFArrayGetValueAtIndex(services, i) as *mut c_void;
+        let is_pointer = IOHIDServiceClientConformsTo(service, 1, USAGE_GD_POINTER as u32) != 0
+            || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_MOUSE as u32) != 0
+            || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_TRACKPAD as u32) != 0;
+        if !is_pointer {
+            continue;
+        }
+        let vid = prop_int(service, KEY_VENDOR_ID).unwrap_or(0) as u32;
+        let pid = prop_int(service, KEY_PRODUCT_ID).unwrap_or(0) as u32;
+        keys.push((vid, pid));
+    }
+    CFRelease(services as *const c_void);
+    keys
+}
+
+/// 延迟重查:防抖窗口内被跳过的插拔事件在这里补处理。先用现有 client 做便宜 diff,
+/// 只有设备集真变化(或 force)才重建 client + 重应用指针设置 + 刷新设置 UI。
+/// 启动时连发回调的 700ms 后复查会因设备集无变化而安静结束,不会重蹈反馈循环;
+/// BLE 重连场景则在此刻设备已完成 HID 注册,重建能拿到完整列表。
+///
+/// Delayed recheck: plug events skipped by the debounce window are handled here. A cheap
+/// diff with the existing client runs first; only a real device-set change (or force)
+/// triggers a client rebuild + pointer re-apply + settings-UI refresh. At startup the
+/// 700ms-after-the-burst recheck finds an unchanged set and quietly exits, so the feedback
+/// loop does not return; for BLE reconnects the device has finished HID registration by
+/// then, and the rebuild gets the complete list.
+fn run_recheck(force_rebuild: bool) {
+    let changed = if force_rebuild {
+        true
+    } else {
+        let reg = registry().lock().unwrap();
+        if reg.client.is_null() {
+            return;
+        }
+        let before: Vec<DeviceKey> = reg.devices.iter().map(|d| d.key()).collect();
+        let now = unsafe { enumerate_keys(reg.client) };
+        before != now
+    };
+    if !changed {
+        log_debug!("[device] delayed recheck: device set unchanged, skipping.");
+        return;
+    }
+    {
+        let mut reg = registry().lock().unwrap();
+        unsafe { enumerate_locked(&mut reg, true) };
+        log_debug!(
+            "[device] delayed recheck: re-enumerated {} device(s).",
+            reg.devices.len()
+        );
+    }
+    // 释放 REGISTRY 锁后再 apply(pointer::apply 自建 client、不锁 REGISTRY;幂等可重复调用)。
+    // Drop the REGISTRY lock before applying (pointer::apply creates its own client and never
+    // locks REGISTRY; idempotent, safe to call repeatedly).
+    crate::mouse::pointer::apply();
+    notify_devices_changed();
+}
 
 /// IOHIDManager 回调:设备接入/移除时,强制重建注册表(重建 IOHIDEventSystemClient)。
 /// 蓝牙鼠标休眠断连重连正是走这里——重连触发 removal+matching 回调,重建后归因链恢复,
 /// 不必等下一次归因失败才自愈。重建后还要重新应用指针加速设置:加速度属性写在旧的
 /// IOHIDServiceClient 实例上,断连后随实例消失,新实例恢复默认(加速度重新生效),必须
 /// 在重连时重新 apply,否则"禁用指针加速"失效,只能靠用户进设置手动点一次恢复。
+/// 被防抖吞掉的回调调度延迟重查兜底(见 LAST_PLUG_HANDLE 注释)。
 ///
 /// IOHIDManager callback: on device attach/detach, force-rebuild the registry (recreate the
 /// IOHIDEventSystemClient). A Bluetooth disconnect/reconnect fires these callbacks; the rebuild
@@ -487,22 +629,37 @@ const PLUG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500)
 /// acceleration must also be re-applied: the acceleration properties live on the old
 /// IOHIDServiceClient instance, which disappears on disconnect; the new instance reverts to
 /// defaults (acceleration back on). Without re-applying on reconnect, "disable pointer
-/// acceleration" silently breaks until the user re-toggles it in Settings.
+/// acceleration" silently breaks until the user re-toggles it in Settings. Callbacks
+/// swallowed by the debounce are covered by the delayed recheck (see LAST_PLUG_HANDLE).
 unsafe extern "C" fn device_change_callback(
     _context: *mut c_void,
     _result: i32,
     _sender: *mut c_void,
     _callback: *mut c_void,
+    is_removal: bool,
 ) {
     // 防抖(见 LAST_PLUG_HANDLE 注释):500ms 内的重复插拔回调只处理第一次。
     // Debounce (see LAST_PLUG_HANDLE): only the first plug callback within 500ms is handled.
-    {
+    let debounced = {
         let mut last = LAST_PLUG_HANDLE.lock().unwrap();
         if last.is_some_and(|t| t.elapsed() < PLUG_DEBOUNCE) {
-            return;
+            true
+        } else {
+            *last = Some(std::time::Instant::now());
+            false
         }
-        *last = Some(std::time::Instant::now());
+    };
+    if debounced {
+        // 被防抖吞掉:调度延迟重查。removal 后紧跟 matching = BLE 重连,旧 client
+        // 缓存已失效,标记强制重建(便宜 diff 不可靠)。
+        // Swallowed by the debounce: schedule a delayed recheck. A matching event right
+        // after a removal is a BLE reconnect; the old client's cache is dead, so force a
+        // full rebuild (the cheap diff would be unreliable).
+        let last_removal = *LAST_PROCESSED_REMOVAL.lock().unwrap();
+        schedule_recheck(!is_removal && last_removal);
+        return;
     }
+    *LAST_PROCESSED_REMOVAL.lock().unwrap() = is_removal;
     {
         let mut reg = registry().lock().unwrap();
         enumerate_locked(&mut reg, true);
@@ -519,13 +676,39 @@ unsafe extern "C" fn device_change_callback(
     // Refresh the settings device popup live when the window is open: this callback runs on
     // the mouse thread, so hop to main via the controller's handleDevicesChanged:
     // (see on_devices_changed in main.rs).
-    if let Some(ctrl) = crate::CONTROLLER.lock().unwrap().map(|c| c.0) {
-        let _: () = msg_send![ctrl,
-            performSelectorOnMainThread: sel!(handleDevicesChanged:),
-            withObject: std::ptr::null::<AnyObject>(),
-            waitUntilDone: false
-        ];
-    }
+    notify_devices_changed();
+    // 已处理的事件也调度一次延迟重查:重建后 30ms settle 可能漏掉刚重连的设备
+    // (异步匹配竞态,见 enumerate_locked),700ms 后设备已完成注册,diff 检出变化即
+    // 补齐。启动连发场景下 diff 无变化,安静结束,不会重启反馈循环。
+    // Also schedule a delayed recheck after processed events: the 30ms settle after a
+    // rebuild can miss a just-reconnected device (async-matching race, see enumerate_locked);
+    // by 700ms the device has registered, and the diff picks up the change. In the startup
+    // burst the diff finds no change and quietly exits, so the feedback loop stays broken.
+    schedule_recheck(false);
+}
+
+/// IOHIDManager 接入(matching)回调包装:带方向标记进入统一处理。
+/// Wrapper for IOHIDManager matching (attach) callbacks, entering the shared handler with
+/// the direction flag.
+unsafe extern "C" fn device_matching_callback(
+    context: *mut c_void,
+    result: i32,
+    sender: *mut c_void,
+    callback: *mut c_void,
+) {
+    device_change_callback(context, result, sender, callback, false);
+}
+
+/// IOHIDManager 移除(removal)回调包装:带方向标记进入统一处理。
+/// Wrapper for IOHIDManager removal (detach) callbacks, entering the shared handler with
+/// the direction flag.
+unsafe extern "C" fn device_removal_callback(
+    context: *mut c_void,
+    result: i32,
+    sender: *mut c_void,
+    callback: *mut c_void,
+) {
+    device_change_callback(context, result, sender, callback, true);
 }
 
 /// 启动设备插拔监听:创建 IOHIDManager,注册接入/移除回调,挂到指定 RunLoop。
@@ -564,10 +747,17 @@ pub(crate) unsafe fn start_plug_monitor(runloop: crate::event_tap::CFRunLoopRef)
     IOHIDManagerSetDeviceMatchingMultiple(manager_obj, arr as *const c_void);
     CFRelease(page_key as *const c_void);
 
-    let cb: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)> =
-        Some(device_change_callback as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void));
-    IOHIDManagerRegisterDeviceMatchingCallback(manager_obj, cb, std::ptr::null_mut());
-    IOHIDManagerRegisterDeviceRemovalCallback(manager_obj, cb, std::ptr::null_mut());
+    // 接入与移除分开注册,以区分事件方向(removal 后紧跟 matching = BLE 重连,
+    // 防抖吞掉时触发强制重建,见 LAST_PROCESSED_REMOVAL 与 schedule_recheck)。
+    // Register attach and removal separately so the event direction is known (a matching
+    // event right after a removal is a BLE reconnect; if debounced it forces a full
+    // rebuild, see LAST_PROCESSED_REMOVAL and schedule_recheck).
+    let matching_cb: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)> =
+        Some(device_matching_callback as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void));
+    let removal_cb: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)> =
+        Some(device_removal_callback as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void));
+    IOHIDManagerRegisterDeviceMatchingCallback(manager_obj, matching_cb, std::ptr::null_mut());
+    IOHIDManagerRegisterDeviceRemovalCallback(manager_obj, removal_cb, std::ptr::null_mut());
     IOHIDManagerScheduleWithRunLoop(manager_obj, runloop, crate::event_tap::kCFRunLoopDefaultMode);
     *m = manager_obj;
     log_info!("[device] plug/unplug monitor started.");
@@ -647,11 +837,31 @@ pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Opt
         // re-enumeration on every event that still misses).
         {
             let mut reg = registry().lock().unwrap();
+            let before: Vec<DeviceKey> = reg.devices.iter().map(|d| d.key()).collect();
             enumerate_locked(&mut reg, true);
-            if let Some(idx) = lookup_service_index(&reg, sender) {
+            let (key, set_changed) = if let Some(idx) = lookup_service_index(&reg, sender) {
                 let dev = &reg.devices[idx];
                 *LAST_ACTIVE_KEY.lock().unwrap() = Some(dev.key());
-                return Some(dev.key());
+                let after: Vec<DeviceKey> = reg.devices.iter().map(|d| d.key()).collect();
+                (Some(dev.key()), before != after)
+            } else {
+                (None, false)
+            };
+            drop(reg);
+            // 注册表在此自愈(重连设备找回):若设备集确实变化,补一次 apply + 设置 UI
+            // 刷新——防抖/延迟重查漏检时的兜底,用户一动鼠标下拉立即恢复。每次恢复
+            // 至多触发一次(后续事件命中首查路径)。此路径罕见(miss 才走)。
+            // The registry self-healed here (reconnected device recovered): if the device set
+            // actually changed, re-apply pointer settings and refresh the settings UI -- the
+            // backstop when the debounce/delayed recheck missed, so the popup recovers as soon
+            // as the user moves the mouse. At most one trigger per recovery (later events hit
+            // the first-lookup path). This path is rare (only runs on a miss).
+            if set_changed {
+                crate::mouse::pointer::apply();
+                notify_devices_changed();
+            }
+            if let Some(k) = key {
+                return Some(k);
             }
         }
         last_active_key()
