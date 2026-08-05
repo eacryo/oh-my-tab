@@ -42,6 +42,8 @@ If windows are already open when the app starts, their ordering differs from the
 - **Some keyboards also declare extra Mouse/Pointer usages** in their HID descriptor (e.g. Kzzi-i75), so they appear in the device picker too. This is cosmetic: event attribution matches by the exact sender ID (`CGEvent → IOHIDEvent → sender ID → IOHIDServiceClient`), so keyboard events never resolve to a mouse profile.
 - The device picker refreshes on every settings-window open; hot-plug is picked up on the next open.
 
+**Mouse control may fail when launched under a debugger**: when the app is started in Debug mode via RustRover (or another debugger), frequent mouse usage (scrolling / clicking) right after launch can cause mouse control features (reverse scrolling, per-device settings) to stop working — the app stops receiving mouse events, scrolling reverts to the system direction, and pointer acceleration settings stop applying, until the app is restarted. Launching the packaged `.app` or running the binary directly from a terminal is unaffected; this only affects unsigned dev builds started under a debugger (a macOS 26 restriction on HID-level event listening for debugger-launched processes).
+
 ## Requirements
 
 - macOS (developed on macOS 26; older versions supported via the `NSVisualEffectView` fallback, but availability is not guaranteed).
