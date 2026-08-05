@@ -5,6 +5,18 @@ use std::ffi::c_void;
 
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
+    // IORegistryEntryFromPath 返回 +1,用完 IOObjectRelease。
+    // IORegistryEntryFromPath returns +1; release with IOObjectRelease.
+    pub(crate) fn IORegistryEntryFromPath(main_port: u32, path: *const std::ffi::c_char) -> *mut c_void;
+    // properties 返回 +1(CFMutableDictionaryRef)。
+    // properties comes back +1 (CFMutableDictionaryRef).
+    pub(crate) fn IORegistryEntryCreateCFProperties(
+        entry: *mut c_void,
+        properties: *mut *mut c_void,
+        allocator: *const c_void,
+        options: u32,
+    ) -> i32;
+    pub(crate) fn IOObjectRelease(object: *mut c_void) -> i32;
     // IOHIDEventSystemClient:设备枚举入口(LinearMouse PointerDeviceManager 同款)。
     // IOHIDEventSystemClient: device enumeration entry (same as LinearMouse's PointerDeviceManager).
     pub(crate) fn IOHIDEventSystemClientCreate(allocator: *const c_void) -> *mut c_void;
@@ -129,6 +141,13 @@ extern "C" {
     /// 按索引取元素(借用,不持有)。
     /// Element by index (borrowed, not owned).
     pub(crate) fn CFArrayGetValueAtIndex(the_array: *const c_void, idx: isize) -> *const c_void;
+    /// CFDictionary 取键值(借用,不持有)。
+    /// Dictionary lookup (borrowed, not owned).
+    pub(crate) fn CFDictionaryGetValue(the_dict: *const c_void, key: *const c_void) -> *const c_void;
+    /// CFData 长度与字节指针(借用,随 CFData 存活)。
+    /// CFData length and byte pointer (borrowed; valid while the CFData lives).
+    pub(crate) fn CFDataGetLength(data: *const c_void) -> isize;
+    pub(crate) fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
 }
 
 // ========== 属性键常量 / property key constants ==========
@@ -158,6 +177,18 @@ pub(crate) const KEY_PRODUCT_ID: &str = "ProductID";
 /// 设备连接方式(USB/Bluetooth/BLE)。
 /// Device transport (USB/Bluetooth/BLE).
 pub(crate) const KEY_TRANSPORT: &str = "Transport";
+/// 蓝牙设备的地址属性(仅在蓝牙传输设备上存在,格式 "cc-d7-81-0a-f6-62")。
+/// BT address property (present only on Bluetooth-transport devices, e.g. "cc-d7-81-0a-f6-62").
+pub(crate) const KEY_DEVICE_ADDRESS: &str = "DeviceAddress";
+/// bluetoothd 写入 NVRAM 的设备缓存键(IODTNVRAM 的注册表属性,私有格式)。
+/// bluetoothd's device-cache key written to NVRAM (an IODTNVRAM registry property, private format).
+pub(crate) const KEY_BLUETOOTH_INFO: &str = "BluetoothInfo";
+/// IODTNVRAM 的注册表路径(BluetoothInfo 挂在这个节点上)。
+/// IORegistry path of the IODTNVRAM node (where BluetoothInfo lives).
+pub(crate) const IOSERVICE_OPTIONS_PATH: &str = "IOService:/options";
+/// GAP Appearance:键盘(0x03C1)。鼠标为 0x03C2,触控板为 0x03C9。
+/// GAP Appearance: keyboard (0x03C1). Mouse is 0x03C2, touchpad is 0x03C9.
+pub(crate) const GAP_APPEARANCE_KEYBOARD: u16 = 0x03C1;
 
 // HID 用途常量 / HID usage constants
 /// kHIDPage_GenericDesktop = 0x01

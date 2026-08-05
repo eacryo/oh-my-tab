@@ -20,7 +20,8 @@ use crate::mouse::ffi::*;
 use crate::{log_debug, log_info};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
-use std::ffi::c_void;
+use std::collections::HashMap;
+use std::ffi::{c_void, CString};
 use std::sync::{Mutex, OnceLock};
 
 // ========== 设备身份与运行时表示 / device identity & runtime handle ==========
@@ -146,6 +147,101 @@ unsafe fn prop_string(service: *mut c_void, key: &str) -> String {
     s
 }
 
+// ========== 蓝牙设备分类:GAP Appearance(NVRAM 缓存)/ Bluetooth classification ==========
+
+/// 读取 NVRAM 中 bluetoothd 写入的蓝牙设备缓存(BluetoothInfo),解析出
+/// 地址 -> GAP Appearance 映射。Appearance 是设备在蓝牙广播里自报的类别
+/// (0x03C1 = 键盘 / 0x03C2 = 鼠标),与 macOS 蓝牙面板的图标同源。HID 描述符
+/// 不可靠(部分键盘固件虚报鼠标用途,如 KZI I75),用这张表做精确分类。
+/// 解析失败/缓存缺失时返回空表,调用方回退到纯 HID 判定。
+///
+/// Read bluetoothd's BluetoothInfo cache from NVRAM, parsing an address -> GAP Appearance
+/// map. Appearance is the device's self-reported class in its Bluetooth advertisement
+/// (0x03C1 keyboard / 0x03C2 mouse), the same source macOS's Bluetooth pane icons use.
+/// HID descriptors are unreliable here (some keyboard firmware fakes mouse usages, e.g.
+/// KZI I75), so this table performs the precise classification. On failure / missing cache
+/// an empty map is returned and the caller falls back to HID-only classification.
+fn bluetooth_appearance_map() -> HashMap<String, u16> {
+    let mut map = HashMap::new();
+    unsafe {
+        // IORegistryEntryFromPath 返回 +1,用完 IOObjectRelease。
+        // IORegistryEntryFromPath returns +1; IOObjectRelease when done.
+        let path = match CString::new(IOSERVICE_OPTIONS_PATH) {
+            Ok(p) => p,
+            Err(_) => return map,
+        };
+        let entry = IORegistryEntryFromPath(0, path.as_ptr());
+        if entry.is_null() {
+            return map;
+        }
+        let mut props: *mut c_void = std::ptr::null_mut();
+        let kr = IORegistryEntryCreateCFProperties(entry, &mut props, std::ptr::null(), 0);
+        IOObjectRelease(entry);
+        if kr != 0 || props.is_null() {
+            return map;
+        }
+        let key = make_nsstring(KEY_BLUETOOTH_INFO);
+        let data = CFDictionaryGetValue(props as *const c_void, key as *const c_void);
+        CFRelease(key as *const c_void);
+        if data.is_null() {
+            CFRelease(props as *const c_void);
+            return map;
+        }
+        let len = CFDataGetLength(data) as usize;
+        let ptr = CFDataGetBytePtr(data);
+        // 在 props 释放前完成解析(CFDataGetBytePtr 借用 props 持有的数据)。
+        // Parse before releasing props (CFDataGetBytePtr borrows data owned by props).
+        if !ptr.is_null() && len > 0 {
+            parse_bluetooth_info(std::slice::from_raw_parts(ptr, len), &mut map);
+        }
+        CFRelease(props as *const c_void);
+    }
+    map
+}
+
+/// 解析 BluetoothInfo TLV 流(bluetoothd 私有格式,按实测稳定结构解析):
+/// tag 0x02 = 设备名(记录起点),0x0e = 蓝牙地址(7 字节:1 字节标记 + 6 字节地址),
+/// 0x11 = GAP Appearance(2 字节小端,实测:键盘存 c1 03,鼠标存 c2 03)。
+/// 地址与 Appearance 按记录内顺序配对:0x0e 暂存地址,0x11 出现时写入 map。
+/// 未知 tag 按 length 跳过,异常数据即停。
+///
+/// Parse the BluetoothInfo TLV stream (bluetoothd private format; stable structure verified
+/// empirically): tag 0x02 = device name (record start), 0x0e = BT address (7 bytes: 1 flag
+/// byte + 6 address bytes), 0x11 = GAP Appearance (2 bytes little-endian; measured: keyboard
+/// is c1 03, mouse is c2 03). The address is paired with the next appearance in a record:
+/// 0x0e stashes the address, 0x11 writes the map entry. Unknown tags are skipped by length;
+/// malformed data stops parsing.
+fn parse_bluetooth_info(bytes: &[u8], map: &mut HashMap<String, u16>) {
+    let mut i = 0;
+    let mut pending_addr: Option<String> = None;
+    while i + 2 <= bytes.len() {
+        let tag = bytes[i];
+        let len = bytes[i + 1] as usize;
+        i += 2;
+        if i + len > bytes.len() {
+            break;
+        }
+        match tag {
+            0x0e if len == 7 => {
+                pending_addr = Some(
+                    bytes[i + 1..i + 7]
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join("-"),
+                );
+            }
+            0x11 if len == 2 => {
+                if let Some(addr) = pending_addr.take() {
+                    map.insert(addr, u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+}
+
 // ========== 枚举 / enumeration ==========
 
 /// 枚举当前已连接的鼠标/触控板设备,填充注册表。
@@ -226,6 +322,13 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
 
     reg.devices.clear();
 
+    // 蓝牙设备分类表(NVRAM 里 bluetoothd 的 BluetoothInfo 缓存)。解析失败时为空表,
+    // 蓝牙设备全部回退 HID 判定,不影响原有行为。
+    // Bluetooth classification table (bluetoothd's BluetoothInfo cache in NVRAM). On parse
+    // failure it is empty and every Bluetooth device falls back to HID-only classification,
+    // preserving the previous behavior.
+    let appearance_map = bluetooth_appearance_map();
+
     let count = CFArrayGetCount(services);
     for i in 0..count {
         let service = CFArrayGetValueAtIndex(services, i) as *mut c_void;
@@ -233,15 +336,17 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
         // 原因:有些真实鼠标(如 ATK A9 SE 这类 Nearlink/星闪设备)的 PrimaryUsage 被
         // 系统报成 Keyboard(6),白名单 {1,2,5} 会把它剔除;ConformsTo 检查整个
         // DeviceUsagePairs,能识别它声明过的 Mouse(1,2)/Pointer(1,1)/Trackpad(1,5)。
-        // 副作用:少数键盘也声明了多余的 Mouse 用途(与 LinearMouse 行为一致),会一并
-        // 纳入;归因靠 senderID 精确匹配,不影响功能正确性。
+        // 副作用:少数键盘也声明了多余的 Mouse 用途(如 KZI I75),会一并纳入——
+        // 蓝牙键盘随后由下方的 GAP Appearance 判定排除;归因靠 senderID 精确匹配,
+        // 不影响功能正确性。
         //
         // Determine pointer/mouse/trackpad via ConformsTo instead of the PrimaryUsage scalar.
         // Some real mice (e.g. ATK A9 SE Nearlink devices) report PrimaryUsage = Keyboard(6),
         // and a {1,2,5} whitelist would drop them; ConformsTo inspects the full DeviceUsagePairs
         // and sees the Mouse(1,2)/Pointer(1,1)/Trackpad(1,5) usages they declare. Side effect:
-        // a few keyboards also declare extra Mouse usages (same as LinearMouse) and get included;
-        // attribution uses exact senderID matching, so this never affects correctness.
+        // a few keyboards also declare extra Mouse usages (e.g. KZI I75) and get included --
+        // Bluetooth keyboards are then weeded out by the GAP Appearance check below; attribution
+        // uses exact senderID matching, so this never affects correctness.
         let is_pointer = IOHIDServiceClientConformsTo(service, 1, USAGE_GD_POINTER as u32) != 0
             || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_MOUSE as u32) != 0
             || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_TRACKPAD as u32) != 0;
@@ -252,6 +357,27 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
         let pid = prop_int(service, KEY_PRODUCT_ID).unwrap_or(0) as u32;
         let name = prop_string(service, KEY_PRODUCT);
         let transport = prop_string(service, KEY_TRANSPORT);
+
+        // 蓝牙设备按 GAP Appearance 排除键盘:一些键盘固件在 HID 描述符里虚报鼠标用途
+        // (如 KZI I75),ConformsTo 判定会误收;Appearance 是设备在蓝牙广播里自报的类别,
+        // 与 macOS 蓝牙面板同源(0x03C1 = 键盘)。DeviceAddress 只在蓝牙传输设备上存在;
+        // 不在 NVRAM 缓存里的设备(如新配对尚未缓存)回退 HID 判定,不会误杀。
+        // Exclude Bluetooth keyboards by GAP Appearance: some keyboard firmware fakes mouse
+        // usages in the HID descriptor (e.g. KZI I75), fooling the ConformsTo filter;
+        // Appearance is the self-reported class in the Bluetooth advertisement, the same
+        // source as the macOS Bluetooth pane (0x03C1 = keyboard). DeviceAddress exists only
+        // on Bluetooth-transport devices; devices absent from the NVRAM cache (e.g. freshly
+        // paired) fall back to HID-only classification and are never false-positively dropped.
+        let addr = prop_string(service, KEY_DEVICE_ADDRESS);
+        let is_bt_keyboard = !addr.is_empty()
+            && appearance_map.get(&addr.to_uppercase()) == Some(&GAP_APPEARANCE_KEYBOARD);
+        if is_bt_keyboard {
+            log_info!(
+                "[device] excluding '{}' (Bluetooth GAP appearance = keyboard)",
+                name
+            );
+            continue;
+        }
 
         let dev = Device {
             identity: DeviceIdentity {
