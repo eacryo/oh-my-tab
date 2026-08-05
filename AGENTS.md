@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) and OpenCode when wo
 
 ## What this is
 
-`oh-my-tab` is a macOS app/window switcher (an alternative to the system Cmd+Tab). It runs as an **accessory** app (no Dock icon; lives in the menu bar), intercepts a global shortcut (default **Option+Tab**, toggleable to Cmd+Tab), shows a floating "Liquid Glass" overlay of cards for currently-open windows, and raises the selected window on release using the Accessibility (AX) API.
+`oh-my-tab` is a macOS app/window switcher (an alternative to the system Cmd+Tab). It runs as an **accessory** app (no Dock icon; lives in the menu bar), intercepts a global shortcut (default **Option+Tab**, toggleable to Cmd+Tab), shows a floating "Liquid Glass" overlay of cards for currently-open windows, and raises the selected window on release using the Accessibility (AX) API. It also ships a **mouse enhancement** module: scroll-mode control (default passthrough/reverse vs. fixed-line), per-device pointer-acceleration control, and per-device profiles matching by VID/PID.
 
 It is Rust calling AppKit/CoreGraphics/ApplicationServices directly via `objc2` FFI — there is no Swift bridge and no Rust UI framework.
 
@@ -14,7 +14,11 @@ It is Rust calling AppKit/CoreGraphics/ApplicationServices directly via `objc2` 
 cargo build        # or cargo check for fast type-checking
 cargo run          # build + run (takes over the global shortcut)
 cargo clippy       # not configured in CI, but available
+cargo fmt          # auto-format; run after every code change
 ```
+
+**After every code modification, run (in this order, commands lowercase):**
+`cargo fmt` → `cargo check` → `cargo clippy`. All three must pass cleanly before the change is considered done.
 
 There are **no tests** in the project.
 
@@ -26,7 +30,7 @@ There are **no tests** in the project.
 
 ## Architecture
 
-Five modules. The tricky parts span several files, so the breakdown below is load-bearing.
+Top-level modules: `main` (UI, ObjC classes, orchestration), `event_monitor` + `event_tap` (global-shortcut tap; `event_tap` is the shared CGEventTap/CFRunLoop leaf used by both the switcher and the mouse module), `window_collector`, `overlay`, `settings`, `menu`, `config`, `i18n`, `theme`, `autostart`, `logger`, `ffi` (CF/ObjC primitives), and `mouse` — a submodule hub (`src/mouse.rs`) with `device` / `event_tap` / `ffi` / `pointer` / `resolve` / `scrolling`. The tricky parts span several files, so the breakdown below is load-bearing.
 
 ### Event flow & threading (spans all files)
 1. `event_monitor::start` spawns a **dedicated thread** running a `CGEventTap` + `CFRunLoop`. It detects Tab+modifier-down (`CmdTabPressed`) and modifier-release (`CmdReleased`), and sends `GlobalEvent`s over a `flume` channel. The active shortcut (Cmd vs Opt) is the `SHORTCUT_IS_CMD` atomic, toggleable from the menu.
@@ -37,7 +41,7 @@ Shared state is global `static`s guarded by `Mutex`/`RwLock`: `TAB_STATE` (the w
 
 ### `main.rs` — UI, ObjC classes, orchestration
 - Custom ObjC classes (`OhMyTabCardView`, `OhMyTabContainerView`, `OhMyTabController`, menu target) are **registered at runtime** via `objc_allocateClassPair` + `class_addMethod`, not declared in a bridge. Method impls are `extern "C" fn`s.
-- **Some calls must use raw `objc_msgSend` FFI** because `objc2`'s `msg_send!` can't encode CF/CG types or (historically) void returns. See `hex_to_cg_color`, `layer_set_background`, `layer_set_border`, and `activate_pid`. When adding AppKit calls that touch `CGColorRef` or return void, follow those patterns. Background: `notes/window-activation-approaches.md`.
+- **Some calls must use raw `objc_msgSend` FFI** because `objc2`'s `msg_send!` can't encode CF/CG types or (historically) void returns. See `hex_to_cg_color`, `layer_set_background`, `layer_set_border`, and `activate_pid`. When adding AppKit calls that touch `CGColorRef` or return void, follow those patterns.
 - **Card ↔ index mapping**: dynamically-registered classes can't expose properties through `msg_send!` reliably, so each card view's index is stored in `CARD_INDEX_MAP` keyed by view pointer (not as an ObjC property). `get_card_index`/`set_card_index`/`remove_card_index` manage it.
 - **macOS version split**: macOS 26+ renders the overlay with `NSGlassEffectView` (Liquid Glass); older macOS falls back to `NSVisualEffectView` (withinWindow + Dark). Detected via `AnyClass::get(c"NSGlassEffectView")`.
 - **Hover gating**: `MOUSE_MOVED` prevents the card under the cursor from being selected when the overlay first appears; the user must move the mouse first (matches native Cmd+Tab).
@@ -55,17 +59,31 @@ Shared state is global `static`s guarded by `Mutex`/`RwLock`: `TAB_STATE` (the w
 - Loading is **per-field resilient**, not all-or-nothing: `validate()` collects errors, then `merge_valid()` keeps loaded values for valid fields and resets invalid ones to defaults. Config errors are logged, never fatal.
 - Reloadable at runtime via the menu ("Reload Config" → `reload_config`), which also re-applies theme and refreshes the overlay.
 - Color fields are 8-hex-digit `RRGGBBAA` strings; `parse_hex8` converts them. Many layout/font values are read live from `CONFIG` inside the UI helpers (e.g. `card_w()`, `current_colors()`), so config changes take effect on the next render.
+- **Mouse section**: `mouse.enabled` (master switch) and `mouse.profiles` — per-device profiles keyed by VID/PID (`device.vendor_id`/`product_id`), each with `scroll_mode` / `line_count` / `reverse` / pointer-acceleration fields. Validated with the same per-field resilient pattern; legacy flat mouse fields are migrated via `MouseSection::migrate_legacy()`. Config matches devices by hardware identity (VID+PID), never by PID or name.
+
+### `mouse/` submodule — device registry, attribution, scroll & acceleration
+- **Module hub** (`mouse.rs`): `start()`/`stop()` idempotently manage the dedicated **mouse thread** (its own CGEventTap + CFRunLoop; taps are per-thread, so it cannot share the switcher's tap). `mouse::event_tap` is the tap/runloop implementation; `mouse::ffi` centralizes the IOKit private SPI.
+- **Device registry & attribution chain** (`device.rs`): `device_from_cgevent` resolves which device produced an event: `CGEventCopyIOHIDEvent` -> `IOHIDEventGetSenderID` -> `IOHIDEventSystemClientCopyServiceForRegistryID` -> `CFEqual` against the enumerated list. The `IOHIDEventSystemClient` must be **scheduled on the mouse thread's runloop** or the registry-ID map is incomplete and attribution silently falls back to "All Mice" (this is why the runloop is recorded at startup). On a miss, the client is force-rebuilt and re-enumerated once (a stale client's cache dies on Bluetooth reconnect); still missing -> `LAST_ACTIVE_KEY` (VID/PID, stable across reconnects) -> "All Mice" profile.
+- **Enumeration filter**: pointer/mouse/trackpad is decided by `IOHIDServiceClientConformsTo` over the full `DeviceUsagePairs`, NOT the `PrimaryUsage` scalar — real mice (e.g. ATK A9 SE Nearlink) can report PrimaryUsage = Keyboard(6), and a `{1,2,5}` whitelist would drop them.
+- **Bluetooth keyboard exclusion (load-bearing)**: some keyboard firmware *fakes* pointer usages in its HID descriptor (e.g. KZI I75 declares full Mouse collections), so the ConformsTo filter alone admits keyboards. The fix reads the device's **GAP Appearance** from bluetoothd's `BluetoothInfo` cache in NVRAM (`IOService:/options`, private TLV: tag `0x0e` = BT address, tag `0x11` = appearance **little-endian**, 0x03C1 = keyboard) via `bluetooth_appearance_map()`, matched by the HID service's `DeviceAddress` property. Appearance = keyboard -> device excluded from the registry. Devices absent from the NVRAM cache (freshly paired) or non-Bluetooth fall back to HID-only classification — never false-positively dropped.
+- **Plug/unplug monitor**: `start_plug_monitor` uses an `IOHIDManager` with **separate matching/removal callbacks** (direction matters). The 500ms debounce (`LAST_PLUG_HANDLE`) breaks the startup callback burst, but skipped events are **not dropped**: they schedule a one-shot delayed recheck (~700ms, `schedule_recheck`/`run_recheck`) that cheap-diffs the device set with the existing client and only rebuilds + re-applies + notifies the UI when it changed. A matching event right after a removal (the BLE sleep-wake pattern) sets the force flag: the stale client makes the cheap diff unreliable, so a full rebuild is forced. This is what makes a reconnected Bluetooth mouse reappear in the settings picker without reopening.
+- **UI notification**: `notify_devices_changed()` (shared by the plug callback, the delayed recheck, and the attribution self-heal) hops to the main thread via `performSelectorOnMainThread: handleDevicesChanged:`; settings rebuilds the device popup live (`refresh_device_popup_if_open`, `rebuild_device_popup`). The device list is external live state and is NOT OK/Cancel-gated; the popup selection is restored from in-memory `SELECTED_DEVICE` (`ensure_selected_device` recalibrates it against the connected list on each settings open).
+- **Pointer acceleration** (`pointer.rs`): acceleration properties live on the `IOHIDServiceClient` instance, so a Bluetooth disconnect wipes them; `apply()` must re-run on every plug event / delayed recheck / attribution self-heal. Idempotent, checks `mouse.enabled` internally.
+- **Scrolling** (`scrolling.rs`): two modes — Default (passthrough, optionally reversed per device) and Line (fixed line count). **Resolve** (`resolve.rs`): effective per-device config = "All Mice" base profile merged with the matched device profile (by VID/PID).
+
+### `logger.rs` — two-tier logging + stderr capture
+- Only two levels: Debug (diagnostic detail) / Info (normal runtime info); errors/warnings all go through `log_info!` (content preserved, no separate tiers). Macros (`log_debug!`/`log_info!`) funnel into a bounded flume channel; the writer thread prints to stdout in dev mode and appends to `~/Library/Logs/oh-my-tab/oh-my-tab-*.log` (30-day cleanup; user-supplied `log.file_path` is used verbatim, never pruned).
+- **stderr capture (load-bearing)**: at init, stderr (fd 2) is redirected to a pipe and a reader thread hands each line to the log pipeline at **Info** level with a `[stderr]` prefix. This is what makes NSLog/AppKit internal warnings (e.g. `[Menu_Tracking]` messages) and Rust panics visible in the app's own log instead of only in the terminal. Do not localize log lines (`println!`/`eprintln!` stay English).
 
 ### `i18n.rs` - internationalization (handcrafted TOML, zero deps)
 - A handcrafted TOML-based i18n system, deliberately DIY (not `rust-i18n`/`fluent`) to keep dependencies minimal and stay isomorphic with `config.rs`. Translation files are embedded at compile time via `include_str!` from `locales/{en,zh-Hans,zh-Hant}.toml` (no runtime file IO, no missing-file risk).
 - **Locale flow**: driven by `config.i18n.locale` (`"auto"` | `"en"` | `"zh-Hans"` | `"zh-Hant"`, default `"auto"`). Resolution priority: config value (non-`auto` & supported) > first matching entry in the system `NSLocale preferredLanguages` list (scanned **in order**, so a supported language lower in the user's preference beats the default - e.g. `[ja, zh-Hans, en]` -> `zh-Hans`) > `"en"`. Chinese tags split by script/region: `Hant` / `TW` / `HK` / `MO` -> `zh-Hant`; everything else (incl. bare `zh`, `CN`, `SG`) -> `zh-Hans`.
 - **API**: `t(key) -> String` (current locale -> en fallback -> key itself) and `tf(key, &[("name","value")])` for templates with `{name}` placeholders. Locale TOML uses `[section]` groups, flattened at load to dot keys (e.g. `[menu]` `settings` -> `menu.settings`). Keys: `[menu]` / `[settings]` / `[alert]` / `[errors]`.
-- **Hot-reload**: `config.rs::reload_config()` and the `CONFIG` LazyLock init both call `i18n::apply_config_locale()`. `main.rs::refresh_menu_titles()` re-titles all 5 menu items (theme + shortcut labels are state-dependent; settings/reload/quit are static, stored in `FIXED_MENU_ITEMS`); `invalidate_settings_window()` releases the cached settings window so it rebuilds with the new locale on next open. Both run from `handle_reload_config`, `apply_config_refresh`, and `on_locale_changed`.
+- **Hot-reload**: `config.rs::reload_config()` and the `CONFIG` LazyLock init both call `i18n::apply_config_locale()`. `main.rs::refresh_menu_titles()` re-titles all 6 menu items (theme + shortcut labels are state-dependent; settings/reload/clear_cache/quit are static, stored in `FIXED_MENU_ITEMS`); `invalidate_settings_window()` releases the cached settings window so it rebuilds with the new locale on next open. Both run from `handle_reload_config`, `apply_config_refresh`, and `on_locale_changed`.
 - **Live system-language follow**: `on_locale_changed` observes `NSLocaleCurrentLocaleDidChangeNotification` on the default `NSNotificationCenter`; when the system language changes and `config.i18n.locale` is `auto`, it re-resolves and refreshes the UI (explicit locales short-circuit). It self-marshals to the main thread via `performSelectorOnMainThread` since the notification's delivery thread isn't guaranteed.
 - **No-cycle constraint (load-bearing)**: `i18n.rs` NEVER reads `CONFIG` (only `NSLocale`). This is required because `CONFIG`'s LazyLock init calls `validate()` -> `tf()` -> `I18N` init; if `I18N` read `CONFIG` it would deadlock. Do not break this.
 - **Add a language**: create `locales/xx.toml` (same keys), register it in `i18n::locale_raw()`, add it to the `validate()` allow-list in `config.rs`, and extend `map_tag_to_supported()` if `auto` should map a system tag to it.
 - Validation errors from `config.rs::validate()` are themselves localized via `tf()` (they surface in `show_alert`).
-
 
 ## Commit Messages
 
