@@ -1089,8 +1089,6 @@ pub(crate) fn show_overlay() {
             release_obj(card); // container owns the card; drop create_card_view's alloc +1
         }
 
-        update_status_label();
-
         // Resize window (h computed above). Target screen per config (follow active window / main).
         let screen_frame = overlay_target_screen(&windows);
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
@@ -1102,6 +1100,15 @@ pub(crate) fn show_overlay() {
         // (width + height sizable), so they resize automatically when the
         // window frame changes. Just update the container explicitly.
         let _: () = msg_send![container, setFrameSize: NSSize::new(w, h)];
+
+        // 状态栏文本必须在窗口/容器 resize 之后居中:update_status_label 按容器当前宽度
+        // 计算 x,若在 resize 前调用会拿旧宽度(启动初为最大宽度、之后为上次召唤的宽度)
+        // 定位,容器缩小后文本就偏右/偏左(表现为标题栏不居中)。
+        // The status text must be centered AFTER the window/container resize:
+        // update_status_label computes x from the container's current width; if called before
+        // the resize it uses the stale width (the initial max width at launch, or the previous
+        // summon's width), leaving the text off-center once the container shrinks.
+        update_status_label();
 
         // Ignore initial mouse position - require a real mouse movement before
         // hover-selection kicks in (matches native Cmd+Tab behaviour).
