@@ -1168,6 +1168,61 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         });
     }
 
+    // 修剪 MRU:只保留存活窗口的条目。存活集用 All 模式枚举(含最小化/离屏窗口),
+    // 不用显示列表——OnScreenOnly 看不到最小化窗口,按显示列表修剪会清掉它们的
+    // 排序记忆。已关闭窗口的残留条目不清的话,系统复用 CGWindowID 时新窗口会
+    // or_insert 命中旧时间戳、按旧窗口的时间排序(继承污染)。存活集只做最保守
+    // 过滤(layer 0 + 有效 pid),宁全勿缺;显示层的过滤(AX 配对/Dock/alpha)不适用。
+    // 代价:show_minimized 关闭时每次 summon 补一次 All 枚举(亚毫秒级)。
+    //
+    // Prune MRU to the live window set. The live set is enumerated in All mode (includes
+    // minimized/off-screen windows) rather than the display list -- OnScreenOnly can't see
+    // minimized windows, so pruning against the display list would wipe their ordering
+    // memory. Without pruning, a recycled CGWindowID would make a new window or_insert
+    // the dead window's timestamp (inheritance pollution). The live set uses only the most
+    // conservative filters (layer 0 + valid pid) -- better to keep than to drop; display
+    // filters (AX pairing / Dock / alpha) don't apply here. Cost: one extra All-mode
+    // enumeration per summon when show_minimized is off (sub-millisecond).
+    let live_set: HashSet<(i32, u32)> = {
+        let src = if show_minimized {
+            array // 主查询已是 All 模式,直接复用 / main query is already All mode
+        } else {
+            unsafe { CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ALL, 0) }
+        };
+        let mut s: HashSet<(i32, u32)> = HashSet::new();
+        if !src.is_null() {
+            let n = unsafe { CFArrayGetCount(src) };
+            for i in 0..n {
+                let dict = unsafe { CFArrayGetValueAtIndex(src, i) };
+                if dict.is_null() {
+                    continue;
+                }
+                if cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0 {
+                    continue;
+                }
+                let pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+                if pid <= 0 {
+                    continue;
+                }
+                let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+                s.insert((pid, cgwid));
+            }
+        }
+        if !show_minimized && !src.is_null() {
+            unsafe { CFRelease(src) };
+        }
+        s
+    };
+    let mru_len_before = mru.len();
+    mru.retain(|k, _| live_set.contains(k));
+    // 修剪数量可观测(debug 档):有残留才打,平时每次 summon 无噪音。
+    // Pruning is observable (debug tier): logged only when entries were dropped, so a
+    // normal summon stays silent.
+    let pruned = mru_len_before - mru.len();
+    if pruned > 0 {
+        log_debug!("[windows] pruned {} stale MRU entries", pruned);
+    }
+
     unsafe { CFRelease(array) };
 
     // summon 时刷新前台聚焦窗口的 MRU 为 now。
