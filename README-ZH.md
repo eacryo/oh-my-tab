@@ -39,8 +39,8 @@
 
 **设备识别的问题**：判断某设备是否为鼠标/触控板,看它是否符合 Generic Desktop 页的 Pointer(1,1)、Mouse(1,2) 或 Trackpad(1,5) 用途 —— 用公开 API `IOHIDServiceClientConformsTo` 检查,它遍历设备完整的 `DeviceUsagePairs`,而不是单个 `PrimaryUsage` 值。这是必要的,因为有些真实鼠标的主用途会被系统报错:例如 **ATK A9 SE**(Nearlink/星闪鼠标)在系统里 `PrimaryUsage = 6(Keyboard)`,系统设置会把它显示为键盘——但它的 `DeviceUsagePairs` 里同时声明了 Mouse(1,2),`ConformsTo` 能识别出来。如果只看 `PrimaryUsage`,这类设备会被静默丢弃,它们的事件会被错误地套到"最近使用"的档位上。已知的副作用(与 LinearMouse 行为一致):
 
-- **少数键盘的 HID 描述符也声明了多余的 Mouse/Pointer 用途**(如 Kzzi-i75),它们也会出现在设备下拉框里。这纯粹是显示层面:事件归因按精确的 sender ID 匹配(`CGEvent → IOHIDEvent → sender ID → IOHIDServiceClient`),键盘事件永远不会被解析到鼠标档位。
-- 设备下拉框在每次打开设置窗口时刷新;热插拔的设备会在下次打开时出现。
+- **蓝牙键盘会被排除在设备下拉框之外**,即使它们的 HID 描述符虚报了指针用途(如 Kzzi-i75 声明了完整的 Mouse 集合)。下拉框会交叉核对蓝牙 **GAP Appearance**(0x03C1 = 键盘)——数据来自 bluetoothd 写入 NVRAM 的缓存,按 HID 服务的蓝牙地址匹配,与 macOS 蓝牙面板的图标同源。不在 NVRAM 缓存里的设备(如新配对)或非蓝牙设备,回退到纯 HID 判定。
+- 设备下拉框**实时刷新**:拔掉设备会立即从列表移除,重连也会自动重新出现(插拔事件有防抖但不会丢弃;延迟重查覆盖快速的 BLE 休眠-唤醒模式)。
 
 **Debug 模式下鼠标控制可能失效**：通过 RustRover(或其他调试器)以 Debug 方式启动应用时,若在启动阶段频繁操作鼠标(滚动/点击),鼠标控制功能(反向滚动、按设备配置等)可能会失效——应用不再收到鼠标事件,滚动方向恢复为系统默认、指针加速设置停止生效,直到重启应用。直接启动打包的 `.app` 或在终端中直接运行二进制不受影响;该问题只出现在调试器启动的未签名开发构建上(macOS 26 对调试器进程的 HID 层事件监听限制所致)。
 
@@ -231,7 +231,7 @@ app_name_size     = 13.0
 app_name_weight   = 0.5
 
 [keyboard]
-modifier = "option"      # "option"(Option+Tab)| "command"(Cmd+Tab)
+modifier = "command"     # "option"(Option+Tab)| "command"(Cmd+Tab)
 
 [i18n]
 locale = "auto"          # "auto" | "en" | "zh-Hans" | "zh-Hant"
@@ -272,7 +272,7 @@ line_count = 3
 disable_acceleration = true
 ```
 
-鼠标设置也可以在设置窗口中调整(用**设备下拉框**选中某款已连接的鼠标,编辑它那一层)。开启 `mouse.enabled` 需要重启应用(OK 按钮会提示)。
+鼠标设置也可以在设置窗口中调整(用**设备下拉框**选中某款已连接的鼠标,编辑它那一层)。切换 `mouse.enabled` **立即生效** —— 点确认时鼠标 event tap 会被热切换,无需重启应用。
 
 ## 日志
 
@@ -283,6 +283,8 @@ disable_acceleration = true
 - **默认文件路径**:`~/Library/Logs/oh-my-tab/oh-my-tab-<启动时间戳>.log` -- **每次启动一个文件**,时间戳取进程启动时刻、文件名安全格式(如 `oh-my-tab-2026-07-25_17-08-30.log`)。
 - **自动清理 30 天前日志**:启动时扫描默认日志目录,删除任何 mtime 超过 30 天的 `oh-my-tab-*.log`。当前运行的文件不会被误删(它一直在写,mtime 持续更新)。清理只匹配 `oh-my-tab-*.log` 模式,同目录下的无关文件不受影响。
 - **单次长时间运行内**文件仍会增长 -- 没有按大小轮转。30 天清理是跨运行、按 mtime 进行的。
+- **stderr 捕获**:启动时把 stderr(fd 2)重定向进日志管线 -- NSLog / AppKit 内部消息(如 `[Menu_Tracking]` 警告)和 Rust panic 会以 **Info** 级、带 `[stderr]` 前缀出现在日志里,而不只是终端可见。
+- **隐私**:debug 日志绝不记录具体按键。切换器的按键 tap 只记录 `Tab` / `Command` / `Option`(以及召唤组合名);其余按键一律记成 `Other` -- 不记键码、不记修饰位,密码和正文输入永远不会落到日志里。
 
 ### 自定义日志路径 -- 以及为什么应用绝不碰它
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) and OpenCode when wo
 
 ## What this is
 
-`oh-my-tab` is a macOS app/window switcher (an alternative to the system Cmd+Tab). It runs as an **accessory** app (no Dock icon; lives in the menu bar), intercepts a global shortcut (default **Option+Tab**, toggleable to Cmd+Tab), shows a floating "Liquid Glass" overlay of cards for currently-open windows, and raises the selected window on release using the Accessibility (AX) API. It also ships a **mouse enhancement** module: scroll-mode control (default passthrough/reverse vs. fixed-line), per-device pointer-acceleration control, and per-device profiles matching by VID/PID.
+`oh-my-tab` is a macOS app/window switcher (an alternative to the system Cmd+Tab). It runs as an **accessory** app (no Dock icon; lives in the menu bar), intercepts a global shortcut (default **Command+Tab**, toggleable to Option+Tab), shows a floating "Liquid Glass" overlay of cards for currently-open windows, and raises the selected window on release using the Accessibility (AX) API. It also ships a **mouse enhancement** module: scroll-mode control (default passthrough/reverse vs. fixed-line), per-device pointer-acceleration control, and per-device profiles matching by VID/PID.
 
 It is Rust calling AppKit/CoreGraphics/ApplicationServices directly via `objc2` FFI — there is no Swift bridge and no Rust UI framework.
 

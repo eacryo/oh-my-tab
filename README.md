@@ -39,8 +39,8 @@ If windows are already open when the app starts, their ordering differs from the
 
 **Device recognition caveats**: a device is treated as a mouse/trackpad when it **conforms to** the Pointer (1,1), Mouse (1,2), or Trackpad (1,5) usage on the Generic Desktop page — checked via the public `IOHIDServiceClientConformsTo` API, which inspects the device's full `DeviceUsagePairs` rather than a single `PrimaryUsage` value. This is needed because some real mice report an unexpected primary usage: for example, **ATK A9 SE** (a Nearlink/星闪 device) exposes `PrimaryUsage = 6 (Keyboard)`, so macOS shows it as a keyboard in System Settings — but it also declares Mouse (1,2) in its `DeviceUsagePairs`, and `ConformsTo` catches it. Using `PrimaryUsage` alone would silently drop such devices from the picker and force their events onto the "last active" profile. Known caveats (same behavior as LinearMouse):
 
-- **Some keyboards also declare extra Mouse/Pointer usages** in their HID descriptor (e.g. Kzzi-i75), so they appear in the device picker too. This is cosmetic: event attribution matches by the exact sender ID (`CGEvent → IOHIDEvent → sender ID → IOHIDServiceClient`), so keyboard events never resolve to a mouse profile.
-- The device picker refreshes on every settings-window open; hot-plug is picked up on the next open.
+- **Bluetooth keyboards are excluded from the device picker** even when their HID descriptor fakes pointer usages (e.g. Kzzi-i75 declares full Mouse collections). The picker cross-checks the Bluetooth **GAP Appearance** (0x03C1 = keyboard) from bluetoothd's NVRAM cache, matched by the HID service's Bluetooth address — the same source macOS's Bluetooth pane uses for its icons. Devices absent from the NVRAM cache (freshly paired) or non-Bluetooth devices fall back to HID-only classification.
+- The device picker refreshes **live**: unplugging a device removes it from the list immediately, and a reconnect reappears automatically (plug events are debounced but never dropped; a delayed recheck catches the fast BLE sleep-wake pattern).
 
 **Mouse control may fail when launched under a debugger**: when the app is started in Debug mode via RustRover (or another debugger), frequent mouse usage (scrolling / clicking) right after launch can cause mouse control features (reverse scrolling, per-device settings) to stop working — the app stops receiving mouse events, scrolling reverts to the system direction, and pointer acceleration settings stop applying, until the app is restarted. Launching the packaged `.app` or running the binary directly from a terminal is unaffected; this only affects unsigned dev builds started under a debugger (a macOS 26 restriction on HID-level event listening for debugger-launched processes).
 
@@ -231,7 +231,7 @@ app_name_size     = 13.0
 app_name_weight   = 0.5
 
 [keyboard]
-modifier = "option"      # "option" (Option+Tab) | "command" (Cmd+Tab)
+modifier = "command"     # "option" (Option+Tab) | "command" (Cmd+Tab)
 
 [i18n]
 locale = "auto"          # "auto" | "en" | "zh-Hans" | "zh-Hant"
@@ -272,7 +272,7 @@ line_count = 3
 disable_acceleration = true
 ```
 
-Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). Enabling `mouse.enabled` requires an app restart (the OK button reflects this).
+Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). Toggling `mouse.enabled` takes effect immediately — the mouse event tap is hot-switched on OK, no app restart needed.
 
 ## Logging
 
@@ -283,6 +283,8 @@ Logging is asynchronous and designed to **never block the UI / event loop**.
 - **Default file path**: `~/Library/Logs/oh-my-tab/oh-my-tab-<startup-timestamp>.log` — one file **per app launch**, where the timestamp is the process start time in a filename-safe form (e.g. `oh-my-tab-2026-07-25_17-08-30.log`).
 - **Automatic 30-day cleanup**: at startup, the default log directory is scanned and any `oh-my-tab-*.log` whose modification time is older than 30 days is deleted. The current run's file is never pruned (its mtime keeps updating as it is written). Cleanup matches only the `oh-my-tab-*.log` pattern, so unrelated files in the same directory are left alone.
 - **Within a single long run** the file still grows — there is no size-based rotation. The 30-day cleanup is cross-run, by mtime.
+- **stderr capture**: at startup, stderr (fd 2) is redirected into the log pipeline — NSLog / AppKit internal messages (e.g. `[Menu_Tracking]` warnings) and Rust panics appear in the log at **Info** level with a `[stderr]` prefix instead of only in the terminal.
+- **Privacy**: debug logs never record the actual keystrokes. The switcher's key tap logs only `Tab` / `Command` / `Option` (and the summon combo name); every other key is logged as plain `Other` — no keycodes, no modifier details, so passwords and typed text never reach the log.
 
 ### Custom log path — and why the app never touches it
 
