@@ -26,6 +26,8 @@ const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
 const K_CG_EVENT_FLAG_MASK_COMMAND: crate::event_tap::CGEventFlags = 0x00100000;
 const K_CG_EVENT_FLAG_MASK_ALTERNATE: crate::event_tap::CGEventFlags = 0x00080000;
 const K_VK_TAB: u16 = 48;
+const K_VK_COMMAND: u16 = 55;
+const K_VK_OPTION: u16 = 58;
 
 // 标记是否已经发送过 CmdTabPressed，防止修饰键变化时误发 CmdReleased
 // Tracks whether CmdTabPressed was sent, to avoid spurious CmdReleased
@@ -50,25 +52,43 @@ unsafe extern "C" fn event_tap_callback(
                     as u16;
             let flags = crate::event_tap::CGEventGetFlags(event);
 
-            // 诊断日志(debug 档):每次 keyDown 都打,用于判断键盘 tap 是否收到事件。
-            // 复现"快捷键失效"时看这条 —— 完全没日志 = tap 被系统层拦截/禁用;
-            // 有日志但没召唤 = 下游(bridge/主线程)问题。
-            // Diagnostic log (debug tier): logged on every keyDown to tell whether the keyboard
-            // tap receives events. When "shortcut dead" reproduces: no lines at all = the tap is
-            // being blocked/disabled system-side; lines but no summon = downstream (bridge/main).
-            log_debug!("[kbd] keyDown keycode={} flags=0x{:x}", keycode, flags);
-
+            // 隐私:debug 日志绝不记录用户的按键内容——除 Tab / Command / Option 外的
+            // 按键一律只打 "Other"(不记键码、不记修饰位),密码、正文等输入不会泄漏
+            // 到日志文件。其余行仍承担原诊断职责:有 keyDown 行 = tap 存活;有召唤行
+            // 但没反应 = 下游(bridge/主线程)问题。
+            // Privacy: debug logs never record the user's keystrokes -- any key other than
+            // Tab / Command / Option is logged as plain "Other" (no keycode, no flags), so
+            // passwords and typed text never leak into the log. The remaining lines keep the
+            // old diagnostic value: any keyDown line proves the tap is alive; a summon line
+            // with no reaction means the issue is downstream (bridge/main thread).
             if keycode == K_VK_TAB {
-                let mod_mask = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
+                let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
+                let mod_mask = if is_cmd {
                     K_CG_EVENT_FLAG_MASK_COMMAND
                 } else {
                     K_CG_EVENT_FLAG_MASK_ALTERNATE
                 };
                 if (flags & mod_mask) != 0 {
+                    // 召唤组合:只打组合名(不敏感),不打键码/修饰位细节。
+                    // The summon combo: log only the combo name (not sensitive), never raw keycode/flags.
+                    let combo = if is_cmd { "Tab+Command" } else { "Tab+Option" };
+                    log_debug!("[kbd] summon keyDown {}", combo);
                     TAB_PRESSED.store(true, Ordering::SeqCst);
                     let _ = sender.send(GlobalEvent::CmdTabPressed);
                     return std::ptr::null_mut();
                 }
+                log_debug!("[kbd] keyDown Tab");
+            } else if keycode == K_VK_COMMAND || keycode == K_VK_OPTION {
+                // 修饰键本身:固定键位,打按键名即可。
+                // Modifier keys themselves: fixed positions, logged by name.
+                let name = if keycode == K_VK_COMMAND {
+                    "Command"
+                } else {
+                    "Option"
+                };
+                log_debug!("[kbd] keyDown {}", name);
+            } else {
+                log_debug!("[kbd] keyDown Other");
             }
         }
         K_CG_EVENT_FLAGS_CHANGED => {
