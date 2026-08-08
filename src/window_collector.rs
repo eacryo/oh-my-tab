@@ -61,6 +61,29 @@ pub fn bump_window_mru(mru: &mut MruMap, pid: i32, cgwid: u32) {
     }
 }
 
+/// 纯窗口级 MRU 排序:按最后激活时间升序(最近使用的在前),无 MRU 记录的窗口
+/// 回退到 999 秒(视为极旧,排最后)。纯函数,`now` 由调用方给定,测试可注入固定时间。
+/// Pure window-level MRU sort: ascending by last-activation time (most recent first);
+/// windows without an MRU record fall back to 999s (treated as very old, sorted last).
+/// Pure — `now` is supplied by the caller, so tests can inject a fixed clock.
+fn sort_windows_by_mru(windows: &mut [WindowInfo], mru: &MruMap, now: Instant) {
+    let age = |pid: i32, wid: u32| {
+        mru.get(&(pid, wid))
+            .map(|t| now.saturating_duration_since(*t))
+            .unwrap_or(std::time::Duration::from_secs(999))
+    };
+    windows.sort_by_key(|a| age(a.pid, a.window_id));
+}
+
+/// 修剪 MRU:删除不在存活窗口集里的条目(防 CGWindowID 复用继承旧时间戳),返回清理数。
+/// Prune MRU entries not in the live window set (prevents CGWindowID-reuse inheriting a dead
+/// timestamp); returns how many were dropped.
+fn prune_mru(mru: &mut MruMap, live_set: &HashSet<(i32, u32)>) -> usize {
+    let before = mru.len();
+    mru.retain(|k, _| live_set.contains(k));
+    before - mru.len()
+}
+
 fn icon_cache_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     format!("{}/Library/Caches/oh-my-tab-icons", home)
@@ -1213,12 +1236,10 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         }
         s
     };
-    let mru_len_before = mru.len();
-    mru.retain(|k, _| live_set.contains(k));
+    let pruned = prune_mru(mru, &live_set);
     // 修剪数量可观测(debug 档):有残留才打,平时每次 summon 无噪音。
     // Pruning is observable (debug tier): logged only when entries were dropped, so a
     // normal summon stays silent.
-    let pruned = mru_len_before - mru.len();
     if pruned > 0 {
         log_debug!("[windows] pruned {} stale MRU entries", pruned);
     }
@@ -1282,17 +1303,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // when it was last activated. No app-level LAST_ACTIVATED grouping —
     // prevents browser window B from riding A's coattails when switching
     // from app C to browser window A.
-    windows.sort_by(|a, b| {
-        let wa = mru
-            .get(&(a.pid, a.window_id))
-            .map(|t| t.elapsed())
-            .unwrap_or(std::time::Duration::from_secs(999));
-        let wb = mru
-            .get(&(b.pid, b.window_id))
-            .map(|t| t.elapsed())
-            .unwrap_or(std::time::Duration::from_secs(999));
-        wa.cmp(&wb)
-    });
+    sort_windows_by_mru(&mut windows, mru, now);
 
     // 每次 summon 时打印排序后的窗口列表（= 实际显示顺序），含 mru 年龄。`*` 标记第 0 个(当前/前台窗口)。
     // Print the sorted window list on every summon (= display order), with MRU age. `*` marks index 0 (current/frontmost).
@@ -1358,4 +1369,186 @@ pub fn cache_running_app_icons() {
         cached.len(),
         skipped,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(pid: i32, wid: u32) -> WindowInfo {
+        WindowInfo {
+            pid,
+            window_id: wid,
+            app_name: String::new(),
+            window_title: String::new(),
+            icon_path: None,
+            is_active: false,
+            minimized: false,
+            bounds: (0.0, 0.0, 0.0, 0.0),
+        }
+    }
+
+    #[test]
+    fn fnv1a_hex_is_deterministic_and_stable() {
+        // 同一输入恒定;输出为 16 位十六进制,不含 `/`(文件名安全)。
+        // Same input -> same output; 16 hex chars, no '/' (filename-safe).
+        let a = fnv1a_hex("/Applications/Safari.app/Contents/MacOS/Safari");
+        let b = fnv1a_hex("/Applications/Safari.app/Contents/MacOS/Safari");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // 不同路径应产生不同键(极低碰撞概率)。
+        // Different paths should yield different keys (vanishingly low collision chance).
+        assert_ne!(
+            fnv1a_hex("/Applications/Safari.app"),
+            fnv1a_hex("/Applications/Firefox.app")
+        );
+        assert_ne!(fnv1a_hex(""), fnv1a_hex("x"));
+    }
+
+    #[test]
+    fn sort_windows_by_mru_orders_most_recent_first() {
+        let now = Instant::now();
+        let mut mru = MruMap::new();
+        // 窗口 (1,100) 5 秒前激活,(2,200) 1 秒前激活 -> 后者在前。
+        mru.insert((1, 100), now - std::time::Duration::from_secs(5));
+        mru.insert((2, 200), now - std::time::Duration::from_secs(1));
+        let mut ws = vec![window(1, 100), window(2, 200)];
+        sort_windows_by_mru(&mut ws, &mru, now);
+        assert_eq!((ws[0].pid, ws[0].window_id), (2, 200));
+        assert_eq!((ws[1].pid, ws[1].window_id), (1, 100));
+    }
+
+    #[test]
+    fn sort_windows_by_mru_no_record_sorted_last() {
+        // 无 MRU 记录的窗口回退 999 秒,排在所有有记录的窗口之后。
+        // Windows without an MRU record fall back to 999s — after all recorded ones.
+        let now = Instant::now();
+        let mut mru = MruMap::new();
+        mru.insert((1, 100), now - std::time::Duration::from_secs(60));
+        let mut ws = vec![window(9, 999), window(1, 100)];
+        sort_windows_by_mru(&mut ws, &mru, now);
+        assert_eq!((ws[0].pid, ws[0].window_id), (1, 100));
+        assert_eq!((ws[1].pid, ws[1].window_id), (9, 999));
+    }
+
+    #[test]
+    fn prune_mru_drops_only_dead_entries() {
+        let now = Instant::now();
+        let mut mru = MruMap::new();
+        mru.insert((1, 100), now);
+        mru.insert((2, 200), now); // 死条目 / dead entry
+        mru.insert((3, 300), now); // 死条目 / dead entry
+        let live: HashSet<(i32, u32)> = [(1, 100), (4, 400)].into_iter().collect();
+        let pruned = prune_mru(&mut mru, &live);
+        assert_eq!(pruned, 2);
+        assert!(mru.contains_key(&(1, 100)));
+        assert_eq!(mru.len(), 1);
+        // 无死条目时返回 0 且不动 map。
+        // Nothing to drop -> 0 and the map is untouched.
+        assert_eq!(prune_mru(&mut mru, &live), 0);
+        assert_eq!(mru.len(), 1);
+    }
+
+    #[test]
+    fn bump_window_mru_ignores_zero_cgwid() {
+        // cgwid == 0(未配对成功)不写入 MRU。
+        // cgwid == 0 (pairing failed) is not recorded.
+        let mut mru = MruMap::new();
+        bump_window_mru(&mut mru, 1, 0);
+        assert!(mru.is_empty());
+        bump_window_mru(&mut mru, 1, 42);
+        assert!(mru.contains_key(&(1, 42)));
+    }
+
+    // ========== 冒烟测试(需要真实 GUI 会话 + 辅助功能权限,手动运行)==========
+    // ========== Smoke tests (need a real GUI session + Accessibility grant; run manually) ==========
+    // 运行:cargo test -- --ignored
+    // 这些测试真实调用 CG/AX 栈,CI 上无 GUI 会话,默认跳过。
+
+    #[test]
+    #[ignore]
+    fn collect_windows_smoke() {
+        // 无辅助功能权限时直接跳过(不是失败)。
+        // Skip (not fail) when Accessibility is not granted.
+        if !crate::ffi::has_accessibility_permission() {
+            eprintln!("[smoke] Accessibility not granted; skipping collect_windows");
+            return;
+        }
+        let mut mru = MruMap::new();
+        let wins = collect_windows(&mut mru);
+        // 有 GUI 会话时至少应能看到若干窗口(通常 >2)。
+        // With a GUI session we should see at least a few windows (usually >2).
+        assert!(wins.len() >= 2, "expected >=2 windows, got {}", wins.len());
+        // 不变式 1:(pid, window_id) 全局唯一。
+        // Invariant 1: (pid, window_id) globally unique.
+        let mut seen: HashSet<(i32, u32)> = HashSet::new();
+        for w in &wins {
+            assert!(w.window_id != 0, "window_id must be nonzero");
+            assert!(
+                seen.insert((w.pid, w.window_id)),
+                "duplicate window: pid={} wid={}",
+                w.pid,
+                w.window_id
+            );
+            assert!(!w.app_name.is_empty(), "app_name must not be empty");
+        }
+        // 不变式 2:第一个窗口被标记为激活。
+        // Invariant 2: the first window is marked active.
+        assert!(wins[0].is_active);
+        // 不变式 3:排序依赖 MRU —— 显示列表里每个窗口都应有 MRU 条目。
+        // 反向(每个 MRU 条目都在显示列表)不成立:frontmost 聚焦窗口是单独经系统 API
+        // bump 的,可能被 AX 配对过滤而不在显示列表,反向断言会偶发误报。
+        // Invariant 3: sorting relies on MRU — every display-list window must have an entry.
+        // The converse (every MRU entry in the display list) does NOT hold: the frontmost
+        // focused window is bumped via a separate system-API path and may be filtered out of
+        // the display list by AX pairing, so a reverse assertion would flake spuriously.
+        let all_have_mru = wins.iter().all(|w| mru.contains_key(&(w.pid, w.window_id)));
+        assert!(
+            all_have_mru,
+            "some display windows lack MRU entries (sorting would fall back)"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn icon_cache_roundtrip_smoke() {
+        if !crate::ffi::has_accessibility_permission() {
+            eprintln!("[smoke] Accessibility not granted; skipping icon roundtrip");
+            return;
+        }
+        // 用 Finder(bundle id 稳定)做往返——测试二进制自身是裸 exec,身份解析不可靠。
+        // Use Finder (stable bundle id) for the roundtrip; the test binary itself is a bare
+        // exec whose identity resolution is unreliable.
+        let pid = unsafe {
+            let ns_key = crate::ffi::make_nsstring("com.apple.finder");
+            let apps: *mut AnyObject = msg_send![
+                class!(NSRunningApplication),
+                runningApplicationsWithBundleIdentifier: ns_key
+            ];
+            CFRelease(ns_key as *const c_void);
+            let count: usize = msg_send![apps, count];
+            let mut pid: i32 = 0;
+            if count > 0 {
+                let app: *mut AnyObject = msg_send![apps, objectAtIndex: 0usize];
+                pid = msg_send![app, processIdentifier];
+            }
+            pid
+        };
+        assert!(pid > 0, "Finder must be running in a GUI session");
+        // 清空缓存从干净状态开始(冒烟测试会重提图标,是可接受的副作用)。
+        // Start clean by clearing the cache (the smoke test re-extracts; acceptable side effect).
+        clear_icon_cache();
+        let path = extract_icon_to_cache(pid).expect("Finder icon extraction failed");
+        assert!(std::fs::metadata(&path).is_ok(), "extracted PNG must exist");
+        // 再次查询应命中缓存,幂等返回同一路径。
+        // A second query hits the cache; idempotent same path.
+        assert_eq!(check_icon_cache(pid).as_deref(), Some(path.as_str()));
+        assert_eq!(
+            extract_icon_to_cache(pid).as_deref(),
+            Some(path.as_str()),
+            "re-extract must short-circuit on a valid cache"
+        );
+        clear_icon_cache();
+    }
 }

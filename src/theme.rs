@@ -110,12 +110,26 @@ pub(crate) fn letter_px() -> f64 {
     icon_px() * 0.5
 }
 
+/// 浮窗高度 = 顶部 32 + 行数 * 卡片高 + 状态栏高(纯函数,可测)。
+/// Overlay height = top 32 + rows * card height + status bar height (pure, testable).
+fn compute_window_height(count: usize, cards_per_row: usize, card_h: f64) -> f64 {
+    let rows = count.max(1).div_ceil(cards_per_row);
+    32.0 + rows as f64 * card_h + STATUS_H
+}
+
 /// 浮窗高度 = 顶部 32 + 行数 * 卡片高 + 状态栏高。
 /// Overlay height = top 32 + rows * card height + status bar height.
 pub(crate) fn window_height(count: usize) -> f64 {
-    let cpr = cards_per_row();
-    let rows = count.max(1).div_ceil(cpr);
-    32.0 + rows as f64 * card_h() + STATUS_H
+    compute_window_height(count, cards_per_row(), card_h())
+}
+
+/// 浮窗宽度 = 卡片数 * 卡片宽 + 间距 + 两侧内边距(纯函数,可测)。
+/// 下限为单卡宽度:任何情况下都不允许出现细条状窗口。
+/// Overlay width = cards * card width + gaps + padding on both sides (pure, testable).
+/// Floor is one card's width: the overlay must never degenerate into a thin strip.
+fn compute_window_width(cards_in_row: usize, card_w: f64, card_gap: f64) -> f64 {
+    let n = cards_in_row.max(1);
+    n as f64 * card_w + (n - 1) as f64 * card_gap + H_PADDING * 2.0
 }
 
 /// 浮窗宽度 = 卡片数 * 卡片宽 + 间距 + 两侧内边距。
@@ -125,6 +139,55 @@ pub(crate) fn window_height(count: usize) -> f64 {
 /// Floor is one card's width (cards_in_row.max(1)): the overlay must never degenerate into a
 /// thin strip (the empty state takes the three-card width in show_overlay; this is the floor).
 pub(crate) fn window_width(cards_in_row: usize) -> f64 {
-    let n = cards_in_row.max(1);
-    n as f64 * card_w() + (n - 1) as f64 * card_gap() + H_PADDING * 2.0
+    compute_window_width(cards_in_row, card_w(), card_gap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn height_uses_at_least_one_row() {
+        // 0 个窗口:至少一行,高度兜底。
+        // Zero windows: at least one row as the floor.
+        assert_eq!(compute_window_height(0, 5, 100.0), 32.0 + 100.0 + STATUS_H);
+        assert_eq!(compute_window_height(1, 5, 100.0), 32.0 + 100.0 + STATUS_H);
+    }
+
+    #[test]
+    fn height_rounds_rows_up() {
+        // 每行 4 个:5 个窗口 -> 2 行。
+        // Four per row: five windows -> two rows.
+        assert_eq!(
+            compute_window_height(5, 4, 120.0),
+            32.0 + 2.0 * 120.0 + STATUS_H
+        );
+        assert_eq!(
+            compute_window_height(8, 4, 120.0),
+            32.0 + 2.0 * 120.0 + STATUS_H
+        );
+        assert_eq!(
+            compute_window_height(9, 4, 120.0),
+            32.0 + 3.0 * 120.0 + STATUS_H
+        );
+    }
+
+    #[test]
+    fn width_floors_at_one_card() {
+        // 0 或 1 张卡:宽度 = 单卡宽 + 两侧内边距(无间距)。
+        // Zero or one card: width = one card + both paddings (no gap).
+        let w0 = compute_window_width(0, 100.0, 20.0);
+        let w1 = compute_window_width(1, 100.0, 20.0);
+        assert_eq!(w0, 100.0 + H_PADDING * 2.0);
+        assert_eq!(w1, w0);
+        // 3 张卡:3 * 卡宽 + 2 * 间距 + 内边距。
+        // Three cards: 3 * card_w + 2 * gaps + padding.
+        assert_eq!(
+            compute_window_width(3, 100.0, 20.0),
+            300.0 + 40.0 + H_PADDING * 2.0
+        );
+        // 卡宽为 0 时依然不塌缩成负宽度(兜底单卡)。
+        // Even with a zero card width the floor keeps it non-degenerate.
+        assert!(compute_window_width(0, 0.0, 0.0) > 0.0);
+    }
 }

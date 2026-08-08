@@ -98,7 +98,8 @@ pub(crate) fn compute_delta(
 
 #[cfg(test)]
 mod tests {
-    use super::should_flip;
+    use super::*;
+    use crate::mouse::resolve::ResolvedMouse;
 
     #[test]
     fn flip_equals_user_reverse() {
@@ -106,5 +107,66 @@ mod tests {
         assert!(!should_flip(false));
         // 反转开 -> 取反(相对系统的反转)。
         assert!(should_flip(true));
+    }
+
+    fn resolved(mode: ScrollMode, reverse: bool, line_count: u32) -> ResolvedMouse {
+        ResolvedMouse {
+            reverse_scroll: reverse,
+            scroll_mode: mode,
+            line_count,
+            disable_acceleration: false,
+        }
+    }
+
+    #[test]
+    fn default_mode_passes_delta_through() {
+        // 透传模式:原样返回(方向由 reverse 决定)。
+        // Passthrough mode: delta returned verbatim (direction handled by reverse).
+        let r = resolved(ScrollMode::Default, false, 3);
+        assert_eq!(compute_delta(10, -5, &r), (10, -5));
+        assert_eq!(compute_delta(0, 0, &r), (0, 0));
+    }
+
+    #[test]
+    fn default_mode_with_reverse_flips_both_axes() {
+        let r = resolved(ScrollMode::Default, true, 3);
+        assert_eq!(compute_delta(10, -5, &r), (-10, 5));
+    }
+
+    #[test]
+    fn line_mode_normalizes_by_sign() {
+        // 行模式:任何幅度都归一化为 ±line_count,0 保持 0。
+        // Line mode: any magnitude normalizes to ±line_count; zero stays zero.
+        let r = resolved(ScrollMode::Line, false, 3);
+        assert_eq!(compute_delta(1000, -1, &r), (3, -3));
+        assert_eq!(compute_delta(0, 0, &r), (0, 0));
+    }
+
+    #[test]
+    fn line_mode_line_count_is_clamped() {
+        // 行数被 clamp 到 1..=10(配置层已校验,这里兜底)。
+        // Line count clamps to 1..=10 (validated at the config layer; belt-and-braces here).
+        let r = resolved(ScrollMode::Line, false, 0);
+        assert_eq!(compute_delta(5, 0, &r), (1, 0));
+        let r = resolved(ScrollMode::Line, false, 99);
+        assert_eq!(compute_delta(5, 0, &r), (10, 0));
+    }
+
+    #[test]
+    fn line_mode_with_reverse_flips_signs() {
+        let r = resolved(ScrollMode::Line, true, 4);
+        assert_eq!(compute_delta(100, 200, &r), (-4, -4));
+    }
+
+    #[test]
+    fn scroll_mode_from_str_falls_back_to_default() {
+        // 未知字符串回退 Default(配置校验后不应出现)。
+        // Unknown strings fall back to Default (shouldn't happen after config validation).
+        assert_eq!(ScrollMode::from_str("line"), ScrollMode::Line);
+        assert_eq!(ScrollMode::from_str("default"), ScrollMode::Default);
+        assert_eq!(ScrollMode::from_str("turbo"), ScrollMode::Default);
+        assert_eq!(ScrollMode::from_str(""), ScrollMode::Default);
+        assert_eq!(ScrollMode::as_str(&ScrollMode::Line), "line");
+        assert_eq!(ScrollMode::as_str(&ScrollMode::Default), "default");
     }
 }

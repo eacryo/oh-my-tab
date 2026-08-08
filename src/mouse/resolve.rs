@@ -261,7 +261,7 @@ disable_acceleration = true
         );
         // 旧字段应被清空(防止序列化出冗余)。
         // Legacy fields should be cleared (avoid serializing cruft).
-        assert!(!parsed.mouse.reverse_scroll);
-        assert!(parsed.mouse.scroll_mode.is_empty());
+        assert!(parsed.mouse.reverse_scroll.is_none());
+        assert!(parsed.mouse.scroll_mode.is_none());
     }
 }

@@ -15,12 +15,17 @@ cargo build        # or cargo check for fast type-checking
 cargo run          # build + run (takes over the global shortcut)
 cargo clippy       # not configured in CI, but available
 cargo fmt          # auto-format; run after every code change
+cargo test         # unit tests (fast, headless-safe; smoke tests are #[ignore])
 ```
 
 **After every code modification, run (in this order, commands lowercase):**
-`cargo fmt` → `cargo check` → `cargo clippy`. All three must pass cleanly before the change is considered done.
+`cargo fmt` → `cargo check` → `cargo clippy` → `cargo test`. All must pass cleanly before the change is considered done.
 
-There are **no tests** in the project.
+**Testing strategy** (see also the `.github/workflows/ci.yml`):
+- The test suite is **text-assertion based** — no screenshots/visual regression. Layout/color/branch logic is extracted into pure functions (`compute_window_height`, `resolve_locale_from`, `sort_windows_by_mru`, `parse_bluetooth_info`, etc.) and verified with `assert_eq!`.
+- Unit tests cover: config parse/validate/merge/migration + save/load roundtrips (via `tempfile`), i18n locale resolution + cross-locale key-set consistency, mouse profile merging, scroll delta math, Bluetooth NVRAM TLV parsing, MRU sort/prune, theme layout math, logger cleanup.
+- **Smoke tests** (`window_collector::tests::*_smoke`, `#[ignore]`) exercise the real CG/AX stack and need a GUI session + Accessibility grant; run with `cargo test -- --ignored`. CI skips them.
+- `tempfile` is a `[dev-dependencies]`-only crate — never linked into the release binary.
 
 **Permissions & runtime caveats:**
 - The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and AX window queries. Grant it under System Settings → Privacy & Security → Accessibility. A freshly built binary at a new path must be re-granted.

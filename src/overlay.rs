@@ -110,6 +110,26 @@ fn display_title(title: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::display_title;
+
+    #[test]
+    fn empty_title_gets_placeholder() {
+        // 空标题只影响显示层;内部 title 不动(见函数注释,raise_ax_window 靠空标题匹配)。
+        // Empty titles only affect display; the stored title is untouched (see the fn doc:
+        // raise_ax_window matches by the empty title).
+        assert_eq!(display_title(""), "-");
+        assert_eq!(display_title("   "), "   "); // 空白串不是空串 / whitespace is not empty
+    }
+
+    #[test]
+    fn non_empty_title_passes_through() {
+        assert_eq!(display_title("Safari — Apple"), "Safari — Apple");
+        assert_eq!(display_title("x"), "x");
+    }
+}
+
 // ========== 通用控件 helper / generic control helper ==========
 
 /// 创建一个简单(非 attributed)NSTextField 标签,sizeToFit 后在 container_width 内水平居中。

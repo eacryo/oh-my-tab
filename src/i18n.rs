@@ -145,6 +145,13 @@ pub fn apply_config_locale(locale_cfg: &str) {
 /// Resolve the final locale. Priority: locale_cfg (non-auto & supported) > first system
 /// preferred language that maps to a supported locale > DEFAULT_LOCALE.
 fn resolve_locale(locale_cfg: Option<&str>) -> String {
+    resolve_locale_from(locale_cfg, &system_locales())
+}
+
+/// 从配置值与注入的系统语言列表解析最终 locale(纯函数,测试可直接喂列表)。
+/// Resolve the final locale from a config value and an injected system-language list
+/// (pure; tests feed their own lists instead of the real NSLocale).
+fn resolve_locale_from(locale_cfg: Option<&str>, system: &[String]) -> String {
     if let Some(cfg) = locale_cfg {
         if cfg != "auto" && is_supported(cfg) {
             return cfg.to_string();
@@ -157,8 +164,8 @@ fn resolve_locale(locale_cfg: Option<&str>) -> String {
     // supported locale. Iterating (instead of taking only the first) ensures a supported
     // language lower in the user's preference is chosen over the default fallback: e.g. for
     // preference order [ja, zh-Hans, en] we pick zh-Hans, not en.
-    for tag in system_locales() {
-        if let Some(loc) = map_tag_to_supported(&tag) {
+    for tag in system {
+        if let Some(loc) = map_tag_to_supported(tag) {
             return loc.to_string();
         }
     }
@@ -225,4 +232,181 @@ unsafe fn nsstring_to_rust(ns: *mut AnyObject) -> String {
     std::ffi::CStr::from_ptr(utf8)
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(tags: &[&str]) -> Vec<String> {
+        tags.iter().map(|s| s.to_string()).collect()
+    }
+
+    // 提取字符串里所有 {name} 占位符的名字。
+    // Extract the names of all {name} placeholders in a string.
+    fn placeholders(s: &str) -> std::collections::HashSet<&str> {
+        let mut set = std::collections::HashSet::new();
+        for part in s.split('{').skip(1) {
+            if let Some(end) = part.find('}') {
+                set.insert(&part[..end]);
+            }
+        }
+        set
+    }
+
+    #[test]
+    fn explicit_config_wins_over_system() {
+        // 显式配置(受支持)优先于系统语言。
+        // An explicit supported config locale beats the system list.
+        let sys = list(&["ja", "zh-Hans", "en"]);
+        assert_eq!(resolve_locale_from(Some("en"), &sys), "en");
+        assert_eq!(resolve_locale_from(Some("zh-Hant"), &sys), "zh-Hant");
+    }
+
+    #[test]
+    fn auto_or_unsupported_falls_back_to_system() {
+        // auto 与不支持的配置值都走系统语言。
+        // "auto" and unsupported config values fall back to the system list.
+        let sys = list(&["ja", "zh-Hans", "en"]);
+        assert_eq!(resolve_locale_from(Some("auto"), &sys), "zh-Hans");
+        assert_eq!(resolve_locale_from(Some("fr"), &sys), "zh-Hans");
+        assert_eq!(resolve_locale_from(None, &sys), "zh-Hans");
+    }
+
+    #[test]
+    fn lower_preference_supported_locale_wins_over_default() {
+        // 支持的语言排在偏好列表靠后时仍应被选中,而不是直接回退 en。
+        // A supported language lower in the preference list is still chosen over en.
+        assert_eq!(
+            resolve_locale_from(Some("auto"), &list(&["ja", "zh-Hant", "en"])),
+            "zh-Hant"
+        );
+        assert_eq!(resolve_locale_from(None, &list(&["fr", "de", "en"])), "en");
+    }
+
+    #[test]
+    fn empty_system_list_falls_back_to_default() {
+        assert_eq!(resolve_locale_from(None, &Vec::new()), "en");
+    }
+
+    #[test]
+    fn map_tag_covers_chinese_variants() {
+        // 简/繁拆分:区域与脚本都影响结果。
+        // Script/region both decide Simplified vs Traditional.
+        assert_eq!(map_tag_to_supported("zh"), Some("zh-Hans"));
+        assert_eq!(map_tag_to_supported("zh-CN"), Some("zh-Hans"));
+        assert_eq!(map_tag_to_supported("zh-SG"), Some("zh-Hans"));
+        assert_eq!(map_tag_to_supported("zh-Hans"), Some("zh-Hans"));
+        assert_eq!(map_tag_to_supported("zh-Hant"), Some("zh-Hant"));
+        assert_eq!(map_tag_to_supported("zh-TW"), Some("zh-Hant"));
+        assert_eq!(map_tag_to_supported("zh-HK"), Some("zh-Hant"));
+        assert_eq!(map_tag_to_supported("zh-MO"), Some("zh-Hant"));
+        assert_eq!(map_tag_to_supported("en"), Some("en"));
+        assert_eq!(map_tag_to_supported("en-US"), Some("en"));
+        assert_eq!(map_tag_to_supported("ja"), None);
+        assert_eq!(map_tag_to_supported("de-DE"), None);
+        assert_eq!(map_tag_to_supported(""), None);
+    }
+
+    #[test]
+    fn flatten_nests_tables_with_dot_keys() {
+        let mut out = HashMap::new();
+        flatten(
+            &toml::from_str(
+                r#"
+[menu]
+settings = "Settings"
+[menu.sub]
+nested = "x"
+number = 42
+"#,
+            )
+            .unwrap(),
+            "",
+            &mut out,
+        );
+        assert_eq!(
+            out.get("menu.settings").map(String::as_str),
+            Some("Settings")
+        );
+        assert_eq!(out.get("menu.sub.nested").map(String::as_str), Some("x"));
+        // 非字符串叶节点被忽略。
+        // Non-string leaves are ignored.
+        assert!(!out.contains_key("menu.sub.number"));
+    }
+
+    #[test]
+    fn tf_replaces_all_placeholders() {
+        // 模板插值:所有 {name} 都被替换。
+        // All {name} placeholders are replaced.
+        let s = tf("settings.version_label", &[("version", "0.1.4")]);
+        assert!(!s.contains('{'));
+        assert!(s.contains("0.1.4"));
+        // 缺失参数保持原样(占位符不消失)。
+        // A missing argument leaves the placeholder untouched.
+        let s2 = tf("settings.version_label", &[]);
+        assert!(s2.contains('{'));
+    }
+
+    #[test]
+    fn all_locales_share_identical_key_sets() {
+        // 三份 locale 文件的 key 集合必须完全一致,防止漏翻译/多翻译。
+        // All locale files must expose the exact same key set (no missing/extra keys).
+        let mut keys = |raw: &str| {
+            let parsed: toml::Value = toml::from_str(raw).unwrap();
+            let mut map = HashMap::new();
+            flatten(&parsed, "", &mut map);
+            map
+        };
+        let en = keys(EN_TOML);
+        let zh = keys(ZH_TOML);
+        let zh_hant = keys(ZH_HANT_TOML);
+        assert!(!en.is_empty(), "en locale must not be empty");
+        let en_set: std::collections::HashSet<&String> = en.keys().collect();
+        let zh_set: std::collections::HashSet<&String> = zh.keys().collect();
+        let hant_set: std::collections::HashSet<&String> = zh_hant.keys().collect();
+        assert_eq!(en_set, zh_set, "zh-Hans keys differ from en");
+        assert_eq!(zh_set, hant_set, "zh-Hant keys differ from zh-Hans");
+        // 每个 key 在 zh 里都有非空值(不做空翻译)。
+        // Every key has a non-empty value in zh (no empty translations).
+        for (k, v) in &zh {
+            assert!(!v.is_empty(), "empty translation for key {}", k);
+        }
+    }
+
+    #[test]
+    fn placeholder_parity_across_locales() {
+        // 同一 key 的 {name} 占位符必须跨语言一致:某语言漏写占位符会静默把
+        // 用户数据(如版本号)硬编码成翻译的一部分,key 集合测试抓不到这种错。
+        // Placeholders ({name}) must match across locales for every key: a translation
+        // missing a placeholder would silently bake user data (e.g. a version number)
+        // into the text -- the key-set test cannot catch that.
+        let parse = |raw: &str| {
+            let parsed: toml::Value = toml::from_str(raw).unwrap();
+            let mut map = HashMap::new();
+            flatten(&parsed, "", &mut map);
+            map
+        };
+        let en = parse(EN_TOML);
+        let zh = parse(ZH_TOML);
+        let hant = parse(ZH_HANT_TOML);
+        for (k, v) in &en {
+            let expected = placeholders(v);
+            if expected.is_empty() {
+                continue;
+            }
+            let zh_ph = placeholders(&zh[k]);
+            let hant_ph = placeholders(&hant[k]);
+            assert_eq!(
+                zh_ph, expected,
+                "zh-Hans placeholder mismatch for key {} (en: {:?}, zh: {:?})",
+                k, v, zh[k]
+            );
+            assert_eq!(
+                hant_ph, expected,
+                "zh-Hant placeholder mismatch for key {} (en: {:?}, hant: {:?})",
+                k, v, hant[k]
+            );
+        }
+    }
 }

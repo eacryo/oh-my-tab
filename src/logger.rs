@@ -353,3 +353,54 @@ fn file_timestamp() -> String {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levels_map_to_padded_labels() {
+        assert_eq!(LogLevel::Debug.as_str(), "DEBUG");
+        assert_eq!(LogLevel::Info.as_str(), "INFO ");
+        assert!(LogLevel::Debug < LogLevel::Info);
+    }
+
+    #[test]
+    fn timestamps_are_well_formed() {
+        // 时间戳格式:带 T 分隔与毫秒;文件名时间戳无冒号且可排序。
+        // Timestamp format: ISO-ish with T and milliseconds; file timestamp has no colons.
+        let ts = now_timestamp();
+        assert_eq!(ts.len(), 23); // "YYYY-MM-DDTHH:MM:SS.mmm"
+        assert!(ts.contains('T'));
+        let ft = file_timestamp();
+        assert_eq!(ft.len(), 19); // "YYYY-MM-DD_HH-MM-SS"
+        assert!(!ft.contains(':'));
+    }
+
+    #[test]
+    fn cleanup_old_logs_only_touches_stale_own_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let old = SystemTime::now()
+            .checked_sub(Duration::from_secs(31 * 86_400))
+            .unwrap();
+        let fresh = SystemTime::now();
+        let make = |name: &str, mtime: SystemTime| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, "x").unwrap();
+            let f = std::fs::File::open(&p).unwrap();
+            f.set_modified(mtime).unwrap();
+            p
+        };
+        // 过期本应用日志:应被删 / stale own log: removed.
+        let stale = make("oh-my-tab-2020-01-01_00-00-00.log", old);
+        // 新本应用日志:保留 / fresh own log: kept.
+        let fresh_log = make("oh-my-tab-2099-01-01_00-00-00.log", fresh);
+        // 过期但非本应用的日志:绝不误删 / stale but unrelated: never removed.
+        let foreign = make("something-else.log", old);
+        cleanup_old_logs(d);
+        assert!(!stale.exists());
+        assert!(fresh_log.exists());
+        assert!(foreign.exists());
+    }
+}

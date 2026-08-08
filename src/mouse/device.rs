@@ -895,3 +895,101 @@ fn last_active_key() -> Option<DeviceKey> {
         reg.devices.iter().find(|d| d.key() == k).map(|d| d.key())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TLV 构造: tag, len, payload。
+    // TLV helper: tag, len, payload.
+    fn tlv(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag, payload.len() as u8];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn bt_info_pairs_address_with_appearance() {
+        // 实测格式:0x0e 7 字节(1 标记 + 6 地址),0x11 2 字节小端 appearance。
+        // Measured layout: 0x0e 7 bytes (1 flag + 6 address), 0x11 2 bytes LE appearance.
+        let mut bytes = Vec::new();
+        bytes.extend(tlv(0x02, b"Mouse"));
+        bytes.extend(tlv(0x0e, &[0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+        bytes.extend(tlv(0x11, &[0xC2, 0x03])); // 鼠标 / mouse appearance
+        let mut map = HashMap::new();
+        parse_bluetooth_info(&bytes, &mut map);
+        // 地址格式化为大写冒号分隔,appearance 小端解析。
+        // Address formatted dashed-uppercase; appearance parsed little-endian.
+        assert_eq!(map.get("AA-BB-CC-DD-EE-FF"), Some(&0x03C2));
+    }
+
+    #[test]
+    fn bt_info_keyboard_appearance_is_distinguishable() {
+        // 键盘 appearance 0x03C1,与鼠标 0x03C2 可区分——这是排除虚报键盘的依据。
+        // Keyboard appearance 0x03C1 vs mouse 0x03C2 — the basis for keyboard exclusion.
+        let mut bytes = Vec::new();
+        bytes.extend(tlv(0x0e, &[0x01, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]));
+        bytes.extend(tlv(0x11, &[0xC1, 0x03]));
+        let mut map = HashMap::new();
+        parse_bluetooth_info(&bytes, &mut map);
+        assert_eq!(map.get("11-22-33-44-55-66"), Some(&0x03C1));
+    }
+
+    #[test]
+    fn bt_info_appearance_without_address_is_dropped() {
+        // 无待配对地址的 0x11 被忽略,不产生孤儿条目。
+        // A 0x11 without a pending address is ignored — no orphan entries.
+        let mut bytes = Vec::new();
+        bytes.extend(tlv(0x11, &[0xC1, 0x03]));
+        let mut map = HashMap::new();
+        parse_bluetooth_info(&bytes, &mut map);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn bt_info_unknown_tags_are_skipped_by_length() {
+        // 未知 tag 按 len 跳过,后续记录仍被解析。
+        // Unknown tags skipped by length; later records still parse.
+        let mut bytes = Vec::new();
+        bytes.extend(tlv(0x02, b"Device"));
+        bytes.extend(tlv(0x99, &[0x00, 0x01, 0x02])); // 未知 3 字节 / unknown 3 bytes
+        bytes.extend(tlv(0x0e, &[0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+        bytes.extend(tlv(0x11, &[0xC2, 0x03]));
+        let mut map = HashMap::new();
+        parse_bluetooth_info(&bytes, &mut map);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("AA-BB-CC-DD-EE-FF"));
+    }
+
+    #[test]
+    fn bt_info_truncated_data_stops_cleanly() {
+        // 截断/异常长度不会 panic,只解析到有效处为止。
+        // Truncated/malformed data never panics; parsing stops at the first bad record.
+        let mut map = HashMap::new();
+        parse_bluetooth_info(&[], &mut map);
+        parse_bluetooth_info(&[0x0e], &mut map); // 只有 tag 没有 len / tag only
+        parse_bluetooth_info(&[0x0e, 0x07, 0x01], &mut map); // len 超过剩余 / len past end
+        assert!(map.is_empty());
+        // 截断的 0x11(1 字节)不产生条目。
+        // A truncated 0x11 (1 byte) produces no entry.
+        let mut bytes = Vec::new();
+        bytes.extend(tlv(0x0e, &[0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+        bytes.extend(tlv(0x11, &[0xC2]));
+        parse_bluetooth_info(&bytes, &mut map);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn bt_info_later_appearance_replaces_earlier() {
+        // 同一地址的后续 appearance 覆盖前值(最后一条生效)。
+        // A later appearance for the same address overwrites the earlier one (last wins).
+        let mut bytes = Vec::new();
+        bytes.extend(tlv(0x0e, &[0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+        bytes.extend(tlv(0x11, &[0xC1, 0x03]));
+        bytes.extend(tlv(0x0e, &[0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+        bytes.extend(tlv(0x11, &[0xC2, 0x03]));
+        let mut map = HashMap::new();
+        parse_bluetooth_info(&bytes, &mut map);
+        assert_eq!(map.get("AA-BB-CC-DD-EE-FF"), Some(&0x03C2));
+    }
+}
