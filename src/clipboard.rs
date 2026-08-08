@@ -1167,14 +1167,23 @@ unsafe fn rebuild_rows() {
     if total == 0 {
         let doc_h = rows_top_offset() + row_button_height(1) + PAD_Y;
         let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
+        // 提示文本:frame 高度 = 单行高,垂直位置手动居中(单行 NSTextField 不会
+        // 自动在 frame 内垂直居中),水平居中。
+        // The hint: frame height = one line, vertically centered by hand (a single-line
+        // NSTextField does not auto-center vertically within its frame), horizontally centered.
+        let content_top = rows_top_offset();
+        let content_h = PICKER_MIN_HEIGHT - content_top - PAD_Y;
+        let label_h = row_button_height(1);
+        let label_y = content_top + (content_h - label_h) / 2.0;
         let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let label: *mut AnyObject = msg_send![
             label,
             initWithFrame: NSRect::new(
-                NSPoint::new(PAD_X, rows_top_offset()),
-                NSSize::new(PICKER_W - PAD_X * 2.0, row_button_height(1))
+                NSPoint::new(PAD_X, label_y),
+                NSSize::new(PICKER_W - PAD_X * 2.0, label_h)
             )
         ];
+        let _: () = msg_send![label, setAlignment: 1isize]; // NSTextAlignmentCenter
         let hint_ns = make_nsstring(&t("clipboard.empty"));
         let _: () = msg_send![label, setStringValue: hint_ns];
         CFRelease(hint_ns as *const c_void);
