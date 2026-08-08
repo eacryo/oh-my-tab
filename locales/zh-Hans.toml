@@ -3,6 +3,9 @@
 # Simplified Chinese locale. Keys are flattened with dot separators at load time.
 # Keys must match across locale files; only values differ.
 
+[clipboard]
+clear_all = "清除全部"
+
 [menu]
 toggle_theme.dark = "切换深色"
 toggle_theme.light = "切换浅色"

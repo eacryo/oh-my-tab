@@ -28,6 +28,7 @@ use crate::ffi::{
     class_addMethod, make_nsstring, nsstring_to_rust, objc_allocateClassPair,
     objc_registerClassPair, release_obj, CFRelease, ObjPtr,
 };
+use crate::i18n::t;
 use crate::{log_debug, log_info};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
@@ -66,6 +67,11 @@ const MAX_TEXT_LINES: usize = 3;
 const LINE_MAX_UNITS: usize = 60;
 /// 上下留白 / vertical padding.
 const PAD_Y: f64 = 10.0;
+/// 右上角"清除全部"按钮尺寸 / the "clear all" button's size.
+const CLEAR_BTN_W: f64 = 60.0;
+const CLEAR_BTN_H: f64 = 22.0;
+/// 清除按钮与行列表的间距 / gap between the clear button and the row list.
+const CLEAR_BTN_GAP: f64 = 6.0;
 /// 左右留白 / horizontal padding.
 const PAD_X: f64 = 12.0;
 /// 玻璃圆角:小浮窗固定小圆角,不跟随 config 的大圆角(那会让 420pt 小窗成胶囊)。
@@ -215,10 +221,16 @@ fn compute_pitches(texts: &[String]) -> Vec<f64> {
         .collect()
 }
 
-/// 第 idx 行的顶部 y(flipped 坐标):PAD_Y + 前 idx 行行距之和。
-/// The top y of row `idx` (flipped coords): PAD_Y + the sum of the pitches before it.
+/// 行列表的顶部偏移:顶部留白 + 清除按钮行 + 按钮与列表间距。
+/// The row list's top offset: top padding + the clear button row + its gap.
+fn rows_top_offset() -> f64 {
+    PAD_Y + CLEAR_BTN_H + CLEAR_BTN_GAP
+}
+
+/// 第 idx 行的顶部 y(flipped 坐标):rows_top_offset + 前 idx 行行距之和。
+/// The top y of row `idx` (flipped coords): rows_top_offset + the pitches before it.
 fn row_top(idx: usize, pitches: &[f64]) -> f64 {
-    PAD_Y + pitches.iter().take(idx).sum::<f64>()
+    rows_top_offset() + pitches.iter().take(idx).sum::<f64>()
 }
 
 /// 把新文本记入历史。规则:
@@ -450,6 +462,12 @@ unsafe fn observer() -> *mut AnyObject {
                 scroll_indicator_bounds_changed as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(clearClipboardHistory:),
+                clear_clipboard_history as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             // 实例 alloc(+1):进程级单例,不释放(与静态生命周期一致)。
             // Instance alloc (+1): process-level singleton, never released (matches the
@@ -533,6 +551,15 @@ fn update_scroll_indicator() {
 /// Clip-view bounds-change notification callback (scrolling) -> update the indicator.
 extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
     update_scroll_indicator();
+}
+
+/// "清除全部"按钮回调:清空剪贴板历史并关闭浮窗(空历史呼出会被忽略)。
+/// "Clear all" button callback: empty the clipboard history and close the picker (an empty
+/// history is ignored on summon).
+extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    CLIP_HISTORY.lock().unwrap().clear();
+    log_info!("Clipboard history cleared by user.");
+    hide_picker();
 }
 
 /// 是否已注册剪贴板变化通知(幂等,防止 start/stop 反复注册导致重复回调)。
@@ -682,7 +709,7 @@ fn show_picker() {
             compute_pitches(&hist)
         };
         let visible = hist_len.min(PICKER_MAX_ROWS);
-        let h = PAD_Y * 2.0 + pitches.iter().take(visible).sum::<f64>();
+        let h = rows_top_offset() + pitches.iter().take(visible).sum::<f64>() + PAD_Y;
 
         // 定位:跟随光标(光标右下偏移,空间不足翻转;光标所在屏幕,找不到回退主屏)。
         // Position: follow the cursor (bottom-right offset, flips when tight; the screen the
@@ -763,7 +790,7 @@ unsafe fn ensure_picker_window() {
     // 初始高度按最大可视行数(占位;show_picker 每次按实际 pitch 重设)。
     // Initial height sized for the max visible rows (placeholder; show_picker re-sizes per
     // summon using the real pitches).
-    let h = PAD_Y * 2.0 + PICKER_MAX_ROWS as f64 * row_pitch(row_button_height(1));
+    let h = rows_top_offset() + PICKER_MAX_ROWS as f64 * row_pitch(row_button_height(1)) + PAD_Y;
     let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
     let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
@@ -960,6 +987,28 @@ unsafe fn ensure_picker_window() {
     CFRelease(bounds_name as *const c_void);
     *SCROLL_VIEW.lock().unwrap() = Some(ObjPtr(scroll));
     *SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(indicator));
+
+    // 右上角"清除全部"按钮:清空剪贴板历史。
+    // "Clear all" button at the top-right: empties the clipboard history.
+    let clear_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let clear_btn: *mut AnyObject = msg_send![
+        clear_btn,
+        initWithFrame: NSRect::new(
+            NSPoint::new(w - CLEAR_BTN_W - 3.0, PAD_Y),
+            NSSize::new(CLEAR_BTN_W, CLEAR_BTN_H)
+        )
+    ];
+    let _: () = msg_send![clear_btn, setBordered: false];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
+    let _: () = msg_send![clear_btn, setFont: font];
+    let _: () = msg_send![clear_btn, setAlignment: 2isize]; // right
+    let title_ns = make_nsstring(&t("clipboard.clear_all"));
+    let _: () = msg_send![clear_btn, setTitle: title_ns];
+    CFRelease(title_ns as *const c_void);
+    let _: () = msg_send![clear_btn, setTarget: observer()];
+    let _: () = msg_send![clear_btn, setAction: sel!(clearClipboardHistory:)];
+    let _: () = msg_send![scroll, addSubview: clear_btn];
+    release_obj(clear_btn);
     // 点击外部(浮窗失去 key)→ 自动隐藏。Win+V 同款行为:呼出后点任何地方即消失。
     // Outside clicks (the picker resigns key) -> auto-hide. Same as Win+V: any click after
     // summoning dismisses the picker.
@@ -1024,7 +1073,7 @@ unsafe fn rebuild_rows() {
 
     // 文档高度 = 全部条目(滚动区域),由 NSScrollView 滚动。
     // Document height covers ALL entries (the scrollable area).
-    let doc_h = PAD_Y * 2.0 + pitches.iter().sum::<f64>();
+    let doc_h = rows_top_offset() + pitches.iter().sum::<f64>() + PAD_Y;
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
 
     let sel_idx = *PICKER_SELECTION.lock().unwrap();

@@ -2,6 +2,9 @@
 # e.g. [menu] toggle_theme.dark  ->  "menu.toggle_theme.dark".
 # Keep keys identical across locale files; only values differ.
 
+[clipboard]
+clear_all = "Clear all"
+
 [menu]
 toggle_theme.dark = "Switch to Dark"
 toggle_theme.light = "Switch to Light"
