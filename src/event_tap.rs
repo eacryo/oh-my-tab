@@ -131,6 +131,15 @@ extern "C" {
     // Post an event to a tap level. kCGSessionEventTap=1 posts to the session level,
     // bypassing HID-level taps and thus the system's natural-scroll override at the HID layer.
     pub(crate) fn CGEventPost(tap: i32, event: CGEventRef);
+
+    // 创建键盘事件(keyDown=1 / keyUp=0),供历史剪贴板模拟 Cmd+V 粘贴使用。
+    // Create a keyboard event (keyDown=1 / keyUp=0), used by the history clipboard to
+    // synthesize Cmd+V for pasting.
+    pub(crate) fn CGEventCreateKeyboardEvent(
+        source: *const c_void,
+        keycode: u16,
+        key_down: bool,
+    ) -> CGEventRef;
 }
 
 // IOKit 私有 API:读写 IOHIDEvent 的浮点字段。

@@ -18,6 +18,7 @@ pub struct Config {
     pub windows: WindowsSection,
     pub logging: LoggingSection,
     pub startup: StartupSection,
+    pub clipboard: ClipboardSection,
     pub mouse: MouseSection,
 }
 
@@ -122,6 +123,26 @@ pub struct StartupSection {
     // 开机自启;默认 false,bool::default() 即 false,故 Default 可直接派生。
     // Launch at login; defaults to false (bool::default() is false, so Default derives directly).
     pub launch_at_login: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClipboardSection {
+    // 历史剪贴板总开关;默认 false(不启动剪贴板轮询)。
+    // History-clipboard master switch; defaults to false (no pasteboard polling).
+    pub enabled: bool,
+    // 历史最大条数(1..=100,默认 50)。第一版仅内存,不持久化。
+    // Max history entries (1..=100, default 50). v1 is in-memory only, no persistence.
+    pub max_entries: u32,
+}
+
+impl Default for ClipboardSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: 50,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -618,6 +639,14 @@ impl Config {
             ));
         }
 
+        // --- clipboard ---
+        if !(1..=100).contains(&self.clipboard.max_entries) {
+            errs.push(tf(
+                "errors.clipboard_max_entries_invalid",
+                &[("value", &self.clipboard.max_entries.to_string())],
+            ));
+        }
+
         // --- mouse profiles ---
         for (i, p) in self.mouse.profiles.iter().enumerate() {
             let prefix = format!("mouse.profiles[{i}]");
@@ -785,6 +814,13 @@ impl Config {
         // startup (bool 字段无需校验,恒有效)
         // startup (bool field needs no validation, always valid)
         self.startup = other.startup;
+
+        // clipboard (enabled 恒有效;max_entries 有校验)
+        // clipboard (enabled always valid; max_entries is validated)
+        self.clipboard.enabled = other.clipboard.enabled;
+        if !errs.iter().any(|e| e.starts_with("clipboard.max_entries")) {
+            self.clipboard.max_entries = other.clipboard.max_entries;
+        }
 
         // mouse:profiles 逐档逐字段合并(沿用 per-field resilient 模式)。
         // enabled 与 bool 字段恒有效;profiles 的每个档按字段校验结果保留或丢弃。
@@ -1120,6 +1156,8 @@ mod tests {
         other.keyboard.modifier = "option".into();
         other.i18n.locale = "zh-Hant".into();
         other.mouse.enabled = true;
+        other.clipboard.enabled = true;
+        other.clipboard.max_entries = 30;
         let mut merged = Config::default();
         merged.merge_valid(other, &[]);
         assert_eq!(merged.appearance.theme, "dark");
@@ -1127,6 +1165,21 @@ mod tests {
         assert_eq!(merged.keyboard.modifier, "option");
         assert_eq!(merged.i18n.locale, "zh-Hant");
         assert!(merged.mouse.enabled);
+        assert!(merged.clipboard.enabled);
+        assert_eq!(merged.clipboard.max_entries, 30);
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_clipboard_max_entries() {
+        // 剪贴板最大条数必须在 1..=100 内。
+        // Clipboard max entries must be within 1..=100.
+        let mut cfg = Config::default();
+        cfg.clipboard.max_entries = 0;
+        assert_err_count(&cfg, 1);
+        cfg.clipboard.max_entries = 101;
+        assert_err_count(&cfg, 1);
+        cfg.clipboard.max_entries = 50;
+        assert_err_count(&cfg, 0);
     }
 
     #[test]

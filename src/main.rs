@@ -1,4 +1,5 @@
 mod autostart;
+mod clipboard;
 mod config;
 mod event_monitor;
 mod event_tap;
@@ -527,6 +528,12 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(onClipboardToggled:),
+            clipboard::on_clipboard_toggle as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleAppActivation:),
             on_app_activated as *mut c_void,
             types_v_obj.as_ptr(),
@@ -902,6 +909,28 @@ fn prompt_accessibility_if_needed() {
 }
 
 fn main() {
+    // 冒烟测试入口(--smoke-clipboard):在真实主线程 + NSApplication 环境里两次显示
+    // 剪贴板浮窗(覆盖 rebuild_rows 行清理路径),成功 exit(0)。由 clipboard 模块的
+    // #[ignore] 测试以子进程方式调用——测试 harness 的工作线程会被 AppKit 主线程限制拦下。
+    // Smoke-test entry (--smoke-clipboard): show the clipboard picker twice on the real main
+    // thread inside a real NSApplication (exercising rebuild_rows' row cleanup), exit(0) on
+    // success. Invoked as a subprocess by the #[ignore] test in clipboard.rs -- the test
+    // harness's worker threads trip AppKit's main-thread guard.
+    if std::env::args().any(|a| a == "--smoke-clipboard") {
+        unsafe {
+            let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+            init_app();
+            drop(CONFIG.read().unwrap()); // 触发 CONFIG 初始化,与正常启动一致
+            let ok = clipboard::smoke_runner();
+            let _: () = msg_send![pool, drain];
+            if !ok {
+                eprintln!("[smoke-clipboard] picker smoke failed");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+    }
+
     // 1. Init NSApplication as accessory (no dock icon)
     init_app();
 
@@ -1056,6 +1085,14 @@ fn main() {
     // 指针设置(配置了禁用系统加速时立即生效)。
     mouse::pointer::apply();
 
+    // 7d. Start the clipboard-history poller only if enabled in config.
+    // 剪贴板历史轮询:仅在配置启用时启动(幂等)。
+    // Clipboard-history polling: start only if enabled (idempotent).
+    let clip_enabled = CONFIG.read().map(|c| c.clipboard.enabled).unwrap_or(false);
+    if clip_enabled {
+        clipboard::start();
+    }
+
     // Bridge thread: flume events → main thread via performSelectorOnMainThread
     thread::spawn(move || {
         while let Ok(event) = event_rx.recv() {
@@ -1063,6 +1100,7 @@ fn main() {
                 GlobalEvent::CmdTabPressed => sel!(handleCmdTabPressed:),
                 GlobalEvent::CmdReleased => sel!(handleCmdReleased:),
                 GlobalEvent::ThemeToggled => sel!(handleThemeToggled:),
+                GlobalEvent::ClipboardToggled => sel!(onClipboardToggled:),
             };
             // Read controller pointer from static (only written once, safe to read)
             let ctrl = CONTROLLER.lock().unwrap().unwrap().0;

@@ -40,10 +40,12 @@ struct SettingsUi {
     sidebar_general: *mut AnyObject, // NSButton: 通用 / General (tag=0)
     sidebar_experimental: *mut AnyObject, // NSButton: 实验性功能 / Experimental (tag=1)
     sidebar_mouse: *mut AnyObject,   // NSButton: 鼠标控制 / Mouse (tag=2)
+    sidebar_clipboard: *mut AnyObject, // NSButton: 剪贴板历史 / Clipboard history (tag=3)
     sidebar_highlight: *mut AnyObject, // NSView: 选中行高亮背景 (layer-backed)
     general_view: *mut AnyObject,    // NSView: 通用页容器 / General page container
     experimental_view: *mut AnyObject, // NSView: 实验性页容器 / Experimental page container
     mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
+    clipboard_view: *mut AnyObject,  // NSView: 剪贴板历史页容器 / Clipboard page container
     theme: *mut AnyObject,           // NSPopUpButton: dark / light / auto
     glass_style: *mut AnyObject,     // NSPopUpButton: regular / clear
     glass_tint: *mut AnyObject,      // NSTextField: RRGGBBAA hex
@@ -66,6 +68,8 @@ struct SettingsUi {
     line_count_label: *mut AnyObject, // NSTextField: line count row 的 label / the row's label
     line_count_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
     disable_pointer_accel: *mut AnyObject,  // NSSwitch: 禁用指针加速 / disable pointer acceleration
+    clipboard_enabled: *mut AnyObject,      // NSSwitch: 启用剪贴板历史 / enable clipboard history
+    clipboard_max_entries: *mut AnyObject,  // NSTextField: 历史最大条数 / max history entries
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
@@ -428,6 +432,14 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
             crate::mouse::stop();
         }
     }
+
+    // 剪贴板历史轮询热切换(无需重启)。
+    // Clipboard-history polling hot-switch (no restart needed).
+    if cfg.clipboard.enabled {
+        crate::clipboard::start();
+    } else {
+        crate::clipboard::stop();
+    }
 }
 
 /// 根据 enable_mouse switch 状态,冻结或解冻其下方的所有鼠标控件。
@@ -706,7 +718,7 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
 /// content views' visibility, and bold the selected item's label.
 fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
-    let idx = if idx > 2 { 0 } else { idx };
+    let idx = if idx > 3 { 0 } else { idx };
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         let ui = match ui.as_ref() {
@@ -717,8 +729,14 @@ fn select_sidebar(idx: usize) {
             ui.sidebar_general,
             ui.sidebar_experimental,
             ui.sidebar_mouse,
+            ui.sidebar_clipboard,
         ];
-        let views = [ui.general_view, ui.experimental_view, ui.mouse_view];
+        let views = [
+            ui.general_view,
+            ui.experimental_view,
+            ui.mouse_view,
+            ui.clipboard_view,
+        ];
         // 高亮背景对齐到选中按钮的 frame / align the highlight to the selected button's frame
         let frame: NSRect = msg_send![buttons[idx], frame];
         let _: () = msg_send![ui.sidebar_highlight, setFrame: frame];
@@ -728,6 +746,7 @@ fn select_sidebar(idx: usize) {
             t("settings.sidebar_general"),
             t("settings.sidebar_experimental"),
             t("settings.sidebar_mouse"),
+            t("settings.sidebar_clipboard"),
         ];
         for (i, &b) in buttons.iter().enumerate() {
             set_sidebar_title(b, &titles[i], i == idx);
@@ -1034,6 +1053,17 @@ fn load_settings_from(cfg: &Config) {
         // 根据滚动模式刷新行数行的条件显隐。
         // Refresh the conditional visibility of the lines-per-tick row by mode.
         update_mode_dependent_visibility(ui);
+
+        // ===== 剪贴板历史页:填充全局配置 =====
+        // Clipboard page: populate from the global config.
+        let _: () = msg_send![
+            ui.clipboard_enabled,
+            setState: if cfg.clipboard.enabled { 1isize } else { 0isize }
+        ];
+        set_field(
+            ui.clipboard_max_entries,
+            cfg.clipboard.max_entries.to_string(),
+        );
     }
 }
 
@@ -1219,6 +1249,21 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         if p.scroll_mode.as_deref() == Some("line") {
             let lc_val: isize = msg_send![ui.line_count, integerValue];
             p.line_count = Some(lc_val.clamp(1, 10) as u32);
+        }
+
+        // ===== 剪贴板历史页(全局配置,不随设备)=====
+        // Clipboard page (global config, not per-device).
+        let cb_state: isize = msg_send![ui.clipboard_enabled, state];
+        cfg.clipboard.enabled = cb_state == 1;
+        match parse_usize(&nsstring_to_rust(msg_send![
+            ui.clipboard_max_entries,
+            stringValue
+        ])) {
+            Ok(v) => cfg.clipboard.max_entries = v as u32,
+            Err(_) => errs.push(tf(
+                "errors.not_an_integer",
+                &[("field", "clipboard.max_entries")],
+            )),
         }
     }
     for e in cfg.validate() {
@@ -1477,10 +1522,12 @@ fn create_settings_window() {
             sidebar_general: std::ptr::null_mut(),
             sidebar_experimental: std::ptr::null_mut(),
             sidebar_mouse: std::ptr::null_mut(),
+            sidebar_clipboard: std::ptr::null_mut(),
             sidebar_highlight: std::ptr::null_mut(),
             general_view: std::ptr::null_mut(),
             experimental_view: std::ptr::null_mut(),
             mouse_view: std::ptr::null_mut(),
+            clipboard_view: std::ptr::null_mut(),
             theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             glass_tint: std::ptr::null_mut(),
@@ -1503,6 +1550,8 @@ fn create_settings_window() {
             line_count_label: std::ptr::null_mut(),
             line_count_value_label: std::ptr::null_mut(),
             disable_pointer_accel: std::ptr::null_mut(),
+            clipboard_enabled: std::ptr::null_mut(),
+            clipboard_max_entries: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
             ok_button: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
@@ -1629,6 +1678,15 @@ fn create_settings_window() {
             btn_y0 - 68.0,
             btn_w,
         );
+        ui.sidebar_clipboard = make_sidebar_button(
+            sidebar_view,
+            target,
+            &t("settings.sidebar_clipboard"),
+            3,
+            12.0,
+            btn_y0 - 102.0,
+            btn_w,
+        );
 
         // --- 通用页容器 general page container ---
         let general_view: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -1656,6 +1714,15 @@ fn create_settings_window() {
         let _: () = msg_send![content, addSubview: mouse_view];
         release_obj(mouse_view);
         ui.mouse_view = mouse_view;
+
+        // --- 剪贴板历史页容器 clipboard page container(初始隐藏 / initially hidden)---
+        let clipboard_view: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let clipboard_view: *mut AnyObject = msg_send![clipboard_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
+        let _: () = msg_send![clipboard_view, setHidden: true];
+        let _: () = msg_send![clipboard_view, setAutoresizingMask: 18u64]; // 同 general_view:宽高拉伸
+        let _: () = msg_send![content, addSubview: clipboard_view];
+        release_obj(clipboard_view);
+        ui.clipboard_view = clipboard_view;
 
         // ===== 通用页内容 general page content =====
         let mut y = layout_h - 12.0; // 顶部光标:下一个元素的底边 y / top cursor (bottom y of next element)
@@ -2150,6 +2217,50 @@ fn create_settings_window() {
             &t("settings.row_disable_pointer_accel"),
             make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
+
+        // ===== 剪贴板历史页内容 clipboard page content =====
+        // 独立布局游标(该页内容与鼠标页互不相关)。
+        // Independent layout cursor (this page's content is unrelated to the mouse page).
+        let mut cy = layout_h - 12.0;
+        add_header(
+            clipboard_view,
+            &t("settings.header_clipboard"),
+            12.0,
+            cy - 18.0,
+            content_w - 24.0,
+        );
+        cy -= 8.0 + 26.0;
+        // 启用开关 / master switch.
+        ui.clipboard_enabled = add_row(
+            clipboard_view,
+            label_x,
+            cy,
+            label_w,
+            row_h,
+            &t("settings.row_clipboard_enabled"),
+            make_switch(ctrl_x + ctrl_w, cy, row_h, false),
+        );
+        cy -= 8.0 + row_h;
+        // 最大条数(数字输入)/ max entries (number input).
+        ui.clipboard_max_entries = add_row(
+            clipboard_view,
+            label_x,
+            cy,
+            label_w,
+            row_h,
+            &t("settings.row_clipboard_max_entries"),
+            make_text_input(ctrl_x, cy, ctrl_w, row_h, "50"),
+        );
+        cy -= 8.0 + row_h;
+        // 呼出快捷键说明(只读 label)/ shortcut hint (read-only label).
+        let hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let hint: *mut AnyObject = msg_send![hint, initWithFrame: NSRect::new(NSPoint::new(label_x, cy), NSSize::new(content_w - 24.0, row_h))];
+        set_field(hint, t("settings.row_clipboard_shortcut"));
+        let _: () = msg_send![hint, setBezeled: false];
+        let _: () = msg_send![hint, setDrawsBackground: false];
+        let _: () = msg_send![hint, setEditable: false];
+        let _: () = msg_send![clipboard_view, addSubview: hint];
+        release_obj(hint);
 
         // banner 最后添加:作为 general_view 的最后一个 subview,保证在内容之上(缺权限时覆盖顶部)。
         // Added last: as general_view's final subview so it floats above the content (when

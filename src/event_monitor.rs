@@ -17,6 +17,7 @@ pub enum GlobalEvent {
     CmdTabPressed,
     CmdReleased,
     ThemeToggled,
+    ClipboardToggled,
 }
 
 // 窗口切换专用常量 / window-switcher-specific constants
@@ -28,6 +29,9 @@ const K_CG_EVENT_FLAG_MASK_ALTERNATE: crate::event_tap::CGEventFlags = 0x0008000
 const K_VK_TAB: u16 = 48;
 const K_VK_COMMAND: u16 = 55;
 const K_VK_OPTION: u16 = 58;
+// 历史剪贴板呼出键:Option+V(V 键码 9)。
+// History-clipboard summon key: Option+V (V keycode 9).
+const K_VK_V: u16 = 9;
 
 // 标记是否已经发送过 CmdTabPressed，防止修饰键变化时误发 CmdReleased
 // Tracks whether CmdTabPressed was sent, to avoid spurious CmdReleased
@@ -78,6 +82,15 @@ unsafe extern "C" fn event_tap_callback(
                     return std::ptr::null_mut();
                 }
                 log_debug!("[kbd] keyDown Tab");
+            } else if keycode == K_VK_V && (flags & K_CG_EVENT_FLAG_MASK_ALTERNATE) != 0 {
+                // 历史剪贴板呼出:Option+V(始终走 Option 修饰,不随快捷键模式切换)。
+                // 吞掉事件,与 Win+V 行为一致。只打组合名(隐私约定)。
+                // History-clipboard summon: Option+V (always Option, independent of the
+                // shortcut mode). The event is swallowed, mirroring Win+V. Only the combo
+                // name is logged (privacy convention).
+                log_debug!("[kbd] summon keyDown V+Option (clipboard)");
+                let _ = sender.send(GlobalEvent::ClipboardToggled);
+                return std::ptr::null_mut();
             } else if keycode == K_VK_COMMAND || keycode == K_VK_OPTION {
                 // 修饰键本身:固定键位,打按键名即可。
                 // Modifier keys themselves: fixed positions, logged by name.
