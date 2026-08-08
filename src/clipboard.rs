@@ -635,8 +635,16 @@ extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _no
 /// "Clear all" button callback: empty the clipboard history and close the picker (an empty
 /// history is ignored on summon).
 extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    CLIP_HISTORY.lock().unwrap().clear();
-    log_info!("Clipboard history cleared by user.");
+    // 清除全部时保留置顶条目(置顶 = 用户主动保存的常用内容)。
+    // "Clear all" keeps the pinned entries (pinned = content the user deliberately saved).
+    let mut hist = CLIP_HISTORY.lock().unwrap();
+    let kept = hist.iter().filter(|e| e.pinned).count();
+    hist.retain(|e| e.pinned);
+    log_info!(
+        "Clipboard history cleared by user ({} pinned entries kept).",
+        kept
+    );
+    drop(hist);
     hide_picker();
 }
 
