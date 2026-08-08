@@ -51,10 +51,19 @@ const POLL_INTERVAL: f64 = 0.5;
 const PICKER_MAX_ROWS: usize = 10;
 /// 浮窗宽度 / picker width.
 const PICKER_W: f64 = 420.0;
-/// 行距(行按钮 + 间距)/ row pitch.
-const ROW_H: f64 = 34.0;
-/// 行按钮高度 / row button height.
-const ROW_BTN_H: f64 = 28.0;
+/// 行按钮内的行高(13pt 字体的行高约 17.5pt,留余量取 20)。
+/// Line height inside a row button (13pt font's line height is ~17.5pt; 20 keeps headroom).
+const LINE_H: f64 = 20.0;
+/// 行按钮内上下内边距 / row button vertical padding.
+const BTN_PAD_Y: f64 = 3.0;
+/// 行按钮之间的间距 / gap between row buttons.
+const ROW_GAP: f64 = 8.0;
+/// 每条文本最多显示的行数(超出第 3 行截断加省略号)。
+/// Max lines shown per entry (truncated with an ellipsis beyond line 3).
+const MAX_TEXT_LINES: usize = 3;
+/// 单行显示宽度上限(以 ASCII 字符为单位;中文/全角按 2 折算)。
+/// Per-line width cap in ASCII-character units (CJK/full-width chars count as 2).
+const LINE_MAX_UNITS: usize = 60;
 /// 上下留白 / vertical padding.
 const PAD_Y: f64 = 10.0;
 /// 左右留白 / horizontal padding.
@@ -92,6 +101,10 @@ static PICKER_CONTAINER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// 每行按钮指针(按行索引,供高亮/点击)/ row button pointers by index (highlight / click).
 static ROW_BUTTONS: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// 每行的实际行距(按钮高 + 间距,随换行行数变化)/ per-row pitch (button height + gap,
+/// varies with the wrapped line count).
+static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
 /// 行列表重建进行中:重建期间 addSubview 的新行按钮会因鼠标恰好在区域内而立即派发
 /// mouseEntered(ActiveInKeyWindow + InVisibleRect 的 tracking area),若该回调再触发
 /// rebuild_rows 就是无限递归(窗口为 key 时键盘导航触发 rebuild 必现,曾导致进程挂起)。
@@ -106,6 +119,97 @@ static ROW_BUTTONS: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(V
 static REBUILDING: AtomicBool = AtomicBool::new(false);
 
 // ========== 纯逻辑(可测)/ pure logic (testable) ==========
+
+/// 按显示宽度估算文本的换行行数:ASCII 字符记 1 单位,中文/全角记 2;显式换行符单独成行。
+/// Estimate the wrapped line count by display width: ASCII counts as 1 unit, CJK/full-width
+/// as 2; explicit newlines start a new line.
+fn estimate_lines(text: &str, max_units: usize) -> usize {
+    let mut units = 0usize;
+    let mut lines = 1usize;
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines += 1;
+            units = 0;
+            continue;
+        }
+        let w = if ch.is_ascii() { 1 } else { 2 };
+        if units + w > max_units {
+            lines += 1;
+            units = w;
+        } else {
+            units += w;
+        }
+    }
+    lines
+}
+
+/// 把文本截断为最多 max_lines 行(按显示宽度),截断处(第 max_lines 行末尾)加省略号。
+/// Truncate the text to at most `max_lines` display lines (by width), appending an ellipsis
+/// at the truncation point (the end of the last kept line).
+fn truncate_to_lines(text: &str, max_units: usize, max_lines: usize) -> String {
+    let mut out = String::new();
+    let mut units = 0usize;
+    let mut lines = 1usize;
+    for ch in text.chars() {
+        if ch == '\n' {
+            if lines >= max_lines {
+                out.push('…');
+                return out;
+            }
+            lines += 1;
+            units = 0;
+            out.push('\n');
+            continue;
+        }
+        let w = if ch.is_ascii() { 1 } else { 2 };
+        if units + w > max_units {
+            if lines >= max_lines {
+                out.push('…');
+                return out;
+            }
+            lines += 1;
+            units = w;
+            out.push(ch);
+        } else {
+            units += w;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// 文本的行数(上限 MAX_TEXT_LINES,超出按 3 行计——第 3 行截断)。
+/// The entry's display line count (capped at MAX_TEXT_LINES; beyond that it renders 3 lines
+/// with the last one truncated).
+fn text_lines(text: &str) -> usize {
+    estimate_lines(text, LINE_MAX_UNITS).min(MAX_TEXT_LINES)
+}
+
+/// 行按钮高度 = 行数 * 行高 + 上下内边距。
+/// Row-button height = lines * line height + vertical padding.
+fn row_button_height(lines: usize) -> f64 {
+    lines as f64 * LINE_H + BTN_PAD_Y * 2.0
+}
+
+/// 行距(按钮高 + 间距)。/ Row pitch (button height + gap).
+fn row_pitch(btn_h: f64) -> f64 {
+    btn_h + ROW_GAP
+}
+
+/// 计算一批文本的每行行距(由各自换行行数决定)。
+/// Compute the per-row pitches for a batch of texts (driven by each entry's wrapped lines).
+fn compute_pitches(texts: &[String]) -> Vec<f64> {
+    texts
+        .iter()
+        .map(|t| row_pitch(row_button_height(text_lines(t))))
+        .collect()
+}
+
+/// 第 idx 行的顶部 y(flipped 坐标):PAD_Y + 前 idx 行行距之和。
+/// The top y of row `idx` (flipped coords): PAD_Y + the sum of the pitches before it.
+fn row_top(idx: usize, pitches: &[f64]) -> f64 {
+    PAD_Y + pitches.iter().take(idx).sum::<f64>()
+}
 
 /// 把新文本记入历史。规则:
 /// - 空文本忽略
@@ -398,6 +502,66 @@ unsafe fn timer_target() -> *mut AnyObject {
 
 // ========== 浮窗 / the picker ==========
 
+/// 浮窗相对光标的偏移(右下 16pt;空间不足时翻转到左/上)。
+/// The picker's offset from the cursor (16pt to the bottom-right; flips to the left/top
+/// when there isn't room).
+const PICKER_CURSOR_OFF: f64 = 16.0;
+/// 边缘最小留白 / minimum margin from the screen edge.
+const PICKER_EDGE_MARGIN: f64 = 8.0;
+
+/// 纯逻辑:包含光标的屏幕 frame(找不到返回 None)。
+/// Pure: the screen frame containing the cursor (None when no screen contains it).
+fn screen_containing(cursor: NSPoint, frames: &[NSRect]) -> Option<NSRect> {
+    frames.iter().copied().find(|f| {
+        f.origin.x <= cursor.x
+            && cursor.x < f.origin.x + f.size.width
+            && f.origin.y <= cursor.y
+            && cursor.y < f.origin.y + f.size.height
+    })
+}
+
+/// 纯逻辑:计算浮窗 frame——光标右下偏移,右侧/下方空间不足时翻转到左侧/上方,
+/// 仍不足则贴屏边缘 clamp,永不越出屏幕。
+///
+/// Pure: compute the picker frame -- offset to the cursor's bottom-right; flip to the
+/// left/top when the right/bottom side lacks room; clamp to the screen edge otherwise.
+/// Never placed outside the screen.
+fn picker_frame_for(cursor: NSPoint, screen: NSRect, w: f64, h: f64) -> NSRect {
+    let min_x = screen.origin.x;
+    let max_x = screen.origin.x + screen.size.width;
+    let min_y = screen.origin.y;
+    let max_y = screen.origin.y + screen.size.height;
+
+    // x:优先光标右侧;不足翻转到左侧;再不足贴左右缘。
+    // x: prefer the cursor's right; flip to the left when tight; clamp to the edges.
+    let mut x = cursor.x + PICKER_CURSOR_OFF;
+    if x + w > max_x {
+        x = cursor.x - w - PICKER_CURSOR_OFF;
+    }
+    if x < min_x {
+        x = min_x + PICKER_EDGE_MARGIN;
+    }
+    if x + w > max_x {
+        x = max_x - w - PICKER_EDGE_MARGIN;
+    }
+
+    // y:优先光标下方(面板顶边距光标 16pt);下方不足翻转到上方;再不足贴上下缘。
+    // y: prefer below the cursor (the panel's top edge sits 16pt under it); flip above when
+    // tight; clamp to the edges.
+    let mut y = cursor.y - h - PICKER_CURSOR_OFF;
+    if y < min_y {
+        y = cursor.y + PICKER_CURSOR_OFF;
+    }
+    if y + h > max_y {
+        y = max_y - h - PICKER_EDGE_MARGIN;
+    }
+    if y < min_y {
+        y = min_y + PICKER_EDGE_MARGIN;
+    }
+
+    NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+}
+
 /// Option+V 呼出/关闭(由 bridge 在主线程调用)。
 /// Toggle the picker on Option+V (called on the main thread by the bridge).
 pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -428,15 +592,43 @@ fn show_picker() {
         let hist_len = CLIP_HISTORY.lock().unwrap().len();
         log_debug!("[clip] show picker: history={} entries", hist_len);
 
-        // 窗口高度 = 上下留白 + 可视行数 * 行距(不空留整页)。
-        // Window height = paddings + visible rows * row pitch (no empty page).
+        // 窗口高度 = 上下留白 + 可视行的行距之和(行距由各条文本的换行行数决定)。
+        // Window height = paddings + the sum of the visible rows' pitches (each pitch follows
+        // the entry's wrapped line count).
+        let pitches = {
+            let hist = CLIP_HISTORY.lock().unwrap();
+            compute_pitches(&hist)
+        };
         let visible = hist_len.min(PICKER_MAX_ROWS);
-        let h = PAD_Y * 2.0 + visible as f64 * ROW_H;
-        let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-        let screen_frame: NSRect = msg_send![screen, frame];
-        let x = (screen_frame.size.width - PICKER_W) / 2.0 + screen_frame.origin.x;
-        let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
-        let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(PICKER_W, h));
+        let h = PAD_Y * 2.0 + pitches.iter().take(visible).sum::<f64>();
+
+        // 定位:跟随光标(光标右下偏移,空间不足翻转;光标所在屏幕,找不到回退主屏)。
+        // Position: follow the cursor (bottom-right offset, flips when tight; the screen the
+        // cursor is on, falling back to the main screen).
+        let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        let count: usize = msg_send![screens, count];
+        let mut frames: Vec<NSRect> = Vec::with_capacity(count);
+        for i in 0..count {
+            // objectAtIndex: 的参数编码是 'q'(signed long),必须传 isize。
+            // objectAtIndex: expects 'q' (signed long); pass isize.
+            let s: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
+            frames.push(msg_send![s, frame]);
+        }
+        let screen_frame = screen_containing(cursor, &frames).unwrap_or_else(|| {
+            let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+            msg_send![main, frame]
+        });
+        let frame = picker_frame_for(cursor, screen_frame, PICKER_W, h);
+        log_debug!(
+            "[clip] picker frame: ({:.0},{:.0}) {}x{} on screen ({:.0},{:.0})",
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+            screen_frame.origin.x,
+            screen_frame.origin.y
+        );
         let _: () = msg_send![window, setFrame: frame, display: true];
 
         rebuild_rows();
@@ -482,9 +674,10 @@ unsafe fn ensure_picker_window() {
     let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
     let screen_frame: NSRect = msg_send![screen, frame];
     let w = PICKER_W;
-    // 初始高度按最大可视行数(show_picker 每次按实际条数重设)。
-    // Initial height sized for the max visible rows (show_picker re-sizes per summon).
-    let h = PAD_Y * 2.0 + PICKER_MAX_ROWS as f64 * ROW_H;
+    // 初始高度按最大可视行数(占位;show_picker 每次按实际 pitch 重设)。
+    // Initial height sized for the max visible rows (placeholder; show_picker re-sizes per
+    // summon using the real pitches).
+    let h = PAD_Y * 2.0 + PICKER_MAX_ROWS as f64 * row_pitch(row_button_height(1));
     let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
     let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
@@ -694,16 +887,21 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![b.0, removeFromSuperview];
     }
     rows.clear();
+    let mut pitches = ROW_PITCHES.lock().unwrap();
+    pitches.clear();
+    // 每行的按钮高/行距由文本换行行数决定。
+    // Each row's button height / pitch derives from its wrapped line count.
+    *pitches = compute_pitches(&hist);
+    let total = hist.len();
 
     // 文档高度 = 全部条目(滚动区域),由 NSScrollView 滚动。
     // Document height covers ALL entries (the scrollable area).
-    let total = hist.len();
-    let doc_h = PAD_Y * 2.0 + total as f64 * ROW_H;
+    let doc_h = PAD_Y * 2.0 + pitches.iter().sum::<f64>();
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
 
     let sel_idx = *PICKER_SELECTION.lock().unwrap();
     for i in 0..total {
-        let y = PAD_Y + i as f64 * ROW_H;
+        let y = row_top(i, &pitches);
         log_debug!(
             "[clip] row {} created: y={} title=\"{}\"",
             i,
@@ -713,12 +911,16 @@ unsafe fn rebuild_rows() {
         let btn: *mut AnyObject = msg_send![row_button_class(), alloc];
         let btn: *mut AnyObject = msg_send![
             btn,
-            initWithFrame: NSRect::new(NSPoint::new(PAD_X, y), NSSize::new(PICKER_W - PAD_X * 2.0, ROW_BTN_H))
+            initWithFrame: NSRect::new(
+                NSPoint::new(PAD_X, y),
+                NSSize::new(PICKER_W - PAD_X * 2.0, pitches[i] - ROW_GAP)
+            )
         ];
         let _: () = msg_send![btn, setBordered: false];
         let _: () = msg_send![btn, setAlignment: 0isize]; // left
-                                                          // 截断长文本为单行 / truncate long text to a single line.
-        let title = truncate_line(&hist[i], 60);
+                                                          // 超长文本换行显示,最多 3 行(第 3 行超出截断加省略号)。
+                                                          // Long text wraps, up to 3 lines (truncated with an ellipsis on line 3).
+        let title = truncate_to_lines(&hist[i], LINE_MAX_UNITS, MAX_TEXT_LINES);
         let attr = make_row_attributed_title(&title, i == sel_idx);
         let _: () = msg_send![btn, setAttributedTitle: attr];
         release_obj(attr);
@@ -901,14 +1103,17 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 refresh_selection(idx);
                 // 滚动到选中行可见 / scroll the selection into view.
                 if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
-                    let y = PAD_Y + idx as f64 * ROW_H;
+                    let pitches = ROW_PITCHES.lock().unwrap();
+                    let y = row_top(idx, &pitches);
+                    let h = pitches.get(idx).copied().unwrap_or(ROW_GAP);
+                    drop(pitches);
                     // scrollRectToVisible: 返回 BOOL('B')。
                     // scrollRectToVisible: returns BOOL ('B').
                     let _: bool = msg_send![
                         c.0,
                         scrollRectToVisible: NSRect::new(
                             NSPoint::new(0.0, y),
-                            NSSize::new(1.0, ROW_H)
+                            NSSize::new(1.0, h)
                         )
                     ];
                 }
@@ -976,14 +1181,24 @@ unsafe fn make_row_attributed_title(title: &str, selected: bool) -> *mut AnyObje
     } else {
         msg_send![class!(NSColor), secondaryLabelColor]
     };
+    // 段落样式:单词换行——长文本在行按钮内换行显示(最多 3 行由 truncate_to_lines 保证)。
+    // Paragraph style: word wrapping -- long text wraps inside the row button (the 3-line cap
+    // is guaranteed by truncate_to_lines).
+    let pstyle: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+    let pstyle: *mut AnyObject = msg_send![pstyle, init];
+    let _: () = msg_send![pstyle, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
     let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let attrs: *mut AnyObject = msg_send![attrs, init];
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
+    let pstyle_key = make_nsstring("NSParagraphStyle");
     let _: () = msg_send![attrs, setObject: font, forKey: font_key];
     let _: () = msg_send![attrs, setObject: color, forKey: color_key];
+    let _: () = msg_send![attrs, setObject: pstyle, forKey: pstyle_key];
     CFRelease(font_key as *const c_void);
     CFRelease(color_key as *const c_void);
+    CFRelease(pstyle_key as *const c_void);
+    release_obj(pstyle);
     let ns_title = make_nsstring(title);
     let attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
     let attr: *mut AnyObject = msg_send![attr, initWithString: ns_title, attributes: attrs];
@@ -1159,6 +1374,65 @@ mod tests {
     }
 
     #[test]
+    fn estimate_lines_handles_width_and_newlines() {
+        use super::estimate_lines;
+        // 短文本一行 / short text stays on one line.
+        assert_eq!(estimate_lines("hello", 60), 1);
+        // 恰好 60 单位占满一行,不折行;61 个单位折成 2 行。
+        // Exactly 60 units fill a line (no wrap); 61 units wrap to 2 lines.
+        assert_eq!(estimate_lines(&"a".repeat(60), 60), 1);
+        assert_eq!(estimate_lines(&"a".repeat(61), 60), 2);
+        // 中文按 2 单位折算:30 个汉字占满一行,第 31 个折行。
+        // CJK counts as 2 units: 30 hanzi fill a line, the 31st wraps.
+        let hanzi: String = "中".repeat(30);
+        assert_eq!(estimate_lines(&hanzi, 60), 1);
+        assert_eq!(estimate_lines(&(hanzi + "中"), 60), 2);
+        // 显式换行符单独成行。
+        // Explicit newlines start new lines.
+        assert_eq!(estimate_lines("ab\ncd", 60), 2);
+        assert_eq!(estimate_lines("ab\ncd\nef", 60), 3);
+    }
+
+    #[test]
+    fn truncate_to_lines_caps_at_max_lines() {
+        use super::truncate_to_lines;
+        // 短文本原样保留 / short text passes through.
+        assert_eq!(truncate_to_lines("hello", 60, 3), "hello");
+        // 超过 3 行:3 整行 + 省略号(180 字符 + '…')。
+        // More than 3 lines: 3 full lines + the ellipsis (180 chars + '…').
+        let long: String = "a".repeat(200);
+        let t = truncate_to_lines(&long, 60, 3);
+        assert_eq!(t.chars().count(), 181);
+        assert!(t.ends_with('…'));
+        // 显式换行也计入行数 / explicit newlines count toward the cap.
+        let t3 = truncate_to_lines("l1\nl2\nl3\nl4", 60, 3);
+        assert_eq!(t3, "l1\nl2\nl3…");
+    }
+
+    #[test]
+    fn row_pitch_follows_line_count() {
+        use super::{compute_pitches, row_button_height, text_lines};
+        // 单行 vs 三行:行距随行数增大。
+        // One line vs three lines: the pitch grows with the line count.
+        let texts = vec!["short".to_string(), format!("{}", "长".repeat(100))];
+        let pitches = compute_pitches(&texts);
+        assert!(pitches[1] > pitches[0]);
+        // 按钮高 = 行数 * 行高 + 内边距。
+        // Button height = lines * line height + padding.
+        assert_eq!(
+            row_button_height(1),
+            1.0 * super::LINE_H + 2.0 * super::BTN_PAD_Y
+        );
+        assert_eq!(
+            row_button_height(3),
+            3.0 * super::LINE_H + 2.0 * super::BTN_PAD_Y
+        );
+        // 100 个汉字(200 单位)> 3 行上限 → 3 行。
+        // 100 hanzi (200 units) exceeds the 3-line cap -> 3 lines.
+        assert_eq!(text_lines(&"长".repeat(100)), 3);
+    }
+
+    #[test]
     fn nav_arrow_moves_and_wraps() {
         use super::nav_arrow;
         // ↓(125)前进,↑(126)后退,循环。
@@ -1171,6 +1445,62 @@ mod tests {
                                                    // Other keys are ignored; an empty history never moves.
         assert_eq!(nav_arrow(36, 1, 3), None);
         assert_eq!(nav_arrow(125, 0, 0), None);
+    }
+
+    #[test]
+    fn screen_containing_finds_the_cursor_screen() {
+        use super::screen_containing;
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        // 主屏 (0,0) 1440x900,副屏在左侧 (-800,0) 800x900。
+        // Main screen at (0,0) 1440x900; a second screen to the left at (-800,0) 800x900.
+        let frames = [
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0)),
+            NSRect::new(NSPoint::new(-800.0, 0.0), NSSize::new(800.0, 900.0)),
+        ];
+        // 光标在主屏 / cursor on the main screen.
+        assert_eq!(
+            screen_containing(NSPoint::new(700.0, 500.0), &frames),
+            Some(frames[0])
+        );
+        // 光标在左侧副屏(负 x)/ cursor on the left second screen (negative x).
+        assert_eq!(
+            screen_containing(NSPoint::new(-400.0, 200.0), &frames),
+            Some(frames[1])
+        );
+        // 光标在屏幕外 → None / cursor off-screen -> None.
+        assert_eq!(
+            screen_containing(NSPoint::new(3000.0, 500.0), &frames),
+            None
+        );
+    }
+
+    #[test]
+    fn picker_frame_follows_cursor_with_flips() {
+        use super::{picker_frame_for, PICKER_CURSOR_OFF, PICKER_EDGE_MARGIN};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0));
+        let w = 420.0;
+        let h = 300.0;
+        // 光标居中:窗口在光标右下方 16pt。
+        // Centered cursor: the panel sits 16pt to its bottom-right.
+        let f = picker_frame_for(NSPoint::new(700.0, 500.0), screen, w, h);
+        assert_eq!(f.origin.x, 700.0 + PICKER_CURSOR_OFF);
+        assert_eq!(f.origin.y, 500.0 - h - PICKER_CURSOR_OFF);
+        // 右侧空间不足 → 翻转到光标左侧。
+        // Not enough room on the right -> flip to the cursor's left.
+        let f = picker_frame_for(NSPoint::new(1300.0, 500.0), screen, w, h);
+        assert_eq!(f.origin.x, 1300.0 - w - PICKER_CURSOR_OFF);
+        // 下方空间不足 → 翻转到光标上方。
+        // Not enough room below -> flip above the cursor.
+        let f = picker_frame_for(NSPoint::new(700.0, 50.0), screen, w, h);
+        assert_eq!(f.origin.y, 50.0 + PICKER_CURSOR_OFF);
+        // 角落(右下):两边都翻转后仍越界 → clamp 进屏幕内。
+        // Bottom-right corner: both flips still overflow -> clamped inside the screen.
+        let f = picker_frame_for(NSPoint::new(1400.0, 20.0), screen, w, h);
+        assert!(f.origin.x >= screen.origin.x + PICKER_EDGE_MARGIN);
+        assert!(f.origin.x + w <= screen.origin.x + screen.size.width - PICKER_EDGE_MARGIN);
+        assert!(f.origin.y >= screen.origin.y + PICKER_EDGE_MARGIN);
+        assert!(f.origin.y + h <= screen.origin.y + screen.size.height - PICKER_EDGE_MARGIN);
     }
 
     // ========== 冒烟测试(需要真实 GUI 会话,手动运行)==========
