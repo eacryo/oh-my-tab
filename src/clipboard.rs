@@ -50,6 +50,10 @@ const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = 0x00100000;
 const POLL_INTERVAL: f64 = 0.5;
 /// 浮窗可视行数上限(超出滚动)/ max visible rows (scrolls beyond).
 const PICKER_MAX_ROWS: usize = 10;
+/// 浮窗最小高度(内容再少也不低于此,约 5-6 行的高度)。
+/// The picker's minimum height (never smaller, ~5-6 rows worth), also applied to the empty
+/// state for a consistent look.
+const PICKER_MIN_HEIGHT: f64 = 250.0;
 /// 浮窗宽度 / picker width.
 const PICKER_W: f64 = 420.0;
 /// 行按钮内的行高(13pt 字体的行高约 17.5pt,留余量取 20)。
@@ -786,7 +790,9 @@ fn show_picker() {
         } else {
             pitches.iter().take(visible).sum::<f64>()
         };
-        let h = rows_top_offset() + list_h + PAD_Y;
+        // 最小高度兜底(内容再少也不低于 PICKER_MIN_HEIGHT,含空历史态)。
+        // Floor at the minimum height (never smaller, empty state included).
+        let h = (rows_top_offset() + list_h + PAD_Y).max(PICKER_MIN_HEIGHT);
 
         // 定位:跟随光标(光标右下偏移,空间不足翻转;光标所在屏幕,找不到回退主屏)。
         // Position: follow the cursor (bottom-right offset, flips when tight; the screen the
