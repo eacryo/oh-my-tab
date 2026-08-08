@@ -72,6 +72,10 @@ const CLEAR_BTN_W: f64 = 60.0;
 const CLEAR_BTN_H: f64 = 22.0;
 /// 清除按钮与行列表的间距 / gap between the clear button and the row list.
 const CLEAR_BTN_GAP: f64 = 6.0;
+/// 行内图钉按钮宽度 / the per-row pin button width.
+const PIN_BTN_W: f64 = 24.0;
+/// 行内图钉按钮高度 / the per-row pin button height.
+const PIN_BTN_H: f64 = 20.0;
 /// 左右留白 / horizontal padding.
 const PAD_X: f64 = 12.0;
 /// 玻璃圆角:小浮窗固定小圆角,不跟随 config 的大圆角(那会让 420pt 小窗成胶囊)。
@@ -88,7 +92,7 @@ const SCROLL_INDICATOR_MIN_LEN: f64 = 24.0;
 // ========== 状态 / state ==========
 
 /// 历史列表,最新在前 / history, newest first.
-static CLIP_HISTORY: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static CLIP_HISTORY: LazyLock<Mutex<Vec<ClipEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// 上次读到的 changeCount(变化才读剪贴板)/ last observed changeCount (read only on change).
 static LAST_CHANGE_COUNT: LazyLock<Mutex<i64>> = LazyLock::new(|| Mutex::new(-1));
@@ -214,10 +218,10 @@ fn row_pitch(btn_h: f64) -> f64 {
 
 /// 计算一批文本的每行行距(由各自换行行数决定)。
 /// Compute the per-row pitches for a batch of texts (driven by each entry's wrapped lines).
-fn compute_pitches(texts: &[String]) -> Vec<f64> {
+fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
     texts
         .iter()
-        .map(|t| row_pitch(row_button_height(text_lines(t))))
+        .map(|e| row_pitch(row_button_height(text_lines(&e.text))))
         .collect()
 }
 
@@ -233,31 +237,101 @@ fn row_top(idx: usize, pitches: &[f64]) -> f64 {
     rows_top_offset() + pitches.iter().take(idx).sum::<f64>()
 }
 
+/// 历史条目:文本 + 置顶标记。置顶条目恒在列表顶部。
+/// A history entry: text + a pinned flag. Pinned entries stay at the top.
+#[derive(Debug, Clone, PartialEq)]
+struct ClipEntry {
+    text: String,
+    pinned: bool,
+}
+
+/// 新条目(非置顶)应插入的位置:置顶区之后(第一个非置顶条目的下标)。
+/// The insertion index for a new (unpinned) entry: right after the pinned block.
+fn insert_position(history: &[ClipEntry]) -> usize {
+    history.iter().take_while(|e| e.pinned).count()
+}
+
+/// 按文本查找条目下标;找不到返回 None。
+/// Find an entry's index by text; None when absent.
+fn find_by_text(history: &[ClipEntry], text: &str) -> Option<usize> {
+    history.iter().position(|e| e.text == text)
+}
+
+/// 把已存在的条目提到最前:保留其置顶状态——置顶条目移到置顶区顶部,
+/// 未置顶条目移到非置顶区顶部(即"最新位置")。列表因此永不重复。
+/// Move an existing entry to the front, KEEPING its pinned state: pinned entries go to the
+/// top of the pinned block, unpinned ones to the top of the unpinned block (the newest
+/// slot). The list therefore never holds duplicates.
+fn move_entry_to_front(history: &mut Vec<ClipEntry>, idx: usize) {
+    if idx >= history.len() {
+        return;
+    }
+    let e = history.remove(idx);
+    let pos = if e.pinned {
+        0
+    } else {
+        insert_position(history)
+    };
+    history.insert(pos, e);
+}
+
 /// 把新文本记入历史。规则:
 /// - 空文本忽略
-/// - 与栈顶相同(连续复制同一内容)忽略,不重复入栈
-/// - 超出 max 裁剪最旧条目
+/// - 全表查重:文本已存在 → 把旧条目提到最前(保留置顶状态,见 move_entry_to_front)
+/// - 未命中 → 新条目插到置顶区之后;超出 max 裁剪最旧条目
 ///
 /// 返回是否真正写入。
 ///
 /// Record a new text into the history:
 /// - empty text is ignored
-/// - a duplicate of the top entry (re-copying the same text) is skipped
-/// - entries beyond `max` are trimmed from the tail
+/// - full-list dedup: an existing text is moved to the front (pinned state kept, see
+///   move_entry_to_front)
+/// - a new text is inserted after the pinned block; entries beyond `max` are trimmed
 ///
 /// Returns whether something was actually recorded.
-fn record_text(history: &mut Vec<String>, text: &str, max: usize) -> bool {
+fn record_text(history: &mut Vec<ClipEntry>, text: &str, max: usize) -> bool {
     if text.is_empty() || max == 0 {
         return false;
     }
-    if history.first().map(|s| s == text).unwrap_or(false) {
-        return false;
+    if let Some(idx) = find_by_text(history, text) {
+        move_entry_to_front(history, idx);
+        return true;
     }
-    history.insert(0, text.to_string());
+    let pos = insert_position(history);
+    history.insert(
+        pos,
+        ClipEntry {
+            text: text.to_string(),
+            pinned: false,
+        },
+    );
     if history.len() > max {
         history.truncate(max);
     }
     true
+}
+
+/// 置顶第 idx 条:移到置顶区顶部(最上)。
+/// Pin entry `idx`: move it to the top of the pinned block.
+fn pin_entry(history: &mut Vec<ClipEntry>, idx: usize) {
+    if idx >= history.len() || history[idx].pinned {
+        return;
+    }
+    let mut e = history.remove(idx);
+    e.pinned = true;
+    history.insert(0, e);
+}
+
+/// 取消第 idx 条的置顶:移到非置顶区顶部(最新位置)。
+/// Unpin entry `idx`: move it to the top of the unpinned block (the newest slot).
+fn unpin_entry(history: &mut Vec<ClipEntry>, idx: usize) {
+    if idx >= history.len() || !history[idx].pinned {
+        return;
+    }
+    let mut e = history.remove(idx);
+    e.pinned = false;
+    let pos = insert_position(history);
+    history.insert(pos, e);
 }
 
 /// 当前生效的最大条数(从 CONFIG 读,设置保存后下次轮询生效)。
@@ -1116,21 +1190,31 @@ unsafe fn rebuild_rows() {
             "[clip] row {} created: y={} title=\"{}\"",
             i,
             y,
-            truncate_line(&hist[i], 20)
+            truncate_line(&hist[i].text, 20)
         );
         let btn: *mut AnyObject = msg_send![row_button_class(), alloc];
+        // 行按钮宽度右侧留出图钉按钮区域。
+        // The row button's width leaves room for the pin button on the right.
         let btn: *mut AnyObject = msg_send![
             btn,
             initWithFrame: NSRect::new(
                 NSPoint::new(PAD_X, y),
-                NSSize::new(PICKER_W - PAD_X * 2.0, pitches[i] - ROW_GAP)
+                NSSize::new(PICKER_W - PAD_X * 2.0 - PIN_BTN_W - 2.0, pitches[i] - ROW_GAP)
             )
         ];
         let _: () = msg_send![btn, setBordered: false];
         let _: () = msg_send![btn, setAlignment: 0isize]; // left
-                                                          // 超长文本换行显示,最多 3 行(第 3 行超出截断加省略号)。
-                                                          // Long text wraps, up to 3 lines (truncated with an ellipsis on line 3).
-        let title = truncate_to_lines(&hist[i], LINE_MAX_UNITS, MAX_TEXT_LINES);
+                                                          // 裁剪:行文本渲染不得溢出按钮边界(否则会画进右侧图钉区域)。
+                                                          // Clip: the row text must not render outside the button (it would bleed into the
+                                                          // pin button's area on the right).
+        let _: () = msg_send![btn, setWantsLayer: true];
+        let btn_layer: *mut AnyObject = msg_send![btn, layer];
+        if !btn_layer.is_null() {
+            let _: () = msg_send![btn_layer, setMasksToBounds: true];
+        }
+        // 超长文本换行显示,最多 3 行(第 3 行超出截断加省略号)。
+        // Long text wraps, up to 3 lines (truncated with an ellipsis on line 3).
+        let title = truncate_to_lines(&hist[i].text, LINE_MAX_UNITS, MAX_TEXT_LINES);
         let attr = make_row_attributed_title(&title, i == sel_idx);
         let _: () = msg_send![btn, setAttributedTitle: attr];
         release_obj(attr);
@@ -1175,6 +1259,53 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![container, addSubview: btn];
         release_obj(btn);
         rows.push(ObjPtr(btn));
+
+        // 行内图钉按钮:置顶/取消置顶。独立于行按钮(点击图钉不会触发粘贴)。
+        // Per-row pin button: pin/unpin. Separate from the row button (clicking the pin does
+        // not paste).
+        let pin_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+        let pin_btn: *mut AnyObject = msg_send![
+            pin_btn,
+            initWithFrame: NSRect::new(
+                NSPoint::new(
+                    PICKER_W - PAD_X - PIN_BTN_W,
+                    y + (pitches[i] - ROW_GAP - PIN_BTN_H) / 2.0
+                ),
+                NSSize::new(PIN_BTN_W, PIN_BTN_H)
+            )
+        ];
+        let _: () = msg_send![pin_btn, setBordered: false];
+        // NSImageOnly = 1。曾误用 2(NSImageLeft = 图像与标题并排),按钮默认标题
+        // 会显示在图标右侧(用户看到的"字母")。
+        // NSImageOnly = 1. Was mistakenly 2 (NSImageLeft = image beside the title), which
+        // showed the button's default title right of the icon (the stray letter).
+        let _: () = msg_send![pin_btn, setImagePosition: 1isize];
+        // 显式清空标题(默认值不可靠)。
+        // Explicitly clear the title (the default is unreliable).
+        let empty_ns = make_nsstring("");
+        let _: () = msg_send![pin_btn, setTitle: empty_ns];
+        CFRelease(empty_ns as *const c_void);
+        // SF Symbol:置顶用 pin.fill,未置顶用 pin。
+        // SF Symbol: pin.fill when pinned, pin otherwise.
+        let symbol = if hist[i].pinned { "pin.fill" } else { "pin" };
+        let sym_ns = make_nsstring(symbol);
+        let desc = make_nsstring("Pin");
+        let img: *mut AnyObject = msg_send![
+            class!(NSImage),
+            imageWithSystemSymbolName: sym_ns,
+            accessibilityDescription: desc
+        ];
+        CFRelease(sym_ns as *const c_void);
+        CFRelease(desc as *const c_void);
+        if !img.is_null() {
+            let _: () = msg_send![pin_btn, setImage: img];
+        }
+        let _: () = msg_send![pin_btn, setTag: i as isize];
+        let _: () = msg_send![pin_btn, setTarget: row_target()];
+        let _: () = msg_send![pin_btn, setAction: sel!(togglePin:)];
+        let _: () = msg_send![container, addSubview: pin_btn];
+        release_obj(pin_btn);
+        rows.push(ObjPtr(pin_btn));
     }
 
     // 恢复滚动位置 / restore the scroll position.
@@ -1236,12 +1367,32 @@ extern "C" fn handle_clipboard_row_click(_self: *mut c_void, _cmd: Sel, sender: 
     }
 }
 
+/// 图钉按钮回调(tag = 行索引):置顶/取消置顶并刷新列表。
+/// Pin-button callback (tag = row index): pin/unpin and refresh the list.
+extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
+    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+    if idx < 0 {
+        return;
+    }
+    let mut hist = CLIP_HISTORY.lock().unwrap();
+    if idx as usize >= hist.len() {
+        return;
+    }
+    if hist[idx as usize].pinned {
+        unpin_entry(&mut hist, idx as usize);
+    } else {
+        pin_entry(&mut hist, idx as usize);
+    }
+    drop(hist);
+    unsafe { rebuild_rows() };
+}
+
 /// 粘贴指定索引的条目:关闭浮窗 + 写回剪贴板 + 模拟 Cmd+V。
 /// Paste the entry at `idx`: close the picker + write back to the pasteboard + synthesize Cmd+V.
 fn paste_at(idx: usize) {
     let text = {
         let hist = CLIP_HISTORY.lock().unwrap();
-        hist.get(idx).cloned()
+        hist.get(idx).map(|e| e.text.clone())
     };
     match text {
         Some(t) => {
@@ -1439,6 +1590,12 @@ unsafe fn row_target() -> *mut AnyObject {
                 handle_clipboard_row_click as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(togglePin:),
+                toggle_pin as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             // 实例 alloc(+1):进程级单例,不释放(与静态生命周期一致)。
             // Instance alloc (+1): process-level singleton, never released (matches the
@@ -1534,27 +1691,69 @@ unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
 
 #[cfg(test)]
 mod tests {
-    use super::record_text;
+    use super::{record_text, ClipEntry};
+
+    fn entry(text: &str) -> ClipEntry {
+        ClipEntry {
+            text: text.to_string(),
+            pinned: false,
+        }
+    }
+
+    fn texts(h: &[ClipEntry]) -> Vec<String> {
+        h.iter().map(|e| e.text.clone()).collect()
+    }
 
     #[test]
     fn empty_text_is_ignored() {
-        let mut h = vec!["a".to_string()];
+        let mut h = vec![entry("a")];
         assert!(!record_text(&mut h, "", 50));
         assert_eq!(h.len(), 1);
     }
 
     #[test]
-    fn duplicate_of_top_is_skipped() {
-        // 连续复制同一内容:去重,不重复入栈。
-        // Re-copying the same text: dedup, no duplicate entries.
-        let mut h = vec!["a".to_string()];
-        assert!(!record_text(&mut h, "a", 50));
-        assert_eq!(h.len(), 1);
-        // 与栈顶不同的重复(历史中间的同内容)正常入栈。
-        // A duplicate that isn't the top (same content deeper in history) is recorded normally.
-        record_text(&mut h, "b", 50);
-        record_text(&mut h, "a", 50);
-        assert_eq!(h, vec!["a".to_string(), "b".to_string(), "a".to_string()]);
+    fn duplicate_is_moved_to_front_not_duplicated() {
+        // 全表查重:再次复制历史中已有的文本 → 旧条目提到最前,不新增重复。
+        // Full-list dedup: re-copying an existing text moves the old entry to the front
+        // instead of adding a duplicate.
+        let mut h = vec![entry("a"), entry("b")];
+        // 复制 "a"(已在列表末尾)→ 提到最前。
+        // Copy "a" (already at the tail) -> moved to the front.
+        assert!(record_text(&mut h, "a", 50));
+        assert_eq!(texts(&h), vec!["a", "b"]);
+        // 连续复制同一内容:原地不动,列表不重复。
+        // Re-copying the same text again: no move, no duplicate.
+        assert!(record_text(&mut h, "a", 50));
+        assert_eq!(texts(&h), vec!["a", "b"]);
+        assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_pinned_entry_stays_pinned_and_moves_to_pin_top() {
+        use super::pin_entry;
+        // 置顶 B 后,再复制 B:保持置顶并移到置顶区顶部。
+        // After pinning B, re-copying B keeps it pinned and moves it to the top of the
+        // pinned block.
+        let mut h = Vec::new();
+        record_text(&mut h, "A", 50);
+        record_text(&mut h, "B", 50);
+        pin_entry(&mut h, 0); // 置顶 B / pin B
+        record_text(&mut h, "C", 50);
+        record_text(&mut h, "D", 50);
+        // 现在:B(置顶) D C A(新条目插到置顶区之后,最新在前)。
+        // Now: B (pinned) D C A (new entries land after the pinned block, newest first).
+        assert_eq!(texts(&h), vec!["B", "D", "C", "A"]);
+        // 复制 B → 保持置顶且在置顶区顶部(顺序不变)。
+        // Copying B keeps it pinned at the top of the pinned block (order unchanged).
+        record_text(&mut h, "B", 50);
+        assert!(h[0].pinned);
+        assert_eq!(texts(&h), vec!["B", "D", "C", "A"]);
+        // 复制 A → 提到非置顶区顶部(D 比 C 新,仍在 C 前)。
+        // Copying A moves it to the top of the unpinned block (D is newer than C, so it
+        // stays before C).
+        record_text(&mut h, "A", 50);
+        assert_eq!(texts(&h), vec!["B", "A", "D", "C"]);
+        assert!(!h[1].pinned);
     }
 
     #[test]
@@ -1562,7 +1761,7 @@ mod tests {
         let mut h = Vec::new();
         record_text(&mut h, "first", 50);
         record_text(&mut h, "second", 50);
-        assert_eq!(h, vec!["second".to_string(), "first".to_string()]);
+        assert_eq!(texts(&h), vec!["second", "first"]);
     }
 
     #[test]
@@ -1574,8 +1773,8 @@ mod tests {
             record_text(&mut h, &format!("item{i}"), 3);
         }
         assert_eq!(h.len(), 3);
-        assert_eq!(h[0], "item4");
-        assert_eq!(h[2], "item2");
+        assert_eq!(h[0].text, "item4");
+        assert_eq!(h[2].text, "item2");
     }
 
     #[test]
@@ -1583,6 +1782,49 @@ mod tests {
         let mut h = Vec::new();
         assert!(!record_text(&mut h, "x", 0));
         assert!(h.is_empty());
+    }
+
+    #[test]
+    fn pinned_entries_stay_on_top_of_new_records() {
+        use super::{pin_entry, unpin_entry};
+        // 置顶 B 后,新复制的 C 插到置顶区之后(B 仍在顶部)。
+        // After pinning B, a new copy of C lands after the pinned block (B stays on top).
+        let mut h = Vec::new();
+        record_text(&mut h, "A", 50);
+        record_text(&mut h, "B", 50);
+        pin_entry(&mut h, 0); // 置顶 B / pin B
+        assert!(h[0].pinned);
+        record_text(&mut h, "C", 50);
+        assert_eq!(texts(&h), vec!["B", "C", "A"]);
+        // 取消置顶 B:移到非置顶区顶部。
+        // Unpinning B moves it to the top of the unpinned block.
+        unpin_entry(&mut h, 0);
+        assert!(!h[0].pinned);
+        assert_eq!(texts(&h), vec!["B", "C", "A"]);
+        // 新复制 D 排到 B 之前。
+        // A new copy of D lands before B.
+        record_text(&mut h, "D", 50);
+        assert_eq!(texts(&h), vec!["D", "B", "C", "A"]);
+    }
+
+    #[test]
+    fn pin_moves_entry_to_top_and_is_idempotent() {
+        use super::pin_entry;
+        let mut h = Vec::new();
+        record_text(&mut h, "A", 50);
+        record_text(&mut h, "B", 50);
+        record_text(&mut h, "C", 50);
+        pin_entry(&mut h, 2); // 置顶 A / pin A
+        assert_eq!(texts(&h), vec!["A", "C", "B"]);
+        assert!(h[0].pinned);
+        // 再次置顶同一位置:无变化。
+        // Pinning the same entry again: no change.
+        pin_entry(&mut h, 0);
+        assert_eq!(h.len(), 3);
+        // 越界置顶:忽略。
+        // Out-of-range pin: ignored.
+        pin_entry(&mut h, 99);
+        assert_eq!(h.len(), 3);
     }
 
     #[test]
@@ -1629,10 +1871,19 @@ mod tests {
 
     #[test]
     fn row_pitch_follows_line_count() {
-        use super::{compute_pitches, row_button_height, text_lines};
+        use super::{compute_pitches, row_button_height, text_lines, ClipEntry};
         // 单行 vs 三行:行距随行数增大。
         // One line vs three lines: the pitch grows with the line count.
-        let texts = vec!["short".to_string(), format!("{}", "长".repeat(100))];
+        let texts = vec![
+            ClipEntry {
+                text: "short".into(),
+                pinned: false,
+            },
+            ClipEntry {
+                text: "长".repeat(100),
+                pinned: false,
+            },
+        ];
         let pitches = compute_pitches(&texts);
         assert!(pitches[1] > pitches[0]);
         // 按钮高 = 行数 * 行高 + 内边距。
