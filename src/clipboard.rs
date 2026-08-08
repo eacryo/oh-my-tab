@@ -405,6 +405,14 @@ unsafe fn write_pasteboard_text(text: &str) {
 /// 轮询一次:changeCount 变化时读文本入历史。
 /// Poll once: read the text into history when changeCount changed.
 fn poll_clipboard() {
+    // 总开关关闭时停止记录(timer 已被 stop() 停掉,但全局通知观察者仍在,
+    // 回调必须自行检查——否则关闭后历史还在后台累积)。
+    // Stop recording when the master switch is off (stop() kills the timer, but the
+    // process-wide pasteboard notification observer stays registered, so the callback must
+    // check the switch itself -- otherwise history keeps accumulating while disabled).
+    if !CONFIG.read().unwrap().clipboard.enabled {
+        return;
+    }
     let changed = unsafe {
         let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
         if pb.is_null() {
@@ -760,6 +768,13 @@ fn picker_frame_for(cursor: NSPoint, screen: NSRect, w: f64, h: f64) -> NSRect {
 /// Option+V 呼出/关闭(由 bridge 在主线程调用)。
 /// Toggle the picker on Option+V (called on the main thread by the bridge).
 pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    // 总开关关闭时忽略呼出(设置里关闭后 Option+V 不应再显示浮窗)。
+    // Ignore the summon when the master switch is off (Option+V must not open the picker
+    // after the user disabled the feature in Settings).
+    if !CONFIG.read().unwrap().clipboard.enabled {
+        log_debug!("[clip] toggle ignored: clipboard history disabled");
+        return;
+    }
     if PICKER_VISIBLE.load(Ordering::SeqCst) {
         hide_picker();
         return;
