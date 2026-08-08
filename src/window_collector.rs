@@ -1003,13 +1003,20 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // orderOut'd (off-screen) so OnScreenOnly excludes it -- "open -> shown as a card, closed
     // -> hidden" holds automatically.
     let mut windows: Vec<WindowInfo> = Vec::new();
+    // TIMING-DEBUG 阶段计时(debug 档):定位 summon 卡顿——CG 枚举 / 每 PID AX 查询 / frontmost。
+    // TIMING-DEBUG Phase timings (debug tier): locate summon stalls -- CG enumeration /
+    // per-PID AX queries / the frontmost lookup. Remove together with the [collect] logs.
+    let t0 = Instant::now();
     let count = unsafe { CFArrayGetCount(array) };
     let now = Instant::now();
+    let t_cg_ms = t0.elapsed().as_millis();
     let mut insertion_order: u32 = 0;
 
     // 第一遍遍历：收集所有 PID，用于批量查询 AX 窗口
     // First pass: collect all PIDs to batch query AX windows
     let mut pids: HashSet<i32> = HashSet::new();
+    // TIMING-DEBUG pid -> 应用名(慢 AX 日志用)/ pid -> app name (for the slow-AX log).
+    let mut pid_names: HashMap<i32, String> = HashMap::new();
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
         if dict.is_null() {
@@ -1027,6 +1034,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         if owner_name.is_empty() || owner_name == "Dock" {
             continue;
         }
+        pid_names.insert(owner_pid, owner_name);
         pids.insert(owner_pid);
     }
 
@@ -1055,9 +1063,25 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // second pass can look up the cache per-window without an NSRunningApplication call each time
     // (wasteful when one app has many windows).
     let mut icon_ids: HashMap<i32, AppIdentity> = HashMap::new();
+    // TIMING-DEBUG 每 PID AX 查询耗时累计 / per-PID AX query time accumulator.
+    let mut ax_total_ms: u128 = 0;
     for &pid in &pids {
+        let t_pid = Instant::now();
         icon_ids.insert(pid, unsafe { resolve_app_identity(pid) });
         let ax_wins = get_ax_windows_for_pid(pid);
+        let pid_ms = t_pid.elapsed().as_millis();
+        ax_total_ms += pid_ms;
+        // TIMING-DEBUG 慢 AX 查询(≥20ms)单独标记:定位卡顿来自哪个应用(如 Ghostty)。
+        // TIMING-DEBUG Flag slow AX queries (>=20ms) individually: pin down which app stalls
+        // the summon.
+        if pid_ms >= 20 {
+            log_debug!(
+                "[collect] ax slow: pid={} app=\"{}\" {}ms",
+                pid,
+                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                pid_ms
+            );
+        }
         match ax_wins {
             Some(wins) if !wins.is_empty() => {
                 ax_queried_pids.insert(pid);
@@ -1179,6 +1203,15 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         mru.entry((owner_pid, cgwid)).or_insert(ordered_ts);
         insertion_order += 1;
         let icon_path = icon_ids.get(&owner_pid).and_then(check_cache_for_identity);
+        // TIMING-DEBUG 图标缓存 miss 标记:排查 summon 卡顿——哪些 app 会触发同步提取。
+        // TIMING-DEBUG Flag icon-cache misses: which apps trigger the synchronous extract.
+        if icon_path.is_none() {
+            log_debug!(
+                "[collect] icon miss: pid={} app=\"{}\"",
+                owner_pid,
+                owner_name
+            );
+        }
         windows.push(WindowInfo {
             pid: owner_pid,
             window_id: cgwid,
@@ -1261,6 +1294,8 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // (NSWorkspace.frontmostApplication + focused_window_cgwid) rather than CG enumeration
     // order, because CG's "All" option doesn't guarantee z-order when show_minimized is on.
     // Fall back to the first non-minimized window in CG enumeration if the system API fails.
+    // TIMING-DEBUG 前台 app 的 AX 聚焦窗口查询计时(从慢响应 app 切出时这里是第二个等待点)。
+    let t_fm = Instant::now();
     let frontmost: Option<(i32, u32)> = unsafe {
         let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         let front_app: *mut AnyObject = msg_send![workspace, frontmostApplication];
@@ -1271,6 +1306,18 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             None
         }
     };
+    let fm_ms = t_fm.elapsed().as_millis();
+    // 前台 app 的 AX 聚焦窗口查询也单独计时(从慢响应 app 切出时这里是第二个等待点)。
+    // The frontmost app's AX focused-window query is timed too (a second wait when leaving a
+    // slow-responding app).
+    if let Some((pid, _)) = frontmost {
+        log_debug!(
+            "[collect] frontmost pid={} app=\"{}\" {}ms",
+            pid,
+            pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+            fm_ms
+        );
+    }
     if let Some((pid, cgwid)) = frontmost {
         mru.insert((pid, cgwid), now);
         let w = windows
@@ -1327,6 +1374,16 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     if let Some(first) = windows.first_mut() {
         first.is_active = true;
     }
+    // TIMING-DEBUG 汇总:总耗时 + 各阶段(排查 summon 卡顿用)。
+    // TIMING-DEBUG Summary: total + per-phase timings (for summon-stall diagnosis).
+    let total_ms = t0.elapsed().as_millis();
+    log_debug!(
+        "[collect] total={}ms cg={}ms ax={}ms frontmost={}ms",
+        total_ms,
+        t_cg_ms,
+        ax_total_ms,
+        fm_ms
+    );
     windows
 }
 

@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::time::Instant; // TIMING-DEBUG
 
 use crate::config::{self, CONFIG};
 use crate::ffi::*;
@@ -170,6 +171,8 @@ pub(crate) unsafe fn make_centered_label(
 // ========== ObjC 回调实现 / ObjC callback implementations ==========
 
 pub(crate) extern "C" fn on_cmd_tab_pressed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    // TIMING-DEBUG 端到端计时:tap 回调 → collect → show_overlay(定位卡顿段)。
+    let t_end = Instant::now();
     let mut state_opt = TAB_STATE.lock().unwrap();
     let state = state_opt.as_mut().unwrap();
 
@@ -179,6 +182,8 @@ pub(crate) extern "C" fn on_cmd_tab_pressed(_self: *mut c_void, _cmd: Sel, _arg:
         state.selected = if state.windows.len() > 1 { 1 } else { 0 };
         drop(state_opt);
         show_overlay();
+        // TIMING-DEBUG 端到端:tap 回调 → collect_windows → show_overlay 完成。
+        log_debug!("[overlay] summon e2e={}ms", t_end.elapsed().as_millis());
     } else {
         state.selected = (state.selected + 1) % state.windows.len().max(1);
         drop(state_opt);
@@ -626,7 +631,10 @@ pub(crate) fn extract_uncached_icons() {
     // just those cards in place (otherwise the on-screen letter icons wouldn't
     // update until the next summon).
     let mut updated_indices: Vec<usize> = Vec::new();
+    // TIMING-DEBUG 逐 PID 提取计时:定位是哪个 app 的图标提取拖慢 summon。
+    let mut icons_total_ms: u128 = 0; // TIMING-DEBUG
     for pid in uncached {
+        let t_icon = Instant::now(); // TIMING-DEBUG
         if let Some(ref path) = extract_icon_to_cache(pid) {
             let path = path.clone();
             let mut state_opt = TAB_STATE.lock().unwrap();
@@ -639,10 +647,24 @@ pub(crate) fn extract_uncached_icons() {
                 }
             }
         }
+        let icon_ms = t_icon.elapsed().as_millis(); // TIMING-DEBUG
+        icons_total_ms += icon_ms;
+        // TIMING-DEBUG 标记慢提取(≥20ms)。
+        if icon_ms >= 20 {
+            log_debug!("[overlay] icons: extract pid={} {}ms", pid, icon_ms);
+        }
     }
 
     if !updated_indices.is_empty() {
+        let t_rebuild = Instant::now(); // TIMING-DEBUG
         rebuild_cards(&updated_indices);
+        // TIMING-DEBUG 汇总:提取总耗时 + 卡片就地重建耗时。
+        log_debug!(
+            "[overlay] icons: extract_total={}ms rebuild_cards x={} {}ms",
+            icons_total_ms,
+            updated_indices.len(),
+            t_rebuild.elapsed().as_millis()
+        );
     }
 }
 
@@ -1044,6 +1066,8 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> NSRect {
 
 pub(crate) fn show_overlay() {
     unsafe {
+        // TIMING-DEBUG 阶段计时:定位 summon 卡顿——卡片构建 / 图标 / resize / 状态栏。
+        let t0 = Instant::now();
         let state_opt = TAB_STATE.lock().unwrap();
         let state = state_opt.as_ref().unwrap();
         let count = state.windows.len();
@@ -1066,6 +1090,7 @@ pub(crate) fn show_overlay() {
                 let _: () = msg_send![sv, removeFromSuperview];
             }
         }
+        let t_remove_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
         // Clear old card index mappings, then create new card views
         clear_card_indices();
@@ -1090,8 +1115,21 @@ pub(crate) fn show_overlay() {
             (card_w(), card_w() + card_gap(), (w - row_width) / 2.0)
         };
 
+        let mut cards_total_ms: u128 = 0; // TIMING-DEBUG
         for (idx, w) in windows.iter().enumerate() {
+            let t_card = Instant::now(); // TIMING-DEBUG
             let card = create_card_view(w, idx, card_w_eff);
+            let card_ms = t_card.elapsed().as_millis(); // TIMING-DEBUG
+            cards_total_ms += card_ms;
+            // TIMING-DEBUG 单卡构建 >5ms:标记慢卡(图标加载/文本通常是耗时大头)。
+            if card_ms >= 5 {
+                log_debug!(
+                    "[overlay] card #{} slow: {}ms app=\"{}\"",
+                    idx,
+                    card_ms,
+                    w.app_name
+                );
+            }
 
             // Standard coords: y=0 at bottom. Cards stack from top down.
             let col = idx % cards_per_row();
@@ -1108,6 +1146,7 @@ pub(crate) fn show_overlay() {
             let _: () = msg_send![container, addSubview: card];
             release_obj(card); // container owns the card; drop create_card_view's alloc +1
         }
+        let t_cards_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
         // Resize window (h computed above). Target screen per config (follow active window / main).
         let screen_frame = overlay_target_screen(&windows);
@@ -1169,13 +1208,27 @@ pub(crate) fn show_overlay() {
 
         // Highlight selected card
         refresh_highlight();
+        let t_resize_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
+
+        // 补提取缺失图标(启动时未缓存/启动通知提取失败的应用,如刚启动 icon 未就绪的
+        // LinearMouse)。每次召唤都触发,而不是只在浮窗已可见时连按 Tab——否则这些 app
+        // 会一直显示字母占位,直到用户碰巧连续按 Tab。提取成功会 rebuild_cards 就地刷新。
+        // Backfill missing icons (apps not cached at startup / whose launch-notification extract
+        // failed, e.g. LinearMouse when its icon wasn't ready yet). Runs on every summon instead of
+        // only on repeated Tab while visible -- otherwise such apps show the letter placeholder
+        // until the user happens to press Tab again. Successful extracts rebuild cards in place.
+        let t_icons = Instant::now(); // TIMING-DEBUG
+        extract_uncached_icons();
+        // TIMING-DEBUG 汇总:各阶段耗时(排查 summon 卡顿用)。
+        let total_ms = t0.elapsed().as_millis();
+        log_debug!(
+            "[overlay] show: remove={}ms cards={}ms (sum={}ms) resize+status+highlight={}ms icons={}ms total={}ms",
+            t_remove_ms,
+            t_cards_ms - t_remove_ms,
+            cards_total_ms,
+            t_resize_ms - t_cards_ms,
+            t_icons.elapsed().as_millis(),
+            total_ms
+        );
     }
-    // 补提取缺失图标(启动时未缓存/启动通知提取失败的应用,如刚启动 icon 未就绪的
-    // LinearMouse)。每次召唤都触发,而不是只在浮窗已可见时连按 Tab——否则这些 app
-    // 会一直显示字母占位,直到用户碰巧连续按 Tab。提取成功会 rebuild_cards 就地刷新。
-    // Backfill missing icons (apps not cached at startup / whose launch-notification extract
-    // failed, e.g. LinearMouse when its icon wasn't ready yet). Runs on every summon instead of
-    // only on repeated Tab while visible -- otherwise such apps show the letter placeholder
-    // until the user happens to press Tab again. Successful extracts rebuild cards in place.
-    extract_uncached_icons();
 }

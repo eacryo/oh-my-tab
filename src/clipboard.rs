@@ -80,6 +80,10 @@ const CLEAR_BTN_GAP: f64 = 6.0;
 const PIN_BTN_W: f64 = 24.0;
 /// 行内图钉按钮高度 / the per-row pin button height.
 const PIN_BTN_H: f64 = 20.0;
+/// 行内删除按钮宽度 / the per-row delete button width.
+const DEL_BTN_W: f64 = 24.0;
+/// 行内删除按钮高度 / the per-row delete button height.
+const DEL_BTN_H: f64 = 20.0;
 /// 左右留白 / horizontal padding.
 const PAD_X: f64 = 12.0;
 /// 玻璃圆角:小浮窗固定小圆角,不跟随 config 的大圆角(那会让 420pt 小窗成胶囊)。
@@ -336,6 +340,13 @@ fn unpin_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     e.pinned = false;
     let pos = insert_position(history);
     history.insert(pos, e);
+}
+
+/// 删除第 idx 条(越界忽略)。/ Delete entry `idx` (out of range is ignored).
+fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
+    if idx < history.len() {
+        history.remove(idx);
+    }
 }
 
 /// 当前生效的最大条数(从 CONFIG 读,设置保存后下次轮询生效)。
@@ -1231,13 +1242,16 @@ unsafe fn rebuild_rows() {
             truncate_line(&hist[i].text, 20)
         );
         let btn: *mut AnyObject = msg_send![row_button_class(), alloc];
-        // 行按钮宽度右侧留出图钉按钮区域。
-        // The row button's width leaves room for the pin button on the right.
+        // 行按钮宽度右侧留出图钉 + 删除两个按钮区域。
+        // The row button's width leaves room for the pin and delete buttons on the right.
         let btn: *mut AnyObject = msg_send![
             btn,
             initWithFrame: NSRect::new(
                 NSPoint::new(PAD_X, y),
-                NSSize::new(PICKER_W - PAD_X * 2.0 - PIN_BTN_W - 2.0, pitches[i] - ROW_GAP)
+                NSSize::new(
+                    PICKER_W - PAD_X * 2.0 - PIN_BTN_W - DEL_BTN_W - 4.0,
+                    pitches[i] - ROW_GAP
+                )
             )
         ];
         let _: () = msg_send![btn, setBordered: false];
@@ -1306,7 +1320,7 @@ unsafe fn rebuild_rows() {
             pin_btn,
             initWithFrame: NSRect::new(
                 NSPoint::new(
-                    PICKER_W - PAD_X - PIN_BTN_W,
+                    PICKER_W - PAD_X - DEL_BTN_W - PIN_BTN_W - 2.0,
                     y + (pitches[i] - ROW_GAP - PIN_BTN_H) / 2.0
                 ),
                 NSSize::new(PIN_BTN_W, PIN_BTN_H)
@@ -1344,6 +1358,48 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![container, addSubview: pin_btn];
         release_obj(pin_btn);
         rows.push(ObjPtr(pin_btn));
+
+        // 行内删除按钮(Backspace 图标):单条删除。独立于行按钮(点击不会触发粘贴)。
+        // Per-row delete button (the Backspace icon): removes the entry. Separate from the
+        // row button (clicking it does not paste).
+        let del_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+        let del_btn: *mut AnyObject = msg_send![
+            del_btn,
+            initWithFrame: NSRect::new(
+                NSPoint::new(
+                    PICKER_W - PAD_X - DEL_BTN_W,
+                    y + (pitches[i] - ROW_GAP - DEL_BTN_H) / 2.0
+                ),
+                NSSize::new(DEL_BTN_W, DEL_BTN_H)
+            )
+        ];
+        let _: () = msg_send![del_btn, setBordered: false];
+        // NSImageOnly = 1;显式清空标题,只显示图标。
+        // NSImageOnly = 1; title cleared explicitly, icon only.
+        let _: () = msg_send![del_btn, setImagePosition: 1isize];
+        let empty_ns = make_nsstring("");
+        let _: () = msg_send![del_btn, setTitle: empty_ns];
+        CFRelease(empty_ns as *const c_void);
+        // SF Symbol "delete.left" = Backspace 图标。
+        // SF Symbol "delete.left" = the Backspace icon.
+        let sym_ns = make_nsstring("delete.left");
+        let desc = make_nsstring("Delete");
+        let img: *mut AnyObject = msg_send![
+            class!(NSImage),
+            imageWithSystemSymbolName: sym_ns,
+            accessibilityDescription: desc
+        ];
+        CFRelease(sym_ns as *const c_void);
+        CFRelease(desc as *const c_void);
+        if !img.is_null() {
+            let _: () = msg_send![del_btn, setImage: img];
+        }
+        let _: () = msg_send![del_btn, setTag: i as isize];
+        let _: () = msg_send![del_btn, setTarget: row_target()];
+        let _: () = msg_send![del_btn, setAction: sel!(deleteEntry:)];
+        let _: () = msg_send![container, addSubview: del_btn];
+        release_obj(del_btn);
+        rows.push(ObjPtr(del_btn));
     }
 
     // 恢复滚动位置 / restore the scroll position.
@@ -1421,6 +1477,29 @@ extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     } else {
         pin_entry(&mut hist, idx as usize);
     }
+    drop(hist);
+    unsafe { rebuild_rows() };
+}
+
+/// 删除按钮回调(tag = 行索引):删除该条并刷新列表。
+/// Delete-button callback (tag = row index): remove the entry and refresh the list.
+extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
+    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+    if idx < 0 {
+        return;
+    }
+    let mut hist = CLIP_HISTORY.lock().unwrap();
+    if idx as usize >= hist.len() {
+        return;
+    }
+    delete_entry(&mut hist, idx as usize);
+    // 删除后选中保持同位置(指向原下一条);越界则回退到末条。
+    // Selection stays at the same index (pointing at the next entry); clamps to the tail.
+    let mut sel = PICKER_SELECTION.lock().unwrap();
+    if *sel >= hist.len() {
+        *sel = hist.len().saturating_sub(1);
+    }
+    drop(sel);
     drop(hist);
     unsafe { rebuild_rows() };
 }
@@ -1522,6 +1601,24 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 let idx = *sel;
                 drop(sel);
                 paste_at(idx);
+            }
+            51 => {
+                // Backspace(删除键):删除选中条目并刷新。
+                // Backspace (delete): remove the selected entry and refresh.
+                let idx = *sel;
+                drop(sel);
+                let mut hist = CLIP_HISTORY.lock().unwrap();
+                if idx < hist.len() {
+                    delete_entry(&mut hist, idx);
+                    let len = hist.len();
+                    let mut sel = PICKER_SELECTION.lock().unwrap();
+                    if *sel >= len {
+                        *sel = len.saturating_sub(1);
+                    }
+                    drop(sel);
+                    drop(hist);
+                    rebuild_rows();
+                }
             }
             53 => {
                 // Esc
@@ -1632,6 +1729,12 @@ unsafe fn row_target() -> *mut AnyObject {
                 cls,
                 sel!(togglePin:),
                 toggle_pin as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(deleteEntry:),
+                delete_entry_cb as *mut c_void,
                 types.as_ptr(),
             );
             objc_registerClassPair(cls);
@@ -1863,6 +1966,42 @@ mod tests {
         // Out-of-range pin: ignored.
         pin_entry(&mut h, 99);
         assert_eq!(h.len(), 3);
+    }
+
+    #[test]
+    fn delete_entry_removes_by_index_and_ignores_out_of_range() {
+        use super::delete_entry;
+        let mut h = Vec::new();
+        record_text(&mut h, "A", 50);
+        record_text(&mut h, "B", 50);
+        record_text(&mut h, "C", 50);
+        // 删除中间条目 / remove the middle entry.
+        delete_entry(&mut h, 1);
+        assert_eq!(texts(&h), vec!["C", "A"]);
+        // 越界删除:无变化 / out-of-range delete: no change.
+        delete_entry(&mut h, 99);
+        assert_eq!(h.len(), 2);
+        // 删除后列表顺序保持 / order is preserved after deletion.
+        delete_entry(&mut h, 0);
+        assert_eq!(texts(&h), vec!["A"]);
+    }
+
+    #[test]
+    fn delete_pinned_entry_keeps_others_pinned() {
+        use super::{delete_entry, pin_entry};
+        let mut h = Vec::new();
+        record_text(&mut h, "A", 50);
+        record_text(&mut h, "B", 50);
+        record_text(&mut h, "C", 50);
+        pin_entry(&mut h, 0); // 置顶 C / pin C
+        pin_entry(&mut h, 1); // 置顶 B / pin B
+        assert_eq!(texts(&h), vec!["B", "C", "A"]);
+        // 删除置顶的 C:其余置顶保留,列表无空洞。
+        // Delete the pinned C: the other pin stays, no hole in the list.
+        delete_entry(&mut h, 1);
+        assert_eq!(texts(&h), vec!["B", "A"]);
+        assert!(h[0].pinned);
+        assert!(!h[1].pinned);
     }
 
     #[test]

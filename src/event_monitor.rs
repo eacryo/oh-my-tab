@@ -88,9 +88,17 @@ unsafe extern "C" fn event_tap_callback(
                 // History-clipboard summon: Option+V (always Option, independent of the
                 // shortcut mode). The event is swallowed, mirroring Win+V. Only the combo
                 // name is logged (privacy convention).
-                log_debug!("[kbd] summon keyDown V+Option (clipboard)");
-                let _ = sender.send(GlobalEvent::ClipboardToggled);
-                return std::ptr::null_mut();
+                //
+                // 功能关闭时不拦截:其他应用可能需要 Option+V 组合键,必须透传。
+                // When the feature is disabled, do NOT swallow Option+V -- other apps may
+                // need the combo, so it passes through (falls through to the Other log).
+                if !crate::config::CONFIG.read().unwrap().clipboard.enabled {
+                    log_debug!("[kbd] Option+V passthrough (clipboard disabled)");
+                } else {
+                    log_debug!("[kbd] summon keyDown V+Option (clipboard)");
+                    let _ = sender.send(GlobalEvent::ClipboardToggled);
+                    return std::ptr::null_mut();
+                }
             } else if keycode == K_VK_COMMAND || keycode == K_VK_OPTION {
                 // 修饰键本身:固定键位,打按键名即可。
                 // Modifier keys themselves: fixed positions, logged by name.
