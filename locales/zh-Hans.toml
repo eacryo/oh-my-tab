@@ -5,6 +5,7 @@
 
 [clipboard]
 clear_all = "清除全部"
+empty = "暂无剪贴板历史"
 
 [menu]
 toggle_theme.dark = "切换深色"

@@ -4,6 +4,7 @@
 
 [clipboard]
 clear_all = "Clear all"
+empty = "No clipboard history yet"
 
 [menu]
 toggle_theme.dark = "Switch to Dark"

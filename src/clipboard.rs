@@ -678,13 +678,9 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
         hide_picker();
         return;
     }
-    // 历史为空不显示 / show nothing when the history is empty.
-    let hist = CLIP_HISTORY.lock().unwrap();
-    if hist.is_empty() {
-        log_debug!("[clip] toggle with empty history; ignored");
-        return;
-    }
-    drop(hist);
+    // 历史为空也显示浮窗(空状态提示,见 rebuild_rows 的空分支)。
+    // Show the picker even with an empty history (the empty-state hint lives in
+    // rebuild_rows' empty branch).
     *PICKER_SELECTION.lock().unwrap() = 0;
     show_picker();
 }
@@ -709,7 +705,14 @@ fn show_picker() {
             compute_pitches(&hist)
         };
         let visible = hist_len.min(PICKER_MAX_ROWS);
-        let h = rows_top_offset() + pitches.iter().take(visible).sum::<f64>() + PAD_Y;
+        // 空历史时列表区高度 = 一条提示行的高度。
+        // With an empty history the list area is one hint row tall.
+        let list_h = if hist_len == 0 {
+            row_button_height(1)
+        } else {
+            pitches.iter().take(visible).sum::<f64>()
+        };
+        let h = rows_top_offset() + list_h + PAD_Y;
 
         // 定位:跟随光标(光标右下偏移,空间不足翻转;光标所在屏幕,找不到回退主屏)。
         // Position: follow the cursor (bottom-right offset, flips when tight; the screen the
@@ -1070,6 +1073,36 @@ unsafe fn rebuild_rows() {
     // Each row's button height / pitch derives from its wrapped line count.
     *pitches = compute_pitches(&hist);
     let total = hist.len();
+
+    // 历史为空:显示一条空状态提示(占一行高度),而不是空白浮窗。
+    // Empty history: show an empty-state hint (one row tall) instead of a blank panel.
+    if total == 0 {
+        let doc_h = rows_top_offset() + row_button_height(1) + PAD_Y;
+        let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
+        let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let label: *mut AnyObject = msg_send![
+            label,
+            initWithFrame: NSRect::new(
+                NSPoint::new(PAD_X, rows_top_offset()),
+                NSSize::new(PICKER_W - PAD_X * 2.0, row_button_height(1))
+            )
+        ];
+        let hint_ns = make_nsstring(&t("clipboard.empty"));
+        let _: () = msg_send![label, setStringValue: hint_ns];
+        CFRelease(hint_ns as *const c_void);
+        let _: () = msg_send![label, setBezeled: false];
+        let _: () = msg_send![label, setDrawsBackground: false];
+        let _: () = msg_send![label, setEditable: false];
+        let text_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        let _: () = msg_send![label, setTextColor: text_color];
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+        let _: () = msg_send![label, setFont: font];
+        let _: () = msg_send![container, addSubview: label];
+        release_obj(label);
+        rows.push(ObjPtr(label));
+        REBUILDING.store(false, Ordering::SeqCst);
+        return;
+    }
 
     // 文档高度 = 全部条目(滚动区域),由 NSScrollView 滚动。
     // Document height covers ALL entries (the scrollable area).
