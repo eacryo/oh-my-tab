@@ -74,6 +74,14 @@ const PAD_X: f64 = 12.0;
 const CORNER_R: f64 = 14.0;
 /// 选中行的圆角背景块圆角 / selected-row highlight tile corner radius.
 const SEL_TILE_R: f64 = 7.0;
+/// 自定义滚动指示器宽度 / custom scroll indicator width.
+const SCROLL_INDICATOR_W: f64 = 4.0;
+/// 停止滚动后淡出指示器的延迟(秒)/ fade-out delay after scrolling stops (seconds).
+const SCROLL_INDICATOR_FADE_DELAY: f64 = 1.0;
+/// 指示器淡出动画时长(秒)/ indicator fade-out animation duration (seconds).
+const SCROLL_INDICATOR_FADE_DURATION: f64 = 0.25;
+/// 指示器最短显示长度(条太短不可读)/ minimum indicator length (too short is unreadable).
+const SCROLL_INDICATOR_MIN_LEN: f64 = 24.0;
 
 // ========== 状态 / state ==========
 
@@ -104,6 +112,15 @@ static ROW_BUTTONS: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(V
 /// 每行的实际行距(按钮高 + 间距,随换行行数变化)/ per-row pitch (button height + gap,
 /// varies with the wrapped line count).
 static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// 滚动视图 / the scroll view.
+static SCROLL_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
+/// 自定义滚动指示器 / the custom scroll indicator view.
+static SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
+/// 指示器淡出计时器(一次性)/ the indicator fade-out timer (one-shot).
+static SCROLL_FADE_TIMER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
 /// 行列表重建进行中:重建期间 addSubview 的新行按钮会因鼠标恰好在区域内而立即派发
 /// mouseEntered(ActiveInKeyWindow + InVisibleRect 的 tracking area),若该回调再触发
@@ -390,7 +407,10 @@ pub fn stop() {
         let mut guard = timer_holder.lock().unwrap();
         if !guard.0.is_null() {
             let _: () = msg_send![guard.0, invalidate];
-            release_obj(guard.0);
+            // scheduledTimerWithTimeInterval: 返回 +0(runloop 持有),不能 release
+            // (over-release 会崩溃);invalidate 后 runloop 自行释放。
+            // scheduledTimerWithTimeInterval: returns +0 (owned by the run loop); it must
+            // NOT be released (over-release crashes); invalidate lets the run loop release it.
             *guard = ObjPtr(std::ptr::null_mut());
             log_info!("Clipboard history polling stopped.");
         }
@@ -431,6 +451,18 @@ unsafe fn observer() -> *mut AnyObject {
                 window_did_resign_key as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(scrollIndicatorBoundsChanged:),
+                scroll_indicator_bounds_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(scrollIndicatorFadeOut:),
+                scroll_indicator_fade_out as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             // 实例 alloc(+1):进程级单例,不释放(与静态生命周期一致)。
             // Instance alloc (+1): process-level singleton, never released (matches the
@@ -451,6 +483,128 @@ extern "C" fn pasteboard_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_vo
 /// Picker resign-key notification callback (main thread): auto-hide on outside clicks, etc.
 extern "C" fn window_did_resign_key(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
     hide_picker();
+}
+
+/// 滚动指示器:根据 clipView 的 bounds 更新位置/长度;内容溢出时显示并重启淡出计时器。
+/// Scroll indicator: update the knob's position/length from the clip view's bounds; show it
+/// and restart the fade-out timer while the content overflows.
+extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
+    unsafe {
+        let scroll = match *SCROLL_VIEW.lock().unwrap() {
+            Some(s) => s.0,
+            None => return,
+        };
+        let indicator = match *SCROLL_INDICATOR.lock().unwrap() {
+            Some(i) => i.0,
+            None => return,
+        };
+        let clip: *mut AnyObject = msg_send![scroll, contentView];
+        let clip_bounds: NSRect = msg_send![clip, bounds];
+        let visible_h = clip_bounds.size.height;
+        let doc: *mut AnyObject = msg_send![scroll, documentView];
+        let doc_h = if doc.is_null() {
+            0.0
+        } else {
+            let df: NSRect = msg_send![doc, frame];
+            df.size.height
+        };
+
+        // 内容不溢出:隐藏指示器并取消淡出计时器。
+        // No overflow: hide the indicator and cancel the fade-out timer.
+        if doc_h <= visible_h || visible_h <= 0.0 {
+            let _: () = msg_send![indicator, setHidden: true];
+            cancel_fade_timer();
+            return;
+        }
+
+        // 指示器长度 ∝ 可视高/文档高,位置 ∝ 滚动偏移(flipped 坐标下偏移 = bounds.origin.y)。
+        // Knob length scales with visible/doc; its position with the scroll offset (in flipped
+        // coords the offset is bounds.origin.y).
+        let ratio = visible_h / doc_h;
+        let mut knob_h = (visible_h * ratio).max(SCROLL_INDICATOR_MIN_LEN);
+        if knob_h > visible_h - 6.0 {
+            knob_h = visible_h - 6.0;
+        }
+        let mut knob_y = 3.0 + clip_bounds.origin.y * ratio;
+        if knob_y + knob_h > visible_h - 3.0 {
+            knob_y = visible_h - 3.0 - knob_h;
+        }
+        if knob_y < 3.0 {
+            knob_y = 3.0;
+        }
+        let _: () = msg_send![
+            indicator,
+            setFrame: NSRect::new(
+                NSPoint::new(
+                    clip_bounds.size.width - SCROLL_INDICATOR_W - 3.0,
+                    knob_y
+                ),
+                NSSize::new(SCROLL_INDICATOR_W, knob_h)
+            )
+        ];
+        let _: () = msg_send![indicator, setHidden: false];
+        // 立即不透明,1s 后淡出(重启计时器)。
+        // Opaque immediately; fade out after 1s (timer restarted).
+        let layer: *mut AnyObject = msg_send![indicator, layer];
+        let _: () = msg_send![layer, setOpacity: 1.0f32];
+        restart_fade_timer();
+    }
+}
+
+/// 取消指示器淡出计时器。/ Cancel the indicator fade-out timer.
+fn cancel_fade_timer() {
+    unsafe {
+        let mut guard = SCROLL_FADE_TIMER.lock().unwrap();
+        if let Some(t) = guard.take() {
+            let _: () = msg_send![t.0, invalidate];
+            // 注意:scheduledTimerWithTimeInterval: 返回的 timer 由 runloop 持有(+0),
+            // 不能 release——release 会造成 over-release,方向键滚动重启计时器时
+            // 崩溃(SIGSEGV,无 panic 日志)。invalidate 后 runloop 自行释放。
+            // Note: scheduledTimerWithTimeInterval: returns a timer owned by the run loop
+            // (+0); it must NOT be released -- releasing over-releases and crashed on arrow
+            // navigation restarting the timer (SIGSEGV, no panic in the log). invalidate lets
+            // the run loop release it.
+        }
+    }
+}
+
+/// 重启淡出计时器:1s 后淡出指示器。
+/// Restart the fade-out timer: fade the indicator out after 1s.
+fn restart_fade_timer() {
+    unsafe {
+        cancel_fade_timer();
+        let timer: *mut AnyObject = msg_send![
+            class!(NSTimer),
+            scheduledTimerWithTimeInterval: SCROLL_INDICATOR_FADE_DELAY,
+            target: observer(),
+            selector: sel!(scrollIndicatorFadeOut:),
+            userInfo: std::ptr::null::<AnyObject>(),
+            repeats: false
+        ];
+        *SCROLL_FADE_TIMER.lock().unwrap() = Some(ObjPtr(timer));
+    }
+}
+
+/// 淡出指示器(计时器触发,主线程)。/ Fade the indicator out (timer-fired, main thread).
+extern "C" fn scroll_indicator_fade_out(_self: *mut c_void, _cmd: Sel, _timer: *mut c_void) {
+    unsafe {
+        *SCROLL_FADE_TIMER.lock().unwrap() = None;
+        let indicator = match *SCROLL_INDICATOR.lock().unwrap() {
+            Some(i) => i.0,
+            None => return,
+        };
+        let layer: *mut AnyObject = msg_send![indicator, layer];
+        // NSAnimationContext 动画块:0.25s 淡出到透明。
+        // setDuration: 是 currentContext 的实例方法(类上调用会 panic "method not found")。
+        // NSAnimationContext grouping: fade to transparent over 0.25s.
+        // setDuration: is an instance method on currentContext (calling it on the class
+        // panics with "method not found").
+        let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+        let ctx: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
+        let _: () = msg_send![ctx, setDuration: SCROLL_INDICATOR_FADE_DURATION];
+        let _: () = msg_send![layer, setOpacity: 0.0f32];
+        let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+    }
 }
 
 /// 是否已注册剪贴板变化通知(幂等,防止 start/stop 反复注册导致重复回调)。
@@ -816,22 +970,64 @@ unsafe fn ensure_picker_window() {
     // with the scroll view.
     let _: () = msg_send![container, setAutoresizingMask: 0u64];
 
-    // NSScrollView:滚动条 + 自动滚轮滚动(超可视行数时可滚)。
-    // NSScrollView: scroller + wheel scrolling (when entries exceed the visible rows).
+    // NSScrollView:滚轮滚动 + 自定义滚动指示器(去掉系统滚动条,视觉更贴合玻璃)。
+    // NSScrollView: wheel scrolling + a custom scroll indicator (the system scroller is
+    // replaced for a cleaner look on the glass).
     let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
     let scroll: *mut AnyObject =
         msg_send![scroll, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
     let _: () = msg_send![scroll, setAutoresizingMask: 18u64];
     let _: () = msg_send![scroll, setBorderType: 0u64]; // NSNoBorder
     let _: () = msg_send![scroll, setDrawsBackground: false];
-    let _: () = msg_send![scroll, setHasVerticalScroller: true];
+    let _: () = msg_send![scroll, setHasVerticalScroller: false];
     let _: () = msg_send![scroll, setHasHorizontalScroller: false];
-    let _: () = msg_send![scroll, setAutohidesScrollers: true];
-    let _: () = msg_send![scroll, setScrollerStyle: 1isize]; // NSScrollerStyleOverlay(悬浮滚动条)
     let _: () = msg_send![content_parent, addSubview: scroll];
     release_obj(scroll);
     let _: () = msg_send![scroll, setDocumentView: container];
     release_obj(container);
+
+    // 自定义滚动指示器:右侧 4pt 宽胶囊条,半透明白,滚动时显示、停止 1s 后淡出。
+    // Custom scroll indicator: a 4pt rounded capsule on the right, semi-transparent white;
+    // shown while scrolling and faded out 1s after scrolling stops.
+    let indicator: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let indicator: *mut AnyObject = msg_send![
+        indicator,
+        initWithFrame: NSRect::new(
+            NSPoint::new(w - SCROLL_INDICATOR_W - 3.0, 3.0),
+            NSSize::new(SCROLL_INDICATOR_W, h - 6.0)
+        )
+    ];
+    let _: () = msg_send![indicator, setWantsLayer: true];
+    let ind_layer: *mut AnyObject = msg_send![indicator, layer];
+    // 深色半透明:浅色玻璃背景下白色指示器完全融入背景不可见;半透明黑在明暗玻璃上都清晰。
+    // Dark semi-transparent: a white indicator vanishes into light glass; a translucent black
+    // knob stays legible on both light and dark glass.
+    let ind_bg: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.35f64];
+    // layer_set_background 走 raw objc_msgSend:objc2 无法编码 CGColor 参数。
+    // layer_set_background goes through raw objc_msgSend: objc2 can't encode CGColor args.
+    crate::ffi::layer_set_background(ind_layer, crate::ffi::ns_color_to_cg(ind_bg));
+    let _: () = msg_send![ind_layer, setCornerRadius: SCROLL_INDICATOR_W / 2.0];
+    let _: () = msg_send![indicator, setHidden: true];
+    let _: () = msg_send![scroll, addSubview: indicator];
+    release_obj(indicator);
+
+    // 观察 clipView 的 bounds 变化(滚动发生)→ 更新指示器 + 重启淡出计时器。
+    // Observe the clip view's bounds changes (scrolling) -> update the indicator + restart
+    // the fade-out timer.
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let _: () = msg_send![clip, setPostsBoundsChangedNotifications: true];
+    let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+    let bounds_name = make_nsstring("NSViewBoundsDidChangeNotification");
+    let _: () = msg_send![
+        center,
+        addObserver: observer(),
+        selector: sel!(scrollIndicatorBoundsChanged:),
+        name: bounds_name,
+        object: clip
+    ];
+    CFRelease(bounds_name as *const c_void);
+    *SCROLL_VIEW.lock().unwrap() = Some(ObjPtr(scroll));
+    *SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(indicator));
     // 点击外部(浮窗失去 key)→ 自动隐藏。Win+V 同款行为:呼出后点任何地方即消失。
     // Outside clicks (the picker resigns key) -> auto-hide. Same as Win+V: any click after
     // summoning dismisses the picker.
@@ -1282,6 +1478,32 @@ pub(crate) fn smoke_runner() -> bool {
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
             let ev2 = make_key_event(126); // ↑ / up arrow
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev2 as *mut c_void);
+            // 主动滚动到文档中部:触发 clipView bounds 变化通知 → 滚动指示器更新路径
+            // (setOpacity: 等 msg_send 曾因 float/double 编码错误 panic,冒烟必须覆盖)。
+            // Scroll into the middle of the document: fires the clip-view bounds-change
+            // notification -> the indicator-update path (setOpacity: once panicked on a
+            // float/double encoding mismatch; the smoke run must cover it).
+            //
+            // 多次滚动:每次滚动都取消并重建淡出计时器——曾因对 +0 的
+            // scheduledTimerWithTimeInterval: 返回值 release(over-release)在多次滚动
+            // 后 SIGSEGV,无 panic 日志。循环覆盖该路径。
+            // Scroll several times: each scroll cancels and recreates the fade-out timer --
+            // releasing the +0 scheduledTimerWithTimeInterval: return once SIGSEGV'd after a
+            // few scrolls (no panic in the log). The loop covers that path.
+            for step in 1..=5u8 {
+                let _: () = msg_send![c.0, scrollPoint: NSPoint::new(0.0, step as f64 * 30.0)];
+            }
+            // 手动触发淡出回调:冒烟进程不跑 runloop,scheduledTimer 不会触发计时器回调,
+            // 直接调用覆盖 NSAnimationContext setDuration: 路径(类方法调用曾 panic
+            // "method not found")。
+            // Fire the fade-out callback manually: the smoke process never runs the run loop,
+            // so scheduled timers never fire; calling it directly covers the NSAnimationContext
+            // setDuration: path (a class-method call once panicked with "method not found").
+            scroll_indicator_fade_out(
+                std::ptr::null_mut(),
+                sel!(scrollIndicatorFadeOut:),
+                std::ptr::null_mut(),
+            );
         }
     }
     hide_picker();
