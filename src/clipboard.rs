@@ -48,8 +48,12 @@ const VK_V: u16 = 9;
 const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = 0x00100000;
 /// 轮询间隔(秒)/ polling interval (seconds)
 const POLL_INTERVAL: f64 = 0.5;
-/// 浮窗可视行数上限(超出滚动)/ max visible rows (scrolls beyond).
-const PICKER_MAX_ROWS: usize = 10;
+/// 浮窗最大高度:行距(98pt)按 6 行 + 留白 = 636pt,1080p 屏(可用 ~990pt)占 ~64%,
+/// 比例协调;条目更多时滚动查看。小屏(如 1366x768)再动态收缩(见 show_picker)。
+/// The picker's max height: 6 rows at the 98pt pitch + paddings = 636pt, ~64% of a 1080p
+/// screen's usable height -- proportional; more entries scroll. Small screens (e.g.
+/// 1366x768) shrink it further (see show_picker).
+const PICKER_MAX_HEIGHT: f64 = 640.0;
 /// 浮窗最小高度(内容再少也不低于此,约 5-6 行的高度)。
 /// The picker's minimum height (never smaller, ~5-6 rows worth), also applied to the empty
 /// state for a consistent look.
@@ -274,11 +278,6 @@ fn text_lines(text: &str) -> usize {
 /// Row-button height = lines * line height + vertical padding (the button hugs its text).
 fn row_button_height(lines: usize) -> f64 {
     lines as f64 * LINE_H + BTN_PAD_Y * 2.0
-}
-
-/// 行距(按钮高 + 间距)。/ Row pitch (button height + gap).
-fn row_pitch(btn_h: f64) -> f64 {
-    btn_h + ROW_GAP
 }
 
 /// 是否显示来源应用(读 CONFIG;记录始终进行,开关只控制标题栏里的名称显示)。
@@ -1098,21 +1097,8 @@ fn show_picker() {
             let hist = CLIP_HISTORY.lock().unwrap();
             compute_pitches(&hist)
         };
-        let visible = hist_len.min(PICKER_MAX_ROWS);
-        // 空历史时列表区高度 = 一条提示行的高度。
-        // With an empty history the list area is one hint row tall.
-        let list_h = if hist_len == 0 {
-            row_button_height(1)
-        } else {
-            pitches.iter().take(visible).sum::<f64>()
-        };
-        // 最小高度兜底(内容再少也不低于 PICKER_MIN_HEIGHT,含空历史态)。
-        // Floor at the minimum height (never smaller, empty state included).
-        let h = (rows_top_offset() + list_h + PAD_Y).max(PICKER_MIN_HEIGHT);
-
-        // 定位:跟随光标(光标右下偏移,空间不足翻转;光标所在屏幕,找不到回退主屏)。
-        // Position: follow the cursor (bottom-right offset, flips when tight; the screen the
-        // cursor is on, falling back to the main screen).
+        // 先解析光标所在屏幕(高度上限需要屏幕高度)。
+        // Resolve the cursor's screen first (the height cap needs its height).
         let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
         let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
         let count: usize = msg_send![screens, count];
@@ -1127,6 +1113,33 @@ fn show_picker() {
             let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
             msg_send![main, frame]
         });
+
+        // 最大高度:640pt 硬上限,小屏再收缩(留 120pt 给菜单栏/光标偏移/边缘余量)。
+        // Max height: the 640pt hard cap, shrunk on small screens (120pt kept for the menu
+        // bar / cursor offset / edge margins).
+        let max_h = PICKER_MAX_HEIGHT.min(screen_frame.size.height - 120.0);
+        // 可视行数由高度上限倒推,取整行(窗口底部不出现半截行)。
+        // The visible row count derives from the height cap, floored to whole rows (no
+        // half-cut row at the window's bottom).
+        let visible = if hist_len == 0 {
+            0
+        } else {
+            let pitch = pitches[0];
+            (((max_h - rows_top_offset() - PAD_Y) / pitch).floor() as usize)
+                .min(hist_len)
+                .max(1)
+        };
+        // 空历史时列表区高度 = 一条提示行的高度。
+        // With an empty history the list area is one hint row tall.
+        let list_h = if hist_len == 0 {
+            row_button_height(1)
+        } else {
+            pitches.iter().take(visible).sum::<f64>()
+        };
+        // 最小高度兜底(内容再少也不低于 PICKER_MIN_HEIGHT,含空历史态)。
+        // Floor at the minimum height (never smaller, empty state included).
+        let h = (rows_top_offset() + list_h + PAD_Y).max(PICKER_MIN_HEIGHT);
+
         let frame = picker_frame_for(cursor, screen_frame, PICKER_W, h);
         log_debug!(
             "[clip] picker frame: ({:.0},{:.0}) {}x{} on screen ({:.0},{:.0})",
@@ -1186,10 +1199,10 @@ unsafe fn ensure_picker_window() {
     let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
     let screen_frame: NSRect = msg_send![screen, frame];
     let w = PICKER_W;
-    // 初始高度按最大可视行数(占位;show_picker 每次按实际 pitch 重设)。
-    // Initial height sized for the max visible rows (placeholder; show_picker re-sizes per
+    // 初始高度按最大高度(占位;show_picker 每次按实际 pitch 重设)。
+    // Initial height sized for the max height (placeholder; show_picker re-sizes per
     // summon using the real pitches).
-    let h = rows_top_offset() + PICKER_MAX_ROWS as f64 * row_pitch(row_button_height(1)) + PAD_Y;
+    let h = PICKER_MAX_HEIGHT;
     let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
     let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
