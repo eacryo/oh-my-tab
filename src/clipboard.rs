@@ -76,6 +76,8 @@ const CLEAR_BTN_W: f64 = 60.0;
 const CLEAR_BTN_H: f64 = 22.0;
 /// 清除按钮与行列表的间距 / gap between the clear button and the row list.
 const CLEAR_BTN_GAP: f64 = 6.0;
+/// 顶部搜索框宽度(清除按钮左侧)/ the top search field's width (left of the clear button).
+const SEARCH_BAR_W: f64 = 240.0;
 /// 行内图钉按钮宽度 / the per-row pin button width.
 const PIN_BTN_W: f64 = 24.0;
 /// 行内图钉按钮高度 / the per-row pin button height.
@@ -130,6 +132,16 @@ static ROW_BUTTONS: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(V
 /// 每行的实际行距(按钮高 + 间距,随换行行数变化)/ per-row pitch (button height + gap,
 /// varies with the wrapped line count).
 static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// 顶部搜索框指针 / the top search field.
+static SEARCH_FIELD: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
+/// 当前搜索词(空 = 不过滤)。/ The current search query (empty = no filtering).
+static SEARCH_QUERY: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+
+/// 当前显示列表:历史索引(过滤后的顺序)。空查询时 = 全部索引。
+/// The current display list: history indices (filtered order). All indices when no query.
+static FILTERED: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// 滚动视图 / the scroll view.
 static SCROLL_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
@@ -217,8 +229,8 @@ fn text_lines(text: &str) -> usize {
     estimate_lines(text, LINE_MAX_UNITS).min(MAX_TEXT_LINES)
 }
 
-/// 行按钮高度 = 行数 * 行高 + 上下内边距。
-/// Row-button height = lines * line height + vertical padding.
+/// 行按钮高度 = 行数 * 行高 + 上下内边距(按钮随文本行数紧凑包裹)。
+/// Row-button height = lines * line height + vertical padding (the button hugs its text).
 fn row_button_height(lines: usize) -> f64 {
     lines as f64 * LINE_H + BTN_PAD_Y * 2.0
 }
@@ -228,13 +240,15 @@ fn row_pitch(btn_h: f64) -> f64 {
     btn_h + ROW_GAP
 }
 
-/// 计算一批文本的每行行距(由各自换行行数决定)。
-/// Compute the per-row pitches for a batch of texts (driven by each entry's wrapped lines).
+/// 计算一批文本的每行行距。**所有条目固定同一行距**(按 3 行高度):列表高度整齐,
+/// 短文本的按钮紧凑包裹文本、顶对齐在条目空间内,下方留白。
+/// Compute the per-row pitches. **All entries share ONE fixed pitch** (sized for 3 lines):
+/// the list height stays even, and short-text buttons hug their text, top-aligned inside the
+/// slot with the space below left blank.
 fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
-    texts
-        .iter()
-        .map(|e| row_pitch(row_button_height(text_lines(&e.text))))
-        .collect()
+    let fixed_pitch = row_pitch(row_button_height(MAX_TEXT_LINES));
+    let _ = texts;
+    texts.iter().map(|_| fixed_pitch).collect()
 }
 
 /// 行列表的顶部偏移:顶部留白 + 清除按钮行 + 按钮与列表间距。
@@ -353,6 +367,27 @@ fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     }
 }
 
+/// 过滤:返回匹配 query 的历史索引列表(空 query = 全部;大小写不敏感子串匹配)。
+/// Filter: indices of entries matching `query` (empty query = all; case-insensitive substring).
+fn filtered_indices(history: &[ClipEntry], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..history.len()).collect();
+    }
+    let q = query.to_lowercase();
+    history
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.text.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// 显示索引 → 历史索引(经当前过滤列表映射;越界返回 None)。
+/// Display index -> history index (via the current filtered list; None when out of range).
+fn mapped_index(display_idx: usize) -> Option<usize> {
+    FILTERED.lock().unwrap().get(display_idx).copied()
+}
+
 /// 当前生效的最大条数(从 CONFIG 读,设置保存后下次轮询生效)。
 /// The effective max entry count (read from CONFIG; takes effect on the next poll).
 fn max_entries() -> usize {
@@ -398,18 +433,12 @@ unsafe fn write_pasteboard_text(text: &str) {
     let type_ns = make_nsstring(NSPASTEBOARD_TYPE_STRING);
     let ns = make_nsstring(text);
     let ok: bool = msg_send![pb, setString: ns, forType: type_ns];
-    // 读回验证写入结果 / read back to verify the write.
-    let back: *mut AnyObject = msg_send![pb, stringForType: type_ns];
-    let back_str = if back.is_null() {
-        "NULL".to_string()
-    } else {
-        nsstring_to_rust(back)
-    };
+    // 日志只打元数据,绝不打剪贴板内容(隐私:内容可能是密码/正文)。
+    // Log metadata only, NEVER the clipboard text (privacy: it may be a password/body text).
     log_debug!(
-        "[clip] write back {} chars (setString ok={}) readback=\"{}\"",
+        "[clip] write back {} chars (setString ok={})",
         text.chars().count(),
-        ok,
-        truncate_line(&back_str, 20)
+        ok
     );
     CFRelease(type_ns as *const c_void);
     CFRelease(ns as *const c_void);
@@ -569,6 +598,22 @@ unsafe fn observer() -> *mut AnyObject {
                 clear_clipboard_history as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(searchFieldChanged:),
+                search_field_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            // 搜索框 delegate:拦截字段编辑器翻译出的命令(如 ↓ → moveDown:)。
+            // Search-field delegate: intercepts commands the field editor translates
+            // (e.g. ↓ -> moveDown:).
+            let types_cmd = CString::new("B@:@@:").unwrap();
+            class_addMethod(
+                cls,
+                sel!(control:textView:doCommandBySelector:),
+                search_field_do_command as *mut c_void,
+                types_cmd.as_ptr(),
+            );
             objc_registerClassPair(cls);
             // 实例 alloc(+1):进程级单例,不释放(与静态生命周期一致)。
             // Instance alloc (+1): process-level singleton, never released (matches the
@@ -668,7 +713,96 @@ extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *m
         kept
     );
     drop(hist);
+    // 顺带清空搜索词与搜索框文本。
+    // Also clear the search query and the search field's text.
+    clear_search();
     hide_picker();
+}
+
+/// 清空搜索词 + 搜索框文本(不重建;调用方按需 rebuild)。
+/// Clear the search query and the search field's text (no rebuild; callers rebuild as needed).
+fn clear_search() {
+    SEARCH_QUERY.lock().unwrap().clear();
+    if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
+        unsafe {
+            let empty_ns = make_nsstring("");
+            let _: () = msg_send![f.0, setStringValue: empty_ns];
+            CFRelease(empty_ns as *const c_void);
+        }
+    }
+}
+
+/// 搜索框文本变化通知回调:更新搜索词并重建过滤列表。
+/// Search-field text-change notification callback: update the query and rebuild the filter.
+extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
+    let field: *mut AnyObject = unsafe { msg_send![note as *mut AnyObject, object] };
+    if field.is_null() {
+        return;
+    }
+    let s: *mut AnyObject = unsafe { msg_send![field, stringValue] };
+    let q = unsafe { nsstring_to_rust(s) };
+    *SEARCH_QUERY.lock().unwrap() = q;
+    // 搜索词变化后选中重置到列表首条。
+    // Reset the selection to the top of the list after the query changes.
+    *PICKER_SELECTION.lock().unwrap() = 0;
+    unsafe { rebuild_rows() };
+}
+
+/// NSSearchField 的 Esc(cancelOperation:):有搜索词 → 清空并恢复全列表(方案 A 第一级);
+/// 无搜索词 → 关闭浮窗(第二级)。
+/// NSSearchField's Esc (cancelOperation:): a query gets cleared and the full list restored
+/// (scheme A, level one); with no query the picker closes (level two).
+extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
+    let has_query = !SEARCH_QUERY.lock().unwrap().is_empty();
+    if has_query {
+        clear_search();
+        *PICKER_SELECTION.lock().unwrap() = 0;
+        unsafe { rebuild_rows() };
+    } else {
+        hide_picker();
+    }
+}
+
+/// 搜索框 delegate 的命令拦截:↓(moveDown:) → 焦点切到列表并选中过滤结果第一条,返回
+/// YES 吞掉该命令;其余命令返回 NO 交给字段编辑器正常处理(光标移动/输入等)。
+/// Search-field delegate command interception: ↓ (moveDown:) moves focus into the list and
+/// selects the first filtered entry, returning YES (consumed); any other command returns NO
+/// so the field editor handles it (cursor movement / text input).
+///
+/// 为什么必须走这里:搜索框开始编辑后第一响应者是窗口的字段编辑器(NSTextView),键盘事件
+/// 根本不经过搜索框的 keyDown:;编辑器把 ↓ 翻译成 moveDown: 命令后通过
+/// control:textView:doCommandBySelector: 转发给搜索框的 delegate——这是文本控件拦截按键
+/// 的官方机制。
+/// Why this is necessary: once the search field edits, the FIRST RESPONDER is the window's
+/// field editor (an NSTextView) -- key events never reach the search field's keyDown:. The
+/// editor translates ↓ into a moveDown: command and forwards it to the field's delegate via
+/// control:textView:doCommandBySelector: -- the official way to intercept keys on text controls.
+extern "C" fn search_field_do_command(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _control: *mut c_void,
+    _text_view: *mut c_void,
+    command_selector: Sel,
+) -> bool {
+    if command_selector != sel!(moveDown:) {
+        return false;
+    }
+    unsafe {
+        // 搜索词/过滤结果保留,仅把焦点与选中交给列表。
+        // The query/filter stays; only focus and the selection move to the list.
+        *PICKER_SELECTION.lock().unwrap() = 0;
+        rebuild_rows();
+        if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
+            let window = match *PICKER_WINDOW.lock().unwrap() {
+                Some(w) => w.0,
+                None => return true,
+            };
+            // makeFirstResponder: 返回 BOOL('B')。
+            // makeFirstResponder: returns BOOL ('B').
+            let _: bool = msg_send![window, makeFirstResponder: c.0];
+        }
+    }
+    true
 }
 
 /// 是否已注册剪贴板变化通知(幂等,防止 start/stop 反复注册导致重复回调)。
@@ -806,6 +940,9 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
 fn show_picker() {
     unsafe {
         ensure_picker_window();
+        // 每次呼出重置搜索(干净起点)。
+        // Reset the search on every summon (a clean slate).
+        clear_search();
         let window = match *PICKER_WINDOW.lock().unwrap() {
             Some(w) => w.0,
             None => return,
@@ -1109,6 +1246,58 @@ unsafe fn ensure_picker_window() {
     *SCROLL_VIEW.lock().unwrap() = Some(ObjPtr(scroll));
     *SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(indicator));
 
+    // 顶部搜索框(NSSearchField 子类):模糊过滤条目。不自动聚焦(用户点击才开始搜索)。
+    // 子类只重写 cancelOperation:(Esc)——编辑期间的按键由字段编辑器处理,↓ 等命令经
+    // delegate 的 control:textView:doCommandBySelector: 拦截(见 search_field_do_command)。
+    // Top search field (an NSSearchField subclass): fuzzy entry filtering. Not auto-focused
+    // (the user clicks it to start searching). The subclass only overrides cancelOperation:
+    // (Esc) -- while editing, keys go to the field editor, and commands like ↓ are intercepted
+    // via the delegate's control:textView:doCommandBySelector: (see search_field_do_command).
+    let search_cls = {
+        let name = CString::new("OhMyTabClipSearchField").unwrap();
+        let superclass = class!(NSSearchField) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        let types_v = CString::new("v@:").unwrap();
+        class_addMethod(
+            cls,
+            sel!(cancelOperation:),
+            search_field_cancel as *mut c_void,
+            types_v.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        cls
+    };
+    let search: *mut AnyObject = msg_send![search_cls, alloc];
+    let search: *mut AnyObject = msg_send![
+        search,
+        initWithFrame: NSRect::new(
+            NSPoint::new(PAD_X, PAD_Y),
+            NSSize::new(SEARCH_BAR_W, CLEAR_BTN_H)
+        )
+    ];
+    let ph_ns = make_nsstring(&t("clipboard.search_hint"));
+    let _: () = msg_send![search, setPlaceholderString: ph_ns];
+    CFRelease(ph_ns as *const c_void);
+    // delegate = observer()(复用通知单例):↓ 命令拦截(字段编辑器转发 moveDown:)。
+    // Delegate = observer() (reusing the notification singleton): intercepts ↓ (the field
+    // editor forwards moveDown:).
+    let _: () = msg_send![search, setDelegate: observer()];
+    let _: () = msg_send![scroll, addSubview: search];
+    release_obj(search);
+    *SEARCH_FIELD.lock().unwrap() = Some(ObjPtr(search));
+    // 文本变化(含系统清除按钮/NSSearchField 的 Esc 清空)→ 实时过滤。
+    // Text changes (including the system clear button / NSSearchField's Esc clear) filter live.
+    let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+    let text_name = make_nsstring("NSControlTextDidChangeNotification");
+    let _: () = msg_send![
+        center,
+        addObserver: observer(),
+        selector: sel!(searchFieldChanged:),
+        name: text_name,
+        object: search
+    ];
+    CFRelease(text_name as *const c_void);
+
     // 右上角"清除全部"按钮:清空剪贴板历史。
     // "Clear all" button at the top-right: empties the clipboard history.
     let clear_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
@@ -1191,10 +1380,22 @@ unsafe fn rebuild_rows() {
     // Each row's button height / pitch derives from its wrapped line count.
     *pitches = compute_pitches(&hist);
     let total = hist.len();
+    // 重建当前显示列表(按搜索词过滤)。
+    // Rebuild the display list (filtered by the search query).
+    *FILTERED.lock().unwrap() = filtered_indices(&hist, &SEARCH_QUERY.lock().unwrap());
+    let filtered = FILTERED.lock().unwrap();
 
-    // 历史为空:显示一条空状态提示(占一行高度),而不是空白浮窗。
-    // Empty history: show an empty-state hint (one row tall) instead of a blank panel.
-    if total == 0 {
+    // 空态:历史为空 → "暂无历史";有搜索词但无匹配 → "无匹配结果"。共用提示渲染。
+    // Empty state: empty history -> "no history"; a query with no matches -> "no match".
+    // Both share the same hint rendering.
+    let empty_hint = if total == 0 {
+        t("clipboard.empty")
+    } else if filtered.is_empty() {
+        t("clipboard.no_match")
+    } else {
+        String::new()
+    };
+    if !empty_hint.is_empty() {
         let doc_h = rows_top_offset() + row_button_height(1) + PAD_Y;
         let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
         // 提示文本:frame 高度 = 单行高,垂直位置手动居中(单行 NSTextField 不会
@@ -1214,7 +1415,7 @@ unsafe fn rebuild_rows() {
             )
         ];
         let _: () = msg_send![label, setAlignment: 1isize]; // NSTextAlignmentCenter
-        let hint_ns = make_nsstring(&t("clipboard.empty"));
+        let hint_ns = make_nsstring(&empty_hint);
         let _: () = msg_send![label, setStringValue: hint_ns];
         CFRelease(hint_ns as *const c_void);
         let _: () = msg_send![label, setBezeled: false];
@@ -1231,21 +1432,22 @@ unsafe fn rebuild_rows() {
         return;
     }
 
-    // 文档高度 = 全部条目(滚动区域),由 NSScrollView 滚动。
-    // Document height covers ALL entries (the scrollable area).
-    let doc_h = rows_top_offset() + pitches.iter().sum::<f64>() + PAD_Y;
+    // 文档高度 = 全部显示条目(滚动区域),由 NSScrollView 滚动。
+    // Document height covers ALL displayed entries (the scrollable area).
+    let doc_h = rows_top_offset() + pitches.iter().take(filtered.len()).sum::<f64>() + PAD_Y;
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
 
     let sel_idx = *PICKER_SELECTION.lock().unwrap();
-    for i in 0..total {
+    for (i, &h_idx) in filtered.iter().enumerate() {
         let y = row_top(i, &pitches);
-        log_debug!(
-            "[clip] row {} created: y={} title=\"{}\"",
-            i,
-            y,
-            truncate_line(&hist[i].text, 20)
-        );
+        // 日志只打索引/坐标,绝不打条目内容(隐私)。
+        // Log the index/position only, NEVER the entry text (privacy).
+        log_debug!("[clip] row {} created: y={}", i, y);
         let btn: *mut AnyObject = msg_send![row_button_class(), alloc];
+        // 行按钮高度 = 实际文本行数(紧凑包裹文本,顶对齐在固定行距的条目空间内)。
+        // Row-button height = the text's real line count (hugs the text, top-aligned inside
+        // the fixed-pitch slot).
+        let btn_h = row_button_height(text_lines(&hist[h_idx].text));
         // 行按钮宽度右侧留出图钉 + 删除两个按钮区域。
         // The row button's width leaves room for the pin and delete buttons on the right.
         let btn: *mut AnyObject = msg_send![
@@ -1254,7 +1456,7 @@ unsafe fn rebuild_rows() {
                 NSPoint::new(PAD_X, y),
                 NSSize::new(
                     PICKER_W - PAD_X * 2.0 - PIN_BTN_W - DEL_BTN_W - 4.0,
-                    pitches[i] - ROW_GAP
+                    btn_h
                 )
             )
         ];
@@ -1270,7 +1472,7 @@ unsafe fn rebuild_rows() {
         }
         // 超长文本换行显示,最多 3 行(第 3 行超出截断加省略号)。
         // Long text wraps, up to 3 lines (truncated with an ellipsis on line 3).
-        let title = truncate_to_lines(&hist[i].text, LINE_MAX_UNITS, MAX_TEXT_LINES);
+        let title = truncate_to_lines(&hist[h_idx].text, LINE_MAX_UNITS, MAX_TEXT_LINES);
         let attr = make_row_attributed_title(&title, i == sel_idx);
         let _: () = msg_send![btn, setAttributedTitle: attr];
         release_obj(attr);
@@ -1325,7 +1527,7 @@ unsafe fn rebuild_rows() {
             initWithFrame: NSRect::new(
                 NSPoint::new(
                     PICKER_W - PAD_X - DEL_BTN_W - PIN_BTN_W - 2.0,
-                    y + (pitches[i] - ROW_GAP - PIN_BTN_H) / 2.0
+                    y + (btn_h - PIN_BTN_H) / 2.0
                 ),
                 NSSize::new(PIN_BTN_W, PIN_BTN_H)
             )
@@ -1343,7 +1545,11 @@ unsafe fn rebuild_rows() {
         CFRelease(empty_ns as *const c_void);
         // SF Symbol:置顶用 pin.fill,未置顶用 pin。
         // SF Symbol: pin.fill when pinned, pin otherwise.
-        let symbol = if hist[i].pinned { "pin.fill" } else { "pin" };
+        let symbol = if hist[h_idx].pinned {
+            "pin.fill"
+        } else {
+            "pin"
+        };
         let sym_ns = make_nsstring(symbol);
         let desc = make_nsstring("Pin");
         let img: *mut AnyObject = msg_send![
@@ -1377,7 +1583,7 @@ unsafe fn rebuild_rows() {
             initWithFrame: NSRect::new(
                 NSPoint::new(
                     PICKER_W - PAD_X - DEL_BTN_W,
-                    y + (pitches[i] - ROW_GAP - DEL_BTN_H) / 2.0
+                    y + (btn_h - DEL_BTN_H) / 2.0
                 ),
                 NSSize::new(DEL_BTN_W, DEL_BTN_H)
             )
@@ -1475,38 +1681,38 @@ extern "C" fn handle_clipboard_row_click(_self: *mut c_void, _cmd: Sel, sender: 
     }
 }
 
-/// 图钉按钮回调(tag = 行索引):置顶/取消置顶并刷新列表。
-/// Pin-button callback (tag = row index): pin/unpin and refresh the list.
+/// 图钉按钮回调(tag = 显示行索引)→ 映射历史索引置顶/取消置顶并刷新列表。
+/// Pin-button callback (tag = display row index) -> mapped history index, pin/unpin, refresh.
 extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
     if idx < 0 {
         return;
     }
-    let mut hist = CLIP_HISTORY.lock().unwrap();
-    if idx as usize >= hist.len() {
+    let Some(h_idx) = mapped_index(idx as usize) else {
         return;
-    }
-    if hist[idx as usize].pinned {
-        unpin_entry(&mut hist, idx as usize);
+    };
+    let mut hist = CLIP_HISTORY.lock().unwrap();
+    if hist[h_idx].pinned {
+        unpin_entry(&mut hist, h_idx);
     } else {
-        pin_entry(&mut hist, idx as usize);
+        pin_entry(&mut hist, h_idx);
     }
     drop(hist);
     unsafe { rebuild_rows() };
 }
 
-/// 删除按钮回调(tag = 行索引):删除该条并刷新列表。
-/// Delete-button callback (tag = row index): remove the entry and refresh the list.
+/// 删除按钮回调(tag = 显示行索引)→ 映射历史索引删除并刷新列表。
+/// Delete-button callback (tag = display row index) -> mapped history index, remove, refresh.
 extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
     if idx < 0 {
         return;
     }
-    let mut hist = CLIP_HISTORY.lock().unwrap();
-    if idx as usize >= hist.len() {
+    let Some(h_idx) = mapped_index(idx as usize) else {
         return;
-    }
-    delete_entry(&mut hist, idx as usize);
+    };
+    let mut hist = CLIP_HISTORY.lock().unwrap();
+    delete_entry(&mut hist, h_idx);
     // 删除后选中保持同位置(指向原下一条);越界则回退到末条。
     // Selection stays at the same index (pointing at the next entry); clamps to the tail.
     let mut sel = PICKER_SELECTION.lock().unwrap();
@@ -1518,16 +1724,24 @@ extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void
     unsafe { rebuild_rows() };
 }
 
-/// 粘贴指定索引的条目:关闭浮窗 + 写回剪贴板 + 模拟 Cmd+V。
-/// Paste the entry at `idx`: close the picker + write back to the pasteboard + synthesize Cmd+V.
+/// 粘贴指定显示索引的条目(经 FILTERED 映射):关闭浮窗 + 写回剪贴板 + 模拟 Cmd+V。
+/// Paste the entry at display `idx` (mapped through FILTERED): close the picker + write back
+/// to the pasteboard + synthesize Cmd+V.
 fn paste_at(idx: usize) {
+    let Some(h_idx) = mapped_index(idx) else {
+        log_debug!("[clip] paste index {} out of range", idx);
+        hide_picker();
+        return;
+    };
     let text = {
         let hist = CLIP_HISTORY.lock().unwrap();
-        hist.get(idx).map(|e| e.text.clone())
+        hist.get(h_idx).map(|e| e.text.clone())
     };
     match text {
         Some(t) => {
-            log_debug!("[clip] paste_at idx={}: \"{}\"", idx, truncate_line(&t, 20));
+            // 日志只打索引,绝不打粘贴内容(隐私)。
+            // Log the index only, NEVER the pasted text (privacy).
+            log_debug!("[clip] paste_at idx={}", idx);
             // 必须先关闭浮窗再合成 Cmd+V:浮窗是 key window(NonactivatingPanel +
             // makeKeyWindow),此时合成键盘事件会被路由给浮窗所属的 app(我们自己),
             // 输入框收不到;orderOut 后面板失去 key,系统 key window 回归原应用,
@@ -1581,13 +1795,30 @@ fn nav_arrow(keycode: u16, sel: usize, hist_len: usize) -> Option<usize> {
 extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let keycode: u16 = msg_send![event as *mut AnyObject, keyCode];
-        // 可选中范围是全部条目(超出可视部分靠滚动查看)。
-        // The selectable range covers ALL entries (scrolling reveals the rest).
-        let hist_len = CLIP_HISTORY.lock().unwrap().len();
+        // 可选中范围是当前显示列表(搜索过滤后;超出可视部分靠滚动查看)。
+        // The selectable range is the current display list (post-filter; scrolling reveals
+        // the rest).
+        let display_len = FILTERED.lock().unwrap().len();
         let mut sel = PICKER_SELECTION.lock().unwrap();
         match keycode {
             126 | 125 => {
-                if let Some(next) = nav_arrow(keycode, *sel, hist_len) {
+                // ↑(126):已在列表第一条时跳回搜索框(搜索词/过滤/选中保留),否则正常上移。
+                // Up (126): at the first list entry, jump focus back to the search field
+                // (query/filter/selection kept); otherwise move up normally.
+                if keycode == 126 && *sel == 0 {
+                    if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
+                        drop(sel);
+                        let window = match *PICKER_WINDOW.lock().unwrap() {
+                            Some(w) => w.0,
+                            None => return,
+                        };
+                        // makeFirstResponder: 返回 BOOL('B')。
+                        // makeFirstResponder: returns BOOL ('B').
+                        let _: bool = msg_send![window, makeFirstResponder: f.0];
+                        return;
+                    }
+                }
+                if let Some(next) = nav_arrow(keycode, *sel, display_len) {
                     *sel = next;
                 }
                 let idx = *sel;
@@ -1621,23 +1852,42 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // Backspace (delete): remove the selected entry and refresh.
                 let idx = *sel;
                 drop(sel);
+                let Some(h_idx) = mapped_index(idx) else {
+                    return;
+                };
                 let mut hist = CLIP_HISTORY.lock().unwrap();
-                if idx < hist.len() {
-                    delete_entry(&mut hist, idx);
-                    let len = hist.len();
-                    let mut sel = PICKER_SELECTION.lock().unwrap();
-                    if *sel >= len {
-                        *sel = len.saturating_sub(1);
-                    }
-                    drop(sel);
-                    drop(hist);
-                    rebuild_rows();
+                delete_entry(&mut hist, h_idx);
+                // 删除后选中保持同位置(指向原下一条);越界则回退到显示列表末条。
+                // Selection stays at the same position (the next entry); clamps to the tail
+                // of the display list.
+                let display_len = FILTERED.lock().unwrap().len();
+                let mut sel = PICKER_SELECTION.lock().unwrap();
+                if *sel >= display_len {
+                    *sel = display_len.saturating_sub(1);
                 }
+                drop(sel);
+                drop(hist);
+                rebuild_rows();
             }
             53 => {
-                // Esc
-                drop(sel);
-                hide_picker();
+                // Esc:清空搜索词则恢复全列表,再按才关闭——搜索框聚焦时的第一级由
+                // NSSearchField 子类的 cancelOperation: 处理;这里处理列表聚焦时。
+                // Esc: a query gets cleared first (restoring the full list), a second press
+                // closes. The search-field-focused first level is handled by the
+                // NSSearchField subclass's cancelOperation:; this handles list focus.
+                let mut q = SEARCH_QUERY.lock().unwrap();
+                if !q.is_empty() {
+                    q.clear();
+                    drop(q);
+                    // rebuild_rows 会重锁 PICKER_SELECTION,必须先释放 sel。
+                    // rebuild_rows re-locks PICKER_SELECTION; sel must be dropped first.
+                    drop(sel);
+                    rebuild_rows();
+                } else {
+                    drop(q);
+                    drop(sel);
+                    hide_picker();
+                }
             }
             _ => {}
         }
@@ -1660,17 +1910,6 @@ extern "C" fn picker_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> boo
 }
 
 // ========== 文本/样式 helper ==========
-
-/// 截断到单行显示(超出加省略号)。/ Truncate to a single display line.
-fn truncate_line(s: &str, max_chars: usize) -> String {
-    let count = s.chars().count();
-    if count <= max_chars {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max_chars).collect();
-    out.push('…');
-    out
-}
 
 /// 行标题(attributed):选中 = 白字粗体,未选 = labelColor。
 /// Row title (attributed): selected = white bold, unselected = labelColor.
@@ -1779,12 +2018,55 @@ pub(crate) fn smoke_runner() -> bool {
         for i in 0..12 {
             record_text(&mut hist, &format!("smoke entry {i:02}"), 50);
         }
+        record_text(&mut hist, "apple pie recipe", 50);
+        record_text(&mut hist, "banana bread", 50);
     }
     show_picker();
     hide_picker();
     // 第二次显示:rebuild_rows 会先移除旧行(曾经的 UAF 路径)。
     // Second show: rebuild_rows removes the old rows first (the former UAF path).
     show_picker();
+    // 搜索冒烟:设置搜索词 → 重建(过滤显示)→ 方向键在过滤列表内导航 → 清空恢复。
+    // Search smoke: set a query -> rebuild (filtered display) -> arrow navigation within the
+    // filtered list -> clear restores everything.
+    unsafe {
+        *SEARCH_QUERY.lock().unwrap() = "apple".to_string();
+        rebuild_rows();
+        let c_opt = *PICKER_CONTAINER.lock().unwrap();
+        if let Some(c) = c_opt {
+            let ev = make_key_event(125); // ↓ / down arrow
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+        }
+        // 搜索框 ↓:经 delegate 命令拦截(moveDown:)焦点切到列表并选中第一条(过滤结果
+        // 保留)。直接调 handler:真实链路里字段编辑器把 ↓ 翻译成 moveDown: 后调它。
+        // Search-field down-arrow: the delegate command interception (moveDown:) moves focus
+        // into the list and selects the first filtered entry. The handler is called directly
+        // -- in the real chain the field editor translates ↓ to moveDown: and invokes it.
+        if let Some(_f) = *SEARCH_FIELD.lock().unwrap() {
+            search_field_do_command(
+                std::ptr::null_mut(),
+                sel!(control:textView:doCommandBySelector:),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                sel!(moveDown:),
+            );
+        }
+        // 列表顶部 ↑:焦点跳回搜索框(搜索词保留)。
+        // Up at the list top: focus jumps back to the search field (query kept).
+        let c_opt = *PICKER_CONTAINER.lock().unwrap();
+        if let Some(c) = c_opt {
+            let ev = make_key_event(126); // ↑ / up arrow
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+        }
+        // Esc 第一级:清空搜索词并恢复全列表(列表聚焦路径)。
+        // Esc level one: clear the query and restore the full list (list-focus path).
+        let ev_esc = make_key_event(53);
+        let c_opt = *PICKER_CONTAINER.lock().unwrap();
+        if let Some(c) = c_opt {
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev_esc as *mut c_void);
+        }
+        clear_search();
+    }
     // 键盘导航冒烟:构造真实 NSEvent 走 container_key_down,覆盖方向键 → 选中 → 滚动
     // 到可见的完整路径(曾因 scrollRectToVisible: 返回类型编码错误 panic)。
     // Keyboard-navigation smoke: build a real NSEvent and drive container_key_down, covering
@@ -2019,9 +2301,44 @@ mod tests {
     }
 
     #[test]
-    fn truncate_line_keeps_short_and_ellipsizes_long() {
-        assert_eq!(super::truncate_line("short", 10), "short");
-        assert_eq!(super::truncate_line("abcdef", 3), "abc…");
+    fn filtered_indices_matches_case_insensitively() {
+        use super::filtered_indices;
+        let h = vec![
+            entry("Apple Pie"),
+            entry("Banana"),
+            entry("apple cider"),
+            entry("Pineapple"),
+        ];
+        // 空查询 = 全部 / an empty query returns everything.
+        assert_eq!(filtered_indices(&h, ""), vec![0, 1, 2, 3]);
+        // 大小写不敏感子串 / case-insensitive substring.
+        assert_eq!(filtered_indices(&h, "apple"), vec![0, 2, 3]);
+        // 无匹配 → 空 / no match -> empty.
+        assert!(filtered_indices(&h, "orange").is_empty());
+        // 前缀/单字符 / prefix and single chars.
+        assert_eq!(filtered_indices(&h, "ban"), vec![1]);
+    }
+
+    #[test]
+    fn mapped_index_goes_through_the_filtered_list() {
+        use super::{filtered_indices, mapped_index};
+        let h = vec![
+            entry("Apple"),
+            entry("Banana"),
+            entry("Cherry"),
+            entry("Apricot"),
+        ];
+        let filtered = filtered_indices(&h, "a");
+        // 显示顺序 = 匹配项的顺序;映射回历史索引(Apple / Banana / Apricot 均含 'a')。
+        // Display order = the matched order; mapped back to history indices (all contain 'a').
+        let expected = vec![0usize, 1usize, 3usize];
+        assert_eq!(filtered, expected);
+        // mapped_index 需要 FILTERED 是当前列表——直接构造验证边界行为。
+        // mapped_index reads the global FILTERED; construct it to verify boundary behavior.
+        *super::FILTERED.lock().unwrap() = filtered.clone();
+        assert_eq!(mapped_index(0), Some(0));
+        assert_eq!(mapped_index(2), Some(3));
+        assert_eq!(mapped_index(3), None);
     }
 
     #[test]
@@ -2062,9 +2379,11 @@ mod tests {
 
     #[test]
     fn row_pitch_follows_line_count() {
-        use super::{compute_pitches, row_button_height, text_lines, ClipEntry};
-        // 单行 vs 三行:行距随行数增大。
-        // One line vs three lines: the pitch grows with the line count.
+        use super::{
+            compute_pitches, row_button_height, text_lines, ClipEntry, MAX_TEXT_LINES, ROW_GAP,
+        };
+        // 固定行距:所有条目(长短文本)行距相同,等于 3 行高度 + 间距。
+        // Fixed pitch: every entry (short or long text) shares the same pitch = 3 lines + gap.
         let texts = vec![
             ClipEntry {
                 text: "short".into(),
@@ -2076,7 +2395,8 @@ mod tests {
             },
         ];
         let pitches = compute_pitches(&texts);
-        assert!(pitches[1] > pitches[0]);
+        assert_eq!(pitches[0], pitches[1]);
+        assert_eq!(pitches[0], row_button_height(MAX_TEXT_LINES) + ROW_GAP);
         // 按钮高 = 行数 * 行高 + 内边距。
         // Button height = lines * line height + padding.
         assert_eq!(

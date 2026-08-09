@@ -6,6 +6,8 @@
 [clipboard]
 clear_all = "清除全部"
 empty = "暫無剪貼板歷史"
+no_match = "無匹配結果"
+search_hint = "搜尋剪貼板"
 
 [menu]
 toggle_theme.dark = "切換深色"
