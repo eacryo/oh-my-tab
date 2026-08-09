@@ -98,6 +98,11 @@ const PAD_X: f64 = 12.0;
 const CORNER_R: f64 = 14.0;
 /// 选中行的圆角背景块圆角 / selected-row highlight tile corner radius.
 const SEL_TILE_R: f64 = 7.0;
+/// 每行背景块透明度(白色,明暗玻璃上都清晰)/ per-row tile alpha (white; legible on both
+/// light and dark glass). 8% 在亮色玻璃上不可见(玻璃本身亮度 ~0.78,零对比度),提到
+/// 0.35 才能形成清晰的磨砂卡片观感。8% vanished on the bright glass (the glass itself is
+/// ~0.78 luminance -- zero contrast); 0.35 reads as a visible frosted card.
+const ROW_TILE_ALPHA: f64 = 0.35;
 /// 自定义滚动指示器宽度 / custom scroll indicator width.
 const SCROLL_INDICATOR_W: f64 = 4.0;
 /// 指示器最短显示长度(条太短不可读)/ minimum indicator length (too short is unreadable).
@@ -128,6 +133,11 @@ static PICKER_CONTAINER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
 /// 每行按钮指针(按行索引,供高亮/点击)/ row button pointers by index (highlight / click).
 static ROW_BUTTONS: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// 每行背景块视图(与 ROW_BUTTONS 一一对应、同顺序;选中行不创建)。
+/// Per-row background tiles (one per entry, same order as ROW_BUTTONS; skipped for the
+/// selected row).
+static ROW_TILES: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// 每行的实际行距(按钮高 + 间距,随换行行数变化)/ per-row pitch (button height + gap,
 /// varies with the wrapped line count).
@@ -1311,7 +1321,21 @@ unsafe fn ensure_picker_window() {
     let _: () = msg_send![clear_btn, setBordered: false];
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
     let _: () = msg_send![clear_btn, setFont: font];
-    let _: () = msg_send![clear_btn, setAlignment: 2isize]; // right
+    // 居中显示在磨砂白块内(与行卡片同款观感),而不是贴右边的裸文字。
+    // Centered inside the frosted-white tile (same look as the row cards), not bare text
+    // hugging the right edge.
+    let _: () = msg_send![clear_btn, setAlignment: 1isize]; // center
+                                                            // 磨砂白块背景:与行背景块同色同圆角,顶部工具栏与列表视觉统一。
+                                                            // Frosted-white tile background: same color and corner radius as the row tiles, so the
+                                                            // top bar matches the list.
+    let _: () = msg_send![clear_btn, setWantsLayer: true];
+    let clear_layer: *mut AnyObject = msg_send![clear_btn, layer];
+    let white: *mut AnyObject =
+        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: ROW_TILE_ALPHA];
+    // layer_set_background 走 raw objc_msgSend(与行卡片同款)。
+    // layer_set_background goes through raw objc_msgSend (same as the row tiles).
+    crate::ffi::layer_set_background(clear_layer, crate::ffi::ns_color_to_cg(white));
+    let _: () = msg_send![clear_layer, setCornerRadius: SEL_TILE_R];
     let title_ns = make_nsstring(&t("clipboard.clear_all"));
     let _: () = msg_send![clear_btn, setTitle: title_ns];
     CFRelease(title_ns as *const c_void);
@@ -1374,6 +1398,15 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![b.0, removeFromSuperview];
     }
     rows.clear();
+    // 背景块与按钮同生命周期:同样由父视图持有,removeFromSuperview 即释放,绝不二次
+    // release(同按钮的 UAF 教训)。
+    // Tiles share the buttons' lifecycle: parent-owned, released by removeFromSuperview,
+    // never released again (same UAF lesson as the buttons).
+    let mut tiles = ROW_TILES.lock().unwrap();
+    for &t in tiles.iter() {
+        let _: () = msg_send![t.0, removeFromSuperview];
+    }
+    tiles.clear();
     let mut pitches = ROW_PITCHES.lock().unwrap();
     pitches.clear();
     // 每行的按钮高/行距由文本换行行数决定。
@@ -1396,16 +1429,18 @@ unsafe fn rebuild_rows() {
         String::new()
     };
     if !empty_hint.is_empty() {
-        let doc_h = rows_top_offset() + row_button_height(1) + PAD_Y;
+        // 容器高度 = 可视区高度,而不是单行高:文档视图悬挂在 clip 底部(clip 不翻转),
+        // 太矮会被裁掉/贴底,提示文字(按窗口居中定位)会落在容器外而不可见。
+        // The container height = the visible area, NOT one row: the document view hangs off
+        // the clip view's bottom (the clip isn't flipped); a short document gets clipped, and
+        // the hint (positioned for the window center) would land outside the container.
+        let doc_h = PICKER_MIN_HEIGHT - PAD_Y;
         let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
-        // 提示文本:frame 高度 = 单行高,垂直位置手动居中(单行 NSTextField 不会
-        // 自动在 frame 内垂直居中),水平居中。
-        // The hint: frame height = one line, vertically centered by hand (a single-line
-        // NSTextField does not auto-center vertically within its frame), horizontally centered.
-        let content_top = rows_top_offset();
-        let content_h = PICKER_MIN_HEIGHT - content_top - PAD_Y;
+        // 提示文本:在窗口内垂直居中(与容器高度无关,直接按窗口算)。
+        // The hint: vertically centered within the window (independent of the container
+        // height).
         let label_h = row_button_height(1);
-        let label_y = content_top + (content_h - label_h) / 2.0;
+        let label_y = (PICKER_MIN_HEIGHT - label_h) / 2.0;
         let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let label: *mut AnyObject = msg_send![
             label,
@@ -1421,7 +1456,11 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![label, setBezeled: false];
         let _: () = msg_send![label, setDrawsBackground: false];
         let _: () = msg_send![label, setEditable: false];
-        let text_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        // 提示文字用 labelColor(比 secondaryLabelColor 深一档):亮色玻璃上太浅会
+        // 看不见(用户报告的"只有四个字")。
+        // The hint uses labelColor (one notch darker than secondaryLabelColor): the lighter
+        // shade vanished on the bright glass (the reported "only four characters").
+        let text_color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
         let _: () = msg_send![label, setTextColor: text_color];
         let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
         let _: () = msg_send![label, setFont: font];
@@ -1433,8 +1472,12 @@ unsafe fn rebuild_rows() {
     }
 
     // 文档高度 = 全部显示条目(滚动区域),由 NSScrollView 滚动。
-    // Document height covers ALL displayed entries (the scrollable area).
-    let doc_h = rows_top_offset() + pitches.iter().take(filtered.len()).sum::<f64>() + PAD_Y;
+    // 下限 = 可视区高度:文档比窗口矮时悬挂在 clip 底部(clip 不翻转),行会贴底。
+    // Document height covers ALL displayed entries (the scrollable area). Floored at the
+    // visible height: a document shorter than the window hangs off the clip view's bottom
+    // (the clip isn't flipped), pushing the rows against the bottom edge.
+    let doc_h = (rows_top_offset() + pitches.iter().take(filtered.len()).sum::<f64>() + PAD_Y)
+        .max(PICKER_MIN_HEIGHT - PAD_Y);
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
 
     let sel_idx = *PICKER_SELECTION.lock().unwrap();
@@ -1443,6 +1486,30 @@ unsafe fn rebuild_rows() {
         // 日志只打索引/坐标,绝不打条目内容(隐私)。
         // Log the index/position only, NEVER the entry text (privacy).
         log_debug!("[clip] row {} created: y={}", i, y);
+        // 每行背景块:占满固定行距(行距 - 间距),行与行才整齐;选中行跳过(其按钮自带
+        // 强调色块,不叠双层)。先于按钮加入容器,保证按钮/选中块画在其上层。
+        // Per-row tile: fills the fixed pitch (pitch - gap) so rows stay even; skipped for the
+        // selected row (its button already carries the accent tile -- no double layer). Added
+        // to the container BEFORE the button so the button/accent tile draws on top.
+        if i != sel_idx {
+            let row_w = PICKER_W - PAD_X * 2.0 - PIN_BTN_W - DEL_BTN_W - 4.0;
+            let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let tile: *mut AnyObject = msg_send![
+                tile,
+                initWithFrame: NSRect::new(NSPoint::new(PAD_X, y), NSSize::new(row_w, pitches[i] - ROW_GAP))
+            ];
+            let _: () = msg_send![tile, setWantsLayer: true];
+            let tile_layer: *mut AnyObject = msg_send![tile, layer];
+            let white: *mut AnyObject =
+                msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: ROW_TILE_ALPHA];
+            // layer_set_background 走 raw objc_msgSend(与选中块同款)。
+            // layer_set_background goes through raw objc_msgSend (same as the accent tile).
+            crate::ffi::layer_set_background(tile_layer, crate::ffi::ns_color_to_cg(white));
+            let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
+            let _: () = msg_send![container, addSubview: tile];
+            release_obj(tile);
+            tiles.push(ObjPtr(tile));
+        }
         let btn: *mut AnyObject = msg_send![row_button_class(), alloc];
         // 行按钮高度 = 实际文本行数(紧凑包裹文本,顶对齐在固定行距的条目空间内)。
         // Row-button height = the text's real line count (hugs the text, top-aligned inside
