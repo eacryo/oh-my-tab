@@ -321,10 +321,22 @@ fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
     texts.iter().map(|_| fixed_pitch).collect()
 }
 
-/// 行列表的顶部偏移:顶部留白 + 清除按钮行 + 按钮与列表间距。
-/// The row list's top offset: top padding + the clear button row + its gap.
-fn rows_top_offset() -> f64 {
+/// 固定头部条高度:顶部留白 + 搜索框/清除按钮行 + 与列表的间距。
+/// 头部条独立于滚动区(见 ensure_picker_window),窗口总高 = 头部条 + 列表 + 底部留白。
+/// The fixed header strip's height: top padding + the search/clear row + the gap to the
+/// list. The strip is separate from the scroll area (see ensure_picker_window); the window
+/// height = the strip + the list + the bottom padding.
+fn header_strip_h() -> f64 {
     PAD_Y + CLEAR_BTN_H + CLEAR_BTN_GAP
+}
+
+/// 文档内行列表的顶部偏移:仅保留与头部条的间距(头部条已不在滚动区内,
+/// 不再需要为它让位 38pt——那会留下"第一条与搜索框之间的奇怪空白")。
+/// The row list's top offset INSIDE the document: just the gap to the header strip (the
+/// strip is no longer inside the scroll area, so no 38pt clearance is needed -- that left
+/// the odd blank band between the first row and the search field).
+fn rows_top_offset() -> f64 {
+    CLEAR_BTN_GAP
 }
 
 /// 第 idx 行的顶部 y(flipped 坐标):rows_top_offset + 前 idx 行行距之和。
@@ -1119,13 +1131,15 @@ fn show_picker() {
         // bar / cursor offset / edge margins).
         let max_h = PICKER_MAX_HEIGHT.min(screen_frame.size.height - 120.0);
         // 可视行数由高度上限倒推,取整行(窗口底部不出现半截行)。
+        // 窗口总高 = 头部条 + 列表 + 底部留白,所以列表高度预算 = max_h - 头部条 - 留白。
         // The visible row count derives from the height cap, floored to whole rows (no
-        // half-cut row at the window's bottom).
+        // half-cut row at the window's bottom). The window height = the strip + the list +
+        // the bottom padding, so the list's budget = max_h - strip - padding.
         let visible = if hist_len == 0 {
             0
         } else {
             let pitch = pitches[0];
-            (((max_h - rows_top_offset() - PAD_Y) / pitch).floor() as usize)
+            (((max_h - header_strip_h() - PAD_Y) / pitch).floor() as usize)
                 .min(hist_len)
                 .max(1)
         };
@@ -1138,7 +1152,7 @@ fn show_picker() {
         };
         // 最小高度兜底(内容再少也不低于 PICKER_MIN_HEIGHT,含空历史态)。
         // Floor at the minimum height (never smaller, empty state included).
-        let h = (rows_top_offset() + list_h + PAD_Y).max(PICKER_MIN_HEIGHT);
+        let h = (header_strip_h() + list_h + PAD_Y).max(PICKER_MIN_HEIGHT);
 
         let frame = picker_frame_for(cursor, screen_frame, PICKER_W, h);
         log_debug!(
@@ -1341,12 +1355,53 @@ unsafe fn ensure_picker_window() {
     // with the scroll view.
     let _: () = msg_send![container, setAutoresizingMask: 0u64];
 
+    // 固定头部条:搜索框 + 清除按钮所在行,不随列表滚动(滚动时文字曾从半透明 tile
+    // 底下穿过形成重叠)。flipped 坐标系让搜索框/清除按钮的既有 frame 直接可用。
+    // A fixed header strip holding the search field + the clear button; it does NOT scroll
+    // with the list (scrolling text used to bleed through the translucent tiles). Flipped so
+    // the search/clear frames work unchanged.
+    let header_strip: *mut AnyObject = {
+        let name = CString::new("OhMyTabClipHeaderView").unwrap();
+        let superclass = class!(NSView) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        let types_bool = CString::new("B@:").unwrap();
+        class_addMethod(
+            cls,
+            sel!(isFlipped),
+            header_strip_is_flipped as *mut c_void,
+            types_bool.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        let strip: *mut AnyObject = msg_send![cls, alloc];
+        let strip: *mut AnyObject = msg_send![
+            strip,
+            initWithFrame: NSRect::new(
+                NSPoint::new(0.0, h - header_strip_h()),
+                NSSize::new(w, header_strip_h())
+            )
+        ];
+        // NSViewMinYMargin(8):底边距自适应 → 窗口高度变化时始终贴顶。
+        // NSViewMinYMargin (8): the bottom gap adapts -> pinned to the top as the window
+        // resizes.
+        let _: () = msg_send![strip, setAutoresizingMask: 8u64];
+        let _: () = msg_send![content_parent, addSubview: strip];
+        release_obj(strip);
+        strip
+    };
+
     // NSScrollView:滚轮滚动 + 自定义滚动指示器(去掉系统滚动条,视觉更贴合玻璃)。
+    // 只占头部条以下的区域:列表在自身区域内滚动,永不与搜索行重叠。
     // NSScrollView: wheel scrolling + a custom scroll indicator (the system scroller is
-    // replaced for a cleaner look on the glass).
+    // replaced for a cleaner look on the glass). It only occupies the area below the header
+    // strip: the list scrolls within its own region and can never overlap the search row.
     let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
-    let scroll: *mut AnyObject =
-        msg_send![scroll, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
+    let scroll: *mut AnyObject = msg_send![
+        scroll,
+        initWithFrame: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(w, h - header_strip_h())
+        )
+    ];
     let _: () = msg_send![scroll, setAutoresizingMask: 18u64];
     let _: () = msg_send![scroll, setBorderType: 0u64]; // NSNoBorder
     let _: () = msg_send![scroll, setDrawsBackground: false];
@@ -1501,7 +1556,9 @@ unsafe fn ensure_picker_window() {
     // Delegate = observer() (reusing the notification singleton): intercepts ↓ (the field
     // editor forwards moveDown:).
     let _: () = msg_send![search, setDelegate: observer()];
-    let _: () = msg_send![scroll, addSubview: search];
+    // 搜索框挂在固定头部条(不随列表滚动)。
+    // The search field lives in the fixed header strip (it does not scroll with the list).
+    let _: () = msg_send![header_strip, addSubview: search];
     release_obj(search);
     *SEARCH_FIELD.lock().unwrap() = Some(ObjPtr(search));
     // 文本变化(含系统清除按钮/NSSearchField 的 Esc 清空)→ 实时过滤。
@@ -1553,7 +1610,9 @@ unsafe fn ensure_picker_window() {
     CFRelease(title_ns as *const c_void);
     let _: () = msg_send![clear_btn, setTarget: observer()];
     let _: () = msg_send![clear_btn, setAction: sel!(clearClipboardHistory:)];
-    let _: () = msg_send![scroll, addSubview: clear_btn];
+    // 清除按钮挂在固定头部条(不随列表滚动)。
+    // The clear button lives in the fixed header strip (it does not scroll with the list).
+    let _: () = msg_send![header_strip, addSubview: clear_btn];
     release_obj(clear_btn);
     // 点击外部(浮窗失去 key)→ 自动隐藏。Win+V 同款行为:呼出后点任何地方即消失。
     // Outside clicks (the picker resigns key) -> auto-hide. Same as Win+V: any click after
@@ -1641,18 +1700,17 @@ unsafe fn rebuild_rows() {
         String::new()
     };
     if !empty_hint.is_empty() {
-        // 容器高度 = 可视区高度,而不是单行高:文档视图悬挂在 clip 底部(clip 不翻转),
-        // 太矮会被裁掉/贴底,提示文字(按窗口居中定位)会落在容器外而不可见。
-        // The container height = the visible area, NOT one row: the document view hangs off
-        // the clip view's bottom (the clip isn't flipped); a short document gets clipped, and
-        // the hint (positioned for the window center) would land outside the container.
-        let doc_h = PICKER_MIN_HEIGHT - PAD_Y;
+        // 容器高度 = 可视区高度(窗口减去头部条),而不是单行高:文档视图悬挂在
+        // clip 底部(clip 不翻转),太矮会被裁掉/贴底,提示文字会落在容器外而不可见。
+        // The container height = the visible area (the window minus the header strip), NOT
+        // one row: the document view hangs off the clip view's bottom (the clip isn't
+        // flipped); a short document gets clipped, and the hint would land outside it.
+        let doc_h = PICKER_MIN_HEIGHT - header_strip_h();
         let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
-        // 提示文本:在窗口内垂直居中(与容器高度无关,直接按窗口算)。
-        // The hint: vertically centered within the window (independent of the container
-        // height).
+        // 提示文本:在可视列表区内垂直居中。
+        // The hint: vertically centered within the visible list area.
         let label_h = row_button_height(1);
-        let label_y = (PICKER_MIN_HEIGHT - label_h) / 2.0;
+        let label_y = (doc_h - label_h) / 2.0;
         // 空态卡片:磨砂白块包住提示文字(细边框 + 圆角,与条目卡片同款),不再孤零零
         // 漂在玻璃上。
         // Empty-state card: a frosted tile wrapping the hint (hairline border + radius, same
@@ -1711,12 +1769,14 @@ unsafe fn rebuild_rows() {
     }
 
     // 文档高度 = 全部显示条目(滚动区域),由 NSScrollView 滚动。
-    // 下限 = 可视区高度:文档比窗口矮时悬挂在 clip 底部(clip 不翻转),行会贴底。
+    // 下限 = 可视区高度(窗口减头部条):文档比可视区矮时悬挂在 clip 底部
+    // (clip 不翻转),行会贴底。
     // Document height covers ALL displayed entries (the scrollable area). Floored at the
-    // visible height: a document shorter than the window hangs off the clip view's bottom
-    // (the clip isn't flipped), pushing the rows against the bottom edge.
+    // visible height (the window minus the header strip): a document shorter than the
+    // visible area hangs off the clip view's bottom (the clip isn't flipped), pushing the
+    // rows against the bottom edge.
     let doc_h = (rows_top_offset() + pitches.iter().take(filtered.len()).sum::<f64>() + PAD_Y)
-        .max(PICKER_MIN_HEIGHT - PAD_Y);
+        .max(PICKER_MIN_HEIGHT - header_strip_h());
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
 
     let sel_idx = *PICKER_SELECTION.lock().unwrap();
@@ -1997,6 +2057,12 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![container, scrollPoint: NSPoint::new(0.0, scroll_offset)];
     }
     REBUILDING.store(false, Ordering::SeqCst);
+}
+
+/// 头部条 flipped:搜索框/清除按钮按顶部坐标布局。
+/// The header strip is flipped: the search/clear frames are top-anchored.
+extern "C" fn header_strip_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
+    true
 }
 
 /// 容器 flipped:原点在左上,行从顶部排起(最新在最上)。
