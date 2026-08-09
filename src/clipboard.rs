@@ -134,6 +134,13 @@ static PICKER_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// 当前选中行索引 / the currently selected row index.
 static PICKER_SELECTION: Mutex<usize> = Mutex::new(0);
 
+/// 无选中行的哨兵值:焦点在搜索框时使用(↑ 从列表顶跳入搜索框 / 点击搜索框),
+/// 此时列表不该有高光;↓ 回列表时 search_field_do_command 重置为 0。
+/// Sentinel for "no selected row": used while the search field is focused (↑ from the list
+/// top into the search field, or a click on it), so no row keeps its highlight; ↓ back into
+/// the list resets it to 0 in search_field_do_command.
+const NO_SELECTION: usize = usize::MAX;
+
 /// 浮窗窗口 / the picker window.
 static PICKER_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
@@ -706,6 +713,15 @@ unsafe fn observer() -> *mut AnyObject {
                 search_field_do_command as *mut c_void,
                 types_cmd.as_ptr(),
             );
+            // 搜索框开始编辑(↑ 从列表顶跳入 / 鼠标点击)→ 清除列表选中高光。
+            // The search field begins editing (↑ from the list top / a mouse click) ->
+            // clear the list's selection highlight.
+            class_addMethod(
+                cls,
+                sel!(controlTextDidBeginEditing:),
+                search_field_began_editing as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             // 实例 alloc(+1):进程级单例,不释放(与静态生命周期一致)。
             // Instance alloc (+1): process-level singleton, never released (matches the
@@ -834,9 +850,11 @@ extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_v
     let s: *mut AnyObject = unsafe { msg_send![field, stringValue] };
     let q = unsafe { nsstring_to_rust(s) };
     *SEARCH_QUERY.lock().unwrap() = q;
-    // 搜索词变化后选中重置到列表首条。
-    // Reset the selection to the top of the list after the query changes.
-    *PICKER_SELECTION.lock().unwrap() = 0;
+    // 不重置选中:编辑期间(焦点在搜索框)保持无选中;回列表时(↓)由
+    // search_field_do_command 重置为首条。
+    // Do NOT reset the selection: while editing (focus in the search field) it stays
+    // "no selection"; returning to the list (↓) resets it to the first entry in
+    // search_field_do_command.
     unsafe { rebuild_rows() };
 }
 
@@ -848,7 +866,8 @@ extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
     let has_query = !SEARCH_QUERY.lock().unwrap().is_empty();
     if has_query {
         clear_search();
-        *PICKER_SELECTION.lock().unwrap() = 0;
+        // 焦点仍在搜索框,保持无选中(高光不恢复)。
+        // Focus stays in the search field: keep "no selection" (no highlight returns).
         unsafe { rebuild_rows() };
     } else {
         hide_picker();
@@ -895,6 +914,21 @@ extern "C" fn search_field_do_command(
         }
     }
     true
+}
+
+/// 搜索框开始编辑(↑ 从列表顶跳入 / 鼠标点击):清除列表选中,高光消失。
+/// 通知在 makeFirstResponder: 同步派发;selection 未变化(如再次聚焦)时跳过重建。
+/// The search field begins editing (↑ from the list top / a mouse click): clear the list's
+/// selection so the highlight disappears. The notification fires synchronously inside
+/// makeFirstResponder:; skip the rebuild when the selection is unchanged (e.g. re-focus).
+extern "C" fn search_field_began_editing(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
+    let mut sel = PICKER_SELECTION.lock().unwrap();
+    if *sel == NO_SELECTION {
+        return;
+    }
+    *sel = NO_SELECTION;
+    drop(sel);
+    unsafe { rebuild_rows() };
 }
 
 /// 是否已注册剪贴板变化通知(幂等,防止 start/stop 反复注册导致重复回调)。
@@ -1827,13 +1861,25 @@ unsafe fn row_button_class() -> *mut AnyObject {
         .0
 }
 
-/// 悬停行按钮:选中该行并刷新高亮。
-/// Hovering a row button: select it and refresh the highlight.
+/// 悬停行按钮:选中该行并刷新高亮。搜索框编辑中(光标在搜索框)时忽略——用户要求
+/// 焦点在搜索框时列表不得有任何选中行,而 rebuild 后光标仍可能停在行上触发 enter。
+/// Hovering a row button: select it and refresh the highlight. Ignored while the search
+/// field is editing (focus in the search box): the requirement is no selected row while the
+/// search box has focus, and after a rebuild the cursor may still sit over a row and fire
+/// mouseEntered.
 extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
     // 重建期间派发的 enter 忽略(防无限递归,见 REBUILDING 注释)。
     // Ignore enters dispatched during a rebuild (prevents infinite recursion; see REBUILDING).
     if REBUILDING.load(Ordering::SeqCst) {
         return;
+    }
+    // 搜索框正在编辑(currentEditor 非空)→ 悬停不选中。
+    // The search field is editing (currentEditor non-nil) -> hovering must not select.
+    if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
+        let editor: *mut AnyObject = unsafe { msg_send![f.0, currentEditor] };
+        if !editor.is_null() {
+            return;
+        }
     }
     let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
     if idx >= 0 {
@@ -1953,9 +1999,18 @@ fn nav_arrow(keycode: u16, sel: usize, hist_len: usize) -> Option<usize> {
     if hist_len == 0 {
         return None;
     }
+    // sel 可能为 NO_SELECTION(usize::MAX,焦点在搜索框时的哨兵)——冒烟直接驱动
+    // handler 会走到这里,必须防溢出并视为"无选中"处理。
+    // sel may be NO_SELECTION (usize::MAX, the sentinel while the search field has focus) --
+    // the smoke drives the handler directly so this must not overflow and treats it as
+    // "no selection".
     match keycode {
-        126 => Some(if sel == 0 { hist_len - 1 } else { sel - 1 }),
-        125 => Some(if sel + 1 >= hist_len { 0 } else { sel + 1 }),
+        126 => Some(if sel == 0 || sel >= hist_len {
+            hist_len - 1
+        } else {
+            sel - 1
+        }),
+        125 => Some(if sel >= hist_len - 1 { 0 } else { sel + 1 }),
         _ => None,
     }
 }
@@ -1972,12 +2027,16 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
         let mut sel = PICKER_SELECTION.lock().unwrap();
         match keycode {
             126 | 125 => {
-                // ↑(126):已在列表第一条时跳回搜索框(搜索词/过滤/选中保留),否则正常上移。
-                // Up (126): at the first list entry, jump focus back to the search field
-                // (query/filter/selection kept); otherwise move up normally.
-                if keycode == 126 && *sel == 0 {
+                // ↑(126):已在列表第一条(或无选中)时跳回搜索框;进入前清除选中,
+                // 高光消失(delegate 的 controlTextDidBeginEditing: 也会清,双保险)。
+                // Up (126): at the first list entry (or no selection), jump focus back to the
+                // search field; clear the selection BEFORE entering so the highlight goes away
+                // (the controlTextDidBeginEditing: delegate also clears - belt and braces).
+                if keycode == 126 && (*sel == 0 || *sel == NO_SELECTION) {
                     if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
                         drop(sel);
+                        *PICKER_SELECTION.lock().unwrap() = NO_SELECTION;
+                        rebuild_rows();
                         let window = match *PICKER_WINDOW.lock().unwrap() {
                             Some(w) => w.0,
                             None => return,
@@ -2282,13 +2341,24 @@ pub(crate) fn smoke_runner() -> bool {
                 sel!(moveDown:),
             );
         }
-        // 列表顶部 ↑:焦点跳回搜索框(搜索词保留)。
-        // Up at the list top: focus jumps back to the search field (query kept).
+        // 列表顶部 ↑:焦点跳回搜索框(搜索词保留);搜索框开始编辑的 delegate 回调
+        // (search_field_began_editing)会清除选中 → 高光消失。
+        // Up at the list top: focus jumps back to the search field (query kept); the
+        // search field's begin-editing delegate callback (search_field_began_editing) clears
+        // the selection -> the highlight disappears.
         let c_opt = *PICKER_CONTAINER.lock().unwrap();
         if let Some(c) = c_opt {
             let ev = make_key_event(126); // ↑ / up arrow
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
         }
+        // 断言:焦点进搜索框后选中被清除(无行高亮)。
+        // Assert: after focus enters the search field the selection is cleared (no row
+        // highlight).
+        assert_eq!(
+            *PICKER_SELECTION.lock().unwrap(),
+            NO_SELECTION,
+            "selection must clear when focus moves into the search field"
+        );
         // Esc 第一级:清空搜索词并恢复全列表(列表聚焦路径)。
         // Esc level one: clear the query and restore the full list (list-focus path).
         let ev_esc = make_key_event(53);
@@ -2729,7 +2799,7 @@ mod tests {
 
     #[test]
     fn nav_arrow_moves_and_wraps() {
-        use super::nav_arrow;
+        use super::{nav_arrow, NO_SELECTION};
         // ↓(125)前进,↑(126)后退,循环。
         // Down advances, up retreats, wrapping at both ends.
         assert_eq!(nav_arrow(125, 0, 3), Some(1));
@@ -2740,6 +2810,11 @@ mod tests {
                                                    // Other keys are ignored; an empty history never moves.
         assert_eq!(nav_arrow(36, 1, 3), None);
         assert_eq!(nav_arrow(125, 0, 0), None);
+        // 无选中哨兵(usize::MAX):不溢出,按无选中处理(↓ → 0,↑ → 末条)。
+        // The no-selection sentinel (usize::MAX): no overflow; treated as "no selection"
+        // (↓ -> 0, ↑ -> the tail).
+        assert_eq!(nav_arrow(125, NO_SELECTION, 3), Some(0));
+        assert_eq!(nav_arrow(126, NO_SELECTION, 3), Some(2));
     }
 
     #[test]
