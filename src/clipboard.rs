@@ -84,6 +84,10 @@ const PIN_BTN_H: f64 = 20.0;
 const DEL_BTN_W: f64 = 24.0;
 /// 行内删除按钮高度 / the per-row delete button height.
 const DEL_BTN_H: f64 = 20.0;
+/// 行内图标按钮(图钉/删除)的着色:比系统 labelColor 稍深,浅色界面上更清晰。
+/// Tint for the per-row icon buttons (pin/delete): slightly darker than the system
+/// labelColor for legibility on light glass.
+const ROW_ICON_TINT: f64 = 0.25;
 /// 左右留白 / horizontal padding.
 const PAD_X: f64 = 12.0;
 /// 玻璃圆角:小浮窗固定小圆角,不跟随 config 的大圆角(那会让 420pt 小窗成胶囊)。
@@ -1355,6 +1359,11 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![pin_btn, setTag: i as isize];
         let _: () = msg_send![pin_btn, setTarget: row_target()];
         let _: () = msg_send![pin_btn, setAction: sel!(togglePin:)];
+        // 图标加深(比系统默认 labelColor 深一档)。
+        // Darken the icon (one notch darker than the default labelColor).
+        let tint: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: ROW_ICON_TINT, alpha: 1.0f64];
+        let _: () = msg_send![pin_btn, setContentTintColor: tint];
         let _: () = msg_send![container, addSubview: pin_btn];
         release_obj(pin_btn);
         rows.push(ObjPtr(pin_btn));
@@ -1397,6 +1406,11 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![del_btn, setTag: i as isize];
         let _: () = msg_send![del_btn, setTarget: row_target()];
         let _: () = msg_send![del_btn, setAction: sel!(deleteEntry:)];
+        // 图标加深(与图钉一致)。
+        // Darken the icon (same as the pin).
+        let tint: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: ROW_ICON_TINT, alpha: 1.0f64];
+        let _: () = msg_send![del_btn, setContentTintColor: tint];
         let _: () = msg_send![container, addSubview: del_btn];
         release_obj(del_btn);
         rows.push(ObjPtr(del_btn));

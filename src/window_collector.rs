@@ -86,7 +86,18 @@ fn prune_mru(mru: &mut MruMap, live_set: &HashSet<(i32, u32)>) -> usize {
 
 fn icon_cache_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    format!("{}/Library/Caches/oh-my-tab-icons", home)
+    // 测试构建使用与真实缓存同级的专用目录:冒烟测试里的 clear_icon_cache()
+    // 只清测试目录,绝不触碰用户的真实图标缓存(曾清空真实缓存导致下次
+    // summon 全部重提取,卡 ~400ms)。
+    // Test builds use a dedicated sibling directory: the smoke tests' clear_icon_cache()
+    // only clears the test dir, never the user's real icon cache (clearing the real one
+    // used to force a full re-extract on the next summon, stalling ~400ms).
+    let name = if cfg!(test) {
+        "oh-my-tab-icons-test"
+    } else {
+        "oh-my-tab-icons"
+    };
+    format!("{}/Library/Caches/{}", home, name)
 }
 
 const K_C_G_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
