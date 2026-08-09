@@ -22,6 +22,7 @@
 - 手写、零依赖的国际化(英文、简体中文、繁体中文),自动检测系统语言并实时跟随。
 - 每次启动一个日志文件,自动保留 30 天(见[日志](#日志))。
 - **鼠标控制**(可选,默认关闭):反向滚动、滚动模式(默认 / 按行(每 tick 行数))、禁用指针加速 -- 且**按鼠标设备分别配置**(见[配置](#配置))。此功能参考并借鉴了 [LinearMouse](https://github.com/linearmouse/linearmouse),用纯 Rust 从零重写实现(见[致谢](#致谢))。
+- **剪贴板历史**(可选,默认关闭):**Option+V** 呼出;记录纯文本(内存态,不持久化),全局去重(再次复制自动提到最前)、置顶常用条目、单条删除(Backspace 图标/按键)、清除全部(保留置顶);浮窗跟随光标显示。
 
 ## 截图
 
@@ -155,7 +156,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 
 ### 事件流与线程(跨所有文件)
 
-1. `event_monitor` 起一个**专用线程**跑 `CGEventTap` + `CFRunLoop`,检测快捷键按下(`CmdTabPressed`)和修饰键松开(`CmdReleased`),通过 `flume` 通道发送 `GlobalEvent`。当前快捷键(Cmd 或 Opt)由 `SHORTCUT_IS_CMD` 原子量决定,可从菜单切换。
+1. `event_monitor` 起一个**专用线程**跑 `CGEventTap` + `CFRunLoop`,检测快捷键按下(`CmdTabPressed`)和修饰键松开(`CmdReleased`),通过 `flume` 通道发送 `GlobalEvent`。当前快捷键(Cmd 或 Opt)由 `SHORTCUT_IS_CMD` 原子量决定,可从菜单切换。`Option+V` 也在这里检测(`ClipboardToggled`);剪贴板功能关闭时该组合键**透传不拦截**,其他应用可正常使用。
 2. **桥接线程**从 flume 收 `GlobalEvent`,通过 `performSelectorOnMainThread:` 转交主线程上的 controller 对象(`OhMyTabController`)。
 3. **主线程**跑 `NSApplication.run`,拥有所有 UI:ObjC 回调负责构建/刷新/显示浮层。
 
@@ -173,6 +174,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 | `i18n.rs` | 手写 TOML 国际化,编译期内嵌,自动检测语言。 |
 | `settings.rs` | 设置窗口(控件、校验告警、配置热应用)。 |
 | `mouse/` | 鼠标控制:第二个 HID 层 `CGEventTap` 拦截滚轮/按键事件,滚动模式(默认/按行)、指针加速控制、按设备匹配(`device.rs` / `resolve.rs`)。 |
+| `clipboard.rs` | 历史剪贴板:`NSPasteboard` 轮询 + 变更通知,历史/置顶/去重/删除逻辑,Option+V 浮窗与自动粘贴。 |
 | `menu.rs` | 状态栏菜单及动作回调。 |
 | `logger.rs` | 异步日志(有界通道、后台 writer 线程)。 |
 | `ffi.rs` / `theme.rs` | FFI 基础工具(CF/CG/NSString helper、`Send`/`Sync` 包装)与主题/布局访问器。 |
@@ -245,6 +247,10 @@ file_path = ""           # 空 = 默认带时间戳路径;见下方「日志」
 
 [startup]
 launch_at_login = false  # 开机自启(需以 .app 方式运行;macOS 13+)
+
+[clipboard]
+enabled = false          # 剪贴板历史总开关(默认关闭)
+max_entries = 50         # 历史最大条数(1..=100)
 
 [mouse]
 enabled = true           # 鼠标控制总开关(控制 event tap)

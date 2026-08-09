@@ -22,6 +22,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 - Handcrafted, zero-dependency i18n (English, Simplified Chinese, Traditional Chinese) with automatic locale detection and live system-language follow.
 - Per-launch log files with automatic 30-day retention (see [Logging](#logging)).
 - **Mouse control** (optional, off by default): scroll reversal, scroll modes (Default / Line with a per-tick line count), and disabling pointer acceleration — all configurable **per mouse device** (see [Configuration](#configuration)). This feature is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse), re-implemented from scratch in pure Rust (see [Credits](#credits)).
+- **Clipboard history** (optional, off by default): summon with **Option+V**; records plain text in memory (no persistence), with global dedup (re-copying an entry moves it to the front), per-entry pinning, per-entry delete (Backspace icon / key), and clear-all (keeps pinned entries). The picker follows the cursor.
 
 ## Screenshots
 
@@ -155,7 +156,7 @@ The codebase is organised into focused modules. The tricky parts span several fi
 
 ### Event flow & threading (spans all files)
 
-1. `event_monitor` spawns a **dedicated thread** running a `CGEventTap` + `CFRunLoop`. It detects shortcut press (`CmdTabPressed`) and modifier-release (`CmdReleased`) and sends `GlobalEvent`s over a `flume` channel. The active shortcut (Cmd vs Opt) is the `SHORTCUT_IS_CMD` atomic, toggleable from the menu.
+1. `event_monitor` spawns a **dedicated thread** running a `CGEventTap` + `CFRunLoop`. It detects shortcut press (`CmdTabPressed`) and modifier-release (`CmdReleased`) and sends `GlobalEvent`s over a `flume` channel. The active shortcut (Cmd vs Opt) is the `SHORTCUT_IS_CMD` atomic, toggleable from the menu. `Option+V` is also detected here (`ClipboardToggled`); it is passed through untouched when the clipboard feature is disabled, so other apps can use the combo.
 2. A **bridge thread** receives `GlobalEvent`s from flume and marshals each to the main thread via `performSelectorOnMainThread:` on the controller object (`OhMyTabController`).
 3. The **main thread** runs `NSApplication.run` and owns all UI: ObjC callbacks build/refresh/show the overlay.
 
@@ -173,6 +174,7 @@ Shared state lives in global `static`s guarded by `Mutex` / `RwLock`: `TAB_STATE
 | `i18n.rs` | Handcrafted TOML i18n, embedded at compile time, auto locale detection. |
 | `settings.rs` | Settings window (controls, validation alerts, hot config application). |
 | `mouse/` | Mouse control: a second HID-level `CGEventTap` for scroll/button events, scroll modes (default/line), pointer acceleration control, and per-device matching (`device.rs` / `resolve.rs`). |
+| `clipboard.rs` | Clipboard history: `NSPasteboard` polling + change notifications, history/pin/dedup/delete logic, the Option+V picker and auto-paste. |
 | `menu.rs` | Status-bar menu and action callbacks. |
 | `logger.rs` | Async logging (bounded channel, background writer). |
 | `ffi.rs` / `theme.rs` | FFI primitives (CF/CG/NSString helpers, `Send`/`Sync` wrappers) and theme/layout accessors. |
@@ -245,6 +247,10 @@ file_path = ""           # empty = default timestamped path; see Logging below
 
 [startup]
 launch_at_login = false  # launch at login (requires running as a .app bundle; macOS 13+)
+
+[clipboard]
+enabled = false          # clipboard history master switch (off by default)
+max_entries = 50         # max history entries (1..=100)
 
 [mouse]
 enabled = true           # master switch for the mouse-control event tap
