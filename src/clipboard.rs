@@ -91,10 +91,12 @@ const DEL_BTN_H: f64 = 14.0;
 const HEADER_H: f64 = 22.0;
 /// 标题栏与正文按钮的间隙 / gap between the header bar and the body button.
 const BODY_GAP: f64 = 2.0;
-/// 标题栏横条颜色:比白色卡片深一档(黑色 0.12 叠在 0.35 白卡上,形成"标题栏"观感)。
-/// Header strip color: one notch darker than the white card (black 0.12 over the 0.35 white
-/// tile reads as a title bar).
-const HEADER_BG_ALPHA: f64 = 0.12;
+/// 正文左右内边距:文字不要贴卡片边缘(卡片 x=PAD_X,文字再缩进 BODY_PAD_X)。
+/// Body horizontal padding: the text shouldn't hug the card's edge (the card starts at
+/// PAD_X; the text is inset by another BODY_PAD_X on each side).
+const BODY_PAD_X: f64 = 6.0;
+/// 标题栏图标与标题文字的间距 / the header icon-to-title gap.
+const HEADER_ICON_GAP: f64 = 4.0;
 /// 行内图标按钮(图钉/删除)的着色:比系统 labelColor 稍深,浅色界面上更清晰。
 /// Tint for the per-row icon buttons (pin/delete): slightly darker than the system
 /// labelColor for legibility on light glass.
@@ -106,7 +108,20 @@ const PAD_X: f64 = 12.0;
 /// panel into a capsule).
 const CORNER_R: f64 = 14.0;
 /// 选中行的圆角背景块圆角 / selected-row highlight tile corner radius.
-const SEL_TILE_R: f64 = 7.0;
+const SEL_TILE_R: f64 = 9.0;
+/// 卡片细边框:白色半透明,把卡片从亮玻璃上"立起来"。
+/// Card hairline border: translucent white, lifting the cards off the bright glass.
+const CARD_BORDER_ALPHA: f64 = 0.6;
+/// 卡片细边框宽度(pt)/ card hairline border width (pt).
+const CARD_BORDER_W: f64 = 0.5;
+/// 标题栏横条颜色:浅色磨砂(白 0.18 叠在卡片上,靠轻微亮度差分层,比黑色灰条现代)。
+/// Header strip: light frosted (white 0.18 over the card; a subtle brightness step layers it
+/// cleanly, more modern than the dark gray band).
+const HEADER_BG_ALPHA: f64 = 0.18;
+/// 选中行标题栏:accent 加深一档(0.5),避免"accent 卡 + 灰条"两色拼贴。
+/// The selected row's header: a deeper accent (0.5), avoiding the two-tone "accent card +
+/// gray strip" patchwork.
+const HEADER_SEL_ALPHA: f64 = 0.5;
 /// 每行背景块透明度(白色,明暗玻璃上都清晰)/ per-row tile alpha (white; legible on both
 /// light and dark glass). 8% 在亮色玻璃上不可见(玻璃本身亮度 ~0.78,零对比度),提到
 /// 0.35 才能形成清晰的磨砂卡片观感。8% vanished on the bright glass (the glass itself is
@@ -1401,9 +1416,37 @@ unsafe fn ensure_picker_window() {
             NSSize::new(SEARCH_BAR_W, CLEAR_BTN_H)
         )
     ];
+    // 占位文字基线偏移 -2.5pt:NSSearchFieldCell 画的占位文字中心比图标/输入文字/
+    // 清除按钮低约 2.6pt(像素测量),负基线偏移上移对齐(正偏移反而更低)。
+    // Placeholder baseline offset -2.5pt: NSSearchFieldCell draws the placeholder ~2.6pt
+    // lower than the search icon / typed text / clear button (pixel-measured); a NEGATIVE
+    // baseline offset raises it into alignment (a positive one lowers it further).
+    let ph_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let ph_attrs: *mut AnyObject = msg_send![ph_attrs, init];
+    let off_key = make_nsstring("NSBaselineOffset");
+    let off_val: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: -2.5f64];
+    let _: () = msg_send![ph_attrs, setObject: off_val, forKey: off_key];
+    CFRelease(off_key as *const c_void);
     let ph_ns = make_nsstring(&t("clipboard.search_hint"));
-    let _: () = msg_send![search, setPlaceholderString: ph_ns];
+    let ph_attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let ph_attr: *mut AnyObject = msg_send![ph_attr, initWithString: ph_ns, attributes: ph_attrs];
     CFRelease(ph_ns as *const c_void);
+    release_obj(ph_attrs);
+    let _: () = msg_send![search, setPlaceholderAttributedString: ph_attr];
+    release_obj(ph_attr);
+    // 磨砂化:去掉系统描边/bezel,改用与"清除全部"按钮同款的白色圆角 tile,顶部控件
+    // 风格统一(系统 ✕ 清除按钮随之不渲染,清空由 Esc/cancelOperation: 覆盖)。
+    // Frosted look: drop the system bezel and use the same white rounded tile as the
+    // "clear all" button, unifying the top bar (the system ✕ clear button no longer renders;
+    // clearing is covered by Esc/cancelOperation:).
+    let _: () = msg_send![search, setBezeled: false];
+    let _: () = msg_send![search, setDrawsBackground: false];
+    let _: () = msg_send![search, setWantsLayer: true];
+    let search_layer: *mut AnyObject = msg_send![search, layer];
+    let s_bg: *mut AnyObject =
+        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: ROW_TILE_ALPHA];
+    crate::ffi::layer_set_background(search_layer, crate::ffi::ns_color_to_cg(s_bg));
+    let _: () = msg_send![search_layer, setCornerRadius: SEL_TILE_R];
     // delegate = observer()(复用通知单例):↓ 命令拦截(字段编辑器转发 moveDown:)。
     // Delegate = observer() (reusing the notification singleton): intercepts ↓ (the field
     // editor forwards moveDown:).
@@ -1557,6 +1600,33 @@ unsafe fn rebuild_rows() {
         // height).
         let label_h = row_button_height(1);
         let label_y = (PICKER_MIN_HEIGHT - label_h) / 2.0;
+        // 空态卡片:磨砂白块包住提示文字(细边框 + 圆角,与条目卡片同款),不再孤零零
+        // 漂在玻璃上。
+        // Empty-state card: a frosted tile wrapping the hint (hairline border + radius, same
+        // style as the entry cards), no longer floating bare on the glass.
+        let card_h = label_h + 16.0;
+        let card_y = label_y - 8.0;
+        let card: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let card: *mut AnyObject = msg_send![
+            card,
+            initWithFrame: NSRect::new(
+                NSPoint::new(PAD_X + 60.0, card_y),
+                NSSize::new(PICKER_W - (PAD_X + 60.0) * 2.0, card_h)
+            )
+        ];
+        let _: () = msg_send![card, setWantsLayer: true];
+        let card_layer: *mut AnyObject = msg_send![card, layer];
+        let c_bg: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: ROW_TILE_ALPHA];
+        crate::ffi::layer_set_background(card_layer, crate::ffi::ns_color_to_cg(c_bg));
+        let _: () = msg_send![card_layer, setCornerRadius: SEL_TILE_R];
+        let c_border: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: CARD_BORDER_ALPHA];
+        crate::ffi::layer_set_border(card_layer, crate::ffi::ns_color_to_cg(c_border));
+        let _: () = msg_send![card_layer, setBorderWidth: CARD_BORDER_W];
+        let _: () = msg_send![container, addSubview: card];
+        release_obj(card);
+        tiles.push(ObjPtr(card));
         let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let label: *mut AnyObject = msg_send![
             label,
@@ -1611,8 +1681,10 @@ unsafe fn rebuild_rows() {
         let selected = i == sel_idx;
 
         // 卡片背景块:占满固定行距(行距 - 间距);选中行用强调色盖满整卡。
+        // 细边框 + 圆角把卡片从亮玻璃上"立起来"。
         // The card tile: fills the fixed pitch (pitch - gap); the selected row gets the
-        // accent color across the whole card.
+        // accent color across the whole card. A hairline border + radius lift the cards off
+        // the bright glass.
         let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
         let tile: *mut AnyObject = msg_send![
             tile,
@@ -1635,14 +1707,21 @@ unsafe fn rebuild_rows() {
         // CGColor args/returns ('^{CGColor=}' vs '^v').
         crate::ffi::layer_set_background(tile_layer, crate::ffi::ns_color_to_cg(bg));
         let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
+        // 细边框(同 raw FFI 路径)。
+        // The hairline border (same raw-FFI path).
+        let border: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: CARD_BORDER_ALPHA];
+        crate::ffi::layer_set_border(tile_layer, crate::ffi::ns_color_to_cg(border));
+        let _: () = msg_send![tile_layer, setBorderWidth: CARD_BORDER_W];
         let _: () = msg_send![container, addSubview: tile];
         release_obj(tile);
         tiles.push(ObjPtr(tile));
 
-        // 标题栏:深色横条 + 应用名,只圆顶部两角(与卡片顶角贴合);整条可点击 = 粘贴,
-        // 悬停选中该行(与正文按钮同款行为)。
-        // Header bar: a darker strip + the app name, top corners rounded only (flush with the
-        // card's top); the whole strip is clickable = paste, hover selects (same as the body).
+        // 标题栏:浅色磨砂横条(选中行 = accent 加深)+ 应用名,只圆顶部两角(与卡片顶角
+        // 贴合);整条可点击 = 粘贴,悬停选中该行(与正文按钮同款行为)。
+        // Header bar: a light frosted strip (a deeper accent when selected) + the app name,
+        // top corners rounded only (flush with the card's top); the whole strip is clickable
+        // = paste, hover selects (same as the body).
         let header: *mut AnyObject = msg_send![row_button_class(), alloc];
         let header: *mut AnyObject = msg_send![
             header,
@@ -1652,37 +1731,71 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![header, setAlignment: 0isize]; // left
         let _: () = msg_send![header, setWantsLayer: true];
         let h_layer: *mut AnyObject = msg_send![header, layer];
-        let h_bg: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: HEADER_BG_ALPHA];
+        let h_bg: *mut AnyObject = if selected {
+            let accent: *mut AnyObject = msg_send![class!(NSColor), controlAccentColor];
+            msg_send![accent, colorWithAlphaComponent: HEADER_SEL_ALPHA]
+        } else {
+            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: HEADER_BG_ALPHA]
+        };
         crate::ffi::layer_set_background(h_layer, crate::ffi::ns_color_to_cg(h_bg));
         let _: () = msg_send![h_layer, setCornerRadius: SEL_TILE_R];
         // 只圆顶部两角(CALayerCornerMask: minXMinY = 1<<0, maxXMinY = 1<<1)。
         // Round only the top corners (CALayerCornerMask: minXMinY = 1<<0, maxXMinY = 1<<1).
         let _: () = msg_send![h_layer, setMaskedCorners: 3u64];
-        let h_title = header_title(entry, show_source);
-        let h_attr = make_header_title(&h_title);
-        let _: () = msg_send![header, setAttributedTitle: h_attr];
-        release_obj(h_attr);
-        // 来源应用小图标:开关开 + 有缓存键 + 小图存在 → 显示在名称左侧(16pt,
-        // 32px PNG 需 setSize 否则按 32pt 显示会溢出 22pt 标题栏)。
-        // The source app's small icon: toggle on + a cache key + the small PNG exists ->
-        // shown left of the name (16pt; a 32px PNG must be setSize'd or it renders at 32pt
-        // and overflows the 22pt header).
+        // 来源应用小图标:开关开 + 有缓存键 + 小图存在 → 图标画进一个带左补白的透明
+        // 画布再挂到按钮上(NSImageLeft):图标从 x=BODY_PAD_X 处显示、不拦截点击(仍是
+        // 按钮的 image,整条标题栏可点=粘贴);标题在图标后自动右移,无需额外缩进。
+        // The source app's small icon: toggle on + a cache key + the small PNG exists -> the
+        // icon is drawn into a transparent canvas with left padding and set on the button
+        // (NSImageLeft): the icon shows from x=BODY_PAD_X and never intercepts clicks (it is
+        // still the button's image, so the whole header stays clickable = paste); the title
+        // follows the image, no extra indent needed.
+        let mut has_icon = false;
         if show_source && !entry.source_key.is_empty() {
             let icon_path = crate::window_collector::small_icon_path_for_key(&entry.source_key);
             if std::path::Path::new(&icon_path).exists() {
                 let ns_path = make_nsstring(&icon_path);
-                let ns_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-                let ns_image: *mut AnyObject = msg_send![ns_image, initWithContentsOfFile: ns_path];
+                let icon_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                let icon_image: *mut AnyObject =
+                    msg_send![icon_image, initWithContentsOfFile: ns_path];
                 CFRelease(ns_path as *const c_void);
-                if !ns_image.is_null() {
-                    let _: () = msg_send![ns_image, setSize: NSSize::new(16.0, 16.0)];
-                    let _: () = msg_send![header, setImage: ns_image];
+                if !icon_image.is_null() {
+                    // 32px PNG 需 setSize 否则按 32pt 显示会溢出 22pt 标题栏。
+                    // A 32px PNG must be setSize'd or it renders at 32pt and overflows the
+                    // 22pt header.
+                    let _: () = msg_send![icon_image, setSize: NSSize::new(16.0, 16.0)];
+                    let pad_w = BODY_PAD_X + 16.0 + HEADER_ICON_GAP;
+                    let canvas: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                    let canvas: *mut AnyObject =
+                        msg_send![canvas, initWithSize: NSSize::new(pad_w, 16.0)];
+                    let _: () = msg_send![canvas, lockFocus];
+                    let dst = NSRect::new(NSPoint::new(BODY_PAD_X, 0.0), NSSize::new(16.0, 16.0));
+                    let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+                    let op: usize = 1; // NSCompositingOperationCopy
+                    let _: () = msg_send![
+                        icon_image,
+                        drawInRect: dst,
+                        fromRect: src,
+                        operation: op,
+                        fraction: 1.0f64
+                    ];
+                    let _: () = msg_send![canvas, unlockFocus];
+                    let _: () = msg_send![header, setImage: canvas];
                     let _: () = msg_send![header, setImagePosition: 2isize]; // NSImageLeft
-                    release_obj(ns_image);
+                    release_obj(canvas);
+                    release_obj(icon_image);
+                    has_icon = true;
                 }
             }
         }
+        let h_title = header_title(entry, show_source);
+        // 无图标时标题首行缩进与正文对齐;有图标时图标位已由补白画布让出。
+        // Without an icon the title's first line aligns with the body text; with an icon the
+        // padded canvas already reserves the slot.
+        let title_indent = if has_icon { 0.0 } else { BODY_PAD_X };
+        let h_attr = make_header_title(&h_title, title_indent);
+        let _: () = msg_send![header, setAttributedTitle: h_attr];
+        release_obj(h_attr);
         let _: () = msg_send![header, setTag: i as isize];
         let _: () = msg_send![header, setTarget: row_target()];
         let _: () = msg_send![header, setAction: sel!(handleClipboardRowClick:)];
@@ -1699,8 +1812,8 @@ unsafe fn rebuild_rows() {
         let body: *mut AnyObject = msg_send![
             body,
             initWithFrame: NSRect::new(
-                NSPoint::new(PAD_X, y + HEADER_H + BODY_GAP),
-                NSSize::new(row_w, body_h)
+                NSPoint::new(PAD_X + BODY_PAD_X, y + HEADER_H + BODY_GAP),
+                NSSize::new(row_w - BODY_PAD_X * 2.0, body_h)
             )
         ];
         let _: () = msg_send![body, setBordered: false];
@@ -2185,10 +2298,12 @@ unsafe fn make_row_attributed_title(title: &str, selected: bool) -> *mut AnyObje
     attr
 }
 
-/// 标题栏文字(attributed):10pt,次要色,在深色横条上可读;空串时整行留空。
-/// Header-bar text (attributed): 10pt, secondary color, legible on the darker strip; an
-/// empty string renders nothing.
-unsafe fn make_header_title(title: &str) -> *mut AnyObject {
+/// 标题栏文字(attributed):10pt,次要色,在浅色磨砂横条上可读;空串时整行留空。
+/// `indent`: 首行左缩进(pt)——有图标时让出图标位,无图标时与正文文字对齐。
+/// Header-bar text (attributed): 10pt, secondary color, legible on the light frosted strip;
+/// an empty string renders nothing. `indent`: the first-line left indent (pt) -- reserves the
+/// icon slot when present, aligns with the body text otherwise.
+unsafe fn make_header_title(title: &str, indent: f64) -> *mut AnyObject {
     if title.is_empty() {
         let empty = make_nsstring("");
         let attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
@@ -2206,6 +2321,18 @@ unsafe fn make_header_title(title: &str) -> *mut AnyObject {
     let _: () = msg_send![attrs, setObject: color, forKey: color_key];
     CFRelease(font_key as *const c_void);
     CFRelease(color_key as *const c_void);
+    if indent > 0.0 {
+        // 首行缩进:与正文文字缩进对齐,有图标时让出图标位。
+        // First-line indent: aligned with the body text; reserves the icon slot when shown.
+        let pstyle: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+        let pstyle: *mut AnyObject = msg_send![pstyle, init];
+        let _: () = msg_send![pstyle, setHeadIndent: indent];
+        let _: () = msg_send![pstyle, setFirstLineHeadIndent: indent];
+        let pstyle_key = make_nsstring("NSParagraphStyle");
+        let _: () = msg_send![attrs, setObject: pstyle, forKey: pstyle_key];
+        CFRelease(pstyle_key as *const c_void);
+        release_obj(pstyle);
+    }
     let ns_title = make_nsstring(title);
     let attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
     let attr: *mut AnyObject = msg_send![attr, initWithString: ns_title, attributes: attrs];
