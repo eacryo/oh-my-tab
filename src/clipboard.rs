@@ -1416,24 +1416,61 @@ unsafe fn ensure_picker_window() {
             NSSize::new(SEARCH_BAR_W, CLEAR_BTN_H)
         )
     ];
-    // 占位文字基线偏移 -2.5pt:NSSearchFieldCell 画的占位文字中心比图标/输入文字/
-    // 清除按钮低约 2.6pt(像素测量),负基线偏移上移对齐(正偏移反而更低)。
-    // Placeholder baseline offset -2.5pt: NSSearchFieldCell draws the placeholder ~2.6pt
-    // lower than the search icon / typed text / clear button (pixel-measured); a NEGATIVE
-    // baseline offset raises it into alignment (a positive one lowers it further).
-    let ph_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-    let ph_attrs: *mut AnyObject = msg_send![ph_attrs, init];
-    let off_key = make_nsstring("NSBaselineOffset");
-    let off_val: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: -2.5f64];
-    let _: () = msg_send![ph_attrs, setObject: off_val, forKey: off_key];
-    CFRelease(off_key as *const c_void);
+    // 居中 cell:占位 = "放大镜 SF Symbol + 搜索提示"整体水平居中(见 search_cell_class)。
+    // A centered cell: the placeholder = "magnifier SF Symbol + search hint" centered as a
+    // group (see search_cell_class).
+    let cell: *mut AnyObject = msg_send![search_cell_class(), alloc];
+    let empty_ns = make_nsstring("");
+    let cell: *mut AnyObject = msg_send![cell, initTextCell: empty_ns];
+    CFRelease(empty_ns as *const c_void);
+    // 放大镜附件(13pt,微降 2pt 与文字基线贴合)。
+    // The magnifier attachment (13pt, dropped 2pt to sit on the text baseline).
+    let sym_ns = make_nsstring("magnifyingglass");
+    let magnifier: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: sym_ns,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(sym_ns as *const c_void);
+    let attachment: *mut AnyObject = msg_send![class!(NSTextAttachment), alloc];
+    let attachment: *mut AnyObject = msg_send![attachment, init];
+    let _: () = msg_send![attachment, setImage: magnifier];
+    let _: () = msg_send![attachment, setBounds: NSRect::new(
+        NSPoint::new(0.0, -2.0),
+        NSSize::new(13.0, 13.0)
+    )];
+    let ph_m: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+    let empty_ns2 = make_nsstring("");
+    let ph_m: *mut AnyObject = msg_send![ph_m, initWithString: empty_ns2];
+    CFRelease(empty_ns2 as *const c_void);
+    let att_str: *mut AnyObject = msg_send![
+        class!(NSAttributedString),
+        attributedStringWithAttachment: attachment
+    ];
+    let _: () = msg_send![ph_m, appendAttributedString: att_str];
+    release_obj(attachment);
+    let ph_text_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let ph_text_attrs: *mut AnyObject = msg_send![ph_text_attrs, init];
+    let font_key = make_nsstring("NSFont");
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+    let _: () = msg_send![ph_text_attrs, setObject: font, forKey: font_key];
+    CFRelease(font_key as *const c_void);
+    let color_key = make_nsstring("NSColor");
+    let ph_color: *mut AnyObject = msg_send![class!(NSColor), placeholderTextColor];
+    let _: () = msg_send![ph_text_attrs, setObject: ph_color, forKey: color_key];
+    CFRelease(color_key as *const c_void);
     let ph_ns = make_nsstring(&t("clipboard.search_hint"));
-    let ph_attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-    let ph_attr: *mut AnyObject = msg_send![ph_attr, initWithString: ph_ns, attributes: ph_attrs];
+    let ph_text: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let ph_text: *mut AnyObject =
+        msg_send![ph_text, initWithString: ph_ns, attributes: ph_text_attrs];
     CFRelease(ph_ns as *const c_void);
-    release_obj(ph_attrs);
-    let _: () = msg_send![search, setPlaceholderAttributedString: ph_attr];
-    release_obj(ph_attr);
+    release_obj(ph_text_attrs);
+    let _: () = msg_send![ph_m, appendAttributedString: ph_text];
+    release_obj(ph_text);
+    let _: () = msg_send![cell, setPlaceholderAttributedString: ph_m];
+    release_obj(ph_m);
+    let _: () = msg_send![search, setCell: cell];
+    release_obj(cell);
     // 磨砂化:去掉系统描边/bezel,改用与"清除全部"按钮同款的白色圆角 tile,顶部控件
     // 风格统一(系统 ✕ 清除按钮随之不渲染,清空由 Esc/cancelOperation: 覆盖)。
     // Frosted look: drop the system bezel and use the same white rounded tile as the
@@ -1467,13 +1504,16 @@ unsafe fn ensure_picker_window() {
     ];
     CFRelease(text_name as *const c_void);
 
-    // 右上角"清除全部"按钮:清空剪贴板历史。
-    // "Clear all" button at the top-right: empties the clipboard history.
+    // 右上角"清除全部"按钮:清空剪贴板历史。右缘与条目卡片右缘对齐
+    // (卡片右缘 = PICKER_W - PAD_X;此前多留的 3pt 边距导致右缘错位)。
+    // "Clear all" button at the top-right: empties the clipboard history. Its right edge
+    // aligns with the entry cards' right edge (cards end at PICKER_W - PAD_X; the old extra
+    // 3pt margin misaligned them).
     let clear_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let clear_btn: *mut AnyObject = msg_send![
         clear_btn,
         initWithFrame: NSRect::new(
-            NSPoint::new(w - CLEAR_BTN_W - 3.0, PAD_Y),
+            NSPoint::new(w - PAD_X - CLEAR_BTN_W, PAD_Y),
             NSSize::new(CLEAR_BTN_W, CLEAR_BTN_H)
         )
     ];
@@ -1972,6 +2012,81 @@ unsafe fn row_button_class() -> *mut AnyObject {
             ObjPtr(cls)
         })
         .0
+}
+
+/// 搜索框 cell 类(NSSearchFieldCell 子类,覆写 drawInteriorWithFrame:inView:)。
+/// 非编辑态且有占位文字时,自绘"放大镜图标 + 占位文字"整体水平居中——NSSearchFieldCell
+/// 的系统布局(图标固定靠左 + 文字紧随)无法居中,而 `centersPlaceholder` 在 macOS 26
+/// 已不存在。
+/// The search field's cell class (an NSSearchFieldCell subclass overriding
+/// drawInteriorWithFrame:inView:). In the non-editing state with a placeholder, it draws the
+/// "magnifier icon + placeholder text" group centered horizontally -- NSSearchFieldCell's
+/// stock layout (icon pinned left + text after it) cannot center, and `centersPlaceholder`
+/// no longer exists on macOS 26.
+unsafe fn search_cell_class() -> *mut AnyObject {
+    static CELL_CLS: OnceLock<ObjPtr> = OnceLock::new();
+    CELL_CLS
+        .get_or_init(|| {
+            let name = CString::new("OhMyTabClipSearchCell").unwrap();
+            let superclass = class!(NSSearchFieldCell) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            // 参数:NSRect(struct) + NSView* -> 编码 "v@:{CGRect=dddd}@"。
+            // Args: NSRect (struct) + NSView* -> encoding "v@:{CGRect=dddd}@".
+            let types = CString::new("v@:{CGRect=dddd}@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(drawInteriorWithFrame:inView:),
+                search_cell_draw_interior as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            ObjPtr(cls)
+        })
+        .0
+}
+
+/// 居中自绘占位:非编辑态 + 有占位 → 把"放大镜 + 文字"整体画在 cell 水平中心;
+/// 其余(编辑态/无占位)交给父类(系统图标 + 输入文字)。
+/// Draws the centered placeholder: non-editing + a placeholder -> the "magnifier + text"
+/// group is drawn at the cell's horizontal center; everything else (editing / no
+/// placeholder) goes to the superclass (the stock icon + typed text).
+extern "C" fn search_cell_draw_interior(
+    _self: *mut c_void,
+    _cmd: Sel,
+    cell_frame: NSRect,
+    control_view: *mut c_void,
+) {
+    unsafe {
+        // 编辑态检测:字段编辑器存在 = 正在编辑(占位不显示,交给父类)。
+        // Editing detection: a live field editor means editing (no placeholder; super).
+        let editing = if control_view.is_null() {
+            false
+        } else {
+            let editor: *mut AnyObject = msg_send![control_view as *mut AnyObject, currentEditor];
+            !editor.is_null()
+        };
+        if !editing {
+            let placeholder: *mut AnyObject =
+                msg_send![_self as *mut AnyObject, placeholderAttributedString];
+            let has_text = !placeholder.is_null() && {
+                let len: usize = msg_send![placeholder, length];
+                len > 0
+            };
+            if has_text {
+                let size: NSSize = msg_send![placeholder, size];
+                let x = cell_frame.origin.x + (cell_frame.size.width - size.width) / 2.0;
+                let y = cell_frame.origin.y + (cell_frame.size.height - size.height) / 2.0;
+                let _: () = msg_send![placeholder, drawAtPoint: NSPoint::new(x, y)];
+                return;
+            }
+        }
+        let cls = objc2::runtime::AnyClass::get(c"OhMyTabClipSearchCell").unwrap();
+        let _: () = msg_send![
+            super(_self as *mut AnyObject, cls),
+            drawInteriorWithFrame: cell_frame,
+            inView: control_view
+        ];
+    }
 }
 
 /// 悬停行按钮:选中该行并刷新高亮。搜索框编辑中(光标在搜索框)时忽略——用户要求
