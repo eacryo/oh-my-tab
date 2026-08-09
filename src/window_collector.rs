@@ -483,11 +483,11 @@ fn cf_dict_get_bounds(dict: *const c_void, key: &str) -> Option<(f64, f64, f64, 
 
 /// 一个运行中 App 的缓存身份:`key` 用作缓存文件名,`fingerprint` 用于检测 App 更新。
 /// A running app's cache identity: `key` is the cache filename, `fingerprint` detects updates.
-struct AppIdentity {
-    key: String,
+pub(crate) struct AppIdentity {
+    pub(crate) key: String,
     /// 可执行文件 mtime(自 UNIX epoch 的秒数)。None 表示无法校验,退化为「文件存在即有效」。
     /// Executable mtime (seconds since UNIX epoch). None means unverified -> "file exists = valid".
-    fingerprint: Option<String>,
+    pub(crate) fingerprint: Option<String>,
 }
 
 /// 读一个 NSString 到 Rust String(nil -> None)。对象是 autoreleased,调用方需在池内。
@@ -519,11 +519,13 @@ fn fnv1a_hex(s: &str) -> String {
 /// 解析一个 PID 对应 App 的缓存身份。
 /// 键优先级:bundleIdentifier(reverse-DNS,文件名安全)> 可执行文件路径哈希 > `pid_{pid}` 兜底。
 /// 指纹取可执行文件 mtime;App 更新会换新 mtime -> 触发重提。
+/// 剪贴板记录来源时也复用此身份(与切换器同一套键/回退)。
 ///
 /// Resolve a PID's cache identity. Key priority: bundleIdentifier (reverse-DNS,
 /// filename-safe) > hashed executable path > `pid_{pid}` fallback. Fingerprint is the
-/// executable mtime; an app update gets a new mtime -> forces re-extract.
-unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
+/// executable mtime; an app update gets a new mtime -> forces re-extract. The clipboard
+/// reuses this identity when recording a source (the same key/fallback chain as the switcher).
+pub(crate) unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
     let app: *mut AnyObject =
         msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
     if app.is_null() {
@@ -567,8 +569,11 @@ unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
     AppIdentity { key, fingerprint }
 }
 
-fn cache_path_for_key(key: &str) -> String {
-    format!("{}/{}.png", icon_cache_dir(), key)
+/// 缓存 PNG 路径(支持后缀:"" = 切换器大图,".small" = 剪贴板小图)。
+/// The cached PNG path (suffix-aware: "" = the switcher's big icon, ".small" = the
+/// clipboard's small one).
+fn cache_path_for_key_suffix(key: &str, suffix: &str) -> String {
+    format!("{}/{}{}.png", icon_cache_dir(), key, suffix)
 }
 
 fn meta_path_for_key(key: &str) -> String {
@@ -581,7 +586,13 @@ fn meta_path_for_key(key: &str) -> String {
 /// Validate the cache: PNG exists, and (when a fingerprint is present) the sidecar
 /// matches. An app update changes the mtime -> fingerprint mismatch -> None -> re-extract.
 fn check_cache_for_identity(id: &AppIdentity) -> Option<String> {
-    let png = cache_path_for_key(&id.key);
+    check_cache_for_suffix(id, "")
+}
+
+/// 同上,支持小图后缀(.small);大小图共享同一份 .meta 指纹。
+/// Same as above, suffix-aware for the small icon; both sizes share one .meta fingerprint.
+fn check_cache_for_suffix(id: &AppIdentity, suffix: &str) -> Option<String> {
+    let png = cache_path_for_key_suffix(&id.key, suffix);
     if std::fs::metadata(&png).is_err() {
         return None;
     }
@@ -650,9 +661,9 @@ pub fn check_icon_cache(pid: i32) -> Option<String> {
     check_cache_for_identity(&id)
 }
 
-fn write_png_to_cache(png: *mut AnyObject, key: &str) -> Option<String> {
+fn write_png_to_cache(png: *mut AnyObject, key: &str, suffix: &str) -> Option<String> {
     unsafe {
-        let path = cache_path_for_key(key);
+        let path = cache_path_for_key_suffix(key, suffix);
         let path_cstr = std::ffi::CString::new(&*path).unwrap();
         let cf_path = CFStringCreateWithCString(std::ptr::null(), path_cstr.as_ptr(), 0x08000100);
         // 原子写入：先写临时文件再重命名，避免写一半崩溃留下半截 PNG。
@@ -668,7 +679,14 @@ fn write_png_to_cache(png: *mut AnyObject, key: &str) -> Option<String> {
     }
 }
 
-pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
+/// 提取图标到缓存(按目标 pt 尺寸渲染):切换器大图(128pt)与剪贴板小图(16pt)共用管线。
+/// `suffix`: 文件名后缀("" = {key}.png,".small" = {key}.small.png),大小图共享同一份
+/// {key}.meta 指纹(同一可执行文件 mtime)。
+/// Extract an app icon into the cache at the target point size: the switcher's big icon
+/// (128pt) and the clipboard's small one (16pt) share this pipeline. `suffix`: the filename
+/// suffix ("" -> {key}.png, ".small" -> {key}.small.png); both sizes share one {key}.meta
+/// fingerprint (the same executable mtime).
+fn extract_icon_to_cache_sized(pid: i32, pt_size: f64, suffix: &str) -> Option<String> {
     unsafe {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -682,7 +700,7 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
         let id = resolve_app_identity(pid);
         // 命中既有且有效的缓存(含 mtime 校验)-> 跳过提取。
         // Hit an existing valid cache (mtime-verified) -> skip extraction.
-        if let Some(path) = check_cache_for_identity(&id) {
+        if let Some(path) = check_cache_for_suffix(&id, suffix) {
             let _: () = msg_send![pool, drain];
             return Some(path);
         }
@@ -726,7 +744,7 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
             return None;
         }
 
-        // Render at Retina resolution: 64pt display → 128px (2x) or 64px (1x)
+        // Render at Retina resolution: pt_size pt display → 2x (or 1x) pixels.
         let scale: f64 = {
             let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
             if screen.is_null() {
@@ -735,7 +753,7 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
                 msg_send![screen, backingScaleFactor]
             }
         };
-        let px = 128.0 * scale;
+        let px = pt_size * scale;
 
         let target_img: *mut AnyObject = msg_send![class!(NSImage), alloc];
         let target_img: *mut AnyObject = msg_send![target_img, initWithSize: NSSize::new(px, px)];
@@ -771,7 +789,7 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
             return None;
         }
 
-        let result = write_png_to_cache(png, &id.key);
+        let result = write_png_to_cache(png, &id.key, suffix);
         // 写 mtime sidecar:下次命中时据此判断 App 是否更新过(mtime 变 -> 重提)。
         // 仅在 PNG 写成功时写,避免留下无 PNG 的孤儿 meta。
         // Write the mtime sidecar: next hit checks it to detect app updates (mtime change ->
@@ -784,6 +802,25 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
         let _: () = msg_send![pool, drain];
         result
     }
+}
+
+pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
+    extract_icon_to_cache_sized(pid, 128.0, "")
+}
+
+/// 剪贴板标题栏的小图标(16pt,2x = 32px)。记录来源时调用(app 此刻必存活);
+/// 键与 .meta 指纹和切换器大图共用,`{key}.small.png` 独立于大图文件。
+/// The clipboard header's small icon (16pt, 32px @2x). Called when the source is recorded
+/// (the app is guaranteed alive then); the key and .meta fingerprint are shared with the
+/// switcher's big icon, while `{key}.small.png` is a separate file.
+pub fn extract_small_icon(pid: i32) -> Option<String> {
+    extract_icon_to_cache_sized(pid, 16.0, ".small")
+}
+
+/// 剪贴板小图的路径(存在性检查用;key = resolve_app_identity 的缓存键)。
+/// The clipboard small-icon path (for existence checks; key = resolve_app_identity's key).
+pub fn small_icon_path_for_key(key: &str) -> String {
+    cache_path_for_key_suffix(key, ".small")
 }
 
 pub fn raise_ax_window(pid: i32, cgwid: u32) {
@@ -1416,12 +1453,11 @@ pub fn cache_running_app_icons() {
             let app: *mut AnyObject = msg_send![running, objectAtIndex: i];
             let pid: i32 = msg_send![app, processIdentifier];
             if check_icon_cache(pid).is_none() {
-                let name: *mut AnyObject = msg_send![app, localizedName];
-                let utf8: *const c_char = msg_send![name, UTF8String];
-                let name_str = if utf8.is_null() {
+                let name_str = crate::ffi::ns_running_app_name(app);
+                let name_str = if name_str.is_empty() {
                     "?".to_string()
                 } else {
-                    CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                    name_str
                 };
                 log_debug!("cached icon: {} (pid {})", name_str, pid);
                 cached.push(name_str);
@@ -1436,6 +1472,38 @@ pub fn cache_running_app_icons() {
         "icon cache done: {} cached, {} skipped (already fresh)",
         cached.len(),
         skipped,
+    );
+}
+
+/// 启动时预热剪贴板标题栏的小图标(16pt)。仅当配置开启剪贴板时才调用(main.rs 门控),
+/// 否则小图标缓存不会被生成——剪贴板功能关闭时没必要为每个运行应用提取。
+/// Pre-warm the clipboard header's small icons (16pt) at startup. Only called when the
+/// clipboard feature is enabled (gated in main.rs); the small cache stays ungenerated when
+/// the feature is off -- extracting it for every running app would be wasted work.
+pub fn cache_running_app_icons_small() {
+    let mut cached: Vec<String> = Vec::new();
+    unsafe {
+        // 与 cache_running_app_icons 同理:NSApp run 之前主线程没有 autorelease 池。
+        // Same as cache_running_app_icons: no autorelease pool before NSApp run.
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let running: *mut AnyObject = msg_send![workspace, runningApplications];
+        let count: usize = msg_send![running, count];
+        for i in 0..count {
+            let app: *mut AnyObject = msg_send![running, objectAtIndex: i];
+            let pid: i32 = msg_send![app, processIdentifier];
+            // extract_small_icon 内部按 {key}.small.png + mtime 指纹校验,命中即跳过。
+            // extract_small_icon verifies {key}.small.png + the mtime fingerprint, hitting
+            // the cache skips the work.
+            if extract_small_icon(pid).is_some() {
+                cached.push(pid.to_string());
+            }
+        }
+        let _: () = msg_send![pool, drain];
+    }
+    log_debug!(
+        "small icon cache done: {} cached/verified (clipboard)",
+        cached.len()
     );
 }
 
@@ -1472,6 +1540,22 @@ mod tests {
             fnv1a_hex("/Applications/Firefox.app")
         );
         assert_ne!(fnv1a_hex(""), fnv1a_hex("x"));
+    }
+
+    #[test]
+    fn small_icon_path_uses_dot_small_suffix() {
+        // 剪贴板小图 = {key}.small.png,与切换器大图({key}.png)同 key 同目录。
+        // The clipboard small icon = {key}.small.png, same key and dir as the switcher's
+        // big icon ({key}.png).
+        let key = "com.apple.Safari";
+        let path = small_icon_path_for_key(key);
+        assert!(path.ends_with(&format!("{}.small.png", key)), "{}", path);
+        assert!(!path.contains("..png"));
+        // 大小图路径只差后缀。
+        // The big/small paths differ only by the suffix.
+        let big = cache_path_for_key_suffix(key, "");
+        assert!(big.ends_with(&format!("{}.png", key)), "{}", big);
+        assert_eq!(path, format!("{}.small.png", &big[..big.len() - 4]));
     }
 
     #[test]

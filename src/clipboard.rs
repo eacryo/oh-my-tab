@@ -80,12 +80,21 @@ const CLEAR_BTN_GAP: f64 = 6.0;
 const SEARCH_BAR_W: f64 = 240.0;
 /// 行内图钉按钮宽度 / the per-row pin button width.
 const PIN_BTN_W: f64 = 24.0;
-/// 行内图钉按钮高度 / the per-row pin button height.
-const PIN_BTN_H: f64 = 20.0;
+/// 行内图钉按钮高度(标题栏内,矮小)/ the per-row pin button height (inside the header bar).
+const PIN_BTN_H: f64 = 14.0;
 /// 行内删除按钮宽度 / the per-row delete button width.
 const DEL_BTN_W: f64 = 24.0;
-/// 行内删除按钮高度 / the per-row delete button height.
-const DEL_BTN_H: f64 = 20.0;
+/// 行内删除按钮高度(标题栏内,矮小)/ the per-row delete button height (inside the header bar).
+const DEL_BTN_H: f64 = 14.0;
+/// 条目标题栏高度(来源应用名 + 图钉/删除图标)/ the per-entry header bar height (source app
+/// name + pin/delete icons).
+const HEADER_H: f64 = 22.0;
+/// 标题栏与正文按钮的间隙 / gap between the header bar and the body button.
+const BODY_GAP: f64 = 2.0;
+/// 标题栏横条颜色:比白色卡片深一档(黑色 0.12 叠在 0.35 白卡上,形成"标题栏"观感)。
+/// Header strip color: one notch darker than the white card (black 0.12 over the 0.35 white
+/// tile reads as a title bar).
+const HEADER_BG_ALPHA: f64 = 0.12;
 /// 行内图标按钮(图钉/删除)的着色:比系统 labelColor 稍深,浅色界面上更清晰。
 /// Tint for the per-row icon buttons (pin/delete): slightly darker than the system
 /// labelColor for legibility on light glass.
@@ -250,13 +259,43 @@ fn row_pitch(btn_h: f64) -> f64 {
     btn_h + ROW_GAP
 }
 
-/// 计算一批文本的每行行距。**所有条目固定同一行距**(按 3 行高度):列表高度整齐,
-/// 短文本的按钮紧凑包裹文本、顶对齐在条目空间内,下方留白。
-/// Compute the per-row pitches. **All entries share ONE fixed pitch** (sized for 3 lines):
-/// the list height stays even, and short-text buttons hug their text, top-aligned inside the
-/// slot with the space below left blank.
+/// 是否显示来源应用(读 CONFIG;记录始终进行,开关只控制标题栏里的名称显示)。
+/// Whether the source app name is shown (reads CONFIG; recording is always on, the toggle
+/// only gates the name in the header bar).
+fn show_source_app() -> bool {
+    CONFIG.read().unwrap().clipboard.show_source_app
+}
+
+/// 标题栏文字:开关开 → 来源应用名(无来源显示"未知来源");开关关 → 空串(横条只放图标)。
+/// The header text: toggle on -> the source app name ("unknown source" when absent);
+/// toggle off -> empty (the strip only hosts the icons).
+fn header_title(entry: &ClipEntry, show_source: bool) -> String {
+    if !show_source {
+        return String::new();
+    }
+    if entry.source_app.is_empty() {
+        t("clipboard.unknown_source")
+    } else {
+        entry.source_app.clone()
+    }
+}
+
+/// 正文按钮高度 = 正文行数(≤3),紧凑包裹文本、顶对齐在条目空间内(标题栏恒占顶部)。
+/// The body button height = text lines (≤3); it hugs the text, top-aligned inside the slot
+/// (the header bar always occupies the top).
+fn body_button_height(entry: &ClipEntry) -> f64 {
+    row_button_height(text_lines(&entry.text))
+}
+
+/// 计算一批文本的每行行距。**所有条目固定同一行距** = 标题栏 + 正文 3 行:列表高度
+/// 整齐,短文本的按钮紧凑包裹文本、顶对齐在条目空间内。
+/// Compute the per-row pitches. **All entries share ONE fixed pitch** = header + 3 text
+/// lines: the list height stays even, and short-text buttons hug their text, top-aligned
+/// inside the slot.
 fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
-    let fixed_pitch = row_pitch(row_button_height(MAX_TEXT_LINES));
+    // 标题栏 + 间隙 + 3 行正文 + 行距。
+    // Header + gap + 3 body lines + row gap.
+    let fixed_pitch = HEADER_H + BODY_GAP + row_button_height(MAX_TEXT_LINES) + ROW_GAP;
     let _ = texts;
     texts.iter().map(|_| fixed_pitch).collect()
 }
@@ -273,12 +312,22 @@ fn row_top(idx: usize, pitches: &[f64]) -> f64 {
     rows_top_offset() + pitches.iter().take(idx).sum::<f64>()
 }
 
-/// 历史条目:文本 + 置顶标记。置顶条目恒在列表顶部。
-/// A history entry: text + a pinned flag. Pinned entries stay at the top.
+/// 历史条目:文本 + 置顶标记 + 来源应用名 + 来源图标缓存键。置顶条目恒在列表顶部。
+/// A history entry: text + a pinned flag + the source app name + the source icon-cache key.
+/// Pinned entries stay at the top.
 #[derive(Debug, Clone, PartialEq)]
 struct ClipEntry {
     text: String,
     pinned: bool,
+    /// 复制该文本时的前台应用名(空 = 未知,如旧条目/取不到前台应用)。
+    /// The frontmost app name when the text was copied (empty = unknown, e.g. legacy entries
+    /// or an unavailable frontmost app).
+    source_app: String,
+    /// 来源应用的图标缓存键(resolve_app_identity: bundle id > exec 路径哈希 > pid)。
+    /// 空 = 取不到身份(旧条目等),标题栏不显示图标。
+    /// The source app's icon-cache key (resolve_app_identity: bundle id > exec-path hash >
+    /// pid). Empty = no identity (e.g. legacy entries) -> no icon in the header.
+    source_key: String,
 }
 
 /// 新条目(非置顶)应插入的位置:置顶区之后(第一个非置顶条目的下标)。
@@ -313,7 +362,8 @@ fn move_entry_to_front(history: &mut Vec<ClipEntry>, idx: usize) {
 
 /// 把新文本记入历史。规则:
 /// - 空文本忽略
-/// - 全表查重:文本已存在 → 把旧条目提到最前(保留置顶状态,见 move_entry_to_front)
+/// - 全表查重:文本已存在 → 把旧条目提到最前(保留置顶状态,见 move_entry_to_front),
+///   并把来源(名称 + 图标键)更新为本次复制的来源(它是"最新一次复制"的来源)
 /// - 未命中 → 新条目插到置顶区之后;超出 max 裁剪最旧条目
 ///
 /// 返回是否真正写入。
@@ -321,15 +371,24 @@ fn move_entry_to_front(history: &mut Vec<ClipEntry>, idx: usize) {
 /// Record a new text into the history:
 /// - empty text is ignored
 /// - full-list dedup: an existing text is moved to the front (pinned state kept, see
-///   move_entry_to_front)
+///   move_entry_to_front), and its source (name + icon key) is updated to this copy's source
+///   (it is the "latest copy" now)
 /// - a new text is inserted after the pinned block; entries beyond `max` are trimmed
 ///
 /// Returns whether something was actually recorded.
-fn record_text(history: &mut Vec<ClipEntry>, text: &str, max: usize) -> bool {
+fn record_text(
+    history: &mut Vec<ClipEntry>,
+    text: &str,
+    source: &str,
+    source_key: &str,
+    max: usize,
+) -> bool {
     if text.is_empty() || max == 0 {
         return false;
     }
     if let Some(idx) = find_by_text(history, text) {
+        history[idx].source_app = source.to_string();
+        history[idx].source_key = source_key.to_string();
         move_entry_to_front(history, idx);
         return true;
     }
@@ -339,6 +398,8 @@ fn record_text(history: &mut Vec<ClipEntry>, text: &str, max: usize) -> bool {
         ClipEntry {
             text: text.to_string(),
             pinned: false,
+            source_app: source.to_string(),
+            source_key: source_key.to_string(),
         },
     );
     if history.len() > max {
@@ -487,8 +548,29 @@ fn poll_clipboard() {
     }
     match unsafe { read_pasteboard_text() } {
         Some(text) => {
+            // 来源 = 复制瞬间的前台应用(始终记录;显示与否由 CONFIG 的
+            // clipboard.show_source_app 决定)。轮询间隔(0.5s)内切应用可能记错来源,
+            // 通知路径(changeCount 变化即时回调)则基本精确,第一版接受这个误差。
+            // 图标缓存键 = resolve_app_identity 的 key(与切换器同一套回退);
+            // 顺带提取 16pt 小图标(app 此刻存活,提取最可靠;失败不影响记录)。
+            // Source = the frontmost app at copy time (always recorded; whether it is shown
+            // is gated by CONFIG.clipboard.show_source_app). Switching apps within the 0.5s
+            // poll interval can misattribute; the notification path (immediate callback) is
+            // mostly accurate -- acceptable for v1. The icon-cache key comes from
+            // resolve_app_identity (same fallbacks as the switcher); the 16pt small icon is
+            // extracted here too (the app is alive now -- the most reliable moment; failure
+            // only means no icon).
+            let (source, pid) = crate::ffi::frontmost_app_info();
+            let source_key = if pid > 0 {
+                let id = unsafe { crate::window_collector::resolve_app_identity(pid) };
+                let key = id.key.clone();
+                let _ = crate::window_collector::extract_small_icon(pid);
+                key
+            } else {
+                String::new()
+            };
             let mut hist = CLIP_HISTORY.lock().unwrap();
-            if record_text(&mut hist, &text, max_entries()) {
+            if record_text(&mut hist, &text, &source, &source_key, max_entries()) {
                 log_debug!(
                     "[clip] recorded text ({} chars, total {})",
                     text.chars().count(),
@@ -1481,120 +1563,145 @@ unsafe fn rebuild_rows() {
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
 
     let sel_idx = *PICKER_SELECTION.lock().unwrap();
+    // 读一次配置:标题栏里是否显示应用名(标题栏本身恒在,承载图钉/删除图标)。
+    // Read the toggle once: whether the header bar shows the app name (the header itself is
+    // always present, hosting the pin/delete icons).
+    let show_source = show_source_app();
     for (i, &h_idx) in filtered.iter().enumerate() {
         let y = row_top(i, &pitches);
         // 日志只打索引/坐标,绝不打条目内容(隐私)。
         // Log the index/position only, NEVER the entry text (privacy).
         log_debug!("[clip] row {} created: y={}", i, y);
-        // 每行背景块:占满固定行距(行距 - 间距),行与行才整齐;选中行跳过(其按钮自带
-        // 强调色块,不叠双层)。先于按钮加入容器,保证按钮/选中块画在其上层。
-        // Per-row tile: fills the fixed pitch (pitch - gap) so rows stay even; skipped for the
-        // selected row (its button already carries the accent tile -- no double layer). Added
-        // to the container BEFORE the button so the button/accent tile draws on top.
-        if i != sel_idx {
-            let row_w = PICKER_W - PAD_X * 2.0 - PIN_BTN_W - DEL_BTN_W - 4.0;
-            let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
-            let tile: *mut AnyObject = msg_send![
-                tile,
-                initWithFrame: NSRect::new(NSPoint::new(PAD_X, y), NSSize::new(row_w, pitches[i] - ROW_GAP))
-            ];
-            let _: () = msg_send![tile, setWantsLayer: true];
-            let tile_layer: *mut AnyObject = msg_send![tile, layer];
-            let white: *mut AnyObject =
-                msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: ROW_TILE_ALPHA];
-            // layer_set_background 走 raw objc_msgSend(与选中块同款)。
-            // layer_set_background goes through raw objc_msgSend (same as the accent tile).
-            crate::ffi::layer_set_background(tile_layer, crate::ffi::ns_color_to_cg(white));
-            let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
-            let _: () = msg_send![container, addSubview: tile];
-            release_obj(tile);
-            tiles.push(ObjPtr(tile));
+        let row_w = PICKER_W - PAD_X * 2.0;
+        let entry = &hist[h_idx];
+        let selected = i == sel_idx;
+
+        // 卡片背景块:占满固定行距(行距 - 间距);选中行用强调色盖满整卡。
+        // The card tile: fills the fixed pitch (pitch - gap); the selected row gets the
+        // accent color across the whole card.
+        let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let tile: *mut AnyObject = msg_send![
+            tile,
+            initWithFrame: NSRect::new(NSPoint::new(PAD_X, y), NSSize::new(row_w, pitches[i] - ROW_GAP))
+        ];
+        let _: () = msg_send![tile, setWantsLayer: true];
+        let tile_layer: *mut AnyObject = msg_send![tile, layer];
+        let bg: *mut AnyObject = if selected {
+            // 选中 = 系统强调色半透明(明暗玻璃都清晰);colorWithAlphaComponent: 是 double。
+            // Selected = the system accent at partial alpha (legible on both glasses);
+            // colorWithAlphaComponent: takes a double.
+            let accent: *mut AnyObject = msg_send![class!(NSColor), controlAccentColor];
+            msg_send![accent, colorWithAlphaComponent: 0.35f64]
+        } else {
+            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: ROW_TILE_ALPHA]
+        };
+        // layer_set_background 走 raw objc_msgSend:objc2 的 msg_send! 无法编码
+        // CGColor 参数/返回(参数编码 '^{CGColor=}' 与 *mut c_void 的 '^v' 不匹配)。
+        // layer_set_background goes through raw objc_msgSend: objc2's msg_send! can't encode
+        // CGColor args/returns ('^{CGColor=}' vs '^v').
+        crate::ffi::layer_set_background(tile_layer, crate::ffi::ns_color_to_cg(bg));
+        let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
+        let _: () = msg_send![container, addSubview: tile];
+        release_obj(tile);
+        tiles.push(ObjPtr(tile));
+
+        // 标题栏:深色横条 + 应用名,只圆顶部两角(与卡片顶角贴合);整条可点击 = 粘贴,
+        // 悬停选中该行(与正文按钮同款行为)。
+        // Header bar: a darker strip + the app name, top corners rounded only (flush with the
+        // card's top); the whole strip is clickable = paste, hover selects (same as the body).
+        let header: *mut AnyObject = msg_send![row_button_class(), alloc];
+        let header: *mut AnyObject = msg_send![
+            header,
+            initWithFrame: NSRect::new(NSPoint::new(PAD_X, y), NSSize::new(row_w, HEADER_H))
+        ];
+        let _: () = msg_send![header, setBordered: false];
+        let _: () = msg_send![header, setAlignment: 0isize]; // left
+        let _: () = msg_send![header, setWantsLayer: true];
+        let h_layer: *mut AnyObject = msg_send![header, layer];
+        let h_bg: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: HEADER_BG_ALPHA];
+        crate::ffi::layer_set_background(h_layer, crate::ffi::ns_color_to_cg(h_bg));
+        let _: () = msg_send![h_layer, setCornerRadius: SEL_TILE_R];
+        // 只圆顶部两角(CALayerCornerMask: minXMinY = 1<<0, maxXMinY = 1<<1)。
+        // Round only the top corners (CALayerCornerMask: minXMinY = 1<<0, maxXMinY = 1<<1).
+        let _: () = msg_send![h_layer, setMaskedCorners: 3u64];
+        let h_title = header_title(entry, show_source);
+        let h_attr = make_header_title(&h_title);
+        let _: () = msg_send![header, setAttributedTitle: h_attr];
+        release_obj(h_attr);
+        // 来源应用小图标:开关开 + 有缓存键 + 小图存在 → 显示在名称左侧(16pt,
+        // 32px PNG 需 setSize 否则按 32pt 显示会溢出 22pt 标题栏)。
+        // The source app's small icon: toggle on + a cache key + the small PNG exists ->
+        // shown left of the name (16pt; a 32px PNG must be setSize'd or it renders at 32pt
+        // and overflows the 22pt header).
+        if show_source && !entry.source_key.is_empty() {
+            let icon_path = crate::window_collector::small_icon_path_for_key(&entry.source_key);
+            if std::path::Path::new(&icon_path).exists() {
+                let ns_path = make_nsstring(&icon_path);
+                let ns_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                let ns_image: *mut AnyObject = msg_send![ns_image, initWithContentsOfFile: ns_path];
+                CFRelease(ns_path as *const c_void);
+                if !ns_image.is_null() {
+                    let _: () = msg_send![ns_image, setSize: NSSize::new(16.0, 16.0)];
+                    let _: () = msg_send![header, setImage: ns_image];
+                    let _: () = msg_send![header, setImagePosition: 2isize]; // NSImageLeft
+                    release_obj(ns_image);
+                }
+            }
         }
-        let btn: *mut AnyObject = msg_send![row_button_class(), alloc];
-        // 行按钮高度 = 实际文本行数(紧凑包裹文本,顶对齐在固定行距的条目空间内)。
-        // Row-button height = the text's real line count (hugs the text, top-aligned inside
-        // the fixed-pitch slot).
-        let btn_h = row_button_height(text_lines(&hist[h_idx].text));
-        // 行按钮宽度右侧留出图钉 + 删除两个按钮区域。
-        // The row button's width leaves room for the pin and delete buttons on the right.
-        let btn: *mut AnyObject = msg_send![
-            btn,
+        let _: () = msg_send![header, setTag: i as isize];
+        let _: () = msg_send![header, setTarget: row_target()];
+        let _: () = msg_send![header, setAction: sel!(handleClipboardRowClick:)];
+        add_hover_tracking(header);
+        let _: () = msg_send![container, addSubview: header];
+        release_obj(header);
+        rows.push(ObjPtr(header));
+
+        // 正文按钮:标题栏下方,占满卡宽(图钉/删除已搬进标题栏,不再占宽度)。
+        // Body button: below the header, full card width (pin/delete moved into the header,
+        // no longer reserving width).
+        let body: *mut AnyObject = msg_send![row_button_class(), alloc];
+        let body_h = body_button_height(entry);
+        let body: *mut AnyObject = msg_send![
+            body,
             initWithFrame: NSRect::new(
-                NSPoint::new(PAD_X, y),
-                NSSize::new(
-                    PICKER_W - PAD_X * 2.0 - PIN_BTN_W - DEL_BTN_W - 4.0,
-                    btn_h
-                )
+                NSPoint::new(PAD_X, y + HEADER_H + BODY_GAP),
+                NSSize::new(row_w, body_h)
             )
         ];
-        let _: () = msg_send![btn, setBordered: false];
-        let _: () = msg_send![btn, setAlignment: 0isize]; // left
-                                                          // 裁剪:行文本渲染不得溢出按钮边界(否则会画进右侧图钉区域)。
-                                                          // Clip: the row text must not render outside the button (it would bleed into the
-                                                          // pin button's area on the right).
-        let _: () = msg_send![btn, setWantsLayer: true];
-        let btn_layer: *mut AnyObject = msg_send![btn, layer];
-        if !btn_layer.is_null() {
-            let _: () = msg_send![btn_layer, setMasksToBounds: true];
+        let _: () = msg_send![body, setBordered: false];
+        let _: () = msg_send![body, setAlignment: 0isize]; // left
+                                                           // 裁剪:行文本渲染不得溢出按钮边界(正文外还有标题栏/卡片边缘)。
+                                                           // Clip: the row text must not render outside the button.
+        let _: () = msg_send![body, setWantsLayer: true];
+        let body_layer: *mut AnyObject = msg_send![body, layer];
+        if !body_layer.is_null() {
+            let _: () = msg_send![body_layer, setMasksToBounds: true];
         }
         // 超长文本换行显示,最多 3 行(第 3 行超出截断加省略号)。
         // Long text wraps, up to 3 lines (truncated with an ellipsis on line 3).
-        let title = truncate_to_lines(&hist[h_idx].text, LINE_MAX_UNITS, MAX_TEXT_LINES);
-        let attr = make_row_attributed_title(&title, i == sel_idx);
-        let _: () = msg_send![btn, setAttributedTitle: attr];
+        let title = truncate_to_lines(&entry.text, LINE_MAX_UNITS, MAX_TEXT_LINES);
+        let attr = make_row_attributed_title(&title, selected);
+        let _: () = msg_send![body, setAttributedTitle: attr];
         release_obj(attr);
-        // 选中行:半透明白圆角背景块(与文字一起构成强对比)。
-        // Selected row: a semi-transparent white rounded tile behind the text.
-        if i == sel_idx {
-            let _: () = msg_send![btn, setWantsLayer: true];
-            let layer: *mut AnyObject = msg_send![btn, layer];
-            // 选中背景 = 系统强调色半透明:明暗界面都清晰(白字时代的固定 0.16 白块在
-            // 浅色玻璃上不可见)。colorWithAlphaComponent: 的参数是 double。
-            // Selected tile = the system accent color at partial alpha: legible on both light
-            // and dark glass (the old fixed 0.16-white tile vanished on light glass).
-            // colorWithAlphaComponent: takes a double.
-            let accent: *mut AnyObject = msg_send![class!(NSColor), controlAccentColor];
-            let accent_a: *mut AnyObject = msg_send![accent, colorWithAlphaComponent: 0.35f64];
-            // layer_set_background 走 raw objc_msgSend:objc2 的 msg_send! 无法编码
-            // CGColor 参数/返回(参数编码 '^{CGColor=}' 与 *mut c_void 的 '^v' 不匹配)。
-            // layer_set_background goes through raw objc_msgSend: objc2's msg_send! can't
-            // encode CGColor args/returns ('^{CGColor=}' vs '^v').
-            crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(accent_a));
-            let _: () = msg_send![layer, setCornerRadius: SEL_TILE_R];
-        }
-        // 行点击 → handleClipboardRowClick:(tag = 行索引)。
-        // Row click -> handleClipboardRowClick: (tag = row index).
-        let _: () = msg_send![btn, setTag: i as isize];
-        let _: () = msg_send![btn, setTarget: row_target()];
-        let _: () = msg_send![btn, setAction: sel!(handleClipboardRowClick:)];
-        // 悬停高亮:行按钮类重写 mouseEntered:,选中悬停行(与窗口切换浮窗一致)。
-        // Hover highlight: the row-button class overrides mouseEntered: to select the hovered
-        // row (same as the switcher overlay).
-        let opts: u64 = 0x02 | 0x40 | 0x100; // MouseEnteredAndExited | ActiveInKeyWindow | InVisibleRect
-        let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        let ta: *mut AnyObject = msg_send![
-            ta,
-            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
-            options: opts,
-            owner: btn,
-            userInfo: std::ptr::null::<AnyObject>()
-        ];
-        let _: () = msg_send![btn, addTrackingArea: ta];
-        release_obj(ta);
-        let _: () = msg_send![container, addSubview: btn];
-        release_obj(btn);
-        rows.push(ObjPtr(btn));
+        let _: () = msg_send![body, setTag: i as isize];
+        let _: () = msg_send![body, setTarget: row_target()];
+        let _: () = msg_send![body, setAction: sel!(handleClipboardRowClick:)];
+        add_hover_tracking(body);
+        let _: () = msg_send![container, addSubview: body];
+        release_obj(body);
+        rows.push(ObjPtr(body));
 
-        // 行内图钉按钮:置顶/取消置顶。独立于行按钮(点击图钉不会触发粘贴)。
-        // Per-row pin button: pin/unpin. Separate from the row button (clicking the pin does
-        // not paste).
+        // 行内图钉按钮:标题栏右侧,垂直居中。独立于行按钮(点击不会触发粘贴)。
+        // Per-row pin button: the header's right side, vertically centered. Separate from the
+        // row buttons (clicking the pin does not paste).
         let pin_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
         let pin_btn: *mut AnyObject = msg_send![
             pin_btn,
             initWithFrame: NSRect::new(
                 NSPoint::new(
                     PICKER_W - PAD_X - DEL_BTN_W - PIN_BTN_W - 2.0,
-                    y + (btn_h - PIN_BTN_H) / 2.0
+                    y + (HEADER_H - PIN_BTN_H) / 2.0
                 ),
                 NSSize::new(PIN_BTN_W, PIN_BTN_H)
             )
@@ -1612,11 +1719,7 @@ unsafe fn rebuild_rows() {
         CFRelease(empty_ns as *const c_void);
         // SF Symbol:置顶用 pin.fill,未置顶用 pin。
         // SF Symbol: pin.fill when pinned, pin otherwise.
-        let symbol = if hist[h_idx].pinned {
-            "pin.fill"
-        } else {
-            "pin"
-        };
+        let symbol = if entry.pinned { "pin.fill" } else { "pin" };
         let sym_ns = make_nsstring(symbol);
         let desc = make_nsstring("Pin");
         let img: *mut AnyObject = msg_send![
@@ -1643,14 +1746,14 @@ unsafe fn rebuild_rows() {
 
         // 行内删除按钮(Backspace 图标):单条删除。独立于行按钮(点击不会触发粘贴)。
         // Per-row delete button (the Backspace icon): removes the entry. Separate from the
-        // row button (clicking it does not paste).
+        // row buttons (clicking it does not paste).
         let del_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
         let del_btn: *mut AnyObject = msg_send![
             del_btn,
             initWithFrame: NSRect::new(
                 NSPoint::new(
                     PICKER_W - PAD_X - DEL_BTN_W,
-                    y + (btn_h - DEL_BTN_H) / 2.0
+                    y + (HEADER_H - DEL_BTN_H) / 2.0
                 ),
                 NSSize::new(DEL_BTN_W, DEL_BTN_H)
             )
@@ -2023,6 +2126,52 @@ unsafe fn make_row_attributed_title(title: &str, selected: bool) -> *mut AnyObje
     attr
 }
 
+/// 标题栏文字(attributed):10pt,次要色,在深色横条上可读;空串时整行留空。
+/// Header-bar text (attributed): 10pt, secondary color, legible on the darker strip; an
+/// empty string renders nothing.
+unsafe fn make_header_title(title: &str) -> *mut AnyObject {
+    if title.is_empty() {
+        let empty = make_nsstring("");
+        let attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+        let attr: *mut AnyObject = msg_send![attr, initWithString: empty];
+        CFRelease(empty as *const c_void);
+        return attr;
+    }
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+    let color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+    let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let attrs: *mut AnyObject = msg_send![attrs, init];
+    let font_key = make_nsstring("NSFont");
+    let color_key = make_nsstring("NSColor");
+    let _: () = msg_send![attrs, setObject: font, forKey: font_key];
+    let _: () = msg_send![attrs, setObject: color, forKey: color_key];
+    CFRelease(font_key as *const c_void);
+    CFRelease(color_key as *const c_void);
+    let ns_title = make_nsstring(title);
+    let attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let attr: *mut AnyObject = msg_send![attr, initWithString: ns_title, attributes: attrs];
+    CFRelease(ns_title as *const c_void);
+    release_obj(attrs);
+    attr
+}
+
+/// 给行内按钮(标题栏/正文)挂悬停跟踪区:悬停 = 选中该行(与窗口切换浮窗一致)。
+/// Attach a hover tracking area to a row button (header/body): hovering selects the row
+/// (same as the switcher overlay).
+unsafe fn add_hover_tracking(view: *mut AnyObject) {
+    let opts: u64 = 0x02 | 0x40 | 0x100; // MouseEnteredAndExited | ActiveInKeyWindow | InVisibleRect
+    let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let ta: *mut AnyObject = msg_send![
+        ta,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
+        options: opts,
+        owner: view,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![view, addTrackingArea: ta];
+    release_obj(ta);
+}
+
 /// 行按钮的 target(响应 handleClipboardRowClick:)。
 /// 单例:NSControl 的 setTarget: 是弱引用(不 retain),每次 rebuild 都 new 新实例会
 /// 永久泄漏;进程内只创建一次,实例存活到进程结束,按钮弱引用它始终有效。
@@ -2083,10 +2232,25 @@ pub(crate) fn smoke_runner() -> bool {
         // Inject 12 entries: more than the visible rows (10), covering the scroll-document
         // (NSScrollView) path.
         for i in 0..12 {
-            record_text(&mut hist, &format!("smoke entry {i:02}"), 50);
+            record_text(
+                &mut hist,
+                &format!("smoke entry {i:02}"),
+                "Ghostty",
+                "com.mitchellh.ghostty",
+                50,
+            );
         }
-        record_text(&mut hist, "apple pie recipe", 50);
-        record_text(&mut hist, "banana bread", 50);
+        record_text(
+            &mut hist,
+            "apple pie recipe",
+            "Safari",
+            "com.apple.Safari",
+            50,
+        );
+        record_text(&mut hist, "banana bread", "Chrome", "com.google.Chrome", 50);
+        // 无来源条目:标题栏应显示"未知来源",无图标。
+        // A source-less entry: the header shows "unknown source", no icon.
+        record_text(&mut hist, "legacy entry without a source", "", "", 50);
     }
     show_picker();
     hide_picker();
@@ -2195,12 +2359,39 @@ unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
 
 #[cfg(test)]
 mod tests {
-    use super::{record_text, ClipEntry};
+    use super::ClipEntry;
+
+    /// 测试用的 3 参便捷包装(来源与图标键留空,既有用例不受签名变化影响)。
+    /// A 3-arg convenience wrapper for tests (empty source and icon key; existing cases are
+    /// unaffected by the signature change).
+    fn record_text(h: &mut Vec<ClipEntry>, text: &str, max: usize) -> bool {
+        super::record_text(h, text, "", "", max)
+    }
 
     fn entry(text: &str) -> ClipEntry {
         ClipEntry {
             text: text.to_string(),
             pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+        }
+    }
+
+    fn entry_with_source(text: &str, source: &str) -> ClipEntry {
+        ClipEntry {
+            text: text.to_string(),
+            pinned: false,
+            source_app: source.to_string(),
+            source_key: String::new(),
+        }
+    }
+
+    fn entry_with_identity(text: &str, source: &str, key: &str) -> ClipEntry {
+        ClipEntry {
+            text: text.to_string(),
+            pinned: false,
+            source_app: source.to_string(),
+            source_key: key.to_string(),
         }
     }
 
@@ -2230,6 +2421,38 @@ mod tests {
         assert!(record_text(&mut h, "a", 50));
         assert_eq!(texts(&h), vec!["a", "b"]);
         assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn dedup_updates_the_source_to_the_latest_copy() {
+        // 同一文本从不同应用复制:去重移前时来源更新为最新复制的应用。
+        // Re-copying the same text from another app: the dedup move updates the source to the
+        // latest copy's app.
+        let mut h = Vec::new();
+        super::record_text(&mut h, "token", "Safari", "com.apple.Safari", 50);
+        assert_eq!(h[0].source_app, "Safari");
+        assert_eq!(h[0].source_key, "com.apple.Safari");
+        super::record_text(&mut h, "token", "Chrome", "com.google.Chrome", 50);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].source_app, "Chrome");
+        // 去重移前时图标键一并更新为最新来源。
+        // The dedup move also updates the icon key to the latest source.
+        assert_eq!(h[0].source_key, "com.google.Chrome");
+    }
+
+    #[test]
+    fn record_keeps_the_source_and_pin_moves_preserve_it() {
+        use super::pin_entry;
+        // 来源随条目走:置顶/移动不影响来源。
+        // The source travels with the entry: pin/move operations preserve it.
+        let mut h = Vec::new();
+        super::record_text(&mut h, "A", "Safari", "com.apple.Safari", 50);
+        super::record_text(&mut h, "B", "Chrome", "com.google.Chrome", 50);
+        pin_entry(&mut h, 0);
+        assert_eq!(h[0].text, "B");
+        assert_eq!(h[0].source_app, "Chrome");
+        assert_eq!(h[0].source_key, "com.google.Chrome");
+        assert_eq!(h[1].source_app, "Safari");
     }
 
     #[test]
@@ -2447,23 +2670,19 @@ mod tests {
     #[test]
     fn row_pitch_follows_line_count() {
         use super::{
-            compute_pitches, row_button_height, text_lines, ClipEntry, MAX_TEXT_LINES, ROW_GAP,
+            body_button_height, compute_pitches, row_button_height, text_lines, BODY_GAP, HEADER_H,
+            MAX_TEXT_LINES, ROW_GAP,
         };
-        // 固定行距:所有条目(长短文本)行距相同,等于 3 行高度 + 间距。
-        // Fixed pitch: every entry (short or long text) shares the same pitch = 3 lines + gap.
-        let texts = vec![
-            ClipEntry {
-                text: "short".into(),
-                pinned: false,
-            },
-            ClipEntry {
-                text: "长".repeat(100),
-                pinned: false,
-            },
-        ];
+        // 固定行距:所有条目(长短文本)行距相同 = 标题栏 + 3 行正文 + 行距。
+        // Fixed pitch: every entry (short or long text) shares the same pitch = header +
+        // 3 body lines + the row gap.
+        let texts = vec![entry("short"), entry(&"长".repeat(100))];
         let pitches = compute_pitches(&texts);
         assert_eq!(pitches[0], pitches[1]);
-        assert_eq!(pitches[0], row_button_height(MAX_TEXT_LINES) + ROW_GAP);
+        assert_eq!(
+            pitches[0],
+            HEADER_H + BODY_GAP + row_button_height(MAX_TEXT_LINES) + ROW_GAP
+        );
         // 按钮高 = 行数 * 行高 + 内边距。
         // Button height = lines * line height + padding.
         assert_eq!(
@@ -2477,6 +2696,35 @@ mod tests {
         // 100 个汉字(200 单位)> 3 行上限 → 3 行。
         // 100 hanzi (200 units) exceeds the 3-line cap -> 3 lines.
         assert_eq!(text_lines(&"长".repeat(100)), 3);
+        // 正文按钮高度只看正文行数,与来源无关(来源在标题栏里)。
+        // The body button height follows the text only; the source lives in the header.
+        let with_src = entry_with_source("short", "Safari");
+        assert_eq!(body_button_height(&with_src), row_button_height(1));
+        assert_eq!(
+            body_button_height(&entry(&"长".repeat(100))),
+            row_button_height(3)
+        );
+    }
+
+    #[test]
+    fn header_title_has_three_branches() {
+        use super::header_title;
+        // 开关开 + 有来源 → 应用名。
+        // Toggle on + a source -> the app name.
+        assert_eq!(
+            header_title(&entry_with_source("t", "Safari"), true),
+            "Safari"
+        );
+        // 开关开 + 无来源 → "未知来源"。
+        // Toggle on + no source -> "unknown source".
+        assert_eq!(
+            header_title(&entry("t"), true),
+            super::t("clipboard.unknown_source")
+        );
+        // 开关关 → 空(横条只放图标)。
+        // Toggle off -> empty (the strip only hosts the icons).
+        assert_eq!(header_title(&entry_with_source("t", "Safari"), false), "");
+        assert_eq!(header_title(&entry("t"), false), "");
     }
 
     #[test]

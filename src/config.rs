@@ -134,6 +134,11 @@ pub struct ClipboardSection {
     // 历史最大条数(1..=100,默认 50)。第一版仅内存,不持久化。
     // Max history entries (1..=100, default 50). v1 is in-memory only, no persistence.
     pub max_entries: u32,
+    // 显示来源应用:复制时始终记录来源(ClipEntry.source_app),此开关只控制是否在
+    // 条目里显示应用名。默认 false。
+    // Show the source app: the source is ALWAYS recorded at copy time (ClipEntry.source_app);
+    // this switch only controls whether the row displays the app name. Default false.
+    pub show_source_app: bool,
 }
 
 impl Default for ClipboardSection {
@@ -141,6 +146,7 @@ impl Default for ClipboardSection {
         Self {
             enabled: false,
             max_entries: 50,
+            show_source_app: false,
         }
     }
 }
@@ -818,6 +824,9 @@ impl Config {
         // clipboard (enabled 恒有效;max_entries 有校验)
         // clipboard (enabled always valid; max_entries is validated)
         self.clipboard.enabled = other.clipboard.enabled;
+        // show_source_app 是布尔,恒有效。
+        // show_source_app is a bool, always valid.
+        self.clipboard.show_source_app = other.clipboard.show_source_app;
         if !errs.iter().any(|e| e.starts_with("clipboard.max_entries")) {
             self.clipboard.max_entries = other.clipboard.max_entries;
         }

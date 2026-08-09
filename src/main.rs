@@ -39,8 +39,9 @@ use std::thread;
 
 use event_monitor::{start as start_event_monitor, GlobalEvent};
 use window_collector::{
-    bump_window_mru, cache_running_app_icons, ensure_icon_cache_dir, extract_icon_to_cache,
-    focused_window_cgwid, migrate_legacy_cache, note_app_activated, MruMap, WindowInfo,
+    bump_window_mru, cache_running_app_icons, cache_running_app_icons_small, ensure_icon_cache_dir,
+    extract_icon_to_cache, focused_window_cgwid, migrate_legacy_cache, note_app_activated, MruMap,
+    WindowInfo,
 };
 
 // FFI 声明与 ObjC 桥接基础工具已移至 `ffi.rs` / FFI declarations and ObjC bridging primitives moved to `ffi.rs`
@@ -996,6 +997,12 @@ fn main() {
     // the new version and just take up space.
     migrate_legacy_cache();
     cache_running_app_icons(); // pre-warm icon cache for all running apps
+                               // 剪贴板标题栏小图标预热:仅当剪贴板功能开启时才生成,否则跳过(避免无谓的提取)。
+                               // Pre-warm the clipboard header's small icons: only when the clipboard feature is enabled,
+                               // otherwise skip (no point extracting for a disabled feature).
+    if CONFIG.read().unwrap().clipboard.enabled {
+        cache_running_app_icons_small();
+    }
 
     // 4b. Force CONFIG to initialise and report any validation errors
     {

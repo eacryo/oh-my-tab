@@ -70,6 +70,7 @@ struct SettingsUi {
     disable_pointer_accel: *mut AnyObject,  // NSSwitch: 禁用指针加速 / disable pointer acceleration
     clipboard_enabled: *mut AnyObject,      // NSSwitch: 启用剪贴板历史 / enable clipboard history
     clipboard_max_entries: *mut AnyObject,  // NSTextField: 历史最大条数 / max history entries
+    clipboard_show_source_app: *mut AnyObject, // NSSwitch: 显示来源应用 / show the source app
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
@@ -1060,6 +1061,10 @@ fn load_settings_from(cfg: &Config) {
             ui.clipboard_enabled,
             setState: if cfg.clipboard.enabled { 1isize } else { 0isize }
         ];
+        let _: () = msg_send![
+            ui.clipboard_show_source_app,
+            setState: if cfg.clipboard.show_source_app { 1isize } else { 0isize }
+        ];
         set_field(
             ui.clipboard_max_entries,
             cfg.clipboard.max_entries.to_string(),
@@ -1255,6 +1260,8 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // Clipboard page (global config, not per-device).
         let cb_state: isize = msg_send![ui.clipboard_enabled, state];
         cfg.clipboard.enabled = cb_state == 1;
+        let src_state: isize = msg_send![ui.clipboard_show_source_app, state];
+        cfg.clipboard.show_source_app = src_state == 1;
         match parse_usize(&nsstring_to_rust(msg_send![
             ui.clipboard_max_entries,
             stringValue
@@ -1552,6 +1559,7 @@ fn create_settings_window() {
             disable_pointer_accel: std::ptr::null_mut(),
             clipboard_enabled: std::ptr::null_mut(),
             clipboard_max_entries: std::ptr::null_mut(),
+            clipboard_show_source_app: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
             ok_button: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
@@ -2238,6 +2246,17 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_clipboard_enabled"),
+            make_switch(ctrl_x + ctrl_w, cy, row_h, false),
+        );
+        cy -= 8.0 + row_h;
+        // 显示来源应用 / show the source app.
+        ui.clipboard_show_source_app = add_row(
+            clipboard_view,
+            label_x,
+            cy,
+            label_w,
+            row_h,
+            &t("settings.row_clipboard_show_source_app"),
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
         cy -= 8.0 + row_h;

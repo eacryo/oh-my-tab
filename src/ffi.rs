@@ -129,6 +129,40 @@ pub(crate) unsafe fn nsstring_to_rust(ns: *mut AnyObject) -> String {
         .into_owned()
 }
 
+// ========== 应用名 / app names ==========
+
+/// 取 NSRunningApplication 的 localizedName(UTF-8 规范化,空 = 失败)。
+/// 窗口切换(图标缓存)与剪贴板(来源应用)共用,避免各自手写 UTF8String 转换。
+/// The NSRunningApplication's localizedName (canonical UTF-8; empty = failure). Shared by the
+/// window switcher (icon cache) and the clipboard (source app), so the UTF8String conversion
+/// isn't hand-rolled twice.
+pub(crate) unsafe fn ns_running_app_name(app: *mut AnyObject) -> String {
+    if app.is_null() {
+        return String::new();
+    }
+    let name: *mut AnyObject = msg_send![app, localizedName];
+    nsstring_to_rust(name)
+}
+
+/// 当前前台应用的 (名称, pid)。剪贴板记录来源时一次拿全:名称用于标题栏文字,
+/// pid 用于解析图标缓存身份(resolve_app_identity)并提取小图标。
+/// The frontmost app as (name, pid). The clipboard grabs both in one lookup at record time:
+/// the name feeds the header text, the pid resolves the icon-cache identity
+/// (resolve_app_identity) and extracts the small icon.
+pub(crate) fn frontmost_app_info() -> (String, i32) {
+    unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+        let name = ns_running_app_name(app);
+        let pid: i32 = if app.is_null() {
+            -1
+        } else {
+            msg_send![app, processIdentifier]
+        };
+        (name, pid)
+    }
+}
+
 // ========== 颜色 / 图层 helper ==========
 
 /// hex u32 -> NSColor。
