@@ -42,6 +42,14 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 /// 剪贴板文本类型(与 NSPasteboardTypeString 相同)。
 /// The plain-text pasteboard type (same as NSPasteboardTypeString).
 const NSPASTEBOARD_TYPE_STRING: &str = "public.utf8-plain-text";
+/// 剪贴板 PNG 图片类型(与 NSPasteboardTypePNG 相同)。
+/// The pasteboard PNG type (same as NSPasteboardTypePNG).
+const NSPASTEBOARD_TYPE_PNG: &str = "public.png";
+/// 剪贴板 TIFF 图片类型(无 PNG 时回退转换用,与 NSPasteboardTypeTIFF 相同)。
+/// The pasteboard TIFF type (fallback conversion when no PNG, same as NSPasteboardTypeTIFF).
+const NSPASTEBOARD_TYPE_TIFF: &str = "public.tiff";
+/// 图片缩略图正文区高度 / the image thumbnail's body height.
+const IMG_PREVIEW_H: f64 = 64.0;
 /// 模拟粘贴用的 V 键码 / keycode used when synthesizing Cmd+V.
 const VK_V: u16 = 9;
 /// 模拟粘贴用的 Command 修饰掩码 / Command modifier mask for synthesized paste.
@@ -314,11 +322,21 @@ fn body_button_height(entry: &ClipEntry) -> f64 {
 /// lines: the list height stays even, and short-text buttons hug their text, top-aligned
 /// inside the slot.
 fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
-    // 标题栏 + 间隙 + 3 行正文 + 行距。
-    // Header + gap + 3 body lines + row gap.
-    let fixed_pitch = HEADER_H + BODY_GAP + row_button_height(MAX_TEXT_LINES) + ROW_GAP;
-    let _ = texts;
-    texts.iter().map(|_| fixed_pitch).collect()
+    // 文本行:标题栏 + 间隙 + 3 行正文 + 行距;图片行:标题栏 + 间隙 + 缩略图 + 行距。
+    // 混排时可见行数按首行行距估算(show_picker),±1 行近似,第一版接受。
+    // Text rows: header + gap + 3 body lines + row gap; image rows: header + gap +
+    // thumbnail + row gap. With mixed lists the visible-row estimate (show_picker) uses the
+    // first row's pitch -- within ±1 row, accepted for v1.
+    texts
+        .iter()
+        .map(|e| {
+            if e.image_png.is_some() {
+                HEADER_H + BODY_GAP + IMG_PREVIEW_H + ROW_GAP
+            } else {
+                HEADER_H + BODY_GAP + row_button_height(MAX_TEXT_LINES) + ROW_GAP
+            }
+        })
+        .collect()
 }
 
 /// 固定头部条高度:顶部留白 + 搜索框/清除按钮行 + 与列表的间距。
@@ -351,6 +369,12 @@ fn row_top(idx: usize, pitches: &[f64]) -> f64 {
 #[derive(Debug, Clone, PartialEq)]
 struct ClipEntry {
     text: String,
+    /// PNG 编码的图片数据(图片条目;文本条目为 None)。图文同存时文本优先,
+    /// 图片仅在剪贴板无文本时记录。
+    /// PNG-encoded image data (image entries; None for text entries). When both text and an
+    /// image are on the pasteboard, text wins -- images are only recorded when there is no
+    /// text.
+    image_png: Option<Vec<u8>>,
     pinned: bool,
     /// 复制该文本时的前台应用名(空 = 未知,如旧条目/取不到前台应用)。
     /// The frontmost app name when the text was copied (empty = unknown, e.g. legacy entries
@@ -362,6 +386,62 @@ struct ClipEntry {
     /// pid). Empty = no identity (e.g. legacy entries) -> no icon in the header.
     source_key: String,
 }
+
+/// FNV-1a 64 位哈希:图片去重用(比较 PNG 字节内容,不比较字符串)。
+/// FNV-1a 64-bit hash: image dedup (compares the PNG bytes, not a string).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/*
+【第二阶段】图片内容哈希:解码 PNG → 画成 16x16 缩略图 → 对 TIFF 字节做 FNV-1a。
+同一张图即使被应用重新编码(字节不同)也得到相同哈希;解码失败回退原始字节哈希。
+第一阶段暂不使用(去重只按原始字节哈希,同图不同编码的去重留待后续启用)。
+启用时:去掉本块注释,并在 record_image 里恢复 image_content_hash 调用与
+ClipEntry.image_hash 字段(结构体、record_text、record_image、测试 helper 同步补回)。
+
+[PHASE 2] Image CONTENT hash: decode the PNG -> draw a 16x16 thumbnail -> FNV-1a over
+its TIFF bytes. Re-encoded copies of the same image (different bytes) hash identically;
+decoding failures fall back to the raw-byte hash. Deferred: phase 1 dedups by the raw
+byte hash only (cross-encoding dedup waits for this). To enable: uncomment this block and
+restore the image_content_hash call + the ClipEntry.image_hash field in record_image
+(also in the struct, record_text, and the test helpers).
+unsafe fn image_content_hash(png: &[u8]) -> u64 {
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: png.as_ptr() as *const c_void,
+        length: png.len()
+    ];
+    let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let img: *mut AnyObject = msg_send![img, initWithData: data];
+    if img.is_null() {
+        return fnv1a64(png);
+    }
+    let thumb: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let thumb: *mut AnyObject = msg_send![thumb, initWithSize: NSSize::new(16.0, 16.0)];
+    let _: () = msg_send![thumb, lockFocus];
+    let dst = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(16.0, 16.0));
+    let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+    let op: usize = 1; // NSCompositingOperationCopy
+    let _: () = msg_send![img, drawInRect: dst, fromRect: src, operation: op, fraction: 1.0f64];
+    let _: () = msg_send![thumb, unlockFocus];
+    let tiff: *mut AnyObject = msg_send![thumb, TIFFRepresentation];
+    if tiff.is_null() {
+        return fnv1a64(png);
+    }
+    let len: usize = msg_send![tiff, length];
+    let ptr: *const c_void = msg_send![tiff, bytes];
+    if ptr.is_null() || len == 0 {
+        return fnv1a64(png);
+    }
+    fnv1a64(std::slice::from_raw_parts(ptr as *const u8, len))
+}
+*/
 
 /// 新条目(非置顶)应插入的位置:置顶区之后(第一个非置顶条目的下标)。
 /// The insertion index for a new (unpinned) entry: right after the pinned block.
@@ -430,6 +510,60 @@ fn record_text(
         pos,
         ClipEntry {
             text: text.to_string(),
+            image_png: None,
+            pinned: false,
+            source_app: source.to_string(),
+            source_key: source_key.to_string(),
+        },
+    );
+    if history.len() > max {
+        history.truncate(max);
+    }
+    true
+}
+
+/// 把一张 PNG 记入历史。规则与 record_text 一致,但查重按 PNG 原始字节哈希:
+/// - 空数据忽略
+/// - 字节哈希已存在 → 旧条目提到最前(保留置顶),来源更新为本次复制来源
+/// - 未命中 → 新条目(text 为空串,image_png = 数据)插到置顶区之后;超出 max 裁剪
+///   同图不同编码的去重留待第二阶段(见被注释的 image_content_hash)。
+///
+/// Record a PNG image into the history. Same rules as record_text, but dedup compares the
+/// raw PNG byte hash:
+/// - empty data is ignored
+/// - an existing byte hash -> the old entry moves to the front (pinned kept), the source
+///   updates
+/// - a new image (empty text, image_png = the data) is inserted after the pinned block;
+///   entries beyond `max` are trimmed (cross-encoding dedup waits for phase 2, see the
+///   commented-out image_content_hash).
+fn record_image(
+    history: &mut Vec<ClipEntry>,
+    png: &[u8],
+    source: &str,
+    source_key: &str,
+    max: usize,
+) -> bool {
+    if png.is_empty() || max == 0 {
+        return false;
+    }
+    let hash = fnv1a64(png);
+    if let Some(idx) = history.iter().position(|e| {
+        e.image_png
+            .as_deref()
+            .map(|d| fnv1a64(d) == hash)
+            .unwrap_or(false)
+    }) {
+        history[idx].source_app = source.to_string();
+        history[idx].source_key = source_key.to_string();
+        move_entry_to_front(history, idx);
+        return true;
+    }
+    let pos = insert_position(history);
+    history.insert(
+        pos,
+        ClipEntry {
+            text: String::new(),
+            image_png: Some(png.to_vec()),
             pinned: false,
             source_app: source.to_string(),
             source_key: source_key.to_string(),
@@ -519,6 +653,145 @@ unsafe fn read_pasteboard_text() -> Option<String> {
     }
     Some(nsstring_to_rust(s))
 }
+
+/// 读当前剪贴板图片(PNG 字节;无图片/解码失败返回 None)。
+/// 优先直接取 PNG;只有 TIFF 时经 NSBitmapImageRep 转成 PNG。
+/// Read the pasteboard's image as PNG bytes (None when absent or undecodable). PNG is taken
+/// directly; a bare TIFF goes through NSBitmapImageRep for conversion.
+unsafe fn read_pasteboard_png() -> Option<Vec<u8>> {
+    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pb.is_null() {
+        return None;
+    }
+    // NSData -> 字节:dataForType: 返回 NSData,取 bytes/length 拷进 Rust Vec。
+    // NSData -> bytes: dataForType: returns NSData; grab bytes/length into a Rust Vec.
+    let bytes_for_type = |t: &str| -> Option<Vec<u8>> {
+        let type_ns = make_nsstring(t);
+        let data: *mut AnyObject = msg_send![pb, dataForType: type_ns];
+        CFRelease(type_ns as *const c_void);
+        if data.is_null() {
+            return None;
+        }
+        let len: usize = msg_send![data, length];
+        let ptr: *const c_void = msg_send![data, bytes];
+        if ptr.is_null() || len == 0 {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
+    };
+    if let Some(png) = bytes_for_type(NSPASTEBOARD_TYPE_PNG) {
+        return Some(png);
+    }
+    let tiff = bytes_for_type(NSPASTEBOARD_TYPE_TIFF)?;
+    // TIFF -> PNG:NSBitmapImageRep imageRepWithData: -> representationUsingType PNG(4)。
+    // TIFF -> PNG: NSBitmapImageRep imageRepWithData: -> representationUsingType PNG (4).
+    let data: *mut AnyObject = msg_send![class!(NSData), dataWithBytes: tiff.as_ptr() as *const c_void, length: tiff.len()];
+    let rep: *mut AnyObject = msg_send![class!(NSBitmapImageRep), imageRepWithData: data];
+    if rep.is_null() {
+        return None;
+    }
+    let png: *mut AnyObject =
+        msg_send![rep, representationUsingType: 4u64, properties: std::ptr::null::<AnyObject>()];
+    if png.is_null() {
+        return None;
+    }
+    let len: usize = msg_send![png, length];
+    let ptr: *const c_void = msg_send![png, bytes];
+    if ptr.is_null() || len == 0 {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
+}
+
+/// 文件扩展名是否为图片类型(小写匹配)。/ Whether a file extension denotes an image.
+fn is_image_extension(path: &str) -> bool {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "tiff" | "tif" | "webp" | "heic" | "heif" | "bmp"
+    )
+}
+
+/// 图片文件复制(Finder 里 Cmd+C 一个图片文件):剪贴板上只有文件名文本 + 一个
+/// `public.file-url`。识别条件:file-url 存在,且文本恰好等于该文件的文件名——这时按
+/// "文件复制"处理,读出图片内容(已是 PNG 直接用,其它格式经 NSImage 转 PNG),
+/// 让用户复制的图片文件记成图片条目,而不是孤零零的文件名。
+/// 非图片文件 / 文本与文件名不符 / 多文件 → None(走原文本逻辑)。
+/// An image-FILE copy (Cmd+C on an image file in Finder): the pasteboard carries only the
+/// filename as text plus a `public.file-url`. Recognition: a file-url exists AND the text is
+/// exactly that file's name -- then it is a FILE copy: the image content is read (PNG is
+/// used as-is, other formats are converted via NSImage), so the copied image file lands as
+/// an image entry instead of a bare filename. Non-image files / text/name mismatch /
+/// multiple files -> None (fall back to the text path).
+unsafe fn file_copy_image_png(text: &str) -> Option<Vec<u8>> {
+    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pb.is_null() {
+        return None;
+    }
+    let url_type = make_nsstring("public.file-url");
+    let url_str_obj: *mut AnyObject = msg_send![pb, stringForType: url_type];
+    CFRelease(url_type as *const c_void);
+    if url_str_obj.is_null() {
+        return None;
+    }
+    let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_str_obj];
+    if url.is_null() {
+        return None;
+    }
+    let path_obj: *mut AnyObject = msg_send![url, path];
+    if path_obj.is_null() {
+        return None;
+    }
+    let path = nsstring_to_rust(path_obj);
+    // 文本必须等于文件名:否则是普通文本复制(碰巧带了 file-url)。
+    // The text must equal the file's name: otherwise it is a normal text copy that happens
+    // to carry a file-url.
+    let name = path.rsplit('/').next().unwrap_or("");
+    if name != text {
+        return None;
+    }
+    if !is_image_extension(&path) {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    if path.to_ascii_lowercase().ends_with(".png") {
+        return Some(bytes);
+    }
+    // 非 PNG 图片格式 → NSImage → PNG 转码(与 TIFF 转码同款管线)。
+    // Non-PNG image formats -> NSImage -> PNG conversion (same pipeline as the TIFF path).
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: bytes.as_ptr() as *const c_void,
+        length: bytes.len()
+    ];
+    let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let img: *mut AnyObject = msg_send![img, initWithData: data];
+    if img.is_null() {
+        return None;
+    }
+    let tiff: *mut AnyObject = msg_send![img, TIFFRepresentation];
+    if tiff.is_null() {
+        return None;
+    }
+    let rep: *mut AnyObject = msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff];
+    if rep.is_null() {
+        return None;
+    }
+    let png: *mut AnyObject =
+        msg_send![rep, representationUsingType: 4u64, properties: std::ptr::null::<AnyObject>()];
+    if png.is_null() {
+        return None;
+    }
+    let len: usize = msg_send![png, length];
+    let ptr: *const c_void = msg_send![png, bytes];
+    if ptr.is_null() || len == 0 {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
+}
 /// 把文本写回剪贴板(粘贴路径)。写回会 bump changeCount,下次轮询读到的是本文本,
 /// 但 record_text 的去重(与栈顶相同)会忽略它,不会产生重复条目。
 /// Write text back to the pasteboard (the paste path). This bumps changeCount; the next poll
@@ -546,6 +819,30 @@ unsafe fn write_pasteboard_text(text: &str) {
     );
     CFRelease(type_ns as *const c_void);
     CFRelease(ns as *const c_void);
+}
+
+/// 把 PNG 图片写回剪贴板(图片粘贴路径)。同样先 clearContents 再 setData。
+/// Write a PNG image back to the pasteboard (the image paste path). Same clearContents
+/// then setData flow.
+unsafe fn write_pasteboard_png(png: &[u8]) {
+    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pb.is_null() {
+        return;
+    }
+    let _: isize = msg_send![pb, clearContents];
+    let type_ns = make_nsstring(NSPASTEBOARD_TYPE_PNG);
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: png.as_ptr() as *const c_void,
+        length: png.len()
+    ];
+    let ok: bool = msg_send![pb, setData: data, forType: type_ns];
+    log_debug!(
+        "[clip] write back image ({} bytes, setData ok={})",
+        png.len(),
+        ok
+    );
+    CFRelease(type_ns as *const c_void);
 }
 
 // ========== 轮询 / polling ==========
@@ -603,7 +900,22 @@ fn poll_clipboard() {
                 String::new()
             };
             let mut hist = CLIP_HISTORY.lock().unwrap();
-            if record_text(&mut hist, &text, &source, &source_key, max_entries()) {
+            // 图片文件复制(Finder 里 Cmd+C 图片文件):识别为文件复制 → 记成图片条目;
+            // 否则按普通文本记录。
+            // An image-FILE copy (Cmd+C on an image file in Finder): recognized as a file
+            // copy -> recorded as an image entry; otherwise recorded as plain text.
+            let file_png = unsafe { file_copy_image_png(&text) };
+            if let Some(png) = file_png {
+                if record_image(&mut hist, &png, &source, &source_key, max_entries()) {
+                    log_debug!(
+                        "[clip] recorded image from file ({} bytes, total {})",
+                        png.len(),
+                        hist.len()
+                    );
+                } else {
+                    log_debug!("[clip] change skipped: dup image ({} bytes)", png.len());
+                }
+            } else if record_text(&mut hist, &text, &source, &source_key, max_entries()) {
                 log_debug!(
                     "[clip] recorded text ({} chars, total {})",
                     text.chars().count(),
@@ -617,7 +929,32 @@ fn poll_clipboard() {
                 );
             }
         }
-        None => log_debug!("[clip] change but no text (non-text paste?)"),
+        // 无文本 → 尝试图片(图文同存时文本优先,第一版取舍)。
+        // No text -> try an image (text wins when both are present; a v1 tradeoff).
+        None => match unsafe { read_pasteboard_png() } {
+            Some(png) => {
+                let (source, pid) = crate::ffi::frontmost_app_info();
+                let source_key = if pid > 0 {
+                    let id = unsafe { crate::window_collector::resolve_app_identity(pid) };
+                    let key = id.key.clone();
+                    let _ = crate::window_collector::extract_small_icon(pid);
+                    key
+                } else {
+                    String::new()
+                };
+                let mut hist = CLIP_HISTORY.lock().unwrap();
+                if record_image(&mut hist, &png, &source, &source_key, max_entries()) {
+                    log_debug!(
+                        "[clip] recorded image ({} bytes, total {})",
+                        png.len(),
+                        hist.len()
+                    );
+                } else {
+                    log_debug!("[clip] change skipped: dup image ({} bytes)", png.len());
+                }
+            }
+            None => log_debug!("[clip] change but no text/image (non-pasteboard content?)"),
+        },
     }
 }
 
@@ -1918,10 +2255,17 @@ unsafe fn rebuild_rows() {
         rows.push(ObjPtr(header));
 
         // 正文按钮:标题栏下方,占满卡宽(图钉/删除已搬进标题栏,不再占宽度)。
+        // 图片条目 = 缩略图按钮(等比缩放的图,点击同样粘贴);文本条目 = 文字按钮。
         // Body button: below the header, full card width (pin/delete moved into the header,
-        // no longer reserving width).
+        // no longer reserving width). Image entries = a thumbnail button (proportionally
+        // scaled, clicking pastes too); text entries = the text button.
         let body: *mut AnyObject = msg_send![row_button_class(), alloc];
-        let body_h = body_button_height(entry);
+        let is_image = entry.image_png.is_some();
+        let body_h = if is_image {
+            IMG_PREVIEW_H
+        } else {
+            body_button_height(entry)
+        };
         let body: *mut AnyObject = msg_send![
             body,
             initWithFrame: NSRect::new(
@@ -1938,12 +2282,77 @@ unsafe fn rebuild_rows() {
         if !body_layer.is_null() {
             let _: () = msg_send![body_layer, setMasksToBounds: true];
         }
-        // 超长文本换行显示,最多 3 行(第 3 行超出截断加省略号)。
-        // Long text wraps, up to 3 lines (truncated with an ellipsis on line 3).
-        let title = truncate_to_lines(&entry.text, LINE_MAX_UNITS, MAX_TEXT_LINES);
-        let attr = make_row_attributed_title(&title, selected);
-        let _: () = msg_send![body, setAttributedTitle: attr];
-        release_obj(attr);
+        if is_image {
+            // 缩略图:PNG 字节 → NSImage。**预缩放**后挂到按钮:按钮 cell 对大图按原生
+            // 尺寸绘制再裁剪(实测只显示左上角一部分),而 setImageScaling: 不生效;
+            // 把原图画进适配尺寸的目标 NSImage,图片点尺寸恰好等于按钮 frame,
+            // cell 无需任何缩放逻辑,整图按原比例显示。
+            // The thumbnail: PNG bytes -> NSImage, PRE-SCALED onto the button: the button's
+            // cell draws large images at native size and crops them (measured: only the
+            // top-left shows), and setImageScaling: has no effect; drawing the source into a
+            // target NSImage sized to the fit makes the image's point size exactly the
+            // button's frame, so the cell scales nothing and the whole image shows at its
+            // real proportions.
+            if let Some(png) = &entry.image_png {
+                let data: *mut AnyObject = msg_send![
+                    class!(NSData),
+                    dataWithBytes: png.as_ptr() as *const c_void,
+                    length: png.len()
+                ];
+                let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                let image: *mut AnyObject = msg_send![image, initWithData: data];
+                if !image.is_null() {
+                    let img_size: NSSize = msg_send![image, size];
+                    let avail_w = row_w - BODY_PAD_X * 2.0;
+                    if img_size.width > 0.0 && img_size.height > 0.0 {
+                        // 等比适配可用区域(宽 IMG_PREVIEW_H 高),居中放置。
+                        // Fit proportionally into the available area (IMG_PREVIEW_H tall),
+                        // centered.
+                        let fit_scale =
+                            (avail_w / img_size.width).min(IMG_PREVIEW_H / img_size.height);
+                        let fit_w = img_size.width * fit_scale;
+                        let fit_h = img_size.height * fit_scale;
+                        let _: () = msg_send![
+                            body,
+                            setFrameOrigin: NSPoint::new(
+                                PAD_X + BODY_PAD_X,
+                                y + HEADER_H + BODY_GAP + (IMG_PREVIEW_H - fit_h) / 2.0
+                            )
+                        ];
+                        let _: () = msg_send![body, setFrameSize: NSSize::new(fit_w, fit_h)];
+                        // 预缩放:原图 → fit 尺寸目标图(与图标提取同款 lockFocus 管线)。
+                        // Pre-scale: the source -> a fit-sized target (the same lockFocus
+                        // pipeline as the icon extraction).
+                        let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                        let target: *mut AnyObject =
+                            msg_send![target, initWithSize: NSSize::new(fit_w, fit_h)];
+                        let _: () = msg_send![target, lockFocus];
+                        let dst = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(fit_w, fit_h));
+                        let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+                        let op: usize = 1; // NSCompositingOperationCopy
+                        let _: () = msg_send![
+                            image,
+                            drawInRect: dst,
+                            fromRect: src,
+                            operation: op,
+                            fraction: 1.0f64
+                        ];
+                        let _: () = msg_send![target, unlockFocus];
+                        let _: () = msg_send![body, setImage: target];
+                        let _: () = msg_send![body, setImagePosition: 1isize]; // NSImageOnly
+                        release_obj(target);
+                    }
+                    release_obj(image);
+                }
+            }
+        } else {
+            // 超长文本换行显示,最多 3 行(第 3 行超出截断加省略号)。
+            // Long text wraps, up to 3 lines (truncated with an ellipsis on line 3).
+            let title = truncate_to_lines(&entry.text, LINE_MAX_UNITS, MAX_TEXT_LINES);
+            let attr = make_row_attributed_title(&title, selected);
+            let _: () = msg_send![body, setAttributedTitle: attr];
+            release_obj(attr);
+        }
         let _: () = msg_send![body, setTag: i as isize];
         let _: () = msg_send![body, setTarget: row_target()];
         let _: () = msg_send![body, setAction: sel!(handleClipboardRowClick:)];
@@ -2256,46 +2665,49 @@ fn paste_at(idx: usize) {
         hide_picker();
         return;
     };
-    let text = {
+    let entry = {
         let hist = CLIP_HISTORY.lock().unwrap();
-        hist.get(h_idx).map(|e| e.text.clone())
+        hist.get(h_idx).cloned()
     };
-    match text {
-        Some(t) => {
-            // 日志只打索引,绝不打粘贴内容(隐私)。
-            // Log the index only, NEVER the pasted text (privacy).
-            log_debug!("[clip] paste_at idx={}", idx);
-            // 必须先关闭浮窗再合成 Cmd+V:浮窗是 key window(NonactivatingPanel +
-            // makeKeyWindow),此时合成键盘事件会被路由给浮窗所属的 app(我们自己),
-            // 输入框收不到;orderOut 后面板失去 key,系统 key window 回归原应用,
-            // 合成事件才能到达用户原来的输入框。
-            // Close the picker BEFORE synthesizing Cmd+V: the panel is the key window
-            // (NonactivatingPanel + makeKeyWindow), so a synthesized key event would be
-            // routed to the panel's app (us) and never reach the input field; once ordered
-            // out, the panel resigns key, the system key window returns to the previous app,
-            // and the synthesized Cmd+V lands in the user's input field.
-            hide_picker();
-            unsafe {
-                write_pasteboard_text(&t);
-                // 合成 Cmd+V(keyDown + keyUp),post 到 session 层。
-                // Synthesize Cmd+V (keyDown + keyUp), posted at the session level.
-                let down = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, true);
-                if !down.is_null() {
-                    CGEventSetFlags(down, K_CG_EVENT_FLAG_MASK_COMMAND);
-                    CGEventPost(K_CG_SESSION_EVENT_TAP, down);
-                }
-                let up = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, false);
-                if !up.is_null() {
-                    CGEventSetFlags(up, K_CG_EVENT_FLAG_MASK_COMMAND);
-                    CGEventPost(K_CG_SESSION_EVENT_TAP, up);
-                }
-            }
-            log_debug!("[clip] pasted entry {}", idx);
+    let Some(entry) = entry else {
+        log_debug!("[clip] paste index {} out of range", idx);
+        hide_picker();
+        return;
+    };
+    // 日志只打索引,绝不打粘贴内容(隐私)。
+    // Log the index only, NEVER the pasted content (privacy).
+    log_debug!("[clip] paste_at idx={}", idx);
+    hide_picker();
+    unsafe {
+        if let Some(png) = &entry.image_png {
+            write_pasteboard_png(png);
+        } else {
+            write_pasteboard_text(&entry.text);
         }
-        None => {
-            log_debug!("[clip] paste index {} out of range", idx);
-            hide_picker();
-        }
+        synthesize_paste();
+    }
+    log_debug!("[clip] pasted entry {}", idx);
+}
+
+/// 先关闭浮窗后合成 Cmd+V(keyDown + keyUp,post 到 session 层)。
+/// 浮窗是 key window(NonactivatingPanel + makeKeyWindow),此时合成键盘事件会被路由给
+/// 浮窗所属的 app(我们自己),输入框收不到;orderOut 后面板失去 key,系统 key window
+/// 回归原应用,合成事件才能到达用户原来的输入框。
+/// Synthesize Cmd+V (keyDown + keyUp, posted at the session level) AFTER the picker is
+/// closed. The panel is the key window (NonactivatingPanel + makeKeyWindow), so a
+/// synthesized key event would be routed to the panel's app (us) and never reach the input
+/// field; once ordered out, the panel resigns key, the system key window returns to the
+/// previous app, and the synthesized Cmd+V lands in the user's input field.
+unsafe fn synthesize_paste() {
+    let down = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, true);
+    if !down.is_null() {
+        CGEventSetFlags(down, K_CG_EVENT_FLAG_MASK_COMMAND);
+        CGEventPost(K_CG_SESSION_EVENT_TAP, down);
+    }
+    let up = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, false);
+    if !up.is_null() {
+        CGEventSetFlags(up, K_CG_EVENT_FLAG_MASK_COMMAND);
+        CGEventPost(K_CG_SESSION_EVENT_TAP, up);
     }
 }
 
@@ -2631,6 +3043,23 @@ pub(crate) fn smoke_runner() -> bool {
         // 无来源条目:标题栏应显示"未知来源",无图标。
         // A source-less entry: the header shows "unknown source", no icon.
         record_text(&mut hist, "legacy entry without a source", "", "", 50);
+        // 图片条目:1x1 透明 PNG(内存构造),覆盖缩略图渲染/清理路径。
+        // An image entry: a 1x1 transparent PNG built in memory, covering the thumbnail
+        // render/cleanup paths.
+        const TINY_PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        record_image(&mut hist, TINY_PNG, "Safari", "com.apple.Safari", 50);
+        // 同图再复制一次:内容哈希去重,历史不增长(验证图片去重)。
+        // Re-copying the same image: the content-hash dedup keeps the history from growing
+        // (exercises image dedup).
+        let before = hist.len();
+        record_image(&mut hist, TINY_PNG, "Safari", "com.apple.Safari", 50);
+        assert_eq!(hist.len(), before, "same image must dedup");
     }
     show_picker();
     hide_picker();
@@ -2762,6 +3191,7 @@ mod tests {
     fn entry(text: &str) -> ClipEntry {
         ClipEntry {
             text: text.to_string(),
+            image_png: None,
             pinned: false,
             source_app: String::new(),
             source_key: String::new(),
@@ -2771,6 +3201,7 @@ mod tests {
     fn entry_with_source(text: &str, source: &str) -> ClipEntry {
         ClipEntry {
             text: text.to_string(),
+            image_png: None,
             pinned: false,
             source_app: source.to_string(),
             source_key: String::new(),
@@ -2780,9 +3211,21 @@ mod tests {
     fn entry_with_identity(text: &str, source: &str, key: &str) -> ClipEntry {
         ClipEntry {
             text: text.to_string(),
+            image_png: None,
             pinned: false,
             source_app: source.to_string(),
             source_key: key.to_string(),
+        }
+    }
+
+    /// 测试用图片条目 / an image entry for tests.
+    fn entry_image(png: &[u8]) -> ClipEntry {
+        ClipEntry {
+            text: String::new(),
+            image_png: Some(png.to_vec()),
+            pinned: false,
+            source_app: "Safari".to_string(),
+            source_key: "com.apple.Safari".to_string(),
         }
     }
 
@@ -2844,6 +3287,120 @@ mod tests {
         assert_eq!(h[0].source_app, "Chrome");
         assert_eq!(h[0].source_key, "com.google.Chrome");
         assert_eq!(h[1].source_app, "Safari");
+    }
+
+    #[test]
+    fn fnv1a64_is_stable_and_distinct() {
+        use super::fnv1a64;
+        // 同一输入恒定 / same input -> same hash.
+        assert_eq!(fnv1a64(b"png-a"), fnv1a64(b"png-a"));
+        // 不同输入(哪怕只差一字节)不同 / different inputs (even one byte) differ.
+        assert_ne!(fnv1a64(b"png-a"), fnv1a64(b"png-b"));
+        assert_ne!(fnv1a64(b""), fnv1a64(b"x"));
+    }
+
+    #[test]
+    fn is_image_extension_covers_common_formats() {
+        use super::is_image_extension;
+        // 常见图片格式(大小写不敏感)/ common image formats (case-insensitive).
+        for p in [
+            "/a/b/photo.png",
+            "/a/b/photo.PNG",
+            "/a/b/pic.jpg",
+            "/a/b/pic.JPEG",
+            "/a/b/anim.gif",
+            "/a/b/scan.tiff",
+            "/a/b/img.webp",
+            "/a/b/img.heic",
+            "/a/b/img.bmp",
+        ] {
+            assert!(is_image_extension(p), "{}", p);
+        }
+        // 非图片 / 无扩展名 / 目录被排除。
+        // Non-images / no extension / a directory are excluded.
+        assert!(!is_image_extension("/a/b/doc.pdf"));
+        assert!(!is_image_extension("/a/b/notes.txt"));
+        assert!(!is_image_extension("/a/b/noext"));
+        assert!(!is_image_extension("/a/b/"));
+    }
+
+    #[test]
+    fn record_image_dedups_by_bytes_and_updates_source() {
+        use super::record_image;
+        let png_a = b"fake-png-bytes-a";
+        let png_b = b"fake-png-bytes-b";
+        let mut h = Vec::new();
+        assert!(record_image(
+            &mut h,
+            png_a,
+            "Safari",
+            "com.apple.Safari",
+            50
+        ));
+        assert_eq!(h.len(), 1);
+        assert!(h[0].image_png.is_some());
+        assert!(h[0].text.is_empty());
+        // 同一张图(相同字节)再次复制 → 去重移前,来源更新。
+        // Re-copying the same bytes -> dedup to the front, source updated.
+        assert!(record_image(
+            &mut h,
+            png_a,
+            "Chrome",
+            "com.google.Chrome",
+            50
+        ));
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].source_app, "Chrome");
+        // 不同图 → 新条目(最新在前)。
+        // Different bytes -> a new entry (newest first).
+        assert!(record_image(
+            &mut h,
+            png_b,
+            "Safari",
+            "com.apple.Safari",
+            50
+        ));
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].text, "");
+        assert!(h[1].image_png.is_some());
+        // 空数据忽略 / empty data is ignored.
+        assert!(!record_image(&mut h, b"", "Safari", "com.apple.Safari", 50));
+    }
+
+    #[test]
+    fn record_image_respects_the_max_cap() {
+        use super::record_image;
+        let mut h = Vec::new();
+        for i in 0..3u8 {
+            record_image(&mut h, &[i], "Safari", "com.apple.Safari", 2);
+        }
+        assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn filtered_indices_hides_images_when_querying() {
+        use super::filtered_indices;
+        // 图片条目无文字:空查询显示全部,非空查询被排除。
+        // Image entries have no text: shown with an empty query, excluded when querying.
+        let h = vec![
+            entry_image(b"png"),
+            entry("apple pie"),
+            entry_image(b"png2"),
+        ];
+        assert_eq!(filtered_indices(&h, ""), vec![0, 1, 2]);
+        assert_eq!(filtered_indices(&h, "apple"), vec![1]);
+        assert!(filtered_indices(&h, "png").is_empty());
+    }
+
+    #[test]
+    fn compute_pitches_sizes_image_rows_for_the_thumbnail() {
+        use super::{compute_pitches, BODY_GAP, HEADER_H, IMG_PREVIEW_H, ROW_GAP};
+        // 文本行 = 标题栏 + 3 行正文 + 间距;图片行 = 标题栏 + 缩略图 + 间距。
+        // Text rows = header + 3 body lines + gap; image rows = header + thumbnail + gap.
+        let texts = vec![entry("short"), entry_image(b"png")];
+        let pitches = compute_pitches(&texts);
+        assert_eq!(pitches[1], HEADER_H + BODY_GAP + IMG_PREVIEW_H + ROW_GAP);
+        assert!(pitches[1] < pitches[0]);
     }
 
     #[test]
