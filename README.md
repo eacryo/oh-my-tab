@@ -47,6 +47,8 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 - Image-data entries dedup by content hash; image-file entries dedup by content hash too (a file and its Finder duplicate — identical bytes, different paths — collapse into one entry, keeping the latest path).
 - The same picture copied both as an image and as a file stays as **two separate entries** (they answer different paste semantics). They share the content hash, so they share the disk cache; deleting one entry only removes the cache files when no other entry still references them.
 
+**Using an entry reorders the history by default**: selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top (like Maccy). The **"Move used entries to top"** switch in Settings turns this off — pasting then never reorders the history (like Windows Win+V).
+
 The picker's "Clear all" keeps pinned entries; per-entry delete (Backspace) and the entry-cap trim follow the same cache rules. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note under [Configuration](#configuration).
 
 ## Known Issues

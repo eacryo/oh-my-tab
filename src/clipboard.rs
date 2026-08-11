@@ -1356,6 +1356,60 @@ const SENSITIVE_PASTEBOARD_TYPES: &[&str] = &[
     "com.agilebits.onepassword",
 ];
 
+/// 自家粘贴写回的标记类型:paste_at 写回内容后打上它,轮询据此识别"这是我们的
+/// 写回"而非用户的新复制。`clipboard.move_used_to_top` 关闭时,带此标记的
+/// changeCount 变化被跳过(粘贴不重排历史);真实复制会 clearContents 清掉标记,
+/// 不受影响。与 Maccy 的 `org.p0deje.Maccy` 标记同款做法,对其它应用无害。
+/// The marker type for our own paste write-backs: `paste_at` stamps it after writing the
+/// content back, so the poll can tell "this is OUR write-back" apart from a genuine new
+/// copy. When `clipboard.move_used_to_top` is off, a changeCount bump carrying this
+/// marker is skipped (pasting does not reorder the history); a real copy clears the
+/// pasteboard and thus the marker, so it is never affected. Same approach as Maccy's
+/// `org.p0deje.Maccy` marker; harmless to other apps.
+const PASTE_MARKER_TYPE: &str = "org.oh-my-tab.paste";
+
+/// 剪贴板是否带自家粘贴标记(stringForType: 非空即命中)。
+/// Whether the pasteboard carries our own paste marker (stringForType: non-nil).
+unsafe fn pasteboard_has_paste_marker() -> bool {
+    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pb.is_null() {
+        return false;
+    }
+    let type_ns = make_nsstring(PASTE_MARKER_TYPE);
+    let s: *mut AnyObject = msg_send![pb, stringForType: type_ns];
+    CFRelease(type_ns as *const c_void);
+    !s.is_null()
+}
+
+/// 给剪贴板打上自家粘贴标记(写回内容之后调用)。
+/// Stamp the pasteboard with our own paste marker (called after a write-back).
+unsafe fn stamp_paste_marker(pb: *mut AnyObject) {
+    let type_ns = make_nsstring(PASTE_MARKER_TYPE);
+    let v = make_nsstring("1");
+    let _: bool = msg_send![pb, setString: v, forType: type_ns];
+    CFRelease(type_ns as *const c_void);
+    CFRelease(v as *const c_void);
+}
+
+/// 当前是否"使用后移到最前"(从 CONFIG 实时读,设置保存后立即生效)。
+/// Whether used entries move to the top (read live from CONFIG; takes effect on the
+/// next poll after settings are saved).
+fn move_used_to_top() -> bool {
+    CONFIG
+        .read()
+        .map(|c| c.clipboard.move_used_to_top)
+        .unwrap_or(true)
+}
+
+/// 是否应跳过本次 changeCount 变化:关闭"使用后移到最前"且剪贴板带自家粘贴标记
+/// (即本次变化是我们自己的写回,不是用户的新复制)。纯函数,便于单测。
+/// Whether this changeCount bump should be skipped: "move used to top" is off AND the
+/// pasteboard carries our paste marker (the change is our own write-back, not a new
+/// copy). Pure, unit-tested.
+fn should_skip_paste_writeback(toggle: bool, has_marker: bool) -> bool {
+    !toggle && has_marker
+}
+
 /// 剪贴板是否携带敏感标记(availableTypeFromArray: 一次性探测,存在即返回该类型)。
 /// Whether the pasteboard carries a sensitive marker (probed in one
 /// availableTypeFromArray: call).
@@ -1538,9 +1592,12 @@ unsafe fn file_copy_image(text: &str) -> Option<ImageEntry> {
     })
 }
 /// 把文本写回剪贴板(粘贴路径)。写回会 bump changeCount,下次轮询读到的是本文本,
-/// 但 record_text 的去重(与栈顶相同)会忽略它,不会产生重复条目。
-/// Write text back to the pasteboard (the paste path). This bumps changeCount; the next poll
-/// reads this same text, but record_text's dedup (same as the top entry) skips it.
+/// 但 record_text 的去重(与栈顶相同)会忽略它,不会产生重复条目;并打上自家
+/// 粘贴标记(供"使用后移到最前"关闭时跳过记录)。
+/// Write text back to the pasteboard (the paste path). This bumps changeCount; the next
+/// poll reads this same text, but record_text's dedup (same as the top entry) skips it.
+/// The own-paste marker is stamped too (so the poll can skip the change when "move used
+/// entries to top" is off).
 unsafe fn write_pasteboard_text(text: &str) {
     let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
     if pb.is_null() {
@@ -1555,6 +1612,7 @@ unsafe fn write_pasteboard_text(text: &str) {
     let type_ns = make_nsstring(NSPASTEBOARD_TYPE_STRING);
     let ns = make_nsstring(text);
     let ok: bool = msg_send![pb, setString: ns, forType: type_ns];
+    stamp_paste_marker(pb);
     // 日志只打元数据,绝不打剪贴板内容(隐私:内容可能是密码/正文)。
     // Log metadata only, NEVER the clipboard text (privacy: it may be a password/body text).
     log_debug!(
@@ -1597,6 +1655,7 @@ unsafe fn write_pasteboard_image(entry: &ImageEntry) -> bool {
         length: data.len()
     ];
     let ok: bool = msg_send![pb, setData: data_obj, forType: type_ns];
+    stamp_paste_marker(pb);
     log_debug!(
         "[clip] write back image ({} bytes, uti={}, setData ok={})",
         data.len(),
@@ -1647,6 +1706,7 @@ unsafe fn write_pasteboard_file(path: &str) {
         CFRelease(type_ns as *const c_void);
     }
     CFRelease(url_str_ns as *const c_void);
+    stamp_paste_marker(pb);
     log_debug!("[clip] write back file ({})", path);
 }
 
@@ -1688,6 +1748,17 @@ fn poll_clipboard() {
     // memory nor on disk). The industry-standard nspasteboard.org convention.
     if unsafe { pasteboard_has_sensitive_marker() } {
         log_debug!("[clip] change skipped: sensitive/transient marker on pasteboard");
+        return;
+    }
+    // 自家粘贴写回拦截:"使用后移到最前"关闭时,带自家标记的 changeCount 变化
+    // (即我们自己的粘贴写回)跳过记录——否则去重移前会把刚用过的条目提到最顶,
+    // 历史顺序被"使用"污染。真实复制会 clearContents 清掉标记,不受影响。
+    // Own-paste write-back interception: when "move used entries to top" is off, a
+    // changeCount bump carrying our marker (our own paste write-back) is skipped --
+    // otherwise the dedup-move would bring the just-used entry to the top, polluting the
+    // copy-order with usage. A real copy clears the pasteboard and the marker with it.
+    if should_skip_paste_writeback(move_used_to_top(), unsafe { pasteboard_has_paste_marker() }) {
+        log_debug!("[clip] change skipped: our own paste write-back (move_used_to_top off)");
         return;
     }
     match unsafe { read_pasteboard_text() } {
@@ -4624,6 +4695,20 @@ mod tests {
         assert!(SENSITIVE_PASTEBOARD_TYPES.contains(&"org.nspasteboard.ConcealedType"));
         assert!(SENSITIVE_PASTEBOARD_TYPES.contains(&"org.nspasteboard.AutoGeneratedType"));
         assert!(SENSITIVE_PASTEBOARD_TYPES.contains(&"com.agilebits.onepassword"));
+    }
+
+    #[test]
+    fn paste_writeback_skip_only_when_toggle_off_and_marker_present() {
+        use super::should_skip_paste_writeback;
+        // 开关开(默认)→ 永不跳过(维持"使用后置顶"现状)。
+        // Toggle on (default) -> never skip (used entries keep moving to the top).
+        assert!(!should_skip_paste_writeback(true, false));
+        assert!(!should_skip_paste_writeback(true, true));
+        // 开关关:自家标记在 → 跳过(粘贴不重排);无标记(真实复制)→ 正常记录。
+        // Toggle off: our marker present -> skip (pasting does not reorder); no marker
+        // (a genuine copy) -> record normally.
+        assert!(should_skip_paste_writeback(false, true));
+        assert!(!should_skip_paste_writeback(false, false));
     }
 
     #[test]

@@ -147,6 +147,12 @@ pub struct ClipboardSection {
     // plaintext on disk has privacy implications (any same-user app can read it); the
     // README carries an explicit warning.
     pub persist: bool,
+    // 使用后移到最前:粘贴(选中回车)会把条目提到列表最前(副作用:写回被轮询
+    // 当成再次复制)。关闭后粘贴不重排历史(与 Windows Win+V 一致)。默认 true。
+    // Move used entries to the top: pasting (select + Enter) brings the entry to the
+    // front (a side effect: the write-back is re-captured by the poll as another copy).
+    // When off, pasting does not reorder the history (like Windows Win+V). Default true.
+    pub move_used_to_top: bool,
 }
 
 impl Default for ClipboardSection {
@@ -156,6 +162,7 @@ impl Default for ClipboardSection {
             max_entries: 50,
             show_source_app: false,
             persist: false,
+            move_used_to_top: true,
         }
     }
 }
@@ -833,10 +840,11 @@ impl Config {
         // clipboard (enabled 恒有效;max_entries 有校验)
         // clipboard (enabled always valid; max_entries is validated)
         self.clipboard.enabled = other.clipboard.enabled;
-        // show_source_app / persist 是布尔,恒有效。
-        // show_source_app / persist are bools, always valid.
+        // show_source_app / persist / move_used_to_top 是布尔,恒有效。
+        // show_source_app / persist / move_used_to_top are bools, always valid.
         self.clipboard.show_source_app = other.clipboard.show_source_app;
         self.clipboard.persist = other.clipboard.persist;
+        self.clipboard.move_used_to_top = other.clipboard.move_used_to_top;
         if !errs.iter().any(|e| e.starts_with("clipboard.max_entries")) {
             self.clipboard.max_entries = other.clipboard.max_entries;
         }
@@ -1178,6 +1186,7 @@ mod tests {
         other.clipboard.enabled = true;
         other.clipboard.max_entries = 30;
         other.clipboard.persist = true;
+        other.clipboard.move_used_to_top = false;
         let mut merged = Config::default();
         merged.merge_valid(other, &[]);
         assert_eq!(merged.appearance.theme, "dark");
@@ -1188,6 +1197,7 @@ mod tests {
         assert!(merged.clipboard.enabled);
         assert_eq!(merged.clipboard.max_entries, 30);
         assert!(merged.clipboard.persist);
+        assert!(!merged.clipboard.move_used_to_top);
     }
 
     #[test]

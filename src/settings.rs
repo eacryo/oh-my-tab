@@ -69,9 +69,10 @@ struct SettingsUi {
     line_count_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
     disable_pointer_accel: *mut AnyObject,  // NSSwitch: 禁用指针加速 / disable pointer acceleration
     clipboard_enabled: *mut AnyObject,      // NSSwitch: 启用剪贴板历史 / enable clipboard history
-    clipboard_persist: *mut AnyObject, // NSSwitch: 保存剪贴板历史记录 / persist clipboard history
-    clipboard_max_entries: *mut AnyObject, // NSTextField: 历史最大条数 / max history entries
-    clipboard_show_source_app: *mut AnyObject, // NSSwitch: 显示来源应用 / show the source app
+    clipboard_persist: *mut AnyObject, // NSSwitch: 保存剪贴板历史记录到磁盘 / persist clipboard history
+    clipboard_move_used_to_top: *mut AnyObject, // NSSwitch: 使用后移到最前 / move used entries to top
+    clipboard_max_entries: *mut AnyObject,      // NSTextField: 历史最大条数 / max history entries
+    clipboard_show_source_app: *mut AnyObject,  // NSSwitch: 显示来源应用 / show the source app
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
@@ -1077,6 +1078,10 @@ fn load_settings_from(cfg: &Config) {
             ui.clipboard_show_source_app,
             setState: if cfg.clipboard.show_source_app { 1isize } else { 0isize }
         ];
+        let _: () = msg_send![
+            ui.clipboard_move_used_to_top,
+            setState: if cfg.clipboard.move_used_to_top { 1isize } else { 0isize }
+        ];
         set_field(
             ui.clipboard_max_entries,
             cfg.clipboard.max_entries.to_string(),
@@ -1276,6 +1281,8 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         cfg.clipboard.persist = persist_state == 1;
         let src_state: isize = msg_send![ui.clipboard_show_source_app, state];
         cfg.clipboard.show_source_app = src_state == 1;
+        let move_top_state: isize = msg_send![ui.clipboard_move_used_to_top, state];
+        cfg.clipboard.move_used_to_top = move_top_state == 1;
         match parse_usize(&nsstring_to_rust(msg_send![
             ui.clipboard_max_entries,
             stringValue
@@ -1573,6 +1580,7 @@ fn create_settings_window() {
             disable_pointer_accel: std::ptr::null_mut(),
             clipboard_enabled: std::ptr::null_mut(),
             clipboard_persist: std::ptr::null_mut(),
+            clipboard_move_used_to_top: std::ptr::null_mut(),
             clipboard_max_entries: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
@@ -2285,6 +2293,19 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_clipboard_show_source_app"),
+            make_switch(ctrl_x + ctrl_w, cy, row_h, false),
+        );
+        cy -= 8.0 + row_h;
+        // 使用后移到最前(粘贴是否重排历史;默认开 = 保持现状)。
+        // Move used entries to the top (whether pasting reorders the history; on by
+        // default = current behavior).
+        ui.clipboard_move_used_to_top = add_row(
+            clipboard_view,
+            label_x,
+            cy,
+            label_w,
+            row_h,
+            &t("settings.row_clipboard_move_used_to_top"),
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
         cy -= 8.0 + row_h;
