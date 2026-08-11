@@ -1,24 +1,35 @@
-//! 历史剪贴板模块(第一版:纯文本、内存态、不持久化)。
+//! 历史剪贴板模块(纯文本 + 图片、不持久化)。
 //!
 //! 架构:
-//! - 主线程 NSTimer 每 0.5s 轮询 NSPasteboard 的 changeCount,变化时读纯文本入历史
+//! - 主线程 NSTimer 每 0.5s 轮询 NSPasteboard 的 changeCount,变化时读文本/图片入历史
 //!   (连续复制相同内容去重,上限裁剪)。
 //! - Option+V 由 event_monitor 的 tap 检测,经 bridge 转主线程调用 on_clipboard_toggle,
 //!   显示/关闭浮窗;↑↓/Enter/Esc/点击选择,Enter 或点击 = 写回剪贴板 + 合成 Cmd+V
 //!   自动粘贴(行为同 Windows 的 Win+V)。
-//! - 只保存纯文本(NSPasteboardTypeString),不做图片,不做持久化。
+//! - 文本条目存原文;图片条目**原始字节落盘**(`~/Library/Caches/oh-my-tab-clip-images/`,
+//!   按内容哈希命名),内存只留降采样 PNG 预览;粘贴时按需读回,按原始 UTI 写回
+//!   (JPG 粘回 JPG、GIF 动图粘回动图)。文件复制的条目另记来源路径:粘贴时恢复
+//!   `public.file-url`(文件语义,同 Windows Win+V);源文件被删/移动则回退到影子
+//!   副本。启动时清空缓存目录(历史不持久化,残留必为孤儿),删除条目/清空/超上限
+//!   裁剪时联动删除对应缓存文件。
 //!
-//! History clipboard module (v1: text-only, in-memory, no persistence).
+//! History clipboard module (text + images, no persistence).
 //!
 //! Architecture:
 //! - A main-thread NSTimer polls NSPasteboard's changeCount every 0.5s; when it changes,
-//!   the plain text is read into the history (duplicates of the top are skipped, overflow
-//!   trimmed).
+//!   the text/image is read into the history (duplicates are skipped, overflow trimmed).
 //! - Option+V is detected by the event_monitor tap and marshalled to the main thread via the
 //!   bridge (on_clipboard_toggle), showing/hiding the picker. Arrow keys / Enter / Esc /
 //!   clicks navigate; Enter or a click = write back to the pasteboard + synthesize Cmd+V for
 //!   an automatic paste (mirrors Windows' Win+V).
-//! - Text only (NSPasteboardTypeString); no images, no persistence.
+//! - Text entries keep the raw text; image entries keep their ORIGINAL bytes ON DISK
+//!   (`~/Library/Caches/oh-my-tab-clip-images/`, keyed by a content hash) with only a
+//!   downsampled PNG preview in memory; pasting reads the bytes back on demand and writes
+//!   them under the original UTI (a JPG pastes back as JPG, an animated GIF as a GIF).
+//!   File-copy entries also remember the source path: pasting restores `public.file-url`
+//!   (file semantics, like Windows Win+V); a deleted/moved source falls back to the shadow
+//!   copy. The cache dir is wiped at startup (the history is not persisted, so leftovers
+//!   are orphans) and files are removed in sync with delete/clear-all/trim.
 
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -39,14 +50,39 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 // ========== 常量 / constants ==========
 
+/// 剪贴板文件 URL 类型(Finder 文件复制携带;粘贴时恢复它 = 文件语义)。
+/// The pasteboard file-URL type (carried by Finder file copies; restoring it on paste =
+/// file semantics).
+const NSPASTEBOARD_TYPE_FILE_URL: &str = "public.file-url";
+/// 剪贴板通用 URL 类型(Finder 文件复制附带,兼容读取方)。
+/// The generic pasteboard URL type (carried by Finder file copies; compatibility).
+const NSPASTEBOARD_TYPE_URL: &str = "public.url";
 /// 剪贴板文本类型(与 NSPasteboardTypeString 相同)。
 /// The plain-text pasteboard type (same as NSPasteboardTypeString).
 const NSPASTEBOARD_TYPE_STRING: &str = "public.utf8-plain-text";
 /// 剪贴板 PNG 图片类型(与 NSPasteboardTypePNG 相同)。
 /// The pasteboard PNG type (same as NSPasteboardTypePNG).
 const NSPASTEBOARD_TYPE_PNG: &str = "public.png";
-/// 剪贴板 TIFF 图片类型(无 PNG 时回退转换用,与 NSPasteboardTypeTIFF 相同)。
-/// The pasteboard TIFF type (fallback conversion when no PNG, same as NSPasteboardTypeTIFF).
+/// 剪贴板 JPEG 图片类型(与 NSPasteboardTypeJPEG 相同)。
+/// The pasteboard JPEG type (same as NSPasteboardTypeJPEG).
+const NSPASTEBOARD_TYPE_JPEG: &str = "public.jpeg";
+/// 剪贴板 GIF 图片类型(与 NSPasteboardTypeGIF 相同;动画保留)。
+/// The pasteboard GIF type (same as NSPasteboardTypeGIF; animation preserved).
+const NSPASTEBOARD_TYPE_GIF: &str = "com.compuserve.gif";
+/// 剪贴板 GIF 类型的别名(个别应用声明 public.gif 而非 com.compuserve.gif,
+/// 只写这一种时会漏识,掉进 TIFF 静态兜底)。
+/// The GIF type's alias (some apps declare public.gif instead of
+/// com.compuserve.gif; recognizing only the canonical one would fall through to the
+/// static TIFF fallback).
+const NSPASTEBOARD_TYPE_GIF_ALIAS: &str = "public.gif";
+/// 剪贴板 WebP 类型 / the pasteboard WebP type.
+const NSPASTEBOARD_TYPE_WEBP: &str = "org.webmproject.webp";
+/// 剪贴板 HEIC 类型 / the pasteboard HEIC type.
+const NSPASTEBOARD_TYPE_HEIC: &str = "public.heic";
+/// 剪贴板 BMP 类型 / the pasteboard BMP type.
+const NSPASTEBOARD_TYPE_BMP: &str = "com.microsoft.bmp";
+/// 剪贴板 TIFF 图片类型(macOS 通用兜底,与 NSPasteboardTypeTIFF 相同)。
+/// The pasteboard TIFF type (the generic macOS fallback, same as NSPasteboardTypeTIFF).
 const NSPASTEBOARD_TYPE_TIFF: &str = "public.tiff";
 /// 图片缩略图正文区高度 / the image thumbnail's body height.
 const IMG_PREVIEW_H: f64 = 64.0;
@@ -330,7 +366,7 @@ fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
     texts
         .iter()
         .map(|e| {
-            if e.image_png.is_some() {
+            if e.image.is_some() {
                 HEADER_H + BODY_GAP + IMG_PREVIEW_H + ROW_GAP
             } else {
                 HEADER_H + BODY_GAP + row_button_height(MAX_TEXT_LINES) + ROW_GAP
@@ -363,18 +399,56 @@ fn row_top(idx: usize, pitches: &[f64]) -> f64 {
     rows_top_offset() + pitches.iter().take(idx).sum::<f64>()
 }
 
+/// 图片条目:原始格式字节的**磁盘引用** + UTI + 降采样 PNG 预览(+ 文件复制来源)。
+/// 原始字节不驻内存:录制时算 hash 并写入缓存文件,粘贴时按需从磁盘读回。
+/// 粘贴时按 `uti` 原样写回,预览只供缩略图用(动图取第一帧,不影响粘贴)。
+/// **文件复制**的条目额外记住来源路径——粘贴时恢复 `public.file-url`,把"文件"
+/// 而不是"图片数据"交回给目标应用(Finder 复制原文件、聊天应用附加文件,GIF 动画
+/// 因此完整保留;若把图片数据当纯图片粘贴,Finder 会直接忽略,部分应用还会重编码
+/// 成 PNG)。
+/// An image entry: a DISK reference to the original-format bytes + its UTI + a downsampled
+/// PNG preview (plus the source path for file copies). The original bytes never stay in
+/// memory: hashed and written to a cache file at record time, read back on paste. Pasting
+/// writes the original bytes back under `uti` verbatim; the preview is only for the
+/// thumbnail (first frame for animations, never pasted). Entries from a FILE copy also
+/// remember the source path -- pasting then restores `public.file-url`, handing the FILE
+/// (not the image data) to the target app (Finder duplicates the original file, chat apps
+/// attach the file, GIF animation fully preserved; bare image data is ignored by Finder
+/// and re-encoded into PNG by some apps).
+#[derive(Debug, Clone, PartialEq)]
+struct ImageEntry {
+    /// 原始格式的 UTI(public.png / public.jpeg / com.compuserve.gif ...)。
+    /// The original format's UTI (public.png / public.jpeg / com.compuserve.gif ...).
+    uti: String,
+    /// 原始字节的内容哈希(FNV-1a):缓存文件名 + 图片查重(不重读字节)。
+    /// The original bytes' content hash (FNV-1a): the cache filename + image dedup key
+    /// (no re-reading of the bytes).
+    hash: u64,
+    /// 原始格式字节的缓存文件路径(数据复制的正本,文件复制的影子副本)。
+    /// The cache file holding the original-format bytes (the master copy for image-data
+    /// copies, a shadow copy for file copies).
+    data_path: std::path::PathBuf,
+    /// 降采样 PNG 预览(缩略图绘制用;唯一常驻内存的图片字节,约 100-300KB)。
+    /// A downsampled PNG preview (thumbnail drawing; the only image bytes held in memory,
+    /// ~100-300KB).
+    preview_png: Vec<u8>,
+    /// 文件复制的来源路径(None = 纯图片复制,非文件复制)。
+    /// The source path of a file copy (None = a bare image copy, not a file copy).
+    source_path: Option<String>,
+}
+
 /// 历史条目:文本 + 置顶标记 + 来源应用名 + 来源图标缓存键。置顶条目恒在列表顶部。
 /// A history entry: text + a pinned flag + the source app name + the source icon-cache key.
 /// Pinned entries stay at the top.
 #[derive(Debug, Clone, PartialEq)]
 struct ClipEntry {
     text: String,
-    /// PNG 编码的图片数据(图片条目;文本条目为 None)。图文同存时文本优先,
+    /// 图片条目(原始格式 + 预览;文本条目为 None)。图文同存时文本优先,
     /// 图片仅在剪贴板无文本时记录。
-    /// PNG-encoded image data (image entries; None for text entries). When both text and an
-    /// image are on the pasteboard, text wins -- images are only recorded when there is no
-    /// text.
-    image_png: Option<Vec<u8>>,
+    /// An image entry (original format + preview; None for text entries). When both text
+    /// and an image are on the pasteboard, text wins -- images are only recorded when
+    /// there is no text.
+    image: Option<ImageEntry>,
     pinned: bool,
     /// 复制该文本时的前台应用名(空 = 未知,如旧条目/取不到前台应用)。
     /// The frontmost app name when the text was copied (empty = unknown, e.g. legacy entries
@@ -510,49 +584,54 @@ fn record_text(
         pos,
         ClipEntry {
             text: text.to_string(),
-            image_png: None,
+            image: None,
             pinned: false,
             source_app: source.to_string(),
             source_key: source_key.to_string(),
         },
     );
     if history.len() > max {
+        // 超上限裁剪时,被裁图片条目的缓存文件一并删除(不再被任何条目引用)。
+        // When trimming beyond the cap, drop the trimmed image entries' cache files too
+        // (they are no longer referenced by any entry).
+        for dropped in &history[max..] {
+            cache_delete_for_entry(dropped);
+        }
         history.truncate(max);
     }
     true
 }
 
-/// 把一张 PNG 记入历史。规则与 record_text 一致,但查重按 PNG 原始字节哈希:
-/// - 空数据忽略
-/// - 字节哈希已存在 → 旧条目提到最前(保留置顶),来源更新为本次复制来源
-/// - 未命中 → 新条目(text 为空串,image_png = 数据)插到置顶区之后;超出 max 裁剪
+/// 把一张图片(原始格式,字节已由调用方落盘)记入历史。规则与 record_text 一致,
+/// 但查重按内容哈希:
+/// - 空预览忽略(录制失败)
+/// - 内容哈希已存在 → 旧条目提到最前(保留置顶),来源更新为本次复制来源
+/// - 未命中 → 新条目(text 为空串,image = 原始格式)插到置顶区之后;超出 max 裁剪
 ///   同图不同编码的去重留待第二阶段(见被注释的 image_content_hash)。
 ///
-/// Record a PNG image into the history. Same rules as record_text, but dedup compares the
-/// raw PNG byte hash:
-/// - empty data is ignored
-/// - an existing byte hash -> the old entry moves to the front (pinned kept), the source
+/// Record an image (original format, bytes already cached by the caller) into the history.
+/// Same rules as record_text, but dedup compares the content hash:
+/// - an empty preview is ignored (recording failed)
+/// - an existing content hash -> the old entry moves to the front (pinned kept), the source
 ///   updates
-/// - a new image (empty text, image_png = the data) is inserted after the pinned block;
-///   entries beyond `max` are trimmed (cross-encoding dedup waits for phase 2, see the
-///   commented-out image_content_hash).
+/// - a new image (empty text, image = the original format) is inserted after the pinned
+///   block; entries beyond `max` are trimmed (cross-encoding dedup waits for phase 2, see
+///   the commented-out image_content_hash).
 fn record_image(
     history: &mut Vec<ClipEntry>,
-    png: &[u8],
+    image: &ImageEntry,
     source: &str,
     source_key: &str,
     max: usize,
 ) -> bool {
-    if png.is_empty() || max == 0 {
+    if image.preview_png.is_empty() || max == 0 {
         return false;
     }
-    let hash = fnv1a64(png);
-    if let Some(idx) = history.iter().position(|e| {
-        e.image_png
-            .as_deref()
-            .map(|d| fnv1a64(d) == hash)
-            .unwrap_or(false)
-    }) {
+    let hash = image.hash;
+    if let Some(idx) = history
+        .iter()
+        .position(|e| e.image.as_ref().map(|i| i.hash) == Some(hash))
+    {
         history[idx].source_app = source.to_string();
         history[idx].source_key = source_key.to_string();
         move_entry_to_front(history, idx);
@@ -563,13 +642,19 @@ fn record_image(
         pos,
         ClipEntry {
             text: String::new(),
-            image_png: Some(png.to_vec()),
+            image: Some(image.clone()),
             pinned: false,
             source_app: source.to_string(),
             source_key: source_key.to_string(),
         },
     );
     if history.len() > max {
+        // 超上限裁剪时,被裁图片条目的缓存文件一并删除(不再被任何条目引用)。
+        // When trimming beyond the cap, drop the trimmed image entries' cache files too
+        // (they are no longer referenced by any entry).
+        for dropped in &history[max..] {
+            cache_delete_for_entry(dropped);
+        }
         history.truncate(max);
     }
     true
@@ -598,10 +683,12 @@ fn unpin_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     history.insert(pos, e);
 }
 
-/// 删除第 idx 条(越界忽略)。/ Delete entry `idx` (out of range is ignored).
+/// 删除第 idx 条(越界忽略),图片条目的缓存文件一并删除。
+/// Delete entry `idx` (out of range is ignored); an image entry's cache file goes too.
 fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     if idx < history.len() {
-        history.remove(idx);
+        let removed = history.remove(idx);
+        cache_delete_for_entry(&removed);
     }
 }
 
@@ -636,6 +723,86 @@ fn max_entries() -> usize {
         .clamp(1, 100)
 }
 
+// ========== 图片磁盘缓存 / image disk cache ==========
+
+/// 图片字节缓存目录:原始格式字节全部落盘,内存只留降采样预览(历史不持久化,
+/// 启动时清空整个目录,见 start())。测试构建使用专用目录,绝不触碰真实缓存。
+/// The image-byte cache directory: original-format bytes live on disk, memory only keeps
+/// the downsampled preview (the history itself is not persisted, so the whole dir is
+/// wiped at startup, see start()). Test builds use a dedicated directory, never the real
+/// cache.
+fn clip_image_cache_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    // 测试构建按线程隔离目录:测试并行运行,清缓存/删文件的用例不能与其它
+    // 正在写文件的用例共用同一目录(否则互相踩踏)。
+    // Test builds isolate the directory per thread: tests run in parallel, so a
+    // wipe/delete test must not share its directory with tests that are writing files.
+    let name = if cfg!(test) {
+        format!(
+            "oh-my-tab-clip-images-test-{:?}",
+            std::thread::current().id()
+        )
+    } else {
+        "oh-my-tab-clip-images".to_string()
+    };
+    std::path::PathBuf::from(format!("{}/Library/Caches/{}", home, name))
+}
+
+/// hash → 缓存文件路径(与 fnv1a64 输出同构的 hex)。/ hash -> cache file path.
+fn clip_image_path(hash: u64) -> std::path::PathBuf {
+    clip_image_cache_dir().join(format!("{hash:016x}"))
+}
+
+/// 把原始字节写入缓存(幂等:同 hash 已存在则跳过)。/ Write bytes into the cache.
+fn cache_write_image(hash: u64, bytes: &[u8]) -> bool {
+    let dir = clip_image_cache_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let path = clip_image_path(hash);
+    if path.exists() {
+        return true;
+    }
+    // 临时文件 + rename,避免写一半被粘贴路径读到。
+    // Write to a temp file then rename, so the paste path never reads a half-written file.
+    let tmp = dir.join(format!("{hash:016x}.tmp"));
+    let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ok
+}
+
+/// 从缓存读回原始字节(不存在/读失败返回 None)。/ Read the original bytes back.
+fn cache_read_image(hash: u64) -> Option<Vec<u8>> {
+    std::fs::read(clip_image_path(hash)).ok()
+}
+
+/// 删除一个缓存文件。/ Delete one cache file.
+fn cache_delete_image(hash: u64) {
+    let _ = std::fs::remove_file(clip_image_path(hash));
+}
+
+/// 删除一个图片条目对应的缓存文件(带 hash 才删)。
+/// Delete an image entry's cache file (only when it has a hash).
+fn cache_delete_for_entry(entry: &ClipEntry) {
+    if let Some(img) = &entry.image {
+        cache_delete_image(img.hash);
+    }
+}
+
+/// 清空整个图片缓存目录(启动时调用:历史不持久化,残留文件必为孤儿)。
+/// Wipe the whole image cache dir (called at startup: the history is not persisted, so
+/// any leftover file is an orphan).
+fn clear_clip_image_cache() {
+    let dir = clip_image_cache_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 // ========== 剪贴板读写 / pasteboard I/O ==========
 
 /// 读当前剪贴板纯文本(无文本返回 None)。
@@ -654,11 +821,127 @@ unsafe fn read_pasteboard_text() -> Option<String> {
     Some(nsstring_to_rust(s))
 }
 
-/// 读当前剪贴板图片(PNG 字节;无图片/解码失败返回 None)。
-/// 优先直接取 PNG;只有 TIFF 时经 NSBitmapImageRep 转成 PNG。
-/// Read the pasteboard's image as PNG bytes (None when absent or undecodable). PNG is taken
-/// directly; a bare TIFF goes through NSBitmapImageRep for conversion.
-unsafe fn read_pasteboard_png() -> Option<Vec<u8>> {
+/// 预览最长边上限(px):缩略图 ~64pt 显示,480px 足够;原图再大,内存里也只留
+/// 这个小预览——原始字节落盘不入内存。
+/// Preview max edge (px): thumbnails display at ~64pt, 480px is plenty; no matter the
+/// source size, only this small preview stays in memory -- the original bytes live on
+/// disk.
+const PREVIEW_MAX_DIM: f64 = 480.0;
+
+/// 把任意图片字节解码成**降采样** PNG 预览(缩略图用;解码失败返回 None)。
+/// 动图(GIF/WebP)只取第一帧;超过 PREVIEW_MAX_DIM 的原图按比例缩小再编码。
+/// Decode arbitrary image bytes into a DOWNSAMPLED PNG preview (for the thumbnail; None
+/// on failure). Animations (GIF/WebP) yield their first frame; sources larger than
+/// PREVIEW_MAX_DIM are scaled down proportionally before encoding.
+unsafe fn any_image_to_preview_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    // NSImage -> (必要时 lockFocus 缩放)-> TIFFRepresentation -> NSBitmapImageRep ->
+    // PNG(4)。与缩略图绘制同款缩放管线。
+    // NSImage -> (lockFocus scale when needed) -> TIFFRepresentation -> NSBitmapImageRep ->
+    // PNG (4). The same scaling pipeline as the thumbnail drawing.
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: bytes.as_ptr() as *const c_void,
+        length: bytes.len()
+    ];
+    let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let img: *mut AnyObject = msg_send![img, initWithData: data];
+    if img.is_null() {
+        return None;
+    }
+    let src_size: NSSize = msg_send![img, size];
+    let (w, h) = (src_size.width, src_size.height);
+    // 需要降采样才画进缩放目标图;小图直接用原图,省一次重绘。
+    // Only draw into a scaled target when downsampling is needed; small sources are used
+    // as-is, skipping the extra pass.
+    let source: *mut AnyObject = if w > PREVIEW_MAX_DIM || h > PREVIEW_MAX_DIM {
+        let scale = (PREVIEW_MAX_DIM / w).min(PREVIEW_MAX_DIM / h);
+        let (tw, th) = (w * scale, h * scale);
+        let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let target: *mut AnyObject = msg_send![target, initWithSize: NSSize::new(tw, th)];
+        let _: () = msg_send![target, lockFocus];
+        let dst = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(tw, th));
+        let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+        let op: usize = 1; // NSCompositingOperationCopy
+        let _: () = msg_send![
+            img,
+            drawInRect: dst,
+            fromRect: src,
+            operation: op,
+            fraction: 1.0f64
+        ];
+        let _: () = msg_send![target, unlockFocus];
+        target
+    } else {
+        img
+    };
+    let tiff: *mut AnyObject = msg_send![source, TIFFRepresentation];
+    if tiff.is_null() {
+        return None;
+    }
+    let rep: *mut AnyObject = msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff];
+    if rep.is_null() {
+        return None;
+    }
+    let png: *mut AnyObject =
+        msg_send![rep, representationUsingType: 4u64, properties: std::ptr::null::<AnyObject>()];
+    if png.is_null() {
+        return None;
+    }
+    let len: usize = msg_send![png, length];
+    let ptr: *const c_void = msg_send![png, bytes];
+    if ptr.is_null() || len == 0 {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
+}
+
+/// 剪贴板图片类型探测优先级(load-bearing,顺序不可随意改):
+/// **动图原格式(GIF/WebP)最优先**——应用复制动图时剪贴板上常有"原始动图字节 +
+/// 静态重编码(PNG/JPEG/TIFF)"多份并存,必须取原始动图那份,否则历史里就是静态图,
+/// Option+V 粘出去不再动(系统 Cmd+V 却能粘出动图)。
+/// 静态格式按保真度排:PNG(无损)> JPEG(有损)> HEIC > BMP;TIFF 垫底——它是
+/// macOS 各 App 复制图片时几乎都会附带的通用兜底(NSImagePboardType),且是静态的。
+/// 命中某类型但解码不出预览时继续探测下一个(同图往往还有 TIFF 可解码)。
+///
+/// Pasteboard image type probe order (load-bearing; do NOT reorder casually):
+/// **animation-capable originals (GIF/WebP) first** -- when an app copies an animated
+/// GIF, the pasteboard usually carries BOTH the original animated bytes AND a static
+/// re-encode (PNG/JPEG/TIFF); we must take the animated original, otherwise the history
+/// holds a static frame and our Option+V paste stops animating (while the system Cmd+V
+/// still pastes the animation from the untouched pasteboard). Static formats follow in
+/// fidelity order: PNG (lossless) > JPEG (lossy) > HEIC > BMP; TIFF is last -- it is the
+/// generic static fallback almost every macOS app carries (NSImagePboardType). A type
+/// whose data fails to decode as a preview is skipped (the same image is usually also
+/// available as TIFF).
+const PASTEBOARD_IMAGE_UTIS: &[&str] = &[
+    NSPASTEBOARD_TYPE_GIF,
+    NSPASTEBOARD_TYPE_GIF_ALIAS,
+    NSPASTEBOARD_TYPE_WEBP,
+    NSPASTEBOARD_TYPE_PNG,
+    NSPASTEBOARD_TYPE_JPEG,
+    NSPASTEBOARD_TYPE_HEIC,
+    NSPASTEBOARD_TYPE_BMP,
+    NSPASTEBOARD_TYPE_TIFF,
+];
+
+/// 从剪贴板实际存在的类型里,按 PASTEBOARD_IMAGE_UTIS 优先级挑出要用的那一个。
+/// 纯函数,便于单测(顺序与 GIF 别名都在这锁定)。
+/// Pick the preferred UTI from the types actually present on the pasteboard, following
+/// PASTEBOARD_IMAGE_UTIS' priority. Pure, unit-tested (the order and the GIF alias are
+/// pinned here).
+fn preferred_uti(present: &[&str]) -> Option<&'static str> {
+    PASTEBOARD_IMAGE_UTIS
+        .iter()
+        .find(|uti| present.contains(uti))
+        .copied()
+}
+
+/// 读当前剪贴板图片:原样取原始格式字节 → 算 hash 落盘 → 派生降采样 PNG 预览
+/// (无图片/无法解码/缓存写入失败返回 None)。
+/// Read the pasteboard's image: the original-format bytes verbatim -> hashed and written
+/// to the disk cache -> a downsampled PNG preview (None when absent, undecodable, or the
+/// cache write fails).
+unsafe fn read_pasteboard_image() -> Option<ImageEntry> {
     let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
     if pb.is_null() {
         return None;
@@ -679,51 +962,78 @@ unsafe fn read_pasteboard_png() -> Option<Vec<u8>> {
         }
         Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
     };
-    if let Some(png) = bytes_for_type(NSPASTEBOARD_TYPE_PNG) {
-        return Some(png);
+    // 先收集剪贴板上实际存在的类型(按优先级序),再逐个尝试:优先挑 GIF/WebP 等
+    // 原始格式;选中类型解码/落盘失败则试下一个(同图往往还有 TIFF 可解码)。
+    // Collect the types actually present (in priority order), then try them one by one:
+    // animation-capable originals win; a type whose data fails to decode or cache is
+    // skipped (the same image is usually also available as TIFF).
+    let mut present: Vec<&str> = PASTEBOARD_IMAGE_UTIS
+        .iter()
+        .copied()
+        .filter(|uti| bytes_for_type(uti).is_some())
+        .collect();
+    while let Some(uti) = preferred_uti(&present) {
+        present.retain(|u| *u != uti);
+        let data = bytes_for_type(uti).unwrap();
+        let Some(preview_png) = any_image_to_preview_png(&data) else {
+            continue;
+        };
+        let hash = fnv1a64(&data);
+        // 缓存写失败则本条目不收(粘贴时将无字节可写回,等于坏条目)。
+        // A failed cache write drops the entry (nothing to paste back later).
+        if !cache_write_image(hash, &data) {
+            continue;
+        }
+        return Some(ImageEntry {
+            uti: uti.to_string(),
+            hash,
+            data_path: clip_image_path(hash),
+            preview_png,
+            source_path: None,
+        });
     }
-    let tiff = bytes_for_type(NSPASTEBOARD_TYPE_TIFF)?;
-    // TIFF -> PNG:NSBitmapImageRep imageRepWithData: -> representationUsingType PNG(4)。
-    // TIFF -> PNG: NSBitmapImageRep imageRepWithData: -> representationUsingType PNG (4).
-    let data: *mut AnyObject = msg_send![class!(NSData), dataWithBytes: tiff.as_ptr() as *const c_void, length: tiff.len()];
-    let rep: *mut AnyObject = msg_send![class!(NSBitmapImageRep), imageRepWithData: data];
-    if rep.is_null() {
-        return None;
+    None
+}
+
+/// 文件扩展名 → 剪贴板 UTI 映射(图片类型清单的唯一来源,测试同步覆盖)。
+/// File extension -> pasteboard UTI mapping (the single image-format list; tests cover it).
+fn ext_to_uti(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some(NSPASTEBOARD_TYPE_PNG),
+        "jpg" | "jpeg" => Some(NSPASTEBOARD_TYPE_JPEG),
+        "gif" => Some(NSPASTEBOARD_TYPE_GIF),
+        "tiff" | "tif" => Some(NSPASTEBOARD_TYPE_TIFF),
+        "webp" => Some(NSPASTEBOARD_TYPE_WEBP),
+        "heic" | "heif" => Some(NSPASTEBOARD_TYPE_HEIC),
+        "bmp" => Some(NSPASTEBOARD_TYPE_BMP),
+        _ => None,
     }
-    let png: *mut AnyObject =
-        msg_send![rep, representationUsingType: 4u64, properties: std::ptr::null::<AnyObject>()];
-    if png.is_null() {
-        return None;
-    }
-    let len: usize = msg_send![png, length];
-    let ptr: *const c_void = msg_send![png, bytes];
-    if ptr.is_null() || len == 0 {
-        return None;
-    }
-    Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
 }
 
 /// 文件扩展名是否为图片类型(小写匹配)。/ Whether a file extension denotes an image.
+#[cfg(test)]
 fn is_image_extension(path: &str) -> bool {
-    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    matches!(
-        ext.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "tiff" | "tif" | "webp" | "heic" | "heif" | "bmp"
-    )
+    ext_to_uti(path).is_some()
 }
 
 /// 图片文件复制(Finder 里 Cmd+C 一个图片文件):剪贴板上只有文件名文本 + 一个
 /// `public.file-url`。识别条件:file-url 存在,且文本恰好等于该文件的文件名——这时按
-/// "文件复制"处理,读出图片内容(已是 PNG 直接用,其它格式经 NSImage 转 PNG),
+/// "文件复制"处理,读一次文件内容(瞬时):算 hash 写入**影子副本**缓存(源文件
+/// 被删/移动后粘贴仍可用),原始字节不驻内存;另派生降采样 PNG 预览。
 /// 让用户复制的图片文件记成图片条目,而不是孤零零的文件名。
+/// 预览解码失败(文件损坏/伪扩展名)→ None(走原文本逻辑)。
 /// 非图片文件 / 文本与文件名不符 / 多文件 → None(走原文本逻辑)。
 /// An image-FILE copy (Cmd+C on an image file in Finder): the pasteboard carries only the
-/// filename as text plus a `public.file-url`. Recognition: a file-url exists AND the text is
-/// exactly that file's name -- then it is a FILE copy: the image content is read (PNG is
-/// used as-is, other formats are converted via NSImage), so the copied image file lands as
-/// an image entry instead of a bare filename. Non-image files / text/name mismatch /
-/// multiple files -> None (fall back to the text path).
-unsafe fn file_copy_image_png(text: &str) -> Option<Vec<u8>> {
+/// filename as text plus a `public.file-url`. Recognition: a file-url exists AND the text
+/// is exactly that file's name -- then it is a FILE copy: the file is read once
+/// (transiently), hashed, and a SHADOW copy is written to the disk cache (paste still
+/// works after the source is deleted/moved); the original bytes never stay in memory. A
+/// downsampled PNG preview is derived. The copied image file lands as an image entry
+/// instead of a bare filename. Preview-decode failure (corrupt file / fake extension) ->
+/// None (fall back to the text path). Non-image files / text/name mismatch / multiple
+/// files -> None.
+unsafe fn file_copy_image(text: &str) -> Option<ImageEntry> {
     let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
     if pb.is_null() {
         return None;
@@ -750,47 +1060,26 @@ unsafe fn file_copy_image_png(text: &str) -> Option<Vec<u8>> {
     if name != text {
         return None;
     }
-    if !is_image_extension(&path) {
-        return None;
-    }
+    let uti = ext_to_uti(&path)?;
     let bytes = std::fs::read(&path).ok()?;
     if bytes.is_empty() {
         return None;
     }
-    if path.to_ascii_lowercase().ends_with(".png") {
-        return Some(bytes);
-    }
-    // 非 PNG 图片格式 → NSImage → PNG 转码(与 TIFF 转码同款管线)。
-    // Non-PNG image formats -> NSImage -> PNG conversion (same pipeline as the TIFF path).
-    let data: *mut AnyObject = msg_send![
-        class!(NSData),
-        dataWithBytes: bytes.as_ptr() as *const c_void,
-        length: bytes.len()
-    ];
-    let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let img: *mut AnyObject = msg_send![img, initWithData: data];
-    if img.is_null() {
+    let hash = fnv1a64(&bytes);
+    // 影子副本:源文件被删/移动后,粘贴回退仍能按原 UTI 写回。
+    // The shadow copy: after the source file is deleted/moved, the paste fallback can
+    // still write the original UTI back.
+    if !cache_write_image(hash, &bytes) {
         return None;
     }
-    let tiff: *mut AnyObject = msg_send![img, TIFFRepresentation];
-    if tiff.is_null() {
-        return None;
-    }
-    let rep: *mut AnyObject = msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff];
-    if rep.is_null() {
-        return None;
-    }
-    let png: *mut AnyObject =
-        msg_send![rep, representationUsingType: 4u64, properties: std::ptr::null::<AnyObject>()];
-    if png.is_null() {
-        return None;
-    }
-    let len: usize = msg_send![png, length];
-    let ptr: *const c_void = msg_send![png, bytes];
-    if ptr.is_null() || len == 0 {
-        return None;
-    }
-    Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
+    let preview_png = any_image_to_preview_png(&bytes)?;
+    Some(ImageEntry {
+        uti: uti.to_string(),
+        hash,
+        data_path: clip_image_path(hash),
+        preview_png,
+        source_path: Some(path),
+    })
 }
 /// 把文本写回剪贴板(粘贴路径)。写回会 bump changeCount,下次轮询读到的是本文本,
 /// 但 record_text 的去重(与栈顶相同)会忽略它,不会产生重复条目。
@@ -821,28 +1110,88 @@ unsafe fn write_pasteboard_text(text: &str) {
     CFRelease(ns as *const c_void);
 }
 
-/// 把 PNG 图片写回剪贴板(图片粘贴路径)。同样先 clearContents 再 setData。
-/// Write a PNG image back to the pasteboard (the image paste path). Same clearContents
-/// then setData flow.
-unsafe fn write_pasteboard_png(png: &[u8]) {
+/// 把图片按**原始格式**写回剪贴板(图片粘贴路径):先 clearContents 再 setData,
+/// UTI 用条目保存的原始类型——JPG 粘回 JPG,GIF 动图粘回动图,不再统一转 PNG。
+/// 原始字节在粘贴瞬间从磁盘缓存读回(不入内存驻留);缓存缺失(被清)返回 false,
+/// 调用方应跳过合成 Cmd+V,避免把旧剪贴板内容粘出去。
+/// Write an image back to the pasteboard in its ORIGINAL format (the image paste path).
+/// Same clearContents then setData flow; the UTI is the entry's original type -- a JPG
+/// pastes back as JPG, an animated GIF as a GIF, never a blanket PNG re-encode. The
+/// original bytes are read back from the disk cache at paste time (never held in memory);
+/// a cache miss returns false and the caller must skip the synthesized Cmd+V so the OLD
+/// pasteboard content is not pasted.
+unsafe fn write_pasteboard_image(entry: &ImageEntry) -> bool {
+    let Some(data) = cache_read_image(entry.hash) else {
+        log_debug!(
+            "[clip] image cache miss on paste (hash={:016x}, uti={})",
+            entry.hash,
+            entry.uti
+        );
+        return false;
+    };
+    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pb.is_null() {
+        return false;
+    }
+    let _: isize = msg_send![pb, clearContents];
+    let type_ns = make_nsstring(&entry.uti);
+    let data_obj: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: data.as_ptr() as *const c_void,
+        length: data.len()
+    ];
+    let ok: bool = msg_send![pb, setData: data_obj, forType: type_ns];
+    log_debug!(
+        "[clip] write back image ({} bytes, uti={}, setData ok={})",
+        data.len(),
+        entry.uti,
+        ok
+    );
+    CFRelease(type_ns as *const c_void);
+    ok
+}
+
+/// 把文件复制写回剪贴板(文件复制的粘贴路径):恢复 `public.file-url` + 文件名文本,
+/// 与 Finder 原生文件复制一致——粘贴进 Finder 复制原文件(GIF 等格式原封不动)、
+/// 粘贴进聊天应用附加文件;而非把图片数据当纯图片粘贴(Finder 会忽略,部分应用
+/// 还会重编码成 PNG)。
+/// Write a file copy back to the pasteboard (the file-copy paste path): restore
+/// `public.file-url` + the filename text, matching Finder's native file copy -- pasting
+/// into Finder duplicates the original file (GIF etc. untouched), pasting into a chat app
+/// attaches the file; instead of pasting image data as a bare image (which Finder ignores
+/// and some apps re-encode into PNG).
+unsafe fn write_pasteboard_file(path: &str) {
     let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
     if pb.is_null() {
         return;
     }
     let _: isize = msg_send![pb, clearContents];
-    let type_ns = make_nsstring(NSPASTEBOARD_TYPE_PNG);
-    let data: *mut AnyObject = msg_send![
-        class!(NSData),
-        dataWithBytes: png.as_ptr() as *const c_void,
-        length: png.len()
-    ];
-    let ok: bool = msg_send![pb, setData: data, forType: type_ns];
-    log_debug!(
-        "[clip] write back image ({} bytes, setData ok={})",
-        png.len(),
-        ok
-    );
+    // 文件名文本(与 Finder 复制文件时剪贴板上的字符串一致)。
+    // The filename text (same string Finder puts on the pasteboard for a file copy).
+    let name = path.rsplit('/').next().unwrap_or("");
+    let name_ns = make_nsstring(name);
+    let type_ns = make_nsstring(NSPASTEBOARD_TYPE_STRING);
+    let _: bool = msg_send![pb, setString: name_ns, forType: type_ns];
     CFRelease(type_ns as *const c_void);
+    CFRelease(name_ns as *const c_void);
+    // file:// URL(file-url + url 两种类型都写,兼容不同读取方)。
+    // The file:// URL (written as both file-url and url for reader compatibility).
+    let path_ns = make_nsstring(path);
+    let url: *mut AnyObject = msg_send![class!(NSURL), fileURLWithPath: path_ns];
+    CFRelease(path_ns as *const c_void);
+    if url.is_null() {
+        return;
+    }
+    let abs: *mut AnyObject = msg_send![url, absoluteString];
+    let url_str = nsstring_to_rust(abs);
+    let url_str_ns = make_nsstring(&url_str);
+    for uti in [NSPASTEBOARD_TYPE_FILE_URL, NSPASTEBOARD_TYPE_URL] {
+        let type_ns = make_nsstring(uti);
+        let _: bool = msg_send![pb, setString: url_str_ns, forType: type_ns];
+        CFRelease(type_ns as *const c_void);
+    }
+    CFRelease(url_str_ns as *const c_void);
+    log_debug!("[clip] write back file ({})", path);
 }
 
 // ========== 轮询 / polling ==========
@@ -904,16 +1253,17 @@ fn poll_clipboard() {
             // 否则按普通文本记录。
             // An image-FILE copy (Cmd+C on an image file in Finder): recognized as a file
             // copy -> recorded as an image entry; otherwise recorded as plain text.
-            let file_png = unsafe { file_copy_image_png(&text) };
-            if let Some(png) = file_png {
-                if record_image(&mut hist, &png, &source, &source_key, max_entries()) {
+            let file_img = unsafe { file_copy_image(&text) };
+            if let Some(img) = &file_img {
+                if record_image(&mut hist, img, &source, &source_key, max_entries()) {
                     log_debug!(
-                        "[clip] recorded image from file ({} bytes, total {})",
-                        png.len(),
+                        "[clip] recorded image from file (hash={:016x}, uti={}, total {})",
+                        img.hash,
+                        img.uti,
                         hist.len()
                     );
                 } else {
-                    log_debug!("[clip] change skipped: dup image ({} bytes)", png.len());
+                    log_debug!("[clip] change skipped: dup image (hash={:016x})", img.hash);
                 }
             } else if record_text(&mut hist, &text, &source, &source_key, max_entries()) {
                 log_debug!(
@@ -931,8 +1281,8 @@ fn poll_clipboard() {
         }
         // 无文本 → 尝试图片(图文同存时文本优先,第一版取舍)。
         // No text -> try an image (text wins when both are present; a v1 tradeoff).
-        None => match unsafe { read_pasteboard_png() } {
-            Some(png) => {
+        None => match unsafe { read_pasteboard_image() } {
+            Some(img) => {
                 let (source, pid) = crate::ffi::frontmost_app_info();
                 let source_key = if pid > 0 {
                     let id = unsafe { crate::window_collector::resolve_app_identity(pid) };
@@ -943,14 +1293,15 @@ fn poll_clipboard() {
                     String::new()
                 };
                 let mut hist = CLIP_HISTORY.lock().unwrap();
-                if record_image(&mut hist, &png, &source, &source_key, max_entries()) {
+                if record_image(&mut hist, &img, &source, &source_key, max_entries()) {
                     log_debug!(
-                        "[clip] recorded image ({} bytes, total {})",
-                        png.len(),
+                        "[clip] recorded image (hash={:016x}, uti={}, total {})",
+                        img.hash,
+                        img.uti,
                         hist.len()
                     );
                 } else {
-                    log_debug!("[clip] change skipped: dup image ({} bytes)", png.len());
+                    log_debug!("[clip] change skipped: dup image (hash={:016x})", img.hash);
                 }
             }
             None => log_debug!("[clip] change but no text/image (non-pasteboard content?)"),
@@ -974,8 +1325,14 @@ pub fn start() {
         if !guard.0.is_null() {
             return; // 已在跑 / already running
         }
-        // 先记录当前剪贴板,否则首次呼出历史为空。
-        // Record the current pasteboard first, or the first summon would show an empty list.
+        // 先清空图片字节缓存再记录当前剪贴板:历史不持久化,上次会话残留的缓存
+        // 文件必为孤儿;先清后记,避免刚写下的缓存被自己清掉。
+        // Wipe the image-byte cache BEFORE recording the current pasteboard: the history
+        // is not persisted, so leftover cache files from a previous session are orphans;
+        // sweeping first keeps the just-written cache from being deleted.
+        clear_clip_image_cache();
+        // 再记录当前剪贴板,否则首次呼出历史为空。
+        // Then record the current pasteboard, or the first summon would show an empty list.
         poll_clipboard();
         // 注册剪贴板变化通知:每次变化即时记录,轮询间隔内的快速连续复制不丢失。
         // Register the pasteboard-change notification: instant recording on every change, so
@@ -1174,10 +1531,15 @@ extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _no
 /// "Clear all" button callback: empty the clipboard history and close the picker (an empty
 /// history is ignored on summon).
 extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // 清除全部时保留置顶条目(置顶 = 用户主动保存的常用内容)。
-    // "Clear all" keeps the pinned entries (pinned = content the user deliberately saved).
+    // 清除全部时保留置顶条目(置顶 = 用户主动保存的常用内容),被丢弃条目的
+    // 缓存文件一并删除。
+    // "Clear all" keeps the pinned entries (pinned = content the user deliberately saved);
+    // the dropped entries' cache files go too.
     let mut hist = CLIP_HISTORY.lock().unwrap();
     let kept = hist.iter().filter(|e| e.pinned).count();
+    for dropped in hist.iter().filter(|e| !e.pinned) {
+        cache_delete_for_entry(dropped);
+    }
     hist.retain(|e| e.pinned);
     log_info!(
         "Clipboard history cleared by user ({} pinned entries kept).",
@@ -2260,7 +2622,7 @@ unsafe fn rebuild_rows() {
         // no longer reserving width). Image entries = a thumbnail button (proportionally
         // scaled, clicking pastes too); text entries = the text button.
         let body: *mut AnyObject = msg_send![row_button_class(), alloc];
-        let is_image = entry.image_png.is_some();
+        let is_image = entry.image.is_some();
         let body_h = if is_image {
             IMG_PREVIEW_H
         } else {
@@ -2293,7 +2655,8 @@ unsafe fn rebuild_rows() {
             // target NSImage sized to the fit makes the image's point size exactly the
             // button's frame, so the cell scales nothing and the whole image shows at its
             // real proportions.
-            if let Some(png) = &entry.image_png {
+            if let Some(img) = &entry.image {
+                let png = &img.preview_png;
                 let data: *mut AnyObject = msg_send![
                     class!(NSData),
                     dataWithBytes: png.as_ptr() as *const c_void,
@@ -2679,14 +3042,56 @@ fn paste_at(idx: usize) {
     log_debug!("[clip] paste_at idx={}", idx);
     hide_picker();
     unsafe {
-        if let Some(png) = &entry.image_png {
-            write_pasteboard_png(png);
+        if let Some(img) = &entry.image {
+            // 文件复制条目:源文件还在 → 恢复文件语义(file-url)粘贴;文件已删除/
+            // 移动 → 回退为图片数据粘贴(字节来自影子副本缓存)。
+            // A file-copy entry: if the source file still exists, restore file semantics
+            // (file-url) for the paste; if it has been deleted/moved, fall back to image
+            // data (bytes from the shadow-copy cache).
+            let ok = match paste_kind(img) {
+                PasteKind::File(path) => {
+                    write_pasteboard_file(&path);
+                    true
+                }
+                PasteKind::Image if img.source_path.is_some() => {
+                    log_debug!(
+                        "[clip] source file gone, fall back to image paste (uti={})",
+                        img.uti
+                    );
+                    write_pasteboard_image(img)
+                }
+                PasteKind::Image => write_pasteboard_image(img),
+            };
+            // 写回失败(如缓存缺失)时跳过合成 Cmd+V,避免把旧剪贴板内容粘出去。
+            // On a failed write-back (e.g. cache miss) skip the synthesized Cmd+V, so the
+            // OLD pasteboard content is not pasted.
+            if ok {
+                synthesize_paste();
+            }
         } else {
             write_pasteboard_text(&entry.text);
+            synthesize_paste();
         }
-        synthesize_paste();
     }
     log_debug!("[clip] pasted entry {}", idx);
+}
+
+/// 粘贴内容判定:文件复制条目且源文件仍存在 → 文件粘贴(恢复 file-url);
+/// 其余情况 → 图片数据粘贴(按原始 UTI)。纯函数,便于单测。
+/// Decide the paste kind: a file-copy entry whose source file still exists pastes as a
+/// FILE (restoring the file-url); everything else pastes as image data (original UTI).
+/// Pure, unit-tested.
+#[derive(Debug, Clone, PartialEq)]
+enum PasteKind {
+    File(String),
+    Image,
+}
+
+fn paste_kind(img: &ImageEntry) -> PasteKind {
+    match &img.source_path {
+        Some(path) if std::path::Path::new(path).exists() => PasteKind::File(path.clone()),
+        _ => PasteKind::Image,
+    }
 }
 
 /// 先关闭浮窗后合成 Cmd+V(keyDown + keyUp,post 到 session 层)。
@@ -3043,9 +3448,9 @@ pub(crate) fn smoke_runner() -> bool {
         // 无来源条目:标题栏应显示"未知来源",无图标。
         // A source-less entry: the header shows "unknown source", no icon.
         record_text(&mut hist, "legacy entry without a source", "", "", 50);
-        // 图片条目:1x1 透明 PNG(内存构造),覆盖缩略图渲染/清理路径。
-        // An image entry: a 1x1 transparent PNG built in memory, covering the thumbnail
-        // render/cleanup paths.
+        // 图片条目:1x1 透明 PNG(写入测试缓存目录 + 构造引用),覆盖缩略图渲染/清理路径。
+        // An image entry: a 1x1 transparent PNG (written into the test cache dir and
+        // referenced), covering the thumbnail render/cleanup paths.
         const TINY_PNG: &[u8] = &[
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
             0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
@@ -3053,12 +3458,21 @@ pub(crate) fn smoke_runner() -> bool {
             0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
             0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
-        record_image(&mut hist, TINY_PNG, "Safari", "com.apple.Safari", 50);
+        let tiny_hash = fnv1a64(TINY_PNG);
+        let _ = cache_write_image(tiny_hash, TINY_PNG);
+        let tiny = ImageEntry {
+            uti: NSPASTEBOARD_TYPE_PNG.to_string(),
+            hash: tiny_hash,
+            data_path: clip_image_path(tiny_hash),
+            preview_png: TINY_PNG.to_vec(),
+            source_path: None,
+        };
+        record_image(&mut hist, &tiny, "Safari", "com.apple.Safari", 50);
         // 同图再复制一次:内容哈希去重,历史不增长(验证图片去重)。
         // Re-copying the same image: the content-hash dedup keeps the history from growing
         // (exercises image dedup).
         let before = hist.len();
-        record_image(&mut hist, TINY_PNG, "Safari", "com.apple.Safari", 50);
+        record_image(&mut hist, &tiny, "Safari", "com.apple.Safari", 50);
         assert_eq!(hist.len(), before, "same image must dedup");
     }
     show_picker();
@@ -3179,7 +3593,7 @@ unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
 
 #[cfg(test)]
 mod tests {
-    use super::ClipEntry;
+    use super::{ClipEntry, ImageEntry, NSPASTEBOARD_TYPE_PNG};
 
     /// 测试用的 3 参便捷包装(来源与图标键留空,既有用例不受签名变化影响)。
     /// A 3-arg convenience wrapper for tests (empty source and icon key; existing cases are
@@ -3191,7 +3605,7 @@ mod tests {
     fn entry(text: &str) -> ClipEntry {
         ClipEntry {
             text: text.to_string(),
-            image_png: None,
+            image: None,
             pinned: false,
             source_app: String::new(),
             source_key: String::new(),
@@ -3201,7 +3615,7 @@ mod tests {
     fn entry_with_source(text: &str, source: &str) -> ClipEntry {
         ClipEntry {
             text: text.to_string(),
-            image_png: None,
+            image: None,
             pinned: false,
             source_app: source.to_string(),
             source_key: String::new(),
@@ -3211,18 +3625,46 @@ mod tests {
     fn entry_with_identity(text: &str, source: &str, key: &str) -> ClipEntry {
         ClipEntry {
             text: text.to_string(),
-            image_png: None,
+            image: None,
             pinned: false,
             source_app: source.to_string(),
             source_key: key.to_string(),
         }
     }
 
+    /// 测试用图片条目:把字节写入**测试缓存目录**并按引用构造(与真实录制路径
+    /// 一致;预览与原始字节共用同一份小数据)。无文件来源。
+    /// A test image entry: the bytes are written into the TEST cache dir and referenced,
+    /// mirroring the real record path (the preview shares the small byte set). No file
+    /// source.
+    fn image(data: &[u8]) -> ImageEntry {
+        let hash = super::fnv1a64(data);
+        assert!(
+            super::cache_write_image(hash, data),
+            "test cache write must succeed"
+        );
+        ImageEntry {
+            uti: NSPASTEBOARD_TYPE_PNG.to_string(),
+            hash,
+            data_path: super::clip_image_path(hash),
+            preview_png: data.to_vec(),
+            source_path: None,
+        }
+    }
+
+    /// 测试用文件复制图片条目(带来源路径)。
+    /// An image entry from a file copy for tests (with a source path).
+    fn image_from_file(data: &[u8], path: &str) -> ImageEntry {
+        let mut e = image(data);
+        e.source_path = Some(path.to_string());
+        e
+    }
+
     /// 测试用图片条目 / an image entry for tests.
     fn entry_image(png: &[u8]) -> ClipEntry {
         ClipEntry {
             text: String::new(),
-            image_png: Some(png.to_vec()),
+            image: Some(image(png)),
             pinned: false,
             source_app: "Safari".to_string(),
             source_key: "com.apple.Safari".to_string(),
@@ -3325,26 +3767,51 @@ mod tests {
     }
 
     #[test]
+    fn ext_to_uti_maps_every_supported_extension() {
+        use super::{
+            ext_to_uti, NSPASTEBOARD_TYPE_BMP, NSPASTEBOARD_TYPE_GIF, NSPASTEBOARD_TYPE_HEIC,
+            NSPASTEBOARD_TYPE_JPEG, NSPASTEBOARD_TYPE_PNG, NSPASTEBOARD_TYPE_TIFF,
+            NSPASTEBOARD_TYPE_WEBP,
+        };
+        // 每个支持的扩展名都映射到对应 UTI(大小写不敏感)。
+        // Every supported extension maps to its UTI (case-insensitive).
+        assert_eq!(ext_to_uti("/a/b/p.png"), Some(NSPASTEBOARD_TYPE_PNG));
+        assert_eq!(ext_to_uti("/a/b/p.PNG"), Some(NSPASTEBOARD_TYPE_PNG));
+        assert_eq!(ext_to_uti("/a/b/p.jpg"), Some(NSPASTEBOARD_TYPE_JPEG));
+        assert_eq!(ext_to_uti("/a/b/p.JPEG"), Some(NSPASTEBOARD_TYPE_JPEG));
+        assert_eq!(ext_to_uti("/a/b/p.gif"), Some(NSPASTEBOARD_TYPE_GIF));
+        assert_eq!(ext_to_uti("/a/b/p.tiff"), Some(NSPASTEBOARD_TYPE_TIFF));
+        assert_eq!(ext_to_uti("/a/b/p.tif"), Some(NSPASTEBOARD_TYPE_TIFF));
+        assert_eq!(ext_to_uti("/a/b/p.webp"), Some(NSPASTEBOARD_TYPE_WEBP));
+        assert_eq!(ext_to_uti("/a/b/p.heic"), Some(NSPASTEBOARD_TYPE_HEIC));
+        assert_eq!(ext_to_uti("/a/b/p.heif"), Some(NSPASTEBOARD_TYPE_HEIC));
+        assert_eq!(ext_to_uti("/a/b/p.bmp"), Some(NSPASTEBOARD_TYPE_BMP));
+        // 非图片格式不映射 / non-image formats don't map.
+        assert_eq!(ext_to_uti("/a/b/doc.pdf"), None);
+        assert_eq!(ext_to_uti("/a/b/noext"), None);
+    }
+
+    #[test]
     fn record_image_dedups_by_bytes_and_updates_source() {
         use super::record_image;
-        let png_a = b"fake-png-bytes-a";
-        let png_b = b"fake-png-bytes-b";
+        let img_a = image(b"fake-image-bytes-a");
+        let img_b = image(b"fake-image-bytes-b");
         let mut h = Vec::new();
         assert!(record_image(
             &mut h,
-            png_a,
+            &img_a,
             "Safari",
             "com.apple.Safari",
             50
         ));
         assert_eq!(h.len(), 1);
-        assert!(h[0].image_png.is_some());
+        assert!(h[0].image.is_some());
         assert!(h[0].text.is_empty());
         // 同一张图(相同字节)再次复制 → 去重移前,来源更新。
         // Re-copying the same bytes -> dedup to the front, source updated.
         assert!(record_image(
             &mut h,
-            png_a,
+            &img_a,
             "Chrome",
             "com.google.Chrome",
             50
@@ -3355,16 +3822,22 @@ mod tests {
         // Different bytes -> a new entry (newest first).
         assert!(record_image(
             &mut h,
-            png_b,
+            &img_b,
             "Safari",
             "com.apple.Safari",
             50
         ));
         assert_eq!(h.len(), 2);
         assert_eq!(h[0].text, "");
-        assert!(h[1].image_png.is_some());
+        assert!(h[1].image.is_some());
         // 空数据忽略 / empty data is ignored.
-        assert!(!record_image(&mut h, b"", "Safari", "com.apple.Safari", 50));
+        assert!(!record_image(
+            &mut h,
+            &image(b""),
+            "Safari",
+            "com.apple.Safari",
+            50
+        ));
     }
 
     #[test]
@@ -3372,9 +3845,201 @@ mod tests {
         use super::record_image;
         let mut h = Vec::new();
         for i in 0..3u8 {
-            record_image(&mut h, &[i], "Safari", "com.apple.Safari", 2);
+            record_image(&mut h, &image(&[i]), "Safari", "com.apple.Safari", 2);
         }
         assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn image_cache_write_read_delete_roundtrip() {
+        use super::{cache_delete_image, cache_read_image, cache_write_image, fnv1a64};
+        let bytes = b"cache-roundtrip-bytes";
+        let hash = fnv1a64(bytes);
+        // 写入 → 读回相同 / write -> read back identical.
+        assert!(cache_write_image(hash, bytes));
+        assert_eq!(cache_read_image(hash).as_deref(), Some(&bytes[..]));
+        // 幂等:同 hash 重复写不报错 / idempotent: re-writing the same hash is fine.
+        assert!(cache_write_image(hash, bytes));
+        // 删除 → 读回 None / delete -> read back None.
+        cache_delete_image(hash);
+        assert_eq!(cache_read_image(hash), None);
+    }
+
+    #[test]
+    fn delete_entry_removes_the_image_cache_file() {
+        use super::{cache_read_image, delete_entry};
+        let bytes = b"delete-entry-cleanup";
+        let img = image(bytes);
+        assert!(cache_read_image(img.hash).is_some());
+        let mut h = vec![ClipEntry {
+            text: String::new(),
+            image: Some(img.clone()),
+            pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+        }];
+        delete_entry(&mut h, 0);
+        assert!(h.is_empty());
+        // 条目删除 → 缓存文件一并删除 / the entry is gone -> so is its cache file.
+        assert_eq!(cache_read_image(img.hash), None);
+    }
+
+    #[test]
+    fn trim_beyond_max_deletes_dropped_image_cache_files() {
+        use super::{cache_read_image, record_image};
+        let mut h = Vec::new();
+        // max=2:塞 3 张图,最旧的一张被裁掉,其缓存文件必须删除。
+        // max=2: 3 images, the oldest is trimmed and its cache file must go.
+        let imgs: Vec<_> = (0..3u8).map(|i| image(&[b't', i, b'x'])).collect();
+        for img in &imgs {
+            record_image(&mut h, img, "Safari", "com.apple.Safari", 2);
+        }
+        assert_eq!(h.len(), 2);
+        assert_eq!(
+            cache_read_image(imgs[0].hash),
+            None,
+            "trimmed entry's file deleted"
+        );
+        assert!(cache_read_image(imgs[1].hash).is_some());
+        assert!(cache_read_image(imgs[2].hash).is_some());
+    }
+
+    #[test]
+    fn text_record_trim_deletes_dropped_image_cache_files() {
+        use super::{cache_read_image, record_image, record_text};
+        let mut h = Vec::new();
+        let img = image(b"text-trim-image");
+        record_image(&mut h, &img, "Safari", "com.apple.Safari", 2);
+        // 两条文本把图片条目挤出 max=2 → 缓存文件删除。
+        // Two text entries push the image out of max=2 -> its cache file is deleted.
+        record_text(&mut h, "a", "Ghostty", "com.mitchellh.ghostty", 2);
+        record_text(&mut h, "b", "Ghostty", "com.mitchellh.ghostty", 2);
+        assert_eq!(h.len(), 2);
+        assert!(h.iter().all(|e| e.image.is_none()));
+        assert_eq!(cache_read_image(img.hash), None);
+    }
+
+    #[test]
+    fn clear_clip_image_cache_wipes_the_test_dir_only() {
+        use super::{cache_read_image, cache_write_image, clear_clip_image_cache, fnv1a64};
+        let a = b"wipe-test-a";
+        let b = b"wipe-test-b";
+        let (ha, hb) = (fnv1a64(a), fnv1a64(b));
+        assert!(cache_write_image(ha, a));
+        assert!(cache_write_image(hb, b));
+        clear_clip_image_cache();
+        assert_eq!(cache_read_image(ha), None);
+        assert_eq!(cache_read_image(hb), None);
+    }
+
+    #[test]
+    fn paste_kind_prefers_the_file_when_it_still_exists() {
+        use super::{paste_kind, PasteKind};
+        use std::fs;
+        // 纯图片复制(无来源路径)→ 图片数据粘贴。
+        // A bare image copy (no source path) -> image data paste.
+        assert_eq!(paste_kind(&image(b"x")), PasteKind::Image);
+        // 文件复制但源文件已删除 → 回退图片数据粘贴。
+        // A file copy whose source file is gone -> fall back to image data.
+        assert_eq!(
+            paste_kind(&image_from_file(b"x", "/nonexistent/omt-gone.gif")),
+            PasteKind::Image
+        );
+        // 文件复制且源文件还在 → 文件粘贴(路径原样带回)。
+        // A file copy whose source file still exists -> file paste (path carried back).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("anim.gif");
+        fs::write(&p, b"GIF89a").unwrap();
+        assert_eq!(
+            paste_kind(&image_from_file(b"GIF89a", p.to_str().unwrap())),
+            PasteKind::File(p.to_str().unwrap().to_string())
+        );
+    }
+
+    #[test]
+    fn preferred_uti_picks_the_animated_original_over_static_reencodes() {
+        use super::{
+            preferred_uti, NSPASTEBOARD_TYPE_GIF, NSPASTEBOARD_TYPE_GIF_ALIAS,
+            NSPASTEBOARD_TYPE_JPEG, NSPASTEBOARD_TYPE_PNG, NSPASTEBOARD_TYPE_TIFF,
+            NSPASTEBOARD_TYPE_WEBP,
+        };
+        // 核心回归:动图 GIF + 静态 PNG/TIFF 同现时,必须选 GIF(否则历史存成
+        // 静态帧,Option+V 粘出去不再动)。这正是"某些对话框 Cmd+V 是动图、
+        // 我们的 Option+V 是静态图"的根因。
+        // Core regression: when an animated GIF coexists with static PNG/TIFF, GIF must
+        // win (otherwise the history holds a static frame and Option+V stops animating --
+        // the exact bug where Cmd+V pasted a GIF but ours pasted a static image).
+        assert_eq!(
+            preferred_uti(&[NSPASTEBOARD_TYPE_PNG, NSPASTEBOARD_TYPE_GIF]),
+            Some(NSPASTEBOARD_TYPE_GIF)
+        );
+        assert_eq!(
+            preferred_uti(&[NSPASTEBOARD_TYPE_TIFF, NSPASTEBOARD_TYPE_GIF]),
+            Some(NSPASTEBOARD_TYPE_GIF)
+        );
+        assert_eq!(
+            preferred_uti(&[
+                NSPASTEBOARD_TYPE_PNG,
+                NSPASTEBOARD_TYPE_JPEG,
+                NSPASTEBOARD_TYPE_GIF
+            ]),
+            Some(NSPASTEBOARD_TYPE_GIF)
+        );
+        // GIF 别名:只声明 public.gif(无 com.compuserve.gif)也能选中。
+        // The GIF alias: a pasteboard carrying only public.gif is recognized too.
+        assert_eq!(
+            preferred_uti(&[NSPASTEBOARD_TYPE_PNG, NSPASTEBOARD_TYPE_GIF_ALIAS]),
+            Some(NSPASTEBOARD_TYPE_GIF_ALIAS)
+        );
+        assert_eq!(
+            preferred_uti(&[NSPASTEBOARD_TYPE_TIFF, NSPASTEBOARD_TYPE_GIF_ALIAS]),
+            Some(NSPASTEBOARD_TYPE_GIF_ALIAS)
+        );
+        // 动图优先于所有静态格式;WebP 紧随 GIF。
+        // Animation wins over every static format; WebP follows right after GIF.
+        assert_eq!(
+            preferred_uti(&[NSPASTEBOARD_TYPE_PNG, NSPASTEBOARD_TYPE_WEBP]),
+            Some(NSPASTEBOARD_TYPE_WEBP)
+        );
+        // 无 GIF 时静态保真序:PNG > JPEG > TIFF。
+        // Without GIF, static fidelity order: PNG > JPEG > TIFF.
+        assert_eq!(
+            preferred_uti(&[NSPASTEBOARD_TYPE_JPEG, NSPASTEBOARD_TYPE_PNG]),
+            Some(NSPASTEBOARD_TYPE_PNG)
+        );
+        assert_eq!(
+            preferred_uti(&[NSPASTEBOARD_TYPE_TIFF, NSPASTEBOARD_TYPE_JPEG]),
+            Some(NSPASTEBOARD_TYPE_JPEG)
+        );
+        assert_eq!(
+            preferred_uti(&[NSPASTEBOARD_TYPE_TIFF]),
+            Some(NSPASTEBOARD_TYPE_TIFF)
+        );
+        // 什么都不存在 → None / nothing present -> None.
+        assert_eq!(preferred_uti(&[]), None);
+    }
+
+    #[test]
+    fn preferred_uti_order_pins_gif_before_static_fallbacks() {
+        use super::{
+            preferred_uti, NSPASTEBOARD_TYPE_BMP, NSPASTEBOARD_TYPE_GIF, NSPASTEBOARD_TYPE_HEIC,
+            NSPASTEBOARD_TYPE_PNG, NSPASTEBOARD_TYPE_TIFF,
+        };
+        // 顺序不变式:GIF 系恒排在所有静态兜底之前(防止将来被改回)。
+        // Order invariant: GIF always ranks before every static fallback (guards against
+        // someone reverting the order).
+        for static_uti in [
+            NSPASTEBOARD_TYPE_PNG,
+            NSPASTEBOARD_TYPE_HEIC,
+            NSPASTEBOARD_TYPE_BMP,
+            NSPASTEBOARD_TYPE_TIFF,
+        ] {
+            assert_eq!(
+                preferred_uti(&[static_uti, NSPASTEBOARD_TYPE_GIF]),
+                Some(NSPASTEBOARD_TYPE_GIF),
+                "GIF must rank before {static_uti}"
+            );
+        }
     }
 
     #[test]
