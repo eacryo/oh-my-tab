@@ -22,7 +22,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 - Handcrafted, zero-dependency i18n (English, Simplified Chinese, Traditional Chinese) with automatic locale detection and live system-language follow.
 - Per-launch log files with automatic 30-day retention (see [Logging](#logging)).
 - **Mouse control** (optional, off by default): scroll reversal, scroll modes (Default / Line with a per-tick line count), and disabling pointer acceleration — all configurable **per mouse device** (see [Configuration](#configuration)). This feature is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse), re-implemented from scratch in pure Rust (see [Credits](#credits)).
-- **Clipboard history** (optional, off by default): summon with **Option+V**; records plain text in memory (no persistence), with global dedup (re-copying an entry moves it to the front), per-entry pinning, per-entry delete (Backspace icon / key), and clear-all (keeps pinned entries). The picker follows the cursor.
+- **Clipboard history** (optional, off by default): summon with **Option+V**; records text and images with global dedup (re-copying an entry moves it to the front), per-entry pinning, per-entry delete (Backspace icon / key), and clear-all (keeps pinned entries). Images paste back in their **original format** (JPG → JPG, animated GIF → GIF, never a PNG re-encode) — the original bytes live in a disk cache so big images never sit in RAM; **file copies are stored as pure references** (the file is never read; pasting restores the file so Finder duplicates it as-is, like Windows Win+V / Maccy). The picker follows the cursor.
 
 ## Screenshots
 

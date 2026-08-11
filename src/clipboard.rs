@@ -6,12 +6,13 @@
 //! - Option+V 由 event_monitor 的 tap 检测,经 bridge 转主线程调用 on_clipboard_toggle,
 //!   显示/关闭浮窗;↑↓/Enter/Esc/点击选择,Enter 或点击 = 写回剪贴板 + 合成 Cmd+V
 //!   自动粘贴(行为同 Windows 的 Win+V)。
-//! - 文本条目存原文;图片条目**原始字节落盘**(`~/Library/Caches/oh-my-tab-clip-images/`,
+//! - 文本条目存原文;**图片数据**条目原始字节落盘(`~/Library/Caches/oh-my-tab-clip-images/`,
 //!   按内容哈希命名),内存只留降采样 PNG 预览;粘贴时按需读回,按原始 UTI 写回
-//!   (JPG 粘回 JPG、GIF 动图粘回动图)。文件复制的条目另记来源路径:粘贴时恢复
-//!   `public.file-url`(文件语义,同 Windows Win+V);源文件被删/移动则回退到影子
-//!   副本。启动时清空缓存目录(历史不持久化,残留必为孤儿),删除条目/清空/超上限
-//!   裁剪时联动删除对应缓存文件。
+//!   (JPG 粘回 JPG、GIF 动图粘回动图)。**文件复制**条目只存引用(来源路径 + UTI,
+//!   零字节:不读文件、不落盘,同 Windows Win+V / Maccy):粘贴时恢复 `public.file-url`,
+//!   应用按需读原文件;源文件被删/移动后该条目粘贴即失效(无影子副本)。行内显示
+//!   文件名文本(可搜索)。启动时清空缓存目录(历史不持久化,残留必为孤儿),删除
+//!   条目/清空/超上限裁剪时联动删除对应缓存文件。
 //!
 //! History clipboard module (text + images, no persistence).
 //!
@@ -22,14 +23,16 @@
 //!   bridge (on_clipboard_toggle), showing/hiding the picker. Arrow keys / Enter / Esc /
 //!   clicks navigate; Enter or a click = write back to the pasteboard + synthesize Cmd+V for
 //!   an automatic paste (mirrors Windows' Win+V).
-//! - Text entries keep the raw text; image entries keep their ORIGINAL bytes ON DISK
+//! - Text entries keep the raw text; image-DATA entries keep their ORIGINAL bytes ON DISK
 //!   (`~/Library/Caches/oh-my-tab-clip-images/`, keyed by a content hash) with only a
 //!   downsampled PNG preview in memory; pasting reads the bytes back on demand and writes
 //!   them under the original UTI (a JPG pastes back as JPG, an animated GIF as a GIF).
-//!   File-copy entries also remember the source path: pasting restores `public.file-url`
-//!   (file semantics, like Windows Win+V); a deleted/moved source falls back to the shadow
-//!   copy. The cache dir is wiped at startup (the history is not persisted, so leftovers
-//!   are orphans) and files are removed in sync with delete/clear-all/trim.
+//!   FILE-COPY entries are stored as pure references (source path + UTI, zero bytes: the
+//!   file is never read or written to disk, like Windows Win+V / Maccy): pasting restores
+//!   `public.file-url` and the target app reads the original file on demand; a deleted or
+//!   moved source makes the entry unpastable (no shadow copy). The row shows the filename
+//!   text (searchable). The cache dir is wiped at startup (the history is not persisted, so
+//!   leftovers are orphans) and files are removed in sync with delete/clear-all/trim.
 
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -399,41 +402,50 @@ fn row_top(idx: usize, pitches: &[f64]) -> f64 {
     rows_top_offset() + pitches.iter().take(idx).sum::<f64>()
 }
 
-/// 图片条目:原始格式字节的**磁盘引用** + UTI + 降采样 PNG 预览(+ 文件复制来源)。
-/// 原始字节不驻内存:录制时算 hash 并写入缓存文件,粘贴时按需从磁盘读回。
-/// 粘贴时按 `uti` 原样写回,预览只供缩略图用(动图取第一帧,不影响粘贴)。
-/// **文件复制**的条目额外记住来源路径——粘贴时恢复 `public.file-url`,把"文件"
-/// 而不是"图片数据"交回给目标应用(Finder 复制原文件、聊天应用附加文件,GIF 动画
-/// 因此完整保留;若把图片数据当纯图片粘贴,Finder 会直接忽略,部分应用还会重编码
-/// 成 PNG)。
-/// An image entry: a DISK reference to the original-format bytes + its UTI + a downsampled
-/// PNG preview (plus the source path for file copies). The original bytes never stay in
-/// memory: hashed and written to a cache file at record time, read back on paste. Pasting
-/// writes the original bytes back under `uti` verbatim; the preview is only for the
-/// thumbnail (first frame for animations, never pasted). Entries from a FILE copy also
-/// remember the source path -- pasting then restores `public.file-url`, handing the FILE
-/// (not the image data) to the target app (Finder duplicates the original file, chat apps
-/// attach the file, GIF animation fully preserved; bare image data is ignored by Finder
-/// and re-encoded into PNG by some apps).
+/// 图片条目,两种形态:
+/// - **数据条目**(图片数据复制):原始格式字节的**磁盘引用** + UTI + 降采样 PNG
+///   预览。原始字节不驻内存:录制时算 hash 写入缓存文件,粘贴时按需读回、按 `uti`
+///   原样写回(JPG 粘回 JPG、GIF 动图粘回动图);预览只供缩略图(动图取第一帧)。
+/// - **文件引用条目**(文件复制):只有 `source_path` + `uti`,**零字节**(hash=0、
+///   data_path/preview 为空)——文件内容从不读入。粘贴时恢复 `public.file-url`,把
+///   "文件"而不是"图片数据"交回给目标应用(Finder 复制原文件、聊天应用附加文件,
+///   GIF 动画因此完整保留;若把图片数据当纯图片粘贴,Finder 会直接忽略,部分应用
+///   还会重编码成 PNG);源文件被删/移动后该条目粘贴即失效。
+///
+/// An image entry, in two forms:
+/// - a DATA entry (image-data copy): a DISK reference to the original-format bytes + its
+///   UTI + a downsampled PNG preview. The original bytes never stay in memory: hashed and
+///   written to a cache file at record time, read back on paste and written verbatim under
+///   `uti` (a JPG pastes back as JPG, an animated GIF as a GIF); the preview is only for
+///   the thumbnail (first frame for animations, never pasted).
+/// - a FILE-REFERENCE entry (file copy): only `source_path` + `uti`, ZERO bytes
+///   (hash=0, empty data_path/preview) -- the file content is never read. Pasting restores
+///   `public.file-url`, handing the FILE (not the image data) to the target app (Finder
+///   duplicates the original file, chat apps attach the file, GIF animation fully
+///   preserved; bare image data is ignored by Finder and re-encoded into PNG by some
+///   apps); a deleted/moved source makes the entry unpastable.
 #[derive(Debug, Clone, PartialEq)]
 struct ImageEntry {
     /// 原始格式的 UTI(public.png / public.jpeg / com.compuserve.gif ...)。
     /// The original format's UTI (public.png / public.jpeg / com.compuserve.gif ...).
     uti: String,
-    /// 原始字节的内容哈希(FNV-1a):缓存文件名 + 图片查重(不重读字节)。
-    /// The original bytes' content hash (FNV-1a): the cache filename + image dedup key
-    /// (no re-reading of the bytes).
+    /// 原始字节的内容哈希(FNV-1a):缓存文件名 + 数据条目查重(不重读字节)。
+    /// 文件引用条目为 0。
+    /// The original bytes' content hash (FNV-1a): the cache filename + the data-entry
+    /// dedup key (no re-reading of the bytes). 0 for file-reference entries.
     hash: u64,
-    /// 原始格式字节的缓存文件路径(数据复制的正本,文件复制的影子副本)。
-    /// The cache file holding the original-format bytes (the master copy for image-data
-    /// copies, a shadow copy for file copies).
+    /// 原始格式字节的缓存文件路径(仅数据条目;文件引用条目为空)。
+    /// The cache file holding the original-format bytes (data entries only; empty for
+    /// file-reference entries).
     data_path: std::path::PathBuf,
-    /// 降采样 PNG 预览(缩略图绘制用;唯一常驻内存的图片字节,约 100-300KB)。
-    /// A downsampled PNG preview (thumbnail drawing; the only image bytes held in memory,
-    /// ~100-300KB).
+    /// 降采样 PNG 预览(数据条目缩略图绘制用;唯一常驻内存的图片字节,约 100-300KB)。
+    /// 文件引用条目为空(行内改显示文件名文本)。
+    /// A downsampled PNG preview (thumbnail drawing for data entries; the only image
+    /// bytes held in memory, ~100-300KB). Empty for file-reference entries (the row shows
+    /// the filename text instead).
     preview_png: Vec<u8>,
-    /// 文件复制的来源路径(None = 纯图片复制,非文件复制)。
-    /// The source path of a file copy (None = a bare image copy, not a file copy).
+    /// 文件复制的来源路径(None = 数据条目,纯图片复制)。
+    /// The source path of a file copy (None = a data entry, a bare image copy).
     source_path: Option<String>,
 }
 
@@ -602,21 +614,27 @@ fn record_text(
     true
 }
 
-/// 把一张图片(原始格式,字节已由调用方落盘)记入历史。规则与 record_text 一致,
-/// 但查重按内容哈希:
-/// - 空预览忽略(录制失败)
-/// - 内容哈希已存在 → 旧条目提到最前(保留置顶),来源更新为本次复制来源
-/// - 未命中 → 新条目(text 为空串,image = 原始格式)插到置顶区之后;超出 max 裁剪
+/// 把一张图片记入历史(两种条目):
+/// - **数据条目**(image-data copies,字节已由调用方落盘):查重按内容哈希
+/// - **文件引用条目**(file-copy references,零字节):查重按来源路径
+///
+/// 规则与 record_text 一致:
+/// - 空预览且无来源路径(录制失败)忽略
+/// - 已存在(同哈希 / 同路径)→ 旧条目提到最前(保留置顶),来源更新为本次复制来源
+/// - 未命中 → 新条目插到置顶区之后;超出 max 裁剪
 ///   同图不同编码的去重留待第二阶段(见被注释的 image_content_hash)。
 ///
-/// Record an image (original format, bytes already cached by the caller) into the history.
-/// Same rules as record_text, but dedup compares the content hash:
-/// - an empty preview is ignored (recording failed)
-/// - an existing content hash -> the old entry moves to the front (pinned kept), the source
+/// Record an image into the history (two kinds):
+/// - a DATA entry (image-data copy, bytes already cached by the caller): dedup by content
+///   hash
+/// - a FILE-REFERENCE entry (file-copy reference, zero bytes): dedup by the source path
+///
+/// Same rules as record_text:
+/// - an empty preview AND no source path (recording failed) is ignored
+/// - an existing entry (same hash / same path) moves to the front (pinned kept), the source
 ///   updates
-/// - a new image (empty text, image = the original format) is inserted after the pinned
-///   block; entries beyond `max` are trimmed (cross-encoding dedup waits for phase 2, see
-///   the commented-out image_content_hash).
+/// - a new entry is inserted after the pinned block; entries beyond `max` are trimmed
+///   (cross-encoding dedup waits for phase 2, see the commented-out image_content_hash).
 fn record_image(
     history: &mut Vec<ClipEntry>,
     image: &ImageEntry,
@@ -624,14 +642,24 @@ fn record_image(
     source_key: &str,
     max: usize,
 ) -> bool {
-    if image.preview_png.is_empty() || max == 0 {
+    if (image.preview_png.is_empty() && image.source_path.is_none()) || max == 0 {
         return false;
     }
-    let hash = image.hash;
-    if let Some(idx) = history
-        .iter()
-        .position(|e| e.image.as_ref().map(|i| i.hash) == Some(hash))
-    {
+    // 文件引用条目无字节哈希 → 按来源路径查重;数据条目按内容哈希查重。
+    // File-reference entries have no byte hash -> dedup by source path; data entries dedup
+    // by content hash.
+    let dedup_hit = if image.source_path.is_some() {
+        history.iter().position(|e| {
+            e.image
+                .as_ref()
+                .is_some_and(|i| i.source_path.as_deref() == image.source_path.as_deref())
+        })
+    } else {
+        history
+            .iter()
+            .position(|e| e.image.as_ref().is_some_and(|i| i.hash == image.hash))
+    };
+    if let Some(idx) = dedup_hit {
         history[idx].source_app = source.to_string();
         history[idx].source_key = source_key.to_string();
         move_entry_to_front(history, idx);
@@ -641,7 +669,16 @@ fn record_image(
     history.insert(
         pos,
         ClipEntry {
-            text: String::new(),
+            // 文件引用条目把文件名放进 text:行内显示 + 可被搜索(粘贴走 image 分支,
+            // text 不会参与粘贴)。数据条目保持空 text。
+            // File-reference entries keep the filename in text: the row shows it and it is
+            // searchable (paste goes through the image branch; text never gets pasted).
+            // Data entries keep an empty text.
+            text: image
+                .source_path
+                .as_deref()
+                .map(|p| p.rsplit('/').next().unwrap_or("").to_string())
+                .unwrap_or_default(),
             image: Some(image.clone()),
             pinned: false,
             source_app: source.to_string(),
@@ -783,11 +820,13 @@ fn cache_delete_image(hash: u64) {
     let _ = std::fs::remove_file(clip_image_path(hash));
 }
 
-/// 删除一个图片条目对应的缓存文件(带 hash 才删)。
-/// Delete an image entry's cache file (only when it has a hash).
+/// 删除一个图片条目对应的缓存文件(文件引用条目 hash=0,无缓存文件可删)。
+/// Delete an image entry's cache file (file-reference entries have hash=0 and no file).
 fn cache_delete_for_entry(entry: &ClipEntry) {
     if let Some(img) = &entry.image {
-        cache_delete_image(img.hash);
+        if img.hash != 0 {
+            cache_delete_image(img.hash);
+        }
     }
 }
 
@@ -1019,20 +1058,24 @@ fn is_image_extension(path: &str) -> bool {
 
 /// 图片文件复制(Finder 里 Cmd+C 一个图片文件):剪贴板上只有文件名文本 + 一个
 /// `public.file-url`。识别条件:file-url 存在,且文本恰好等于该文件的文件名——这时按
-/// "文件复制"处理,读一次文件内容(瞬时):算 hash 写入**影子副本**缓存(源文件
-/// 被删/移动后粘贴仍可用),原始字节不驻内存;另派生降采样 PNG 预览。
-/// 让用户复制的图片文件记成图片条目,而不是孤零零的文件名。
-/// 预览解码失败(文件损坏/伪扩展名)→ None(走原文本逻辑)。
-/// 非图片文件 / 文本与文件名不符 / 多文件 → None(走原文本逻辑)。
+/// "文件复制"处理,**只存引用**:记录来源路径 + 按扩展名推导 UTI,**完全不读文件
+/// 字节**(零 I/O、磁盘/内存零驻留;与 Windows Win+V / Maccy 一致——文件复制永远
+/// 以引用流转,从不把内容拷进历史)。粘贴时恢复 `public.file-url`,应用按需读原文件。
+/// 源文件被删/移动后该条目粘贴即失效(无影子副本,这是本设计的取舍)。
+/// 文件条目没有缩略图预览,行内显示文件名文本;text 存文件名,可被搜索。
+/// 非图片文件 / 文本与文件名不符 / 多文件 / 文件不存在 → None(走原文本逻辑)。
 /// An image-FILE copy (Cmd+C on an image file in Finder): the pasteboard carries only the
 /// filename as text plus a `public.file-url`. Recognition: a file-url exists AND the text
-/// is exactly that file's name -- then it is a FILE copy: the file is read once
-/// (transiently), hashed, and a SHADOW copy is written to the disk cache (paste still
-/// works after the source is deleted/moved); the original bytes never stay in memory. A
-/// downsampled PNG preview is derived. The copied image file lands as an image entry
-/// instead of a bare filename. Preview-decode failure (corrupt file / fake extension) ->
-/// None (fall back to the text path). Non-image files / text/name mismatch / multiple
-/// files -> None.
+/// is exactly that file's name -- then it is a FILE copy stored as a REFERENCE ONLY: the
+/// source path + a UTI derived from the extension, with the file bytes NEVER read (zero
+/// I/O, nothing held on disk or in RAM; the same model as Windows Win+V / Maccy -- file
+/// copies always flow as references, their content is never pulled into the history).
+/// Pasting restores `public.file-url` and the target app reads the original file on
+/// demand. A deleted/moved source makes the entry unpastable (no shadow copy -- the
+/// accepted tradeoff of this design). File entries have no thumbnail; the row shows the
+/// filename text, and `text` holds the filename so entries are searchable. Non-image
+/// files / text/name mismatch / multiple files / a missing file -> None (fall back to the
+/// text path).
 unsafe fn file_copy_image(text: &str) -> Option<ImageEntry> {
     let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
     if pb.is_null() {
@@ -1061,23 +1104,17 @@ unsafe fn file_copy_image(text: &str) -> Option<ImageEntry> {
         return None;
     }
     let uti = ext_to_uti(&path)?;
-    let bytes = std::fs::read(&path).ok()?;
-    if bytes.is_empty() {
+    // 只做一次 stat 级存在性检查(不读字节):引用一个不存在的文件只会产生坏条目。
+    // A stat-level existence check only (no byte reads): referencing a missing file would
+    // only create a dead entry.
+    if !std::path::Path::new(&path).exists() {
         return None;
     }
-    let hash = fnv1a64(&bytes);
-    // 影子副本:源文件被删/移动后,粘贴回退仍能按原 UTI 写回。
-    // The shadow copy: after the source file is deleted/moved, the paste fallback can
-    // still write the original UTI back.
-    if !cache_write_image(hash, &bytes) {
-        return None;
-    }
-    let preview_png = any_image_to_preview_png(&bytes)?;
     Some(ImageEntry {
         uti: uti.to_string(),
-        hash,
-        data_path: clip_image_path(hash),
-        preview_png,
+        hash: 0,
+        data_path: std::path::PathBuf::new(),
+        preview_png: Vec::new(),
         source_path: Some(path),
     })
 }
@@ -1256,14 +1293,17 @@ fn poll_clipboard() {
             let file_img = unsafe { file_copy_image(&text) };
             if let Some(img) = &file_img {
                 if record_image(&mut hist, img, &source, &source_key, max_entries()) {
+                    // 文件复制 = 纯引用:日志只打来源路径 + UTI,绝不读文件内容。
+                    // A file copy is a pure reference: the log carries the source path + UTI
+                    // only, never the file's content.
                     log_debug!(
-                        "[clip] recorded image from file (hash={:016x}, uti={}, total {})",
-                        img.hash,
+                        "[clip] recorded file ref ({}, uti={}, total {})",
+                        img.source_path.as_deref().unwrap_or(""),
                         img.uti,
                         hist.len()
                     );
                 } else {
-                    log_debug!("[clip] change skipped: dup image (hash={:016x})", img.hash);
+                    log_debug!("[clip] change skipped: dup file ref, total {}", hist.len());
                 }
             } else if record_text(&mut hist, &text, &source, &source_key, max_entries()) {
                 log_debug!(
@@ -2645,67 +2685,80 @@ unsafe fn rebuild_rows() {
             let _: () = msg_send![body_layer, setMasksToBounds: true];
         }
         if is_image {
-            // 缩略图:PNG 字节 → NSImage。**预缩放**后挂到按钮:按钮 cell 对大图按原生
-            // 尺寸绘制再裁剪(实测只显示左上角一部分),而 setImageScaling: 不生效;
-            // 把原图画进适配尺寸的目标 NSImage,图片点尺寸恰好等于按钮 frame,
-            // cell 无需任何缩放逻辑,整图按原比例显示。
-            // The thumbnail: PNG bytes -> NSImage, PRE-SCALED onto the button: the button's
-            // cell draws large images at native size and crops them (measured: only the
-            // top-left shows), and setImageScaling: has no effect; drawing the source into a
-            // target NSImage sized to the fit makes the image's point size exactly the
-            // button's frame, so the cell scales nothing and the whole image shows at its
-            // real proportions.
             if let Some(img) = &entry.image {
-                let png = &img.preview_png;
-                let data: *mut AnyObject = msg_send![
-                    class!(NSData),
-                    dataWithBytes: png.as_ptr() as *const c_void,
-                    length: png.len()
-                ];
-                let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-                let image: *mut AnyObject = msg_send![image, initWithData: data];
-                if !image.is_null() {
-                    let img_size: NSSize = msg_send![image, size];
-                    let avail_w = row_w - BODY_PAD_X * 2.0;
-                    if img_size.width > 0.0 && img_size.height > 0.0 {
-                        // 等比适配可用区域(宽 IMG_PREVIEW_H 高),居中放置。
-                        // Fit proportionally into the available area (IMG_PREVIEW_H tall),
-                        // centered.
-                        let fit_scale =
-                            (avail_w / img_size.width).min(IMG_PREVIEW_H / img_size.height);
-                        let fit_w = img_size.width * fit_scale;
-                        let fit_h = img_size.height * fit_scale;
-                        let _: () = msg_send![
-                            body,
-                            setFrameOrigin: NSPoint::new(
-                                PAD_X + BODY_PAD_X,
-                                y + HEADER_H + BODY_GAP + (IMG_PREVIEW_H - fit_h) / 2.0
-                            )
-                        ];
-                        let _: () = msg_send![body, setFrameSize: NSSize::new(fit_w, fit_h)];
-                        // 预缩放:原图 → fit 尺寸目标图(与图标提取同款 lockFocus 管线)。
-                        // Pre-scale: the source -> a fit-sized target (the same lockFocus
-                        // pipeline as the icon extraction).
-                        let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
-                        let target: *mut AnyObject =
-                            msg_send![target, initWithSize: NSSize::new(fit_w, fit_h)];
-                        let _: () = msg_send![target, lockFocus];
-                        let dst = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(fit_w, fit_h));
-                        let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
-                        let op: usize = 1; // NSCompositingOperationCopy
-                        let _: () = msg_send![
-                            image,
-                            drawInRect: dst,
-                            fromRect: src,
-                            operation: op,
-                            fraction: 1.0f64
-                        ];
-                        let _: () = msg_send![target, unlockFocus];
-                        let _: () = msg_send![body, setImage: target];
-                        let _: () = msg_send![body, setImagePosition: 1isize]; // NSImageOnly
-                        release_obj(target);
+                if img.preview_png.is_empty() {
+                    // 文件引用条目(零字节、无缩略图):正文显示文件名文本(entry.text
+                    // 已存文件名)。与 Windows Win+V / Maccy 一致——文件条目以引用展示。
+                    // A file-reference entry (zero bytes, no thumbnail): the body shows the
+                    // filename text (entry.text already holds it). Like Windows Win+V /
+                    // Maccy, file entries are shown as references.
+                    let title = truncate_to_lines(&entry.text, LINE_MAX_UNITS, MAX_TEXT_LINES);
+                    let attr = make_row_attributed_title(&title, selected);
+                    let _: () = msg_send![body, setAttributedTitle: attr];
+                    release_obj(attr);
+                } else {
+                    // 缩略图:PNG 字节 → NSImage。**预缩放**后挂到按钮:按钮 cell 对大图按
+                    // 原生尺寸绘制再裁剪(实测只显示左上角一部分),而 setImageScaling: 不
+                    // 生效;把原图画进适配尺寸的目标 NSImage,图片点尺寸恰好等于按钮
+                    // frame,cell 无需任何缩放逻辑,整图按原比例显示。
+                    // The thumbnail: PNG bytes -> NSImage, PRE-SCALED onto the button: the
+                    // button's cell draws large images at native size and crops them (measured:
+                    // only the top-left shows), and setImageScaling: has no effect; drawing the
+                    // source into a target NSImage sized to the fit makes the image's point size
+                    // exactly the button's frame, so the cell scales nothing and the whole image
+                    // shows at its real proportions.
+                    let png = &img.preview_png;
+                    let data: *mut AnyObject = msg_send![
+                        class!(NSData),
+                        dataWithBytes: png.as_ptr() as *const c_void,
+                        length: png.len()
+                    ];
+                    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                    let image: *mut AnyObject = msg_send![image, initWithData: data];
+                    if !image.is_null() {
+                        let img_size: NSSize = msg_send![image, size];
+                        let avail_w = row_w - BODY_PAD_X * 2.0;
+                        if img_size.width > 0.0 && img_size.height > 0.0 {
+                            // 等比适配可用区域(宽 IMG_PREVIEW_H 高),居中放置。
+                            // Fit proportionally into the available area (IMG_PREVIEW_H tall),
+                            // centered.
+                            let fit_scale =
+                                (avail_w / img_size.width).min(IMG_PREVIEW_H / img_size.height);
+                            let fit_w = img_size.width * fit_scale;
+                            let fit_h = img_size.height * fit_scale;
+                            let _: () = msg_send![
+                                body,
+                                setFrameOrigin: NSPoint::new(
+                                    PAD_X + BODY_PAD_X,
+                                    y + HEADER_H + BODY_GAP + (IMG_PREVIEW_H - fit_h) / 2.0
+                                )
+                            ];
+                            let _: () = msg_send![body, setFrameSize: NSSize::new(fit_w, fit_h)];
+                            // 预缩放:原图 → fit 尺寸目标图(与图标提取同款 lockFocus 管线)。
+                            // Pre-scale: the source -> a fit-sized target (the same lockFocus
+                            // pipeline as the icon extraction).
+                            let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                            let target: *mut AnyObject =
+                                msg_send![target, initWithSize: NSSize::new(fit_w, fit_h)];
+                            let _: () = msg_send![target, lockFocus];
+                            let dst =
+                                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(fit_w, fit_h));
+                            let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+                            let op: usize = 1; // NSCompositingOperationCopy
+                            let _: () = msg_send![
+                                image,
+                                drawInRect: dst,
+                                fromRect: src,
+                                operation: op,
+                                fraction: 1.0f64
+                            ];
+                            let _: () = msg_send![target, unlockFocus];
+                            let _: () = msg_send![body, setImage: target];
+                            let _: () = msg_send![body, setImagePosition: 1isize]; // NSImageOnly
+                            release_obj(target);
+                        }
+                        release_obj(image);
                     }
-                    release_obj(image);
                 }
             }
         } else {
@@ -3043,22 +3096,20 @@ fn paste_at(idx: usize) {
     hide_picker();
     unsafe {
         if let Some(img) = &entry.image {
-            // 文件复制条目:源文件还在 → 恢复文件语义(file-url)粘贴;文件已删除/
-            // 移动 → 回退为图片数据粘贴(字节来自影子副本缓存)。
+            // 文件复制条目:源文件还在 → 恢复文件语义(file-url)粘贴(应用按需读
+            // 原文件);源文件已删除/移动 → 直接跳过(文件条目零字节,无内容可回退)。
             // A file-copy entry: if the source file still exists, restore file semantics
-            // (file-url) for the paste; if it has been deleted/moved, fall back to image
-            // data (bytes from the shadow-copy cache).
+            // (file-url) -- the target app reads the original file on demand; if the source
+            // is deleted/moved, skip the paste (a file reference holds no bytes to fall
+            // back to).
             let ok = match paste_kind(img) {
                 PasteKind::File(path) => {
                     write_pasteboard_file(&path);
                     true
                 }
                 PasteKind::Image if img.source_path.is_some() => {
-                    log_debug!(
-                        "[clip] source file gone, fall back to image paste (uti={})",
-                        img.uti
-                    );
-                    write_pasteboard_image(img)
+                    log_debug!("[clip] source file gone ({}), nothing to paste", img.uti);
+                    false
                 }
                 PasteKind::Image => write_pasteboard_image(img),
             };
@@ -3652,12 +3703,18 @@ mod tests {
         }
     }
 
-    /// 测试用文件复制图片条目(带来源路径)。
-    /// An image entry from a file copy for tests (with a source path).
-    fn image_from_file(data: &[u8], path: &str) -> ImageEntry {
-        let mut e = image(data);
-        e.source_path = Some(path.to_string());
-        e
+    /// 测试用**文件引用**条目(零字节:无 hash、无缓存文件、无预览,只带来源路径;
+    /// 与真实文件复制路径一致)。
+    /// A test FILE-REFERENCE entry (zero bytes: no hash, no cache file, no preview; just
+    /// the source path -- same as the real file-copy path).
+    fn image_from_file(path: &str) -> ImageEntry {
+        ImageEntry {
+            uti: NSPASTEBOARD_TYPE_PNG.to_string(),
+            hash: 0,
+            data_path: std::path::PathBuf::new(),
+            preview_png: Vec::new(),
+            source_path: Some(path.to_string()),
+        }
     }
 
     /// 测试用图片条目 / an image entry for tests.
@@ -3939,21 +3996,60 @@ mod tests {
         // 纯图片复制(无来源路径)→ 图片数据粘贴。
         // A bare image copy (no source path) -> image data paste.
         assert_eq!(paste_kind(&image(b"x")), PasteKind::Image);
-        // 文件复制但源文件已删除 → 回退图片数据粘贴。
-        // A file copy whose source file is gone -> fall back to image data.
+        // 文件引用但源文件已删除 → Image(调用方直接跳过,无字节可回退)。
+        // A file reference whose source file is gone -> Image (the caller skips the paste;
+        // a reference holds no bytes to fall back to).
         assert_eq!(
-            paste_kind(&image_from_file(b"x", "/nonexistent/omt-gone.gif")),
+            paste_kind(&image_from_file("/nonexistent/omt-gone.gif")),
             PasteKind::Image
         );
-        // 文件复制且源文件还在 → 文件粘贴(路径原样带回)。
-        // A file copy whose source file still exists -> file paste (path carried back).
+        // 文件引用且源文件还在 → 文件粘贴(路径原样带回)。
+        // A file reference whose source file still exists -> file paste (path carried back).
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("anim.gif");
         fs::write(&p, b"GIF89a").unwrap();
         assert_eq!(
-            paste_kind(&image_from_file(b"GIF89a", p.to_str().unwrap())),
+            paste_kind(&image_from_file(p.to_str().unwrap())),
             PasteKind::File(p.to_str().unwrap().to_string())
         );
+    }
+
+    #[test]
+    fn record_image_file_refs_dedup_by_path_and_keep_the_filename() {
+        use super::record_image;
+        // 同一文件再次复制 → 按来源路径去重移前,不产生重复条目。
+        // Re-copying the same file -> dedup by source path, no duplicate.
+        let mut h = Vec::new();
+        let p = "/Users/ceres/Downloads/vva划船.gif";
+        assert!(record_image(&mut h, &image_from_file(p), "Finder", "", 50));
+        assert_eq!(h.len(), 1);
+        // 条目 text 存文件名(行内显示 + 可搜索)。
+        // The entry's text holds the filename (row display + search).
+        assert_eq!(h[0].text, "vva划船.gif");
+        assert!(record_image(&mut h, &image_from_file(p), "Ghostty", "", 50));
+        assert_eq!(h.len(), 1, "same path must dedup");
+        assert_eq!(h[0].source_app, "Ghostty");
+        // 不同路径 → 新条目 / a different path -> a new entry.
+        let q = "/Users/ceres/Downloads/other.gif";
+        assert!(record_image(&mut h, &image_from_file(q), "Finder", "", 50));
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].text, "other.gif");
+        // 文件引用与数据条目互不误伤(同内容、不同形态 = 两条)。
+        // A file reference and a data entry never collide (same content, different forms).
+        let data_img = image(b"GIF89a");
+        assert!(record_image(&mut h, &data_img, "Safari", "", 50));
+        assert_eq!(h.len(), 3);
+        // 空预览且无来源路径 → 拒绝(录制失败)。
+        // An empty preview AND no source path -> rejected (recording failed).
+        let dead = super::ImageEntry {
+            uti: super::NSPASTEBOARD_TYPE_PNG.to_string(),
+            hash: 0,
+            data_path: std::path::PathBuf::new(),
+            preview_png: Vec::new(),
+            source_path: None,
+        };
+        assert!(!record_image(&mut h, &dead, "Safari", "", 50));
+        assert_eq!(h.len(), 3);
     }
 
     #[test]
