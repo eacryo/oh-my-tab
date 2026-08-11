@@ -69,7 +69,8 @@ struct SettingsUi {
     line_count_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
     disable_pointer_accel: *mut AnyObject,  // NSSwitch: 禁用指针加速 / disable pointer acceleration
     clipboard_enabled: *mut AnyObject,      // NSSwitch: 启用剪贴板历史 / enable clipboard history
-    clipboard_max_entries: *mut AnyObject,  // NSTextField: 历史最大条数 / max history entries
+    clipboard_persist: *mut AnyObject, // NSSwitch: 保存剪贴板历史记录 / persist clipboard history
+    clipboard_max_entries: *mut AnyObject, // NSTextField: 历史最大条数 / max history entries
     clipboard_show_source_app: *mut AnyObject, // NSSwitch: 显示来源应用 / show the source app
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
@@ -441,6 +442,13 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
     } else {
         crate::clipboard::stop();
     }
+
+    // persist 热切换:开启 → 从磁盘加载并合并历史(与 start() 的加载去重互幂等);
+    // 关闭 → 删除磁盘历史文件(内存历史保留到本次退出)。
+    // Persist hot-switch: ON -> load and merge the history from disk (idempotent with
+    // start()'s load, dedup makes the double-merge harmless); OFF -> delete the history
+    // file (the in-memory history stays until this session ends).
+    crate::clipboard::apply_persist_toggle(cfg.clipboard.persist);
 }
 
 /// 根据 enable_mouse switch 状态,冻结或解冻其下方的所有鼠标控件。
@@ -1062,6 +1070,10 @@ fn load_settings_from(cfg: &Config) {
             setState: if cfg.clipboard.enabled { 1isize } else { 0isize }
         ];
         let _: () = msg_send![
+            ui.clipboard_persist,
+            setState: if cfg.clipboard.persist { 1isize } else { 0isize }
+        ];
+        let _: () = msg_send![
             ui.clipboard_show_source_app,
             setState: if cfg.clipboard.show_source_app { 1isize } else { 0isize }
         ];
@@ -1260,6 +1272,8 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // Clipboard page (global config, not per-device).
         let cb_state: isize = msg_send![ui.clipboard_enabled, state];
         cfg.clipboard.enabled = cb_state == 1;
+        let persist_state: isize = msg_send![ui.clipboard_persist, state];
+        cfg.clipboard.persist = persist_state == 1;
         let src_state: isize = msg_send![ui.clipboard_show_source_app, state];
         cfg.clipboard.show_source_app = src_state == 1;
         match parse_usize(&nsstring_to_rust(msg_send![
@@ -1558,6 +1572,7 @@ fn create_settings_window() {
             line_count_value_label: std::ptr::null_mut(),
             disable_pointer_accel: std::ptr::null_mut(),
             clipboard_enabled: std::ptr::null_mut(),
+            clipboard_persist: std::ptr::null_mut(),
             clipboard_max_entries: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
@@ -2246,6 +2261,19 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_clipboard_enabled"),
+            make_switch(ctrl_x + ctrl_w, cy, row_h, false),
+        );
+        cy -= 8.0 + row_h;
+        // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。
+        // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
+        // privacy implications are documented in the README).
+        ui.clipboard_persist = add_row(
+            clipboard_view,
+            label_x,
+            cy,
+            label_w,
+            row_h,
+            &t("settings.row_clipboard_persist"),
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
         cy -= 8.0 + row_h;

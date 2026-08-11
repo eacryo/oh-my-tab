@@ -8,11 +8,13 @@
 //!   自动粘贴(行为同 Windows 的 Win+V)。
 //! - 文本条目存原文;**图片数据**条目原始字节落盘(`~/Library/Caches/oh-my-tab-clip-images/`,
 //!   按内容哈希命名),内存只留降采样 PNG 预览;粘贴时按需读回,按原始 UTI 写回
-//!   (JPG 粘回 JPG、GIF 动图粘回动图)。**文件复制**条目只存引用(来源路径 + UTI,
-//!   零字节:不读文件、不落盘,同 Windows Win+V / Maccy):粘贴时恢复 `public.file-url`,
-//!   应用按需读原文件;源文件被删/移动后该条目粘贴即失效(无影子副本)。行内显示
-//!   文件名文本(可搜索)。启动时清空缓存目录(历史不持久化,残留必为孤儿),删除
-//!   条目/清空/超上限裁剪时联动删除对应缓存文件。
+//!   (JPG 粘回 JPG、GIF 动图粘回动图)。**文件复制**条目:复制时读一次文件内容
+//!   (瞬时)算内容哈希 + 生成缩略图预览,字节丢弃(不写数据缓存、无影子副本,
+//!   同 Windows Win+V / Maccy 的引用语义):粘贴时恢复 `public.file-url`,应用按需读
+//!   原文件;源文件被删/移动后该条目粘贴即失效;内容哈希让原文件与访达副本
+//!   (不同路径同字节)去重成一条。行内显示缩略图,text 存文件名(可搜索)。
+//!   启动时清空缓存目录(历史不持久化,残留必为孤儿),删除条目/清空/超上限裁剪时
+//!   联动删除对应缓存文件。
 //!
 //! History clipboard module (text + images, no persistence).
 //!
@@ -27,12 +29,15 @@
 //!   (`~/Library/Caches/oh-my-tab-clip-images/`, keyed by a content hash) with only a
 //!   downsampled PNG preview in memory; pasting reads the bytes back on demand and writes
 //!   them under the original UTI (a JPG pastes back as JPG, an animated GIF as a GIF).
-//!   FILE-COPY entries are stored as pure references (source path + UTI, zero bytes: the
-//!   file is never read or written to disk, like Windows Win+V / Maccy): pasting restores
+//!   FILE-COPY entries read the file ONCE at record time (transiently) for a content hash
+//!   and a thumbnail preview, then discard the bytes (no data-cache write, no shadow
+//!   copy -- the reference semantics of Windows Win+V / Maccy): pasting restores
 //!   `public.file-url` and the target app reads the original file on demand; a deleted or
-//!   moved source makes the entry unpastable (no shadow copy). The row shows the filename
-//!   text (searchable). The cache dir is wiped at startup (the history is not persisted, so
-//!   leftovers are orphans) and files are removed in sync with delete/clear-all/trim.
+//!   moved source makes the entry unpastable; the content hash collapses a file and its
+//!   Finder duplicate (different paths, identical bytes) into one entry. The row shows the
+//!   thumbnail, and `text` holds the filename (searchable). The cache dir is wiped at
+//!   startup (the history is not persisted, so leftovers are orphans) and files are
+//!   removed in sync with delete/clear-all/trim.
 
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -47,6 +52,7 @@ use crate::{log_debug, log_info};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
+use serde::{Deserialize, Serialize};
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -402,15 +408,33 @@ fn row_top(idx: usize, pitches: &[f64]) -> f64 {
     rows_top_offset() + pitches.iter().take(idx).sum::<f64>()
 }
 
+/// u64 以十六进制字符串序列化:TOML 整数是 i64,高位置位的 hash 直接序列化会失败
+/// ("u64 value out of range"),哈希必须走字符串。
+/// u64 serialized as a hex string: TOML integers are i64, so hashes with the high bit
+/// set would fail to serialize ("u64 value out of range"); hashes must go as strings.
+mod u64_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{v:016x}"))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        let s = String::deserialize(d)?;
+        u64::from_str_radix(&s, 16).map_err(serde::de::Error::custom)
+    }
+}
+
 /// 图片条目,两种形态:
 /// - **数据条目**(图片数据复制):原始格式字节的**磁盘引用** + UTI + 降采样 PNG
 ///   预览。原始字节不驻内存:录制时算 hash 写入缓存文件,粘贴时按需读回、按 `uti`
 ///   原样写回(JPG 粘回 JPG、GIF 动图粘回动图);预览只供缩略图(动图取第一帧)。
-/// - **文件引用条目**(文件复制):只有 `source_path` + `uti`,**零字节**(hash=0、
-///   data_path/preview 为空)——文件内容从不读入。粘贴时恢复 `public.file-url`,把
-///   "文件"而不是"图片数据"交回给目标应用(Finder 复制原文件、聊天应用附加文件,
-///   GIF 动画因此完整保留;若把图片数据当纯图片粘贴,Finder 会直接忽略,部分应用
-///   还会重编码成 PNG);源文件被删/移动后该条目粘贴即失效。
+/// - **文件复制条目**(Finder 复制图片文件):复制时读一次文件内容(瞬时)算内容
+///   hash + 生成缩略图预览,字节丢弃(data_path 恒空,无影子副本)。hash 用于同内容
+///   去重(原文件与访达副本只留一条);`source_path` 记录来源。粘贴时恢复
+///   `public.file-url`,把"文件"而不是"图片数据"交回给目标应用(Finder 复制原文件、
+///   聊天应用附加文件,GIF 动画因此完整保留;若把图片数据当纯图片粘贴,Finder 会
+///   直接忽略,部分应用还会重编码成 PNG);源文件被删/移动后该条目粘贴即失效。
 ///
 /// An image entry, in two forms:
 /// - a DATA entry (image-data copy): a DISK reference to the original-format bytes + its
@@ -418,31 +442,43 @@ fn row_top(idx: usize, pitches: &[f64]) -> f64 {
 ///   written to a cache file at record time, read back on paste and written verbatim under
 ///   `uti` (a JPG pastes back as JPG, an animated GIF as a GIF); the preview is only for
 ///   the thumbnail (first frame for animations, never pasted).
-/// - a FILE-REFERENCE entry (file copy): only `source_path` + `uti`, ZERO bytes
-///   (hash=0, empty data_path/preview) -- the file content is never read. Pasting restores
-///   `public.file-url`, handing the FILE (not the image data) to the target app (Finder
-///   duplicates the original file, chat apps attach the file, GIF animation fully
-///   preserved; bare image data is ignored by Finder and re-encoded into PNG by some
-///   apps); a deleted/moved source makes the entry unpastable.
-#[derive(Debug, Clone, PartialEq)]
+/// - a FILE-COPY entry (an image file copied in Finder): the file is read ONCE at record
+///   time (transiently) for a content hash + a thumbnail preview, then the bytes are
+///   discarded (data_path is always empty, no shadow copy). The hash drives CONTENT dedup
+///   (a file and its Finder duplicate collapse into one entry); `source_path` records the
+///   source. Pasting restores `public.file-url`, handing the FILE (not the image data) to
+///   the target app (Finder duplicates the original file, chat apps attach the file, GIF
+///   animation fully preserved; bare image data is ignored by Finder and re-encoded into
+///   PNG by some apps); a deleted/moved source makes the entry unpastable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ImageEntry {
     /// 原始格式的 UTI(public.png / public.jpeg / com.compuserve.gif ...)。
     /// The original format's UTI (public.png / public.jpeg / com.compuserve.gif ...).
     uti: String,
-    /// 原始字节的内容哈希(FNV-1a):缓存文件名 + 数据条目查重(不重读字节)。
-    /// 文件引用条目为 0。
-    /// The original bytes' content hash (FNV-1a): the cache filename + the data-entry
-    /// dedup key (no re-reading of the bytes). 0 for file-reference entries.
+    /// 原始字节的内容哈希(FNV-1a):数据条目 = 缓存文件名 + 查重键;文件复制条目 =
+    /// 同内容去重键 + 预览文件名。解码失败的退化文件条目为 0。序列化为十六进制
+    /// 字符串(TOML 整数放不下 64 位无符号)。
+    /// The original bytes' content hash (FNV-1a): the cache filename + dedup key for data
+    /// entries; the content-dedup key + preview filename for file-copy entries. 0 for a
+    /// degenerate file entry whose decode failed. Serialized as a hex string (TOML
+    /// integers can't hold 64-bit unsigned values).
+    #[serde(with = "u64_hex")]
     hash: u64,
-    /// 原始格式字节的缓存文件路径(仅数据条目;文件引用条目为空)。
-    /// The cache file holding the original-format bytes (data entries only; empty for
-    /// file-reference entries).
+    /// 原始格式字节的缓存文件路径(仅数据条目;文件复制条目恒空——粘贴走 file-url)。
+    /// 序列化时跳过:加载时由 hash 重建。
+    /// The cache file holding the original-format bytes (data entries only; always empty
+    /// for file-copy entries -- pasting goes through the file-url). Skipped in
+    /// serialization: rebuilt from the hash on load.
+    #[serde(skip)]
     data_path: std::path::PathBuf,
-    /// 降采样 PNG 预览(数据条目缩略图绘制用;唯一常驻内存的图片字节,约 100-300KB)。
-    /// 文件引用条目为空(行内改显示文件名文本)。
-    /// A downsampled PNG preview (thumbnail drawing for data entries; the only image
-    /// bytes held in memory, ~100-300KB). Empty for file-reference entries (the row shows
-    /// the filename text instead).
+    /// 降采样 PNG 预览(缩略图绘制用;唯一常驻内存的图片字节,约 100-300KB)。
+    /// 序列化时跳过:预览单独落盘为 `{hash}.preview`,加载时读回(缺失则从数据字节
+    /// 或源文件重新生成)。
+    /// A downsampled PNG preview (thumbnail drawing; the only image bytes held in memory,
+    /// ~100-300KB). Skipped in serialization: the preview lives separately as
+    /// `{hash}.preview` and is read back on load (regenerated from the data bytes or the
+    /// source file when missing).
+    #[serde(skip)]
     preview_png: Vec<u8>,
     /// 文件复制的来源路径(None = 数据条目,纯图片复制)。
     /// The source path of a file copy (None = a data entry, a bare image copy).
@@ -452,7 +488,7 @@ struct ImageEntry {
 /// 历史条目:文本 + 置顶标记 + 来源应用名 + 来源图标缓存键。置顶条目恒在列表顶部。
 /// A history entry: text + a pinned flag + the source app name + the source icon-cache key.
 /// Pinned entries stay at the top.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ClipEntry {
     text: String,
     /// 图片条目(原始格式 + 预览;文本条目为 None)。图文同存时文本优先,
@@ -614,25 +650,31 @@ fn record_text(
     true
 }
 
-/// 把一张图片记入历史(两种条目):
+/// 把一张图片记入历史(两种条目,**各自按类去重,不跨类**):
 /// - **数据条目**(image-data copies,字节已由调用方落盘):查重按内容哈希
-/// - **文件引用条目**(file-copy references,零字节):查重按来源路径
+/// - **文件复制条目**(file copies,只读一次内容算哈希 + 缩略图,字节不落盘):
+///   查重按内容哈希——原文件与它在访达里的副本(不同路径、同样字节)只保留一条;
+///   解码失败的退化条目(hash=0)按来源路径查重
 ///
 /// 规则与 record_text 一致:
 /// - 空预览且无来源路径(录制失败)忽略
-/// - 已存在(同哈希 / 同路径)→ 旧条目提到最前(保留置顶),来源更新为本次复制来源
+/// - 已存在(同哈希 / 同路径)→ 旧条目提到最前(保留置顶),来源更新为本次复制来源;
+///   文件条目的来源路径一并更新为最新一次复制
 /// - 未命中 → 新条目插到置顶区之后;超出 max 裁剪
 ///   同图不同编码的去重留待第二阶段(见被注释的 image_content_hash)。
 ///
-/// Record an image into the history (two kinds):
+/// Record an image into the history (two kinds, EACH deduped within its own class):
 /// - a DATA entry (image-data copy, bytes already cached by the caller): dedup by content
 ///   hash
-/// - a FILE-REFERENCE entry (file-copy reference, zero bytes): dedup by the source path
+/// - a FILE-COPY entry (the file is read once for a hash + thumbnail, bytes never
+///   stored): dedup by content hash -- a file and its Finder duplicate (different paths,
+///   identical bytes) collapse into one entry; degenerate entries whose decode failed
+///   (hash=0) fall back to dedup by source path
 ///
 /// Same rules as record_text:
 /// - an empty preview AND no source path (recording failed) is ignored
-/// - an existing entry (same hash / same path) moves to the front (pinned kept), the source
-///   updates
+/// - an existing entry (same hash / same path) moves to the front (pinned kept), the
+///   source updates; a file entry's source path also updates to the latest copy
 /// - a new entry is inserted after the pinned block; entries beyond `max` are trimmed
 ///   (cross-encoding dedup waits for phase 2, see the commented-out image_content_hash).
 fn record_image(
@@ -645,23 +687,37 @@ fn record_image(
     if (image.preview_png.is_empty() && image.source_path.is_none()) || max == 0 {
         return false;
     }
-    // 文件引用条目无字节哈希 → 按来源路径查重;数据条目按内容哈希查重。
-    // File-reference entries have no byte hash -> dedup by source path; data entries dedup
-    // by content hash.
+    // 文件条目按内容哈希在文件条目内查重;退化条目(hash=0)按来源路径查重;
+    // 数据条目按内容哈希在数据条目内查重。三类互不跨类。
+    // File entries dedup by content hash among file entries (degenerate hash=0 entries by
+    // path); data entries dedup by content hash among data entries. Never across classes.
     let dedup_hit = if image.source_path.is_some() {
+        history.iter().position(|e| {
+            e.image.as_ref().is_some_and(|i| {
+                i.source_path.is_some()
+                    && if image.hash != 0 {
+                        i.hash == image.hash
+                    } else {
+                        i.source_path.as_deref() == image.source_path.as_deref()
+                    }
+            })
+        })
+    } else {
         history.iter().position(|e| {
             e.image
                 .as_ref()
-                .is_some_and(|i| i.source_path.as_deref() == image.source_path.as_deref())
+                .is_some_and(|i| i.source_path.is_none() && i.hash == image.hash)
         })
-    } else {
-        history
-            .iter()
-            .position(|e| e.image.as_ref().is_some_and(|i| i.hash == image.hash))
     };
     if let Some(idx) = dedup_hit {
         history[idx].source_app = source.to_string();
         history[idx].source_key = source_key.to_string();
+        // 文件条目去重命中:来源路径更新为最新一次复制(粘贴恢复最新文件)。
+        // A file-entry dedup hit: the source path updates to the latest copy (pasting
+        // restores the newest file).
+        if image.source_path.is_some() {
+            history[idx].image.as_mut().unwrap().source_path = image.source_path.clone();
+        }
         move_entry_to_front(history, idx);
         return true;
     }
@@ -815,13 +871,47 @@ fn cache_read_image(hash: u64) -> Option<Vec<u8>> {
     std::fs::read(clip_image_path(hash)).ok()
 }
 
-/// 删除一个缓存文件。/ Delete one cache file.
+/// 删除一个缓存文件(数据字节 + 预览一并删除)。/ Delete a cache file (data + preview).
 fn cache_delete_image(hash: u64) {
     let _ = std::fs::remove_file(clip_image_path(hash));
+    let _ = std::fs::remove_file(clip_image_preview_path(hash));
 }
 
-/// 删除一个图片条目对应的缓存文件(文件引用条目 hash=0,无缓存文件可删)。
-/// Delete an image entry's cache file (file-reference entries have hash=0 and no file).
+/// hash → 预览文件路径(缩略图单独落盘,重启加载历史时不必重新解码)。
+/// hash -> the preview file path (the thumbnail is persisted separately so loading the
+/// history after a restart needs no re-decoding).
+fn clip_image_preview_path(hash: u64) -> std::path::PathBuf {
+    clip_image_cache_dir().join(format!("{hash:016x}.preview"))
+}
+
+/// 把预览 PNG 写入缓存(幂等)。/ Write the preview PNG into the cache (idempotent).
+fn cache_write_preview(hash: u64, preview: &[u8]) -> bool {
+    let dir = clip_image_cache_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let path = clip_image_preview_path(hash);
+    if path.exists() {
+        return true;
+    }
+    let tmp = dir.join(format!("{hash:016x}.preview.tmp"));
+    let ok = std::fs::write(&tmp, preview).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ok
+}
+
+/// 读回预览 PNG(缺失返回 None,调用方从数据字节重新生成)。
+/// Read the preview back (None when missing; the caller regenerates from the data bytes).
+fn cache_read_preview(hash: u64) -> Option<Vec<u8>> {
+    std::fs::read(clip_image_preview_path(hash)).ok()
+}
+
+/// 删除一个图片条目对应的缓存文件(数据字节 + 预览一并删除;退化文件条目
+/// hash=0 无文件可删)。
+/// Delete an image entry's cache file (data bytes + preview together; a degenerate file
+/// entry with hash=0 has no files).
 fn cache_delete_for_entry(entry: &ClipEntry) {
     if let Some(img) = &entry.image {
         if img.hash != 0 {
@@ -838,6 +928,264 @@ fn clear_clip_image_cache() {
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+// ========== 历史持久化 / history persistence ==========
+
+/// 历史文件格式版本(结构变更时递增;加载遇到更高版本时放弃,按空历史启动)。
+/// The history file format version (bump on structural changes; a higher version is
+/// ignored on load and the app starts with an empty history).
+const HISTORY_VERSION: u32 = 1;
+
+/// 历史文件包装结构(带版本号,方便将来演进)。
+/// The history file wrapper (versioned, for future evolution).
+#[derive(Debug, Serialize, Deserialize)]
+struct HistoryFile {
+    version: u32,
+    entries: Vec<ClipEntry>,
+}
+
+/// 持久化历史文件路径(与 config.toml 同目录;测试构建走测试目录)。
+/// The persisted-history path (same dir as config.toml; test builds use a test dir).
+fn history_file_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = if cfg!(test) {
+        format!(
+            "{}/Library/Caches/oh-my-tab-clip-images-test-{:?}/history",
+            home,
+            std::thread::current().id()
+        )
+    } else {
+        format!("{}/.config/oh-my-tab", home)
+    };
+    std::path::PathBuf::from(dir).join("clipboard-history.toml")
+}
+
+/// 当前是否开启历史持久化(从 CONFIG 读)。
+/// Whether history persistence is enabled (read from CONFIG).
+fn persist_enabled() -> bool {
+    CONFIG.read().map(|c| c.clipboard.persist).unwrap_or(false)
+}
+
+/// 序列化历史(纯函数,便于单测)。/ Serialize the history (pure, unit-tested).
+fn serialize_history(entries: &[ClipEntry]) -> Option<String> {
+    let payload = HistoryFile {
+        version: HISTORY_VERSION,
+        entries: entries.to_vec(),
+    };
+    toml::to_string(&payload).ok()
+}
+
+/// 解析历史文件文本:损坏或版本不匹配 → None(调用方按空历史处理)。
+/// Parse the history text: corruption or a version mismatch -> None (the caller treats it
+/// as an empty history).
+fn parse_history(text: &str) -> Option<Vec<ClipEntry>> {
+    let file: HistoryFile = toml::from_str(text).ok()?;
+    if file.version > HISTORY_VERSION {
+        return None;
+    }
+    Some(file.entries)
+}
+
+/// 加载时恢复条目的运行态字段(data_path/preview_png):
+/// - 数据条目:数据字节缺失(缓存被清过)→ None(坏条目丢弃);预览缺失 → 从数据
+///   字节重新生成并落盘
+/// - 文件复制条目:预览从 `{hash}.preview` 读回(缺失 → 从源文件重新生成并落盘,
+///   源文件也不在 → 空预览,行内显示文件名);data_path 恒为空(粘贴走 file-url)
+/// - 文本条目:原样返回
+///
+/// Restore a loaded entry's runtime fields (data_path/preview_png) on load:
+/// - data entries: a missing data file (the cache was swept) -> None (the broken entry is
+///   dropped); a missing preview is regenerated from the data bytes and re-persisted
+/// - file-copy entries: the preview is read back from `{hash}.preview` (when missing,
+///   regenerated from the source file and re-persisted; when the source is also gone, the
+///   preview stays empty and the row shows the filename); data_path is always empty
+///   (pasting goes through the file-url)
+/// - text entries: returned as-is
+fn restore_loaded_entry(entry: ClipEntry) -> Option<ClipEntry> {
+    let Some(img) = &entry.image else {
+        return Some(entry); // 文本条目 / a text entry
+    };
+    if img.hash == 0 {
+        return Some(entry); // 解码失败的退化文件条目(无预览) / a degenerate file entry
+    }
+    if let Some(path) = &img.source_path {
+        // 文件复制条目:预览优先读落盘的 {hash}.preview;缺失则从源文件重生。
+        // File-copy entries: the preview comes from the persisted {hash}.preview; when
+        // missing it is regenerated from the source file.
+        let preview = cache_read_preview(img.hash).unwrap_or_else(|| {
+            std::fs::read(path)
+                .ok()
+                .and_then(|d| unsafe { any_image_to_preview_png(&d) })
+                .unwrap_or_default()
+        });
+        if !preview.is_empty() {
+            let _ = cache_write_preview(img.hash, &preview);
+        }
+        return Some(ClipEntry {
+            text: entry.text,
+            image: Some(ImageEntry {
+                uti: img.uti.clone(),
+                hash: img.hash,
+                data_path: std::path::PathBuf::new(),
+                preview_png: preview,
+                source_path: Some(path.clone()),
+            }),
+            pinned: entry.pinned,
+            source_app: entry.source_app,
+            source_key: entry.source_key,
+        });
+    }
+    let data = cache_read_image(img.hash)?;
+    let preview = cache_read_preview(img.hash)
+        .unwrap_or_else(|| unsafe { any_image_to_preview_png(&data) }.unwrap_or_default());
+    let _ = cache_write_preview(img.hash, &preview);
+    Some(ClipEntry {
+        text: entry.text,
+        image: Some(ImageEntry {
+            uti: img.uti.clone(),
+            hash: img.hash,
+            data_path: clip_image_path(img.hash),
+            preview_png: preview,
+            source_path: None,
+        }),
+        pinned: entry.pinned,
+        source_app: entry.source_app,
+        source_key: entry.source_key,
+    })
+}
+
+/// 把当前历史保存到磁盘(仅 persist 开启时;临时文件 + rename 原子写,权限 600)。
+/// 内容为明文,隐私风险见 README。
+/// Save the current history to disk (only when persist is on; atomic temp+rename, mode
+/// 600). Plaintext -- the privacy implications are documented in the README.
+fn save_history() {
+    if !persist_enabled() {
+        return;
+    }
+    let hist = CLIP_HISTORY.lock().unwrap();
+    let entries = hist.clone();
+    drop(hist);
+    let Some(text) = serialize_history(&entries) else {
+        log_info!("Clipboard history save failed: serialize error.");
+        return;
+    };
+    let path = history_file_path();
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        log_info!("Clipboard history save failed: cannot create dir.");
+        return;
+    }
+    let tmp = dir.join(format!("clipboard-history.toml.tmp{}", std::process::id()));
+    let ok = std::fs::write(&tmp, text.as_bytes()).is_ok();
+    if ok {
+        // 权限 600:仅当前用户可读写(防其他用户;同用户其他应用仍可读,加密见 README)。
+        // Mode 600: owner-only (blocks other users; same-user apps can still read it --
+        // encryption is out of scope, see the README).
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    let ok = ok && std::fs::rename(&tmp, &path).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        log_info!("Clipboard history save failed: write error.");
+        return;
+    }
+    log_debug!(
+        "[clip] history saved ({} entries, {})",
+        entries.len(),
+        path.display()
+    );
+}
+
+/// 从磁盘加载历史并**合并**进当前内存(去重规则复用;置顶条目进置顶区,其余按
+/// 文件顺序(旧→新)追加到列表尾部,再按 max_entries 裁剪)。文件缺失/损坏/版本
+/// 不匹配 → 记日志,按空历史处理(与 config 同款弹性)。
+/// Load the persisted history and MERGE it into the in-memory history (reusing the dedup
+/// rules; pinned entries join the pinned block, the rest append in file order (old ->
+/// new) at the tail, then trim to max_entries). A missing/corrupt/version-mismatched file
+/// is logged and treated as an empty history (config-style resilience).
+fn load_history() {
+    if !persist_enabled() {
+        return;
+    }
+    let path = history_file_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return; // 文件不存在 = 首次使用 / a missing file = first run
+    };
+    let Some(entries) = parse_history(&text) else {
+        log_info!(
+            "Clipboard history load failed (corrupt/version mismatch, starting empty): {}",
+            path.display()
+        );
+        return;
+    };
+    let mut hist = CLIP_HISTORY.lock().unwrap();
+    let max = max_entries();
+    for entry in entries {
+        // 数据条目:数据字节缺失(被清过缓存)→ 丢弃坏条目;预览缺失 → 重新解码。
+        // Data entries: a missing data file (cache was swept) drops the broken entry; a
+        // missing preview is regenerated from the data bytes.
+        let Some(entry) = restore_loaded_entry(entry) else {
+            continue;
+        };
+        let dup = match &entry.image {
+            Some(img) => hist.iter().any(|e| {
+                e.image
+                    .as_ref()
+                    .is_some_and(|i| i.source_path.as_deref() == img.source_path.as_deref())
+            }),
+            None => hist
+                .iter()
+                .any(|e| e.image.is_none() && e.text == entry.text),
+        };
+        if dup {
+            continue;
+        }
+        // 置顶条目进置顶区顶部(最新置顶在前),其余追加到列表尾部(旧→新)。
+        // Pinned entries join the top of the pinned block (newest first); the rest append
+        // at the tail (old -> new).
+        if entry.pinned {
+            hist.insert(0, entry);
+        } else {
+            hist.push(entry);
+        }
+    }
+    if hist.len() > max {
+        // 被裁条目的缓存文件一并删除 / dropped entries' cache files go too.
+        for dropped in &hist[max..] {
+            cache_delete_for_entry(dropped);
+        }
+        hist.truncate(max);
+    }
+    let total = hist.len();
+    drop(hist);
+    log_info!("Clipboard history loaded ({} entries).", total);
+    // 加载后立刻回写:合并/裁剪/补预览的结果落盘,保证磁盘与内存一致。
+    // Rewrite right after loading so the merge/trim/preview-fill result is on disk,
+    // keeping disk and memory in sync.
+    save_history();
+}
+
+/// persist 开关在设置页热切换时的应用规则:
+/// - 开启:从磁盘加载并合并进当前内存历史(load_history)
+/// - 关闭:删除磁盘历史文件(内存历史保留到本次退出)
+///
+/// Applied when the persist toggle changes in Settings:
+/// - ON: load and merge the persisted history into memory (load_history)
+/// - OFF: delete the history file (the in-memory history stays until this session ends)
+pub(crate) fn apply_persist_toggle(on: bool) {
+    if on {
+        load_history();
+    } else {
+        let path = history_file_path();
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+            log_info!("Clipboard history file removed (persistence off).");
         }
     }
 }
@@ -975,6 +1323,44 @@ fn preferred_uti(present: &[&str]) -> Option<&'static str> {
         .copied()
 }
 
+/// 敏感/临时剪贴板标记(nspasteboard.org "Securing Copy" 协议):带这些标记的内容
+/// **绝不记录进历史**(内存与磁盘都不会)——密码管理器(1Password 等)复制密码时会
+/// 打上 ConcealedType,让剪贴板历史应用跳过。与 Maccy 的处理一致。
+/// Sensitive/transient pasteboard markers (the nspasteboard.org "Securing Copy"
+/// protocol): content carrying these markers is NEVER recorded (not in memory, not on
+/// disk) -- password managers (1Password et al.) stamp ConcealedType when copying
+/// passwords so clipboard historians skip them. Same handling as Maccy.
+const SENSITIVE_PASTEBOARD_TYPES: &[&str] = &[
+    "org.nspasteboard.TransientType",
+    "org.nspasteboard.ConcealedType",
+    "org.nspasteboard.AutoGeneratedType",
+    "com.agilebits.onepassword",
+];
+
+/// 剪贴板是否携带敏感标记(availableTypeFromArray: 一次性探测,存在即返回该类型)。
+/// Whether the pasteboard carries a sensitive marker (probed in one
+/// availableTypeFromArray: call).
+unsafe fn pasteboard_has_sensitive_marker() -> bool {
+    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pb.is_null() {
+        return false;
+    }
+    // 必须 alloc+init(owned +1),`[NSArray array]` 是 +0 自动释放对象,CFRelease
+    // 会过度释放直接崩溃。
+    // Must use alloc+init (owned, +1): `[NSArray array]` returns a +0 autoreleased
+    // object, and CFRelease on it over-releases and crashes.
+    let array: *mut AnyObject = msg_send![class!(NSMutableArray), alloc];
+    let array: *mut AnyObject = msg_send![array, init];
+    for t in SENSITIVE_PASTEBOARD_TYPES {
+        let t_ns = make_nsstring(t);
+        let _: () = msg_send![array, addObject: t_ns];
+        CFRelease(t_ns as *const c_void);
+    }
+    let hit: *mut AnyObject = msg_send![pb, availableTypeFromArray: array];
+    CFRelease(array as *const c_void);
+    !hit.is_null()
+}
+
 /// 读当前剪贴板图片:原样取原始格式字节 → 算 hash 落盘 → 派生降采样 PNG 预览
 /// (无图片/无法解码/缓存写入失败返回 None)。
 /// Read the pasteboard's image: the original-format bytes verbatim -> hashed and written
@@ -1023,6 +1409,10 @@ unsafe fn read_pasteboard_image() -> Option<ImageEntry> {
         if !cache_write_image(hash, &data) {
             continue;
         }
+        // 预览单独落盘:持久化历史重启加载时直接读回,无需重新解码。
+        // The preview is persisted separately so a persisted history loads without
+        // re-decoding after a restart.
+        let _ = cache_write_preview(hash, &preview_png);
         return Some(ImageEntry {
             uti: uti.to_string(),
             hash,
@@ -1058,24 +1448,28 @@ fn is_image_extension(path: &str) -> bool {
 
 /// 图片文件复制(Finder 里 Cmd+C 一个图片文件):剪贴板上只有文件名文本 + 一个
 /// `public.file-url`。识别条件:file-url 存在,且文本恰好等于该文件的文件名——这时按
-/// "文件复制"处理,**只存引用**:记录来源路径 + 按扩展名推导 UTI,**完全不读文件
-/// 字节**(零 I/O、磁盘/内存零驻留;与 Windows Win+V / Maccy 一致——文件复制永远
-/// 以引用流转,从不把内容拷进历史)。粘贴时恢复 `public.file-url`,应用按需读原文件。
-/// 源文件被删/移动后该条目粘贴即失效(无影子副本,这是本设计的取舍)。
-/// 文件条目没有缩略图预览,行内显示文件名文本;text 存文件名,可被搜索。
-/// 非图片文件 / 文本与文件名不符 / 多文件 / 文件不存在 → None(走原文本逻辑)。
+/// "文件复制"处理:**读一次文件内容(瞬时)**,算内容哈希 + 解码首帧生成缩略图预览,
+/// 然后**丢弃字节**(不写数据缓存、无影子副本——磁盘/内存零驻留,粘贴仍走 file-url
+/// 引用语义,与 Windows Win+V / Maccy 一致)。内容哈希用于**同内容去重**:原文件与
+/// 它在访达里的副本(不同路径、同样字节)只保留一条。
+/// 粘贴时恢复 `public.file-url`,应用按需读原文件;源文件被删/移动后该条目粘贴即
+/// 失效(无影子副本,这是本设计的取舍)。行内显示缩略图预览;text 存文件名,可搜索。
+/// 读取失败 → None(走原文本逻辑);解码失败(损坏/伪扩展名)→ 退化为纯引用条目
+/// (hash=0、无预览,粘贴仍可用)。
 /// An image-FILE copy (Cmd+C on an image file in Finder): the pasteboard carries only the
 /// filename as text plus a `public.file-url`. Recognition: a file-url exists AND the text
-/// is exactly that file's name -- then it is a FILE copy stored as a REFERENCE ONLY: the
-/// source path + a UTI derived from the extension, with the file bytes NEVER read (zero
-/// I/O, nothing held on disk or in RAM; the same model as Windows Win+V / Maccy -- file
-/// copies always flow as references, their content is never pulled into the history).
-/// Pasting restores `public.file-url` and the target app reads the original file on
-/// demand. A deleted/moved source makes the entry unpastable (no shadow copy -- the
-/// accepted tradeoff of this design). File entries have no thumbnail; the row shows the
-/// filename text, and `text` holds the filename so entries are searchable. Non-image
-/// files / text/name mismatch / multiple files / a missing file -> None (fall back to the
-/// text path).
+/// is exactly that file's name -- then it is a FILE copy: the file is read ONCE
+/// (transiently) to compute a content hash and decode a first-frame thumbnail preview,
+/// then the bytes are DISCARDED (no data-cache write, no shadow copy -- nothing held on
+/// disk or in RAM; pasting still restores `public.file-url`, the reference semantics of
+/// Windows Win+V / Maccy). The content hash enables CONTENT dedup: a file and its Finder
+/// duplicate (different paths, identical bytes) collapse into one entry. Pasting restores
+/// `public.file-url` and the target app reads the original file on demand; a deleted or
+/// moved source makes the entry unpastable (no shadow copy -- the accepted tradeoff). The
+/// row shows the thumbnail preview; `text` holds the filename so entries are searchable.
+/// A read failure -> None (fall back to the text path); a decode failure (corrupt file /
+/// fake extension) degrades to a reference-only entry (hash=0, no preview, still
+/// pasteable). Non-image files / text/name mismatch / multiple files -> None.
 unsafe fn file_copy_image(text: &str) -> Option<ImageEntry> {
     let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
     if pb.is_null() {
@@ -1104,17 +1498,23 @@ unsafe fn file_copy_image(text: &str) -> Option<ImageEntry> {
         return None;
     }
     let uti = ext_to_uti(&path)?;
-    // 只做一次 stat 级存在性检查(不读字节):引用一个不存在的文件只会产生坏条目。
-    // A stat-level existence check only (no byte reads): referencing a missing file would
-    // only create a dead entry.
-    if !std::path::Path::new(&path).exists() {
-        return None;
+    // 读一次文件内容(瞬时,不入内存驻留):内容哈希 = 同内容去重键,首帧 = 缩略图。
+    // Read the file once (transient): the content hash is the content-dedup key, the first
+    // frame becomes the thumbnail.
+    let bytes = std::fs::read(&path).ok()?;
+    let hash = fnv1a64(&bytes);
+    let preview_png = unsafe { any_image_to_preview_png(&bytes) }.unwrap_or_default();
+    // 预览落盘({hash}.preview):持久化历史重启加载时直接读回,无需重新解码。
+    // The preview is persisted ({hash}.preview) so a persisted history loads without
+    // re-decoding after a restart.
+    if !preview_png.is_empty() {
+        let _ = cache_write_preview(hash, &preview_png);
     }
     Some(ImageEntry {
         uti: uti.to_string(),
-        hash: 0,
+        hash,
         data_path: std::path::PathBuf::new(),
-        preview_png: Vec::new(),
+        preview_png,
         source_path: Some(path),
     })
 }
@@ -1262,6 +1662,15 @@ fn poll_clipboard() {
     if !changed {
         return;
     }
+    // 敏感标记拦截:密码管理器等打上 ConcealedType/TransientType 的内容直接跳过,
+    // 不进历史(内存与磁盘都不落)。这是 nspasteboard.org 协议的行业标准做法。
+    // Sensitive-marker interception: content stamped ConcealedType/TransientType by
+    // password managers is skipped entirely -- it never enters the history (neither in
+    // memory nor on disk). The industry-standard nspasteboard.org convention.
+    if unsafe { pasteboard_has_sensitive_marker() } {
+        log_debug!("[clip] change skipped: sensitive/transient marker on pasteboard");
+        return;
+    }
     match unsafe { read_pasteboard_text() } {
         Some(text) => {
             // 来源 = 复制瞬间的前台应用(始终记录;显示与否由 CONFIG 的
@@ -1347,6 +1756,9 @@ fn poll_clipboard() {
             None => log_debug!("[clip] change but no text/image (non-pasteboard content?)"),
         },
     }
+    // 历史有变更(记录/去重移前/裁剪)→ persist 开启时落盘。
+    // The history changed (record/dedup-move/trim) -> persist when enabled.
+    save_history();
 }
 
 /// timer tick 回调(主线程):继续轮询。
@@ -1365,12 +1777,19 @@ pub fn start() {
         if !guard.0.is_null() {
             return; // 已在跑 / already running
         }
-        // 先清空图片字节缓存再记录当前剪贴板:历史不持久化,上次会话残留的缓存
-        // 文件必为孤儿;先清后记,避免刚写下的缓存被自己清掉。
-        // Wipe the image-byte cache BEFORE recording the current pasteboard: the history
-        // is not persisted, so leftover cache files from a previous session are orphans;
-        // sweeping first keeps the just-written cache from being deleted.
-        clear_clip_image_cache();
+        // persist 开启:不清缓存(上次会话的图片字节/预览还要用),先加载历史再
+        // 记录当前剪贴板;persist 关闭(默认):清空缓存——历史不持久化,残留必为
+        // 孤儿;先清后记,避免刚写下的缓存被自己清掉。
+        // With persist ON: the cache is kept (the previous session's image bytes/previews
+        // are still referenced) and the history is loaded BEFORE recording the current
+        // pasteboard. With persist OFF (default): the cache is wiped -- the history is not
+        // persisted, so leftovers are orphans; sweeping first keeps the just-written cache
+        // from being deleted.
+        if persist_enabled() {
+            load_history();
+        } else {
+            clear_clip_image_cache();
+        }
         // 再记录当前剪贴板,否则首次呼出历史为空。
         // Then record the current pasteboard, or the first summon would show an empty list.
         poll_clipboard();
@@ -1586,6 +2005,7 @@ extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *m
         kept
     );
     drop(hist);
+    save_history();
     // 顺带清空搜索词与搜索框文本。
     // Also clear the search query and the search field's text.
     clear_search();
@@ -2687,11 +3107,11 @@ unsafe fn rebuild_rows() {
         if is_image {
             if let Some(img) = &entry.image {
                 if img.preview_png.is_empty() {
-                    // 文件引用条目(零字节、无缩略图):正文显示文件名文本(entry.text
-                    // 已存文件名)。与 Windows Win+V / Maccy 一致——文件条目以引用展示。
-                    // A file-reference entry (zero bytes, no thumbnail): the body shows the
-                    // filename text (entry.text already holds it). Like Windows Win+V /
-                    // Maccy, file entries are shown as references.
+                    // 无预览(解码失败的退化文件条目 / 源文件已删的空预览):正文显示
+                    // 文件名文本(entry.text 已存文件名)。
+                    // No preview (a degenerate file entry whose decode failed, or an empty
+                    // preview whose source is gone): the body shows the filename text
+                    // (entry.text already holds it).
                     let title = truncate_to_lines(&entry.text, LINE_MAX_UNITS, MAX_TEXT_LINES);
                     let attr = make_row_attributed_title(&title, selected);
                     let _: () = msg_send![body, setAttributedTitle: attr];
@@ -3046,6 +3466,7 @@ extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
         pin_entry(&mut hist, h_idx);
     }
     drop(hist);
+    save_history();
     unsafe { rebuild_rows() };
 }
 
@@ -3069,6 +3490,7 @@ extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void
     }
     drop(sel);
     drop(hist);
+    save_history();
     unsafe { rebuild_rows() };
 }
 
@@ -3097,11 +3519,11 @@ fn paste_at(idx: usize) {
     unsafe {
         if let Some(img) = &entry.image {
             // 文件复制条目:源文件还在 → 恢复文件语义(file-url)粘贴(应用按需读
-            // 原文件);源文件已删除/移动 → 直接跳过(文件条目零字节,无内容可回退)。
+            // 原文件);源文件已删除/移动 → 直接跳过(文件条目不存字节,无内容可回退)。
             // A file-copy entry: if the source file still exists, restore file semantics
             // (file-url) -- the target app reads the original file on demand; if the source
-            // is deleted/moved, skip the paste (a file reference holds no bytes to fall
-            // back to).
+            // is deleted/moved, skip the paste (a file entry stores no bytes to fall back
+            // to).
             let ok = match paste_kind(img) {
                 PasteKind::File(path) => {
                     write_pasteboard_file(&path);
@@ -3271,6 +3693,7 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 }
                 drop(sel);
                 drop(hist);
+                save_history();
                 rebuild_rows();
             }
             53 => {
@@ -3703,16 +4126,17 @@ mod tests {
         }
     }
 
-    /// 测试用**文件引用**条目(零字节:无 hash、无缓存文件、无预览,只带来源路径;
-    /// 与真实文件复制路径一致)。
-    /// A test FILE-REFERENCE entry (zero bytes: no hash, no cache file, no preview; just
-    /// the source path -- same as the real file-copy path).
-    fn image_from_file(path: &str) -> ImageEntry {
+    /// 测试用**文件复制**条目:字节 → 内容哈希 + 预览(data 兼作预览),data_path 恒空,
+    /// 只带来源路径——与真实文件复制路径一致(字节不落盘)。
+    /// A test FILE-COPY entry: bytes -> content hash + preview (data doubles as the
+    /// preview), data_path always empty, only the source path is carried -- same as the
+    /// real file-copy path (bytes are never stored).
+    fn image_from_file(data: &[u8], path: &str) -> ImageEntry {
         ImageEntry {
             uti: NSPASTEBOARD_TYPE_PNG.to_string(),
-            hash: 0,
+            hash: super::fnv1a64(data),
             data_path: std::path::PathBuf::new(),
-            preview_png: Vec::new(),
+            preview_png: data.to_vec(),
             source_path: Some(path.to_string()),
         }
     }
@@ -3990,53 +4414,286 @@ mod tests {
     }
 
     #[test]
+    fn cache_preview_roundtrip_and_delete_removes_both() {
+        use super::{
+            cache_delete_image, cache_read_image, cache_read_preview, cache_write_image,
+            cache_write_preview, fnv1a64,
+        };
+        let data = b"preview-test-data";
+        let preview = b"fake-preview-png";
+        let hash = fnv1a64(data);
+        assert!(cache_write_image(hash, data));
+        assert!(cache_write_preview(hash, preview));
+        assert_eq!(cache_read_preview(hash).as_deref(), Some(&preview[..]));
+        // 删除条目 → 数据与预览一并删除 / deleting removes data and preview together.
+        cache_delete_image(hash);
+        assert_eq!(cache_read_image(hash), None);
+        assert_eq!(cache_read_preview(hash), None);
+    }
+
+    #[test]
+    fn history_serialize_parse_roundtrip_skips_runtime_fields() {
+        use super::{fnv1a64, parse_history};
+        // 三类条目 + unicode/换行文本 + 置顶 + 来源,序列化→解析后核心字段等值,
+        // 运行态字段(preview_png/data_path)不落盘。
+        // All three entry kinds + unicode/newline text + pinned + source survive the
+        // roundtrip; runtime fields (preview_png/data_path) are NOT serialized.
+        let img = image(b"history-roundtrip-img");
+        let file_ref = image_from_file(
+            b"history-roundtrip-file",
+            "/Users/ceres/Downloads/vva划船.gif",
+        );
+        let entries = vec![
+            ClipEntry {
+                text: "密码 A\n第二行 🎉".to_string(),
+                image: None,
+                pinned: true,
+                source_app: "1Password".to_string(),
+                source_key: "com.agilebits.onepassword".to_string(),
+            },
+            ClipEntry {
+                text: String::new(),
+                image: Some(img.clone()),
+                pinned: false,
+                source_app: "Safari".to_string(),
+                source_key: "com.apple.Safari".to_string(),
+            },
+            ClipEntry {
+                text: "vva划船.gif".to_string(),
+                image: Some(file_ref),
+                pinned: false,
+                source_app: "Finder".to_string(),
+                source_key: String::new(),
+            },
+        ];
+        let text = super::serialize_history(&entries).expect("serialize");
+        let parsed = parse_history(&text).expect("parse");
+        assert_eq!(parsed.len(), 3);
+        // 文本条目全字段等值 / the text entry matches fully.
+        assert_eq!(parsed[0].text, "密码 A\n第二行 🎉");
+        assert!(parsed[0].pinned);
+        assert_eq!(parsed[0].source_app, "1Password");
+        // 数据条目:uti/hash 保留,预览与 data_path 不落盘(重建后由 restore 补回)。
+        // The data entry keeps uti/hash; the preview and data_path are skipped (restore
+        // fills them back).
+        let p_img = parsed[1].image.as_ref().unwrap();
+        assert_eq!(p_img.uti, img.uti);
+        assert_eq!(p_img.hash, img.hash);
+        assert!(p_img.preview_png.is_empty());
+        assert!(p_img.data_path.as_os_str().is_empty());
+        // 文件复制条目:source_path 与内容 hash 保留 / the file copy keeps its path + hash.
+        let p_file = parsed[2].image.as_ref().unwrap();
+        assert_eq!(
+            p_file.source_path.as_deref(),
+            Some("/Users/ceres/Downloads/vva划船.gif")
+        );
+        assert_eq!(p_file.hash, fnv1a64(b"history-roundtrip-file"));
+        // 回写可再序列化(幂等)/ re-serializing is idempotent.
+        assert!(super::serialize_history(&parsed).is_some());
+    }
+
+    #[test]
+    fn history_parse_rejects_corruption_and_future_versions() {
+        use super::parse_history;
+        assert_eq!(parse_history("not toml at all {{{"), None);
+        // 未来版本 → 拒绝(按空历史处理)/ a future version is rejected.
+        let entries = super::serialize_history(&[]).unwrap();
+        let future = entries.replace("version = 1", "version = 2");
+        assert_eq!(parse_history(&future), None);
+        // 当前版本 → 可解析 / the current version parses.
+        assert_eq!(parse_history(&entries), Some(vec![]));
+    }
+
+    #[test]
+    fn restore_loaded_entry_recovers_preview_and_drops_broken_data_entries() {
+        use super::{cache_write_image, cache_write_preview, fnv1a64, restore_loaded_entry};
+        // 数据条目:预览落盘 → 恢复预览 + 重建 data_path。
+        // A data entry with a persisted preview -> the preview is restored and data_path
+        // rebuilt.
+        let bytes = b"restore-test-img";
+        let hash = fnv1a64(bytes);
+        assert!(cache_write_image(hash, bytes));
+        let preview = b"restore-test-preview";
+        assert!(cache_write_preview(hash, preview));
+        let img = super::ImageEntry {
+            uti: NSPASTEBOARD_TYPE_PNG.to_string(),
+            hash,
+            data_path: std::path::PathBuf::new(),
+            preview_png: Vec::new(),
+            source_path: None,
+        };
+        let entry = ClipEntry {
+            text: String::new(),
+            image: Some(img.clone()),
+            pinned: true,
+            source_app: "Safari".to_string(),
+            source_key: String::new(),
+        };
+        let restored = restore_loaded_entry(entry.clone()).expect("restore");
+        let r_img = restored.image.as_ref().unwrap();
+        assert_eq!(r_img.preview_png, preview);
+        assert_eq!(r_img.data_path, super::clip_image_path(hash));
+        assert_eq!(restored.pinned, entry.pinned);
+        // 数据字节缺失(缓存被清过)→ 坏条目丢弃 / a missing data file drops the entry.
+        let ghost = super::ImageEntry {
+            uti: NSPASTEBOARD_TYPE_PNG.to_string(),
+            hash: fnv1a64(b"ghost"),
+            data_path: std::path::PathBuf::new(),
+            preview_png: Vec::new(),
+            source_path: None,
+        };
+        let ghost_entry = ClipEntry {
+            text: String::new(),
+            image: Some(ghost),
+            pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+        };
+        assert!(restore_loaded_entry(ghost_entry).is_none());
+        // 文本条目原样返回 / a text entry passes through.
+        let text_entry = ClipEntry {
+            text: "hello".to_string(),
+            image: None,
+            pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+        };
+        assert_eq!(restore_loaded_entry(text_entry.clone()), Some(text_entry));
+        // 文件复制条目:预览从 {hash}.preview 恢复,data_path 恒空,来源路径保留。
+        // A file-copy entry: the preview is restored from {hash}.preview, data_path stays
+        // empty, the source path is kept.
+        let fbytes = b"restore-test-file";
+        let fhash = fnv1a64(fbytes);
+        let fpreview = b"restore-test-file-preview";
+        assert!(cache_write_preview(fhash, fpreview));
+        let file_ref = image_from_file(fbytes, "/tmp/exists.gif");
+        let file_entry = ClipEntry {
+            text: "exists.gif".to_string(),
+            image: Some(file_ref),
+            pinned: false,
+            source_app: "Finder".to_string(),
+            source_key: String::new(),
+        };
+        let restored_file = restore_loaded_entry(file_entry.clone()).expect("restore file");
+        let rf_img = restored_file.image.as_ref().unwrap();
+        assert_eq!(rf_img.preview_png, fpreview);
+        assert!(rf_img.data_path.as_os_str().is_empty());
+        assert_eq!(rf_img.source_path.as_deref(), Some("/tmp/exists.gif"));
+        // 退化文件条目(hash=0,无预览)→ 原样返回。
+        // A degenerate file entry (hash=0, no preview) passes through.
+        let degenerate = super::ImageEntry {
+            uti: NSPASTEBOARD_TYPE_PNG.to_string(),
+            hash: 0,
+            data_path: std::path::PathBuf::new(),
+            preview_png: Vec::new(),
+            source_path: Some("/tmp/broken.gif".to_string()),
+        };
+        let degen_entry = ClipEntry {
+            text: "broken.gif".to_string(),
+            image: Some(degenerate),
+            pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+        };
+        assert_eq!(restore_loaded_entry(degen_entry.clone()), Some(degen_entry));
+    }
+
+    #[test]
+    fn sensitive_marker_list_covers_the_securing_copy_protocol() {
+        use super::SENSITIVE_PASTEBOARD_TYPES;
+        // nspasteboard.org "Securing Copy" 协议的四类标记必须全部拦截。
+        // All four Securing-Copy markers must be in the skip list.
+        assert!(SENSITIVE_PASTEBOARD_TYPES.contains(&"org.nspasteboard.TransientType"));
+        assert!(SENSITIVE_PASTEBOARD_TYPES.contains(&"org.nspasteboard.ConcealedType"));
+        assert!(SENSITIVE_PASTEBOARD_TYPES.contains(&"org.nspasteboard.AutoGeneratedType"));
+        assert!(SENSITIVE_PASTEBOARD_TYPES.contains(&"com.agilebits.onepassword"));
+    }
+
+    #[test]
     fn paste_kind_prefers_the_file_when_it_still_exists() {
         use super::{paste_kind, PasteKind};
         use std::fs;
         // 纯图片复制(无来源路径)→ 图片数据粘贴。
         // A bare image copy (no source path) -> image data paste.
         assert_eq!(paste_kind(&image(b"x")), PasteKind::Image);
-        // 文件引用但源文件已删除 → Image(调用方直接跳过,无字节可回退)。
-        // A file reference whose source file is gone -> Image (the caller skips the paste;
-        // a reference holds no bytes to fall back to).
+        // 文件复制但源文件已删除 → Image(调用方直接跳过,无字节可回退)。
+        // A file copy whose source file is gone -> Image (the caller skips the paste;
+        // a file copy holds no bytes to fall back to).
         assert_eq!(
-            paste_kind(&image_from_file("/nonexistent/omt-gone.gif")),
+            paste_kind(&image_from_file(b"x", "/nonexistent/omt-gone.gif")),
             PasteKind::Image
         );
-        // 文件引用且源文件还在 → 文件粘贴(路径原样带回)。
-        // A file reference whose source file still exists -> file paste (path carried back).
+        // 文件复制且源文件还在 → 文件粘贴(路径原样带回)。
+        // A file copy whose source file still exists -> file paste (path carried back).
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("anim.gif");
         fs::write(&p, b"GIF89a").unwrap();
         assert_eq!(
-            paste_kind(&image_from_file(p.to_str().unwrap())),
+            paste_kind(&image_from_file(b"GIF89a", p.to_str().unwrap())),
             PasteKind::File(p.to_str().unwrap().to_string())
         );
     }
 
     #[test]
-    fn record_image_file_refs_dedup_by_path_and_keep_the_filename() {
+    fn record_image_file_copies_dedup_by_content_and_keep_the_filename() {
         use super::record_image;
-        // 同一文件再次复制 → 按来源路径去重移前,不产生重复条目。
-        // Re-copying the same file -> dedup by source path, no duplicate.
+        // 同一内容、同一路径再次复制 → 内容哈希去重移前。
+        // Re-copying the same path -> dedup by content hash, no duplicate.
         let mut h = Vec::new();
         let p = "/Users/ceres/Downloads/vva划船.gif";
-        assert!(record_image(&mut h, &image_from_file(p), "Finder", "", 50));
+        let bytes = b"GIF89a-anim";
+        assert!(record_image(
+            &mut h,
+            &image_from_file(bytes, p),
+            "Finder",
+            "",
+            50
+        ));
         assert_eq!(h.len(), 1);
         // 条目 text 存文件名(行内显示 + 可搜索)。
         // The entry's text holds the filename (row display + search).
         assert_eq!(h[0].text, "vva划船.gif");
-        assert!(record_image(&mut h, &image_from_file(p), "Ghostty", "", 50));
-        assert_eq!(h.len(), 1, "same path must dedup");
+        assert!(record_image(
+            &mut h,
+            &image_from_file(bytes, p),
+            "Ghostty",
+            "",
+            50
+        ));
+        assert_eq!(h.len(), 1, "same content must dedup");
         assert_eq!(h[0].source_app, "Ghostty");
-        // 不同路径 → 新条目 / a different path -> a new entry.
+        // 原文件与访达副本:不同路径、同样字节 → 也只保留一条,来源路径更新为
+        // 最新一次复制(粘贴恢复最新文件)。
+        // A file and its Finder duplicate: different paths, identical bytes -> still one
+        // entry, with the source path updated to the latest copy (pasting restores the
+        // newest file).
+        let copy = "/Users/ceres/Downloads/vva划船_副本.gif";
+        assert!(record_image(
+            &mut h,
+            &image_from_file(bytes, copy),
+            "Finder",
+            "",
+            50
+        ));
+        assert_eq!(h.len(), 1, "same content at another path must dedup");
+        assert_eq!(
+            h[0].image.as_ref().unwrap().source_path.as_deref(),
+            Some(copy)
+        );
+        // 不同内容 → 新条目 / different content -> a new entry.
         let q = "/Users/ceres/Downloads/other.gif";
-        assert!(record_image(&mut h, &image_from_file(q), "Finder", "", 50));
+        assert!(record_image(
+            &mut h,
+            &image_from_file(b"different-bytes", q),
+            "Finder",
+            "",
+            50
+        ));
         assert_eq!(h.len(), 2);
         assert_eq!(h[0].text, "other.gif");
-        // 文件引用与数据条目互不误伤(同内容、不同形态 = 两条)。
-        // A file reference and a data entry never collide (same content, different forms).
-        let data_img = image(b"GIF89a");
+        // 文件复制与数据条目互不跨类去重(同内容、不同形态 = 两条)。
+        // File copies and data entries never cross-dedup (same content, different forms).
+        let data_img = image(bytes);
         assert!(record_image(&mut h, &data_img, "Safari", "", 50));
         assert_eq!(h.len(), 3);
         // 空预览且无来源路径 → 拒绝(录制失败)。
