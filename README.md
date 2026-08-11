@@ -32,6 +32,23 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 
 ![Mouse control](docs/pictures/mouse_control.png)
 
+## Clipboard history
+
+Optional (off by default). Summon with **Option+V**, navigate with the arrow keys / Enter / Esc / Backspace, or click; clicking outside closes it. The history records **three kinds of entries**:
+
+| Kind | What is stored | Paste behavior |
+|---|---|---|
+| **Text** | The copied text, held in memory | The text is written back and Cmd+V is synthesized |
+| **Image data** | An image copied inside an app (e.g. right-click → "Copy Image"): the original-format bytes are hashed and kept in a disk cache (`~/Library/Caches/oh-my-tab-clip-images/{hash}`) plus a downsampled thumbnail; only the thumbnail stays in RAM | The original bytes are written back under their original UTI — a JPG pastes back as JPG, an animated GIF as a GIF, never a PNG re-encode |
+| **Image file** | An image FILE copied in Finder (Cmd+C): the file is read once at copy time to compute a content hash and a thumbnail, then the bytes are discarded — only the path, hash and thumbnail are kept | `public.file-url` is restored (file semantics, like Windows Win+V / Maccy): Finder duplicates the file, chat apps attach it, GIF animation stays intact. If the source file has been deleted, the paste is skipped |
+
+**Dedup is per-kind** (never across kinds):
+- Text dedups by exact text.
+- Image-data entries dedup by content hash; image-file entries dedup by content hash too (a file and its Finder duplicate — identical bytes, different paths — collapse into one entry, keeping the latest path).
+- The same picture copied both as an image and as a file stays as **two separate entries** (they answer different paste semantics). They share the content hash, so they share the disk cache; deleting one entry only removes the cache files when no other entry still references them.
+
+The picker's "Clear all" keeps pinned entries; per-entry delete (Backspace) and the entry-cap trim follow the same cache rules. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note under [Configuration](#configuration).
+
 ## Known Issues
 
 If windows are already open when the app starts, their ordering differs from the native Cmd+Tab order. This is because there is no initial window-ordering data; oh-my-tab builds it by continuously observing window changes after launch.

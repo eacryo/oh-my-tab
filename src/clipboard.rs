@@ -639,11 +639,13 @@ fn record_text(
         },
     );
     if history.len() > max {
-        // 超上限裁剪时,被裁图片条目的缓存文件一并删除(不再被任何条目引用)。
-        // When trimming beyond the cap, drop the trimmed image entries' cache files too
-        // (they are no longer referenced by any entry).
+        // 超上限裁剪时,被裁图片条目的缓存文件一并删除——但仅当其 hash 不再被
+        // 幸存条目引用(同 hash 的文件/数据条目可能共存,共享缓存)。
+        // When trimming beyond the cap, drop the trimmed image entries' cache files too --
+        // but only when the hash is no longer referenced by a survivor (same-hash
+        // file/data entries may coexist and share the cache).
         for dropped in &history[max..] {
-            cache_delete_for_entry(dropped);
+            cache_delete_for_removed(&history[..max], dropped);
         }
         history.truncate(max);
     }
@@ -742,11 +744,13 @@ fn record_image(
         },
     );
     if history.len() > max {
-        // 超上限裁剪时,被裁图片条目的缓存文件一并删除(不再被任何条目引用)。
-        // When trimming beyond the cap, drop the trimmed image entries' cache files too
-        // (they are no longer referenced by any entry).
+        // 超上限裁剪时,被裁图片条目的缓存文件一并删除——但仅当其 hash 不再被
+        // 幸存条目引用(同 hash 的文件/数据条目可能共存,共享缓存)。
+        // When trimming beyond the cap, drop the trimmed image entries' cache files too --
+        // but only when the hash is no longer referenced by a survivor (same-hash
+        // file/data entries may coexist and share the cache).
         for dropped in &history[max..] {
-            cache_delete_for_entry(dropped);
+            cache_delete_for_removed(&history[..max], dropped);
         }
         history.truncate(max);
     }
@@ -781,7 +785,7 @@ fn unpin_entry(history: &mut Vec<ClipEntry>, idx: usize) {
 fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     if idx < history.len() {
         let removed = history.remove(idx);
-        cache_delete_for_entry(&removed);
+        cache_delete_for_removed(history, &removed);
     }
 }
 
@@ -908,15 +912,28 @@ fn cache_read_preview(hash: u64) -> Option<Vec<u8>> {
     std::fs::read(clip_image_preview_path(hash)).ok()
 }
 
-/// 删除一个图片条目对应的缓存文件(数据字节 + 预览一并删除;退化文件条目
-/// hash=0 无文件可删)。
-/// Delete an image entry's cache file (data bytes + preview together; a degenerate file
-/// entry with hash=0 has no files).
-fn cache_delete_for_entry(entry: &ClipEntry) {
-    if let Some(img) = &entry.image {
-        if img.hash != 0 {
-            cache_delete_image(img.hash);
-        }
+/// hash 是否仍被幸存条目引用。文件条目与数据条目同内容(同 hash)可以共存并共享
+/// 磁盘缓存(`{hash}` 数据字节 + `{hash}.preview`),所以删除条目时**必须先查引用**,
+/// 否则会误删幸存者的文件——数据条目会永久失去粘贴字节。
+/// Whether `hash` is still referenced by the surviving entries. A file entry and a data
+/// entry with identical content (same hash) coexist and SHARE the disk cache (`{hash}`
+/// data bytes + `{hash}.preview`), so deletion MUST check references first -- an unguarded
+/// delete would wipe a survivor's files (a data entry would lose its paste bytes forever).
+fn hash_referenced_by<'a>(mut survivors: impl Iterator<Item = &'a ClipEntry>, hash: u64) -> bool {
+    survivors.any(|e| e.image.as_ref().is_some_and(|i| i.hash == hash))
+}
+
+/// 删除一个条目时清理它的缓存文件(数据字节 + 预览一并删除),但**仅当该 hash 不再
+/// 被任何幸存条目引用**;退化条目(hash=0)无文件可删。
+/// Delete a removed entry's cache files (data bytes + preview together), but ONLY when
+/// the hash is no longer referenced by any surviving entry; a degenerate entry (hash=0)
+/// has no files.
+fn cache_delete_for_removed(history: &[ClipEntry], removed: &ClipEntry) {
+    let Some(img) = &removed.image else {
+        return;
+    };
+    if img.hash != 0 && !hash_referenced_by(history.iter(), img.hash) {
+        cache_delete_image(img.hash);
     }
 }
 
@@ -1156,9 +1173,11 @@ fn load_history() {
         }
     }
     if hist.len() > max {
-        // 被裁条目的缓存文件一并删除 / dropped entries' cache files go too.
+        // 被裁条目的缓存文件一并删除——但仅当其 hash 不再被幸存条目引用。
+        // Dropped entries' cache files go too -- but only when the hash is no longer
+        // referenced by a survivor.
         for dropped in &hist[max..] {
-            cache_delete_for_entry(dropped);
+            cache_delete_for_removed(&hist[..max], dropped);
         }
         hist.truncate(max);
     }
@@ -1991,13 +2010,21 @@ extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _no
 /// history is ignored on summon).
 extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     // 清除全部时保留置顶条目(置顶 = 用户主动保存的常用内容),被丢弃条目的
-    // 缓存文件一并删除。
+    // 缓存文件一并删除——但仅当其 hash 不再被幸存的置顶条目引用(同 hash 的
+    // 文件/数据条目可能共存,共享缓存)。
     // "Clear all" keeps the pinned entries (pinned = content the user deliberately saved);
-    // the dropped entries' cache files go too.
+    // the dropped entries' cache files go too -- but only when the hash is no longer
+    // referenced by a surviving pinned entry (same-hash file/data entries may coexist and
+    // share the cache).
     let mut hist = CLIP_HISTORY.lock().unwrap();
     let kept = hist.iter().filter(|e| e.pinned).count();
     for dropped in hist.iter().filter(|e| !e.pinned) {
-        cache_delete_for_entry(dropped);
+        let Some(img) = &dropped.image else {
+            continue;
+        };
+        if img.hash != 0 && !hash_referenced_by(hist.iter().filter(|e| e.pinned), img.hash) {
+            cache_delete_image(img.hash);
+        }
     }
     hist.retain(|e| e.pinned);
     log_info!(
@@ -4096,16 +4123,6 @@ mod tests {
         }
     }
 
-    fn entry_with_identity(text: &str, source: &str, key: &str) -> ClipEntry {
-        ClipEntry {
-            text: text.to_string(),
-            image: None,
-            pinned: false,
-            source_app: source.to_string(),
-            source_key: key.to_string(),
-        }
-    }
-
     /// 测试用图片条目:把字节写入**测试缓存目录**并按引用构造(与真实录制路径
     /// 一致;预览与原始字节共用同一份小数据)。无文件来源。
     /// A test image entry: the bytes are written into the TEST cache dir and referenced,
@@ -4707,6 +4724,129 @@ mod tests {
         };
         assert!(!record_image(&mut h, &dead, "Safari", "", 50));
         assert_eq!(h.len(), 3);
+    }
+
+    #[test]
+    fn same_hash_file_and_data_entries_keep_shared_cache_until_both_are_gone() {
+        use super::{
+            cache_read_image, cache_read_preview, cache_write_preview, delete_entry, record_image,
+        };
+        // 文件条目 + 数据条目,同内容同 hash,跨类共存(各自按类去重,不互相合并)。
+        // 删除文件条目时**绝不能**误删共享的 `{hash}` 数据字节与 `{hash}.preview`
+        // (数据条目仍需要它们);两条都删光后缓存才清理。
+        // A file entry and a data entry with identical content (same hash) coexist across
+        // classes. Deleting the FILE entry must NOT wipe the shared `{hash}` data bytes and
+        // `{hash}.preview` (the data entry still needs them); only after both are gone may
+        // the cache be cleaned.
+        let bytes = b"shared-cache-test";
+        let hash = super::fnv1a64(bytes);
+        let mut h = Vec::new();
+        assert!(record_image(
+            &mut h,
+            &image_from_file(bytes, "/tmp/a.gif"),
+            "Finder",
+            "",
+            50
+        ));
+        assert!(record_image(&mut h, &image(bytes), "Safari", "", 50));
+        assert_eq!(h.len(), 2, "file + data entries coexist");
+        assert!(cache_read_image(hash).is_some());
+        assert!(cache_write_preview(hash, b"shared-preview"));
+        // 顺序:[数据, 文件] → 删除文件条目(idx=1)→ 共享缓存必须保留。
+        // Order: [data, file]; deleting the file entry (idx=1) must keep the shared cache.
+        delete_entry(&mut h, 1);
+        assert_eq!(h.len(), 1);
+        assert!(h[0].image.as_ref().unwrap().source_path.is_none());
+        assert!(
+            cache_read_image(hash).is_some(),
+            "data entry's paste bytes must survive"
+        );
+        assert!(
+            cache_read_preview(hash).is_some(),
+            "shared preview must survive"
+        );
+        // 删除数据条目 → 不再有引用 → 缓存清理。
+        // Deleting the data entry: no references left -> the cache is cleaned up.
+        delete_entry(&mut h, 0);
+        assert!(h.is_empty());
+        assert_eq!(cache_read_image(hash), None);
+        assert_eq!(cache_read_preview(hash), None);
+    }
+
+    #[test]
+    fn trim_keeps_shared_cache_for_the_surviving_same_hash_entry() {
+        use super::{
+            cache_read_image, cache_read_preview, cache_write_preview, record_image, record_text,
+        };
+        // max=2:文件(H) + 数据(H) 占满;文本把最旧的**文件条目**裁掉,但数据条目(H)
+        // 幸存 → 共享缓存保留;再裁掉数据条目 → 缓存清理。
+        // max=2: a file entry (H) + a data entry (H) fill the list; a text entry trims the
+        // oldest FILE entry, but the surviving data entry (H) keeps the shared cache; the
+        // next trim drops the data entry and the cache is cleaned.
+        let bytes = b"trim-shared-test";
+        let hash = super::fnv1a64(bytes);
+        let mut h = Vec::new();
+        assert!(record_image(
+            &mut h,
+            &image_from_file(bytes, "/tmp/t.gif"),
+            "Finder",
+            "",
+            2
+        ));
+        assert!(record_image(&mut h, &image(bytes), "Safari", "", 2));
+        assert!(cache_write_preview(hash, b"preview"));
+        record_text(&mut h, "x", "Ghostty", "", 2);
+        // 顺序:[x, 数据, 文件] → 裁剪掉文件 / [x, data, file] -> the file is trimmed.
+        assert_eq!(h.len(), 2);
+        assert!(h.iter().any(|e| {
+            e.image
+                .as_ref()
+                .is_some_and(|i| i.hash == hash && i.source_path.is_none())
+        }));
+        assert!(
+            cache_read_image(hash).is_some(),
+            "trimmed file entry must not wipe the data entry's bytes"
+        );
+        assert!(cache_read_preview(hash).is_some());
+        // 再裁:数据条目也被挤出 → 无引用 → 缓存清理。
+        // Another trim pushes the data entry out -> unreferenced -> cache cleaned.
+        record_text(&mut h, "y", "Ghostty", "", 2);
+        assert_eq!(h.len(), 2);
+        assert!(h.iter().all(|e| e.image.is_none()));
+        assert_eq!(cache_read_image(hash), None);
+        assert_eq!(cache_read_preview(hash), None);
+    }
+
+    #[test]
+    fn reference_check_honors_pinned_survivors_for_clear_all() {
+        use super::hash_referenced_by;
+        // 模拟"清除全部(保留置顶)":pinned 数据条目与同 hash 的 unpinned 文件条目
+        // 共存 → 被丢弃的文件条目的 hash 仍被幸存(置顶)条目引用 → 缓存保留。
+        // Simulates clear-all (keeps pinned): a pinned data entry and an unpinned file
+        // entry share a hash -> the dropped file entry's hash is still referenced by the
+        // surviving pinned entry -> the cache must be kept.
+        let bytes = b"clear-shared-test";
+        let hash = super::fnv1a64(bytes);
+        let data_entry = ClipEntry {
+            text: String::new(),
+            image: Some(image(bytes)),
+            pinned: true,
+            source_app: String::new(),
+            source_key: String::new(),
+        };
+        let file_entry = ClipEntry {
+            text: "x.gif".to_string(),
+            image: Some(image_from_file(bytes, "/tmp/x.gif")),
+            pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+        };
+        let all = vec![file_entry, data_entry];
+        assert!(hash_referenced_by(all.iter().filter(|e| e.pinned), hash));
+        assert!(!hash_referenced_by(
+            all.iter().filter(|e| e.pinned),
+            0xdeadbeef
+        ));
     }
 
     #[test]
