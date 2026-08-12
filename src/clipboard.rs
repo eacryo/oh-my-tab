@@ -4,8 +4,11 @@
 //! - 主线程 NSTimer 每 0.5s 轮询 NSPasteboard 的 changeCount,变化时读文本/图片入历史
 //!   (连续复制相同内容去重,上限裁剪)。
 //! - Option+V 由 event_monitor 的 tap 检测,经 bridge 转主线程调用 on_clipboard_toggle,
-//!   显示/关闭浮窗;↑↓/Enter/Esc/点击选择,Enter 或点击 = 写回剪贴板 + 合成 Cmd+V
-//!   自动粘贴(行为同 Windows 的 Win+V)。
+//!   显示/关闭浮窗;↑↓/←/→/Enter/Esc/点击导航:↑↓ 选择,← 置顶(详情打开时先关详情),
+//!   → 展开详情浮窗(完整文本 / 图片大图,内容跟随 ↑↓ 浏览实时刷新;打开时再按 ←/→
+//!   即关闭)。Enter 或点击 = 写回剪贴板 + 合成 Cmd+V 自动粘贴(行为同 Windows 的
+//!   Win+V)。详情浮窗是被动展示面板(永不成为 key,键盘焦点留在列表),点击面板任意
+//!   处/Esc 关闭,随主浮窗隐藏。
 //! - 文本条目存原文;**图片数据**条目原始字节落盘(`~/Library/Caches/oh-my-tab-clip-images/`,
 //!   按内容哈希命名),内存只留降采样 PNG 预览;粘贴时按需读回,按原始 UTI 写回
 //!   (JPG 粘回 JPG、GIF 动图粘回动图)。**文件复制**条目:复制时读一次文件内容
@@ -14,7 +17,8 @@
 //!   原文件;源文件被删/移动后该条目粘贴即失效;内容哈希让原文件与访达副本
 //!   (不同路径同字节)去重成一条。行内显示缩略图,text 存文件名(可搜索)。
 //!   启动时清空缓存目录(历史不持久化,残留必为孤儿),删除条目/清空/超上限裁剪时
-//!   联动删除对应缓存文件。
+//!   联动删除对应缓存文件。详情浮窗的大图另存 `{hash}.detail`(最长边 ≤1280px,
+//!   首次打开详情时懒生成,内存不常驻),随条目删除/清空/裁剪一并清理。
 //!
 //! History clipboard module (text + images, no persistence).
 //!
@@ -23,8 +27,12 @@
 //!   the text/image is read into the history (duplicates are skipped, overflow trimmed).
 //! - Option+V is detected by the event_monitor tap and marshalled to the main thread via the
 //!   bridge (on_clipboard_toggle), showing/hiding the picker. Arrow keys / Enter / Esc /
-//!   clicks navigate; Enter or a click = write back to the pasteboard + synthesize Cmd+V for
-//!   an automatic paste (mirrors Windows' Win+V).
+//!   clicks navigate: up/down select, left pins (closing the detail panel first when it is
+//!   open), right expands a detail panel (full text / large image; it follows ↑/↓ browsing
+//!   live; pressing ← or → again closes it), Enter or a click = write back to the
+//!   pasteboard + synthesize Cmd+V for an automatic paste (mirrors Windows' Win+V). The
+//!   detail panel is a passive display (never becomes key, so keyboard focus stays in the
+//!   list); a click anywhere on it or Esc closes it, and it hides together with the picker.
 //! - Text entries keep the raw text; image-DATA entries keep their ORIGINAL bytes ON DISK
 //!   (`~/Library/Caches/oh-my-tab-clip-images/`, keyed by a content hash) with only a
 //!   downsampled PNG preview in memory; pasting reads the bytes back on demand and writes
@@ -37,7 +45,9 @@
 //!   Finder duplicate (different paths, identical bytes) into one entry. The row shows the
 //!   thumbnail, and `text` holds the filename (searchable). The cache dir is wiped at
 //!   startup (the history is not persisted, so leftovers are orphans) and files are
-//!   removed in sync with delete/clear-all/trim.
+//!   removed in sync with delete/clear-all/trim. A separate `{hash}.detail` preview (longest
+//!   edge <= 1280px, generated lazily on the first detail open, never held in RAM) feeds the
+//!   detail panel and shares the same deletion lifecycle.
 
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -188,6 +198,26 @@ const ROW_TILE_ALPHA: f64 = 0.35;
 const SCROLL_INDICATOR_W: f64 = 4.0;
 /// 指示器最短显示长度(条太短不可读)/ minimum indicator length (too short is unreadable).
 const SCROLL_INDICATOR_MIN_LEN: f64 = 24.0;
+/// 详情浮窗与主浮窗的间距 / gap between the picker and the detail panel.
+const DETAIL_GAP: f64 = 8.0;
+/// 详情浮窗内容内边距 / the detail panel's inner padding.
+const DETAIL_PAD: f64 = 12.0;
+/// 详情浮窗最大宽度 / the detail panel's max width.
+const DETAIL_MAX_W: f64 = 480.0;
+/// 详情文本最大高度(超出滚动)/ max text height in the detail panel (scrolls beyond).
+const DETAIL_MAX_H: f64 = 640.0;
+/// 详情文本最小高度(短文本也保持面板体量)。
+/// The detail text panel's min height (short text keeps the panel a decent size).
+const DETAIL_TEXT_MIN_H: f64 = 96.0;
+/// 详情图片最大框(等比适配)/ max image box in the detail panel (fit proportionally).
+const DETAIL_IMAGE_MAX_W: f64 = 720.0;
+const DETAIL_IMAGE_MAX_H: f64 = 640.0;
+/// 详情预览最长边上限(px):视网膜屏 640pt 面板上 ~89% 原生密度,足够清晰;只在
+/// 首次打开详情时生成并落盘 `{hash}.detail`,不占内存(内存仍只留 480px 缩略图)。
+/// Detail preview max edge (px): ~89% native density on a retina 640pt panel; generated
+/// once on the first detail open and cached as `{hash}.detail`, never held in RAM (RAM
+/// still keeps only the 480px thumbnail).
+const DETAIL_PREVIEW_MAX_DIM: f64 = 1280.0;
 
 // ========== 状态 / state ==========
 
@@ -252,6 +282,15 @@ static SCROLL_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
 /// 自定义滚动指示器 / the custom scroll indicator view.
 static SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
+/// 详情浮窗窗口(→ 展开详情)/ the detail panel window (right-arrow expands).
+static DETAIL_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 详情浮窗内容容器(文本滚动视图 / 图片视图所在容器;点击面板任意处 = 关闭)。
+/// The detail panel's content container (hosts the text scroll view / the image view;
+/// clicking anywhere on the panel dismisses it).
+static DETAIL_CONTENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 详情浮窗是否可见 / whether the detail panel is visible.
+static DETAIL_VISIBLE: AtomicBool = AtomicBool::new(false);
 
 /// 行列表重建进行中:重建期间 addSubview 的新行按钮会因鼠标恰好在区域内而立即派发
 /// mouseEntered(ActiveInKeyWindow + InVisibleRect 的 tracking area),若该回调再触发
@@ -331,6 +370,15 @@ fn truncate_to_lines(text: &str, max_units: usize, max_lines: usize) -> String {
 /// with the last one truncated).
 fn text_lines(text: &str) -> usize {
     estimate_lines(text, LINE_MAX_UNITS).min(MAX_TEXT_LINES)
+}
+
+/// 详情面板可用宽 → 每行可容纳的显示宽度单位,与行按钮同一估算口径
+/// (60 单位 ≈ 行内容宽 = PICKER_W - 两侧留白)。
+/// Detail-panel content width -> per-line width units, using the same estimate as the row
+/// buttons (60 units fit the row content width = PICKER_W - both paddings).
+fn detail_text_units(width: f64) -> usize {
+    let units_per_pt = LINE_MAX_UNITS as f64 / (PICKER_W - PAD_X * 2.0 - BODY_PAD_X * 2.0);
+    ((width * units_per_pt).floor() as usize).max(1)
 }
 
 /// 行按钮高度 = 行数 * 行高 + 上下内边距(按钮随文本行数紧凑包裹)。
@@ -786,6 +834,23 @@ fn unpin_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     history.insert(pos, e);
 }
 
+/// 切换第 idx 条的置顶状态;返回切换后的状态(置顶 = true)。纯函数,图钉按钮回调
+/// 与 ← 键盘快捷键共用,单测覆盖。
+/// Toggle the pinned state of entry `idx`; returns the new state (true = pinned). Pure
+/// function shared by the pin-button callback and the ← shortcut; unit-tested.
+fn toggle_pin_on(history: &mut Vec<ClipEntry>, idx: usize) -> bool {
+    let Some(entry) = history.get(idx) else {
+        return false;
+    };
+    let pinned = entry.pinned;
+    if pinned {
+        unpin_entry(history, idx);
+    } else {
+        pin_entry(history, idx);
+    }
+    !pinned
+}
+
 /// 删除第 idx 条(越界忽略),图片条目的缓存文件一并删除。
 /// Delete entry `idx` (out of range is ignored); an image entry's cache file goes too.
 fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
@@ -885,6 +950,7 @@ fn cache_read_image(hash: u64) -> Option<Vec<u8>> {
 fn cache_delete_image(hash: u64) {
     let _ = std::fs::remove_file(clip_image_path(hash));
     let _ = std::fs::remove_file(clip_image_preview_path(hash));
+    let _ = std::fs::remove_file(clip_image_detail_path(hash));
 }
 
 /// hash → 预览文件路径(缩略图单独落盘,重启加载历史时不必重新解码)。
@@ -916,6 +982,74 @@ fn cache_write_preview(hash: u64, preview: &[u8]) -> bool {
 /// Read the preview back (None when missing; the caller regenerates from the data bytes).
 fn cache_read_preview(hash: u64) -> Option<Vec<u8>> {
     std::fs::read(clip_image_preview_path(hash)).ok()
+}
+
+/// hash → 详情预览文件路径(→ 展开详情的大图;懒生成,首次打开时落盘)。
+/// hash -> the detail-preview path (the big image shown by the → detail panel; generated
+/// lazily and cached on the first open).
+fn clip_image_detail_path(hash: u64) -> std::path::PathBuf {
+    clip_image_cache_dir().join(format!("{hash:016x}.detail"))
+}
+
+/// 读回详情预览(缺失返回 None)。/ Read the detail preview back (None when missing).
+fn cache_read_detail_preview(hash: u64) -> Option<Vec<u8>> {
+    std::fs::read(clip_image_detail_path(hash)).ok()
+}
+
+/// 把详情预览 PNG 写入缓存(幂等)。/ Write the detail preview PNG into the cache (idempotent).
+fn cache_write_detail_preview(hash: u64, png: &[u8]) -> bool {
+    let dir = clip_image_cache_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let path = clip_image_detail_path(hash);
+    if path.exists() {
+        return true;
+    }
+    let tmp = dir.join(format!("{hash:016x}.detail.tmp"));
+    let ok = std::fs::write(&tmp, png).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ok
+}
+
+/// 为图片条目生成详情预览字节(懒生成 + 落盘,内存模型不变——RAM 仍只存 480px
+/// 缩略图):数据条目从缓存原始字节生成;文件复制条目**临时读源文件**、生成后即弃
+/// (不落字节,同粘贴的引用语义);两者都不可得 → 回退内存预览;预览也空 → None。
+/// 生成成功即写缓存,下次打开直接读盘,不重复解码。
+///
+/// Generate the detail-preview bytes for an image entry (lazily, then cached; the memory
+/// model is unchanged -- RAM still holds only the 480px thumbnail): data entries generate
+/// from the cached original bytes; file-copy entries READ the source file transiently and
+/// discard it (same reference semantics as pasting); when neither is available -> fall back
+/// to the in-memory preview; an empty preview too -> None. Success is cached so the next
+/// open reads the file instead of re-decoding.
+fn ensure_detail_preview(img: &ImageEntry) -> Option<Vec<u8>> {
+    if let Some(png) = cache_read_detail_preview(img.hash) {
+        return Some(png);
+    }
+    let bytes = if img.source_path.is_none() {
+        cache_read_image(img.hash)
+    } else {
+        img.source_path
+            .as_deref()
+            .and_then(|p| std::fs::read(p).ok())
+    };
+    if let Some(bytes) = bytes {
+        if let Some(png) = unsafe { any_image_to_scaled_png(&bytes, DETAIL_PREVIEW_MAX_DIM) } {
+            // 退化条目(hash=0)不写缓存,避免 0000... 孤儿文件。
+            // Degenerate entries (hash=0) skip the cache write (no orphan file).
+            if img.hash != 0 {
+                cache_write_detail_preview(img.hash, &png);
+            }
+            return Some(png);
+        }
+    }
+    if !img.preview_png.is_empty() {
+        return Some(img.preview_png.clone());
+    }
+    None
 }
 
 /// hash 是否仍被幸存条目引用。文件条目与数据条目同内容(同 hash)可以共存并共享
@@ -1245,7 +1379,10 @@ const PREVIEW_MAX_DIM: f64 = 480.0;
 /// Decode arbitrary image bytes into a DOWNSAMPLED PNG preview (for the thumbnail; None
 /// on failure). Animations (GIF/WebP) yield their first frame; sources larger than
 /// PREVIEW_MAX_DIM are scaled down proportionally before encoding.
-unsafe fn any_image_to_preview_png(bytes: &[u8]) -> Option<Vec<u8>> {
+/// 图片字节 → 降采样 PNG 预览(最长边 ≤ max_dim)。与缩略图绘制同款缩放管线。
+/// Image bytes -> a downsampled PNG (longest edge <= max_dim). Same scaling pipeline as the
+/// thumbnail drawing.
+unsafe fn any_image_to_scaled_png(bytes: &[u8], max_dim: f64) -> Option<Vec<u8>> {
     // NSImage -> (必要时 lockFocus 缩放)-> TIFFRepresentation -> NSBitmapImageRep ->
     // PNG(4)。与缩略图绘制同款缩放管线。
     // NSImage -> (lockFocus scale when needed) -> TIFFRepresentation -> NSBitmapImageRep ->
@@ -1265,8 +1402,8 @@ unsafe fn any_image_to_preview_png(bytes: &[u8]) -> Option<Vec<u8>> {
     // 需要降采样才画进缩放目标图;小图直接用原图,省一次重绘。
     // Only draw into a scaled target when downsampling is needed; small sources are used
     // as-is, skipping the extra pass.
-    let source: *mut AnyObject = if w > PREVIEW_MAX_DIM || h > PREVIEW_MAX_DIM {
-        let scale = (PREVIEW_MAX_DIM / w).min(PREVIEW_MAX_DIM / h);
+    let source: *mut AnyObject = if w > max_dim || h > max_dim {
+        let scale = (max_dim / w).min(max_dim / h);
         let (tw, th) = (w * scale, h * scale);
         let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
         let target: *mut AnyObject = msg_send![target, initWithSize: NSSize::new(tw, th)];
@@ -1305,6 +1442,11 @@ unsafe fn any_image_to_preview_png(bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
+}
+
+/// 图片字节 → 缩略图预览 PNG(最长边 ≤ PREVIEW_MAX_DIM)。/ Bytes -> thumbnail PNG (<= 480px).
+unsafe fn any_image_to_preview_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    any_image_to_scaled_png(bytes, PREVIEW_MAX_DIM)
 }
 
 /// 剪贴板图片类型探测优先级(load-bearing,顺序不可随意改):
@@ -2066,10 +2208,14 @@ fn update_scroll_indicator() {
     }
 }
 
-/// clipView bounds 变化通知回调(滚动发生)→ 更新指示器。
-/// Clip-view bounds-change notification callback (scrolling) -> update the indicator.
+/// clipView bounds 变化通知回调(滚动发生)→ 更新指示器;详情打开时同步移动详情,
+/// 让它跟着选中行走(否则滚动后详情与行错位)。
+/// Clip-view bounds-change notification callback (scrolling) -> update the indicator; with
+/// the detail open, move it along so it keeps following the selected row (otherwise a
+/// scroll would leave the detail misaligned with its row).
 extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
     update_scroll_indicator();
+    reposition_detail();
 }
 
 /// "清除全部"按钮回调:清空剪贴板历史并关闭浮窗(空历史呼出会被忽略)。
@@ -2304,7 +2450,144 @@ fn picker_frame_for(cursor: NSPoint, screen: NSRect, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
-/// Option+V 呼出/关闭(由 bridge 在主线程调用)。
+/// 纯逻辑:详情浮窗 frame——优先放在主浮窗右侧,右侧不足翻转到左侧,仍不足贴屏
+/// clamp;y 与 `align_top_y` 对齐(调用方传入选中行的屏幕 y),屏幕不够时上移/clamp,
+/// 永不越出屏幕。对齐"选中行"而非主浮窗窗口顶:主浮窗顶部是搜索框/清除按钮头部条,
+/// 且条目少时窗口被最小高度撑高、行下面有空白——对齐窗口顶会让详情悬在行上方错位。
+///
+/// Pure: the detail panel's frame -- placed right of the picker; flips to the left when the
+/// right side lacks room; clamps to the screen edges otherwise. y aligns with `align_top_y`
+/// (the SELECTED ROW's screen y, supplied by the caller), shifting up / clamping when the
+/// screen is too short; never placed outside the screen. Aligning with the row instead of
+/// the window's top: the picker's top strip holds the search field / clear button, and with
+/// few entries the window is floored at the min height with blank space below the rows --
+/// a window-top alignment would float the panel above the row.
+fn detail_frame_for(picker: NSRect, align_top_y: f64, screen: NSRect, w: f64, h: f64) -> NSRect {
+    let min_x = screen.origin.x;
+    let max_x = screen.origin.x + screen.size.width;
+    let min_y = screen.origin.y;
+    let max_y = screen.origin.y + screen.size.height;
+
+    // x:优先主浮窗右侧;不足翻转到左侧;再不足贴左右缘。
+    // x: prefer the picker's right; flip to the left when tight; clamp to the edges.
+    let mut x = picker.origin.x + picker.size.width + DETAIL_GAP;
+    if x + w > max_x {
+        x = picker.origin.x - w - DETAIL_GAP;
+    }
+    if x < min_x {
+        x = min_x + PICKER_EDGE_MARGIN;
+    }
+    if x + w > max_x {
+        x = max_x - w - PICKER_EDGE_MARGIN;
+    }
+
+    // y:与选中行顶部对齐(对齐后向下延伸);屏幕放不下时整体上移,再不够贴缘。
+    // y: align the top with the selected row (extending downward); shift up when the
+    // screen is too short, then clamp to the edges.
+    let mut y = align_top_y - h;
+    if y < min_y {
+        y = min_y + PICKER_EDGE_MARGIN;
+    }
+    if y + h > max_y {
+        y = max_y - h - PICKER_EDGE_MARGIN;
+    }
+    if y < min_y {
+        y = min_y + PICKER_EDGE_MARGIN;
+    }
+
+    NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+}
+
+/// 主浮窗所在屏幕的 frame(跨屏时跟随其所在屏;拿不到时回退主屏)。
+/// The frame of the picker's screen (follows it across screens; falls back to the main
+/// screen when unavailable).
+unsafe fn picker_screen_frame(picker_win: *mut AnyObject) -> NSRect {
+    let sc: *mut AnyObject = msg_send![picker_win, screen];
+    if sc.is_null() {
+        let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+        msg_send![main, frame]
+    } else {
+        msg_send![sc, frame]
+    }
+}
+
+/// 选中行的屏幕 y(AppKit 坐标,详情面板顶要对齐的位置):窗口顶 + 头部条 + 行在
+/// 文档内的 flipped y − 当前滚动偏移。锁只取指针即放,不持有跨 msg_send 的锁。
+///
+/// The selected row's screen y (AppKit coords -- where the detail panel's top aligns):
+/// the window top + the header strip + the row's flipped y within the document - the
+/// current scroll offset. Locks are taken only to copy pointers/values, never held
+/// across msg_send calls.
+fn selected_row_screen_y(picker: NSRect) -> Option<f64> {
+    let sel = *PICKER_SELECTION.lock().unwrap();
+    if sel == NO_SELECTION {
+        return None;
+    }
+    let pitches = ROW_PITCHES.lock().unwrap();
+    if pitches.is_empty() {
+        return None;
+    }
+    let row_idx = sel.min(pitches.len() - 1);
+    let row_flipped = header_strip_h() + row_top(row_idx, &pitches);
+    drop(pitches);
+    // 滚动偏移:clip view 的 bounds.origin.y(flipped 坐标)。走 SCROLL_VIEW 而非
+    // PICKER_CONTAINER:键盘驱动的 scrollRectToVisible 期间容器锁仍被 if-let 临时
+    // 守卫持有,从这里再锁就是同线程自死锁(仓库里已有的教训)。
+    // Scroll offset: the clip view's bounds.origin.y (flipped). Read via SCROLL_VIEW,
+    // NOT PICKER_CONTAINER: during key-driven scrollRectToVisible the container lock is
+    // still held by the if-let temporary guard -- locking it here would self-deadlock
+    // (a lesson this repo has already learned the hard way).
+    let scroll_offset = {
+        let sv = SCROLL_VIEW.lock().unwrap();
+        match *sv {
+            Some(s) => unsafe {
+                let clip: *mut AnyObject = msg_send![s.0, contentView];
+                if clip.is_null() {
+                    0.0
+                } else {
+                    let b: NSRect = msg_send![clip, bounds];
+                    b.origin.y
+                }
+            },
+            None => 0.0,
+        }
+    };
+    Some(picker.origin.y + picker.size.height - (row_flipped - scroll_offset))
+}
+
+/// 详情打开时,列表滚动会移动选中行 → 重算对齐位置并 setFrame(只移动,不重建内容)。
+/// 挂在 clipView 的 bounds 变化通知上;rebuild_rows 期间跳过——其末尾的滚动恢复会
+/// 同步触发通知,而那时 ROW_PITCHES 锁仍被持有,同线程非重入锁会自死锁。
+///
+/// Reposition the detail panel while it is open when the list scrolls (the selected row
+/// moves): recompute the alignment y and setFrame only, no content rebuild. Hooked onto
+/// the clip-view bounds-change notification; skipped during rebuild_rows -- its trailing
+/// scroll restore fires the notification synchronously while ROW_PITCHES is still held,
+/// and locking it here would self-deadlock on the same non-reentrant mutex.
+fn reposition_detail() {
+    if !DETAIL_VISIBLE.load(Ordering::SeqCst) || REBUILDING.load(Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        let picker_win = match *PICKER_WINDOW.lock().unwrap() {
+            Some(w) => w.0,
+            None => return,
+        };
+        let detail_win = match *DETAIL_WINDOW.lock().unwrap() {
+            Some(w) => w.0,
+            None => return,
+        };
+        let pf: NSRect = msg_send![picker_win, frame];
+        let Some(align_top_y) = selected_row_screen_y(pf) else {
+            return;
+        };
+        let cf: NSRect = msg_send![detail_win, frame];
+        let sf = picker_screen_frame(picker_win);
+        let frame = detail_frame_for(pf, align_top_y, sf, cf.size.width, cf.size.height);
+        let _: () = msg_send![detail_win, setFrame: frame, display: true];
+    }
+}
+
 /// Toggle the picker on Option+V (called on the main thread by the bridge).
 pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     // 总开关关闭时忽略呼出(设置里关闭后 Option+V 不应再显示浮窗)。
@@ -2330,8 +2613,9 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
 fn show_picker() {
     unsafe {
         ensure_picker_window();
-        // 每次呼出重置搜索(干净起点)。
-        // Reset the search on every summon (a clean slate).
+        // 每次呼出重置搜索(干净起点);上次遗留的详情浮窗一并收起。
+        // Reset the search on every summon (a clean slate); a stale detail panel goes too.
+        hide_detail();
         clear_search();
         let window = match *PICKER_WINDOW.lock().unwrap() {
             Some(w) => w.0,
@@ -2430,6 +2714,9 @@ fn show_picker() {
 /// 隐藏浮窗。/ Hide the picker.
 fn hide_picker() {
     PICKER_VISIBLE.store(false, Ordering::SeqCst);
+    // 详情浮窗一并关闭(浮窗隐藏/粘贴/点击外部都该连带收起详情)。
+    // The detail panel closes with it (paste / outside clicks / Esc all dismiss it too).
+    hide_detail();
     // 锁内只取指针,orderOut 放到锁外:orderOut 会同步触发 NSWindowDidResignKeyNotification,
     // 回调再进 hide_picker 并锁同一把 Mutex——非重入锁会自死锁(曾导致进程挂起)。
     // Take the pointer under the lock but orderOut outside it: orderOut synchronously fires
@@ -2441,6 +2728,365 @@ fn hide_picker() {
             let _: () = msg_send![w.0, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
+}
+
+/// 隐藏详情浮窗(幂等;详情面板从不成为 key,orderOut 不会触发 resign-key 通知,
+/// 但沿用"锁内取指针、锁外 orderOut"的纪律)。/ Hide the detail panel (idempotent; the
+/// panel never becomes key so orderOut fires no resign-key notification, but the
+/// pointer-outside-the-lock discipline is kept anyway).
+fn hide_detail() {
+    if !DETAIL_VISIBLE.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let win = *DETAIL_WINDOW.lock().unwrap();
+    unsafe {
+        if let Some(w) = win {
+            let _: () = msg_send![w.0, orderOut: std::ptr::null::<AnyObject>()];
+        }
+    }
+}
+
+/// 构建详情浮窗窗口(一次):Nonactivating NSPanel + 与主浮窗同款玻璃背景。
+/// **关键**:重写 canBecomeKeyWindow = NO,面板永不成为 key——键盘焦点始终留在
+/// 主浮窗容器(↑/↓/←/→/Enter/Esc 全部继续走 container_key_down),详情只是被动展示。
+///
+/// Build the detail panel window (once): a Nonactivating NSPanel with the same glass
+/// backdrop as the picker. KEY: canBecomeKeyWindow is overridden to NO, so the panel never
+/// becomes key -- keyboard focus stays in the picker's container (all keys keep going
+/// through container_key_down); the detail is a passive display only.
+unsafe fn ensure_detail_window() {
+    if DETAIL_WINDOW.lock().unwrap().is_some() {
+        return;
+    }
+    let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+    let screen_frame: NSRect = msg_send![screen, frame];
+    let w = DETAIL_MAX_W;
+    let h = DETAIL_MAX_H;
+    let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
+    let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
+    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+
+    // 与主浮窗同款:NSWindowStyleMaskNonactivatingPanel(1<<7),不激活所属 app。
+    // Same as the picker: NSWindowStyleMaskNonactivatingPanel (1<<7), no app activation.
+    let style: u64 = 1 << 7;
+
+    let window_cls = {
+        let name = CString::new("OhMyTabClipDetailWindow").unwrap();
+        let superclass = class!(NSPanel) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        let types_bool = CString::new("B@:").unwrap();
+        class_addMethod(
+            cls,
+            sel!(canBecomeKeyWindow),
+            detail_window_can_not_become_key as *mut c_void,
+            types_bool.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        cls
+    };
+    let window: *mut AnyObject = msg_send![window_cls, alloc];
+    let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
+    let _: () = msg_send![window, setLevel: 3u64];
+    let _: () = msg_send![window, setOpaque: false];
+    let _: () = msg_send![window, setReleasedWhenClosed: false];
+    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+    let _: () = msg_send![window, setBackgroundColor: clear];
+    let _: () = msg_send![window, setHasShadow: false];
+
+    // --- 玻璃背景(Liquid Glass),与主浮窗同款 ---
+    // Glass backdrop (Liquid Glass), same as the picker.
+    let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
+    let content_parent: *mut AnyObject;
+
+    if is_macos_26 {
+        let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
+        let glass: *mut AnyObject = msg_send![glass_cls, alloc];
+        let glass: *mut AnyObject =
+            msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
+        let radius = CORNER_R;
+        let _: () = msg_send![glass, setCornerRadius: radius];
+        let style_i: i64 = match CONFIG.read().unwrap().appearance.glass_style.as_str() {
+            "clear" => 1,
+            _ => 0,
+        };
+        let _: () = msg_send![glass, setStyle: style_i];
+        let tint_hex = crate::config::parse_hex8(&CONFIG.read().unwrap().appearance.glass_tint);
+        let tint = crate::ffi::hex_to_ns_color(tint_hex);
+        let _: () = msg_send![glass, setTintColor: tint];
+        let _: () = msg_send![glass, setAutoresizingMask: 18u64];
+        let _: () = msg_send![window, setContentView: glass];
+        let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let inner: *mut AnyObject =
+            msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
+        let _: () = msg_send![inner, setAutoresizingMask: 18u64];
+        let _: () = msg_send![glass, setContentView: inner];
+        let _: () = msg_send![glass, setWantsLayer: true];
+        let glass_layer: *mut AnyObject = msg_send![glass, layer];
+        if !glass_layer.is_null() {
+            let _: () = msg_send![glass_layer, setCornerRadius: radius];
+            let _: () = msg_send![glass_layer, setMasksToBounds: true];
+        }
+        content_parent = inner;
+    } else {
+        let content: *mut AnyObject = msg_send![window, contentView];
+        let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+        let ve: *mut AnyObject =
+            msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
+        let _: () = msg_send![ve, setBlendingMode: 1u64]; // WithinWindow
+        let _: () = msg_send![ve, setMaterial: 12u64]; // Dark
+        let _: () = msg_send![ve, setState: 1u64]; // Active
+        let _: () = msg_send![ve, setAutoresizingMask: 18u64];
+        let _: () = msg_send![content, addSubview: ve];
+        content_parent = ve;
+    }
+
+    // 内容容器:flipped,内容从顶部排起;点击面板任意处 = 关闭详情(详情不成为 key,
+    // 点击面板不会 resign 主浮窗,必须自己处理)。
+    // Content container: flipped, content top-aligned; clicking anywhere on the panel
+    // dismisses it (the panel never becomes key, so a click neither resigns the picker nor
+    // triggers window_did_resign_key -- handled here directly).
+    let content = {
+        let name = CString::new("OhMyTabClipDetailContent").unwrap();
+        let superclass = class!(NSView) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        let types_v = CString::new("v@:@").unwrap();
+        class_addMethod(
+            cls,
+            sel!(mouseDown:),
+            detail_content_mouse_down as *mut c_void,
+            types_v.as_ptr(),
+        );
+        let types_bool = CString::new("B@:").unwrap();
+        class_addMethod(
+            cls,
+            sel!(isFlipped),
+            detail_content_is_flipped as *mut c_void,
+            types_bool.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        let content: *mut AnyObject = msg_send![cls, alloc];
+        let content: *mut AnyObject = msg_send![
+            content,
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
+        ];
+        let _: () = msg_send![content, setAutoresizingMask: 18u64];
+        let _: () = msg_send![content_parent, addSubview: content];
+        release_obj(content);
+        content
+    };
+
+    *DETAIL_CONTENT.lock().unwrap() = Some(ObjPtr(content));
+    *DETAIL_WINDOW.lock().unwrap() = Some(ObjPtr(window));
+}
+
+/// 详情面板永不成为 key(键盘焦点保持留在主浮窗容器)。
+/// The detail panel never becomes key (keyboard focus stays in the picker's container).
+extern "C" fn detail_window_can_not_become_key(_self: *mut c_void, _cmd: Sel) -> bool {
+    false
+}
+
+/// 内容容器 flipped。 / The content container is flipped.
+extern "C" fn detail_content_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
+    true
+}
+
+/// 点击详情面板 = 关闭详情(回到列表;主浮窗保持 key,可继续 ←/→/↑/↓/Enter)。
+/// Clicking the detail panel dismisses it (back to the list; the picker stays key, so
+/// ←/→/↑/↓/Enter keep working).
+extern "C" fn detail_content_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    hide_detail();
+}
+
+/// 打开/刷新详情浮窗:内容跟随选中条目——文本 = 完整未截断;图片 = 详情预览大图
+/// (懒生成 .detail,见 ensure_detail_preview)。位置在主浮窗右侧,详情比主浮窗高时
+/// 顶对齐向下延伸;屏幕放不下则翻转到左侧/clamp。
+///
+/// Open/refresh the detail panel: content follows the selected entry -- full untruncated
+/// text for text entries; the large detail preview (lazy `.detail`, see ensure_detail_preview)
+/// for images. Placed right of the picker, top-aligned and extending down when taller;
+/// flips left / clamps when the screen is tight.
+unsafe fn show_detail_for_sel() {
+    // 无选中(焦点在搜索框)/ 空列表时不动作。
+    // No-op without a selection (search-field focus) or an empty list.
+    let sel = *PICKER_SELECTION.lock().unwrap();
+    if sel == NO_SELECTION {
+        return;
+    }
+    let Some(h_idx) = mapped_index(sel) else {
+        return;
+    };
+    let entry = {
+        let hist = CLIP_HISTORY.lock().unwrap();
+        hist.get(h_idx).cloned()
+    };
+    let Some(entry) = entry else {
+        return;
+    };
+    ensure_detail_window();
+    let window = match *DETAIL_WINDOW.lock().unwrap() {
+        Some(w) => w.0,
+        None => return,
+    };
+    let content = match *DETAIL_CONTENT.lock().unwrap() {
+        Some(c) => c.0,
+        None => return,
+    };
+
+    // 清除旧内容:removeFromSuperview 即释放(父视图持有,绝不二次 release,
+    // 与 rebuild_rows 同一条纪律)。
+    // Clear the old content: removeFromSuperview releases it (parent-owned; never released
+    // again -- the same discipline as rebuild_rows).
+    let subs: *mut AnyObject = msg_send![content, subviews];
+    let count: usize = msg_send![subs, count];
+    for i in 0..count {
+        let v: *mut AnyObject = msg_send![subs, objectAtIndex: i as isize];
+        let _: () = msg_send![v, removeFromSuperview];
+    }
+
+    // 构建内容:三种分支都算出 (w, h) 并填充容器,统一落到定位代码。
+    // Build the content: every branch computes (w, h), fills the container, and falls
+    // through to the shared positioning code below.
+    let (w, h): (f64, f64);
+    if let Some(img) = &entry.image {
+        // --- 图片条目:详情预览大图,等比适配最大框 ---
+        // Image entry: the detail preview, fit proportionally into the max box.
+        if let Some(png) = ensure_detail_preview(img) {
+            let data: *mut AnyObject = msg_send![
+                class!(NSData),
+                dataWithBytes: png.as_ptr() as *const c_void,
+                length: png.len()
+            ];
+            let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+            let image: *mut AnyObject = msg_send![image, initWithData: data];
+            if image.is_null() {
+                return;
+            }
+            let img_size: NSSize = msg_send![image, size];
+            let (iw, ih) = (img_size.width, img_size.height);
+            let fit_scale = (DETAIL_IMAGE_MAX_W / iw)
+                .min(DETAIL_IMAGE_MAX_H / ih)
+                .min(1.0);
+            let (fit_w, fit_h) = if iw > 0.0 && ih > 0.0 {
+                (iw * fit_scale, ih * fit_scale)
+            } else {
+                (DETAIL_IMAGE_MAX_W, DETAIL_IMAGE_MAX_H)
+            };
+            w = fit_w + DETAIL_PAD * 2.0;
+            h = fit_h + DETAIL_PAD * 2.0;
+            let view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+            let view: *mut AnyObject = msg_send![
+                view,
+                initWithFrame: NSRect::new(
+                    NSPoint::new(DETAIL_PAD, DETAIL_PAD),
+                    NSSize::new(fit_w, fit_h)
+                )
+            ];
+            let _: () = msg_send![view, setImage: image];
+            let _: () = msg_send![view, setImageScaling: 3u64]; // NSImageScaleProportionallyUpOrDown
+            let _: () = msg_send![view, setEditable: false];
+            let _: () = msg_send![content, addSubview: view];
+            release_obj(view);
+            release_obj(image);
+        } else {
+            // 退化条目(无预览无源文件):详情回退文件名文本(与行内兜底一致)。
+            // Degenerate entry (no preview, no source file): the detail falls back to the
+            // filename text (same fallback as the row body).
+            let (tw, th) = detail_text_size(&entry.text);
+            add_detail_text(content, &entry.text, tw, th);
+            w = tw;
+            h = th;
+        }
+    } else {
+        // --- 文本条目:完整未截断文本,超出 DETAIL_MAX_H 滚动 ---
+        // Text entry: the full untruncated text; scrolls beyond DETAIL_MAX_H.
+        let (tw, th) = detail_text_size(&entry.text);
+        add_detail_text(content, &entry.text, tw, th);
+        w = tw;
+        h = th;
+    }
+
+    // 定位:主浮窗右侧(与选中行顶部对齐)/ 翻转 / clamp。对齐选中行而非窗口顶:
+    // 窗口顶是搜索/清除头部条,且条目少时窗口被最小高度撑高,对窗口顶会让详情
+    // 悬在行上方错位(用户反馈)。
+    // Position: right of the picker, top-aligned with the SELECTED ROW / flip / clamp.
+    // Row alignment instead of the window top: the top strip holds the search/clear bar
+    // and with few entries the window is floored at the min height, so a window-top
+    // alignment floats the panel above the row (user-reported misalignment).
+    let picker_win = match *PICKER_WINDOW.lock().unwrap() {
+        Some(w) => w.0,
+        None => return,
+    };
+    let pf: NSRect = msg_send![picker_win, frame];
+    let Some(align_top_y) = selected_row_screen_y(pf) else {
+        return;
+    };
+    let sf = picker_screen_frame(picker_win);
+    let frame = detail_frame_for(pf, align_top_y, sf, w, h);
+    log_debug!(
+        "[clip] detail frame: ({:.0},{:.0}) {}x{}",
+        frame.origin.x,
+        frame.origin.y,
+        frame.size.width,
+        frame.size.height
+    );
+    let _: () = msg_send![window, setFrame: frame, display: true];
+    // orderFrontRegardless:不抢 key(面板 canBecomeKeyWindow=NO,主浮窗保持 key)。
+    // orderFrontRegardless: never takes key (canBecomeKeyWindow=NO keeps the picker key).
+    let _: () = msg_send![window, orderFrontRegardless];
+    DETAIL_VISIBLE.store(true, Ordering::SeqCst);
+}
+
+/// 计算详情文本面板尺寸(宽 DETAIL_MAX_W;高 = 完整文本行数,clamp 到 DETAIL_MAX_H)。
+/// Compute the detail text panel's size (width DETAIL_MAX_W; height from the full text's
+/// line count, clamped to DETAIL_MAX_H).
+fn detail_text_size(text: &str) -> (f64, f64) {
+    let avail_w = DETAIL_MAX_W - DETAIL_PAD * 2.0;
+    let lines = estimate_lines(text, detail_text_units(avail_w));
+    let h = (lines as f64 * LINE_H + DETAIL_PAD * 2.0).clamp(DETAIL_TEXT_MIN_H, DETAIL_MAX_H);
+    (DETAIL_MAX_W, h)
+}
+
+/// 构建详情文本视图(NSScrollView + NSTextView,完整文本自动换行,超出滚动)。
+/// Build the detail text view (NSScrollView + NSTextView, full wrapped text, scrolls).
+unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
+    let avail_w = w - DETAIL_PAD * 2.0;
+    let body_h = (h - DETAIL_PAD * 2.0).max(LINE_H);
+    let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
+    let scroll: *mut AnyObject = msg_send![
+        scroll,
+        initWithFrame: NSRect::new(
+            NSPoint::new(DETAIL_PAD, DETAIL_PAD),
+            NSSize::new(avail_w, body_h)
+        )
+    ];
+    let _: () = msg_send![scroll, setBorderType: 0u64]; // NSNoBorder
+    let _: () = msg_send![scroll, setDrawsBackground: false];
+    let _: () = msg_send![scroll, setHasVerticalScroller: true];
+    let _: () = msg_send![scroll, setAutohidesScrollers: true];
+    let _: () = msg_send![scroll, setHasHorizontalScroller: false];
+    let tv: *mut AnyObject = msg_send![class!(NSTextView), alloc];
+    let tv: *mut AnyObject = msg_send![
+        tv,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(avail_w, body_h))
+    ];
+    let ns_text = make_nsstring(text);
+    let _: () = msg_send![tv, setString: ns_text];
+    CFRelease(ns_text as *const c_void);
+    let _: () = msg_send![tv, setEditable: false];
+    let _: () = msg_send![tv, setSelectable: false];
+    let _: () = msg_send![tv, setDrawsBackground: false];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+    let _: () = msg_send![tv, setFont: font];
+    let _: () = msg_send![tv, setTextContainerInset: NSSize::new(0.0, 0.0)];
+    // 垂直增长 + 水平固定:换行宽 = 面板内容宽,超出行数靠滚动。
+    // Vertically resizable, horizontally fixed: wrapping width = the panel's content width,
+    // excess lines scroll.
+    let _: () = msg_send![tv, setVerticallyResizable: true];
+    let _: () = msg_send![tv, setHorizontallyResizable: false];
+    let _: () = msg_send![scroll, setDocumentView: tv];
+    release_obj(tv);
+    let _: () = msg_send![content, addSubview: scroll];
+    release_obj(scroll);
 }
 
 /// 构建浮窗窗口(一次)。/ Build the picker window (once).
@@ -3757,11 +4403,7 @@ extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
         return;
     };
     let mut hist = CLIP_HISTORY.lock().unwrap();
-    if hist[h_idx].pinned {
-        unpin_entry(&mut hist, h_idx);
-    } else {
-        pin_entry(&mut hist, h_idx);
-    }
+    toggle_pin_on(&mut hist, h_idx);
     drop(hist);
     save_history();
     unsafe { rebuild_rows() };
@@ -3909,8 +4551,10 @@ fn nav_arrow(keycode: u16, sel: usize, hist_len: usize) -> Option<usize> {
     }
 }
 
-/// 键盘导航:↑/↓ 选择,Enter 粘贴,Esc 关闭。
-/// Keyboard navigation: up/down to select, Enter to paste, Esc to close.
+/// 键盘导航:↑/↓ 选择,← 置顶,→ 展开详情(详情打开时 ←/→ 都关闭详情),
+/// Enter 粘贴,Esc 关闭。
+/// Keyboard navigation: up/down to select, left to pin, right to expand details (with the
+/// detail open, both ← and → close it), Enter to paste, Esc to close.
 extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let keycode: u16 = msg_send![event as *mut AnyObject, keyCode];
@@ -3920,6 +4564,43 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
         let display_len = FILTERED.lock().unwrap().len();
         let mut sel = PICKER_SELECTION.lock().unwrap();
         match keycode {
+            123 => {
+                // ←(123):详情打开时先关闭详情;否则切换选中条目的置顶状态。
+                // Left: the detail panel closes first when open; otherwise the selected
+                // entry's pinned state toggles.
+                if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+                    drop(sel);
+                    hide_detail();
+                    return;
+                }
+                let idx = *sel;
+                drop(sel);
+                let Some(h_idx) = mapped_index(idx) else {
+                    return;
+                };
+                let mut hist = CLIP_HISTORY.lock().unwrap();
+                toggle_pin_on(&mut hist, h_idx);
+                drop(hist);
+                save_history();
+                rebuild_rows();
+            }
+            124 => {
+                // →(124):详情打开时关闭详情(与 ← 一致);否则展开选中条目的详情
+                // (完整文本 / 图片大图)。
+                // Right: closes the detail panel when it is open (same as ←); otherwise
+                // expands the selected entry's details (full text / large image).
+                if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+                    drop(sel);
+                    hide_detail();
+                    return;
+                }
+                let idx = *sel;
+                drop(sel);
+                if idx == NO_SELECTION {
+                    return;
+                }
+                show_detail_for_sel();
+            }
             126 | 125 => {
                 // ↑(126):已在列表第一条(或无选中)时跳回搜索框;进入前清除选中,
                 // 高光消失(delegate 的 controlTextDidBeginEditing: 也会清,双保险)。
@@ -3963,6 +4644,12 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                         )
                     ];
                 }
+                // 详情打开时跟随选中条目实时刷新(浏览体验,类似 Quick Look)。
+                // The detail panel follows the selection live while open (Quick-Look-style
+                // browsing).
+                if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+                    show_detail_for_sel();
+                }
             }
             36 => {
                 // Enter
@@ -3994,6 +4681,14 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 rebuild_rows();
             }
             53 => {
+                // Esc:详情打开时第一级 = 关闭详情(浮窗与搜索词保持不动)。
+                // Esc: with the detail open, the first press closes the detail (the picker
+                // and the query stay untouched).
+                if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+                    drop(sel);
+                    hide_detail();
+                    return;
+                }
                 // Esc:清空搜索词则恢复全列表,再按才关闭——搜索框聚焦时的第一级由
                 // NSSearchField 子类的 cancelOperation: 处理;这里处理列表聚焦时。
                 // Esc: a query gets cleared first (restoring the full list), a second press
@@ -4194,6 +4889,21 @@ unsafe fn row_target() -> *mut AnyObject {
 /// the picker twice to exercise rebuild_rows' row-cleanup path -- the site of a double-release
 /// UAF that once segfaulted on the second summon. Returns true on success; a crash is a failure.
 pub(crate) fn smoke_runner() -> bool {
+    // 8x8 实心 PNG:图片条目 + 详情预览(.detail 懒生成)共用。注意不能用 1x1 透明图:
+    // 那种图在 TIFFRepresentation 重编码时失败(CGImageDestinationFinalize),详情预览
+    // 生成路径会走不到"生成并落盘"分支。
+    // An 8x8 solid PNG shared by the image entry and the lazy detail preview. Deliberately
+    // NOT the 1x1 transparent PNG: that one fails TIFFRepresentation re-encoding
+    // (CGImageDestinationFinalize), so the detail-preview generate-and-cache branch would
+    // never be exercised.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x4B,
+        0x6D, 0x29, 0xDC, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x38,
+        0xA1, 0xA1, 0x81, 0x15, 0x31, 0x0C, 0x2D, 0x09, 0x00, 0x82, 0x5D, 0x46, 0x01, 0x6A, 0x8D,
+        0x16, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let tiny_hash = fnv1a64(TINY_PNG);
     {
         let mut hist = CLIP_HISTORY.lock().unwrap();
         // 注入 12 条:超出可视行数(10),覆盖滚动文档(NSScrollView)路径。
@@ -4219,17 +4929,9 @@ pub(crate) fn smoke_runner() -> bool {
         // 无来源条目:标题栏应显示"未知来源",无图标。
         // A source-less entry: the header shows "unknown source", no icon.
         record_text(&mut hist, "legacy entry without a source", "", "", 50);
-        // 图片条目:1x1 透明 PNG(写入测试缓存目录 + 构造引用),覆盖缩略图渲染/清理路径。
-        // An image entry: a 1x1 transparent PNG (written into the test cache dir and
-        // referenced), covering the thumbnail render/cleanup paths.
-        const TINY_PNG: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        let tiny_hash = fnv1a64(TINY_PNG);
+        // 图片条目:写入测试缓存目录 + 构造引用,覆盖缩略图渲染/清理路径。
+        // An image entry: written into the cache dir and referenced, covering the thumbnail
+        // render/cleanup paths.
         let _ = cache_write_image(tiny_hash, TINY_PNG);
         let tiny = ImageEntry {
             uti: NSPASTEBOARD_TYPE_PNG.to_string(),
@@ -4329,6 +5031,114 @@ pub(crate) fn smoke_runner() -> bool {
             // encoding mismatch; the smoke run must cover it).
             for step in 1..=5u8 {
                 let _: () = msg_send![c.0, scrollPoint: NSPoint::new(0.0, step as f64 * 30.0)];
+            }
+        }
+    }
+    // 详情/置顶冒烟:→ 展开详情(文本),↓ 跟随刷新(不关闭),← 关闭详情,再 ← 置顶;
+    // 图片条目 → 展开详情(懒生成 .detail 大图);Esc 详情打开时第一级 = 关详情。
+    // Detail/pin smoke: → opens the detail (text), ↓ follows it (stays open), ← closes it,
+    // a second ← pins; an image entry's → opens its detail (lazy .detail generation); with
+    // the detail open, Esc's level one closes the detail only.
+    unsafe {
+        *PICKER_SELECTION.lock().unwrap() = 0;
+        rebuild_rows();
+        let c_opt = *PICKER_CONTAINER.lock().unwrap();
+        if let Some(c) = c_opt {
+            // →:展开详情(显示第 0 条 = 最新录制的图片条目 → 图片大图分支)。
+            // Right: expand the detail for display 0 (the newest recorded entry, an image ->
+            // the image branch).
+            let ev = make_key_event(124);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+            assert!(
+                DETAIL_VISIBLE.load(Ordering::SeqCst),
+                "right arrow must open the detail panel"
+            );
+            // ↓:详情跟随选中条目(不关闭);选中切到文本条目 → 完整文本分支。
+            // Down: the detail follows the selection (stays open); the selection moves to a
+            // text entry -> the full-text branch.
+            let ev = make_key_event(125);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+            assert!(
+                DETAIL_VISIBLE.load(Ordering::SeqCst),
+                "the detail must stay open while navigating"
+            );
+            // ←:第一级关闭详情。
+            // Left level one: close the detail.
+            let ev = make_key_event(123);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+            assert!(
+                !DETAIL_VISIBLE.load(Ordering::SeqCst),
+                "left arrow must close the detail panel"
+            );
+            // ←:再按 = 置顶当前选中条目(置顶会把条目移到列表顶部,按身份断言)。
+            // Left again: pin the selected entry (pinning moves it to the top of the list,
+            // so assert by identity).
+            let pinned_text = {
+                let sel_idx = *PICKER_SELECTION.lock().unwrap();
+                let hist = CLIP_HISTORY.lock().unwrap();
+                mapped_index(sel_idx)
+                    .and_then(|h| hist.get(h))
+                    .map(|e| e.text.clone())
+            };
+            let ev = make_key_event(123);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+            {
+                let hist = CLIP_HISTORY.lock().unwrap();
+                assert!(
+                    pinned_text
+                        .as_deref()
+                        .is_some_and(|t| hist.iter().any(|e| e.pinned && e.text == t)),
+                    "left arrow must pin the selected entry"
+                );
+            }
+            // →:详情打开时再按 → 也关闭详情(与 ← 一致)。
+            // Right with the detail open: pressing → again also closes it (same as ←).
+            let ev = make_key_event(124);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+            assert!(DETAIL_VISIBLE.load(Ordering::SeqCst));
+            let ev = make_key_event(124);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+            assert!(
+                !DETAIL_VISIBLE.load(Ordering::SeqCst),
+                "right arrow must close the detail when it is open"
+            );
+            // Esc:详情打开时第一级 = 关闭详情,浮窗与搜索词保持。
+            // Esc with the detail open: level one closes the detail; the picker stays.
+            let ev = make_key_event(124);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+            assert!(DETAIL_VISIBLE.load(Ordering::SeqCst));
+            let ev = make_key_event(53);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+            assert!(
+                !DETAIL_VISIBLE.load(Ordering::SeqCst),
+                "Esc must close the detail first"
+            );
+        }
+        // 图片条目:定位其显示索引,→ 展开详情 → .detail 大图懒生成落盘。
+        // Image entry: locate its display index, → expands it -> the lazy .detail preview is
+        // generated and cached.
+        let img_h = {
+            let hist = CLIP_HISTORY.lock().unwrap();
+            hist.iter().position(|e| e.image.is_some())
+        };
+        if let Some(h_idx) = img_h {
+            let d_idx = FILTERED.lock().unwrap().iter().position(|&h| h == h_idx);
+            if let Some(d_idx) = d_idx {
+                *PICKER_SELECTION.lock().unwrap() = d_idx;
+                rebuild_rows();
+                let c_opt = *PICKER_CONTAINER.lock().unwrap();
+                if let Some(c) = c_opt {
+                    let ev = make_key_event(124);
+                    container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+                    assert!(
+                        DETAIL_VISIBLE.load(Ordering::SeqCst),
+                        "image detail must open"
+                    );
+                    assert!(
+                        cache_read_detail_preview(tiny_hash).is_some(),
+                        "the lazy .detail preview must be generated on first open"
+                    );
+                }
             }
         }
     }
@@ -4635,10 +5445,20 @@ mod tests {
 
     #[test]
     fn delete_entry_removes_the_image_cache_file() {
-        use super::{cache_read_image, delete_entry};
+        use super::{
+            cache_read_detail_preview, cache_read_image, cache_write_detail_preview, delete_entry,
+        };
         let bytes = b"delete-entry-cleanup";
         let img = image(bytes);
         assert!(cache_read_image(img.hash).is_some());
+        // 详情预览(.detail)与条目同生命周期:先写一份,删除时一并清理。
+        // The detail preview (.detail) shares the entry's lifecycle: written here, it must
+        // be removed with the entry.
+        assert!(cache_write_detail_preview(
+            img.hash,
+            b"detail-preview-bytes"
+        ));
+        assert!(cache_read_detail_preview(img.hash).is_some());
         let mut h = vec![ClipEntry {
             text: String::new(),
             image: Some(img.clone()),
@@ -4650,6 +5470,7 @@ mod tests {
         assert!(h.is_empty());
         // 条目删除 → 缓存文件一并删除 / the entry is gone -> so is its cache file.
         assert_eq!(cache_read_image(img.hash), None);
+        assert_eq!(cache_read_detail_preview(img.hash), None);
     }
 
     #[test]
@@ -5591,6 +6412,100 @@ mod tests {
         assert!(f.origin.x + w <= screen.origin.x + screen.size.width - PICKER_EDGE_MARGIN);
         assert!(f.origin.y >= screen.origin.y + PICKER_EDGE_MARGIN);
         assert!(f.origin.y + h <= screen.origin.y + screen.size.height - PICKER_EDGE_MARGIN);
+    }
+
+    #[test]
+    fn detail_frame_places_right_of_picker_and_flips() {
+        use super::{detail_frame_for, DETAIL_GAP, PICKER_EDGE_MARGIN};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0));
+        let w = 480.0;
+        let h = 400.0;
+        // 常规:主浮窗右侧,顶对齐到 align_top_y(选中行的屏幕 y,详情比行高 → 向下延伸)。
+        // Normal: right of the picker, top aligned to align_top_y (the selected row's screen
+        // y; a taller panel extends downward).
+        let picker = NSRect::new(NSPoint::new(0.0, 300.0), NSSize::new(420.0, 300.0));
+        let align = 300.0 + 300.0; // 本例 = 窗口顶(未滚动、行从顶对齐的等价场景)
+        let f = detail_frame_for(picker, align, screen, w, h);
+        assert_eq!(f.origin.x, 0.0 + 420.0 + DETAIL_GAP);
+        assert_eq!(f.origin.y, align - h);
+        // 右侧空间不足 → 翻转到主浮窗左侧。
+        // Not enough room on the right -> flip to the picker's left.
+        let picker = NSRect::new(NSPoint::new(1000.0, 300.0), NSSize::new(420.0, 300.0));
+        let align = 300.0 + 300.0;
+        let f = detail_frame_for(picker, align, screen, w, h);
+        assert_eq!(f.origin.x, 1000.0 - w - DETAIL_GAP);
+        assert_eq!(f.origin.y, align - h);
+        // 两侧都放不下 → clamp 进屏幕内。
+        // Neither side fits -> clamped inside the screen.
+        let picker = NSRect::new(NSPoint::new(0.0, 300.0), NSSize::new(1440.0, 300.0));
+        let align = 300.0 + 300.0;
+        let f = detail_frame_for(picker, align, screen, w, h);
+        assert!(f.origin.x >= screen.origin.x + PICKER_EDGE_MARGIN);
+        assert!(f.origin.x + w <= screen.origin.x + screen.size.width - PICKER_EDGE_MARGIN);
+        assert!(f.origin.y >= screen.origin.y + PICKER_EDGE_MARGIN);
+        assert!(f.origin.y + h <= screen.origin.y + screen.size.height - PICKER_EDGE_MARGIN);
+        // 条目少时窗口被最小高度撑高:选中行顶 ≠ 窗口顶(窗口顶 38pt 是头部条 + 行
+        // 内缩进),详情必须对到行的屏幕 y,而不是悬在窗口顶。
+        // With few entries the window is floored at the min height: the selected row's top
+        // is NOT the window top (38pt of header strip + row offset below it) -- the detail
+        // must align to the row's screen y, not float at the window top.
+        let picker = NSRect::new(NSPoint::new(0.0, 300.0), NSSize::new(420.0, 250.0));
+        let row_top_y = 300.0 + 250.0 - 44.0; // 第一行顶 = 窗口顶 − 44pt(头部条 + 行偏移)
+        let f = detail_frame_for(picker, row_top_y, screen, 480.0, 200.0);
+        assert_eq!(f.origin.y, row_top_y - 200.0);
+        // 对齐点贴近屏顶(行已滚到列表顶部)且详情很高 → 上移 clamp(顶部让出边距)。
+        // An alignment point at the screen's top with a tall panel shifts down to the margin.
+        let picker = NSRect::new(NSPoint::new(0.0, 800.0), NSSize::new(420.0, 100.0));
+        let f = detail_frame_for(picker, 900.0, screen, 480.0, 600.0);
+        assert_eq!(f.origin.y, 900.0 - 600.0);
+        assert!(f.origin.y + 600.0 <= screen.origin.y + screen.size.height);
+        // 对齐点贴屏底且详情很高 → 上移到边距处(底部让出边距)。
+        // An alignment point at the screen's bottom with a tall panel shifts up to the margin.
+        let picker = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 50.0));
+        let f = detail_frame_for(picker, 50.0, screen, 480.0, 600.0);
+        assert_eq!(f.origin.y, screen.origin.y + PICKER_EDGE_MARGIN);
+    }
+
+    #[test]
+    fn detail_text_units_scales_with_width() {
+        use super::detail_text_units;
+        // 行内容宽(384pt)≈ 60 单位,与行按钮同一口径。
+        // The row content width (384pt) maps to ~60 units, the same basis as the row buttons.
+        assert_eq!(detail_text_units(384.0), 60);
+        assert_eq!(detail_text_units(192.0), 30);
+        // 极窄宽度保底 1 单位(不为 0)。
+        // A tiny width floors at 1 unit (never 0).
+        assert_eq!(detail_text_units(1.0), 1);
+    }
+
+    #[test]
+    fn detail_text_size_clamps_to_min_and_max() {
+        use super::detail_text_size;
+        // 短文本 → 最小高度;长文本 → 封顶高度(超出滚动)。
+        // Short text -> the min height; long text -> capped (scrolls beyond).
+        assert_eq!(detail_text_size("hi").1, super::DETAIL_TEXT_MIN_H);
+        let long = "a".repeat(200_000);
+        assert_eq!(detail_text_size(&long).1, super::DETAIL_MAX_H);
+    }
+
+    #[test]
+    fn toggle_pin_on_roundtrips_pinned_state() {
+        use super::toggle_pin_on;
+        let mut h = vec![entry("a"), entry("b"), entry("c")];
+        // 置顶:条目移到置顶区顶部。
+        // Pin: the entry moves to the top of the pinned block.
+        assert!(toggle_pin_on(&mut h, 1));
+        assert!(h[0].pinned);
+        assert_eq!(h[0].text, "b");
+        // 再切:取消置顶。
+        // Toggle again: unpin.
+        assert!(!toggle_pin_on(&mut h, 0));
+        assert!(!h[0].pinned);
+        // 越界:安全 no-op,返回 false。
+        // Out of range: safe no-op, returns false.
+        assert!(!toggle_pin_on(&mut h, 99));
+        assert_eq!(h.len(), 3);
     }
 
     // ========== 冒烟测试(需要真实 GUI 会话,手动运行)==========
