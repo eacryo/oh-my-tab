@@ -3605,6 +3605,18 @@ unsafe fn rebuild_rows() {
     *FILTERED.lock().unwrap() = filtered_indices(&hist, &SEARCH_QUERY.lock().unwrap());
     let filtered = FILTERED.lock().unwrap();
 
+    // 删除/裁剪后把选中索引钳到新显示列表内(越界 → 末条;NO_SELECTION 不动)。
+    // 所有重建路径自愈——修复"删除最后一条后高亮消失"(删除路径此前用删除前的脏
+    // FILTERED 长度/历史长度钳制,删末条后选中越界,无行命中高亮)。
+    // Clamp the selection into the fresh display list (out of range -> the tail;
+    // NO_SELECTION untouched) so every rebuild path self-heals -- fixes the lost highlight
+    // after deleting the last row (the delete paths used to clamp against the stale
+    // pre-delete FILTERED / history lengths, leaving the selection past the new list).
+    {
+        let mut sel = PICKER_SELECTION.lock().unwrap();
+        *sel = clamp_selection(*sel, filtered.len());
+    }
+
     // 空态:历史为空 → "暂无历史";有搜索词但无匹配 → "无匹配结果"。共用提示渲染。
     // Empty state: empty history -> "no history"; a query with no matches -> "no match".
     // Both share the same hint rendering.
@@ -4421,16 +4433,32 @@ extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void
     };
     let mut hist = CLIP_HISTORY.lock().unwrap();
     delete_entry(&mut hist, h_idx);
-    // 删除后选中保持同位置(指向原下一条);越界则回退到末条。
-    // Selection stays at the same index (pointing at the next entry); clamps to the tail.
+    // 被删行在选中行上方 → 选中下移一格(保持指向同一条);被删行即选中行或在其下方
+    // → 不动(前者指向原下一条)。无选中哨兵(搜索框聚焦)不动。越界钳制统一交给
+    // rebuild_rows 在 FILTERED 重算后处理——此前用 hist.len() 钳制显示索引:无搜索词
+    // 时两者恰好相等才碰巧正确,搜索过滤时维度不匹配,删末条后仍会越界、高亮消失。
+    // A deleted row ABOVE the selection shifts it down one (the same entry stays selected);
+    // deleting the selected row or a row below leaves it alone (the former points at the
+    // next entry). The no-selection sentinel (search-field focus) is untouched. The
+    // out-of-range clamp happens in rebuild_rows after FILTERED is recomputed -- this used
+    // to clamp the display index against hist.len(): correct only by coincidence without a
+    // search query, dimensionally wrong under a filter, and still past the list after
+    // deleting the tail (the lost highlight).
     let mut sel = PICKER_SELECTION.lock().unwrap();
-    if *sel >= hist.len() {
-        *sel = hist.len().saturating_sub(1);
+    let deleted_selected = *sel != NO_SELECTION && *sel == idx as usize;
+    if *sel != NO_SELECTION && (idx as usize) < *sel {
+        *sel -= 1;
     }
     drop(sel);
     drop(hist);
     save_history();
     unsafe { rebuild_rows() };
+    // 详情面板跟随选中条目;若删的正是选中条目则关闭它(避免残留已删内容)。
+    // The detail panel follows the selected entry; when the deleted row WAS the selection,
+    // close the panel (no stale content).
+    if deleted_selected && DETAIL_VISIBLE.load(Ordering::SeqCst) {
+        hide_detail();
+    }
 }
 
 /// 粘贴指定显示索引的条目(经 FILTERED 映射):关闭浮窗 + 写回剪贴板 + 模拟 Cmd+V。
@@ -4551,6 +4579,18 @@ fn nav_arrow(keycode: u16, sel: usize, hist_len: usize) -> Option<usize> {
     }
 }
 
+/// 删除/裁剪后把选中索引钳制到当前显示列表内(越界 → 末条);
+/// 无选中哨兵(NO_SELECTION)不动。纯函数,供 rebuild_rows 与删除路径共用,单测覆盖。
+/// Clamp a selection index into the current display list after deletions/trims
+/// (out of range -> the tail); the no-selection sentinel (NO_SELECTION) is left untouched.
+/// Pure function shared by rebuild_rows and the delete paths; unit-tested.
+fn clamp_selection(sel: usize, len: usize) -> usize {
+    if sel == NO_SELECTION || len == 0 {
+        return sel;
+    }
+    sel.min(len - 1)
+}
+
 /// 键盘导航:↑/↓ 选择,← 置顶,→ 展开详情(详情打开时 ←/→ 都关闭详情),
 /// Enter 粘贴,Esc 关闭。
 /// Keyboard navigation: up/down to select, left to pin, right to expand details (with the
@@ -4667,18 +4707,21 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 };
                 let mut hist = CLIP_HISTORY.lock().unwrap();
                 delete_entry(&mut hist, h_idx);
-                // 删除后选中保持同位置(指向原下一条);越界则回退到显示列表末条。
-                // Selection stays at the same position (the next entry); clamps to the tail
-                // of the display list.
-                let display_len = FILTERED.lock().unwrap().len();
-                let mut sel = PICKER_SELECTION.lock().unwrap();
-                if *sel >= display_len {
-                    *sel = display_len.saturating_sub(1);
-                }
-                drop(sel);
+                // 删除的是选中行本身 → 选中保持原位(指向原下一条);删末条后越界则由
+                // rebuild_rows 在 FILTERED 重算后钳到新末条——此前用删除前的脏
+                // FILTERED 长度钳制,删末条后选中越界、无行命中高亮,高亮消失。
+                // Deleting the selected row keeps the selection in place (pointing at the
+                // next entry); an out-of-range selection (deleted the tail) is clamped to
+                // the new tail by rebuild_rows after FILTERED is recomputed -- the old code
+                // clamped against the stale pre-delete FILTERED length, so the selection
+                // stayed past the new list, no row matched, and the highlight vanished.
                 drop(hist);
                 save_history();
                 rebuild_rows();
+                // 详情面板跟随选中条目,而选中条目刚被删除 → 关闭,避免残留已删内容。
+                // The detail panel follows the selected entry, which was just deleted ->
+                // close it, so no stale content lingers.
+                hide_detail();
             }
             53 => {
                 // Esc:详情打开时第一级 = 关闭详情(浮窗与搜索词保持不动)。
@@ -6356,6 +6399,28 @@ mod tests {
         // (↓ -> 0, ↑ -> the tail).
         assert_eq!(nav_arrow(125, NO_SELECTION, 3), Some(0));
         assert_eq!(nav_arrow(126, NO_SELECTION, 3), Some(2));
+    }
+
+    #[test]
+    fn clamp_selection_after_delete_lands_on_the_new_tail() {
+        use super::{clamp_selection, NO_SELECTION};
+        // 删除末条后:选中越界 → 钳到新末条(本次修复的核心场景)。
+        // After deleting the tail: an out-of-range selection clamps to the new tail
+        // (the core scenario of this fix).
+        assert_eq!(clamp_selection(3, 3), 2);
+        assert_eq!(clamp_selection(2, 3), 2); // 界内不动 / in range, untouched
+        assert_eq!(clamp_selection(0, 1), 0);
+        // 空列表:没有可钳的末条,原样返回(空态提示分支不渲染行,无高光问题)。
+        // Empty list: no tail to clamp to, returned unchanged (the empty-state hint
+        // renders no rows, so no highlight concern).
+        assert_eq!(clamp_selection(0, 0), 0);
+        assert_eq!(clamp_selection(3, 0), 3);
+        // 无选中哨兵(搜索框聚焦):绝不恢复高光。
+        // The no-selection sentinel (search-field focus): never resurrect a highlight.
+        assert_eq!(clamp_selection(NO_SELECTION, 3), NO_SELECTION);
+        // 大幅越界(多次删除累积)→ 直接末条。
+        // Way out of range (accumulated deletions) -> the tail.
+        assert_eq!(clamp_selection(5, 2), 1);
     }
 
     #[test]
