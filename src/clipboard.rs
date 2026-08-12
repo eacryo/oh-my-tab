@@ -3426,7 +3426,7 @@ unsafe fn ensure_picker_window() {
     // the cell (see search_cell_draw_interior).
     let mut hint = SEARCH_HINT_TEXT.lock().unwrap();
     if let Some(old) = *hint {
-        release_obj(old.0 as *mut AnyObject);
+        release_obj(old.0);
     }
     *hint = Some(ObjPtr(ph_m));
     drop(hint);
