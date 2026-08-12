@@ -380,7 +380,10 @@ unsafe fn add_row_with_label(
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let _: () = msg_send![label, setAlignment: 1isize]; // NSTextAlignmentRight
+    // 右对齐:Apple Silicon 上 NSTextAlignment 走 iOS 值分支,Right=2(1 是 Center)。
+    // Right-aligned: on Apple Silicon NSTextAlignment uses the iOS values, Right=2 (1 is
+    // Center).
+    let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight on arm64
                                                         // 自适应:标签固定宽、顶部+左侧锚定(MinYMargin|MaxXMargin = 8|4 = 12)。
                                                         // Adaptive: label keeps fixed width, stays top- and left-anchored.
     let _: () = msg_send![label, setAutoresizingMask: 12u64];
@@ -2190,7 +2193,10 @@ fn create_settings_window() {
         let _: () = msg_send![value_label, setBezeled: false];
         let _: () = msg_send![value_label, setDrawsBackground: false];
         let _: () = msg_send![value_label, setEditable: false];
-        let _: () = msg_send![value_label, setAlignment: 1isize]; // NSTextAlignmentRight
+        // 右对齐:Apple Silicon 上 NSTextAlignment 走 iOS 值分支,Right=2(1 是 Center)。
+        // Right-aligned: on Apple Silicon NSTextAlignment uses the iOS values, Right=2 (1
+        // is Center).
+        let _: () = msg_send![value_label, setAlignment: 2isize]; // NSTextAlignmentRight on arm64
         let _: () = msg_send![mouse_view, addSubview: value_label];
         release_obj(value_label);
         ui.line_count_value_label = value_label;

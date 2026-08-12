@@ -233,6 +233,12 @@ static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec:
 
 /// 顶部搜索框指针 / the top search field.
 static SEARCH_FIELD: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 居中占位的"放大镜 + 搜索提示"富文本(手绘;字段本身不设 placeholder 属性,避免
+/// 字段编辑器在聚焦空字段时把占位画在左侧)。
+/// The centered "magnifier + search hint" attributed string (hand-drawn; the field itself
+/// carries NO placeholder property, so the field editor never draws the placeholder
+/// left-aligned on a focused-but-empty field).
+static SEARCH_HINT_TEXT: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
 /// 当前搜索词(空 = 不过滤)。/ The current search query (empty = no filtering).
 static SEARCH_QUERY: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
@@ -1391,8 +1397,7 @@ unsafe fn stamp_paste_marker(pb: *mut AnyObject) {
     CFRelease(v as *const c_void);
 }
 
-/// 当前是否"使用后移到最前"(从 CONFIG 实时读,设置保存后立即生效)。
-/// Whether used entries move to the top (read live from CONFIG; takes effect on the
+/// 当前是否"使用后移到最前"(从 CONFIG 实时读,设置保存后立即生效)。/// Whether used entries move to the top (read live from CONFIG; takes effect on the
 /// next poll after settings are saved).
 fn move_used_to_top() -> bool {
     CONFIG
@@ -1982,15 +1987,6 @@ unsafe fn observer() -> *mut AnyObject {
                 search_field_do_command as *mut c_void,
                 types_cmd.as_ptr(),
             );
-            // 搜索框开始编辑(↑ 从列表顶跳入 / 鼠标点击)→ 清除列表选中高光。
-            // The search field begins editing (↑ from the list top / a mouse click) ->
-            // clear the list's selection highlight.
-            class_addMethod(
-                cls,
-                sel!(controlTextDidBeginEditing:),
-                search_field_began_editing as *mut c_void,
-                types.as_ptr(),
-            );
             objc_registerClassPair(cls);
             // 实例 alloc(+1):进程级单例,不释放(与静态生命周期一致)。
             // Instance alloc (+1): process-level singleton, never released (matches the
@@ -2197,21 +2193,6 @@ extern "C" fn search_field_do_command(
         }
     }
     true
-}
-
-/// 搜索框开始编辑(↑ 从列表顶跳入 / 鼠标点击):清除列表选中,高光消失。
-/// 通知在 makeFirstResponder: 同步派发;selection 未变化(如再次聚焦)时跳过重建。
-/// The search field begins editing (↑ from the list top / a mouse click): clear the list's
-/// selection so the highlight disappears. The notification fires synchronously inside
-/// makeFirstResponder:; skip the rebuild when the selection is unchanged (e.g. re-focus).
-extern "C" fn search_field_began_editing(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
-    let mut sel = PICKER_SELECTION.lock().unwrap();
-    if *sel == NO_SELECTION {
-        return;
-    }
-    *sel = NO_SELECTION;
-    drop(sel);
-    unsafe { rebuild_rows() };
 }
 
 /// 是否已注册剪贴板变化通知(幂等,防止 start/stop 反复注册导致重复回调)。
@@ -2723,7 +2704,7 @@ unsafe fn ensure_picker_window() {
         let name = CString::new("OhMyTabClipSearchField").unwrap();
         let superclass = class!(NSSearchField) as *const _ as *mut AnyObject;
         let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_v = CString::new("v@:").unwrap();
+        let types_v = CString::new("v@:@").unwrap();
         class_addMethod(
             cls,
             sel!(cancelOperation:),
@@ -2792,15 +2773,47 @@ unsafe fn ensure_picker_window() {
     release_obj(ph_text_attrs);
     let _: () = msg_send![ph_m, appendAttributedString: ph_text];
     release_obj(ph_text);
-    let _: () = msg_send![cell, setPlaceholderAttributedString: ph_m];
-    release_obj(ph_m);
+    // 占位不挂到字段上(字段编辑器会在聚焦空字段时把它画在左侧):存入静态,
+    // 由 cell 手绘居中(见 search_cell_draw_interior)。
+    // The placeholder is NOT set on the field (the field editor would draw it left-aligned
+    // on a focused-but-empty field): it lives in a static and is hand-drawn centered by
+    // the cell (see search_cell_draw_interior).
+    let mut hint = SEARCH_HINT_TEXT.lock().unwrap();
+    if let Some(old) = *hint {
+        release_obj(old.0 as *mut AnyObject);
+    }
+    *hint = Some(ObjPtr(ph_m));
+    drop(hint);
     let _: () = msg_send![search, setCell: cell];
     release_obj(cell);
-    // 磨砂化:去掉系统描边/bezel,改用与"清除全部"按钮同款的白色圆角 tile,顶部控件
-    // 风格统一(系统 ✕ 清除按钮随之不渲染,清空由 Esc/cancelOperation: 覆盖)。
-    // Frosted look: drop the system bezel and use the same white rounded tile as the
-    // "clear all" button, unifying the top bar (the system ✕ clear button no longer renders;
-    // clearing is covered by Esc/cancelOperation:).
+    // 显式置空 placeholder 属性(双保险,任何读取方都拿不到内容)。
+    // Explicitly empty the placeholder property (belt and braces; no reader finds text).
+    let empty_attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let empty_attr: *mut AnyObject = msg_send![empty_attr, init];
+    let _: () = msg_send![search, setPlaceholderAttributedString: empty_attr];
+    release_obj(empty_attr);
+    // 修复:initTextCell: 创建的自定义 cell 默认不可编辑(isEditable=false),
+    // NSSearchField 因此 acceptsFirstResponder=false——点击/↑ 都无法进入编辑。
+    // 替换 cell 后必须显式恢复 editable(selectable 一并保证)。
+    // FIX: a custom cell created via initTextCell: is NOT editable by default
+    // (isEditable=false), which makes NSSearchField refuse first responder -- clicks and
+    // the ↑ jump could never start editing. Editable must be restored explicitly after
+    // replacing the cell (selectable too, for good measure).
+    let _: () = msg_send![search, setEditable: true];
+    let _: () = msg_send![search, setSelectable: true];
+    // 聚焦环会在编辑时画一圈方形描边,破坏磨砂圆角观感——关闭。
+    // The focus ring draws a square outline while editing, breaking the frosted rounded
+    // look -- disabled.
+    let _: () = msg_send![search, setFocusRingType: 1u64]; // NSFocusRingTypeNone
+                                                           // 编辑态文本与占位一致居中(字段编辑器继承 cell 的对齐)。
+                                                           // The editing text centers like the placeholder (the field editor inherits the cell's
+                                                           // alignment).
+    let _: () = msg_send![search, setAlignment: 1u64]; // Center on arm64 (NSTextAlignment uses iOS values)
+                                                       // 磨砂化:去掉系统描边/bezel,改用与"清除全部"按钮同款的白色圆角 tile,顶部控件
+                                                       // 风格统一(系统 ✕ 清除按钮随之不渲染,清空由 Esc/cancelOperation: 覆盖)。
+                                                       // Frosted look: drop the system bezel and use the same white rounded tile as the
+                                                       // "clear all" button, unifying the top bar (the system ✕ clear button no longer renders;
+                                                       // clearing is covered by Esc/cancelOperation:).
     let _: () = msg_send![search, setBezeled: false];
     let _: () = msg_send![search, setDrawsBackground: false];
     let _: () = msg_send![search, setWantsLayer: true];
@@ -2850,7 +2863,7 @@ unsafe fn ensure_picker_window() {
     // 居中显示在磨砂白块内(与行卡片同款观感),而不是贴右边的裸文字。
     // Centered inside the frosted-white tile (same look as the row cards), not bare text
     // hugging the right edge.
-    let _: () = msg_send![clear_btn, setAlignment: 1isize]; // center
+    let _: () = msg_send![clear_btn, setAlignment: 1isize]; // Center on arm64 (NSTextAlignment uses iOS values)
                                                             // 磨砂白块背景:与行背景块同色同圆角,顶部工具栏与列表视觉统一。
                                                             // Frosted-white tile background: same color and corner radius as the row tiles, so the
                                                             // top bar matches the list.
@@ -2968,33 +2981,6 @@ unsafe fn rebuild_rows() {
         // The hint: vertically centered within the visible list area.
         let label_h = row_button_height(1);
         let label_y = (doc_h - label_h) / 2.0;
-        // 空态卡片:磨砂白块包住提示文字(细边框 + 圆角,与条目卡片同款),不再孤零零
-        // 漂在玻璃上。
-        // Empty-state card: a frosted tile wrapping the hint (hairline border + radius, same
-        // style as the entry cards), no longer floating bare on the glass.
-        let card_h = label_h + 16.0;
-        let card_y = label_y - 8.0;
-        let card: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let card: *mut AnyObject = msg_send![
-            card,
-            initWithFrame: NSRect::new(
-                NSPoint::new(PAD_X + 60.0, card_y),
-                NSSize::new(PICKER_W - (PAD_X + 60.0) * 2.0, card_h)
-            )
-        ];
-        let _: () = msg_send![card, setWantsLayer: true];
-        let card_layer: *mut AnyObject = msg_send![card, layer];
-        let c_bg: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: ROW_TILE_ALPHA];
-        crate::ffi::layer_set_background(card_layer, crate::ffi::ns_color_to_cg(c_bg));
-        let _: () = msg_send![card_layer, setCornerRadius: SEL_TILE_R];
-        let c_border: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: CARD_BORDER_ALPHA];
-        crate::ffi::layer_set_border(card_layer, crate::ffi::ns_color_to_cg(c_border));
-        let _: () = msg_send![card_layer, setBorderWidth: CARD_BORDER_W];
-        let _: () = msg_send![container, addSubview: card];
-        release_obj(card);
-        tiles.push(ObjPtr(card));
         let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let label: *mut AnyObject = msg_send![
             label,
@@ -3003,7 +2989,14 @@ unsafe fn rebuild_rows() {
                 NSSize::new(PICKER_W - PAD_X * 2.0, label_h)
             )
         ];
-        let _: () = msg_send![label, setAlignment: 1isize]; // NSTextAlignmentCenter
+        // 注意(load-bearing):Apple Silicon 上 TARGET_ABI_USES_IOS_VALUES=1,
+        // NSTextAlignment 走 iOS 值分支——Center=1、Right=2(与传统 Mac 相反)。
+        // 这里必须用 1 才是居中;传 2 会渲染成右对齐(曾因此"修坏"过)。
+        // NOTE (load-bearing): on Apple Silicon TARGET_ABI_USES_IOS_VALUES=1, so
+        // NSTextAlignment uses the iOS values -- Center=1, Right=2 (reversed vs classic
+        // Mac). 1 is required here for centering; 2 renders right-aligned (a past
+        // regression).
+        let _: () = msg_send![label, setAlignment: 1isize]; // Center on arm64
         let hint_ns = make_nsstring(&empty_hint);
         let _: () = msg_send![label, setStringValue: hint_ns];
         CFRelease(hint_ns as *const c_void);
@@ -3454,12 +3447,42 @@ unsafe fn search_cell_class() -> *mut AnyObject {
             let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
             // 参数:NSRect(struct) + NSView* -> 编码 "v@:{CGRect=dddd}@"。
             // Args: NSRect (struct) + NSView* -> encoding "v@:{CGRect=dddd}@".
+            // super 调用走原始 objc_msgSendSuper(见 search_cell_draw_super):objc2 的
+            // msg_send! 对新式嵌套结构编码 {CGRect={CGPoint=dd}{CGSize=dd}} 会在签名
+            // 校验里无限递归(实测栈溢出),CG 结构必须走 raw FFI(与 layer_set_* 同款)。
             let types = CString::new("v@:{CGRect=dddd}@").unwrap();
             class_addMethod(
                 cls,
                 sel!(drawInteriorWithFrame:inView:),
                 search_cell_draw_interior as *mut c_void,
                 types.as_ptr(),
+            );
+            // 外层绘制覆写:聚焦空字段时搜索图标与占位都由父类的 drawWithFrame: 画出
+            // (drawInterior 只画内部文字区,实测管不到),在这里整帧跳过。
+            // Outer-draw override: when focused-and-empty, the search icon and the
+            // placeholder are drawn by the superclass's drawWithFrame: (drawInterior only
+            // covers the interior text area, verified); skip the whole frame here.
+            class_addMethod(
+                cls,
+                sel!(drawWithFrame:inView:),
+                search_cell_draw_with_frame as *mut c_void,
+                types.as_ptr(),
+            );
+            // 编辑启动时直接定位字段编辑器:drawingRectForBounds: 对编辑器无效
+            // (原生 NSSearchFieldCell 返回整框高度,覆写条件永不成立,文本始终贴顶,
+            // 实测光标顶端与字段上缘仅差 0.5pt)。在 selectWithFrame: 里把编辑器
+            // frame 垂直居中,光标与输入文字随行框一起居中。
+            // The field editor is positioned directly at edit start: drawingRectForBounds:
+            // has no effect on it (the native NSSearchFieldCell returns the full-height
+            // rect, so the override condition never fires and the text stays top-aligned --
+            // measured 0.5pt from the field top). selectWithFrame: re-centers the editor
+            // frame vertically, centering the caret and the typed text with the line box.
+            let types_sel = CString::new("v@:{CGRect=dddd}@@@@qq").unwrap();
+            class_addMethod(
+                cls,
+                sel!(selectWithFrame:inView:editor:delegate:start:length:),
+                search_cell_select_with_frame as *mut c_void,
+                types_sel.as_ptr(),
             );
             objc_registerClassPair(cls);
             ObjPtr(cls)
@@ -3488,8 +3511,10 @@ extern "C" fn search_cell_draw_interior(
             !editor.is_null()
         };
         if !editing {
-            let placeholder: *mut AnyObject =
-                msg_send![_self as *mut AnyObject, placeholderAttributedString];
+            let placeholder = match *SEARCH_HINT_TEXT.lock().unwrap() {
+                Some(p) => p.0,
+                None => std::ptr::null_mut(),
+            };
             let has_text = !placeholder.is_null() && {
                 let len: usize = msg_send![placeholder, length];
                 len > 0
@@ -3502,12 +3527,186 @@ extern "C" fn search_cell_draw_interior(
                 return;
             }
         }
-        let cls = objc2::runtime::AnyClass::get(c"OhMyTabClipSearchCell").unwrap();
-        let _: () = msg_send![
-            super(_self as *mut AnyObject, cls),
-            drawInteriorWithFrame: cell_frame,
-            inView: control_view
-        ];
+        // 编辑态:占位已在 search_field_began_editing 里按会话清空。空字符串时
+        // 什么都不画(父类的搜索图标也不要——聚焦空字段只留光标);有文字 → 父类
+        // 画图标,文字由字段编辑器绘制。
+        // Editing state: the placeholder was cleared for the whole session in
+        // search_field_began_editing. With an empty string draw NOTHING (not even the
+        // superclass's search icon -- a focused empty field shows only the caret); with
+        // text, the superclass draws the icon and the field editor draws the text.
+        let str_obj: *mut AnyObject = msg_send![_self as *mut AnyObject, stringValue];
+        let str_len: usize = msg_send![str_obj, length];
+        if str_len == 0 {
+            return;
+        }
+        // 原始 objc_msgSendSuper:objc2 的 msg_send! 对嵌套结构编码会在签名校验里
+        // 无限递归(实测栈溢出),CG 结构必须走 raw FFI(与 ffi::layer_set_* 同款)。
+        // Raw objc_msgSendSuper: objc2's msg_send! infinitely recurses in signature
+        // verification for the nested-struct encoding (observed stack overflow); CG
+        // structs must go through raw FFI (same as ffi::layer_set_*).
+        #[repr(C)]
+        struct ObjcSuper {
+            receiver: *mut c_void,
+            super_class: *mut c_void,
+        }
+        extern "C" {
+            fn objc_msgSendSuper();
+        }
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut c_void) -> ();
+        let super_class =
+            objc2::runtime::AnyClass::get(c"NSSearchFieldCell").unwrap() as *const _ as *mut c_void;
+        let mut sup = ObjcSuper {
+            receiver: _self,
+            super_class,
+        };
+        let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        f(
+            &mut sup,
+            sel!(drawInteriorWithFrame:inView:),
+            cell_frame,
+            control_view,
+        );
+    }
+}
+
+/// 外层绘制:编辑态空字符串时整帧不画(父类会在此层画搜索图标 + 左侧占位),
+/// 只留光标;其余交给父类(内部文字区由 drawInteriorWithFrame: 覆写处理)。
+/// Outer drawing: when editing with an empty string, draw NOTHING for the whole frame
+/// (the superclass draws the search icon + the left-aligned placeholder here), leaving
+/// only the caret; everything else goes to the superclass (the interior is handled by the
+/// drawInteriorWithFrame: override).
+extern "C" fn search_cell_draw_with_frame(
+    _self: *mut c_void,
+    _cmd: Sel,
+    cell_frame: NSRect,
+    control_view: *mut c_void,
+) {
+    unsafe {
+        // 编辑态检测(与 drawInterior 同款)。
+        // Editing detection (same as drawInterior).
+        let editing = if control_view.is_null() {
+            false
+        } else {
+            let editor: *mut AnyObject = msg_send![control_view as *mut AnyObject, currentEditor];
+            !editor.is_null()
+        };
+        if editing {
+            let str_obj: *mut AnyObject = msg_send![_self as *mut AnyObject, stringValue];
+            let str_len: usize = msg_send![str_obj, length];
+            if str_len == 0 {
+                return;
+            }
+        }
+        // 原始 objc_msgSendSuper(与 drawInterior 同款,结构编码走 raw FFI)。
+        // Raw objc_msgSendSuper (same as drawInterior; the struct encoding goes through
+        // raw FFI).
+        #[repr(C)]
+        struct ObjcSuper {
+            receiver: *mut c_void,
+            super_class: *mut c_void,
+        }
+        extern "C" {
+            fn objc_msgSendSuper();
+        }
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut c_void) -> ();
+        let super_class =
+            objc2::runtime::AnyClass::get(c"NSSearchFieldCell").unwrap() as *const _ as *mut c_void;
+        let mut sup = ObjcSuper {
+            receiver: _self,
+            super_class,
+        };
+        let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        f(
+            &mut sup,
+            sel!(drawWithFrame:inView:),
+            cell_frame,
+            control_view,
+        );
+    }
+}
+
+/// 编辑启动定位覆写:先走父类(图标留白/选择范围等),再把编辑器 frame 调整为
+/// cell 内垂直居中(行框高度来自字体度量)。编辑器 frame 的顶部即文字容器顶部,
+/// 居中后光标与输入文字随行框对称分布。
+/// Edit-start positioning override: calls the superclass first (icon inset / selection
+/// range), then re-centers the editor frame in the cell (line height from font metrics).
+/// The editor frame's top is the text container's top, so centering it centers the caret
+/// and the typed text.
+extern "C" fn search_cell_select_with_frame(
+    _self: *mut c_void,
+    _cmd: Sel,
+    rect: NSRect,
+    control_view: *mut c_void,
+    editor: *mut c_void,
+    delegate: *mut c_void,
+    sel_start: isize,
+    sel_length: isize,
+) {
+    unsafe {
+        // 原始 objc_msgSendSuper(与 drawWithFrame 同款,结构编码走 raw FFI)。
+        // Raw objc_msgSendSuper (same as drawWithFrame; the struct encoding goes through
+        // raw FFI).
+        #[repr(C)]
+        struct ObjcSuper {
+            receiver: *mut c_void,
+            super_class: *mut c_void,
+        }
+        extern "C" {
+            fn objc_msgSendSuper();
+        }
+        type F = unsafe extern "C" fn(
+            *mut ObjcSuper,
+            Sel,
+            NSRect,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            isize,
+            isize,
+        ) -> ();
+        let super_class =
+            objc2::runtime::AnyClass::get(c"NSSearchFieldCell").unwrap() as *const _ as *mut c_void;
+        let mut sup = ObjcSuper {
+            receiver: _self,
+            super_class,
+        };
+        let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        f(
+            &mut sup,
+            sel!(selectWithFrame:inView:editor:delegate:start:length:),
+            rect,
+            control_view,
+            editor,
+            delegate,
+            sel_start,
+            sel_length,
+        );
+        // 编辑器文本容器垂直居中:frame 会被系统在后续布局中重置(setFrame 无效,
+        // 实测第二次 selectWithFrame 时已回 0,0),而 textContainerInset 是持久属性。
+        // 上边距 = (cell 高 - 行框高)/2,文字/光标随容器整体下移居中。
+        // Vertically centers the editor's text container: the frame gets reset by later
+        // layout passes (setFrame is useless -- the frame was already back to 0,0 at the
+        // second selectWithFrame), while textContainerInset persists. Top inset =
+        // (cell height - line height)/2 moves the text and caret down to center.
+        if !editor.is_null() && rect.size.height > 0.0 {
+            let font: *mut AnyObject = msg_send![_self as *mut AnyObject, font];
+            if !font.is_null() {
+                let asc: f64 = msg_send![font, ascender];
+                let desc: f64 = msg_send![font, descender];
+                let lead: f64 = msg_send![font, leading];
+                let line_h = asc - desc + lead;
+                if line_h > 0.0 && line_h < rect.size.height {
+                    // 实测(容器溢出居中):光标顶 ≈ inset - 1.8;目标光标顶 3.5 → 5.3。
+                    // Measured (overflow-centering in the container): caret top ~= inset - 1.8;
+                    // target caret top 3.5 -> 5.3.
+                    let top = 5.3;
+                    let _: () = msg_send![
+                        editor as *mut AnyObject,
+                        setTextContainerInset: NSSize::new(0.0, top)
+                    ];
+                }
+            }
+        }
     }
 }
 
