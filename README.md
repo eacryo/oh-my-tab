@@ -42,7 +42,7 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 | **Image data** | An image copied inside an app (e.g. right-click → "Copy Image"): the original-format bytes are hashed and kept in a disk cache (`~/Library/Caches/oh-my-tab-clip-images/{hash}`) plus a downsampled thumbnail; only the thumbnail stays in RAM | The original bytes are written back under their original UTI — a JPG pastes back as JPG, an animated GIF as a GIF, never a PNG re-encode |
 | **Image file** | An image FILE copied in Finder (Cmd+C): the file is read once at copy time to compute a content hash and a thumbnail, then the bytes are discarded — only the path, hash and thumbnail are kept | `public.file-url` is restored (file semantics, like Windows Win+V / Maccy): Finder duplicates the file, chat apps attach it, GIF animation stays intact. If the source file has been deleted, the paste is skipped |
 
-> **One kind per entry (known limitation)** — each entry records exactly one kind of content: either the **text** or the **image** (image data / image file). When a copy carries **both text and an image** (e.g. copying an image from a web page, which usually also puts text on the pasteboard), only the **text** is recorded and the image is dropped. This is a deliberate v1 tradeoff — unlike Windows Win+V, which keeps every pasteboard format in one entry and lets the destination app pick what it supports on paste.
+> **One kind per entry (known limitation)** — each entry records exactly one kind of content: either the **text** or the **image** (image data / image file). When a copy carries **both text and an image** (e.g. copying an image from a web page, which usually also puts text on the pasteboard), only the **text** is recorded and the image is dropped. **Multiple files are not recorded at all** — copying several files at once (Cmd+C on a multi-selection in Finder, whether or not they include images) produces no entry: the pasteboard then carries file URLs without a text representation, and only single-file image copies are recognized. These are deliberate v1 tradeoffs — unlike Windows Win+V, which keeps every pasteboard format in one entry and lets the destination app pick what it supports on paste.
 
 **Dedup is per-kind** (never across kinds):
 - Text dedups by exact text.
@@ -275,6 +275,7 @@ launch_at_login = false  # launch at login (requires running as a .app bundle; m
 enabled = false          # clipboard history master switch (off by default)
 max_entries = 50         # max history entries (1..=100)
 persist = false          # save history to disk so it survives restarts (see the privacy note below)
+```
 
 > **Clipboard-history persistence & privacy** — enabling `persist` (or the "Save clipboard
 > history" switch in Settings) writes your clipboard history — copied text, filenames, and
@@ -292,6 +293,7 @@ persist = false          # save history to disk so it survives restarts (see the
 > stamp these markers on password copies, so such content never reaches the history (memory
 > or disk) in the first place. Persistence is off by default.
 
+```toml
 [mouse]
 enabled = true           # master switch for the mouse-control event tap
 
@@ -314,8 +316,6 @@ reverse_scroll = true
 scroll_mode = "line"
 line_count = 3
 
-[mouse.profiles.pointer]
-disable_acceleration = true
 ```
 
 Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). Toggling `mouse.enabled` takes effect immediately — the mouse event tap is hot-switched on OK, no app restart needed.
