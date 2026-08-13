@@ -6,8 +6,9 @@
 clear_all = "Clear all"
 empty = "No clipboard history yet"
 no_match = "No matching entries"
-search_hint = "Search clipboard"
+search_hint_count = "Search all {count} entries"
 unknown_source = "Unknown source"
+copied_at = "Copied at: {time}"
 
 [menu]
 toggle_theme.dark = "Switch to Dark"

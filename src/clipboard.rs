@@ -57,7 +57,7 @@ use crate::ffi::{
     class_addMethod, make_nsstring, nsstring_to_rust, objc_allocateClassPair,
     objc_registerClassPair, release_obj, CFRelease, ObjPtr,
 };
-use crate::i18n::t;
+use crate::i18n::{t, tf};
 use crate::{log_debug, log_info};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
@@ -270,6 +270,85 @@ static SEARCH_FIELD: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// left-aligned on a focused-but-empty field).
 static SEARCH_HINT_TEXT: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
+/// 最近一次搜索占位提示对应的条数(条数变了才重建提示,避免悬停/方向键等
+/// 高频 rebuild 反复重建富文本)。
+/// The entry count the search placeholder was last built for (the hint is rebuilt only
+/// when the count changes, so frequent rebuilds from hover/arrow keys don't re-create
+/// the attributed string).
+static LAST_HINT_COUNT: Mutex<usize> = Mutex::new(usize::MAX);
+
+/// 重建搜索框占位提示(放大镜 + "搜索全部{count}条记录"):占位不挂到字段上
+/// (字段编辑器会在聚焦空字段时把它画在左侧),存入静态由 cell 手绘居中
+/// (见 search_cell_draw_interior)。
+/// Rebuild the search field's placeholder (magnifier + "Search all {count} entries"): the
+/// placeholder is NOT set on the field (the field editor would draw it left-aligned on a
+/// focused-but-empty field); it lives in a static and is hand-drawn centered by the cell
+/// (see search_cell_draw_interior).
+unsafe fn rebuild_search_hint(count: usize) {
+    let sym_ns = make_nsstring("magnifyingglass");
+    let magnifier: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: sym_ns,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(sym_ns as *const c_void);
+    let attachment: *mut AnyObject = msg_send![class!(NSTextAttachment), alloc];
+    let attachment: *mut AnyObject = msg_send![attachment, init];
+    let _: () = msg_send![attachment, setImage: magnifier];
+    let _: () = msg_send![attachment, setBounds: NSRect::new(
+        NSPoint::new(0.0, -2.0),
+        NSSize::new(13.0, 13.0)
+    )];
+    let ph_m: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+    let empty_ns2 = make_nsstring("");
+    let ph_m: *mut AnyObject = msg_send![ph_m, initWithString: empty_ns2];
+    CFRelease(empty_ns2 as *const c_void);
+    let att_str: *mut AnyObject = msg_send![
+        class!(NSAttributedString),
+        attributedStringWithAttachment: attachment
+    ];
+    let _: () = msg_send![ph_m, appendAttributedString: att_str];
+    release_obj(attachment);
+    let ph_text_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let ph_text_attrs: *mut AnyObject = msg_send![ph_text_attrs, init];
+    let font_key = make_nsstring("NSFont");
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+    let _: () = msg_send![ph_text_attrs, setObject: font, forKey: font_key];
+    CFRelease(font_key as *const c_void);
+    let color_key = make_nsstring("NSColor");
+    let ph_color: *mut AnyObject = msg_send![class!(NSColor), placeholderTextColor];
+    let _: () = msg_send![ph_text_attrs, setObject: ph_color, forKey: color_key];
+    CFRelease(color_key as *const c_void);
+    let ph_ns = make_nsstring(&tf(
+        "clipboard.search_hint_count",
+        &[("count", &count.to_string())],
+    ));
+    let ph_text: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let ph_text: *mut AnyObject =
+        msg_send![ph_text, initWithString: ph_ns, attributes: ph_text_attrs];
+    CFRelease(ph_ns as *const c_void);
+    release_obj(ph_text_attrs);
+    let _: () = msg_send![ph_m, appendAttributedString: ph_text];
+    release_obj(ph_text);
+    let mut hint = SEARCH_HINT_TEXT.lock().unwrap();
+    if let Some(old) = *hint {
+        release_obj(old.0);
+    }
+    *hint = Some(ObjPtr(ph_m));
+    drop(hint);
+    *LAST_HINT_COUNT.lock().unwrap() = count;
+}
+
+/// 搜索框占位提示按当前条数刷新(条数未变则不动作;rebuild_rows 每次重建时调用)。
+/// Refresh the search placeholder for the current count (no-op when the count is
+/// unchanged; called on every rebuild_rows).
+unsafe fn refresh_search_hint(total: usize) {
+    if *LAST_HINT_COUNT.lock().unwrap() == total {
+        return;
+    }
+    rebuild_search_hint(total);
+}
+
 /// 当前搜索词(空 = 不过滤)。/ The current search query (empty = no filtering).
 static SEARCH_QUERY: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 
@@ -394,17 +473,29 @@ fn show_source_app() -> bool {
     CONFIG.read().unwrap().clipboard.show_source_app
 }
 
-/// 标题栏文字:开关开 → 来源应用名(无来源显示"未知来源");开关关 → 空串(横条只放图标)。
-/// The header text: toggle on -> the source app name ("unknown source" when absent);
-/// toggle off -> empty (the strip only hosts the icons).
+/// 标题栏文字:开关开 → 来源应用名(无来源显示"未知来源"),有复制时间戳时
+/// 追加"复制于: MM-dd HH:mm";开关关 → 空串(横条只放图标)。
+/// The header text: toggle on -> the source app name ("unknown source" when absent),
+/// with "Copied at: MM-dd HH:mm" appended when a copy timestamp exists; toggle off ->
+/// empty (the strip only hosts the icons).
 fn header_title(entry: &ClipEntry, show_source: bool) -> String {
     if !show_source {
         return String::new();
     }
-    if entry.source_app.is_empty() {
+    let name = if entry.source_app.is_empty() {
         t("clipboard.unknown_source")
     } else {
         entry.source_app.clone()
+    };
+    match entry.copied_at {
+        // 旧条目(无时间戳)不显示时间。
+        // Legacy entries (no timestamp) show no time.
+        Some(ts) => format!(
+            "{} {}",
+            name,
+            tf("clipboard.copied_at", &[("time", &format_copied_at(ts))])
+        ),
+        None => name,
     }
 }
 
@@ -576,6 +667,46 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// 本地时间 FFI:与 logger.rs 同款零依赖模式(无 chrono 等运行时依赖)。
+// Local-time FFI: the same zero-dependency pattern as logger.rs (no chrono-style runtime deps).
+#[repr(C)]
+struct LmTm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+    tm_gmtoff: i64,
+    tm_zone: *const i8,
+}
+
+unsafe extern "C" {
+    fn localtime_r(time: *const i64, result: *mut LmTm) -> *mut LmTm;
+}
+
+/// 复制时间戳 → "MM-dd HH:mm"(本地时区;标题栏空间有限,省略年份)。
+/// 纯函数,单测覆盖格式。
+/// Copy timestamp -> "MM-dd HH:mm" (local time; the header bar is narrow, so the year is
+/// dropped). Pure function; the format is unit-tested.
+fn format_copied_at(unix_secs: u64) -> String {
+    unsafe {
+        let mut tm: LmTm = std::mem::zeroed();
+        let s = unix_secs as i64;
+        localtime_r(&s, &mut tm);
+        format!(
+            "{:02}-{:02} {:02}:{:02}",
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min
+        )
+    }
 }
 
 /// 自动过期 TTL(秒):0 天 = 关闭 → None。从 CONFIG 实时读(设置热重载即生效)。
@@ -3491,61 +3622,10 @@ unsafe fn ensure_picker_window() {
     let empty_ns = make_nsstring("");
     let cell: *mut AnyObject = msg_send![cell, initTextCell: empty_ns];
     CFRelease(empty_ns as *const c_void);
-    // 放大镜附件(13pt,微降 2pt 与文字基线贴合)。
-    // The magnifier attachment (13pt, dropped 2pt to sit on the text baseline).
-    let sym_ns = make_nsstring("magnifyingglass");
-    let magnifier: *mut AnyObject = msg_send![
-        class!(NSImage),
-        imageWithSystemSymbolName: sym_ns,
-        accessibilityDescription: std::ptr::null::<AnyObject>()
-    ];
-    CFRelease(sym_ns as *const c_void);
-    let attachment: *mut AnyObject = msg_send![class!(NSTextAttachment), alloc];
-    let attachment: *mut AnyObject = msg_send![attachment, init];
-    let _: () = msg_send![attachment, setImage: magnifier];
-    let _: () = msg_send![attachment, setBounds: NSRect::new(
-        NSPoint::new(0.0, -2.0),
-        NSSize::new(13.0, 13.0)
-    )];
-    let ph_m: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
-    let empty_ns2 = make_nsstring("");
-    let ph_m: *mut AnyObject = msg_send![ph_m, initWithString: empty_ns2];
-    CFRelease(empty_ns2 as *const c_void);
-    let att_str: *mut AnyObject = msg_send![
-        class!(NSAttributedString),
-        attributedStringWithAttachment: attachment
-    ];
-    let _: () = msg_send![ph_m, appendAttributedString: att_str];
-    release_obj(attachment);
-    let ph_text_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-    let ph_text_attrs: *mut AnyObject = msg_send![ph_text_attrs, init];
-    let font_key = make_nsstring("NSFont");
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
-    let _: () = msg_send![ph_text_attrs, setObject: font, forKey: font_key];
-    CFRelease(font_key as *const c_void);
-    let color_key = make_nsstring("NSColor");
-    let ph_color: *mut AnyObject = msg_send![class!(NSColor), placeholderTextColor];
-    let _: () = msg_send![ph_text_attrs, setObject: ph_color, forKey: color_key];
-    CFRelease(color_key as *const c_void);
-    let ph_ns = make_nsstring(&t("clipboard.search_hint"));
-    let ph_text: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-    let ph_text: *mut AnyObject =
-        msg_send![ph_text, initWithString: ph_ns, attributes: ph_text_attrs];
-    CFRelease(ph_ns as *const c_void);
-    release_obj(ph_text_attrs);
-    let _: () = msg_send![ph_m, appendAttributedString: ph_text];
-    release_obj(ph_text);
-    // 占位不挂到字段上(字段编辑器会在聚焦空字段时把它画在左侧):存入静态,
-    // 由 cell 手绘居中(见 search_cell_draw_interior)。
-    // The placeholder is NOT set on the field (the field editor would draw it left-aligned
-    // on a focused-but-empty field): it lives in a static and is hand-drawn centered by
-    // the cell (see search_cell_draw_interior).
-    let mut hint = SEARCH_HINT_TEXT.lock().unwrap();
-    if let Some(old) = *hint {
-        release_obj(old.0);
-    }
-    *hint = Some(ObjPtr(ph_m));
-    drop(hint);
+    // 占位提示(放大镜 + 带条数文案)独立构建,条数变化时由 rebuild_rows 刷新。
+    // The placeholder (magnifier + count-bearing text) is built separately and refreshed
+    // by rebuild_rows when the entry count changes.
+    rebuild_search_hint(0);
     let _: () = msg_send![search, setCell: cell];
     release_obj(cell);
     // 显式置空 placeholder 属性(双保险,任何读取方都拿不到内容)。
@@ -3716,6 +3796,10 @@ unsafe fn rebuild_rows() {
     // Each row's button height / pitch derives from its wrapped line count.
     *pitches = compute_pitches(&hist);
     let total = hist.len();
+    // 搜索占位提示带条数:条数变化时刷新(高频 rebuild 不重建富文本)。
+    // The search placeholder carries the count: refresh when it changes (frequent
+    // rebuilds don't re-create the attributed string).
+    unsafe { refresh_search_hint(total) };
     // 重建当前显示列表(按搜索词过滤)。
     // Rebuild the display list (filtered by the search query).
     *FILTERED.lock().unwrap() = filtered_indices(&hist, &SEARCH_QUERY.lock().unwrap());
@@ -6666,6 +6750,44 @@ mod tests {
         // Toggle off -> empty (the strip only hosts the icons).
         assert_eq!(header_title(&entry_with_source("t", "Safari"), false), "");
         assert_eq!(header_title(&entry("t"), false), "");
+    }
+
+    #[test]
+    fn header_title_appends_copied_at_time() {
+        use super::{format_copied_at, header_title};
+        // 有时间戳 → 应用名 + "复制于: MM-dd HH:mm"(旧条目 None 不显示)。
+        // With a timestamp -> app name + "Copied at: MM-dd HH:mm" (legacy None shows none).
+        let mut e = entry_with_source("t", "Safari");
+        assert_eq!(header_title(&e, true), "Safari"); // None -> 无时间 / no time
+        e.copied_at = Some(1755000000);
+        let title = header_title(&e, true);
+        assert!(title.starts_with("Safari "));
+        // 文案来自 i18n(随 locale),只校验结构:含时间文本 + 格式化后的时间。
+        // The wording comes from i18n (locale-dependent); assert the structure only:
+        // it carries the formatted time.
+        assert!(title.contains(&format_copied_at(1755000000)));
+        // 开关关 → 仍为空串,时间不显示。
+        // Toggle off -> still empty, no time.
+        assert_eq!(header_title(&e, false), "");
+    }
+
+    #[test]
+    fn format_copied_at_is_mm_dd_hh_mm() {
+        use super::format_copied_at;
+        // 本地时区无关的结构断言:长度 11,形如 "MM-dd HH:mm"。
+        // Timezone-independent structure assertion: length 11, shaped "MM-dd HH:mm".
+        let s = format_copied_at(1755000000);
+        assert_eq!(s.len(), 11, "got {s}");
+        assert_eq!(s.as_bytes()[2], b'-', "got {s}");
+        assert_eq!(s.as_bytes()[5], b' ', "got {s}");
+        assert_eq!(s.as_bytes()[8], b':', "got {s}");
+        // 全数字字段 / all-numeric fields.
+        let digits: Vec<u8> = s
+            .bytes()
+            .filter(|b| !matches!(b, b'-' | b' ' | b':'))
+            .collect();
+        assert_eq!(digits.len(), 8);
+        assert!(digits.iter().all(u8::is_ascii_digit));
     }
 
     #[test]
