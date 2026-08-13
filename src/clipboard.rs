@@ -2556,14 +2556,43 @@ extern "C" fn search_field_do_command(
     _text_view: *mut c_void,
     command_selector: Sel,
 ) -> bool {
-    if command_selector != sel!(moveDown:) {
+    if command_selector != sel!(moveDown:) && command_selector != sel!(moveUp:) {
         return false;
     }
     unsafe {
-        // 搜索词/过滤结果保留,仅把焦点与选中交给列表。
+        // 搜索词/过滤结果保留,仅把焦点与选中交给列表。↓ = 最新一条(首行);
+        // ↑ = 最久远的一条(显示列表末行,随后滚动到可见)。
         // The query/filter stays; only focus and the selection move to the list.
-        *PICKER_SELECTION.lock().unwrap() = 0;
+        // ↓ = the newest entry (first row); ↑ = the oldest (the display list's tail,
+        // scrolled into view afterwards).
+        let display_len = FILTERED.lock().unwrap().len();
+        let sel = if command_selector == sel!(moveUp:) {
+            // 空列表:0(无行可选中,无高光;saturating_sub 防下溢)。
+            // Empty list: 0 (no row to select, no highlight; saturating_sub guards).
+            display_len.saturating_sub(1)
+        } else {
+            0
+        };
+        *PICKER_SELECTION.lock().unwrap() = sel;
         rebuild_rows();
+        // ↑ 选中末行时视口还停在顶部:滚动选中行可见(与列表内方向键导航同款;
+        // 空列表时 row_top 的 take 防越界,无副作用)。
+        // With ↑ the tail is selected while the viewport still sits at the top -- scroll
+        // the selection into view (same as the in-list arrow navigation; row_top's take
+        // guards the empty-list case, harmless).
+        if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
+            let pitches = ROW_PITCHES.lock().unwrap();
+            let y = row_top(sel, &pitches);
+            let h = pitches.get(sel).copied().unwrap_or(ROW_GAP);
+            drop(pitches);
+            let _: bool = msg_send![
+                c.0,
+                scrollRectToVisible: NSRect::new(
+                    NSPoint::new(0.0, y),
+                    NSSize::new(1.0, h)
+                )
+            ];
+        }
         if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
             let window = match *PICKER_WINDOW.lock().unwrap() {
                 Some(w) => w.0,
