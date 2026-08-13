@@ -1511,11 +1511,30 @@ fn load_history() {
         let Some(entry) = restore_loaded_entry(entry) else {
             continue;
         };
+        // 去重与 record_image 同规则:**按条目类型区分**。数据条目(source_path 恒为
+        // None)按内容 hash 判重——此前对所有图片统一按 source_path 比较,数据条目
+        // 之间 None==None 互相判重,重启加载时除第一条外全部被丢(缓存残留为证)。
+        // 文件条目按内容 hash 判重,退化条目(hash=0)按来源路径。
+        // Dedup follows record_image, **split by entry kind**: data entries (source_path
+        // is ALWAYS None) dedup by content hash -- comparing every image by source_path
+        // used to make data entries dedup against each other (None==None), dropping all
+        // but the first on every load (orphan cache files were the evidence). File entries
+        // dedup by content hash; degenerate entries (hash=0) by source path.
         let dup = match &entry.image {
+            Some(img) if img.source_path.is_some() => hist.iter().any(|e| {
+                e.image.as_ref().is_some_and(|i| {
+                    i.source_path.is_some()
+                        && if img.hash != 0 {
+                            i.hash == img.hash
+                        } else {
+                            i.source_path.as_deref() == img.source_path.as_deref()
+                        }
+                })
+            }),
             Some(img) => hist.iter().any(|e| {
                 e.image
                     .as_ref()
-                    .is_some_and(|i| i.source_path.as_deref() == img.source_path.as_deref())
+                    .is_some_and(|i| i.source_path.is_none() && i.hash == img.hash)
             }),
             None => hist
                 .iter()
@@ -5890,6 +5909,82 @@ mod tests {
         };
         let parsed_ts = parse_history(&super::serialize_history(&[with_ts]).unwrap()).unwrap();
         assert_eq!(parsed_ts[0].copied_at, Some(1755000000));
+    }
+
+    #[test]
+    fn load_history_keeps_distinct_data_images() {
+        use super::{
+            cache_write_image, clip_image_path, fnv1a64, history_file_path, load_history,
+            serialize_history, ImageEntry, CLIP_HISTORY, NSPASTEBOARD_TYPE_PNG,
+        };
+        // 回归:多个**不同**数据图片条目(网页复制,source_path 恒 None)必须全部存活。
+        // 此前对所有图片统一按 source_path 判重,None==None 导致除第一条外全被丢弃。
+        // Regression: DISTINCT data-image entries (web copies, source_path always None)
+        // must all survive; the old all-images-by-source_path dedup (None==None) dropped
+        // every entry after the first.
+        let prev = {
+            let cfg = crate::config::CONFIG.read().unwrap();
+            (cfg.clipboard.persist, cfg.clipboard.auto_expire_days)
+        };
+        {
+            let mut cfg = crate::config::CONFIG.write().unwrap();
+            cfg.clipboard.persist = true;
+            cfg.clipboard.auto_expire_days = 0;
+        }
+        let mk = |bytes: &[u8]| {
+            let hash = fnv1a64(bytes);
+            assert!(cache_write_image(hash, bytes));
+            ClipEntry {
+                text: String::new(),
+                image: Some(ImageEntry {
+                    uti: NSPASTEBOARD_TYPE_PNG.to_string(),
+                    hash,
+                    data_path: clip_image_path(hash),
+                    preview_png: bytes.to_vec(),
+                    source_path: None,
+                }),
+                pinned: false,
+                source_app: String::new(),
+                source_key: String::new(),
+                copied_at: Some(1755000000),
+            }
+        };
+        let a = mk(b"load-keep-a");
+        let b = mk(b"load-keep-b");
+        let c = mk(b"load-keep-c");
+        let path = history_file_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serialize_history(&[a, b, c]).unwrap()).unwrap();
+        CLIP_HISTORY.lock().unwrap().clear();
+        load_history();
+        let hashes: Vec<u64> = CLIP_HISTORY
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.image.as_ref().map(|i| i.hash))
+            .collect();
+        assert_eq!(
+            hashes.len(),
+            3,
+            "三个不同数据图片条目必须全部存活,实际: {hashes:?}"
+        );
+        // 同图重复(同 hash)→ 仍判重合并为一条。
+        // Re-copying the same image (same hash) still dedups to one.
+        let dup_path = history_file_path();
+        std::fs::write(&dup_path, serialize_history(&[mk(b"load-keep-a")]).unwrap()).unwrap();
+        CLIP_HISTORY.lock().unwrap().clear();
+        load_history();
+        let n = CLIP_HISTORY
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.image.is_some())
+            .count();
+        assert_eq!(n, 1, "同 hash 数据条目应合并为一条");
+        // 恢复原配置 / restore the original config.
+        let mut cfg = crate::config::CONFIG.write().unwrap();
+        cfg.clipboard.persist = prev.0;
+        cfg.clipboard.auto_expire_days = prev.1;
     }
 
     #[test]
