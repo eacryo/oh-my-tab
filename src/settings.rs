@@ -381,10 +381,10 @@ unsafe fn add_row_with_label(
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    // 右对齐:Apple Silicon 上 NSTextAlignment 走 iOS 值分支,Right=2(1 是 Center)。
-    // Right-aligned: on Apple Silicon NSTextAlignment uses the iOS values, Right=2 (1 is
-    // Center).
-    let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight on arm64
+    // 左对齐:设置项标签贴在内容区左侧(NSTextAlignmentLeft = 0,arm64/x86_64 一致)。
+    // Left-aligned: the row label hugs the content area's left edge (NSTextAlignmentLeft = 0,
+    // identical on arm64 and x86_64).
+    let _: () = msg_send![label, setAlignment: 0isize]; // NSTextAlignmentLeft
                                                         // 自适应:标签固定宽、顶部+左侧锚定(MinYMargin|MaxXMargin = 8|4 = 12)。
                                                         // Adaptive: label keeps fixed width, stays top- and left-anchored.
     let _: () = msg_send![label, setAutoresizingMask: 12u64];
@@ -2282,7 +2282,10 @@ fn create_settings_window() {
             cy - 18.0,
             content_w - 24.0,
         );
-        cy -= 8.0 + 26.0;
+        // header 与首行间距与其他页一致(8 + row_h = 30):此前 16pt 挨得太近。
+        // Header-to-first-row gap matches the other pages (8 + row_h = 30); it used to be
+        // 16pt, too cramped.
+        cy -= 18.0 + 8.0 + row_h;
         // 启用开关 / master switch.
         ui.clipboard_enabled = add_row(
             clipboard_view,

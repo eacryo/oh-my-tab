@@ -21,6 +21,8 @@ cargo test         # unit tests (fast, headless-safe; smoke tests are #[ignore])
 **After every code modification, run (in this order, commands lowercase):**
 `cargo fmt` → `cargo check` → `cargo clippy` → `cargo test`. All must pass cleanly before the change is considered done.
 
+**Dev restart convention (when developing via `cargo run`)**: after the gates pass, run `scripts/dev-restart.sh`. It SIGTERMs the old `target/debug/oh-my-tab` process (graceful quit), runs `cargo build` — required, because `cargo check`/`clippy`/`test` do NOT produce the main binary — starts the fresh binary in the background, and verifies it stays alive for 5 seconds. On `restart FAILED` (exit 1), read the **newest** file in `~/Library/Logs/oh-my-tab/` (each launch creates a new timestamped log; the failed run's log is the latest one), diagnose the exit cause, fix it, then re-run the gates + restart until it succeeds. Caveats: clipboard history only survives restarts when `clipboard.persist` is on (otherwise memory history and the image cache are wiped at startup by design); the logger flushes every line, so no log data is lost across kills.
+
 **Testing strategy** (see also the `.github/workflows/ci.yml`):
 - The test suite is **text-assertion based** — no screenshots/visual regression. Layout/color/branch logic is extracted into pure functions (`compute_window_height`, `resolve_locale_from`, `sort_windows_by_mru`, `parse_bluetooth_info`, etc.) and verified with `assert_eq!`.
 - Unit tests cover: config parse/validate/merge/migration + save/load roundtrips (via `tempfile`), i18n locale resolution + cross-locale key-set consistency, mouse profile merging, scroll delta math, Bluetooth NVRAM TLV parsing, MRU sort/prune, theme layout math, logger cleanup, clipboard history logic (dedup-to-front, pin/unpin, delete).
@@ -113,6 +115,8 @@ When asked for a commit message, always follow the [Conventional Commits](https:
 Format: `type: description`
 
 Types: feat, fix, docs, style, refactor, perf, test, chore, ci, build
+
+**`style` means CODE style only** — formatting, whitespace, naming, lint fixes; no behavior change. UI/visual changes (alignment, colors, spacing, fonts, layout) are NOT `style`: use `fix` for a visual bug fix or `feat` for new visual behavior. Example: left-aligning settings labels is `fix`, reformatting a function's indentation is `style`.
 
 Example: `feat: implement compact floating window selector with auto-resize`
 

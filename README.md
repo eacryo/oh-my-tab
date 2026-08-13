@@ -51,7 +51,9 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 
 **Using an entry reorders the history by default**: selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top (like Maccy). The **"Move used entries to top"** switch in Settings turns this off — pasting then never reorders the history (like Windows Win+V).
 
-The picker's "Clear all" keeps pinned entries; per-entry delete (Backspace) and the entry-cap trim follow the same cache rules. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note under [Configuration](#configuration).
+The picker's "Clear all" keeps pinned entries; per-entry delete (Backspace), auto-expiry, and the entry-cap trim follow the same cache rules. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note under [Configuration](#configuration).
+
+**Cache locations**: image entries keep their original-format bytes and previews under `~/Library/Caches/oh-my-tab-clip-images/` — the original bytes as `{hash:016x}` (no extension), the downsampled thumbnail as `{hash:016x}.preview`, and the lazily generated detail-panel large preview as `{hash:016x}.detail` (all keyed by the content hash). File-copy entries store **no bytes** (reference-only, a pasted file is read from its original path). The cache directory is wiped at startup unless persistence is on; cache files are deleted in sync with per-entry delete / clear-all / auto-expiry / the entry-cap trim. With **"Save clipboard history"** on, the history itself lives at `~/.config/oh-my-tab/clipboard-history.toml` (mode 600, plaintext — see the privacy note under [Configuration](#configuration)).
 
 ## Known Issues
 
