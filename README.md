@@ -17,7 +17,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 - Pure Rust calling macOS APIs directly — no Electron, no Tauri — resulting in a 1.5 MB binary and 35 MB memory footprint.
 - Floating Liquid Glass overlay (tested only on macOS 26; lower versions not guaranteed to work).
 - **Window-level** MRU ordering — each window is tracked independently by `(pid, CGWindowID)`, so switching to one window of an app doesn't drag the app's other windows forward.
-- Optionally show or hide minimized windows in the switcher; when shown, minimized windows' icons are greyed out.
+- The switcher lists **every real window**, including off-screen ones — apps that hide a dialog when another window is activated (e.g. JetBrains hides its Settings window when the main window is activated) and windows on other Spaces — so a window never vanishes from the list while it exists. Minimized windows are shown or hidden by a toggle (greyed out when shown).
 - TOML configuration, validated and **hot-reloadable** from the menu.
 - Handcrafted, zero-dependency i18n (English, Simplified Chinese, Traditional Chinese) with automatic locale detection and live system-language follow.
 - Per-launch log files with automatic 30-day retention (see [Logging](#logging)).

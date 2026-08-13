@@ -100,8 +100,12 @@ fn icon_cache_dir() -> String {
     format!("{}/Library/Caches/{}", home, name)
 }
 
-const K_C_G_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
-const K_C_G_WINDOW_LIST_OPTION_ALL: u32 = 0; // 含离屏窗口(最小化等)/ includes off-screen windows (minimized, etc.)
+// 枚举常量:All(0)= 含离屏窗口(orderOut 对话框/最小化/其他 Space),收集恒用它——
+// 离屏窗口是否显示由 AX 语义决定(见 collect_windows 的过滤注释)。
+// Enumeration constants: All (0) includes off-screen windows (orderOut'd dialogs /
+// minimized / other Spaces); collection always uses it -- whether an off-screen window
+// shows is decided by AX semantics (see collect_windows' filter comments).
+const K_C_G_WINDOW_LIST_OPTION_ALL: u32 = 0;
 
 // AX types
 type AXUIElementRef = *const c_void;
@@ -1071,13 +1075,21 @@ fn cf_to_rust_string(cf_string: *const c_void) -> Option<String> {
 
 pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
-    // show_minimized 打开时用 All(含离屏最小化窗口),否则 OnScreenOnly(原行为)。
-    // When show_minimized is on, use All (includes off-screen minimized windows); else OnScreenOnly (original behavior).
-    let cg_option = if show_minimized {
-        K_C_G_WINDOW_LIST_OPTION_ALL
-    } else {
-        K_C_G_WINDOW_LIST_OPTION_ON_SCREEN_ONLY
-    };
+    // 始终用 All 枚举(含离屏窗口)。原因:部分应用(如 JetBrains 系 IDE)在"主窗口被
+    // 激活"时会把设置对话框 orderOut(隐藏但保留窗口对象)——它 isOnscreen=false,
+    // OnScreenOnly 枚举不到,切换器就会"切到主窗口后设置窗口消失"(BetterCmdTab 用
+    // All 枚举,无此问题)。离屏窗口是否显示改由 AX 语义决定(见下文的过滤逻辑):
+    // AX 仍报的窗口是合法可切换窗口(调度中心/系统 Cmd+Tab 也认),AX 不报的
+    // 隐藏辅助窗口会被 subrole/空标题过滤拦掉。
+    // Always enumerate with All (off-screen windows included). Some apps (JetBrains IDEs)
+    // orderOut their settings dialog when the main window is activated -- it then has
+    // isOnscreen=false, invisible to OnScreenOnly, so the switcher would lose it after
+    // switching to the main window (BetterCmdTab uses All; no such issue). Whether an
+    // off-screen window shows is now decided by AX semantics (see the filter below): a
+    // window AX still reports is a legitimate switchable window (Mission Control and the
+    // system Cmd+Tab agree); hidden helper surfaces AX never reports are dropped by the
+    // subrole/empty-title filters.
+    let cg_option = K_C_G_WINDOW_LIST_OPTION_ALL;
     let array = unsafe { CGWindowListCopyWindowInfo(cg_option, 0) };
     if array.is_null() {
         return vec![];
@@ -1085,18 +1097,20 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
     // 不再按 PID 排除本应用(own-PID)窗口:设置窗口也是 own-PID,排除它会导致设置
     // 开着时切不到它。浮窗自己不需要靠 PID 排除--它 setLevel:3(floating,
-    // kCGWindowLayer != 0)已被下面的 layer 过滤挡掉,且 summon 时 collect 先于
-    // show_overlay 调用、浮窗尚离屏,OnScreenOnly 也不会枚举到。设置窗口关着时走
-    // orderOut 离屏,OnScreenOnly 自然排除,故"开->显示为卡片、关->不显示"自动成立。
+    // kCGWindowLayer != 0)已被下面的 layer 过滤挡掉(与枚举模式无关)。设置窗口
+    // 关着时 orderOut 离屏,由下文的 own-PID isOnscreen 过滤排除,故
+    // "开->显示为卡片、关->不显示"仍然成立。
     //
     // Own-PID windows are no longer excluded by PID: the settings window is own-PID too, and
     // excluding it would make it unswitchable while open. The overlay itself needs no PID
     // exclusion -- it's setLevel:3 (floating, kCGWindowLayer != 0), already dropped by the
-    // layer check below, and collect runs before show_overlay so the overlay is still off-screen
-    // and OnScreenOnly won't enumerate it either. The settings window, when closed, is
-    // orderOut'd (off-screen) so OnScreenOnly excludes it -- "open -> shown as a card, closed
-    // -> hidden" holds automatically.
+    // layer check below (independent of the enumeration mode). The settings window, when
+    // closed, is orderOut'd (off-screen) and excluded by the own-PID isOnscreen filter
+    // below, so "open -> shown as a card, closed -> hidden" still holds.
     let mut windows: Vec<WindowInfo> = Vec::new();
+    // CG 循环里已显示的窗口集合:AX 补漏时跳过(避免重复卡片)。
+    // Windows already shown by the CG loop: skipped by the AX backfill (no duplicate rows).
+    let mut shown: HashSet<(i32, u32)> = HashSet::new();
     // TIMING-DEBUG 阶段计时(debug 档):定位 summon 卡顿——CG 枚举 / 每 PID AX 查询 / frontmost。
     // TIMING-DEBUG Phase timings (debug tier): locate summon stalls -- CG enumeration /
     // per-PID AX queries / the frontmost lookup. Remove together with the [collect] logs.
@@ -1165,6 +1179,25 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         let ax_wins = get_ax_windows_for_pid(pid);
         let pid_ms = t_pid.elapsed().as_millis();
         ax_total_ms += pid_ms;
+        // AX 查询结果汇总:定位“一会 1 个一会 2 个”——设置窗口抖动时看 windows 数
+        // 是否变化(缺窗口/失败/超时)。
+        // AX query summary: pin down the 1-vs-2 flicker -- watch whether the window
+        // count changes (missing windows / failure / timeout).
+        match &ax_wins {
+            Some(w) => log_debug!(
+                "[collect] ax pid={} app=\"{}\" windows={} ({}ms)",
+                pid,
+                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                w.len(),
+                pid_ms
+            ),
+            None => log_debug!(
+                "[collect] ax pid={} app=\"{}\" FAILED (CG fallback, {}ms)",
+                pid,
+                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                pid_ms
+            ),
+        }
         // TIMING-DEBUG 慢 AX 查询(≥20ms)单独标记:定位卡顿来自哪个应用(如 Ghostty)。
         // TIMING-DEBUG Flag slow AX queries (>=20ms) individually: pin down which app stalls
         // the summon.
@@ -1244,7 +1277,22 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         let (window_title, minimized) = if let Some(wid_map) = ax_wid_to_info.get(&owner_pid) {
             match wid_map.get(&cgwid) {
                 Some((t, m)) => (t.clone(), *m),
-                None => continue, // CG 窗口在 AX 里没有 -> 弹出面板，跳过 / popup, skip
+                None => {
+                    // 配对失败:CG 窗口在 AX 列表里没有(弹出面板 或 AX 漏报)。
+                    // 记日志定位设置窗口“时有时无”:抖动时这里应出现它的 cgwid。
+                    // Pair miss: the CG window has no AX counterpart (a popup, or AX
+                    // failed to report it). Logged to pin the Settings-window flicker.
+                    log_debug!(
+                        "[collect] ax pair-miss: pid={} app=\"{}\" cgwid={} cg_title=\"{}\" {:.0}x{:.0} -> dropped",
+                        owner_pid,
+                        owner_name,
+                        cgwid,
+                        cg_title,
+                        bounds.2,
+                        bounds.3
+                    );
+                    continue; // CG 窗口在 AX 里没有 -> 弹出面板，跳过 / popup, skip
+                }
             }
         } else if ax_queried_pids.contains(&owner_pid) {
             // AX 查询成功但该 App 无标准窗口(如 BetterDisplay 的隐形锚点窗口):
@@ -1259,15 +1307,34 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             (cg_title, false)
         };
 
-        // show_minimized 打开时(用 CG All 枚举):保留在屏窗口 或 最小化窗口;
-        // 其它离屏窗口(别的 Space、隐藏)跳过。关闭时走 OnScreenOnly,此过滤恒通过。
-        // When show_minimized is on (CG All): keep on-screen OR minimized windows; skip other
-        // off-screen windows (other Spaces, hidden). When off (OnScreenOnly), always passes.
-        if show_minimized {
+        // 枚举已改为 All(见 cg_option 注释),离屏窗口(orderOut 的对话框/最小化/其他
+        // Space)全部在列表里,显示与否由以下规则决定:
+        // - 本应用自己的窗口(设置窗口):orderOut = 关闭,按 isOnscreen 过滤——
+        //   开->显示、关->不显示,维持原行为(其他应用的 orderOut 窗口不能用此规则,
+        //   它们可能是 JetBrains 那种"隐藏但合法"的设置对话框)。
+        // - 其他应用的窗口:AX 配对成功的都显示——orderOut 但 AX 仍报的窗口
+        //   (JetBrains 激活主窗口时隐藏的设置对话框)是合法可切换窗口必须显示;
+        //   最小化窗口由"显示最小化窗口"开关控制(AX minimized 标记,与 isOnscreen
+        //   无关——最小化窗口 isOnscreen=false 但 minimized=true)。
+        // The enumeration is now All (see the cg_option comment): off-screen windows
+        // (orderOut'd dialogs / minimized / other Spaces) are all listed, and whether they
+        // show is decided here:
+        // - own windows (the settings window): orderOut = closed, filtered by isOnscreen --
+        //   open -> shown, closed -> hidden, preserving the original behavior (other apps'
+        //   orderOut'd windows can't use this rule; they may be JetBrains-style hidden-but-
+        //   legitimate settings dialogs).
+        // - other apps' windows: every AX-paired window shows -- an orderOut'd window AX
+        //   still reports (JetBrains hiding its settings dialog on main-window activation)
+        //   is a legitimate switchable window and must show; minimized windows are gated
+        //   by the "show minimized windows" switch (the AX minimized flag -- unrelated to
+        //   isOnscreen: a minimized window is isOnscreen=false but minimized=true).
+        if owner_pid == std::process::id() as i32 {
             let is_onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false);
-            if !is_onscreen && !minimized {
+            if !is_onscreen {
                 continue;
             }
+        } else if !show_minimized && minimized {
+            continue;
         }
 
         // 空标题窗口仅对「AX 确认过全部窗口无标题」的 App(titleless_pids)保留;
@@ -1316,6 +1383,72 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             minimized,
             bounds,
         });
+        shown.insert((owner_pid, cgwid));
+    }
+
+    // AX 补漏:AX 窗口列表报、但 CG 枚举没有的窗口。例:JetBrains 系 IDE 在“主窗口
+    // 被激活”时把设置对话框 orderOut(隐藏但保留窗口对象)——orderOut 的窗口不在
+    // CGWindowList 里(optionAll 也只含屏上窗口),按 CG 遍历永远看不到它;但 AX 仍
+    // 报它,且它是合法可切换窗口(BetterCmdTab 以 AX 列表为主数据源,故稳定显示)。
+    // 这里用 AX 的标题/minimized 补出条目;bounds 未知(离屏),调用方回退主屏幕。
+    // AX backfill: windows AX reports but the CG enumeration lacks. E.g. JetBrains IDEs
+    // orderOut their settings dialog when the main window is activated -- an orderOut'd
+    // window is NOT in CGWindowList (optionAll only covers on-screen windows), so a
+    // CG-driven loop can never see it; AX still reports it and it is a legitimate
+    // switchable window (BetterCmdTab uses the AX list as its primary source and shows
+    // it stably). Entries are built from AX title/minimized; bounds are unknown
+    // (off-screen), callers fall back to the main screen.
+    for (&pid, wid_map) in ax_wid_to_info.iter() {
+        // 本应用窗口(设置窗口)走 CG 路径的 isOnscreen 过滤,这里不补:
+        // 关闭(orderOut)时不应出现在切换器里。
+        // Own windows (the settings window) go through the CG isOnscreen filter; not
+        // backfilled here: when closed (orderOut) they must not show.
+        if pid == std::process::id() as i32 {
+            continue;
+        }
+        let mut entries: Vec<(u32, &String, bool)> =
+            wid_map.iter().map(|(w, (t, m))| (*w, t, *m)).collect();
+        entries.sort_by_key(|(w, _, _)| *w);
+        for (cgwid, title, minimized) in entries {
+            if shown.contains(&(pid, cgwid)) {
+                continue;
+            }
+            // 与 CG 路径同款过滤:最小化由开关控制;空标题(非 titleless)无意义。
+            // Same filters as the CG path: minimized gated by the switch; empty titles
+            // (not titleless) are meaningless.
+            if !show_minimized && minimized {
+                continue;
+            }
+            if title.is_empty() && !titleless_pids.contains(&pid) {
+                continue;
+            }
+            let ancient_base = now
+                .checked_sub(std::time::Duration::from_secs(86_400))
+                .unwrap_or(now);
+            let ordered_ts = ancient_base
+                .checked_sub(std::time::Duration::from_millis(insertion_order as u64))
+                .unwrap_or(ancient_base);
+            insertion_order += 1;
+            mru.entry((pid, cgwid)).or_insert(ordered_ts);
+            let icon_path = icon_ids.get(&pid).and_then(check_cache_for_identity);
+            log_debug!(
+                "[collect] ax-only window restored: pid={} app=\"{}\" cgwid={} title=\"{}\"",
+                pid,
+                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                cgwid,
+                title
+            );
+            windows.push(WindowInfo {
+                pid,
+                window_id: cgwid,
+                app_name: pid_names.get(&pid).cloned().unwrap_or_default(),
+                window_title: title.clone(),
+                icon_path,
+                is_active: false,
+                minimized,
+                bounds: (0.0, 0.0, 0.0, 0.0),
+            });
+        }
     }
 
     // 修剪 MRU:只保留存活窗口的条目。存活集用 All 模式枚举(含最小化/离屏窗口),
@@ -1333,7 +1466,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // conservative filters (layer 0 + valid pid) -- better to keep than to drop; display
     // filters (AX pairing / Dock / alpha) don't apply here. Cost: one extra All-mode
     // enumeration per summon when show_minimized is off (sub-millisecond).
-    let live_set: HashSet<(i32, u32)> = {
+    let mut live_set: HashSet<(i32, u32)> = {
         let src = if show_minimized {
             array // 主查询已是 All 模式,直接复用 / main query is already All mode
         } else {
@@ -1363,6 +1496,16 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
         }
         s
     };
+    // AX 仍报但 CG 枚举不到的窗口(orderOut 的合法窗口)也是存活窗口:并入存活集,
+    // 否则 MRU 修剪会清掉它们的排序记忆(下次 summon 又按新窗口排到末尾)。
+    // AX-reported windows missing from the CG enumeration (orderOut'd but legitimate)
+    // count as alive too: merge them in, or the MRU prune would wipe their ordering
+    // memory (they would re-sort to the tail as "new" windows next summon).
+    for (&pid, wid_map) in ax_wid_to_info.iter() {
+        for &cgwid in wid_map.keys() {
+            live_set.insert((pid, cgwid));
+        }
+    }
     let pruned = prune_mru(mru, &live_set);
     // 修剪数量可观测(debug 档):有残留才打,平时每次 summon 无噪音。
     // Pruning is observable (debug tier): logged only when entries were dropped, so a
