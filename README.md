@@ -275,6 +275,7 @@ launch_at_login = false  # launch at login (requires running as a .app bundle; m
 enabled = false          # clipboard history master switch (off by default)
 max_entries = 50         # max history entries (1..=100)
 persist = false          # save history to disk so it survives restarts (see the privacy note below)
+auto_expire_days = 30    # unpinned entries expire after N days (memory AND disk); 0 = off
 ```
 
 > **Clipboard-history persistence & privacy** — enabling `persist` (or the "Save clipboard

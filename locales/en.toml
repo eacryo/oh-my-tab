@@ -69,6 +69,7 @@ row_clipboard_persist = "Save clipboard history to disk"
 row_clipboard_move_used_to_top = "Move used entries to top"
 row_clipboard_show_source_app = "Show source app"
 row_clipboard_max_entries = "Max entries"
+row_clipboard_auto_expire_days = "Auto-expire (days)"
 row_clipboard_shortcut = "Option+V to open history"
 header_mouse_device = "Device"
 experimental_note = "Experimental options - no guarantee of availability; may be removed in future versions."
@@ -113,5 +114,6 @@ logging_level_invalid = "logging.level: '{value}' is invalid (expect: debug, inf
 config_read_failed = "cannot read config: {error}"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line'
 clipboard_max_entries_invalid = "clipboard.max_entries: {value} must be 1..=100"
+clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} must be 0..=365 (0 = off)"
 mouse_line_count_invalid = "line_count: {value} must be 1..=10"
 windows_overlay_position_invalid = 'windows.overlay_position: "{value}" is not one of active_window, main'

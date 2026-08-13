@@ -153,6 +153,11 @@ pub struct ClipboardSection {
     // front (a side effect: the write-back is re-captured by the poll as another copy).
     // When off, pasting does not reorder the history (like Windows Win+V). Default true.
     pub move_used_to_top: bool,
+    // 自动过期天数:非置顶条目超过 N 天自动从历史(内存与持久化)清除,置顶条目
+    // 永不过期。0 = 关闭。默认 30 天。
+    // Auto-expire days: unpinned entries older than N days are removed from the history
+    // (memory AND persistence); pinned entries never expire. 0 = off. Default 30 days.
+    pub auto_expire_days: u32,
 }
 
 impl Default for ClipboardSection {
@@ -163,6 +168,7 @@ impl Default for ClipboardSection {
             show_source_app: false,
             persist: false,
             move_used_to_top: true,
+            auto_expire_days: 30,
         }
     }
 }
@@ -668,6 +674,12 @@ impl Config {
                 &[("value", &self.clipboard.max_entries.to_string())],
             ));
         }
+        if self.clipboard.auto_expire_days > 365 {
+            errs.push(tf(
+                "errors.clipboard_auto_expire_days_invalid",
+                &[("value", &self.clipboard.auto_expire_days.to_string())],
+            ));
+        }
 
         // --- mouse profiles ---
         for (i, p) in self.mouse.profiles.iter().enumerate() {
@@ -847,6 +859,12 @@ impl Config {
         self.clipboard.move_used_to_top = other.clipboard.move_used_to_top;
         if !errs.iter().any(|e| e.starts_with("clipboard.max_entries")) {
             self.clipboard.max_entries = other.clipboard.max_entries;
+        }
+        if !errs
+            .iter()
+            .any(|e| e.starts_with("clipboard.auto_expire_days"))
+        {
+            self.clipboard.auto_expire_days = other.clipboard.auto_expire_days;
         }
 
         // mouse:profiles 逐档逐字段合并(沿用 per-field resilient 模式)。
@@ -1211,6 +1229,21 @@ mod tests {
         assert_err_count(&cfg, 1);
         cfg.clipboard.max_entries = 50;
         assert_err_count(&cfg, 0);
+    }
+
+    #[test]
+    fn validate_accepts_auto_expire_days_0_to_365() {
+        // 自动过期天数:0(关闭)与 365 合法,366 非法。
+        // Auto-expire days: 0 (off) and 365 are valid, 366 is rejected.
+        let mut cfg = Config::default();
+        assert_eq!(cfg.clipboard.auto_expire_days, 30, "default is 30 days");
+        assert_err_count(&cfg, 0);
+        cfg.clipboard.auto_expire_days = 0;
+        assert_err_count(&cfg, 0);
+        cfg.clipboard.auto_expire_days = 365;
+        assert_err_count(&cfg, 0);
+        cfg.clipboard.auto_expire_days = 366;
+        assert_err_count(&cfg, 1);
     }
 
     #[test]

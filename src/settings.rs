@@ -72,6 +72,7 @@ struct SettingsUi {
     clipboard_persist: *mut AnyObject, // NSSwitch: 保存剪贴板历史记录到磁盘 / persist clipboard history
     clipboard_move_used_to_top: *mut AnyObject, // NSSwitch: 使用后移到最前 / move used entries to top
     clipboard_max_entries: *mut AnyObject,      // NSTextField: 历史最大条数 / max history entries
+    clipboard_auto_expire_days: *mut AnyObject, // NSTextField: 自动过期天数(0=关闭)/ auto-expire days (0 = off)
     clipboard_show_source_app: *mut AnyObject,  // NSSwitch: 显示来源应用 / show the source app
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
@@ -1089,6 +1090,10 @@ fn load_settings_from(cfg: &Config) {
             ui.clipboard_max_entries,
             cfg.clipboard.max_entries.to_string(),
         );
+        set_field(
+            ui.clipboard_auto_expire_days,
+            cfg.clipboard.auto_expire_days.to_string(),
+        );
     }
 }
 
@@ -1294,6 +1299,16 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             Err(_) => errs.push(tf(
                 "errors.not_an_integer",
                 &[("field", "clipboard.max_entries")],
+            )),
+        }
+        match parse_usize(&nsstring_to_rust(msg_send![
+            ui.clipboard_auto_expire_days,
+            stringValue
+        ])) {
+            Ok(v) => cfg.clipboard.auto_expire_days = v as u32,
+            Err(_) => errs.push(tf(
+                "errors.not_an_integer",
+                &[("field", "clipboard.auto_expire_days")],
             )),
         }
     }
@@ -1585,6 +1600,7 @@ fn create_settings_window() {
             clipboard_persist: std::ptr::null_mut(),
             clipboard_move_used_to_top: std::ptr::null_mut(),
             clipboard_max_entries: std::ptr::null_mut(),
+            clipboard_auto_expire_days: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
             ok_button: std::ptr::null_mut(),
@@ -2324,6 +2340,17 @@ fn create_settings_window() {
             row_h,
             &t("settings.row_clipboard_max_entries"),
             make_text_input(ctrl_x, cy, ctrl_w, row_h, "50"),
+        );
+        cy -= 8.0 + row_h;
+        // 自动过期天数(数字输入,0 = 关闭)/ auto-expire days (number input, 0 = off).
+        ui.clipboard_auto_expire_days = add_row(
+            clipboard_view,
+            label_x,
+            cy,
+            label_w,
+            row_h,
+            &t("settings.row_clipboard_auto_expire_days"),
+            make_text_input(ctrl_x, cy, ctrl_w, row_h, "30"),
         );
         cy -= 8.0 + row_h;
         // 呼出快捷键说明(只读 label)/ shortcut hint (read-only label).

@@ -561,6 +561,68 @@ struct ClipEntry {
     /// The source app's icon-cache key (resolve_app_identity: bundle id > exec-path hash >
     /// pid). Empty = no identity (e.g. legacy entries) -> no icon in the header.
     source_key: String,
+    /// 复制时间戳(unix 秒):自动过期的依据,去重移前时刷新为最近一次复制时间。
+    /// None = 旧版本条目(无时间戳),不参与过期——保守迁移,绝不误删。
+    /// The copy timestamp (unix seconds): the basis of auto-expiry; refreshed to the
+    /// latest copy time on dedup-move-to-front. None = a legacy entry (no timestamp),
+    /// exempt from expiry -- a conservative migration, never wrongly deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copied_at: Option<u64>,
+}
+
+/// 当前 unix 秒。/ The current unix seconds.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 自动过期 TTL(秒):0 天 = 关闭 → None。从 CONFIG 实时读(设置热重载即生效)。
+/// The auto-expiry TTL in seconds: 0 days = off -> None. Read live from CONFIG (a hot
+/// reload takes effect immediately).
+fn ttl_secs() -> Option<u64> {
+    let days = CONFIG
+        .read()
+        .map(|c| c.clipboard.auto_expire_days)
+        .unwrap_or(0);
+    if days == 0 {
+        None
+    } else {
+        Some(days as u64 * 86400)
+    }
+}
+
+/// 清理过期条目(纯函数,同步):非置顶且 copied_at 存在且 `now - copied_at >= ttl`
+/// → 删除;置顶永不过期;无时间戳(旧条目)不过期。图片缓存按引用规则同步清理
+/// (与 delete/truncate 一致:hash 仍被幸存条目引用则保留)。ttl_secs = None 表示
+/// 关闭,直接返回 0。返回删除条数。
+/// Expire entries (pure, synchronous): unpinned entries with a timestamp whose
+/// `now - copied_at >= ttl` are removed; pinned entries never expire; legacy entries
+/// without a timestamp never expire. Image cache files follow the reference rules
+/// (same as delete/truncate: a hash still referenced by a survivor is kept).
+/// ttl_secs = None disables expiry (returns 0). Returns the number removed.
+fn expire_entries(history: &mut Vec<ClipEntry>, now_secs: u64, ttl_secs: Option<u64>) -> usize {
+    let Some(ttl) = ttl_secs else {
+        return 0;
+    };
+    let mut dropped: Vec<ClipEntry> = Vec::new();
+    history.retain(|e| {
+        // 时间回拨(now < copied_at):saturating_sub 为 0,未到 ttl,天然安全。
+        // Clock rollback (now < copied_at): saturating_sub yields 0, under ttl, safe.
+        let expired = !e.pinned
+            && e.copied_at
+                .map(|t| now_secs.saturating_sub(t) >= ttl)
+                .unwrap_or(false);
+        if expired {
+            dropped.push(e.clone());
+        }
+        !expired
+    });
+    for d in &dropped {
+        cache_delete_for_removed(history, d);
+    }
+    dropped.len()
 }
 
 /// FNV-1a 64 位哈希:图片去重用(比较 PNG 字节内容,不比较字符串)。
@@ -678,6 +740,10 @@ fn record_text(
     if let Some(idx) = find_by_text(history, text) {
         history[idx].source_app = source.to_string();
         history[idx].source_key = source_key.to_string();
+        // 去重移前 = 最近一次复制:刷新时间戳,过期从“最后一次复制”重新计时。
+        // A dedup-move = the latest copy: refresh the timestamp so expiry counts from
+        // the most recent copy, not the first one.
+        history[idx].copied_at = Some(now_secs());
         move_entry_to_front(history, idx);
         return true;
     }
@@ -690,6 +756,7 @@ fn record_text(
             pinned: false,
             source_app: source.to_string(),
             source_key: source_key.to_string(),
+            copied_at: Some(now_secs()),
         },
     );
     if history.len() > max {
@@ -768,6 +835,9 @@ fn record_image(
     if let Some(idx) = dedup_hit {
         history[idx].source_app = source.to_string();
         history[idx].source_key = source_key.to_string();
+        // 去重移前 = 最近一次复制:刷新时间戳(同 record_text)。
+        // A dedup-move = the latest copy: refresh the timestamp (same as record_text).
+        history[idx].copied_at = Some(now_secs());
         // 文件条目去重命中:来源路径更新为最新一次复制(粘贴恢复最新文件)。
         // A file-entry dedup hit: the source path updates to the latest copy (pasting
         // restores the newest file).
@@ -795,6 +865,7 @@ fn record_image(
             pinned: false,
             source_app: source.to_string(),
             source_key: source_key.to_string(),
+            copied_at: Some(now_secs()),
         },
     );
     if history.len() > max {
@@ -1193,6 +1264,7 @@ fn restore_loaded_entry(entry: ClipEntry) -> Option<ClipEntry> {
             pinned: entry.pinned,
             source_app: entry.source_app,
             source_key: entry.source_key,
+            copied_at: entry.copied_at,
         });
     }
     let data = cache_read_image(img.hash)?;
@@ -1211,6 +1283,7 @@ fn restore_loaded_entry(entry: ClipEntry) -> Option<ClipEntry> {
         pinned: entry.pinned,
         source_app: entry.source_app,
         source_key: entry.source_key,
+        copied_at: entry.copied_at,
     })
 }
 
@@ -1222,7 +1295,11 @@ fn save_history() {
     if !persist_enabled() {
         return;
     }
-    let hist = CLIP_HISTORY.lock().unwrap();
+    let mut hist = CLIP_HISTORY.lock().unwrap();
+    // 写盘前清理过期条目:磁盘文件永不残留过期条目(内存与持久化同步过期)。
+    // Expire before writing: the disk file never keeps expired entries (expiry applies
+    // to memory and persistence alike).
+    expire_entries(&mut hist, now_secs(), ttl_secs());
     let entries = hist.clone();
     drop(hist);
     let Some(text) = serialize_history(&entries) else {
@@ -1283,7 +1360,20 @@ fn load_history() {
     };
     let mut hist = CLIP_HISTORY.lock().unwrap();
     let max = max_entries();
+    // 过期条目直接跳过:不进入内存(磁盘文件随后由 save_history 回写清理)。
+    // Expired entries are skipped outright: they never reach memory (the disk file is
+    // cleaned up afterwards by the save_history rewrite).
+    let ttl = ttl_secs();
+    let now = now_secs();
     for entry in entries {
+        if ttl.is_some_and(|ttl| {
+            !entry.pinned
+                && entry
+                    .copied_at
+                    .is_some_and(|t| now.saturating_sub(t) >= ttl)
+        }) {
+            continue;
+        }
         // 数据条目:数据字节缺失(被清过缓存)→ 丢弃坏条目;预览缺失 → 重新解码。
         // Data entries: a missing data file (cache was swept) drops the broken entry; a
         // missing preview is regenerated from the data bytes.
@@ -1964,6 +2054,10 @@ fn poll_clipboard() {
                     hist.len()
                 );
             }
+            // 记录后顺手清理过期条目(懒清理,无额外定时器;呼出时还会再清一次)。
+            // Expire right after recording (lazy, no extra timer; the picker summon
+            // cleans again).
+            expire_entries(&mut hist, now_secs(), ttl_secs());
         }
         // 无文本 → 尝试图片(图文同存时文本优先,第一版取舍)。
         // No text -> try an image (text wins when both are present; a v1 tradeoff).
@@ -1989,6 +2083,9 @@ fn poll_clipboard() {
                 } else {
                     log_debug!("[clip] change skipped: dup image (hash={:016x})", img.hash);
                 }
+                // 记录后顺手清理过期条目(与文本分支一致)。
+                // Expire right after recording (same as the text branch).
+                expire_entries(&mut hist, now_secs(), ttl_secs());
             }
             None => log_debug!("[clip] change but no text/image (non-pasteboard content?)"),
         },
@@ -2026,6 +2123,14 @@ pub fn start() {
             load_history();
         } else {
             clear_clip_image_cache();
+        }
+        // 启动即清理过期条目(load_history 只覆盖 persist 开启的情况;persist 关闭时
+        // 内存历史同样需要过期)。
+        // Expire at startup (load_history only covers the persist-on case; the in-memory
+        // history needs expiry with persist off too).
+        {
+            let mut hist = CLIP_HISTORY.lock().unwrap();
+            expire_entries(&mut hist, now_secs(), ttl_secs());
         }
         // 再记录当前剪贴板,否则首次呼出历史为空。
         // Then record the current pasteboard, or the first summon would show an empty list.
@@ -2612,6 +2717,17 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
 /// Show the picker (built once, reused; the window height follows the visible row count).
 fn show_picker() {
     unsafe {
+        // 呼出前清理过期条目(长时间不复制时,历史里的过期条目在此清除;rebuild_rows
+        // 随后按新列表渲染)。置顶永不过期。
+        // Expire before summon (entries that aged out while the user wasn't copying are
+        // removed here; rebuild_rows renders the fresh list). Pinned never expire.
+        {
+            let mut hist = CLIP_HISTORY.lock().unwrap();
+            let removed = expire_entries(&mut hist, now_secs(), ttl_secs());
+            if removed > 0 {
+                log_debug!("[clip] show picker: expired {} entries", removed);
+            }
+        }
         ensure_picker_window();
         // 每次呼出重置搜索(干净起点);上次遗留的详情浮窗一并收起。
         // Reset the search on every summon (a clean slate); a stale detail panel goes too.
@@ -5233,6 +5349,7 @@ mod tests {
             pinned: false,
             source_app: String::new(),
             source_key: String::new(),
+            copied_at: None,
         }
     }
 
@@ -5243,6 +5360,7 @@ mod tests {
             pinned: false,
             source_app: source.to_string(),
             source_key: String::new(),
+            copied_at: None,
         }
     }
 
@@ -5289,6 +5407,7 @@ mod tests {
             pinned: false,
             source_app: "Safari".to_string(),
             source_key: "com.apple.Safari".to_string(),
+            copied_at: None,
         }
     }
 
@@ -5508,6 +5627,7 @@ mod tests {
             pinned: false,
             source_app: String::new(),
             source_key: String::new(),
+            copied_at: None,
         }];
         delete_entry(&mut h, 0);
         assert!(h.is_empty());
@@ -5601,6 +5721,7 @@ mod tests {
                 pinned: true,
                 source_app: "1Password".to_string(),
                 source_key: "com.agilebits.onepassword".to_string(),
+                copied_at: None,
             },
             ClipEntry {
                 text: String::new(),
@@ -5608,6 +5729,7 @@ mod tests {
                 pinned: false,
                 source_app: "Safari".to_string(),
                 source_key: "com.apple.Safari".to_string(),
+                copied_at: None,
             },
             ClipEntry {
                 text: "vva划船.gif".to_string(),
@@ -5615,6 +5737,7 @@ mod tests {
                 pinned: false,
                 source_app: "Finder".to_string(),
                 source_key: String::new(),
+                copied_at: None,
             },
         ];
         let text = super::serialize_history(&entries).expect("serialize");
@@ -5641,6 +5764,68 @@ mod tests {
         assert_eq!(p_file.hash, fnv1a64(b"history-roundtrip-file"));
         // 回写可再序列化(幂等)/ re-serializing is idempotent.
         assert!(super::serialize_history(&parsed).is_some());
+        // 时间戳落盘并还原(None 不写字段,Some 写 unix 秒)。
+        // The timestamp survives the roundtrip (None is skipped, Some is written).
+        assert!(parsed.iter().all(|e| e.copied_at.is_none()));
+        let with_ts = ClipEntry {
+            text: "ts".to_string(),
+            image: None,
+            pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+            copied_at: Some(1755000000),
+        };
+        let parsed_ts = parse_history(&super::serialize_history(&[with_ts]).unwrap()).unwrap();
+        assert_eq!(parsed_ts[0].copied_at, Some(1755000000));
+    }
+
+    #[test]
+    fn load_history_skips_expired_entries() {
+        use super::{expire_entries, now_secs};
+        // 持久化加载路径:过期条目(非置顶、超时)不进入内存;置顶与未到期保留。
+        // The persist load path: expired entries (unpinned, past TTL) never reach memory;
+        // pinned and fresh ones stay.
+        let now = now_secs();
+        let ttl = Some(30u64 * 86400);
+        let mut h = vec![
+            ClipEntry {
+                text: "expired".to_string(),
+                image: None,
+                pinned: false,
+                source_app: String::new(),
+                source_key: String::new(),
+                copied_at: Some(now - 31 * 86400),
+            },
+            ClipEntry {
+                text: "pinned-old".to_string(),
+                image: None,
+                pinned: true,
+                source_app: String::new(),
+                source_key: String::new(),
+                copied_at: Some(now - 365 * 86400),
+            },
+            ClipEntry {
+                text: "fresh".to_string(),
+                image: None,
+                pinned: false,
+                source_app: String::new(),
+                source_key: String::new(),
+                copied_at: Some(now - 1000),
+            },
+        ];
+        assert_eq!(expire_entries(&mut h, now, ttl), 1);
+        assert_eq!(texts(&h), vec!["pinned-old", "fresh"]);
+        // 关闭(ttl None)不动。/ Off (None) touches nothing.
+        let mut h = vec![ClipEntry {
+            text: "expired".to_string(),
+            image: None,
+            pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+            copied_at: Some(now - 400 * 86400),
+        }];
+        assert_eq!(expire_entries(&mut h, now, None), 0);
+        assert_eq!(h.len(), 1);
     }
 
     #[test]
@@ -5679,6 +5864,7 @@ mod tests {
             pinned: true,
             source_app: "Safari".to_string(),
             source_key: String::new(),
+            copied_at: None,
         };
         let restored = restore_loaded_entry(entry.clone()).expect("restore");
         let r_img = restored.image.as_ref().unwrap();
@@ -5699,6 +5885,7 @@ mod tests {
             pinned: false,
             source_app: String::new(),
             source_key: String::new(),
+            copied_at: None,
         };
         assert!(restore_loaded_entry(ghost_entry).is_none());
         // 文本条目原样返回 / a text entry passes through.
@@ -5708,6 +5895,7 @@ mod tests {
             pinned: false,
             source_app: String::new(),
             source_key: String::new(),
+            copied_at: None,
         };
         assert_eq!(restore_loaded_entry(text_entry.clone()), Some(text_entry));
         // 文件复制条目:预览从 {hash}.preview 恢复,data_path 恒空,来源路径保留。
@@ -5724,6 +5912,7 @@ mod tests {
             pinned: false,
             source_app: "Finder".to_string(),
             source_key: String::new(),
+            copied_at: None,
         };
         let restored_file = restore_loaded_entry(file_entry.clone()).expect("restore file");
         let rf_img = restored_file.image.as_ref().unwrap();
@@ -5745,6 +5934,7 @@ mod tests {
             pinned: false,
             source_app: String::new(),
             source_key: String::new(),
+            copied_at: None,
         };
         assert_eq!(restore_loaded_entry(degen_entry.clone()), Some(degen_entry));
     }
@@ -5981,6 +6171,7 @@ mod tests {
             pinned: true,
             source_app: String::new(),
             source_key: String::new(),
+            copied_at: None,
         };
         let file_entry = ClipEntry {
             text: "x.gif".to_string(),
@@ -5988,6 +6179,7 @@ mod tests {
             pinned: false,
             source_app: String::new(),
             source_key: String::new(),
+            copied_at: None,
         };
         let all = vec![file_entry, data_entry];
         assert!(hash_referenced_by(all.iter().filter(|e| e.pinned), hash));
@@ -6242,6 +6434,101 @@ mod tests {
         assert_eq!(texts(&h), vec!["B", "A"]);
         assert!(h[0].pinned);
         assert!(!h[1].pinned);
+    }
+
+    #[test]
+    fn expire_entries_respects_pin_ttl_and_legacy_entries() {
+        use super::expire_entries;
+        // 测试 helper:带指定时间戳的条目。/ An entry with an explicit timestamp.
+        let mut mk = |text: &str, pinned: bool, copied_at: Option<u64>| ClipEntry {
+            text: text.to_string(),
+            image: None,
+            pinned,
+            source_app: String::new(),
+            source_key: String::new(),
+            copied_at,
+        };
+        // ttl = None(关闭)→ 什么都不删。/ ttl None (off) -> nothing is removed.
+        let mut h = vec![mk("old", false, Some(1))];
+        assert_eq!(expire_entries(&mut h, 1_000_000, None), 0);
+        assert_eq!(h.len(), 1);
+        // 未到期 → 保留。/ Not yet expired -> kept.
+        let mut h = vec![mk("a", false, Some(90))];
+        assert_eq!(expire_entries(&mut h, 100, Some(30)), 0);
+        assert_eq!(h.len(), 1);
+        // 边界:now - copied_at == ttl → 删(>= 语义)。/ Boundary: == ttl -> expired (>=).
+        let mut h = vec![mk("a", false, Some(70))];
+        assert_eq!(expire_entries(&mut h, 100, Some(30)), 1);
+        assert!(h.is_empty());
+        // 到期非置顶 → 删;到期置顶 → 保留。/ Expired unpinned -> removed; pinned -> kept.
+        let mut h = vec![
+            mk("old-pinned", true, Some(1)),
+            mk("old-free", false, Some(1)),
+            mk("fresh", false, Some(99)),
+        ];
+        assert_eq!(expire_entries(&mut h, 100, Some(30)), 1);
+        assert_eq!(texts(&h), vec!["old-pinned", "fresh"]);
+        // 无时间戳(旧版本条目)→ 保留(保守迁移)。/ Legacy entries -> kept.
+        let mut h = vec![mk("legacy", false, None)];
+        assert_eq!(expire_entries(&mut h, 1_000_000, Some(30)), 0);
+        assert_eq!(h.len(), 1);
+        // 时间回拨(now < copied_at)→ 不过期(不溢出)。/ Clock rollback -> safe.
+        let mut h = vec![mk("future", false, Some(200))];
+        assert_eq!(expire_entries(&mut h, 100, Some(30)), 0);
+        assert_eq!(h.len(), 1);
+    }
+
+    #[test]
+    fn expire_entries_deletes_image_cache_only_when_unreferenced() {
+        use super::expire_entries;
+        let img = image(&b"expire-cache-test-bytes".to_vec());
+        // 图片条目过期 → 缓存文件(数据 + 预览)一并删除。
+        // An expired image entry takes its cache files (data + preview) with it.
+        let mut h = vec![ClipEntry {
+            text: String::new(),
+            image: Some(img.clone()),
+            pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+            copied_at: Some(1),
+        }];
+        assert!(super::cache_read_image(img.hash).is_some());
+        assert_eq!(expire_entries(&mut h, 100, Some(30)), 1);
+        assert!(h.is_empty());
+        assert!(
+            super::cache_read_image(img.hash).is_none(),
+            "expired image's cache must be swept"
+        );
+        // 同 hash 仍有幸存条目(置顶)→ 缓存保留。
+        // A pinned survivor sharing the hash keeps the cache files.
+        // 重新写缓存:上一场景已把它删掉(同 hash 的"已删除"证据)。
+        // Re-write the cache: the previous scenario deleted it (proof of the sweep).
+        let img = image(&b"expire-cache-test-bytes".to_vec());
+        let mut h = vec![
+            ClipEntry {
+                text: String::new(),
+                image: Some(img.clone()),
+                pinned: true, // 置顶幸存者 / pinned survivor
+                source_app: String::new(),
+                source_key: String::new(),
+                copied_at: Some(1),
+            },
+            ClipEntry {
+                text: String::new(),
+                image: Some(img.clone()),
+                pinned: false,
+                source_app: String::new(),
+                source_key: String::new(),
+                copied_at: Some(1),
+            },
+        ];
+        assert_eq!(expire_entries(&mut h, 100, Some(30)), 1);
+        assert_eq!(h.len(), 1);
+        assert!(h[0].pinned);
+        assert!(
+            super::cache_read_image(img.hash).is_some(),
+            "a pinned survivor keeps the shared cache"
+        );
     }
 
     #[test]

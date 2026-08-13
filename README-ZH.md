@@ -276,6 +276,7 @@ launch_at_login = false  # 开机自启(需以 .app 方式运行;macOS 13+)
 enabled = false          # 剪贴板历史总开关(默认关闭)
 max_entries = 50         # 历史最大条数(1..=100)
 persist = false          # 把历史保存到磁盘,重启不丢(隐私风险见下方说明)
+auto_expire_days = 30    # 非置顶条目超过 N 天自动过期(内存与磁盘同时生效);0 = 关闭
 ```
 
 > **剪贴板历史持久化与隐私** — 开启 `persist`(或设置里的"保存剪贴板历史记录"开关)会把
