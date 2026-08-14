@@ -28,12 +28,14 @@
 
 <p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="主界面"></p>
 
-<div style="display: flex; gap: 8px;">
-  <img src="docs/pictures/settings.png" style="flex: 1; width: 100%; min-width: 0;" alt="设置">
-  <img src="docs/pictures/mouse.png" style="flex: 1; width: 100%; min-width: 0;" alt="鼠标控制">
-  <img src="docs/pictures/clipboard.png" style="flex: 1; width: 100%; min-width: 0;" alt="剪贴板历史">
-  <img src="docs/pictures/experimental.png" style="flex: 1; width: 100%; min-width: 0;" alt="实验性功能">
-</div>
+<table style="border-collapse: collapse;">
+  <tr>
+    <td style="border: none; padding: 4px;"><img src="docs/pictures/settings.png" style="width: 100%;" alt="设置"></td>
+    <td style="border: none; padding: 4px;"><img src="docs/pictures/mouse.png" style="width: 100%;" alt="鼠标控制"></td>
+    <td style="border: none; padding: 4px;"><img src="docs/pictures/clipboard.png" style="width: 100%;" alt="剪贴板历史"></td>
+    <td style="border: none; padding: 4px;"><img src="docs/pictures/experimental.png" style="width: 100%;" alt="实验性功能"></td>
+  </tr>
+</table>
 
 ## 剪贴板历史
 
