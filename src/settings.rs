@@ -2300,11 +2300,21 @@ fn create_settings_window() {
         // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。
         // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
         // privacy implications are documented in the README).
+        // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。
+        // 中文标签"保存剪贴板历史记录到磁盘"(11 字)与英文 "Save clipboard history
+        // to disk" 都超出默认 label_w=150(渲染截断),该行加宽到 225——与
+        // show_minimized 行同款处理;开关仍右对齐到 popup 右缘,不重叠。
+        // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
+        // privacy implications are documented in the README). The Chinese (11 CJK
+        // chars) and English labels both exceed the default label_w=150 (rendered
+        // truncated), so this row widens its label to 225 -- same as the
+        // show_minimized row; the switch still right-aligns to the popups' right
+        // edge, no overlap.
         ui.clipboard_persist = add_row(
             clipboard_view,
             label_x,
             cy,
-            label_w,
+            225.0,
             row_h,
             &t("settings.row_clipboard_persist"),
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
