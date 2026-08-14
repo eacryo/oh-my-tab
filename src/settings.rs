@@ -2312,11 +2312,16 @@ fn create_settings_window() {
         // 16pt, too cramped.
         cy -= 18.0 + 8.0 + row_h;
         // 启用开关 / master switch.
+        // 启用开关 / master switch.
+        // 英文 "Enable clipboard history"(实测 146pt)+ cell 内边距在 label_w=150 边缘,
+        // 与 persist/move_used_to_top 行一起加宽到 225(见下方注释)。
+        // English "Enable clipboard history" (measured 146pt) plus cell padding sits on
+        // the label_w=150 edge; widen to 225 along with the persist/move_used_to_top rows.
         ui.clipboard_enabled = add_row(
             clipboard_view,
             label_x,
             cy,
-            label_w,
+            225.0,
             row_h,
             &t("settings.row_clipboard_enabled"),
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
@@ -2359,11 +2364,16 @@ fn create_settings_window() {
         // 使用后移到最前(粘贴是否重排历史;默认开 = 保持现状)。
         // Move used entries to the top (whether pasting reorders the history; on by
         // default = current behavior).
+        // 英文 "Move used entries to top"(实测 150.3pt)超出 label_w=150 渲染截断
+        // (用户切英文后看到 "move used entries to"),加宽到 225。
+        // English "Move used entries to top" (measured 150.3pt) exceeds label_w=150 and
+        // rendered truncated ("move used entries to" after switching to English), widened
+        // to 225.
         ui.clipboard_move_used_to_top = add_row(
             clipboard_view,
             label_x,
             cy,
-            label_w,
+            225.0,
             row_h,
             &t("settings.row_clipboard_move_used_to_top"),
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
