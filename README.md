@@ -26,11 +26,14 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 
 ## Screenshots
 
-![Main window](docs/pictures/main_window.png)
+<p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="Main window"></p>
 
-![Settings](docs/pictures/settings.png)
-
-![Mouse control](docs/pictures/mouse_control.png)
+<div style="display: flex; gap: 8px;">
+  <img src="docs/pictures/settings.png" style="flex: 1; width: 100%; min-width: 0;" alt="Settings">
+  <img src="docs/pictures/mouse.png" style="flex: 1; width: 100%; min-width: 0;" alt="Mouse control">
+  <img src="docs/pictures/clipboard.png" style="flex: 1; width: 100%; min-width: 0;" alt="Clipboard history">
+  <img src="docs/pictures/experimental.png" style="flex: 1; width: 100%; min-width: 0;" alt="Experimental settings">
+</div>
 
 ## Clipboard history
 

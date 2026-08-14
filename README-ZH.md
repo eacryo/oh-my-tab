@@ -26,11 +26,14 @@
 
 ## 截图
 
-![主界面](docs/pictures/main_window.png)
+<p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="主界面"></p>
 
-![设置](docs/pictures/settings.png)
-
-![鼠标控制](docs/pictures/mouse_control.png)
+<div style="display: flex; gap: 8px;">
+  <img src="docs/pictures/settings.png" style="flex: 1; width: 100%; min-width: 0;" alt="设置">
+  <img src="docs/pictures/mouse.png" style="flex: 1; width: 100%; min-width: 0;" alt="鼠标控制">
+  <img src="docs/pictures/clipboard.png" style="flex: 1; width: 100%; min-width: 0;" alt="剪贴板历史">
+  <img src="docs/pictures/experimental.png" style="flex: 1; width: 100%; min-width: 0;" alt="实验性功能">
+</div>
 
 ## 剪贴板历史
 
