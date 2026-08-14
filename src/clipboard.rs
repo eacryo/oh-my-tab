@@ -162,8 +162,9 @@ const BODY_GAP: f64 = 2.0;
 /// Body horizontal padding: the text shouldn't hug the card's edge (the card starts at
 /// PAD_X; the text is inset by another BODY_PAD_X on each side).
 const BODY_PAD_X: f64 = 6.0;
-/// 标题栏图标与标题文字的间距 / the header icon-to-title gap.
-const HEADER_ICON_GAP: f64 = 4.0;
+/// 标题栏图标与标题文字的间距(试调值:4pt 偏宽,收窄到 2pt 更紧凑)。
+/// The header icon-to-title gap (tuned: 4pt was too wide, 2pt is tighter).
+const HEADER_ICON_GAP: f64 = 2.0;
 /// 行内图标按钮(图钉/删除)的着色:比系统 labelColor 稍深,浅色界面上更清晰。
 /// Tint for the per-row icon buttons (pin/delete): slightly darker than the system
 /// labelColor for legibility on light glass.
@@ -491,7 +492,9 @@ fn header_title(entry: &ClipEntry, show_source: bool) -> String {
         // 旧条目(无时间戳)不显示时间。
         // Legacy entries (no timestamp) show no time.
         Some(ts) => format!(
-            "{} {}",
+            // 两个空格:名称与"复制于:"之间留出呼吸感(单空格贴太近)。
+            // Two spaces: breathing room between the app name and "Copied at:".
+            "{}  {}",
             name,
             tf("clipboard.copied_at", &[("time", &format_copied_at(ts))])
         ),
