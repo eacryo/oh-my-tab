@@ -58,6 +58,7 @@ struct SettingsUi {
     modifier: *mut AnyObject,         // NSPopUpButton: option / command
     locale: *mut AnyObject,           // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject,   // NSSwitch: 显示最小化窗口 / show minimized windows
+    windows_enabled: *mut AnyObject,  // NSSwitch: 窗口切换总开关 / app-switcher master switch
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
     log_level: *mut AnyObject,        // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject,  // NSSwitch: 开机自启 / launch at login
@@ -417,6 +418,13 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
         let old_cfg = CONFIG.read().unwrap();
         old_cfg.mouse.enabled != cfg.mouse.enabled
     };
+
+    // 窗口切换开关被关闭:收起可能正开着的浮窗并复位状态,避免残留。
+    // The switcher switch was turned off: dismiss a possibly-open overlay and reset
+    // the state, so nothing stale lingers.
+    if !cfg.windows.enabled {
+        crate::overlay::reset_switcher();
+    }
 
     if let Err(e) = cfg.save() {
         show_alert(&t("alert.save_failed_title"), &e);
@@ -1010,8 +1018,10 @@ fn load_settings_from(cfg: &Config) {
             .map(|i| i as isize)
             .unwrap_or(0);
         let _: () = msg_send![ui.locale, selectItemAtIndex: loc_idx];
-        // show_minimized:switch state(1=on / 0=off)。
-        // show_minimized: switch state (1=on / 0=off).
+        // windows_enabled / show_minimized:switch state(1=on / 0=off)。
+        // windows_enabled / show_minimized: switch state (1=on / 0=off).
+        let we_state = if cfg.windows.enabled { 1isize } else { 0isize };
+        let _: () = msg_send![ui.windows_enabled, setState: we_state];
         let sm_state = if cfg.windows.show_minimized {
             1isize
         } else {
@@ -1199,8 +1209,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             .get(loc_idx as usize)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "auto".into());
-        // show_minimized:switch state(1=on / 0=off)。
-        // show_minimized: switch state (1=on / 0=off).
+        // windows_enabled / show_minimized:switch state(1=on / 0=off)。
+        // windows_enabled / show_minimized: switch state (1=on / 0=off).
+        let we_state: isize = msg_send![ui.windows_enabled, state];
+        cfg.windows.enabled = we_state == 1;
         let sm_state: isize = msg_send![ui.show_minimized, state];
         cfg.windows.show_minimized = sm_state == 1;
         // overlay_position:下拉框 index 0 = 跟随激活窗口, 1 = 主屏幕。
@@ -1586,6 +1598,7 @@ fn create_settings_window() {
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
             show_minimized: std::ptr::null_mut(),
+            windows_enabled: std::ptr::null_mut(),
             overlay_position: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
@@ -1951,6 +1964,18 @@ fn create_settings_window() {
             12.0,
             y,
             content_w - 24.0,
+        );
+        y -= 8.0 + row_h;
+        // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器接管)。
+        // App-switcher master switch: off = Cmd+Tab passes through to the system.
+        ui.windows_enabled = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_windows_enabled"),
+            make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
         y -= 8.0 + row_h;
         // show_minimized 开关(切换器语义本就只有显/隐两态,用 Toggle 比下拉更直观)。

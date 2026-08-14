@@ -73,6 +73,19 @@ unsafe extern "C" fn event_tap_callback(
                     K_CG_EVENT_FLAG_MASK_ALTERNATE
                 };
                 if (flags & mod_mask) != 0 {
+                    // 窗口切换总开关:关闭时透传给系统(原生 Cmd+Tab 接管),不吞、不发。
+                    // 与 Option+V 的 passthrough 同哲学:功能关闭 = 把组合键还给系统/其他应用。
+                    // Master switch: when off, pass the event through (the native Cmd+Tab
+                    // takes over) -- no swallow, no event. Same philosophy as the Option+V
+                    // passthrough: a disabled feature returns the combo to the system.
+                    if !crate::config::CONFIG
+                        .read()
+                        .map(|c| c.windows.enabled)
+                        .unwrap_or(true)
+                    {
+                        log_debug!("[kbd] Tab+Command passthrough (switcher disabled)");
+                        return event;
+                    }
                     // 召唤组合:只打组合名(不敏感),不打键码/修饰位细节。
                     // The summon combo: log only the combo name (not sensitive), never raw keycode/flags.
                     let combo = if is_cmd { "Tab+Command" } else { "Tab+Option" };

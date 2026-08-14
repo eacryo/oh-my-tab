@@ -490,6 +490,17 @@ pub(crate) fn hide_overlay() {
     // the switcher only collects it as a card and raises the target window.
 }
 
+/// 关闭窗口切换开关时调用:收起浮窗(orderOut)并复位 TAB_STATE.visible,
+/// 避免残留状态导致下次开启后误触发。
+/// Called when the switcher master switch is turned off: dismiss the overlay (orderOut)
+/// and reset TAB_STATE.visible, so no stale state trips the next re-enable.
+pub(crate) fn reset_switcher() {
+    hide_overlay();
+    if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
+        state.visible = false;
+    }
+}
+
 /// 视觉隐藏浮窗但**不 orderOut**(窗口保持 ordered)。
 /// 切换窗口时不能先 orderOut 再激活目标:面板 orderOut 后 WindowServer 可能把焦点路由到
 /// 错误窗口,导致目标窗口的 key-window / first-responder 未被正确确立(光标停止闪烁等)。

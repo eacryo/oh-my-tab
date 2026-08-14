@@ -86,6 +86,11 @@ pub struct I18nSection {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WindowsSection {
+    // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器恢复),tap 不再拦截。
+    // 默认 true(保持历史行为)。
+    // Master switch for the app switcher: when off, Cmd+Tab passes through to the system
+    // (the native switcher takes over) and the tap stops intercepting. Defaults to true.
+    pub enabled: bool,
     // 默认 false(不显示最小化窗口,与历史行为一致);bool::default() 即 false,故 Default 可直接派生。
     // Defaults to false (hide minimized windows, matching prior behavior); bool::default() is
     // false, so Default can be derived directly.
@@ -100,6 +105,7 @@ pub struct WindowsSection {
 impl Default for WindowsSection {
     fn default() -> Self {
         Self {
+            enabled: true,
             show_minimized: false,
             overlay_position: "active_window".to_string(),
         }
@@ -1351,6 +1357,8 @@ mod tests {
         cfg.keyboard.modifier = "option".into();
         cfg.i18n.locale = "zh-Hans".into();
         cfg.windows.overlay_position = "main".into();
+        cfg.windows.show_minimized = true;
+        cfg.windows.enabled = false; // 非默认值:验证 roundtrip / non-default: verify the roundtrip
         cfg.mouse.enabled = true;
         cfg.mouse.profiles = vec![
             MouseProfile {
@@ -1383,6 +1391,8 @@ mod tests {
         assert_eq!(loaded.keyboard.modifier, "option");
         assert_eq!(loaded.i18n.locale, "zh-Hans");
         assert_eq!(loaded.windows.overlay_position, "main");
+        assert!(loaded.windows.show_minimized);
+        assert!(!loaded.windows.enabled);
         // mouse profiles 原样保留(通配档 + per-device 档各一条)。
         // Mouse profiles survive untouched (one wildcard + one per-device).
         assert!(loaded.mouse.enabled);

@@ -265,6 +265,7 @@ modifier = "command"     # "option"(Option+Tab)| "command"(Cmd+Tab)
 locale = "auto"          # "auto" | "en" | "zh-Hans" | "zh-Hant"
 
 [windows]
+enabled = true            # 应用切换总开关(关闭后 Cmd+Tab 透传给系统原生切换器)
 show_minimized = false   # 在浮层中显示最小化窗口
 
 [logging]

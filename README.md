@@ -264,6 +264,7 @@ modifier = "command"     # "option" (Option+Tab) | "command" (Cmd+Tab)
 locale = "auto"          # "auto" | "en" | "zh-Hans" | "zh-Hant"
 
 [windows]
+enabled = true            # app-switcher master switch (off = Cmd+Tab passes through to the system)
 show_minimized = false   # show minimized windows in the overlay
 
 [logging]
