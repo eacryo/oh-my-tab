@@ -1,30 +1,36 @@
 <p align="center">
-  <img src="assets/Icon-512x512.png" width="256" height="256" alt="oh-my-tab icon">
+  <img src="assets/Icon-512x512.png" width="120" height="120" alt="oh-my-tab">
 </p>
 
-<p align="center"><strong>oh-my-tab</strong></p>
+<p align="center"><b>oh-my-tab</b>&nbsp;&nbsp;—&nbsp;&nbsp;macOS app switcher, clipboard history &amp; mouse control — in pure Rust</p>
+
+<p align="center">
+  <a href="https://github.com/eacryo/oh-my-tab/releases"><img src="https://img.shields.io/github/v/release/eacryo/oh-my-tab?style=for-the-badge" alt="GitHub release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="MIT License"></a>
+  <a href="https://github.com/eacryo/oh-my-tab"><img src="https://img.shields.io/badge/platform-macOS-black?style=for-the-badge" alt="macOS"></a>
+</p>
 
 > [简体中文](README-ZH.md) | English
+
+<br />
 
 A macOS window switcher — an alternative to the system Cmd+Tab. It runs as a **menu-bar accessory** app (no Dock icon), intercepts a global shortcut (**Command+Tab** by default, toggleable to Option+Tab), shows a floating **Liquid Glass** overlay of cards for currently-open windows, and raises the selected window on release using the Accessibility (AX) API.
 
 It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly through `objc2` FFI — there is no Swift bridge and no Rust UI framework.
 
-## Features
+- <img height="14" src="docs/icons/stack.svg"> Enhances the native switcher — shows app names and window titles, with one card per window.
+- <img height="14" src="docs/icons/key.svg"> Navigate with Tab, arrow keys, or the mouse after pressing Command/Option.
+- <img height="14" src="docs/icons/zap.svg"> Pure Rust on macOS APIs — a 1.5 MB binary, ~35 MB memory. No Electron, no Tauri.
+- <img height="14" src="docs/icons/star.svg"> Floating Liquid Glass overlay (macOS 26).
+- <img height="14" src="docs/icons/history.svg"> **Window-level** MRU ordering — switching to one window never drags the app's other windows forward.
+- <img height="14" src="docs/icons/eye.svg"> Lists **every real window** — off-screen dialogs and other-Space windows included; minimized windows can be shown or hidden.
+- <img height="14" src="docs/icons/gear.svg"> TOML configuration, validated and **hot-reloadable** from the menu.
+- <img height="14" src="docs/icons/globe.svg"> Zero-dependency i18n (English / Simplified / Traditional Chinese) with live system-language follow.
+- <img height="14" src="docs/icons/note.svg"> Per-launch log files with automatic 30-day retention (see [Logging](#logging)).
+- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes / reversal, pointer acceleration — configurable **per device** (see [Configuration](#configuration)).
+- <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images and file copies with search, pin, delete, auto-expiry and optional persistence (see [Clipboard history](#clipboard-history)).
 
-- Enhances the native window switcher: shows the app name and window title (shown as '-' when untitled); when an app has multiple windows open, they appear as separate cards in the switcher.
-- After pressing Command or Option, navigate the selected window with Tab, arrow keys, or the mouse.
-- Pure Rust calling macOS APIs directly — no Electron, no Tauri — resulting in a 1.5 MB binary and 35 MB memory footprint.
-- Floating Liquid Glass overlay (tested only on macOS 26; lower versions not guaranteed to work).
-- **Window-level** MRU ordering — each window is tracked independently by `(pid, CGWindowID)`, so switching to one window of an app doesn't drag the app's other windows forward.
-- The switcher lists **every real window**, including off-screen ones — apps that hide a dialog when another window is activated (e.g. JetBrains hides its Settings window when the main window is activated) and windows on other Spaces — so a window never vanishes from the list while it exists. Minimized windows are shown or hidden by a toggle (greyed out when shown).
-- TOML configuration, validated and **hot-reloadable** from the menu.
-- Handcrafted, zero-dependency i18n (English, Simplified Chinese, Traditional Chinese) with automatic locale detection and live system-language follow.
-- Per-launch log files with automatic 30-day retention (see [Logging](#logging)).
-- **Mouse control** (optional, off by default): scroll reversal, scroll modes (Default / Line with a per-tick line count), and disabling pointer acceleration — all configurable **per mouse device** (see [Configuration](#configuration)). This feature is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse), re-implemented from scratch in pure Rust (see [Credits](#credits)).
-- **Clipboard history** (optional, off by default): summon with **Option+V**; records text and images with global dedup (re-copying an entry moves it to the front), per-entry pinning, per-entry delete (Backspace icon / key), and clear-all (keeps pinned entries). **← pins/unpins the selected entry and → opens a detail panel** (full text / large image, see [Clipboard history](#clipboard-history)). Images paste back in their **original format** (JPG → JPG, animated GIF → GIF, never a PNG re-encode) — the original bytes live in a disk cache so big images never sit in RAM; **file copies keep the reference semantics** of Windows Win+V / Maccy (pasting restores the file so Finder duplicates it as-is), with the file read once at copy time only to build a thumbnail and a content-dedup key — its bytes are never stored, and a file plus its Finder duplicate (same content, different paths) collapse into one entry. The picker follows the cursor. Supported image formats — as **image data**: PNG, JPEG, GIF (animation preserved), WebP, HEIC, BMP, TIFF; as **file copies** (reference-only): `.png`, `.jpg/.jpeg`, `.gif`, `.tiff/.tif`, `.webp`, `.heic/.heif`, `.bmp`. An optional **"Save clipboard history"** switch persists the history to disk so it survives restarts — off by default, with a plaintext-storage privacy warning (see [Configuration](#configuration)); content stamped as transient/concealed by password managers is never recorded.
-
-## Screenshots
+## <img height="16" src="docs/icons/image.svg">&nbsp;&nbsp;Screenshots
 
 <p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="Main window"></p>
 
@@ -37,7 +43,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
   </tr>
 </table>
 
-## Clipboard history
+## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;Clipboard history
 
 Optional (off by default). Summon with **Option+V**, navigate with the arrow keys / Enter / Esc / Backspace, or click; clicking outside closes it. Extra keys: **← pins/unpins** the selected entry; **→ opens a detail panel** beside the picker showing the full untruncated text or a large image preview (it follows ↑/↓ browsing live; Esc, ←, →, or a click on it closes it). The history records **three kinds of entries**:
 
@@ -60,7 +66,7 @@ The picker's "Clear all" keeps pinned entries; per-entry delete (Backspace), aut
 
 **Cache locations**: image entries keep their original-format bytes and previews under `~/Library/Caches/oh-my-tab-clip-images/` — the original bytes as `{hash:016x}` (no extension), the downsampled thumbnail as `{hash:016x}.preview`, and the lazily generated detail-panel large preview as `{hash:016x}.detail` (all keyed by the content hash). File-copy entries store **no bytes** (reference-only, a pasted file is read from its original path). The cache directory is wiped at startup unless persistence is on; cache files are deleted in sync with per-entry delete / clear-all / auto-expiry / the entry-cap trim. With **"Save clipboard history"** on, the history itself lives at `~/.config/oh-my-tab/clipboard-history.toml` (mode 600, plaintext — see the privacy note under [Configuration](#configuration)).
 
-## Known Issues
+## <img height="16" src="docs/icons/alert.svg">&nbsp;&nbsp;Known Issues
 
 **Closing a window brings the same app's other window forward (macOS-native)**: closing the frontmost window of the active app makes macOS activate the app's remaining window — e.g. closing a Chrome incognito window brings the regular Chrome window to the front. oh-my-tab receives no event at that moment and does nothing; the next summon merely reflects the real frontmost window. This is identical to the behavior of the system Cmd+Tab.
 
@@ -75,12 +81,12 @@ If windows are already open when the app starts, their ordering differs from the
 
 **Mouse control may fail when launched under a debugger**: when the app is started in Debug mode via RustRover (or another debugger), frequent mouse usage (scrolling / clicking) right after launch can cause mouse control features (reverse scrolling, per-device settings) to stop working — the app stops receiving mouse events, scrolling reverts to the system direction, and pointer acceleration settings stop applying, until the app is restarted. Launching the packaged `.app` or running the binary directly from a terminal is unaffected; this only affects unsigned dev builds started under a debugger (a macOS 26 restriction on HID-level event listening for debugger-launched processes).
 
-## Requirements
+## <img height="16" src="docs/icons/tools.svg">&nbsp;&nbsp;Requirements
 
 - macOS (developed on macOS 26; older versions supported via the `NSVisualEffectView` fallback, but availability is not guaranteed).
 - **Accessibility** permission granted to the app.
 
-## Install via Homebrew
+## <img height="16" src="docs/icons/download.svg">&nbsp;&nbsp;Install via Homebrew
 
 If you just want to use the app (no need to build from source), install the prebuilt release via Homebrew Cask:
 
@@ -93,7 +99,7 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 - Update: `brew upgrade --cask oh-my-tab`
 - Uninstall: `brew uninstall --cask oh-my-tab`
 
-## Build & run
+## <img height="16" src="docs/icons/terminal.svg">&nbsp;&nbsp;Build & run
 
 **Prerequisites:** Rust stable toolchain, Xcode Command Line Tools (`xcode-select --install`), macOS 13+. Accessibility permission is required at runtime (see Permissions below).
 
@@ -159,7 +165,7 @@ After step 4, `brew install --cask eacryo/tap/oh-my-tab` (or `brew upgrade --cas
 
 `brew install --cask` actually reads the committed copy in the tap repo: [`Casks/oh-my-tab.rb`](https://github.com/eacryo/homebrew-tap/blob/main/Casks/oh-my-tab.rb) in `eacryo/homebrew-tap`. `release.sh` only regenerates it locally so you can copy the new version over.
 
-## App icon
+## <img height="16" src="docs/icons/package.svg">&nbsp;&nbsp;App icon
 
 The app icon (`AppIcon.icns`) is generated from `assets/Icon-Default-1024x1024@1x.png` and bundled into `Contents/Resources/`. The committed `assets/AppIcon.icns` is used directly by `bundle.sh`, so contributors need no extra tooling to build the `.app`.
 
@@ -173,14 +179,14 @@ Requires `iconutil` (Xcode CLT); `sips` ships with macOS. Then commit the regene
 
 If `assets/AppIcon.icon` (a directory) is present, `bundle.sh` also bundles it into `Contents/Resources/` for the macOS 26+ Liquid Glass icon format, which macOS prefers over `.icns`.
 
-## Permissions & runtime caveats
+## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;Permissions & runtime caveats
 
 - The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary must be re-granted -- unless you sign with a stable identity (see [Code signing](#code-signing)), in which case the grant persists across rebuilds.
 - If the event tap fails to create, the app prints an error and the shortcut silently does nothing — almost always a missing Accessibility grant.
 - Runtime config: `~/.config/oh-my-tab/config.toml` (auto-created with defaults on first run).
 - Icon cache: `~/Library/Caches/oh-my-tab-icons/{bundle-id}.png` (keyed by bundle id, with a `.meta` mtime sidecar).
 
-## Architecture
+## <img height="16" src="docs/icons/graph.svg">&nbsp;&nbsp;Architecture
 
 The codebase is organised into focused modules. The tricky parts span several files, so the breakdown below is load-bearing.
 
@@ -216,7 +222,7 @@ Shared state lives in global `static`s guarded by `Mutex` / `RwLock`: `TAB_STATE
 - **macOS version split**: macOS 26+ renders with `NSGlassEffectView` (Liquid Glass); older macOS falls back to `NSVisualEffectView` (withinWindow + Dark).
 - **Some calls use raw `objc_msgSend` FFI** because `objc2`'s `msg_send!` can't encode CF/CG types or void returns.
 
-## Configuration
+## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;Configuration
 
 `~/.config/oh-my-tab/config.toml` — auto-created with defaults on first run. Loading is **per-field resilient**, not all-or-nothing: invalid fields fall back to defaults (logged, never fatal). Reloadable at runtime via the menu (*Reload Config*), which also re-applies theme and refreshes the overlay.
 
@@ -329,7 +335,7 @@ line_count = 3
 
 Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). Toggling `mouse.enabled` takes effect immediately — the mouse event tap is hot-switched on OK, no app restart needed.
 
-## Logging
+## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 
 Logging is asynchronous and designed to **never block the UI / event loop**.
 
@@ -352,14 +358,14 @@ When `file_path` is set (non-empty), the logger uses that path **verbatim**, in 
 
 The app deliberately **never writes extra files into, and never deletes any files from, a user-specified location.** If you point `file_path` at your own file or directory, you own its rotation and retention — the 30-day auto-cleanup applies *only* to the default `~/Library/Logs/oh-my-tab/` directory. This keeps the logger from surprising you by creating or deleting files in a location you explicitly chose to control.
 
-## Internationalization
+## <img height="16" src="docs/icons/globe.svg">&nbsp;&nbsp;Internationalization
 
 - Handcrafted TOML, zero dependencies, embedded at compile time via `include_str!` from `locales/{en,zh-Hans,zh-Hant}.toml` (no runtime file IO, no missing-file risk).
 - Driven by `config.i18n.locale`: `"auto"` (default) | `"en"` | `"zh-Hans"` | `"zh-Hant"`. `"auto"` resolves from the system `NSLocale` preferred languages (scanned in order).
 - **Hot-reload**: menu and settings re-title on config reload, and on system language change when `locale` is `auto`.
 - **Adding a language**: create `locales/xx.toml` (same keys), register it in `i18n::locale_raw()`, add it to the `validate()` allow-list in `config.rs`, and extend `map_tag_to_supported()` if `auto` should map a system tag to it.
 
-## Icon cache
+## <img height="16" src="docs/icons/database.svg">&nbsp;&nbsp;Icon cache
 
 `~/Library/Caches/oh-my-tab-icons/` — keyed by the app's **bundle identifier** (e.g. `com.microsoft.edgemac`), not by PID. Each app is stored as a pair of files:
 
@@ -372,16 +378,16 @@ Keying by bundle id means **PID recycling can never serve another app's stale ic
 
 Icons are pre-cached at startup and on `NSWorkspaceDidLaunchApplicationNotification`. The cache can be cleared from the menu (*Clear Icon Cache*).
 
-## Credits
+## <img height="16" src="docs/icons/heart.svg">&nbsp;&nbsp;Credits
 
 The **mouse control** feature (scroll reversal, scroll modes, per-device configuration, and pointer-acceleration control) is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse). We re-implemented its core features from scratch in pure Rust (via `objc2` FFI, no Swift bridge) and integrated them into oh-my-tab's configuration model. Many thanks to the original author and the LinearMouse project for the excellent work.
 
 The **window switcher** (overlay design, card-based selection, Liquid Glass styling) draws inspiration from [BetterCmdTab](https://github.com/rokartur/BetterCmdTab). We re-implemented the ideas from scratch in pure Rust (via `objc2` FFI, no Swift bridge). Many thanks to the author for the excellent work.
 
-## Repository
+## <img height="16" src="docs/icons/repo.svg">&nbsp;&nbsp;Repository
 
 https://github.com/eacryo/oh-my-tab
 
-## License
+## <img height="16" src="docs/icons/law.svg">&nbsp;&nbsp;License
 
 This project is open-sourced under the [MIT License](LICENSE).

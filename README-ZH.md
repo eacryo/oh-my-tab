@@ -1,30 +1,36 @@
 <p align="center">
-  <img src="assets/Icon-512x512.png" width="256" height="256" alt="oh-my-tab 图标">
+  <img src="assets/Icon-512x512.png" width="120" height="120" alt="oh-my-tab">
 </p>
 
-<p align="center"><strong>oh-my-tab</strong></p>
+<p align="center"><b>oh-my-tab</b>&nbsp;&nbsp;—&nbsp;&nbsp;纯 Rust 的 macOS 应用切换器、剪贴板历史与鼠标控制</p>
+
+<p align="center">
+  <a href="https://github.com/eacryo/oh-my-tab/releases"><img src="https://img.shields.io/github/v/release/eacryo/oh-my-tab?style=for-the-badge" alt="GitHub release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="MIT License"></a>
+  <a href="https://github.com/eacryo/oh-my-tab"><img src="https://img.shields.io/badge/platform-macOS-black?style=for-the-badge" alt="macOS"></a>
+</p>
 
 > 简体中文 | [English](README.md)
+
+<br />
 
 一个 macOS 窗口切换器 -- 系统 Cmd+Tab 的替代品。它以**菜单栏辅助应用**方式运行(无 Dock 图标),拦截全局快捷键(默认 **Command+Tab**,可切换为 Option+Tab),弹出一个 **Liquid Glass** 风格的浮层,以卡片形式展示当前打开的窗口,松开快捷键时通过辅助功能(Accessibility,AX)API 把选中的窗口抬到最前。
 
 它是纯 Rust 通过 `objc2` FFI 直接调用 AppKit / CoreGraphics / ApplicationServices -- 没有 Swift 桥接,也没有 Rust UI 框架。
 
-## 功能特性
+- <img height="14" src="docs/icons/stack.svg"> 增强原生切换器——显示应用名与窗口标题,同一应用的多个窗口分列卡片。
+- <img height="14" src="docs/icons/key.svg"> 按下 Command/Option 后,可用 Tab、方向键或鼠标选择窗口。
+- <img height="14" src="docs/icons/zap.svg"> 纯 Rust 直调 macOS API——1.5MB 体积、约 35MB 内存,无 Electron/Tauri。
+- <img height="14" src="docs/icons/star.svg"> Liquid Glass 浮层(仅 macOS 26)。
+- <img height="14" src="docs/icons/history.svg"> **窗口级** MRU 排序——切到某个窗口不会把该应用的其他窗口一起带前。
+- <img height="14" src="docs/icons/eye.svg"> 列出**所有真实窗口**——含离屏对话框与其他 Space 的窗口;最小化窗口可显可隐。
+- <img height="14" src="docs/icons/gear.svg"> TOML 配置,校验后可从菜单**热重载**。
+- <img height="14" src="docs/icons/globe.svg"> 零依赖国际化(英文/简中/繁中),自动检测并实时跟随系统语言。
+- <img height="14" src="docs/icons/note.svg"> 每次启动一个日志文件,自动保留 30 天(见[日志](#日志))。
+- <img height="14" src="docs/icons/sliders.svg"> **鼠标控制**(可选):滚动模式/反向、指针加速——**按设备分别配置**(见[配置](#配置))。
+- <img height="14" src="docs/icons/copy.svg"> **剪贴板历史**(可选):文本/图片/文件复制,支持搜索、置顶、删除、自动过期与可选持久化(见[剪贴板历史](#剪贴板历史))。
 
-- 对于系统原生窗口切换的增强，可以显示应用名称和窗口标题（无标题时使用-显示）同一个应用打开多个窗口时，可以分列在窗口切换界面
-- 按下Command或Option后，可以通过Tab键以及上下左右方向键和鼠标指针移动选中窗口
-- 纯Rust调用MacOS api，没有Electron，没有Tauri，带来了仅1.5MB的体积大小和35MB的内存占用
-- 浮层 Liquid Glass 效果，因此只在MacOS 26上测试过，更低版本不保证可用性。
-- **窗口级** MRU 排序 -- 每个窗口按 `(pid, CGWindowID)` 独立追踪,切到某 App 的一个窗口时不会把该 App 的其它窗口一起带到前面。
-- 切换器列出**所有真实窗口**——包括离屏窗口(应用在激活其他窗口时隐藏的对话框,如 JetBrains 隐藏设置窗口,以及其它 Space 上的窗口),窗口只要存在就不会从列表中消失。最小化窗口由开关控制显示/隐藏(显示时置灰图标)。
-- TOML 配置,校验后可从菜单**热重载**。
-- 手写、零依赖的国际化(英文、简体中文、繁体中文),自动检测系统语言并实时跟随。
-- 每次启动一个日志文件,自动保留 30 天(见[日志](#日志))。
-- **鼠标控制**(可选,默认关闭):反向滚动、滚动模式(默认 / 按行(每 tick 行数))、禁用指针加速 -- 且**按鼠标设备分别配置**(见[配置](#配置))。此功能参考并借鉴了 [LinearMouse](https://github.com/linearmouse/linearmouse),用纯 Rust 从零重写实现(见[致谢](#致谢))。
-- **剪贴板历史**(可选,默认关闭):**Option+V** 呼出;记录文本与图片,全局去重(再次复制自动提到最前)、置顶常用条目、单条删除(Backspace 图标/按键)、清除全部(保留置顶)。**← 置顶/取消置顶选中条目,→ 展开详情面板**(完整文本/图片大图,见[剪贴板历史](#剪贴板历史))。图片按**原始格式**粘贴(JPG 粘回 JPG、GIF 动图粘回动图,绝不重编码成 PNG)——原始字节存磁盘缓存,大图不占内存;**文件复制保留引用语义**(同 Windows Win+V / Maccy:粘贴恢复文件,Finder 原样复制),复制时只读一次文件用于生成缩略图与内容去重键——字节从不落盘,原文件与访达副本(同内容不同路径)合并为一条;浮窗跟随光标显示。支持的图片格式——**图片数据**:PNG、JPEG、GIF(动图保留)、WebP、HEIC、BMP、TIFF;**文件复制**(仅引用):`.png`、`.jpg/.jpeg`、`.gif`、`.tiff/.tif`、`.webp`、`.heic/.heif`、`.bmp`。可选**"保存剪贴板历史记录"**开关把历史持久化到磁盘、重启不丢——默认关闭,且带有明文存储的隐私警示(见[配置](#配置));密码管理器标记为临时/机密的剪贴板内容不会被记录。
-
-## 截图
+## <img height="16" src="docs/icons/image.svg">&nbsp;&nbsp;截图
 
 <p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="主界面"></p>
 
@@ -37,7 +43,7 @@
   </tr>
 </table>
 
-## 剪贴板历史
+## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;剪贴板历史
 
 可选功能(默认关闭)。**Option+V** 呼出,方向键 / Enter / Esc / Backspace 或点击操作,点击外部关闭。附加按键:**← 置顶/取消置顶**选中条目;**→ 在主浮窗旁展开详情面板**——完整未截断的文本或图片大图(跟随 ↑/↓ 浏览实时切换;Esc、←、→ 或点击面板关闭)。历史记录**三种条目**:
 
@@ -60,7 +66,7 @@
 
 **缓存位置**:图片条目把原始格式字节与预览存放在 `~/Library/Caches/oh-my-tab-clip-images/` —— 原始字节为 `{hash:016x}`(无扩展名),降采样缩略图为 `{hash:016x}.preview`,详情面板的懒生成大图为 `{hash:016x}.detail`(均按内容哈希命名)。文件复制条目**不存任何字节**(纯引用,粘贴时从原路径读取)。持久化关闭时该目录在启动时清空;缓存文件随单条删除 / 清除全部 / 自动过期 / 超上限裁剪同步清理。开启**"保存剪贴板历史记录"**后,历史本身存放在 `~/.config/oh-my-tab/clipboard-history.toml`(权限 600,明文——隐私风险见[配置](#配置)中的说明)。
 
-## 已知问题
+## <img height="16" src="docs/icons/alert.svg">&nbsp;&nbsp;已知问题
 
 **关闭窗口后,同一应用的其它窗口会跳到前面(macOS 原生行为)**:关闭前台应用的最前窗口时,系统会自动激活该应用的剩余窗口——例如关掉 Chrome 无痕窗口后,普通 Chrome 窗口会跳到前面。这不是 oh-my-tab 的行为:那一刻应用收不到任何事件、也没有任何操作,下次呼出只是如实反映当前真正的前台窗口。与系统 Cmd+Tab 的行为完全一致。
 
@@ -76,12 +82,12 @@
 
 **Debug 模式下鼠标控制可能失效**：通过 RustRover(或其他调试器)以 Debug 方式启动应用时,若在启动阶段频繁操作鼠标(滚动/点击),鼠标控制功能(反向滚动、按设备配置等)可能会失效——应用不再收到鼠标事件,滚动方向恢复为系统默认、指针加速设置停止生效,直到重启应用。直接启动打包的 `.app` 或在终端中直接运行二进制不受影响;该问题只出现在调试器启动的未签名开发构建上(macOS 26 对调试器进程的 HID 层事件监听限制所致)。
 
-## 环境要求
+## <img height="16" src="docs/icons/tools.svg">&nbsp;&nbsp;环境要求
 
 - macOS(在 macOS 26 上开发;旧版本通过 `NSVisualEffectView` 回退支持，但不保证其可用性)。
 - 已授予应用 **辅助功能** 权限。
 
-## 通过 Homebrew 安装
+## <img height="16" src="docs/icons/download.svg">&nbsp;&nbsp;通过 Homebrew 安装
 
 如果只是使用、不需要从源码构建,可以通过 Homebrew Cask 安装预编译版本:
 
@@ -94,7 +100,7 @@ brew install --cask eacryo/tap/oh-my-tab
 - 更新:`brew upgrade --cask oh-my-tab`
 - 卸载:`brew uninstall --cask oh-my-tab`
 
-## 构建与运行
+## <img height="16" src="docs/icons/terminal.svg">&nbsp;&nbsp;构建与运行
 
 **前置条件:** Rust 稳定版工具链、Xcode Command Line Tools(`xcode-select --install`)、macOS 13+。运行时需要辅助功能权限(见下方「权限与运行须知」)。
 
@@ -160,7 +166,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 
 `brew install --cask` 实际读取的是 tap 仓库里已提交的那份:`eacryo/homebrew-tap` 下的 [`Casks/oh-my-tab.rb`](https://github.com/eacryo/homebrew-tap/blob/main/Casks/oh-my-tab.rb)。`release.sh` 只是在本地重新生成它,方便你把新版本拷过去。
 
-## 应用图标
+## <img height="16" src="docs/icons/package.svg">&nbsp;&nbsp;应用图标
 
 应用图标(`AppIcon.icns`)由 `assets/Icon-Default-1024x1024@1x.png` 生成,打包进 `Contents/Resources/`。`assets/AppIcon.icns` 已提交进仓库,`bundle.sh` 直接使用它,因此贡献者构建 `.app` 时无需任何额外工具。
 
@@ -174,14 +180,14 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 
 若存在 `assets/AppIcon.icon`(目录),`bundle.sh` 还会把它拷进 `Contents/Resources/`,用于 macOS 26+ 的 Liquid Glass 图标格式(系统优先于 `.icns`)。
 
-## 权限与运行须知
+## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;权限与运行须知
 
 - 应用需要 **辅助功能** 权限(`AXIsProcessTrusted`),全局按键事件 tap 和 AX 窗口查询都依赖它。在 *系统设置 -> 隐私与安全性 -> 辅助功能* 中授予。重新编译出的二进制需要重新授权 -- 除非用稳定身份签名(见[代码签名](#代码签名)),此时授权跨 rebuild 持续有效。
 - 如果事件 tap 创建失败,应用会打印一条错误,快捷键静默失效 -- 几乎总是辅助功能权限没给。
 - 运行时配置:`~/.config/oh-my-tab/config.toml`(首次运行自动按默认值创建)。
 - 图标缓存:`~/Library/Caches/oh-my-tab-icons/{bundle-id}.png`(按应用 bundle id 索引,配 `.meta` mtime sidecar)。
 
-## 架构
+## <img height="16" src="docs/icons/graph.svg">&nbsp;&nbsp;架构
 
 代码按职责拆成若干模块。关键逻辑跨多个文件,下面的拆分是承重的。
 
@@ -217,7 +223,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 - **macOS 版本分流**:macOS 26+ 用 `NSGlassEffectView`(Liquid Glass);旧版回退到 `NSVisualEffectView`(withinWindow + Dark)。
 - **部分调用使用原生 `objc_msgSend` FFI**,因为 `objc2` 的 `msg_send!` 无法编码 CF/CG 类型或 void 返回。
 
-## 配置
+## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;配置
 
 `~/.config/oh-my-tab/config.toml` -- 首次运行按默认值自动创建。加载是**逐字段容错**的,不是全有或全无:非法字段回退到默认值(记日志,绝不致命)。可从菜单(*Reload Config*)运行时热重载,同时重新应用主题并刷新浮窗。
 
@@ -327,7 +333,7 @@ line_count = 3
 
 鼠标设置也可以在设置窗口中调整(用**设备下拉框**选中某款已连接的鼠标,编辑它那一层)。切换 `mouse.enabled` **立即生效** —— 点确认时鼠标 event tap 会被热切换,无需重启应用。
 
-## 日志
+## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;日志
 
 日志是异步的,设计上**绝不阻塞 UI / 事件循环**。
 
@@ -350,14 +356,14 @@ line_count = 3
 
 应用刻意**绝不往用户指定的位置写入额外文件,也绝不删除其中的任何文件。** 如果你把 `file_path` 指向自己的文件或目录,轮转和保留由你自己负责 -- 30 天自动清理*只*作用于默认目录 `~/Library/Logs/oh-my-tab/`。这样 logger 就不会在你显式选择接管的位置上,用创建或删除文件来给你制造意外。
 
-## 国际化
+## <img height="16" src="docs/icons/globe.svg">&nbsp;&nbsp;国际化
 
 - 手写 TOML,零依赖,编译期内通过 `include_str!` 从 `locales/{en,zh-Hans,zh-Hant}.toml` 内嵌(无运行时文件 IO,无缺文件风险)。
 - 由 `config.i18n.locale` 驱动:`"auto"`(默认)| `"en"` | `"zh-Hans"` | `"zh-Hant"`。`"auto"` 从系统 `NSLocale` 首选语言解析(按顺序扫描)。
 - **热重载**:配置重载时、以及 `locale` 为 `auto` 时系统语言变更,都会刷新菜单和设置窗口的文案。
 - **新增语言**:创建 `locales/xx.toml`(同样的 key),在 `i18n::locale_raw()` 注册,在 `config.rs` 的 `validate()` 白名单里加入,并在 `map_tag_to_supported()` 里扩展(如果希望 `auto` 把某系统 tag 映射到它)。
 
-## 图标缓存
+## <img height="16" src="docs/icons/database.svg">&nbsp;&nbsp;图标缓存
 
 `~/Library/Caches/oh-my-tab-icons/` -- 按**应用 bundle id**(如 `com.microsoft.edgemac`)索引,不再按 PID。每个 App 存成一对文件:
 
@@ -371,16 +377,16 @@ line_count = 3
 启动时预缓存,并在 `NSWorkspaceDidLaunchApplicationNotification` 时补提取。可从菜单(*Clear Icon Cache*)清空。
 
 
-## 致谢
+## <img height="16" src="docs/icons/heart.svg">&nbsp;&nbsp;致谢
 
 **鼠标控制**功能(反向滚动、滚动模式、按设备配置、禁用指针加速)参考并借鉴了 [LinearMouse](https://github.com/linearmouse/linearmouse)。我们用纯 Rust(通过 `objc2` FFI 直接调 AppKit,无 Swift 桥接)从零重写了它的核心功能,并将其融入 oh-my-tab 的配置模型。衷心感谢原作者以及 LinearMouse 项目做出的优秀工作。
 
 **窗口切换器**(浮层设计、卡片式选中、Liquid Glass 风格)参考并借鉴了 [BetterCmdTab](https://github.com/rokartur/BetterCmdTab)。我们用纯 Rust(通过 `objc2` FFI 直接调 AppKit,无 Swift 桥接)从零重写了这些思路。衷心感谢作者做出的优秀工作。
 
-## 仓库
+## <img height="16" src="docs/icons/repo.svg">&nbsp;&nbsp;仓库
 
 https://github.com/eacryo/oh-my-tab
 
-## 开源协议
+## <img height="16" src="docs/icons/law.svg">&nbsp;&nbsp;开源协议
 
 本项目以 [MIT 协议](LICENSE)开源。
