@@ -1909,6 +1909,24 @@ fn is_image_extension(path: &str) -> bool {
     ext_to_uti(path).is_some()
 }
 
+/// 剪贴板是否携带文件复制标记(public.file-url 存在)。文件复制(含多文件)时,
+/// 剪贴板文本只是文件名(列表),绝不能按普通文本记录。
+/// Whether the pasteboard carries a file-copy marker (public.file-url present). On a
+/// file copy (including multi-file selections) the text is just the filename(s) and
+/// must never be recorded as plain text.
+unsafe fn pasteboard_has_file_url() -> bool {
+    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pb.is_null() {
+        return false;
+    }
+    let url_type = make_nsstring("public.file-url");
+    let url_str_obj: *mut AnyObject = msg_send![pb, stringForType: url_type];
+    CFRelease(url_type as *const c_void);
+    // stringForType: 返回 autoreleased 对象,无需手动 release(与 file_copy_image 一致)。
+    // stringForType: returns an autoreleased object; no manual release (same as file_copy_image).
+    !url_str_obj.is_null()
+}
+
 /// 图片文件复制(Finder 里 Cmd+C 一个图片文件):剪贴板上只有文件名文本 + 一个
 /// `public.file-url`。识别条件:file-url 存在,且文本恰好等于该文件的文件名——这时按
 /// "文件复制"处理:**读一次文件内容(瞬时)**,算内容哈希 + 解码首帧生成缩略图预览,
@@ -2179,7 +2197,19 @@ fn poll_clipboard() {
             // 否则按普通文本记录。
             // An image-FILE copy (Cmd+C on an image file in Finder): recognized as a file
             // copy -> recorded as an image entry; otherwise recorded as plain text.
-            let file_img = unsafe { file_copy_image(&text) };
+            // 剪贴板带文件 URL(文件复制):本应用只支持**单个图片文件**的复制
+            // (记成图片条目);其他文件复制——非图片文件、多文件选择——一律跳过,
+            // 否则文件名文本会被当成普通文本记进历史。
+            // A file-url on the pasteboard means a FILE copy: this app only supports a
+            // SINGLE image-file copy (recorded as an image entry); every other file copy
+            // -- non-image files, multi-file selections -- is skipped entirely, so the
+            // filename text never leaks into the history as plain text.
+            let has_file_url = unsafe { pasteboard_has_file_url() };
+            let file_img = if has_file_url {
+                unsafe { file_copy_image(&text) }
+            } else {
+                None
+            };
             if let Some(img) = &file_img {
                 if record_image(&mut hist, img, &source, &source_key, max_entries()) {
                     // 文件复制 = 纯引用:日志只打来源路径 + UTI,绝不读文件内容。
@@ -2194,6 +2224,14 @@ fn poll_clipboard() {
                 } else {
                     log_debug!("[clip] change skipped: dup file ref, total {}", hist.len());
                 }
+            } else if has_file_url {
+                // 文件复制但非单个图片文件(非图片文件 / 多文件):跳过,不记录文件名文本。
+                // A file copy that isn't a single image file (non-image / multi-file):
+                // skipped, the filename text is never recorded.
+                log_debug!(
+                    "[clip] change skipped: file copy without a single image file ({} chars)",
+                    text.chars().count()
+                );
             } else if record_text(&mut hist, &text, &source, &source_key, max_entries()) {
                 log_debug!(
                     "[clip] recorded text ({} chars, total {})",
