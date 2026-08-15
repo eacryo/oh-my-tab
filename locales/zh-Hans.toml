@@ -7,7 +7,7 @@
 clear_all = "清除全部"
 empty = "暂无剪贴板历史"
 no_match = "无匹配结果"
-search_hint_count = "搜索全部{count}条记录"
+search_hint_count = "Command+F 搜索 {count} 条记录"
 unknown_source = "未知来源"
 copied_at = "复制于: {time}"
 

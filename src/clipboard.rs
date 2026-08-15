@@ -4887,6 +4887,24 @@ fn clamp_selection(sel: usize, len: usize) -> usize {
 extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let keycode: u16 = msg_send![event as *mut AnyObject, keyCode];
+        // Cmd+F(键码 3 + Command 修饰 0x100000):聚焦顶部搜索框。搜索框已聚焦时
+        // 按键由字段编辑器消化,不会到达这里——天然无操作。
+        // Cmd+F (keycode 3 + Command modifier 0x100000): focus the top search field.
+        // When the field is already focused, the key goes to the field editor and never
+        // reaches here -- a natural no-op.
+        let mods: u64 = msg_send![event as *mut AnyObject, modifierFlags];
+        if keycode == 3 && (mods & 0x0010_0000) != 0 {
+            if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
+                let window = match *PICKER_WINDOW.lock().unwrap() {
+                    Some(w) => w.0,
+                    None => return,
+                };
+                // makeFirstResponder: 返回 BOOL('B')。
+                // makeFirstResponder: returns BOOL ('B').
+                let _: bool = msg_send![window, makeFirstResponder: f.0];
+            }
+            return;
+        }
         // 可选中范围是当前显示列表(搜索过滤后;超出可视部分靠滚动查看)。
         // The selectable range is the current display list (post-filter; scrolling reveals
         // the rest).
