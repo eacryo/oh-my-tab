@@ -46,7 +46,6 @@ struct SettingsUi {
     experimental_view: *mut AnyObject, // NSView: 实验性页容器 / Experimental page container
     mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
     clipboard_view: *mut AnyObject,  // NSView: 剪贴板历史页容器 / Clipboard page container
-    theme: *mut AnyObject,           // NSPopUpButton: dark / light / auto
     glass_style: *mut AnyObject,     // NSPopUpButton: regular / clear
     glass_tint: *mut AnyObject,      // NSTextField: RRGGBBAA hex
     corner_radius: *mut AnyObject,   // NSTextField
@@ -989,12 +988,6 @@ fn load_settings_from(cfg: &Config) {
             Some(u) => u,
             None => return,
         };
-        let theme_idx: isize = match cfg.appearance.theme.as_str() {
-            "dark" => 0,
-            "light" => 1,
-            _ => 2,
-        };
-        let _: () = msg_send![ui.theme, selectItemAtIndex: theme_idx];
         let gs_idx: isize = if cfg.appearance.glass_style == "clear" {
             1
         } else {
@@ -1149,12 +1142,6 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         let ui = match ui.as_ref() {
             Some(u) => u,
             None => return (cfg, vec!["settings UI not ready".into()]),
-        };
-        let theme_idx: isize = msg_send![ui.theme, indexOfSelectedItem];
-        cfg.appearance.theme = match theme_idx {
-            0 => "dark".into(),
-            1 => "light".into(),
-            _ => "auto".into(),
         };
         let gs_idx: isize = msg_send![ui.glass_style, indexOfSelectedItem];
         cfg.appearance.glass_style = if gs_idx == 1 {
@@ -1586,7 +1573,6 @@ fn create_settings_window() {
             experimental_view: std::ptr::null_mut(),
             mouse_view: std::ptr::null_mut(),
             clipboard_view: std::ptr::null_mut(),
-            theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             glass_tint: std::ptr::null_mut(),
             corner_radius: std::ptr::null_mut(),
@@ -1866,16 +1852,6 @@ fn create_settings_window() {
             content_w - 24.0,
         );
         y -= 8.0 + row_h;
-        ui.theme = add_row(
-            general_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_theme"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &["dark", "light", "auto"], 0),
-        );
-        y -= row_pitch;
         ui.glass_style = add_row(
             general_view,
             label_x,

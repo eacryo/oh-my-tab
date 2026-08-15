@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub enum GlobalEvent {
     CmdTabPressed,
     CmdReleased,
-    ThemeToggled,
     ClipboardToggled,
 }
 

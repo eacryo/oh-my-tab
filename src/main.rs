@@ -50,13 +50,6 @@ use window_collector::{
 
 // ========== Types ==========
 
-struct MenuState {
-    pub(crate) item: *mut AnyObject,
-    pub(crate) is_dark: bool,
-}
-unsafe impl Send for MenuState {}
-unsafe impl Sync for MenuState {}
-
 // 跨模块共享的应用状态(overlay/menu/settings 均会访问,故 pub(crate))。
 // AppState 与 TAB_STATE 留在 main.rs,避免 overlay↔menu 互相依赖形成环。
 // Cross-module shared app state (pub(crate) so overlay/menu/settings can access).
@@ -108,7 +101,6 @@ impl AppState {
 
 pub(crate) static TAB_STATE: Mutex<Option<AppState>> = Mutex::new(None);
 pub(crate) static CONTROLLER: Mutex<Option<ObjPtr>> = Mutex::new(None);
-pub(crate) static THEME_STATE: Mutex<Option<MenuState>> = Mutex::new(None);
 
 /// 菜单项与设置按钮共用的 ObjC target 对象（OhMyTabMenuTarget2 实例）。
 /// Shared ObjC target object for menu items and settings buttons.
@@ -529,12 +521,6 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
-            sel!(handleThemeToggled:),
-            on_theme_toggled as *mut c_void,
-            types_v_obj.as_ptr(),
-        );
-        class_addMethod(
-            cls,
             sel!(onClipboardToggled:),
             clipboard::on_clipboard_toggle as *mut c_void,
             types_v_obj.as_ptr(),
@@ -675,12 +661,6 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
-                sel!(handleToggleTheme:),
-                handle_toggle_theme as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
                 sel!(handleToggleShortcut:),
                 handle_toggle_shortcut as *mut c_void,
                 types.as_ptr(),
@@ -763,16 +743,6 @@ fn setup_status_bar() {
         let menu_target: *mut AnyObject = msg_send![action_cls as *const AnyObject, new];
         *MENU_TARGET.lock().unwrap() = Some(ObjPtr(menu_target));
 
-        // Toggle theme item
-        let toggle_title = make_nsstring(&t("menu.toggle_theme.dark"));
-        let toggle_key = make_nsstring("");
-        let toggle_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
-        let toggle_item: *mut AnyObject = msg_send![toggle_item, initWithTitle: toggle_title, action: sel!(handleToggleTheme:), keyEquivalent: toggle_key];
-        CFRelease(toggle_title as *const c_void);
-        CFRelease(toggle_key as *const c_void);
-        let _: () = msg_send![toggle_item, setTarget: menu_target];
-        let _: () = msg_send![menu, addItem: toggle_item];
-
         // Shortcut toggle item
         let shortcut_title = make_nsstring(&t("menu.toggle_shortcut.cmd"));
         let shortcut_key = make_nsstring("");
@@ -840,12 +810,6 @@ fn setup_status_bar() {
             reload: reload_item,
             clear_cache: clear_cache_item,
             quit: quit_item,
-        });
-
-        // Store toggle item reference for title updates
-        *THEME_STATE.lock().unwrap() = Some(MenuState {
-            item: toggle_item,
-            is_dark: false,
         });
 
         let _: () = msg_send![status_item, setMenu: menu];
@@ -1112,7 +1076,6 @@ fn main() {
             let action = match event {
                 GlobalEvent::CmdTabPressed => sel!(handleCmdTabPressed:),
                 GlobalEvent::CmdReleased => sel!(handleCmdReleased:),
-                GlobalEvent::ThemeToggled => sel!(handleThemeToggled:),
                 GlobalEvent::ClipboardToggled => sel!(onClipboardToggled:),
             };
             // Read controller pointer from static (only written once, safe to read)

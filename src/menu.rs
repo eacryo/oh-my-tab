@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 use crate::config::{reload_config, CONFIG};
-use crate::event_monitor::{GlobalEvent, SHORTCUT_IS_CMD};
+use crate::event_monitor::SHORTCUT_IS_CMD;
 use crate::ffi::*;
 use crate::i18n::t;
 use crate::overlay::{apply_theme, extract_uncached_icons, refresh_highlight, update_status_label};
@@ -22,7 +22,7 @@ use crate::settings::invalidate_settings_window;
 use crate::window_collector::clear_icon_cache;
 // 跨模块共享状态(由 main.rs 持有)/ cross-module shared state (owned by main.rs)
 use crate::log_info;
-use crate::{STATUS_EVENT_TX, TAB_STATE, THEME_STATE};
+use crate::TAB_STATE;
 
 // ========== 菜单项状态 / menu-item state ==========
 
@@ -70,20 +70,6 @@ pub(crate) fn set_shortcut_mode(is_cmd: bool) {
 /// and at startup to fix the initial labels.
 pub(crate) fn refresh_menu_titles() {
     unsafe {
-        // theme item:标题取决于当前主题(点一下要切到另一边)
-        // theme item: label depends on current theme (clicking switches to the other)
-        let is_dark = CONFIG.read().unwrap().appearance.theme.as_str() != "light";
-        let theme_key = if is_dark {
-            "menu.toggle_theme.light"
-        } else {
-            "menu.toggle_theme.dark"
-        };
-        if let Some(ref mut s) = *THEME_STATE.lock().unwrap() {
-            s.is_dark = is_dark;
-            let ns_title = make_nsstring(&t(theme_key));
-            let _: () = msg_send![s.item, setTitle: ns_title];
-            CFRelease(ns_title as *const c_void);
-        }
         // shortcut item
         let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
         let sc_key = if is_cmd {
@@ -149,50 +135,6 @@ pub(crate) extern "C" fn handle_toggle_shortcut(
     }
     set_shortcut_mode(is_cmd);
     log_info!("Shortcut: {}", if is_cmd { "Cmd+Tab" } else { "Opt+Tab" });
-}
-
-pub(crate) extern "C" fn handle_toggle_theme(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // Flip theme in CONFIG and persist to file so menu <-> config are linked.
-    let new_theme = match CONFIG.read().unwrap().appearance.theme.as_str() {
-        "dark" => "light",
-        _ => "dark",
-    };
-    {
-        let mut cfg = CONFIG.write().unwrap();
-        cfg.appearance.theme = new_theme.to_string();
-        // Save to file
-        let path = {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            std::path::PathBuf::from(home).join(".config/oh-my-tab/config.toml")
-        };
-        if let Ok(toml_str) = toml::to_string_pretty(&*cfg) {
-            let _ = std::fs::write(&path, toml_str);
-        }
-    }
-    let is_dark = new_theme == "dark";
-    let new_label = if is_dark {
-        t("menu.toggle_theme.light")
-    } else {
-        t("menu.toggle_theme.dark")
-    };
-    log_info!(
-        "Toggled theme to {}",
-        if is_dark { "dark" } else { "light" }
-    );
-    // Update menu item title
-    let mut state = THEME_STATE.lock().unwrap();
-    if let Some(ref mut s) = *state {
-        s.is_dark = is_dark;
-        unsafe {
-            let ns_title = make_nsstring(&new_label);
-            let _: () = msg_send![s.item, setTitle: ns_title];
-            CFRelease(ns_title as *const c_void);
-        }
-    }
-    drop(state);
-    if let Some(tx) = STATUS_EVENT_TX.get() {
-        let _ = tx.send(GlobalEvent::ThemeToggled);
-    }
 }
 
 pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {

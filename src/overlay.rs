@@ -24,8 +24,8 @@ use crate::window_collector::{
     bump_window_mru, extract_icon_to_cache, raise_ax_window, WindowInfo,
 };
 // 跨模块共享状态(由 main.rs 持有,这里读写)/ cross-module shared state (owned by main.rs)
+use crate::TAB_STATE;
 use crate::{log_debug, log_info};
-use crate::{TAB_STATE, THEME_STATE};
 
 // ========== 键盘键码 / keyboard key codes ==========
 
@@ -286,10 +286,6 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         hide_overlay();
     }
     state.visible = false;
-}
-
-pub(crate) extern "C" fn on_theme_toggled(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    apply_theme();
 }
 
 // --- Card View ---
@@ -922,11 +918,13 @@ pub(crate) unsafe fn apply_glass_properties() {
 
 pub(crate) fn apply_theme() {
     unsafe {
-        let is_dark = THEME_STATE
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|s| s.is_dark);
+        // 主题来源只有 config(界面上的切换入口已移除;手动改 config 仍生效)。
+        // The theme now comes from config only (the UI toggle is gone; manual config
+        // edits still apply).
+        let is_dark = crate::config::CONFIG
+            .read()
+            .map(|c| c.appearance.theme.as_str() != "light")
+            .unwrap_or(false);
 
         // Update window appearance for blur material tint
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
