@@ -25,6 +25,8 @@ const K_CG_EVENT_FLAGS_CHANGED: crate::event_tap::CGEventType = 12;
 const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
 const K_CG_EVENT_FLAG_MASK_COMMAND: crate::event_tap::CGEventFlags = 0x00100000;
 const K_CG_EVENT_FLAG_MASK_ALTERNATE: crate::event_tap::CGEventFlags = 0x00080000;
+const K_CG_EVENT_FLAG_MASK_CONTROL: crate::event_tap::CGEventFlags = 0x00040000;
+const K_CG_EVENT_FLAG_MASK_SHIFT: crate::event_tap::CGEventFlags = 0x00020000;
 const K_VK_TAB: u16 = 48;
 const K_VK_COMMAND: u16 = 55;
 const K_VK_OPTION: u16 = 58;
@@ -101,10 +103,25 @@ unsafe extern "C" fn event_tap_callback(
                 // shortcut mode). The event is swallowed, mirroring Win+V. Only the combo
                 // name is logged (privacy convention).
                 //
-                // 功能关闭时不拦截:其他应用可能需要 Option+V 组合键,必须透传。
-                // When the feature is disabled, do NOT swallow Option+V -- other apps may
-                // need the combo, so it passes through (falls through to the Other log).
-                if !crate::config::CONFIG.read().unwrap().clipboard.enabled {
+                // 必须精确匹配:flags 是当前所有按下的修饰键的位掩码,只要"含 Option"
+                // 就把 Cmd+Option+V(粘贴并匹配样式)等组合误认为呼出并吞掉,系统
+                // 快捷键随之失效。带上其他修饰键的组合一律透传。
+                // Precise match is required: flags is the bitmask of ALL currently held
+                // modifiers, so a bare "contains Option" check would swallow combos like
+                // Cmd+Option+V (paste-and-match-style) and break the system shortcut.
+                // Combos carrying any other modifier pass through untouched.
+                let other_mods = flags
+                    & (K_CG_EVENT_FLAG_MASK_COMMAND
+                        | K_CG_EVENT_FLAG_MASK_SHIFT
+                        | K_CG_EVENT_FLAG_MASK_CONTROL);
+                if other_mods != 0 {
+                    // 带其他修饰键(如 Cmd+Option+V):透传,让系统/应用处理。
+                    // Combos with extra modifiers (e.g. Cmd+Option+V) pass through.
+                    log_debug!("[kbd] Option+V passthrough (extra modifiers)");
+                } else if !crate::config::CONFIG.read().unwrap().clipboard.enabled {
+                    // 功能关闭时不拦截:其他应用可能需要 Option+V 组合键,必须透传。
+                    // When the feature is disabled, do NOT swallow Option+V -- other apps may
+                    // need the combo, so it passes through (falls through to the Other log).
                     log_debug!("[kbd] Option+V passthrough (clipboard disabled)");
                 } else {
                     log_debug!("[kbd] summon keyDown V+Option (clipboard)");
