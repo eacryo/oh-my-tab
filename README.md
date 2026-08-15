@@ -391,7 +391,3 @@ Icons are pre-cached at startup and on `NSWorkspaceDidLaunchApplicationNotificat
 The **mouse control** feature (scroll reversal, scroll modes, per-device configuration, and pointer-acceleration control) is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse). We re-implemented its core features from scratch in pure Rust (via `objc2` FFI, no Swift bridge) and integrated them into oh-my-tab's configuration model. Many thanks to the original author and the LinearMouse project for the excellent work.
 
 The **window switcher** (overlay design, card-based selection, Liquid Glass styling) draws inspiration from [BetterCmdTab](https://github.com/rokartur/BetterCmdTab). We re-implemented the ideas from scratch in pure Rust (via `objc2` FFI, no Swift bridge). Many thanks to the author for the excellent work.
-
-## <img height="16" src="docs/icons/law.svg">&nbsp;&nbsp;License
-
-This project is open-sourced under the [MIT License](LICENSE).

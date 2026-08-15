@@ -390,7 +390,3 @@ line_count = 3
 **鼠标控制**功能(反向滚动、滚动模式、按设备配置、禁用指针加速)参考并借鉴了 [LinearMouse](https://github.com/linearmouse/linearmouse)。我们用纯 Rust(通过 `objc2` FFI 直接调 AppKit,无 Swift 桥接)从零重写了它的核心功能,并将其融入 oh-my-tab 的配置模型。衷心感谢原作者以及 LinearMouse 项目做出的优秀工作。
 
 **窗口切换器**(浮层设计、卡片式选中、Liquid Glass 风格)参考并借鉴了 [BetterCmdTab](https://github.com/rokartur/BetterCmdTab)。我们用纯 Rust(通过 `objc2` FFI 直接调 AppKit,无 Swift 桥接)从零重写了这些思路。衷心感谢作者做出的优秀工作。
-
-## <img height="16" src="docs/icons/law.svg">&nbsp;&nbsp;开源协议
-
-本项目以 [MIT 协议](LICENSE)开源。
