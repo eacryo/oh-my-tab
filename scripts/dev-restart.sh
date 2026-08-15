@@ -5,9 +5,15 @@
 # start it in the background -> verify it is alive. Run by the agent after the
 # fmt/check/clippy/test gates pass (see the AGENTS.md convention).
 
-# 精确匹配裸二进制路径(cargo run 场景),避免误杀同名进程;无旧进程也不报错。
-# Match the raw binary path exactly (cargo run workflow); no error when nothing is running.
+# 杀掉所有 oh-my-tab 实例:开发二进制 + 打包安装的 .app 都会注册同一个全局快捷键,
+# 两个进程并存时旧版会抢走 Cmd+Tab(用户曾因此误以为新功能没生效)。
+# 精确匹配路径,避免误杀同名进程;无旧进程也不报错。
+# Kill every oh-my-tab instance: both the dev binary and the packaged .app register the
+# same global shortcut -- with two running, the older one hijacks Cmd+Tab (which once made
+# new features look dead). Exact path matches only; no error when nothing is running.
 pkill -f 'target/debug/oh-my-tab' 2>/dev/null
+pkill -f 'target/release/oh-my-tab' 2>/dev/null
+pkill -f '/Applications/Oh-My-Tab.app/Contents/MacOS/oh-my-tab' 2>/dev/null
 sleep 0.5
 
 # cargo check/clippy/test 不产出主二进制,必须显式 build,否则启动的是旧版。
