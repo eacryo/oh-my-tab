@@ -38,6 +38,19 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 
 <br />
 
+## <img height="16" src="docs/icons/download.svg">&nbsp;&nbsp;Install via Homebrew
+
+If you just want to use the app (no need to build from source), install the prebuilt release via Homebrew Cask:
+
+> ```sh
+> brew install --cask eacryo/tap/oh-my-tab
+> ```
+
+This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and installs `Oh-My-Tab.app` into `/Applications`. Requires macOS 13+ on Apple Silicon.
+
+- Update: `brew upgrade --cask oh-my-tab`
+- Uninstall: `brew uninstall --cask oh-my-tab`
+
 ## <img height="16" src="docs/icons/image.svg">&nbsp;&nbsp;Screenshots
 
 <p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="Main window"></p>
@@ -93,19 +106,6 @@ If windows are already open when the app starts, their ordering differs from the
 
 - macOS (developed on macOS 26; older versions supported via the `NSVisualEffectView` fallback, but availability is not guaranteed).
 - **Accessibility** permission granted to the app.
-
-## <img height="16" src="docs/icons/download.svg">&nbsp;&nbsp;Install via Homebrew
-
-If you just want to use the app (no need to build from source), install the prebuilt release via Homebrew Cask:
-
-> ```sh
-> brew install --cask eacryo/tap/oh-my-tab
-> ```
-
-This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and installs `Oh-My-Tab.app` into `/Applications`. Requires macOS 13+ on Apple Silicon.
-
-- Update: `brew upgrade --cask oh-my-tab`
-- Uninstall: `brew uninstall --cask oh-my-tab`
 
 ## <img height="16" src="docs/icons/terminal.svg">&nbsp;&nbsp;Build & run
 
