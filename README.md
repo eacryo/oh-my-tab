@@ -2,13 +2,19 @@
   <img src="assets/Icon-512x512.png" width="120" height="120" alt="oh-my-tab">
 </p>
 
-<p align="center"><b>oh-my-tab</b>&nbsp;&nbsp;—&nbsp;&nbsp;macOS app switcher, clipboard history &amp; mouse control — in pure Rust</p>
+<br />
+
+<div align="center"><b>——&nbsp;&nbsp;&nbsp;macOS app switcher, clipboard history &amp; mouse control, in pure Rust&nbsp;&nbsp;&nbsp;——</b></div>
+
+<br />
 
 <p align="center">
   <a href="https://github.com/eacryo/oh-my-tab/releases"><img src="https://img.shields.io/github/v/release/eacryo/oh-my-tab?style=for-the-badge" alt="GitHub release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="MIT License"></a>
   <a href="https://github.com/eacryo/oh-my-tab"><img src="https://img.shields.io/badge/platform-macOS-black?style=for-the-badge" alt="macOS"></a>
 </p>
+
+<br />
 
 > [简体中文](README-ZH.md) | English
 
@@ -18,17 +24,19 @@ A macOS window switcher — an alternative to the system Cmd+Tab. It runs as a *
 
 It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly through `objc2` FFI — there is no Swift bridge and no Rust UI framework.
 
-- <img height="14" src="docs/icons/stack.svg"> Enhances the native switcher — shows app names and window titles, with one card per window.
-- <img height="14" src="docs/icons/key.svg"> Navigate with Tab, arrow keys, or the mouse after pressing Command/Option.
-- <img height="14" src="docs/icons/zap.svg"> Pure Rust on macOS APIs — a 1.5 MB binary, ~35 MB memory. No Electron, no Tauri.
-- <img height="14" src="docs/icons/star.svg"> Floating Liquid Glass overlay (macOS 26).
-- <img height="14" src="docs/icons/history.svg"> **Window-level** MRU ordering — switching to one window never drags the app's other windows forward.
-- <img height="14" src="docs/icons/eye.svg"> Lists **every real window** — off-screen dialogs and other-Space windows included; minimized windows can be shown or hidden.
-- <img height="14" src="docs/icons/gear.svg"> TOML configuration, validated and **hot-reloadable** from the menu.
-- <img height="14" src="docs/icons/globe.svg"> Zero-dependency i18n (English / Simplified / Traditional Chinese) with live system-language follow.
-- <img height="14" src="docs/icons/note.svg"> Per-launch log files with automatic 30-day retention (see [Logging](#logging)).
-- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes / reversal, pointer acceleration — configurable **per device** (see [Configuration](#configuration)).
-- <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images and file copies with search, pin, delete, auto-expiry and optional persistence (see [Clipboard history](#clipboard-history)).
+- <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names, window titles, one card per window.
+- <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab, arrow keys, or mouse after Command/Option.
+- <img height="14" src="docs/icons/zap.svg"> **Featherweight**: pure Rust — 1.5 MB binary, ~35 MB memory. No Electron/Tauri.
+- <img height="14" src="docs/icons/star.svg"> **Liquid Glass**: floating overlay (macOS 26).
+- <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window never drags the app's others forward.
+- <img height="14" src="docs/icons/eye.svg"> **Full window visibility**: every real window, including off-screen and minimized (toggleable).
+- <img height="14" src="docs/icons/gear.svg"> **Hot-reloadable TOML**: validated config from the menu.
+- <img height="14" src="docs/icons/globe.svg"> **Zero-dependency i18n**: English / Simplified / Traditional Chinese, live system-language follow.
+- <img height="14" src="docs/icons/note.svg"> **Per-launch logs**: 30-day retention ([Logging](#logging)).
+- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration ([Configuration](#configuration)).
+- <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images, file copies — search, pin, delete, expiry, persistence ([Clipboard history](#clipboard-history)).
+
+<br />
 
 ## <img height="16" src="docs/icons/image.svg">&nbsp;&nbsp;Screenshots
 
@@ -90,9 +98,9 @@ If windows are already open when the app starts, their ordering differs from the
 
 If you just want to use the app (no need to build from source), install the prebuilt release via Homebrew Cask:
 
-```sh
-brew install --cask eacryo/tap/oh-my-tab
-```
+> ```sh
+> brew install --cask eacryo/tap/oh-my-tab
+> ```
 
 This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and installs `Oh-My-Tab.app` into `/Applications`. Requires macOS 13+ on Apple Silicon.
 
@@ -105,20 +113,20 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 
 ### Development
 
-```sh
-cargo check       # fast type-check
-cargo run         # build + run (takes over the global shortcut)
-cargo clippy      # available, not wired into CI
-```
+> ```sh
+> cargo check       # fast type-check
+> cargo run         # build + run (takes over the global shortcut)
+> cargo clippy      # available, not wired into CI
+> ```
 
 `cargo run` launches the raw binary in **dev mode**: logs go to both stdout and the log file, and launch-at-login is inactive (SMAppService needs a `.app` bundle). There are **no tests** in the project.
 
 ### Release `.app` + `.dmg`
 
-```sh
-sh scripts/bundle.sh        # cargo build --release -> dist/Oh-My-Tab.app -> sign -> dist/Oh-My-Tab.dmg
-open dist/Oh-My-Tab.dmg     # install: drag Oh-My-Tab into Applications
-```
+> ```sh
+> sh scripts/bundle.sh        # cargo build --release -> dist/Oh-My-Tab.app -> sign -> dist/Oh-My-Tab.dmg
+> open dist/Oh-My-Tab.dmg     # install: drag Oh-My-Tab into Applications
+> ```
 
 `bundle.sh` assembles `dist/Oh-My-Tab.app` (binary + `Info.plist`), signs it, then packages it into `dist/Oh-My-Tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution.
 

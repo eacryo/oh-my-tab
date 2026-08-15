@@ -2,13 +2,19 @@
   <img src="assets/Icon-512x512.png" width="120" height="120" alt="oh-my-tab">
 </p>
 
-<p align="center"><b>oh-my-tab</b>&nbsp;&nbsp;—&nbsp;&nbsp;纯 Rust 的 macOS 应用切换器、剪贴板历史与鼠标控制</p>
+<br />
+
+<div align="center"><b>——&nbsp;&nbsp;&nbsp;纯 Rust 的 macOS 应用切换器、剪贴板历史与鼠标控制&nbsp;&nbsp;&nbsp;——</b></div>
+
+<br />
 
 <p align="center">
   <a href="https://github.com/eacryo/oh-my-tab/releases"><img src="https://img.shields.io/github/v/release/eacryo/oh-my-tab?style=for-the-badge" alt="GitHub release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="MIT License"></a>
   <a href="https://github.com/eacryo/oh-my-tab"><img src="https://img.shields.io/badge/platform-macOS-black?style=for-the-badge" alt="macOS"></a>
 </p>
+
+<br />
 
 > 简体中文 | [English](README.md)
 
@@ -18,17 +24,19 @@
 
 它是纯 Rust 通过 `objc2` FFI 直接调用 AppKit / CoreGraphics / ApplicationServices -- 没有 Swift 桥接,也没有 Rust UI 框架。
 
-- <img height="14" src="docs/icons/stack.svg"> 增强原生切换器——显示应用名与窗口标题,同一应用的多个窗口分列卡片。
-- <img height="14" src="docs/icons/key.svg"> 按下 Command/Option 后,可用 Tab、方向键或鼠标选择窗口。
-- <img height="14" src="docs/icons/zap.svg"> 纯 Rust 直调 macOS API——1.5MB 体积、约 35MB 内存,无 Electron/Tauri。
-- <img height="14" src="docs/icons/star.svg"> Liquid Glass 浮层(仅 macOS 26)。
-- <img height="14" src="docs/icons/history.svg"> **窗口级** MRU 排序——切到某个窗口不会把该应用的其他窗口一起带前。
-- <img height="14" src="docs/icons/eye.svg"> 列出**所有真实窗口**——含离屏对话框与其他 Space 的窗口;最小化窗口可显可隐。
-- <img height="14" src="docs/icons/gear.svg"> TOML 配置,校验后可从菜单**热重载**。
-- <img height="14" src="docs/icons/globe.svg"> 零依赖国际化(英文/简中/繁中),自动检测并实时跟随系统语言。
-- <img height="14" src="docs/icons/note.svg"> 每次启动一个日志文件,自动保留 30 天(见[日志](#日志))。
-- <img height="14" src="docs/icons/sliders.svg"> **鼠标控制**(可选):滚动模式/反向、指针加速——**按设备分别配置**(见[配置](#配置))。
-- <img height="14" src="docs/icons/copy.svg"> **剪贴板历史**(可选):文本/图片/文件复制,支持搜索、置顶、删除、自动过期与可选持久化(见[剪贴板历史](#剪贴板历史))。
+- <img height="14" src="docs/icons/stack.svg"> **原生切换增强**:显示应用名与窗口标题,同一应用的多个窗口分列卡片。
+- <img height="14" src="docs/icons/key.svg"> **键盘导航**:按下 Command/Option 后用 Tab、方向键或鼠标选择窗口。
+- <img height="14" src="docs/icons/zap.svg"> **轻量**:纯 Rust——1.5MB 体积、约 35MB 内存,无 Electron/Tauri。
+- <img height="14" src="docs/icons/star.svg"> **Liquid Glass**:浮层效果(仅 macOS 26)。
+- <img height="14" src="docs/icons/history.svg"> **窗口级 MRU**:切到某个窗口不会把该应用的其他窗口一起带前。
+- <img height="14" src="docs/icons/eye.svg"> **完整窗口可见**:所有真实窗口,含离屏与最小化(可开关)。
+- <img height="14" src="docs/icons/gear.svg"> **TOML 热重载**:配置经校验,菜单一键生效。
+- <img height="14" src="docs/icons/globe.svg"> **零依赖国际化**:英文/简中/繁中,实时跟随系统语言。
+- <img height="14" src="docs/icons/note.svg"> **每次启动一份日志**:保留 30 天([日志](#日志))。
+- <img height="14" src="docs/icons/sliders.svg"> **鼠标控制**(可选):滚动模式/反向、按设备加速([配置](#配置))。
+- <img height="14" src="docs/icons/copy.svg"> **剪贴板历史**(可选):文本/图片/文件复制——搜索、置顶、删除、过期、持久化([剪贴板历史](#剪贴板历史))。
+
+<br />
 
 ## <img height="16" src="docs/icons/image.svg">&nbsp;&nbsp;截图
 
@@ -91,9 +99,9 @@
 
 如果只是使用、不需要从源码构建,可以通过 Homebrew Cask 安装预编译版本:
 
-```sh
-brew install --cask eacryo/tap/oh-my-tab
-```
+> ```sh
+> brew install --cask eacryo/tap/oh-my-tab
+> ```
 
 这会自动添加 [homebrew-tap](https://github.com/eacryo/homebrew-tap) 仓库,把 `Oh-My-Tab.app` 装进 `/Applications`。需要 macOS 13+ 的 Apple Silicon 机型。
 
@@ -106,20 +114,20 @@ brew install --cask eacryo/tap/oh-my-tab
 
 ### 开发
 
-```sh
-cargo check       # 快速类型检查
-cargo run         # 构建并运行(会接管全局快捷键)
-cargo clippy      # 可用,未接入 CI
-```
+> ```sh
+> cargo check       # 快速类型检查
+> cargo run         # 构建并运行(会接管全局快捷键)
+> cargo clippy      # 可用,未接入 CI
+> ```
 
 `cargo run` 以**开发模式**跑裸二进制:日志同时输出到 stdout 和日志文件,开机自启不生效(SMAppService 需要 `.app` bundle)。项目**没有测试**。
 
 ### Release `.app` + `.dmg`
 
-```sh
-sh scripts/bundle.sh        # cargo build --release -> dist/Oh-My-Tab.app -> 签名 -> dist/Oh-My-Tab.dmg
-open dist/Oh-My-Tab.dmg     # 安装:把 Oh-My-Tab 拖到 Applications
-```
+> ```sh
+> sh scripts/bundle.sh        # cargo build --release -> dist/Oh-My-Tab.app -> 签名 -> dist/Oh-My-Tab.dmg
+> open dist/Oh-My-Tab.dmg     # 安装:把 Oh-My-Tab 拖到 Applications
+> ```
 
 `bundle.sh` 组装 `dist/Oh-My-Tab.app`(二进制 + `Info.plist`)、做签名,再打成 `dist/Oh-My-Tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。
 
