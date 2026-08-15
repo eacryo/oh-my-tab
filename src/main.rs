@@ -523,6 +523,12 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(closeCard:),
+            on_close_card as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleThemeToggled:),
             on_theme_toggled as *mut c_void,
             types_v_obj.as_ptr(),

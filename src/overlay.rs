@@ -36,6 +36,11 @@ pub(crate) const KEY_DOWN: u16 = 125;
 pub(crate) const KEY_UP: u16 = 126;
 pub(crate) const KEY_ESCAPE: u16 = 53;
 pub(crate) const KEY_RETURN: u16 = 36;
+pub(crate) const KEY_DELETE: u16 = 51; // Backspace
+/// 卡片右上角关闭按钮的 tag(hover 显隐查找用;卡片 index 不存 tag)。
+/// The close-button tag on a card (used to find it for hover show/hide; the card
+/// index is NOT stored in the tag).
+pub(crate) const CLOSE_BTN_TAG: isize = 0xE7F1;
 
 // ========== 浮窗相关全局状态 / overlay global state ==========
 
@@ -125,6 +130,25 @@ mod tests {
     }
 
     #[test]
+    fn remove_window_adjust_selection_keeps_a_sane_selection() {
+        use super::remove_window_adjust_selection;
+        // 关的是选中项之后 → 选中不动。
+        // Closing something after the selection leaves it.
+        assert_eq!(remove_window_adjust_selection(1, 3, 4), 1);
+        // 关的是选中项之前 → 前移一格(保持指向同一张窗口)。
+        // Closing something before it shifts back one (same window stays selected).
+        assert_eq!(remove_window_adjust_selection(3, 1, 4), 2);
+        // 关的正是选中项 → 指向下一张(原位置就是新列表的同位)。
+        // Closing the selection itself -> the next window (the same slot).
+        assert_eq!(remove_window_adjust_selection(1, 1, 4), 1);
+        // 关的是末张且选中末张 → 钳到新末张。
+        // Closing the tail while it is selected -> clamps to the new tail.
+        assert_eq!(remove_window_adjust_selection(4, 4, 4), 3);
+        // 空列表 → 0。
+        assert_eq!(remove_window_adjust_selection(0, 0, 0), 0);
+    }
+
+    #[test]
     fn non_empty_title_passes_through() {
         assert_eq!(display_title("Safari — Apple"), "Safari — Apple");
         assert_eq!(display_title("x"), "x");
@@ -191,6 +215,19 @@ pub(crate) extern "C" fn on_cmd_tab_pressed(_self: *mut c_void, _cmd: Sel, _arg:
         update_status_label();
         extract_uncached_icons();
     }
+}
+
+/// 卡片右上角关闭按钮的 action(sender = 关闭按钮):取按钮所在卡片(superview)
+/// 的 index,关闭该窗口。浮窗保持打开。
+/// Action of the card's top-right close button (sender = the button): resolve the
+/// card via the button's superview, close that window. The overlay stays open.
+pub(crate) extern "C" fn on_close_card(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
+    let card: *mut AnyObject = unsafe { msg_send![sender as *mut AnyObject, superview] };
+    if card.is_null() {
+        return;
+    }
+    let idx = get_card_index(card);
+    close_window_at(idx);
 }
 
 pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -294,6 +331,8 @@ pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _even
         drop(state_opt);
         refresh_highlight();
         update_status_label();
+    } else {
+        drop(state_opt);
     }
 }
 
@@ -347,6 +386,15 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                         refresh_highlight();
                         update_status_label();
                     }
+                }
+            }
+            KEY_DELETE => {
+                // Backspace:关闭选中卡片对应的窗口,浮窗保持打开。
+                // Backspace: close the selected card's window; the overlay stays open.
+                if !state.windows.is_empty() {
+                    let idx = state.selected;
+                    drop(state_opt);
+                    close_window_at(idx);
                 }
             }
             KEY_RETURN => {
@@ -501,6 +549,86 @@ pub(crate) fn reset_switcher() {
     }
 }
 
+/// 关闭索引 removed_idx 的窗口后调整选中索引(纯函数,单测覆盖):
+///
+/// - 被关窗口在选中项之前 → 选中前移一格(保持指向同一张窗口);
+/// - 被关窗口就是选中项或在其后 → 不动(前者自然指向下一张);
+/// - 越界 → 钳到末条;空列表 → 0。
+///
+/// Adjust the selection after closing the window at `removed_idx` (pure, unit-tested):
+///
+/// - a closed window BEFORE the selection shifts it back one (same window stays selected);
+/// - closing the selection itself or anything after it leaves it (the former naturally
+///   points at the next window);
+/// - out of range -> the tail; an empty list -> 0.
+fn remove_window_adjust_selection(selected: usize, removed_idx: usize, new_len: usize) -> usize {
+    let sel = if removed_idx < selected {
+        selected - 1
+    } else {
+        selected
+    };
+    if new_len == 0 {
+        0
+    } else {
+        sel.min(new_len - 1)
+    }
+}
+
+/// 关闭第 idx 张卡片对应的窗口(小叉按钮 / Backspace 共用):AX 关闭成功后
+/// 从列表移除、调整选中、重建浮窗;失败则列表不动(日志)。全部关完 → 收起浮窗。
+/// Close the window of card `idx` (shared by the close button and Backspace): on a
+/// successful AX close, remove it from the list, adjust the selection and rebuild the
+/// overlay; on failure the list stays (logged). Closing the last one dismisses the overlay.
+pub(crate) fn close_window_at(idx: usize) {
+    let (pid, cgwid, title) = {
+        let state_opt = TAB_STATE.lock().unwrap();
+        let state = match state_opt.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        match state.windows.get(idx) {
+            Some(w) => (w.pid, w.window_id, w.window_title.clone()),
+            None => return,
+        }
+    };
+    if !crate::window_collector::close_ax_window(pid, cgwid) {
+        log_info!(
+            "close window FAILED (AX close rejected): pid={} cgwid={} title=\"{}\"",
+            pid,
+            cgwid,
+            title
+        );
+        return;
+    }
+    log_info!(
+        "close window: pid={} cgwid={} title=\"{}\"",
+        pid,
+        cgwid,
+        title
+    );
+    {
+        let mut state_opt = TAB_STATE.lock().unwrap();
+        let state = match state_opt.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        state.windows.remove(idx);
+        state.mru.remove(&(pid, cgwid));
+        if state.windows.is_empty() {
+            // 全部关完:收起浮窗,不留在空态。
+            // All closed: dismiss the overlay, don't linger on an empty state.
+            hide_overlay();
+            state.visible = false;
+            return;
+        }
+        state.selected = remove_window_adjust_selection(state.selected, idx, state.windows.len());
+    }
+    // 全量重建(布局/窗口尺寸可能随行数变化),再刷新高亮。
+    // Full rebuild (layout/window size may change with the row count), then the highlight.
+    show_overlay();
+    refresh_highlight();
+}
+
 /// 视觉隐藏浮窗但**不 orderOut**(窗口保持 ordered)。
 /// 切换窗口时不能先 orderOut 再激活目标:面板 orderOut 后 WindowServer 可能把焦点路由到
 /// 错误窗口,导致目标窗口的 key-window / first-responder 未被正确确立(光标停止闪烁等)。
@@ -616,6 +744,15 @@ pub(crate) fn refresh_highlight() {
             } else {
                 let _: () = msg_send![layer, setBorderWidth: 0.0f64];
                 layer_set_border(layer, std::ptr::null_mut());
+            }
+            // ⌫ 关闭按钮随选中态显隐:选中卡片显示、其余隐藏(选中即出现,
+            // 不限于鼠标悬停——键盘导航选中同样可见)。
+            // The ⌫ close button follows the selection: the selected card shows it, the
+            // rest hide it (visible whenever the card is selected, keyboard navigation
+            // included -- not only while the mouse hovers).
+            let btn: *mut AnyObject = msg_send![sv, viewWithTag: CLOSE_BTN_TAG];
+            if !btn.is_null() {
+                let _: () = msg_send![btn, setHidden: tag != selected];
             }
         }
     }
@@ -991,6 +1128,45 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
         let _: () = msg_send![view, addTrackingArea: ta];
         release_obj(ta); // view owns the tracking area; drop our alloc +1
 
+        // --- 右上角关闭按钮(⌫ Backspace 符号):hover 卡片才显示,点击 = AX 关闭该窗口 ---
+        // The top-right close button (the Backspace symbol): shown on hover only;
+        // clicking AX-closes this window.
+        let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+        let btn: *mut AnyObject = msg_send![btn, initWithFrame: NSRect::new(
+            NSPoint::new(card_width - 26.0, card_h() - 30.0),
+            NSSize::new(20.0, 20.0)
+        )];
+        let _: () = msg_send![btn, setBordered: false];
+        let _: () = msg_send![btn, setImagePosition: 1isize]; // NSImageOnly
+        let empty_ns = make_nsstring("");
+        let _: () = msg_send![btn, setTitle: empty_ns];
+        CFRelease(empty_ns as *const c_void);
+        let sym_ns = make_nsstring("delete.left");
+        let desc = make_nsstring("Close window");
+        let img: *mut AnyObject = msg_send![
+            class!(NSImage),
+            imageWithSystemSymbolName: sym_ns,
+            accessibilityDescription: desc
+        ];
+        CFRelease(sym_ns as *const c_void);
+        CFRelease(desc as *const c_void);
+        if !img.is_null() {
+            let _: () = msg_send![btn, setImage: img];
+        }
+        // 半透明圆底:与剪贴板删除按钮同款观感。
+        // A translucent round backdrop (same look as the clipboard delete button).
+        let _: () = msg_send![btn, setWantsLayer: true];
+        let bl: *mut AnyObject = msg_send![btn, layer];
+        let _: () = msg_send![bl, setCornerRadius: 10.0f64];
+        let _: () = msg_send![bl, setMasksToBounds: true];
+        layer_set_background(bl, hex_to_cg_color(0xFFFFFF33));
+        let _: () = msg_send![btn, setTag: CLOSE_BTN_TAG];
+        let _: () = msg_send![btn, setTarget: crate::CONTROLLER.lock().unwrap().unwrap().0];
+        let _: () = msg_send![btn, setAction: sel!(closeCard:)];
+        let _: () = msg_send![btn, setHidden: true];
+        let _: () = msg_send![view, addSubview: btn];
+        release_obj(btn); // view owns the button; drop our alloc +1
+
         view
     }
 }
@@ -1184,6 +1360,11 @@ pub(crate) fn show_overlay() {
         // hover-selection kicks in (matches native Cmd+Tab behaviour).
         MOUSE_MOVED.store(false, Ordering::Relaxed);
         let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
+        // 召唤后刷新一次高亮/选中态:新卡片刚创建(⌫ 按钮默认隐藏),选中卡片的
+        // 边框与 ⌫ 需要按当前选中项补上。
+        // Refresh the highlight/selection once after summoning: fresh cards start with the
+        // ⌫ button hidden, so the selected card's border and ⌫ must be applied now.
+        refresh_highlight();
 
         // Show window. NSPanel + nonactivatingPanel: the panel becomes key (keyboard works)
         // WITHOUT activating our app -- do NOT call activateIgnoringOtherApps, or the settings

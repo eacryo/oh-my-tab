@@ -827,6 +827,67 @@ pub fn small_icon_path_for_key(key: &str) -> String {
     cache_path_for_key_suffix(key, ".small")
 }
 
+/// AX 关闭窗口(等效点击窗口的关闭按钮):遍历 pid 的 AXWindows 匹配 cgwid,
+/// 主方案 = 取窗口的 AXCloseButton 元素并执行 AXPress;兜底 = 窗口级 AXClose
+/// action(macOS 26 上多数 app 不再暴露,故以按钮方案为主)。最小化窗口同样适用。
+/// 返回是否找到并成功发起关闭;失败 → false。
+/// Close a window via AX (equivalent to clicking its close button): scan the pid's
+/// AXWindows for cgwid; the PRIMARY path grabs the window's AXCloseButton and presses it;
+/// the fallback is the window-level AXClose action (most apps no longer expose it on
+/// macOS 26, hence the button-first approach). Works for minimized windows too. Returns
+/// whether the close was initiated.
+pub(crate) fn close_ax_window(pid: i32, cgwid: u32) -> bool {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.5);
+        let windows_key = cf_string_new("AXWindows");
+        let mut windows_array: *const c_void = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
+        CFRelease(windows_key);
+        CFRelease(app);
+        if err != K_AX_SUCCESS || windows_array.is_null() {
+            return false;
+        }
+        let count = CFArrayGetCount(windows_array);
+        let close_btn_key = cf_string_new("AXCloseButton");
+        let press_key = cf_string_new("AXPress");
+        let close_key = cf_string_new("AXClose");
+        let mut ok = false;
+        for i in 0..count {
+            let element = CFArrayGetValueAtIndex(windows_array, i);
+            if element.is_null() {
+                continue;
+            }
+            if ax_window_cgwid(element) != Some(cgwid) {
+                continue;
+            }
+            // 主方案:关闭按钮 + AXPress(标准窗口通用,系统设置/Chrome 实测可用)。
+            // Primary: the close button + AXPress (works on any standard window; verified
+            // on System Settings and Chrome).
+            let mut close_btn: *const c_void = std::ptr::null();
+            if AXUIElementCopyAttributeValue(element, close_btn_key, &mut close_btn) == K_AX_SUCCESS
+                && !close_btn.is_null()
+            {
+                ok = AXUIElementPerformAction(close_btn, press_key) == K_AX_SUCCESS;
+                CFRelease(close_btn);
+                break;
+            }
+            // 兜底:窗口级 AXClose。
+            // Fallback: the window-level AXClose action.
+            ok = AXUIElementPerformAction(element, close_key) == K_AX_SUCCESS;
+            break;
+        }
+        CFRelease(close_btn_key);
+        CFRelease(press_key);
+        CFRelease(close_key);
+        CFRelease(windows_array);
+        ok
+    }
+}
+
 pub fn raise_ax_window(pid: i32, cgwid: u32) {
     if cgwid == 0 {
         return;
