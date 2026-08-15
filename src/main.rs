@@ -998,6 +998,9 @@ fn main() {
     *OVERLAY_WINDOW.lock().unwrap() = Some(ObjPtr(window));
     // Hide initially
     hide_overlay();
+    // 点击浮窗外部 → 取消切换(面板失去 key 时收起,同 Esc 语义)。
+    // A click outside the overlay cancels the switch (dismissed when the panel loses key).
+    install_click_to_cancel();
 
     // 6. Create controller object
     let controller = create_controller();

@@ -12,8 +12,9 @@ use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant; // TIMING-DEBUG
 
 use crate::config::{self, CONFIG};
@@ -542,6 +543,95 @@ pub(crate) fn reset_switcher() {
     hide_overlay();
     if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
         state.visible = false;
+    }
+}
+
+// ========== 点击外部取消 / click-outside cancel ==========
+
+/// 注册「点击浮窗外部 → 取消本次切换」:浮窗是 key 面板,点击其他 app 的窗口时
+/// WindowServer 把 key 转给新窗口 → 面板收到 NSWindowDidResignKeyNotification →
+/// 收起浮窗且不切换(与 Esc 取消同语义)。
+/// 点击浮窗内部不会触发(面板保持 key);点击面板自身的空白区/卡片由卡片事件处理。
+///
+/// 为什么不用全局鼠标监听:resign-key 通知天然区分「点击面板内/外」(事件属于本 app
+/// 时不通知),无需 block、无需位置判断;且剪贴板面板已用同一模式,行为一致。
+///
+/// Register click-outside cancel: the overlay is the key panel, so clicking another app's
+/// window hands key to it and the panel fires NSWindowDidResignKeyNotification -> dismiss
+/// the overlay without switching (same semantics as Esc).
+/// Clicks inside the panel never fire it (the panel keeps key); empty areas of the panel
+/// are handled by card events.
+///
+/// Why not a global mouse monitor: the resign-key notification inherently distinguishes
+/// inside/outside clicks (it doesn't fire for our own events), needs no blocks and no
+/// hit-testing; the clipboard picker already uses this exact pattern.
+pub(crate) fn install_click_to_cancel() {
+    unsafe {
+        let win = match *OVERLAY_WINDOW.lock().unwrap() {
+            Some(w) => w.0,
+            None => return,
+        };
+        let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let name = make_nsstring("NSWindowDidResignKeyNotification");
+        let _: () = msg_send![
+            center,
+            addObserver: overlay_observer(),
+            selector: sel!(overlayWindowResigned:),
+            name: name,
+            object: win
+        ];
+        CFRelease(name as *const c_void);
+    }
+}
+
+/// overlay 专用的通知观察者单例(只承载 resign-key 回调)。
+/// Singleton notification observer for the overlay (carries the resign-key callback only).
+unsafe fn overlay_observer() -> *mut AnyObject {
+    static OBSERVER: OnceLock<ObjPtr> = OnceLock::new();
+    OBSERVER
+        .get_or_init(|| {
+            let name = CString::new("OhMyTabOverlayObserver").unwrap();
+            let superclass = class!(NSObject) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(overlayWindowResigned:),
+                overlay_window_resigned as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            let inst: *mut AnyObject = msg_send![cls as *const AnyObject, new];
+            ObjPtr(inst)
+        })
+        .0
+}
+
+/// 浮窗失去 key → 取消切换。
+/// The overlay lost key -> cancel the switch.
+extern "C" fn overlay_window_resigned(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
+    // try_lock 是必须的:切换进行中(activate 目标 app → key 转移)会同步重入本回调,
+    // 而 on_cmd_released 全程持 TAB_STATE 锁(非重入)——拿不到锁就跳过:切换本来
+    // 就在结束浮窗,无需再取消。同理 hide_overlay 的 orderOut 也会触发本回调,
+    // visible 已置 false 后重入直接返回。
+    // try_lock is required: an in-flight switch (activating the target app steals key)
+    // re-enters this callback synchronously while on_cmd_released holds the non-reentrant
+    // TAB_STATE lock -- skip when busy, since the switch is dismissing the overlay anyway.
+    // hide_overlay's orderOut also fires this callback; the re-entry returns early once
+    // visible is false.
+    let should_hide = match TAB_STATE.try_lock() {
+        Ok(mut s) => match s.as_mut() {
+            Some(st) if st.visible => {
+                st.visible = false;
+                true
+            }
+            _ => false,
+        },
+        Err(_) => return,
+    };
+    if should_hide {
+        log_debug!("[overlay] cancelled by click outside (window resigned key)");
+        hide_overlay();
     }
 }
 
