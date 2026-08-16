@@ -1610,7 +1610,7 @@ fn open_mapping_panel(btn: Option<u32>) {
             let menu: *mut AnyObject = msg_send![action, menu];
             let item_cnt: usize = msg_send![menu, numberOfItems];
             let icons = [
-                "circle",
+                "dot.circle",
                 "slash.circle",
                 "keyboard",
                 "square.grid.2x2",
