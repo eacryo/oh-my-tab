@@ -489,8 +489,6 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
                     drop(state_opt);
                     refresh_highlight();
                     update_status_label();
-                } else {
-                    log_debug!("[overlay] mm select unchanged {}", idx);
                 }
             }
             break;
