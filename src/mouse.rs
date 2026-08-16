@@ -13,6 +13,7 @@ pub(crate) mod pointer;
 pub(crate) mod resolve;
 pub(crate) mod scrolling;
 pub(crate) mod shortcut;
+pub(crate) mod system_action;
 
 use crate::log_info;
 

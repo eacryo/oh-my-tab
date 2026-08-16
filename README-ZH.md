@@ -329,10 +329,12 @@ line_count = 3           # "line" 模式每 tick 行数(1..=10)
 [mouse.profiles.pointer]
 disable_acceleration = false  # 禁用系统指针加速(线性移动)
 
-# 按键映射:把中键/侧键(按钮号 >= 2)绑定成快捷键(按下 = keyDown,松开 = keyUp)。
+# 按键映射:把中键/侧键(按钮号 >= 2)绑定成动作(快捷键 / 系统功能 / 禁用)。
 # 左键(0)/右键(1)不允许绑定,防止把自己锁死。按钮号是鼠标按键编号:
 # 2 = 中键,3 = 后退,4 = 前进,5+ = 其他侧键/宏键(不同鼠标可能不同,按设备分别配置)。
-# 绑定 Cmd+Tab / Option+V 会打开**我们自己的**浮窗/剪贴板(合成事件回环到本应用的 tap)。
+# 值可以是快捷键("cmd+shift+v")、系统动作名("missioncontrol"/"launchpad"/"showdesktop"/
+# "appexpose",经 Dock 私有通知触发,不受系统快捷键占用影响)或 "none"(吞掉按键,按钮失效)。
+# 绑定 Cmd+Tab / Option+V 会打开**我们自己的**浮窗/剪贴板(内部派发,不走合成事件)。
 # Button mappings: bind middle/side buttons (button number >= 2) to shortcuts (press = keyDown,
 # release = keyUp). Left (0) / right (1) can't be bound (you'd lock yourself out of clicking).
 # Button numbers: 2 = middle, 3 = back, 4 = forward, 5+ = other side/macro buttons (they vary
@@ -352,7 +354,7 @@ line_count = 3
 
 ```
 
-鼠标设置也可以在设置窗口中调整(用**设备下拉框**选中某款已连接的鼠标,编辑它那一层)。切换 `mouse.enabled` **立即生效** —— 点确认时鼠标 event tap 会被热切换,无需重启应用。
+鼠标设置也可以在设置窗口中调整(用**设备下拉框**选中某款已连接的鼠标,编辑它那一层)。按键映射区**预定义**中键/后退/前进/宏键(按钮 2-7)各行:每行下拉选择动作类型(默认/无/自定义按键/Mission Control/Launchpad/显示桌面/App Expose),选「自定义按键」后点行内「录制」录组合键。切换 `mouse.enabled` **立即生效** —— 点确认时鼠标 event tap 会被热切换,无需重启应用。
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;日志
 

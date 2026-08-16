@@ -169,6 +169,55 @@ pub(crate) fn parse_shortcut(desc: &str) -> Result<Shortcut, String> {
     }
 }
 
+/// 一个绑定的解析结果:自定义按键 / 系统动作 / 显式禁用。
+/// A parsed binding: a custom key press, a system action, or explicit none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Binding {
+    Key(Shortcut),
+    /// 系统动作(按下时经 CoreDockSendNotification 触发,值为 Dock 通知字符串)。
+    /// A system action (fired via CoreDockSendNotification on press; value = the Dock
+    /// notification string).
+    System(&'static str),
+    /// 显式禁用:吞掉按键事件但不产生任何动作(按钮完全失效)。
+    /// Explicit none: swallow the button events without any action (the button is dead).
+    None,
+}
+
+/// 系统动作名 -> Dock 通知字符串(LinearMouse DockKit 同款私有通知)。
+/// System action name -> Dock notification string (the same private notifications as
+/// LinearMouse's DockKit).
+pub(crate) fn system_action_notification(name: &str) -> Option<&'static str> {
+    match name {
+        "missioncontrol" => Some("com.apple.expose.awake"),
+        "launchpad" => Some("com.apple.launchpad.toggle"),
+        "showdesktop" => Some("com.apple.showdesktop.awake"),
+        "appexpose" => Some("com.apple.expose.front.awake"),
+        _ => None,
+    }
+}
+
+/// 系统动作的显示/配置名(与 UI 下拉和配置值一致)。
+/// System actions' display/config names (consistent with the UI popup and config values).
+pub(crate) const SYSTEM_ACTIONS: [&str; 4] =
+    ["missioncontrol", "launchpad", "showdesktop", "appexpose"];
+
+/// 解析一个绑定描述:先试系统动作/显式禁用,再退到快捷键解析。
+/// 值可能是 "none"、系统动作名(如 "missioncontrol"),或 "cmd+shift+v" 这类快捷键。
+///
+/// Parse a binding description: try system actions / explicit none first, then fall back to
+/// shortcut parsing. Values are "none", a system-action name (e.g. "missioncontrol"), or a
+/// shortcut like "cmd+shift+v".
+pub(crate) fn parse_binding(desc: &str) -> Result<Binding, String> {
+    let lower = desc.trim().to_ascii_lowercase();
+    if lower == "none" {
+        return Ok(Binding::None);
+    }
+    if let Some(notif) = system_action_notification(&lower) {
+        return Ok(Binding::System(notif));
+    }
+    parse_shortcut(desc).map(Binding::Key)
+}
+
 /// 键码 -> 显示名(字母大写/数字/特殊键名)。
 /// Keycode -> display name (capitalized letter/digit/special name).
 fn key_name(keycode: u16) -> String {
@@ -364,7 +413,9 @@ pub(crate) fn validate_mappings(mappings: &HashMap<String, String>, prefix: &str
                 "{prefix}.button_mappings[{btn}]: invalid button number"
             )),
         }
-        if let Err(e) = parse_shortcut(desc) {
+        // 用 parse_binding:接受 "none" / 系统动作名 / 快捷键,其余报错。
+        // parse_binding accepts "none" / system-action names / shortcuts; anything else errors.
+        if let Err(e) = parse_binding(desc) {
             errs.push(format!("{prefix}.button_mappings[{btn}]: {e}"));
         }
     }
@@ -426,5 +477,40 @@ mod tests {
         m.insert("4".into(), "badkey".into()); // 快捷键非法
         let errs = validate_mappings(&m, "mouse.profiles[0]");
         assert_eq!(errs.len(), 2);
+    }
+
+    #[test]
+    fn parses_system_actions() {
+        assert_eq!(
+            parse_binding("missioncontrol").unwrap(),
+            Binding::System("com.apple.expose.awake")
+        );
+        assert_eq!(
+            parse_binding("launchpad").unwrap(),
+            Binding::System("com.apple.launchpad.toggle")
+        );
+        assert_eq!(
+            parse_binding("showdesktop").unwrap(),
+            Binding::System("com.apple.showdesktop.awake")
+        );
+        assert_eq!(
+            parse_binding("appexpose").unwrap(),
+            Binding::System("com.apple.expose.front.awake")
+        );
+        assert_eq!(
+            parse_binding("MissionControl").unwrap(),
+            Binding::System("com.apple.expose.awake")
+        );
+        assert_eq!(parse_binding("none").unwrap(), Binding::None);
+        assert!(matches!(parse_binding("cmd+c").unwrap(), Binding::Key(_)));
+    }
+
+    #[test]
+    fn validate_accepts_system_actions() {
+        let mut m = HashMap::new();
+        m.insert("3".into(), "missioncontrol".into());
+        m.insert("4".into(), "none".into());
+        let errs = validate_mappings(&m, "mouse.profiles[0]");
+        assert!(errs.is_empty(), "{errs:?}");
     }
 }
