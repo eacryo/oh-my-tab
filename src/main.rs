@@ -471,6 +471,12 @@ fn create_overlay_window() -> *mut AnyObject {
                 container_mouse_moved as *mut c_void,
                 types_v_obj.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(mouseDragged:),
+                container_mouse_moved as *mut c_void,
+                types_v_obj.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };
@@ -1126,6 +1132,14 @@ fn main() {
     if mouse_enabled {
         mouse::start();
     }
+
+    // 7b2. hover 轮询定时器在浮窗显示/隐藏时由 overlay 自行启停(show_overlay 调用
+    // start_hover_timer),无需在此启动:主线程 runloop 每 16ms 读全局鼠标位置命中
+    // 卡片,不依赖事件投递(侧键按住期间移动事件无法通过任何 tap/tracking 获取,实测)。
+    // The hover poll timer is started/stopped by the overlay itself (start_hover_timer
+    // from show_overlay): the main-thread runloop reads the global cursor position every
+    // 16ms and hit-tests the cards, independent of event delivery (moves while a side
+    // button is held can't be obtained via any tap/tracking, verified).
 
     // 7c. Apply pointer settings (disable system acceleration if configured).
     // 指针设置(配置了禁用系统加速时立即生效)。

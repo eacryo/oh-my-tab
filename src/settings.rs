@@ -223,7 +223,7 @@ const MAPPING_ROW_H: f64 = 28.0;
 /// 动作类型下拉的项,index 与语义一一对应(render/变化回调共用)。
 /// The action-type popup items; index maps 1:1 to semantics (shared by render and the
 /// change handler).
-const MAPPING_ACTION_KEYS: [&str; 7] = [
+const MAPPING_ACTION_KEYS: [&str; 8] = [
     "settings.mapping_action_default",
     "settings.mapping_action_none",
     "settings.mapping_action_key",
@@ -231,6 +231,7 @@ const MAPPING_ACTION_KEYS: [&str; 7] = [
     "settings.mapping_action_launchpad",
     "settings.mapping_action_showdesktop",
     "settings.mapping_action_appexpose",
+    "settings.mapping_action_switcher",
 ];
 unsafe impl Sync for SettingsUi {}
 static SETTINGS_UI: Mutex<Option<SettingsUi>> = Mutex::new(None);
@@ -995,18 +996,18 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
                         .unwrap_or(0);
                     (idx, false)
                 }
+                Ok(crate::mouse::shortcut::Binding::Switcher) => (7, false),
                 Ok(crate::mouse::shortcut::Binding::None) => (1, false),
                 Err(_) => (0, false),
             };
             // 按钮名。
             // The button name.
-            // NSTextField 文字比 popup 文字高 ~7pt:label 下移 7pt 让两行文字视觉对齐
-            // (label 透明无边框,frame 溢出无碍;实测校准)。
-            // The text field's glyphs sit ~7pt above the popup's: shift the label down 7pt
-            // so both lines align visually (transparent label; frame overflow is harmless;
-            // calibrated by screenshots).
+            // NSTextField 的 13pt 文字在 28pt 框内偏顶部(非垂直居中):label 下移 7pt
+            // 让文字中线与右侧按钮文字对齐(实测校准)。
+            // The 13pt text sits toward the TOP of the 28pt field (not vertically centered):
+            // shifting the label down 7pt aligns its midline with the buttons' (calibrated).
             let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-            let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(0.0, y + 7.0), NSSize::new(60.0, row_h))];
+            let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(0.0, y + 5.0), NSSize::new(60.0, row_h))];
             set_field(label, 0);
             let _: () = msg_send![label, setBezeled: false];
             let _: () = msg_send![label, setDrawsBackground: false];
@@ -1445,6 +1446,11 @@ pub(crate) extern "C" fn handle_mapping_confirm(
             }
             edits.insert(btn.to_string(), combo);
         }
+        7 => {
+            // 打开切换器。
+            // Open the switcher.
+            edits.insert(btn.to_string(), "switcher".to_string());
+        }
         i => {
             if let Some(name) = crate::mouse::shortcut::SYSTEM_ACTIONS.get((i - 3) as usize) {
                 edits.insert(btn.to_string(), name.to_string());
@@ -1512,6 +1518,7 @@ fn open_mapping_panel(btn: Option<u32>) {
                                 .unwrap_or(0),
                             String::new(),
                         ),
+                        Ok(Binding::Switcher) => (7, String::new()),
                         Ok(Binding::None) => (1, String::new()),
                         Err(_) => (0, String::new()),
                     }
@@ -1617,6 +1624,7 @@ fn open_mapping_panel(btn: Option<u32>) {
                 "square.grid.3x3",
                 "macwindow",
                 "rectangle.on.rectangle",
+                "arrow.left.arrow.right",
             ];
             for (i, icon) in icons.iter().enumerate().take(item_cnt) {
                 let item: *mut AnyObject = msg_send![menu, itemAtIndex: i as isize];

@@ -169,8 +169,8 @@ pub(crate) fn parse_shortcut(desc: &str) -> Result<Shortcut, String> {
     }
 }
 
-/// 一个绑定的解析结果:自定义按键 / 系统动作 / 显式禁用。
-/// A parsed binding: a custom key press, a system action, or explicit none.
+/// 一个绑定的解析结果:自定义按键 / 系统动作 / 打开切换器 / 显式禁用。
+/// A parsed binding: a custom key press, a system action, opening the switcher, or none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Binding {
     Key(Shortcut),
@@ -178,6 +178,12 @@ pub(crate) enum Binding {
     /// A system action (fired via CoreDockSendNotification on press; value = the Dock
     /// notification string).
     System(&'static str),
+    /// 打开应用切换浮窗:按下发 CmdTabPressed(浮窗开),抬起发 CmdReleased(提交切换)。
+    /// 与 Key Press 绑定 Cmd+Tab 的内部派发同一条路径,但不受快捷键模式影响。
+    /// Open the app switcher: press sends CmdTabPressed (overlay opens), release sends
+    /// CmdReleased (commits the switch). Same path as the internal dispatch of a
+    /// Cmd+Tab Key Press binding, but independent of the shortcut mode.
+    Switcher,
     /// 显式禁用:吞掉按键事件但不产生任何动作(按钮完全失效)。
     /// Explicit none: swallow the button events without any action (the button is dead).
     None,
@@ -211,6 +217,11 @@ pub(crate) fn parse_binding(desc: &str) -> Result<Binding, String> {
     let lower = desc.trim().to_ascii_lowercase();
     if lower == "none" {
         return Ok(Binding::None);
+    }
+    // 打开切换器(内部动作,非 Dock 通知)。
+    // Open the switcher (an internal action, not a Dock notification).
+    if lower == "switcher" {
+        return Ok(Binding::Switcher);
     }
     if let Some(notif) = system_action_notification(&lower) {
         return Ok(Binding::System(notif));

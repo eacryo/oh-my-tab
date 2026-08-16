@@ -147,6 +147,29 @@ extern "C" {
         keycode: u16,
         key_down: bool,
     ) -> CGEventRef;
+
+    // 查询事件的全局屏幕坐标(左下原点,点单位)。用于 hover 轮询读取当前鼠标位置。
+    // Query an event's global screen point (bottom-left origin, points). Used by the hover
+    // poll to read the current cursor position.
+    pub(crate) fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+
+    // 创建一个事件(source 传 null 用默认源):不带事件源的事件,其位置 = 当前鼠标位置。
+    // 用于 hover 轮询读全局鼠标位置——不依赖 mouseMoved 事件流(侧键按住期间系统不产生
+    // mouseMoved,NSEvent.mouseLocation 会冻结,实测)。
+    // Create an event (null source = default source): a source-less event carries the
+    // current mouse location. Used by the hover poll to read the global cursor without
+    // depending on the mouseMoved stream (while a side button is held the system emits no
+    // mouseMoved, freezing NSEvent.mouseLocation -- verified).
+    pub(crate) fn CGEventCreate(source: *const c_void) -> CGEventRef;
+}
+
+/// CGPoint 的 Rust 表示(与 CoreGraphics 的 CGPoint 同布局)。
+/// Rust representation of CGPoint (same layout as CoreGraphics').
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CGPoint {
+    pub x: f64,
+    pub y: f64,
 }
 
 // IOKit 私有 API:读写 IOHIDEvent 的浮点字段。
@@ -180,8 +203,10 @@ extern "C" {
         mode: CFStringRef,
     );
     pub(crate) fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    pub(crate) fn CFRunLoopGetMain() -> CFRunLoopRef;
     pub(crate) fn CFRunLoopRun();
     pub(crate) fn CFRunLoopStop(rl: CFRunLoopRef);
+    pub(crate) fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
 
     // 定时器(看门狗用)。fireDate 传 0 表示下一个 runloop 周期立即触发一次,interval 为周期(秒)。
     // 注意 context 参数是指向 CFRunLoopTimerContext 结构体的指针,Create 会拷贝其内容,
@@ -301,12 +326,12 @@ pub(crate) unsafe fn create_tap_with_retry(
 /// CFRunLoopTimerCreate 的 context 结构体(version=0,info 在回调时原样传回)。
 /// Context struct for CFRunLoopTimerCreate (version=0; info is passed back to the callback).
 #[repr(C)]
-struct CFRunLoopTimerContext {
-    version: isize,
-    info: *mut c_void,
-    retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
-    release: Option<unsafe extern "C" fn(*const c_void)>,
-    copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
+pub(crate) struct CFRunLoopTimerContext {
+    pub(crate) version: isize,
+    pub(crate) info: *mut c_void,
+    pub(crate) retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
+    pub(crate) release: Option<unsafe extern "C" fn(*const c_void)>,
+    pub(crate) copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
 }
 
 /// 看门狗回调:周期性检查 tap 是否被系统禁用,禁用则重新启用(自愈)。

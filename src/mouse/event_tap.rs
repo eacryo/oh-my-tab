@@ -209,6 +209,21 @@ unsafe extern "C" fn mouse_event_tap_callback(
                         }
                         return std::ptr::null_mut();
                     }
+                    Ok(crate::mouse::shortcut::Binding::Switcher) => {
+                        // 打开切换器(两段式):按下开浮窗,抬起提交切换 —— 与按住 Cmd+Tab
+                        // 的语义一致(选择在按住期间,提交在松开)。
+                        // Open the switcher (two-phase): press opens the overlay, release
+                        // commits -- same semantics as holding Cmd+Tab (selection while
+                        // held, commit on release).
+                        if let Some(tx) = crate::STATUS_EVENT_TX.get() {
+                            if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN {
+                                let _ = tx.send(crate::event_monitor::GlobalEvent::CmdTabPressed);
+                            } else if event_type == K_CG_EVENT_OTHER_MOUSE_UP {
+                                let _ = tx.send(crate::event_monitor::GlobalEvent::CmdReleased);
+                            }
+                        }
+                        return std::ptr::null_mut();
+                    }
                     Ok(crate::mouse::shortcut::Binding::None) => {
                         // 显式禁用:吞事件,无动作。
                         // Explicit none: swallow, no action.
