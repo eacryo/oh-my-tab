@@ -124,6 +124,7 @@ struct SettingsUi {
     clipboard_auto_expire_days: *mut AnyObject, // NSTextField: 自动过期天数(0=关闭)/ auto-expire days (0 = off)
     clipboard_show_source_app: *mut AnyObject,  // NSSwitch: 显示来源应用 / show the source app
     add_mapping_button: *mut AnyObject,         // NSButton: 添加映射 / add-mapping button
+    mapping_empty: *mut AnyObject, // NSTextField: 空状态提示(卡片内) / empty-state hint (in-card)
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
@@ -134,20 +135,25 @@ unsafe impl Send for SettingsUi {}
 /// - label:按钮名(只读)
 /// - action:动作类型下拉(tag = 按钮号)
 /// - record:录制组合键按钮(tag = 按钮号,仅 Key Press 时显示)
-/// - key_label:已录组合键的键帽显示(仅 Key Press 时显示)
+/// - caps:键帽胶囊(修饰符号 + 主键各一个圆角小方块,仅 Key Press 时显示)
 ///
 /// One button-mapping row:
 /// - label: the button name (read-only)
 /// - action: the action-type popup (tag = button number)
 /// - record: the record-combo button (tag = button number; visible only for Key Press)
-/// - key_label: the recorded combo's keycap display (visible only for Key Press)
+/// - caps: keycap pills (one rounded square per modifier symbol + main key, Key Press only)
 struct MappingRow {
     label: *mut AnyObject,
     action: *mut AnyObject,
     record: *mut AnyObject,
-    key_label: *mut AnyObject,
+    caps: Vec<*mut AnyObject>,
 }
 unsafe impl Send for MappingRow {}
+
+/// 映射区行高(独立于全局 row_h;build 的卡片高度与 render 共用)。
+/// Mapping-row height (independent of the global row_h; shared by the card height in build
+/// and by render).
+const MAPPING_ROW_H: f64 = 28.0;
 
 /// 动作类型下拉的项,index 与语义一一对应(render/变化回调共用)。
 /// The action-type popup items; index maps 1:1 to semantics (shared by render and the
@@ -859,7 +865,9 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             let _: () = msg_send![row.label, removeFromSuperview];
             let _: () = msg_send![row.action, removeFromSuperview];
             let _: () = msg_send![row.record, removeFromSuperview];
-            let _: () = msg_send![row.key_label, removeFromSuperview];
+            for cap in row.caps {
+                let _: () = msg_send![cap, removeFromSuperview];
+            }
         }
         let doc = u.mapping_doc;
         // 列表只显示已绑定的行 + 刚添加未配置的临时行(方案 A 的行内配置,动态行)。
@@ -882,18 +890,23 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             items.len()
         );
         items.sort_by_key(|(b, _)| *b);
-        let row_h = 24.0;
-        let doc_h = items.len() as f64 * row_h;
+        let row_h = MAPPING_ROW_H;
+        // 文档恒高卡片高度(行少时行从顶部排起,不留底部空白;行多时滚动)。
+        // The document is always the card height (rows start at the top; scroll when more).
+        // 空状态提示:无行时显示。
+        // Empty-state hint: shown when there are no rows.
+        let _: () = msg_send![u.mapping_empty, setHidden: !items.is_empty()];
         // 只改高度,宽度保持初始值:曾用 setFrameSize(0.0, doc_h) 把宽清零,
         // 宽度为 0 的文档视图 hit-test 失败 —— 行内删除按钮永远点不到。
         // Resize height only, keeping the initial width: setFrameSize(0.0, doc_h) used to
         // zero the width, and a zero-width document view fails hit-testing -- the delete
         // buttons became unclickable.
-        let cur_frame: NSRect = msg_send![doc, frame];
-        let _: () = msg_send![doc, setFrameSize: NSSize::new(cur_frame.size.width, doc_h)];
-        // flipped:y 最大在顶行。
-        // Flipped: the top row has the largest y.
-        let mut y = doc_h - row_h;
+        // 卡片高度固定(build 时定为 3 行);行多时由圆角 + masksToBounds 裁剪。
+        // The card height is fixed (3 rows at build time); extra rows are clipped by the
+        // rounded corner + masksToBounds.
+        // flipped:y=0 在顶部,行从顶部依次向下排。
+        // Flipped: y=0 is the top; rows stack down from the top.
+        let mut y = 0.0;
         let target = MENU_TARGET.lock().unwrap().unwrap().0;
         for (btn, desc) in items {
             // 动作类型 index:默认/无/系统动作/快捷键(快捷键 = Key Press)。
@@ -915,8 +928,13 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             };
             // 按钮名。
             // The button name.
+            // NSTextField 文字比 popup 文字高 ~7pt:label 下移 7pt 让两行文字视觉对齐
+            // (label 透明无边框,frame 溢出无碍;实测校准)。
+            // The text field's glyphs sit ~7pt above the popup's: shift the label down 7pt
+            // so both lines align visually (transparent label; frame overflow is harmless;
+            // calibrated by screenshots).
             let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-            let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(0.0, y), NSSize::new(60.0, row_h))];
+            let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(0.0, y + 7.0), NSSize::new(60.0, row_h))];
             set_field(label, 0);
             let _: () = msg_send![label, setBezeled: false];
             let _: () = msg_send![label, setDrawsBackground: false];
@@ -930,11 +948,41 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             // The action-type popup (1:1 with MAPPING_ACTION_KEYS).
             let popup_items: Vec<String> = MAPPING_ACTION_KEYS.iter().map(|k| t(k)).collect();
             let popup_items: Vec<&str> = popup_items.iter().map(|s| s.as_str()).collect();
-            let action: *mut AnyObject = make_popup(64.0, y, 130.0, row_h, &popup_items, 0);
+            // NSPopUpButton 内部文字比 NSTextField 偏低 ~11pt:下拉 frame 上移并收矮,
+            // 让两行文字视觉对齐(实测校准)。
+            // The popup's text renders ~11pt lower than a text field's: nudge the popup up
+            // and shrink it so both baselines align visually (calibrated by screenshots).
+            let action: *mut AnyObject = make_popup(64.0, y + 4.0, 130.0, 24.0, &popup_items, 0);
             let _: () = msg_send![action, setTag: btn as isize];
             let _: () = msg_send![action, selectItemAtIndex: action_idx as isize];
             let _: () = msg_send![action, setTarget: target];
             let _: () = msg_send![action, setAction: sel!(handleMappingActionChanged:)];
+            // 下拉各项加 SF Symbol 图标(Default/None/Key Press/系统功能)。
+            // SF Symbol icons on the popup items (Default/None/Key Press/system actions).
+            let menu: *mut AnyObject = msg_send![action, menu];
+            let item_cnt: usize = msg_send![menu, numberOfItems];
+            let icons = [
+                "circle",
+                "slash.circle",
+                "keyboard",
+                "square.grid.2x2",
+                "square.grid.3x3",
+                "macwindow",
+                "rectangle.on.rectangle",
+            ];
+            for (i, icon) in icons.iter().enumerate().take(item_cnt) {
+                let item: *mut AnyObject = msg_send![menu, itemAtIndex: i as isize];
+                let sym = make_nsstring(icon);
+                let img: *mut AnyObject = msg_send![
+                    class!(NSImage),
+                    imageWithSystemSymbolName: sym,
+                    accessibilityDescription: std::ptr::null::<AnyObject>()
+                ];
+                CFRelease(sym as *const c_void);
+                if !img.is_null() {
+                    let _: () = msg_send![item, setImage: img];
+                }
+            }
             let _: () = msg_send![doc, addSubview: action];
             release_obj(action);
             // 按键区(仅 Key Press 显示):录制按钮 + 键帽。
@@ -951,27 +999,56 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             let _: () = msg_send![record, setHidden: !is_key];
             let _: () = msg_send![doc, addSubview: record];
             release_obj(record);
-            let key_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-            let key_label: *mut AnyObject = msg_send![key_label, initWithFrame: NSRect::new(NSPoint::new(268.0, y), NSSize::new(76.0, row_h))];
-            set_field(key_label, 0);
-            let _: () = msg_send![key_label, setBezeled: false];
-            let _: () = msg_send![key_label, setDrawsBackground: false];
-            let _: () = msg_send![key_label, setEditable: false];
-            let _: () = msg_send![key_label, setHidden: !is_key];
+            // 键帽胶囊:修饰符号 + 主键各一个圆角小方块(像真实键盘键帽)。
+            // Keycap pills: one rounded square per modifier symbol + the main key (like
+            // real keyboard keycaps).
+            let mut caps: Vec<*mut AnyObject> = Vec::new();
             if is_key {
-                let key_ns = make_nsstring(&display_shortcut(&desc));
-                let _: () = msg_send![key_label, setStringValue: key_ns];
-                CFRelease(key_ns as *const c_void);
+                let key_str = display_shortcut(&desc);
+                let cap_size = 20.0;
+                let cap_y = y + (row_h - cap_size) / 2.0;
+                let mut cap_x = 268.0;
+                for ch in key_str.chars() {
+                    let cap: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+                    let cap: *mut AnyObject = msg_send![cap, initWithFrame: NSRect::new(NSPoint::new(cap_x, cap_y), NSSize::new(cap_size, cap_size))];
+                    set_field(cap, 0);
+                    let _: () = msg_send![cap, setBezeled: false];
+                    let _: () = msg_send![cap, setDrawsBackground: false];
+                    let _: () = msg_send![cap, setEditable: false];
+                    let _: () = msg_send![cap, setAlignment: 1isize]; // center
+                    let ch_ns = make_nsstring(&ch.to_string());
+                    let _: () = msg_send![cap, setStringValue: ch_ns];
+                    CFRelease(ch_ns as *const c_void);
+                    // 圆角浅灰底。
+                    // Rounded light-gray backing.
+                    let _: () = msg_send![cap, setWantsLayer: true];
+                    let cap_layer: *mut AnyObject = msg_send![cap, layer];
+                    let _: () = msg_send![cap_layer, setCornerRadius: 4.0f64];
+                    let cap_bg: *mut AnyObject = msg_send![class!(NSColor), separatorColor];
+                    layer_set_background(cap_layer, ns_color_to_cg(cap_bg));
+                    let _: () = msg_send![doc, addSubview: cap];
+                    release_obj(cap);
+                    caps.push(cap);
+                    cap_x += cap_size + 4.0;
+                }
             }
-            let _: () = msg_send![doc, addSubview: key_label];
-            release_obj(key_label);
+            // 行底分隔线(最后一行被卡片底圆角裁掉,无妨)。
+            // Row-bottom separator (the last row's line is clipped by the card corner).
+            let sep: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let sep: *mut AnyObject = msg_send![sep, initWithFrame: NSRect::new(NSPoint::new(0.0, y + row_h - 1.0), NSSize::new(380.0, 1.0))];
+            let _: () = msg_send![sep, setWantsLayer: true];
+            let sep_layer: *mut AnyObject = msg_send![sep, layer];
+            let sep_color: *mut AnyObject = msg_send![class!(NSColor), separatorColor];
+            layer_set_background(sep_layer, ns_color_to_cg(sep_color));
+            let _: () = msg_send![doc, addSubview: sep];
+            release_obj(sep);
             u.mapping_rows.push(MappingRow {
                 label,
                 action,
                 record,
-                key_label,
+                caps,
             });
-            y -= row_h;
+            y += row_h;
         }
     }
 }
@@ -2433,6 +2510,7 @@ fn create_settings_window() {
             clipboard_auto_expire_days: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
             add_mapping_button: std::ptr::null_mut(),
+            mapping_empty: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
             ok_button: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
@@ -3119,33 +3197,75 @@ fn create_settings_window() {
             content_w - 24.0,
         );
         y -= 8.0 + row_h;
-        // 滚动容器:固定高度 3 行,内容多时滚动。
-        // Scroll container: fixed height of 3 rows; scrolls when there are more.
-        let list_h = row_h * 3.0;
-        let mapping_scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
-        let mapping_scroll: *mut AnyObject = msg_send![mapping_scroll, initWithFrame: NSRect::new(NSPoint::new(label_x, y - list_h), NSSize::new(content_w - 24.0, list_h))];
-        let _: () = msg_send![mapping_scroll, setBorderType: 1isize]; // NSBezelBorder
-        let _: () = msg_send![mapping_scroll, setHasVerticalScroller: true];
-        let _: () = msg_send![mapping_scroll, setAutohidesScrollers: true];
-        let _: () = msg_send![mapping_scroll, setDrawsBackground: false];
-        // flipped 文档视图:行从顶向下排。
-        // Flipped document view: rows stack top-down.
-        let mapping_doc: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let mapping_doc: *mut AnyObject = msg_send![mapping_doc, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(content_w - 40.0, list_h))];
-        let _: () = msg_send![mapping_doc, setFlipped: true];
-        let _: () = msg_send![mapping_scroll, setDocumentView: mapping_doc];
-        release_obj(mapping_doc);
-        let _: () = msg_send![mouse_view, addSubview: mapping_scroll];
-        release_obj(mapping_scroll);
-        ui.mapping_scroll = mapping_scroll;
-        ui.mapping_doc = mapping_doc;
-        // 注意:窗口内容视图非 flipped(frame origin 是底部),按钮视觉顶部 = y + row_h。
-        // 若只减 14+list_h,按钮会向上伸进滚动容器 12pt(重叠)。必须再减 row_h。
-        y -= 14.0 + list_h + row_h;
-        // 添加映射按钮(录制在独立弹出浮窗里进行,见 show_rec_panel)。
-        // Add-mapping button (recording happens in a separate popup panel, see show_rec_panel).
+        // 显式坐标布局(不再依赖游标链):卡片顶部 = 当前 y,卡片 [top-list_h, top]。
+        // Explicit coordinates (no cursor chain): card top = current y, card spans
+        // [top-list_h, top] (the content view is NOT flipped, so a frame origin is the
+        // bottom edge).
+        let list_h = MAPPING_ROW_H * 3.0;
+        // 卡片顶部 = 当前 y(非 flipped,origin 是底部)。
+        // Card top = current y (not flipped; a frame origin is the bottom edge).
+        let card_bottom = y - list_h;
+        let card_w = content_w - 24.0;
+        // 卡片底色:一块独立的圆角背景视图,先 add(mouse_view 上),scroll 盖在它上面。
+        // NSScrollView 的 clipView 白底(及其 layer 透明化)实测都不可靠,干脆在 scroll
+        // 底下垫一块圆角底色,scroll 自身完全透明 —— 与 clip 的绘制彻底解耦。
+        // The card color is a standalone rounded background view added FIRST (on mouse_view),
+        // with the scroll view on top. The clip view's white fill (and its layer
+        // transparency) proved unreliable, so a rounded backdrop sits under the scroll and
+        // the scroll itself is fully transparent -- decoupled from the clip's drawing.
+        // 卡片:一块圆角底色视图,行直接铺在它上面(flipped,行从顶排)。
+        // 不用 NSScrollView —— 它的 clipView 白底反复盖住底色(所有 layer 透明手段
+        // 实测都不可靠),普通视图平铺干净利落;行数少(最多 7 个按钮)无需滚动,
+        // 溢出由圆角 + masksToBounds 裁掉。
+        // The card is one rounded background view with the rows laid directly on it
+        // (flipped; rows stack from the top). No NSScrollView -- its clip view's white fill
+        // kept hiding the background (every layer-transparency trick proved unreliable);
+        // plain views are clean. Row counts are small (≤ 7 buttons) so scrolling is
+        // unnecessary; overflow is clipped by the rounded corner + masksToBounds.
+        // 卡片背景:NSVisualEffectView(material 自绘,跟随主题)。
+        // 不要用 NSView+layer 的 controlBackgroundColor —— 动态系统色的 CGColor 为 nil,
+        // layer 底色不渲染(实测);material 由控件自绘,不依赖 layer 色。
+        // Card background: NSVisualEffectView (material drawn by the control, theme-aware).
+        // Don't use NSView+layer with controlBackgroundColor -- dynamic system colors give
+        // a nil CGColor and the layer fill never renders (verified); the material is drawn
+        // by the control itself, independent of layer colors.
+        let card_bg: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+        let card_bg: *mut AnyObject = msg_send![card_bg, initWithFrame: NSRect::new(NSPoint::new(label_x, card_bottom), NSSize::new(card_w, list_h))];
+        let _: () = msg_send![card_bg, setBlendingMode: 1u64]; // WithinWindow
+        let _: () = msg_send![card_bg, setMaterial: 0u64]; // NSVisualEffectMaterialAppearanceBased(跟随主题)
+        let _: () = msg_send![card_bg, setState: 1u64]; // Active
+        let _: () = msg_send![card_bg, setFlipped: true];
+        let _: () = msg_send![card_bg, setWantsLayer: true];
+        let bg_layer: *mut AnyObject = msg_send![card_bg, layer];
+        let _: () = msg_send![bg_layer, setCornerRadius: 8.0f64];
+        let _: () = msg_send![bg_layer, setMasksToBounds: true];
+        let _: () = msg_send![mouse_view, addSubview: card_bg];
+        release_obj(card_bg);
+        ui.mapping_scroll = std::ptr::null_mut();
+        ui.mapping_doc = card_bg;
+        // 空状态提示(行数为 0 时显示在卡片内;render 时控制显隐)。
+        // Empty-state hint (shown inside the card when there are no rows; toggled by render).
+        let empty: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let empty: *mut AnyObject = msg_send![empty, initWithFrame: NSRect::new(NSPoint::new(label_x, card_bottom), NSSize::new(card_w, list_h))];
+        set_field(empty, 0);
+        let _: () = msg_send![empty, setBezeled: false];
+        let _: () = msg_send![empty, setDrawsBackground: false];
+        let _: () = msg_send![empty, setEditable: false];
+        let _: () = msg_send![empty, setAlignment: 1isize]; // center
+        let empty_ns = make_nsstring(&t("settings.mapping_empty"));
+        let _: () = msg_send![empty, setStringValue: empty_ns];
+        CFRelease(empty_ns as *const c_void);
+        let empty_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        let _: () = msg_send![empty, setTextColor: empty_color];
+        let _: () = msg_send![empty, setHidden: true];
+        let _: () = msg_send![card_bg, addSubview: empty];
+        release_obj(empty);
+        ui.mapping_empty = empty;
+        // 添加按钮:卡片底部下方 14pt(显式坐标,origin = 底部边)。
+        // Add button: 14pt below the card bottom (explicit coordinate; origin = bottom edge).
+        let btn_bottom = card_bottom - 14.0 - row_h;
         let add_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let add_btn: *mut AnyObject = msg_send![add_btn, initWithFrame: NSRect::new(NSPoint::new(label_x, y), NSSize::new(180.0, row_h))];
+        let add_btn: *mut AnyObject = msg_send![add_btn, initWithFrame: NSRect::new(NSPoint::new(label_x, btn_bottom), NSSize::new(card_w, row_h))];
         let _: () = msg_send![add_btn, setBezelStyle: 2isize]; // NSRoundedBezelStyle
         let add_title = make_nsstring(&t("settings.row_add_mapping"));
         let _: () = msg_send![add_btn, setTitle: add_title];
