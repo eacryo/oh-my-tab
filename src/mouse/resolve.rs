@@ -11,6 +11,7 @@
 use crate::config::{Config, MouseProfile, CONFIG};
 use crate::mouse::device::DeviceKey;
 use crate::mouse::scrolling::ScrollMode;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// 解析后的具体生效配置(非 Option,所有字段已定)。
@@ -21,6 +22,9 @@ pub(crate) struct ResolvedMouse {
     pub scroll_mode: ScrollMode,
     pub line_count: u32,
     pub disable_acceleration: bool,
+    // 按键映射:按钮号 -> 快捷键描述(逐键合并,后者覆盖)。
+    // Button mappings: button number -> shortcut description (per-key merge, later wins).
+    pub button_mappings: HashMap<String, String>,
 }
 
 impl Default for ResolvedMouse {
@@ -30,6 +34,7 @@ impl Default for ResolvedMouse {
             scroll_mode: ScrollMode::Default,
             line_count: 3,
             disable_acceleration: false,
+            button_mappings: HashMap::new(),
         }
     }
 }
@@ -106,6 +111,7 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
     r.scroll_mode = defaults.scroll_mode;
     r.line_count = defaults.line_count;
     r.disable_acceleration = defaults.disable_acceleration;
+    r.button_mappings = HashMap::new();
 
     // 遍历 profiles,合并所有匹配档(后者优先)。
     // Iterate profiles, merging all matching ones (later wins).
@@ -126,6 +132,11 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
             if let Some(da) = ptr.disable_acceleration {
                 r.disable_acceleration = da;
             }
+        }
+        // 按键映射:逐键并入(同键后者覆盖)。
+        // Button mappings: fold in per key (same key: later wins).
+        for (btn, desc) in &p.button_mappings {
+            r.button_mappings.insert(btn.clone(), desc.clone());
         }
     }
 

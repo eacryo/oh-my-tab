@@ -8,9 +8,11 @@
 pub(crate) mod device;
 pub(crate) mod event_tap;
 pub(crate) mod ffi;
+pub(crate) mod keysim;
 pub(crate) mod pointer;
 pub(crate) mod resolve;
 pub(crate) mod scrolling;
+pub(crate) mod shortcut;
 
 use crate::log_info;
 

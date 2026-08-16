@@ -20,10 +20,12 @@ use crate::event_tap::{
     K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, K_CG_SESSION_EVENT_TAP, SYNTHETIC_MARKER,
 };
 use crate::mouse::device;
+use crate::mouse::keysim;
 use crate::mouse::resolve;
 use crate::mouse::scrolling::compute_delta;
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
@@ -38,9 +40,19 @@ const K_CG_EVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
 const K_CG_EVENT_OTHER_MOUSE_UP: CGEventType = 26;
 const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
 
-// mouseEventButtonNumber 字段(field 0),用于日志识别按键编号。
-// mouseEventButtonNumber field (field 0), for log button-number identification.
-const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 0;
+// mouseEventButtonNumber 字段(field 3,不是 0 —— 0 是 kCGMouseEventNumber 事件编号,
+// 用它拿到的是一路递增的事件号而非真实按钮号,导致录制/匹配全错)。
+// mouseEventButtonNumber field (field 3, NOT 0 -- 0 is kCGMouseEventNumber, an ever-increasing
+// event counter, so reading it yields the counter instead of the real button number, breaking
+// recording and matching).
+const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 3;
+
+/// 按键映射录制中标志:设置界面录制按钮/组合键期间置位,tap 跳过映射执行,
+/// 避免录制时误触发绑定(LinearMouse 的 SettingsState.shared.recording 同款)。
+/// Recording-in-progress flag: set while the settings UI records a button/combo; the tap
+/// skips mapping execution so recording never fires a binding (same as LinearMouse's
+/// SettingsState.shared.recording).
+pub(crate) static RECORDING: AtomicBool = AtomicBool::new(false);
 
 /// 合成一个滚轮事件并 post 到 session 层。
 /// 行模式按"行"单位 post;默认模式透传原 delta。
@@ -156,6 +168,34 @@ unsafe extern "C" fn mouse_event_tap_callback(
             button_name(button),
             flags
         );
+        // 按键映射:仅中键及侧键(button >= 2)参与;左键(0)/右键(1)永不绑定,
+        // 防止用户把自己锁死(无法点击)。录制期间跳过执行。
+        // Button mappings: only middle/side buttons (>= 2) take part; left (0)/right (1)
+        // are never bound so the user can't lock themselves out of clicking. Skipped while
+        // recording.
+        if button >= 2 && !RECORDING.load(Ordering::Relaxed) {
+            let dev_key = device::device_from_cgevent(event);
+            let resolved = resolve::resolve(dev_key);
+            if let Some(desc) = resolved.button_mappings.get(&button.to_string()) {
+                // 按下:合成目标快捷键的 keyDown(回环进我们的 tap → 浮窗/剪贴板/透传);
+                // 释放:合成 keyUp + 修饰键 flagsChanged(→ CmdReleased 提交切换)。
+                // Both directions swallow the original event (the app never sees the raw
+                // side-button click).
+                if let Ok(sc) = crate::mouse::shortcut::parse_shortcut(desc) {
+                    match event_type {
+                        K_CG_EVENT_OTHER_MOUSE_DOWN => {
+                            keysim::press_down(sc.keycode, sc.flags, desc);
+                            return std::ptr::null_mut();
+                        }
+                        K_CG_EVENT_OTHER_MOUSE_UP => {
+                            keysim::release_up(sc.keycode, sc.flags, desc);
+                            return std::ptr::null_mut();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         event
     }
 }

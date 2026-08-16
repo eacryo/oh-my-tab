@@ -115,6 +115,7 @@ mod tests {
             scroll_mode: mode,
             line_count,
             disable_acceleration: false,
+            button_mappings: std::collections::HashMap::new(),
         }
     }
 

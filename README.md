@@ -33,7 +33,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 - <img height="14" src="docs/icons/gear.svg"> **Hot-reloadable TOML**: validated config from the menu.
 - <img height="14" src="docs/icons/globe.svg"> **Zero-dependency i18n**: English / Simplified / Traditional Chinese, live system-language follow.
 - <img height="14" src="docs/icons/note.svg"> **Per-launch logs**: 30-day retention ([Logging](#logging)).
-- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration ([Configuration](#configuration)).
+- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration, and **side-button → shortcut mapping** ([Configuration](#configuration)).
 - <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images, file copies — search, pin, delete, expiry, persistence ([Clipboard history](#clipboard-history)).
 
 <br />
@@ -330,6 +330,19 @@ line_count = 3           # lines per tick in "line" mode (1..=10)
 
 [mouse.profiles.pointer]
 disable_acceleration = false  # disable system pointer acceleration (linear tracking)
+
+# Button mappings: bind middle/side buttons (button number >= 2) to shortcuts (press = keyDown,
+# release = keyUp). Left (0) / right (1) can't be bound (you'd lock yourself out of clicking).
+# Button numbers: 2 = middle, 3 = back, 4 = forward, 5+ = other side/macro buttons (they vary
+# per mouse -- configure per device). Binding Cmd+Tab / Option+V opens OUR overlay / clipboard
+# (synthetic events loop back into this app's own tap).
+# 按键映射:把中键/侧键(按钮号 >= 2)绑定成快捷键(按下 = keyDown,松开 = keyUp)。
+# 左键(0)/右键(1)不允许绑定,防止把自己锁死。按钮号是鼠标按键编号:2 = 中键,3 = 后退,
+# 4 = 前进,5+ = 其他侧键/宏键(不同鼠标可能不同,按设备分别配置)。
+# 绑定 Cmd+Tab / Option+V 会打开**我们自己的**浮窗/剪贴板(合成事件回环到本应用的 tap)。
+[ mouse.profiles.button_mappings ]
+"3" = "cmd+shift+v"
+"4" = "alt+tab"
 
 # Example per-device override layer (Logitech MCHOSE G3 V2):
 [[mouse.profiles]]

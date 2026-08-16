@@ -228,6 +228,13 @@ pub struct MouseProfile {
     // Line mode lines per notch (1..=10).
     pub line_count: Option<u32>,
     pub pointer: Option<PartialPointerSection>,
+    // 按键映射:按钮号(字符串,>=2)-> 快捷键描述(如 "cmd+shift+v")。
+    // 左键(0)/右键(1)不允许绑定,避免用户把自己锁死(无法点击任何界面)。
+    // Button mappings: button number (string, >= 2) -> shortcut description (e.g. "cmd+shift+v").
+    // Left (0) and right (1) buttons cannot be bound, so the user can never lock themselves
+    // out of clicking.
+    #[serde(default)]
+    pub button_mappings: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -709,6 +716,12 @@ impl Config {
                     errs.push(format!("{prefix}.line_count: {msg}"));
                 }
             }
+            // 按键映射:按钮号合法(数字且 >= 2)+ 快捷键可解析。
+            // Button mappings: valid button numbers (numeric, >= 2) + parseable shortcuts.
+            errs.extend(crate::mouse::shortcut::validate_mappings(
+                &p.button_mappings,
+                &prefix,
+            ));
         }
 
         errs
@@ -906,6 +919,14 @@ impl Config {
                     .any(|e| e.starts_with(&format!("{prefix}.line_count")))
             {
                 merged_p.line_count = p.line_count;
+            }
+            // 按键映射:逐键校验,只保留合法项(非法按钮号/快捷键丢弃)。
+            // Button mappings: per-entry validation; only valid entries survive.
+            for (btn, desc) in &p.button_mappings {
+                let ep = format!("{prefix}.button_mappings[{btn}]");
+                if !errs.iter().any(|e| e.starts_with(&ep)) {
+                    merged_p.button_mappings.insert(btn.clone(), desc.clone());
+                }
             }
             // pointer.disable_acceleration 是 bool,恒有效。
             // pointer.disable_acceleration is a bool, always valid.

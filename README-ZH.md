@@ -33,7 +33,7 @@
 - <img height="14" src="docs/icons/gear.svg"> **TOML 热重载**:配置经校验,菜单一键生效。
 - <img height="14" src="docs/icons/globe.svg"> **零依赖国际化**:英文/简中/繁中,实时跟随系统语言。
 - <img height="14" src="docs/icons/note.svg"> **每次启动一份日志**:保留 30 天([日志](#日志))。
-- <img height="14" src="docs/icons/sliders.svg"> **鼠标控制**(可选):滚动模式/反向、按设备加速([配置](#配置))。
+- <img height="14" src="docs/icons/sliders.svg"> **鼠标控制**(可选):滚动模式/反向、按设备加速、**侧键→快捷键映射**([配置](#配置))。
 - <img height="14" src="docs/icons/copy.svg"> **剪贴板历史**(可选):文本/图片/文件复制——搜索、置顶、删除、过期、持久化([剪贴板历史](#剪贴板历史))。
 
 <br />
@@ -328,6 +328,19 @@ line_count = 3           # "line" 模式每 tick 行数(1..=10)
 
 [mouse.profiles.pointer]
 disable_acceleration = false  # 禁用系统指针加速(线性移动)
+
+# 按键映射:把中键/侧键(按钮号 >= 2)绑定成快捷键(按下 = keyDown,松开 = keyUp)。
+# 左键(0)/右键(1)不允许绑定,防止把自己锁死。按钮号是鼠标按键编号:
+# 2 = 中键,3 = 后退,4 = 前进,5+ = 其他侧键/宏键(不同鼠标可能不同,按设备分别配置)。
+# 绑定 Cmd+Tab / Option+V 会打开**我们自己的**浮窗/剪贴板(合成事件回环到本应用的 tap)。
+# Button mappings: bind middle/side buttons (button number >= 2) to shortcuts (press = keyDown,
+# release = keyUp). Left (0) / right (1) can't be bound (you'd lock yourself out of clicking).
+# Button numbers: 2 = middle, 3 = back, 4 = forward, 5+ = other side/macro buttons (they vary
+# per mouse -- configure per device). Binding Cmd+Tab / Option+V opens OUR overlay / clipboard
+# (synthetic events loop back into this app's own tap).
+[ mouse.profiles.button_mappings ]
+"3" = "cmd+shift+v"
+"4" = "alt+tab"
 
 # 按设备覆盖示例(Logitech MCHOSE G3 V2):
 [[mouse.profiles]]

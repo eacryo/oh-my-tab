@@ -737,6 +737,42 @@ fn setup_status_bar() {
                 handle_line_count_changed as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(handleAddMapping:),
+                handle_add_mapping as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleDeleteMapping:),
+                handle_delete_mapping as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleRecordingStage:),
+                handle_recording_stage as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleRecordingFinished:),
+                handle_recording_finished as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleRecordingCancelled:),
+                handle_recording_cancelled as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleCancelRecording:),
+                handle_cancel_recording as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };
