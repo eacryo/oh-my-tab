@@ -344,6 +344,13 @@ disable_acceleration = false  # 禁用系统指针加速(线性移动)
 "3" = "cmd+shift+v"
 "4" = "alt+tab"
 
+# 该设备档的映射总开关(默认 true;false 时该鼠标的映射不执行,事件透传)。
+# 每个设备档独立 —— 不同鼠标可以有不同值。也可以写入 "所有鼠标" 默认档。
+# Per-profile mappings master switch (default true; false skips this mouse's mappings,
+# events pass through). Independent per device -- different mice can differ. The default
+# "All Mice" profile can carry its own value too.
+button_mappings_enabled = true
+
 # 按设备覆盖示例(Logitech MCHOSE G3 V2):
 [[mouse.profiles]]
 device_vendor_id = 10007

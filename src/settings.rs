@@ -124,7 +124,8 @@ struct SettingsUi {
     clipboard_auto_expire_days: *mut AnyObject, // NSTextField: 自动过期天数(0=关闭)/ auto-expire days (0 = off)
     clipboard_show_source_app: *mut AnyObject,  // NSSwitch: 显示来源应用 / show the source app
     add_mapping_button: *mut AnyObject,         // NSButton: 添加映射 / add-mapping button
-    mapping_empty: *mut AnyObject, // NSTextField: 空状态提示(卡片内) / empty-state hint (in-card)
+    mapping_enabled: *mut AnyObject, // NSSwitch: 按键映射总开关(per-device) / mappings master switch (per-device)
+    mapping_empty: *mut AnyObject,   // NSTextField: 空状态提示(卡片内) / empty-state hint (in-card)
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
@@ -906,6 +907,13 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
         // rounded corner + masksToBounds.
         // flipped:y=0 在顶部,行从顶部依次向下排。
         // Flipped: y=0 is the top; rows stack down from the top.
+        let mappings_on = {
+            let st: isize = msg_send![u.mapping_enabled, state];
+            st == 1
+        };
+        // 添加按钮一并置灰(开关关闭时不可添加新映射)。
+        // The add button greys out too (no new mappings while off).
+        let _: () = msg_send![u.add_mapping_button, setEnabled: mappings_on];
         let mut y = 0.0;
         let target = MENU_TARGET.lock().unwrap().unwrap().0;
         for (btn, desc) in items {
@@ -942,6 +950,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             let name_ns = make_nsstring(&button_name(btn));
             let _: () = msg_send![label, setStringValue: name_ns];
             CFRelease(name_ns as *const c_void);
+            let _: () = msg_send![label, setEnabled: mappings_on];
             let _: () = msg_send![doc, addSubview: label];
             release_obj(label);
             // 动作类型下拉(与 MAPPING_ACTION_KEYS 一一对应)。
@@ -955,6 +964,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             let action: *mut AnyObject = make_popup(64.0, y + 4.0, 130.0, 24.0, &popup_items, 0);
             let _: () = msg_send![action, setTag: btn as isize];
             let _: () = msg_send![action, selectItemAtIndex: action_idx as isize];
+            let _: () = msg_send![action, setEnabled: mappings_on];
             let _: () = msg_send![action, setTarget: target];
             let _: () = msg_send![action, setAction: sel!(handleMappingActionChanged:)];
             // 下拉各项加 SF Symbol 图标(Default/None/Key Press/系统功能)。
@@ -997,6 +1007,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             let _: () = msg_send![record, setTitle: rec_title];
             CFRelease(rec_title as *const c_void);
             let _: () = msg_send![record, setHidden: !is_key];
+            let _: () = msg_send![record, setEnabled: mappings_on];
             let _: () = msg_send![doc, addSubview: record];
             release_obj(record);
             // 键帽胶囊:修饰符号 + 主键各一个圆角小方块(像真实键盘键帽)。
@@ -1016,6 +1027,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
                     let _: () = msg_send![cap, setDrawsBackground: false];
                     let _: () = msg_send![cap, setEditable: false];
                     let _: () = msg_send![cap, setAlignment: 1isize]; // center
+                    let _: () = msg_send![cap, setEnabled: mappings_on];
                     let ch_ns = make_nsstring(&ch.to_string());
                     let _: () = msg_send![cap, setStringValue: ch_ns];
                     CFRelease(ch_ns as *const c_void);
@@ -1454,6 +1466,17 @@ pub(crate) extern "C" fn handle_add_mapping(_self: *mut c_void, _cmd: Sel, _send
     );
     log_info!("[mouse] recording button mapping (step 1: press a mouse button)");
     *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
+}
+
+/// 映射总开关变化回调:重渲染映射行(关闭时行控件置灰不可点)。
+/// The mappings master switch toggled: re-render the rows (greyed out and inert when off).
+pub(crate) extern "C" fn handle_mapping_enabled_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    render_mapping_rows();
+    log_info!("[mouse] mappings master switch toggled");
 }
 
 /// 动作类型下拉变化回调(sender = popup,tag = 按钮号):按下拉选择写映射。
@@ -2031,6 +2054,9 @@ unsafe fn fill_mouse_device_controls(
     // 同步滑块右侧数值 label。
     // Sync the slider's value label.
     set_field(ui.line_count_value_label, resolved.line_count);
+    // 映射总开关:用有效值(合并"所有鼠标"档后的生效值)。
+    // The mappings master switch: the effective value (merged across profiles).
+    let _: () = msg_send![ui.mapping_enabled, setState: if resolved.button_mappings_enabled { 1isize } else { 0isize }];
 }
 
 /// 从控件收集成 Config(克隆当前 CONFIG,只覆盖表单内字段),并收集错误。
@@ -2184,6 +2210,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // 按键映射:编辑态写回当前设备的专属 profile(整体替换)。
         // Button mappings: the in-edit state replaces the selected device's own profile.
         p.button_mappings = MAPPING_EDITS.lock().unwrap().clone();
+        // 映射总开关:写当前设备档(不同鼠标可以不同值)。
+        // The mappings master switch: written to the current device's profile (per-device).
+        let me_state: isize = msg_send![ui.mapping_enabled, state];
+        p.button_mappings_enabled = Some(me_state == 1);
 
         // ===== 剪贴板历史页(全局配置,不随设备)=====
         // Clipboard page (global config, not per-device).
@@ -2510,6 +2540,7 @@ fn create_settings_window() {
             clipboard_auto_expire_days: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
             add_mapping_button: std::ptr::null_mut(),
+            mapping_enabled: std::ptr::null_mut(),
             mapping_empty: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
             ok_button: std::ptr::null_mut(),
@@ -3196,6 +3227,17 @@ fn create_settings_window() {
             y,
             content_w - 24.0,
         );
+        // 映射总开关(per-device):header 行右侧的开关(NSSwitch,与设置行同款)。
+        // The mappings master switch (per-device): a switch at the header row's right
+        // (an NSSwitch, same as the settings rows).
+        let ms: *mut AnyObject = make_switch(ctrl_x + ctrl_w, y - 4.0, row_h, true);
+        // 开关变化即时重渲染映射行(关闭时行控件置灰不可点)。
+        // Re-render the mapping rows on toggle (rows grey out and become inert when off).
+        let _: () = msg_send![ms, setTarget: target];
+        let _: () = msg_send![ms, setAction: sel!(handleMappingEnabledChanged:)];
+        let _: () = msg_send![mouse_view, addSubview: ms];
+        release_obj(ms);
+        ui.mapping_enabled = ms;
         y -= 8.0 + row_h;
         // 显式坐标布局(不再依赖游标链):卡片顶部 = 当前 y,卡片 [top-list_h, top]。
         // Explicit coordinates (no cursor chain): card top = current y, card spans

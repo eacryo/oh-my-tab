@@ -347,6 +347,11 @@ disable_acceleration = false  # disable system pointer acceleration (linear trac
 "3" = "cmd+shift+v"
 "4" = "alt+tab"
 
+# Per-profile mappings master switch (default true; false skips this mouse's mappings and
+# events pass through). Independent per device -- different mice can differ; the "All Mice"
+# default profile can carry its own value too.
+button_mappings_enabled = true
+
 # Example per-device override layer (Logitech MCHOSE G3 V2):
 [[mouse.profiles]]
 device_vendor_id = 10007

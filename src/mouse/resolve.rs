@@ -25,6 +25,9 @@ pub(crate) struct ResolvedMouse {
     // 按键映射:按钮号 -> 快捷键描述(逐键合并,后者覆盖)。
     // Button mappings: button number -> shortcut description (per-key merge, later wins).
     pub button_mappings: HashMap<String, String>,
+    // 按键映射总开关(per-device 档独立;false 时映射不执行)。
+    // The button-mappings master switch (independent per device; mappings skipped when off).
+    pub button_mappings_enabled: bool,
 }
 
 impl Default for ResolvedMouse {
@@ -35,6 +38,7 @@ impl Default for ResolvedMouse {
             line_count: 3,
             disable_acceleration: false,
             button_mappings: HashMap::new(),
+            button_mappings_enabled: true,
         }
     }
 }
@@ -112,6 +116,7 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
     r.line_count = defaults.line_count;
     r.disable_acceleration = defaults.disable_acceleration;
     r.button_mappings = HashMap::new();
+    r.button_mappings_enabled = defaults.button_mappings_enabled;
 
     // 遍历 profiles,合并所有匹配档(后者优先)。
     // Iterate profiles, merging all matching ones (later wins).
@@ -137,6 +142,9 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
         // Button mappings: fold in per key (same key: later wins).
         for (btn, desc) in &p.button_mappings {
             r.button_mappings.insert(btn.clone(), desc.clone());
+        }
+        if let Some(en) = p.button_mappings_enabled {
+            r.button_mappings_enabled = en;
         }
     }
 

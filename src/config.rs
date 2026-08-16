@@ -235,6 +235,14 @@ pub struct MouseProfile {
     // out of clicking.
     #[serde(default)]
     pub button_mappings: std::collections::HashMap<String, String>,
+    // 该档按键映射的总开关(None = 继承下层档;默认 true,绑定即生效)。
+    // 每个设备档独立 —— 不同鼠标可以有不同值。关闭时该设备的映射不执行(事件透传)。
+    // Per-profile master switch for button mappings (None = inherit the lower layer;
+    // defaults to true, so bindings take effect as soon as they exist). Independent per
+    // device -- different mice can differ. When off, the device's mappings are skipped
+    // (events pass through).
+    #[serde(default)]
+    pub button_mappings_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

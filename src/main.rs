@@ -745,6 +745,12 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handleMappingEnabledChanged:),
+                handle_mapping_enabled_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleMappingActionChanged:),
                 handle_mapping_action_changed as *mut c_void,
                 types.as_ptr(),

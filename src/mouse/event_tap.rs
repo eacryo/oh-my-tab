@@ -176,6 +176,12 @@ unsafe extern "C" fn mouse_event_tap_callback(
         if button >= 2 && !RECORDING.load(Ordering::Relaxed) {
             let dev_key = device::device_from_cgevent(event);
             let resolved = resolve::resolve(dev_key);
+            // 该设备档的映射总开关:关闭时等同未绑定,事件透传。
+            // The device profile's mappings master switch: when off, behave as unbound
+            // (events pass through).
+            if !resolved.button_mappings_enabled {
+                return event;
+            }
             if let Some(desc) = resolved.button_mappings.get(&button.to_string()) {
                 // 按绑定类型分发:快捷键 -> 合成键盘事件;系统动作 -> Dock 私有通知;
                 // none -> 吞事件不动作。两端都吞原始事件(应用看不到侧键点击)。

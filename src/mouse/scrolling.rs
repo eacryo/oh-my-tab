@@ -116,6 +116,7 @@ mod tests {
             line_count,
             disable_acceleration: false,
             button_mappings: std::collections::HashMap::new(),
+            button_mappings_enabled: true,
         }
     }
 
