@@ -745,8 +745,14 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
-                sel!(handleDeleteMapping:),
-                handle_delete_mapping as *mut c_void,
+                sel!(handleMappingActionChanged:),
+                handle_mapping_action_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleRecordCombo:),
+                handle_record_combo as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(

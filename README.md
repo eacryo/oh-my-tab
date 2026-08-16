@@ -331,11 +331,14 @@ line_count = 3           # lines per tick in "line" mode (1..=10)
 [mouse.profiles.pointer]
 disable_acceleration = false  # disable system pointer acceleration (linear tracking)
 
-# Button mappings: bind middle/side buttons (button number >= 2) to shortcuts (press = keyDown,
-# release = keyUp). Left (0) / right (1) can't be bound (you'd lock yourself out of clicking).
-# Button numbers: 2 = middle, 3 = back, 4 = forward, 5+ = other side/macro buttons (they vary
-# per mouse -- configure per device). Binding Cmd+Tab / Option+V opens OUR overlay / clipboard
-# (synthetic events loop back into this app's own tap).
+# Button mappings: bind middle/side buttons (button number >= 2) to actions (keyboard
+# shortcut / system action / disabled). Left (0) / right (1) can't be bound (you'd lock
+# yourself out of clicking). Button numbers: 2 = middle, 3 = back, 4 = forward, 5+ = other
+# side/macro buttons (they vary per mouse -- configure per device). Values can be a shortcut
+# ("cmd+shift+v"), a system action ("missioncontrol"/"launchpad"/"showdesktop"/"appexpose",
+# fired via Dock's private notification -- immune to system-shortcut occupancy), or "none"
+# (swallow the button; it becomes inert). Binding Cmd+Tab / Option+V opens OUR overlay /
+# clipboard (dispatched internally, no synthesized events).
 # 按键映射:把中键/侧键(按钮号 >= 2)绑定成快捷键(按下 = keyDown,松开 = keyUp)。
 # 左键(0)/右键(1)不允许绑定,防止把自己锁死。按钮号是鼠标按键编号:2 = 中键,3 = 后退,
 # 4 = 前进,5+ = 其他侧键/宏键(不同鼠标可能不同,按设备分别配置)。
@@ -354,7 +357,7 @@ line_count = 3
 
 ```
 
-Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). Toggling `mouse.enabled` takes effect immediately — the mouse event tap is hot-switched on OK, no app restart needed.
+Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). The button-mappings section **predefines** rows for the middle/back/forward/macro buttons (2-7): each row has an action-type popup (Default / None / Key Press / Mission Control / Launchpad / Show Desktop / App Expose); picking "Key Press" reveals an in-row "Record" button for the combo. Toggling `mouse.enabled` takes effect immediately — the mouse event tap is hot-switched on OK, no app restart needed.
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 

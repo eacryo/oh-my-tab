@@ -177,12 +177,13 @@ unsafe extern "C" fn mouse_event_tap_callback(
             let dev_key = device::device_from_cgevent(event);
             let resolved = resolve::resolve(dev_key);
             if let Some(desc) = resolved.button_mappings.get(&button.to_string()) {
-                // 按下:合成目标快捷键的 keyDown(回环进我们的 tap → 浮窗/剪贴板/透传);
-                // 释放:合成 keyUp + 修饰键 flagsChanged(→ CmdReleased 提交切换)。
-                // Both directions swallow the original event (the app never sees the raw
-                // side-button click).
-                if let Ok(sc) = crate::mouse::shortcut::parse_shortcut(desc) {
-                    match event_type {
+                // 按绑定类型分发:快捷键 -> 合成键盘事件;系统动作 -> Dock 私有通知;
+                // none -> 吞事件不动作。两端都吞原始事件(应用看不到侧键点击)。
+                // Dispatch by binding type: shortcut -> synthesized keys; system action ->
+                // Dock private notification; none -> swallow without action. Both directions
+                // swallow the original event (the app never sees the raw side-button click).
+                match crate::mouse::shortcut::parse_binding(desc) {
+                    Ok(crate::mouse::shortcut::Binding::Key(sc)) => match event_type {
                         K_CG_EVENT_OTHER_MOUSE_DOWN => {
                             keysim::press_down(sc.keycode, sc.flags, desc);
                             return std::ptr::null_mut();
@@ -192,12 +193,26 @@ unsafe extern "C" fn mouse_event_tap_callback(
                             return std::ptr::null_mut();
                         }
                         _ => {}
+                    },
+                    Ok(crate::mouse::shortcut::Binding::System(notif)) => {
+                        // 系统动作按下时触发一次(Dock 通知是 toggle 语义);释放只吞。
+                        // System actions fire once on press (Dock notifications toggle);
+                        // the release is only swallowed.
+                        if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN {
+                            crate::mouse::system_action::fire(notif);
+                        }
+                        return std::ptr::null_mut();
                     }
-                } else {
-                    // 绑定存在但快捷键解析失败(配置被手改坏):提示。
-                    // Mapping exists but the shortcut failed to parse (hand-edited config):
-                    // note it.
-                    log_info!("[mouse] button {}: unparseable shortcut {:?}", button, desc);
+                    Ok(crate::mouse::shortcut::Binding::None) => {
+                        // 显式禁用:吞事件,无动作。
+                        // Explicit none: swallow, no action.
+                        return std::ptr::null_mut();
+                    }
+                    Err(_) => {
+                        // 绑定存在但解析失败(配置被手改坏):提示。
+                        // Mapping exists but failed to parse (hand-edited config): note it.
+                        log_info!("[mouse] button {}: unparseable binding {:?}", button, desc);
+                    }
                 }
             } else {
                 // 诊断:未命中映射时打印归因与当前设备的映射键,定位"绑定不生效"。
