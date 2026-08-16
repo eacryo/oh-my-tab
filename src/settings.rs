@@ -21,10 +21,10 @@ use crate::event_tap::{
 };
 use crate::ffi::*;
 use crate::i18n::{t, tf};
-use crate::log_info;
 use crate::menu::{refresh_menu_titles, set_shortcut_mode};
 use crate::mouse::shortcut::{button_name, describe_shortcut, display_shortcut};
 use crate::overlay::{apply_theme, refresh_highlight, update_status_label};
+use crate::{log_debug, log_info};
 // 跨模块共享状态(由 main.rs 持有)/ cross-module shared state (owned by main.rs)
 use crate::MENU_TARGET;
 
@@ -830,6 +830,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
         // removeFromSuperview already drops the superview's reference; the alloc +1 was
         // balanced by release_obj right after addSubview. Re-releasing here would double-free
         // (EXC_BAD_ACCESS).
+        let stale = u.mapping_rows.len();
         for row in u.mapping_rows.drain(..) {
             let _: () = msg_send![row.label, removeFromSuperview];
             let _: () = msg_send![row.delete, removeFromSuperview];
@@ -841,10 +842,21 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             .iter()
             .filter_map(|(b, d)| b.parse::<u32>().ok().map(|n| (n, d.clone())))
             .collect();
+        log_debug!(
+            "[mouse] render mappings: removed {} stale rows, {} live entries",
+            stale,
+            items.len()
+        );
         items.sort_by_key(|(b, _)| *b);
         let row_h = 24.0;
         let doc_h = items.len() as f64 * row_h;
-        let _: () = msg_send![doc, setFrameSize: NSSize::new(0.0, doc_h)];
+        // 只改高度,宽度保持初始值:曾用 setFrameSize(0.0, doc_h) 把宽清零,
+        // 宽度为 0 的文档视图 hit-test 失败 —— 行内删除按钮永远点不到。
+        // Resize height only, keeping the initial width: setFrameSize(0.0, doc_h) used to
+        // zero the width, and a zero-width document view fails hit-testing -- the delete
+        // buttons became unclickable.
+        let cur_frame: NSRect = msg_send![doc, frame];
+        let _: () = msg_send![doc, setFrameSize: NSSize::new(cur_frame.size.width, doc_h)];
         // flipped:y 最大在顶行。
         // Flipped: the top row has the largest y.
         let mut y = doc_h - row_h;
@@ -1049,6 +1061,8 @@ pub(crate) extern "C" fn handle_cancel_recording(
 pub(crate) fn cancel_recording_from_main() {
     if *REC_STAGE.lock().unwrap() != RecStage::Idle {
         *REC_STAGE.lock().unwrap() = RecStage::Idle;
+        *REC_MODS.lock().unwrap() = 0;
+        REC_DESC.lock().unwrap().clear();
         REC_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
         crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
         disable_rec_tap();
@@ -1096,6 +1110,10 @@ fn notify_main(sel: Sel) {
 /// recording tap thread.
 unsafe fn finish_recording(success: bool) {
     *REC_STAGE.lock().unwrap() = RecStage::Idle;
+    // 完成/取消后清零中间态,杜绝下次录制的残留(见 handle_add_mapping 的注释)。
+    // Clear the intermediates on finish/cancel, so nothing leaks into the next session.
+    *REC_MODS.lock().unwrap() = 0;
+    REC_DESC.lock().unwrap().clear();
     REC_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
     // 先禁用 tap 再停 runloop:禁用立即生效,杜绝退出窗口期吞键。
@@ -1233,6 +1251,13 @@ pub(crate) extern "C" fn handle_add_mapping(_self: *mut c_void, _cmd: Sel, _send
         return;
     }
     *REC_BUTTON.lock().unwrap() = 0;
+    // 清零录制中间态:REC_MODS 残留会让"等待组合键"浮窗自动带出上次的修饰键
+    // (用户只按侧键就看到旧的 Ctrl 符号,误以为删除没生效)。
+    // Clear the recording intermediates: a stale REC_MODS makes the waiting-for-combo
+    // popup show the previous modifiers right after the side button (the user sees the old
+    // Ctrl symbol without pressing anything, mistaking it for a failed delete).
+    *REC_MODS.lock().unwrap() = 0;
+    REC_DESC.lock().unwrap().clear();
     *REC_STAGE.lock().unwrap() = RecStage::WaitingButton;
     REC_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);

@@ -886,14 +886,30 @@ pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Opt
 }
 
 /// 回退:取 last_active 设备的 (VID,PID)。按硬件身份匹配,不受重枚举 id 漂移影响。
+/// 鼠标**按键**事件的 CGEvent 经常拿不到 IOHIDEvent sender(滚动事件可以),归因会走到
+/// 这里;若本进程还没成功归因过(LAST_ACTIVE_KEY 为 None),注册表里只有一台设备时
+/// 直接用它 —— 一台鼠标的场景按键绑定因此可靠工作。
+///
 /// Fallback: return the last-active device's (VID, PID), matched by hardware identity so
-/// re-enumeration id drift doesn't break it.
+/// re-enumeration id drift doesn't break it. Mouse BUTTON events frequently carry no
+/// IOHIDEvent sender (scroll events do), so attribution lands here; when the process hasn't
+/// attributed anything yet (LAST_ACTIVE_KEY is None), a single-device registry is used
+/// directly -- making button bindings reliable on single-mouse setups.
 fn last_active_key() -> Option<DeviceKey> {
     let key = *LAST_ACTIVE_KEY.lock().unwrap();
-    key.and_then(|k| {
-        let reg = registry().lock().unwrap();
-        reg.devices.iter().find(|d| d.key() == k).map(|d| d.key())
-    })
+    let reg = registry().lock().unwrap();
+    if let Some(k) = key {
+        if let Some(d) = reg.devices.iter().find(|d| d.key() == k) {
+            return Some(d.key());
+        }
+    }
+    // 唯一设备兜底(注册表只含鼠标/触控板,蓝牙键盘已被排除)。
+    // Single-device fallback (the registry holds only mice/trackpads; Bluetooth keyboards
+    // are already excluded).
+    if reg.devices.len() == 1 {
+        return Some(reg.devices[0].key());
+    }
+    None
 }
 
 #[cfg(test)]

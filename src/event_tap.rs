@@ -109,8 +109,11 @@ extern "C" {
     pub(crate) fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
     pub(crate) fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
     // 修改事件的类型(如把键盘事件改成 flagsChanged,用于合成修饰键状态变化)。
+    // 当前无调用方(按键合成不再发 flagsChanged);保留供未来合成修饰键状态用。
     // Change an event's type (e.g. turn a keyboard event into flagsChanged, for synthesizing
-    // modifier-key state transitions).
+    // modifier-key state transitions). No caller today (key synthesis no longer emits
+    // flagsChanged); kept for future modifier-state synthesis.
+    #[allow(dead_code)]
     pub(crate) fn CGEventSetType(event: CGEventRef, t: CGEventType);
     // 从 CGEvent 提取底层 IOHIDEvent(公开 API);用于事件归因(按设备匹配配置)。
     // Extract the underlying IOHIDEvent from a CGEvent (public API); used for event attribution

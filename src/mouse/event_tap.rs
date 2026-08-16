@@ -193,7 +193,22 @@ unsafe extern "C" fn mouse_event_tap_callback(
                         }
                         _ => {}
                     }
+                } else {
+                    // 绑定存在但快捷键解析失败(配置被手改坏):提示。
+                    // Mapping exists but the shortcut failed to parse (hand-edited config):
+                    // note it.
+                    log_info!("[mouse] button {}: unparseable shortcut {:?}", button, desc);
                 }
+            } else {
+                // 诊断:未命中映射时打印归因与当前设备的映射键,定位"绑定不生效"。
+                // Diagnostic: on a miss, print the attribution and the device's mapping keys
+                // to pinpoint "binding not working".
+                log_debug!(
+                    "[mouse] button {}: no mapping (dev={:?}, keys={:?})",
+                    button,
+                    dev_key,
+                    resolved.button_mappings.keys().collect::<Vec<_>>()
+                );
             }
         }
         event
