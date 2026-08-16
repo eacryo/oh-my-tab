@@ -751,20 +751,44 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
-                sel!(handleMappingActionChanged:),
-                handle_mapping_action_changed as *mut c_void,
+                sel!(handleMappingEdit:),
+                handle_mapping_edit as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
                 cls,
-                sel!(handleRecordCombo:),
-                handle_record_combo as *mut c_void,
+                sel!(handleDeleteMapping:),
+                handle_delete_mapping as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
                 cls,
-                sel!(handleRecordingStage:),
-                handle_recording_stage as *mut c_void,
+                sel!(handlePanelRecordTrigger:),
+                handle_panel_record_trigger as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handlePanelRecordCombo:),
+                handle_panel_record_combo as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handlePanelActionChanged:),
+                handle_panel_action_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleMappingConfirm:),
+                handle_mapping_confirm as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleMappingCancel:),
+                handle_mapping_cancel as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -777,12 +801,6 @@ fn setup_status_bar() {
                 cls,
                 sel!(handleRecordingCancelled:),
                 handle_recording_cancelled as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleCancelRecording:),
-                handle_cancel_recording as *mut c_void,
                 types.as_ptr(),
             );
             objc_registerClassPair(cls);

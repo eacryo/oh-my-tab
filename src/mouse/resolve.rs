@@ -154,6 +154,36 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merges_button_mappings_enabled_per_device() {
+        let mut cfg = crate::config::Config::default();
+        // 默认档(所有鼠标):enabled 不设(继承 true)。
+        // Default layer: enabled unset (inherits true).
+        cfg.mouse.profiles[0].button_mappings_enabled = None;
+        // 设备档:G3 V2 关闭。
+        // Device profile: G3 V2 turns it off.
+        let mut dev = crate::config::MouseProfile {
+            device: crate::config::DeviceMatcher {
+                vendor_id: Some(10007),
+                product_id: Some(12976),
+            },
+            ..Default::default()
+        };
+        dev.button_mappings_enabled = Some(false);
+        cfg.mouse.profiles.push(dev);
+        // 默认档合并:无设备 -> true。
+        // All-Mice resolve: true.
+        assert!(resolve_from(&cfg, None).button_mappings_enabled);
+        // G3 V2 -> false。
+        // G3 V2 -> false.
+        assert!(!resolve_from(&cfg, Some((10007, 12976))).button_mappings_enabled);
+        // 其他设备 -> true。
+        // Another device -> true.
+        assert!(resolve_from(&cfg, Some((1, 2))).button_mappings_enabled);
+    }
+
+    use super::*;
     use crate::config::PartialPointerSection;
 
     #[test]

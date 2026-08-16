@@ -9,7 +9,7 @@
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -76,6 +76,66 @@ unsafe impl Send for RecRunLoopMutex {}
 unsafe impl Sync for RecRunLoopMutex {}
 static REC_RUNLOOP: LazyLock<RecRunLoopMutex> = LazyLock::new(|| RecRunLoopMutex(Mutex::new(None)));
 
+/// 录制中实时累积的修饰键(WaitingCombo 阶段,flagsChanged 时更新)。
+/// Modifiers accumulated live while recording (updated on flagsChanged during
+/// waiting-for-combo).
+static REC_MODS: Mutex<u32> = Mutex::new(0);
+/// 录制模式:面板里录侧键(触发条件)或录组合键(Key Press 动作)。
+/// Recording mode: the panel records the side button (trigger) or the combo (Key Press).
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum RecMode {
+    PanelTrigger,
+    PanelCombo,
+}
+
+/// 当前录制模式(主线程读写;finish 后由 handle_recording_finished 按模式收尾)。
+/// The current recording mode (main-thread; handle_recording_finished finishes per mode).
+static REC_MODE: Mutex<RecMode> = Mutex::new(RecMode::PanelTrigger);
+
+// ========== 映射编辑面板 / mapping edit panel ==========
+
+/// 正在编辑的按钮号(面板打开期间;新增时为 None,录制侧键后确定)。
+/// The button number being edited (while the panel is open; None for a new mapping until
+/// the side button is recorded).
+static EDIT_BUTTON: Mutex<Option<u32>> = Mutex::new(None);
+/// 面板里的动作类型下拉选中 index。
+/// The panel's action-type popup selection.
+static EDIT_ACTION_IDX: Mutex<isize> = Mutex::new(0);
+/// 面板里录好的组合键描述(Key Press 动作;空 = 未录)。
+/// The combo recorded in the panel (Key Press action; empty = not recorded).
+static EDIT_COMBO: Mutex<String> = Mutex::new(String::new());
+/// 面板窗口与控件。
+/// The panel window and its controls.
+static EDIT_PANEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static EDIT_PANEL_BTN_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static EDIT_PANEL_ACTION: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static EDIT_PANEL_COMBO_BTN: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static EDIT_PANEL_COMBO_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static EDIT_PANEL_OK: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 面板打开时的窗口遮罩(半透明灰层,modal 调暗设置窗口)。
+/// The window dim layer while the panel is open (a translucent gray overlay that dims the
+/// settings window, modal-style).
+static EDIT_DIM: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
+/// 录制取消标志:取消时置位。既是 tap 创建重试的提前退出信号(录制线程可能还卡在
+/// 缺权限的重试 sleep 里,此时 CFRunLoopStop 无效 —— 没有这个标志 tap 会常驻吞键),
+/// 也供回调在 Idle 后防御性透传。
+/// Recording-cancel flag: set on cancel. It bails the tap-creation retry loop early (the
+/// recording thread may still be sleeping through permission-retries, where CFRunLoopStop
+/// is a no-op -- without this flag the tap would linger and keep swallowing keys) and lets
+/// the callback defensively pass everything through once idle.
+static REC_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 录制 tap 的 CFMachPort 引用:取消/完成时立即 CGEventTapEnable(false),不等 runloop
+/// 退出(CFRunLoopStop 是异步的,退出前 tap 仍在分发事件,可能吞掉取消后的首个按键)。
+/// The recording tap's CFMachPort: disabled immediately on cancel/finish via
+/// CGEventTapEnable(false) -- CFRunLoopStop is asynchronous and the tap keeps dispatching
+/// until the loop actually exits, which could swallow the first keystroke after cancel.
+struct RecTapMutex(Mutex<Option<crate::event_tap::CFMachPortRef>>);
+unsafe impl Send for RecTapMutex {}
+unsafe impl Sync for RecTapMutex {}
+static REC_TAP: LazyLock<RecTapMutex> = LazyLock::new(|| RecTapMutex(Mutex::new(None)));
+
 // ========== 设置窗口状态 / settings window state ==========
 
 // 设置窗口的控件指针集合（非模态窗口，复用，隐藏而非销毁）。
@@ -132,21 +192,25 @@ struct SettingsUi {
 }
 unsafe impl Send for SettingsUi {}
 
-/// 一行按键映射:
+/// 一行按键映射(只读显示):
 /// - label:按钮名(只读)
-/// - action:动作类型下拉(tag = 按钮号)
-/// - record:录制组合键按钮(tag = 按钮号,仅 Key Press 时显示)
-/// - caps:键帽胶囊(修饰符号 + 主键各一个圆角小方块,仅 Key Press 时显示)
+/// - desc_label:动作描述(系统动作名/None 文本;Key Press 时用键帽胶囊)
+/// - edit:编辑按钮(tag = 按钮号,点击打开编辑面板)
+/// - delete:删除按钮(tag = 按钮号)
+/// - caps:键帽胶囊(Key Press 时显示)
 ///
-/// One button-mapping row:
-/// - label: the button name (read-only)
-/// - action: the action-type popup (tag = button number)
-/// - record: the record-combo button (tag = button number; visible only for Key Press)
-/// - caps: keycap pills (one rounded square per modifier symbol + main key, Key Press only)
+/// One button-mapping row (read-only display):
+/// - label: the button name
+/// - desc_label: the action description (system-action name / None text; keycaps for Key
+///   Press)
+/// - edit: the edit button (tag = button number; opens the edit panel)
+/// - delete: the delete button (tag = button number)
+/// - caps: keycap pills (shown for Key Press)
 struct MappingRow {
     label: *mut AnyObject,
-    action: *mut AnyObject,
-    record: *mut AnyObject,
+    desc_label: *mut AnyObject,
+    edit: *mut AnyObject,
+    delete: *mut AnyObject,
     caps: Vec<*mut AnyObject>,
 }
 unsafe impl Send for MappingRow {}
@@ -494,9 +558,10 @@ pub(crate) extern "C" fn on_settings_open(_self: *mut c_void, _cmd: Sel, _sender
 }
 
 pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // 防御:点 OK 时若仍在录制,先收尾(复位 RECORDING、收起浮窗)。
-    // Defensive: if a recording is still in progress on OK, wrap it up first.
+    // 防御:点 OK 时若仍在录制,先收尾(复位 RECORDING);关闭编辑面板。
+    // Defensive: wrap up any in-progress recording on OK; close the edit panel.
     cancel_recording_from_main();
+    close_mapping_panel();
     let (cfg, errs) = collect_settings_config();
     if !errs.is_empty() {
         show_alert(&t("alert.config_error_title"), &errs.join("\n"));
@@ -662,9 +727,10 @@ pub(crate) extern "C" fn handle_enable_mouse_toggle(
 }
 
 pub(crate) extern "C" fn on_settings_cancel(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // 防御:点取消时若仍在录制,先收尾(复位 RECORDING、收起浮窗)。
-    // Defensive: if a recording is still in progress on cancel, wrap it up first.
+    // 防御:点取消时若仍在录制,先收尾(复位 RECORDING);关闭编辑面板。
+    // Defensive: wrap up any in-progress recording on cancel; close the edit panel.
     cancel_recording_from_main();
+    close_mapping_panel();
     hide_settings();
 }
 
@@ -824,6 +890,7 @@ pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, se
             *MAPPING_EDITS.lock().unwrap() = prof_idx
                 .map(|i| cfg.mouse.profiles[i].button_mappings.clone())
                 .unwrap_or_default();
+
             render_mapping_rows_locked(u);
         }
     }
@@ -864,8 +931,9 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
         let stale = u.mapping_rows.len();
         for row in u.mapping_rows.drain(..) {
             let _: () = msg_send![row.label, removeFromSuperview];
-            let _: () = msg_send![row.action, removeFromSuperview];
-            let _: () = msg_send![row.record, removeFromSuperview];
+            let _: () = msg_send![row.desc_label, removeFromSuperview];
+            let _: () = msg_send![row.edit, removeFromSuperview];
+            let _: () = msg_send![row.delete, removeFromSuperview];
             for cap in row.caps {
                 let _: () = msg_send![cap, removeFromSuperview];
             }
@@ -880,11 +948,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             .iter()
             .filter_map(|(b, d)| b.parse::<u32>().ok().map(|n| (n, d.clone())))
             .collect();
-        for b in MAPPING_EXTRA_ROWS.lock().unwrap().iter() {
-            if !items.iter().any(|(n, _)| n == b) {
-                items.push((*b, String::new()));
-            }
-        }
+
         log_debug!(
             "[mouse] render mappings: removed {} stale rows, {} live entries",
             stale,
@@ -953,63 +1017,56 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             let _: () = msg_send![label, setEnabled: mappings_on];
             let _: () = msg_send![doc, addSubview: label];
             release_obj(label);
-            // 动作类型下拉(与 MAPPING_ACTION_KEYS 一一对应)。
-            // The action-type popup (1:1 with MAPPING_ACTION_KEYS).
-            let popup_items: Vec<String> = MAPPING_ACTION_KEYS.iter().map(|k| t(k)).collect();
-            let popup_items: Vec<&str> = popup_items.iter().map(|s| s.as_str()).collect();
-            // NSPopUpButton 内部文字比 NSTextField 偏低 ~11pt:下拉 frame 上移并收矮,
-            // 让两行文字视觉对齐(实测校准)。
-            // The popup's text renders ~11pt lower than a text field's: nudge the popup up
-            // and shrink it so both baselines align visually (calibrated by screenshots).
-            let action: *mut AnyObject = make_popup(64.0, y + 4.0, 130.0, 24.0, &popup_items, 0);
-            let _: () = msg_send![action, setTag: btn as isize];
-            let _: () = msg_send![action, selectItemAtIndex: action_idx as isize];
-            let _: () = msg_send![action, setEnabled: mappings_on];
-            let _: () = msg_send![action, setTarget: target];
-            let _: () = msg_send![action, setAction: sel!(handleMappingActionChanged:)];
-            // 下拉各项加 SF Symbol 图标(Default/None/Key Press/系统功能)。
-            // SF Symbol icons on the popup items (Default/None/Key Press/system actions).
-            let menu: *mut AnyObject = msg_send![action, menu];
-            let item_cnt: usize = msg_send![menu, numberOfItems];
-            let icons = [
-                "circle",
-                "slash.circle",
-                "keyboard",
-                "square.grid.2x2",
-                "square.grid.3x3",
-                "macwindow",
-                "rectangle.on.rectangle",
-            ];
-            for (i, icon) in icons.iter().enumerate().take(item_cnt) {
-                let item: *mut AnyObject = msg_send![menu, itemAtIndex: i as isize];
-                let sym = make_nsstring(icon);
-                let img: *mut AnyObject = msg_send![
-                    class!(NSImage),
-                    imageWithSystemSymbolName: sym,
-                    accessibilityDescription: std::ptr::null::<AnyObject>()
-                ];
-                CFRelease(sym as *const c_void);
-                if !img.is_null() {
-                    let _: () = msg_send![item, setImage: img];
-                }
+            // 动作描述:系统动作/None 显示文本;Key Press 显示键帽胶囊。
+            // The action description: text for system actions/None; keycaps for Key Press.
+            let desc_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+            let desc_label: *mut AnyObject = msg_send![desc_label, initWithFrame: NSRect::new(NSPoint::new(64.0, y + 5.0), NSSize::new(130.0, row_h))];
+            set_field(desc_label, 0);
+            let _: () = msg_send![desc_label, setBezeled: false];
+            let _: () = msg_send![desc_label, setDrawsBackground: false];
+            let _: () = msg_send![desc_label, setEditable: false];
+            let _: () = msg_send![desc_label, setEnabled: mappings_on];
+            if !is_key && action_idx > 0 {
+                // 系统动作/None 的动作名文本(用 i18n 标签)。
+                // The action-name text for system actions/None (i18n labels).
+                let key = MAPPING_ACTION_KEYS
+                    .get(action_idx)
+                    .copied()
+                    .unwrap_or("settings.mapping_action_default");
+                let ns = make_nsstring(&t(key));
+                let _: () = msg_send![desc_label, setStringValue: ns];
+                CFRelease(ns as *const c_void);
             }
-            let _: () = msg_send![doc, addSubview: action];
-            release_obj(action);
-            // 按键区(仅 Key Press 显示):录制按钮 + 键帽。
-            // The key area (Key Press only): a record button + the keycap.
-            let record: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let record: *mut AnyObject = msg_send![record, initWithFrame: NSRect::new(NSPoint::new(200.0, y), NSSize::new(64.0, row_h))];
-            let _: () = msg_send![record, setBordered: false];
-            let _: () = msg_send![record, setTag: btn as isize];
-            let _: () = msg_send![record, setTarget: target];
-            let _: () = msg_send![record, setAction: sel!(handleRecordCombo:)];
-            let rec_title = make_nsstring(&t("settings.mapping_record"));
-            let _: () = msg_send![record, setTitle: rec_title];
-            CFRelease(rec_title as *const c_void);
-            let _: () = msg_send![record, setHidden: !is_key];
-            let _: () = msg_send![record, setEnabled: mappings_on];
-            let _: () = msg_send![doc, addSubview: record];
-            release_obj(record);
+            let _: () = msg_send![doc, addSubview: desc_label];
+            release_obj(desc_label);
+            // 编辑按钮(打开编辑面板)。
+            // The edit button (opens the edit panel).
+            let edit: *mut AnyObject = msg_send![class!(NSButton), alloc];
+            let edit: *mut AnyObject = msg_send![edit, initWithFrame: NSRect::new(NSPoint::new(200.0, y + 2.0), NSSize::new(72.0, 24.0))];
+            let _: () = msg_send![edit, setBezelStyle: 2isize]; // NSRoundedBezelStyle
+            let _: () = msg_send![edit, setTag: btn as isize];
+            let _: () = msg_send![edit, setEnabled: mappings_on];
+            let _: () = msg_send![edit, setTarget: target];
+            let _: () = msg_send![edit, setAction: sel!(handleMappingEdit:)];
+            let edit_title = make_nsstring(&t("settings.mapping_edit"));
+            let _: () = msg_send![edit, setTitle: edit_title];
+            CFRelease(edit_title as *const c_void);
+            let _: () = msg_send![doc, addSubview: edit];
+            release_obj(edit);
+            // 删除按钮(文字样式,与编辑按钮同款)。
+            // The delete button (text style, same look as Edit).
+            let delete: *mut AnyObject = msg_send![class!(NSButton), alloc];
+            let delete: *mut AnyObject = msg_send![delete, initWithFrame: NSRect::new(NSPoint::new(278.0, y + 2.0), NSSize::new(72.0, 24.0))];
+            let _: () = msg_send![delete, setBezelStyle: 2isize]; // NSRoundedBezelStyle
+            let _: () = msg_send![delete, setTag: btn as isize];
+            let _: () = msg_send![delete, setEnabled: mappings_on];
+            let _: () = msg_send![delete, setTarget: target];
+            let _: () = msg_send![delete, setAction: sel!(handleDeleteMapping:)];
+            let del_title = make_nsstring(&t("settings.mapping_delete"));
+            let _: () = msg_send![delete, setTitle: del_title];
+            CFRelease(del_title as *const c_void);
+            let _: () = msg_send![doc, addSubview: delete];
+            release_obj(delete);
             // 键帽胶囊:修饰符号 + 主键各一个圆角小方块(像真实键盘键帽)。
             // Keycap pills: one rounded square per modifier symbol + the main key (like
             // real keyboard keycaps).
@@ -1056,8 +1113,9 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             release_obj(sep);
             u.mapping_rows.push(MappingRow {
                 label,
-                action,
-                record,
+                desc_label,
+                edit,
+                delete,
                 caps,
             });
             y += row_h;
@@ -1066,222 +1124,6 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
 }
 
 // ========== 录制弹出浮窗 / recording popup panel ==========
-
-/// 录制浮窗(非模态小面板,锚定在「添加映射」按钮下方;跨设置打开复用)。
-/// The recording popup (a small non-modal panel anchored below the Add-mapping button;
-/// reused across settings opens).
-static REC_PANEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
-/// 浮窗里的提示 label。
-/// The popup's hint label.
-static REC_PANEL_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
-/// 浮窗里的取消按钮(点击 = 中途退出录制)。
-/// The popup's cancel button (click = abort the recording mid-way).
-static REC_PANEL_CANCEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
-/// 录制中实时累积的修饰键(WaitingCombo 阶段,flagsChanged 时更新,浮窗实时显示)。
-/// Modifiers accumulated live while recording (updated on flagsChanged during the
-/// waiting-for-combo stage; the popup shows them in real time).
-static REC_MODS: Mutex<u32> = Mutex::new(0);
-/// 录制 tap 的 CFMachPort 引用:取消/完成时立即 CGEventTapEnable(false),不等 runloop
-/// 退出(CFRunLoopStop 是异步的,退出前 tap 仍在分发事件,可能吞掉取消后的首个按键)。
-/// The recording tap's CFMachPort: disabled immediately on cancel/finish via
-/// CGEventTapEnable(false) -- CFRunLoopStop is asynchronous and the tap keeps dispatching
-/// until the loop actually exits, which could swallow the first keystroke after cancel.
-/// 裸指针 static 的 Send 包装(与 RecRunLoopMutex 同模式)。
-/// Send wrapper for the raw-pointer static (same pattern as RecRunLoopMutex).
-struct RecTapMutex(Mutex<Option<crate::event_tap::CFMachPortRef>>);
-unsafe impl Send for RecTapMutex {}
-unsafe impl Sync for RecTapMutex {}
-static REC_TAP: LazyLock<RecTapMutex> = LazyLock::new(|| RecTapMutex(Mutex::new(None)));
-/// 已添加但尚未配置动作的按钮号(编辑期的临时行;与 MAPPING_EDITS 合并显示,
-/// 不写入配置 —— 列表只显示已绑定的行 + 刚添加未配置的行)。
-/// Button numbers added but not yet configured (transient edit rows; merged with
-/// MAPPING_EDITS for display, never written to config -- the list shows bound rows plus
-/// freshly added unconfigured ones).
-static MAPPING_EXTRA_ROWS: LazyLock<Mutex<HashSet<u32>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-/// 录制模式:「添加映射」只录侧键(完成后加临时行),行内「录制」只录组合键(写映射)。
-/// Recording mode: "Add mapping" records the side button only (adds a transient row);
-/// the in-row "Record" button records the combo (writes the mapping).
-#[derive(PartialEq, Clone, Copy, Debug)]
-enum RecMode {
-    AddButton,
-    Combo,
-}
-
-/// 当前录制模式(主线程读写;finish 后由 handle_recording_finished 按模式收尾)。
-/// The current recording mode (main-thread; handle_recording_finished finishes per mode).
-static REC_MODE: Mutex<RecMode> = Mutex::new(RecMode::AddButton);
-
-/// 录制取消标志:取消时置位。既是 tap 创建重试的提前退出信号(录制线程可能还卡在
-/// 缺权限的重试 sleep 里,此时 CFRunLoopStop 无效 —— 没有这个标志 tap 会常驻吞键),
-/// 也供回调在 Idle 后防御性透传。
-/// Recording-cancel flag: set on cancel. It bails the tap-creation retry loop early (the
-/// recording thread may still be sleeping through permission-retries, where CFRunLoopStop
-/// is a no-op -- without this flag the tap would linger and keep swallowing keys) and lets
-/// the callback defensively pass everything through once idle.
-static REC_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// 显示/更新录制浮窗并锚定到 anchor 按钮下方。首次调用创建面板(复用)。
-/// Show/update the recording popup anchored below the anchor button; creates the panel on
-/// first use (reused afterwards).
-fn show_rec_panel(anchor: *mut AnyObject, text: &str) {
-    unsafe {
-        // 注意:if-let 的 scrutinee 临时值(MutexGuard)会贯穿整个 if/else 表达式,
-        // else 分支里再次 lock 同一把 Mutex 就是自死锁(风火轮)。必须先取值、guard
-        // 立即释放,再分支。下面用 map 先取出 Option<ObjPtr>。
-        // NB: an if-let scrutinee temporary (the MutexGuard) lives for the WHOLE if/else
-        // expression, so locking the same Mutex again inside the else branch self-deadlocks
-        // (the beach ball). Take the value first (guard dropped immediately), then branch.
-        let existing = REC_PANEL.lock().unwrap().map(|p| p.0);
-        let panel = if let Some(p) = existing {
-            p
-        } else {
-            // borderless 浮动面板:圆角 + 毛玻璃观感(与剪贴板 picker 同风格)。
-            // Borderless floating panel: rounded corners + frosted look (same style as the
-            // clipboard picker).
-            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 88.0));
-            let panel: *mut AnyObject = msg_send![class!(NSPanel), alloc];
-            let panel: *mut AnyObject = msg_send![panel, initWithContentRect: frame, styleMask: 0u64, backing: 2u64, defer: false];
-            let _: () = msg_send![panel, setReleasedWhenClosed: false];
-            let _: () = msg_send![panel, setOpaque: false];
-            let _: () = msg_send![panel, setLevel: 3isize]; // NSFloatingWindowLevel
-                                                            // 圆角 + 毛玻璃:contentView 用 NSVisualEffectView(NSView 子类,setWantsLayer
-                                                            // 是 NSView 的方法;NSPanel/NSWindow 没有 —— 对窗口调用会
-                                                            // "invalid message send ... method not found" 直接 panic,勿重蹈)。
-                                                            // Rounded + frosted: the content view is an NSVisualEffectView (an NSView subclass;
-                                                            // setWantsLayer lives on NSView -- calling it on NSPanel/NSWindow panics with
-                                                            // "invalid message send ... method not found", don't repeat that).
-            let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-            let ve: *mut AnyObject = msg_send![ve, initWithFrame: frame];
-            let _: () = msg_send![ve, setBlendingMode: 1u64]; // WithinWindow
-            let _: () = msg_send![ve, setMaterial: 0u64]; // NSVisualEffectMaterialAppearanceBased(跟随主题)
-            let _: () = msg_send![ve, setState: 1u64]; // Active
-            let _: () = msg_send![ve, setWantsLayer: true];
-            let ve_layer: *mut AnyObject = msg_send![ve, layer];
-            let _: () = msg_send![ve_layer, setCornerRadius: 10.0f64];
-            let _: () = msg_send![ve_layer, setMasksToBounds: true];
-            let _: () = msg_send![panel, setContentView: ve];
-            release_obj(ve); // contentView 持有
-            let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-            let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(12.0, 56.0), NSSize::new(376.0, 22.0))];
-            set_field(label, 0);
-            let _: () = msg_send![label, setBezeled: false];
-            let _: () = msg_send![label, setDrawsBackground: false];
-            let _: () = msg_send![label, setEditable: false];
-            let _: () = msg_send![label, setAlignment: 1isize]; // center
-            let _: () = msg_send![ve, addSubview: label];
-            release_obj(label); // ve 持有
-                                // 取消按钮:中途退出录制(点击 = cancel_recording_from_main)。
-                                // Cancel button: aborts the recording mid-way (click = cancel_recording_from_main).
-            let cancel_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let cancel_btn: *mut AnyObject = msg_send![cancel_btn, initWithFrame: NSRect::new(NSPoint::new(308.0, 10.0), NSSize::new(84.0, 24.0))];
-            let _: () = msg_send![cancel_btn, setBezelStyle: 2isize]; // NSRoundedBezelStyle
-            let cancel_title = make_nsstring(&t("settings.recording_cancel"));
-            let _: () = msg_send![cancel_btn, setTitle: cancel_title];
-            CFRelease(cancel_title as *const c_void);
-            let _: () = msg_send![cancel_btn, setTarget: MENU_TARGET.lock().unwrap().unwrap().0];
-            let _: () = msg_send![cancel_btn, setAction: sel!(handleCancelRecording:)];
-            let _: () = msg_send![ve, addSubview: cancel_btn];
-            release_obj(cancel_btn); // ve 持有
-            *REC_PANEL.lock().unwrap() = Some(ObjPtr(panel));
-            *REC_PANEL_LABEL.lock().unwrap() = Some(ObjPtr(label));
-            *REC_PANEL_CANCEL.lock().unwrap() = Some(ObjPtr(cancel_btn));
-            panel
-        };
-        // 更新提示文本。
-        // Update the hint text.
-        if let Some(l) = *REC_PANEL_LABEL.lock().unwrap() {
-            let ns = make_nsstring(text);
-            let _: () = msg_send![l.0, setStringValue: ns];
-            CFRelease(ns as *const c_void);
-        }
-        // 锚定:按钮位置转窗口坐标再转屏幕坐标,面板置于按钮下方。
-        // Anchor: convert the button origin to window coords, then to screen coords; the
-        // panel sits just below the button.
-        let btn_origin: NSPoint = msg_send![anchor, convertPoint: NSPoint::new(0.0, 0.0), toView: std::ptr::null::<AnyObject>()];
-        let window: *mut AnyObject = msg_send![anchor, window];
-        let screen_rect: NSRect = msg_send![
-            window,
-            convertRectToScreen: NSRect::new(btn_origin, NSSize::new(0.0, 0.0))
-        ];
-        let screen_point = screen_rect.origin;
-        let panel_frame: NSRect = msg_send![panel, frame];
-        let _: () = msg_send![panel, setFrameOrigin: NSPoint::new(
-            screen_point.x,
-            screen_point.y - panel_frame.size.height - 6.0
-        )];
-        let _: () = msg_send![panel, orderFrontRegardless];
-    }
-}
-
-/// 只更新浮窗提示文本(不重新定位)。
-/// Update the popup hint text only (no repositioning).
-fn update_rec_panel(text: &str) {
-    unsafe {
-        if let Some(l) = *REC_PANEL_LABEL.lock().unwrap() {
-            let ns = make_nsstring(text);
-            let _: () = msg_send![l.0, setStringValue: ns];
-            CFRelease(ns as *const c_void);
-        }
-    }
-}
-
-/// 关闭录制浮窗(幂等)。
-/// Close the recording popup (idempotent).
-fn close_rec_panel() {
-    if let Some(p) = *REC_PANEL.lock().unwrap() {
-        unsafe {
-            let _: () = msg_send![p.0, orderOut: std::ptr::null::<AnyObject>()];
-        }
-    }
-}
-
-/// 防御性取消录制:设置窗口 OK/Cancel/关闭时若仍在录制(浮窗开着、RECORDING=true),
-/// 复位状态并收起浮窗,避免残留录制态影响下次使用。
-///
-/// Defensive recording cancel: when the settings window OKs/cancels/closes while a recording
-/// is in progress, reset the state and dismiss the popup so no stale recording state lingers.
-/// 「取消」按钮回调:中途退出录制(复用 cancel_recording_from_main 的收尾)。
-/// The Cancel button callback: aborts the recording mid-way (reuses
-/// cancel_recording_from_main's teardown).
-pub(crate) extern "C" fn handle_cancel_recording(
-    _self: *mut c_void,
-    _cmd: Sel,
-    _sender: *mut c_void,
-) {
-    cancel_recording_from_main();
-    log_info!("[mouse] button-mapping recording cancelled by button");
-}
-
-pub(crate) fn cancel_recording_from_main() {
-    if *REC_STAGE.lock().unwrap() != RecStage::Idle {
-        *REC_STAGE.lock().unwrap() = RecStage::Idle;
-        *REC_MODS.lock().unwrap() = 0;
-        REC_DESC.lock().unwrap().clear();
-        REC_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
-        crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
-        disable_rec_tap();
-        if let Some(rl) = *REC_RUNLOOP.0.lock().unwrap() {
-            unsafe {
-                crate::event_tap::CFRunLoopStop(rl);
-            }
-        }
-    }
-    close_rec_panel();
-}
-
-/// 立即禁用录制 tap(若存在)。禁用是同步生效的,CGEventTapEnable(false) 后该 tap
-/// 不再收到任何事件。
-/// Immediately disable the recording tap (if any). Disabling is synchronous: after
-/// CGEventTapEnable(false) the tap receives nothing more.
-fn disable_rec_tap() {
-    if let Some(tap) = *REC_TAP.0.lock().unwrap() {
-        unsafe {
-            crate::event_tap::CGEventTapEnable(tap, false);
-        }
-    }
-}
 
 /// 经 performSelectorOnMainThread 唤醒主线程上的设置回调(无参版本)。
 /// Wake the settings callback on the main thread (argument-less variant).
@@ -1304,6 +1146,38 @@ fn notify_main(sel: Sel) {
 /// Common teardown for recording finish/cancel: reset the stage and the RECORDING flag,
 /// stop the recording thread's RunLoop, and wake the main-thread callback. Called on the
 /// recording tap thread.
+/// 防御性取消录制:设置窗口 OK/Cancel/关闭时若仍在录制(面板录制中),复位状态,
+/// 避免残留录制态影响下次使用。
+/// Defensive recording cancel: when the settings window OKs/cancels/closes while a
+/// recording is in progress, reset the state so nothing lingers.
+pub(crate) fn cancel_recording_from_main() {
+    if *REC_STAGE.lock().unwrap() != RecStage::Idle {
+        *REC_STAGE.lock().unwrap() = RecStage::Idle;
+        *REC_MODS.lock().unwrap() = 0;
+        REC_DESC.lock().unwrap().clear();
+        REC_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
+        disable_rec_tap();
+        if let Some(rl) = *REC_RUNLOOP.0.lock().unwrap() {
+            unsafe {
+                crate::event_tap::CFRunLoopStop(rl);
+            }
+        }
+    }
+}
+
+/// 立即禁用录制 tap(若存在)。禁用是同步生效的,CGEventTapEnable(false) 后该 tap
+/// 不再收到任何事件。
+/// Immediately disable the recording tap (if any). Disabling is synchronous: after
+/// CGEventTapEnable(false) the tap receives nothing more.
+fn disable_rec_tap() {
+    if let Some(tap) = *REC_TAP.0.lock().unwrap() {
+        unsafe {
+            crate::event_tap::CGEventTapEnable(tap, false);
+        }
+    }
+}
+
 unsafe fn finish_recording(success: bool) {
     *REC_STAGE.lock().unwrap() = RecStage::Idle;
     // 完成/取消后清零中间态,杜绝下次录制的残留(见 handle_add_mapping 的注释)。
@@ -1348,15 +1222,10 @@ unsafe extern "C" fn recording_tap_callback(
                 let btn = CGEventGetIntegerValueField(event, 3) as u32;
                 if btn >= 2 {
                     *REC_BUTTON.lock().unwrap() = btn;
-                    // 添加映射模式:捕获侧键即完成(加临时行,动作类型行内选)。
-                    // Add-mapping mode: the side button completes the recording (a transient
-                    // row is added; the action type is picked in-row).
-                    if *REC_MODE.lock().unwrap() == RecMode::AddButton {
-                        finish_recording(true);
-                    } else {
-                        *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
-                        notify_main(sel!(handleRecordingStage:));
-                    }
+                    // 面板录触发:捕获侧键即完成,回调更新面板。
+                    // Panel trigger recording: the side button completes it; the callback
+                    // updates the panel.
+                    finish_recording(true);
                     return std::ptr::null_mut();
                 }
             }
@@ -1442,30 +1311,165 @@ unsafe fn recording_thread() {
 
 /// 删除按钮(tag = 按钮号):移除该映射。
 /// The delete button (tag = button number): removes that mapping.
-/// 「添加映射」按钮:录制侧键,完成后加一个临时行(Default),动作类型在行内下拉里选。
-/// The "Add mapping" button: records the side button, then adds a transient row (Default);
-/// the action type is picked in the row's popup.
+/// 「添加映射」按钮:打开映射编辑面板(触发/动作/组合键在面板里一次配完)。
+/// The "Add mapping" button: opens the mapping edit panel (trigger/action/combo configured
+/// in one place, LinearMouse style).
 pub(crate) extern "C" fn handle_add_mapping(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // 已在录制中则忽略。
-    // Ignore when already recording.
+    // 面板已开:先关再开。
+    // Panel already open: close it first.
+    if EDIT_PANEL.lock().unwrap().is_some() {
+        close_mapping_panel();
+    }
+    open_mapping_panel(None);
+    log_info!("[mouse] mapping panel opened (new mapping)");
+}
+
+/// 列表行「编辑」回调(tag = 按钮号):打开面板预填该按钮的映射。
+/// The row "Edit" callback (tag = button number): opens the panel prefilled.
+pub(crate) extern "C" fn handle_mapping_edit(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
+    // 面板已开:先关再开(用户点编辑期望打开新面板,而不是无反应)。
+    // Panel already open: close it first (the user expects a fresh panel, not silence).
+    if EDIT_PANEL.lock().unwrap().is_some() {
+        close_mapping_panel();
+    }
+    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+    open_mapping_panel(Some(tag as u32));
+    log_info!("[mouse] mapping panel opened (edit button {})", tag);
+}
+
+/// 面板「录制触发」按钮:录侧键。
+/// The panel "Record trigger" button: records the side button.
+pub(crate) extern "C" fn handle_panel_record_trigger(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
     if *REC_STAGE.lock().unwrap() != RecStage::Idle {
         return;
     }
     *REC_BUTTON.lock().unwrap() = 0;
-    // 清零录制中间态:REC_MODS 残留会让浮窗带出上次的修饰键。
-    // Clear the recording intermediates so no stale modifiers leak into the popup.
     *REC_MODS.lock().unwrap() = 0;
     REC_DESC.lock().unwrap().clear();
-    *REC_MODE.lock().unwrap() = RecMode::AddButton;
+    *REC_MODE.lock().unwrap() = RecMode::PanelTrigger;
     *REC_STAGE.lock().unwrap() = RecStage::WaitingButton;
     REC_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
-    show_rec_panel(
-        _sender as *mut AnyObject,
-        &t("settings.recording_hint_button"),
-    );
-    log_info!("[mouse] recording button mapping (step 1: press a mouse button)");
+    // 录制中禁用面板确认,防中途误确认。
+    // Disable the panel OK while recording.
+    unsafe {
+        if let Some(o) = *EDIT_PANEL_OK.lock().unwrap() {
+            let _: () = msg_send![o.0, setEnabled: false];
+        }
+    }
+    log_info!("[mouse] recording trigger (press a mouse button)");
     *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
+}
+
+/// 面板「录制组合键」按钮:录组合键(Key Press 动作)。
+/// The panel "Record combo" button: records the combo (Key Press action).
+pub(crate) extern "C" fn handle_panel_record_combo(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    if *REC_STAGE.lock().unwrap() != RecStage::Idle {
+        return;
+    }
+    // 需要先有触发按钮(新增时)。
+    // The trigger must exist first (for new mappings).
+    let Some(btn) = *EDIT_BUTTON.lock().unwrap() else {
+        return;
+    };
+    *REC_BUTTON.lock().unwrap() = btn;
+    *REC_MODS.lock().unwrap() = 0;
+    REC_DESC.lock().unwrap().clear();
+    *REC_MODE.lock().unwrap() = RecMode::PanelCombo;
+    *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
+    REC_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
+    unsafe {
+        if let Some(o) = *EDIT_PANEL_OK.lock().unwrap() {
+            let _: () = msg_send![o.0, setEnabled: false];
+        }
+    }
+    log_info!("[mouse] recording combo (press the key combo)");
+    *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
+}
+
+/// 面板动作下拉变化:更新组合键行显隐与确认可用性。
+/// The panel action popup changed: refresh the combo row and OK availability.
+pub(crate) extern "C" fn handle_panel_action_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, indexOfSelectedItem] };
+    *EDIT_ACTION_IDX.lock().unwrap() = idx;
+    // 切到非 Key Press 时清掉已录组合键。
+    // Leaving Key Press clears the recorded combo.
+    if idx != 2 {
+        EDIT_COMBO.lock().unwrap().clear();
+    }
+    unsafe {
+        update_mapping_panel();
+    }
+}
+
+/// 面板「确认」:写入 MAPPING_EDITS 并关闭。
+/// The panel "OK": write to MAPPING_EDITS and close.
+pub(crate) extern "C" fn handle_mapping_confirm(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    let Some(btn) = *EDIT_BUTTON.lock().unwrap() else {
+        return;
+    };
+    let idx = *EDIT_ACTION_IDX.lock().unwrap();
+    let mut edits = MAPPING_EDITS.lock().unwrap();
+    match idx {
+        0 => {
+            // Default:等同删除(列表只显示已绑定)。
+            // Default: same as delete (the list shows bound rows only).
+            edits.remove(&btn.to_string());
+        }
+        1 => {
+            edits.insert(btn.to_string(), "none".to_string());
+        }
+        2 => {
+            // Key Press:需要已录组合键(确认按钮已按可用性禁用)。
+            // Key Press: needs a recorded combo (OK is disabled otherwise).
+            let combo = EDIT_COMBO.lock().unwrap().clone();
+            if combo.is_empty() {
+                return;
+            }
+            edits.insert(btn.to_string(), combo);
+        }
+        i => {
+            if let Some(name) = crate::mouse::shortcut::SYSTEM_ACTIONS.get((i - 3) as usize) {
+                edits.insert(btn.to_string(), name.to_string());
+            }
+        }
+    }
+    drop(edits);
+    close_mapping_panel();
+    render_mapping_rows();
+    log_info!(
+        "[mouse] mapping panel confirmed: button {} -> index {}",
+        btn,
+        idx
+    );
+}
+
+/// 面板「取消」:直接关闭,不改动。
+/// The panel "Cancel": close without changes.
+pub(crate) extern "C" fn handle_mapping_cancel(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    close_mapping_panel();
+    log_info!("[mouse] mapping panel cancelled");
 }
 
 /// 映射总开关变化回调:重渲染映射行(关闭时行控件置灰不可点)。
@@ -1479,128 +1483,326 @@ pub(crate) extern "C" fn handle_mapping_enabled_changed(
     log_info!("[mouse] mappings master switch toggled");
 }
 
-/// 动作类型下拉变化回调(sender = popup,tag = 按钮号):按下拉选择写映射。
-/// Default -> 移除映射(透传);None -> "none";Key Press -> 保留原快捷键(未录时无映射,
-/// 行内显示录制按钮);系统动作 -> 动作名。
+// ========== 映射编辑面板实现 / mapping edit panel ==========
+
+/// 打开映射编辑面板。btn = 正在编辑的按钮号(Some = 编辑已有映射,None = 新增)。
+/// 新增时先从录制侧键开始;编辑时预填当前值。
 ///
-/// The action-type popup changed (sender = popup, tag = button number): write the mapping
-/// per selection. Default -> remove (pass-through); None -> "none"; Key Press -> keep the
-/// existing shortcut (no mapping until recorded; the row shows the record button); system
-/// action -> the action name.
-pub(crate) extern "C" fn handle_mapping_action_changed(
-    _self: *mut c_void,
-    _cmd: Sel,
-    sender: *mut c_void,
-) {
-    let popup = sender as *mut AnyObject;
-    let tag: isize = unsafe { msg_send![popup, tag] };
-    let idx: isize = unsafe { msg_send![popup, indexOfSelectedItem] };
-    let btn = tag.to_string();
-    let btn_num = tag as u32;
-    let mut edits = MAPPING_EDITS.lock().unwrap();
-    match idx {
-        0 => {
-            // Default:移除映射,行从列表消失(列表只显示已绑定的行)。
-            // Default: remove the mapping; the row disappears (the list shows bound rows only).
-            edits.remove(&btn);
-            MAPPING_EXTRA_ROWS.lock().unwrap().remove(&btn_num);
-        }
-        _ => {
-            // 非 Default:行不再是"未配置"临时行。
-            // Anything but Default: the row is no longer an unconfigured transient.
-            MAPPING_EXTRA_ROWS.lock().unwrap().remove(&btn_num);
-            match idx {
-                1 => {
-                    // None:显式禁用(吞事件)。
-                    // None: explicitly disabled (swallowed).
-                    edits.insert(btn.clone(), "none".to_string());
-                }
-                2 => {
-                    // Key Press:保留已有快捷键(未录时保持原值;无原值则不写,等待录制)。
-                    // Key Press: keep any existing shortcut (no-op if none; the row shows
-                    // the Record button).
-                }
-                i => {
-                    // 系统动作(3..=6):写动作名。
-                    // System actions (3..=6): write the action name.
-                    if let Some(name) = crate::mouse::shortcut::SYSTEM_ACTIONS.get((i - 3) as usize)
-                    {
-                        edits.insert(btn.clone(), name.to_string());
+/// Open the mapping edit panel. btn = the button being edited (Some = editing an existing
+/// mapping, None = adding a new one). New mappings start by recording the side button;
+/// existing ones are prefilled.
+fn open_mapping_panel(btn: Option<u32>) {
+    unsafe {
+        *EDIT_BUTTON.lock().unwrap() = btn;
+        *EDIT_COMBO.lock().unwrap() = String::new();
+        // 预填:编辑已有映射时,按当前值推导动作 index 与组合键。
+        // Prefill: for an existing mapping, derive the action index and combo from the
+        // current value.
+        let (action_idx, combo) = match btn {
+            Some(b) => match MAPPING_EDITS.lock().unwrap().get(&b.to_string()) {
+                Some(desc) => {
+                    use crate::mouse::shortcut::{Binding, SYSTEM_ACTIONS};
+                    match crate::mouse::shortcut::parse_binding(desc) {
+                        Ok(Binding::Key(_)) => (2, desc.clone()),
+                        Ok(Binding::System(_)) => (
+                            SYSTEM_ACTIONS
+                                .iter()
+                                .position(|a| a.eq_ignore_ascii_case(desc))
+                                .map(|i| i as isize + 3)
+                                .unwrap_or(0),
+                            String::new(),
+                        ),
+                        Ok(Binding::None) => (1, String::new()),
+                        Err(_) => (0, String::new()),
                     }
                 }
+                None => (0, String::new()),
+            },
+            None => (0, String::new()),
+        };
+        *EDIT_ACTION_IDX.lock().unwrap() = action_idx;
+        *EDIT_COMBO.lock().unwrap() = combo;
+
+        let existing = EDIT_PANEL.lock().unwrap().map(|p| p.0);
+        let panel = if let Some(p) = existing {
+            p
+        } else {
+            // 创建面板:圆角毛玻璃 + 触发/动作/组合键行 + 取消确认。
+            // Create the panel: rounded material + trigger/action/combo rows + cancel/OK.
+            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(440.0, 240.0));
+            let panel: *mut AnyObject = msg_send![class!(NSPanel), alloc];
+            let panel: *mut AnyObject = msg_send![panel, initWithContentRect: frame, styleMask: 0u64, backing: 2u64, defer: false];
+            let _: () = msg_send![panel, setReleasedWhenClosed: false];
+            let _: () = msg_send![panel, setOpaque: false];
+            let _: () = msg_send![panel, setLevel: 3isize]; // NSFloatingWindowLevel
+                                                            // 背景透明:圆角外的四角露出后面的遮罩/设置窗口,圆角才可见。
+                                                            // Transparent background: the corners outside the radius show what's behind
+                                                            // (the dim layer / settings window), making the rounding visible.
+            let clear_ns: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+            let _: () = msg_send![panel, setBackgroundColor: clear_ns];
+            // 背景:普通视图 + windowBackgroundColor(与设置窗口右侧内容区同款颜色,
+            // 同款机制 —— 该颜色的 CGColor 可用;controlBackgroundColor 的动态色才为 nil)。
+            // Background: a plain view + windowBackgroundColor (same color and mechanism as
+            // the settings window's content area -- its CGColor works; only
+            // controlBackgroundColor's dynamic color is nil).
+            let ve: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let ve: *mut AnyObject = msg_send![ve, initWithFrame: frame];
+            let _: () = msg_send![ve, setWantsLayer: true];
+            let ve_layer: *mut AnyObject = msg_send![ve, layer];
+            let _: () = msg_send![ve_layer, setCornerRadius: 10.0f64];
+            let _: () = msg_send![ve_layer, setMasksToBounds: true];
+            let bg_ns: *mut AnyObject = msg_send![class!(NSColor), windowBackgroundColor];
+            layer_set_background(ve_layer, ns_color_to_cg(bg_ns));
+            let _: () = msg_send![panel, setContentView: ve];
+            release_obj(ve);
+            let target = MENU_TARGET.lock().unwrap().unwrap().0;
+            // 触发行。
+            // The trigger row.
+            let t_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+            let t_label: *mut AnyObject = msg_send![t_label, initWithFrame: NSRect::new(NSPoint::new(16.0, 190.0), NSSize::new(110.0, 24.0))];
+            set_field(t_label, 0);
+            let _: () = msg_send![t_label, setBezeled: false];
+            let _: () = msg_send![t_label, setDrawsBackground: false];
+            let _: () = msg_send![t_label, setEditable: false];
+            let t_label_ns = make_nsstring(&t("settings.mapping_panel_trigger"));
+            let _: () = msg_send![t_label, setStringValue: t_label_ns];
+            CFRelease(t_label_ns as *const c_void);
+            let _: () = msg_send![ve, addSubview: t_label];
+            release_obj(t_label);
+            let btn_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+            let btn_label: *mut AnyObject = msg_send![btn_label, initWithFrame: NSRect::new(NSPoint::new(130.0, 190.0), NSSize::new(140.0, 24.0))];
+            set_field(btn_label, 0);
+            let _: () = msg_send![btn_label, setBezeled: false];
+            let _: () = msg_send![btn_label, setDrawsBackground: false];
+            let _: () = msg_send![btn_label, setEditable: false];
+            let _: () = msg_send![ve, addSubview: btn_label];
+            release_obj(btn_label);
+            let rec_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+            let rec_btn: *mut AnyObject = msg_send![rec_btn, initWithFrame: NSRect::new(NSPoint::new(280.0, 190.0), NSSize::new(140.0, 24.0))];
+            let _: () = msg_send![rec_btn, setBezelStyle: 2isize]; // NSRoundedBezelStyle
+            let rec_title = make_nsstring(&t("settings.mapping_record"));
+            let _: () = msg_send![rec_btn, setTitle: rec_title];
+            CFRelease(rec_title as *const c_void);
+            let _: () = msg_send![rec_btn, setTarget: target];
+            let _: () = msg_send![rec_btn, setAction: sel!(handlePanelRecordTrigger:)];
+            let _: () = msg_send![ve, addSubview: rec_btn];
+            release_obj(rec_btn);
+            // 动作行。
+            // The action row.
+            let a_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+            let a_label: *mut AnyObject = msg_send![a_label, initWithFrame: NSRect::new(NSPoint::new(16.0, 140.0), NSSize::new(110.0, 24.0))];
+            set_field(a_label, 0);
+            let _: () = msg_send![a_label, setBezeled: false];
+            let _: () = msg_send![a_label, setDrawsBackground: false];
+            let _: () = msg_send![a_label, setEditable: false];
+            let a_label_ns = make_nsstring(&t("settings.mapping_panel_action"));
+            let _: () = msg_send![a_label, setStringValue: a_label_ns];
+            CFRelease(a_label_ns as *const c_void);
+            let _: () = msg_send![ve, addSubview: a_label];
+            release_obj(a_label);
+            let popup_items: Vec<String> = MAPPING_ACTION_KEYS.iter().map(|k| t(k)).collect();
+            let popup_items: Vec<&str> = popup_items.iter().map(|s| s.as_str()).collect();
+            let action: *mut AnyObject = make_popup(130.0, 140.0, 290.0, 26.0, &popup_items, 0);
+            let _: () = msg_send![action, setTarget: target];
+            let _: () = msg_send![action, setAction: sel!(handlePanelActionChanged:)];
+            // 下拉图标(与行内同款)。
+            // Popup icons (same as the rows).
+            let menu: *mut AnyObject = msg_send![action, menu];
+            let item_cnt: usize = msg_send![menu, numberOfItems];
+            let icons = [
+                "circle",
+                "slash.circle",
+                "keyboard",
+                "square.grid.2x2",
+                "square.grid.3x3",
+                "macwindow",
+                "rectangle.on.rectangle",
+            ];
+            for (i, icon) in icons.iter().enumerate().take(item_cnt) {
+                let item: *mut AnyObject = msg_send![menu, itemAtIndex: i as isize];
+                let sym = make_nsstring(icon);
+                let img: *mut AnyObject = msg_send![
+                    class!(NSImage),
+                    imageWithSystemSymbolName: sym,
+                    accessibilityDescription: std::ptr::null::<AnyObject>()
+                ];
+                CFRelease(sym as *const c_void);
+                if !img.is_null() {
+                    let _: () = msg_send![item, setImage: img];
+                }
             }
+            let _: () = msg_send![ve, addSubview: action];
+            release_obj(action);
+            // 组合键行(Key Press 时显示)。
+            // The combo row (shown for Key Press).
+            let combo_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+            let combo_btn: *mut AnyObject = msg_send![combo_btn, initWithFrame: NSRect::new(NSPoint::new(130.0, 96.0), NSSize::new(140.0, 24.0))];
+            let _: () = msg_send![combo_btn, setBezelStyle: 2isize];
+            let combo_title = make_nsstring(&t("settings.mapping_record"));
+            let _: () = msg_send![combo_btn, setTitle: combo_title];
+            CFRelease(combo_title as *const c_void);
+            let _: () = msg_send![combo_btn, setTarget: target];
+            let _: () = msg_send![combo_btn, setAction: sel!(handlePanelRecordCombo:)];
+            let _: () = msg_send![combo_btn, setHidden: true];
+            let _: () = msg_send![ve, addSubview: combo_btn];
+            release_obj(combo_btn);
+            let combo_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+            let combo_label: *mut AnyObject = msg_send![combo_label, initWithFrame: NSRect::new(NSPoint::new(280.0, 96.0), NSSize::new(140.0, 24.0))];
+            set_field(combo_label, 0);
+            let _: () = msg_send![combo_label, setBezeled: false];
+            let _: () = msg_send![combo_label, setDrawsBackground: false];
+            let _: () = msg_send![combo_label, setEditable: false];
+            let _: () = msg_send![combo_label, setHidden: true];
+            let _: () = msg_send![ve, addSubview: combo_label];
+            release_obj(combo_label);
+            // 取消/确认。
+            // Cancel/OK.
+            let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
+            let cancel: *mut AnyObject = msg_send![cancel, initWithFrame: NSRect::new(NSPoint::new(240.0, 24.0), NSSize::new(88.0, 28.0))];
+            let _: () = msg_send![cancel, setBezelStyle: 2isize];
+            let cancel_ns = make_nsstring(&t("settings.recording_cancel"));
+            let _: () = msg_send![cancel, setTitle: cancel_ns];
+            CFRelease(cancel_ns as *const c_void);
+            let _: () = msg_send![cancel, setTarget: target];
+            let _: () = msg_send![cancel, setAction: sel!(handleMappingCancel:)];
+            let _: () = msg_send![ve, addSubview: cancel];
+            release_obj(cancel);
+            let ok: *mut AnyObject = msg_send![class!(NSButton), alloc];
+            let ok: *mut AnyObject = msg_send![ok, initWithFrame: NSRect::new(NSPoint::new(336.0, 24.0), NSSize::new(88.0, 28.0))];
+            let _: () = msg_send![ok, setBezelStyle: 2isize];
+            let ok_ns = make_nsstring(&t("settings.ok"));
+            let _: () = msg_send![ok, setTitle: ok_ns];
+            CFRelease(ok_ns as *const c_void);
+            let _: () = msg_send![ok, setTarget: target];
+            let _: () = msg_send![ok, setAction: sel!(handleMappingConfirm:)];
+            let _: () = msg_send![ve, addSubview: ok];
+            release_obj(ok);
+            *EDIT_PANEL.lock().unwrap() = Some(ObjPtr(panel));
+            *EDIT_PANEL_BTN_LABEL.lock().unwrap() = Some(ObjPtr(btn_label));
+            *EDIT_PANEL_ACTION.lock().unwrap() = Some(ObjPtr(action));
+            *EDIT_PANEL_COMBO_BTN.lock().unwrap() = Some(ObjPtr(combo_btn));
+            *EDIT_PANEL_COMBO_LABEL.lock().unwrap() = Some(ObjPtr(combo_label));
+            *EDIT_PANEL_OK.lock().unwrap() = Some(ObjPtr(ok));
+            panel
+        };
+        // 更新面板显示。
+        // Update the panel display.
+        update_mapping_panel();
+        // 定位:相对外层设置窗口居中(不随屏幕位置漂移)。
+        // Position: centered on the settings window (does not drift with the screen).
+        let win = SETTINGS_UI.lock().unwrap().as_ref().unwrap().window;
+        let win_frame: NSRect = msg_send![win, frame];
+        let pf: NSRect = msg_send![panel, frame];
+        let _: () = msg_send![panel, setFrameOrigin: NSPoint::new(
+            win_frame.origin.x + (win_frame.size.width - pf.size.width) / 2.0,
+            win_frame.origin.y + (win_frame.size.height - pf.size.height) / 2.0
+        )];
+        // 遮罩:设置窗口内容区上的半透明灰层(modal 调暗;面板在遮罩之上)。
+        // The dim layer: a translucent gray overlay on the settings content (modal dim;
+        // the panel floats above it).
+        let content: *mut AnyObject = msg_send![win, contentView];
+        let content_bounds: NSRect = msg_send![content, bounds];
+        let dim: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let dim: *mut AnyObject = msg_send![dim, initWithFrame: content_bounds];
+        let _: () = msg_send![dim, setWantsLayer: true];
+        let dim_layer: *mut AnyObject = msg_send![dim, layer];
+        // 半透明黑 25%:hex 是 0xRRGGBBAA —— alpha 在最低字节。
+        // Translucent black at 25%: hex is 0xRRGGBBAA -- alpha lives in the low byte.
+        layer_set_background(dim_layer, hex_to_cg_color(0x00000040));
+        let _: () = msg_send![content, addSubview: dim];
+        release_obj(dim);
+        *EDIT_DIM.lock().unwrap() = Some(ObjPtr(dim));
+        let _: () = msg_send![panel, orderFrontRegardless];
+    }
+}
+
+/// 刷新面板显示(触发按钮名/动作下拉/组合键行/确认可用性)。
+/// Refresh the panel display (trigger name / action popup / combo row / OK availability).
+unsafe fn update_mapping_panel() {
+    let btn = *EDIT_BUTTON.lock().unwrap();
+    // 触发按钮名。
+    // The trigger button name.
+    if let Some(l) = *EDIT_PANEL_BTN_LABEL.lock().unwrap() {
+        let text = match btn {
+            Some(b) => crate::mouse::shortcut::button_name(b),
+            None => t("settings.mapping_panel_no_button"),
+        };
+        let ns = make_nsstring(&text);
+        let _: () = msg_send![l.0, setStringValue: ns];
+        CFRelease(ns as *const c_void);
+    }
+    let idx = *EDIT_ACTION_IDX.lock().unwrap();
+    // 动作下拉。
+    // The action popup.
+    if let Some(a) = *EDIT_PANEL_ACTION.lock().unwrap() {
+        let _: () = msg_send![a.0, selectItemAtIndex: idx];
+    }
+    // 组合键行显隐(Key Press = index 2)。
+    // Combo row visibility (Key Press = index 2).
+    let is_key = idx == 2;
+    if let Some(b) = *EDIT_PANEL_COMBO_BTN.lock().unwrap() {
+        let _: () = msg_send![b.0, setHidden: !is_key];
+    }
+    if let Some(l) = *EDIT_PANEL_COMBO_LABEL.lock().unwrap() {
+        let _: () = msg_send![l.0, setHidden: !is_key];
+        if is_key {
+            let combo = EDIT_COMBO.lock().unwrap().clone();
+            let text = if combo.is_empty() {
+                t("settings.mapping_panel_no_combo")
+            } else {
+                display_shortcut(&combo)
+            };
+            let ns = make_nsstring(&text);
+            let _: () = msg_send![l.0, setStringValue: ns];
+            CFRelease(ns as *const c_void);
         }
     }
-    drop(edits);
-    render_mapping_rows();
-    log_info!(
-        "[mouse] mapping action changed: button {} -> index {}",
-        tag,
-        idx
-    );
+    // 确认可用性:Key Press 需要已录组合键;新增需要已录侧键。
+    // OK availability: Key Press needs a recorded combo; a new mapping needs the trigger.
+    let ok_enabled =
+        (idx != 2 || !EDIT_COMBO.lock().unwrap().is_empty()) && (btn.is_some() || idx != 2);
+    if let Some(o) = *EDIT_PANEL_OK.lock().unwrap() {
+        let _: () = msg_send![o.0, setEnabled: ok_enabled];
+    }
 }
 
-/// 行内「录制」按钮回调(tag = 按钮号):录制组合键并写入该按钮的映射。
-/// The in-row "Record" button (tag = button number): records the combo and writes the
-/// mapping for this button.
-pub(crate) extern "C" fn handle_record_combo(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    // 已在录制中则忽略。
-    // Ignore when already recording.
-    if *REC_STAGE.lock().unwrap() != RecStage::Idle {
-        return;
+/// 关闭映射编辑面板(幂等)。
+/// Close the mapping edit panel (idempotent).
+fn close_mapping_panel() {
+    log_debug!("[mouse] close panel: step 1 (orderOut)");
+    // take():if-let scrutinee 的 MutexGuard 会贯穿整个 if 块,块内再 lock 同一把
+    // Mutex 就是自死锁(风火轮,实测)。take 拿走值后 guard 立即释放。
+    // take(): an if-let scrutinee MutexGuard lives for the WHOLE if block, so locking the
+    // same Mutex inside it self-deadlocks (the beach ball, verified). take() moves the
+    // value out and the guard drops immediately.
+    if let Some(p) = EDIT_PANEL.lock().unwrap().take() {
+        unsafe {
+            let _: () = msg_send![p.0, orderOut: std::ptr::null::<AnyObject>()];
+        }
     }
+    log_debug!("[mouse] close panel: step 2 (remove dim)");
+    // 移除遮罩。
+    // Remove the dim layer.
+    if let Some(d) = EDIT_DIM.lock().unwrap().take() {
+        unsafe {
+            let _: () = msg_send![d.0, removeFromSuperview];
+        }
+    }
+    log_debug!("[mouse] close panel: step 3 (reset state)");
+    *EDIT_BUTTON.lock().unwrap() = None;
+    *EDIT_ACTION_IDX.lock().unwrap() = 0;
+    EDIT_COMBO.lock().unwrap().clear();
+}
+
+/// 删除按钮(tag = 按钮号):移除该映射。
+/// The delete button (tag = button number): removes that mapping.
+pub(crate) extern "C" fn handle_delete_mapping(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    *REC_BUTTON.lock().unwrap() = tag as u32;
-    *REC_MODS.lock().unwrap() = 0;
-    REC_DESC.lock().unwrap().clear();
-    *REC_MODE.lock().unwrap() = RecMode::Combo;
-    *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
-    REC_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
-    crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
-    show_rec_panel(
-        sender as *mut AnyObject,
-        &t("settings.recording_hint_combo"),
-    );
-    log_info!(
-        "[mouse] recording combo for button {} (press the key combo)",
-        tag
-    );
-    *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
+    MAPPING_EDITS.lock().unwrap().remove(&tag.to_string());
+    render_mapping_rows();
+    log_info!("[mouse] removed mapping for button {}", tag);
 }
 
-pub(crate) extern "C" fn handle_recording_stage(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    // 实时显示:已选按钮名 + 当前按下的修饰键符号(如 "Back → ⌘⇧…")。
-    // Live display: the captured button name + the modifiers currently held.
-    let btn = *REC_BUTTON.lock().unwrap();
-    let mods = *REC_MODS.lock().unwrap();
-    let btn_name = crate::mouse::shortcut::button_name(btn);
-    let mod_str = crate::mouse::shortcut::modifier_display(mods);
-    // 添加映射模式(只录侧键):显示按钮名即完成提示。
-    // Add-mapping mode (side button only): show the button name; done.
-    if *REC_MODE.lock().unwrap() == RecMode::AddButton {
-        update_rec_panel(&format!(
-            "{} → {}",
-            btn_name,
-            t("settings.recording_hint_done")
-        ));
-        return;
-    }
-    // 无修饰:显示 "Back → 请按目标组合键…(Esc 取消)";按住修饰键:实时变 "Back → ⌘⇧…"。
-    // No modifiers yet: "Back → press the combo…"; while holding modifiers it becomes
-    // "Back → ⌘⇧…" live.
-    if mod_str.is_empty() {
-        update_rec_panel(&format!(
-            "{} → {}",
-            btn_name,
-            t("settings.recording_hint_combo")
-        ));
-    } else {
-        update_rec_panel(&format!("{} → {}…", btn_name, mod_str));
-    }
-}
-
-/// 主线程回调:录制完成,写入编辑态映射并重渲染。
-/// Main-thread callback: recording finished; store the mapping and re-render.
 pub(crate) extern "C" fn handle_recording_finished(
     _self: *mut c_void,
     _cmd: Sel,
@@ -1608,26 +1810,26 @@ pub(crate) extern "C" fn handle_recording_finished(
 ) {
     let btn = *REC_BUTTON.lock().unwrap();
     match *REC_MODE.lock().unwrap() {
-        // 添加映射:只录侧键 —— 加临时行(Default),动作类型在行内下拉里选。
-        // Add-mapping: side button only -- add a transient row (Default); the action type
-        // is picked in the row's popup.
-        RecMode::AddButton => {
-            MAPPING_EXTRA_ROWS.lock().unwrap().insert(btn);
-            log_info!("[mouse] added mapping row for button {}", btn);
+        // 面板录触发侧键:更新面板显示。
+        // The panel recorded the trigger: update the panel.
+        RecMode::PanelTrigger => {
+            *EDIT_BUTTON.lock().unwrap() = Some(btn);
+            unsafe {
+                update_mapping_panel();
+            }
+            log_info!("[mouse] panel trigger recorded: button {}", btn);
         }
-        // 行内录制组合键:写入该按钮的映射。
-        // In-row combo recording: write the mapping for this button.
-        RecMode::Combo => {
+        // 面板录组合键:更新面板显示(Key Press 动作)。
+        // The panel recorded the combo: update the panel (Key Press action).
+        RecMode::PanelCombo => {
             let desc = REC_DESC.lock().unwrap().clone();
-            MAPPING_EDITS
-                .lock()
-                .unwrap()
-                .insert(btn.to_string(), desc.clone());
-            log_info!("[mouse] recorded combo: button {} -> {}", btn, desc);
+            *EDIT_COMBO.lock().unwrap() = desc.clone();
+            unsafe {
+                update_mapping_panel();
+            }
+            log_info!("[mouse] panel combo recorded: {}", desc);
         }
     }
-    close_rec_panel();
-    render_mapping_rows();
 }
 
 /// 主线程回调:录制取消/失败。
@@ -1637,7 +1839,6 @@ pub(crate) extern "C" fn handle_recording_cancelled(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
-    close_rec_panel();
     log_info!("[mouse] button-mapping recording cancelled");
 }
 
@@ -1983,6 +2184,7 @@ fn load_settings_from(cfg: &Config) {
         *MAPPING_EDITS.lock().unwrap() = prof_idx
             .map(|i| cfg.mouse.profiles[i].button_mappings.clone())
             .unwrap_or_default();
+
         render_mapping_rows_locked(ui);
 
         // 重建设备下拉框(每次打开设置时刷新,反映热插拔)。

@@ -362,7 +362,7 @@ line_count = 3
 
 ```
 
-Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). The button-mappings section **predefines** rows for the middle/back/forward/macro buttons (2-7): each row has an action-type popup (Default / None / Key Press / Mission Control / Launchpad / Show Desktop / App Expose); picking "Key Press" reveals an in-row "Record" button for the combo. Toggling `mouse.enabled` takes effect immediately — the mouse event tap is hot-switched on OK, no app restart needed.
+Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). The button-mappings section lists bound rows (button name + action description + keycaps); clicking **Edit** opens an edit panel (same as LinearMouse): record the trigger side button, pick the action type (Default / None / Key Press / Mission Control / Launchpad / Show Desktop / App Expose), and record the combo for Key Press, then confirm. Toggling `mouse.enabled` takes effect immediately — the mouse event tap is hot-switched on OK, no app restart needed.
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 
