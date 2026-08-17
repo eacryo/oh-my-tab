@@ -103,98 +103,109 @@ const NSPASTEBOARD_TYPE_BMP: &str = "com.microsoft.bmp";
 /// 剪贴板 TIFF 图片类型(macOS 通用兜底,与 NSPasteboardTypeTIFF 相同)。
 /// The pasteboard TIFF type (the generic macOS fallback, same as NSPasteboardTypeTIFF).
 const NSPASTEBOARD_TYPE_TIFF: &str = "public.tiff";
-/// 图片缩略图正文区高度 / the image thumbnail's body height.
-const IMG_PREVIEW_H: f64 = 64.0;
+/// 图片行缩略图盒尺寸(45×38,圆角 6,浅底 + 内描边,镜像 HTML 设计稿)。
+/// The image rows' thumbnail box (45x38, radius 6, faint fill + inner ring, mirroring the
+/// HTML mockup).
+const THUMB_W: f64 = 45.0;
+const THUMB_H: f64 = 38.0;
+const THUMB_R: f64 = 6.0;
+/// 画布内来源图标与缩略图之间的间隙 / gap between the app icon and the thumb in the canvas.
+const IMG_CANVAS_GAP: f64 = 11.0;
 /// 模拟粘贴用的 V 键码 / keycode used when synthesizing Cmd+V.
 const VK_V: u16 = 9;
 /// 模拟粘贴用的 Command 修饰掩码 / Command modifier mask for synthesized paste.
 const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = 0x00100000;
 /// 轮询间隔(秒)/ polling interval (seconds)
 const POLL_INTERVAL: f64 = 0.5;
-/// 浮窗最大高度:行距(98pt)按 6 行 + 留白 = 636pt,1080p 屏(可用 ~990pt)占 ~64%,
-/// 比例协调;条目更多时滚动查看。小屏(如 1366x768)再动态收缩(见 show_picker)。
-/// The picker's max height: 6 rows at the 98pt pitch + paddings = 636pt, ~64% of a 1080p
-/// screen's usable height -- proportional; more entries scroll. Small screens (e.g.
-/// 1366x768) shrink it further (see show_picker).
-const PICKER_MAX_HEIGHT: f64 = 640.0;
-/// 浮窗最小高度(内容再少也不低于此,约 5-6 行的高度)。
-/// The picker's minimum height (never smaller, ~5-6 rows worth), also applied to the empty
-/// state for a consistent look.
+/// 浮窗最大高度:单行 61pt 行距 + 头部条(108)+ 底部栏(43),约 8-9 行 + 留白 ≈ 720pt,
+/// 1080p 屏(可用 ~990pt)占 ~73%;条目更多时滚动查看。小屏再动态收缩(见 show_picker)。
+/// The picker's max height: 61pt rows + the header (108) + the footer (43), ~8-9 rows +
+/// paddings ≈ 720pt, ~73% of a 1080p screen's usable height; more entries scroll. Small
+/// screens shrink it further (see show_picker).
+const PICKER_MAX_HEIGHT: f64 = 720.0;
+/// 浮窗最小高度(内容再少也不低于此)/ the picker's minimum height (never smaller).
 const PICKER_MIN_HEIGHT: f64 = 250.0;
-/// 浮窗宽度 / picker width.
-const PICKER_W: f64 = 420.0;
-/// 行按钮内的行高(13pt 字体的行高约 17.5pt,留余量取 20)。
-/// Line height inside a row button (13pt font's line height is ~17.5pt; 20 keeps headroom).
-const LINE_H: f64 = 20.0;
-/// 行按钮内上下内边距 / row button vertical padding.
-const BTN_PAD_Y: f64 = 3.0;
-/// 行按钮之间的间距 / gap between row buttons.
-const ROW_GAP: f64 = 8.0;
-/// 每条文本最多显示的行数(超出第 3 行截断加省略号)。
-/// Max lines shown per entry (truncated with an ellipsis beyond line 3).
-const MAX_TEXT_LINES: usize = 3;
-/// 单行显示宽度上限(以 ASCII 字符为单位;中文/全角按 2 折算)。
-/// Per-line width cap in ASCII-character units (CJK/full-width chars count as 2).
+/// 浮窗宽度(按设计稿 720px 折算到 560pt,保持内容可读性与信息密度平衡)。
+/// Picker width (the mockup's 720px scaled to 560pt -- readable content without losing
+/// density).
+const PICKER_W: f64 = 560.0;
+/// 行统一高度(设计稿 min-height 61px)/ the uniform row height (mockup min-height 61px).
+const ROW_H: f64 = 61.0;
+/// 正文内容行高(13pt 字体的行高 ~16.3pt,取 17 留余量)。
+/// Content line height (13pt font's line height is ~16.3pt; 17 keeps headroom).
+const LINE_H: f64 = 17.0;
+/// 每条文本最多显示的行数(先按单行做,超长省略号;后续可按设计稿的多行分支扩展)。
+/// Max text lines per entry (single line first, ellipsis beyond; the mockup's multiline
+/// branch can come later).
+const MAX_TEXT_LINES: usize = 1;
+/// 单行显示宽度上限(以 ASCII 字符为单位;中文/全角按 2 折算)。行内容宽 ≈ 427pt
+/// (560 - 列表边距 16 - 行内边距 10 - 图标 32 - 图标间隙 11 - 右侧操作区 52 - 内容
+/// 右内边距 12),13pt 字体下每行约 30 个汉字 ≈ 60 单位。
+/// Per-line width cap in ASCII units (CJK counts as 2). The content width is ~427pt
+/// (560 - list margins 16 - row padding 10 - icon 32 - icon gap 11 - actions 52 - main
+/// right padding 12), i.e. ~30 CJK chars per 13pt line ≈ 60 units.
 const LINE_MAX_UNITS: usize = 60;
-/// 上下留白 / vertical padding.
-const PAD_Y: f64 = 10.0;
-/// 右上角"清除全部"按钮尺寸 / the "clear all" button's size.
-const CLEAR_BTN_W: f64 = 60.0;
-const CLEAR_BTN_H: f64 = 22.0;
-/// 清除按钮与行列表的间距 / gap between the clear button and the row list.
-const CLEAR_BTN_GAP: f64 = 6.0;
-/// 顶部搜索框宽度(清除按钮左侧)/ the top search field's width (left of the clear button).
-const SEARCH_BAR_W: f64 = 240.0;
-/// 行内图钉按钮宽度 / the per-row pin button width.
-const PIN_BTN_W: f64 = 24.0;
-/// 行内图钉按钮高度(标题栏内,矮小)/ the per-row pin button height (inside the header bar).
-const PIN_BTN_H: f64 = 14.0;
-/// 行内删除按钮宽度 / the per-row delete button width.
-const DEL_BTN_W: f64 = 24.0;
-/// 行内删除按钮高度(标题栏内,矮小)/ the per-row delete button height (inside the header bar).
-const DEL_BTN_H: f64 = 14.0;
-/// 条目标题栏高度(来源应用名 + 图钉/删除图标)/ the per-entry header bar height (source app
-/// name + pin/delete icons).
-const HEADER_H: f64 = 22.0;
-/// 标题栏与正文按钮的间隙 / gap between the header bar and the body button.
-const BODY_GAP: f64 = 2.0;
-/// 正文左右内边距:文字不要贴卡片边缘(卡片 x=PAD_X,文字再缩进 BODY_PAD_X)。
-/// Body horizontal padding: the text shouldn't hug the card's edge (the card starts at
-/// PAD_X; the text is inset by another BODY_PAD_X on each side).
-const BODY_PAD_X: f64 = 6.0;
-/// 标题栏图标与标题文字的间距(试调值:4pt 偏宽,收窄到 2pt 更紧凑)。
-/// The header icon-to-title gap (tuned: 4pt was too wide, 2pt is tighter).
-const HEADER_ICON_GAP: f64 = 2.0;
-/// 行内图标按钮(图钉/删除)的着色:比系统 labelColor 稍深,浅色界面上更清晰。
-/// Tint for the per-row icon buttons (pin/delete): slightly darker than the system
-/// labelColor for legibility on light glass.
-const ROW_ICON_TINT: f64 = 0.25;
-/// 左右留白 / horizontal padding.
-const PAD_X: f64 = 12.0;
-/// 玻璃圆角:小浮窗固定小圆角,不跟随 config 的大圆角(那会让 420pt 小窗成胶囊)。
-/// Fixed small corner radius for the glass: NOT the config value (which would turn a 420pt
-/// panel into a capsule).
-const CORNER_R: f64 = 14.0;
-/// 选中行的圆角背景块圆角 / selected-row highlight tile corner radius.
-const SEL_TILE_R: f64 = 9.0;
-/// 卡片细边框:白色半透明,把卡片从亮玻璃上"立起来"。
-/// Card hairline border: translucent white, lifting the cards off the bright glass.
-const CARD_BORDER_ALPHA: f64 = 0.6;
-/// 卡片细边框宽度(pt)/ card hairline border width (pt).
-const CARD_BORDER_W: f64 = 0.5;
-/// 标题栏横条颜色:浅色磨砂(白 0.18 叠在卡片上,靠轻微亮度差分层,比黑色灰条现代)。
-/// Header strip: light frosted (white 0.18 over the card; a subtle brightness step layers it
-/// cleanly, more modern than the dark gray band).
-const HEADER_BG_ALPHA: f64 = 0.18;
-/// 选中行标题栏:accent 加深一档(0.5),避免"accent 卡 + 灰条"两色拼贴。
-/// The selected row's header: a deeper accent (0.5), avoiding the two-tone "accent card +
-/// gray strip" patchwork.
-const HEADER_SEL_ALPHA: f64 = 0.5;
-/// 每行背景块透明度(白色,明暗玻璃上都清晰)/ per-row tile alpha (white; legible on both
-/// light and dark glass). 8% 在亮色玻璃上不可见(玻璃本身亮度 ~0.78,零对比度),提到
-/// 0.35 才能形成清晰的磨砂卡片观感。8% vanished on the bright glass (the glass itself is
-/// ~0.78 luminance -- zero contrast); 0.35 reads as a visible frosted card.
-const ROW_TILE_ALPHA: f64 = 0.35;
+/// 行与行之间的间距(设计稿条目之间无间距)/ row-to-row gap (the mockup stacks items flush).
+const ROW_GAP: f64 = 0.0;
+/// 列表区左右边距(设计稿 .history padding 0 8px)/ the list's side padding (8px).
+const PAD_X: f64 = 8.0;
+/// 行内左右内边距(设计稿 padding 0 10px)/ the row's inner horizontal padding (10px).
+const ROW_PAD_X: f64 = 10.0;
+/// 行首来源应用小图标尺寸(设计稿 32px)/ the source app's icon size (32px).
+const ROW_ICON: f64 = 32.0;
+/// 行首图标与正文的间距(设计稿 margin-right 11px)/ gap after the app icon (11px).
+const ICON_GAP: f64 = 11.0;
+/// 内容区右侧内边距(设计稿 .item-main padding-right 12px)。
+/// The main content's right padding (the mockup's 12px).
+const MAIN_PAD_R: f64 = 12.0;
+/// 行内操作按钮(置顶/删除)尺寸(设计稿 25px)/ the per-row action buttons' size (25px).
+const ACTION_BTN: f64 = 25.0;
+/// 操作按钮之间的间距(设计稿 gap 3px)/ gap between the action buttons (3px).
+const ACTION_GAP: f64 = 3.0;
+/// 右侧操作区占宽(设计稿 .actions 52px)/ the actions strip's width (52px).
+const ACTIONS_W: f64 = 52.0;
+/// 时间分组头区域高度(设计稿 27px)/ the time-group header zone height (27px).
+const GROUP_H: f64 = 27.0;
+/// 分组标签顶部偏移(垂直居中)/ the group label's top offset (vertically centered).
+const GROUP_LABEL_PAD: f64 = 7.0;
+/// 头部条:搜索栏区顶部留白(设计稿 .top padding 14px 8px)。
+/// The header strip: the search zone's top padding (mockup 14px).
+const TOP_PAD_Y: f64 = 14.0;
+/// 搜索栏高度(设计稿 48px)/ the search bar's height (48px).
+const SEARCH_H: f64 = 48.0;
+/// 搜索栏左右边距(设计稿 .top padding 14px)/ the search bar's side padding (14px).
+const SEARCH_PAD_X: f64 = 14.0;
+/// 搜索栏圆角(设计稿 10px)/ the search bar's corner radius (10px).
+const SEARCH_R: f64 = 10.0;
+/// 搜索栏与筛选行间距(设计稿 .top 底 8px)/ the gap under the search bar (8px).
+const SEARCH_GAP_Y: f64 = 8.0;
+/// 筛选行高度(设计稿 38px)/ the filters row's height (38px).
+const FILTERS_H: f64 = 38.0;
+/// 筛选行左右边距(设计稿 padding 0 20px)/ the filters row's side padding (20px).
+const FILTERS_PAD_X: f64 = 20.0;
+/// 筛选项间距(设计稿 gap 17px)/ the gap between filter items (17px).
+const FILTER_GAP: f64 = 17.0;
+/// 底部栏高度(设计稿 43px)/ the footer's height (43px).
+const FOOTER_H: f64 = 43.0;
+/// 窗口底部留白 / the window's bottom padding.
+const PAD_Y: f64 = 12.0;
+/// 底部栏左右边距(设计稿 padding 0 16px)/ the footer's side padding (16px).
+const FOOTER_PAD_X: f64 = 16.0;
+/// 底部快捷键分组间距(设计稿 margin-left 16px)/ the footer shortcut groups' spacing.
+const FOOTER_GROUP_GAP: f64 = 16.0;
+/// 底部"清除全部"按钮高度 / the footer clear-all button's height.
+const CLEAR_BTN_H: f64 = 20.0;
+/// 列表顶部与头部条的间距(设计稿 .history padding-top 2px)。
+/// The list's top offset inside the document (mockup 2px).
+const CLEAR_BTN_GAP: f64 = 2.0;
+/// 玻璃圆角(设计稿 16px)/ the glass panel's corner radius (16px).
+const CORNER_R: f64 = 16.0;
+/// 行选中高亮圆角(设计稿 8px)/ the row highlight's corner radius (8px).
+const SEL_TILE_R: f64 = 8.0;
+/// 选中行左侧指示条(设计稿 2px,上下各留 9px)/ the selected row's left bar (2px wide,
+/// inset 9px top/bottom).
+const SEL_BAR_W: f64 = 2.0;
+const SEL_BAR_INSET_Y: f64 = 9.0;
 /// 自定义滚动指示器宽度 / custom scroll indicator width.
 const SCROLL_INDICATOR_W: f64 = 4.0;
 /// 指示器最短显示长度(条太短不可读)/ minimum indicator length (too short is unreadable).
@@ -244,6 +255,13 @@ static PICKER_SELECTION: Mutex<usize> = Mutex::new(0);
 /// the list resets it to 0 in search_field_do_command.
 const NO_SELECTION: usize = usize::MAX;
 
+/// 当前鼠标悬停的行(显示浅灰 hover 底;与选中独立——键盘导航时鼠标可停在别的行)。
+/// 无悬停 = NO_SELECTION。由 mouseEntered/mouseExited 维护。
+/// The row currently under the cursor (shows the faint hover backdrop; independent of the
+/// selection -- with keyboard navigation the mouse may park on another row). NO_SELECTION
+/// when nothing is hovered. Maintained by mouseEntered/mouseExited.
+static HOVER_ROW: Mutex<usize> = Mutex::new(NO_SELECTION);
+
 /// 浮窗窗口 / the picker window.
 static PICKER_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
@@ -262,6 +280,14 @@ static ROW_TILES: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(Vec
 /// varies with the wrapped line count).
 static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// 筛选 pill(全部/文本/图片/链接)按钮指针(与 tag 一一对应;切换/重建时重设样式)。
+/// The filter pills' button pointers (one per tag; restyled on change/rebuild).
+static FILTER_PILLS: Mutex<Vec<ObjPtr>> = Mutex::new(Vec::new());
+
+/// 筛选选中项的下划线小视图(共享单例,随选中项移动)。
+/// The active filter's underline (one shared view, moved under the active item).
+static FILTER_UNDERLINE: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
 /// 顶部搜索框指针 / the top search field.
 static SEARCH_FIELD: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// 居中占位的"放大镜 + 搜索提示"富文本(手绘;字段本身不设 placeholder 属性,避免
@@ -271,21 +297,14 @@ static SEARCH_FIELD: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// left-aligned on a focused-but-empty field).
 static SEARCH_HINT_TEXT: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
-/// 最近一次搜索占位提示对应的条数(条数变了才重建提示,避免悬停/方向键等
-/// 高频 rebuild 反复重建富文本)。
-/// The entry count the search placeholder was last built for (the hint is rebuilt only
-/// when the count changes, so frequent rebuilds from hover/arrow keys don't re-create
-/// the attributed string).
-static LAST_HINT_COUNT: Mutex<usize> = Mutex::new(usize::MAX);
-
-/// 重建搜索框占位提示(放大镜 + "搜索全部{count}条记录"):占位不挂到字段上
-/// (字段编辑器会在聚焦空字段时把它画在左侧),存入静态由 cell 手绘居中
-/// (见 search_cell_draw_interior)。
-/// Rebuild the search field's placeholder (magnifier + "Search all {count} entries"): the
+/// 重建搜索框占位提示(放大镜 + "搜索剪贴板",15pt):占位不挂到字段上(字段编辑器
+/// 会在聚焦空字段时把它画在左侧),存入静态由 cell 手绘在字段左侧(见
+/// search_cell_draw_interior)。
+/// Rebuild the search field's placeholder (magnifier + "Search clipboard", 15pt): the
 /// placeholder is NOT set on the field (the field editor would draw it left-aligned on a
-/// focused-but-empty field); it lives in a static and is hand-drawn centered by the cell
+/// focused-but-empty field); it lives in a static and is hand-drawn at the field's left
 /// (see search_cell_draw_interior).
-unsafe fn rebuild_search_hint(count: usize) {
+unsafe fn rebuild_search_hint() {
     let sym_ns = make_nsstring("magnifyingglass");
     let magnifier: *mut AnyObject = msg_send![
         class!(NSImage),
@@ -297,8 +316,8 @@ unsafe fn rebuild_search_hint(count: usize) {
     let attachment: *mut AnyObject = msg_send![attachment, init];
     let _: () = msg_send![attachment, setImage: magnifier];
     let _: () = msg_send![attachment, setBounds: NSRect::new(
-        NSPoint::new(0.0, -2.0),
-        NSSize::new(13.0, 13.0)
+        NSPoint::new(0.0, -2.5),
+        NSSize::new(15.0, 15.0)
     )];
     let ph_m: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
     let empty_ns2 = make_nsstring("");
@@ -313,17 +332,17 @@ unsafe fn rebuild_search_hint(count: usize) {
     let ph_text_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let ph_text_attrs: *mut AnyObject = msg_send![ph_text_attrs, init];
     let font_key = make_nsstring("NSFont");
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 15.0f64];
     let _: () = msg_send![ph_text_attrs, setObject: font, forKey: font_key];
     CFRelease(font_key as *const c_void);
     let color_key = make_nsstring("NSColor");
-    let ph_color: *mut AnyObject = msg_send![class!(NSColor), placeholderTextColor];
+    // 设计稿 .search-placeholder:15px、40% 黑。icon 后加一个空格。
+    // The mockup's .search-placeholder: 15px, 40% black. A space after the icon.
+    let ph_color: *mut AnyObject =
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.40f64];
     let _: () = msg_send![ph_text_attrs, setObject: ph_color, forKey: color_key];
     CFRelease(color_key as *const c_void);
-    let ph_ns = make_nsstring(&tf(
-        "clipboard.search_hint_count",
-        &[("count", &count.to_string())],
-    ));
+    let ph_ns = make_nsstring(&format!(" {}", t("clipboard.search_placeholder")));
     let ph_text: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
     let ph_text: *mut AnyObject =
         msg_send![ph_text, initWithString: ph_ns, attributes: ph_text_attrs];
@@ -336,18 +355,6 @@ unsafe fn rebuild_search_hint(count: usize) {
         release_obj(old.0);
     }
     *hint = Some(ObjPtr(ph_m));
-    drop(hint);
-    *LAST_HINT_COUNT.lock().unwrap() = count;
-}
-
-/// 搜索框占位提示按当前条数刷新(条数未变则不动作;rebuild_rows 每次重建时调用)。
-/// Refresh the search placeholder for the current count (no-op when the count is
-/// unchanged; called on every rebuild_rows).
-unsafe fn refresh_search_hint(total: usize) {
-    if *LAST_HINT_COUNT.lock().unwrap() == total {
-        return;
-    }
-    rebuild_search_hint(total);
 }
 
 /// 当前搜索词(空 = 不过滤)。/ The current search query (empty = no filtering).
@@ -445,100 +452,194 @@ fn truncate_to_lines(text: &str, max_units: usize, max_lines: usize) -> String {
     out
 }
 
-/// 文本的行数(上限 MAX_TEXT_LINES,超出按 3 行计——第 3 行截断)。
-/// The entry's display line count (capped at MAX_TEXT_LINES; beyond that it renders 3 lines
-/// with the last one truncated).
-fn text_lines(text: &str) -> usize {
-    estimate_lines(text, LINE_MAX_UNITS).min(MAX_TEXT_LINES)
-}
-
 /// 详情面板可用宽 → 每行可容纳的显示宽度单位,与行按钮同一估算口径
-/// (60 单位 ≈ 行内容宽 = PICKER_W - 两侧留白)。
+/// (50 单位 ≈ 行内容宽 ≈ 346pt)。
 /// Detail-panel content width -> per-line width units, using the same estimate as the row
-/// buttons (60 units fit the row content width = PICKER_W - both paddings).
+/// buttons (50 units fit the row content width ≈ 346pt).
 fn detail_text_units(width: f64) -> usize {
-    let units_per_pt = LINE_MAX_UNITS as f64 / (PICKER_W - PAD_X * 2.0 - BODY_PAD_X * 2.0);
+    let units_per_pt = LINE_MAX_UNITS as f64 / content_width();
     ((width * units_per_pt).floor() as usize).max(1)
 }
 
-/// 行按钮高度 = 行数 * 行高 + 上下内边距(按钮随文本行数紧凑包裹)。
-/// Row-button height = lines * line height + vertical padding (the button hugs its text).
-fn row_button_height(lines: usize) -> f64 {
-    lines as f64 * LINE_H + BTN_PAD_Y * 2.0
+/// 行内容可用宽度:窗口宽 - 两翼留白 - 来源图标 - 图标间隙 - 操作按钮条。
+/// The row content's usable width: window - both paddings - icon - icon gap - actions.
+fn content_width() -> f64 {
+    PICKER_W - PAD_X * 2.0 - ROW_PAD_X - ROW_ICON - ICON_GAP - ACTIONS_W - MAIN_PAD_R
 }
 
-/// 是否显示来源应用(读 CONFIG;记录始终进行,开关只控制标题栏里的名称显示)。
+/// 是否显示来源应用(读 CONFIG;记录始终进行,开关只控制行内副信息里的名称显示)。
 /// Whether the source app name is shown (reads CONFIG; recording is always on, the toggle
-/// only gates the name in the header bar).
+/// only gates the name in the row's meta line).
 fn show_source_app() -> bool {
     CONFIG.read().unwrap().clipboard.show_source_app
 }
 
-/// 标题栏文字:开关开 → 来源应用名(无来源显示"未知来源"),有复制时间戳时
-/// 追加"复制于: MM-dd HH:mm";开关关 → 空串(横条只放图标)。
-/// The header text: toggle on -> the source app name ("unknown source" when absent),
-/// with "Copied at: MM-dd HH:mm" appended when a copy timestamp exists; toggle off ->
-/// empty (the strip only hosts the icons).
-fn header_title(entry: &ClipEntry, show_source: bool) -> String {
-    if !show_source {
-        return String::new();
+/// 剪贴板条目类型分类:按内容给极克制的视觉提示(URL 箭头 / 代码括号)。
+/// 启发式保持保守:拿不准就归为普通文本,宁可没提示也不误标。
+/// Clipboard-entry kind classification for the restrained visual cue (URL arrow / code
+/// braces). The heuristic stays conservative: when in doubt, plain text wins -- better no
+/// badge than a wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextKind {
+    Plain,
+    Url,
+    Code,
+}
+
+fn classify_text(text: &str) -> TextKind {
+    let t = text.trim();
+    if t.is_empty() {
+        return TextKind::Plain;
     }
-    let name = if entry.source_app.is_empty() {
-        t("clipboard.unknown_source")
+    // URL:含 scheme 或 www. 开头(整段就是一条链接)。
+    // URL: contains a scheme or starts with www. (the whole text is one link).
+    if t.contains("://") || t.starts_with("www.") {
+        return TextKind::Url;
+    }
+    // 代码:多行 + 明显的代码特征(括号对/分号/缩进/常见关键字)。
+    // Code: multi-line + code-ish cues (paren pairs / semicolons / indentation / keywords).
+    let has_newline = text.contains('\n');
+    let has_code_cues = text.contains('{')
+        || text.contains(';')
+        || text.starts_with('#')
+        || text.starts_with("fn ")
+        || text.starts_with("def ")
+        || text.starts_with("import ")
+        || text.starts_with("const ")
+        || text.starts_with("let ")
+        || text.starts_with("<")
+        || text
+            .lines()
+            .any(|l| l.starts_with(' ') && !l.trim().is_empty());
+    if has_newline && has_code_cues {
+        TextKind::Code
     } else {
-        entry.source_app.clone()
-    };
-    match entry.copied_at {
-        // 旧条目(无时间戳)不显示时间。
-        // Legacy entries (no timestamp) show no time.
-        Some(ts) => format!(
-            // 两个空格:名称与"复制于:"之间留出呼吸感(单空格贴太近)。
-            // Two spaces: breathing room between the app name and "Copied at:".
-            "{}  {}",
-            name,
-            tf("clipboard.copied_at", &[("time", &format_copied_at(ts))])
-        ),
-        None => name,
+        TextKind::Plain
     }
 }
 
-/// 正文按钮高度 = 正文行数(≤3),紧凑包裹文本、顶对齐在条目空间内(标题栏恒占顶部)。
-/// The body button height = text lines (≤3); it hugs the text, top-aligned inside the slot
-/// (the header bar always occupies the top).
-fn body_button_height(entry: &ClipEntry) -> f64 {
-    row_button_height(text_lines(&entry.text))
+/// 行内副信息(应用名 · 相对时间):正文下方的小字,按设计稿 10px 浅灰。
+/// 类型提示改由正文本身的着色/字体表达(URL 蓝、代码等宽),副信息不再挂角标。
+/// The row's meta line (app · relative time): the small text below the content, 10px
+/// light gray per the mockup. The kind cue moved INTO the content itself (blue URLs,
+/// monospaced code); the meta line carries no badge.
+fn build_meta_text(entry: &ClipEntry, show_source: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if show_source {
+        if entry.source_app.is_empty() {
+            parts.push(t("clipboard.unknown_source"));
+        } else {
+            parts.push(entry.source_app.clone());
+        }
+    }
+    if let Some(ts) = entry.copied_at {
+        parts.push(relative_time_label(ts, now_secs()));
+    }
+    parts.join(" · ")
 }
 
-/// 计算一批文本的每行行距。**所有条目固定同一行距** = 标题栏 + 正文 3 行:列表高度
-/// 整齐,短文本的按钮紧凑包裹文本、顶对齐在条目空间内。
-/// Compute the per-row pitches. **All entries share ONE fixed pitch** = header + 3 text
-/// lines: the list height stays even, and short-text buttons hug their text, top-aligned
-/// inside the slot.
+/// 相对时间:刚刚 / 今天 HH:mm / 昨天 HH:mm / 更早 MM-dd HH:mm(本地时区)。
+/// Relative time: Just now / Today HH:mm / Yesterday HH:mm / older MM-dd HH:mm (local tz).
+fn relative_time_label(ts: u64, now: u64) -> String {
+    if now.saturating_sub(ts) < 60 {
+        return t("clipboard.time_just_now");
+    }
+    let delta = day_no(ts) - day_no(now);
+    let hhmm = local_hhmm(ts);
+    match delta {
+        0 => tf("clipboard.time_today", &[("time", &hhmm)]),
+        1 => tf("clipboard.time_yesterday", &[("time", &hhmm)]),
+        _ => format_copied_at(ts),
+    }
+}
+
+/// 本地日期序号(年 × 366 + 年内第几天):同一天相减 = 0,昨天 = 1(与 DST 无关)。
+/// The local day ordinal (year*366 + yday): same-day diff = 0, yesterday = 1 (DST-proof).
+fn day_no(unix_secs: u64) -> i64 {
+    unsafe {
+        let mut tm: LmTm = std::mem::zeroed();
+        let s = unix_secs as i64;
+        localtime_r(&s, &mut tm);
+        tm.tm_year as i64 * 366 + tm.tm_yday as i64
+    }
+}
+
+/// 时间戳 → 本地 HH:mm / timestamp -> local HH:mm.
+fn local_hhmm(unix_secs: u64) -> String {
+    unsafe {
+        let mut tm: LmTm = std::mem::zeroed();
+        let s = unix_secs as i64;
+        localtime_r(&s, &mut tm);
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    }
+}
+
+/// 时间分组:今天 / 昨天 / 更早(按本地日序号)。无时间戳的旧条目归入更早。
+/// Time group: Today / Yesterday / Earlier (by the local day ordinal). Legacy entries
+/// without a timestamp join Earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DayGroup {
+    Today,
+    Yesterday,
+    Earlier,
+}
+
+fn day_group(ts: Option<u64>) -> DayGroup {
+    let Some(ts) = ts else {
+        return DayGroup::Earlier;
+    };
+    match day_no(ts) - day_no(now_secs()) {
+        0 => DayGroup::Today,
+        1 => DayGroup::Yesterday,
+        _ => DayGroup::Earlier,
+    }
+}
+
+/// 分组头文字(轻量分隔)/ the group header's label.
+fn group_label(g: DayGroup) -> String {
+    match g {
+        DayGroup::Today => t("clipboard.group_today"),
+        DayGroup::Yesterday => t("clipboard.group_yesterday"),
+        DayGroup::Earlier => t("clipboard.group_earlier"),
+    }
+}
+
+/// 行内容高度:统一固定 61pt(设计稿 min-height 61px,内容垂直居中)。
+/// The row content height: uniformly 61pt (the mockup's min-height 61px, content
+/// vertically centered).
+fn row_content_h(_entry: &ClipEntry) -> f64 {
+    ROW_H
+}
+
+/// 计算一批条目的每行行距。**每条目标定同一行距** = 内容高 + 行距;分组边界
+/// 前插入分组头高度(列表筛完后的显示顺序下,时间跨组必然正确)。
+/// Compute the per-row pitches. **Every entry keeps ONE fixed pitch** = content + row gap;
+/// a group-header height is inserted before the first row of each group (computed on the
+/// FILTERED display order, so time boundaries stay correct under filtering).
 fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
-    // 文本行:标题栏 + 间隙 + 3 行正文 + 行距;图片行:标题栏 + 间隙 + 缩略图 + 行距。
-    // 混排时可见行数按首行行距估算(show_picker),±1 行近似,第一版接受。
-    // Text rows: header + gap + 3 body lines + row gap; image rows: header + gap +
-    // thumbnail + row gap. With mixed lists the visible-row estimate (show_picker) uses the
-    // first row's pitch -- within ±1 row, accepted for v1.
+    let mut prev: Option<DayGroup> = None;
     texts
         .iter()
         .map(|e| {
-            if e.image.is_some() {
-                HEADER_H + BODY_GAP + IMG_PREVIEW_H + ROW_GAP
+            let g = day_group(e.copied_at);
+            let hdr = if prev.is_none() || prev != Some(g) {
+                GROUP_H
             } else {
-                HEADER_H + BODY_GAP + row_button_height(MAX_TEXT_LINES) + ROW_GAP
-            }
+                0.0
+            };
+            prev = Some(g);
+            hdr + row_content_h(e)
         })
         .collect()
 }
 
-/// 固定头部条高度:顶部留白 + 搜索框/清除按钮行 + 与列表的间距。
-/// 头部条独立于滚动区(见 ensure_picker_window),窗口总高 = 头部条 + 列表 + 底部留白。
-/// The fixed header strip's height: top padding + the search/clear row + the gap to the
-/// list. The strip is separate from the scroll area (see ensure_picker_window); the window
-/// height = the strip + the list + the bottom padding.
+/// 固定头部条高度:顶部留白 + 搜索框/筛选/清除按钮行 + 与列表的间距。
+/// The fixed header strip's height: top padding + the search/filter/clear row + the gap
+/// to the list.
+/// 固定头部条高度:搜索栏区(14 + 48 + 8)+ 筛选行(38),镜像设计稿。
+/// The fixed header strip: the search zone (14 + 48 + 8) + the filters row (38).
 fn header_strip_h() -> f64 {
-    PAD_Y + CLEAR_BTN_H + CLEAR_BTN_GAP
+    TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y + FILTERS_H
 }
 
 /// 文档内行列表的顶部偏移:仅保留与头部条的间距(头部条已不在滚动区内,
@@ -1065,17 +1166,41 @@ fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     }
 }
 
-/// 过滤:返回匹配 query 的历史索引列表(空 query = 全部;大小写不敏感子串匹配)。
-/// Filter: indices of entries matching `query` (empty query = all; case-insensitive substring).
-fn filtered_indices(history: &[ClipEntry], query: &str) -> Vec<usize> {
-    if query.is_empty() {
-        return (0..history.len()).collect();
+/// 条目筛选:全部 / 文本 / 图片 / 链接(无代码档——代码归入文本,只在行内做
+/// 克制的括号提示)。/ Picker filters: All / Text / Image / Link (no code tier -- code
+/// falls under Text, only the subtle brace cue marks it in the row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipFilter {
+    All,
+    Text,
+    Image,
+    Link,
+}
+
+/// 当前生效的筛选项 / the active filter.
+static CLIP_FILTER: Mutex<ClipFilter> = Mutex::new(ClipFilter::All);
+
+/// 条目是否命中筛选项 / whether an entry matches the filter.
+fn matches_filter(e: &ClipEntry, f: ClipFilter) -> bool {
+    match f {
+        ClipFilter::All => true,
+        ClipFilter::Image => e.image.is_some(),
+        ClipFilter::Text => e.image.is_none(),
+        ClipFilter::Link => e.image.is_none() && classify_text(&e.text) == TextKind::Url,
     }
+}
+
+/// 过滤:返回匹配 query + 筛选项的历史索引列表(空 query + All = 全部;大小写不敏感
+/// 子串匹配)。/ Filter: indices of entries matching the query AND the filter (empty query
+/// + All = every entry; case-insensitive substring match).
+fn filtered_indices(history: &[ClipEntry], query: &str, filter: ClipFilter) -> Vec<usize> {
     let q = query.to_lowercase();
     history
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.text.to_lowercase().contains(&q))
+        .filter(|(_, e)| {
+            matches_filter(e, filter) && (q.is_empty() || e.text.to_lowercase().contains(&q))
+        })
         .map(|(i, _)| i)
         .collect()
 }
@@ -1106,11 +1231,14 @@ fn max_entries() -> usize {
 /// cache.
 fn clip_image_cache_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    // 测试构建按线程隔离目录:测试并行运行,清缓存/删文件的用例不能与其它
-    // 正在写文件的用例共用同一目录(否则互相踩踏)。
-    // Test builds isolate the directory per thread: tests run in parallel, so a
-    // wipe/delete test must not share its directory with tests that are writing files.
-    let name = if cfg!(test) {
+    // 冒烟模式(--smoke-clipboard)走专用目录:真实二进制运行时 cfg!(test) 不生效,
+    // 不隔离就会把注入的测试条目写进用户的真实历史/缓存(曾污染真实 history 文件)。
+    // Smoke mode (--smoke-clipboard) uses a dedicated dir: the smoke runs the REAL binary,
+    // so cfg!(test) is off -- without this, injected test entries used to land in the
+    // user's real history/cache.
+    let name = if SMOKE_MODE.load(Ordering::SeqCst) {
+        "oh-my-tab-clip-images-smoke".to_string()
+    } else if cfg!(test) {
         format!(
             "oh-my-tab-clip-images-test-{:?}",
             std::thread::current().id()
@@ -1313,7 +1441,12 @@ struct HistoryFile {
 /// The persisted-history path (same dir as config.toml; test builds use a test dir).
 fn history_file_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let dir = if cfg!(test) {
+    let dir = if SMOKE_MODE.load(Ordering::SeqCst) {
+        format!(
+            "{}/Library/Caches/oh-my-tab-clip-images-smoke/history",
+            home
+        )
+    } else if cfg!(test) {
         format!(
             "{}/Library/Caches/oh-my-tab-clip-images-test-{:?}/history",
             home,
@@ -2415,6 +2548,12 @@ unsafe fn observer() -> *mut AnyObject {
                 search_field_changed as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(filterPillClicked:),
+                filter_pill_clicked as *mut c_void,
+                types.as_ptr(),
+            );
             // 搜索框 delegate:拦截字段编辑器翻译出的命令(如 ↓ → moveDown:)。
             // Search-field delegate: intercepts commands the field editor translates
             // (e.g. ↓ -> moveDown:).
@@ -2989,28 +3128,33 @@ fn show_picker() {
         // bar / cursor offset / edge margins).
         let max_h = PICKER_MAX_HEIGHT.min(screen_frame.size.height - 120.0);
         // 可视行数由高度上限倒推,取整行(窗口底部不出现半截行)。
+        // 估算行距用"无分组头的常规行距"(首行带 26pt 分组头,直接用它会低估密度)。
         // 窗口总高 = 头部条 + 列表 + 底部留白,所以列表高度预算 = max_h - 头部条 - 留白。
         // The visible row count derives from the height cap, floored to whole rows (no
-        // half-cut row at the window's bottom). The window height = the strip + the list +
-        // the bottom padding, so the list's budget = max_h - strip - padding.
+        // half-cut row at the window's bottom). The estimate uses the plain (header-less)
+        // row pitch -- the first row carries a 26pt group header, which would undercount.
+        // The window height = the strip + the list + the bottom padding, so the list's
+        // budget = max_h - strip - padding.
+        // 行距统一 61pt(ROW_H);窗口总高 = 头部条 + 列表 + 底部栏 + 留白。
+        // Rows are a uniform 61pt (ROW_H); the window height = the header + the list +
+        // the footer + padding.
         let visible = if hist_len == 0 {
             0
         } else {
-            let pitch = pitches[0];
-            (((max_h - header_strip_h() - PAD_Y) / pitch).floor() as usize)
+            (((max_h - header_strip_h() - FOOTER_H - PAD_Y) / ROW_H).floor() as usize)
                 .min(hist_len)
                 .max(1)
         };
         // 空历史时列表区高度 = 一条提示行的高度。
         // With an empty history the list area is one hint row tall.
         let list_h = if hist_len == 0 {
-            row_button_height(1)
+            40.0
         } else {
             pitches.iter().take(visible).sum::<f64>()
         };
         // 最小高度兜底(内容再少也不低于 PICKER_MIN_HEIGHT,含空历史态)。
         // Floor at the minimum height (never smaller, empty state included).
-        let h = (header_strip_h() + list_h + PAD_Y).max(PICKER_MIN_HEIGHT);
+        let h = (header_strip_h() + list_h + FOOTER_H + PAD_Y).max(PICKER_MIN_HEIGHT);
 
         let frame = picker_frame_for(cursor, screen_frame, PICKER_W, h);
         log_debug!(
@@ -3618,8 +3762,8 @@ unsafe fn ensure_picker_window() {
     let scroll: *mut AnyObject = msg_send![
         scroll,
         initWithFrame: NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(w, h - header_strip_h())
+            NSPoint::new(0.0, FOOTER_H),
+            NSSize::new(w, h - header_strip_h() - FOOTER_H)
         )
     ];
     let _: () = msg_send![scroll, setAutoresizingMask: 18u64];
@@ -3640,7 +3784,7 @@ unsafe fn ensure_picker_window() {
         indicator,
         initWithFrame: NSRect::new(
             NSPoint::new(w - SCROLL_INDICATOR_W - 3.0, 3.0),
-            NSSize::new(SCROLL_INDICATOR_W, h - 6.0)
+            NSSize::new(SCROLL_INDICATOR_W, h - header_strip_h() - FOOTER_H - 6.0)
         )
     ];
     let _: () = msg_send![indicator, setWantsLayer: true];
@@ -3696,25 +3840,30 @@ unsafe fn ensure_picker_window() {
         objc_registerClassPair(cls);
         cls
     };
+    // 搜索框(设计稿 .search):48pt 高、10 圆角、4.5% 黑底 + 1px 内描边,占位左对齐。
+    // The search field (the mockup's .search): 48pt tall, radius 10, a 4.5% black fill
+    // with a 1px inner ring; the placeholder is left-aligned.
+    let search_w = PICKER_W - SEARCH_PAD_X * 2.0;
     let search: *mut AnyObject = msg_send![search_cls, alloc];
     let search: *mut AnyObject = msg_send![
         search,
         initWithFrame: NSRect::new(
-            NSPoint::new(PAD_X, PAD_Y),
-            NSSize::new(SEARCH_BAR_W, CLEAR_BTN_H)
+            NSPoint::new(SEARCH_PAD_X, TOP_PAD_Y),
+            NSSize::new(search_w, SEARCH_H)
         )
     ];
-    // 居中 cell:占位 = "放大镜 SF Symbol + 搜索提示"整体水平居中(见 search_cell_class)。
-    // A centered cell: the placeholder = "magnifier SF Symbol + search hint" centered as a
-    // group (see search_cell_class).
+    // 自定义 cell:占位 = "放大镜 SF Symbol + 搜索提示"整体画在字段左侧(见
+    // search_cell_class),⌘F 键帽画在最右侧。
+    // A custom cell: the placeholder = "magnifier SF Symbol + search hint" drawn at the
+    // field's left (see search_cell_class), with the ⌘F keycap at the far right.
     let cell: *mut AnyObject = msg_send![search_cell_class(), alloc];
     let empty_ns = make_nsstring("");
     let cell: *mut AnyObject = msg_send![cell, initTextCell: empty_ns];
     CFRelease(empty_ns as *const c_void);
-    // 占位提示(放大镜 + 带条数文案)独立构建,条数变化时由 rebuild_rows 刷新。
-    // The placeholder (magnifier + count-bearing text) is built separately and refreshed
-    // by rebuild_rows when the entry count changes.
-    rebuild_search_hint(0);
+    // 占位提示(放大镜 + 文案)独立构建;按设计稿为静态文案(条数显示移到底部栏)。
+    // The placeholder (magnifier + text) is built separately; per the mockup it is a
+    // static string (the entry count moved to the footer).
+    rebuild_search_hint();
     let _: () = msg_send![search, setCell: cell];
     release_obj(cell);
     // 显式置空 placeholder 属性(双保险,任何读取方都拿不到内容)。
@@ -3732,27 +3881,29 @@ unsafe fn ensure_picker_window() {
     // replacing the cell (selectable too, for good measure).
     let _: () = msg_send![search, setEditable: true];
     let _: () = msg_send![search, setSelectable: true];
-    // 聚焦环会在编辑时画一圈方形描边,破坏磨砂圆角观感——关闭。
-    // The focus ring draws a square outline while editing, breaking the frosted rounded
-    // look -- disabled.
+    // 聚焦环会在编辑时画一圈方形描边,破坏圆角观感——关闭。
+    // The focus ring draws a square outline while editing, breaking the rounded look --
+    // disabled.
     let _: () = msg_send![search, setFocusRingType: 1u64]; // NSFocusRingTypeNone
-                                                           // 编辑态文本与占位一致居中(字段编辑器继承 cell 的对齐)。
-                                                           // The editing text centers like the placeholder (the field editor inherits the cell's
-                                                           // alignment).
-    let _: () = msg_send![search, setAlignment: 1u64]; // Center on arm64 (NSTextAlignment uses iOS values)
-                                                       // 磨砂化:去掉系统描边/bezel,改用与"清除全部"按钮同款的白色圆角 tile,顶部控件
-                                                       // 风格统一(系统 ✕ 清除按钮随之不渲染,清空由 Esc/cancelOperation: 覆盖)。
-                                                       // Frosted look: drop the system bezel and use the same white rounded tile as the
-                                                       // "clear all" button, unifying the top bar (the system ✕ clear button no longer renders;
-                                                       // clearing is covered by Esc/cancelOperation:).
+                                                           // 编辑态文本与占位一致左对齐(设计稿文字靠左)。
+                                                           // Editing text is left-aligned like the placeholder (the mockup's layout).
+    let _: () = msg_send![search, setAlignment: 0u64]; // left
+                                                       // 磨砂化:去掉系统描边/bezel,换成 4.5% 黑底 + 1px 内描边(系统 ✕ 清除按钮
+                                                       // 随之不渲染,清空由 Esc/cancelOperation: 覆盖)。
+                                                       // Frosted: drop the system bezel for a 4.5% black fill + a 1px inner ring (the
+                                                       // system ✕ clear button no longer renders; clearing is covered by
+                                                       // Esc/cancelOperation:).
     let _: () = msg_send![search, setBezeled: false];
     let _: () = msg_send![search, setDrawsBackground: false];
     let _: () = msg_send![search, setWantsLayer: true];
     let search_layer: *mut AnyObject = msg_send![search, layer];
-    let s_bg: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: ROW_TILE_ALPHA];
+    let s_bg: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.045f64];
     crate::ffi::layer_set_background(search_layer, crate::ffi::ns_color_to_cg(s_bg));
-    let _: () = msg_send![search_layer, setCornerRadius: SEL_TILE_R];
+    let s_ring: *mut AnyObject =
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.035f64];
+    crate::ffi::layer_set_border(search_layer, crate::ffi::ns_color_to_cg(s_ring));
+    let _: () = msg_send![search_layer, setBorderWidth: 1.0f64];
+    let _: () = msg_send![search_layer, setCornerRadius: SEARCH_R];
     // delegate = observer()(复用通知单例):↓ 命令拦截(字段编辑器转发 moveDown:)。
     // Delegate = observer() (reusing the notification singleton): intercepts ↓ (the field
     // editor forwards moveDown:).
@@ -3775,46 +3926,34 @@ unsafe fn ensure_picker_window() {
     ];
     CFRelease(text_name as *const c_void);
 
-    // 右上角"清除全部"按钮:清空剪贴板历史。右缘与条目卡片右缘对齐
-    // (卡片右缘 = PICKER_W - PAD_X;此前多留的 3pt 边距导致右缘错位)。
-    // "Clear all" button at the top-right: empties the clipboard history. Its right edge
-    // aligns with the entry cards' right edge (cards end at PICKER_W - PAD_X; the old extra
-    // 3pt margin misaligned them).
-    let clear_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let clear_btn: *mut AnyObject = msg_send![
-        clear_btn,
-        initWithFrame: NSRect::new(
-            NSPoint::new(w - PAD_X - CLEAR_BTN_W, PAD_Y),
-            NSSize::new(CLEAR_BTN_W, CLEAR_BTN_H)
-        )
+    // 筛选行(设计稿 .filters):纯文字 12pt,选中项加深 + 底部 16×2 下划线。
+    // The filters row (the mockup's .filters): bare 12pt text; the active one darkens and
+    // gains a 16x2 underline.
+    let filter_labels = [
+        t("clipboard.filter_all"),
+        t("clipboard.filter_text"),
+        t("clipboard.filter_image"),
+        t("clipboard.filter_link"),
     ];
-    let _: () = msg_send![clear_btn, setBordered: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
-    let _: () = msg_send![clear_btn, setFont: font];
-    // 居中显示在磨砂白块内(与行卡片同款观感),而不是贴右边的裸文字。
-    // Centered inside the frosted-white tile (same look as the row cards), not bare text
-    // hugging the right edge.
-    let _: () = msg_send![clear_btn, setAlignment: 1isize]; // Center on arm64 (NSTextAlignment uses iOS values)
-                                                            // 磨砂白块背景:与行背景块同色同圆角,顶部工具栏与列表视觉统一。
-                                                            // Frosted-white tile background: same color and corner radius as the row tiles, so the
-                                                            // top bar matches the list.
-    let _: () = msg_send![clear_btn, setWantsLayer: true];
-    let clear_layer: *mut AnyObject = msg_send![clear_btn, layer];
-    let white: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: ROW_TILE_ALPHA];
-    // layer_set_background 走 raw objc_msgSend(与行卡片同款)。
-    // layer_set_background goes through raw objc_msgSend (same as the row tiles).
-    crate::ffi::layer_set_background(clear_layer, crate::ffi::ns_color_to_cg(white));
-    let _: () = msg_send![clear_layer, setCornerRadius: SEL_TILE_R];
-    let title_ns = make_nsstring(&t("clipboard.clear_all"));
-    let _: () = msg_send![clear_btn, setTitle: title_ns];
-    CFRelease(title_ns as *const c_void);
-    let _: () = msg_send![clear_btn, setTarget: observer()];
-    let _: () = msg_send![clear_btn, setAction: sel!(clearClipboardHistory:)];
-    // 清除按钮挂在固定头部条(不随列表滚动)。
-    // The clear button lives in the fixed header strip (it does not scroll with the list).
-    let _: () = msg_send![header_strip, addSubview: clear_btn];
-    release_obj(clear_btn);
+    let filters_y = TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y;
+    *FILTER_PILLS.lock().unwrap() = Vec::new();
+    let mut fx = FILTERS_PAD_X;
+    for (i, lab) in filter_labels.iter().enumerate() {
+        // 按钮宽 = 文字宽 + 点击余量;间距按设计稿 17px。
+        // Button width = the text + click slack; gaps per the mockup's 17px.
+        let w = localized_string_width(lab, 12.0) + 12.0;
+        let pill = make_filter_pill(lab, i as isize, fx, filters_y, w);
+        let _: () = msg_send![header_strip, addSubview: pill];
+        release_obj(pill);
+        FILTER_PILLS.lock().unwrap().push(ObjPtr(pill));
+        fx += w + FILTER_GAP;
+    }
+    update_filter_pill_style();
+
+    // 底部栏(设计稿 .footer):43pt,顶部分隔线 + 条目数 + 快捷键图例 + 清除全部。
+    // The footer (the mockup's .footer): 43pt, a top hairline + the entry count + the
+    // shortcut legends + clear all.
+    build_footer(content_parent, w);
     // 点击外部(浮窗失去 key)→ 自动隐藏。Win+V 同款行为:呼出后点任何地方即消失。
     // Outside clicks (the picker resigns key) -> auto-hide. Same as Win+V: any click after
     // summoning dismisses the picker.
@@ -3885,13 +4024,17 @@ unsafe fn rebuild_rows() {
     // Each row's button height / pitch derives from its wrapped line count.
     *pitches = compute_pitches(&hist);
     let total = hist.len();
-    // 搜索占位提示带条数:条数变化时刷新(高频 rebuild 不重建富文本)。
-    // The search placeholder carries the count: refresh when it changes (frequent
-    // rebuilds don't re-create the attributed string).
-    unsafe { refresh_search_hint(total) };
-    // 重建当前显示列表(按搜索词过滤)。
-    // Rebuild the display list (filtered by the search query).
-    *FILTERED.lock().unwrap() = filtered_indices(&hist, &SEARCH_QUERY.lock().unwrap());
+    // 底部栏条目数随历史变化刷新(占位提示已改为静态文案)。
+    // The footer's entry count follows the history (the search placeholder is now a
+    // static string).
+    refresh_footer_count(total);
+    // 重建当前显示列表(按搜索词 + 筛选项过滤)。
+    // Rebuild the display list (filtered by the query AND the kind filter).
+    *FILTERED.lock().unwrap() = filtered_indices(
+        &hist,
+        &SEARCH_QUERY.lock().unwrap(),
+        *CLIP_FILTER.lock().unwrap(),
+    );
     let filtered = FILTERED.lock().unwrap();
 
     // 删除/裁剪后把选中索引钳到新显示列表内(越界 → 末条;NO_SELECTION 不动)。
@@ -3922,11 +4065,11 @@ unsafe fn rebuild_rows() {
         // The container height = the visible area (the window minus the header strip), NOT
         // one row: the document view hangs off the clip view's bottom (the clip isn't
         // flipped); a short document gets clipped, and the hint would land outside it.
-        let doc_h = PICKER_MIN_HEIGHT - header_strip_h();
+        let doc_h = PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H;
         let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
         // 提示文本:在可视列表区内垂直居中。
         // The hint: vertically centered within the visible list area.
-        let label_h = row_button_height(1);
+        let label_h = 40.0;
         let label_y = (doc_h - label_h) / 2.0;
         let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let label: *mut AnyObject = msg_send![
@@ -3973,14 +4116,19 @@ unsafe fn rebuild_rows() {
     // visible area hangs off the clip view's bottom (the clip isn't flipped), pushing the
     // rows against the bottom edge.
     let doc_h = (rows_top_offset() + pitches.iter().take(filtered.len()).sum::<f64>() + PAD_Y)
-        .max(PICKER_MIN_HEIGHT - header_strip_h());
+        .max(PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H);
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
 
     let sel_idx = *PICKER_SELECTION.lock().unwrap();
-    // 读一次配置:标题栏里是否显示应用名(标题栏本身恒在,承载图钉/删除图标)。
-    // Read the toggle once: whether the header bar shows the app name (the header itself is
-    // always present, hosting the pin/delete icons).
+    // 鼠标悬停行(与选中独立:键盘导航时鼠标停在别的行上 → 两态并存)。
+    // The hovered row (independent of the selection: with keyboard navigation the mouse
+    // may park on another row -> both states coexist, like the mockup's :hover/.selected).
+    let hover_idx = *HOVER_ROW.lock().unwrap();
+    // 读一次配置:副信息行是否显示应用名(记录始终进行,开关只控制名称)。
+    // Read the toggle once: whether the meta line shows the app name (recording never
+    // stops; the toggle only gates the name).
     let show_source = show_source_app();
+    let mut prev_group: Option<DayGroup> = None;
     for (i, &h_idx) in filtered.iter().enumerate() {
         let y = row_top(i, &pitches);
         // 日志只打索引/坐标,绝不打条目内容(隐私)。
@@ -3989,350 +4137,191 @@ unsafe fn rebuild_rows() {
         let row_w = PICKER_W - PAD_X * 2.0;
         let entry = &hist[h_idx];
         let selected = i == sel_idx;
+        let hovered = i == hover_idx;
+        let group = day_group(entry.copied_at);
+        let has_hdr = prev_group.is_none() || prev_group != Some(group);
+        prev_group = Some(group);
+        let hdr_h = if has_hdr { GROUP_H } else { 0.0 };
+        let content_y = y + hdr_h;
+        let row_h = pitches[i] - hdr_h;
 
-        // 卡片背景块:占满固定行距(行距 - 间距);选中行用强调色盖满整卡。
-        // 细边框 + 圆角把卡片从亮玻璃上"立起来"。
-        // The card tile: fills the fixed pitch (pitch - gap); the selected row gets the
-        // accent color across the whole card. A hairline border + radius lift the cards off
-        // the bright glass.
+        // 分组头:一行 11px medium 小字(设计稿 .group-title,27px 高,垂直居中)。
+        // Group header: one line of 11px medium text (the mockup's .group-title, 27px tall,
+        // vertically centered).
+        if has_hdr {
+            let g_label = make_nsstring(&group_label(group));
+            let g: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+            let g: *mut AnyObject = msg_send![
+                g,
+                initWithFrame: NSRect::new(
+                    NSPoint::new(PAD_X + 4.0, y + GROUP_LABEL_PAD),
+                    NSSize::new(row_w - PAD_X, GROUP_H - GROUP_LABEL_PAD)
+                )
+            ];
+            let _: () = msg_send![g, setStringValue: g_label];
+            CFRelease(g_label as *const c_void);
+            let _: () = msg_send![g, setBezeled: false];
+            let _: () = msg_send![g, setDrawsBackground: false];
+            let _: () = msg_send![g, setEditable: false];
+            let _: () = msg_send![g, setSelectable: false];
+            let g_font: *mut AnyObject =
+                msg_send![class!(NSFont), systemFontOfSize: 11.0f64, weight: 0.23f64]; // Medium
+            let _: () = msg_send![g, setFont: g_font];
+            let g_color: *mut AnyObject =
+                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
+            let _: () = msg_send![g, setTextColor: g_color];
+            let _: () = msg_send![container, addSubview: g];
+            release_obj(g);
+            rows.push(ObjPtr(g));
+        }
+
+        // 行底:选中 = 0.055 黑 + 2px 左指示条;悬停(未选中)= 0.035 黑;其余透明。
+        // 按设计稿 .item:hover/.item.selected 的浅黑层次,无描边、无彩色环。
+        // The row backdrop: selected = 0.055 black + a 2px left bar; hovered (not
+        // selected) = 0.035 black; otherwise transparent. The mockup's :hover/.selected
+        // light-black layers -- no border, no colored ring.
         let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
         let tile: *mut AnyObject = msg_send![
             tile,
-            initWithFrame: NSRect::new(NSPoint::new(PAD_X, y), NSSize::new(row_w, pitches[i] - ROW_GAP))
+            initWithFrame: NSRect::new(NSPoint::new(PAD_X, content_y), NSSize::new(row_w, row_h))
         ];
         let _: () = msg_send![tile, setWantsLayer: true];
         let tile_layer: *mut AnyObject = msg_send![tile, layer];
-        let bg: *mut AnyObject = if selected {
-            // 选中 = 系统强调色半透明(明暗玻璃都清晰);colorWithAlphaComponent: 是 double。
-            // Selected = the system accent at partial alpha (legible on both glasses);
-            // colorWithAlphaComponent: takes a double.
-            let accent: *mut AnyObject = msg_send![class!(NSColor), controlAccentColor];
-            msg_send![accent, colorWithAlphaComponent: 0.35f64]
+        let bg_alpha = if selected {
+            0.055
+        } else if hovered {
+            0.035
         } else {
-            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: ROW_TILE_ALPHA]
+            0.0
         };
+        let bg: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha];
         // layer_set_background 走 raw objc_msgSend:objc2 的 msg_send! 无法编码
         // CGColor 参数/返回(参数编码 '^{CGColor=}' 与 *mut c_void 的 '^v' 不匹配)。
         // layer_set_background goes through raw objc_msgSend: objc2's msg_send! can't encode
         // CGColor args/returns ('^{CGColor=}' vs '^v').
         crate::ffi::layer_set_background(tile_layer, crate::ffi::ns_color_to_cg(bg));
         let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
-        // 细边框(同 raw FFI 路径)。
-        // The hairline border (same raw-FFI path).
-        let border: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: CARD_BORDER_ALPHA];
-        crate::ffi::layer_set_border(tile_layer, crate::ffi::ns_color_to_cg(border));
-        let _: () = msg_send![tile_layer, setBorderWidth: CARD_BORDER_W];
+        // 选中行左侧 2px 指示条(上下各缩进 9px,设计稿 .item.selected::before)。
+        // The selected row's 2px left bar (inset 9px top/bottom, the mockup's ::before).
+        if selected {
+            let bar: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let bar: *mut AnyObject = msg_send![
+                bar,
+                initWithFrame: NSRect::new(
+                    NSPoint::new(0.0, SEL_BAR_INSET_Y),
+                    NSSize::new(SEL_BAR_W, row_h - SEL_BAR_INSET_Y * 2.0)
+                )
+            ];
+            let _: () = msg_send![bar, setWantsLayer: true];
+            let bar_layer: *mut AnyObject = msg_send![bar, layer];
+            let bar_bg: *mut AnyObject =
+                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.45f64];
+            crate::ffi::layer_set_background(bar_layer, crate::ffi::ns_color_to_cg(bar_bg));
+            let _: () = msg_send![bar_layer, setCornerRadius: SEL_BAR_W / 2.0];
+            let _: () = msg_send![tile, addSubview: bar];
+            release_obj(bar);
+        }
         let _: () = msg_send![container, addSubview: tile];
         release_obj(tile);
         tiles.push(ObjPtr(tile));
 
-        // 标题栏:浅色磨砂横条(选中行 = accent 加深)+ 应用名,只圆顶部两角(与卡片顶角
-        // 贴合);整条可点击 = 粘贴,悬停选中该行(与正文按钮同款行为)。
-        // Header bar: a light frosted strip (a deeper accent when selected) + the app name,
-        // top corners rounded only (flush with the card's top); the whole strip is clickable
-        // = paste, hover selects (same as the body).
-        let header: *mut AnyObject = msg_send![row_button_class(), alloc];
-        let header: *mut AnyObject = msg_send![
-            header,
-            initWithFrame: NSRect::new(NSPoint::new(PAD_X, y), NSSize::new(row_w, HEADER_H))
-        ];
-        let _: () = msg_send![header, setBordered: false];
-        let _: () = msg_send![header, setAlignment: 0isize]; // left
-        let _: () = msg_send![header, setWantsLayer: true];
-        let h_layer: *mut AnyObject = msg_send![header, layer];
-        let h_bg: *mut AnyObject = if selected {
-            let accent: *mut AnyObject = msg_send![class!(NSColor), controlAccentColor];
-            msg_send![accent, colorWithAlphaComponent: HEADER_SEL_ALPHA]
-        } else {
-            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: HEADER_BG_ALPHA]
-        };
-        crate::ffi::layer_set_background(h_layer, crate::ffi::ns_color_to_cg(h_bg));
-        let _: () = msg_send![h_layer, setCornerRadius: SEL_TILE_R];
-        // 只圆顶部两角(CALayerCornerMask: minXMinY = 1<<0, maxXMinY = 1<<1)。
-        // Round only the top corners (CALayerCornerMask: minXMinY = 1<<0, maxXMinY = 1<<1).
-        let _: () = msg_send![h_layer, setMaskedCorners: 3u64];
-        // 来源应用小图标:开关开 + 有缓存键 + 小图存在 → 图标画进一个带左补白的透明
-        // 画布再挂到按钮上(NSImageLeft):图标从 x=BODY_PAD_X 处显示、不拦截点击(仍是
-        // 按钮的 image,整条标题栏可点=粘贴);标题在图标后自动右移,无需额外缩进。
-        // The source app's small icon: toggle on + a cache key + the small PNG exists -> the
-        // icon is drawn into a transparent canvas with left padding and set on the button
-        // (NSImageLeft): the icon shows from x=BODY_PAD_X and never intercepts clicks (it is
-        // still the button's image, so the whole header stays clickable = paste); the title
-        // follows the image, no extra indent needed.
-        let mut has_icon = false;
-        if show_source && !entry.source_key.is_empty() {
-            let icon_path = crate::window_collector::small_icon_path_for_key(&entry.source_key);
-            if std::path::Path::new(&icon_path).exists() {
-                let ns_path = make_nsstring(&icon_path);
-                let icon_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-                let icon_image: *mut AnyObject =
-                    msg_send![icon_image, initWithContentsOfFile: ns_path];
-                CFRelease(ns_path as *const c_void);
-                if !icon_image.is_null() {
-                    // 32px PNG 需 setSize 否则按 32pt 显示会溢出 22pt 标题栏。
-                    // A 32px PNG must be setSize'd or it renders at 32pt and overflows the
-                    // 22pt header.
-                    let _: () = msg_send![icon_image, setSize: NSSize::new(16.0, 16.0)];
-                    let pad_w = BODY_PAD_X + 16.0 + HEADER_ICON_GAP;
-                    let canvas: *mut AnyObject = msg_send![class!(NSImage), alloc];
-                    let canvas: *mut AnyObject =
-                        msg_send![canvas, initWithSize: NSSize::new(pad_w, 16.0)];
-                    let _: () = msg_send![canvas, lockFocus];
-                    let dst = NSRect::new(NSPoint::new(BODY_PAD_X, 0.0), NSSize::new(16.0, 16.0));
-                    let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
-                    let op: usize = 1; // NSCompositingOperationCopy
-                    let _: () = msg_send![
-                        icon_image,
-                        drawInRect: dst,
-                        fromRect: src,
-                        operation: op,
-                        fraction: 1.0f64
-                    ];
-                    let _: () = msg_send![canvas, unlockFocus];
-                    let _: () = msg_send![header, setImage: canvas];
-                    let _: () = msg_send![header, setImagePosition: 2isize]; // NSImageLeft
-                    release_obj(canvas);
-                    release_obj(icon_image);
-                    has_icon = true;
-                }
-            }
-        }
-        let h_title = header_title(entry, show_source);
-        // 无图标时标题首行缩进与正文对齐;有图标时图标位已由补白画布让出。
-        // Without an icon the title's first line aligns with the body text; with an icon the
-        // padded canvas already reserves the slot.
-        let title_indent = if has_icon { 0.0 } else { BODY_PAD_X };
-        let h_attr = make_header_title(&h_title, title_indent);
-        let _: () = msg_send![header, setAttributedTitle: h_attr];
-        release_obj(h_attr);
-        let _: () = msg_send![header, setTag: i as isize];
-        let _: () = msg_send![header, setTarget: row_target()];
-        let _: () = msg_send![header, setAction: sel!(handleClipboardRowClick:)];
-        add_hover_tracking(header);
-        let _: () = msg_send![container, addSubview: header];
-        release_obj(header);
-        rows.push(ObjPtr(header));
-
-        // 正文按钮:标题栏下方,占满卡宽(图钉/删除已搬进标题栏,不再占宽度)。
-        // 图片条目 = 缩略图按钮(等比缩放的图,点击同样粘贴);文本条目 = 文字按钮。
-        // Body button: below the header, full card width (pin/delete moved into the header,
-        // no longer reserving width). Image entries = a thumbnail button (proportionally
-        // scaled, clicking pastes too); text entries = the text button.
-        let body: *mut AnyObject = msg_send![row_button_class(), alloc];
+        // 主按钮:整行可点击(粘贴)+ 悬停;来源图标(图片行再加缩略图盒)画进左侧画布,
+        // 标题 = 正文(单行,按类型着色)+ 副信息一段 attributed。无边框、无背景。
+        // The main button: the row is clickable (paste) and hover-tracked; the source icon
+        // (plus the thumbnail box on image rows) lives in the left canvas; the title is one
+        // attributed string of content (single line, styled by kind) + the meta line.
+        // Borderless, backgroundless.
+        let row_img = make_row_image(entry);
+        let main: *mut AnyObject = msg_send![row_button_class(), alloc];
         let is_image = entry.image.is_some();
-        let body_h = if is_image {
-            IMG_PREVIEW_H
-        } else {
-            body_button_height(entry)
-        };
-        let body: *mut AnyObject = msg_send![
-            body,
+        let main_h = row_h;
+        let main: *mut AnyObject = msg_send![
+            main,
             initWithFrame: NSRect::new(
-                NSPoint::new(PAD_X + BODY_PAD_X, y + HEADER_H + BODY_GAP),
-                NSSize::new(row_w - BODY_PAD_X * 2.0, body_h)
+                NSPoint::new(PAD_X, content_y),
+                NSSize::new(row_w - ACTIONS_W, main_h)
             )
         ];
-        let _: () = msg_send![body, setBordered: false];
-        let _: () = msg_send![body, setAlignment: 0isize]; // left
-                                                           // 裁剪:行文本渲染不得溢出按钮边界(正文外还有标题栏/卡片边缘)。
-                                                           // Clip: the row text must not render outside the button.
-        let _: () = msg_send![body, setWantsLayer: true];
-        let body_layer: *mut AnyObject = msg_send![body, layer];
-        if !body_layer.is_null() {
-            let _: () = msg_send![body_layer, setMasksToBounds: true];
+        let _: () = msg_send![main, setBordered: false];
+        let _: () = msg_send![main, setAlignment: 0isize]; // left
+        let cell: *mut AnyObject = msg_send![main, cell];
+        let _: () = msg_send![cell, setUsesSingleLineMode: false];
+        let _: () = msg_send![cell, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+        if !row_img.is_null() {
+            let _: () = msg_send![main, setImage: row_img];
+            let _: () = msg_send![main, setImagePosition: 2isize]; // NSImageLeft
+            release_obj(row_img);
         }
+        // 正文:图片条目 = 缩略图(预览缺失时退化为文件名文本);文本条目 = 单行截断。
+        // Content: image rows show the thumbnail (falling back to the filename text when the
+        // preview is missing); text rows show one truncated line.
+        let meta = build_meta_text(entry, show_source);
+        let mut content = String::new();
         if is_image {
-            if let Some(img) = &entry.image {
-                if img.preview_png.is_empty() {
-                    // 无预览(解码失败的退化文件条目 / 源文件已删的空预览):正文显示
-                    // 文件名文本(entry.text 已存文件名)。
-                    // No preview (a degenerate file entry whose decode failed, or an empty
-                    // preview whose source is gone): the body shows the filename text
-                    // (entry.text already holds it).
-                    let title = truncate_to_lines(&entry.text, LINE_MAX_UNITS, MAX_TEXT_LINES);
-                    let attr = make_row_attributed_title(&title, selected);
-                    let _: () = msg_send![body, setAttributedTitle: attr];
-                    release_obj(attr);
-                } else {
-                    // 缩略图:PNG 字节 → NSImage。**预缩放**后挂到按钮:按钮 cell 对大图按
-                    // 原生尺寸绘制再裁剪(实测只显示左上角一部分),而 setImageScaling: 不
-                    // 生效;把原图画进适配尺寸的目标 NSImage,图片点尺寸恰好等于按钮
-                    // frame,cell 无需任何缩放逻辑,整图按原比例显示。
-                    // The thumbnail: PNG bytes -> NSImage, PRE-SCALED onto the button: the
-                    // button's cell draws large images at native size and crops them (measured:
-                    // only the top-left shows), and setImageScaling: has no effect; drawing the
-                    // source into a target NSImage sized to the fit makes the image's point size
-                    // exactly the button's frame, so the cell scales nothing and the whole image
-                    // shows at its real proportions.
-                    let png = &img.preview_png;
-                    let data: *mut AnyObject = msg_send![
-                        class!(NSData),
-                        dataWithBytes: png.as_ptr() as *const c_void,
-                        length: png.len()
-                    ];
-                    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-                    let image: *mut AnyObject = msg_send![image, initWithData: data];
-                    if !image.is_null() {
-                        let img_size: NSSize = msg_send![image, size];
-                        let avail_w = row_w - BODY_PAD_X * 2.0;
-                        if img_size.width > 0.0 && img_size.height > 0.0 {
-                            // 等比适配可用区域(宽 IMG_PREVIEW_H 高),居中放置。
-                            // Fit proportionally into the available area (IMG_PREVIEW_H tall),
-                            // centered.
-                            let fit_scale =
-                                (avail_w / img_size.width).min(IMG_PREVIEW_H / img_size.height);
-                            let fit_w = img_size.width * fit_scale;
-                            let fit_h = img_size.height * fit_scale;
-                            let _: () = msg_send![
-                                body,
-                                setFrameOrigin: NSPoint::new(
-                                    PAD_X + BODY_PAD_X,
-                                    y + HEADER_H + BODY_GAP + (IMG_PREVIEW_H - fit_h) / 2.0
-                                )
-                            ];
-                            let _: () = msg_send![body, setFrameSize: NSSize::new(fit_w, fit_h)];
-                            // 预缩放:原图 → fit 尺寸目标图(与图标提取同款 lockFocus 管线)。
-                            // Pre-scale: the source -> a fit-sized target (the same lockFocus
-                            // pipeline as the icon extraction).
-                            let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
-                            let target: *mut AnyObject =
-                                msg_send![target, initWithSize: NSSize::new(fit_w, fit_h)];
-                            let _: () = msg_send![target, lockFocus];
-                            let dst =
-                                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(fit_w, fit_h));
-                            let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
-                            let op: usize = 1; // NSCompositingOperationCopy
-                            let _: () = msg_send![
-                                image,
-                                drawInRect: dst,
-                                fromRect: src,
-                                operation: op,
-                                fraction: 1.0f64
-                            ];
-                            let _: () = msg_send![target, unlockFocus];
-                            let _: () = msg_send![body, setImage: target];
-                            let _: () = msg_send![body, setImagePosition: 1isize]; // NSImageOnly
-                            release_obj(target);
-                        }
-                        release_obj(image);
-                    }
-                }
+            let has_preview = entry
+                .image
+                .as_ref()
+                .map(|i| !i.preview_png.is_empty())
+                .unwrap_or(false);
+            if !has_preview {
+                content = truncate_to_lines(&entry.text, LINE_MAX_UNITS, MAX_TEXT_LINES);
             }
         } else {
-            // 超长文本换行显示,最多 3 行(第 3 行超出截断加省略号)。
-            // Long text wraps, up to 3 lines (truncated with an ellipsis on line 3).
-            let title = truncate_to_lines(&entry.text, LINE_MAX_UNITS, MAX_TEXT_LINES);
-            let attr = make_row_attributed_title(&title, selected);
-            let _: () = msg_send![body, setAttributedTitle: attr];
-            release_obj(attr);
+            content = truncate_to_lines(&entry.text, LINE_MAX_UNITS, MAX_TEXT_LINES);
         }
-        let _: () = msg_send![body, setTag: i as isize];
-        let _: () = msg_send![body, setTarget: row_target()];
-        let _: () = msg_send![body, setAction: sel!(handleClipboardRowClick:)];
-        add_hover_tracking(body);
-        let _: () = msg_send![container, addSubview: body];
-        release_obj(body);
-        rows.push(ObjPtr(body));
+        let kind = if is_image {
+            TextKind::Plain
+        } else {
+            classify_text(&entry.text)
+        };
+        let attr = make_row_attributed(&content, &meta, kind);
+        let _: () = msg_send![main, setAttributedTitle: attr];
+        release_obj(attr);
+        let _: () = msg_send![main, setTag: i as isize];
+        let _: () = msg_send![main, setTarget: row_target()];
+        let _: () = msg_send![main, setAction: sel!(handleClipboardRowClick:)];
+        add_hover_tracking(main);
+        let _: () = msg_send![container, addSubview: main];
+        release_obj(main);
+        rows.push(ObjPtr(main));
 
-        // 行内图钉按钮:标题栏右侧,垂直居中。独立于行按钮(点击不会触发粘贴)。
-        // Per-row pin button: the header's right side, vertically centered. Separate from the
-        // row buttons (clicking the pin does not paste).
-        let pin_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let pin_btn: *mut AnyObject = msg_send![
-            pin_btn,
-            initWithFrame: NSRect::new(
-                NSPoint::new(
-                    PICKER_W - PAD_X - DEL_BTN_W - PIN_BTN_W - 2.0,
-                    y + (HEADER_H - PIN_BTN_H) / 2.0
-                ),
-                NSSize::new(PIN_BTN_W, PIN_BTN_H)
-            )
-        ];
-        let _: () = msg_send![pin_btn, setBordered: false];
-        // NSImageOnly = 1。曾误用 2(NSImageLeft = 图像与标题并排),按钮默认标题
-        // 会显示在图标右侧(用户看到的"字母")。
-        // NSImageOnly = 1. Was mistakenly 2 (NSImageLeft = image beside the title), which
-        // showed the button's default title right of the icon (the stray letter).
-        let _: () = msg_send![pin_btn, setImagePosition: 1isize];
-        // 显式清空标题(默认值不可靠)。
-        // Explicitly clear the title (the default is unreliable).
-        let empty_ns = make_nsstring("");
-        let _: () = msg_send![pin_btn, setTitle: empty_ns];
-        CFRelease(empty_ns as *const c_void);
-        // SF Symbol:置顶用 pin.fill,未置顶用 pin。
-        // SF Symbol: pin.fill when pinned, pin otherwise.
-        let symbol = if entry.pinned { "pin.fill" } else { "pin" };
-        let sym_ns = make_nsstring(symbol);
-        let desc = make_nsstring("Pin");
-        let img: *mut AnyObject = msg_send![
-            class!(NSImage),
-            imageWithSystemSymbolName: sym_ns,
-            accessibilityDescription: desc
-        ];
-        CFRelease(sym_ns as *const c_void);
-        CFRelease(desc as *const c_void);
-        if !img.is_null() {
-            let _: () = msg_send![pin_btn, setImage: img];
+        // 操作按钮(置顶/删除):默认完全透明,行悬停或选中时显现(设计稿 opacity 0→1)。
+        // 独立于主按钮,点击不会触发粘贴。
+        // Action buttons (pin / delete): fully transparent by default, revealed when the
+        // row is hovered or selected (the mockup's opacity 0 -> 1). Separate from the main
+        // button; clicking them does not paste.
+        let act_alpha = if selected || hovered { 1.0 } else { 0.0 };
+        let act_y = content_y + (row_h - ACTION_BTN) / 2.0;
+        let x_del = PICKER_W - PAD_X - ROW_PAD_X - ACTION_BTN;
+        let x_pin = x_del - ACTION_GAP - ACTION_BTN;
+        let pin_sym = if entry.pinned { "pin.fill" } else { "pin" };
+        let pin_btn = make_action_button(
+            pin_sym,
+            sel!(togglePin:),
+            i as isize,
+            x_pin,
+            act_y,
+            act_alpha,
+        );
+        if !pin_btn.is_null() {
+            let _: () = msg_send![container, addSubview: pin_btn];
+            release_obj(pin_btn);
+            rows.push(ObjPtr(pin_btn));
         }
-        let _: () = msg_send![pin_btn, setTag: i as isize];
-        let _: () = msg_send![pin_btn, setTarget: row_target()];
-        let _: () = msg_send![pin_btn, setAction: sel!(togglePin:)];
-        // 图标加深(比系统默认 labelColor 深一档)。
-        // Darken the icon (one notch darker than the default labelColor).
-        let tint: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: ROW_ICON_TINT, alpha: 1.0f64];
-        let _: () = msg_send![pin_btn, setContentTintColor: tint];
-        let _: () = msg_send![container, addSubview: pin_btn];
-        release_obj(pin_btn);
-        rows.push(ObjPtr(pin_btn));
-
-        // 行内删除按钮(Backspace 图标):单条删除。独立于行按钮(点击不会触发粘贴)。
-        // Per-row delete button (the Backspace icon): removes the entry. Separate from the
-        // row buttons (clicking it does not paste).
-        let del_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let del_btn: *mut AnyObject = msg_send![
-            del_btn,
-            initWithFrame: NSRect::new(
-                NSPoint::new(
-                    PICKER_W - PAD_X - DEL_BTN_W,
-                    y + (HEADER_H - DEL_BTN_H) / 2.0
-                ),
-                NSSize::new(DEL_BTN_W, DEL_BTN_H)
-            )
-        ];
-        let _: () = msg_send![del_btn, setBordered: false];
-        // NSImageOnly = 1;显式清空标题,只显示图标。
-        // NSImageOnly = 1; title cleared explicitly, icon only.
-        let _: () = msg_send![del_btn, setImagePosition: 1isize];
-        let empty_ns = make_nsstring("");
-        let _: () = msg_send![del_btn, setTitle: empty_ns];
-        CFRelease(empty_ns as *const c_void);
-        // SF Symbol "delete.left" = Backspace 图标。
-        // SF Symbol "delete.left" = the Backspace icon.
-        let sym_ns = make_nsstring("delete.left");
-        let desc = make_nsstring("Delete");
-        let img: *mut AnyObject = msg_send![
-            class!(NSImage),
-            imageWithSystemSymbolName: sym_ns,
-            accessibilityDescription: desc
-        ];
-        CFRelease(sym_ns as *const c_void);
-        CFRelease(desc as *const c_void);
-        if !img.is_null() {
-            let _: () = msg_send![del_btn, setImage: img];
+        let del_btn = make_action_button(
+            "delete.left",
+            sel!(deleteEntry:),
+            i as isize,
+            x_del,
+            act_y,
+            act_alpha,
+        );
+        if !del_btn.is_null() {
+            let _: () = msg_send![container, addSubview: del_btn];
+            release_obj(del_btn);
+            rows.push(ObjPtr(del_btn));
         }
-        let _: () = msg_send![del_btn, setTag: i as isize];
-        let _: () = msg_send![del_btn, setTarget: row_target()];
-        let _: () = msg_send![del_btn, setAction: sel!(deleteEntry:)];
-        // 图标加深(与图钉一致)。
-        // Darken the icon (same as the pin).
-        let tint: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: ROW_ICON_TINT, alpha: 1.0f64];
-        let _: () = msg_send![del_btn, setContentTintColor: tint];
-        let _: () = msg_send![container, addSubview: del_btn];
-        release_obj(del_btn);
-        rows.push(ObjPtr(del_btn));
     }
 
     // 恢复滚动位置 / restore the scroll position.
@@ -4368,6 +4357,12 @@ unsafe fn row_button_class() -> *mut AnyObject {
                 cls,
                 sel!(mouseEntered:),
                 row_button_mouse_entered as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                row_button_mouse_exited as *mut c_void,
                 types.as_ptr(),
             );
             objc_registerClassPair(cls);
@@ -4467,8 +4462,57 @@ extern "C" fn search_cell_draw_interior(
                 len > 0
             };
             if has_text {
+                // ⌘F 快捷键提示:右侧键帽(设计稿 .search-shortcut:28×22、5 圆角、
+                // 5.5% 黑底、11px 38% 黑字)。
+                // The ⌘F shortcut hint: a keycap at the right (the mockup's
+                // .search-shortcut: 28x22, radius 5, 5.5% black fill, 11px 38% black text).
+                let chip_w = 28.0;
+                let chip_h = 22.0;
+                let chip_rect = NSRect::new(
+                    NSPoint::new(
+                        cell_frame.origin.x + cell_frame.size.width - chip_w - 13.0,
+                        cell_frame.origin.y + (cell_frame.size.height - chip_h) / 2.0,
+                    ),
+                    NSSize::new(chip_w, chip_h),
+                );
+                let path: *mut AnyObject = msg_send![
+                    class!(NSBezierPath),
+                    bezierPathWithRoundedRect: chip_rect,
+                    xRadius: 5.0,
+                    yRadius: 5.0
+                ];
+                let cap_bg: *mut AnyObject =
+                    msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.055];
+                let _: () = msg_send![cap_bg, set];
+                let _: () = msg_send![path, fill];
+                let chip_font: *mut AnyObject =
+                    msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
+                let chip_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+                let chip_attrs: *mut AnyObject = msg_send![chip_attrs, init];
+                let cf_key = make_nsstring("NSFont");
+                let cc_key = make_nsstring("NSColor");
+                let _: () = msg_send![chip_attrs, setObject: chip_font, forKey: cf_key];
+                let chip_color: *mut AnyObject =
+                    msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.38f64];
+                let _: () = msg_send![chip_attrs, setObject: chip_color, forKey: cc_key];
+                CFRelease(cf_key as *const c_void);
+                CFRelease(cc_key as *const c_void);
+                let chip_ns = make_nsstring("⌘F");
+                let chip_str: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+                let chip_str: *mut AnyObject =
+                    msg_send![chip_str, initWithString: chip_ns, attributes: chip_attrs];
+                CFRelease(chip_ns as *const c_void);
+                release_obj(chip_attrs);
+                let csize: NSSize = msg_send![chip_str, size];
+                let cx = chip_rect.origin.x + (chip_rect.size.width - csize.width) / 2.0;
+                let cy = chip_rect.origin.y + (chip_rect.size.height - csize.height) / 2.0;
+                let _: () = msg_send![chip_str, drawAtPoint: NSPoint::new(cx, cy)];
+                release_obj(chip_str);
+
+                // 占位整体画在字段左侧(设计稿 .search-placeholder 跟在图标后)。
+                // The placeholder is drawn at the field's left (the mockup's layout).
                 let size: NSSize = msg_send![placeholder, size];
-                let x = cell_frame.origin.x + (cell_frame.size.width - size.width) / 2.0;
+                let x = cell_frame.origin.x + 13.0;
                 let y = cell_frame.origin.y + (cell_frame.size.height - size.height) / 2.0;
                 let _: () = msg_send![placeholder, drawAtPoint: NSPoint::new(x, y)];
                 return;
@@ -4679,8 +4723,32 @@ extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *m
     }
     let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
     if idx >= 0 {
+        // 悬停行与选中都更新(悬停即选中,与切换浮窗一致;hover 底是独立视觉状态)。
+        // Both the hovered row and the selection update (hover selects, same as the
+        // switcher; the hover backdrop is a separate visual state).
+        *HOVER_ROW.lock().unwrap() = idx as usize;
         *PICKER_SELECTION.lock().unwrap() = idx as usize;
         unsafe { rebuild_rows() };
+    }
+}
+
+/// 鼠标离开行按钮:清除悬停行(仅当离开的正是悬停行;先进入下一行再离开的
+/// 事件序不会误清)→ 重建以收起 hover 底与操作按钮。
+/// Mouse leaves a row button: clear the hovered row (only when the exited row IS the
+/// hovered one -- the enter-next-then-exit-previous event order must not clear wrongly)
+/// -> rebuild to hide the hover backdrop and the action buttons.
+extern "C" fn row_button_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    if REBUILDING.load(Ordering::SeqCst) {
+        return;
+    }
+    let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
+    if idx >= 0 {
+        let mut hover = HOVER_ROW.lock().unwrap();
+        if *hover == idx as usize {
+            *hover = NO_SELECTION;
+            drop(hover);
+            unsafe { rebuild_rows() };
+        }
     }
 }
 
@@ -5082,90 +5150,602 @@ extern "C" fn picker_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> boo
 
 /// 行标题(attributed):选中 = 白字粗体,未选 = labelColor。
 /// Row title (attributed): selected = white bold, unselected = labelColor.
-unsafe fn make_row_attributed_title(title: &str, selected: bool) -> *mut AnyObject {
-    let font: *mut AnyObject = if selected {
-        msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64]
-    } else {
-        msg_send![class!(NSFont), systemFontOfSize: 13.0f64]
-    };
-    // 文字跟随系统明暗:玻璃背景会随桌面明暗变化,固定白色在浅色玻璃上不可读。
-    // 选中行 = labelColor(系统文本色)+ 粗体,配合强调色背景块;未选中 = secondaryLabelColor。
-    // Text follows the system appearance: the glass backdrop adapts to the desktop's
-    // light/dark state, so fixed white becomes unreadable on light glass. The selected row
-    // uses labelColor (system text color) + bold over an accent tile; unselected rows use
-    // secondaryLabelColor.
-    let color: *mut AnyObject = if selected {
-        msg_send![class!(NSColor), labelColor]
-    } else {
-        msg_send![class!(NSColor), secondaryLabelColor]
-    };
-    // 段落样式:单词换行——长文本在行按钮内换行显示(最多 3 行由 truncate_to_lines 保证)。
-    // Paragraph style: word wrapping -- long text wraps inside the row button (the 3-line cap
-    // is guaranteed by truncate_to_lines).
+/// 行标题(attributed):正文段(≤2 行,13pt,labelColor)+ 换行 + 副信息段(10pt,
+/// secondaryLabelColor)。段落单词换行;短文本顶对齐(按钮 frame 恰好贴合文本块高度,
+/// cell 无需垂直居中)。选中不用粗体——高亮块和左侧指示条已表达状态,正文保持克制。
+/// The row title (attributed): the content block (<=2 lines, 13pt, labelColor) + a
+/// newline + the meta block (10pt, secondaryLabelColor). Paragraph word-wrapping; short
+/// text sits top-aligned (the button frame hugs the text block, so the cell centers
+/// nothing). No bold on selection -- the highlight + left bar carry the state; the text
+/// stays restrained.
+/// 行标题(attributed):正文段(单行省略号,按类型着色:URL 蓝 / 代码等宽 + 深灰 /
+/// 普通 78% 黑)+ 换行 + 副信息段(10pt 35% 黑)。镜像设计稿的 .content/.meta。
+/// The row title (attributed): the content line (single-line ellipsis, styled by kind:
+/// blue URLs / monospaced code / plain 78% black) + a newline + the meta line (10pt 35%
+/// black). Mirrors the mockup's .content/.meta.
+unsafe fn make_row_attributed(content: &str, meta: &str, kind: TextKind) -> *mut AnyObject {
+    let total: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+    let empty_ns = make_nsstring("");
+    let total: *mut AnyObject = msg_send![total, initWithString: empty_ns];
+    CFRelease(empty_ns as *const c_void);
+
+    // 段落样式:单词换行(截断到 1 行由 truncate_to_lines 保证)。
+    // Paragraph style: word wrapping (the 1-line cap is guaranteed by truncate_to_lines).
     let pstyle: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
     let pstyle: *mut AnyObject = msg_send![pstyle, init];
     let _: () = msg_send![pstyle, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
-    let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-    let attrs: *mut AnyObject = msg_send![attrs, init];
-    let font_key = make_nsstring("NSFont");
-    let color_key = make_nsstring("NSColor");
-    let pstyle_key = make_nsstring("NSParagraphStyle");
-    let _: () = msg_send![attrs, setObject: font, forKey: font_key];
-    let _: () = msg_send![attrs, setObject: color, forKey: color_key];
-    let _: () = msg_send![attrs, setObject: pstyle, forKey: pstyle_key];
-    CFRelease(font_key as *const c_void);
-    CFRelease(color_key as *const c_void);
-    CFRelease(pstyle_key as *const c_void);
+
+    if !content.is_empty() {
+        let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+        let attrs: *mut AnyObject = msg_send![attrs, init];
+        // 按类型取字体/颜色:URL = 蓝色;代码 = 等宽 12pt + 深灰;普通 = 13pt 78% 黑。
+        // Styled by kind: URLs are blue; code is monospaced 12pt + dark gray; plain text
+        // is 13pt at 78% black.
+        let font: *mut AnyObject = match kind {
+            TextKind::Code => {
+                msg_send![class!(NSFont), monospacedSystemFontOfSize: 12.0f64, weight: 0.0f64]
+            }
+            _ => msg_send![class!(NSFont), systemFontOfSize: 13.0f64],
+        };
+        let color: *mut AnyObject = match kind {
+            TextKind::Url => {
+                msg_send![class!(NSColor), colorWithSRGBRed: 35.0f64 / 255.0, green: 95.0f64 / 255.0, blue: 170.0f64 / 255.0, alpha: 0.82f64]
+            }
+            TextKind::Code => {
+                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.67f64]
+            }
+            TextKind::Plain => {
+                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.78f64]
+            }
+        };
+        let font_key = make_nsstring("NSFont");
+        let color_key = make_nsstring("NSColor");
+        let pstyle_key = make_nsstring("NSParagraphStyle");
+        let _: () = msg_send![attrs, setObject: font, forKey: font_key];
+        let _: () = msg_send![attrs, setObject: color, forKey: color_key];
+        let _: () = msg_send![attrs, setObject: pstyle, forKey: pstyle_key];
+        CFRelease(font_key as *const c_void);
+        CFRelease(color_key as *const c_void);
+        CFRelease(pstyle_key as *const c_void);
+        let ns = make_nsstring(content);
+        let part: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+        let part: *mut AnyObject = msg_send![part, initWithString: ns, attributes: attrs];
+        CFRelease(ns as *const c_void);
+        release_obj(attrs);
+        let _: () = msg_send![total, appendAttributedString: part];
+        release_obj(part);
+    }
+    if !meta.is_empty() {
+        // 内容与副信息之间换行(内容为空时省略,避免图片行出现悬空的首行)。
+        // A newline between the content and the meta line (omitted when the content is
+        // empty, so image rows don't get a dangling blank first line).
+        if !content.is_empty() {
+            let nl = make_nsstring("\n");
+            let nl_attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+            let nl_attr: *mut AnyObject = msg_send![nl_attr, initWithString: nl];
+            CFRelease(nl as *const c_void);
+            let _: () = msg_send![total, appendAttributedString: nl_attr];
+            release_obj(nl_attr);
+        }
+
+        let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+        let attrs: *mut AnyObject = msg_send![attrs, init];
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+        let color: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.35f64];
+        let font_key = make_nsstring("NSFont");
+        let color_key = make_nsstring("NSColor");
+        let pstyle_key = make_nsstring("NSParagraphStyle");
+        let _: () = msg_send![attrs, setObject: font, forKey: font_key];
+        let _: () = msg_send![attrs, setObject: color, forKey: color_key];
+        let _: () = msg_send![attrs, setObject: pstyle, forKey: pstyle_key];
+        CFRelease(font_key as *const c_void);
+        CFRelease(color_key as *const c_void);
+        CFRelease(pstyle_key as *const c_void);
+        let ns = make_nsstring(meta);
+        let part: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+        let part: *mut AnyObject = msg_send![part, initWithString: ns, attributes: attrs];
+        CFRelease(ns as *const c_void);
+        release_obj(attrs);
+        let _: () = msg_send![total, appendAttributedString: part];
+        release_obj(part);
+    }
     release_obj(pstyle);
-    let ns_title = make_nsstring(title);
-    let attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-    let attr: *mut AnyObject = msg_send![attr, initWithString: ns_title, attributes: attrs];
-    CFRelease(ns_title as *const c_void);
-    release_obj(attrs);
-    attr
+    total
 }
 
-/// 标题栏文字(attributed):10pt,次要色,在浅色磨砂横条上可读;空串时整行留空。
-/// `indent`: 首行左缩进(pt)——有图标时让出图标位,无图标时与正文文字对齐。
-/// Header-bar text (attributed): 10pt, secondary color, legible on the light frosted strip;
-/// an empty string renders nothing. `indent`: the first-line left indent (pt) -- reserves the
-/// icon slot when present, aligns with the body text otherwise.
-unsafe fn make_header_title(title: &str, indent: f64) -> *mut AnyObject {
-    if title.is_empty() {
-        let empty = make_nsstring("");
+/// 加载来源应用的小图标(28pt,已按点尺寸缩放;无缓存则返回 null)。
+/// Load the source app's small icon (28pt, pre-scaled in points; null when uncached).
+unsafe fn load_source_icon(entry: &ClipEntry) -> *mut AnyObject {
+    if entry.source_key.is_empty() {
+        return std::ptr::null_mut();
+    }
+    let icon_path = crate::window_collector::small_icon_path_for_key(&entry.source_key);
+    if !std::path::Path::new(&icon_path).exists() {
+        return std::ptr::null_mut();
+    }
+    let ns_path = make_nsstring(&icon_path);
+    let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let img: *mut AnyObject = msg_send![img, initWithContentsOfFile: ns_path];
+    CFRelease(ns_path as *const c_void);
+    if !img.is_null() {
+        let _: () = msg_send![img, setSize: NSSize::new(ROW_ICON, ROW_ICON)];
+    }
+    img
+}
+
+/// 组装行按钮左侧画布(NSImage):文本框 = 来源图标 28×28;图片框 = 来源图标 +
+/// 等比缩略图(≤IMG_PREVIEW_H 高,≤72 宽)。什么都画不了时返回 null(按钮不设
+/// image,标题自动左移)。用 lockFocus 管线避免按钮 cell 对大图按原生尺寸裁剪。
+/// Compose the row button's left canvas (NSImage): text rows = the source app icon
+/// 28x28; image rows = the icon + a proportionally scaled thumbnail (<=IMG_PREVIEW_H
+/// tall, <=72 wide). Returns null when nothing is drawable (the button gets no image and
+/// the title shifts left automatically). The lockFocus pipeline avoids the button cell's
+/// native-size cropping of large images.
+/// 组装行按钮左侧画布(NSImage):文本框 = 来源图标 32×32;图片框 = 来源图标 +
+/// 45×38 圆角缩略图盒(浅底 + 内描边,设计稿 .thumbnail)。画布锁在 lockFocus 管线里
+/// 绘制:缩略图先裁剪进圆角路径再画,最后描一圈内环。什么都画不了时返回 null。
+/// Compose the row button's left canvas (NSImage): text rows = the source app icon
+/// 32x32; image rows = the icon + a 45x38 rounded thumbnail box (faint fill + inner
+/// ring, the mockup's .thumbnail). Drawn inside the lockFocus pipeline: the image is
+/// clipped to the rounded path first, then the inner ring is stroked. Returns null when
+/// nothing is drawable.
+unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
+    let icon = load_source_icon(entry);
+    let thumb: *mut AnyObject = if let Some(img) = &entry.image {
+        if img.preview_png.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            let data: *mut AnyObject = msg_send![
+                class!(NSData),
+                dataWithBytes: img.preview_png.as_ptr() as *const c_void,
+                length: img.preview_png.len()
+            ];
+            let im: *mut AnyObject = msg_send![class!(NSImage), alloc];
+            let im: *mut AnyObject = msg_send![im, initWithData: data];
+            if im.is_null() {
+                std::ptr::null_mut()
+            } else {
+                let s: NSSize = msg_send![im, size];
+                if s.width <= 0.0 || s.height <= 0.0 {
+                    release_obj(im);
+                    std::ptr::null_mut()
+                } else {
+                    // 等比 contain 进 45×38 盒 / fit-contain into the 45x38 box.
+                    let scale = (THUMB_W / s.width).min(THUMB_H / s.height);
+                    let w = s.width * scale;
+                    let h = s.height * scale;
+                    let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                    let target: *mut AnyObject =
+                        msg_send![target, initWithSize: NSSize::new(THUMB_W, THUMB_H)];
+                    let _: () = msg_send![target, lockFocus];
+                    // 盒底:浅灰渐变太细,用设计稿的底色纯色近似(0.08 → 0.025 中间值)。
+                    // The box fill: a flat approximation of the mockup's faint gradient.
+                    let fill: *mut AnyObject =
+                        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.05f64];
+                    let _: () = msg_send![fill, set];
+                    let box_path: *mut AnyObject = msg_send![
+                        class!(NSBezierPath),
+                        bezierPathWithRoundedRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(THUMB_W, THUMB_H)),
+                        xRadius: THUMB_R,
+                        yRadius: THUMB_R
+                    ];
+                    let _: () = msg_send![box_path, fill];
+                    // 圆角裁剪后画图 / clip to the rounded rect, then draw the image.
+                    let _: () = msg_send![box_path, addClip];
+                    let dst = NSRect::new(
+                        NSPoint::new((THUMB_W - w) / 2.0, (THUMB_H - h) / 2.0),
+                        NSSize::new(w, h),
+                    );
+                    let src_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+                    let op: usize = 1; // NSCompositingOperationCopy
+                    let _: () = msg_send![im, drawInRect: dst, fromRect: src_rect, operation: op, fraction: 1.0f64];
+                    // 内描边(设计稿 inset ring)/ the inset ring.
+                    let ring: *mut AnyObject =
+                        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.045f64];
+                    let _: () = msg_send![ring, set];
+                    let _: () = msg_send![box_path, setLineWidth: 1.0f64];
+                    let _: () = msg_send![box_path, stroke];
+                    let _: () = msg_send![target, unlockFocus];
+                    release_obj(im);
+                    target
+                }
+            }
+        }
+    } else {
+        std::ptr::null_mut()
+    };
+
+    if icon.is_null() && thumb.is_null() {
+        return std::ptr::null_mut();
+    }
+    // 画布宽含行内左边距(10pt):图标落在设计稿的 x=18 处(列表边距 8 + 行内边距 10)。
+    // The canvas width includes the row's left padding (10pt): the icon lands at the
+    // mockup's x=18 (list margin 8 + row padding 10).
+    let canvas_w = if icon.is_null() {
+        THUMB_W
+    } else if thumb.is_null() {
+        ROW_PAD_X + ROW_ICON
+    } else {
+        ROW_PAD_X + ROW_ICON + IMG_CANVAS_GAP + THUMB_W
+    };
+    let canvas_h = if thumb.is_null() { ROW_ICON } else { THUMB_H };
+    let canvas: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let canvas: *mut AnyObject = msg_send![canvas, initWithSize: NSSize::new(canvas_w, canvas_h)];
+    let _: () = msg_send![canvas, lockFocus];
+    if !icon.is_null() {
+        // 图标在 38 高的画布里垂直居中(与缩略图盒对齐)。
+        // The icon is vertically centered in the 38pt-tall canvas (aligned with the box).
+        let icon_y = (canvas_h - ROW_ICON) / 2.0;
+        let dst = NSRect::new(
+            NSPoint::new(ROW_PAD_X, icon_y),
+            NSSize::new(ROW_ICON, ROW_ICON),
+        );
+        let src_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+        let op: usize = 1; // NSCompositingOperationCopy
+        let _: () =
+            msg_send![icon, drawInRect: dst, fromRect: src_rect, operation: op, fraction: 1.0f64];
+        release_obj(icon);
+    }
+    if !thumb.is_null() {
+        let x0 = if icon.is_null() {
+            ROW_PAD_X
+        } else {
+            ROW_PAD_X + ROW_ICON + IMG_CANVAS_GAP
+        };
+        let dst = NSRect::new(NSPoint::new(x0, 0.0), NSSize::new(THUMB_W, THUMB_H));
+        let src_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+        let op: usize = 1; // NSCompositingOperationCopy
+        let _: () =
+            msg_send![thumb, drawInRect: dst, fromRect: src_rect, operation: op, fraction: 1.0f64];
+        release_obj(thumb);
+    }
+    let _: () = msg_send![canvas, unlockFocus];
+    canvas
+}
+
+/// 行内操作按钮(置顶/删除):SF Symbol 图标、无边框、透明度由调用方给出
+/// (完全透明待命,行悬停/选中时显现)。
+/// A per-row action button (pin/delete): an SF Symbol icon, borderless, its alpha
+/// supplied by the caller (fully transparent until the row is hovered/selected).
+unsafe fn make_action_button(
+    symbol: &str,
+    action: Sel,
+    tag: isize,
+    x: f64,
+    y: f64,
+    alpha: f64,
+) -> *mut AnyObject {
+    let b: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let b: *mut AnyObject = msg_send![
+        b,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(ACTION_BTN, ACTION_BTN))
+    ];
+    let _: () = msg_send![b, setBordered: false];
+    let _: () = msg_send![b, setImagePosition: 1isize]; // NSImageOnly
+    let empty_ns = make_nsstring("");
+    let _: () = msg_send![b, setTitle: empty_ns];
+    CFRelease(empty_ns as *const c_void);
+    let sym_ns = make_nsstring(symbol);
+    let img: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: sym_ns,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(sym_ns as *const c_void);
+    if !img.is_null() {
+        let _: () = msg_send![b, setImage: img];
+    }
+    let _: () = msg_send![b, setTag: tag];
+    let _: () = msg_send![b, setTarget: row_target()];
+    let _: () = msg_send![b, setAction: action];
+    // 着色 = 设计稿 .action 的 35% 黑;显隐由透明度表达。
+    // Tint = the mockup's .action 35% black; visibility is carried by alpha.
+    let tint: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.35f64];
+    let _: () = msg_send![b, setContentTintColor: tint];
+    let _: () = msg_send![b, setAlphaValue: alpha];
+    b
+}
+
+/// 本地化字符串的显示宽度(pt,按系统字体测量)/ a string's display width in points.
+fn localized_string_width(s: &str, font_size: f64) -> f64 {
+    unsafe {
+        let ns = make_nsstring(s);
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: font_size];
+        let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+        let attrs: *mut AnyObject = msg_send![attrs, init];
+        let font_key = make_nsstring("NSFont");
+        let _: () = msg_send![attrs, setObject: font, forKey: font_key];
+        CFRelease(font_key as *const c_void);
         let attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let attr: *mut AnyObject = msg_send![attr, initWithString: empty];
-        CFRelease(empty as *const c_void);
-        return attr;
+        let attr: *mut AnyObject = msg_send![attr, initWithString: ns, attributes: attrs];
+        let size: NSSize = msg_send![attr, size];
+        CFRelease(ns as *const c_void);
+        release_obj(attr);
+        release_obj(attrs);
+        size.width
     }
+}
+
+/// 创建一枚筛选 pill(纯文字;样式由 update_filter_pill_style 统一按选中态刷新)。
+/// Create a filter pill (bare text; its style is refreshed centrally by
+/// update_filter_pill_style according to the active filter).
+unsafe fn make_filter_pill(label: &str, tag: isize, x: f64, y: f64, w: f64) -> *mut AnyObject {
+    let b: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let b: *mut AnyObject = msg_send![
+        b,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, FILTERS_H))
+    ];
+    let _: () = msg_send![b, setBordered: false];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+    let _: () = msg_send![b, setFont: font];
+    let label_ns = make_nsstring(label);
+    let _: () = msg_send![b, setTitle: label_ns];
+    CFRelease(label_ns as *const c_void);
+    let _: () = msg_send![b, setTag: tag];
+    let _: () = msg_send![b, setTarget: observer()];
+    let _: () = msg_send![b, setAction: sel!(filterPillClicked:)];
+    b
+}
+
+/// 刷新筛选样式:选中项 78% 黑 + 底部 16×2 下划线;未选中 38% 黑(设计稿 .filter)。
+/// 下划线是一个共享的小视图,按选中按钮的 frame 重新定位(首个样式调用时创建)。
+/// Refresh the filter styling: the active item is 78% black with a 16x2 underline below;
+/// the rest are 38% black (the mockup's .filter). The underline is one shared little view
+/// repositioned under the active button (created on the first style pass).
+fn update_filter_pill_style() {
+    let active = *CLIP_FILTER.lock().unwrap();
+    unsafe {
+        let active_tag = match active {
+            ClipFilter::All => 0isize,
+            ClipFilter::Text => 1,
+            ClipFilter::Image => 2,
+            ClipFilter::Link => 3,
+        };
+        let mut active_frame: Option<NSRect> = None;
+        let pills = FILTER_PILLS.lock().unwrap();
+        for p in pills.iter() {
+            let tag: isize = msg_send![p.0, tag];
+            let color: *mut AnyObject = if tag == active_tag {
+                active_frame = Some(msg_send![p.0, frame]);
+                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.78f64]
+            } else {
+                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.38f64]
+            };
+            let _: () = msg_send![p.0, setContentTintColor: color];
+        }
+        drop(pills);
+        // 下划线:16×2、2 圆角、45% 黑,位于选中按钮文字下方 9px(设计稿 bottom:-9)。
+        // The underline: 16x2, radius 2, 45% black, 9px under the active item's text.
+        if let Some(frame) = active_frame {
+            let parent: *mut AnyObject = {
+                let p0 = FILTER_PILLS.lock().unwrap()[0];
+                msg_send![p0.0, superview]
+            };
+            let underline_w = 16.0;
+            let underline_h = 2.0;
+            let ux = frame.origin.x + (frame.size.width - underline_w) / 2.0;
+            // flipped 坐标:按钮高 38,文字垂直居中,下划线在文字下方 9px ≈ 行底 -3。
+            // Flipped coords: the button is 38pt tall with centered text; the underline
+            // sits 9px under the text ≈ 3pt above the row's bottom.
+            let uy = frame.origin.y + FILTERS_H - 3.0;
+            let mut guard = FILTER_UNDERLINE.lock().unwrap();
+            if let Some(u) = *guard {
+                let _: () = msg_send![u.0, setFrame: NSRect::new(
+                    NSPoint::new(ux, uy),
+                    NSSize::new(underline_w, underline_h)
+                )];
+            } else {
+                let u: *mut AnyObject = msg_send![class!(NSView), alloc];
+                let u: *mut AnyObject = msg_send![
+                    u,
+                    initWithFrame: NSRect::new(
+                        NSPoint::new(ux, uy),
+                        NSSize::new(underline_w, underline_h)
+                    )
+                ];
+                let _: () = msg_send![u, setWantsLayer: true];
+                let ulayer: *mut AnyObject = msg_send![u, layer];
+                let ubg: *mut AnyObject =
+                    msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.45f64];
+                crate::ffi::layer_set_background(ulayer, crate::ffi::ns_color_to_cg(ubg));
+                let _: () = msg_send![ulayer, setCornerRadius: 1.0f64];
+                let _: () = msg_send![parent, addSubview: u];
+                release_obj(u);
+                *guard = Some(ObjPtr(u));
+            }
+        }
+    }
+}
+
+/// 底部栏条目数标签 / the footer's entry-count label.
+static FOOTER_COUNT: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
+/// 刷新底部栏条目数(rebuild_rows 每次调用;窗口构建后标签已存在)。
+/// Refresh the footer's entry count (called on every rebuild_rows; the label exists once
+/// the window has been built).
+fn refresh_footer_count(total: usize) {
+    unsafe {
+        let label = match *FOOTER_COUNT.lock().unwrap() {
+            Some(l) => l.0,
+            None => return,
+        };
+        let text = tf("clipboard.footer_count", &[("count", &total.to_string())]);
+        let ns = make_nsstring(&text);
+        let _: () = msg_send![label, setStringValue: ns];
+        CFRelease(ns as *const c_void);
+    }
+}
+
+/// 构建底部栏(设计稿 .footer):顶部分隔线 + 条目数 + 快捷键图例(kbd 键帽)+ 清除全部。
+/// 非 flipped 坐标系,y=0 是底部,43pt 高,固定在窗口底边。
+/// Build the footer (the mockup's .footer): a top hairline + the entry count + shortcut
+/// legends (kbd keycaps) + clear all. Non-flipped coords (y=0 at the bottom), 43pt tall,
+/// pinned to the window's bottom edge.
+unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
+    // 顶部分隔线 / the top hairline.
+    let line: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let line: *mut AnyObject = msg_send![
+        line,
+        initWithFrame: NSRect::new(
+            NSPoint::new(0.0, FOOTER_H - 1.0),
+            NSSize::new(w, 1.0)
+        )
+    ];
+    let _: () = msg_send![line, setWantsLayer: true];
+    let llayer: *mut AnyObject = msg_send![line, layer];
+    let lbg: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.055f64];
+    crate::ffi::layer_set_background(llayer, crate::ffi::ns_color_to_cg(lbg));
+    let _: () = msg_send![parent, addSubview: line];
+    release_obj(line);
+
+    // 条目数标签(内容由 refresh_footer_count 更新)/ the entry-count label.
+    let count_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let count_label: *mut AnyObject = msg_send![
+        count_label,
+        initWithFrame: NSRect::new(
+            NSPoint::new(FOOTER_PAD_X, (FOOTER_H - 14.0) / 2.0),
+            NSSize::new(140.0, 14.0)
+        )
+    ];
+    let _: () = msg_send![count_label, setBezeled: false];
+    let _: () = msg_send![count_label, setDrawsBackground: false];
+    let _: () = msg_send![count_label, setEditable: false];
+    let _: () = msg_send![count_label, setSelectable: false];
+    let cf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+    let _: () = msg_send![count_label, setFont: cf];
+    let cc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
+    let _: () = msg_send![count_label, setTextColor: cc];
+    let _: () = msg_send![parent, addSubview: count_label];
+    release_obj(count_label);
+    *FOOTER_COUNT.lock().unwrap() = Some(ObjPtr(count_label));
+
+    // 快捷键图例(kbd 键帽 + 说明),从右往左排:↵ 输入选中条目 / ⌫ 删除 / → 详情 / ← 置顶。
+    // The shortcut legends (kbd keycap + label), laid out right-to-left: ↵ paste /
+    // ⌫ delete / → details / ← pin.
+    let kbd_keys = ["↵", "⌫", "→", "←"];
+    let kbd_labels = [
+        t("clipboard.kbd_paste"),
+        t("clipboard.kbd_delete"),
+        t("clipboard.kbd_detail"),
+        t("clipboard.kbd_pin"),
+    ];
+    let kbd_w = 21.0;
+    let kbd_h = 19.0;
+    let mut x = w - FOOTER_PAD_X;
+    for (i, key) in kbd_keys.iter().enumerate() {
+        let label_w = localized_string_width(&kbd_labels[i], 10.0);
+        let group_w = kbd_w + 5.0 + label_w;
+        x -= group_w;
+        // 键帽 / the keycap.
+        let cap: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let cap: *mut AnyObject = msg_send![
+            cap,
+            initWithFrame: NSRect::new(
+                NSPoint::new(x, (FOOTER_H - kbd_h) / 2.0),
+                NSSize::new(kbd_w, kbd_h)
+            )
+        ];
+        let _: () = msg_send![cap, setWantsLayer: true];
+        let clayer: *mut AnyObject = msg_send![cap, layer];
+        let cbg: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.045f64];
+        crate::ffi::layer_set_background(clayer, crate::ffi::ns_color_to_cg(cbg));
+        let cring: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.035f64];
+        crate::ffi::layer_set_border(clayer, crate::ffi::ns_color_to_cg(cring));
+        let _: () = msg_send![clayer, setBorderWidth: 1.0f64];
+        let _: () = msg_send![clayer, setCornerRadius: 4.0f64];
+        // 键帽文字 / the keycap's glyph.
+        let key_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let key_label: *mut AnyObject = msg_send![
+            key_label,
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(kbd_w, kbd_h))
+        ];
+        let _: () = msg_send![key_label, setBezeled: false];
+        let _: () = msg_send![key_label, setDrawsBackground: false];
+        let _: () = msg_send![key_label, setEditable: false];
+        let _: () = msg_send![key_label, setSelectable: false];
+        let _: () = msg_send![key_label, setAlignment: 1isize]; // Center on arm64
+        let kf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 9.0f64];
+        let _: () = msg_send![key_label, setFont: kf];
+        let kc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.48f64];
+        let _: () = msg_send![key_label, setTextColor: kc];
+        let key_ns = make_nsstring(key);
+        let _: () = msg_send![key_label, setStringValue: key_ns];
+        CFRelease(key_ns as *const c_void);
+        let _: () = msg_send![cap, addSubview: key_label];
+        release_obj(key_label);
+        let _: () = msg_send![parent, addSubview: cap];
+        release_obj(cap);
+        // 说明文字 / the legend label.
+        let hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let hint: *mut AnyObject = msg_send![
+            hint,
+            initWithFrame: NSRect::new(
+                NSPoint::new(x + kbd_w + 5.0, (FOOTER_H - 14.0) / 2.0),
+                NSSize::new(label_w, 14.0)
+            )
+        ];
+        let _: () = msg_send![hint, setBezeled: false];
+        let _: () = msg_send![hint, setDrawsBackground: false];
+        let _: () = msg_send![hint, setEditable: false];
+        let _: () = msg_send![hint, setSelectable: false];
+        let hf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+        let _: () = msg_send![hint, setFont: hf];
+        let hc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
+        let _: () = msg_send![hint, setTextColor: hc];
+        let hint_ns = make_nsstring(&kbd_labels[i]);
+        let _: () = msg_send![hint, setStringValue: hint_ns];
+        CFRelease(hint_ns as *const c_void);
+        let _: () = msg_send![parent, addSubview: hint];
+        release_obj(hint);
+        // 下一组间距 / spacing before the next group.
+        x -= FOOTER_GROUP_GAP;
+        let _ = i;
+    }
+
+    // 最右:清除全部(纯文字,与快捷键同色系)。
+    // The far right: clear all (bare text, same palette as the shortcuts).
+    let clear_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let clear_w = localized_string_width(&t("clipboard.clear_all"), 10.0) + 12.0;
+    let clear_btn: *mut AnyObject = msg_send![
+        clear_btn,
+        initWithFrame: NSRect::new(
+            NSPoint::new(x - clear_w - FOOTER_GROUP_GAP, (FOOTER_H - CLEAR_BTN_H) / 2.0),
+            NSSize::new(clear_w, CLEAR_BTN_H)
+        )
+    ];
+    let _: () = msg_send![clear_btn, setBordered: false];
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
-    let color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
-    let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-    let attrs: *mut AnyObject = msg_send![attrs, init];
-    let font_key = make_nsstring("NSFont");
-    let color_key = make_nsstring("NSColor");
-    let _: () = msg_send![attrs, setObject: font, forKey: font_key];
-    let _: () = msg_send![attrs, setObject: color, forKey: color_key];
-    CFRelease(font_key as *const c_void);
-    CFRelease(color_key as *const c_void);
-    if indent > 0.0 {
-        // 首行缩进:与正文文字缩进对齐,有图标时让出图标位。
-        // First-line indent: aligned with the body text; reserves the icon slot when shown.
-        let pstyle: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
-        let pstyle: *mut AnyObject = msg_send![pstyle, init];
-        let _: () = msg_send![pstyle, setHeadIndent: indent];
-        let _: () = msg_send![pstyle, setFirstLineHeadIndent: indent];
-        let pstyle_key = make_nsstring("NSParagraphStyle");
-        let _: () = msg_send![attrs, setObject: pstyle, forKey: pstyle_key];
-        CFRelease(pstyle_key as *const c_void);
-        release_obj(pstyle);
-    }
-    let ns_title = make_nsstring(title);
-    let attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-    let attr: *mut AnyObject = msg_send![attr, initWithString: ns_title, attributes: attrs];
-    CFRelease(ns_title as *const c_void);
-    release_obj(attrs);
-    attr
+    let _: () = msg_send![clear_btn, setFont: font];
+    let clear_color: *mut AnyObject =
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
+    let _: () = msg_send![clear_btn, setContentTintColor: clear_color];
+    let title_ns = make_nsstring(&t("clipboard.clear_all"));
+    let _: () = msg_send![clear_btn, setTitle: title_ns];
+    CFRelease(title_ns as *const c_void);
+    let _: () = msg_send![clear_btn, setTarget: observer()];
+    let _: () = msg_send![clear_btn, setAction: sel!(clearClipboardHistory:)];
+    let _: () = msg_send![parent, addSubview: clear_btn];
+    release_obj(clear_btn);
+}
+
+/// 筛选 pill 点击回调:切换筛选项并重建列表(选中索引越界由 rebuild_rows 自愈)。
+/// Filter-pill click: switch the filter and rebuild the list (an out-of-range selection
+/// self-heals in rebuild_rows).
+extern "C" fn filter_pill_clicked(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
+    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+    let f = match tag {
+        0 => ClipFilter::All,
+        1 => ClipFilter::Text,
+        2 => ClipFilter::Image,
+        3 => ClipFilter::Link,
+        _ => return,
+    };
+    *CLIP_FILTER.lock().unwrap() = f;
+    update_filter_pill_style();
+    unsafe { rebuild_rows() };
 }
 
 /// 给行内按钮(标题栏/正文)挂悬停跟踪区:悬停 = 选中该行(与窗口切换浮窗一致)。
@@ -5230,6 +5810,20 @@ unsafe fn row_target() -> *mut AnyObject {
 }
 
 // ========== 测试 / tests ==========
+
+/// 冒烟模式(--smoke-clipboard):历史文件与图片缓存重定向到专用目录,绝不触碰
+/// 真实用户数据(真实二进制运行时 cfg!(test) 不生效,这是唯一的隔离手段)。
+/// Smoke mode (--smoke-clipboard): the history file and the image cache are redirected to
+/// a dedicated directory, never touching real user data (cfg!(test) is off in the real
+/// binary, so this is the only isolation available).
+static SMOKE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// 开启冒烟模式(main.rs 在 --smoke-clipboard 分支调用,须在 smoke_runner 之前)。
+/// Enable smoke mode (called by main.rs on the --smoke-clipboard branch, before
+/// smoke_runner).
+pub(crate) fn set_smoke_mode() {
+    SMOKE_MODE.store(true, Ordering::SeqCst);
+}
 
 /// --smoke-clipboard 入口(主线程调用):注入两条历史后连续两次显示/隐藏浮窗,
 /// 覆盖 rebuild_rows 的行清理路径——这里曾是二次释放 UAF(第二次呼出 segfault)。
@@ -6544,7 +7138,7 @@ mod tests {
 
     #[test]
     fn filtered_indices_hides_images_when_querying() {
-        use super::filtered_indices;
+        use super::{filtered_indices, ClipFilter};
         // 图片条目无文字:空查询显示全部,非空查询被排除。
         // Image entries have no text: shown with an empty query, excluded when querying.
         let h = vec![
@@ -6552,20 +7146,44 @@ mod tests {
             entry("apple pie"),
             entry_image(b"png2"),
         ];
-        assert_eq!(filtered_indices(&h, ""), vec![0, 1, 2]);
-        assert_eq!(filtered_indices(&h, "apple"), vec![1]);
-        assert!(filtered_indices(&h, "png").is_empty());
+        assert_eq!(filtered_indices(&h, "", ClipFilter::All), vec![0, 1, 2]);
+        assert_eq!(filtered_indices(&h, "apple", ClipFilter::All), vec![1]);
+        assert!(filtered_indices(&h, "png", ClipFilter::All).is_empty());
+        // 筛选项:图片 / 文本 / 链接。
+        // The kind filters: Image / Text / Link.
+        assert_eq!(filtered_indices(&h, "", ClipFilter::Image), vec![0, 2]);
+        assert_eq!(filtered_indices(&h, "", ClipFilter::Text), vec![1]);
+        assert!(filtered_indices(&h, "", ClipFilter::Link).is_empty());
+    }
+
+    #[test]
+    fn filtered_indices_link_filter_matches_urls_only() {
+        use super::{filtered_indices, ClipFilter};
+        let h = vec![
+            entry("hello world"),
+            entry("https://github.com/eacryo/oh-my-tab"),
+        ];
+        assert_eq!(filtered_indices(&h, "", ClipFilter::Link), vec![1]);
+        assert_eq!(
+            filtered_indices(&h, "hello", ClipFilter::Link),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]
     fn compute_pitches_sizes_image_rows_for_the_thumbnail() {
-        use super::{compute_pitches, BODY_GAP, HEADER_H, IMG_PREVIEW_H, ROW_GAP};
-        // 文本行 = 标题栏 + 3 行正文 + 间距;图片行 = 标题栏 + 缩略图 + 间距。
-        // Text rows = header + 3 body lines + gap; image rows = header + thumbnail + gap.
+        use super::{compute_pitches, GROUP_H, ROW_H, THUMB_H};
+        // 行距统一 61pt(文本/图片同高);首条(更早组)带分组头,后一条同组不再带。
+        // Every row is a uniform 61pt (text and image alike); the first row of the group
+        // carries the header, the second (same group) does not.
         let texts = vec![entry("short"), entry_image(b"png")];
         let pitches = compute_pitches(&texts);
-        assert_eq!(pitches[1], HEADER_H + BODY_GAP + IMG_PREVIEW_H + ROW_GAP);
+        assert_eq!(pitches[0], GROUP_H + ROW_H);
+        assert_eq!(pitches[1], ROW_H);
         assert!(pitches[1] < pitches[0]);
+        // 缩略图盒高 ≤ 行高(行能放下缩略图)。
+        // The thumbnail box fits inside the row.
+        assert!(THUMB_H <= ROW_H);
     }
 
     #[test]
@@ -6800,7 +7418,7 @@ mod tests {
 
     #[test]
     fn filtered_indices_matches_case_insensitively() {
-        use super::filtered_indices;
+        use super::{filtered_indices, ClipFilter};
         let h = vec![
             entry("Apple Pie"),
             entry("Banana"),
@@ -6808,25 +7426,28 @@ mod tests {
             entry("Pineapple"),
         ];
         // 空查询 = 全部 / an empty query returns everything.
-        assert_eq!(filtered_indices(&h, ""), vec![0, 1, 2, 3]);
+        assert_eq!(filtered_indices(&h, "", ClipFilter::All), vec![0, 1, 2, 3]);
         // 大小写不敏感子串 / case-insensitive substring.
-        assert_eq!(filtered_indices(&h, "apple"), vec![0, 2, 3]);
+        assert_eq!(
+            filtered_indices(&h, "apple", ClipFilter::All),
+            vec![0, 2, 3]
+        );
         // 无匹配 → 空 / no match -> empty.
-        assert!(filtered_indices(&h, "orange").is_empty());
+        assert!(filtered_indices(&h, "orange", ClipFilter::All).is_empty());
         // 前缀/单字符 / prefix and single chars.
-        assert_eq!(filtered_indices(&h, "ban"), vec![1]);
+        assert_eq!(filtered_indices(&h, "ban", ClipFilter::All), vec![1]);
     }
 
     #[test]
     fn mapped_index_goes_through_the_filtered_list() {
-        use super::{filtered_indices, mapped_index};
+        use super::{filtered_indices, mapped_index, ClipFilter};
         let h = vec![
             entry("Apple"),
             entry("Banana"),
             entry("Cherry"),
             entry("Apricot"),
         ];
-        let filtered = filtered_indices(&h, "a");
+        let filtered = filtered_indices(&h, "a", ClipFilter::All);
         // 显示顺序 = 匹配项的顺序;映射回历史索引(Apple / Banana / Apricot 均含 'a')。
         // Display order = the matched order; mapped back to history indices (all contain 'a').
         let expected = vec![0usize, 1usize, 3usize];
@@ -6876,82 +7497,108 @@ mod tests {
     }
 
     #[test]
-    fn row_pitch_follows_line_count() {
-        use super::{
-            body_button_height, compute_pitches, row_button_height, text_lines, BODY_GAP, HEADER_H,
-            MAX_TEXT_LINES, ROW_GAP,
-        };
-        // 固定行距:所有条目(长短文本)行距相同 = 标题栏 + 3 行正文 + 行距。
-        // Fixed pitch: every entry (short or long text) shares the same pitch = header +
-        // 3 body lines + the row gap.
+    fn row_pitch_is_fixed_per_kind_with_group_headers() {
+        use super::{compute_pitches, GROUP_H, ROW_H};
+        // 同一时间组内:首条带分组头,后续条目行距完全一致(短/长文本相同)。
+        // In the same time group: the first row carries the header; the rest share an
+        // identical pitch (short/long alike).
         let texts = vec![entry("short"), entry(&"长".repeat(100))];
         let pitches = compute_pitches(&texts);
-        assert_eq!(pitches[0], pitches[1]);
-        assert_eq!(
-            pitches[0],
-            HEADER_H + BODY_GAP + row_button_height(MAX_TEXT_LINES) + ROW_GAP
-        );
-        // 按钮高 = 行数 * 行高 + 内边距。
-        // Button height = lines * line height + padding.
-        assert_eq!(
-            row_button_height(1),
-            1.0 * super::LINE_H + 2.0 * super::BTN_PAD_Y
-        );
-        assert_eq!(
-            row_button_height(3),
-            3.0 * super::LINE_H + 2.0 * super::BTN_PAD_Y
-        );
-        // 100 个汉字(200 单位)> 3 行上限 → 3 行。
-        // 100 hanzi (200 units) exceeds the 3-line cap -> 3 lines.
-        assert_eq!(text_lines(&"长".repeat(100)), 3);
-        // 正文按钮高度只看正文行数,与来源无关(来源在标题栏里)。
-        // The body button height follows the text only; the source lives in the header.
-        let with_src = entry_with_source("short", "Safari");
-        assert_eq!(body_button_height(&with_src), row_button_height(1));
-        assert_eq!(
-            body_button_height(&entry(&"长".repeat(100))),
-            row_button_height(3)
-        );
+        // 第一条 = 分组头 + 行;第二条 = 纯行距。
+        // The first = header + row; the second = the plain pitch.
+        assert_eq!(pitches[0], GROUP_H + ROW_H);
+        assert_eq!(pitches[1], ROW_H);
     }
 
     #[test]
-    fn header_title_has_three_branches() {
-        use super::header_title;
-        // 开关开 + 有来源 → 应用名。
-        // Toggle on + a source -> the app name.
+    fn group_headers_break_into_new_groups() {
+        use super::{compute_pitches, GROUP_H, ROW_H};
+        // 无时间戳(更早)的首条带分组头;同一组内后续条目不再带。
+        // The first entry (no timestamp -> Earlier) carries the header; the rest of the
+        // same group does not.
+        let now = super::now_secs();
+        let mut old = entry("old");
+        old.copied_at = Some(now - 3 * 86400);
+        let texts = vec![old.clone(), old.clone(), old.clone()];
+        let pitches = compute_pitches(&texts);
+        // 首条 = 分组头 + 行;后两条 = 纯行距。
+        // The first = header + row; the others are plain pitches.
+        assert_eq!(pitches[0] - pitches[1], GROUP_H);
+        assert_eq!(pitches[1], pitches[2]);
+        // 今天的一条跟在更早之后 → 两个条目各自带分组头(行距相同)。
+        // A today entry after earlier ones gets its own header too (equal pitches).
+        let mut today = entry("today");
+        today.copied_at = Some(now - 60);
+        let texts = vec![old.clone(), today];
+        let pitches = compute_pitches(&texts);
+        assert_eq!(pitches[0], pitches[1]);
+        // 文本与图片行同高(统一 61pt)——扣除分组头后应相等。
+        // Text and image rows share the uniform 61pt pitch -- equal after removing the
+        // header.
+        let mixed = vec![entry("a"), entry_image(b"png")];
+        let p2 = compute_pitches(&mixed);
+        assert_eq!(p2[1], p2[0] - GROUP_H);
+        // 行距常量自检(防止意外回归):统一 61pt 行高。
+        // Sanity-check the pitch constant (guards regressions): a uniform 61pt row.
+        assert!(ROW_H >= 50.0 && ROW_H < 80.0);
+    }
+
+    #[test]
+    fn classify_text_distinguishes_urls_and_code() {
+        use super::{classify_text, TextKind};
+        // URL:scheme 或 www. 开头。
+        // URL: a scheme or a www. prefix.
+        assert_eq!(classify_text("https://github.com"), TextKind::Url);
+        assert_eq!(classify_text("www.example.com/a"), TextKind::Url);
+        assert_eq!(classify_text("a://b"), TextKind::Url);
+        // 代码:多行 + 明显的代码特征。
+        // Code: multi-line + obvious code cues.
         assert_eq!(
-            header_title(&entry_with_source("t", "Safari"), true),
-            "Safari"
+            classify_text("fn main() {\n    let x = 1;\n}"),
+            TextKind::Code
         );
-        // 开关开 + 无来源 → "未知来源"。
-        // Toggle on + no source -> "unknown source".
         assert_eq!(
-            header_title(&entry("t"), true),
+            classify_text("int main() {\n  return 0;\n}"),
+            TextKind::Code
+        );
+        // 保守:单行括号文本、普通句子都不是代码;空串无害。
+        // Conservative: single-line paren prose and plain text are not code; empty is safe.
+        assert_eq!(
+            classify_text("just some (parenthesis) prose"),
+            TextKind::Plain
+        );
+        assert_eq!(classify_text("hello world"), TextKind::Plain);
+        assert_eq!(classify_text(""), TextKind::Plain);
+        assert_eq!(classify_text("  "), TextKind::Plain);
+    }
+
+    #[test]
+    fn build_meta_text_joins_app_and_relative_time() {
+        use super::build_meta_text;
+        let mut e = entry_with_source("hello", "Safari");
+        e.copied_at = Some(super::now_secs() - 5);
+        // 有开关 + 来源 + 时间(设计稿 "应用 · 时间",无类型角标)。
+        // toggle on + source + time (the mockup's "app · time"; no kind badge).
+        let m = build_meta_text(&e, true);
+        assert!(m.starts_with("Safari · "));
+        assert!(m.contains("刚刚"), "got {m}");
+        // 开关关 → 无来源名,只有时间。
+        // Toggle off -> no source name, just the time.
+        let m2 = build_meta_text(&e, false);
+        assert!(!m2.contains("Safari"));
+        assert!(!m2.is_empty());
+        // 旧条目(无时间戳)→ 只有来源名。
+        // Legacy (no timestamp) -> the source name only.
+        let legacy = entry_with_source("t", "Safari");
+        let ml = build_meta_text(&legacy, true);
+        assert_eq!(ml, "Safari");
+        // 无来源(但开关开)→ 显示"未知来源"占位。
+        // No source (toggle on) -> the "unknown source" placeholder.
+        let bare = entry("t");
+        assert_eq!(
+            build_meta_text(&bare, true),
             super::t("clipboard.unknown_source")
         );
-        // 开关关 → 空(横条只放图标)。
-        // Toggle off -> empty (the strip only hosts the icons).
-        assert_eq!(header_title(&entry_with_source("t", "Safari"), false), "");
-        assert_eq!(header_title(&entry("t"), false), "");
-    }
-
-    #[test]
-    fn header_title_appends_copied_at_time() {
-        use super::{format_copied_at, header_title};
-        // 有时间戳 → 应用名 + "复制于: MM-dd HH:mm"(旧条目 None 不显示)。
-        // With a timestamp -> app name + "Copied at: MM-dd HH:mm" (legacy None shows none).
-        let mut e = entry_with_source("t", "Safari");
-        assert_eq!(header_title(&e, true), "Safari"); // None -> 无时间 / no time
-        e.copied_at = Some(1755000000);
-        let title = header_title(&e, true);
-        assert!(title.starts_with("Safari "));
-        // 文案来自 i18n(随 locale),只校验结构:含时间文本 + 格式化后的时间。
-        // The wording comes from i18n (locale-dependent); assert the structure only:
-        // it carries the formatted time.
-        assert!(title.contains(&format_copied_at(1755000000)));
-        // 开关关 → 仍为空串,时间不显示。
-        // Toggle off -> still empty, no time.
-        assert_eq!(header_title(&e, false), "");
     }
 
     #[test]
@@ -7127,10 +7774,11 @@ mod tests {
     #[test]
     fn detail_text_units_scales_with_width() {
         use super::detail_text_units;
-        // 行内容宽(384pt)≈ 60 单位,与行按钮同一口径。
-        // The row content width (384pt) maps to ~60 units, the same basis as the row buttons.
-        assert_eq!(detail_text_units(384.0), 60);
-        assert_eq!(detail_text_units(192.0), 30);
+        // 行内容宽(≈427pt)≈ 60 单位,与行按钮同一口径。
+        // The row content width (~427pt) maps to ~60 units, the same basis as the row buttons.
+        let cw = super::content_width();
+        assert_eq!(detail_text_units(cw), 59);
+        assert_eq!(detail_text_units(cw / 2.0), 29);
         // 极窄宽度保底 1 单位(不为 0)。
         // A tiny width floors at 1 unit (never 0).
         assert_eq!(detail_text_units(1.0), 1);
