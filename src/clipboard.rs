@@ -171,16 +171,19 @@ const GROUP_LABEL_PAD: f64 = 7.0;
 /// 头部条:搜索栏区顶部留白(设计稿 .top padding 14px 8px)。
 /// The header strip: the search zone's top padding (mockup 14px).
 const TOP_PAD_Y: f64 = 14.0;
-/// 搜索栏高度(设计稿 48px)/ the search bar's height (48px).
-const SEARCH_H: f64 = 48.0;
+/// 搜索栏高度(设计稿 48px,先缩至 2/3 后按反馈调到 36)/ the search bar's height (the
+/// mockup's 48px, shrunk to two-thirds then settled on 36 per feedback).
+const SEARCH_H: f64 = 36.0;
 /// 搜索栏左右边距(设计稿 .top padding 14px)/ the search bar's side padding (14px).
 const SEARCH_PAD_X: f64 = 14.0;
 /// 搜索栏圆角(设计稿 10px)/ the search bar's corner radius (10px).
 const SEARCH_R: f64 = 10.0;
-/// 搜索栏与筛选行间距(设计稿 .top 底 8px)/ the gap under the search bar (8px).
-const SEARCH_GAP_Y: f64 = 8.0;
-/// 筛选行高度(设计稿 38px)/ the filters row's height (38px).
-const FILTERS_H: f64 = 38.0;
+/// 搜索栏与筛选行间距(设计稿 8px,按反馈收紧)/ the gap under the search bar (the
+/// mockup's 8px, tightened per feedback).
+const SEARCH_GAP_Y: f64 = 4.0;
+/// 筛选行高度(设计稿 38px,按反馈收紧)/ the filters row's height (the mockup's 38px,
+/// tightened per feedback).
+const FILTERS_H: f64 = 32.0;
 /// 筛选行左右边距(设计稿 padding 0 20px)/ the filters row's side padding (20px).
 const FILTERS_PAD_X: f64 = 20.0;
 /// 筛选项间距(设计稿 gap 17px)/ the gap between filter items (17px).
