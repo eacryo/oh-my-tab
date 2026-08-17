@@ -5,6 +5,9 @@
 
 [clipboard]
 clear_all = "清空歷史"
+toast_cleared = "已清空歷史"
+toast_pinned = "已置頂"
+toast_unpinned = "已取消置頂"
 empty = "暫無剪貼板歷史"
 no_match = "無匹配結果"
 search_placeholder = "搜尋剪貼簿"

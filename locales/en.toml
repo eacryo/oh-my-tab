@@ -4,6 +4,9 @@
 
 [clipboard]
 clear_all = "Clear history"
+toast_cleared = "History cleared"
+toast_pinned = "Pinned"
+toast_unpinned = "Unpinned"
 empty = "No clipboard history yet"
 no_match = "No matching entries"
 search_placeholder = "Search clipboard"
