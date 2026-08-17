@@ -4,7 +4,7 @@
 # Keys must match across locale files; only values differ.
 
 [clipboard]
-clear_all = "清除全部"
+clear_all = "清空历史"
 empty = "暂无剪贴板历史"
 no_match = "无匹配结果"
 search_placeholder = "搜索剪贴板"

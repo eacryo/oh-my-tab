@@ -131,13 +131,13 @@ const PICKER_MIN_HEIGHT: f64 = 250.0;
 const PICKER_W: f64 = 560.0;
 /// 行统一高度(设计稿 min-height 61px)/ the uniform row height (mockup min-height 61px).
 const ROW_H: f64 = 61.0;
-/// 正文内容行高(13pt 字体的行高 ~16.3pt,取 17 留余量)。
-/// Content line height (13pt font's line height is ~16.3pt; 17 keeps headroom).
-const LINE_H: f64 = 17.0;
-/// 每条文本最多显示的行数(先按单行做,超长省略号;后续可按设计稿的多行分支扩展)。
-/// Max text lines per entry (single line first, ellipsis beyond; the mockup's multiline
-/// branch can come later).
-const MAX_TEXT_LINES: usize = 1;
+/// 正文内容行高(13pt 字体的行高 ~16.3pt,取 16 让两行内容 + 副信息在 61pt 行内放得下)。
+/// Content line height (13pt font's line height is ~16.3pt; 16 lets two content lines +
+/// the meta fit inside the 61pt row).
+const LINE_H: f64 = 16.0;
+/// 每条文本最多显示的行数(新设计稿 .content.multiline 的 2 行截断)。
+/// Max text lines per entry (the new mockup's .multiline 2-line clamp).
+const MAX_TEXT_LINES: usize = 2;
 /// 单行显示宽度上限(以 ASCII 字符为单位;中文/全角按 2 折算)。行内容宽 ≈ 427pt
 /// (560 - 列表边距 16 - 行内边距 10 - 图标 32 - 图标间隙 11 - 右侧操作区 52 - 内容
 /// 右内边距 12),13pt 字体下每行约 30 个汉字 ≈ 60 单位。
@@ -151,6 +151,8 @@ const ROW_GAP: f64 = 0.0;
 const PAD_X: f64 = 8.0;
 /// 行内左右内边距(设计稿 padding 0 10px)/ the row's inner horizontal padding (10px).
 const ROW_PAD_X: f64 = 10.0;
+/// 搜索栏内边距(新设计稿 padding 0 12px)/ the search bar's inner padding (12px).
+const SEARCH_PAD_IN: f64 = 12.0;
 /// 行首来源应用小图标尺寸(设计稿 32px)/ the source app's icon size (32px).
 const ROW_ICON: f64 = 32.0;
 /// 行首图标与正文的间距(设计稿 margin-right 11px)/ gap after the app icon (11px).
@@ -168,22 +170,19 @@ const ACTIONS_W: f64 = 52.0;
 const GROUP_H: f64 = 27.0;
 /// 分组标签顶部偏移(垂直居中)/ the group label's top offset (vertically centered).
 const GROUP_LABEL_PAD: f64 = 7.0;
-/// 头部条:搜索栏区顶部留白(设计稿 .top padding 14px 8px)。
-/// The header strip: the search zone's top padding (mockup 14px).
-const TOP_PAD_Y: f64 = 14.0;
-/// 搜索栏高度(设计稿 48px,先缩至 2/3 后按反馈调到 36)/ the search bar's height (the
-/// mockup's 48px, shrunk to two-thirds then settled on 36 per feedback).
-const SEARCH_H: f64 = 36.0;
+/// 头部条:搜索栏区顶部留白(新设计稿 .top padding 12px)。
+/// The header strip: the search zone's top padding (the new mockup's 12px).
+const TOP_PAD_Y: f64 = 12.0;
+/// 搜索栏高度(新设计稿 40px)/ the search bar's height (the new mockup's 40px).
+const SEARCH_H: f64 = 40.0;
 /// 搜索栏左右边距(设计稿 .top padding 14px)/ the search bar's side padding (14px).
 const SEARCH_PAD_X: f64 = 14.0;
-/// 搜索栏圆角(设计稿 10px)/ the search bar's corner radius (10px).
-const SEARCH_R: f64 = 10.0;
-/// 搜索栏与筛选行间距(设计稿 8px,按反馈收紧)/ the gap under the search bar (the
-/// mockup's 8px, tightened per feedback).
-const SEARCH_GAP_Y: f64 = 4.0;
-/// 筛选行高度(设计稿 38px,按反馈收紧)/ the filters row's height (the mockup's 38px,
-/// tightened per feedback).
-const FILTERS_H: f64 = 32.0;
+/// 搜索栏圆角(新设计稿 9px)/ the search bar's corner radius (the new mockup's 9px).
+const SEARCH_R: f64 = 9.0;
+/// 搜索栏与筛选行间距(新设计稿 6px)/ the gap under the search bar (the new mockup's 6px).
+const SEARCH_GAP_Y: f64 = 6.0;
+/// 筛选行高度(新设计稿 36px)/ the filters row's height (the new mockup's 36px).
+const FILTERS_H: f64 = 36.0;
 /// 筛选行左右边距(设计稿 padding 0 20px)/ the filters row's side padding (20px).
 const FILTERS_PAD_X: f64 = 20.0;
 /// 筛选项间距(设计稿 gap 17px)/ the gap between filter items (17px).
@@ -196,8 +195,6 @@ const PAD_Y: f64 = 12.0;
 const FOOTER_PAD_X: f64 = 16.0;
 /// 底部快捷键分组间距(设计稿 margin-left 16px)/ the footer shortcut groups' spacing.
 const FOOTER_GROUP_GAP: f64 = 16.0;
-/// 底部"清除全部"按钮高度 / the footer clear-all button's height.
-const CLEAR_BTN_H: f64 = 20.0;
 /// 列表顶部与头部条的间距(设计稿 .history padding-top 2px)。
 /// The list's top offset inside the document (mockup 2px).
 const CLEAR_BTN_GAP: f64 = 2.0;
@@ -319,8 +316,8 @@ unsafe fn rebuild_search_hint() {
     let attachment: *mut AnyObject = msg_send![attachment, init];
     let _: () = msg_send![attachment, setImage: magnifier];
     let _: () = msg_send![attachment, setBounds: NSRect::new(
-        NSPoint::new(0.0, -2.5),
-        NSSize::new(15.0, 15.0)
+        NSPoint::new(0.0, -2.0),
+        NSSize::new(18.0, 18.0)
     )];
     let ph_m: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
     let empty_ns2 = make_nsstring("");
@@ -335,12 +332,12 @@ unsafe fn rebuild_search_hint() {
     let ph_text_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let ph_text_attrs: *mut AnyObject = msg_send![ph_text_attrs, init];
     let font_key = make_nsstring("NSFont");
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 15.0f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
     let _: () = msg_send![ph_text_attrs, setObject: font, forKey: font_key];
     CFRelease(font_key as *const c_void);
     let color_key = make_nsstring("NSColor");
-    // 设计稿 .search-placeholder:15px、40% 黑。icon 后加一个空格。
-    // The mockup's .search-placeholder: 15px, 40% black. A space after the icon.
+    // 新设计稿 .search-input::placeholder:14px、40% 黑。icon 后加一个空格。
+    // The new mockup's placeholder: 14px, 40% black. A space after the icon.
     let ph_color: *mut AnyObject =
         msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.40f64];
     let _: () = msg_send![ph_text_attrs, setObject: ph_color, forKey: color_key];
@@ -2557,6 +2554,18 @@ unsafe fn observer() -> *mut AnyObject {
                 filter_pill_clicked as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(searchFocusBegan:),
+                search_focus_began as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(searchFocusEnded:),
+                search_focus_ended as *mut c_void,
+                types.as_ptr(),
+            );
             // 搜索框 delegate:拦截字段编辑器翻译出的命令(如 ↓ → moveDown:)。
             // Search-field delegate: intercepts commands the field editor translates
             // (e.g. ↓ -> moveDown:).
@@ -2734,6 +2743,75 @@ extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
         unsafe { rebuild_rows() };
     } else {
         hide_picker();
+    }
+}
+
+/// 搜索框底/描边样式助手(层背景走 raw FFI)。`white_bg` = 聚焦时的白色底
+/// (设计稿 .search:focus-within rgba(255,255,255,.72)),其余为黑色系。
+/// The search field's fill/ring helper (raw FFI for the layer background). `white_bg` is
+/// the focus state's white fill (the mockup's rgba(255,255,255,.72)); everything else is
+/// the black family.
+unsafe fn style_search_field(
+    field: *mut AnyObject,
+    white_bg: bool,
+    bg_alpha: f64,
+    ring_alpha: f64,
+) {
+    let layer: *mut AnyObject = msg_send![field, layer];
+    let bg: *mut AnyObject = if white_bg {
+        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: bg_alpha]
+    } else {
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha]
+    };
+    crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
+    let ring: *mut AnyObject =
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: ring_alpha];
+    crate::ffi::layer_set_border(layer, crate::ffi::ns_color_to_cg(ring));
+}
+
+/// 搜索框悬停进入:非编辑态变深(设计稿 .search:hover 4.5%→5.5%)。
+/// The search field's hover enter: darken while not editing (.search:hover 4.5%->5.5%).
+extern "C" fn search_field_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let f = _self as *mut AnyObject;
+        let editor: *mut AnyObject = msg_send![f, currentEditor];
+        if !editor.is_null() {
+            return; // 编辑中:聚焦样式优先 / editing: the focus style wins.
+        }
+        style_search_field(f, false, 0.055, 0.035);
+    }
+}
+
+/// 搜索框悬停退出:还原 4.5% 底。 / restore the 4.5% fill on exit.
+extern "C" fn search_field_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let f = _self as *mut AnyObject;
+        let editor: *mut AnyObject = msg_send![f, currentEditor];
+        if !editor.is_null() {
+            return;
+        }
+        style_search_field(f, false, 0.045, 0.035);
+    }
+}
+
+/// 编辑开始(设计稿 .search:focus-within):白底 + 10% 内描边。
+/// Editing begins (.search:focus-within): a white fill + a 10% inner ring.
+extern "C" fn search_focus_began(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
+    unsafe {
+        let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
+        if !field.is_null() {
+            style_search_field(field, true, 0.72, 0.10);
+        }
+    }
+}
+
+/// 编辑结束:还原 4.5% 底。 / Editing ends: restore the 4.5% fill.
+extern "C" fn search_focus_ended(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
+    unsafe {
+        let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
+        if !field.is_null() {
+            style_search_field(field, false, 0.045, 0.035);
+        }
     }
 }
 
@@ -3840,6 +3918,21 @@ unsafe fn ensure_picker_window() {
             search_field_cancel as *mut c_void,
             types_v.as_ptr(),
         );
+        // 悬停变深(设计稿 .search:hover);编辑中由聚焦样式接管,悬停回调自行跳过。
+        // Hover darkens the field (the mockup's .search:hover); while editing the focus
+        // style takes over, so the hover callbacks skip the editing state.
+        class_addMethod(
+            cls,
+            sel!(mouseEntered:),
+            search_field_mouse_entered as *mut c_void,
+            types_v.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(mouseExited:),
+            search_field_mouse_exited as *mut c_void,
+            types_v.as_ptr(),
+        );
         objc_registerClassPair(cls);
         cls
     };
@@ -3907,6 +4000,7 @@ unsafe fn ensure_picker_window() {
     crate::ffi::layer_set_border(search_layer, crate::ffi::ns_color_to_cg(s_ring));
     let _: () = msg_send![search_layer, setBorderWidth: 1.0f64];
     let _: () = msg_send![search_layer, setCornerRadius: SEARCH_R];
+    add_hover_tracking(search);
     // delegate = observer()(复用通知单例):↓ 命令拦截(字段编辑器转发 moveDown:)。
     // Delegate = observer() (reusing the notification singleton): intercepts ↓ (the field
     // editor forwards moveDown:).
@@ -3928,6 +4022,27 @@ unsafe fn ensure_picker_window() {
         object: search
     ];
     CFRelease(text_name as *const c_void);
+    // 聚焦样式(设计稿 .search:focus-within):白底 + 深一档内描边;失焦还原。
+    // Focus style (the mockup's .search:focus-within): a white fill + a stronger inner
+    // ring; restored on blur.
+    let begin_name = make_nsstring("NSControlTextDidBeginEditingNotification");
+    let _: () = msg_send![
+        center,
+        addObserver: observer(),
+        selector: sel!(searchFocusBegan:),
+        name: begin_name,
+        object: search
+    ];
+    CFRelease(begin_name as *const c_void);
+    let end_name = make_nsstring("NSControlTextDidEndEditingNotification");
+    let _: () = msg_send![
+        center,
+        addObserver: observer(),
+        selector: sel!(searchFocusEnded:),
+        name: end_name,
+        object: search
+    ];
+    CFRelease(end_name as *const c_void);
 
     // 筛选行(设计稿 .filters):纯文字 12pt,选中项加深 + 底部 16×2 下划线。
     // The filters row (the mockup's .filters): bare 12pt text; the active one darkens and
@@ -4096,13 +4211,12 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![label, setBezeled: false];
         let _: () = msg_send![label, setDrawsBackground: false];
         let _: () = msg_send![label, setEditable: false];
-        // 提示文字用 labelColor(比 secondaryLabelColor 深一档):亮色玻璃上太浅会
-        // 看不见(用户报告的"只有四个字")。
-        // The hint uses labelColor (one notch darker than secondaryLabelColor): the lighter
-        // shade vanished on the bright glass (the reported "only four characters").
-        let text_color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
+        // 空态样式按新设计稿 .empty-state:12px、30% 黑。
+        // The empty state follows the new mockup's .empty-state: 12px, 30% black.
+        let text_color: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
         let _: () = msg_send![label, setTextColor: text_color];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
         let _: () = msg_send![label, setFont: font];
         let _: () = msg_send![container, addSubview: label];
         release_obj(label);
@@ -4230,10 +4344,10 @@ unsafe fn rebuild_rows() {
         tiles.push(ObjPtr(tile));
 
         // 主按钮:整行可点击(粘贴)+ 悬停;来源图标(图片行再加缩略图盒)画进左侧画布,
-        // 标题 = 正文(单行,按类型着色)+ 副信息一段 attributed。无边框、无背景。
+        // 标题 = 正文(≤2 行,按类型着色)+ 副信息一段 attributed。无边框、无背景。
         // The main button: the row is clickable (paste) and hover-tracked; the source icon
         // (plus the thumbnail box on image rows) lives in the left canvas; the title is one
-        // attributed string of content (single line, styled by kind) + the meta line.
+        // attributed string of content (<=2 lines, styled by kind) + the meta line.
         // Borderless, backgroundless.
         let row_img = make_row_image(entry);
         let main: *mut AnyObject = msg_send![row_button_class(), alloc];
@@ -4256,7 +4370,7 @@ unsafe fn rebuild_rows() {
             let _: () = msg_send![main, setImagePosition: 2isize]; // NSImageLeft
             release_obj(row_img);
         }
-        // 正文:图片条目 = 缩略图(预览缺失时退化为文件名文本);文本条目 = 单行截断。
+        // 正文:图片条目 = 缩略图(预览缺失时退化为文件名文本);文本条目 = 2 行截断。
         // Content: image rows show the thumbnail (falling back to the filename text when the
         // preview is missing); text rows show one truncated line.
         let meta = build_meta_text(entry, show_source);
@@ -4469,8 +4583,8 @@ extern "C" fn search_cell_draw_interior(
                 // 5.5% 黑底、11px 38% 黑字)。
                 // The ⌘F shortcut hint: a keycap at the right (the mockup's
                 // .search-shortcut: 28x22, radius 5, 5.5% black fill, 11px 38% black text).
-                let chip_w = 28.0;
-                let chip_h = 22.0;
+                let chip_w = 27.0;
+                let chip_h = 21.0;
                 let chip_rect = NSRect::new(
                     NSPoint::new(
                         cell_frame.origin.x + cell_frame.size.width - chip_w - 13.0,
@@ -4489,7 +4603,7 @@ extern "C" fn search_cell_draw_interior(
                 let _: () = msg_send![cap_bg, set];
                 let _: () = msg_send![path, fill];
                 let chip_font: *mut AnyObject =
-                    msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
+                    msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
                 let chip_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
                 let chip_attrs: *mut AnyObject = msg_send![chip_attrs, init];
                 let cf_key = make_nsstring("NSFont");
@@ -4515,7 +4629,7 @@ extern "C" fn search_cell_draw_interior(
                 // 占位整体画在字段左侧(设计稿 .search-placeholder 跟在图标后)。
                 // The placeholder is drawn at the field's left (the mockup's layout).
                 let size: NSSize = msg_send![placeholder, size];
-                let x = cell_frame.origin.x + 13.0;
+                let x = cell_frame.origin.x + SEARCH_PAD_IN;
                 let y = cell_frame.origin.y + (cell_frame.size.height - size.height) / 2.0;
                 let _: () = msg_send![placeholder, drawAtPoint: NSPoint::new(x, y)];
                 return;
@@ -5411,6 +5525,117 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
 /// (完全透明待命,行悬停/选中时显现)。
 /// A per-row action button (pin/delete): an SF Symbol icon, borderless, its alpha
 /// supplied by the caller (fully transparent until the row is hovered/selected).
+/// 悬停感知按钮类(NSButton 子类,覆写 mouseEntered:/mouseExited:):按 action 选择器
+/// 决定悬停样式——置顶 = 深一档 + 浅底;删除/清空 = 红色;筛选 = 仅变深。退出时恢复
+/// (筛选走 update_filter_pill_style 重算,避免与选中态打架)。
+/// A hover-aware button class (an NSButton subclass overriding mouseEntered:/mouseExited:):
+/// the hover style is picked by the action selector -- pin darkens with a faint fill,
+/// delete/clear turn red, filters only darken. On exit the state is restored (filters go
+/// through update_filter_pill_style so the active tint is never clobbered).
+unsafe fn hover_button_class() -> *mut AnyObject {
+    static HOVER_BTN_CLS: OnceLock<ObjPtr> = OnceLock::new();
+    HOVER_BTN_CLS
+        .get_or_init(|| {
+            let name = CString::new("OhMyTabClipHoverButton").unwrap();
+            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                hover_button_entered as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                hover_button_exited as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            ObjPtr(cls)
+        })
+        .0
+}
+
+/// 悬停进入:按 action 上色(设计稿 .action:hover / .clear-history:hover / .filter:hover)。
+/// Hover enter: color by action (the mockup's .action:hover / .clear-history:hover /
+/// .filter:hover).
+extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let b = _self as *mut AnyObject;
+        let action: Sel = msg_send![b, action];
+        if action == sel!(deleteEntry:) {
+            let c: *mut AnyObject = msg_send![
+                class!(NSColor),
+                colorWithSRGBRed: 210.0f64 / 255.0,
+                green: 45.0f64 / 255.0,
+                blue: 40.0f64 / 255.0,
+                alpha: 0.85f64
+            ];
+            let _: () = msg_send![b, setContentTintColor: c];
+            let bg: *mut AnyObject = msg_send![
+                class!(NSColor),
+                colorWithSRGBRed: 210.0f64 / 255.0,
+                green: 45.0f64 / 255.0,
+                blue: 40.0f64 / 255.0,
+                alpha: 0.07f64
+            ];
+            let layer: *mut AnyObject = msg_send![b, layer];
+            crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
+        } else if action == sel!(clearClipboardHistory:) {
+            let c: *mut AnyObject = msg_send![
+                class!(NSColor),
+                colorWithSRGBRed: 190.0f64 / 255.0,
+                green: 35.0f64 / 255.0,
+                blue: 35.0f64 / 255.0,
+                alpha: 0.78f64
+            ];
+            let _: () = msg_send![b, setContentTintColor: c];
+            let bg: *mut AnyObject = msg_send![
+                class!(NSColor),
+                colorWithSRGBRed: 190.0f64 / 255.0,
+                green: 35.0f64 / 255.0,
+                blue: 35.0f64 / 255.0,
+                alpha: 0.07f64
+            ];
+            let layer: *mut AnyObject = msg_send![b, layer];
+            crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
+        } else if action == sel!(togglePin:) {
+            let c: *mut AnyObject =
+                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.72f64];
+            let _: () = msg_send![b, setContentTintColor: c];
+            let bg: *mut AnyObject =
+                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.055f64];
+            let layer: *mut AnyObject = msg_send![b, layer];
+            crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
+        } else if action == sel!(filterPillClicked:) {
+            let c: *mut AnyObject =
+                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.62f64];
+            let _: () = msg_send![b, setContentTintColor: c];
+        }
+    }
+}
+
+/// 悬停退出:恢复基础色(筛选交给 update_filter_pill_style 保持选中态)。
+/// Hover exit: restore the base color (filters delegate to update_filter_pill_style so the
+/// active state survives).
+extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let b = _self as *mut AnyObject;
+        let action: Sel = msg_send![b, action];
+        if action == sel!(filterPillClicked:) {
+            update_filter_pill_style();
+            return;
+        }
+        let c: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.35f64];
+        let _: () = msg_send![b, setContentTintColor: c];
+        let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+        let layer: *mut AnyObject = msg_send![b, layer];
+        crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(clear));
+    }
+}
+
 unsafe fn make_action_button(
     symbol: &str,
     action: Sel,
@@ -5419,12 +5644,16 @@ unsafe fn make_action_button(
     y: f64,
     alpha: f64,
 ) -> *mut AnyObject {
-    let b: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let b: *mut AnyObject = msg_send![hover_button_class(), alloc];
     let b: *mut AnyObject = msg_send![
         b,
         initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(ACTION_BTN, ACTION_BTN))
     ];
     let _: () = msg_send![b, setBordered: false];
+    // 悬停底色需要 layer + 圆角(设计稿 .action 圆角 6)。/ hover fill needs a layer.
+    let _: () = msg_send![b, setWantsLayer: true];
+    let blayer: *mut AnyObject = msg_send![b, layer];
+    let _: () = msg_send![blayer, setCornerRadius: 6.0];
     let _: () = msg_send![b, setImagePosition: 1isize]; // NSImageOnly
     let empty_ns = make_nsstring("");
     let _: () = msg_send![b, setTitle: empty_ns];
@@ -5447,6 +5676,7 @@ unsafe fn make_action_button(
     let tint: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.35f64];
     let _: () = msg_send![b, setContentTintColor: tint];
     let _: () = msg_send![b, setAlphaValue: alpha];
+    add_hover_tracking(b);
     b
 }
 
@@ -5474,7 +5704,7 @@ fn localized_string_width(s: &str, font_size: f64) -> f64 {
 /// Create a filter pill (bare text; its style is refreshed centrally by
 /// update_filter_pill_style according to the active filter).
 unsafe fn make_filter_pill(label: &str, tag: isize, x: f64, y: f64, w: f64) -> *mut AnyObject {
-    let b: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let b: *mut AnyObject = msg_send![hover_button_class(), alloc];
     let b: *mut AnyObject = msg_send![
         b,
         initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, FILTERS_H))
@@ -5488,6 +5718,8 @@ unsafe fn make_filter_pill(label: &str, tag: isize, x: f64, y: f64, w: f64) -> *
     let _: () = msg_send![b, setTag: tag];
     let _: () = msg_send![b, setTarget: observer()];
     let _: () = msg_send![b, setAction: sel!(filterPillClicked:)];
+    // 悬停变深(设计稿 .filter:hover)/ hover darkens (the mockup's .filter:hover).
+    add_hover_tracking(b);
     b
 }
 
@@ -5563,6 +5795,9 @@ fn update_filter_pill_style() {
 
 /// 底部栏条目数标签 / the footer's entry-count label.
 static FOOTER_COUNT: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 底部栏"清空历史"按钮(跟随条目数标签定位)/ the footer's clear-history button
+/// (positioned next to the count label).
+static FOOTER_CLEAR: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
 /// 刷新底部栏条目数(rebuild_rows 每次调用;窗口构建后标签已存在)。
 /// Refresh the footer's entry count (called on every rebuild_rows; the label exists once
@@ -5577,6 +5812,16 @@ fn refresh_footer_count(total: usize) {
         let ns = make_nsstring(&text);
         let _: () = msg_send![label, setStringValue: ns];
         CFRelease(ns as *const c_void);
+        // 清空按钮紧跟在条目数后面(新设计稿 .footer-left:count + .clear-history)。
+        // The clear button follows the count (the new mockup's .footer-left layout).
+        if let Some(clear) = *FOOTER_CLEAR.lock().unwrap() {
+            let label_w = localized_string_width(&text, 10.0);
+            let clear_w = localized_string_width(&t("clipboard.clear_all"), 10.0) + 14.0;
+            let _: () = msg_send![clear.0, setFrame: NSRect::new(
+                NSPoint::new(FOOTER_PAD_X + label_w + 8.0, (FOOTER_H - 24.0) / 2.0),
+                NSSize::new(clear_w, 24.0)
+            )];
+        }
     }
 }
 
@@ -5708,30 +5953,36 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _ = i;
     }
 
-    // 最右:清除全部(纯文字,与快捷键同色系)。
-    // The far right: clear all (bare text, same palette as the shortcuts).
-    let clear_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let clear_w = localized_string_width(&t("clipboard.clear_all"), 10.0) + 12.0;
+    // 清空历史按钮(新设计稿 .clear-history):紧跟条目数,悬停变红。
+    // The clear-history button (the new mockup's .clear-history): right after the count,
+    // red on hover.
+    let clear_btn: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    let clear_w = localized_string_width(&t("clipboard.clear_all"), 10.0) + 14.0;
     let clear_btn: *mut AnyObject = msg_send![
         clear_btn,
         initWithFrame: NSRect::new(
-            NSPoint::new(x - clear_w - FOOTER_GROUP_GAP, (FOOTER_H - CLEAR_BTN_H) / 2.0),
-            NSSize::new(clear_w, CLEAR_BTN_H)
+            NSPoint::new(FOOTER_PAD_X + 140.0 + 8.0, (FOOTER_H - 24.0) / 2.0),
+            NSSize::new(clear_w, 24.0)
         )
     ];
     let _: () = msg_send![clear_btn, setBordered: false];
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
     let _: () = msg_send![clear_btn, setFont: font];
     let clear_color: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.38f64];
     let _: () = msg_send![clear_btn, setContentTintColor: clear_color];
+    let _: () = msg_send![clear_btn, setWantsLayer: true];
+    let clayer: *mut AnyObject = msg_send![clear_btn, layer];
+    let _: () = msg_send![clayer, setCornerRadius: 5.0];
     let title_ns = make_nsstring(&t("clipboard.clear_all"));
     let _: () = msg_send![clear_btn, setTitle: title_ns];
     CFRelease(title_ns as *const c_void);
     let _: () = msg_send![clear_btn, setTarget: observer()];
     let _: () = msg_send![clear_btn, setAction: sel!(clearClipboardHistory:)];
+    add_hover_tracking(clear_btn);
     let _: () = msg_send![parent, addSubview: clear_btn];
     release_obj(clear_btn);
+    *FOOTER_CLEAR.lock().unwrap() = Some(ObjPtr(clear_btn));
 }
 
 /// 筛选 pill 点击回调:切换筛选项并重建列表(选中索引越界由 rebuild_rows 自愈)。
@@ -5755,11 +6006,23 @@ extern "C" fn filter_pill_clicked(_self: *mut c_void, _cmd: Sel, sender: *mut c_
 /// Attach a hover tracking area to a row button (header/body): hovering selects the row
 /// (same as the switcher overlay).
 unsafe fn add_hover_tracking(view: *mut AnyObject) {
-    let opts: u64 = 0x02 | 0x40 | 0x100; // MouseEnteredAndExited | ActiveInKeyWindow | InVisibleRect
+    // MouseEnteredAndExited(0x01) | ActiveAlways(0x80),矩形 = 视图 bounds,与切换浮窗
+    // 完全同款。两条 load-bearing:
+    // - nonactivating 面板宿主 app 未激活 → ActiveInActiveApp(0x40) 不投递 hover,
+    //   必须 ActiveAlways(曾误用 0x40,悬停永不触发)。
+    // - 不用 InVisibleRect:滚动容器里的可见区计算不可靠,直接给显式 bounds。
+    // MouseEnteredAndExited (0x01) | ActiveAlways (0x80), the rect is the view's bounds --
+    // exactly the switcher overlay's setup. Two load-bearing points: (1) the picker's host
+    // app stays inactive behind the nonactivating panel, and ActiveInActiveApp (0x40)
+    // delivers no hover events -- ActiveAlways is required (it was 0x40, so hover never
+    // fired); (2) no InVisibleRect -- the visible-rect computation inside the scroll
+    // container is unreliable, so an explicit bounds rect is used instead.
+    let opts: u64 = 0x01 | 0x80;
     let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let bounds: NSRect = msg_send![view, bounds];
     let ta: *mut AnyObject = msg_send![
         ta,
-        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
+        initWithRect: bounds,
         options: opts,
         owner: view,
         userInfo: std::ptr::null::<AnyObject>()

@@ -3,7 +3,7 @@
 # Keep keys identical across locale files; only values differ.
 
 [clipboard]
-clear_all = "Clear all"
+clear_all = "Clear history"
 empty = "No clipboard history yet"
 no_match = "No matching entries"
 search_placeholder = "Search clipboard"
