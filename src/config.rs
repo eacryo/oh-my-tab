@@ -164,6 +164,10 @@ pub struct ClipboardSection {
     // Auto-expire days: unpinned entries older than N days are removed from the history
     // (memory AND persistence); pinned entries never expire. 0 = off. Default 30 days.
     pub auto_expire_days: u32,
+    // 剪贴板浮窗位置:"mouse" = 跟随鼠标,"main" = 主屏幕居中。默认跟随鼠标。
+    // The clipboard picker position: "mouse" = follows the cursor, "main" = centered on
+    // the main screen. Defaults to following the mouse.
+    pub picker_position: String,
 }
 
 impl Default for ClipboardSection {
@@ -175,6 +179,7 @@ impl Default for ClipboardSection {
             persist: false,
             move_used_to_top: true,
             auto_expire_days: 30,
+            picker_position: "mouse".to_string(),
         }
     }
 }
@@ -701,6 +706,12 @@ impl Config {
                 &[("value", &self.clipboard.auto_expire_days.to_string())],
             ));
         }
+        if !["mouse", "main"].contains(&self.clipboard.picker_position.as_str()) {
+            errs.push(tf(
+                "errors.clipboard_picker_position_invalid",
+                &[("value", &self.clipboard.picker_position)],
+            ));
+        }
 
         // --- mouse profiles ---
         for (i, p) in self.mouse.profiles.iter().enumerate() {
@@ -892,6 +903,12 @@ impl Config {
             .any(|e| e.starts_with("clipboard.auto_expire_days"))
         {
             self.clipboard.auto_expire_days = other.clipboard.auto_expire_days;
+        }
+        if !errs
+            .iter()
+            .any(|e| e.starts_with("clipboard.picker_position"))
+        {
+            self.clipboard.picker_position = other.clipboard.picker_position.clone();
         }
 
         // mouse:profiles 逐档逐字段合并(沿用 per-field resilient 模式)。
@@ -1263,6 +1280,20 @@ mod tests {
         cfg.clipboard.max_entries = 101;
         assert_err_count(&cfg, 1);
         cfg.clipboard.max_entries = 50;
+        assert_err_count(&cfg, 0);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_clipboard_picker_position() {
+        // 悬浮窗位置只允许 mouse / main。
+        // The picker position only accepts mouse / main.
+        let mut cfg = Config::default();
+        assert_eq!(cfg.clipboard.picker_position, "mouse");
+        cfg.clipboard.picker_position = "top-right".into();
+        assert_err_count(&cfg, 1);
+        cfg.clipboard.picker_position = "mouse".into();
+        assert_err_count(&cfg, 0);
+        cfg.clipboard.picker_position = "main".into();
         assert_err_count(&cfg, 0);
     }
 

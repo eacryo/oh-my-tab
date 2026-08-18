@@ -183,7 +183,9 @@ struct SettingsUi {
     clipboard_max_entries: *mut AnyObject,      // NSTextField: 历史最大条数 / max history entries
     clipboard_auto_expire_days: *mut AnyObject, // NSTextField: 自动过期天数(0=关闭)/ auto-expire days (0 = off)
     clipboard_show_source_app: *mut AnyObject,  // NSSwitch: 显示来源应用 / show the source app
-    add_mapping_button: *mut AnyObject,         // NSButton: 添加映射 / add-mapping button
+    clipboard_picker_position: *mut AnyObject, // NSPopUpButton: 跟随鼠标 / 主屏幕居中 / picker position
+    // (follow mouse / centered on the main screen)
+    add_mapping_button: *mut AnyObject, // NSButton: 添加映射 / add-mapping button
     mapping_enabled: *mut AnyObject, // NSSwitch: 按键映射总开关(per-device) / mappings master switch (per-device)
     mapping_empty: *mut AnyObject,   // NSTextField: 空状态提示(卡片内) / empty-state hint (in-card)
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
@@ -2232,6 +2234,13 @@ fn load_settings_from(cfg: &Config) {
             ui.clipboard_auto_expire_days,
             cfg.clipboard.auto_expire_days.to_string(),
         );
+        // picker_position:下拉框 index 0 = 跟随鼠标(mouse), 1 = 主屏幕居中(main)。
+        // picker_position: popup index 0 = follow mouse (mouse), 1 = centered (main).
+        let pos_idx = match cfg.clipboard.picker_position.as_str() {
+            "main" => 1,
+            _ => 0, // "mouse" (default)
+        };
+        let _: () = msg_send![ui.clipboard_picker_position, selectItemAtIndex: pos_idx as isize];
     }
 }
 
@@ -2455,6 +2464,14 @@ fn collect_settings_config() -> (Config, Vec<String>) {
                 &[("field", "clipboard.auto_expire_days")],
             )),
         }
+        // picker_position:下拉框 index 0 = 跟随鼠标, 1 = 主屏幕居中。
+        // picker_position: popup index 0 = follow mouse, 1 = centered on the main screen.
+        let pos_idx: isize = msg_send![ui.clipboard_picker_position, indexOfSelectedItem];
+        cfg.clipboard.picker_position = match pos_idx {
+            1 => "main",
+            _ => "mouse", // index 0 or out-of-range
+        }
+        .into();
     }
     for e in cfg.validate() {
         errs.push(e);
@@ -2749,6 +2766,7 @@ fn create_settings_window() {
             clipboard_max_entries: std::ptr::null_mut(),
             clipboard_auto_expire_days: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
+            clipboard_picker_position: std::ptr::null_mut(),
             add_mapping_button: std::ptr::null_mut(),
             mapping_enabled: std::ptr::null_mut(),
             mapping_empty: std::ptr::null_mut(),
@@ -3560,6 +3578,24 @@ fn create_settings_window() {
             row_h,
             &t("settings.row_clipboard_enabled"),
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
+        );
+        cy -= 8.0 + row_h;
+        // 悬浮窗位置下拉框:项 = [跟随鼠标, 始终显示在主屏幕正中间];默认 index 0(跟随鼠标)。
+        // Picker-position popup: items = [Follow Mouse, Always Center on Main Screen];
+        // default index 0 (follow mouse).
+        let pos_labels = [
+            t("settings.picker_position_follow_mouse"),
+            t("settings.picker_position_main_screen"),
+        ];
+        let pos_label_refs: Vec<&str> = pos_labels.iter().map(|s| s.as_str()).collect();
+        ui.clipboard_picker_position = add_row(
+            clipboard_view,
+            label_x,
+            cy,
+            225.0,
+            row_h,
+            &t("settings.row_clipboard_picker_position"),
+            make_popup(ctrl_x, cy, ctrl_w, row_h, &pos_label_refs, 0),
         );
         cy -= 8.0 + row_h;
         // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。

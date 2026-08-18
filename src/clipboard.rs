@@ -3170,22 +3170,30 @@ fn show_picker() {
             let hist = CLIP_HISTORY.lock().unwrap();
             compute_pitches(&hist)
         };
-        // 先解析光标所在屏幕(高度上限需要屏幕高度)。
-        // Resolve the cursor's screen first (the height cap needs its height).
+        // 先解析定位模式:跟随鼠标(mouse)用光标所在屏,follow;居中(main)用主屏并
+        // 在正中显示(高度上限也按主屏算)。
+        // Resolve the position mode first: "mouse" follows the cursor on its screen;
+        // "main" centers the picker on the main screen (the height cap uses that screen
+        // too).
         let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-        let count: usize = msg_send![screens, count];
-        let mut frames: Vec<NSRect> = Vec::with_capacity(count);
-        for i in 0..count {
-            // objectAtIndex: 的参数编码是 'q'(signed long),必须传 isize。
-            // objectAtIndex: expects 'q' (signed long); pass isize.
-            let s: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
-            frames.push(msg_send![s, frame]);
-        }
-        let screen_frame = screen_containing(cursor, &frames).unwrap_or_else(|| {
-            let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-            msg_send![main, frame]
-        });
+        let picker_pos = CONFIG.read().unwrap().clipboard.picker_position.clone();
+        let center_on_main = picker_pos == "main";
+        let main_screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+        let main_frame: NSRect = msg_send![main_screen, frame];
+        let screen_frame = if center_on_main {
+            main_frame
+        } else {
+            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+            let count: usize = msg_send![screens, count];
+            let mut frames: Vec<NSRect> = Vec::with_capacity(count);
+            for i in 0..count {
+                // objectAtIndex: 的参数编码是 'q'(signed long),必须传 isize。
+                // objectAtIndex: expects 'q' (signed long); pass isize.
+                let s: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
+                frames.push(msg_send![s, frame]);
+            }
+            screen_containing(cursor, &frames).unwrap_or(main_frame)
+        };
 
         // 最大高度:640pt 硬上限,小屏再收缩(留 120pt 给菜单栏/光标偏移/边缘余量)。
         // Max height: the 640pt hard cap, shrunk on small screens (120pt kept for the menu
@@ -3220,15 +3228,28 @@ fn show_picker() {
         // Floor at the minimum height (never smaller, empty state included).
         let h = (header_strip_h() + list_h + FOOTER_H + PAD_Y).max(PICKER_MIN_HEIGHT);
 
-        let frame = picker_frame_for(cursor, screen_frame, PICKER_W, h);
+        let frame = if center_on_main {
+            // 始终在主屏幕正中间(设计稿 .window 居中展示);不翻转。
+            // Always centered on the main screen; no flip/clamp.
+            NSRect::new(
+                NSPoint::new(
+                    main_frame.origin.x + (main_frame.size.width - PICKER_W) / 2.0,
+                    main_frame.origin.y + (main_frame.size.height - h) / 2.0,
+                ),
+                NSSize::new(PICKER_W, h),
+            )
+        } else {
+            picker_frame_for(cursor, screen_frame, PICKER_W, h)
+        };
         log_debug!(
-            "[clip] picker frame: ({:.0},{:.0}) {}x{} on screen ({:.0},{:.0})",
+            "[clip] picker frame: ({:.0},{:.0}) {}x{} on screen ({:.0},{:.0}) mode={}",
             frame.origin.x,
             frame.origin.y,
             frame.size.width,
             frame.size.height,
             screen_frame.origin.x,
-            screen_frame.origin.y
+            screen_frame.origin.y,
+            center_on_main
         );
         let _: () = msg_send![window, setFrame: frame, display: true];
 
