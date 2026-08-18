@@ -399,7 +399,7 @@ impl Default for Appearance {
             theme: "light".into(),
             glass_style: "regular".into(),
             glass_tint: "eeeeee66".into(),
-            corner_radius: 64.0,
+            corner_radius: 36.0,
         }
     }
 }
