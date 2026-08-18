@@ -265,6 +265,23 @@ const NO_SELECTION: usize = usize::MAX;
 /// when nothing is hovered. Maintained by mouseEntered/mouseExited.
 static HOVER_ROW: Mutex<usize> = Mutex::new(NO_SELECTION);
 
+/// 每行悬停相关的视图(底块 + 3 个操作按钮),按显示行索引。悬停变化时只增量刷新
+/// 这些视图(改底块背景/按钮透明度),**不再全量重建**——滚轮滚动时行在静止光标
+/// 下滑过,每行都会触发一次 mouseEntered,全量重建(移除/重建全部行 + 富文本)是
+/// 滚动卡顿的根源。
+/// Per-row hover-dependent views (the tile + the 3 action buttons), indexed by display
+/// row. Hover changes only refresh these views (tile backdrop / button alpha) instead of
+/// rebuilding ALL rows -- while wheel-scrolling, rows slide under a stationary cursor and
+/// each row fires a mouseEntered; the full rebuild (remove/recreate every row + attributed
+/// strings) was the cause of the scroll jank.
+struct RowHoverViews {
+    tile: ObjPtr,
+    pin: ObjPtr,
+    details: ObjPtr,
+    del: ObjPtr,
+}
+static ROW_HOVER_VIEWS: Mutex<Vec<RowHoverViews>> = Mutex::new(Vec::new());
+
 /// 浮窗窗口 / the picker window.
 static PICKER_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
@@ -4190,6 +4207,7 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![t.0, removeFromSuperview];
     }
     tiles.clear();
+    ROW_HOVER_VIEWS.lock().unwrap().clear();
     let mut pitches = ROW_PITCHES.lock().unwrap();
     pitches.clear();
     // 每行的按钮高/行距由文本换行行数决定。
@@ -4517,6 +4535,15 @@ unsafe fn rebuild_rows() {
             release_obj(del_btn);
             rows.push(ObjPtr(del_btn));
         }
+        // 记录本行的悬停相关视图(底块 + 操作按钮),供悬停变化时增量刷新。
+        // Record this row's hover-dependent views (tile + action buttons) for the
+        // incremental hover refresh.
+        ROW_HOVER_VIEWS.lock().unwrap().push(RowHoverViews {
+            tile: ObjPtr(tile),
+            pin: ObjPtr(pin_btn),
+            details: ObjPtr(details_btn),
+            del: ObjPtr(del_btn),
+        });
     }
 
     // 恢复滚动位置 / restore the scroll position.
@@ -4897,6 +4924,51 @@ extern "C" fn search_cell_select_with_frame(
 }
 
 /// 悬停行按钮:选中该行并刷新高亮。搜索框编辑中(光标在搜索框)时忽略——用户要求
+/// 悬停行从 prev 变为 new 时增量刷新视觉:只更新受影响行的底块背景与操作按钮
+/// 透明度(与 rebuild_rows 建行时相同的两处样式),**不重建任何行**。滚轮滚动时
+/// 行在静止光标下滑过,每行都触发一次 mouseEntered——若每次都全量重建,滚动就
+/// 会卡顿(这正是之前的卡顿根源)。
+/// Incrementally refresh the visuals as the hovered row moves from prev to new: only the
+/// affected rows' tile backdrop and action-button alpha change (the same two styles
+/// rebuild_rows applies at creation), and NO row is rebuilt. Wheel-scrolling slides rows
+/// under a stationary cursor, firing one mouseEntered per row -- a full rebuild per event
+/// was the source of the scroll jank.
+fn update_hover_visuals(prev: usize, new: usize) {
+    let sel = *PICKER_SELECTION.lock().unwrap();
+    let views = ROW_HOVER_VIEWS.lock().unwrap();
+    // 与建行时的样式常量保持一致(选中 0.050 优先于悬停 0.032)。
+    // Keep in sync with the constants at row creation (selected 0.050 beats hovered 0.032).
+    const SEL_BG: f64 = 0.050;
+    const HOVER_BG: f64 = 0.032;
+    unsafe {
+        for i in [prev, new] {
+            if i == NO_SELECTION || i >= views.len() {
+                continue;
+            }
+            let rv = &views[i];
+            let selected = i == sel;
+            let hovered = i == new;
+            let bg_alpha = if selected {
+                SEL_BG
+            } else if hovered {
+                HOVER_BG
+            } else {
+                0.0
+            };
+            let layer: *mut AnyObject = msg_send![rv.tile.0, layer];
+            let bg: *mut AnyObject =
+                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha];
+            crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
+            let act_alpha: f64 = if selected || hovered { 1.0 } else { 0.0 };
+            for b in [rv.pin, rv.details, rv.del] {
+                if !b.0.is_null() {
+                    let _: () = msg_send![b.0, setAlphaValue: act_alpha];
+                }
+            }
+        }
+    }
+}
+
 /// 焦点在搜索框时列表不得有任何选中行,而 rebuild 后光标仍可能停在行上触发 enter。
 /// Hovering a row button: select it and refresh the highlight. Ignored while the search
 /// field is editing (focus in the search box): the requirement is no selected row while the
@@ -4927,16 +4999,21 @@ extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *m
         // / clicks only. The two states stay independently visible, matching the mockup's
         // separate .item:hover and .item.selected rules (auto-select-on-hover would always
         // render the hovered row as the selected style, making them look identical).
-        *HOVER_ROW.lock().unwrap() = idx as usize;
-        unsafe { rebuild_rows() };
+        let mut hover = HOVER_ROW.lock().unwrap();
+        let prev = *hover;
+        *hover = idx as usize;
+        drop(hover);
+        // 增量刷新悬停视觉,不重建。
+        // Incremental hover visuals, no rebuild.
+        update_hover_visuals(prev, idx as usize);
     }
 }
 
 /// 鼠标离开行按钮:清除悬停行(仅当离开的正是悬停行;先进入下一行再离开的
-/// 事件序不会误清)→ 重建以收起 hover 底与操作按钮。
+/// 事件序不会误清)→ 增量收起 hover 底与操作按钮(不重建)。
 /// Mouse leaves a row button: clear the hovered row (only when the exited row IS the
 /// hovered one -- the enter-next-then-exit-previous event order must not clear wrongly)
-/// -> rebuild to hide the hover backdrop and the action buttons.
+/// -> incrementally hide the hover backdrop and the action buttons (no rebuild).
 extern "C" fn row_button_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
     if REBUILDING.load(Ordering::SeqCst) {
         return;
@@ -4947,7 +5024,7 @@ extern "C" fn row_button_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mu
         if *hover == idx as usize {
             *hover = NO_SELECTION;
             drop(hover);
-            unsafe { rebuild_rows() };
+            update_hover_visuals(idx as usize, NO_SELECTION);
         }
     }
 }
