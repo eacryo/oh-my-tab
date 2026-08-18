@@ -270,15 +270,16 @@ const NO_SELECTION: usize = usize::MAX;
 /// when nothing is hovered. Maintained by mouseEntered/mouseExited.
 static HOVER_ROW: Mutex<usize> = Mutex::new(NO_SELECTION);
 
-/// 每行悬停相关的视图(底块 + 3 个操作按钮),按显示行索引。悬停变化时只增量刷新
-/// 这些视图(改底块背景/按钮透明度),**不再全量重建**——滚轮滚动时行在静止光标
-/// 下滑过,每行都会触发一次 mouseEntered,全量重建(移除/重建全部行 + 富文本)是
-/// 滚动卡顿的根源。
+/// 每行的悬停相关视图(底块 + 3 个操作按钮),按显示行索引。悬停变化时只增量刷新
+/// 这些视图(行底背景 + **非置顶**行的按钮透明度),**不再全量重建**——滚轮滚动时行
+/// 在静止光标下滑过,每行都会触发一次 mouseEntered,全量重建(移除/重建全部行 +
+/// 富文本)是滚动卡顿的根源。置顶条目按钮常显,不受悬停影响。
 /// Per-row hover-dependent views (the tile + the 3 action buttons), indexed by display
-/// row. Hover changes only refresh these views (tile backdrop / button alpha) instead of
-/// rebuilding ALL rows -- while wheel-scrolling, rows slide under a stationary cursor and
-/// each row fires a mouseEntered; the full rebuild (remove/recreate every row + attributed
-/// strings) was the cause of the scroll jank.
+/// row. Hover changes only refresh these views (tile backdrop + the button alpha of
+/// UNPINNED rows) instead of rebuilding ALL rows -- while wheel-scrolling, rows slide
+/// under a stationary cursor and each row fires a mouseEntered; the full rebuild
+/// (remove/recreate every row + attributed strings) was the cause of the scroll jank.
+/// Pinned entries keep their buttons always visible, independent of hover.
 struct RowHoverViews {
     tile: ObjPtr,
     pin: ObjPtr,
@@ -4652,11 +4653,18 @@ unsafe fn rebuild_rows() {
         release_obj(meta_btn);
         rows.push(ObjPtr(meta_btn));
 
-        // 操作按钮(置顶 ☆/★ · 详情 ⓘ · 删除 ⌫):默认完全透明,行悬停或选中时显现
-        // (新设计稿 .actions opacity 0→1)。独立于内容/meta 按钮,点击不触发粘贴。
-        // Action buttons (pin ☆/★ · details ⓘ · delete ⌫): transparent until the row is
-        // hovered or selected. Separate from the content/meta buttons; they never paste.
-        let act_alpha = if selected || hovered { 1.0 } else { 0.0 };
+        // 操作按钮(置顶 ☆/★ · 详情 ⓘ · 删除 ⌫):**置顶条目常显**,非置顶条目仅
+        // 悬停/选中时显现(设计稿 .actions opacity 0→1)。独立于内容/meta 按钮,点击
+        // 不触发粘贴。
+        // Action buttons (pin ☆/★ · details ⓘ · delete ⌫): ALWAYS visible on PINNED
+        // entries; on unpinned entries they appear only when the row is hovered or
+        // selected (the mockup's .actions opacity 0->1). Separate from the content/meta
+        // buttons; they never paste.
+        let act_alpha = if entry.pinned || selected || hovered {
+            1.0
+        } else {
+            0.0
+        };
         let act_y = meta_y + (META_FOOTER_H - ACTION_H) / 2.0;
         let x_del = PICKER_W - PAD_X - ROW_PAD_R - ACTION_BTN;
         let x_details = x_del - ACTION_GAP - ACTION_BTN;
@@ -5096,6 +5104,8 @@ extern "C" fn search_cell_select_with_frame(
 fn update_hover_visuals(prev: usize, new: usize) {
     let sel = *PICKER_SELECTION.lock().unwrap();
     let views = ROW_HOVER_VIEWS.lock().unwrap();
+    let hist = CLIP_HISTORY.lock().unwrap();
+    let filtered = FILTERED.lock().unwrap();
     // 与建行时的样式常量保持一致(选中 0.050 优先于悬停 0.032)。
     // Keep in sync with the constants at row creation (selected 0.050 beats hovered 0.032).
     const SEL_BG: f64 = 0.050;
@@ -5119,10 +5129,20 @@ fn update_hover_visuals(prev: usize, new: usize) {
             let bg: *mut AnyObject =
                 msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha];
             crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
-            let act_alpha: f64 = if selected || hovered { 1.0 } else { 0.0 };
-            for b in [rv.pin, rv.details, rv.del] {
-                if !b.0.is_null() {
-                    let _: () = msg_send![b.0, setAlphaValue: act_alpha];
+            // 按钮透明度:置顶条目常显(恒 1.0);非置顶条目 = 悬停/选中才显现。
+            // Button alpha: pinned entries keep them always visible (fixed 1.0); unpinned
+            // entries show them on hover/selection only.
+            let pinned = filtered
+                .get(i)
+                .and_then(|&h| hist.get(h))
+                .map(|e| e.pinned)
+                .unwrap_or(false);
+            if !pinned {
+                let act_alpha: f64 = if selected || hovered { 1.0 } else { 0.0 };
+                for b in [rv.pin, rv.details, rv.del] {
+                    if !b.0.is_null() {
+                        let _: () = msg_send![b.0, setAlphaValue: act_alpha];
+                    }
                 }
             }
         }
@@ -5899,7 +5919,7 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
 /// 行内操作按钮(置顶/删除):SF Symbol 图标、无边框、透明度由调用方给出
 /// (完全透明待命,行悬停/选中时显现)。
 /// A per-row action button (pin/delete): an SF Symbol icon, borderless, its alpha
-/// supplied by the caller (fully transparent until the row is hovered/selected).
+/// supplied by the caller (pinned rows pass 1.0; unpinned rows pass hover/selection).
 /// 悬停感知按钮类(NSButton 子类,覆写 mouseEntered:/mouseExited:):按 action 选择器
 /// 决定悬停样式——置顶 = 深一档 + 浅底;删除/清空 = 红色;筛选 = 仅变深。退出时恢复
 /// (筛选走 update_filter_pill_style 重算,避免与选中态打架)。
