@@ -43,6 +43,10 @@ pub(crate) const KEY_DELETE: u16 = 51; // Backspace
 /// The close-button tag on a card (used to find it for hover show/hide; the card
 /// index is NOT stored in the tag).
 pub(crate) const CLOSE_BTN_TAG: isize = 0xE7F1;
+/// 选中态位移用的图标视图 tag,避免依赖动态 ObjC 类的属性访问。
+/// Tag used to find the icon view for the selected-state nudge without relying on
+/// property accessors on the dynamically registered ObjC card class.
+pub(crate) const ICON_VIEW_TAG: isize = 0xE7F2;
 
 // ========== 浮窗相关全局状态 / overlay global state ==========
 
@@ -291,6 +295,67 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
 }
 
 // --- Card View ---
+
+/// 设置关闭按钮的基础/悬停颜色与背景。
+/// Apply the close button's base or hover tint and background.
+unsafe fn set_close_button_hover_style(button: *mut AnyObject, hovered: bool) {
+    let tint = if hovered {
+        // HTML .close:hover: rgba(195, 40, 35, .86)
+        hex_to_ns_color(0xC32823DB)
+    } else {
+        // HTML .close: rgba(0, 0, 0, .30)
+        hex_to_ns_color(0x0000004D)
+    };
+    let _: () = msg_send![button, setContentTintColor: tint];
+
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if hovered {
+        // HTML .close:hover background: rgba(195, 40, 35, .07)
+        layer_set_background(layer, hex_to_cg_color(0xC3282312));
+    } else {
+        layer_set_background(layer, std::ptr::null_mut());
+    }
+}
+
+/// 关闭按钮的动态 ObjC 子类,用于实现 HTML 参考中的悬停红色反馈。
+/// Dynamic ObjC subclass for the close button, providing the HTML reference's red hover feedback.
+fn close_button_class() -> *mut AnyObject {
+    static CLOSE_BUTTON_CLASS: OnceLock<ObjClassPtr> = OnceLock::new();
+    CLOSE_BUTTON_CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabCloseButton").unwrap();
+            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types_v_obj = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                close_button_mouse_entered as *mut c_void,
+                types_v_obj.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                close_button_mouse_exited as *mut c_void,
+                types_v_obj.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            ObjClassPtr(cls as *const objc2::runtime::AnyClass)
+        })
+        .0 as *mut AnyObject
+}
+
+extern "C" fn close_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        set_close_button_hover_style(_self as *mut AnyObject, true);
+    }
+}
+
+extern "C" fn close_button_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        set_close_button_hover_style(_self as *mut AnyObject, false);
+    }
+}
 
 pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
     let idx = get_card_index(_self as *mut AnyObject);
@@ -1043,7 +1108,11 @@ pub(crate) fn refresh_highlight() {
         }
         let selected = state.selected;
         let colors = current_colors();
-        let sel_color = hex_to_cg_color(colors.card_border_sel);
+        // 选中态采用 HTML 参考中的轻量背景和 1px 内描边,不再使用厚重的蓝色边框。
+        // Match the HTML reference with a subtle background and 1px inset-style border instead of
+        // the previous heavy blue outline.
+        let sel_bg_color = hex_to_cg_color(colors.card_bg_sel);
+        let sel_border_color = hex_to_cg_color(colors.card_border_sel);
 
         let subviews: *mut AnyObject = msg_send![container, subviews];
         let sv_count: usize = msg_send![subviews, count];
@@ -1060,13 +1129,38 @@ pub(crate) fn refresh_highlight() {
             // 读卡片标题 label 文本,验证内容与索引对应(排查"显示 Picview 却打开 Ghostty")。
             // Read the card's title-label text to verify content matches the index (investigating
             // "shows Picview but opens Ghostty").
-            if tag == selected {
-                let _: () = msg_send![layer, setBorderWidth: 3.0f64];
-                layer_set_border(layer, sel_color);
+            let is_selected = tag == selected;
+            if is_selected {
+                let _: () = msg_send![layer, setBorderWidth: 1.0f64];
+                layer_set_border(layer, sel_border_color);
+                layer_set_background(layer, sel_bg_color);
             } else {
                 let _: () = msg_send![layer, setBorderWidth: 0.0f64];
                 layer_set_border(layer, std::ptr::null_mut());
+                layer_set_background(layer, std::ptr::null_mut());
             }
+
+            // HTML 参考中的图标在选中态向上轻移 1px;每次都从基准 y 重算,避免反复
+            // 切换时累计位移。
+            // The HTML reference nudges the icon up by 1px when selected; recompute from the
+            // baseline on every refresh so repeated selection changes never accumulate the offset.
+            let icon: *mut AnyObject = msg_send![sv, viewWithTag: ICON_VIEW_TAG];
+            if !icon.is_null() {
+                let icon_frame: NSRect = msg_send![icon, frame];
+                let icon_px_now = icon_frame.size.height;
+                let icon_bottom = card_h() - 8.0 - icon_px();
+                let base_y = if (icon_px_now - icon_px()).abs() < 0.5 {
+                    icon_bottom
+                } else {
+                    icon_bottom + (icon_px() - icon_px_now) / 2.0
+                };
+                let icon_y = base_y + if is_selected { 1.0 } else { 0.0 };
+                let _: () = msg_send![
+                    icon,
+                    setFrameOrigin: NSPoint::new(icon_frame.origin.x, icon_y)
+                ];
+            }
+
             // ⌫ 关闭按钮随选中态显隐:选中卡片显示、其余隐藏(选中即出现,
             // 不限于鼠标悬停——键盘导航选中同样可见)。
             // The ⌫ close button follows the selection: the selected card shows it, the
@@ -1353,6 +1447,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
                 release_obj(image_to_show); // img_view owns the image now; drop our alloc +1
                                             // NSImageScaleProportionallyUpOrDown = 3
                 let _: () = msg_send![img_view, setImageScaling: 3u64];
+                let _: () = msg_send![img_view, setTag: ICON_VIEW_TAG];
                 let _: () = msg_send![view, addSubview: img_view];
                 release_obj(img_view); // view owns the image view now; drop our alloc +1
             }
@@ -1370,6 +1465,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
             let letter_view: *mut AnyObject = msg_send![class!(NSView), alloc];
             let letter_view: *mut AnyObject = msg_send![letter_view, initWithFrame: letter_frame];
             let _: () = msg_send![letter_view, setWantsLayer: true];
+            let _: () = msg_send![letter_view, setTag: ICON_VIEW_TAG];
             let ll: *mut AnyObject = msg_send![letter_view, layer];
             let _: () = msg_send![ll, setCornerRadius: 14.0f64];
             let _: () = msg_send![ll, setMasksToBounds: true];
@@ -1452,42 +1548,45 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
         let _: () = msg_send![view, addTrackingArea: ta];
         release_obj(ta); // view owns the tracking area; drop our alloc +1
 
-        // --- 右上角关闭按钮(⌫ Backspace 符号):hover 卡片才显示,点击 = AX 关闭该窗口 ---
-        // The top-right close button (the Backspace symbol): shown on hover only;
-        // clicking AX-closes this window.
-        let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+        // --- 右上角关闭按钮:按 HTML 参考使用 ×,选中/悬停显示,按钮悬停变红 ---
+        // Top-right close button: use the HTML reference's ×, show on selection/hover, and turn red on button hover.
+        let btn: *mut AnyObject = msg_send![close_button_class(), alloc];
         let btn: *mut AnyObject = msg_send![btn, initWithFrame: NSRect::new(
-            NSPoint::new(card_width - 26.0, card_h() - 30.0),
+            NSPoint::new(card_width - 27.0, card_h() - 27.0),
             NSSize::new(20.0, 20.0)
         )];
         let _: () = msg_send![btn, setBordered: false];
-        let _: () = msg_send![btn, setImagePosition: 1isize]; // NSImageOnly
-        let empty_ns = make_nsstring("");
-        let _: () = msg_send![btn, setTitle: empty_ns];
-        CFRelease(empty_ns as *const c_void);
-        let sym_ns = make_nsstring("delete.left");
-        let desc = make_nsstring("Close window");
-        let img: *mut AnyObject = msg_send![
-            class!(NSImage),
-            imageWithSystemSymbolName: sym_ns,
-            accessibilityDescription: desc
-        ];
-        CFRelease(sym_ns as *const c_void);
-        CFRelease(desc as *const c_void);
-        if !img.is_null() {
-            let _: () = msg_send![btn, setImage: img];
-        }
-        // 半透明圆底:与剪贴板删除按钮同款观感。
-        // A translucent round backdrop (same look as the clipboard delete button).
+        let title_ns = make_nsstring("×");
+        let _: () = msg_send![btn, setTitle: title_ns];
+        CFRelease(title_ns as *const c_void);
+        let close_font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: 12.0f64, weight: 0.0f64];
+        let _: () = msg_send![btn, setFont: close_font];
+        let _: () = msg_send![btn, setAlignment: 1isize]; // NSTextAlignmentCenter on arm64
+                                                          // HTML .close 的默认状态是透明背景 + 半透明黑色文字。
+                                                          // The HTML .close base state uses a transparent background and translucent black text.
         let _: () = msg_send![btn, setWantsLayer: true];
         let bl: *mut AnyObject = msg_send![btn, layer];
-        let _: () = msg_send![bl, setCornerRadius: 10.0f64];
+        let _: () = msg_send![bl, setCornerRadius: 6.0f64];
         let _: () = msg_send![bl, setMasksToBounds: true];
-        layer_set_background(bl, hex_to_cg_color(0xFFFFFF33));
+        set_close_button_hover_style(btn, false);
         let _: () = msg_send![btn, setTag: CLOSE_BTN_TAG];
         let _: () = msg_send![btn, setTarget: crate::CONTROLLER.lock().unwrap().unwrap().0];
         let _: () = msg_send![btn, setAction: sel!(closeCard:)];
         let _: () = msg_send![btn, setHidden: true];
+
+        // 给按钮单独添加 tracking area,让悬停颜色只在指针进入 × 按钮时变化。
+        // Add a tracking area to the button itself so the red hover style only applies while
+        // the pointer is over the × button.
+        let opts: u64 = 0x01 | 0x80; // NSTrackingMouseEnteredAndExited | ActiveAlways
+        let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+        let ta: *mut AnyObject = msg_send![ta, initWithRect: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(20.0, 20.0)
+        ), options: opts, owner: btn, userInfo: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![btn, addTrackingArea: ta];
+        release_obj(ta);
+
         let _: () = msg_send![view, addSubview: btn];
         release_obj(btn); // view owns the button; drop our alloc +1
 

@@ -265,8 +265,8 @@ app_name        = "1a1a1aff"
 win_title       = "333333ff"
 icon_inner_bg   = "d0d0e066"
 icon_text       = "666688ff"
-card_bg_sel     = "ffffff66"
-card_border_sel = "5577ccff"
+card_bg_sel     = "3460AF11"
+card_border_sel = "3460AF24"
 
 [fonts]
 status_bar_size   = 13.0

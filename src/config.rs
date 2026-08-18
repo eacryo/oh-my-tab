@@ -451,8 +451,10 @@ impl ThemeColors {
             win_title: "333333ff".into(),
             icon_inner_bg: "d0d0e066".into(),
             icon_text: "666688ff".into(),
-            card_bg_sel: "ffffff66".into(),
-            card_border_sel: "5577ccff".into(),
+            // HTML 参考中的浅蓝选中背景与 1px 内描边。
+            // Light selection background and 1px inset-style border from the HTML reference.
+            card_bg_sel: "3460AF11".into(),
+            card_border_sel: "3460AF24".into(),
         }
     }
 }
