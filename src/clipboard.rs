@@ -33,6 +33,11 @@
 //!   pasteboard + synthesize Cmd+V for an automatic paste (mirrors Windows' Win+V). The
 //!   detail panel is a passive display (never becomes key, so keyboard focus stays in the
 //!   list); a click anywhere on it or Esc closes it, and it hides together with the picker.
+//!   The detail's text is mouse-selectable; copying goes through the native paths only --
+//!   the right-click menu, and Cmd+C in the picker (forwarded by container_key_down to
+//!   copy_detail_selection: the selection, or the full text when nothing is selected). No
+//!   paste marker is stamped -- a selection copy is a genuine copy that enters the history
+//!   normally.
 //! - Text entries keep the raw text; image-DATA entries keep their ORIGINAL bytes ON DISK
 //!   (`~/Library/Caches/oh-my-tab-clip-images/`, keyed by a content hash) with only a
 //!   downsampled PNG preview in memory; pasting reads the bytes back on demand and writes
@@ -61,7 +66,7 @@ use crate::i18n::{t, tf};
 use crate::{log_debug, log_info};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -405,6 +410,12 @@ static DETAIL_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 static DETAIL_CONTENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// 详情浮窗是否可见 / whether the detail panel is visible.
 static DETAIL_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// 详情面板当前文本视图(可选中;用于"复制所选")。旧内容移除/面板关闭时必须清空,
+/// 否则悬空指针会在 Cmd+C 时被解引用(use-after-free)。
+/// The detail panel's current text view (selectable; feeds "copy selection"). MUST be
+/// cleared when the old content is removed / the panel hides, or a dangling pointer would
+/// be dereferenced on Cmd+C (use-after-free).
+static DETAIL_TEXT_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
 /// 行列表重建进行中:重建期间 addSubview 的新行按钮会因鼠标恰好在区域内而立即派发
 /// mouseEntered(ActiveInKeyWindow + InVisibleRect 的 tracking area),若该回调再触发
@@ -2168,7 +2179,7 @@ unsafe fn file_copy_image(text: &str) -> Option<ImageEntry> {
 /// poll reads this same text, but record_text's dedup (same as the top entry) skips it.
 /// The own-paste marker is stamped too (so the poll can skip the change when "move used
 /// entries to top" is off).
-unsafe fn write_pasteboard_text(text: &str) {
+unsafe fn write_pasteboard_text(text: &str, stamp_marker: bool) {
     let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
     if pb.is_null() {
         return;
@@ -2182,13 +2193,21 @@ unsafe fn write_pasteboard_text(text: &str) {
     let type_ns = make_nsstring(NSPASTEBOARD_TYPE_STRING);
     let ns = make_nsstring(text);
     let ok: bool = msg_send![pb, setString: ns, forType: type_ns];
-    stamp_paste_marker(pb);
+    // 粘贴回写路径打 marker(防轮询把粘贴动作当新复制重新入史/置顶);
+    // **用户手动复制所选**不打——那是一次真实复制,应当正常入史。
+    // The paste write-back stamps the marker (the poll must not re-record the paste as a
+    // fresh copy / reorder history); a USER-INITIATED selection copy does NOT stamp it --
+    // it is a genuine copy that should enter the history normally.
+    if stamp_marker {
+        stamp_paste_marker(pb);
+    }
     // 日志只打元数据,绝不打剪贴板内容(隐私:内容可能是密码/正文)。
     // Log metadata only, NEVER the clipboard text (privacy: it may be a password/body text).
     log_debug!(
-        "[clip] write back {} chars (setString ok={})",
+        "[clip] write back {} chars (setString ok={}, stamp={})",
         text.chars().count(),
-        ok
+        ok,
+        stamp_marker
     );
     CFRelease(type_ns as *const c_void);
     CFRelease(ns as *const c_void);
@@ -2581,6 +2600,22 @@ unsafe fn observer() -> *mut AnyObject {
                 cls,
                 sel!(filterPillClicked:),
                 filter_pill_clicked as *mut c_void,
+                types.as_ptr(),
+            );
+            // 详情文本光标(owner = observer 的 tracking area 投递):进入 = I-beam,
+            // 离开 = 箭头。见 detail_tv_cursor_entered 注释。
+            // The detail-text cursor (delivered by the tracking area owned by this
+            // observer): enter -> I-beam, exit -> arrow. See detail_tv_cursor_entered.
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                detail_tv_cursor_entered as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                detail_tv_cursor_exited as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -3326,9 +3361,28 @@ fn hide_detail() {
     if !DETAIL_VISIBLE.swap(false, Ordering::SeqCst) {
         return;
     }
+    // 面板关闭后旧内容视图会被移除,文本视图指针必须一并清空(防 Cmd+C 悬空)。
+    // The content views get removed once the panel hides; clear the text-view pointer so
+    // Cmd+C never dereferences a dangling one.
+    *DETAIL_TEXT_VIEW.lock().unwrap() = None;
     let win = *DETAIL_WINDOW.lock().unwrap();
     unsafe {
         if let Some(w) = win {
+            // 面板隐藏时若光标仍停在文本上,显式恢复箭头(cursor region 只在鼠标
+            // 移动时重算,这里兜底);光标在别处则不动,避免踩掉搜索框自身的 I-beam。
+            // If the cursor still sits on the text as the panel hides, restore the arrow
+            // explicitly (cursor regions re-evaluate only on mouse movement); skip when
+            // the cursor is elsewhere so the search field's own I-beam is never clobbered.
+            let loc: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+            let f: NSRect = msg_send![w.0, frame];
+            if f.origin.x <= loc.x
+                && loc.x <= f.origin.x + f.size.width
+                && f.origin.y <= loc.y
+                && loc.y <= f.origin.y + f.size.height
+            {
+                let arrow: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
+                let _: () = msg_send![arrow, set];
+            }
             let _: () = msg_send![w.0, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
@@ -3521,9 +3575,11 @@ unsafe fn show_detail_for_sel() {
     };
 
     // 清除旧内容:removeFromSuperview 即释放(父视图持有,绝不二次 release,
-    // 与 rebuild_rows 同一条纪律)。
+    // 与 rebuild_rows 同一条纪律)。详情文本视图指针一并清空(防悬空)。
     // Clear the old content: removeFromSuperview releases it (parent-owned; never released
-    // again -- the same discipline as rebuild_rows).
+    // again -- the same discipline as rebuild_rows). The detail text-view pointer is
+    // cleared too (no dangling pointer).
+    *DETAIL_TEXT_VIEW.lock().unwrap() = None;
     let subs: *mut AnyObject = msg_send![content, subviews];
     let count: usize = msg_send![subs, count];
     for i in 0..count {
@@ -3635,7 +3691,12 @@ fn detail_text_size(text: &str) -> (f64, f64) {
 }
 
 /// 构建详情文本视图(NSScrollView + NSTextView,完整文本自动换行,超出滚动)。
+/// 文本**可鼠标选中**(选中范围由底部"复制所选"按钮/Cmd+C 复制);面板不成为 key,
+/// 键盘焦点仍留在主浮窗,所以不能依赖系统 Cmd+C 路由。
 /// Build the detail text view (NSScrollView + NSTextView, full wrapped text, scrolls).
+/// The text IS mouse-selectable; the selection is copied by the bottom "copy selection"
+/// button / Cmd+C. The panel never becomes key (keyboard focus stays in the picker), so
+/// the system Cmd+C routing cannot be relied upon.
 unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
     let avail_w = w - DETAIL_PAD * 2.0;
     let body_h = (h - DETAIL_PAD * 2.0).max(LINE_H);
@@ -3661,7 +3722,14 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
     let _: () = msg_send![tv, setString: ns_text];
     CFRelease(ns_text as *const c_void);
     let _: () = msg_send![tv, setEditable: false];
-    let _: () = msg_send![tv, setSelectable: false];
+    // 可选中(之前禁用了选中,长文本没法复制其中一部分)。非 key 窗口里 NSTextView
+    // 仍支持鼠标拖选(选中显示灰色);复制交给原生路径——右键菜单,以及主浮窗
+    // container_key_down 对 Cmd+C 的转发(见 copy_detail_selection)。
+    // Selectable (it used to be disabled, so a part of a long text could never be
+    // copied). In a non-key window NSTextView still supports mouse-drag selection
+    // (shown gray); copying goes through the native paths -- the right-click menu, and
+    // the Cmd+C forwarding in the picker's container_key_down (see copy_detail_selection).
+    let _: () = msg_send![tv, setSelectable: true];
     let _: () = msg_send![tv, setDrawsBackground: false];
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
     let _: () = msg_send![tv, setFont: font];
@@ -3673,8 +3741,88 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
     let _: () = msg_send![tv, setHorizontallyResizable: false];
     let _: () = msg_send![scroll, setDocumentView: tv];
     release_obj(tv);
+    *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr(tv));
     let _: () = msg_send![content, addSubview: scroll];
     release_obj(scroll);
+
+    // 详情文本上显示 I-beam 输入光标:非 key 窗口里 cursor rect 不生效(NSTextView
+    // 自带的 I-beam 矩形只在 key 窗口激活,详情面板永远不是 key → 之前一直箭头)。
+    // 用与行悬停同款的 mouseEntered/Exited + ActiveAlways tracking area 手动设置
+    // NSCursor;cursorUpdate 选项明确不支持 ActiveAlways(见 NSTrackingArea.h),
+    // 所以走 enter/exit 路径。tracking area 放在固定大小的滚动视图上——每次打开
+    // 详情都是新视图,rect 不会随文本增长而过期。
+    // Show the I-beam over the detail text: cursor rects apply only to the KEY window
+    // (NSTextView's own I-beam rect never activates in the non-key panel -> it used to be
+    // an arrow). A mouseEntered/Exited + ActiveAlways tracking area (identical to the row
+    // hover) sets NSCursor manually; cursorUpdate is documented as NOT supported with
+    // ActiveAlways (NSTrackingArea.h), so the enter/exit path is used. The area sits on
+    // the fixed-size scroll view -- a fresh view per detail open, so the rect never goes
+    // stale as the text grows.
+    let opts: u64 = 0x01 | 0x80; // MouseEnteredAndExited | ActiveAlways
+    let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let bounds: NSRect = msg_send![scroll, bounds];
+    let ta: *mut AnyObject = msg_send![
+        ta,
+        initWithRect: bounds,
+        options: opts,
+        owner: observer(),
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![scroll, addTrackingArea: ta];
+    release_obj(ta);
+}
+
+/// 详情文本光标:进入 → I-beam(输入光标)。非 key 窗口里 cursor rect 只在 key 窗口
+/// 生效,NSTextView 自带的 I-beam 矩形从不激活,鼠标在详情文本上一直显示箭头;
+/// 这里用 ActiveAlways 的 mouseEntered/Exited tracking area(owner = observer,与行
+/// 悬停同款)手动设置 NSCursor。cursorUpdate 选项不支持 ActiveAlways(NSTrackingArea.h
+/// 明确标注),所以不能走 cursorUpdate 路径。
+/// The detail-text cursor: entering -> I-beam. Cursor rects apply only to the key window,
+/// so NSTextView's own I-beam rect never activates in the non-key panel and the mouse
+/// showed an arrow over the text; an ActiveAlways mouseEntered/Exited tracking area
+/// (owner = the observer, same as the row hover) sets NSCursor manually. cursorUpdate is
+/// documented as unsupported with ActiveAlways (NSTrackingArea.h), hence the enter/exit
+/// path.
+extern "C" fn detail_tv_cursor_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let ibeam: *mut AnyObject = msg_send![class!(NSCursor), IBeamCursor];
+        let _: () = msg_send![ibeam, set];
+    }
+}
+
+/// 详情文本光标:离开 → 恢复默认箭头。
+/// The detail-text cursor: leaving -> back to the default arrow.
+extern "C" fn detail_tv_cursor_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let arrow: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
+        let _: () = msg_send![arrow, set];
+    }
+}
+
+/// 把详情文本视图的**选中范围**写入剪贴板(无选中则兜底复制全文),Toast 提示,
+/// 详情面板保持打开(可能还要继续复制其他片段)。**不打 paste marker**——这是一次
+/// 真实复制,应当正常进入历史(与粘贴回写的抑制语义相反)。
+/// Copy the detail text view's SELECTION to the pasteboard (full text when nothing is
+/// selected), toast, and keep the detail open (the user may copy more ranges). Does NOT
+/// stamp the paste marker -- this is a genuine copy that should enter the history (the
+/// opposite of the paste-write-back suppression).
+fn copy_detail_selection() {
+    let tv = match *DETAIL_TEXT_VIEW.lock().unwrap() {
+        Some(t) => t.0,
+        None => return,
+    };
+    unsafe {
+        let sel_range: NSRange = msg_send![tv, selectedRange];
+        let full: *mut AnyObject = msg_send![tv, string];
+        let text = if sel_range.length > 0 {
+            let sub: *mut AnyObject = msg_send![full, substringWithRange: sel_range];
+            nsstring_to_rust(sub)
+        } else {
+            nsstring_to_rust(full)
+        };
+        write_pasteboard_text(&text, false);
+        show_toast(&t("clipboard.toast_copied"));
+    }
 }
 
 /// 构建浮窗窗口(一次)。/ Build the picker window (once).
@@ -4161,7 +4309,6 @@ unsafe fn ensure_picker_window() {
 
 /// 根据当前历史重建行按钮(选中行高亮 + 圆角背景块)。
 /// Rebuild the row buttons from history (selected row highlighted with a rounded tile).
-
 unsafe fn rebuild_rows() {
     let hist = CLIP_HISTORY.lock().unwrap();
     let container = match *PICKER_CONTAINER.lock().unwrap() {
@@ -5183,7 +5330,10 @@ fn paste_at(idx: usize) {
                 synthesize_paste();
             }
         } else {
-            write_pasteboard_text(&entry.text);
+            // 粘贴回写:打 marker(轮询跳过,防止粘贴被当成新复制移动条目)。
+            // Paste write-back: stamp the marker (the poll skips it, so a paste is never
+            // re-captured as a fresh copy that reorders the history).
+            write_pasteboard_text(&entry.text, true);
             synthesize_paste();
         }
     }
@@ -5278,6 +5428,18 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
         // When the field is already focused, the key goes to the field editor and never
         // reaches here -- a natural no-op.
         let mods: u64 = msg_send![event as *mut AnyObject, modifierFlags];
+        // Cmd+C(键码 8):详情打开时复制选中范围(无选中 = 复制全文)。键盘路径与
+        // 详情底部的"复制所选"按钮等价——详情面板永不成为 key,系统 Cmd+C 路由
+        // 到主浮窗,这里手动转发。搜索框聚焦时按键由字段编辑器消化,天然不冲突。
+        // Cmd+C (keycode 8): with the detail open, copy the selection (full text when
+        // nothing is selected) -- the keyboard twin of the detail's "copy selection"
+        // button. The detail never becomes key, so the system routes Cmd+C to the picker;
+        // we forward it here. With the search field focused the key goes to the field
+        // editor first, so no conflict.
+        if keycode == 8 && (mods & 0x0010_0000) != 0 && DETAIL_VISIBLE.load(Ordering::SeqCst) {
+            copy_detail_selection();
+            return;
+        }
         if keycode == 3 && (mods & 0x0010_0000) != 0 {
             if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
                 let window = match *PICKER_WINDOW.lock().unwrap() {
@@ -5974,7 +6136,15 @@ unsafe fn toast_owner() -> *mut AnyObject {
 }
 
 /// 隐藏 toast(NSTimer 回调)/ hide the toast (the NSTimer callback).
+/// **load-bearing**:非重复 timer 触发后会被 runloop 释放,这里必须把 TOAST_TIMER
+/// 清空——否则下次 show_toast 会对悬空指针调 invalidate(内存已被其他对象占用时
+/// objc2 抛 "method not found" panic,实测第二次 ← 取消置顶即崩)。
+/// **load-bearing**: a non-repeating timer is released by the run loop after firing, so
+/// TOAST_TIMER must be cleared here -- otherwise the next show_toast calls invalidate on
+/// a dangling pointer (when the memory now holds some other object, objc2 panics with
+/// "method not found"; reproduced by a second ← press to unpin).
 extern "C" fn toast_dismiss(_self: *mut c_void, _cmd: Sel, _timer: *mut c_void) {
+    *TOAST_TIMER.lock().unwrap() = None;
     unsafe {
         if let Some(label) = *TOAST_LABEL.lock().unwrap() {
             let _: () = msg_send![label.0, setHidden: true];
@@ -6003,10 +6173,15 @@ fn show_toast(msg: &str) {
             NSSize::new(w, label_frame.size.height)
         )];
         let _: () = msg_send![label, setHidden: false];
-        // 取消上一个待隐藏的 timer,重新计时 / invalidate the previous timer, restart.
+        // 取消上一个待隐藏的 timer,重新计时;无论是否有效都清空指针(invalidate
+        // 后/已触发的 timer 指针都不再可用,保留会变成悬空指针)。
+        // Invalidate the previous pending timer and restart; ALWAYS clear the pointer
+        // (an invalidated or already-fired timer's pointer is dead -- keeping it would
+        // leave a dangling pointer for the next invalidate).
         if let Some(t) = *TOAST_TIMER.lock().unwrap() {
             let _: () = msg_send![t.0, invalidate];
         }
+        *TOAST_TIMER.lock().unwrap() = None;
         let timer: *mut AnyObject = msg_send![
             class!(NSTimer),
             scheduledTimerWithTimeInterval: 1.4f64,
