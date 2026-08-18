@@ -4465,9 +4465,14 @@ unsafe fn rebuild_rows() {
 
         // 底部 meta 按钮:17pt 栏,左侧是 [13px 来源图标]·应用名·时间,整块可可点
         // (点击 = 粘贴)、悬停选中;右侧悬浮着操作按钮。
+        // 位置 = 行底向上留 ROW_PAD_BOT(8pt,对应设计稿 .item 的 padding-bottom 8px)
+        // —— 之前贴行底,meta 栏与删除/详情/收藏按钮离下边框太近。
         // The bottom meta button: a 17pt bar with [13px source icon] + app · time on the
         // left; clickable (paste) and hover-tracked; the action buttons float on its right.
-        let meta_y = content_y + row_h - META_FOOTER_H;
+        // Positioned ROW_PAD_BOT (8pt) above the row bottom, matching the mockup's
+        // .item padding-bottom 8px -- it used to sit flush with the bottom edge, leaving
+        // the meta bar and the delete/details/pin buttons too close to the bottom border.
+        let meta_y = content_y + row_h - META_FOOTER_H - ROW_PAD_BOT;
         let meta_btn: *mut AnyObject = msg_send![row_button_class(), alloc];
         let meta_w = row_w - ROW_PAD_L - ROW_PAD_R - ACTIONS_W - 4.0;
         let meta_btn: *mut AnyObject = msg_send![
