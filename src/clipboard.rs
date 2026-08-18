@@ -4890,11 +4890,16 @@ extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *m
     }
     let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
     if idx >= 0 {
-        // 悬停行与选中都更新(悬停即选中,与切换浮窗一致;hover 底是独立视觉状态)。
-        // Both the hovered row and the selection update (hover selects, same as the
-        // switcher; the hover backdrop is a separate visual state).
+        // 悬停只更新 hover 行(轻底,0.032),**不改选中**——选中(0.050 + 左条)只由
+        // 键盘方向键/点击驱动。两个状态因此能同时可见,对应设计稿里独立的
+        // .item:hover 与 .item.selected(悬停即选中会让悬停行恒为选中样式,
+        // 轻悬停底永远看不到,两种状态看着就一样)。
+        // Hovering only sets the hovered row (the light 0.032 fill) and does NOT move the
+        // selection (0.050 + the left bar) -- the selection moves via the keyboard arrows
+        // / clicks only. The two states stay independently visible, matching the mockup's
+        // separate .item:hover and .item.selected rules (auto-select-on-hover would always
+        // render the hovered row as the selected style, making them look identical).
         *HOVER_ROW.lock().unwrap() = idx as usize;
-        *PICKER_SELECTION.lock().unwrap() = idx as usize;
         unsafe { rebuild_rows() };
     }
 }
