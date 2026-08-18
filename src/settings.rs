@@ -185,6 +185,8 @@ struct SettingsUi {
     clipboard_show_source_app: *mut AnyObject,  // NSSwitch: 显示来源应用 / show the source app
     clipboard_picker_position: *mut AnyObject, // NSPopUpButton: 跟随鼠标 / 主屏幕居中 / picker position
     // (follow mouse / centered on the main screen)
+    clipboard_pin_follow: *mut AnyObject, // NSPopUpButton: 置顶后选中项位置 / selection after pin
+    // (follow the pinned entry / keep current position)
     add_mapping_button: *mut AnyObject, // NSButton: 添加映射 / add-mapping button
     mapping_enabled: *mut AnyObject, // NSSwitch: 按键映射总开关(per-device) / mappings master switch (per-device)
     mapping_empty: *mut AnyObject,   // NSTextField: 空状态提示(卡片内) / empty-state hint (in-card)
@@ -2241,6 +2243,14 @@ fn load_settings_from(cfg: &Config) {
             _ => 0, // "mouse" (default)
         };
         let _: () = msg_send![ui.clipboard_picker_position, selectItemAtIndex: pos_idx as isize];
+        // pin_follow_selection:下拉框 index 0 = 跟随置顶, 1 = 保持当前位置。
+        // pin_follow_selection: popup index 0 = follow, 1 = keep.
+        let pin_idx: isize = if cfg.clipboard.pin_follow_selection {
+            0
+        } else {
+            1
+        };
+        let _: () = msg_send![ui.clipboard_pin_follow, selectItemAtIndex: pin_idx];
     }
 }
 
@@ -2472,6 +2482,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             _ => "mouse", // index 0 or out-of-range
         }
         .into();
+        // pin_follow_selection:下拉框 index 0 = 跟随置顶, 1 = 保持当前位置。
+        // pin_follow_selection: popup index 0 = follow, 1 = keep.
+        let pin_idx: isize = msg_send![ui.clipboard_pin_follow, indexOfSelectedItem];
+        cfg.clipboard.pin_follow_selection = pin_idx != 1;
     }
     for e in cfg.validate() {
         errs.push(e);
@@ -2767,6 +2781,7 @@ fn create_settings_window() {
             clipboard_auto_expire_days: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
             clipboard_picker_position: std::ptr::null_mut(),
+            clipboard_pin_follow: std::ptr::null_mut(),
             add_mapping_button: std::ptr::null_mut(),
             mapping_enabled: std::ptr::null_mut(),
             mapping_empty: std::ptr::null_mut(),
@@ -3596,6 +3611,25 @@ fn create_settings_window() {
             row_h,
             &t("settings.row_clipboard_picker_position"),
             make_popup(ctrl_x, cy, ctrl_w, row_h, &pos_label_refs, 0),
+        );
+        cy -= 8.0 + row_h;
+        // 置顶后选中项位置下拉框:项 = [跟随置顶, 保持当前位置];默认 index 0(跟随置顶),
+        // 实际值由 load_settings_from 填充。
+        // Pin-selection popup: items = [Follow the Pinned Entry, Keep Current Position];
+        // default index 0 (follow); the real value is set by load_settings_from.
+        let pin_labels = [
+            t("settings.pin_follow_entry"),
+            t("settings.pin_keep_position"),
+        ];
+        let pin_label_refs: Vec<&str> = pin_labels.iter().map(|s| s.as_str()).collect();
+        ui.clipboard_pin_follow = add_row(
+            clipboard_view,
+            label_x,
+            cy,
+            225.0,
+            row_h,
+            &t("settings.row_clipboard_pin_follow"),
+            make_popup(ctrl_x, cy, ctrl_w, row_h, &pin_label_refs, 0),
         );
         cy -= 8.0 + row_h;
         // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。

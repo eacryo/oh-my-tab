@@ -1157,44 +1157,52 @@ fn record_image(
     true
 }
 
-/// 置顶第 idx 条:移到置顶区顶部(最上)。
-/// Pin entry `idx`: move it to the top of the pinned block.
-fn pin_entry(history: &mut Vec<ClipEntry>, idx: usize) {
+/// 置顶第 idx 条:移到置顶区顶部(最上)。返回条目的**新历史索引**(恒为 0)。
+/// Pin entry `idx`: move it to the top of the pinned block. Returns the entry's NEW
+/// history index (always 0).
+fn pin_entry(history: &mut Vec<ClipEntry>, idx: usize) -> usize {
     if idx >= history.len() || history[idx].pinned {
-        return;
+        return idx;
     }
     let mut e = history.remove(idx);
     e.pinned = true;
     history.insert(0, e);
+    0
 }
 
-/// 取消第 idx 条的置顶:移到非置顶区顶部(最新位置)。
-/// Unpin entry `idx`: move it to the top of the unpinned block (the newest slot).
-fn unpin_entry(history: &mut Vec<ClipEntry>, idx: usize) {
+/// 取消第 idx 条的置顶:移到非置顶区顶部(最新位置)。返回条目的**新历史索引**(= 插
+/// 入位置,紧随最后一个置顶条目)。
+/// Unpin entry `idx`: move it to the top of the unpinned block (the newest slot). Returns
+/// the entry's NEW history index (the insert position, right after the last pinned entry).
+fn unpin_entry(history: &mut Vec<ClipEntry>, idx: usize) -> usize {
     if idx >= history.len() || !history[idx].pinned {
-        return;
+        return idx;
     }
     let mut e = history.remove(idx);
     e.pinned = false;
     let pos = insert_position(history);
     history.insert(pos, e);
+    pos
 }
 
-/// 切换第 idx 条的置顶状态;返回切换后的状态(置顶 = true)。纯函数,图钉按钮回调
-/// 与 ← 键盘快捷键共用,单测覆盖。
-/// Toggle the pinned state of entry `idx`; returns the new state (true = pinned). Pure
-/// function shared by the pin-button callback and the ← shortcut; unit-tested.
-fn toggle_pin_on(history: &mut Vec<ClipEntry>, idx: usize) -> bool {
+/// 切换第 idx 条的置顶状态;返回 (切换后的状态, 条目的新历史索引)。纯函数,图钉
+/// 按钮回调与 ← 键盘快捷键共用,单测覆盖。新索引供"跟随置顶"选中定位——旧索引在
+/// 重排后会指向别的条目,不能用。
+/// Toggle the pinned state of entry `idx`; returns (the new state, the entry's NEW history
+/// index). Pure function shared by the pin-button callback and the ← shortcut; unit-tested.
+/// The new index feeds "follow-pin" selection -- the OLD index points at a different entry
+/// once the list is reordered, so it must not be used.
+fn toggle_pin_on(history: &mut Vec<ClipEntry>, idx: usize) -> (bool, usize) {
     let Some(entry) = history.get(idx) else {
-        return false;
+        return (false, idx);
     };
     let pinned = entry.pinned;
-    if pinned {
-        unpin_entry(history, idx);
+    let new_idx = if pinned {
+        unpin_entry(history, idx)
     } else {
-        pin_entry(history, idx);
-    }
-    !pinned
+        pin_entry(history, idx)
+    };
+    (!pinned, new_idx)
 }
 
 /// 删除第 idx 条(越界忽略),图片条目的缓存文件一并删除。
@@ -5201,16 +5209,55 @@ extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
         return;
     };
     let mut hist = CLIP_HISTORY.lock().unwrap();
-    let now_pinned = toggle_pin_on(&mut hist, h_idx);
+    let (now_pinned, new_h_idx) = toggle_pin_on(&mut hist, h_idx);
     drop(hist);
     save_history();
     unsafe { rebuild_rows() };
+    // 跟随置顶设置:选中被操作条目(用重排后的新索引)→ 再重建一次刷新高亮。
+    // Follow-pin setting: select the toggled entry (the POST-REORDER index), then rebuild
+    // once more.
+    if selection_after_pin(new_h_idx) {
+        unsafe { rebuild_rows() };
+    }
     let msg = if now_pinned {
         t("clipboard.toast_pinned")
     } else {
         t("clipboard.toast_unpinned")
     };
     show_toast(&msg);
+}
+
+/// 置顶/取消置顶后按设置移动选中(`clipboard.pin_follow_selection`):
+/// - 跟随置顶(true,默认):选中移到被操作条目的**新显示位置**(置顶 → 列表顶,
+///   取消置顶 → 非置顶区顶部);
+/// - 保持当前位置(false):不动(rebuild_rows 只做越界钳制,选中指向原下一条,
+///   便于批量置顶)。
+///
+/// 返回是否移动了选中(调用方据此再补一次 rebuild_rows 刷新高亮)。`new_h_idx` 是
+/// 条目**重排后**的历史索引(toggle_pin_on 返回的新索引)——旧索引此时已指向别的
+/// 条目,搜新列表会落在旧位置,等于"保持当前位置"(曾因此"跟随"不生效)。
+/// Move the selection after pin/unpin per `clipboard.pin_follow_selection`:
+/// - Follow (true, default): select the toggled entry's NEW display position (pin -> the
+///   top of the list; unpin -> the top of the unpinned block);
+/// - Keep (false): leave it (rebuild_rows only clamps; the selection points at the next
+///   entry, convenient for batch pinning).
+///
+/// Returns whether the selection moved (the caller then rebuilds once more to refresh the
+/// highlight). `new_h_idx` is the entry's POST-REORDER history index (returned by
+/// toggle_pin_on) -- the OLD index already refers to a different entry, so searching the
+/// fresh list with it would land on the old position, i.e. exactly "keep current" (the
+/// follow mode once failed this way).
+fn selection_after_pin(new_h_idx: usize) -> bool {
+    if !CONFIG.read().unwrap().clipboard.pin_follow_selection {
+        return false;
+    }
+    let filtered = FILTERED.lock().unwrap();
+    if let Some(pos) = filtered.iter().position(|&h| h == new_h_idx) {
+        *PICKER_SELECTION.lock().unwrap() = pos;
+        true
+    } else {
+        false
+    }
 }
 
 /// 删除按钮回调(tag = 显示行索引)→ 映射历史索引删除并刷新列表。
@@ -5473,10 +5520,16 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                     return;
                 };
                 let mut hist = CLIP_HISTORY.lock().unwrap();
-                let now_pinned = toggle_pin_on(&mut hist, h_idx);
+                let (now_pinned, new_h_idx) = toggle_pin_on(&mut hist, h_idx);
                 drop(hist);
                 save_history();
                 rebuild_rows();
+                // 跟随置顶设置:选中被操作条目(用重排后的新索引)→ 再重建一次刷新高亮。
+                // Follow-pin setting: select the toggled entry (the POST-REORDER index),
+                // then rebuild once more to refresh the highlight.
+                if selection_after_pin(new_h_idx) {
+                    rebuild_rows();
+                }
                 let msg = if now_pinned {
                     t("clipboard.toast_pinned")
                 } else {
@@ -8445,19 +8498,45 @@ mod tests {
     fn toggle_pin_on_roundtrips_pinned_state() {
         use super::toggle_pin_on;
         let mut h = vec![entry("a"), entry("b"), entry("c")];
-        // 置顶:条目移到置顶区顶部。
-        // Pin: the entry moves to the top of the pinned block.
-        assert!(toggle_pin_on(&mut h, 1));
+        // 置顶:条目移到置顶区顶部,返回 (true, 新索引 0)。
+        // Pin: the entry moves to the top of the pinned block; returns (true, new index 0).
+        let (now_pinned, new_idx) = toggle_pin_on(&mut h, 1);
+        assert!(now_pinned);
+        assert_eq!(new_idx, 0);
         assert!(h[0].pinned);
         assert_eq!(h[0].text, "b");
-        // 再切:取消置顶。
-        // Toggle again: unpin.
-        assert!(!toggle_pin_on(&mut h, 0));
+        // 再切:取消置顶,移到非置顶区顶部(新索引 = 紧跟置顶区之后 = 0)。
+        // Toggle again: unpin, to the top of the unpinned block (new index = right after
+        // the pinned block = 0 here).
+        let (now_pinned, new_idx) = toggle_pin_on(&mut h, 0);
+        assert!(!now_pinned);
+        assert_eq!(new_idx, 0);
         assert!(!h[0].pinned);
-        // 越界:安全 no-op,返回 false。
-        // Out of range: safe no-op, returns false.
-        assert!(!toggle_pin_on(&mut h, 99));
+        // 越界:安全 no-op,返回 (false, idx)。
+        // Out of range: safe no-op, returns (false, idx).
+        let (ok, idx) = toggle_pin_on(&mut h, 99);
+        assert!(!ok);
+        assert_eq!(idx, 99);
         assert_eq!(h.len(), 3);
+    }
+
+    #[test]
+    fn toggle_pin_on_returns_new_index_for_follow_selection() {
+        // "跟随置顶"要用条目重排后的新索引定位——旧索引此时已指向别的条目。
+        // Follow-pin selection locates the entry by its POST-REORDER index; the old index
+        // already points at a different entry after the reorder.
+        use super::{pin_entry, unpin_entry};
+        // 已有置顶区时,新置顶的条目到索引 0;取消置顶回到置顶区末尾之后。
+        // With an existing pinned block, a newly pinned entry lands at index 0; unpinning
+        // lands right after the pinned block.
+        let mut h = vec![entry("p1"), entry("u1"), entry("u2")];
+        pin_entry(&mut h, 0); // p1 已在置顶区 / p1 already pinned
+        assert_eq!(pin_entry(&mut h, 1), 0); // u1 置顶 → 索引 0 / u1 pinned -> index 0
+        assert_eq!(h[0].text, "u1");
+        assert!(h[0].pinned);
+        assert_eq!(unpin_entry(&mut h, 0), 1); // u1 取消置顶 → 置顶区之后索引 1
+        assert_eq!(h[1].text, "u1");
+        assert!(!h[1].pinned);
     }
 
     // ========== 冒烟测试(需要真实 GUI 会话,手动运行)==========

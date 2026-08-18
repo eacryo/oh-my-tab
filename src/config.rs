@@ -168,6 +168,12 @@ pub struct ClipboardSection {
     // The clipboard picker position: "mouse" = follows the cursor, "main" = centered on
     // the main screen. Defaults to following the mouse.
     pub picker_position: String,
+    // 置顶后选中项位置:true = 跟随置顶(选中移到被置顶/取消置顶条目的新位置),false
+    // = 保持当前位置(指向原下一条,便于批量置顶)。默认跟随。
+    // Where the selection lands after pin/unpin: true = follow the toggled entry to its
+    // new position; false = keep the current display position (pointing at the next
+    // entry, convenient for batch pinning). Defaults to follow.
+    pub pin_follow_selection: bool,
 }
 
 impl Default for ClipboardSection {
@@ -180,6 +186,7 @@ impl Default for ClipboardSection {
             move_used_to_top: true,
             auto_expire_days: 30,
             picker_position: "mouse".to_string(),
+            pin_follow_selection: true,
         }
     }
 }
@@ -910,6 +917,9 @@ impl Config {
         {
             self.clipboard.picker_position = other.clipboard.picker_position.clone();
         }
+        // pin_follow_selection 是布尔,恒有效。
+        // pin_follow_selection is a bool, always valid.
+        self.clipboard.pin_follow_selection = other.clipboard.pin_follow_selection;
 
         // mouse:profiles 逐档逐字段合并(沿用 per-field resilient 模式)。
         // enabled 与 bool 字段恒有效;profiles 的每个档按字段校验结果保留或丢弃。
@@ -1257,6 +1267,7 @@ mod tests {
         other.clipboard.max_entries = 30;
         other.clipboard.persist = true;
         other.clipboard.move_used_to_top = false;
+        other.clipboard.pin_follow_selection = false;
         let mut merged = Config::default();
         merged.merge_valid(other, &[]);
         assert_eq!(merged.appearance.theme, "dark");
@@ -1268,6 +1279,7 @@ mod tests {
         assert_eq!(merged.clipboard.max_entries, 30);
         assert!(merged.clipboard.persist);
         assert!(!merged.clipboard.move_used_to_top);
+        assert!(!merged.clipboard.pin_follow_selection);
     }
 
     #[test]
