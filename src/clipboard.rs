@@ -54,7 +54,10 @@
 //!   edge <= 1280px, generated lazily on the first detail open, never held in RAM) feeds the
 //!   detail panel and shares the same deletion lifecycle.
 
-use crate::clipboard_highlight::{apply_highlights, classify_text, TextKind};
+use crate::clipboard_highlight::{
+    apply_code_paragraph_styles, apply_highlights, classify_text, format_code_for_display,
+    DisplaySourceMap, TextKind,
+};
 use crate::config::CONFIG;
 use crate::event_tap::{
     CGEventCreateKeyboardEvent, CGEventFlags, CGEventPost, CGEventSetFlags, K_CG_SESSION_EVENT_TAP,
@@ -138,10 +141,13 @@ const PICKER_W: f64 = 560.0;
 const ROW_H: f64 = 78.0;
 /// 条目底部 meta 栏高(内容与操作处于其间)/ the item's bottom meta bar height.
 const META_FOOTER_H: f64 = 17.0;
-/// 正文内容行高(13pt 字体的行高 ~16.3pt,取 16 让两行内容 + 副信息在 61pt 行内放得下)。
-/// Content line height (13pt font's line height is ~16.3pt; 16 lets two content lines +
-/// the meta fit inside the 61pt row).
-const LINE_H: f64 = 16.0;
+/// 详情正文行高(14pt 字体的安全布局高度),避免 NSTextView 实际行框超出估算。
+/// Detail body line height (a safe layout height for 14pt text), preventing NSTextView's
+/// actual line box from exceeding the estimate.
+const DETAIL_LINE_H: f64 = 18.0;
+/// 详情文本底部安全余量,覆盖 NSTextView 最后一个 line fragment 的实际占用。
+/// Detail text bottom safety allowance, covering the actual height of NSTextView's final line fragment.
+const DETAIL_TEXT_EXTRA_H: f64 = DETAIL_LINE_H;
 /// 每条文本最多显示的行数(新设计稿 .content.multiline 的 2 行截断)。
 /// Max text lines per entry (the new mockup's .multiline 2-line clamp).
 const MAX_TEXT_LINES: usize = 2;
@@ -223,10 +229,16 @@ const SCROLL_INDICATOR_MIN_LEN: f64 = 24.0;
 const DETAIL_GAP: f64 = 8.0;
 /// 详情浮窗内容内边距 / the detail panel's inner padding.
 const DETAIL_PAD: f64 = 12.0;
-/// 详情浮窗最大宽度 / the detail panel's max width.
+/// 普通文本详情浮窗最大宽度 / the max width of a plain-text detail panel.
 const DETAIL_MAX_W: f64 = 480.0;
-/// 详情文本最大高度(超出滚动)/ max text height in the detail panel (scrolls beyond).
-const DETAIL_MAX_H: f64 = 640.0;
+/// 代码详情浮窗最大宽度,代码不自然换行而是横向滚动。
+/// The max width of a code detail panel; code scrolls horizontally instead of wrapping.
+const DETAIL_CODE_MAX_W: f64 = 720.0;
+/// 代码安全断点预留列数,给滚动条/字体实际宽度留出余量。
+/// Safety columns reserved for scrollers and the font's actual advance width.
+const DETAIL_CODE_WRAP_SAFETY: usize = 4;
+/// 详情文本上下安全边距 / vertical safety margin for the detail panel.
+const DETAIL_SCREEN_MARGIN: f64 = 8.0;
 /// 详情文本最小高度与主列表单条记录高度保持一致(78pt)。
 /// Match the detail panel's minimum height to one history-list row (78pt).
 const DETAIL_TEXT_MIN_H: f64 = ROW_H;
@@ -418,6 +430,9 @@ static DETAIL_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// cleared when the old content is removed / the panel hides, or a dangling pointer would
 /// be dereferenced on Cmd+C (use-after-free).
 static DETAIL_TEXT_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 代码详情显示文本到原文的映射,保证格式化换行不会改变复制结果。
+/// Mapping from formatted code display text back to its source, preserving copied content.
+static DETAIL_SOURCE_MAP: Mutex<Option<DisplaySourceMap>> = Mutex::new(None);
 
 /// 行列表重建进行中:重建期间 addSubview 的新行按钮会因鼠标恰好在区域内而立即派发
 /// mouseEntered(ActiveInKeyWindow + InVisibleRect 的 tracking area),若该回调再触发
@@ -3331,6 +3346,7 @@ fn hide_detail() {
     // The content views get removed once the panel hides; clear the text-view pointer so
     // Cmd+C never dereferences a dangling one.
     *DETAIL_TEXT_VIEW.lock().unwrap() = None;
+    *DETAIL_SOURCE_MAP.lock().unwrap() = None;
     let win = *DETAIL_WINDOW.lock().unwrap();
     unsafe {
         if let Some(w) = win {
@@ -3369,7 +3385,7 @@ unsafe fn ensure_detail_window() {
     let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
     let screen_frame: NSRect = msg_send![screen, frame];
     let w = DETAIL_MAX_W;
-    let h = DETAIL_MAX_H;
+    let h = (screen_frame.size.height - DETAIL_SCREEN_MARGIN * 2.0).max(DETAIL_TEXT_MIN_H);
     let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
     let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
@@ -3552,6 +3568,12 @@ unsafe fn show_detail_for_sel() {
         Some(c) => c.0,
         None => return,
     };
+    let picker_win = match *PICKER_WINDOW.lock().unwrap() {
+        Some(w) => w.0,
+        None => return,
+    };
+    let screen_frame = picker_screen_frame(picker_win);
+    let max_detail_h = detail_max_height(screen_frame);
 
     // 清除旧内容:removeFromSuperview 即释放(父视图持有,绝不二次 release,
     // 与 rebuild_rows 同一条纪律)。详情文本视图指针一并清空(防悬空)。
@@ -3559,6 +3581,7 @@ unsafe fn show_detail_for_sel() {
     // again -- the same discipline as rebuild_rows). The detail text-view pointer is
     // cleared too (no dangling pointer).
     *DETAIL_TEXT_VIEW.lock().unwrap() = None;
+    *DETAIL_SOURCE_MAP.lock().unwrap() = None;
     let subs: *mut AnyObject = msg_send![content, subviews];
     let count: usize = msg_send![subs, count];
     for i in 0..count {
@@ -3614,16 +3637,17 @@ unsafe fn show_detail_for_sel() {
             // 退化条目(无预览无源文件):详情回退文件名文本(与行内兜底一致)。
             // Degenerate entry (no preview, no source file): the detail falls back to the
             // filename text (same fallback as the row body).
-            let (tw, th) = detail_text_size(&entry.text);
-            add_detail_text(content, &entry.text, tw, th);
+            let (tw, th) = detail_text_size(&entry.text, TextKind::Plain, max_detail_h);
+            add_detail_text(content, &entry.text, tw, th, TextKind::Plain);
             w = tw;
             h = th;
         }
     } else {
-        // --- 文本条目:完整未截断文本,超出 DETAIL_MAX_H 滚动 ---
-        // Text entry: the full untruncated text; scrolls beyond DETAIL_MAX_H.
-        let (tw, th) = detail_text_size(&entry.text);
-        add_detail_text(content, &entry.text, tw, th);
+        // --- 文本条目:完整未截断文本,超出当前屏幕可用高度后滚动 ---
+        // Text entry: the full untruncated text; scrolls beyond the available screen height.
+        let kind = classify_text(&entry.text);
+        let (tw, th) = detail_text_size(&entry.text, kind, max_detail_h);
+        add_detail_text(content, &entry.text, tw, th, kind);
         w = tw;
         h = th;
     }
@@ -3635,16 +3659,11 @@ unsafe fn show_detail_for_sel() {
     // Row alignment instead of the window top: the top strip holds the search/clear bar
     // and with few entries the window is floored at the min height, so a window-top
     // alignment floats the panel above the row (user-reported misalignment).
-    let picker_win = match *PICKER_WINDOW.lock().unwrap() {
-        Some(w) => w.0,
-        None => return,
-    };
     let pf: NSRect = msg_send![picker_win, frame];
     let Some(align_top_y) = selected_row_screen_y(pf) else {
         return;
     };
-    let sf = picker_screen_frame(picker_win);
-    let frame = detail_frame_for(pf, align_top_y, sf, w, h);
+    let frame = detail_frame_for(pf, align_top_y, screen_frame, w, h);
     log_debug!(
         "[clip] detail frame: ({:.0},{:.0}) {}x{}",
         frame.origin.x,
@@ -3659,26 +3678,76 @@ unsafe fn show_detail_for_sel() {
     DETAIL_VISIBLE.store(true, Ordering::SeqCst);
 }
 
-/// 计算详情文本面板尺寸(宽 DETAIL_MAX_W;高 = 完整文本行数,clamp 到 DETAIL_MAX_H)。
-/// Compute the detail text panel's size (width DETAIL_MAX_W; height from the full text's
-/// line count, clamped to DETAIL_MAX_H).
-fn detail_text_size(text: &str) -> (f64, f64) {
-    let avail_w = DETAIL_MAX_W - DETAIL_PAD * 2.0;
-    let lines = estimate_lines(text, detail_text_units(avail_w));
-    let h = (lines as f64 * LINE_H + DETAIL_PAD * 2.0).clamp(DETAIL_TEXT_MIN_H, DETAIL_MAX_H);
-    (DETAIL_MAX_W, h)
+/// 根据详情所在屏幕计算可用最大高度,上下保留安全边距。
+/// Compute the available maximum height on the detail panel's screen, keeping safe margins.
+fn detail_max_height(screen: NSRect) -> f64 {
+    (screen.size.height - DETAIL_SCREEN_MARGIN * 2.0).max(DETAIL_TEXT_MIN_H)
 }
 
-/// 构建详情文本视图(NSScrollView + NSTextView,完整文本自动换行,超出滚动)。
+/// 计算详情文本面板尺寸(宽按文本类型;高按视觉行数并限制在屏幕可用高度内)。
+/// Compute detail text-panel dimensions (type-specific width, height capped by available
+/// screen space).
+fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
+    let w = if kind == TextKind::Code {
+        DETAIL_CODE_MAX_W
+    } else {
+        DETAIL_MAX_W
+    };
+    let lines = if kind == TextKind::Code {
+        // 用同一套显示格式化器计算视觉行数,避免插入的安全换行被高度估算漏掉。
+        // Use the same display formatter for visual line count so inserted safe breaks affect height.
+        let max_columns = (((DETAIL_CODE_MAX_W - DETAIL_PAD * 2.0) / 8.4).floor() as usize)
+            .saturating_sub(DETAIL_CODE_WRAP_SAFETY)
+            .max(24);
+        format_code_for_display(text, max_columns)
+            .text
+            .split('\n')
+            .count()
+    } else {
+        let avail_w = w - DETAIL_PAD * 2.0;
+        estimate_lines(text, detail_text_units(avail_w))
+    };
+    let h = (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_EXTRA_H)
+        .clamp(DETAIL_TEXT_MIN_H, max_height);
+    (w, h)
+}
+
+/// 构建详情文本视图:普通文本自然换行,代码/HTML 在安全符号处悬挂式换行,超出高度后垂直滚动。
 /// 文本**可鼠标选中**(选中范围由底部"复制所选"按钮/Cmd+C 复制);面板不成为 key,
 /// 键盘焦点仍留在主浮窗,所以不能依赖系统 Cmd+C 路由。
-/// Build the detail text view (NSScrollView + NSTextView, full wrapped text, scrolls).
+/// Build the detail text view: plain text wraps naturally, while code/HTML use hanging
+/// breaks at safe symbols; all content scrolls vertically when it exceeds the panel height.
 /// The text IS mouse-selectable; the selection is copied by the bottom "copy selection"
 /// button / Cmd+C. The panel never becomes key (keyboard focus stays in the picker), so
 /// the system Cmd+C routing cannot be relied upon.
-unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
+fn detail_text_view_class() -> *mut AnyObject {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    *CLASS.get_or_init(|| unsafe {
+        let name = CString::new("OhMyTabClipDetailTextView").unwrap();
+        let superclass = class!(NSTextView) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        let types = CString::new("v@:@").unwrap();
+        class_addMethod(
+            cls,
+            sel!(copy:),
+            detail_text_view_copy as *mut c_void,
+            types.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        cls as usize
+    }) as *mut AnyObject
+}
+
+/// 详情文本的原生 Copy 菜单也必须经过原文映射,不能复制格式化后的显示文本。
+/// The native Copy menu must also pass through the source mapping, never copying formatted text.
+extern "C" fn detail_text_view_copy(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
+    copy_detail_selection();
+}
+
+unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64, kind: TextKind) {
+    let is_code = kind == TextKind::Code;
     let avail_w = w - DETAIL_PAD * 2.0;
-    let body_h = (h - DETAIL_PAD * 2.0).max(LINE_H);
+    let body_h = (h - DETAIL_PAD * 2.0).max(DETAIL_LINE_H);
     let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
     let scroll: *mut AnyObject = msg_send![
         scroll,
@@ -3691,13 +3760,26 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
     let _: () = msg_send![scroll, setDrawsBackground: false];
     let _: () = msg_send![scroll, setHasVerticalScroller: true];
     let _: () = msg_send![scroll, setAutohidesScrollers: true];
+    // 代码由显示格式化器在安全符号处插入悬挂式视觉换行,不再依赖横向滚动。
+    // The display formatter inserts hanging visual breaks at safe symbols, so no horizontal
+    // scrolling is needed for normal code lines.
     let _: () = msg_send![scroll, setHasHorizontalScroller: false];
-    let tv: *mut AnyObject = msg_send![class!(NSTextView), alloc];
+    let max_columns = ((avail_w / 8.4).floor() as usize)
+        .saturating_sub(DETAIL_CODE_WRAP_SAFETY)
+        .max(24);
+    let display_text = if is_code {
+        let formatted = format_code_for_display(text, max_columns);
+        *DETAIL_SOURCE_MAP.lock().unwrap() = Some(formatted.source_map);
+        formatted.text
+    } else {
+        text.to_owned()
+    };
+    let tv: *mut AnyObject = msg_send![detail_text_view_class(), alloc];
     let tv: *mut AnyObject = msg_send![
         tv,
         initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(avail_w, body_h))
     ];
-    let ns_text = make_nsstring(text);
+    let ns_text = make_nsstring(&display_text);
     let _: () = msg_send![tv, setString: ns_text];
     CFRelease(ns_text as *const c_void);
 
@@ -3705,7 +3787,7 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
     // The detail view reuses the same text classification and lexical highlighter as the list,
     // including URLs, HTML, and ordinary code snippets.
     let storage: *mut AnyObject = msg_send![tv, textStorage];
-    apply_highlights(storage, text, classify_text(text));
+    apply_highlights(storage, &display_text, kind);
 
     let _: () = msg_send![tv, setEditable: false];
     // 可选中(之前禁用了选中,长文本没法复制其中一部分)。非 key 窗口里 NSTextView
@@ -3717,14 +3799,27 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
     // the Cmd+C forwarding in the picker's container_key_down (see copy_detail_selection).
     let _: () = msg_send![tv, setSelectable: true];
     let _: () = msg_send![tv, setDrawsBackground: false];
-    // 详情正文与历史列表的普通内容文字保持一致,统一使用 14pt。
-    // Keep detail text consistent with the regular history-list content at 14pt.
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
+    // 普通详情文字使用 14pt;代码使用等宽 14pt,让列宽和断点计算稳定。
+    // Plain detail text uses 14pt; code uses a 14pt monospaced font for stable columns/breaks.
+    let font: *mut AnyObject = if is_code {
+        msg_send![class!(NSFont), monospacedSystemFontOfSize: 14.0f64, weight: 0.0f64]
+    } else {
+        msg_send![class!(NSFont), systemFontOfSize: 14.0f64]
+    };
     let _: () = msg_send![tv, setFont: font];
+    if is_code {
+        apply_code_paragraph_styles(storage, &display_text);
+    }
     let _: () = msg_send![tv, setTextContainerInset: NSSize::new(0.0, 0.0)];
-    // 垂直增长 + 水平固定:换行宽 = 面板内容宽,超出行数靠滚动。
-    // Vertically resizable, horizontally fixed: wrapping width = the panel's content width,
-    // excess lines scroll.
+    let text_container: *mut AnyObject = msg_send![tv, textContainer];
+    if is_code {
+        // 去掉 NSTextView 默认的行内留白,让代码内容边界由 DETAIL_PAD 统一控制。
+        // Remove NSTextView's default line padding so DETAIL_PAD controls the code boundary.
+        let _: () = msg_send![text_container, setLineFragmentPadding: 0.0f64];
+    }
+    // 普通文本和代码都在面板内垂直滚动;代码的安全断点已经写入显示文本。
+    // Both plain text and code scroll vertically inside the panel; code's safe breaks are
+    // already represented in the display text.
     let _: () = msg_send![tv, setVerticallyResizable: true];
     let _: () = msg_send![tv, setHorizontallyResizable: false];
     let _: () = msg_send![scroll, setDocumentView: tv];
@@ -3801,12 +3896,32 @@ fn copy_detail_selection() {
     };
     unsafe {
         let sel_range: NSRange = msg_send![tv, selectedRange];
-        let full: *mut AnyObject = msg_send![tv, string];
-        let text = if sel_range.length > 0 {
-            let sub: *mut AnyObject = msg_send![full, substringWithRange: sel_range];
-            nsstring_to_rust(sub)
+        let mapped = {
+            let map = DETAIL_SOURCE_MAP.lock().unwrap();
+            map.as_ref().map(|source_map| {
+                (
+                    source_map.source.clone(),
+                    source_map.source_range(sel_range),
+                )
+            })
+        };
+        let text = if let Some((source, source_range)) = mapped {
+            // 代码详情可能插入了显示换行;按映射从原文提取,绝不把格式化字符复制出去。
+            // Code details may contain display-only breaks; extract from the source mapping
+            // so formatting characters are never copied.
+            let source_ns = make_nsstring(&source);
+            let sub: *mut AnyObject = msg_send![source_ns, substringWithRange: source_range];
+            let text = nsstring_to_rust(sub);
+            CFRelease(source_ns as *const c_void);
+            text
         } else {
-            nsstring_to_rust(full)
+            let full: *mut AnyObject = msg_send![tv, string];
+            if sel_range.length > 0 {
+                let sub: *mut AnyObject = msg_send![full, substringWithRange: sel_range];
+                nsstring_to_rust(sub)
+            } else {
+                nsstring_to_rust(full)
+            }
         };
         write_pasteboard_text(&text, false);
         show_toast(&t("clipboard.toast_copied"));
@@ -8283,6 +8398,28 @@ mod tests {
     }
 
     #[test]
+    fn formatted_code_breaks_at_safe_points_and_maps_back_to_source() {
+        use crate::clipboard_highlight::format_code_for_display;
+        use objc2_foundation::NSRange;
+
+        let source =
+            "const result = veryLongObjectName.veryLongMethodName(firstArgument, secondArgument);";
+        let formatted = format_code_for_display(source, 32);
+        // 方法名保持完整,断点落在调用括号/方法链等安全位置,而不是标识符中间。
+        // The method name stays intact; breaks land at call/method-chain boundaries, never in
+        // the middle of an identifier.
+        assert!(formatted
+            .text
+            .lines()
+            .any(|line| line.contains("veryLongMethodName(")));
+        let display_len = formatted.text.encode_utf16().count();
+        let source_range = formatted
+            .source_map
+            .source_range(NSRange::new(0, display_len));
+        assert_eq!(source_range.length, source.encode_utf16().count());
+    }
+
+    #[test]
     fn build_meta_text_joins_app_and_relative_time() {
         use super::build_meta_text;
         let mut e = entry_with_source("hello", "Safari");
@@ -8495,13 +8632,28 @@ mod tests {
     }
 
     #[test]
-    fn detail_text_size_clamps_to_min_and_max() {
-        use super::detail_text_size;
-        // 短文本 → 最小高度;长文本 → 封顶高度(超出滚动)。
-        // Short text -> the min height; long text -> capped (scrolls beyond).
-        assert_eq!(detail_text_size("hi").1, super::DETAIL_TEXT_MIN_H);
+    fn detail_text_size_clamps_to_screen_height() {
+        use super::{detail_max_height, detail_text_size, TextKind};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0));
+        let max_height = detail_max_height(screen);
+        // 短文本 → 最小高度;长文本 → 当前屏幕可用高度(超出滚动)。
+        // Short text -> the minimum; long text -> the current screen's available height.
+        assert_eq!(
+            detail_text_size("hi", TextKind::Plain, max_height).1,
+            super::DETAIL_TEXT_MIN_H
+        );
         let long = "a".repeat(200_000);
-        assert_eq!(detail_text_size(&long).1, super::DETAIL_MAX_H);
+        assert_eq!(
+            detail_text_size(&long, TextKind::Plain, max_height).1,
+            max_height
+        );
+        // 代码使用更宽的面板,长单行不因自然换行而增加高度。
+        // Code uses the wider panel, and a long single line does not gain fake wrapped height.
+        let long_code = "x".repeat(200_000);
+        let (code_w, code_h) = detail_text_size(&long_code, TextKind::Code, max_height);
+        assert_eq!(code_w, super::DETAIL_CODE_MAX_W);
+        assert_eq!(code_h, super::DETAIL_TEXT_MIN_H);
     }
 
     #[test]

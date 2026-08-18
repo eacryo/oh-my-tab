@@ -4,9 +4,9 @@
 //! 这里不构建 AST,只按字符扫描,因此代码片段不完整时仍能稳定显示。
 //! This module does not build an AST; it scans characters so incomplete snippets remain safe.
 
-use crate::ffi::{hex_to_ns_color, make_nsstring, CFRelease};
-use objc2::msg_send;
+use crate::ffi::{hex_to_ns_color, make_nsstring, release_obj, CFRelease};
 use objc2::runtime::AnyObject;
+use objc2::{class, msg_send};
 use objc2_foundation::NSRange;
 use std::ffi::c_void;
 
@@ -365,6 +365,360 @@ fn highlight_color(kind: HighlightKind) -> u32 {
 
 /// 给 attributed string 批量添加语法颜色;单次扫描即可处理不完整片段。
 /// Apply syntax colors to an attributed string in batches; one scan handles incomplete snippets.
+/// 详情浮窗中的格式化代码及其原文偏移映射。
+/// Formatted detail code together with a mapping back to the original source offsets.
+pub(crate) struct FormattedCode {
+    pub(crate) text: String,
+    pub(crate) source_map: DisplaySourceMap,
+}
+
+pub(crate) struct DisplaySourceMap {
+    pub(crate) source: String,
+    // Each UTF-16 boundary in the display maps to a UTF-16 boundary in the source.
+    boundaries: Vec<usize>,
+}
+
+impl DisplaySourceMap {
+    pub(crate) fn source_range(&self, display_range: NSRange) -> NSRange {
+        let start = self
+            .boundaries
+            .get(display_range.location)
+            .copied()
+            .unwrap_or_else(|| self.source.encode_utf16().count());
+        let end_index = display_range
+            .location
+            .saturating_add(display_range.length)
+            .min(self.boundaries.len().saturating_sub(1));
+        let end = self.boundaries.get(end_index).copied().unwrap_or(start);
+        NSRange::new(start.min(end), end.saturating_sub(start))
+    }
+}
+
+fn source_utf16_offsets(source: &str) -> Vec<usize> {
+    let mut offsets = vec![0; source.len() + 1];
+    let mut utf16 = 0;
+    for (byte, ch) in source.char_indices() {
+        offsets[byte] = utf16;
+        utf16 += ch.len_utf16();
+        offsets[byte + ch.len_utf8()] = utf16;
+    }
+    offsets
+}
+
+fn append_mapped_source(
+    out: &mut String,
+    boundaries: &mut Vec<usize>,
+    source: &str,
+    offsets: &[usize],
+    start: usize,
+    end: usize,
+) {
+    if let Some(last) = boundaries.last_mut() {
+        *last = offsets[start];
+    }
+    let mut byte = start;
+    while byte < end {
+        let ch = source[byte..].chars().next().unwrap();
+        let next = byte + ch.len_utf8();
+        out.push(ch);
+        for _ in 0..ch.len_utf16() {
+            boundaries.push(offsets[next]);
+        }
+        byte = next;
+    }
+}
+
+fn append_mapped_insert(
+    out: &mut String,
+    boundaries: &mut Vec<usize>,
+    text: &str,
+    source_offset: usize,
+) {
+    out.push_str(text);
+    for ch in text.chars() {
+        for _ in 0..ch.len_utf16() {
+            boundaries.push(source_offset);
+        }
+    }
+}
+
+fn visual_width(text: &str) -> usize {
+    let mut width = 0;
+    for ch in text.chars() {
+        width += if ch == '\t' { 4 - (width % 4) } else { 1 };
+    }
+    width
+}
+
+fn leading_indent(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let mut byte = start;
+    let mut columns = 0;
+    while byte < end {
+        let ch = text[byte..].chars().next().unwrap();
+        if ch == ' ' {
+            columns += 1;
+            byte += 1;
+        } else if ch == '\t' {
+            columns += 4 - (columns % 4);
+            byte += 1;
+        } else {
+            break;
+        }
+    }
+    (byte, columns)
+}
+
+fn safe_breaks(source: &str, start: usize, end: usize) -> Vec<usize> {
+    let bytes = source.as_bytes();
+    let mut points = Vec::new();
+    let mut byte = start;
+    while byte < end {
+        let ch = source[byte..].chars().next().unwrap();
+        if ch.is_whitespace() {
+            while byte < end {
+                let c = source[byte..].chars().next().unwrap();
+                if !c.is_whitespace() {
+                    break;
+                }
+                byte += c.len_utf8();
+            }
+            points.push(byte);
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            let quote = ch;
+            byte += ch.len_utf8();
+            while byte < end {
+                let c = source[byte..].chars().next().unwrap();
+                byte += c.len_utf8();
+                if c == '\\' && byte < end {
+                    let escaped = source[byte..].chars().next().unwrap();
+                    byte += escaped.len_utf8();
+                } else if c == quote {
+                    break;
+                }
+            }
+            continue;
+        }
+        if is_identifier_start(bytes[byte]) || bytes[byte].is_ascii_digit() {
+            byte += ch.len_utf8();
+            while byte < end {
+                let c = source[byte..].chars().next().unwrap();
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    byte += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '.' {
+            // Break before a method-chain dot, never in the method name itself.
+            points.push(byte);
+            byte += 1;
+            continue;
+        }
+        let next = source[byte + ch.len_utf8()..end].chars().next();
+        if matches!(ch, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
+            || matches!(ch, '=' | '+' | '-' | '*' | '/' | '&' | '|' | '<' | '>')
+        {
+            byte += ch.len_utf8();
+            if next == Some('=') || (matches!(ch, '&' | '|') && next == Some(ch)) {
+                byte += 1;
+            }
+            points.push(byte);
+            continue;
+        }
+        byte += ch.len_utf8();
+    }
+    points.sort_unstable();
+    points.dedup();
+    points
+}
+
+fn trim_trailing_space(source: &str, start: usize, end: usize) -> usize {
+    let mut trimmed = end;
+    while trimmed > start {
+        let ch = source[..trimmed].chars().next_back().unwrap();
+        if ch == ' ' || ch == '\t' {
+            trimmed -= ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    trimmed
+}
+
+fn skip_leading_space(source: &str, mut byte: usize, end: usize) -> usize {
+    while byte < end {
+        let ch = source[byte..].chars().next().unwrap();
+        if ch == ' ' || ch == '\t' {
+            byte += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    byte
+}
+
+fn append_code_line(
+    source: &str,
+    offsets: &[usize],
+    line_start: usize,
+    line_end: usize,
+    max_columns: usize,
+    out: &mut String,
+    boundaries: &mut Vec<usize>,
+) {
+    if line_start == line_end {
+        return;
+    }
+    let (content_start, indent_columns) = leading_indent(source, line_start, line_end);
+    if visual_width(&source[line_start..line_end]) <= max_columns {
+        append_mapped_source(out, boundaries, source, offsets, line_start, line_end);
+        return;
+    }
+
+    let breaks = safe_breaks(source, content_start, line_end);
+    let mut chunk_start = line_start;
+    let mut first_chunk = true;
+    while chunk_start < line_end {
+        let prefix_columns = if first_chunk { 0 } else { indent_columns + 4 };
+        let available = max_columns.saturating_sub(prefix_columns).max(12);
+        if visual_width(&source[chunk_start..line_end]) <= available {
+            if !first_chunk {
+                append_mapped_insert(
+                    out,
+                    boundaries,
+                    &" ".repeat(indent_columns + 4),
+                    offsets[chunk_start],
+                );
+            }
+            append_mapped_source(out, boundaries, source, offsets, chunk_start, line_end);
+            break;
+        }
+
+        let candidate = breaks
+            .iter()
+            .copied()
+            .filter(|&point| point > chunk_start)
+            .take_while(|&point| {
+                visual_width(&source[chunk_start..trim_trailing_space(source, chunk_start, point)])
+                    <= available
+            })
+            .last();
+        let Some(break_point) =
+            candidate.or_else(|| breaks.iter().copied().find(|&point| point > chunk_start))
+        else {
+            if !first_chunk {
+                append_mapped_insert(
+                    out,
+                    boundaries,
+                    &" ".repeat(indent_columns + 4),
+                    offsets[chunk_start],
+                );
+            }
+            append_mapped_source(out, boundaries, source, offsets, chunk_start, line_end);
+            break;
+        };
+
+        let chunk_end = trim_trailing_space(source, chunk_start, break_point);
+        if !first_chunk {
+            append_mapped_insert(
+                out,
+                boundaries,
+                &" ".repeat(indent_columns + 4),
+                offsets[chunk_start],
+            );
+        }
+        append_mapped_source(out, boundaries, source, offsets, chunk_start, chunk_end);
+        if let Some(last) = boundaries.last_mut() {
+            *last = offsets[break_point];
+        }
+        append_mapped_insert(out, boundaries, "\n", offsets[break_point]);
+        chunk_start = skip_leading_space(source, break_point, line_end);
+        first_chunk = false;
+    }
+}
+
+/// 代码详情的显示格式化:只插入视觉换行和悬挂缩进,原文通过偏移映射保留。
+/// Format code for the detail view by inserting only visual breaks and hanging indents;
+/// the source remains available through the offset map.
+pub(crate) fn format_code_for_display(source: &str, max_columns: usize) -> FormattedCode {
+    let offsets = source_utf16_offsets(source);
+    let mut display = String::new();
+    let mut boundaries = vec![0];
+    let mut line_start = 0;
+    while line_start <= source.len() {
+        let line_end = source[line_start..]
+            .find('\n')
+            .map(|offset| line_start + offset)
+            .unwrap_or(source.len());
+        append_code_line(
+            source,
+            &offsets,
+            line_start,
+            line_end,
+            max_columns,
+            &mut display,
+            &mut boundaries,
+        );
+        if line_end < source.len() {
+            append_mapped_source(
+                &mut display,
+                &mut boundaries,
+                source,
+                &offsets,
+                line_end,
+                line_end + 1,
+            );
+            line_start = line_end + 1;
+        } else {
+            break;
+        }
+    }
+    FormattedCode {
+        text: display,
+        source_map: DisplaySourceMap {
+            source: source.to_owned(),
+            boundaries,
+        },
+    }
+}
+
+/// 给代码的每个显示段落设置悬挂缩进,即使 NSTextView 仍需二次换行也不会顶到最左侧。
+/// Set hanging indents on every displayed code paragraph so any fallback NSTextView wrap
+/// also stays indented instead of jumping to the far left.
+pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: &str) {
+    let style_key = make_nsstring("NSParagraphStyle");
+    let mut location = 0;
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let (_, indent_columns) = leading_indent(content, 0, content.len());
+        let continuation_columns = indent_columns.max(4);
+        let style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+        let style: *mut AnyObject = msg_send![style, init];
+        let _: () = msg_send![
+            style,
+            setHeadIndent: continuation_columns as f64 * 8.4
+        ];
+        let _: () = msg_send![style, setFirstLineHeadIndent: 0.0f64];
+        let _: () = msg_send![style, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+        let length = line.encode_utf16().count();
+        if length > 0 {
+            let _: () = msg_send![
+                storage,
+                addAttribute: style_key,
+                value: style,
+                range: NSRange::new(location, length)
+            ];
+        }
+        release_obj(style);
+        location += length;
+    }
+    CFRelease(style_key as *const c_void);
+}
+
 pub(crate) unsafe fn apply_highlights(storage: *mut AnyObject, text: &str, kind: TextKind) {
     let spans = highlight_spans(text, kind);
     if spans.is_empty() {
