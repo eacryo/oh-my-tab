@@ -84,6 +84,125 @@ fn prune_mru(mru: &mut MruMap, live_set: &HashSet<(i32, u32)>) -> usize {
     before - mru.len()
 }
 
+/// 启动时按窗口前→后顺序预种 MRU(同应用窗口分组,应用级顺序 = CG 前→后序)。
+///
+/// **重要(load-bearing):这个顺序只是一个启动占位,未必等于原生 Cmd+Tab 的顺序。**
+/// macOS 没有公开 API 返回应用切换器的 App MRU,而 CG 的 z 序记录的是"窗口创建/点击
+/// 抬升"的历史,与应用激活顺序是两回事——实测应用激活(包括 Cmd+Tab/Dock 切换)不会
+/// 重排 z 序(Ghostty/Edge 激活后窗口仍在 z 序深处)。因此这里排出的顺序只是"我们
+/// 随便定的一个初始顺序",保证:① 同 App 窗口聚在一起;② 顺序稳定可复现;③ 全部
+/// 排在 999s 回退值之前。真正精确的顺序在应用运行起来后由实时激活通知(MRU bump)
+/// 逐步修正。如果以后要精确恢复重启前的顺序,需要把 MRU 持久化到磁盘(见
+/// clipboard-history 的持久化模式),而不是依赖这个种子。
+///
+/// 该方法在启动时调用一次(见 AppState::new),返回带种子的 MruMap。
+/// Seed the MRU from the front-to-back window order at startup (same-app windows grouped,
+/// app-level order = the CG front-to-back order).
+///
+/// **Important (load-bearing): this order is only a startup placeholder and is NOT
+/// guaranteed to match the native Cmd+Tab order.** macOS exposes no public API for the
+/// switcher's app MRU, and the CG z-order reflects "window created / clicked-raised"
+/// history rather than app-activation order -- verified: activating an app (Cmd+Tab / Dock)
+/// does NOT reorder the z-order (Ghostty/Edge stayed deep in the z-order after activation).
+/// So this is just a plausible initial order we impose, ensuring: 1) same-app windows are
+/// grouped; 2) the order is stable and reproducible; 3) everything sorts ahead of the 999s
+/// fallback. The precise order is corrected live by the activation notifications (MRU bumps)
+/// once the app is running. To exactly restore the pre-restart order, the MRU would need to
+/// be persisted to disk (see the clipboard-history persistence pattern), not seeded.
+pub fn seed_mru_from_system_order() -> MruMap {
+    unsafe {
+        let array = CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ALL, 0);
+        if array.is_null() {
+            return MruMap::new();
+        }
+        let count = CFArrayGetCount(array);
+        let now = Instant::now();
+        // App 首次出现顺序(前到后)+ 每个 App 内的窗口 CG 顺序。
+        // **只用可见(on-screen)窗口推导**:不可见/最小化/其他 Space 的窗口会穿插在
+        // z 序里,把应用相对顺序搅乱(实测 Clash Verge 因离屏窗口靠前而虚高)。
+        // App first-appearance order (front-to-back) + each app's windows in CG order.
+        // ONLY on-screen windows rank: invisible/minimized/other-Space windows interleave
+        // in the z-order and skew the app ranking (Clash Verge used to rank high thanks
+        // to its off-screen windows).
+        let mut app_order: Vec<i32> = Vec::new();
+        let mut app_windows: HashMap<i32, Vec<u32>> = HashMap::new();
+        let mut app_names: HashMap<i32, String> = HashMap::new();
+        for i in 0..count {
+            let dict = CFArrayGetValueAtIndex(array, i);
+            if dict.is_null() {
+                continue;
+            }
+            let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
+            if layer != 0 {
+                continue;
+            }
+            let onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false);
+            if !onscreen {
+                continue;
+            }
+            let pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+            if pid <= 0 {
+                continue;
+            }
+            let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
+            if owner_name.is_empty() || owner_name == "Dock" {
+                continue;
+            }
+            if !app_order.contains(&pid) {
+                app_order.push(pid);
+                app_names.insert(pid, owner_name);
+            }
+            let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+            let list = app_windows.entry(pid).or_default();
+            if cgwid != 0 && !list.contains(&cgwid) {
+                list.push(cgwid);
+            }
+        }
+        // 打印启动时的占位顺序(前→后,应用分组)。注意这只是近似占位,不是原生
+        // Cmd+Tab 的应用序(激活不重排 z 序,见函数注释)——仅用于核对与排查。
+        // Print the startup PLACEHOLDER order (front-to-back, app-grouped). This is only an
+        // approximation, NOT the native Cmd+Tab order (activation does not reorder the
+        // z-order; see the fn doc) -- printed for cross-checking and debugging.
+        log_debug!("[seed] startup placeholder window order (front-to-back, on-screen only):");
+        for pid in &app_order {
+            let wins = app_windows.get(pid).map(|v| v.as_slice()).unwrap_or(&[]);
+            let names: Vec<String> = wins.iter().map(|w| w.to_string()).collect();
+            log_debug!(
+                "  pid={} app=\"{}\" windows=[{}]",
+                pid,
+                app_names.get(pid).map(|s| s.as_str()).unwrap_or("?"),
+                names.join(", ")
+            );
+        }
+        seed_timestamps(&app_order, &app_windows, now)
+    }
+}
+
+/// 纯逻辑:按显示顺序(应用分组 + 应用内 CG 序)给每个窗口赋一个单调递增的"年龄",
+/// 让 sort_windows_by_mru(按年龄升序)排出该顺序;全部 < 1s,仍排在 999s 回退前。
+/// 纯函数,单测覆盖排序结果。`now` 由调用方给定,测试注入固定时刻。
+/// Pure logic: assign each window a monotonically increasing "age" in display order
+/// (app-grouped + per-app CG order), so sort_windows_by_mru (ascending age) emits that
+/// order; all < 1s, still ahead of the 999s fallback. Pure -- `now` is injected by tests.
+fn seed_timestamps(
+    app_order: &[i32],
+    app_windows: &HashMap<i32, Vec<u32>>,
+    now: Instant,
+) -> MruMap {
+    let mut mru = MruMap::new();
+    let mut step: u64 = 0;
+    for pid in app_order {
+        if let Some(wins) = app_windows.get(pid) {
+            for &cgwid in wins {
+                let t = now - std::time::Duration::from_millis(step);
+                mru.insert((*pid, cgwid), t);
+                step += 1;
+            }
+        }
+    }
+    mru
+}
+
 fn icon_cache_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     // 测试构建使用与真实缓存同级的专用目录:冒烟测试里的 clear_icon_cache()
@@ -1852,6 +1971,47 @@ mod tests {
         sort_windows_by_mru(&mut ws, &mru, now);
         assert_eq!((ws[0].pid, ws[0].window_id), (1, 100));
         assert_eq!((ws[1].pid, ws[1].window_id), (9, 999));
+    }
+
+    #[test]
+    fn seed_groups_windows_by_app_in_system_front_to_back_order() {
+        // 启动种子:同 App 窗口分组、App 顺序 = 前到后首次出现、应用内 = CG 序,
+        // 且全部排在无记录(999s 回退)之前。这是"重启后顺序与原生应用序一致"的核心。
+        // Startup seed: same-app windows group together, apps follow the front-to-back
+        // first-appearance order, per-app windows keep the CG z-order, and everything
+        // sorts ahead of the 999s no-record fallback -- the core of "order matches the
+        // native app order after restart".
+        let now = Instant::now();
+        // 呈现为乱序的 CG 前→后窗口流,经 app_order/app_windows 分组后应为:
+        // App1(100,200) / App2(300) / App3(400,500) —— 应用内窗口按 CG 出现序。
+        // A jumbled CG window stream exposes the grouping: after app_order/app_windows,
+        // the display order must be App1(100,200) / App2(300) / App3(400,500), with each
+        // app's windows in CG appearance order.
+        let app_order = vec![1, 2, 3];
+        let app_windows: HashMap<i32, Vec<u32>> = [
+            (1, vec![200, 100]), // CG 序:200 在前(更靠前)
+            (2, vec![300]),
+            (3, vec![400, 500]),
+        ]
+        .into_iter()
+        .collect();
+        let mru = seed_timestamps(&app_order, &app_windows, now);
+
+        let mut ws = vec![
+            window(3, 500),
+            window(1, 100),
+            window(2, 300),
+            window(3, 400),
+            window(1, 200),
+            window(9, 999), // 无记录回退 / no-record fallback
+        ];
+        sort_windows_by_mru(&mut ws, &mru, now);
+        let order: Vec<(i32, u32)> = ws.iter().map(|w| (w.pid, w.window_id)).collect();
+        assert_eq!(
+            order,
+            vec![(1, 200), (1, 100), (2, 300), (3, 400), (3, 500), (9, 999)],
+            "seeded order must group apps and keep the per-app CG order"
+        );
     }
 
     #[test]

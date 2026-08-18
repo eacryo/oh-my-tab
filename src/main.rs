@@ -63,7 +63,11 @@ pub(crate) struct AppState {
 
 impl AppState {
     pub(crate) fn new() -> Self {
-        let mut mru = MruMap::new();
+        // 启动时用系统窗口前→后顺序预种 MRU:重启后初始顺序与原生 Cmd+Tab 的
+        // 应用级顺序一致(见 window_collector::seed_mru_from_system_order)。
+        // Seed the MRU from the system's front-to-back window order at startup, so the
+        // initial ordering after a restart matches the native app-level Cmd+Tab order.
+        let mut mru = window_collector::seed_mru_from_system_order();
         let windows = if has_accessibility_permission() {
             window_collector::collect_windows(&mut mru)
         } else {
