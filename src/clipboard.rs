@@ -308,30 +308,37 @@ static SEARCH_HINT_TEXT: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// focused-but-empty field); it lives in a static and is hand-drawn at the field's left
 /// (see search_cell_draw_interior).
 unsafe fn rebuild_search_hint() {
-    let sym_ns = make_nsstring("magnifyingglass");
-    let magnifier: *mut AnyObject = msg_send![
-        class!(NSImage),
-        imageWithSystemSymbolName: sym_ns,
-        accessibilityDescription: std::ptr::null::<AnyObject>()
-    ];
-    CFRelease(sym_ns as *const c_void);
-    let attachment: *mut AnyObject = msg_send![class!(NSTextAttachment), alloc];
-    let attachment: *mut AnyObject = msg_send![attachment, init];
-    let _: () = msg_send![attachment, setImage: magnifier];
-    let _: () = msg_send![attachment, setBounds: NSRect::new(
-        NSPoint::new(0.0, -2.0),
-        NSSize::new(18.0, 18.0)
-    )];
+    // 图标用文本字形 ⌕(U+2315,与 HTML .search-icon 一致)而非 SF Symbol 放大镜:
+    // 单独一段 18pt / 42% 黑,后接空格 + 14pt / 40% 黑的占位文字。
+    // The icon is the ⌕ text glyph (U+2315, matching the HTML's .search-icon), appended
+    // as an 18pt / 42% black run before the 14pt / 40% black placeholder text.
     let ph_m: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
     let empty_ns2 = make_nsstring("");
     let ph_m: *mut AnyObject = msg_send![ph_m, initWithString: empty_ns2];
     CFRelease(empty_ns2 as *const c_void);
-    let att_str: *mut AnyObject = msg_send![
-        class!(NSAttributedString),
-        attributedStringWithAttachment: attachment
-    ];
-    let _: () = msg_send![ph_m, appendAttributedString: att_str];
-    release_obj(attachment);
+
+    // 图标段 / the icon run.
+    let icon_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let icon_attrs: *mut AnyObject = msg_send![icon_attrs, init];
+    let icon_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 18.0f64];
+    let icon_color: *mut AnyObject =
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.42f64];
+    let font_key = make_nsstring("NSFont");
+    let color_key = make_nsstring("NSColor");
+    let _: () = msg_send![icon_attrs, setObject: icon_font, forKey: font_key];
+    let _: () = msg_send![icon_attrs, setObject: icon_color, forKey: color_key];
+    CFRelease(font_key as *const c_void);
+    CFRelease(color_key as *const c_void);
+    let icon_ns = make_nsstring("\u{2315}  ");
+    let icon_part: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let icon_part: *mut AnyObject =
+        msg_send![icon_part, initWithString: icon_ns, attributes: icon_attrs];
+    CFRelease(icon_ns as *const c_void);
+    release_obj(icon_attrs);
+    let _: () = msg_send![ph_m, appendAttributedString: icon_part];
+    release_obj(icon_part);
+
+    // 占位文字段 / the placeholder run.
     let ph_text_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let ph_text_attrs: *mut AnyObject = msg_send![ph_text_attrs, init];
     let font_key = make_nsstring("NSFont");
@@ -339,13 +346,13 @@ unsafe fn rebuild_search_hint() {
     let _: () = msg_send![ph_text_attrs, setObject: font, forKey: font_key];
     CFRelease(font_key as *const c_void);
     let color_key = make_nsstring("NSColor");
-    // 新设计稿 .search-input::placeholder:14px、40% 黑。icon 后加一个空格。
-    // The new mockup's placeholder: 14px, 40% black. A space after the icon.
+    // 新设计稿 .search-input::placeholder:14px、40% 黑。
+    // The new mockup's placeholder: 14px, 40% black.
     let ph_color: *mut AnyObject =
         msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.40f64];
     let _: () = msg_send![ph_text_attrs, setObject: ph_color, forKey: color_key];
     CFRelease(color_key as *const c_void);
-    let ph_ns = make_nsstring(&format!(" {}", t("clipboard.search_placeholder")));
+    let ph_ns = make_nsstring(&t("clipboard.search_placeholder"));
     let ph_text: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
     let ph_text: *mut AnyObject =
         msg_send![ph_text, initWithString: ph_ns, attributes: ph_text_attrs];
@@ -6012,10 +6019,17 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _: () = msg_send![clayer, setBorderWidth: 1.0f64];
         let _: () = msg_send![clayer, setCornerRadius: 4.0f64];
         // 键帽文字 / the keycap's glyph.
+        // NSTextField 是顶对齐,若 frame 撑满 19pt 键帽字就悬在上沿——让 label 恰好
+        // 包裹行高并垂直居中(键帽内容与 ←/→ 等图标居中对齐)。
+        // NSTextField top-aligns its glyph, so a full-height label would float the arrow at
+        // the cap's top; hug the line height and center it inside the 19pt cap instead.
         let key_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let key_label: *mut AnyObject = msg_send![
             key_label,
-            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(kbd_w, kbd_h))
+            initWithFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(kbd_w, kbd_h)
+            )
         ];
         let _: () = msg_send![key_label, setBezeled: false];
         let _: () = msg_send![key_label, setDrawsBackground: false];
@@ -6024,6 +6038,15 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _: () = msg_send![key_label, setAlignment: 1isize]; // Center on arm64
         let kf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 9.0f64];
         let _: () = msg_send![key_label, setFont: kf];
+        // 用 9pt 字体的行高包住文本,垂直居中(替换全高 frame)。
+        // Swallow the text with the 9pt font's line height and center it vertically.
+        let asc: f64 = msg_send![kf, ascender];
+        let desc: f64 = msg_send![kf, descender];
+        let line_h = (asc - desc + 1.0).max(11.0);
+        let _: () = msg_send![key_label, setFrame: NSRect::new(
+            NSPoint::new(0.0, (kbd_h - line_h) / 2.0),
+            NSSize::new(kbd_w, line_h)
+        )];
         let kc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.48f64];
         let _: () = msg_send![key_label, setTextColor: kc];
         let key_ns = make_nsstring(key);
@@ -6034,12 +6057,17 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _: () = msg_send![parent, addSubview: cap];
         release_obj(cap);
         // 说明文字 / the legend label.
+        // 说明文字帧加宽 6pt + 增高到 16pt:实测按测量宽度刚好等于文字宽时,渲染
+        // 内边距会吃掉一点导致尾部截断("输入选中条目" 等),留余量防截断。
+        // The legend frame gets +6pt width and a taller 16pt height: with the measured
+        // width at exactly the text width, the cell's inner padding clipped the tail;
+        // the slack keeps long labels like "输入选中条目" fully visible.
         let hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let hint: *mut AnyObject = msg_send![
             hint,
             initWithFrame: NSRect::new(
-                NSPoint::new(x + kbd_w + 5.0, (FOOTER_H - 14.0) / 2.0),
-                NSSize::new(label_w, 14.0)
+                NSPoint::new(x + kbd_w + 5.0, (FOOTER_H - 16.0) / 2.0),
+                NSSize::new(label_w + 6.0, 16.0)
             )
         ];
         let _: () = msg_send![hint, setBezeled: false];
