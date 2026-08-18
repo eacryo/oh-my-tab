@@ -226,9 +226,9 @@ const DETAIL_PAD: f64 = 12.0;
 const DETAIL_MAX_W: f64 = 480.0;
 /// 详情文本最大高度(超出滚动)/ max text height in the detail panel (scrolls beyond).
 const DETAIL_MAX_H: f64 = 640.0;
-/// 详情文本最小高度(短文本也保持面板体量)。
-/// The detail text panel's min height (short text keeps the panel a decent size).
-const DETAIL_TEXT_MIN_H: f64 = 96.0;
+/// 详情文本最小高度与主列表单条记录高度保持一致(78pt)。
+/// Match the detail panel's minimum height to one history-list row (78pt).
+const DETAIL_TEXT_MIN_H: f64 = ROW_H;
 /// 详情图片最大框(等比适配)/ max image box in the detail panel (fit proportionally).
 const DETAIL_IMAGE_MAX_W: f64 = 720.0;
 const DETAIL_IMAGE_MAX_H: f64 = 640.0;
@@ -3447,15 +3447,33 @@ unsafe fn ensure_detail_window() {
     // --- 玻璃背景(Liquid Glass),与主浮窗同款 ---
     // Glass backdrop (Liquid Glass), same as the picker.
     let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
-    let content_parent: *mut AnyObject;
 
+    // 详情浮窗外层使用与选中条目相同的 CALayer 圆角和裁剪,而不是依赖玻璃视图自身的
+    // cornerRadius 渲染,这样两者的实际视觉轮廓保持一致。
+    // Use the same CALayer radius and clipping as a selected row for the detail panel's outer
+    // shape instead of relying on the glass view's own corner rendering, keeping both outlines
+    // visually identical.
+    let clip: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let clip: *mut AnyObject = msg_send![
+        clip,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
+    ];
+    let _: () = msg_send![clip, setWantsLayer: true];
+    let clip_layer: *mut AnyObject = msg_send![clip, layer];
+    let _: () = msg_send![clip_layer, setCornerRadius: SEL_TILE_R];
+    let _: () = msg_send![clip_layer, setMasksToBounds: true];
+    let _: () = msg_send![clip, setAutoresizingMask: 18u64];
+    let _: () = msg_send![window, setContentView: clip];
+
+    let content_parent: *mut AnyObject;
     if is_macos_26 {
         let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
         let glass: *mut AnyObject = msg_send![glass_cls, alloc];
         let glass: *mut AnyObject =
             msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        let radius = CORNER_R;
-        let _: () = msg_send![glass, setCornerRadius: radius];
+        // 玻璃本身保持方角,由外层 clip 视图统一裁成选中条目的圆角。
+        // Keep the glass square; the outer clip view applies the selected-row corner exactly.
+        let _: () = msg_send![glass, setCornerRadius: 0.0f64];
         let style_i: i64 = match CONFIG.read().unwrap().appearance.glass_style.as_str() {
             "clear" => 1,
             _ => 0,
@@ -3465,21 +3483,15 @@ unsafe fn ensure_detail_window() {
         let tint = crate::ffi::hex_to_ns_color(tint_hex);
         let _: () = msg_send![glass, setTintColor: tint];
         let _: () = msg_send![glass, setAutoresizingMask: 18u64];
-        let _: () = msg_send![window, setContentView: glass];
+        let _: () = msg_send![clip, addSubview: glass];
         let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
         let inner: *mut AnyObject =
             msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
         let _: () = msg_send![inner, setAutoresizingMask: 18u64];
         let _: () = msg_send![glass, setContentView: inner];
-        let _: () = msg_send![glass, setWantsLayer: true];
-        let glass_layer: *mut AnyObject = msg_send![glass, layer];
-        if !glass_layer.is_null() {
-            let _: () = msg_send![glass_layer, setCornerRadius: radius];
-            let _: () = msg_send![glass_layer, setMasksToBounds: true];
-        }
+        release_obj(glass);
         content_parent = inner;
     } else {
-        let content: *mut AnyObject = msg_send![window, contentView];
         let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
         let ve: *mut AnyObject =
             msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
@@ -3487,9 +3499,10 @@ unsafe fn ensure_detail_window() {
         let _: () = msg_send![ve, setMaterial: 12u64]; // Dark
         let _: () = msg_send![ve, setState: 1u64]; // Active
         let _: () = msg_send![ve, setAutoresizingMask: 18u64];
-        let _: () = msg_send![content, addSubview: ve];
+        let _: () = msg_send![clip, addSubview: ve];
         content_parent = ve;
     }
+    release_obj(clip);
 
     // 内容容器:flipped,内容从顶部排起;点击面板任意处 = 关闭详情(详情不成为 key,
     // 点击面板不会 resign 主浮窗,必须自己处理)。
@@ -3730,6 +3743,30 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
     let ns_text = make_nsstring(text);
     let _: () = msg_send![tv, setString: ns_text];
     CFRelease(ns_text as *const c_void);
+
+    // 详情文本视图默认使用系统纯文本颜色;对 URL 条目显式复用主列表的蓝色属性。
+    // NSTextView defaults to the system plain-text color; explicitly apply the same blue
+    // attribute used by the main list for URL entries.
+    if classify_text(text) == TextKind::Url {
+        let storage: *mut AnyObject = msg_send![tv, textStorage];
+        let url_color: *mut AnyObject = msg_send![
+            class!(NSColor),
+            colorWithSRGBRed: 32.0f64 / 255.0,
+            green: 91.0f64 / 255.0,
+            blue: 166.0f64 / 255.0,
+            alpha: 0.72f64
+        ];
+        let color_key = make_nsstring("NSColor");
+        let text_len = text.encode_utf16().count();
+        let _: () = msg_send![
+            storage,
+            addAttribute: color_key,
+            value: url_color,
+            range: NSRange::new(0, text_len)
+        ];
+        CFRelease(color_key as *const c_void);
+    }
+
     let _: () = msg_send![tv, setEditable: false];
     // 可选中(之前禁用了选中,长文本没法复制其中一部分)。非 key 窗口里 NSTextView
     // 仍支持鼠标拖选(选中显示灰色);复制交给原生路径——右键菜单,以及主浮窗
@@ -3740,7 +3777,9 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
     // the Cmd+C forwarding in the picker's container_key_down (see copy_detail_selection).
     let _: () = msg_send![tv, setSelectable: true];
     let _: () = msg_send![tv, setDrawsBackground: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+    // 详情正文与历史列表的普通内容文字保持一致,统一使用 14pt。
+    // Keep detail text consistent with the regular history-list content at 14pt.
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
     let _: () = msg_send![tv, setFont: font];
     let _: () = msg_send![tv, setTextContainerInset: NSSize::new(0.0, 0.0)];
     // 垂直增长 + 水平固定:换行宽 = 面板内容宽,超出行数靠滚动。
