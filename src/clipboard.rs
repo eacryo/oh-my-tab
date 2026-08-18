@@ -54,6 +54,7 @@
 //!   edge <= 1280px, generated lazily on the first detail open, never held in RAM) feeds the
 //!   detail panel and shares the same deletion lifecycle.
 
+use crate::clipboard_highlight::{apply_highlights, classify_text, TextKind};
 use crate::config::CONFIG;
 use crate::event_tap::{
     CGEventCreateKeyboardEvent, CGEventFlags, CGEventPost, CGEventSetFlags, K_CG_SESSION_EVENT_TAP,
@@ -513,50 +514,6 @@ fn content_width() -> f64 {
 /// only gates the name in the row's meta line).
 fn show_source_app() -> bool {
     CONFIG.read().unwrap().clipboard.show_source_app
-}
-
-/// 剪贴板条目类型分类:按内容给极克制的视觉提示(URL 箭头 / 代码括号)。
-/// 启发式保持保守:拿不准就归为普通文本,宁可没提示也不误标。
-/// Clipboard-entry kind classification for the restrained visual cue (URL arrow / code
-/// braces). The heuristic stays conservative: when in doubt, plain text wins -- better no
-/// badge than a wrong one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextKind {
-    Plain,
-    Url,
-    Code,
-}
-
-fn classify_text(text: &str) -> TextKind {
-    let t = text.trim();
-    if t.is_empty() {
-        return TextKind::Plain;
-    }
-    // URL:含 scheme 或 www. 开头(整段就是一条链接)。
-    // URL: contains a scheme or starts with www. (the whole text is one link).
-    if t.contains("://") || t.starts_with("www.") {
-        return TextKind::Url;
-    }
-    // 代码:多行 + 明显的代码特征(括号对/分号/缩进/常见关键字)。
-    // Code: multi-line + code-ish cues (paren pairs / semicolons / indentation / keywords).
-    let has_newline = text.contains('\n');
-    let has_code_cues = text.contains('{')
-        || text.contains(';')
-        || text.starts_with('#')
-        || text.starts_with("fn ")
-        || text.starts_with("def ")
-        || text.starts_with("import ")
-        || text.starts_with("const ")
-        || text.starts_with("let ")
-        || text.starts_with("<")
-        || text
-            .lines()
-            .any(|l| l.starts_with(' ') && !l.trim().is_empty());
-    if has_newline && has_code_cues {
-        TextKind::Code
-    } else {
-        TextKind::Plain
-    }
 }
 
 /// 行内副信息(应用名 · 相对时间):正文下方的小字,按设计稿 10px 浅灰。
@@ -3744,28 +3701,11 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64) {
     let _: () = msg_send![tv, setString: ns_text];
     CFRelease(ns_text as *const c_void);
 
-    // 详情文本视图默认使用系统纯文本颜色;对 URL 条目显式复用主列表的蓝色属性。
-    // NSTextView defaults to the system plain-text color; explicitly apply the same blue
-    // attribute used by the main list for URL entries.
-    if classify_text(text) == TextKind::Url {
-        let storage: *mut AnyObject = msg_send![tv, textStorage];
-        let url_color: *mut AnyObject = msg_send![
-            class!(NSColor),
-            colorWithSRGBRed: 32.0f64 / 255.0,
-            green: 91.0f64 / 255.0,
-            blue: 166.0f64 / 255.0,
-            alpha: 0.72f64
-        ];
-        let color_key = make_nsstring("NSColor");
-        let text_len = text.encode_utf16().count();
-        let _: () = msg_send![
-            storage,
-            addAttribute: color_key,
-            value: url_color,
-            range: NSRange::new(0, text_len)
-        ];
-        CFRelease(color_key as *const c_void);
-    }
+    // 详情与主列表复用同一套文本分类和词法高亮,包括 URL、HTML 和普通代码片段。
+    // The detail view reuses the same text classification and lexical highlighter as the list,
+    // including URLs, HTML, and ordinary code snippets.
+    let storage: *mut AnyObject = msg_send![tv, textStorage];
+    apply_highlights(storage, text, classify_text(text));
 
     let _: () = msg_send![tv, setEditable: false];
     // 可选中(之前禁用了选中,长文本没法复制其中一部分)。非 key 窗口里 NSTextView
@@ -5747,23 +5687,6 @@ extern "C" fn picker_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> boo
 
 /// 行标题(attributed):选中 = 白字粗体,未选 = labelColor。
 /// Row title (attributed): selected = white bold, unselected = labelColor.
-/// 行标题(attributed):正文段(≤2 行,13pt,labelColor)+ 换行 + 副信息段(10pt,
-/// secondaryLabelColor)。段落单词换行;短文本顶对齐(按钮 frame 恰好贴合文本块高度,
-/// cell 无需垂直居中)。选中不用粗体——高亮块和左侧指示条已表达状态,正文保持克制。
-/// The row title (attributed): the content block (<=2 lines, 13pt, labelColor) + a
-/// newline + the meta block (10pt, secondaryLabelColor). Paragraph word-wrapping; short
-/// text sits top-aligned (the button frame hugs the text block, so the cell centers
-/// nothing). No bold on selection -- the highlight + left bar carry the state; the text
-/// stays restrained.
-/// 行标题(attributed):正文段(单行省略号,按类型着色:URL 蓝 / 代码等宽 + 深灰 /
-/// 普通 78% 黑)+ 换行 + 副信息段(10pt 35% 黑)。镜像设计稿的 .content/.meta。
-/// The row title (attributed): the content line (single-line ellipsis, styled by kind:
-/// blue URLs / monospaced code / plain 78% black) + a newline + the meta line (10pt 35%
-/// black). Mirrors the mockup's .content/.meta.
-/// 内容段(attributed):14px,按类型着色(URL 蓝 / 代码等宽 12px / 普通 84% 黑),
-/// 至多 2 行截断,单词换行。新设计稿 .content/.multiline/.url/.code。
-/// The content (attributed): 14px, styled by kind (blue URLs / monospaced code 12px /
-/// plain 84% black), capped at 2 lines with word wrapping. The new mockup's .content.
 unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObject {
     let pstyle: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
     let pstyle: *mut AnyObject = msg_send![pstyle, init];
@@ -5799,10 +5722,11 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
     CFRelease(pstyle_key as *const c_void);
     release_obj(pstyle);
     let ns = make_nsstring(content);
-    let attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let attr: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
     let attr: *mut AnyObject = msg_send![attr, initWithString: ns, attributes: attrs];
     CFRelease(ns as *const c_void);
     release_obj(attrs);
+    apply_highlights(attr, content, kind);
     attr
 }
 
@@ -8329,6 +8253,33 @@ mod tests {
         assert_eq!(classify_text("hello world"), TextKind::Plain);
         assert_eq!(classify_text(""), TextKind::Plain);
         assert_eq!(classify_text("  "), TextKind::Plain);
+    }
+
+    #[test]
+    fn syntax_highlighting_covers_html_and_incomplete_code() {
+        use super::{classify_text, TextKind};
+        use crate::clipboard_highlight::{highlight_spans, HighlightKind};
+
+        let html = r#"<div class="title">Hello</div>"#;
+        assert_eq!(classify_text(html), TextKind::Code);
+        let html_spans = highlight_spans(html, TextKind::Code);
+        assert!(html_spans.iter().any(|s| s.kind == HighlightKind::Tag));
+        assert!(html_spans
+            .iter()
+            .any(|s| s.kind == HighlightKind::Attribute));
+        assert!(html_spans.iter().any(|s| s.kind == HighlightKind::String));
+
+        // 未闭合标签/字符串也只扫描到文本末尾,不要求片段可解析。
+        // Unclosed tags/strings scan to the end without requiring a parseable snippet.
+        let incomplete = r#"<div class="title""#;
+        assert_eq!(classify_text(incomplete), TextKind::Code);
+        assert!(!highlight_spans(incomplete, TextKind::Code).is_empty());
+
+        let code = "fn main() { // note\n    let answer = 42;\n}";
+        let code_spans = highlight_spans(code, TextKind::Code);
+        assert!(code_spans.iter().any(|s| s.kind == HighlightKind::Keyword));
+        assert!(code_spans.iter().any(|s| s.kind == HighlightKind::Comment));
+        assert!(code_spans.iter().any(|s| s.kind == HighlightKind::Number));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod autostart;
 mod clipboard;
+mod clipboard_highlight;
 mod config;
 mod event_monitor;
 mod event_tap;
