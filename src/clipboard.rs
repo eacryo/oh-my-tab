@@ -4987,17 +4987,31 @@ extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
 /// 删除按钮回调(tag = 显示行索引)→ 映射历史索引删除并刷新列表。
 /// Delete-button callback (tag = display row index) -> mapped history index, remove, refresh.
 /// 详情按钮回调(tag = 显示行索引)→ 选中该行并打开详情面板(与 → 键同路径)。
+/// **toggle**:详情已开且点的正是当前选中行 → 关闭(再点一下取消详情);否则照常
+/// 选中该行并打开/刷新详情(跨行点击时详情跟随新行)。
 /// The details-button callback (tag = display row index) -> select the row and open the
-/// detail panel (the same path as the → key).
+/// detail panel (the same path as the → key). TOGGLE: with the detail already open and
+/// the click landing on the CURRENTLY selected row, close it (a second click cancels the
+/// detail); otherwise select the row and open/refresh the detail (a different row's click
+/// moves the detail along to the new row).
 extern "C" fn show_item_details_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
     if idx < 0 {
         return;
     }
-    *PICKER_SELECTION.lock().unwrap() = idx as usize;
+    let mut sel = PICKER_SELECTION.lock().unwrap();
+    // 已打开且点的是当前选中行 → 本次点击是"取消详情"。
+    // Detail already open AND the click is on the selected row -> this click cancels it.
+    let close = DETAIL_VISIBLE.load(Ordering::SeqCst) && *sel == idx as usize;
+    *sel = idx as usize;
+    drop(sel);
     unsafe {
         rebuild_rows();
-        show_detail_for_sel();
+        if close {
+            hide_detail();
+        } else {
+            show_detail_for_sel();
+        }
     }
 }
 
