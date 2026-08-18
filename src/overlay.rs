@@ -1408,7 +1408,9 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
         // Enable layer for selection border
         let _: () = msg_send![view, setWantsLayer: true];
         let layer: *mut AnyObject = msg_send![view, layer];
-        let _: () = msg_send![layer, setCornerRadius: 24.0f64];
+        // 卡片圆角与参考样式一致,选中态背景和描边都沿用 14px 圆角。
+        // Match the reference style with a 14px radius for the selected background and border.
+        let _: () = msg_send![layer, setCornerRadius: 14.0f64];
         let _: () = msg_send![layer, setMasksToBounds: true];
 
         // Store card index in side map (avoids msg_send! issues on dynamic classes)

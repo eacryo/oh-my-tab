@@ -239,7 +239,7 @@ Shared state lives in global `static`s guarded by `Mutex` / `RwLock`: `TAB_STATE
 theme = "light"          # "dark" | "light" | "auto"
 glass_style = "clear"    # "regular" | "clear"
 glass_tint = "eeeeee66"  # RRGGBBAA
-corner_radius = 36.0
+corner_radius = 32.0
 
 [layout]
 cards_per_row = 6
