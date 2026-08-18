@@ -55,8 +55,8 @@
 //!   detail panel and shares the same deletion lifecycle.
 
 use crate::clipboard_highlight::{
-    apply_code_paragraph_styles, apply_highlights, classify_text, format_code_for_display,
-    DisplaySourceMap, TextKind,
+    apply_code_paragraph_styles, apply_highlights, apply_prepared_code_highlights, classify_text,
+    prepare_code_display, DisplaySourceMap, TextKind,
 };
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -1187,15 +1187,15 @@ fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     }
 }
 
-/// 条目筛选:全部 / 文本 / 图片 / 链接(无代码档——代码归入文本,只在行内做
-/// 克制的括号提示)。/ Picker filters: All / Text / Image / Link (no code tier -- code
-/// falls under Text, only the subtle brace cue marks it in the row).
+/// 条目筛选:全部 / 文本 / 图片 / 链接 / 代码片段。
+/// Picker filters: All / Text / Image / Link / Code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipFilter {
     All,
     Text,
     Image,
     Link,
+    Code,
 }
 
 /// 当前生效的筛选项 / the active filter.
@@ -1206,8 +1206,9 @@ fn matches_filter(e: &ClipEntry, f: ClipFilter) -> bool {
     match f {
         ClipFilter::All => true,
         ClipFilter::Image => e.image.is_some(),
-        ClipFilter::Text => e.image.is_none(),
+        ClipFilter::Text => e.image.is_none() && classify_text(&e.text) == TextKind::Plain,
         ClipFilter::Link => e.image.is_none() && classify_text(&e.text) == TextKind::Url,
+        ClipFilter::Code => e.image.is_none() && classify_text(&e.text) == TextKind::Code,
     }
 }
 
@@ -2458,6 +2459,7 @@ extern "C" fn clip_poll_tick(_self: *mut c_void, _cmd: Sel, _timer: *mut c_void)
 /// Start polling (idempotent): create a main-thread NSTimer and record the current
 /// pasteboard once immediately.
 pub fn start() {
+    crate::clipboard_highlight::warm_up_syntect();
     unsafe {
         let timer_holder = POLL_TIMER.get_or_init(|| Mutex::new(ObjPtr(std::ptr::null_mut())));
         let mut guard = timer_holder.lock().unwrap();
@@ -3699,7 +3701,7 @@ fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
         let max_columns = (((DETAIL_CODE_MAX_W - DETAIL_PAD * 2.0) / 8.4).floor() as usize)
             .saturating_sub(DETAIL_CODE_WRAP_SAFETY)
             .max(24);
-        format_code_for_display(text, max_columns)
+        prepare_code_display(text, max_columns)
             .text
             .split('\n')
             .count()
@@ -3767,13 +3769,14 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64, k
     let max_columns = ((avail_w / 8.4).floor() as usize)
         .saturating_sub(DETAIL_CODE_WRAP_SAFETY)
         .max(24);
-    let display_text = if is_code {
-        let formatted = format_code_for_display(text, max_columns);
-        *DETAIL_SOURCE_MAP.lock().unwrap() = Some(formatted.source_map);
-        formatted.text
-    } else {
-        text.to_owned()
-    };
+    let prepared = is_code.then(|| prepare_code_display(text, max_columns));
+    let display_text = prepared
+        .as_ref()
+        .map(|code| code.text.clone())
+        .unwrap_or_else(|| text.to_owned());
+    if let Some(code) = &prepared {
+        *DETAIL_SOURCE_MAP.lock().unwrap() = Some(code.source_map.clone());
+    }
     let tv: *mut AnyObject = msg_send![detail_text_view_class(), alloc];
     let tv: *mut AnyObject = msg_send![
         tv,
@@ -3787,7 +3790,11 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64, k
     // The detail view reuses the same text classification and lexical highlighter as the list,
     // including URLs, HTML, and ordinary code snippets.
     let storage: *mut AnyObject = msg_send![tv, textStorage];
-    apply_highlights(storage, &display_text, kind);
+    if let Some(code) = &prepared {
+        apply_prepared_code_highlights(storage, code);
+    } else {
+        apply_highlights(storage, &display_text, kind);
+    }
 
     let _: () = msg_send![tv, setEditable: false];
     // 可选中(之前禁用了选中,长文本没法复制其中一部分)。非 key 窗口里 NSTextView
@@ -4314,6 +4321,7 @@ unsafe fn ensure_picker_window() {
         t("clipboard.filter_text"),
         t("clipboard.filter_image"),
         t("clipboard.filter_link"),
+        t("clipboard.filter_code"),
     ];
     let filters_y = TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y;
     *FILTER_PILLS.lock().unwrap() = Vec::new();
@@ -6200,6 +6208,7 @@ fn update_filter_pill_style() {
             ClipFilter::Text => 1,
             ClipFilter::Image => 2,
             ClipFilter::Link => 3,
+            ClipFilter::Code => 4,
         };
         let mut active_frame: Option<NSRect> = None;
         let pills = FILTER_PILLS.lock().unwrap();
@@ -6521,6 +6530,7 @@ extern "C" fn filter_pill_clicked(_self: *mut c_void, _cmd: Sel, sender: *mut c_
         1 => ClipFilter::Text,
         2 => ClipFilter::Image,
         3 => ClipFilter::Link,
+        4 => ClipFilter::Code,
         _ => return,
     };
     *CLIP_FILTER.lock().unwrap() = f;
@@ -7943,15 +7953,17 @@ mod tests {
             entry_image(b"png"),
             entry("apple pie"),
             entry_image(b"png2"),
+            entry("fn main() {\n    let answer = 42;\n}"),
         ];
-        assert_eq!(filtered_indices(&h, "", ClipFilter::All), vec![0, 1, 2]);
+        assert_eq!(filtered_indices(&h, "", ClipFilter::All), vec![0, 1, 2, 3]);
         assert_eq!(filtered_indices(&h, "apple", ClipFilter::All), vec![1]);
         assert!(filtered_indices(&h, "png", ClipFilter::All).is_empty());
-        // 筛选项:图片 / 文本 / 链接。
-        // The kind filters: Image / Text / Link.
+        // 筛选项:图片 / 文本 / 链接 / 代码片段。
+        // The kind filters: Image / Text / Link / Code.
         assert_eq!(filtered_indices(&h, "", ClipFilter::Image), vec![0, 2]);
         assert_eq!(filtered_indices(&h, "", ClipFilter::Text), vec![1]);
         assert!(filtered_indices(&h, "", ClipFilter::Link).is_empty());
+        assert_eq!(filtered_indices(&h, "", ClipFilter::Code), vec![3]);
     }
 
     #[test]
@@ -8368,6 +8380,22 @@ mod tests {
         assert_eq!(classify_text("hello world"), TextKind::Plain);
         assert_eq!(classify_text(""), TextKind::Plain);
         assert_eq!(classify_text("  "), TextKind::Plain);
+    }
+
+    #[test]
+    fn syntect_language_detection_is_conservative_and_supports_hints() {
+        use crate::clipboard_highlight::detect_language;
+
+        assert_eq!(detect_language("```rust\nfn main() {}\n```"), Some("rs"));
+        assert_eq!(
+            detect_language("#!/usr/bin/env python3\nprint('hello')"),
+            Some("py")
+        );
+        assert_eq!(
+            detect_language("fn main() {\n    let answer = 42;\n}"),
+            Some("rs")
+        );
+        assert_eq!(detect_language("ordinary text with a comma"), None);
     }
 
     #[test]

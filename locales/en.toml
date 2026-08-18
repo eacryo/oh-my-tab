@@ -21,6 +21,7 @@ filter_all = "All"
 filter_text = "Text"
 filter_image = "Image"
 filter_link = "Link"
+filter_code = "Code"
 group_today = "Today"
 group_yesterday = "Yesterday"
 group_earlier = "Earlier"
@@ -160,6 +161,8 @@ logging_level_invalid = "logging.level: '{value}' is invalid (expect: debug, inf
 config_read_failed = "cannot read config: {error}"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line'
 clipboard_max_entries_invalid = "clipboard.max_entries: {value} must be 1..=100"
+clipboard_max_highlight_bytes_invalid = "clipboard.max_highlight_bytes: {value} must be 0..=4194304"
+clipboard_max_highlight_lines_invalid = "clipboard.max_highlight_lines: {value} must be 0..=10000"
 clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} must be 0..=365 (0 = off)"
 mouse_line_count_invalid = "line_count: {value} must be 1..=10"
 windows_overlay_position_invalid = 'windows.overlay_position: "{value}" is not one of active_window, main'
