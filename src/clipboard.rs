@@ -4,9 +4,9 @@
 //! - 主线程 NSTimer 每 0.5s 轮询 NSPasteboard 的 changeCount,变化时读文本/图片入历史
 //!   (连续复制相同内容去重,上限裁剪)。
 //! - Option+V 由 event_monitor 的 tap 检测,经 bridge 转主线程调用 on_clipboard_toggle,
-//!   显示/关闭浮窗;↑↓/←/→/Enter/Esc/点击导航:↑↓ 选择,← 置顶(详情打开时先关详情),
-//!   → 展开详情浮窗(完整文本 / 图片大图,内容跟随 ↑↓ 浏览实时刷新;打开时再按 ←/→
-//!   即关闭)。Enter 或点击 = 写回剪贴板 + 合成 Cmd+V 自动粘贴(行为同 Windows 的
+//!   显示/关闭浮窗;↑↓/←/→/Enter/Esc/点击导航:↑↓ 选择,← 置顶,
+//!   → 展开详情浮窗(完整文本 / 图片大图,内容跟随 ↑↓ 浏览实时刷新;打开时再按 →
+//!   关闭)。Enter 或点击 = 写回剪贴板 + 合成 Cmd+V 自动粘贴(行为同 Windows 的
 //!   Win+V)。详情浮窗是被动展示面板(永不成为 key,键盘焦点留在列表),点击面板任意
 //!   处/Esc 关闭,随主浮窗隐藏。
 //! - 文本条目存原文;**图片数据**条目原始字节落盘(`~/Library/Caches/oh-my-tab-clip-images/`,
@@ -27,9 +27,9 @@
 //!   the text/image is read into the history (duplicates are skipped, overflow trimmed).
 //! - Option+V is detected by the event_monitor tap and marshalled to the main thread via the
 //!   bridge (on_clipboard_toggle), showing/hiding the picker. Arrow keys / Enter / Esc /
-//!   clicks navigate: up/down select, left pins (closing the detail panel first when it is
-//!   open), right expands a detail panel (full text / large image; it follows ↑/↓ browsing
-//!   live; pressing ← or → again closes it), Enter or a click = write back to the
+//!   clicks navigate: up/down select, left pins (also while the detail panel is open), right
+//!   expands a detail panel (full text / large image; it follows ↑/↓ browsing live; pressing
+//!   → again closes it), Enter or a click = write back to the
 //!   pasteboard + synthesize Cmd+V for an automatic paste (mirrors Windows' Win+V). The
 //!   detail panel is a passive display (never becomes key, so keyboard focus stays in the
 //!   list); a click anywhere on it or Esc closes it, and it hides together with the picker.
@@ -5768,10 +5768,10 @@ fn clamp_selection(sel: usize, len: usize) -> usize {
     sel.min(len - 1)
 }
 
-/// 键盘导航:↑/↓ 选择,← 置顶,→ 展开详情(详情打开时 ←/→ 都关闭详情),
+/// 键盘导航:↑/↓ 选择,← 置顶,→ 展开详情(详情打开时 → 关闭详情),
 /// Enter 粘贴,Esc 关闭。
-/// Keyboard navigation: up/down to select, left to pin, right to expand details (with the
-/// detail open, both ← and → close it), Enter to paste, Esc to close.
+/// Keyboard navigation: up/down to select, left pins, right expands details (with the
+/// detail open, right closes it), Enter pastes, Esc closes.
 extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let keycode: u16 = msg_send![event as *mut AnyObject, keyCode];
@@ -5812,14 +5812,9 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
         let mut sel = PICKER_SELECTION.lock().unwrap();
         match keycode {
             123 => {
-                // ←(123):详情打开时先关闭详情;否则切换选中条目的置顶状态。
-                // Left: the detail panel closes first when open; otherwise the selected
-                // entry's pinned state toggles.
-                if DETAIL_VISIBLE.load(Ordering::SeqCst) {
-                    drop(sel);
-                    hide_detail();
-                    return;
-                }
+                // ←(123):无论详情是否打开,都切换当前选中条目的置顶状态。
+                // Left: toggle the selected entry's pinned state whether or not the detail
+                // panel is open.
                 let idx = *sel;
                 drop(sel);
                 let Some(h_idx) = mapped_index(idx) else {
@@ -5835,6 +5830,12 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // then rebuild once more to refresh the highlight.
                 if selection_after_pin(new_h_idx) {
                     rebuild_rows();
+                }
+                // 置顶会改变条目在列表中的位置;详情保持打开并跟随新的选中行。
+                // Pinning changes the row position; keep the detail open and follow the new
+                // selected row.
+                if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+                    show_detail_for_sel();
                 }
                 let msg = if now_pinned {
                     t("clipboard.toast_pinned")
@@ -7019,11 +7020,11 @@ pub(crate) fn smoke_runner() -> bool {
             }
         }
     }
-    // 详情/置顶冒烟:→ 展开详情(文本),↓ 跟随刷新(不关闭),← 关闭详情,再 ← 置顶;
-    // 图片条目 → 展开详情(懒生成 .detail 大图);Esc 详情打开时第一级 = 关详情。
-    // Detail/pin smoke: → opens the detail (text), ↓ follows it (stays open), ← closes it,
-    // a second ← pins; an image entry's → opens its detail (lazy .detail generation); with
-    // the detail open, Esc's level one closes the detail only.
+    // 详情/置顶冒烟:→ 展开详情(文本),↓ 跟随刷新(不关闭),← 直接置顶且保持详情,
+    // → 关闭详情;图片条目 → 展开详情(懒生成 .detail 大图);Esc 详情打开时第一级 = 关详情。
+    // Detail/pin smoke: → opens the detail (text), ↓ follows it (stays open), ← pins while
+    // keeping the detail open, and → closes it; an image entry's → opens its detail (lazy
+    // .detail generation); with the detail open, Esc's level one closes the detail only.
     unsafe {
         *PICKER_SELECTION.lock().unwrap() = 0;
         rebuild_rows();
@@ -7047,17 +7048,8 @@ pub(crate) fn smoke_runner() -> bool {
                 DETAIL_VISIBLE.load(Ordering::SeqCst),
                 "the detail must stay open while navigating"
             );
-            // ←:第一级关闭详情。
-            // Left level one: close the detail.
-            let ev = make_key_event(123);
-            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
-            assert!(
-                !DETAIL_VISIBLE.load(Ordering::SeqCst),
-                "left arrow must close the detail panel"
-            );
-            // ←:再按 = 置顶当前选中条目(置顶会把条目移到列表顶部,按身份断言)。
-            // Left again: pin the selected entry (pinning moves it to the top of the list,
-            // so assert by identity).
+            // ←:详情打开时直接置顶当前选中条目,详情保持打开并跟随重排后的位置。
+            // Left: pin the selected entry while the detail stays open and follows its new row.
             let pinned_text = {
                 let sel_idx = *PICKER_SELECTION.lock().unwrap();
                 let hist = CLIP_HISTORY.lock().unwrap();
@@ -7067,6 +7059,10 @@ pub(crate) fn smoke_runner() -> bool {
             };
             let ev = make_key_event(123);
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+            assert!(
+                DETAIL_VISIBLE.load(Ordering::SeqCst),
+                "left arrow must keep the detail panel open"
+            );
             {
                 let hist = CLIP_HISTORY.lock().unwrap();
                 assert!(
@@ -7076,8 +7072,16 @@ pub(crate) fn smoke_runner() -> bool {
                     "left arrow must pin the selected entry"
                 );
             }
-            // →:详情打开时再按 → 也关闭详情(与 ← 一致)。
-            // Right with the detail open: pressing → again also closes it (same as ←).
+            // →:详情打开时关闭详情。
+            // Right with the detail open: close the detail panel.
+            let ev = make_key_event(124);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
+            assert!(
+                !DETAIL_VISIBLE.load(Ordering::SeqCst),
+                "right arrow must close the detail when it is open"
+            );
+            // →:再次展开详情,再按 → 关闭,覆盖详情 toggle 路径。
+            // Reopen with →, then close with → again to cover the detail toggle path.
             let ev = make_key_event(124);
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
             assert!(DETAIL_VISIBLE.load(Ordering::SeqCst));
