@@ -146,9 +146,13 @@ const META_FOOTER_H: f64 = 17.0;
 /// Detail body line height (a safe layout height for 14pt text), preventing NSTextView's
 /// actual line box from exceeding the estimate.
 const DETAIL_LINE_H: f64 = 18.0;
-/// 详情文本底部安全余量,覆盖 NSTextView 最后一个 line fragment 的实际占用。
-/// Detail text bottom safety allowance, covering the actual height of NSTextView's final line fragment.
-const DETAIL_TEXT_EXTRA_H: f64 = DETAIL_LINE_H;
+/// NSTextView 的纵向 textContainerInset 同时作用于上、下两边;详情正文沿用列表
+/// 的 11pt 顶部留白时,尺寸估算必须把两侧都算入,否则恰好两行的内容会溢出并错误显示
+/// 滚动条。
+/// NSTextView's vertical textContainerInset applies at both the top and bottom. Detail text
+/// reuses the list's 11pt top inset, so sizing must include both sides; otherwise exactly
+/// two lines overflow and incorrectly show a scrollbar.
+const DETAIL_TEXT_INSET_H: f64 = ROW_PAD_TOP * 2.0;
 /// 每条文本最多显示的行数(新设计稿 .content.multiline 的 2 行截断)。
 /// Max text lines per entry (the new mockup's .multiline 2-line clamp).
 const MAX_TEXT_LINES: usize = 2;
@@ -228,6 +232,11 @@ const SCROLL_INDICATOR_MIN_LEN: f64 = 24.0;
 const DETAIL_GAP: f64 = 8.0;
 /// 详情浮窗内容内边距 / the detail panel's inner padding.
 const DETAIL_PAD: f64 = 12.0;
+/// 被动详情窗口的 Liquid Glass 会被 AppKit 以非活动状态压暗;用当前玻璃 tint 的
+/// 55% 覆盖补偿,使其回到主浮窗的未选中底色。
+/// AppKit darkens Liquid Glass in the passive detail window. A 55% overlay of the current
+/// glass tint compensates it back to the picker's unselected base surface.
+const DETAIL_INACTIVE_GLASS_COMPENSATION_A: u32 = 0x8D;
 /// 详情浮窗固定外框宽度,文本/代码/图片共用,避免切换条目时横向跳变。
 /// Fixed outer width shared by text, code, and image details to prevent horizontal jumps.
 const DETAIL_MAX_W: f64 = 640.0;
@@ -244,7 +253,6 @@ const DETAIL_SCREEN_MARGIN: f64 = 8.0;
 const DETAIL_TEXT_MIN_H: f64 = ROW_H;
 /// 详情图片内部最大宽度(扣除固定外框的左右内边距)/ max inner image width after fixed-panel padding.
 const DETAIL_IMAGE_MAX_W: f64 = DETAIL_MAX_W - DETAIL_PAD * 2.0;
-const DETAIL_IMAGE_MAX_H: f64 = 640.0;
 /// 详情预览最长边上限(px):视网膜屏 640pt 面板上 ~89% 原生密度,足够清晰;只在
 /// 首次打开详情时生成并落盘 `{hash}.detail`,不占内存(内存仍只留 480px 缩略图)。
 /// Detail preview max edge (px): ~89% native density on a retina 640pt panel; generated
@@ -3094,17 +3102,14 @@ fn picker_frame_for(cursor: NSPoint, screen: NSRect, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
-/// 纯逻辑:详情始终在主浮窗右侧,空间不足时保持右侧并贴屏 clamp,不翻转到左侧。
-/// y 与 `align_top_y` 对齐(调用方传入选中行的屏幕 y),屏幕不够时上移/clamp。
+/// 纯逻辑:详情始终在主浮窗右侧,并在其垂直边界内对齐选中行;因此详情上下边缘
+/// 永远不会越出主浮窗。
 ///
-/// Pure: keep the detail panel on the picker's right; when space is tight, clamp it while
-/// staying on the right instead of flipping to the left. y aligns with `align_top_y`
-/// (the selected row's screen y), shifting up / clamping when the screen is too short.
+/// Pure: keep the detail panel on the picker's right and align it to the selected row within
+/// the picker's vertical bounds, so neither detail edge can exceed the picker.
 fn detail_frame_for(picker: NSRect, align_top_y: f64, screen: NSRect, w: f64, h: f64) -> NSRect {
     let min_x = screen.origin.x + PICKER_EDGE_MARGIN;
     let max_x = screen.origin.x + screen.size.width - PICKER_EDGE_MARGIN;
-    let min_y = screen.origin.y;
-    let max_y = screen.origin.y + screen.size.height;
 
     // x:详情始终从主浮窗右边开始;组合过宽时贴右侧区域,不翻转到左边。
     // x: keep detail on the picker's right; clamp to the right-side region when the group is wide.
@@ -3115,18 +3120,13 @@ fn detail_frame_for(picker: NSRect, align_top_y: f64, screen: NSRect, w: f64, h:
         preferred_x.min(max_x - w).max(min_x)
     };
 
-    // y:与选中行顶部对齐(对齐后向下延伸);屏幕放不下时整体上移,再不够贴缘。
-    // y: align with the selected row (extending downward); shift up and clamp when needed.
-    let mut y = align_top_y - h;
-    if y < min_y {
-        y = min_y + PICKER_EDGE_MARGIN;
-    }
-    if y + h > max_y {
-        y = max_y - h - PICKER_EDGE_MARGIN;
-    }
-    if y < min_y {
-        y = min_y + PICKER_EDGE_MARGIN;
-    }
+    // y:优先与选中行顶部对齐;长详情向上移,但始终 clamp 在主浮窗上下边缘内。
+    // y: prefer aligning to the selected row's top; long details shift upward, but always
+    // clamp within the picker's top and bottom edges.
+    let picker_min_y = picker.origin.y;
+    let picker_max_y = picker.origin.y + picker.size.height;
+    debug_assert!(h <= picker.size.height);
+    let y = (align_top_y - h).max(picker_min_y).min(picker_max_y - h);
 
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
@@ -3553,32 +3553,17 @@ unsafe fn ensure_detail_window() {
     // Glass backdrop (Liquid Glass), same as the picker.
     let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
 
-    // 详情浮窗外层使用与选中条目相同的 CALayer 圆角和裁剪,而不是依赖玻璃视图自身的
-    // cornerRadius 渲染,这样两者的实际视觉轮廓保持一致。
-    // Use the same CALayer radius and clipping as a selected row for the detail panel's outer
-    // shape instead of relying on the glass view's own corner rendering, keeping both outlines
-    // visually identical.
-    let clip: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let clip: *mut AnyObject = msg_send![
-        clip,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
-    ];
-    let _: () = msg_send![clip, setWantsLayer: true];
-    let clip_layer: *mut AnyObject = msg_send![clip, layer];
-    let _: () = msg_send![clip_layer, setCornerRadius: SEL_TILE_R];
-    let _: () = msg_send![clip_layer, setMasksToBounds: true];
-    let _: () = msg_send![clip, setAutoresizingMask: 18u64];
-    let _: () = msg_send![window, setContentView: clip];
-
     let content_parent: *mut AnyObject;
     if is_macos_26 {
         let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
         let glass: *mut AnyObject = msg_send![glass_cls, alloc];
         let glass: *mut AnyObject =
             msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        // 玻璃本身保持方角,由外层 clip 视图统一裁成选中条目的圆角。
-        // Keep the glass square; the outer clip view applies the selected-row corner exactly.
-        let _: () = msg_send![glass, setCornerRadius: 0.0f64];
+        // NSGlassEffectView 的圆角会参与玻璃材质着色;必须和主浮窗保持相同值。其
+        // 自身 layer 随后负责硬裁剪,避免模糊越出边缘。
+        // NSGlassEffectView's corner radius participates in the glass-material rendering, so
+        // it must match the picker. Its own layer hard-clips afterward to prevent blur leaks.
+        let _: () = msg_send![glass, setCornerRadius: CORNER_R];
         let style_i: i64 = match CONFIG.read().unwrap().appearance.glass_style.as_str() {
             "clear" => 1,
             _ => 0,
@@ -3588,12 +3573,42 @@ unsafe fn ensure_detail_window() {
         let tint = crate::ffi::hex_to_ns_color(tint_hex);
         let _: () = msg_send![glass, setTintColor: tint];
         let _: () = msg_send![glass, setAutoresizingMask: 18u64];
-        let _: () = msg_send![clip, addSubview: glass];
+        // 详情直接采用主浮窗的 contentView 层级;额外的 clip 容器会改变 Liquid
+        // Glass 的合成效果,使其看起来像选中条目的深色背景。
+        // Use the picker's contentView hierarchy directly. An extra clip container changes
+        // Liquid Glass compositing and makes it resemble a selected row's darker backdrop.
+        let _: () = msg_send![window, setContentView: glass];
         let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
         let inner: *mut AnyObject =
             msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
         let _: () = msg_send![inner, setAutoresizingMask: 18u64];
+        // 详情面板不能成为 key,系统因而压暗其 Glass。颜色取同一配置 tint,仅提高
+        // alpha 作为底色补偿,而不是借用选中行的深色 tile。
+        // The detail panel cannot become key, so the system darkens its Glass. Reuse the same
+        // configured tint with a higher alpha as base-surface compensation, never the selected
+        // row's dark tile.
+        let fill: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let fill: *mut AnyObject = msg_send![
+            fill,
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
+        ];
+        let _: () = msg_send![fill, setWantsLayer: true];
+        let fill_layer: *mut AnyObject = msg_send![fill, layer];
+        let compensation_hex = (tint_hex & 0xFFFF_FF00) | DETAIL_INACTIVE_GLASS_COMPENSATION_A;
+        crate::ffi::layer_set_background(fill_layer, crate::ffi::hex_to_cg_color(compensation_hex));
+        let _: () = msg_send![fill, setAutoresizingMask: 18u64];
+        let _: () = msg_send![inner, addSubview: fill];
+        release_obj(fill);
         let _: () = msg_send![glass, setContentView: inner];
+        // 与主浮窗完全一致的硬裁剪:玻璃材质本身控制圆角,layer 仅防止模糊越出边缘。
+        // Same hard clipping as the picker: the glass material owns the corner while the
+        // layer only prevents blur from leaking beyond it.
+        let _: () = msg_send![glass, setWantsLayer: true];
+        let glass_layer: *mut AnyObject = msg_send![glass, layer];
+        if !glass_layer.is_null() {
+            let _: () = msg_send![glass_layer, setCornerRadius: CORNER_R];
+            let _: () = msg_send![glass_layer, setMasksToBounds: true];
+        }
         release_obj(glass);
         content_parent = inner;
     } else {
@@ -3604,16 +3619,15 @@ unsafe fn ensure_detail_window() {
         let _: () = msg_send![ve, setMaterial: 12u64]; // Dark
         let _: () = msg_send![ve, setState: 1u64]; // Active
         let _: () = msg_send![ve, setAutoresizingMask: 18u64];
-        let _: () = msg_send![clip, addSubview: ve];
+        let content: *mut AnyObject = msg_send![window, contentView];
+        let _: () = msg_send![content, addSubview: ve];
         content_parent = ve;
     }
-    release_obj(clip);
 
-    // 内容容器:flipped,内容从顶部排起;点击面板任意处 = 关闭详情(详情不成为 key,
-    // 点击面板不会 resign 主浮窗,必须自己处理)。
-    // Content container: flipped, content top-aligned; clicking anywhere on the panel
-    // dismisses it (the panel never becomes key, so a click neither resigns the picker nor
-    // triggers window_did_resign_key -- handled here directly).
+    // 内容容器 flipped,内容从顶部排起。详情正文可选中,且图片也不应因一次普通点击
+    // 被关闭;关闭统一交给 Esc/←/→ 或列表操作。
+    // The content container is flipped and top-aligned. Detail text is selectable, and an
+    // ordinary image click must not dismiss the panel either; Esc/←/→ or list actions close it.
     let content = {
         let name = CString::new("OhMyTabClipDetailContent").unwrap();
         let superclass = class!(NSView) as *const _ as *mut AnyObject;
@@ -3659,21 +3673,21 @@ extern "C" fn detail_content_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
     true
 }
 
-/// 点击详情面板 = 关闭详情(回到列表;主浮窗保持 key,可继续 ←/→/↑/↓/Enter)。
-/// Clicking the detail panel dismisses it (back to the list; the picker stays key, so
-/// ←/→/↑/↓/Enter keep working).
-extern "C" fn detail_content_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    hide_detail();
-}
+/// 吞掉详情容器的普通点击:文本 NSTextView 本来会消费点击以支持选择,图片则会落到
+/// 容器;两种内容必须保持一致,不能因查看图片而意外关闭详情。
+/// Consume ordinary clicks on the detail container. NSTextView already consumes clicks for
+/// selection, whereas image clicks reach the container; both content kinds must behave alike
+/// and never accidentally dismiss the detail panel.
+extern "C" fn detail_content_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {}
 
 /// 打开/刷新详情浮窗:内容跟随选中条目——文本 = 完整未截断;图片 = 详情预览大图
-/// (懒生成 .detail,见 ensure_detail_preview)。位置在主浮窗右侧,详情比主浮窗高时
-/// 顶对齐向下延伸;屏幕放不下则翻转到左侧/clamp。
+/// (懒生成 .detail,见 ensure_detail_preview)。位置在主浮窗右侧,高度及上下位置均
+/// 收在主浮窗内。
 ///
 /// Open/refresh the detail panel: content follows the selected entry -- full untruncated
 /// text for text entries; the large detail preview (lazy `.detail`, see ensure_detail_preview)
-/// for images. The panel has a fixed width, is placed right of the picker, and is
-/// top-aligned while extending down when taller; it clamps when the screen is tight.
+/// for images. It has a fixed width to the right of the picker, with its height and vertical
+/// position both contained within the picker.
 unsafe fn show_detail_for_sel() {
     // 无选中(焦点在搜索框)/ 空列表时不动作。
     // No-op without a selection (search-field focus) or an empty list.
@@ -3705,7 +3719,8 @@ unsafe fn show_detail_for_sel() {
         None => return,
     };
     let screen_frame = picker_screen_frame(picker_win);
-    let max_detail_h = detail_max_height(screen_frame);
+    let picker_frame: NSRect = msg_send![picker_win, frame];
+    let max_detail_h = detail_max_height(picker_frame);
 
     // 清除旧内容:removeFromSuperview 即释放(父视图持有,绝不二次 release,
     // 与 rebuild_rows 同一条纪律)。详情文本视图指针一并清空(防悬空)。
@@ -3741,13 +3756,15 @@ unsafe fn show_detail_for_sel() {
             }
             let img_size: NSSize = msg_send![image, size];
             let (iw, ih) = (img_size.width, img_size.height);
-            let fit_scale = (DETAIL_IMAGE_MAX_W / iw)
-                .min(DETAIL_IMAGE_MAX_H / ih)
-                .min(1.0);
+            // 详情始终收在主浮窗高度内:图片内部高度 = 主浮窗高度扣除上下内边距。
+            // Keep the detail inside the picker height: the image's inner height is the
+            // picker's height minus the detail's vertical padding.
+            let max_image_h = (max_detail_h - DETAIL_PAD * 2.0).max(0.0);
+            let fit_scale = (DETAIL_IMAGE_MAX_W / iw).min(max_image_h / ih).min(1.0);
             let (fit_w, fit_h) = if iw > 0.0 && ih > 0.0 {
                 (iw * fit_scale, ih * fit_scale)
             } else {
-                (DETAIL_IMAGE_MAX_W, DETAIL_IMAGE_MAX_H)
+                (DETAIL_IMAGE_MAX_W, max_image_h)
             };
             // 外框固定宽度,图片只在内部可用区域等比缩放。
             // Keep the outer panel fixed-width; scale the image inside its usable area.
@@ -3777,8 +3794,8 @@ unsafe fn show_detail_for_sel() {
             h = th;
         }
     } else {
-        // --- 文本条目:完整未截断文本,超出当前屏幕可用高度后滚动 ---
-        // Text entry: the full untruncated text; scrolls beyond the available screen height.
+        // --- 文本条目:完整未截断文本,超出主浮窗高度后在详情内滚动 ---
+        // Text entry: the full untruncated text; scrolls inside detail beyond picker height.
         let kind = classify_text(&entry.text);
         let (tw, th) = detail_text_size(&entry.text, kind, max_detail_h);
         add_detail_text(content, &entry.text, tw, th, kind);
@@ -3793,12 +3810,11 @@ unsafe fn show_detail_for_sel() {
     // Row alignment instead of the window top: the top strip holds the search/clear bar
     // and with few entries the window is floored at the min height, so a window-top
     // alignment floats the panel above the row (user-reported misalignment).
-    let pf: NSRect = msg_send![picker_win, frame];
-    let Some(align_top_y) = selected_row_screen_y(pf) else {
+    let Some(align_top_y) = selected_row_screen_y(picker_frame) else {
         return;
     };
     if !DETAIL_VISIBLE.load(Ordering::SeqCst) {
-        *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(pf.origin);
+        *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(picker_frame.origin);
     }
     // 先计算主浮窗 + 详情的整体布局,详情始终在主浮窗右侧并与选中行对齐。
     // Lay out the picker + detail as one group, keeping detail on the right and aligned to
@@ -3806,7 +3822,7 @@ unsafe fn show_detail_for_sel() {
     let center_on_main = CONFIG.read().unwrap().clipboard.picker_position == "main";
     let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
     let (picker_frame, frame) = detail_group_frames(
-        pf,
+        picker_frame,
         align_top_y,
         screen_frame,
         w,
@@ -3831,15 +3847,14 @@ unsafe fn show_detail_for_sel() {
     DETAIL_VISIBLE.store(true, Ordering::SeqCst);
 }
 
-/// 根据详情所在屏幕计算可用最大高度,上下保留安全边距。
-/// Compute the available maximum height on the detail panel's screen, keeping safe margins.
-fn detail_max_height(screen: NSRect) -> f64 {
-    (screen.size.height - DETAIL_SCREEN_MARGIN * 2.0).max(DETAIL_TEXT_MIN_H)
+/// 详情高度上限等于主浮窗高度,使详情上下边缘始终包含在主浮窗内。
+/// The detail-height cap equals the picker height, keeping both detail edges inside it.
+fn detail_max_height(picker: NSRect) -> f64 {
+    picker.size.height.max(DETAIL_TEXT_MIN_H)
 }
 
-/// 计算详情文本面板尺寸(宽按文本类型;高按视觉行数并限制在屏幕可用高度内)。
-/// Compute detail text-panel dimensions (type-specific width, height capped by available
-/// screen space).
+/// 计算详情文本面板尺寸(宽按文本类型;高按视觉行数并限制在主浮窗高度内)。
+/// Compute detail text-panel dimensions (type-specific width, height capped by the picker).
 fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
     let w = if kind == TextKind::Code {
         DETAIL_CODE_MAX_W
@@ -3860,7 +3875,7 @@ fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
         let avail_w = w - DETAIL_PAD * 2.0;
         estimate_lines(text, detail_text_units(avail_w))
     };
-    let h = (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_EXTRA_H)
+    let h = (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H)
         .clamp(DETAIL_TEXT_MIN_H, max_height);
     (w, h)
 }
@@ -9000,22 +9015,22 @@ mod tests {
         // 常规:主浮窗右侧,顶对齐到 align_top_y(选中行的屏幕 y,详情比行高 → 向下延伸)。
         // Normal: right of the picker, top aligned to align_top_y (the selected row's screen
         // y; a taller panel extends downward).
-        let picker = NSRect::new(NSPoint::new(0.0, 300.0), NSSize::new(420.0, 300.0));
-        let align = 300.0 + 300.0; // 本例 = 窗口顶(未滚动、行从顶对齐的等价场景)
+        let picker = NSRect::new(NSPoint::new(0.0, 300.0), NSSize::new(420.0, 500.0));
+        let align = 300.0 + 500.0; // 本例 = 窗口顶(未滚动、行从顶对齐的等价场景)
         let f = detail_frame_for(picker, align, screen, w, h);
         assert_eq!(f.origin.x, 0.0 + 420.0 + DETAIL_GAP);
         assert_eq!(f.origin.y, align - h);
         // 右侧空间不足时仍保持在右侧区域,不翻转到主浮窗左侧。
         // When the right side is tight, stay in the right-side region instead of flipping left.
-        let picker = NSRect::new(NSPoint::new(1000.0, 300.0), NSSize::new(420.0, 300.0));
-        let align = 300.0 + 300.0;
+        let picker = NSRect::new(NSPoint::new(1000.0, 300.0), NSSize::new(420.0, 500.0));
+        let align = 300.0 + 500.0;
         let f = detail_frame_for(picker, align, screen, w, h);
         assert_eq!(f.origin.x, 1440.0 - PICKER_EDGE_MARGIN - w);
         assert_eq!(f.origin.y, align - h);
         // 两侧都放不下 → clamp 进屏幕内。
         // Neither side fits -> clamped inside the screen.
-        let picker = NSRect::new(NSPoint::new(0.0, 300.0), NSSize::new(1440.0, 300.0));
-        let align = 300.0 + 300.0;
+        let picker = NSRect::new(NSPoint::new(0.0, 300.0), NSSize::new(1440.0, 500.0));
+        let align = 300.0 + 500.0;
         let f = detail_frame_for(picker, align, screen, w, h);
         assert!(f.origin.x >= screen.origin.x + PICKER_EDGE_MARGIN);
         assert!(f.origin.x + w <= screen.origin.x + screen.size.width - PICKER_EDGE_MARGIN);
@@ -9030,17 +9045,24 @@ mod tests {
         let row_top_y = 300.0 + 250.0 - 44.0; // 第一行顶 = 窗口顶 − 44pt(头部条 + 行偏移)
         let f = detail_frame_for(picker, row_top_y, screen, 480.0, 200.0);
         assert_eq!(f.origin.y, row_top_y - 200.0);
-        // 对齐点贴近屏顶(行已滚到列表顶部)且详情很高 → 上移 clamp(顶部让出边距)。
-        // An alignment point at the screen's top with a tall panel shifts down to the margin.
+        // 长详情顶对齐时向上 clamp,上下边缘都保持在主浮窗内。
+        // A tall detail aligned to the top clamps upward, keeping both edges inside the picker.
         let picker = NSRect::new(NSPoint::new(0.0, 800.0), NSSize::new(420.0, 100.0));
-        let f = detail_frame_for(picker, 900.0, screen, 480.0, 600.0);
-        assert_eq!(f.origin.y, 900.0 - 600.0);
-        assert!(f.origin.y + 600.0 <= screen.origin.y + screen.size.height);
-        // 对齐点贴屏底且详情很高 → 上移到边距处(底部让出边距)。
-        // An alignment point at the screen's bottom with a tall panel shifts up to the margin.
+        let f = detail_frame_for(picker, 900.0, screen, 480.0, 100.0);
+        assert_eq!(f.origin.y, picker.origin.y);
+        assert_eq!(
+            f.origin.y + f.size.height,
+            picker.origin.y + picker.size.height
+        );
+        // 主浮窗在屏幕底部也一样:详情不得越过其顶部或底部。
+        // The same holds at the screen bottom: detail may not pass either picker edge.
         let picker = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 50.0));
-        let f = detail_frame_for(picker, 50.0, screen, 480.0, 600.0);
-        assert_eq!(f.origin.y, screen.origin.y + PICKER_EDGE_MARGIN);
+        let f = detail_frame_for(picker, 50.0, screen, 480.0, 50.0);
+        assert_eq!(f.origin.y, picker.origin.y);
+        assert_eq!(
+            f.origin.y + f.size.height,
+            picker.origin.y + picker.size.height
+        );
     }
 
     #[test]
@@ -9094,13 +9116,24 @@ mod tests {
     fn detail_text_size_clamps_to_screen_height() {
         use super::{detail_max_height, detail_text_size, TextKind};
         use objc2_foundation::{NSPoint, NSRect, NSSize};
-        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0));
-        let max_height = detail_max_height(screen);
-        // 短文本 → 最小高度;长文本 → 当前屏幕可用高度(超出滚动)。
-        // Short text -> the minimum; long text -> the current screen's available height.
+        let picker = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 400.0));
+        let max_height = detail_max_height(picker);
+        // 短文本 → 最小高度;长文本 → 主浮窗高度(超出才滚动)。
+        // Short text -> the minimum; long text -> the picker height (scrolling only beyond it).
         let (plain_w, plain_h) = detail_text_size("hi", TextKind::Plain, max_height);
         assert_eq!(plain_w, super::DETAIL_MAX_W);
         assert_eq!(plain_h, super::DETAIL_TEXT_MIN_H);
+        // 两行内容必须扩过 78pt 最小高,为 textContainerInset 的上下 11pt 都留空间;
+        // 否则内容高度大于 scroll view,即使没有可滚动内容也会露出滚动条。
+        // Two lines must grow beyond the 78pt minimum, leaving room for both 11pt sides of
+        // textContainerInset; otherwise the document exceeds the scroll view and exposes a
+        // scrollbar despite having no content that should need scrolling.
+        let (_, two_line_h) = detail_text_size("first\nsecond", TextKind::Plain, max_height);
+        assert_eq!(
+            two_line_h,
+            super::DETAIL_LINE_H * 2.0 + super::DETAIL_PAD * 2.0 + super::DETAIL_TEXT_INSET_H
+        );
+        assert!(two_line_h > super::DETAIL_TEXT_MIN_H);
         let long = "a".repeat(200_000);
         assert_eq!(
             detail_text_size(&long, TextKind::Plain, max_height).1,
