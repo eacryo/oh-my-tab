@@ -5292,17 +5292,48 @@ extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *m
     }
 }
 
-/// 鼠标离开行按钮:清除悬停行(仅当离开的正是悬停行;先进入下一行再离开的
-/// 事件序不会误清)→ 增量收起 hover 底与操作按钮(不重建)。
-/// Mouse leaves a row button: clear the hovered row (only when the exited row IS the
-/// hovered one -- the enter-next-then-exit-previous event order must not clear wrongly)
-/// -> incrementally hide the hover backdrop and the action buttons (no rebuild).
-extern "C" fn row_button_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+/// 判断鼠标是否仍在整行区域内,包括右侧独立的操作按钮。
+/// Check whether the pointer is still inside the whole row, including its separate action buttons.
+unsafe fn mouse_inside_row(event: *mut c_void, idx: usize) -> bool {
+    let views = ROW_HOVER_VIEWS.lock().unwrap();
+    let Some(row) = views.get(idx) else {
+        return false;
+    };
+    if row.tile.0.is_null() {
+        return false;
+    }
+    let container = match *PICKER_CONTAINER.lock().unwrap() {
+        Some(c) => c.0,
+        None => return false,
+    };
+    // locationInWindow 使用窗口基准坐标;fromView 必须是 NSView,不能误传 NSWindow。
+    // locationInWindow uses the window-base coordinate system; fromView must be an NSView,
+    // never an NSWindow.
+    let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+    let point: NSPoint = msg_send![
+        container,
+        convertPoint: location,
+        fromView: std::ptr::null::<AnyObject>()
+    ];
+    let frame: NSRect = msg_send![row.tile.0, frame];
+    point.x >= frame.origin.x
+        && point.x <= frame.origin.x + frame.size.width
+        && point.y >= frame.origin.y
+        && point.y <= frame.origin.y + frame.size.height
+}
+
+/// 鼠标离开行按钮:仅在真正离开整行时清除悬停,避免移向右下角操作按钮时消失。
+/// Mouse leaves a row button: clear hover only after leaving the whole row, so moving to the
+/// bottom-right action buttons does not hide them mid-transition.
+extern "C" fn row_button_mouse_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     if REBUILDING.load(Ordering::SeqCst) {
         return;
     }
     let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
     if idx >= 0 {
+        if unsafe { mouse_inside_row(event, idx as usize) } {
+            return;
+        }
         let mut hover = HOVER_ROW.lock().unwrap();
         if *hover == idx as usize {
             *hover = NO_SELECTION;
