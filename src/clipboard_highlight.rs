@@ -477,15 +477,15 @@ pub(crate) fn classify_text(text: &str) -> TextKind {
     if t.is_empty() {
         return TextKind::Plain;
     }
+    // HTML/JSON 结构优先于 URL;结构化内容可能包含链接字段,不能因此被整段判为链接。
+    // HTML/JSON structure takes precedence over URLs; structured content may contain URL fields.
+    if looks_like_html(t) || looks_like_json(t) {
+        return TextKind::Code;
+    }
     // URL:含 scheme 或 www. 开头(整段就是一条链接)。
     // URL: contains a scheme or starts with www. (the whole text is one link).
     if t.contains("://") || t.starts_with("www.") {
         return TextKind::Url;
-    }
-    // HTML 单行片段也应进入代码样式,例如 `<div>hello</div>`。
-    // Single-line HTML snippets should also use code styling, e.g. `<div>hello</div>`.
-    if looks_like_html(t) {
-        return TextKind::Code;
     }
     // 代码:多行 + 明显的代码特征(括号对/分号/缩进/常见关键字)。
     // Code: multi-line + code-ish cues (paren pairs / semicolons / indentation / keywords).

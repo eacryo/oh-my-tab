@@ -8361,6 +8361,12 @@ mod tests {
         assert_eq!(classify_text("https://github.com"), TextKind::Url);
         assert_eq!(classify_text("www.example.com/a"), TextKind::Url);
         assert_eq!(classify_text("a://b"), TextKind::Url);
+        // 结构化内容中的 URL 字段不能把整个 JSON 误判成链接。
+        // A URL field inside structured content must not classify the whole JSON as a link.
+        assert_eq!(
+            classify_text(r#"{"homepage":"https://example.com","enabled":true}"#),
+            TextKind::Code
+        );
         // 代码:多行 + 明显的代码特征。
         // Code: multi-line + obvious code cues.
         assert_eq!(
