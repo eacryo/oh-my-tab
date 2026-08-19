@@ -124,15 +124,44 @@ pub(crate) fn detect_language(text: &str) -> Option<&'static str> {
     }
 
     let lower = text.to_ascii_lowercase();
+    // 只使用足够有辨识度的特征;低于阈值或得分并列时返回 None,交给通用兜底。
+    // Use distinctive cues only; below the threshold or on a tie, return None for the
+    // generic fallback instead of applying the wrong grammar.
     let candidates: &[(&str, &[&str])] = &[
         (
             "rs",
-            &["fn ", "let ", "impl ", "pub ", "use ", "match ", "::", "->"],
+            &[
+                "fn ", "let ", "impl ", "pub ", "use ", "match ", "::", "->", "trait ",
+            ],
         ),
         (
             "py",
             &[
-                "def ", "import ", "from ", "elif ", "none", "__name__", "except ", "yield ",
+                "def ", "import ", "from ", "elif ", "__name__", "except ", "yield ", "self.",
+            ],
+        ),
+        (
+            "java",
+            &[
+                "package ",
+                "import java.",
+                "public ",
+                "private ",
+                "protected ",
+                "public class",
+                "private class",
+                "protected class",
+                "@override",
+                "@test",
+                "static ",
+                "final ",
+                "void ",
+                "string ",
+                "boolean ",
+                "throws ",
+                "return ",
+                "system.out.",
+                "implements ",
             ],
         ),
         (
@@ -144,6 +173,7 @@ pub(crate) fn detect_language(text: &str) -> Option<&'static str> {
                 ": number",
                 " as const",
                 "readonly ",
+                "implements ",
             ],
         ),
         (
@@ -156,9 +186,13 @@ pub(crate) fn detect_language(text: &str) -> Option<&'static str> {
                 "console.",
                 "require(",
                 "export ",
+                "import ",
             ],
         ),
-        ("go", &["package ", "func ", ":=", "go ", "defer ", "chan "]),
+        (
+            "go",
+            &["package ", "func ", ":=", "defer ", "chan ", "go func"],
+        ),
         (
             "swift",
             &[
@@ -168,7 +202,75 @@ pub(crate) fn detect_language(text: &str) -> Option<&'static str> {
                 "let ",
                 "var ",
                 "struct ",
+                "protocol ",
             ],
+        ),
+        (
+            "c",
+            &[
+                "#include <stdio.h>",
+                "#include <stdlib.h>",
+                "printf(",
+                "scanf(",
+                "sizeof(",
+                "typedef struct",
+                "null",
+            ],
+        ),
+        (
+            "cpp",
+            &[
+                "#include <iostream>",
+                "#include <vector>",
+                "std::",
+                "cout <<",
+                "cin >>",
+                "nullptr",
+                "template<",
+            ],
+        ),
+        (
+            "cs",
+            &[
+                "using system",
+                "namespace ",
+                "console.",
+                "async task",
+                "string[] args",
+                "get; set;",
+            ],
+        ),
+        (
+            "kt",
+            &[
+                "fun ",
+                "val ",
+                "data class",
+                "when ",
+                "println(",
+                "companion object",
+            ],
+        ),
+        (
+            "dart",
+            &[
+                "import 'dart:",
+                "void main(",
+                "future<",
+                "widget build(",
+                "@override",
+                "print(",
+            ],
+        ),
+        (
+            "ruby",
+            &[
+                "def ", "require ", "attr_", "do |", "puts ", "unless ", "end\n",
+            ],
+        ),
+        (
+            "php",
+            &["<?php", "echo ", "namespace ", "$this->", "function ", "->"],
         ),
         (
             "sql",
@@ -178,6 +280,7 @@ pub(crate) fn detect_language(text: &str) -> Option<&'static str> {
                 "update ",
                 "delete from ",
                 "create table ",
+                "alter table ",
             ],
         ),
         (
@@ -188,6 +291,12 @@ pub(crate) fn detect_language(text: &str) -> Option<&'static str> {
                 "background:",
                 "display:",
                 "!important",
+            ],
+        ),
+        (
+            "sh",
+            &[
+                "set -e", "#!/bin/", "$(", "echo ", "export ", "fi\n", "then\n",
             ],
         ),
     ];
@@ -230,6 +339,8 @@ fn normalize_language_hint(hint: &str) -> Option<&'static str> {
         "c#" | "cs" | "csharp" => Some("cs"),
         "go" | "golang" => Some("go"),
         "swift" => Some("swift"),
+        "kotlin" | "kt" => Some("kt"),
+        "dart" => Some("dart"),
         "shell" | "bash" | "zsh" | "sh" => Some("sh"),
         "html" | "xml" => Some("html"),
         "css" => Some("css"),
@@ -237,6 +348,8 @@ fn normalize_language_hint(hint: &str) -> Option<&'static str> {
         "sql" => Some("sql"),
         "ruby" | "rb" => Some("rb"),
         "php" => Some("php"),
+        "yaml" | "yml" => Some("yml"),
+        "markdown" | "md" => Some("md"),
         _ => None,
     }
 }
@@ -395,17 +508,56 @@ pub(crate) fn classify_text(text: &str) -> TextKind {
     }
 }
 
-/// 轻量判断文本是否像 HTML,避免把普通比较表达式误判成代码。
-/// Cheap HTML detection that avoids classifying ordinary comparison expressions as code.
+/// 轻量判断文本是否像 HTML,避免把 Java 泛型 `<T>` 等普通代码误判成标签。
+/// Cheap HTML detection that avoids mistaking ordinary code such as Java generics `<T>` for tags.
 fn looks_like_html(text: &str) -> bool {
     let bytes = text.as_bytes();
-    let Some(open) = bytes.iter().position(|&b| b == b'<') else {
-        return false;
-    };
-    let Some(&next) = bytes.get(open + 1) else {
-        return false;
-    };
-    next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?')
+    let mut search_from = 0;
+    while search_from < bytes.len() {
+        let Some(relative_open) = bytes[search_from..].iter().position(|&b| b == b'<') else {
+            return false;
+        };
+        let open = search_from + relative_open;
+        let Some(&next) = bytes.get(open + 1) else {
+            return false;
+        };
+        if matches!(next, b'!' | b'?') {
+            return true;
+        }
+
+        let mut name_start = open + 1;
+        if bytes.get(name_start) == Some(&b'/') {
+            name_start += 1;
+        }
+        if !bytes
+            .get(name_start)
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+        {
+            search_from = open + 1;
+            continue;
+        }
+        let mut name_end = name_start + 1;
+        while bytes
+            .get(name_end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':'))
+        {
+            name_end += 1;
+        }
+        let name = &bytes[name_start..name_end];
+        // 单字母标签只保留 HTML 中常见的真实标签,过滤 `<T>`、`<K>` 等泛型。
+        // Keep only common real one-letter HTML tags, filtering generics such as `<T>` and `<K>`.
+        let valid_name = name.len() >= 2
+            || (name.len() == 1
+                && matches!(
+                    name[0].to_ascii_lowercase(),
+                    b'a' | b'b' | b'i' | b'p' | b'q' | b's' | b'u'
+                ));
+        if valid_name {
+            return true;
+        }
+        search_from = open + 1;
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

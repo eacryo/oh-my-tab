@@ -8395,6 +8395,16 @@ mod tests {
             detect_language("fn main() {\n    let answer = 42;\n}"),
             Some("rs")
         );
+        assert_eq!(
+            detect_language("    public String findName() {\n        return \"name\";\n    }"),
+            Some("java")
+        );
+        assert_eq!(
+            detect_language("    public <T> T findValue() {\n        return null;\n    }"),
+            Some("java")
+        );
+        // 没有足够语言特征时必须返回 None,由渲染层使用通用轻量高亮兜底。
+        // With insufficient language cues, return None so rendering uses the generic fallback.
         assert_eq!(detect_language("ordinary text with a comma"), None);
     }
 
@@ -8423,6 +8433,13 @@ mod tests {
         assert!(code_spans.iter().any(|s| s.kind == HighlightKind::Keyword));
         assert!(code_spans.iter().any(|s| s.kind == HighlightKind::Comment));
         assert!(code_spans.iter().any(|s| s.kind == HighlightKind::Number));
+
+        // Java 泛型不能被轻量 HTML 扫描器误认为标签。
+        // Java generics must not be mistaken for tags by the lightweight HTML scanner.
+        let java_generic = "    public <T> T findValue() {\n        return null;\n    }";
+        assert!(!highlight_spans(java_generic, TextKind::Code)
+            .iter()
+            .any(|s| s.kind == HighlightKind::Tag));
     }
 
     #[test]
