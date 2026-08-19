@@ -6048,7 +6048,7 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
     let attrs: *mut AnyObject = msg_send![attrs, init];
     let font: *mut AnyObject = match kind {
         TextKind::Code => {
-            msg_send![class!(NSFont), monospacedSystemFontOfSize: 12.0f64, weight: 0.0f64]
+            msg_send![class!(NSFont), monospacedSystemFontOfSize: 14.0f64, weight: 0.0f64]
         }
         _ => msg_send![class!(NSFont), systemFontOfSize: 14.0f64],
     };
