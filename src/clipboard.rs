@@ -158,8 +158,6 @@ const MAX_TEXT_LINES: usize = 2;
 /// (560 - list margins 16 - row padding 10 - icon 32 - icon gap 11 - actions 52 - main
 /// right padding 12), i.e. ~30 CJK chars per 13pt line ≈ 60 units.
 const LINE_MAX_UNITS: usize = 60;
-/// 行与行之间的间距(设计稿条目之间无间距)/ row-to-row gap (the mockup stacks items flush).
-const ROW_GAP: f64 = 0.0;
 /// 列表区左右边距(设计稿 .history padding 0 8px)/ the list's side padding (8px).
 const PAD_X: f64 = 8.0;
 /// 行内边距(新设计稿 padding 11 11 8 13):上/右/下/左。
@@ -284,18 +282,14 @@ const NO_SELECTION: usize = usize::MAX;
 /// when nothing is hovered. Maintained by mouseEntered/mouseExited.
 static HOVER_ROW: Mutex<usize> = Mutex::new(NO_SELECTION);
 
-/// 每行的悬停相关视图(底块 + 3 个操作按钮),按显示行索引。悬停变化时只增量刷新
-/// 这些视图(行底背景 + **非置顶**行的按钮透明度),**不再全量重建**——滚轮滚动时行
-/// 在静止光标下滑过,每行都会触发一次 mouseEntered,全量重建(移除/重建全部行 +
-/// 富文本)是滚动卡顿的根源。置顶条目按钮常显,不受悬停影响。
-/// Per-row hover-dependent views (the tile + the 3 action buttons), indexed by display
-/// row. Hover changes only refresh these views (tile backdrop + the button alpha of
-/// UNPINNED rows) instead of rebuilding ALL rows -- while wheel-scrolling, rows slide
-/// under a stationary cursor and each row fires a mouseEntered; the full rebuild
-/// (remove/recreate every row + attributed strings) was the cause of the scroll jank.
-/// Pinned entries keep their buttons always visible, independent of hover.
+/// 每行的增量视觉视图(底块、选中标记 + 3 个操作按钮),按显示行索引。
+/// 悬停和方向键选中只刷新受影响的行,不再全量重建列表。
+/// Per-row incremental visual views (tile, selection bar + 3 action buttons), indexed by
+/// display row. Hover and arrow-key selection update only affected rows instead of rebuilding
+/// the whole list.
 struct RowHoverViews {
     tile: ObjPtr,
+    bar: ObjPtr,
     pin: ObjPtr,
     details: ObjPtr,
     del: ObjPtr,
@@ -2885,23 +2879,11 @@ extern "C" fn search_field_do_command(
         };
         *PICKER_SELECTION.lock().unwrap() = sel;
         rebuild_rows();
-        // ↑ 选中末行时视口还停在顶部:滚动选中行可见(与列表内方向键导航同款;
-        // 空列表时 row_top 的 take 防越界,无副作用)。
-        // With ↑ the tail is selected while the viewport still sits at the top -- scroll
-        // the selection into view (same as the in-list arrow navigation; row_top's take
-        // guards the empty-list case, harmless).
+        // ↑ 选中末行时视口还停在顶部:用确定性的偏移计算滚动到选中行可见。
+        // With ↑ the tail is selected while the viewport is still at the top: use the
+        // deterministic offset calculation to bring the selected row into view.
         if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
-            let pitches = ROW_PITCHES.lock().unwrap();
-            let y = row_top(sel, &pitches);
-            let h = pitches.get(sel).copied().unwrap_or(ROW_GAP);
-            drop(pitches);
-            let _: bool = msg_send![
-                c.0,
-                scrollRectToVisible: NSRect::new(
-                    NSPoint::new(0.0, y),
-                    NSSize::new(1.0, h)
-                )
-            ];
+            scroll_selection_into_view(c.0, sel);
         }
         if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
             let window = match *PICKER_WINDOW.lock().unwrap() {
@@ -4714,26 +4696,26 @@ unsafe fn rebuild_rows() {
         // CGColor args/returns ('^{CGColor=}' vs '^v').
         crate::ffi::layer_set_background(tile_layer, crate::ffi::ns_color_to_cg(bg));
         let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
-        // 选中行左侧 2px 指示条(左侧移 1px、上下各缩 10px,设计稿 .item.selected::before)。
-        // The selected row's 2px left bar (at x=1, inset 10px top/bottom).
-        if selected {
-            let bar: *mut AnyObject = msg_send![class!(NSView), alloc];
-            let bar: *mut AnyObject = msg_send![
-                bar,
-                initWithFrame: NSRect::new(
-                    NSPoint::new(SEL_BAR_X, SEL_BAR_INSET_Y),
-                    NSSize::new(SEL_BAR_W, row_h - SEL_BAR_INSET_Y * 2.0)
-                )
-            ];
-            let _: () = msg_send![bar, setWantsLayer: true];
-            let bar_layer: *mut AnyObject = msg_send![bar, layer];
-            let bar_bg: *mut AnyObject =
-                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.42f64];
-            crate::ffi::layer_set_background(bar_layer, crate::ffi::ns_color_to_cg(bar_bg));
-            let _: () = msg_send![bar_layer, setCornerRadius: SEL_BAR_W / 2.0];
-            let _: () = msg_send![tile, addSubview: bar];
-            release_obj(bar);
-        }
+        // 每行都预建左侧 2px 指示条并按选中状态隐藏,这样方向键切换只需切换可见性。
+        // Prebuild the 2px selection bar for every row and hide it when unselected, so arrow
+        // navigation only toggles visibility instead of rebuilding rows.
+        let bar: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let bar: *mut AnyObject = msg_send![
+            bar,
+            initWithFrame: NSRect::new(
+                NSPoint::new(SEL_BAR_X, SEL_BAR_INSET_Y),
+                NSSize::new(SEL_BAR_W, row_h - SEL_BAR_INSET_Y * 2.0)
+            )
+        ];
+        let _: () = msg_send![bar, setWantsLayer: true];
+        let bar_layer: *mut AnyObject = msg_send![bar, layer];
+        let bar_bg: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.42f64];
+        crate::ffi::layer_set_background(bar_layer, crate::ffi::ns_color_to_cg(bar_bg));
+        let _: () = msg_send![bar_layer, setCornerRadius: SEL_BAR_W / 2.0];
+        let _: () = msg_send![bar, setHidden: !selected];
+        let _: () = msg_send![tile, addSubview: bar];
+        release_obj(bar);
         let _: () = msg_send![container, addSubview: tile];
         release_obj(tile);
         tiles.push(ObjPtr(tile));
@@ -4874,6 +4856,7 @@ unsafe fn rebuild_rows() {
         // incremental hover refresh.
         ROW_HOVER_VIEWS.lock().unwrap().push(RowHoverViews {
             tile: ObjPtr(tile),
+            bar: ObjPtr(bar),
             pin: ObjPtr(pin_btn),
             details: ObjPtr(details_btn),
             del: ObjPtr(del_btn),
@@ -5295,6 +5278,9 @@ fn update_hover_visuals(prev: usize, new: usize) {
             let bg: *mut AnyObject =
                 msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha];
             crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
+            if !rv.bar.0.is_null() {
+                let _: () = msg_send![rv.bar.0, setHidden: !selected];
+            }
             // 按钮透明度:置顶条目常显(恒 1.0);非置顶条目 = 悬停/选中才显现。
             // Button alpha: pinned entries keep them always visible (fixed 1.0); unpinned
             // entries show them on hover/selection only.
@@ -5792,27 +5778,16 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                         return;
                     }
                 }
+                let previous = *sel;
                 if let Some(next) = nav_arrow(keycode, *sel, display_len) {
                     *sel = next;
                 }
                 let idx = *sel;
                 drop(sel);
-                refresh_selection(idx);
+                refresh_selection(previous, idx);
                 // 滚动到选中行可见 / scroll the selection into view.
                 if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
-                    let pitches = ROW_PITCHES.lock().unwrap();
-                    let y = row_top(idx, &pitches);
-                    let h = pitches.get(idx).copied().unwrap_or(ROW_GAP);
-                    drop(pitches);
-                    // scrollRectToVisible: 返回 BOOL('B')。
-                    // scrollRectToVisible: returns BOOL ('B').
-                    let _: bool = msg_send![
-                        c.0,
-                        scrollRectToVisible: NSRect::new(
-                            NSPoint::new(0.0, y),
-                            NSSize::new(1.0, h)
-                        )
-                    ];
+                    scroll_selection_into_view(c.0, idx);
                 }
                 // 详情打开时跟随选中条目实时刷新(浏览体验,类似 Quick Look)。
                 // The detail panel follows the selection live while open (Quick-Look-style
@@ -5886,11 +5861,61 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
     }
 }
 
-/// 更新选中高亮(重建行)。/ Refresh selection highlight (rebuild rows).
-fn refresh_selection(_idx: usize) {
-    unsafe {
-        rebuild_rows();
+/// 根据可视区与选中行位置计算滚动偏移,避免快速按键时 scrollRectToVisible 与重建互相覆盖。
+/// Compute the scroll offset from the viewport and selected-row geometry, avoiding the race-like
+/// interaction between scrollRectToVisible and rapid row rebuilds.
+fn selection_scroll_offset(current: f64, viewport_h: f64, document_h: f64, y: f64, h: f64) -> f64 {
+    let max_offset = (document_h - viewport_h).max(0.0);
+    let target = if y < current {
+        y
+    } else if y + h > current + viewport_h {
+        y + h - viewport_h
+    } else {
+        current
+    };
+    target.max(0.0).min(max_offset)
+}
+
+/// 直接把选中行滚入可视区,不依赖 AppKit 的异步可见性调整。
+/// Scroll the selected row into view directly, without relying on AppKit's asynchronous
+/// visibility adjustment.
+unsafe fn scroll_selection_into_view(container: *mut AnyObject, idx: usize) {
+    let (y, h) = {
+        let pitches = ROW_PITCHES.lock().unwrap();
+        let Some(&h) = pitches.get(idx) else {
+            return;
+        };
+        (row_top(idx, &pitches), h)
+    };
+    let scroll = match *SCROLL_VIEW.lock().unwrap() {
+        Some(s) => s.0,
+        None => return,
+    };
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    if clip.is_null() {
+        return;
     }
+    let bounds: NSRect = msg_send![clip, bounds];
+    let document: NSRect = msg_send![container, frame];
+    let target = selection_scroll_offset(
+        bounds.origin.y,
+        bounds.size.height,
+        document.size.height,
+        y,
+        h,
+    );
+    if (target - bounds.origin.y).abs() > f64::EPSILON {
+        // scrollPoint:使用文档视图坐标;显式 clamp 后不会因快速重复事件被旧位置覆盖。
+        // scrollPoint: uses document-view coordinates; explicit clamping prevents rapid
+        // repeated events from being overwritten by a stale position.
+        let _: () = msg_send![container, scrollPoint: NSPoint::new(0.0, target)];
+    }
+}
+
+/// 更新选中高亮,只刷新前后两行的视觉状态,不重建列表。
+/// Refresh selection highlight by updating only the previous and new rows, without rebuilding.
+fn refresh_selection(previous: usize, current: usize) {
+    update_hover_visuals(previous, current);
 }
 
 extern "C" fn container_accepts_first_responder(_self: *mut c_void, _cmd: Sel) -> bool {
@@ -8642,6 +8667,34 @@ mod tests {
         // (↓ -> 0, ↑ -> the tail).
         assert_eq!(nav_arrow(125, NO_SELECTION, 3), Some(0));
         assert_eq!(nav_arrow(126, NO_SELECTION, 3), Some(2));
+    }
+
+    #[test]
+    fn selection_scroll_offset_keeps_the_selected_row_visible() {
+        use super::selection_scroll_offset;
+        // 选中行在视口下方 → 向下滚到行底贴近视口底部。
+        // A row below the viewport scrolls down until its bottom meets the viewport bottom.
+        assert_eq!(
+            selection_scroll_offset(0.0, 300.0, 1000.0, 500.0, 78.0),
+            278.0
+        );
+        // 选中行在视口上方 → 向上滚到行顶。
+        // A row above the viewport scrolls up until its top is visible.
+        assert_eq!(
+            selection_scroll_offset(300.0, 300.0, 1000.0, 200.0, 78.0),
+            200.0
+        );
+        // 已经可见 → 保持当前位置;目标超出文档 → clamp 到最大偏移。
+        // An already-visible row keeps the current offset; a target past the document clamps
+        // to the maximum offset.
+        assert_eq!(
+            selection_scroll_offset(300.0, 300.0, 1000.0, 350.0, 78.0),
+            300.0
+        );
+        assert_eq!(
+            selection_scroll_offset(0.0, 300.0, 1000.0, 950.0, 78.0),
+            700.0
+        );
     }
 
     #[test]
