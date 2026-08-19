@@ -183,8 +183,6 @@ struct SettingsUi {
     clipboard_max_entries: *mut AnyObject,      // NSTextField: 历史最大条数 / max history entries
     clipboard_auto_expire_days: *mut AnyObject, // NSTextField: 自动过期天数(0=关闭)/ auto-expire days (0 = off)
     clipboard_show_source_app: *mut AnyObject,  // NSSwitch: 显示来源应用 / show the source app
-    clipboard_picker_position: *mut AnyObject, // NSPopUpButton: 跟随鼠标 / 主屏幕居中 / picker position
-    // (follow mouse / centered on the main screen)
     clipboard_pin_follow: *mut AnyObject, // NSPopUpButton: 置顶后选中项位置 / selection after pin
     // (follow the pinned entry / keep current position)
     add_mapping_button: *mut AnyObject, // NSButton: 添加映射 / add-mapping button
@@ -562,6 +560,264 @@ pub(crate) extern "C" fn on_settings_open(_self: *mut c_void, _cmd: Sel, _sender
     show_settings();
 }
 
+/// 记录设置窗口提交的逐字段变更,不记录剪贴板历史内容。
+/// Log field-level changes submitted from Settings without recording clipboard contents.
+fn log_config_changes(old: &Config, new: &Config) {
+    macro_rules! changed {
+        ($name:literal, $old:expr, $new:expr) => {{
+            let old_value = &$old;
+            let new_value = &$new;
+            if old_value != new_value {
+                log_info!(
+                    "[settings] config changed: {}: {:?} -> {:?}",
+                    $name,
+                    old_value,
+                    new_value
+                );
+            }
+        }};
+    }
+
+    changed!(
+        "appearance.theme",
+        old.appearance.theme,
+        new.appearance.theme
+    );
+    changed!(
+        "appearance.glass_style",
+        old.appearance.glass_style,
+        new.appearance.glass_style
+    );
+    changed!(
+        "appearance.glass_tint",
+        old.appearance.glass_tint,
+        new.appearance.glass_tint
+    );
+    changed!(
+        "appearance.corner_radius",
+        old.appearance.corner_radius,
+        new.appearance.corner_radius
+    );
+
+    changed!(
+        "layout.cards_per_row",
+        old.layout.cards_per_row,
+        new.layout.cards_per_row
+    );
+    changed!(
+        "layout.card_width",
+        old.layout.card_width,
+        new.layout.card_width
+    );
+    changed!(
+        "layout.card_height",
+        old.layout.card_height,
+        new.layout.card_height
+    );
+    changed!("layout.card_gap", old.layout.card_gap, new.layout.card_gap);
+    changed!(
+        "layout.icon_size",
+        old.layout.icon_size,
+        new.layout.icon_size
+    );
+
+    changed!(
+        "colors.dark.status_bar_text",
+        old.colors.dark.status_bar_text,
+        new.colors.dark.status_bar_text
+    );
+    changed!(
+        "colors.dark.app_name",
+        old.colors.dark.app_name,
+        new.colors.dark.app_name
+    );
+    changed!(
+        "colors.dark.win_title",
+        old.colors.dark.win_title,
+        new.colors.dark.win_title
+    );
+    changed!(
+        "colors.dark.icon_inner_bg",
+        old.colors.dark.icon_inner_bg,
+        new.colors.dark.icon_inner_bg
+    );
+    changed!(
+        "colors.dark.icon_text",
+        old.colors.dark.icon_text,
+        new.colors.dark.icon_text
+    );
+    changed!(
+        "colors.dark.card_bg_sel",
+        old.colors.dark.card_bg_sel,
+        new.colors.dark.card_bg_sel
+    );
+    changed!(
+        "colors.dark.card_border_sel",
+        old.colors.dark.card_border_sel,
+        new.colors.dark.card_border_sel
+    );
+    changed!(
+        "colors.light.status_bar_text",
+        old.colors.light.status_bar_text,
+        new.colors.light.status_bar_text
+    );
+    changed!(
+        "colors.light.app_name",
+        old.colors.light.app_name,
+        new.colors.light.app_name
+    );
+    changed!(
+        "colors.light.win_title",
+        old.colors.light.win_title,
+        new.colors.light.win_title
+    );
+    changed!(
+        "colors.light.icon_inner_bg",
+        old.colors.light.icon_inner_bg,
+        new.colors.light.icon_inner_bg
+    );
+    changed!(
+        "colors.light.icon_text",
+        old.colors.light.icon_text,
+        new.colors.light.icon_text
+    );
+    changed!(
+        "colors.light.card_bg_sel",
+        old.colors.light.card_bg_sel,
+        new.colors.light.card_bg_sel
+    );
+    changed!(
+        "colors.light.card_border_sel",
+        old.colors.light.card_border_sel,
+        new.colors.light.card_border_sel
+    );
+
+    changed!(
+        "fonts.status_bar_size",
+        old.fonts.status_bar_size,
+        new.fonts.status_bar_size
+    );
+    changed!(
+        "fonts.status_bar_weight",
+        old.fonts.status_bar_weight,
+        new.fonts.status_bar_weight
+    );
+    changed!(
+        "fonts.title_size",
+        old.fonts.title_size,
+        new.fonts.title_size
+    );
+    changed!(
+        "fonts.title_weight",
+        old.fonts.title_weight,
+        new.fonts.title_weight
+    );
+    changed!(
+        "fonts.app_name_size",
+        old.fonts.app_name_size,
+        new.fonts.app_name_size
+    );
+    changed!(
+        "fonts.app_name_weight",
+        old.fonts.app_name_weight,
+        new.fonts.app_name_weight
+    );
+
+    changed!(
+        "keyboard.modifier",
+        old.keyboard.modifier,
+        new.keyboard.modifier
+    );
+    changed!("i18n.locale", old.i18n.locale, new.i18n.locale);
+    changed!("windows.enabled", old.windows.enabled, new.windows.enabled);
+    changed!(
+        "windows.show_minimized",
+        old.windows.show_minimized,
+        new.windows.show_minimized
+    );
+    changed!(
+        "windows.overlay_position",
+        old.windows.overlay_position,
+        new.windows.overlay_position
+    );
+    changed!("logging.level", old.logging.level, new.logging.level);
+    changed!(
+        "logging.file_path",
+        old.logging.file_path,
+        new.logging.file_path
+    );
+    changed!(
+        "startup.launch_at_login",
+        old.startup.launch_at_login,
+        new.startup.launch_at_login
+    );
+
+    changed!(
+        "clipboard.enabled",
+        old.clipboard.enabled,
+        new.clipboard.enabled
+    );
+    changed!(
+        "clipboard.max_entries",
+        old.clipboard.max_entries,
+        new.clipboard.max_entries
+    );
+    changed!(
+        "clipboard.max_highlight_bytes",
+        old.clipboard.max_highlight_bytes,
+        new.clipboard.max_highlight_bytes
+    );
+    changed!(
+        "clipboard.max_highlight_lines",
+        old.clipboard.max_highlight_lines,
+        new.clipboard.max_highlight_lines
+    );
+    changed!(
+        "clipboard.show_source_app",
+        old.clipboard.show_source_app,
+        new.clipboard.show_source_app
+    );
+    changed!(
+        "clipboard.persist",
+        old.clipboard.persist,
+        new.clipboard.persist
+    );
+    changed!(
+        "clipboard.move_used_to_top",
+        old.clipboard.move_used_to_top,
+        new.clipboard.move_used_to_top
+    );
+    changed!(
+        "clipboard.auto_expire_days",
+        old.clipboard.auto_expire_days,
+        new.clipboard.auto_expire_days
+    );
+    changed!(
+        "clipboard.picker_position",
+        old.clipboard.picker_position,
+        new.clipboard.picker_position
+    );
+    changed!(
+        "clipboard.pin_follow_selection",
+        old.clipboard.pin_follow_selection,
+        new.clipboard.pin_follow_selection
+    );
+
+    changed!("mouse.enabled", old.mouse.enabled, new.mouse.enabled);
+
+    // 鼠标配置档包含嵌套映射,用 Debug 快照比较并记录完整旧/新值。
+    // Mouse profiles contain nested mappings, so compare and log complete Debug snapshots.
+    let old_profiles = format!("{:?}", old.mouse.profiles);
+    let new_profiles = format!("{:?}", new.mouse.profiles);
+    if old_profiles != new_profiles {
+        log_info!(
+            "[settings] config changed: mouse.profiles: {:?} -> {:?}",
+            old_profiles,
+            new_profiles
+        );
+    }
+}
+
 pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     // 防御:点 OK 时若仍在录制,先收尾(复位 RECORDING);关闭编辑面板。
     // Defensive: wrap up any in-progress recording on OK; close the edit panel.
@@ -575,10 +831,8 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
 
     // 检查是否需要重启:对比新旧 mouse.enabled。按钮标题已在 switch toggle 时实时更新。
     // Check if restart needed: button title already updated in real time when the switch toggled.
-    let needs_restart = {
-        let old_cfg = CONFIG.read().unwrap();
-        old_cfg.mouse.enabled != cfg.mouse.enabled
-    };
+    let old_cfg = CONFIG.read().unwrap().clone();
+    let needs_restart = old_cfg.mouse.enabled != cfg.mouse.enabled;
 
     // 窗口切换开关被关闭:收起可能正开着的浮窗并复位状态,避免残留。
     // The switcher switch was turned off: dismiss a possibly-open overlay and reset
@@ -623,6 +877,8 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
     // start()'s load, dedup makes the double-merge harmless); OFF -> delete the history
     // file (the in-memory history stays until this session ends).
     crate::clipboard::apply_persist_toggle(cfg.clipboard.persist);
+    log_config_changes(&old_cfg, &cfg);
+    log_info!("[settings] configuration saved and applied from settings window");
 }
 
 /// 根据 enable_mouse switch 状态,冻结或解冻其下方的所有鼠标控件。
@@ -2236,13 +2492,6 @@ fn load_settings_from(cfg: &Config) {
             ui.clipboard_auto_expire_days,
             cfg.clipboard.auto_expire_days.to_string(),
         );
-        // picker_position:下拉框 index 0 = 跟随鼠标(mouse), 1 = 主屏幕居中(main)。
-        // picker_position: popup index 0 = follow mouse (mouse), 1 = centered (main).
-        let pos_idx = match cfg.clipboard.picker_position.as_str() {
-            "main" => 1,
-            _ => 0, // "mouse" (default)
-        };
-        let _: () = msg_send![ui.clipboard_picker_position, selectItemAtIndex: pos_idx as isize];
         // pin_follow_selection:下拉框 index 0 = 跟随置顶, 1 = 保持当前位置。
         // pin_follow_selection: popup index 0 = follow, 1 = keep.
         let pin_idx: isize = if cfg.clipboard.pin_follow_selection {
@@ -2474,14 +2723,6 @@ fn collect_settings_config() -> (Config, Vec<String>) {
                 &[("field", "clipboard.auto_expire_days")],
             )),
         }
-        // picker_position:下拉框 index 0 = 跟随鼠标, 1 = 主屏幕居中。
-        // picker_position: popup index 0 = follow mouse, 1 = centered on the main screen.
-        let pos_idx: isize = msg_send![ui.clipboard_picker_position, indexOfSelectedItem];
-        cfg.clipboard.picker_position = match pos_idx {
-            1 => "main",
-            _ => "mouse", // index 0 or out-of-range
-        }
-        .into();
         // pin_follow_selection:下拉框 index 0 = 跟随置顶, 1 = 保持当前位置。
         // pin_follow_selection: popup index 0 = follow, 1 = keep.
         let pin_idx: isize = msg_send![ui.clipboard_pin_follow, indexOfSelectedItem];
@@ -2780,7 +3021,6 @@ fn create_settings_window() {
             clipboard_max_entries: std::ptr::null_mut(),
             clipboard_auto_expire_days: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
-            clipboard_picker_position: std::ptr::null_mut(),
             clipboard_pin_follow: std::ptr::null_mut(),
             add_mapping_button: std::ptr::null_mut(),
             mapping_enabled: std::ptr::null_mut(),
@@ -3595,24 +3835,6 @@ fn create_settings_window() {
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
         cy -= 8.0 + row_h;
-        // 悬浮窗位置下拉框:项 = [跟随鼠标, 始终显示在主屏幕正中间];默认 index 0(跟随鼠标)。
-        // Picker-position popup: items = [Follow Mouse, Always Center on Main Screen];
-        // default index 0 (follow mouse).
-        let pos_labels = [
-            t("settings.picker_position_follow_mouse"),
-            t("settings.picker_position_main_screen"),
-        ];
-        let pos_label_refs: Vec<&str> = pos_labels.iter().map(|s| s.as_str()).collect();
-        ui.clipboard_picker_position = add_row(
-            clipboard_view,
-            label_x,
-            cy,
-            225.0,
-            row_h,
-            &t("settings.row_clipboard_picker_position"),
-            make_popup(ctrl_x, cy, ctrl_w, row_h, &pos_label_refs, 0),
-        );
-        cy -= 8.0 + row_h;
         // 置顶后选中项位置下拉框:项 = [跟随置顶, 保持当前位置];默认 index 0(跟随置顶),
         // 实际值由 load_settings_from 填充。
         // Pin-selection popup: items = [Follow the Pinned Entry, Keep Current Position];
@@ -3703,7 +3925,7 @@ fn create_settings_window() {
             label_w,
             row_h,
             &t("settings.row_clipboard_auto_expire_days"),
-            make_text_input(ctrl_x, cy, ctrl_w, row_h, "30"),
+            make_text_input(ctrl_x, cy, ctrl_w, row_h, "3"),
         );
         cy -= 8.0 + row_h;
         // 呼出快捷键说明(只读 label)/ shortcut hint (read-only label).

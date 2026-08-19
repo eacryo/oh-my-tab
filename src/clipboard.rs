@@ -20,7 +20,7 @@
 //!   联动删除对应缓存文件。详情浮窗的大图另存 `{hash}.detail`(最长边 ≤1280px,
 //!   首次打开详情时懒生成,内存不常驻),随条目删除/清空/裁剪一并清理。
 //!
-//! History clipboard module (text + images, no persistence).
+//! History clipboard module (text + images, optional persistence).
 //!
 //! Architecture:
 //! - A main-thread NSTimer polls NSPasteboard's changeCount every 0.5s; when it changes,
@@ -49,8 +49,8 @@
 //!   moved source makes the entry unpastable; the content hash collapses a file and its
 //!   Finder duplicate (different paths, identical bytes) into one entry. The row shows the
 //!   thumbnail, and `text` holds the filename (searchable). The cache dir is wiped at
-//!   startup (the history is not persisted, so leftovers are orphans) and files are
-//!   removed in sync with delete/clear-all/trim. A separate `{hash}.detail` preview (longest
+//!   startup when persistence is off; when persistence is on, a reference-based sweep
+//!   removes orphan files. Files are also removed in sync with delete/clear-all/trim. A separate `{hash}.detail` preview (longest
 //!   edge <= 1280px, generated lazily on the first detail open, never held in RAM) feeds the
 //!   detail panel and shares the same deletion lifecycle.
 
@@ -72,6 +72,7 @@ use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -1244,12 +1245,11 @@ fn max_entries() -> usize {
 
 // ========== 图片磁盘缓存 / image disk cache ==========
 
-/// 图片字节缓存目录:原始格式字节全部落盘,内存只留降采样预览(历史不持久化,
-/// 启动时清空整个目录,见 start())。测试构建使用专用目录,绝不触碰真实缓存。
-/// The image-byte cache directory: original-format bytes live on disk, memory only keeps
-/// the downsampled preview (the history itself is not persisted, so the whole dir is
-/// wiped at startup, see start()). Test builds use a dedicated directory, never the real
-/// cache.
+/// 图片字节缓存目录:原始格式字节全部落盘,内存只留降采样预览;持久化关闭时启动清空,
+/// 持久化开启时按历史引用扫描孤儿文件。测试构建使用专用目录,绝不触碰真实缓存。
+/// The image-byte cache directory: original-format bytes live on disk and memory only keeps
+/// the downsampled preview; persistence-off startup wipes it, while persistence-on startup
+/// sweeps unreferenced files. Test builds use a dedicated directory, never the real cache.
 fn clip_image_cache_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     // 冒烟模式(--smoke-clipboard)走专用目录:真实二进制运行时 cfg!(test) 不生效,
@@ -1441,6 +1441,63 @@ fn clear_clip_image_cache() {
             let _ = std::fs::remove_file(e.path());
         }
     }
+}
+
+/// 按当前历史条目清理图片缓存中的孤儿文件。
+/// 数据条目需要无后缀原图 + preview/detail;文件引用条目只需要 preview/detail。
+/// Sweep orphan image-cache files against the current history. DATA entries may keep the
+/// extensionless original plus preview/detail; FILE references may keep preview/detail only.
+fn sweep_clip_image_cache(history: &[ClipEntry]) -> usize {
+    let mut all_hashes = HashSet::new();
+    let mut data_hashes = HashSet::new();
+    for entry in history {
+        let Some(img) = &entry.image else {
+            continue;
+        };
+        if img.hash == 0 {
+            continue;
+        }
+        all_hashes.insert(img.hash);
+        if img.source_path.is_none() {
+            data_hashes.insert(img.hash);
+        }
+    }
+
+    let dir = clip_image_cache_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let (stem, is_raw) = if let Some(stem) = name.strip_suffix(".preview") {
+            (stem, false)
+        } else if let Some(stem) = name.strip_suffix(".detail") {
+            (stem, false)
+        } else {
+            (name, true)
+        };
+        let keep = u64::from_str_radix(stem, 16).ok().is_some_and(|hash| {
+            all_hashes.contains(&hash) && (!is_raw || data_hashes.contains(&hash))
+        });
+        if !keep && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 按当前内存历史清理缓存,用于启动和持久化热切换路径。
+/// Sweep against the in-memory history for startup and persistence-toggle paths.
+fn sweep_current_clip_image_cache() -> usize {
+    let history = CLIP_HISTORY.lock().unwrap();
+    sweep_clip_image_cache(&history)
 }
 
 // ========== 历史持久化 / history persistence ==========
@@ -1637,6 +1694,10 @@ fn load_history() {
     }
     let path = history_file_path();
     let Ok(text) = std::fs::read_to_string(&path) else {
+        let removed = sweep_current_clip_image_cache();
+        if removed > 0 {
+            log_debug!("[clip] swept {} orphan image cache files", removed);
+        }
         return; // 文件不存在 = 首次使用 / a missing file = first run
     };
     let Some(entries) = parse_history(&text) else {
@@ -1644,6 +1705,10 @@ fn load_history() {
             "Clipboard history load failed (corrupt/version mismatch, starting empty): {}",
             path.display()
         );
+        let removed = sweep_current_clip_image_cache();
+        if removed > 0 {
+            log_debug!("[clip] swept {} orphan image cache files", removed);
+        }
         return;
     };
     let mut hist = CLIP_HISTORY.lock().unwrap();
@@ -1718,8 +1783,12 @@ fn load_history() {
         }
         hist.truncate(max);
     }
+    let swept = sweep_clip_image_cache(&hist);
     let total = hist.len();
     drop(hist);
+    if swept > 0 {
+        log_debug!("[clip] swept {} orphan image cache files", swept);
+    }
     log_info!("Clipboard history loaded ({} entries).", total);
     // 加载后立刻回写:合并/裁剪/补预览的结果落盘,保证磁盘与内存一致。
     // Rewrite right after loading so the merge/trim/preview-fill result is on disk,
@@ -2485,6 +2554,12 @@ pub fn start() {
         {
             let mut hist = CLIP_HISTORY.lock().unwrap();
             expire_entries(&mut hist, now_secs(), ttl_secs());
+        }
+        if persist_enabled() {
+            let removed = sweep_current_clip_image_cache();
+            if removed > 0 {
+                log_debug!("[clip] swept {} orphan image cache files", removed);
+            }
         }
         // 再记录当前剪贴板,否则首次呼出历史为空。
         // Then record the current pasteboard, or the first summon would show an empty list.
@@ -7392,6 +7467,54 @@ mod tests {
         assert_eq!(h.len(), 2);
         assert!(h.iter().all(|e| e.image.is_none()));
         assert_eq!(cache_read_image(img.hash), None);
+    }
+
+    #[test]
+    fn sweep_clip_image_cache_removes_orphans_and_respects_file_refs() {
+        use super::{
+            cache_read_detail_preview, cache_read_image, cache_read_preview,
+            cache_write_detail_preview, cache_write_image, cache_write_preview,
+            clear_clip_image_cache, clip_image_detail_path, clip_image_path,
+            clip_image_preview_path, sweep_clip_image_cache,
+        };
+        clear_clip_image_cache();
+        let keep = image(b"sweep-keep-data");
+        let orphan = image(b"sweep-orphan-data");
+        let file_bytes = b"sweep-file-reference";
+        let file_img = image_from_file(file_bytes, "/tmp/sweep-file.png");
+        let _ = cache_write_preview(keep.hash, b"keep-preview");
+        let _ = cache_write_detail_preview(keep.hash, b"keep-detail");
+        let _ = cache_write_preview(orphan.hash, b"orphan-preview");
+        let _ = cache_write_detail_preview(orphan.hash, b"orphan-detail");
+        let _ = cache_write_image(file_img.hash, file_bytes);
+        let _ = cache_write_preview(file_img.hash, b"file-preview");
+        let _ = cache_write_detail_preview(file_img.hash, b"file-detail");
+        let history = vec![
+            entry_image(b"sweep-keep-data"),
+            ClipEntry {
+                text: "sweep-file.png".to_string(),
+                image: Some(file_img.clone()),
+                pinned: false,
+                source_app: String::new(),
+                source_key: String::new(),
+                copied_at: None,
+            },
+        ];
+
+        assert!(sweep_clip_image_cache(&history) >= 4);
+        assert!(cache_read_image(keep.hash).is_some());
+        assert!(cache_read_preview(keep.hash).is_some());
+        assert!(cache_read_detail_preview(keep.hash).is_some());
+        assert!(cache_read_image(orphan.hash).is_none());
+        assert!(cache_read_preview(orphan.hash).is_none());
+        assert!(cache_read_detail_preview(orphan.hash).is_none());
+        assert!(cache_read_image(file_img.hash).is_none());
+        assert!(cache_read_preview(file_img.hash).is_some());
+        assert!(cache_read_detail_preview(file_img.hash).is_some());
+        assert!(!clip_image_path(file_img.hash).exists());
+        assert!(clip_image_preview_path(file_img.hash).exists());
+        assert!(clip_image_detail_path(file_img.hash).exists());
+        clear_clip_image_cache();
     }
 
     #[test]

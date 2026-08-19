@@ -166,13 +166,13 @@ pub struct ClipboardSection {
     // When off, pasting does not reorder the history (like Windows Win+V). Default true.
     pub move_used_to_top: bool,
     // 自动过期天数:非置顶条目超过 N 天自动从历史(内存与持久化)清除,置顶条目
-    // 永不过期。0 = 关闭。默认 30 天。
+    // 永不过期。0 = 关闭。默认 3 天。
     // Auto-expire days: unpinned entries older than N days are removed from the history
-    // (memory AND persistence); pinned entries never expire. 0 = off. Default 30 days.
+    // (memory AND persistence); pinned entries never expire. 0 = off. Default 3 days.
     pub auto_expire_days: u32,
-    // 剪贴板浮窗位置:"mouse" = 跟随鼠标,"main" = 主屏幕居中。默认跟随鼠标。
+    // 剪贴板浮窗位置:"mouse" = 跟随鼠标,"main" = 主屏幕居中。默认主屏幕居中。
     // The clipboard picker position: "mouse" = follows the cursor, "main" = centered on
-    // the main screen. Defaults to following the mouse.
+    // the main screen. Defaults to the center of the main screen.
     pub picker_position: String,
     // 置顶后选中项位置:true = 跟随置顶(选中移到被置顶/取消置顶条目的新位置),false
     // = 保持当前位置(指向原下一条,便于批量置顶)。默认跟随。
@@ -192,8 +192,8 @@ impl Default for ClipboardSection {
             show_source_app: false,
             persist: false,
             move_used_to_top: true,
-            auto_expire_days: 30,
-            picker_position: "mouse".to_string(),
+            auto_expire_days: 3,
+            picker_position: "main".to_string(),
             pin_follow_selection: true,
         }
     }
@@ -1349,7 +1349,7 @@ mod tests {
         // 悬浮窗位置只允许 mouse / main。
         // The picker position only accepts mouse / main.
         let mut cfg = Config::default();
-        assert_eq!(cfg.clipboard.picker_position, "mouse");
+        assert_eq!(cfg.clipboard.picker_position, "main");
         cfg.clipboard.picker_position = "top-right".into();
         assert_err_count(&cfg, 1);
         cfg.clipboard.picker_position = "mouse".into();
@@ -1363,7 +1363,7 @@ mod tests {
         // 自动过期天数:0(关闭)与 365 合法,366 非法。
         // Auto-expire days: 0 (off) and 365 are valid, 366 is rejected.
         let mut cfg = Config::default();
-        assert_eq!(cfg.clipboard.auto_expire_days, 30, "default is 30 days");
+        assert_eq!(cfg.clipboard.auto_expire_days, 3, "default is 3 days");
         assert_err_count(&cfg, 0);
         cfg.clipboard.auto_expire_days = 0;
         assert_err_count(&cfg, 0);
