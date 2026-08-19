@@ -5519,6 +5519,12 @@ extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     if selection_after_pin(new_h_idx) {
         unsafe { rebuild_rows() };
     }
+    // 置顶会改变条目在列表中的位置;详情面板按选中行重新定位并刷新内容。
+    // Pinning changes the row position; reposition and refresh the detail panel from the
+    // current selection so it follows the reordered row.
+    if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+        unsafe { show_detail_for_sel() };
+    }
     let msg = if now_pinned {
         t("clipboard.toast_pinned")
     } else {
