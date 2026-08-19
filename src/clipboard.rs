@@ -3183,7 +3183,26 @@ fn selected_row_screen_y(picker: NSRect) -> Option<f64> {
         return None;
     }
     let row_idx = sel.min(pitches.len() - 1);
-    let row_flipped = header_strip_h() + row_top(row_idx, &pitches);
+    // 分组标题属于行距,但不属于记录内容;详情应对齐内容块而不是分组标题顶部。
+    // The group header is part of the row pitch but not the record content; align the detail
+    // with the content block instead of the top of the group header.
+    let group_header_h = {
+        let filtered = FILTERED.lock().unwrap().clone();
+        let history = CLIP_HISTORY.lock().unwrap();
+        let &history_idx = filtered.get(row_idx)?;
+        let entry = history.get(history_idx)?;
+        let current_group = day_group(entry.copied_at);
+        let previous_group = filtered[..row_idx]
+            .iter()
+            .rev()
+            .find_map(|&idx| history.get(idx).map(|e| day_group(e.copied_at)));
+        if previous_group != Some(current_group) {
+            GROUP_H
+        } else {
+            0.0
+        }
+    };
+    let row_flipped = header_strip_h() + row_top(row_idx, &pitches) + group_header_h;
     drop(pitches);
     // 滚动偏移:clip view 的 bounds.origin.y(flipped 坐标)。走 SCROLL_VIEW 而非
     // PICKER_CONTAINER:键盘驱动的 scrollRectToVisible 期间容器锁仍被 if-let 临时
@@ -3938,7 +3957,10 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64, k
     if is_code {
         apply_code_paragraph_styles(storage, &display_text);
     }
-    let _: () = msg_send![tv, setTextContainerInset: NSSize::new(0.0, 0.0)];
+    // 详情窗口外框对齐条目内容块顶部,正文再补上列表的行内顶部留白,避免整体窗口下移。
+    // The detail frame aligns with the row content block; add the list's top padding inside
+    // the text view so the whole detail window does not shift downward.
+    let _: () = msg_send![tv, setTextContainerInset: NSSize::new(0.0, ROW_PAD_TOP)];
     let text_container: *mut AnyObject = msg_send![tv, textContainer];
     if is_code {
         // 去掉 NSTextView 默认的行内留白,让代码内容边界由 DETAIL_PAD 统一控制。
