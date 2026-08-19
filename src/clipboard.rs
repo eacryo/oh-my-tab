@@ -4,7 +4,7 @@
 //! - 主线程 NSTimer 每 0.5s 轮询 NSPasteboard 的 changeCount,变化时读文本/图片入历史
 //!   (连续复制相同内容去重,上限裁剪)。
 //! - Option+V 由 event_monitor 的 tap 检测,经 bridge 转主线程调用 on_clipboard_toggle,
-//!   显示/关闭浮窗;↑↓/←/→/Enter/Esc/点击导航:↑↓ 选择,← 置顶,
+//!   显示/关闭浮窗;Tab 循环切换分类,↑↓/←/→/Enter/Esc/点击导航:↑↓ 选择,← 置顶,
 //!   → 展开详情浮窗(完整文本 / 图片大图,内容跟随 ↑↓ 浏览实时刷新;打开时再按 →
 //!   关闭)。Enter 或点击 = 写回剪贴板 + 合成 Cmd+V 自动粘贴(行为同 Windows 的
 //!   Win+V)。详情浮窗是被动展示面板(永不成为 key,键盘焦点留在列表),点击面板任意
@@ -26,10 +26,10 @@
 //! - A main-thread NSTimer polls NSPasteboard's changeCount every 0.5s; when it changes,
 //!   the text/image is read into the history (duplicates are skipped, overflow trimmed).
 //! - Option+V is detected by the event_monitor tap and marshalled to the main thread via the
-//!   bridge (on_clipboard_toggle), showing/hiding the picker. Arrow keys / Enter / Esc /
-//!   clicks navigate: up/down select, left pins (also while the detail panel is open), right
-//!   expands a detail panel (full text / large image; it follows ↑/↓ browsing live; pressing
-//!   → again closes it), Enter or a click = write back to the
+//!   bridge (on_clipboard_toggle), showing/hiding the picker. Tab cycles filters; arrow keys
+//!   / Enter / Esc / clicks navigate: up/down select, left pins (also while the detail panel
+//!   is open), right expands a detail panel (full text / large image; it follows ↑/↓ browsing
+//!   live; pressing → again closes it), Enter or a click = write back to the
 //!   pasteboard + synthesize Cmd+V for an automatic paste (mirrors Windows' Win+V). The
 //!   detail panel is a passive display (never becomes key, so keyboard focus stays in the
 //!   list); a click anywhere on it or Esc closes it, and it hides together with the picker.
@@ -1200,6 +1200,18 @@ enum ClipFilter {
 
 /// 当前生效的筛选项 / the active filter.
 static CLIP_FILTER: Mutex<ClipFilter> = Mutex::new(ClipFilter::All);
+
+/// Tab 键的分类循环顺序:全部 → 文本 → 图片 → 链接 → 代码 → 全部。
+/// The Tab filter cycle: All -> Text -> Image -> Link -> Code -> All.
+fn next_clip_filter(filter: ClipFilter) -> ClipFilter {
+    match filter {
+        ClipFilter::All => ClipFilter::Text,
+        ClipFilter::Text => ClipFilter::Image,
+        ClipFilter::Image => ClipFilter::Link,
+        ClipFilter::Link => ClipFilter::Code,
+        ClipFilter::Code => ClipFilter::All,
+    }
+}
 
 /// 条目是否命中筛选项 / whether an entry matches the filter.
 fn matches_filter(e: &ClipEntry, f: ClipFilter) -> bool {
@@ -4482,9 +4494,9 @@ unsafe fn ensure_picker_window() {
     update_filter_pill_style();
 
     // 清空历史(新设计稿 .clear-history):筛选行右侧(间距 auto),透明、10px、28% 黑,
-    // 悬停变红(190,45,40,.78,无底)。
+    // 悬停变红并显示带小圆角的浅红底。
     // Clear history (the new mockup's .clear-history): at the filters row's right (auto
-    // margin), transparent, 10px / 28% black, red on hover (no fill).
+    // margin), transparent, 10px / 28% black; hover turns red with a subtly rounded red fill.
     let clear_w = localized_string_width(&t("clipboard.clear_all"), 10.0) + 8.0;
     let clear_x = PICKER_W - SEARCH_PAD_X - clear_w;
     let clear_btn: *mut AnyObject = msg_send![hover_button_class(), alloc];
@@ -4496,6 +4508,12 @@ unsafe fn ensure_picker_window() {
         )
     ];
     let _: () = msg_send![clear_btn, setBordered: false];
+    // 悬停底色绘制在 CALayer 上;设置小圆角以免矩形底色露出直角。
+    // The hover fill is drawn on the CALayer; use a small radius so its rectangle has no
+    // exposed sharp corners.
+    let _: () = msg_send![clear_btn, setWantsLayer: true];
+    let clear_layer: *mut AnyObject = msg_send![clear_btn, layer];
+    let _: () = msg_send![clear_layer, setCornerRadius: 5.0f64];
     let cfont: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
     let _: () = msg_send![clear_btn, setFont: cfont];
     let ccolor: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.28f64];
@@ -5768,10 +5786,10 @@ fn clamp_selection(sel: usize, len: usize) -> usize {
     sel.min(len - 1)
 }
 
-/// 键盘导航:↑/↓ 选择,← 置顶,→ 展开详情(详情打开时 → 关闭详情),
+/// 键盘导航:Tab 循环分类,↑/↓ 选择,← 置顶,→ 展开详情(详情打开时 → 关闭详情),
 /// Enter 粘贴,Esc 关闭。
-/// Keyboard navigation: up/down to select, left pins, right expands details (with the
-/// detail open, right closes it), Enter pastes, Esc closes.
+/// Keyboard navigation: Tab cycles filters; up/down select, left pins, right expands
+/// details (with the detail open, right closes it), Enter pastes, Esc closes.
 extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let keycode: u16 = msg_send![event as *mut AnyObject, keyCode];
@@ -5811,6 +5829,18 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
         let display_len = FILTERED.lock().unwrap().len();
         let mut sel = PICKER_SELECTION.lock().unwrap();
         match keycode {
+            48 => {
+                // Tab(48):按固定顺序循环筛选分类;详情若已展开则先关闭,避免筛选后
+                // 详情遗留一条不属于当前列表的陈旧内容。
+                // Tab(48): cycle filters in the fixed order. Close an open detail first so
+                // filtering cannot leave stale content that no longer belongs to the list.
+                drop(sel);
+                let next = {
+                    let active = CLIP_FILTER.lock().unwrap();
+                    next_clip_filter(*active)
+                };
+                apply_clip_filter(next);
+            }
             123 => {
                 // ←(123):无论详情是否打开,都切换当前选中条目的置顶状态。
                 // Left: toggle the selected entry's pinned state whether or not the detail
@@ -6604,11 +6634,11 @@ fn refresh_footer_count(total: usize) {
     }
 }
 
-/// 构建底部栏(设计稿 .footer):顶部分隔线 + 条目数 + 快捷键图例(kbd 键帽)+ 清除全部。
+/// 构建底部栏(设计稿 .footer):顶部分隔线 + 条目数 + 快捷键图例(kbd 键帽)。
 /// 非 flipped 坐标系,y=0 是底部,43pt 高,固定在窗口底边。
 /// Build the footer (the mockup's .footer): a top hairline + the entry count + shortcut
-/// legends (kbd keycaps) + clear all. Non-flipped coords (y=0 at the bottom), 43pt tall,
-/// pinned to the window's bottom edge.
+/// legends (kbd keycaps). Non-flipped coords (y=0 at the bottom), 43pt tall, pinned to the
+/// window's bottom edge.
 unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     // 顶部分隔线 / the top hairline.
     let line: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -6647,21 +6677,25 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     release_obj(count_label);
     *FOOTER_COUNT.lock().unwrap() = Some(ObjPtr(count_label));
 
-    // 快捷键图例(kbd 键帽 + 说明),从右往左排:↵ 输入选中条目 / ⌫ 删除 / → 详情 / ← 置顶。
-    // The shortcut legends (kbd keycap + label), laid out right-to-left: ↵ paste /
-    // ⌫ delete / → details / ← pin.
-    let kbd_keys = ["↵", "⌫", "→", "←"];
+    // 快捷键图例(kbd 键帽 + 说明),从右往左排;Tab 分类切换位于这组提示最左侧。
+    // The shortcut legends (kbd keycap + label) are laid out right-to-left; the Tab filter
+    // cycle sits at the left edge of this hint group.
+    let kbd_keys = ["↵", "⌫", "→", "←", "Tab"];
     let kbd_labels = [
         t("clipboard.kbd_paste"),
         t("clipboard.kbd_delete"),
         t("clipboard.kbd_detail"),
         t("clipboard.kbd_pin"),
+        t("clipboard.kbd_filter"),
     ];
-    let kbd_w = 21.0;
+    let kbd_min_w = 21.0;
     let kbd_h = 19.0;
     let mut x = w - FOOTER_PAD_X;
     for (i, key) in kbd_keys.iter().enumerate() {
         let label_w = localized_string_width(&kbd_labels[i], 10.0);
+        // Tab 文字键帽比方向键图标宽;其余维持原 21pt 尺寸。
+        // The text keycap for Tab is wider than arrow glyphs; the rest retain 21pt.
+        let kbd_w = if *key == "Tab" { 28.0 } else { kbd_min_w };
         let group_w = kbd_w + 5.0 + label_w;
         x -= group_w;
         // 键帽 / the keycap.
@@ -6722,24 +6756,28 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _: () = msg_send![parent, addSubview: cap];
         release_obj(cap);
         // 说明文字 / the legend label.
-        // 说明文字帧加宽 6pt + 增高到 16pt:实测按测量宽度刚好等于文字宽时,渲染
-        // 内边距会吃掉一点导致尾部截断("输入选中条目" 等),留余量防截断。
-        // The legend frame gets +6pt width and a taller 16pt height: with the measured
-        // width at exactly the text width, the cell's inner padding clipped the tail;
-        // the slack keeps long labels like "输入选中条目" fully visible.
+        // 说明文字宽度加 6pt,避免 cell 内边距吃掉尾字;高度必须用字体真实行高并居中。
+        // 原来固定 16pt 的 NSTextField 会从顶部绘字,相对已经按行高居中的键帽文字
+        // 上浮约一点。
+        // Give the hint 6pt width slack so cell insets do not clip its tail; its height uses
+        // the font's real line height and is centered. The old fixed 16pt NSTextField drew
+        // from its top, making the hint sit slightly above the keycap glyph.
+        let hf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+        let hint_asc: f64 = msg_send![hf, ascender];
+        let hint_desc: f64 = msg_send![hf, descender];
+        let hint_line_h = (hint_asc - hint_desc + 1.0).max(11.0);
         let hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let hint: *mut AnyObject = msg_send![
             hint,
             initWithFrame: NSRect::new(
-                NSPoint::new(x + kbd_w + 5.0, (FOOTER_H - 16.0) / 2.0),
-                NSSize::new(label_w + 6.0, 16.0)
+                NSPoint::new(x + kbd_w + 5.0, (FOOTER_H - hint_line_h) / 2.0),
+                NSSize::new(label_w + 6.0, hint_line_h)
             )
         ];
         let _: () = msg_send![hint, setBezeled: false];
         let _: () = msg_send![hint, setDrawsBackground: false];
         let _: () = msg_send![hint, setEditable: false];
         let _: () = msg_send![hint, setSelectable: false];
-        let hf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
         let _: () = msg_send![hint, setFont: hf];
         let hc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
         let _: () = msg_send![hint, setTextColor: hc];
@@ -6752,6 +6790,18 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         x -= FOOTER_GROUP_GAP;
         let _ = i;
     }
+}
+
+/// 应用新的筛选项并重建列表。展开的详情先关闭,不让它显示筛选结果之外的旧条目。
+/// Apply a new filter and rebuild the list. An open detail closes first so it never displays
+/// a stale entry outside the filtered result.
+fn apply_clip_filter(filter: ClipFilter) {
+    if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+        hide_detail();
+    }
+    *CLIP_FILTER.lock().unwrap() = filter;
+    update_filter_pill_style();
+    unsafe { rebuild_rows() };
 }
 
 /// 筛选 pill 点击回调:切换筛选项并重建列表(选中索引越界由 rebuild_rows 自愈)。
@@ -6767,9 +6817,7 @@ extern "C" fn filter_pill_clicked(_self: *mut c_void, _cmd: Sel, sender: *mut c_
         4 => ClipFilter::Code,
         _ => return,
     };
-    *CLIP_FILTER.lock().unwrap() = f;
-    update_filter_pill_style();
-    unsafe { rebuild_rows() };
+    apply_clip_filter(f);
 }
 
 /// 给行内按钮(标题栏/正文)挂悬停跟踪区:悬停 = 选中该行(与窗口切换浮窗一致)。
@@ -8263,6 +8311,18 @@ mod tests {
             filtered_indices(&h, "hello", ClipFilter::Link),
             Vec::<usize>::new()
         );
+    }
+
+    #[test]
+    fn tab_filter_cycle_visits_every_category_and_wraps() {
+        use super::{next_clip_filter, ClipFilter};
+        // Tab 固定按 UI 从左到右的分类顺序循环,末项回到全部。
+        // Tab cycles in the UI's left-to-right filter order and wraps from the last item.
+        assert_eq!(next_clip_filter(ClipFilter::All), ClipFilter::Text);
+        assert_eq!(next_clip_filter(ClipFilter::Text), ClipFilter::Image);
+        assert_eq!(next_clip_filter(ClipFilter::Image), ClipFilter::Link);
+        assert_eq!(next_clip_filter(ClipFilter::Link), ClipFilter::Code);
+        assert_eq!(next_clip_filter(ClipFilter::Code), ClipFilter::All);
     }
 
     #[test]
