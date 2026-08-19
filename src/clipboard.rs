@@ -55,8 +55,8 @@
 //!   detail panel and shares the same deletion lifecycle.
 
 use crate::clipboard_highlight::{
-    apply_code_paragraph_styles, apply_highlights, apply_prepared_code_highlights, classify_text,
-    prepare_code_display, DisplaySourceMap, TextKind,
+    apply_code_paragraph_styles, apply_highlights, apply_prepared_code_highlights,
+    apply_visible_space_markers, classify_text, prepare_code_display, DisplaySourceMap, TextKind,
 };
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -3792,6 +3792,7 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64, k
     let storage: *mut AnyObject = msg_send![tv, textStorage];
     if let Some(code) = &prepared {
         apply_prepared_code_highlights(storage, code);
+        apply_visible_space_markers(storage, &code.text);
     } else {
         apply_highlights(storage, &display_text, kind);
     }
@@ -5811,6 +5812,11 @@ extern "C" fn picker_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> boo
 /// 行标题(attributed):选中 = 白字粗体,未选 = labelColor。
 /// Row title (attributed): selected = white bold, unselected = labelColor.
 unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObject {
+    let prepared_code = (kind == TextKind::Code).then(|| prepare_code_display(content, usize::MAX));
+    let display_content = prepared_code
+        .as_ref()
+        .map(|code| code.text.as_str())
+        .unwrap_or(content);
     let pstyle: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
     let pstyle: *mut AnyObject = msg_send![pstyle, init];
     let _: () = msg_send![pstyle, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
@@ -5844,12 +5850,17 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
     CFRelease(color_key as *const c_void);
     CFRelease(pstyle_key as *const c_void);
     release_obj(pstyle);
-    let ns = make_nsstring(content);
+    let ns = make_nsstring(display_content);
     let attr: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
     let attr: *mut AnyObject = msg_send![attr, initWithString: ns, attributes: attrs];
     CFRelease(ns as *const c_void);
     release_obj(attrs);
-    apply_highlights(attr, content, kind);
+    if let Some(code) = &prepared_code {
+        apply_prepared_code_highlights(attr, code);
+        apply_visible_space_markers(attr, &code.text);
+    } else {
+        apply_highlights(attr, display_content, kind);
+    }
     attr
 }
 
@@ -8456,6 +8467,7 @@ mod tests {
         let source =
             "const result = veryLongObjectName.veryLongMethodName(firstArgument, secondArgument);";
         let formatted = format_code_for_display(source, 32);
+        assert!(formatted.text.contains('·'));
         // 方法名保持完整,断点落在调用括号/方法链等安全位置,而不是标识符中间。
         // The method name stays intact; breaks land at call/method-chain boundaries, never in
         // the middle of an identifier.

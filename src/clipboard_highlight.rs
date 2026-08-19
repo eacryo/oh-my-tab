@@ -1291,6 +1291,12 @@ pub(crate) fn format_code_for_display(source: &str, max_columns: usize) -> Forma
             break;
         }
     }
+    // 只改变显示文本;中点和普通 ASCII 空格都是一个 UTF-16 单元,因此原文映射无需改变。
+    // Change only the display text; a middle dot and an ASCII space are both one UTF-16 unit,
+    // so the source mapping remains unchanged.
+    if display.contains(' ') {
+        display = display.replace(' ', "·");
+    }
     FormattedCode {
         text: display,
         source_map: DisplaySourceMap {
@@ -1298,6 +1304,39 @@ pub(crate) fn format_code_for_display(source: &str, max_columns: usize) -> Forma
             boundaries,
         },
     }
+}
+
+/// 给代码中的可见空格设置淡色,缩进空格比普通空格稍明显。
+/// Tint visible code spaces; indentation spaces are slightly stronger than ordinary spaces.
+pub(crate) unsafe fn apply_visible_space_markers(storage: *mut AnyObject, text: &str) {
+    let color_key = make_nsstring("NSColor");
+    let mut location = 0;
+    let mut at_line_start = true;
+    for ch in text.chars() {
+        let length = ch.len_utf16();
+        if ch == '·' {
+            let alpha = if at_line_start { 0.20 } else { 0.16 };
+            let color: *mut AnyObject = msg_send![
+                class!(NSColor),
+                colorWithWhite: 0.0f64,
+                alpha: alpha
+            ];
+            let _: () = msg_send![
+                storage,
+                addAttribute: color_key,
+                value: color,
+                range: NSRange::new(location, length)
+            ];
+            location += length;
+            continue;
+        }
+        at_line_start = ch == '\n';
+        if ch != '\n' {
+            at_line_start = false;
+        }
+        location += length;
+    }
+    CFRelease(color_key as *const c_void);
 }
 
 /// 给代码的每个显示段落设置悬挂缩进,即使 NSTextView 仍需二次换行也不会顶到最左侧。
