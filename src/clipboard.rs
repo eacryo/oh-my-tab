@@ -174,6 +174,13 @@ const ROW_PAD_BOT: f64 = 8.0;
 const ROW_PAD_L: f64 = 13.0;
 /// 搜索栏内边距(新设计稿 padding 0 12px)/ the search bar's inner padding (12px).
 const SEARCH_PAD_IN: f64 = 12.0;
+/// 搜索图标预留列宽(设计稿 .search-icon width: 22px)。
+/// The reserved search-icon column (the mockup's `.search-icon { width: 22px }`).
+const SEARCH_ICON_W: f64 = 22.0;
+/// 搜索内容存在时附加的清除叉号尺寸及其与 ⌘F 键帽的间距。
+/// The extra clear × size and its gap from the ⌘F keycap when a query exists.
+const SEARCH_CLEAR_W: f64 = 18.0;
+const SEARCH_CLEAR_GAP: f64 = 6.0;
 /// meta 行内来源应用小图标尺寸(新设计稿 .app-icon 13px)。
 /// The meta line's source-app icon size (the new mockup's .app-icon 13px).
 const META_ICON: f64 = 13.0;
@@ -2879,6 +2886,7 @@ fn clear_search() {
         unsafe {
             let empty_ns = make_nsstring("");
             let _: () = msg_send![f.0, setStringValue: empty_ns];
+            let _: () = msg_send![f.0, setNeedsDisplay: true];
             CFRelease(empty_ns as *const c_void);
         }
     }
@@ -2894,6 +2902,12 @@ extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_v
     let s: *mut AnyObject = unsafe { msg_send![field, stringValue] };
     let q = unsafe { nsstring_to_rust(s) };
     *SEARCH_QUERY.lock().unwrap() = q;
+    // ⌘F 键帽和右侧 × 都由自绘 cell 根据查询状态定位,文本变化时强制重绘。
+    // The hand-drawn ⌘F keycap and right × are positioned from query state, so force a redraw
+    // whenever text changes.
+    unsafe {
+        let _: () = msg_send![field, setNeedsDisplay: true];
+    }
     // 不重置选中:编辑期间(焦点在搜索框)保持无选中;回列表时(↓)由
     // search_field_do_command 重置为首条。
     // Do NOT reset the selection: while editing (focus in the search field) it stays
@@ -2918,46 +2932,82 @@ extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
     }
 }
 
-/// 搜索框底/描边样式助手(层背景走 raw FFI)。`white_bg` = 聚焦时的白色底
-/// (设计稿 .search:focus-within rgba(255,255,255,.72)),其余为黑色系。
-/// The search field's fill/ring helper (raw FFI for the layer background). `white_bg` is
-/// the focus state's white fill (the mockup's rgba(255,255,255,.72)); everything else is
-/// the black family.
-unsafe fn style_search_field(
-    field: *mut AnyObject,
-    white_bg: bool,
-    bg_alpha: f64,
-    ring_alpha: f64,
-) {
+/// 搜索框右侧清除按钮:不走响应链的 cancelOperation:(它可能被字段编辑器截获),直接
+/// 清空字段和过滤条件。与 Esc 不同,空字段点击不会关闭浮窗。
+/// The search field's right clear button: do not route through responder-chain cancelOperation:
+/// (which the field editor may intercept); clear the field and filter directly. Unlike Esc,
+/// clicking an already-empty field never closes the picker.
+extern "C" fn search_clear_button(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    clear_search();
+    unsafe { rebuild_rows() };
+}
+
+/// 搜索框的自绘 × 命中测试:只在有查询时拦截右侧 18pt,其余鼠标事件照常交给父类。
+/// Hit-tests the custom search ×: intercept only the rightmost 18pt while queried and forward
+/// every other mouse event to the superclass normally.
+extern "C" fn search_field_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    unsafe {
+        let field = _self as *mut AnyObject;
+        let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        let point: NSPoint =
+            msg_send![field, convertPoint: location, fromView: std::ptr::null::<AnyObject>()];
+        let bounds: NSRect = msg_send![field, bounds];
+        if search_has_query()
+            && point.x >= bounds.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W
+            && point.x <= bounds.size.width - SEARCH_PAD_IN
+        {
+            search_clear_button(_self, sel!(clearSearch:), event);
+            return;
+        }
+        #[repr(C)]
+        struct ObjcSuper {
+            receiver: *mut c_void,
+            super_class: *mut c_void,
+        }
+        extern "C" {
+            fn objc_msgSendSuper();
+        }
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void) -> ();
+        let super_class = class!(NSSearchField) as *const _ as *mut c_void;
+        let mut sup = ObjcSuper {
+            receiver: _self,
+            super_class,
+        };
+        let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        f(&mut sup, sel!(mouseDown:), event);
+    }
+}
+
+/// 搜索框底/描边样式助手(层背景走 raw FFI)。聚焦只加强内描边,保持稳定的磨砂底色。
+/// The search field's fill/ring helper (raw FFI for the layer background). Focus strengthens
+/// only the inner ring and keeps the frosted fill stable.
+unsafe fn style_search_field(field: *mut AnyObject, bg_alpha: f64, ring_alpha: f64) {
     let layer: *mut AnyObject = msg_send![field, layer];
-    let bg: *mut AnyObject = if white_bg {
-        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: bg_alpha]
-    } else {
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha]
-    };
+    let bg: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha];
     crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
     let ring: *mut AnyObject =
         msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: ring_alpha];
     crate::ffi::layer_set_border(layer, crate::ffi::ns_color_to_cg(ring));
 }
 
-/// 编辑开始(设计稿 .search:focus-within):白底 + 10% 内描边。
-/// Editing begins (.search:focus-within): a white fill + a 10% inner ring.
+/// 编辑开始:保持默认 4.5% 磨砂底,仅使用 10% 内描边指示焦点,避免输入时突变白色。
+/// Editing begins: keep the default 4.5% frosted fill and use only a 10% inner ring for focus,
+/// avoiding a disruptive white transition while typing.
 extern "C" fn search_focus_began(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
     unsafe {
         let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
         if !field.is_null() {
-            style_search_field(field, true, 0.72, 0.10);
+            style_search_field(field, 0.045, 0.10);
         }
     }
 }
 
-/// 编辑结束:还原 4.5% 底。 / Editing ends: restore the 4.5% fill.
+/// 编辑结束:还原默认内描边。 / Editing ends: restore the default inner ring.
 extern "C" fn search_focus_ended(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
     unsafe {
         let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
         if !field.is_null() {
-            style_search_field(field, false, 0.045, 0.035);
+            style_search_field(field, 0.045, 0.035);
         }
     }
 }
@@ -4505,6 +4555,18 @@ unsafe fn ensure_picker_window() {
             search_field_cancel as *mut c_void,
             types_v.as_ptr(),
         );
+        class_addMethod(
+            cls,
+            sel!(clearSearch:),
+            search_clear_button as *mut c_void,
+            types_v.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(mouseDown:),
+            search_field_mouse_down as *mut c_void,
+            types_v.as_ptr(),
+        );
         objc_registerClassPair(cls);
         cls
     };
@@ -4532,7 +4594,39 @@ unsafe fn ensure_picker_window() {
     // The placeholder (magnifier + text) is built separately; per the mockup it is a
     // static string (the entry count moved to the footer).
     rebuild_search_hint();
+    // 保留原生 search button 的布局宽度,但清除它的图像;所有状态统一由 cell 手绘
+    // 初始的 ⌕，否则输入时 AppKit 会换成不同的 stock magnifier。
+    // Keep the native search button's layout width but clear its image; the cell hand-draws the
+    // original ⌕ in every state, preventing AppKit from substituting a different stock magnifier
+    // while typing.
+    let search_button: *mut AnyObject = msg_send![cell, searchButtonCell];
+    if !search_button.is_null() {
+        let blank_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let blank_image: *mut AnyObject =
+            msg_send![blank_image, initWithSize: NSSize::new(22.0, 22.0)];
+        let _: () = msg_send![search_button, setImage: blank_image];
+        release_obj(blank_image);
+    }
     let _: () = msg_send![search, setCell: cell];
+    // NSSearchFieldCell 默认把 × 的 cancelOperation: 发往响应链,字段编辑器可能吞掉
+    // 它。将 cancel cell 直连到字段的 clearSearch:，确保点击一定同步清空过滤条件。
+    // NSSearchFieldCell normally sends its × cancelOperation: through the responder chain,
+    // where the field editor can consume it. Bind it directly to clearSearch: so a click always
+    // clears the matching filter too.
+    let cancel_cell: *mut AnyObject = msg_send![cell, cancelButtonCell];
+    if !cancel_cell.is_null() {
+        // 透明原生 cancel image 仍保留其布局/事件兼容性;可见的 × 由 cell 按 HTML
+        // 尺寸绘制,因此不会和系统符号混用。
+        // Keep the native cancel image transparent for layout/event compatibility; the cell
+        // draws the visible × at the HTML size so no system symbol is mixed in.
+        let blank_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let blank_image: *mut AnyObject =
+            msg_send![blank_image, initWithSize: NSSize::new(SEARCH_CLEAR_W, SEARCH_CLEAR_W)];
+        let _: () = msg_send![cancel_cell, setImage: blank_image];
+        release_obj(blank_image);
+        let _: () = msg_send![cancel_cell, setTarget: search];
+        let _: () = msg_send![cancel_cell, setAction: sel!(clearSearch:)];
+    }
     release_obj(cell);
     // 显式置空 placeholder 属性(双保险,任何读取方都拿不到内容)。
     // Explicitly empty the placeholder property (belt and braces; no reader finds text).
@@ -4556,11 +4650,10 @@ unsafe fn ensure_picker_window() {
                                                            // 编辑态文本与占位一致左对齐(设计稿文字靠左)。
                                                            // Editing text is left-aligned like the placeholder (the mockup's layout).
     let _: () = msg_send![search, setAlignment: 0u64]; // left
-                                                       // 磨砂化:去掉系统描边/bezel,换成 4.5% 黑底 + 1px 内描边(系统 ✕ 清除按钮
-                                                       // 随之不渲染,清空由 Esc/cancelOperation: 覆盖)。
-                                                       // Frosted: drop the system bezel for a 4.5% black fill + a 1px inner ring (the
-                                                       // system ✕ clear button no longer renders; clearing is covered by
-                                                       // Esc/cancelOperation:).
+                                                       // 磨砂化:去掉系统描边/bezel,换成 4.5% 黑底 + 1px 内描边;保留的系统 × 已直连
+                                                       // clearSearch:，不会因响应链而失效。
+                                                       // Frosted: drop the system bezel for a 4.5% black fill + a 1px inner ring; any
+                                                       // remaining system × is bound directly to clearSearch:, not the responder chain.
     let _: () = msg_send![search, setBezeled: false];
     let _: () = msg_send![search, setDrawsBackground: false];
     let _: () = msg_send![search, setWantsLayer: true];
@@ -4593,9 +4686,9 @@ unsafe fn ensure_picker_window() {
         object: search
     ];
     CFRelease(text_name as *const c_void);
-    // 聚焦样式(设计稿 .search:focus-within):白底 + 深一档内描边;失焦还原。
-    // Focus style (the mockup's .search:focus-within): a white fill + a stronger inner
-    // ring; restored on blur.
+    // 聚焦样式:保持磨砂底色,仅加深内描边;失焦还原。
+    // Focus style: preserve the frosted fill and strengthen only the inner ring; restore it
+    // on blur.
     let begin_name = make_nsstring("NSControlTextDidBeginEditingNotification");
     let _: () = msg_send![
         center,
@@ -5242,11 +5335,147 @@ unsafe fn search_cell_class() -> *mut AnyObject {
         .0
 }
 
-/// 居中自绘占位:非编辑态 + 有占位 → 把"放大镜 + 文字"整体画在 cell 水平中心;
-/// 其余(编辑态/无占位)交给父类(系统图标 + 输入文字)。
-/// Draws the centered placeholder: non-editing + a placeholder -> the "magnifier + text"
-/// group is drawn at the cell's horizontal center; everything else (editing / no
-/// placeholder) goes to the superclass (the stock icon + typed text).
+/// 当前搜索是否需要显示右侧清除叉号。
+/// Whether the current search needs its right-side clear ×.
+fn search_has_query() -> bool {
+    !SEARCH_QUERY.lock().unwrap().is_empty()
+}
+
+/// 绘制设计稿的 ⌘F 键帽;有查询时为右侧清除叉号留出空间。
+/// Draws the mockup's ⌘F keycap, reserving room for the right-side clear × when queried.
+unsafe fn draw_search_keycap(cell_frame: NSRect) {
+    let chip_w = 27.0;
+    let chip_h = 21.0;
+    let clear_reserve = if search_has_query() {
+        SEARCH_CLEAR_W + SEARCH_CLEAR_GAP
+    } else {
+        0.0
+    };
+    let chip_rect = NSRect::new(
+        NSPoint::new(
+            cell_frame.origin.x + cell_frame.size.width - chip_w - SEARCH_PAD_IN - clear_reserve,
+            cell_frame.origin.y + (cell_frame.size.height - chip_h) / 2.0,
+        ),
+        NSSize::new(chip_w, chip_h),
+    );
+    let path: *mut AnyObject = msg_send![
+        class!(NSBezierPath),
+        bezierPathWithRoundedRect: chip_rect,
+        xRadius: 5.0,
+        yRadius: 5.0
+    ];
+    let cap_bg: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.055];
+    let _: () = msg_send![cap_bg, set];
+    let _: () = msg_send![path, fill];
+    let chip_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+    let chip_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let chip_attrs: *mut AnyObject = msg_send![chip_attrs, init];
+    let font_key = make_nsstring("NSFont");
+    let color_key = make_nsstring("NSColor");
+    let _: () = msg_send![chip_attrs, setObject: chip_font, forKey: font_key];
+    let chip_color: *mut AnyObject =
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.38f64];
+    let _: () = msg_send![chip_attrs, setObject: chip_color, forKey: color_key];
+    CFRelease(font_key as *const c_void);
+    CFRelease(color_key as *const c_void);
+    let chip_ns = make_nsstring("⌘F");
+    let chip: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let chip: *mut AnyObject = msg_send![chip, initWithString: chip_ns, attributes: chip_attrs];
+    CFRelease(chip_ns as *const c_void);
+    release_obj(chip_attrs);
+    let size: NSSize = msg_send![chip, size];
+    let x = chip_rect.origin.x + (chip_rect.size.width - size.width) / 2.0;
+    let y = chip_rect.origin.y + (chip_rect.size.height - size.height) / 2.0;
+    let _: () = msg_send![chip, drawAtPoint: NSPoint::new(x, y)];
+    release_obj(chip);
+}
+
+/// 绘制唯一偏离 HTML 的右侧清除叉号(仅有输入时出现)。
+/// Draws the only deliberate HTML deviation: a right-side clear × when text exists.
+unsafe fn draw_search_clear(cell_frame: NSRect) {
+    if !search_has_query() {
+        return;
+    }
+    let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let attrs: *mut AnyObject = msg_send![attrs, init];
+    let font_key = make_nsstring("NSFont");
+    let color_key = make_nsstring("NSColor");
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 16.0f64];
+    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.42f64];
+    let _: () = msg_send![attrs, setObject: font, forKey: font_key];
+    let _: () = msg_send![attrs, setObject: color, forKey: color_key];
+    CFRelease(font_key as *const c_void);
+    CFRelease(color_key as *const c_void);
+    let text = make_nsstring("×");
+    let cross: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let cross: *mut AnyObject = msg_send![cross, initWithString: text, attributes: attrs];
+    CFRelease(text as *const c_void);
+    release_obj(attrs);
+    let size: NSSize = msg_send![cross, size];
+    let x = cell_frame.origin.x + cell_frame.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W
+        + (SEARCH_CLEAR_W - size.width) / 2.0;
+    let y = cell_frame.origin.y + (cell_frame.size.height - size.height) / 2.0;
+    let _: () = msg_send![cross, drawAtPoint: NSPoint::new(x, y)];
+    release_obj(cross);
+}
+
+/// 手绘始终一致的 "⌕" 图标列,并返回其实际排版宽度供提示/查询对齐。
+/// Draws the consistent hand-crafted "⌕" icon column and returns its actual layout width for
+/// aligning the hint and query.
+unsafe fn draw_search_icon_prefix(cell_frame: NSRect) -> Option<NSSize> {
+    let hint = (*SEARCH_HINT_TEXT.lock().unwrap())?;
+    // 提示的前三个 UTF-16 单元是 "⌕  ";复用其真实排版宽度,使查询起点与占位文字一致。
+    // The hint's first three UTF-16 units are "⌕  "; reuse its actual layout width so the query
+    // begins at precisely the same point as the placeholder text.
+    let icon_prefix: *mut AnyObject = msg_send![
+        hint.0,
+        attributedSubstringFromRange: NSRange::new(0, 3)
+    ];
+    if icon_prefix.is_null() {
+        return None;
+    }
+    let prefix_size: NSSize = msg_send![icon_prefix, size];
+    let prefix_x = cell_frame.origin.x + SEARCH_PAD_IN;
+    let prefix_y = cell_frame.origin.y + (cell_frame.size.height - prefix_size.height) / 2.0;
+    let _: () = msg_send![icon_prefix, drawAtPoint: NSPoint::new(prefix_x, prefix_y)];
+    Some(prefix_size)
+}
+
+/// 失焦但仍有查询时,用与手绘占位相同的字体和基线绘制值,避免 ↓ 进入结果列表时从
+/// NSTextView 的居中行框跳到 NSSearchFieldCell 的默认偏上基线。
+/// When a query remains after focus leaves, draw it with the hand-drawn hint's typography and
+/// baseline, avoiding a jump from NSTextView's centered line box to NSSearchFieldCell's
+/// default higher baseline as ↓ enters the results list.
+unsafe fn draw_retained_search_query(cell_frame: NSRect, query: *mut AnyObject) {
+    let Some(prefix_size) = draw_search_icon_prefix(cell_frame) else {
+        return;
+    };
+    draw_search_keycap(cell_frame);
+    draw_search_clear(cell_frame);
+    let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let attrs: *mut AnyObject = msg_send![attrs, init];
+    let font_key = make_nsstring("NSFont");
+    let color_key = make_nsstring("NSColor");
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
+    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.82f64];
+    let _: () = msg_send![attrs, setObject: font, forKey: font_key];
+    let _: () = msg_send![attrs, setObject: color, forKey: color_key];
+    CFRelease(font_key as *const c_void);
+    CFRelease(color_key as *const c_void);
+    let value: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let value: *mut AnyObject = msg_send![value, initWithString: query, attributes: attrs];
+    release_obj(attrs);
+    let size: NSSize = msg_send![value, size];
+    let x = cell_frame.origin.x + SEARCH_PAD_IN + prefix_size.width;
+    let y = cell_frame.origin.y + (cell_frame.size.height - size.height) / 2.0;
+    let _: () = msg_send![value, drawAtPoint: NSPoint::new(x, y)];
+    release_obj(value);
+}
+
+/// 居中自绘占位:非编辑态 + 空字段 → 把"放大镜 + 文字"整体画在 cell 水平中心;
+/// 失焦的已输入查询走同基线自绘,编辑态交给字段编辑器。
+/// Draws the centered placeholder for a non-editing empty field; a retained unfocused query is
+/// hand-drawn on the same baseline, while an actively edited value belongs to the field editor.
 extern "C" fn search_cell_draw_interior(
     _self: *mut c_void,
     _cmd: Sel,
@@ -5262,7 +5491,27 @@ extern "C" fn search_cell_draw_interior(
             let editor: *mut AnyObject = msg_send![control_view as *mut AnyObject, currentEditor];
             !editor.is_null()
         };
-        if !editing {
+        let str_obj: *mut AnyObject = msg_send![_self as *mut AnyObject, stringValue];
+        let str_len: usize = msg_send![str_obj, length];
+        // 未聚焦时也可能保留搜索词(↓ 将焦点交给列表)。仅空字段可绘制占位;
+        // 否则必须让父类绘制已输入的查询。
+        // An unfocused field may still retain a query after ↓ moves focus into the list. Draw
+        // the placeholder only while it is empty; otherwise super must draw the entered query.
+        if !editing && str_len > 0 {
+            draw_retained_search_query(cell_frame, str_obj);
+            return;
+        }
+        if editing && str_len > 0 {
+            // 文字由字段编辑器绘制;图标必须手绘,避免 NSSearchField 的 stock glyph 在
+            // 输入后替换初始的 ⌕。
+            // The field editor draws text; hand-draw the icon so NSSearchField's stock glyph
+            // never replaces the initial ⌕ after typing.
+            let _ = draw_search_icon_prefix(cell_frame);
+            draw_search_keycap(cell_frame);
+            draw_search_clear(cell_frame);
+            return;
+        }
+        if !editing && str_len == 0 {
             let placeholder = match *SEARCH_HINT_TEXT.lock().unwrap() {
                 Some(p) => p.0,
                 None => std::ptr::null_mut(),
@@ -5272,52 +5521,7 @@ extern "C" fn search_cell_draw_interior(
                 len > 0
             };
             if has_text {
-                // ⌘F 快捷键提示:右侧键帽(设计稿 .search-shortcut:28×22、5 圆角、
-                // 5.5% 黑底、11px 38% 黑字)。
-                // The ⌘F shortcut hint: a keycap at the right (the mockup's
-                // .search-shortcut: 28x22, radius 5, 5.5% black fill, 11px 38% black text).
-                let chip_w = 27.0;
-                let chip_h = 21.0;
-                let chip_rect = NSRect::new(
-                    NSPoint::new(
-                        cell_frame.origin.x + cell_frame.size.width - chip_w - 13.0,
-                        cell_frame.origin.y + (cell_frame.size.height - chip_h) / 2.0,
-                    ),
-                    NSSize::new(chip_w, chip_h),
-                );
-                let path: *mut AnyObject = msg_send![
-                    class!(NSBezierPath),
-                    bezierPathWithRoundedRect: chip_rect,
-                    xRadius: 5.0,
-                    yRadius: 5.0
-                ];
-                let cap_bg: *mut AnyObject =
-                    msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.055];
-                let _: () = msg_send![cap_bg, set];
-                let _: () = msg_send![path, fill];
-                let chip_font: *mut AnyObject =
-                    msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
-                let chip_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-                let chip_attrs: *mut AnyObject = msg_send![chip_attrs, init];
-                let cf_key = make_nsstring("NSFont");
-                let cc_key = make_nsstring("NSColor");
-                let _: () = msg_send![chip_attrs, setObject: chip_font, forKey: cf_key];
-                let chip_color: *mut AnyObject =
-                    msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.38f64];
-                let _: () = msg_send![chip_attrs, setObject: chip_color, forKey: cc_key];
-                CFRelease(cf_key as *const c_void);
-                CFRelease(cc_key as *const c_void);
-                let chip_ns = make_nsstring("⌘F");
-                let chip_str: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-                let chip_str: *mut AnyObject =
-                    msg_send![chip_str, initWithString: chip_ns, attributes: chip_attrs];
-                CFRelease(chip_ns as *const c_void);
-                release_obj(chip_attrs);
-                let csize: NSSize = msg_send![chip_str, size];
-                let cx = chip_rect.origin.x + (chip_rect.size.width - csize.width) / 2.0;
-                let cy = chip_rect.origin.y + (chip_rect.size.height - csize.height) / 2.0;
-                let _: () = msg_send![chip_str, drawAtPoint: NSPoint::new(cx, cy)];
-                release_obj(chip_str);
+                draw_search_keycap(cell_frame);
 
                 // 占位整体画在字段左侧(设计稿 .search-placeholder 跟在图标后)。
                 // The placeholder is drawn at the field's left (the mockup's layout).
@@ -5328,15 +5532,11 @@ extern "C" fn search_cell_draw_interior(
                 return;
             }
         }
-        // 编辑态:占位已在 search_field_began_editing 里按会话清空。空字符串时
-        // 什么都不画(父类的搜索图标也不要——聚焦空字段只留光标);有文字 → 父类
-        // 画图标,文字由字段编辑器绘制。
-        // Editing state: the placeholder was cleared for the whole session in
-        // search_field_began_editing. With an empty string draw NOTHING (not even the
-        // superclass's search icon -- a focused empty field shows only the caret); with
-        // text, the superclass draws the icon and the field editor draws the text.
-        let str_obj: *mut AnyObject = msg_send![_self as *mut AnyObject, stringValue];
-        let str_len: usize = msg_send![str_obj, length];
+        // 编辑态空字符串由外层 drawWithFrame: 自绘完整提示,这里不重复绘制。有文字
+        // (包括 ↓ 交出焦点后保留的查询)→ 父类画图标和字段值。
+        // An empty editing string is fully drawn by outer drawWithFrame:, so do not draw it
+        // here again. With text (including a query retained after ↓ gives up focus), super draws
+        // the icon and field value.
         if str_len == 0 {
             return;
         }
@@ -5370,12 +5570,11 @@ extern "C" fn search_cell_draw_interior(
     }
 }
 
-/// 外层绘制:编辑态空字符串时整帧不画(父类会在此层画搜索图标 + 左侧占位),
-/// 只留光标;其余交给父类(内部文字区由 drawInteriorWithFrame: 覆写处理)。
-/// Outer drawing: when editing with an empty string, draw NOTHING for the whole frame
-/// (the superclass draws the search icon + the left-aligned placeholder here), leaving
-/// only the caret; everything else goes to the superclass (the interior is handled by the
-/// drawInteriorWithFrame: override).
+/// 外层绘制:编辑态空字符串时不调用父类(否则会画出左对齐的系统占位),改走自绘完整
+/// 搜索提示。这样 HTML 原本的提示在点击后仍可见,直到用户输入首个字符。
+/// Outer drawing: with an empty editing string, do not call super (which would paint its
+/// left-aligned system placeholder); draw our complete search hint instead. This keeps the
+/// HTML mockup's hint visible after a click until the user enters the first character.
 extern "C" fn search_cell_draw_with_frame(
     _self: *mut c_void,
     _cmd: Sel,
@@ -5395,6 +5594,12 @@ extern "C" fn search_cell_draw_with_frame(
             let str_obj: *mut AnyObject = msg_send![_self as *mut AnyObject, stringValue];
             let str_len: usize = msg_send![str_obj, length];
             if str_len == 0 {
+                // 传入空 view 使内部绘制走未编辑分支:完整提示(放大镜、文字、⌘F)
+                // 会保留在空字段下方,而字段编辑器随后在其输入起点绘制光标。
+                // Pass a null view to take the non-editing branch: the full hint (magnifier,
+                // text, and ⌘F) remains beneath the empty field while its editor draws the caret
+                // at the input start afterward.
+                search_cell_draw_interior(_self, _cmd, cell_frame, std::ptr::null_mut());
                 return;
             }
         }
@@ -5482,13 +5687,14 @@ extern "C" fn search_cell_select_with_frame(
             sel_start,
             sel_length,
         );
-        // 编辑器文本容器垂直居中:frame 会被系统在后续布局中重置(setFrame 无效,
-        // 实测第二次 selectWithFrame 时已回 0,0),而 textContainerInset 是持久属性。
-        // 上边距 = (cell 高 - 行框高)/2,文字/光标随容器整体下移居中。
-        // Vertically centers the editor's text container: the frame gets reset by later
-        // layout passes (setFrame is useless -- the frame was already back to 0,0 at the
-        // second selectWithFrame), while textContainerInset persists. Top inset =
-        // (cell height - line height)/2 moves the text and caret down to center.
+        // 编辑器 frame 会被系统在后续布局中重置(setFrame 无效),而 textContainerInset
+        // 是持久属性。AppKit 已预留搜索框的内边距,这里只补 22pt 图标列;再加 12pt 会
+        // 让光标压到占位文字。垂直位置按 40pt 搜索栏和实际字体行框居中。
+        // The system resets the editor frame during later layout (so setFrame is ineffective),
+        // whereas textContainerInset persists. AppKit already reserves the search field's inner
+        // padding, so add only the 22pt icon column; adding another 12pt puts the caret over the
+        // placeholder text. Vertically center against the 40pt search field and its real font
+        // line box.
         if !editor.is_null() && rect.size.height > 0.0 {
             let font: *mut AnyObject = msg_send![_self as *mut AnyObject, font];
             if !font.is_null() {
@@ -5497,13 +5703,14 @@ extern "C" fn search_cell_select_with_frame(
                 let lead: f64 = msg_send![font, leading];
                 let line_h = asc - desc + lead;
                 if line_h > 0.0 && line_h < rect.size.height {
-                    // 实测(容器溢出居中):光标顶 ≈ inset - 1.8;目标光标顶 3.5 → 5.3。
-                    // Measured (overflow-centering in the container): caret top ~= inset - 1.8;
-                    // target caret top 3.5 -> 5.3.
-                    let top = 5.3;
+                    // NSTextView 的 caret 顶端比 textContainerInset 高约 1.8pt;补偿后
+                    // 让可见 caret 的中点与 CSS `align-items: center` 的输入行对齐。
+                    // NSTextView draws the caret about 1.8pt above textContainerInset; compensate
+                    // so its visible midpoint aligns with CSS `align-items: center`.
+                    let vertical = ((rect.size.height - line_h) / 2.0 + 1.8).max(0.0);
                     let _: () = msg_send![
                         editor as *mut AnyObject,
-                        setTextContainerInset: NSSize::new(0.0, top)
+                        setTextContainerInset: NSSize::new(SEARCH_ICON_W, vertical)
                     ];
                 }
             }
@@ -5572,24 +5779,14 @@ fn update_hover_visuals(prev: usize, new: usize) {
     }
 }
 
-/// 焦点在搜索框时列表不得有任何选中行,而 rebuild 后光标仍可能停在行上触发 enter。
-/// Hovering a row button: select it and refresh the highlight. Ignored while the search
-/// field is editing (focus in the search box): the requirement is no selected row while the
-/// search box has focus, and after a rebuild the cursor may still sit over a row and fire
-/// mouseEntered.
+/// 搜索框聚焦时列表没有键盘选中项,但过滤后的条目仍应显示独立的鼠标悬停样式。
+/// With search focus, the list has no keyboard-selected row, but filtered entries must still
+/// show their independent mouse-hover style.
 extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
     // 重建期间派发的 enter 忽略(防无限递归,见 REBUILDING 注释)。
     // Ignore enters dispatched during a rebuild (prevents infinite recursion; see REBUILDING).
     if REBUILDING.load(Ordering::SeqCst) {
         return;
-    }
-    // 搜索框正在编辑(currentEditor 非空)→ 悬停不选中。
-    // The search field is editing (currentEditor non-nil) -> hovering must not select.
-    if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
-        let editor: *mut AnyObject = unsafe { msg_send![f.0, currentEditor] };
-        if !editor.is_null() {
-            return;
-        }
     }
     let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
     if idx >= 0 {
