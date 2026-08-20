@@ -314,6 +314,10 @@ static PICKER_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// 浮窗容器(接收键盘)/ the picker container (receives key events).
 static PICKER_CONTAINER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
+/// 浮窗内容父视图(重建本地化 footer 时使用)。/ The picker content parent, used to rebuild
+/// the localized footer in place.
+static PICKER_CONTENT_PARENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
 /// 每行按钮指针(按行索引,供高亮/点击)/ row button pointers by index (highlight / click).
 static ROW_BUTTONS: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -330,9 +334,23 @@ static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec:
 /// The filter pills' button pointers (one per tag; restyled on change/rebuild).
 static FILTER_PILLS: Mutex<Vec<ObjPtr>> = Mutex::new(Vec::new());
 
+/// 清空历史按钮指针(语言切换时更新标题和按英文宽度重排)。
+/// The clear-history button, whose title and frame are relaid out on locale changes.
+static CLEAR_HISTORY_BUTTON: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
 /// 筛选选中项的下划线小视图(共享单例,随选中项移动)。
 /// The active filter's underline (one shared view, moved under the active item).
 static FILTER_UNDERLINE: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
+fn localized_filter_labels() -> [String; 5] {
+    [
+        t("clipboard.filter_all"),
+        t("clipboard.filter_text"),
+        t("clipboard.filter_image"),
+        t("clipboard.filter_link"),
+        t("clipboard.filter_code"),
+    ]
+}
 
 /// 顶部搜索框指针 / the top search field.
 static SEARCH_FIELD: Mutex<Option<ObjPtr>> = Mutex::new(None);
@@ -4326,6 +4344,8 @@ unsafe fn ensure_picker_window() {
         content_parent = ve;
     }
 
+    *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr(content_parent));
+
     // 容器(接收键盘事件;flipped,行从顶部往下排,最新条目在顶)。
     // Container (receives key events; flipped so rows stack top-down, newest on top).
     let container = {
@@ -4598,13 +4618,7 @@ unsafe fn ensure_picker_window() {
     // 筛选行(设计稿 .filters):纯文字 12pt,选中项加深 + 底部 16×2 下划线。
     // The filters row (the mockup's .filters): bare 12pt text; the active one darkens and
     // gains a 16x2 underline.
-    let filter_labels = [
-        t("clipboard.filter_all"),
-        t("clipboard.filter_text"),
-        t("clipboard.filter_image"),
-        t("clipboard.filter_link"),
-        t("clipboard.filter_code"),
-    ];
+    let filter_labels = localized_filter_labels();
     let filters_y = TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y;
     *FILTER_PILLS.lock().unwrap() = Vec::new();
     let mut fx = FILTERS_PAD_X;
@@ -4653,6 +4667,7 @@ unsafe fn ensure_picker_window() {
     add_hover_tracking(clear_btn);
     let _: () = msg_send![header_strip, addSubview: clear_btn];
     release_obj(clear_btn);
+    *CLEAR_HISTORY_BUTTON.lock().unwrap() = Some(ObjPtr(clear_btn));
 
     // 底部栏(新设计稿 .footer):43pt,顶部分隔线 + 条目数 + 快捷键图例(清空已移到
     // 筛选行)。/ The footer: a top hairline + the entry count + the shortcut legends
@@ -6819,6 +6834,9 @@ fn update_filter_pill_style() {
 
 /// 底部栏条目数标签 / the footer's entry-count label.
 static FOOTER_COUNT: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 底部栏根视图:语言切换时整栏重建,以按新文本宽度重新排版快捷键图例。
+/// The footer root: rebuilt on locale changes so shortcut legends reflow to their new widths.
+static FOOTER_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
 /// toast 提示标签(新设计稿 .toast)/ the toast label (the new mockup's .toast).
 static TOAST_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
@@ -6927,6 +6945,19 @@ fn refresh_footer_count(total: usize) {
 /// legends (kbd keycaps). Non-flipped coords (y=0 at the bottom), 43pt tall, pinned to the
 /// window's bottom edge.
 unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
+    // 把 footer 收进独立根视图;语言变更时可整体替换,不用保留每个图例的指针。
+    // Put the footer in its own root view so locale changes can replace it as a whole instead
+    // of retaining pointers to every individual legend.
+    let footer: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let footer: *mut AnyObject = msg_send![
+        footer,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, FOOTER_H))
+    ];
+    let _: () = msg_send![parent, addSubview: footer];
+    release_obj(footer);
+    *FOOTER_VIEW.lock().unwrap() = Some(ObjPtr(footer));
+    let parent = footer;
+
     // 顶部分隔线 / the top hairline.
     let line: *mut AnyObject = msg_send![class!(NSView), alloc];
     let line: *mut AnyObject = msg_send![
@@ -7076,6 +7107,79 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         // 下一组间距 / spacing before the next group.
         x -= FOOTER_GROUP_GAP;
         let _ = i;
+    }
+}
+
+/// 刷新已创建剪贴板浮窗的本地化 UI。菜单/设置会在 locale 改变时重建或重设标题,
+/// 但 picker 是长驻缓存窗口;它的搜索提示、筛选、清空按钮和 footer 必须显式更新。
+/// Refresh localization for an already-created clipboard picker. Menus/settings rebuild or
+/// retitle on locale changes, but the picker is a long-lived cached window, so its search hint,
+/// filters, clear button, and footer must be updated explicitly.
+pub fn refresh_localized_ui() {
+    unsafe {
+        rebuild_search_hint();
+        if let Some(search) = *SEARCH_FIELD.lock().unwrap() {
+            let _: () = msg_send![search.0, setNeedsDisplay: true];
+        }
+        if PICKER_WINDOW.lock().unwrap().is_none() {
+            return;
+        }
+
+        let labels = localized_filter_labels();
+        let pills: Vec<*mut AnyObject> = FILTER_PILLS
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pill| pill.0)
+            .collect();
+        if pills.len() == labels.len() {
+            let filters_y = TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y;
+            let mut x = FILTERS_PAD_X;
+            for (pill, label) in pills.iter().zip(labels.iter()) {
+                let title = make_nsstring(label);
+                let _: () = msg_send![*pill, setTitle: title];
+                CFRelease(title as *const c_void);
+                let width = localized_string_width(label, 12.0) + 12.0;
+                let _: () = msg_send![
+                    *pill,
+                    setFrame: NSRect::new(
+                        NSPoint::new(x, filters_y),
+                        NSSize::new(width, FILTERS_H)
+                    )
+                ];
+                x += width + FILTER_GAP;
+            }
+            update_filter_pill_style();
+
+            if let Some(clear) = *CLEAR_HISTORY_BUTTON.lock().unwrap() {
+                let clear_title = t("clipboard.clear_all");
+                let title = make_nsstring(&clear_title);
+                let _: () = msg_send![clear.0, setTitle: title];
+                CFRelease(title as *const c_void);
+                let width = localized_string_width(&clear_title, 10.0) + 8.0;
+                let _: () = msg_send![
+                    clear.0,
+                    setFrame: NSRect::new(
+                        NSPoint::new(PICKER_W - SEARCH_PAD_X - width, filters_y + 8.0),
+                        NSSize::new(width, 20.0)
+                    )
+                ];
+            }
+        }
+
+        // footer 的英文提示宽度与中文不同;整体替换以重走从右向左的图例布局。
+        // English footer legends have different widths; replace the whole footer to rerun its
+        // right-to-left layout.
+        let old_footer = *FOOTER_VIEW.lock().unwrap();
+        if let Some(footer) = old_footer {
+            let _: () = msg_send![footer.0, removeFromSuperview];
+        }
+        *FOOTER_VIEW.lock().unwrap() = None;
+        *FOOTER_COUNT.lock().unwrap() = None;
+        if let Some(parent) = *PICKER_CONTENT_PARENT.lock().unwrap() {
+            build_footer(parent.0, PICKER_W);
+        }
+        rebuild_rows();
     }
 }
 
@@ -9179,7 +9283,10 @@ mod tests {
         // toggle on + source + time (the mockup's "app · time"; no kind badge).
         let m = build_meta_text(&e, true);
         assert!(m.starts_with("Safari · "));
-        assert!(m.contains("刚刚"), "got {m}");
+        // 相对时间已国际化;并行测试可能切换全局 locale,只验证动态时间段确实存在。
+        // Relative time is localized and parallel tests may change the global locale; verify
+        // only that its dynamic segment is present.
+        assert!(m.len() > "Safari · ".len(), "got {m}");
         // 开关关 → 无来源名,只有时间。
         // Toggle off -> no source name, just the time.
         let m2 = build_meta_text(&e, false);

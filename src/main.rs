@@ -240,6 +240,7 @@ extern "C" fn on_locale_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void
     i18n::apply_config_locale(&locale_cfg);
     refresh_menu_titles();
     invalidate_settings_window();
+    clipboard::refresh_localized_ui();
 }
 
 /// 鼠标插拔回调(在鼠标线程执行)经 performSelectorOnMainThread 转到主线程后的重入点:

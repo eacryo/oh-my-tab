@@ -160,6 +160,7 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
     // so it rebuilds with the new locale on next open
     refresh_menu_titles();
     invalidate_settings_window();
+    crate::clipboard::refresh_localized_ui();
     // Apply immediately
     apply_theme();
     refresh_highlight();

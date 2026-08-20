@@ -2166,6 +2166,7 @@ fn select_sidebar(idx: usize) {
 fn apply_config_refresh() {
     refresh_menu_titles();
     invalidate_settings_window();
+    crate::clipboard::refresh_localized_ui();
     apply_theme();
     refresh_highlight();
     update_status_label();
