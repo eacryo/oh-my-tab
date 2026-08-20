@@ -5419,26 +5419,53 @@ unsafe fn draw_search_clear(cell_frame: NSRect) {
     release_obj(cross);
 }
 
-/// 手绘始终一致的 "⌕" 图标列,并返回其实际排版宽度供提示/查询对齐。
-/// Draws the consistent hand-crafted "⌕" icon column and returns its actual layout width for
-/// aligning the hint and query.
+/// 手绘始终一致的 "⌕" 图标列。图标本身在 40pt 高度内独立居中,而不是和提示
+/// 文本共用富文本基线;返回固定 22pt 列宽供查询/占位文字对齐。
+/// Draws the consistent hand-crafted "⌕" icon column. The icon itself is centered independently
+/// within the 40pt field rather than sharing the hint text's attributed-string baseline; returns
+/// the fixed 22pt column width for aligning query/placeholder text.
 unsafe fn draw_search_icon_prefix(cell_frame: NSRect) -> Option<NSSize> {
     let hint = (*SEARCH_HINT_TEXT.lock().unwrap())?;
-    // 提示的前三个 UTF-16 单元是 "⌕  ";复用其真实排版宽度,使查询起点与占位文字一致。
-    // The hint's first three UTF-16 units are "⌕  "; reuse its actual layout width so the query
-    // begins at precisely the same point as the placeholder text.
-    let icon_prefix: *mut AnyObject = msg_send![
+    let icon: *mut AnyObject = msg_send![
         hint.0,
-        attributedSubstringFromRange: NSRange::new(0, 3)
+        attributedSubstringFromRange: NSRange::new(0, 1)
     ];
-    if icon_prefix.is_null() {
+    if icon.is_null() {
         return None;
     }
-    let prefix_size: NSSize = msg_send![icon_prefix, size];
-    let prefix_x = cell_frame.origin.x + SEARCH_PAD_IN;
-    let prefix_y = cell_frame.origin.y + (cell_frame.size.height - prefix_size.height) / 2.0;
-    let _: () = msg_send![icon_prefix, drawAtPoint: NSPoint::new(prefix_x, prefix_y)];
-    Some(prefix_size)
+    let icon_size: NSSize = msg_send![icon, size];
+    let x = cell_frame.origin.x + SEARCH_PAD_IN;
+    let y = cell_frame.origin.y + (cell_frame.size.height - icon_size.height) / 2.0;
+    let _: () = msg_send![icon, drawAtPoint: NSPoint::new(x, y)];
+    Some(NSSize::new(SEARCH_ICON_W, icon_size.height))
+}
+
+/// 手绘提示文本:与图标、⌘F 键帽一样在 40pt 高度内独立垂直居中,并从固定 22pt
+/// 图标列之后开始。
+/// Draws the placeholder text independently centered within the 40pt field like the icon and
+/// ⌘F keycap, starting after the fixed 22pt icon column.
+unsafe fn draw_search_placeholder(cell_frame: NSRect) {
+    let Some(hint) = *SEARCH_HINT_TEXT.lock().unwrap() else {
+        return;
+    };
+    let len: usize = msg_send![hint.0, length];
+    // "⌕  " 占前三个 UTF-16 单元;余下部分保留已有的 14pt/40% 黑属性。
+    // "⌕  " occupies the first three UTF-16 units; the remainder retains its existing
+    // 14pt/40%-black attributes.
+    if len <= 3 {
+        return;
+    }
+    let text: *mut AnyObject = msg_send![
+        hint.0,
+        attributedSubstringFromRange: NSRange::new(3, len - 3)
+    ];
+    if text.is_null() {
+        return;
+    }
+    let size: NSSize = msg_send![text, size];
+    let x = cell_frame.origin.x + SEARCH_PAD_IN + SEARCH_ICON_W;
+    let y = cell_frame.origin.y + (cell_frame.size.height - size.height) / 2.0;
+    let _: () = msg_send![text, drawAtPoint: NSPoint::new(x, y)];
 }
 
 /// 失焦但仍有查询时,用与手绘占位相同的字体和基线绘制值,避免 ↓ 进入结果列表时从
@@ -5512,23 +5539,12 @@ extern "C" fn search_cell_draw_interior(
             return;
         }
         if !editing && str_len == 0 {
-            let placeholder = match *SEARCH_HINT_TEXT.lock().unwrap() {
-                Some(p) => p.0,
-                None => std::ptr::null_mut(),
-            };
-            let has_text = !placeholder.is_null() && {
-                let len: usize = msg_send![placeholder, length];
-                len > 0
-            };
-            if has_text {
+            // 三个独立 flex 项(⌕、提示、⌘F)均按自己的尺寸在 40pt 高度内居中。
+            // Center the three independent flex items (⌕, hint, ⌘F) by their own sizes in the
+            // 40pt field.
+            if draw_search_icon_prefix(cell_frame).is_some() {
+                draw_search_placeholder(cell_frame);
                 draw_search_keycap(cell_frame);
-
-                // 占位整体画在字段左侧(设计稿 .search-placeholder 跟在图标后)。
-                // The placeholder is drawn at the field's left (the mockup's layout).
-                let size: NSSize = msg_send![placeholder, size];
-                let x = cell_frame.origin.x + SEARCH_PAD_IN;
-                let y = cell_frame.origin.y + (cell_frame.size.height - size.height) / 2.0;
-                let _: () = msg_send![placeholder, drawAtPoint: NSPoint::new(x, y)];
                 return;
             }
         }
