@@ -436,6 +436,11 @@ fn cached_syntect_highlight(text: &str, language: &'static str) -> Option<Vec<Sy
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut source_offset = 0;
     let mut spans = Vec::new();
+    // 预先建立 byte → UTF-16 边界表。以前每个 syntect 片段都从头 encode_utf16(),
+    // HTML 的大量片段会反复扫描同一前缀而退化为 O(n²)。
+    // Build byte-to-UTF-16 boundaries once. Previously every syntect fragment encoded a prefix
+    // from the beginning, which rescanned HTML's many fragments into O(n²).
+    let utf16_offsets = source_utf16_offsets(text);
     for line in LinesWithEndings::from(text) {
         let ranges = highlighter.highlight_line(line, &state.syntax_set).ok()?;
         let mut line_offset = 0;
@@ -443,8 +448,8 @@ fn cached_syntect_highlight(text: &str, language: &'static str) -> Option<Vec<Sy
             let end = line_offset + fragment.len();
             if end > line_offset {
                 spans.push(SyntectSpan {
-                    start: text[..source_offset + line_offset].encode_utf16().count(),
-                    end: text[..source_offset + end].encode_utf16().count(),
+                    start: utf16_offsets[source_offset + line_offset],
+                    end: utf16_offsets[source_offset + end],
                     foreground: [
                         style.foreground.r,
                         style.foreground.g,
@@ -892,26 +897,26 @@ impl DisplaySourceMap {
     fn display_ranges_for_source_range(&self, source_range: NSRange) -> Vec<NSRange> {
         let source_start = source_range.location;
         let source_end = source_start.saturating_add(source_range.length);
-        let mut ranges = Vec::new();
-        let mut run_start: Option<usize> = None;
-        for index in 0..self.boundaries.len().saturating_sub(1) {
-            let start = self.boundaries[index];
-            let end = self.boundaries[index + 1];
-            let included = (start < source_end && end > source_start)
-                || (start == end && start >= source_start && start <= source_end);
-            if included {
-                run_start.get_or_insert(index);
-            } else if let Some(start_index) = run_start.take() {
-                ranges.push(NSRange::new(start_index, index - start_index));
-            }
+        // boundaries 按原文 UTF-16 偏移单调递增;插入的换行/缩进只会重复同一偏移。
+        // 因此一个原文区间在显示文本中仍是连续区间,可以二分查找边界。以前每个
+        // syntect span 都全扫 boundaries,使片段多的 HTML 再次退化为 O(n²)。
+        // Boundaries are monotonic source UTF-16 offsets; inserted wraps/indents only repeat an
+        // offset. A source interval is therefore contiguous in display text and can use binary
+        // boundary searches. The former full scan per syntect span was another O(n²) HTML path.
+        let first = self
+            .boundaries
+            .partition_point(|&boundary| boundary < source_start);
+        let after_last = self
+            .boundaries
+            .partition_point(|&boundary| boundary <= source_end);
+        let end = after_last
+            .saturating_sub(1)
+            .min(self.boundaries.len().saturating_sub(1));
+        if first >= end {
+            Vec::new()
+        } else {
+            vec![NSRange::new(first, end - first)]
         }
-        if let Some(start_index) = run_start {
-            ranges.push(NSRange::new(
-                start_index,
-                self.boundaries.len().saturating_sub(1) - start_index,
-            ));
-        }
-        ranges
     }
 }
 
@@ -1056,12 +1061,24 @@ fn append_mapped_insert(
     }
 }
 
-fn visual_width(text: &str) -> usize {
-    let mut width = 0;
-    for ch in text.chars() {
-        width += if ch == '\t' { 4 - (width % 4) } else { 1 };
+/// 将同一显示行的一段文本累加到列宽;`trimmed_width` 忽略末尾空格/制表符。
+/// Accumulate one display-line segment into its column width; `trimmed_width` ignores trailing
+/// spaces and tabs.
+fn extend_visual_width(
+    source: &str,
+    byte: &mut usize,
+    end: usize,
+    width: &mut usize,
+    trimmed_width: &mut usize,
+) {
+    while *byte < end {
+        let ch = source[*byte..].chars().next().unwrap();
+        *width += if ch == '\t' { 4 - (*width % 4) } else { 1 };
+        *byte += ch.len_utf8();
+        if ch != ' ' && ch != '\t' {
+            *trimmed_width = *width;
+        }
     }
-    width
 }
 
 fn leading_indent(text: &str, start: usize, end: usize) -> (usize, usize) {
@@ -1188,18 +1205,20 @@ fn append_code_line(
         return;
     }
     let (content_start, indent_columns) = leading_indent(source, line_start, line_end);
-    if visual_width(&source[line_start..line_end]) <= max_columns {
-        append_mapped_source(out, boundaries, source, offsets, line_start, line_end);
-        return;
-    }
-
     let breaks = safe_breaks(source, content_start, line_end);
     let mut chunk_start = line_start;
     let mut first_chunk = true;
     while chunk_start < line_end {
         let prefix_columns = if first_chunk { 0 } else { indent_columns + 4 };
         let available = max_columns.saturating_sub(prefix_columns).max(12);
-        if visual_width(&source[chunk_start..line_end]) <= available {
+        // 每一段只向前扫描到下一个超宽断点。旧实现对每个候选断点重新计算
+        // `chunk_start..point` 的宽度,并在每次换行从头遍历 breaks;压缩成长单行
+        // 的 HTML 因而为 O(n²)。
+        // Scan each chunk forward only until its next over-width break. The old version
+        // recalculated `chunk_start..point` for every candidate and restarted `breaks` after
+        // every wrap, making minified one-line HTML O(n²).
+        let mut break_index = breaks.partition_point(|&point| point <= chunk_start);
+        if break_index == breaks.len() {
             if !first_chunk {
                 append_mapped_insert(
                     out,
@@ -1212,30 +1231,43 @@ fn append_code_line(
             break;
         }
 
-        let candidate = breaks
-            .iter()
-            .copied()
-            .filter(|&point| point > chunk_start)
-            .take_while(|&point| {
-                visual_width(&source[chunk_start..trim_trailing_space(source, chunk_start, point)])
-                    <= available
-            })
-            .last();
-        let Some(break_point) =
-            candidate.or_else(|| breaks.iter().copied().find(|&point| point > chunk_start))
-        else {
-            if !first_chunk {
-                append_mapped_insert(
-                    out,
-                    boundaries,
-                    &" ".repeat(indent_columns + 4),
-                    offsets[chunk_start],
-                );
+        let first_break = breaks[break_index];
+        let mut byte = chunk_start;
+        let mut width = 0;
+        let mut trimmed_width = 0;
+        let mut best_break = None;
+        while break_index < breaks.len() && breaks[break_index] <= line_end {
+            let point = breaks[break_index];
+            extend_visual_width(source, &mut byte, point, &mut width, &mut trimmed_width);
+            if trimmed_width > available {
+                break;
             }
-            append_mapped_source(out, boundaries, source, offsets, chunk_start, line_end);
-            break;
-        };
+            best_break = Some(point);
+            break_index += 1;
+        }
 
+        // 若所有安全断点都在宽度内,再检查最后一个断点到行尾的尾段。
+        // If every safe break fits, inspect the tail from the final break to line end.
+        if break_index == breaks.len() || breaks[break_index] > line_end {
+            extend_visual_width(source, &mut byte, line_end, &mut width, &mut trimmed_width);
+            if trimmed_width <= available {
+                if !first_chunk {
+                    append_mapped_insert(
+                        out,
+                        boundaries,
+                        &" ".repeat(indent_columns + 4),
+                        offsets[chunk_start],
+                    );
+                }
+                append_mapped_source(out, boundaries, source, offsets, chunk_start, line_end);
+                break;
+            }
+        }
+
+        // 没有能容纳的断点时沿用旧行为:在首个安全点换行,绝不在标识符中间断开。
+        // With no fitting break, retain the former behavior: wrap at the first safe point and
+        // never split an identifier.
+        let break_point = best_break.unwrap_or(first_break);
         let chunk_end = trim_trailing_space(source, chunk_start, break_point);
         if !first_chunk {
             append_mapped_insert(
@@ -1309,6 +1341,10 @@ pub(crate) fn format_code_for_display(source: &str, max_columns: usize) -> Forma
 /// 给代码中的可见空格设置淡色,缩进空格比普通空格稍明显。
 /// Tint visible code spaces; indentation spaces are slightly stronger than ordinary spaces.
 pub(crate) unsafe fn apply_visible_space_markers(storage: *mut AnyObject, text: &str) {
+    // 大片段的每个可见空格都会写一次属性;合并编辑避免 NSTextStorage 每次都通知布局。
+    // A large snippet writes an attribute for every visible space; batch edits so NSTextStorage
+    // does not notify layout after every individual mutation.
+    let _: () = msg_send![storage, beginEditing];
     let color_key = make_nsstring("NSColor");
     let mut location = 0;
     let mut at_line_start = true;
@@ -1337,12 +1373,14 @@ pub(crate) unsafe fn apply_visible_space_markers(storage: *mut AnyObject, text: 
         location += length;
     }
     CFRelease(color_key as *const c_void);
+    let _: () = msg_send![storage, endEditing];
 }
 
 /// 给代码的每个显示段落设置悬挂缩进,即使 NSTextView 仍需二次换行也不会顶到最左侧。
 /// Set hanging indents on every displayed code paragraph so any fallback NSTextView wrap
 /// also stays indented instead of jumping to the far left.
 pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: &str) {
+    let _: () = msg_send![storage, beginEditing];
     let style_key = make_nsstring("NSParagraphStyle");
     let mut location = 0;
     for line in text.split_inclusive('\n') {
@@ -1370,12 +1408,14 @@ pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: 
         location += length;
     }
     CFRelease(style_key as *const c_void);
+    let _: () = msg_send![storage, endEditing];
 }
 
 unsafe fn apply_lexical_highlights(storage: *mut AnyObject, text: &str, spans: Vec<HighlightSpan>) {
     if spans.is_empty() {
         return;
     }
+    let _: () = msg_send![storage, beginEditing];
     let color_key = make_nsstring("NSColor");
     for span in spans {
         let color = hex_to_ns_color(highlight_color(span.kind));
@@ -1387,6 +1427,7 @@ unsafe fn apply_lexical_highlights(storage: *mut AnyObject, text: &str, spans: V
         ];
     }
     CFRelease(color_key as *const c_void);
+    let _: () = msg_send![storage, endEditing];
 }
 
 unsafe fn apply_syntect_highlights(
@@ -1397,6 +1438,7 @@ unsafe fn apply_syntect_highlights(
     if spans.is_empty() {
         return;
     }
+    let _: () = msg_send![storage, beginEditing];
     let color_key = make_nsstring("NSColor");
     for span in spans {
         let color: *mut AnyObject = msg_send![
@@ -1423,6 +1465,7 @@ unsafe fn apply_syntect_highlights(
         }
     }
     CFRelease(color_key as *const c_void);
+    let _: () = msg_send![storage, endEditing];
 }
 
 /// 直接应用已缓存的显示范围,避免每次打开详情重新扫描原文映射。
@@ -1434,6 +1477,7 @@ pub(crate) unsafe fn apply_prepared_code_highlights(
     if prepared.spans.is_empty() {
         return;
     }
+    let _: () = msg_send![storage, beginEditing];
     let color_key = make_nsstring("NSColor");
     for span in &prepared.spans {
         let color: *mut AnyObject = msg_send![
@@ -1451,6 +1495,7 @@ pub(crate) unsafe fn apply_prepared_code_highlights(
         ];
     }
     CFRelease(color_key as *const c_void);
+    let _: () = msg_send![storage, endEditing];
 }
 
 /// 使用缓存的 syntect 结果高亮代码;语言不确定时回退到原有轻量扫描器。

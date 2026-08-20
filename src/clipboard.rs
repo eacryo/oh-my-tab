@@ -56,7 +56,8 @@
 
 use crate::clipboard_highlight::{
     apply_code_paragraph_styles, apply_highlights, apply_prepared_code_highlights,
-    apply_visible_space_markers, classify_text, prepare_code_display, DisplaySourceMap, TextKind,
+    apply_visible_space_markers, classify_text, prepare_code_display, DisplaySourceMap,
+    PreparedCodeDisplay, TextKind,
 };
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -3801,7 +3802,7 @@ unsafe fn show_detail_for_sel() {
             // Degenerate entry (no preview, no source file): the detail falls back to the
             // filename text (same fallback as the row body).
             let (tw, th) = detail_text_size(&entry.text, TextKind::Plain, max_detail_h);
-            add_detail_text(content, &entry.text, tw, th, TextKind::Plain);
+            add_detail_text(content, &entry.text, tw, th, TextKind::Plain, None);
             w = tw;
             h = th;
         }
@@ -3809,8 +3810,18 @@ unsafe fn show_detail_for_sel() {
         // --- 文本条目:完整未截断文本,超出主浮窗高度后在详情内滚动 ---
         // Text entry: the full untruncated text; scrolls inside detail beyond picker height.
         let kind = classify_text(&entry.text);
-        let (tw, th) = detail_text_size(&entry.text, kind, max_detail_h);
-        add_detail_text(content, &entry.text, tw, th, kind);
+        // 代码详情的高度和内容视图共享同一份 PreparedCodeDisplay。此前两者各自调用
+        // prepare_code_display:第二次虽命中缓存,仍会哈希、检测语言并 clone 长文本模型。
+        // Code-detail sizing and content now share one PreparedCodeDisplay. Previously both
+        // called prepare_code_display; the second cache hit still hashed, detected language,
+        // and cloned the large text model.
+        let prepared_code = (kind == TextKind::Code)
+            .then(|| prepare_code_display(&entry.text, detail_code_max_columns(DETAIL_CODE_MAX_W)));
+        let (tw, th) = prepared_code
+            .as_ref()
+            .map(|prepared| detail_prepared_code_size(prepared, max_detail_h))
+            .unwrap_or_else(|| detail_text_size(&entry.text, kind, max_detail_h));
+        add_detail_text(content, &entry.text, tw, th, kind, prepared_code.as_ref());
         w = tw;
         h = th;
     }
@@ -3866,28 +3877,35 @@ fn detail_max_height(picker: NSRect) -> f64 {
     picker.size.height.max(DETAIL_TEXT_MIN_H)
 }
 
+/// 详情代码区可用宽度映射到同一套安全换行列数。高度计算和 NSTextView 构建必须使用
+/// 完全相同的值,才能复用一次准备的代码显示模型。
+/// Map detail-code width to the shared safe-wrap column count. Sizing and NSTextView creation
+/// must use exactly this value so they can reuse one prepared code-display model.
+fn detail_code_max_columns(width: f64) -> usize {
+    let columns = ((width - DETAIL_PAD * 2.0) / 8.4).floor().max(0.0) as usize;
+    columns.saturating_sub(DETAIL_CODE_WRAP_SAFETY).max(24)
+}
+
+/// 根据已准备的代码显示模型计算尺寸,避免高度估算再次格式化、哈希和复制长文本。
+/// Size the panel from an already prepared code-display model, avoiding a second formatting,
+/// hashing, and large-text copy during height estimation.
+fn detail_prepared_code_size(prepared: &PreparedCodeDisplay, max_height: f64) -> (f64, f64) {
+    let lines = prepared.text.split('\n').count();
+    let h = (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H)
+        .clamp(DETAIL_TEXT_MIN_H, max_height);
+    (DETAIL_CODE_MAX_W, h)
+}
+
 /// 计算详情文本面板尺寸(宽按文本类型;高按视觉行数并限制在主浮窗高度内)。
 /// Compute detail text-panel dimensions (type-specific width, height capped by the picker).
 fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
-    let w = if kind == TextKind::Code {
-        DETAIL_CODE_MAX_W
-    } else {
-        DETAIL_MAX_W
-    };
-    let lines = if kind == TextKind::Code {
-        // 用同一套显示格式化器计算视觉行数,避免插入的安全换行被高度估算漏掉。
-        // Use the same display formatter for visual line count so inserted safe breaks affect height.
-        let max_columns = (((DETAIL_CODE_MAX_W - DETAIL_PAD * 2.0) / 8.4).floor() as usize)
-            .saturating_sub(DETAIL_CODE_WRAP_SAFETY)
-            .max(24);
-        prepare_code_display(text, max_columns)
-            .text
-            .split('\n')
-            .count()
-    } else {
-        let avail_w = w - DETAIL_PAD * 2.0;
-        estimate_lines(text, detail_text_units(avail_w))
-    };
+    if kind == TextKind::Code {
+        let prepared = prepare_code_display(text, detail_code_max_columns(DETAIL_CODE_MAX_W));
+        return detail_prepared_code_size(&prepared, max_height);
+    }
+    let w = DETAIL_MAX_W;
+    let avail_w = w - DETAIL_PAD * 2.0;
+    let lines = estimate_lines(text, detail_text_units(avail_w));
     let h = (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H)
         .clamp(DETAIL_TEXT_MIN_H, max_height);
     (w, h)
@@ -3925,8 +3943,16 @@ extern "C" fn detail_text_view_copy(_self: *mut c_void, _cmd: Sel, _sender: *mut
     copy_detail_selection();
 }
 
-unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64, kind: TextKind) {
+unsafe fn add_detail_text(
+    content: *mut AnyObject,
+    text: &str,
+    w: f64,
+    h: f64,
+    kind: TextKind,
+    prepared_code: Option<&PreparedCodeDisplay>,
+) {
     let is_code = kind == TextKind::Code;
+    debug_assert!(!is_code || prepared_code.is_some());
     let avail_w = w - DETAIL_PAD * 2.0;
     let body_h = (h - DETAIL_PAD * 2.0).max(DETAIL_LINE_H);
     let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
@@ -3945,15 +3971,13 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64, k
     // The display formatter inserts hanging visual breaks at safe symbols, so no horizontal
     // scrolling is needed for normal code lines.
     let _: () = msg_send![scroll, setHasHorizontalScroller: false];
-    let max_columns = ((avail_w / 8.4).floor() as usize)
-        .saturating_sub(DETAIL_CODE_WRAP_SAFETY)
-        .max(24);
-    let prepared = is_code.then(|| prepare_code_display(text, max_columns));
-    let display_text = prepared
-        .as_ref()
-        .map(|code| code.text.clone())
-        .unwrap_or_else(|| text.to_owned());
-    if let Some(code) = &prepared {
+    // 详情打开路径已在 show_detail_for_sel 准备一次;此处只借用,不再命中缓存后 clone
+    // 完整的显示文本/映射/span。
+    // show_detail_for_sel prepares code once before this call; borrow it here instead of hitting
+    // the cache and cloning its complete display text, map, and spans again.
+    let prepared = prepared_code;
+    let display_text = prepared.map(|code| code.text.as_str()).unwrap_or(text);
+    if let Some(code) = prepared {
         *DETAIL_SOURCE_MAP.lock().unwrap() = Some(code.source_map.clone());
     }
     let tv: *mut AnyObject = msg_send![detail_text_view_class(), alloc];
@@ -3961,7 +3985,7 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64, k
         tv,
         initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(avail_w, body_h))
     ];
-    let ns_text = make_nsstring(&display_text);
+    let ns_text = make_nsstring(display_text);
     let _: () = msg_send![tv, setString: ns_text];
     CFRelease(ns_text as *const c_void);
 
@@ -3969,11 +3993,11 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64, k
     // The detail view reuses the same text classification and lexical highlighter as the list,
     // including URLs, HTML, and ordinary code snippets.
     let storage: *mut AnyObject = msg_send![tv, textStorage];
-    if let Some(code) = &prepared {
+    if let Some(code) = prepared {
         apply_prepared_code_highlights(storage, code);
         apply_visible_space_markers(storage, &code.text);
     } else {
-        apply_highlights(storage, &display_text, kind);
+        apply_highlights(storage, display_text, kind);
     }
 
     let _: () = msg_send![tv, setEditable: false];
@@ -3995,7 +4019,7 @@ unsafe fn add_detail_text(content: *mut AnyObject, text: &str, w: f64, h: f64, k
     };
     let _: () = msg_send![tv, setFont: font];
     if is_code {
-        apply_code_paragraph_styles(storage, &display_text);
+        apply_code_paragraph_styles(storage, display_text);
     }
     // 详情窗口外框对齐条目内容块顶部,正文再补上列表的行内顶部留白,避免整体窗口下移。
     // The detail frame aligns with the row content block; add the list's top padding inside
