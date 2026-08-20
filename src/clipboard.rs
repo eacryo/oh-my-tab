@@ -180,6 +180,9 @@ const SEARCH_ICON_W: f64 = 22.0;
 /// 搜索内容存在时附加的清除叉号尺寸。
 /// The extra clear × size when a query exists.
 const SEARCH_CLEAR_W: f64 = 18.0;
+/// 搜索查询在编辑态和失焦态共用的字号。
+/// Shared query font size for both editing and unfocused states.
+const SEARCH_FONT_SIZE: f64 = 14.0;
 /// meta 行内来源应用小图标尺寸(新设计稿 .app-icon 13px)。
 /// The meta line's source-app icon size (the new mockup's .app-icon 13px).
 const META_ICON: f64 = 13.0;
@@ -4661,6 +4664,12 @@ unsafe fn ensure_picker_window() {
     let empty_ns = make_nsstring("");
     let cell: *mut AnyObject = msg_send![cell, initTextCell: empty_ns];
     CFRelease(empty_ns as *const c_void);
+    // NSSearchField 的 field editor 不保证从 control 继承字号;先把 cell 固定为共享
+    // 字号,并在 selectWithFrame: 中再次应用给实际 editor。
+    // NSSearchField's field editor does not reliably inherit the control font; set the cell to
+    // the shared size here and apply it again to the live editor in selectWithFrame:.
+    let search_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: SEARCH_FONT_SIZE];
+    let _: () = msg_send![cell, setFont: search_font];
     // 占位提示(放大镜 + 文案)独立构建;按设计稿为静态文案(条数显示移到底部栏)。
     // The placeholder (magnifier + text) is built separately; per the mockup it is a
     // static string (the entry count moved to the footer).
@@ -4721,10 +4730,13 @@ unsafe fn ensure_picker_window() {
                                                            // 编辑态文本与占位一致左对齐(设计稿文字靠左)。
                                                            // Editing text is left-aligned like the placeholder (the mockup's layout).
     let _: () = msg_send![search, setAlignment: 0u64]; // left
-                                                       // 磨砂化:去掉系统描边/bezel,换成 4.5% 黑底 + 1px 内描边;保留的系统 × 已直连
-                                                       // clearSearch:，不会因响应链而失效。
-                                                       // Frosted: drop the system bezel for a 4.5% black fill + a 1px inner ring; any
-                                                       // remaining system × is bound directly to clearSearch:, not the responder chain.
+                                                       // 输入态必须与 ↓ 后手绘的保留查询统一为 14pt,避免焦点切换时字号突变。
+                                                       // Match the 14pt hand-drawn retained query after ↓, avoiding a font-size jump on focus change.
+    let _: () = msg_send![search, setFont: search_font];
+    // 磨砂化:去掉系统描边/bezel,换成 4.5% 黑底 + 1px 内描边;保留的系统 × 已直连
+    // clearSearch:，不会因响应链而失效。
+    // Frosted: drop the system bezel for a 4.5% black fill + a 1px inner ring; any
+    // remaining system × is bound directly to clearSearch:, not the responder chain.
     let _: () = msg_send![search, setBezeled: false];
     let _: () = msg_send![search, setDrawsBackground: false];
     let _: () = msg_send![search, setWantsLayer: true];
@@ -5609,9 +5621,21 @@ unsafe fn draw_search_placeholder(cell_frame: NSRect) {
     if text.is_null() {
         return;
     }
-    let size: NSSize = msg_send![text, size];
     let x = cell_frame.origin.x + SEARCH_PAD_IN + SEARCH_ICON_W;
-    let y = cell_frame.origin.y + (cell_frame.size.height - size.height) / 2.0;
+    // 与保留查询同款:用字体 lineHeight 垂直居中,保证占位/输入/失焦三种状态文字在
+    // 同一行框内,首字符键入与 ↓ 切换都不跳动。
+    // Same lineHeight centering as the retained query, so the placeholder, the typed text,
+    // and the unfocused query all share one line box (no jump on the first keystroke or ↓).
+    let font_key = make_nsstring("NSFont");
+    let font: *mut AnyObject = msg_send![
+        text,
+        attribute: font_key,
+        atIndex: 0usize,
+        effectiveRange: std::ptr::null_mut::<NSRange>()
+    ];
+    CFRelease(font_key as *const c_void);
+    let line_h: f64 = msg_send![font, lineHeight];
+    let y = cell_frame.origin.y + (cell_frame.size.height - line_h) / 2.0;
     let _: () = msg_send![text, drawAtPoint: NSPoint::new(x, y)];
 }
 
@@ -5630,7 +5654,7 @@ unsafe fn draw_retained_search_query(cell_frame: NSRect, query: *mut AnyObject) 
     let attrs: *mut AnyObject = msg_send![attrs, init];
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: SEARCH_FONT_SIZE];
     let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.82f64];
     let _: () = msg_send![attrs, setObject: font, forKey: font_key];
     let _: () = msg_send![attrs, setObject: color, forKey: color_key];
@@ -5639,9 +5663,14 @@ unsafe fn draw_retained_search_query(cell_frame: NSRect, query: *mut AnyObject) 
     let value: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
     let value: *mut AnyObject = msg_send![value, initWithString: query, attributes: attrs];
     release_obj(attrs);
-    let size: NSSize = msg_send![value, size];
     let x = cell_frame.origin.x + SEARCH_PAD_IN + prefix_size.width;
-    let y = cell_frame.origin.y + (cell_frame.size.height - size.height) / 2.0;
+    // 垂直居中用字体的 lineHeight(实测 17.0)——即编辑态光标/行片段的高度,与字段
+    // 编辑器 inset 同款度量,保证按 ↓ 后保留查询与输入态文字在同一行框内。
+    // Center with the font's lineHeight (measured 17.0) -- the same height as the field
+    // editor's caret/line fragment and its textContainerInset metric, so the retained
+    // query shares the editing text's line box after ↓.
+    let line_h: f64 = msg_send![font, lineHeight];
+    let y = cell_frame.origin.y + (cell_frame.size.height - line_h) / 2.0;
     let _: () = msg_send![value, drawAtPoint: NSPoint::new(x, y)];
     release_obj(value);
 }
@@ -5851,30 +5880,68 @@ extern "C" fn search_cell_select_with_frame(
             sel_length,
         );
         // 编辑器 frame 会被系统在后续布局中重置(setFrame 无效),而 textContainerInset
-        // 是持久属性。AppKit 已预留搜索框的内边距,这里只补 22pt 图标列;再加 12pt 会
-        // 让光标压到占位文字。垂直位置按 40pt 搜索栏和实际字体行框居中。
+        // 是持久属性。输入态必须从 12pt 内边距 + 22pt 图标列开始,与 ↓ 交出焦点后
+        // draw_retained_search_query 的坐标完全一致,避免文本横向跳动。
         // The system resets the editor frame during later layout (so setFrame is ineffective),
-        // whereas textContainerInset persists. AppKit already reserves the search field's inner
-        // padding, so add only the 22pt icon column; adding another 12pt puts the caret over the
-        // placeholder text. Vertically center against the 40pt search field and its real font
-        // line box.
-        if !editor.is_null() && rect.size.height > 0.0 {
+        // whereas textContainerInset persists. Typing must start after the 12pt field padding
+        // plus 22pt icon column, exactly matching draw_retained_search_query after ↓ moves
+        // focus to the list, so the text never shifts horizontally.
+        if !editor.is_null() && rect.size.height > 0.0 && !control_view.is_null() {
             let font: *mut AnyObject = msg_send![_self as *mut AnyObject, font];
             if !font.is_null() {
-                let asc: f64 = msg_send![font, ascender];
-                let desc: f64 = msg_send![font, descender];
-                let lead: f64 = msg_send![font, leading];
-                let line_h = asc - desc + lead;
+                // 强制 live field editor 使用与失焦手绘查询相同的字体。仅设置
+                // NSSearchField 并不总会覆盖复用的 shared field editor 的默认字体。
+                // Force the live field editor to the same font as the hand-drawn unfocused
+                // query. Setting NSSearchField alone does not always override a reused shared
+                // field editor's default font.
+                let _: () = msg_send![editor as *mut AnyObject, setFont: font];
+                // 光标/行片段高度 = 字体的 lineHeight(实测 17.0),而非 asc-desc+lead
+                // (16.49):按后者居中会让 17pt 高的片段/光标中心落在 20.25,偏高 0.25pt。
+                // The caret/line-fragment height is the font's lineHeight (measured 17.0),
+                // not asc-desc+lead (16.49): centering by the latter leaves the 17pt-tall
+                // fragment/caret center at 20.25, 0.25pt off the field's center.
+                let line_h: f64 = msg_send![font, lineHeight];
                 if line_h > 0.0 && line_h < rect.size.height {
-                    // NSTextView 的 caret 顶端比 textContainerInset 高约 1.8pt;补偿后
-                    // 让可见 caret 的中点与 CSS `align-items: center` 的输入行对齐。
-                    // NSTextView draws the caret about 1.8pt above textContainerInset; compensate
-                    // so its visible midpoint aligns with CSS `align-items: center`.
-                    let vertical = ((rect.size.height - line_h) / 2.0 + 1.8).max(0.0);
+                    // 垂直居中必须相对"编辑器顶部在字段坐标中的位置"计算:输入态文字顶边
+                    // = 编辑器顶边相对字段上沿的偏移 + inset,行框中心应落在字段垂直中心。
+                    // 之前按 frame 高度差做**加法**补偿,会把共享 field editor 每次聚焦
+                    // 撑高 2/4/8/16pt(inset 越大越长,正反馈),文字逐次下移且越来越偏。
+                    // 改为减去编辑器顶部偏移(convertRect 换算到字段坐标系),inset 随
+                    // 编辑器实际位置自我校正,文字稳定居中,也不再触发编辑器长高。
+                    // Vertical centering must be computed against the editor's TOP in the
+                    // field's coordinate system: the typed text's top edge = the editor's
+                    // top offset above the field + the inset, and the line box's center must
+                    // land on the field's vertical center. The old code ADDED the frame's
+                    // height excess to the inset, which inflated the shared field editor by
+                    // 2/4/8/16pt on every focus (a positive feedback loop -- the bigger the
+                    // inset, the taller it grew), drifting the text lower each cycle. Now the
+                    // editor's top offset (converted into field coordinates) is SUBTRACTED,
+                    // so the inset self-corrects against the editor's real position: the text
+                    // stays centered and the editor stops growing.
+                    let ed_bounds: NSRect = msg_send![editor as *mut AnyObject, bounds];
+                    let in_field: NSRect = msg_send![
+                        control_view as *mut AnyObject,
+                        convertRect: ed_bounds,
+                        fromView: editor as *mut AnyObject
+                    ];
+                    // 编辑器顶部相对字段上沿的偏移(非翻转字段坐标:顶部 = maxY)。
+                    // How far the editor's top sits above the field's top (non-flipped:
+                    // the top edge is maxY).
+                    let top_offset = in_field.origin.y + in_field.size.height - rect.size.height;
+                    let vertical = ((rect.size.height - line_h) / 2.0 - top_offset).max(0.0);
                     let _: () = msg_send![
                         editor as *mut AnyObject,
-                        setTextContainerInset: NSSize::new(SEARCH_ICON_W, vertical)
+                        setTextContainerInset: NSSize::new(SEARCH_PAD_IN + SEARCH_ICON_W, vertical)
                     ];
+                    // NSTextContainer 默认 lineFragmentPadding = 2,会把输入文字额外右推 2pt,
+                    // 与失焦后手绘保留查询的起点(12 + 22 = 34)不一致 → 按 ↓ 时文字左跳 2pt。
+                    // 置零让字形从容器原点(即 inset 起点)开始,与手绘坐标完全一致。
+                    // NSTextContainer's default lineFragmentPadding = 2 pushes the typed text
+                    // 2pt right of the hand-drawn retained query's start (12 + 22 = 34),
+                    // making the text jump left on ↓. Zeroing it makes the glyphs start at
+                    // the container origin (the inset start), matching the hand-drawn x.
+                    let tc: *mut AnyObject = msg_send![editor as *mut AnyObject, textContainer];
+                    let _: () = msg_send![tc, setLineFragmentPadding: 0.0];
                 }
             }
         }
