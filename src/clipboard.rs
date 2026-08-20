@@ -5622,21 +5622,12 @@ unsafe fn draw_search_placeholder(cell_frame: NSRect) {
         return;
     }
     let x = cell_frame.origin.x + SEARCH_PAD_IN + SEARCH_ICON_W;
-    // 与保留查询同款:用字体 lineHeight 垂直居中,保证占位/输入/失焦三种状态文字在
-    // 同一行框内,首字符键入与 ↓ 切换都不跳动。
-    // Same lineHeight centering as the retained query, so the placeholder, the typed text,
-    // and the unfocused query all share one line box (no jump on the first keystroke or ↓).
-    let font_key = make_nsstring("NSFont");
-    let font: *mut AnyObject = msg_send![
-        text,
-        attribute: font_key,
-        atIndex: 0usize,
-        effectiveRange: std::ptr::null_mut::<NSRange>()
-    ];
-    CFRelease(font_key as *const c_void);
-    let line_h: f64 = msg_send![font, lineHeight];
-    let y = cell_frame.origin.y + (cell_frame.size.height - line_h) / 2.0;
-    let _: () = msg_send![text, drawAtPoint: NSPoint::new(x, y)];
+    // 与保留查询同款(同一 NSLayoutManager 路径 + floor 定位),保证占位/输入/失焦三种
+    // 状态文字逐像素一致,首字符键入与 ↓ 切换都不跳动。
+    // Same rendering as the retained query (the shared NSLayoutManager path + floored
+    // position), so the placeholder, the typed text, and the unfocused query are
+    // pixel-identical (no jump on the first keystroke or ↓).
+    draw_search_query_layout(cell_frame, text, x);
 }
 
 /// 失焦但仍有查询时,用与手绘占位相同的字体和基线绘制值,避免 ↓ 进入结果列表时从
@@ -5664,15 +5655,64 @@ unsafe fn draw_retained_search_query(cell_frame: NSRect, query: *mut AnyObject) 
     let value: *mut AnyObject = msg_send![value, initWithString: query, attributes: attrs];
     release_obj(attrs);
     let x = cell_frame.origin.x + SEARCH_PAD_IN + prefix_size.width;
-    // 垂直居中用字体的 lineHeight(实测 17.0)——即编辑态光标/行片段的高度,与字段
-    // 编辑器 inset 同款度量,保证按 ↓ 后保留查询与输入态文字在同一行框内。
-    // Center with the font's lineHeight (measured 17.0) -- the same height as the field
-    // editor's caret/line fragment and its textContainerInset metric, so the retained
-    // query shares the editing text's line box after ↓.
-    let line_h: f64 = msg_send![font, lineHeight];
-    let y = cell_frame.origin.y + (cell_frame.size.height - line_h) / 2.0;
-    let _: () = msg_send![value, drawAtPoint: NSPoint::new(x, y)];
+    draw_search_query_layout(cell_frame, value, x);
     release_obj(value);
+}
+
+/// 用字段编辑器同款 NSLayoutManager 路径绘制查询/占位文本:drawAtPoint: 的字形布局与
+/// layout manager 有 ~0.5pt 差异('l' 字干顶端会被截短),按 ↓ 切换时文字看似下移。
+/// 建临时 storage/layoutManager/textContainer,画完即弃,保证与输入态文字逐像素一致。
+/// Draws the query/placeholder text through the same NSLayoutManager path as the field
+/// editor: drawAtPoint:'s glyph layout differs ~0.5pt from the layout manager (the 'l'
+/// stem tip gets clipped), making the text look lower after ↓. A throwaway storage /
+/// layoutManager / textContainer makes the rendering pixel-identical to the typed text.
+/// 行框顶边取 floor:字段编辑器的 textContainerOrigin 会把 inset 向下取整到整数点
+/// (实测 11.5 → 11.0),保留绘制必须用同一个取整后的位置,否则按 ↓ 会差 0.5pt。
+/// The line-box top is floored: the field editor's textContainerOrigin floors the inset
+/// to integer points (measured 11.5 -> 11.0); the retained draw must use that same
+/// floored position or it ends up 0.5pt off after ↓.
+unsafe fn draw_search_query_layout(cell_frame: NSRect, value: *mut AnyObject, x: f64) {
+    let font_key = make_nsstring("NSFont");
+    let font: *mut AnyObject = msg_send![
+        value,
+        attribute: font_key,
+        atIndex: 0usize,
+        effectiveRange: std::ptr::null_mut::<NSRange>()
+    ];
+    CFRelease(font_key as *const c_void);
+    let line_h: f64 = msg_send![font, lineHeight];
+    let y_top = ((cell_frame.size.height - line_h) / 2.0).floor();
+    let storage: *mut AnyObject = msg_send![class!(NSTextStorage), alloc];
+    let storage: *mut AnyObject = msg_send![storage, initWithAttributedString: value];
+    let lm: *mut AnyObject = msg_send![class!(NSLayoutManager), alloc];
+    let lm: *mut AnyObject = msg_send![lm, init];
+    let _: () = msg_send![storage, addLayoutManager: lm];
+    let tc: *mut AnyObject = msg_send![class!(NSTextContainer), alloc];
+    let tc: *mut AnyObject =
+        msg_send![tc, initWithContainerSize: NSSize::new(cell_frame.size.width, line_h)];
+    let _: () = msg_send![lm, addTextContainer: tc];
+    // 与编辑器容器同款配置:无行片段内边距、使用字体 leading。
+    // Match the editor's container: no line-fragment padding, use font leading.
+    let _: () = msg_send![tc, setLineFragmentPadding: 0.0];
+    let _: () = msg_send![lm, setUsesFontLeading: true];
+    let _: () = msg_send![lm, ensureLayoutForTextContainer: tc];
+    let glyph_range: NSRange = msg_send![lm, glyphRangeForTextContainer: tc];
+    // 搜索框是翻转视图(isFlipped=true,实测),cell 绘制上下文与 LM 字形同为翻转坐标:
+    // 直接以行框顶边 y_top 为原点画字形即可,与字段编辑器完全一致。之前用翻转离屏图
+    // 合成,NSImage 的翻转语义随目标上下文变化——真实屏幕(翻转)上会上下颠倒。
+    // The search field is a flipped view (isFlipped=true, measured), so the cell's drawing
+    // context and the layout-manager glyphs share the flipped coordinate system: drawing
+    // the glyphs directly with the line-box top y_top as the origin matches the field
+    // editor exactly. The earlier flipped-offscreen-image composite flipped again on the
+    // real (flipped) screen, rendering the text upside down.
+    let _: () = msg_send![
+        lm,
+        drawGlyphsForGlyphRange: glyph_range,
+        atPoint: NSPoint::new(x, y_top)
+    ];
+    release_obj(tc);
+    release_obj(lm);
+    release_obj(storage);
 }
 
 /// 居中自绘占位:非编辑态 + 空字段 → 把"放大镜 + 文字"整体画在 cell 水平中心;
