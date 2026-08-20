@@ -181,6 +181,8 @@ const META_ICON: f64 = 13.0;
 const ACTION_BTN: f64 = 23.0;
 const ACTION_H: f64 = 21.0;
 const ACTION_GAP: f64 = 2.0;
+/// 详情 SVG 图标画布尺寸(设计稿 16px)。/ Detail SVG-style icon canvas (16px in mockup).
+const DETAIL_ACTION_ICON: f64 = 16.0;
 /// 右侧操作区占宽 = 置顶 + 详情 + 删除 + 两间隙 / the actions strip's width.
 const ACTIONS_W: f64 = ACTION_BTN * 3.0 + ACTION_GAP * 2.0;
 /// 时间分组头区域高度(设计稿 27px)/ the time-group header zone height (27px).
@@ -532,11 +534,18 @@ fn content_width() -> f64 {
     PICKER_W - PAD_X * 2.0 - ROW_PAD_L - ROW_PAD_R
 }
 
-/// 是否显示来源应用(读 CONFIG;记录始终进行,开关只控制行内副信息里的名称显示)。
-/// Whether the source app name is shown (reads CONFIG; recording is always on, the toggle
-/// only gates the name in the row's meta line).
+/// 是否显示来源应用(读 CONFIG;记录始终进行,开关同时控制行内副信息的名称和图标)。
+/// Whether the source app is shown (reads CONFIG; recording is always on, the toggle gates
+/// both the name and icon in the row's meta line).
 fn show_source_app() -> bool {
     CONFIG.read().unwrap().clipboard.show_source_app
+}
+
+/// 来源图标和来源名称属于同一个显示开关;缺少图标缓存键时也无需尝试读取文件。
+/// The source icon and name share one display switch; without an icon-cache key there is no
+/// file to load either.
+fn should_show_source_icon(show_source: bool, entry: &ClipEntry) -> bool {
+    show_source && !entry.source_key.is_empty()
 }
 
 /// 行内副信息(应用名 · 相对时间):正文下方的小字,按设计稿 10px 浅灰。
@@ -3460,6 +3469,9 @@ fn hide_detail() {
     if !DETAIL_VISIBLE.swap(false, Ordering::SeqCst) {
         return;
     }
+    // 关闭后撤掉对应行的实心详情图标,无需重建整个列表。
+    // Remove the source row's filled detail icon on close without rebuilding the list.
+    refresh_detail_action_visuals();
     // 详情打开期间主浮窗为了整体布局可能被左移;关闭时恢复原始位置,但保留当前高度。
     // The picker may have shifted left for the combined layout; restore its original origin
     // while preserving its current height.
@@ -3845,6 +3857,7 @@ unsafe fn show_detail_for_sel() {
     // orderFrontRegardless: never takes key (canBecomeKeyWindow=NO keeps the picker key).
     let _: () = msg_send![window, orderFrontRegardless];
     DETAIL_VISIBLE.store(true, Ordering::SeqCst);
+    refresh_detail_action_visuals();
 }
 
 /// 详情高度上限等于主浮窗高度,使详情上下边缘始终包含在主浮窗内。
@@ -5051,6 +5064,13 @@ unsafe fn rebuild_rows() {
             act_y,
             act_alpha,
         );
+        // 详情已展开且本行被选中时,详情按钮显示实心圆 + 白色 i 的激活图标。
+        // When detail is open for this selected row, show the active filled-circle + white-i icon.
+        set_detail_action_style(
+            details_btn,
+            detail_action_is_active(DETAIL_VISIBLE.load(Ordering::SeqCst), sel_idx, i),
+            false,
+        );
         if !details_btn.is_null() {
             let _: () = msg_send![container, addSubview: details_btn];
             release_obj(details_btn);
@@ -6215,16 +6235,23 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
 }
 
 /// meta 段(attributed):13px 来源应用小图标(文本附件)+ "应用 · 时间",10px 30% 黑。
-/// 图标不存在时只出文字。新设计稿 meta 行的 .app-icon。
+/// 关闭来源显示或图标不存在时只出时间。新设计稿 meta 行的 .app-icon。
 /// The meta line (attributed): a 13px source-app icon (text attachment) + "app · time",
-/// 10px 30% black. Text only when no icon. The new mockup's meta .app-icon.
+/// 10px 30% black. With source display off or no icon, it shows time only.
 unsafe fn make_meta_footer_attributed(entry: &ClipEntry, show_source: bool) -> *mut AnyObject {
     let total: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
     let empty_ns = make_nsstring("");
     let total: *mut AnyObject = msg_send![total, initWithString: empty_ns];
     CFRelease(empty_ns as *const c_void);
 
-    let icon = load_source_icon(entry, META_ICON);
+    // 设置关闭时不读取也不附加来源图标,确保图标与来源文字同时隐藏。
+    // With the setting off, neither load nor attach the source icon so it hides together
+    // with the source text.
+    let icon = if should_show_source_icon(show_source, entry) {
+        load_source_icon(entry, META_ICON)
+    } else {
+        std::ptr::null_mut()
+    };
     if !icon.is_null() {
         // 13px 图标 → 文本附件,基线对齐后接一个空格。
         // The 13px icon as a text attachment, baseline-aligned with a trailing space.
@@ -6363,6 +6390,121 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     target
 }
 
+/// 详情按钮仅在详情已展开且所属行仍被选中时激活。独立成纯逻辑,让建行、开关详情
+/// 与单测都使用同一条件。
+/// A detail action is active only while detail is open and its owning row remains selected.
+/// Keep this pure so row creation, detail open/close, and tests share one condition.
+fn detail_action_is_active(detail_visible: bool, selected: usize, row: usize) -> bool {
+    detail_visible && selected != NO_SELECTION && selected == row
+}
+
+/// 生成 HTML 设计稿同款详情图标:普通态为深色空心圆 + i;激活态为深色实心圆 +
+/// 白色 i。用预着色 NSImage 而非 Unicode `ⓘ`,以便圆环、点和竖线分别遵循设计稿。
+/// Draw the mockup's detail icon: a dark outlined circle plus i normally, or a dark filled
+/// circle plus white i while active. Use a precolored NSImage instead of Unicode `ⓘ` so the
+/// ring, dot, and stem follow the mockup independently.
+unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject {
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject = msg_send![
+        image,
+        initWithSize: NSSize::new(DETAIL_ACTION_ICON, DETAIL_ACTION_ICON)
+    ];
+    let _: () = msg_send![image, lockFocus];
+    let circle: *mut AnyObject = msg_send![
+        class!(NSBezierPath),
+        bezierPathWithOvalInRect: NSRect::new(
+            // HTML: viewBox 20 × 20, circle cx/cy=10, r=7. 映射到 16pt 画布时,
+            // 圆心为 8、半径为 5.6,不能直接使用原 SVG 的 7pt 半径。
+            // HTML uses a 20 × 20 viewBox with a circle at 10/10 and r=7. On our 16pt
+            // canvas that is center 8 and radius 5.6; do not use the SVG's raw 7pt radius.
+            NSPoint::new(2.4, 2.4),
+            NSSize::new(11.2, 11.2)
+        )
+    ];
+    let circle_alpha = match (active, hovered) {
+        (true, true) => 0.68,
+        (true, false) => 0.58,
+        (false, true) => 0.62,
+        (false, false) => 0.34,
+    };
+    let circle_color: *mut AnyObject =
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: circle_alpha];
+    let _: () = msg_send![circle_color, set];
+    // 设计稿的 1.45px 描边同样按 16 / 20 缩放;激活态仍保留同色描边。
+    // Scale the mockup's 1.45px stroke by 16 / 20; the active state retains this same-color stroke.
+    let _: () = msg_send![circle, setLineWidth: 1.16f64];
+    if active {
+        let _: () = msg_send![circle, fill];
+    }
+    let _: () = msg_send![circle, stroke];
+    let glyph_alpha = if active {
+        0.96
+    } else if hovered {
+        0.66
+    } else {
+        0.42
+    };
+    let glyph_color: *mut AnyObject = if active {
+        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: glyph_alpha]
+    } else {
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: glyph_alpha]
+    };
+    let _: () = msg_send![glyph_color, set];
+    // 坐标按 SVG 视图翻转后换算:点在上,竖线从中部延伸到底部。
+    // Coordinates convert the SVG view's flipped axis: the dot is above the stem.
+    let dot: *mut AnyObject = msg_send![
+        class!(NSBezierPath),
+        bezierPathWithOvalInRect: NSRect::new(NSPoint::new(7.2, 10.08), NSSize::new(1.6, 1.6))
+    ];
+    let _: () = msg_send![dot, fill];
+    let stem: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+    let _: () = msg_send![stem, moveToPoint: NSPoint::new(8.0, 8.56)];
+    let _: () = msg_send![stem, lineToPoint: NSPoint::new(8.0, 4.8)];
+    let _: () = msg_send![stem, setLineWidth: 1.12f64];
+    let _: () = msg_send![stem, setLineCapStyle: 1isize]; // NSLineCapStyleRound
+    let _: () = msg_send![stem, stroke];
+    let _: () = msg_send![image, unlockFocus];
+    let _: () = msg_send![image, setTemplate: false];
+    image
+}
+
+/// 用普通/悬停/激活状态替换详情按钮的自绘图标。图标自身携带颜色,按钮底色保持透明,
+/// 与 HTML `.action.details` 规则一致。
+/// Replace the detail action's drawn icon for its normal/hover/active state. The image carries
+/// its own colors and the button background remains transparent, matching HTML `.action.details`.
+unsafe fn set_detail_action_style(button: *mut AnyObject, active: bool, hovered: bool) {
+    if button.is_null() {
+        return;
+    }
+    let icon = make_detail_action_icon(active, hovered);
+    let empty = make_nsstring("");
+    let _: () = msg_send![button, setTitle: empty];
+    CFRelease(empty as *const c_void);
+    let _: () = msg_send![button, setImage: icon];
+    let _: () = msg_send![button, setImagePosition: 1isize]; // NSImageOnly
+    release_obj(icon);
+    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(clear));
+}
+
+/// 详情开关不会重建列表,因此单独刷新已有详情按钮的激活态。
+/// Toggling detail does not rebuild the list, so refresh existing detail-action active states.
+fn refresh_detail_action_visuals() {
+    let visible = DETAIL_VISIBLE.load(Ordering::SeqCst);
+    let selected = *PICKER_SELECTION.lock().unwrap();
+    let views = ROW_HOVER_VIEWS.lock().unwrap();
+    unsafe {
+        for (row, view) in views.iter().enumerate() {
+            set_detail_action_style(
+                view.details.0,
+                detail_action_is_active(visible, selected, row),
+                false,
+            );
+        }
+    }
+}
+
 /// 行内操作按钮(置顶/删除):SF Symbol 图标、无边框、透明度由调用方给出
 /// (完全透明待命,行悬停/选中时显现)。
 /// A per-row action button (pin/delete): an SF Symbol icon, borderless, its alpha
@@ -6407,6 +6549,17 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
+        if action == sel!(showItemDetails:) {
+            let tag: isize = msg_send![b, tag];
+            let active = tag >= 0
+                && detail_action_is_active(
+                    DETAIL_VISIBLE.load(Ordering::SeqCst),
+                    *PICKER_SELECTION.lock().unwrap(),
+                    tag as usize,
+                );
+            set_detail_action_style(b, active, true);
+            return;
+        }
         if action == sel!(deleteEntry:) {
             let c: *mut AnyObject = msg_send![
                 class!(NSColor),
@@ -6443,9 +6596,11 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
             ];
             let layer: *mut AnyObject = msg_send![b, layer];
             crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
-        } else if action == sel!(togglePin:) || action == sel!(showItemDetails:) {
-            // 置顶/详情共同的行内悬停(新设计稿 .action:hover):变深 + 浅底。
-            // The shared per-row hover for pin/details (the new mockup's .action:hover).
+        } else if action == sel!(togglePin:) {
+            // 置顶行内悬停(新设计稿 .action:hover):变深 + 浅底。详情改用专属 SVG
+            // 图标的空心/实心状态,已在本函数开头提前处理。
+            // Pin hover darkens with a faint fill. Details use their dedicated SVG-style
+            // outlined/filled states and were handled at this function's start.
             let c: *mut AnyObject =
                 msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.72f64];
             let _: () = msg_send![b, setContentTintColor: c];
@@ -6470,6 +6625,17 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_
         let action: Sel = msg_send![b, action];
         if action == sel!(filterPillClicked:) {
             update_filter_pill_style();
+            return;
+        }
+        if action == sel!(showItemDetails:) {
+            let tag: isize = msg_send![b, tag];
+            let active = tag >= 0
+                && detail_action_is_active(
+                    DETAIL_VISIBLE.load(Ordering::SeqCst),
+                    *PICKER_SELECTION.lock().unwrap(),
+                    tag as usize,
+                );
+            set_detail_action_style(b, active, false);
             return;
         }
         let c: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.32f64];
@@ -8397,6 +8563,15 @@ mod tests {
     }
 
     #[test]
+    fn detail_action_is_active_only_for_the_open_selected_row() {
+        use super::{detail_action_is_active, NO_SELECTION};
+        assert!(detail_action_is_active(true, 2, 2));
+        assert!(!detail_action_is_active(false, 2, 2));
+        assert!(!detail_action_is_active(true, 2, 1));
+        assert!(!detail_action_is_active(true, NO_SELECTION, 0));
+    }
+
+    #[test]
     fn empty_state_hint_uses_the_live_viewport_height() {
         use super::{empty_state_doc_height, header_strip_h, FOOTER_H, PICKER_MIN_HEIGHT};
         let min_list_h = PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H;
@@ -8947,6 +9122,17 @@ mod tests {
             .source_map
             .source_range(NSRange::new(0, display_len));
         assert_eq!(source_range.length, source.encode_utf16().count());
+    }
+
+    #[test]
+    fn source_icon_visibility_follows_the_source_display_toggle() {
+        use super::should_show_source_icon;
+        let mut e = entry("copied");
+        e.source_key = "com.example.app".to_string();
+        assert!(should_show_source_icon(true, &e));
+        assert!(!should_show_source_icon(false, &e));
+        e.source_key.clear();
+        assert!(!should_show_source_icon(true, &e));
     }
 
     #[test]
