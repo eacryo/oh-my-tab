@@ -4064,6 +4064,13 @@ extern "C" fn detail_tv_cursor_exited(_self: *mut c_void, _cmd: Sel, _event: *mu
 /// Find a text entry's display index in the current filters. History deduplicates text
 /// globally, so text is a stable detail-entry identity; after a copied excerpt is inserted,
 /// the source detail must stay selected and remain visible.
+/// 空态文档至少覆盖最小列表区,其余情况下恰好等于实时可视区高度,供提示真正居中。
+/// The empty-state document covers at least the minimum list area, otherwise exactly the
+/// live visible height so its hint is truly centered.
+fn empty_state_doc_height(visible_h: f64) -> f64 {
+    visible_h.max(PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H)
+}
+
 fn visible_selection_for_text(
     history: &[ClipEntry],
     query: &str,
@@ -4752,12 +4759,19 @@ unsafe fn rebuild_rows() {
         String::new()
     };
     if !empty_hint.is_empty() {
-        // 容器高度 = 可视区高度(窗口减去头部条),而不是单行高:文档视图悬挂在
-        // clip 底部(clip 不翻转),太矮会被裁掉/贴底,提示文字会落在容器外而不可见。
-        // The container height = the visible area (the window minus the header strip), NOT
-        // one row: the document view hangs off the clip view's bottom (the clip isn't
-        // flipped); a short document gets clipped, and the hint would land outside it.
-        let doc_h = PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H;
+        // 容器高度必须取当前 clip view 的实际可视高度,而不是最小窗口高度:筛选后
+        // 虽然没有结果,主窗口仍保留原有的较大高度;若用最小值提示会错误地偏到上方。
+        // The container height must use the clip view's live visible height, not the minimum
+        // window height. Filtering can leave the picker tall with no results; using the
+        // minimum would incorrectly place the hint near the top.
+        let clip: *mut AnyObject = msg_send![container, superview];
+        let visible_h = if clip.is_null() {
+            PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H
+        } else {
+            let bounds: NSRect = msg_send![clip, bounds];
+            bounds.size.height
+        };
+        let doc_h = empty_state_doc_height(visible_h);
         let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
         // 提示文本:在可视列表区内垂直居中。
         // The hint: vertically centered within the visible list area.
@@ -8380,6 +8394,17 @@ mod tests {
         assert_eq!(filtered_indices(&h, "", ClipFilter::Text), vec![1]);
         assert!(filtered_indices(&h, "", ClipFilter::Link).is_empty());
         assert_eq!(filtered_indices(&h, "", ClipFilter::Code), vec![3]);
+    }
+
+    #[test]
+    fn empty_state_hint_uses_the_live_viewport_height() {
+        use super::{empty_state_doc_height, header_strip_h, FOOTER_H, PICKER_MIN_HEIGHT};
+        let min_list_h = PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H;
+        assert_eq!(empty_state_doc_height(min_list_h - 20.0), min_list_h);
+        // 分类筛空时主窗口仍可能很高;提示文档必须跟着可视区扩展才能居中。
+        // When a category filters to no results, the picker can remain tall; the hint document
+        // must grow with the viewport to stay centered.
+        assert_eq!(empty_state_doc_height(480.0), 480.0);
     }
 
     #[test]
