@@ -4059,6 +4059,56 @@ extern "C" fn detail_tv_cursor_exited(_self: *mut c_void, _cmd: Sel, _event: *mu
     }
 }
 
+/// 在当前筛选结果中找回指定文本条目的显示下标。历史全局按文本去重,因此文本可作为
+/// 详情条目的稳定身份;复制出的片段插入历史后,原详情仍应保持选中并继续显示。
+/// Find a text entry's display index in the current filters. History deduplicates text
+/// globally, so text is a stable detail-entry identity; after a copied excerpt is inserted,
+/// the source detail must stay selected and remain visible.
+fn visible_selection_for_text(
+    history: &[ClipEntry],
+    query: &str,
+    filter: ClipFilter,
+    text: &str,
+) -> Option<usize> {
+    let history_idx = history
+        .iter()
+        .position(|entry| entry.image.is_none() && entry.text == text)?;
+    filtered_indices(history, query, filter)
+        .iter()
+        .position(|&idx| idx == history_idx)
+}
+
+/// 详情内复制后立即重建已打开的历史列表。不能等下一次呼出:轮询虽会写入内存,
+/// 但已建好的行视图不会自行读取新历史。重建前恢复源详情的选择,避免新片段插到顶部后
+/// 高亮改指向新条目而右侧仍显示旧详情。
+/// Immediately rebuild the open history list after copying from detail. Polling writes to
+/// memory, but existing row views do not read the new history until the next summon. Restore
+/// the source-detail selection before rebuilding, so a new excerpt at the top does not make
+/// the highlight point at it while the right panel still shows the old detail.
+fn refresh_open_picker_after_detail_copy(source_detail_text: Option<&str>) {
+    if !PICKER_VISIBLE.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(text) = source_detail_text {
+        let selection = {
+            let history = CLIP_HISTORY.lock().unwrap();
+            let query = SEARCH_QUERY.lock().unwrap();
+            let filter = *CLIP_FILTER.lock().unwrap();
+            visible_selection_for_text(&history, &query, filter, text)
+        };
+        if let Some(selection) = selection {
+            *PICKER_SELECTION.lock().unwrap() = selection;
+        }
+    }
+    unsafe { rebuild_rows() };
+    // 新片段插入会让来源行下移;行重建完成、REBUILDING 已解除后只重算详情位置,
+    // 不重建详情文本视图,从而保留用户当前的选中文本。
+    // Inserting the excerpt moves the source row down. Once rebuilding releases REBUILDING,
+    // recompute only the detail position without recreating its text view, preserving the
+    // user's current text selection.
+    reposition_detail();
+}
+
 /// 把详情文本视图的**选中范围**写入剪贴板(无选中则兜底复制全文),Toast 提示,
 /// 详情面板保持打开(可能还要继续复制其他片段)。**不打 paste marker**——这是一次
 /// 真实复制,应当正常进入历史(与粘贴回写的抑制语义相反)。
@@ -4070,6 +4120,17 @@ fn copy_detail_selection() {
     let tv = match *DETAIL_TEXT_VIEW.lock().unwrap() {
         Some(t) => t.0,
         None => return,
+    };
+    let source_detail_text = {
+        let sel = *PICKER_SELECTION.lock().unwrap();
+        mapped_index(sel).and_then(|history_idx| {
+            CLIP_HISTORY
+                .lock()
+                .unwrap()
+                .get(history_idx)
+                .filter(|entry| entry.image.is_none())
+                .map(|entry| entry.text.clone())
+        })
     };
     unsafe {
         let sel_range: NSRange = msg_send![tv, selectedRange];
@@ -4101,6 +4162,13 @@ fn copy_detail_selection() {
             }
         };
         write_pasteboard_text(&text, false);
+        // 复制是由本应用主动发起的,立刻读回并重建;不能只依赖 0.5s 轮询或通知,
+        // 否则详情保持打开时新片段会延迟到下次呼出才出现。
+        // This copy originates in our app, so read it back and rebuild immediately instead
+        // of relying only on the 0.5s poll/notification; otherwise the new excerpt appears
+        // only after the next picker summon while detail remains open.
+        poll_clipboard();
+        refresh_open_picker_after_detail_copy(source_detail_text.as_deref());
         show_toast(&t("clipboard.toast_copied"));
     }
 }
@@ -8312,6 +8380,31 @@ mod tests {
         assert_eq!(filtered_indices(&h, "", ClipFilter::Text), vec![1]);
         assert!(filtered_indices(&h, "", ClipFilter::Link).is_empty());
         assert_eq!(filtered_indices(&h, "", ClipFilter::Code), vec![3]);
+    }
+
+    #[test]
+    fn detail_copy_refresh_restores_source_selection_in_filtered_list() {
+        use super::{visible_selection_for_text, ClipFilter};
+        // 复制片段后,新条目排在顶部;详情来源条目下移,但显示选择必须随它移动。
+        // After copying an excerpt, the new entry goes to the top; the detail source moves
+        // down, but the displayed selection must follow it.
+        let h = vec![
+            entry("copied excerpt"),
+            entry("source detail"),
+            entry("other"),
+        ];
+        assert_eq!(
+            visible_selection_for_text(&h, "", ClipFilter::All, "source detail"),
+            Some(1)
+        );
+        assert_eq!(
+            visible_selection_for_text(&h, "source", ClipFilter::All, "source detail"),
+            Some(0)
+        );
+        assert_eq!(
+            visible_selection_for_text(&h, "", ClipFilter::Link, "source detail"),
+            None
+        );
     }
 
     #[test]
