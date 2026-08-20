@@ -177,10 +177,9 @@ const SEARCH_PAD_IN: f64 = 12.0;
 /// 搜索图标预留列宽(设计稿 .search-icon width: 22px)。
 /// The reserved search-icon column (the mockup's `.search-icon { width: 22px }`).
 const SEARCH_ICON_W: f64 = 22.0;
-/// 搜索内容存在时附加的清除叉号尺寸及其与 ⌘F 键帽的间距。
-/// The extra clear × size and its gap from the ⌘F keycap when a query exists.
+/// 搜索内容存在时附加的清除叉号尺寸。
+/// The extra clear × size when a query exists.
 const SEARCH_CLEAR_W: f64 = 18.0;
-const SEARCH_CLEAR_GAP: f64 = 6.0;
 /// meta 行内来源应用小图标尺寸(新设计稿 .app-icon 13px)。
 /// The meta line's source-app icon size (the new mockup's .app-icon 13px).
 const META_ICON: f64 = 13.0;
@@ -5341,19 +5340,17 @@ fn search_has_query() -> bool {
     !SEARCH_QUERY.lock().unwrap().is_empty()
 }
 
-/// 绘制设计稿的 ⌘F 键帽;有查询时为右侧清除叉号留出空间。
-/// Draws the mockup's ⌘F keycap, reserving room for the right-side clear × when queried.
+/// 绘制设计稿的 ⌘F 键帽;用户开始输入后隐藏,由右侧清除叉号取代。
+/// Draws the mockup's ⌘F keycap; it hides once the user types, replaced by the right-side ×.
 unsafe fn draw_search_keycap(cell_frame: NSRect) {
+    if search_has_query() {
+        return;
+    }
     let chip_w = 27.0;
     let chip_h = 21.0;
-    let clear_reserve = if search_has_query() {
-        SEARCH_CLEAR_W + SEARCH_CLEAR_GAP
-    } else {
-        0.0
-    };
     let chip_rect = NSRect::new(
         NSPoint::new(
-            cell_frame.origin.x + cell_frame.size.width - chip_w - SEARCH_PAD_IN - clear_reserve,
+            cell_frame.origin.x + cell_frame.size.width - chip_w - SEARCH_PAD_IN,
             cell_frame.origin.y + (cell_frame.size.height - chip_h) / 2.0,
         ),
         NSSize::new(chip_w, chip_h),
