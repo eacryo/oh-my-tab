@@ -236,8 +236,14 @@ const SEL_TILE_R: f64 = 8.0;
 const SEL_BAR_W: f64 = 2.0;
 const SEL_BAR_X: f64 = 1.0;
 const SEL_BAR_INSET_Y: f64 = 10.0;
-/// 自定义滚动指示器宽度 / custom scroll indicator width.
-const SCROLL_INDICATOR_W: f64 = 4.0;
+/// 自定义滚动指示器的可见宽度 / visible custom scroll indicator width.
+const SCROLL_INDICATOR_W: f64 = 6.0;
+/// 指示器实际鼠标命中宽度;透明两侧扩大拖拽区域,不改变可见胶囊宽度。
+/// Actual mouse hit width; transparent side padding enlarges the drag area without changing
+/// the visible capsule width.
+const SCROLL_INDICATOR_HIT_W: f64 = 10.0;
+/// 滚动条可见胶囊的圆角(与 6pt 宽度匹配)/ visible scrollbar capsule radius (matching its 6pt width).
+const SCROLL_INDICATOR_R: f64 = 3.0;
 /// 指示器最短显示长度(条太短不可读)/ minimum indicator length (too short is unreadable).
 const SCROLL_INDICATOR_MIN_LEN: f64 = 24.0;
 /// 详情浮窗与主浮窗的间距 / gap between the picker and the detail panel.
@@ -454,6 +460,31 @@ static SCROLL_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
 /// 自定义滚动指示器 / the custom scroll indicator view.
 static SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
+/// 详情文本滚动视图及其自定义指示器;图片详情没有滚动区域。
+/// The detail text scroll view and its custom indicator; image details have no scroll area.
+static DETAIL_SCROLL_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static DETAIL_SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
+/// 自定义滚动指示器拖拽状态;系统滚动条被关闭后,NSView 不会自动处理拖拽。
+/// Drag state for the custom scroll indicator; once the system scroller is disabled, an
+/// NSView does not implement thumb dragging for us.
+#[derive(Clone, Copy)]
+enum ScrollTarget {
+    Picker,
+    Detail,
+}
+
+#[derive(Clone, Copy)]
+struct ScrollDragState {
+    target: ScrollTarget,
+    start_y: f64,
+    start_offset: f64,
+    max_offset: f64,
+    thumb_travel: f64,
+}
+
+static SCROLL_DRAG: Mutex<Option<ScrollDragState>> = Mutex::new(None);
 
 /// 详情浮窗窗口(→ 展开详情)/ the detail panel window (right-arrow expands).
 static DETAIL_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
@@ -2705,6 +2736,12 @@ unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(detailScrollIndicatorBoundsChanged:),
+                detail_scroll_indicator_bounds_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(clearClipboardHistory:),
                 clear_clipboard_history as *mut c_void,
                 types.as_ptr(),
@@ -2781,61 +2818,270 @@ extern "C" fn window_did_resign_key(_self: *mut c_void, _cmd: Sel, _note: *mut c
     hide_picker();
 }
 
+/// 主列表和详情共用同一个自定义指示器类;只通过目标滚动视图区分状态。
+/// The picker and detail share one custom indicator class; only the target scroll view differs.
+unsafe fn scroll_indicator_class() -> *mut AnyObject {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    *CLASS.get_or_init(|| {
+        let name = CString::new("OhMyTabClipboardScrollIndicator").unwrap();
+        let superclass = class!(NSView) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        let types_mouse = CString::new("v@:@").unwrap();
+        class_addMethod(
+            cls,
+            sel!(mouseDown:),
+            scroll_indicator_mouse_down as *mut c_void,
+            types_mouse.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(mouseDragged:),
+            scroll_indicator_mouse_dragged as *mut c_void,
+            types_mouse.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(mouseUp:),
+            scroll_indicator_mouse_up as *mut c_void,
+            types_mouse.as_ptr(),
+        );
+        let types_accepts_first_mouse = CString::new("B@:@").unwrap();
+        class_addMethod(
+            cls,
+            sel!(acceptsFirstMouse:),
+            scroll_indicator_accepts_first_mouse as *mut c_void,
+            types_accepts_first_mouse.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        cls as usize
+    }) as *mut AnyObject
+}
+
+fn scroll_target_for_indicator(indicator: *mut AnyObject) -> Option<ScrollTarget> {
+    if DETAIL_SCROLL_INDICATOR
+        .lock()
+        .unwrap()
+        .is_some_and(|detail| detail.0 == indicator)
+    {
+        return Some(ScrollTarget::Detail);
+    }
+    if SCROLL_INDICATOR
+        .lock()
+        .unwrap()
+        .is_some_and(|picker| picker.0 == indicator)
+    {
+        Some(ScrollTarget::Picker)
+    } else {
+        None
+    }
+}
+
+unsafe fn scroll_for_target(target: ScrollTarget) -> Option<*mut AnyObject> {
+    match target {
+        ScrollTarget::Picker => SCROLL_VIEW.lock().unwrap().map(|scroll| scroll.0),
+        ScrollTarget::Detail => DETAIL_SCROLL_VIEW.lock().unwrap().map(|scroll| scroll.0),
+    }
+}
+
+/// 计算指示器的 y/高度;拖拽和绘制必须使用同一套映射,否则拖到轨道底部时会跳动。
+/// Compute the indicator's y/height; dragging and drawing must share this mapping or the
+/// thumb jumps when it reaches the end of the track.
+fn scroll_indicator_geometry(visible_h: f64, doc_h: f64, offset: f64) -> Option<(f64, f64)> {
+    if visible_h <= 6.0 || doc_h <= visible_h {
+        return None;
+    }
+    let track_h = visible_h - 6.0;
+    let knob_h = (visible_h * visible_h / doc_h)
+        .max(SCROLL_INDICATOR_MIN_LEN)
+        .min(track_h);
+    let max_offset = doc_h - visible_h;
+    let travel = track_h - knob_h;
+    let progress = if max_offset > 0.0 {
+        (offset / max_offset).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Some((3.0 + progress * travel, knob_h))
+}
+
+/// 在 10pt 透明命中视图中绘制居中的 6pt 可见胶囊;父视图仍负责接收拖拽事件。
+/// Draw a centered 6pt visible capsule inside the 10pt transparent hit view; the parent view
+/// remains responsible for receiving drag events.
+unsafe fn update_scroll_indicator_visual(indicator: *mut AnyObject, height: f64) {
+    let _: () = msg_send![indicator, setWantsLayer: true];
+    let parent_layer: *mut AnyObject = msg_send![indicator, layer];
+    let sublayers: *mut AnyObject = msg_send![parent_layer, sublayers];
+    let count: usize = if sublayers.is_null() {
+        0
+    } else {
+        msg_send![sublayers, count]
+    };
+    let visual_layer: *mut AnyObject = if count == 0 {
+        let visual: *mut AnyObject = msg_send![class!(CALayer), layer];
+        let ind_bg: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.35f64];
+        crate::ffi::layer_set_background(visual, crate::ffi::ns_color_to_cg(ind_bg));
+        let _: () = msg_send![visual, setCornerRadius: SCROLL_INDICATOR_R];
+        let _: () = msg_send![parent_layer, addSublayer: visual];
+        visual
+    } else {
+        msg_send![sublayers, objectAtIndex: 0usize]
+    };
+    let _: () = msg_send![
+        visual_layer,
+        setFrame: NSRect::new(
+            NSPoint::new((SCROLL_INDICATOR_HIT_W - SCROLL_INDICATOR_W) / 2.0, 0.0),
+            NSSize::new(SCROLL_INDICATOR_W, height)
+        )
+    ];
+}
+
 /// 更新滚动指示器的位置/长度:内容溢出时显示(恒显示,不淡出),否则隐藏。
 /// 由 clipView 的 bounds 变化通知回调与 show_picker(首次呼出即显示)调用。
 /// Update the scroll indicator's position/length: shown while the content overflows
 /// (always visible, no fade-out), hidden otherwise. Called by the clip-view bounds-change
 /// notification callback AND by show_picker (visible on the first summon).
-fn update_scroll_indicator() {
-    unsafe {
-        let scroll = match *SCROLL_VIEW.lock().unwrap() {
-            Some(s) => s.0,
+unsafe fn update_scroll_indicator_for(target: ScrollTarget) {
+    let scroll = match scroll_for_target(target) {
+        Some(scroll) => scroll,
+        None => return,
+    };
+    let indicator = match target {
+        ScrollTarget::Picker => match *SCROLL_INDICATOR.lock().unwrap() {
+            Some(indicator) => indicator.0,
             None => return,
+        },
+        ScrollTarget::Detail => match *DETAIL_SCROLL_INDICATOR.lock().unwrap() {
+            Some(indicator) => indicator.0,
+            None => return,
+        },
+    };
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    let visible_h = clip_bounds.size.height;
+    let doc: *mut AnyObject = msg_send![scroll, documentView];
+    let doc_h = if doc.is_null() {
+        0.0
+    } else {
+        let df: NSRect = msg_send![doc, frame];
+        df.size.height
+    };
+
+    // 需要滚动(内容超出可视高度)才显示;无需滚动则隐藏。
+    // Shown only when scrolling is needed (content exceeds the visible height).
+    let Some((knob_y, knob_h)) = scroll_indicator_geometry(visible_h, doc_h, clip_bounds.origin.y)
+    else {
+        let _: () = msg_send![indicator, setHidden: true];
+        return;
+    };
+    let _: () = msg_send![
+        indicator,
+        setFrame: NSRect::new(
+            NSPoint::new(
+                clip_bounds.size.width - SCROLL_INDICATOR_HIT_W - 3.0,
+                knob_y
+            ),
+            NSSize::new(SCROLL_INDICATOR_HIT_W, knob_h)
+        )
+    ];
+    update_scroll_indicator_visual(indicator, knob_h);
+    let _: () = msg_send![indicator, setHidden: false];
+}
+
+fn update_scroll_indicator() {
+    unsafe { update_scroll_indicator_for(ScrollTarget::Picker) }
+}
+
+fn update_detail_scroll_indicator() {
+    unsafe { update_scroll_indicator_for(ScrollTarget::Detail) }
+}
+
+/// 允许自定义指示器接收第一次鼠标点击;非激活面板也要能直接开始拖拽。
+/// Accept the first mouse click so the nonactivating panel can start dragging immediately.
+extern "C" fn scroll_indicator_accepts_first_mouse(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _event: *mut c_void,
+) -> bool {
+    true
+}
+
+/// 按指示器拖动距离换算文档滚动偏移。系统滚动条已关闭,NSView 不会自动提供这套行为。
+/// Convert thumb movement into document offset. The system scroller is disabled, so NSView
+/// does not provide this behavior automatically.
+extern "C" fn scroll_indicator_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    unsafe {
+        let Some(target) = scroll_target_for_indicator(_self as *mut AnyObject) else {
+            return;
         };
-        let indicator = match *SCROLL_INDICATOR.lock().unwrap() {
-            Some(i) => i.0,
+        let scroll = match scroll_for_target(target) {
+            Some(scroll) => scroll,
             None => return,
         };
         let clip: *mut AnyObject = msg_send![scroll, contentView];
         let clip_bounds: NSRect = msg_send![clip, bounds];
-        let visible_h = clip_bounds.size.height;
         let doc: *mut AnyObject = msg_send![scroll, documentView];
-        let doc_h = if doc.is_null() {
-            0.0
-        } else {
-            let df: NSRect = msg_send![doc, frame];
-            df.size.height
-        };
-
-        // 需要滚动(内容超出可视高度)才显示;无需滚动则隐藏。
-        // Shown only when scrolling is needed (content exceeds the visible height).
-        if doc_h <= visible_h || visible_h <= 0.0 {
-            let _: () = msg_send![indicator, setHidden: true];
+        if doc.is_null() {
             return;
         }
-        let ratio = visible_h / doc_h;
-        let knob_h = (visible_h * ratio)
-            .max(SCROLL_INDICATOR_MIN_LEN)
-            .min(visible_h - 6.0);
-        let mut knob_y = 3.0 + clip_bounds.origin.y * ratio;
-        if knob_y + knob_h > visible_h - 3.0 {
-            knob_y = visible_h - 3.0 - knob_h;
+        let doc_frame: NSRect = msg_send![doc, frame];
+        let Some((_, knob_h)) = scroll_indicator_geometry(
+            clip_bounds.size.height,
+            doc_frame.size.height,
+            clip_bounds.origin.y,
+        ) else {
+            return;
+        };
+        let track_h = clip_bounds.size.height - 6.0;
+        let thumb_travel = track_h - knob_h;
+        if thumb_travel <= 0.0 {
+            return;
         }
-        if knob_y < 3.0 {
-            knob_y = 3.0;
-        }
-        let _: () = msg_send![
-            indicator,
-            setFrame: NSRect::new(
-                NSPoint::new(
-                    clip_bounds.size.width - SCROLL_INDICATOR_W - 3.0,
-                    knob_y
-                ),
-                NSSize::new(SCROLL_INDICATOR_W, knob_h)
-            )
+        let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        let point: NSPoint = msg_send![
+            scroll,
+            convertPoint: location,
+            fromView: std::ptr::null::<AnyObject>()
         ];
-        let _: () = msg_send![indicator, setHidden: false];
+        let max_offset = (doc_frame.size.height - clip_bounds.size.height).max(0.0);
+        *SCROLL_DRAG.lock().unwrap() = Some(ScrollDragState {
+            target,
+            start_y: point.y,
+            start_offset: clip_bounds.origin.y.clamp(0.0, max_offset),
+            max_offset,
+            thumb_travel,
+        });
     }
+}
+
+extern "C" fn scroll_indicator_mouse_dragged(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    unsafe {
+        let drag = match *SCROLL_DRAG.lock().unwrap() {
+            Some(drag) => drag,
+            None => return,
+        };
+        let scroll = match scroll_for_target(drag.target) {
+            Some(scroll) => scroll,
+            None => return,
+        };
+        let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        let point: NSPoint = msg_send![
+            scroll,
+            convertPoint: location,
+            fromView: std::ptr::null::<AnyObject>()
+        ];
+        let offset = (drag.start_offset
+            + (point.y - drag.start_y) * drag.max_offset / drag.thumb_travel)
+            .clamp(0.0, drag.max_offset);
+        let doc: *mut AnyObject = msg_send![scroll, documentView];
+        if !doc.is_null() {
+            let _: () = msg_send![doc, scrollPoint: NSPoint::new(0.0, offset)];
+        }
+    }
+}
+
+extern "C" fn scroll_indicator_mouse_up(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    *SCROLL_DRAG.lock().unwrap() = None;
 }
 
 /// clipView bounds 变化通知回调(滚动发生)→ 更新指示器;详情打开时同步移动详情,
@@ -2846,6 +3092,17 @@ fn update_scroll_indicator() {
 extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
     update_scroll_indicator();
     reposition_detail();
+}
+
+/// 详情文本滚动回调:只更新详情指示器,不触发主浮窗布局重算。
+/// Detail-text scrolling callback: update only the detail indicator, without relaying out the
+/// picker.
+extern "C" fn detail_scroll_indicator_bounds_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _note: *mut c_void,
+) {
+    update_detail_scroll_indicator();
 }
 
 /// "清除全部"按钮回调:清空剪贴板历史并关闭浮窗(空历史呼出会被忽略)。
@@ -3571,6 +3828,7 @@ fn show_picker() {
 /// 隐藏浮窗。/ Hide the picker.
 fn hide_picker() {
     PICKER_VISIBLE.store(false, Ordering::SeqCst);
+    *SCROLL_DRAG.lock().unwrap() = None;
     hide_detail();
 
     // 锁内只取指针,orderOut 放到锁外:orderOut 会同步触发 NSWindowDidResignKeyNotification,
@@ -3866,6 +4124,12 @@ unsafe fn show_detail_for_sel() {
     // cleared too (no dangling pointer).
     *DETAIL_TEXT_VIEW.lock().unwrap() = None;
     *DETAIL_SOURCE_MAP.lock().unwrap() = None;
+    // 详情内容每次重建都会替换滚动视图,先清除旧指针避免滚轮/拖拽触碰已移除的对象。
+    // Detail content rebuilds the scroll view each time, so clear stale pointers before
+    // removing the old views and avoid wheel/drag callbacks touching them.
+    *DETAIL_SCROLL_VIEW.lock().unwrap() = None;
+    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = None;
+    *SCROLL_DRAG.lock().unwrap() = None;
     let subs: *mut AnyObject = msg_send![content, subviews];
     let count: usize = msg_send![subs, count];
     for i in 0..count {
@@ -4078,19 +4342,24 @@ unsafe fn add_detail_text(
     let is_code = kind == TextKind::Code;
     debug_assert!(!is_code || prepared_code.is_some());
     let avail_w = w - DETAIL_PAD * 2.0;
+    // 滚动视图向右延伸到面板边缘,只在文本视图内部保留右侧内边距,让指示器与主界面同为 3pt。
+    // Extend the scroll view to the panel edge; keep the right inset inside the text view so
+    // the indicator has the same 3pt outer margin as the picker.
+    let scroll_w = w - DETAIL_PAD;
     let body_h = (h - DETAIL_PAD * 2.0).max(DETAIL_LINE_H);
     let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
     let scroll: *mut AnyObject = msg_send![
         scroll,
         initWithFrame: NSRect::new(
             NSPoint::new(DETAIL_PAD, DETAIL_PAD),
-            NSSize::new(avail_w, body_h)
+            NSSize::new(scroll_w, body_h)
         )
     ];
     let _: () = msg_send![scroll, setBorderType: 0u64]; // NSNoBorder
     let _: () = msg_send![scroll, setDrawsBackground: false];
-    let _: () = msg_send![scroll, setHasVerticalScroller: true];
-    let _: () = msg_send![scroll, setAutohidesScrollers: true];
+    let _: () = msg_send![scroll, setHasVerticalScroller: false];
+    let _: () = msg_send![scroll, setAutohidesScrollers: false];
+
     // 代码由显示格式化器在安全符号处插入悬挂式视觉换行,不再依赖横向滚动。
     // The display formatter inserts hanging visual breaks at safe symbols, so no horizontal
     // scrolling is needed for normal code lines.
@@ -4163,8 +4432,46 @@ unsafe fn add_detail_text(
     let _: () = msg_send![scroll, setDocumentView: tv];
     release_obj(tv);
     *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr(tv));
+
+    // 必须在 setDocumentView 之后加入指示器,使它位于 document/clip view 之上;
+    // 否则详情文本视图会覆盖同一位置,视觉上就不会与主界面的指示器一致。
+    // Add the indicator after setDocumentView so it stays above the document/clip view;
+    // otherwise the detail text view covers the same area and the indicator differs visually.
+    let indicator: *mut AnyObject = msg_send![scroll_indicator_class(), alloc];
+    let indicator: *mut AnyObject = msg_send![
+        indicator,
+        initWithFrame: NSRect::new(
+            NSPoint::new(scroll_w - SCROLL_INDICATOR_HIT_W - 3.0, 3.0),
+            NSSize::new(SCROLL_INDICATOR_HIT_W, (body_h - 6.0).max(0.0))
+        )
+    ];
+    // 命中视图保持 10pt,实际绘制仍是 6pt,圆角与可见胶囊宽度匹配。
+    // Keep the hit view at 10pt while drawing only 6pt, with a radius matching the visible capsule.
+    update_scroll_indicator_visual(indicator, (body_h - 6.0).max(0.0));
+    let _: () = msg_send![indicator, setHidden: true];
+    let _: () = msg_send![scroll, addSubview: indicator];
+    release_obj(indicator);
+
+    // 监听详情 clipView 的 bounds 变化,让自绘指示器跟随滚轮/键盘滚动。
+    // Observe the detail clip view's bounds changes so the custom indicator follows wheel/key
+    // scrolling.
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let _: () = msg_send![clip, setPostsBoundsChangedNotifications: true];
+    let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+    let bounds_name = make_nsstring("NSViewBoundsDidChangeNotification");
+    let _: () = msg_send![
+        center,
+        addObserver: observer(),
+        selector: sel!(detailScrollIndicatorBoundsChanged:),
+        name: bounds_name,
+        object: clip
+    ];
+    CFRelease(bounds_name as *const c_void);
+    *DETAIL_SCROLL_VIEW.lock().unwrap() = Some(ObjPtr(scroll));
+    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(indicator));
     let _: () = msg_send![content, addSubview: scroll];
     release_obj(scroll);
+    update_detail_scroll_indicator();
 
     // 详情文本上显示 I-beam 输入光标:非 key 窗口里 cursor rect 不生效(NSTextView
     // 自带的 I-beam 矩形只在 key 窗口激活,详情面板永远不是 key → 之前一直箭头)。
@@ -4553,24 +4860,24 @@ unsafe fn ensure_picker_window() {
     // 自定义滚动指示器:右侧 4pt 宽胶囊条,半透明白,滚动时显示、停止 1s 后淡出。
     // Custom scroll indicator: a 4pt rounded capsule on the right, semi-transparent white;
     // shown while scrolling and faded out 1s after scrolling stops.
-    let indicator: *mut AnyObject = msg_send![class!(NSView), alloc];
+    //
+    // 这里不能使用普通 NSView:系统滚动条已关闭,普通视图既不会响应拖拽也不会改变
+    // NSScrollView 的 content offset,所以之前只能滚轮/键盘滚动。
+    // A plain NSView is not enough here: with the system scroller disabled it neither handles
+    // thumb dragging nor changes NSScrollView's content offset, which is why only wheel/key
+    // scrolling worked before.
+    let indicator: *mut AnyObject = msg_send![scroll_indicator_class(), alloc];
     let indicator: *mut AnyObject = msg_send![
         indicator,
         initWithFrame: NSRect::new(
-            NSPoint::new(w - SCROLL_INDICATOR_W - 3.0, 3.0),
-            NSSize::new(SCROLL_INDICATOR_W, h - header_strip_h() - FOOTER_H - 6.0)
+            NSPoint::new(w - SCROLL_INDICATOR_HIT_W - 3.0, 3.0),
+            NSSize::new(SCROLL_INDICATOR_HIT_W, h - header_strip_h() - FOOTER_H - 6.0)
         )
     ];
-    let _: () = msg_send![indicator, setWantsLayer: true];
-    let ind_layer: *mut AnyObject = msg_send![indicator, layer];
-    // 深色半透明:浅色玻璃背景下白色指示器完全融入背景不可见;半透明黑在明暗玻璃上都清晰。
-    // Dark semi-transparent: a white indicator vanishes into light glass; a translucent black
-    // knob stays legible on both light and dark glass.
-    let ind_bg: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.35f64];
-    // layer_set_background 走 raw objc_msgSend:objc2 无法编码 CGColor 参数。
-    // layer_set_background goes through raw objc_msgSend: objc2 can't encode CGColor args.
-    crate::ffi::layer_set_background(ind_layer, crate::ffi::ns_color_to_cg(ind_bg));
-    let _: () = msg_send![ind_layer, setCornerRadius: SCROLL_INDICATOR_W / 2.0];
+    // 透明命中区域比可见胶囊更宽;不要把背景设到父层,否则会把 10pt 全部画出来。
+    // The transparent hit area is wider than the visible capsule; do not paint the parent
+    // layer or all 10pt would become visible.
+    update_scroll_indicator_visual(indicator, h - header_strip_h() - FOOTER_H - 6.0);
     let _: () = msg_send![indicator, setHidden: true];
     let _: () = msg_send![scroll, addSubview: indicator];
     release_obj(indicator);
