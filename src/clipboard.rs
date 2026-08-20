@@ -360,6 +360,11 @@ fn localized_filter_labels() -> [String; 5] {
 
 /// 顶部搜索框指针 / the top search field.
 static SEARCH_FIELD: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 搜索框清除叉号的悬停状态。/ The search field clear × hover state.
+static SEARCH_CLEAR_HOVERED: AtomicBool = AtomicBool::new(false);
+/// 覆盖自绘 × 的真实点击按钮;绘制仍由 cell 完成。
+/// The real click button over the hand-drawn ×; rendering remains in the cell.
+static SEARCH_CLEAR_BUTTON: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// 居中占位的"放大镜 + 搜索提示"富文本(手绘;字段本身不设 placeholder 属性,避免
 /// 字段编辑器在聚焦空字段时把占位画在左侧)。
 /// The centered "magnifier + search hint" attributed string (hand-drawn; the field itself
@@ -2879,8 +2884,16 @@ extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *m
 
 /// 清空搜索词 + 搜索框文本(不重建;调用方按需 rebuild)。
 /// Clear the search query and the search field's text (no rebuild; callers rebuild as needed).
+unsafe fn set_search_clear_button_visible(visible: bool) {
+    if let Some(button) = *SEARCH_CLEAR_BUTTON.lock().unwrap() {
+        let _: () = msg_send![button.0, setHidden: !visible];
+    }
+}
+
 fn clear_search() {
     SEARCH_QUERY.lock().unwrap().clear();
+    SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
+    unsafe { set_search_clear_button_visible(false) };
     if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
         unsafe {
             let empty_ns = make_nsstring("");
@@ -2900,7 +2913,12 @@ extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_v
     }
     let s: *mut AnyObject = unsafe { msg_send![field, stringValue] };
     let q = unsafe { nsstring_to_rust(s) };
+    let has_query = !q.is_empty();
     *SEARCH_QUERY.lock().unwrap() = q;
+    if !has_query {
+        SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
+    }
+    unsafe { set_search_clear_button_visible(has_query) };
     // ⌘F 键帽和右侧 × 都由自绘 cell 根据查询状态定位,文本变化时强制重绘。
     // The hand-drawn ⌘F keycap and right × are positioned from query state, so force a redraw
     // whenever text changes.
@@ -2944,17 +2962,53 @@ extern "C" fn search_clear_button(_self: *mut c_void, _cmd: Sel, _sender: *mut c
 /// 搜索框的自绘 × 命中测试:只在有查询时拦截右侧 18pt,其余鼠标事件照常交给父类。
 /// Hit-tests the custom search ×: intercept only the rightmost 18pt while queried and forward
 /// every other mouse event to the superclass normally.
+/// 鼠标位置是否落在搜索框右侧自绘 × 的命中区域。
+/// Whether a mouse location falls inside the search field's custom right-side × hit area.
+unsafe fn search_clear_contains_event(field: *mut AnyObject, event: *mut c_void) -> bool {
+    if !search_has_query() {
+        return false;
+    }
+    let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+    let point: NSPoint =
+        msg_send![field, convertPoint: location, fromView: std::ptr::null::<AnyObject>()];
+    let bounds: NSRect = msg_send![field, bounds];
+    point.x >= bounds.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W
+        && point.x <= bounds.size.width - SEARCH_PAD_IN
+        && point.y >= 0.0
+        && point.y <= bounds.size.height
+}
+
+/// 刷新自绘 × 的悬停状态;状态变化时仅重绘搜索框,不触发过滤或列表重建。
+/// Refreshes the custom × hover state; redraws only the search field on changes, never filters
+/// or rebuilds the list.
+unsafe fn update_search_clear_hover(field: *mut AnyObject, event: *mut c_void) {
+    let hovered = search_clear_contains_event(field, event);
+    if SEARCH_CLEAR_HOVERED.swap(hovered, Ordering::SeqCst) != hovered {
+        let _: () = msg_send![field, setNeedsDisplay: true];
+    }
+}
+
+extern "C" fn search_field_mouse_moved(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    unsafe { update_search_clear_hover(_self as *mut AnyObject, event) }
+}
+
+extern "C" fn search_field_mouse_entered(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    unsafe { update_search_clear_hover(_self as *mut AnyObject, event) }
+}
+
+extern "C" fn search_field_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    if SEARCH_CLEAR_HOVERED.swap(false, Ordering::SeqCst) {
+        unsafe {
+            let field = _self as *mut AnyObject;
+            let _: () = msg_send![field, setNeedsDisplay: true];
+        }
+    }
+}
+
 extern "C" fn search_field_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let field = _self as *mut AnyObject;
-        let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
-        let point: NSPoint =
-            msg_send![field, convertPoint: location, fromView: std::ptr::null::<AnyObject>()];
-        let bounds: NSRect = msg_send![field, bounds];
-        if search_has_query()
-            && point.x >= bounds.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W
-            && point.x <= bounds.size.width - SEARCH_PAD_IN
-        {
+        if search_clear_contains_event(field, event) {
             search_clear_button(_self, sel!(clearSearch:), event);
             return;
         }
@@ -4566,6 +4620,24 @@ unsafe fn ensure_picker_window() {
             search_field_mouse_down as *mut c_void,
             types_v.as_ptr(),
         );
+        class_addMethod(
+            cls,
+            sel!(mouseMoved:),
+            search_field_mouse_moved as *mut c_void,
+            types_v.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(mouseEntered:),
+            search_field_mouse_entered as *mut c_void,
+            types_v.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(mouseExited:),
+            search_field_mouse_exited as *mut c_void,
+            types_v.as_ptr(),
+        );
         objc_registerClassPair(cls);
         cls
     };
@@ -4671,6 +4743,47 @@ unsafe fn ensure_picker_window() {
     // 搜索框挂在固定头部条(不随列表滚动)。
     // The search field lives in the fixed header strip (it does not scroll with the list).
     let _: () = msg_send![header_strip, addSubview: search];
+    // 用 tracking area 只追踪搜索框内的 ×;InVisibleRect 让 AppKit 在尺寸变化时自动更新范围。
+    // Track only the search field's × with a tracking area; InVisibleRect lets AppKit update
+    // its range automatically if the field is resized.
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(search_w, SEARCH_H)),
+        // NSTrackingArea 必须指定一个 active 状态;非激活的浮窗需要 ActiveAlways。
+        // NSTrackingArea requires one active state; this nonactivating panel needs ActiveAlways.
+        options: 0x283u64, // entered/exited + moved + active-always + in-visible-rect
+        owner: search,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![search, addTrackingArea: tracking];
+    release_obj(tracking);
+    // 自绘 × 没有原生 cell 的点击目标;叠放一个透明 NSButton 确保它先收到 click,
+    // 避免 NSSearchFieldCell 吞掉 mouseDown。文字与悬停底仍由下面的 cell 统一绘制。
+    // The hand-drawn × has no native click target, so overlay a transparent NSButton that gets
+    // the click before NSSearchFieldCell can consume mouseDown. The cell below still draws its
+    // glyph and hover fill consistently.
+    let clear_button: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let clear_button: *mut AnyObject = msg_send![
+        clear_button,
+        initWithFrame: NSRect::new(
+            NSPoint::new(
+                SEARCH_PAD_X + search_w - SEARCH_PAD_IN - SEARCH_CLEAR_W,
+                TOP_PAD_Y + (SEARCH_H - ACTION_H) / 2.0
+            ),
+            NSSize::new(SEARCH_CLEAR_W, ACTION_H)
+        )
+    ];
+    let _: () = msg_send![clear_button, setBordered: false];
+    let empty_title = make_nsstring("");
+    let _: () = msg_send![clear_button, setTitle: empty_title];
+    CFRelease(empty_title as *const c_void);
+    let _: () = msg_send![clear_button, setTarget: search];
+    let _: () = msg_send![clear_button, setAction: sel!(clearSearch:)];
+    let _: () = msg_send![clear_button, setHidden: true];
+    let _: () = msg_send![header_strip, addSubview: clear_button];
+    release_obj(clear_button);
+    *SEARCH_CLEAR_BUTTON.lock().unwrap() = Some(ObjPtr(clear_button));
     release_obj(search);
     *SEARCH_FIELD.lock().unwrap() = Some(ObjPtr(search));
     // 文本变化(含系统清除按钮/NSSearchField 的 Esc 清空)→ 实时过滤。
@@ -5393,12 +5506,50 @@ unsafe fn draw_search_clear(cell_frame: NSRect) {
     if !search_has_query() {
         return;
     }
+    let hovered = SEARCH_CLEAR_HOVERED.load(Ordering::SeqCst);
+    let clear_x = cell_frame.origin.x + cell_frame.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W;
+    let clear_rect = NSRect::new(
+        NSPoint::new(
+            clear_x,
+            cell_frame.origin.y + (cell_frame.size.height - ACTION_H) / 2.0,
+        ),
+        NSSize::new(SEARCH_CLEAR_W, ACTION_H),
+    );
+    if hovered {
+        // 与行内删除按钮相同:210/45/40 红色文字 + 7% 红色圆角底。
+        // Match the row delete button: 210/45/40 red glyph with a 7% red rounded fill.
+        let path: *mut AnyObject = msg_send![
+            class!(NSBezierPath),
+            bezierPathWithRoundedRect: clear_rect,
+            xRadius: 5.0,
+            yRadius: 5.0
+        ];
+        let bg: *mut AnyObject = msg_send![
+            class!(NSColor),
+            colorWithSRGBRed: 210.0f64 / 255.0,
+            green: 45.0f64 / 255.0,
+            blue: 40.0f64 / 255.0,
+            alpha: 0.07f64
+        ];
+        let _: () = msg_send![bg, set];
+        let _: () = msg_send![path, fill];
+    }
     let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let attrs: *mut AnyObject = msg_send![attrs, init];
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 16.0f64];
-    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.42f64];
+    let color: *mut AnyObject = if hovered {
+        msg_send![
+            class!(NSColor),
+            colorWithSRGBRed: 210.0f64 / 255.0,
+            green: 45.0f64 / 255.0,
+            blue: 40.0f64 / 255.0,
+            alpha: 0.85f64
+        ]
+    } else {
+        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.42f64]
+    };
     let _: () = msg_send![attrs, setObject: font, forKey: font_key];
     let _: () = msg_send![attrs, setObject: color, forKey: color_key];
     CFRelease(font_key as *const c_void);
@@ -5409,9 +5560,8 @@ unsafe fn draw_search_clear(cell_frame: NSRect) {
     CFRelease(text as *const c_void);
     release_obj(attrs);
     let size: NSSize = msg_send![cross, size];
-    let x = cell_frame.origin.x + cell_frame.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W
-        + (SEARCH_CLEAR_W - size.width) / 2.0;
-    let y = cell_frame.origin.y + (cell_frame.size.height - size.height) / 2.0;
+    let x = clear_rect.origin.x + (clear_rect.size.width - size.width) / 2.0;
+    let y = clear_rect.origin.y + (clear_rect.size.height - size.height) / 2.0;
     let _: () = msg_send![cross, drawAtPoint: NSPoint::new(x, y)];
     release_obj(cross);
 }
