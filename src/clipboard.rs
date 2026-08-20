@@ -9044,6 +9044,17 @@ mod tests {
             classify_text(r#"{"homepage":"https://example.com","enabled":true}"#),
             TextKind::Code
         );
+        // 包含 URL 的代码/句子不是纯链接,不能让整条记录变成 Link。
+        // Code/prose containing a URL is not a standalone link and must not turn the entire row
+        // into Link.
+        assert_eq!(
+            classify_text("const endpoint = \"https://api.example.com\";\nfetch(endpoint);"),
+            TextKind::Code
+        );
+        assert_eq!(
+            classify_text("See https://example.com for details"),
+            TextKind::Plain
+        );
         // 代码:多行 + 明显的代码特征。
         // Code: multi-line + obvious code cues.
         assert_eq!(

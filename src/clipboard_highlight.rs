@@ -487,9 +487,11 @@ pub(crate) fn classify_text(text: &str) -> TextKind {
     if looks_like_html(t) || looks_like_json(t) {
         return TextKind::Code;
     }
-    // URL:含 scheme 或 www. 开头(整段就是一条链接)。
-    // URL: contains a scheme or starts with www. (the whole text is one link).
-    if t.contains("://") || t.starts_with("www.") {
+    // 仅整段本身是 URL 才归入链接。不能用 `contains("://")`:代码、JSON 之外的
+    // 普通片段也可能含 URL 字符串,却不应整行变蓝或从代码筛选中消失。
+    // Classify as Link only when the entire entry is a URL. Do not use `contains("://")`:
+    // non-JSON code and prose can contain a URL string without becoming a blue link row.
+    if is_standalone_url(t) {
         return TextKind::Url;
     }
     // 代码:多行 + 明显的代码特征(括号对/分号/缩进/常见关键字)。
@@ -511,6 +513,29 @@ pub(crate) fn classify_text(text: &str) -> TextKind {
     } else {
         TextKind::Plain
     }
+}
+
+/// 判断去除首尾空白后的完整条目是否是一条 URL。scheme 必须从开头开始,避免将
+/// `let endpoint = \"https://…\"` 之类的代码误归入链接;空白也意味着不是单一 URL。
+/// Decide whether the complete trimmed entry is one URL. The scheme must begin at offset zero,
+/// avoiding code such as `let endpoint = \"https://…\"`; whitespace also means it is not one URL.
+fn is_standalone_url(text: &str) -> bool {
+    if text.is_empty() || text.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return false;
+    }
+    if let Some(scheme_end) = text.find("://") {
+        let scheme = &text[..scheme_end];
+        return !scheme.is_empty()
+            && scheme.bytes().enumerate().all(|(index, byte)| {
+                if index == 0 {
+                    byte.is_ascii_alphabetic()
+                } else {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+                }
+            })
+            && !text[scheme_end + 3..].is_empty();
+    }
+    text.starts_with("www.") && text.len() > "www.".len()
 }
 
 /// 轻量判断文本是否像 HTML,避免把 Java 泛型 `<T>` 等普通代码误判成标签。
