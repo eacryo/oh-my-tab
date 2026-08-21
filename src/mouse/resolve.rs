@@ -183,7 +183,6 @@ mod tests {
         assert!(resolve_from(&cfg, Some((1, 2))).button_mappings_enabled);
     }
 
-    use super::*;
     use crate::config::PartialPointerSection;
 
     #[test]

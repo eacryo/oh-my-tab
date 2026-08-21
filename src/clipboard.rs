@@ -2996,10 +2996,6 @@ fn update_scroll_indicator() {
     unsafe { update_scroll_indicator_for(ScrollTarget::Picker) }
 }
 
-fn update_detail_scroll_indicator() {
-    unsafe { update_scroll_indicator_for(ScrollTarget::Detail) }
-}
-
 /// 允许自定义指示器接收第一次鼠标点击;非激活面板也要能直接开始拖拽。
 /// Accept the first mouse click so the nonactivating panel can start dragging immediately.
 extern "C" fn scroll_indicator_accepts_first_mouse(
@@ -3098,15 +3094,83 @@ extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _no
     reposition_detail();
 }
 
-/// 详情文本滚动回调:只更新详情指示器,不触发主浮窗布局重算。
-/// Detail-text scrolling callback: update only the detail indicator, without relaying out the
-/// picker.
+/// 返回详情 NSClipView 的实时合法纵向范围。NSTextView 的 textContainerInset 会让
+/// 顶部/底部不一定等于 `0..documentHeight-visibleHeight`,必须交给 AppKit 约束。
+/// Return the detail NSClipView's live legal vertical range. NSTextView's text-container inset
+/// means the endpoints are not necessarily `0..documentHeight-visibleHeight`; AppKit must
+/// constrain them.
+unsafe fn detail_scroll_range(scroll: *mut AnyObject) -> Option<(f64, f64)> {
+    if scroll.is_null() {
+        return None;
+    }
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    if clip.is_null() {
+        return None;
+    }
+    let bounds: NSRect = msg_send![clip, bounds];
+    let top_request = NSRect::new(NSPoint::new(bounds.origin.x, -1_000_000_000.0), bounds.size);
+    let bottom_request = NSRect::new(NSPoint::new(bounds.origin.x, 1_000_000_000.0), bounds.size);
+    let top: NSRect = msg_send![clip, constrainBoundsRect: top_request];
+    let bottom: NSRect = msg_send![clip, constrainBoundsRect: bottom_request];
+    Some((
+        top.origin.y.min(bottom.origin.y),
+        top.origin.y.max(bottom.origin.y),
+    ))
+}
+
+/// 把详情视口钳制到 AppKit 的实时合法范围;用于拦截滚轮相位/惯性造成的端点越界。
+/// Clamp the detail viewport to AppKit's live legal range, intercepting endpoint overscroll
+/// caused by wheel phases or momentum.
+unsafe fn clamp_detail_scroll(scroll: *mut AnyObject) {
+    let Some((min_y, max_y)) = detail_scroll_range(scroll) else {
+        return;
+    };
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let bounds: NSRect = msg_send![clip, bounds];
+    let clamped_y = bounds.origin.y.clamp(min_y, max_y);
+    if (clamped_y - bounds.origin.y).abs() > f64::EPSILON {
+        log_debug!(
+            "[clip] clamped detail scroll: {:.1} -> {:.1} ({:.1}..{:.1})",
+            bounds.origin.y,
+            clamped_y,
+            min_y,
+            max_y
+        );
+        let _: () = msg_send![
+            clip,
+            setBoundsOrigin: NSPoint::new(bounds.origin.x, clamped_y)
+        ];
+        let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+    }
+}
+
+/// 无条件滚到 AppKit 计算出的真实顶部,而不是假设顶部 y=0。
+/// Scroll unconditionally to AppKit's actual constrained top instead of assuming y=0.
+unsafe fn scroll_detail_to_top(scroll: *mut AnyObject) {
+    let Some((min_y, _)) = detail_scroll_range(scroll) else {
+        return;
+    };
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let bounds: NSRect = msg_send![clip, bounds];
+    let _: () = msg_send![
+        clip,
+        setBoundsOrigin: NSPoint::new(bounds.origin.x, min_y)
+    ];
+    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+}
+
+/// 详情原生滚动视图的 bounds 变化:硬钳制两端,不允许弹性越界。
+/// Bounds changes from the detail's native scroll view: hard-clamp both endpoints and disallow
+/// elastic overscroll.
 extern "C" fn detail_scroll_indicator_bounds_changed(
     _self: *mut c_void,
     _cmd: Sel,
     _note: *mut c_void,
 ) {
-    update_detail_scroll_indicator();
+    let detail_scroll = *DETAIL_SCROLL_VIEW.lock().unwrap();
+    if let Some(scroll) = detail_scroll {
+        unsafe { clamp_detail_scroll(scroll.0) };
+    }
 }
 
 /// "清除全部"按钮回调:清空剪贴板历史并关闭浮窗(空历史呼出会被忽略)。
@@ -4262,6 +4326,25 @@ unsafe fn show_detail_for_sel() {
     // orderFrontRegardless: never takes key (canBecomeKeyWindow=NO keeps the picker key).
     let _: () = msg_send![window, orderFrontRegardless];
     DETAIL_VISIBLE.store(true, Ordering::SeqCst);
+    // 文档完整布局和窗口最终 frame 都已生效后,无条件设置到 AppKit 约束出的真实顶部。
+    // 鼠标详情按钮、键盘 →、以及详情打开后的 ↑/↓ 切换最终都汇聚到这里,行为完全一致。
+    // Once full document layout and the final window frame are both applied, unconditionally
+    // set AppKit's actual constrained top. Mouse detail clicks, keyboard Right, and Up/Down
+    // navigation while detail is open all converge here and therefore behave identically.
+    let detail_scroll = *DETAIL_SCROLL_VIEW.lock().unwrap();
+    if let Some(scroll) = detail_scroll {
+        scroll_detail_to_top(scroll.0);
+        let clip: *mut AnyObject = msg_send![scroll.0, contentView];
+        let bounds: NSRect = msg_send![clip, bounds];
+        if let Some((min_y, max_y)) = detail_scroll_range(scroll.0) {
+            log_debug!(
+                "[clip] detail scroll initialized: y={:.1} range={:.1}..{:.1}",
+                bounds.origin.y,
+                min_y,
+                max_y
+            );
+        }
+    }
     refresh_detail_action_visuals();
 }
 
@@ -4573,9 +4656,9 @@ unsafe fn add_detail_text(
     let is_code = kind == TextKind::Code;
     debug_assert!(!is_code || prepared_code.is_some());
     let avail_w = w - DETAIL_PAD * 2.0;
-    // 滚动视图向右延伸到面板边缘,只在文本视图内部保留右侧内边距,让指示器与主界面同为 3pt。
-    // Extend the scroll view to the panel edge; keep the right inset inside the text view so
-    // the indicator has the same 3pt outer margin as the picker.
+    // 滚动视图向右延伸到面板边缘,文本视图内部保留右侧内边距给原生 overlay scroller。
+    // Extend the scroll view to the panel edge and keep right padding inside the text view for
+    // the native overlay scroller.
     let scroll_w = w - DETAIL_PAD;
     let body_h = (h - DETAIL_PAD * 2.0).max(DETAIL_LINE_H);
     let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
@@ -4588,8 +4671,16 @@ unsafe fn add_detail_text(
     ];
     let _: () = msg_send![scroll, setBorderType: 0u64]; // NSNoBorder
     let _: () = msg_send![scroll, setDrawsBackground: false];
-    let _: () = msg_send![scroll, setHasVerticalScroller: false];
+    // 详情使用 AppKit 原生 overlay scroller;端点、拖拽和滚轮相位都由 NSScrollView
+    // 处理,不再复制一套容易与 NSTextView 合法 bounds 不一致的自绘映射。
+    // Detail uses AppKit's native overlay scroller, leaving endpoints, dragging, and wheel
+    // phases to NSScrollView instead of duplicating a custom mapping that can diverge from
+    // NSTextView's legal bounds.
+    let _: () = msg_send![scroll, setHasVerticalScroller: true];
     let _: () = msg_send![scroll, setAutohidesScrollers: false];
+    let _: () = msg_send![scroll, setScrollerStyle: 1isize]; // NSScrollerStyleOverlay
+    let _: () = msg_send![scroll, setVerticalScrollElasticity: 1isize]; // NSScrollElasticityNone
+    let _: () = msg_send![scroll, setHorizontalScrollElasticity: 1isize];
 
     // 代码保留原始字符串;NSTextView 负责 visual soft wrap,不插入额外的 '\n'。
     // Code keeps the original string; NSTextView performs visual soft wrapping without adding
@@ -4609,12 +4700,15 @@ unsafe fn add_detail_text(
         initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(avail_w, body_h))
     ];
     *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = is_code.then_some(ObjPtr(tv));
-    // 允许 TextKit 非连续布局,大型 HTML 打开时优先布局可见区域,避免 setString/setFrame
-    // 为计算整个长文档的 glyph 和换行而同步阻塞主线程。
-    // Allow TextKit non-contiguous layout so large HTML prioritizes visible regions instead of
-    // synchronously laying out every glyph and wrapped line during setString/setFrame.
+    // 详情必须在显示前完成完整布局。非连续/后台布局会在面板出现后分批增大
+    // documentView,NSClipView 为维持旧可见区域会同步改变 bounds.origin.y,这正是
+    // 滚动条打开后向下跳的根因。
+    // Detail must finish layout before display. Non-contiguous/background layout grows the
+    // document view in batches after the panel appears, and NSClipView changes bounds.origin.y
+    // to preserve the old visible region—the root cause of the post-open downward jump.
     let layout: *mut AnyObject = msg_send![tv, layoutManager];
-    let _: () = msg_send![layout, setAllowsNonContiguousLayout: true];
+    let _: () = msg_send![layout, setAllowsNonContiguousLayout: false];
+    let _: () = msg_send![layout, setBackgroundLayoutEnabled: false];
 
     let ns_text = make_nsstring(display_text);
     let _: () = msg_send![tv, setString: ns_text];
@@ -4661,37 +4755,34 @@ unsafe fn add_detail_text(
         // Remove NSTextView's default line padding so DETAIL_PAD controls the code boundary.
         let _: () = msg_send![text_container, setLineFragmentPadding: 0.0f64];
     }
-    // 普通文本和代码都在面板内垂直滚动;代码的安全断点已经写入显示文本。
-    // Both plain text and code scroll vertically inside the panel; code's safe breaks are
-    // already represented in the display text.
-    let _: () = msg_send![tv, setVerticallyResizable: true];
+    // 先按最终宽度完成全部 TextKit 布局,再把 documentView 高度固定为完整 usedRect。
+    // 若让 NSTextView 在显示后继续 verticallyResizable,它仍会异步改 frame 并推走顶部。
+    // Complete all TextKit layout at the final width, then freeze documentView height to the
+    // full usedRect. Leaving NSTextView vertically resizable after display would still mutate
+    // its frame asynchronously and push the viewport away from the top.
+    let _: () = msg_send![text_container, setWidthTracksTextView: true];
+    let _: () = msg_send![
+        text_container,
+        setContainerSize: NSSize::new(avail_w, 1_000_000_000.0)
+    ];
     let _: () = msg_send![tv, setHorizontallyResizable: false];
+    let _: () = msg_send![tv, setVerticallyResizable: true];
+    let _: () = msg_send![layout, ensureLayoutForTextContainer: text_container];
+    let used: NSRect = msg_send![layout, usedRectForTextContainer: text_container];
+    let document_h = (used.origin.y + used.size.height + ROW_PAD_TOP * 2.0)
+        .ceil()
+        .max(body_h);
+    let _: () = msg_send![tv, setFrameSize: NSSize::new(avail_w, document_h)];
+    let _: () = msg_send![tv, setVerticallyResizable: false];
+    let _: () = msg_send![tv, setSelectedRange: NSRange::new(0, 0)];
     let _: () = msg_send![scroll, setDocumentView: tv];
     release_obj(tv);
     *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr(tv));
 
-    // 必须在 setDocumentView 之后加入指示器,使它位于 document/clip view 之上;
-    // 否则详情文本视图会覆盖同一位置,视觉上就不会与主界面的指示器一致。
-    // Add the indicator after setDocumentView so it stays above the document/clip view;
-    // otherwise the detail text view covers the same area and the indicator differs visually.
-    let indicator: *mut AnyObject = msg_send![scroll_indicator_class(), alloc];
-    let indicator: *mut AnyObject = msg_send![
-        indicator,
-        initWithFrame: NSRect::new(
-            NSPoint::new(scroll_w - SCROLL_INDICATOR_HIT_W - 3.0, 3.0),
-            NSSize::new(SCROLL_INDICATOR_HIT_W, (body_h - 6.0).max(0.0))
-        )
-    ];
-    // 命中视图保持 10pt,实际绘制仍是 6pt,圆角与可见胶囊宽度匹配。
-    // Keep the hit view at 10pt while drawing only 6pt, with a radius matching the visible capsule.
-    update_scroll_indicator_visual(indicator, (body_h - 6.0).max(0.0));
-    let _: () = msg_send![indicator, setHidden: true];
-    let _: () = msg_send![scroll, addSubview: indicator];
-    release_obj(indicator);
-
-    // 监听详情 clipView 的 bounds 变化,让自绘指示器跟随滚轮/键盘滚动。
-    // Observe the detail clip view's bounds changes so the custom indicator follows wheel/key
-    // scrolling.
+    // 原生 scroller 不叠加任何自绘 indicator。bounds 通知只负责把滚轮/惯性产生的
+    // 临时越界硬钳回 AppKit 实时合法范围。
+    // No custom indicator is overlaid on the native scroller. Bounds notifications only hard-
+    // clamp transient wheel/momentum overscroll to AppKit's live legal range.
     let clip: *mut AnyObject = msg_send![scroll, contentView];
     let _: () = msg_send![clip, setPostsBoundsChangedNotifications: true];
     let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
@@ -4705,10 +4796,9 @@ unsafe fn add_detail_text(
     ];
     CFRelease(bounds_name as *const c_void);
     *DETAIL_SCROLL_VIEW.lock().unwrap() = Some(ObjPtr(scroll));
-    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(indicator));
+    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = None;
     let _: () = msg_send![content, addSubview: scroll];
     release_obj(scroll);
-    update_detail_scroll_indicator();
 
     // 详情文本上显示 I-beam 输入光标:非 key 窗口里 cursor rect 不生效(NSTextView
     // 自带的 I-beam 矩形只在 key 窗口激活,详情面板永远不是 key → 之前一直箭头)。
@@ -8365,6 +8455,18 @@ pub(crate) fn smoke_runner() -> bool {
         // 无来源条目:标题栏应显示"未知来源",无图标。
         // A source-less entry: the header shows "unknown source", no icon.
         record_text(&mut hist, "legacy entry without a source", "", "", 50);
+        // 长文本紧邻最新图片:→ 打开图片后按 ↓ 会切到真正溢出的文本详情,覆盖完整
+        // TextKit 布局、原生 scroller、顶部复位和两端硬钳制。
+        // A long text next to the newest image means Down after opening the image reaches a
+        // genuinely overflowing text detail, covering full TextKit layout, the native scroller,
+        // top reset, and hard clamping at both endpoints.
+        record_text(
+            &mut hist,
+            &"detail scrolling regression line\n".repeat(400),
+            "TextEdit",
+            "com.apple.TextEdit",
+            50,
+        );
         // 图片条目:写入测试缓存目录 + 构造引用,覆盖缩略图渲染/清理路径。
         // An image entry: written into the cache dir and referenced, covering the thumbnail
         // render/cleanup paths.
@@ -8498,6 +8600,61 @@ pub(crate) fn smoke_runner() -> bool {
                 DETAIL_VISIBLE.load(Ordering::SeqCst),
                 "the detail must stay open while navigating"
             );
+            // 溢出文本详情必须使用稳定的完整布局 + 原生 scroller,打开即处于 AppKit
+            // 真实顶部。再模拟 bounds 越过上下端点,通知回调必须立即钳回。
+            // An overflowing text detail must use stable full layout plus the native scroller
+            // and open at AppKit's actual top. Simulate bounds crossing both endpoints; the
+            // notification callback must clamp them immediately.
+            let detail_scroll = DETAIL_SCROLL_VIEW
+                .lock()
+                .unwrap()
+                .expect("text detail must install a scroll view")
+                .0;
+            let detail_clip: *mut AnyObject = msg_send![detail_scroll, contentView];
+            let (min_y, max_y) =
+                detail_scroll_range(detail_scroll).expect("detail must have a legal range");
+            assert!(max_y > min_y, "long detail must overflow");
+            let opened_bounds: NSRect = msg_send![detail_clip, bounds];
+            assert_eq!(
+                opened_bounds.origin.y, min_y,
+                "detail must open at its real top"
+            );
+            let has_scroller: bool = msg_send![detail_scroll, hasVerticalScroller];
+            let elasticity: isize = msg_send![detail_scroll, verticalScrollElasticity];
+            let detail_doc: *mut AnyObject = msg_send![detail_scroll, documentView];
+            let layout: *mut AnyObject = msg_send![detail_doc, layoutManager];
+            let noncontiguous: bool = msg_send![layout, allowsNonContiguousLayout];
+            let background: bool = msg_send![layout, backgroundLayoutEnabled];
+            assert!(has_scroller, "detail must use AppKit's native scroller");
+            assert_eq!(elasticity, 1, "detail elasticity must be disabled");
+            assert!(!noncontiguous, "detail layout must be contiguous");
+            assert!(!background, "detail background layout must be disabled");
+            let _: () = msg_send![
+                detail_clip,
+                setBoundsOrigin: NSPoint::new(opened_bounds.origin.x, min_y - 30.0)
+            ];
+            detail_scroll_indicator_bounds_changed(
+                observer() as *mut c_void,
+                sel!(detailScrollIndicatorBoundsChanged:),
+                std::ptr::null_mut(),
+            );
+            let top_bounds: NSRect = msg_send![detail_clip, bounds];
+            assert_eq!(top_bounds.origin.y, min_y, "top overscroll must clamp");
+            let _: () = msg_send![
+                detail_clip,
+                setBoundsOrigin: NSPoint::new(opened_bounds.origin.x, max_y + 30.0)
+            ];
+            detail_scroll_indicator_bounds_changed(
+                observer() as *mut c_void,
+                sel!(detailScrollIndicatorBoundsChanged:),
+                std::ptr::null_mut(),
+            );
+            let bottom_bounds: NSRect = msg_send![detail_clip, bounds];
+            assert_eq!(
+                bottom_bounds.origin.y, max_y,
+                "bottom overscroll must clamp"
+            );
+            scroll_detail_to_top(detail_scroll);
             // ←:详情打开时直接置顶当前选中条目,详情保持打开并跟随重排后的位置。
             // Left: pin the selected entry while the detail stays open and follows its new row.
             let pinned_text = {
@@ -9927,7 +10084,7 @@ mod tests {
     fn expire_entries_respects_pin_ttl_and_legacy_entries() {
         use super::expire_entries;
         // 测试 helper:带指定时间戳的条目。/ An entry with an explicit timestamp.
-        let mut mk = |text: &str, pinned: bool, copied_at: Option<u64>| ClipEntry {
+        let mk = |text: &str, pinned: bool, copied_at: Option<u64>| ClipEntry {
             text: text.to_string(),
             image: None,
             pinned,

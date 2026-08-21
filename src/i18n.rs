@@ -352,7 +352,7 @@ number = 42
     fn all_locales_share_identical_key_sets() {
         // 三份 locale 文件的 key 集合必须完全一致,防止漏翻译/多翻译。
         // All locale files must expose the exact same key set (no missing/extra keys).
-        let mut keys = |raw: &str| {
+        let keys = |raw: &str| {
             let parsed: toml::Value = toml::from_str(raw).unwrap();
             let mut map = HashMap::new();
             flatten(&parsed, "", &mut map);
