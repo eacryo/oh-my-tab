@@ -1,10 +1,6 @@
-//! 剪贴板文本分类与轻量词法高亮。
-//! Clipboard text classification and lightweight lexical highlighting.
-//!
-//! 这里不构建 AST,只按字符扫描,因此代码片段不完整时仍能稳定显示。
-//! This module does not build an AST; it scans characters so incomplete snippets remain safe.
+//! 剪贴板文本分类、代码换行和显示映射。
+//! Clipboard text classification, code wrapping, and display mapping.
 
-use crate::config::CONFIG;
 use crate::ffi::{hex_to_ns_color, make_nsstring, release_obj, CFRelease};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
@@ -12,10 +8,6 @@ use objc2_foundation::NSRange;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
-use syntect::util::LinesWithEndings;
 
 /// 剪贴板条目类型分类,供列表和详情浮窗共用。
 /// Clipboard entry classification shared by the list and detail panel.
@@ -26,495 +18,38 @@ pub(crate) enum TextKind {
     Code,
 }
 
-const SYNTECT_THEME: &str = "InspiredGitHub";
-const SYNTECT_CACHE_CAPACITY: usize = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SyntectCacheKey {
-    content_hash: u64,
-    content_len: usize,
-    language: &'static str,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SyntectSpan {
-    start: usize,
-    end: usize,
-    foreground: [u8; 4],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SourceHighlightAnalysis {
-    language: Option<&'static str>,
-    use_syntect: bool,
-}
+const CODE_DISPLAY_CACHE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CodeDisplayCacheKey {
     content_hash: u64,
     content_len: usize,
     max_columns: usize,
-    use_syntect: bool,
     soft_wrap: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DisplayHighlightSpan {
-    start: usize,
-    end: usize,
-    foreground: [u8; 4],
 }
 
 pub(crate) struct PreparedCodeDisplay {
     pub(crate) text: String,
-    spans: Vec<DisplayHighlightSpan>,
     pub(crate) source_map: Option<Arc<DisplaySourceMap>>,
 }
 
-struct SyntectState {
-    syntax_set: SyntaxSet,
-    theme_set: ThemeSet,
-}
-
-static SYNTECT_STATE: OnceLock<Option<SyntectState>> = OnceLock::new();
-// 两级缓存都共享不可变结果。命中时只增加 Arc 引用计数,不再复制长文本和大量 span。
-// Both cache levels share immutable results. A hit only increments an Arc reference count
-// instead of copying long text and large span arrays.
-static SYNTECT_CACHE: OnceLock<Mutex<HashMap<SyntectCacheKey, Arc<[SyntectSpan]>>>> =
-    OnceLock::new();
+// 格式化模型通过 Arc 共享;缓存命中不复制长文本或原文映射。
+// Share formatted models through Arc so cache hits do not copy long text or source maps.
 static CODE_DISPLAY_CACHE: OnceLock<Mutex<HashMap<CodeDisplayCacheKey, Arc<PreparedCodeDisplay>>>> =
     OnceLock::new();
-
-/// 保守地从剪贴板片段推断语言;没有足够证据时返回 None,交给现有通用高亮兜底。
-/// Conservatively infer a language from a clipboard snippet; return None when uncertain so
-/// the existing generic highlighter can remain the fallback.
-pub(crate) fn detect_language(text: &str) -> Option<&'static str> {
-    let trimmed = text.trim_start();
-    if let Some(first) = trimmed.lines().next() {
-        if let Some(token) = first
-            .trim()
-            .strip_prefix("```")
-            .or_else(|| first.trim().strip_prefix("~~~"))
-        {
-            if let Some(language) = normalize_language_hint(token.trim()) {
-                return Some(language);
-            }
-        }
-        if first.starts_with("#!") {
-            let lower = first.to_ascii_lowercase();
-            if lower.contains("python") {
-                return Some("py");
-            }
-            if lower.contains("ruby") {
-                return Some("rb");
-            }
-            if lower.contains("node") || lower.contains("deno") {
-                return Some("js");
-            }
-            if lower.contains("bash") || lower.contains("zsh") || lower.contains("fish") {
-                return Some("sh");
-            }
-            if lower.contains("php") {
-                return Some("php");
-            }
-        }
-    }
-    if looks_like_html(trimmed) {
-        return Some("html");
-    }
-    if looks_like_json(trimmed) {
-        return Some("json");
-    }
-
-    let lower = text.to_ascii_lowercase();
-    // 只使用足够有辨识度的特征;低于阈值或得分并列时返回 None,交给通用兜底。
-    // Use distinctive cues only; below the threshold or on a tie, return None for the
-    // generic fallback instead of applying the wrong grammar.
-    let candidates: &[(&str, &[&str])] = &[
-        (
-            "rs",
-            &[
-                "fn ", "let ", "impl ", "pub ", "use ", "match ", "::", "->", "trait ",
-            ],
-        ),
-        (
-            "py",
-            &[
-                "def ", "import ", "from ", "elif ", "__name__", "except ", "yield ", "self.",
-            ],
-        ),
-        (
-            "java",
-            &[
-                "package ",
-                "import java.",
-                "public ",
-                "private ",
-                "protected ",
-                "public class",
-                "private class",
-                "protected class",
-                "@override",
-                "@test",
-                "static ",
-                "final ",
-                "void ",
-                "string ",
-                "boolean ",
-                "throws ",
-                "return ",
-                "system.out.",
-                "implements ",
-            ],
-        ),
-        (
-            "ts",
-            &[
-                "interface ",
-                "type ",
-                ": string",
-                ": number",
-                " as const",
-                "readonly ",
-                "implements ",
-            ],
-        ),
-        (
-            "js",
-            &[
-                "const ",
-                "let ",
-                "function ",
-                "=>",
-                "console.",
-                "require(",
-                "export ",
-                "import ",
-            ],
-        ),
-        (
-            "go",
-            &["package ", "func ", ":=", "defer ", "chan ", "go func"],
-        ),
-        (
-            "swift",
-            &[
-                "import foundation",
-                "guard ",
-                "func ",
-                "let ",
-                "var ",
-                "struct ",
-                "protocol ",
-            ],
-        ),
-        (
-            "c",
-            &[
-                "#include <stdio.h>",
-                "#include <stdlib.h>",
-                "printf(",
-                "scanf(",
-                "sizeof(",
-                "typedef struct",
-                "null",
-            ],
-        ),
-        (
-            "cpp",
-            &[
-                "#include <iostream>",
-                "#include <vector>",
-                "std::",
-                "cout <<",
-                "cin >>",
-                "nullptr",
-                "template<",
-            ],
-        ),
-        (
-            "cs",
-            &[
-                "using system",
-                "namespace ",
-                "console.",
-                "async task",
-                "string[] args",
-                "get; set;",
-            ],
-        ),
-        (
-            "kt",
-            &[
-                "fun ",
-                "val ",
-                "data class",
-                "when ",
-                "println(",
-                "companion object",
-            ],
-        ),
-        (
-            "dart",
-            &[
-                "import 'dart:",
-                "void main(",
-                "future<",
-                "widget build(",
-                "@override",
-                "print(",
-            ],
-        ),
-        (
-            "ruby",
-            &[
-                "def ", "require ", "attr_", "do |", "puts ", "unless ", "end\n",
-            ],
-        ),
-        (
-            "php",
-            &["<?php", "echo ", "namespace ", "$this->", "function ", "->"],
-        ),
-        (
-            "sql",
-            &[
-                "select ",
-                "insert into ",
-                "update ",
-                "delete from ",
-                "create table ",
-                "alter table ",
-            ],
-        ),
-        (
-            "css",
-            &[
-                "@media",
-                "font-family",
-                "background:",
-                "display:",
-                "!important",
-            ],
-        ),
-        (
-            "sh",
-            &[
-                "set -e", "#!/bin/", "$(", "echo ", "export ", "fi\n", "then\n",
-            ],
-        ),
-    ];
-    let mut best: Option<(&'static str, usize)> = None;
-    let mut tied = false;
-    for (language, cues) in candidates {
-        let score = cues.iter().filter(|cue| lower.contains(**cue)).count();
-        if score == 0 {
-            continue;
-        }
-        match best {
-            None => best = Some((language, score)),
-            Some((_, best_score)) if score > best_score => {
-                best = Some((language, score));
-                tied = false;
-            }
-            Some((_, best_score)) if score == best_score => tied = true,
-            _ => {}
-        }
-    }
-    best.filter(|(_, score)| *score >= 2 && !tied)
-        .map(|(language, _)| language)
-}
-
-fn normalize_language_hint(hint: &str) -> Option<&'static str> {
-    let normalized = hint
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '#')
-        .to_ascii_lowercase();
-    match normalized.as_str() {
-        "rust" | "rs" => Some("rs"),
-        "python" | "py" => Some("py"),
-        "javascript" | "js" => Some("js"),
-        "typescript" | "ts" => Some("ts"),
-        "java" => Some("java"),
-        "c" => Some("c"),
-        "c++" | "cpp" => Some("cpp"),
-        "c#" | "cs" | "csharp" => Some("cs"),
-        "go" | "golang" => Some("go"),
-        "swift" => Some("swift"),
-        "kotlin" | "kt" => Some("kt"),
-        "dart" => Some("dart"),
-        "shell" | "bash" | "zsh" | "sh" => Some("sh"),
-        "html" | "xml" => Some("html"),
-        "css" => Some("css"),
-        "json" => Some("json"),
-        "sql" => Some("sql"),
-        "ruby" | "rb" => Some("rb"),
-        "php" => Some("php"),
-        "yaml" | "yml" => Some("yml"),
-        "markdown" | "md" => Some("md"),
-        _ => None,
-    }
-}
 
 fn looks_like_json(text: &str) -> bool {
     let starts = text.starts_with('{') || text.starts_with('[');
     starts && (text.contains("\":") || text.contains("\": "))
 }
 
-/// 根据配置判断是否允许对该片段运行 syntect;0 表示主动关闭高亮。
-/// Decide whether syntect may run for this snippet; zero explicitly disables highlighting.
-fn should_use_syntect_with_limits(text: &str, max_bytes: usize, max_lines: usize) -> bool {
-    if max_bytes == 0 || max_lines == 0 || text.len() > max_bytes {
-        return false;
-    }
-    // 达到行数上限后立即退出;无需像 split().count() 一样继续扫描超长输入的剩余部分。
-    // Exit as soon as the line limit is exceeded instead of scanning the rest of a long input
-    // like split().count() would.
-    let mut lines = 1usize;
-    for byte in text.bytes() {
-        if byte == b'\n' {
-            lines += 1;
-            if lines > max_lines {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-pub(crate) fn should_use_syntect(text: &str) -> bool {
-    let (max_bytes, max_lines) = CONFIG
-        .read()
-        .map(|cfg| {
-            (
-                cfg.clipboard.max_highlight_bytes as usize,
-                cfg.clipboard.max_highlight_lines as usize,
-            )
-        })
-        .unwrap_or((64 * 1024, 1000));
-    should_use_syntect_with_limits(text, max_bytes, max_lines)
-}
-
-fn syntect_fnv1a64(bytes: &[u8]) -> u64 {
+fn code_fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
-}
-
-/// 一次性计算高亮路径共用的限制和语言元数据。之前 display cache 和 syntect cache
-/// 分别执行这些检查;内容哈希由调用方同样只计算一次后传入两级缓存。
-/// Compute limit and language metadata shared by the complete highlighting path once. Previously
-/// the display and syntect caches repeated these checks; callers likewise hash content once and
-/// pass that hash through both cache levels.
-fn analyze_source_with_decision(source: &str, use_syntect: bool) -> SourceHighlightAnalysis {
-    SourceHighlightAnalysis {
-        // 高亮被配置/尺寸限制关闭时不做昂贵且不会被使用的语言扫描。
-        // Skip the expensive, unused language scan when highlighting is disabled by limits.
-        language: if use_syntect {
-            detect_language(source)
-        } else {
-            None
-        },
-        use_syntect,
-    }
-}
-
-fn analyze_source_for_highlighting(source: &str) -> SourceHighlightAnalysis {
-    analyze_source_with_decision(source, should_use_syntect(source))
-}
-
-/// 在剪贴板功能启动时后台预热语法集,避免首次查看 HTML 阻塞主线程。
-/// Warm the syntax sets in the background when clipboard support starts, so the first HTML
-/// detail open does not block the main thread.
-pub(crate) fn warm_up_syntect() {
-    std::thread::spawn(|| {
-        let _ = syntect_state();
-    });
-}
-
-fn syntect_state() -> Option<&'static SyntectState> {
-    SYNTECT_STATE
-        .get_or_init(|| {
-            // 语法集和主题集只在进程内加载一次,后续详情打开直接复用。
-            // Load syntax and theme sets once per process; later detail opens reuse them.
-            Some(SyntectState {
-                syntax_set: SyntaxSet::load_defaults_newlines(),
-                theme_set: ThemeSet::load_defaults(),
-            })
-        })
-        .as_ref()
-}
-
-fn cached_syntect_highlight(
-    text: &str,
-    content_hash: u64,
-    analysis: SourceHighlightAnalysis,
-) -> Option<Arc<[SyntectSpan]>> {
-    if !analysis.use_syntect {
-        return None;
-    }
-    let language = analysis.language?;
-    let key = SyntectCacheKey {
-        content_hash,
-        content_len: text.len(),
-        language,
-    };
-    let cache = SYNTECT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
-        return Some(cached);
-    }
-
-    let state = syntect_state()?;
-    let syntax = state.syntax_set.find_syntax_by_token(language)?;
-    let theme = state
-        .theme_set
-        .themes
-        .get(SYNTECT_THEME)
-        .or_else(|| state.theme_set.themes.values().next())?;
-    let mut highlighter = HighlightLines::new(syntax, theme);
-    let mut source_offset = 0;
-    let mut spans = Vec::new();
-    // 预先建立 byte → UTF-16 边界表。以前每个 syntect 片段都从头 encode_utf16(),
-    // HTML 的大量片段会反复扫描同一前缀而退化为 O(n²)。
-    // Build byte-to-UTF-16 boundaries once. Previously every syntect fragment encoded a prefix
-    // from the beginning, which rescanned HTML's many fragments into O(n²).
-    let utf16_offsets = source_utf16_offsets(text);
-    for line in LinesWithEndings::from(text) {
-        let ranges = highlighter.highlight_line(line, &state.syntax_set).ok()?;
-        let mut line_offset = 0;
-        for (style, fragment) in ranges {
-            let end = line_offset + fragment.len();
-            if end > line_offset {
-                spans.push(SyntectSpan {
-                    start: utf16_offsets[source_offset + line_offset],
-                    end: utf16_offsets[source_offset + end],
-                    foreground: [
-                        style.foreground.r,
-                        style.foreground.g,
-                        style.foreground.b,
-                        style.foreground.a,
-                    ],
-                });
-            }
-            line_offset = end;
-        }
-        source_offset += line.len();
-    }
-
-    let spans: Arc<[SyntectSpan]> = spans.into();
-    if let Ok(mut guard) = cache.lock() {
-        if guard.len() >= SYNTECT_CACHE_CAPACITY {
-            if let Some(old_key) = guard.keys().next().copied() {
-                guard.remove(&old_key);
-            }
-        }
-        guard.insert(key, Arc::clone(&spans));
-    }
-    Some(spans)
 }
 
 pub(crate) fn classify_text(text: &str) -> TextKind {
@@ -578,11 +113,47 @@ fn is_standalone_url(text: &str) -> bool {
     text.starts_with("www.") && text.len() > "www.".len()
 }
 
-/// 轻量判断文本是否像 HTML,避免把 Java 泛型 `<T>` 等普通代码误判成标签。
-/// Cheap HTML detection that avoids mistaking ordinary code such as Java generics `<T>` for tags.
+fn matches_ignore_ascii_case(word: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| word.eq_ignore_ascii_case(candidate))
+}
+
+fn is_known_html_tag(name: &str) -> bool {
+    matches_ignore_ascii_case(
+        name,
+        &[
+            "a", "article", "aside", "audio", "b", "body", "button", "canvas", "code", "details",
+            "dialog", "div", "em", "fieldset", "footer", "form", "h1", "h2", "h3", "h4", "h5",
+            "h6", "head", "header", "html", "i", "iframe", "img", "input", "label", "li", "link",
+            "main", "meta", "nav", "ol", "option", "p", "picture", "pre", "script", "section",
+            "select", "small", "source", "span", "strong", "style", "summary", "svg", "table",
+            "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "title", "tr", "u",
+            "ul", "video",
+        ],
+    )
+}
+
+fn has_matching_closing_tag(bytes: &[u8], name: &[u8], from: usize) -> bool {
+    bytes[from..]
+        .windows(name.len() + 2)
+        .enumerate()
+        .any(|(offset, window)| {
+            let boundary = from + offset + name.len() + 2;
+            window.starts_with(b"</")
+                && window[2..].eq_ignore_ascii_case(name)
+                && bytes
+                    .get(boundary)
+                    .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>')
+        })
+}
+
+/// 轻量判断文本是否像 HTML/XML,避免把 Java 泛型和 C++ include 误判成标签。
+/// Cheap HTML/XML detection that avoids mistaking Java generics and C++ includes for tags.
 fn looks_like_html(text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut search_from = 0;
+    let mut closing_tag_checks = 0usize;
     while search_from < bytes.len() {
         let Some(relative_open) = bytes[search_from..].iter().position(|&b| b == b'<') else {
             return false;
@@ -614,15 +185,34 @@ fn looks_like_html(text: &str) -> bool {
             name_end += 1;
         }
         let name = &bytes[name_start..name_end];
-        // 单字母标签只保留 HTML 中常见的真实标签,过滤 `<T>`、`<K>` 等泛型。
-        // Keep only common real one-letter HTML tags, filtering generics such as `<T>` and `<K>`.
-        let valid_name = name.len() >= 2
-            || (name.len() == 1
-                && matches!(
-                    name[0].to_ascii_lowercase(),
-                    b'a' | b'b' | b'i' | b'p' | b'q' | b's' | b'u'
-                ));
-        if valid_name {
+        let valid_boundary = bytes
+            .get(name_end)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'));
+        let tag_end = bytes[name_end..]
+            .iter()
+            .position(|&byte| byte == b'>')
+            .map(|offset| name_end + offset);
+        let self_closing = tag_end.is_some_and(|end| {
+            bytes[..end]
+                .iter()
+                .rposition(|byte| !byte.is_ascii_whitespace())
+                .is_some_and(|last| bytes[last] == b'/')
+        });
+        // 未知 XML/JSX 名称只对前几个候选查找闭合标签,防止大量 C++ 泛型触发 O(n²)。
+        // Search for closing tags for only the first few unknown XML/JSX candidates, preventing
+        // large amounts of C++ generic syntax from turning detection into O(n²).
+        let locally_credible = std::str::from_utf8(name).is_ok_and(is_known_html_tag)
+            || name.contains(&b'-')
+            || name.contains(&b':')
+            || self_closing;
+        let has_closing_tag = if !locally_credible && closing_tag_checks < 4 {
+            closing_tag_checks += 1;
+            has_matching_closing_tag(bytes, name, name_end)
+        } else {
+            false
+        };
+        let credible_name = locally_credible || has_closing_tag;
+        if credible_name && valid_boundary {
             return true;
         }
         search_from = open + 1;
@@ -630,303 +220,10 @@ fn looks_like_html(text: &str) -> bool {
     false
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HighlightKind {
-    Link,
-    Keyword,
-    String,
-    Comment,
-    Number,
-    Tag,
-    Attribute,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HighlightSpan {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    pub(crate) kind: HighlightKind,
-}
-
 fn is_identifier_start(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || byte == b'_'
 }
 
-fn is_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn is_keyword(word: &str) -> bool {
-    matches!(
-        word,
-        "as" | "async"
-            | "await"
-            | "bool"
-            | "break"
-            | "class"
-            | "const"
-            | "continue"
-            | "def"
-            | "else"
-            | "enum"
-            | "export"
-            | "false"
-            | "fn"
-            | "for"
-            | "from"
-            | "func"
-            | "if"
-            | "impl"
-            | "import"
-            | "in"
-            | "interface"
-            | "let"
-            | "match"
-            | "mod"
-            | "mut"
-            | "new"
-            | "None"
-            | "null"
-            | "package"
-            | "pub"
-            | "return"
-            | "self"
-            | "static"
-            | "struct"
-            | "trait"
-            | "true"
-            | "type"
-            | "undefined"
-            | "use"
-            | "var"
-            | "where"
-            | "while"
-            | "with"
-            | "yield"
-    )
-}
-
-fn collect_html_highlights(text: &str, spans: &mut Vec<HighlightSpan>) {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"<!--") {
-            let start = i;
-            i += 4;
-            while i < bytes.len() && !bytes[i..].starts_with(b"-->") {
-                i += 1;
-            }
-            i = (i + 3).min(bytes.len());
-            spans.push(HighlightSpan {
-                start,
-                end: i,
-                kind: HighlightKind::Comment,
-            });
-            continue;
-        }
-        if bytes[i] != b'<' {
-            i += 1;
-            continue;
-        }
-
-        i += 1;
-        if bytes.get(i) == Some(&b'/') {
-            i += 1;
-        }
-        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
-            i += 1;
-        }
-        let name_start = i;
-        while bytes
-            .get(i)
-            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'_'))
-        {
-            i += 1;
-        }
-        if i > name_start {
-            spans.push(HighlightSpan {
-                start: name_start,
-                end: i,
-                kind: HighlightKind::Tag,
-            });
-        }
-
-        while i < bytes.len() && bytes[i] != b'>' {
-            if matches!(bytes[i], b'\'' | b'"') {
-                let quote = bytes[i];
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i = (i + 2).min(bytes.len());
-                    } else if bytes[i] == quote {
-                        i += 1;
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
-                spans.push(HighlightSpan {
-                    start,
-                    end: i,
-                    kind: HighlightKind::String,
-                });
-            } else if is_identifier_start(bytes[i]) {
-                let start = i;
-                i += 1;
-                while i < bytes.len() && is_identifier_byte(bytes[i]) {
-                    i += 1;
-                }
-                spans.push(HighlightSpan {
-                    start,
-                    end: i,
-                    kind: HighlightKind::Attribute,
-                });
-            } else {
-                i += 1;
-            }
-        }
-        if i < bytes.len() {
-            i += 1;
-        }
-    }
-}
-
-fn collect_generic_highlights(text: &str, spans: &mut Vec<HighlightSpan>) {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let line_start = i == 0 || bytes[i - 1] == b'\n';
-        if bytes[i..].starts_with(b"//") || bytes[i..].starts_with(b"/*") {
-            let start = i;
-            if bytes[i..].starts_with(b"//") {
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            } else {
-                i += 2;
-                while i < bytes.len() && !bytes[i..].starts_with(b"*/") {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-            }
-            spans.push(HighlightSpan {
-                start,
-                end: i,
-                kind: HighlightKind::Comment,
-            });
-            continue;
-        }
-        if bytes[i] == b'#' && (line_start || bytes[i - 1].is_ascii_whitespace()) {
-            let start = i;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            spans.push(HighlightSpan {
-                start,
-                end: i,
-                kind: HighlightKind::Comment,
-            });
-            continue;
-        }
-        if matches!(bytes[i], b'\'' | b'"' | b'`') {
-            let quote = bytes[i];
-            let start = i;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' {
-                    i = (i + 2).min(bytes.len());
-                } else if bytes[i] == quote {
-                    i += 1;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-            spans.push(HighlightSpan {
-                start,
-                end: i,
-                kind: HighlightKind::String,
-            });
-            continue;
-        }
-        if bytes[i].is_ascii_digit() && (i == 0 || !is_identifier_byte(bytes[i - 1])) {
-            let start = i;
-            i += 1;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'.' | b'_'))
-            {
-                i += 1;
-            }
-            spans.push(HighlightSpan {
-                start,
-                end: i,
-                kind: HighlightKind::Number,
-            });
-            continue;
-        }
-        if is_identifier_start(bytes[i]) {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && is_identifier_byte(bytes[i]) {
-                i += 1;
-            }
-            if let Some(word) = text.get(start..i) {
-                if is_keyword(word) {
-                    spans.push(HighlightSpan {
-                        start,
-                        end: i,
-                        kind: HighlightKind::Keyword,
-                    });
-                }
-            }
-            continue;
-        }
-        i += 1;
-    }
-}
-
-pub(crate) fn highlight_spans(text: &str, kind: TextKind) -> Vec<HighlightSpan> {
-    match kind {
-        TextKind::Plain => Vec::new(),
-        TextKind::Url => vec![HighlightSpan {
-            start: 0,
-            end: text.len(),
-            kind: HighlightKind::Link,
-        }],
-        TextKind::Code => {
-            let mut spans = Vec::new();
-            if looks_like_html(text) {
-                collect_html_highlights(text, &mut spans);
-            } else {
-                collect_generic_highlights(text, &mut spans);
-            }
-            spans
-        }
-    }
-}
-
-fn utf16_range(text: &str, start: usize, end: usize) -> NSRange {
-    let location = text[..start].encode_utf16().count();
-    let length = text[start..end].encode_utf16().count();
-    NSRange::new(location, length)
-}
-
-fn highlight_color(kind: HighlightKind) -> u32 {
-    match kind {
-        HighlightKind::Link => 0x205BA6B8,
-        HighlightKind::Keyword => 0x7C3AEDCC,
-        HighlightKind::String => 0x047857CC,
-        HighlightKind::Comment => 0x6B7280AA,
-        HighlightKind::Number => 0xB45309CC,
-        HighlightKind::Tag => 0x9D174DCC,
-        HighlightKind::Attribute => 0x1D4ED8CC,
-    }
-}
-
-/// 给 attributed string 批量添加语法颜色;单次扫描即可处理不完整片段。
-/// Apply syntax colors to an attributed string in batches; one scan handles incomplete snippets.
 /// 详情浮窗中的格式化代码及其原文偏移映射。
 /// Formatted detail code together with a mapping back to the original source offsets.
 #[derive(Clone)]
@@ -956,73 +253,17 @@ impl DisplaySourceMap {
         let end = self.boundaries.get(end_index).copied().unwrap_or(start);
         NSRange::new(start.min(end), end.saturating_sub(start))
     }
-
-    /// 将原文高亮范围反向投影到插入了视觉换行的显示文本。
-    /// Project a source highlight range back onto display text containing visual breaks.
-    fn display_ranges_for_source_range(&self, source_range: NSRange) -> Vec<NSRange> {
-        let source_start = source_range.location;
-        let source_end = source_start.saturating_add(source_range.length);
-        // boundaries 按原文 UTF-16 偏移单调递增;插入的换行/缩进只会重复同一偏移。
-        // 因此一个原文区间在显示文本中仍是连续区间,可以二分查找边界。以前每个
-        // syntect span 都全扫 boundaries,使片段多的 HTML 再次退化为 O(n²)。
-        // Boundaries are monotonic source UTF-16 offsets; inserted wraps/indents only repeat an
-        // offset. A source interval is therefore contiguous in display text and can use binary
-        // boundary searches. The former full scan per syntect span was another O(n²) HTML path.
-        let first = self
-            .boundaries
-            .partition_point(|&boundary| boundary < source_start);
-        let after_last = self
-            .boundaries
-            .partition_point(|&boundary| boundary <= source_end);
-        let end = after_last
-            .saturating_sub(1)
-            .min(self.boundaries.len().saturating_sub(1));
-        if first >= end {
-            Vec::new()
-        } else {
-            vec![NSRange::new(first, end - first)]
-        }
-    }
 }
 
-fn rgba_from_hex(color: u32) -> [u8; 4] {
-    [
-        (color >> 24) as u8,
-        (color >> 16) as u8,
-        (color >> 8) as u8,
-        color as u8,
-    ]
-}
-
-fn merge_display_spans(mut spans: Vec<DisplayHighlightSpan>) -> Vec<DisplayHighlightSpan> {
-    spans.sort_unstable_by_key(|span| (span.start, span.end));
-    let mut merged: Vec<DisplayHighlightSpan> = Vec::with_capacity(spans.len());
-    for span in spans {
-        if span.start >= span.end {
-            continue;
-        }
-        if let Some(last) = merged.last_mut() {
-            if last.end == span.start && last.foreground == span.foreground {
-                last.end = span.end;
-                continue;
-            }
-        }
-        merged.push(span);
-    }
-    merged
-}
-
-/// 一次准备详情显示文本、原文映射和显示高亮范围;缓存和调用方通过 Arc 共享不可变结果。
-/// Prepare display text, source mapping, and display highlight ranges once; the cache and callers
-/// share the immutable result through Arc.
+/// 一次准备代码显示文本和原文映射;缓存和调用方通过 Arc 共享不可变结果。
+/// Prepare code display text and its source mapping once; the cache and callers share the
+/// immutable result through Arc.
 pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Arc<PreparedCodeDisplay> {
-    let use_syntect = should_use_syntect(source);
-    let content_hash = syntect_fnv1a64(source.as_bytes());
+    let content_hash = code_fnv1a64(source.as_bytes());
     let key = CodeDisplayCacheKey {
         content_hash,
         content_len: source.len(),
         max_columns,
-        use_syntect,
         soft_wrap: false,
     };
     let cache = CODE_DISPLAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1030,21 +271,10 @@ pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Arc<Prep
         return cached;
     }
 
-    // 语言由内容唯一决定,无需进入 display cache key。只在 cache miss 后识别,
-    // 避免每次重开同一详情都对全文执行语言特征扫描。
-    // Language is deterministic from content and need not be part of the display-cache key.
-    // Detect it only after a miss so reopening the same detail avoids a full language scan.
-    let analysis = analyze_source_with_decision(source, use_syntect);
     let formatted = format_code_for_display(source, max_columns);
-    let prepared = Arc::new(build_prepared_code(
-        source,
-        formatted,
-        content_hash,
-        analysis,
-        false,
-    ));
+    let prepared = Arc::new(build_prepared_code(formatted, false));
     if let Ok(mut guard) = cache.lock() {
-        if guard.len() >= SYNTECT_CACHE_CAPACITY {
+        if guard.len() >= CODE_DISPLAY_CACHE_CAPACITY {
             if let Some(old_key) = guard.keys().next().copied() {
                 guard.remove(&old_key);
             }
@@ -1054,47 +284,11 @@ pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Arc<Prep
     prepared
 }
 
-/// 构建显示字符串的语法高亮,同时保留显示到原文的偏移映射。
-/// Build syntax highlights for a display string while preserving its source mapping.
-fn build_prepared_code(
-    source: &str,
-    formatted: FormattedCode,
-    content_hash: u64,
-    analysis: SourceHighlightAnalysis,
-    retain_source_map: bool,
-) -> PreparedCodeDisplay {
-    let mut spans = Vec::new();
-    if let Some(source_spans) = cached_syntect_highlight(source, content_hash, analysis) {
-        for span in source_spans.iter() {
-            let source_range = NSRange::new(span.start, span.end.saturating_sub(span.start));
-            for range in formatted
-                .source_map
-                .display_ranges_for_source_range(source_range)
-            {
-                spans.push(DisplayHighlightSpan {
-                    start: range.location,
-                    end: range.location.saturating_add(range.length),
-                    foreground: span.foreground,
-                });
-            }
-        }
-    }
-    if analysis.use_syntect && spans.is_empty() {
-        for span in highlight_spans(&formatted.text, TextKind::Code) {
-            let range = utf16_range(&formatted.text, span.start, span.end);
-            spans.push(DisplayHighlightSpan {
-                start: range.location,
-                end: range.location.saturating_add(range.length),
-                foreground: rgba_from_hex(highlight_color(span.kind)),
-            });
-        }
-    }
+fn build_prepared_code(formatted: FormattedCode, retain_source_map: bool) -> PreparedCodeDisplay {
     PreparedCodeDisplay {
         text: formatted.text,
-        spans: merge_display_spans(spans),
-        // 列表预览只需映射高亮范围,构建完成后立即释放;只有详情复制需要长期保留。
-        // Row previews need the map only while projecting highlights and release it afterward;
-        // only detail copying retains it.
+        // 列表预览不需要复制映射,只有代码详情复制需要长期保留。
+        // Row previews do not need a copy map; only code-detail copying retains it.
         source_map: retain_source_map.then(|| Arc::new(formatted.source_map)),
     }
 }
@@ -1106,13 +300,11 @@ pub(crate) fn prepare_code_for_soft_wrap(
     source: &str,
     max_columns: usize,
 ) -> Arc<PreparedCodeDisplay> {
-    let use_syntect = should_use_syntect(source);
-    let content_hash = syntect_fnv1a64(source.as_bytes());
+    let content_hash = code_fnv1a64(source.as_bytes());
     let key = CodeDisplayCacheKey {
         content_hash,
         content_len: source.len(),
         max_columns,
-        use_syntect,
         soft_wrap: true,
     };
     let cache = CODE_DISPLAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1120,22 +312,14 @@ pub(crate) fn prepare_code_for_soft_wrap(
         return cached;
     }
 
-    // 自定义软换行插入 U+2028,因此保留共享 source map 供高亮和复制选区使用。
-    // 语言识别推迟到 miss 后,cache hit 只做限制检查、哈希和 Arc clone。
-    // Custom soft wrapping inserts U+2028, so retain a shared source map for highlighting and
-    // copied selections. Language detection is deferred until after a miss; a hit only checks
-    // limits, hashes, and clones the Arc.
-    let analysis = analyze_source_with_decision(source, use_syntect);
+    // 自定义软换行插入 U+2028,因此保留共享 source map 供复制选区使用。
+    // 缓存命中只做哈希和 Arc clone。
+    // Custom soft wrapping inserts U+2028, so retain a shared source map for copied selections.
+    // A cache hit only hashes and clones the Arc.
     let formatted = format_code_for_soft_wrap(source, max_columns);
-    let prepared = Arc::new(build_prepared_code(
-        source,
-        formatted,
-        content_hash,
-        analysis,
-        true,
-    ));
+    let prepared = Arc::new(build_prepared_code(formatted, true));
     if let Ok(mut guard) = cache.lock() {
-        if guard.len() >= SYNTECT_CACHE_CAPACITY {
+        if guard.len() >= CODE_DISPLAY_CACHE_CAPACITY {
             if let Some(old_key) = guard.keys().next().copied() {
                 guard.remove(&old_key);
             }
@@ -1716,170 +900,34 @@ pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: 
     let _: () = msg_send![storage, endEditing];
 }
 
-unsafe fn apply_lexical_highlights(storage: *mut AnyObject, text: &str, spans: Vec<HighlightSpan>) {
-    if spans.is_empty() {
+/// 链接仍使用列表既有的蓝色;代码只保留等宽字体和换行,不再做语法着色。
+/// Links retain the list's existing blue color; code keeps only monospace layout and wrapping,
+/// with no syntax coloring.
+pub(crate) unsafe fn apply_link_color(storage: *mut AnyObject, text: &str, kind: TextKind) {
+    if kind != TextKind::Url || text.is_empty() {
         return;
     }
     let _: () = msg_send![storage, beginEditing];
     let color_key = make_nsstring("NSColor");
-    for span in spans {
-        let color = hex_to_ns_color(highlight_color(span.kind));
-        let _: () = msg_send![
-            storage,
-            addAttribute: color_key,
-            value: color,
-            range: utf16_range(text, span.start, span.end)
-        ];
-    }
-    CFRelease(color_key as *const c_void);
-    let _: () = msg_send![storage, endEditing];
-}
-
-unsafe fn apply_syntect_highlights(
-    storage: *mut AnyObject,
-    spans: &[SyntectSpan],
-    display_map: Option<&DisplaySourceMap>,
-) {
-    if spans.is_empty() {
-        return;
-    }
-    let _: () = msg_send![storage, beginEditing];
-    let color_key = make_nsstring("NSColor");
-    for span in spans {
-        let color: *mut AnyObject = msg_send![
-            class!(NSColor),
-            colorWithSRGBRed: f64::from(span.foreground[0]) / 255.0,
-            green: f64::from(span.foreground[1]) / 255.0,
-            blue: f64::from(span.foreground[2]) / 255.0,
-            alpha: f64::from(span.foreground[3]) / 255.0
-        ];
-        let source_range = NSRange::new(span.start, span.end.saturating_sub(span.start));
-        let ranges = display_map
-            .map(|map| map.display_ranges_for_source_range(source_range))
-            .unwrap_or_else(|| vec![source_range]);
-        for range in ranges {
-            if range.length == 0 {
-                continue;
-            }
-            let _: () = msg_send![
-                storage,
-                addAttribute: color_key,
-                value: color,
-                range: range
-            ];
-        }
-    }
-    CFRelease(color_key as *const c_void);
-    let _: () = msg_send![storage, endEditing];
-}
-
-/// 直接应用已缓存的显示范围,避免每次打开详情重新扫描原文映射。
-/// Apply cached display ranges directly, avoiding a fresh source-map scan on every detail open.
-pub(crate) unsafe fn apply_prepared_code_highlights(
-    storage: *mut AnyObject,
-    prepared: &PreparedCodeDisplay,
-) {
-    if prepared.spans.is_empty() {
-        return;
-    }
-    let _: () = msg_send![storage, beginEditing];
-    let color_key = make_nsstring("NSColor");
-    let mut colors: HashMap<[u8; 4], *mut AnyObject> = HashMap::new();
-    for span in &prepared.spans {
-        let color = if let Some(&color) = colors.get(&span.foreground) {
-            color
-        } else {
-            let color: *mut AnyObject = msg_send![
-                class!(NSColor),
-                colorWithSRGBRed: f64::from(span.foreground[0]) / 255.0,
-                green: f64::from(span.foreground[1]) / 255.0,
-                blue: f64::from(span.foreground[2]) / 255.0,
-                alpha: f64::from(span.foreground[3]) / 255.0
-            ];
-            colors.insert(span.foreground, color);
-            color
-        };
-        let _: () = msg_send![
-            storage,
-            addAttribute: color_key,
-            value: color,
-            range: NSRange::new(span.start, span.end.saturating_sub(span.start))
-        ];
-    }
-    CFRelease(color_key as *const c_void);
-    let _: () = msg_send![storage, endEditing];
-}
-
-/// 使用缓存的 syntect 结果高亮代码;语言不确定时回退到原有轻量扫描器。
-/// Apply cached syntect results to code; fall back to the existing lightweight scanner when
-/// the language cannot be identified confidently.
-pub(crate) unsafe fn apply_code_highlights(
-    storage: *mut AnyObject,
-    source_text: &str,
-    display_text: &str,
-    display_map: Option<&DisplaySourceMap>,
-) {
-    let analysis = analyze_source_for_highlighting(source_text);
-    if !analysis.use_syntect {
-        return;
-    }
-    let content_hash = syntect_fnv1a64(source_text.as_bytes());
-    if let Some(spans) = cached_syntect_highlight(source_text, content_hash, analysis) {
-        apply_syntect_highlights(storage, spans.as_ref(), display_map);
-        return;
-    }
-    apply_lexical_highlights(
+    let color = hex_to_ns_color(0x205BA6B8);
+    let _: () = msg_send![
         storage,
-        display_text,
-        highlight_spans(display_text, TextKind::Code),
-    );
-}
-
-pub(crate) unsafe fn apply_highlights(storage: *mut AnyObject, text: &str, kind: TextKind) {
-    if kind == TextKind::Code {
-        apply_code_highlights(storage, text, text, None);
-    } else {
-        apply_lexical_highlights(storage, text, highlight_spans(text, kind));
-    }
+        addAttribute: color_key,
+        value: color,
+        range: NSRange::new(0, text.encode_utf16().count())
+    ];
+    CFRelease(color_key as *const c_void);
+    let _: () = msg_send![storage, endEditing];
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        analyze_source_for_highlighting, cached_syntect_highlight, detect_language,
-        format_code_for_soft_wrap, prepare_code_for_soft_wrap, should_use_syntect_with_limits,
-    };
+    use super::{format_code_for_soft_wrap, prepare_code_for_soft_wrap};
     use objc2_foundation::NSRange;
     use std::sync::Arc;
 
     #[test]
-    fn highlight_limits_skip_large_snippets() {
-        let source = "<div>\ncontent\n</div>";
-        assert!(should_use_syntect_with_limits(source, 64, 3));
-        assert!(!should_use_syntect_with_limits(source, 8 * 1024, 2));
-        assert!(!should_use_syntect_with_limits(source, 0, 100));
-        assert!(!should_use_syntect_with_limits(source, 1024, 0));
-    }
-
-    #[test]
-    fn syntect_highlights_and_reuses_cached_code() {
-        let source = "fn main() {\n    let answer = 42;\n}";
-        let analysis = analyze_source_for_highlighting(source);
-        assert_eq!(analysis.language, detect_language(source));
-        let content_hash = super::syntect_fnv1a64(source.as_bytes());
-        let first =
-            cached_syntect_highlight(source, content_hash, analysis).expect("syntect should load");
-        let second =
-            cached_syntect_highlight(source, content_hash, analysis).expect("cache should hit");
-        assert!(!first.is_empty());
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "syntect cache hits must share spans"
-        );
-    }
-
-    #[test]
-    fn prepared_code_cache_hits_share_text_and_spans() {
+    fn prepared_code_cache_hits_share_the_model() {
         let source = "fn shared_cache() {\n    println!(\"cached\");\n}";
         let first = prepare_code_for_soft_wrap(source, 48);
         let second = prepare_code_for_soft_wrap(source, 48);

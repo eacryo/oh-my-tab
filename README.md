@@ -296,8 +296,6 @@ launch_at_login = false  # launch at login (requires running as a .app bundle; m
 [clipboard]
 enabled = false          # clipboard history master switch (off by default)
 max_entries = 50         # max history entries (1..=100)
-max_highlight_bytes = 65536 # skip syntect above this many UTF-8 bytes; 0 = always skip
-max_highlight_lines = 1000  # skip syntect above this many lines; 0 = always skip
 persist = false          # save history to disk so it survives restarts (see the privacy note below)
 auto_expire_days = 3     # unpinned entries expire after N days (memory AND disk); 0 = off
 pin_follow_selection = true # after pin/unpin, move the selection to the toggled entry (false = keep the current position)

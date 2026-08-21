@@ -763,16 +763,6 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.clipboard.max_entries
     );
     changed!(
-        "clipboard.max_highlight_bytes",
-        old.clipboard.max_highlight_bytes,
-        new.clipboard.max_highlight_bytes
-    );
-    changed!(
-        "clipboard.max_highlight_lines",
-        old.clipboard.max_highlight_lines,
-        new.clipboard.max_highlight_lines
-    );
-    changed!(
         "clipboard.show_source_app",
         old.clipboard.show_source_app,
         new.clipboard.show_source_app

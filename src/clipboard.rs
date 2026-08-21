@@ -55,9 +55,9 @@
 //!   detail panel and shares the same deletion lifecycle.
 
 use crate::clipboard_highlight::{
-    apply_code_paragraph_styles, apply_highlights, apply_prepared_code_highlights,
-    apply_visible_space_markers, classify_text, prepare_code_display, prepare_code_for_soft_wrap,
-    DisplaySourceMap, PreparedCodeDisplay, TextKind,
+    apply_code_paragraph_styles, apply_link_color, apply_visible_space_markers, classify_text,
+    prepare_code_display, prepare_code_for_soft_wrap, DisplaySourceMap, PreparedCodeDisplay,
+    TextKind,
 };
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -2625,7 +2625,6 @@ extern "C" fn clip_poll_tick(_self: *mut c_void, _cmd: Sel, _timer: *mut c_void)
 /// Start polling (idempotent): create a main-thread NSTimer and record the current
 /// pasteboard once immediately.
 pub fn start() {
-    crate::clipboard_highlight::warm_up_syntect();
     unsafe {
         let timer_holder = POLL_TIMER.get_or_init(|| Mutex::new(ObjPtr(std::ptr::null_mut())));
         let mut guard = timer_holder.lock().unwrap();
@@ -4269,10 +4268,10 @@ unsafe fn show_detail_for_sel() {
         // --- 文本条目:完整未截断文本,超出主浮窗高度后在详情内滚动 ---
         // Text entry: the full untruncated text; scrolls inside detail beyond picker height.
         let kind = classify_text(&entry.text);
-        // 代码详情的高度和内容视图共享同一个 Arc<PreparedCodeDisplay>;缓存命中也只
-        // 增加引用计数,不会复制长文本或高亮 span。
-        // Code-detail sizing and content share one Arc<PreparedCodeDisplay>; cache hits likewise
-        // only increment the reference count instead of copying long text or highlight spans.
+        // 代码详情的高度和内容视图共享同一个 Arc<PreparedCodeDisplay>;缓存命中只
+        // 增加引用计数,不会复制长文本或原文映射。
+        // Code-detail sizing and content share one Arc<PreparedCodeDisplay>; cache hits only
+        // increment the reference count instead of copying long text or its source map.
         let prepared_code = (kind == TextKind::Code).then(|| {
             prepare_code_for_soft_wrap(&entry.text, detail_code_max_columns(DETAIL_CODE_MAX_W))
         });
@@ -4688,21 +4687,16 @@ unsafe fn add_detail_text(
     let _: () = msg_send![tv, setString: ns_text];
     CFRelease(ns_text as *const c_void);
 
-    // 详情与主列表复用同一套文本分类和词法高亮,包括 URL、HTML 和普通代码片段。
-    // The detail view reuses the same text classification and lexical highlighter as the list,
-    // including URLs, HTML, and ordinary code snippets.
+    // 代码只保留等宽排版和软换行,不再做语法着色;URL 继续沿用列表的蓝色。
+    // Code retains only monospace layout and soft wrapping, with no syntax coloring; URLs keep
+    // the list's blue color.
     let storage: *mut AnyObject = msg_send![tv, textStorage];
-    // 高亮、字体和段落样式会分别修改整段 NSTextStorage;外层编辑事务把它们的
-    // TextKit 无效化/修复合并为一次,避免软换行详情在布局前重复处理全文。
-    // Highlighting, font, and paragraph styles each mutate the full NSTextStorage. An outer
-    // editing transaction coalesces their TextKit invalidation/fix-up into one pass instead of
-    // repeatedly processing the whole soft-wrapped detail before layout.
+    // 链接颜色、字体和段落样式会修改 NSTextStorage;外层事务合并 TextKit
+    // 无效化/修复,避免软换行详情在布局前重复处理全文。
+    // Link color, font, and paragraph styles mutate NSTextStorage. An outer transaction coalesces
+    // TextKit invalidation/fix-up instead of repeatedly processing the soft-wrapped detail.
     let _: () = msg_send![storage, beginEditing];
-    if let Some(code) = prepared {
-        apply_prepared_code_highlights(storage, code);
-    } else {
-        apply_highlights(storage, display_text, kind);
-    }
+    apply_link_color(storage, display_text, kind);
 
     let _: () = msg_send![tv, setEditable: false];
     // 可选中(之前禁用了选中,长文本没法复制其中一部分)。非 key 窗口里 NSTextView
@@ -7347,10 +7341,9 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
     CFRelease(ns as *const c_void);
     release_obj(attrs);
     if let Some(code) = &prepared_code {
-        apply_prepared_code_highlights(attr, code);
         apply_visible_space_markers(attr, &code.text);
     } else {
-        apply_highlights(attr, display_content, kind);
+        apply_link_color(attr, display_content, kind);
     }
     attr
 }
@@ -8437,10 +8430,10 @@ pub(crate) fn smoke_runner() -> bool {
         // A source-less entry: the header shows "unknown source", no icon.
         record_text(&mut hist, "legacy entry without a source", "", "", 50);
         // 长代码紧邻最新图片:→ 打开图片后按 ↓ 会切到真正溢出的软换行详情,覆盖
-        // syntect、完整 TextKit 布局、原生 scroller、顶部复位和两端硬钳制。
+        // 自定义软换行、完整 TextKit 布局、原生 scroller、顶部复位和两端硬钳制。
         // Long code next to the newest image means Down after opening the image reaches a
-        // genuinely overflowing soft-wrapped detail, covering syntect, full TextKit layout, the
-        // native scroller, top reset, and hard clamping at both endpoints.
+        // genuinely overflowing soft-wrapped detail, covering custom wrapping, full TextKit
+        // layout, the native scroller, top reset, and hard clamping at both endpoints.
         record_text(
             &mut hist,
             &"fn detail_scrolling_regression() { let result = service.fetch(first_argument, second_argument) && enabled; }\n".repeat(200),
@@ -10336,66 +10329,6 @@ mod tests {
         assert_eq!(classify_text("hello world"), TextKind::Plain);
         assert_eq!(classify_text(""), TextKind::Plain);
         assert_eq!(classify_text("  "), TextKind::Plain);
-    }
-
-    #[test]
-    fn syntect_language_detection_is_conservative_and_supports_hints() {
-        use crate::clipboard_highlight::detect_language;
-
-        assert_eq!(detect_language("```rust\nfn main() {}\n```"), Some("rs"));
-        assert_eq!(
-            detect_language("#!/usr/bin/env python3\nprint('hello')"),
-            Some("py")
-        );
-        assert_eq!(
-            detect_language("fn main() {\n    let answer = 42;\n}"),
-            Some("rs")
-        );
-        assert_eq!(
-            detect_language("    public String findName() {\n        return \"name\";\n    }"),
-            Some("java")
-        );
-        assert_eq!(
-            detect_language("    public <T> T findValue() {\n        return null;\n    }"),
-            Some("java")
-        );
-        // 没有足够语言特征时必须返回 None,由渲染层使用通用轻量高亮兜底。
-        // With insufficient language cues, return None so rendering uses the generic fallback.
-        assert_eq!(detect_language("ordinary text with a comma"), None);
-    }
-
-    #[test]
-    fn syntax_highlighting_covers_html_and_incomplete_code() {
-        use super::{classify_text, TextKind};
-        use crate::clipboard_highlight::{highlight_spans, HighlightKind};
-
-        let html = r#"<div class="title">Hello</div>"#;
-        assert_eq!(classify_text(html), TextKind::Code);
-        let html_spans = highlight_spans(html, TextKind::Code);
-        assert!(html_spans.iter().any(|s| s.kind == HighlightKind::Tag));
-        assert!(html_spans
-            .iter()
-            .any(|s| s.kind == HighlightKind::Attribute));
-        assert!(html_spans.iter().any(|s| s.kind == HighlightKind::String));
-
-        // 未闭合标签/字符串也只扫描到文本末尾,不要求片段可解析。
-        // Unclosed tags/strings scan to the end without requiring a parseable snippet.
-        let incomplete = r#"<div class="title""#;
-        assert_eq!(classify_text(incomplete), TextKind::Code);
-        assert!(!highlight_spans(incomplete, TextKind::Code).is_empty());
-
-        let code = "fn main() { // note\n    let answer = 42;\n}";
-        let code_spans = highlight_spans(code, TextKind::Code);
-        assert!(code_spans.iter().any(|s| s.kind == HighlightKind::Keyword));
-        assert!(code_spans.iter().any(|s| s.kind == HighlightKind::Comment));
-        assert!(code_spans.iter().any(|s| s.kind == HighlightKind::Number));
-
-        // Java 泛型不能被轻量 HTML 扫描器误认为标签。
-        // Java generics must not be mistaken for tags by the lightweight HTML scanner.
-        let java_generic = "    public <T> T findValue() {\n        return null;\n    }";
-        assert!(!highlight_spans(java_generic, TextKind::Code)
-            .iter()
-            .any(|s| s.kind == HighlightKind::Tag));
     }
 
     #[test]

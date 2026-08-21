@@ -9,10 +9,6 @@ objc2-foundation = "0.3"
 flume = "0.11"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-# 纯 Rust 正则引擎,避免引入 Oniguruma 原生依赖。
-# Pure-Rust regex engine, avoiding the native Oniguruma dependency.
-syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
-
 # 仅测试用,不进入 release 产物。
 # Dev-only; never linked into the release binary.
 [dev-dependencies]

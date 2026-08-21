@@ -140,12 +140,6 @@ pub struct ClipboardSection {
     // 历史最大条数(1..=100,默认 50)。
     // Max history entries (1..=100, default 50).
     pub max_entries: u32,
-    // syntect 高亮最大输入字节数;0 = 禁用语法高亮,默认 65536(64 KiB)。
-    // Maximum input bytes for syntect highlighting; 0 disables syntax highlighting. Default 65536 (64 KiB).
-    pub max_highlight_bytes: u32,
-    // syntect 高亮最大行数;0 = 禁用语法高亮,默认 1000 行。
-    // Maximum lines for syntect highlighting; 0 disables syntax highlighting. Default 1000 lines.
-    pub max_highlight_lines: u32,
     // 显示来源应用:复制时始终记录来源(ClipEntry.source_app),此开关只控制是否在
     // 条目里显示应用名。默认 false。
     // Show the source app: the source is ALWAYS recorded at copy time (ClipEntry.source_app);
@@ -187,8 +181,6 @@ impl Default for ClipboardSection {
         Self {
             enabled: false,
             max_entries: 50,
-            max_highlight_bytes: 64 * 1024,
-            max_highlight_lines: 1000,
             show_source_app: false,
             persist: false,
             move_used_to_top: true,
@@ -717,18 +709,6 @@ impl Config {
                 &[("value", &self.clipboard.max_entries.to_string())],
             ));
         }
-        if self.clipboard.max_highlight_bytes > 4 * 1024 * 1024 {
-            errs.push(tf(
-                "errors.clipboard_max_highlight_bytes_invalid",
-                &[("value", &self.clipboard.max_highlight_bytes.to_string())],
-            ));
-        }
-        if self.clipboard.max_highlight_lines > 10_000 {
-            errs.push(tf(
-                "errors.clipboard_max_highlight_lines_invalid",
-                &[("value", &self.clipboard.max_highlight_lines.to_string())],
-            ));
-        }
         if self.clipboard.auto_expire_days > 365 {
             errs.push(tf(
                 "errors.clipboard_auto_expire_days_invalid",
@@ -926,18 +906,6 @@ impl Config {
         self.clipboard.move_used_to_top = other.clipboard.move_used_to_top;
         if !errs.iter().any(|e| e.starts_with("clipboard.max_entries")) {
             self.clipboard.max_entries = other.clipboard.max_entries;
-        }
-        if !errs
-            .iter()
-            .any(|e| e.starts_with("clipboard.max_highlight_bytes"))
-        {
-            self.clipboard.max_highlight_bytes = other.clipboard.max_highlight_bytes;
-        }
-        if !errs
-            .iter()
-            .any(|e| e.starts_with("clipboard.max_highlight_lines"))
-        {
-            self.clipboard.max_highlight_lines = other.clipboard.max_highlight_lines;
         }
         if !errs
             .iter()
@@ -1299,8 +1267,6 @@ mod tests {
         other.mouse.enabled = true;
         other.clipboard.enabled = true;
         other.clipboard.max_entries = 30;
-        other.clipboard.max_highlight_bytes = 32 * 1024;
-        other.clipboard.max_highlight_lines = 500;
         other.clipboard.persist = true;
         other.clipboard.move_used_to_top = false;
         other.clipboard.pin_follow_selection = false;
@@ -1313,8 +1279,6 @@ mod tests {
         assert!(merged.mouse.enabled);
         assert!(merged.clipboard.enabled);
         assert_eq!(merged.clipboard.max_entries, 30);
-        assert_eq!(merged.clipboard.max_highlight_bytes, 32 * 1024);
-        assert_eq!(merged.clipboard.max_highlight_lines, 500);
         assert!(merged.clipboard.persist);
         assert!(!merged.clipboard.move_used_to_top);
         assert!(!merged.clipboard.pin_follow_selection);
@@ -1334,14 +1298,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_out_of_range_clipboard_highlight_limits() {
-        let mut cfg = Config::default();
-        cfg.clipboard.max_highlight_bytes = 4 * 1024 * 1024 + 1;
-        cfg.clipboard.max_highlight_lines = 10_001;
-        assert_err_count(&cfg, 2);
-        cfg.clipboard.max_highlight_bytes = 0;
-        cfg.clipboard.max_highlight_lines = 0;
-        assert_err_count(&cfg, 0);
+    fn retired_clipboard_highlight_limits_are_ignored() {
+        // 旧配置里的高亮限制已失效,但 serde 必须忽略它们,避免升级后整份配置加载失败。
+        // Highlight limits in old configs are retired, but serde must ignore them so upgrades do
+        // not make the entire config fail to load.
+        let cfg: Config = toml::from_str(
+            "[clipboard]\nmax_highlight_bytes = 65536\nmax_highlight_lines = 1000\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.clipboard.max_entries, 50);
     }
 
     #[test]
@@ -1480,8 +1445,6 @@ mod tests {
         cfg.windows.overlay_position = "main".into();
         cfg.windows.show_minimized = true;
         cfg.windows.enabled = false; // 非默认值:验证 roundtrip / non-default: verify the roundtrip
-        cfg.clipboard.max_highlight_bytes = 32 * 1024;
-        cfg.clipboard.max_highlight_lines = 500;
         cfg.mouse.enabled = true;
         cfg.mouse.profiles = vec![
             MouseProfile {
@@ -1516,8 +1479,6 @@ mod tests {
         assert_eq!(loaded.windows.overlay_position, "main");
         assert!(loaded.windows.show_minimized);
         assert!(!loaded.windows.enabled);
-        assert_eq!(loaded.clipboard.max_highlight_bytes, 32 * 1024);
-        assert_eq!(loaded.clipboard.max_highlight_lines, 500);
         // mouse profiles 原样保留(通配档 + per-device 档各一条)。
         // Mouse profiles survive untouched (one wildcard + one per-device).
         assert!(loaded.mouse.enabled);
