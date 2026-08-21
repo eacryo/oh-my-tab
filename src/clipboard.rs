@@ -76,7 +76,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 // ========== 常量 / constants ==========
 
@@ -504,13 +504,14 @@ static DETAIL_PICKER_ORIGINAL_ORIGIN: Mutex<Option<NSPoint>> = Mutex::new(None);
 /// cleared when the old content is removed / the panel hides, or a dangling pointer would
 /// be dereferenced on Cmd+C (use-after-free).
 static DETAIL_TEXT_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
-/// 当前启用软换行装饰的代码文本视图;装饰只画在视图上,不写入文本。
-/// The code text view currently using soft-wrap decorations; decorations are drawn on the view,
-/// never written into the text.
+/// 当前启用软换行装饰的代码文本视图;箭头装饰只绘制,U+2028 分隔符由原文映射剥离。
+/// The code text view using soft-wrap decorations; arrows are drawing-only, while U+2028
+/// separators are stripped through the source map.
 static DETAIL_SOFT_WRAP_TEXT_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
-/// 代码详情显示文本到原文的映射,软换行装饰不会改变复制结果。
-/// Mapping from detail code display text back to its source; soft-wrap decorations never affect copying.
-static DETAIL_SOURCE_MAP: Mutex<Option<DisplaySourceMap>> = Mutex::new(None);
+/// 代码详情显示文本到原文的共享映射,保证 U+2028 和其它显示字符不会进入复制结果。
+/// Shared mapping from detail display text to source, ensuring U+2028 and other display-only
+/// characters never enter copied content.
+static DETAIL_SOURCE_MAP: Mutex<Option<Arc<DisplaySourceMap>>> = Mutex::new(None);
 
 /// 行列表重建进行中:重建期间 addSubview 的新行按钮会因鼠标恰好在区域内而立即派发
 /// mouseEntered(ActiveInKeyWindow + InVisibleRect 的 tracking area),若该回调再触发
@@ -4268,18 +4269,18 @@ unsafe fn show_detail_for_sel() {
         // --- 文本条目:完整未截断文本,超出主浮窗高度后在详情内滚动 ---
         // Text entry: the full untruncated text; scrolls inside detail beyond picker height.
         let kind = classify_text(&entry.text);
-        // 代码详情的高度和内容视图共享同一份 PreparedCodeDisplay。此前两者各自调用
-        // prepare_code_display:第二次虽命中缓存,仍会哈希、检测语言并 clone 长文本模型。
-        // Code-detail sizing and content now share one PreparedCodeDisplay. Previously both
-        // called prepare_code_display; the second cache hit still hashed, detected language,
-        // and cloned the large text model.
-        let prepared_code =
-            (kind == TextKind::Code).then(|| prepare_code_for_soft_wrap(&entry.text));
+        // 代码详情的高度和内容视图共享同一个 Arc<PreparedCodeDisplay>;缓存命中也只
+        // 增加引用计数,不会复制长文本或高亮 span。
+        // Code-detail sizing and content share one Arc<PreparedCodeDisplay>; cache hits likewise
+        // only increment the reference count instead of copying long text or highlight spans.
+        let prepared_code = (kind == TextKind::Code).then(|| {
+            prepare_code_for_soft_wrap(&entry.text, detail_code_max_columns(DETAIL_CODE_MAX_W))
+        });
         let (tw, th) = prepared_code
             .as_ref()
             .map(|prepared| detail_prepared_code_size(prepared, max_detail_h))
             .unwrap_or_else(|| detail_text_size(&entry.text, kind, max_detail_h));
-        add_detail_text(content, &entry.text, tw, th, kind, prepared_code.as_ref());
+        add_detail_text(content, &entry.text, tw, th, kind, prepared_code.as_deref());
         w = tw;
         h = th;
     }
@@ -4361,47 +4362,16 @@ fn detail_code_max_columns(width: f64) -> usize {
     columns.saturating_sub(DETAIL_CODE_WRAP_SAFETY).max(24)
 }
 
-/// 根据已准备的原文代码模型计算尺寸,避免视图创建时再次扫描高亮和复制长文本。
-/// Size the detail panel from the prepared raw-code model, avoiding another highlight scan and
-/// large-text copy during view creation.
-fn estimate_code_visual_lines(text: &str, max_columns: usize) -> usize {
-    let cap = max_columns.max(1);
-    text.split('\n')
-        .map(|line| {
-            let mut width = 0usize;
-            let mut indent = 0usize;
-            let mut at_indent = true;
-            for ch in line.chars() {
-                if ch == '\t' {
-                    let next = 4 - (width % 4);
-                    width += next;
-                    if at_indent {
-                        indent += next;
-                    }
-                } else {
-                    width += 1;
-                    if at_indent && ch == ' ' {
-                        indent += 1;
-                    } else {
-                        at_indent = false;
-                    }
-                }
-            }
-            if width <= cap {
-                return 1;
-            }
-            let continuation_width = cap.saturating_sub(indent + 4).max(1);
-            1 + (width - cap).div_ceil(continuation_width)
-        })
-        .sum::<usize>()
-        .max(1)
-}
-
+/// 根据已准备的软换行模型计算尺寸;U+2028 已代表最终视觉折行,不再重复扫描每行宽度。
+/// Size the panel from the prepared soft-wrap model. U+2028 already represents final visual
+/// wraps, so line widths are not scanned again.
 fn detail_prepared_code_size(prepared: &PreparedCodeDisplay, max_height: f64) -> (f64, f64) {
-    // 这里只用于估算高度;真正的 NSTextView 仍使用原文,运行时软换行不会插入这些换行符。
-    // This is sizing-only; the actual NSTextView keeps the raw string and adds no newlines.
-    let lines =
-        estimate_code_visual_lines(&prepared.text, detail_code_max_columns(DETAIL_CODE_MAX_W));
+    let lines = prepared
+        .text
+        .chars()
+        .filter(|ch| matches!(ch, '\n' | '\u{2028}'))
+        .count()
+        + 1;
     let h = (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H)
         .clamp(DETAIL_TEXT_MIN_H, max_height);
     (DETAIL_CODE_MAX_W, h)
@@ -4411,7 +4381,7 @@ fn detail_prepared_code_size(prepared: &PreparedCodeDisplay, max_height: f64) ->
 /// Compute detail text-panel dimensions (type-specific width, height capped by the picker).
 fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
     if kind == TextKind::Code {
-        let prepared = prepare_code_for_soft_wrap(text);
+        let prepared = prepare_code_for_soft_wrap(text, detail_code_max_columns(DETAIL_CODE_MAX_W));
         return detail_prepared_code_size(&prepared, max_height);
     }
     let w = DETAIL_MAX_W;
@@ -4422,11 +4392,11 @@ fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
     (w, h)
 }
 
-/// 构建详情文本视图:普通文本自然换行,代码保留原文并由 NSTextView 软换行;标记只作为绘制装饰。
+/// 构建详情文本视图:普通文本自然换行;代码按优先级插入 U+2028 软换行,标记只作为绘制装饰。
 /// 文本**可鼠标选中**(选中范围由底部"复制所选"按钮/Cmd+C 复制);面板不成为 key,
 /// 键盘焦点仍留在主浮窗,所以不能依赖系统 Cmd+C 路由。
-/// Build the detail text view: plain text wraps naturally, while code keeps its raw string and
-/// NSTextView performs visual soft wrapping; markers are drawing-only decorations.
+/// Build the detail text view: plain text wraps naturally; code inserts prioritized U+2028 soft
+/// wraps, with markers remaining drawing-only decorations.
 /// The text IS mouse-selectable; selection is copied by the bottom "copy selection" button / Cmd+C.
 /// The panel never becomes key (keyboard focus stays in the picker), so system Cmd+C routing
 /// cannot be relied upon.
@@ -4682,18 +4652,22 @@ unsafe fn add_detail_text(
     let _: () = msg_send![scroll, setVerticalScrollElasticity: 1isize]; // NSScrollElasticityNone
     let _: () = msg_send![scroll, setHorizontalScrollElasticity: 1isize];
 
-    // 代码保留原始字符串;NSTextView 负责 visual soft wrap,不插入额外的 '\n'。
-    // Code keeps the original string; NSTextView performs visual soft wrapping without adding
-    // extra '\n' characters.
+    // 代码模型只插入 U+2028 视觉行分隔符;禁用横向滚动,极端像素宽度误差仍由
+    // NSTextView 的字符级兜底处理。
+    // The code model inserts only U+2028 visual line separators. Horizontal scrolling stays off;
+    // NSTextView still provides character-level fallback for extreme pixel-width differences.
     let _: () = msg_send![scroll, setHasHorizontalScroller: false];
     // 详情打开路径已在 show_detail_for_sel 准备一次;此处只借用原文/映射/span,不再复制长文本模型。
     // show_detail_for_sel prepares code once before this call; borrow its raw text, map, and
     // spans instead of cloning another complete large-text model.
     let prepared = prepared_code;
     let display_text = prepared.map(|code| code.text.as_str()).unwrap_or(text);
-    // 软换行详情展示的就是原文,复制时直接读取 NSTextView,不再复制一份 identity map。
-    // Soft-wrapped detail text is the original string, so copy directly from NSTextView instead
-    // of cloning an identity source map.
+    // 自定义软换行只在显示文本中插入行分隔符;共享缓存里的原文映射,复制选区时
+    // 去掉这些显示字符,不复制长原文/边界数组。
+    // Custom soft wrapping inserts line separators only into display text. Share the cached
+    // source map so copied selections omit those display characters without cloning the long
+    // source or boundary array.
+    *DETAIL_SOURCE_MAP.lock().unwrap() = prepared.and_then(|code| code.source_map.clone());
     let tv: *mut AnyObject = msg_send![detail_text_view_class(), alloc];
     let tv: *mut AnyObject = msg_send![
         tv,
@@ -4718,6 +4692,12 @@ unsafe fn add_detail_text(
     // The detail view reuses the same text classification and lexical highlighter as the list,
     // including URLs, HTML, and ordinary code snippets.
     let storage: *mut AnyObject = msg_send![tv, textStorage];
+    // 高亮、字体和段落样式会分别修改整段 NSTextStorage;外层编辑事务把它们的
+    // TextKit 无效化/修复合并为一次,避免软换行详情在布局前重复处理全文。
+    // Highlighting, font, and paragraph styles each mutate the full NSTextStorage. An outer
+    // editing transaction coalesces their TextKit invalidation/fix-up into one pass instead of
+    // repeatedly processing the whole soft-wrapped detail before layout.
+    let _: () = msg_send![storage, beginEditing];
     if let Some(code) = prepared {
         apply_prepared_code_highlights(storage, code);
     } else {
@@ -4745,6 +4725,7 @@ unsafe fn add_detail_text(
     if is_code {
         apply_code_paragraph_styles(storage, display_text);
     }
+    let _: () = msg_send![storage, endEditing];
     // 详情窗口外框对齐条目内容块顶部,正文再补上列表的行内顶部留白,避免整体窗口下移。
     // The detail frame aligns with the row content block; add the list's top padding inside
     // the text view so the whole detail window does not shift downward.
@@ -8455,14 +8436,14 @@ pub(crate) fn smoke_runner() -> bool {
         // 无来源条目:标题栏应显示"未知来源",无图标。
         // A source-less entry: the header shows "unknown source", no icon.
         record_text(&mut hist, "legacy entry without a source", "", "", 50);
-        // 长文本紧邻最新图片:→ 打开图片后按 ↓ 会切到真正溢出的文本详情,覆盖完整
-        // TextKit 布局、原生 scroller、顶部复位和两端硬钳制。
-        // A long text next to the newest image means Down after opening the image reaches a
-        // genuinely overflowing text detail, covering full TextKit layout, the native scroller,
-        // top reset, and hard clamping at both endpoints.
+        // 长代码紧邻最新图片:→ 打开图片后按 ↓ 会切到真正溢出的软换行详情,覆盖
+        // syntect、完整 TextKit 布局、原生 scroller、顶部复位和两端硬钳制。
+        // Long code next to the newest image means Down after opening the image reaches a
+        // genuinely overflowing soft-wrapped detail, covering syntect, full TextKit layout, the
+        // native scroller, top reset, and hard clamping at both endpoints.
         record_text(
             &mut hist,
-            &"detail scrolling regression line\n".repeat(400),
+            &"fn detail_scrolling_regression() { let result = service.fetch(first_argument, second_argument) && enabled; }\n".repeat(200),
             "TextEdit",
             "com.apple.TextEdit",
             50,
@@ -8622,6 +8603,15 @@ pub(crate) fn smoke_runner() -> bool {
             let has_scroller: bool = msg_send![detail_scroll, hasVerticalScroller];
             let elasticity: isize = msg_send![detail_scroll, verticalScrollElasticity];
             let detail_doc: *mut AnyObject = msg_send![detail_scroll, documentView];
+            let detail_string: *mut AnyObject = msg_send![detail_doc, string];
+            assert!(
+                nsstring_to_rust(detail_string).contains('\u{2028}'),
+                "long code detail must contain custom soft-wrap separators"
+            );
+            assert!(
+                DETAIL_SOURCE_MAP.lock().unwrap().is_some(),
+                "custom soft wraps must retain a source map for copying"
+            );
             let layout: *mut AnyObject = msg_send![detail_doc, layoutManager];
             let noncontiguous: bool = msg_send![layout, allowsNonContiguousLayout];
             let background: bool = msg_send![layout, backgroundLayoutEnabled];

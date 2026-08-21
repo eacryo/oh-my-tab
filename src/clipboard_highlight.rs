@@ -11,7 +11,7 @@ use objc2::{class, msg_send};
 use objc2_foundation::NSRange;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
@@ -43,9 +43,10 @@ struct SyntectSpan {
     foreground: [u8; 4],
 }
 
-#[derive(Debug, Clone)]
-struct CachedSyntectHighlight {
-    spans: Vec<SyntectSpan>,
+#[derive(Debug, Clone, Copy)]
+struct SourceHighlightAnalysis {
+    language: Option<&'static str>,
+    use_syntect: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,7 +54,6 @@ struct CodeDisplayCacheKey {
     content_hash: u64,
     content_len: usize,
     max_columns: usize,
-    language: Option<&'static str>,
     use_syntect: bool,
     soft_wrap: bool,
 }
@@ -65,10 +65,10 @@ struct DisplayHighlightSpan {
     foreground: [u8; 4],
 }
 
-#[derive(Clone)]
 pub(crate) struct PreparedCodeDisplay {
     pub(crate) text: String,
     spans: Vec<DisplayHighlightSpan>,
+    pub(crate) source_map: Option<Arc<DisplaySourceMap>>,
 }
 
 struct SyntectState {
@@ -77,9 +77,12 @@ struct SyntectState {
 }
 
 static SYNTECT_STATE: OnceLock<Option<SyntectState>> = OnceLock::new();
-static SYNTECT_CACHE: OnceLock<Mutex<HashMap<SyntectCacheKey, CachedSyntectHighlight>>> =
+// 两级缓存都共享不可变结果。命中时只增加 Arc 引用计数,不再复制长文本和大量 span。
+// Both cache levels share immutable results. A hit only increments an Arc reference count
+// instead of copying long text and large span arrays.
+static SYNTECT_CACHE: OnceLock<Mutex<HashMap<SyntectCacheKey, Arc<[SyntectSpan]>>>> =
     OnceLock::new();
-static CODE_DISPLAY_CACHE: OnceLock<Mutex<HashMap<CodeDisplayCacheKey, PreparedCodeDisplay>>> =
+static CODE_DISPLAY_CACHE: OnceLock<Mutex<HashMap<CodeDisplayCacheKey, Arc<PreparedCodeDisplay>>>> =
     OnceLock::new();
 
 /// 保守地从剪贴板片段推断语言;没有足够证据时返回 None,交给现有通用高亮兜底。
@@ -362,10 +365,22 @@ fn looks_like_json(text: &str) -> bool {
 /// 根据配置判断是否允许对该片段运行 syntect;0 表示主动关闭高亮。
 /// Decide whether syntect may run for this snippet; zero explicitly disables highlighting.
 fn should_use_syntect_with_limits(text: &str, max_bytes: usize, max_lines: usize) -> bool {
-    max_bytes > 0
-        && max_lines > 0
-        && text.len() <= max_bytes
-        && text.split('\n').count() <= max_lines
+    if max_bytes == 0 || max_lines == 0 || text.len() > max_bytes {
+        return false;
+    }
+    // 达到行数上限后立即退出;无需像 split().count() 一样继续扫描超长输入的剩余部分。
+    // Exit as soon as the line limit is exceeded instead of scanning the rest of a long input
+    // like split().count() would.
+    let mut lines = 1usize;
+    for byte in text.bytes() {
+        if byte == b'\n' {
+            lines += 1;
+            if lines > max_lines {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub(crate) fn should_use_syntect(text: &str) -> bool {
@@ -390,6 +405,28 @@ fn syntect_fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// 一次性计算高亮路径共用的限制和语言元数据。之前 display cache 和 syntect cache
+/// 分别执行这些检查;内容哈希由调用方同样只计算一次后传入两级缓存。
+/// Compute limit and language metadata shared by the complete highlighting path once. Previously
+/// the display and syntect caches repeated these checks; callers likewise hash content once and
+/// pass that hash through both cache levels.
+fn analyze_source_with_decision(source: &str, use_syntect: bool) -> SourceHighlightAnalysis {
+    SourceHighlightAnalysis {
+        // 高亮被配置/尺寸限制关闭时不做昂贵且不会被使用的语言扫描。
+        // Skip the expensive, unused language scan when highlighting is disabled by limits.
+        language: if use_syntect {
+            detect_language(source)
+        } else {
+            None
+        },
+        use_syntect,
+    }
+}
+
+fn analyze_source_for_highlighting(source: &str) -> SourceHighlightAnalysis {
+    analyze_source_with_decision(source, should_use_syntect(source))
+}
+
 /// 在剪贴板功能启动时后台预热语法集,避免首次查看 HTML 阻塞主线程。
 /// Warm the syntax sets in the background when clipboard support starts, so the first HTML
 /// detail open does not block the main thread.
@@ -412,18 +449,23 @@ fn syntect_state() -> Option<&'static SyntectState> {
         .as_ref()
 }
 
-fn cached_syntect_highlight(text: &str, language: &'static str) -> Option<Vec<SyntectSpan>> {
-    if !should_use_syntect(text) {
+fn cached_syntect_highlight(
+    text: &str,
+    content_hash: u64,
+    analysis: SourceHighlightAnalysis,
+) -> Option<Arc<[SyntectSpan]>> {
+    if !analysis.use_syntect {
         return None;
     }
+    let language = analysis.language?;
     let key = SyntectCacheKey {
-        content_hash: syntect_fnv1a64(text.as_bytes()),
+        content_hash,
         content_len: text.len(),
         language,
     };
     let cache = SYNTECT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cached) = cache.lock().ok()?.get(&key) {
-        return Some(cached.spans.clone());
+    if let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
+        return Some(cached);
     }
 
     let state = syntect_state()?;
@@ -463,16 +505,14 @@ fn cached_syntect_highlight(text: &str, language: &'static str) -> Option<Vec<Sy
         source_offset += line.len();
     }
 
-    let result = CachedSyntectHighlight {
-        spans: spans.clone(),
-    };
+    let spans: Arc<[SyntectSpan]> = spans.into();
     if let Ok(mut guard) = cache.lock() {
         if guard.len() >= SYNTECT_CACHE_CAPACITY {
             if let Some(old_key) = guard.keys().next().copied() {
                 guard.remove(&old_key);
             }
         }
-        guard.insert(key, result);
+        guard.insert(key, Arc::clone(&spans));
     }
     Some(spans)
 }
@@ -972,17 +1012,16 @@ fn merge_display_spans(mut spans: Vec<DisplayHighlightSpan>) -> Vec<DisplayHighl
     merged
 }
 
-/// 一次准备详情显示文本、原文映射和显示高亮范围,尺寸计算与视图创建共享这份缓存。
-/// Prepare display text, source mapping, and display highlight ranges once; size calculation
-/// and view creation share this cached result.
-pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> PreparedCodeDisplay {
+/// 一次准备详情显示文本、原文映射和显示高亮范围;缓存和调用方通过 Arc 共享不可变结果。
+/// Prepare display text, source mapping, and display highlight ranges once; the cache and callers
+/// share the immutable result through Arc.
+pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Arc<PreparedCodeDisplay> {
     let use_syntect = should_use_syntect(source);
-    let language = detect_language(source);
+    let content_hash = syntect_fnv1a64(source.as_bytes());
     let key = CodeDisplayCacheKey {
-        content_hash: syntect_fnv1a64(source.as_bytes()),
+        content_hash,
         content_len: source.len(),
         max_columns,
-        language,
         use_syntect,
         soft_wrap: false,
     };
@@ -991,15 +1030,26 @@ pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Prepared
         return cached;
     }
 
+    // 语言由内容唯一决定,无需进入 display cache key。只在 cache miss 后识别,
+    // 避免每次重开同一详情都对全文执行语言特征扫描。
+    // Language is deterministic from content and need not be part of the display-cache key.
+    // Detect it only after a miss so reopening the same detail avoids a full language scan.
+    let analysis = analyze_source_with_decision(source, use_syntect);
     let formatted = format_code_for_display(source, max_columns);
-    let prepared = build_prepared_code(source, formatted, use_syntect, language);
+    let prepared = Arc::new(build_prepared_code(
+        source,
+        formatted,
+        content_hash,
+        analysis,
+        false,
+    ));
     if let Ok(mut guard) = cache.lock() {
         if guard.len() >= SYNTECT_CACHE_CAPACITY {
             if let Some(old_key) = guard.keys().next().copied() {
                 guard.remove(&old_key);
             }
         }
-        guard.insert(key, prepared.clone());
+        guard.insert(key, Arc::clone(&prepared));
     }
     prepared
 }
@@ -1009,31 +1059,27 @@ pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Prepared
 fn build_prepared_code(
     source: &str,
     formatted: FormattedCode,
-    use_syntect: bool,
-    language: Option<&'static str>,
+    content_hash: u64,
+    analysis: SourceHighlightAnalysis,
+    retain_source_map: bool,
 ) -> PreparedCodeDisplay {
     let mut spans = Vec::new();
-    if use_syntect {
-        if let Some(language) = language {
-            if let Some(source_spans) = cached_syntect_highlight(source, language) {
-                for span in source_spans {
-                    let source_range =
-                        NSRange::new(span.start, span.end.saturating_sub(span.start));
-                    for range in formatted
-                        .source_map
-                        .display_ranges_for_source_range(source_range)
-                    {
-                        spans.push(DisplayHighlightSpan {
-                            start: range.location,
-                            end: range.location.saturating_add(range.length),
-                            foreground: span.foreground,
-                        });
-                    }
-                }
+    if let Some(source_spans) = cached_syntect_highlight(source, content_hash, analysis) {
+        for span in source_spans.iter() {
+            let source_range = NSRange::new(span.start, span.end.saturating_sub(span.start));
+            for range in formatted
+                .source_map
+                .display_ranges_for_source_range(source_range)
+            {
+                spans.push(DisplayHighlightSpan {
+                    start: range.location,
+                    end: range.location.saturating_add(range.length),
+                    foreground: span.foreground,
+                });
             }
         }
     }
-    if use_syntect && spans.is_empty() {
+    if analysis.use_syntect && spans.is_empty() {
         for span in highlight_spans(&formatted.text, TextKind::Code) {
             let range = utf16_range(&formatted.text, span.start, span.end);
             spans.push(DisplayHighlightSpan {
@@ -1046,19 +1092,26 @@ fn build_prepared_code(
     PreparedCodeDisplay {
         text: formatted.text,
         spans: merge_display_spans(spans),
+        // 列表预览只需映射高亮范围,构建完成后立即释放;只有详情复制需要长期保留。
+        // Row previews need the map only while projecting highlights and release it afterward;
+        // only detail copying retains it.
+        source_map: retain_source_map.then(|| Arc::new(formatted.source_map)),
     }
 }
 
-/// 为 NSTextView 准备软换行原文;不插入视觉换行符或额外缩进。
-/// Prepare raw code for NSTextView soft wrapping; no visual newline or indentation is inserted.
-pub(crate) fn prepare_code_for_soft_wrap(source: &str) -> PreparedCodeDisplay {
+/// 为 NSTextView 准备自定义软换行显示文本;只插入 U+2028,不插入额外缩进,缓存命中共享 Arc。
+/// Prepare custom soft-wrapped display text for NSTextView by inserting only U+2028, without
+/// extra indentation; cache hits share the Arc.
+pub(crate) fn prepare_code_for_soft_wrap(
+    source: &str,
+    max_columns: usize,
+) -> Arc<PreparedCodeDisplay> {
     let use_syntect = should_use_syntect(source);
-    let language = detect_language(source);
+    let content_hash = syntect_fnv1a64(source.as_bytes());
     let key = CodeDisplayCacheKey {
-        content_hash: syntect_fnv1a64(source.as_bytes()),
+        content_hash,
         content_len: source.len(),
-        max_columns: usize::MAX,
-        language,
+        max_columns,
         use_syntect,
         soft_wrap: true,
     };
@@ -1067,57 +1120,29 @@ pub(crate) fn prepare_code_for_soft_wrap(source: &str) -> PreparedCodeDisplay {
         return cached;
     }
 
-    // 原文详情不需要完整 source map:显示文本和复制文本完全相同,映射只会浪费一份
-    // UTF-16 边界数组和一份 source clone。高亮范围直接使用原文坐标。
-    // Raw code details need no full source map: display and copy text are identical, so a map
-    // would only allocate another source clone and UTF-16 boundary array. Highlight ranges use
-    // source coordinates directly.
-    let prepared = build_raw_prepared_code(source, use_syntect, language);
+    // 自定义软换行插入 U+2028,因此保留共享 source map 供高亮和复制选区使用。
+    // 语言识别推迟到 miss 后,cache hit 只做限制检查、哈希和 Arc clone。
+    // Custom soft wrapping inserts U+2028, so retain a shared source map for highlighting and
+    // copied selections. Language detection is deferred until after a miss; a hit only checks
+    // limits, hashes, and clones the Arc.
+    let analysis = analyze_source_with_decision(source, use_syntect);
+    let formatted = format_code_for_soft_wrap(source, max_columns);
+    let prepared = Arc::new(build_prepared_code(
+        source,
+        formatted,
+        content_hash,
+        analysis,
+        true,
+    ));
     if let Ok(mut guard) = cache.lock() {
         if guard.len() >= SYNTECT_CACHE_CAPACITY {
             if let Some(old_key) = guard.keys().next().copied() {
                 guard.remove(&old_key);
             }
         }
-        guard.insert(key, prepared.clone());
+        guard.insert(key, Arc::clone(&prepared));
     }
     prepared
-}
-
-fn build_raw_prepared_code(
-    source: &str,
-    use_syntect: bool,
-    language: Option<&'static str>,
-) -> PreparedCodeDisplay {
-    let mut spans = Vec::new();
-    if use_syntect {
-        if let Some(language) = language {
-            if let Some(source_spans) = cached_syntect_highlight(source, language) {
-                spans.extend(source_spans.into_iter().map(|span| DisplayHighlightSpan {
-                    start: span.start,
-                    end: span.end,
-                    foreground: span.foreground,
-                }));
-            }
-        }
-    }
-    if use_syntect && spans.is_empty() {
-        let offsets = source_utf16_offsets(source);
-        for span in highlight_spans(source, TextKind::Code) {
-            let start = offsets[span.start];
-            let end = offsets[span.end];
-            spans.push(DisplayHighlightSpan {
-                start,
-                end,
-                foreground: rgba_from_hex(highlight_color(span.kind)),
-            });
-        }
-    }
-    PreparedCodeDisplay {
-        // Raw detail copy falls back to NSTextView's identical original string.
-        text: source.to_owned(),
-        spans: merge_display_spans(spans),
-    }
 }
 
 fn source_utf16_offsets(source: &str) -> Vec<usize> {
@@ -1168,24 +1193,62 @@ fn append_mapped_insert(
     }
 }
 
-/// 将同一显示行的一段文本累加到列宽;`trimmed_width` 忽略末尾空格/制表符。
-/// Accumulate one display-line segment into its column width; `trimmed_width` ignores trailing
-/// spaces and tabs.
-fn extend_visual_width(
+/// 将片段累加到可用列宽;在下一个字符超宽前立即停止并返回 false。
+/// Accumulate a segment within the available columns; stop before the next overflowing character
+/// and return false.
+fn extend_visual_width_with_limit(
     source: &str,
     byte: &mut usize,
     end: usize,
     width: &mut usize,
     trimmed_width: &mut usize,
-) {
+    available: usize,
+) -> bool {
     while *byte < end {
         let ch = source[*byte..].chars().next().unwrap();
-        *width += if ch == '\t' { 4 - (*width % 4) } else { 1 };
+        let next_width = *width + if ch == '\t' { 4 - (*width % 4) } else { 1 };
+        if next_width > available {
+            return false;
+        }
+        *width = next_width;
         *byte += ch.len_utf8();
         if ch != ' ' && ch != '\t' {
             *trimmed_width = *width;
         }
     }
+    true
+}
+
+/// 代码软换行优先级:逗号 > 运算符 > 成员访问 > 参数边界 > 空白。
+/// Code soft-wrap priority: comma > operator > member access > parameter boundary > whitespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CodeBreakPriority {
+    Comma,
+    Operator,
+    Member,
+    Parameter,
+    Whitespace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodeBreak {
+    byte: usize,
+    priority: CodeBreakPriority,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeWrapStyle {
+    /// 列表预览:插入普通换行和悬挂缩进,并显示空格标记。
+    /// Row preview: insert regular newlines and hanging indentation, with visible spaces.
+    Preview,
+    /// 详情软换行:插入 U+2028 行分隔符,不改变段落或复制出的原文。
+    /// Detail soft wrap: insert U+2028 line separators without changing the paragraph or copied source.
+    Detail,
+}
+
+struct MappedCodeOutput {
+    text: String,
+    boundaries: Vec<usize>,
 }
 
 fn leading_indent(text: &str, start: usize, end: usize) -> (usize, usize) {
@@ -1206,7 +1269,7 @@ fn leading_indent(text: &str, start: usize, end: usize) -> (usize, usize) {
     (byte, columns)
 }
 
-fn safe_breaks(source: &str, start: usize, end: usize) -> Vec<usize> {
+fn code_breaks(source: &str, start: usize, end: usize) -> Vec<CodeBreak> {
     let bytes = source.as_bytes();
     let mut points = Vec::new();
     let mut byte = start;
@@ -1220,9 +1283,15 @@ fn safe_breaks(source: &str, start: usize, end: usize) -> Vec<usize> {
                 }
                 byte += c.len_utf8();
             }
-            points.push(byte);
+            points.push(CodeBreak {
+                byte,
+                priority: CodeBreakPriority::Whitespace,
+            });
             continue;
         }
+        // 字符串内部的标点不是代码结构边界;超长字符串最终仍会走任意字符折行。
+        // Punctuation inside strings is not a code-structure boundary; an overlong string still
+        // falls back to arbitrary character wrapping.
         if matches!(ch, '\'' | '"' | '`') {
             let quote = ch;
             byte += ch.len_utf8();
@@ -1250,27 +1319,58 @@ fn safe_breaks(source: &str, start: usize, end: usize) -> Vec<usize> {
             }
             continue;
         }
-        if ch == '.' {
-            // Break before a method-chain dot, never in the method name itself.
-            points.push(byte);
-            byte += 1;
-            continue;
-        }
-        let next = source[byte + ch.len_utf8()..end].chars().next();
-        if matches!(ch, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
-            || matches!(ch, '=' | '+' | '-' | '*' | '/' | '&' | '|' | '<' | '>')
-        {
-            byte += ch.len_utf8();
-            if next == Some('=') || (matches!(ch, '&' | '|') && next == Some(ch)) {
-                byte += 1;
-            }
-            points.push(byte);
-            continue;
-        }
+
+        let start_byte = byte;
         byte += ch.len_utf8();
+        match ch {
+            ',' => points.push(CodeBreak {
+                byte,
+                priority: CodeBreakPriority::Comma,
+            }),
+            '.' => {
+                points.push(CodeBreak {
+                    byte: start_byte,
+                    priority: CodeBreakPriority::Member,
+                });
+                points.push(CodeBreak {
+                    byte,
+                    priority: CodeBreakPriority::Member,
+                });
+            }
+            '(' | ')' => {
+                points.push(CodeBreak {
+                    byte: start_byte,
+                    priority: CodeBreakPriority::Parameter,
+                });
+                points.push(CodeBreak {
+                    byte,
+                    priority: CodeBreakPriority::Parameter,
+                });
+            }
+            '=' | '+' | '-' | '&' | '|' => {
+                // 把 ==、=>、+=、->、&&、|| 等连续运算符视为一个边界单元。
+                // Treat consecutive operators such as ==, =>, +=, ->, &&, and || as one unit.
+                while byte < end
+                    && matches!(source.as_bytes()[byte], b'=' | b'+' | b'-' | b'&' | b'|')
+                {
+                    byte += 1;
+                }
+                points.push(CodeBreak {
+                    byte: start_byte,
+                    priority: CodeBreakPriority::Operator,
+                });
+                points.push(CodeBreak {
+                    byte,
+                    priority: CodeBreakPriority::Operator,
+                });
+            }
+            _ => {}
+        }
     }
-    points.sort_unstable();
-    points.dedup();
+    points.sort_unstable_by_key(|point| (point.byte, point.priority));
+    // 同一位置可能同时属于多个类别,保留优先级最高的一个。
+    // A position can belong to multiple categories; retain its highest-priority category.
+    points.dedup_by_key(|point| point.byte);
     points
 }
 
@@ -1305,102 +1405,142 @@ fn append_code_line(
     line_start: usize,
     line_end: usize,
     max_columns: usize,
-    out: &mut String,
-    boundaries: &mut Vec<usize>,
+    style: CodeWrapStyle,
+    output: &mut MappedCodeOutput,
 ) {
     if line_start == line_end {
         return;
     }
     let (content_start, indent_columns) = leading_indent(source, line_start, line_end);
-    let breaks = safe_breaks(source, content_start, line_end);
+    let breaks = code_breaks(source, content_start, line_end);
     let mut chunk_start = line_start;
     let mut first_chunk = true;
     while chunk_start < line_end {
-        let prefix_columns = if first_chunk { 0 } else { indent_columns + 4 };
+        let prefix_columns = if first_chunk {
+            0
+        } else {
+            match style {
+                CodeWrapStyle::Preview => indent_columns + 4,
+                CodeWrapStyle::Detail => indent_columns.max(4),
+            }
+        };
         let available = max_columns.saturating_sub(prefix_columns).max(12);
-        // 每一段只向前扫描到下一个超宽断点。旧实现对每个候选断点重新计算
-        // `chunk_start..point` 的宽度,并在每次换行从头遍历 breaks;压缩成长单行
-        // 的 HTML 因而为 O(n²)。
-        // Scan each chunk forward only until its next over-width break. The old version
-        // recalculated `chunk_start..point` for every candidate and restarted `breaks` after
-        // every wrap, making minified one-line HTML O(n²).
-        let mut break_index = breaks.partition_point(|&point| point <= chunk_start);
-        if break_index == breaks.len() {
-            if !first_chunk {
+        let mut break_index = breaks.partition_point(|point| point.byte <= chunk_start);
+        let mut byte = chunk_start;
+        let mut width = 0;
+        let mut trimmed_width = 0;
+        let mut best = [None; 5];
+        let mut fits = true;
+
+        // 每个字符最多参与一个输出段的宽度扫描。遇到超宽字符立即停下,既保留类别
+        // 优先级,也避免长标识符/压缩 HTML 在任意字符兜底时退化为 O(n²)。
+        // Each character participates in at most one output chunk's width scan. Stop at the
+        // overflowing character so category priority is preserved without turning long
+        // identifiers or minified HTML into O(n²) during arbitrary-character fallback.
+        while break_index < breaks.len() && breaks[break_index].byte <= line_end {
+            let point = breaks[break_index];
+            if !extend_visual_width_with_limit(
+                source,
+                &mut byte,
+                point.byte,
+                &mut width,
+                &mut trimmed_width,
+                available,
+            ) {
+                fits = false;
+                break;
+            }
+            if trimmed_width <= available {
+                best[point.priority as usize] = Some(point.byte);
+            }
+            break_index += 1;
+        }
+        if fits {
+            fits = extend_visual_width_with_limit(
+                source,
+                &mut byte,
+                line_end,
+                &mut width,
+                &mut trimmed_width,
+                available,
+            );
+        }
+        if fits {
+            if !first_chunk && style == CodeWrapStyle::Preview {
                 append_mapped_insert(
-                    out,
-                    boundaries,
+                    &mut output.text,
+                    &mut output.boundaries,
                     &" ".repeat(indent_columns + 4),
                     offsets[chunk_start],
                 );
             }
-            append_mapped_source(out, boundaries, source, offsets, chunk_start, line_end);
+            append_mapped_source(
+                &mut output.text,
+                &mut output.boundaries,
+                source,
+                offsets,
+                chunk_start,
+                line_end,
+            );
             break;
         }
 
-        let first_break = breaks[break_index];
-        let mut byte = chunk_start;
-        let mut width = 0;
-        let mut trimmed_width = 0;
-        let mut best_break = None;
-        while break_index < breaks.len() && breaks[break_index] <= line_end {
-            let point = breaks[break_index];
-            extend_visual_width(source, &mut byte, point, &mut width, &mut trimmed_width);
-            if trimmed_width > available {
-                break;
-            }
-            best_break = Some(point);
-            break_index += 1;
+        // 先选最高优先级类别中最靠后的可容纳位置;所有结构边界都放不下时,
+        // `byte` 就是最后一个可容纳的 UTF-8 字符边界,允许在任意字符处折行。
+        // Pick the latest fitting point from the highest-priority category. If no structural
+        // boundary fits, `byte` is the last fitting UTF-8 character boundary and permits an
+        // arbitrary-character wrap.
+        let mut break_point = best.into_iter().flatten().next().unwrap_or(byte);
+        if break_point <= chunk_start {
+            let ch = source[chunk_start..].chars().next().unwrap();
+            break_point = chunk_start + ch.len_utf8();
         }
-
-        // 若所有安全断点都在宽度内,再检查最后一个断点到行尾的尾段。
-        // If every safe break fits, inspect the tail from the final break to line end.
-        if break_index == breaks.len() || breaks[break_index] > line_end {
-            extend_visual_width(source, &mut byte, line_end, &mut width, &mut trimmed_width);
-            if trimmed_width <= available {
-                if !first_chunk {
-                    append_mapped_insert(
-                        out,
-                        boundaries,
-                        &" ".repeat(indent_columns + 4),
-                        offsets[chunk_start],
-                    );
-                }
-                append_mapped_source(out, boundaries, source, offsets, chunk_start, line_end);
-                break;
-            }
-        }
-
-        // 没有能容纳的断点时沿用旧行为:在首个安全点换行,绝不在标识符中间断开。
-        // With no fitting break, retain the former behavior: wrap at the first safe point and
-        // never split an identifier.
-        let break_point = best_break.unwrap_or(first_break);
-        let chunk_end = trim_trailing_space(source, chunk_start, break_point);
-        if !first_chunk {
+        let trimmed = trim_trailing_space(source, chunk_start, break_point);
+        let chunk_end = if trimmed > chunk_start {
+            trimmed
+        } else {
+            break_point
+        };
+        if !first_chunk && style == CodeWrapStyle::Preview {
             append_mapped_insert(
-                out,
-                boundaries,
+                &mut output.text,
+                &mut output.boundaries,
                 &" ".repeat(indent_columns + 4),
                 offsets[chunk_start],
             );
         }
-        append_mapped_source(out, boundaries, source, offsets, chunk_start, chunk_end);
-        if let Some(last) = boundaries.last_mut() {
+        append_mapped_source(
+            &mut output.text,
+            &mut output.boundaries,
+            source,
+            offsets,
+            chunk_start,
+            chunk_end,
+        );
+        if let Some(last) = output.boundaries.last_mut() {
             *last = offsets[break_point];
         }
-        append_mapped_insert(out, boundaries, "\n", offsets[break_point]);
+        let separator = match style {
+            CodeWrapStyle::Preview => "\n",
+            CodeWrapStyle::Detail => "\u{2028}",
+        };
+        append_mapped_insert(
+            &mut output.text,
+            &mut output.boundaries,
+            separator,
+            offsets[break_point],
+        );
         chunk_start = skip_leading_space(source, break_point, line_end);
         first_chunk = false;
     }
 }
 
-/// 代码详情的显示格式化:只插入视觉换行和悬挂缩进,原文通过偏移映射保留。
-/// Format code for the detail view by inserting only visual breaks and hanging indents;
-/// the source remains available through the offset map.
-pub(crate) fn format_code_for_display(source: &str, max_columns: usize) -> FormattedCode {
+fn format_code_with_style(source: &str, max_columns: usize, style: CodeWrapStyle) -> FormattedCode {
     let offsets = source_utf16_offsets(source);
-    let mut display = String::new();
-    let mut boundaries = vec![0];
+    let mut output = MappedCodeOutput {
+        text: String::new(),
+        boundaries: vec![0],
+    };
     let mut line_start = 0;
     while line_start <= source.len() {
         let line_end = source[line_start..]
@@ -1413,13 +1553,13 @@ pub(crate) fn format_code_for_display(source: &str, max_columns: usize) -> Forma
             line_start,
             line_end,
             max_columns,
-            &mut display,
-            &mut boundaries,
+            style,
+            &mut output,
         );
         if line_end < source.len() {
             append_mapped_source(
-                &mut display,
-                &mut boundaries,
+                &mut output.text,
+                &mut output.boundaries,
                 source,
                 &offsets,
                 line_end,
@@ -1430,19 +1570,33 @@ pub(crate) fn format_code_for_display(source: &str, max_columns: usize) -> Forma
             break;
         }
     }
-    // 只改变显示文本;中点和普通 ASCII 空格都是一个 UTF-16 单元,因此原文映射无需改变。
-    // Change only the display text; a middle dot and an ASCII space are both one UTF-16 unit,
-    // so the source mapping remains unchanged.
-    if display.contains(' ') {
-        display = display.replace(' ', "·");
+    // 列表预览继续显示空格标记;详情保留普通空格,仅插入不可复制的 U+2028 软换行。
+    // Row previews retain visible-space markers; details preserve regular spaces and only insert
+    // non-copying U+2028 soft wraps.
+    if style == CodeWrapStyle::Preview && output.text.contains(' ') {
+        output.text = output.text.replace(' ', "·");
     }
     FormattedCode {
-        text: display,
+        text: output.text,
         source_map: DisplaySourceMap {
             source: source.to_owned(),
-            boundaries,
+            boundaries: output.boundaries,
         },
     }
+}
+
+/// 代码列表预览格式化:插入视觉换行/悬挂缩进并显示空格,原文由映射保留。
+/// Format code row previews with visual breaks, hanging indentation, and visible spaces while
+/// retaining the source through the offset map.
+pub(crate) fn format_code_for_display(source: &str, max_columns: usize) -> FormattedCode {
+    format_code_with_style(source, max_columns, CodeWrapStyle::Preview)
+}
+
+/// 代码详情软换行:按代码边界优先级插入 U+2028,不插入缩进或可复制字符。
+/// Soft-wrap code details by inserting U+2028 according to code-boundary priorities, without
+/// inserted indentation or copyable characters.
+fn format_code_for_soft_wrap(source: &str, max_columns: usize) -> FormattedCode {
+    format_code_with_style(source, max_columns, CodeWrapStyle::Detail)
 }
 
 /// 给代码中的可见空格设置淡色,缩进空格比普通空格稍明显。
@@ -1515,7 +1669,9 @@ pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: 
                             setHeadIndent: previous_indent as f64 * 8.4
                         ];
                         let _: () = msg_send![style, setFirstLineHeadIndent: 0.0f64];
-                        let _: () = msg_send![style, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+                        // 自定义 U+2028 已选择结构断点;像素宽度仍溢出时按字符兜底。
+                        // U+2028 already selects structural breaks; fall back by character on pixel overflow.
+                        let _: () = msg_send![style, setLineBreakMode: 1isize]; // NSLineBreakByCharWrapping
                         style
                     });
                     let _: () = msg_send![
@@ -1539,7 +1695,9 @@ pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: 
                 let style: *mut AnyObject = msg_send![style, init];
                 let _: () = msg_send![style, setHeadIndent: indent as f64 * 8.4];
                 let _: () = msg_send![style, setFirstLineHeadIndent: 0.0f64];
-                let _: () = msg_send![style, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+                // 自定义 U+2028 已选择结构断点;像素宽度仍溢出时按字符兜底。
+                // U+2028 already selects structural breaks; fall back by character on pixel overflow.
+                let _: () = msg_send![style, setLineBreakMode: 1isize]; // NSLineBreakByCharWrapping
                 style
             });
             let _: () = msg_send![
@@ -1661,14 +1819,14 @@ pub(crate) unsafe fn apply_code_highlights(
     display_text: &str,
     display_map: Option<&DisplaySourceMap>,
 ) {
-    if !should_use_syntect(source_text) {
+    let analysis = analyze_source_for_highlighting(source_text);
+    if !analysis.use_syntect {
         return;
     }
-    if let Some(language) = detect_language(source_text) {
-        if let Some(spans) = cached_syntect_highlight(source_text, language) {
-            apply_syntect_highlights(storage, &spans, display_map);
-            return;
-        }
+    let content_hash = syntect_fnv1a64(source_text.as_bytes());
+    if let Some(spans) = cached_syntect_highlight(source_text, content_hash, analysis) {
+        apply_syntect_highlights(storage, spans.as_ref(), display_map);
+        return;
     }
     apply_lexical_highlights(
         storage,
@@ -1687,7 +1845,12 @@ pub(crate) unsafe fn apply_highlights(storage: *mut AnyObject, text: &str, kind:
 
 #[cfg(test)]
 mod tests {
-    use super::{cached_syntect_highlight, detect_language, should_use_syntect_with_limits};
+    use super::{
+        analyze_source_for_highlighting, cached_syntect_highlight, detect_language,
+        format_code_for_soft_wrap, prepare_code_for_soft_wrap, should_use_syntect_with_limits,
+    };
+    use objc2_foundation::NSRange;
+    use std::sync::Arc;
 
     #[test]
     fn highlight_limits_skip_large_snippets() {
@@ -1701,12 +1864,59 @@ mod tests {
     #[test]
     fn syntect_highlights_and_reuses_cached_code() {
         let source = "fn main() {\n    let answer = 42;\n}";
-        let language = detect_language(source).expect("Rust snippet should be detected");
-        let first = cached_syntect_highlight(source, language).expect("syntect should load");
-        let second = cached_syntect_highlight(source, language).expect("cache should hit");
+        let analysis = analyze_source_for_highlighting(source);
+        assert_eq!(analysis.language, detect_language(source));
+        let content_hash = super::syntect_fnv1a64(source.as_bytes());
+        let first =
+            cached_syntect_highlight(source, content_hash, analysis).expect("syntect should load");
+        let second =
+            cached_syntect_highlight(source, content_hash, analysis).expect("cache should hit");
         assert!(!first.is_empty());
-        assert_eq!(first.len(), second.len());
-        assert_eq!(first[0].start, second[0].start);
-        assert_eq!(first[0].foreground, second[0].foreground);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "syntect cache hits must share spans"
+        );
+    }
+
+    #[test]
+    fn prepared_code_cache_hits_share_text_and_spans() {
+        let source = "fn shared_cache() {\n    println!(\"cached\");\n}";
+        let first = prepare_code_for_soft_wrap(source, 48);
+        let second = prepare_code_for_soft_wrap(source, 48);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "prepared-code cache hits must not clone the model"
+        );
+    }
+
+    #[test]
+    fn soft_wrap_prefers_code_boundaries_then_falls_back_to_characters() {
+        let first_break = |source: &str| {
+            format_code_for_soft_wrap(source, 18)
+                .text
+                .find('\u{2028}')
+                .expect("source must wrap")
+        };
+        // 每个样例都让更低优先级的断点更靠近右边;仍应选择更高优先级类别。
+        // Each sample puts a lower-priority point farther right; the higher-priority category
+        // must still win.
+        assert_eq!(first_break("aa, bb = cc.dd(ee) tailtailtail"), 3); // comma
+        assert_eq!(first_break("aa = bb.cc(dd) tailtailtail"), 4); // operator
+        assert_eq!(first_break("aa.bb(cc) dd tailtailtail"), 3); // member access
+        assert_eq!(first_break("aabb(cc) dd tailtailtail"), 8); // parameter boundary
+        assert_eq!(first_break("aabbcc dd tailtailtail"), 9); // whitespace
+        assert_eq!(first_break("abcdefghijklmnopqrstuvwxyz"), 18); // arbitrary character
+    }
+
+    #[test]
+    fn soft_wrap_source_map_excludes_virtual_separators() {
+        let source = "veryLongObject.member(firstArgument, secondArgument)";
+        let formatted = format_code_for_soft_wrap(source, 16);
+        assert!(formatted.text.contains('\u{2028}'));
+        let display_len = formatted.text.encode_utf16().count();
+        let source_range = formatted
+            .source_map
+            .source_range(NSRange::new(0, display_len));
+        assert_eq!(source_range.length, source.encode_utf16().count());
     }
 }
