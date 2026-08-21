@@ -242,6 +242,14 @@ const SCROLL_INDICATOR_W: f64 = 6.0;
 /// Actual mouse hit width; transparent side padding enlarges the drag area without changing
 /// the visible capsule width.
 const SCROLL_INDICATOR_HIT_W: f64 = 10.0;
+/// 滚动轨道边缘留白 / empty inset at each scrollbar track edge.
+const SCROLL_INDICATOR_EDGE: f64 = 3.0;
+/// 详情页始终保留右下角安全区,即使当前只有一条滚动条。
+/// The detail view always reserves a lower-right safe corner, even when only one scrollbar exists.
+const SCROLL_INDICATOR_CORNER_GAP: f64 = 2.0;
+/// 右下角安全区 = 另一条滚动条的命中宽度 + 视觉间距。
+/// Lower-right safe-corner reserve = the other scrollbar's hit width plus the visual gap.
+const SCROLL_INDICATOR_CORNER_RESERVE: f64 = SCROLL_INDICATOR_HIT_W + SCROLL_INDICATOR_CORNER_GAP;
 /// 滚动条可见胶囊的圆角(与 6pt 宽度匹配)/ visible scrollbar capsule radius (matching its 6pt width).
 const SCROLL_INDICATOR_R: f64 = 3.0;
 /// 指示器最短显示长度(条太短不可读)/ minimum indicator length (too short is unreadable).
@@ -2924,22 +2932,32 @@ unsafe fn scroll_for_target(target: ScrollTarget) -> Option<*mut AnyObject> {
 /// 计算指示器的 y/高度;拖拽和绘制必须使用同一套映射,否则拖到轨道底部时会跳动。
 /// Compute the indicator's y/height; dragging and drawing must share this mapping or the
 /// thumb jumps when it reaches the end of the track.
-fn scroll_indicator_geometry(visible_h: f64, doc_h: f64, offset: f64) -> Option<(f64, f64)> {
-    if visible_h <= 6.0 || doc_h <= visible_h {
+fn scroll_indicator_geometry(
+    visible: f64,
+    document: f64,
+    offset: f64,
+    corner_reserve: f64,
+) -> Option<(f64, f64)> {
+    let track_start = SCROLL_INDICATOR_EDGE;
+    let track_end = visible - SCROLL_INDICATOR_EDGE - corner_reserve;
+    if track_end <= track_start || document <= visible {
         return None;
     }
-    let track_h = visible_h - 6.0;
-    let knob_h = (visible_h * visible_h / doc_h)
+    // 轨道末端统一避开右下角安全区;绘制和拖拽必须使用同一轨道映射。
+    // Keep the track end outside the lower-right safe corner; drawing and dragging must use
+    // this same track mapping.
+    let track_len = track_end - track_start;
+    let knob_len = (visible * visible / document)
         .max(SCROLL_INDICATOR_MIN_LEN)
-        .min(track_h);
-    let max_offset = doc_h - visible_h;
-    let travel = track_h - knob_h;
+        .min(track_len);
+    let max_offset = document - visible;
+    let travel = track_len - knob_len;
     let progress = if max_offset > 0.0 {
         (offset / max_offset).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    Some((3.0 + progress * travel, knob_h))
+    Some((track_start + progress * travel, knob_len))
 }
 
 /// 在 10pt 透明命中视图中绘制居中的 6pt 可见胶囊;父视图仍负责接收拖拽事件。
@@ -3036,7 +3054,13 @@ unsafe fn update_scroll_indicator_for(target: ScrollTarget) {
         }
     };
 
-    let Some((knob_pos, knob_len)) = scroll_indicator_geometry(visible, document, offset) else {
+    let corner_reserve = match target {
+        ScrollTarget::Picker => 0.0,
+        ScrollTarget::Detail | ScrollTarget::DetailHorizontal => SCROLL_INDICATOR_CORNER_RESERVE,
+    };
+    let Some((knob_pos, knob_len)) =
+        scroll_indicator_geometry(visible, document, offset, corner_reserve)
+    else {
         let _: () = msg_send![indicator, setHidden: true];
         return;
     };
@@ -3111,10 +3135,18 @@ extern "C" fn scroll_indicator_mouse_down(_self: *mut c_void, _cmd: Sel, event: 
         } else {
             clip_bounds.origin.y
         };
-        let Some((_, knob_len)) = scroll_indicator_geometry(visible, document, offset) else {
+        let corner_reserve = match target {
+            ScrollTarget::Picker => 0.0,
+            ScrollTarget::Detail | ScrollTarget::DetailHorizontal => {
+                SCROLL_INDICATOR_CORNER_RESERVE
+            }
+        };
+        let Some((_, knob_len)) =
+            scroll_indicator_geometry(visible, document, offset, corner_reserve)
+        else {
             return;
         };
-        let track_len = visible - 6.0;
+        let track_len = visible - (SCROLL_INDICATOR_EDGE * 2.0) - corner_reserve;
         let thumb_travel = track_len - knob_len;
         if thumb_travel <= 0.0 {
             return;
@@ -5132,11 +5164,10 @@ unsafe fn add_detail_text(
     release_obj(tv);
     *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr(tv));
 
-    // 胶囊由原生 NSScroller 自己绘制,这里不再叠加独立指示器。bounds 通知只负责把
-    // 滚轮/惯性产生的临时越界硬钳回 AppKit 实时合法范围。
-    // The capsule is drawn by the native NSScroller itself; no separate indicator is overlaid.
-    // Bounds notifications only hard-clamp transient wheel/momentum overscroll to AppKit's
-    // live legal range.
+    // 详情滚动条由自定义胶囊绘制;bounds 通知仍负责把滚轮/惯性产生的临时越界硬钳回
+    // AppKit 实时合法范围。
+    // Detail scrollbars are drawn by the custom capsules; bounds notifications still hard-clamp
+    // transient wheel/momentum overscroll to AppKit's live legal range.
     let clip: *mut AnyObject = msg_send![scroll, contentView];
     let _: () = msg_send![clip, setPostsBoundsChangedNotifications: true];
     let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
@@ -5159,11 +5190,21 @@ unsafe fn add_detail_text(
     let vertical_indicator: *mut AnyObject = msg_send![
         vertical_indicator,
         initWithFrame: NSRect::new(
-            NSPoint::new(scroll_w - SCROLL_INDICATOR_HIT_W - 3.0, 3.0),
-            NSSize::new(SCROLL_INDICATOR_HIT_W, body_h - 6.0)
+            NSPoint::new(
+                scroll_w - SCROLL_INDICATOR_HIT_W - SCROLL_INDICATOR_EDGE,
+                SCROLL_INDICATOR_EDGE,
+            ),
+            NSSize::new(
+                SCROLL_INDICATOR_HIT_W,
+                body_h - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
+            )
         )
     ];
-    update_scroll_indicator_visual(vertical_indicator, body_h - 6.0, false);
+    update_scroll_indicator_visual(
+        vertical_indicator,
+        body_h - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
+        false,
+    );
     let _: () = msg_send![scroll, addSubview: vertical_indicator];
     *DETAIL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(vertical_indicator));
     release_obj(vertical_indicator);
@@ -5177,10 +5218,19 @@ unsafe fn add_detail_text(
                     3.0,
                     body_h - SCROLL_INDICATOR_HIT_W - 3.0,
                 ),
-                NSSize::new(scroll_w - 6.0, SCROLL_INDICATOR_HIT_W)
+                NSSize::new(
+                    scroll_w
+                        - (SCROLL_INDICATOR_EDGE * 2.0)
+                        - SCROLL_INDICATOR_CORNER_RESERVE,
+                    SCROLL_INDICATOR_HIT_W,
+                )
             )
         ];
-        update_scroll_indicator_visual(horizontal_indicator, scroll_w - 6.0, true);
+        update_scroll_indicator_visual(
+            horizontal_indicator,
+            scroll_w - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
+            true,
+        );
         let _: () = msg_send![scroll, addSubview: horizontal_indicator];
         *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(horizontal_indicator));
         release_obj(horizontal_indicator);
@@ -9314,7 +9364,27 @@ unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipEntry, ImageEntry, NSPASTEBOARD_TYPE_PNG};
+    use super::{
+        scroll_indicator_geometry, ClipEntry, ImageEntry, NSPASTEBOARD_TYPE_PNG,
+        SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE,
+    };
+
+    #[test]
+    fn detail_scroll_geometry_keeps_a_fixed_lower_right_reserve() {
+        let visible = 100.0;
+        let document = 400.0;
+        let max_offset = document - visible;
+        let (position, length) = scroll_indicator_geometry(
+            visible,
+            document,
+            max_offset,
+            SCROLL_INDICATOR_CORNER_RESERVE,
+        )
+        .expect("overflowing detail content must produce a thumb");
+        let end = position + length;
+        let expected_end = visible - SCROLL_INDICATOR_EDGE - SCROLL_INDICATOR_CORNER_RESERVE;
+        assert!((end - expected_end).abs() < f64::EPSILON);
+    }
 
     /// 测试用的 3 参便捷包装(来源与图标键留空,既有用例不受签名变化影响)。
     /// A 3-arg convenience wrapper for tests (empty source and icon key; existing cases are
