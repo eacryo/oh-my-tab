@@ -472,6 +472,7 @@ static SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// The detail text scroll view and its custom indicator; image details have no scroll area.
 static DETAIL_SCROLL_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 static DETAIL_SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static DETAIL_HORIZONTAL_SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
 /// 自定义滚动指示器拖拽状态;系统滚动条被关闭后,NSView 不会自动处理拖拽。
 /// Drag state for the custom scroll indicator; once the system scroller is disabled, an
@@ -480,12 +481,13 @@ static DETAIL_SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
 enum ScrollTarget {
     Picker,
     Detail,
+    DetailHorizontal,
 }
 
 #[derive(Clone, Copy)]
 struct ScrollDragState {
     target: ScrollTarget,
-    start_y: f64,
+    start_axis: f64,
     start_offset: f64,
     max_offset: f64,
     thumb_travel: f64,
@@ -2892,6 +2894,13 @@ fn scroll_target_for_indicator(indicator: *mut AnyObject) -> Option<ScrollTarget
     {
         return Some(ScrollTarget::Detail);
     }
+    if DETAIL_HORIZONTAL_SCROLL_INDICATOR
+        .lock()
+        .unwrap()
+        .is_some_and(|detail| detail.0 == indicator)
+    {
+        return Some(ScrollTarget::DetailHorizontal);
+    }
     if SCROLL_INDICATOR
         .lock()
         .unwrap()
@@ -2906,7 +2915,9 @@ fn scroll_target_for_indicator(indicator: *mut AnyObject) -> Option<ScrollTarget
 unsafe fn scroll_for_target(target: ScrollTarget) -> Option<*mut AnyObject> {
     match target {
         ScrollTarget::Picker => SCROLL_VIEW.lock().unwrap().map(|scroll| scroll.0),
-        ScrollTarget::Detail => DETAIL_SCROLL_VIEW.lock().unwrap().map(|scroll| scroll.0),
+        ScrollTarget::Detail | ScrollTarget::DetailHorizontal => {
+            DETAIL_SCROLL_VIEW.lock().unwrap().map(|scroll| scroll.0)
+        }
     }
 }
 
@@ -2934,7 +2945,7 @@ fn scroll_indicator_geometry(visible_h: f64, doc_h: f64, offset: f64) -> Option<
 /// 在 10pt 透明命中视图中绘制居中的 6pt 可见胶囊;父视图仍负责接收拖拽事件。
 /// Draw a centered 6pt visible capsule inside the 10pt transparent hit view; the parent view
 /// remains responsible for receiving drag events.
-unsafe fn update_scroll_indicator_visual(indicator: *mut AnyObject, height: f64) {
+unsafe fn update_scroll_indicator_visual(indicator: *mut AnyObject, length: f64, horizontal: bool) {
     let _: () = msg_send![indicator, setWantsLayer: true];
     let parent_layer: *mut AnyObject = msg_send![indicator, layer];
     let sublayers: *mut AnyObject = msg_send![parent_layer, sublayers];
@@ -2954,13 +2965,18 @@ unsafe fn update_scroll_indicator_visual(indicator: *mut AnyObject, height: f64)
     } else {
         msg_send![sublayers, objectAtIndex: 0usize]
     };
-    let _: () = msg_send![
-        visual_layer,
-        setFrame: NSRect::new(
-            NSPoint::new((SCROLL_INDICATOR_HIT_W - SCROLL_INDICATOR_W) / 2.0, 0.0),
-            NSSize::new(SCROLL_INDICATOR_W, height)
+    let frame = if horizontal {
+        NSRect::new(
+            NSPoint::new(0.0, (SCROLL_INDICATOR_HIT_W - SCROLL_INDICATOR_W) / 2.0),
+            NSSize::new(length, SCROLL_INDICATOR_W),
         )
-    ];
+    } else {
+        NSRect::new(
+            NSPoint::new((SCROLL_INDICATOR_HIT_W - SCROLL_INDICATOR_W) / 2.0, 0.0),
+            NSSize::new(SCROLL_INDICATOR_W, length),
+        )
+    };
+    let _: () = msg_send![visual_layer, setFrame: frame];
 }
 
 /// 更新滚动指示器的位置/长度:内容溢出时显示(恒显示,不淡出),否则隐藏。
@@ -2973,45 +2989,76 @@ unsafe fn update_scroll_indicator_for(target: ScrollTarget) {
         Some(scroll) => scroll,
         None => return,
     };
-    let indicator = match target {
-        ScrollTarget::Picker => match *SCROLL_INDICATOR.lock().unwrap() {
-            Some(indicator) => indicator.0,
-            None => return,
-        },
-        ScrollTarget::Detail => match *DETAIL_SCROLL_INDICATOR.lock().unwrap() {
-            Some(indicator) => indicator.0,
-            None => return,
-        },
+    let (indicator, horizontal) = match target {
+        ScrollTarget::Picker => (
+            match *SCROLL_INDICATOR.lock().unwrap() {
+                Some(indicator) => indicator.0,
+                None => return,
+            },
+            false,
+        ),
+        ScrollTarget::Detail => (
+            match *DETAIL_SCROLL_INDICATOR.lock().unwrap() {
+                Some(indicator) => indicator.0,
+                None => return,
+            },
+            false,
+        ),
+        ScrollTarget::DetailHorizontal => (
+            match *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() {
+                Some(indicator) => indicator.0,
+                None => return,
+            },
+            true,
+        ),
     };
     let clip: *mut AnyObject = msg_send![scroll, contentView];
     let clip_bounds: NSRect = msg_send![clip, bounds];
-    let visible_h = clip_bounds.size.height;
+    let visible = if horizontal {
+        clip_bounds.size.width
+    } else {
+        clip_bounds.size.height
+    };
+    let offset = if horizontal {
+        clip_bounds.origin.x
+    } else {
+        clip_bounds.origin.y
+    };
     let doc: *mut AnyObject = msg_send![scroll, documentView];
-    let doc_h = if doc.is_null() {
+    let document = if doc.is_null() {
         0.0
     } else {
         let df: NSRect = msg_send![doc, frame];
-        df.size.height
+        if horizontal {
+            df.size.width
+        } else {
+            df.size.height
+        }
     };
 
-    // 需要滚动(内容超出可视高度)才显示;无需滚动则隐藏。
-    // Shown only when scrolling is needed (content exceeds the visible height).
-    let Some((knob_y, knob_h)) = scroll_indicator_geometry(visible_h, doc_h, clip_bounds.origin.y)
-    else {
+    let Some((knob_pos, knob_len)) = scroll_indicator_geometry(visible, document, offset) else {
         let _: () = msg_send![indicator, setHidden: true];
         return;
     };
-    let _: () = msg_send![
-        indicator,
-        setFrame: NSRect::new(
+    let frame = if horizontal {
+        NSRect::new(
+            NSPoint::new(
+                knob_pos,
+                clip_bounds.size.height - SCROLL_INDICATOR_HIT_W - 3.0,
+            ),
+            NSSize::new(knob_len, SCROLL_INDICATOR_HIT_W),
+        )
+    } else {
+        NSRect::new(
             NSPoint::new(
                 clip_bounds.size.width - SCROLL_INDICATOR_HIT_W - 3.0,
-                knob_y
+                knob_pos,
             ),
-            NSSize::new(SCROLL_INDICATOR_HIT_W, knob_h)
+            NSSize::new(SCROLL_INDICATOR_HIT_W, knob_len),
         )
-    ];
-    update_scroll_indicator_visual(indicator, knob_h);
+    };
+    let _: () = msg_send![indicator, setFrame: frame];
+    update_scroll_indicator_visual(indicator, knob_len, horizontal);
     let _: () = msg_send![indicator, setHidden: false];
 }
 
@@ -3048,15 +3095,27 @@ extern "C" fn scroll_indicator_mouse_down(_self: *mut c_void, _cmd: Sel, event: 
             return;
         }
         let doc_frame: NSRect = msg_send![doc, frame];
-        let Some((_, knob_h)) = scroll_indicator_geometry(
-            clip_bounds.size.height,
-            doc_frame.size.height,
-            clip_bounds.origin.y,
-        ) else {
+        let horizontal = matches!(target, ScrollTarget::DetailHorizontal);
+        let visible = if horizontal {
+            clip_bounds.size.width
+        } else {
+            clip_bounds.size.height
+        };
+        let document = if horizontal {
+            doc_frame.size.width
+        } else {
+            doc_frame.size.height
+        };
+        let offset = if horizontal {
+            clip_bounds.origin.x
+        } else {
+            clip_bounds.origin.y
+        };
+        let Some((_, knob_len)) = scroll_indicator_geometry(visible, document, offset) else {
             return;
         };
-        let track_h = clip_bounds.size.height - 6.0;
-        let thumb_travel = track_h - knob_h;
+        let track_len = visible - 6.0;
+        let thumb_travel = track_len - knob_len;
         if thumb_travel <= 0.0 {
             return;
         }
@@ -3066,11 +3125,11 @@ extern "C" fn scroll_indicator_mouse_down(_self: *mut c_void, _cmd: Sel, event: 
             convertPoint: location,
             fromView: std::ptr::null::<AnyObject>()
         ];
-        let max_offset = (doc_frame.size.height - clip_bounds.size.height).max(0.0);
+        let max_offset = (document - visible).max(0.0);
         *SCROLL_DRAG.lock().unwrap() = Some(ScrollDragState {
             target,
-            start_y: point.y,
-            start_offset: clip_bounds.origin.y.clamp(0.0, max_offset),
+            start_axis: if horizontal { point.x } else { point.y },
+            start_offset: offset.clamp(0.0, max_offset),
             max_offset,
             thumb_travel,
         });
@@ -3093,13 +3152,20 @@ extern "C" fn scroll_indicator_mouse_dragged(_self: *mut c_void, _cmd: Sel, even
             convertPoint: location,
             fromView: std::ptr::null::<AnyObject>()
         ];
+        let horizontal = matches!(drag.target, ScrollTarget::DetailHorizontal);
+        let axis = if horizontal { point.x } else { point.y };
         let offset = (drag.start_offset
-            + (point.y - drag.start_y) * drag.max_offset / drag.thumb_travel)
+            + (axis - drag.start_axis) * drag.max_offset / drag.thumb_travel)
             .clamp(0.0, drag.max_offset);
-        let doc: *mut AnyObject = msg_send![scroll, documentView];
-        if !doc.is_null() {
-            let _: () = msg_send![doc, scrollPoint: NSPoint::new(0.0, offset)];
-        }
+        let clip: *mut AnyObject = msg_send![scroll, contentView];
+        let bounds: NSRect = msg_send![clip, bounds];
+        let origin = if horizontal {
+            NSPoint::new(offset, bounds.origin.y)
+        } else {
+            NSPoint::new(bounds.origin.x, offset)
+        };
+        let _: () = msg_send![clip, setBoundsOrigin: origin];
+        let _: () = msg_send![scroll, reflectScrolledClipView: clip];
     }
 }
 
@@ -3192,7 +3258,11 @@ extern "C" fn detail_scroll_indicator_bounds_changed(
 ) {
     let detail_scroll = *DETAIL_SCROLL_VIEW.lock().unwrap();
     if let Some(scroll) = detail_scroll {
-        unsafe { clamp_detail_scroll(scroll.0) };
+        unsafe {
+            clamp_detail_scroll(scroll.0);
+            update_scroll_indicator_for(ScrollTarget::Detail);
+            update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
+        };
     }
 }
 
@@ -4457,6 +4527,7 @@ unsafe fn show_detail_for_sel() {
     // removing the old views and avoid wheel/drag callbacks touching them.
     *DETAIL_SCROLL_VIEW.lock().unwrap() = None;
     *DETAIL_SCROLL_INDICATOR.lock().unwrap() = None;
+    *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() = None;
     *SCROLL_DRAG.lock().unwrap() = None;
     let subs: *mut AnyObject = msg_send![content, subviews];
     let count: usize = msg_send![subs, count];
@@ -4937,8 +5008,11 @@ unsafe fn add_detail_text(
     // owns endpoints, dragging, and wheel phases; NSClipView also stops drawing its background
     // to avoid the default white corner.
     let no_wrap = is_code && !code_soft_wrap;
-    let _: () = msg_send![scroll, setHasVerticalScroller: true];
-    let _: () = msg_send![scroll, setHasHorizontalScroller: no_wrap];
+    // 关闭系统滚动条,避免它在滚动/布局回调中重新出现并与自定义胶囊重叠。
+    // Disable native scrollers so they cannot reappear during scrolling/layout and overlap the
+    // always-visible custom capsules.
+    let _: () = msg_send![scroll, setHasVerticalScroller: false];
+    let _: () = msg_send![scroll, setHasHorizontalScroller: false];
     let _: () = msg_send![scroll, setAutohidesScrollers: true];
     let _: () = msg_send![scroll, setScrollerStyle: 1isize]; // NSScrollerStyleOverlay
     let clip_view: *mut AnyObject = msg_send![scroll, contentView];
@@ -5076,7 +5150,47 @@ unsafe fn add_detail_text(
     ];
     CFRelease(bounds_name as *const c_void);
     *DETAIL_SCROLL_VIEW.lock().unwrap() = Some(ObjPtr(scroll));
-    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = None;
+
+    // 系统滚动条已完全关闭;实际滚动仍由 NSScrollView/NSClipView 处理,自定义视图只负责视觉
+    // 与拖拽映射,因此不会出现两层滚动条。
+    // Native scrollers are fully disabled; NSScrollView/NSClipView still perform scrolling,
+    // while the custom views handle visuals and thumb dragging, preventing double scrollbars.
+    let vertical_indicator: *mut AnyObject = msg_send![scroll_indicator_class(), alloc];
+    let vertical_indicator: *mut AnyObject = msg_send![
+        vertical_indicator,
+        initWithFrame: NSRect::new(
+            NSPoint::new(scroll_w - SCROLL_INDICATOR_HIT_W - 3.0, 3.0),
+            NSSize::new(SCROLL_INDICATOR_HIT_W, body_h - 6.0)
+        )
+    ];
+    update_scroll_indicator_visual(vertical_indicator, body_h - 6.0, false);
+    let _: () = msg_send![scroll, addSubview: vertical_indicator];
+    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(vertical_indicator));
+    release_obj(vertical_indicator);
+
+    if no_wrap {
+        let horizontal_indicator: *mut AnyObject = msg_send![scroll_indicator_class(), alloc];
+        let horizontal_indicator: *mut AnyObject = msg_send![
+            horizontal_indicator,
+            initWithFrame: NSRect::new(
+                NSPoint::new(
+                    3.0,
+                    body_h - SCROLL_INDICATOR_HIT_W - 3.0,
+                ),
+                NSSize::new(scroll_w - 6.0, SCROLL_INDICATOR_HIT_W)
+            )
+        ];
+        update_scroll_indicator_visual(horizontal_indicator, scroll_w - 6.0, true);
+        let _: () = msg_send![scroll, addSubview: horizontal_indicator];
+        *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(horizontal_indicator));
+        release_obj(horizontal_indicator);
+    } else {
+        *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() = None;
+    }
+    update_scroll_indicator_for(ScrollTarget::Detail);
+    if no_wrap {
+        update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
+    }
     let _: () = msg_send![content, addSubview: scroll];
     release_obj(scroll);
 
@@ -5484,7 +5598,7 @@ unsafe fn ensure_picker_window() {
     // 透明命中区域比可见胶囊更宽;不要把背景设到父层,否则会把 10pt 全部画出来。
     // The transparent hit area is wider than the visible capsule; do not paint the parent
     // layer or all 10pt would become visible.
-    update_scroll_indicator_visual(indicator, h - header_strip_h() - FOOTER_H - 6.0);
+    update_scroll_indicator_visual(indicator, h - header_strip_h() - FOOTER_H - 6.0, false);
     let _: () = msg_send![indicator, setHidden: true];
     let _: () = msg_send![scroll, addSubview: indicator];
     release_obj(indicator);
@@ -8995,8 +9109,12 @@ pub(crate) fn smoke_runner() -> bool {
             let no_wrap_clip: *mut AnyObject = msg_send![no_wrap_scroll, contentView];
             let no_wrap_bounds: NSRect = msg_send![no_wrap_clip, bounds];
             assert!(
-                no_wrap_horizontal,
-                "no-wrap mode must enable horizontal scrolling"
+                !no_wrap_horizontal,
+                "no-wrap mode must use only the custom horizontal indicator"
+            );
+            assert!(
+                DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap().is_some(),
+                "no-wrap mode must install a custom horizontal indicator"
             );
             assert!(
                 !nsstring_to_rust(no_wrap_string).contains('\u{2028}'),
@@ -9040,14 +9158,17 @@ pub(crate) fn smoke_runner() -> bool {
             let noncontiguous: bool = msg_send![layout, allowsNonContiguousLayout];
             let background: bool = msg_send![layout, backgroundLayoutEnabled];
             assert!(
-                has_scroller,
-                "detail must use AppKit's native vertical scroller"
+                !has_scroller,
+                "detail must disable the native vertical scroller"
             );
             assert!(
                 !has_horizontal_scroller,
                 "soft-wrap detail must not use a horizontal scroller"
             );
-            assert!(autohides, "detail overlay scrollers must auto-hide");
+            assert!(
+                autohides,
+                "detail keeps native scroller auto-hide enabled as a defensive fallback"
+            );
             assert_eq!(scroller_style, 1, "detail must use overlay scrollers");
             assert_eq!(elasticity, 1, "detail elasticity must be disabled");
             assert!(!noncontiguous, "detail layout must be contiguous");
