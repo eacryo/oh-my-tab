@@ -250,6 +250,11 @@ const SCROLL_INDICATOR_MIN_LEN: f64 = 24.0;
 const DETAIL_GAP: f64 = 8.0;
 /// 详情浮窗内容内边距 / the detail panel's inner padding.
 const DETAIL_PAD: f64 = 12.0;
+/// 详情顶部工具栏与底部来源/统计栏高度。
+/// Heights of the detail toolbar and source/statistics footer.
+const DETAIL_TOOLBAR_H: f64 = 44.0;
+const DETAIL_FOOTER_H: f64 = 42.0;
+const DETAIL_CHROME_H: f64 = DETAIL_TOOLBAR_H + DETAIL_FOOTER_H;
 /// 被动详情窗口的 Liquid Glass 会被 AppKit 以非活动状态压暗;用当前玻璃 tint 的
 /// 55% 覆盖补偿,使其回到主浮窗的未选中底色。
 /// AppKit darkens Liquid Glass in the passive detail window. A 55% overlay of the current
@@ -258,17 +263,19 @@ const DETAIL_INACTIVE_GLASS_COMPENSATION_A: u32 = 0x8D;
 /// 详情浮窗固定外框宽度,文本/代码/图片共用,避免切换条目时横向跳变。
 /// Fixed outer width shared by text, code, and image details to prevent horizontal jumps.
 const DETAIL_MAX_W: f64 = 640.0;
-/// 代码详情使用同一固定宽度,代码不自然换行而是横向滚动。
-/// Code details use the same fixed width; long lines scroll horizontally instead of wrapping.
+/// 代码详情使用同一固定宽度;软换行关闭时长行通过原生横向滚动条查看。
+/// Code details use the same fixed width; with soft wrap off, native horizontal scrolling shows
+/// long lines.
 const DETAIL_CODE_MAX_W: f64 = DETAIL_MAX_W;
 /// 代码安全断点预留列数,给滚动条/字体实际宽度留出余量。
 /// Safety columns reserved for scrollers and the font's actual advance width.
 const DETAIL_CODE_WRAP_SAFETY: usize = 4;
 /// 详情文本上下安全边距 / vertical safety margin for the detail panel.
 const DETAIL_SCREEN_MARGIN: f64 = 8.0;
-/// 详情文本最小高度与主列表单条记录高度保持一致(78pt)。
-/// Match the detail panel's minimum height to one history-list row (78pt).
+/// 详情正文最小高度与主列表单条记录高度保持一致;外框再加工具栏和来源栏。
+/// Match the detail body's minimum height to one history-list row; toolbar and footer are extra.
 const DETAIL_TEXT_MIN_H: f64 = ROW_H;
+const DETAIL_PANEL_MIN_H: f64 = DETAIL_TEXT_MIN_H + DETAIL_CHROME_H;
 /// 详情图片内部最大宽度(扣除固定外框的左右内边距)/ max inner image width after fixed-panel padding.
 const DETAIL_IMAGE_MAX_W: f64 = DETAIL_MAX_W - DETAIL_PAD * 2.0;
 /// 详情预览最长边上限(px):视网膜屏 640pt 面板上 ~89% 原生密度,足够清晰;只在
@@ -494,6 +501,10 @@ static DETAIL_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 static DETAIL_CONTENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// 详情浮窗是否可见 / whether the detail panel is visible.
 static DETAIL_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// 代码详情软换行开关,会话内保持;关闭后使用原文和原生横向滚动条。
+/// Code-detail soft-wrap toggle, retained for the session; when off, raw text uses the native
+/// horizontal scroller.
+static DETAIL_SOFT_WRAP_ENABLED: AtomicBool = AtomicBool::new(true);
 /// 打开详情前主浮窗的位置,关闭详情时恢复;只保存 origin,保留期间可能变化的窗口高度。
 /// The picker's origin before opening detail; restored on close while preserving any height
 /// changes that may have occurred while the detail was open.
@@ -2746,6 +2757,18 @@ unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(toggleDetailSoftWrap:),
+                toggle_detail_soft_wrap as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(detailSharePlaceholder:),
+                detail_share_placeholder as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(clearClipboardHistory:),
                 clear_clipboard_history as *mut c_void,
                 types.as_ptr(),
@@ -3981,7 +4004,7 @@ unsafe fn ensure_detail_window() {
     let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
     let screen_frame: NSRect = msg_send![screen, visibleFrame];
     let w = DETAIL_MAX_W;
-    let h = (screen_frame.size.height - DETAIL_SCREEN_MARGIN * 2.0).max(DETAIL_TEXT_MIN_H);
+    let h = (screen_frame.size.height - DETAIL_SCREEN_MARGIN * 2.0).max(DETAIL_PANEL_MIN_H);
     let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
     let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
@@ -4144,6 +4167,241 @@ extern "C" fn detail_content_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
 /// and never accidentally dismiss the detail panel.
 extern "C" fn detail_content_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {}
 
+/// 切换代码详情软换行并原位重建;新滚动视图会自然把水平位置复位到左端。
+/// Toggle code-detail soft wrapping and rebuild in place; the new scroll view naturally resets
+/// its horizontal position to the leading edge.
+extern "C" fn toggle_detail_soft_wrap(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
+    DETAIL_SOFT_WRAP_ENABLED.fetch_xor(true, Ordering::SeqCst);
+    unsafe { show_detail_for_sel() };
+}
+
+/// 分享入口的占位 action;按钮当前只提供视觉与悬停反馈。
+/// Placeholder share action; the button currently provides visual and hover feedback only.
+extern "C" fn detail_share_placeholder(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {}
+
+unsafe fn add_detail_separator(content: *mut AnyObject, y: f64, width: f64) {
+    let line: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let line: *mut AnyObject = msg_send![
+        line,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, 1.0))
+    ];
+    let _: () = msg_send![line, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![line, layer];
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(0x0000000B));
+    let _: () = msg_send![content, addSubview: line];
+    release_obj(line);
+}
+
+unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
+    let enabled = DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
+    let share_x = width - 42.0;
+
+    // 使用 AppKit 原生 NSSwitch,让轨道、滑块和点击反馈完全跟随当前 macOS。
+    // Use AppKit's native NSSwitch so its track, thumb, and press feedback follow the current macOS.
+    let toggle: *mut AnyObject = msg_send![class!(NSSwitch), alloc];
+    let toggle: *mut AnyObject = msg_send![
+        toggle,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
+    ];
+    let _: () = msg_send![toggle, setControlSize: 2isize]; // NSControlSizeMini
+    let _: () = msg_send![toggle, setState: if enabled { 1isize } else { 0isize }];
+    let _: () = msg_send![toggle, sizeToFit];
+    let switch_frame: NSRect = msg_send![toggle, frame];
+    let switch_x = share_x - 9.0 - switch_frame.size.width;
+    let switch_y = (DETAIL_TOOLBAR_H - switch_frame.size.height) / 2.0;
+    let _: () = msg_send![toggle, setFrameOrigin: NSPoint::new(switch_x, switch_y)];
+    let _: () = msg_send![toggle, setTarget: observer()];
+    let _: () = msg_send![toggle, setAction: sel!(toggleDetailSoftWrap:)];
+    let tooltip = make_nsstring(&t("clipboard.detail_soft_wrap"));
+    let _: () = msg_send![toggle, setToolTip: tooltip];
+    CFRelease(tooltip as *const c_void);
+    let _: () = msg_send![content, addSubview: toggle];
+    release_obj(toggle);
+
+    let label_ns = make_nsstring(&t("clipboard.detail_soft_wrap"));
+    let label: *mut AnyObject = msg_send![class!(NSTextField), labelWithString: label_ns];
+    CFRelease(label_ns as *const c_void);
+    let _: () = msg_send![label, setFrame: NSRect::new(
+        NSPoint::new(switch_x - 77.0, 14.0),
+        NSSize::new(70.0, 16.0)
+    )];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.36f64];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setTextColor: color];
+    let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight
+    let _: () = msg_send![content, addSubview: label];
+}
+
+/// 按 preview (5).html 的三段 SVG path 绘制分享图标,不使用 SF Symbol 的变体。
+/// Draw the share icon from the three SVG paths in preview (5).html instead of using an SF
+/// Symbol variant.
+unsafe fn make_detail_share_icon(alpha: f64) -> *mut AnyObject {
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject = msg_send![image, initWithSize: NSSize::new(18.0, 18.0)];
+    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: alpha];
+    let _: () = msg_send![image, lockFocus];
+    let _: () = msg_send![color, set];
+
+    // NSBezierPath 的原点在左下角,HTML SVG 的原点在左上角,所以 y 坐标按 18-y 翻转。
+    // NSBezierPath uses a bottom-left origin while the HTML SVG uses a top-left origin, so
+    // convert every y coordinate with 18-y.
+    let square: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+    let _: () = msg_send![square, moveToPoint: NSPoint::new(5.0, 11.0)];
+    let _: () = msg_send![square, lineToPoint: NSPoint::new(5.0, 4.0)];
+    let _: () = msg_send![
+        square,
+        curveToPoint: NSPoint::new(6.0, 3.0),
+        controlPoint1: NSPoint::new(5.0, 3.45),
+        controlPoint2: NSPoint::new(5.45, 3.0)
+    ];
+    let _: () = msg_send![square, lineToPoint: NSPoint::new(13.0, 3.0)];
+    let _: () = msg_send![
+        square,
+        curveToPoint: NSPoint::new(14.0, 4.0),
+        controlPoint1: NSPoint::new(13.55, 3.0),
+        controlPoint2: NSPoint::new(14.0, 3.45)
+    ];
+    let _: () = msg_send![square, lineToPoint: NSPoint::new(14.0, 11.0)];
+
+    let stem: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+    let _: () = msg_send![stem, moveToPoint: NSPoint::new(9.5, 7.0)];
+    let _: () = msg_send![stem, lineToPoint: NSPoint::new(9.5, 15.0)];
+
+    let head: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+    let _: () = msg_send![head, moveToPoint: NSPoint::new(6.8, 12.3)];
+    let _: () = msg_send![head, lineToPoint: NSPoint::new(9.5, 15.0)];
+    let _: () = msg_send![head, lineToPoint: NSPoint::new(12.2, 12.3)];
+
+    for path in [square, stem, head] {
+        let _: () = msg_send![path, setLineWidth: 1.45f64];
+        let _: () = msg_send![path, setLineCapStyle: 1isize]; // NSLineCapStyleRound
+        let _: () = msg_send![path, setLineJoinStyle: 1isize]; // NSLineJoinStyleRound
+        let _: () = msg_send![path, stroke];
+    }
+    let _: () = msg_send![image, unlockFocus];
+    let _: () = msg_send![image, setTemplate: false];
+    image
+}
+
+/// 预留分享入口:占位 action 不执行业务,但保留设计稿的悬停反馈。
+/// Reserve the share entry point: its placeholder action performs no business behavior while the
+/// button retains the mockup's hover feedback.
+unsafe fn add_detail_share_button(content: *mut AnyObject, width: f64) {
+    let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    let button: *mut AnyObject = msg_send![
+        button,
+        initWithFrame: NSRect::new(NSPoint::new(width - 42.0, 8.0), NSSize::new(28.0, 28.0))
+    ];
+    let empty = make_nsstring("");
+    let _: () = msg_send![button, setTitle: empty];
+    CFRelease(empty as *const c_void);
+    let _: () = msg_send![button, setBordered: false];
+    let _: () = msg_send![button, setTarget: observer()];
+    let _: () = msg_send![button, setAction: sel!(detailSharePlaceholder:)];
+    let _: () = msg_send![button, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    let _: () = msg_send![layer, setCornerRadius: 6.0f64];
+    let icon = make_detail_share_icon(0.34);
+    let _: () = msg_send![button, setImage: icon];
+    let _: () = msg_send![button, setImagePosition: 1u64]; // NSImageOnly
+    release_obj(icon);
+    let tooltip = make_nsstring(&t("clipboard.detail_share"));
+    let _: () = msg_send![button, setToolTip: tooltip];
+    CFRelease(tooltip as *const c_void);
+    add_hover_tracking(button);
+    let _: () = msg_send![content, addSubview: button];
+    release_obj(button);
+}
+
+unsafe fn detail_wrap_button(content: *mut AnyObject) -> *mut AnyObject {
+    let subviews: *mut AnyObject = msg_send![content, subviews];
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        let is_switch: bool = msg_send![view, isKindOfClass: class!(NSSwitch)];
+        if is_switch {
+            return view;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+unsafe fn detail_share_button(content: *mut AnyObject) -> *mut AnyObject {
+    let subviews: *mut AnyObject = msg_send![content, subviews];
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+        if is_button {
+            let action: Sel = msg_send![view, action];
+            if action == sel!(detailSharePlaceholder:) {
+                return view;
+            }
+        }
+    }
+    std::ptr::null_mut()
+}
+
+/// 添加固定工具栏和来源/统计栏。没有语言识别,顶部左侧按设计留空。
+/// Add the fixed toolbar and source/statistics footer. Without language detection, the toolbar's
+/// leading side intentionally remains empty.
+unsafe fn add_detail_chrome(
+    content: *mut AnyObject,
+    entry: &ClipEntry,
+    kind: TextKind,
+    width: f64,
+    height: f64,
+) {
+    add_detail_separator(content, DETAIL_TOOLBAR_H - 1.0, width);
+    add_detail_separator(content, height - DETAIL_FOOTER_H, width);
+
+    if kind == TextKind::Code {
+        add_detail_wrap_control(content, width);
+    }
+    add_detail_share_button(content, width);
+
+    let source_attr = make_meta_footer_attributed(entry, true);
+    let source: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let source: *mut AnyObject = msg_send![source, initWithFrame: NSRect::new(
+        NSPoint::new(15.0, height - DETAIL_FOOTER_H + 12.0),
+        NSSize::new(width * 0.55, 18.0)
+    )];
+    let _: () = msg_send![source, setBezeled: false];
+    let _: () = msg_send![source, setEditable: false];
+    let _: () = msg_send![source, setSelectable: false];
+    let _: () = msg_send![source, setDrawsBackground: false];
+    let _: () = msg_send![source, setAttributedStringValue: source_attr];
+    release_obj(source_attr);
+    let _: () = msg_send![content, addSubview: source];
+    release_obj(source);
+
+    if entry.image.is_none() {
+        let line_count = entry.text.split('\n').count().max(1).to_string();
+        let char_count = entry.text.chars().count().to_string();
+        let lines = tf("clipboard.detail_lines", &[("count", &line_count)]);
+        let chars = tf("clipboard.detail_chars", &[("count", &char_count)]);
+        let stats_text = format!("{lines}  ·  {chars}");
+        let stats_ns = make_nsstring(&stats_text);
+        let stats: *mut AnyObject = msg_send![
+            class!(NSTextField),
+            labelWithString: stats_ns
+        ];
+        CFRelease(stats_ns as *const c_void);
+        let _: () = msg_send![stats, setFrame: NSRect::new(
+            NSPoint::new(width - 250.0, height - DETAIL_FOOTER_H + 12.0),
+            NSSize::new(235.0, 18.0)
+        )];
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+        let color: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
+        let _: () = msg_send![stats, setFont: font];
+        let _: () = msg_send![stats, setTextColor: color];
+        let _: () = msg_send![stats, setAlignment: 2isize]; // NSTextAlignmentRight
+        let _: () = msg_send![content, addSubview: stats];
+    }
+}
+
 /// 打开/刷新详情浮窗:内容跟随选中条目——文本 = 完整未截断;图片 = 详情预览大图
 /// (懒生成 .detail,见 ensure_detail_preview)。位置在主浮窗右侧,高度及上下位置均
 /// 收在主浮窗内。
@@ -4230,7 +4488,7 @@ unsafe fn show_detail_for_sel() {
             // 详情始终收在主浮窗高度内:图片内部高度 = 主浮窗高度扣除上下内边距。
             // Keep the detail inside the picker height: the image's inner height is the
             // picker's height minus the detail's vertical padding.
-            let max_image_h = (max_detail_h - DETAIL_PAD * 2.0).max(0.0);
+            let max_image_h = (max_detail_h - DETAIL_CHROME_H - DETAIL_PAD * 2.0).max(0.0);
             let fit_scale = (DETAIL_IMAGE_MAX_W / iw).min(max_image_h / ih).min(1.0);
             let (fit_w, fit_h) = if iw > 0.0 && ih > 0.0 {
                 (iw * fit_scale, ih * fit_scale)
@@ -4240,12 +4498,13 @@ unsafe fn show_detail_for_sel() {
             // 外框固定宽度,图片只在内部可用区域等比缩放。
             // Keep the outer panel fixed-width; scale the image inside its usable area.
             w = DETAIL_MAX_W;
-            h = fit_h + DETAIL_PAD * 2.0;
+            h = (fit_h + DETAIL_PAD * 2.0 + DETAIL_CHROME_H)
+                .clamp(DETAIL_PANEL_MIN_H, max_detail_h);
             let view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
             let view: *mut AnyObject = msg_send![
                 view,
                 initWithFrame: NSRect::new(
-                    NSPoint::new(DETAIL_PAD, DETAIL_PAD),
+                    NSPoint::new(DETAIL_PAD, DETAIL_TOOLBAR_H + DETAIL_PAD),
                     NSSize::new(fit_w, fit_h)
                 )
             ];
@@ -4260,7 +4519,7 @@ unsafe fn show_detail_for_sel() {
             // Degenerate entry (no preview, no source file): the detail falls back to the
             // filename text (same fallback as the row body).
             let (tw, th) = detail_text_size(&entry.text, TextKind::Plain, max_detail_h);
-            add_detail_text(content, &entry.text, tw, th, TextKind::Plain, None);
+            add_detail_text(content, &entry.text, tw, th, TextKind::Plain, None, false);
             w = tw;
             h = th;
         }
@@ -4272,17 +4531,36 @@ unsafe fn show_detail_for_sel() {
         // 增加引用计数,不会复制长文本或原文映射。
         // Code-detail sizing and content share one Arc<PreparedCodeDisplay>; cache hits only
         // increment the reference count instead of copying long text or its source map.
-        let prepared_code = (kind == TextKind::Code).then(|| {
+        let code_soft_wrap =
+            kind == TextKind::Code && DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
+        let prepared_code = code_soft_wrap.then(|| {
             prepare_code_for_soft_wrap(&entry.text, detail_code_max_columns(DETAIL_CODE_MAX_W))
         });
-        let (tw, th) = prepared_code
-            .as_ref()
-            .map(|prepared| detail_prepared_code_size(prepared, max_detail_h))
-            .unwrap_or_else(|| detail_text_size(&entry.text, kind, max_detail_h));
-        add_detail_text(content, &entry.text, tw, th, kind, prepared_code.as_deref());
+        let (tw, th) = if let Some(prepared) = &prepared_code {
+            detail_prepared_code_size(prepared, max_detail_h)
+        } else if kind == TextKind::Code {
+            detail_unwrapped_code_size(&entry.text, max_detail_h)
+        } else {
+            detail_text_size(&entry.text, kind, max_detail_h)
+        };
+        add_detail_text(
+            content,
+            &entry.text,
+            tw,
+            th,
+            kind,
+            prepared_code.as_deref(),
+            code_soft_wrap,
+        );
         w = tw;
         h = th;
     }
+    let chrome_kind = if entry.image.is_some() {
+        TextKind::Plain
+    } else {
+        classify_text(&entry.text)
+    };
+    add_detail_chrome(content, &entry, chrome_kind, w, h);
 
     // 定位:主浮窗右侧(与选中行顶部对齐)/ 翻转 / clamp。对齐选中行而非窗口顶:
     // 窗口顶是搜索/清除头部条,且条目少时窗口被最小高度撑高,对窗口顶会让详情
@@ -4351,7 +4629,7 @@ unsafe fn show_detail_for_sel() {
 /// 详情高度上限等于主浮窗高度,使详情上下边缘始终包含在主浮窗内。
 /// The detail-height cap equals the picker height, keeping both detail edges inside it.
 fn detail_max_height(picker: NSRect) -> f64 {
-    picker.size.height.max(DETAIL_TEXT_MIN_H)
+    picker.size.height.max(DETAIL_PANEL_MIN_H)
 }
 
 /// 详情代码区可用宽度映射到软换行高度估算列数,不会向显示文本插入字符。
@@ -4371,8 +4649,19 @@ fn detail_prepared_code_size(prepared: &PreparedCodeDisplay, max_height: f64) ->
         .filter(|ch| matches!(ch, '\n' | '\u{2028}'))
         .count()
         + 1;
-    let h = (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H)
-        .clamp(DETAIL_TEXT_MIN_H, max_height);
+    let h =
+        (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H)
+            .clamp(DETAIL_PANEL_MIN_H, max_height);
+    (DETAIL_CODE_MAX_W, h)
+}
+
+/// 不换行代码只按真实换行估算高度;超宽部分交给原生横向滚动条。
+/// Size unwrapped code from hard lines only; native horizontal scrolling handles excess width.
+fn detail_unwrapped_code_size(text: &str, max_height: f64) -> (f64, f64) {
+    let lines = text.split('\n').count().max(1);
+    let h =
+        (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H)
+            .clamp(DETAIL_PANEL_MIN_H, max_height);
     (DETAIL_CODE_MAX_W, h)
 }
 
@@ -4386,19 +4675,18 @@ fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
     let w = DETAIL_MAX_W;
     let avail_w = w - DETAIL_PAD * 2.0;
     let lines = estimate_lines(text, detail_text_units(avail_w));
-    let h = (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H)
-        .clamp(DETAIL_TEXT_MIN_H, max_height);
+    let h =
+        (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H)
+            .clamp(DETAIL_PANEL_MIN_H, max_height);
     (w, h)
 }
 
 /// 构建详情文本视图:普通文本自然换行;代码按优先级插入 U+2028 软换行,标记只作为绘制装饰。
-/// 文本**可鼠标选中**(选中范围由底部"复制所选"按钮/Cmd+C 复制);面板不成为 key,
-/// 键盘焦点仍留在主浮窗,所以不能依赖系统 Cmd+C 路由。
+/// 文本**可鼠标选中**;复制走原生右键菜单或主浮窗转发的 Cmd+C。面板不成为 key,
+/// 因而不能依赖系统把 Cmd+C 直接路由到详情。
 /// Build the detail text view: plain text wraps naturally; code inserts prioritized U+2028 soft
-/// wraps, with markers remaining drawing-only decorations.
-/// The text IS mouse-selectable; selection is copied by the bottom "copy selection" button / Cmd+C.
-/// The panel never becomes key (keyboard focus stays in the picker), so system Cmd+C routing
-/// cannot be relied upon.
+/// wraps, with markers remaining drawing-only decorations. Text remains mouse-selectable; copying
+/// uses the native context menu or Cmd+C forwarded by the picker because the detail never becomes key.
 fn detail_text_view_class() -> *mut AnyObject {
     static CLASS: OnceLock<usize> = OnceLock::new();
     *CLASS.get_or_init(|| unsafe {
@@ -4621,44 +4909,52 @@ unsafe fn add_detail_text(
     h: f64,
     kind: TextKind,
     prepared_code: Option<&PreparedCodeDisplay>,
+    code_soft_wrap: bool,
 ) {
     let is_code = kind == TextKind::Code;
-    debug_assert!(!is_code || prepared_code.is_some());
+    debug_assert!(!code_soft_wrap || (is_code && prepared_code.is_some()));
     let avail_w = w - DETAIL_PAD * 2.0;
     // 滚动视图向右延伸到面板边缘,文本视图内部保留右侧内边距给原生 overlay scroller。
     // Extend the scroll view to the panel edge and keep right padding inside the text view for
     // the native overlay scroller.
     let scroll_w = w - DETAIL_PAD;
-    let body_h = (h - DETAIL_PAD * 2.0).max(DETAIL_LINE_H);
+    let body_h = (h - DETAIL_CHROME_H).max(DETAIL_LINE_H);
     let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
     let scroll: *mut AnyObject = msg_send![
         scroll,
         initWithFrame: NSRect::new(
-            NSPoint::new(DETAIL_PAD, DETAIL_PAD),
+            NSPoint::new(DETAIL_PAD, DETAIL_TOOLBAR_H),
             NSSize::new(scroll_w, body_h)
         )
     ];
     let _: () = msg_send![scroll, setBorderType: 0u64]; // NSNoBorder
+    let clear_background: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+    let _: () = msg_send![scroll, setBackgroundColor: clear_background];
     let _: () = msg_send![scroll, setDrawsBackground: false];
-    // 详情使用 AppKit 原生 overlay scroller;端点、拖拽和滚轮相位都由 NSScrollView
-    // 处理,不再复制一套容易与 NSTextView 合法 bounds 不一致的自绘映射。
-    // Detail uses AppKit's native overlay scroller, leaving endpoints, dragging, and wheel
-    // phases to NSScrollView instead of duplicating a custom mapping that can diverge from
-    // NSTextView's legal bounds.
+    // 使用 AppKit Overlay 滚动条,不为横纵滚动条预留交叉 corner;滚动端点、拖拽和滚轮
+    // 相位全部交给 NSScrollView。NSClipView 也关闭背景绘制,避免默认白块。
+    // Use AppKit Overlay scrollers, which reserve no horizontal/vertical corner. NSScrollView
+    // owns endpoints, dragging, and wheel phases; NSClipView also stops drawing its background
+    // to avoid the default white corner.
+    let no_wrap = is_code && !code_soft_wrap;
     let _: () = msg_send![scroll, setHasVerticalScroller: true];
-    let _: () = msg_send![scroll, setAutohidesScrollers: false];
+    let _: () = msg_send![scroll, setHasHorizontalScroller: no_wrap];
+    let _: () = msg_send![scroll, setAutohidesScrollers: true];
     let _: () = msg_send![scroll, setScrollerStyle: 1isize]; // NSScrollerStyleOverlay
+    let clip_view: *mut AnyObject = msg_send![scroll, contentView];
+    if !clip_view.is_null() {
+        let _: () = msg_send![clip_view, setDrawsBackground: false];
+    }
     let _: () = msg_send![scroll, setVerticalScrollElasticity: 1isize]; // NSScrollElasticityNone
     let _: () = msg_send![scroll, setHorizontalScrollElasticity: 1isize];
 
-    // 代码模型只插入 U+2028 视觉行分隔符;禁用横向滚动,极端像素宽度误差仍由
-    // NSTextView 的字符级兜底处理。
-    // The code model inserts only U+2028 visual line separators. Horizontal scrolling stays off;
-    // NSTextView still provides character-level fallback for extreme pixel-width differences.
-    let _: () = msg_send![scroll, setHasHorizontalScroller: false];
-    // 详情打开路径已在 show_detail_for_sel 准备一次;此处只借用原文/映射/span,不再复制长文本模型。
-    // show_detail_for_sel prepares code once before this call; borrow its raw text, map, and
-    // spans instead of cloning another complete large-text model.
+    // 软换行关闭时保留原文宽度并启用横向滚动;开启时继续使用 U+2028 显示模型,不显示
+    // 横向滚动条。
+    // With soft wrap off, preserve raw line width and enable horizontal scrolling. When on,
+    // use the U+2028 display model and hide the horizontal scroller.
+    // 详情打开路径已准备软换行模型;这里只借用文本和映射,不复制长文本。
+    // The open path has already prepared the soft-wrap model; borrow its text and mapping here
+    // without copying the long source.
     let prepared = prepared_code;
     let display_text = prepared.map(|code| code.text.as_str()).unwrap_or(text);
     // 自定义软换行只在显示文本中插入行分隔符;共享缓存里的原文映射,复制选区时
@@ -4672,7 +4968,7 @@ unsafe fn add_detail_text(
         tv,
         initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(avail_w, body_h))
     ];
-    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = is_code.then_some(ObjPtr(tv));
+    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = code_soft_wrap.then_some(ObjPtr(tv));
     // 详情必须在显示前完成完整布局。非连续/后台布局会在面板出现后分批增大
     // documentView,NSClipView 为维持旧可见区域会同步改变 bounds.origin.y,这正是
     // 滚动条打开后向下跳的根因。
@@ -4716,7 +5012,7 @@ unsafe fn add_detail_text(
         msg_send![class!(NSFont), systemFontOfSize: 14.0f64]
     };
     let _: () = msg_send![tv, setFont: font];
-    if is_code {
+    if code_soft_wrap {
         apply_code_paragraph_styles(storage, display_text);
     }
     let _: () = msg_send![storage, endEditing];
@@ -4735,29 +5031,38 @@ unsafe fn add_detail_text(
     // Complete all TextKit layout at the final width, then freeze documentView height to the
     // full usedRect. Leaving NSTextView vertically resizable after display would still mutate
     // its frame asynchronously and push the viewport away from the top.
-    let _: () = msg_send![text_container, setWidthTracksTextView: true];
+    let _: () = msg_send![text_container, setWidthTracksTextView: !no_wrap];
+    let container_w = if no_wrap { 1_000_000_000.0 } else { avail_w };
     let _: () = msg_send![
         text_container,
-        setContainerSize: NSSize::new(avail_w, 1_000_000_000.0)
+        setContainerSize: NSSize::new(container_w, 1_000_000_000.0)
     ];
-    let _: () = msg_send![tv, setHorizontallyResizable: false];
+    let _: () = msg_send![tv, setHorizontallyResizable: no_wrap];
     let _: () = msg_send![tv, setVerticallyResizable: true];
     let _: () = msg_send![layout, ensureLayoutForTextContainer: text_container];
     let used: NSRect = msg_send![layout, usedRectForTextContainer: text_container];
+    let document_w = if no_wrap {
+        (used.origin.x + used.size.width + DETAIL_PAD)
+            .ceil()
+            .max(avail_w)
+    } else {
+        avail_w
+    };
     let document_h = (used.origin.y + used.size.height + ROW_PAD_TOP * 2.0)
         .ceil()
         .max(body_h);
-    let _: () = msg_send![tv, setFrameSize: NSSize::new(avail_w, document_h)];
+    let _: () = msg_send![tv, setFrameSize: NSSize::new(document_w, document_h)];
     let _: () = msg_send![tv, setVerticallyResizable: false];
     let _: () = msg_send![tv, setSelectedRange: NSRange::new(0, 0)];
     let _: () = msg_send![scroll, setDocumentView: tv];
     release_obj(tv);
     *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr(tv));
 
-    // 原生 scroller 不叠加任何自绘 indicator。bounds 通知只负责把滚轮/惯性产生的
-    // 临时越界硬钳回 AppKit 实时合法范围。
-    // No custom indicator is overlaid on the native scroller. Bounds notifications only hard-
-    // clamp transient wheel/momentum overscroll to AppKit's live legal range.
+    // 胶囊由原生 NSScroller 自己绘制,这里不再叠加独立指示器。bounds 通知只负责把
+    // 滚轮/惯性产生的临时越界硬钳回 AppKit 实时合法范围。
+    // The capsule is drawn by the native NSScroller itself; no separate indicator is overlaid.
+    // Bounds notifications only hard-clamp transient wheel/momentum overscroll to AppKit's
+    // live legal range.
     let clip: *mut AnyObject = msg_send![scroll, contentView];
     let _: () = msg_send![clip, setPostsBoundsChangedNotifications: true];
     let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
@@ -7650,10 +7955,26 @@ unsafe fn hover_button_class() -> *mut AnyObject {
                 hover_button_exited as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(mouseDown:),
+                hover_button_mouse_down as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             ObjPtr(cls)
         })
         .0
+}
+
+unsafe fn set_detail_share_style(button: *mut AnyObject, tint_alpha: f64, bg_alpha: u32) {
+    // 非 template NSImage 不接受 contentTintColor,每个状态直接替换 18pt 图标。
+    // A non-template NSImage ignores contentTintColor, so replace the 18pt icon for each state.
+    let icon = make_detail_share_icon(tint_alpha);
+    let _: () = msg_send![button, setImage: icon];
+    release_obj(icon);
+    let layer: *mut AnyObject = msg_send![button, layer];
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(bg_alpha));
 }
 
 /// 悬停进入:按 action 上色(设计稿 .action:hover / .clear-history:hover / .filter:hover)。
@@ -7663,6 +7984,12 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
+        if action == sel!(detailSharePlaceholder:) {
+            // HTML .icon-button:hover:68% 图标 + 5% 黑底。
+            // HTML .icon-button:hover: 68% icon tint with a 5% black fill.
+            set_detail_share_style(b, 0.68, 0x0000000D);
+            return;
+        }
         if action == sel!(showItemDetails:) {
             let tag: isize = msg_send![b, tag];
             let active = tag >= 0
@@ -7737,6 +8064,10 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
+        if action == sel!(detailSharePlaceholder:) {
+            set_detail_share_style(b, 0.34, 0x00000000);
+            return;
+        }
         if action == sel!(filterPillClicked:) {
             update_filter_pill_style();
             return;
@@ -7757,6 +8088,39 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_
         let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
         let layer: *mut AnyObject = msg_send![b, layer];
         crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(clear));
+    }
+}
+
+/// 分享按钮按下时使用 HTML 的 7.5% 底色;其它按钮完全沿用 NSButton 原行为。
+/// The share button uses the HTML mockup's 7.5% pressed fill; all other buttons retain native
+/// NSButton behavior.
+extern "C" fn hover_button_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    unsafe {
+        let button = _self as *mut AnyObject;
+        let action: Sel = msg_send![button, action];
+        if action == sel!(detailSharePlaceholder:) {
+            set_detail_share_style(button, 0.68, 0x00000013);
+        }
+
+        #[repr(C)]
+        struct ObjcSuper {
+            receiver: *mut c_void,
+            super_class: *mut c_void,
+        }
+        extern "C" {
+            fn objc_msgSendSuper();
+        }
+        type MouseDown = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void);
+        let mut sup = ObjcSuper {
+            receiver: _self,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        let call: MouseDown = std::mem::transmute(objc_msgSendSuper as *const ());
+        call(&mut sup, sel!(mouseDown:), event);
+
+        if action == sel!(detailSharePlaceholder:) {
+            set_detail_share_style(button, 0.68, 0x0000000D);
+        }
     }
 }
 
@@ -8579,10 +8943,83 @@ pub(crate) fn smoke_runner() -> bool {
             // An overflowing text detail must use stable full layout plus the native scroller
             // and open at AppKit's actual top. Simulate bounds crossing both endpoints; the
             // notification callback must clamp them immediately.
-            let detail_scroll = DETAIL_SCROLL_VIEW
+            let wrapped_scroll = DETAIL_SCROLL_VIEW
                 .lock()
                 .unwrap()
                 .expect("text detail must install a scroll view")
+                .0;
+            let wrapped_doc: *mut AnyObject = msg_send![wrapped_scroll, documentView];
+            let wrapped_string: *mut AnyObject = msg_send![wrapped_doc, string];
+            let wrapped_horizontal: bool = msg_send![wrapped_scroll, hasHorizontalScroller];
+            assert!(
+                !wrapped_horizontal,
+                "soft-wrap detail must remove the horizontal scroller"
+            );
+            assert!(
+                nsstring_to_rust(wrapped_string).contains('\u{2028}'),
+                "long code detail must contain custom soft-wrap separators"
+            );
+            assert!(
+                DETAIL_SOURCE_MAP.lock().unwrap().is_some(),
+                "custom soft wraps must retain a source map for copying"
+            );
+
+            let detail_content = DETAIL_CONTENT.lock().unwrap().unwrap().0;
+            let wrap_button = detail_wrap_button(detail_content);
+            assert!(
+                !wrap_button.is_null(),
+                "code detail must install a wrap button"
+            );
+            let share_button = detail_share_button(detail_content);
+            assert!(
+                !share_button.is_null(),
+                "detail toolbar must install an inert share button"
+            );
+            let wrap_before_share = DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
+            let _: () = msg_send![share_button, performClick: std::ptr::null::<AnyObject>()];
+            assert_eq!(
+                DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst),
+                wrap_before_share,
+                "placeholder share action must not alter detail state"
+            );
+            let _: () = msg_send![wrap_button, performClick: std::ptr::null::<AnyObject>()];
+            let no_wrap_scroll = DETAIL_SCROLL_VIEW
+                .lock()
+                .unwrap()
+                .expect("no-wrap detail must rebuild its scroll view")
+                .0;
+            let no_wrap_doc: *mut AnyObject = msg_send![no_wrap_scroll, documentView];
+            let no_wrap_string: *mut AnyObject = msg_send![no_wrap_doc, string];
+            let no_wrap_horizontal: bool = msg_send![no_wrap_scroll, hasHorizontalScroller];
+            let no_wrap_frame: NSRect = msg_send![no_wrap_doc, frame];
+            let no_wrap_clip: *mut AnyObject = msg_send![no_wrap_scroll, contentView];
+            let no_wrap_bounds: NSRect = msg_send![no_wrap_clip, bounds];
+            assert!(
+                no_wrap_horizontal,
+                "no-wrap mode must enable horizontal scrolling"
+            );
+            assert!(
+                !nsstring_to_rust(no_wrap_string).contains('\u{2028}'),
+                "no-wrap mode must display the untouched source"
+            );
+            assert!(DETAIL_SOURCE_MAP.lock().unwrap().is_none());
+            assert!(
+                no_wrap_frame.size.width > no_wrap_bounds.size.width,
+                "long source lines must overflow the horizontal viewport"
+            );
+
+            // 还原默认软换行,继续验证完整布局和垂直端点。
+            // Restore the default soft-wrap state before checking full layout and vertical bounds.
+            let no_wrap_button = detail_wrap_button(detail_content);
+            assert!(
+                !no_wrap_button.is_null(),
+                "rebuilt code detail must retain its wrap button"
+            );
+            let _: () = msg_send![no_wrap_button, performClick: std::ptr::null::<AnyObject>()];
+            let detail_scroll = DETAIL_SCROLL_VIEW
+                .lock()
+                .unwrap()
+                .expect("wrapped detail must rebuild its scroll view")
                 .0;
             let detail_clip: *mut AnyObject = msg_send![detail_scroll, contentView];
             let (min_y, max_y) =
@@ -8594,21 +9031,24 @@ pub(crate) fn smoke_runner() -> bool {
                 "detail must open at its real top"
             );
             let has_scroller: bool = msg_send![detail_scroll, hasVerticalScroller];
+            let has_horizontal_scroller: bool = msg_send![detail_scroll, hasHorizontalScroller];
+            let autohides: bool = msg_send![detail_scroll, autohidesScrollers];
+            let scroller_style: isize = msg_send![detail_scroll, scrollerStyle];
             let elasticity: isize = msg_send![detail_scroll, verticalScrollElasticity];
             let detail_doc: *mut AnyObject = msg_send![detail_scroll, documentView];
-            let detail_string: *mut AnyObject = msg_send![detail_doc, string];
-            assert!(
-                nsstring_to_rust(detail_string).contains('\u{2028}'),
-                "long code detail must contain custom soft-wrap separators"
-            );
-            assert!(
-                DETAIL_SOURCE_MAP.lock().unwrap().is_some(),
-                "custom soft wraps must retain a source map for copying"
-            );
             let layout: *mut AnyObject = msg_send![detail_doc, layoutManager];
             let noncontiguous: bool = msg_send![layout, allowsNonContiguousLayout];
             let background: bool = msg_send![layout, backgroundLayoutEnabled];
-            assert!(has_scroller, "detail must use AppKit's native scroller");
+            assert!(
+                has_scroller,
+                "detail must use AppKit's native vertical scroller"
+            );
+            assert!(
+                !has_horizontal_scroller,
+                "soft-wrap detail must not use a horizontal scroller"
+            );
+            assert!(autohides, "detail overlay scrollers must auto-hide");
+            assert_eq!(scroller_style, 1, "detail must use overlay scrollers");
             assert_eq!(elasticity, 1, "detail elasticity must be disabled");
             assert!(!noncontiguous, "detail layout must be contiguous");
             assert!(!background, "detail background layout must be disabled");
@@ -10659,7 +11099,7 @@ mod tests {
         // Short text -> the minimum; long text -> the picker height (scrolling only beyond it).
         let (plain_w, plain_h) = detail_text_size("hi", TextKind::Plain, max_height);
         assert_eq!(plain_w, super::DETAIL_MAX_W);
-        assert_eq!(plain_h, super::DETAIL_TEXT_MIN_H);
+        assert_eq!(plain_h, super::DETAIL_PANEL_MIN_H);
         // 两行内容必须扩过 78pt 最小高,为 textContainerInset 的上下 11pt 都留空间;
         // 否则内容高度大于 scroll view,即使没有可滚动内容也会露出滚动条。
         // Two lines must grow beyond the 78pt minimum, leaving room for both 11pt sides of
@@ -10668,9 +11108,12 @@ mod tests {
         let (_, two_line_h) = detail_text_size("first\nsecond", TextKind::Plain, max_height);
         assert_eq!(
             two_line_h,
-            super::DETAIL_LINE_H * 2.0 + super::DETAIL_PAD * 2.0 + super::DETAIL_TEXT_INSET_H
+            super::DETAIL_LINE_H * 2.0
+                + super::DETAIL_PAD * 2.0
+                + super::DETAIL_TEXT_INSET_H
+                + super::DETAIL_CHROME_H
         );
-        assert!(two_line_h > super::DETAIL_TEXT_MIN_H);
+        assert!(two_line_h > super::DETAIL_PANEL_MIN_H);
         let long = "a".repeat(200_000);
         assert_eq!(
             detail_text_size(&long, TextKind::Plain, max_height).1,
@@ -10682,6 +11125,10 @@ mod tests {
         let (code_w, code_h) = detail_text_size(&long_code, TextKind::Code, max_height);
         assert_eq!(code_w, super::DETAIL_CODE_MAX_W);
         assert_eq!(code_h, max_height);
+        // 不换行时同一长行只占一条视觉行,宽度溢出由横向滚动承担。
+        // With wrapping off, the same long line occupies one visual line and overflows horizontally.
+        let (_, no_wrap_h) = super::detail_unwrapped_code_size(&long_code, max_height);
+        assert_eq!(no_wrap_h, super::DETAIL_PANEL_MIN_H);
     }
 
     #[test]

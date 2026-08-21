@@ -30,6 +30,10 @@ group_earlier = "更早"
 time_just_now = "剛剛"
 time_today = "今天 {time}"
 time_yesterday = "昨天 {time}"
+detail_soft_wrap = "自動換行"
+detail_share = "分享"
+detail_lines = "{count} 行"
+detail_chars = "{count} 字元"
 
 [menu]
 toggle_shortcut.opt = "切換opt+tab"
