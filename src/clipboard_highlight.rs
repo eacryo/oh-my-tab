@@ -55,6 +55,7 @@ struct CodeDisplayCacheKey {
     max_columns: usize,
     language: Option<&'static str>,
     use_syntect: bool,
+    soft_wrap: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,7 +68,6 @@ struct DisplayHighlightSpan {
 #[derive(Clone)]
 pub(crate) struct PreparedCodeDisplay {
     pub(crate) text: String,
-    pub(crate) source_map: DisplaySourceMap,
     spans: Vec<DisplayHighlightSpan>,
 }
 
@@ -984,6 +984,7 @@ pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Prepared
         max_columns,
         language,
         use_syntect,
+        soft_wrap: false,
     };
     let cache = CODE_DISPLAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
@@ -991,6 +992,26 @@ pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Prepared
     }
 
     let formatted = format_code_for_display(source, max_columns);
+    let prepared = build_prepared_code(source, formatted, use_syntect, language);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= SYNTECT_CACHE_CAPACITY {
+            if let Some(old_key) = guard.keys().next().copied() {
+                guard.remove(&old_key);
+            }
+        }
+        guard.insert(key, prepared.clone());
+    }
+    prepared
+}
+
+/// 构建显示字符串的语法高亮,同时保留显示到原文的偏移映射。
+/// Build syntax highlights for a display string while preserving its source mapping.
+fn build_prepared_code(
+    source: &str,
+    formatted: FormattedCode,
+    use_syntect: bool,
+    language: Option<&'static str>,
+) -> PreparedCodeDisplay {
     let mut spans = Vec::new();
     if use_syntect {
         if let Some(language) = language {
@@ -1022,11 +1043,36 @@ pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Prepared
             });
         }
     }
-    let prepared = PreparedCodeDisplay {
+    PreparedCodeDisplay {
         text: formatted.text,
-        source_map: formatted.source_map,
         spans: merge_display_spans(spans),
+    }
+}
+
+/// 为 NSTextView 准备软换行原文;不插入视觉换行符或额外缩进。
+/// Prepare raw code for NSTextView soft wrapping; no visual newline or indentation is inserted.
+pub(crate) fn prepare_code_for_soft_wrap(source: &str) -> PreparedCodeDisplay {
+    let use_syntect = should_use_syntect(source);
+    let language = detect_language(source);
+    let key = CodeDisplayCacheKey {
+        content_hash: syntect_fnv1a64(source.as_bytes()),
+        content_len: source.len(),
+        max_columns: usize::MAX,
+        language,
+        use_syntect,
+        soft_wrap: true,
     };
+    let cache = CODE_DISPLAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
+        return cached;
+    }
+
+    // 原文详情不需要完整 source map:显示文本和复制文本完全相同,映射只会浪费一份
+    // UTF-16 边界数组和一份 source clone。高亮范围直接使用原文坐标。
+    // Raw code details need no full source map: display and copy text are identical, so a map
+    // would only allocate another source clone and UTF-16 boundary array. Highlight ranges use
+    // source coordinates directly.
+    let prepared = build_raw_prepared_code(source, use_syntect, language);
     if let Ok(mut guard) = cache.lock() {
         if guard.len() >= SYNTECT_CACHE_CAPACITY {
             if let Some(old_key) = guard.keys().next().copied() {
@@ -1036,6 +1082,42 @@ pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Prepared
         guard.insert(key, prepared.clone());
     }
     prepared
+}
+
+fn build_raw_prepared_code(
+    source: &str,
+    use_syntect: bool,
+    language: Option<&'static str>,
+) -> PreparedCodeDisplay {
+    let mut spans = Vec::new();
+    if use_syntect {
+        if let Some(language) = language {
+            if let Some(source_spans) = cached_syntect_highlight(source, language) {
+                spans.extend(source_spans.into_iter().map(|span| DisplayHighlightSpan {
+                    start: span.start,
+                    end: span.end,
+                    foreground: span.foreground,
+                }));
+            }
+        }
+    }
+    if use_syntect && spans.is_empty() {
+        let offsets = source_utf16_offsets(source);
+        for span in highlight_spans(source, TextKind::Code) {
+            let start = offsets[span.start];
+            let end = offsets[span.end];
+            spans.push(DisplayHighlightSpan {
+                start,
+                end,
+                foreground: rgba_from_hex(highlight_color(span.kind)),
+            });
+        }
+    }
+    PreparedCodeDisplay {
+        // Raw detail copy falls back to NSTextView's identical original string.
+        text: source.to_owned(),
+        spans: merge_display_spans(spans),
+    }
 }
 
 fn source_utf16_offsets(source: &str) -> Vec<usize> {
@@ -1407,30 +1489,70 @@ pub(crate) unsafe fn apply_visible_space_markers(storage: *mut AnyObject, text: 
 pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: &str) {
     let _: () = msg_send![storage, beginEditing];
     let style_key = make_nsstring("NSParagraphStyle");
-    let mut location = 0;
+    let mut styles: HashMap<usize, *mut AnyObject> = HashMap::new();
+    let mut location = 0usize;
+    let mut group_start = 0usize;
+    let mut group_indent = None;
+
     for line in text.split_inclusive('\n') {
         let content = line.strip_suffix('\n').unwrap_or(line);
         let (_, indent_columns) = leading_indent(content, 0, content.len());
         let continuation_columns = indent_columns.max(4);
-        let style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
-        let style: *mut AnyObject = msg_send![style, init];
-        let _: () = msg_send![
-            style,
-            setHeadIndent: continuation_columns as f64 * 8.4
-        ];
-        let _: () = msg_send![style, setFirstLineHeadIndent: 0.0f64];
-        let _: () = msg_send![style, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
         let length = line.encode_utf16().count();
-        if length > 0 {
+        if length == 0 {
+            continue;
+        }
+
+        if group_indent != Some(continuation_columns) {
+            if let Some(previous_indent) = group_indent {
+                if location > group_start {
+                    let style = *styles.entry(previous_indent).or_insert_with(|| {
+                        let style: *mut AnyObject =
+                            msg_send![class!(NSMutableParagraphStyle), alloc];
+                        let style: *mut AnyObject = msg_send![style, init];
+                        let _: () = msg_send![
+                            style,
+                            setHeadIndent: previous_indent as f64 * 8.4
+                        ];
+                        let _: () = msg_send![style, setFirstLineHeadIndent: 0.0f64];
+                        let _: () = msg_send![style, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+                        style
+                    });
+                    let _: () = msg_send![
+                        storage,
+                        addAttribute: style_key,
+                        value: style,
+                        range: NSRange::new(group_start, location - group_start)
+                    ];
+                }
+            }
+            group_start = location;
+            group_indent = Some(continuation_columns);
+        }
+        location += length;
+    }
+
+    if let Some(indent) = group_indent {
+        if location > group_start {
+            let style = *styles.entry(indent).or_insert_with(|| {
+                let style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+                let style: *mut AnyObject = msg_send![style, init];
+                let _: () = msg_send![style, setHeadIndent: indent as f64 * 8.4];
+                let _: () = msg_send![style, setFirstLineHeadIndent: 0.0f64];
+                let _: () = msg_send![style, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+                style
+            });
             let _: () = msg_send![
                 storage,
                 addAttribute: style_key,
                 value: style,
-                range: NSRange::new(location, length)
+                range: NSRange::new(group_start, location - group_start)
             ];
         }
+    }
+
+    for style in styles.into_values() {
         release_obj(style);
-        location += length;
     }
     CFRelease(style_key as *const c_void);
     let _: () = msg_send![storage, endEditing];
@@ -1504,14 +1626,21 @@ pub(crate) unsafe fn apply_prepared_code_highlights(
     }
     let _: () = msg_send![storage, beginEditing];
     let color_key = make_nsstring("NSColor");
+    let mut colors: HashMap<[u8; 4], *mut AnyObject> = HashMap::new();
     for span in &prepared.spans {
-        let color: *mut AnyObject = msg_send![
-            class!(NSColor),
-            colorWithSRGBRed: f64::from(span.foreground[0]) / 255.0,
-            green: f64::from(span.foreground[1]) / 255.0,
-            blue: f64::from(span.foreground[2]) / 255.0,
-            alpha: f64::from(span.foreground[3]) / 255.0
-        ];
+        let color = if let Some(&color) = colors.get(&span.foreground) {
+            color
+        } else {
+            let color: *mut AnyObject = msg_send![
+                class!(NSColor),
+                colorWithSRGBRed: f64::from(span.foreground[0]) / 255.0,
+                green: f64::from(span.foreground[1]) / 255.0,
+                blue: f64::from(span.foreground[2]) / 255.0,
+                alpha: f64::from(span.foreground[3]) / 255.0
+            ];
+            colors.insert(span.foreground, color);
+            color
+        };
         let _: () = msg_send![
             storage,
             addAttribute: color_key,

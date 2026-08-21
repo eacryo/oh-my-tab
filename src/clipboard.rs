@@ -56,8 +56,8 @@
 
 use crate::clipboard_highlight::{
     apply_code_paragraph_styles, apply_highlights, apply_prepared_code_highlights,
-    apply_visible_space_markers, classify_text, prepare_code_display, DisplaySourceMap,
-    PreparedCodeDisplay, TextKind,
+    apply_visible_space_markers, classify_text, prepare_code_display, prepare_code_for_soft_wrap,
+    DisplaySourceMap, PreparedCodeDisplay, TextKind,
 };
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -504,8 +504,12 @@ static DETAIL_PICKER_ORIGINAL_ORIGIN: Mutex<Option<NSPoint>> = Mutex::new(None);
 /// cleared when the old content is removed / the panel hides, or a dangling pointer would
 /// be dereferenced on Cmd+C (use-after-free).
 static DETAIL_TEXT_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
-/// 代码详情显示文本到原文的映射,保证格式化换行不会改变复制结果。
-/// Mapping from formatted code display text back to its source, preserving copied content.
+/// 当前启用软换行装饰的代码文本视图;装饰只画在视图上,不写入文本。
+/// The code text view currently using soft-wrap decorations; decorations are drawn on the view,
+/// never written into the text.
+static DETAIL_SOFT_WRAP_TEXT_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 代码详情显示文本到原文的映射,软换行装饰不会改变复制结果。
+/// Mapping from detail code display text back to its source; soft-wrap decorations never affect copying.
 static DETAIL_SOURCE_MAP: Mutex<Option<DisplaySourceMap>> = Mutex::new(None);
 
 /// 行列表重建进行中:重建期间 addSubview 的新行按钮会因鼠标恰好在区域内而立即派发
@@ -3873,6 +3877,7 @@ fn hide_detail() {
     // The content views get removed once the panel hides; clear the text-view pointer so
     // Cmd+C never dereferences a dangling one.
     *DETAIL_TEXT_VIEW.lock().unwrap() = None;
+    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = None;
     *DETAIL_SOURCE_MAP.lock().unwrap() = None;
     let win = *DETAIL_WINDOW.lock().unwrap();
     unsafe {
@@ -4123,6 +4128,7 @@ unsafe fn show_detail_for_sel() {
     // again -- the same discipline as rebuild_rows). The detail text-view pointer is
     // cleared too (no dangling pointer).
     *DETAIL_TEXT_VIEW.lock().unwrap() = None;
+    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = None;
     *DETAIL_SOURCE_MAP.lock().unwrap() = None;
     // 详情内容每次重建都会替换滚动视图,先清除旧指针避免滚轮/拖拽触碰已移除的对象。
     // Detail content rebuilds the scroll view each time, so clear stale pointers before
@@ -4203,8 +4209,8 @@ unsafe fn show_detail_for_sel() {
         // Code-detail sizing and content now share one PreparedCodeDisplay. Previously both
         // called prepare_code_display; the second cache hit still hashed, detected language,
         // and cloned the large text model.
-        let prepared_code = (kind == TextKind::Code)
-            .then(|| prepare_code_display(&entry.text, detail_code_max_columns(DETAIL_CODE_MAX_W)));
+        let prepared_code =
+            (kind == TextKind::Code).then(|| prepare_code_for_soft_wrap(&entry.text));
         let (tw, th) = prepared_code
             .as_ref()
             .map(|prepared| detail_prepared_code_size(prepared, max_detail_h))
@@ -4265,20 +4271,54 @@ fn detail_max_height(picker: NSRect) -> f64 {
     picker.size.height.max(DETAIL_TEXT_MIN_H)
 }
 
-/// 详情代码区可用宽度映射到同一套安全换行列数。高度计算和 NSTextView 构建必须使用
-/// 完全相同的值,才能复用一次准备的代码显示模型。
-/// Map detail-code width to the shared safe-wrap column count. Sizing and NSTextView creation
-/// must use exactly this value so they can reuse one prepared code-display model.
+/// 详情代码区可用宽度映射到软换行高度估算列数,不会向显示文本插入字符。
+/// Map the detail code width to soft-wrap sizing columns; no characters are inserted into the display.
 fn detail_code_max_columns(width: f64) -> usize {
     let columns = ((width - DETAIL_PAD * 2.0) / 8.4).floor().max(0.0) as usize;
     columns.saturating_sub(DETAIL_CODE_WRAP_SAFETY).max(24)
 }
 
-/// 根据已准备的代码显示模型计算尺寸,避免高度估算再次格式化、哈希和复制长文本。
-/// Size the panel from an already prepared code-display model, avoiding a second formatting,
-/// hashing, and large-text copy during height estimation.
+/// 根据已准备的原文代码模型计算尺寸,避免视图创建时再次扫描高亮和复制长文本。
+/// Size the detail panel from the prepared raw-code model, avoiding another highlight scan and
+/// large-text copy during view creation.
+fn estimate_code_visual_lines(text: &str, max_columns: usize) -> usize {
+    let cap = max_columns.max(1);
+    text.split('\n')
+        .map(|line| {
+            let mut width = 0usize;
+            let mut indent = 0usize;
+            let mut at_indent = true;
+            for ch in line.chars() {
+                if ch == '\t' {
+                    let next = 4 - (width % 4);
+                    width += next;
+                    if at_indent {
+                        indent += next;
+                    }
+                } else {
+                    width += 1;
+                    if at_indent && ch == ' ' {
+                        indent += 1;
+                    } else {
+                        at_indent = false;
+                    }
+                }
+            }
+            if width <= cap {
+                return 1;
+            }
+            let continuation_width = cap.saturating_sub(indent + 4).max(1);
+            1 + (width - cap).div_ceil(continuation_width)
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
 fn detail_prepared_code_size(prepared: &PreparedCodeDisplay, max_height: f64) -> (f64, f64) {
-    let lines = prepared.text.split('\n').count();
+    // 这里只用于估算高度;真正的 NSTextView 仍使用原文,运行时软换行不会插入这些换行符。
+    // This is sizing-only; the actual NSTextView keeps the raw string and adds no newlines.
+    let lines =
+        estimate_code_visual_lines(&prepared.text, detail_code_max_columns(DETAIL_CODE_MAX_W));
     let h = (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H)
         .clamp(DETAIL_TEXT_MIN_H, max_height);
     (DETAIL_CODE_MAX_W, h)
@@ -4288,7 +4328,7 @@ fn detail_prepared_code_size(prepared: &PreparedCodeDisplay, max_height: f64) ->
 /// Compute detail text-panel dimensions (type-specific width, height capped by the picker).
 fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
     if kind == TextKind::Code {
-        let prepared = prepare_code_display(text, detail_code_max_columns(DETAIL_CODE_MAX_W));
+        let prepared = prepare_code_for_soft_wrap(text);
         return detail_prepared_code_size(&prepared, max_height);
     }
     let w = DETAIL_MAX_W;
@@ -4299,14 +4339,14 @@ fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
     (w, h)
 }
 
-/// 构建详情文本视图:普通文本自然换行,代码/HTML 在安全符号处悬挂式换行,超出高度后垂直滚动。
+/// 构建详情文本视图:普通文本自然换行,代码保留原文并由 NSTextView 软换行;标记只作为绘制装饰。
 /// 文本**可鼠标选中**(选中范围由底部"复制所选"按钮/Cmd+C 复制);面板不成为 key,
 /// 键盘焦点仍留在主浮窗,所以不能依赖系统 Cmd+C 路由。
-/// Build the detail text view: plain text wraps naturally, while code/HTML use hanging
-/// breaks at safe symbols; all content scrolls vertically when it exceeds the panel height.
-/// The text IS mouse-selectable; the selection is copied by the bottom "copy selection"
-/// button / Cmd+C. The panel never becomes key (keyboard focus stays in the picker), so
-/// the system Cmd+C routing cannot be relied upon.
+/// Build the detail text view: plain text wraps naturally, while code keeps its raw string and
+/// NSTextView performs visual soft wrapping; markers are drawing-only decorations.
+/// The text IS mouse-selectable; selection is copied by the bottom "copy selection" button / Cmd+C.
+/// The panel never becomes key (keyboard focus stays in the picker), so system Cmd+C routing
+/// cannot be relied upon.
 fn detail_text_view_class() -> *mut AnyObject {
     static CLASS: OnceLock<usize> = OnceLock::new();
     *CLASS.get_or_init(|| unsafe {
@@ -4320,6 +4360,13 @@ fn detail_text_view_class() -> *mut AnyObject {
             detail_text_view_copy as *mut c_void,
             types.as_ptr(),
         );
+        let types_draw = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
+        class_addMethod(
+            cls,
+            sel!(drawRect:),
+            detail_text_view_draw_rect as *mut c_void,
+            types_draw.as_ptr(),
+        );
         objc_registerClassPair(cls);
         cls as usize
     }) as *mut AnyObject
@@ -4329,6 +4376,190 @@ fn detail_text_view_class() -> *mut AnyObject {
 /// The native Copy menu must also pass through the source mapping, never copying formatted text.
 extern "C" fn detail_text_view_copy(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
     copy_detail_selection();
+}
+
+struct SoftWrapGlyphs {
+    end: ObjPtr,
+    continuation: ObjPtr,
+    end_size: NSSize,
+    continuation_size: NSSize,
+}
+
+/// 软换行字形只创建一次;drawRect 可能被频繁调用,不能在每次重绘时复制大段文本或构建属性。
+/// Create the soft-wrap glyphs once; drawRect can run frequently, so it must not copy large text
+/// or rebuild attributed strings on every repaint.
+unsafe fn soft_wrap_glyphs() -> &'static SoftWrapGlyphs {
+    static GLYPHS: OnceLock<SoftWrapGlyphs> = OnceLock::new();
+    GLYPHS.get_or_init(|| {
+        let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+        let attrs: *mut AnyObject = msg_send![attrs, init];
+        let font_key = make_nsstring("NSFont");
+        let color_key = make_nsstring("NSColor");
+        let font: *mut AnyObject =
+            msg_send![class!(NSFont), monospacedSystemFontOfSize: 10.0f64, weight: 0.0f64];
+        let color: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.36f64];
+        let _: () = msg_send![attrs, setObject: font, forKey: font_key];
+        let _: () = msg_send![attrs, setObject: color, forKey: color_key];
+        CFRelease(font_key as *const c_void);
+        CFRelease(color_key as *const c_void);
+        let end_ns = make_nsstring("↵");
+        let end: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+        let end: *mut AnyObject = msg_send![end, initWithString: end_ns, attributes: attrs];
+        CFRelease(end_ns as *const c_void);
+        let continuation_ns = make_nsstring("↪");
+        let continuation: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+        let continuation: *mut AnyObject = msg_send![
+            continuation,
+            initWithString: continuation_ns,
+            attributes: attrs
+        ];
+        CFRelease(continuation_ns as *const c_void);
+        release_obj(attrs);
+        SoftWrapGlyphs {
+            end: ObjPtr(end),
+            continuation: ObjPtr(continuation),
+            end_size: msg_send![end, size],
+            continuation_size: msg_send![continuation, size],
+        }
+    })
+}
+
+/// 在 NSTextView 绘制完成后叠加软换行标记;只读布局结果,不改 textStorage。
+/// Draw soft-wrap markers after NSTextView finishes, reading layout results without modifying
+/// textStorage.
+extern "C" fn detail_text_view_draw_rect(_self: *mut c_void, _cmd: Sel, rect: NSRect) {
+    unsafe {
+        #[repr(C)]
+        struct ObjcSuper {
+            receiver: *mut c_void,
+            super_class: *mut c_void,
+        }
+        extern "C" {
+            fn objc_msgSendSuper();
+        }
+        type Draw = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect);
+        let mut sup = ObjcSuper {
+            receiver: _self,
+            super_class: class!(NSTextView) as *const _ as *mut c_void,
+        };
+        let draw: Draw = std::mem::transmute(objc_msgSendSuper as *const ());
+        draw(&mut sup, sel!(drawRect:), rect);
+
+        let view = _self as *mut AnyObject;
+        let is_code = DETAIL_SOFT_WRAP_TEXT_VIEW
+            .lock()
+            .unwrap()
+            .is_some_and(|code_view| code_view.0 == view);
+        if !is_code {
+            return;
+        }
+        let layout: *mut AnyObject = msg_send![view, layoutManager];
+        let container: *mut AnyObject = msg_send![view, textContainer];
+        let string: *mut AnyObject = msg_send![view, string];
+        let text_len: usize = msg_send![string, length];
+        let glyph_count: usize = msg_send![layout, numberOfGlyphs];
+        if glyph_count == 0 || text_len == 0 {
+            return;
+        }
+        let text_origin: NSPoint = msg_send![view, textContainerOrigin];
+        // 只检查脏矩形覆盖的字形,并额外检查上一行以判断首个可见行是否为软换行续行。
+        // Only inspect glyphs intersecting the invalidated rectangle, plus one preceding line
+        // to recover whether the first visible line is a soft-wrap continuation.
+        let layout_rect = NSRect::new(
+            NSPoint::new(rect.origin.x - text_origin.x, rect.origin.y - text_origin.y),
+            rect.size,
+        );
+        let visible_glyphs: NSRange = msg_send![
+            layout,
+            glyphRangeForBoundingRect: layout_rect,
+            inTextContainer: container
+        ];
+        if visible_glyphs.length == 0 {
+            return;
+        }
+        let mut glyph = visible_glyphs.location;
+        if glyph > 0 {
+            let mut previous = NSRange::new(0, 0);
+            let _: NSRect = msg_send![
+                layout,
+                lineFragmentUsedRectForGlyphAtIndex: glyph - 1,
+                effectiveRange: &mut previous
+            ];
+            glyph = previous.location;
+        }
+        let glyph_end = visible_glyphs
+            .location
+            .saturating_add(visible_glyphs.length)
+            .min(glyph_count);
+        let glyphs = soft_wrap_glyphs();
+        let end_attr = glyphs.end.0;
+        let continuation_attr = glyphs.continuation.0;
+        let mut continuation = false;
+        while glyph < glyph_end {
+            let mut effective = NSRange::new(0, 0);
+            let fragment: NSRect = msg_send![
+                layout,
+                lineFragmentUsedRectForGlyphAtIndex: glyph,
+                effectiveRange: &mut effective
+            ];
+            if effective.length == 0 {
+                glyph += 1;
+                continue;
+            }
+            let character_range: NSRange = msg_send![
+                layout,
+                characterRangeForGlyphRange: effective,
+                actualGlyphRange: std::ptr::null_mut::<NSRange>()
+            ];
+            let char_start = character_range.location;
+            let char_end = character_range
+                .location
+                .saturating_add(character_range.length)
+                .min(text_len);
+            let line = NSRect::new(
+                NSPoint::new(
+                    fragment.origin.x + text_origin.x,
+                    fragment.origin.y + text_origin.y,
+                ),
+                fragment.size,
+            );
+            let visible = line.origin.y + line.size.height >= rect.origin.y
+                && line.origin.y <= rect.origin.y + rect.size.height;
+            if visible && continuation {
+                let x = (line.origin.x - glyphs.continuation_size.width - 2.0).max(0.0);
+                let y = line.origin.y + (line.size.height - glyphs.continuation_size.height) / 2.0;
+                let _: () = msg_send![continuation_attr, drawAtPoint: NSPoint::new(x, y)];
+            }
+
+            // 软换行是视觉行片段边界,断点两侧都没有真实的 '\n'。
+            // A soft wrap is a line-fragment boundary without a hard '\n' at either side.
+            let char_at_end: u16 = if char_end < text_len {
+                msg_send![string, characterAtIndex: char_end]
+            } else {
+                0
+            };
+            let char_before_end: u16 = if char_end > char_start {
+                msg_send![string, characterAtIndex: char_end - 1]
+            } else {
+                0
+            };
+            let hard_break = char_end >= text_len
+                || char_at_end == '\n' as u16
+                || char_before_end == '\n' as u16;
+            let soft_wrap = char_end < text_len && !hard_break;
+            if visible && soft_wrap {
+                let x = (line.origin.x + line.size.width - glyphs.end_size.width).max(0.0);
+                let y = line.origin.y + (line.size.height - glyphs.end_size.height) / 2.0;
+                let _: () = msg_send![end_attr, drawAtPoint: NSPoint::new(x, y)];
+            }
+            continuation = soft_wrap;
+            glyph = effective
+                .location
+                .saturating_add(effective.length)
+                .max(glyph.saturating_add(1));
+        }
+    }
 }
 
 unsafe fn add_detail_text(
@@ -4360,24 +4591,31 @@ unsafe fn add_detail_text(
     let _: () = msg_send![scroll, setHasVerticalScroller: false];
     let _: () = msg_send![scroll, setAutohidesScrollers: false];
 
-    // 代码由显示格式化器在安全符号处插入悬挂式视觉换行,不再依赖横向滚动。
-    // The display formatter inserts hanging visual breaks at safe symbols, so no horizontal
-    // scrolling is needed for normal code lines.
+    // 代码保留原始字符串;NSTextView 负责 visual soft wrap,不插入额外的 '\n'。
+    // Code keeps the original string; NSTextView performs visual soft wrapping without adding
+    // extra '\n' characters.
     let _: () = msg_send![scroll, setHasHorizontalScroller: false];
-    // 详情打开路径已在 show_detail_for_sel 准备一次;此处只借用,不再命中缓存后 clone
-    // 完整的显示文本/映射/span。
-    // show_detail_for_sel prepares code once before this call; borrow it here instead of hitting
-    // the cache and cloning its complete display text, map, and spans again.
+    // 详情打开路径已在 show_detail_for_sel 准备一次;此处只借用原文/映射/span,不再复制长文本模型。
+    // show_detail_for_sel prepares code once before this call; borrow its raw text, map, and
+    // spans instead of cloning another complete large-text model.
     let prepared = prepared_code;
     let display_text = prepared.map(|code| code.text.as_str()).unwrap_or(text);
-    if let Some(code) = prepared {
-        *DETAIL_SOURCE_MAP.lock().unwrap() = Some(code.source_map.clone());
-    }
+    // 软换行详情展示的就是原文,复制时直接读取 NSTextView,不再复制一份 identity map。
+    // Soft-wrapped detail text is the original string, so copy directly from NSTextView instead
+    // of cloning an identity source map.
     let tv: *mut AnyObject = msg_send![detail_text_view_class(), alloc];
     let tv: *mut AnyObject = msg_send![
         tv,
         initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(avail_w, body_h))
     ];
+    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = is_code.then_some(ObjPtr(tv));
+    // 允许 TextKit 非连续布局,大型 HTML 打开时优先布局可见区域,避免 setString/setFrame
+    // 为计算整个长文档的 glyph 和换行而同步阻塞主线程。
+    // Allow TextKit non-contiguous layout so large HTML prioritizes visible regions instead of
+    // synchronously laying out every glyph and wrapped line during setString/setFrame.
+    let layout: *mut AnyObject = msg_send![tv, layoutManager];
+    let _: () = msg_send![layout, setAllowsNonContiguousLayout: true];
+
     let ns_text = make_nsstring(display_text);
     let _: () = msg_send![tv, setString: ns_text];
     CFRelease(ns_text as *const c_void);
@@ -4388,7 +4626,6 @@ unsafe fn add_detail_text(
     let storage: *mut AnyObject = msg_send![tv, textStorage];
     if let Some(code) = prepared {
         apply_prepared_code_highlights(storage, code);
-        apply_visible_space_markers(storage, &code.text);
     } else {
         apply_highlights(storage, display_text, kind);
     }
@@ -10359,12 +10596,12 @@ mod tests {
             detail_text_size(&long, TextKind::Plain, max_height).1,
             max_height
         );
-        // 代码使用更宽的面板,长单行不因自然换行而增加高度。
-        // Code uses the wider panel, and a long single line does not gain fake wrapped height.
+        // 长代码行按可视宽度软换行,但高度仍受详情面板上限约束。
+        // Long code lines soft-wrap visually, while the detail panel still clamps to its height.
         let long_code = "x".repeat(200_000);
         let (code_w, code_h) = detail_text_size(&long_code, TextKind::Code, max_height);
         assert_eq!(code_w, super::DETAIL_CODE_MAX_W);
-        assert_eq!(code_h, super::DETAIL_TEXT_MIN_H);
+        assert_eq!(code_h, max_height);
     }
 
     #[test]
