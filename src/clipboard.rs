@@ -4979,7 +4979,17 @@ extern "C" fn detail_text_view_draw_rect(_self: *mut c_void, _cmd: Sel, rect: NS
                 || char_before_end == '\n' as u16;
             let soft_wrap = char_end < text_len && !hard_break;
             if visible && soft_wrap {
-                let x = (line.origin.x + line.size.width - glyphs.end_size.width).max(0.0);
+                // 标记画在行片段右缘之外 2pt 的空白带,不再叠在行尾字符上——旧实现右对齐
+                // 到 usedRect 右缘,半透明箭头会压住行末字形,逗号结尾时轮廓相触最明显。
+                // 折行预算(68 列)刻意小于容器容量(~72 列),每个软换行行尾天然保有
+                // ≥4 列空白,标记既不会越出面板也不会压到任何内容。
+                // Draw the marker just OUTSIDE the fragment's right edge with a 2pt gap instead
+                // of on top of the trailing glyph -- the old right-aligned placement brushed
+                // against the last glyph and was most visible after commas. The wrap budget
+                // (68 columns) is deliberately below container capacity (~72 columns), so every
+                // soft-wrapped line keeps >= 4 spare columns: the marker can neither clip at the
+                // panel edge nor cover any content.
+                let x = line.origin.x + line.size.width + 2.0;
                 let y = line.origin.y + (line.size.height - glyphs.end_size.height) / 2.0;
                 let _: () = msg_send![end_attr, drawAtPoint: NSPoint::new(x, y)];
             }
