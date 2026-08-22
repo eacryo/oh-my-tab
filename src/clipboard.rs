@@ -56,8 +56,8 @@
 
 use crate::clipboard_highlight::{
     apply_code_paragraph_styles, apply_link_color, apply_visible_space_markers, classify_text,
-    prepare_code_display, prepare_code_for_soft_wrap, DisplaySourceMap, PreparedCodeDisplay,
-    TextKind, CODE_ADVANCE_PT,
+    prepare_code_display, prepare_code_for_soft_wrap, prepare_code_no_wrap_display,
+    DisplaySourceMap, PreparedCodeDisplay, TextKind, CODE_ADVANCE_PT,
 };
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -4699,9 +4699,17 @@ unsafe fn show_detail_for_sel() {
         // increment the reference count instead of copying long text or its source map.
         let code_soft_wrap =
             kind == TextKind::Code && DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
-        let prepared_code = code_soft_wrap.then(|| {
-            prepare_code_for_soft_wrap(&entry.text, detail_code_max_columns(DETAIL_CODE_MAX_W))
-        });
+        // 代码详情两种模式都走准备管线:软换行 = 结构断点折行 + 中点标记;
+        // 非软换行 = 不折行(横向滚动)+ 同样的中点标记,并携带映射保证复制保真。
+        let prepared_code = if kind == TextKind::Code {
+            Some(if code_soft_wrap {
+                prepare_code_for_soft_wrap(&entry.text, detail_code_max_columns(DETAIL_CODE_MAX_W))
+            } else {
+                prepare_code_no_wrap_display(&entry.text)
+            })
+        } else {
+            None
+        };
         let (tw, th) = if let Some(prepared) = &prepared_code {
             detail_prepared_code_size(prepared, max_detail_h)
         } else if kind == TextKind::Code {
@@ -5217,6 +5225,11 @@ unsafe fn add_detail_text(
     let _: () = msg_send![tv, setFont: font];
     if code_soft_wrap {
         apply_code_paragraph_styles(storage, display_text);
+    }
+    // 代码详情两种模式(软换行/非软换行)的段内空格都显示为中点,统一淡色染色,
+    // 与列表行的空格标记观感一致。普通文本/链接无中点,调用无副作用。
+    if is_code {
+        apply_visible_space_markers(storage, display_text);
     }
     let _: () = msg_send![storage, endEditing];
     // 详情窗口外框对齐条目内容块顶部,正文再补上列表的行内顶部留白,避免整体窗口下移。
@@ -9281,7 +9294,9 @@ pub(crate) fn smoke_runner() -> bool {
                 !nsstring_to_rust(no_wrap_string).contains('\u{2028}'),
                 "no-wrap mode must display the untouched source"
             );
-            assert!(DETAIL_SOURCE_MAP.lock().unwrap().is_none());
+            // 非软换行模式同样携带映射(段内中点的复制保真依赖它),且显示文本
+            // 应含中点标记、不含真实空格以外的 U+2028。
+            assert!(DETAIL_SOURCE_MAP.lock().unwrap().is_some());
             assert!(
                 no_wrap_frame.size.width > no_wrap_bounds.size.width,
                 "long source lines must overflow the horizontal viewport"

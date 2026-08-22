@@ -124,7 +124,11 @@ struct CodeDisplayCacheKey {
     content_hash: u64,
     content_len: usize,
     max_columns: usize,
-    soft_wrap: bool,
+    /// 显示模式:0 = 列表预览,1 = 详情软换行,2 = 详情非软换行(横向滚动)。
+    /// Display mode: 0 = row preview, 1 = detail soft wrap, 2 = detail no-wrap.
+    mode: u8,
+    /// 软换行算法标识(见 `WrapAlgorithm`),防切换后命中脏缓存。
+    /// Soft-wrap algorithm id (see `WrapAlgorithm`) so switching never hits stale entries.
     algorithm: u8,
 }
 
@@ -396,7 +400,7 @@ pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Arc<Prep
         content_hash,
         content_len: source.len(),
         max_columns,
-        soft_wrap: false,
+        mode: 0,
         algorithm: active_wrap_algorithm().id(),
     };
     let cache = CODE_DISPLAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -438,7 +442,7 @@ pub(crate) fn prepare_code_for_soft_wrap(
         content_hash,
         content_len: source.len(),
         max_columns,
-        soft_wrap: true,
+        mode: 1,
         algorithm: active_wrap_algorithm().id(),
     };
     let cache = CODE_DISPLAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -461,6 +465,114 @@ pub(crate) fn prepare_code_for_soft_wrap(
         guard.insert(key, Arc::clone(&prepared));
     }
     prepared
+}
+
+/// 非软换行代码详情的显示文本:不折行、不展开 tab,仅把段内空格显示为中点
+/// (行首缩进保留真实空格,与软换行模式观感一致),并携带原文映射供复制还原。
+/// 每个中点按 1:1 替换空格、边界即恒等映射——选中任意子集都还原原文。
+pub(crate) fn prepare_code_no_wrap_display(source: &str) -> Arc<PreparedCodeDisplay> {
+    let content_hash = code_fnv1a64(source.as_bytes());
+    let key = CodeDisplayCacheKey {
+        content_hash,
+        content_len: source.len(),
+        max_columns: 0,
+        mode: 2,
+        algorithm: active_wrap_algorithm().id(),
+    };
+    let cache = CODE_DISPLAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
+        return cached;
+    }
+
+    // 逐字符构建:普通字符推 after 偏移;替换出的中点同样推该空格的 after 偏移,
+    // 因此任意显示区间的边界都能连续覆盖到原文字符。段首空白保持原样。
+    let offsets = source_utf16_offsets(source);
+    let mut output = MappedCodeOutput {
+        text: String::with_capacity(source.len()),
+        boundaries: vec![0],
+    };
+    let mut line_start = 0;
+    while line_start <= source.len() {
+        let line_end = source[line_start..]
+            .find('\n')
+            .map(|offset| line_start + offset)
+            .unwrap_or(source.len());
+        append_marked_source_line(
+            &mut output.text,
+            &mut output.boundaries,
+            source,
+            &offsets,
+            line_start,
+            line_end,
+        );
+        if line_end < source.len() {
+            append_mapped_source(
+                &mut output.text,
+                &mut output.boundaries,
+                source,
+                &offsets,
+                line_end,
+                line_end + 1,
+            );
+            line_start = line_end + 1;
+        } else {
+            break;
+        }
+    }
+    let formatted = FormattedCode {
+        text: output.text,
+        source_map: DisplaySourceMap {
+            source: source.to_owned(),
+            boundaries: output.boundaries,
+        },
+    };
+    let prepared = Arc::new(build_prepared_code(formatted, true));
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= CODE_DISPLAY_CACHE_CAPACITY {
+            if let Some(old_key) = guard.keys().next().copied() {
+                guard.remove(&old_key);
+            }
+        }
+        guard.insert(key, Arc::clone(&prepared));
+    }
+    prepared
+}
+
+/// 单行标记构建:前导空白(tab 与空格)原样直拷;其余空格显示为中点,
+/// 但边界仍指向该空格自身(after 偏移),复制还原不受影响。
+fn append_marked_source_line(
+    out: &mut String,
+    boundaries: &mut Vec<usize>,
+    source: &str,
+    offsets: &[usize],
+    start: usize,
+    end: usize,
+) {
+    if let Some(last) = boundaries.last_mut() {
+        *last = offsets[start];
+    }
+    let mut byte = start;
+    let mut in_leading_ws = true;
+    while byte < end {
+        let ch = source[byte..].chars().next().unwrap();
+        let next = byte + ch.len_utf8();
+        // 首个非空白字符结束缩进段;其后的空格才显示为中点。
+        if ch != ' ' && ch != '\t' {
+            in_leading_ws = false;
+        }
+        // 行首空白(tab 与空格)保持字面;其余空格显示为中点,
+        // 但边界仍指向该空格自身(after 偏移),复制还原不受影响。
+        let displayed = if ch == ' ' && !in_leading_ws {
+            '·'
+        } else {
+            ch
+        };
+        out.push(displayed);
+        for _ in 0..ch.len_utf16() {
+            boundaries.push(offsets[next]);
+        }
+        byte = next;
+    }
 }
 
 fn source_utf16_offsets(source: &str) -> Vec<usize> {
@@ -899,11 +1011,38 @@ fn format_code_with_style(source: &str, max_columns: usize, style: CodeWrapStyle
             break;
         }
     }
-    // 列表预览继续显示空格标记;详情保留普通空格,仅插入不可复制的 U+2028 软换行。
-    // Row previews retain visible-space markers; details preserve regular spaces and only insert
-    // non-copying U+2028 soft wraps.
-    if style == CodeWrapStyle::Preview && output.text.contains(' ') {
-        output.text = output.text.replace(' ', "·");
+    // 列表预览整行把空格显示为中点;详情同样显示中点,但保留段首缩进空格——
+    // apply_code_paragraph_styles 依赖前导空格计算 headIndent,缩进必须是真实空格。
+    // 替换为 1:1 UTF-16(' ' ↔ '·'),边界数组与 source map 完全不受影响。
+    // Row previews replace every space with a middle dot; details do too, EXCEPT the leading
+    // indentation run of each visual line -- apply_code_paragraph_styles derives headIndent
+    // from those leading spaces, so they must remain real spaces. The swap is 1:1 UTF-16
+    // (' ' ↔ '·'), leaving boundary arrays and the source map untouched.
+    match style {
+        CodeWrapStyle::Preview => {
+            if output.text.contains(' ') {
+                output.text = output.text.replace(' ', "·");
+            }
+        }
+        CodeWrapStyle::Detail => {
+            let mut marked = String::with_capacity(output.text.len());
+            let mut in_leading_ws = true;
+            for ch in output.text.chars() {
+                match ch {
+                    '\n' | '\u{2028}' => {
+                        marked.push(ch);
+                        in_leading_ws = true;
+                    }
+                    ' ' if in_leading_ws => marked.push(' '),
+                    ' ' => marked.push('·'),
+                    other => {
+                        in_leading_ws = false;
+                        marked.push(other);
+                    }
+                }
+            }
+            output.text = marked;
+        }
     }
     // 边界从"展开文本"空间映射回原文 UTF-16 空间。
     // Map boundaries from expanded-text space back into original-source space.
@@ -964,10 +1103,9 @@ pub(crate) unsafe fn apply_visible_space_markers(storage: *mut AnyObject, text: 
             location += length;
             continue;
         }
-        at_line_start = ch == '\n';
-        if ch != '\n' {
-            at_line_start = false;
-        }
+        // 行首判定包含 U+2028:详情的视觉行由软换行分隔符开启。
+        // Line starts include U+2028: detail visual lines begin at the soft-wrap separator.
+        at_line_start = ch == '\n' || ch == '\u{2028}';
         location += length;
     }
     CFRelease(color_key as *const c_void);
@@ -1076,10 +1214,14 @@ pub(crate) unsafe fn apply_link_color(storage: *mut AnyObject, text: &str, kind:
 #[cfg(test)]
 mod tests {
     use super::{
-        char_columns, format_code_for_soft_wrap, prepare_code_for_soft_wrap, CODE_ADVANCE_PT,
-        TAB_STOP_COLUMNS,
+        apply_visible_space_markers, char_columns, format_code_for_soft_wrap,
+        prepare_code_for_soft_wrap, CODE_ADVANCE_PT, TAB_STOP_COLUMNS,
     };
+    use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send, sel};
     use objc2_foundation::NSRange;
+    use std::ffi::c_void;
     use std::sync::Arc;
 
     /// 按 \n 与 U+2028 切出最终视觉行(与详情渲染的行边界一致)。
@@ -1111,9 +1253,14 @@ mod tests {
     #[test]
     fn soft_wrap_prefers_code_boundaries_then_falls_back_to_characters() {
         let first_break = |source: &str| {
+            // 断言按字符位计数:'·' 在 UTF-8 中占 2 字节,字节索引会随点号出现而漂移;
+            // 期望值本就是列语义。
+            // Assertions count CHARACTER positions: '·' costs 2 bytes in UTF-8, so byte
+            // indices drift once dots appear; the expectations are column semantics anyway.
             format_code_for_soft_wrap(source, 18)
                 .text
-                .find('\u{2028}')
+                .char_indices()
+                .position(|(_, ch)| ch == '\u{2028}')
                 .expect("source must wrap")
         };
         // 每个样例都让更低优先级的断点更靠近右边;仍应选择更高优先级类别。
@@ -1127,16 +1274,109 @@ mod tests {
         assert_eq!(first_break("abcdefghijklmnopqrstuvwxyz"), 18); // arbitrary character
     }
 
+    /// 详情点号契约:段内空格显示为中点,行首缩进保持真实空格(段落 headIndent 依赖),
+    /// 且 source map 往返仍逐字符还原含空格的原文。
+    /// Detail dot contract: interior spaces render as middle dots while the leading
+    /// indentation run stays real spaces (paragraph headIndent depends on them), and the
+    /// source-map roundtrip still restores the original verbatim.
     #[test]
-    fn soft_wrap_source_map_excludes_virtual_separators() {
-        let source = "veryLongObject.member(firstArgument, secondArgument)";
-        let formatted = format_code_for_soft_wrap(source, 16);
-        assert!(formatted.text.contains('\u{2028}'));
+    fn detail_soft_wrap_marks_interior_spaces_but_keeps_indentation() {
+        let source = "let value = compute(a, b);\n    return value.field;";
+        let formatted = format_code_for_soft_wrap(source, 68);
+        assert!(
+            formatted.text.contains('·'),
+            "interior spaces must render as middle dots"
+        );
+        for seg in visual_segments(&formatted.text) {
+            let indent = seg.len() - seg.trim_start_matches(' ').len();
+            assert!(
+                !seg[indent..].contains(' '),
+                "only leading indentation may keep spaces: {seg:?}"
+            );
+            if indent > 0 {
+                assert!(seg[..indent].chars().all(|ch| ch == ' '));
+            }
+        }
         let display_len = formatted.text.encode_utf16().count();
-        let source_range = formatted
+        let range = formatted
             .source_map
             .source_range(NSRange::new(0, display_len));
-        assert_eq!(source_range.length, source.encode_utf16().count());
+        assert_eq!(
+            utf16_slice(&formatted.source_map.source, range),
+            source,
+            "roundtrip must restore spaces verbatim"
+        );
+    }
+
+    /// 染色函数行首判定契约:U+2028 之后的首个中点也按"行首"染色。
+    /// 用 NSMutableAttributedString 承载(NSTextStorage 没有 initWithString:)。
+    /// 注意:macOS 26 运行时只认复数形式 attributesAtIndex:effectiveRange:,
+    /// 单数 attributeAtIndex:effectiveRange: 已不存在(respondsToSelector=false),
+    /// 因此断言走 raw objc_msgSend + NSSelectorFromString 的复数选择器。
+    /// Marker-tint contract: the first dot after a U+2028 must count as a line start.
+    /// Uses an NSMutableAttributedString carrier (NSTextStorage has no initWithString:).
+    /// NOTE: on macOS 26 the runtime only responds to the PLURAL
+    /// attributesAtIndex:effectiveRange: -- the singular variant is gone
+    /// (respondsToSelector = false), so assertions go through raw objc_msgSend +
+    /// NSSelectorFromString with the plural selector.
+    #[test]
+    fn space_marker_tint_treats_u2028_as_a_line_start() {
+        let text = "ab ·\u{2028} ·cd";
+        // UTF-16 位图:a0 b1 sp2 ·3 ␨4 sp5 ·6 c7 d8 —— 中点在位 3 与位 6。
+        // UTF-16 map: a0 b1 sp2 dot3 sep4 sp5 dot6 c7 d8 -- dots at offsets 3 and 6.
+        unsafe {
+            extern "C" {
+                fn objc_msgSend();
+                fn NSSelectorFromString(name: *const c_void) -> objc2::runtime::Sel;
+            }
+            type AttrFn = unsafe extern "C" fn(
+                *mut c_void,
+                objc2::runtime::Sel,
+                u64,
+                *mut NSRange,
+            ) -> *mut AnyObject;
+            let attr_fn: AttrFn = std::mem::transmute(objc_msgSend as *const ());
+
+            let attr_alloc: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+            let ns = make_nsstring(text);
+            let storage: *mut AnyObject = msg_send![attr_alloc, initWithString: ns];
+            CFRelease(ns as *const c_void);
+            apply_visible_space_markers(storage, text);
+
+            for (offset, expected) in [
+                (0usize, false),
+                (3usize, true),
+                (5usize, false),
+                (6usize, true),
+            ] {
+                let mut eff = NSRange::new(0, 0);
+                let dict = attr_fn(
+                    storage as *mut c_void,
+                    NSSelectorFromString(
+                        make_nsstring("attributesAtIndex:effectiveRange:") as *const c_void
+                    ),
+                    offset as u64,
+                    &mut eff as *mut NSRange,
+                );
+                // attributesAtIndex 对界内索引恒返回非空字典(可能为空),空值检查
+                // 无法区分;必须查 NSColor 键是否存在(染色标记的唯一属性)。
+                // attributesAtIndex always returns a NON-NULL (possibly empty) dictionary
+                // for in-bounds indexes, so a null check cannot discriminate -- look up the
+                // NSColor key instead (the tint is the only attribute ever applied here).
+                let color_key = make_nsstring("NSColor");
+                let has_tint: *mut AnyObject = if dict.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    msg_send![dict, objectForKey: color_key]
+                };
+                CFRelease(color_key as *const c_void);
+                assert_eq!(
+                    !has_tint.is_null(),
+                    expected,
+                    "tint presence at utf16 offset {offset} mismatched"
+                );
+            }
+        }
     }
 
     /// 契约夹具:置顶片段同款的超宽中文注释、行尾注释、tab 缩进与纯 ASCII 长行。
