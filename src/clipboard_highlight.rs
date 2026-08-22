@@ -20,12 +20,144 @@ pub(crate) enum TextKind {
 
 const CODE_DISPLAY_CACHE_CAPACITY: usize = 64;
 
+/// 等宽代码字体的实测字符步进(pt)。`.AppleSystemUIFontMonospaced-Regular` @14pt 实测
+/// 8.654pt;取 8.66 让列数预算略保守(宁可早折一行,不可超出容器触发 AppKit 二次折行)。
+/// Measured advance of the monospaced code font in points. `.AppleSystemUIFontMonospaced-Regular`
+/// at 14pt measures 8.654pt; 8.66 keeps the column budget slightly conservative -- wrap a line
+/// early rather than overflow the container and let AppKit add unmarked breaks.
+pub(crate) const CODE_ADVANCE_PT: f64 = 8.66;
+
+/// Tab 显示层展开的制表位宽度(列)。展开只影响显示,复制经 source map 还原原文 tab。
+/// Tab stop width (columns) used by the display-layer expansion. Expansion affects display
+/// only; copies restore the original tabs through the source map.
+const TAB_STOP_COLUMNS: usize = 4;
+
+/// 单个字符在等宽渲染下的视觉列宽:CJK/全角区段按 2 列计。此前一律按 1 列估算,含中文的
+/// 行真实像素宽超出容器后被 AppKit 按字符硬切出无标记断点——正是"软换行后格式错乱"
+/// 的根因之一(另一处是步进常量偏小)。
+/// Visual columns of one character under monospace rendering: CJK/fullwidth ranges count as
+/// two. Estimating them as one made CJK-laden lines exceed the container's pixel width, so
+/// AppKit inserted unmarked character-level breaks -- one half of the messy-wrapping bug (the
+/// other half was the understated advance constant).
+fn char_columns(ch: char) -> usize {
+    let c = ch as u32;
+    if matches!(c,
+        0x1100..=0x115F       // Hangul Jamo 谚文字母
+        | 0x2E80..=0x303E     // CJK 部首与符号
+        | 0x3041..=0x33FF     // 平假名/片假名/兼容区
+        | 0x3400..=0x4DBF     // CJK 扩展 A
+        | 0x4E00..=0x9FFF     // CJK 统一表意文字
+        | 0xA000..=0xA4CF     // 彝文
+        | 0xAC00..=0xD7A3     // 谚文音节
+        | 0xF900..=0xFAFF     // CJK 兼容表意
+        | 0xFE10..=0xFE19     // 竖排形式
+        | 0xFE30..=0xFE6F     // CJK 兼容形式
+        | 0xFF00..=0xFF60     // 全角 ASCII 与标点
+        | 0xFFE0..=0xFFE6     // 全角符号
+        | 0x1F300..=0x1FAFF   // Emoji(近似 2 列)
+        | 0x20000..=0x3FFFD   // CJK 扩展 B–F
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Tab 展开的中间产物:`text` 把源码中的 tab 替换为对齐到制表位的空格;`to_source_utf16[k]`
+/// 是展开文本第 k 个 UTF-16 位之前的原文 UTF-16 偏移(末位为原文总长),供换行机制把边界
+/// 映射回原文。列计数从行首起算(遇 `\n` 清零);一个 tab 展开出的多格空格中,首格映射到
+/// tab 起点、其余映射到 tab 结束——选中任意连续子集都能还原出原 tab 或其空区间。
+/// Intermediate product of tab expansion: `text` replaces each tab with spaces aligned to tab
+/// stops, and `to_source_utf16[k]` holds the source UTF-16 offset before the k-th unit of the
+/// expanded text (last entry = source length) so the wrap machinery can map boundaries back.
+/// Columns restart at every `\n`; among the spaces one tab expands into, the first maps to the
+/// tab's start and the rest to its end -- selecting any contiguous subset restores either the
+/// original tab or an empty range, never wrong characters.
+struct ExpandedSource {
+    text: String,
+    to_source_utf16: Vec<usize>,
+}
+
+fn expand_tabs(source: &str) -> ExpandedSource {
+    let mut text = String::with_capacity(source.len());
+    let mut map = Vec::with_capacity(source.encode_utf16().count() + 1);
+    let mut col = 0usize;
+    let mut src16 = 0usize;
+    for ch in source.chars() {
+        match ch {
+            '\n' => {
+                map.push(src16);
+                text.push('\n');
+                col = 0;
+            }
+            // \r 渲染零宽,不计列。/ \r renders zero-width; do not count it.
+            '\r' => {
+                map.push(src16);
+                text.push('\r');
+            }
+            '\t' => {
+                let pad = TAB_STOP_COLUMNS - (col % TAB_STOP_COLUMNS);
+                let after = src16 + ch.len_utf16();
+                for step in 0..pad {
+                    map.push(if step == 0 { src16 } else { after });
+                    text.push(' ');
+                }
+                col += pad;
+            }
+            _ => {
+                map.push(src16);
+                text.push(ch);
+                col += char_columns(ch);
+            }
+        }
+        src16 += ch.len_utf16();
+    }
+    map.push(src16);
+    ExpandedSource {
+        text,
+        to_source_utf16: map,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CodeDisplayCacheKey {
     content_hash: u64,
     content_len: usize,
     max_columns: usize,
     soft_wrap: bool,
+    algorithm: u8,
+}
+
+/// 详情软换行算法(开发期在 `active_soft_wrap_algorithm` 内切换,不进配置)。
+/// Soft-wrap algorithm for the detail panel (switched in code during development via
+/// `active_soft_wrap_algorithm`; not persisted to config).
+///
+/// 启用/关闭软换行的运行时入口仍是详情工具栏的换行按钮(no-wrap 横向滚动路径);
+/// 这里的变体只决定"开启时用哪种折行逻辑"。
+/// The runtime enable/disable switch remains the wrap button in the detail toolbar (the
+/// no-wrap horizontal-scroll path); these variants only pick WHICH logic runs when enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WrapAlgorithm {
+    /// 结构优先级折行:逗号 > 运算符 > 成员 > 括号 > 空白,宽度按 `char_columns`
+    /// 与 `CODE_ADVANCE_PT` 估算,U+2028 落在结构边界上。
+    /// Structural-priority wrapping: comma > operator > member > parens > whitespace,
+    /// widths estimated with `char_columns` and `CODE_ADVANCE_PT`, U+2028 on boundaries.
+    StructuralPriority,
+}
+
+impl WrapAlgorithm {
+    fn id(self) -> u8 {
+        match self {
+            WrapAlgorithm::StructuralPriority => 0,
+        }
+    }
+}
+
+/// 当前生效的软换行算法。开发期对比不同逻辑时改这里并重编译。
+/// The active soft-wrap algorithm. While experimenting with alternatives, change this and
+/// rebuild.
+pub(crate) fn active_wrap_algorithm() -> WrapAlgorithm {
+    WrapAlgorithm::StructuralPriority
 }
 
 pub(crate) struct PreparedCodeDisplay {
@@ -265,6 +397,7 @@ pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Arc<Prep
         content_len: source.len(),
         max_columns,
         soft_wrap: false,
+        algorithm: active_wrap_algorithm().id(),
     };
     let cache = CODE_DISPLAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
@@ -306,6 +439,7 @@ pub(crate) fn prepare_code_for_soft_wrap(
         content_len: source.len(),
         max_columns,
         soft_wrap: true,
+        algorithm: active_wrap_algorithm().id(),
     };
     let cache = CODE_DISPLAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
@@ -390,7 +524,9 @@ fn extend_visual_width_with_limit(
 ) -> bool {
     while *byte < end {
         let ch = source[*byte..].chars().next().unwrap();
-        let next_width = *width + if ch == '\t' { 4 - (*width % 4) } else { 1 };
+        // 输入是 tab 展开后的文本;列宽按真实渲染步进(CJK/全角 = 2)。
+        // Input is tab-expanded text; columns follow real rendered widths (CJK/fullwidth = 2).
+        let next_width = *width + char_columns(ch);
         if next_width > available {
             return false;
         }
@@ -436,15 +572,13 @@ struct MappedCodeOutput {
 }
 
 fn leading_indent(text: &str, start: usize, end: usize) -> (usize, usize) {
+    // 输入是 tab 展开后的文本,缩进只可能是空格。
+    // Input is tab-expanded text, so indentation can only be spaces.
     let mut byte = start;
     let mut columns = 0;
     while byte < end {
-        let ch = text[byte..].chars().next().unwrap();
-        if ch == ' ' {
+        if text.as_bytes()[byte] == b' ' {
             columns += 1;
-            byte += 1;
-        } else if ch == '\t' {
-            columns += 4 - (columns % 4);
             byte += 1;
         } else {
             break;
@@ -720,6 +854,17 @@ fn append_code_line(
 }
 
 fn format_code_with_style(source: &str, max_columns: usize, style: CodeWrapStyle) -> FormattedCode {
+    // 显示层先展开 tab:折行机制只面对无 tab 文本,列宽即真实渲染宽度;边界最终经
+    // to_source_utf16 映射回原文空间,复制保真不受影响。
+    // Expand tabs on the display layer first so the wrap machinery only sees tab-free text
+    // and column widths equal real rendered widths; boundaries are mapped back into source
+    // space at the end, keeping copies faithful.
+    let expanded = expand_tabs(source);
+    // 原文引用先行保存:下方 source 遮蔽为展开文本,而 map.source 必须是原文。
+    // Keep the original reference first: `source` below is shadowed by the expanded text,
+    // while the map's `source` field must hold the original.
+    let original = source;
+    let source = &expanded.text;
     let offsets = source_utf16_offsets(source);
     let mut output = MappedCodeOutput {
         text: String::new(),
@@ -760,11 +905,19 @@ fn format_code_with_style(source: &str, max_columns: usize, style: CodeWrapStyle
     if style == CodeWrapStyle::Preview && output.text.contains(' ') {
         output.text = output.text.replace(' ', "·");
     }
+    // 边界从"展开文本"空间映射回原文 UTF-16 空间。
+    // Map boundaries from expanded-text space back into original-source space.
+    let expanded_len16 = expanded.text.encode_utf16().count();
+    let boundaries = output
+        .boundaries
+        .into_iter()
+        .map(|boundary| expanded.to_source_utf16[boundary.min(expanded_len16)])
+        .collect();
     FormattedCode {
         text: output.text,
         source_map: DisplaySourceMap {
-            source: source.to_owned(),
-            boundaries: output.boundaries,
+            source: original.to_owned(),
+            boundaries,
         },
     }
 }
@@ -850,7 +1003,7 @@ pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: 
                         let style: *mut AnyObject = msg_send![style, init];
                         let _: () = msg_send![
                             style,
-                            setHeadIndent: previous_indent as f64 * 8.4
+                            setHeadIndent: previous_indent as f64 * CODE_ADVANCE_PT
                         ];
                         let _: () = msg_send![style, setFirstLineHeadIndent: 0.0f64];
                         // 自定义 U+2028 已选择结构断点;像素宽度仍溢出时按字符兜底。
@@ -877,7 +1030,7 @@ pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: 
             let style = *styles.entry(indent).or_insert_with(|| {
                 let style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
                 let style: *mut AnyObject = msg_send![style, init];
-                let _: () = msg_send![style, setHeadIndent: indent as f64 * 8.4];
+                let _: () = msg_send![style, setHeadIndent: indent as f64 * CODE_ADVANCE_PT];
                 let _: () = msg_send![style, setFirstLineHeadIndent: 0.0f64];
                 // 自定义 U+2028 已选择结构断点;像素宽度仍溢出时按字符兜底。
                 // U+2028 already selects structural breaks; fall back by character on pixel overflow.
@@ -922,9 +1075,27 @@ pub(crate) unsafe fn apply_link_color(storage: *mut AnyObject, text: &str, kind:
 
 #[cfg(test)]
 mod tests {
-    use super::{format_code_for_soft_wrap, prepare_code_for_soft_wrap};
+    use super::{
+        char_columns, format_code_for_soft_wrap, prepare_code_for_soft_wrap, CODE_ADVANCE_PT,
+        TAB_STOP_COLUMNS,
+    };
     use objc2_foundation::NSRange;
     use std::sync::Arc;
+
+    /// 按 \n 与 U+2028 切出最终视觉行(与详情渲染的行边界一致)。
+    /// Split into final visual lines by \n and U+2028 (matching the detail rendering).
+    fn visual_segments(text: &str) -> Vec<&str> {
+        text.split(['\n', '\u{2028}']).collect()
+    }
+
+    /// 用 source map 把显示 UTF-16 区间还原为原文切片。
+    /// Map a display UTF-16 range back to a slice of the original source.
+    fn utf16_slice(source: &str, range: NSRange) -> String {
+        let units: Vec<u16> = source.encode_utf16().collect();
+        let start = range.location as usize;
+        let end = start + range.length as usize;
+        String::from_utf16(&units[start..end]).expect("mapped range must stay on char boundaries")
+    }
 
     #[test]
     fn prepared_code_cache_hits_share_the_model() {
@@ -966,5 +1137,83 @@ mod tests {
             .source_map
             .source_range(NSRange::new(0, display_len));
         assert_eq!(source_range.length, source.encode_utf16().count());
+    }
+
+    /// 契约夹具:置顶片段同款的超宽中文注释、行尾注释、tab 缩进与纯 ASCII 长行。
+    /// Contract fixtures: the pinned snippet's over-long CJK comments, a trailing inline
+    /// comment, tab indentation, and a long pure-ASCII line.
+    const CONTRACT_FIXTURES: [&str; 5] = [
+        "// config.rs 在 CONFIG 初始化与 reload 后单向调用 apply_config_locale() 应用配置覆盖。",
+        "/// 中文区分简体/繁体:含 Hant 或区域为 TW/HK/MO 视为繁体;其余(含 Hans、CN、SG、纯 zh)为简体。",
+        "    messages: HashMap<String, String>, // 当前 locale 的扁平 key->string(locale==\"en\" 时与 EN_MESSAGES 相同)",
+        "\tlet value = compute(arg_one, arg_two);\n\t\treturn value.field;",
+        "veryLongObjectName.veryLongMethodName(firstArgument, secondArgument).thirdChainLink;",
+    ];
+
+    /// 核心回归契约:每个视觉段的估算像素宽不得超过详情容器宽(628pt)。
+    /// 修复前 CJK 按 1 列计,这类行被误判"放得下",AppKit 兜底按字符硬切出无标记断点。
+    /// Core regression contract: every visual segment's estimated pixel width must stay
+    /// within the detail container (628pt). Before the fix CJK counted as one column, such
+    /// lines were misjudged as fitting, and AppKit chopped them with unmarked breaks.
+    #[test]
+    fn soft_wrap_segments_stay_within_the_container_pixel_budget() {
+        let container_pt = 628.0;
+        // detail_code_max_columns(640):floor(628/8.66)-4
+        let max_columns = 68;
+        for source in CONTRACT_FIXTURES {
+            let formatted = format_code_for_soft_wrap(source, max_columns);
+            for seg in visual_segments(&formatted.text) {
+                let cols: usize = seg.chars().map(char_columns).sum();
+                assert!(
+                    (cols as f64) * CODE_ADVANCE_PT <= container_pt + f64::EPSILON,
+                    "segment of {cols} columns overflows {container_pt}pt: {seg:?}"
+                );
+                // 段列数同时不得突破预算(续行的前缀预留已在生成时扣除)。
+                // Segment columns must also respect the budget (continuation prefix is
+                // already reserved during generation).
+                assert!(
+                    cols <= max_columns.max(TAB_STOP_COLUMNS),
+                    "segment of {cols} columns exceeds budget {max_columns}: {seg:?}"
+                );
+            }
+        }
+    }
+
+    /// 复制保真契约:整段显示文本经 source map 还原后必须逐字符等于原文。
+    /// Copy-fidelity contract: mapping the whole display text back through the source map
+    /// must reproduce the original character-for-character.
+    #[test]
+    fn soft_wrap_source_map_roundtrips_every_fixture() {
+        for source in CONTRACT_FIXTURES {
+            let formatted = format_code_for_soft_wrap(source, 68);
+            let display_len = formatted.text.encode_utf16().count();
+            let range = formatted
+                .source_map
+                .source_range(NSRange::new(0, display_len));
+            assert_eq!(
+                utf16_slice(&formatted.source_map.source, range),
+                source,
+                "roundtrip must restore the original verbatim"
+            );
+        }
+    }
+
+    /// Tab 展开契约:缩进的显示空格映射回原 tab;选中任意子集不产生错位文本。
+    /// Tab-expansion contract: the expanded indent spaces map back to the original tab, and
+    /// selecting any subset never yields shifted text.
+    #[test]
+    fn expanded_tab_indent_maps_back_to_the_original_tab() {
+        let source = "\tlet x = 1;";
+        let formatted = format_code_for_soft_wrap(source, 48);
+        assert!(
+            formatted.text.starts_with(&" ".repeat(TAB_STOP_COLUMNS)),
+            "leading tab must expand to aligned spaces"
+        );
+        let indent_range = formatted.source_map.source_range(NSRange::new(0, 4));
+        assert_eq!((indent_range.location, indent_range.length), (0, 1));
+        assert_eq!(
+            utf16_slice(&formatted.source_map.source, indent_range),
+            "\t"
+        );
     }
 }

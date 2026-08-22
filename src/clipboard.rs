@@ -57,7 +57,7 @@
 use crate::clipboard_highlight::{
     apply_code_paragraph_styles, apply_link_color, apply_visible_space_markers, classify_text,
     prepare_code_display, prepare_code_for_soft_wrap, DisplaySourceMap, PreparedCodeDisplay,
-    TextKind,
+    TextKind, CODE_ADVANCE_PT,
 };
 use crate::config::CONFIG;
 use crate::event_tap::{
@@ -4717,9 +4717,15 @@ fn detail_max_height(picker: NSRect) -> f64 {
 }
 
 /// 详情代码区可用宽度映射到软换行高度估算列数,不会向显示文本插入字符。
-/// Map the detail code width to soft-wrap sizing columns; no characters are inserted into the display.
+/// 预算基于真实容器宽(滚动视图延伸到面板右缘,故容器 = 面板宽 - 左侧内边距),
+/// 步进用实测值 `CODE_ADVANCE_PT`;SAFETY 抵消取整与字体度量的微小波动。
+/// Map the detail code width to soft-wrap sizing columns; no characters are inserted into
+/// the display. The budget uses the REAL container width (the scroll view extends to the
+/// panel's right edge, so container = panel width - left padding) and the measured
+/// `CODE_ADVANCE_PT`; SAFETY absorbs rounding and small font-metric drift.
 fn detail_code_max_columns(width: f64) -> usize {
-    let columns = ((width - DETAIL_PAD * 2.0) / 8.4).floor().max(0.0) as usize;
+    let container = width - DETAIL_PAD;
+    let columns = (container / CODE_ADVANCE_PT).floor().max(0.0) as usize;
     columns.saturating_sub(DETAIL_CODE_WRAP_SAFETY).max(24)
 }
 
