@@ -3239,32 +3239,6 @@ unsafe fn detail_scroll_range(scroll: *mut AnyObject) -> Option<(f64, f64)> {
     ))
 }
 
-/// 把详情视口钳制到 AppKit 的实时合法范围;用于拦截滚轮相位/惯性造成的端点越界。
-/// Clamp the detail viewport to AppKit's live legal range, intercepting endpoint overscroll
-/// caused by wheel phases or momentum.
-unsafe fn clamp_detail_scroll(scroll: *mut AnyObject) {
-    let Some((min_y, max_y)) = detail_scroll_range(scroll) else {
-        return;
-    };
-    let clip: *mut AnyObject = msg_send![scroll, contentView];
-    let bounds: NSRect = msg_send![clip, bounds];
-    let clamped_y = bounds.origin.y.clamp(min_y, max_y);
-    if (clamped_y - bounds.origin.y).abs() > f64::EPSILON {
-        log_debug!(
-            "[clip] clamped detail scroll: {:.1} -> {:.1} ({:.1}..{:.1})",
-            bounds.origin.y,
-            clamped_y,
-            min_y,
-            max_y
-        );
-        let _: () = msg_send![
-            clip,
-            setBoundsOrigin: NSPoint::new(bounds.origin.x, clamped_y)
-        ];
-        let _: () = msg_send![scroll, reflectScrolledClipView: clip];
-    }
-}
-
 /// 无条件滚到 AppKit 计算出的真实顶部,而不是假设顶部 y=0。
 /// Scroll unconditionally to AppKit's actual constrained top instead of assuming y=0.
 unsafe fn scroll_detail_to_top(scroll: *mut AnyObject) {
@@ -3280,24 +3254,31 @@ unsafe fn scroll_detail_to_top(scroll: *mut AnyObject) {
     let _: () = msg_send![scroll, reflectScrolledClipView: clip];
 }
 
-/// 详情原生滚动视图的 bounds 变化:硬钳制两端,不允许弹性越界。
-/// Bounds changes from the detail's native scroll view: hard-clamp both endpoints and disallow
-/// elastic overscroll.
+/// 详情原生滚动视图的 bounds 变化 → 只更新自定义滚动条胶囊。端点越界(橡皮筋)
+/// 属于原生 elasticity 的职责,绝不能在这里改写 clipView bounds——手势进行中的
+/// 同步硬钳会污染 NSScrollView 的动量累加基准,让后续惯性事件从脏基准重新施加
+/// delta,两端反复拉锯直到惯性耗尽,屏幕上就是滚动条"抽搐一下"。橡皮筋期间
+/// 指示器几何把进度 clamp 到 0..1,滑块自然钉在端点,与系统滚动条表现一致。
+/// Bounds changes from the detail's native scroll view -> update the custom capsule
+/// indicators only. Endpoint overscroll (rubber banding) is native elasticity's job and
+/// must never be answered by rewriting the clip-view bounds here -- a synchronous hard
+/// clamp mid-gesture poisons NSScrollView's momentum base, so each following momentum
+/// event reapplies its delta from the stale base and the two systems fight until the decay
+/// ends (the on-screen scrollbar twitch). During rubber banding the indicator geometry
+/// clamps progress to 0..1, so the thumb pins at the endpoint just like a system scroller.
 extern "C" fn detail_scroll_indicator_bounds_changed(
     _self: *mut c_void,
     _cmd: Sel,
     _note: *mut c_void,
 ) {
-    let detail_scroll = *DETAIL_SCROLL_VIEW.lock().unwrap();
-    if let Some(scroll) = detail_scroll {
-        unsafe {
-            clamp_detail_scroll(scroll.0);
-            update_scroll_indicator_for(ScrollTarget::Detail);
-            update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
-        };
+    // update_scroll_indicator_for 内部自取 DETAIL_SCROLL_VIEW,视图不存在时会静默返回。
+    // update_scroll_indicator_for reads DETAIL_SCROLL_VIEW itself and returns silently
+    // when the view is gone.
+    unsafe {
+        update_scroll_indicator_for(ScrollTarget::Detail);
+        update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
     }
 }
-
 /// "清除全部"按钮回调:清空剪贴板历史并关闭浮窗(空历史呼出会被忽略)。
 /// "Clear all" button callback: empty the clipboard history and close the picker (an empty
 /// history is ignored on summon).
@@ -5005,6 +4986,8 @@ extern "C" fn detail_text_view_draw_rect(_self: *mut c_void, _cmd: Sel, rect: NS
     }
 }
 
+// ========== 详情滚动视图 ==========
+
 unsafe fn add_detail_text(
     content: *mut AnyObject,
     text: &str,
@@ -5016,7 +4999,6 @@ unsafe fn add_detail_text(
 ) {
     let is_code = kind == TextKind::Code;
     debug_assert!(!code_soft_wrap || (is_code && prepared_code.is_some()));
-    let avail_w = w - DETAIL_PAD * 2.0;
     // 滚动视图向右延伸到面板边缘,文本视图内部保留右侧内边距给原生 overlay scroller。
     // Extend the scroll view to the panel edge and keep right padding inside the text view for
     // the native overlay scroller.
@@ -5051,8 +5033,18 @@ unsafe fn add_detail_text(
     if !clip_view.is_null() {
         let _: () = msg_send![clip_view, setDrawsBackground: false];
     }
-    let _: () = msg_send![scroll, setVerticalScrollElasticity: 1isize]; // NSScrollElasticityNone
-    let _: () = msg_send![scroll, setHorizontalScrollElasticity: 1isize];
+    // 端点橡皮筋完全交给原生 elasticity(Automatic:内容溢出的方向才回弹)。
+    // 千万不要在 bounds 通知里硬钳越界原点来"关闭"它——手势进行中改写 clipView
+    // 会污染 NSScrollView 的动量累加基准,后续惯性事件从脏基准重新施加 delta,
+    // 与硬钳反复拉锯,滚动条就会在端点抽搐(见 detail_scroll_indicator_bounds_changed)。
+    // Endpoint rubber banding is left entirely to native elasticity (Automatic: bounces
+    // only on axes whose content overflows). Never "disable" it by hard-clamping
+    // out-of-range origins inside the bounds notification -- rewriting the clip view
+    // mid-gesture poisons NSScrollView's momentum base, so following momentum events
+    // reapply their deltas from the stale base and fight the clamp, making the scrollbar
+    // twitch at the endpoints (see detail_scroll_indicator_bounds_changed).
+    let _: () = msg_send![scroll, setVerticalScrollElasticity: 0isize]; // NSScrollElasticityAutomatic
+    let _: () = msg_send![scroll, setHorizontalScrollElasticity: 0isize];
 
     // 软换行关闭时保留原文宽度并启用横向滚动;开启时继续使用 U+2028 显示模型,不显示
     // 横向滚动条。
@@ -5070,9 +5062,16 @@ unsafe fn add_detail_text(
     // source or boundary array.
     *DETAIL_SOURCE_MAP.lock().unwrap() = prepared.and_then(|code| code.source_map.clone());
     let tv: *mut AnyObject = msg_send![detail_text_view_class(), alloc];
+    // 宽度必须等于安装后的真实宽度(scroll_w = clip 宽)。用更窄的 avail_w 构建,
+    // NSClipView 装 doc 时会把它拉伸到 scroll_w,宽度差迫使 TextKit 显示时整体重排,
+    // 并触发把视口拖离顶部的滚动动画(→ 打开后滚动条不在最顶的根因)。
+    // The width must equal the real post-install width (scroll_w = clip width). Building
+    // narrower (avail_w) makes NSClipView stretch the document view on install; the width
+    // delta forces a full TextKit re-layout at display time and spawns the scroll animation
+    // that drags the viewport away from the top (the scrollbar-not-at-top-after-open bug).
     let tv: *mut AnyObject = msg_send![
         tv,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(avail_w, body_h))
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(scroll_w, body_h))
     ];
     *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = code_soft_wrap.then_some(ObjPtr(tv));
     // 详情必须在显示前完成完整布局。非连续/后台布局会在面板出现后分批增大
@@ -5138,7 +5137,9 @@ unsafe fn add_detail_text(
     // full usedRect. Leaving NSTextView vertically resizable after display would still mutate
     // its frame asynchronously and push the viewport away from the top.
     let _: () = msg_send![text_container, setWidthTracksTextView: !no_wrap];
-    let container_w = if no_wrap { 1_000_000_000.0 } else { avail_w };
+    // 与安装后的真实宽度保持一致(见上方 initWithFrame 的说明)。
+    // Keep this consistent with the real post-install width (see the initWithFrame note above).
+    let container_w = if no_wrap { 1_000_000_000.0 } else { scroll_w };
     let _: () = msg_send![
         text_container,
         setContainerSize: NSSize::new(container_w, 1_000_000_000.0)
@@ -5150,9 +5151,9 @@ unsafe fn add_detail_text(
     let document_w = if no_wrap {
         (used.origin.x + used.size.width + DETAIL_PAD)
             .ceil()
-            .max(avail_w)
+            .max(scroll_w)
     } else {
-        avail_w
+        scroll_w
     };
     let document_h = (used.origin.y + used.size.height + ROW_PAD_TOP * 2.0)
         .ceil()
@@ -5164,10 +5165,12 @@ unsafe fn add_detail_text(
     release_obj(tv);
     *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr(tv));
 
-    // 详情滚动条由自定义胶囊绘制;bounds 通知仍负责把滚轮/惯性产生的临时越界硬钳回
-    // AppKit 实时合法范围。
-    // Detail scrollbars are drawn by the custom capsules; bounds notifications still hard-clamp
-    // transient wheel/momentum overscroll to AppKit's live legal range.
+    // 详情滚动条由自定义胶囊绘制;bounds 通知只负责刷新胶囊位置,端点橡皮筋由原生
+    // elasticity 处理,这里绝不改写 bounds(改写会在手势中与动量拉锯,导致抽搐)。
+    // Detail scrollbars are drawn by the custom capsules; the bounds notification only
+    // refreshes capsule positions. Endpoint rubber banding is handled by native
+    // elasticity -- never rewrite bounds here (doing so fights momentum mid-gesture and
+    // causes the endpoint twitch).
     let clip: *mut AnyObject = msg_send![scroll, contentView];
     let _: () = msg_send![clip, setPostsBoundsChangedNotifications: true];
     let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
@@ -8958,10 +8961,10 @@ pub(crate) fn smoke_runner() -> bool {
         // A source-less entry: the header shows "unknown source", no icon.
         record_text(&mut hist, "legacy entry without a source", "", "", 50);
         // 长代码紧邻最新图片:→ 打开图片后按 ↓ 会切到真正溢出的软换行详情,覆盖
-        // 自定义软换行、完整 TextKit 布局、原生 scroller、顶部复位和两端硬钳制。
+        // 自定义软换行、完整 TextKit 布局、原生 scroller、顶部复位和两端橡皮筋状态。
         // Long code next to the newest image means Down after opening the image reaches a
         // genuinely overflowing soft-wrapped detail, covering custom wrapping, full TextKit
-        // layout, the native scroller, top reset, and hard clamping at both endpoints.
+        // layout, the native scroller, top reset, and rubber-band state at both endpoints.
         record_text(
             &mut hist,
             &"fn detail_scrolling_regression() { let result = service.fetch(first_argument, second_argument) && enabled; }\n".repeat(200),
@@ -9103,10 +9106,12 @@ pub(crate) fn smoke_runner() -> bool {
                 "the detail must stay open while navigating"
             );
             // 溢出文本详情必须使用稳定的完整布局 + 原生 scroller,打开即处于 AppKit
-            // 真实顶部。再模拟 bounds 越过上下端点,通知回调必须立即钳回。
+            // 真实顶部。再模拟 bounds 越过上下端点,通知回调只刷新胶囊、绝不能改写
+            // clipView(橡皮筋是原生 elasticity 的职责)。
             // An overflowing text detail must use stable full layout plus the native scroller
             // and open at AppKit's actual top. Simulate bounds crossing both endpoints; the
-            // notification callback must clamp them immediately.
+            // notification callback only refreshes the capsules and must never rewrite the
+            // clip view (rubber banding is native elasticity's job).
             let wrapped_scroll = DETAIL_SCROLL_VIEW
                 .lock()
                 .unwrap()
@@ -9220,9 +9225,22 @@ pub(crate) fn smoke_runner() -> bool {
                 "detail keeps native scroller auto-hide enabled as a defensive fallback"
             );
             assert_eq!(scroller_style, 1, "detail must use overlay scrollers");
-            assert_eq!(elasticity, 1, "detail elasticity must be disabled");
+            // 0 = NSScrollElasticityAutomatic:端点橡皮筋是原生职责,bounds 通知里
+            // 严禁改写 clipView(硬钳会与动量拉锯导致滚动条抽搐)。
+            // 0 = NSScrollElasticityAutomatic: endpoint rubber banding is native; the
+            // bounds notification must never rewrite the clip view (hard-clamping fights
+            // momentum and twitches the scrollbar).
+            assert_eq!(
+                elasticity, 0,
+                "detail must keep native automatic rubber-band elasticity"
+            );
             assert!(!noncontiguous, "detail layout must be contiguous");
             assert!(!background, "detail background layout must be disabled");
+            // 越界原点是橡皮筋的合法状态:bounds 通知回调只刷新胶囊,绝不能改写
+            // clipView——两端各验证一次"回调后越界原点保持原样"。
+            // Out-of-range origins are legal rubber-band state: the notification callback
+            // only refreshes capsules and must not touch the clip view -- verified at both
+            // endpoints by asserting the overscrolled origin survives the callback.
             let _: () = msg_send![
                 detail_clip,
                 setBoundsOrigin: NSPoint::new(opened_bounds.origin.x, min_y - 30.0)
@@ -9233,7 +9251,11 @@ pub(crate) fn smoke_runner() -> bool {
                 std::ptr::null_mut(),
             );
             let top_bounds: NSRect = msg_send![detail_clip, bounds];
-            assert_eq!(top_bounds.origin.y, min_y, "top overscroll must clamp");
+            assert_eq!(
+                top_bounds.origin.y,
+                min_y - 30.0,
+                "top overscroll belongs to native rubber banding and must survive"
+            );
             let _: () = msg_send![
                 detail_clip,
                 setBoundsOrigin: NSPoint::new(opened_bounds.origin.x, max_y + 30.0)
@@ -9245,8 +9267,9 @@ pub(crate) fn smoke_runner() -> bool {
             );
             let bottom_bounds: NSRect = msg_send![detail_clip, bounds];
             assert_eq!(
-                bottom_bounds.origin.y, max_y,
-                "bottom overscroll must clamp"
+                bottom_bounds.origin.y,
+                max_y + 30.0,
+                "bottom overscroll belongs to native rubber banding and must survive"
             );
             scroll_detail_to_top(detail_scroll);
             // ←:详情打开时直接置顶当前选中条目,详情保持打开并跟随重排后的位置。
