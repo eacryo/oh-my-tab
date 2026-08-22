@@ -4278,42 +4278,121 @@ unsafe fn add_detail_separator(content: *mut AnyObject, y: f64, width: f64) {
 unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
     let enabled = DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
     let share_x = width - 42.0;
-
-    // 使用 AppKit 原生 NSSwitch,让轨道、滑块和点击反馈完全跟随当前 macOS。
-    // Use AppKit's native NSSwitch so its track, thumb, and press feedback follow the current macOS.
-    let toggle: *mut AnyObject = msg_send![class!(NSSwitch), alloc];
-    let toggle: *mut AnyObject = msg_send![
-        toggle,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
+    // 自绘迷你开关(轨道 + 白色滑块两层 CALayer)。详情面板是非激活 NSPanel
+    // (canBecomeKeyWindow = false),AppKit 对非 key 窗口的原生控件统一降饱和——
+    // 系统 NSSwitch 在这里永远画不出蓝色开启态;层颜色由我们直接设置,与焦点无关。
+    // Custom-drawn mini switch (track layer + white knob sublayer). The detail panel is a
+    // passive non-activating NSPanel (canBecomeKeyWindow = false); AppKit desaturates native
+    // controls in non-key windows, so a stock NSSwitch never shows its blue on-state here.
+    // Layer colors are set directly and are immune to focus state.
+    const TRACK_W: f64 = 40.0;
+    const TRACK_H: f64 = 20.0;
+    let x = share_x - 8.0 - TRACK_W;
+    let y = (DETAIL_TOOLBAR_H - TRACK_H) / 2.0;
+    let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    let button: *mut AnyObject = msg_send![
+        button,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(TRACK_W, TRACK_H))
     ];
-    let _: () = msg_send![toggle, setControlSize: 2isize]; // NSControlSizeMini
-    let _: () = msg_send![toggle, setState: if enabled { 1isize } else { 0isize }];
-    let _: () = msg_send![toggle, sizeToFit];
-    let switch_frame: NSRect = msg_send![toggle, frame];
-    let switch_x = share_x - 9.0 - switch_frame.size.width;
-    let switch_y = (DETAIL_TOOLBAR_H - switch_frame.size.height) / 2.0;
-    let _: () = msg_send![toggle, setFrameOrigin: NSPoint::new(switch_x, switch_y)];
-    let _: () = msg_send![toggle, setTarget: observer()];
-    let _: () = msg_send![toggle, setAction: sel!(toggleDetailSoftWrap:)];
-    let tooltip = make_nsstring(&t("clipboard.detail_soft_wrap"));
-    let _: () = msg_send![toggle, setToolTip: tooltip];
+    let empty = make_nsstring("");
+    let _: () = msg_send![button, setTitle: empty];
+    CFRelease(empty as *const c_void);
+    let _: () = msg_send![button, setBordered: false];
+    let _: () = msg_send![button, setTarget: observer()];
+    let _: () = msg_send![button, setAction: sel!(toggleDetailSoftWrap:)];
+    let _: () = msg_send![button, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    let _: () = msg_send![layer, setCornerRadius: TRACK_H / 2.0];
+    apply_wrap_control_style(button, false);
+    let tooltip_key = if enabled {
+        "clipboard.detail_soft_wrap_on"
+    } else {
+        "clipboard.detail_soft_wrap_off"
+    };
+    let tooltip = make_nsstring(&t(tooltip_key));
+    let _: () = msg_send![button, setToolTip: tooltip];
     CFRelease(tooltip as *const c_void);
-    let _: () = msg_send![content, addSubview: toggle];
-    release_obj(toggle);
+    add_hover_tracking(button);
+    let _: () = msg_send![content, addSubview: button];
+    release_obj(button);
 
+    // 标签置于开关左侧并右对齐;透明度提到 0.5,与开关的从属关系更清楚。
+    // Label sits left of the switch, right-aligned; alpha raised to 0.5 so the
+    // label-to-switch association reads clearly.
     let label_ns = make_nsstring(&t("clipboard.detail_soft_wrap"));
     let label: *mut AnyObject = msg_send![class!(NSTextField), labelWithString: label_ns];
     CFRelease(label_ns as *const c_void);
     let _: () = msg_send![label, setFrame: NSRect::new(
-        NSPoint::new(switch_x - 77.0, 14.0),
+        NSPoint::new(x - 6.0 - 70.0, 14.0),
         NSSize::new(70.0, 16.0)
     )];
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
-    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.36f64];
+    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.5f64];
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight
+    release_obj(font);
+    release_obj(color);
     let _: () = msg_send![content, addSubview: label];
+}
+
+/// 软换行开关的状态绘制(读 `DETAIL_SOFT_WRAP_ENABLED`,hover 由悬停回调传入)。
+/// 按钮自身图层即轨道(圆角已在创建时设为高度一半);首个子层是白色滑块,不存在则
+/// 创建。开启 = 主题蓝轨道 + 滑块居右;关闭 = 灰轨道 + 滑块居左;悬停整体加深一档。
+/// 颜色直接写层背景,与非 key 面板的降饱和渲染无关。
+/// State drawing for the wrap switch (reads `DETAIL_SOFT_WRAP_ENABLED`; hover comes from
+/// the tracking callbacks). The button's own layer IS the track (corner radius was set to
+/// half its height at creation); its first sublayer is the white knob, created on demand.
+/// On = accent-blue track with the knob at the right; off = grey track, knob left; hover
+/// deepens whichever state is showing. Colors go straight onto layer backgrounds and are
+/// unaffected by the non-key panel's desaturated control rendering.
+unsafe fn apply_wrap_control_style(button: *mut AnyObject, hovered: bool) {
+    let enabled = DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
+    let layer: *mut AnyObject = msg_send![button, layer];
+    let track_hex: u32 = match (enabled, hovered) {
+        (true, false) => 0x205BA6,
+        (true, true) => 0x1A4A85,
+        (false, false) => 0x00000029,
+        (false, true) => 0x00000038,
+    };
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(track_hex));
+
+    // 滑块:白色圆形子层,存在则复用,否则新建并挂到轨道上。
+    // Knob: a white circular sublayer, reused when present, created on demand.
+    let sublayers: *mut AnyObject = msg_send![layer, sublayers];
+    let count: usize = if sublayers.is_null() {
+        0
+    } else {
+        msg_send![sublayers, count]
+    };
+    let knob: *mut AnyObject = if count > 0 {
+        msg_send![sublayers, objectAtIndex: 0usize]
+    } else {
+        let knob_new: *mut AnyObject = msg_send![class!(CALayer), layer];
+        let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
+        // 背景色必须走 ffi::layer_set_background:直接 msg_send 传 CGColorRef
+        // 会因类型编码(^v vs ^{CGColor=})触发 objc2 的调试期校验 panic。
+        // The background must go through ffi::layer_set_background -- sending a CGColorRef
+        // through plain msg_send trips objc2's debug encoding check (^v vs ^{CGColor=}).
+        crate::ffi::layer_set_background(knob_new, crate::ffi::ns_color_to_cg(white));
+        let _: () = msg_send![layer, addSublayer: knob_new];
+        knob_new
+    };
+    // 几何:滑块直径 = 轨道高 − 4,上下留 2pt;开启居右、关闭居左,半径随直径走。
+    // Geometry: knob diameter = track height - 4 with a 2pt inset; right side when on,
+    // left when off; radius always follows the diameter.
+    let frame: NSRect = msg_send![button, frame];
+    let knob_d = frame.size.height - 4.0;
+    let knob_x = if enabled {
+        frame.size.width - knob_d - 2.0
+    } else {
+        2.0
+    };
+    let _: () = msg_send![knob, setCornerRadius: knob_d / 2.0];
+    let _: () = msg_send![knob, setFrame: NSRect::new(
+        NSPoint::new(knob_x, 2.0),
+        NSSize::new(knob_d, knob_d)
+    )];
 }
 
 /// 按 preview (5).html 的三段 SVG path 绘制分享图标,不使用 SF Symbol 的变体。
@@ -4402,8 +4481,11 @@ unsafe fn detail_wrap_button(content: *mut AnyObject) -> *mut AnyObject {
     let count: usize = msg_send![subviews, count];
     for index in 0..count {
         let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        let is_switch: bool = msg_send![view, isKindOfClass: class!(NSSwitch)];
-        if is_switch {
+        // 软换行控件现在是状态胶囊按钮(hover_button_class 实例),按 action 定位。
+        // The wrap control is now a state capsule (a hover_button_class instance); locate it
+        // by its action.
+        let action: Sel = msg_send![view, action];
+        if action == sel!(toggleDetailSoftWrap:) {
             return view;
         }
     }
@@ -8173,6 +8255,10 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
             set_detail_share_style(b, 0.68, 0x0000000D);
             return;
         }
+        if action == sel!(toggleDetailSoftWrap:) {
+            apply_wrap_control_style(b, true);
+            return;
+        }
         if action == sel!(showItemDetails:) {
             let tag: isize = msg_send![b, tag];
             let active = tag >= 0
@@ -8249,6 +8335,10 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_
         let action: Sel = msg_send![b, action];
         if action == sel!(detailSharePlaceholder:) {
             set_detail_share_style(b, 0.34, 0x00000000);
+            return;
+        }
+        if action == sel!(toggleDetailSoftWrap:) {
+            apply_wrap_control_style(b, false);
             return;
         }
         if action == sel!(filterPillClicked:) {
