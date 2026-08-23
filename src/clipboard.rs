@@ -5924,6 +5924,40 @@ fn visible_selection_for_text(
         .position(|&idx| idx == history_idx)
 }
 
+/// 悬停样式门禁(纯函数,单测覆盖):指针不在浮窗窗口内时,悬停索引一律按无效
+/// 处理(NO_SELECTION)。HOVER_ROW 只反映最后一次 enter/exited 事件,事件丢失
+/// (REBUILDING 抑制、跨面板穿越、行视图拆除)会让它冻结成残留值——重建时套到
+/// 新行上就是幽灵悬停底。
+/// The hover-style gate (pure; unit-tested): when the pointer is outside the picker
+/// window, the hover index is always treated as invalid (NO_SELECTION). HOVER_ROW only
+/// mirrors the last enter/exited event -- lost events (REBUILDING suppression, cross-panel
+/// transitions, row teardown) can freeze it into a stale value that would paint a phantom
+/// hover fill onto rebuilt rows.
+fn effective_hover_row(pointer_in_window: bool, hover_row: usize) -> usize {
+    if pointer_in_window {
+        hover_row
+    } else {
+        NO_SELECTION
+    }
+}
+
+/// 指针当前是否位于浮窗窗口内。NSEvent.mouseLocation 与窗口 frame 同为全局屏坐标
+/// (底部原点),可直接包含判定。
+/// Whether the pointer is currently inside the picker window. NSEvent.mouseLocation and
+/// the window frame share global screen coordinates (bottom-left origin), so containment
+/// is a direct comparison.
+unsafe fn pointer_in_picker_window() -> bool {
+    let Some(w) = *PICKER_WINDOW.lock().unwrap() else {
+        return false;
+    };
+    let frame: NSRect = msg_send![w.0, frame];
+    let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+    mouse.x >= frame.origin.x
+        && mouse.x <= frame.origin.x + frame.size.width
+        && mouse.y >= frame.origin.y
+        && mouse.y <= frame.origin.y + frame.size.height
+}
+
 /// 详情内复制后立即重建已打开的历史列表。不能等下一次呼出:轮询虽会写入内存,
 /// 但已建好的行视图不会自行读取新历史。重建前恢复源详情的选择,避免新片段插到顶部后
 /// 高亮改指向新条目而右侧仍显示旧详情。
@@ -5935,6 +5969,14 @@ fn refresh_open_picker_after_detail_copy(source_detail_text: Option<&str>) {
     if !PICKER_VISIBLE.load(Ordering::SeqCst) {
         return;
     }
+    // 本流程指针定义上在详情面板上,列表悬停不可能成立;显式清掉 HOVER_ROW,
+    // 防止重建把残留值套到新插入的顶部条目上(幽灵悬停底)。第二道保险——
+    // rebuild_rows 的指针门禁是主防线。
+    // The pointer is by definition over the detail panel in this flow, so no list hover
+    // can exist; clear HOVER_ROW explicitly so the rebuild never paints a stale value onto
+    // the newly inserted top entry (the phantom hover fill). A second line of defense --
+    // the pointer gate in rebuild_rows is the primary one.
+    *HOVER_ROW.lock().unwrap() = NO_SELECTION;
     if let Some(text) = source_detail_text {
         let selection = {
             let history = CLIP_HISTORY.lock().unwrap();
@@ -6775,7 +6817,18 @@ unsafe fn rebuild_rows() {
     // 鼠标悬停行(与选中独立:键盘导航时鼠标停在别的行上 → 两态并存)。
     // The hovered row (independent of the selection: with keyboard navigation the mouse
     // may park on another row -> both states coexist, like the mockup's :hover/.selected).
-    let hover_idx = *HOVER_ROW.lock().unwrap();
+    // 悬停门禁:指针不在浮窗窗口内时悬停必然不成立(enter/exited 事件可能被
+    // REBUILDING 抑制或跨面板穿越吞掉,HOVER_ROW 会冻结成残留值),按 NO_SELECTION
+    // 渲染并把静态值归位自愈——否则重建会把幽灵悬停底套到新行上。
+    // Hover gate: when the pointer is outside the picker window a hover cannot be valid
+    // (enter/exited events may be suppressed by REBUILDING or swallowed across panels,
+    // freezing HOVER_ROW into a stale value) -- render without hover and reset the static
+    // to self-heal, otherwise rebuilds would paint phantom hover fills onto fresh rows.
+    let mut hover_idx = *HOVER_ROW.lock().unwrap();
+    if !unsafe { pointer_in_picker_window() } {
+        hover_idx = effective_hover_row(false, hover_idx);
+        *HOVER_ROW.lock().unwrap() = hover_idx;
+    }
     // 读一次配置:meta 行是否显示应用名(记录始终进行,开关只控制名称)。
     // Read the toggle once: whether the meta line shows the app name (recording never
     // stops; the toggle only gates the name).
@@ -9999,8 +10052,9 @@ unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
 #[cfg(test)]
 mod tests {
     use super::{
-        detail_result_still_wanted, scroll_indicator_geometry, ClipEntry, ImageEntry,
-        NSPASTEBOARD_TYPE_PNG, SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE,
+        detail_result_still_wanted, effective_hover_row, scroll_indicator_geometry, ClipEntry,
+        ImageEntry, NO_SELECTION, NSPASTEBOARD_TYPE_PNG, SCROLL_INDICATOR_CORNER_RESERVE,
+        SCROLL_INDICATOR_EDGE,
     };
 
     #[test]
@@ -10035,6 +10089,21 @@ mod tests {
         assert!(!wanted(true, None, 42));
         // 面板已关闭(含随主浮窗隐藏)/ panel closed (incl. hidden with the picker).
         assert!(!wanted(false, Some(42), 42));
+    }
+
+    /// 悬停门禁真值表:指针在窗内 → 原样保留悬停索引(含无选中哨兵);
+    /// 指针不在窗内 → 一律归位 NO_SELECTION(幽灵悬停底修复)。
+    //  Truth table for the hover gate: pointer inside -> keep the hover index as-is
+    //  (including the no-selection sentinel); pointer outside -> always reset to
+    //  NO_SELECTION (the phantom hover fill fix).
+    #[test]
+    fn effective_hover_row_requires_pointer_inside() {
+        assert_eq!(effective_hover_row(true, 3), 3);
+        assert_eq!(effective_hover_row(true, 0), 0);
+        assert_eq!(effective_hover_row(true, NO_SELECTION), NO_SELECTION);
+        assert_eq!(effective_hover_row(false, 0), NO_SELECTION);
+        assert_eq!(effective_hover_row(false, 7), NO_SELECTION);
+        assert_eq!(effective_hover_row(false, NO_SELECTION), NO_SELECTION);
     }
 
     /// 测试用的 3 参便捷包装(来源与图标键留空,既有用例不受签名变化影响)。
