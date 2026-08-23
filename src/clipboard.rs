@@ -18,7 +18,8 @@
 //!   (不同路径同字节)去重成一条。行内显示缩略图,text 存文件名(可搜索)。
 //!   启动时清空缓存目录(历史不持久化,残留必为孤儿),删除条目/清空/超上限裁剪时
 //!   联动删除对应缓存文件。详情浮窗的大图另存 `{hash}.detail`(最长边 ≤1280px,
-//!   首次打开详情时懒生成,内存不常驻),随条目删除/清空/裁剪一并清理。
+//!   录制时后台预生成,首开 miss 兜底生成;内存不常驻),随条目删除/清空/裁剪一并
+//!   清理。
 //!
 //! History clipboard module (text + images, optional persistence).
 //!
@@ -51,8 +52,8 @@
 //!   thumbnail, and `text` holds the filename (searchable). The cache dir is wiped at
 //!   startup when persistence is off; when persistence is on, a reference-based sweep
 //!   removes orphan files. Files are also removed in sync with delete/clear-all/trim. A separate `{hash}.detail` preview (longest
-//!   edge <= 1280px, generated lazily on the first detail open, never held in RAM) feeds the
-//!   detail panel and shares the same deletion lifecycle.
+//!   edge <= 1280px, pregenerated in the background at record time with a first-open
+//!   fallback, never held in RAM) feeds the detail panel and shares the same deletion lifecycle.
 
 use crate::clipboard_highlight::{
     apply_code_paragraph_styles, apply_link_color, apply_visible_space_markers, classify_text,
@@ -524,6 +525,22 @@ static DETAIL_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 static DETAIL_CONTENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// 详情浮窗是否可见 / whether the detail panel is visible.
 static DETAIL_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// 详情高清预览单槽:后台线程刚生成的 ≤1280px PNG(hash, bytes)。show_detail_for_sel
+/// 取数的第一优先级——命中即消费清空,避免再读盘;未命中走磁盘缓存/480 预览。
+/// 单槽有界(~2MB),被下一条目投递覆盖;过期内容由 detail_preview_ready 清空。
+/// The single slot for a freshly generated <=1280px hi-res detail preview (hash, bytes).
+//  First priority in show_detail_for_sel's byte lookup -- consumed (cleared) on a hash
+//  match so the disk is never re-read; misses fall through to the disk cache / 480px
+//  preview. Bounded to one entry (~2MB), overwritten by the next delivery; stale content
+//  is dropped by detail_preview_ready.
+static DETAIL_PENDING_HD: Mutex<Option<(u64, Vec<u8>)>> = Mutex::new(None);
+/// 在途详情预览生成任务(hash 集合):录制预生成与首开按需投递共用,防止同一内容
+/// 重复入队(↑↓ 折返、录制+首开竞态)。工作线程处理完(含跳过)即移除。
+/// In-flight detail-preview generation jobs (hash set): shared by record-time pregen and
+/// first-open on-demand requests so the same content never queues twice (arrow-key bounce,
+/// record+open races). The worker removes an entry once its job finishes (including skips).
+static DETAIL_INFLIGHT: LazyLock<Mutex<HashSet<u64>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 /// 代码详情软换行开关,会话内保持;关闭后使用原文和原生横向滚动条。
 /// Code-detail soft-wrap toggle, retained for the session; when off, raw text uses the native
 /// horizontal scroller.
@@ -1503,9 +1520,9 @@ fn cache_read_preview(hash: u64) -> Option<Vec<u8>> {
     std::fs::read(clip_image_preview_path(hash)).ok()
 }
 
-/// hash → 详情预览文件路径(→ 展开详情的大图;懒生成,首次打开时落盘)。
-/// hash -> the detail-preview path (the big image shown by the → detail panel; generated
-/// lazily and cached on the first open).
+/// hash → 详情预览文件路径(→ 展开详情的大图;录制时后台预生成,首开 miss 兜底)。
+/// hash -> the detail-preview path (the big image shown by the → detail panel;
+/// pregenerated in the background at record time, with a first-open fallback).
 fn clip_image_detail_path(hash: u64) -> std::path::PathBuf {
     clip_image_cache_dir().join(format!("{hash:016x}.detail"))
 }
@@ -1533,39 +1550,205 @@ fn cache_write_detail_preview(hash: u64, png: &[u8]) -> bool {
     ok
 }
 
-/// 为图片条目生成详情预览字节(懒生成 + 落盘,内存模型不变——RAM 仍只存 480px
-/// 缩略图):数据条目从缓存原始字节生成;文件复制条目**临时读源文件**、生成后即弃
-/// (不落字节,同粘贴的引用语义);两者都不可得 → 回退内存预览;预览也空 → None。
-/// 生成成功即写缓存,下次打开直接读盘,不重复解码。
+/// 详情预览后台任务的时效判定(纯函数,单测覆盖):仅当详情可见**且**当前选中
+/// 条目就是任务条目时,生成结果才值得刷新到 UI。预生成任务(录制时投递)不做
+/// 此检查——它们只为落盘缓存,与选中态无关。
+/// Freshness predicate for background detail-preview jobs (pure; unit-tested): the
+/// result is worth swapping into the UI only when the detail panel is visible AND the
+/// currently selected entry IS the job's entry. Pregen jobs (enqueued at record time)
+/// skip this check -- they only populate the disk cache and never touch the selection.
+fn detail_result_still_wanted(
+    detail_visible: bool,
+    current_hash: Option<u64>,
+    job_hash: u64,
+) -> bool {
+    detail_visible && current_hash == Some(job_hash)
+}
+
+/// 当前选中图片条目的 hash(工作线程也会调用;全部经 Mutex,跨线程安全)。
+/// 无选中 / 条目非图片 → None。
+/// The selected image entry's hash (also called from the worker thread; everything goes
+/// through Mutexes, so this is thread-safe). None without a selection / for text entries.
+fn detail_current_hash() -> Option<u64> {
+    let sel = *PICKER_SELECTION.lock().unwrap();
+    if sel == NO_SELECTION {
+        return None;
+    }
+    let h_idx = mapped_index(sel)?;
+    let hist = CLIP_HISTORY.lock().unwrap();
+    hist.get(h_idx)
+        .and_then(|e| e.image.as_ref())
+        .map(|i| i.hash)
+}
+
+/// 后台详情预览任务:从数据缓存/源文件生成 ≤1280px 的 `{hash}.detail` 并原子落盘。
+/// deliver = true 表示任务源自"首开 miss"(完成后需尝试刷新 UI);false = 录制/
+/// 加载预热(只落盘,不动 UI)。
+/// A background detail-preview job: generate the <=1280px `{hash}.detail` from the data
+/// cache / source file and write it atomically. deliver = true means the job originated
+/// from a first-open miss (try to refresh the UI afterwards); false = record/load warm-up
+/// (cache only, no UI interaction).
+struct DetailPreviewJob {
+    hash: u64,
+    source_path: Option<String>,
+    deliver: bool,
+}
+
+/// 详情预览工作线程的发件端(懒启动常驻循环)。flume recv 阻塞等待;线程随进程
+/// 退出,无需停机协议(tmp+rename 原子写,中断无害)。
+/// The sender side of the detail-preview worker (a lazily started persistent loop).
+//  flume recv blocks between jobs; the thread dies with the process (no shutdown
+//  protocol needed -- tmp+rename writes are atomic and interruption-safe).
+fn detail_job_sender() -> flume::Sender<DetailPreviewJob> {
+    static SENDER: OnceLock<flume::Sender<DetailPreviewJob>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let (tx, rx) = flume::unbounded::<DetailPreviewJob>();
+            // 线程名带模块前缀,便于日志/调试器识别。
+            // The thread name carries the module prefix for logs/debuggers.
+            std::thread::Builder::new()
+                .name("clip-detail-preview".into())
+                .spawn(move || {
+                    for job in rx.iter() {
+                        unsafe { run_detail_preview_job(&job) };
+                    }
+                })
+                .expect("spawn clip-detail-preview worker");
+            tx
+        })
+        .clone()
+}
+
+/// 工作线程单任务处理:幂等跳过(缓存已存在)→ 按需任务的取件时效检查 →
+/// autoreleasepool 内生成 + 原子写盘 → deliver 任务经静态槽 + 主线程回调刷新。
+/// One worker iteration: idempotent skip (cache exists) -> dequeue freshness check for
+/// on-demand jobs -> generate inside an autoreleasepool + atomic cache write -> deliver
+/// jobs stash the bytes and hop to the main thread.
+unsafe fn run_detail_preview_job(job: &DetailPreviewJob) {
+    // 幂等:预生成与按需请求撞车时,先到者已写盘,后来者直接跳过。
+    // Idempotent: when pregen and on-demand requests race, whoever lands first writes
+    // the file and the other skips.
+    if clip_image_detail_path(job.hash).exists() {
+        DETAIL_INFLIGHT.lock().unwrap().remove(&job.hash);
+        return;
+    }
+    // 取件时效:按需任务出队时用户可能已经 ↑↓ 切走——跳过省一次解码+编码。
+    // 最终防线仍在主线程回调(生成期间也可能切走)。
+    // Dequeue freshness: the user may have arrowed away before an on-demand job starts --
+    // skipping saves a decode+encode. The final guard stays in the main-thread callback
+    // (the user can also navigate away mid-generation).
+    if job.deliver
+        && !detail_result_still_wanted(
+            DETAIL_VISIBLE.load(Ordering::SeqCst),
+            detail_current_hash(),
+            job.hash,
+        )
+    {
+        DETAIL_INFLIGHT.lock().unwrap().remove(&job.hash);
+        return;
+    }
+    // AppKit 临时对象(NSImage/TIFF/PNG 编码产物)随池回收——与图标提取的
+    // "后台线程 + autoreleasepool"先例同款;若实测不稳,备选改纯 CoreGraphics
+    // (CGImageSourceCreateThumbnailAtIndex,线程绝对安全)。
+    // AppKit temporaries (NSImage/TIFF/PNG encodes) drain with the pool -- same
+    // precedent as icon extraction's "background thread + autoreleasepool"; if this ever
+    // proves unstable, switch to pure CoreGraphics (CGImageSourceCreateThumbnailAtIndex,
+    // unconditionally thread-safe).
+    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+    let png = generate_detail_preview_bytes(job.hash, job.source_path.as_deref());
+    let _: () = msg_send![pool, drain];
+    if let Some(png) = png {
+        if job.deliver {
+            // 先写槽再跳主线程:handler/show_detail_for_sel 消费槽位时有完整数据。
+            // Stash before hopping to the main thread: the handler / show_detail_for_sel
+            // sees complete bytes when consuming the slot.
+            *DETAIL_PENDING_HD.lock().unwrap() = Some((job.hash, png));
+            let target = observer();
+            let _: () = msg_send![
+                target,
+                performSelectorOnMainThread: sel!(detailPreviewReady:),
+                withObject: std::ptr::null_mut::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
+    }
+    DETAIL_INFLIGHT.lock().unwrap().remove(&job.hash);
+}
+
+/// 从数据缓存/源文件生成详情预览字节并落盘(原 ensure_detail_preview 的生成半段;
+/// 只做纯 IO + 解码编码,不触碰任何 UI 静态,可在任意线程执行)。退化 hash=0 不写
+/// 缓存避免孤儿文件。
+/// Generate the detail-preview bytes from the data cache / source file and cache them
+/// (the generation half of the old ensure_detail_preview; pure IO + decode/encode with no
+/// UI statics touched -- safe on any thread). Degenerate hash=0 skips the cache write to
+/// avoid orphan files.
+unsafe fn generate_detail_preview_bytes(hash: u64, source_path: Option<&str>) -> Option<Vec<u8>> {
+    let bytes = match source_path {
+        None => cache_read_image(hash),
+        Some(p) => std::fs::read(p).ok(),
+    };
+    let bytes = bytes?;
+    let png = any_image_to_scaled_png(&bytes, DETAIL_PREVIEW_MAX_DIM)?;
+    if hash != 0 {
+        cache_write_detail_preview(hash, &png);
+    }
+    Some(png)
+}
+
+/// 投递详情预览生成任务(hash=0 的退化条目不入队)。在途集合去重;入队失败
+/// (线程异常终止)回滚在途标记。
+/// Enqueue a detail-preview generation job (degenerate hash=0 entries are never queued).
+//  Deduplicated via the in-flight set; an enqueue failure (dead worker) rolls the marker
+//  back.
+fn request_detail_preview(img: &ImageEntry, deliver: bool) {
+    if img.hash == 0 {
+        return;
+    }
+    {
+        let mut inflight = DETAIL_INFLIGHT.lock().unwrap();
+        if !inflight.insert(img.hash) {
+            return;
+        }
+    }
+    if detail_job_sender()
+        .send(DetailPreviewJob {
+            hash: img.hash,
+            source_path: img.source_path.clone(),
+            deliver,
+        })
+        .is_err()
+    {
+        DETAIL_INFLIGHT.lock().unwrap().remove(&img.hash);
+    }
+}
+
+/// 为图片条目取详情展示字节(同步三态,**绝不阻塞**):
+/// ① 后台刚生成的单槽命中 → 消费清空;
+/// ② `{hash}.detail` 磁盘缓存 → 同步读(毫秒级);
+/// ③ 内存 480px 预览立即返回,同时投递后台生成(deliver=true),完成后由
+///    detail_preview_ready 触发重建升级为高清。
+/// 字节都不可得(None)→ 调用方走文件名文本回退。
 ///
-/// Generate the detail-preview bytes for an image entry (lazily, then cached; the memory
-/// model is unchanged -- RAM still holds only the 480px thumbnail): data entries generate
-/// from the cached original bytes; file-copy entries READ the source file transiently and
-/// discard it (same reference semantics as pasting); when neither is available -> fall back
-/// to the in-memory preview; an empty preview too -> None. Success is cached so the next
-/// open reads the file instead of re-decoding.
+/// Fetch the detail display bytes for an image entry (synchronous three states, NEVER
+/// blocking): 1) a hit in the freshly-generated slot -> consume and clear it; 2) the
+/// `{hash}.detail` disk cache -> a millisecond-scale read; 3) return the in-memory 480px
+/// preview right away while enqueueing background generation (deliver=true); completion
+/// triggers a rebuild through detail_preview_ready to upgrade to hi-res. None (no bytes
+//  at all) lets the caller fall back to the filename text.
 fn ensure_detail_preview(img: &ImageEntry) -> Option<Vec<u8>> {
+    {
+        let mut slot = DETAIL_PENDING_HD.lock().unwrap();
+        if let Some((h, _)) = slot.as_ref() {
+            if *h == img.hash {
+                return slot.take().map(|(_, p)| p);
+            }
+        }
+    }
     if let Some(png) = cache_read_detail_preview(img.hash) {
         return Some(png);
     }
-    let bytes = if img.source_path.is_none() {
-        cache_read_image(img.hash)
-    } else {
-        img.source_path
-            .as_deref()
-            .and_then(|p| std::fs::read(p).ok())
-    };
-    if let Some(bytes) = bytes {
-        if let Some(png) = unsafe { any_image_to_scaled_png(&bytes, DETAIL_PREVIEW_MAX_DIM) } {
-            // 退化条目(hash=0)不写缓存,避免 0000... 孤儿文件。
-            // Degenerate entries (hash=0) skip the cache write (no orphan file).
-            if img.hash != 0 {
-                cache_write_detail_preview(img.hash, &png);
-            }
-            return Some(png);
-        }
-    }
     if !img.preview_png.is_empty() {
+        request_detail_preview(img, true);
         return Some(img.preview_png.clone());
     }
     None
@@ -2667,6 +2850,15 @@ fn poll_clipboard() {
                         img.uti,
                         hist.len()
                     );
+                    // 录制即预生成详情大图(后台):刚复制的图最可能马上被查看,
+                    // 提前落 {hash}.detail 让首开直接秒出高清。deliver=false——
+                    // 只为落盘,与选中态无关。
+                    // Pregenerate the hi-res detail preview right after recording
+                    // (background): a freshly copied image is the most likely one to be
+                    // inspected next, so landing {hash}.detail early makes the first
+                    // open instantly sharp. deliver=false -- cache only, selection is
+                    // irrelevant.
+                    request_detail_preview(&img, false);
                 } else {
                     log_debug!("[clip] change skipped: dup image (hash={:016x})", img.hash);
                 }
@@ -2723,6 +2915,16 @@ pub fn start() {
             let removed = sweep_current_clip_image_cache();
             if removed > 0 {
                 log_debug!("[clip] swept {} orphan image cache files", removed);
+            }
+            // 存量图片条目补投详情大图预生成(后台):重启后 {hash}.detail 可能尚不存在
+            // (上次会话没开过详情),提前生成让首次打开即高清。
+            // Warm up detail previews for restored image entries (background): after a
+            // restart {hash}.detail may not exist yet (the last session never opened that
+            // detail), so generating ahead keeps the first open instantly sharp.
+            for entry in CLIP_HISTORY.lock().unwrap().iter() {
+                if let Some(img) = &entry.image {
+                    request_detail_preview(img, false);
+                }
             }
         }
         // 再记录当前剪贴板,否则首次呼出历史为空。
@@ -2832,6 +3034,16 @@ unsafe fn observer() -> *mut AnyObject {
                 cls,
                 sel!(detailSaveAsDeferred:),
                 detail_save_as_deferred as *mut c_void,
+                types.as_ptr(),
+            );
+            // 详情高清预览生成完成(后台线程 → performSelectorOnMainThread):时效
+            // 复核后重建详情面板升级为高清图。
+            // Detail hi-res preview finished (worker -> performSelectorOnMainThread):
+            // re-validate freshness, then rebuild the detail panel to upgrade to hi-res.
+            class_addMethod(
+                cls,
+                sel!(detailPreviewReady:),
+                detail_preview_ready as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -4502,6 +4714,33 @@ extern "C" fn detail_save_as_deferred(_self: *mut c_void, _cmd: Sel, _sender: *m
     }
 }
 
+/// 详情高清预览生成完成的主线程回调:复核时效(详情可见 + 选中的仍是该条目),
+/// 命中则整面板重建——show_detail_for_sel 会消费 DETAIL_PENDING_HD 槽位直接用上
+/// 高清字节;过期/已关闭则丢弃槽位({hash}.detail 已落盘,下次打开走磁盘快路径)。
+/// Main-thread completion callback for a generated hi-res detail preview: re-validate
+/// freshness (detail visible AND the same entry still selected); on a hit, rebuild the
+//  whole panel -- show_detail_for_sel consumes the DETAIL_PENDING_HD slot directly. On a
+/// miss, drop the slot ({hash}.detail is already cached, so the next open takes the fast
+/// disk path).
+extern "C" fn detail_preview_ready(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
+    let job_hash = match *DETAIL_PENDING_HD.lock().unwrap() {
+        Some((h, _)) => h,
+        None => return,
+    };
+    if !detail_result_still_wanted(
+        DETAIL_VISIBLE.load(Ordering::SeqCst),
+        detail_current_hash(),
+        job_hash,
+    ) {
+        // 过期:释放槽内字节(磁盘缓存已写,后续打开不依赖槽位)。
+        // Stale: release the slot bytes (the disk cache is written; later opens do not
+        // need the slot).
+        *DETAIL_PENDING_HD.lock().unwrap() = None;
+        return;
+    }
+    unsafe { show_detail_for_sel() };
+}
+
 unsafe fn add_detail_separator(content: *mut AnyObject, y: f64, width: f64) {
     let line: *mut AnyObject = msg_send![class!(NSView), alloc];
     let line: *mut AnyObject = msg_send![
@@ -4815,7 +5054,7 @@ unsafe fn add_detail_chrome(
 }
 
 /// 打开/刷新详情浮窗:内容跟随选中条目——文本 = 完整未截断;图片 = 详情预览大图
-/// (懒生成 .detail,见 ensure_detail_preview)。位置在主浮窗右侧,高度及上下位置均
+/// (详情大图 .detail 由后台预生成/兜底生成,见 ensure_detail_preview)。位置在主浮窗右侧,高度及上下位置均
 /// 收在主浮窗内。
 ///
 /// Open/refresh the detail panel: content follows the selected entry -- full untruncated
@@ -9760,8 +9999,8 @@ unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
 #[cfg(test)]
 mod tests {
     use super::{
-        scroll_indicator_geometry, ClipEntry, ImageEntry, NSPASTEBOARD_TYPE_PNG,
-        SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE,
+        detail_result_still_wanted, scroll_indicator_geometry, ClipEntry, ImageEntry,
+        NSPASTEBOARD_TYPE_PNG, SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE,
     };
 
     #[test]
@@ -9779,6 +10018,23 @@ mod tests {
         let end = position + length;
         let expected_end = visible - SCROLL_INDICATOR_EDGE - SCROLL_INDICATOR_CORNER_RESERVE;
         assert!((end - expected_end).abs() < f64::EPSILON);
+    }
+
+    /// 详情高清预览时效判定真值表:详情可见 + 选中条目即任务条目才刷新;其余
+    /// (面板已关 / 已切走 / 无选中)一律丢弃。
+    //  Truth table for the hi-res detail freshness predicate: swap into the UI only when
+    //  the panel is visible AND the selected entry is the job's entry; everything else
+    //  (panel closed / navigated away / no selection) drops the result.
+    #[test]
+    fn detail_result_still_wanted_truth_table() {
+        use super::detail_result_still_wanted as wanted;
+        assert!(wanted(true, Some(42), 42));
+        // 详情可见但已切到别的条目 / visible but navigated to another entry.
+        assert!(!wanted(true, Some(7), 42));
+        // 无选中(搜索框聚焦)/ no selection (search-field focus).
+        assert!(!wanted(true, None, 42));
+        // 面板已关闭(含随主浮窗隐藏)/ panel closed (incl. hidden with the picker).
+        assert!(!wanted(false, Some(42), 42));
     }
 
     /// 测试用的 3 参便捷包装(来源与图标键留空,既有用例不受签名变化影响)。
