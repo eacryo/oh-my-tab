@@ -105,7 +105,23 @@ fn expand_tabs(source: &str) -> ExpandedSource {
                 col += pad;
             }
             _ => {
+                // 不变量:map 必须覆盖展开文本的每个 UTF-16 位(末位哨兵 = 原文总长)。
+                // astral 字符占 2 个 UTF-16 位,只推 1 条会让 map 短 1——边界取到文本
+                // 末尾时索引恰好等于 map.len(),直接越界 panic;且之后的选中/复制范围
+                // 映射全部错位。与 tab 分支同款约定:首单元映射字符起点,其余单元映射
+                // 字符终点(BMP 字符只有首条,行为不变)。
+                // Invariant: the map must cover every UTF-16 unit of the expanded text
+                // (final sentinel = source length). An astral char spans TWO UTF-16 units;
+                // pushing a single entry leaves the map one short -- a boundary at the end
+                // of the text then indexes exactly map.len() and panics out of bounds, and
+                // every selection/copy range after the char mis-maps. Same convention as
+                // the tab branch: the first unit maps to the char start, the rest to the
+                // char end (BMP chars only get the first entry -- behavior unchanged).
+                let width = ch.len_utf16();
                 map.push(src16);
+                for _ in 1..width {
+                    map.push(src16 + width);
+                }
                 text.push(ch);
                 col += char_columns(ch);
             }
@@ -1214,8 +1230,8 @@ pub(crate) unsafe fn apply_link_color(storage: *mut AnyObject, text: &str, kind:
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_visible_space_markers, char_columns, format_code_for_soft_wrap,
-        prepare_code_for_soft_wrap, CODE_ADVANCE_PT, TAB_STOP_COLUMNS,
+        apply_visible_space_markers, char_columns, expand_tabs, format_code_for_display,
+        format_code_for_soft_wrap, prepare_code_for_soft_wrap, CODE_ADVANCE_PT, TAB_STOP_COLUMNS,
     };
     use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
     use objc2::runtime::AnyObject;
@@ -1455,5 +1471,49 @@ mod tests {
             utf16_slice(&formatted.source_map.source, indent_range),
             "\t"
         );
+    }
+
+    /// astral 字符回归:map 必须保持 "utf16 长度 + 1" 不变量(曾因 astral 字符只推
+    /// 一条而短 1,边界取到文本末尾时索引越界 panic——extern "C" 键回调内 panic 即 abort)。
+    /// Astral-char regression: the map must keep the "utf16 length + 1" invariant (it used
+    /// to run one short per astral char, so an end-of-text boundary indexed out of bounds
+    /// and panicked -- a panic inside the extern "C" key callback aborts the process).
+    #[test]
+    fn expand_tabs_keeps_one_map_entry_per_utf16_unit() {
+        let source = "a😀b\tc\nx𠀀y";
+        let expanded = expand_tabs(source);
+        assert_eq!(
+            expanded.to_source_utf16.len(),
+            expanded.text.encode_utf16().count() + 1,
+            "map must cover every UTF-16 unit plus the end sentinel"
+        );
+        // 哨兵与字符起点映射 / sentinel and per-char start mappings.
+        let last = *expanded.to_source_utf16.last().unwrap();
+        assert_eq!(last, source.encode_utf16().count());
+        assert_eq!(expanded.to_source_utf16[0], 0);
+    }
+
+    /// 含 emoji 的代码过预览与详情两条格式化路径都不得 panic,且选中范围还原原文保真。
+    /// Code containing emoji must pass both formatting paths without panicking, with a
+    /// faithful selection roundtrip.
+    #[test]
+    fn format_code_with_astral_char_roundtrips_faithfully() {
+        let source = "let s = \"😀\"; // emoji 😀 tail";
+        for formatted in [
+            format_code_for_display(source, 48),
+            format_code_for_soft_wrap(source, 48),
+        ] {
+            assert_eq!(formatted.source_map.source, source);
+            // 全文范围往返 / whole-text range roundtrip.
+            let full_utf16 = source.encode_utf16().count();
+            let range = formatted
+                .source_map
+                .source_range(NSRange::new(0, full_utf16));
+            assert_eq!(
+                utf16_slice(&formatted.source_map.source, range),
+                source,
+                "whole-text selection must restore the original verbatim"
+            );
+        }
     }
 }
