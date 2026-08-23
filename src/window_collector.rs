@@ -1253,6 +1253,117 @@ fn cf_to_rust_string(cf_string: *const c_void) -> Option<String> {
     }
 }
 
+// ========== per-PID AX 收集(可并行)/ per-PID AX collection (parallelizable) ==========
+
+/// 一个工作线程处理一段 PID 后的部分结果集,线程间按 key 合并——合并后与串行版
+/// 逐字段一致(卡片顺序由第二遍 CG 数组遍历决定,与收集顺序无关)。
+/// One worker thread's partial result set for its PID chunk; merged by key afterwards --
+/// the merge equals the serial version field-for-field (card order is decided by the
+/// second pass over the CG array and never depends on collection order).
+struct AxPartial {
+    icon_ids: HashMap<i32, AppIdentity>,
+    ax_queried_pids: HashSet<i32>,
+    ax_wid_to_info: HashMap<i32, HashMap<u32, (String, bool)>>,
+    titleless_pids: HashSet<i32>,
+    /// 本段所有 PID 的 AX 查询工作耗时之和(诊断用;墙钟由调用方测)。
+    /// Sum of AX query work time for this chunk (diagnostics; wall clock is measured by the caller).
+    ax_work_ms: u128,
+}
+
+/// 处理一段 PID:逐个解析应用身份 + 查询该应用的 AX 窗口列表。AX 远程查询支持
+/// 多线程(messaging timeout 按 element 隔离);resolve_app_identity 只读
+/// NSRunningApplication 属性 + stat。整段包 autoreleasepool 回收 ObjC 临时对象。
+/// Process a chunk of PIDs: resolve each app identity + query its AX window list. AX
+/// remote messaging works from any thread (messaging timeouts are per-element);
+/// resolve_app_identity only reads NSRunningApplication properties + stat. The whole
+/// chunk runs inside an autoreleasepool to drain ObjC temporaries.
+///
+/// # Safety
+/// 调用方需保证无并发的 AX/ObjC 环境冲突(与主线程的 AX 使用互不共享元素)。
+/// The caller must ensure no conflicting concurrent use of shared AX/ObjC elements with
+/// the main thread.
+unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> AxPartial {
+    let mut partial = AxPartial {
+        icon_ids: HashMap::new(),
+        ax_queried_pids: HashSet::new(),
+        ax_wid_to_info: HashMap::new(),
+        titleless_pids: HashSet::new(),
+        ax_work_ms: 0,
+    };
+    // AppKit 临时对象(NSRunningApplication 等)随池回收;图标提取后台线程同款先例。
+    // AppKit temporaries (NSRunningApplication et al) drain with the pool; same precedent
+    // as the background icon-extraction thread.
+    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+    for &pid in chunk {
+        let t_pid = Instant::now();
+        partial
+            .icon_ids
+            .insert(pid, unsafe { resolve_app_identity(pid) });
+        let ax_wins = get_ax_windows_for_pid(pid);
+        let pid_ms = t_pid.elapsed().as_millis();
+        partial.ax_work_ms += pid_ms;
+        // AX 查询结果汇总:定位“一会 1 个一会 2 个”——设置窗口抖动时看 windows 数
+        // 是否变化(缺窗口/失败/超时)。多线程下日志行可能交错,但每行自带 pid/app
+        // 标识,logger 的 flume 通道保证行内原子输出。
+        // AX query summary: pin down the 1-vs-2 flicker -- watch whether the window count
+        // changes (missing windows / failure / timeout). Lines from parallel workers may
+        // interleave, but each carries its own pid/app tag, and the logger's flume channel
+        // keeps every line atomic.
+        match &ax_wins {
+            Some(w) => log_debug!(
+                "[collect] ax pid={} app=\"{}\" windows={} ({}ms)",
+                pid,
+                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                w.len(),
+                pid_ms
+            ),
+            None => log_debug!(
+                "[collect] ax pid={} app=\"{}\" FAILED (CG fallback, {}ms)",
+                pid,
+                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                pid_ms
+            ),
+        }
+        // TIMING-DEBUG 慢 AX 查询(≥20ms)单独标记:定位卡顿来自哪个应用(如 Ghostty)。
+        // TIMING-DEBUG Flag slow AX queries (>=20ms) individually: pin down which app stalls
+        // the summon.
+        if pid_ms >= 20 {
+            log_debug!(
+                "[collect] ax slow: pid={} app=\"{}\" {}ms",
+                pid,
+                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                pid_ms
+            );
+        }
+        match ax_wins {
+            Some(wins) if !wins.is_empty() => {
+                partial.ax_queried_pids.insert(pid);
+                if wins.iter().all(|(_, t, _)| t.is_empty()) {
+                    partial.titleless_pids.insert(pid);
+                }
+                let mut wid_map: HashMap<u32, (String, bool)> = HashMap::new();
+                for (cgwid, title, minimized) in &wins {
+                    if *cgwid != 0 {
+                        wid_map.insert(*cgwid, (title.clone(), *minimized));
+                    }
+                }
+                partial.ax_wid_to_info.insert(pid, wid_map);
+            }
+            // AX 查询成功但无标准窗口:该 App 没有调度中心可见的窗口,后续直接跳过。
+            // AX query succeeded but no standard windows: the app has no Mission-Control-visible
+            // windows; skip all its CG windows in the second pass.
+            Some(_) => {
+                partial.ax_queried_pids.insert(pid);
+            }
+            // AX 查询失败(无 AX 数据):保留 CG 回退路径。
+            // AX query failed (no AX data): keep the CG fallback path.
+            None => {}
+        }
+    }
+    let _: () = msg_send![pool, drain];
+    partial
+}
+
 pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
     // 始终用 All 枚举(含离屏窗口)。原因:部分应用(如 JetBrains 系 IDE)在"主窗口被
@@ -1328,6 +1439,23 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
     // 以 AX 窗口列表为主数据源（macOS App Switcher 的做法）
     // Use AX window list as primary source (same as macOS App Switcher)
+    // pid -> 缓存身份(bundle id + mtime)。AX 循环里按 pid 解析一次,供第二遍按窗口查缓存,
+    // 避免每个窗口都做一次 NSRunningApplication 查找(一个 App 多窗口时尤其浪费)。
+    // pid -> cache identity (bundle id + mtime). Resolved once per pid in the AX phase so the
+    // second pass can look up the cache per-window without an NSRunningApplication call each time
+    // (wasteful when one app has many windows).
+    let mut icon_ids: HashMap<i32, AppIdentity> = HashMap::new();
+    // AX 收集阶段(并行):把 PID 分成 K 组(K = min(逻辑核数, PID 数),运行时自适应
+    // 任意 M 系列芯片),各组在工作线程同时查询——AX 远程消息支持多线程,每组结果
+    // 按 key 合并后与串行版逐字段一致。墙钟时间从"所有 PID 之和"降为"最慢单 PID"
+    // (微信这类对 AX 提问反复磨蹭的应用曾是串行总耗时的主导项,实测单 PID 可达 1.5s)。
+    // The AX collection phase (parallel): split PIDs into K chunks (K = min(logical cores,
+    // PID count), runtime-adaptive to any Apple Silicon variant) queried simultaneously on
+    // worker threads -- AX remote messaging is multi-thread-capable and each chunk merges
+    // by key into a result identical to the serial version. Wall clock drops from "sum of
+    // all PIDs" to "slowest single PID" (apps like WeChat that stall on every AX question
+    // used to dominate serial totals; up to 1.5s for one PID in logs).
+    let mut ax_wid_to_info: HashMap<i32, HashMap<u32, (String, bool)>> = HashMap::new();
     // AX 查询「成功」的 pid 集合:成功但无标准窗口的 App 应整体跳过(调度中心不显示它),
     // 只有查询失败(None)才允许走 CG 回退。这是 BetterDisplay 隐形窗口 bug 的根因修复:
     // AX 成功但 subrole 过滤后为空,不能等同于「无 AX 数据」。
@@ -1336,84 +1464,47 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // allows the CG fallback. This fixes the BetterDisplay invisible-window bug: an AX query
     // that succeeds but yields no standard windows must not be treated as "no AX data".
     let mut ax_queried_pids: HashSet<i32> = HashSet::new();
-    // pid -> (CGWindowID -> (AX 标题, 是否最小化)),用于按 CGWindowID 精确配对 CG 窗口。
-    // pid -> (CGWindowID -> (AX title, minimized)), to pair CG windows by CGWindowID.
-    let mut ax_wid_to_info: HashMap<i32, HashMap<u32, (String, bool)>> = HashMap::new();
     // AX 窗口「全部」为空标题的 App（如 Microsoft To Do：自绘标题栏 -> AXTitle 为空）。
     // 这类 App 的空标题窗口是真实主窗口，不能被当作弹出面板丢弃。
     // Apps whose AX windows are ALL untitled (e.g. Microsoft To Do, which has a
     // custom title bar and an empty AXTitle). Their titleless windows are real
     // main windows and must not be dropped as popups.
     let mut titleless_pids: HashSet<i32> = HashSet::new();
-    // pid -> 缓存身份(bundle id + mtime)。在此 AX 循环里按 pid 解析一次,供第二遍按窗口查缓存,
-    // 避免每个窗口都做一次 NSRunningApplication 查找(一个 App 多窗口时尤其浪费)。
-    // pid -> cache identity (bundle id + mtime). Resolved once per pid in this AX loop so the
-    // second pass can look up the cache per-window without an NSRunningApplication call each time
-    // (wasteful when one app has many windows).
-    let mut icon_ids: HashMap<i32, AppIdentity> = HashMap::new();
-    // TIMING-DEBUG 每 PID AX 查询耗时累计 / per-PID AX query time accumulator.
-    let mut ax_total_ms: u128 = 0;
-    for &pid in &pids {
-        let t_pid = Instant::now();
-        icon_ids.insert(pid, unsafe { resolve_app_identity(pid) });
-        let ax_wins = get_ax_windows_for_pid(pid);
-        let pid_ms = t_pid.elapsed().as_millis();
-        ax_total_ms += pid_ms;
-        // AX 查询结果汇总:定位“一会 1 个一会 2 个”——设置窗口抖动时看 windows 数
-        // 是否变化(缺窗口/失败/超时)。
-        // AX query summary: pin down the 1-vs-2 flicker -- watch whether the window
-        // count changes (missing windows / failure / timeout).
-        match &ax_wins {
-            Some(w) => log_debug!(
-                "[collect] ax pid={} app=\"{}\" windows={} ({}ms)",
-                pid,
-                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
-                w.len(),
-                pid_ms
-            ),
-            None => log_debug!(
-                "[collect] ax pid={} app=\"{}\" FAILED (CG fallback, {}ms)",
-                pid,
-                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
-                pid_ms
-            ),
-        }
-        // TIMING-DEBUG 慢 AX 查询(≥20ms)单独标记:定位卡顿来自哪个应用(如 Ghostty)。
-        // TIMING-DEBUG Flag slow AX queries (>=20ms) individually: pin down which app stalls
-        // the summon.
-        if pid_ms >= 20 {
-            log_debug!(
-                "[collect] ax slow: pid={} app=\"{}\" {}ms",
-                pid,
-                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
-                pid_ms
-            );
-        }
-        match ax_wins {
-            Some(wins) if !wins.is_empty() => {
-                ax_queried_pids.insert(pid);
-                if wins.iter().all(|(_, t, _)| t.is_empty()) {
-                    titleless_pids.insert(pid);
-                }
-                let mut wid_map: HashMap<u32, (String, bool)> = HashMap::new();
-                for (cgwid, title, minimized) in &wins {
-                    if *cgwid != 0 {
-                        wid_map.insert(*cgwid, (title.clone(), *minimized));
-                    }
-                }
-                ax_wid_to_info.insert(pid, wid_map);
-            }
-            // AX 查询成功但无标准窗口:该 App 没有调度中心可见的窗口,后续直接跳过。
-            // AX query succeeded but no standard windows: the app has no Mission-Control-visible
-            // windows; skip all its CG windows in the second pass.
-            Some(_) => {
-                ax_queried_pids.insert(pid);
-            }
-            // AX 查询失败(无 AX 数据):保留 CG 回退路径。
-            // AX query failed (no AX data): keep the CG fallback path.
-            None => {}
+    let t_ax = Instant::now();
+    {
+        let pid_list: Vec<i32> = pids.iter().copied().collect();
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(pid_list.len())
+            .max(1);
+        let chunk_size = pid_list.len().div_ceil(workers);
+        let partials: Vec<AxPartial> = std::thread::scope(|scope| {
+            let handles: Vec<_> = pid_list
+                .chunks(chunk_size)
+                .map(|chunk| scope.spawn(|| unsafe { ax_collect_chunk(chunk, &pid_names) }))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("ax collect worker panicked"))
+                .collect()
+        });
+        // 按 key 合并各分段;ax_wid_to_info 的键互不相交(每 PID 只属于一段),
+        // 合并顺序不影响最终内容。
+        // Merge chunks by key; ax_wid_to_info keys are disjoint (each PID lives in exactly
+        // one chunk), so merge order cannot affect the outcome.
+        for p in partials {
+            icon_ids.extend(p.icon_ids);
+            ax_queried_pids.extend(p.ax_queried_pids);
+            ax_wid_to_info.extend(p.ax_wid_to_info);
+            titleless_pids.extend(p.titleless_pids);
         }
     }
+    // TIMING-DEBUG AX 阶段墙钟(并行后 ≠ 各 PID 工作耗时之和;单 PID 工作耗时见
+    // 各 "ax pid=" 行的 ms 值)。
+    // TIMING-DEBUG Wall clock of the parallel AX phase (NOT the sum of per-PID work
+    // times anymore; per-PID work shows in each "ax pid=" line's ms value).
+    let ax_total_ms = t_ax.elapsed().as_millis();
 
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
