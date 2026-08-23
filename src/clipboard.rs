@@ -3542,6 +3542,14 @@ extern "C" fn search_focus_began(_self: *mut c_void, _cmd: Sel, note: *mut c_voi
         let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
         if !field.is_null() {
             style_search_field(field, 0.045, 0.10);
+            // 聚焦态切换必须显式重绘 cell:占位提示由 cell 自绘,聚焦即隐(IME 组合
+            // 期间 stringValue 仍为空,若不重绘会与拼音预编辑串叠加)。图层底色变化
+            // 不会触发 cell 重绘。
+            // Focus transitions must explicitly redraw the cell: the placeholder is
+            // cell-drawn and hides on focus (during IME composition stringValue stays
+            // empty, so a stale placeholder would sit under the pre-edit pinyin).
+            // Layer background changes do not trigger cell redraws.
+            let _: () = msg_send![field, setNeedsDisplay: true];
         }
     }
 }
@@ -3552,6 +3560,10 @@ extern "C" fn search_focus_ended(_self: *mut c_void, _cmd: Sel, note: *mut c_voi
         let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
         if !field.is_null() {
             style_search_field(field, 0.045, 0.035);
+            // 与 search_focus_began 同理:失焦后恢复占位提示需要立即重绘。
+            // Same as search_focus_began: restoring the placeholder on blur needs an
+            // immediate redraw.
+            let _: () = msg_send![field, setNeedsDisplay: true];
         }
     }
 }
@@ -7253,12 +7265,20 @@ extern "C" fn search_cell_draw_with_frame(
             let str_obj: *mut AnyObject = msg_send![_self as *mut AnyObject, stringValue];
             let str_len: usize = msg_send![str_obj, length];
             if str_len == 0 {
-                // 传入空 view 使内部绘制走未编辑分支:完整提示(放大镜、文字、⌘F)
-                // 会保留在空字段下方,而字段编辑器随后在其输入起点绘制光标。
-                // Pass a null view to take the non-editing branch: the full hint (magnifier,
-                // text, and ⌘F) remains beneath the empty field while its editor draws the caret
-                // at the input start afterward.
-                search_cell_draw_interior(_self, _cmd, cell_frame, std::ptr::null_mut());
+                // 聚焦且 stringValue 为空 → 只画放大镜 + ⌘F 键帽,**不画占位文字**。
+                // IME 组合期间拼音是字段编辑器里的 marked text,不进 stringValue,
+                // 此分支同样命中——若在这里画占位,编辑器的预编辑串会叠在
+                // "Search clipboard" 上。聚焦即隐藏提示(与原生搜索框一致);
+                // ⌘F 键帽贴右缘,不在拼音落点区域,保留。
+                // Focused with an empty stringValue -> draw ONLY the magnifier and the
+                // ⌘F keycap, never the placeholder text. During IME composition the
+                // pinyin lives in the field editor as marked text (stringValue stays
+                // empty), so this branch is active too -- drawing the placeholder here
+                // would put the pre-edit string right on top of "Search clipboard".
+                // The hint hides on focus (native search-field behavior); the keycap
+                // hugs the right edge away from the caret and stays.
+                let _ = draw_search_icon_prefix(cell_frame);
+                draw_search_keycap(cell_frame);
                 return;
             }
         }
