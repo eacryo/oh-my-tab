@@ -1506,44 +1506,53 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
 
         // Gap below icon before text starts
         let text_gap: f64 = 6.0;
-        // App name: 18px tall, 2px above window title
-        let name_bottom = icon_bottom - text_gap - 18.0; // 64 - 6 - 18 = 40
-                                                         // Window title: 16px tall, sits at bottom
-        let title_bottom = name_bottom - 2.0 - 16.0; // 40 - 2 - 16 = 22
+        // 主行 = 窗口标题,次行 = 应用名(HTML 参考 preview (1).html):标题 12px
+        // medium 深色(win_title),应用名 10px regular 浅色(app_name)。字体/配色键
+        // 与内容语义对齐;样式跟随内容,槽位只提供位置。
+        // Primary line = window title, secondary = app name (HTML reference preview
+        // (1).html): title at 12px medium in the dark color (win_title), app name at
+        // 10px regular in the light color (app_name). Font/color keys align with their
+        // content semantics; slots only position.
+        let primary_bottom = icon_bottom - text_gap - 18.0; // 64 - 6 - 18 = 40
+                                                            // 次行:16px 高,贴卡片底部。
+                                                            // Secondary line: 16px tall at the bottom.
+        let secondary_bottom = primary_bottom - 2.0 - 16.0; // 40 - 2 - 16 = 22
 
-        // --- App name label ---
-        let name_font: *mut AnyObject = {
-            let cfg = CONFIG.read().unwrap();
-            msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.app_name_size, weight: cfg.fonts.app_name_weight]
-        };
-        let name_color = hex_to_ns_color(colors.app_name);
-        let name_label = make_centered_label(
-            &truncate_text(&w.app_name, 17),
-            name_font,
-            name_color,
-            name_bottom,
-            card_width,
-            18.0,
-        );
-        let _: () = msg_send![view, addSubview: name_label];
-        release_obj(name_label); // view owns the label; drop our alloc +1
-
-        // --- Window title label ---
-        let title_font: *mut AnyObject = {
+        // --- 主行:窗口标题(12px medium 深色)---
+        // --- Primary line: window title (12px medium, dark).
+        let primary_font: *mut AnyObject = {
             let cfg = CONFIG.read().unwrap();
             msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
         };
-        let win_color = hex_to_ns_color(colors.win_title);
+        let primary_color = hex_to_ns_color(colors.win_title);
         let title_label = make_centered_label(
             &truncate_text(&display_title(&w.window_title), 20),
-            title_font,
-            win_color,
-            title_bottom,
+            primary_font,
+            primary_color,
+            primary_bottom,
             card_width,
-            16.0,
+            18.0,
         );
         let _: () = msg_send![view, addSubview: title_label];
         release_obj(title_label); // view owns the label; drop our alloc +1
+
+        // --- 次行:应用名(10px regular 浅色)---
+        // --- Secondary line: app name (10px regular, light).
+        let secondary_font: *mut AnyObject = {
+            let cfg = CONFIG.read().unwrap();
+            msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.app_name_size, weight: cfg.fonts.app_name_weight]
+        };
+        let secondary_color = hex_to_ns_color(colors.app_name);
+        let name_label = make_centered_label(
+            &truncate_text(&w.app_name, 17),
+            secondary_font,
+            secondary_color,
+            secondary_bottom,
+            card_width,
+            16.0,
+        );
+        let _: () = msg_send![view, addSubview: name_label];
+        release_obj(name_label); // view owns the label; drop our alloc +1
 
         // --- Tracking area for hover ---
         // NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways

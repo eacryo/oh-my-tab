@@ -433,10 +433,16 @@ impl Default for ThemeColors {
 
 impl ThemeColors {
     fn dark_default() -> Self {
+        // 卡片文字色对齐 HTML 参考:主行(窗口标题)rgba(0,0,0,.82) → 暗色主题取
+        // 白色同透明度;次行(应用名)rgba(0,0,0,.34)。alpha = 0.82/0.34 × 255 ≈
+        // D1/57。
+        // Card text colors follow the HTML reference: primary (window title)
+        // rgba(0,0,0,.82) -> same alpha in white for the dark theme; secondary (app
+        // name) rgba(0,0,0,.34). alpha = 0.82/0.34 x 255 ~= D1/57.
         ThemeColors {
             status_bar_text: "999999ff".into(),
-            app_name: "ddddddff".into(),
-            win_title: "888888ff".into(),
+            app_name: "FFFFFF57".into(),
+            win_title: "FFFFFFD1".into(),
             icon_inner_bg: "22224444".into(),
             icon_text: "9999bbff".into(),
             card_bg_sel: "22224444".into(),
@@ -447,8 +453,10 @@ impl ThemeColors {
     fn light_default() -> Self {
         ThemeColors {
             status_bar_text: "333333ff".into(),
-            app_name: "1a1a1aff".into(),
-            win_title: "333333ff".into(),
+            // rgba(0,0,0,.82) / rgba(0,0,0,.34),见 dark_default 注释。
+            // rgba(0,0,0,.82) / rgba(0,0,0,.34); see the dark_default comment.
+            app_name: "00000057".into(),
+            win_title: "000000D1".into(),
             icon_inner_bg: "d0d0e066".into(),
             icon_text: "666688ff".into(),
             // HTML 参考中的浅蓝选中背景与 1px 内描边。
@@ -461,13 +469,20 @@ impl ThemeColors {
 
 impl Default for Fonts {
     fn default() -> Self {
+        // 卡片两行文字对齐 HTML 参考(preview (1).html):主行 = 窗口标题 12px /
+        // weight 500(CSS 500 ≈ NSFont medium 0.23,不加粗);次行 = 应用名 10px /
+        // regular(CSS 未写 font-weight = 400 ≈ NSFontWeightRegular 0.0)。
+        // The two card text lines follow the HTML reference (preview (1).html):
+        // primary = window title at 12px / weight 500 (CSS 500 ~= NSFont medium 0.23,
+        // not bold); secondary = app name at 10px / regular (CSS omits font-weight =
+        // 400 ~= NSFontWeightRegular 0.0).
         Fonts {
             status_bar_size: 13.0,
             status_bar_weight: 0.23,
-            title_size: 11.0,
+            title_size: 12.0,
             title_weight: 0.23,
-            app_name_size: 13.0,
-            app_name_weight: 0.5,
+            app_name_size: 10.0,
+            app_name_weight: 0.0,
         }
     }
 }
@@ -1063,6 +1078,60 @@ impl Config {
         Self::load_or_default_from(&path)
     }
 
+    /// 卡片文字样式一次性迁移:内容互换后(窗口标题为主行、应用名为次行),旧默认
+    /// 组合(title 11/0.23 + app_name 13/0.5,以及旧配色对)在新层级下会颠倒主次
+    /// (次行比主行还大)。仅当**全部四个字体值**与旧默认完全一致时才改写为新默认;
+    /// 配色同理按"成对精确匹配旧暗色/旧亮色默认"改写——用户自定义过任意一项则
+    /// 整体跳过(保守迁移,绝不覆盖定制值)。幂等:新默认组合不匹配旧值,再次调用
+    /// 无操作。返回是否有改动。
+    /// One-time migration for the card text style: after the content swap (window title
+    /// as primary line, app name as secondary), the OLD default combo (title 11/0.23 +
+    /// app_name 13/0.5, plus the old color pairs) inverts the hierarchy under the new
+    /// layout (the secondary line would render larger than the primary). Rewrites only
+    /// when ALL four font values exactly match the old defaults; colors likewise rewrite
+    /// only on an exact PAIR match against the old dark or old light defaults -- any
+    /// customized value skips the whole rewrite (conservative migration, never clobbers
+    /// customizations). Idempotent: the new defaults no longer match the old values.
+    /// Returns whether anything changed.
+    pub(crate) fn migrate_card_text_style(&mut self) -> bool {
+        let mut changed = false;
+        // 旧字体默认:title_size 11 / weight 0.23,app_name_size 13 / weight 0.5。
+        // Old font defaults: title_size 11 / weight 0.23, app_name_size 13 / weight 0.5.
+        let f = &mut self.fonts;
+        if f.title_size == 11.0
+            && f.title_weight == 0.23
+            && f.app_name_size == 13.0
+            && f.app_name_weight == 0.5
+        {
+            f.title_size = 12.0; // HTML 参考:标题 12px medium / reference: title 12px medium
+            f.app_name_size = 10.0; // 应用名 10px regular / app name 10px regular
+            f.app_name_weight = 0.0;
+            changed = true;
+        }
+        // 配色按主题节分别迁移:每节的配色对独立精确匹配旧暗色(dddddd/888888)
+        // 或旧亮色(1a1a1a/333333)默认,才改写为同族新对(D1/57 透明度)。
+        // Colors migrate per theme section: each section's pair independently and
+        // exactly matches the old dark (dddddd/888888) or old light (1a1a1a/333333)
+        // defaults before being rewritten to its new same-family pair (D1/57 alpha).
+        for theme in [&mut self.colors.dark, &mut self.colors.light] {
+            let pair = (theme.app_name.as_str(), theme.win_title.as_str());
+            match pair {
+                ("ddddddff", "888888ff") => {
+                    theme.app_name = "FFFFFF57".into();
+                    theme.win_title = "FFFFFFD1".into();
+                    changed = true;
+                }
+                ("1a1a1aff", "333333ff") => {
+                    theme.app_name = "00000057".into();
+                    theme.win_title = "000000D1".into();
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
     /// 从指定路径加载(纯逻辑,测试注入临时目录)。默认路径为 `~/.config/oh-my-tab/config.toml`。
     /// Load from a given path (pure logic; tests inject a temp dir).
     fn load_or_default_from(path: &std::path::Path) -> (Self, Vec<String>) {
@@ -1074,7 +1143,10 @@ impl Config {
                 // Migrate legacy flat [mouse] fields into profiles (idempotent); the return
                 // value signals a change so only actual changes rewrite the file (new-format
                 // configs no longer trigger a rewrite via serde-backfilled defaults).
-                let needs_persist = loaded.mouse.migrate_legacy();
+                let mut needs_persist = loaded.mouse.migrate_legacy();
+                // 卡片文字样式迁移(见 migrate_card_text_style):有改动才写盘。
+                // Card text style migration (see migrate_card_text_style): persist only on change.
+                needs_persist |= loaded.migrate_card_text_style();
                 let errs = loaded.validate();
                 if !errs.is_empty() {
                     // Start from defaults, merge only valid fields
@@ -1107,7 +1179,10 @@ impl Config {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let mut loaded: Config = toml::from_str(&content).unwrap_or_default();
-                let needs_persist = loaded.mouse.migrate_legacy();
+                let mut needs_persist = loaded.mouse.migrate_legacy();
+                // 卡片文字样式迁移(见 migrate_card_text_style):有改动才写盘。
+                // Card text style migration (see migrate_card_text_style): persist only on change.
+                needs_persist |= loaded.migrate_card_text_style();
                 let errs = loaded.validate();
                 if !errs.is_empty() {
                     let mut merged = Config::default();
@@ -1395,6 +1470,69 @@ mod tests {
         // A second migration must not change anything.
         assert_eq!(cfg.mouse.profiles.len(), before.profiles.len());
         assert!(cfg.mouse.reverse_scroll.is_none());
+    }
+
+    #[test]
+    fn card_text_style_migration_rewrites_old_defaults() {
+        let mut cfg = Config::default();
+        // 注入旧默认组合(内容互换前的字体与配色):字体 + 暗色节旧暗对 + 亮色节旧亮对。
+        // Inject the old-default combo (pre-swap fonts and colors): fonts + the old dark
+        // pair in the dark section + the old light pair in the light section.
+        cfg.fonts.title_size = 11.0;
+        cfg.fonts.title_weight = 0.23;
+        cfg.fonts.app_name_size = 13.0;
+        cfg.fonts.app_name_weight = 0.5;
+        cfg.colors.dark.app_name = "ddddddff".into();
+        cfg.colors.dark.win_title = "888888ff".into();
+        cfg.colors.light.app_name = "1a1a1aff".into();
+        cfg.colors.light.win_title = "333333ff".into();
+
+        assert!(cfg.migrate_card_text_style());
+        assert_eq!(cfg.fonts.title_size, 12.0);
+        assert_eq!(cfg.fonts.title_weight, 0.23);
+        assert_eq!(cfg.fonts.app_name_size, 10.0);
+        assert_eq!(cfg.fonts.app_name_weight, 0.0);
+        // 各节迁移到同族新对 / each section migrates to its same-family new pair.
+        assert_eq!(cfg.colors.dark.app_name, "FFFFFF57");
+        assert_eq!(cfg.colors.dark.win_title, "FFFFFFD1");
+        assert_eq!(cfg.colors.light.app_name, "00000057");
+        assert_eq!(cfg.colors.light.win_title, "000000D1");
+        // 幂等:新默认组合不再命中旧值,二次调用无操作。
+        // Idempotent: the new defaults no longer match the old values; a second call is a no-op.
+        assert!(!cfg.migrate_card_text_style());
+    }
+
+    #[test]
+    fn card_text_style_migration_skips_customized_values() {
+        let mut cfg = Config::default();
+        // 仅一个字体值被自定义 → 整组跳过(保守迁移;配色此时为新默认也不触发)。
+        // A single customized font value -> the whole group is skipped (conservative;
+        // colors are at the new defaults here and do not trigger either).
+        cfg.fonts.title_size = 11.0;
+        cfg.fonts.title_weight = 0.23;
+        cfg.fonts.app_name_size = 13.0;
+        cfg.fonts.app_name_weight = 0.4; // 自定义 / customized
+        assert!(!cfg.migrate_card_text_style());
+        assert_eq!(cfg.fonts.app_name_weight, 0.4);
+
+        // 配色同理:两节都不成对匹配旧默认则不动。
+        // Colors likewise: with NEITHER section pairing up against an old default, nothing moves.
+        cfg.colors.dark.app_name = "custom01ff".into();
+        cfg.colors.light.app_name = "custom01ff".into();
+        assert!(!cfg.migrate_card_text_style());
+        assert_eq!(cfg.colors.dark.app_name, "custom01ff");
+        assert_eq!(cfg.colors.light.app_name, "custom01ff");
+    }
+
+    #[test]
+    fn card_text_style_migration_handles_dark_color_pair() {
+        let mut cfg = Config::default();
+        cfg.fonts.title_size = 12.0; // 字体已是新默认,不触发字体分支 / fonts already new
+        cfg.colors.dark.app_name = "ddddddff".into();
+        cfg.colors.dark.win_title = "888888ff".into();
+        assert!(cfg.migrate_card_text_style());
+        assert_eq!(cfg.colors.dark.app_name, "FFFFFF57");
+        assert_eq!(cfg.colors.dark.win_title, "FFFFFFD1");
     }
 
     #[test]
