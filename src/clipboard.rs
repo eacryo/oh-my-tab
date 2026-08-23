@@ -260,7 +260,7 @@ const DETAIL_GAP: f64 = 8.0;
 const DETAIL_PAD: f64 = 12.0;
 /// 详情顶部工具栏与底部来源/统计栏高度。
 /// Heights of the detail toolbar and source/statistics footer.
-const DETAIL_TOOLBAR_H: f64 = 44.0;
+const DETAIL_TOOLBAR_H: f64 = 36.0;
 const DETAIL_FOOTER_H: f64 = 42.0;
 const DETAIL_CHROME_H: f64 = DETAIL_TOOLBAR_H + DETAIL_FOOTER_H;
 /// 被动详情窗口的 Liquid Glass 会被 AppKit 以非活动状态压暗;用当前玻璃 tint 的
@@ -4672,9 +4672,17 @@ unsafe fn make_detail_save_icon(alpha: f64) -> *mut AnyObject {
 /// image file" for image entries.
 unsafe fn add_detail_save_as_button(content: *mut AnyObject, width: f64, is_image: bool) {
     let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    // y 按工具栏高度推导居中(与软换行开关同款逻辑),不再硬编码——改 DETAIL_TOOLBAR_H
+    // 时不会漏改。
+    // The y offset derives from the toolbar height for vertical centering (same logic as
+    // the soft-wrap switch) instead of a hardcoded value that drifts on resize.
+    let save_y = (DETAIL_TOOLBAR_H - 28.0) / 2.0;
     let button: *mut AnyObject = msg_send![
         button,
-        initWithFrame: NSRect::new(NSPoint::new(width - 42.0, 8.0), NSSize::new(28.0, 28.0))
+        initWithFrame: NSRect::new(
+            NSPoint::new(width - 42.0, save_y),
+            NSSize::new(28.0, 28.0)
+        )
     ];
     let empty = make_nsstring("");
     let _: () = msg_send![button, setTitle: empty];
