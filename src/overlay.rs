@@ -1279,10 +1279,10 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
         for (old_view, frame, idx) in replacements {
             if let Some(w) = to_rebuild.get(&idx) {
                 remove_card_index(old_view);
-                // 沿用旧卡 frame 的宽(图标异步加载后原位替换,卡宽可能已是拉伸值)。
-                // Reuse the old card frame's width (in-place icon replacement after async
-                // extraction; the width may already be a stretched value).
-                let new_card = create_card_view(w, idx, frame.size.width);
+                // 沿用旧卡 frame 的宽高(原位替换:流式布局缩卡后高宽都是逐卡值)。
+                // Reuse the old card frame's width AND height (in-place replacement:
+                // after flow shrink both are per-card values).
+                let new_card = create_card_view(w, idx, frame.size.width, frame.size.height);
                 let _: () = msg_send![new_card, setFrame: frame];
                 let _: () = msg_send![old_view, removeFromSuperview];
                 let _: () = msg_send![container, addSubview: new_card];
@@ -1518,28 +1518,27 @@ unsafe fn add_preview_icon_fallback(
     }
 }
 
-pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) -> *mut AnyObject {
+pub(crate) fn create_card_view(
+    w: &WindowInfo,
+    index: usize,
+    card_width: f64,
+    card_h: f64,
+) -> *mut AnyObject {
     unsafe {
         let card_cls = CARD_CLASS.lock().unwrap().unwrap();
         let card_cls_ptr = card_cls.0 as *mut AnyObject;
 
-        // 缩略图开 = 设计稿新布局(标题行 + 16:10 预览区,高度由宽度推导);
-        // 关 = 旧版布局(居中大图标 + 两行文字,高度用配置 card_height)。
-        // Thumbnails on = the mockup layout (caption + 16:10 preview, height derived
-        // from width); off = the legacy layout (centered icon + two text lines,
-        // height from the configured card_height).
+        // 缩略图开 = 设计稿新布局(标题行 + 16:10 预览区);关 = 旧版布局
+        // (居中大图标 + 两行文字)。高度由调用方传入(流式布局缩卡后各卡
+        // 实际高度 < 基准值,内部几何必须按实际高度排布,否则标题行会被
+        // masksToBounds 裁掉——实测)。
+        // Thumbnails on = the mockup layout (caption + 16:10 preview); off = the
+        // legacy layout (centered icon + two text lines). The height comes from the
+        // caller: after the flow layout's shrink step each card's actual height is
+        // smaller than the base, and the internal geometry MUST be laid out from
+        // that actual height or masksToBounds clips the caption away (verified).
         let use_new = crate::theme::thumbnails_enabled();
-        // 流式布局:全网格统一高度(由配置 card_width 推导一次),宽度按各窗口
-        // 宽高比在 show_overlay 里逐卡计算后经 card_width 传入。
-        // Flow layout: one uniform height (derived once from the configured
-        // card_width); per-card widths come from each window's aspect ratio,
-        // computed in show_overlay and passed in via card_width.
-        let card_h_eff = if use_new {
-            crate::theme::thumb_card_h_fixed()
-        } else {
-            card_h()
-        };
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h_eff));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h));
         let view: *mut AnyObject = msg_send![card_cls_ptr, alloc];
         let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
 
@@ -1557,8 +1556,8 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
         let colors = current_colors();
 
         if use_new {
-            let preview_h = crate::theme::thumb_preview_h(card_h_eff);
-            let caption_y = card_h_eff - THUMB_PAD - THUMB_CAPTION_H;
+            let preview_h = (card_h - THUMB_PAD * 2.0 - THUMB_CAPTION_H - THUMB_GAP).max(40.0);
+            let caption_y = card_h - THUMB_PAD - THUMB_CAPTION_H;
 
             // --- 标题行:迷你图标 20pt(圆角 5,加载失败用首字母块) ---
             // --- Caption row: 20pt mini icon (radius 5, letter block on failure) ---
@@ -1697,7 +1696,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
             // ===== 旧版布局(缩略图关闭):居中大图标 + 两行文字 =====
             // ===== Legacy layout (thumbnails off): centered icon + two text lines =====
             let icon_x = (card_width - icon_px()) / 2.0; // 16.0
-            let icon_bottom = card_h() - 8.0 - icon_px(); // 64.0
+            let icon_bottom = card_h - 8.0 - icon_px(); // 64.0
 
             // --- Icon ---
             if let Some(ref icon_path) = w.icon_path {
@@ -1836,7 +1835,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
         // mouseEntered 悬停事件。activeInActiveApp(0x40) 在 app 非激活时不投递。
         let opts: u64 = 0x01 | 0x80;
         let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h_eff));
+        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h));
         let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds, options: opts, owner: view, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![view, addTrackingArea: ta];
         release_obj(ta); // view owns the tracking area; drop our alloc +1
@@ -1845,7 +1844,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
         // --- Close button: new layout puts it in the caption row (24px circle, the
         // mockup's .close); legacy keeps the 20px top-right one. ---
         let (btn_frame, btn_radius, btn_font_sz) = if use_new {
-            let caption_y = card_h_eff - THUMB_PAD - THUMB_CAPTION_H;
+            let caption_y = card_h - THUMB_PAD - THUMB_CAPTION_H;
             (
                 NSRect::new(
                     NSPoint::new(
@@ -1860,7 +1859,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
         } else {
             (
                 NSRect::new(
-                    NSPoint::new(card_width - 27.0, card_h() - 27.0),
+                    NSPoint::new(card_width - 27.0, card_h - 27.0),
                     NSSize::new(20.0, 20.0),
                 ),
                 6.0f64,
@@ -2143,7 +2142,7 @@ pub(crate) fn show_overlay() {
         for (idx, w) in windows.iter().enumerate() {
             let t_card = Instant::now(); // TIMING-DEBUG
             let (card_x, card_y, card_w_i) = pos[idx];
-            let card = create_card_view(w, idx, card_w_i);
+            let card = create_card_view(w, idx, card_w_i, card_h_outer);
             let card_ms = t_card.elapsed().as_millis(); // TIMING-DEBUG
             cards_total_ms += card_ms;
             // TIMING-DEBUG 单卡构建 >5ms:标记慢卡(图标加载/文本通常是耗时大头)。
