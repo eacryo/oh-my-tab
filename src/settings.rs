@@ -159,10 +159,11 @@ struct SettingsUi {
     card_height: *mut AnyObject,
     card_gap: *mut AnyObject,
     icon_size: *mut AnyObject,
-    modifier: *mut AnyObject,         // NSPopUpButton: option / command
-    locale: *mut AnyObject,           // NSPopUpButton: auto / en / zh-Hans / zh-Hant
-    show_minimized: *mut AnyObject,   // NSSwitch: 显示最小化窗口 / show minimized windows
-    windows_enabled: *mut AnyObject,  // NSSwitch: 窗口切换总开关 / app-switcher master switch
+    modifier: *mut AnyObject,           // NSPopUpButton: option / command
+    locale: *mut AnyObject,             // NSPopUpButton: auto / en / zh-Hans / zh-Hant
+    show_minimized: *mut AnyObject,     // NSSwitch: 显示最小化窗口 / show minimized windows
+    thumbnails_enabled: *mut AnyObject, // NSSwitch: 显示窗口缩略图 / show window thumbnails
+    windows_enabled: *mut AnyObject,    // NSSwitch: 窗口切换总开关 / app-switcher master switch
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
     log_level: *mut AnyObject,        // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject,  // NSSwitch: 开机自启 / launch at login
@@ -736,6 +737,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.windows.show_minimized
     );
     changed!(
+        "layout.thumbnails_enabled",
+        old.layout.thumbnails_enabled,
+        new.layout.thumbnails_enabled
+    );
+    changed!(
         "windows.overlay_position",
         old.windows.overlay_position,
         new.windows.overlay_position
@@ -859,6 +865,15 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
         crate::clipboard::start();
     } else {
         crate::clipboard::stop();
+    }
+
+    // 缩略图服务热切换:start 幂等;关闭时 worker/observer 每任务前检查配置自动休眠,
+    // 无需显式停止线程。
+    // Thumbnail-service hot-switch: start is idempotent; when off, the worker and
+    // observer re-check the config per job and sleep on their own -- no explicit
+    // thread shutdown needed.
+    if cfg.layout.thumbnails_enabled {
+        crate::thumbnail::start();
     }
 
     // persist 热切换:开启 → 从磁盘加载并合并历史(与 start() 的加载去重互幂等);
@@ -2394,6 +2409,14 @@ fn load_settings_from(cfg: &Config) {
             0isize
         };
         let _: () = msg_send![ui.show_minimized, setState: sm_state];
+        // thumbnails_enabled:switch 状态(1=on / 0=off)。
+        // thumbnails_enabled: switch state (1=on / 0=off).
+        let th_state = if cfg.layout.thumbnails_enabled {
+            1isize
+        } else {
+            0isize
+        };
+        let _: () = msg_send![ui.thumbnails_enabled, setState: th_state];
         // overlay_position:下拉框 index 0 = 跟随激活窗口(active_window), 1 = 主屏幕(main)。
         // overlay_position: popup index 0 = follow active window (active_window), 1 = main (main).
         let op_idx = match cfg.windows.overlay_position.as_str() {
@@ -2599,6 +2622,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         cfg.windows.enabled = we_state == 1;
         let sm_state: isize = msg_send![ui.show_minimized, state];
         cfg.windows.show_minimized = sm_state == 1;
+        // thumbnails_enabled:switch state(1=on / 0=off)。
+        // thumbnails_enabled: switch state (1=on / 0=off).
+        let th_state: isize = msg_send![ui.thumbnails_enabled, state];
+        cfg.layout.thumbnails_enabled = th_state == 1;
         // overlay_position:下拉框 index 0 = 跟随激活窗口, 1 = 主屏幕。
         // overlay_position: popup index 0 = follow active window, 1 = main.
         let op_idx: isize = msg_send![ui.overlay_position, indexOfSelectedItem];
@@ -2989,6 +3016,7 @@ fn create_settings_window() {
             card_height: std::ptr::null_mut(),
             card_gap: std::ptr::null_mut(),
             icon_size: std::ptr::null_mut(),
+            thumbnails_enabled: std::ptr::null_mut(),
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
             show_minimized: std::ptr::null_mut(),
@@ -3383,6 +3411,21 @@ fn create_settings_window() {
             225.0,
             row_h,
             &t("settings.row_show_minimized"),
+            make_switch(ctrl_x + ctrl_w, y, row_h, false),
+        );
+        y -= 8.0 + row_h;
+        // thumbnails_enabled 开关:关闭后浮窗回到纯图标渲染,缩略图服务休眠。
+        // 无屏幕录制权限时即使开启也自动休眠(见 thumbnail 模块)。
+        // thumbnails_enabled switch: off = the overlay returns to icon-only rendering
+        // and the thumbnail service sleeps. It also auto-sleeps without the Screen
+        // Recording permission even when on (see the thumbnail module).
+        ui.thumbnails_enabled = add_row(
+            general_view,
+            label_x,
+            y,
+            225.0,
+            row_h,
+            &t("settings.row_thumbnails"),
             make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
         y -= 8.0 + row_h;

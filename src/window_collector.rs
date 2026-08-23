@@ -371,11 +371,13 @@ static SLPS_POST_EVENT_RECORD: std::sync::LazyLock<Option<SlpsPostEventRecordFn>
 /// 取一个 AX 窗口的 CGWindowID（私有 API _AXUIElementGetWindow）。
 /// 用它把 AX 窗口和 CG 窗口按 CGWindowID 精确配对，不再靠顺序/标题猜
 /// （Edge 等 CG 无窗口名的 App 之前会配错，导致 mru/raise 跟错窗口）。
+/// 缩略图模块的 AXObserver 回调也用它解析新创建窗口的 cgwid。
 /// Get a CGWindowID for an AX window (private API _AXUIElementGetWindow).
 /// Used to pair AX windows with CG windows by CGWindowID instead of guessing
 /// by order/title (apps like Edge with no CG window name used to mismatch,
-/// corrupting mru/raise targeting).
-unsafe fn ax_window_cgwid(element: AXUIElementRef) -> Option<u32> {
+/// corrupting mru/raise targeting). The thumbnail module's AXObserver callback
+/// also uses it to resolve newly created windows' cgwids.
+pub(crate) unsafe fn ax_window_cgwid(element: AXUIElementRef) -> Option<u32> {
     let f = (*AX_GET_WINDOW)?;
     let mut wid: u32 = 0;
     if f(element, &mut wid) == K_AX_SUCCESS && wid != 0 {
@@ -1118,7 +1120,11 @@ fn ax_subrole_kept(subrole: Option<&str>, titled: bool) -> bool {
     }
 }
 
-fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)>> {
+/// 查某 PID 的全部标准 AX 窗口:(cgwid, 标题, 是否最小化)。collect_windows 与
+/// 缩略图模块的启动预生成共用。
+/// All standard AX windows for a PID: (cgwid, title, minimized). Shared between
+/// collect_windows and the thumbnail module's startup pre-generation.
+pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)>> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {

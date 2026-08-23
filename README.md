@@ -28,6 +28,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 - <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab, arrow keys, or mouse after Command/Option.
 - <img height="14" src="docs/icons/zap.svg"> **Featherweight**: pure Rust — 1.5 MB binary, ~35 MB memory. No Electron/Tauri.
 - <img height="14" src="docs/icons/star.svg"> **Liquid Glass**: floating overlay (macOS 26).
+- <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: Alt-Tab-style cards — caption row (mini app icon + window title + close) above a 16:10 live preview captured via a private WindowServer API; cached frames render instantly and refresh in the background; equal-height cards pack into rows by each window's aspect ratio. Requires **Screen Recording** permission — without it the switcher falls back to icon-only cards.
 - <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window never drags the app's others forward.
 - <img height="14" src="docs/icons/eye.svg"> **Full window visibility**: every real window, including off-screen and minimized (toggleable).
 - <img height="14" src="docs/icons/gear.svg"> **Hot-reloadable TOML**: validated config from the menu.
@@ -191,6 +192,7 @@ If `assets/AppIcon.icon` (a directory) is present, `bundle.sh` also bundles it i
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;Permissions & runtime caveats
 
 - The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary must be re-granted -- unless you sign with a stable identity (see [Code signing](#code-signing)), in which case the grant persists across rebuilds.
+- **Window thumbnails** additionally require the **Screen Recording** permission (a private WindowServer capture API is used, same as DockDoor/AltTab). Without it the switcher silently keeps icon-only cards; macOS 14+ may periodically re-ask you to re-confirm this permission. Frames are kept **in memory only** — nothing is ever written to disk.
 - If the event tap fails to create, the app prints an error and the shortcut silently does nothing — almost always a missing Accessibility grant.
 - Runtime config: `~/.config/oh-my-tab/config.toml` (auto-created with defaults on first run).
 - Icon cache: `~/Library/Caches/oh-my-tab-icons/{bundle-id}.png` (keyed by bundle id, with a `.meta` mtime sidecar).
@@ -248,6 +250,7 @@ card_width = 140.0
 card_height = 180.0
 card_gap = 0.0
 icon_size = 110.0
+thumbnails_enabled = true  # window thumbnails on cards (auto-sleeps without Screen Recording permission; card_width ~200 / card_height ~170 recommended for thumbnail mode)
 
 [colors]
 # Each palette has: status_bar_text, app_name, win_title, icon_inner_bg,

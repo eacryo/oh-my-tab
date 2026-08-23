@@ -773,7 +773,13 @@ pub(crate) fn update_status_label() {
             t("overlay.no_windows")
         } else {
             match state.windows.get(selected) {
-                Some(w) => truncate_text(&display_title(&w.window_title), 126),
+                // 设计稿 .footer-current:选中的「标题 · 应用名」。
+                // The mockup's .footer-current: the selected "title · app".
+                Some(w) => format!(
+                    "{} · {}",
+                    truncate_text(&display_title(&w.window_title), 96),
+                    truncate_text(&w.app_name, 40)
+                ),
                 None => String::new(),
             }
         };
@@ -1378,168 +1384,451 @@ unsafe fn grayed_image(orig: *mut AnyObject, size: NSSize) -> *mut AnyObject {
     img
 }
 
+/// CGImageRef -> NSImage(指定 pt 尺寸)。CG/CF 类型 objc2 的 msg_send! 编不了——
+/// 裸 c_void 会编出 '^v' 而方法期望 '^{CGImage=}',运行时直接 panic(实测把持有
+/// TAB_STATE 锁的 show_overlay 炸掉、锁中毒后每次 Cmd+Tab 连环崩);照
+/// layer_set_background 惯例走裸 objc_msgSend。
+/// CGImageRef -> NSImage at a given point size. CG/CF types cannot go through
+/// objc2's msg_send! -- a bare c_void encodes as '^v' while the method expects
+/// '^{CGImage=}', and the runtime panics (verified: it blew up show_overlay while
+/// it held the TAB_STATE lock, and the poisoned lock then crashed every following
+/// Cmd+Tab). Follows the layer_set_background raw objc_msgSend convention.
+pub(crate) unsafe fn nsimage_from_cgimage(cg: *const c_void, size: NSSize) -> *mut AnyObject {
+    let sel = sel!(initWithCGImage:size:);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut AnyObject, Sel, *const c_void, NSSize) -> *mut AnyObject;
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    if img.is_null() {
+        return std::ptr::null_mut();
+    }
+    f(img, sel, cg, size)
+}
+
+/// 左对齐标签(设计稿 .caption-title):固定宽度 + 尾部截断,不居中。
+/// A left-aligned label (the mockup's .caption-title): fixed width + tail
+/// truncation, no centering.
+unsafe fn make_left_label(
+    text: &str,
+    font: *mut AnyObject,
+    color: *mut AnyObject,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> *mut AnyObject {
+    let ns_str = make_nsstring(text);
+    let init_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: init_frame];
+    let _: () = msg_send![label, setStringValue: ns_str];
+    CFRelease(ns_str as *const c_void);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setTextColor: color];
+    // 尾部截断(NSLineBreakByTruncatingTail = 4):超宽自动省略号。
+    // Tail truncation (NSLineBreakByTruncatingTail = 4): ellipsis on overflow.
+    let _: () = msg_send![label, setLineBreakMode: 4isize];
+    label
+}
+
+/// 预览区无缩略图时的兜底内容:居中的大应用图标(或首字母块),最小化烘焙灰度。
+/// 在 container 本地坐标系里布局(container 尺寸 pw×ph)。
+/// Fallback content for a preview without a thumbnail: a centered large app icon
+/// (or first-letter block), grayscale-baked when minimized. Laid out in the
+/// container's local coordinates (container is pw×ph).
+unsafe fn add_preview_icon_fallback(
+    container: *mut AnyObject,
+    pw: f64,
+    ph: f64,
+    w: &WindowInfo,
+    colors: &Colors,
+) {
+    let big = (ph - 16.0).clamp(36.0, 72.0);
+    let cx = (pw - big) / 2.0;
+    let cy = (ph - big) / 2.0;
+    let frame = NSRect::new(NSPoint::new(cx, cy), NSSize::new(big, big));
+    let mut loaded: Option<*mut AnyObject> = None;
+    if let Some(ref icon_path) = w.icon_path {
+        let ns_path = make_nsstring(icon_path);
+        let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let img: *mut AnyObject = msg_send![img, initWithContentsOfFile: ns_path];
+        CFRelease(ns_path as *const c_void);
+        if !img.is_null() {
+            loaded = Some(img);
+        }
+    }
+    if let Some(img) = loaded {
+        let shown: *mut AnyObject = if w.minimized {
+            let g = grayed_image(img, NSSize::new(big, big));
+            release_obj(img);
+            g
+        } else {
+            img
+        };
+        let iv: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+        let iv: *mut AnyObject = msg_send![iv, initWithFrame: frame];
+        let _: () = msg_send![iv, setImage: shown];
+        release_obj(shown);
+        let _: () = msg_send![iv, setImageScaling: 3u64];
+        let _: () = msg_send![container, addSubview: iv];
+        release_obj(iv);
+    } else {
+        // 首字母块(圆角 + icon_inner_bg + 首字母),与旧版字母占位同款样式。
+        // First-letter block (rounded + icon_inner_bg + initial), same style as the
+        // legacy letter placeholder.
+        let lv: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+        let lv: *mut AnyObject = msg_send![lv, initWithFrame: frame];
+        let _: () = msg_send![lv, setWantsLayer: true];
+        let ll: *mut AnyObject = msg_send![lv, layer];
+        let _: () = msg_send![ll, setCornerRadius: 12.0f64];
+        let _: () = msg_send![ll, setMasksToBounds: true];
+        layer_set_background(ll, hex_to_cg_color(colors.icon_inner_bg));
+        let init_char = w.app_name.chars().next().unwrap_or('?').to_string();
+        let font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: 24.0f64, weight: 0.4f64];
+        let label = make_centered_label(
+            &init_char,
+            font,
+            hex_to_ns_color(colors.icon_text),
+            0.0,
+            big,
+            big,
+        );
+        let _: () = msg_send![lv, addSubview: label];
+        release_obj(label);
+        if w.minimized {
+            let dim: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let dim: *mut AnyObject = msg_send![dim, initWithFrame: frame];
+            let _: () = msg_send![dim, setWantsLayer: true];
+            let dl: *mut AnyObject = msg_send![dim, layer];
+            let _: () = msg_send![dl, setCornerRadius: 12.0f64];
+            let _: () = msg_send![dl, setMasksToBounds: true];
+            layer_set_background(dl, hex_to_cg_color(0x808080AA));
+            let _: () = msg_send![lv, addSubview: dim];
+            release_obj(dim);
+        }
+        let _: () = msg_send![container, addSubview: lv];
+        release_obj(lv);
+    }
+}
+
 pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) -> *mut AnyObject {
     unsafe {
         let card_cls = CARD_CLASS.lock().unwrap().unwrap();
         let card_cls_ptr = card_cls.0 as *mut AnyObject;
 
-        // 卡宽由调用方传入:正常态 = 配置 card_w();卡片不足一行时拉伸填满(见 show_overlay)。
-        // 内部元素(图标/标签)全部按实际卡宽居中,拉伸后不会偏左。
-        // The card width comes from the caller: config card_w() normally, stretched to fill the
-        // row when fewer cards than slots (see show_overlay). All inner elements (icon/labels)
-        // are centered against the actual width, so a stretched card stays balanced.
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h()));
+        // 缩略图开 = 设计稿新布局(标题行 + 16:10 预览区,高度由宽度推导);
+        // 关 = 旧版布局(居中大图标 + 两行文字,高度用配置 card_height)。
+        // Thumbnails on = the mockup layout (caption + 16:10 preview, height derived
+        // from width); off = the legacy layout (centered icon + two text lines,
+        // height from the configured card_height).
+        let use_new = crate::theme::thumbnails_enabled();
+        // 流式布局:全网格统一高度(由配置 card_width 推导一次),宽度按各窗口
+        // 宽高比在 show_overlay 里逐卡计算后经 card_width 传入。
+        // Flow layout: one uniform height (derived once from the configured
+        // card_width); per-card widths come from each window's aspect ratio,
+        // computed in show_overlay and passed in via card_width.
+        let card_h_eff = if use_new {
+            crate::theme::thumb_card_h_fixed()
+        } else {
+            card_h()
+        };
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h_eff));
         let view: *mut AnyObject = msg_send![card_cls_ptr, alloc];
         let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
 
         // Enable layer for selection border
         let _: () = msg_send![view, setWantsLayer: true];
         let layer: *mut AnyObject = msg_send![view, layer];
-        // 卡片圆角与参考样式一致,选中态背景和描边都沿用 14px 圆角。
-        // Match the reference style with a 14px radius for the selected background and border.
-        let _: () = msg_send![layer, setCornerRadius: 14.0f64];
+        // 新版圆角 16(设计稿 .item),旧版保持 14。
+        // 16px radius for the new layout (.item), legacy keeps 14.
+        let _: () = msg_send![layer, setCornerRadius: if use_new { 16.0f64 } else { 14.0f64 }];
         let _: () = msg_send![layer, setMasksToBounds: true];
 
         // Store card index in side map (avoids msg_send! issues on dynamic classes)
         set_card_index(view, index);
 
         let colors = current_colors();
-        let icon_x = (card_width - icon_px()) / 2.0; // 16.0
-                                                     // Standard coords: y=0 at bottom, y=200 at top.
-                                                     // Icon: 8px from top -> y = 200 - 8 - 128 = 64
-        let icon_bottom = card_h() - 8.0 - icon_px(); // 64.0
 
-        // --- Icon ---
-        if let Some(ref icon_path) = w.icon_path {
-            let ns_path = make_nsstring(icon_path);
-            let ns_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-            let ns_image: *mut AnyObject = msg_send![ns_image, initWithContentsOfFile: ns_path];
-            CFRelease(ns_path as *const c_void);
+        if use_new {
+            let preview_h = crate::theme::thumb_preview_h(card_h_eff);
+            let caption_y = card_h_eff - THUMB_PAD - THUMB_CAPTION_H;
 
-            if !ns_image.is_null() {
-                let img_frame = NSRect::new(
-                    NSPoint::new(icon_x, icon_bottom),
-                    NSSize::new(icon_px(), icon_px()),
-                );
-                let img_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-                let img_view: *mut AnyObject = msg_send![img_view, initWithFrame: img_frame];
-                // 最小化:把图标烘焙成灰度版(灰只落在图标 alpha 区域,不形成方框);否则用原图。
-                // Minimized: bake a grayed version (gray confined to the icon's alpha, no box); else original.
-                let image_to_show: *mut AnyObject = if w.minimized {
-                    let g = grayed_image(ns_image, NSSize::new(icon_px(), icon_px()));
-                    release_obj(ns_image); // 原图用完释放 / original no longer needed
-                    g
-                } else {
-                    ns_image
-                };
-                let _: () = msg_send![img_view, setImage: image_to_show];
-                release_obj(image_to_show); // img_view owns the image now; drop our alloc +1
-                                            // NSImageScaleProportionallyUpOrDown = 3
-                let _: () = msg_send![img_view, setImageScaling: 3u64];
-                let _: () = msg_send![img_view, setTag: ICON_VIEW_TAG];
-                let _: () = msg_send![view, addSubview: img_view];
-                release_obj(img_view); // view owns the image view now; drop our alloc +1
-            }
-        } else {
-            // Letter icon: rounded square with first letter
-            let letter_sq = letter_px();
-            let letter_x = icon_x + (icon_px() - letter_sq) / 2.0;
-            // Center the 64x64 square within the 128x128 icon area
-            let letter_y = icon_bottom + (icon_px() - letter_sq) / 2.0;
-            let letter_frame = NSRect::new(
-                NSPoint::new(letter_x, letter_y),
-                NSSize::new(letter_sq, letter_sq),
+            // --- 标题行:迷你图标 20pt(圆角 5,加载失败用首字母块) ---
+            // --- Caption row: 20pt mini icon (radius 5, letter block on failure) ---
+            let mini_sz = 20.0;
+            let mini_frame = NSRect::new(
+                NSPoint::new(THUMB_PAD, caption_y + (THUMB_CAPTION_H - mini_sz) / 2.0),
+                NSSize::new(mini_sz, mini_sz),
             );
-
-            // 字母头像容器用 NSImageView 承载:下方 viewWithTag 依赖 tag 定位,
-            // 而 setTag: 只有 NSControl 系(含 NSImageView)提供,裸 NSView 的
-            // tag 属性只读,objc2 调试期校验会直接 panic。
-            // The letter-avatar container uses NSImageView: the refresh path locates it via
-            // viewWithTag, and setTag: only exists on NSControl-derived classes -- a bare
-            // NSView's tag property is readonly and objc2's debug check would panic.
-            let letter_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-            let letter_view: *mut AnyObject = msg_send![letter_view, initWithFrame: letter_frame];
-            let _: () = msg_send![letter_view, setWantsLayer: true];
-            let _: () = msg_send![letter_view, setTag: ICON_VIEW_TAG];
-            let ll: *mut AnyObject = msg_send![letter_view, layer];
-            let _: () = msg_send![ll, setCornerRadius: 14.0f64];
-            let _: () = msg_send![ll, setMasksToBounds: true];
-            let bg_color = hex_to_cg_color(colors.icon_inner_bg);
-            layer_set_background(ll, bg_color);
-
-            let init = w.app_name.chars().next().unwrap_or('?').to_string();
-            let font: *mut AnyObject =
-                msg_send![class!(NSFont), systemFontOfSize: 28.0f64, weight: 0.4f64];
-            let text_color = hex_to_ns_color(colors.icon_text);
-            let label = make_centered_label(&init, font, text_color, 0.0, letter_sq, letter_sq);
-            let _: () = msg_send![letter_view, addSubview: label];
-            release_obj(label); // letter_view owns the label; drop our alloc +1
-            let _: () = msg_send![view, addSubview: letter_view];
-            release_obj(letter_view); // view owns the letter view; drop our alloc +1
-            if w.minimized {
-                // 最小化窗口:在字母图标上叠浅灰半透明遮罩(圆角与字母背景一致)。
-                // Minimized window: overlay a light wash on the letter icon (radius matches the bg).
-                let dim: *mut AnyObject = msg_send![class!(NSView), alloc];
-                let dim: *mut AnyObject = msg_send![dim, initWithFrame: letter_frame];
-                let _: () = msg_send![dim, setWantsLayer: true];
-                let dl: *mut AnyObject = msg_send![dim, layer];
-                let _: () = msg_send![dl, setCornerRadius: 14.0f64];
-                let _: () = msg_send![dl, setMasksToBounds: true];
-                layer_set_background(dl, hex_to_cg_color(0x808080AA));
-                let _: () = msg_send![view, addSubview: dim];
-                release_obj(dim);
+            let mut mini_img: Option<*mut AnyObject> = None;
+            if let Some(ref icon_path) = w.icon_path {
+                let ns_path = make_nsstring(icon_path);
+                let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                let img: *mut AnyObject = msg_send![img, initWithContentsOfFile: ns_path];
+                CFRelease(ns_path as *const c_void);
+                if !img.is_null() {
+                    mini_img = Some(img);
+                }
             }
+            let mini: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+            let mini: *mut AnyObject = msg_send![mini, initWithFrame: mini_frame];
+            let _: () = msg_send![mini, setWantsLayer: true];
+            let ml: *mut AnyObject = msg_send![mini, layer];
+            let _: () = msg_send![ml, setCornerRadius: 5.0f64];
+            let _: () = msg_send![ml, setMasksToBounds: true];
+            match mini_img {
+                Some(img) => {
+                    let _: () = msg_send![mini, setImage: img];
+                    release_obj(img);
+                    let _: () = msg_send![mini, setImageScaling: 3u64];
+                }
+                None => {
+                    layer_set_background(ml, hex_to_cg_color(colors.icon_inner_bg));
+                    let init_char = w.app_name.chars().next().unwrap_or('?').to_string();
+                    let font: *mut AnyObject =
+                        msg_send![class!(NSFont), systemFontOfSize: 10.0f64, weight: 0.5f64];
+                    let label = make_centered_label(
+                        &init_char,
+                        font,
+                        hex_to_ns_color(colors.icon_text),
+                        0.0,
+                        mini_sz,
+                        mini_sz,
+                    );
+                    let _: () = msg_send![mini, addSubview: label];
+                    release_obj(label);
+                }
+            }
+            let _: () = msg_send![view, addSubview: mini];
+            release_obj(mini);
+
+            // --- 标题(左对齐,尾部截断;应用名沉到底部状态栏) ---
+            // --- Title (left-aligned, tail-truncated; the app name sinks into the
+            // status footer) ---
+            let title_x = THUMB_PAD + mini_sz + 8.0;
+            let close_sz = 24.0;
+            let title_w = (card_width - title_x - close_sz - THUMB_PAD).max(20.0);
+            let title_font: *mut AnyObject = {
+                let cfg = CONFIG.read().unwrap();
+                msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
+            };
+            let title_label = make_left_label(
+                &display_title(&w.window_title),
+                title_font,
+                hex_to_ns_color(colors.win_title),
+                title_x,
+                caption_y + (THUMB_CAPTION_H - 18.0) / 2.0,
+                title_w,
+                18.0,
+            );
+            let _: () = msg_send![view, addSubview: title_label];
+            release_obj(title_label);
+
+            // --- 预览区(16:10,圆角 10,1px 描边) ---
+            // --- Preview area (16:10, radius 10, 1px border) ---
+            let preview_frame = NSRect::new(
+                NSPoint::new(THUMB_PAD, THUMB_PAD),
+                NSSize::new(card_width - THUMB_PAD * 2.0, preview_h),
+            );
+            let container: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let container: *mut AnyObject = msg_send![container, initWithFrame: preview_frame];
+            let _: () = msg_send![container, setWantsLayer: true];
+            let cl: *mut AnyObject = msg_send![container, layer];
+            let _: () = msg_send![cl, setCornerRadius: 10.0f64];
+            let _: () = msg_send![cl, setMasksToBounds: true];
+            let _: () = msg_send![cl, setBorderWidth: 1.0f64];
+            layer_set_border(cl, hex_to_cg_color(colors.preview_border));
+            layer_set_background(cl, hex_to_cg_color(colors.icon_inner_bg));
+
+            let pw = preview_frame.size.width;
+            let ph = preview_frame.size.height;
+            let mut thumb: Option<(*const c_void, u32, u32)> = None;
+            if crate::thumbnail::capture_allowed() && w.bounds.2 > 0.0 && w.bounds.3 > 0.0 {
+                thumb = crate::thumbnail::lookup_retained(w.pid, w.window_id);
+            }
+            if let Some((cg, w_px, h_px)) = thumb {
+                // aspect-fit:先按窗口像素比例算出完整可见的绘制尺寸,NSImage 直接以
+                // 该尺寸创建——自然尺寸 == 视图尺寸,ScaleNone 恰好铺满且窗口完整可见
+                // (此前用自然 pt 尺寸 + ScaleNone,图片按原尺寸绘制被容器裁剪,
+                // 表现为"只看到窗口的一部分")。
+                // Aspect-fit: derive the fully-visible drawn size from the window's
+                // pixel aspect first, then create the NSImage at EXACTLY that size --
+                // natural size == view size, so ScaleNone fills the view and the whole
+                // window stays visible. (Previously the image kept its natural point
+                // size and got clipped by the container -- "only part of the window".)
+                let (cw, ch) = crate::thumbnail::fit_size(w_px as f64, h_px as f64, pw, ph);
+                let nsimg = nsimage_from_cgimage(cg, NSSize::new(cw, ch));
+                CFRelease(cg); // lookup 给的 +1 已被 NSImage 持有 / NSImage retains its own copy
+                if !nsimg.is_null() {
+                    let shown: *mut AnyObject = if w.minimized {
+                        let g = grayed_image(nsimg, NSSize::new(cw, ch));
+                        release_obj(nsimg);
+                        g
+                    } else {
+                        nsimg
+                    };
+                    let iv: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+                    let iv: *mut AnyObject = msg_send![iv, initWithFrame: NSRect::new(
+                        NSPoint::new((pw - cw) / 2.0, (ph - ch) / 2.0),
+                        NSSize::new(cw, ch)
+                    )];
+                    let _: () = msg_send![iv, setImage: shown];
+                    release_obj(shown);
+                    let _: () = msg_send![iv, setImageScaling: 2u64]; // 尺寸已精确,不再缩放 / exact size, no scaling
+                    let _: () = msg_send![container, addSubview: iv];
+                    release_obj(iv);
+                } else {
+                    add_preview_icon_fallback(container, pw, ph, w, &colors);
+                }
+            } else {
+                add_preview_icon_fallback(container, pw, ph, w, &colors);
+            }
+
+            let _: () = msg_send![view, addSubview: container];
+            release_obj(container); // view owns the container; drop our alloc +1
+        } else {
+            // ===== 旧版布局(缩略图关闭):居中大图标 + 两行文字 =====
+            // ===== Legacy layout (thumbnails off): centered icon + two text lines =====
+            let icon_x = (card_width - icon_px()) / 2.0; // 16.0
+            let icon_bottom = card_h() - 8.0 - icon_px(); // 64.0
+
+            // --- Icon ---
+            if let Some(ref icon_path) = w.icon_path {
+                let ns_path = make_nsstring(icon_path);
+                let ns_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                let ns_image: *mut AnyObject = msg_send![ns_image, initWithContentsOfFile: ns_path];
+                CFRelease(ns_path as *const c_void);
+
+                if !ns_image.is_null() {
+                    let img_frame = NSRect::new(
+                        NSPoint::new(icon_x, icon_bottom),
+                        NSSize::new(icon_px(), icon_px()),
+                    );
+                    let img_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+                    let img_view: *mut AnyObject = msg_send![img_view, initWithFrame: img_frame];
+                    // 最小化:把图标烘焙成灰度版(灰只落在图标 alpha 区域,不形成方框);否则用原图。
+                    // Minimized: bake a grayed version (gray confined to the icon's alpha, no box); else original.
+                    let image_to_show: *mut AnyObject = if w.minimized {
+                        let g = grayed_image(ns_image, NSSize::new(icon_px(), icon_px()));
+                        release_obj(ns_image); // 原图用完释放 / original no longer needed
+                        g
+                    } else {
+                        ns_image
+                    };
+                    let _: () = msg_send![img_view, setImage: image_to_show];
+                    release_obj(image_to_show); // img_view owns the image now; drop our alloc +1
+                                                // NSImageScaleProportionallyUpOrDown = 3
+                    let _: () = msg_send![img_view, setImageScaling: 3u64];
+                    let _: () = msg_send![img_view, setTag: ICON_VIEW_TAG];
+                    let _: () = msg_send![view, addSubview: img_view];
+                    release_obj(img_view); // view owns the image view now; drop our alloc +1
+                }
+            } else {
+                // Letter icon: rounded square with first letter
+                let letter_sq = letter_px();
+                let letter_x = icon_x + (icon_px() - letter_sq) / 2.0;
+                // Center the 64x64 square within the 128x128 icon area
+                let letter_y = icon_bottom + (icon_px() - letter_sq) / 2.0;
+                let letter_frame = NSRect::new(
+                    NSPoint::new(letter_x, letter_y),
+                    NSSize::new(letter_sq, letter_sq),
+                );
+
+                // 字母头像容器用 NSImageView 承载:下方 viewWithTag 依赖 tag 定位,
+                // 而 setTag: 只有 NSControl 系(含 NSImageView)提供,裸 NSView 的
+                // tag 属性只读,objc2 调试期校验会直接 panic。
+                // The letter-avatar container uses NSImageView: the refresh path locates it via
+                // viewWithTag, and setTag: only exists on NSControl-derived classes -- a bare
+                // NSView's tag property is readonly and objc2's debug check would panic.
+                let letter_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+                let letter_view: *mut AnyObject =
+                    msg_send![letter_view, initWithFrame: letter_frame];
+                let _: () = msg_send![letter_view, setWantsLayer: true];
+                let _: () = msg_send![letter_view, setTag: ICON_VIEW_TAG];
+                let ll: *mut AnyObject = msg_send![letter_view, layer];
+                let _: () = msg_send![ll, setCornerRadius: 14.0f64];
+                let _: () = msg_send![ll, setMasksToBounds: true];
+                let bg_color = hex_to_cg_color(colors.icon_inner_bg);
+                layer_set_background(ll, bg_color);
+
+                let init = w.app_name.chars().next().unwrap_or('?').to_string();
+                let font: *mut AnyObject =
+                    msg_send![class!(NSFont), systemFontOfSize: 28.0f64, weight: 0.4f64];
+                let text_color = hex_to_ns_color(colors.icon_text);
+                let label = make_centered_label(&init, font, text_color, 0.0, letter_sq, letter_sq);
+                let _: () = msg_send![letter_view, addSubview: label];
+                release_obj(label); // letter_view owns the label; drop our alloc +1
+                let _: () = msg_send![view, addSubview: letter_view];
+                release_obj(letter_view); // view owns the letter view; drop our alloc +1
+                if w.minimized {
+                    // 最小化窗口:在字母图标上叠浅灰半透明遮罩(圆角与字母背景一致)。
+                    // Minimized window: overlay a light wash on the letter icon (radius matches the bg).
+                    let dim: *mut AnyObject = msg_send![class!(NSView), alloc];
+                    let dim: *mut AnyObject = msg_send![dim, initWithFrame: letter_frame];
+                    let _: () = msg_send![dim, setWantsLayer: true];
+                    let dl: *mut AnyObject = msg_send![dim, layer];
+                    let _: () = msg_send![dl, setCornerRadius: 14.0f64];
+                    let _: () = msg_send![dl, setMasksToBounds: true];
+                    layer_set_background(dl, hex_to_cg_color(0x808080AA));
+                    let _: () = msg_send![view, addSubview: dim];
+                    release_obj(dim);
+                }
+            }
+
+            // Gap below icon before text starts
+            let text_gap: f64 = 6.0;
+            // 主行 = 窗口标题,次行 = 应用名:标题 12px medium 深色(win_title),
+            // 应用名 10px regular 浅色(app_name)。
+            // Primary line = window title, secondary = app name: title 12px medium
+            // (win_title), app name 10px regular (app_name).
+            let primary_bottom = icon_bottom - text_gap - 18.0; // 64 - 6 - 18 = 40
+                                                                // 次行:16px 高,贴卡片底部。
+                                                                // Secondary line: 16px tall at the bottom.
+            let secondary_bottom = primary_bottom - 2.0 - 16.0; // 40 - 2 - 16 = 22
+
+            // --- 主行:窗口标题(12px medium 深色)---
+            // --- Primary line: window title (12px medium, dark).
+            let primary_font: *mut AnyObject = {
+                let cfg = CONFIG.read().unwrap();
+                msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
+            };
+            let primary_color = hex_to_ns_color(colors.win_title);
+            let title_label = make_centered_label(
+                &truncate_text(&display_title(&w.window_title), 20),
+                primary_font,
+                primary_color,
+                primary_bottom,
+                card_width,
+                18.0,
+            );
+            let _: () = msg_send![view, addSubview: title_label];
+            release_obj(title_label); // view owns the label; drop our alloc +1
+
+            // --- 次行:应用名(10px regular 浅色)---
+            // --- Secondary line: app name (10px regular, light).
+            let secondary_font: *mut AnyObject = {
+                let cfg = CONFIG.read().unwrap();
+                msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.app_name_size, weight: cfg.fonts.app_name_weight]
+            };
+            let secondary_color = hex_to_ns_color(colors.app_name);
+            let name_label = make_centered_label(
+                &truncate_text(&w.app_name, 17),
+                secondary_font,
+                secondary_color,
+                secondary_bottom,
+                card_width,
+                16.0,
+            );
+            let _: () = msg_send![view, addSubview: name_label];
+            release_obj(name_label); // view owns the label; drop our alloc +1
         }
-
-        // Gap below icon before text starts
-        let text_gap: f64 = 6.0;
-        // 主行 = 窗口标题,次行 = 应用名(HTML 参考 preview (1).html):标题 12px
-        // medium 深色(win_title),应用名 10px regular 浅色(app_name)。字体/配色键
-        // 与内容语义对齐;样式跟随内容,槽位只提供位置。
-        // Primary line = window title, secondary = app name (HTML reference preview
-        // (1).html): title at 12px medium in the dark color (win_title), app name at
-        // 10px regular in the light color (app_name). Font/color keys align with their
-        // content semantics; slots only position.
-        let primary_bottom = icon_bottom - text_gap - 18.0; // 64 - 6 - 18 = 40
-                                                            // 次行:16px 高,贴卡片底部。
-                                                            // Secondary line: 16px tall at the bottom.
-        let secondary_bottom = primary_bottom - 2.0 - 16.0; // 40 - 2 - 16 = 22
-
-        // --- 主行:窗口标题(12px medium 深色)---
-        // --- Primary line: window title (12px medium, dark).
-        let primary_font: *mut AnyObject = {
-            let cfg = CONFIG.read().unwrap();
-            msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
-        };
-        let primary_color = hex_to_ns_color(colors.win_title);
-        let title_label = make_centered_label(
-            &truncate_text(&display_title(&w.window_title), 20),
-            primary_font,
-            primary_color,
-            primary_bottom,
-            card_width,
-            18.0,
-        );
-        let _: () = msg_send![view, addSubview: title_label];
-        release_obj(title_label); // view owns the label; drop our alloc +1
-
-        // --- 次行:应用名(10px regular 浅色)---
-        // --- Secondary line: app name (10px regular, light).
-        let secondary_font: *mut AnyObject = {
-            let cfg = CONFIG.read().unwrap();
-            msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.app_name_size, weight: cfg.fonts.app_name_weight]
-        };
-        let secondary_color = hex_to_ns_color(colors.app_name);
-        let name_label = make_centered_label(
-            &truncate_text(&w.app_name, 17),
-            secondary_font,
-            secondary_color,
-            secondary_bottom,
-            card_width,
-            16.0,
-        );
-        let _: () = msg_send![view, addSubview: name_label];
-        release_obj(name_label); // view owns the label; drop our alloc +1
 
         // --- Tracking area for hover ---
         // NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
@@ -1547,31 +1836,52 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
         // mouseEntered 悬停事件。activeInActiveApp(0x40) 在 app 非激活时不投递。
         let opts: u64 = 0x01 | 0x80;
         let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h()));
+        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h_eff));
         let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds, options: opts, owner: view, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![view, addTrackingArea: ta];
         release_obj(ta); // view owns the tracking area; drop our alloc +1
 
-        // --- 右上角关闭按钮:按 HTML 参考使用 ×,选中/悬停显示,按钮悬停变红 ---
-        // Top-right close button: use the HTML reference's ×, show on selection/hover, and turn red on button hover.
+        // --- 关闭按钮:新版在标题行右侧(圆形 24,设计稿 .close);旧版保持右上角 20 ---
+        // --- Close button: new layout puts it in the caption row (24px circle, the
+        // mockup's .close); legacy keeps the 20px top-right one. ---
+        let (btn_frame, btn_radius, btn_font_sz) = if use_new {
+            let caption_y = card_h_eff - THUMB_PAD - THUMB_CAPTION_H;
+            (
+                NSRect::new(
+                    NSPoint::new(
+                        card_width - THUMB_PAD - 24.0,
+                        caption_y + (THUMB_CAPTION_H - 24.0) / 2.0,
+                    ),
+                    NSSize::new(24.0, 24.0),
+                ),
+                12.0f64,
+                13.0f64,
+            )
+        } else {
+            (
+                NSRect::new(
+                    NSPoint::new(card_width - 27.0, card_h() - 27.0),
+                    NSSize::new(20.0, 20.0),
+                ),
+                6.0f64,
+                12.0f64,
+            )
+        };
         let btn: *mut AnyObject = msg_send![close_button_class(), alloc];
-        let btn: *mut AnyObject = msg_send![btn, initWithFrame: NSRect::new(
-            NSPoint::new(card_width - 27.0, card_h() - 27.0),
-            NSSize::new(20.0, 20.0)
-        )];
+        let btn: *mut AnyObject = msg_send![btn, initWithFrame: btn_frame];
         let _: () = msg_send![btn, setBordered: false];
         let title_ns = make_nsstring("×");
         let _: () = msg_send![btn, setTitle: title_ns];
         CFRelease(title_ns as *const c_void);
         let close_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 12.0f64, weight: 0.0f64];
+            msg_send![class!(NSFont), systemFontOfSize: btn_font_sz, weight: 0.0f64];
         let _: () = msg_send![btn, setFont: close_font];
         let _: () = msg_send![btn, setAlignment: 1isize]; // NSTextAlignmentCenter on arm64
                                                           // HTML .close 的默认状态是透明背景 + 半透明黑色文字。
                                                           // The HTML .close base state uses a transparent background and translucent black text.
         let _: () = msg_send![btn, setWantsLayer: true];
         let bl: *mut AnyObject = msg_send![btn, layer];
-        let _: () = msg_send![bl, setCornerRadius: 6.0f64];
+        let _: () = msg_send![bl, setCornerRadius: btn_radius];
         let _: () = msg_send![bl, setMasksToBounds: true];
         set_close_button_hover_style(btn, false);
         let _: () = msg_send![btn, setTag: CLOSE_BTN_TAG];
@@ -1586,7 +1896,7 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
         let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
         let ta: *mut AnyObject = msg_send![ta, initWithRect: NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(20.0, 20.0)
+            NSSize::new(24.0, 24.0)
         ), options: opts, owner: btn, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![btn, addTrackingArea: ta];
         release_obj(ta);
@@ -1618,13 +1928,18 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
 /// containing the key window, so summoning while the active app sits on a secondary display
 /// would resolve to that display, making "always on main screen" behave like "follow active
 /// window". The primary display is screens[0].
-fn overlay_target_screen(windows: &[WindowInfo]) -> NSRect {
+/// 返回 (目标屏幕 frame, 该屏 visibleFrame)。visibleFrame 排除菜单栏/Dock,
+/// 流式布局的高度上限按它计算(BetterCmdTab 同款 visibleFrame × 0.85)。
+/// Returns (target screen frame, its visibleFrame). visibleFrame excludes the menu
+/// bar/Dock; the flow layout's height cap uses it (BetterCmdTab-style
+/// visibleFrame x 0.85).
+fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect) {
     unsafe {
         let pos = CONFIG.read().unwrap().windows.overlay_position.clone();
         // 主显示器 = screens[0](系统保证首屏带菜单栏);screens 为空时回退 mainScreen。
         // Primary display = screens[0] (first entry hosts the menu bar); fall back to
         // mainScreen if the screens array is somehow empty.
-        let main_frame: NSRect = {
+        let main_screen_obj: *mut AnyObject = {
             let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
             let count: usize = msg_send![screens, count];
             if count > 0 {
@@ -1632,26 +1947,28 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> NSRect {
                 // 传整数字面量会被推断为 i32('i'),objc2 运行时校验会 panic。
                 // objectAtIndex: expects a 'q' (signed long) argument; pass isize/i64 or
                 // objc2's runtime encoding check panics on an i32 literal.
-                let s: *mut AnyObject = msg_send![screens, objectAtIndex: 0isize];
-                msg_send![s, frame]
+                msg_send![screens, objectAtIndex: 0isize]
             } else {
-                let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-                msg_send![main, frame]
+                msg_send![class!(NSScreen), mainScreen]
             }
         };
+        let main_frame: NSRect = msg_send![main_screen_obj, frame];
         if pos != "active_window" {
-            return main_frame;
+            let vf: NSRect = msg_send![main_screen_obj, visibleFrame];
+            return (main_frame, vf);
         }
         // 激活窗口:collect_windows 排序后 index 0 = 当前前台窗口(is_active 已置位)。
         // The active window: after collect_windows' sort, index 0 is the frontmost (is_active set).
         let Some(active) = windows.iter().find(|w| w.is_active) else {
-            return main_frame;
+            let vf: NSRect = msg_send![main_screen_obj, visibleFrame];
+            return (main_frame, vf);
         };
         let (bx, by, bw, bh) = active.bounds;
         // bounds 全 0 = 未获取到,无法定位,回退主屏。
         // All-zero bounds = unavailable, can't locate, fall back to the main screen.
         if bw <= 0.0 || bh <= 0.0 {
-            return main_frame;
+            let vf: NSRect = msg_send![main_screen_obj, visibleFrame];
+            return (main_frame, vf);
         }
         let cx = bx + bw / 2.0;
         let cy = by + bh / 2.0;
@@ -1670,11 +1987,13 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> NSRect {
                 && cy >= f.origin.y
                 && cy <= f.origin.y + f.size.height
             {
-                return f;
+                let vf: NSRect = msg_send![s, visibleFrame];
+                return (f, vf);
             }
             i += 1;
         }
-        main_frame
+        let vf: NSRect = msg_send![main_screen_obj, visibleFrame];
+        (main_frame, vf)
     }
 }
 
@@ -1708,31 +2027,123 @@ pub(crate) fn show_overlay() {
 
         // Clear old card index mappings, then create new card views
         clear_card_indices();
-        let h = window_height(count);
-        // 窗口宽按「槽位」计算:最少 3 个槽位(count<3 时也保持三卡宽,空窗口态同样)。
-        // 槽位 = min(每行卡数配置, max(3, count))。
-        // The window width is based on "slots": at least 3 (count<3 and the empty state keep
-        // the three-card width). slots = min(cards-per-row config, max(3, count)).
-        let slots = cards_per_row().min(count.max(3));
-        let w = window_width(slots);
-        // 卡片不足槽位(1-2 卡)时拉伸填满整行,不留右空白;卡片内部元素按实际卡宽居中
-        // (见 create_card_view 的 card_width 参数)。其余情况用配置卡宽、行内居中。
-        // With fewer cards than slots (1-2), cards stretch to fill the row -- no right-side
-        // blank; inner elements center on the actual card width (see create_card_view's
-        // card_width). Otherwise the configured width applies and the row is centered.
-        let (card_w_eff, pitch, start_x) = if count > 0 && count < slots {
-            let inner = w - H_PADDING * 2.0;
-            let cw = (inner - (count as f64 - 1.0) * card_gap()) / count as f64;
-            (cw, cw + card_gap(), H_PADDING)
+        // 目标屏幕先行计算:流式布局需要屏宽作装箱上限,居中也复用。
+        // The target screen comes first: the flow layout needs its width as the
+        // packing budget; centering reuses it.
+        let (screen_frame, screen_visible) = overlay_target_screen(&windows);
+        let use_flow = crate::theme::thumbnails_enabled();
+        let flow_card_h = thumb_card_h_fixed();
+
+        // (x, y, w) per card — 两种布局统一产出位置表,卡片循环共用。
+        // (x, y, w) per card — both layouts produce one position table consumed by
+        // the single card loop below.
+        let (h, w, pos, flow_card_h_use): (f64, f64, Vec<(f64, f64, f64)>, f64) = if use_flow {
+            // ===== 流式布局(缩略图模式):等高不等宽,贪心装箱,行内居中 =====
+            // 窗口宽高比决定卡宽;极端比例被 clamp_aspect 钳制;每行能容纳的
+            // 卡片数随行内已占宽度自然变化。
+            // 高度上限 = 目标屏 visibleFrame × 0.85(BetterCmdTab 同款):超限按
+            // 0.05 步长整体缩卡重排,下限 0.5。
+            // ===== Flow layout (thumbnail mode): uniform height, per-aspect widths
+            // ===== greedily packed into rows; per-row capacity varies naturally.
+            // Height cap = target screen visibleFrame x 0.85 (BetterCmdTab-style):
+            // on overflow, shrink all cards by 0.05 steps and re-pack, floor 0.5.
+            let gap = card_gap();
+            let max_inner = ((screen_frame.size.width - H_PADDING * 2.0) * 0.92)
+                .clamp(300.0, 1240.0 - H_PADDING * 2.0);
+            let max_panel_h = (screen_visible.size.height * 0.85).max(240.0);
+            let mut scale = 1.0f64;
+            let (panel_w, panel_h, pos, card_h_use) = loop {
+                let card_h = flow_card_h * scale;
+                let widths: Vec<f64> = windows
+                    .iter()
+                    .map(|wi| {
+                        let (_, _, bw, bh) = wi.bounds;
+                        let aspect = if bw > 0.0 && bh > 0.0 {
+                            bw / bh
+                        } else {
+                            THUMB_PREVIEW_RATIO // bounds 未知按 16:10 / unknown -> 16:10
+                        };
+                        thumb_card_w_for_aspect(card_h, aspect)
+                    })
+                    .collect();
+                let rows = pack_rows(&widths, max_inner, gap);
+                let n_rows = rows.len().max(1); // 空窗口态保底一行高度 / floor for the empty state
+                let inner_w = rows
+                    .iter()
+                    .map(|r| {
+                        if r.is_empty() {
+                            0.0
+                        } else {
+                            r.iter().map(|&i| widths[i]).sum::<f64>() + (r.len() - 1) as f64 * gap
+                        }
+                    })
+                    .fold(0.0f64, f64::max)
+                    .max(280.0);
+                let panel_w = inner_w + H_PADDING * 2.0;
+                let panel_h = 32.0 + n_rows as f64 * card_h + (n_rows - 1) as f64 * gap + STATUS_H;
+                if panel_h <= max_panel_h || scale <= 0.5 {
+                    let mut pos: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); windows.len()];
+                    // 行内居中:每行宽度不同,各自在面板内水平居中。
+                    // Center each row: widths differ per row, so rows center individually.
+                    for (ri, row) in rows.iter().enumerate() {
+                        if row.is_empty() {
+                            continue;
+                        }
+                        let row_w: f64 = row.iter().map(|&i| widths[i]).sum::<f64>()
+                            + (row.len() - 1) as f64 * gap;
+                        let mut x = (panel_w - row_w) / 2.0;
+                        let y = panel_h - 32.0 - (ri as f64 + 1.0) * card_h - ri as f64 * gap;
+                        for &i in row {
+                            pos[i] = (x, y, widths[i]);
+                            x += widths[i] + gap;
+                        }
+                    }
+                    break (panel_w, panel_h, pos, card_h);
+                }
+                scale = (scale - 0.05).max(0.5);
+            };
+            (panel_h, panel_w, pos, card_h_use)
         } else {
-            let row_width = slots as f64 * card_w() + (slots.saturating_sub(1)) as f64 * card_gap();
-            (card_w(), card_w() + card_gap(), (w - row_width) / 2.0)
+            // ===== 旧版均匀网格(纯图标模式)=====
+            // 窗口宽按「槽位」计算:最少 3 个槽位(count<3 时也保持三卡宽,空窗口态同样)。
+            // 槽位 = min(每行卡数配置, max(3, count))。
+            // ===== Legacy uniform grid (icon-only mode). The window width is based on
+            // ===== "slots": at least 3. slots = min(cards-per-row config, max(3, count)).
+            let h = window_height(count);
+            let slots = cards_per_row().min(count.max(3));
+            let w = window_width(slots);
+            // 卡片不足槽位(1-2 卡)时拉伸填满整行,不留右空白;卡片内部元素按实际卡宽居中
+            // (见 create_card_view 的 card_width 参数)。其余情况用配置卡宽、行内居中。
+            // With fewer cards than slots (1-2), cards stretch to fill the row -- no right-side
+            // blank; inner elements center on the actual card width (see create_card_view's
+            // card_width). Otherwise the configured width applies and the row is centered.
+            let (card_w_eff, pitch, start_x) = if count > 0 && count < slots {
+                let inner = w - H_PADDING * 2.0;
+                let cw = (inner - (count as f64 - 1.0) * card_gap()) / count as f64;
+                (cw, cw + card_gap(), H_PADDING)
+            } else {
+                let row_width =
+                    slots as f64 * card_w() + (slots.saturating_sub(1)) as f64 * card_gap();
+                (card_w(), card_w() + card_gap(), (w - row_width) / 2.0)
+            };
+            let mut pos: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); windows.len()];
+            for (idx, _) in windows.iter().enumerate() {
+                // Standard coords: y=0 at bottom. Cards stack from top down.
+                let col = idx % cards_per_row();
+                let row = idx / cards_per_row();
+                let x = start_x + col as f64 * pitch;
+                let y = h - 32.0 - (row + 1) as f64 * card_h();
+                pos[idx] = (x, y, card_w_eff);
+            }
+            (h, w, pos, card_h())
         };
+        let card_h_outer = flow_card_h_use;
 
         let mut cards_total_ms: u128 = 0; // TIMING-DEBUG
         for (idx, w) in windows.iter().enumerate() {
             let t_card = Instant::now(); // TIMING-DEBUG
-            let card = create_card_view(w, idx, card_w_eff);
+            let (card_x, card_y, card_w_i) = pos[idx];
+            let card = create_card_view(w, idx, card_w_i);
             let card_ms = t_card.elapsed().as_millis(); // TIMING-DEBUG
             cards_total_ms += card_ms;
             // TIMING-DEBUG 单卡构建 >5ms:标记慢卡(图标加载/文本通常是耗时大头)。
@@ -1745,15 +2156,9 @@ pub(crate) fn show_overlay() {
                 );
             }
 
-            // Standard coords: y=0 at bottom. Cards stack from top down.
-            let col = idx % cards_per_row();
-            let row = idx / cards_per_row();
-            let card_x = start_x + col as f64 * pitch;
-            // topmost card origin_y = h - 32.0 - card_h() (32 = top padding area)
-            let card_y = h - 32.0 - (row + 1) as f64 * card_h();
             let card_frame = NSRect::new(
                 NSPoint::new(card_x, card_y),
-                NSSize::new(card_w_eff, card_h()),
+                NSSize::new(card_w_i, card_h_outer),
             );
             let _: () = msg_send![card, setFrame: card_frame];
 
@@ -1762,8 +2167,6 @@ pub(crate) fn show_overlay() {
         }
         let t_cards_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
-        // Resize window (h computed above). Target screen per config (follow active window / main).
-        let screen_frame = overlay_target_screen(&windows);
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
         let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
@@ -1866,6 +2269,12 @@ pub(crate) fn show_overlay() {
         // until the user happens to press Tab again. Successful extracts rebuild cards in place.
         let t_icons = Instant::now(); // TIMING-DEBUG
         extract_uncached_icons();
+        // 缩略图召唤期补拍:卡片已按缓存旧帧渲染(无帧走图标兜底),过期/缺失项
+        // 入队异步重截,完成后 thumbnailReady → rebuild_cards 原位换卡。
+        // Summon-time thumbnail refresh: cards already render their cached frames
+        // (icon fallback when absent); stale/missing ones are re-captured async and
+        // swapped in place via thumbnailReady -> rebuild_cards.
+        crate::thumbnail::refresh_for_summon();
         // TIMING-DEBUG 汇总:各阶段耗时(排查 summon 卡顿用)。
         let total_ms = t0.elapsed().as_millis();
         log_debug!(

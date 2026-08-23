@@ -12,6 +12,7 @@ mod mouse;
 mod overlay;
 mod settings;
 mod theme;
+mod thumbnail;
 mod window_collector;
 
 use config::CONFIG;
@@ -212,6 +213,32 @@ extern "C" fn on_app_launched(_self: *mut c_void, _cmd: Sel, notification: *mut 
         }
         let _: () = msg_send![pool, drain];
     });
+    // 缩略图:给新启动的 App 安装 AXObserver 并预生成其既有窗口。
+    // Thumbnails: install the new app's AXObserver and pre-generate its windows.
+    thumbnail::app_launched(pid);
+}
+
+/// NSWorkspaceDidTerminateApplicationNotification 转发点(main 线程):
+/// 通知缩略图模块卸载该 App 的 observer。
+/// Forwarding point for NSWorkspaceDidTerminateApplicationNotification (main
+/// thread): tells the thumbnail module to uninstall that app's observer.
+extern "C" fn on_app_terminated(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
+    let pid: i32 = unsafe {
+        let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
+        if user_info.is_null() {
+            return;
+        }
+        let key = make_nsstring("NSWorkspaceApplicationKey");
+        let app: *mut AnyObject = msg_send![user_info, objectForKey: key];
+        CFRelease(key as *const c_void);
+        if app.is_null() {
+            return;
+        }
+        msg_send![app, processIdentifier]
+    };
+    if pid > 0 {
+        thumbnail::app_terminated(pid);
+    }
 }
 
 extern "C" fn on_locale_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -261,6 +288,15 @@ extern "C" fn on_devices_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_voi
         }
     }
     crate::settings::refresh_device_popup_if_open();
+}
+
+/// 缩略图捕获完成(worker 线程经 performSelectorOnMainThread 跳来):清空待投递
+/// 队列并原位重建受影响卡片。
+/// Thumbnail capture finished (hopped from the worker thread via
+/// performSelectorOnMainThread): drains the pending queue and rebuilds the
+/// affected cards in place.
+extern "C" fn on_thumbnail_ready(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    thumbnail::handle_ready_main();
 }
 
 // ========== Class Registration ==========
@@ -565,6 +601,18 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleDevicesChanged:),
             on_devices_changed as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(thumbnailReady:),
+            on_thumbnail_ready as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleAppTerminate:),
+            on_app_terminated as *mut c_void,
             types_v_obj.as_ptr(),
         );
         objc_registerClassPair(cls);
@@ -1114,6 +1162,18 @@ fn main() {
         ];
         CFRelease(launch_name as *const c_void);
 
+        // App 退出通知:缩略图模块据此卸载该 App 的 AXObserver(缓存由 LRU 自然淘汰)。
+        // App-terminate notice: the thumbnail module uninstalls that app's observer
+        // (cached entries age out via the LRU).
+        let term_name = make_nsstring("NSWorkspaceDidTerminateApplicationNotification");
+        let _: () = msg_send![nc,
+            addObserver: controller,
+            selector: sel!(handleAppTerminate:),
+            name: term_name,
+            object: std::ptr::null::<AnyObject>(),
+        ];
+        CFRelease(term_name as *const c_void);
+
         // 监听系统语言变更,locale 为 auto 时实时跟随。NSLocaleCurrentLocaleDidChangeNotification
         // 投递在默认通知中心(不是 workspace 中心),故用 NSNotificationCenter defaultCenter。
         // Listen for system language changes to live-follow when locale is auto.
@@ -1163,6 +1223,19 @@ fn main() {
         clipboard::start();
     }
 
+    // 7e. 窗口缩略图服务:常驻 AXObserver 监听新窗口 + 内存 LRU 缓存。无屏幕录制
+    // 权限时 worker 每任务前 preflight 自动休眠,浮窗保持纯图标渲染。
+    // Window thumbnails: resident AXObserver listener + memory LRU. Without the
+    // Screen Recording permission the worker sleeps per-job (preflighted) and the
+    // overlay keeps icon-only rendering.
+    let thumbs_enabled = CONFIG
+        .read()
+        .map(|c| c.layout.thumbnails_enabled)
+        .unwrap_or(false);
+    if thumbs_enabled {
+        thumbnail::start();
+    }
+
     // Bridge thread: flume events → main thread via performSelectorOnMainThread
     thread::spawn(move || {
         while let Ok(event) = event_rx.recv() {
@@ -1183,6 +1256,34 @@ fn main() {
         }
         log_info!("Bridge thread exiting.");
     });
+
+    // 冒烟测试入口(--smoke-overlay):完整初始化后直接驱动一次召唤路径
+    // (on_cmd_tab_pressed → show_overlay → create_card_view ×N),泵 2 秒主 runloop
+    // 让异步缩略图投递(thumbnailReady)落地,无崩溃 exit(0)。用于无头验证
+    // Cmd+Tab 召唤链路(合成按键到不了 CGEventTap,无法从外部触发)。
+    // Smoke-test entry (--smoke-overlay): after full init, drive one summon directly
+    // (on_cmd_tab_pressed -> show_overlay -> create_card_view xN), pump the main
+    // runloop for 2s so async thumbnail deliveries (thumbnailReady) land, exit(0)
+    // on survival. Headless verification of the Cmd+Tab chain (synthetic keystrokes
+    // never reach the CGEventTap, so it can't be triggered externally).
+    if std::env::args().any(|a| a == "--smoke-overlay") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            log_info!("[smoke-overlay] summoning");
+            on_cmd_tab_pressed(
+                std::ptr::null_mut(),
+                sel!(handleCmdTabPressed:),
+                std::ptr::null_mut(),
+            );
+            let rl: *mut AnyObject = msg_send![class!(NSRunLoop), currentRunLoop];
+            let date: *mut AnyObject =
+                msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 2.0f64];
+            let _: () = msg_send![rl, runUntilDate: date];
+            log_info!("[smoke-overlay] summon survived");
+            std::process::exit(0);
+        }
+    }
 
     // 8. Run the main event loop (blocks until [NSApp terminate:])
     unsafe {

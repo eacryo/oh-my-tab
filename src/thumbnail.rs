@@ -1,0 +1,1308 @@
+//! 窗口缩略图:私有 SkyLight API `CGSHWCCaptureWindowList` 截取窗口画面,
+//! **纯内存 LRU** 缓存(刻意不落盘——屏幕内容明文落盘有隐私风险,BetterCmdTab/
+//! DockDoor 同样只保留内存)。三条生产线:
+//! 1. 启动预生成:监视线程启动时枚举所有运行中 App 的标准窗口补拍
+//! 2. 常驻监听:每 PID 一个 AXObserver 订阅 kAXWindowCreatedNotification,
+//!    新窗口防抖 300ms 后预生成(等窗口完成初始化,避免拍到白屏)
+//! 3. 召唤补拍:show_overlay 时对过期/缺失项入队,完成后主线程原位换卡
+//!
+//! 无屏幕录制权限(TCC)时整个模块休眠,浮窗保持纯图标渲染;运行中授权后
+//! 下一个捕获任务自动恢复(worker 每个任务前都重新 preflight)。
+//!
+//!
+//! Window thumbnails: capture window imagery via the private SkyLight API
+//! `CGSHWCCaptureWindowList`, cached in a **memory-only LRU** (deliberately never
+//! written to disk -- plaintext screen content in ~/Library/Caches is a privacy
+//! risk; BetterCmdTab/DockDoor likewise keep frames in RAM only). Three producers:
+//! 1. startup pre-generation: enumerate every running app's standard windows
+//! 2. resident listener: one AXObserver per PID watching kAXWindowCreatedNotification;
+//!    a new window debounces 300ms (letting it finish initializing, avoiding a white
+//!    flash) then pre-generates
+//! 3. summon refresh: show_overlay enqueues stale/missing windows; results swap the
+//!    affected cards in place on the main thread.
+//!
+//! Without the Screen Recording TCC permission the whole module sleeps and the
+//! overlay keeps rendering icons only; granting permission mid-run resumes
+//! automatically (the worker re-preflights before every capture).
+
+use objc2::runtime::AnyObject;
+use objc2::{class, msg_send, sel};
+use std::collections::{HashMap, VecDeque};
+use std::ffi::{c_char, c_void, CString};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use crate::log_debug;
+
+/// 缩略图缓存键:(进程 ID, CG 窗口 ID)。两者组合才能防 PID 复用串图。
+/// Thumbnail cache key: (process id, CG window id). The pair guards against
+/// recycled PIDs serving another window's frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ThumbKey {
+    pub(crate) pid: i32,
+    pub(crate) wid: u32,
+}
+
+// ========== FFI:dlopen 私有符号 + 公开 CoreGraphics/AX 符号 ==========
+// (照 window_collector 的 per-module 自包含 extern 惯例,不跨模块共享声明。)
+// (following window_collector's self-contained per-module extern convention.)
+
+extern "C" {
+    fn dlopen(filename: *const c_char, mode: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+const RTLD_NOW: i32 = 2;
+
+unsafe fn dlopen_path(path: &str) -> *mut c_void {
+    let c = CString::new(path).unwrap();
+    dlopen(c.as_ptr(), RTLD_NOW)
+}
+
+type CGSConnectionID = u32;
+type CgsMainConnFn = unsafe extern "C" fn() -> CGSConnectionID;
+/// 返回 CFArray(CGImageRef 列表);调用方负责 CFRelease 整个数组。
+/// Returns a CFArray of CGImageRefs; the caller owns the array (CFRelease it).
+type CgsCaptureListFn =
+    unsafe extern "C" fn(CGSConnectionID, *const u32, usize, u32) -> *const c_void;
+
+/// CGSWindowCaptureOptions 位(DockDoor PrivateApis.swift 同源):
+/// bestResolution = Retina 原生分辨率,nominalResolution = 点尺寸(1x),
+/// ignoreGlobalClipShape 绕过全局裁剪,fullSize 绕过 Stage Manager 歪斜。
+/// CGSWindowCaptureOptions bits (mirroring DockDoor's PrivateApis.swift):
+/// bestResolution = native retina pixels, nominalResolution = point size (1x),
+/// ignoreGlobalClipShape bypasses the global clip shape, fullSize dodges the
+/// Stage Manager skew workaround.
+const CGS_CAPTURE_NOMINAL_RESOLUTION: u32 = 1 << 9;
+const CGS_CAPTURE_IGNORE_GLOBAL_CLIP_SHAPE: u32 = 1 << 11;
+
+static CGS_MAIN_CONN: LazyLock<Option<CgsMainConnFn>> = LazyLock::new(|| unsafe {
+    // CGSMainConnectionID 与 CGSHWCCaptureWindowList 都由 SkyLight 导出。
+    // Both symbols are exported by the SkyLight framework.
+    let h = dlopen_path("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight");
+    if h.is_null() {
+        return None;
+    }
+    let name = b"CGSMainConnectionID\0";
+    let p = dlsym(h, name.as_ptr() as *const c_char);
+    if p.is_null() {
+        return None;
+    }
+    Some(std::mem::transmute::<*mut c_void, CgsMainConnFn>(p))
+});
+
+static CGS_CAPTURE_LIST: LazyLock<Option<CgsCaptureListFn>> = LazyLock::new(|| unsafe {
+    let h = dlopen_path("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight");
+    if h.is_null() {
+        return None;
+    }
+    // 注意:公开名 CGSHWCCaptureWindowList 是 CoreGraphics 对 SkyLight 内部符号
+    // _SLSHWCaptureWindowList 的再导出,dlsym(SkyLight, "CGSHWCCaptureWindowList")
+    // 拿不到(实测);必须用 SkyLight 原生名 SLSHWCaptureWindowList。
+    // Note: the public name CGSHWCCaptureWindowList is CoreGraphics's re-export of
+    // SkyLight's internal _SLSHWCaptureWindowList; dlsym(SkyLight,
+    // "CGSHWCCaptureWindowList") finds nothing (verified) -- SkyLight's native name
+    // SLSHWCaptureWindowList must be used.
+    let name = b"SLSHWCaptureWindowList\0";
+    let p = dlsym(h, name.as_ptr() as *const c_char);
+    if p.is_null() {
+        return None;
+    }
+    Some(std::mem::transmute::<*mut c_void, CgsCaptureListFn>(p))
+});
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
+    fn CGImageGetWidth(image: *const c_void) -> usize;
+    fn CGImageGetHeight(image: *const c_void) -> usize;
+    fn CGColorSpaceCreateDeviceRGB() -> *const c_void;
+    fn CGBitmapContextCreate(
+        data: *mut c_void,
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bytes_per_row: usize,
+        space: *const c_void,
+        bitmap_info: u32,
+    ) -> *mut c_void;
+    fn CGContextDrawImage(ctx: *mut c_void, rect: CGRect, image: *const c_void);
+    fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *const c_void;
+    fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+    fn CFRelease(cf: *const c_void);
+    fn CFRetain(cf: *const c_void);
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    /// CFString 值比较:相等返回 0(kCFCompareEqualTo)。
+    /// CFString value comparison: 0 when equal (kCFCompareEqualTo).
+    fn CFStringCompare(a: *const c_void, b: *const c_void, options: usize) -> isize;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// kCGImageAlphaPremultipliedLast(RGBA, alpha 在低字节序的末字节)。
+/// kCGImageAlphaPremultipliedLast (RGBA with alpha in the last byte on LE).
+const BITMAP_PREMULTIPLIED_LAST: u32 = 1;
+
+// ========== 屏幕录制权限(TCC) ==========
+
+static PERMISSION_PROMPTED: AtomicBool = AtomicBool::new(false);
+
+/// 是否已授予屏幕录制权限(preflight,廉价可反复调用)。
+/// Whether Screen Recording is granted (cheap preflight, safe to call often).
+pub(crate) fn capture_allowed() -> bool {
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+/// 未授权时的主动申请:每次启动至多弹一次系统授权框,之后静默休眠。
+/// Active request when unauthorized: the system prompt fires at most once per
+/// launch; afterwards the module sleeps silently.
+fn request_permission_once() {
+    if PERMISSION_PROMPTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        CGRequestScreenCaptureAccess();
+    }
+}
+
+// ========== 纯函数(单元测试覆盖) ==========
+
+/// 判断缓存帧是否仍新鲜:TTL 内视为新鲜(召唤时直接用,不重截)。
+/// Whether a cached frame is still fresh: within the TTL it is served as-is at
+/// summon time (no recapture).
+fn is_fresh(captured: Instant, now: Instant, ttl_ms: u128) -> bool {
+    now.duration_since(captured).as_millis() < ttl_ms
+}
+
+/// aspect-fit 适配尺寸:把内容(content_w×content_h)完整放进目标框(box_w×box_h),
+/// 等比缩到长边贴合、短边留白(由容器背景补);返回实际绘制宽高(调用方居中定位)。
+/// 选 fit 不选 cover:用户预期是"看到完整窗口",cover 会裁掉溢出部分。
+/// Aspect-fit sizing: fit the content ENTIRELY inside the target box (long edge
+/// fits, short edge letterboxed by the container background); returns the drawn
+/// width/height (the caller centers it). Fit over cover: the user expects to see
+/// the WHOLE window -- cover would crop the overflow.
+pub(crate) fn fit_size(content_w: f64, content_h: f64, box_w: f64, box_h: f64) -> (f64, f64) {
+    if content_w <= 0.0 || content_h <= 0.0 || box_w <= 0.0 || box_h <= 0.0 {
+        return (box_w.max(0.0), box_h.max(0.0));
+    }
+    let s = (box_w / content_w).min(box_h / content_h);
+    (content_w * s, content_h * s)
+}
+
+/// 目标像素尺寸:按最大高度等比缩小(绝不放大);退化输入原样返回。
+/// Target pixel size: proportional shrink to a max height (never upscale);
+/// degenerate inputs pass through.
+fn fit_target(src_w: u32, src_h: u32, max_h: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || max_h == 0 || src_h <= max_h {
+        return (src_w, src_h);
+    }
+    let tw = ((src_w as u64 * max_h as u64) / src_h as u64).max(1) as u32;
+    (tw, max_h)
+}
+
+// ========== 内存 LRU(泛型核心,便于无 CG 依赖地测试) ==========
+
+/// 确定性 LRU:读命中提升到队尾,插入超限从队头驱逐并**返回被逐项**(值可能持有
+/// CGImageRef 等 +1 资源,由调用方释放)。刻意不用 NSCache——它会在内存压力下
+/// 自作主张驱逐(BetterCmdTab #82 的教训),而本应用是常驻 accessory,随机丢帧
+/// 表现为浮窗偶发闪图标。
+///
+/// A deterministic LRU: reads bump to the back, over-limit inserts evict from the
+/// front and RETURN the evicted values (they may hold +1 resources like
+/// CGImageRefs, released by the caller). Deliberately not NSCache -- it evicts on
+/// its own under memory pressure (BetterCmdTab #82's lesson), and random frame
+/// loss in a permanent accessory shows up as flickering placeholder icons.
+pub(crate) struct Lru<K: Eq + Clone, V: Clone> {
+    max_items: usize,
+    max_cost: u64,
+    cost: fn(&V) -> u64,
+    items: VecDeque<(K, V)>, // 队尾 = 最近使用 / back = most recently used
+}
+
+impl<K: Eq + Clone, V: Clone> Lru<K, V> {
+    pub(crate) fn new(max_items: usize, max_cost: u64, cost: fn(&V) -> u64) -> Self {
+        Self {
+            max_items,
+            max_cost,
+            cost,
+            items: VecDeque::new(),
+        }
+    }
+
+    /// 读命中:提升最近使用并克隆值(CGImageRef 为浅拷贝,所有权仍在缓存)。
+    /// Hit: bumps recency and clones the value (a CGImageRef clone is shallow;
+    /// ownership stays with the cache).
+    pub(crate) fn get(&mut self, key: &K) -> Option<V> {
+        let idx = self.items.iter().position(|(k, _)| k == key)?;
+        let (k, v) = self.items.remove(idx).unwrap();
+        self.items.push_back((k, v.clone()));
+        Some(v)
+    }
+
+    fn total_cost(&self) -> u64 {
+        self.items.iter().map(|(_, v)| (self.cost)(v)).sum()
+    }
+
+    /// 插入/更新(移到队尾);超出容量或总成本时从头驱逐**旧条目**,驱逐项原样
+    /// 返回由调用方释放资源。刚插入的队尾新帧受保护:成本超限只挤旧帧(单帧超
+    /// 预算时保留最新、旧帧让路),仅条目数上限能把新帧本身挤掉。
+    /// Insert/update (moves to the back); over-capacity OLD entries are evicted
+    /// from the front and returned verbatim for the caller to release. The
+    /// just-inserted back item is protected: a cost overrun only evicts older
+    /// frames (an over-budget single frame keeps the newest and sacrifices the
+    /// old), and only the item-count cap can evict the newcomer itself.
+    pub(crate) fn put(&mut self, key: K, val: V) -> Vec<V> {
+        let mut evicted: Vec<V> = Vec::new();
+        if let Some(idx) = self.items.iter().position(|(k, _)| *k == key) {
+            let (_, old) = self.items.remove(idx).unwrap();
+            evicted.push(old);
+        }
+        self.items.push_back((key, val));
+        // 先挤旧帧;队尾新帧只在条目数超限时才参与驱逐(见函数注释)。
+        // Evict old frames first; the back item only participates when the item
+        // count itself is over the cap (see the fn doc).
+        while self.items.len() > 1
+            && (self.items.len() > self.max_items || self.total_cost() > self.max_cost)
+        {
+            let Some((_, v)) = self.items.pop_front() else {
+                break;
+            };
+            evicted.push(v);
+        }
+        while self.items.len() > self.max_items {
+            let Some((_, v)) = self.items.pop_front() else {
+                break;
+            };
+            evicted.push(v);
+        }
+        evicted
+    }
+
+    /// 条件删除(如按 pid 清退),返回被删值供释放。
+    /// Conditional removal (e.g. by pid); removed values returned for releasing.
+    pub(crate) fn remove_where(&mut self, pred: impl Fn((&K, &V)) -> bool) -> Vec<V> {
+        let mut removed: Vec<V> = Vec::new();
+        let mut i = 0;
+        while i < self.items.len() {
+            if pred((&self.items[i].0, &self.items[i].1)) {
+                let (_, v) = self.items.remove(i).unwrap();
+                removed.push(v);
+            } else {
+                i += 1;
+            }
+        }
+        removed
+    }
+
+    /// 当前条目数(测试断言用)。
+    /// Current entry count (for test assertions).
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
+// ========== 缓存状态 ==========
+
+const CACHE_MAX_ITEMS: usize = 32;
+/// ~24MB 成本上限(w*h*4 记账),与 BetterCmdTab 的 ~19MB 同量级。
+/// ~24MB cost budget (accounted as w*h*4), same ballpark as BetterCmdTab's ~19MB.
+const CACHE_MAX_COST: u64 = 24_000_000;
+/// 新鲜 TTL:召唤时 2s 内的直接复用,过期的先画旧帧再后台重截。
+/// Freshness TTL: frames younger than 2s are reused at summon; older ones are
+/// drawn immediately while a background recapture swaps them in.
+const FRESH_TTL_MS: u128 = 2000;
+/// 单张缩略图的目标像素高度上限(约两张 Retina 卡片高),限制单帧内存。
+/// Max target pixel height for one thumbnail (~two retina card heights) to bound
+/// per-frame memory.
+const TARGET_PX_H: u32 = 512;
+
+/// Clone 为浅拷贝(CGImageRef 位拷贝),所有权纪律:缓存持有 +1,克隆方仅在
+/// 显式 CFRetain 后才能长期持有(见 lookup_retained)。
+/// Clone is a shallow bit-copy of the CGImageRef. Ownership discipline: the cache
+/// owns +1; a clonee may only hold it long-term after an explicit CFRetain (see
+/// lookup_retained).
+#[derive(Clone)]
+struct CachedThumb {
+    /// CGImageRef(+1,缓存持有;驱逐时 CFRelease)。
+    /// CGImageRef (+1, owned by the cache; CFRelease on eviction).
+    img: *const c_void,
+    w_px: u32,
+    h_px: u32,
+    captured: Instant,
+}
+
+/// CachedThumb 内含裸 CGImageRef,需要 Send+Sync 才能放进跨线程 static;
+/// 读写全部经 CACHE 互斥锁,CF 类型本身线程安全。
+/// CachedThumb holds a raw CGImageRef, so it needs Send+Sync for the cross-thread
+/// static; all access goes through the CACHE mutex and CF types are thread-safe.
+unsafe impl Send for CachedThumb {}
+unsafe impl Sync for CachedThumb {}
+
+fn thumb_cost(t: &CachedThumb) -> u64 {
+    (t.w_px as u64) * (t.h_px as u64) * 4
+}
+
+static CACHE: LazyLock<Mutex<Lru<ThumbKey, CachedThumb>>> =
+    LazyLock::new(|| Mutex::new(Lru::new(CACHE_MAX_ITEMS, CACHE_MAX_COST, thumb_cost)));
+
+/// 取缩略图(+1 返回,调用方用完必须 CFRelease;缓存自己的引用不受影响)。
+/// Fetch a thumbnail (+1 returned; the caller MUST CFRelease when done -- the
+/// cache's own reference is unaffected).
+pub(crate) fn lookup_retained(pid: i32, wid: u32) -> Option<(*const c_void, u32, u32)> {
+    let mut cache = CACHE.lock().unwrap();
+    let t = cache.get(&ThumbKey { pid, wid })?;
+    unsafe {
+        CFRetain(t.img);
+    }
+    Some((t.img, t.w_px, t.h_px))
+}
+
+/// 是否新鲜(召唤端决策用;过期帧仍会画,只是同时入队重截)。
+/// Freshness probe for the summon-side decision (stale frames still render --
+/// they just trigger a background recapture too).
+pub(crate) fn is_cached_fresh(pid: i32, wid: u32) -> bool {
+    // get() 会提升最近使用,需要可变借用。
+    // get() bumps recency, so it needs a mutable borrow.
+    let mut cache = CACHE.lock().unwrap();
+    cache
+        .get(&ThumbKey { pid, wid })
+        .map(|t| is_fresh(t.captured, Instant::now(), FRESH_TTL_MS))
+        .unwrap_or(false)
+}
+
+fn cache_store(pid: i32, wid: u32, t: CachedThumb) {
+    let mut cache = CACHE.lock().unwrap();
+    for evicted in cache.put(ThumbKey { pid, wid }, t) {
+        unsafe {
+            CFRelease(evicted.img);
+        }
+    }
+}
+
+// ========== 捕获管线(flume 队列 + 单 worker 串行限流) ==========
+
+struct CaptureJob {
+    pid: i32,
+    wid: u32,
+    /// true = 召唤期按需任务(完成后尝试刷新 UI);false = 预生成(只进缓存)。
+    /// true = on-demand summon job (tries a UI refresh on completion); false =
+    /// pre-generation (cache only).
+    deliver: bool,
+}
+
+static JOB_TX: OnceLock<flume::Sender<CaptureJob>> = OnceLock::new();
+
+fn enqueue_job(job: CaptureJob) {
+    let tx = JOB_TX.get_or_init(|| {
+        let (tx, rx) = flume::unbounded::<CaptureJob>();
+        std::thread::Builder::new()
+            .name("thumb-capture".into())
+            .spawn(move || {
+                log_debug!("[thumb] capture worker online");
+                for job in rx.iter() {
+                    log_debug!(
+                        "[thumb] job recv pid={} wid={} deliver={}",
+                        job.pid,
+                        job.wid,
+                        job.deliver
+                    );
+                    run_capture_job(&job);
+                }
+            })
+            .expect("spawn thumb-capture worker");
+        tx
+    });
+    let _ = tx.send(job);
+}
+
+fn run_capture_job(job: &CaptureJob) {
+    // 每个任务前重新 preflight:未授权时静默跳过(运行中授权后自动恢复)。
+    // Re-preflight per job: silently skip while unauthorized (auto-resumes once
+    // granted mid-run).
+    if !capture_allowed() || !crate::theme::thumbnails_enabled() {
+        log_debug!(
+            "[thumb] job skipped (allowed={}, enabled={})",
+            capture_allowed(),
+            crate::theme::thumbnails_enabled()
+        );
+        return;
+    }
+    let Some(t) = (unsafe { capture_window(job.wid) }) else {
+        log_debug!("[thumb] capture failed pid={} wid={}", job.pid, job.wid);
+        return;
+    };
+    log_debug!(
+        "[thumb] captured pid={} wid={} {}x{}",
+        job.pid,
+        job.wid,
+        t.w_px,
+        t.h_px
+    );
+    cache_store(job.pid, job.wid, t);
+    if job.deliver && overlay_wants(job.pid, job.wid) {
+        // 先写队列再跳主线程(handler 消费时有完整缓存)。
+        // Queue before hopping to main (the handler sees complete cache entries).
+        READY_QUEUE.lock().unwrap().push(ThumbKey {
+            pid: job.pid,
+            wid: job.wid,
+        });
+        let ctrl = match *crate::CONTROLLER.lock().unwrap() {
+            Some(c) => c.0,
+            None => return,
+        };
+        unsafe {
+            let _: () = msg_send![
+                ctrl,
+                performSelectorOnMainThread: sel!(thumbnailReady:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
+    }
+}
+
+/// 浮窗是否可见且该窗口仍在列表中(投递时效双重校验的 worker 半段)。
+/// Whether the overlay is visible AND the window is still listed (the worker half
+/// of the delivery-freshness double check).
+fn overlay_wants(pid: i32, wid: u32) -> bool {
+    let state_opt = crate::TAB_STATE.lock().unwrap();
+    match state_opt.as_ref() {
+        Some(s) => s.visible && s.windows.iter().any(|w| w.pid == pid && w.window_id == wid),
+        None => false,
+    }
+}
+
+/// 主线程回调入口(controller 的 thumbnailReady:):清空待投递队列,逐键校验后
+/// 就地重建对应卡片。生成期间用户可能已 ↑↓ 或关浮窗,每键都要重新校验。
+/// Main-thread callback entry (the controller's thumbnailReady:): drains the
+/// pending queue, re-verifies each key, and rebuilds the affected cards in place.
+/// The user may have arrowed away or closed the overlay mid-generation, so every
+/// key is re-verified.
+pub(crate) fn handle_ready_main() {
+    let keys: Vec<ThumbKey> = std::mem::take(&mut *READY_QUEUE.lock().unwrap());
+    if keys.is_empty() {
+        return;
+    }
+    let indices: Vec<usize> = {
+        let state_opt = crate::TAB_STATE.lock().unwrap();
+        let state = match state_opt.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        if !state.visible {
+            return;
+        }
+        keys.iter()
+            .filter_map(|k| {
+                state
+                    .windows
+                    .iter()
+                    .position(|w| w.pid == k.pid && w.window_id == k.wid)
+            })
+            .collect()
+    };
+    if !indices.is_empty() {
+        crate::overlay::rebuild_cards(&indices);
+    }
+}
+
+static READY_QUEUE: Mutex<Vec<ThumbKey>> = Mutex::new(Vec::new());
+
+/// 截取一个窗口:CGSHWCaptureWindowList(count=1)→ 取首张 CGImage →
+/// 等比缩到目标像素高(降内存:Retina 原生帧可达数十 MB)。
+/// Capture one window: CGSHWCCaptureWindowList (count=1) -> first CGImage ->
+/// proportionally downscale to the target pixel height (native retina frames can
+/// reach tens of MB).
+unsafe fn capture_window(wid: u32) -> Option<CachedThumb> {
+    let cap = *CGS_CAPTURE_LIST.as_ref()?;
+    // 连接 ID 进程内恒定,缓存一次;0 = 获取失败(私有符号缺失)。
+    // The connection ID is process-wide constant; cache it once (0 = unavailable).
+    let cid =
+        *CONNECTION_ID.get_or_init(|| CGS_MAIN_CONN.as_ref().map(|f| unsafe { f() }).unwrap_or(0));
+    if cid == 0 {
+        return None;
+    }
+    let wids = [wid];
+    let opts = CGS_CAPTURE_NOMINAL_RESOLUTION | CGS_CAPTURE_IGNORE_GLOBAL_CLIP_SHAPE;
+    let arr = cap(cid, wids.as_ptr(), 1, opts);
+    if arr.is_null() {
+        return None;
+    }
+    let n = CFArrayGetCount(arr);
+    let raw = if n > 0 {
+        CFArrayGetValueAtIndex(arr, 0)
+    } else {
+        std::ptr::null()
+    };
+    if raw.is_null() {
+        CFRelease(arr);
+        return None;
+    }
+    CFRetain(raw); // 数组即将释放,自留一份 / the array goes away; keep our own ref
+    CFRelease(arr);
+
+    let src_w = CGImageGetWidth(raw) as u32;
+    let src_h = CGImageGetHeight(raw) as u32;
+    let (tw, th) = fit_target(src_w, src_h, TARGET_PX_H);
+    let img = if tw == src_w && th == src_h {
+        raw
+    } else {
+        let scaled = downscale_cgimage(raw, tw, th);
+        CFRelease(raw);
+        if scaled.is_null() {
+            return None;
+        }
+        scaled
+    };
+    if img.is_null() {
+        return None;
+    }
+    Some(CachedThumb {
+        img,
+        w_px: tw,
+        h_px: th,
+        captured: Instant::now(),
+    })
+}
+
+/// CGBitmapContext 重绘降采样(纯 CoreGraphics,线程安全;方向与原图一致)。
+/// Downscale by redrawing through a CGBitmapContext (pure CoreGraphics,
+/// thread-safe; orientation matches the source).
+unsafe fn downscale_cgimage(src: *const c_void, tw: u32, th: u32) -> *const c_void {
+    if tw == 0 || th == 0 {
+        return std::ptr::null();
+    }
+    let cs = CGColorSpaceCreateDeviceRGB();
+    let ctx = CGBitmapContextCreate(
+        std::ptr::null_mut(),
+        tw as usize,
+        th as usize,
+        8,
+        (tw as usize) * 4,
+        cs,
+        BITMAP_PREMULTIPLIED_LAST,
+    );
+    CFRelease(cs);
+    if ctx.is_null() {
+        return std::ptr::null();
+    }
+    CGContextDrawImage(
+        ctx,
+        CGRect {
+            x: 0.0,
+            y: 0.0,
+            w: tw as f64,
+            h: th as f64,
+        },
+        src,
+    );
+    let out = CGBitmapContextCreateImage(ctx);
+    CFRelease(ctx);
+    out
+}
+
+static CONNECTION_ID: OnceLock<u32> = OnceLock::new();
+
+// ========== 召唤期刷新(show_overlay 尾部调用) ==========
+
+/// 召唤期补拍:对可见、非最小化、有 bounds 的窗口检查缓存新鲜度,过期/缺失的
+/// 入队异步重截(deliver=true,完成后原位换卡)。选中窗口排最前以优先出图。
+/// 选中项从 TAB_STATE 内部读取,调用方只在 show_overlay 尾部触发一次。
+/// Summon-time refresh: for visible, non-minimized windows with valid bounds,
+/// enqueue async recaptures for stale/missing frames (deliver=true -> in-place
+/// card swap on completion). The selected window is queued first for priority.
+/// The selection is read from TAB_STATE internally; callers just invoke once at
+/// the end of show_overlay.
+pub(crate) fn refresh_for_summon() {
+    if !crate::theme::thumbnails_enabled() {
+        return;
+    }
+    if !capture_allowed() {
+        // 未授权:本次召唤静默跳过;若尚未弹过授权框则申请一次。
+        // Unauthorized: skip silently; request permission once if never prompted.
+        request_permission_once();
+        return;
+    }
+    let jobs: Vec<(i32, u32)> = {
+        let state_opt = crate::TAB_STATE.lock().unwrap();
+        let Some(state) = state_opt.as_ref() else {
+            return;
+        };
+        if !state.visible {
+            return;
+        }
+        let selected = state
+            .windows
+            .get(state.selected)
+            .map(|w| (w.pid, w.window_id));
+        let mut jobs: Vec<(i32, u32)> = state
+            .windows
+            .iter()
+            .filter(|w| !w.minimized && w.bounds.2 > 0.0 && w.bounds.3 > 0.0)
+            .filter(|w| !is_cached_fresh(w.pid, w.window_id))
+            .map(|w| (w.pid, w.window_id))
+            .collect();
+        // 选中窗口排最前(false < true,选中的键为 false 排队首)。
+        // Selected window first (false < true; the selected key maps to false).
+        jobs.sort_by_key(|&(pid, wid)| Some((pid, wid)) != selected);
+        jobs
+    };
+    log_debug!(
+        "[thumb] summon refresh: {} stale/missing enqueued (deliver)",
+        jobs.len()
+    );
+    for (pid, wid) in jobs {
+        enqueue_job(CaptureJob {
+            pid,
+            wid,
+            deliver: true,
+        });
+    }
+}
+
+// ========== 常驻监视线程(AXObserver + 自有 CFRunLoop) ==========
+
+static STARTED: AtomicBool = AtomicBool::new(false);
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 裸 CFRunLoopRef 的 Send+Sync 包装(static 存储要求;指针只在观察者线程解引用,
+/// 其他线程仅用于 CFRunLoopWakeUp 唤醒——CFWakeUp 线程安全)。
+/// Send+Sync wrapper for the raw CFRunLoopRef (required for statics). The pointer
+/// is only dereferenced on the observer thread; other threads merely use it for
+/// CFRunLoopWakeUp, which is thread-safe.
+struct RunLoopSlot(Mutex<Option<*mut c_void>>);
+unsafe impl Send for RunLoopSlot {}
+unsafe impl Sync for RunLoopSlot {}
+static OBSERVER_RL: RunLoopSlot = RunLoopSlot(Mutex::new(None));
+/// 命令注入源(观察者线程创建后存入,任意线程 Signal 唤醒命令处理)。
+/// The command-injection source (stashed once the observer thread creates it; any
+/// thread signals it to wake command processing).
+static CMD_SOURCE: RunLoopSlot = RunLoopSlot(Mutex::new(None));
+
+/// 观察者线程命令:安装/卸载某 PID 的 observer(NSWorkspace 通知跨线程转发而来)。
+/// Observer-thread commands: install/uninstall a PID's observer (forwarded across
+/// threads from NSWorkspace notifications).
+enum ObsCmd {
+    Install(i32),
+    Remove(i32),
+}
+static CMD_TX: OnceLock<flume::Sender<ObsCmd>> = OnceLock::new();
+static CMD_RX: OnceLock<flume::Receiver<ObsCmd>> = OnceLock::new();
+
+/// 已安装的观察者:pid → (AXObserverRef, runloop source)。卸载时成对清理。
+/// 同为裸指针,需要 Send+Sync 包装(增删只在观察者线程,读检查任意线程)。
+/// Installed observers: pid -> (AXObserverRef, runloop source); removed as a pair.
+/// Raw pointers again -- needs the Send+Sync wrapper (inserts/removes happen on
+/// the observer thread; lookups from any thread).
+type AxObserverRef = *mut c_void;
+struct InstalledMap(Mutex<HashMap<i32, (AxObserverRef, *mut c_void)>>);
+unsafe impl Send for InstalledMap {}
+unsafe impl Sync for InstalledMap {}
+static INSTALLED: LazyLock<InstalledMap> =
+    LazyLock::new(|| InstalledMap(Mutex::new(HashMap::new())));
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXObserverCreate(
+        pid: i32,
+        callback: unsafe extern "C" fn(AxObserverRef, *const c_void, *const c_void, *mut c_void),
+        out: *mut AxObserverRef,
+    ) -> i32;
+    fn AXObserverAddNotification(
+        observer: AxObserverRef,
+        element: *const c_void,
+        notification: *const c_void,
+        refcon: *mut c_void,
+    ) -> i32;
+    fn AXObserverGetRunLoopSource(observer: AxObserverRef) -> *mut c_void;
+    // 签名与 window_collector 的声明保持一致(AXUIElementRef = *const c_void),
+    // 避免跨模块重复 extern 声明的签名冲突警告。
+    // Keep the signature identical to window_collector's declaration
+    // (AXUIElementRef = *const c_void) to avoid cross-module duplicate-extern
+    // signature-clash warnings.
+    fn AXUIElementCreateApplication(pid: i32) -> *const c_void;
+    fn AXUIElementGetPid(element: *const c_void, pid: *mut i32) -> i32;
+    // kAXWindowCreatedNotification 常量不能直接 extern 链接(部分工具链报 undefined
+    // symbol),改走下方 dlsym 运行时解析(与 _AXUIElementGetWindow 同款)。
+    // The kAXWindowCreatedNotification constant cannot be linked directly (some
+    // toolchains report an undefined symbol); it is resolved at runtime via dlsym
+    // below (same approach as _AXUIElementGetWindow).
+    fn CFRunLoopRemoveSource(rl: *mut c_void, src: *mut c_void, mode: *const c_void);
+    fn CFRunLoopSourceCreate(
+        alloc: *const c_void,
+        order: isize,
+        ctx: *const CFRunLoopSourceContext,
+    ) -> *mut c_void;
+    fn CFRunLoopSourceSignal(src: *mut c_void);
+    fn CFRunLoopWakeUp(rl: *mut c_void);
+    // CFRunLoopGetCurrent/Run/AddSource 与 kCFRunLoopDefaultMode 复用 event_tap 的
+    // pub(crate) 声明(见下方 use),不在此重复。
+    // CFRunLoopGetCurrent/Run/AddSource and kCFRunLoopDefaultMode are reused from
+    // event_tap's pub(crate) declarations (see the use below), not redeclared here.
+}
+use crate::event_tap::{
+    kCFRunLoopDefaultMode, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun,
+};
+
+/// CFRunLoopSource 的 perform 回调上下文(只用 perform 字段)。
+/// CFRunLoopSource context (only the perform field is used).
+#[repr(C)]
+struct CFRunLoopSourceContext {
+    version: i64,
+    info: *mut c_void,
+    retain: *const c_void,
+    release: *const c_void,
+    copy_description: *const c_void,
+    equal: *const c_void,
+    hash: *const c_void,
+    schedule: *const c_void,
+    cancel: *const c_void,
+    perform: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+/// 裸 CF 指针的 Send+Sync 包装(值只在 LazyLock 初始化时解析一次,只读使用)。
+/// Send+Sync wrapper for the raw CF pointer (resolved once at LazyLock init,
+/// read-only afterwards).
+struct ConstPtr(*const c_void);
+unsafe impl Send for ConstPtr {}
+unsafe impl Sync for ConstPtr {}
+impl Clone for ConstPtr {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for ConstPtr {}
+
+/// kAXWindowCreatedNotification 的等价物。该常量在新系统上不再作为动态符号导出
+/// (extern 链接与 dlsym 均不可得,实测),但 AX 通知名按**字符串值**比较,字面量
+/// "AXWindowCreated" 与系统常量语义完全等价(注册与回调都用它)。
+/// An equivalent of kAXWindowCreatedNotification. The constant is no longer
+/// exported as a dynamic symbol on current macOS (both extern linking and dlsym
+/// fail -- verified empirically), but AX notification names compare by STRING
+/// VALUE, so the literal "AXWindowCreated" is semantically identical for both
+/// registration and callback matching.
+static AX_WINDOW_CREATED: LazyLock<ConstPtr> = LazyLock::new(|| unsafe {
+    // make_nsstring +1 常驻(静态持有);转 *const c_void 与 CF API 对接。
+    // make_nsstring +1 lives for the process lifetime (statically held); cast
+    // to *const c_void for the CF APIs.
+    let s = crate::ffi::make_nsstring("AXWindowCreated");
+    ConstPtr(std::mem::transmute::<*mut AnyObject, *const c_void>(s))
+});
+
+/// 启动常驻监视线程(幂等)。线程职责:为现有运行中 App 装 AXObserver → 对已有
+/// 标准窗口做启动预生成 → 运行 runloop 处理后续 Install/Remove 命令与 AX 事件。
+/// Start the resident listener thread (idempotent). Duties: install AXObservers
+/// for running apps -> pre-generate existing standard windows -> run the runloop
+/// serving Install/Remove commands and AX events.
+pub(crate) fn start() {
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (tx, rx) = flume::unbounded::<ObsCmd>();
+    let _ = CMD_TX.set(tx);
+    let _ = CMD_RX.set(rx);
+    STOP_REQUESTED.store(false, Ordering::SeqCst);
+    std::thread::Builder::new()
+        .name("thumb-observer".into())
+        .spawn(|| unsafe {
+            let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+            // 本线程枚举运行中 App 并装观察者(AXObserverCreate 必须在将要 pump 其
+            // runloop source 的线程上调用)。
+            // Enumerate running apps and install observers here (AXObserverCreate
+            // must run on the thread whose runloop pumps the observer's source).
+            let pids = regular_running_pids();
+            for pid in &pids {
+                install_observer_for_pid(*pid);
+            }
+            log_debug!(
+                "[thumb] observer thread started: {} regular apps observed, capture_allowed={}",
+                pids.len(),
+                capture_allowed()
+            );
+            // 启动预生成:已有标准窗口补拍(最小化窗口无渲染缓冲,跳过)。
+            // Startup pre-generation: capture existing standard windows (minimized
+            // windows have no backing store and are skipped).
+            for pid in &pids {
+                pregen_windows_for_pid(*pid);
+            }
+            // 诊断:等 worker 清完队列后,校验 TAB_STATE 的渲染键能否命中缓存
+            // (键不一致 = 卡片渲染必然回退图标,与 UI 无关的键问题定位)。
+            // Diagnostics: after the worker drains, verify TAB_STATE render keys hit
+            // the cache (a miss here means cards will fall back to icons -- a pure
+            // key-consistency issue, independent of the UI).
+            std::thread::sleep(Duration::from_millis(600));
+            {
+                let state = crate::TAB_STATE.lock().unwrap();
+                if let Some(s) = state.as_ref() {
+                    let hits = s
+                        .windows
+                        .iter()
+                        .filter(|w| is_cached_fresh(w.pid, w.window_id))
+                        .count();
+                    log_debug!(
+                        "[thumb] post-pregen lookup: {}/{} TAB_STATE windows hit cache",
+                        hits,
+                        s.windows.len()
+                    );
+                }
+            }
+            // 命令源:Install/Remove 命令经 CFRunLoopSourceSignal 从任意线程注入。
+            // Command source: Install/Remove injected from any thread via
+            // CFRunLoopSourceSignal.
+            let src = CFRunLoopSourceCreate(
+                std::ptr::null(),
+                0,
+                &CFRunLoopSourceContext {
+                    version: 0,
+                    info: std::ptr::null_mut(),
+                    retain: std::ptr::null(),
+                    release: std::ptr::null(),
+                    copy_description: std::ptr::null(),
+                    equal: std::ptr::null(),
+                    hash: std::ptr::null(),
+                    schedule: std::ptr::null(),
+                    cancel: std::ptr::null(),
+                    perform: Some(drain_obs_commands),
+                },
+            );
+            let rl = CFRunLoopGetCurrent();
+            if !src.is_null() {
+                CFRunLoopAddSource(rl, src, kCFRunLoopDefaultMode);
+                // 存下 source 供任意线程 Signal(见 signal_observer_runloop)。
+                // Stash the source so any thread can signal it (see
+                // signal_observer_runloop).
+                *CMD_SOURCE.0.lock().unwrap() = Some(src);
+            }
+            *OBSERVER_RL.0.lock().unwrap() = Some(rl);
+            if !STOP_REQUESTED.load(Ordering::SeqCst) {
+                CFRunLoopRun();
+            }
+            *OBSERVER_RL.0.lock().unwrap() = None;
+            let _: () = msg_send![pool, drain];
+        })
+        .expect("spawn thumb-observer thread");
+}
+
+/// runloop source 的 perform:清空命令队列执行 Install/Remove。
+/// The runloop source's perform: drains and executes the command queue.
+unsafe extern "C" fn drain_obs_commands(_info: *mut c_void) {
+    let Some(rx) = CMD_RX.get() else {
+        return;
+    };
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            ObsCmd::Install(pid) => {
+                install_observer_for_pid(pid);
+                pregen_windows_for_pid(pid);
+            }
+            ObsCmd::Remove(pid) => {
+                if let Some((obs, src)) = INSTALLED.0.lock().unwrap().remove(&pid) {
+                    let rl = CFRunLoopGetCurrent();
+                    CFRunLoopRemoveSource(rl, src, kCFRunLoopDefaultMode);
+                    CFRelease(obs as *const c_void);
+                }
+                // 该 App 的缓存帧一并驱逐:死 App 的帧不会再被展示,占着 LRU 槽位
+                // 只会挤掉活窗口的帧。
+                // Evict the dead app's cached frames too: they will never be shown
+                // again and would only crowd out live windows' frames.
+                let evicted = CACHE.lock().unwrap().remove_where(|(k, _)| k.pid == pid);
+                for t in evicted {
+                    CFRelease(t.img);
+                }
+            }
+        }
+    }
+}
+
+/// NSWorkspaceDidLaunch 转发点(main 线程调用)。新 App 装 observer + 补拍既有窗口。
+/// Forwarding point for NSWorkspaceDidLaunch (called on main). Installs the new
+/// app's observer and pre-generates its existing windows.
+pub(crate) fn app_launched(pid: i32) {
+    if !STARTED.load(Ordering::SeqCst) || pid == std::process::id() as i32 {
+        return;
+    }
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.send(ObsCmd::Install(pid));
+        signal_observer_runloop();
+    }
+}
+
+/// NSWorkspaceDidTerminate 转发点:卸载 observer(缓存条目交给 LRU 自然淘汰)。
+/// Forwarding point for NSWorkspaceDidTerminate: uninstall the observer (cached
+/// entries age out via the LRU naturally).
+pub(crate) fn app_terminated(pid: i32) {
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.send(ObsCmd::Remove(pid));
+        signal_observer_runloop();
+    }
+}
+
+/// 从任意线程唤醒观察者 runloop 处理刚投递的命令:Signal 唤醒 source(触发
+/// perform 清空命令队列)+ WakeUp 确保 runloop 醒来。
+/// Wake the observer runloop from any thread: Signal marks the source (its perform
+/// drains the command queue) and WakeUp makes sure the runloop actually wakes.
+fn signal_observer_runloop() {
+    let src = CMD_SOURCE.0.lock().unwrap();
+    if let Some(src) = *src {
+        unsafe {
+            CFRunLoopSourceSignal(src);
+        }
+    }
+    drop(src);
+    let rl = OBSERVER_RL.0.lock().unwrap();
+    if let Some(rl) = *rl {
+        unsafe {
+            CFRunLoopWakeUp(rl);
+        }
+    }
+}
+
+/// 当前激活策略为 .regular 的运行中 App(排除自身)。菜单栏小工具/后台进程没有
+/// 标准窗口,装了 observer 也只会白耗 AX 往返。
+/// Running apps with .regular activation policy (excluding ourselves). Menu-bar
+/// agents/background processes have no standard windows -- observing them would
+/// burn AX round-trips for nothing.
+fn regular_running_pids() -> Vec<i32> {
+    unsafe {
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        let mut out: Vec<i32> = Vec::new();
+        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let running: *mut AnyObject = msg_send![ws, runningApplications];
+        let count: usize = msg_send![running, count];
+        for i in 0..count {
+            let app: *mut AnyObject = msg_send![running, objectAtIndex: i];
+            let pid: i32 = msg_send![app, processIdentifier];
+            // NSApplicationActivationPolicyRegular = 0
+            let policy: i64 = msg_send![app, activationPolicy];
+            if pid > 0 && policy == 0 && pid != std::process::id() as i32 {
+                out.push(pid);
+            }
+        }
+        let _: () = msg_send![pool, drain];
+        out
+    }
+}
+
+/// 为单个 PID 安装 AXObserver(必须在观察者线程调用)。失败仅记日志——个别 App
+/// 拒绝 AX 观察属常态,不影响其他 App。
+/// Install an AXObserver for one PID (MUST run on the observer thread). Failures
+/// are logged only -- some apps refuse AX observation, which is normal.
+unsafe fn install_observer_for_pid(pid: i32) {
+    {
+        let installed = INSTALLED.0.lock().unwrap();
+        if installed.contains_key(&pid) {
+            return;
+        }
+    }
+    let mut obs: AxObserverRef = std::ptr::null_mut();
+    if AXObserverCreate(pid, thumb_ax_observer, &mut obs) != 0 || obs.is_null() {
+        log_debug!("[thumb] AXObserverCreate failed for pid={}", pid);
+        return;
+    }
+    let app_el = AXUIElementCreateApplication(pid);
+    if app_el.is_null() {
+        CFRelease(obs as *const c_void);
+        return;
+    }
+    let err = AXObserverAddNotification(obs, app_el, AX_WINDOW_CREATED.0, std::ptr::null_mut());
+    if err != 0 {
+        log_debug!(
+            "[thumb] add kAXWindowCreated failed for pid={} err={}",
+            pid,
+            err
+        );
+        CFRelease(app_el);
+        CFRelease(obs as *const c_void);
+        return;
+    }
+    let src = AXObserverGetRunLoopSource(obs);
+    let rl = CFRunLoopGetCurrent();
+    CFRunLoopAddSource(rl, src, kCFRunLoopDefaultMode);
+    CFRelease(app_el); // observer 已持有所需引用 / the observer holds what it needs
+    INSTALLED.0.lock().unwrap().insert(pid, (obs, src));
+}
+
+/// 启动/新装 App 的既有标准窗口补拍。
+/// Pre-generate existing standard windows for startup / newly installed apps.
+unsafe fn pregen_windows_for_pid(pid: i32) {
+    if !crate::theme::thumbnails_enabled() || !capture_allowed() {
+        return;
+    }
+    let Some(windows) = crate::window_collector::get_ax_windows_for_pid(pid) else {
+        log_debug!("[thumb] pregen pid={}: AX query failed", pid);
+        return;
+    };
+    let mut queued = 0;
+    for (wid, _title, minimized) in windows {
+        // wid=0 = _AXUIElementGetWindow 解析失败的退化条目,截取必然失败。
+        // wid=0 = degenerate entries whose _AXUIElementGetWindow failed; capturing
+        // them always fails.
+        if minimized || wid == 0 {
+            continue; // 最小化窗口无渲染缓冲,截取必然失败 / no backing store while minimized
+        }
+        queued += 1;
+        enqueue_job(CaptureJob {
+            pid,
+            wid,
+            deliver: false,
+        });
+    }
+    log_debug!("[thumb] pregen pid={}: {} windows queued", pid, queued);
+}
+
+/// AXObserver 回调:kAXWindowCreated → 解析新窗口 cgwid → 防抖 300ms 后预生成。
+/// 防抖放独立短命线程,避免阻塞观察者 runloop。
+///
+/// The AXObserver callback: kAXWindowCreated -> resolve the new window's cgwid ->
+/// pre-generate after a 300ms debounce (on a throwaway thread so the observer
+/// runloop never blocks).
+unsafe extern "C" fn thumb_ax_observer(
+    _observer: AxObserverRef,
+    element: *const c_void,
+    notification: *const c_void,
+    _info: *mut c_void,
+) {
+    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+    // 通知名按字符串值比较(字面量与系统常量等价,见 AX_WINDOW_CREATED)。
+    // Notification names compare by string value (the literal equals the system
+    // constant; see AX_WINDOW_CREATED).
+    if !notification.is_null()
+        && unsafe { CFStringCompare(notification, AX_WINDOW_CREATED.0, 0) } == 0
+    {
+        let mut wid: u32 = 0;
+        if crate::window_collector::ax_window_cgwid(element).is_some_and(|resolved| {
+            wid = resolved;
+            wid != 0
+        }) {
+            let mut pid: i32 = 0;
+            AXUIElementGetPid(element, &mut pid);
+            if pid > 0 && crate::theme::thumbnails_enabled() {
+                // 防抖 300ms:窗口刚创建可能还在布局/白屏。
+                // Debounce 300ms: brand-new windows may still be laying out / blank.
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    if crate::theme::thumbnails_enabled() {
+                        enqueue_job(CaptureJob {
+                            pid,
+                            wid,
+                            deliver: false,
+                        });
+                    }
+                });
+            }
+        }
+    }
+    let _: () = msg_send![pool, drain];
+}
+
+// ========== 单元测试 ==========
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lru_evicts_by_count_and_returns_victims() {
+        let mut lru: Lru<(i32, u32), u64> = Lru::new(2, u64::MAX, |v| *v);
+        lru.put((1, 1), 10);
+        lru.put((1, 2), 20);
+        assert_eq!(lru.len(), 2);
+        // 第三个插入挤掉最旧的 (1,1)。
+        // A third insert evicts the oldest entry.
+        let evicted = lru.put((1, 3), 30);
+        assert_eq!(evicted, vec![10]);
+        assert_eq!(lru.len(), 2);
+        assert!(lru.get(&(1, 1)).is_none());
+        assert!(lru.get(&(1, 2)).is_some());
+        assert!(lru.get(&(1, 3)).is_some());
+    }
+
+    #[test]
+    fn lru_read_touch_refreshes_recency() {
+        let mut lru: Lru<(i32, u32), u64> = Lru::new(2, u64::MAX, |v| *v);
+        lru.put((1, 1), 10);
+        lru.put((1, 2), 20);
+        // 读 (1,1) 使它变成最近使用,下一个插入应挤掉 (1,2)。
+        // Reading (1,1) makes it most-recent; the next insert must evict (1,2).
+        assert_eq!(lru.get(&(1, 1)), Some(10));
+        let evicted = lru.put((1, 3), 30);
+        assert_eq!(evicted, vec![20]);
+        assert!(lru.get(&(1, 1)).is_some());
+    }
+
+    #[test]
+    fn lru_put_same_key_moves_and_reports_old_value() {
+        let mut lru: Lru<(i32, u32), u64> = Lru::new(3, u64::MAX, |v| *v);
+        lru.put((1, 1), 10);
+        lru.put((1, 2), 20);
+        lru.put((1, 3), 30);
+        // 更新已存在的键:旧值返回供释放,顺序提到队尾,不新增容量占用。
+        // Updating an existing key returns the old value for release, moves it to
+        // the back, and consumes no extra capacity.
+        let evicted = lru.put((1, 2), 99);
+        assert_eq!(evicted, vec![20]);
+        assert_eq!(lru.len(), 3);
+        let evicted = lru.put((1, 4), 40);
+        // (1,2) 已提到队尾,条目数超限挤掉的是最旧的 (1,1)。
+        // (1,2) was moved to the back; the count overrun evicts the oldest, (1,1).
+        assert_eq!(evicted, vec![10]);
+        assert!(lru.get(&(1, 1)).is_none());
+        assert!(lru.get(&(1, 3)).is_some());
+        assert_eq!(lru.get(&(1, 2)), Some(99));
+    }
+
+    #[test]
+    fn lru_cost_budget_drives_eviction() {
+        // 成本上限 15:新帧受保护,每次插入只挤掉上一帧(单帧超预算时保留最新)。
+        // Cost budget 15: the newest frame is protected; each insert evicts only
+        // the previous frame (an over-budget single frame keeps the newest).
+        let mut lru: Lru<u32, u64> = Lru::new(100, 15, |v| *v);
+        lru.put(1, 10);
+        let evicted = lru.put(2, 20);
+        assert_eq!(evicted, vec![10]);
+        let evicted = lru.put(3, 30);
+        assert_eq!(evicted, vec![20]);
+        assert!(lru.get(&3).is_some());
+        assert!(lru.get(&1).is_none());
+        assert!(lru.get(&2).is_none());
+    }
+
+    #[test]
+    fn lru_remove_where_drops_matching_entries() {
+        let mut lru: Lru<(i32, u32), u64> = Lru::new(10, u64::MAX, |v| *v);
+        lru.put((1, 1), 10);
+        lru.put((2, 2), 20);
+        lru.put((1, 3), 30);
+        let removed = lru.remove_where(|(k, _)| k.0 == 1);
+        assert_eq!(removed, vec![10, 30]);
+        assert!(lru.get(&(2, 2)).is_some());
+        assert!(lru.get(&(1, 1)).is_none());
+    }
+
+    #[test]
+    fn freshness_ttl_boundary() {
+        let now = Instant::now();
+        // 用构造的偏移验证边界:略小于 TTL 新鲜,达到 TTL 即过期。
+        // Constructed offsets prove the boundary: just under TTL is fresh, at TTL stale.
+        let captured = now - Duration::from_millis(FRESH_TTL_MS as u64 - 1);
+        assert!(is_fresh(captured, now, FRESH_TTL_MS));
+        let captured = now - Duration::from_millis(FRESH_TTL_MS as u64);
+        assert!(!is_fresh(captured, now, FRESH_TTL_MS));
+    }
+
+    #[test]
+    fn fit_size_fits_long_edge_and_letterboxes_short_edge() {
+        // 16:9 内容放进 4:3 框:内容更"宽",宽度贴合框、高度按比例缩小(上下留白)。
+        // 16:9 content into a 4:3 box: the content is wider, so the width fits the
+        // box and the height shrinks proportionally (letterboxed top/bottom).
+        let (w, h) = fit_size(160.0, 90.0, 400.0, 300.0);
+        assert_eq!(w, 400.0);
+        assert!((h - 225.0).abs() < 1e-9);
+        // 竖版内容放进横框:内容更"窄",高度贴合框、宽度按比例缩小(左右留白)。
+        // Portrait content into a landscape box: the content is narrower, so the
+        // height fits the box and the width shrinks (letterboxed left/right).
+        let (w, h) = fit_size(90.0, 160.0, 400.0, 300.0);
+        assert_eq!(h, 300.0);
+        assert!((w - 168.75).abs() < 1e-9);
+        // 完全同比例:恰好铺满。
+        // Same aspect ratio: an exact fill.
+        let (w, h) = fit_size(200.0, 100.0, 400.0, 200.0);
+        assert_eq!((w, h), (400.0, 200.0));
+        // 退化输入回退为目标框尺寸(不产生负值/NaN)。
+        // Degenerate inputs fall back to the box size (no negatives / NaN).
+        assert_eq!(fit_size(0.0, 90.0, 400.0, 300.0), (400.0, 300.0));
+        // 核心不变量:fit 的结果必须完整放进目标框(宽高都不超过)。
+        // Core invariant: the fit result must fit ENTIRELY inside the box.
+        let (w, h) = fit_size(1920.0, 1080.0, 184.0, 115.0);
+        assert!(w <= 184.0 && h <= 115.0);
+    }
+
+    #[test]
+    fn fit_target_shrinks_proportionally_and_never_upscales() {
+        // 大图按高度等比缩。
+        // Large images shrink proportionally by height.
+        assert_eq!(fit_target(1920, 1080, 512), (910, 512));
+        // 小于上限的原样保留(不放大)。
+        // Below-cap images stay untouched (no upscale).
+        assert_eq!(fit_target(800, 450, 512), (800, 450));
+        // 极端比例下宽度至少 1px。
+        // Extreme ratios keep a floor of 1px width.
+        assert_eq!(fit_target(10, 5000, 512), (1, 512));
+        // 退化输入原样返回。
+        // Degenerate inputs pass through.
+        assert_eq!(fit_target(0, 0, 512), (0, 0));
+    }
+}
+
+#[test]
+#[ignore]
+fn cgshwc_capture_smoke() {
+    // 真实截取 Finder 的窗口:验证 dlsym 符号解析、CGS 调用链与降采样。
+    // 需要 GUI 会话 + 屏幕录制权限;CI 无权限自动跳过。
+    // Really capture a Finder window: verifies dlsym symbol resolution, the CGS
+    // call chain, and downscaling. Needs a GUI session + Screen Recording; CI
+    // skips automatically without the permission.
+    if !capture_allowed() {
+        eprintln!("[smoke] Screen Recording not granted; skipping capture smoke");
+        return;
+    }
+    let pid: i32 = unsafe {
+        let key = crate::ffi::make_nsstring("com.apple.finder");
+        let apps: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationsWithBundleIdentifier: key
+        ];
+        CFRelease(key as *const c_void);
+        let count: usize = msg_send![apps, count];
+        if count == 0 {
+            eprintln!("[smoke] Finder not running; skipping");
+            return;
+        }
+        let app: *mut AnyObject = msg_send![apps, objectAtIndex: 0usize];
+        msg_send![app, processIdentifier]
+    };
+    let windows = crate::window_collector::get_ax_windows_for_pid(pid).expect("Finder AX windows");
+    let wid = windows
+        .iter()
+        .find(|(_, _, minimized)| !*minimized)
+        .map(|(wid, _, _)| *wid)
+        .expect("Finder has no visible window");
+    let t = unsafe { capture_window(wid) }.expect("CGSHWCCaptureWindowList failed");
+    assert!(t.w_px > 0 && t.h_px > 0, "degenerate capture size");
+    println!(
+        "[smoke] captured Finder window {wid}: {}x{}",
+        t.w_px, t.h_px
+    );
+    // 连带验证渲染侧的 CGImage -> NSImage 转换(msg_send 编码陷阱回归位)。
+    // Also verify the render-side CGImage -> NSImage conversion (regression site
+    // of the msg_send encoding trap).
+    let scale: f64 = unsafe {
+        let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+        if screen.is_null() {
+            2.0
+        } else {
+            msg_send![screen, backingScaleFactor]
+        }
+    };
+    let ns = unsafe {
+        crate::overlay::nsimage_from_cgimage(
+            t.img,
+            objc2_foundation::NSSize::new(t.w_px as f64 / scale, t.h_px as f64 / scale),
+        )
+    };
+    assert!(!ns.is_null(), "nsimage_from_cgimage returned null");
+    unsafe { CFRelease(t.img) };
+}

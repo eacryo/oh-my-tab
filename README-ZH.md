@@ -28,6 +28,7 @@
 - <img height="14" src="docs/icons/key.svg"> **键盘导航**:按下 Command/Option 后用 Tab、方向键或鼠标选择窗口。
 - <img height="14" src="docs/icons/zap.svg"> **轻量**:纯 Rust——1.5MB 体积、约 35MB 内存,无 Electron/Tauri。
 - <img height="14" src="docs/icons/star.svg"> **Liquid Glass**:浮层效果(仅 macOS 26)。
+- <img height="14" src="docs/icons/image.svg"> **窗口缩略图**:Alt-Tab 风格卡片——标题行(迷你应用图标 + 窗口标题 + 关闭按钮)在上方,下方为 16:10 实时预览(经私有 WindowServer API 截取);缓存旧帧即时显示、后台异步刷新;等高卡片按各窗口宽高比装箱成行。需要**屏幕录制**权限——未授权时自动回退为纯图标卡片。
 - <img height="14" src="docs/icons/history.svg"> **窗口级 MRU**:切到某个窗口不会把该应用的其他窗口一起带前。
 - <img height="14" src="docs/icons/eye.svg"> **完整窗口可见**:所有真实窗口,含离屏与最小化(可开关)。
 - <img height="14" src="docs/icons/gear.svg"> **TOML 热重载**:配置经校验,菜单一键生效。
@@ -191,6 +192,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;权限与运行须知
 
 - 应用需要 **辅助功能** 权限(`AXIsProcessTrusted`),全局按键事件 tap 和 AX 窗口查询都依赖它。在 *系统设置 -> 隐私与安全性 -> 辅助功能* 中授予。重新编译出的二进制需要重新授权 -- 除非用稳定身份签名(见[代码签名](#代码签名)),此时授权跨 rebuild 持续有效。
+- **窗口缩略图**还需要**屏幕录制**权限(使用与 DockDoor/AltTab 相同的私有 WindowServer 截取 API)。未授权时切换器静默保持纯图标渲染;macOS 14+ 可能周期性要求重新确认该权限。画面帧**仅存内存**——绝不落盘。
 - 如果事件 tap 创建失败,应用会打印一条错误,快捷键静默失效 -- 几乎总是辅助功能权限没给。
 - 运行时配置:`~/.config/oh-my-tab/config.toml`(首次运行自动按默认值创建)。
 - 图标缓存:`~/Library/Caches/oh-my-tab-icons/{bundle-id}.png`(按应用 bundle id 索引,配 `.meta` mtime sidecar)。
@@ -248,6 +250,7 @@ card_width = 140.0
 card_height = 180.0
 card_gap = 0.0
 icon_size = 110.0
+thumbnails_enabled = true  # 卡片窗口缩略图(无屏幕录制权限自动休眠;缩略图模式建议 card_width ~200 / card_height ~170)
 
 [colors]
 # 每套配色包含:status_bar_text, app_name, win_title, icon_inner_bg,

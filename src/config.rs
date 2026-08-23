@@ -39,6 +39,12 @@ pub struct Layout {
     pub card_height: f64,
     pub card_gap: f64,
     pub icon_size: f64,
+    // 窗口缩略图总开关:关闭后浮窗保持纯图标渲染,缩略图服务不启动。默认开;
+    // 无屏幕录制权限时自动休眠(见 thumbnail 模块)。
+    // Window-thumbnail master switch: off = the overlay keeps icon-only rendering
+    // and the thumbnail service never starts. Default on; auto-sleeps without the
+    // Screen Recording permission (see the thumbnail module).
+    pub thumbnails_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -412,6 +418,7 @@ impl Default for Layout {
             card_height: 180.0,
             card_gap: 0.0,
             icon_size: 110.0,
+            thumbnails_enabled: true,
         }
     }
 }
@@ -818,6 +825,10 @@ impl Config {
             if !errs.iter().any(|e| e.starts_with("layout.card_gap")) {
                 self.layout.card_gap = other.layout.card_gap;
             }
+            // 布尔字段恒有效,无条件采纳加载值(与其他布尔开关同约定)。
+            // Booleans are always valid; adopt the loaded value unconditionally
+            // (same convention as the other boolean switches).
+            self.layout.thumbnails_enabled = other.layout.thumbnails_enabled;
             if !errs.iter().any(|e| e.starts_with("layout.icon_size")) {
                 self.layout.icon_size = other.layout.icon_size;
             }
