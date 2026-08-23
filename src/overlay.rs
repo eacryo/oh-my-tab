@@ -587,12 +587,7 @@ static HOVER_TIMER: TimerMutex = TimerMutex(Mutex::new(None));
 
 /// hover 轮询 tick(主线程):读全局鼠标位置,位置变化时按卡片选中。
 /// Hover poll tick (main thread): reads the global cursor; on movement, selects the card.
-/// tick 计数器(心跳日志用,每 50 tick 打一次确认 timer 存活)。
-/// Tick counter (heartbeat log every 50 ticks to confirm the timer is alive).
-static TICK_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 unsafe extern "C" fn hover_tick_callback(_timer: event_tap::CFRunLoopTimerRef, _info: *mut c_void) {
-    let n = TICK_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 用 CGEventCreate 读当前鼠标位置:不依赖 mouseMoved 事件流(侧键按住期间系统
     // 不产生 mouseMoved,NSEvent.mouseLocation 冻结;CGEventCreate 直接查系统状态)。
     // Read the cursor via CGEventCreate: independent of the mouseMoved stream (while a side
@@ -617,14 +612,6 @@ unsafe extern "C" fn hover_tick_callback(_timer: event_tap::CFRunLoopTimerRef, _
         mf.size.height
     };
     let pos = NSPoint::new(pos.x, main_h - pos.y);
-    if n.is_multiple_of(50) {
-        log_debug!(
-            "[overlay] hover tick #{} pos=({:.0},{:.0})",
-            n,
-            pos.x,
-            pos.y
-        );
-    }
     let mut last = HOVER_TICK_POS.lock().unwrap();
     match *last {
         // 首次 tick:last 还没基准,只记录位置不选中(保持"移动后才选中"的门控
