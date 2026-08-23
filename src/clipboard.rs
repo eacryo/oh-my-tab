@@ -470,6 +470,19 @@ static SEARCH_QUERY: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(Strin
 /// The current display list: history indices (filtered order). All indices when no query.
 static FILTERED: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// 待另存为的条目:detail_save_as_action 在按钮 mouseDown 追踪循环内被调用,而
+/// runModal 的嵌套模态循环不能在追踪上下文里启动(面板文件名框拿不到键盘焦点,
+/// 无法编辑)。动作先把条目存这里,经 performSelectorOnMainThread 跳到下一轮
+/// runloop 由 detail_save_as_deferred 取走执行——此时追踪已结束,模态在干净的
+/// 事件上下文中运行。同一时刻至多一个待处理条目(模态期间输入被阻塞)。
+/// The entry pending save-as: detail_save_as_action runs inside the button's mouseDown
+/// tracking loop, and a runModal nested loop must not start in that context (the panel's
+/// name field never gets keyboard focus). The action stashes the entry here and hops to
+/// the next runloop turn via performSelectorOnMainThread; detail_save_as_deferred takes
+/// it and runs the save with tracking unwound. At most one pending entry at a time (the
+/// modal blocks input while up).
+static PENDING_SAVE_AS: Mutex<Option<ClipEntry>> = Mutex::new(None);
+
 /// 滚动视图 / the scroll view.
 static SCROLL_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
@@ -2810,6 +2823,17 @@ unsafe fn observer() -> *mut AnyObject {
                 detail_save_as_action as *mut c_void,
                 types.as_ptr(),
             );
+            // 另存为的主线程重入点:动作在按钮追踪循环内只存槽 + 跳转,真正弹
+            // NSSavePanel 在这里(见 PENDING_SAVE_AS 注释)。
+            // Main-thread re-entry for save-as: the action only stashes and hops from
+            // inside the button tracking loop; the NSSavePanel is presented here (see
+            // the PENDING_SAVE_AS comment).
+            class_addMethod(
+                cls,
+                sel!(detailSaveAsDeferred:),
+                detail_save_as_deferred as *mut c_void,
+                types.as_ptr(),
+            );
             class_addMethod(
                 cls,
                 sel!(clearClipboardHistory:),
@@ -4424,7 +4448,46 @@ extern "C" fn detail_save_as_action(_self: *mut c_void, _cmd: Sel, _sender: *mut
     let Some(entry) = CLIP_HISTORY.lock().unwrap().get(h_idx).cloned() else {
         return;
     };
-    unsafe { run_detail_save_as(&entry) };
+    // 本 action 在 NSCell trackMouse 的鼠标追踪会话内被同步调用;runModal 绝不能
+    // 在这里启动(嵌套模态会让保存面板的文件名框拿不到键盘焦点)。存槽 + 跳下一轮
+    // runloop,追踪结束后由 detail_save_as_deferred 执行。
+    // This action is invoked synchronously inside the button's mouseDown tracking
+    // session; runModal must NOT start here (a nested modal leaves the save panel's
+    // name field without keyboard focus). Stash the entry and hop to the next runloop
+    // turn; detail_save_as_deferred runs once tracking has unwound.
+    *PENDING_SAVE_AS.lock().unwrap() = Some(entry);
+    let target = unsafe { observer() };
+    unsafe {
+        let _: () = msg_send![
+            target,
+            performSelectorOnMainThread: sel!(detailSaveAsDeferred:),
+            withObject: std::ptr::null_mut::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
+
+/// 另存为的主线程重入点(经 performSelectorOnMainThread 跳出按钮追踪循环后到达):
+/// 激活应用(accessory 态下保证面板键盘焦点),再执行落盘。
+/// Main-thread re-entry for save-as (arrives after hopping out of the button tracking
+/// loop via performSelectorOnMainThread): activate the app first (reliable panel
+/// keyboard focus in accessory mode), then run the save flow.
+extern "C" fn detail_save_as_deferred(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
+    let Some(entry) = PENDING_SAVE_AS.lock().unwrap().take() else {
+        return;
+    };
+    unsafe {
+        // accessory 应用可能处于未激活态;先激活自身,NSSavePanel 才能可靠建立 key
+        // 窗口与字段编辑器(文件名可编辑的前提)。activateIgnoringOtherApps 已废弃
+        // 但仍有效且无新替代的裸 FFI 等价物。
+        // An accessory app may be inactive; activate ourselves so the NSSavePanel can
+        // reliably establish its key window and field editor (the precondition for an
+        // editable name field). activateIgnoringOtherApps is deprecated yet still
+        // functional with no raw-FFI replacement.
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, activateIgnoringOtherApps: true];
+        run_detail_save_as(&entry);
+    }
 }
 
 unsafe fn add_detail_separator(content: *mut AnyObject, y: f64, width: f64) {
