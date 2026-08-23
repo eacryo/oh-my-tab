@@ -41,8 +41,8 @@ use std::thread;
 use event_monitor::{start as start_event_monitor, GlobalEvent};
 use window_collector::{
     bump_window_mru, cache_running_app_icons, cache_running_app_icons_small, ensure_icon_cache_dir,
-    extract_icon_to_cache, focused_window_cgwid, migrate_legacy_cache, note_app_activated, MruMap,
-    WindowInfo,
+    extract_icon_to_cache, focused_window_cgwid, migrate_legacy_cache,
+    migrate_stale_strategy_cache, note_app_activated, MruMap, WindowInfo,
 };
 
 // FFI 声明与 ObjC 桥接基础工具已移至 `ffi.rs` / FFI declarations and ObjC bridging primitives moved to `ffi.rs`
@@ -1048,6 +1048,14 @@ fn main() {
     // One-shot cleanup of legacy PID-named cache files (purely-numeric-stem .png); useless to
     // the new version and just take up space.
     migrate_legacy_cache();
+    // 一次性迁移:检测到旧提取策略版本的缓存(meta 无当前 v{N}: 前缀)时清空整个缓存目录,
+    // 强制全量重提取。必须在 cache_running_app_icons* 之前——否则大图先提取把共享 meta
+    // 重写为当前版本,小图(.small)会躲过逐条失效,继续留旧策略的图标内容。
+    // One-shot migration: wipe the whole cache dir when any .meta lacks the current strategy
+    // prefix, forcing a full re-extract. Must precede cache_running_app_icons* -- otherwise
+    // the big icon rewrites the shared meta to current first and .small dodges invalidation,
+    // keeping pre-change artwork.
+    migrate_stale_strategy_cache();
     cache_running_app_icons(); // pre-warm icon cache for all running apps
                                // 剪贴板标题栏小图标预热:仅当剪贴板功能开启时才生成,否则跳过(避免无谓的提取)。
                                // Pre-warm the clipboard header's small icons: only when the clipboard feature is enabled,

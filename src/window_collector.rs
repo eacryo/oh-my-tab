@@ -604,13 +604,27 @@ fn cf_dict_get_bounds(dict: *const c_void, key: &str) -> Option<(f64, f64, f64, 
     Some((x, y, w, h))
 }
 
-/// 一个运行中 App 的缓存身份:`key` 用作缓存文件名,`fingerprint` 用于检测 App 更新。
-/// A running app's cache identity: `key` is the cache filename, `fingerprint` detects updates.
+/// 一个运行中 App 的缓存身份:`key` 用作缓存文件名,`fingerprint` 用于检测 App 更新,
+/// `icon_src` 记录图标提取来源分流结果(meta 校验需比对,分类状态变化会触发重建)。
+/// A running app's cache identity: `key` is the cache filename, `fingerprint` detects updates,
+/// and `icon_src` records the icon-source routing (compared during cache validation, so a
+/// classification change forces a rebuild).
 pub(crate) struct AppIdentity {
     pub(crate) key: String,
     /// 可执行文件 mtime(自 UNIX epoch 的秒数)。None 表示无法校验,退化为「文件存在即有效」。
     /// Executable mtime (seconds since UNIX epoch). None means unverified -> "file exists = valid".
     pub(crate) fingerprint: Option<String>,
+    /// 图标提取来源:"raw" = 读 bundle 原图 .icns;"sys" = IconServices 渲染。
+    /// 分流规则见 probe_bundle_icon:仅老式 CFBundleIconFile 且无自定义图标的应用走 "raw",
+    /// 已适配(CFBundleIconName)/自定义图标/无声明的走 "sys" 以保留液态玻璃高光。
+    /// Icon source: "raw" reads the bundle's original .icns; "sys" uses IconServices.
+    /// Routing rules in probe_bundle_icon: only legacy-CFBundleIconFile bundles without a
+    /// custom icon get "raw"; adapted (CFBundleIconName) / custom-icon / undeclared apps use
+    /// "sys" to preserve the Liquid Glass highlights.
+    pub(crate) icon_src: &'static str,
+    /// icon_src == "raw" 时为探测所得原图文件路径;其余为 None。
+    /// When icon_src == "raw", the probed raw-artwork file path; None otherwise.
+    pub(crate) raw_path: Option<String>,
 }
 
 /// 读一个 NSString 到 Rust String(nil -> None)。对象是 autoreleased,调用方需在池内。
@@ -642,21 +656,25 @@ fn fnv1a_hex(s: &str) -> String {
 /// 解析一个 PID 对应 App 的缓存身份。
 /// 键优先级:bundleIdentifier(reverse-DNS,文件名安全)> 可执行文件路径哈希 > `pid_{pid}` 兜底。
 /// 指纹取可执行文件 mtime;App 更新会换新 mtime -> 触发重提。
+/// 同时完成图标来源探测(bundle Info.plist + 自定义图标 xattr),结果记入 icon_src/raw_path。
 /// 剪贴板记录来源时也复用此身份(与切换器同一套键/回退)。
 ///
 /// Resolve a PID's cache identity. Key priority: bundleIdentifier (reverse-DNS,
 /// filename-safe) > hashed executable path > `pid_{pid}` fallback. Fingerprint is the
-/// executable mtime; an app update gets a new mtime -> forces re-extract. The clipboard
-/// reuses this identity when recording a source (the same key/fallback chain as the switcher).
+/// executable mtime; an app update gets a new mtime -> forces re-extract. Also performs
+/// the icon-source probe (bundle Info.plist + custom-icon xattr); the result lands in
+/// icon_src/raw_path. The clipboard reuses this identity (same key/fallback chain).
 pub(crate) unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
     let app: *mut AnyObject =
         msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
     if app.is_null() {
-        // PID 已失效(App 刚退出)-> 回退到 pid 键,无指纹(无法校验)。
-        // PID stale (app just quit) -> fall back to pid key, no fingerprint (can't verify).
+        // PID 已失效(App 刚退出)-> 回退到 pid 键,无指纹(无法校验);系统渲染兜底。
+        // PID stale (app just quit) -> fall back to pid key, no fingerprint; system rendering.
         return AppIdentity {
             key: format!("pid_{}", pid),
             fingerprint: None,
+            icon_src: "sys",
+            raw_path: None,
         };
     }
 
@@ -689,7 +707,30 @@ pub(crate) unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
         format!("pid_{}", pid)
     };
 
-    AppIdentity { key, fingerprint }
+    // 图标来源分流:非 bundle 进程(裸 exec)直接系统渲染;其余交给探测。
+    // Icon-source routing: non-bundle processes (bare execs) go straight to system
+    // rendering; everything else goes through the probe.
+    let bundle_url: *mut AnyObject = msg_send![app, bundleURL];
+    let bundle_path = if bundle_url.is_null() {
+        None
+    } else {
+        let p: *mut AnyObject = msg_send![bundle_url, path];
+        read_nsstring(p)
+    };
+    let (icon_src, raw_path) = match bundle_path.as_deref() {
+        Some(bp) => match probe_bundle_icon(bp) {
+            IconProbe::FileFound(path) => ("raw", Some(path)),
+            _ => ("sys", None),
+        },
+        None => ("sys", None),
+    };
+
+    AppIdentity {
+        key,
+        fingerprint,
+        icon_src,
+        raw_path,
+    }
 }
 
 /// 缓存 PNG 路径(支持后缀:"" = 切换器大图,".small" = 剪贴板小图)。
@@ -703,11 +744,91 @@ fn meta_path_for_key(key: &str) -> String {
     format!("{}/{}.meta", icon_cache_dir(), key)
 }
 
-/// 校验缓存是否有效:PNG 存在,且(若有指纹)sidecar 指纹与当前一致。
-/// App 更新会换 mtime -> 指纹不符 -> 返回 None,触发重提。
+/// 图标提取策略版本号。策略本身变化(来源分流规则、绕过 IconServices 等)时 +1,
+/// 使所有存量 .meta 校验失配 -> 启动清扫整目录全量重提取一次,无需用户手工清缓存。
+/// The icon-extraction strategy version. Bump whenever the strategy itself changes
+/// (source-routing rules, bypassing IconServices, ...), so every stale .meta fails
+/// verification -> the startup wipe re-extracts everything once, no manual cache clear.
+const ICON_STRATEGY_VERSION: u32 = 3;
+
+/// 编码 .meta sidecar 内容:`v{版本}:{来源 raw|sys}:{可执行文件 mtime}`。
+/// Encode the .meta sidecar payload: `v{version}:{source raw|sys}:{executable mtime}`.
+fn encode_meta(version: u32, src: &str, fingerprint: &str) -> String {
+    format!("v{}:{}:{}", version, src, fingerprint)
+}
+
+/// 解析 .meta 内容为 `(版本号, 来源, 指纹)`;无 `vN:` 前缀、段数不足(v2 旧格式)或版本
+/// 非数字 -> None。
+/// Parse .meta content into `(version, source, fingerprint)`; missing the `v{N}:` prefix,
+/// too few segments (the v2 format), or a non-numeric version -> None.
+fn parse_meta(stored: &str) -> Option<(u32, &str, &str)> {
+    let rest = stored.trim().strip_prefix('v')?;
+    let (ver, rest) = rest.split_once(':')?;
+    let (src, fp) = rest.split_once(':')?;
+    Some((ver.parse().ok()?, src, fp))
+}
+
+/// 解码并校验 .meta sidecar:版本与当前策略一致、来源标签与当前分流结果一致、指纹相同,
+/// 三者全中才算命中。旧格式 / 策略升级 / 分类状态变化(App 更新换了图标声明方式)-> 一律
+/// 不命中,触发重提取。
 ///
-/// Validate the cache: PNG exists, and (when a fingerprint is present) the sidecar
-/// matches. An app update changes the mtime -> fingerprint mismatch -> None -> re-extract.
+/// Decode and verify a .meta sidecar: strategy version matches, source tag equals the
+/// current routing result, and the fingerprint matches -- all three must hold. Legacy
+/// formats, strategy bumps, or classification changes (app update altering its icon
+/// declaration) never match -> forces re-extract.
+fn meta_matches(stored: &str, src: &str, fingerprint: &str) -> bool {
+    matches!(
+        parse_meta(stored),
+        Some((ver, s, fp)) if ver == ICON_STRATEGY_VERSION && s == src && fp == fingerprint
+    )
+}
+
+/// 纯判定:任一 meta 的版本段不是当前提取策略 -> 整目录需要清空重建。
+/// 空列表(全新安装)不需要。
+///
+/// Pure decision: any meta whose version segment isn't the current extraction strategy ->
+/// the whole dir needs a wipe. An empty list (fresh install) does not.
+fn cache_needs_strategy_wipe(metas: &[&str]) -> bool {
+    metas.iter().any(|s| {
+        !matches!(
+            parse_meta(s),
+            Some((ver, _, _)) if ver == ICON_STRATEGY_VERSION
+        )
+    })
+}
+
+/// 一次性迁移:发现旧策略版本的缓存(任一 .meta 不带当前 `v{N}:` 前缀)时清空整个缓存
+/// 目录,强制全量重提取。必须在任何提取路径之前调用(main.rs 启动序列)——大图先提取会
+/// 把共享 meta「治好」,小图等后缀就会躲过逐条校验的一次性失效,所以必须整目录清。
+///
+/// One-shot migration: when any .meta carries an outdated strategy version (missing the
+/// current `v{N}:` prefix), wipe the whole cache dir to force a full re-extract. Must run
+/// BEFORE any extraction path (main.rs startup sequence): the big icon's extraction rewrites
+/// the shared meta first, letting other suffixes (.small) slip past the per-entry check --
+/// hence the directory-wide wipe.
+pub fn migrate_stale_strategy_cache() {
+    let Ok(entries) = std::fs::read_dir(icon_cache_dir()) else {
+        return;
+    };
+    let metas: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("meta"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+    let refs: Vec<&str> = metas.iter().map(String::as_str).collect();
+    if !cache_needs_strategy_wipe(&refs) {
+        return;
+    }
+    log_info!("icon cache: extraction strategy changed -> wiping cache for full re-extract");
+    clear_icon_cache();
+}
+
+/// 校验缓存是否有效:PNG 存在,且(若有指纹)sidecar 版本+指纹与当前一致。
+/// App 更新会换 mtime -> 指纹不符;策略升级 -> 版本不符;两者都触发重提。
+///
+/// Validate the cache: PNG exists, and (when a fingerprint is present) the sidecar's
+/// strategy version + fingerprint both match. An app update changes the mtime ->
+/// mismatch; a strategy bump changes the version -> mismatch; either re-extracts.
 fn check_cache_for_identity(id: &AppIdentity) -> Option<String> {
     check_cache_for_suffix(id, "")
 }
@@ -721,7 +842,12 @@ fn check_cache_for_suffix(id: &AppIdentity, suffix: &str) -> Option<String> {
     }
     match &id.fingerprint {
         Some(fp) => match std::fs::read_to_string(meta_path_for_key(&id.key)) {
-            Ok(stored) if stored.trim() == *fp => Some(png),
+            // 版本 + 来源标签 + 指纹三者全比对:分类状态变化(如 App 更新换了图标声明)
+            // 会改 icon_src,旧缓存的标签失配 -> 重提取。
+            // Compare version + source tag + fingerprint: a classification change (e.g. an
+            // app update altering its icon declaration) flips icon_src, the stale sidecar's
+            // tag mismatches -> re-extract.
+            Ok(stored) if meta_matches(&stored, id.icon_src, fp) => Some(png),
             _ => None,
         },
         None => Some(png), // 无指纹(极端兜底)-> 文件存在即有效 / no fingerprint -> file exists = valid
@@ -802,6 +928,201 @@ fn write_png_to_cache(png: *mut AnyObject, key: &str, suffix: &str) -> Option<St
     }
 }
 
+// macOS libc 的扩展属性读取(项目惯例:裸声明系统函数,不引 libc crate)。
+// macOS libc extended-attribute read (codebase convention: bare extern decls, no libc crate).
+extern "C" {
+    fn getxattr(
+        path: *const c_char,
+        name: *const c_char,
+        value: *mut c_void,
+        size: usize,
+        position: u32,
+        options: i32,
+    ) -> isize;
+}
+
+/// kHasCustomIcon 标志位(Finder flags)。置位表示该文件/目录带用户自定义图标。
+/// The kHasCustomIcon flag bit (Finder flags). Set = the file/dir carries a user-applied custom icon.
+const K_HAS_CUSTOM_ICON: u16 = 0x0400;
+
+/// 从 com.apple.FinderInfo xattr 字节解析 kHasCustomIcon。
+/// 注意偏移差异:目录(DInfo)flags 在前 2 字节,文件(FInfo)在 offset 8-9,均大端;
+/// 缓冲不足 10 字节(xattr 缺失被截断)一律返回 false。
+///
+/// Parse kHasCustomIcon out of com.apple.FinderInfo xattr bytes.
+/// Note the offset difference: directories (DInfo) keep the flags in the first 2 bytes,
+/// files (FInfo) at offset 8..10; both big-endian. Buffers shorter than 10 bytes
+/// (missing/truncated xattr) always yield false.
+fn finder_flags_has_custom_icon(buf: &[u8], is_dir: bool) -> bool {
+    if buf.len() < 10 {
+        return false;
+    }
+    let flags = if is_dir {
+        u16::from_be_bytes([buf[0], buf[1]])
+    } else {
+        u16::from_be_bytes([buf[8], buf[9]])
+    };
+    flags & K_HAS_CUSTOM_ICON != 0
+}
+
+/// 探测 .app bundle 是否带用户自定义图标(Finder「显示简介」粘贴 / Replacicon 类工具)。
+/// 自定义图标挂在 bundle 的 custom-icon 标志位上(+隐藏 Icon 文件),完全不经过
+/// CFBundleIconFile;命中时必须回退 NSRunningApplication.icon——IconServices 会渲染
+/// 自定义图,而原图路径会把用户的个性化图标覆盖成开发者原图。
+///
+/// Detect whether an .app bundle carries a user-applied custom icon (Finder Get Info
+/// paste / Replacicon-style tools). Custom icons hang off the bundle's custom-icon flag
+/// bit (+ the hidden Icon file) and never go through CFBundleIconFile; on a hit we MUST
+/// fall back to NSRunningApplication.icon -- IconServices renders the custom art, while
+/// the raw-icns path would clobber the user's customization with stock developer artwork.
+fn bundle_has_custom_icon(bundle_path: &str) -> bool {
+    const FINDER_INFO_XATTR: &[u8] = b"com.apple.FinderInfo\0";
+    let Ok(meta) = std::fs::metadata(bundle_path) else {
+        return false; // bundle 不存在/不可读 -> 保守视为无自定义 / missing/unreadable -> conservatively none
+    };
+    let Ok(c_path) = std::ffi::CString::new(bundle_path) else {
+        return false;
+    };
+    let mut buf = [0u8; 32]; // com.apple.FinderInfo 恒为 32 字节 / always 32 bytes when present
+    let n = unsafe {
+        getxattr(
+            c_path.as_ptr(),
+            FINDER_INFO_XATTR.as_ptr() as *const c_char,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len(),
+            0, // position 仅对 resource-fork 属性有意义,其余必须为 0 / only meaningful for resource forks; must be 0 here
+            0,
+        )
+    };
+    if n <= 0 {
+        return false; // 无该 xattr 或读取失败 -> 无自定义图标 / missing xattr or failure -> none
+    }
+    finder_flags_has_custom_icon(&buf[..(n as usize).min(buf.len())], meta.is_dir())
+}
+
+/// bundle 图标探测结果 -> 决定提取来源分流。
+/// Bundle icon probe outcome -> decides the extraction source.
+enum IconProbe {
+    /// 无 bundle / Info.plist 缺失或无任何图标声明 -> 系统渲染兜底。
+    /// No bundle / missing Info.plist or no icon declaration at all -> system rendering.
+    Absent,
+    /// 用户自定义图标(Finder「显示简介」粘贴 / Replacicon 类工具)-> 系统渲染以保留
+    /// 个性化;原图路径会把自定义图覆盖成开发者原图。
+    /// User-applied custom icon (Finder Get Info paste / Replacicon-style tools) ->
+    /// system rendering preserves it; the raw path would clobber it with stock artwork.
+    CustomIcon,
+    /// 声明了 CFBundleIconName(已适配 macOS 26 分层图标规范)-> 系统渲染:保留
+    /// IconServices 的液态玻璃高光并跟随 Dock 的 Dark/Tinted 外观变体。与 CFBundleIconFile
+    /// 同时存在时也以此为准(资产目录才是现代构建的当前图标)。
+    /// CFBundleIconName declared (adapted to the macOS 26 layered icon spec) -> system
+    /// rendering: keeps IconServices' Liquid Glass highlights and follows the Dock's
+    /// Dark/Tinted variants. Wins over CFBundleIconFile when both exist (the asset catalog
+    /// is what modern builds consider current).
+    NamedOnly,
+    /// 仅老式 CFBundleIconFile 且对应文件存在 -> 读原图,绕过 IconServices 对未适配应用的
+    /// 灰色底板合成。携带定位到的资源文件路径。
+    /// Legacy CFBundleIconFile only, with the file present -> raw artwork, bypassing
+    /// IconServices' gray-plate composite of unadapted apps. Carries the located path.
+    FileFound(String),
+}
+
+/// 探测 .app bundle 的图标声明,得出提取来源分流结果:
+/// 自定义图标 > CFBundleIconName(已适配) > CFBundleIconFile(老式,需文件实际存在)
+/// > Absent。调用方按结果选择系统渲染或读原图。
+///
+/// Probe an .app bundle's icon declarations and route the extraction source:
+/// custom icon > CFBundleIconName (adapted) > CFBundleIconFile (legacy, file must exist)
+/// > Absent. The caller picks system rendering vs raw artwork from the result.
+unsafe fn probe_bundle_icon(bundle_path: &str) -> IconProbe {
+    // 1) 用户自定义图标优先:命中必须走系统渲染(IconServices 会渲染自定义图)。
+    // 1) Custom icons win: on a hit we must go through system rendering (IconServices
+    // renders the customized art).
+    if bundle_has_custom_icon(bundle_path) {
+        return IconProbe::CustomIcon;
+    }
+
+    let bundle: *mut AnyObject =
+        msg_send![class!(NSBundle), bundleWithPath: crate::ffi::make_nsstring(bundle_path)];
+    if bundle.is_null() {
+        return IconProbe::Absent;
+    }
+    let info: *mut AnyObject = msg_send![bundle, infoDictionary];
+    if info.is_null() {
+        return IconProbe::Absent;
+    }
+
+    // 2) CFBundleIconName(资产目录/分层规范):存在即视为已适配,走系统渲染。
+    // 2) CFBundleIconName (asset catalog / layered spec): presence = adapted -> system rendering.
+    let name_key = cf_string_new("CFBundleIconName");
+    // CF 指针传入 msg_send 前必须转成 *mut AnyObject:objc2 按参数静态类型编码方法签名,
+    // 裸 c_void 会编出 '^v' 而被运行时拒绝(见 write_png_to_cache 同款处理)。
+    // CF pointers must be cast to *mut AnyObject before msg_send: objc2 encodes the selector
+    // from static arg types, so bare c_void yields '^v' which the runtime rejects (same
+    // handling as write_png_to_cache).
+    let name_value: *mut AnyObject = msg_send![info, objectForKey: name_key as *mut AnyObject];
+    CFRelease(name_key);
+    if !name_value.is_null() {
+        return IconProbe::NamedOnly;
+    }
+
+    // 3) 老式 CFBundleIconFile:值带扩展名按原值找文件;否则先补 .icns 再按原值。
+    // 3) Legacy CFBundleIconFile: value with an extension is used verbatim; otherwise try
+    // +".icns" first, then verbatim.
+    let file_key = cf_string_new("CFBundleIconFile");
+    let file_value: *mut AnyObject = msg_send![info, objectForKey: file_key as *mut AnyObject];
+    CFRelease(file_key);
+    let Some(icon_name) = read_nsstring(file_value) else {
+        return IconProbe::Absent;
+    };
+    if icon_name.contains('/') || icon_name.contains('\0') {
+        return IconProbe::Absent; // 防御畸形值 / guard against malformed values
+    }
+    match icon_file_candidates(bundle_path, &icon_name)
+        .into_iter()
+        .find(|p| std::fs::metadata(p).is_ok())
+    {
+        Some(path) => IconProbe::FileFound(path),
+        None => IconProbe::Absent,
+    }
+}
+
+/// 由 CFBundleIconFile 值生成候选资源路径(直接拼 Contents/Resources,比
+/// pathForResource:ofType: 更可预期)。
+/// Candidate resource paths from a CFBundleIconFile value (joined under Contents/Resources
+/// directly -- more predictable than pathForResource:ofType:).
+fn icon_file_candidates(bundle_path: &str, icon_name: &str) -> Vec<String> {
+    if icon_name.contains('.') {
+        vec![format!("{}/Contents/Resources/{}", bundle_path, icon_name)]
+    } else {
+        vec![
+            format!("{}/Contents/Resources/{}.icns", bundle_path, icon_name),
+            format!("{}/Contents/Resources/{}", bundle_path, icon_name),
+        ]
+    }
+}
+
+/// 从文件路径加载原始图(.icns 多分辨率表示),校验有效后以 autoreleased 返回;
+/// 失败返回 nil,由调用方回退系统渲染。
+///
+/// Load raw artwork from a file path (multi-rep .icns supported); returns an autoreleased,
+/// validated NSImage, or nil on failure so the caller falls back to system rendering.
+unsafe fn load_raw_image_from(file_path: &str) -> *mut AnyObject {
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject =
+        msg_send![image, initWithContentsOfFile: crate::ffi::make_nsstring(file_path)];
+    let valid: bool = !image.is_null() && msg_send![image, isValid];
+    if !valid {
+        if !image.is_null() {
+            let _: () = msg_send![image, release]; // alloc 出来的 +1,失败时手动释放 / alloc'd +1, release on failure
+        }
+        return std::ptr::null_mut();
+    }
+    // 归入调用方的 autorelease 池,与 app.icon 返回对象同等生命周期纪律。
+    // Autorelease into the caller's pool -- same lifetime discipline as app.icon's object.
+    let _: *mut AnyObject = msg_send![image, autorelease];
+    image
+}
+
 /// 提取图标到缓存(按目标 pt 尺寸渲染):切换器大图(128pt)与剪贴板小图(16pt)共用管线。
 /// `suffix`: 文件名后缀("" = {key}.png,".small" = {key}.small.png),大小图共享同一份
 /// {key}.meta 指纹(同一可执行文件 mtime)。
@@ -828,14 +1149,24 @@ fn extract_icon_to_cache_sized(pid: i32, pt_size: f64, suffix: &str) -> Option<S
             return Some(path);
         }
 
-        // 源图标:自身进程用编译期嵌入的 AppIcon.icns--cargo run 是裸 exec 无 bundle,
-        // NSRunningApplication.icon 会返回通用 exec 图标(带 EXEC 字样);这里强制用我们
-        // 自己的图标,开发与打包表现一致。其他进程仍走 NSRunningApplication.icon。
+        // 源图标选择(按身份探测结果分流):
+        // 1. 自身进程用编译期嵌入的 AppIcon.icns--cargo run 是裸 exec 无 bundle,
+        //    NSRunningApplication.icon 会返回通用 exec 图标(带 EXEC 字样);这里强制用
+        //    我们自己的图标,开发与打包表现一致。
+        // 2. icon_src == "raw"(仅老式 CFBundleIconFile 的未适配应用)-> 读 bundle 原图,
+        //    绕过 macOS 26 上 IconServices 的灰色底板合成。
+        // 3. icon_src == "sys"(已适配 CFBundleIconName / 自定义图标 / 无声明)-> 走
+        //    IconServices,保留液态玻璃高光并跟随 Dock 的外观变体;raw 加载失败也落回这里。
         //
-        // Source icon: for our own process use the compile-time-embedded AppIcon.icns --
-        // cargo run is a bare exec with no bundle, so NSRunningApplication.icon returns the
-        // generic exec icon (the "EXEC" placeholder); this forces our own icon so dev and
-        // bundled builds match. Other processes still go through NSRunningApplication.icon.
+        // Source selection (routed by the identity probe):
+        // 1. Our own process uses the compile-time-embedded AppIcon.icns -- cargo run is a
+        //    bare exec with no bundle, so NSRunningApplication.icon would return the generic
+        //    exec icon (the "EXEC" placeholder); force our own so dev matches bundled builds.
+        // 2. icon_src == "raw" (unadapted apps with legacy CFBundleIconFile only) -> read the
+        //    bundle's raw art, bypassing IconServices' gray-plate composite on macOS 26.
+        // 3. icon_src == "sys" (adapted CFBundleIconName / custom icon / undeclared) ->
+        //    IconServices, preserving Liquid Glass highlights and following Dock variants;
+        //    a failed raw load also lands here.
         let icon: *mut AnyObject = if pid == std::process::id() as i32 {
             let icns_bytes: &[u8] = include_bytes!("../assets/AppIcon.icns");
             let nsdata: *mut AnyObject = msg_send![
@@ -860,7 +1191,18 @@ fn extract_icon_to_cache_sized(pid: i32, pt_size: f64, suffix: &str) -> Option<S
                 let _: () = msg_send![pool, drain];
                 return None;
             }
-            msg_send![app, icon]
+            // 按探测分流:"raw" 用身份解析时已定位的原图路径;"sys" 或加载失败走 IconServices。
+            // Routed by the probe: "raw" uses the path already resolved during identity
+            // parsing; "sys" or a failed load goes through IconServices.
+            let raw = match (&id.raw_path, id.icon_src) {
+                (Some(path), "raw") => load_raw_image_from(path),
+                _ => std::ptr::null_mut(),
+            };
+            if !raw.is_null() {
+                raw
+            } else {
+                msg_send![app, icon]
+            }
         };
         if icon.is_null() {
             let _: () = msg_send![pool, drain];
@@ -913,13 +1255,19 @@ fn extract_icon_to_cache_sized(pid: i32, pt_size: f64, suffix: &str) -> Option<S
         }
 
         let result = write_png_to_cache(png, &id.key, suffix);
-        // 写 mtime sidecar:下次命中时据此判断 App 是否更新过(mtime 变 -> 重提)。
+        // 写版本化 sidecar(版本 + 来源标签 + mtime):下次命中时据此判断 App 是否更新过
+        // (mtime 变)、策略是否升级(版本不符)或分类状态是否变化(来源标签不符)-> 重提。
         // 仅在 PNG 写成功时写,避免留下无 PNG 的孤儿 meta。
-        // Write the mtime sidecar: next hit checks it to detect app updates (mtime change ->
-        // re-extract). Only written when the PNG succeeds, so no orphan meta is left behind.
+        // Write the versioned sidecar (version + source tag + mtime): next hits use it to
+        // detect app updates (mtime change), strategy upgrades (version mismatch), or
+        // classification changes (source tag mismatch) -> re-extract. Only written when the
+        // PNG succeeds, so no orphan meta is left behind.
         if result.is_some() {
             if let Some(fp) = &id.fingerprint {
-                let _ = std::fs::write(meta_path_for_key(&id.key), fp);
+                let _ = std::fs::write(
+                    meta_path_for_key(&id.key),
+                    encode_meta(ICON_STRATEGY_VERSION, id.icon_src, fp),
+                );
             }
         }
         let _: () = msg_send![pool, drain];
@@ -2132,6 +2480,125 @@ mod tests {
         assert!(mru.is_empty());
         bump_window_mru(&mut mru, 1, 42);
         assert!(mru.contains_key(&(1, 42)));
+    }
+
+    #[test]
+    fn meta_version_roundtrip_and_legacy_rejection() {
+        // 当前版本 + 当前来源编码后必须命中。
+        // Current version + current source encoding must verify.
+        let fp = "1735689600";
+        let encoded = encode_meta(ICON_STRATEGY_VERSION, "raw", fp);
+        assert_eq!(encoded, format!("v{}:raw:{}", ICON_STRATEGY_VERSION, fp));
+        assert!(meta_matches(&encoded, "raw", fp));
+        // 尾随换行(文件写入常见)应被容忍。
+        // Trailing newline (common from file writes) must be tolerated.
+        assert!(meta_matches(&format!("{}\n", encoded), "raw", fp));
+        // 裸 mtime(v1 时代)/ 两段式(v2 时代)-> 段数不足,一律不命中。
+        // Bare mtime (v1 era) / two-segment (v2 era) -> too few segments, never matches.
+        assert!(!meta_matches(fp, "raw", fp));
+        assert!(!meta_matches("v2:1735689600", "raw", fp));
+        // 版本不符(旧策略 / 未来版本)不命中。
+        // Version mismatch (older / future strategies) never matches.
+        assert!(!meta_matches("v1:raw:1735689600", "raw", fp));
+        assert!(!meta_matches("v9999:raw:1735689600", "raw", fp));
+        // 来源标签不符(App 更新换了图标声明方式,分类变化)不命中。
+        // Source-tag mismatch (app update changed its icon declaration) never matches.
+        assert!(!meta_matches(&encoded, "sys", fp));
+        assert!(!meta_matches("v3:sys:1735689600", "raw", fp));
+        // 同版本同来源但指纹不同(App 更新换 mtime)不命中。
+        // Same version+source but different fingerprint (app update) never matches.
+        assert!(!meta_matches(&encoded, "raw", "1999999999"));
+        // 畸形内容(段缺失 / 段多余 / 空串 / 版本非数字)不命中。
+        // Malformed payloads (missing/extra segments / empty / non-numeric version).
+        assert!(!meta_matches("v3", "raw", fp));
+        assert!(!meta_matches("v3:raw", "raw", fp));
+        assert!(!meta_matches("v3:raw:123:456", "raw", "123"));
+        assert!(!meta_matches("", "raw", fp));
+        assert!(!meta_matches("vx:raw:1735689600", "raw", fp));
+    }
+
+    #[test]
+    fn strategy_wipe_decision_triggers_on_any_outdated_meta() {
+        let cur = encode_meta(ICON_STRATEGY_VERSION, "sys", "100");
+        let old = "1735689600"; // 裸 mtime(v1 旧格式)/ bare mtime (v1 legacy format)
+        let v2 = "v2:100"; // 两段式(v2 旧格式)/ two-segment (v2 legacy format)
+        let newer = format!("v{}:raw:200", ICON_STRATEGY_VERSION + 1);
+        // 全部当前版本 / 空目录(全新安装)-> 不清;来源标签不影响清扫判定。
+        // All current / empty dir (fresh install) -> no wipe; source tags don't affect the sweep.
+        assert!(!cache_needs_strategy_wipe(&[]));
+        assert!(!cache_needs_strategy_wipe(&[&cur]));
+        assert!(!cache_needs_strategy_wipe(&[
+            &cur,
+            &encode_meta(ICON_STRATEGY_VERSION, "raw", "300")
+        ]));
+        // 任一旧格式或异版本 -> 清。
+        // Any legacy-format or foreign-version entry -> wipe.
+        assert!(cache_needs_strategy_wipe(&[&cur, old]));
+        assert!(cache_needs_strategy_wipe(&[&cur, &newer]));
+        assert!(cache_needs_strategy_wipe(&[old]));
+        assert!(cache_needs_strategy_wipe(&[v2]));
+        // 尾随换行不应误判为陈旧。
+        // Trailing newline must not read as stale.
+        assert!(!cache_needs_strategy_wipe(&[&format!("{}\n", cur)]));
+    }
+
+    #[test]
+    fn icon_file_candidates_cover_extensionless_and_verbatim_names() {
+        // 不带扩展名的历史约定:先补 .icns 再按原值。
+        // Extension-less legacy convention: try +".icns" first, then verbatim.
+        assert_eq!(
+            icon_file_candidates("/Applications/Foo.app", "AppIcon"),
+            vec![
+                "/Applications/Foo.app/Contents/Resources/AppIcon.icns".to_string(),
+                "/Applications/Foo.app/Contents/Resources/AppIcon".to_string(),
+            ]
+        );
+        // 值已带扩展名 -> 仅按原值。
+        // Value already carries an extension -> verbatim only.
+        assert_eq!(
+            icon_file_candidates("/Applications/Foo.app", "electron.icns"),
+            vec!["/Applications/Foo.app/Contents/Resources/electron.icns".to_string()]
+        );
+    }
+
+    #[test]
+    fn finder_flags_custom_icon_respects_dir_file_offsets() {
+        // kHasCustomIcon = 0x0400。目录(DInfo):flags 在前 2 字节;
+        // 文件(FInfo):flags 在 offset 8-9。均大端。缓冲 <10 字节一律 false。
+        // kHasCustomIcon = 0x0400. Directories (DInfo): flags in bytes 0..2;
+        // files (FInfo): flags at offset 8..10. Both big-endian. Buffers <10 bytes -> false.
+        let mut buf = [0u8; 32];
+        buf[0] = 0x04;
+        buf[1] = 0x00;
+        assert!(finder_flags_has_custom_icon(&buf, true), "dir flag at 0..2");
+        assert!(
+            !finder_flags_has_custom_icon(&buf, false),
+            "file layout ignores bytes 0..2"
+        );
+
+        let mut fbuf = [0u8; 32];
+        fbuf[8] = 0x04;
+        fbuf[9] = 0x00;
+        assert!(
+            finder_flags_has_custom_icon(&fbuf, false),
+            "file flag at 8..10"
+        );
+        assert!(
+            !finder_flags_has_custom_icon(&fbuf, true),
+            "dir layout ignores bytes 8..10"
+        );
+
+        // 位未置位(仅其他标志位,如 kHasBundle 0x2000)-> false。
+        // Bit unset (only other flags, e.g. kHasBundle 0x2000) -> false.
+        let mut clean = [0u8; 32];
+        clean[0] = 0x20;
+        clean[1] = 0x00;
+        assert!(!finder_flags_has_custom_icon(&clean, true));
+
+        // 短缓冲(xattr 缺失/截断)-> false。
+        // Short buffer (missing/truncated xattr) -> false.
+        assert!(!finder_flags_has_custom_icon(&buf[..9], true));
+        assert!(!finder_flags_has_custom_icon(&[], false));
     }
 
     // ========== 冒烟测试(需要真实 GUI 会话 + 辅助功能权限,手动运行)==========
