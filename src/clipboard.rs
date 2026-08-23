@@ -933,6 +933,39 @@ fn format_copied_at(unix_secs: u64) -> String {
     }
 }
 
+/// 复制时间戳 → "YYYY-MM-DD HH.MM.SS"(本地时区,另存为的建议文件名后缀)。
+/// 时间部分刻意用点号而非冒号——冒号在 HFS+/Finder 里是非法/保留字符(macOS 截图
+/// 同款命名风格)。纯函数,单测覆盖格式。
+/// Copy timestamp -> "YYYY-MM-DD HH.MM.SS" (local time; the save-as suggested-filename
+/// suffix). The time part deliberately uses dots instead of colons -- colons are
+/// illegal/reserved in HFS+/Finder names (macOS screenshot naming style). Pure function;
+/// the format is unit-tested.
+fn format_save_stamp(unix_secs: u64) -> String {
+    unsafe {
+        let mut tm: LmTm = std::mem::zeroed();
+        let s = unix_secs as i64;
+        localtime_r(&s, &mut tm);
+        format!(
+            "{:04}-{:02}-{:02} {:02}.{:02}.{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    }
+}
+
+/// 另存为建议文件名的时间戳:取条目的复制时间(copied_at);旧版本条目无时间戳,
+/// 退化为保存时刻(有总比无强,且旧条目会随过期策略淘汰)。
+/// The save-as suggested-filename stamp: the entry's copy time (copied_at); legacy
+/// entries without a timestamp degrade to the save moment (better than nothing, and
+/// legacy entries age out via expiry anyway).
+fn save_stamp_for(entry: &ClipEntry) -> String {
+    format_save_stamp(entry.copied_at.unwrap_or_else(now_secs))
+}
+
 /// 自动过期 TTL(秒):0 天 = 关闭 → None。从 CONFIG 实时读(设置热重载即生效)。
 /// The auto-expiry TTL in seconds: 0 days = off -> None. Read live from CONFIG (a hot
 /// reload takes effect immediately).
@@ -2773,8 +2806,8 @@ unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
-                sel!(detailSharePlaceholder:),
-                detail_share_placeholder as *mut c_void,
+                sel!(detailSaveAs:),
+                detail_save_as_action as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -4260,7 +4293,139 @@ extern "C" fn toggle_detail_soft_wrap(_self: *mut c_void, _cmd: Sel, _sender: *m
 
 /// 分享入口的占位 action;按钮当前只提供视觉与悬停反馈。
 /// Placeholder share action; the button currently provides visual and hover feedback only.
-extern "C" fn detail_share_placeholder(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {}
+/// UTI → 常见图片扩展名(未知回落 png)。
+/// Map a UTI to a common image file extension (png fallback).
+fn ext_for_image_uti(uti: &str) -> &'static str {
+    let u = uti.to_ascii_lowercase();
+    if u.contains("jpeg") {
+        "jpg"
+    } else if u.contains("gif") {
+        "gif"
+    } else if u.contains("heic") || u.contains("heif") {
+        "heic"
+    } else if u.contains("tiff") {
+        "tif"
+    } else if u.contains("webp") {
+        "webp"
+    } else if u.contains("bmp") {
+        "bmp"
+    } else {
+        "png"
+    }
+}
+
+/// 弹出 NSSavePanel(runModal),返回选中的文件系统路径;取消返回 None。
+unsafe fn run_save_panel(suggested_name: &str) -> Option<String> {
+    // 包一层池子统一回收本次调用产生的临时对象(runModal 嵌套事件循环里的
+    // autoreleased 对象由 AppKit 自己的池子管理,互不干扰)。
+    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+    // Wrap in a pool to reclaim temporaries; objects autoreleased inside runModal's
+    // nested event loop are managed by AppKit's own pools and stay untouched.
+    let panel: *mut AnyObject = msg_send![class!(NSSavePanel), savePanel];
+    let name_ns = make_nsstring(suggested_name);
+    let _: () = msg_send![panel, setNameFieldStringValue: name_ns];
+    CFRelease(name_ns as *const c_void);
+    let resp: isize = msg_send![panel, runModal]; // NSModalResponseOK == 1
+    let result = if resp == 1 {
+        // URL/path 都是属性 getter,按 Cocoa 惯例返回 +0(autoreleased),已挂进上面的
+        // 池子——**绝不能**再手动 release:提前归零会立即析构,drain 时对悬垂指针再发
+        // release 直接 SIGSEGV(与 stringForType: 处同口径)。
+        // URL/path come from property getters that return +0 (autoreleased) per Cocoa
+        // convention and are registered in the pool above -- NEVER release them manually:
+        // an early zero refcount deallocs the object now, and drain then sends -release
+        // to dangling pointers (SIGSEGV). Same rule as the stringForType: call sites.
+        let url: *mut AnyObject = msg_send![panel, URL];
+        if !url.is_null() {
+            let path_ns: *mut AnyObject = msg_send![url, path];
+            let path = nsstring_to_rust(path_ns);
+            (!path.is_empty()).then_some(path)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _: () = msg_send![pool, drain];
+    result
+}
+
+/// 另存为落盘:文本条目写 .txt;图片条目按 数据缓存原始字节 → 源文件字节 →
+/// 预览 PNG 兜底 的顺序取内容(扩展名随来源变化)。
+unsafe fn run_detail_save_as(entry: &ClipEntry) {
+    match &entry.image {
+        Some(img) => {
+            // 内容优先级:数据缓存原始字节 > 文件复制条目的源文件 > 预览 PNG。
+            let (bytes, ext): (Vec<u8>, &'static str) =
+                if img.data_path.as_os_str().is_empty() && img.source_path.is_none() {
+                    match cache_read_preview(img.hash) {
+                        Some(preview) => (preview, "png"),
+                        None => {
+                            log_info!("[clip] save-as image failed: no cached bytes");
+                            return;
+                        }
+                    }
+                } else {
+                    let raw = img
+                        .source_path
+                        .as_deref()
+                        .and_then(|p| std::fs::read(p).ok())
+                        .or_else(|| cache_read_image(img.hash));
+                    match raw {
+                        Some(data) => (data, ext_for_image_uti(&img.uti)),
+                        None => match cache_read_preview(img.hash) {
+                            Some(preview) => (preview, "png"),
+                            None => {
+                                log_info!("[clip] save-as image failed: source unreadable");
+                                return;
+                            }
+                        },
+                    }
+                };
+            // 建议文件名带条目的复制时间戳(非保存时刻):"Clipboard Image 2026-08-23 08.31.42.png"。
+            // The suggested filename carries the entry's COPY timestamp (not the save
+            // moment): "Clipboard Image 2026-08-23 08.31.42.png".
+            let stamp = save_stamp_for(entry);
+            let suggested = format!(
+                "{} {stamp}.{ext}",
+                t("clipboard.detail_save_image_name"),
+                ext = ext
+            );
+            let Some(dest) = run_save_panel(&suggested) else {
+                return;
+            };
+            match std::fs::write(&dest, &bytes) {
+                Ok(()) => log_info!("[clip] image saved to {dest}"),
+                Err(e) => log_info!("[clip] image save to {dest} failed: {e}"),
+            }
+        }
+        None => {
+            let stamp = save_stamp_for(entry);
+            let suggested = format!("{} {stamp}.txt", t("clipboard.detail_save_text_name"));
+            let Some(dest) = run_save_panel(&suggested) else {
+                return;
+            };
+            match std::fs::write(&dest, entry.text.as_bytes()) {
+                Ok(()) => log_info!("[clip] text saved to {dest}"),
+                Err(e) => log_info!("[clip] text save to {dest} failed: {e}"),
+            }
+        }
+    }
+}
+
+/// 另存为动作:详情跟随主列表选中条目,文本写 txt、图片按来源落盘。
+extern "C" fn detail_save_as_action(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
+    let sel = *PICKER_SELECTION.lock().unwrap();
+    if sel == NO_SELECTION {
+        return;
+    }
+    let Some(h_idx) = mapped_index(sel) else {
+        return;
+    };
+    let Some(entry) = CLIP_HISTORY.lock().unwrap().get(h_idx).cloned() else {
+        return;
+    };
+    unsafe { run_detail_save_as(&entry) };
+}
 
 unsafe fn add_detail_separator(content: *mut AnyObject, y: f64, width: f64) {
     let line: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -4396,46 +4561,36 @@ unsafe fn apply_wrap_control_style(button: *mut AnyObject, hovered: bool) {
 }
 
 /// 按 preview (5).html 的三段 SVG path 绘制分享图标,不使用 SF Symbol 的变体。
-/// Draw the share icon from the three SVG paths in preview (5).html instead of using an SF
-/// Symbol variant.
-unsafe fn make_detail_share_icon(alpha: f64) -> *mut AnyObject {
+/// 绘制"另存为"图标(下载到托盘):向下箭头 + 底部托盘,三段路径与既有按钮
+/// 同款描边参数,不使用 SF Symbol 变体。
+/// Draw the save-as icon (download into a tray): a downward arrow plus a bottom tray,
+/// stroked with the same parameters as the other toolbar buttons -- no SF Symbol variant.
+unsafe fn make_detail_save_icon(alpha: f64) -> *mut AnyObject {
     let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
     let image: *mut AnyObject = msg_send![image, initWithSize: NSSize::new(18.0, 18.0)];
     let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: alpha];
     let _: () = msg_send![image, lockFocus];
     let _: () = msg_send![color, set];
 
-    // NSBezierPath 的原点在左下角,HTML SVG 的原点在左上角,所以 y 坐标按 18-y 翻转。
-    // NSBezierPath uses a bottom-left origin while the HTML SVG uses a top-left origin, so
-    // convert every y coordinate with 18-y.
-    let square: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![square, moveToPoint: NSPoint::new(5.0, 11.0)];
-    let _: () = msg_send![square, lineToPoint: NSPoint::new(5.0, 4.0)];
-    let _: () = msg_send![
-        square,
-        curveToPoint: NSPoint::new(6.0, 3.0),
-        controlPoint1: NSPoint::new(5.0, 3.45),
-        controlPoint2: NSPoint::new(5.45, 3.0)
-    ];
-    let _: () = msg_send![square, lineToPoint: NSPoint::new(13.0, 3.0)];
-    let _: () = msg_send![
-        square,
-        curveToPoint: NSPoint::new(14.0, 4.0),
-        controlPoint1: NSPoint::new(13.55, 3.0),
-        controlPoint2: NSPoint::new(14.0, 3.45)
-    ];
-    let _: () = msg_send![square, lineToPoint: NSPoint::new(14.0, 11.0)];
+    // AppKit 坐标原点在左下:视觉向下 = y 减小。托盘开口朝上贴底,箭头指向托盘。
+    // AppKit's origin is bottom-left: visual "down" means smaller y. The tray hugs the
+    // bottom with its opening up; the arrow points into it.
+    let tray: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+    let _: () = msg_send![tray, moveToPoint: NSPoint::new(4.5, 7.5)];
+    let _: () = msg_send![tray, lineToPoint: NSPoint::new(4.5, 4.5)];
+    let _: () = msg_send![tray, lineToPoint: NSPoint::new(13.5, 4.5)];
+    let _: () = msg_send![tray, lineToPoint: NSPoint::new(13.5, 7.5)];
 
     let stem: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![stem, moveToPoint: NSPoint::new(9.5, 7.0)];
-    let _: () = msg_send![stem, lineToPoint: NSPoint::new(9.5, 15.0)];
+    let _: () = msg_send![stem, moveToPoint: NSPoint::new(9.0, 14.5)];
+    let _: () = msg_send![stem, lineToPoint: NSPoint::new(9.0, 7.5)];
 
     let head: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![head, moveToPoint: NSPoint::new(6.8, 12.3)];
-    let _: () = msg_send![head, lineToPoint: NSPoint::new(9.5, 15.0)];
-    let _: () = msg_send![head, lineToPoint: NSPoint::new(12.2, 12.3)];
+    let _: () = msg_send![head, moveToPoint: NSPoint::new(6.2, 10.2)];
+    let _: () = msg_send![head, lineToPoint: NSPoint::new(9.0, 7.4)];
+    let _: () = msg_send![head, lineToPoint: NSPoint::new(11.8, 10.2)];
 
-    for path in [square, stem, head] {
+    for path in [tray, stem, head] {
         let _: () = msg_send![path, setLineWidth: 1.45f64];
         let _: () = msg_send![path, setLineCapStyle: 1isize]; // NSLineCapStyleRound
         let _: () = msg_send![path, setLineJoinStyle: 1isize]; // NSLineJoinStyleRound
@@ -4449,7 +4604,10 @@ unsafe fn make_detail_share_icon(alpha: f64) -> *mut AnyObject {
 /// 预留分享入口:占位 action 不执行业务,但保留设计稿的悬停反馈。
 /// Reserve the share entry point: its placeholder action performs no business behavior while the
 /// button retains the mockup's hover feedback.
-unsafe fn add_detail_share_button(content: *mut AnyObject, width: f64) {
+/// 另存为按钮:文本条目提示"另存为文本文件",图片条目提示"另存为图片文件"。
+/// Save-as button: the tooltip reads "save as text file" for text entries and "save as
+/// image file" for image entries.
+unsafe fn add_detail_save_as_button(content: *mut AnyObject, width: f64, is_image: bool) {
     let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
     let button: *mut AnyObject = msg_send![
         button,
@@ -4460,15 +4618,20 @@ unsafe fn add_detail_share_button(content: *mut AnyObject, width: f64) {
     CFRelease(empty as *const c_void);
     let _: () = msg_send![button, setBordered: false];
     let _: () = msg_send![button, setTarget: observer()];
-    let _: () = msg_send![button, setAction: sel!(detailSharePlaceholder:)];
+    let _: () = msg_send![button, setAction: sel!(detailSaveAs:)];
     let _: () = msg_send![button, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![button, layer];
     let _: () = msg_send![layer, setCornerRadius: 6.0f64];
-    let icon = make_detail_share_icon(0.34);
+    let icon = make_detail_save_icon(0.34);
     let _: () = msg_send![button, setImage: icon];
     let _: () = msg_send![button, setImagePosition: 1u64]; // NSImageOnly
     release_obj(icon);
-    let tooltip = make_nsstring(&t("clipboard.detail_share"));
+    let tooltip_key = if is_image {
+        "clipboard.detail_save_as_image"
+    } else {
+        "clipboard.detail_save_as_text"
+    };
+    let tooltip = make_nsstring(&t(tooltip_key));
     let _: () = msg_send![button, setToolTip: tooltip];
     CFRelease(tooltip as *const c_void);
     add_hover_tracking(button);
@@ -4492,7 +4655,7 @@ unsafe fn detail_wrap_button(content: *mut AnyObject) -> *mut AnyObject {
     std::ptr::null_mut()
 }
 
-unsafe fn detail_share_button(content: *mut AnyObject) -> *mut AnyObject {
+unsafe fn detail_save_as_button(content: *mut AnyObject) -> *mut AnyObject {
     let subviews: *mut AnyObject = msg_send![content, subviews];
     let count: usize = msg_send![subviews, count];
     for index in 0..count {
@@ -4500,7 +4663,7 @@ unsafe fn detail_share_button(content: *mut AnyObject) -> *mut AnyObject {
         let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
         if is_button {
             let action: Sel = msg_send![view, action];
-            if action == sel!(detailSharePlaceholder:) {
+            if action == sel!(detailSaveAs:) {
                 return view;
             }
         }
@@ -4524,7 +4687,8 @@ unsafe fn add_detail_chrome(
     if kind == TextKind::Code {
         add_detail_wrap_control(content, width);
     }
-    add_detail_share_button(content, width);
+    // 另存为按钮的 tooltip 按条目类型切换:文本 = 另存为文本文件,图片 = 另存为图片文件。
+    add_detail_save_as_button(content, width, entry.image.is_some());
 
     let source_attr = make_meta_footer_attributed(entry, true);
     let source: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -8248,7 +8412,7 @@ unsafe fn hover_button_class() -> *mut AnyObject {
 unsafe fn set_detail_share_style(button: *mut AnyObject, tint_alpha: f64, bg_alpha: u32) {
     // 非 template NSImage 不接受 contentTintColor,每个状态直接替换 18pt 图标。
     // A non-template NSImage ignores contentTintColor, so replace the 18pt icon for each state.
-    let icon = make_detail_share_icon(tint_alpha);
+    let icon = make_detail_save_icon(tint_alpha);
     let _: () = msg_send![button, setImage: icon];
     release_obj(icon);
     let layer: *mut AnyObject = msg_send![button, layer];
@@ -8262,7 +8426,7 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
-        if action == sel!(detailSharePlaceholder:) {
+        if action == sel!(detailSaveAs:) {
             // HTML .icon-button:hover:68% 图标 + 5% 黑底。
             // HTML .icon-button:hover: 68% icon tint with a 5% black fill.
             set_detail_share_style(b, 0.68, 0x0000000D);
@@ -8346,7 +8510,7 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
-        if action == sel!(detailSharePlaceholder:) {
+        if action == sel!(detailSaveAs:) {
             set_detail_share_style(b, 0.34, 0x00000000);
             return;
         }
@@ -8384,7 +8548,7 @@ extern "C" fn hover_button_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut
     unsafe {
         let button = _self as *mut AnyObject;
         let action: Sel = msg_send![button, action];
-        if action == sel!(detailSharePlaceholder:) {
+        if action == sel!(detailSaveAs:) {
             set_detail_share_style(button, 0.68, 0x00000013);
         }
 
@@ -8404,7 +8568,7 @@ extern "C" fn hover_button_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut
         let call: MouseDown = std::mem::transmute(objc_msgSendSuper as *const ());
         call(&mut sup, sel!(mouseDown:), event);
 
-        if action == sel!(detailSharePlaceholder:) {
+        if action == sel!(detailSaveAs:) {
             set_detail_share_style(button, 0.68, 0x0000000D);
         }
     }
@@ -9258,17 +9422,13 @@ pub(crate) fn smoke_runner() -> bool {
                 !wrap_button.is_null(),
                 "code detail must install a wrap button"
             );
-            let share_button = detail_share_button(detail_content);
+            // 另存为按钮只验证存在:点击会弹出 NSSavePanel 模态,测试里不能触发。
+            // The save-as button is only presence-checked: clicking it would present the
+            // NSSavePanel modal loop, which tests must not trigger.
+            let save_as_button = detail_save_as_button(detail_content);
             assert!(
-                !share_button.is_null(),
-                "detail toolbar must install an inert share button"
-            );
-            let wrap_before_share = DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
-            let _: () = msg_send![share_button, performClick: std::ptr::null::<AnyObject>()];
-            assert_eq!(
-                DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst),
-                wrap_before_share,
-                "placeholder share action must not alter detail state"
+                !save_as_button.is_null(),
+                "detail toolbar must install a save-as button"
             );
             let _: () = msg_send![wrap_button, performClick: std::ptr::null::<AnyObject>()];
             let no_wrap_scroll = DETAIL_SCROLL_VIEW
@@ -11189,6 +11349,32 @@ mod tests {
             .collect();
         assert_eq!(digits.len(), 8);
         assert!(digits.iter().all(u8::is_ascii_digit));
+    }
+
+    #[test]
+    fn format_save_stamp_is_yyyy_mm_dd_hh_mm_ss_with_dots() {
+        use super::format_save_stamp;
+        // 本地时区无关的结构断言:长度 19,形如 "YYYY-MM-DD HH.MM.SS"
+        // (时间分隔必须是点号——冒号在 HFS+/Finder 文件名里非法)。
+        // Timezone-independent structure assertion: length 19, shaped
+        // "YYYY-MM-DD HH.MM.SS" (the time separators MUST be dots -- colons are
+        // illegal in HFS+/Finder filenames).
+        let s = format_save_stamp(1755000000);
+        assert_eq!(s.len(), 19, "got {s}");
+        assert_eq!(s.as_bytes()[4], b'-', "got {s}");
+        assert_eq!(s.as_bytes()[7], b'-', "got {s}");
+        assert_eq!(s.as_bytes()[10], b' ', "got {s}");
+        assert_eq!(s.as_bytes()[13], b'.', "got {s}");
+        assert_eq!(s.as_bytes()[16], b'.', "got {s}");
+        // 全数字字段 / all-numeric fields.
+        let digits: Vec<u8> = s
+            .bytes()
+            .filter(|b| !matches!(b, b'-' | b' ' | b'.'))
+            .collect();
+        assert_eq!(digits.len(), 14);
+        assert!(digits.iter().all(u8::is_ascii_digit));
+        // 年份字段是 4 位(含前导零)/ the year field is 4 digits wide.
+        assert!(s[..=3].bytes().all(|b| b.is_ascii_digit()), "got {s}");
     }
 
     #[test]

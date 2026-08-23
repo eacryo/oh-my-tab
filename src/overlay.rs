@@ -1464,7 +1464,13 @@ pub(crate) fn create_card_view(w: &WindowInfo, index: usize, card_width: f64) ->
                 NSSize::new(letter_sq, letter_sq),
             );
 
-            let letter_view: *mut AnyObject = msg_send![class!(NSView), alloc];
+            // 字母头像容器用 NSImageView 承载:下方 viewWithTag 依赖 tag 定位,
+            // 而 setTag: 只有 NSControl 系(含 NSImageView)提供,裸 NSView 的
+            // tag 属性只读,objc2 调试期校验会直接 panic。
+            // The letter-avatar container uses NSImageView: the refresh path locates it via
+            // viewWithTag, and setTag: only exists on NSControl-derived classes -- a bare
+            // NSView's tag property is readonly and objc2's debug check would panic.
+            let letter_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
             let letter_view: *mut AnyObject = msg_send![letter_view, initWithFrame: letter_frame];
             let _: () = msg_send![letter_view, setWantsLayer: true];
             let _: () = msg_send![letter_view, setTag: ICON_VIEW_TAG];
