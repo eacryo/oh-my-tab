@@ -91,8 +91,7 @@
 
 **关闭窗口后,同一应用的其它窗口会跳到前面(macOS 原生行为)**:关闭前台应用的最前窗口时,系统会自动激活该应用的剩余窗口——例如关掉 Chrome 无痕窗口后,普通 Chrome 窗口会跳到前面。这不是 oh-my-tab 的行为:那一刻应用收不到任何事件、也没有任何操作,下次呼出只是如实反映当前真正的前台窗口。与系统 Cmd+Tab 的行为完全一致。
 
-如果应用启动时已经有窗口存在，此时窗口排序与原生的Command加Tab排序不同，
-这是由于没有初始的窗口排序数据导致的，oh-my-tab启动后会持续监听窗口的变化
+**如果应用启动时已有窗口存在,此时的窗口排序与原生 Cmd+Tab 不同**:这是因为没有初始的窗口排序数据;oh-my-tab 启动后会持续监听窗口变化并逐步修正。
 
 **开发模式下图标可能不正确**：用 `cargo run` 跑裸二进制时,浮层偶尔会把 oh-my-tab 自己的卡片显示成首字母占位块而不是应用图标,而且可能一直持续到手动清空图标缓存。图标缓存按 bundle id 索引,以可执行文件的 **mtime** 作为失效指纹;开发模式下每次构建都会重链接二进制、改变 mtime,导致运行中实例的缓存条目失效。打包后的 `.app` 不受影响(安装后二进制 mtime 稳定)。开发中遇到此问题,可从菜单 *Clear Icon Cache* 清空,或删除 `~/Library/Caches/oh-my-tab-icons/`。
 
@@ -118,9 +117,10 @@
 > cargo check       # 快速类型检查
 > cargo run         # 构建并运行(会接管全局快捷键)
 > cargo clippy      # 可用,未接入 CI
+> cargo test        # 单元测试;加 -- --ignored 运行 CG/AX 冒烟测试
 > ```
 
-`cargo run` 以**开发模式**跑裸二进制:日志同时输出到 stdout 和日志文件,开机自启不生效(SMAppService 需要 `.app` bundle)。项目**没有测试**。
+`cargo run` 以**开发模式**跑裸二进制:日志同时输出到 stdout 和日志文件,开机自启不生效(SMAppService 需要 `.app` bundle)。单元测试默认即可运行(`cargo test`,无 GUI 依赖);少量**冒烟测试**标记为 `#[ignore]` —— 它们调用真实的 CG/AX 栈,需要 GUI 会话和辅助功能权限(用 `cargo test -- --ignored` 运行)。
 
 ### Release `.app` + `.dmg`
 
@@ -266,8 +266,8 @@ app_name        = "1a1a1aff"
 win_title       = "333333ff"
 icon_inner_bg   = "d0d0e066"
 icon_text       = "666688ff"
-card_bg_sel     = "ffffff66"
-card_border_sel = "5577ccff"
+card_bg_sel     = "3460AF11"
+card_border_sel = "3460AF24"
 
 [fonts]
 status_bar_size   = 13.0
@@ -286,6 +286,7 @@ locale = "auto"          # "auto" | "en" | "zh-Hans" | "zh-Hant"
 [windows]
 enabled = true            # 应用切换总开关(关闭后 Cmd+Tab 透传给系统原生切换器)
 show_minimized = false   # 在浮层中显示最小化窗口
+overlay_position = "active_window"  # "active_window"(跟随激活窗口所在屏幕)| "main"(固定主屏)
 
 [logging]
 level = "info"           # "debug" | "info"
@@ -300,6 +301,9 @@ max_entries = 50         # 历史最大条数(1..=100)
 persist = false          # 把历史保存到磁盘,重启不丢(隐私风险见下方说明)
 auto_expire_days = 3     # 非置顶条目超过 N 天自动过期(内存与磁盘同时生效);0 = 关闭
 pin_follow_selection = true # 置顶/取消置顶后选中项是否跟随该条目(关闭 = 保持当前位置)
+move_used_to_top = true  # 粘贴后把用过的条目移到最前(关闭 = 粘贴不重排历史,同 Win+V)
+picker_position = "main" # 剪贴板浮窗位置:"mouse"(跟随鼠标)| "main"(主屏居中)
+show_source_app = false  # 条目行是否显示来源应用名(来源始终会记录)
 ```
 
 > **剪贴板历史持久化与隐私** — 开启 `persist`(或设置里的"保存剪贴板历史记录"开关)会把

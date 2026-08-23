@@ -117,9 +117,10 @@ If windows are already open when the app starts, their ordering differs from the
 > cargo check       # fast type-check
 > cargo run         # build + run (takes over the global shortcut)
 > cargo clippy      # available, not wired into CI
+> cargo test        # unit tests; add -- --ignored for the CG/AX smoke tests
 > ```
 
-`cargo run` launches the raw binary in **dev mode**: logs go to both stdout and the log file, and launch-at-login is inactive (SMAppService needs a `.app` bundle). There are **no tests** in the project.
+`cargo run` launches the raw binary in **dev mode**: logs go to both stdout and the log file, and launch-at-login is inactive (SMAppService needs a `.app` bundle). The unit-test suite runs headless by default (`cargo test`); a few **smoke tests** are marked `#[ignore]` — they exercise the real CG/AX stack and need a GUI session plus an Accessibility grant (run with `cargo test -- --ignored`).
 
 ### Release `.app` + `.dmg`
 
@@ -285,6 +286,7 @@ locale = "auto"          # "auto" | "en" | "zh-Hans" | "zh-Hant"
 [windows]
 enabled = true            # app-switcher master switch (off = Cmd+Tab passes through to the system)
 show_minimized = false   # show minimized windows in the overlay
+overlay_position = "active_window"  # "active_window" (follow the active window's screen) | "main" (always the main screen)
 
 [logging]
 level = "info"           # "debug" | "info"
@@ -299,6 +301,9 @@ max_entries = 50         # max history entries (1..=100)
 persist = false          # save history to disk so it survives restarts (see the privacy note below)
 auto_expire_days = 3     # unpinned entries expire after N days (memory AND disk); 0 = off
 pin_follow_selection = true # after pin/unpin, move the selection to the toggled entry (false = keep the current position)
+move_used_to_top = true  # pasting moves the used entry to the top (false = pasting never reorders, like Win+V)
+picker_position = "main" # picker position: "mouse" (follow the cursor) | "main" (centered on the main screen)
+show_source_app = false  # show the source app name in rows (the source is always recorded either way)
 ```
 
 > **Clipboard-history persistence & privacy** — enabling `persist` (or the "Save clipboard
