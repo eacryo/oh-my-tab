@@ -26,9 +26,9 @@
 
 - <img height="14" src="docs/icons/stack.svg"> **原生切换增强**:显示应用名与窗口标题,同一应用的多个窗口分列卡片。
 - <img height="14" src="docs/icons/key.svg"> **键盘导航**:按下 Command/Option 后用 Tab、方向键或鼠标选择窗口。
-- <img height="14" src="docs/icons/zap.svg"> **轻量**:纯 Rust——1.5MB 体积、约 35MB 内存,无 Electron/Tauri。
+- <img height="14" src="docs/icons/zap.svg"> **轻量**:纯 Rust——1.5MB 体积、约 35MB 基础内存,内存缩略图缓存上限约 64MB,无 Electron/Tauri。
 - <img height="14" src="docs/icons/star.svg"> **Liquid Glass**:浮层效果(仅 macOS 26)。
-- <img height="14" src="docs/icons/image.svg"> **窗口缩略图**:Alt-Tab 风格卡片——标题行(迷你应用图标 + 窗口标题 + 关闭按钮)在上方,下方为 16:10 实时预览(经私有 WindowServer API 截取);缓存旧帧即时显示、后台异步刷新;等高卡片按各窗口宽高比装箱成行。需要**屏幕录制**权限——未授权时自动回退为纯图标卡片。
+- <img height="14" src="docs/icons/image.svg"> **窗口缩略图**:Alt-Tab 风格卡片——标题行(迷你应用图标 + 窗口标题 + 关闭按钮)在上方,下方为 16:10 实时预览(经私有 WindowServer API 截取);缓存旧帧即时显示、后台异步刷新;等高卡片按各窗口宽高比装箱成行。窗口较少时卡片动态放大至最多 1.5 倍;大量窗口保持可读的最小尺寸,选中项前进时连续滑动可见区间。需要**屏幕录制**权限——未授权时自动回退为纯图标卡片。
 - <img height="14" src="docs/icons/history.svg"> **窗口级 MRU**:切到某个窗口不会把该应用的其他窗口一起带前。
 - <img height="14" src="docs/icons/eye.svg"> **完整窗口可见**:所有真实窗口,含离屏与最小化(可开关)。
 - <img height="14" src="docs/icons/gear.svg"> **TOML 热重载**:配置经校验,菜单一键生效。

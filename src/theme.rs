@@ -7,6 +7,7 @@
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use std::ffi::c_void;
+use std::ops::Range;
 
 use crate::config::{self, CONFIG};
 use crate::ffi::{make_nsstring, CFRelease};
@@ -140,6 +141,13 @@ pub(crate) const THUMB_CAPTION_H: f64 = 24.0;
 pub(crate) const THUMB_GAP: f64 = 6.0;
 /// 预览区宽高比(设计稿 aspect-ratio 16/10)。/ Preview aspect ratio (16/10).
 pub(crate) const THUMB_PREVIEW_RATIO: f64 = 1.6;
+/// 少量窗口时的最大卡片放大倍数；1.0 是原有缩略图卡片尺寸。
+/// Maximum card enlargement for small window sets; 1.0 is the original thumbnail size.
+pub(crate) const THUMB_MAX_SCALE: f64 = 1.5;
+/// 动态放大搜索步长。/ Search step for dynamic enlargement.
+const THUMB_SCALE_STEP: f64 = 0.05;
+/// 卡片区顶部留白。/ Top inset above the thumbnail card area.
+const THUMB_TOP_INSET: f64 = 32.0;
 
 /// 缩略图卡片高度按基准卡宽推导(纯函数,可测):
 /// 上下 padding + 标题行 + 间距 + 16:10 预览区。
@@ -155,6 +163,13 @@ fn thumb_card_h(card_width: f64) -> f64 {
 /// every card shares it.
 pub(crate) fn thumb_card_h_fixed() -> f64 {
     thumb_card_h(THUMB_CARD_BASE_W)
+}
+
+/// scale 以基准卡宽为准，标题行和内边距保持固定，不机械放大文字与控件。
+/// Scale is based on the base card width; caption and padding stay fixed instead
+/// of mechanically enlarging text and controls.
+pub(crate) fn thumb_card_h_for_scale(scale: f64) -> f64 {
+    thumb_card_h(THUMB_CARD_BASE_W * scale.max(1.0))
 }
 
 /// 预览区高度 = 卡片高 - 上下 padding - 标题行 - 间距(纯函数,可测)。
@@ -207,6 +222,292 @@ pub(crate) fn pack_rows(widths: &[f64], max_inner_w: f64, gap: f64) -> Vec<Vec<u
         rows.push(Vec::new());
     }
     rows
+}
+
+/// 连续可见区间的移动方向。/ Direction used to slide the contiguous visible range.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ThumbSlideDirection {
+    Forward,
+    Backward,
+    #[default]
+    Preserve,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ThumbPlacement {
+    pub(crate) index: usize,
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) width: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ThumbFlowLayout {
+    pub(crate) panel_w: f64,
+    pub(crate) panel_h: f64,
+    pub(crate) card_h: f64,
+    pub(crate) scale: f64,
+    pub(crate) visible: Range<usize>,
+    pub(crate) placements: Vec<ThumbPlacement>,
+    pub(crate) overflowed: bool,
+}
+
+fn thumb_widths(aspects: &[f64], range: &Range<usize>, card_h: f64, max_inner: f64) -> Vec<f64> {
+    aspects[range.clone()]
+        .iter()
+        // 极窄屏幕下钳制单卡宽度；图片仍按 aspect-fit 完整显示，只增加留白。
+        // Clamp a single card on exceptionally narrow screens; the image remains
+        // fully visible via aspect-fit and merely gains letterboxing.
+        .map(|&aspect| thumb_card_w_for_aspect(card_h, aspect).min(max_inner))
+        .collect()
+}
+
+fn thumb_max_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
+    let available = (max_panel_h - THUMB_TOP_INSET - STATUS_H).max(card_h);
+    ((available + gap) / (card_h + gap)).floor().max(1.0) as usize
+}
+
+#[derive(Clone, Copy)]
+struct ThumbFlowConstraints {
+    card_h: f64,
+    max_inner: f64,
+    max_rows: usize,
+    gap: f64,
+}
+
+fn thumb_range_fits(
+    aspects: &[f64],
+    range: &Range<usize>,
+    constraints: ThumbFlowConstraints,
+) -> bool {
+    pack_rows(
+        &thumb_widths(aspects, range, constraints.card_h, constraints.max_inner),
+        constraints.max_inner,
+        constraints.gap,
+    )
+    .len()
+        <= constraints.max_rows
+}
+
+fn maximal_prefix(
+    aspects: &[f64],
+    start: usize,
+    constraints: ThumbFlowConstraints,
+) -> Range<usize> {
+    let mut end = start.min(aspects.len());
+    while end < aspects.len() {
+        let candidate = start..end + 1;
+        if end == start || thumb_range_fits(aspects, &candidate, constraints) {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    start.min(end)..end
+}
+
+fn maximal_suffix(aspects: &[f64], end: usize, constraints: ThumbFlowConstraints) -> Range<usize> {
+    let end = end.min(aspects.len());
+    let mut start = end;
+    while start > 0 {
+        let candidate = start - 1..end;
+        if start == end || thumb_range_fits(aspects, &candidate, constraints) {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    start..end
+}
+
+fn normalize_previous(previous: Option<Range<usize>>, len: usize) -> Option<Range<usize>> {
+    let mut range = previous?;
+    range.start = range.start.min(len);
+    range.end = range.end.min(len);
+    (range.start < range.end).then_some(range)
+}
+
+fn overflow_range(
+    aspects: &[f64],
+    selected: usize,
+    previous: Option<Range<usize>>,
+    direction: ThumbSlideDirection,
+    constraints: ThumbFlowConstraints,
+) -> Range<usize> {
+    let len = aspects.len();
+    if len == 0 {
+        return 0..0;
+    }
+    let selected = selected.min(len - 1);
+    let previous = normalize_previous(previous, len);
+
+    match (direction, previous) {
+        (ThumbSlideDirection::Forward, Some(range)) => {
+            if range.contains(&selected) {
+                return range;
+            }
+            // 末项向首项循环时回到首段。/ Wrapping last -> first resets to the leading slice.
+            if selected < range.start {
+                return maximal_prefix(aspects, 0, constraints);
+            }
+            let mut next = range.start..selected + 1;
+            while next.start < selected && !thumb_range_fits(aspects, &next, constraints) {
+                next.start += 1;
+            }
+            next
+        }
+        (ThumbSlideDirection::Backward, Some(range)) => {
+            if range.contains(&selected) {
+                return range;
+            }
+            // 首项向末项循环时回到末段。/ Wrapping first -> last resets to the trailing slice.
+            if selected >= range.end {
+                return maximal_suffix(aspects, len, constraints);
+            }
+            let mut next = selected..range.end;
+            while next.end > selected + 1 && !thumb_range_fits(aspects, &next, constraints) {
+                next.end -= 1;
+            }
+            next
+        }
+        (_, Some(range))
+            if range.contains(&selected) && thumb_range_fits(aspects, &range, constraints) =>
+        {
+            range
+        }
+        _ => {
+            let leading = maximal_prefix(aspects, 0, constraints);
+            if leading.contains(&selected) {
+                leading
+            } else {
+                maximal_suffix(aspects, selected + 1, constraints)
+            }
+        }
+    }
+}
+
+fn build_thumb_layout(
+    aspects: &[f64],
+    visible: Range<usize>,
+    scale: f64,
+    max_inner: f64,
+    max_panel_h: f64,
+    gap: f64,
+    overflowed: bool,
+) -> ThumbFlowLayout {
+    let card_h = thumb_card_h_for_scale(scale);
+    let widths = thumb_widths(aspects, &visible, card_h, max_inner);
+    let rows = pack_rows(&widths, max_inner, gap);
+    let n_rows = rows.len().max(1);
+    let used_inner_w = rows
+        .iter()
+        .map(|row| {
+            row.iter().map(|&i| widths[i]).sum::<f64>() + row.len().saturating_sub(1) as f64 * gap
+        })
+        .fold(0.0f64, f64::max);
+    // 超量时固定为最大可用网格，连续滑动不会因宽高比变化来回跳动。
+    // Overflow uses the maximum grid footprint so aspect changes do not make the
+    // panel jump in size while the visible slice slides.
+    let (panel_w, panel_h) = if overflowed {
+        let max_rows = thumb_max_rows(card_h, max_panel_h, gap);
+        (
+            max_inner + H_PADDING * 2.0,
+            THUMB_TOP_INSET
+                + max_rows as f64 * card_h
+                + max_rows.saturating_sub(1) as f64 * gap
+                + STATUS_H,
+        )
+    } else {
+        (
+            used_inner_w.max(280.0_f64.min(max_inner)) + H_PADDING * 2.0,
+            THUMB_TOP_INSET
+                + n_rows as f64 * card_h
+                + n_rows.saturating_sub(1) as f64 * gap
+                + STATUS_H,
+        )
+    };
+    let mut placements = Vec::with_capacity(visible.len());
+    for (row_index, row) in rows.iter().enumerate() {
+        if row.is_empty() {
+            continue;
+        }
+        let row_w =
+            row.iter().map(|&i| widths[i]).sum::<f64>() + row.len().saturating_sub(1) as f64 * gap;
+        let mut x = (panel_w - row_w) / 2.0;
+        let y =
+            panel_h - THUMB_TOP_INSET - (row_index as f64 + 1.0) * card_h - row_index as f64 * gap;
+        for &local_index in row {
+            placements.push(ThumbPlacement {
+                index: visible.start + local_index,
+                x,
+                y,
+                width: widths[local_index],
+            });
+            x += widths[local_index] + gap;
+        }
+    }
+    ThumbFlowLayout {
+        panel_w,
+        panel_h,
+        card_h,
+        scale,
+        visible,
+        placements,
+        overflowed,
+    }
+}
+
+/// 规划缩略图网格：全部窗口能放下时在 1.0–1.5 间尽量放大；否则保持
+/// 1.0，并按导航方向滑动一个连续可见区间。
+/// Plan the thumbnail grid: enlarge all windows as much as possible from 1.0 to
+/// 1.5 when they fit; otherwise stay at 1.0 and slide a contiguous visible slice.
+pub(crate) fn plan_thumb_flow_layout(
+    aspects: &[f64],
+    selected: usize,
+    previous: Option<Range<usize>>,
+    direction: ThumbSlideDirection,
+    max_inner: f64,
+    max_panel_h: f64,
+    gap: f64,
+) -> ThumbFlowLayout {
+    let max_inner = max_inner.max(1.0);
+    if aspects.is_empty() {
+        return build_thumb_layout(aspects, 0..0, 1.0, max_inner, max_panel_h, gap, false);
+    }
+    let base_h = thumb_card_h_fixed();
+    let base_rows = thumb_max_rows(base_h, max_panel_h, gap);
+    let base_constraints = ThumbFlowConstraints {
+        card_h: base_h,
+        max_inner,
+        max_rows: base_rows,
+        gap,
+    };
+    let full = 0..aspects.len();
+    let all_fit = thumb_range_fits(aspects, &full, base_constraints);
+
+    if all_fit {
+        let mut scale = 1.0;
+        let mut candidate = 1.0 + THUMB_SCALE_STEP;
+        while candidate <= THUMB_MAX_SCALE + 1e-9 {
+            let card_h = thumb_card_h_for_scale(candidate);
+            let max_rows = thumb_max_rows(card_h, max_panel_h, gap);
+            let constraints = ThumbFlowConstraints {
+                card_h,
+                max_inner,
+                max_rows,
+                gap,
+            };
+            if !thumb_range_fits(aspects, &full, constraints) {
+                break;
+            }
+            scale = candidate.min(THUMB_MAX_SCALE);
+            candidate += THUMB_SCALE_STEP;
+        }
+        return build_thumb_layout(aspects, full, scale, max_inner, max_panel_h, gap, false);
+    }
+
+    let visible = overflow_range(aspects, selected, previous, direction, base_constraints);
+    build_thumb_layout(aspects, visible, 1.0, max_inner, max_panel_h, gap, true)
 }
 
 /// 浮窗高度 = 顶部 32 + 行数 * 卡片高 + 状态栏高(纯函数,可测)。
@@ -344,5 +645,145 @@ mod flow_tests {
         // 空输入返回一行空行(空窗口态保底)。
         // Empty input yields one empty row (the empty-state floor).
         assert_eq!(pack_rows(&[], 250.0, 10.0), vec![Vec::<usize>::new()]);
+    }
+
+    #[test]
+    fn flow_layout_enlarges_small_sets_to_the_cap() {
+        let layout = plan_thumb_flow_layout(
+            &[1.6, 1.6],
+            1,
+            None,
+            ThumbSlideDirection::Preserve,
+            1200.0,
+            1000.0,
+            THUMB_ROW_GAP,
+        );
+        assert_eq!(layout.visible, 0..2);
+        assert!(!layout.overflowed);
+        assert!((layout.scale - THUMB_MAX_SCALE).abs() < 1e-9);
+        assert!(layout.card_h > thumb_card_h_fixed());
+    }
+
+    #[test]
+    fn overflow_keeps_base_size_and_slides_one_card_forward() {
+        let aspects = vec![1.6; 8];
+        let base_h = thumb_card_h_fixed();
+        let two_row_panel_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let initial = plan_thumb_flow_layout(
+            &aspects,
+            1,
+            None,
+            ThumbSlideDirection::Preserve,
+            614.0,
+            two_row_panel_h,
+            THUMB_ROW_GAP,
+        );
+        assert!(initial.overflowed);
+        assert_eq!(initial.scale, 1.0);
+        assert_eq!(initial.visible, 0..4);
+
+        let next = plan_thumb_flow_layout(
+            &aspects,
+            4,
+            Some(initial.visible),
+            ThumbSlideDirection::Forward,
+            614.0,
+            two_row_panel_h,
+            THUMB_ROW_GAP,
+        );
+        assert_eq!(next.visible, 1..5);
+        assert_eq!(
+            next.placements
+                .iter()
+                .map(|placement| placement.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn overflow_sliding_reaches_tail_and_mirrors_backward() {
+        let aspects = vec![1.6; 8];
+        let base_h = thumb_card_h_fixed();
+        let max_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let tail = plan_thumb_flow_layout(
+            &aspects,
+            7,
+            Some(3..7),
+            ThumbSlideDirection::Forward,
+            614.0,
+            max_h,
+            THUMB_ROW_GAP,
+        );
+        assert_eq!(tail.visible, 4..8);
+
+        let backward = plan_thumb_flow_layout(
+            &aspects,
+            3,
+            Some(tail.visible),
+            ThumbSlideDirection::Backward,
+            614.0,
+            max_h,
+            THUMB_ROW_GAP,
+        );
+        assert_eq!(backward.visible, 3..7);
+
+        let wrapped = plan_thumb_flow_layout(
+            &aspects,
+            0,
+            Some(4..8),
+            ThumbSlideDirection::Forward,
+            614.0,
+            max_h,
+            THUMB_ROW_GAP,
+        );
+        assert_eq!(wrapped.visible, 0..4);
+
+        let wrapped_backward = plan_thumb_flow_layout(
+            &aspects,
+            7,
+            Some(0..4),
+            ThumbSlideDirection::Backward,
+            614.0,
+            max_h,
+            THUMB_ROW_GAP,
+        );
+        assert_eq!(wrapped_backward.visible, 4..8);
+    }
+
+    #[test]
+    fn overflow_capacity_adapts_to_mixed_aspects() {
+        let aspects = vec![1.6, 1.6, 2.2, 2.2, 2.2, 2.2];
+        let base_h = thumb_card_h_fixed();
+        let max_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let initial = plan_thumb_flow_layout(
+            &aspects,
+            1,
+            None,
+            ThumbSlideDirection::Preserve,
+            614.0,
+            max_h,
+            THUMB_ROW_GAP,
+        );
+        // 两张标准卡可同排，宽卡只能独占一排，因此首段容量自然降为 3。
+        // Two standard cards share a row while a wide card occupies its own, so
+        // the leading slice naturally drops to three items.
+        assert_eq!(initial.visible, 0..3);
+    }
+
+    #[test]
+    fn empty_flow_layout_stays_at_base_size() {
+        let layout = plan_thumb_flow_layout(
+            &[],
+            0,
+            None,
+            ThumbSlideDirection::Preserve,
+            1200.0,
+            1000.0,
+            THUMB_ROW_GAP,
+        );
+        assert_eq!(layout.visible, 0..0);
+        assert_eq!(layout.scale, 1.0);
+        assert!(layout.placements.is_empty());
     }
 }

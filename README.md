@@ -26,9 +26,9 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 
 - <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names, window titles, one card per window.
 - <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab, arrow keys, or mouse after Command/Option.
-- <img height="14" src="docs/icons/zap.svg"> **Featherweight**: pure Rust — 1.5 MB binary, ~35 MB memory. No Electron/Tauri.
+- <img height="14" src="docs/icons/zap.svg"> **Featherweight**: pure Rust — 1.5 MB binary, ~35 MB baseline memory, with the in-memory thumbnail cache bounded at ~64 MB. No Electron/Tauri.
 - <img height="14" src="docs/icons/star.svg"> **Liquid Glass**: floating overlay (macOS 26).
-- <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: Alt-Tab-style cards — caption row (mini app icon + window title + close) above a 16:10 live preview captured via a private WindowServer API; cached frames render instantly and refresh in the background; equal-height cards pack into rows by each window's aspect ratio. Requires **Screen Recording** permission — without it the switcher falls back to icon-only cards.
+- <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: Alt-Tab-style cards — caption row (mini app icon + window title + close) above a 16:10 live preview captured via a private WindowServer API; cached frames render instantly and refresh in the background; equal-height cards pack into rows by each window's aspect ratio. Small sets enlarge dynamically up to 1.5×; large sets keep a readable minimum size and slide a contiguous visible range as selection advances. Requires **Screen Recording** permission — without it the switcher falls back to icon-only cards.
 - <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window never drags the app's others forward.
 - <img height="14" src="docs/icons/eye.svg"> **Full window visibility**: every real window, including off-screen and minimized (toggleable).
 - <img height="14" src="docs/icons/gear.svg"> **Hot-reloadable TOML**: validated config from the menu.

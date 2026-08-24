@@ -13,6 +13,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ffi::CString;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant; // TIMING-DEBUG
@@ -81,6 +82,11 @@ pub(crate) static CARD_CLASS: Mutex<Option<ObjClassPtr>> = Mutex::new(None);
 /// msg_send! issues on dynamically-registered ObjC classes.
 pub(crate) static CARD_INDEX_MAP: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 缩略图模式当前实际渲染的全局窗口索引区间；窗口列表本身从不截断。
+/// Global window-index range currently rendered in thumbnail mode; the authoritative
+/// window list is never truncated.
+static THUMB_VISIBLE_RANGE: Mutex<Option<Range<usize>>> = Mutex::new(None);
+type CardPlacementFrame = (usize, f64, f64, f64);
 /// Prevents hover-selection on the card under the cursor when the window first
 /// opens. Set to false in show_overlay(), flipped to true on first mouseMoved:.
 pub(crate) static MOUSE_MOVED: AtomicBool = AtomicBool::new(false);
@@ -108,6 +114,15 @@ pub(crate) fn remove_card_index(view: *mut AnyObject) {
 pub(crate) fn clear_card_indices() {
     let mut map = CARD_INDEX_MAP.lock().unwrap();
     map.clear();
+}
+
+/// 缩略图捕获调度读取的可见区间快照。/ Visible-range snapshot for thumbnail scheduling.
+pub(crate) fn thumbnail_visible_range() -> Option<Range<usize>> {
+    THUMB_VISIBLE_RANGE.lock().unwrap().clone()
+}
+
+fn reset_thumbnail_visible_range() {
+    *THUMB_VISIBLE_RANGE.lock().unwrap() = None;
 }
 
 // ========== 文本 helper / text helpers ==========
@@ -306,14 +321,41 @@ pub(crate) extern "C" fn on_cmd_tab_pressed(_self: *mut c_void, _cmd: Sel, _arg:
         state.visible = true;
         state.selected = if state.windows.len() > 1 { 1 } else { 0 };
         drop(state_opt);
+        reset_thumbnail_visible_range();
         show_overlay();
         // TIMING-DEBUG 端到端:tap 回调 → collect_windows → show_overlay 完成。
         log_debug!("[overlay] summon e2e={}ms", t_end.elapsed().as_millis());
     } else {
         state.selected = (state.selected + 1) % state.windows.len().max(1);
         drop(state_opt);
-        refresh_highlight();
-        update_status_label();
+        refresh_after_selection_change(ThumbSlideDirection::Forward, true);
+    }
+}
+
+/// 选中项仍在当前可见区间时只刷新样式；越过边缘时重排连续区间。
+/// Refresh styling while selection stays visible; re-plan the contiguous slice
+/// only after selection crosses an edge.
+fn refresh_after_selection_change(direction: ThumbSlideDirection, backfill_icons: bool) {
+    let selected = TAB_STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|state| state.selected);
+    let needs_relayout = crate::theme::thumbnails_enabled()
+        && selected.is_some_and(|index| {
+            !THUMB_VISIBLE_RANGE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|range| range.contains(&index))
+        });
+    if needs_relayout {
+        show_overlay_with_direction(direction);
+        return;
+    }
+    refresh_highlight();
+    update_status_label();
+    if backfill_icons {
         extract_uncached_icons();
     }
 }
@@ -612,8 +654,7 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 if !state.windows.is_empty() {
                     state.selected = (state.selected + 1) % state.windows.len();
                     drop(state_opt);
-                    refresh_highlight();
-                    update_status_label();
+                    refresh_after_selection_change(ThumbSlideDirection::Forward, false);
                 }
             }
             KEY_LEFT => {
@@ -624,8 +665,7 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                         state.selected - 1
                     };
                     drop(state_opt);
-                    refresh_highlight();
-                    update_status_label();
+                    refresh_after_selection_change(ThumbSlideDirection::Backward, false);
                 }
             }
             KEY_UP => {
@@ -1220,6 +1260,7 @@ pub(crate) fn close_window_at(idx: usize) {
     }
     // 全量重建(布局/窗口尺寸可能随行数变化),再刷新高亮。
     // Full rebuild (layout/window size may change with the row count), then the highlight.
+    reset_thumbnail_visible_range();
     show_overlay();
     refresh_highlight();
 }
@@ -2369,12 +2410,17 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect) {
 }
 
 pub(crate) fn show_overlay() {
+    show_overlay_with_direction(ThumbSlideDirection::Preserve);
+}
+
+fn show_overlay_with_direction(direction: ThumbSlideDirection) {
     unsafe {
         // TIMING-DEBUG 阶段计时:定位 summon 卡顿——卡片构建 / 图标 / resize / 状态栏。
         let t0 = Instant::now();
         let state_opt = TAB_STATE.lock().unwrap();
         let state = state_opt.as_ref().unwrap();
         let count = state.windows.len();
+        let selected = state.selected;
         let windows = state.windows.clone();
         drop(state_opt);
 
@@ -2403,78 +2449,65 @@ pub(crate) fn show_overlay() {
         // packing budget; centering reuses it.
         let (screen_frame, screen_visible) = overlay_target_screen(&windows);
         let use_flow = crate::theme::thumbnails_enabled();
-        let flow_card_h = thumb_card_h_fixed();
 
-        // (x, y, w) per card — 两种布局统一产出位置表,卡片循环共用。
-        // (x, y, w) per card — both layouts produce one position table consumed by
-        // the single card loop below.
-        let (h, w, pos, flow_card_h_use): (f64, f64, Vec<(f64, f64, f64)>, f64) = if use_flow {
+        // (全局 index, x, y, w)——缩略图模式只产出当前连续可见区间，纯图标模式
+        // 仍产出全部窗口。
+        // (global index, x, y, w): thumbnail mode emits only the current contiguous
+        // visible slice; icon mode still emits every window.
+        let (h, w, placements, card_h_use): (f64, f64, Vec<CardPlacementFrame>, f64) = if use_flow {
             // ===== 流式布局(缩略图模式):等高不等宽,贪心装箱,行内居中 =====
             // 窗口宽高比决定卡宽;极端比例被 clamp_aspect 钳制;每行能容纳的
-            // 卡片数随行内已占宽度自然变化。
-            // 高度上限 = 目标屏 visibleFrame × 0.85(BetterCmdTab 同款):超限按
-            // 0.05 步长整体缩卡重排,下限 0.5。
+            // 卡片数随行内已占宽度自然变化。全部能放下时在 1.0–1.5 间尽量
+            // 放大；放不下时保持 1.0，并随选择滑动连续可见区间。
             // ===== Flow layout (thumbnail mode): uniform height, per-aspect widths
             // ===== greedily packed into rows; per-row capacity varies naturally.
-            // Height cap = target screen visibleFrame x 0.85 (BetterCmdTab-style):
-            // on overflow, shrink all cards by 0.05 steps and re-pack, floor 0.5.
+            // Enlarge from 1.0 to 1.5 while everything fits; on overflow, retain
+            // 1.0 and slide a contiguous visible slice with the selection.
             let gap = THUMB_ROW_GAP;
-            let max_inner = ((screen_frame.size.width - H_PADDING * 2.0) * 0.92)
-                .clamp(300.0, 1240.0 - H_PADDING * 2.0);
+            let screen_inner = (screen_frame.size.width - H_PADDING * 2.0).max(160.0);
+            let max_inner = (screen_inner * 0.92)
+                .min(1240.0 - H_PADDING * 2.0)
+                .min(screen_inner)
+                .max(160.0);
             let max_panel_h = (screen_visible.size.height * 0.85).max(240.0);
-            let mut scale = 1.0f64;
-            let (panel_w, panel_h, pos, card_h_use) = loop {
-                let card_h = flow_card_h * scale;
-                let widths: Vec<f64> = windows
-                    .iter()
-                    .map(|wi| {
-                        let (_, _, bw, bh) = wi.bounds;
-                        let aspect = if bw > 0.0 && bh > 0.0 {
-                            bw / bh
-                        } else {
-                            THUMB_PREVIEW_RATIO // bounds 未知按 16:10 / unknown -> 16:10
-                        };
-                        thumb_card_w_for_aspect(card_h, aspect)
-                    })
-                    .collect();
-                let rows = pack_rows(&widths, max_inner, gap);
-                let n_rows = rows.len().max(1); // 空窗口态保底一行高度 / floor for the empty state
-                let inner_w = rows
-                    .iter()
-                    .map(|r| {
-                        if r.is_empty() {
-                            0.0
-                        } else {
-                            r.iter().map(|&i| widths[i]).sum::<f64>() + (r.len() - 1) as f64 * gap
-                        }
-                    })
-                    .fold(0.0f64, f64::max)
-                    .max(280.0);
-                let panel_w = inner_w + H_PADDING * 2.0;
-                let panel_h = 32.0 + n_rows as f64 * card_h + (n_rows - 1) as f64 * gap + STATUS_H;
-                if panel_h <= max_panel_h || scale <= 0.5 {
-                    let mut pos: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); windows.len()];
-                    // 行内居中:每行宽度不同,各自在面板内水平居中。
-                    // Center each row: widths differ per row, so rows center individually.
-                    for (ri, row) in rows.iter().enumerate() {
-                        if row.is_empty() {
-                            continue;
-                        }
-                        let row_w: f64 = row.iter().map(|&i| widths[i]).sum::<f64>()
-                            + (row.len() - 1) as f64 * gap;
-                        let mut x = (panel_w - row_w) / 2.0;
-                        let y = panel_h - 32.0 - (ri as f64 + 1.0) * card_h - ri as f64 * gap;
-                        for &i in row {
-                            pos[i] = (x, y, widths[i]);
-                            x += widths[i] + gap;
-                        }
+            let aspects: Vec<f64> = windows
+                .iter()
+                .map(|wi| {
+                    let (_, _, bw, bh) = wi.bounds;
+                    if bw > 0.0 && bh > 0.0 {
+                        bw / bh
+                    } else {
+                        THUMB_PREVIEW_RATIO // bounds 未知按 16:10 / unknown -> 16:10
                     }
-                    break (panel_w, panel_h, pos, card_h);
-                }
-                scale = (scale - 0.05).max(0.5);
-            };
-            (panel_h, panel_w, pos, card_h_use)
+                })
+                .collect();
+            let previous = THUMB_VISIBLE_RANGE.lock().unwrap().clone();
+            let layout = plan_thumb_flow_layout(
+                &aspects,
+                selected,
+                previous,
+                direction,
+                max_inner,
+                max_panel_h,
+                gap,
+            );
+            *THUMB_VISIBLE_RANGE.lock().unwrap() = Some(layout.visible.clone());
+            log_debug!(
+                "[overlay] flow scale={:.2} visible={}..{} of {} overflow={}",
+                layout.scale,
+                layout.visible.start,
+                layout.visible.end,
+                windows.len(),
+                layout.overflowed
+            );
+            let placements = layout
+                .placements
+                .into_iter()
+                .map(|p| (p.index, p.x, p.y, p.width))
+                .collect();
+            (layout.panel_h, layout.panel_w, placements, layout.card_h)
         } else {
+            reset_thumbnail_visible_range();
             // ===== 旧版均匀网格(纯图标模式)=====
             // 窗口宽按「槽位」计算:最少 3 个槽位(count<3 时也保持三卡宽,空窗口态同样)。
             // 槽位 = min(每行卡数配置, max(3, count))。
@@ -2497,23 +2530,25 @@ pub(crate) fn show_overlay() {
                     slots as f64 * card_w() + (slots.saturating_sub(1)) as f64 * card_gap();
                 (card_w(), card_w() + card_gap(), (w - row_width) / 2.0)
             };
-            let mut pos: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); windows.len()];
+            let mut placements = Vec::with_capacity(windows.len());
             for (idx, _) in windows.iter().enumerate() {
                 // Standard coords: y=0 at bottom. Cards stack from top down.
                 let col = idx % cards_per_row();
                 let row = idx / cards_per_row();
                 let x = start_x + col as f64 * pitch;
                 let y = h - 32.0 - (row + 1) as f64 * card_h();
-                pos[idx] = (x, y, card_w_eff);
+                placements.push((idx, x, y, card_w_eff));
             }
-            (h, w, pos, card_h())
+            (h, w, placements, card_h())
         };
-        let card_h_outer = flow_card_h_use;
+        let card_h_outer = card_h_use;
 
         let mut cards_total_ms: u128 = 0; // TIMING-DEBUG
-        for (idx, w) in windows.iter().enumerate() {
+        for (idx, card_x, card_y, card_w_i) in placements {
+            let Some(w) = windows.get(idx) else {
+                continue;
+            };
             let t_card = Instant::now(); // TIMING-DEBUG
-            let (card_x, card_y, card_w_i) = pos[idx];
             let card = create_card_view(w, idx, card_w_i, card_h_outer);
             let card_ms = t_card.elapsed().as_millis(); // TIMING-DEBUG
             cards_total_ms += card_ms;

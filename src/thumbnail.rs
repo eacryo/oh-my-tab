@@ -4,7 +4,8 @@
 //! 1. 启动预生成:监视线程启动时枚举所有运行中 App 的标准窗口补拍
 //! 2. 常驻监听:每 PID 一个 AXObserver 订阅 kAXWindowCreatedNotification,
 //!    新窗口防抖 300ms 后预生成(等窗口完成初始化,避免拍到白屏)
-//! 3. 召唤补拍:show_overlay 时对过期/缺失项入队,完成后主线程原位换卡
+//! 3. 召唤补拍:show_overlay 时对可见区间及两侧预取项中的过期/缺失帧入队,
+//!    完成后主线程原位换卡
 //!
 //! 无屏幕录制权限(TCC)时整个模块休眠,浮窗保持纯图标渲染;运行中授权后
 //! 下一个捕获任务自动恢复(worker 每个任务前都重新 preflight)。
@@ -18,8 +19,8 @@
 //! 2. resident listener: one AXObserver per PID watching kAXWindowCreatedNotification;
 //!    a new window debounces 300ms (letting it finish initializing, avoiding a white
 //!    flash) then pre-generates
-//! 3. summon refresh: show_overlay enqueues stale/missing windows; results swap the
-//!    affected cards in place on the main thread.
+//! 3. summon refresh: show_overlay enqueues stale/missing windows in the visible
+//!    slice plus prefetch margins; results swap affected cards in place on the main thread.
 //!
 //! Without the Screen Recording TCC permission the whole module sleeps and the
 //! overlay keeps rendering icons only; granting permission mid-run resumes
@@ -29,6 +30,7 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CString};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -316,10 +318,14 @@ impl<K: Eq + Clone, V: Clone> Lru<K, V> {
 
 // ========== 缓存状态 ==========
 
-const CACHE_MAX_ITEMS: usize = 32;
-/// ~24MB 成本上限(w*h*4 记账),与 BetterCmdTab 的 ~19MB 同量级。
-/// ~24MB cost budget (accounted as w*h*4), same ballpark as BetterCmdTab's ~19MB.
-const CACHE_MAX_COST: u64 = 24_000_000;
+/// 大量窗口连续滑动时保留更多相邻帧；窗口列表本身没有数量上限。
+/// Retain more neighboring frames for large sliding window sets; the authoritative
+/// window list itself has no count limit.
+const CACHE_MAX_ITEMS: usize = 64;
+/// 约 64MB 成本上限(w*h*4 记账)，可容纳约 40 张常见 16:10 缩略图。
+/// ~64MB cost budget (accounted as w*h*4), enough for roughly forty typical
+/// 16:10 thumbnails.
+const CACHE_MAX_COST: u64 = 64_000_000;
 /// 新鲜 TTL:召唤时 2s 内的直接复用,过期的先画旧帧再后台重截。
 /// Freshness TTL: frames younger than 2s are reused at summon; older ones are
 /// drawn immediately while a background recapture swaps them in.
@@ -328,6 +334,10 @@ const FRESH_TTL_MS: u128 = 2000;
 /// Max target pixel height for one thumbnail (~two retina card heights) to bound
 /// per-frame memory.
 const TARGET_PX_H: u32 = 512;
+/// 连续可见区间两侧的预取窗口数；新卡滑入前通常已经有缓存。
+/// Number of windows prefetched on each side of the visible slice so newly slid-in
+/// cards normally already have a cached frame.
+const VISIBLE_PREFETCH_MARGIN: usize = 4;
 
 /// Clone 为浅拷贝(CGImageRef 位拷贝),所有权纪律:缓存持有 +1,克隆方仅在
 /// 显式 CFRetain 后才能长期持有(见 lookup_retained)。
@@ -495,14 +505,20 @@ fn run_capture_job(key: ThumbKey) {
     }
 }
 
-/// 浮窗是否可见且该窗口仍在列表中(投递时效双重校验的 worker 半段)。
-/// Whether the overlay is visible AND the window is still listed (the worker half
-/// of the delivery-freshness double check).
+/// 浮窗是否可见且该窗口当前确实有卡片(投递时效双重校验的 worker 半段)。
+/// Whether the overlay is visible AND the window currently has a rendered card
+/// (the worker half of the delivery-freshness double check).
 fn overlay_wants(pid: i32, wid: u32) -> bool {
+    let visible = crate::overlay::thumbnail_visible_range();
     let state_opt = crate::TAB_STATE.lock().unwrap();
     match state_opt.as_ref() {
-        Some(s) => s.visible && s.windows.iter().any(|w| w.pid == pid && w.window_id == wid),
+        Some(s) if s.visible => s
+            .windows
+            .iter()
+            .position(|w| w.pid == pid && w.window_id == wid)
+            .is_some_and(|index| visible.as_ref().is_none_or(|range| range.contains(&index))),
         None => false,
+        Some(_) => false,
     }
 }
 
@@ -517,6 +533,7 @@ pub(crate) fn handle_ready_main() {
     if keys.is_empty() {
         return;
     }
+    let visible = crate::overlay::thumbnail_visible_range();
     let indices: Vec<usize> = {
         let state_opt = crate::TAB_STATE.lock().unwrap();
         let state = match state_opt.as_ref() {
@@ -533,6 +550,7 @@ pub(crate) fn handle_ready_main() {
                     .iter()
                     .position(|w| w.pid == k.pid && w.window_id == k.wid)
             })
+            .filter(|index| visible.as_ref().is_none_or(|range| range.contains(index)))
             .collect()
     };
     if !indices.is_empty() {
@@ -639,12 +657,27 @@ static CONNECTION_ID: OnceLock<u32> = OnceLock::new();
 
 // ========== 召唤期刷新(show_overlay 尾部调用) ==========
 
-/// 召唤期补拍:对可见、非最小化、有 bounds 的窗口检查缓存新鲜度,过期/缺失的
-/// 请求异步重截。pending/in-flight 键由 enqueue_job 合并；选中窗口排最前。
+fn capture_range_for_visible(visible: Option<Range<usize>>, len: usize) -> Range<usize> {
+    let visible = visible.unwrap_or(0..len);
+    visible
+        .start
+        .min(len)
+        .saturating_sub(VISIBLE_PREFETCH_MARGIN)
+        ..visible
+            .end
+            .min(len)
+            .saturating_add(VISIBLE_PREFETCH_MARGIN)
+            .min(len)
+}
+
+/// 召唤期补拍:对当前可见区间及两侧预取范围中非最小化、有 bounds 的窗口检查
+/// 缓存新鲜度，过期/缺失的请求异步重截。pending/in-flight 键由 enqueue_job
+/// 合并；选中窗口排最前。
 /// 选中项从 TAB_STATE 内部读取,调用方只在 show_overlay 尾部触发一次。
-/// Summon-time refresh: for visible, non-minimized windows with valid bounds,
-/// request async recaptures for stale/missing frames. enqueue_job coalesces keys
-/// already pending/in-flight; the selected window is requested first.
+/// Summon-time refresh: for non-minimized windows with valid bounds in the visible
+/// slice plus its prefetch margins, request async recaptures for stale/missing
+/// frames. enqueue_job coalesces keys already pending/in-flight; the selected
+/// window is requested first.
 /// The selection is read from TAB_STATE internally; callers just invoke once at
 /// the end of show_overlay.
 pub(crate) fn refresh_for_summon() {
@@ -657,6 +690,9 @@ pub(crate) fn refresh_for_summon() {
         request_permission_once();
         return;
     }
+    // 与 worker 的 overlay_wants 保持锁序：先可见区间，后 TAB_STATE。
+    // Match the worker's overlay_wants lock order: visible range before TAB_STATE.
+    let visible_snapshot = crate::overlay::thumbnail_visible_range();
     let jobs: Vec<(i32, u32)> = {
         let state_opt = crate::TAB_STATE.lock().unwrap();
         let Some(state) = state_opt.as_ref() else {
@@ -669,9 +705,13 @@ pub(crate) fn refresh_for_summon() {
             .windows
             .get(state.selected)
             .map(|w| (w.pid, w.window_id));
+        let capture_range = capture_range_for_visible(visible_snapshot, state.windows.len());
         let mut jobs: Vec<(i32, u32)> = state
             .windows
             .iter()
+            .enumerate()
+            .filter(|(index, _)| capture_range.contains(index))
+            .map(|(_, window)| window)
             .filter(|w| !w.minimized && w.bounds.2 > 0.0 && w.bounds.3 > 0.0)
             .filter(|w| !is_cached_fresh(w.pid, w.window_id))
             .map(|w| (w.pid, w.window_id))
@@ -1144,6 +1184,15 @@ mod tests {
         assert!(state.request(first));
         assert!(!state.request(first));
         assert!(state.request(other));
+    }
+
+    #[test]
+    fn visible_capture_range_adds_bounded_prefetch_margins() {
+        assert_eq!(capture_range_for_visible(Some(10..20), 40), 6..24);
+        assert_eq!(capture_range_for_visible(Some(0..5), 40), 0..9);
+        assert_eq!(capture_range_for_visible(Some(36..40), 40), 32..40);
+        assert_eq!(capture_range_for_visible(None, 40), 0..40);
+        assert_eq!(capture_range_for_visible(Some(50..60), 40), 36..40);
     }
 
     #[test]
