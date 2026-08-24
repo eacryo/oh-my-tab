@@ -1809,7 +1809,14 @@ pub(crate) fn create_card_view(
             let container: *mut AnyObject = msg_send![container, initWithFrame: preview_frame];
             let _: () = msg_send![container, setWantsLayer: true];
             let cl: *mut AnyObject = msg_send![container, layer];
-            let _: () = msg_send![cl, setCornerRadius: 10.0f64];
+            // 预览区圆角 4pt:预览是缩小的窗口(约 1/8 缩放),macOS 窗口真实圆角
+            // (Tahoe 16pt / Sequoia 10pt)在此缩放下等效 ~2pt,加 1px 描边的视觉
+            // 补偿取 4pt——10pt 会显得比窗口本身圆得多(实测反馈)。
+            // Preview corner radius of 4pt: the preview is a shrunken window (~1/8
+            // scale), where a real macOS window corner (Tahoe 16pt / Sequoia 10pt)
+            // equates to ~2pt; 4pt adds compensation for the 1px border. 10pt read
+            // far rounder than the window itself (user-reported).
+            let _: () = msg_send![cl, setCornerRadius: 4.0f64];
             let _: () = msg_send![cl, setMasksToBounds: true];
             let _: () = msg_send![cl, setBorderWidth: 1.0f64];
             layer_set_border(cl, hex_to_cg_color(colors.preview_border));
