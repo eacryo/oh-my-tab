@@ -41,9 +41,10 @@ use std::thread;
 
 use event_monitor::{start as start_event_monitor, GlobalEvent};
 use window_collector::{
-    bump_window_mru, cache_running_app_icons, cache_running_app_icons_small, ensure_icon_cache_dir,
-    extract_icon_to_cache, focused_window_cgwid, migrate_legacy_cache, note_app_activated, MruMap,
-    WindowInfo,
+    app_activation_is_current, bump_window_mru, cache_running_app_icons,
+    cache_running_app_icons_small, ensure_icon_cache_dir, extract_icon_to_cache,
+    focused_window_cgwid, migrate_legacy_cache, note_app_activated, note_app_terminated,
+    remove_pid_mru, MruMap, WindowInfo,
 };
 
 // FFI 声明与 ObjC 桥接基础工具已移至 `ffi.rs` / FFI declarations and ObjC bridging primitives moved to `ffi.rs`
@@ -149,9 +150,12 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
             return;
         }
         let pid: i32 = msg_send![app, processIdentifier];
-        // 更新 App 级激活时间（仅用于诊断，不参与排序）
-        // Update app-level activation time (diagnostics only, not used in sorting)
-        note_app_activated(pid);
+        // 记录本次 App 激活 token：新窗口首次进入 MRU 表时用它作初始时间，异步查询
+        // 也用它识别迟到结果；已有窗口不会因这个 App 级时间被整体更新。
+        // Record this app activation's token: newly discovered windows use it as their initial
+        // MRU, and async queries use it to reject stale results. Existing windows are never
+        // updated together from this app-level timestamp.
+        let activated_at = note_app_activated(pid);
         // 后台线程解析焦点窗口的 CGWindowID 并 bump 窗口级 MRU。
         // 系统 Cmd+Tab / Dock 点击等外部焦点切换通过此路径反馈到窗口排序中。
         // kAXFocusedWindow 的 AX 查询可能阻塞最高 50ms（目标 App 无响应时），
@@ -161,22 +165,53 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
         // ordering through this path. The kAXFocusedWindow AX query can block up
         // to 50ms (target app unresponsive), so it must run off the main thread.
         thread::spawn(move || {
+            let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
             // 日志用于诊断 MRU 是否被正确 bump:成功打印 pid+cgwid;失败(AX 查询超时/无聚焦窗口)
-            // 也打印,便于排查"所有窗口 mru 都停在 ancient 回退值"这类问题。
+            // 会有限重试；每轮先验证激活 token 与系统前台 PID，防止迟到线程误提升已切走的 App。
             // Log to diagnose MRU bumping: print pid+cgwid on success; also log on failure
-            // (AX timeout / no focused window) to investigate "all windows stuck at ancient fallback".
-            if let Some(cgwid) = focused_window_cgwid(pid) {
-                let mut state_opt = TAB_STATE.lock().unwrap();
-                if let Some(ref mut state) = *state_opt {
-                    bump_window_mru(&mut state.mru, pid, cgwid);
-                    log_debug!("app-activated bump: pid={} cgwid={}", pid, cgwid);
+            // (AX timeout / no focused window) after bounded retries. Each attempt first checks
+            // the activation token and system frontmost PID so a late thread cannot bump an app
+            // the user already left.
+            let retry_delays_ms = [0_u64, 50, 150, 300, 700, 1_000];
+            let mut bumped = false;
+            for (attempt, delay_ms) in retry_delays_ms.into_iter().enumerate() {
+                if delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 }
-            } else {
+                if !app_activation_is_current(pid, activated_at) {
+                    break;
+                }
+                let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+                let front_app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+                if front_app.is_null() {
+                    continue;
+                }
+                let front_pid: i32 = msg_send![front_app, processIdentifier];
+                if front_pid != pid {
+                    break;
+                }
+                if let Some(cgwid) = focused_window_cgwid(pid) {
+                    let mut state_opt = TAB_STATE.lock().unwrap();
+                    if let Some(ref mut state) = *state_opt {
+                        bump_window_mru(&mut state.mru, pid, cgwid);
+                        log_debug!(
+                            "app-activated bump: pid={} cgwid={} attempt={}",
+                            pid,
+                            cgwid,
+                            attempt + 1
+                        );
+                    }
+                    bumped = true;
+                    break;
+                }
+            }
+            if !bumped {
                 log_debug!(
-                    "app-activated bump: pid={} (no focused window / AX timeout)",
+                    "app-activated bump: pid={} (no focused window / stale activation / AX timeout)",
                     pid
                 );
             }
+            let _: () = msg_send![pool, drain];
         });
     }
 }
@@ -246,6 +281,21 @@ extern "C" fn on_app_terminated(_self: *mut c_void, _cmd: Sel, notification: *mu
         msg_send![app, processIdentifier]
     };
     if pid > 0 {
+        // 退出即清掉激活 token 与该 PID 的窗口 MRU，既会使未结束的重试失效，也避免
+        // PID/CGWindowID 复用继承旧进程的时间戳。
+        // Termination clears the activation token and this PID's window MRUs immediately,
+        // invalidating in-flight retries and preventing PID/CGWindowID reuse contamination.
+        note_app_terminated(pid);
+        if let Some(ref mut state) = *TAB_STATE.lock().unwrap() {
+            let removed = remove_pid_mru(&mut state.mru, pid);
+            if removed > 0 {
+                log_debug!(
+                    "app-terminated MRU cleanup: pid={} removed={}",
+                    pid,
+                    removed
+                );
+            }
+        }
         thumbnail::app_terminated(pid);
     }
 }

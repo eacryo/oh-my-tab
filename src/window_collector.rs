@@ -2,7 +2,7 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::CONFIG;
 use crate::{log_debug, log_info};
@@ -30,18 +30,33 @@ pub struct WindowInfo {
 pub type MruMap = HashMap<(i32, u32), Instant>;
 
 /// PID → 最后一次 App 激活时间（通过 NSWorkspace 通知）。
-/// 仅用于诊断输出，不参与排序。排序已改为纯窗口级 MRU。
+/// 仅作为新窗口第一次进入 MRU 表时的启动种子；已有窗口永不随 App 激活整体更新。
 /// PID → last app activation time (via NSWorkspace notification).
-/// Diagnostics only — sorting is now purely window-level MRU.
+/// Used only to seed a window the first time it enters the MRU map; existing windows
+/// are never updated together when their app activates.
 static LAST_ACTIVATED: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, Instant>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// 通过 NSWorkspaceDidActivateApplicationNotification 发送，由 main.rs 调用。
-/// 保留用于诊断——排序不再依赖此数据。
+/// 返回本次激活 token，供异步焦点查询丢弃迟到结果。
 /// Called from the NSWorkspaceDidActivateApplicationNotification handler in main.rs.
-/// Kept for diagnostics — sorting no longer depends on this data.
-pub fn note_app_activated(pid: i32) {
-    LAST_ACTIVATED.lock().unwrap().insert(pid, Instant::now());
+/// Returns this activation's token so async focus queries can discard stale results.
+pub fn note_app_activated(pid: i32) -> Instant {
+    let activated_at = Instant::now();
+    LAST_ACTIVATED.lock().unwrap().insert(pid, activated_at);
+    activated_at
+}
+
+/// 异步激活查询是否仍对应 PID 的最新一次激活。
+/// Whether an async activation query still belongs to the PID's latest activation.
+pub fn app_activation_is_current(pid: i32, activated_at: Instant) -> bool {
+    LAST_ACTIVATED.lock().unwrap().get(&pid).copied() == Some(activated_at)
+}
+
+/// App 退出时清除激活种子，避免 PID 复用继承旧进程的时间。
+/// Clear the activation seed on termination so PID reuse cannot inherit old process state.
+pub fn note_app_terminated(pid: i32) {
+    LAST_ACTIVATED.lock().unwrap().remove(&pid);
 }
 
 /// 将指定窗口的 MRU 时间戳更新为当前时间。
@@ -82,6 +97,46 @@ fn prune_mru(mru: &mut MruMap, live_set: &HashSet<(i32, u32)>) -> usize {
     let before = mru.len();
     mru.retain(|k, _| live_set.contains(k));
     before - mru.len()
+}
+
+/// 清除指定进程的全部窗口 MRU；由 App 退出通知调用，立即切断 PID/CGWindowID 复用污染。
+/// Remove every window MRU for a process; termination calls this to immediately prevent
+/// PID/CGWindowID reuse from inheriting stale timestamps.
+pub fn remove_pid_mru(mru: &mut MruMap, pid: i32) -> usize {
+    let before = mru.len();
+    mru.retain(|(entry_pid, _), _| *entry_pid != pid);
+    before - mru.len()
+}
+
+/// 新窗口只初始化一次：优先使用 App 最近激活时间，否则退回 ancient；顺序偏移只用于
+/// 同批首次发现窗口的稳定排序。`or_insert` 是纯窗口 MRU 不搭便车的关键。
+/// Initialize a new window once: prefer the app's latest activation time, otherwise use
+/// ancient; the order offset only stabilizes windows first seen in the same batch. `or_insert`
+/// is what prevents existing sibling windows from riding an app activation.
+fn initialize_window_mru(
+    mru: &mut MruMap,
+    pid: i32,
+    cgwid: u32,
+    app_activated_at: Option<Instant>,
+    ancient_base: Instant,
+    insertion_order: u32,
+) {
+    let base = app_activated_at.unwrap_or(ancient_base);
+    let ordered_ts = base
+        .checked_sub(Duration::from_millis(insertion_order as u64))
+        .unwrap_or(base);
+    mru.entry((pid, cgwid)).or_insert(ordered_ts);
+}
+
+/// AX 聚焦查询失败时只能在系统报告的前台 App 内回退，不能误提升全局 CG 列表首项。
+/// If the AX focused query fails, fallback is restricted to the system-reported frontmost
+/// app rather than accidentally bumping the first item in the global CG list.
+fn frontmost_fallback(windows: &[WindowInfo], front_pid: Option<i32>) -> Option<(i32, u32)> {
+    let pid = front_pid?;
+    windows
+        .iter()
+        .find(|w| w.pid == pid && !w.minimized)
+        .map(|w| (w.pid, w.window_id))
 }
 
 /// 启动时按窗口前→后顺序预种 MRU(同应用窗口分组,应用级顺序 = CG 前→后序)。
@@ -1414,6 +1469,11 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     let t0 = Instant::now();
     let count = unsafe { CFArrayGetCount(array) };
     let now = Instant::now();
+    let ancient_base = now.checked_sub(Duration::from_secs(86_400)).unwrap_or(now);
+    // 一次收集使用同一激活快照，避免同批窗口因通知并发到达而得到两套时间基准。
+    // One collection uses one activation snapshot so concurrent notifications cannot give
+    // windows in the same batch two different time bases.
+    let last_activated = LAST_ACTIVATED.lock().unwrap().clone();
     let t_cg_ms = t0.elapsed().as_millis();
     let mut insertion_order: u32 = 0;
 
@@ -1623,22 +1683,21 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             continue;
         }
 
-        // 使用极旧的时间戳作为回退值，确保真实 MRU 条目（用户曾选中过的窗口）永远排在前面。
-        // ordeded_ts 在 CG 枚举顺序上递减，作为无 MRU 记录的窗口之间的稳定排序依据。
-        // Use very old timestamps as fallback so real MRU entries (windows the user has
-        // explicitly selected) always sort first. ordered_ts decreasing within CG enumeration
-        // order serves as a stable tiebreaker among "no MRU record" windows.
-        let ancient_base = now
-            .checked_sub(std::time::Duration::from_secs(86_400))
-            .unwrap_or(now);
-        let ordered_ts = ancient_base
-            .checked_sub(std::time::Duration::from_millis(insertion_order as u64))
-            .unwrap_or(ancient_base);
         // mru 按 (pid, CGWindowID) 索引——CGWindowID 在窗口生命周期内稳定不变，
-        // 比 title 更可靠（title 会随浏览器标签页切换而变）。
+        // 比 title 更可靠（title 会随浏览器标签页切换而变）。新窗口优先以 App 最近
+        // 激活时间初始化；已有条目绝不覆盖，因此旧同 App 窗口不会搭便车。
         // Key mru by (pid, CGWindowID) — CGWindowID is stable for the window's
-        // lifetime, more reliable than title (which changes with browser tabs).
-        mru.entry((owner_pid, cgwid)).or_insert(ordered_ts);
+        // lifetime, more reliable than title (which changes with browser tabs). New windows
+        // prefer the app's latest activation as their seed; existing entries are never
+        // overwritten, so old same-app windows cannot ride along.
+        initialize_window_mru(
+            mru,
+            owner_pid,
+            cgwid,
+            last_activated.get(&owner_pid).copied(),
+            ancient_base,
+            insertion_order,
+        );
         insertion_order += 1;
         let icon_path = icon_ids.get(&owner_pid).and_then(check_cache_for_identity);
         // TIMING-DEBUG 图标缓存 miss 标记:排查 summon 卡顿——哪些 app 会触发同步提取。
@@ -1699,14 +1758,15 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             if title.is_empty() && !titleless_pids.contains(&pid) {
                 continue;
             }
-            let ancient_base = now
-                .checked_sub(std::time::Duration::from_secs(86_400))
-                .unwrap_or(now);
-            let ordered_ts = ancient_base
-                .checked_sub(std::time::Duration::from_millis(insertion_order as u64))
-                .unwrap_or(ancient_base);
+            initialize_window_mru(
+                mru,
+                pid,
+                cgwid,
+                last_activated.get(&pid).copied(),
+                ancient_base,
+                insertion_order,
+            );
             insertion_order += 1;
-            mru.entry((pid, cgwid)).or_insert(ordered_ts);
             let icon_path = icon_ids.get(&pid).and_then(check_cache_for_identity);
             log_debug!(
                 "[collect] ax-only window restored: pid={} app=\"{}\" cgwid={} title=\"{}\"",
@@ -1799,7 +1859,7 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // "用户正看的窗口"刷成最新即可纠正。
     // 前台窗口的识别不依赖 CG 枚举顺序（show_minimized 开启时 CG ALL 枚举顺序不保证
     // z-order），改用系统级 API NSWorkspace.frontmostApplication + focused_window_cgwid
-    // 精确定位。获取失败时回退到 CG 枚举中首个非最小化窗口。
+    // 精确定位。获取失败时仅回退到该前台 App 的首个非最小化窗口。
     // Refresh the MRU of the frontmost focused window to now on summon. Focus changes that
     // don't fire an app-activation notification (e.g. switching terminal tabs, or a frontmost
     // app never system-activated) leave the current window's MRU at the ancient fallback,
@@ -1807,17 +1867,20 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // every summon corrects this. The frontmost window is identified via system APIs
     // (NSWorkspace.frontmostApplication + focused_window_cgwid) rather than CG enumeration
     // order, because CG's "All" option doesn't guarantee z-order when show_minimized is on.
-    // Fall back to the first non-minimized window in CG enumeration if the system API fails.
+    // If the focused-window query fails, fall back only within that frontmost app.
     // TIMING-DEBUG 前台 app 的 AX 聚焦窗口查询计时(从慢响应 app 切出时这里是第二个等待点)。
     let t_fm = Instant::now();
-    let frontmost: Option<(i32, u32)> = unsafe {
+    let (front_pid, frontmost): (Option<i32>, Option<(i32, u32)>) = unsafe {
         let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         let front_app: *mut AnyObject = msg_send![workspace, frontmostApplication];
         if !front_app.is_null() {
             let front_pid: i32 = msg_send![front_app, processIdentifier];
-            focused_window_cgwid(front_pid).map(|cgwid| (front_pid, cgwid))
+            (
+                Some(front_pid),
+                focused_window_cgwid(front_pid).map(|cgwid| (front_pid, cgwid)),
+            )
         } else {
-            None
+            (None, None)
         }
     };
     let fm_ms = t_fm.elapsed().as_millis();
@@ -1844,26 +1907,32 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
             cgwid,
             w.map_or("?", |w| w.window_title.as_str()),
         );
-    } else if let Some(w) = windows.iter().find(|w| !w.minimized) {
-        // 回退：系统 API 获取失败时，取 CG 枚举中首个非最小化窗口
-        // Fallback: when the system API fails, use the first non-minimized window in CG enumeration
-        mru.insert((w.pid, w.window_id), now);
-        log_debug!(
-            "summon-bump frontmost (fallback): pid={} app=\"{}\" cgwid={} title=\"{}\"",
-            w.pid,
-            w.app_name,
-            w.window_id,
-            w.window_title
-        );
+    } else if let Some((pid, cgwid)) = frontmost_fallback(&windows, front_pid) {
+        // 回退严格限制在系统前台 App 内，避免 AX 失败时把其他 App 的 CG 首项误刷为最新。
+        // Restrict fallback to the system frontmost app so an AX failure cannot bump another
+        // app's first CG item as most recent.
+        mru.insert((pid, cgwid), now);
+        if let Some(w) = windows
+            .iter()
+            .find(|w| w.pid == pid && w.window_id == cgwid)
+        {
+            log_debug!(
+                "summon-bump frontmost (fallback): pid={} app=\"{}\" cgwid={} title=\"{}\"",
+                w.pid,
+                w.app_name,
+                w.window_id,
+                w.window_title
+            );
+        }
     }
 
     // 纯窗口级 MRU 排序：每个窗口独立按最后被激活的时间排序。
-    // 不再使用 App 级 LAST_ACTIVATED——避免从 App C 切到浏览器的窗口 A 时，
-    // 浏览器的另一个窗口 B 也搭便车排到 C 前面。
+    // LAST_ACTIVATED 只为新窗口生成一次初始窗口时间；已有窗口不更新，避免从 App C
+    // 切到浏览器窗口 A 时，浏览器的旧窗口 B 也搭便车排到 C 前面。
     // Pure window-level MRU sort: each window is sorted independently by
-    // when it was last activated. No app-level LAST_ACTIVATED grouping —
-    // prevents browser window B from riding A's coattails when switching
-    // from app C to browser window A.
+    // when it was last activated. LAST_ACTIVATED only seeds a newly discovered window once;
+    // existing windows are not updated, preventing browser window B from riding A's coattails
+    // when switching from app C to browser window A.
     sort_windows_by_mru(&mut windows, mru, now);
 
     // 每次 summon 时打印排序后的窗口列表（= 实际显示顺序），含 mru 年龄。`*` 标记第 0 个(当前/前台窗口)。
@@ -2098,6 +2167,75 @@ mod tests {
     }
 
     #[test]
+    fn newly_discovered_windows_preserve_activation_timeline() {
+        // Edge 启动时先使用新标签页，随后恢复并聚焦 ChatGPT：恢复窗口的显式焦点 bump
+        // 最新，新标签页保留 Edge 激活种子，之前使用的其他 App 依次排后。
+        // Edge starts on a new tab, then restores and focuses ChatGPT: the restored window's
+        // explicit focus bump is newest, the new tab keeps Edge's activation seed, and apps
+        // used earlier follow in order.
+        let now = Instant::now();
+        let ancient = now - Duration::from_secs(86_400);
+        let edge_activated = now - Duration::from_secs(2);
+        let mut mru = MruMap::new();
+        mru.insert((20, 200), now - Duration::from_secs(10)); // RustRover
+        mru.insert((30, 300), now - Duration::from_secs(20)); // Ghostty
+        initialize_window_mru(&mut mru, 10, 101, Some(edge_activated), ancient, 0); // new tab
+        initialize_window_mru(&mut mru, 10, 102, Some(edge_activated), ancient, 1); // ChatGPT
+        mru.insert((10, 102), now); // restored focused window
+
+        let mut ws = vec![
+            window(30, 300),
+            window(10, 101),
+            window(20, 200),
+            window(10, 102),
+        ];
+        sort_windows_by_mru(&mut ws, &mru, now);
+        let order: Vec<(i32, u32)> = ws.iter().map(|w| (w.pid, w.window_id)).collect();
+        assert_eq!(order, vec![(10, 102), (10, 101), (20, 200), (30, 300)]);
+    }
+
+    #[test]
+    fn app_activation_does_not_bump_existing_sibling_window() {
+        // `or_insert` 不覆盖已有窗口：激活浏览器窗口 A 时，旧窗口 B 保留自己的旧 MRU。
+        // `or_insert` does not overwrite an existing window: activating browser window A
+        // leaves old sibling B at its own older MRU.
+        let now = Instant::now();
+        let old_sibling_mru = now - Duration::from_secs(60);
+        let mut mru = MruMap::from([((10, 100), old_sibling_mru)]);
+        initialize_window_mru(
+            &mut mru,
+            10,
+            100,
+            Some(now - Duration::from_secs(1)),
+            now - Duration::from_secs(86_400),
+            0,
+        );
+        assert_eq!(mru.get(&(10, 100)), Some(&old_sibling_mru));
+    }
+
+    #[test]
+    fn new_window_without_activation_uses_ancient_fallback() {
+        let now = Instant::now();
+        let ancient = now - Duration::from_secs(86_400);
+        let mut mru = MruMap::new();
+        initialize_window_mru(&mut mru, 10, 100, None, ancient, 3);
+        assert_eq!(
+            mru.get(&(10, 100)),
+            Some(&(ancient - Duration::from_millis(3)))
+        );
+    }
+
+    #[test]
+    fn frontmost_fallback_never_selects_another_app() {
+        let mut own_front = window(10, 100);
+        own_front.minimized = true;
+        let ws = vec![window(20, 200), own_front];
+        assert_eq!(frontmost_fallback(&ws, Some(10)), None);
+        assert_eq!(frontmost_fallback(&ws, Some(20)), Some((20, 200)));
+        assert_eq!(frontmost_fallback(&ws, None), None);
+    }
+
+    #[test]
     fn seed_groups_windows_by_app_in_system_front_to_back_order() {
         // 启动种子:同 App 窗口分组、App 顺序 = 前到后首次出现、应用内 = CG 序,
         // 且全部排在无记录(999s 回退)之前。这是"重启后顺序与原生应用序一致"的核心。
@@ -2154,6 +2292,15 @@ mod tests {
         // Nothing to drop -> 0 and the map is untouched.
         assert_eq!(prune_mru(&mut mru, &live), 0);
         assert_eq!(mru.len(), 1);
+    }
+
+    #[test]
+    fn remove_pid_mru_drops_only_terminated_process() {
+        let now = Instant::now();
+        let mut mru = MruMap::from([((1, 100), now), ((1, 101), now), ((2, 200), now)]);
+        assert_eq!(remove_pid_mru(&mut mru, 1), 2);
+        assert_eq!(mru, MruMap::from([((2, 200), now)]));
+        assert_eq!(remove_pid_mru(&mut mru, 1), 0);
     }
 
     #[test]
