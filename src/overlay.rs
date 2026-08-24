@@ -133,18 +133,18 @@ fn color_with_alpha(color: u32, alpha: u8) -> u32 {
     (color & 0xFFFF_FF00) | u32::from(alpha)
 }
 
-/// 占位符:窗口没有标题时(如 Microsoft To Do,AXTitle 为空)显示一个短横线。
+/// 窗口没有标题时(如 Microsoft To Do,AXTitle 为空)回退显示应用名。
 /// 注意:仅用于显示。内部 `window_title` 仍保持空串,这样 raise_ax_window 仍能
 /// 按空标题匹配到对应的 AX 窗口并聚焦。
-/// Placeholder shown for windows that expose no title (e.g. Microsoft To Do,
-/// whose custom title bar yields an empty AXTitle). Display-only: the internal
-/// `window_title` stays empty so raise_ax_window can still match the AX window
-/// by its empty title.
-fn display_title(title: &str) -> String {
+/// Fall back to the app name for windows that expose no title (e.g. Microsoft
+/// To Do, whose custom title bar yields an empty AXTitle). Display-only: the
+/// internal `window_title` stays empty so raise_ax_window can still match the
+/// AX window by its empty title.
+fn display_title<'a>(title: &'a str, app_name: &'a str) -> &'a str {
     if title.is_empty() {
-        "-".to_string()
+        app_name
     } else {
-        title.to_string()
+        title
     }
 }
 
@@ -222,12 +222,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_title_gets_placeholder() {
+    fn empty_title_gets_app_name() {
         // 空标题只影响显示层;内部 title 不动(见函数注释,raise_ax_window 靠空标题匹配)。
         // Empty titles only affect display; the stored title is untouched (see the fn doc:
         // raise_ax_window matches by the empty title).
-        assert_eq!(display_title(""), "-");
-        assert_eq!(display_title("   "), "   "); // 空白串不是空串 / whitespace is not empty
+        assert_eq!(display_title("", "Microsoft To Do"), "Microsoft To Do");
+        assert_eq!(display_title("   ", "Notes"), "   "); // 空白串不是空串 / whitespace is not empty
     }
 
     #[test]
@@ -251,8 +251,8 @@ mod tests {
 
     #[test]
     fn non_empty_title_passes_through() {
-        assert_eq!(display_title("Safari — Apple"), "Safari — Apple");
-        assert_eq!(display_title("x"), "x");
+        assert_eq!(display_title("Safari — Apple", "Safari"), "Safari — Apple");
+        assert_eq!(display_title("x", "App"), "x");
     }
 }
 
@@ -993,9 +993,10 @@ pub(crate) fn update_status_label() {
             match state.windows.get(selected) {
                 // 设计稿 .footer-current:选中的「标题 · 应用名」。
                 // The mockup's .footer-current: the selected "title · app".
+                Some(w) if w.window_title.is_empty() => truncate_text(&w.app_name, 40),
                 Some(w) => format!(
                     "{} · {}",
-                    truncate_text(&display_title(&w.window_title), 96),
+                    truncate_text(display_title(&w.window_title, &w.app_name), 96),
                     truncate_text(&w.app_name, 40)
                 ),
                 None => String::new(),
@@ -1967,7 +1968,7 @@ pub(crate) fn create_card_view(
                 msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
             };
             let title_label = make_left_label(
-                &display_title(&w.window_title),
+                display_title(&w.window_title, &w.app_name),
                 title_font,
                 hex_to_ns_color(colors.win_title),
                 title_x,
@@ -2166,7 +2167,7 @@ pub(crate) fn create_card_view(
             };
             let primary_color = hex_to_ns_color(colors.win_title);
             let title_label = make_centered_label(
-                &truncate_text(&display_title(&w.window_title), 20),
+                &truncate_text(display_title(&w.window_title, &w.app_name), 20),
                 primary_font,
                 primary_color,
                 primary_bottom,

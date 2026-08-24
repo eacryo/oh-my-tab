@@ -229,7 +229,7 @@ Shared state lives in global `static`s guarded by `Mutex` / `RwLock`: `TAB_STATE
 ### Key design points
 
 - **AX is authoritative** for window filtering: a CG window must match an AX `AXStandardWindow` (paired by `CGWindowID` via the private `_AXUIElementGetWindow`), so popups/panels/dropdowns are dropped.
-- **Titleless windows**: apps with a custom title bar (e.g. Microsoft To Do) expose an empty `AXTitle`; their windows are kept via a `titleless_pids` set, and only the *display* layer substitutes a placeholder (`"-"`). The stored title stays empty so `raise_ax_window` can still match the AX window.
+- **Titleless windows**: apps with a custom title bar (e.g. Microsoft To Do) expose an empty `AXTitle`; their windows are kept via a `titleless_pids` set, and only the *display* layer falls back to the app name. The stored title stays empty so `raise_ax_window` can still match the AX window.
 - **macOS version split**: macOS 26+ renders with `NSGlassEffectView` (Liquid Glass); older macOS falls back to `NSVisualEffectView` (withinWindow + Dark).
 - **Some calls use raw `objc_msgSend` FFI** because `objc2`'s `msg_send!` can't encode CF/CG types or void returns.
 

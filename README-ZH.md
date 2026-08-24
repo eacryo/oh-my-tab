@@ -229,7 +229,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 ### 关键设计点
 
 - **AX 为权威数据源**做窗口过滤:CG 窗口必须能通过私有 `_AXUIElementGetWindow` 按 `CGWindowID` 配对到一个 AX `AXStandardWindow`,从而丢弃弹出面板/下拉菜单。
-- **无标题窗口**:自绘标题栏的 App(如 Microsoft To Do)`AXTitle` 为空;这类窗口通过 `titleless_pids` 集合保留,只有*显示层*用占位符 `"-"` 替换。内部存储的标题保持空串,这样 `raise_ax_window` 仍能按空标题匹配到 AX 窗口。
+- **无标题窗口**:自绘标题栏的 App(如 Microsoft To Do)`AXTitle` 为空;这类窗口通过 `titleless_pids` 集合保留,只有*显示层*回退使用应用名称。内部存储的标题保持空串,这样 `raise_ax_window` 仍能按空标题匹配到 AX 窗口。
 - **macOS 版本分流**:macOS 26+ 用 `NSGlassEffectView`(Liquid Glass);旧版回退到 `NSVisualEffectView`(withinWindow + Dark)。
 - **部分调用使用原生 `objc_msgSend` FFI**,因为 `objc2` 的 `msg_send!` 无法编码 CF/CG 类型或 void 返回。
 
