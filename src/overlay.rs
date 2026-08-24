@@ -60,6 +60,9 @@ const SELECTION_RING_ALPHA: u8 = 0x29;
 /// 设计稿选中预览描边 = rgba(...,.34),换算为 8 位 alpha。
 /// Mockup selected-preview border = rgba(...,.34), converted to 8-bit alpha.
 const SELECTED_PREVIEW_BORDER_ALPHA: u8 = 0x57;
+/// 选中时仅内容上移的距离；不移动卡片本身。
+/// Distance that selected content moves upward; the card itself stays put.
+const SELECTED_CONTENT_NUDGE: f64 = 2.0;
 
 // ========== 浮窗相关全局状态 / overlay global state ==========
 
@@ -1385,10 +1388,10 @@ pub(crate) fn refresh_highlight() {
                 let _: () = msg_send![ring, setHidden: !is_selected];
             }
 
-            // HTML 参考中的图标在选中态向上轻移 1px;每次都从基准 y 重算,避免反复
+            // 图标在选中态向上轻移 2pt;每次都从基准 y 重算,避免反复
             // 切换时累计位移。
-            // The HTML reference nudges the icon up by 1px when selected; recompute from the
-            // baseline on every refresh so repeated selection changes never accumulate the offset.
+            // Nudge the icon up by 2pt when selected; recompute from the baseline on every
+            // refresh so repeated selection changes never accumulate the offset.
             let icon: *mut AnyObject = msg_send![sv, viewWithTag: ICON_VIEW_TAG];
             if !icon.is_null() {
                 let icon_frame: NSRect = msg_send![icon, frame];
@@ -1399,16 +1402,21 @@ pub(crate) fn refresh_highlight() {
                 } else {
                     icon_bottom + (icon_px() - icon_px_now) / 2.0
                 };
-                let icon_y = base_y + if is_selected { 1.0 } else { 0.0 };
+                let icon_y = base_y
+                    + if is_selected {
+                        SELECTED_CONTENT_NUDGE
+                    } else {
+                        0.0
+                    };
                 let _: () = msg_send![
                     icon,
                     setFrameOrigin: NSPoint::new(icon_frame.origin.x, icon_y)
                 ];
             }
 
-            // 缩略图模式:预览区随选中态上移 1px(与旧版图标轻移同款)。基准 y 恒为
+            // 缩略图模式:预览区随选中态上移 2pt(与旧版图标轻移同款)。基准 y 恒为
             // THUMB_PAD(布局常量),每次从基准绝对重算,反复切换零累计位移。
-            // Thumbnail mode: the preview area nudges up 1px when selected (same as
+            // Thumbnail mode: the preview area nudges up 2pt when selected (same as
             // the legacy icon nudge). The baseline y is always THUMB_PAD (a layout
             // constant) -- absolute recomputation per refresh, zero accumulated drift.
             let preview: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_PREVIEW_TAG];
@@ -1424,7 +1432,12 @@ pub(crate) fn refresh_highlight() {
                 };
                 layer_set_border(preview_layer, hex_to_cg_color(preview_border));
                 let preview_frame: NSRect = msg_send![preview, frame];
-                let preview_y = THUMB_PAD + if is_selected { 1.0 } else { 0.0 };
+                let preview_y = THUMB_PAD
+                    + if is_selected {
+                        SELECTED_CONTENT_NUDGE
+                    } else {
+                        0.0
+                    };
                 let _: () = msg_send![
                     preview,
                     setFrameOrigin: NSPoint::new(preview_frame.origin.x, preview_y)

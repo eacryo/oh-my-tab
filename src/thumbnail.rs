@@ -27,7 +27,7 @@
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -38,7 +38,7 @@ use crate::log_debug;
 /// 缩略图缓存键:(进程 ID, CG 窗口 ID)。两者组合才能防 PID 复用串图。
 /// Thumbnail cache key: (process id, CG window id). The pair guards against
 /// recycled PIDs serving another window's frame.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ThumbKey {
     pub(crate) pid: i32,
     pub(crate) wid: u32,
@@ -394,41 +394,62 @@ fn cache_store(pid: i32, wid: u32, t: CachedThumb) {
 
 // ========== 捕获管线(flume 队列 + 单 worker 串行限流) ==========
 
-struct CaptureJob {
-    pid: i32,
-    wid: u32,
-    /// true = 召唤期按需任务(完成后尝试刷新 UI);false = 预生成(只进缓存)。
-    /// true = on-demand summon job (tries a UI refresh on completion); false =
-    /// pre-generation (cache only).
-    deliver: bool,
+/// 同时记录队列中和正在执行的键；同一窗口直到当前任务结束前最多存在一次。
+/// Tracks both queued and in-flight keys; a window exists at most once until its
+/// current job finishes.
+#[derive(Default)]
+struct CaptureState {
+    active: HashSet<ThumbKey>,
 }
 
-static JOB_TX: OnceLock<flume::Sender<CaptureJob>> = OnceLock::new();
+impl CaptureState {
+    fn request(&mut self, key: ThumbKey) -> bool {
+        self.active.insert(key)
+    }
 
-fn enqueue_job(job: CaptureJob) {
+    fn finish(&mut self, key: ThumbKey) {
+        self.active.remove(&key);
+    }
+}
+
+static CAPTURE_STATE: LazyLock<Mutex<CaptureState>> =
+    LazyLock::new(|| Mutex::new(CaptureState::default()));
+static JOB_TX: OnceLock<flume::Sender<ThumbKey>> = OnceLock::new();
+
+/// 尝试安排一次捕获；返回 false 表示相同窗口已 pending/in-flight，或 worker 已退出。
+/// Try to schedule one capture; false means the same window is already pending/in-flight,
+/// or the worker has exited.
+fn enqueue_job(pid: i32, wid: u32) -> bool {
+    let key = ThumbKey { pid, wid };
+    if !CAPTURE_STATE.lock().unwrap().request(key) {
+        return false;
+    }
     let tx = JOB_TX.get_or_init(|| {
-        let (tx, rx) = flume::unbounded::<CaptureJob>();
+        let (tx, rx) = flume::unbounded::<ThumbKey>();
         std::thread::Builder::new()
             .name("thumb-capture".into())
             .spawn(move || {
                 log_debug!("[thumb] capture worker online");
-                for job in rx.iter() {
-                    log_debug!(
-                        "[thumb] job recv pid={} wid={} deliver={}",
-                        job.pid,
-                        job.wid,
-                        job.deliver
-                    );
-                    run_capture_job(&job);
+                for key in rx.iter() {
+                    log_debug!("[thumb] job recv pid={} wid={}", key.pid, key.wid);
+                    run_capture_job(key);
+                    // 成功、失败、权限跳过都释放 active，后续召唤才能按需重试。
+                    // Success, failure, and permission skips all release active so a
+                    // later summon can retry when needed.
+                    CAPTURE_STATE.lock().unwrap().finish(key);
                 }
             })
             .expect("spawn thumb-capture worker");
         tx
     });
-    let _ = tx.send(job);
+    if tx.send(key).is_err() {
+        CAPTURE_STATE.lock().unwrap().finish(key);
+        return false;
+    }
+    true
 }
 
-fn run_capture_job(job: &CaptureJob) {
+fn run_capture_job(key: ThumbKey) {
     // 每个任务前重新 preflight:未授权时静默跳过(运行中授权后自动恢复)。
     // Re-preflight per job: silently skip while unauthorized (auto-resumes once
     // granted mid-run).
@@ -440,25 +461,25 @@ fn run_capture_job(job: &CaptureJob) {
         );
         return;
     }
-    let Some(t) = (unsafe { capture_window(job.wid) }) else {
-        log_debug!("[thumb] capture failed pid={} wid={}", job.pid, job.wid);
+    let Some(t) = (unsafe { capture_window(key.wid) }) else {
+        log_debug!("[thumb] capture failed pid={} wid={}", key.pid, key.wid);
         return;
     };
     log_debug!(
         "[thumb] captured pid={} wid={} {}x{}",
-        job.pid,
-        job.wid,
+        key.pid,
+        key.wid,
         t.w_px,
         t.h_px
     );
-    cache_store(job.pid, job.wid, t);
-    if job.deliver && overlay_wants(job.pid, job.wid) {
+    cache_store(key.pid, key.wid, t);
+    // 不再按任务来源预先决定是否投递：启动预热也可能在浮窗打开后才完成。
+    // Do not decide delivery from the request source: startup pre-generation may
+    // also finish after the overlay has opened.
+    if overlay_wants(key.pid, key.wid) {
         // 先写队列再跳主线程(handler 消费时有完整缓存)。
         // Queue before hopping to main (the handler sees complete cache entries).
-        READY_QUEUE.lock().unwrap().push(ThumbKey {
-            pid: job.pid,
-            wid: job.wid,
-        });
+        READY_QUEUE.lock().unwrap().push(key);
         let ctrl = match *crate::CONTROLLER.lock().unwrap() {
             Some(c) => c.0,
             None => return,
@@ -619,11 +640,11 @@ static CONNECTION_ID: OnceLock<u32> = OnceLock::new();
 // ========== 召唤期刷新(show_overlay 尾部调用) ==========
 
 /// 召唤期补拍:对可见、非最小化、有 bounds 的窗口检查缓存新鲜度,过期/缺失的
-/// 入队异步重截(deliver=true,完成后原位换卡)。选中窗口排最前以优先出图。
+/// 请求异步重截。pending/in-flight 键由 enqueue_job 合并；选中窗口排最前。
 /// 选中项从 TAB_STATE 内部读取,调用方只在 show_overlay 尾部触发一次。
 /// Summon-time refresh: for visible, non-minimized windows with valid bounds,
-/// enqueue async recaptures for stale/missing frames (deliver=true -> in-place
-/// card swap on completion). The selected window is queued first for priority.
+/// request async recaptures for stale/missing frames. enqueue_job coalesces keys
+/// already pending/in-flight; the selected window is requested first.
 /// The selection is read from TAB_STATE internally; callers just invoke once at
 /// the end of show_overlay.
 pub(crate) fn refresh_for_summon() {
@@ -660,17 +681,16 @@ pub(crate) fn refresh_for_summon() {
         jobs.sort_by_key(|&(pid, wid)| Some((pid, wid)) != selected);
         jobs
     };
-    log_debug!(
-        "[thumb] summon refresh: {} stale/missing enqueued (deliver)",
-        jobs.len()
-    );
+    let requested = jobs.len();
+    let mut enqueued = 0;
     for (pid, wid) in jobs {
-        enqueue_job(CaptureJob {
-            pid,
-            wid,
-            deliver: true,
-        });
+        enqueued += usize::from(enqueue_job(pid, wid));
     }
+    log_debug!(
+        "[thumb] summon refresh: {} stale/missing requested, {} newly enqueued",
+        requested,
+        enqueued
+    );
 }
 
 // ========== 常驻监视线程(AXObserver + 自有 CFRunLoop) ==========
@@ -1038,7 +1058,14 @@ unsafe fn install_observer_for_pid(pid: i32) {
 /// 启动/新装 App 的既有标准窗口补拍。
 /// Pre-generate existing standard windows for startup / newly installed apps.
 unsafe fn pregen_windows_for_pid(pid: i32) {
-    if !crate::theme::thumbnails_enabled() || !capture_allowed() {
+    // 这里只判断功能开关，不重复做 TCC preflight。启动时 producer 与 worker 并行，
+    // producer 每个 PID 都 preflight 曾导致前三个任务开始捕获后其余 PID 被静默漏排。
+    // worker 会在每个任务执行前重新 preflight，权限判断仍然完整且可热恢复。
+    // Check only the feature switch here, not TCC again. Producer and worker run in
+    // parallel at startup; preflighting every PID caused the remaining PIDs to be
+    // silently missed once the first captures began. The worker still re-preflights
+    // every job, preserving permission safety and hot recovery.
+    if !crate::theme::thumbnails_enabled() {
         return;
     }
     let Some(windows) = crate::window_collector::get_ax_windows_for_pid(pid) else {
@@ -1053,12 +1080,7 @@ unsafe fn pregen_windows_for_pid(pid: i32) {
         if minimized || wid == 0 {
             continue; // 最小化窗口无渲染缓冲,截取必然失败 / no backing store while minimized
         }
-        queued += 1;
-        enqueue_job(CaptureJob {
-            pid,
-            wid,
-            deliver: false,
-        });
+        queued += usize::from(enqueue_job(pid, wid));
     }
     log_debug!("[thumb] pregen pid={}: {} windows queued", pid, queued);
 }
@@ -1095,11 +1117,7 @@ unsafe extern "C" fn thumb_ax_observer(
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(300));
                     if crate::theme::thumbnails_enabled() {
-                        enqueue_job(CaptureJob {
-                            pid,
-                            wid,
-                            deliver: false,
-                        });
+                        enqueue_job(pid, wid);
                     }
                 });
             }
@@ -1113,6 +1131,33 @@ unsafe extern "C" fn thumb_ax_observer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_state_coalesces_pending_and_in_flight_requests() {
+        let mut state = CaptureState::default();
+        let first = ThumbKey { pid: 10, wid: 20 };
+        let other = ThumbKey { pid: 10, wid: 21 };
+
+        // 同一键无论还在队列还是正在捕获都只能登记一次；其他窗口不受影响。
+        // The same key registers once whether queued or in-flight; another window
+        // remains independent.
+        assert!(state.request(first));
+        assert!(!state.request(first));
+        assert!(state.request(other));
+    }
+
+    #[test]
+    fn capture_state_finish_allows_failed_job_to_retry() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+
+        assert!(state.request(key));
+        // worker 对成功、失败和权限跳过统一调用 finish；之后下一次召唤可重试。
+        // The worker calls finish after success, failure, or a permission skip;
+        // the next summon can then retry.
+        state.finish(key);
+        assert!(state.request(key));
+    }
 
     #[test]
     fn lru_evicts_by_count_and_returns_victims() {
