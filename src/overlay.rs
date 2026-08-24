@@ -47,6 +47,10 @@ pub(crate) const CLOSE_BTN_TAG: isize = 0xE7F1;
 /// Tag used to find the icon view for the selected-state nudge without relying on
 /// property accessors on the dynamically registered ObjC card class.
 pub(crate) const ICON_VIEW_TAG: isize = 0xE7F2;
+/// 缩略图模式预览区容器的 tag(选中态上移 nudge 查找用)。
+/// Tag for the thumbnail-mode preview container (located by the selected-state
+/// nudge).
+const THUMB_PREVIEW_TAG: isize = 0xE7F3;
 
 // ========== 浮窗相关全局状态 / overlay global state ==========
 
@@ -1323,6 +1327,21 @@ pub(crate) fn refresh_highlight() {
                 ];
             }
 
+            // 缩略图模式:预览区随选中态上移 1px(与旧版图标轻移同款)。基准 y 恒为
+            // THUMB_PAD(布局常量),每次从基准绝对重算,反复切换零累计位移。
+            // Thumbnail mode: the preview area nudges up 1px when selected (same as
+            // the legacy icon nudge). The baseline y is always THUMB_PAD (a layout
+            // constant) -- absolute recomputation per refresh, zero accumulated drift.
+            let preview: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_PREVIEW_TAG];
+            if !preview.is_null() {
+                let preview_frame: NSRect = msg_send![preview, frame];
+                let preview_y = THUMB_PAD + if is_selected { 1.0 } else { 0.0 };
+                let _: () = msg_send![
+                    preview,
+                    setFrameOrigin: NSPoint::new(preview_frame.origin.x, preview_y)
+                ];
+            }
+
             // ⌫ 关闭按钮随选中态显隐:选中卡片显示、其余隐藏(选中即出现,
             // 不限于鼠标悬停——键盘导航选中同样可见)。
             // The ⌫ close button follows the selection: the selected card shows it, the
@@ -1799,14 +1818,25 @@ pub(crate) fn create_card_view(
             let _: () = msg_send![view, addSubview: title_label];
             release_obj(title_label);
 
-            // --- 预览区(16:10,圆角 10,1px 描边) ---
-            // --- Preview area (16:10, radius 10, 1px border) ---
+            // --- 预览区(16:10,圆角 4,1px 描边) ---
+            // --- Preview area (16:10, radius 4, 1px border) ---
             let preview_frame = NSRect::new(
                 NSPoint::new(THUMB_PAD, THUMB_PAD),
                 NSSize::new(card_width - THUMB_PAD * 2.0, preview_h),
             );
-            let container: *mut AnyObject = msg_send![class!(NSView), alloc];
+            // 容器用 NSImageView 承载:refresh_highlight 的选中态 nudge 依赖
+            // viewWithTag 定位,而 setTag: 只有 NSControl 系(含 NSImageView)提供,
+            // 裸 NSView 的 tag 属性只读,objc2 调试期校验会直接 panic(与字母头像
+            // 同一个坑)。无 image 的 NSImageView 什么都不画,子视图照常渲染。
+            // The preview container is an NSImageView: refresh_highlight's
+            // selected-state nudge locates it via viewWithTag, and setTag: only
+            // exists on NSControl-derived classes -- a bare NSView's tag property is
+            // readonly and objc2's debug check would panic (same pitfall as the
+            // letter avatar). An image-less NSImageView draws nothing; subviews
+            // render normally.
+            let container: *mut AnyObject = msg_send![class!(NSImageView), alloc];
             let container: *mut AnyObject = msg_send![container, initWithFrame: preview_frame];
+            let _: () = msg_send![container, setTag: THUMB_PREVIEW_TAG];
             let _: () = msg_send![container, setWantsLayer: true];
             let cl: *mut AnyObject = msg_send![container, layer];
             // 预览区圆角 4pt:预览是缩小的窗口(约 1/8 缩放),macOS 窗口真实圆角
