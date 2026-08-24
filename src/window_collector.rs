@@ -1901,8 +1901,21 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     windows
 }
 
-/// Pre‑cache icons for every currently‑running application.
+/// Pre‑cache icons for every currently‑running regular application.
 /// Called once at startup so the overlay never shows a missing icon.
+///
+/// 只处理 .regular 策略的应用:嵌套 helper 后台进程(如像素蛋糕的 pix-worker/
+/// pix-camera-link)与主应用共用 bundle id,其 NSRunningApplication.icon 是
+/// AppKit 通用占位图,提取会以相同缓存键污染主应用图标,且 helper 与主程序
+/// 二进制 mtime 相同(同一安装包),meta 校验无法察觉——错误图标会整个会话
+/// 有效。helper 无窗口,其图标本就不需要。
+///
+/// Pre-cache icons for every currently-running REGULAR application. Helper
+/// background processes (e.g. PixCake's nested pix-worker/pix-camera-link) share
+/// the main app's bundle id, and their NSRunningApplication.icon is the AppKit
+/// generic placeholder -- extracting poisons the shared cache key, and since the
+/// helpers' binary mtimes equal the main binary's (same install), the .meta check
+/// can never detect it. Helpers have no windows; their icons are never needed.
 pub fn cache_running_app_icons() {
     let mut cached: Vec<String> = Vec::new();
     let mut skipped: usize = 0;
@@ -1917,6 +1930,13 @@ pub fn cache_running_app_icons() {
         let count: usize = msg_send![running, count];
         for i in 0..count {
             let app: *mut AnyObject = msg_send![running, objectAtIndex: i];
+            // NSApplicationActivationPolicyRegular = 0;后台/辅助进程跳过。
+            // NSApplicationActivationPolicyRegular = 0; skip background/helper apps.
+            let policy: i64 = msg_send![app, activationPolicy];
+            if policy != 0 {
+                skipped += 1;
+                continue;
+            }
             let pid: i32 = msg_send![app, processIdentifier];
             if check_icon_cache(pid).is_none() {
                 let name_str = crate::ffi::ns_running_app_name(app);
@@ -1935,7 +1955,7 @@ pub fn cache_running_app_icons() {
         let _: () = msg_send![pool, drain];
     }
     log_debug!(
-        "icon cache done: {} cached, {} skipped (already fresh)",
+        "icon cache done: {} cached, {} skipped (already fresh / non-regular)",
         cached.len(),
         skipped,
     );
@@ -1957,6 +1977,13 @@ pub fn cache_running_app_icons_small() {
         let count: usize = msg_send![running, count];
         for i in 0..count {
             let app: *mut AnyObject = msg_send![running, objectAtIndex: i];
+            // 同 cache_running_app_icons:跳过后台/辅助进程(helper 图标会污染共享缓存键)。
+            // Same as cache_running_app_icons: skip background/helper apps (their icons
+            // would poison the shared cache key).
+            let policy: i64 = msg_send![app, activationPolicy];
+            if policy != 0 {
+                continue;
+            }
             let pid: i32 = msg_send![app, processIdentifier];
             // extract_small_icon 内部按 {key}.small.png + mtime 指纹校验,命中即跳过。
             // extract_small_icon verifies {key}.small.png + the mtime fingerprint, hitting

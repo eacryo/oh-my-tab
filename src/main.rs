@@ -139,6 +139,15 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
         if app.is_null() {
             return;
         }
+        // 非常规策略 = 后台/辅助进程(如嵌套 helper):无窗口、图标多为通用占位图,
+        // 提取会以相同 bundle id 污染主应用的图标缓存;缩略图观察者也不需要。
+        // Non-regular policy = background/helper processes: no windows, icons are
+        // usually the generic placeholder, and extracting would poison the main
+        // app's shared cache key; the thumbnail observer doesn't need them either.
+        let policy: i64 = msg_send![app, activationPolicy];
+        if policy != 0 {
+            return;
+        }
         let pid: i32 = msg_send![app, processIdentifier];
         // 更新 App 级激活时间（仅用于诊断，不参与排序）
         // Update app-level activation time (diagnostics only, not used in sorting)
