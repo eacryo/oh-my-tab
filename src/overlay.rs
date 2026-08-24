@@ -54,9 +54,13 @@ const THUMB_PREVIEW_TAG: isize = 0xE7F3;
 /// 缩略图模式选中态的 2pt 外圈视图 tag。
 /// Tag for the thumbnail-mode selected-state 2pt outer ring.
 const THUMB_SELECTION_RING_TAG: isize = 0xE7F4;
-/// 设计稿 accent-soft = rgba(...,.16),换算为 8 位 alpha。
-/// Mockup accent-soft = rgba(...,.16), converted to 8-bit alpha.
-const SELECTION_RING_ALPHA: u8 = 0x29;
+/// Liquid Glass 会稀释设计稿 16% 的 accent-soft，提升到 28% 保持可辨识度。
+/// Liquid Glass washes out the mockup's 16% accent-soft; use 28% for legibility.
+const SELECTION_RING_ALPHA: u8 = 0x47;
+/// 外圈附加的零偏移柔光；与卡片自身的深色向下投影分层。
+/// Zero-offset glow around the ring, layered separately from the card's dark drop shadow.
+const SELECTION_GLOW_OPACITY: f32 = 0.35;
+const SELECTION_GLOW_RADIUS: f64 = 4.0;
 /// 设计稿选中预览描边 = rgba(...,.34),换算为 8 位 alpha。
 /// Mockup selected-preview border = rgba(...,.34), converted to 8-bit alpha.
 const SELECTED_PREVIEW_BORDER_ALPHA: u8 = 0x57;
@@ -162,7 +166,7 @@ mod tests {
 
     #[test]
     fn color_with_alpha_preserves_rgb() {
-        assert_eq!(color_with_alpha(0x4B7BECC7, 0x29), 0x4B7BEC29);
+        assert_eq!(color_with_alpha(0x4B7BECC7, 0x47), 0x4B7BEC47);
         assert_eq!(color_with_alpha(0x5577CCFF, 0x57), 0x5577CC57);
     }
 
@@ -1370,11 +1374,12 @@ pub(crate) fn refresh_highlight() {
 
             // CSS 的第一层 box-shadow 是卡片外侧 2px、零模糊的 accent-soft 圈,
             // 不能与下面的深色模糊投影共用 CALayer.shadow。独立 ring 视图保留
-            // RGB 并把 alpha 固定为设计稿的 16%,只在缩略图模式选中时显示。
+            // RGB 并把 alpha 提升到适合 Liquid Glass 的 28%,再叠一层零偏移蓝色柔光；
+            // 只在缩略图模式选中时显示。
             // The first CSS box-shadow is a zero-blur 2px accent-soft ring outside the
             // card; it cannot share CALayer.shadow with the dark blurred drop shadow.
-            // A dedicated ring view preserves the RGB, fixes alpha at the mockup's 16%,
-            // and appears only for the selected thumbnail card.
+            // A dedicated ring view preserves the RGB, raises alpha to 28% for Liquid
+            // Glass, adds a zero-offset blue glow, and appears only on the selected card.
             let ring: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_SELECTION_RING_TAG];
             if !ring.is_null() {
                 let ring_layer: *mut AnyObject = msg_send![ring, layer];
@@ -1385,6 +1390,18 @@ pub(crate) fn refresh_highlight() {
                         SELECTION_RING_ALPHA,
                     )),
                 );
+                layer_set_shadow_color(
+                    ring_layer,
+                    hex_to_cg_color(color_with_alpha(colors.card_border_sel, 0xFF)),
+                );
+                let glow_opacity = if is_selected {
+                    SELECTION_GLOW_OPACITY
+                } else {
+                    0.0
+                };
+                let _: () = msg_send![ring_layer, setShadowOpacity: glow_opacity];
+                let _: () = msg_send![ring_layer, setShadowRadius: SELECTION_GLOW_RADIUS];
+                let _: () = msg_send![ring_layer, setShadowOffset: NSSize::new(0.0, 0.0)];
                 let _: () = msg_send![ring, setHidden: !is_selected];
             }
 
