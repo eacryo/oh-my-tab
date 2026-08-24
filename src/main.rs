@@ -201,6 +201,7 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
                             attempt + 1
                         );
                     }
+                    thumbnail::refresh_after_activation(pid, cgwid, activated_at);
                     bumped = true;
                     break;
                 }

@@ -4,8 +4,9 @@
 //! 1. 启动预生成:监视线程启动时枚举所有运行中 App 的标准窗口补拍
 //! 2. 常驻监听:每 PID 一个 AXObserver 订阅 kAXWindowCreatedNotification,
 //!    新窗口防抖 300ms 后预生成(等窗口完成初始化,避免拍到白屏)
-//! 3. 召唤补拍:show_overlay 时对可见区间及两侧预取项中的过期/缺失帧入队,
-//!    完成后主线程原位换卡
+//! 3. 召唤补拍:show_overlay 时对可见区间及两侧预取项中的缺失帧、前台 App
+//!    的过期帧入队；后台 App 保留最后一张有效帧，完成后主线程原位换卡
+//! 4. 激活刷新:NSWorkspace 确认焦点窗口后延迟补拍，等 Web 内容完成恢复/重绘
 //!
 //! 无屏幕录制权限(TCC)时整个模块休眠,浮窗保持纯图标渲染;运行中授权后
 //! 下一个捕获任务自动恢复(worker 每个任务前都重新 preflight)。
@@ -19,8 +20,11 @@
 //! 2. resident listener: one AXObserver per PID watching kAXWindowCreatedNotification;
 //!    a new window debounces 300ms (letting it finish initializing, avoiding a white
 //!    flash) then pre-generates
-//! 3. summon refresh: show_overlay enqueues stale/missing windows in the visible
-//!    slice plus prefetch margins; results swap affected cards in place on the main thread.
+//! 3. summon refresh: show_overlay enqueues missing windows and stale frames from the
+//!    frontmost app in the visible slice plus prefetch margins; background apps retain
+//!    their last-known-good frame, and results swap affected cards in place on the main thread
+//! 4. activation refresh: after NSWorkspace resolves the focused window, capture it with a
+//!    short delay so restored web content has time to redraw.
 //!
 //! Without the Screen Recording TCC permission the whole module sleeps and the
 //! overlay keeps rendering icons only; granting permission mid-run resumes
@@ -349,10 +353,13 @@ const CACHE_MAX_ITEMS: usize = 64;
 /// ~64MB cost budget (accounted as w*h*4), enough for roughly forty typical
 /// 16:10 thumbnails.
 const CACHE_MAX_COST: u64 = 64_000_000;
-/// 新鲜 TTL:召唤时 2s 内的直接复用,过期的先画旧帧再后台重截。
-/// Freshness TTL: frames younger than 2s are reused at summon; older ones are
-/// drawn immediately while a background recapture swaps them in.
+/// 新鲜 TTL:召唤时 2s 内的直接复用；前台 App 的过期帧先画旧图再异步重截。
+/// Freshness TTL: frames younger than 2s are reused at summon; stale frames from
+/// the frontmost app render immediately while an async recapture swaps them in.
 const FRESH_TTL_MS: u128 = 2000;
+/// App 激活后等待内容进程恢复并完成一轮重绘，再补拍焦点窗口。
+/// Wait for a restored content process to redraw once before refreshing the focused window.
+const ACTIVATION_CAPTURE_DELAY_MS: u64 = 350;
 /// 启动预热与新窗口后台预生成使用的基准高度；召唤时按实际卡片与屏幕倍率升级。
 /// Baseline height for startup/new-window pre-generation; summon-time demand upgrades it
 /// from the actual card size and target screen scale.
@@ -409,9 +416,9 @@ pub(crate) fn lookup_retained(pid: i32, wid: u32) -> Option<(*const c_void, u32,
     Some((t.img, t.w_px, t.h_px))
 }
 
-/// 是否新鲜(召唤端决策用;过期帧仍会画,只是同时入队重截)。
-/// Freshness probe for the summon-side decision (stale frames still render --
-/// they just trigger a background recapture too).
+/// 是否新鲜(召唤端及启动诊断用；过期帧仍可继续渲染)。
+/// Freshness probe for summon decisions and startup diagnostics; stale frames
+/// remain renderable.
 fn cached_frame_is_usable(
     captured: Instant,
     captured_for_px_h: u32,
@@ -419,6 +426,52 @@ fn cached_frame_is_usable(
     now: Instant,
 ) -> bool {
     is_fresh(captured, now, FRESH_TTL_MS) && captured_for_px_h >= required_px_h
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SummonRefreshDecision {
+    Missing,
+    FrontmostStale,
+    BackgroundLastGood,
+    Fresh,
+}
+
+/// 后台窗口即使 TTL 过期或分辨率偏低也保留已有帧，避免休眠 WebView 的白色
+/// 内容层覆盖最后一张正常画面；完全缺失时仍允许首次预热。
+/// Keep an existing background frame even when stale or undersized so a suspended
+/// WebView's white content layer cannot replace the last-known-good image. A wholly
+/// missing frame may still be pre-warmed.
+fn summon_refresh_decision(
+    cached: Option<(Instant, u32)>,
+    required_px_h: u32,
+    now: Instant,
+    is_frontmost: bool,
+) -> SummonRefreshDecision {
+    let Some((captured, captured_for_px_h)) = cached else {
+        return SummonRefreshDecision::Missing;
+    };
+    if cached_frame_is_usable(captured, captured_for_px_h, required_px_h, now) {
+        SummonRefreshDecision::Fresh
+    } else if is_frontmost {
+        SummonRefreshDecision::FrontmostStale
+    } else {
+        SummonRefreshDecision::BackgroundLastGood
+    }
+}
+
+fn cached_summon_refresh_decision(
+    pid: i32,
+    wid: u32,
+    required_px_h: u32,
+    is_frontmost: bool,
+) -> SummonRefreshDecision {
+    // get() 会提升最近使用,需要可变借用。
+    // get() bumps recency, so it needs a mutable borrow.
+    let mut cache = CACHE.lock().unwrap();
+    let cached = cache
+        .get(&ThumbKey { pid, wid })
+        .map(|t| (t.captured, t.captured_for_px_h));
+    summon_refresh_decision(cached, required_px_h, Instant::now(), is_frontmost)
 }
 
 fn is_cached_fresh_for(pid: i32, wid: u32, required_px_h: u32) -> bool {
@@ -436,6 +489,14 @@ fn is_cached_fresh_for(pid: i32, wid: u32, required_px_h: u32) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn cached_target_px_height(pid: i32, wid: u32) -> u32 {
+    let mut cache = CACHE.lock().unwrap();
+    cache
+        .get(&ThumbKey { pid, wid })
+        .map(|t| t.captured_for_px_h.max(BASE_TARGET_PX_H))
+        .unwrap_or(BASE_TARGET_PX_H)
 }
 
 pub(crate) fn is_cached_fresh(pid: i32, wid: u32) -> bool {
@@ -764,13 +825,14 @@ fn capture_range_for_visible(visible: Option<Range<usize>>, len: usize) -> Range
 }
 
 /// 召唤期补拍:对当前可见区间及两侧预取范围中非最小化、有 bounds 的窗口检查
-/// 缓存新鲜度，过期/缺失的请求异步重截。pending/in-flight 键由 enqueue_job
-/// 合并；选中窗口排最前。
+/// 缓存状态。缺失帧和前台 App 的过期帧异步重截；后台 App 的已有帧不因 TTL
+/// 或屏幕倍率变化而覆盖。pending/in-flight 键由 enqueue_job 合并；选中窗口排最前。
 /// 选中项从 TAB_STATE 内部读取,调用方只在 show_overlay 尾部触发一次。
 /// Summon-time refresh: for non-minimized windows with valid bounds in the visible
-/// slice plus its prefetch margins, request async recaptures for stale/missing
-/// frames. enqueue_job coalesces keys already pending/in-flight; the selected
-/// window is requested first.
+/// slice plus its prefetch margins, request async recaptures for missing frames and
+/// stale frontmost-app frames. Existing background frames survive TTL and display-scale
+/// changes. enqueue_job coalesces keys already pending/in-flight; the selected window
+/// is requested first.
 /// The selection is read from TAB_STATE internally; callers just invoke once at
 /// the end of show_overlay.
 pub(crate) fn refresh_for_summon(required_px_h: u32) {
@@ -786,7 +848,12 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
     // 与 worker 的 overlay_wants 保持锁序：先可见区间，后 TAB_STATE。
     // Match the worker's overlay_wants lock order: visible range before TAB_STATE.
     let visible_snapshot = crate::overlay::thumbnail_visible_range();
-    let jobs: Vec<(i32, u32)> = {
+    let (jobs, missing, frontmost_stale, background_last_good): (
+        Vec<(i32, u32)>,
+        usize,
+        usize,
+        usize,
+    ) = {
         let state_opt = crate::TAB_STATE.lock().unwrap();
         let Some(state) = state_opt.as_ref() else {
             return;
@@ -798,21 +865,57 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
             .windows
             .get(state.selected)
             .map(|w| (w.pid, w.window_id));
+        // is_active 只标记前台 App 的一个代表窗口；同 PID 的其他窗口也应允许刷新。
+        // is_active marks one representative window only; sibling windows from the
+        // same frontmost PID must be eligible for refresh too.
+        let frontmost_pid = state.windows.iter().find(|w| w.is_active).map(|w| w.pid);
         let capture_range = capture_range_for_visible(visible_snapshot, state.windows.len());
-        let mut jobs: Vec<(i32, u32)> = state
+        let decisions: Vec<(i32, u32, SummonRefreshDecision)> = state
             .windows
             .iter()
             .enumerate()
             .filter(|(index, _)| capture_range.contains(index))
             .map(|(_, window)| window)
             .filter(|w| !w.minimized && w.bounds.2 > 0.0 && w.bounds.3 > 0.0)
-            .filter(|w| !is_cached_fresh_for(w.pid, w.window_id, required_px_h))
-            .map(|w| (w.pid, w.window_id))
+            .map(|w| {
+                (
+                    w.pid,
+                    w.window_id,
+                    cached_summon_refresh_decision(
+                        w.pid,
+                        w.window_id,
+                        required_px_h,
+                        frontmost_pid == Some(w.pid),
+                    ),
+                )
+            })
+            .collect();
+        let missing = decisions
+            .iter()
+            .filter(|(_, _, decision)| *decision == SummonRefreshDecision::Missing)
+            .count();
+        let frontmost_stale = decisions
+            .iter()
+            .filter(|(_, _, decision)| *decision == SummonRefreshDecision::FrontmostStale)
+            .count();
+        let background_last_good = decisions
+            .iter()
+            .filter(|(_, _, decision)| *decision == SummonRefreshDecision::BackgroundLastGood)
+            .count();
+        let mut jobs: Vec<(i32, u32)> = decisions
+            .into_iter()
+            .filter(|(_, _, decision)| {
+                matches!(
+                    decision,
+                    SummonRefreshDecision::Missing | SummonRefreshDecision::FrontmostStale
+                )
+            })
+            .map(|(pid, wid, _)| (pid, wid))
             .collect();
         // 选中窗口排最前(false < true,选中的键为 false 排队首)。
         // Selected window first (false < true; the selected key maps to false).
         jobs.sort_by_key(|&(pid, wid)| Some((pid, wid)) != selected);
-        jobs
+        (jobs, missing, frontmost_stale, background_last_good)
     };
     let requested = jobs.len();
     let mut enqueued = 0;
@@ -820,11 +923,67 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
         enqueued += usize::from(enqueue_job(pid, wid, required_px_h));
     }
     log_debug!(
-        "[thumb] summon refresh: {} stale/missing requested, {} newly enqueued target_h={}",
+        "[thumb] summon refresh: missing={} frontmost_stale={} background_last_good={} requested={} enqueued={} target_h={}",
+        missing,
+        frontmost_stale,
+        background_last_good,
         requested,
         enqueued,
         required_px_h
     );
+}
+
+fn activation_capture_is_valid(
+    pid: i32,
+    activation_is_current: bool,
+    frontmost_pid: Option<i32>,
+) -> bool {
+    activation_is_current && frontmost_pid == Some(pid)
+}
+
+/// WebView 等内容进程在 App 从后台恢复时可能晚于 AppKit 标题栏重绘。延迟后再次
+/// 核对激活 token 与系统前台 PID，只有仍在前台才刷新最后一张正常缓存。
+/// Web content may resume later than its AppKit title bar when an app returns from the
+/// background. Recheck the activation token and system frontmost PID after a delay before
+/// replacing the last-known-good cache entry.
+pub(crate) fn refresh_after_activation(pid: i32, wid: u32, activated_at: Instant) {
+    if !crate::theme::thumbnails_enabled() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("oh-my-tab-thumb-activation".into())
+        .spawn(move || unsafe {
+            std::thread::sleep(Duration::from_millis(ACTIVATION_CAPTURE_DELAY_MS));
+            let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+            let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let front_app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+            let frontmost_pid = if front_app.is_null() {
+                None
+            } else {
+                let current_pid: i32 = msg_send![front_app, processIdentifier];
+                Some(current_pid)
+            };
+            let activation_is_current =
+                crate::window_collector::app_activation_is_current(pid, activated_at);
+            if activation_capture_is_valid(pid, activation_is_current, frontmost_pid) {
+                let target_px_h = cached_target_px_height(pid, wid);
+                let enqueued = enqueue_job(pid, wid, target_px_h);
+                log_debug!(
+                    "[thumb] activation refresh: pid={} wid={} enqueued={} target_h={}",
+                    pid,
+                    wid,
+                    enqueued,
+                    target_px_h
+                );
+            } else {
+                log_debug!(
+                    "[thumb] activation refresh skipped: pid={} wid={} stale_or_background",
+                    pid,
+                    wid
+                );
+            }
+            let _: () = msg_send![pool, drain];
+        });
 }
 
 // ========== 常驻监视线程(AXObserver + 自有 CFRunLoop) ==========
@@ -1419,6 +1578,38 @@ mod tests {
         // 切回低需求屏时高清缓存直接复用，不降级重截。
         // A high-resolution frame remains usable after returning to a lower-demand display.
         assert!(cached_frame_is_usable(captured, 640, 512, now));
+    }
+
+    #[test]
+    fn summon_refresh_preserves_background_last_known_good_frames() {
+        let now = Instant::now();
+        let stale = now - Duration::from_millis(FRESH_TTL_MS as u64);
+        let fresh = now - Duration::from_millis(100);
+
+        assert_eq!(
+            summon_refresh_decision(None, 640, now, false),
+            SummonRefreshDecision::Missing
+        );
+        assert_eq!(
+            summon_refresh_decision(Some((stale, 512)), 640, now, false),
+            SummonRefreshDecision::BackgroundLastGood
+        );
+        assert_eq!(
+            summon_refresh_decision(Some((stale, 512)), 640, now, true),
+            SummonRefreshDecision::FrontmostStale
+        );
+        assert_eq!(
+            summon_refresh_decision(Some((fresh, 640)), 640, now, false),
+            SummonRefreshDecision::Fresh
+        );
+    }
+
+    #[test]
+    fn activation_refresh_requires_current_token_and_frontmost_pid() {
+        assert!(activation_capture_is_valid(42, true, Some(42)));
+        assert!(!activation_capture_is_valid(42, false, Some(42)));
+        assert!(!activation_capture_is_valid(42, true, Some(7)));
+        assert!(!activation_capture_is_valid(42, true, None));
     }
 
     #[test]
