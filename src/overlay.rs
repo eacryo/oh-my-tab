@@ -48,9 +48,9 @@ pub(crate) const CLOSE_BTN_TAG: isize = 0xE7F1;
 /// Tag used to find the icon view for the selected-state nudge without relying on
 /// property accessors on the dynamically registered ObjC card class.
 pub(crate) const ICON_VIEW_TAG: isize = 0xE7F2;
-/// 缩略图模式预览区容器的 tag(选中态上移 nudge 查找用)。
-/// Tag for the thumbnail-mode preview container (located by the selected-state
-/// nudge).
+/// 缩略图模式预览区容器的 tag(选中描边与整卡上浮模式识别用)。
+/// Tag for the thumbnail-mode preview container (used for its selected border and
+/// to identify cards that receive the whole-card lift).
 const THUMB_PREVIEW_TAG: isize = 0xE7F3;
 /// 缩略图模式选中态的 2pt 外圈视图 tag。
 /// Tag for the thumbnail-mode selected-state 2pt outer ring.
@@ -65,9 +65,15 @@ const SELECTION_GLOW_RADIUS: f64 = 4.0;
 /// 设计稿选中预览描边 = rgba(...,.34),换算为 8 位 alpha。
 /// Mockup selected-preview border = rgba(...,.34), converted to 8-bit alpha.
 const SELECTED_PREVIEW_BORDER_ALPHA: u8 = 0x57;
-/// 选中时仅内容上移的距离；不移动卡片本身。
-/// Distance that selected content moves upward; the card itself stays put.
+/// 旧版纯图标模式选中时仅图标上移的距离。
+/// Distance that only the icon moves upward in legacy icon-only mode.
 const SELECTED_CONTENT_NUDGE: f64 = 2.0;
+/// 设计稿 `.item.selected { transform: translateY(-1px) }`：AppKit y 轴向上为正，
+/// 因此缩略图卡片根层使用 +1pt，标题、预览和卡片表面作为整体上浮。
+/// The mockup's `.item.selected { transform: translateY(-1px) }`: AppKit's y axis is
+/// positive upward, so the thumbnail card root uses +1pt and lifts its caption, preview,
+/// and surface as one unit.
+const SELECTED_CARD_LIFT: f64 = 1.0;
 
 // ========== 浮窗相关全局状态 / overlay global state ==========
 
@@ -148,6 +154,14 @@ fn color_with_alpha(color: u32, alpha: u8) -> u32 {
     (color & 0xFFFF_FF00) | u32::from(alpha)
 }
 
+fn thumbnail_card_lift_y(is_selected: bool) -> f64 {
+    if is_selected {
+        SELECTED_CARD_LIFT
+    } else {
+        0.0
+    }
+}
+
 /// 窗口没有标题时(如 Microsoft To Do,AXTitle 为空)回退显示应用名。
 /// 注意:仅用于显示。内部 `window_title` 仍保持空串,这样 raise_ax_window 仍能
 /// 按空标题匹配到对应的 AX 窗口并聚焦。
@@ -183,6 +197,12 @@ mod tests {
     fn color_with_alpha_preserves_rgb() {
         assert_eq!(color_with_alpha(0x4B7BECC7, 0x47), 0x4B7BEC47);
         assert_eq!(color_with_alpha(0x5577CCFF, 0x57), 0x5577CC57);
+    }
+
+    #[test]
+    fn thumbnail_selection_lifts_the_whole_card_by_one_point() {
+        assert_eq!(super::thumbnail_card_lift_y(true), 1.0);
+        assert_eq!(super::thumbnail_card_lift_y(false), 0.0);
     }
 
     #[test]
@@ -628,6 +648,20 @@ unsafe fn layer_set_shadow_color(layer: *mut AnyObject, cg: *mut c_void) {
     type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
     let f: F = std::mem::transmute(objc_msgSend as *const ());
     f(layer as *mut c_void, sel, cg);
+}
+
+/// 用 CALayer 的 KVC 子键设置二维平移，避免把 CATransform3D 结构体传进 objc2
+/// `msg_send!` 的运行时编码校验。父层变换会携带背景、描边、阴影与全部子视图，
+/// 同时不改 NSView frame，因此导航几何和原位卡片重建仍使用稳定基准。
+/// Set 2D translation through CALayer's KVC sub-key, avoiding CATransform3D in objc2's
+/// runtime-checked `msg_send!`. Transforming the parent carries its background, border,
+/// shadow, and all subviews without changing the NSView frame, so navigation geometry and
+/// in-place card rebuilding retain a stable baseline.
+unsafe fn layer_set_translation_y(layer: *mut AnyObject, y: f64) {
+    let value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: y];
+    let key = make_nsstring("transform.translation.y");
+    let _: () = msg_send![layer, setValue: value, forKeyPath: key];
+    CFRelease(key as *const c_void);
 }
 
 pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
@@ -1383,6 +1417,16 @@ pub(crate) fn refresh_highlight() {
             // Read the card's title-label text to verify content matches the index (investigating
             // "shows Picview but opens Ghostty").
             let is_selected = tag == selected;
+            let preview: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_PREVIEW_TAG];
+            if !preview.is_null() {
+                // HTML 把 translateY(-1px) 施加在 `.item.selected` 根元素，而不是
+                // `.preview`；在 AppKit 坐标中以 +1pt 平移卡片根层，标题行与预览区
+                // 才会作为一个整体上浮。
+                // The HTML applies translateY(-1px) to the `.item.selected` root rather
+                // than `.preview`; +1pt in AppKit coordinates lifts the caption row and
+                // preview together as one card.
+                layer_set_translation_y(layer, thumbnail_card_lift_y(is_selected));
+            }
             if is_selected {
                 // 设计稿 .item.selected:1px 清晰 accent 描边 rgba(75,123,236,.78)。
                 // 白底上柔色圈不可见,轮廓线必须用实色 accent 才能显形。
@@ -1473,12 +1517,11 @@ pub(crate) fn refresh_highlight() {
                 ];
             }
 
-            // 缩略图模式:预览区随选中态上移 2pt(与旧版图标轻移同款)。基准 y 恒为
-            // THUMB_PAD(布局常量),每次从基准绝对重算,反复切换零累计位移。
-            // Thumbnail mode: the preview area nudges up 2pt when selected (same as
-            // the legacy icon nudge). The baseline y is always THUMB_PAD (a layout
-            // constant) -- absolute recomputation per refresh, zero accumulated drift.
-            let preview: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_PREVIEW_TAG];
+            // 缩略图模式:预览区自身不再单独位移，整卡根层已携带标题与预览共同上浮；
+            // 此处只切换设计稿中的选中预览描边。
+            // Thumbnail mode: the preview no longer moves independently because the card
+            // root now lifts the caption and preview together; only its selected border
+            // changes here.
             if !preview.is_null() {
                 // 设计稿选中时把预览区 1px 描边切为 accent 34%;未选中恢复中性描边。
                 // The mockup switches the preview's 1px border to accent at 34% when
@@ -1490,17 +1533,6 @@ pub(crate) fn refresh_highlight() {
                     colors.preview_border
                 };
                 layer_set_border(preview_layer, hex_to_cg_color(preview_border));
-                let preview_frame: NSRect = msg_send![preview, frame];
-                let preview_y = THUMB_PAD
-                    + if is_selected {
-                        SELECTED_CONTENT_NUDGE
-                    } else {
-                        0.0
-                    };
-                let _: () = msg_send![
-                    preview,
-                    setFrameOrigin: NSPoint::new(preview_frame.origin.x, preview_y)
-                ];
             }
 
             // ⌫ 关闭按钮随选中态显隐:选中卡片显示、其余隐藏(选中即出现,
