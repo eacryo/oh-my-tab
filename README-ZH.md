@@ -246,11 +246,11 @@ corner_radius = 32.0
 
 [layout]
 cards_per_row = 6
-card_width = 300.0
+card_width = 140.0
 card_height = 180.0
-card_gap = 14.0
+card_gap = 0.0
 icon_size = 110.0
-thumbnails_enabled = true  # 卡片窗口缩略图(无屏幕录制权限自动休眠;缩略图模式高度由宽度推导)
+thumbnails_enabled = true  # 卡片窗口缩略图(无屏幕录制权限自动休眠;缩略图模式的卡片尺寸/间距为代码内常量,与本组字段无关)
 
 [colors]
 # 每套配色包含:status_bar_text, app_name, win_title, icon_inner_bg,

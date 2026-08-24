@@ -246,11 +246,11 @@ corner_radius = 32.0
 
 [layout]
 cards_per_row = 6
-card_width = 300.0
+card_width = 140.0
 card_height = 180.0
-card_gap = 14.0
+card_gap = 0.0
 icon_size = 110.0
-thumbnails_enabled = true  # window thumbnails on cards (auto-sleeps without Screen Recording permission; height derives from width in thumbnail mode)
+thumbnails_enabled = true  # window thumbnails on cards (auto-sleeps without Screen Recording permission; card size/gap in thumbnail mode are code constants, independent of these fields)
 
 [colors]
 # Each palette has: status_bar_text, app_name, win_title, icon_inner_bg,

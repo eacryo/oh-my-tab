@@ -413,16 +413,10 @@ impl Default for Appearance {
 impl Default for Layout {
     fn default() -> Self {
         Layout {
-            // 300pt 与参考实现对齐(BetterCmdTab 有效 312 / DockDoor 300 / 设计稿
-            // 1240 面板 4 列 ≈ 295):缩略图模式下卡片高由宽度推导 ≈ 223pt。
-            // 300pt aligns with the reference implementations (BetterCmdTab
-            // effective 312 / DockDoor 300 / mockup 1240-wide 4-col ≈ 295): in
-            // thumbnail mode the card height derives from width ≈ 223pt.
             cards_per_row: 6,
-            card_width: 300.0,
+            card_width: 140.0,
             card_height: 180.0,
-            // 设计稿 .grid gap 14px。/ The mockup's .grid gap of 14px.
-            card_gap: 14.0,
+            card_gap: 0.0,
             icon_size: 110.0,
             thumbnails_enabled: true,
         }

@@ -123,6 +123,15 @@ pub(crate) fn thumbnails_enabled() -> bool {
 
 // ========== 缩略图卡片布局(HTML 设计稿 preview (6).html)/ thumbnail card layout ==========
 
+/// 流式布局基准卡宽,代码内写死、与旧版图标网格的 card_width 完全独立:
+/// 对齐参考实现(BetterCmdTab 有效 312 / DockDoor 300 / 设计稿 ≈295)。
+/// Flow-layout base card width, hard-coded and fully independent of the legacy
+/// icon grid's card_width: aligned with the references (BetterCmdTab effective
+/// 312 / DockDoor 300 / mockup ~295).
+pub(crate) const THUMB_CARD_BASE_W: f64 = 300.0;
+/// 流式布局行间距(设计稿 .grid gap 14px)。
+/// Flow-layout row/inter-card gap (the mockup's .grid gap of 14px).
+pub(crate) const THUMB_ROW_GAP: f64 = 14.0;
 /// 卡片内边距(设计稿 .item padding 8px)。/ Card inner padding (.item padding 8px).
 pub(crate) const THUMB_PAD: f64 = 8.0;
 /// 标题行高(设计稿 .caption 34px 含 7px 底距,取净高 24)。/ Caption row height.
@@ -132,20 +141,20 @@ pub(crate) const THUMB_GAP: f64 = 6.0;
 /// 预览区宽高比(设计稿 aspect-ratio 16/10)。/ Preview aspect ratio (16/10).
 pub(crate) const THUMB_PREVIEW_RATIO: f64 = 1.6;
 
-/// 缩略图卡片高度由宽度按设计稿推导(纯函数,可测):
+/// 缩略图卡片高度按基准卡宽推导(纯函数,可测):
 /// 上下 padding + 标题行 + 间距 + 16:10 预览区。
-/// Thumbnail card height derives from width per the mockup (pure, testable):
-/// vertical paddings + caption + gap + a 16:10 preview.
+/// Thumbnail card height derives from the base width per the mockup (pure,
+/// testable): vertical paddings + caption + gap + a 16:10 preview.
 fn thumb_card_h(card_width: f64) -> f64 {
     let preview_h = (card_width - THUMB_PAD * 2.0) / THUMB_PREVIEW_RATIO;
     THUMB_PAD * 2.0 + THUMB_CAPTION_H + THUMB_GAP + preview_h
 }
 
-/// 流式布局的统一卡片高度:由配置 card_width 推导一次,全网格等高。
-/// The flow layout's uniform card height: derived once from the configured
-/// card_width; every card shares it.
+/// 流式布局的统一卡片高度:由基准卡宽推导一次,全网格等高。
+/// The flow layout's uniform card height: derived once from the base width;
+/// every card shares it.
 pub(crate) fn thumb_card_h_fixed() -> f64 {
-    thumb_card_h(card_w())
+    thumb_card_h(THUMB_CARD_BASE_W)
 }
 
 /// 预览区高度 = 卡片高 - 上下 padding - 标题行 - 间距(纯函数,可测)。

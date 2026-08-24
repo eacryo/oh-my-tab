@@ -2252,7 +2252,7 @@ pub(crate) fn show_overlay() {
             // ===== greedily packed into rows; per-row capacity varies naturally.
             // Height cap = target screen visibleFrame x 0.85 (BetterCmdTab-style):
             // on overflow, shrink all cards by 0.05 steps and re-pack, floor 0.5.
-            let gap = card_gap();
+            let gap = THUMB_ROW_GAP;
             let max_inner = ((screen_frame.size.width - H_PADDING * 2.0) * 0.92)
                 .clamp(300.0, 1240.0 - H_PADDING * 2.0);
             let max_panel_h = (screen_visible.size.height * 0.85).max(240.0);
