@@ -2372,13 +2372,19 @@ pub(crate) fn create_card_view(
 /// containing the key window, so summoning while the active app sits on a secondary display
 /// would resolve to that display, making "always on main screen" behave like "follow active
 /// window". The primary display is screens[0].
-/// 返回 (目标屏幕 frame, 该屏 visibleFrame)。visibleFrame 排除菜单栏/Dock,
-/// 流式布局的高度上限按它计算(BetterCmdTab 同款 visibleFrame × 0.85)。
-/// Returns (target screen frame, its visibleFrame). visibleFrame excludes the menu
-/// bar/Dock; the flow layout's height cap uses it (BetterCmdTab-style
-/// visibleFrame x 0.85).
-fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect) {
+/// 返回 (目标屏幕 frame, visibleFrame, backingScaleFactor)。屏幕对象不跨召唤缓存，
+/// 外接/拔出显示器或更改缩放模式后，下次召唤会读取新的实时倍率。
+/// Returns (target screen frame, visibleFrame, backingScaleFactor). The NSScreen object is
+/// never cached across summons, so display hot-plug/unplug and scaling-mode changes use the
+/// new live scale on the next summon.
+fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect, f64) {
     unsafe {
+        let metrics = |screen: *mut AnyObject| {
+            let frame: NSRect = msg_send![screen, frame];
+            let visible: NSRect = msg_send![screen, visibleFrame];
+            let scale: f64 = msg_send![screen, backingScaleFactor];
+            (frame, visible, if scale > 0.0 { scale } else { 1.0 })
+        };
         let pos = CONFIG.read().unwrap().windows.overlay_position.clone();
         // 主显示器 = screens[0](系统保证首屏带菜单栏);screens 为空时回退 mainScreen。
         // Primary display = screens[0] (first entry hosts the menu bar); fall back to
@@ -2396,23 +2402,19 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect) {
                 msg_send![class!(NSScreen), mainScreen]
             }
         };
-        let main_frame: NSRect = msg_send![main_screen_obj, frame];
         if pos != "active_window" {
-            let vf: NSRect = msg_send![main_screen_obj, visibleFrame];
-            return (main_frame, vf);
+            return metrics(main_screen_obj);
         }
         // 激活窗口:collect_windows 排序后 index 0 = 当前前台窗口(is_active 已置位)。
         // The active window: after collect_windows' sort, index 0 is the frontmost (is_active set).
         let Some(active) = windows.iter().find(|w| w.is_active) else {
-            let vf: NSRect = msg_send![main_screen_obj, visibleFrame];
-            return (main_frame, vf);
+            return metrics(main_screen_obj);
         };
         let (bx, by, bw, bh) = active.bounds;
         // bounds 全 0 = 未获取到,无法定位,回退主屏。
         // All-zero bounds = unavailable, can't locate, fall back to the main screen.
         if bw <= 0.0 || bh <= 0.0 {
-            let vf: NSRect = msg_send![main_screen_obj, visibleFrame];
-            return (main_frame, vf);
+            return metrics(main_screen_obj);
         }
         let cx = bx + bw / 2.0;
         let cy = by + bh / 2.0;
@@ -2431,13 +2433,11 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect) {
                 && cy >= f.origin.y
                 && cy <= f.origin.y + f.size.height
             {
-                let vf: NSRect = msg_send![s, visibleFrame];
-                return (f, vf);
+                return metrics(s);
             }
             i += 1;
         }
-        let vf: NSRect = msg_send![main_screen_obj, visibleFrame];
-        (main_frame, vf)
+        metrics(main_screen_obj)
     }
 }
 
@@ -2479,7 +2479,7 @@ fn show_overlay_with_direction(direction: ThumbSlideDirection) {
         // 目标屏幕先行计算:流式布局需要屏宽作装箱上限,居中也复用。
         // The target screen comes first: the flow layout needs its width as the
         // packing budget; centering reuses it.
-        let (screen_frame, screen_visible) = overlay_target_screen(&windows);
+        let (screen_frame, screen_visible, screen_scale) = overlay_target_screen(&windows);
         let use_flow = crate::theme::thumbnails_enabled();
 
         // (全局 index, x, y, w)——缩略图模式只产出当前连续可见区间，纯图标模式
@@ -2574,6 +2574,24 @@ fn show_overlay_with_direction(direction: ThumbSlideDirection) {
             (h, w, placements, card_h())
         };
         let card_h_outer = card_h_use;
+        // 截图像素需求必须在流式布局确定卡片实际高度后计算：同一块 2x 屏上，少窗口
+        // 从 1.0 放大到 1.5 也会从 512px 升到 640px；屏幕热插拔则由本次实时 scale
+        // 自然触发升级。旧高清缓存切回低需求屏时继续复用。
+        // Compute capture demand only after flow layout determines the actual card height:
+        // even on the same 2x screen, a small set growing from 1.0 to 1.5 can upgrade 512px
+        // to 640px. Live screen scale naturally handles hot-plug; a higher cached frame remains
+        // valid after returning to a lower-demand display.
+        let capture_target_px_h = use_flow.then(|| {
+            crate::thumbnail::target_px_height(thumb_preview_h(card_h_outer), screen_scale)
+        });
+        if let Some(target_px_h) = capture_target_px_h {
+            log_debug!(
+                "[overlay] thumbnail target_h={} preview_h={:.1}pt backing_scale={:.2}",
+                target_px_h,
+                thumb_preview_h(card_h_outer),
+                screen_scale
+            );
+        }
 
         let mut cards_total_ms: u128 = 0; // TIMING-DEBUG
         for (idx, card_x, card_y, card_w_i) in placements {
@@ -2712,7 +2730,9 @@ fn show_overlay_with_direction(direction: ThumbSlideDirection) {
         // Summon-time thumbnail refresh: cards already render their cached frames
         // (icon fallback when absent); stale/missing ones are re-captured async and
         // swapped in place via thumbnailReady -> rebuild_cards.
-        crate::thumbnail::refresh_for_summon();
+        if let Some(target_px_h) = capture_target_px_h {
+            crate::thumbnail::refresh_for_summon(target_px_h);
+        }
         // TIMING-DEBUG 汇总:各阶段耗时(排查 summon 卡顿用)。
         let total_ms = t0.elapsed().as_millis();
         log_debug!(

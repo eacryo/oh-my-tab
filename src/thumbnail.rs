@@ -28,7 +28,7 @@
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CString};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,13 +69,13 @@ type CgsCaptureListFn =
     unsafe extern "C" fn(CGSConnectionID, *const u32, usize, u32) -> *const c_void;
 
 /// CGSWindowCaptureOptions 位(DockDoor PrivateApis.swift 同源):
-/// bestResolution = Retina 原生分辨率,nominalResolution = 点尺寸(1x),
+/// bestResolution = Retina 原生分辨率,
 /// ignoreGlobalClipShape 绕过全局裁剪,fullSize 绕过 Stage Manager 歪斜。
 /// CGSWindowCaptureOptions bits (mirroring DockDoor's PrivateApis.swift):
-/// bestResolution = native retina pixels, nominalResolution = point size (1x),
+/// bestResolution = native retina pixels,
 /// ignoreGlobalClipShape bypasses the global clip shape, fullSize dodges the
 /// Stage Manager skew workaround.
-const CGS_CAPTURE_NOMINAL_RESOLUTION: u32 = 1 << 9;
+const CGS_CAPTURE_BEST_RESOLUTION: u32 = 1 << 8;
 const CGS_CAPTURE_IGNORE_GLOBAL_CLIP_SHAPE: u32 = 1 << 11;
 
 static CGS_MAIN_CONN: LazyLock<Option<CgsMainConnFn>> = LazyLock::new(|| unsafe {
@@ -214,6 +214,29 @@ fn fit_target(src_w: u32, src_h: u32, max_h: u32) -> (u32, u32) {
     (tw, max_h)
 }
 
+/// 根据本次浮窗预览的 pt 高度与目标屏 backing scale 选择捕获像素高度。
+/// 分档避免布局小幅变化造成重复升级；启动预热仍使用 512px，召唤时可按实际屏幕
+/// 升到 640/768/1024px。输入异常时安全回退 512px。
+/// Choose capture pixel height from this overlay's preview height in points and the target
+/// screen's backing scale. Buckets avoid repeated upgrades from tiny layout changes; startup
+/// pre-generation stays at 512px while summon-time demand may rise to 640/768/1024px.
+/// Invalid inputs safely fall back to 512px.
+pub(crate) fn target_px_height(preview_h_pt: f64, backing_scale: f64) -> u32 {
+    if !preview_h_pt.is_finite()
+        || !backing_scale.is_finite()
+        || preview_h_pt <= 0.0
+        || backing_scale <= 0.0
+    {
+        return BASE_TARGET_PX_H;
+    }
+    let required = (preview_h_pt * backing_scale).ceil() as u32;
+    CAPTURE_HEIGHT_BUCKETS
+        .iter()
+        .copied()
+        .find(|&bucket| bucket >= required)
+        .unwrap_or(MAX_TARGET_PX_H)
+}
+
 // ========== 内存 LRU(泛型核心,便于无 CG 依赖地测试) ==========
 
 /// 确定性 LRU:读命中提升到队尾,插入超限从队头驱逐并**返回被逐项**(值可能持有
@@ -330,10 +353,12 @@ const CACHE_MAX_COST: u64 = 64_000_000;
 /// Freshness TTL: frames younger than 2s are reused at summon; older ones are
 /// drawn immediately while a background recapture swaps them in.
 const FRESH_TTL_MS: u128 = 2000;
-/// 单张缩略图的目标像素高度上限(约两张 Retina 卡片高),限制单帧内存。
-/// Max target pixel height for one thumbnail (~two retina card heights) to bound
-/// per-frame memory.
-const TARGET_PX_H: u32 = 512;
+/// 启动预热与新窗口后台预生成使用的基准高度；召唤时按实际卡片与屏幕倍率升级。
+/// Baseline height for startup/new-window pre-generation; summon-time demand upgrades it
+/// from the actual card size and target screen scale.
+const BASE_TARGET_PX_H: u32 = 512;
+const CAPTURE_HEIGHT_BUCKETS: [u32; 4] = [512, 640, 768, 1024];
+const MAX_TARGET_PX_H: u32 = 1024;
 /// 连续可见区间两侧的预取窗口数；新卡滑入前通常已经有缓存。
 /// Number of windows prefetched on each side of the visible slice so newly slid-in
 /// cards normally already have a cached frame.
@@ -351,6 +376,10 @@ struct CachedThumb {
     img: *const c_void,
     w_px: u32,
     h_px: u32,
+    /// 本帧按哪个目标高度捕获；源窗口小于目标时实际 h_px 可以更小，但同一目标无需重试。
+    /// Requested capture height for this frame. A smaller source may yield a lower h_px,
+    /// but the same target must not trigger endless retries.
+    captured_for_px_h: u32,
     captured: Instant,
 }
 
@@ -383,14 +412,34 @@ pub(crate) fn lookup_retained(pid: i32, wid: u32) -> Option<(*const c_void, u32,
 /// 是否新鲜(召唤端决策用;过期帧仍会画,只是同时入队重截)。
 /// Freshness probe for the summon-side decision (stale frames still render --
 /// they just trigger a background recapture too).
-pub(crate) fn is_cached_fresh(pid: i32, wid: u32) -> bool {
+fn cached_frame_is_usable(
+    captured: Instant,
+    captured_for_px_h: u32,
+    required_px_h: u32,
+    now: Instant,
+) -> bool {
+    is_fresh(captured, now, FRESH_TTL_MS) && captured_for_px_h >= required_px_h
+}
+
+fn is_cached_fresh_for(pid: i32, wid: u32, required_px_h: u32) -> bool {
     // get() 会提升最近使用,需要可变借用。
     // get() bumps recency, so it needs a mutable borrow.
     let mut cache = CACHE.lock().unwrap();
     cache
         .get(&ThumbKey { pid, wid })
-        .map(|t| is_fresh(t.captured, Instant::now(), FRESH_TTL_MS))
+        .map(|t| {
+            cached_frame_is_usable(
+                t.captured,
+                t.captured_for_px_h,
+                required_px_h,
+                Instant::now(),
+            )
+        })
         .unwrap_or(false)
+}
+
+pub(crate) fn is_cached_fresh(pid: i32, wid: u32) -> bool {
+    is_cached_fresh_for(pid, wid, BASE_TARGET_PX_H)
 }
 
 fn cache_store(pid: i32, wid: u32, t: CachedThumb) {
@@ -404,21 +453,42 @@ fn cache_store(pid: i32, wid: u32, t: CachedThumb) {
 
 // ========== 捕获管线(flume 队列 + 单 worker 串行限流) ==========
 
-/// 同时记录队列中和正在执行的键；同一窗口直到当前任务结束前最多存在一次。
-/// Tracks both queued and in-flight keys; a window exists at most once until its
-/// current job finishes.
+/// 同时记录队列中/执行中的键及其最高目标高度。更高清请求会合并到 existing entry；
+/// 若捕获已经按较低目标开始，finish 返回最高目标让 worker 自动补拍。
+/// Tracks queued/in-flight keys and their highest requested height. A higher-resolution
+/// request merges into the existing entry; if capture already started lower, finish returns
+/// the higher target so the worker automatically runs a follow-up.
 #[derive(Default)]
 struct CaptureState {
-    active: HashSet<ThumbKey>,
+    desired: HashMap<ThumbKey, u32>,
 }
 
 impl CaptureState {
-    fn request(&mut self, key: ThumbKey) -> bool {
-        self.active.insert(key)
+    fn request(&mut self, key: ThumbKey, target_px_h: u32) -> bool {
+        match self.desired.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(target_px_h);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() = (*entry.get()).max(target_px_h);
+                false
+            }
+        }
     }
 
-    fn finish(&mut self, key: ThumbKey) {
-        self.active.remove(&key);
+    fn target_for(&self, key: ThumbKey) -> Option<u32> {
+        self.desired.get(&key).copied()
+    }
+
+    fn finish(&mut self, key: ThumbKey, captured_target_px_h: u32) -> Option<u32> {
+        let desired = self.desired.get(&key).copied()?;
+        if desired > captured_target_px_h {
+            Some(desired)
+        } else {
+            self.desired.remove(&key);
+            None
+        }
     }
 }
 
@@ -429,37 +499,53 @@ static JOB_TX: OnceLock<flume::Sender<ThumbKey>> = OnceLock::new();
 /// 尝试安排一次捕获；返回 false 表示相同窗口已 pending/in-flight，或 worker 已退出。
 /// Try to schedule one capture; false means the same window is already pending/in-flight,
 /// or the worker has exited.
-fn enqueue_job(pid: i32, wid: u32) -> bool {
+fn enqueue_job(pid: i32, wid: u32, target_px_h: u32) -> bool {
     let key = ThumbKey { pid, wid };
-    if !CAPTURE_STATE.lock().unwrap().request(key) {
+    if !CAPTURE_STATE.lock().unwrap().request(key, target_px_h) {
         return false;
     }
     let tx = JOB_TX.get_or_init(|| {
         let (tx, rx) = flume::unbounded::<ThumbKey>();
+        let retry_tx = tx.clone();
         std::thread::Builder::new()
             .name("thumb-capture".into())
             .spawn(move || {
                 log_debug!("[thumb] capture worker online");
                 for key in rx.iter() {
-                    log_debug!("[thumb] job recv pid={} wid={}", key.pid, key.wid);
-                    run_capture_job(key);
-                    // 成功、失败、权限跳过都释放 active，后续召唤才能按需重试。
-                    // Success, failure, and permission skips all release active so a
-                    // later summon can retry when needed.
-                    CAPTURE_STATE.lock().unwrap().finish(key);
+                    let target_px_h = CAPTURE_STATE
+                        .lock()
+                        .unwrap()
+                        .target_for(key)
+                        .unwrap_or(BASE_TARGET_PX_H);
+                    log_debug!(
+                        "[thumb] job recv pid={} wid={} target_h={}",
+                        key.pid,
+                        key.wid,
+                        target_px_h
+                    );
+                    run_capture_job(key, target_px_h);
+                    // 捕获期间若来了更高清请求，保留 active 并自行补发；否则成功、失败、
+                    // 权限跳过都释放，后续召唤可重试。
+                    // If a higher request arrived during capture, keep the key active and
+                    // self-enqueue a follow-up; otherwise release it after success, failure,
+                    // or a permission skip so later summons can retry.
+                    let follow_up = CAPTURE_STATE.lock().unwrap().finish(key, target_px_h);
+                    if follow_up.is_some() && retry_tx.send(key).is_err() {
+                        CAPTURE_STATE.lock().unwrap().desired.remove(&key);
+                    }
                 }
             })
             .expect("spawn thumb-capture worker");
         tx
     });
     if tx.send(key).is_err() {
-        CAPTURE_STATE.lock().unwrap().finish(key);
+        CAPTURE_STATE.lock().unwrap().desired.remove(&key);
         return false;
     }
     true
 }
 
-fn run_capture_job(key: ThumbKey) {
+fn run_capture_job(key: ThumbKey, target_px_h: u32) {
     // 每个任务前重新 preflight:未授权时静默跳过(运行中授权后自动恢复)。
     // Re-preflight per job: silently skip while unauthorized (auto-resumes once
     // granted mid-run).
@@ -471,16 +557,17 @@ fn run_capture_job(key: ThumbKey) {
         );
         return;
     }
-    let Some(t) = (unsafe { capture_window(key.wid) }) else {
+    let Some(t) = (unsafe { capture_window(key.wid, target_px_h) }) else {
         log_debug!("[thumb] capture failed pid={} wid={}", key.pid, key.wid);
         return;
     };
     log_debug!(
-        "[thumb] captured pid={} wid={} {}x{}",
+        "[thumb] captured pid={} wid={} {}x{} target_h={}",
         key.pid,
         key.wid,
         t.w_px,
-        t.h_px
+        t.h_px,
+        t.captured_for_px_h
     );
     cache_store(key.pid, key.wid, t);
     // 不再按任务来源预先决定是否投递：启动预热也可能在浮窗打开后才完成。
@@ -565,7 +652,7 @@ static READY_QUEUE: Mutex<Vec<ThumbKey>> = Mutex::new(Vec::new());
 /// Capture one window: CGSHWCCaptureWindowList (count=1) -> first CGImage ->
 /// proportionally downscale to the target pixel height (native retina frames can
 /// reach tens of MB).
-unsafe fn capture_window(wid: u32) -> Option<CachedThumb> {
+unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CachedThumb> {
     let cap = *CGS_CAPTURE_LIST.as_ref()?;
     // 连接 ID 进程内恒定,缓存一次;0 = 获取失败(私有符号缺失)。
     // The connection ID is process-wide constant; cache it once (0 = unavailable).
@@ -575,7 +662,11 @@ unsafe fn capture_window(wid: u32) -> Option<CachedThumb> {
         return None;
     }
     let wids = [wid];
-    let opts = CGS_CAPTURE_NOMINAL_RESOLUTION | CGS_CAPTURE_IGNORE_GLOBAL_CLIP_SHAPE;
+    // 显式请求 Retina 原生像素；nominalResolution 只给逻辑点尺寸，小窗口在 4K/5K
+    // 屏上放大后仍会发糊，即使后续目标高度提高也无法补回源细节。
+    // Explicitly request native Retina pixels. nominalResolution only returns point-sized
+    // content, so small windows stay blurry on 4K/5K displays even with a larger target later.
+    let opts = CGS_CAPTURE_BEST_RESOLUTION | CGS_CAPTURE_IGNORE_GLOBAL_CLIP_SHAPE;
     let arr = cap(cid, wids.as_ptr(), 1, opts);
     if arr.is_null() {
         return None;
@@ -595,7 +686,8 @@ unsafe fn capture_window(wid: u32) -> Option<CachedThumb> {
 
     let src_w = CGImageGetWidth(raw) as u32;
     let src_h = CGImageGetHeight(raw) as u32;
-    let (tw, th) = fit_target(src_w, src_h, TARGET_PX_H);
+    let target_px_h = target_px_h.clamp(BASE_TARGET_PX_H, MAX_TARGET_PX_H);
+    let (tw, th) = fit_target(src_w, src_h, target_px_h);
     let img = if tw == src_w && th == src_h {
         raw
     } else {
@@ -613,6 +705,7 @@ unsafe fn capture_window(wid: u32) -> Option<CachedThumb> {
         img,
         w_px: tw,
         h_px: th,
+        captured_for_px_h: target_px_h,
         captured: Instant::now(),
     })
 }
@@ -680,7 +773,7 @@ fn capture_range_for_visible(visible: Option<Range<usize>>, len: usize) -> Range
 /// window is requested first.
 /// The selection is read from TAB_STATE internally; callers just invoke once at
 /// the end of show_overlay.
-pub(crate) fn refresh_for_summon() {
+pub(crate) fn refresh_for_summon(required_px_h: u32) {
     if !crate::theme::thumbnails_enabled() {
         return;
     }
@@ -713,7 +806,7 @@ pub(crate) fn refresh_for_summon() {
             .filter(|(index, _)| capture_range.contains(index))
             .map(|(_, window)| window)
             .filter(|w| !w.minimized && w.bounds.2 > 0.0 && w.bounds.3 > 0.0)
-            .filter(|w| !is_cached_fresh(w.pid, w.window_id))
+            .filter(|w| !is_cached_fresh_for(w.pid, w.window_id, required_px_h))
             .map(|w| (w.pid, w.window_id))
             .collect();
         // 选中窗口排最前(false < true,选中的键为 false 排队首)。
@@ -724,12 +817,13 @@ pub(crate) fn refresh_for_summon() {
     let requested = jobs.len();
     let mut enqueued = 0;
     for (pid, wid) in jobs {
-        enqueued += usize::from(enqueue_job(pid, wid));
+        enqueued += usize::from(enqueue_job(pid, wid, required_px_h));
     }
     log_debug!(
-        "[thumb] summon refresh: {} stale/missing requested, {} newly enqueued",
+        "[thumb] summon refresh: {} stale/missing requested, {} newly enqueued target_h={}",
         requested,
-        enqueued
+        enqueued,
+        required_px_h
     );
 }
 
@@ -1120,7 +1214,7 @@ unsafe fn pregen_windows_for_pid(pid: i32) {
         if minimized || wid == 0 {
             continue; // 最小化窗口无渲染缓冲,截取必然失败 / no backing store while minimized
         }
-        queued += usize::from(enqueue_job(pid, wid));
+        queued += usize::from(enqueue_job(pid, wid, BASE_TARGET_PX_H));
     }
     log_debug!("[thumb] pregen pid={}: {} windows queued", pid, queued);
 }
@@ -1157,7 +1251,7 @@ unsafe extern "C" fn thumb_ax_observer(
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(300));
                     if crate::theme::thumbnails_enabled() {
-                        enqueue_job(pid, wid);
+                        enqueue_job(pid, wid, BASE_TARGET_PX_H);
                     }
                 });
             }
@@ -1181,9 +1275,28 @@ mod tests {
         // 同一键无论还在队列还是正在捕获都只能登记一次；其他窗口不受影响。
         // The same key registers once whether queued or in-flight; another window
         // remains independent.
-        assert!(state.request(first));
-        assert!(!state.request(first));
-        assert!(state.request(other));
+        assert!(state.request(first, 512));
+        assert!(!state.request(first, 512));
+        assert!(state.request(other, 512));
+        assert_eq!(state.target_for(first), Some(512));
+    }
+
+    #[test]
+    fn capture_state_preserves_a_higher_request_arriving_in_flight() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+
+        assert!(state.request(key, 512));
+        // 低清任务已开始后接入高分屏：请求合并但不重复入队；低清完成时返回 640，
+        // worker 据此自动补拍。高清完成后才释放 active。
+        // A high-DPI display appears after the low-res job starts: merge without a duplicate
+        // queue item; finishing 512 returns 640 for an automatic follow-up. The key is released
+        // only after the high-res capture finishes.
+        assert!(!state.request(key, 640));
+        assert_eq!(state.finish(key, 512), Some(640));
+        assert_eq!(state.target_for(key), Some(640));
+        assert_eq!(state.finish(key, 640), None);
+        assert_eq!(state.target_for(key), None);
     }
 
     #[test]
@@ -1200,12 +1313,12 @@ mod tests {
         let mut state = CaptureState::default();
         let key = ThumbKey { pid: 10, wid: 20 };
 
-        assert!(state.request(key));
+        assert!(state.request(key, 512));
         // worker 对成功、失败和权限跳过统一调用 finish；之后下一次召唤可重试。
         // The worker calls finish after success, failure, or a permission skip;
         // the next summon can then retry.
-        state.finish(key);
-        assert!(state.request(key));
+        assert_eq!(state.finish(key, 512), None);
+        assert!(state.request(key, 512));
     }
 
     #[test]
@@ -1298,6 +1411,30 @@ mod tests {
     }
 
     #[test]
+    fn fresh_cache_still_upgrades_when_the_display_needs_more_pixels() {
+        let now = Instant::now();
+        let captured = now - Duration::from_millis(100);
+        assert!(cached_frame_is_usable(captured, 512, 512, now));
+        assert!(!cached_frame_is_usable(captured, 512, 640, now));
+        // 切回低需求屏时高清缓存直接复用，不降级重截。
+        // A high-resolution frame remains usable after returning to a lower-demand display.
+        assert!(cached_frame_is_usable(captured, 640, 512, now));
+    }
+
+    #[test]
+    fn target_height_tracks_card_size_and_live_screen_scale() {
+        // 多窗口基准卡在 2x 屏不超过 512px；少窗口 1.5x 卡约 271pt，在 2x
+        // 4K/5K 屏升级到 640px。非 Retina 外屏无需升级，未来 3x 走 1024px。
+        // A base card on 2x fits 512px; a ~271pt 1.5x card upgrades to 640px on a
+        // 2x 4K/5K display. A 1x external display needs no upgrade; future 3x uses 1024px.
+        assert_eq!(target_px_height(177.5, 2.0), 512);
+        assert_eq!(target_px_height(271.25, 2.0), 640);
+        assert_eq!(target_px_height(271.25, 1.0), 512);
+        assert_eq!(target_px_height(271.25, 3.0), 1024);
+        assert_eq!(target_px_height(f64::NAN, 2.0), 512);
+    }
+
+    #[test]
     fn fit_size_fits_long_edge_and_letterboxes_short_edge() {
         // 16:9 内容放进 4:3 框:内容更"宽",宽度贴合框、高度按比例缩小(上下留白)。
         // 16:9 content into a 4:3 box: the content is wider, so the width fits the
@@ -1374,15 +1511,6 @@ fn cgshwc_capture_smoke() {
         .find(|(_, _, minimized)| !*minimized)
         .map(|(wid, _, _)| *wid)
         .expect("Finder has no visible window");
-    let t = unsafe { capture_window(wid) }.expect("CGSHWCCaptureWindowList failed");
-    assert!(t.w_px > 0 && t.h_px > 0, "degenerate capture size");
-    println!(
-        "[smoke] captured Finder window {wid}: {}x{}",
-        t.w_px, t.h_px
-    );
-    // 连带验证渲染侧的 CGImage -> NSImage 转换(msg_send 编码陷阱回归位)。
-    // Also verify the render-side CGImage -> NSImage conversion (regression site
-    // of the msg_send encoding trap).
     let scale: f64 = unsafe {
         let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
         if screen.is_null() {
@@ -1391,6 +1519,21 @@ fn cgshwc_capture_smoke() {
             msg_send![screen, backingScaleFactor]
         }
     };
+    // 用最大放大卡片的预览高度驱动真实捕获；当前 2x Retina 环境会走 640px，
+    // 同时验证 bestResolution 与动态降采样路径。
+    // Drive the real capture with a maximally enlarged card preview; the current 2x Retina
+    // environment takes the 640px path, covering bestResolution plus dynamic downscaling.
+    let target_px_h = target_px_height(271.25, scale);
+    let t = unsafe { capture_window(wid, target_px_h) }.expect("CGSHWCCaptureWindowList failed");
+    assert!(t.w_px > 0 && t.h_px > 0, "degenerate capture size");
+    assert_eq!(t.captured_for_px_h, target_px_h);
+    println!(
+        "[smoke] captured Finder window {wid}: {}x{} target={}",
+        t.w_px, t.h_px, target_px_h
+    );
+    // 连带验证渲染侧的 CGImage -> NSImage 转换(msg_send 编码陷阱回归位)。
+    // Also verify the render-side CGImage -> NSImage conversion (regression site
+    // of the msg_send encoding trap).
     let ns = unsafe {
         crate::overlay::nsimage_from_cgimage(
             t.img,
