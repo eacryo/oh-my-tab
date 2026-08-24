@@ -51,6 +51,15 @@ pub(crate) const ICON_VIEW_TAG: isize = 0xE7F2;
 /// Tag for the thumbnail-mode preview container (located by the selected-state
 /// nudge).
 const THUMB_PREVIEW_TAG: isize = 0xE7F3;
+/// 缩略图模式选中态的 2pt 外圈视图 tag。
+/// Tag for the thumbnail-mode selected-state 2pt outer ring.
+const THUMB_SELECTION_RING_TAG: isize = 0xE7F4;
+/// 设计稿 accent-soft = rgba(...,.16),换算为 8 位 alpha。
+/// Mockup accent-soft = rgba(...,.16), converted to 8-bit alpha.
+const SELECTION_RING_ALPHA: u8 = 0x29;
+/// 设计稿选中预览描边 = rgba(...,.34),换算为 8 位 alpha。
+/// Mockup selected-preview border = rgba(...,.34), converted to 8-bit alpha.
+const SELECTED_PREVIEW_BORDER_ALPHA: u8 = 0x57;
 
 // ========== 浮窗相关全局状态 / overlay global state ==========
 
@@ -111,6 +120,12 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     text.to_string()
 }
 
+/// 保留 RRGGBB,只替换 RRGGBBAA 的 alpha。
+/// Preserve RRGGBB and replace only the alpha in RRGGBBAA.
+fn color_with_alpha(color: u32, alpha: u8) -> u32 {
+    (color & 0xFFFF_FF00) | u32::from(alpha)
+}
+
 /// 占位符:窗口没有标题时(如 Microsoft To Do,AXTitle 为空)显示一个短横线。
 /// 注意:仅用于显示。内部 `window_title` 仍保持空串,这样 raise_ax_window 仍能
 /// 按空标题匹配到对应的 AX 窗口并聚焦。
@@ -128,6 +143,7 @@ fn display_title(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::color_with_alpha;
     use super::display_title;
     use super::vertical_nav_index;
 
@@ -139,6 +155,12 @@ mod tests {
             .enumerate()
             .map(|(n, &i)| (i, n as f64 * 110.0, y, 100.0))
             .collect()
+    }
+
+    #[test]
+    fn color_with_alpha_preserves_rgb() {
+        assert_eq!(color_with_alpha(0x4B7BECC7, 0x29), 0x4B7BEC29);
+        assert_eq!(color_with_alpha(0x5577CCFF, 0x57), 0x5577CC57);
     }
 
     #[test]
@@ -1343,6 +1365,26 @@ pub(crate) fn refresh_highlight() {
                 let _: () = msg_send![layer, setShadowOpacity: 0.0f32];
             }
 
+            // CSS 的第一层 box-shadow 是卡片外侧 2px、零模糊的 accent-soft 圈,
+            // 不能与下面的深色模糊投影共用 CALayer.shadow。独立 ring 视图保留
+            // RGB 并把 alpha 固定为设计稿的 16%,只在缩略图模式选中时显示。
+            // The first CSS box-shadow is a zero-blur 2px accent-soft ring outside the
+            // card; it cannot share CALayer.shadow with the dark blurred drop shadow.
+            // A dedicated ring view preserves the RGB, fixes alpha at the mockup's 16%,
+            // and appears only for the selected thumbnail card.
+            let ring: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_SELECTION_RING_TAG];
+            if !ring.is_null() {
+                let ring_layer: *mut AnyObject = msg_send![ring, layer];
+                layer_set_border(
+                    ring_layer,
+                    hex_to_cg_color(color_with_alpha(
+                        colors.card_border_sel,
+                        SELECTION_RING_ALPHA,
+                    )),
+                );
+                let _: () = msg_send![ring, setHidden: !is_selected];
+            }
+
             // HTML 参考中的图标在选中态向上轻移 1px;每次都从基准 y 重算,避免反复
             // 切换时累计位移。
             // The HTML reference nudges the icon up by 1px when selected; recompute from the
@@ -1371,6 +1413,16 @@ pub(crate) fn refresh_highlight() {
             // constant) -- absolute recomputation per refresh, zero accumulated drift.
             let preview: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_PREVIEW_TAG];
             if !preview.is_null() {
+                // 设计稿选中时把预览区 1px 描边切为 accent 34%;未选中恢复中性描边。
+                // The mockup switches the preview's 1px border to accent at 34% when
+                // selected; restore the neutral border otherwise.
+                let preview_layer: *mut AnyObject = msg_send![preview, layer];
+                let preview_border = if is_selected {
+                    color_with_alpha(colors.card_border_sel, SELECTED_PREVIEW_BORDER_ALPHA)
+                } else {
+                    colors.preview_border
+                };
+                layer_set_border(preview_layer, hex_to_cg_color(preview_border));
                 let preview_frame: NSRect = msg_send![preview, frame];
                 let preview_y = THUMB_PAD + if is_selected { 1.0 } else { 0.0 };
                 let _: () = msg_send![
@@ -1781,6 +1833,7 @@ pub(crate) fn create_card_view(
         // caption / close button) are all inset from the card edges and stay inside
         // the rounded shape, so disabling the clip is safe (cornerRadius still rounds
         // the background and border).
+        let _: () = msg_send![layer, setMasksToBounds: false];
 
         // Store card index in side map (avoids msg_send! issues on dynamic classes)
         set_card_index(view, index);
@@ -1788,6 +1841,39 @@ pub(crate) fn create_card_view(
         let colors = current_colors();
 
         if use_new {
+            // 设计稿 box-shadow 的第一层是向外扩 2pt 的零模糊柔蓝圈。用独立透明
+            // NSImageView 承载 2pt border:frame 每边扩 2pt,边框向内绘制后恰好覆盖
+            // 卡片外侧 [-2,0] 区间。它先加入卡片,位于标题/预览内容下方；卡片关闭
+            // masksToBounds 后外圈才能完整显示。refresh_highlight 控制显隐与主题色。
+            // The mockup's first box-shadow is a zero-blur soft-blue ring spread 2pt
+            // outward. A transparent NSImageView carries a 2pt border: expanding its
+            // frame by 2pt per side makes the inward-drawn border cover exactly the
+            // card's outer [-2,0] band. It is added before caption/preview content;
+            // masksToBounds=false keeps the outer ring visible. refresh_highlight owns
+            // visibility and theme color.
+            let ring_frame = NSRect::new(
+                NSPoint::new(-2.0, -2.0),
+                NSSize::new(card_width + 4.0, card_h + 4.0),
+            );
+            let ring: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+            let ring: *mut AnyObject = msg_send![ring, initWithFrame: ring_frame];
+            let _: () = msg_send![ring, setTag: THUMB_SELECTION_RING_TAG];
+            let _: () = msg_send![ring, setWantsLayer: true];
+            let ring_layer: *mut AnyObject = msg_send![ring, layer];
+            let _: () = msg_send![ring_layer, setCornerRadius: 18.0f64];
+            let _: () = msg_send![ring_layer, setMasksToBounds: false];
+            let _: () = msg_send![ring_layer, setBorderWidth: 2.0f64];
+            layer_set_border(
+                ring_layer,
+                hex_to_cg_color(color_with_alpha(
+                    colors.card_border_sel,
+                    SELECTION_RING_ALPHA,
+                )),
+            );
+            let _: () = msg_send![ring, setHidden: true];
+            let _: () = msg_send![view, addSubview: ring];
+            release_obj(ring);
+
             let preview_h = (card_h - THUMB_PAD * 2.0 - THUMB_CAPTION_H - THUMB_GAP).max(40.0);
             let caption_y = card_h - THUMB_PAD - THUMB_CAPTION_H;
 
