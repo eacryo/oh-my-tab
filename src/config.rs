@@ -464,12 +464,24 @@ impl ThemeColors {
             // rgba(0,0,0,.82) / rgba(0,0,0,.34); see the dark_default comment.
             app_name: "00000057".into(),
             win_title: "000000D1".into(),
-            icon_inner_bg: "d0d0e066".into(),
+            // 设计稿(preview (7).html)预览区底色 #f6f7f9:近乎白的中性色,让预览区
+            // 与卡片读作同一张表面。
+            // The mockup's preview background #f6f7f9: a near-white neutral so the
+            // preview reads as the same surface as the card.
+            icon_inner_bg: "F6F7F9FF".into(),
             icon_text: "666688ff".into(),
-            // HTML 参考中的浅蓝选中背景与 1px 内描边。
-            // Light selection background and 1px inset-style border from the HTML reference.
-            card_bg_sel: "3460AF11".into(),
-            card_border_sel: "3460AF24".into(),
+            // 设计稿 .item.selected 背景 rgba(255,255,255,.88):一张明显的浅色表面
+            // 托起标题行与预览区(淡 accent 底在玻璃面板上几乎不可见,实测反馈)。
+            // The mockup's .item.selected background rgba(255,255,255,.88): a clearly
+            // visible light surface carrying the caption and preview (the faint accent
+            // tint was invisible on the glass panel -- user-reported).
+            card_bg_sel: "FFFFFFE0".into(),
+            // 设计稿 .item.selected 的 1px 清晰描边 rgba(75,123,236,.78)——白底上
+            // 唯一可见的轮廓线(2px 柔色圈在白底上不可见,见 refresh_highlight 注释)。
+            // The mockup's crisp 1px selected border rgba(75,123,236,.78) -- the only
+            // outline visible against the white surface (a 2px soft ring disappears
+            // on white; see the refresh_highlight comment).
+            card_border_sel: "4B7BECC7".into(),
         }
     }
 }

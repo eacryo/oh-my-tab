@@ -543,6 +543,22 @@ fn vertical_nav_index(rects: &[(usize, f64, f64, f64)], current: usize, up: bool
         .map(|(i, ..)| *i)
 }
 
+/// 设置 CALayer.shadowColor。CGColorRef 与 CGImageRef 同理不能进 objc2 的
+/// msg_send!(参数编码 '@' vs '^{CGColor=}' 被运行时拒绝),照 layer_set_background
+/// 惯例走裸 objc_msgSend。
+/// Set CALayer.shadowColor. A CGColorRef, like CGImageRef, cannot go through
+/// objc2's msg_send! (arg encoding '@' vs '^{CGColor=}' rejected at runtime);
+/// raw objc_msgSend per the layer_set_background convention.
+unsafe fn layer_set_shadow_color(layer: *mut AnyObject, cg: *mut c_void) {
+    let sel = sel!(setShadowColor:);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel, cg);
+}
+
 pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let key_code: u16 = msg_send![event as *mut AnyObject, keyCode];
@@ -1297,13 +1313,34 @@ pub(crate) fn refresh_highlight() {
             // "shows Picview but opens Ghostty").
             let is_selected = tag == selected;
             if is_selected {
+                // 设计稿 .item.selected:1px 清晰 accent 描边 rgba(75,123,236,.78)。
+                // 白底上柔色圈不可见,轮廓线必须用实色 accent 才能显形。
+                // The mockup's .item.selected: a crisp 1px accent border
+                // rgba(75,123,236,.78). A soft ring is invisible on the white
+                // surface -- the outline needs the solid accent to show.
                 let _: () = msg_send![layer, setBorderWidth: 1.0f64];
                 layer_set_border(layer, sel_border_color);
                 layer_set_background(layer, sel_bg_color);
+                // 投影:0 10px 24px rgba(42,62,102,.12)(设计稿同款)。CSS blur 24 ≈
+                // CALayer shadowRadius 12;CALayer shadowOffset y 正值向上,向下投影取 -10。
+                // Drop shadow: 0 10px 24px rgba(42,62,102,.12), straight from the mockup.
+                // CSS blur 24 ≈ CALayer shadowRadius 12; CALayer's shadowOffset y is up-positive,
+                // so a downward shadow takes -10.
+                let shadow_color = hex_to_cg_color(0x2A3E66FF);
+                // CGColorRef 不能进 objc2 的 msg_send!('@' vs '^{CGColor=}' 运行时
+                // 拒绝,实测召唤即崩),照 layer_set_background 惯例走裸 objc_msgSend。
+                // A CGColorRef cannot go through objc2's msg_send! ('@' vs
+                // '^{CGColor=}' rejected at runtime -- crashed the summon, verified);
+                // use raw objc_msgSend per the layer_set_background convention.
+                layer_set_shadow_color(layer, shadow_color);
+                let _: () = msg_send![layer, setShadowOpacity: 0.12f32];
+                let _: () = msg_send![layer, setShadowRadius: 12.0f64];
+                let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -10.0)];
             } else {
                 let _: () = msg_send![layer, setBorderWidth: 0.0f64];
                 layer_set_border(layer, std::ptr::null_mut());
                 layer_set_background(layer, std::ptr::null_mut());
+                let _: () = msg_send![layer, setShadowOpacity: 0.0f32];
             }
 
             // HTML 参考中的图标在选中态向上轻移 1px;每次都从基准 y 重算,避免反复
@@ -1736,7 +1773,14 @@ pub(crate) fn create_card_view(
         // 新版圆角 16(设计稿 .item),旧版保持 14。
         // 16px radius for the new layout (.item), legacy keeps 14.
         let _: () = msg_send![layer, setCornerRadius: if use_new { 16.0f64 } else { 14.0f64 }];
-        let _: () = msg_send![layer, setMasksToBounds: true];
+        // masksToBounds 必须为 false:选中态的投影画在卡片边界之外,裁剪会把它
+        // 整个吃掉。子元素(预览区/标题行/关闭按钮)均相对卡片边缘内缩,几何上
+        // 没有内容超出圆角形状,关闭裁剪是安全的(cornerRadius 仍会圆出背景与描边)。
+        // masksToBounds MUST be false: the selected-state shadow draws OUTSIDE the
+        // card bounds and clipping would swallow it entirely. Children (preview /
+        // caption / close button) are all inset from the card edges and stay inside
+        // the rounded shape, so disabling the clip is safe (cornerRadius still rounds
+        // the background and border).
 
         // Store card index in side map (avoids msg_send! issues on dynamic classes)
         set_card_index(view, index);

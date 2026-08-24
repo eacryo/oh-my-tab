@@ -267,10 +267,10 @@ card_border_sel = "5577ccff"
 status_bar_text = "333333ff"
 app_name        = "1a1a1aff"
 win_title       = "333333ff"
-icon_inner_bg   = "d0d0e066"
+icon_inner_bg   = "F6F7F9FF"
 icon_text       = "666688ff"
-card_bg_sel     = "3460AF11"
-card_border_sel = "3460AF24"
+card_bg_sel     = "FFFFFFE0"
+card_border_sel = "4B7BECC7"
 
 [fonts]
 status_bar_size   = 13.0
