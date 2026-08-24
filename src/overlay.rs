@@ -125,6 +125,68 @@ fn display_title(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::display_title;
+    use super::vertical_nav_index;
+
+    /// 构造一行卡片的 rects:y 固定,x 依次排开(宽 100 间距 10)。
+    /// Build one row of rects: fixed y, sequential x (width 100, gap 10).
+    fn row(indices: &[usize], y: f64) -> Vec<(usize, f64, f64, f64)> {
+        indices
+            .iter()
+            .enumerate()
+            .map(|(n, &i)| (i, n as f64 * 110.0, y, 100.0))
+            .collect()
+    }
+
+    #[test]
+    fn vertical_nav_picks_closest_center_in_adjacent_row() {
+        // 首行 3 张(0,1,2),次行 4 张(3,4,5,6),第三行 2 张(7,8)——流式典型形态。
+        // Rows of 3 / 4 / 2 -- the typical flow shape.
+        let mut rects = row(&[0, 1, 2], 200.0);
+        rects.extend(row(&[3, 4, 5, 6], 100.0));
+        rects.extend(row(&[7, 8], 0.0));
+
+        // 从 1(中心 160)下移:次行中心 110/220/330/440,最近 = 4(220)。
+        // From 1 (center 160) down: row-2 centers 110/220/330/440 -> nearest is 4.
+        assert_eq!(vertical_nav_index(&rects, 1, false), Some(4));
+        // 从 4(中心 220)上移:回到 1(160 比 110/330 更近)。
+        // From 4 (center 220) up: back to 1 (160 beats 110/330).
+        assert_eq!(vertical_nav_index(&rects, 4, true), Some(1));
+        // 从 0(中心 50)下移:最近 = 3(110)。
+        // From 0 (center 50) down: nearest is 3 (110).
+        assert_eq!(vertical_nav_index(&rects, 0, false), Some(3));
+        // 从 6(中心 440)下移:第三行中心 50/160,最近 = 8(160)。
+        // From 6 (center 440) down: nearest in the last row is 8 (160).
+        assert_eq!(vertical_nav_index(&rects, 6, false), Some(8));
+        // 从 8(中心 160)上移:第二行最近 = 4(中心 160,完全对齐)。
+        // From 8 (center 160) up: nearest in the middle row is 4 (center 160, aligned).
+        assert_eq!(vertical_nav_index(&rects, 8, true), Some(4));
+    }
+
+    #[test]
+    fn vertical_nav_no_adjacent_row_is_no_op() {
+        let mut rects = row(&[0, 1], 100.0);
+        rects.extend(row(&[2, 3], 0.0));
+        // 已在最上行:再往上无行 -> None(到边不动)。
+        // Already on the top row: no row above -> None (edge = no-op).
+        assert_eq!(vertical_nav_index(&rects, 0, true), None);
+        assert_eq!(vertical_nav_index(&rects, 1, true), None);
+        // 已在最下行:再往下无行 -> None。
+        // Already on the bottom row: no row below -> None.
+        assert_eq!(vertical_nav_index(&rects, 2, false), None);
+        // 单行场景上下都是 None。
+        // A single row yields None both ways.
+        let single = row(&[0, 1, 2], 100.0);
+        assert_eq!(vertical_nav_index(&single, 1, true), None);
+        assert_eq!(vertical_nav_index(&single, 1, false), None);
+    }
+
+    #[test]
+    fn vertical_nav_unknown_current_is_no_op() {
+        // 当前 index 不在 rects 里(理论不发生,防御) -> None。
+        // A current index absent from rects (defensive) -> None.
+        let rects = row(&[0, 1], 100.0);
+        assert_eq!(vertical_nav_index(&rects, 99, true), None);
+    }
 
     #[test]
     fn empty_title_gets_placeholder() {
@@ -406,9 +468,89 @@ pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _even
 
 // --- Container View ---
 
+/// 从浮窗容器收集每张卡片的 (index, x, y, width)(按实际 frame,跳过状态栏标签)。
+/// Collect (index, x, y, width) for every card from the live container subviews
+/// (actual frames; the status-bar labels are skipped).
+unsafe fn collect_card_rects() -> Vec<(usize, f64, f64, f64)> {
+    let container = match *CONTAINER.lock().unwrap() {
+        Some(c) => c.0,
+        None => return Vec::new(),
+    };
+    let subviews: *mut AnyObject = msg_send![container, subviews];
+    let count: usize = msg_send![subviews, count];
+    let mut out: Vec<(usize, f64, f64, f64)> = Vec::new();
+    for i in 0..count {
+        let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
+        let is_label: bool = msg_send![sv, isKindOfClass: class!(NSTextField)];
+        if is_label {
+            continue;
+        }
+        let idx = get_card_index(sv);
+        let f: NSRect = msg_send![sv, frame];
+        out.push((idx, f.origin.x, f.origin.y, f.size.width));
+    }
+    out
+}
+
+/// 几何感知的垂直导航(纯函数,可单测):跳到相邻行中水平中心最接近当前卡片的
+/// 那一张。流式布局每行卡片数不同,固定步长跳转会错位/越界,必须按实际位置。
+/// 返回 None 表示该方向没有相邻行(保持"到边不动"的语义)。
+/// 行聚类按 y 值 + 1.0pt 容差(同一行的卡片 y 完全相同,容差只防浮点漂移)。
+///
+/// Geometry-aware vertical navigation (pure, unit-testable): jump to the card in
+/// the adjacent row whose horizontal center is CLOSEST to the current card's.
+/// Flow rows hold different card counts, so a fixed step misaligns or runs off
+/// the end. None = no adjacent row in that direction (edge = no-op semantics).
+/// Rows cluster by y with a 1pt epsilon (same-row cards share y exactly; the
+/// epsilon only guards float drift).
+fn vertical_nav_index(rects: &[(usize, f64, f64, f64)], current: usize, up: bool) -> Option<usize> {
+    const ROW_EPS: f64 = 1.0;
+    let (_, cx, cy, cw) = rects.iter().find(|(i, ..)| *i == current)?;
+    let cur_center = cx + cw / 2.0;
+    let cur_y = cy;
+
+    // 相邻行:同方向里 y 最接近当前行的那个。
+    // The adjacent row: nearest y in the requested direction.
+    let mut best_row_y: Option<f64> = None;
+    for (_, _, y, _) in rects {
+        let dy = y - cur_y;
+        let in_direction = if up { dy > ROW_EPS } else { dy < -ROW_EPS };
+        if !in_direction {
+            continue;
+        }
+        best_row_y = Some(match best_row_y {
+            Some(by) if up => by.min(*y),
+            Some(by) => by.max(*y),
+            None => *y,
+        });
+    }
+    let target_y = best_row_y?;
+
+    // 目标行内取水平中心最近者(平分取先出现者)。
+    // Within the target row, pick the closest horizontal center (ties -> first).
+    rects
+        .iter()
+        .filter(|(_, _, y, _)| (y - target_y).abs() <= ROW_EPS)
+        .min_by(|a, b| {
+            let da = ((a.1 + a.3 / 2.0) - cur_center).abs();
+            let db = ((b.1 + b.3 / 2.0) - cur_center).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, ..)| *i)
+}
+
 pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let key_code: u16 = msg_send![event as *mut AnyObject, keyCode];
+        // 几何导航的 frame 收集先于 TAB_STATE 加锁:避免 CONTAINER/TAB_STATE 交叉
+        // 持有(锁序与其他路径相反会造成理论死锁)。
+        // Collect nav frames BEFORE taking TAB_STATE: avoids holding CONTAINER and
+        // TAB_STATE across each other (inverted lock order vs other paths).
+        let nav_rects = if crate::theme::thumbnails_enabled() {
+            collect_card_rects()
+        } else {
+            Vec::new()
+        };
         let mut state_opt = TAB_STATE.lock().unwrap();
         let state = state_opt.as_mut().unwrap();
 
@@ -438,15 +580,42 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 }
             }
             KEY_UP => {
-                if !state.windows.is_empty() && state.selected >= cards_per_row() {
-                    state.selected -= cards_per_row();
-                    drop(state_opt);
-                    refresh_highlight();
-                    update_status_label();
+                if state.windows.is_empty() {
+                    return;
+                }
+                if crate::theme::thumbnails_enabled() {
+                    // 流式布局:每行卡片数不同,按实际几何跳到正上方最近的卡片。
+                    // Flow layout: per-row counts differ; jump geometrically to the
+                    // card directly above.
+                    if let Some(idx) = vertical_nav_index(&nav_rects, state.selected, true) {
+                        state.selected = idx;
+                        drop(state_opt);
+                        refresh_highlight();
+                        update_status_label();
+                    }
+                } else {
+                    // 旧版均匀网格:保持原有 ±cards_per_row 行为,不变。
+                    // Legacy uniform grid: the original +/-cards-per-row step, unchanged.
+                    if state.selected >= cards_per_row() {
+                        state.selected -= cards_per_row();
+                        drop(state_opt);
+                        refresh_highlight();
+                        update_status_label();
+                    }
                 }
             }
             KEY_DOWN => {
-                if !state.windows.is_empty() {
+                if state.windows.is_empty() {
+                    return;
+                }
+                if crate::theme::thumbnails_enabled() {
+                    if let Some(idx) = vertical_nav_index(&nav_rects, state.selected, false) {
+                        state.selected = idx;
+                        drop(state_opt);
+                        refresh_highlight();
+                        update_status_label();
+                    }
+                } else {
                     let new_idx = state.selected + cards_per_row();
                     if new_idx < state.windows.len() {
                         state.selected = new_idx;
