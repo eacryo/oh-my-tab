@@ -2047,20 +2047,25 @@ pub(crate) fn create_card_view(
         release_obj(ta); // view owns the tracking area; drop our alloc +1
 
         // --- 关闭按钮:新版在标题行右侧(圆形 24,设计稿 .close);旧版保持右上角 20 ---
-        // --- Close button: new layout puts it in the caption row (24px circle, the
-        // mockup's .close); legacy keeps the 20px top-right one. ---
+        // --- 关闭按钮:两种模式统一样式(20×20、圆角 6、字号 12,与旧版图标模式
+        // 完全一致——含悬停变红的观感);仅位置随布局:缩略图模式在标题行右侧
+        // 垂直居中,旧版在卡片右上角。 ---
+        // --- Close button: unified style across both layouts (20x20, radius 6,
+        // font 12 -- identical to the legacy icon-mode button, hover-red included);
+        // only the position follows the layout: caption-row right edge (centered)
+        // in thumbnail mode, top-right corner in legacy. ---
         let (btn_frame, btn_radius, btn_font_sz) = if use_new {
             let caption_y = card_h - THUMB_PAD - THUMB_CAPTION_H;
             (
                 NSRect::new(
                     NSPoint::new(
-                        card_width - THUMB_PAD - 24.0,
-                        caption_y + (THUMB_CAPTION_H - 24.0) / 2.0,
+                        card_width - THUMB_PAD - 20.0,
+                        caption_y + (THUMB_CAPTION_H - 20.0) / 2.0,
                     ),
-                    NSSize::new(24.0, 24.0),
+                    NSSize::new(20.0, 20.0),
                 ),
+                6.0f64,
                 12.0f64,
-                13.0f64,
             )
         } else {
             (
@@ -2101,7 +2106,7 @@ pub(crate) fn create_card_view(
         let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
         let ta: *mut AnyObject = msg_send![ta, initWithRect: NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(24.0, 24.0)
+            NSSize::new(20.0, 20.0)
         ), options: opts, owner: btn, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![btn, addTrackingArea: ta];
         release_obj(ta);
