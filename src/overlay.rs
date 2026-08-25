@@ -83,6 +83,9 @@ const SELECTED_CARD_LIFT: f64 = 1.0;
 pub(crate) static OVERLAY_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 pub(crate) static CONTAINER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 pub(crate) static STATUS_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 缩略图溢出时显示的原生竖向滚动条。
+/// Native vertical scroller shown when the thumbnail rows overflow the viewport.
+pub(crate) static THUMB_SCROLLER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// macOS 26+ 的 NSGlassEffectView 指针(用于设置热重载时重新应用玻璃属性)。
 /// Pointer to the NSGlassEffectView on macOS 26+ (used to re-apply glass properties on hot reload).
 pub(crate) static GLASS_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
@@ -95,14 +98,39 @@ pub(crate) static CARD_INDEX_MAP: LazyLock<Mutex<HashMap<usize, usize>>> =
 /// Global window-index range currently rendered in thumbnail mode; the authoritative
 /// window list is never truncated.
 static THUMB_VISIBLE_RANGE: Mutex<Option<Range<usize>>> = Mutex::new(None);
+/// 完整流式布局的稳定行范围,用于按行滚动和把选中项带回视口。
+/// Stable row ranges for the complete flow layout, used for row scrolling and keeping selection visible.
+static THUMB_ROW_RANGES: Mutex<Option<Vec<Range<usize>>>> = Mutex::new(None);
+/// 当前面板一次能显示的最大行数。
+/// Maximum number of rows visible in the current panel.
+static THUMB_MAX_ROWS: Mutex<usize> = Mutex::new(1);
+/// 当前滚动视口的首行,0 表示从 MRU 列表顶部开始。
+/// First row of the scrolling viewport; zero starts at the top of the MRU list.
+static THUMB_SCROLL_ROW: Mutex<usize> = Mutex::new(0);
+/// 当前滚动视口相对内容顶部的 point 偏移,支持卡片在边界处部分可见。
+/// Point offset from the top of the scrolling content, allowing cards to cross viewport edges smoothly.
+static THUMB_SCROLL_OFFSET: Mutex<f64> = Mutex::new(0.0);
+/// 当前完整布局允许的最大 point 偏移。
+/// Maximum point offset allowed by the current complete layout.
+static THUMB_SCROLL_MAX_OFFSET: Mutex<f64> = Mutex::new(0.0);
+/// 当前完整布局的行间距(卡片高度 + 行间距),供键盘整行导航复用。
+/// Current full-layout row pitch (card height + row gap), reused by whole-row keyboard navigation.
+static THUMB_SCROLL_ROW_PITCH: Mutex<f64> = Mutex::new(1.0);
+/// 更新滚动条外观时抑制 AppKit action 回调重入 show_overlay。
+/// Suppress AppKit action re-entry while synchronizing the scroller's appearance.
+static THUMB_SCROLLER_SYNCING: AtomicBool = AtomicBool::new(false);
 /// 连续上下导航保持的水平中心；水平切换、鼠标选择和新召唤时重置。
 /// Preferred horizontal center retained across consecutive vertical moves; reset
 /// by horizontal navigation, mouse selection, and a fresh summon.
 static THUMB_NAV_ANCHOR_X: Mutex<Option<f64>> = Mutex::new(None);
 type CardPlacementFrame = (usize, f64, f64, f64);
 /// Prevents hover-selection on the card under the cursor when the window first
-/// opens. Set to false in show_overlay(), flipped to true on first mouseMoved:.
+/// opens. Reset on a fresh summon and flipped to true on the first mouse move.
 pub(crate) static MOUSE_MOVED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn thumbnail_scroller() -> Option<ObjPtr> {
+    *THUMB_SCROLLER.lock().unwrap()
+}
 
 // ========== 卡片 ↔ 索引映射 / card <-> index map ==========
 
@@ -136,6 +164,76 @@ pub(crate) fn thumbnail_visible_range() -> Option<Range<usize>> {
 
 fn reset_thumbnail_visible_range() {
     *THUMB_VISIBLE_RANGE.lock().unwrap() = None;
+    *THUMB_ROW_RANGES.lock().unwrap() = None;
+}
+
+fn reset_thumbnail_scroll() {
+    *THUMB_SCROLL_ROW.lock().unwrap() = 0;
+    *THUMB_SCROLL_OFFSET.lock().unwrap() = 0.0;
+    *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = 0.0;
+    *THUMB_SCROLL_ROW_PITCH.lock().unwrap() = 1.0;
+}
+
+/// 让选中项所在行进入视口;已在视口时不改变用户通过滚轮选择的滚动位置。
+/// Bring the selected item into view; leave a user-scrolled viewport alone when it already contains it.
+fn ensure_thumbnail_selection_visible(selected: usize) -> bool {
+    let rows = THUMB_ROW_RANGES.lock().unwrap().clone();
+    let Some(rows) = rows else {
+        return false;
+    };
+    let max_rows = (*THUMB_MAX_ROWS.lock().unwrap()).max(1);
+    let Some(selected_row) = rows.iter().position(|range| range.contains(&selected)) else {
+        return false;
+    };
+    let mut scroll_row = THUMB_SCROLL_ROW.lock().unwrap();
+    let current = *scroll_row;
+    let next = scroll_start_for_selection(current, selected_row, max_rows);
+    let changed = next != current;
+    *scroll_row = next;
+    if changed {
+        let row_pitch = *THUMB_SCROLL_ROW_PITCH.lock().unwrap();
+        *THUMB_SCROLL_OFFSET.lock().unwrap() = next as f64 * row_pitch;
+    }
+    changed
+}
+
+/// 选择项越过当前视口边缘时只移动一行,保留上一视口的重叠行。
+/// Move only one row when selection crosses a viewport edge, preserving one overlapping row.
+fn scroll_start_for_selection(current: usize, selected_row: usize, max_rows: usize) -> usize {
+    let max_rows = max_rows.max(1);
+    if selected_row < current {
+        selected_row
+    } else if selected_row >= current + max_rows {
+        selected_row + 1 - max_rows
+    } else {
+        current
+    }
+}
+
+/// 以 point 偏移移动缩略图视口,滚轮和触控板都通过此路径获得连续滚动。
+/// Move the thumbnail viewport by a point offset; both mouse wheels and trackpads use this path
+/// for continuous scrolling.
+fn scroll_thumbnail_by_offset(delta: f64) {
+    if !delta.is_finite() || delta.abs() < f64::EPSILON {
+        return;
+    }
+    let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
+    let mut offset = THUMB_SCROLL_OFFSET.lock().unwrap();
+    let next = (*offset + delta).clamp(0.0, max_offset);
+    if (next - *offset).abs() < f64::EPSILON {
+        return;
+    }
+    *offset = next;
+    drop(offset);
+    show_overlay();
+    // 滚动后重新命中固定指针下的卡片;滚动条本身不会参与卡片命中。
+    // Re-hit-test the card under the stationary pointer after scrolling; the scrollbar itself is
+    // never treated as a card.
+    container_mouse_moved(
+        std::ptr::null_mut(),
+        sel!(mouseMoved:),
+        std::ptr::null_mut(),
+    );
 }
 
 fn reset_thumbnail_nav_anchor() {
@@ -206,6 +304,7 @@ mod tests {
     use super::display_title;
     use super::edge_row_nav_index;
     use super::horizontal_nav_index;
+    use super::scroll_start_for_selection;
     use super::vertical_nav_index;
 
     /// 构造一行卡片的 rects:y 固定,x 依次排开(宽 100 间距 10)。
@@ -237,6 +336,16 @@ mod tests {
         assert_eq!(horizontal_nav_index(4, 5, true), 3);
         assert_eq!(horizontal_nav_index(0, 5, true), 4);
         assert_eq!(horizontal_nav_index(0, 0, true), 0);
+    }
+
+    #[test]
+    fn selection_scrolls_one_row_with_overlap_at_viewport_edges() {
+        assert_eq!(scroll_start_for_selection(0, 0, 3), 0);
+        assert_eq!(scroll_start_for_selection(0, 2, 3), 0);
+        assert_eq!(scroll_start_for_selection(0, 3, 3), 1);
+        assert_eq!(scroll_start_for_selection(1, 6, 3), 4);
+        assert_eq!(scroll_start_for_selection(4, 3, 3), 3);
+        assert_eq!(scroll_start_for_selection(4, 5, 3), 4);
     }
 
     #[test]
@@ -391,7 +500,10 @@ fn step_switcher(backward: bool) {
         };
         drop(state_opt);
         reset_thumbnail_visible_range();
+        reset_thumbnail_scroll();
         reset_thumbnail_nav_anchor();
+        MOUSE_MOVED.store(false, Ordering::Relaxed);
+        *HOVER_TICK_POS.lock().unwrap() = None;
         show_overlay();
         // TIMING-DEBUG 端到端:tap 回调 → collect_windows → show_overlay 完成。
         log_debug!("[overlay] summon e2e={}ms", t_end.elapsed().as_millis());
@@ -433,6 +545,9 @@ fn refresh_after_selection_change(backfill_icons: bool) {
                 .is_some_and(|range| range.contains(&index))
         });
     if needs_relayout {
+        if let Some(index) = selected {
+            ensure_thumbnail_selection_visible(index);
+        }
         show_overlay();
         return;
     }
@@ -640,8 +755,7 @@ unsafe fn collect_card_rects() -> Vec<(usize, f64, f64, f64)> {
     let mut out: Vec<(usize, f64, f64, f64)> = Vec::new();
     for i in 0..count {
         let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-        let is_label: bool = msg_send![sv, isKindOfClass: class!(NSTextField)];
-        if is_label {
+        if is_overlay_non_card_subview(sv) {
             continue;
         }
         let idx = get_card_index(sv);
@@ -750,8 +864,12 @@ unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool
     if let Some(index) = vertical_nav_index(rects, state.selected, up, anchor_x) {
         state.selected = index;
         drop(state_opt);
-        refresh_highlight();
-        update_status_label();
+        if ensure_thumbnail_selection_visible(index) {
+            show_overlay();
+        } else {
+            refresh_highlight();
+            update_status_label();
+        }
         return;
     }
 
@@ -770,6 +888,7 @@ unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool
     state.selected = provisional;
     drop(state_opt);
 
+    ensure_thumbnail_selection_visible(provisional);
     show_overlay();
     let next_rects = collect_card_rects();
     if let Some(index) = edge_row_nav_index(&next_rects, !up, anchor_x) {
@@ -938,6 +1057,105 @@ pub(crate) extern "C" fn container_accepts_first_responder(_self: *mut c_void, _
     true
 }
 
+/// 缩略图模式接收鼠标滚轮和触控板滚动,保留 point 级增量而不是量化为整行。
+/// Handle mouse-wheel and trackpad scrolling in thumbnail mode, preserving point-level deltas
+/// instead of quantizing them to whole rows.
+pub(crate) extern "C" fn container_scroll_wheel(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    if !crate::theme::thumbnails_enabled() {
+        return;
+    }
+    unsafe {
+        let delta_y: f64 = msg_send![event as *mut AnyObject, scrollingDeltaY];
+        if delta_y.abs() < f64::EPSILON {
+            return;
+        }
+        let precise: bool = msg_send![event as *mut AnyObject, hasPreciseScrollingDeltas];
+        if precise {
+            scroll_thumbnail_by_offset(-delta_y);
+        } else {
+            // 离散鼠标滚轮仍按一个小的 point 步长前进,而不是直接跳到下一行。
+            // Discrete mouse wheels still advance by a small point step instead of jumping to the
+            // next row immediately.
+            const DISCRETE_SCROLL_STEP: f64 = 40.0;
+            scroll_thumbnail_by_offset(-delta_y.signum() * DISCRETE_SCROLL_STEP);
+        }
+    }
+}
+
+/// NSScroller action 回调:把 0..1 的滚动条位置映射为完整布局中的 point 偏移。
+/// NSScroller action callback: map the 0..1 knob position to a point offset in the full layout.
+pub(crate) extern "C" fn thumbnail_scroller_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    if !crate::theme::thumbnails_enabled() {
+        return;
+    }
+    if THUMB_SCROLLER_SYNCING.load(Ordering::Acquire) {
+        return;
+    }
+    unsafe {
+        let value: f32 = msg_send![sender as *mut AnyObject, floatValue];
+        let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
+        let next = f64::from(value).clamp(0.0, 1.0) * max_offset;
+        let mut offset = THUMB_SCROLL_OFFSET.lock().unwrap();
+        if (*offset - next).abs() < f64::EPSILON {
+            return;
+        }
+        *offset = next;
+        drop(offset);
+        show_overlay();
+        container_mouse_moved(
+            std::ptr::null_mut(),
+            sel!(mouseMoved:),
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+unsafe fn is_overlay_non_card_subview(view: *mut AnyObject) -> bool {
+    let is_label: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
+    let is_scroller: bool = msg_send![view, isKindOfClass: class!(NSScroller)];
+    is_label || is_scroller
+}
+
+/// 更新滚动条的轨道、滑块比例和当前位置;无溢出时完全隐藏,避免干扰旧布局。
+/// Update the scroller track, knob proportion, and position; hide it without overflow so the
+/// legacy layout is unaffected.
+unsafe fn update_thumbnail_scroller(
+    panel_w: f64,
+    panel_h: f64,
+    overflowed: bool,
+    row_count: usize,
+    max_rows: usize,
+    scroll_offset: f64,
+    max_scroll_offset: f64,
+) {
+    let Some(scroller) = thumbnail_scroller() else {
+        return;
+    };
+    if !overflowed || row_count <= max_rows || max_rows == 0 {
+        let _: () = msg_send![scroller.0, setHidden: true];
+        return;
+    }
+    let frame = NSRect::new(
+        NSPoint::new(panel_w - H_PADDING - THUMB_SCROLLBAR_W, 0.0),
+        NSSize::new(THUMB_SCROLLBAR_W, (panel_h - STATUS_H).max(1.0)),
+    );
+    let _: () = msg_send![scroller.0, setFrame: frame];
+    THUMB_SCROLLER_SYNCING.store(true, Ordering::Release);
+    let _: () = msg_send![scroller.0, setKnobProportion: (max_rows as f64 / row_count as f64).clamp(0.05, 1.0)];
+    let fraction = if max_scroll_offset <= 0.0 {
+        0.0
+    } else {
+        (scroll_offset / max_scroll_offset).clamp(0.0, 1.0) as f32
+    };
+    let _: () = msg_send![scroller.0, setFloatValue: fraction];
+    THUMB_SCROLLER_SYNCING.store(false, Ordering::Release);
+    let _: () = msg_send![scroller.0, setHidden: false];
+}
+
 /// borderless 浮窗重写:允许成为 key 窗口(否则收不到键盘事件)。
 /// Override for the borderless overlay window: allow it to become key (otherwise it
 /// receives no keyboard events).
@@ -966,14 +1184,18 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
             Some(c) => c.0,
             None => return,
         };
+        let container_frame: NSRect = msg_send![container, frame];
+        let loc = NSPoint::new(
+            loc.x - container_frame.origin.x,
+            loc.y - container_frame.origin.y,
+        );
         let subviews: *mut AnyObject = msg_send![container, subviews];
         let sv_count: usize = msg_send![subviews, count];
         for i in 0..sv_count {
             let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
             // 跳过状态栏 label(与 refresh_highlight 同款判断)。
             // Skip the status label (same check as refresh_highlight).
-            let is_label: bool = msg_send![sv, isKindOfClass: class!(NSTextField)];
-            if is_label {
+            if is_overlay_non_card_subview(sv) {
                 continue;
             }
             let frame: NSRect = msg_send![sv, frame];
@@ -1555,9 +1777,8 @@ pub(crate) fn refresh_highlight() {
 
         for i in 0..sv_count {
             let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            // Only operate on card views (skip status label which is NSTextField)
-            let is_nstextfield: bool = msg_send![sv, isKindOfClass: class!(NSTextField)];
-            if is_nstextfield {
+            // Only operate on card views (skip the status label and scrollbar).
+            if is_overlay_non_card_subview(sv) {
                 continue;
             }
             let layer: *mut AnyObject = msg_send![sv, layer];
@@ -1796,8 +2017,7 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
         let mut replacements: Vec<(*mut AnyObject, NSRect, usize)> = Vec::new();
         for i in 0..sv_count {
             let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            let is_label: bool = msg_send![sv, isKindOfClass: class!(NSTextField)];
-            if is_label {
+            if is_overlay_non_card_subview(sv) {
                 continue;
             }
             let idx = get_card_index(sv);
@@ -1873,8 +2093,7 @@ pub(crate) fn refresh_thumbnail_previews(indices: &[usize]) {
         let mut updated = 0usize;
         for i in 0..count {
             let card: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            let is_label: bool = msg_send![card, isKindOfClass: class!(NSTextField)];
-            if is_label {
+            if is_overlay_non_card_subview(card) {
                 continue;
             }
             let index = get_card_index(card);
@@ -2686,14 +2905,13 @@ pub(crate) fn show_overlay() {
         let state_opt = TAB_STATE.lock().unwrap();
         let state = state_opt.as_ref().unwrap();
         let count = state.windows.len();
-        let selected = state.selected;
         let windows = state.windows.clone();
         drop(state_opt);
 
         let window = OVERLAY_WINDOW.lock().unwrap().unwrap().0;
         let container = CONTAINER.lock().unwrap().unwrap().0;
 
-        // Remove old card subviews (keep status label)
+        // Remove old card subviews (keep the status label and scrollbar).
         let subviews: *mut AnyObject = msg_send![container, subviews];
         let sv_count: usize = msg_send![subviews, count];
         // Iterate in reverse since we're removing from the array
@@ -2701,8 +2919,7 @@ pub(crate) fn show_overlay() {
         while i > 0 {
             i -= 1;
             let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            let is_label: bool = msg_send![sv, isKindOfClass: class!(NSTextField)];
-            if !is_label {
+            if !is_overlay_non_card_subview(sv) {
                 let _: () = msg_send![sv, removeFromSuperview];
             }
         }
@@ -2720,18 +2937,18 @@ pub(crate) fn show_overlay() {
         // per create_card_view call.
         let thumbnail_capture_allowed = use_flow && crate::thumbnail::capture_allowed();
 
-        // (全局 index, x, y, w)——缩略图模式只产出当前稳定页面，纯图标模式仍产出全部窗口。
-        // (global index, x, y, w): thumbnail mode emits only the current stable page;
+        // (全局 index, x, y, w)——缩略图模式只产出当前滚动视口，纯图标模式仍产出全部窗口。
+        // (global index, x, y, w): thumbnail mode emits only the current scrolling viewport;
         // icon mode still emits every window.
+        let mut thumb_scroll_metrics: Option<(bool, usize, usize, f64, f64)> = None;
         let (h, w, placements, card_h_use): (f64, f64, Vec<CardPlacementFrame>, f64) = if use_flow {
-            // ===== 流式布局(缩略图模式):等高不等宽,平衡分行,行内居中 =====
+            // ===== 流式布局(缩略图模式):等高不等宽,单页平衡分行,溢出时优先填满前行 =====
             // 窗口宽高比决定卡宽;极端比例被 clamp_aspect 钳制;每行能容纳的
             // 卡片数随行内已占宽度自然变化。窗口总数先决定 1.0–1.5 尺寸，
-            // 换行不反向改变尺寸；放不下时使用固定页面边界。
-            // ===== Flow layout (thumbnail mode): uniform height, per-aspect widths
-            // ===== balanced into rows; per-row capacity varies naturally. Window count
-            // determines the 1.0-1.5 size before wrapping; overflow uses stable pages while
-            // the panel width follows the current page's widest row.
+            // 换行不反向改变尺寸；放不下时优先填满 MRU 前面的行,再进入固定最大宽度的连续滚动视口。
+            // ===== Flow layout (thumbnail mode): uniform height, per-aspect widths are balanced
+            // when they fit; overflow greedily fills leading MRU rows. Window count determines
+            // the 1.0-1.5 size before wrapping; the panel width stays at the screen budget.
             let gap = THUMB_ROW_GAP;
             let screen_inner = (screen_frame.size.width - H_PADDING * 2.0).max(160.0);
             // 缩略图模式按屏幕宽度的 92% 装箱，不再额外套 1240pt 上限；否则四张
@@ -2740,7 +2957,9 @@ pub(crate) fn show_overlay() {
             // cap; otherwise four standard cards (1242pt including gaps) can never
             // share a row, creating an unnecessary extra page on wide displays.
             let max_panel_w = (screen_frame.size.width * 0.92).max(160.0 + H_PADDING * 2.0);
-            let max_inner = (max_panel_w - H_PADDING * 2.0).min(screen_inner).max(160.0);
+            let max_inner = (max_panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W)
+                .min(screen_inner)
+                .max(160.0);
             let max_panel_h = (screen_visible.size.height * 0.85).max(240.0);
             let aspects: Vec<f64> = windows
                 .iter()
@@ -2753,16 +2972,41 @@ pub(crate) fn show_overlay() {
                     }
                 })
                 .collect();
-            let layout = plan_thumb_flow_layout(&aspects, selected, max_inner, max_panel_h, gap);
+            let scroll_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+            let layout = plan_thumb_scroll_layout(
+                &aspects,
+                max_inner,
+                max_panel_w,
+                max_panel_h,
+                gap,
+                THUMB_SCROLLBAR_W,
+                scroll_offset,
+            );
             *THUMB_VISIBLE_RANGE.lock().unwrap() = Some(layout.visible.clone());
+            *THUMB_ROW_RANGES.lock().unwrap() = Some(layout.row_ranges.clone());
+            *THUMB_MAX_ROWS.lock().unwrap() = layout.max_rows.max(1);
+            *THUMB_SCROLL_ROW.lock().unwrap() = layout.row_start;
+            *THUMB_SCROLL_OFFSET.lock().unwrap() =
+                scroll_offset.clamp(0.0, layout.max_scroll_offset);
+            *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = layout.max_scroll_offset;
+            *THUMB_SCROLL_ROW_PITCH.lock().unwrap() = layout.card_h + gap;
+            thumb_scroll_metrics = Some((
+                layout.overflowed,
+                layout.row_ranges.len(),
+                layout.max_rows,
+                scroll_offset.clamp(0.0, layout.max_scroll_offset),
+                layout.max_scroll_offset,
+            ));
             log_debug!(
-                "[overlay] flow scale={:.2} visible={}..{} of {} page={}/{} overflow={}",
+                "[overlay] flow scale={:.2} visible={}..{} of {} offset={:.1} row={} rows={} visible_rows={} overflow={}",
                 layout.scale,
                 layout.visible.start,
                 layout.visible.end,
                 windows.len(),
-                layout.page_index + 1,
-                layout.page_count,
+                scroll_offset,
+                layout.row_start,
+                layout.row_ranges.len(),
+                layout.max_rows,
                 layout.overflowed
             );
             let placements = layout
@@ -2773,6 +3017,8 @@ pub(crate) fn show_overlay() {
             (layout.panel_h, layout.panel_w, placements, layout.card_h)
         } else {
             reset_thumbnail_visible_range();
+            reset_thumbnail_scroll();
+            *THUMB_MAX_ROWS.lock().unwrap() = 1;
             // ===== 旧版均匀网格(纯图标模式)=====
             // 窗口宽按「槽位」计算:最少 3 个槽位(count<3 时也保持三卡宽,空窗口态同样)。
             // 槽位 = min(每行卡数配置, max(3, count))。
@@ -2846,13 +3092,19 @@ pub(crate) fn show_overlay() {
             }
 
             let card_frame = NSRect::new(
-                NSPoint::new(card_x, card_y),
+                NSPoint::new(card_x, card_y - STATUS_H),
                 NSSize::new(card_w_i, card_h_outer),
             );
             let _: () = msg_send![card, setFrame: card_frame];
 
             let _: () = msg_send![container, addSubview: card];
             release_obj(card); // container owns the card; drop create_card_view's alloc +1
+        }
+        // 卡片是后添加的,把滚动条重新置于最上层,否则右侧命中会被卡片吞掉。
+        // Cards are added after the scroller; bring it back to the front so the scrollbar
+        // receives clicks instead of a card underneath it.
+        if let Some(scroller) = thumbnail_scroller() {
+            let _: () = msg_send![container, addSubview: scroller.0];
         }
         let t_cards_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
@@ -2863,8 +3115,29 @@ pub(crate) fn show_overlay() {
 
         // wrapper / VFX view / container all have autoresizingMask = 18
         // (width + height sizable), so they resize automatically when the
-        // window frame changes. Just update the container explicitly.
-        let _: () = msg_send![container, setFrameSize: NSSize::new(w, h)];
+        // window frame changes. Keep the clip view above the status footer.
+        let _: () = msg_send![
+            container,
+            setFrame: NSRect::new(
+                NSPoint::new(0.0, STATUS_H),
+                NSSize::new(w, (h - STATUS_H).max(1.0))
+            )
+        ];
+        if let Some((overflowed, row_count, max_rows, scroll_offset, max_scroll_offset)) =
+            thumb_scroll_metrics
+        {
+            update_thumbnail_scroller(
+                w,
+                h,
+                overflowed,
+                row_count,
+                max_rows,
+                scroll_offset,
+                max_scroll_offset,
+            );
+        } else if let Some(scroller) = thumbnail_scroller() {
+            let _: () = msg_send![scroller.0, setHidden: true];
+        }
 
         // 状态栏文本必须在窗口/容器 resize 之后居中:update_status_label 按容器当前宽度
         // 计算 x,若在 resize 前调用会拿旧宽度(启动初为最大宽度、之后为上次召唤的宽度)
@@ -2875,15 +3148,6 @@ pub(crate) fn show_overlay() {
         // summon's width), leaving the text off-center once the container shrinks.
         update_status_label();
 
-        // Ignore initial mouse position - require a real mouse movement before
-        // hover-selection kicks in (matches native Cmd+Tab behaviour).
-        MOUSE_MOVED.store(false, Ordering::Relaxed);
-        // 轮询基准同步重置:否则上一次召唤残留的基准会让本次第一个 tick 误判"已移动"
-        // (召唤间隙鼠标动过),浮窗一打开就选中鼠标下的卡片(实测)。
-        // Reset the poll baseline too: a stale baseline from the previous summon would make
-        // the first tick of this summon misjudge "moved" (cursor moved between summons),
-        // selecting the card under the cursor the moment the overlay opens (verified).
-        *HOVER_TICK_POS.lock().unwrap() = None;
         let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
         // 召唤后刷新一次高亮/选中态:新卡片刚创建(⌫ 按钮默认隐藏),选中卡片的
         // 边框与 ⌫ 需要按当前选中项补上。

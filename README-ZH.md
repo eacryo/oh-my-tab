@@ -28,7 +28,7 @@
 - <img height="14" src="docs/icons/key.svg"> **键盘导航**:按下 Command/Option 后用 Tab、方向键或鼠标选择窗口。
 - <img height="14" src="docs/icons/zap.svg"> **轻量**:纯 Rust——1.5MB 体积、约 35MB 基础内存,内存缩略图缓存上限约 64MB,无 Electron/Tauri。
 - <img height="14" src="docs/icons/star.svg"> **Liquid Glass**:浮层效果(仅 macOS 26)。
-- <img height="14" src="docs/icons/image.svg"> **窗口缩略图**:Alt-Tab 风格卡片——标题行(迷你应用图标 + 窗口标题 + 关闭按钮)在上方,下方为 16:10 实时预览(经私有 WindowServer API 截取);缓存旧帧即时显示、后台异步刷新;等高、不等宽的比例卡片平衡排列并逐行居中。缩略图的 1.0–1.5 倍尺寸只由窗口总数决定,换行不会改变尺寸;大量窗口使用稳定分页、空间方向键导航和 Shift+Tab 反向切换。需要**屏幕录制**权限——未授权时自动回退为纯图标卡片。
+- <img height="14" src="docs/icons/image.svg"> **窗口缩略图**:Alt-Tab 风格卡片——标题行(迷你应用图标 + 窗口标题 + 关闭按钮)在上方,下方为 16:10 实时预览(经私有 WindowServer API 截取);缓存旧帧即时显示、后台异步刷新;等高、不等宽的比例卡片在单页时平衡排列并逐行居中,发生溢出时优先填满 MRU 前面的行并连续滚动。缩略图的 1.0–1.5 倍尺寸只由窗口总数决定,换行不会改变尺寸;空间方向键导航和 Shift+Tab 反向切换在滚动时保持稳定。需要**屏幕录制**权限——未授权时自动回退为纯图标卡片。
 - <img height="14" src="docs/icons/history.svg"> **窗口级 MRU**:切到某个窗口不会把该应用的其他窗口一起带前。
 - <img height="14" src="docs/icons/eye.svg"> **完整窗口可见**:所有真实窗口,含离屏与最小化(可开关)。
 - <img height="14" src="docs/icons/gear.svg"> **TOML 热重载**:配置经校验,菜单一键生效。

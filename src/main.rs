@@ -549,10 +549,10 @@ fn create_overlay_window() -> *mut AnyObject {
         }
 
         // --- Container view for cards ---
-        // Register OhMyTabContainerView : NSView
+        // Register OhMyTabContainerView : NSClipView
         let container_cls = {
             let name = CString::new("OhMyTabContainerView").unwrap();
-            let superclass = class!(NSView) as *const _ as *mut AnyObject;
+            let superclass = class!(NSClipView) as *const _ as *mut AnyObject;
             let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
             let types_v_obj = CString::new("v@:@").unwrap();
             let types_bool = CString::new("B@:").unwrap();
@@ -580,13 +580,32 @@ fn create_overlay_window() -> *mut AnyObject {
                 container_mouse_moved as *mut c_void,
                 types_v_obj.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(scrollWheel:),
+                container_scroll_wheel as *mut c_void,
+                types_v_obj.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(thumbnailScrollerChanged:),
+                thumbnail_scroller_changed as *mut c_void,
+                types_v_obj.as_ptr(),
+            );
             objc_registerClassPair(cls);
             cls
         };
 
         let container: *mut AnyObject = msg_send![container_cls, alloc];
-        let container: *mut AnyObject = msg_send![container, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
+        // 卡片容器只覆盖状态栏以上的区域,NSClipView 会裁掉连续滚动时越过边界的卡片。
+        // The card container covers only the area above the status footer; NSClipView clips cards
+        // as they move continuously across the viewport edges.
+        let container: *mut AnyObject = msg_send![container, initWithFrame: NSRect::new(
+            NSPoint::new(0.0, STATUS_H),
+            NSSize::new(w, (h - STATUS_H).max(1.0))
+        )];
         let _: () = msg_send![container, setAutoresizingMask: 18u64];
+        let _: () = msg_send![container, setDrawsBackground: false];
         let _: () = msg_send![content_parent, addSubview: container];
         *CONTAINER.lock().unwrap() = Some(ObjPtr(container));
 
@@ -597,8 +616,26 @@ fn create_overlay_window() -> *mut AnyObject {
         };
         let status_color = hex_to_ns_color(0x999999ff);
         let status_label = make_centered_label("", status_font, status_color, 0.0, w, STATUS_H);
-        let _: () = msg_send![container, addSubview: status_label];
+        let _: () = msg_send![content_parent, addSubview: status_label];
         *STATUS_LABEL.lock().unwrap() = Some(ObjPtr(status_label));
+
+        // 缩略图溢出时使用悬浮式原生滚动条,避免 Legacy 样式绘制贯穿面板的完整轨道。
+        // Use an overlay-style native scroller for thumbnail overflow, avoiding the full-height
+        // track drawn by the Legacy style.
+        let scroller: *mut AnyObject = msg_send![class!(NSScroller), alloc];
+        let scroller: *mut AnyObject = msg_send![
+            scroller,
+            initWithFrame: NSRect::new(
+                NSPoint::new(w - H_PADDING - THUMB_SCROLLBAR_W, 0.0),
+                NSSize::new(THUMB_SCROLLBAR_W, (h - STATUS_H).max(1.0))
+            )
+        ];
+        let _: () = msg_send![scroller, setScrollerStyle: 1isize]; // NSScrollerStyleOverlay
+        let _: () = msg_send![scroller, setTarget: container];
+        let _: () = msg_send![scroller, setAction: sel!(thumbnailScrollerChanged:)];
+        let _: () = msg_send![scroller, setHidden: true];
+        let _: () = msg_send![container, addSubview: scroller];
+        *THUMB_SCROLLER.lock().unwrap() = Some(ObjPtr(scroller));
 
         window
     }
@@ -1326,11 +1363,11 @@ fn main() {
     });
 
     // 冒烟测试入口(--smoke-overlay):完整初始化后直接驱动召唤路径，再遍历并循环
-    // 一次窗口列表并反向一步，覆盖超量布局的稳定分页/双向回绕；随后泵 2 秒主 runloop 让异步
+    // 一次窗口列表并反向一步，覆盖超量布局的连续滚动/双向回绕；随后泵 2 秒主 runloop 让异步
     // 缩略图投递(thumbnailReady)落地，无崩溃 exit(0)。用于无头验证 Cmd+Tab
     // 链路(合成按键到不了 CGEventTap，无法从外部触发)。
     // Smoke-test entry (--smoke-overlay): after full init, drive a summon directly,
-    // then traverse, wrap, and step backward once to cover stable bidirectional paging. Pump
+    // then traverse, wrap, and step backward once to cover continuous scrolling and bidirectional navigation. Pump
     // the main runloop for 2s so async thumbnail deliveries (thumbnailReady) land,
     // and exit(0) on survival. Synthetic keystrokes never reach the CGEventTap, so
     // this path must be driven internally.
@@ -1361,6 +1398,20 @@ fn main() {
                 sel!(handleCmdShiftTabPressed:),
                 std::ptr::null_mut(),
             );
+            // 直接驱动滚动条 action,覆盖小数位置、拖动映射与底部行钳制;真实滚轮/触控板仍由
+            // container 的 scrollWheel: 路径处理。
+            // Drive the scroller action through a fractional position and the bottom clamp;
+            // real wheel/trackpad input still enters through container's scrollWheel: method.
+            if let Some(scroller) = thumbnail_scroller() {
+                for fraction in [0.35f32, 1.0f32] {
+                    let _: () = msg_send![scroller.0, setFloatValue: fraction];
+                    thumbnail_scroller_changed(
+                        std::ptr::null_mut(),
+                        sel!(thumbnailScrollerChanged:),
+                        scroller.0 as *mut c_void,
+                    );
+                }
+            }
             let rl: *mut AnyObject = msg_send![class!(NSRunLoop), currentRunLoop];
             let date: *mut AnyObject =
                 msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 2.0f64];

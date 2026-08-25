@@ -133,6 +133,9 @@ pub(crate) const THUMB_CARD_BASE_W: f64 = 300.0;
 /// 流式布局行间距(设计稿 .grid gap 14px)。
 /// Flow-layout row/inter-card gap (the mockup's .grid gap of 14px).
 pub(crate) const THUMB_ROW_GAP: f64 = 14.0;
+/// 滚动缩略图视口右侧滚动条的保留宽度。
+/// Width reserved for the scrollbar at the right edge of the scrolling thumbnail viewport.
+pub(crate) const THUMB_SCROLLBAR_W: f64 = 14.0;
 /// 卡片内边距(设计稿 .item padding 8px)。/ Card inner padding (.item padding 8px).
 pub(crate) const THUMB_PAD: f64 = 8.0;
 /// 标题行高(设计稿 .caption 34px 含 7px 底距,取净高 24)。/ Caption row height.
@@ -267,6 +270,39 @@ pub(crate) fn pack_rows(widths: &[f64], max_inner_w: f64, gap: f64) -> Vec<Vec<u
     rows
 }
 
+/// 溢出滚动时按 MRU 顺序贪心填充每一行,优先让初始视口容纳最多窗口。
+/// Greedy MRU-order packing for overflow scrolling, prioritizing the most windows in the initial viewport.
+fn pack_rows_greedy(widths: &[f64], max_inner_w: f64, gap: f64) -> Vec<Vec<usize>> {
+    if widths.is_empty() {
+        return vec![Vec::new()];
+    }
+    let max_inner_w = max_inner_w.max(1.0);
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut row_w = 0.0;
+
+    for (index, &width) in widths.iter().enumerate() {
+        let next_w = if row.is_empty() {
+            width
+        } else {
+            row_w + gap + width
+        };
+        if !row.is_empty() && next_w > max_inner_w + 1e-9 {
+            rows.push(row);
+            row = Vec::new();
+            row_w = 0.0;
+        }
+        if row.is_empty() {
+            row_w = width;
+        } else {
+            row_w += gap + width;
+        }
+        row.push(index);
+    }
+    rows.push(row);
+    rows
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ThumbPlacement {
     pub(crate) index: usize,
@@ -286,6 +322,12 @@ pub(crate) struct ThumbFlowLayout {
     pub(crate) overflowed: bool,
     pub(crate) page_index: usize,
     pub(crate) page_count: usize,
+    /// 完整流式布局的行范围;滚动模式按这些稳定行切换视口。
+    /// Complete flow-layout row ranges; scrolling mode moves the viewport by these stable rows.
+    pub(crate) row_ranges: Vec<Range<usize>>,
+    pub(crate) row_start: usize,
+    pub(crate) max_rows: usize,
+    pub(crate) max_scroll_offset: f64,
 }
 
 fn thumb_widths(aspects: &[f64], range: &Range<usize>, card_h: f64, max_inner: f64) -> Vec<f64> {
@@ -311,6 +353,7 @@ struct ThumbFlowConstraints {
     gap: f64,
 }
 
+#[cfg(test)]
 fn thumb_range_fits(
     aspects: &[f64],
     range: &Range<usize>,
@@ -325,6 +368,7 @@ fn thumb_range_fits(
         <= constraints.max_rows
 }
 
+#[cfg(test)]
 fn maximal_prefix(
     aspects: &[f64],
     start: usize,
@@ -342,6 +386,7 @@ fn maximal_prefix(
     start.min(end)..end
 }
 
+#[cfg(test)]
 fn stable_pages(aspects: &[f64], constraints: ThumbFlowConstraints) -> Vec<Range<usize>> {
     if aspects.is_empty() {
         return std::iter::once(0..0).collect();
@@ -356,6 +401,7 @@ fn stable_pages(aspects: &[f64], constraints: ThumbFlowConstraints) -> Vec<Range
     pages
 }
 
+#[cfg(test)]
 fn build_thumb_layout(
     aspects: &[f64],
     visible: Range<usize>,
@@ -401,6 +447,10 @@ fn build_thumb_layout(
         )
     };
     let mut placements = Vec::with_capacity(visible.len());
+    let row_ranges = rows
+        .iter()
+        .filter_map(|row| Some(visible.start + row.first()?..visible.start + row.last()? + 1))
+        .collect::<Vec<_>>();
     for (row_index, row) in rows.iter().enumerate() {
         if row.is_empty() {
             continue;
@@ -430,6 +480,118 @@ fn build_thumb_layout(
         overflowed,
         page_index,
         page_count,
+        row_ranges,
+        row_start: 0,
+        max_rows: constraints.max_rows,
+        max_scroll_offset: 0.0,
+    }
+}
+
+/// 以完整窗口列表进行一次稳定分行,再只取连续的可见行构建视口。
+/// Pack the complete window list once, then build the viewport from a contiguous slice of rows.
+fn build_thumb_scroll_layout(
+    all_rows: &[Vec<usize>],
+    widths: &[f64],
+    scale: f64,
+    constraints: ThumbFlowConstraints,
+    max_panel_w: f64,
+    scrollbar_w: f64,
+    scroll_offset: f64,
+) -> ThumbFlowLayout {
+    let overflowed = all_rows.len() > constraints.max_rows;
+    let viewport_row_count = if overflowed {
+        constraints.max_rows
+    } else {
+        all_rows.len().max(1)
+    };
+    let row_pitch = constraints.card_h + constraints.gap;
+    let total_content_h = all_rows.len().max(1) as f64 * constraints.card_h
+        + all_rows.len().saturating_sub(1) as f64 * constraints.gap;
+    let viewport_h = viewport_row_count as f64 * constraints.card_h
+        + viewport_row_count.saturating_sub(1) as f64 * constraints.gap;
+    let max_scroll_offset = (total_content_h - viewport_h).max(0.0);
+    let scroll_offset = scroll_offset.clamp(0.0, max_scroll_offset);
+    let max_row_start = all_rows.len().saturating_sub(viewport_row_count);
+    let row_start = if row_pitch > 0.0 {
+        (scroll_offset / row_pitch).floor() as usize
+    } else {
+        0
+    }
+    .min(max_row_start);
+    let intra_row_offset = (scroll_offset - row_start as f64 * row_pitch).max(0.0);
+    let has_partial_row = overflowed
+        && intra_row_offset > f64::EPSILON
+        && row_start + viewport_row_count < all_rows.len();
+    let rendered_row_count = viewport_row_count + usize::from(has_partial_row);
+    let row_end = (row_start + rendered_row_count).min(all_rows.len());
+    let visible = match (
+        all_rows.get(row_start),
+        all_rows.get(row_end.saturating_sub(1)),
+    ) {
+        (Some(first), Some(last)) => {
+            first.first().copied().unwrap_or(0)..last.last().map_or(0, |i| i + 1)
+        }
+        _ => 0..0,
+    };
+    let used_inner_w = all_rows
+        .iter()
+        .map(|row| {
+            row.iter().map(|&i| widths[i]).sum::<f64>()
+                + row.len().saturating_sub(1) as f64 * constraints.gap
+        })
+        .fold(0.0f64, f64::max);
+    let panel_w = if overflowed {
+        max_panel_w.max(used_inner_w + H_PADDING * 2.0 + scrollbar_w)
+    } else {
+        used_inner_w.max(280.0_f64.min(constraints.max_inner)) + H_PADDING * 2.0
+    };
+    let rendered_rows = viewport_row_count.max(1);
+    let panel_h = THUMB_TOP_INSET
+        + rendered_rows as f64 * constraints.card_h
+        + rendered_rows.saturating_sub(1) as f64 * constraints.gap
+        + STATUS_H;
+    let card_area_w = if overflowed {
+        (panel_w - scrollbar_w).max(1.0)
+    } else {
+        panel_w
+    };
+    let mut placements = Vec::with_capacity(visible.len());
+    for (local_row, row) in all_rows[row_start..row_end].iter().enumerate() {
+        let row_w = row.iter().map(|&i| widths[i]).sum::<f64>()
+            + row.len().saturating_sub(1) as f64 * constraints.gap;
+        let mut x = (card_area_w - row_w) / 2.0;
+        let y = panel_h
+            - THUMB_TOP_INSET
+            - (local_row as f64 + 1.0) * constraints.card_h
+            - local_row as f64 * constraints.gap
+            + intra_row_offset;
+        for &index in row {
+            placements.push(ThumbPlacement {
+                index,
+                x,
+                y,
+                width: widths[index],
+            });
+            x += widths[index] + constraints.gap;
+        }
+    }
+    ThumbFlowLayout {
+        panel_w,
+        panel_h,
+        card_h: constraints.card_h,
+        scale,
+        visible,
+        placements,
+        overflowed,
+        page_index: 0,
+        page_count: 1,
+        row_ranges: all_rows
+            .iter()
+            .filter_map(|row| Some(row.first().copied()?..row.last().copied()? + 1))
+            .collect(),
+        row_start,
+        max_rows: viewport_row_count,
+        max_scroll_offset,
     }
 }
 
@@ -438,6 +600,7 @@ fn build_thumb_layout(
 /// Plan the thumbnail grid: total window count first determines the 1.0–1.5 scale,
 /// then aspect-width cards are balanced into rows. Overflow retains that size and
 /// uses deterministic pages beginning at index zero.
+#[cfg(test)]
 pub(crate) fn plan_thumb_flow_layout(
     aspects: &[f64],
     selected: usize,
@@ -473,6 +636,49 @@ pub(crate) fn plan_thumb_flow_layout(
         page_count > 1,
         page_index,
         page_count,
+    )
+}
+
+/// 规划连续滚动的缩略图视口。单页时使用平衡分行;发生溢出时按 MRU 顺序优先填满前面的行,
+/// 让初始视口容纳最多窗口。完整分行结果保持不变,滚动偏移按 point 计算,因此卡片可以平滑地
+/// 经过视口边缘。
+/// Plan the continuous thumbnail viewport. Use balanced rows when everything fits; when it
+/// overflows, fill leading rows in MRU order so the initial viewport shows as many windows as
+/// possible. The complete row plan stays unchanged, while point-based scrolling lets cards pass
+/// smoothly through the viewport edges.
+pub(crate) fn plan_thumb_scroll_layout(
+    aspects: &[f64],
+    max_inner: f64,
+    max_panel_w: f64,
+    max_panel_h: f64,
+    gap: f64,
+    scrollbar_w: f64,
+    scroll_offset: f64,
+) -> ThumbFlowLayout {
+    let max_inner = max_inner.max(1.0);
+    let scale = thumb_scale_for_count(aspects.len());
+    let card_h = thumb_card_h_for_scale(scale);
+    let constraints = ThumbFlowConstraints {
+        card_h,
+        max_inner,
+        max_rows: thumb_max_rows(card_h, max_panel_h, gap),
+        gap,
+    };
+    let widths = thumb_widths(aspects, &(0..aspects.len()), card_h, max_inner);
+    let balanced_rows = pack_rows(&widths, max_inner, gap);
+    let rows = if balanced_rows.len() > constraints.max_rows {
+        pack_rows_greedy(&widths, max_inner, gap)
+    } else {
+        balanced_rows
+    };
+    build_thumb_scroll_layout(
+        &rows,
+        &widths,
+        scale,
+        constraints,
+        max_panel_w,
+        scrollbar_w,
+        scroll_offset,
     )
 }
 
@@ -777,5 +983,164 @@ mod flow_tests {
         assert_eq!(layout.visible, 0..0);
         assert_eq!(layout.scale, 1.0);
         assert!(layout.placements.is_empty());
+    }
+
+    #[test]
+    fn scrolling_layout_keeps_rows_and_panel_size_stable() {
+        let aspects = vec![1.6; 20];
+        let card_h = thumb_card_h_fixed();
+        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let first = plan_thumb_scroll_layout(
+            &aspects,
+            1288.0,
+            1400.0,
+            max_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            0.0,
+        );
+        let next = plan_thumb_scroll_layout(
+            &aspects,
+            1288.0,
+            1400.0,
+            max_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            card_h + THUMB_ROW_GAP,
+        );
+
+        assert!(first.overflowed);
+        assert_eq!(first.row_ranges.len(), 5);
+        assert_eq!(first.visible, 0..8);
+        assert_eq!(next.visible, 4..12);
+        assert_eq!(first.panel_w, next.panel_w);
+        assert_eq!(first.panel_h, next.panel_h);
+        assert_eq!(first.row_ranges, next.row_ranges);
+        assert_eq!(
+            next.placements
+                .iter()
+                .map(|placement| placement.index)
+                .collect::<Vec<_>>(),
+            (4..12).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scrolling_overflow_fills_the_initial_viewport_greedily() {
+        let aspects = vec![1.6; 13];
+        let card_h = thumb_card_h_fixed();
+        let max_h = THUMB_TOP_INSET + card_h * 3.0 + THUMB_ROW_GAP * 2.0 + STATUS_H + 0.1;
+        let layout = plan_thumb_scroll_layout(
+            &aspects,
+            1288.0,
+            1400.0,
+            max_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            0.0,
+        );
+
+        assert!(layout.overflowed);
+        assert_eq!(layout.row_ranges, vec![0..4, 4..8, 8..12, 12..13]);
+        assert_eq!(layout.visible, 0..12);
+    }
+
+    #[test]
+    fn scrolling_layout_keeps_balanced_packing_when_everything_fits() {
+        let aspects = vec![2.2, 0.7, 0.7];
+        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
+        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let layout = plan_thumb_scroll_layout(
+            &aspects,
+            800.0,
+            900.0,
+            max_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            0.0,
+        );
+
+        assert!(!layout.overflowed);
+        assert_eq!(layout.row_ranges, vec![0..1, 1..3]);
+        assert_eq!(layout.visible, 0..3);
+    }
+
+    #[test]
+    fn scrolling_layout_clamps_to_the_last_row() {
+        let aspects = vec![1.6; 20];
+        let card_h = thumb_card_h_fixed();
+        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let layout = plan_thumb_scroll_layout(
+            &aspects,
+            1288.0,
+            1400.0,
+            max_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            f64::MAX,
+        );
+        assert_eq!(layout.row_start, 3);
+        assert_eq!(layout.visible, 12..20);
+    }
+
+    #[test]
+    fn scrolling_layout_keeps_fractional_offset_and_renders_partial_row() {
+        let aspects = vec![1.6; 20];
+        let card_h = thumb_card_h_fixed();
+        let row_pitch = card_h + THUMB_ROW_GAP;
+        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let layout = plan_thumb_scroll_layout(
+            &aspects,
+            1288.0,
+            1400.0,
+            max_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            12.0,
+        );
+
+        assert_eq!(layout.row_start, 0);
+        assert_eq!(layout.visible, 0..12);
+        assert!(layout
+            .placements
+            .iter()
+            .any(|placement| placement.index == 8));
+        assert!(layout
+            .placements
+            .iter()
+            .any(|placement| placement.index == 11));
+        assert!(layout.max_scroll_offset > 12.0);
+
+        let before_row_boundary = plan_thumb_scroll_layout(
+            &aspects,
+            1288.0,
+            1400.0,
+            max_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            row_pitch - 1.0,
+        );
+        let at_row_boundary = plan_thumb_scroll_layout(
+            &aspects,
+            1288.0,
+            1400.0,
+            max_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            row_pitch,
+        );
+        let before_y = before_row_boundary
+            .placements
+            .iter()
+            .find(|placement| placement.index == 4)
+            .map(|placement| placement.y)
+            .unwrap();
+        let boundary_y = at_row_boundary
+            .placements
+            .iter()
+            .find(|placement| placement.index == 4)
+            .map(|placement| placement.y)
+            .unwrap();
+        assert!((boundary_y - before_y - 1.0).abs() < 1e-9);
     }
 }
