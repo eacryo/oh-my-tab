@@ -377,13 +377,15 @@ fn build_thumb_layout(
             row.iter().map(|&i| widths[i]).sum::<f64>() + row.len().saturating_sub(1) as f64 * gap
         })
         .fold(0.0f64, f64::max);
-    // 超量时固定为最大可用网格，不同页面的宽高比组成不会让面板来回跳动。
-    // Overflow uses the maximum grid footprint so differing aspect mixes across
-    // stable pages do not make the panel jump in size.
+    // 宽度始终跟随当前页最宽的一行；分页只固定页面边界和高度，不再为较窄页面
+    // 保留整块最大网格的空白。
+    // Width follows the widest row on the current page. Pagination still keeps stable
+    // page boundaries and height, but no longer reserves the full grid for narrower pages.
+    let panel_inner_w = used_inner_w.max(280.0_f64.min(max_inner));
     let (panel_w, panel_h) = if overflowed {
         let max_rows = constraints.max_rows;
         (
-            max_inner + H_PADDING * 2.0,
+            panel_inner_w + H_PADDING * 2.0,
             THUMB_TOP_INSET
                 + max_rows as f64 * card_h
                 + max_rows.saturating_sub(1) as f64 * gap
@@ -391,7 +393,7 @@ fn build_thumb_layout(
         )
     } else {
         (
-            used_inner_w.max(280.0_f64.min(max_inner)) + H_PADDING * 2.0,
+            panel_inner_w + H_PADDING * 2.0,
             THUMB_TOP_INSET
                 + n_rows as f64 * card_h
                 + n_rows.saturating_sub(1) as f64 * gap
@@ -655,15 +657,24 @@ mod flow_tests {
         let aspects = vec![1.6; 8];
         let base_h = thumb_card_h_fixed();
         let two_row_panel_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
-        let initial = plan_thumb_flow_layout(&aspects, 1, 614.0, two_row_panel_h, THUMB_ROW_GAP);
+        let initial = plan_thumb_flow_layout(&aspects, 1, 900.0, two_row_panel_h, THUMB_ROW_GAP);
         assert!(initial.overflowed);
         assert_eq!(initial.scale, 1.0);
         assert_eq!(initial.visible, 0..4);
+        // 两行各两张卡时，宽度按当前页最宽行收缩，而不是占满 900pt 预算。
+        // With two rows of two cards, width follows the widest actual row instead of
+        // consuming the full 900pt packing budget.
+        assert_eq!(
+            initial.panel_w,
+            2.0 * 300.0 + THUMB_ROW_GAP + H_PADDING * 2.0
+        );
 
-        let next = plan_thumb_flow_layout(&aspects, 4, 614.0, two_row_panel_h, THUMB_ROW_GAP);
+        let next = plan_thumb_flow_layout(&aspects, 4, 900.0, two_row_panel_h, THUMB_ROW_GAP);
         assert_eq!(next.visible, 4..8);
         assert_eq!(next.page_index, 1);
         assert_eq!(next.page_count, 2);
+        assert_eq!(next.panel_w, initial.panel_w);
+        assert_eq!(next.panel_h, initial.panel_h);
         assert_eq!(
             next.placements
                 .iter()
@@ -671,6 +682,34 @@ mod flow_tests {
                 .collect::<Vec<_>>(),
             vec![4, 5, 6, 7]
         );
+    }
+
+    #[test]
+    fn wide_thumbnail_budget_fits_four_columns_without_changing_height() {
+        let aspects = vec![1.6; 12];
+        let card_h = thumb_card_h_fixed();
+        let three_row_panel_h =
+            THUMB_TOP_INSET + card_h * 3.0 + THUMB_ROW_GAP * 2.0 + STATUS_H + 0.1;
+        let capped = plan_thumb_flow_layout(
+            &aspects,
+            1,
+            1240.0 - H_PADDING * 2.0,
+            three_row_panel_h,
+            THUMB_ROW_GAP,
+        );
+        let wide = plan_thumb_flow_layout(&aspects, 1, 1288.0, three_row_panel_h, THUMB_ROW_GAP);
+
+        // 旧上限下每行只能放三张；放宽横向预算后四列可用，12 张保持一页。
+        // Under the old cap only three cards fit per row; with the wider budget four
+        // columns fit and all twelve cards remain on one page.
+        assert_eq!(capped.visible, 0..9);
+        assert!(capped.overflowed);
+        assert_eq!(wide.visible, 0..12);
+        assert!(!wide.overflowed);
+        assert_eq!(wide.page_count, 1);
+        // 只改变横向容量，三行高度应保持一致。
+        // Only horizontal capacity changes; the three-row height remains identical.
+        assert_eq!(wide.panel_h, capped.panel_h);
     }
 
     #[test]

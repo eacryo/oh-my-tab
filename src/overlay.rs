@@ -2730,13 +2730,17 @@ pub(crate) fn show_overlay() {
             // 换行不反向改变尺寸；放不下时使用固定页面边界。
             // ===== Flow layout (thumbnail mode): uniform height, per-aspect widths
             // ===== balanced into rows; per-row capacity varies naturally. Window count
-            // determines the 1.0-1.5 size before wrapping; overflow uses stable pages.
+            // determines the 1.0-1.5 size before wrapping; overflow uses stable pages while
+            // the panel width follows the current page's widest row.
             let gap = THUMB_ROW_GAP;
             let screen_inner = (screen_frame.size.width - H_PADDING * 2.0).max(160.0);
-            let max_inner = (screen_inner * 0.92)
-                .min(1240.0 - H_PADDING * 2.0)
-                .min(screen_inner)
-                .max(160.0);
+            // 缩略图模式按屏幕宽度的 92% 装箱，不再额外套 1240pt 上限；否则四张
+            // 标准卡(1242pt 含间距)永远无法同排，宽屏上会无意义地多出一页。
+            // Thumbnail mode packs against 92% of the screen without another 1240pt
+            // cap; otherwise four standard cards (1242pt including gaps) can never
+            // share a row, creating an unnecessary extra page on wide displays.
+            let max_panel_w = (screen_frame.size.width * 0.92).max(160.0 + H_PADDING * 2.0);
+            let max_inner = (max_panel_w - H_PADDING * 2.0).min(screen_inner).max(160.0);
             let max_panel_h = (screen_visible.size.height * 0.85).max(240.0);
             let aspects: Vec<f64> = windows
                 .iter()
