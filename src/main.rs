@@ -586,11 +586,49 @@ fn create_overlay_window() -> *mut AnyObject {
                 container_scroll_wheel as *mut c_void,
                 types_v_obj.as_ptr(),
             );
+            objc_registerClassPair(cls);
+            cls
+        };
+
+        // 自定义滚动条由 NSView 显式处理拖拽,避免非激活面板中的 NSScroller 原生 tracking 失效。
+        // The custom scrollbar handles dragging explicitly, avoiding native NSScroller tracking
+        // failures inside the nonactivating panel.
+        let scroller_cls = {
+            let name = CString::new("OhMyTabThumbnailScrollIndicator").unwrap();
+            let superclass = class!(NSView) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types_rect = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
             class_addMethod(
                 cls,
-                sel!(thumbnailScrollerChanged:),
-                thumbnail_scroller_changed as *mut c_void,
-                types_v_obj.as_ptr(),
+                sel!(drawRect:),
+                thumbnail_scroller_draw_rect as *mut c_void,
+                types_rect.as_ptr(),
+            );
+            let types_mouse = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseDown:),
+                thumbnail_scroller_mouse_down as *mut c_void,
+                types_mouse.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseDragged:),
+                thumbnail_scroller_mouse_dragged as *mut c_void,
+                types_mouse.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseUp:),
+                thumbnail_scroller_mouse_up as *mut c_void,
+                types_mouse.as_ptr(),
+            );
+            let types_accepts_first_mouse = CString::new("B@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(acceptsFirstMouse:),
+                thumbnail_scroller_accepts_first_mouse as *mut c_void,
+                types_accepts_first_mouse.as_ptr(),
             );
             objc_registerClassPair(cls);
             cls
@@ -619,22 +657,20 @@ fn create_overlay_window() -> *mut AnyObject {
         let _: () = msg_send![content_parent, addSubview: status_label];
         *STATUS_LABEL.lock().unwrap() = Some(ObjPtr(status_label));
 
-        // 缩略图溢出时使用悬浮式原生滚动条,避免 Legacy 样式绘制贯穿面板的完整轨道。
-        // Use an overlay-style native scroller for thumbnail overflow, avoiding the full-height
-        // track drawn by the Legacy style.
-        let scroller: *mut AnyObject = msg_send![class!(NSScroller), alloc];
+        // 指示器放在卡片容器外层,卡片重建不会改变它的 z-order 或中断显式拖拽。
+        // Keep the indicator above the card container; rebuilding cards cannot change its z-order
+        // or interrupt explicit dragging.
+        let scroller: *mut AnyObject = msg_send![scroller_cls, alloc];
         let scroller: *mut AnyObject = msg_send![
             scroller,
             initWithFrame: NSRect::new(
-                NSPoint::new(w - H_PADDING - THUMB_SCROLLBAR_W, 0.0),
+                NSPoint::new(w - H_PADDING - THUMB_SCROLLBAR_W, STATUS_H),
                 NSSize::new(THUMB_SCROLLBAR_W, (h - STATUS_H).max(1.0))
             )
         ];
-        let _: () = msg_send![scroller, setScrollerStyle: 1isize]; // NSScrollerStyleOverlay
-        let _: () = msg_send![scroller, setTarget: container];
-        let _: () = msg_send![scroller, setAction: sel!(thumbnailScrollerChanged:)];
+        let _: () = msg_send![scroller, setWantsLayer: false];
         let _: () = msg_send![scroller, setHidden: true];
-        let _: () = msg_send![container, addSubview: scroller];
+        let _: () = msg_send![content_parent, addSubview: scroller];
         *THUMB_SCROLLER.lock().unwrap() = Some(ObjPtr(scroller));
 
         window
@@ -1381,6 +1417,22 @@ fn main() {
                 sel!(handleCmdTabPressed:),
                 std::ptr::null_mut(),
             );
+            if let Some(scroller) = thumbnail_scroller() {
+                let hidden: bool = msg_send![scroller.0, isHidden];
+                let bounds: NSRect = msg_send![scroller.0, bounds];
+                let geometry = thumbnail_scroller_geometry(
+                    bounds.size.height,
+                    thumbnail_scroller_max_offset(),
+                    0.0,
+                );
+                log_info!(
+                    "[smoke-overlay] scroller hidden={} frame={:.1}x{:.1} knob_h={:.1}",
+                    hidden,
+                    bounds.size.width,
+                    bounds.size.height,
+                    geometry.map_or(0.0, |g| g.knob_h)
+                );
+            }
             let window_count = TAB_STATE
                 .lock()
                 .unwrap()
@@ -1398,19 +1450,11 @@ fn main() {
                 sel!(handleCmdShiftTabPressed:),
                 std::ptr::null_mut(),
             );
-            // 直接驱动滚动条 action,覆盖小数位置、拖动映射与底部行钳制;真实滚轮/触控板仍由
-            // container 的 scrollWheel: 路径处理。
-            // Drive the scroller action through a fractional position and the bottom clamp;
-            // real wheel/trackpad input still enters through container's scrollWheel: method.
-            if let Some(scroller) = thumbnail_scroller() {
-                for fraction in [0.35f32, 1.0f32] {
-                    let _: () = msg_send![scroller.0, setFloatValue: fraction];
-                    thumbnail_scroller_changed(
-                        std::ptr::null_mut(),
-                        sel!(thumbnailScrollerChanged:),
-                        scroller.0 as *mut c_void,
-                    );
-                }
+            // 直接驱动同一套绝对偏移换算,覆盖小数位置与底部钳制;真实拖拽和滚轮也复用该路径。
+            // Drive the same absolute-offset path to cover fractional positions and bottom
+            // clamping; real dragging and wheel scrolling use this path too.
+            for fraction in [0.35f64, 1.0f64] {
+                thumbnail_scroller_set_fraction_for_smoke(fraction);
             }
             let rl: *mut AnyObject = msg_send![class!(NSRunLoop), currentRunLoop];
             let date: *mut AnyObject =

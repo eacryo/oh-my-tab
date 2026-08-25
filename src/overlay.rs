@@ -116,9 +116,21 @@ static THUMB_SCROLL_MAX_OFFSET: Mutex<f64> = Mutex::new(0.0);
 /// 当前完整布局的行间距(卡片高度 + 行间距),供键盘整行导航复用。
 /// Current full-layout row pitch (card height + row gap), reused by whole-row keyboard navigation.
 static THUMB_SCROLL_ROW_PITCH: Mutex<f64> = Mutex::new(1.0);
-/// 更新滚动条外观时抑制 AppKit action 回调重入 show_overlay。
-/// Suppress AppKit action re-entry while synchronizing the scroller's appearance.
-static THUMB_SCROLLER_SYNCING: AtomicBool = AtomicBool::new(false);
+/// 自定义滚动条当前的显式拖拽状态。
+/// Explicit drag state for the custom scrollbar.
+#[derive(Clone, Copy)]
+struct ThumbnailScrollDrag {
+    start_y: f64,
+    start_offset: f64,
+    max_offset: f64,
+    thumb_travel: f64,
+}
+
+static THUMB_SCROLL_DRAG: Mutex<Option<ThumbnailScrollDrag>> = Mutex::new(None);
+
+fn clear_thumbnail_scroll_drag() {
+    *THUMB_SCROLL_DRAG.lock().unwrap() = None;
+}
 /// 连续上下导航保持的水平中心；水平切换、鼠标选择和新召唤时重置。
 /// Preferred horizontal center retained across consecutive vertical moves; reset
 /// by horizontal navigation, mouse selection, and a fresh summon.
@@ -172,6 +184,7 @@ fn reset_thumbnail_scroll() {
     *THUMB_SCROLL_OFFSET.lock().unwrap() = 0.0;
     *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = 0.0;
     *THUMB_SCROLL_ROW_PITCH.lock().unwrap() = 1.0;
+    clear_thumbnail_scroll_drag();
 }
 
 /// 让选中项所在行进入视口;已在视口时不改变用户通过滚轮选择的滚动位置。
@@ -217,9 +230,17 @@ fn scroll_thumbnail_by_offset(delta: f64) {
     if !delta.is_finite() || delta.abs() < f64::EPSILON {
         return;
     }
+    let current = *THUMB_SCROLL_OFFSET.lock().unwrap();
     let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
+    set_thumbnail_scroll_offset(current + delta, max_offset);
+}
+
+pub(crate) fn set_thumbnail_scroll_offset(next: f64, max_offset: f64) {
+    if !next.is_finite() || !max_offset.is_finite() {
+        return;
+    }
     let mut offset = THUMB_SCROLL_OFFSET.lock().unwrap();
-    let next = (*offset + delta).clamp(0.0, max_offset);
+    let next = next.clamp(0.0, max_offset.max(0.0));
     if (next - *offset).abs() < f64::EPSILON {
         return;
     }
@@ -234,6 +255,15 @@ fn scroll_thumbnail_by_offset(delta: f64) {
         sel!(mouseMoved:),
         std::ptr::null_mut(),
     );
+}
+
+pub(crate) fn thumbnail_scroller_set_fraction_for_smoke(fraction: f64) {
+    let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
+    set_thumbnail_scroll_offset(fraction.clamp(0.0, 1.0) * max_offset, max_offset);
+}
+
+pub(crate) fn thumbnail_scroller_max_offset() -> f64 {
+    *THUMB_SCROLL_MAX_OFFSET.lock().unwrap()
 }
 
 fn reset_thumbnail_nav_anchor() {
@@ -305,6 +335,8 @@ mod tests {
     use super::edge_row_nav_index;
     use super::horizontal_nav_index;
     use super::scroll_start_for_selection;
+    use super::thumbnail_scroll_offset_for_drag;
+    use super::thumbnail_scroller_geometry;
     use super::vertical_nav_index;
 
     /// 构造一行卡片的 rects:y 固定,x 依次排开(宽 100 间距 10)。
@@ -327,6 +359,38 @@ mod tests {
     fn thumbnail_selection_lifts_the_whole_card_by_one_point() {
         assert_eq!(super::thumbnail_card_lift_y(true), 1.0);
         assert_eq!(super::thumbnail_card_lift_y(false), 0.0);
+    }
+
+    #[test]
+    fn thumbnail_scroller_geometry_has_a_real_drag_travel() {
+        let top = thumbnail_scroller_geometry(100.0, 100.0, 0.0).unwrap();
+        let bottom = thumbnail_scroller_geometry(100.0, 100.0, 100.0).unwrap();
+        assert!(top.knob_h < 96.0);
+        assert!(top.thumb_travel > 0.0);
+        assert!(top.knob_y > bottom.knob_y);
+        assert!((bottom.knob_y - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn thumbnail_scroller_geometry_rejects_no_overflow() {
+        assert!(thumbnail_scroller_geometry(100.0, 0.0, 0.0).is_none());
+        assert!(thumbnail_scroller_geometry(0.0, 10.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn thumbnail_scroller_drag_maps_and_clamps_offset() {
+        assert_eq!(
+            thumbnail_scroll_offset_for_drag(0.0, 50.0, 25.0, 100.0, 50.0),
+            50.0
+        );
+        assert_eq!(
+            thumbnail_scroll_offset_for_drag(20.0, 50.0, 200.0, 100.0, 50.0),
+            0.0
+        );
+        assert_eq!(
+            thumbnail_scroll_offset_for_drag(80.0, 50.0, -200.0, 100.0, 50.0),
+            100.0
+        );
     }
 
     #[test]
@@ -1082,42 +1146,199 @@ pub(crate) extern "C" fn container_scroll_wheel(_self: *mut c_void, _cmd: Sel, e
     }
 }
 
-/// NSScroller action 回调:把 0..1 的滚动条位置映射为完整布局中的 point 偏移。
-/// NSScroller action callback: map the 0..1 knob position to a point offset in the full layout.
-pub(crate) extern "C" fn thumbnail_scroller_changed(
-    _self: *mut c_void,
+const THUMB_SCROLLBAR_VISIBLE_W: f64 = 6.0;
+const THUMB_SCROLLBAR_EDGE: f64 = 2.0;
+const THUMB_SCROLLBAR_MIN_KNOB_H: f64 = 24.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ThumbnailScrollerGeometry {
+    pub(crate) knob_y: f64,
+    pub(crate) knob_h: f64,
+    pub(crate) thumb_travel: f64,
+}
+
+/// 用完整滚动范围计算胶囊位置;绘制和拖拽必须共享这套几何。
+/// Compute the capsule from the complete scroll range; drawing and dragging must share it.
+pub(crate) fn thumbnail_scroller_geometry(
+    track_h: f64,
+    max_offset: f64,
+    offset: f64,
+) -> Option<ThumbnailScrollerGeometry> {
+    if !track_h.is_finite() || !max_offset.is_finite() || max_offset <= f64::EPSILON {
+        return None;
+    }
+    let track_h = track_h - THUMB_SCROLLBAR_EDGE * 2.0;
+    if track_h <= 0.0 {
+        return None;
+    }
+    let knob_h =
+        (track_h * track_h / (track_h + max_offset)).clamp(THUMB_SCROLLBAR_MIN_KNOB_H, track_h);
+    let thumb_travel = (track_h - knob_h).max(0.0);
+    let progress = (offset / max_offset).clamp(0.0, 1.0);
+    Some(ThumbnailScrollerGeometry {
+        // AppKit coordinates grow upward: offset 0 is the visual top of the content.
+        // AppKit 坐标向上增长:offset 0 对应内容视觉上的顶部。
+        knob_y: THUMB_SCROLLBAR_EDGE + (1.0 - progress) * thumb_travel,
+        knob_h,
+        thumb_travel,
+    })
+}
+
+fn thumbnail_scroll_offset_for_drag(
+    start_offset: f64,
+    start_y: f64,
+    current_y: f64,
+    max_offset: f64,
+    thumb_travel: f64,
+) -> f64 {
+    if max_offset <= 0.0 || thumb_travel <= 0.0 {
+        return start_offset.clamp(0.0, max_offset.max(0.0));
+    }
+    (start_offset + (start_y - current_y) * max_offset / thumb_travel).clamp(0.0, max_offset)
+}
+
+/// 只绘制滚动条胶囊;透明的整个指示器视图负责命中和显式拖拽。
+/// Draw only the scrollbar capsule; the transparent indicator view owns hit testing and explicit dragging.
+pub(crate) extern "C" fn thumbnail_scroller_draw_rect(
+    scroller: *mut c_void,
     _cmd: Sel,
-    sender: *mut c_void,
+    _dirty_rect: NSRect,
 ) {
-    if !crate::theme::thumbnails_enabled() {
-        return;
-    }
-    if THUMB_SCROLLER_SYNCING.load(Ordering::Acquire) {
-        return;
-    }
     unsafe {
-        let value: f32 = msg_send![sender as *mut AnyObject, floatValue];
+        let scroller = scroller as *mut AnyObject;
+        let bounds: NSRect = msg_send![scroller, bounds];
+        let offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
         let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
-        let next = f64::from(value).clamp(0.0, 1.0) * max_offset;
-        let mut offset = THUMB_SCROLL_OFFSET.lock().unwrap();
-        if (*offset - next).abs() < f64::EPSILON {
+        let Some(geometry) = thumbnail_scroller_geometry(bounds.size.height, max_offset, offset)
+        else {
             return;
-        }
-        *offset = next;
-        drop(offset);
-        show_overlay();
-        container_mouse_moved(
-            std::ptr::null_mut(),
-            sel!(mouseMoved:),
-            std::ptr::null_mut(),
+        };
+        let inset_x = ((bounds.size.width - THUMB_SCROLLBAR_VISIBLE_W) / 2.0).max(0.0);
+        let capsule = NSRect::new(
+            NSPoint::new(inset_x, geometry.knob_y),
+            NSSize::new(
+                THUMB_SCROLLBAR_VISIBLE_W.min(bounds.size.width),
+                geometry.knob_h,
+            ),
         );
+        let dark = match CONFIG.read().unwrap().appearance.theme.as_str() {
+            "light" => false,
+            "dark" => true,
+            _ => system_dark_mode(),
+        };
+        let color: *mut AnyObject = if dark {
+            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: 0.72f64]
+        } else {
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.48f64]
+        };
+        let _: () = msg_send![color, set];
+        let path: *mut AnyObject = msg_send![
+            class!(NSBezierPath),
+            bezierPathWithRoundedRect: capsule,
+            xRadius: THUMB_SCROLLBAR_VISIBLE_W / 2.0,
+            yRadius: THUMB_SCROLLBAR_VISIBLE_W / 2.0
+        ];
+        let _: () = msg_send![path, fill];
     }
 }
 
+/// 非激活浮窗第一次点击也必须交给滚动条,否则按住 Command 时首个拖拽按下会被窗口层丢弃。
+/// A nonactivating panel must deliver the first click to the scroller, otherwise the initial
+/// drag press is discarded while Command is held.
+pub(crate) extern "C" fn thumbnail_scroller_accepts_first_mouse(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _event: *mut c_void,
+) -> bool {
+    true
+}
+
+/// 在非激活面板中显式开始拖拽,不依赖 NSScroller 的原生 tracking。
+/// Start dragging explicitly inside the nonactivating panel instead of relying on NSScroller tracking.
+pub(crate) extern "C" fn thumbnail_scroller_mouse_down(
+    _self: *mut c_void,
+    _cmd: Sel,
+    event: *mut c_void,
+) {
+    unsafe {
+        if !crate::theme::thumbnails_enabled() {
+            return;
+        }
+        let scroller = _self as *mut AnyObject;
+        let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        let point: NSPoint = msg_send![
+            scroller,
+            convertPoint: location,
+            fromView: std::ptr::null::<AnyObject>()
+        ];
+        let bounds: NSRect = msg_send![scroller, bounds];
+        let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
+        let current_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+        let Some(geometry) =
+            thumbnail_scroller_geometry(bounds.size.height, max_offset, current_offset)
+        else {
+            return;
+        };
+        let inside_knob =
+            point.y >= geometry.knob_y && point.y <= geometry.knob_y + geometry.knob_h;
+        let start_offset = if inside_knob || geometry.thumb_travel <= 0.0 {
+            current_offset
+        } else {
+            let target_progress =
+                ((geometry.knob_y + geometry.thumb_travel + geometry.knob_h / 2.0 - point.y)
+                    / geometry.thumb_travel)
+                    .clamp(0.0, 1.0);
+            target_progress * max_offset
+        };
+        if !inside_knob {
+            set_thumbnail_scroll_offset(start_offset, max_offset);
+        }
+        *THUMB_SCROLL_DRAG.lock().unwrap() = Some(ThumbnailScrollDrag {
+            start_y: point.y,
+            start_offset,
+            max_offset,
+            thumb_travel: geometry.thumb_travel,
+        });
+    }
+}
+
+pub(crate) extern "C" fn thumbnail_scroller_mouse_dragged(
+    _self: *mut c_void,
+    _cmd: Sel,
+    event: *mut c_void,
+) {
+    unsafe {
+        let Some(drag) = *THUMB_SCROLL_DRAG.lock().unwrap() else {
+            return;
+        };
+        let scroller = _self as *mut AnyObject;
+        let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        let point: NSPoint = msg_send![
+            scroller,
+            convertPoint: location,
+            fromView: std::ptr::null::<AnyObject>()
+        ];
+        let next = thumbnail_scroll_offset_for_drag(
+            drag.start_offset,
+            drag.start_y,
+            point.y,
+            drag.max_offset,
+            drag.thumb_travel,
+        );
+        set_thumbnail_scroll_offset(next, drag.max_offset);
+    }
+}
+
+pub(crate) extern "C" fn thumbnail_scroller_mouse_up(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _event: *mut c_void,
+) {
+    *THUMB_SCROLL_DRAG.lock().unwrap() = None;
+}
+
 unsafe fn is_overlay_non_card_subview(view: *mut AnyObject) -> bool {
-    let is_label: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
-    let is_scroller: bool = msg_send![view, isKindOfClass: class!(NSScroller)];
-    is_label || is_scroller
+    msg_send![view, isKindOfClass: class!(NSTextField)]
 }
 
 /// 更新滚动条的轨道、滑块比例和当前位置;无溢出时完全隐藏,避免干扰旧布局。
@@ -1129,8 +1350,6 @@ unsafe fn update_thumbnail_scroller(
     overflowed: bool,
     row_count: usize,
     max_rows: usize,
-    scroll_offset: f64,
-    max_scroll_offset: f64,
 ) {
     let Some(scroller) = thumbnail_scroller() else {
         return;
@@ -1140,20 +1359,16 @@ unsafe fn update_thumbnail_scroller(
         return;
     }
     let frame = NSRect::new(
-        NSPoint::new(panel_w - H_PADDING - THUMB_SCROLLBAR_W, 0.0),
+        NSPoint::new(panel_w - H_PADDING - THUMB_SCROLLBAR_W, STATUS_H),
         NSSize::new(THUMB_SCROLLBAR_W, (panel_h - STATUS_H).max(1.0)),
     );
-    let _: () = msg_send![scroller.0, setFrame: frame];
-    THUMB_SCROLLER_SYNCING.store(true, Ordering::Release);
-    let _: () = msg_send![scroller.0, setKnobProportion: (max_rows as f64 / row_count as f64).clamp(0.05, 1.0)];
-    let fraction = if max_scroll_offset <= 0.0 {
-        0.0
-    } else {
-        (scroll_offset / max_scroll_offset).clamp(0.0, 1.0) as f32
-    };
-    let _: () = msg_send![scroller.0, setFloatValue: fraction];
-    THUMB_SCROLLER_SYNCING.store(false, Ordering::Release);
+    // 拖拽期间保持命中视图的 frame 不变;卡片重建只刷新胶囊绘制。
+    // Keep the hit view's frame stable during dragging; card rebuilds only refresh the capsule.
+    if THUMB_SCROLL_DRAG.lock().unwrap().is_none() {
+        let _: () = msg_send![scroller.0, setFrame: frame];
+    }
     let _: () = msg_send![scroller.0, setHidden: false];
+    let _: () = msg_send![scroller.0, setNeedsDisplay: true];
 }
 
 /// borderless 浮窗重写:允许成为 key 窗口(否则收不到键盘事件)。
@@ -1476,6 +1691,7 @@ pub(crate) fn update_status_label() {
 
 pub(crate) fn hide_overlay() {
     stop_hover_timer();
+    clear_thumbnail_scroll_drag();
     unsafe {
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
             let _: () = msg_send![window.0, orderOut: std::ptr::null::<AnyObject>()];
@@ -1681,6 +1897,7 @@ pub(crate) fn close_window_at(idx: usize) {
 /// Mirrors BetterCmdTab's vanish() -> activate() -> dismiss() sequence.
 pub(crate) fn vanish_overlay() {
     stop_hover_timer();
+    clear_thumbnail_scroll_drag();
     unsafe {
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
             // alphaValue=0 + contentView hidden:即时视觉消失,但窗口保持 ordered。
@@ -2940,7 +3157,7 @@ pub(crate) fn show_overlay() {
         // (全局 index, x, y, w)——缩略图模式只产出当前滚动视口，纯图标模式仍产出全部窗口。
         // (global index, x, y, w): thumbnail mode emits only the current scrolling viewport;
         // icon mode still emits every window.
-        let mut thumb_scroll_metrics: Option<(bool, usize, usize, f64, f64)> = None;
+        let mut thumb_scroll_metrics: Option<(bool, usize, usize)> = None;
         let (h, w, placements, card_h_use): (f64, f64, Vec<CardPlacementFrame>, f64) = if use_flow {
             // ===== 流式布局(缩略图模式):等高不等宽,单页平衡分行,溢出时优先填满前行 =====
             // 窗口宽高比决定卡宽;极端比例被 clamp_aspect 钳制;每行能容纳的
@@ -2990,13 +3207,8 @@ pub(crate) fn show_overlay() {
                 scroll_offset.clamp(0.0, layout.max_scroll_offset);
             *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = layout.max_scroll_offset;
             *THUMB_SCROLL_ROW_PITCH.lock().unwrap() = layout.card_h + gap;
-            thumb_scroll_metrics = Some((
-                layout.overflowed,
-                layout.row_ranges.len(),
-                layout.max_rows,
-                scroll_offset.clamp(0.0, layout.max_scroll_offset),
-                layout.max_scroll_offset,
-            ));
+            thumb_scroll_metrics =
+                Some((layout.overflowed, layout.row_ranges.len(), layout.max_rows));
             log_debug!(
                 "[overlay] flow scale={:.2} visible={}..{} of {} offset={:.1} row={} rows={} visible_rows={} overflow={}",
                 layout.scale,
@@ -3100,18 +3312,12 @@ pub(crate) fn show_overlay() {
             let _: () = msg_send![container, addSubview: card];
             release_obj(card); // container owns the card; drop create_card_view's alloc +1
         }
-        // 卡片是后添加的,把滚动条重新置于最上层,否则右侧命中会被卡片吞掉。
-        // Cards are added after the scroller; bring it back to the front so the scrollbar
-        // receives clicks instead of a card underneath it.
-        if let Some(scroller) = thumbnail_scroller() {
-            let _: () = msg_send![container, addSubview: scroller.0];
-        }
         let t_cards_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
         let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
-        let _: () = msg_send![window, setFrame: new_frame, display: true];
+        let _: () = msg_send![window, setFrame: new_frame, display: false];
 
         // wrapper / VFX view / container all have autoresizingMask = 18
         // (width + height sizable), so they resize automatically when the
@@ -3123,18 +3329,8 @@ pub(crate) fn show_overlay() {
                 NSSize::new(w, (h - STATUS_H).max(1.0))
             )
         ];
-        if let Some((overflowed, row_count, max_rows, scroll_offset, max_scroll_offset)) =
-            thumb_scroll_metrics
-        {
-            update_thumbnail_scroller(
-                w,
-                h,
-                overflowed,
-                row_count,
-                max_rows,
-                scroll_offset,
-                max_scroll_offset,
-            );
+        if let Some((overflowed, row_count, max_rows)) = thumb_scroll_metrics {
+            update_thumbnail_scroller(w, h, overflowed, row_count, max_rows);
         } else if let Some(scroller) = thumbnail_scroller() {
             let _: () = msg_send![scroller.0, setHidden: true];
         }
@@ -3154,6 +3350,7 @@ pub(crate) fn show_overlay() {
         // Refresh the highlight/selection once after summoning: fresh cards start with the
         // ⌫ button hidden, so the selected card's border and ⌫ must be applied now.
         refresh_highlight();
+        let _: () = msg_send![window, displayIfNeeded];
 
         // Show window. NSPanel + nonactivatingPanel: the panel becomes key (keyboard works)
         // WITHOUT activating our app -- do NOT call activateIgnoringOtherApps, or the settings
