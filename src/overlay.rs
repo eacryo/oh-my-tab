@@ -137,6 +137,19 @@ struct ThumbnailScrollDrag {
 
 static THUMB_SCROLL_DRAG: Mutex<Option<ThumbnailScrollDrag>> = Mutex::new(None);
 
+/// 滚动条的悬停状态:视口悬停时提高滑块可见度,直接悬停滑块时再提高一级。
+/// Scrollbar hover state: increase thumb visibility over the viewport, then one more level over the thumb.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct ThumbnailScrollerHover {
+    viewport: bool,
+    knob: bool,
+}
+
+static THUMB_SCROLLER_HOVER: Mutex<ThumbnailScrollerHover> = Mutex::new(ThumbnailScrollerHover {
+    viewport: false,
+    knob: false,
+});
+
 fn clear_thumbnail_scroll_drag() {
     *THUMB_SCROLL_DRAG.lock().unwrap() = None;
 }
@@ -208,6 +221,40 @@ fn reset_thumbnail_scroll() {
     *THUMB_DOCUMENT_HEIGHT.lock().unwrap() = 0.0;
     *THUMB_SCROLL_ROW_PITCH.lock().unwrap() = 1.0;
     clear_thumbnail_scroll_drag();
+    set_thumbnail_scroller_hover(false, false);
+}
+
+fn thumbnail_scroller_alpha(viewport_hovered: bool, knob_hovered: bool, dragging: bool) -> f64 {
+    if knob_hovered || dragging {
+        0.58
+    } else if viewport_hovered {
+        0.42
+    } else {
+        0.26
+    }
+}
+
+fn thumbnail_scroller_knob_contains(point_y: f64, geometry: ThumbnailScrollerGeometry) -> bool {
+    point_y >= geometry.knob_y && point_y <= geometry.knob_y + geometry.knob_h
+}
+
+fn invalidate_thumbnail_scroller() {
+    unsafe {
+        if let Some(scroller) = thumbnail_scroller() {
+            let _: () = msg_send![scroller.0, setNeedsDisplay: true];
+        }
+    }
+}
+
+fn set_thumbnail_scroller_hover(viewport: bool, knob: bool) {
+    let mut state = THUMB_SCROLLER_HOVER.lock().unwrap();
+    let next = ThumbnailScrollerHover { viewport, knob };
+    if *state == next {
+        return;
+    }
+    *state = next;
+    drop(state);
+    invalidate_thumbnail_scroller();
 }
 
 fn visible_range_for_scroll(
@@ -273,6 +320,10 @@ fn apply_thumbnail_scroll_offset() {
     unsafe {
         apply_thumbnail_clip_offset();
     }
+    // 内容和滑块必须在同一个 offset 更新中失效,否则滚轮只移动内容而滑块停在旧位置。
+    // Invalidate the content and thumb in the same offset update, otherwise wheel scrolling moves
+    // only the content while the thumb stays at its old position.
+    invalidate_thumbnail_scroller();
 }
 
 /// 让选中项所在行进入视口;已在视口时不改变用户通过滚轮选择的滚动位置。
@@ -425,7 +476,9 @@ mod tests {
     use super::horizontal_nav_index;
     use super::scroll_start_for_selection;
     use super::thumbnail_scroll_offset_for_drag;
+    use super::thumbnail_scroller_alpha;
     use super::thumbnail_scroller_geometry;
+    use super::thumbnail_scroller_knob_contains;
     use super::vertical_nav_index;
 
     /// 构造一行卡片的 rects:y 固定,x 依次排开(宽 100 间距 10)。
@@ -457,7 +510,8 @@ mod tests {
         assert!(top.knob_h < 96.0);
         assert!(top.thumb_travel > 0.0);
         assert!(top.knob_y > bottom.knob_y);
-        assert!((bottom.knob_y - 2.0).abs() < 1e-9);
+        assert!((bottom.knob_y - 22.0).abs() < 1e-9);
+        assert!((top.knob_y + top.knob_h - 78.0).abs() < 1e-9);
     }
 
     #[test]
@@ -480,6 +534,28 @@ mod tests {
             thumbnail_scroll_offset_for_drag(80.0, 50.0, -200.0, 100.0, 50.0),
             100.0
         );
+    }
+
+    #[test]
+    fn thumbnail_scroller_alpha_matches_html_hover_levels() {
+        assert_eq!(thumbnail_scroller_alpha(false, false, false), 0.26);
+        assert_eq!(thumbnail_scroller_alpha(true, false, false), 0.42);
+        assert_eq!(thumbnail_scroller_alpha(true, true, false), 0.58);
+        assert_eq!(thumbnail_scroller_alpha(false, false, true), 0.58);
+    }
+
+    #[test]
+    fn thumbnail_scroller_knob_hit_test_uses_capsule_bounds() {
+        let geometry = thumbnail_scroller_geometry(100.0, 100.0, 0.0).unwrap();
+        assert!(thumbnail_scroller_knob_contains(geometry.knob_y, geometry));
+        assert!(thumbnail_scroller_knob_contains(
+            geometry.knob_y + geometry.knob_h,
+            geometry
+        ));
+        assert!(!thumbnail_scroller_knob_contains(
+            geometry.knob_y - 0.1,
+            geometry
+        ));
     }
 
     #[test]
@@ -1207,8 +1283,63 @@ pub(crate) extern "C" fn container_scroll_wheel(_self: *mut c_void, _cmd: Sel, e
     }
 }
 
-const THUMB_SCROLLBAR_VISIBLE_W: f64 = 6.0;
-const THUMB_SCROLLBAR_EDGE: f64 = 2.0;
+pub(crate) extern "C" fn container_mouse_entered(
+    _self: *mut c_void,
+    _cmd: Sel,
+    event: *mut c_void,
+) {
+    unsafe {
+        let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        update_thumbnail_pointer_state(point);
+    }
+}
+
+pub(crate) extern "C" fn container_mouse_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    unsafe {
+        let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        update_thumbnail_pointer_state(point);
+    }
+}
+
+pub(crate) extern "C" fn thumbnail_scroller_mouse_entered(
+    _self: *mut c_void,
+    _cmd: Sel,
+    event: *mut c_void,
+) {
+    unsafe {
+        let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        update_thumbnail_pointer_state(point);
+    }
+}
+
+pub(crate) extern "C" fn thumbnail_scroller_mouse_moved(
+    _self: *mut c_void,
+    _cmd: Sel,
+    event: *mut c_void,
+) {
+    unsafe {
+        let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        update_thumbnail_pointer_state(point);
+    }
+}
+
+pub(crate) extern "C" fn thumbnail_scroller_mouse_exited(
+    _self: *mut c_void,
+    _cmd: Sel,
+    event: *mut c_void,
+) {
+    unsafe {
+        let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        update_thumbnail_pointer_state(point);
+    }
+}
+
+/// HTML 参考稿的可见滑块宽度;命中区域仍由外层 14pt 视图提供。
+/// Visible thumb width from the HTML reference; the outer 14pt view remains the hit area.
+const THUMB_SCROLLBAR_VISIBLE_W: f64 = 5.0;
+/// HTML 参考稿的上下留白在原生浮窗中放大到 6pt,避免胶囊视觉上贴住边缘。
+/// Increase the HTML reference's edge inset to 6pt in the native panel so the capsule never looks flush with the viewport.
+const THUMB_SCROLLBAR_EDGE: f64 = 22.0;
 const THUMB_SCROLLBAR_MIN_KNOB_H: f64 = 24.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1243,6 +1374,45 @@ pub(crate) fn thumbnail_scroller_geometry(
         knob_h,
         thumb_travel,
     })
+}
+
+unsafe fn update_thumbnail_pointer_state(window_point: NSPoint) {
+    let Some(container) = (*CONTAINER.lock().unwrap()).map(|container| container.0) else {
+        set_thumbnail_scroller_hover(false, false);
+        return;
+    };
+    let container_point: NSPoint = msg_send![
+        container,
+        convertPoint: window_point,
+        fromView: std::ptr::null::<AnyObject>()
+    ];
+    let container_bounds: NSRect = msg_send![container, bounds];
+    let in_viewport = container_point.x >= container_bounds.origin.x
+        && container_point.x <= container_bounds.origin.x + container_bounds.size.width
+        && container_point.y >= container_bounds.origin.y
+        && container_point.y <= container_bounds.origin.y + container_bounds.size.height;
+
+    let Some(scroller) = thumbnail_scroller() else {
+        set_thumbnail_scroller_hover(in_viewport, false);
+        return;
+    };
+    let scroller_point: NSPoint = msg_send![
+        scroller.0,
+        convertPoint: window_point,
+        fromView: std::ptr::null::<AnyObject>()
+    ];
+    let scroller_bounds: NSRect = msg_send![scroller.0, bounds];
+    let in_scroller = scroller_point.x >= scroller_bounds.origin.x
+        && scroller_point.x <= scroller_bounds.origin.x + scroller_bounds.size.width
+        && scroller_point.y >= scroller_bounds.origin.y
+        && scroller_point.y <= scroller_bounds.origin.y + scroller_bounds.size.height;
+    let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
+    let offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+    let knob = thumbnail_scroller_geometry(scroller_bounds.size.height, max_offset, offset)
+        .is_some_and(|geometry| {
+            in_scroller && thumbnail_scroller_knob_contains(scroller_point.y, geometry)
+        });
+    set_thumbnail_scroller_hover(in_viewport || in_scroller, knob);
 }
 
 fn thumbnail_scroll_offset_for_drag(
@@ -1287,10 +1457,14 @@ pub(crate) extern "C" fn thumbnail_scroller_draw_rect(
             "dark" => true,
             _ => system_dark_mode(),
         };
+        let hover = *THUMB_SCROLLER_HOVER.lock().unwrap();
+        let dragging = THUMB_SCROLL_DRAG.lock().unwrap().is_some();
+        let alpha = thumbnail_scroller_alpha(hover.viewport, hover.knob, dragging);
         let color: *mut AnyObject = if dark {
-            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: 0.72f64]
+            msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: alpha]
         } else {
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.48f64]
+            let color = 0x464E5C00 | u32::from((alpha * 255.0).round() as u8);
+            hex_to_ns_color(color)
         };
         let _: () = msg_send![color, set];
         let path: *mut AnyObject = msg_send![
@@ -1327,6 +1501,7 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_down(
         }
         let scroller = _self as *mut AnyObject;
         let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        update_thumbnail_pointer_state(location);
         let point: NSPoint = msg_send![
             scroller,
             convertPoint: location,
@@ -1340,8 +1515,7 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_down(
         else {
             return;
         };
-        let inside_knob =
-            point.y >= geometry.knob_y && point.y <= geometry.knob_y + geometry.knob_h;
+        let inside_knob = thumbnail_scroller_knob_contains(point.y, geometry);
         let start_offset = if inside_knob || geometry.thumb_travel <= 0.0 {
             current_offset
         } else {
@@ -1360,6 +1534,7 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_down(
             max_offset,
             thumb_travel: geometry.thumb_travel,
         });
+        invalidate_thumbnail_scroller();
     }
 }
 
@@ -1393,9 +1568,14 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_dragged(
 pub(crate) extern "C" fn thumbnail_scroller_mouse_up(
     _self: *mut c_void,
     _cmd: Sel,
-    _event: *mut c_void,
+    event: *mut c_void,
 ) {
     *THUMB_SCROLL_DRAG.lock().unwrap() = None;
+    unsafe {
+        let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+        update_thumbnail_pointer_state(point);
+    }
+    invalidate_thumbnail_scroller();
 }
 
 /// 更新滚动条的轨道、滑块比例和当前位置;无溢出时完全隐藏,避免干扰旧布局。
@@ -1542,6 +1722,14 @@ unsafe extern "C" fn hover_tick_callback(_timer: event_tap::CFRunLoopTimerRef, _
         mf.size.height
     };
     let pos = NSPoint::new(pos.x, main_h - pos.y);
+    let container = match *CONTAINER.lock().unwrap() {
+        Some(c) => c.0,
+        None => return,
+    };
+    let win: *mut AnyObject = msg_send![container, window];
+    let win_frame: NSRect = msg_send![win, frame];
+    let loc = NSPoint::new(pos.x - win_frame.origin.x, pos.y - win_frame.origin.y);
+    update_thumbnail_pointer_state(loc);
     let mut last = HOVER_TICK_POS.lock().unwrap();
     match *last {
         // 首次 tick:last 还没基准,只记录位置不选中(保持"移动后才选中"的门控
@@ -1566,13 +1754,6 @@ unsafe extern "C" fn hover_tick_callback(_timer: event_tap::CFRunLoopTimerRef, _
         }
     }
     drop(last);
-    let container = match *CONTAINER.lock().unwrap() {
-        Some(c) => c.0,
-        None => return,
-    };
-    let win: *mut AnyObject = msg_send![container, window];
-    let win_frame: NSRect = msg_send![win, frame];
-    let loc = NSPoint::new(pos.x - win_frame.origin.x, pos.y - win_frame.origin.y);
     handle_hover_at(loc);
 }
 
@@ -1648,6 +1829,7 @@ pub(crate) extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _e
             mouse_screen.x - win_frame.origin.x,
             mouse_screen.y - win_frame.origin.y,
         );
+        update_thumbnail_pointer_state(loc);
         handle_hover_at(loc);
     }
 }
@@ -1785,6 +1967,7 @@ pub(crate) fn update_status_label() {
 pub(crate) fn hide_overlay() {
     stop_hover_timer();
     clear_thumbnail_scroll_drag();
+    set_thumbnail_scroller_hover(false, false);
     unsafe {
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
             let _: () = msg_send![window.0, orderOut: std::ptr::null::<AnyObject>()];
@@ -1991,6 +2174,7 @@ pub(crate) fn close_window_at(idx: usize) {
 pub(crate) fn vanish_overlay() {
     stop_hover_timer();
     clear_thumbnail_scroll_drag();
+    set_thumbnail_scroller_hover(false, false);
     unsafe {
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
             // alphaValue=0 + contentView hidden:即时视觉消失,但窗口保持 ordered。
@@ -3494,14 +3678,15 @@ pub(crate) fn show_overlay() {
             let _: () = msg_send![container, removeTrackingArea: area];
         }
         let mm_ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        // NSTrackingMouseMoved=0x02 | NSTrackingActiveAlways=0x80 | NSTrackingInVisibleRect=0x200。
+        // NSTrackingMouseEnteredAndExited=0x01 | NSTrackingMouseMoved=0x02 |
+        // NSTrackingActiveAlways=0x80 | NSTrackingInVisibleRect=0x200。
         // 注意激活模式(NSTrackingActive*)只能指定一个,多指定会抛 NSInvalidArgumentException。
         // 0x04 = mouseDragged:侧键物理按下期间(吞掉 down 后系统仍可能把移动当作
         // drag 事件)也能收到移动;0x02 = mouseMoved;0x80 = activeAlways;0x200 = inVisibleRect。
         // 0x04 = mouseDragged: while a side button is physically held (the system may still
         // treat moves as drags after the tap swallowed the down) moves still arrive;
         // 0x02 = mouseMoved; 0x80 = activeAlways; 0x200 = inVisibleRect.
-        let mm_opts: u64 = 0x02 | 0x04 | 0x80 | 0x200;
+        let mm_opts: u64 = 0x01 | 0x02 | 0x04 | 0x80 | 0x200;
         let container_bounds: NSRect = msg_send![container, bounds];
         let mm_ta: *mut AnyObject = msg_send![mm_ta, initWithRect: container_bounds, options: mm_opts, owner: container, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![container, addTrackingArea: mm_ta];

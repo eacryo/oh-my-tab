@@ -576,6 +576,18 @@ fn create_overlay_window() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(mouseEntered:),
+                container_mouse_entered as *mut c_void,
+                types_v_obj.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                container_mouse_exited as *mut c_void,
+                types_v_obj.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(mouseDragged:),
                 container_mouse_moved as *mut c_void,
                 types_v_obj.as_ptr(),
@@ -621,6 +633,24 @@ fn create_overlay_window() -> *mut AnyObject {
                 cls,
                 sel!(mouseUp:),
                 thumbnail_scroller_mouse_up as *mut c_void,
+                types_mouse.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                thumbnail_scroller_mouse_entered as *mut c_void,
+                types_mouse.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseMoved:),
+                thumbnail_scroller_mouse_moved as *mut c_void,
+                types_mouse.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                thumbnail_scroller_mouse_exited as *mut c_void,
                 types_mouse.as_ptr(),
             );
             let types_accepts_first_mouse = CString::new("B@:@").unwrap();
@@ -686,6 +716,17 @@ fn create_overlay_window() -> *mut AnyObject {
         ];
         let _: () = msg_send![scroller, setWantsLayer: false];
         let _: () = msg_send![scroller, setHidden: true];
+        let scroller_tracking_opts: u64 = 0x01 | 0x02 | 0x80 | 0x200;
+        let scroller_tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+        let scroller_tracking: *mut AnyObject = msg_send![
+            scroller_tracking,
+            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(THUMB_SCROLLBAR_W, (h - STATUS_H).max(1.0))),
+            options: scroller_tracking_opts,
+            owner: scroller,
+            userInfo: std::ptr::null::<AnyObject>()
+        ];
+        let _: () = msg_send![scroller, addTrackingArea: scroller_tracking];
+        release_obj(scroller_tracking);
         let _: () = msg_send![content_parent, addSubview: scroller];
         *THUMB_SCROLLER.lock().unwrap() = Some(ObjPtr(scroller));
 
