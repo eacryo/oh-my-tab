@@ -144,10 +144,22 @@ pub(crate) const THUMB_PREVIEW_RATIO: f64 = 1.6;
 /// 少量窗口时的最大卡片放大倍数；1.0 是原有缩略图卡片尺寸。
 /// Maximum card enlargement for small window sets; 1.0 is the original thumbnail size.
 pub(crate) const THUMB_MAX_SCALE: f64 = 1.5;
-/// 动态放大搜索步长。/ Search step for dynamic enlargement.
-const THUMB_SCALE_STEP: f64 = 0.05;
 /// 卡片区顶部留白。/ Top inset above the thumbnail card area.
 const THUMB_TOP_INSET: f64 = 32.0;
+
+/// 缩略图尺寸只由窗口总数决定，分行与窗口宽高比不能反向改变尺寸。
+/// Thumbnail scale depends only on the total window count; wrapping and window
+/// aspect ratios must not feed back into card size.
+pub(crate) fn thumb_scale_for_count(count: usize) -> f64 {
+    match count {
+        0 | 7.. => 1.0,
+        1 | 2 => THUMB_MAX_SCALE,
+        3 => 1.4,
+        4 => 1.3,
+        5 => 1.2,
+        6 => 1.1,
+    }
+}
 
 /// 缩略图卡片高度按基准卡宽推导(纯函数,可测):
 /// 上下 padding + 标题行 + 间距 + 16:10 预览区。
@@ -161,6 +173,7 @@ fn thumb_card_h(card_width: f64) -> f64 {
 /// 流式布局的统一卡片高度:由基准卡宽推导一次,全网格等高。
 /// The flow layout's uniform card height: derived once from the base width;
 /// every card shares it.
+#[cfg(test)]
 pub(crate) fn thumb_card_h_fixed() -> f64 {
     thumb_card_h(THUMB_CARD_BASE_W)
 }
@@ -194,43 +207,64 @@ pub(crate) fn thumb_card_w_for_aspect(card_h: f64, aspect: f64) -> f64 {
     thumb_preview_h(card_h) * clamp_aspect(aspect) + THUMB_PAD * 2.0
 }
 
-/// 贪心行装箱:按给定顺序把卡片塞进行,放不下就换行(纯函数,可测)。
-/// 返回每行的索引列表(保持输入顺序)。
+/// 平衡行装箱:保持输入顺序，先最小化行数，再最小化各行剩余宽度平方和并轻度
+/// 惩罚孤立卡片。这样不会改变 MRU 顺序，但会把换行点从参差的贪心结果调整为
+/// 更均衡的连续分段。
 ///
-/// Greedy row packing: fill rows in the given order, wrap when the next card
-/// would overflow (pure, testable). Returns per-row index lists preserving the
-/// input order.
+/// Balanced row packing: preserve input order, minimize row count first, then
+/// minimize squared leftover width with a small singleton penalty. This keeps MRU
+/// order while choosing more balanced contiguous line breaks than greedy wrapping.
 pub(crate) fn pack_rows(widths: &[f64], max_inner_w: f64, gap: f64) -> Vec<Vec<usize>> {
-    let mut rows: Vec<Vec<usize>> = Vec::new();
-    let mut cur: Vec<usize> = Vec::new();
-    let mut cur_w = 0.0;
-    for (i, &w) in widths.iter().enumerate() {
-        let needed = if cur.is_empty() { w } else { cur_w + gap + w };
-        if !cur.is_empty() && needed > max_inner_w {
-            rows.push(std::mem::take(&mut cur));
-            cur_w = w;
-            cur.push(i);
-        } else {
-            cur_w = needed;
-            cur.push(i);
+    if widths.is_empty() {
+        return vec![Vec::new()];
+    }
+    let max_inner_w = max_inner_w.max(1.0);
+    let len = widths.len();
+    let mut best_rows = vec![usize::MAX; len + 1];
+    let mut best_cost = vec![f64::INFINITY; len + 1];
+    let mut previous = vec![0usize; len + 1];
+    best_rows[0] = 0;
+    best_cost[0] = 0.0;
+
+    for end in 1..=len {
+        let mut row_w = 0.0;
+        for start in (0..end).rev() {
+            row_w += widths[start];
+            if start + 1 < end {
+                row_w += gap;
+            }
+            let single = start + 1 == end;
+            if row_w > max_inner_w + 1e-9 && !single {
+                break;
+            }
+            if best_rows[start] == usize::MAX {
+                continue;
+            }
+            let rows = best_rows[start] + 1;
+            let leftover = (max_inner_w - row_w.min(max_inner_w)).max(0.0);
+            let singleton_penalty = if single && len > 1 {
+                max_inner_w * max_inner_w * 0.05
+            } else {
+                0.0
+            };
+            let cost = best_cost[start] + leftover * leftover + singleton_penalty;
+            if rows < best_rows[end] || (rows == best_rows[end] && cost < best_cost[end] - 1e-9) {
+                best_rows[end] = rows;
+                best_cost[end] = cost;
+                previous[end] = start;
+            }
         }
     }
-    if !cur.is_empty() {
-        rows.push(cur);
-    }
-    if rows.is_empty() {
-        rows.push(Vec::new());
-    }
-    rows
-}
 
-/// 连续可见区间的移动方向。/ Direction used to slide the contiguous visible range.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ThumbSlideDirection {
-    Forward,
-    Backward,
-    #[default]
-    Preserve,
+    let mut rows = Vec::with_capacity(best_rows[len]);
+    let mut end = len;
+    while end > 0 {
+        let start = previous[end];
+        rows.push((start..end).collect());
+        end = start;
+    }
+    rows.reverse();
+    rows
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -250,6 +284,8 @@ pub(crate) struct ThumbFlowLayout {
     pub(crate) visible: Range<usize>,
     pub(crate) placements: Vec<ThumbPlacement>,
     pub(crate) overflowed: bool,
+    pub(crate) page_index: usize,
+    pub(crate) page_count: usize,
 }
 
 fn thumb_widths(aspects: &[f64], range: &Range<usize>, card_h: f64, max_inner: f64) -> Vec<f64> {
@@ -306,96 +342,32 @@ fn maximal_prefix(
     start.min(end)..end
 }
 
-fn maximal_suffix(aspects: &[f64], end: usize, constraints: ThumbFlowConstraints) -> Range<usize> {
-    let end = end.min(aspects.len());
-    let mut start = end;
-    while start > 0 {
-        let candidate = start - 1..end;
-        if start == end || thumb_range_fits(aspects, &candidate, constraints) {
-            start -= 1;
-        } else {
-            break;
-        }
+fn stable_pages(aspects: &[f64], constraints: ThumbFlowConstraints) -> Vec<Range<usize>> {
+    if aspects.is_empty() {
+        return std::iter::once(0..0).collect();
     }
-    start..end
-}
-
-fn normalize_previous(previous: Option<Range<usize>>, len: usize) -> Option<Range<usize>> {
-    let mut range = previous?;
-    range.start = range.start.min(len);
-    range.end = range.end.min(len);
-    (range.start < range.end).then_some(range)
-}
-
-fn overflow_range(
-    aspects: &[f64],
-    selected: usize,
-    previous: Option<Range<usize>>,
-    direction: ThumbSlideDirection,
-    constraints: ThumbFlowConstraints,
-) -> Range<usize> {
-    let len = aspects.len();
-    if len == 0 {
-        return 0..0;
+    let mut pages = Vec::new();
+    let mut start = 0;
+    while start < aspects.len() {
+        let page = maximal_prefix(aspects, start, constraints);
+        start = page.end;
+        pages.push(page);
     }
-    let selected = selected.min(len - 1);
-    let previous = normalize_previous(previous, len);
-
-    match (direction, previous) {
-        (ThumbSlideDirection::Forward, Some(range)) => {
-            if range.contains(&selected) {
-                return range;
-            }
-            // 末项向首项循环时回到首段。/ Wrapping last -> first resets to the leading slice.
-            if selected < range.start {
-                return maximal_prefix(aspects, 0, constraints);
-            }
-            let mut next = range.start..selected + 1;
-            while next.start < selected && !thumb_range_fits(aspects, &next, constraints) {
-                next.start += 1;
-            }
-            next
-        }
-        (ThumbSlideDirection::Backward, Some(range)) => {
-            if range.contains(&selected) {
-                return range;
-            }
-            // 首项向末项循环时回到末段。/ Wrapping first -> last resets to the trailing slice.
-            if selected >= range.end {
-                return maximal_suffix(aspects, len, constraints);
-            }
-            let mut next = selected..range.end;
-            while next.end > selected + 1 && !thumb_range_fits(aspects, &next, constraints) {
-                next.end -= 1;
-            }
-            next
-        }
-        (_, Some(range))
-            if range.contains(&selected) && thumb_range_fits(aspects, &range, constraints) =>
-        {
-            range
-        }
-        _ => {
-            let leading = maximal_prefix(aspects, 0, constraints);
-            if leading.contains(&selected) {
-                leading
-            } else {
-                maximal_suffix(aspects, selected + 1, constraints)
-            }
-        }
-    }
+    pages
 }
 
 fn build_thumb_layout(
     aspects: &[f64],
     visible: Range<usize>,
     scale: f64,
-    max_inner: f64,
-    max_panel_h: f64,
-    gap: f64,
+    constraints: ThumbFlowConstraints,
     overflowed: bool,
+    page_index: usize,
+    page_count: usize,
 ) -> ThumbFlowLayout {
-    let card_h = thumb_card_h_for_scale(scale);
+    let card_h = constraints.card_h;
+    let max_inner = constraints.max_inner;
+    let gap = constraints.gap;
     let widths = thumb_widths(aspects, &visible, card_h, max_inner);
     let rows = pack_rows(&widths, max_inner, gap);
     let n_rows = rows.len().max(1);
@@ -405,11 +377,11 @@ fn build_thumb_layout(
             row.iter().map(|&i| widths[i]).sum::<f64>() + row.len().saturating_sub(1) as f64 * gap
         })
         .fold(0.0f64, f64::max);
-    // 超量时固定为最大可用网格，连续滑动不会因宽高比变化来回跳动。
-    // Overflow uses the maximum grid footprint so aspect changes do not make the
-    // panel jump in size while the visible slice slides.
+    // 超量时固定为最大可用网格，不同页面的宽高比组成不会让面板来回跳动。
+    // Overflow uses the maximum grid footprint so differing aspect mixes across
+    // stable pages do not make the panel jump in size.
     let (panel_w, panel_h) = if overflowed {
-        let max_rows = thumb_max_rows(card_h, max_panel_h, gap);
+        let max_rows = constraints.max_rows;
         (
             max_inner + H_PADDING * 2.0,
             THUMB_TOP_INSET
@@ -454,60 +426,52 @@ fn build_thumb_layout(
         visible,
         placements,
         overflowed,
+        page_index,
+        page_count,
     }
 }
 
-/// 规划缩略图网格：全部窗口能放下时在 1.0–1.5 间尽量放大；否则保持
-/// 1.0，并按导航方向滑动一个连续可见区间。
-/// Plan the thumbnail grid: enlarge all windows as much as possible from 1.0 to
-/// 1.5 when they fit; otherwise stay at 1.0 and slide a contiguous visible slice.
+/// 规划缩略图网格：窗口总数先决定 1.0–1.5 倍尺寸，比例宽度随后平衡分行；
+/// 放不下时保持该尺寸并使用从索引 0 开始的稳定分页。
+/// Plan the thumbnail grid: total window count first determines the 1.0–1.5 scale,
+/// then aspect-width cards are balanced into rows. Overflow retains that size and
+/// uses deterministic pages beginning at index zero.
 pub(crate) fn plan_thumb_flow_layout(
     aspects: &[f64],
     selected: usize,
-    previous: Option<Range<usize>>,
-    direction: ThumbSlideDirection,
     max_inner: f64,
     max_panel_h: f64,
     gap: f64,
 ) -> ThumbFlowLayout {
     let max_inner = max_inner.max(1.0);
-    if aspects.is_empty() {
-        return build_thumb_layout(aspects, 0..0, 1.0, max_inner, max_panel_h, gap, false);
-    }
-    let base_h = thumb_card_h_fixed();
-    let base_rows = thumb_max_rows(base_h, max_panel_h, gap);
-    let base_constraints = ThumbFlowConstraints {
-        card_h: base_h,
+    let scale = thumb_scale_for_count(aspects.len());
+    let card_h = thumb_card_h_for_scale(scale);
+    let constraints = ThumbFlowConstraints {
+        card_h,
         max_inner,
-        max_rows: base_rows,
+        max_rows: thumb_max_rows(card_h, max_panel_h, gap),
         gap,
     };
-    let full = 0..aspects.len();
-    let all_fit = thumb_range_fits(aspects, &full, base_constraints);
-
-    if all_fit {
-        let mut scale = 1.0;
-        let mut candidate = 1.0 + THUMB_SCALE_STEP;
-        while candidate <= THUMB_MAX_SCALE + 1e-9 {
-            let card_h = thumb_card_h_for_scale(candidate);
-            let max_rows = thumb_max_rows(card_h, max_panel_h, gap);
-            let constraints = ThumbFlowConstraints {
-                card_h,
-                max_inner,
-                max_rows,
-                gap,
-            };
-            if !thumb_range_fits(aspects, &full, constraints) {
-                break;
-            }
-            scale = candidate.min(THUMB_MAX_SCALE);
-            candidate += THUMB_SCALE_STEP;
-        }
-        return build_thumb_layout(aspects, full, scale, max_inner, max_panel_h, gap, false);
+    if aspects.is_empty() {
+        return build_thumb_layout(aspects, 0..0, scale, constraints, false, 0, 1);
     }
-
-    let visible = overflow_range(aspects, selected, previous, direction, base_constraints);
-    build_thumb_layout(aspects, visible, 1.0, max_inner, max_panel_h, gap, true)
+    let pages = stable_pages(aspects, constraints);
+    let selected = selected.min(aspects.len() - 1);
+    let page_index = pages
+        .iter()
+        .position(|page| page.contains(&selected))
+        .unwrap_or(0);
+    let visible = pages[page_index].clone();
+    let page_count = pages.len();
+    build_thumb_layout(
+        aspects,
+        visible,
+        scale,
+        constraints,
+        page_count > 1,
+        page_index,
+        page_count,
+    )
 }
 
 /// 浮窗高度 = 顶部 32 + 行数 * 卡片高 + 状态栏高(纯函数,可测)。
@@ -648,16 +612,30 @@ mod flow_tests {
     }
 
     #[test]
+    fn pack_rows_balances_mixed_widths_without_reordering() {
+        // 贪心会排成 [宽+窄] / [窄]；平衡分行把宽卡独立放置，避免末行孤卡。
+        // Greedy would produce [wide+narrow] / [narrow]; balanced wrapping keeps the
+        // wide card alone and avoids an orphaned final row.
+        let rows = pack_rows(&[400.0, 150.0, 150.0], 614.0, 14.0);
+        assert_eq!(rows, vec![vec![0], vec![1, 2]]);
+    }
+
+    #[test]
+    fn thumbnail_scale_depends_only_on_window_count() {
+        assert_eq!(thumb_scale_for_count(0), 1.0);
+        assert_eq!(thumb_scale_for_count(1), 1.5);
+        assert_eq!(thumb_scale_for_count(2), 1.5);
+        assert_eq!(thumb_scale_for_count(3), 1.4);
+        assert_eq!(thumb_scale_for_count(4), 1.3);
+        assert_eq!(thumb_scale_for_count(5), 1.2);
+        assert_eq!(thumb_scale_for_count(6), 1.1);
+        assert_eq!(thumb_scale_for_count(7), 1.0);
+        assert_eq!(thumb_scale_for_count(30), 1.0);
+    }
+
+    #[test]
     fn flow_layout_enlarges_small_sets_to_the_cap() {
-        let layout = plan_thumb_flow_layout(
-            &[1.6, 1.6],
-            1,
-            None,
-            ThumbSlideDirection::Preserve,
-            1200.0,
-            1000.0,
-            THUMB_ROW_GAP,
-        );
+        let layout = plan_thumb_flow_layout(&[1.6, 1.6], 1, 1200.0, 1000.0, THUMB_ROW_GAP);
         assert_eq!(layout.visible, 0..2);
         assert!(!layout.overflowed);
         assert!((layout.scale - THUMB_MAX_SCALE).abs() < 1e-9);
@@ -665,106 +643,89 @@ mod flow_tests {
     }
 
     #[test]
-    fn overflow_keeps_base_size_and_slides_one_card_forward() {
+    fn scale_is_unchanged_when_aspects_cause_different_wrapping() {
+        let standard = plan_thumb_flow_layout(&[1.6, 1.6, 1.6], 1, 1200.0, 1000.0, THUMB_ROW_GAP);
+        let mixed = plan_thumb_flow_layout(&[2.2, 0.7, 2.2], 1, 800.0, 1000.0, THUMB_ROW_GAP);
+        assert_eq!(standard.scale, 1.4);
+        assert_eq!(mixed.scale, 1.4);
+    }
+
+    #[test]
+    fn overflow_uses_stable_pages_instead_of_sliding() {
         let aspects = vec![1.6; 8];
         let base_h = thumb_card_h_fixed();
         let two_row_panel_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
-        let initial = plan_thumb_flow_layout(
-            &aspects,
-            1,
-            None,
-            ThumbSlideDirection::Preserve,
-            614.0,
-            two_row_panel_h,
-            THUMB_ROW_GAP,
-        );
+        let initial = plan_thumb_flow_layout(&aspects, 1, 614.0, two_row_panel_h, THUMB_ROW_GAP);
         assert!(initial.overflowed);
         assert_eq!(initial.scale, 1.0);
         assert_eq!(initial.visible, 0..4);
 
-        let next = plan_thumb_flow_layout(
-            &aspects,
-            4,
-            Some(initial.visible),
-            ThumbSlideDirection::Forward,
-            614.0,
-            two_row_panel_h,
-            THUMB_ROW_GAP,
-        );
-        assert_eq!(next.visible, 1..5);
+        let next = plan_thumb_flow_layout(&aspects, 4, 614.0, two_row_panel_h, THUMB_ROW_GAP);
+        assert_eq!(next.visible, 4..8);
+        assert_eq!(next.page_index, 1);
+        assert_eq!(next.page_count, 2);
         assert_eq!(
             next.placements
                 .iter()
                 .map(|placement| placement.index)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
+            vec![4, 5, 6, 7]
         );
     }
 
     #[test]
-    fn overflow_sliding_reaches_tail_and_mirrors_backward() {
+    fn selecting_any_item_on_a_page_keeps_the_same_page_boundary() {
         let aspects = vec![1.6; 8];
         let base_h = thumb_card_h_fixed();
         let max_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
-        let tail = plan_thumb_flow_layout(
-            &aspects,
-            7,
-            Some(3..7),
-            ThumbSlideDirection::Forward,
-            614.0,
-            max_h,
-            THUMB_ROW_GAP,
-        );
-        assert_eq!(tail.visible, 4..8);
+        for selected in 4..8 {
+            let layout = plan_thumb_flow_layout(&aspects, selected, 614.0, max_h, THUMB_ROW_GAP);
+            assert_eq!(layout.visible, 4..8);
+        }
+    }
 
-        let backward = plan_thumb_flow_layout(
-            &aspects,
-            3,
-            Some(tail.visible),
-            ThumbSlideDirection::Backward,
-            614.0,
-            max_h,
-            THUMB_ROW_GAP,
-        );
-        assert_eq!(backward.visible, 3..7);
-
-        let wrapped = plan_thumb_flow_layout(
-            &aspects,
-            0,
-            Some(4..8),
-            ThumbSlideDirection::Forward,
-            614.0,
-            max_h,
-            THUMB_ROW_GAP,
-        );
-        assert_eq!(wrapped.visible, 0..4);
-
-        let wrapped_backward = plan_thumb_flow_layout(
-            &aspects,
-            7,
-            Some(0..4),
-            ThumbSlideDirection::Backward,
-            614.0,
-            max_h,
-            THUMB_ROW_GAP,
-        );
-        assert_eq!(wrapped_backward.visible, 4..8);
+    #[test]
+    fn mixed_aspect_pages_are_contiguous_exhaustive_and_stable() {
+        let aspects = vec![2.2, 0.7, 1.6, 2.2, 1.0, 1.6, 0.7, 2.2, 1.6];
+        let scale = thumb_scale_for_count(aspects.len());
+        let card_h = thumb_card_h_for_scale(scale);
+        let constraints = ThumbFlowConstraints {
+            card_h,
+            max_inner: 614.0,
+            max_rows: 2,
+            gap: THUMB_ROW_GAP,
+        };
+        let pages = stable_pages(&aspects, constraints);
+        assert_eq!(pages.first().unwrap().start, 0);
+        assert_eq!(pages.last().unwrap().end, aspects.len());
+        for pair in pages.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+        for page in &pages {
+            assert!(!page.is_empty());
+            assert!(thumb_range_fits(&aspects, page, constraints));
+            for selected in page.clone() {
+                let layout = plan_thumb_flow_layout(
+                    &aspects,
+                    selected,
+                    constraints.max_inner,
+                    THUMB_TOP_INSET
+                        + constraints.max_rows as f64 * card_h
+                        + THUMB_ROW_GAP
+                        + STATUS_H,
+                    THUMB_ROW_GAP,
+                );
+                assert_eq!(&layout.visible, page);
+            }
+        }
     }
 
     #[test]
     fn overflow_capacity_adapts_to_mixed_aspects() {
         let aspects = vec![1.6, 1.6, 2.2, 2.2, 2.2, 2.2];
-        let base_h = thumb_card_h_fixed();
-        let max_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
-        let initial = plan_thumb_flow_layout(
-            &aspects,
-            1,
-            None,
-            ThumbSlideDirection::Preserve,
-            614.0,
-            max_h,
-            THUMB_ROW_GAP,
-        );
+        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
+        let max_h = 32.0 + card_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let initial = plan_thumb_flow_layout(&aspects, 1, 700.0, max_h, THUMB_ROW_GAP);
         // 两张标准卡可同排，宽卡只能独占一排，因此首段容量自然降为 3。
         // Two standard cards share a row while a wide card occupies its own, so
         // the leading slice naturally drops to three items.
@@ -773,15 +734,7 @@ mod flow_tests {
 
     #[test]
     fn empty_flow_layout_stays_at_base_size() {
-        let layout = plan_thumb_flow_layout(
-            &[],
-            0,
-            None,
-            ThumbSlideDirection::Preserve,
-            1200.0,
-            1000.0,
-            THUMB_ROW_GAP,
-        );
+        let layout = plan_thumb_flow_layout(&[], 0, 1200.0, 1000.0, THUMB_ROW_GAP);
         assert_eq!(layout.visible, 0..0);
         assert_eq!(layout.scale, 1.0);
         assert!(layout.placements.is_empty());

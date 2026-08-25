@@ -12,9 +12,10 @@ use flume::Sender;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalEvent {
     CmdTabPressed,
+    CmdShiftTabPressed,
     CmdReleased,
     ClipboardToggled,
 }
@@ -33,6 +34,14 @@ const K_VK_OPTION: u16 = 58;
 // 历史剪贴板呼出键:Option+V(V 键码 9)。
 // History-clipboard summon key: Option+V (V keycode 9).
 const K_VK_V: u16 = 9;
+
+fn switcher_tab_event(flags: crate::event_tap::CGEventFlags) -> GlobalEvent {
+    if flags & K_CG_EVENT_FLAG_MASK_SHIFT != 0 {
+        GlobalEvent::CmdShiftTabPressed
+    } else {
+        GlobalEvent::CmdTabPressed
+    }
+}
 
 // 标记是否已经发送过 CmdTabPressed，防止修饰键变化时误发 CmdReleased
 // Tracks whether CmdTabPressed was sent, to avoid spurious CmdReleased
@@ -92,7 +101,7 @@ unsafe extern "C" fn event_tap_callback(
                     let combo = if is_cmd { "Tab+Command" } else { "Tab+Option" };
                     log_debug!("[kbd] summon keyDown {}", combo);
                     TAB_PRESSED.store(true, Ordering::SeqCst);
-                    let _ = sender.send(GlobalEvent::CmdTabPressed);
+                    let _ = sender.send(switcher_tab_event(flags));
                     return std::ptr::null_mut();
                 }
                 log_debug!("[kbd] keyDown Tab");
@@ -194,4 +203,22 @@ pub fn start(sender: Sender<GlobalEvent>) -> std::thread::JoinHandle<()> {
             );
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shift_tab_emits_the_backward_switcher_event() {
+        assert_eq!(switcher_tab_event(0), GlobalEvent::CmdTabPressed);
+        assert_eq!(
+            switcher_tab_event(K_CG_EVENT_FLAG_MASK_SHIFT),
+            GlobalEvent::CmdShiftTabPressed
+        );
+        assert_eq!(
+            switcher_tab_event(K_CG_EVENT_FLAG_MASK_SHIFT | K_CG_EVENT_FLAG_MASK_COMMAND),
+            GlobalEvent::CmdShiftTabPressed
+        );
+    }
 }

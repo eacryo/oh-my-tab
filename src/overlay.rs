@@ -40,6 +40,9 @@ pub(crate) const KEY_UP: u16 = 126;
 pub(crate) const KEY_ESCAPE: u16 = 53;
 pub(crate) const KEY_RETURN: u16 = 36;
 pub(crate) const KEY_DELETE: u16 = 51; // Backspace
+/// NSEventModifierFlagShift，与 CGEvent 的 Shift 位一致。
+/// NSEventModifierFlagShift; it shares the Shift bit with CGEvent flags.
+const NSEVENT_MODIFIER_FLAG_SHIFT: u64 = 0x0002_0000;
 /// 卡片右上角关闭按钮的 tag(hover 显隐查找用;卡片 index 不存 tag)。
 /// The close-button tag on a card (used to find it for hover show/hide; the card
 /// index is NOT stored in the tag).
@@ -92,6 +95,10 @@ pub(crate) static CARD_INDEX_MAP: LazyLock<Mutex<HashMap<usize, usize>>> =
 /// Global window-index range currently rendered in thumbnail mode; the authoritative
 /// window list is never truncated.
 static THUMB_VISIBLE_RANGE: Mutex<Option<Range<usize>>> = Mutex::new(None);
+/// 连续上下导航保持的水平中心；水平切换、鼠标选择和新召唤时重置。
+/// Preferred horizontal center retained across consecutive vertical moves; reset
+/// by horizontal navigation, mouse selection, and a fresh summon.
+static THUMB_NAV_ANCHOR_X: Mutex<Option<f64>> = Mutex::new(None);
 type CardPlacementFrame = (usize, f64, f64, f64);
 /// Prevents hover-selection on the card under the cursor when the window first
 /// opens. Set to false in show_overlay(), flipped to true on first mouseMoved:.
@@ -131,6 +138,10 @@ fn reset_thumbnail_visible_range() {
     *THUMB_VISIBLE_RANGE.lock().unwrap() = None;
 }
 
+fn reset_thumbnail_nav_anchor() {
+    *THUMB_NAV_ANCHOR_X.lock().unwrap() = None;
+}
+
 // ========== 文本 helper / text helpers ==========
 
 /// 截断文本到指定显示宽度(ASCII 计 1、其余计 2),超出加省略号。
@@ -162,6 +173,18 @@ fn thumbnail_card_lift_y(is_selected: bool) -> f64 {
     }
 }
 
+fn horizontal_nav_index(selected: usize, len: usize, backward: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let selected = selected.min(len - 1);
+    if backward {
+        selected.checked_sub(1).unwrap_or(len - 1)
+    } else {
+        (selected + 1) % len
+    }
+}
+
 /// 窗口没有标题时(如 Microsoft To Do,AXTitle 为空)回退显示应用名。
 /// 注意:仅用于显示。内部 `window_title` 仍保持空串,这样 raise_ax_window 仍能
 /// 按空标题匹配到对应的 AX 窗口并聚焦。
@@ -181,6 +204,8 @@ fn display_title<'a>(title: &'a str, app_name: &'a str) -> &'a str {
 mod tests {
     use super::color_with_alpha;
     use super::display_title;
+    use super::edge_row_nav_index;
+    use super::horizontal_nav_index;
     use super::vertical_nav_index;
 
     /// 构造一行卡片的 rects:y 固定,x 依次排开(宽 100 间距 10)。
@@ -206,6 +231,15 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_navigation_wraps_in_both_directions() {
+        assert_eq!(horizontal_nav_index(0, 5, false), 1);
+        assert_eq!(horizontal_nav_index(4, 5, false), 0);
+        assert_eq!(horizontal_nav_index(4, 5, true), 3);
+        assert_eq!(horizontal_nav_index(0, 5, true), 4);
+        assert_eq!(horizontal_nav_index(0, 0, true), 0);
+    }
+
+    #[test]
     fn vertical_nav_picks_closest_center_in_adjacent_row() {
         // 首行 3 张(0,1,2),次行 4 张(3,4,5,6),第三行 2 张(7,8)——流式典型形态。
         // Rows of 3 / 4 / 2 -- the typical flow shape.
@@ -215,19 +249,20 @@ mod tests {
 
         // 从 1(中心 160)下移:次行中心 110/220/330/440,最近 = 4(220)。
         // From 1 (center 160) down: row-2 centers 110/220/330/440 -> nearest is 4.
-        assert_eq!(vertical_nav_index(&rects, 1, false), Some(4));
+        assert_eq!(vertical_nav_index(&rects, 1, false, 160.0), Some(4));
         // 从 4(中心 220)上移:回到 1(160 比 110/330 更近)。
         // From 4 (center 220) up: back to 1 (160 beats 110/330).
-        assert_eq!(vertical_nav_index(&rects, 4, true), Some(1));
+        assert_eq!(vertical_nav_index(&rects, 4, true, 160.0), Some(1));
         // 从 0(中心 50)下移:最近 = 3(110)。
         // From 0 (center 50) down: nearest is 3 (110).
-        assert_eq!(vertical_nav_index(&rects, 0, false), Some(3));
+        assert_eq!(vertical_nav_index(&rects, 0, false, 50.0), Some(3));
         // 从 6(中心 440)下移:第三行中心 50/160,最近 = 8(160)。
         // From 6 (center 440) down: nearest in the last row is 8 (160).
-        assert_eq!(vertical_nav_index(&rects, 6, false), Some(8));
-        // 从 8(中心 160)上移:第二行最近 = 4(中心 160,完全对齐)。
-        // From 8 (center 160) up: nearest in the middle row is 4 (center 160, aligned).
-        assert_eq!(vertical_nav_index(&rects, 8, true), Some(4));
+        assert_eq!(vertical_nav_index(&rects, 6, false, 380.0), Some(8));
+        // 保留 6 的水平锚点 380 后从 8 上移，会回到 6，而不是跟随 8 的当前中心漂到 4。
+        // Retaining card 6's x anchor (380) makes 8 -> up return to 6 instead of
+        // drifting toward card 4 from card 8's current center.
+        assert_eq!(vertical_nav_index(&rects, 8, true, 380.0), Some(6));
     }
 
     #[test]
@@ -236,16 +271,16 @@ mod tests {
         rects.extend(row(&[2, 3], 0.0));
         // 已在最上行:再往上无行 -> None(到边不动)。
         // Already on the top row: no row above -> None (edge = no-op).
-        assert_eq!(vertical_nav_index(&rects, 0, true), None);
-        assert_eq!(vertical_nav_index(&rects, 1, true), None);
+        assert_eq!(vertical_nav_index(&rects, 0, true, 50.0), None);
+        assert_eq!(vertical_nav_index(&rects, 1, true, 160.0), None);
         // 已在最下行:再往下无行 -> None。
         // Already on the bottom row: no row below -> None.
-        assert_eq!(vertical_nav_index(&rects, 2, false), None);
+        assert_eq!(vertical_nav_index(&rects, 2, false, 50.0), None);
         // 单行场景上下都是 None。
         // A single row yields None both ways.
         let single = row(&[0, 1, 2], 100.0);
-        assert_eq!(vertical_nav_index(&single, 1, true), None);
-        assert_eq!(vertical_nav_index(&single, 1, false), None);
+        assert_eq!(vertical_nav_index(&single, 1, true, 160.0), None);
+        assert_eq!(vertical_nav_index(&single, 1, false, 160.0), None);
     }
 
     #[test]
@@ -253,7 +288,15 @@ mod tests {
         // 当前 index 不在 rects 里(理论不发生,防御) -> None。
         // A current index absent from rects (defensive) -> None.
         let rects = row(&[0, 1], 100.0);
-        assert_eq!(vertical_nav_index(&rects, 99, true), None);
+        assert_eq!(vertical_nav_index(&rects, 99, true, 0.0), None);
+    }
+
+    #[test]
+    fn page_edge_navigation_uses_the_same_horizontal_anchor() {
+        let mut rects = row(&[4, 5, 6], 100.0);
+        rects.extend(row(&[7, 8], 0.0));
+        assert_eq!(edge_row_nav_index(&rects, true, 260.0), Some(6));
+        assert_eq!(edge_row_nav_index(&rects, false, 260.0), Some(8));
     }
 
     #[test]
@@ -330,7 +373,7 @@ pub(crate) unsafe fn make_centered_label(
 
 // ========== ObjC 回调实现 / ObjC callback implementations ==========
 
-pub(crate) extern "C" fn on_cmd_tab_pressed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+fn step_switcher(backward: bool) {
     // TIMING-DEBUG 端到端计时:tap 回调 → collect → show_overlay(定位卡顿段)。
     let t_end = Instant::now();
     let mut state_opt = TAB_STATE.lock().unwrap();
@@ -339,23 +382,43 @@ pub(crate) extern "C" fn on_cmd_tab_pressed(_self: *mut c_void, _cmd: Sel, _arg:
     if !state.visible {
         state.refresh();
         state.visible = true;
-        state.selected = if state.windows.len() > 1 { 1 } else { 0 };
+        state.selected = if backward {
+            state.windows.len().saturating_sub(1)
+        } else if state.windows.len() > 1 {
+            1
+        } else {
+            0
+        };
         drop(state_opt);
         reset_thumbnail_visible_range();
+        reset_thumbnail_nav_anchor();
         show_overlay();
         // TIMING-DEBUG 端到端:tap 回调 → collect_windows → show_overlay 完成。
         log_debug!("[overlay] summon e2e={}ms", t_end.elapsed().as_millis());
     } else {
-        state.selected = (state.selected + 1) % state.windows.len().max(1);
+        state.selected = horizontal_nav_index(state.selected, state.windows.len(), backward);
         drop(state_opt);
-        refresh_after_selection_change(ThumbSlideDirection::Forward, true);
+        reset_thumbnail_nav_anchor();
+        refresh_after_selection_change(true);
     }
 }
 
-/// 选中项仍在当前可见区间时只刷新样式；越过边缘时重排连续区间。
-/// Refresh styling while selection stays visible; re-plan the contiguous slice
-/// only after selection crosses an edge.
-fn refresh_after_selection_change(direction: ThumbSlideDirection, backfill_icons: bool) {
+pub(crate) extern "C" fn on_cmd_tab_pressed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    step_switcher(false);
+}
+
+pub(crate) extern "C" fn on_cmd_shift_tab_pressed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _arg: *mut c_void,
+) {
+    step_switcher(true);
+}
+
+/// 选中项仍在当前页时只刷新样式；越过固定页边界时才重建相邻页。
+/// Refresh styling while selection stays on the current page; rebuild only after
+/// crossing a deterministic page boundary.
+fn refresh_after_selection_change(backfill_icons: bool) {
     let selected = TAB_STATE
         .lock()
         .unwrap()
@@ -370,7 +433,7 @@ fn refresh_after_selection_change(direction: ThumbSlideDirection, backfill_icons
                 .is_some_and(|range| range.contains(&index))
         });
     if needs_relayout {
-        show_overlay_with_direction(direction);
+        show_overlay();
         return;
     }
     refresh_highlight();
@@ -554,6 +617,7 @@ pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _even
     if state.selected != idx {
         state.selected = idx;
         drop(state_opt);
+        reset_thumbnail_nav_anchor();
         refresh_highlight();
         update_status_label();
     } else {
@@ -587,21 +651,25 @@ unsafe fn collect_card_rects() -> Vec<(usize, f64, f64, f64)> {
     out
 }
 
-/// 几何感知的垂直导航(纯函数,可单测):跳到相邻行中水平中心最接近当前卡片的
-/// 那一张。流式布局每行卡片数不同,固定步长跳转会错位/越界,必须按实际位置。
+/// 几何感知的垂直导航(纯函数,可单测):跳到相邻行中水平中心最接近固定锚点的
+/// 那一张。锚点在连续上下移动期间不变，因此下再上可以回到原列附近。
 /// 返回 None 表示该方向没有相邻行(保持"到边不动"的语义)。
 /// 行聚类按 y 值 + 1.0pt 容差(同一行的卡片 y 完全相同,容差只防浮点漂移)。
 ///
 /// Geometry-aware vertical navigation (pure, unit-testable): jump to the card in
-/// the adjacent row whose horizontal center is CLOSEST to the current card's.
+/// the adjacent row whose horizontal center is closest to a stable anchor.
 /// Flow rows hold different card counts, so a fixed step misaligns or runs off
 /// the end. None = no adjacent row in that direction (edge = no-op semantics).
 /// Rows cluster by y with a 1pt epsilon (same-row cards share y exactly; the
 /// epsilon only guards float drift).
-fn vertical_nav_index(rects: &[(usize, f64, f64, f64)], current: usize, up: bool) -> Option<usize> {
+fn vertical_nav_index(
+    rects: &[(usize, f64, f64, f64)],
+    current: usize,
+    up: bool,
+    anchor_x: f64,
+) -> Option<usize> {
     const ROW_EPS: f64 = 1.0;
-    let (_, cx, cy, cw) = rects.iter().find(|(i, ..)| *i == current)?;
-    let cur_center = cx + cw / 2.0;
+    let (_, _, cy, _) = rects.iter().find(|(i, ..)| *i == current)?;
     let cur_y = cy;
 
     // 相邻行:同方向里 y 最接近当前行的那个。
@@ -627,11 +695,90 @@ fn vertical_nav_index(rects: &[(usize, f64, f64, f64)], current: usize, up: bool
         .iter()
         .filter(|(_, _, y, _)| (y - target_y).abs() <= ROW_EPS)
         .min_by(|a, b| {
-            let da = ((a.1 + a.3 / 2.0) - cur_center).abs();
-            let db = ((b.1 + b.3 / 2.0) - cur_center).abs();
+            let da = ((a.1 + a.3 / 2.0) - anchor_x).abs();
+            let db = ((b.1 + b.3 / 2.0) - anchor_x).abs();
             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(i, ..)| *i)
+}
+
+fn card_center_x(rects: &[(usize, f64, f64, f64)], index: usize) -> Option<f64> {
+    rects
+        .iter()
+        .find(|(i, ..)| *i == index)
+        .map(|(_, x, _, width)| x + width / 2.0)
+}
+
+fn edge_row_nav_index(rects: &[(usize, f64, f64, f64)], top: bool, anchor_x: f64) -> Option<usize> {
+    const ROW_EPS: f64 = 1.0;
+    let target_y =
+        rects
+            .iter()
+            .map(|(_, _, y, _)| *y)
+            .reduce(|a, b| if top { a.max(b) } else { a.min(b) })?;
+    rects
+        .iter()
+        .filter(|(_, _, y, _)| (y - target_y).abs() <= ROW_EPS)
+        .min_by(|a, b| {
+            let da = ((a.1 + a.3 / 2.0) - anchor_x).abs();
+            let db = ((b.1 + b.3 / 2.0) - anchor_x).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, ..)| *index)
+}
+
+/// 流式布局的上下导航：页内按固定水平锚点移动；越过页边缘时先切到稳定相邻页，
+/// 再选择其首/末行中最接近锚点的卡片。
+/// Vertical flow navigation uses a stable horizontal anchor within a page. At a
+/// page boundary it rebuilds the deterministic adjacent page, then chooses the
+/// closest card in that page's first/last row.
+unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool) {
+    let mut state_opt = TAB_STATE.lock().unwrap();
+    let Some(state) = state_opt.as_mut() else {
+        return;
+    };
+    if !state.visible || state.windows.is_empty() {
+        return;
+    }
+    let Some(current_center) = card_center_x(rects, state.selected) else {
+        return;
+    };
+    let anchor_x = {
+        let mut anchor = THUMB_NAV_ANCHOR_X.lock().unwrap();
+        *anchor.get_or_insert(current_center)
+    };
+    if let Some(index) = vertical_nav_index(rects, state.selected, up, anchor_x) {
+        state.selected = index;
+        drop(state_opt);
+        refresh_highlight();
+        update_status_label();
+        return;
+    }
+
+    let visible = THUMB_VISIBLE_RANGE.lock().unwrap().clone();
+    let Some(visible) = visible else {
+        return;
+    };
+    let provisional = if up {
+        visible.start.checked_sub(1)
+    } else {
+        (visible.end < state.windows.len()).then_some(visible.end)
+    };
+    let Some(provisional) = provisional else {
+        return;
+    };
+    state.selected = provisional;
+    drop(state_opt);
+
+    show_overlay();
+    let next_rects = collect_card_rects();
+    if let Some(index) = edge_row_nav_index(&next_rects, !up, anchor_x) {
+        if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
+            state.selected = index;
+        }
+        refresh_highlight();
+        update_status_label();
+    }
 }
 
 /// 设置 CALayer.shadowColor。CGColorRef 与 CGImageRef 同理不能进 objc2 的
@@ -667,6 +814,8 @@ unsafe fn layer_set_translation_y(layer: *mut AnyObject, y: f64) {
 pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let key_code: u16 = msg_send![event as *mut AnyObject, keyCode];
+        let modifier_flags: u64 = msg_send![event as *mut AnyObject, modifierFlags];
+        let shift_pressed = modifier_flags & NSEVENT_MODIFIER_FLAG_SHIFT != 0;
         // 几何导航的 frame 收集先于 TAB_STATE 加锁:避免 CONTAINER/TAB_STATE 交叉
         // 持有(锁序与其他路径相反会造成理论死锁)。
         // Collect nav frames BEFORE taking TAB_STATE: avoids holding CONTAINER and
@@ -684,22 +833,31 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
         }
 
         match key_code {
-            KEY_TAB | KEY_RIGHT => {
+            KEY_TAB => {
                 if !state.windows.is_empty() {
-                    state.selected = (state.selected + 1) % state.windows.len();
+                    state.selected =
+                        horizontal_nav_index(state.selected, state.windows.len(), shift_pressed);
                     drop(state_opt);
-                    refresh_after_selection_change(ThumbSlideDirection::Forward, false);
+                    reset_thumbnail_nav_anchor();
+                    refresh_after_selection_change(false);
+                }
+            }
+            KEY_RIGHT => {
+                if !state.windows.is_empty() {
+                    state.selected =
+                        horizontal_nav_index(state.selected, state.windows.len(), false);
+                    drop(state_opt);
+                    reset_thumbnail_nav_anchor();
+                    refresh_after_selection_change(false);
                 }
             }
             KEY_LEFT => {
                 if !state.windows.is_empty() {
-                    state.selected = if state.selected == 0 {
-                        state.windows.len() - 1
-                    } else {
-                        state.selected - 1
-                    };
+                    state.selected =
+                        horizontal_nav_index(state.selected, state.windows.len(), true);
                     drop(state_opt);
-                    refresh_after_selection_change(ThumbSlideDirection::Backward, false);
+                    reset_thumbnail_nav_anchor();
+                    refresh_after_selection_change(false);
                 }
             }
             KEY_UP => {
@@ -707,15 +865,8 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                     return;
                 }
                 if crate::theme::thumbnails_enabled() {
-                    // 流式布局:每行卡片数不同,按实际几何跳到正上方最近的卡片。
-                    // Flow layout: per-row counts differ; jump geometrically to the
-                    // card directly above.
-                    if let Some(idx) = vertical_nav_index(&nav_rects, state.selected, true) {
-                        state.selected = idx;
-                        drop(state_opt);
-                        refresh_highlight();
-                        update_status_label();
-                    }
+                    drop(state_opt);
+                    navigate_thumbnail_vertical(&nav_rects, true);
                 } else {
                     // 旧版均匀网格:保持原有 ±cards_per_row 行为,不变。
                     // Legacy uniform grid: the original +/-cards-per-row step, unchanged.
@@ -732,12 +883,8 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                     return;
                 }
                 if crate::theme::thumbnails_enabled() {
-                    if let Some(idx) = vertical_nav_index(&nav_rects, state.selected, false) {
-                        state.selected = idx;
-                        drop(state_opt);
-                        refresh_highlight();
-                        update_status_label();
-                    }
+                    drop(state_opt);
+                    navigate_thumbnail_vertical(&nav_rects, false);
                 } else {
                     let new_idx = state.selected + cards_per_row();
                     if new_idx < state.windows.len() {
@@ -844,6 +991,7 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
                     log_debug!("[overlay] mm select {} -> {}", state.selected, idx);
                     state.selected = idx;
                     drop(state_opt);
+                    reset_thumbnail_nav_anchor();
                     refresh_highlight();
                     update_status_label();
                 }
@@ -1295,6 +1443,7 @@ pub(crate) fn close_window_at(idx: usize) {
     // 全量重建(布局/窗口尺寸可能随行数变化),再刷新高亮。
     // Full rebuild (layout/window size may change with the row count), then the highlight.
     reset_thumbnail_visible_range();
+    reset_thumbnail_nav_anchor();
     show_overlay();
     refresh_highlight();
 }
@@ -2442,10 +2591,6 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect, f64) {
 }
 
 pub(crate) fn show_overlay() {
-    show_overlay_with_direction(ThumbSlideDirection::Preserve);
-}
-
-fn show_overlay_with_direction(direction: ThumbSlideDirection) {
     unsafe {
         // TIMING-DEBUG 阶段计时:定位 summon 卡顿——卡片构建 / 图标 / resize / 状态栏。
         let t0 = Instant::now();
@@ -2482,19 +2627,17 @@ fn show_overlay_with_direction(direction: ThumbSlideDirection) {
         let (screen_frame, screen_visible, screen_scale) = overlay_target_screen(&windows);
         let use_flow = crate::theme::thumbnails_enabled();
 
-        // (全局 index, x, y, w)——缩略图模式只产出当前连续可见区间，纯图标模式
-        // 仍产出全部窗口。
-        // (global index, x, y, w): thumbnail mode emits only the current contiguous
-        // visible slice; icon mode still emits every window.
+        // (全局 index, x, y, w)——缩略图模式只产出当前稳定页面，纯图标模式仍产出全部窗口。
+        // (global index, x, y, w): thumbnail mode emits only the current stable page;
+        // icon mode still emits every window.
         let (h, w, placements, card_h_use): (f64, f64, Vec<CardPlacementFrame>, f64) = if use_flow {
-            // ===== 流式布局(缩略图模式):等高不等宽,贪心装箱,行内居中 =====
+            // ===== 流式布局(缩略图模式):等高不等宽,平衡分行,行内居中 =====
             // 窗口宽高比决定卡宽;极端比例被 clamp_aspect 钳制;每行能容纳的
-            // 卡片数随行内已占宽度自然变化。全部能放下时在 1.0–1.5 间尽量
-            // 放大；放不下时保持 1.0，并随选择滑动连续可见区间。
+            // 卡片数随行内已占宽度自然变化。窗口总数先决定 1.0–1.5 尺寸，
+            // 换行不反向改变尺寸；放不下时使用固定页面边界。
             // ===== Flow layout (thumbnail mode): uniform height, per-aspect widths
-            // ===== greedily packed into rows; per-row capacity varies naturally.
-            // Enlarge from 1.0 to 1.5 while everything fits; on overflow, retain
-            // 1.0 and slide a contiguous visible slice with the selection.
+            // ===== balanced into rows; per-row capacity varies naturally. Window count
+            // determines the 1.0-1.5 size before wrapping; overflow uses stable pages.
             let gap = THUMB_ROW_GAP;
             let screen_inner = (screen_frame.size.width - H_PADDING * 2.0).max(160.0);
             let max_inner = (screen_inner * 0.92)
@@ -2513,23 +2656,16 @@ fn show_overlay_with_direction(direction: ThumbSlideDirection) {
                     }
                 })
                 .collect();
-            let previous = THUMB_VISIBLE_RANGE.lock().unwrap().clone();
-            let layout = plan_thumb_flow_layout(
-                &aspects,
-                selected,
-                previous,
-                direction,
-                max_inner,
-                max_panel_h,
-                gap,
-            );
+            let layout = plan_thumb_flow_layout(&aspects, selected, max_inner, max_panel_h, gap);
             *THUMB_VISIBLE_RANGE.lock().unwrap() = Some(layout.visible.clone());
             log_debug!(
-                "[overlay] flow scale={:.2} visible={}..{} of {} overflow={}",
+                "[overlay] flow scale={:.2} visible={}..{} of {} page={}/{} overflow={}",
                 layout.scale,
                 layout.visible.start,
                 layout.visible.end,
                 windows.len(),
+                layout.page_index + 1,
+                layout.page_count,
                 layout.overflowed
             );
             let placements = layout

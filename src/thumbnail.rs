@@ -345,8 +345,8 @@ impl<K: Eq + Clone, V: Clone> Lru<K, V> {
 
 // ========== 缓存状态 ==========
 
-/// 大量窗口连续滑动时保留更多相邻帧；窗口列表本身没有数量上限。
-/// Retain more neighboring frames for large sliding window sets; the authoritative
+/// 大量窗口分页时保留更多相邻帧；窗口列表本身没有数量上限。
+/// Retain more neighboring frames around large paged window sets; the authoritative
 /// window list itself has no count limit.
 const CACHE_MAX_ITEMS: usize = 64;
 /// 约 64MB 成本上限(w*h*4 记账)，可容纳约 40 张常见 16:10 缩略图。
@@ -366,9 +366,9 @@ const ACTIVATION_CAPTURE_DELAY_MS: u64 = 350;
 const BASE_TARGET_PX_H: u32 = 512;
 const CAPTURE_HEIGHT_BUCKETS: [u32; 4] = [512, 640, 768, 1024];
 const MAX_TARGET_PX_H: u32 = 1024;
-/// 连续可见区间两侧的预取窗口数；新卡滑入前通常已经有缓存。
-/// Number of windows prefetched on each side of the visible slice so newly slid-in
-/// cards normally already have a cached frame.
+/// 当前页面两侧的预取窗口数；切到相邻页前通常已经有缓存。
+/// Number of windows prefetched on each side of the current page so adjacent-page
+/// cards normally already have cached frames.
 const VISIBLE_PREFETCH_MARGIN: usize = 4;
 
 /// Clone 为浅拷贝(CGImageRef 位拷贝),所有权纪律:缓存持有 +1,克隆方仅在

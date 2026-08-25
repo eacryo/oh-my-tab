@@ -617,6 +617,12 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(handleCmdShiftTabPressed:),
+            on_cmd_shift_tab_pressed as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleCmdReleased:),
             on_cmd_released as *mut c_void,
             types_v_obj.as_ptr(),
@@ -1301,6 +1307,7 @@ fn main() {
         while let Ok(event) = event_rx.recv() {
             let action = match event {
                 GlobalEvent::CmdTabPressed => sel!(handleCmdTabPressed:),
+                GlobalEvent::CmdShiftTabPressed => sel!(handleCmdShiftTabPressed:),
                 GlobalEvent::CmdReleased => sel!(handleCmdReleased:),
                 GlobalEvent::ClipboardToggled => sel!(onClipboardToggled:),
             };
@@ -1318,11 +1325,11 @@ fn main() {
     });
 
     // 冒烟测试入口(--smoke-overlay):完整初始化后直接驱动召唤路径，再遍历并循环
-    // 一次窗口列表，覆盖超量布局的连续滑动/回绕；随后泵 2 秒主 runloop 让异步
+    // 一次窗口列表并反向一步，覆盖超量布局的稳定分页/双向回绕；随后泵 2 秒主 runloop 让异步
     // 缩略图投递(thumbnailReady)落地，无崩溃 exit(0)。用于无头验证 Cmd+Tab
     // 链路(合成按键到不了 CGEventTap，无法从外部触发)。
     // Smoke-test entry (--smoke-overlay): after full init, drive a summon directly,
-    // then traverse and wrap the window list once to cover overflow sliding. Pump
+    // then traverse, wrap, and step backward once to cover stable bidirectional paging. Pump
     // the main runloop for 2s so async thumbnail deliveries (thumbnailReady) land,
     // and exit(0) on survival. Synthetic keystrokes never reach the CGEventTap, so
     // this path must be driven internally.
@@ -1348,6 +1355,11 @@ fn main() {
                     std::ptr::null_mut(),
                 );
             }
+            on_cmd_shift_tab_pressed(
+                std::ptr::null_mut(),
+                sel!(handleCmdShiftTabPressed:),
+                std::ptr::null_mut(),
+            );
             let rl: *mut AnyObject = msg_send![class!(NSRunLoop), currentRunLoop];
             let date: *mut AnyObject =
                 msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 2.0f64];
