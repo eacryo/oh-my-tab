@@ -476,9 +476,9 @@ impl ThemeColors {
             // visible light surface carrying the caption and preview (the faint accent
             // tint was invisible on the glass panel -- user-reported).
             card_bg_sel: "FFFFFFE0".into(),
-            // 设计稿 .item.selected 的 1px 清晰描边 rgba(75,123,236,.78)——白底上
+            // 设计稿 .item.selected 的 1.5px 清晰描边 rgba(75,123,236,.78)——白底上
             // 唯一可见的轮廓线(2px 柔色圈在白底上不可见,见 refresh_highlight 注释)。
-            // The mockup's crisp 1px selected border rgba(75,123,236,.78) -- the only
+            // The mockup's crisp 1.5px selected border rgba(75,123,236,.78) -- the only
             // outline visible against the white surface (a 2px soft ring disappears
             // on white; see the refresh_highlight comment).
             card_border_sel: "4B7BECC7".into(),
