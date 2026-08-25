@@ -316,6 +316,12 @@ pub(crate) struct ThumbFlowLayout {
     pub(crate) panel_w: f64,
     pub(crate) panel_h: f64,
     pub(crate) card_h: f64,
+    /// 完整 document 中所有卡片的稳定坐标,滚动时不重新计算或改写。
+    /// Stable coordinates for every card in the complete document; scrolling never rewrites them.
+    pub(crate) document_placements: Vec<ThumbPlacement>,
+    /// document 高度(不含状态栏,对应 NSClipView 的 document view 高度)。
+    /// Document height excluding the status bar, matching the NSClipView document view height.
+    pub(crate) document_h: f64,
     pub(crate) scale: f64,
     pub(crate) visible: Range<usize>,
     pub(crate) placements: Vec<ThumbPlacement>,
@@ -474,6 +480,8 @@ fn build_thumb_layout(
         panel_w,
         panel_h,
         card_h,
+        document_placements: placements.clone(),
+        document_h: (panel_h - STATUS_H).max(1.0),
         scale,
         visible,
         placements,
@@ -555,6 +563,29 @@ fn build_thumb_scroll_layout(
     } else {
         panel_w
     };
+    let document_h = THUMB_TOP_INSET
+        + all_rows.len() as f64 * constraints.card_h
+        + all_rows.len().saturating_sub(1) as f64 * constraints.gap;
+    let document_panel_h = document_h + STATUS_H;
+    let mut document_placements = Vec::new();
+    for (row_index, row) in all_rows.iter().enumerate() {
+        let row_w = row.iter().map(|&i| widths[i]).sum::<f64>()
+            + row.len().saturating_sub(1) as f64 * constraints.gap;
+        let mut x = (card_area_w - row_w) / 2.0;
+        let y = document_panel_h
+            - THUMB_TOP_INSET
+            - (row_index as f64 + 1.0) * constraints.card_h
+            - row_index as f64 * constraints.gap;
+        for &index in row {
+            document_placements.push(ThumbPlacement {
+                index,
+                x,
+                y,
+                width: widths[index],
+            });
+            x += widths[index] + constraints.gap;
+        }
+    }
     let mut placements = Vec::with_capacity(visible.len());
     for (local_row, row) in all_rows[row_start..row_end].iter().enumerate() {
         let row_w = row.iter().map(|&i| widths[i]).sum::<f64>()
@@ -579,6 +610,8 @@ fn build_thumb_scroll_layout(
         panel_w,
         panel_h,
         card_h: constraints.card_h,
+        document_placements,
+        document_h,
         scale,
         visible,
         placements,

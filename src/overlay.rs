@@ -82,6 +82,9 @@ const SELECTED_CARD_LIFT: f64 = 1.0;
 
 pub(crate) static OVERLAY_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 pub(crate) static CONTAINER: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// 持久的卡片 document view;滚动时只移动 CONTAINER 的 bounds,不重建卡片树。
+/// Persistent card document view; scrolling moves CONTAINER bounds instead of rebuilding cards.
+pub(crate) static CARD_DOCUMENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
 pub(crate) static STATUS_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// 缩略图溢出时显示的原生竖向滚动条。
 /// Native vertical scroller shown when the thumbnail rows overflow the viewport.
@@ -113,6 +116,12 @@ static THUMB_SCROLL_OFFSET: Mutex<f64> = Mutex::new(0.0);
 /// 当前完整布局允许的最大 point 偏移。
 /// Maximum point offset allowed by the current complete layout.
 static THUMB_SCROLL_MAX_OFFSET: Mutex<f64> = Mutex::new(0.0);
+/// 当前缩略图 document 的高度(不含状态栏),用于设置 NSClipView 的合法滚动范围。
+/// Current thumbnail document height excluding the status bar, used for the clip-view range.
+static THUMB_DOCUMENT_HEIGHT: Mutex<f64> = Mutex::new(0.0);
+/// 当前卡片预览所需的像素高度,滚动进入新行时复用同一捕获规格。
+/// Current preview pixel demand, reused when scrolling into a new row.
+static THUMB_CAPTURE_TARGET_PX_H: Mutex<u32> = Mutex::new(512);
 /// 当前完整布局的行间距(卡片高度 + 行间距),供键盘整行导航复用。
 /// Current full-layout row pitch (card height + row gap), reused by whole-row keyboard navigation.
 static THUMB_SCROLL_ROW_PITCH: Mutex<f64> = Mutex::new(1.0);
@@ -149,9 +158,22 @@ pub(crate) fn thumbnail_scroller() -> Option<ObjPtr> {
 /// Read the card index from the card index map (keyed by view pointer).
 /// This avoids msg_send! encoding issues with property accessors on
 /// dynamically-registered ObjC classes.
-pub(crate) fn get_card_index(view: *mut AnyObject) -> usize {
+pub(crate) fn get_card_index(view: *mut AnyObject) -> Option<usize> {
     let map = CARD_INDEX_MAP.lock().unwrap();
-    map.get(&(view as usize)).copied().unwrap_or(0)
+    map.get(&(view as usize)).copied()
+}
+
+fn card_document() -> Option<*mut AnyObject> {
+    CARD_DOCUMENT.lock().unwrap().map(|document| document.0)
+}
+
+unsafe fn card_views(document: *mut AnyObject) -> Vec<*mut AnyObject> {
+    let subviews: *mut AnyObject = msg_send![document, subviews];
+    let count: usize = msg_send![subviews, count];
+    (0..count)
+        .map(|i| msg_send![subviews, objectAtIndex: i])
+        .filter(|view| get_card_index(*view).is_some())
+        .collect()
 }
 
 pub(crate) fn set_card_index(view: *mut AnyObject, idx: usize) {
@@ -183,8 +205,74 @@ fn reset_thumbnail_scroll() {
     *THUMB_SCROLL_ROW.lock().unwrap() = 0;
     *THUMB_SCROLL_OFFSET.lock().unwrap() = 0.0;
     *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = 0.0;
+    *THUMB_DOCUMENT_HEIGHT.lock().unwrap() = 0.0;
     *THUMB_SCROLL_ROW_PITCH.lock().unwrap() = 1.0;
     clear_thumbnail_scroll_drag();
+}
+
+fn visible_range_for_scroll(
+    rows: &[Range<usize>],
+    max_rows: usize,
+    row_pitch: f64,
+    offset: f64,
+) -> (Range<usize>, usize) {
+    if rows.is_empty() || row_pitch <= 0.0 || !row_pitch.is_finite() {
+        return (0..0, 0);
+    }
+    let viewport_rows = max_rows.max(1).min(rows.len());
+    let max_row_start = rows.len().saturating_sub(viewport_rows);
+    let row_start = (offset.max(0.0) / row_pitch).floor() as usize;
+    let row_start = row_start.min(max_row_start);
+    let intra_row_offset = (offset.max(0.0) - row_start as f64 * row_pitch).max(0.0);
+    let has_partial_row = intra_row_offset > f64::EPSILON && row_start + viewport_rows < rows.len();
+    let row_end = (row_start + viewport_rows + usize::from(has_partial_row)).min(rows.len());
+    let visible = rows[row_start].start..rows[row_end - 1].end;
+    (visible, row_start)
+}
+
+fn update_thumbnail_scroll_state(offset: f64) -> bool {
+    let rows = THUMB_ROW_RANGES.lock().unwrap().clone().unwrap_or_default();
+    let max_rows = *THUMB_MAX_ROWS.lock().unwrap();
+    let row_pitch = *THUMB_SCROLL_ROW_PITCH.lock().unwrap();
+    let (visible, row_start) = visible_range_for_scroll(&rows, max_rows, row_pitch, offset);
+    let mut current = THUMB_VISIBLE_RANGE.lock().unwrap();
+    let changed = current.as_ref() != Some(&visible);
+    *current = Some(visible);
+    drop(current);
+    *THUMB_SCROLL_ROW.lock().unwrap() = row_start;
+    changed
+}
+
+unsafe fn apply_thumbnail_clip_offset() {
+    let Some(container) = (*CONTAINER.lock().unwrap()).map(|container| container.0) else {
+        return;
+    };
+    let bounds: NSRect = msg_send![container, bounds];
+    let requested_max = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
+    let document_h = *THUMB_DOCUMENT_HEIGHT.lock().unwrap();
+    let legal_max = (document_h - bounds.size.height).max(0.0);
+    let max_offset = if document_h > 0.0 {
+        requested_max.min(legal_max)
+    } else {
+        requested_max
+    };
+    let offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+    // AppKit 的 y 轴向上:逻辑 offset=0 对应 document 顶部,所以 bounds 从最大值开始。
+    // AppKit's y axis grows upward: logical offset=0 is the document top, so bounds starts at max.
+    let origin_y = (max_offset - offset).clamp(0.0, max_offset.max(0.0));
+    let _: () = msg_send![
+        container,
+        setBoundsOrigin: NSPoint::new(bounds.origin.x, origin_y)
+    ];
+    let _: () = msg_send![container, setNeedsDisplay: true];
+}
+
+fn apply_thumbnail_scroll_offset() {
+    let offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+    update_thumbnail_scroll_state(offset);
+    unsafe {
+        apply_thumbnail_clip_offset();
+    }
 }
 
 /// 让选中项所在行进入视口;已在视口时不改变用户通过滚轮选择的滚动位置。
@@ -246,15 +334,16 @@ pub(crate) fn set_thumbnail_scroll_offset(next: f64, max_offset: f64) {
     }
     *offset = next;
     drop(offset);
-    show_overlay();
-    // 滚动后重新命中固定指针下的卡片;滚动条本身不会参与卡片命中。
-    // Re-hit-test the card under the stationary pointer after scrolling; the scrollbar itself is
-    // never treated as a card.
-    container_mouse_moved(
-        std::ptr::null_mut(),
-        sel!(mouseMoved:),
-        std::ptr::null_mut(),
-    );
+    let visible_changed = update_thumbnail_scroll_state(next);
+    apply_thumbnail_scroll_offset();
+    if visible_changed {
+        let target_px_h = *THUMB_CAPTURE_TARGET_PX_H.lock().unwrap();
+        crate::thumbnail::refresh_for_summon(target_px_h);
+    }
+    // 滚动停止约 50ms 后再命中固定指针,避免滚动途中高光随经过的卡片反复跳动。
+    // Re-hit-test the stationary pointer about 50ms after scrolling stops, avoiding highlight
+    // churn while cards pass under the cursor during a gesture.
+    schedule_deferred_scroll_hover();
 }
 
 pub(crate) fn thumbnail_scroller_set_fraction_for_smoke(fraction: f64) {
@@ -591,9 +680,8 @@ pub(crate) extern "C" fn on_cmd_shift_tab_pressed(
     step_switcher(true);
 }
 
-/// 选中项仍在当前页时只刷新样式；越过固定页边界时才重建相邻页。
-/// Refresh styling while selection stays on the current page; rebuild only after
-/// crossing a deterministic page boundary.
+/// 选中项越过当前视口时只移动 clip bounds,不重建卡片树。
+/// Move clip bounds when selection leaves the viewport; never rebuild the card tree.
 fn refresh_after_selection_change(backfill_icons: bool) {
     let selected = TAB_STATE
         .lock()
@@ -610,10 +698,10 @@ fn refresh_after_selection_change(backfill_icons: bool) {
         });
     if needs_relayout {
         if let Some(index) = selected {
-            ensure_thumbnail_selection_visible(index);
+            if ensure_thumbnail_selection_visible(index) {
+                apply_thumbnail_scroll_offset();
+            }
         }
-        show_overlay();
-        return;
     }
     refresh_highlight();
     update_status_label();
@@ -631,7 +719,9 @@ pub(crate) extern "C" fn on_close_card(_self: *mut c_void, _cmd: Sel, sender: *m
     if card.is_null() {
         return;
     }
-    let idx = get_card_index(card);
+    let Some(idx) = get_card_index(card) else {
+        return;
+    };
     close_window_at(idx);
 }
 
@@ -757,7 +847,9 @@ extern "C" fn close_button_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *
 }
 
 pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    let idx = get_card_index(_self as *mut AnyObject);
+    let Some(idx) = get_card_index(_self as *mut AnyObject) else {
+        return;
+    };
     let mut state_opt = TAB_STATE.lock().unwrap();
     let state = state_opt.as_mut().unwrap();
     if let Some(w) = state.windows.get(idx) {
@@ -782,7 +874,9 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
 pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
     // Ignore hover until the user has moved the mouse at least once.
     // Prevents selecting the card under the cursor when the window first opens.
-    let idx = get_card_index(_self as *mut AnyObject);
+    let Some(idx) = get_card_index(_self as *mut AnyObject) else {
+        return;
+    };
     if !MOUSE_MOVED.load(Ordering::Relaxed) {
         log_debug!(
             "[overlay] card {} mouseEntered (gated, mouse not moved yet)",
@@ -810,19 +904,15 @@ pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _even
 /// Collect (index, x, y, width) for every card from the live container subviews
 /// (actual frames; the status-bar labels are skipped).
 unsafe fn collect_card_rects() -> Vec<(usize, f64, f64, f64)> {
-    let container = match *CONTAINER.lock().unwrap() {
-        Some(c) => c.0,
+    let document = match card_document() {
+        Some(document) => document,
         None => return Vec::new(),
     };
-    let subviews: *mut AnyObject = msg_send![container, subviews];
-    let count: usize = msg_send![subviews, count];
     let mut out: Vec<(usize, f64, f64, f64)> = Vec::new();
-    for i in 0..count {
-        let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-        if is_overlay_non_card_subview(sv) {
+    for sv in card_views(document) {
+        let Some(idx) = get_card_index(sv) else {
             continue;
-        }
-        let idx = get_card_index(sv);
+        };
         let f: NSRect = msg_send![sv, frame];
         out.push((idx, f.origin.x, f.origin.y, f.size.width));
     }
@@ -887,6 +977,7 @@ fn card_center_x(rects: &[(usize, f64, f64, f64)], index: usize) -> Option<f64> 
         .map(|(_, x, _, width)| x + width / 2.0)
 }
 
+#[cfg(test)]
 fn edge_row_nav_index(rects: &[(usize, f64, f64, f64)], top: bool, anchor_x: f64) -> Option<usize> {
     const ROW_EPS: f64 = 1.0;
     let target_y =
@@ -905,11 +996,9 @@ fn edge_row_nav_index(rects: &[(usize, f64, f64, f64)], top: bool, anchor_x: f64
         .map(|(index, ..)| *index)
 }
 
-/// 流式布局的上下导航：页内按固定水平锚点移动；越过页边缘时先切到稳定相邻页，
-/// 再选择其首/末行中最接近锚点的卡片。
-/// Vertical flow navigation uses a stable horizontal anchor within a page. At a
-/// page boundary it rebuilds the deterministic adjacent page, then chooses the
-/// closest card in that page's first/last row.
+/// 流式布局的上下导航:完整 document 中按固定水平锚点移动,越过视口时只移动 clip bounds。
+/// Vertical flow navigation uses the complete document and a stable horizontal anchor; crossing
+/// the viewport only moves clip bounds.
 unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool) {
     let mut state_opt = TAB_STATE.lock().unwrap();
     let Some(state) = state_opt.as_mut() else {
@@ -929,35 +1018,7 @@ unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool
         state.selected = index;
         drop(state_opt);
         if ensure_thumbnail_selection_visible(index) {
-            show_overlay();
-        } else {
-            refresh_highlight();
-            update_status_label();
-        }
-        return;
-    }
-
-    let visible = THUMB_VISIBLE_RANGE.lock().unwrap().clone();
-    let Some(visible) = visible else {
-        return;
-    };
-    let provisional = if up {
-        visible.start.checked_sub(1)
-    } else {
-        (visible.end < state.windows.len()).then_some(visible.end)
-    };
-    let Some(provisional) = provisional else {
-        return;
-    };
-    state.selected = provisional;
-    drop(state_opt);
-
-    ensure_thumbnail_selection_visible(provisional);
-    show_overlay();
-    let next_rects = collect_card_rects();
-    if let Some(index) = edge_row_nav_index(&next_rects, !up, anchor_x) {
-        if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
-            state.selected = index;
+            apply_thumbnail_scroll_offset();
         }
         refresh_highlight();
         update_status_label();
@@ -1337,10 +1398,6 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_up(
     *THUMB_SCROLL_DRAG.lock().unwrap() = None;
 }
 
-unsafe fn is_overlay_non_card_subview(view: *mut AnyObject) -> bool {
-    msg_send![view, isKindOfClass: class!(NSTextField)]
-}
-
 /// 更新滚动条的轨道、滑块比例和当前位置;无溢出时完全隐藏,避免干扰旧布局。
 /// Update the scroller track, knob proportion, and position; hide it without overflow so the
 /// legacy layout is unaffected.
@@ -1395,33 +1452,29 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
     // summons would never hover-select if we only relied on mouseEntered (verified).
     MOUSE_MOVED.store(true, Ordering::Relaxed);
     unsafe {
-        let container = match *CONTAINER.lock().unwrap() {
-            Some(c) => c.0,
+        let document = match card_document() {
+            Some(document) => document,
             None => return,
         };
-        let container_frame: NSRect = msg_send![container, frame];
-        let loc = NSPoint::new(
-            loc.x - container_frame.origin.x,
-            loc.y - container_frame.origin.y,
-        );
-        let subviews: *mut AnyObject = msg_send![container, subviews];
-        let sv_count: usize = msg_send![subviews, count];
-        for i in 0..sv_count {
-            let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            // 跳过状态栏 label(与 refresh_highlight 同款判断)。
-            // Skip the status label (same check as refresh_highlight).
-            if is_overlay_non_card_subview(sv) {
-                continue;
-            }
+        // 交给 AppKit 转换,自动包含 clip bounds 的滚动偏移,不再手工减 container frame。
+        // Let AppKit convert the point so clip bounds scrolling is included automatically.
+        let document_point: NSPoint = msg_send![
+            document,
+            convertPoint: loc,
+            fromView: std::ptr::null::<AnyObject>()
+        ];
+        for sv in card_views(document) {
             let frame: NSRect = msg_send![sv, frame];
-            let inside = loc.x >= frame.origin.x
-                && loc.x <= frame.origin.x + frame.size.width
-                && loc.y >= frame.origin.y
-                && loc.y <= frame.origin.y + frame.size.height;
+            let inside = document_point.x >= frame.origin.x
+                && document_point.x <= frame.origin.x + frame.size.width
+                && document_point.y >= frame.origin.y
+                && document_point.y <= frame.origin.y + frame.size.height;
             if !inside {
                 continue;
             }
-            let idx = get_card_index(sv);
+            let Some(idx) = get_card_index(sv) else {
+                continue;
+            };
             let mut state_opt = TAB_STATE.lock().unwrap();
             if let Some(state) = state_opt.as_mut() {
                 if state.selected != idx {
@@ -1596,6 +1649,46 @@ pub(crate) extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _e
             mouse_screen.y - win_frame.origin.y,
         );
         handle_hover_at(loc);
+    }
+}
+
+fn schedule_deferred_scroll_hover() {
+    unsafe {
+        let Some(controller) = *crate::CONTROLLER.lock().unwrap() else {
+            return;
+        };
+        let selector = sel!(handleDeferredScrollHover:);
+        let _: () = msg_send![
+            class!(NSObject),
+            cancelPreviousPerformRequestsWithTarget: controller.0,
+            selector: selector,
+            object: std::ptr::null::<AnyObject>()
+        ];
+        let _: () = msg_send![
+            controller.0,
+            performSelector: selector,
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: 0.05f64
+        ];
+    }
+}
+
+pub(crate) extern "C" fn on_deferred_scroll_hover(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _arg: *mut c_void,
+) {
+    let visible = TAB_STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|state| state.visible);
+    if visible {
+        container_mouse_moved(
+            std::ptr::null_mut(),
+            sel!(mouseMoved:),
+            std::ptr::null_mut(),
+        );
     }
 }
 
@@ -1969,8 +2062,8 @@ fn schedule_delayed_order_out() {
 
 pub(crate) fn refresh_highlight() {
     unsafe {
-        let container = match *CONTAINER.lock().unwrap() {
-            Some(c) => c.0,
+        let document = match card_document() {
+            Some(document) => document,
             None => return,
         };
         let state_opt = TAB_STATE.lock().unwrap();
@@ -1989,17 +2082,11 @@ pub(crate) fn refresh_highlight() {
         let sel_bg_color = hex_to_cg_color(colors.card_bg_sel);
         let sel_border_color = hex_to_cg_color(colors.card_border_sel);
 
-        let subviews: *mut AnyObject = msg_send![container, subviews];
-        let sv_count: usize = msg_send![subviews, count];
-
-        for i in 0..sv_count {
-            let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            // Only operate on card views (skip the status label and scrollbar).
-            if is_overlay_non_card_subview(sv) {
-                continue;
-            }
+        for sv in card_views(document) {
             let layer: *mut AnyObject = msg_send![sv, layer];
-            let tag = get_card_index(sv);
+            let Some(tag) = get_card_index(sv) else {
+                continue;
+            };
             // 读卡片标题 label 文本,验证内容与索引对应(排查"显示 Picview 却打开 Ghostty")。
             // Read the card's title-label text to verify content matches the index (investigating
             // "shows Picview but opens Ghostty").
@@ -2222,22 +2309,18 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
 
     unsafe {
         let thumbnail_capture_allowed = crate::thumbnail::capture_allowed();
-        let container = match *CONTAINER.lock().unwrap() {
-            Some(c) => c.0,
+        let document = match card_document() {
+            Some(document) => document,
             None => return,
         };
-        let subviews: *mut AnyObject = msg_send![container, subviews];
-        let sv_count: usize = msg_send![subviews, count];
 
         // Collect affected card views + their frames first; don't mutate the
         // subview array while iterating it.
         let mut replacements: Vec<(*mut AnyObject, NSRect, usize)> = Vec::new();
-        for i in 0..sv_count {
-            let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            if is_overlay_non_card_subview(sv) {
+        for sv in card_views(document) {
+            let Some(idx) = get_card_index(sv) else {
                 continue;
-            }
-            let idx = get_card_index(sv);
+            };
             if to_rebuild.contains_key(&idx) {
                 let frame: NSRect = msg_send![sv, frame];
                 replacements.push((sv, frame, idx));
@@ -2259,7 +2342,7 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
                 );
                 let _: () = msg_send![new_card, setFrame: frame];
                 let _: () = msg_send![old_view, removeFromSuperview];
-                let _: () = msg_send![container, addSubview: new_card];
+                let _: () = msg_send![document, addSubview: new_card];
                 release_obj(new_card); // container owns the card; drop create_card_view's alloc +1
             }
         }
@@ -2301,19 +2384,15 @@ pub(crate) fn refresh_thumbnail_previews(indices: &[usize]) {
         let capture_allowed =
             crate::theme::thumbnails_enabled() && crate::thumbnail::capture_allowed();
         let colors = current_colors();
-        let container = match *CONTAINER.lock().unwrap() {
-            Some(container) => container.0,
+        let document = match card_document() {
+            Some(document) => document,
             None => return,
         };
-        let subviews: *mut AnyObject = msg_send![container, subviews];
-        let count: usize = msg_send![subviews, count];
         let mut updated = 0usize;
-        for i in 0..count {
-            let card: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            if is_overlay_non_card_subview(card) {
+        for card in card_views(document) {
+            let Some(index) = get_card_index(card) else {
                 continue;
-            }
-            let index = get_card_index(card);
+            };
             let Some(window) = windows.get(&index) else {
                 continue;
             };
@@ -3127,18 +3206,18 @@ pub(crate) fn show_overlay() {
 
         let window = OVERLAY_WINDOW.lock().unwrap().unwrap().0;
         let container = CONTAINER.lock().unwrap().unwrap().0;
+        let document = CARD_DOCUMENT.lock().unwrap().unwrap().0;
 
-        // Remove old card subviews (keep the status label and scrollbar).
-        let subviews: *mut AnyObject = msg_send![container, subviews];
+        // Remove old cards from the persistent document, never remove the document itself.
+        // 从持久 document 中移除旧卡片,绝不能移除 document view 本身。
+        let subviews: *mut AnyObject = msg_send![document, subviews];
         let sv_count: usize = msg_send![subviews, count];
         // Iterate in reverse since we're removing from the array
         let mut i = sv_count;
         while i > 0 {
             i -= 1;
             let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            if !is_overlay_non_card_subview(sv) {
-                let _: () = msg_send![sv, removeFromSuperview];
-            }
+            let _: () = msg_send![sv, removeFromSuperview];
         }
         let t_remove_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
@@ -3154,11 +3233,17 @@ pub(crate) fn show_overlay() {
         // per create_card_view call.
         let thumbnail_capture_allowed = use_flow && crate::thumbnail::capture_allowed();
 
-        // (全局 index, x, y, w)——缩略图模式只产出当前滚动视口，纯图标模式仍产出全部窗口。
-        // (global index, x, y, w): thumbnail mode emits only the current scrolling viewport;
-        // icon mode still emits every window.
+        // (全局 index, x, y, w)——缩略图模式输出完整 document 的稳定坐标,纯图标模式也输出全部窗口。
+        // (global index, x, y, w): thumbnail mode emits stable coordinates for the complete
+        // document; icon mode also emits every window.
         let mut thumb_scroll_metrics: Option<(bool, usize, usize)> = None;
-        let (h, w, placements, card_h_use): (f64, f64, Vec<CardPlacementFrame>, f64) = if use_flow {
+        let (h, w, placements, card_h_use, document_h): (
+            f64,
+            f64,
+            Vec<CardPlacementFrame>,
+            f64,
+            f64,
+        ) = if use_flow {
             // ===== 流式布局(缩略图模式):等高不等宽,单页平衡分行,溢出时优先填满前行 =====
             // 窗口宽高比决定卡宽;极端比例被 clamp_aspect 钳制;每行能容纳的
             // 卡片数随行内已占宽度自然变化。窗口总数先决定 1.0–1.5 尺寸，
@@ -3222,11 +3307,17 @@ pub(crate) fn show_overlay() {
                 layout.overflowed
             );
             let placements = layout
-                .placements
+                .document_placements
                 .into_iter()
                 .map(|p| (p.index, p.x, p.y, p.width))
                 .collect();
-            (layout.panel_h, layout.panel_w, placements, layout.card_h)
+            (
+                layout.panel_h,
+                layout.panel_w,
+                placements,
+                layout.card_h,
+                layout.document_h,
+            )
         } else {
             reset_thumbnail_visible_range();
             reset_thumbnail_scroll();
@@ -3262,7 +3353,7 @@ pub(crate) fn show_overlay() {
                 let y = h - 32.0 - (row + 1) as f64 * card_h();
                 placements.push((idx, x, y, card_w_eff));
             }
-            (h, w, placements, card_h())
+            (h, w, placements, card_h(), (h - STATUS_H).max(1.0))
         };
         let card_h_outer = card_h_use;
         // 截图像素需求必须在流式布局确定卡片实际高度后计算：同一块 2x 屏上，少窗口
@@ -3276,6 +3367,7 @@ pub(crate) fn show_overlay() {
             crate::thumbnail::target_px_height(thumb_preview_h(card_h_outer), screen_scale)
         });
         if let Some(target_px_h) = capture_target_px_h {
+            *THUMB_CAPTURE_TARGET_PX_H.lock().unwrap() = target_px_h;
             log_debug!(
                 "[overlay] thumbnail target_h={} preview_h={:.1}pt backing_scale={:.2}",
                 target_px_h,
@@ -3309,8 +3401,8 @@ pub(crate) fn show_overlay() {
             );
             let _: () = msg_send![card, setFrame: card_frame];
 
-            let _: () = msg_send![container, addSubview: card];
-            release_obj(card); // container owns the card; drop create_card_view's alloc +1
+            let _: () = msg_send![document, addSubview: card];
+            release_obj(card); // document owns the card; drop create_card_view's alloc +1
         }
         let t_cards_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
@@ -3329,6 +3421,15 @@ pub(crate) fn show_overlay() {
                 NSSize::new(w, (h - STATUS_H).max(1.0))
             )
         ];
+        let _: () = msg_send![
+            document,
+            setFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(w, document_h.max(1.0))
+            )
+        ];
+        *THUMB_DOCUMENT_HEIGHT.lock().unwrap() = document_h.max(1.0);
+        apply_thumbnail_clip_offset();
         if let Some((overflowed, row_count, max_rows)) = thumb_scroll_metrics {
             update_thumbnail_scroller(w, h, overflowed, row_count, max_rows);
         } else if let Some(scroller) = thumbnail_scroller() {

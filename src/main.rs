@@ -647,6 +647,22 @@ fn create_overlay_window() -> *mut AnyObject {
         let _: () = msg_send![content_parent, addSubview: container];
         *CONTAINER.lock().unwrap() = Some(ObjPtr(container));
 
+        // NSClipView 只负责可视窗口;卡片全部挂在持久 document view 上,滚动时只移动 bounds。
+        // NSClipView is only the viewport; all cards live in a persistent document view and
+        // scrolling moves the bounds instead of rebuilding the card hierarchy.
+        let document: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let document: *mut AnyObject = msg_send![
+            document,
+            initWithFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(w, (h - STATUS_H).max(1.0))
+            )
+        ];
+        let _: () = msg_send![document, setWantsLayer: false];
+        let _: () = msg_send![container, setDocumentView: document];
+        *CARD_DOCUMENT.lock().unwrap() = Some(ObjPtr(document));
+        release_obj(document);
+
         // --- Status label at bottom (standard coords: y=0 is bottom) ---
         let status_font: *mut AnyObject = {
             let cfg = CONFIG.read().unwrap();
@@ -735,6 +751,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleDelayedOrderOut:),
             on_delayed_order_out as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleDeferredScrollHover:),
+            on_deferred_scroll_hover as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
