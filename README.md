@@ -90,6 +90,8 @@ The picker's "Clear all" keeps pinned entries; per-entry delete (Backspace), aut
 
 ## <img height="16" src="docs/icons/alert.svg">&nbsp;&nbsp;Known Issues
 
+**Some background-app thumbnails may temporarily appear white**: WindowServer can only capture the surface an app currently provides. A long-suspended WebView app (for example, Clash Verge Rev) may return its title bar with a white content area, especially just after oh-my-tab starts with an empty in-memory thumbnail cache. Activating the app and allowing its content to redraw lets a later capture recover the preview. Thumbnail frames are never written to disk, so a previous good frame cannot survive an oh-my-tab restart.
+
 **Closing a window brings the same app's other window forward (macOS-native)**: closing the frontmost window of the active app makes macOS activate the app's remaining window — e.g. closing a Chrome incognito window brings the regular Chrome window to the front. oh-my-tab receives no event at that moment and does nothing; the next summon merely reflects the real frontmost window. This is identical to the behavior of the system Cmd+Tab.
 
 If windows are already open when the app starts, their ordering differs from the native Cmd+Tab order. This is because there is no initial window-ordering data; oh-my-tab builds it by continuously observing window changes after launch.
