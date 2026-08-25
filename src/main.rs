@@ -264,9 +264,10 @@ extern "C" fn on_app_launched(_self: *mut c_void, _cmd: Sel, notification: *mut 
 }
 
 /// NSWorkspaceDidTerminateApplicationNotification 转发点(main 线程):
-/// 通知缩略图模块卸载该 App 的 observer。
+/// 通知缩略图模块取消捕获、清缓存并卸载该 App 的 observer。
 /// Forwarding point for NSWorkspaceDidTerminateApplicationNotification (main
-/// thread): tells the thumbnail module to uninstall that app's observer.
+/// thread): tells the thumbnail module to cancel captures, clear cached frames,
+/// and uninstall that app's observer.
 extern "C" fn on_app_terminated(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
     let pid: i32 = unsafe {
         let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
@@ -1228,9 +1229,9 @@ fn main() {
         ];
         CFRelease(launch_name as *const c_void);
 
-        // App 退出通知:缩略图模块据此卸载该 App 的 AXObserver(缓存由 LRU 自然淘汰)。
-        // App-terminate notice: the thumbnail module uninstalls that app's observer
-        // (cached entries age out via the LRU).
+        // App 退出通知:缩略图模块据此取消待处理捕获并清理 observer/缓存。
+        // App-terminate notice: the thumbnail module cancels pending captures and
+        // removes the app's observer/cache entries.
         let term_name = make_nsstring("NSWorkspaceDidTerminateApplicationNotification");
         let _: () = msg_send![nc,
             addObserver: controller,
@@ -1289,11 +1290,11 @@ fn main() {
         clipboard::start();
     }
 
-    // 7e. 窗口缩略图服务:常驻 AXObserver 监听新窗口 + 内存 LRU 缓存。无屏幕录制
-    // 权限时 worker 每任务前 preflight 自动休眠,浮窗保持纯图标渲染。
-    // Window thumbnails: resident AXObserver listener + memory LRU. Without the
-    // Screen Recording permission the worker sleeps per-job (preflighted) and the
-    // overlay keeps icon-only rendering.
+    // 7e. 窗口缩略图服务:有界启动预热 + 常驻 AXObserver + 内存 LRU。无屏幕录制
+    // 权限时启动预热跳过、worker 每任务前 preflight,浮窗保持纯图标渲染。
+    // Window thumbnails: bounded startup prewarming + resident AXObserver + memory
+    // LRU. Without Screen Recording permission startup prewarming is skipped and
+    // the worker preflights each job, while the overlay keeps icon-only rendering.
     let thumbs_enabled = CONFIG
         .read()
         .map(|c| c.layout.thumbnails_enabled)

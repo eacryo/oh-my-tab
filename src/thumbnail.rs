@@ -32,7 +32,8 @@
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CString};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -257,6 +258,7 @@ pub(crate) struct Lru<K: Eq + Clone, V: Clone> {
     max_items: usize,
     max_cost: u64,
     cost: fn(&V) -> u64,
+    total_cost: u64,
     items: VecDeque<(K, V)>, // 队尾 = 最近使用 / back = most recently used
 }
 
@@ -266,6 +268,7 @@ impl<K: Eq + Clone, V: Clone> Lru<K, V> {
             max_items,
             max_cost,
             cost,
+            total_cost: 0,
             items: VecDeque::new(),
         }
     }
@@ -280,8 +283,16 @@ impl<K: Eq + Clone, V: Clone> Lru<K, V> {
         Some(v)
     }
 
-    fn total_cost(&self) -> u64 {
-        self.items.iter().map(|(_, v)| (self.cost)(v)).sum()
+    /// 只读元数据探测:不改变 LRU 次序。新鲜度/目标尺寸检查不能把未渲染条目
+    /// 伪装成最近使用；只有真正渲染的 get() 才提升 recency。
+    /// Read-only metadata probe that does not alter LRU order. Freshness/target-size
+    /// checks must not make an unrendered entry look recently used; only rendering
+    /// through get() should bump recency.
+    fn peek(&self, key: &K) -> Option<V> {
+        self.items
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.clone())
     }
 
     /// 插入/更新(移到队尾);超出容量或总成本时从头驱逐**旧条目**,驱逐项原样
@@ -296,24 +307,28 @@ impl<K: Eq + Clone, V: Clone> Lru<K, V> {
         let mut evicted: Vec<V> = Vec::new();
         if let Some(idx) = self.items.iter().position(|(k, _)| *k == key) {
             let (_, old) = self.items.remove(idx).unwrap();
+            self.total_cost = self.total_cost.saturating_sub((self.cost)(&old));
             evicted.push(old);
         }
+        self.total_cost = self.total_cost.saturating_add((self.cost)(&val));
         self.items.push_back((key, val));
         // 先挤旧帧;队尾新帧只在条目数超限时才参与驱逐(见函数注释)。
         // Evict old frames first; the back item only participates when the item
         // count itself is over the cap (see the fn doc).
         while self.items.len() > 1
-            && (self.items.len() > self.max_items || self.total_cost() > self.max_cost)
+            && (self.items.len() > self.max_items || self.total_cost > self.max_cost)
         {
             let Some((_, v)) = self.items.pop_front() else {
                 break;
             };
+            self.total_cost = self.total_cost.saturating_sub((self.cost)(&v));
             evicted.push(v);
         }
         while self.items.len() > self.max_items {
             let Some((_, v)) = self.items.pop_front() else {
                 break;
             };
+            self.total_cost = self.total_cost.saturating_sub((self.cost)(&v));
             evicted.push(v);
         }
         evicted
@@ -327,6 +342,7 @@ impl<K: Eq + Clone, V: Clone> Lru<K, V> {
         while i < self.items.len() {
             if pred((&self.items[i].0, &self.items[i].1)) {
                 let (_, v) = self.items.remove(i).unwrap();
+                self.total_cost = self.total_cost.saturating_sub((self.cost)(&v));
                 removed.push(v);
             } else {
                 i += 1;
@@ -370,6 +386,12 @@ const MAX_TARGET_PX_H: u32 = 1024;
 /// Number of windows prefetched on each side of the current page so adjacent-page
 /// cards normally already have cached frames.
 const VISIBLE_PREFETCH_MARGIN: usize = 4;
+/// 启动时只预热最可能出现在第一页的 MRU 工作集，避免窗口数超过缓存容量时
+/// 先捕获、后立即驱逐。其余窗口在实际进入可见页时按高优先级补拍。
+/// Prewarm only the MRU working set most likely to appear on the first page, avoiding
+/// capture-then-immediate-eviction when the window count exceeds cache capacity. The
+/// rest are captured at high priority when they actually enter a visible page.
+const STARTUP_PREWARM_MAX: usize = 24;
 
 /// Clone 为浅拷贝(CGImageRef 位拷贝),所有权纪律:缓存持有 +1,克隆方仅在
 /// 显式 CFRetain 后才能长期持有(见 lookup_retained)。
@@ -465,47 +487,28 @@ fn cached_summon_refresh_decision(
     required_px_h: u32,
     is_frontmost: bool,
 ) -> SummonRefreshDecision {
-    // get() 会提升最近使用,需要可变借用。
-    // get() bumps recency, so it needs a mutable borrow.
-    let mut cache = CACHE.lock().unwrap();
+    let cache = CACHE.lock().unwrap();
     let cached = cache
-        .get(&ThumbKey { pid, wid })
+        .peek(&ThumbKey { pid, wid })
         .map(|t| (t.captured, t.captured_for_px_h));
     summon_refresh_decision(cached, required_px_h, Instant::now(), is_frontmost)
 }
 
-fn is_cached_fresh_for(pid: i32, wid: u32, required_px_h: u32) -> bool {
-    // get() 会提升最近使用,需要可变借用。
-    // get() bumps recency, so it needs a mutable borrow.
-    let mut cache = CACHE.lock().unwrap();
-    cache
-        .get(&ThumbKey { pid, wid })
-        .map(|t| {
-            cached_frame_is_usable(
-                t.captured,
-                t.captured_for_px_h,
-                required_px_h,
-                Instant::now(),
-            )
-        })
-        .unwrap_or(false)
-}
-
 fn cached_target_px_height(pid: i32, wid: u32) -> u32 {
-    let mut cache = CACHE.lock().unwrap();
+    let cache = CACHE.lock().unwrap();
     cache
-        .get(&ThumbKey { pid, wid })
+        .peek(&ThumbKey { pid, wid })
         .map(|t| t.captured_for_px_h.max(BASE_TARGET_PX_H))
         .unwrap_or(BASE_TARGET_PX_H)
 }
 
-pub(crate) fn is_cached_fresh(pid: i32, wid: u32) -> bool {
-    is_cached_fresh_for(pid, wid, BASE_TARGET_PX_H)
-}
-
 fn cache_store(pid: i32, wid: u32, t: CachedThumb) {
-    let mut cache = CACHE.lock().unwrap();
-    for evicted in cache.put(ThumbKey { pid, wid }, t) {
+    // 释放大型 CGImage 可能回收 IOSurface/位图存储；先放开缓存锁，避免主线程
+    // lookup 在释放期间被无谓阻塞。
+    // Releasing a large CGImage may reclaim IOSurface/bitmap storage. Drop the
+    // cache lock first so main-thread lookups are not blocked by destruction.
+    let evicted = CACHE.lock().unwrap().put(ThumbKey { pid, wid }, t);
+    for evicted in evicted {
         unsafe {
             CFRelease(evicted.img);
         }
@@ -514,142 +517,454 @@ fn cache_store(pid: i32, wid: u32, t: CachedThumb) {
 
 // ========== 捕获管线(flume 队列 + 单 worker 串行限流) ==========
 
-/// 同时记录队列中/执行中的键及其最高目标高度。更高清请求会合并到 existing entry；
-/// 若捕获已经按较低目标开始，finish 返回最高目标让 worker 自动补拍。
-/// Tracks queued/in-flight keys and their highest requested height. A higher-resolution
-/// request merges into the existing entry; if capture already started lower, finish returns
-/// the higher target so the worker automatically runs a follow-up.
+/// 捕获优先级。值越大越先执行；同优先级保持首次入队 FIFO。启动预热永远可被
+/// 后续召唤的选中/可见请求原地提升，不需要复制第二份任务。
+/// Capture priority. Higher values run first; equal priorities retain initial FIFO
+/// order. Startup prewarm work can be promoted in place by later selected/visible
+/// requests without duplicating the job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CapturePriority {
+    Startup,
+    NewWindow,
+    Prefetch,
+    Visible,
+    Activation,
+    Selected,
+}
+
+impl CapturePriority {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::NewWindow => "new-window",
+            Self::Prefetch => "prefetch",
+            Self::Visible => "visible",
+            Self::Activation => "activation",
+            Self::Selected => "selected",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingCapture {
+    target_px_h: u32,
+    priority: CapturePriority,
+    sequence: u64,
+    token: u64,
+    pid_generation: u64,
+    activation_at: Option<Instant>,
+    freshness_sequence: u64,
+    enqueued_at: Instant,
+    running: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CaptureJob {
+    key: ThumbKey,
+    target_px_h: u32,
+    priority: CapturePriority,
+    token: u64,
+    pid_generation: u64,
+    activation_at: Option<Instant>,
+    freshness_sequence: u64,
+    enqueued_at: Instant,
+}
+
+/// 同时记录 queued/in-flight 请求的最高目标、最高优先级和生命周期 token。
+/// worker 每次被 channel 信号唤醒后从这里选最高优先级任务，因此 channel 自身
+/// 只负责计数/唤醒，不再决定执行顺序。
+/// Tracks the highest target, priority, and lifecycle token for queued/in-flight
+/// requests. The channel is only a count/wakeup mechanism; on each wake the worker
+/// selects the highest-priority job here instead of inheriting channel FIFO order.
 #[derive(Default)]
 struct CaptureState {
-    desired: HashMap<ThumbKey, u32>,
+    desired: HashMap<ThumbKey, PendingCapture>,
+    pid_generations: HashMap<i32, u64>,
+    terminated_pids: HashSet<i32>,
+    next_sequence: u64,
+    next_token: u64,
+    next_freshness_sequence: u64,
 }
 
 impl CaptureState {
-    fn request(&mut self, key: ThumbKey, target_px_h: u32) -> bool {
+    fn next_counter(counter: &mut u64) -> u64 {
+        *counter = counter.wrapping_add(1);
+        if *counter == 0 {
+            *counter = 1;
+        }
+        *counter
+    }
+
+    fn request(&mut self, key: ThumbKey, target_px_h: u32, priority: CapturePriority) -> bool {
+        let pid_generation = self.pid_generations.get(&key.pid).copied().unwrap_or(0);
+        self.request_for_generation(key, target_px_h, priority, pid_generation)
+    }
+
+    fn request_for_generation(
+        &mut self,
+        key: ThumbKey,
+        target_px_h: u32,
+        priority: CapturePriority,
+        pid_generation: u64,
+    ) -> bool {
+        if self.terminated_pids.contains(&key.pid)
+            || self.pid_generations.get(&key.pid).copied().unwrap_or(0) != pid_generation
+        {
+            return false;
+        }
+        let freshness_sequence = Self::next_counter(&mut self.next_freshness_sequence);
         match self.desired.entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(target_px_h);
+                let sequence = Self::next_counter(&mut self.next_sequence);
+                let token = Self::next_counter(&mut self.next_token);
+                entry.insert(PendingCapture {
+                    target_px_h,
+                    priority,
+                    sequence,
+                    token,
+                    pid_generation,
+                    activation_at: None,
+                    freshness_sequence: 0,
+                    enqueued_at: Instant::now(),
+                    running: false,
+                });
                 true
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                *entry.get_mut() = (*entry.get()).max(target_px_h);
+                let pending = entry.get_mut();
+                pending.target_px_h = pending.target_px_h.max(target_px_h);
+                pending.priority = pending.priority.max(priority);
+                if priority == CapturePriority::Selected && pending.activation_at.take().is_some() {
+                    pending.freshness_sequence = freshness_sequence;
+                }
                 false
             }
         }
     }
 
-    fn target_for(&self, key: ThumbKey) -> Option<u32> {
-        self.desired.get(&key).copied()
+    fn request_activation(
+        &mut self,
+        key: ThumbKey,
+        target_px_h: u32,
+        activated_at: Instant,
+        pid_generation: u64,
+    ) -> bool {
+        if self.terminated_pids.contains(&key.pid)
+            || self.pid_generations.get(&key.pid).copied().unwrap_or(0) != pid_generation
+        {
+            return false;
+        }
+        let inserted = self.request_for_generation(
+            key,
+            target_px_h,
+            CapturePriority::Activation,
+            pid_generation,
+        );
+        let freshness_sequence = Self::next_counter(&mut self.next_freshness_sequence);
+        if let Some(pending) = self.desired.get_mut(&key) {
+            pending.activation_at = Some(activated_at);
+            pending.freshness_sequence = freshness_sequence;
+        }
+        inserted
     }
 
-    fn finish(&mut self, key: ThumbKey, captured_target_px_h: u32) -> Option<u32> {
-        let desired = self.desired.get(&key).copied()?;
-        if desired > captured_target_px_h {
-            Some(desired)
-        } else {
-            self.desired.remove(&key);
-            None
+    fn take_next(&mut self) -> Option<CaptureJob> {
+        let key = self
+            .desired
+            .iter()
+            .filter(|(_, pending)| !pending.running)
+            .min_by_key(|(_, pending)| (Reverse(pending.priority), pending.sequence))
+            .map(|(key, _)| *key)?;
+        let pending = self.desired.get_mut(&key)?;
+        pending.running = true;
+        Some(CaptureJob {
+            key,
+            target_px_h: pending.target_px_h,
+            priority: pending.priority,
+            token: pending.token,
+            pid_generation: pending.pid_generation,
+            activation_at: pending.activation_at,
+            freshness_sequence: pending.freshness_sequence,
+            enqueued_at: pending.enqueued_at,
+        })
+    }
+
+    fn is_current(&self, job: CaptureJob) -> bool {
+        self.pid_generations.get(&job.key.pid).copied().unwrap_or(0) == job.pid_generation
+            && self
+                .desired
+                .get(&job.key)
+                .is_some_and(|pending| pending.token == job.token)
+    }
+
+    fn finish(&mut self, job: CaptureJob) -> bool {
+        let Some(pending) = self.desired.get_mut(&job.key) else {
+            return false;
+        };
+        if pending.token != job.token || pending.pid_generation != job.pid_generation {
+            return false;
         }
+        if pending.target_px_h > job.target_px_h
+            || pending.priority > job.priority
+            || pending.freshness_sequence > job.freshness_sequence
+        {
+            pending.running = false;
+            pending.enqueued_at = Instant::now();
+            true
+        } else {
+            self.desired.remove(&job.key);
+            false
+        }
+    }
+
+    fn cancel_pid(&mut self, pid: i32) {
+        let generation = self.pid_generations.entry(pid).or_default();
+        *generation = generation.wrapping_add(1);
+        self.terminated_pids.insert(pid);
+        self.desired.retain(|key, _| key.pid != pid);
+    }
+
+    fn activate_pid(&mut self, pid: i32) {
+        let generation = self.pid_generations.entry(pid).or_default();
+        *generation = generation.wrapping_add(1);
+        self.terminated_pids.remove(&pid);
+        self.desired.retain(|key, _| key.pid != pid);
+    }
+
+    fn pid_generation(&self, pid: i32) -> u64 {
+        self.pid_generations.get(&pid).copied().unwrap_or(0)
     }
 }
 
 static CAPTURE_STATE: LazyLock<Mutex<CaptureState>> =
     LazyLock::new(|| Mutex::new(CaptureState::default()));
-static JOB_TX: OnceLock<flume::Sender<ThumbKey>> = OnceLock::new();
+static JOB_TX: OnceLock<flume::Sender<()>> = OnceLock::new();
 
 /// 尝试安排一次捕获；返回 false 表示相同窗口已 pending/in-flight，或 worker 已退出。
 /// Try to schedule one capture; false means the same window is already pending/in-flight,
 /// or the worker has exited.
-fn enqueue_job(pid: i32, wid: u32, target_px_h: u32) -> bool {
+fn enqueue_job(pid: i32, wid: u32, target_px_h: u32, priority: CapturePriority) -> bool {
+    enqueue_job_inner(pid, wid, target_px_h, priority, None)
+}
+
+/// 仅当 PID 仍处于生产者观察到的 generation 时入队，阻止终止前的延迟任务污染
+/// PID 复用后的新进程。
+/// Enqueue only while the PID remains in the generation observed by the producer,
+/// preventing delayed work from an old process from contaminating a reused PID.
+fn enqueue_job_for_generation(
+    pid: i32,
+    wid: u32,
+    target_px_h: u32,
+    priority: CapturePriority,
+    pid_generation: u64,
+) -> bool {
+    enqueue_job_inner(pid, wid, target_px_h, priority, Some(pid_generation))
+}
+
+fn enqueue_activation_job(
+    pid: i32,
+    wid: u32,
+    target_px_h: u32,
+    activated_at: Instant,
+    pid_generation: u64,
+) -> bool {
     let key = ThumbKey { pid, wid };
-    if !CAPTURE_STATE.lock().unwrap().request(key, target_px_h) {
+    let tx = ensure_capture_worker();
+    let accepted = CAPTURE_STATE.lock().unwrap().request_activation(
+        key,
+        target_px_h,
+        activated_at,
+        pid_generation,
+    );
+    if !accepted {
         return false;
     }
-    let tx = JOB_TX.get_or_init(|| {
-        let (tx, rx) = flume::unbounded::<ThumbKey>();
-        let retry_tx = tx.clone();
-        std::thread::Builder::new()
-            .name("thumb-capture".into())
-            .spawn(move || {
-                log_debug!("[thumb] capture worker online");
-                for key in rx.iter() {
-                    let target_px_h = CAPTURE_STATE
-                        .lock()
-                        .unwrap()
-                        .target_for(key)
-                        .unwrap_or(BASE_TARGET_PX_H);
-                    log_debug!(
-                        "[thumb] job recv pid={} wid={} target_h={}",
-                        key.pid,
-                        key.wid,
-                        target_px_h
-                    );
-                    run_capture_job(key, target_px_h);
-                    // 捕获期间若来了更高清请求，保留 active 并自行补发；否则成功、失败、
-                    // 权限跳过都释放，后续召唤可重试。
-                    // If a higher request arrived during capture, keep the key active and
-                    // self-enqueue a follow-up; otherwise release it after success, failure,
-                    // or a permission skip so later summons can retry.
-                    let follow_up = CAPTURE_STATE.lock().unwrap().finish(key, target_px_h);
-                    if follow_up.is_some() && retry_tx.send(key).is_err() {
-                        CAPTURE_STATE.lock().unwrap().desired.remove(&key);
-                    }
-                }
-            })
-            .expect("spawn thumb-capture worker");
-        tx
-    });
-    if tx.send(key).is_err() {
+    if tx.send(()).is_err() {
         CAPTURE_STATE.lock().unwrap().desired.remove(&key);
         return false;
     }
     true
 }
 
-fn run_capture_job(key: ThumbKey, target_px_h: u32) {
-    // 每个任务前重新 preflight:未授权时静默跳过(运行中授权后自动恢复)。
-    // Re-preflight per job: silently skip while unauthorized (auto-resumes once
-    // granted mid-run).
-    if !capture_allowed() || !crate::theme::thumbnails_enabled() {
+fn enqueue_job_inner(
+    pid: i32,
+    wid: u32,
+    target_px_h: u32,
+    priority: CapturePriority,
+    expected_generation: Option<u64>,
+) -> bool {
+    let key = ThumbKey { pid, wid };
+    let tx = ensure_capture_worker();
+    let accepted = {
+        let mut state = CAPTURE_STATE.lock().unwrap();
+        match expected_generation {
+            Some(generation) => {
+                state.request_for_generation(key, target_px_h, priority, generation)
+            }
+            None => state.request(key, target_px_h, priority),
+        }
+    };
+    if !accepted {
+        return false;
+    }
+    if tx.send(()).is_err() {
+        CAPTURE_STATE.lock().unwrap().desired.remove(&key);
+        return false;
+    }
+    true
+}
+
+fn ensure_capture_worker() -> &'static flume::Sender<()> {
+    JOB_TX.get_or_init(|| {
+        let (tx, rx) = flume::unbounded::<()>();
+        let retry_tx = tx.clone();
+        std::thread::Builder::new()
+            .name("thumb-capture".into())
+            .spawn(move || {
+                log_debug!("[thumb] capture worker online");
+                for () in rx.iter() {
+                    let Some(job) = CAPTURE_STATE.lock().unwrap().take_next() else {
+                        continue;
+                    };
+                    log_debug!(
+                        "[thumb] job recv pid={} wid={} target_h={} priority={} queue_ms={}",
+                        job.key.pid,
+                        job.key.wid,
+                        job.target_px_h,
+                        job.priority.label(),
+                        job.enqueued_at.elapsed().as_millis()
+                    );
+                    run_capture_job(job);
+                    // 捕获期间若来了更高清、更高优先级或更新的 activation 请求，保留
+                    // active 并自行补发，避免恢复后的刷新被更早任务吞掉。
+                    // If a higher-resolution, higher-priority, or newer activation request
+                    // arrived during capture, keep the key active and self-enqueue a follow-up
+                    // so an earlier job cannot swallow the post-resume refresh.
+                    let follow_up = CAPTURE_STATE.lock().unwrap().finish(job);
+                    if follow_up && retry_tx.send(()).is_err() {
+                        CAPTURE_STATE.lock().unwrap().desired.remove(&job.key);
+                    }
+                }
+            })
+            .expect("spawn thumb-capture worker");
+        tx
+    })
+}
+
+fn run_capture_job(job: CaptureJob) {
+    let key = job.key;
+    if !CAPTURE_STATE.lock().unwrap().is_current(job) {
         log_debug!(
-            "[thumb] job skipped (allowed={}, enabled={})",
-            capture_allowed(),
-            crate::theme::thumbnails_enabled()
+            "[thumb] job skipped stale pid={} wid={} priority={}",
+            key.pid,
+            key.wid,
+            job.priority.label()
         );
         return;
     }
-    let Some(t) = (unsafe { capture_window(key.wid, target_px_h) }) else {
+    // 每个任务前重新 preflight:未授权时静默跳过(运行中授权后自动恢复)。
+    // Re-preflight per job: silently skip while unauthorized (auto-resumes once
+    // granted mid-run).
+    let allowed = capture_allowed();
+    let enabled = crate::theme::thumbnails_enabled();
+    if !allowed || !enabled {
+        log_debug!(
+            "[thumb] job skipped (allowed={}, enabled={})",
+            allowed,
+            enabled
+        );
+        return;
+    }
+    if job
+        .activation_at
+        .is_some_and(|activated_at| !activation_capture_is_valid_now(key.pid, activated_at))
+    {
+        log_debug!(
+            "[thumb] activation job skipped after losing frontmost pid={} wid={}",
+            key.pid,
+            key.wid
+        );
+        return;
+    }
+    let job_started = Instant::now();
+    let Some(captured) = (unsafe { capture_window(key.wid, job.target_px_h) }) else {
         log_debug!("[thumb] capture failed pid={} wid={}", key.pid, key.wid);
         return;
     };
+    if job
+        .activation_at
+        .is_some_and(|activated_at| !activation_capture_is_valid_now(key.pid, activated_at))
+    {
+        unsafe {
+            CFRelease(captured.thumb.img);
+        }
+        log_debug!(
+            "[thumb] activation result discarded after losing frontmost pid={} wid={}",
+            key.pid,
+            key.wid
+        );
+        return;
+    }
+    // 生命周期校验与缓存写入共用 CAPTURE_STATE 锁。终止路径按同一锁序取消任务并
+    // 清缓存，因此结果不可能在 Remove 之后重新插入。
+    // Validate lifecycle and write the cache while holding CAPTURE_STATE. Termination
+    // takes the same lock before cancellation/cache eviction, so a result cannot be
+    // inserted again after removal.
+    let state = CAPTURE_STATE.lock().unwrap();
+    if !state.is_current(job) {
+        unsafe {
+            CFRelease(captured.thumb.img);
+        }
+        log_debug!(
+            "[thumb] captured result discarded stale pid={} wid={} priority={}",
+            key.pid,
+            key.wid,
+            job.priority.label()
+        );
+        return;
+    }
     log_debug!(
-        "[thumb] captured pid={} wid={} {}x{} target_h={}",
+        "[thumb] captured pid={} wid={} src={}x{} out={}x{} target_h={} priority={} capture_ms={} scale_ms={} total_ms={}",
         key.pid,
         key.wid,
-        t.w_px,
-        t.h_px,
-        t.captured_for_px_h
+        captured.src_w,
+        captured.src_h,
+        captured.thumb.w_px,
+        captured.thumb.h_px,
+        captured.thumb.captured_for_px_h,
+        job.priority.label(),
+        captured.capture_ms,
+        captured.scale_ms,
+        job_started.elapsed().as_millis()
     );
-    cache_store(key.pid, key.wid, t);
+    cache_store(key.pid, key.wid, captured.thumb);
+    drop(state);
     // 不再按任务来源预先决定是否投递：启动预热也可能在浮窗打开后才完成。
     // Do not decide delivery from the request source: startup pre-generation may
     // also finish after the overlay has opened.
     if overlay_wants(key.pid, key.wid) {
         // 先写队列再跳主线程(handler 消费时有完整缓存)。
         // Queue before hopping to main (the handler sees complete cache entries).
-        READY_QUEUE.lock().unwrap().push(key);
-        let ctrl = match *crate::CONTROLLER.lock().unwrap() {
-            Some(c) => c.0,
-            None => return,
+        enqueue_ready_delivery(key);
+    }
+}
+
+fn activation_capture_is_valid_now(pid: i32, activated_at: Instant) -> bool {
+    if !crate::window_collector::app_activation_is_current(pid, activated_at) {
+        return false;
+    }
+    unsafe {
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+        let frontmost = if app.is_null() {
+            false
+        } else {
+            let frontmost_pid: i32 = msg_send![app, processIdentifier];
+            frontmost_pid == pid
         };
-        unsafe {
-            let _: () = msg_send![
-                ctrl,
-                performSelectorOnMainThread: sel!(thumbnailReady:),
-                withObject: std::ptr::null::<AnyObject>(),
-                waitUntilDone: false
-            ];
-        }
+        let _: () = msg_send![pool, drain];
+        frontmost
     }
 }
 
@@ -677,11 +992,22 @@ fn overlay_wants(pid: i32, wid: u32) -> bool {
 /// The user may have arrowed away or closed the overlay mid-generation, so every
 /// key is re-verified.
 pub(crate) fn handle_ready_main() {
-    let keys: Vec<ThumbKey> = std::mem::take(&mut *READY_QUEUE.lock().unwrap());
+    // scheduled=false 与 drain 必须在同一队列锁内完成：否则 worker 可能在两步之间
+    // 看到旧的 true、放入新 key 却不再安排回调。
+    // Clear scheduled and drain under the same queue lock. Otherwise a worker can
+    // observe the old true between those steps, append a key, and leave it without
+    // a future callback.
+    let keys: Vec<ThumbKey> = {
+        let mut ready = READY_QUEUE.lock().unwrap();
+        let keys = std::mem::take(&mut *ready);
+        READY_DELIVERY_SCHEDULED.store(false, Ordering::Release);
+        keys
+    };
     if keys.is_empty() {
         return;
     }
     let visible = crate::overlay::thumbnail_visible_range();
+    let keys: HashSet<ThumbKey> = keys.into_iter().collect();
     let indices: Vec<usize> = {
         let state_opt = crate::TAB_STATE.lock().unwrap();
         let state = match state_opt.as_ref() {
@@ -691,29 +1017,66 @@ pub(crate) fn handle_ready_main() {
         if !state.visible {
             return;
         }
-        keys.iter()
-            .filter_map(|k| {
-                state
-                    .windows
-                    .iter()
-                    .position(|w| w.pid == k.pid && w.window_id == k.wid)
+        state
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(index, window)| {
+                keys.contains(&ThumbKey {
+                    pid: window.pid,
+                    wid: window.window_id,
+                }) && visible.as_ref().is_none_or(|range| range.contains(index))
             })
-            .filter(|index| visible.as_ref().is_none_or(|range| range.contains(index)))
+            .map(|(index, _)| index)
             .collect()
     };
     if !indices.is_empty() {
-        crate::overlay::rebuild_cards(&indices);
+        crate::overlay::refresh_thumbnail_previews(&indices);
     }
 }
 
 static READY_QUEUE: Mutex<Vec<ThumbKey>> = Mutex::new(Vec::new());
+static READY_DELIVERY_SCHEDULED: AtomicBool = AtomicBool::new(false);
+
+/// 多个 worker 完成通知共享一个主线程 selector；handler 一次清空当前 key 批次。
+/// Multiple worker completions share one outstanding main-thread selector; the
+/// handler drains the current key batch in one pass.
+fn enqueue_ready_delivery(key: ThumbKey) {
+    READY_QUEUE.lock().unwrap().push(key);
+    if READY_DELIVERY_SCHEDULED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let ctrl = match *crate::CONTROLLER.lock().unwrap() {
+        Some(c) => c.0,
+        None => {
+            READY_DELIVERY_SCHEDULED.store(false, Ordering::Release);
+            return;
+        }
+    };
+    unsafe {
+        let _: () = msg_send![
+            ctrl,
+            performSelectorOnMainThread: sel!(thumbnailReady:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
 
 /// 截取一个窗口:CGSHWCaptureWindowList(count=1)→ 取首张 CGImage →
 /// 等比缩到目标像素高(降内存:Retina 原生帧可达数十 MB)。
 /// Capture one window: CGSHWCCaptureWindowList (count=1) -> first CGImage ->
 /// proportionally downscale to the target pixel height (native retina frames can
 /// reach tens of MB).
-unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CachedThumb> {
+struct CapturedWindow {
+    thumb: CachedThumb,
+    src_w: u32,
+    src_h: u32,
+    capture_ms: u128,
+    scale_ms: u128,
+}
+
+unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CapturedWindow> {
     let cap = *CGS_CAPTURE_LIST.as_ref()?;
     // 连接 ID 进程内恒定,缓存一次;0 = 获取失败(私有符号缺失)。
     // The connection ID is process-wide constant; cache it once (0 = unavailable).
@@ -728,6 +1091,7 @@ unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CachedThumb> {
     // Explicitly request native Retina pixels. nominalResolution only returns point-sized
     // content, so small windows stay blurry on 4K/5K displays even with a larger target later.
     let opts = CGS_CAPTURE_BEST_RESOLUTION | CGS_CAPTURE_IGNORE_GLOBAL_CLIP_SHAPE;
+    let capture_started = Instant::now();
     let arr = cap(cid, wids.as_ptr(), 1, opts);
     if arr.is_null() {
         return None;
@@ -744,11 +1108,13 @@ unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CachedThumb> {
     }
     CFRetain(raw); // 数组即将释放,自留一份 / the array goes away; keep our own ref
     CFRelease(arr);
+    let capture_ms = capture_started.elapsed().as_millis();
 
     let src_w = CGImageGetWidth(raw) as u32;
     let src_h = CGImageGetHeight(raw) as u32;
     let target_px_h = target_px_h.clamp(BASE_TARGET_PX_H, MAX_TARGET_PX_H);
     let (tw, th) = fit_target(src_w, src_h, target_px_h);
+    let scale_started = Instant::now();
     let img = if tw == src_w && th == src_h {
         raw
     } else {
@@ -762,12 +1128,18 @@ unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CachedThumb> {
     if img.is_null() {
         return None;
     }
-    Some(CachedThumb {
-        img,
-        w_px: tw,
-        h_px: th,
-        captured_for_px_h: target_px_h,
-        captured: Instant::now(),
+    Some(CapturedWindow {
+        thumb: CachedThumb {
+            img,
+            w_px: tw,
+            h_px: th,
+            captured_for_px_h: target_px_h,
+            captured: Instant::now(),
+        },
+        src_w,
+        src_h,
+        capture_ms,
+        scale_ms: scale_started.elapsed().as_millis(),
     })
 }
 
@@ -778,7 +1150,12 @@ unsafe fn downscale_cgimage(src: *const c_void, tw: u32, th: u32) -> *const c_vo
     if tw == 0 || th == 0 {
         return std::ptr::null();
     }
-    let cs = CGColorSpaceCreateDeviceRGB();
+    // Device RGB 色彩空间不可变且线程安全，进程级复用；每帧创建/释放没有收益。
+    // Device RGB color spaces are immutable and thread-safe, so reuse one for the
+    // process instead of creating and releasing it for every frame.
+    static RGB_COLOR_SPACE: LazyLock<ConstPtr> =
+        LazyLock::new(|| ConstPtr(unsafe { CGColorSpaceCreateDeviceRGB() }));
+    let cs = RGB_COLOR_SPACE.0;
     let ctx = CGBitmapContextCreate(
         std::ptr::null_mut(),
         tw as usize,
@@ -788,7 +1165,6 @@ unsafe fn downscale_cgimage(src: *const c_void, tw: u32, th: u32) -> *const c_vo
         cs,
         BITMAP_PREMULTIPLIED_LAST,
     );
-    CFRelease(cs);
     if ctx.is_null() {
         return std::ptr::null();
     }
@@ -849,7 +1225,7 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
     // Match the worker's overlay_wants lock order: visible range before TAB_STATE.
     let visible_snapshot = crate::overlay::thumbnail_visible_range();
     let (jobs, missing, frontmost_stale, background_last_good): (
-        Vec<(i32, u32)>,
+        Vec<(i32, u32, CapturePriority)>,
         usize,
         usize,
         usize,
@@ -869,16 +1245,17 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
         // is_active marks one representative window only; sibling windows from the
         // same frontmost PID must be eligible for refresh too.
         let frontmost_pid = state.windows.iter().find(|w| w.is_active).map(|w| w.pid);
-        let capture_range = capture_range_for_visible(visible_snapshot, state.windows.len());
-        let decisions: Vec<(i32, u32, SummonRefreshDecision)> = state
+        let capture_range =
+            capture_range_for_visible(visible_snapshot.clone(), state.windows.len());
+        let decisions: Vec<(usize, i32, u32, SummonRefreshDecision)> = state
             .windows
             .iter()
             .enumerate()
             .filter(|(index, _)| capture_range.contains(index))
-            .map(|(_, window)| window)
-            .filter(|w| !w.minimized && w.bounds.2 > 0.0 && w.bounds.3 > 0.0)
-            .map(|w| {
+            .filter(|(_, w)| !w.minimized && w.bounds.2 > 0.0 && w.bounds.3 > 0.0)
+            .map(|(index, w)| {
                 (
+                    index,
                     w.pid,
                     w.window_id,
                     cached_summon_refresh_decision(
@@ -892,35 +1269,44 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
             .collect();
         let missing = decisions
             .iter()
-            .filter(|(_, _, decision)| *decision == SummonRefreshDecision::Missing)
+            .filter(|(_, _, _, decision)| *decision == SummonRefreshDecision::Missing)
             .count();
         let frontmost_stale = decisions
             .iter()
-            .filter(|(_, _, decision)| *decision == SummonRefreshDecision::FrontmostStale)
+            .filter(|(_, _, _, decision)| *decision == SummonRefreshDecision::FrontmostStale)
             .count();
         let background_last_good = decisions
             .iter()
-            .filter(|(_, _, decision)| *decision == SummonRefreshDecision::BackgroundLastGood)
+            .filter(|(_, _, _, decision)| *decision == SummonRefreshDecision::BackgroundLastGood)
             .count();
-        let mut jobs: Vec<(i32, u32)> = decisions
+        let jobs: Vec<(i32, u32, CapturePriority)> = decisions
             .into_iter()
-            .filter(|(_, _, decision)| {
+            .filter(|(_, _, _, decision)| {
                 matches!(
                     decision,
                     SummonRefreshDecision::Missing | SummonRefreshDecision::FrontmostStale
                 )
             })
-            .map(|(pid, wid, _)| (pid, wid))
+            .map(|(index, pid, wid, _)| {
+                let priority = if Some((pid, wid)) == selected {
+                    CapturePriority::Selected
+                } else if visible_snapshot
+                    .as_ref()
+                    .is_some_and(|range| range.contains(&index))
+                {
+                    CapturePriority::Visible
+                } else {
+                    CapturePriority::Prefetch
+                };
+                (pid, wid, priority)
+            })
             .collect();
-        // 选中窗口排最前(false < true,选中的键为 false 排队首)。
-        // Selected window first (false < true; the selected key maps to false).
-        jobs.sort_by_key(|&(pid, wid)| Some((pid, wid)) != selected);
         (jobs, missing, frontmost_stale, background_last_good)
     };
     let requested = jobs.len();
     let mut enqueued = 0;
-    for (pid, wid) in jobs {
-        enqueued += usize::from(enqueue_job(pid, wid, required_px_h));
+    for (pid, wid, priority) in jobs {
+        enqueued += usize::from(enqueue_job(pid, wid, required_px_h, priority));
     }
     log_debug!(
         "[thumb] summon refresh: missing={} frontmost_stale={} background_last_good={} requested={} enqueued={} target_h={}",
@@ -950,6 +1336,7 @@ pub(crate) fn refresh_after_activation(pid: i32, wid: u32, activated_at: Instant
     if !crate::theme::thumbnails_enabled() {
         return;
     }
+    let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
     let _ = std::thread::Builder::new()
         .name("oh-my-tab-thumb-activation".into())
         .spawn(move || unsafe {
@@ -967,7 +1354,8 @@ pub(crate) fn refresh_after_activation(pid: i32, wid: u32, activated_at: Instant
                 crate::window_collector::app_activation_is_current(pid, activated_at);
             if activation_capture_is_valid(pid, activation_is_current, frontmost_pid) {
                 let target_px_h = cached_target_px_height(pid, wid);
-                let enqueued = enqueue_job(pid, wid, target_px_h);
+                let enqueued =
+                    enqueue_activation_job(pid, wid, target_px_h, activated_at, pid_generation);
                 log_debug!(
                     "[thumb] activation refresh: pid={} wid={} enqueued={} target_h={}",
                     pid,
@@ -1132,49 +1520,12 @@ pub(crate) fn start() {
         .name("thumb-observer".into())
         .spawn(|| unsafe {
             let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-            // 本线程枚举运行中 App 并装观察者(AXObserverCreate 必须在将要 pump 其
-            // runloop source 的线程上调用)。
-            // Enumerate running apps and install observers here (AXObserverCreate
-            // must run on the thread whose runloop pumps the observer's source).
-            let pids = regular_running_pids();
-            for pid in &pids {
-                install_observer_for_pid(*pid);
-            }
-            log_debug!(
-                "[thumb] observer thread started: {} regular apps observed, capture_allowed={}",
-                pids.len(),
-                capture_allowed()
-            );
-            // 启动预生成:已有标准窗口补拍(最小化窗口无渲染缓冲,跳过)。
-            // Startup pre-generation: capture existing standard windows (minimized
-            // windows have no backing store and are skipped).
-            for pid in &pids {
-                pregen_windows_for_pid(*pid);
-            }
-            // 诊断:等 worker 清完队列后,校验 TAB_STATE 的渲染键能否命中缓存
-            // (键不一致 = 卡片渲染必然回退图标,与 UI 无关的键问题定位)。
-            // Diagnostics: after the worker drains, verify TAB_STATE render keys hit
-            // the cache (a miss here means cards will fall back to icons -- a pure
-            // key-consistency issue, independent of the UI).
-            std::thread::sleep(Duration::from_millis(600));
-            {
-                let state = crate::TAB_STATE.lock().unwrap();
-                if let Some(s) = state.as_ref() {
-                    let hits = s
-                        .windows
-                        .iter()
-                        .filter(|w| is_cached_fresh(w.pid, w.window_id))
-                        .count();
-                    log_debug!(
-                        "[thumb] post-pregen lookup: {}/{} TAB_STATE windows hit cache",
-                        hits,
-                        s.windows.len()
-                    );
-                }
-            }
-            // 命令源:Install/Remove 命令经 CFRunLoopSourceSignal 从任意线程注入。
-            // Command source: Install/Remove injected from any thread via
-            // CFRunLoopSourceSignal.
+            // 先发布命令 source/runloop，再做 AX 安装与预热。启动期间到达的
+            // Launch/Terminate 命令会保持 source signaled，进入 runloop 后立即处理，
+            // 不会因 source 尚不存在而滞留到下一次偶然唤醒。
+            // Publish the command source/runloop before AX installation and prewarming.
+            // Launch/Terminate commands arriving during startup keep the source signaled
+            // and drain immediately once the runloop starts instead of waiting for a later wake.
             let src = CFRunLoopSourceCreate(
                 std::ptr::null(),
                 0,
@@ -1194,12 +1545,28 @@ pub(crate) fn start() {
             let rl = CFRunLoopGetCurrent();
             if !src.is_null() {
                 CFRunLoopAddSource(rl, src, kCFRunLoopDefaultMode);
-                // 存下 source 供任意线程 Signal(见 signal_observer_runloop)。
-                // Stash the source so any thread can signal it (see
-                // signal_observer_runloop).
                 *CMD_SOURCE.0.lock().unwrap() = Some(src);
             }
             *OBSERVER_RL.0.lock().unwrap() = Some(rl);
+            // source 发布前极小窗口内到达的命令没有机会 signal；主动清空一次补上。
+            // Commands arriving in the tiny window before source publication could not
+            // signal it, so explicitly drain once after publication.
+            drain_obs_commands(std::ptr::null_mut());
+
+            // 本线程枚举运行中 App 并装观察者(AXObserverCreate 必须在将要 pump 其
+            // runloop source 的线程上调用)。
+            // Enumerate running apps and install observers here (AXObserverCreate
+            // must run on the thread whose runloop pumps the observer's source).
+            let pids = regular_running_pids();
+            for pid in &pids {
+                install_observer_for_pid(*pid);
+            }
+            log_debug!(
+                "[thumb] observer thread started: {} regular apps observed, capture_allowed={}",
+                pids.len(),
+                capture_allowed()
+            );
+            pregen_startup_windows();
             if !STOP_REQUESTED.load(Ordering::SeqCst) {
                 CFRunLoopRun();
             }
@@ -1244,6 +1611,10 @@ unsafe extern "C" fn drain_obs_commands(_info: *mut c_void) {
 /// Forwarding point for NSWorkspaceDidLaunch (called on main). Installs the new
 /// app's observer and pre-generates its existing windows.
 pub(crate) fn app_launched(pid: i32) {
+    // 即使服务尚未启动也先恢复 PID 活跃状态，覆盖极端的快速退出/PID 复用窗口。
+    // Restore PID liveness even before the service starts, covering rapid exit/PID
+    // reuse during startup.
+    CAPTURE_STATE.lock().unwrap().activate_pid(pid);
     if !STARTED.load(Ordering::SeqCst) || pid == std::process::id() as i32 {
         return;
     }
@@ -1253,10 +1624,27 @@ pub(crate) fn app_launched(pid: i32) {
     }
 }
 
-/// NSWorkspaceDidTerminate 转发点:卸载 observer(缓存条目交给 LRU 自然淘汰)。
-/// Forwarding point for NSWorkspaceDidTerminate: uninstall the observer (cached
-/// entries age out via the LRU naturally).
+/// NSWorkspaceDidTerminate 转发点:立即取消捕获，再异步卸载 observer 与缓存。
+/// Forwarding point for NSWorkspaceDidTerminate: cancel captures immediately,
+/// then remove the observer and cached frames asynchronously.
 pub(crate) fn app_terminated(pid: i32) {
+    // 同一生命周期锁内使 queued/in-flight 捕获失效并清缓存；observer 线程随后只需
+    // 卸载 AX source。该锁序保证迟到截图无法在清理后重新写回。
+    // Invalidate queued/in-flight captures and clear the cache under the same lifecycle
+    // lock; the observer thread then only needs to remove the AX source. This lock order
+    // prevents a late capture from being inserted after cleanup.
+    let mut state = CAPTURE_STATE.lock().unwrap();
+    state.cancel_pid(pid);
+    let evicted = CACHE
+        .lock()
+        .unwrap()
+        .remove_where(|(key, _)| key.pid == pid);
+    drop(state);
+    for thumb in evicted {
+        unsafe {
+            CFRelease(thumb.img);
+        }
+    }
     if let Some(tx) = CMD_TX.get() {
         let _ = tx.send(ObsCmd::Remove(pid));
         signal_observer_runloop();
@@ -1348,19 +1736,72 @@ unsafe fn install_observer_for_pid(pid: i32) {
     INSTALLED.0.lock().unwrap().insert(pid, (obs, src));
 }
 
-/// 启动/新装 App 的既有标准窗口补拍。
-/// Pre-generate existing standard windows for startup / newly installed apps.
-unsafe fn pregen_windows_for_pid(pid: i32) {
-    // 这里只判断功能开关，不重复做 TCC preflight。启动时 producer 与 worker 并行，
-    // producer 每个 PID 都 preflight 曾导致前三个任务开始捕获后其余 PID 被静默漏排。
-    // worker 会在每个任务执行前重新 preflight，权限判断仍然完整且可热恢复。
-    // Check only the feature switch here, not TCC again. Producer and worker run in
-    // parallel at startup; preflighting every PID caused the remaining PIDs to be
-    // silently missed once the first captures began. The worker still re-preflights
-    // every job, preserving permission safety and hot recovery.
-    if !crate::theme::thumbnails_enabled() {
+/// 启动预热直接复用 AppState 已完成 AX 配对的 MRU 快照，避免按 PID 再做一轮 AX
+/// 查询。只取有 bounds、非最小化的前 STARTUP_PREWARM_MAX 个窗口。
+/// Startup prewarming reuses AppState's already AX-paired MRU snapshot instead of
+/// repeating one AX query per PID. It takes only the first STARTUP_PREWARM_MAX
+/// non-minimized windows with usable bounds.
+unsafe fn pregen_startup_windows() {
+    if !crate::theme::thumbnails_enabled() || !capture_allowed() {
+        log_debug!("[thumb] startup prewarm skipped (disabled or unauthorized)");
         return;
     }
+    let (jobs, eligible) = {
+        let state = crate::TAB_STATE.lock().unwrap();
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        let capture_state = CAPTURE_STATE.lock().unwrap();
+        let eligible: Vec<(i32, u32, u64)> = state
+            .windows
+            .iter()
+            .filter(|window| {
+                !window.minimized
+                    && window.window_id != 0
+                    && window.bounds.2 > 0.0
+                    && window.bounds.3 > 0.0
+            })
+            .map(|window| {
+                (
+                    window.pid,
+                    window.window_id,
+                    capture_state.pid_generation(window.pid),
+                )
+            })
+            .collect();
+        let jobs = eligible
+            .iter()
+            .copied()
+            .take(STARTUP_PREWARM_MAX)
+            .collect::<Vec<_>>();
+        (jobs, eligible.len())
+    };
+    let mut queued = 0;
+    for (pid, wid, pid_generation) in &jobs {
+        queued += usize::from(enqueue_job_for_generation(
+            *pid,
+            *wid,
+            BASE_TARGET_PX_H,
+            CapturePriority::Startup,
+            *pid_generation,
+        ));
+    }
+    log_debug!(
+        "[thumb] startup prewarm: eligible={} bounded={} queued={}",
+        eligible,
+        jobs.len(),
+        queued
+    );
+}
+
+/// 新启动 App 的既有标准窗口补拍；启动初始批次走 pregen_startup_windows。
+/// Pre-generate existing standard windows for a newly launched app; the initial
+/// startup batch uses pregen_startup_windows instead.
+unsafe fn pregen_windows_for_pid(pid: i32) {
+    if !crate::theme::thumbnails_enabled() || !capture_allowed() {
+        return;
+    }
+    let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
     let Some(windows) = crate::window_collector::get_ax_windows_for_pid(pid) else {
         log_debug!("[thumb] pregen pid={}: AX query failed", pid);
         return;
@@ -1373,7 +1814,13 @@ unsafe fn pregen_windows_for_pid(pid: i32) {
         if minimized || wid == 0 {
             continue; // 最小化窗口无渲染缓冲,截取必然失败 / no backing store while minimized
         }
-        queued += usize::from(enqueue_job(pid, wid, BASE_TARGET_PX_H));
+        queued += usize::from(enqueue_job_for_generation(
+            pid,
+            wid,
+            BASE_TARGET_PX_H,
+            CapturePriority::NewWindow,
+            pid_generation,
+        ));
     }
     log_debug!("[thumb] pregen pid={}: {} windows queued", pid, queued);
 }
@@ -1405,12 +1852,19 @@ unsafe extern "C" fn thumb_ax_observer(
             let mut pid: i32 = 0;
             AXUIElementGetPid(element, &mut pid);
             if pid > 0 && crate::theme::thumbnails_enabled() {
+                let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
                 // 防抖 300ms:窗口刚创建可能还在布局/白屏。
                 // Debounce 300ms: brand-new windows may still be laying out / blank.
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(300));
-                    if crate::theme::thumbnails_enabled() {
-                        enqueue_job(pid, wid, BASE_TARGET_PX_H);
+                    if crate::theme::thumbnails_enabled() && capture_allowed() {
+                        enqueue_job_for_generation(
+                            pid,
+                            wid,
+                            BASE_TARGET_PX_H,
+                            CapturePriority::NewWindow,
+                            pid_generation,
+                        );
                     }
                 });
             }
@@ -1434,10 +1888,13 @@ mod tests {
         // 同一键无论还在队列还是正在捕获都只能登记一次；其他窗口不受影响。
         // The same key registers once whether queued or in-flight; another window
         // remains independent.
-        assert!(state.request(first, 512));
-        assert!(!state.request(first, 512));
-        assert!(state.request(other, 512));
-        assert_eq!(state.target_for(first), Some(512));
+        assert!(state.request(first, 512, CapturePriority::Startup));
+        assert!(!state.request(first, 512, CapturePriority::Selected));
+        assert!(state.request(other, 512, CapturePriority::Visible));
+        let job = state.take_next().unwrap();
+        assert_eq!(job.key, first);
+        assert_eq!(job.priority, CapturePriority::Selected);
+        assert_eq!(job.target_px_h, 512);
     }
 
     #[test]
@@ -1445,17 +1902,59 @@ mod tests {
         let mut state = CaptureState::default();
         let key = ThumbKey { pid: 10, wid: 20 };
 
-        assert!(state.request(key, 512));
+        assert!(state.request(key, 512, CapturePriority::Startup));
+        let low = state.take_next().unwrap();
         // 低清任务已开始后接入高分屏：请求合并但不重复入队；低清完成时返回 640，
         // worker 据此自动补拍。高清完成后才释放 active。
         // A high-DPI display appears after the low-res job starts: merge without a duplicate
         // queue item; finishing 512 returns 640 for an automatic follow-up. The key is released
         // only after the high-res capture finishes.
-        assert!(!state.request(key, 640));
-        assert_eq!(state.finish(key, 512), Some(640));
-        assert_eq!(state.target_for(key), Some(640));
-        assert_eq!(state.finish(key, 640), None);
-        assert_eq!(state.target_for(key), None);
+        assert!(!state.request(key, 640, CapturePriority::Selected));
+        assert!(state.finish(low));
+        let high = state.take_next().unwrap();
+        assert_eq!(high.target_px_h, 640);
+        assert_eq!(high.priority, CapturePriority::Selected);
+        assert!(!state.finish(high));
+        assert!(state.take_next().is_none());
+    }
+
+    #[test]
+    fn capture_state_retries_an_in_flight_job_after_priority_promotion() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+
+        assert!(state.request(key, 512, CapturePriority::Startup));
+        let startup = state.take_next().unwrap();
+        assert!(!state.request(key, 512, CapturePriority::Activation));
+        assert!(state.finish(startup));
+        let activation = state.take_next().unwrap();
+        assert_eq!(activation.target_px_h, 512);
+        assert_eq!(activation.priority, CapturePriority::Activation);
+    }
+
+    #[test]
+    fn capture_state_preserves_new_activation_freshness_independent_of_priority() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+        let first_activation = Instant::now();
+        let later_activation = first_activation + Duration::from_millis(1);
+
+        assert!(state.request_activation(key, 512, first_activation, 0));
+        let first = state.take_next().unwrap();
+        assert!(!state.request_activation(key, 512, later_activation, 0));
+        assert!(state.finish(first));
+        let later = state.take_next().unwrap();
+        assert_eq!(later.activation_at, Some(later_activation));
+
+        // 显式选中是独立的用户需求，不再受旧 activation 的前台门控；状态变化
+        // 仍触发 follow-up，避免正在执行的旧任务吞掉它。
+        // An explicit selection is an independent user demand and clears old activation
+        // gating; the state change still schedules a follow-up instead of being swallowed.
+        assert!(!state.request(key, 512, CapturePriority::Selected));
+        assert!(state.finish(later));
+        let selected = state.take_next().unwrap();
+        assert_eq!(selected.priority, CapturePriority::Selected);
+        assert_eq!(selected.activation_at, None);
     }
 
     #[test]
@@ -1472,12 +1971,47 @@ mod tests {
         let mut state = CaptureState::default();
         let key = ThumbKey { pid: 10, wid: 20 };
 
-        assert!(state.request(key, 512));
+        assert!(state.request(key, 512, CapturePriority::Startup));
+        let job = state.take_next().unwrap();
         // worker 对成功、失败和权限跳过统一调用 finish；之后下一次召唤可重试。
         // The worker calls finish after success, failure, or a permission skip;
         // the next summon can then retry.
-        assert_eq!(state.finish(key, 512), None);
-        assert!(state.request(key, 512));
+        assert!(!state.finish(job));
+        assert!(state.request(key, 512, CapturePriority::Startup));
+    }
+
+    #[test]
+    fn capture_state_cancels_queued_and_in_flight_jobs_by_pid_generation() {
+        let mut state = CaptureState::default();
+        let running_key = ThumbKey { pid: 10, wid: 20 };
+        let queued_key = ThumbKey { pid: 10, wid: 21 };
+        assert!(state.request(running_key, 512, CapturePriority::Visible));
+        assert!(state.request(queued_key, 512, CapturePriority::Startup));
+        let running = state.take_next().unwrap();
+        assert!(state.is_current(running));
+
+        state.cancel_pid(10);
+        assert!(!state.is_current(running));
+        assert!(state.take_next().is_none());
+        assert!(!state.request(running_key, 640, CapturePriority::Selected));
+
+        // 只有 launch 才能恢复该 PID；旧 generation 的延迟生产者仍必须被拒绝，且
+        // 旧任务 finish 不能删除新进程的请求。
+        // Only launch reactivates the PID; a delayed producer carrying the old generation
+        // must still be rejected, and finishing the old job cannot remove the new request.
+        let old_generation = running.pid_generation;
+        state.activate_pid(10);
+        assert!(!state.request_for_generation(
+            running_key,
+            512,
+            CapturePriority::NewWindow,
+            old_generation,
+        ));
+        assert!(state.request(running_key, 640, CapturePriority::Selected));
+        assert!(!state.finish(running));
+        let replacement = state.take_next().unwrap();
+        assert_eq!(replacement.target_px_h, 640);
+        assert!(state.is_current(replacement));
     }
 
     #[test]
@@ -1507,6 +2041,24 @@ mod tests {
         let evicted = lru.put((1, 3), 30);
         assert_eq!(evicted, vec![20]);
         assert!(lru.get(&(1, 1)).is_some());
+    }
+
+    #[test]
+    fn lru_peek_preserves_recency_and_tracks_cost_incrementally() {
+        let mut lru: Lru<u32, u64> = Lru::new(2, 30, |v| *v);
+        lru.put(1, 10);
+        lru.put(2, 12);
+        assert_eq!(lru.peek(&1), Some(10));
+
+        // peek 只读元数据，不应把最旧的 1 移到队尾；替换值也必须修正总成本。
+        // peek reads metadata without moving oldest key 1 to the back; replacing a
+        // value must also adjust the running total cost.
+        assert_eq!(lru.put(3, 8), vec![10]);
+        assert_eq!(lru.put(2, 20), vec![12]);
+        assert_eq!(lru.put(4, 6), vec![8]);
+        assert!(lru.peek(&2).is_some());
+        assert!(lru.peek(&3).is_none());
+        assert!(lru.peek(&4).is_some());
     }
 
     #[test]
@@ -1715,7 +2267,9 @@ fn cgshwc_capture_smoke() {
     // Drive the real capture with a maximally enlarged card preview; the current 2x Retina
     // environment takes the 640px path, covering bestResolution plus dynamic downscaling.
     let target_px_h = target_px_height(271.25, scale);
-    let t = unsafe { capture_window(wid, target_px_h) }.expect("CGSHWCCaptureWindowList failed");
+    let t = unsafe { capture_window(wid, target_px_h) }
+        .expect("CGSHWCCaptureWindowList failed")
+        .thumb;
     assert!(t.w_px > 0 && t.h_px > 0, "degenerate capture size");
     assert_eq!(t.captured_for_px_h, target_px_h);
     println!(

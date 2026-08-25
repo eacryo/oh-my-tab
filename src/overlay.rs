@@ -1783,6 +1783,7 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
     }
 
     unsafe {
+        let thumbnail_capture_allowed = crate::thumbnail::capture_allowed();
         let container = match *CONTAINER.lock().unwrap() {
             Some(c) => c.0,
             None => return,
@@ -1812,7 +1813,13 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
                 // 沿用旧卡 frame 的宽高(原位替换:流式布局缩卡后高宽都是逐卡值)。
                 // Reuse the old card frame's width AND height (in-place replacement:
                 // after flow shrink both are per-card values).
-                let new_card = create_card_view(w, idx, frame.size.width, frame.size.height);
+                let new_card = create_card_view(
+                    w,
+                    idx,
+                    frame.size.width,
+                    frame.size.height,
+                    thumbnail_capture_allowed,
+                );
                 let _: () = msg_send![new_card, setFrame: frame];
                 let _: () = msg_send![old_view, removeFromSuperview];
                 let _: () = msg_send![container, addSubview: new_card];
@@ -1822,6 +1829,71 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
 
         // New card views have no selection border; re-apply the highlight.
         refresh_highlight();
+    }
+}
+
+/// 缩略图捕获完成后的轻量更新：只刷新受影响卡片的预览容器，不重建标题、按钮、
+/// tracking area 或选中图层。一次 ready 批次只扫描一次容器子视图。
+/// Lightweight post-capture update: refresh only affected cards' preview containers,
+/// without rebuilding captions, buttons, tracking areas, or selection layers. One
+/// ready batch scans the container's subviews once.
+pub(crate) fn refresh_thumbnail_previews(indices: &[usize]) {
+    if indices.is_empty() {
+        return;
+    }
+    let affected: HashSet<usize> = indices.iter().copied().collect();
+    let windows: HashMap<usize, WindowInfo> = {
+        let state = TAB_STATE.lock().unwrap();
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        if !state.visible {
+            return;
+        }
+        affected
+            .iter()
+            .filter_map(|index| state.windows.get(*index).map(|w| (*index, w.clone())))
+            .collect()
+    };
+    if windows.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let started = Instant::now();
+        let capture_allowed =
+            crate::theme::thumbnails_enabled() && crate::thumbnail::capture_allowed();
+        let colors = current_colors();
+        let container = match *CONTAINER.lock().unwrap() {
+            Some(container) => container.0,
+            None => return,
+        };
+        let subviews: *mut AnyObject = msg_send![container, subviews];
+        let count: usize = msg_send![subviews, count];
+        let mut updated = 0usize;
+        for i in 0..count {
+            let card: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
+            let is_label: bool = msg_send![card, isKindOfClass: class!(NSTextField)];
+            if is_label {
+                continue;
+            }
+            let index = get_card_index(card);
+            let Some(window) = windows.get(&index) else {
+                continue;
+            };
+            let preview: *mut AnyObject = msg_send![card, viewWithTag: THUMB_PREVIEW_TAG];
+            if preview.is_null() {
+                continue;
+            }
+            populate_thumbnail_preview(preview, window, &colors, capture_allowed);
+            updated += 1;
+        }
+        log_debug!(
+            "[thumb] preview refresh: requested={} updated={} ms={}",
+            windows.len(),
+            updated,
+            started.elapsed().as_millis()
+        );
     }
 }
 
@@ -2048,11 +2120,70 @@ unsafe fn add_preview_icon_fallback(
     }
 }
 
+/// 只替换预览容器内部的图像/图标内容，保留卡片标题、按钮、tracking area、图层和
+/// 选中态。缩略图异步到达时不再销毁重建整张卡片。
+/// Replace only the image/icon content inside a preview container, preserving the
+/// card caption, buttons, tracking area, layers, and selection state. Asynchronous
+/// thumbnail delivery no longer destroys and rebuilds the whole card.
+unsafe fn populate_thumbnail_preview(
+    container: *mut AnyObject,
+    w: &WindowInfo,
+    colors: &Colors,
+    capture_allowed: bool,
+) {
+    let old: *mut AnyObject = msg_send![container, subviews];
+    let mut old_count: usize = msg_send![old, count];
+    while old_count > 0 {
+        old_count -= 1;
+        let child: *mut AnyObject = msg_send![old, objectAtIndex: old_count];
+        let _: () = msg_send![child, removeFromSuperview];
+    }
+
+    let bounds: NSRect = msg_send![container, bounds];
+    let pw = bounds.size.width;
+    let ph = bounds.size.height;
+    let thumb = if capture_allowed && w.bounds.2 > 0.0 && w.bounds.3 > 0.0 {
+        crate::thumbnail::lookup_retained(w.pid, w.window_id)
+    } else {
+        None
+    };
+    let Some((cg, w_px, h_px)) = thumb else {
+        add_preview_icon_fallback(container, pw, ph, w, colors);
+        return;
+    };
+
+    let (cw, ch) = crate::thumbnail::fit_size(w_px as f64, h_px as f64, pw, ph);
+    let nsimg = nsimage_from_cgimage(cg, NSSize::new(cw, ch));
+    CFRelease(cg); // lookup 给的 +1 已被 NSImage 持有 / NSImage retains its own copy
+    if nsimg.is_null() {
+        add_preview_icon_fallback(container, pw, ph, w, colors);
+        return;
+    }
+    let shown: *mut AnyObject = if w.minimized {
+        let grayed = grayed_image(nsimg, NSSize::new(cw, ch));
+        release_obj(nsimg);
+        grayed
+    } else {
+        nsimg
+    };
+    let iv: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+    let iv: *mut AnyObject = msg_send![iv, initWithFrame: NSRect::new(
+        NSPoint::new((pw - cw) / 2.0, (ph - ch) / 2.0),
+        NSSize::new(cw, ch)
+    )];
+    let _: () = msg_send![iv, setImage: shown];
+    release_obj(shown);
+    let _: () = msg_send![iv, setImageScaling: 2u64]; // exact size, no additional scaling
+    let _: () = msg_send![container, addSubview: iv];
+    release_obj(iv);
+}
+
 pub(crate) fn create_card_view(
     w: &WindowInfo,
     index: usize,
     card_width: f64,
     card_h: f64,
+    thumbnail_capture_allowed: bool,
 ) -> *mut AnyObject {
     unsafe {
         let card_cls = CARD_CLASS.lock().unwrap().unwrap();
@@ -2235,49 +2366,7 @@ pub(crate) fn create_card_view(
             layer_set_border(cl, hex_to_cg_color(colors.preview_border));
             layer_set_background(cl, hex_to_cg_color(colors.icon_inner_bg));
 
-            let pw = preview_frame.size.width;
-            let ph = preview_frame.size.height;
-            let mut thumb: Option<(*const c_void, u32, u32)> = None;
-            if crate::thumbnail::capture_allowed() && w.bounds.2 > 0.0 && w.bounds.3 > 0.0 {
-                thumb = crate::thumbnail::lookup_retained(w.pid, w.window_id);
-            }
-            if let Some((cg, w_px, h_px)) = thumb {
-                // aspect-fit:先按窗口像素比例算出完整可见的绘制尺寸,NSImage 直接以
-                // 该尺寸创建——自然尺寸 == 视图尺寸,ScaleNone 恰好铺满且窗口完整可见
-                // (此前用自然 pt 尺寸 + ScaleNone,图片按原尺寸绘制被容器裁剪,
-                // 表现为"只看到窗口的一部分")。
-                // Aspect-fit: derive the fully-visible drawn size from the window's
-                // pixel aspect first, then create the NSImage at EXACTLY that size --
-                // natural size == view size, so ScaleNone fills the view and the whole
-                // window stays visible. (Previously the image kept its natural point
-                // size and got clipped by the container -- "only part of the window".)
-                let (cw, ch) = crate::thumbnail::fit_size(w_px as f64, h_px as f64, pw, ph);
-                let nsimg = nsimage_from_cgimage(cg, NSSize::new(cw, ch));
-                CFRelease(cg); // lookup 给的 +1 已被 NSImage 持有 / NSImage retains its own copy
-                if !nsimg.is_null() {
-                    let shown: *mut AnyObject = if w.minimized {
-                        let g = grayed_image(nsimg, NSSize::new(cw, ch));
-                        release_obj(nsimg);
-                        g
-                    } else {
-                        nsimg
-                    };
-                    let iv: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-                    let iv: *mut AnyObject = msg_send![iv, initWithFrame: NSRect::new(
-                        NSPoint::new((pw - cw) / 2.0, (ph - ch) / 2.0),
-                        NSSize::new(cw, ch)
-                    )];
-                    let _: () = msg_send![iv, setImage: shown];
-                    release_obj(shown);
-                    let _: () = msg_send![iv, setImageScaling: 2u64]; // 尺寸已精确,不再缩放 / exact size, no scaling
-                    let _: () = msg_send![container, addSubview: iv];
-                    release_obj(iv);
-                } else {
-                    add_preview_icon_fallback(container, pw, ph, w, &colors);
-                }
-            } else {
-                add_preview_icon_fallback(container, pw, ph, w, &colors);
-            }
+            populate_thumbnail_preview(container, w, &colors, thumbnail_capture_allowed);
 
             let _: () = msg_send![view, addSubview: container];
             release_obj(container); // view owns the container; drop our alloc +1
@@ -2626,6 +2715,10 @@ pub(crate) fn show_overlay() {
         // packing budget; centering reuses it.
         let (screen_frame, screen_visible, screen_scale) = overlay_target_screen(&windows);
         let use_flow = crate::theme::thumbnails_enabled();
+        // TCC preflight 一次覆盖本轮所有卡片，避免 create_card_view 对每张卡重复查询。
+        // One TCC preflight covers every card in this render instead of querying once
+        // per create_card_view call.
+        let thumbnail_capture_allowed = use_flow && crate::thumbnail::capture_allowed();
 
         // (全局 index, x, y, w)——缩略图模式只产出当前稳定页面，纯图标模式仍产出全部窗口。
         // (global index, x, y, w): thumbnail mode emits only the current stable page;
@@ -2735,7 +2828,7 @@ pub(crate) fn show_overlay() {
                 continue;
             };
             let t_card = Instant::now(); // TIMING-DEBUG
-            let card = create_card_view(w, idx, card_w_i, card_h_outer);
+            let card = create_card_view(w, idx, card_w_i, card_h_outer, thumbnail_capture_allowed);
             let card_ms = t_card.elapsed().as_millis(); // TIMING-DEBUG
             cards_total_ms += card_ms;
             // TIMING-DEBUG 单卡构建 >5ms:标记慢卡(图标加载/文本通常是耗时大头)。
