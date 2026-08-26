@@ -1369,6 +1369,17 @@ fn setup_status_bar() {
         let menu_target: *mut AnyObject = msg_send![action_cls as *const AnyObject, new];
         *MENU_TARGET.lock().unwrap() = Some(ObjPtr(menu_target));
 
+        // 设置 item 放在菜单第一项,用于打开设置窗口。
+        // Settings item comes first and opens the settings window.
+        let settings_title = make_nsstring(&t("menu.settings"));
+        let settings_key = make_nsstring("");
+        let settings_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let settings_item: *mut AnyObject = msg_send![settings_item, initWithTitle: settings_title, action: sel!(handleSettings:), keyEquivalent: settings_key];
+        CFRelease(settings_title as *const c_void);
+        CFRelease(settings_key as *const c_void);
+        let _: () = msg_send![settings_item, setTarget: menu_target];
+        let _: () = msg_send![menu, addItem: settings_item];
+
         // Shortcut toggle item
         let shortcut_title = make_nsstring(&t("menu.toggle_shortcut.cmd"));
         let shortcut_key = make_nsstring("");
@@ -1400,16 +1411,6 @@ fn setup_status_bar() {
         *THUMBNAIL_ITEM.lock().unwrap() = Some(ThumbnailState {
             item: thumbnail_item,
         });
-
-        // 设置... item (opens the settings window)
-        let settings_title = make_nsstring(&t("menu.settings"));
-        let settings_key = make_nsstring("");
-        let settings_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
-        let settings_item: *mut AnyObject = msg_send![settings_item, initWithTitle: settings_title, action: sel!(handleSettings:), keyEquivalent: settings_key];
-        CFRelease(settings_title as *const c_void);
-        CFRelease(settings_key as *const c_void);
-        let _: () = msg_send![settings_item, setTarget: menu_target];
-        let _: () = msg_send![menu, addItem: settings_item];
 
         // Reload Config item
         let reload_title = make_nsstring(&t("menu.reload_config"));
