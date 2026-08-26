@@ -143,11 +143,13 @@ static REC_TAP: LazyLock<RecTapMutex> = LazyLock::new(|| RecTapMutex(Mutex::new(
 struct SettingsUi {
     window: *mut AnyObject,
     sidebar_general: *mut AnyObject, // NSButton: 通用 / General (tag=0)
-    sidebar_experimental: *mut AnyObject, // NSButton: 实验性功能 / Experimental (tag=1)
-    sidebar_mouse: *mut AnyObject,   // NSButton: 鼠标控制 / Mouse (tag=2)
-    sidebar_clipboard: *mut AnyObject, // NSButton: 剪贴板历史 / Clipboard history (tag=3)
+    sidebar_switcher: *mut AnyObject, // NSButton: 应用切换浮窗 / App switcher overlay (tag=1)
+    sidebar_experimental: *mut AnyObject, // NSButton: 实验性功能 / Experimental (tag=2)
+    sidebar_mouse: *mut AnyObject,   // NSButton: 鼠标控制 / Mouse (tag=3)
+    sidebar_clipboard: *mut AnyObject, // NSButton: 剪贴板历史 / Clipboard history (tag=4)
     sidebar_highlight: *mut AnyObject, // NSView: 选中行高亮背景 (layer-backed)
     general_view: *mut AnyObject,    // NSView: 通用页容器 / General page container
+    switcher_view: *mut AnyObject,   // NSView: 应用切换浮窗页容器 / App switcher page container
     experimental_view: *mut AnyObject, // NSView: 实验性页容器 / Experimental page container
     mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
     clipboard_view: *mut AnyObject,  // NSView: 剪贴板历史页容器 / Clipboard page container
@@ -2121,12 +2123,12 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
     select_sidebar(tag as usize);
 }
 
-/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换三个内容视图显隐、选中项粗体。
-/// Switch the active settings page: align the highlight to the selected button, toggle the three
+/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换五个内容视图显隐、选中项粗体。
+/// Switch the active settings page: align the highlight to the selected button, toggle the five
 /// content views' visibility, and bold the selected item's label.
 fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
-    let idx = if idx > 3 { 0 } else { idx };
+    let idx = if idx > 4 { 0 } else { idx };
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         let ui = match ui.as_ref() {
@@ -2135,12 +2137,14 @@ fn select_sidebar(idx: usize) {
         };
         let buttons = [
             ui.sidebar_general,
+            ui.sidebar_switcher,
             ui.sidebar_experimental,
             ui.sidebar_mouse,
             ui.sidebar_clipboard,
         ];
         let views = [
             ui.general_view,
+            ui.switcher_view,
             ui.experimental_view,
             ui.mouse_view,
             ui.clipboard_view,
@@ -2152,6 +2156,7 @@ fn select_sidebar(idx: usize) {
         // Bold + white text when selected; regular labelColor otherwise.
         let titles = [
             t("settings.sidebar_general"),
+            t("settings.sidebar_switcher"),
             t("settings.sidebar_experimental"),
             t("settings.sidebar_mouse"),
             t("settings.sidebar_clipboard"),
@@ -3000,11 +3005,13 @@ fn create_settings_window() {
         let mut ui = SettingsUi {
             window,
             sidebar_general: std::ptr::null_mut(),
+            sidebar_switcher: std::ptr::null_mut(),
             sidebar_experimental: std::ptr::null_mut(),
             sidebar_mouse: std::ptr::null_mut(),
             sidebar_clipboard: std::ptr::null_mut(),
             sidebar_highlight: std::ptr::null_mut(),
             general_view: std::ptr::null_mut(),
+            switcher_view: std::ptr::null_mut(),
             experimental_view: std::ptr::null_mut(),
             mouse_view: std::ptr::null_mut(),
             clipboard_view: std::ptr::null_mut(),
@@ -3141,8 +3148,8 @@ fn create_settings_window() {
         release_obj(highlight);
         ui.sidebar_highlight = highlight;
 
-        // 两个侧边栏按钮(borderless,tag 0/1,点击触发 handleSettingsSidebar:)。
-        // Two sidebar buttons (borderless, tag 0/1; click triggers handleSettingsSidebar:).
+        // 五个侧边栏按钮(borderless,tag 0..4,点击触发 handleSettingsSidebar:)。
+        // Five sidebar buttons (borderless, tags 0..4; click triggers handleSettingsSidebar:).
         ui.sidebar_general = make_sidebar_button(
             sidebar_view,
             target,
@@ -3152,31 +3159,40 @@ fn create_settings_window() {
             btn_y0,
             btn_w,
         );
+        ui.sidebar_switcher = make_sidebar_button(
+            sidebar_view,
+            target,
+            &t("settings.sidebar_switcher"),
+            1,
+            12.0,
+            btn_y0 - 34.0,
+            btn_w,
+        );
         ui.sidebar_experimental = make_sidebar_button(
             sidebar_view,
             target,
             &t("settings.sidebar_experimental"),
-            1,
+            2,
             12.0,
-            btn_y0 - 34.0,
+            btn_y0 - 68.0,
             btn_w,
         );
         ui.sidebar_mouse = make_sidebar_button(
             sidebar_view,
             target,
             &t("settings.sidebar_mouse"),
-            2,
+            3,
             12.0,
-            btn_y0 - 68.0,
+            btn_y0 - 102.0,
             btn_w,
         );
         ui.sidebar_clipboard = make_sidebar_button(
             sidebar_view,
             target,
             &t("settings.sidebar_clipboard"),
-            3,
+            4,
             12.0,
-            btn_y0 - 102.0,
+            btn_y0 - 136.0,
             btn_w,
         );
 
@@ -3188,6 +3204,15 @@ fn create_settings_window() {
         let _: () = msg_send![content, addSubview: general_view];
         release_obj(general_view);
         ui.general_view = general_view;
+
+        // --- 应用切换浮窗页容器 switcher page container(初始隐藏 / initially hidden)---
+        let switcher_view: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let switcher_view: *mut AnyObject = msg_send![switcher_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
+        let _: () = msg_send![switcher_view, setHidden: true];
+        let _: () = msg_send![switcher_view, setAutoresizingMask: 18u64]; // 同 general_view:宽高拉伸
+        let _: () = msg_send![content, addSubview: switcher_view];
+        release_obj(switcher_view);
+        ui.switcher_view = switcher_view;
 
         // --- 实验性页容器 experimental page container(初始隐藏 / initially hidden)---
         let experimental_view: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -3285,76 +3310,6 @@ fn create_settings_window() {
         // 默认按当前权限显隐(有权限就隐藏)/ initial visibility: hidden when permission is already granted
         let _: () = msg_send![banner, setHidden: has_accessibility_permission()];
 
-        // --- 外观 Appearance ---
-        y -= 12.0;
-        add_header(
-            general_view,
-            &t("settings.header_appearance"),
-            12.0,
-            y,
-            content_w - 24.0,
-        );
-        y -= 8.0 + row_h;
-        ui.glass_style = add_row(
-            general_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_glass_style"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &["regular", "clear"], 0),
-        );
-        y -= row_pitch;
-        // TODO: glass_tint 改用 NSColorWell(系统取色器)替代 hex 文本框,体验更好。
-        // TODO: replace glass_tint's hex text field with NSColorWell (system color picker).
-        ui.glass_tint = add_row(
-            general_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_glass_tint"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "eeeeee66"),
-        );
-        y -= row_pitch;
-        ui.corner_radius = add_row(
-            general_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_corner_radius"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "64"),
-        );
-
-        // --- 键盘 Keyboard ---
-        y -= 14.0 + 24.0;
-        add_header(
-            general_view,
-            &t("settings.header_keyboard"),
-            12.0,
-            y,
-            content_w - 24.0,
-        );
-        y -= 8.0 + row_h;
-        // 修饰键下拉项:显示 Option+Tab / Command+Tab(快捷键名,各 locale 保持原文);值由索引映射到 option/command。
-        // Modifier popup items: show Option+Tab / Command+Tab (shortcut names, kept verbatim across locales);
-        // the value is mapped from the index to option/command.
-        let mod_labels = [
-            t("settings.modifier_option"),
-            t("settings.modifier_command"),
-        ];
-        let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
-        ui.modifier = add_row(
-            general_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_modifier"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0),
-        );
-
         // --- 语言 Language ---
         y -= 14.0 + 24.0;
         add_header(
@@ -3373,77 +3328,6 @@ fn create_settings_window() {
             row_h,
             &t("settings.row_locale"),
             make_popup(ctrl_x, y, ctrl_w, row_h, &LOCALE_LABELS, 0),
-        );
-
-        // --- 窗口 Window ---
-        y -= 14.0 + 24.0;
-        add_header(
-            general_view,
-            &t("settings.header_windows"),
-            12.0,
-            y,
-            content_w - 24.0,
-        );
-        y -= 8.0 + row_h;
-        // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器接管)。
-        // App-switcher master switch: off = Cmd+Tab passes through to the system.
-        ui.windows_enabled = add_row(
-            general_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_windows_enabled"),
-            make_switch(ctrl_x + ctrl_w, y, row_h, false),
-        );
-        y -= 8.0 + row_h;
-        // show_minimized 开关(切换器语义本就只有显/隐两态,用 Toggle 比下拉更直观)。
-        // 英文标签 "Show minimized windows on switch"(215pt)超出默认 label_w=150,
-        // 该行标签加宽到 225;开关与所有开关行一样右对齐到 popup 右缘(ctrl_x + ctrl_w)。
-        // show_minimized as a switch (the option is inherently two-state, so a toggle is more
-        // intuitive than a popup). The English label (215pt) exceeds the default label_w=150,
-        // so this row widens its label to 225; the switch right-aligns to the popups' right
-        // edge (ctrl_x + ctrl_w), like every other switch row.
-        ui.show_minimized = add_row(
-            general_view,
-            label_x,
-            y,
-            225.0,
-            row_h,
-            &t("settings.row_show_minimized"),
-            make_switch(ctrl_x + ctrl_w, y, row_h, false),
-        );
-        y -= 8.0 + row_h;
-        // thumbnails_enabled 开关:关闭后浮窗回到纯图标渲染,缩略图服务休眠。
-        // 无屏幕录制权限时即使开启也自动休眠(见 thumbnail 模块)。
-        // thumbnails_enabled switch: off = the overlay returns to icon-only rendering
-        // and the thumbnail service sleeps. It also auto-sleeps without the Screen
-        // Recording permission even when on (see the thumbnail module).
-        ui.thumbnails_enabled = add_row(
-            general_view,
-            label_x,
-            y,
-            225.0,
-            row_h,
-            &t("settings.row_thumbnails"),
-            make_switch(ctrl_x + ctrl_w, y, row_h, false),
-        );
-        y -= 8.0 + row_h;
-        // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0(跟随激活窗口)。
-        // overlay_position popup: items = [Follow Active Window, Always on Main Screen]; default index 0.
-        let op_labels = [
-            t("settings.overlay_position_follow_active"),
-            t("settings.overlay_position_main_screen"),
-        ];
-        let op_label_refs: Vec<&str> = op_labels.iter().map(|s| s.as_str()).collect();
-        ui.overlay_position = add_row(
-            general_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_overlay_position"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &op_label_refs, 0),
         );
 
         // --- 日志 Logging ---
@@ -3489,6 +3373,145 @@ fn create_settings_window() {
             row_h,
             &t("settings.row_launch_at_login"),
             make_switch(ctrl_x + ctrl_w, y, row_h, false),
+        );
+
+        // ===== 应用切换浮窗页内容 switcher overlay page content =====
+        let mut y = layout_h - 12.0;
+
+        // --- 窗口 Window ---
+        y -= 12.0;
+        add_header(
+            switcher_view,
+            &t("settings.header_windows"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
+        y -= 8.0 + row_h;
+        // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器接管)。
+        // App-switcher master switch: off = Cmd+Tab passes through to the system.
+        ui.windows_enabled = add_row(
+            switcher_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_windows_enabled"),
+            make_switch(ctrl_x + ctrl_w, y, row_h, false),
+        );
+        y -= 8.0 + row_h;
+        // show_minimized 开关(切换器语义本就只有显/隐两态,用 Toggle 比下拉更直观)。
+        // 英文标签较长,该行标签加宽到 225;开关仍与 popup 右缘对齐。
+        // show_minimized is inherently two-state, so a toggle is clearer than a popup. The long
+        // English label uses a wider label column, while the switch stays aligned to the popups.
+        ui.show_minimized = add_row(
+            switcher_view,
+            label_x,
+            y,
+            225.0,
+            row_h,
+            &t("settings.row_show_minimized"),
+            make_switch(ctrl_x + ctrl_w, y, row_h, false),
+        );
+        y -= 8.0 + row_h;
+        // thumbnails_enabled 开关:关闭后浮窗回到纯图标渲染,缩略图服务休眠。
+        // 无屏幕录制权限时即使开启也自动休眠(见 thumbnail 模块)。
+        // thumbnails_enabled off returns the overlay to icon-only rendering and lets the
+        // thumbnail service sleep; without Screen Recording permission it also auto-sleeps.
+        ui.thumbnails_enabled = add_row(
+            switcher_view,
+            label_x,
+            y,
+            225.0,
+            row_h,
+            &t("settings.row_thumbnails"),
+            make_switch(ctrl_x + ctrl_w, y, row_h, false),
+        );
+        y -= 8.0 + row_h;
+        // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0。
+        // overlay_position popup: [Follow Active Window, Always on Main Screen]; default index 0.
+        let op_labels = [
+            t("settings.overlay_position_follow_active"),
+            t("settings.overlay_position_main_screen"),
+        ];
+        let op_label_refs: Vec<&str> = op_labels.iter().map(|s| s.as_str()).collect();
+        ui.overlay_position = add_row(
+            switcher_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_overlay_position"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &op_label_refs, 0),
+        );
+
+        // --- 键盘 Keyboard ---
+        y -= 14.0 + 24.0;
+        add_header(
+            switcher_view,
+            &t("settings.header_keyboard"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
+        y -= 8.0 + row_h;
+        // 修饰键下拉项:显示 Option+Tab / Command+Tab;值由索引映射到 option/command。
+        // Modifier popup shows Option+Tab / Command+Tab; the index maps to option/command.
+        let mod_labels = [
+            t("settings.modifier_option"),
+            t("settings.modifier_command"),
+        ];
+        let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
+        ui.modifier = add_row(
+            switcher_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_modifier"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0),
+        );
+
+        // --- 外观 Appearance ---
+        y -= 14.0 + 24.0;
+        add_header(
+            switcher_view,
+            &t("settings.header_appearance"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
+        y -= 8.0 + row_h;
+        ui.glass_style = add_row(
+            switcher_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_glass_style"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &["regular", "clear"], 0),
+        );
+        y -= row_pitch;
+        // TODO: glass_tint 改用 NSColorWell(系统取色器)替代 hex 文本框,体验更好。
+        // TODO: replace glass_tint with NSColorWell (the system color picker) for a better UX.
+        ui.glass_tint = add_row(
+            switcher_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_glass_tint"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "eeeeee66"),
+        );
+        y -= row_pitch;
+        ui.corner_radius = add_row(
+            switcher_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_corner_radius"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "64"),
         );
 
         // ===== 实验性页内容 experimental page content =====
