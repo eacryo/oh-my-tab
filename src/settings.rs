@@ -700,15 +700,24 @@ unsafe fn configure_glass_tint_panel(target: *mut AnyObject) {
         GLASS_TINT_PANEL_OBSERVER_INSTALLED.store(true, Ordering::SeqCst);
     }
 
+    // accessory 宽度必须匹配颜色面板本身;NSColorPanel 不会因 accessory 超宽而自动扩窗。
+    // The accessory width must match the color panel; NSColorPanel does not widen itself for an
+    // oversized accessory view.
+    let panel_frame: NSRect = msg_send![panel, frame];
+    let accessory_w = panel_frame.size.width.max(250.0);
+    let accessory_margin = 8.0;
     let accessory: *mut AnyObject = msg_send![class!(NSView), alloc];
     let accessory: *mut AnyObject = msg_send![
         accessory,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(300.0, 34.0))
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(accessory_w, 34.0))
     ];
     let reset: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let reset: *mut AnyObject = msg_send![
         reset,
-        initWithFrame: NSRect::new(NSPoint::new(140.0, 4.0), NSSize::new(150.0, 26.0))
+        initWithFrame: NSRect::new(
+            NSPoint::new(accessory_margin, 4.0),
+            NSSize::new(accessory_w - accessory_margin * 2.0, 26.0),
+        )
     ];
     set_control_title(reset, &t("settings.reset_glass_tint"));
     let _: () = msg_send![reset, setBezelStyle: 1isize];
