@@ -159,7 +159,7 @@ struct SettingsUi {
     modifier: *mut AnyObject,        // NSPopUpButton: option / command
     locale: *mut AnyObject,          // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject,  // NSSwitch: 显示最小化窗口 / show minimized windows
-    thumbnails_enabled: *mut AnyObject, // NSSwitch: 显示窗口缩略图 / show window thumbnails
+    thumbnails_enabled: *mut AnyObject, // NSPopUpButton: 窗口显示模式 / window display mode
     windows_enabled: *mut AnyObject, // NSSwitch: 窗口切换总开关 / app-switcher master switch
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
     log_level: *mut AnyObject,        // NSPopUpButton: trace / debug / info / warn / error
@@ -2953,14 +2953,10 @@ fn load_settings_from(cfg: &Config) {
             0isize
         };
         let _: () = msg_send![ui.show_minimized, setState: sm_state];
-        // thumbnails_enabled:switch 状态(1=on / 0=off)。
-        // thumbnails_enabled: switch state (1=on / 0=off).
-        let th_state = if cfg.layout.thumbnails_enabled {
-            1isize
-        } else {
-            0isize
-        };
-        let _: () = msg_send![ui.thumbnails_enabled, setState: th_state];
+        // 窗口显示模式 index 0 = 仅图标, 1 = 图标和缩略图。
+        // Window display mode index 0 = icons only, 1 = icons and thumbnails.
+        let th_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };
+        let _: () = msg_send![ui.thumbnails_enabled, selectItemAtIndex: th_idx];
         // overlay_position:下拉框 index 0 = 跟随激活窗口(active_window), 1 = 主屏幕(main)。
         // overlay_position: popup index 0 = follow active window (active_window), 1 = main (main).
         let op_idx = match cfg.windows.overlay_position.as_str() {
@@ -3146,10 +3142,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         cfg.windows.enabled = we_state == 1;
         let sm_state: isize = msg_send![ui.show_minimized, state];
         cfg.windows.show_minimized = sm_state == 1;
-        // thumbnails_enabled:switch state(1=on / 0=off)。
-        // thumbnails_enabled: switch state (1=on / 0=off).
-        let th_state: isize = msg_send![ui.thumbnails_enabled, state];
-        cfg.layout.thumbnails_enabled = th_state == 1;
+        // 窗口显示模式 index 0 = 仅图标, 1 = 图标和缩略图。
+        // Window display mode index 0 = icons only, 1 = icons and thumbnails.
+        let th_idx: isize = msg_send![ui.thumbnails_enabled, indexOfSelectedItem];
+        cfg.layout.thumbnails_enabled = th_idx == 1;
         // overlay_position:下拉框 index 0 = 跟随激活窗口, 1 = 主屏幕。
         // overlay_position: popup index 0 = follow active window, 1 = main.
         let op_idx: isize = msg_send![ui.overlay_position, indexOfSelectedItem];
@@ -3987,18 +3983,25 @@ fn create_settings_window() {
             make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
         y -= 8.0 + row_h;
-        // thumbnails_enabled 开关:关闭后浮窗回到纯图标渲染,缩略图服务休眠。
-        // 无屏幕录制权限时即使开启也自动休眠(见 thumbnail 模块)。
-        // thumbnails_enabled off returns the overlay to icon-only rendering and lets the
-        // thumbnail service sleep; without Screen Recording permission it also auto-sleeps.
+        // 窗口显示模式:仅图标或图标和缩略图;配置仍由 thumbnails_enabled 布尔值保存。
+        // Window display mode: icons only or icons and thumbnails; the config remains stored as
+        // the thumbnails_enabled boolean.
+        let window_display_mode_labels = [
+            t("settings.window_display_mode_icons"),
+            t("settings.window_display_mode_icons_thumbnails"),
+        ];
+        let window_display_mode_refs: Vec<&str> = window_display_mode_labels
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         ui.thumbnails_enabled = add_row(
             switcher_view,
             label_x,
             y,
             225.0,
             row_h,
-            &t("settings.row_thumbnails"),
-            make_switch(ctrl_x + ctrl_w, y, row_h, false),
+            &t("settings.row_window_display_mode"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &window_display_mode_refs, 0),
         );
         y -= 8.0 + row_h;
         // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0。

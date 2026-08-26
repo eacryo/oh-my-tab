@@ -718,6 +718,25 @@ pub(crate) fn plan_thumb_scroll_layout(
     )
 }
 
+/// 把窗口均匀分配到指定数量的行,每行数量最多相差一张。
+/// Distribute windows evenly across the requested rows; row sizes differ by at most one card.
+fn balanced_icon_row_ranges(count: usize, row_count: usize) -> Vec<Range<usize>> {
+    if count == 0 || row_count == 0 {
+        return Vec::new();
+    }
+    let base = count / row_count;
+    let remainder = count % row_count;
+    let mut start = 0;
+    (0..row_count)
+        .map(|row| {
+            let length = base + usize::from(row < remainder);
+            let range = start..start + length;
+            start += length;
+            range
+        })
+        .collect()
+}
+
 /// 规划固定卡片的纯图标视口:卡片尺寸固定,列数由屏幕宽度自动计算,溢出后连续滚动。
 /// Plan the fixed-card icon-only viewport: card size stays fixed, columns come from screen width,
 /// and overflow becomes continuously scrollable.
@@ -735,22 +754,38 @@ pub(crate) fn plan_icon_scroll_layout(
     let max_columns = ((max_inner + gap) / (ICON_CARD_W + gap)).floor().max(1.0) as usize;
     // 少量窗口仍保留旧版三卡宽基线,但卡片本身始终保持固定尺寸。
     // Keep the legacy three-slot baseline for small sets, while card dimensions remain fixed.
-    let columns = count.max(3).min(max_columns);
-    let row_ranges: Vec<Range<usize>> = if count == 0 {
-        Vec::new()
+    let baseline_columns = count.max(3).min(max_columns);
+    let minimum_rows = if count == 0 {
+        0
     } else {
-        (0..count)
-            .step_by(columns)
-            .map(|start| start..(start + columns).min(count))
-            .collect()
+        count.div_ceil(max_columns)
     };
-    let row_count = row_ranges.len();
-    let visual_row_count = row_count.max(1);
     let max_rows = ((max_panel_h - THUMB_TOP_INSET - STATUS_H).max(ICON_CARD_H)
         / (ICON_CARD_H + gap))
         .floor()
         .max(1.0) as usize;
-    let overflowed = row_count > max_rows;
+    let overflowed = minimum_rows > max_rows;
+    let columns = if overflowed {
+        max_columns
+    } else if count < 3 {
+        baseline_columns
+    } else {
+        count.div_ceil(minimum_rows.max(1))
+    };
+    let row_ranges: Vec<Range<usize>> = if count == 0 {
+        Vec::new()
+    } else if overflowed {
+        (0..count)
+            .step_by(max_columns)
+            .map(|start| start..(start + max_columns).min(count))
+            .collect()
+    } else if count < 3 {
+        std::iter::once(0..count).collect()
+    } else {
+        balanced_icon_row_ranges(count, minimum_rows)
+    };
+    let row_count = row_ranges.len();
+    let visual_row_count = row_count.max(1);
     let viewport_rows = if overflowed {
         max_rows
     } else {
@@ -1322,6 +1357,15 @@ mod flow_tests {
 #[cfg(test)]
 mod icon_scroll_tests {
     use super::*;
+
+    #[test]
+    fn icon_layout_balances_rows_when_the_document_fits() {
+        let layout = plan_icon_scroll_layout(10, 1200.0, 500.0, 14.0, 0.0);
+
+        assert!(!layout.overflowed);
+        assert_eq!(layout.row_ranges, vec![0..5, 5..10]);
+        assert_eq!(layout.panel_w, 5.0 * ICON_CARD_W + H_PADDING * 2.0);
+    }
 
     #[test]
     fn icon_cards_keep_fixed_size_and_three_card_baseline() {
