@@ -2609,23 +2609,24 @@ pub(crate) unsafe fn apply_glass_properties() {
     if glass.is_null() {
         return;
     }
-    let cfg = CONFIG.read().unwrap();
-    let _: () = msg_send![glass, setCornerRadius: cfg.appearance.corner_radius];
+    let radius = CONFIG.read().unwrap().appearance.corner_radius;
+    let style_name = config::effective_glass_style();
+    let tint_hex = config::parse_hex8(&config::effective_glass_tint());
+    let _: () = msg_send![glass, setCornerRadius: radius];
     // 同步 layer 的硬裁剪:cornerRadius 只圆着色不圆模糊,需 masksToBounds 把模糊也裁进圆角
     // (见 create_overlay_window 的 (6.5) 注释)。
     // Mirror the layer hard-clip: cornerRadius rounds the tint but not the blur, so masksToBounds
     // is needed to clip the blur into the rounded shape (see (6.5) in create_overlay_window).
     let glass_layer: *mut AnyObject = msg_send![glass, layer];
     if !glass_layer.is_null() {
-        let _: () = msg_send![glass_layer, setCornerRadius: cfg.appearance.corner_radius];
+        let _: () = msg_send![glass_layer, setCornerRadius: radius];
         let _: () = msg_send![glass_layer, setMasksToBounds: true];
     }
-    let style: i64 = match cfg.appearance.glass_style.as_str() {
+    let style: i64 = match style_name.as_str() {
         "clear" => 1,
         _ => 0, // regular
     };
     let _: () = msg_send![glass, setStyle: style];
-    let tint_hex = config::parse_hex8(&cfg.appearance.glass_tint);
     let tint = hex_to_ns_color(tint_hex);
     let _: () = msg_send![glass, setTintColor: tint];
 }

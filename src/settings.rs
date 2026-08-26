@@ -11,7 +11,7 @@ use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use crate::config::{reload_config, Config, CONFIG};
@@ -154,7 +154,9 @@ struct SettingsUi {
     mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
     clipboard_view: *mut AnyObject,  // NSView: 剪贴板历史页容器 / Clipboard page container
     glass_style: *mut AnyObject,     // NSPopUpButton: regular / clear
-    glass_tint: *mut AnyObject,      // NSTextField: RRGGBBAA hex
+    glass_tint: *mut AnyObject,      // NSColorWell: 玻璃颜色 / glass tint
+    glass_preview_switcher: *mut AnyObject, // NSGlassEffectView: app switcher preview
+    glass_preview_clipboard: *mut AnyObject, // NSGlassEffectView: clipboard preview
     corner_radius: *mut AnyObject,   // NSTextField
     cards_per_row: *mut AnyObject,
     card_width: *mut AnyObject,
@@ -240,6 +242,25 @@ const MAPPING_ACTION_KEYS: [&str; 8] = [
 ];
 unsafe impl Sync for SettingsUi {}
 static SETTINGS_UI: Mutex<Option<SettingsUi>> = Mutex::new(None);
+
+/// 程序同步 color well / color panel 时抑制回调重入。
+/// Suppresses callback re-entry while synchronizing the color well and color panel in code.
+static GLASS_UI_UPDATE: AtomicBool = AtomicBool::new(false);
+
+/// 颜色面板与设置窗口的组合布局状态;详情面板同样只在打开时记录主窗原始位置。
+/// Group-layout state for the color panel and settings window; like the detail panel, it stores
+/// the main window's original position only while the group is open.
+static GLASS_TINT_GROUP_ORIGINAL_ORIGIN: Mutex<Option<NSPoint>> = Mutex::new(None);
+static GLASS_TINT_PANEL_OBSERVER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+const GLASS_TINT_GROUP_GAP: f64 = 8.0;
+const GLASS_TINT_SCREEN_MARGIN: f64 = 8.0;
+
+struct GlassTintWellClass(*mut AnyObject);
+unsafe impl Send for GlassTintWellClass {}
+unsafe impl Sync for GlassTintWellClass {}
+
+static GLASS_TINT_WELL_CLASS: OnceLock<GlassTintWellClass> = OnceLock::new();
 
 /// 当前在鼠标页选中的设备范围。None = "所有鼠标";Some((vid,pid)) = 某款具体鼠标。
 /// The currently-selected device scope on the Mouse page. None = "All Mice";
@@ -332,6 +353,505 @@ unsafe fn make_text_input(x: f64, y: f64, w: f64, h: f64, value: &str) -> *mut A
     let _: () = msg_send![field, setStringValue: ns];
     CFRelease(ns as *const c_void);
     field
+}
+
+fn color_component_to_byte(component: f64) -> u8 {
+    (component.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn rgba_hex_from_components(red: f64, green: f64, blue: f64, alpha: f64) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        color_component_to_byte(red),
+        color_component_to_byte(green),
+        color_component_to_byte(blue),
+        color_component_to_byte(alpha)
+    )
+}
+
+/// 将任意 NSColor 转换到 sRGB 后编码为配置使用的 RRGGBBAA。
+/// Convert any NSColor to sRGB and encode it as the RRGGBBAA format used by the config.
+unsafe fn ns_color_to_hex(color: *mut AnyObject) -> Option<String> {
+    if color.is_null() {
+        return None;
+    }
+    let space: *mut AnyObject = msg_send![class!(NSColorSpace), sRGBColorSpace];
+    let srgb: *mut AnyObject = msg_send![color, colorUsingColorSpace: space];
+    if srgb.is_null() {
+        return None;
+    }
+    let red: f64 = msg_send![srgb, redComponent];
+    let green: f64 = msg_send![srgb, greenComponent];
+    let blue: f64 = msg_send![srgb, blueComponent];
+    let alpha: f64 = msg_send![srgb, alphaComponent];
+    Some(rgba_hex_from_components(red, green, blue, alpha))
+}
+
+/// 原生取色器色块,固定为右侧小色块而不是拉伸成文本框宽度。
+/// Native color well, kept as a compact right-side swatch instead of stretching like a text field.
+unsafe fn make_color_well(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    value: &str,
+    target: *mut AnyObject,
+) -> *mut AnyObject {
+    let well: *mut AnyObject = msg_send![glass_tint_well_class(), alloc];
+    let well: *mut AnyObject = msg_send![
+        well,
+        initWithFrame: NSRect::new(NSPoint::new(x + w - 52.0, y), NSSize::new(52.0, h))
+    ];
+    let _: () = msg_send![well, setColorWellStyle: 0isize]; // NSColorWellStyleDefault
+    let _: () = msg_send![well, setBordered: true];
+    let _: () = msg_send![well, setContinuous: true];
+    let _: () = msg_send![well, setTarget: target];
+    let _: () = msg_send![well, setAction: sel!(handleGlassTintChanged:)];
+    let responds: bool = msg_send![well, respondsToSelector: sel!(setSupportsAlpha:)];
+    if responds {
+        let _: () = msg_send![well, setSupportsAlpha: true];
+    }
+    let color = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(value));
+    let _: () = msg_send![well, setColor: color];
+    let _: () = msg_send![well, setAutoresizingMask: 0u64];
+    well
+}
+
+/// 纯逻辑:水平居中设置窗口+颜色面板的整体,面板在设置窗口右侧并垂直居中。
+/// Pure: center the settings window + color panel as one horizontal group, with the panel on
+/// the right and vertically centered against the settings window.
+fn glass_tint_group_frames(settings: NSRect, panel: NSRect, screen: NSRect) -> (NSRect, NSRect) {
+    let group_w = settings.size.width + GLASS_TINT_GROUP_GAP + panel.size.width;
+    let min_x = screen.origin.x + GLASS_TINT_SCREEN_MARGIN;
+    let max_x = screen.origin.x + screen.size.width - GLASS_TINT_SCREEN_MARGIN;
+    let group_x = if group_w + 2.0 * GLASS_TINT_SCREEN_MARGIN <= screen.size.width {
+        (screen.origin.x + (screen.size.width - group_w) / 2.0)
+            .max(min_x)
+            .min(max_x - group_w)
+    } else {
+        min_x
+    };
+
+    let min_y = screen.origin.y + GLASS_TINT_SCREEN_MARGIN;
+    let max_y = screen.origin.y + screen.size.height - GLASS_TINT_SCREEN_MARGIN - panel.size.height;
+    let centered_y = settings.origin.y + (settings.size.height - panel.size.height) / 2.0;
+    let panel_y = if max_y >= min_y {
+        centered_y.max(min_y).min(max_y)
+    } else {
+        min_y
+    };
+
+    (
+        NSRect::new(NSPoint::new(group_x, settings.origin.y), settings.size),
+        NSRect::new(
+            NSPoint::new(
+                group_x + settings.size.width + GLASS_TINT_GROUP_GAP,
+                panel_y,
+            ),
+            panel.size,
+        ),
+    )
+}
+
+/// 取设置窗口所在屏幕的可见区域;窗口尚未绑定屏幕时回退到主屏。
+/// Get the visible frame of the settings window's screen, falling back to the main screen before
+/// AppKit has assigned one.
+unsafe fn glass_tint_screen_frame(window: *mut AnyObject) -> NSRect {
+    let screen: *mut AnyObject = msg_send![window, screen];
+    if screen.is_null() {
+        let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+        msg_send![main, visibleFrame]
+    } else {
+        msg_send![screen, visibleFrame]
+    }
+}
+
+/// 打开取色器前把设置窗口向左移,让两个窗口作为一个整体居中。
+/// Move the settings window left before opening the color panel so the two windows are centered
+/// as one group.
+unsafe fn position_glass_tint_group(save_original: bool) {
+    let window = match SETTINGS_UI.lock().unwrap().as_ref() {
+        Some(ui) => ui.window,
+        None => return,
+    };
+    let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
+    if panel.is_null() {
+        return;
+    }
+
+    let settings_frame: NSRect = msg_send![window, frame];
+    if save_original {
+        let mut original = GLASS_TINT_GROUP_ORIGINAL_ORIGIN.lock().unwrap();
+        if original.is_none() {
+            *original = Some(settings_frame.origin);
+        }
+    }
+    let panel_frame: NSRect = msg_send![panel, frame];
+    let screen_frame = glass_tint_screen_frame(window);
+    let (settings_frame, panel_frame) =
+        glass_tint_group_frames(settings_frame, panel_frame, screen_frame);
+    let _: () = msg_send![window, setFrameOrigin: settings_frame.origin];
+    let _: () = msg_send![panel, setFrameOrigin: panel_frame.origin];
+}
+
+/// 颜色面板关闭后恢复设置窗口打开前的位置;重复调用必须安全。
+/// Restore the settings window's pre-panel position after the color panel closes; repeated calls
+/// are intentionally harmless.
+pub(crate) fn restore_glass_tint_group() {
+    let original = GLASS_TINT_GROUP_ORIGINAL_ORIGIN.lock().unwrap().take();
+    let Some(origin) = original else { return };
+    unsafe {
+        let window = SETTINGS_UI.lock().unwrap().as_ref().map(|ui| ui.window);
+        if let Some(window) = window {
+            let _: () = msg_send![window, setFrameOrigin: origin];
+        }
+    }
+}
+
+/// 自定义 NSColorWell 在 AppKit 显示共享颜色面板前先调整窗口位置,避免左下角闪现。
+/// Custom NSColorWell positioning before AppKit displays the shared color panel, avoiding a
+/// flash in the screen's lower-left corner.
+extern "C" fn glass_tint_well_activate(this: *mut c_void, _cmd: Sel, exclusive: bool) {
+    unsafe {
+        position_glass_tint_group(true);
+        let superclass = AnyClass::get(c"NSColorWell").unwrap();
+        let _: () = msg_send![
+            super(this as *mut AnyObject, superclass),
+            activate: exclusive
+        ];
+        // AppKit 可能在 activate:期间恢复面板记忆位置,因此 super 返回后再应用一次整体布局。
+        // AppKit may restore the panel's remembered frame during activate:; apply the grouped
+        // position once more after super so the final visible frame is deterministic.
+        position_glass_tint_group(false);
+    }
+}
+
+fn glass_tint_well_class() -> *mut AnyObject {
+    GLASS_TINT_WELL_CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabGlassTintWell").unwrap();
+            let superclass = class!(NSColorWell) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:B").unwrap();
+            class_addMethod(
+                cls,
+                sel!(activate:),
+                glass_tint_well_activate as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            GlassTintWellClass(cls)
+        })
+        .0
+}
+
+/// 创建设置页内的玻璃预览块,内容只使用抽象形状,不暴露真实窗口或剪贴板数据。
+/// Create an in-settings glass preview using abstract shapes only, never real windows or clipboard data.
+unsafe fn make_glass_preview(
+    parent: *mut AnyObject,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    switcher: bool,
+) -> *mut AnyObject {
+    let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
+    let content_parent: *mut AnyObject;
+    let glass: *mut AnyObject;
+    if is_macos_26 {
+        let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
+        let view: *mut AnyObject = msg_send![glass_cls, alloc];
+        glass = msg_send![
+            view,
+            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+        ];
+        let _: () = msg_send![glass, setCornerRadius: 12.0f64];
+        let style = if crate::config::effective_glass_style() == "clear" {
+            1i64
+        } else {
+            0i64
+        };
+        let _: () = msg_send![glass, setStyle: style];
+        let tint = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(
+            &crate::config::effective_glass_tint(),
+        ));
+        let _: () = msg_send![glass, setTintColor: tint];
+        let _: () = msg_send![glass, setWantsLayer: true];
+        let layer: *mut AnyObject = msg_send![glass, layer];
+        if !layer.is_null() {
+            let _: () = msg_send![layer, setCornerRadius: 12.0f64];
+            let _: () = msg_send![layer, setMasksToBounds: true];
+        }
+        let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let inner: *mut AnyObject = msg_send![
+            inner,
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
+        ];
+        let _: () = msg_send![inner, setAutoresizingMask: 18u64];
+        let _: () = msg_send![glass, setContentView: inner];
+        content_parent = inner;
+    } else {
+        let view: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+        glass = msg_send![
+            view,
+            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+        ];
+        let _: () = msg_send![glass, setBlendingMode: 1u64]; // WithinWindow
+        let _: () = msg_send![glass, setMaterial: 12u64]; // Dark
+        let _: () = msg_send![glass, setState: 1u64];
+        content_parent = glass;
+    }
+    let _: () = msg_send![glass, setAutoresizingMask: 0u64];
+    let _: () = msg_send![parent, addSubview: glass];
+    release_obj(glass);
+
+    if switcher {
+        add_preview_tile(
+            content_parent,
+            NSRect::new(NSPoint::new(13.0, 12.0), NSSize::new(42.0, 34.0)),
+            0xFFFFFF18,
+            7.0,
+        );
+        add_preview_tile(
+            content_parent,
+            NSRect::new(NSPoint::new(59.0, 8.0), NSSize::new(42.0, 42.0)),
+            0xFFFFFF32,
+            8.0,
+        );
+        add_preview_tile(
+            content_parent,
+            NSRect::new(NSPoint::new(105.0, 12.0), NSSize::new(42.0, 34.0)),
+            0xFFFFFF18,
+            7.0,
+        );
+    } else {
+        add_preview_tile(
+            content_parent,
+            NSRect::new(NSPoint::new(12.0, h - 22.0), NSSize::new(w - 24.0, 10.0)),
+            0xFFFFFF20,
+            5.0,
+        );
+        add_preview_tile(
+            content_parent,
+            NSRect::new(NSPoint::new(12.0, 25.0), NSSize::new(w - 24.0, 12.0)),
+            0xFFFFFF18,
+            5.0,
+        );
+        add_preview_tile(
+            content_parent,
+            NSRect::new(NSPoint::new(12.0, 9.0), NSSize::new(w - 42.0, 8.0)),
+            0xFFFFFF12,
+            4.0,
+        );
+    }
+    glass
+}
+
+unsafe fn add_preview_tile(parent: *mut AnyObject, frame: NSRect, color_hex: u32, radius: f64) {
+    let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let tile: *mut AnyObject = msg_send![tile, initWithFrame: frame];
+    let _: () = msg_send![tile, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![tile, layer];
+    if !layer.is_null() {
+        let _: () = msg_send![layer, setCornerRadius: radius];
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(color_hex));
+    }
+    let _: () = msg_send![parent, addSubview: tile];
+    release_obj(tile);
+}
+
+unsafe fn add_preview_caption(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: f64) {
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![
+        label,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 18.0))
+    ];
+    let ns = make_nsstring(text);
+    let _: () = msg_send![label, setStringValue: ns];
+    CFRelease(ns as *const c_void);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+    let font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 11.0f64];
+    let _: () = msg_send![label, setTextColor: color];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![parent, addSubview: label];
+    release_obj(label);
+}
+
+unsafe fn configure_glass_tint_panel(target: *mut AnyObject) {
+    let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
+    let _: () = msg_send![panel, setShowsAlpha: true];
+    let _: () = msg_send![panel, setContinuous: true];
+    let _: () = msg_send![panel, setTarget: target];
+    let _: () = msg_send![panel, setAction: sel!(handleGlassTintPanelChanged:)];
+    if !GLASS_TINT_PANEL_OBSERVER_INSTALLED.load(Ordering::SeqCst) {
+        let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let name = make_nsstring("NSWindowWillCloseNotification");
+        let _: () = msg_send![
+            center,
+            addObserver: target,
+            selector: sel!(handleGlassTintPanelWillClose:),
+            name: name,
+            object: panel
+        ];
+        CFRelease(name as *const c_void);
+        GLASS_TINT_PANEL_OBSERVER_INSTALLED.store(true, Ordering::SeqCst);
+    }
+
+    let accessory: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let accessory: *mut AnyObject = msg_send![
+        accessory,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(300.0, 34.0))
+    ];
+    let reset: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let reset: *mut AnyObject = msg_send![
+        reset,
+        initWithFrame: NSRect::new(NSPoint::new(140.0, 4.0), NSSize::new(150.0, 26.0))
+    ];
+    set_control_title(reset, &t("settings.reset_glass_tint"));
+    let _: () = msg_send![reset, setBezelStyle: 1isize];
+    let _: () = msg_send![reset, setTarget: target];
+    let _: () = msg_send![reset, setAction: sel!(handleGlassTintReset:)];
+    let _: () = msg_send![accessory, addSubview: reset];
+    release_obj(reset);
+    let _: () = msg_send![panel, setAccessoryView: accessory];
+    release_obj(accessory);
+}
+
+/// 关闭并解绑系统取色面板,避免设置窗口销毁后面板继续改动悬空的 color well。
+/// Close and detach the system color panel so it cannot mutate a dangling color well after the
+/// settings window is destroyed.
+unsafe fn close_glass_tint_panel(well: *mut AnyObject) {
+    if well.is_null() {
+        return;
+    }
+    let active: bool = msg_send![well, isActive];
+    if active {
+        let _: () = msg_send![well, deactivate];
+        let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
+        let _: () = msg_send![panel, orderOut: std::ptr::null::<AnyObject>()];
+    }
+    let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
+    let _: () = msg_send![panel, setAccessoryView: std::ptr::null::<AnyObject>()];
+    restore_glass_tint_group();
+}
+
+unsafe fn update_settings_preview_views() {
+    let style = if crate::config::effective_glass_style() == "clear" {
+        1i64
+    } else {
+        0i64
+    };
+    let tint = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(
+        &crate::config::effective_glass_tint(),
+    ));
+    let ui = SETTINGS_UI.lock().unwrap();
+    let Some(ui) = ui.as_ref() else { return };
+    for preview in [ui.glass_preview_switcher, ui.glass_preview_clipboard] {
+        if preview.is_null() {
+            continue;
+        }
+        let supports_style: bool = msg_send![preview, respondsToSelector: sel!(setStyle:)];
+        if supports_style {
+            let _: () = msg_send![preview, setStyle: style];
+        }
+        let supports_tint: bool = msg_send![preview, respondsToSelector: sel!(setTintColor:)];
+        if supports_tint {
+            let _: () = msg_send![preview, setTintColor: tint];
+        }
+    }
+}
+
+/// 应用临时玻璃预览到真实浮窗和设置页内的两个模拟浮窗。
+/// Apply the temporary glass preview to the real overlays and the two in-settings mock overlays.
+pub(crate) fn apply_glass_preview() {
+    unsafe {
+        crate::overlay::apply_glass_properties();
+        crate::clipboard::apply_glass_properties();
+        update_settings_preview_views();
+    }
+}
+
+fn clear_glass_preview() {
+    crate::config::set_glass_style_preview(None);
+    crate::config::set_glass_tint_preview(None);
+    apply_glass_preview();
+}
+
+unsafe fn update_glass_tint_from_color(color: *mut AnyObject, sync_well: bool) {
+    if GLASS_UI_UPDATE.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(hex) = ns_color_to_hex(color) else {
+        return;
+    };
+    if sync_well {
+        if let Some(ui) = SETTINGS_UI.lock().unwrap().as_ref() {
+            GLASS_UI_UPDATE.store(true, Ordering::SeqCst);
+            let _: () = msg_send![ui.glass_tint, setColor: color];
+            GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
+        }
+    }
+    crate::config::set_glass_tint_preview(Some(hex));
+    apply_glass_preview();
+}
+
+pub(crate) extern "C" fn on_glass_tint_changed(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
+    unsafe { update_glass_tint_from_color(sender as *mut AnyObject, false) }
+}
+
+pub(crate) extern "C" fn on_glass_tint_panel_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    unsafe {
+        let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
+        let color: *mut AnyObject = msg_send![panel, color];
+        update_glass_tint_from_color(color, true);
+    }
+}
+
+pub(crate) extern "C" fn on_glass_tint_panel_will_close(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _notification: *mut c_void,
+) {
+    restore_glass_tint_group();
+}
+
+pub(crate) extern "C" fn on_glass_tint_reset(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    unsafe {
+        let default_hex = Config::default().appearance.glass_tint;
+        let color = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(&default_hex));
+        GLASS_UI_UPDATE.store(true, Ordering::SeqCst);
+        if let Some(ui) = SETTINGS_UI.lock().unwrap().as_ref() {
+            let _: () = msg_send![ui.glass_tint, setColor: color];
+        }
+        let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
+        let _: () = msg_send![panel, setColor: color];
+        GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
+        crate::config::set_glass_tint_preview(Some(default_hex));
+        apply_glass_preview();
+    }
+}
+
+pub(crate) extern "C" fn on_glass_style_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    unsafe {
+        let idx: isize = msg_send![sender as *mut AnyObject, indexOfSelectedItem];
+        crate::config::set_glass_style_preview(Some(if idx == 1 {
+            "clear".into()
+        } else {
+            "regular".into()
+        }));
+        apply_glass_preview();
+    }
 }
 
 /// 下拉选择控件(alloc +1)。
@@ -2250,8 +2770,8 @@ fn show_settings() {
             // resets them.
             let _: () = msg_send![u.window, layoutIfNeeded];
             reposition_traffic_lights(u.window);
-            // 清掉默认 first responder,避免打开时光标落在 Glass color 文本框。
-            // Clear the default first responder so the cursor doesn't land in the Glass color field on open.
+            // 清掉默认 first responder,避免打开时焦点落在 Glass color 控件。
+            // Clear the default first responder so focus does not land on the Glass color control on open.
             let _: bool = msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
             // 按当前权限刷新警告条显隐(有权限就隐藏)/ refresh banner visibility by current permission
             let _: () =
@@ -2261,12 +2781,21 @@ fn show_settings() {
 }
 
 fn hide_settings() {
+    let window_and_well = SETTINGS_UI
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|u| (u.window, u.glass_tint));
     unsafe {
-        let ui = SETTINGS_UI.lock().unwrap();
-        if let Some(u) = ui.as_ref() {
-            let _: () = msg_send![u.window, orderOut: std::ptr::null::<AnyObject>()];
+        if let Some((window, well)) = window_and_well {
+            // 先释放设置锁再关闭颜色面板,通知回调会重新访问 SETTINGS_UI。
+            // Release the settings lock before closing the color panel; its notification callback
+            // re-enters SETTINGS_UI.
+            close_glass_tint_panel(well);
+            let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
+    clear_glass_preview();
     // 切回 .accessory:设置窗口关闭,回到纯菜单栏(无 Dock 图标)。
     // Switch back to .accessory: the settings window is closed, return to pure menu-bar (no Dock icon).
     crate::set_settings_activation_policy(false);
@@ -2387,7 +2916,13 @@ fn load_settings_from(cfg: &Config) {
             0
         };
         let _: () = msg_send![ui.glass_style, selectItemAtIndex: gs_idx];
-        set_field(ui.glass_tint, &cfg.appearance.glass_tint);
+        GLASS_UI_UPDATE.store(true, Ordering::SeqCst);
+        let tint =
+            crate::ffi::hex_to_ns_color(crate::config::parse_hex8(&cfg.appearance.glass_tint));
+        let _: () = msg_send![ui.glass_tint, setColor: tint];
+        let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
+        let _: () = msg_send![panel, setColor: tint];
+        GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
         set_field(ui.corner_radius, cfg.appearance.corner_radius);
         set_field(ui.cards_per_row, cfg.layout.cards_per_row);
         set_field(ui.card_width, cfg.layout.card_width);
@@ -2520,6 +3055,9 @@ fn load_settings_from(cfg: &Config) {
         };
         let _: () = msg_send![ui.clipboard_pin_follow, selectItemAtIndex: pin_idx];
     }
+    crate::config::set_glass_style_preview(Some(cfg.appearance.glass_style.clone()));
+    crate::config::set_glass_tint_preview(Some(cfg.appearance.glass_tint.clone()));
+    apply_glass_preview();
 }
 
 /// 填充鼠标页的 per-device 控件(反转/禁用加速/模式/行数/平滑预设)。
@@ -2574,7 +3112,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         } else {
             "regular".into()
         };
-        cfg.appearance.glass_tint = nsstring_to_rust(msg_send![ui.glass_tint, stringValue]);
+        let color: *mut AnyObject = msg_send![ui.glass_tint, color];
+        if let Some(hex) = ns_color_to_hex(color) {
+            cfg.appearance.glass_tint = hex;
+        }
         match parse_f64(&nsstring_to_rust(msg_send![ui.corner_radius, stringValue])) {
             Ok(v) => cfg.appearance.corner_radius = v,
             Err(_) => errs.push(tf(
@@ -3017,6 +3558,8 @@ fn create_settings_window() {
             clipboard_view: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             glass_tint: std::ptr::null_mut(),
+            glass_preview_switcher: std::ptr::null_mut(),
+            glass_preview_clipboard: std::ptr::null_mut(),
             corner_radius: std::ptr::null_mut(),
             cards_per_row: std::ptr::null_mut(),
             card_width: std::ptr::null_mut(),
@@ -3310,6 +3853,86 @@ fn create_settings_window() {
         // 默认按当前权限显隐(有权限就隐藏)/ initial visibility: hidden when permission is already granted
         let _: () = msg_send![banner, setHidden: has_accessibility_permission()];
 
+        // --- 外观 Appearance ---
+        y -= 12.0;
+        add_header(
+            general_view,
+            &t("settings.header_appearance"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
+        y -= 8.0 + row_h;
+        ui.glass_style = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_glass_style"),
+            make_popup(ctrl_x, y, ctrl_w, row_h, &["regular", "clear"], 0),
+        );
+        let _: () = msg_send![ui.glass_style, setTarget: target];
+        let _: () = msg_send![ui.glass_style, setAction: sel!(handleGlassStyleChanged:)];
+        y -= row_pitch;
+        ui.glass_tint = add_row(
+            general_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_glass_tint"),
+            make_color_well(
+                ctrl_x,
+                y,
+                ctrl_w,
+                row_h,
+                &Config::default().appearance.glass_tint,
+                target,
+            ),
+        );
+        configure_glass_tint_panel(target);
+
+        // --- 实时预览 Live preview ---
+        y -= 14.0 + 24.0;
+        add_header(
+            general_view,
+            &t("settings.header_preview"),
+            12.0,
+            y,
+            content_w - 24.0,
+        );
+        y -= 8.0 + row_h;
+        let preview_h = 58.0;
+        let preview_y = y - preview_h;
+        let preview_w = (content_w - 36.0) / 2.0;
+        let right_preview_x = 12.0 + preview_w + 12.0;
+        add_preview_caption(
+            general_view,
+            &t("settings.preview_switcher"),
+            12.0,
+            preview_y + preview_h + 3.0,
+            preview_w,
+        );
+        add_preview_caption(
+            general_view,
+            &t("settings.preview_clipboard"),
+            right_preview_x,
+            preview_y + preview_h + 3.0,
+            preview_w,
+        );
+        ui.glass_preview_switcher =
+            make_glass_preview(general_view, 12.0, preview_y, preview_w, preview_h, true);
+        ui.glass_preview_clipboard = make_glass_preview(
+            general_view,
+            right_preview_x,
+            preview_y,
+            preview_w,
+            preview_h,
+            false,
+        );
+        y = preview_y;
+
         // --- 语言 Language ---
         y -= 14.0 + 24.0;
         add_header(
@@ -3444,6 +4067,16 @@ fn create_settings_window() {
             &t("settings.row_overlay_position"),
             make_popup(ctrl_x, y, ctrl_w, row_h, &op_label_refs, 0),
         );
+        y -= 8.0 + row_h;
+        ui.corner_radius = add_row(
+            switcher_view,
+            label_x,
+            y,
+            label_w,
+            row_h,
+            &t("settings.row_corner_radius"),
+            make_text_input(ctrl_x, y, ctrl_w, row_h, "64"),
+        );
 
         // --- 键盘 Keyboard ---
         y -= 14.0 + 24.0;
@@ -3470,48 +4103,6 @@ fn create_settings_window() {
             row_h,
             &t("settings.row_modifier"),
             make_popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0),
-        );
-
-        // --- 外观 Appearance ---
-        y -= 14.0 + 24.0;
-        add_header(
-            switcher_view,
-            &t("settings.header_appearance"),
-            12.0,
-            y,
-            content_w - 24.0,
-        );
-        y -= 8.0 + row_h;
-        ui.glass_style = add_row(
-            switcher_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_glass_style"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &["regular", "clear"], 0),
-        );
-        y -= row_pitch;
-        // TODO: glass_tint 改用 NSColorWell(系统取色器)替代 hex 文本框,体验更好。
-        // TODO: replace glass_tint with NSColorWell (the system color picker) for a better UX.
-        ui.glass_tint = add_row(
-            switcher_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_glass_tint"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "eeeeee66"),
-        );
-        y -= row_pitch;
-        ui.corner_radius = add_row(
-            switcher_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_corner_radius"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "64"),
         );
 
         // ===== 实验性页内容 experimental page content =====
@@ -4070,19 +4661,72 @@ fn create_settings_window() {
 /// Invalidate the cached settings window (release + set None) so it is rebuilt with the
 /// current locale on next open. 用于 locale 变更后让设置窗口标签换语言。
 pub(crate) fn invalidate_settings_window() {
-    unsafe {
-        let mut ui = SETTINGS_UI.lock().unwrap();
-        if let Some(u) = ui.take() {
+    let ui = SETTINGS_UI.lock().unwrap().take();
+    if let Some(u) = ui {
+        unsafe {
+            close_glass_tint_panel(u.glass_tint);
             // 窗口 alloc 是 +1且 setReleasedWhenClosed:false,需手动 release 一次;
             // 其子控件已由父视图持有,随窗口 dealloc 释放。
             // The window is alloc +1 with setReleasedWhenClosed:false, so release once manually;
             // its subviews are retained by the parent view and dealloc with the window.
             let _: () = msg_send![u.window, orderOut: std::ptr::null::<AnyObject>()];
             release_obj(u.window);
-            // 窗口被作废(销毁),切回 .accessory(可能 locale 变更时设置正开着)。
-            // The window is invalidated/destroyed; flip back to .accessory (it may have been open
-            // during a locale change).
-            crate::set_settings_activation_policy(false);
         }
+        // 窗口被作废(销毁),切回 .accessory(可能 locale 变更时设置正开着)。
+        // The window is invalidated/destroyed; flip back to .accessory (it may have been open
+        // during a locale change).
+        crate::set_settings_activation_policy(false);
+    }
+    clear_glass_preview();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        color_component_to_byte, glass_tint_group_frames, rgba_hex_from_components,
+        GLASS_TINT_GROUP_GAP, GLASS_TINT_SCREEN_MARGIN,
+    };
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    #[test]
+    fn color_components_round_and_clamp_to_rgba_hex() {
+        assert_eq!(rgba_hex_from_components(0.0, 0.5, 1.0, 0.25), "0080ff40");
+        assert_eq!(rgba_hex_from_components(-1.0, 2.0, 0.1, 0.9), "00ff1ae6");
+        assert_eq!(color_component_to_byte(0.501), 128);
+    }
+
+    #[test]
+    fn glass_tint_group_centers_settings_and_panel_together() {
+        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0));
+        let settings = NSRect::new(NSPoint::new(100.0, 200.0), NSSize::new(656.0, 690.0));
+        let panel = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(250.0, 397.0));
+        let (settings_frame, panel_frame) = glass_tint_group_frames(settings, panel, screen);
+        let group_w = settings.size.width + GLASS_TINT_GROUP_GAP + panel.size.width;
+        assert_eq!(settings_frame.origin.x, (screen.size.width - group_w) / 2.0);
+        assert_eq!(
+            panel_frame.origin.x,
+            settings_frame.origin.x + settings.size.width + GLASS_TINT_GROUP_GAP
+        );
+        assert_eq!(
+            panel_frame.origin.y,
+            settings.origin.y + (settings.size.height - panel.size.height) / 2.0
+        );
+    }
+
+    #[test]
+    fn glass_tint_group_uses_screen_origin_and_clamps_panel_vertically() {
+        let screen = NSRect::new(NSPoint::new(-1280.0, 80.0), NSSize::new(800.0, 700.0));
+        let settings = NSRect::new(NSPoint::new(-900.0, -200.0), NSSize::new(656.0, 690.0));
+        let panel = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(250.0, 397.0));
+        let (settings_frame, panel_frame) = glass_tint_group_frames(settings, panel, screen);
+        assert_eq!(
+            settings_frame.origin.x,
+            screen.origin.x + GLASS_TINT_SCREEN_MARGIN
+        );
+        assert_eq!(
+            panel_frame.origin.y,
+            screen.origin.y + GLASS_TINT_SCREEN_MARGIN
+        );
+        assert!(panel_frame.origin.y + panel.size.height <= screen.origin.y + screen.size.height);
     }
 }

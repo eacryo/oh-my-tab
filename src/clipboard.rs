@@ -349,6 +349,10 @@ static PICKER_CONTAINER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// the localized footer in place.
 static PICKER_CONTENT_PARENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
+/// macOS 26+ 的 picker 玻璃视图,供设置页实时刷新 tint/style。
+/// The macOS 26+ picker glass view, used for live tint/style preview updates.
+static PICKER_GLASS: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
 /// 每行按钮指针(按行索引,供高亮/点击)/ row button pointers by index (highlight / click).
 static ROW_BUTTONS: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -519,6 +523,10 @@ static SCROLL_DRAG: Mutex<Option<ScrollDragState>> = Mutex::new(None);
 
 /// 详情浮窗窗口(→ 展开详情)/ the detail panel window (right-arrow expands).
 static DETAIL_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// macOS 26+ 的详情玻璃视图及其 inactive 补偿层。
+/// The macOS 26+ detail glass view and its inactive compensation layer.
+static DETAIL_GLASS: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static DETAIL_GLASS_FILL_LAYER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// 详情浮窗内容容器(文本滚动视图 / 图片视图所在容器;点击面板任意处 = 关闭)。
 /// The detail panel's content container (hosts the text scroll view / the image view;
 /// clicking anywhere on the panel dismisses it).
@@ -4415,12 +4423,12 @@ unsafe fn ensure_detail_window() {
         // NSGlassEffectView's corner radius participates in the glass-material rendering, so
         // it must match the picker. Its own layer hard-clips afterward to prevent blur leaks.
         let _: () = msg_send![glass, setCornerRadius: CORNER_R];
-        let style_i: i64 = match CONFIG.read().unwrap().appearance.glass_style.as_str() {
+        let style_i: i64 = match crate::config::effective_glass_style().as_str() {
             "clear" => 1,
             _ => 0,
         };
         let _: () = msg_send![glass, setStyle: style_i];
-        let tint_hex = crate::config::parse_hex8(&CONFIG.read().unwrap().appearance.glass_tint);
+        let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
         let tint = crate::ffi::hex_to_ns_color(tint_hex);
         let _: () = msg_send![glass, setTintColor: tint];
         let _: () = msg_send![glass, setAutoresizingMask: 18u64];
@@ -4447,6 +4455,7 @@ unsafe fn ensure_detail_window() {
         let fill_layer: *mut AnyObject = msg_send![fill, layer];
         let compensation_hex = (tint_hex & 0xFFFF_FF00) | DETAIL_INACTIVE_GLASS_COMPENSATION_A;
         crate::ffi::layer_set_background(fill_layer, crate::ffi::hex_to_cg_color(compensation_hex));
+        *DETAIL_GLASS_FILL_LAYER.lock().unwrap() = Some(ObjPtr(fill_layer));
         let _: () = msg_send![fill, setAutoresizingMask: 18u64];
         let _: () = msg_send![inner, addSubview: fill];
         release_obj(fill);
@@ -4460,6 +4469,7 @@ unsafe fn ensure_detail_window() {
             let _: () = msg_send![glass_layer, setCornerRadius: CORNER_R];
             let _: () = msg_send![glass_layer, setMasksToBounds: true];
         }
+        *DETAIL_GLASS.lock().unwrap() = Some(ObjPtr(glass));
         release_obj(glass);
         content_parent = inner;
     } else {
@@ -6062,6 +6072,34 @@ fn copy_detail_selection() {
 }
 
 /// 构建浮窗窗口(一次)。/ Build the picker window (once).
+///
+/// 设置页实时预览时只更新玻璃视图和详情补偿层,不重建剪贴板内容。
+/// During the settings live preview, update only the glass views and detail compensation layer;
+/// do not rebuild clipboard content.
+pub(crate) unsafe fn apply_glass_properties() {
+    let style = match crate::config::effective_glass_style().as_str() {
+        "clear" => 1i64,
+        _ => 0i64,
+    };
+    let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
+    let tint = crate::ffi::hex_to_ns_color(tint_hex);
+    if let Some(glass) = *PICKER_GLASS.lock().unwrap() {
+        let _: () = msg_send![glass.0, setStyle: style];
+        let _: () = msg_send![glass.0, setTintColor: tint];
+    }
+    if let Some(glass) = *DETAIL_GLASS.lock().unwrap() {
+        let _: () = msg_send![glass.0, setStyle: style];
+        let _: () = msg_send![glass.0, setTintColor: tint];
+    }
+    if let Some(fill_layer) = *DETAIL_GLASS_FILL_LAYER.lock().unwrap() {
+        let compensation_hex = (tint_hex & 0xFFFF_FF00) | DETAIL_INACTIVE_GLASS_COMPENSATION_A;
+        crate::ffi::layer_set_background(
+            fill_layer.0,
+            crate::ffi::hex_to_cg_color(compensation_hex),
+        );
+    }
+}
+
 unsafe fn ensure_picker_window() {
     if PICKER_WINDOW.lock().unwrap().is_some() {
         return;
@@ -6129,12 +6167,12 @@ unsafe fn ensure_picker_window() {
         // Fixed small corner radius for this small panel (not the config's big one).
         let radius = CORNER_R;
         let _: () = msg_send![glass, setCornerRadius: radius];
-        let style_i: i64 = match CONFIG.read().unwrap().appearance.glass_style.as_str() {
+        let style_i: i64 = match crate::config::effective_glass_style().as_str() {
             "clear" => 1,
             _ => 0,
         };
         let _: () = msg_send![glass, setStyle: style_i];
-        let tint_hex = crate::config::parse_hex8(&CONFIG.read().unwrap().appearance.glass_tint);
+        let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
         let tint = crate::ffi::hex_to_ns_color(tint_hex);
         let _: () = msg_send![glass, setTintColor: tint];
         let _: () = msg_send![glass, setAutoresizingMask: 18u64];
@@ -6154,6 +6192,7 @@ unsafe fn ensure_picker_window() {
             let _: () = msg_send![glass_layer, setCornerRadius: radius];
             let _: () = msg_send![glass_layer, setMasksToBounds: true];
         }
+        *PICKER_GLASS.lock().unwrap() = Some(ObjPtr(glass));
         content_parent = inner;
     } else {
         let content: *mut AnyObject = msg_send![window, contentView];

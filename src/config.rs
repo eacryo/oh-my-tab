@@ -1235,6 +1235,13 @@ impl Config {
 
 // ========== Global singleton ==========
 
+// 设置窗口实时预览期间的临时玻璃覆盖值,不写入磁盘配置。
+// Temporary glass overrides used by the live settings preview; never persisted to disk.
+static GLASS_STYLE_PREVIEW: std::sync::LazyLock<RwLock<Option<String>>> =
+    std::sync::LazyLock::new(|| RwLock::new(None));
+static GLASS_TINT_PREVIEW: std::sync::LazyLock<RwLock<Option<String>>> =
+    std::sync::LazyLock::new(|| RwLock::new(None));
+
 pub static CONFIG: std::sync::LazyLock<RwLock<Config>> = std::sync::LazyLock::new(|| {
     let (cfg, _errs) = Config::load_or_default();
     // 应用 config 里的 locale 覆盖(I18N 初始化时只用了系统语言)。
@@ -1244,6 +1251,36 @@ pub static CONFIG: std::sync::LazyLock<RwLock<Config>> = std::sync::LazyLock::ne
     i18n::apply_config_locale(&cfg.i18n.locale);
     RwLock::new(cfg)
 });
+
+/// 返回当前生效的玻璃样式,优先使用设置页的临时预览值。
+/// Return the effective glass style, preferring the settings page's temporary preview value.
+pub fn effective_glass_style() -> String {
+    if let Some(value) = GLASS_STYLE_PREVIEW.read().unwrap().clone() {
+        return value;
+    }
+    CONFIG.read().unwrap().appearance.glass_style.clone()
+}
+
+/// 返回当前生效的玻璃颜色,优先使用设置页的临时预览值。
+/// Return the effective glass tint, preferring the settings page's temporary preview value.
+pub fn effective_glass_tint() -> String {
+    if let Some(value) = GLASS_TINT_PREVIEW.read().unwrap().clone() {
+        return value;
+    }
+    CONFIG.read().unwrap().appearance.glass_tint.clone()
+}
+
+/// 设置或清除玻璃样式的临时预览值。
+/// Set or clear the temporary glass-style preview value.
+pub fn set_glass_style_preview(value: Option<String>) {
+    *GLASS_STYLE_PREVIEW.write().unwrap() = value;
+}
+
+/// 设置或清除玻璃颜色的临时预览值。
+/// Set or clear the temporary glass-tint preview value.
+pub fn set_glass_tint_preview(value: Option<String>) {
+    *GLASS_TINT_PREVIEW.write().unwrap() = value;
+}
 
 /// Reload config from disk and apply. Returns validation errors (empty = success).
 pub fn reload_config() -> Vec<String> {

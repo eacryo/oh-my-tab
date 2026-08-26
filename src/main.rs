@@ -499,13 +499,13 @@ fn create_overlay_window() -> *mut AnyObject {
             let _: () =
                 msg_send![glass, setCornerRadius: CONFIG.read().unwrap().appearance.corner_radius];
             // (5) Glass style — "regular" (0) or "clear" (1), from config.
-            let style: i64 = match CONFIG.read().unwrap().appearance.glass_style.as_str() {
+            let style: i64 = match config::effective_glass_style().as_str() {
                 "clear" => 1,
                 _ => 0, // regular (default)
             };
             let _: () = msg_send![glass, setStyle: style];
             // (6) Tint color — hex RRGGBBAA from config.
-            let tint_hex = config::parse_hex8(&CONFIG.read().unwrap().appearance.glass_tint);
+            let tint_hex = config::parse_hex8(&config::effective_glass_tint());
             let tint = hex_to_ns_color(tint_hex);
             let _: () = msg_send![glass, setTintColor: tint];
             // (7) Autoresizing so the glass view fills the window on resize.
@@ -956,6 +956,36 @@ fn setup_status_bar() {
                 cls,
                 sel!(handleSettingsCancel:),
                 on_settings_cancel as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGlassTintChanged:),
+                on_glass_tint_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGlassTintPanelChanged:),
+                on_glass_tint_panel_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGlassTintPanelWillClose:),
+                on_glass_tint_panel_will_close as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGlassTintReset:),
+                on_glass_tint_reset as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGlassStyleChanged:),
+                on_glass_style_changed as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
