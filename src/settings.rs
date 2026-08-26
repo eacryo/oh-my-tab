@@ -334,6 +334,25 @@ unsafe fn set_control_title(obj: *mut AnyObject, title: &str) {
     CFRelease(ns as *const c_void);
 }
 
+/// 创建设置窗口统一使用的原生圆角操作按钮;调用方负责尺寸、自适应和父视图归属。
+/// Create the native rounded action button shared by Settings; callers own frame, autoresizing,
+/// and parent-view placement.
+unsafe fn make_settings_action_button(
+    frame: NSRect,
+    title: &str,
+    target: *mut AnyObject,
+    action: Sel,
+) -> *mut AnyObject {
+    let button: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
+    set_control_title(button, title);
+    let _: () = msg_send![button, setBezelStyle: 1isize]; // NSRoundedBezelStyle
+    let _: () = msg_send![button, setControlSize: 0isize]; // NSControlSizeRegular
+    let _: () = msg_send![button, setTarget: target];
+    let _: () = msg_send![button, setAction: action];
+    button
+}
+
 /// 用一个数值/字符串填进文本框,并释放临时 NSString。
 /// Set a text field's value from anything Displayable, releasing the temp NSString.
 unsafe fn set_field(field: *mut AnyObject, val: impl std::fmt::Display) {
@@ -711,18 +730,32 @@ unsafe fn configure_glass_tint_panel(target: *mut AnyObject) {
         accessory,
         initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(accessory_w, 34.0))
     ];
-    let reset: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let reset: *mut AnyObject = msg_send![
+    let reset = make_settings_action_button(
+        NSRect::new(
+            NSPoint::new(accessory_margin, 3.0),
+            NSSize::new(accessory_w - accessory_margin * 2.0, 28.0),
+        ),
+        &t("settings.reset_glass_tint"),
+        target,
+        sel!(handleGlassTintReset:),
+    );
+    // 按本地化标题使用原生固有宽度,避免全宽按钮让系统圆角比例失真。
+    // Use the native fitting width for the localized title so a full-width button does not distort
+    // the system bezel's corner proportions.
+    let fitting: NSSize = msg_send![reset, fittingSize];
+    let max_reset_w = accessory_w - accessory_margin * 2.0;
+    let reset_w = if fitting.width > 0.0 {
+        fitting.width.clamp(80.0, max_reset_w)
+    } else {
+        max_reset_w.min(140.0)
+    };
+    let _: () = msg_send![
         reset,
-        initWithFrame: NSRect::new(
-            NSPoint::new(accessory_margin, 4.0),
-            NSSize::new(accessory_w - accessory_margin * 2.0, 26.0),
+        setFrame: NSRect::new(
+            NSPoint::new((accessory_w - reset_w) / 2.0, 3.0),
+            NSSize::new(reset_w, 28.0)
         )
     ];
-    set_control_title(reset, &t("settings.reset_glass_tint"));
-    let _: () = msg_send![reset, setBezelStyle: 1isize];
-    let _: () = msg_send![reset, setTarget: target];
-    let _: () = msg_send![reset, setAction: sel!(handleGlassTintReset:)];
     let _: () = msg_send![accessory, addSubview: reset];
     release_obj(reset);
     let _: () = msg_send![panel, setAccessoryView: accessory];
@@ -3844,18 +3877,15 @@ fn create_settings_window() {
         release_obj(warning_label);
 
         // 「打开隐私与安全性」按钮 / "Open Privacy & Security" button
-        let open_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let open_btn: *mut AnyObject = msg_send![
-            open_btn,
-            initWithFrame: NSRect::new(
+        let open_btn = make_settings_action_button(
+            NSRect::new(
                 NSPoint::new(content_w - 150.0, (banner_h - 28.0) / 2.0),
-                NSSize::new(140.0, 28.0)
-            )
-        ];
-        set_control_title(open_btn, &t("settings.btn_open_privacy"));
-        let _: () = msg_send![open_btn, setBezelStyle: 1isize];
-        let _: () = msg_send![open_btn, setTarget: target];
-        let _: () = msg_send![open_btn, setAction: sel!(handleOpenPrivacy:)];
+                NSSize::new(140.0, 28.0),
+            ),
+            &t("settings.btn_open_privacy"),
+            target,
+            sel!(handleOpenPrivacy:),
+        );
         let _: () = msg_send![banner, addSubview: open_btn];
         release_obj(open_btn);
 
@@ -4607,13 +4637,13 @@ fn create_settings_window() {
         // Restore Defaults button (inside the glass card's bottom, version label below it),
         // on contentView like OK/Cancel, visible on both pages. Width kept within the card
         // (x=12..138, card right edge x=205).
-        let restore: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let restore: *mut AnyObject = msg_send![restore, initWithFrame: NSRect::new(NSPoint::new(12.0, 44.0), NSSize::new(126.0, 28.0))];
+        let restore = make_settings_action_button(
+            NSRect::new(NSPoint::new(12.0, 44.0), NSSize::new(126.0, 28.0)),
+            &t("settings.btn_restore_defaults"),
+            target,
+            sel!(handleRestoreDefaults:),
+        );
         let _: () = msg_send![restore, setAutoresizingMask: 36u64]; // 贴底、贴左 / bottom- and left-anchored
-        set_control_title(restore, &t("settings.btn_restore_defaults"));
-        let _: () = msg_send![restore, setBezelStyle: 1isize];
-        let _: () = msg_send![restore, setTarget: target];
-        let _: () = msg_send![restore, setAction: sel!(handleRestoreDefaults:)];
         let _: () = msg_send![content, addSubview: restore];
         release_obj(restore);
 
@@ -4641,23 +4671,23 @@ fn create_settings_window() {
         release_obj(version_label);
 
         // OK / Cancel on contentView so they stay visible on both pages.
-        let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let cancel: *mut AnyObject = msg_send![cancel, initWithFrame: NSRect::new(NSPoint::new(view_w - 200.0, 14.0), NSSize::new(80.0, 28.0))];
+        let cancel = make_settings_action_button(
+            NSRect::new(NSPoint::new(view_w - 200.0, 14.0), NSSize::new(80.0, 28.0)),
+            &t("settings.btn_cancel"),
+            target,
+            sel!(handleSettingsCancel:),
+        );
         let _: () = msg_send![cancel, setAutoresizingMask: 33u64]; // 贴底、贴右 / bottom- and right-anchored
-        set_control_title(cancel, &t("settings.btn_cancel"));
-        let _: () = msg_send![cancel, setBezelStyle: 1isize];
-        let _: () = msg_send![cancel, setTarget: target];
-        let _: () = msg_send![cancel, setAction: sel!(handleSettingsCancel:)];
         let _: () = msg_send![content, addSubview: cancel];
         release_obj(cancel);
 
-        let ok: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let ok: *mut AnyObject = msg_send![ok, initWithFrame: NSRect::new(NSPoint::new(view_w - 110.0, 14.0), NSSize::new(90.0, 28.0))];
+        let ok = make_settings_action_button(
+            NSRect::new(NSPoint::new(view_w - 110.0, 14.0), NSSize::new(90.0, 28.0)),
+            &t("settings.btn_ok"),
+            target,
+            sel!(handleSettingsOk:),
+        );
         let _: () = msg_send![ok, setAutoresizingMask: 33u64]; // 贴底、贴右
-        set_control_title(ok, &t("settings.btn_ok"));
-        let _: () = msg_send![ok, setBezelStyle: 1isize];
-        let _: () = msg_send![ok, setTarget: target];
-        let _: () = msg_send![ok, setAction: sel!(handleSettingsOk:)];
         let _: () = msg_send![content, addSubview: ok];
         ui.ok_button = ok;
         release_obj(ok);
