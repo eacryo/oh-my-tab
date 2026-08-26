@@ -1426,6 +1426,17 @@ unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> A
 }
 
 pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
+    collect_windows_with_frontmost_bump(mru, true)
+}
+
+/// 收集窗口快照,可选择是否把当前前台窗口写入 MRU。
+/// 生命周期事件触发的刷新只负责更新窗口集合,不能把自身误当成 summon。
+/// Collect a window snapshot, optionally recording the current frontmost window in MRU.
+/// Lifecycle-triggered refreshes only update the window set and must not act like a summon.
+pub(crate) fn collect_windows_with_frontmost_bump(
+    mru: &mut MruMap,
+    bump_frontmost: bool,
+) -> Vec<WindowInfo> {
     let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
     // 始终用 All 枚举(含离屏窗口)。原因:部分应用(如 JetBrains 系 IDE)在"主窗口被
     // 激活"时会把设置对话框 orderOut(隐藏但保留窗口对象)——它 isOnscreen=false,
@@ -1853,76 +1864,69 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
 
     unsafe { CFRelease(array) };
 
-    // summon 时刷新前台聚焦窗口的 MRU 为 now。
-    // 焦点变化若不触发 App 激活通知(如终端切 tab、或前台 App 从未被系统激活过),
-    // 当前窗口的 MRU 会停在 ancient 回退值,排序退化成 CG 枚举顺序。每次 summon 把
-    // "用户正看的窗口"刷成最新即可纠正。
-    // 前台窗口的识别不依赖 CG 枚举顺序（show_minimized 开启时 CG ALL 枚举顺序不保证
-    // z-order），改用系统级 API NSWorkspace.frontmostApplication + focused_window_cgwid
-    // 精确定位。获取失败时仅回退到该前台 App 的首个非最小化窗口。
-    // Refresh the MRU of the frontmost focused window to now on summon. Focus changes that
-    // don't fire an app-activation notification (e.g. switching terminal tabs, or a frontmost
-    // app never system-activated) leave the current window's MRU at the ancient fallback,
-    // degrading sort to CG enumeration order. Bumping the window the user is looking at on
-    // every summon corrects this. The frontmost window is identified via system APIs
-    // (NSWorkspace.frontmostApplication + focused_window_cgwid) rather than CG enumeration
-    // order, because CG's "All" option doesn't guarantee z-order when show_minimized is on.
-    // If the focused-window query fails, fall back only within that frontmost app.
-    // TIMING-DEBUG 前台 app 的 AX 聚焦窗口查询计时(从慢响应 app 切出时这里是第二个等待点)。
-    let t_fm = Instant::now();
-    let (front_pid, frontmost): (Option<i32>, Option<(i32, u32)>) = unsafe {
-        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let front_app: *mut AnyObject = msg_send![workspace, frontmostApplication];
-        if !front_app.is_null() {
-            let front_pid: i32 = msg_send![front_app, processIdentifier];
-            (
-                Some(front_pid),
-                focused_window_cgwid(front_pid).map(|cgwid| (front_pid, cgwid)),
-            )
-        } else {
-            (None, None)
-        }
+    let (front_pid, frontmost, fm_ms): (Option<i32>, Option<(i32, u32)>, u128) = if bump_frontmost {
+        // 只有召唤刷新才读取并 bump 当前前台窗口;生命周期刷新不能因临时窗口创建而改写 MRU。
+        // Only summon refreshes read and bump the frontmost window; a transient lifecycle
+        // window must not rewrite MRU just because it caused a refresh.
+        let t_fm = Instant::now();
+        let result = unsafe {
+            let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let front_app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+            if !front_app.is_null() {
+                let front_pid: i32 = msg_send![front_app, processIdentifier];
+                (
+                    Some(front_pid),
+                    focused_window_cgwid(front_pid).map(|cgwid| (front_pid, cgwid)),
+                )
+            } else {
+                (None, None)
+            }
+        };
+        (result.0, result.1, t_fm.elapsed().as_millis())
+    } else {
+        (None, None, 0)
     };
-    let fm_ms = t_fm.elapsed().as_millis();
-    // 前台 app 的 AX 聚焦窗口查询也单独计时(从慢响应 app 切出时这里是第二个等待点)。
-    // The frontmost app's AX focused-window query is timed too (a second wait when leaving a
-    // slow-responding app).
-    if let Some((pid, _)) = frontmost {
-        log_debug!(
-            "[collect] frontmost pid={} app=\"{}\" {}ms",
-            pid,
-            pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
-            fm_ms
-        );
-    }
-    if let Some((pid, cgwid)) = frontmost {
-        mru.insert((pid, cgwid), now);
-        let w = windows
-            .iter()
-            .find(|w| w.pid == pid && w.window_id == cgwid);
-        log_debug!(
-            "summon-bump frontmost: pid={} app=\"{}\" cgwid={} title=\"{}\"",
-            pid,
-            w.map_or("?", |w| w.app_name.as_str()),
-            cgwid,
-            w.map_or("?", |w| w.window_title.as_str()),
-        );
-    } else if let Some((pid, cgwid)) = frontmost_fallback(&windows, front_pid) {
-        // 回退严格限制在系统前台 App 内，避免 AX 失败时把其他 App 的 CG 首项误刷为最新。
-        // Restrict fallback to the system frontmost app so an AX failure cannot bump another
-        // app's first CG item as most recent.
-        mru.insert((pid, cgwid), now);
-        if let Some(w) = windows
-            .iter()
-            .find(|w| w.pid == pid && w.window_id == cgwid)
-        {
+    if bump_frontmost {
+        // 前台 app 的 AX 聚焦窗口查询也单独计时(从慢响应 app 切出时这里是第二个等待点)。
+        // The frontmost app's AX focused-window query is timed too (a second wait when leaving a
+        // slow-responding app).
+        if let Some((pid, _)) = frontmost {
             log_debug!(
-                "summon-bump frontmost (fallback): pid={} app=\"{}\" cgwid={} title=\"{}\"",
-                w.pid,
-                w.app_name,
-                w.window_id,
-                w.window_title
+                "[collect] frontmost pid={} app=\"{}\" {}ms",
+                pid,
+                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                fm_ms
             );
+        }
+        if let Some((pid, cgwid)) = frontmost {
+            mru.insert((pid, cgwid), now);
+            let w = windows
+                .iter()
+                .find(|w| w.pid == pid && w.window_id == cgwid);
+            log_debug!(
+                "summon-bump frontmost: pid={} app=\"{}\" cgwid={} title=\"{}\"",
+                pid,
+                w.map_or("?", |w| w.app_name.as_str()),
+                cgwid,
+                w.map_or("?", |w| w.window_title.as_str()),
+            );
+        } else if let Some((pid, cgwid)) = frontmost_fallback(&windows, front_pid) {
+            // 回退严格限制在系统前台 App 内,避免 AX 失败时把其他 App 的 CG 首项误刷为最新。
+            // Restrict fallback to the system frontmost app so an AX failure cannot bump another
+            // app's first CG item as most recent.
+            mru.insert((pid, cgwid), now);
+            if let Some(w) = windows
+                .iter()
+                .find(|w| w.pid == pid && w.window_id == cgwid)
+            {
+                log_debug!(
+                    "summon-bump frontmost (fallback): pid={} app=\"{}\" cgwid={} title=\"{}\"",
+                    w.pid,
+                    w.app_name,
+                    w.window_id,
+                    w.window_title
+                );
+            }
         }
     }
 
@@ -1935,8 +1939,9 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     // when switching from app C to browser window A.
     sort_windows_by_mru(&mut windows, mru, now);
 
-    // 每次 summon 时打印排序后的窗口列表（= 实际显示顺序），含 mru 年龄。`*` 标记第 0 个(当前/前台窗口)。
-    // Print the sorted window list on every summon (= display order), with MRU age. `*` marks index 0 (current/frontmost).
+    // 每次完整刷新时打印排序后的窗口列表(=下一次显示顺序),含 mru 年龄。`*`标记第 0 个。
+    // Print the sorted window list on every full refresh (= the next display order), with MRU age.
+    // `*` marks index 0.
     log_debug!("sorted: {} windows", windows.len());
     for (i, w) in windows.iter().enumerate() {
         let mru_ms = mru

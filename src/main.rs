@@ -37,7 +37,7 @@ use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use settings::*;
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread;
 
@@ -64,6 +64,35 @@ pub(crate) struct AppState {
     pub(crate) selected: usize,
     pub(crate) visible: bool,
     pub(crate) mru: MruMap,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowRefreshReason {
+    Lifecycle = 1,
+    Summon = 2,
+}
+
+impl WindowRefreshReason {
+    fn bumps_frontmost(self) -> bool {
+        matches!(self, Self::Summon)
+    }
+
+    fn merge(self, other: Self) -> Self {
+        if self.bumps_frontmost() || other.bumps_frontmost() {
+            Self::Summon
+        } else {
+            Self::Lifecycle
+        }
+    }
+
+    fn from_raw(value: u8) -> Option<Self> {
+        match value {
+            value if value == Self::Lifecycle as u8 => Some(Self::Lifecycle),
+            value if value == Self::Summon as u8 => Some(Self::Summon),
+            _ => None,
+        }
+    }
 }
 
 impl AppState {
@@ -99,7 +128,9 @@ struct WindowRefreshResult {
 }
 
 static WINDOW_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static WINDOW_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+// 保存待处理刷新中最高优先级的原因:召唤刷新不能被生命周期刷新降级。
+// Keep the highest-priority pending reason so a summon refresh cannot be downgraded to a lifecycle refresh.
+static WINDOW_REFRESH_PENDING: AtomicU8 = AtomicU8::new(0);
 static WINDOW_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static WINDOW_REFRESH_RESULT: LazyLock<Mutex<Option<WindowRefreshResult>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -108,8 +139,41 @@ static WINDOW_REFRESH_RESULT: LazyLock<Mutex<Option<WindowRefreshResult>>> =
 /// Request one bounded background window snapshot; only one task may run at a time,
 /// preventing rapid shortcut presses from creating a thread storm.
 fn request_window_refresh() {
+    request_window_refresh_for(WindowRefreshReason::Summon);
+}
+
+fn request_lifecycle_window_refresh() {
+    request_window_refresh_for(WindowRefreshReason::Lifecycle);
+}
+
+fn merge_pending_refresh_reason(reason: WindowRefreshReason) {
+    let mut current = WINDOW_REFRESH_PENDING.load(Ordering::Acquire);
+    loop {
+        let merged =
+            WindowRefreshReason::from_raw(current).map_or(reason, |pending| pending.merge(reason));
+        let requested = merged as u8;
+        if current == requested {
+            return;
+        }
+        match WINDOW_REFRESH_PENDING.compare_exchange(
+            current,
+            requested,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn take_pending_refresh_reason() -> Option<WindowRefreshReason> {
+    WindowRefreshReason::from_raw(WINDOW_REFRESH_PENDING.swap(0, Ordering::AcqRel))
+}
+
+fn request_window_refresh_for(reason: WindowRefreshReason) {
     if WINDOW_REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        WINDOW_REFRESH_PENDING.store(true, Ordering::Release);
+        merge_pending_refresh_reason(reason);
         return;
     }
 
@@ -130,7 +194,10 @@ fn request_window_refresh() {
         .spawn(move || {
             let started = std::time::Instant::now();
             let mut mru = mru;
-            let windows = window_collector::collect_windows(&mut mru);
+            let windows = window_collector::collect_windows_with_frontmost_bump(
+                &mut mru,
+                reason.bumps_frontmost(),
+            );
             *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
                 generation,
                 windows,
@@ -154,8 +221,8 @@ fn request_window_refresh() {
             } else {
                 WINDOW_REFRESH_RESULT.lock().unwrap().take();
                 WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-                if WINDOW_REFRESH_PENDING.swap(false, Ordering::AcqRel) {
-                    request_window_refresh();
+                if let Some(pending_reason) = take_pending_refresh_reason() {
+                    request_window_refresh_for(pending_reason);
                 }
             }
         })
@@ -172,8 +239,8 @@ fn apply_window_refresh() {
     };
     if result.generation != WINDOW_REFRESH_GENERATION.load(Ordering::Acquire) {
         WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-        if WINDOW_REFRESH_PENDING.swap(false, Ordering::AcqRel) {
-            request_window_refresh();
+        if let Some(pending_reason) = take_pending_refresh_reason() {
+            request_window_refresh_for(pending_reason);
         }
         return;
     }
@@ -214,7 +281,7 @@ fn apply_window_refresh() {
         (was_visible, changed)
     };
     WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-    let refresh_pending = WINDOW_REFRESH_PENDING.swap(false, Ordering::AcqRel);
+    let pending_reason = take_pending_refresh_reason();
 
     if changed && was_visible {
         reset_thumbnail_visible_range();
@@ -236,8 +303,8 @@ fn apply_window_refresh() {
         })
         .unwrap_or_default();
     window_server::update_subscriptions(&subscription_ids);
-    if refresh_pending {
-        request_window_refresh();
+    if let Some(reason) = pending_reason {
+        request_window_refresh_for(reason);
     }
 }
 
@@ -289,7 +356,7 @@ extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _arg: *mut c
         }
     });
     if should_refresh {
-        request_window_refresh();
+        request_lifecycle_window_refresh();
     }
 }
 
@@ -1379,6 +1446,10 @@ fn setup_status_bar() {
         CFRelease(settings_key as *const c_void);
         let _: () = msg_send![settings_item, setTarget: menu_target];
         let _: () = msg_send![menu, addItem: settings_item];
+        // 设置与下方操作项之间的分隔线,样式与退出项上方一致。
+        // Separate Settings from the action items below, matching the separator above Quit.
+        let settings_separator: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![menu, addItem: settings_separator];
 
         // Shortcut toggle item
         let shortcut_title = make_nsstring(&t("menu.toggle_shortcut.cmd"));
@@ -1872,5 +1943,32 @@ fn main() {
         // Prompt for Accessibility if missing (the event-monitor thread is already retrying in the background).
         prompt_accessibility_if_needed();
         let _: () = msg_send![nsapp, run];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowRefreshReason;
+
+    #[test]
+    fn lifecycle_refresh_does_not_bump_frontmost() {
+        assert!(!WindowRefreshReason::Lifecycle.bumps_frontmost());
+        assert!(WindowRefreshReason::Summon.bumps_frontmost());
+    }
+
+    #[test]
+    fn pending_refresh_keeps_summon_priority() {
+        assert_eq!(
+            WindowRefreshReason::Lifecycle.merge(WindowRefreshReason::Lifecycle),
+            WindowRefreshReason::Lifecycle
+        );
+        assert_eq!(
+            WindowRefreshReason::Lifecycle.merge(WindowRefreshReason::Summon),
+            WindowRefreshReason::Summon
+        );
+        assert_eq!(
+            WindowRefreshReason::Summon.merge(WindowRefreshReason::Lifecycle),
+            WindowRefreshReason::Summon
+        );
     }
 }
