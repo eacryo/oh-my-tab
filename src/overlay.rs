@@ -26,9 +26,10 @@ use crate::theme::*;
 use crate::window_collector::{
     bump_window_mru, extract_icon_to_cache, raise_ax_window, WindowInfo,
 };
+use crate::window_server;
 // 跨模块共享状态(由 main.rs 持有,这里读写)/ cross-module shared state (owned by main.rs)
 use crate::TAB_STATE;
-use crate::{log_debug, log_info};
+use crate::{log_debug, log_info, request_window_refresh};
 
 // ========== 键盘键码 / keyboard key codes ==========
 
@@ -209,12 +210,12 @@ pub(crate) fn thumbnail_visible_range() -> Option<Range<usize>> {
     THUMB_VISIBLE_RANGE.lock().unwrap().clone()
 }
 
-fn reset_thumbnail_visible_range() {
+pub(crate) fn reset_thumbnail_visible_range() {
     *THUMB_VISIBLE_RANGE.lock().unwrap() = None;
     *THUMB_ROW_RANGES.lock().unwrap() = None;
 }
 
-fn reset_thumbnail_scroll() {
+pub(crate) fn reset_thumbnail_scroll() {
     *THUMB_SCROLL_ROW.lock().unwrap() = 0;
     *THUMB_SCROLL_OFFSET.lock().unwrap() = 0.0;
     *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = 0.0;
@@ -406,7 +407,7 @@ pub(crate) fn thumbnail_scroller_max_offset() -> f64 {
     *THUMB_SCROLL_MAX_OFFSET.lock().unwrap()
 }
 
-fn reset_thumbnail_nav_anchor() {
+pub(crate) fn reset_thumbnail_nav_anchor() {
     *THUMB_NAV_ANCHOR_X.lock().unwrap() = None;
 }
 
@@ -715,10 +716,16 @@ fn step_switcher(backward: bool) {
     // TIMING-DEBUG 端到端计时:tap 回调 → collect → show_overlay(定位卡顿段)。
     let t_end = Instant::now();
     let mut state_opt = TAB_STATE.lock().unwrap();
-    let state = state_opt.as_mut().unwrap();
+    let first_show = !state_opt.as_ref().unwrap().visible;
 
-    if !state.visible {
-        state.refresh();
+    if first_show {
+        drop(state_opt);
+        // 先显示启动时的快照，再后台收集最新窗口，避免 AX 查询阻塞快捷键响应。
+        // Show the startup snapshot first, then collect current windows in the background so
+        // AX queries never block shortcut handling.
+        request_window_refresh();
+        state_opt = TAB_STATE.lock().unwrap();
+        let state = state_opt.as_mut().unwrap();
         state.visible = true;
         state.selected = if backward {
             state.windows.len().saturating_sub(1)
@@ -737,6 +744,7 @@ fn step_switcher(backward: bool) {
         // TIMING-DEBUG 端到端:tap 回调 → collect_windows → show_overlay 完成。
         log_debug!("[overlay] summon e2e={}ms", t_end.elapsed().as_millis());
     } else {
+        let state = state_opt.as_mut().unwrap();
         state.selected = horizontal_nav_index(state.selected, state.windows.len(), backward);
         drop(state_opt);
         reset_thumbnail_nav_anchor();
@@ -1867,6 +1875,7 @@ pub(crate) fn activate_pid(pid: i32) {
 /// Activate the app and raise the target window (located by CGWindowID + raised
 /// individually via SLPS, not all-windows).
 pub(crate) fn activate_and_raise(pid: i32, cgwid: u32) {
+    window_server::note_own_focus(pid, cgwid);
     activate_pid(pid);
     raise_ax_window(pid, cgwid);
 }

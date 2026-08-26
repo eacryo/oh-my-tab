@@ -14,6 +14,7 @@ mod settings;
 mod theme;
 mod thumbnail;
 mod window_collector;
+mod window_server;
 
 use config::CONFIG;
 use i18n::t;
@@ -36,7 +37,8 @@ use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use settings::*;
 use std::ffi::{c_void, CString};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread;
 
 use event_monitor::{start as start_event_monitor, GlobalEvent};
@@ -88,15 +90,206 @@ impl AppState {
             mru,
         }
     }
+}
 
-    pub(crate) fn refresh(&mut self) {
-        self.windows = window_collector::collect_windows(&mut self.mru);
-        if !self.windows.is_empty() && self.selected >= self.windows.len() {
-            self.selected = self.windows.len() - 1;
+struct WindowRefreshResult {
+    generation: u64,
+    windows: Vec<WindowInfo>,
+    mru: MruMap,
+}
+
+static WINDOW_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static WINDOW_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+static WINDOW_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
+static WINDOW_REFRESH_RESULT: LazyLock<Mutex<Option<WindowRefreshResult>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// 请求一次有界的后台窗口快照；同一时间只允许一个任务，避免快捷键连按制造线程风暴。
+/// Request one bounded background window snapshot; only one task may run at a time,
+/// preventing rapid shortcut presses from creating a thread storm.
+fn request_window_refresh() {
+    if WINDOW_REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        WINDOW_REFRESH_PENDING.store(true, Ordering::Release);
+        return;
+    }
+
+    let (generation, mru) = {
+        let state_opt = TAB_STATE.lock().unwrap();
+        let Some(state) = state_opt.as_ref() else {
+            WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+            return;
+        };
+        (
+            WINDOW_REFRESH_GENERATION.fetch_add(1, Ordering::AcqRel) + 1,
+            state.mru.clone(),
+        )
+    };
+
+    thread::Builder::new()
+        .name("window-refresh".into())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            let mut mru = mru;
+            let windows = window_collector::collect_windows(&mut mru);
+            *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
+                generation,
+                windows,
+                mru,
+            });
+            log_debug!(
+                "[windows] background refresh ready generation={} elapsed={}ms",
+                generation,
+                started.elapsed().as_millis()
+            );
+
+            let controller = CONTROLLER.lock().unwrap().map(|ptr| ptr.0);
+            if let Some(controller) = controller {
+                unsafe {
+                    let _: () = msg_send![controller,
+                        performSelectorOnMainThread: sel!(handleWindowRefresh:),
+                        withObject: std::ptr::null::<AnyObject>(),
+                        waitUntilDone: false
+                    ];
+                }
+            } else {
+                WINDOW_REFRESH_RESULT.lock().unwrap().take();
+                WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+                if WINDOW_REFRESH_PENDING.swap(false, Ordering::AcqRel) {
+                    request_window_refresh();
+                }
+            }
+        })
+        .expect("spawn window-refresh thread");
+}
+
+/// 在主线程应用快照，并合并后台任务开始后产生的窗口级 MRU 更新。
+/// Apply a snapshot on the main thread and merge window-level MRU updates made after
+/// the background task started.
+fn apply_window_refresh() {
+    let Some(result) = WINDOW_REFRESH_RESULT.lock().unwrap().take() else {
+        WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        return;
+    };
+    if result.generation != WINDOW_REFRESH_GENERATION.load(Ordering::Acquire) {
+        WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        if WINDOW_REFRESH_PENDING.swap(false, Ordering::AcqRel) {
+            request_window_refresh();
         }
-        if self.windows.is_empty() {
-            self.visible = false;
+        return;
+    }
+
+    let (was_visible, changed) = {
+        let mut state_opt = TAB_STATE.lock().unwrap();
+        let Some(state) = state_opt.as_mut() else {
+            WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+            return;
+        };
+        let selected_key = state
+            .windows
+            .get(state.selected)
+            .map(|window| (window.pid, window.window_id));
+        let mut mru = state.mru.clone();
+        for (key, timestamp) in result.mru {
+            if mru.get(&key).is_none_or(|current| *current < timestamp) {
+                mru.insert(key, timestamp);
+            }
         }
+        let mut windows = result.windows;
+        window_collector::sort_windows_by_mru(&mut windows, &mru, std::time::Instant::now());
+        let selected = selected_key
+            .and_then(|key| {
+                windows
+                    .iter()
+                    .position(|window| (window.pid, window.window_id) == key)
+            })
+            .unwrap_or_else(|| state.selected.min(windows.len().saturating_sub(1)));
+        let changed = state.windows != windows;
+        let was_visible = state.visible;
+        state.windows = windows;
+        state.selected = selected;
+        state.mru = mru;
+        if state.windows.is_empty() {
+            state.visible = false;
+        }
+        (was_visible, changed)
+    };
+    WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+    let refresh_pending = WINDOW_REFRESH_PENDING.swap(false, Ordering::AcqRel);
+
+    if changed && was_visible {
+        reset_thumbnail_visible_range();
+        reset_thumbnail_scroll();
+        reset_thumbnail_nav_anchor();
+        show_overlay();
+        refresh_highlight();
+    }
+    let subscription_ids: Vec<u32> = TAB_STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|state| {
+            state
+                .windows
+                .iter()
+                .map(|window| window.window_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    window_server::update_subscriptions(&subscription_ids);
+    if refresh_pending {
+        request_window_refresh();
+    }
+}
+
+extern "C" fn on_window_refresh(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    apply_window_refresh();
+}
+
+extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    let events = window_server::drain_main();
+    if events.is_empty() {
+        return;
+    }
+    let should_refresh = events.iter().any(|event| match event {
+        window_server::WindowServerEvent::Created(window_id) => {
+            log_debug!("[windows] WindowServer created cgwid={}", window_id);
+            true
+        }
+        window_server::WindowServerEvent::Destroyed(window_id) => {
+            log_debug!("[windows] WindowServer destroyed cgwid={}", window_id);
+            true
+        }
+        window_server::WindowServerEvent::Focused(window_id) => {
+            let target = TAB_STATE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|state| {
+                    state
+                        .windows
+                        .iter()
+                        .find(|window| window.window_id == *window_id)
+                })
+                .map(|window| (window.pid, window.window_id));
+            if let Some((pid, window_id)) = target {
+                let frontmost_pid = frontmost_app_info().1;
+                if frontmost_pid == pid {
+                    let activation_token = window_server::activation_token(pid);
+                    if window_server::focus_should_bump(pid, window_id) {
+                        if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
+                            bump_window_mru(&mut state.mru, pid, window_id);
+                        }
+                        if let Some(activated_at) = activation_token {
+                            thumbnail::refresh_after_activation(pid, window_id, activated_at);
+                        }
+                    }
+                }
+            }
+            false
+        }
+    });
+    if should_refresh {
+        request_window_refresh();
     }
 }
 
@@ -156,6 +349,20 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
         // MRU, and async queries use it to reject stale results. Existing windows are never
         // updated together from this app-level timestamp.
         let activated_at = note_app_activated(pid);
+        let window_ids: Vec<u32> = TAB_STATE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|state| {
+                state
+                    .windows
+                    .iter()
+                    .filter(|window| window.pid == pid)
+                    .map(|window| window.window_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        window_server::begin_activation(pid, &window_ids, activated_at);
         // 后台线程解析焦点窗口的 CGWindowID 并 bump 窗口级 MRU。
         // 系统 Cmd+Tab / Dock 点击等外部焦点切换通过此路径反馈到窗口排序中。
         // kAXFocusedWindow 的 AX 查询可能阻塞最高 50ms（目标 App 无响应时），
@@ -164,56 +371,98 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
         // External focus switches (system Cmd+Tab, Dock clicks) feed into window
         // ordering through this path. The kAXFocusedWindow AX query can block up
         // to 50ms (target app unresponsive), so it must run off the main thread.
-        thread::spawn(move || {
-            let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-            // 日志用于诊断 MRU 是否被正确 bump:成功打印 pid+cgwid;失败(AX 查询超时/无聚焦窗口)
-            // 会有限重试；每轮先验证激活 token 与系统前台 PID，防止迟到线程误提升已切走的 App。
-            // Log to diagnose MRU bumping: print pid+cgwid on success; also log on failure
-            // (AX timeout / no focused window) after bounded retries. Each attempt first checks
-            // the activation token and system frontmost PID so a late thread cannot bump an app
-            // the user already left.
-            let retry_delays_ms = [0_u64, 50, 150, 300, 700, 1_000];
-            let mut bumped = false;
-            for (attempt, delay_ms) in retry_delays_ms.into_iter().enumerate() {
-                if delay_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        schedule_activation_focus(pid, activated_at);
+    }
+}
+
+struct ActivationFocusTask {
+    pid: i32,
+    activated_at: std::time::Instant,
+}
+
+static ACTIVATION_FOCUS_TX: OnceLock<flume::Sender<ActivationFocusTask>> = OnceLock::new();
+
+/// 启动固定大小的 AX 焦点查询队列，避免连续 App 激活创建无限短命线程。
+/// Start a fixed-size AX focus queue so repeated app activations cannot create an
+/// unbounded number of short-lived threads.
+fn start_activation_focus_scheduler() {
+    let (tx, rx) = flume::bounded::<ActivationFocusTask>(32);
+    let _ = ACTIVATION_FOCUS_TX.set(tx);
+    for worker in 0..2 {
+        let rx = rx.clone();
+        thread::Builder::new()
+            .name(format!("activation-focus-{worker}"))
+            .spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    resolve_activation_focus(task);
                 }
-                if !app_activation_is_current(pid, activated_at) {
-                    break;
-                }
-                let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-                let front_app: *mut AnyObject = msg_send![workspace, frontmostApplication];
-                if front_app.is_null() {
-                    continue;
-                }
-                let front_pid: i32 = msg_send![front_app, processIdentifier];
-                if front_pid != pid {
-                    break;
-                }
-                if let Some(cgwid) = focused_window_cgwid(pid) {
-                    let mut state_opt = TAB_STATE.lock().unwrap();
-                    if let Some(ref mut state) = *state_opt {
-                        bump_window_mru(&mut state.mru, pid, cgwid);
-                        log_debug!(
-                            "app-activated bump: pid={} cgwid={} attempt={}",
-                            pid,
-                            cgwid,
-                            attempt + 1
-                        );
-                    }
-                    thumbnail::refresh_after_activation(pid, cgwid, activated_at);
+            })
+            .expect("spawn activation-focus worker");
+    }
+}
+
+fn schedule_activation_focus(pid: i32, activated_at: std::time::Instant) {
+    let Some(tx) = ACTIVATION_FOCUS_TX.get() else {
+        return;
+    };
+    if tx
+        .try_send(ActivationFocusTask { pid, activated_at })
+        .is_err()
+    {
+        log_debug!("activation focus queue full or stopped: pid={}", pid);
+    }
+}
+
+fn resolve_activation_focus(task: ActivationFocusTask) {
+    unsafe {
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        // 日志用于诊断 MRU 是否被正确 bump:成功打印 pid+cgwid;失败只进行有限重试。
+        // Log to diagnose MRU bumping: failures are handled with bounded retries only.
+        let retry_delays_ms = [0_u64, 50, 150, 300, 700, 1_000];
+        let mut bumped = false;
+        for (attempt, delay_ms) in retry_delays_ms.into_iter().enumerate() {
+            if delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            if !app_activation_is_current(task.pid, task.activated_at) {
+                break;
+            }
+            let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let front_app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+            if front_app.is_null() {
+                continue;
+            }
+            let front_pid: i32 = msg_send![front_app, processIdentifier];
+            if front_pid != task.pid {
+                break;
+            }
+            if let Some(cgwid) = focused_window_cgwid(task.pid) {
+                if !window_server::ax_focus_backstop_allowed(task.pid) {
                     bumped = true;
                     break;
                 }
+                let mut state_opt = TAB_STATE.lock().unwrap();
+                if let Some(ref mut state) = *state_opt {
+                    bump_window_mru(&mut state.mru, task.pid, cgwid);
+                    log_debug!(
+                        "app-activated bump: pid={} cgwid={} attempt={}",
+                        task.pid,
+                        cgwid,
+                        attempt + 1
+                    );
+                }
+                thumbnail::refresh_after_activation(task.pid, cgwid, task.activated_at);
+                bumped = true;
+                break;
             }
-            if !bumped {
-                log_debug!(
-                    "app-activated bump: pid={} (no focused window / stale activation / AX timeout)",
-                    pid
-                );
-            }
-            let _: () = msg_send![pool, drain];
-        });
+        }
+        if !bumped {
+            log_debug!(
+                "app-activated bump: pid={} (no focused window / stale activation / AX timeout)",
+                task.pid
+            );
+        }
+        let _: () = msg_send![pool, drain];
     }
 }
 
@@ -818,6 +1067,18 @@ fn create_controller() -> *mut AnyObject {
             on_app_terminated as *mut c_void,
             types_v_obj.as_ptr(),
         );
+        class_addMethod(
+            cls,
+            sel!(handleWindowRefresh:),
+            on_window_refresh as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleWindowServerEvent:),
+            on_window_server_event as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
         objc_registerClassPair(cls);
         msg_send![cls, new]
     }
@@ -1393,6 +1654,25 @@ fn main() {
     // 6. Create controller object
     let controller = create_controller();
     *CONTROLLER.lock().unwrap() = Some(ObjPtr(controller));
+
+    // 固定 worker 承接 App 激活后的 AX 聚焦查询，避免通知风暴时创建大量线程。
+    // Start bounded workers for post-activation AX focus queries so notification bursts do not
+    // create large numbers of threads.
+    start_activation_focus_scheduler();
+    window_server::start();
+    let initial_subscription_ids: Vec<u32> = TAB_STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|state| {
+            state
+                .windows
+                .iter()
+                .map(|window| window.window_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    window_server::update_subscriptions(&initial_subscription_ids);
 
     // 6b. Listen for system app activation so MRU stays in sync
     // when the user switches apps via Dock, Cmd+Tab, etc.

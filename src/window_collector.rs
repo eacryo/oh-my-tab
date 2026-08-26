@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::config::CONFIG;
 use crate::{log_debug, log_info};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowInfo {
     pub pid: i32,
     pub window_id: u32, // CGWindowID，用于精确 raise（SLPS）/配对
@@ -81,7 +81,7 @@ pub fn bump_window_mru(mru: &mut MruMap, pid: i32, cgwid: u32) {
 /// Pure window-level MRU sort: ascending by last-activation time (most recent first);
 /// windows without an MRU record fall back to 999s (treated as very old, sorted last).
 /// Pure — `now` is supplied by the caller, so tests can inject a fixed clock.
-fn sort_windows_by_mru(windows: &mut [WindowInfo], mru: &MruMap, now: Instant) {
+pub(crate) fn sort_windows_by_mru(windows: &mut [WindowInfo], mru: &MruMap, now: Instant) {
     let age = |pid: i32, wid: u32| {
         mru.get(&(pid, wid))
             .map(|t| now.saturating_duration_since(*t))
