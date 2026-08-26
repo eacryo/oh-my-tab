@@ -2929,9 +2929,9 @@ pub(crate) fn create_card_view(
             let preview_h = (card_h - THUMB_PAD * 2.0 - THUMB_CAPTION_H - THUMB_GAP).max(40.0);
             let caption_y = card_h - THUMB_PAD - THUMB_CAPTION_H;
 
-            // --- 标题行:迷你图标 20pt(圆角 5,加载失败用首字母块) ---
-            // --- Caption row: 20pt mini icon (radius 5, letter block on failure) ---
-            let mini_sz = 20.0;
+            // --- 标题行:迷你图标 22pt(圆角 5,加载失败用首字母块) ---
+            // --- Caption row: 22pt mini icon (radius 5, letter block on failure) ---
+            let mini_sz = 22.0;
             let mini_frame = NSRect::new(
                 NSPoint::new(THUMB_PAD, caption_y + (THUMB_CAPTION_H - mini_sz) / 2.0),
                 NSSize::new(mini_sz, mini_sz),
