@@ -387,7 +387,7 @@ pub(crate) fn set_thumbnail_scroll_offset(next: f64, max_offset: f64) {
     drop(offset);
     let visible_changed = update_thumbnail_scroll_state(next);
     apply_thumbnail_scroll_offset();
-    if visible_changed {
+    if visible_changed && crate::theme::thumbnails_enabled() {
         let target_px_h = *THUMB_CAPTURE_TARGET_PX_H.lock().unwrap();
         crate::thumbnail::refresh_for_summon(target_px_h);
     }
@@ -756,22 +756,22 @@ pub(crate) extern "C" fn on_cmd_shift_tab_pressed(
     step_switcher(true);
 }
 
-/// 选中项越过当前视口时只移动 clip bounds,不重建卡片树。
-/// Move clip bounds when selection leaves the viewport; never rebuild the card tree.
+/// 选中项越过当前视口时只移动 clip bounds,不重建卡片树;两种布局共用。
+/// Move clip bounds when selection leaves the viewport; both layouts share this path and never
+/// rebuild the card tree.
 fn refresh_after_selection_change(backfill_icons: bool) {
     let selected = TAB_STATE
         .lock()
         .unwrap()
         .as_ref()
         .map(|state| state.selected);
-    let needs_relayout = crate::theme::thumbnails_enabled()
-        && selected.is_some_and(|index| {
-            !THUMB_VISIBLE_RANGE
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|range| range.contains(&index))
-        });
+    let needs_relayout = selected.is_some_and(|index| {
+        !THUMB_VISIBLE_RANGE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|range| range.contains(&index))
+    });
     if needs_relayout {
         if let Some(index) = selected {
             if ensure_thumbnail_selection_visible(index) {
@@ -1072,9 +1072,9 @@ fn edge_row_nav_index(rects: &[(usize, f64, f64, f64)], top: bool, anchor_x: f64
         .map(|(index, ..)| *index)
 }
 
-/// 流式布局的上下导航:完整 document 中按固定水平锚点移动,越过视口时只移动 clip bounds。
-/// Vertical flow navigation uses the complete document and a stable horizontal anchor; crossing
-/// the viewport only moves clip bounds.
+/// 两种布局的上下导航:完整 document 中按固定水平锚点移动,越过视口时只移动 clip bounds。
+/// Vertical navigation for both layouts uses the complete document and a stable horizontal
+/// anchor; crossing the viewport only moves clip bounds.
 unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool) {
     let mut state_opt = TAB_STATE.lock().unwrap();
     let Some(state) = state_opt.as_mut() else {
@@ -1140,11 +1140,7 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
         // 持有(锁序与其他路径相反会造成理论死锁)。
         // Collect nav frames BEFORE taking TAB_STATE: avoids holding CONTAINER and
         // TAB_STATE across each other (inverted lock order vs other paths).
-        let nav_rects = if crate::theme::thumbnails_enabled() {
-            collect_card_rects()
-        } else {
-            Vec::new()
-        };
+        let nav_rects = collect_card_rects();
         let mut state_opt = TAB_STATE.lock().unwrap();
         let state = state_opt.as_mut().unwrap();
 
@@ -1184,36 +1180,15 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 if state.windows.is_empty() {
                     return;
                 }
-                if crate::theme::thumbnails_enabled() {
-                    drop(state_opt);
-                    navigate_thumbnail_vertical(&nav_rects, true);
-                } else {
-                    // 旧版均匀网格:保持原有 ±cards_per_row 行为,不变。
-                    // Legacy uniform grid: the original +/-cards-per-row step, unchanged.
-                    if state.selected >= cards_per_row() {
-                        state.selected -= cards_per_row();
-                        drop(state_opt);
-                        refresh_highlight();
-                        update_status_label();
-                    }
-                }
+                drop(state_opt);
+                navigate_thumbnail_vertical(&nav_rects, true);
             }
             KEY_DOWN => {
                 if state.windows.is_empty() {
                     return;
                 }
-                if crate::theme::thumbnails_enabled() {
-                    drop(state_opt);
-                    navigate_thumbnail_vertical(&nav_rects, false);
-                } else {
-                    let new_idx = state.selected + cards_per_row();
-                    if new_idx < state.windows.len() {
-                        state.selected = new_idx;
-                        drop(state_opt);
-                        refresh_highlight();
-                        update_status_label();
-                    }
-                }
+                drop(state_opt);
+                navigate_thumbnail_vertical(&nav_rects, false);
             }
             KEY_DELETE => {
                 // Backspace:关闭选中卡片对应的窗口,浮窗保持打开。
@@ -1258,13 +1233,10 @@ pub(crate) extern "C" fn container_accepts_first_responder(_self: *mut c_void, _
     true
 }
 
-/// 缩略图模式接收鼠标滚轮和触控板滚动,保留 point 级增量而不是量化为整行。
-/// Handle mouse-wheel and trackpad scrolling in thumbnail mode, preserving point-level deltas
-/// instead of quantizing them to whole rows.
+/// 两种布局都接收鼠标滚轮和触控板滚动,保留 point 级增量而不是量化为整行。
+/// Both layouts handle mouse-wheel and trackpad scrolling, preserving point-level deltas instead
+/// of quantizing them to whole rows.
 pub(crate) extern "C" fn container_scroll_wheel(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    if !crate::theme::thumbnails_enabled() {
-        return;
-    }
     unsafe {
         let delta_y: f64 = msg_send![event as *mut AnyObject, scrollingDeltaY];
         if delta_y.abs() < f64::EPSILON {
@@ -1496,9 +1468,6 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_down(
     event: *mut c_void,
 ) {
     unsafe {
-        if !crate::theme::thumbnails_enabled() {
-            return;
-        }
         let scroller = _self as *mut AnyObject;
         let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
         update_thumbnail_pointer_state(location);
@@ -1578,9 +1547,8 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_up(
     invalidate_thumbnail_scroller();
 }
 
-/// 更新滚动条的轨道、滑块比例和当前位置;无溢出时完全隐藏,避免干扰旧布局。
-/// Update the scroller track, knob proportion, and position; hide it without overflow so the
-/// legacy layout is unaffected.
+/// 更新滚动条的轨道、滑块比例和当前位置;无溢出时完全隐藏。
+/// Update the scroller track, knob proportion, and position; hide it when there is no overflow.
 unsafe fn update_thumbnail_scroller(
     panel_w: f64,
     panel_h: f64,
@@ -3385,7 +3353,6 @@ pub(crate) fn show_overlay() {
         let t0 = Instant::now();
         let state_opt = TAB_STATE.lock().unwrap();
         let state = state_opt.as_ref().unwrap();
-        let count = state.windows.len();
         let windows = state.windows.clone();
         drop(state_opt);
 
@@ -3418,36 +3385,18 @@ pub(crate) fn show_overlay() {
         // per create_card_view call.
         let thumbnail_capture_allowed = use_flow && crate::thumbnail::capture_allowed();
 
-        // (全局 index, x, y, w)——缩略图模式输出完整 document 的稳定坐标,纯图标模式也输出全部窗口。
-        // (global index, x, y, w): thumbnail mode emits stable coordinates for the complete
-        // document; icon mode also emits every window.
-        let mut thumb_scroll_metrics: Option<(bool, usize, usize)> = None;
-        let (h, w, placements, card_h_use, document_h): (
-            f64,
-            f64,
-            Vec<CardPlacementFrame>,
-            f64,
-            f64,
-        ) = if use_flow {
-            // ===== 流式布局(缩略图模式):等高不等宽,单页平衡分行,溢出时优先填满前行 =====
-            // 窗口宽高比决定卡宽;极端比例被 clamp_aspect 钳制;每行能容纳的
-            // 卡片数随行内已占宽度自然变化。窗口总数先决定 1.0–1.5 尺寸，
-            // 换行不反向改变尺寸；放不下时优先填满 MRU 前面的行,再进入固定最大宽度的连续滚动视口。
-            // ===== Flow layout (thumbnail mode): uniform height, per-aspect widths are balanced
-            // when they fit; overflow greedily fills leading MRU rows. Window count determines
-            // the 1.0-1.5 size before wrapping; the panel width stays at the screen budget.
-            let gap = THUMB_ROW_GAP;
+        // 两种模式都使用同一个完整 document + 可滚动 viewport 模型。
+        // Both modes use the same complete-document plus scrollable-viewport model.
+        let max_panel_h = (screen_visible.size.height * 0.85).max(240.0);
+        let scroll_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+        let layout = if use_flow {
+            // 缩略图按窗口比例平衡分行,纯图标则固定卡片尺寸并自动算列数。
+            // Thumbnails balance rows by window aspect; icon-only mode uses fixed cards and auto columns.
             let screen_inner = (screen_frame.size.width - H_PADDING * 2.0).max(160.0);
-            // 缩略图模式按屏幕宽度的 92% 装箱，不再额外套 1240pt 上限；否则四张
-            // 标准卡(1242pt 含间距)永远无法同排，宽屏上会无意义地多出一页。
-            // Thumbnail mode packs against 92% of the screen without another 1240pt
-            // cap; otherwise four standard cards (1242pt including gaps) can never
-            // share a row, creating an unnecessary extra page on wide displays.
             let max_panel_w = (screen_frame.size.width * 0.92).max(160.0 + H_PADDING * 2.0);
             let max_inner = (max_panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W)
                 .min(screen_inner)
                 .max(160.0);
-            let max_panel_h = (screen_visible.size.height * 0.85).max(240.0);
             let aspects: Vec<f64> = windows
                 .iter()
                 .map(|wi| {
@@ -3455,91 +3404,67 @@ pub(crate) fn show_overlay() {
                     if bw > 0.0 && bh > 0.0 {
                         bw / bh
                     } else {
-                        THUMB_PREVIEW_RATIO // bounds 未知按 16:10 / unknown -> 16:10
+                        THUMB_PREVIEW_RATIO
                     }
                 })
                 .collect();
-            let scroll_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
-            let layout = plan_thumb_scroll_layout(
+            plan_thumb_scroll_layout(
                 &aspects,
                 max_inner,
                 max_panel_w,
                 max_panel_h,
-                gap,
+                THUMB_ROW_GAP,
                 THUMB_SCROLLBAR_W,
                 scroll_offset,
-            );
-            *THUMB_VISIBLE_RANGE.lock().unwrap() = Some(layout.visible.clone());
-            *THUMB_ROW_RANGES.lock().unwrap() = Some(layout.row_ranges.clone());
-            *THUMB_MAX_ROWS.lock().unwrap() = layout.max_rows.max(1);
-            *THUMB_SCROLL_ROW.lock().unwrap() = layout.row_start;
-            *THUMB_SCROLL_OFFSET.lock().unwrap() =
-                scroll_offset.clamp(0.0, layout.max_scroll_offset);
-            *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = layout.max_scroll_offset;
-            *THUMB_SCROLL_ROW_PITCH.lock().unwrap() = layout.card_h + gap;
-            thumb_scroll_metrics =
-                Some((layout.overflowed, layout.row_ranges.len(), layout.max_rows));
-            log_debug!(
-                "[overlay] flow scale={:.2} visible={}..{} of {} offset={:.1} row={} rows={} visible_rows={} overflow={}",
-                layout.scale,
-                layout.visible.start,
-                layout.visible.end,
-                windows.len(),
-                scroll_offset,
-                layout.row_start,
-                layout.row_ranges.len(),
-                layout.max_rows,
-                layout.overflowed
-            );
-            let placements = layout
-                .document_placements
-                .into_iter()
-                .map(|p| (p.index, p.x, p.y, p.width))
-                .collect();
-            (
-                layout.panel_h,
-                layout.panel_w,
-                placements,
-                layout.card_h,
-                layout.document_h,
             )
         } else {
-            reset_thumbnail_visible_range();
-            reset_thumbnail_scroll();
-            *THUMB_MAX_ROWS.lock().unwrap() = 1;
-            // ===== 旧版均匀网格(纯图标模式)=====
-            // 窗口宽按「槽位」计算:最少 3 个槽位(count<3 时也保持三卡宽,空窗口态同样)。
-            // 槽位 = min(每行卡数配置, max(3, count))。
-            // ===== Legacy uniform grid (icon-only mode). The window width is based on
-            // ===== "slots": at least 3. slots = min(cards-per-row config, max(3, count)).
-            let h = window_height(count);
-            let slots = cards_per_row().min(count.max(3));
-            let w = window_width(slots);
-            // 卡片不足槽位(1-2 卡)时拉伸填满整行,不留右空白;卡片内部元素按实际卡宽居中
-            // (见 create_card_view 的 card_width 参数)。其余情况用配置卡宽、行内居中。
-            // With fewer cards than slots (1-2), cards stretch to fill the row -- no right-side
-            // blank; inner elements center on the actual card width (see create_card_view's
-            // card_width). Otherwise the configured width applies and the row is centered.
-            let (card_w_eff, pitch, start_x) = if count > 0 && count < slots {
-                let inner = w - H_PADDING * 2.0;
-                let cw = (inner - (count as f64 - 1.0) * card_gap()) / count as f64;
-                (cw, cw + card_gap(), H_PADDING)
-            } else {
-                let row_width =
-                    slots as f64 * card_w() + (slots.saturating_sub(1)) as f64 * card_gap();
-                (card_w(), card_w() + card_gap(), (w - row_width) / 2.0)
-            };
-            let mut placements = Vec::with_capacity(windows.len());
-            for (idx, _) in windows.iter().enumerate() {
-                // Standard coords: y=0 at bottom. Cards stack from top down.
-                let col = idx % cards_per_row();
-                let row = idx / cards_per_row();
-                let x = start_x + col as f64 * pitch;
-                let y = h - 32.0 - (row + 1) as f64 * card_h();
-                placements.push((idx, x, y, card_w_eff));
-            }
-            (h, w, placements, card_h(), (h - STATUS_H).max(1.0))
+            plan_icon_scroll_layout(
+                windows.len(),
+                screen_frame.size.width,
+                max_panel_h,
+                THUMB_SCROLLBAR_W,
+                scroll_offset,
+            )
         };
+        *THUMB_VISIBLE_RANGE.lock().unwrap() = Some(layout.visible.clone());
+        *THUMB_ROW_RANGES.lock().unwrap() = Some(layout.row_ranges.clone());
+        *THUMB_MAX_ROWS.lock().unwrap() = layout.max_rows.max(1);
+        *THUMB_SCROLL_ROW.lock().unwrap() = layout.row_start;
+        *THUMB_SCROLL_OFFSET.lock().unwrap() = scroll_offset.clamp(0.0, layout.max_scroll_offset);
+        *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = layout.max_scroll_offset;
+        *THUMB_SCROLL_ROW_PITCH.lock().unwrap() = layout.card_h
+            + if use_flow {
+                THUMB_ROW_GAP
+            } else {
+                ICON_CARD_GAP
+            };
+        let thumb_scroll_metrics =
+            Some((layout.overflowed, layout.row_ranges.len(), layout.max_rows));
+        log_debug!(
+            "[overlay] layout mode={} visible={}..{} of {} offset={:.1} row={} rows={} visible_rows={} overflow={}",
+            if use_flow { "thumbnail" } else { "icon" },
+            layout.visible.start,
+            layout.visible.end,
+            windows.len(),
+            scroll_offset,
+            layout.row_start,
+            layout.row_ranges.len(),
+            layout.max_rows,
+            layout.overflowed
+        );
+        // 卡片全部放进 document,由 clip bounds 决定视口;不要只创建可见卡片,否则滚动后没有
+        // 后续窗口可供显示。
+        // Keep every card in the document and let clip bounds define the viewport; creating only
+        // visible cards would leave no later windows to reveal while scrolling.
+        let placements: Vec<CardPlacementFrame> = layout
+            .document_placements
+            .iter()
+            .map(|p| (p.index, p.x, p.y, p.width))
+            .collect();
+        let h = layout.panel_h;
+        let w = layout.panel_w;
+        let card_h_use = layout.card_h;
+        let document_h = layout.document_h;
         let card_h_outer = card_h_use;
         // 截图像素需求必须在流式布局确定卡片实际高度后计算：同一块 2x 屏上，少窗口
         // 从 1.0 放大到 1.5 也会从 512px 升到 640px；屏幕热插拔则由本次实时 scale

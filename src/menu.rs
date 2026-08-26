@@ -33,6 +33,13 @@ unsafe impl Send for ShortcutState {}
 unsafe impl Sync for ShortcutState {}
 pub(crate) static SHORTCUT_ITEM: Mutex<Option<ShortcutState>> = Mutex::new(None);
 
+pub(crate) struct ThumbnailState {
+    pub(crate) item: *mut AnyObject,
+}
+unsafe impl Send for ThumbnailState {}
+unsafe impl Sync for ThumbnailState {}
+pub(crate) static THUMBNAIL_ITEM: Mutex<Option<ThumbnailState>> = Mutex::new(None);
+
 // 固定标题的菜单项(settings / reload / clear_cache / quit)。locale 变更时由 refresh_menu_titles 批量重设标题。
 // Fixed-title menu items (settings / reload / clear_cache / quit); re-titled in bulk by refresh_menu_titles on locale change.
 pub(crate) struct FixedMenuItems {
@@ -65,10 +72,28 @@ pub(crate) fn set_shortcut_mode(is_cmd: bool) {
     }
 }
 
+/// 设置缩略图菜单项标题,标题表示点击后将切换到的模式。
+/// Set the thumbnail menu item's title; the title describes the mode activated by the click.
+pub(crate) fn set_thumbnail_mode(thumbnails_enabled: bool) {
+    let key = if thumbnails_enabled {
+        "menu.toggle_thumbnail_mode.to_icons"
+    } else {
+        "menu.toggle_thumbnail_mode.to_thumbnails"
+    };
+    if let Some(ref s) = *THUMBNAIL_ITEM.lock().unwrap() {
+        unsafe {
+            let ns_title = make_nsstring(&t(key));
+            let _: () = msg_send![s.item, setTitle: ns_title];
+            CFRelease(ns_title as *const c_void);
+        }
+    }
+}
+
 /// 用当前 locale 与状态重设全部菜单项标题。用于 locale 变更(reload)与启动时修正初始标签。
 /// Re-title all menu items from the current locale and state. Used on locale change (reload)
 /// and at startup to fix the initial labels.
 pub(crate) fn refresh_menu_titles() {
+    set_thumbnail_mode(CONFIG.read().unwrap().layout.thumbnails_enabled);
     unsafe {
         // shortcut item
         let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
@@ -135,6 +160,41 @@ pub(crate) extern "C" fn handle_toggle_shortcut(
     }
     set_shortcut_mode(is_cmd);
     log_info!("Shortcut: {}", if is_cmd { "Cmd+Tab" } else { "Opt+Tab" });
+}
+
+pub(crate) extern "C" fn handle_toggle_thumbnail(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    let thumbnails_enabled = !crate::theme::thumbnails_enabled();
+    {
+        let mut cfg = CONFIG.write().unwrap();
+        cfg.layout.thumbnails_enabled = thumbnails_enabled;
+        if let Err(err) = cfg.save() {
+            log_info!("Failed to save thumbnail mode: {}", err);
+            return;
+        }
+    }
+    set_thumbnail_mode(thumbnails_enabled);
+    // 模式改变后丢弃当前卡片布局,下次召唤按新模式重建;缩略图服务按配置自动休眠/启动。
+    // Drop the current card layout so the next summon rebuilds in the new mode; the thumbnail
+    // service sleeps or starts according to the updated config.
+    crate::overlay::reset_switcher();
+    crate::overlay::apply_theme();
+    crate::overlay::refresh_highlight();
+    crate::overlay::update_status_label();
+    if thumbnails_enabled {
+        crate::thumbnail::start();
+    }
+    log_info!(
+        "Window thumbnails: {}",
+        if thumbnails_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 }
 
 pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {

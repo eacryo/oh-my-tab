@@ -395,7 +395,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
         let screen_frame: NSRect = msg_send![screen, frame];
         let h = window_height(6); // initial reasonable default
-        let w = window_width(cards_per_row()); // max possible width
+        let w = window_width(3); // initial three-card baseline; summon recalculates the live width
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
         let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
@@ -930,6 +930,12 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handleToggleThumbnail:),
+                handle_toggle_thumbnail as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleReloadConfig:),
                 handle_reload_config as *mut c_void,
                 types.as_ptr(),
@@ -1113,6 +1119,25 @@ fn setup_status_bar() {
         let _: () = msg_send![menu, addItem: shortcut_item];
         *SHORTCUT_ITEM.lock().unwrap() = Some(ShortcutState {
             item: shortcut_item,
+        });
+
+        // 缩略图/纯图标模式切换项,紧跟快捷键模式切换项。
+        // Thumbnail/icon-only mode toggle, placed immediately below the shortcut toggle.
+        let thumbnail_title_key = if CONFIG.read().unwrap().layout.thumbnails_enabled {
+            "menu.toggle_thumbnail_mode.to_icons"
+        } else {
+            "menu.toggle_thumbnail_mode.to_thumbnails"
+        };
+        let thumbnail_title = make_nsstring(&t(thumbnail_title_key));
+        let thumbnail_key = make_nsstring("");
+        let thumbnail_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let thumbnail_item: *mut AnyObject = msg_send![thumbnail_item, initWithTitle: thumbnail_title, action: sel!(handleToggleThumbnail:), keyEquivalent: thumbnail_key];
+        CFRelease(thumbnail_title as *const c_void);
+        CFRelease(thumbnail_key as *const c_void);
+        let _: () = msg_send![thumbnail_item, setTarget: menu_target];
+        let _: () = msg_send![menu, addItem: thumbnail_item];
+        *THUMBNAIL_ITEM.lock().unwrap() = Some(ThumbnailState {
+            item: thumbnail_item,
         });
 
         // 设置... item (opens the settings window)

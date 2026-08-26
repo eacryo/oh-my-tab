@@ -972,6 +972,9 @@ fn activation_capture_is_valid_now(pid: i32, activated_at: Instant) -> bool {
 /// Whether the overlay is visible AND the window currently has a rendered card
 /// (the worker half of the delivery-freshness double check).
 fn overlay_wants(pid: i32, wid: u32) -> bool {
+    if !crate::theme::thumbnails_enabled() {
+        return false;
+    }
     let visible = crate::overlay::thumbnail_visible_range();
     let state_opt = crate::TAB_STATE.lock().unwrap();
     match state_opt.as_ref() {
@@ -992,6 +995,11 @@ fn overlay_wants(pid: i32, wid: u32) -> bool {
 /// The user may have arrowed away or closed the overlay mid-generation, so every
 /// key is re-verified.
 pub(crate) fn handle_ready_main() {
+    if !crate::theme::thumbnails_enabled() {
+        READY_QUEUE.lock().unwrap().clear();
+        READY_DELIVERY_SCHEDULED.store(false, Ordering::Release);
+        return;
+    }
     // scheduled=false 与 drain 必须在同一队列锁内完成：否则 worker 可能在两步之间
     // 看到旧的 true、放入新 key 却不再安排回调。
     // Clear scheduled and drain under the same queue lock. Otherwise a worker can

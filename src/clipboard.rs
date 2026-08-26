@@ -10091,9 +10091,8 @@ unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
 #[cfg(test)]
 mod tests {
     use super::{
-        detail_result_still_wanted, effective_hover_row, scroll_indicator_geometry, ClipEntry,
-        ImageEntry, NO_SELECTION, NSPASTEBOARD_TYPE_PNG, SCROLL_INDICATOR_CORNER_RESERVE,
-        SCROLL_INDICATOR_EDGE,
+        effective_hover_row, scroll_indicator_geometry, ClipEntry, ImageEntry, NO_SELECTION,
+        NSPASTEBOARD_TYPE_PNG, SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE,
     };
 
     #[test]

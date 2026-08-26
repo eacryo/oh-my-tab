@@ -61,7 +61,6 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
     <td style="border: none; padding: 4px;"><img src="docs/pictures/settings.png" style="width: 100%;" alt="Settings"></td>
     <td style="border: none; padding: 4px;"><img src="docs/pictures/mouse.png" style="width: 100%;" alt="Mouse control"></td>
     <td style="border: none; padding: 4px;"><img src="docs/pictures/clipboard.png" style="width: 100%;" alt="Clipboard history"></td>
-    <td style="border: none; padding: 4px;"><img src="docs/pictures/experimental.png" style="width: 100%;" alt="Experimental settings"></td>
   </tr>
 </table>
 
@@ -247,12 +246,7 @@ glass_tint = "eeeeee66"  # RRGGBBAA
 corner_radius = 32.0
 
 [layout]
-cards_per_row = 6
-card_width = 140.0
-card_height = 180.0
-card_gap = 0.0
-icon_size = 110.0
-thumbnails_enabled = true  # window thumbnails on cards (auto-sleeps without Screen Recording permission; card size/gap in thumbnail mode are code constants, independent of these fields)
+thumbnails_enabled = true  # window thumbnails on cards; icon-only card dimensions and columns are automatic
 
 [colors]
 # Each palette has: status_bar_text, app_name, win_title, icon_inner_bg,

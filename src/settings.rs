@@ -144,13 +144,11 @@ struct SettingsUi {
     window: *mut AnyObject,
     sidebar_general: *mut AnyObject, // NSButton: 通用 / General (tag=0)
     sidebar_switcher: *mut AnyObject, // NSButton: 应用切换浮窗 / App switcher overlay (tag=1)
-    sidebar_experimental: *mut AnyObject, // NSButton: 实验性功能 / Experimental (tag=2)
-    sidebar_mouse: *mut AnyObject,   // NSButton: 鼠标控制 / Mouse (tag=3)
-    sidebar_clipboard: *mut AnyObject, // NSButton: 剪贴板历史 / Clipboard history (tag=4)
+    sidebar_mouse: *mut AnyObject,   // NSButton: 鼠标控制 / Mouse (tag=2)
+    sidebar_clipboard: *mut AnyObject, // NSButton: 剪贴板历史 / Clipboard history (tag=3)
     sidebar_highlight: *mut AnyObject, // NSView: 选中行高亮背景 (layer-backed)
     general_view: *mut AnyObject,    // NSView: 通用页容器 / General page container
     switcher_view: *mut AnyObject,   // NSView: 应用切换浮窗页容器 / App switcher page container
-    experimental_view: *mut AnyObject, // NSView: 实验性页容器 / Experimental page container
     mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
     clipboard_view: *mut AnyObject,  // NSView: 剪贴板历史页容器 / Clipboard page container
     glass_style: *mut AnyObject,     // NSPopUpButton: regular / clear
@@ -158,16 +156,11 @@ struct SettingsUi {
     glass_preview_switcher: *mut AnyObject, // NSGlassEffectView: app switcher preview
     glass_preview_clipboard: *mut AnyObject, // NSGlassEffectView: clipboard preview
     corner_radius: *mut AnyObject,   // NSTextField
-    cards_per_row: *mut AnyObject,
-    card_width: *mut AnyObject,
-    card_height: *mut AnyObject,
-    card_gap: *mut AnyObject,
-    icon_size: *mut AnyObject,
-    modifier: *mut AnyObject,           // NSPopUpButton: option / command
-    locale: *mut AnyObject,             // NSPopUpButton: auto / en / zh-Hans / zh-Hant
-    show_minimized: *mut AnyObject,     // NSSwitch: 显示最小化窗口 / show minimized windows
+    modifier: *mut AnyObject,        // NSPopUpButton: option / command
+    locale: *mut AnyObject,          // NSPopUpButton: auto / en / zh-Hans / zh-Hant
+    show_minimized: *mut AnyObject,  // NSSwitch: 显示最小化窗口 / show minimized windows
     thumbnails_enabled: *mut AnyObject, // NSSwitch: 显示窗口缩略图 / show window thumbnails
-    windows_enabled: *mut AnyObject,    // NSSwitch: 窗口切换总开关 / app-switcher master switch
+    windows_enabled: *mut AnyObject, // NSSwitch: 窗口切换总开关 / app-switcher master switch
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
     log_level: *mut AnyObject,        // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject,  // NSSwitch: 开机自启 / launch at login
@@ -1162,28 +1155,6 @@ fn log_config_changes(old: &Config, new: &Config) {
         "appearance.corner_radius",
         old.appearance.corner_radius,
         new.appearance.corner_radius
-    );
-
-    changed!(
-        "layout.cards_per_row",
-        old.layout.cards_per_row,
-        new.layout.cards_per_row
-    );
-    changed!(
-        "layout.card_width",
-        old.layout.card_width,
-        new.layout.card_width
-    );
-    changed!(
-        "layout.card_height",
-        old.layout.card_height,
-        new.layout.card_height
-    );
-    changed!("layout.card_gap", old.layout.card_gap, new.layout.card_gap);
-    changed!(
-        "layout.icon_size",
-        old.layout.icon_size,
-        new.layout.icon_size
     );
 
     changed!(
@@ -2685,12 +2656,12 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
     select_sidebar(tag as usize);
 }
 
-/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换五个内容视图显隐、选中项粗体。
-/// Switch the active settings page: align the highlight to the selected button, toggle the five
+/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换四个内容视图显隐、选中项粗体。
+/// Switch the active settings page: align the highlight to the selected button, toggle the four
 /// content views' visibility, and bold the selected item's label.
 fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
-    let idx = if idx > 4 { 0 } else { idx };
+    let idx = if idx > 3 { 0 } else { idx };
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         let ui = match ui.as_ref() {
@@ -2700,14 +2671,12 @@ fn select_sidebar(idx: usize) {
         let buttons = [
             ui.sidebar_general,
             ui.sidebar_switcher,
-            ui.sidebar_experimental,
             ui.sidebar_mouse,
             ui.sidebar_clipboard,
         ];
         let views = [
             ui.general_view,
             ui.switcher_view,
-            ui.experimental_view,
             ui.mouse_view,
             ui.clipboard_view,
         ];
@@ -2719,14 +2688,13 @@ fn select_sidebar(idx: usize) {
         let titles = [
             t("settings.sidebar_general"),
             t("settings.sidebar_switcher"),
-            t("settings.sidebar_experimental"),
             t("settings.sidebar_mouse"),
             t("settings.sidebar_clipboard"),
         ];
         for (i, &b) in buttons.iter().enumerate() {
             set_sidebar_title(b, &titles[i], i == idx);
         }
-        // 切换三页显隐 / toggle the three pages' visibility
+        // 切换四页显隐 / toggle the four pages' visibility
         for (i, &v) in views.iter().enumerate() {
             let _: () = msg_send![v, setHidden: i != idx];
         }
@@ -2794,9 +2762,8 @@ fn show_settings() {
             }
         }
         load_settings_values();
-        // 每次打开都复位到通用页(窗口复用、隐藏不销毁,上次可能停在实验性页)。
-        // Reset to the General page on every open (the window is reused / hidden, not destroyed,
-        // so the previous selection may have been Experimental).
+        // 每次打开都复位到通用页(窗口复用、隐藏不销毁)。
+        // Reset to the General page on every open (the window is reused / hidden, not destroyed).
         select_sidebar(0);
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
@@ -2966,11 +2933,6 @@ fn load_settings_from(cfg: &Config) {
         let _: () = msg_send![panel, setColor: tint];
         GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
         set_field(ui.corner_radius, cfg.appearance.corner_radius);
-        set_field(ui.cards_per_row, cfg.layout.cards_per_row);
-        set_field(ui.card_width, cfg.layout.card_width);
-        set_field(ui.card_height, cfg.layout.card_height);
-        set_field(ui.card_gap, cfg.layout.card_gap);
-        set_field(ui.icon_size, cfg.layout.icon_size);
         let mod_idx: isize = if is_cmd { 1 } else { 0 };
         let _: () = msg_send![ui.modifier, selectItemAtIndex: mod_idx];
         // locale:按 CONFIG.i18n.locale 选中对应项,未匹配回退第 0 项(auto)。
@@ -3164,32 +3126,6 @@ fn collect_settings_config() -> (Config, Vec<String>) {
                 "errors.not_a_number",
                 &[("field", "appearance.corner_radius")],
             )),
-        }
-        match parse_usize(&nsstring_to_rust(msg_send![ui.cards_per_row, stringValue])) {
-            Ok(v) => cfg.layout.cards_per_row = v,
-            Err(_) => errs.push(tf(
-                "errors.not_an_integer",
-                &[("field", "layout.cards_per_row")],
-            )),
-        }
-        match parse_f64(&nsstring_to_rust(msg_send![ui.card_width, stringValue])) {
-            Ok(v) => cfg.layout.card_width = v,
-            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "layout.card_width")])),
-        }
-        match parse_f64(&nsstring_to_rust(msg_send![ui.card_height, stringValue])) {
-            Ok(v) => cfg.layout.card_height = v,
-            Err(_) => errs.push(tf(
-                "errors.not_a_number",
-                &[("field", "layout.card_height")],
-            )),
-        }
-        match parse_f64(&nsstring_to_rust(msg_send![ui.card_gap, stringValue])) {
-            Ok(v) => cfg.layout.card_gap = v,
-            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "layout.card_gap")])),
-        }
-        match parse_f64(&nsstring_to_rust(msg_send![ui.icon_size, stringValue])) {
-            Ok(v) => cfg.layout.icon_size = v,
-            Err(_) => errs.push(tf("errors.not_a_number", &[("field", "layout.icon_size")])),
         }
         let mod_idx: isize = msg_send![ui.modifier, indexOfSelectedItem];
         cfg.keyboard.modifier = if mod_idx == 1 {
@@ -3476,7 +3412,7 @@ fn create_settings_window() {
         // (卡片 195 + 10 间隙 + 内容 429 + 右缘 12)。
         // 内容拆成「通用 / 实验性」两页后,通用页(6 段 10 行)最高,高 768 -> 600 不够;
         // 通用页顶部预留 Accessibility 权限警告条,再加 60 -> 660;多出的窗口显示位置行再 +30 -> 690。
-        // Content is now paged (General / Experimental); the General page (6 sections, 10 rows)
+        // Content is split into separate page containers; the General page (6 sections, 10 rows)
         // is the tallest, so 600 doesn't fit; +60 -> 660 reserves the Accessibility permission
         // warning banner at the top, and the overlay-position row adds +30 -> 690.
         // 初始位置:主显示器(screens[0])居中。不要用 NSScreen mainScreen(其语义是跟随
@@ -3589,13 +3525,11 @@ fn create_settings_window() {
             window,
             sidebar_general: std::ptr::null_mut(),
             sidebar_switcher: std::ptr::null_mut(),
-            sidebar_experimental: std::ptr::null_mut(),
             sidebar_mouse: std::ptr::null_mut(),
             sidebar_clipboard: std::ptr::null_mut(),
             sidebar_highlight: std::ptr::null_mut(),
             general_view: std::ptr::null_mut(),
             switcher_view: std::ptr::null_mut(),
-            experimental_view: std::ptr::null_mut(),
             mouse_view: std::ptr::null_mut(),
             clipboard_view: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
@@ -3603,11 +3537,6 @@ fn create_settings_window() {
             glass_preview_switcher: std::ptr::null_mut(),
             glass_preview_clipboard: std::ptr::null_mut(),
             corner_radius: std::ptr::null_mut(),
-            cards_per_row: std::ptr::null_mut(),
-            card_width: std::ptr::null_mut(),
-            card_height: std::ptr::null_mut(),
-            card_gap: std::ptr::null_mut(),
-            icon_size: std::ptr::null_mut(),
             thumbnails_enabled: std::ptr::null_mut(),
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
@@ -3733,8 +3662,8 @@ fn create_settings_window() {
         release_obj(highlight);
         ui.sidebar_highlight = highlight;
 
-        // 五个侧边栏按钮(borderless,tag 0..4,点击触发 handleSettingsSidebar:)。
-        // Five sidebar buttons (borderless, tags 0..4; click triggers handleSettingsSidebar:).
+        // 四个侧边栏按钮(borderless,tag 0..3,点击触发 handleSettingsSidebar:)。
+        // Four sidebar buttons (borderless, tags 0..3; click triggers handleSettingsSidebar:).
         ui.sidebar_general = make_sidebar_button(
             sidebar_view,
             target,
@@ -3753,31 +3682,22 @@ fn create_settings_window() {
             btn_y0 - 34.0,
             btn_w,
         );
-        ui.sidebar_experimental = make_sidebar_button(
-            sidebar_view,
-            target,
-            &t("settings.sidebar_experimental"),
-            2,
-            12.0,
-            btn_y0 - 68.0,
-            btn_w,
-        );
         ui.sidebar_mouse = make_sidebar_button(
             sidebar_view,
             target,
             &t("settings.sidebar_mouse"),
-            3,
+            2,
             12.0,
-            btn_y0 - 102.0,
+            btn_y0 - 68.0,
             btn_w,
         );
         ui.sidebar_clipboard = make_sidebar_button(
             sidebar_view,
             target,
             &t("settings.sidebar_clipboard"),
-            4,
+            3,
             12.0,
-            btn_y0 - 136.0,
+            btn_y0 - 102.0,
             btn_w,
         );
 
@@ -3798,15 +3718,6 @@ fn create_settings_window() {
         let _: () = msg_send![content, addSubview: switcher_view];
         release_obj(switcher_view);
         ui.switcher_view = switcher_view;
-
-        // --- 实验性页容器 experimental page container(初始隐藏 / initially hidden)---
-        let experimental_view: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let experimental_view: *mut AnyObject = msg_send![experimental_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
-        let _: () = msg_send![experimental_view, setHidden: true];
-        let _: () = msg_send![experimental_view, setAutoresizingMask: 18u64]; // 同 general_view:宽高拉伸
-        let _: () = msg_send![content, addSubview: experimental_view];
-        release_obj(experimental_view);
-        ui.experimental_view = experimental_view;
 
         // --- 鼠标页容器 mouse page container(初始隐藏 / initially hidden)---
         let mouse_view: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -4142,92 +4053,6 @@ fn create_settings_window() {
             row_h,
             &t("settings.row_modifier"),
             make_popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0),
-        );
-
-        // ===== 实验性页内容 experimental page content =====
-        let mut y = layout_h - 12.0;
-
-        // 顶部说明文字(次级标签色、小字号、自动换行)。
-        // Top note (secondary label color, small font, word-wrapping).
-        y -= 30.0;
-        let note: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let note: *mut AnyObject = msg_send![note, initWithFrame: NSRect::new(NSPoint::new(12.0, y), NSSize::new(content_w - 24.0, 30.0))];
-        // 自适应:贴顶、宽度拉伸 / adaptive: top-anchored, width sizable
-        let _: () = msg_send![note, setAutoresizingMask: 10u64];
-        let note_ns = make_nsstring(&t("settings.experimental_note"));
-        let _: () = msg_send![note, setStringValue: note_ns];
-        CFRelease(note_ns as *const c_void);
-        let _: () = msg_send![note, setBezeled: false];
-        let _: () = msg_send![note, setDrawsBackground: false];
-        let _: () = msg_send![note, setEditable: false];
-        let _: () = msg_send![note, setSelectable: true];
-        let _: () = msg_send![note, setUsesSingleLineMode: false];
-        let _: () = msg_send![note, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
-        let sec_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
-        let _: () = msg_send![note, setTextColor: sec_color];
-        let note_font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 11.0f64];
-        let _: () = msg_send![note, setFont: note_font];
-        let _: () = msg_send![experimental_view, addSubview: note];
-        release_obj(note);
-
-        // --- 布局 Layout ---
-        y -= 14.0 + 24.0;
-        add_header(
-            experimental_view,
-            &t("settings.header_layout"),
-            12.0,
-            y,
-            content_w - 24.0,
-        );
-        y -= 8.0 + row_h;
-        ui.cards_per_row = add_row(
-            experimental_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_cards_per_row"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "6"),
-        );
-        y -= row_pitch;
-        ui.card_width = add_row(
-            experimental_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_card_width"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "140"),
-        );
-        y -= row_pitch;
-        ui.card_height = add_row(
-            experimental_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_card_height"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "180"),
-        );
-        y -= row_pitch;
-        ui.card_gap = add_row(
-            experimental_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_card_gap"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "0"),
-        );
-        y -= row_pitch;
-        ui.icon_size = add_row(
-            experimental_view,
-            label_x,
-            y,
-            label_w,
-            row_h,
-            &t("settings.row_icon_size"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "110"),
         );
 
         // ===== 鼠标页内容 mouse page content =====

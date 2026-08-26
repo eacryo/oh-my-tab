@@ -17,6 +17,12 @@ use crate::ffi::{make_nsstring, CFRelease};
 pub(crate) const STATUS_H: f64 = 36.0;
 /// 窗口内水平内边距 / horizontal padding inside the window
 pub(crate) const H_PADDING: f64 = 32.0;
+/// 纯图标模式的固定卡片尺寸;布局只自动计算每行列数,不缩放卡片。
+/// Fixed icon-only card dimensions; layout computes columns but never scales the cards.
+pub(crate) const ICON_CARD_W: f64 = 140.0;
+pub(crate) const ICON_CARD_H: f64 = 180.0;
+pub(crate) const ICON_CARD_GAP: f64 = 0.0;
+pub(crate) const ICON_SIZE: f64 = 110.0;
 
 // ========== 配色 / colors ==========
 
@@ -94,22 +100,19 @@ pub(crate) fn current_colors() -> Colors {
     colors_from_config(is_dark)
 }
 
-// ========== 布局访问器(运行时从 CONFIG 读取)/ layout accessors (read from CONFIG at runtime) ==========
+// ========== 固定布局访问器 / fixed layout accessors ==========
 
-pub(crate) fn cards_per_row() -> usize {
-    CONFIG.read().unwrap().layout.cards_per_row
-}
 pub(crate) fn card_w() -> f64 {
-    CONFIG.read().unwrap().layout.card_width
+    ICON_CARD_W
 }
 pub(crate) fn card_h() -> f64 {
-    CONFIG.read().unwrap().layout.card_height
+    ICON_CARD_H
 }
 pub(crate) fn card_gap() -> f64 {
-    CONFIG.read().unwrap().layout.card_gap
+    ICON_CARD_GAP
 }
 pub(crate) fn icon_px() -> f64 {
-    CONFIG.read().unwrap().layout.icon_size
+    ICON_SIZE
 }
 pub(crate) fn letter_px() -> f64 {
     icon_px() * 0.5
@@ -715,24 +718,162 @@ pub(crate) fn plan_thumb_scroll_layout(
     )
 }
 
-/// 浮窗高度 = 顶部 32 + 行数 * 卡片高 + 状态栏高(纯函数,可测)。
-/// 仅旧版(纯图标)网格使用;缩略图流式布局在 show_overlay 内自行计算。
-/// Overlay height = top 32 + rows * card height + status bar (pure, testable).
-/// Legacy icon-grid only; the thumbnail flow layout computes its own in show_overlay.
+/// 规划固定卡片的纯图标视口:卡片尺寸固定,列数由屏幕宽度自动计算,溢出后连续滚动。
+/// Plan the fixed-card icon-only viewport: card size stays fixed, columns come from screen width,
+/// and overflow becomes continuously scrollable.
+pub(crate) fn plan_icon_scroll_layout(
+    count: usize,
+    screen_width: f64,
+    max_panel_h: f64,
+    scrollbar_w: f64,
+    scroll_offset: f64,
+) -> ThumbFlowLayout {
+    let gap = ICON_CARD_GAP;
+    let max_panel_w =
+        (screen_width.max(1.0) * 0.92).max(ICON_CARD_W + H_PADDING * 2.0 + scrollbar_w);
+    let max_inner = (max_panel_w - H_PADDING * 2.0 - scrollbar_w).max(ICON_CARD_W);
+    let max_columns = ((max_inner + gap) / (ICON_CARD_W + gap)).floor().max(1.0) as usize;
+    // 少量窗口仍保留旧版三卡宽基线,但卡片本身始终保持固定尺寸。
+    // Keep the legacy three-slot baseline for small sets, while card dimensions remain fixed.
+    let columns = count.max(3).min(max_columns);
+    let row_ranges: Vec<Range<usize>> = if count == 0 {
+        Vec::new()
+    } else {
+        (0..count)
+            .step_by(columns)
+            .map(|start| start..(start + columns).min(count))
+            .collect()
+    };
+    let row_count = row_ranges.len();
+    let visual_row_count = row_count.max(1);
+    let max_rows = ((max_panel_h - THUMB_TOP_INSET - STATUS_H).max(ICON_CARD_H)
+        / (ICON_CARD_H + gap))
+        .floor()
+        .max(1.0) as usize;
+    let overflowed = row_count > max_rows;
+    let viewport_rows = if overflowed {
+        max_rows
+    } else {
+        visual_row_count
+    };
+    let panel_columns = if overflowed { max_columns } else { columns };
+    let grid_w = panel_columns as f64 * ICON_CARD_W + panel_columns.saturating_sub(1) as f64 * gap;
+    let panel_w = if overflowed {
+        max_panel_w
+    } else {
+        grid_w + H_PADDING * 2.0
+    };
+    let card_area_w = if overflowed {
+        (panel_w - scrollbar_w).max(ICON_CARD_W + H_PADDING * 2.0)
+    } else {
+        panel_w
+    };
+    let row_pitch = ICON_CARD_H + gap;
+    let total_content_h = THUMB_TOP_INSET
+        + visual_row_count as f64 * ICON_CARD_H
+        + visual_row_count.saturating_sub(1) as f64 * gap;
+    let viewport_content_h = THUMB_TOP_INSET
+        + viewport_rows as f64 * ICON_CARD_H
+        + viewport_rows.saturating_sub(1) as f64 * gap;
+    let max_scroll_offset = (total_content_h - viewport_content_h).max(0.0);
+    let scroll_offset = scroll_offset.clamp(0.0, max_scroll_offset);
+    let max_row_start = row_count.saturating_sub(viewport_rows);
+    let row_start = if row_count == 0 {
+        0
+    } else {
+        (scroll_offset / row_pitch).floor() as usize
+    }
+    .min(max_row_start);
+    let intra_row_offset = (scroll_offset - row_start as f64 * row_pitch).max(0.0);
+    let has_partial_row =
+        row_count > 0 && intra_row_offset > f64::EPSILON && row_start + viewport_rows < row_count;
+    let rendered_row_count = viewport_rows + usize::from(has_partial_row);
+    let row_end = (row_start + rendered_row_count).min(row_count);
+    let visible = match (
+        row_ranges.get(row_start),
+        row_ranges.get(row_end.saturating_sub(1)),
+    ) {
+        (Some(first), Some(last)) => first.start..last.end,
+        _ => 0..0,
+    };
+    let panel_h = THUMB_TOP_INSET
+        + viewport_rows as f64 * ICON_CARD_H
+        + viewport_rows.saturating_sub(1) as f64 * gap
+        + STATUS_H;
+    let document_h = total_content_h;
+    let document_panel_h = document_h + STATUS_H;
+    let mut document_placements = Vec::with_capacity(count);
+    for (row_index, row) in row_ranges.iter().enumerate() {
+        let row_w = row.len() as f64 * ICON_CARD_W + row.len().saturating_sub(1) as f64 * gap;
+        let row_x = (card_area_w - row_w) / 2.0;
+        let y = document_panel_h
+            - THUMB_TOP_INSET
+            - (row_index as f64 + 1.0) * ICON_CARD_H
+            - row_index as f64 * gap;
+        for (column, index) in row.clone().enumerate() {
+            document_placements.push(ThumbPlacement {
+                index,
+                x: row_x + column as f64 * (ICON_CARD_W + gap),
+                y,
+                width: ICON_CARD_W,
+            });
+        }
+    }
+    let mut placements = Vec::new();
+    for (local_row, row) in row_ranges[row_start..row_end].iter().enumerate() {
+        let row_w = row.len() as f64 * ICON_CARD_W + row.len().saturating_sub(1) as f64 * gap;
+        let row_x = (card_area_w - row_w) / 2.0;
+        let y = panel_h
+            - THUMB_TOP_INSET
+            - (local_row as f64 + 1.0) * ICON_CARD_H
+            - local_row as f64 * gap
+            + intra_row_offset;
+        for (column, index) in row.clone().enumerate() {
+            placements.push(ThumbPlacement {
+                index,
+                x: row_x + column as f64 * (ICON_CARD_W + gap),
+                y,
+                width: ICON_CARD_W,
+            });
+        }
+    }
+    ThumbFlowLayout {
+        panel_w,
+        panel_h,
+        card_h: ICON_CARD_H,
+        document_placements,
+        document_h,
+        scale: 1.0,
+        visible,
+        placements,
+        overflowed,
+        page_index: 0,
+        page_count: 1,
+        row_ranges,
+        row_start,
+        max_rows: viewport_rows,
+        max_scroll_offset,
+    }
+}
+
+/// 纯图标初始浮窗高度 = 顶部 32 + 行数 * 卡片高 + 状态栏高(纯函数,可测)。
+/// 仅用于创建浮窗时的初始占位尺寸;实际召唤时由滚动布局重新计算。
+/// Initial icon-only overlay height = top 32 + rows * card height + status bar (pure, testable).
+/// Used only for the initial window placeholder; summon-time layout recalculates it.
 fn compute_window_height(count: usize, cards_per_row: usize, card_h: f64) -> f64 {
     let rows = count.max(1).div_ceil(cards_per_row);
     32.0 + rows as f64 * card_h + STATUS_H
 }
 
-/// 浮窗高度 = 顶部 32 + 行数 * 卡片高 + 状态栏高。
-/// Overlay height = top 32 + rows * card height + status bar height.
+/// 纯图标初始浮窗高度;实际布局会按屏幕宽度动态计算列数。
+/// Initial icon-only overlay height; the live layout computes columns from screen width.
 pub(crate) fn window_height(count: usize) -> f64 {
-    compute_window_height(count, cards_per_row(), card_h())
+    compute_window_height(count, 6, card_h())
 }
 
-/// 浮窗宽度 = 卡片数 * 卡片宽 + 间距 + 两侧内边距(纯函数,可测)。
+/// 浮窗宽度 = 卡片数 * 固定卡片宽 + 间距 + 两侧内边距(纯函数,可测)。
 /// 下限为单卡宽度:任何情况下都不允许出现细条状窗口。
-/// Overlay width = cards * card width + gaps + padding on both sides (pure, testable).
+/// Overlay width = cards * fixed card width + gaps + padding on both sides (pure, testable).
 /// Floor is one card's width: the overlay must never degenerate into a thin strip.
 fn compute_window_width(cards_in_row: usize, card_w: f64, card_gap: f64) -> f64 {
     let n = cards_in_row.max(1);
@@ -1175,5 +1316,49 @@ mod flow_tests {
             .map(|placement| placement.y)
             .unwrap();
         assert!((boundary_y - before_y - 1.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod icon_scroll_tests {
+    use super::*;
+
+    #[test]
+    fn icon_cards_keep_fixed_size_and_three_card_baseline() {
+        let layout = plan_icon_scroll_layout(2, 1440.0, 900.0, 14.0, 0.0);
+
+        assert_eq!(layout.panel_w, 3.0 * ICON_CARD_W + H_PADDING * 2.0);
+        assert_eq!(layout.card_h, ICON_CARD_H);
+        assert_eq!(layout.document_placements.len(), 2);
+        assert!(layout
+            .document_placements
+            .iter()
+            .all(|placement| placement.width == ICON_CARD_W));
+        assert_eq!(layout.max_scroll_offset, 0.0);
+    }
+
+    #[test]
+    fn icon_layout_auto_columns_and_scrolls_by_rows() {
+        let layout = plan_icon_scroll_layout(15, 1200.0, 500.0, 14.0, 0.0);
+
+        assert_eq!(layout.row_ranges, vec![0..7, 7..14, 14..15]);
+        assert_eq!(layout.max_rows, 2);
+        assert!(layout.overflowed);
+        assert_eq!(layout.visible, 0..14);
+        assert!(layout.max_scroll_offset > 0.0);
+        assert_eq!(layout.document_placements.len(), 15);
+
+        let bottom = plan_icon_scroll_layout(15, 1200.0, 500.0, 14.0, layout.max_scroll_offset);
+        assert_eq!(bottom.row_start, 1);
+        assert_eq!(bottom.visible, 7..15);
+        assert_eq!(bottom.placements.len(), 8);
+    }
+
+    #[test]
+    fn icon_layout_preserves_card_width_when_screen_is_narrow() {
+        let layout = plan_icon_scroll_layout(1, 200.0, 500.0, 14.0, 0.0);
+
+        assert_eq!(layout.document_placements[0].width, ICON_CARD_W);
+        assert!(layout.panel_w >= ICON_CARD_W + H_PADDING * 2.0);
     }
 }

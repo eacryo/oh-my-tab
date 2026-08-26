@@ -34,11 +34,6 @@ pub struct Appearance {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Layout {
-    pub cards_per_row: usize,
-    pub card_width: f64,
-    pub card_height: f64,
-    pub card_gap: f64,
-    pub icon_size: f64,
     // 窗口缩略图总开关:关闭后浮窗保持纯图标渲染,缩略图服务不启动。默认开;
     // 无屏幕录制权限时自动休眠(见 thumbnail 模块)。
     // Window-thumbnail master switch: off = the overlay keeps icon-only rendering
@@ -413,11 +408,6 @@ impl Default for Appearance {
 impl Default for Layout {
     fn default() -> Self {
         Layout {
-            cards_per_row: 6,
-            card_width: 140.0,
-            card_height: 180.0,
-            card_gap: 0.0,
-            icon_size: 110.0,
             thumbnails_enabled: true,
         }
     }
@@ -566,38 +556,6 @@ impl Config {
             errs.push(tf(
                 "errors.appearance_corner_radius_invalid",
                 &[("value", &self.appearance.corner_radius.to_string())],
-            ));
-        }
-
-        // --- layout ---
-        if self.layout.cards_per_row < 1 || self.layout.cards_per_row > 10 {
-            errs.push(tf(
-                "errors.layout_cards_per_row_invalid",
-                &[("value", &self.layout.cards_per_row.to_string())],
-            ));
-        }
-        if self.layout.card_width < 80.0 {
-            errs.push(tf(
-                "errors.layout_card_width_invalid",
-                &[("value", &self.layout.card_width.to_string())],
-            ));
-        }
-        if self.layout.card_height < 100.0 {
-            errs.push(tf(
-                "errors.layout_card_height_invalid",
-                &[("value", &self.layout.card_height.to_string())],
-            ));
-        }
-        if self.layout.card_gap < 0.0 {
-            errs.push(tf(
-                "errors.layout_card_gap_invalid",
-                &[("value", &self.layout.card_gap.to_string())],
-            ));
-        }
-        if self.layout.icon_size < 32.0 {
-            errs.push(tf(
-                "errors.layout_icon_size_invalid",
-                &[("value", &self.layout.icon_size.to_string())],
             ));
         }
 
@@ -825,25 +783,10 @@ impl Config {
         if !has_error("layout.") {
             self.layout = other.layout;
         } else {
-            if !errs.iter().any(|e| e.starts_with("layout.cards_per_row")) {
-                self.layout.cards_per_row = other.layout.cards_per_row;
-            }
-            if !errs.iter().any(|e| e.starts_with("layout.card_width")) {
-                self.layout.card_width = other.layout.card_width;
-            }
-            if !errs.iter().any(|e| e.starts_with("layout.card_height")) {
-                self.layout.card_height = other.layout.card_height;
-            }
-            if !errs.iter().any(|e| e.starts_with("layout.card_gap")) {
-                self.layout.card_gap = other.layout.card_gap;
-            }
             // 布尔字段恒有效,无条件采纳加载值(与其他布尔开关同约定)。
             // Booleans are always valid; adopt the loaded value unconditionally
             // (same convention as the other boolean switches).
             self.layout.thumbnails_enabled = other.layout.thumbnails_enabled;
-            if !errs.iter().any(|e| e.starts_with("layout.icon_size")) {
-                self.layout.icon_size = other.layout.icon_size;
-            }
         }
 
         // colors
@@ -1356,14 +1299,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_catches_layout_ranges() {
-        let mut cfg = Config::default();
-        cfg.layout.cards_per_row = 0;
-        cfg.layout.card_width = 10.0;
-        cfg.layout.card_height = 50.0;
-        cfg.layout.card_gap = -1.0;
-        cfg.layout.icon_size = 10.0;
-        assert_err_count(&cfg, 5);
+    fn retired_icon_layout_fields_are_ignored() {
+        // 旧实验性布局字段不再属于配置模型,加载时忽略且不产生校验错误。
+        // Retired experimental layout fields are ignored when loading and do not cause errors.
+        let cfg: Config = toml::from_str(
+            "[layout]\ncards_per_row = 10\ncard_width = 300.0\ncard_height = 400.0\ncard_gap = 8.0\nicon_size = 200.0\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().is_empty());
+        assert!(cfg.layout.thumbnails_enabled);
     }
 
     #[test]
@@ -1396,7 +1340,6 @@ mod tests {
         // merged defaults into defaults, making the assertions vacuous).
         let mut other = Config::default();
         other.appearance.theme = "dark".into();
-        other.layout.cards_per_row = 3;
         other.keyboard.modifier = "option".into();
         other.i18n.locale = "zh-Hant".into();
         other.mouse.enabled = true;
@@ -1408,7 +1351,6 @@ mod tests {
         let mut merged = Config::default();
         merged.merge_valid(other, &[]);
         assert_eq!(merged.appearance.theme, "dark");
-        assert_eq!(merged.layout.cards_per_row, 3);
         assert_eq!(merged.keyboard.modifier, "option");
         assert_eq!(merged.i18n.locale, "zh-Hant");
         assert!(merged.mouse.enabled);
@@ -1496,25 +1438,6 @@ mod tests {
         assert_eq!(
             merged.appearance.corner_radius,
             Config::default().appearance.corner_radius
-        );
-    }
-
-    #[test]
-    fn merge_valid_field_level_merges_inside_erroring_section() {
-        // 同一 section 内合法/非法字段混合:只重置非法者。
-        // Mixed valid/invalid fields within one section: only the invalid one is reset.
-        let mut cfg = Config::default();
-        cfg.layout.cards_per_row = 3; // 合法 / valid
-        cfg.layout.card_width = 1.0; // 非法 / invalid
-        let errs = cfg.validate();
-        assert_eq!(errs.len(), 1);
-
-        let mut merged = Config::default();
-        merged.merge_valid(cfg, &errs);
-        assert_eq!(merged.layout.cards_per_row, 3);
-        assert_eq!(
-            merged.layout.card_width,
-            Config::default().layout.card_width
         );
     }
 
@@ -1635,9 +1558,6 @@ mod tests {
         // migrate_legacy overwrite bug (see docs/test-review.md); this is the regression guard.
         cfg.appearance.theme = "dark".into();
         cfg.appearance.glass_tint = "11223344".into();
-        cfg.layout.cards_per_row = 3;
-        cfg.layout.card_width = 200.0;
-        cfg.layout.card_height = 240.0;
         cfg.keyboard.modifier = "option".into();
         cfg.i18n.locale = "zh-Hans".into();
         cfg.windows.overlay_position = "main".into();
@@ -1671,7 +1591,6 @@ mod tests {
         // Non-mouse fields survive the roundtrip.
         assert_eq!(loaded.appearance.theme, "dark");
         assert_eq!(loaded.appearance.glass_tint, "11223344");
-        assert_eq!(loaded.layout.cards_per_row, 3);
         assert_eq!(loaded.keyboard.modifier, "option");
         assert_eq!(loaded.i18n.locale, "zh-Hans");
         assert_eq!(loaded.windows.overlay_position, "main");
@@ -1768,17 +1687,14 @@ reverse_scroll = false
 [appearance]
 theme = "dark"
 glass_tint = "zzzzzzzz"
-[layout]
-cards_per_row = 5
 "#,
         )
         .unwrap();
         let (cfg, errs) = Config::load_or_default_from(&path);
         assert!(!errs.is_empty());
-        // 合法字段(theme/cards_per_row)保留,非法字段(glass_tint)回落默认。
-        // Valid fields survive; the invalid one falls back to the default.
+        // 合法字段(theme)保留,非法字段(glass_tint)回落默认;旧布局字段被忽略。
+        // Valid fields survive; the invalid color falls back to default; retired layout fields are ignored.
         assert_eq!(cfg.appearance.theme, "dark");
-        assert_eq!(cfg.layout.cards_per_row, 5);
         assert_eq!(
             cfg.appearance.glass_tint,
             Config::default().appearance.glass_tint

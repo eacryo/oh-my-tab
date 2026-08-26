@@ -61,7 +61,6 @@
     <td style="border: none; padding: 4px;"><img src="docs/pictures/settings.png" style="width: 100%;" alt="设置"></td>
     <td style="border: none; padding: 4px;"><img src="docs/pictures/mouse.png" style="width: 100%;" alt="鼠标控制"></td>
     <td style="border: none; padding: 4px;"><img src="docs/pictures/clipboard.png" style="width: 100%;" alt="剪贴板历史"></td>
-    <td style="border: none; padding: 4px;"><img src="docs/pictures/experimental.png" style="width: 100%;" alt="实验性功能"></td>
   </tr>
 </table>
 
@@ -247,12 +246,7 @@ glass_tint = "eeeeee66"  # RRGGBBAA
 corner_radius = 32.0
 
 [layout]
-cards_per_row = 6
-card_width = 140.0
-card_height = 180.0
-card_gap = 0.0
-icon_size = 110.0
-thumbnails_enabled = true  # 卡片窗口缩略图(无屏幕录制权限自动休眠;缩略图模式的卡片尺寸/间距为代码内常量,与本组字段无关)
+thumbnails_enabled = true  # 卡片窗口缩略图;纯图标模式的卡片尺寸与每行数量自动计算
 
 [colors]
 # 每套配色包含:status_bar_text, app_name, win_title, icon_inner_bg,

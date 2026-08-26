@@ -1233,9 +1233,9 @@ mod tests {
         apply_visible_space_markers, char_columns, expand_tabs, format_code_for_display,
         format_code_for_soft_wrap, prepare_code_for_soft_wrap, CODE_ADVANCE_PT, TAB_STOP_COLUMNS,
     };
-    use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
+    use crate::ffi::{make_nsstring, CFRelease};
     use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send, sel};
+    use objc2::{class, msg_send};
     use objc2_foundation::NSRange;
     use std::ffi::c_void;
     use std::sync::Arc;
