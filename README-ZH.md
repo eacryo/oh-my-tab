@@ -242,7 +242,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`,�
 [appearance]
 theme = "light"          # "dark" | "light" | "auto"
 glass_style = "clear"    # "regular" | "clear"
-glass_tint = "eeeeee66"  # RRGGBBAA
+glass_tint = "eeeeee66"  # RRGGBBAA — 默认玻璃浮窗 tint 颜色
 corner_radius = 32.0
 
 [layout]

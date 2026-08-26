@@ -242,7 +242,7 @@ Shared state lives in global `static`s guarded by `Mutex` / `RwLock`: `TAB_STATE
 [appearance]
 theme = "light"          # "dark" | "light" | "auto"
 glass_style = "clear"    # "regular" | "clear"
-glass_tint = "eeeeee66"  # RRGGBBAA
+glass_tint = "eeeeee66"  # RRGGBBAA — default Liquid Glass overlay tint
 corner_radius = 32.0
 
 [layout]

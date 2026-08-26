@@ -399,6 +399,8 @@ impl Default for Appearance {
         Appearance {
             theme: "light".into(),
             glass_style: "regular".into(),
+            // 默认玻璃浮窗 tint 颜色(RRGGBBAA);设置页可用取色器选择其他颜色。
+            // Default Liquid Glass overlay tint (RRGGBBAA); the settings page lets users pick another color.
             glass_tint: "eeeeee66".into(),
             corner_radius: 32.0,
         }
