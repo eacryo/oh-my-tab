@@ -1,11 +1,11 @@
 //! 切换器浮窗与卡片 UI:浮窗/容器/状态栏的 static、卡片↔索引映射、键盘/鼠标回调,
 //! 以及浮窗的显示/隐藏/刷新/卡片构建/主题应用等渲染逻辑。activate_and_raise 负责
-//! 激活 App 并抬起目标窗口。KEY_* 为键盘导航键码。
+//! 抬起目标窗口。KEY_* 为键盘导航键码。
 //!
 //! Switcher overlay & card UI: statics for the overlay/container/status bar, the card<->index
 //! map, keyboard/mouse callbacks, and the overlay's show/hide/refresh/card-build/theme-apply
-//! rendering. activate_and_raise activates the app and raises the target window. KEY_* are
-//! keyboard-navigation key codes.
+//! rendering. activate_and_raise raises the target window. KEY_* are keyboard-navigation key
+//! codes.
 
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
@@ -16,7 +16,7 @@ use std::ffi::CString;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
-use std::time::{Duration, Instant}; // TIMING-DEBUG
+use std::time::Instant; // TIMING-DEBUG
 
 use crate::config::{self, CONFIG};
 use crate::event_tap;
@@ -1143,10 +1143,15 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         // active app's windows when summoning from elsewhere; visible through the glass when
         // summoning from settings). It stays put after the switch. Matches BetterCmdTab --
         // no stash/restore machinery.
-        // 抬升链延迟一拍执行,让上面的 vanish 先提交上屏(见 schedule_deferred_raise)。
-        // Defer the raise chain by one runloop turn so the vanish above commits to the screen
-        // first (see schedule_deferred_raise).
-        schedule_deferred_raise(pid, cgwid);
+        // 快速抬升只包含毫秒级的 WindowServer 调用,在当前释放回调中立即执行,避免原生
+        // Cmd+Tab 不需要的额外 RunLoop turn;耗时不稳定的 AX 兜底仍由 activate_and_raise
+        // 异步提交。vanish 已经把面板设为透明且 resignKey,不会再阻塞目标窗口拿焦点。
+        // The fast raise only contains millisecond-scale WindowServer calls, so run it in this
+        // release callback instead of paying for an extra RunLoop turn that native Cmd+Tab does
+        // not need; activate_and_raise still submits the variable-latency AX backstop async.
+        // vanish has already made the panel transparent and resigned key, so it cannot block the
+        // target from taking focus.
+        activate_and_raise(pid, cgwid);
         schedule_delayed_order_out();
         state.focus_key = Some((pid, cgwid));
         bump_window_mru(&mut state.mru, pid, cgwid);
@@ -2166,96 +2171,28 @@ pub(crate) extern "C" fn on_deferred_scroll_hover(
 
 // ========== 窗口激活 / window activation ==========
 
-pub(crate) fn activate_pid(pid: i32) -> bool {
-    unsafe {
-        let app: *mut AnyObject =
-            msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
-        if !app.is_null() {
-            // 激活该 App 但不抬起它所有窗口(不用 AllWindows)--只由 raise_ax_window 里的
-            // SLPS 抬起目标那一个窗口,避免"同 App 多窗口全被拉到前面"。activate 仍触发
-            // 激活通知、更新 LAST_ACTIVATED,MRU 不受影响。
-            // Activate the app without raising all its windows (no AllWindows) -- only
-            // raise_ax_window's SLPS call raises the single target window, avoiding "all
-            // same-app windows jump forward". activate still fires the activation notification
-            // and updates LAST_ACTIVATED, so MRU ordering is unaffected.
-            let activated: bool = msg_send![app, activateWithOptions: 0usize];
-            if !activated {
-                log_info!(
-                    "activate_pid: activateWithOptions returned false for pid {}",
-                    pid
-                );
-            }
-            activated
-        } else {
-            log_info!("activate_pid: no running app for pid {}", pid);
-            false
-        }
-    }
-}
-
-/// 激活/抬窗的同步重试间隔。正常路径只执行第一个 0ms 尝试；只有 WindowServer
-/// 尚未能按 PID 解析目标进程时才会短暂重试，覆盖应用切换通知与进程表更新之间的竞态。
-///
-/// Retry delays for the synchronous activate/raise path. The normal path performs only the
-/// first 0ms attempt; retries happen only when WindowServer cannot resolve the target process
-/// by PID, covering the race between app activation notifications and process-table updates.
-const RAISE_RETRY_DELAYS: [u64; 3] = [0, 8, 20];
-
-/// 激活 App 并把指定窗口抬到最前(用 CGWindowID 精确定位 + SLPS 只抬一个窗口)。
-/// Activate the app and raise the target window (located by CGWindowID + raised
-/// individually via SLPS, not all-windows).
+/// 立即完成可见的快速抬窗,再把 AX 焦点兜底交给后台序列。
+/// Complete the visible fast raise immediately, then enqueue the AX focus backstop.
 pub(crate) fn activate_and_raise(pid: i32, cgwid: u32) {
     window_server::note_own_focus(pid, cgwid);
-    let raise_started = Instant::now();
-    let mut activate_ok = false;
-    let mut slps_ok = false;
-    let mut click_ok = false;
-    let mut attempts = 0;
-    let mut activate_ms = 0;
-    let mut fast_ms = 0;
-    for delay_ms in RAISE_RETRY_DELAYS {
-        if delay_ms > 0 {
-            std::thread::sleep(Duration::from_millis(delay_ms));
-        }
-        attempts += 1;
-        let activate_started = Instant::now();
-        activate_ok = activate_pid(pid);
-        activate_ms = activate_started.elapsed().as_millis();
-        // 快速路径:SLPS 抬窗 + 合成点击(毫秒级,同步执行);AX 阶段交后台 raiser。
-        // Fast path: SLPS raise + synthetic click (millisecond-scale, synchronous); the AX
-        // phase goes to the background raiser.
-        let fast_started = Instant::now();
-        (slps_ok, click_ok) = raise_window_fast(pid, cgwid);
-        fast_ms = fast_started.elapsed().as_millis();
-        if slps_ok && click_ok {
-            break;
-        }
-        if attempts < RAISE_RETRY_DELAYS.len() {
-            log_debug!(
-                "[raise] fast retry: pid={} cgwid={} attempt={} activate={}ms slps={} click={} next_delay={}ms",
-                pid,
-                cgwid,
-                attempts,
-                activate_ms,
-                slps_ok,
-                click_ok,
-                RAISE_RETRY_DELAYS[attempts]
-            );
-        }
-    }
+
+    // SLPS + 合成 key-window 事件只需几毫秒,放在 Command 松开所在的主线程上可以让目标
+    // 窗口立即弹起;耗时不稳定的 AX 查询/写入仍留在后台,避免卡住 UI。
+    // SLPS + the synthetic key-window event normally take only a few milliseconds. Running
+    // them here makes the target window appear immediately; the variable-latency AX query and
+    // mutations remain off the main thread so they cannot block the UI.
+    let fast_started = Instant::now();
+    let (slps_ok, click_ok) = raise_window_fast(pid, cgwid);
     log_debug!(
-        "[raise] fast: pid={} cgwid={} activate={}ms slps_click={}ms activate_ok={} slps={} click={} attempts={} total={}ms",
+        "[raise] precise fast: pid={} cgwid={} slps={} click={} elapsed={}ms",
         pid,
         cgwid,
-        activate_ms,
-        fast_ms,
-        activate_ok,
         slps_ok,
         click_ok,
-        attempts,
-        raise_started.elapsed().as_millis()
+        fast_started.elapsed().as_millis()
     );
-    raise_window_ax_async(pid, cgwid, slps_ok && click_ok);
+
+    raise_window_ax_async(pid, cgwid);
 }
 
 // ========== 浮窗渲染 / overlay rendering ==========

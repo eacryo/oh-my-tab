@@ -46,9 +46,9 @@ use std::thread;
 use event_monitor::{start as start_event_monitor, GlobalEvent};
 use window_collector::{
     app_activation_is_current, bump_window_mru, cache_running_app_icons,
-    cache_running_app_icons_small, ensure_icon_cache_dir, extract_icon_to_cache,
-    focused_window_cgwid, migrate_legacy_cache, note_app_activated, note_app_terminated,
-    remove_pid_mru, MruMap, WindowInfo,
+    cache_running_app_icons_small, clear_ax_window_cache_for_pid, ensure_icon_cache_dir,
+    extract_icon_to_cache, focused_window_cgwid, migrate_legacy_cache, note_app_activated,
+    note_app_terminated, remove_pid_mru, MruMap, WindowInfo,
 };
 
 // FFI 声明与 ObjC 桥接基础工具已移至 `ffi.rs` / FFI declarations and ObjC bridging primitives moved to `ffi.rs`
@@ -939,6 +939,7 @@ extern "C" fn on_app_terminated(_self: *mut c_void, _cmd: Sel, notification: *mu
         // Termination clears the activation token and this PID's window MRUs immediately,
         // invalidating in-flight retries and preventing PID/CGWindowID reuse contamination.
         note_app_terminated(pid);
+        clear_ax_window_cache_for_pid(pid);
         if let Some(ref mut state) = *TAB_STATE.lock().unwrap() {
             let removed = remove_pid_mru(&mut state.mru, pid);
             if state

@@ -2,6 +2,7 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::CONFIG;
@@ -324,6 +325,21 @@ const K_C_G_WINDOW_LIST_OPTION_ALL: u32 = 0;
 type AXUIElementRef = *const c_void;
 type AXError = i32;
 const K_AX_SUCCESS: AXError = 0;
+const K_AX_INVALID_UI_ELEMENT: AXError = -25205;
+
+/// 长期保存一个 AX 窗口元素时必须自己持有 CF 引用;裸指针不能直接跨线程放进静态缓存。
+/// A cached AX window element needs its own CF retain; wrap the raw pointer before sharing it
+/// across the background collector and the serialized raiser thread.
+#[derive(Clone, Copy)]
+struct CachedAxElement(AXUIElementRef);
+unsafe impl Send for CachedAxElement {}
+unsafe impl Sync for CachedAxElement {}
+
+/// `(pid, cgwid) -> AXUIElement` 缓存。普通切换直接复用元素,只有 stale element 才重新枚举。
+/// `(pid, cgwid) -> AXUIElement` cache. Normal raises reuse the element; only stale elements
+/// trigger a fresh AXWindows enumeration.
+static AX_WINDOW_CACHE: LazyLock<Mutex<HashMap<(i32, u32), CachedAxElement>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -348,6 +364,7 @@ extern "C" {
         buffer_size: isize,
         encoding: u32,
     ) -> bool;
+    fn CFRetain(cf: *const c_void);
     fn CFRelease(cf: *const c_void);
     static kCFBooleanFalse: *const c_void;
 }
@@ -539,23 +556,23 @@ unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
     set_front(&mut psn, wid, 0x200) == 0 // kCPSUserGenerated; CGError success == 0
 }
 
-/// 用 SkyLight 私有 API SLPSPostEventRecordTo 向目标窗口投递一对合成鼠标按下/抬起事件，
+/// 用 SkyLight 私有 API SLPSPostEventRecordTo 向目标窗口投递一次合成鼠标按下事件，
 /// 使该窗口成为其 App 的 key window（红绿灯变彩色）。macOS 14+ 把 NSRunningApplication
 /// activate 降级为「建议性请求」，跨 App 转移 key 焦点只剩这条可靠路径；0x200 的
 /// userGenerated 前台切换只解决「抬到前面」，key 状态必须靠这个合成点击确立。
-/// 点击点取窗口外缘 (-1,-1)：按下仍会使窗口变 key，但命中不到任何内容（不会误点控件，
-/// 也避开 #5381 类全屏 UI 误触）。事件按 CGWindowID 定向投递，与坐标无关。
+/// 点击点放到窗口右下方很远处，避免命中任何内容或 resize 区域。事件按 CGWindowID 定向投递，
+/// 与坐标无关。
 /// 字节布局来自 AltTab 对 CGSInternal/CGSEvent.h 的反向工程；缓冲必须 ≥0x100 并清零，
 /// 否则 macOS 14.7.4+ 的 CGSEncodeEventRecord 会越界读取导致 SIGABRT（paneru#123）。
 ///
-/// Make the window `wid` the key window of its app by posting a synthetic left-click
-/// (down then up) to the WindowServer via the SkyLight private API SLPSPostEventRecordTo.
+/// Make the window `wid` the key window of its app by posting a synthetic left-mouse-down
+/// to the WindowServer via the SkyLight private API SLPSPostEventRecordTo.
 /// macOS 14+ downgraded NSRunningApplication.activate to an advisory "request"; posting
 /// this click is the only reliable way left to move key focus across apps. The 0x200
 /// userGenerated front-switch only fronts the window -- the key state needs this click.
-/// The click is aimed just outside the window at (-1,-1): the press still makes the window
-/// key, but it hit-tests to no view (nothing is clicked; avoids fullscreen-UI edge hits).
-/// The event is delivered to the window by CGWindowID, not by the click point. The byte
+/// The click is aimed far beyond the window's bottom-right corner, so it hit-tests to no view
+/// or resize edge (nothing is clicked). The event is delivered to the window by CGWindowID,
+/// not by the click point.
 /// layout is AltTab's reverse-engineering of CGSInternal/CGSEvent.h; the buffer must be
 /// at least 0x100 bytes and zeroed, or CGSEncodeEventRecord reads past it on macOS 14.7.4+
 /// and SIGABRTs (paneru issue 123).
@@ -583,29 +600,84 @@ unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
     bytes[0x3a] = 0x10; // 未公开标志(yabai/Hammerspoon 同款)/ undocumented flag (as yabai/Hammerspoon)
                         // 目标 CGWindowID @ 0x3c(4 字节,小端)/ target CGWindowID @ 0x3c (4 bytes, LE)
     bytes[0x3c..0x40].copy_from_slice(&wid.to_le_bytes());
-    // 窗口相对点击点 @ 0x20(16 字节 = CGPoint 两个 f64)/ window-relative click point @ 0x20
-    bytes[0x20..0x28].copy_from_slice(&(-1.0f64).to_le_bytes());
-    bytes[0x28..0x30].copy_from_slice(&(-1.0f64).to_le_bytes());
-    // 0x08 = CGSEventType:先按下一(0x01)再抬起(0x02),一对合成点击使窗口变 key。
-    // 0x08 = CGSEventType: post a left-mouse-down (0x01) then -up (0x02); the pair makes
-    // the window key.
+    // 窗口相对点击点 @ 0x20(16 字节 = CGPoint 两个 f64),远离内容和 resize 区域。
+    bytes[0x20..0x28].copy_from_slice(&(300_000.0f64).to_le_bytes());
+    bytes[0x28..0x30].copy_from_slice(&(300_000.0f64).to_le_bytes());
+    // 0x08 = CGSEventType:一次左键按下即可让目标窗口变 key。
+    // 0x08 = CGSEventType: one left-mouse-down makes the target window key.
     bytes[0x08] = 0x01;
-    let ok1 = post(&mut psn, bytes.as_mut_ptr()) == 0;
-    bytes[0x08] = 0x02;
-    let ok2 = post(&mut psn, bytes.as_mut_ptr()) == 0;
-    if !ok1 || !ok2 {
+    let ok = post(&mut psn, bytes.as_mut_ptr()) == 0;
+    if !ok {
         log_info!(
-            "make_key_window: SLPSPostEventRecordTo failed (down={} up={})",
-            ok1,
-            ok2
+            "make_key_window: SLPSPostEventRecordTo failed (down={})",
+            ok
         );
     }
-    ok1 && ok2
+    ok
 }
 
 fn cf_string_new(s: &str) -> *const c_void {
     let c_str = std::ffi::CString::new(s).unwrap();
     unsafe { CFStringCreateWithCString(std::ptr::null(), c_str.as_ptr(), 0x08000100) }
+}
+
+unsafe fn cache_ax_window_element(pid: i32, cgwid: u32, element: AXUIElementRef) {
+    if cgwid == 0 || element.is_null() {
+        return;
+    }
+    CFRetain(element);
+    let old = AX_WINDOW_CACHE
+        .lock()
+        .unwrap()
+        .insert((pid, cgwid), CachedAxElement(element));
+    if let Some(old) = old {
+        CFRelease(old.0);
+    }
+}
+
+unsafe fn cached_ax_window_element(pid: i32, cgwid: u32) -> Option<AXUIElementRef> {
+    let cached = AX_WINDOW_CACHE
+        .lock()
+        .unwrap()
+        .get(&(pid, cgwid))
+        .copied()?;
+    // The caller owns this temporary retain and must CFRelease it after the AX operations.
+    CFRetain(cached.0);
+    Some(cached.0)
+}
+
+unsafe fn invalidate_cached_ax_window_element(pid: i32, cgwid: u32, element: AXUIElementRef) {
+    let removed = {
+        let mut cache = AX_WINDOW_CACHE.lock().unwrap();
+        if cache
+            .get(&(pid, cgwid))
+            .is_some_and(|cached| cached.0 == element)
+        {
+            cache.remove(&(pid, cgwid))
+        } else {
+            None
+        }
+    };
+    if let Some(removed) = removed {
+        CFRelease(removed.0);
+    }
+}
+
+pub(crate) fn clear_ax_window_cache_for_pid(pid: i32) {
+    let keys: Vec<_> = AX_WINDOW_CACHE
+        .lock()
+        .unwrap()
+        .keys()
+        .filter(|(cached_pid, _)| *cached_pid == pid)
+        .copied()
+        .collect();
+    let removed: Vec<_> = keys
+        .into_iter()
+        .filter_map(|key| AX_WINDOW_CACHE.lock().unwrap().remove(&key))
+        .collect();
+    for element in removed {
+        unsafe { CFRelease(element.0) };
+    }
 }
 
 fn cf_dict_get_string(dict: *const c_void, key: &str) -> Option<String> {
@@ -1103,14 +1175,12 @@ pub(crate) fn close_ax_window(pid: i32, cgwid: u32) -> bool {
     }
 }
 
-/// 抬升快速路径:WindowServer 层抬窗(SLPS)+ 合成点击确立 key window。
-/// 两者都是毫秒级调用,可安全在主线程同步执行;视觉上窗口在此步就已到最前。
-/// AX 阶段(焦点兜底/还原最小化)另见 raise_window_ax_async。返回 (slps 成功, 点击成功)。
+/// 抬升前半段:WindowServer 层抬窗(SLPS)+ 合成点击确立 key window。
+/// The caller runs this at commit time before enqueueing the background AX backstop.
 ///
-/// Fast path of the raise: WindowServer-level raise (SLPS) plus the synthetic click that
-/// establishes the key window. Both are millisecond-scale calls, safe to run synchronously on
-/// the main thread -- visually the window is already frontmost after this step. The AX phase
-/// (focus backstop / minimize restore) lives in raise_window_ax_async. Returns (slps ok, click ok).
+/// First half of the raise: WindowServer-level raise (SLPS) plus the synthetic click that
+/// establishes the key window. It runs on the main thread at commit time so the visible raise
+/// is not delayed by AX.
 pub(crate) fn raise_window_fast(pid: i32, cgwid: u32) -> (bool, bool) {
     if cgwid == 0 {
         return (false, false);
@@ -1149,7 +1219,6 @@ fn raise_intent_current(generation: u64) -> bool {
 struct RaiseJob {
     pid: i32,
     cgwid: u32,
-    fast_path_ok: bool,
     generation: u64,
     enqueued_at: Instant,
 }
@@ -1172,19 +1241,13 @@ static RAISE_TX: std::sync::LazyLock<flume::Sender<RaiseJob>> = std::sync::LazyL
     tx
 });
 
-/// 提交后台 AX 抬升任务(必要时枚举 + un-minimize + setFocused + AXRaise)。
-/// 由 activate_and_raise 在快速路径(SLPS + 合成点击)完成后调用:
-/// 如果快速路径已成功,这里只检查目标窗口是否最小化;正常窗口不再重复 AXRaise。
-/// 快速路径失败时才补焦点与还原最小化——即使任务排队或超时,切换本身也不受影响。
+/// 提交后台 AX 精确抬升任务(un-minimize + setFocused + AXRaise)。
+/// Enqueue the serialized AX backstop (un-minimize + setFocused + AXRaise).
 /// AX 枚举对无响应 App 可能阻塞几十至上百毫秒,绝不能放主线程。
 ///
-/// Enqueue the background AX raise (enumerate + conditionally un-minimize/setFocused/AXRaise).
-/// Called by activate_and_raise after the fast path (SLPS + synthetic click): the window is
-/// already raised at the WindowServer level. A successful fast path only needs AX work for a
-/// minimized target; normal windows skip the duplicate AXRaise. A queued or timed-out job never
-/// affects the switch itself. AX enumeration can block tens to hundreds of milliseconds on
-/// unresponsive apps; it must stay off the main thread.
-pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32, fast_path_ok: bool) {
+/// AX enumeration can block tens to hundreds of milliseconds on an unresponsive app; it must
+/// stay off the main thread.
+pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32) {
     if cgwid == 0 {
         return;
     }
@@ -1192,19 +1255,9 @@ pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32, fast_path_ok: bool) {
     let _ = RAISE_TX.send(RaiseJob {
         pid,
         cgwid,
-        fast_path_ok,
         generation,
         enqueued_at: Instant::now(),
     });
-}
-
-fn fast_path_focus_verified(
-    fast_path_ok: bool,
-    is_minimized: Option<bool>,
-    focused_cgwid: Option<u32>,
-    target_cgwid: u32,
-) -> bool {
-    fast_path_ok && is_minimized != Some(true) && focused_cgwid == Some(target_cgwid)
 }
 
 fn run_raise_ax_job(job: RaiseJob) {
@@ -1229,12 +1282,10 @@ fn run_raise_ax_job(job: RaiseJob) {
 }
 
 /// AX 阶段本体:枚举目标 App 的 AXWindows,按 CGWindowID 配对;应用变更前重查意图。
-/// 快速路径成功时,正常窗口不再执行任何 AX 抬升;只有最小化窗口才执行
-/// un-minimize + setFocused + AXRaise。快速路径失败时执行完整 AX 兜底。
+/// SLPS 与合成 key-window 事件已在提交时同步完成,这里只做后台 AX 兜底。
 /// The AX phase body: enumerate the target app's AXWindows and pair by CGWindowID; re-check
-/// the raise intent right before applying mutations. After a successful fast path, normal
-/// windows skip all AX raising; only minimized windows use un-minimize + setFocused + AXRaise.
-/// A failed fast path uses the full AX fallback (order mirrors AltTab: SLPS -> makeKey -> AXRaise).
+/// the raise intent right before applying mutations. The synchronous commit path has already
+/// performed SLPS and the synthetic key-window event; this phase is only the AX backstop.
 unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
     let app = AXUIElementCreateApplication(job.pid);
     if app.is_null() {
@@ -1248,11 +1299,62 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
     // timeout). A timeout only loses the focus backstop; the fast path's SLPS raise stands.
     AXUIElementSetMessagingTimeout(app, 1.0);
 
+    let raise_key = cf_string_new("AXRaise");
+    let focused_key = cf_string_new("AXFocusedWindow");
+    let minimized_key = cf_string_new("AXMinimized");
+
+    // collect_windows 已经为当前窗口保留了 AX 元素。正常切换直接复用它，避免每次都做
+    // 一次 AXWindows IPC；只有元素失效时才回退到下面的实时枚举。
+    // collect_windows retains the AX element for the current window. Reuse it for normal
+    // switches to avoid an AXWindows IPC round trip; only stale elements use the live scan below.
+    if let Some(element) = cached_ax_window_element(job.pid, job.cgwid) {
+        if !raise_intent_current(job.generation) {
+            CFRelease(element);
+            CFRelease(raise_key);
+            CFRelease(focused_key);
+            CFRelease(minimized_key);
+            CFRelease(app);
+            return;
+        }
+        let (is_minimized, minimized_set_err, focused_set_err, raise_err) =
+            raise_ax_element(app, element, minimized_key, focused_key, raise_key);
+        if raise_err != K_AX_INVALID_UI_ELEMENT {
+            log_info!(
+                "[raise] ax raised cached: pid={} cgwid={} minimized={:?} set_minimized={} set_focused={} raise={} waited={}ms total={}ms",
+                job.pid,
+                job.cgwid,
+                is_minimized,
+                minimized_set_err,
+                focused_set_err,
+                raise_err,
+                job.enqueued_at.elapsed().as_millis(),
+                started.elapsed().as_millis()
+            );
+            CFRelease(element);
+            CFRelease(raise_key);
+            CFRelease(focused_key);
+            CFRelease(minimized_key);
+            CFRelease(app);
+            return;
+        }
+        log_debug!(
+            "[raise] cached AX element stale: pid={} cgwid={} raise={} — refreshing",
+            job.pid,
+            job.cgwid,
+            raise_err
+        );
+        invalidate_cached_ax_window_element(job.pid, job.cgwid, element);
+        CFRelease(element);
+    }
+
     let windows_key = cf_string_new("AXWindows");
     let mut windows_array: *const c_void = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
     CFRelease(windows_key);
     if err != K_AX_SUCCESS || windows_array.is_null() {
+        CFRelease(raise_key);
+        CFRelease(focused_key);
+        CFRelease(minimized_key);
         CFRelease(app);
         log_info!(
             "[raise] ax NO MATCH: pid={} cgwid={} ax_query_err={} waited={}ms",
@@ -1264,9 +1366,6 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
         return;
     }
     let count = CFArrayGetCount(windows_array);
-    let raise_key = cf_string_new("AXRaise");
-    let focused_key = cf_string_new("AXFocusedWindow");
-    let minimized_key = cf_string_new("AXMinimized");
     let mut matched = false;
     let mut superseded = false;
     for i in 0..count {
@@ -1289,76 +1388,21 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
                 );
                 break;
             }
-            let mut minimized_value: *const c_void = std::ptr::null();
-            let minimized_err =
-                AXUIElementCopyAttributeValue(element, minimized_key, &mut minimized_value);
-            let is_minimized = if minimized_err == K_AX_SUCCESS && !minimized_value.is_null() {
-                let value = CFBooleanGetValue(minimized_value);
-                CFRelease(minimized_value);
-                Some(value)
-            } else {
-                None
-            };
-
-            // 快速路径的返回值只代表调用成功,不代表同一 App 内的目标窗口已经获得焦点。
-            // 读取 AXFocusedWindow 验证 cgwid,只有确实聚焦了目标窗口才跳过 AXRaise。
-            // The fast-path return values only mean the calls succeeded; they do not prove that
-            // the target window (rather than a sibling window in the same app) is focused.
-            // Verify AXFocusedWindow before skipping AXRaise.
-            if job.fast_path_ok && is_minimized != Some(true) {
-                let mut focused_value: *const c_void = std::ptr::null();
-                let focused_err =
-                    AXUIElementCopyAttributeValue(app, focused_key, &mut focused_value);
-                let focused_cgwid = if focused_err == K_AX_SUCCESS && !focused_value.is_null() {
-                    let focused_cgwid = ax_window_cgwid(focused_value);
-                    CFRelease(focused_value);
-                    focused_cgwid
-                } else {
-                    None
-                };
-
-                if fast_path_focus_verified(
-                    job.fast_path_ok,
-                    is_minimized,
-                    focused_cgwid,
-                    job.cgwid,
-                ) {
-                    matched = true;
-                    log_debug!(
-                        "[raise] ax skipped after fast: pid={} cgwid={} focused_cgwid={:?} minimized={:?} waited={}ms total={}ms",
-                        job.pid,
-                        job.cgwid,
-                        focused_cgwid,
-                        is_minimized,
-                        job.enqueued_at.elapsed().as_millis(),
-                        started.elapsed().as_millis()
-                    );
-                    break;
-                }
-
-                log_debug!(
-                    "[raise] fast focus mismatch: pid={} target_cgwid={} focused_cgwid={:?} ax_err={}",
-                    job.pid,
-                    job.cgwid,
-                    focused_cgwid,
-                    focused_err
-                );
-            }
-
-            // 先还原最小化(若已最小化),否则 AXRaise 可能只是带到前面而仍停在 Dock。
-            // Un-minimize first (if minimized), otherwise AXRaise may bring it forward
-            // without restoring from the Dock. Setting false on a non-minimized window is a no-op.
-            AXUIElementSetAttributeValue(element, minimized_key, kCFBooleanFalse);
-            AXUIElementSetAttributeValue(app, focused_key, element);
-            AXUIElementPerformAction(element, raise_key);
+            // 找到实时元素后更新缓存,下一次切换就不必重新枚举。
+            // Refresh the cache with the live element so the next switch skips enumeration.
+            cache_ax_window_element(job.pid, job.cgwid, element);
+            let (is_minimized, minimized_set_err, focused_set_err, raise_err) =
+                raise_ax_element(app, element, minimized_key, focused_key, raise_key);
             matched = true;
             log_info!(
-                "[raise] ax raised: pid={} cgwid={} ax_windows={} minimized={:?} fast_path={} waited={}ms total={}ms",
+                "[raise] ax raised refreshed: pid={} cgwid={} ax_windows={} minimized={:?} set_minimized={} set_focused={} raise={} waited={}ms total={}ms",
                 job.pid,
                 job.cgwid,
                 count,
                 is_minimized,
-                job.fast_path_ok,
+                minimized_set_err,
+                focused_set_err,
+                raise_err,
                 job.enqueued_at.elapsed().as_millis(),
                 started.elapsed().as_millis()
             );
@@ -1380,6 +1424,34 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
     CFRelease(minimized_key);
     CFRelease(windows_array);
     CFRelease(app);
+}
+
+/// 对一个已经解析出的 AX 窗口执行焦点兜底,返回各次 AX 操作的结果码。
+/// Apply the AX focus backstop to an already-resolved window and return each AX result code.
+unsafe fn raise_ax_element(
+    app: AXUIElementRef,
+    element: AXUIElementRef,
+    minimized_key: AXUIElementRef,
+    focused_key: AXUIElementRef,
+    raise_key: AXUIElementRef,
+) -> (Option<bool>, AXError, AXError, AXError) {
+    let mut minimized_value: *const c_void = std::ptr::null();
+    let minimized_err = AXUIElementCopyAttributeValue(element, minimized_key, &mut minimized_value);
+    let is_minimized = if minimized_err == K_AX_SUCCESS && !minimized_value.is_null() {
+        let value = CFBooleanGetValue(minimized_value);
+        CFRelease(minimized_value);
+        Some(value)
+    } else {
+        None
+    };
+
+    // 先还原最小化(若已最小化),否则 AXRaise 可能只是带到前面而仍停在 Dock。
+    // Un-minimize first (if minimized), otherwise AXRaise may bring it forward without restoring
+    // from the Dock. Setting false on a non-minimized window is a no-op.
+    let minimized_set_err = AXUIElementSetAttributeValue(element, minimized_key, kCFBooleanFalse);
+    let focused_set_err = AXUIElementSetAttributeValue(app, focused_key, element);
+    let raise_err = AXUIElementPerformAction(element, raise_key);
+    (is_minimized, minimized_set_err, focused_set_err, raise_err)
 }
 
 /// 查一个 PID 的 AX 标准窗口列表。
@@ -1523,6 +1595,10 @@ pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)
             };
             // 取该 AX 窗口的 CGWindowID（私有 API），用于和 CG 窗口精确配对。
             let cgwid = ax_window_cgwid(element).unwrap_or(0);
+            // 保留精确元素供激活路径复用,这样正常切换不必再次读取 AXWindows。
+            // Retain the exact element for the activation path so normal raises do not need
+            // another AXWindows round trip.
+            cache_ax_window_element(pid, cgwid, element);
             results.push((cgwid, title, minimized));
         }
         CFRelease(title_key);
@@ -2488,15 +2564,6 @@ pub fn cache_running_app_icons_small() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fast_path_skips_ax_only_for_the_focused_target() {
-        assert!(fast_path_focus_verified(true, Some(false), Some(42), 42));
-        assert!(!fast_path_focus_verified(true, Some(false), Some(41), 42));
-        assert!(!fast_path_focus_verified(true, Some(false), None, 42));
-        assert!(!fast_path_focus_verified(true, Some(true), Some(42), 42));
-        assert!(!fast_path_focus_verified(false, Some(false), Some(42), 42));
-    }
 
     #[test]
     fn raise_generation_supersedes_older_jobs() {
