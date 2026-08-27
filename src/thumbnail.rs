@@ -357,6 +357,13 @@ impl<K: Eq + Clone, V: Clone> Lru<K, V> {
     pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
+
+    /// 记账总成本(驱逐判定用的同一计数;内存采样器直接读)。
+    /// Total accounted cost (the same counter the eviction check uses; the memory
+    /// sampler reads it directly).
+    pub(crate) fn total_cost(&self) -> u64 {
+        self.total_cost
+    }
 }
 
 // ========== 缓存状态 ==========
@@ -425,6 +432,16 @@ fn thumb_cost(t: &CachedThumb) -> u64 {
 
 static CACHE: LazyLock<Mutex<Lru<ThumbKey, CachedThumb>>> =
     LazyLock::new(|| Mutex::new(Lru::new(CACHE_MAX_ITEMS, CACHE_MAX_COST, thumb_cost)));
+
+/// 内存采样器的账本读数:(条目数, 记账成本字节)。只取统计字段,不触碰 CGImageRef,
+/// 不改变 LRU 次序(锁只持到读出两个整数)。
+/// Ledger reading for the memory sampler: (item count, accounted cost in bytes). Reads only
+/// the two counter fields -- no CGImageRef is touched and LRU order is unchanged (the lock is
+/// held just long enough to copy two integers out).
+pub(crate) fn cache_stats() -> (usize, u64) {
+    let cache = CACHE.lock().unwrap();
+    (cache.len(), cache.total_cost())
+}
 
 /// 取缩略图(+1 返回,调用方用完必须 CFRelease;缓存自己的引用不受影响)。
 /// Fetch a thumbnail (+1 returned; the caller MUST CFRelease when done -- the

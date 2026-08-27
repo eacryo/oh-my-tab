@@ -299,6 +299,38 @@ const DETAIL_PREVIEW_MAX_DIM: f64 = 1280.0;
 /// 历史列表,最新在前 / history, newest first.
 static CLIP_HISTORY: LazyLock<Mutex<Vec<ClipEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// 内存采样器的账本读数:(条目数, 驻留内存字节预估)。统计结构体本身与各动态缓冲区的
+/// capacity;原始图片字节在磁盘缓存,不计入内存账本。锁只持到读出两个整数。
+/// Ledger reading for the memory sampler: (entry count, estimated resident bytes). Counts the
+/// inline structs and dynamic buffer capacities; original image bytes live in the disk cache
+/// and are excluded. The lock is held only while reading the counters.
+pub(crate) fn history_stats() -> (usize, u64) {
+    let history = CLIP_HISTORY.lock().unwrap();
+    let bytes = history.iter().map(estimated_entry_bytes).sum();
+    (history.len(), bytes)
+}
+
+/// 估算单个条目的实际驻留内存:结构体本身 + 各动态字段的容量。
+/// 不把磁盘中的原始图片数据计入;这里只统计当前进程持有的 Vec/String 缓冲区。
+/// Estimate one entry's resident memory: the inline structs plus the capacities of dynamic
+/// fields. Original image bytes on disk are intentionally excluded; only Vec/String buffers
+/// currently held by this process are counted.
+fn estimated_entry_bytes(entry: &ClipEntry) -> u64 {
+    let mut bytes = std::mem::size_of::<ClipEntry>() as u64
+        + entry.text.capacity() as u64
+        + entry.source_app.capacity() as u64
+        + entry.source_key.capacity() as u64;
+    if let Some(image) = &entry.image {
+        bytes += image.uti.capacity() as u64;
+        bytes += image.data_path.capacity() as u64;
+        bytes += image.preview_png.capacity() as u64;
+        if let Some(source_path) = &image.source_path {
+            bytes += source_path.capacity() as u64;
+        }
+    }
+    bytes
+}
+
 /// 上次读到的 changeCount(变化才读剪贴板)/ last observed changeCount (read only on change).
 static LAST_CHANGE_COUNT: LazyLock<Mutex<i64>> = LazyLock::new(|| Mutex::new(-1));
 
@@ -10091,9 +10123,55 @@ unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_hover_row, scroll_indicator_geometry, ClipEntry, ImageEntry, NO_SELECTION,
-        NSPASTEBOARD_TYPE_PNG, SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE,
+        effective_hover_row, estimated_entry_bytes, scroll_indicator_geometry, ClipEntry,
+        ImageEntry, NO_SELECTION, NSPASTEBOARD_TYPE_PNG, SCROLL_INDICATOR_CORNER_RESERVE,
+        SCROLL_INDICATOR_EDGE,
     };
+
+    #[test]
+    fn estimated_entry_bytes_counts_capacity_once() {
+        let mut text = String::with_capacity(32);
+        text.push_str("hello");
+        let entry = ClipEntry {
+            text,
+            image: None,
+            pinned: false,
+            source_app: String::with_capacity(16),
+            source_key: String::with_capacity(24),
+            copied_at: None,
+        };
+        let expected = std::mem::size_of::<ClipEntry>() as u64
+            + entry.text.capacity() as u64
+            + entry.source_app.capacity() as u64
+            + entry.source_key.capacity() as u64;
+        assert_eq!(estimated_entry_bytes(&entry), expected);
+
+        let image = ImageEntry {
+            uti: String::with_capacity(16),
+            hash: 1,
+            data_path: std::path::PathBuf::from("/tmp/image"),
+            preview_png: Vec::with_capacity(64),
+            source_path: Some(String::with_capacity(32)),
+        };
+        let image_entry = ClipEntry {
+            text: String::new(),
+            image: Some(image),
+            pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+            copied_at: None,
+        };
+        let image = image_entry.image.as_ref().unwrap();
+        let expected = std::mem::size_of::<ClipEntry>() as u64
+            + image_entry.text.capacity() as u64
+            + image_entry.source_app.capacity() as u64
+            + image_entry.source_key.capacity() as u64
+            + image.uti.capacity() as u64
+            + image.data_path.capacity() as u64
+            + image.preview_png.capacity() as u64
+            + image.source_path.as_ref().unwrap().capacity() as u64;
+        assert_eq!(estimated_entry_bytes(&image_entry), expected);
+    }
 
     #[test]
     fn detail_scroll_geometry_keeps_a_fixed_lower_right_reserve() {

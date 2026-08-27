@@ -7,6 +7,7 @@ mod event_tap;
 mod ffi;
 mod i18n;
 mod logger;
+mod mem;
 mod menu;
 mod mouse;
 mod overlay;
@@ -2080,6 +2081,10 @@ fn main() {
     // Start bounded workers for post-activation AX focus queries so notification bursts do not
     // create large numbers of threads.
     start_activation_focus_scheduler();
+    // 内存采样线程:60s 后打基线,之后每 5 分钟一拍(Info 级,泄漏排查的长期数据)。
+    // Memory sampler thread: baseline after 60s, then one sample every 5 minutes (Info level;
+    // the long-term data trail for leak hunting).
+    mem::start();
     window_server::start();
     let initial_subscriptions = window_collector::window_server_candidates();
     window_server::update_subscriptions(&initial_subscriptions);

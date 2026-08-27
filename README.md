@@ -84,7 +84,7 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 
 **Closing a window brings the same app's other window forward (macOS-native)**: closing the frontmost window of the active app makes macOS activate the app's remaining window — e.g. closing a Chrome incognito window brings the regular Chrome window to the front. oh-my-tab receives no event at that moment and does nothing; the next summon merely reflects the real frontmost window. This is identical to the behavior of the system Cmd+Tab.
 
-If windows are already open when the app starts, their ordering differs from the native Cmd+Tab order. This is because there is no initial window-ordering data; oh-my-tab builds it by continuously observing window changes after launch.
+If windows are already open when the app starts, their initial ordering is seeded from WindowServer's front-to-back order. This is a useful approximation, but it is not guaranteed to match the native Cmd+Tab app order; live activation events refine the window-level MRU after launch.
 
 **Device recognition caveats**: some exotic mice (e.g. ATK A9 SE, a Nearlink device) report an unexpected primary usage and appear as keyboards in System Settings; the device picker matches against the device's full HID usage pairs, so they are still recognized and configurable. Bluetooth keyboards whose HID descriptor fakes pointer usages are excluded via their Bluetooth GAP appearance. The picker refreshes live on plug/unplug and reconnect (plug events are debounced but never dropped).
 
@@ -242,6 +242,7 @@ Mouse settings are also exposed in the Settings window (a **device picker** list
 - **Destination**: `cargo run` (dev) → both stdout **and** the log file; a packaged `.app` (prod) → log file only.
 - **Default file path**: `~/Library/Logs/oh-my-tab/oh-my-tab-<startup-timestamp>.log` — one file **per app launch**. Files in the default directory older than 30 days are deleted at startup (no size-based rotation within a single run).
 - **Custom path**: `[logging] file_path` (edit `config.toml` directly; not exposed in Settings). A user-supplied path is used **verbatim**, in append mode — no timestamp is added and no cleanup is performed on it; rotation and retention are yours.
+- **Memory diagnostics**: after roughly 60 seconds, then every 5 minutes, the app records one `[mem]` line containing process footprint/RSS, sampled footprint peak, thread count, and estimated thumbnail/clipboard/window ledgers. It does not record clipboard contents or window imagery.
 - **Privacy**: debug logs never record actual keystrokes. The switcher's key tap logs only `Tab` / `Command` / `Option` (and the summon combo name); every other key is logged as plain `Other` — no keycodes, no modifier details.
 
 ## <img height="16" src="docs/icons/heart.svg">&nbsp;&nbsp;Credits
