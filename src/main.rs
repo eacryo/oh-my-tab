@@ -36,6 +36,7 @@ use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use settings::*;
+use std::collections::HashSet;
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -64,6 +65,37 @@ pub(crate) struct AppState {
     pub(crate) selected: usize,
     pub(crate) visible: bool,
     pub(crate) mru: MruMap,
+    pub(crate) focus_key: Option<(i32, u32)>,
+    // 召唤瞬间模型已持有的窗口 key 集合。浮窗打开后的刷新,只应把「召唤时就在场」的窗口
+    // 视为用户正在选择的目标;召唤后才出现的新窗口是 newcomer,不参与选中(对齐 alt-tab 的
+    // windowIdsAtSummon)。None = 尚未记录(首帧前)。
+    // Window keys the model already held at summon. Refreshes after the overlay shows only treat
+    // windows present at the summon as the user's switching targets; a window appearing after the
+    // summon is a newcomer and does not participate in the pick (mirrors alt-tab's windowIdsAtSummon).
+    // None = not yet recorded (before the first frame).
+    pub(crate) summon_keys: Option<HashSet<(i32, u32)>>,
+    // 用户是否已主动移动过选中(Tab/方向键/点击)。false=选中仍是首帧默认落点,它应跟随
+    // 「召唤时语义」而不是当前 MRU 排序;true=用户已选具体窗口,刷新后需钉住该窗口 key。
+    // false = the selection is still the first-frame default and follows the summon semantics,
+    // not the live MRU order; true = the user picked a concrete window and the selection must
+    // stay pinned to it across refreshes (mirrors alt-tab's userPickedSelection).
+    pub(crate) user_picked: bool,
+    // 用户当前选中的目标窗口 key。user_picked=true 时它是刷新后必须钉住的窗口;
+    // user_picked=false 时它是首帧默认目标,刷新不因 MRU 排序漂移而改选它。
+    // The user's current selection target key. When user_picked=true it is the window the pick
+    // must stay pinned to after a refresh; when false it is the first-frame default target and a
+    // refresh must not re-pick just because the MRU order shifted.
+    pub(crate) selected_target_key: Option<(i32, u32)>,
+    // 首帧「待显示」标记:true 表示本次召唤已发起刷新、但浮窗尚未显示,等待 apply_window_refresh
+    // 拿到首帧快照后一次性显示(一次成图,避免「先显示旧快照再重排」的跳变)。
+    // pending_first_show: true once this summon has kicked off a refresh but the overlay has not
+    // been shown yet; apply_window_refresh consumes it to show once the first snapshot is ready
+    // (single-shot render, avoiding the "show stale snapshot then reorder" jump).
+    pub(crate) pending_first_show: bool,
+    // 首帧待显示时记录用户是按了正向还是反向 Tab,apply_window_refresh 用它在显示时定首选。
+    // backward flag captured while the first frame is pending, so apply_window_refresh can decide
+    // the initial pick direction when it finally shows.
+    pub(crate) pending_first_backward: bool,
 }
 
 #[repr(u8)]
@@ -95,6 +127,12 @@ impl WindowRefreshReason {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowRefreshRequest {
+    Full(WindowRefreshReason),
+    Focused { pid: i32, window_id: u32 },
+}
+
 impl AppState {
     pub(crate) fn new() -> Self {
         // 启动时用系统窗口前→后顺序预种 MRU:重启后初始顺序与原生 Cmd+Tab 的
@@ -117,6 +155,12 @@ impl AppState {
             selected: if win_count > 1 { 1 } else { 0 },
             visible: false,
             mru,
+            focus_key: None,
+            summon_keys: None,
+            user_picked: false,
+            selected_target_key: None,
+            pending_first_show: false,
+            pending_first_backward: false,
         }
     }
 }
@@ -125,12 +169,16 @@ struct WindowRefreshResult {
     generation: u64,
     windows: Vec<WindowInfo>,
     mru: MruMap,
+    replace_pid: Option<i32>,
+    active_key: Option<(i32, u32)>,
 }
 
 static WINDOW_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 // 保存待处理刷新中最高优先级的原因:召唤刷新不能被生命周期刷新降级。
 // Keep the highest-priority pending reason so a summon refresh cannot be downgraded to a lifecycle refresh.
 static WINDOW_REFRESH_PENDING: AtomicU8 = AtomicU8::new(0);
+static WINDOW_REFRESH_PENDING_FOCUS: LazyLock<Mutex<Option<(i32, u32)>>> =
+    LazyLock::new(|| Mutex::new(None));
 static WINDOW_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static WINDOW_REFRESH_RESULT: LazyLock<Mutex<Option<WindowRefreshResult>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -144,6 +192,10 @@ fn request_window_refresh() {
 
 fn request_lifecycle_window_refresh() {
     request_window_refresh_for(WindowRefreshReason::Lifecycle);
+}
+
+fn request_focused_window_refresh(pid: i32, window_id: u32) {
+    request_window_refresh_request(WindowRefreshRequest::Focused { pid, window_id });
 }
 
 fn merge_pending_refresh_reason(reason: WindowRefreshReason) {
@@ -171,12 +223,40 @@ fn take_pending_refresh_reason() -> Option<WindowRefreshReason> {
     WindowRefreshReason::from_raw(WINDOW_REFRESH_PENDING.swap(0, Ordering::AcqRel))
 }
 
+fn take_pending_refresh_request() -> Option<WindowRefreshRequest> {
+    if let Some(reason) = take_pending_refresh_reason() {
+        return Some(WindowRefreshRequest::Full(reason));
+    }
+    WINDOW_REFRESH_PENDING_FOCUS
+        .lock()
+        .unwrap()
+        .take()
+        .map(|(pid, window_id)| WindowRefreshRequest::Focused { pid, window_id })
+}
+
+fn queue_refresh_request(request: WindowRefreshRequest) {
+    match request {
+        WindowRefreshRequest::Full(reason) => merge_pending_refresh_reason(reason),
+        WindowRefreshRequest::Focused { pid, window_id } => {
+            *WINDOW_REFRESH_PENDING_FOCUS.lock().unwrap() = Some((pid, window_id));
+        }
+    }
+}
+
 fn request_window_refresh_for(reason: WindowRefreshReason) {
+    request_window_refresh_request(WindowRefreshRequest::Full(reason));
+}
+
+fn request_window_refresh_request(request: WindowRefreshRequest) {
     if WINDOW_REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        merge_pending_refresh_reason(reason);
+        queue_refresh_request(request);
         return;
     }
 
+    start_window_refresh(request);
+}
+
+fn start_window_refresh(request: WindowRefreshRequest) {
     let (generation, mru) = {
         let state_opt = TAB_STATE.lock().unwrap();
         let Some(state) = state_opt.as_ref() else {
@@ -189,19 +269,66 @@ fn request_window_refresh_for(reason: WindowRefreshReason) {
         )
     };
 
+    // 浮窗已显示后,summon-bump 不再把前台窗口写回 MRU:否则每次刷新都会把前台窗口顶到第 0 位、
+    // 造成已显示的列表重排(跳变)。首帧待显示(visible=false)仍允许 bump 一次,保证首位是真实前台。
+    // Once the overlay is shown, summon-bump must NOT rewrite the frontmost window into MRU:
+    // otherwise every refresh hoists it to index 0 and reorders the displayed list (the jump).
+    // The not-yet-shown first frame (visible=false) still may bump once so the head is the real
+    // frontmost.
+    let allow_bump = {
+        let state_opt = TAB_STATE.lock().unwrap();
+        !state_opt.as_ref().is_some_and(|s| s.visible)
+    };
+
     thread::Builder::new()
         .name("window-refresh".into())
         .spawn(move || {
             let started = std::time::Instant::now();
             let mut mru = mru;
-            let windows = window_collector::collect_windows_with_frontmost_bump(
-                &mut mru,
-                reason.bumps_frontmost(),
-            );
+            let (windows, replace_pid, active_key) = match request {
+                WindowRefreshRequest::Full(reason) => (
+                    window_collector::collect_windows_with_frontmost_bump(
+                        &mut mru,
+                        reason.bumps_frontmost() && allow_bump,
+                    ),
+                    None,
+                    None,
+                ),
+                WindowRefreshRequest::Focused { pid, window_id } => {
+                    match window_collector::collect_windows_for_pid(&mut mru, pid, window_id) {
+                        Some(windows) => {
+                            let active_key = windows
+                                .iter()
+                                .any(|window| window.window_id == window_id)
+                                .then_some((pid, window_id));
+                            (windows, Some(pid), active_key)
+                        }
+                        None => {
+                            // 定向 AX 查询失败时保留完整快照兜底,避免误删目标 App 的卡片。
+                            // Fall back to a full snapshot when the directed AX query fails, so
+                            // a transient timeout cannot erase the target app's cards.
+                            log_debug!(
+                                "[windows] focused refresh fallback: pid={} cgwid={}",
+                                pid,
+                                window_id
+                            );
+                            (
+                                window_collector::collect_windows_with_frontmost_bump(
+                                    &mut mru, false,
+                                ),
+                                None,
+                                None,
+                            )
+                        }
+                    }
+                }
+            };
             *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
                 generation,
                 windows,
                 mru,
+                replace_pid,
+                active_key,
             });
             log_debug!(
                 "[windows] background refresh ready generation={} elapsed={}ms",
@@ -221,12 +348,77 @@ fn request_window_refresh_for(reason: WindowRefreshReason) {
             } else {
                 WINDOW_REFRESH_RESULT.lock().unwrap().take();
                 WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-                if let Some(pending_reason) = take_pending_refresh_reason() {
-                    request_window_refresh_for(pending_reason);
+                if let Some(pending_request) = take_pending_refresh_request() {
+                    request_window_refresh_request(pending_request);
                 }
             }
         })
         .expect("spawn window-refresh thread");
+}
+
+fn merge_refreshed_windows(
+    existing: &[WindowInfo],
+    replace_pid: Option<i32>,
+    mut refreshed: Vec<WindowInfo>,
+) -> Vec<WindowInfo> {
+    // AX 是权威:窗口只在当前快照被 AX 确认时才进入列表,绝不从旧列表复活。
+    // AX 对 tab 多表面应用(如 Ghostty)只报当前聚焦窗口,保留旧列表会把未聚焦的 tab 表面
+    // 当成独立窗口重新塞进来,导致一张窗口显示成多张卡片。
+    // AX is authoritative: a window enters the list only if the current snapshot's AX confirms
+    // it; never resurrect from the previous list. For tab-per-surface apps (e.g. Ghostty) AX
+    // reports only the focused surface, so retaining the old list would re-inject an unfocused
+    // tab surface and show one window as many cards.
+    if let Some(pid) = replace_pid {
+        let mut merged: Vec<WindowInfo> = existing
+            .iter()
+            .filter(|window| window.pid != pid)
+            .cloned()
+            .collect();
+        merged.append(&mut refreshed);
+        merged
+    } else {
+        refreshed
+    }
+}
+
+fn selection_index_after_refresh(
+    selected_key: Option<(i32, u32)>,
+    previous_index: usize,
+    windows: &[WindowInfo],
+) -> usize {
+    selected_key
+        .and_then(|key| {
+            windows
+                .iter()
+                .position(|window| (window.pid, window.window_id) == key)
+        })
+        .unwrap_or_else(|| previous_index.min(windows.len().saturating_sub(1)))
+}
+
+/// 刷新后选中索引:优先跟随「目标窗口 key」,而不是当前列表下标。
+///
+/// - `user_picked = true`(用户已主动导航):钉住 `target_key`(用户选的具体窗口);它还在列表
+///   就恢复其位置,不在才钳制。列表重排(哪怕是同窗口表面切换)不移动选中。
+/// - `user_picked = false`(仍是首帧默认落点):锁定首帧选中的 `target_key`,刷新不因 MRU 排序
+///   被前台窗口 bump 改写而改选——否则用户按一次 Cmd+Tab,选中会跟着「无窗口增减」的重排漂移。
+///
+/// Selection index after a refresh: prefer the target window key over the live list index.
+/// - user_picked = true: pin to target_key; keep its position if still shown, else clamp.
+/// - user_picked = false: lock to the summon-time target so a refresh doesn't re-pick merely
+///   because the MRU order was bumped by the frontmost window (a reorder with no add/remove).
+fn select_index_after_refresh(
+    user_picked: bool,
+    target_key: Option<(i32, u32)>,
+    live_selected_key: Option<(i32, u32)>,
+    previous_index: usize,
+    windows: &[WindowInfo],
+) -> usize {
+    let anchor = if user_picked {
+        target_key
+    } else {
+        target_key.or(live_selected_key)
+    };
+    selection_index_after_refresh(anchor, previous_index, windows)
 }
 
 /// 在主线程应用快照，并合并后台任务开始后产生的窗口级 MRU 更新。
@@ -235,17 +427,22 @@ fn request_window_refresh_for(reason: WindowRefreshReason) {
 fn apply_window_refresh() {
     let Some(result) = WINDOW_REFRESH_RESULT.lock().unwrap().take() else {
         WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        if let Some(pending_request) = take_pending_refresh_request() {
+            request_window_refresh_request(pending_request);
+        }
         return;
     };
     if result.generation != WINDOW_REFRESH_GENERATION.load(Ordering::Acquire) {
         WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-        if let Some(pending_reason) = take_pending_refresh_reason() {
-            request_window_refresh_for(pending_reason);
+        if let Some(pending_request) = take_pending_refresh_request() {
+            request_window_refresh_request(pending_request);
         }
         return;
     }
 
-    let (was_visible, changed) = {
+    let subscriptions = window_collector::window_server_candidates();
+
+    let (was_visible, set_changed) = {
         let mut state_opt = TAB_STATE.lock().unwrap();
         let Some(state) = state_opt.as_mut() else {
             WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
@@ -261,50 +458,117 @@ fn apply_window_refresh() {
                 mru.insert(key, timestamp);
             }
         }
-        let mut windows = result.windows;
+        let replace_pid = result.replace_pid;
+        let active_key = result.active_key;
+        // 定向刷新只替换目标 PID,其他应用的卡片和窗口顺序记忆保持不变。
+        // A directed refresh replaces only the target PID; cards and ordering memory for every
+        // other application remain intact.
+        let mut windows = merge_refreshed_windows(&state.windows, replace_pid, result.windows);
         window_collector::sort_windows_by_mru(&mut windows, &mru, std::time::Instant::now());
-        let selected = selected_key
-            .and_then(|key| {
-                windows
-                    .iter()
-                    .position(|window| (window.pid, window.window_id) == key)
-            })
-            .unwrap_or_else(|| state.selected.min(windows.len().saturating_sub(1)));
+        if replace_pid.is_none() {
+            // 全量刷新合并旧窗口后重新建立唯一的前台代表，避免旧快照的 is_active 残留。
+            // Re-establish one frontmost representative after a full merge so an old snapshot
+            // cannot leave multiple stale is_active flags behind.
+            for window in &mut windows {
+                window.is_active = false;
+            }
+            if let Some(first) = windows.first_mut() {
+                first.is_active = true;
+            }
+        } else if let Some(active_key) = active_key {
+            for window in &mut windows {
+                window.is_active = (window.pid, window.window_id) == active_key;
+            }
+        }
+        // 选中跟随「目标窗口」而非「当前列表下标」:
+        // - user_picked=true(用户已主动导航):钉住 selected_target_key,列表重排不动它。
+        // - user_picked=false(仍是首帧默认落点):锁定首帧选中的目标窗口,刷新不因 MRU
+        //   排序被前台 bump 改写而改选——否则用户按一次 Cmd+Tab,选中会跟着重排漂移。
+        // Selection follows the target window, not the live list index:
+        // - user_picked=true (user navigated): pin to selected_target_key; reorders cannot move it.
+        // - user_picked=false (still the first-frame default): lock to the summon-time target so a
+        //   refresh doesn't re-pick just because the MRU order was bumped by the frontmost window.
+        let selected = select_index_after_refresh(
+            state.user_picked,
+            state.selected_target_key,
+            selected_key,
+            state.selected,
+            &windows,
+        );
         let changed = state.windows != windows;
+        // 集合级变化(窗口增删):只有这个才需要整树重建浮窗。仅排序变化(MRU 被前台 bump 改写、
+        // 表面切换)只更新数据,不重建列表——否则用户看到「打开了还在跳」。定向刷新(replace_pid)
+        // 替换了目标 PID 的卡片,也视为集合变化。
+        // Set-level change (windows added/removed): only this needs a full overlay rebuild. A pure
+        // reorder (MRU bumped by the frontmost, surface flip) only updates data without rebuilding
+        // the list — otherwise the overlay "keeps jumping after it opened". A directed refresh
+        // (replace_pid) swapping a PID's cards also counts as a set change.
+        let set_changed = replace_pid.is_some() || {
+            let old: HashSet<(i32, u32)> =
+                state.windows.iter().map(|w| (w.pid, w.window_id)).collect();
+            let new: HashSet<(i32, u32)> = windows.iter().map(|w| (w.pid, w.window_id)).collect();
+            old != new
+        };
         let was_visible = state.visible;
+        // 浮窗显示期间发生排序/集合变化:打印变更前后的完整窗口序与选中位置,便于排查
+        // 「窗口排序在浮窗显示后被刷新改动」类问题(如 Ghostty tab 表面切换导致的跳变)。
+        // Overlay visible and the ordering/set changed: log the full window order and selection
+        // before and after, so a "reorder-after-show" drift (e.g. a Ghostty tab-surface flip) is
+        // visible in the log.
+        if changed && was_visible {
+            crate::log_window_ordering("refresh before", &state.windows, &mru, state.selected);
+        }
         state.windows = windows;
         state.selected = selected;
         state.mru = mru;
         if state.windows.is_empty() {
             state.visible = false;
         }
-        (was_visible, changed)
+        if changed && was_visible {
+            crate::log_window_ordering("refresh after", &state.windows, &state.mru, state.selected);
+        }
+        (was_visible, set_changed)
     };
     WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-    let pending_reason = take_pending_refresh_reason();
+    let pending_request = take_pending_refresh_request();
 
-    if changed && was_visible {
+    // 首帧快照就绪:消费 pending_first_show,一次性显示(一次成图)。此时窗口列表已是刷新后的
+    // 最终排序,不会再出现「先显示旧快照、再重排」的两段跳变。
+    // First snapshot ready: consume pending_first_show and show once (single-shot render). The
+    // list is already the final post-refresh order, so the "stale then reorder" jump is gone.
+    let first_show_request = {
+        let mut state_opt = TAB_STATE.lock().unwrap();
+        if let Some(state) = state_opt.as_mut() {
+            if state.pending_first_show {
+                state.pending_first_show = false;
+                Some(state.pending_first_backward)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(backward) = first_show_request {
+        crate::overlay::show_first_summon(backward);
+        log_debug!(
+            "[overlay] summon e2e: first snapshot shown (backward={})",
+            backward
+        );
+    }
+
+    if set_changed && was_visible {
         reset_thumbnail_visible_range();
         reset_thumbnail_scroll();
         reset_thumbnail_nav_anchor();
         show_overlay();
         refresh_highlight();
     }
-    let subscription_ids: Vec<u32> = TAB_STATE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|state| {
-            state
-                .windows
-                .iter()
-                .map(|window| window.window_id)
-                .collect()
-        })
-        .unwrap_or_default();
-    window_server::update_subscriptions(&subscription_ids);
-    if let Some(reason) = pending_reason {
-        request_window_refresh_for(reason);
+    // WindowServer 监听所有 CG 候选窗口,而不是只监听 AX 确认并显示的卡片。
+    // WindowServer observes every CG candidate instead of only AX-confirmed display cards.
+    window_server::update_subscriptions(&subscriptions);
+    if let Some(request) = pending_request {
+        request_window_refresh_request(request);
     }
 }
 
@@ -327,7 +591,7 @@ extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _arg: *mut c
             true
         }
         window_server::WindowServerEvent::Focused(window_id) => {
-            let target = TAB_STATE
+            let displayed_pid = TAB_STATE
                 .lock()
                 .unwrap()
                 .as_ref()
@@ -337,26 +601,103 @@ extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _arg: *mut c
                         .iter()
                         .find(|window| window.window_id == *window_id)
                 })
-                .map(|window| (window.pid, window.window_id));
-            if let Some((pid, window_id)) = target {
+                .map(|window| window.pid);
+            let pid = displayed_pid
+                .or_else(|| window_server::owner_for_window(*window_id))
+                .or_else(|| window_collector::owner_pid_for_cgwid(*window_id));
+            if let Some(pid) = pid {
                 let frontmost_pid = frontmost_app_info().1;
                 if frontmost_pid == pid {
                     let activation_token = window_server::activation_token(pid);
-                    if window_server::focus_should_bump(pid, window_id) {
+                    if window_server::focus_should_bump(pid, *window_id) {
                         if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
-                            bump_window_mru(&mut state.mru, pid, window_id);
+                            // 只把「AX 已确认且显示在列表里」的窗口记为焦点 key;未显示的 CG
+                            // surface(Ghostty 单窗口双 tab 的另一个 tab)不该成为焦点锚点。
+                            // Anchor the focus key only for an AX-confirmed, shown window; an
+                            // undisplayed CG surface (the other Ghostty tab) must not be anchored.
+                            best_effort_bump_focus_key(state, pid, *window_id);
                         }
                         if let Some(activated_at) = activation_token {
-                            thumbnail::refresh_after_activation(pid, window_id, activated_at);
+                            thumbnail::refresh_after_activation(pid, *window_id, activated_at);
                         }
                     }
+                    if displayed_pid.is_none() {
+                        // 未显示的 CG 窗口也参与焦点追踪,但只有定向 AX 刷新确认后才进入卡片。
+                        // Track an undisplayed CG window too, but only let a directed AX refresh
+                        // promote it into the card list after confirmation.
+                        log_debug!(
+                            "[windows] focused unlisted cgwid={} pid={}; directed refresh",
+                            window_id,
+                            pid
+                        );
+                        request_focused_window_refresh(pid, *window_id);
+                    }
                 }
+            } else {
+                log_debug!(
+                    "[windows] focused cgwid={} has no known owner PID",
+                    window_id
+                );
             }
             false
         }
     });
     if should_refresh {
         request_lifecycle_window_refresh();
+    }
+}
+
+// 把 (pid, cgwid) 写进 MRU,并且仅当该窗口确实在当前显示列表里时才记为焦点锚点。
+// 未显示的 CG surface(Ghostty 单窗口双 tab 的另一个 tab)不锚定,否则首帧匹配失败,
+// 造成「切到 tab A 却显示 tab B」的内容跳变。
+// Bump (pid, cgwid) into MRU, anchoring the focus key only when the window is actually shown
+// in the current display list. An undisplayed CG surface (the other Ghostty tab of a
+// single-window multi-tab app) is never anchored, so the first frame cannot mismatch and show
+// "switched to tab A but tab B appears". Caller must hold TAB_STATE.
+fn best_effort_bump_focus_key(state: &mut AppState, pid: i32, cgwid: u32) {
+    bump_window_mru(&mut state.mru, pid, cgwid);
+    let shown = state
+        .windows
+        .iter()
+        .any(|window| window.pid == pid && window.window_id == cgwid);
+    if shown {
+        state.focus_key = Some((pid, cgwid));
+    }
+}
+
+/// 诊断:打印当前窗口排序 + 选中标记。`>` = 当前选中项,`*` = active(前台代理)项。
+/// 排序列与 select 位置同时可见,便于定位「Command+Tab 一次却漂移一格」类问题。
+/// Diagnostic: print the window ordering plus the selection marker. `>` = the currently
+/// selected entry, `*` = the active (frontmost proxy) entry. Order and selection position are
+/// both visible, which makes a one-press-Tab-drifts-a-slot bug easy to pinpoint.
+pub(crate) fn log_window_ordering(
+    label: &str,
+    windows: &[WindowInfo],
+    mru: &MruMap,
+    selected: usize,
+) {
+    log_debug!(
+        "[order] {}: {} windows (selected={})",
+        label,
+        windows.len(),
+        selected
+    );
+    for (i, w) in windows.iter().enumerate() {
+        let mru_ms = mru
+            .get(&(w.pid, w.window_id))
+            .map(|t| t.elapsed().as_millis());
+        let selected_mark = if i == selected { ">" } else { " " };
+        let active_mark = if w.is_active { "*" } else { " " };
+        log_debug!(
+            "  {}{} pid={} app=\"{}\" cgwid={} title=\"{}\" mru_ms={:?}",
+            selected_mark,
+            active_mark,
+            w.pid,
+            w.app_name,
+            w.window_id,
+            w.window_title,
+            mru_ms
+        );
     }
 }
 
@@ -416,19 +757,7 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
         // MRU, and async queries use it to reject stale results. Existing windows are never
         // updated together from this app-level timestamp.
         let activated_at = note_app_activated(pid);
-        let window_ids: Vec<u32> = TAB_STATE
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|state| {
-                state
-                    .windows
-                    .iter()
-                    .filter(|window| window.pid == pid)
-                    .map(|window| window.window_id)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let window_ids = window_server::window_ids_for_pid(pid);
         window_server::begin_activation(pid, &window_ids, activated_at);
         // 后台线程解析焦点窗口的 CGWindowID 并 bump 窗口级 MRU。
         // 系统 Cmd+Tab / Dock 点击等外部焦点切换通过此路径反馈到窗口排序中。
@@ -510,7 +839,12 @@ fn resolve_activation_focus(task: ActivationFocusTask) {
                 }
                 let mut state_opt = TAB_STATE.lock().unwrap();
                 if let Some(ref mut state) = *state_opt {
-                    bump_window_mru(&mut state.mru, task.pid, cgwid);
+                    // 同 on_window_server_event:AX 查到的窗口只有确实在显示列表里才记 focus_key,
+                    // 避免未确认的 CG surface 污染焦点锚点。
+                    // Same guard as on_window_server_event: anchor the focus key only when the
+                    // AX-resolved window is actually shown, so an unconfirmed CG surface cannot
+                    // poison the focus anchor.
+                    best_effort_bump_focus_key(state, task.pid, cgwid);
                     log_debug!(
                         "app-activated bump: pid={} cgwid={} attempt={}",
                         task.pid,
@@ -606,6 +940,12 @@ extern "C" fn on_app_terminated(_self: *mut c_void, _cmd: Sel, notification: *mu
         note_app_terminated(pid);
         if let Some(ref mut state) = *TAB_STATE.lock().unwrap() {
             let removed = remove_pid_mru(&mut state.mru, pid);
+            if state
+                .focus_key
+                .is_some_and(|(focus_pid, _)| focus_pid == pid)
+            {
+                state.focus_key = None;
+            }
             if removed > 0 {
                 log_debug!(
                     "app-terminated MRU cleanup: pid={} removed={}",
@@ -1732,19 +2072,8 @@ fn main() {
     // create large numbers of threads.
     start_activation_focus_scheduler();
     window_server::start();
-    let initial_subscription_ids: Vec<u32> = TAB_STATE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|state| {
-            state
-                .windows
-                .iter()
-                .map(|window| window.window_id)
-                .collect()
-        })
-        .unwrap_or_default();
-    window_server::update_subscriptions(&initial_subscription_ids);
+    let initial_subscriptions = window_collector::window_server_candidates();
+    window_server::update_subscriptions(&initial_subscriptions);
 
     // 6b. Listen for system app activation so MRU stays in sync
     // when the user switches apps via Dock, Cmd+Tab, etc.
@@ -1948,7 +2277,21 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::WindowRefreshReason;
+    use super::{merge_refreshed_windows, selection_index_after_refresh, WindowRefreshReason};
+    use crate::window_collector::WindowInfo;
+
+    fn window(pid: i32, window_id: u32) -> WindowInfo {
+        WindowInfo {
+            pid,
+            window_id,
+            app_name: format!("App {pid}"),
+            window_title: format!("Window {window_id}"),
+            icon_path: None,
+            is_active: false,
+            minimized: false,
+            bounds: (0.0, 0.0, 100.0, 100.0),
+        }
+    }
 
     #[test]
     fn lifecycle_refresh_does_not_bump_frontmost() {
@@ -1969,6 +2312,93 @@ mod tests {
         assert_eq!(
             WindowRefreshReason::Summon.merge(WindowRefreshReason::Lifecycle),
             WindowRefreshReason::Summon
+        );
+    }
+
+    #[test]
+    fn focused_refresh_replaces_only_the_target_pid() {
+        let existing = vec![window(10, 100), window(20, 200), window(10, 101)];
+        let refreshed = vec![window(10, 102), window(10, 103)];
+
+        let merged = merge_refreshed_windows(&existing, Some(10), refreshed);
+        let keys: Vec<(i32, u32)> = merged
+            .iter()
+            .map(|window| (window.pid, window.window_id))
+            .collect();
+
+        assert_eq!(keys, vec![(20, 200), (10, 102), (10, 103)]);
+    }
+
+    #[test]
+    fn full_refresh_is_ax_authoritative() {
+        let existing = vec![window(10, 100), window(20, 200)];
+        let refreshed = vec![window(20, 200)];
+
+        let merged = merge_refreshed_windows(&existing, None, refreshed);
+        let keys: Vec<(i32, u32)> = merged
+            .iter()
+            .map(|window| (window.pid, window.window_id))
+            .collect();
+
+        assert_eq!(keys, vec![(20, 200)]);
+    }
+
+    #[test]
+    fn known_window_is_removed_when_its_cg_window_is_gone() {
+        let existing = vec![window(10, 100), window(20, 200)];
+        let refreshed = vec![window(20, 200)];
+
+        let merged = merge_refreshed_windows(&existing, None, refreshed);
+        let keys: Vec<(i32, u32)> = merged
+            .iter()
+            .map(|window| (window.pid, window.window_id))
+            .collect();
+
+        assert_eq!(keys, vec![(20, 200)]);
+    }
+
+    #[test]
+    fn minimized_known_window_is_not_retained_when_hidden_windows_are_disabled() {
+        let mut minimized = window(10, 100);
+        minimized.minimized = true;
+        let existing = vec![minimized];
+
+        let merged = merge_refreshed_windows(&existing, None, Vec::new());
+
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn focused_refresh_drops_omitted_sibling() {
+        let existing = vec![window(10, 100), window(10, 101), window(20, 200)];
+        let refreshed = vec![window(10, 102)];
+
+        let merged = merge_refreshed_windows(&existing, Some(10), refreshed);
+        let keys: Vec<(i32, u32)> = merged
+            .iter()
+            .map(|window| (window.pid, window.window_id))
+            .collect();
+
+        assert_eq!(keys, vec![(20, 200), (10, 102)]);
+    }
+
+    #[test]
+    fn refresh_selection_follows_the_exact_window_key_after_reordering() {
+        let windows = vec![window(20, 200), window(10, 100), window(10, 101)];
+
+        assert_eq!(
+            selection_index_after_refresh(Some((10, 101)), 0, &windows),
+            2
+        );
+    }
+
+    #[test]
+    fn refresh_selection_keeps_the_previous_slot_when_the_key_is_gone() {
+        let windows = vec![window(20, 200), window(10, 100)];
+
+        assert_eq!(
+            selection_index_after_refresh(Some((10, 999)), 3, &windows),
+            1
         );
     }
 }

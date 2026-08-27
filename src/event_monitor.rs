@@ -23,6 +23,7 @@ pub enum GlobalEvent {
 // 窗口切换专用常量 / window-switcher-specific constants
 const K_CG_EVENT_KEY_DOWN: crate::event_tap::CGEventType = 10;
 const K_CG_EVENT_FLAGS_CHANGED: crate::event_tap::CGEventType = 12;
+const K_CG_KEYBOARD_EVENT_AUTOREPEAT: i32 = 8;
 const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
 const K_CG_EVENT_FLAG_MASK_COMMAND: crate::event_tap::CGEventFlags = 0x00100000;
 const K_CG_EVENT_FLAG_MASK_ALTERNATE: crate::event_tap::CGEventFlags = 0x00080000;
@@ -41,6 +42,12 @@ fn switcher_tab_event(flags: crate::event_tap::CGEventFlags) -> GlobalEvent {
     } else {
         GlobalEvent::CmdTabPressed
     }
+}
+
+/// 只忽略系统对同一次 Tab 按住产生的重复事件;独立的实体按键仍可连续导航。
+/// Ignore only the system-generated repeat for one held Tab; separate physical presses still navigate continuously.
+fn should_ignore_tab_autorepeat(autorepeat: i64) -> bool {
+    autorepeat != 0
 }
 
 // 标记是否已经发送过 CmdTabPressed，防止修饰键变化时误发 CmdReleased
@@ -95,6 +102,16 @@ unsafe extern "C" fn event_tap_callback(
                     {
                         log_debug!("[kbd] Tab+Command passthrough (switcher disabled)");
                         return event;
+                    }
+                    let autorepeat = crate::event_tap::CGEventGetIntegerValueField(
+                        event,
+                        K_CG_KEYBOARD_EVENT_AUTOREPEAT,
+                    );
+                    if should_ignore_tab_autorepeat(autorepeat) {
+                        // 重复事件必须吞掉而不是透传,否则系统原生 Cmd+Tab 会与本应用同时响应。
+                        // Repeat events must be swallowed rather than passed through, or the system's native Cmd+Tab responds alongside us.
+                        log_debug!("[kbd] summon autorepeat ignored");
+                        return std::ptr::null_mut();
                     }
                     // 召唤组合:只打组合名(不敏感),不打键码/修饰位细节。
                     // The summon combo: log only the combo name (not sensitive), never raw keycode/flags.
@@ -220,5 +237,11 @@ mod tests {
             switcher_tab_event(K_CG_EVENT_FLAG_MASK_SHIFT | K_CG_EVENT_FLAG_MASK_COMMAND),
             GlobalEvent::CmdShiftTabPressed
         );
+    }
+
+    #[test]
+    fn only_autorepeat_tab_events_are_ignored() {
+        assert!(!should_ignore_tab_autorepeat(0));
+        assert!(should_ignore_tab_autorepeat(1));
     }
 }

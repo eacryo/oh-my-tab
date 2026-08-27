@@ -24,10 +24,12 @@ use crate::ffi::*;
 use crate::i18n::t;
 use crate::theme::*;
 use crate::window_collector::{
-    bump_window_mru, extract_icon_to_cache, raise_ax_window, WindowInfo,
+    bump_window_mru, extract_icon_to_cache, raise_ax_window, sort_windows_by_mru, MruMap,
+    WindowInfo,
 };
 use crate::window_server;
 // 跨模块共享状态(由 main.rs 持有,这里读写)/ cross-module shared state (owned by main.rs)
+use crate::AppState;
 use crate::TAB_STATE;
 use crate::{log_debug, log_info, request_window_refresh};
 
@@ -454,6 +456,75 @@ fn horizontal_nav_index(selected: usize, len: usize, backward: bool) -> usize {
     }
 }
 
+/// 首次召唤前先把缓存数组同步到最新 MRU,并用前台 PID 找到当前窗口代理。
+/// 若前台窗口因 AX 暂时漏报而没有卡片,正向切换从第 0 项开始,避免把旧的同 App 卡片
+/// 当成“下一个窗口”。
+/// 如果有上次精确焦点 key,优先按 `(pid,cgwid)` 匹配;精确窗口缺失时不再拿同 App 的其他窗口冒充当前窗口。
+/// Sort the cached array by the latest MRU and use the exact `(pid,cgwid)` focus key when available.
+/// If AX temporarily omitted that exact window, forward navigation starts at index 0 instead of
+/// treating a stale same-app card as the current window.
+fn prepare_first_summon(
+    windows: &mut [WindowInfo],
+    mru: &mut MruMap,
+    backward: bool,
+    frontmost_pid: Option<i32>,
+    focus_key: Option<(i32, u32)>,
+    now: Instant,
+) -> usize {
+    // 首帧先把当前前台窗口写回 MRU,使首帧顺序与随后后台刷新(summon-bump 也会
+    // 写回前台窗口)一致,消除「旧序 → 重排」的翻转那一下。只对前台 pid 精确匹配
+    // 的 focus_key 写回;窗口缺失时回退到前台 pid 的代表窗口。
+    // Bump the frontmost window into MRU before the first frame so the initial ordering
+    // matches the subsequent background refresh (whose summon-bump also writes the frontmost
+    // window back) -- removing the visible re-order flank. Only write back when the exact
+    // focus key (or the frontmost pid's representative window) is present.
+    if let Some((pid, window_id)) = focus_key.or_else(|| {
+        frontmost_pid.and_then(|pid| {
+            windows
+                .iter()
+                .find(|w| w.pid == pid)
+                .map(|w| (w.pid, w.window_id))
+        })
+    }) {
+        bump_window_mru(mru, pid, window_id);
+    }
+
+    sort_windows_by_mru(windows, mru, now);
+
+    for window in windows.iter_mut() {
+        window.is_active = false;
+    }
+    let frontmost_index = match focus_key {
+        Some(key) => windows
+            .iter()
+            .position(|window| (window.pid, window.window_id) == key)
+            .or_else(|| frontmost_pid.and_then(|pid| windows.iter().position(|w| w.pid == pid))),
+        None => frontmost_pid.and_then(|pid| windows.iter().position(|w| w.pid == pid)),
+    };
+    if let Some(index) = frontmost_index {
+        // 有精确 key 时只把同一张窗口置首,避免同 App 的错误兄弟窗口成为当前窗口代理。
+        // With an exact key, move only that window first so a wrong same-app sibling cannot act as the proxy.
+        windows.swap(0, index);
+        windows[0].is_active = true;
+    } else if frontmost_pid.is_none() {
+        // 无法取得前台 PID 时保留排序后的首项作为屏幕定位代理。
+        // If the frontmost PID is unavailable, retain the sorted first item as the screen proxy.
+        if let Some(first) = windows.first_mut() {
+            first.is_active = true;
+        }
+    }
+
+    if backward {
+        windows.len().saturating_sub(1)
+    } else if frontmost_pid.is_some() && frontmost_index.is_none() {
+        0
+    } else if windows.len() > 1 {
+        1
+    } else {
+        0
+    }
+}
+
 /// 窗口没有标题时(如 Microsoft To Do,AXTitle 为空)回退显示应用名。
 /// 注意:仅用于显示。内部 `window_title` 仍保持空串,这样 raise_ax_window 仍能
 /// 按空标题匹配到对应的 AX 窗口并聚焦。
@@ -475,12 +546,15 @@ mod tests {
     use super::display_title;
     use super::edge_row_nav_index;
     use super::horizontal_nav_index;
+    use super::prepare_first_summon;
     use super::scroll_start_for_selection;
     use super::thumbnail_scroll_offset_for_drag;
     use super::thumbnail_scroller_alpha;
     use super::thumbnail_scroller_geometry;
     use super::thumbnail_scroller_knob_contains;
     use super::vertical_nav_index;
+    use crate::window_collector::{MruMap, WindowInfo};
+    use std::time::Instant;
 
     /// 构造一行卡片的 rects:y 固定,x 依次排开(宽 100 间距 10)。
     /// Build one row of rects: fixed y, sequential x (width 100, gap 10).
@@ -566,6 +640,157 @@ mod tests {
         assert_eq!(horizontal_nav_index(4, 5, true), 3);
         assert_eq!(horizontal_nav_index(0, 5, true), 4);
         assert_eq!(horizontal_nav_index(0, 0, true), 0);
+    }
+
+    #[test]
+    fn first_summon_reorders_before_selecting_the_next_window() {
+        fn window(pid: i32, window_id: u32) -> WindowInfo {
+            WindowInfo {
+                pid,
+                window_id,
+                app_name: format!("App {pid}"),
+                window_title: format!("Window {window_id}"),
+                icon_path: None,
+                is_active: false,
+                minimized: false,
+                bounds: (0.0, 0.0, 100.0, 100.0),
+            }
+        }
+
+        let now = Instant::now();
+        let mut mru = MruMap::new();
+        mru.insert((1, 100), now - std::time::Duration::from_secs(2));
+        mru.insert((2, 200), now - std::time::Duration::from_secs(1));
+        let mut windows = vec![window(1, 100), window(2, 200)];
+
+        let selected = prepare_first_summon(&mut windows, &mut mru, false, Some(2), None, now);
+
+        assert_eq!((windows[0].pid, windows[0].window_id), (2, 200));
+        assert_eq!((windows[1].pid, windows[1].window_id), (1, 100));
+        assert_eq!(selected, 1);
+        assert_eq!(
+            (windows[selected].pid, windows[selected].window_id),
+            (1, 100)
+        );
+        assert!(windows[0].is_active);
+        assert!(!windows[1].is_active);
+    }
+
+    #[test]
+    fn first_summon_starts_at_zero_when_frontmost_card_is_missing() {
+        fn window(pid: i32, window_id: u32) -> WindowInfo {
+            WindowInfo {
+                pid,
+                window_id,
+                app_name: format!("App {pid}"),
+                window_title: format!("Window {window_id}"),
+                icon_path: None,
+                is_active: true,
+                minimized: false,
+                bounds: (0.0, 0.0, 100.0, 100.0),
+            }
+        }
+
+        let now = Instant::now();
+        let mut mru = MruMap::new();
+        mru.insert((1, 100), now - std::time::Duration::from_secs(2));
+        mru.insert((2, 200), now - std::time::Duration::from_secs(1));
+        let mut windows = vec![window(1, 100), window(2, 200)];
+
+        let selected = prepare_first_summon(&mut windows, &mut mru, false, Some(9), None, now);
+
+        assert_eq!(selected, 0);
+        assert_eq!((windows[0].pid, windows[0].window_id), (2, 200));
+        assert!(!windows.iter().any(|window| window.is_active));
+    }
+
+    #[test]
+    fn first_summon_keeps_last_card_for_reverse_navigation() {
+        fn window(pid: i32, window_id: u32) -> WindowInfo {
+            WindowInfo {
+                pid,
+                window_id,
+                app_name: format!("App {pid}"),
+                window_title: format!("Window {window_id}"),
+                icon_path: None,
+                is_active: false,
+                minimized: false,
+                bounds: (0.0, 0.0, 100.0, 100.0),
+            }
+        }
+
+        let now = Instant::now();
+        let mut windows = vec![window(1, 100), window(2, 200)];
+        let selected =
+            prepare_first_summon(&mut windows, &mut MruMap::new(), true, Some(9), None, now);
+
+        assert_eq!(selected, windows.len() - 1);
+    }
+
+    #[test]
+    fn first_summon_uses_exact_focus_key_not_same_pid_proxy() {
+        fn window(pid: i32, window_id: u32) -> WindowInfo {
+            WindowInfo {
+                pid,
+                window_id,
+                app_name: format!("App {pid}"),
+                window_title: format!("Window {window_id}"),
+                icon_path: None,
+                is_active: false,
+                minimized: false,
+                bounds: (0.0, 0.0, 100.0, 100.0),
+            }
+        }
+
+        let now = Instant::now();
+        let mut mru = MruMap::new();
+        mru.insert((1, 100), now - std::time::Duration::from_secs(2));
+        mru.insert((1, 101), now - std::time::Duration::from_secs(1));
+        let mut windows = vec![window(1, 100), window(1, 101)];
+
+        let selected =
+            prepare_first_summon(&mut windows, &mut mru, false, Some(1), Some((1, 101)), now);
+
+        assert_eq!((windows[0].pid, windows[0].window_id), (1, 101));
+        assert_eq!(selected, 1);
+        assert_eq!(
+            (windows[selected].pid, windows[selected].window_id),
+            (1, 100)
+        );
+    }
+
+    #[test]
+    fn first_summon_falls_back_to_frontmost_pid_window_when_exact_key_is_missing() {
+        fn window(pid: i32, window_id: u32) -> WindowInfo {
+            WindowInfo {
+                pid,
+                window_id,
+                app_name: format!("App {pid}"),
+                window_title: format!("Window {window_id}"),
+                icon_path: None,
+                is_active: true,
+                minimized: false,
+                bounds: (0.0, 0.0, 100.0, 100.0),
+            }
+        }
+
+        let now = Instant::now();
+        let mut windows = vec![window(1, 100), window(1, 101)];
+        let mut mru = MruMap::new();
+
+        let selected =
+            prepare_first_summon(&mut windows, &mut mru, false, Some(1), Some((1, 999)), now);
+
+        // focus_key=(1,999) 不在列表,回退到前台 pid(1) 的代表窗口 (1,100):置首、标记 active,
+        // 选中跳到下一张。没有「精确窗口缺失就停在 0 无高亮」的僵死态。
+        // focus_key=(1,999) is missing, so we fall back to the frontmost pid's (1) representative
+        // window (1,100): moved to the front and marked active, selection advances to the next
+        // card. This removes the "exact window missing -> stuck at index 0 with no highlight"
+        // dead state.
+        assert_eq!(selected, 1);
+        assert_eq!((windows[0].pid, windows[0].window_id), (1, 100));
+        assert!(windows[0].is_active);
+        assert!(!windows[1].is_active);
     }
 
     #[test]
@@ -712,44 +937,120 @@ pub(crate) unsafe fn make_centered_label(
 
 // ========== ObjC 回调实现 / ObjC callback implementations ==========
 
-fn step_switcher(backward: bool) {
-    // TIMING-DEBUG 端到端计时:tap 回调 → collect → show_overlay(定位卡顿段)。
-    let t_end = Instant::now();
+/// 首帧一次性显示:用当前(已刷新的)窗口列表做首次选中并弹出浮窗。
+/// 由 apply_window_refresh 在消费 pending_first_show 时调用,保证「一次成图」——
+/// 显示的就是刷新后的最终排序,不存在「先显示旧快照、再重排」的两段跳变。
+/// First-frame single-shot show: pick the initial selection over the (refreshed) window list and
+/// pop the overlay. Called by apply_window_refresh when it consumes pending_first_show so the
+/// render is single-shot — the shown order is already the final one, no "stale then reorder" jump.
+pub(crate) fn show_first_summon(backward: bool) {
     let mut state_opt = TAB_STATE.lock().unwrap();
-    let first_show = !state_opt.as_ref().unwrap().visible;
+    let state = state_opt.as_mut().unwrap();
+    state.visible = true;
+    let (_, frontmost_pid) = frontmost_app_info();
+    let frontmost_pid = (frontmost_pid > 0).then_some(frontmost_pid);
+    let focus_key = state
+        .focus_key
+        .filter(|(pid, _)| frontmost_pid == Some(*pid));
+    state.selected = prepare_first_summon(
+        &mut state.windows,
+        &mut state.mru,
+        backward,
+        frontmost_pid,
+        focus_key,
+        Instant::now(),
+    );
+    // 记录召唤瞬间的窗口 key 集合:浮窗打开后的刷新只知道哪些窗口「召唤时就在场」。
+    state.summon_keys = Some(state.windows.iter().map(|w| (w.pid, w.window_id)).collect());
+    // 首帧默认选中:锁定到「召唤时选中的目标窗口」,刷新不因 MRU 排序变化改选。
+    state.user_picked = false;
+    state.selected_target_key = state
+        .windows
+        .get(state.selected)
+        .map(|w| (w.pid, w.window_id));
+    log_debug!(
+        "[overlay] first summon: frontmost_pid={:?} focus_key={:?} selected={} windows={}",
+        frontmost_pid,
+        focus_key,
+        state.selected,
+        state.windows.len()
+    );
+    crate::log_window_ordering(
+        "first summon order",
+        &state.windows,
+        &state.mru,
+        state.selected,
+    );
+    drop(state_opt);
+    reset_thumbnail_visible_range();
+    reset_thumbnail_scroll();
+    reset_thumbnail_nav_anchor();
+    MOUSE_MOVED.store(false, Ordering::Relaxed);
+    *HOVER_TICK_POS.lock().unwrap() = None;
+    let t_show = Instant::now();
+    show_overlay();
+    // TIMING-DEBUG 端到端:tap 回调 → 收集完成 → show_overlay。
+    log_debug!("[overlay] summon e2e={}ms", t_show.elapsed().as_millis());
+}
+
+fn step_switcher(backward: bool) {
+    let mut state_opt = TAB_STATE.lock().unwrap();
+    let state_ref = state_opt.as_ref().unwrap();
+    let pending = state_ref.pending_first_show;
+    let first_show = !state_ref.visible && !pending;
+
+    if pending {
+        // 首帧快照仍在后台收集:本次浮窗尚未显示,重复 Tab 无法基于旧快照定位,先忽略,
+        // 等 apply_window_refresh 一次性显示后再由用户续按。
+        // The first snapshot is still being collected: the overlay isn't shown yet, so another Tab
+        // can't be positioned over the stale list — ignore it; let the user continue once the
+        // single-shot show lands.
+        log_debug!("[overlay] re-Tab during pending first show ignored");
+        return;
+    }
 
     if first_show {
+        // 首帧:不再先显示旧快照,而是发起后台刷新并标记「待显示」,等 apply_window_refresh
+        // 拿到首帧快照后一次性显示(一次成图)。注意:发起刷新必须释放 TAB_STATE 锁,否则
+        // request_window_refresh 内部同样要锁 TAB_STATE,造成自死锁(主线程永远阻塞)。
+        // First frame: don't show the stale startup snapshot first. Kick off a background refresh
+        // and mark pending_first_show; apply_window_refresh consumes it and shows once the first
+        // snapshot is ready (single-shot render). NB: the refresh must be kicked off AFTER dropping
+        // TAB_STATE, otherwise request_window_refresh re-locks it and deadlocks the main thread.
         drop(state_opt);
-        // 先显示启动时的快照，再后台收集最新窗口，避免 AX 查询阻塞快捷键响应。
-        // Show the startup snapshot first, then collect current windows in the background so
-        // AX queries never block shortcut handling.
         request_window_refresh();
-        state_opt = TAB_STATE.lock().unwrap();
+        let mut state_opt = TAB_STATE.lock().unwrap();
         let state = state_opt.as_mut().unwrap();
-        state.visible = true;
-        state.selected = if backward {
-            state.windows.len().saturating_sub(1)
-        } else if state.windows.len() > 1 {
-            1
-        } else {
-            0
-        };
+        state.visible = false;
+        state.pending_first_show = true;
+        state.pending_first_backward = backward;
+        // TIMING-DEBUG 端到端:tap 回调 → 收集完成 → show_first_summon。
+        log_debug!("[overlay] first summon pending (awaiting snapshot)");
         drop(state_opt);
-        reset_thumbnail_visible_range();
-        reset_thumbnail_scroll();
-        reset_thumbnail_nav_anchor();
-        MOUSE_MOVED.store(false, Ordering::Relaxed);
-        *HOVER_TICK_POS.lock().unwrap() = None;
-        show_overlay();
-        // TIMING-DEBUG 端到端:tap 回调 → collect_windows → show_overlay 完成。
-        log_debug!("[overlay] summon e2e={}ms", t_end.elapsed().as_millis());
     } else {
+        // 用户主动导航(重复按 Tab):选中不再是首帧默认落点,标记 user_picked 并钉住当前目标。
+        // User-initiated navigation (repeated Tab): the pick is no longer the first-frame default;
+        // mark user_picked and pin to the current target.
         let state = state_opt.as_mut().unwrap();
         state.selected = horizontal_nav_index(state.selected, state.windows.len(), backward);
+        mark_user_picked(state);
         drop(state_opt);
         reset_thumbnail_nav_anchor();
         refresh_after_selection_change(true);
     }
+}
+
+/// 用户主动改变了选中(导航/点击/悬停):标记 user_picked 并钉住当前选中窗口 key。
+/// 此后刷新将按该目标窗口恢复选中,再也不随列表重排漂移。调用方须已持有 TAB_STATE。
+/// User actively changed the selection (nav/click/hover): mark user_picked and pin to the newly
+/// selected window key. Subsequent refreshes restore the pick to that target instead of drifting
+/// with a reorder. Caller must already hold TAB_STATE.
+fn mark_user_picked(state: &mut AppState) {
+    state.user_picked = true;
+    state.selected_target_key = state
+        .windows
+        .get(state.selected)
+        .map(|w| (w.pid, w.window_id));
 }
 
 pub(crate) extern "C" fn on_cmd_tab_pressed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -844,6 +1145,7 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         // no stash/restore machinery.
         activate_and_raise(pid, cgwid);
         schedule_delayed_order_out();
+        state.focus_key = Some((pid, cgwid));
         bump_window_mru(&mut state.mru, pid, cgwid);
         log_debug!(
             "commit: pid={} app=\"{}\" cgwid={} title=\"{}\" selected={}",
@@ -944,6 +1246,7 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
         // Same as on_cmd_released: no settings-window handling needed (see comment there).
         activate_and_raise(pid, cgwid);
         schedule_delayed_order_out();
+        state.focus_key = Some((pid, cgwid));
         bump_window_mru(&mut state.mru, pid, cgwid);
         state.visible = false;
     } else {
@@ -973,6 +1276,7 @@ pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _even
     let state = state_opt.as_mut().unwrap();
     if state.selected != idx {
         state.selected = idx;
+        mark_user_picked(state);
         drop(state_opt);
         reset_thumbnail_nav_anchor();
         refresh_highlight();
@@ -1100,6 +1404,7 @@ unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool
     };
     if let Some(index) = vertical_nav_index(rects, state.selected, up, anchor_x) {
         state.selected = index;
+        mark_user_picked(state);
         drop(state_opt);
         if ensure_thumbnail_selection_visible(index) {
             apply_thumbnail_scroll_offset();
@@ -1161,6 +1466,7 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 if !state.windows.is_empty() {
                     state.selected =
                         horizontal_nav_index(state.selected, state.windows.len(), shift_pressed);
+                    mark_user_picked(state);
                     drop(state_opt);
                     reset_thumbnail_nav_anchor();
                     refresh_after_selection_change(false);
@@ -1170,6 +1476,7 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 if !state.windows.is_empty() {
                     state.selected =
                         horizontal_nav_index(state.selected, state.windows.len(), false);
+                    mark_user_picked(state);
                     drop(state_opt);
                     reset_thumbnail_nav_anchor();
                     refresh_after_selection_change(false);
@@ -1179,6 +1486,7 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 if !state.windows.is_empty() {
                     state.selected =
                         horizontal_nav_index(state.selected, state.windows.len(), true);
+                    mark_user_picked(state);
                     drop(state_opt);
                     reset_thumbnail_nav_anchor();
                     refresh_after_selection_change(false);
@@ -1216,6 +1524,7 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                     // Same as on_cmd_released: no settings-window handling needed.
                     activate_and_raise(pid, cgwid);
                     schedule_delayed_order_out();
+                    state.focus_key = Some((pid, cgwid));
                     bump_window_mru(&mut state.mru, pid, cgwid);
                 } else {
                     // 空窗口/选中越界:无目标,直接收起浮窗(防御,与 on_cmd_released 一致)。

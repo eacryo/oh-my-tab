@@ -69,6 +69,34 @@ static ACTIVATIONS: LazyLock<Mutex<HashMap<i32, ActivationState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static OWN_FOCUS_INTENT: LazyLock<Mutex<Option<OwnFocusIntent>>> =
     LazyLock::new(|| Mutex::new(None));
+// 监听索引与显示列表分离:CG 里暂时未被 AX 展示的窗口仍需能反查 owner PID。
+// Keep the observation index separate from the display list so CG windows temporarily omitted
+// by AX can still be resolved back to their owner PID.
+#[derive(Default)]
+struct WindowRegistry {
+    by_pid: HashMap<i32, HashSet<u32>>,
+    by_window: HashMap<u32, i32>,
+}
+
+static WINDOW_REGISTRY: LazyLock<Mutex<WindowRegistry>> =
+    LazyLock::new(|| Mutex::new(WindowRegistry::default()));
+
+fn registry_from_subscriptions(subscriptions: &[(u32, i32)]) -> WindowRegistry {
+    let mut by_window = HashMap::new();
+    for &(window_id, pid) in subscriptions {
+        if window_id != 0 && pid > 0 {
+            by_window.entry(window_id).or_insert(pid);
+        }
+    }
+    let mut registry = WindowRegistry {
+        by_pid: HashMap::new(),
+        by_window,
+    };
+    for (&window_id, &pid) in &registry.by_window {
+        registry.by_pid.entry(pid).or_default().insert(window_id);
+    }
+    registry
+}
 
 static MAIN_CONNECTION: LazyLock<Option<i32>> = LazyLock::new(|| unsafe {
     let handle = dlopen_path("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight");
@@ -304,16 +332,21 @@ pub(crate) fn ax_focus_backstop_allowed(pid: i32) -> bool {
     }
 }
 
-pub(crate) fn update_subscriptions(window_ids: &[u32]) {
+/// 更新 WindowServer 的监听集合，同时保存 PID -> 多窗口和 CGWindowID -> PID 索引。
+/// Update WindowServer subscriptions and retain both PID -> many windows and CGWindowID -> PID
+/// indexes.
+pub(crate) fn update_subscriptions(subscriptions: &[(u32, i32)]) {
+    let registry = registry_from_subscriptions(subscriptions);
+    let mut ids: Vec<u32> = registry.by_window.keys().copied().collect();
+    *WINDOW_REGISTRY.lock().unwrap() = registry;
+
     let Some(connection) = *MAIN_CONNECTION else {
         return;
     };
     let Some(request) = *REQUEST_NOTIFICATIONS else {
         return;
     };
-    let mut ids: Vec<u32> = window_ids.iter().copied().filter(|id| *id != 0).collect();
     ids.sort_unstable();
-    ids.dedup();
     let (window_ptr, window_count) = if ids.is_empty() {
         (std::ptr::null_mut(), 0)
     } else {
@@ -327,6 +360,28 @@ pub(crate) fn update_subscriptions(window_ids: &[u32]) {
             result
         );
     }
+}
+
+pub(crate) fn owner_for_window(window_id: u32) -> Option<i32> {
+    WINDOW_REGISTRY
+        .lock()
+        .unwrap()
+        .by_window
+        .get(&window_id)
+        .copied()
+}
+
+pub(crate) fn window_ids_for_pid(pid: i32) -> Vec<u32> {
+    let mut ids: Vec<u32> = WINDOW_REGISTRY
+        .lock()
+        .unwrap()
+        .by_pid
+        .get(&pid)
+        .into_iter()
+        .flat_map(|ids| ids.iter().copied())
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 pub(crate) fn drain_main() -> Vec<WindowServerEvent> {
@@ -343,6 +398,16 @@ pub(crate) fn drain_main() -> Vec<WindowServerEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_supports_many_windows_for_one_pid() {
+        let registry = registry_from_subscriptions(&[(0x1001, 10), (0x1002, 10), (0x2001, 20)]);
+
+        assert_eq!(registry.by_window.get(&0x1001), Some(&10));
+        assert_eq!(registry.by_window.get(&0x1002), Some(&10));
+        assert_eq!(registry.by_pid.get(&10).map(HashSet::len), Some(2));
+        assert_eq!(registry.by_window.get(&0x9999), None);
+    }
 
     #[test]
     fn external_activation_bumps_first_focus_and_ignores_raise_tail() {

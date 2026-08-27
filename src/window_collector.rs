@@ -90,6 +90,45 @@ pub(crate) fn sort_windows_by_mru(windows: &mut [WindowInfo], mru: &MruMap, now:
     windows.sort_by_key(|a| age(a.pid, a.window_id));
 }
 
+/// 枚举所有 layer 0 的 CG 窗口，专供 WindowServer 焦点监听使用。
+/// 这不是显示列表:AX 仍决定哪些窗口最终展示，监听集合只需要保守覆盖 owner PID。
+/// Enumerate every layer-0 CG window for WindowServer focus observation.
+/// This is not the display list: AX still decides what is shown, while observation conservatively
+/// covers every owner PID.
+pub(crate) fn window_server_candidates() -> Vec<(u32, i32)> {
+    unsafe {
+        let array = CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ALL, 0);
+        if array.is_null() {
+            return Vec::new();
+        }
+        let count = CFArrayGetCount(array);
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for i in 0..count {
+            let dict = CFArrayGetValueAtIndex(array, i);
+            if dict.is_null() || cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0 {
+                continue;
+            }
+            let pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+            let window_id = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+            if pid > 0 && window_id != 0 && seen.insert((window_id, pid)) {
+                candidates.push((window_id, pid));
+            }
+        }
+        CFRelease(array);
+        candidates
+    }
+}
+
+/// 从当前 CG 快照反查一个未订阅窗口的 owner PID，作为订阅索引失效时的兜底。
+/// Resolve an unindexed window's owner PID from a fresh CG snapshot when the subscription index
+/// cannot answer it.
+pub(crate) fn owner_pid_for_cgwid(window_id: u32) -> Option<i32> {
+    window_server_candidates()
+        .into_iter()
+        .find_map(|(candidate, pid)| (candidate == window_id).then_some(pid))
+}
+
 /// 修剪 MRU:删除不在存活窗口集里的条目(防 CGWindowID 复用继承旧时间戳),返回清理数。
 /// Prune MRU entries not in the live window set (prevents CGWindowID-reuse inheriting a dead
 /// timestamp); returns how many were dropped.
@@ -1423,6 +1462,180 @@ unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> A
     }
     let _: () = msg_send![pool, drain];
     partial
+}
+
+/// 只重新发现一个 PID 的窗口，用于 WindowServer 发现“未显示焦点窗口”后的定向刷新。
+/// AX 仍是显示权威，CG 只负责提供当前窗口几何信息和候选集合。
+/// Rediscover one PID's windows after WindowServer reports an undisplayed focused window.
+/// AX remains authoritative for display; CG only supplies current geometry and candidates.
+pub(crate) fn collect_windows_for_pid(
+    mru: &mut MruMap,
+    pid: i32,
+    focused_cgwid: u32,
+) -> Option<Vec<WindowInfo>> {
+    unsafe {
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        let result = collect_windows_for_pid_inner(mru, pid, focused_cgwid);
+        let _: () = msg_send![pool, drain];
+        result
+    }
+}
+
+unsafe fn collect_windows_for_pid_inner(
+    mru: &mut MruMap,
+    pid: i32,
+    focused_cgwid: u32,
+) -> Option<Vec<WindowInfo>> {
+    let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
+    let array = CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ALL, 0);
+    if array.is_null() {
+        return None;
+    }
+
+    let Some(ax_wins) = get_ax_windows_for_pid(pid) else {
+        CFRelease(array);
+        return None;
+    };
+    let ax_wid_to_info: HashMap<u32, (String, bool)> = ax_wins
+        .iter()
+        .filter_map(|(window_id, title, minimized)| {
+            (*window_id != 0).then_some((*window_id, (title.clone(), *minimized)))
+        })
+        .collect();
+    let titleless = !ax_wins.is_empty() && ax_wins.iter().all(|(_, title, _)| title.is_empty());
+    let identity = resolve_app_identity(pid);
+    let icon_path = check_cache_for_identity(&identity);
+    let last_activated = LAST_ACTIVATED.lock().unwrap().get(&pid).copied();
+    let now = Instant::now();
+    let ancient_base = now.checked_sub(Duration::from_secs(86_400)).unwrap_or(now);
+    let mut insertion_order = 0;
+    let mut app_name = String::new();
+    let mut shown = HashSet::new();
+    let mut current_cg_ids = HashSet::new();
+    let mut windows = Vec::new();
+    let count = CFArrayGetCount(array);
+
+    for i in 0..count {
+        let dict = CFArrayGetValueAtIndex(array, i);
+        if dict.is_null() || cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0 {
+            continue;
+        }
+        if cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0) <= 0.0 {
+            continue;
+        }
+        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+        if owner_pid != pid {
+            continue;
+        }
+        let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
+        if owner_name.is_empty() || owner_name == "Dock" {
+            continue;
+        }
+        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        if cgwid != 0 {
+            current_cg_ids.insert(cgwid);
+        }
+        let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let Some((window_title, minimized)) = ax_wid_to_info.get(&cgwid) else {
+            continue;
+        };
+        if pid == std::process::id() as i32
+            && !cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false)
+        {
+            continue;
+        }
+        if !show_minimized && *minimized {
+            continue;
+        }
+        if window_title.is_empty() && !titleless {
+            continue;
+        }
+
+        initialize_window_mru(
+            mru,
+            pid,
+            cgwid,
+            last_activated,
+            ancient_base,
+            insertion_order,
+        );
+        insertion_order += 1;
+        app_name = owner_name;
+        windows.push(WindowInfo {
+            pid,
+            window_id: cgwid,
+            app_name: app_name.clone(),
+            window_title: window_title.clone(),
+            icon_path: icon_path.clone(),
+            is_active: false,
+            minimized: *minimized,
+            bounds,
+        });
+        shown.insert(cgwid);
+    }
+    CFRelease(array);
+
+    // CGWindowList 里没有的 AX 窗口仍然是合法窗口,例如 orderOut 的设置对话框。
+    // AX-only windows remain valid, for example orderOut'd settings dialogs absent from CG.
+    if pid != std::process::id() as i32 {
+        for (&cgwid, (window_title, minimized)) in &ax_wid_to_info {
+            if shown.contains(&cgwid) || (!show_minimized && *minimized) {
+                continue;
+            }
+            if window_title.is_empty() && !titleless {
+                continue;
+            }
+            initialize_window_mru(
+                mru,
+                pid,
+                cgwid,
+                last_activated,
+                ancient_base,
+                insertion_order,
+            );
+            insertion_order += 1;
+            windows.push(WindowInfo {
+                pid,
+                window_id: cgwid,
+                app_name: app_name.clone(),
+                window_title: window_title.clone(),
+                icon_path: icon_path.clone(),
+                is_active: false,
+                minimized: *minimized,
+                bounds: (0.0, 0.0, 0.0, 0.0),
+            });
+        }
+    }
+
+    if app_name.is_empty() {
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        app_name = crate::ffi::ns_running_app_name(app);
+        if app_name.is_empty() {
+            app_name = format!("PID {pid}");
+        }
+        for window in &mut windows {
+            window.app_name = app_name.clone();
+        }
+    }
+
+    // 定向收集只清理目标 PID 的死亡窗口,不能修剪其他 PID 的 MRU。
+    // Directed collection prunes dead windows only for the target PID; it must not prune other PIDs.
+    // AX 暂时漏报时，当前 CG 仍存活的已知窗口不能丢掉 MRU 时间；否则它重新出现会像新窗口。
+    // Preserve MRU for known windows still alive in CG when AX transiently omits them; otherwise
+    // they return as "new" windows and lose their ordering history.
+    let live_ids: HashSet<u32> = current_cg_ids
+        .into_iter()
+        .chain(ax_wid_to_info.keys().copied())
+        .collect();
+    mru.retain(|(entry_pid, window_id), _| *entry_pid != pid || live_ids.contains(window_id));
+    sort_windows_by_mru(&mut windows, mru, now);
+    for window in &mut windows {
+        window.is_active = window.window_id == focused_cgwid;
+    }
+    Some(windows)
 }
 
 pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
