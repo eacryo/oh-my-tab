@@ -16,7 +16,7 @@ use std::ffi::CString;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
-use std::time::Instant; // TIMING-DEBUG
+use std::time::{Duration, Instant}; // TIMING-DEBUG
 
 use crate::config::{self, CONFIG};
 use crate::event_tap;
@@ -2166,7 +2166,7 @@ pub(crate) extern "C" fn on_deferred_scroll_hover(
 
 // ========== 窗口激活 / window activation ==========
 
-pub(crate) fn activate_pid(pid: i32) {
+pub(crate) fn activate_pid(pid: i32) -> bool {
     unsafe {
         let app: *mut AnyObject =
             msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
@@ -2178,34 +2178,82 @@ pub(crate) fn activate_pid(pid: i32) {
             // raise_ax_window's SLPS call raises the single target window, avoiding "all
             // same-app windows jump forward". activate still fires the activation notification
             // and updates LAST_ACTIVATED, so MRU ordering is unaffected.
-            let _: bool = msg_send![app, activateWithOptions: 0usize];
+            let activated: bool = msg_send![app, activateWithOptions: 0usize];
+            if !activated {
+                log_info!(
+                    "activate_pid: activateWithOptions returned false for pid {}",
+                    pid
+                );
+            }
+            activated
         } else {
             log_info!("activate_pid: no running app for pid {}", pid);
+            false
         }
     }
 }
+
+/// 激活/抬窗的同步重试间隔。正常路径只执行第一个 0ms 尝试；只有 WindowServer
+/// 尚未能按 PID 解析目标进程时才会短暂重试，覆盖应用切换通知与进程表更新之间的竞态。
+///
+/// Retry delays for the synchronous activate/raise path. The normal path performs only the
+/// first 0ms attempt; retries happen only when WindowServer cannot resolve the target process
+/// by PID, covering the race between app activation notifications and process-table updates.
+const RAISE_RETRY_DELAYS: [u64; 3] = [0, 8, 20];
 
 /// 激活 App 并把指定窗口抬到最前(用 CGWindowID 精确定位 + SLPS 只抬一个窗口)。
 /// Activate the app and raise the target window (located by CGWindowID + raised
 /// individually via SLPS, not all-windows).
 pub(crate) fn activate_and_raise(pid: i32, cgwid: u32) {
     window_server::note_own_focus(pid, cgwid);
-    let t0 = Instant::now();
-    activate_pid(pid);
-    let activate_ms = t0.elapsed().as_millis();
-    // 快速路径:SLPS 抬窗 + 合成点击(毫秒级,同步执行);AX 阶段交后台 raiser。
-    // Fast path: SLPS raise + synthetic click (millisecond-scale, synchronous); the AX
-    // phase goes to the background raiser.
-    let t1 = Instant::now();
-    let (slps_ok, click_ok) = raise_window_fast(pid, cgwid);
+    let raise_started = Instant::now();
+    let mut activate_ok = false;
+    let mut slps_ok = false;
+    let mut click_ok = false;
+    let mut attempts = 0;
+    let mut activate_ms = 0;
+    let mut fast_ms = 0;
+    for delay_ms in RAISE_RETRY_DELAYS {
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+        attempts += 1;
+        let activate_started = Instant::now();
+        activate_ok = activate_pid(pid);
+        activate_ms = activate_started.elapsed().as_millis();
+        // 快速路径:SLPS 抬窗 + 合成点击(毫秒级,同步执行);AX 阶段交后台 raiser。
+        // Fast path: SLPS raise + synthetic click (millisecond-scale, synchronous); the AX
+        // phase goes to the background raiser.
+        let fast_started = Instant::now();
+        (slps_ok, click_ok) = raise_window_fast(pid, cgwid);
+        fast_ms = fast_started.elapsed().as_millis();
+        if slps_ok && click_ok {
+            break;
+        }
+        if attempts < RAISE_RETRY_DELAYS.len() {
+            log_debug!(
+                "[raise] fast retry: pid={} cgwid={} attempt={} activate={}ms slps={} click={} next_delay={}ms",
+                pid,
+                cgwid,
+                attempts,
+                activate_ms,
+                slps_ok,
+                click_ok,
+                RAISE_RETRY_DELAYS[attempts]
+            );
+        }
+    }
     log_debug!(
-        "[raise] fast: pid={} cgwid={} activate={}ms slps_click={}ms slps={} click={}",
+        "[raise] fast: pid={} cgwid={} activate={}ms slps_click={}ms activate_ok={} slps={} click={} attempts={} total={}ms",
         pid,
         cgwid,
         activate_ms,
-        t1.elapsed().as_millis(),
+        fast_ms,
+        activate_ok,
         slps_ok,
-        click_ok
+        click_ok,
+        attempts,
+        raise_started.elapsed().as_millis()
     );
     raise_window_ax_async(pid, cgwid);
 }
