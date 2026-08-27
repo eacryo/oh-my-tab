@@ -1198,6 +1198,15 @@ pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32, fast_path_ok: bool) {
     });
 }
 
+fn fast_path_focus_verified(
+    fast_path_ok: bool,
+    is_minimized: Option<bool>,
+    focused_cgwid: Option<u32>,
+    target_cgwid: u32,
+) -> bool {
+    fast_path_ok && is_minimized != Some(true) && focused_cgwid == Some(target_cgwid)
+}
+
 fn run_raise_ax_job(job: RaiseJob) {
     if !raise_intent_current(job.generation) {
         log_debug!(
@@ -1291,22 +1300,49 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
                 None
             };
 
-            // 快速路径已经同时完成 WindowServer 抬窗和 key-window 点击时,正常窗口无需再
-            // AXRaise。这样避免目标 App 在两个抬升动作之间发生一次额外重绘。
-            // When the fast path already completed both the WindowServer raise and the
-            // key-window click, a normal window needs no AXRaise. This avoids an extra redraw
-            // between two raise operations in the target app.
+            // 快速路径的返回值只代表调用成功,不代表同一 App 内的目标窗口已经获得焦点。
+            // 读取 AXFocusedWindow 验证 cgwid,只有确实聚焦了目标窗口才跳过 AXRaise。
+            // The fast-path return values only mean the calls succeeded; they do not prove that
+            // the target window (rather than a sibling window in the same app) is focused.
+            // Verify AXFocusedWindow before skipping AXRaise.
             if job.fast_path_ok && is_minimized != Some(true) {
-                matched = true;
+                let mut focused_value: *const c_void = std::ptr::null();
+                let focused_err =
+                    AXUIElementCopyAttributeValue(app, focused_key, &mut focused_value);
+                let focused_cgwid = if focused_err == K_AX_SUCCESS && !focused_value.is_null() {
+                    let focused_cgwid = ax_window_cgwid(focused_value);
+                    CFRelease(focused_value);
+                    focused_cgwid
+                } else {
+                    None
+                };
+
+                if fast_path_focus_verified(
+                    job.fast_path_ok,
+                    is_minimized,
+                    focused_cgwid,
+                    job.cgwid,
+                ) {
+                    matched = true;
+                    log_debug!(
+                        "[raise] ax skipped after fast: pid={} cgwid={} focused_cgwid={:?} minimized={:?} waited={}ms total={}ms",
+                        job.pid,
+                        job.cgwid,
+                        focused_cgwid,
+                        is_minimized,
+                        job.enqueued_at.elapsed().as_millis(),
+                        started.elapsed().as_millis()
+                    );
+                    break;
+                }
+
                 log_debug!(
-                    "[raise] ax skipped after fast: pid={} cgwid={} minimized={:?} waited={}ms total={}ms",
+                    "[raise] fast focus mismatch: pid={} target_cgwid={} focused_cgwid={:?} ax_err={}",
                     job.pid,
                     job.cgwid,
-                    is_minimized,
-                    job.enqueued_at.elapsed().as_millis(),
-                    started.elapsed().as_millis()
+                    focused_cgwid,
+                    focused_err
                 );
-                break;
             }
 
             // 先还原最小化(若已最小化),否则 AXRaise 可能只是带到前面而仍停在 Dock。
@@ -2452,6 +2488,15 @@ pub fn cache_running_app_icons_small() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_path_skips_ax_only_for_the_focused_target() {
+        assert!(fast_path_focus_verified(true, Some(false), Some(42), 42));
+        assert!(!fast_path_focus_verified(true, Some(false), Some(41), 42));
+        assert!(!fast_path_focus_verified(true, Some(false), None, 42));
+        assert!(!fast_path_focus_verified(true, Some(true), Some(42), 42));
+        assert!(!fast_path_focus_verified(false, Some(false), Some(42), 42));
+    }
 
     #[test]
     fn raise_generation_supersedes_older_jobs() {
