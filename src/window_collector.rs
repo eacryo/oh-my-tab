@@ -1103,9 +1103,17 @@ pub(crate) fn close_ax_window(pid: i32, cgwid: u32) -> bool {
     }
 }
 
-pub fn raise_ax_window(pid: i32, cgwid: u32) {
+/// 抬升快速路径:WindowServer 层抬窗(SLPS)+ 合成点击确立 key window。
+/// 两者都是毫秒级调用,可安全在主线程同步执行;视觉上窗口在此步就已到最前。
+/// AX 阶段(焦点兜底/还原最小化)另见 raise_window_ax_async。返回 (slps 成功, 点击成功)。
+///
+/// Fast path of the raise: WindowServer-level raise (SLPS) plus the synthetic click that
+/// establishes the key window. Both are millisecond-scale calls, safe to run synchronously on
+/// the main thread -- visually the window is already frontmost after this step. The AX phase
+/// (focus backstop / minimize restore) lives in raise_window_ax_async. Returns (slps ok, click ok).
+pub(crate) fn raise_window_fast(pid: i32, cgwid: u32) -> (bool, bool) {
     if cgwid == 0 {
-        return;
+        return (false, false);
     }
     unsafe {
         // 1. WindowServer 层只抬这一个窗口（SkyLight 私有 API _SLPSSetFrontProcessWithOptions，
@@ -1116,72 +1124,189 @@ pub fn raise_ax_window(pid: i32, cgwid: u32) {
 
         // 1.5 合成鼠标点击确立 key window：SLPS 只负责「抬到前面 + 设为前台进程」，key 状态
         //    必须由这个合成点击授予（macOS 14+ 无公开 API 可跨 App 转移 key 焦点）。
-        //    顺序对齐 AltTab：SLPS → makeKeyWindow → AXRaise。失败不影响窗口抬起，仅记日志。
         //    The synthetic click establishes the key window: SLPS only fronts the window and
         //    process; the key state is granted by this click (macOS 14+ has no public API to
-        //    move key focus across apps). Order mirrors AltTab: SLPS → makeKeyWindow → AXRaise.
-        //    Failure doesn't stop the raise, it is only logged.
-        let _ = make_key_window(pid, cgwid);
+        //    move key focus across apps).
+        let click_ok = make_key_window(pid, cgwid);
+        (slps_ok, click_ok)
+    }
+}
 
-        // 2. AX 层聚焦该窗口：找到 CGWindowID 对应的 AX 窗口，setFocusedWindow + AXRaise。
-        //    Focus the window via AX: find the AX window with this CGWindowID, then
-        //    setFocusedWindow + AXRaise.
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            return;
-        }
+// ========== AX 阶段后台化(专职 raiser 线程) / background AX phase (dedicated raiser) ==========
 
-        let windows_key = cf_string_new("AXWindows");
-        let mut windows_array: *const c_void = std::ptr::null();
-        let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
-        CFRelease(windows_key);
-        if err != K_AX_SUCCESS || windows_array.is_null() {
-            CFRelease(app);
-            return;
-        }
+// 最新抬升意图代号:每次提交切换自增;后台任务在应用 AX 变更前重查,已被更新的切换
+// 取代就中止——快速连续切换时,旧任务绝不能把旧窗口又抬回新窗口上面(乱序回跳)。
+// Generation of the latest raise intent: bumped on every committed switch. Background jobs
+// re-check before applying AX mutations and abort once a newer switch supersedes them --
+// during rapid consecutive switches, a stale job must never re-raise an old window over the
+// newest one (out-of-order flicker).
+static RAISE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-        let count = CFArrayGetCount(windows_array);
-        let raise_key = cf_string_new("AXRaise");
-        let focused_key = cf_string_new("AXFocusedWindow");
-        let minimized_key = cf_string_new("AXMinimized");
-        let mut matched = false;
+fn raise_intent_current(generation: u64) -> bool {
+    RAISE_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation
+}
 
-        for i in 0..count {
-            let element = CFArrayGetValueAtIndex(windows_array, i);
-            if element.is_null() {
-                continue;
+struct RaiseJob {
+    pid: i32,
+    cgwid: u32,
+    generation: u64,
+    enqueued_at: Instant,
+}
+
+// 单一专职 raiser 线程:串行 FIFO 消费任务,保证两次切换的 AX 阶段不并发、
+// 完成顺序与提交顺序一致(配合 supersede 检查,最终状态永远是最后一次切换)。
+// A single dedicated raiser thread consumes jobs serially, so AX phases of consecutive
+// switches never overlap and completion order equals commit order (combined with the
+// supersede check, the final state is always the last switch).
+static RAISE_TX: std::sync::LazyLock<flume::Sender<RaiseJob>> = std::sync::LazyLock::new(|| {
+    let (tx, rx) = flume::unbounded::<RaiseJob>();
+    std::thread::Builder::new()
+        .name("ax-raiser".into())
+        .spawn(move || {
+            for job in rx.iter() {
+                run_raise_ax_job(job);
             }
-            if ax_window_cgwid(element) == Some(cgwid) {
-                // 先还原最小化(若已最小化),否则 AXRaise 可能只是带到前面而仍停在 Dock。
-                // Un-minimize first (if minimized); otherwise AXRaise may bring it forward
-                // without restoring from the Dock. Setting false on a non-minimized window is a no-op.
-                AXUIElementSetAttributeValue(element, minimized_key, kCFBooleanFalse);
-                AXUIElementSetAttributeValue(app, focused_key, element);
-                AXUIElementPerformAction(element, raise_key);
-                matched = true;
-                log_info!(
-                    "raise_ax_window: matched cgwid={} (slps={}), raised",
-                    cgwid,
-                    slps_ok
+        })
+        .expect("spawn ax-raiser thread");
+    tx
+});
+
+/// 提交后台 AX 抬升任务(枚举 + un-minimize + setFocused + AXRaise)。
+/// 由 activate_and_raise 在快速路径(SLPS + 合成点击)完成后调用:
+/// 窗口已在 WindowServer 层抬起,这里只补焦点与还原最小化——即使任务排队或超时,
+/// 切换本身也不受影响。AX 枚举对无响应 App 可能阻塞几十至上百毫秒,绝不能放主线程。
+///
+/// Enqueue the background AX raise (enumerate + un-minimize + setFocused + AXRaise).
+/// Called by activate_and_raise after the fast path (SLPS + synthetic click): the window is
+/// already raised at the WindowServer level and this only backfills focus and the minimize
+/// restore -- a queued or timed-out job never affects the switch itself. AX enumeration can
+/// block tens to hundreds of milliseconds on unresponsive apps; it must stay off the main thread.
+pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32) {
+    if cgwid == 0 {
+        return;
+    }
+    let generation = RAISE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+    let _ = RAISE_TX.send(RaiseJob {
+        pid,
+        cgwid,
+        generation,
+        enqueued_at: Instant::now(),
+    });
+}
+
+fn run_raise_ax_job(job: RaiseJob) {
+    if !raise_intent_current(job.generation) {
+        log_debug!(
+            "[raise] ax superseded before start: pid={} cgwid={} gen={}",
+            job.pid,
+            job.cgwid,
+            job.generation
+        );
+        return;
+    }
+    let started = Instant::now();
+    // 后台线程一律包 autorelease pool:当前只用 CF 对象,包一层防将来引入 ObjC 调用后泄漏。
+    // Always wrap background work in an autorelease pool: this path only touches CF objects
+    // today; the pool guards against leaks if ObjC calls are ever added.
+    unsafe {
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        raise_window_ax_job(&job, started);
+        let _: () = msg_send![pool, drain];
+    }
+}
+
+/// AX 阶段本体:枚举目标 App 的 AXWindows,按 CGWindowID 配对;应用变更前重查意图,
+/// 再执行 un-minimize + setFocused + AXRaise(顺序对齐 AltTab:SLPS → makeKey → AXRaise)。
+/// The AX phase body: enumerate the target app's AXWindows and pair by CGWindowID; re-check
+/// the raise intent right before applying mutations, then un-minimize + setFocused + AXRaise
+/// (order mirrors AltTab: SLPS -> makeKey -> AXRaise).
+unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
+    let app = AXUIElementCreateApplication(job.pid);
+    if app.is_null() {
+        log_info!("[raise] ax skipped: no AX app for pid={}", job.pid);
+        return;
+    }
+    // 1s 消息超时:无响应 App 不能把 raiser 线程卡太久(旧同步实现无超时,最坏按默认
+    // 超时阻塞主线程);超时只损失焦点兜底,快速路径的 SLPS 抬窗不受影响。
+    // 1s messaging timeout: an unresponsive app must not stall the raiser thread for long
+    // (the old sync path had no timeout and could block the main thread for the default
+    // timeout). A timeout only loses the focus backstop; the fast path's SLPS raise stands.
+    AXUIElementSetMessagingTimeout(app, 1.0);
+
+    let windows_key = cf_string_new("AXWindows");
+    let mut windows_array: *const c_void = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
+    CFRelease(windows_key);
+    if err != K_AX_SUCCESS || windows_array.is_null() {
+        CFRelease(app);
+        log_info!(
+            "[raise] ax NO MATCH: pid={} cgwid={} ax_query_err={} waited={}ms",
+            job.pid,
+            job.cgwid,
+            err,
+            job.enqueued_at.elapsed().as_millis()
+        );
+        return;
+    }
+    let count = CFArrayGetCount(windows_array);
+    let raise_key = cf_string_new("AXRaise");
+    let focused_key = cf_string_new("AXFocusedWindow");
+    let minimized_key = cf_string_new("AXMinimized");
+    let mut matched = false;
+    let mut superseded = false;
+    for i in 0..count {
+        let element = CFArrayGetValueAtIndex(windows_array, i);
+        if element.is_null() {
+            continue;
+        }
+        if ax_window_cgwid(element) == Some(job.cgwid) {
+            // 应用变更前的最后一道 supersede 闸:枚举期间若来了更新的切换,本任务整体
+            // 放弃(枚举结果作废),由新任务重新执行。
+            // Final supersede gate right before applying: if a newer switch arrived during
+            // enumeration, drop this job entirely (stale match) and let the new one run.
+            if !raise_intent_current(job.generation) {
+                superseded = true;
+                log_debug!(
+                    "[raise] ax superseded before apply: pid={} cgwid={} gen={}",
+                    job.pid,
+                    job.cgwid,
+                    job.generation
                 );
                 break;
             }
-        }
-        if !matched {
+            // 先还原最小化(若已最小化),否则 AXRaise 可能只是带到前面而仍停在 Dock。
+            // Un-minimize first (if minimized); otherwise AXRaise may bring it forward
+            // without restoring from the Dock. Setting false on a non-minimized window is a no-op.
+            AXUIElementSetAttributeValue(element, minimized_key, kCFBooleanFalse);
+            AXUIElementSetAttributeValue(app, focused_key, element);
+            AXUIElementPerformAction(element, raise_key);
+            matched = true;
             log_info!(
-                "raise_ax_window: NO MATCH for pid={} cgwid={} (ax_windows={}, slps={})",
-                pid,
-                cgwid,
+                "[raise] ax raised: pid={} cgwid={} ax_windows={} waited={}ms total={}ms",
+                job.pid,
+                job.cgwid,
                 count,
-                slps_ok
+                job.enqueued_at.elapsed().as_millis(),
+                started.elapsed().as_millis()
             );
+            break;
         }
-        CFRelease(raise_key);
-        CFRelease(focused_key);
-        CFRelease(minimized_key);
-        CFRelease(windows_array);
-        CFRelease(app);
     }
+    if !matched && !superseded {
+        log_info!(
+            "[raise] ax NO MATCH: pid={} cgwid={} ax_windows={} waited={}ms total={}ms",
+            job.pid,
+            job.cgwid,
+            count,
+            job.enqueued_at.elapsed().as_millis(),
+            started.elapsed().as_millis()
+        );
+    }
+    CFRelease(raise_key);
+    CFRelease(focused_key);
+    CFRelease(minimized_key);
+    CFRelease(windows_array);
+    CFRelease(app);
 }
 
 /// 查一个 PID 的 AX 标准窗口列表。
@@ -2290,6 +2415,19 @@ pub fn cache_running_app_icons_small() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raise_generation_supersedes_older_jobs() {
+        // 提交一次切换 = bump 出一个新代号;更早的代号立即失效,后台任务据此中止,
+        // 保证快速连续切换时旧任务不会把旧窗口抬回来。
+        // Each committed switch bumps a new generation; older ones immediately go stale and
+        // background jobs abort on that check, so a stale job can never re-raise an old window.
+        let first = RAISE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        assert!(raise_intent_current(first));
+        let second = RAISE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        assert!(!raise_intent_current(first));
+        assert!(raise_intent_current(second));
+    }
 
     #[test]
     fn ax_subrole_keep_rule_accepts_standard_and_titled_dialog() {

@@ -24,8 +24,8 @@ use crate::ffi::*;
 use crate::i18n::t;
 use crate::theme::*;
 use crate::window_collector::{
-    bump_window_mru, extract_icon_to_cache, raise_ax_window, sort_windows_by_mru, MruMap,
-    WindowInfo,
+    bump_window_mru, extract_icon_to_cache, raise_window_ax_async, raise_window_fast,
+    sort_windows_by_mru, MruMap, WindowInfo,
 };
 use crate::window_server;
 // 跨模块共享状态(由 main.rs 持有,这里读写)/ cross-module shared state (owned by main.rs)
@@ -1143,7 +1143,10 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         // active app's windows when summoning from elsewhere; visible through the glass when
         // summoning from settings). It stays put after the switch. Matches BetterCmdTab --
         // no stash/restore machinery.
-        activate_and_raise(pid, cgwid);
+        // 抬升链延迟一拍执行,让上面的 vanish 先提交上屏(见 schedule_deferred_raise)。
+        // Defer the raise chain by one runloop turn so the vanish above commits to the screen
+        // first (see schedule_deferred_raise).
+        schedule_deferred_raise(pid, cgwid);
         schedule_delayed_order_out();
         state.focus_key = Some((pid, cgwid));
         bump_window_mru(&mut state.mru, pid, cgwid);
@@ -1242,9 +1245,10 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
         let pid = w.pid;
         let cgwid = w.window_id;
         vanish_overlay();
-        // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释)。
-        // Same as on_cmd_released: no settings-window handling needed (see comment there).
-        activate_and_raise(pid, cgwid);
+        // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释);抬升延迟一拍执行。
+        // Same as on_cmd_released: no settings-window handling needed (see comment there);
+        // the raise is deferred by one runloop turn so the vanish commits first.
+        schedule_deferred_raise(pid, cgwid);
         schedule_delayed_order_out();
         state.focus_key = Some((pid, cgwid));
         bump_window_mru(&mut state.mru, pid, cgwid);
@@ -1520,9 +1524,10 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                     let pid = w.pid;
                     let cgwid = w.window_id;
                     vanish_overlay();
-                    // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释)。
-                    // Same as on_cmd_released: no settings-window handling needed.
-                    activate_and_raise(pid, cgwid);
+                    // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释);抬升延迟一拍执行。
+                    // Same as on_cmd_released: no settings-window handling needed (see comment
+                    // there); the raise is deferred by one runloop turn so the vanish commits first.
+                    schedule_deferred_raise(pid, cgwid);
                     schedule_delayed_order_out();
                     state.focus_key = Some((pid, cgwid));
                     bump_window_mru(&mut state.mru, pid, cgwid);
@@ -2185,8 +2190,24 @@ pub(crate) fn activate_pid(pid: i32) {
 /// individually via SLPS, not all-windows).
 pub(crate) fn activate_and_raise(pid: i32, cgwid: u32) {
     window_server::note_own_focus(pid, cgwid);
+    let t0 = Instant::now();
     activate_pid(pid);
-    raise_ax_window(pid, cgwid);
+    let activate_ms = t0.elapsed().as_millis();
+    // 快速路径:SLPS 抬窗 + 合成点击(毫秒级,同步执行);AX 阶段交后台 raiser。
+    // Fast path: SLPS raise + synthetic click (millisecond-scale, synchronous); the AX
+    // phase goes to the background raiser.
+    let t1 = Instant::now();
+    let (slps_ok, click_ok) = raise_window_fast(pid, cgwid);
+    log_debug!(
+        "[raise] fast: pid={} cgwid={} activate={}ms slps_click={}ms slps={} click={}",
+        pid,
+        cgwid,
+        activate_ms,
+        t1.elapsed().as_millis(),
+        slps_ok,
+        click_ok
+    );
+    raise_window_ax_async(pid, cgwid);
 }
 
 // ========== 浮窗渲染 / overlay rendering ==========
@@ -2507,6 +2528,61 @@ pub(crate) extern "C" fn on_delayed_order_out(_self: *mut c_void, _cmd: Sel, _ar
             let _: () = msg_send![container.0, setHidden: false];
         }
     }
+}
+
+/// 延迟一拍的切换抬升槽 + 调度。
+/// 释放/点击/回车的处理函数先 vanish_overlay 并结束当前 runloop turn,让渲染事务提交
+/// (vanish 真正上屏、浮窗立即消失),下一个 runloop 周期才执行激活+抬升链。
+/// 之前 vanish 与激活+AX 链挤在同一次主线程 turn 里:AX 枚举阻塞主线程期间 vanish 无法
+/// 提交,表现为「窗口已经切过去,浮窗冻结在上面顿一下才消失」。
+///
+/// Deferred-raise slot + scheduling. The release/click/Enter handlers vanish the overlay and
+/// END their runloop turn so the render transaction commits (the vanish reaches the screen,
+/// the overlay disappears instantly); the activate+raise chain runs on the NEXT runloop cycle.
+/// Previously the vanish and the activate+AX chain shared one main-thread turn: while the AX
+/// enumeration blocked it, the vanish could not commit -- the overlay lingered, frozen, over
+/// the already-switched window.
+struct DeferredRaise {
+    pid: i32,
+    cgwid: u32,
+    scheduled_at: Instant,
+}
+
+static DEFERRED_RAISE: LazyLock<Mutex<Option<DeferredRaise>>> = LazyLock::new(|| Mutex::new(None));
+
+fn schedule_deferred_raise(pid: i32, cgwid: u32) {
+    *DEFERRED_RAISE.lock().unwrap() = Some(DeferredRaise {
+        pid,
+        cgwid,
+        scheduled_at: Instant::now(),
+    });
+    unsafe {
+        let ctrl = crate::CONTROLLER.lock().unwrap().unwrap().0;
+        // afterDelay:0 = 当前 turn 结束后尽快执行——先提交 vanish,再抬升。
+        // afterDelay:0 = run as soon as the current turn ends: commit the vanish first, then raise.
+        let _: () = msg_send![
+            ctrl,
+            performSelector: sel!(handleDeferredRaise:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: 0.0f64
+        ];
+    }
+}
+
+pub(crate) extern "C" fn on_deferred_raise(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    let Some(job) = DEFERRED_RAISE.lock().unwrap().take() else {
+        return;
+    };
+    // 释放→本回调的间隔 = 「先提交 vanish」付出的额外延迟,正常应为几毫秒。
+    // Release-to-callback gap = the extra delay paid for committing the vanish first;
+    // normally a few milliseconds.
+    log_debug!(
+        "[raise] deferred fire: pid={} cgwid={} +{}ms after release",
+        job.pid,
+        job.cgwid,
+        job.scheduled_at.elapsed().as_millis()
+    );
+    activate_and_raise(job.pid, job.cgwid);
 }
 
 /// 在主线程上延迟 0.2s 执行 orderOut(通过 controller 的 handleDelayedOrderOut:)。

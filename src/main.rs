@@ -1450,6 +1450,15 @@ fn create_controller() -> *mut AnyObject {
             on_delayed_order_out as *mut c_void,
             types_v_obj.as_ptr(),
         );
+        // 延迟一拍的切换抬升:释放/点击/回车先让 vanish 提交上屏,下一拍再激活+抬升。
+        // Deferred switch raise: release/click/Enter commit the vanish to the screen first,
+        // then activate+raise on the next runloop turn.
+        class_addMethod(
+            cls,
+            sel!(handleDeferredRaise:),
+            on_deferred_raise as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
         class_addMethod(
             cls,
             sel!(handleDeferredScrollHover:),
