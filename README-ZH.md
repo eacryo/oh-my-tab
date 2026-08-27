@@ -28,7 +28,7 @@
 - <img height="14" src="docs/icons/key.svg"> **键盘导航**:按下 Command/Option 后用 Tab、Shift+Tab、方向键或鼠标选择窗口。
 - <img height="14" src="docs/icons/zap.svg"> **轻量**:纯 Rust——1.5MB 体积、约 35MB 基础内存,内存缩略图缓存上限约 64MB,无 Electron/Tauri。
 - <img height="14" src="docs/icons/star.svg"> **Liquid Glass**:浮层效果(仅 macOS 26;旧版回退 `NSVisualEffectView`)。
-- <img height="14" src="docs/icons/image.svg"> **窗口缩略图**:标题行在上方、下方为 16:10 实时预览(经私有 WindowServer API 截取,仅存内存)——缓存旧帧即时显示、后台异步刷新;单页时平衡排列,溢出时优先填满 MRU 前面的行并连续滚动。需要**屏幕录制**权限——未授权时自动回退为纯图标卡片。
+- <img height="14" src="docs/icons/image.svg"> **窗口缩略图**:标题行在上方、下方为 16:10 实时预览(经私有 WindowServer API 截取,仅存内存)——缓存旧帧即时显示、后台异步刷新;单页时平衡排列,溢出时优先填满 MRU 前面的行并连续滚动。需要**屏幕录制**权限——未授权时自动回退为纯图标卡片。关闭缩略图后会立即释放内存中的窗口截图。
 - <img height="14" src="docs/icons/history.svg"> **窗口级 MRU**:切到某个窗口不会把该应用的其他窗口一起带前。
 - <img height="14" src="docs/icons/eye.svg"> **完整窗口可见**:所有真实窗口,含离屏与最小化(可开关)。
 - <img height="14" src="docs/icons/gear.svg"> **TOML 热重载**:配置经校验,菜单一键生效。

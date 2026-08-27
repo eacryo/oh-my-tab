@@ -1403,12 +1403,14 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
     }
 
     // 缩略图服务热切换:start 幂等;关闭时 worker/observer 每任务前检查配置自动休眠,
-    // 无需显式停止线程。
+    // 同时立即释放内存中的窗口截图(线程本身保留,便于重新开启)。
     // Thumbnail-service hot-switch: start is idempotent; when off, the worker and
-    // observer re-check the config per job and sleep on their own -- no explicit
-    // thread shutdown needed.
+    // observer re-check the config per job and sleep on their own; clear the in-memory
+    // window-image cache immediately when the mode is disabled.
     if cfg.layout.thumbnails_enabled {
         crate::thumbnail::start();
+    } else {
+        crate::thumbnail::clear_runtime_cache();
     }
 
     // persist 热切换:开启 → 从磁盘加载并合并历史(与 start() 的加载去重互幂等);

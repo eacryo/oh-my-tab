@@ -443,6 +443,36 @@ pub(crate) fn cache_stats() -> (usize, u64) {
     (cache.len(), cache.total_cost())
 }
 
+/// 关闭缩略图模式时清掉进程内所有窗口截图,并使排队/进行中的捕获失效。
+/// The thumbnail service stays resident for a cheap re-enable, but disabling the mode
+/// releases all cached window images and invalidates queued/in-flight captures.
+pub(crate) fn clear_runtime_cache() {
+    // 与 app_terminated 使用相同的锁序:先失效任务,再清缓存。这样正在捕获的迟到结果
+    // 在写入缓存前会发现 token 已失效,不会在关闭后把截图重新塞回来。
+    // Keep the same lock order as app_terminated: invalidate jobs, then clear the cache. An
+    // in-flight result therefore observes the invalid state before it can be cached.
+    let mut state = CAPTURE_STATE.lock().unwrap();
+    state.cancel_all();
+    let evicted = CACHE.lock().unwrap().remove_where(|_| true);
+    drop(state);
+
+    let released = evicted.len();
+    for thumb in evicted {
+        unsafe {
+            CFRelease(thumb.img);
+        }
+    }
+
+    // 丢弃已经排队但尚未处理的 UI 更新,避免重新开启时消费旧批次。
+    // Drop queued UI updates so a later re-enable cannot consume an old batch.
+    READY_QUEUE.lock().unwrap().clear();
+    READY_DELIVERY_SCHEDULED.store(false, Ordering::Release);
+    log_debug!(
+        "[thumb] runtime cache cleared: frames_released={}",
+        released
+    );
+}
+
 /// 取缩略图(+1 返回,调用方用完必须 CFRelease;缓存自己的引用不受影响)。
 /// Fetch a thumbnail (+1 returned; the caller MUST CFRelease when done -- the
 /// cache's own reference is unaffected).
@@ -746,6 +776,10 @@ impl CaptureState {
         *generation = generation.wrapping_add(1);
         self.terminated_pids.remove(&pid);
         self.desired.retain(|key, _| key.pid != pid);
+    }
+
+    fn cancel_all(&mut self) {
+        self.desired.clear();
     }
 
     fn pid_generation(&self, pid: i32) -> u64 {
@@ -2040,6 +2074,19 @@ mod tests {
     }
 
     #[test]
+    fn cancel_all_invalidates_queued_and_running_jobs() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+        assert!(state.request(key, 512, CapturePriority::Visible));
+        let job = state.take_next().unwrap();
+        assert!(state.is_current(job));
+
+        state.cancel_all();
+        assert!(!state.is_current(job));
+        assert!(state.take_next().is_none());
+    }
+
+    #[test]
     fn lru_evicts_by_count_and_returns_victims() {
         let mut lru: Lru<(i32, u32), u64> = Lru::new(2, u64::MAX, |v| *v);
         lru.put((1, 1), 10);
@@ -2133,6 +2180,18 @@ mod tests {
         assert_eq!(removed, vec![10, 30]);
         assert!(lru.get(&(2, 2)).is_some());
         assert!(lru.get(&(1, 1)).is_none());
+    }
+
+    #[test]
+    fn lru_remove_where_can_clear_all_and_reset_cost() {
+        let mut lru: Lru<u32, u64> = Lru::new(10, u64::MAX, |v| *v);
+        lru.put(1, 10);
+        lru.put(2, 20);
+
+        let removed = lru.remove_where(|_| true);
+        assert_eq!(removed, vec![10, 20]);
+        assert_eq!(lru.len(), 0);
+        assert_eq!(lru.total_cost(), 0);
     }
 
     #[test]

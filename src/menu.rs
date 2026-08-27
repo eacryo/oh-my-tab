@@ -177,15 +177,17 @@ pub(crate) extern "C" fn handle_toggle_thumbnail(
         }
     }
     set_thumbnail_mode(thumbnails_enabled);
-    // 模式改变后丢弃当前卡片布局,下次召唤按新模式重建;缩略图服务按配置自动休眠/启动。
-    // Drop the current card layout so the next summon rebuilds in the new mode; the thumbnail
-    // service sleeps or starts according to the updated config.
+    // 模式改变后丢弃当前卡片布局,下次召唤按新模式重建;关闭时同时释放内存截图。
+    // Drop the current card layout so the next summon rebuilds in the new mode; disabling
+    // thumbnails also releases the in-memory window images.
     crate::overlay::reset_switcher();
     crate::overlay::apply_theme();
     crate::overlay::refresh_highlight();
     crate::overlay::update_status_label();
     if thumbnails_enabled {
         crate::thumbnail::start();
+    } else {
+        crate::thumbnail::clear_runtime_cache();
     }
     log_info!(
         "Window thumbnails: {}",
@@ -228,6 +230,11 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
     // 重新应用指针加速设置(reload 后配置可能变化)。
     // Re-apply pointer acceleration settings (config may have changed on reload).
     crate::mouse::pointer::apply();
+    if CONFIG.read().unwrap().layout.thumbnails_enabled {
+        crate::thumbnail::start();
+    } else {
+        crate::thumbnail::clear_runtime_cache();
+    }
 }
 
 /// 清空图标缓存:删除缓存目录里所有缓存文件({key}.png + {key}.meta),失效内存里的 icon_path,
