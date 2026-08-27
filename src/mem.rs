@@ -10,7 +10,7 @@
 use crate::clipboard;
 use crate::ffi::{task_vm_info, TaskVmInfo};
 use crate::thumbnail;
-use crate::{log_info, TAB_STATE};
+use crate::{log_info, CONFIG, TAB_STATE};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -92,12 +92,15 @@ struct Ledger {
     thumbs_bytes: u64,
     clip_entries: usize,
     clip_bytes: u64,
+    clip_text_bytes: u64,
+    clip_preview_bytes: u64,
+    clip_metadata_bytes: u64,
     windows: usize,
 }
 
 fn read_ledgers() -> Ledger {
     let (thumbs_items, thumbs_bytes) = thumbnail::cache_stats();
-    let (clip_entries, clip_bytes) = clipboard::history_stats();
+    let clip = clipboard::history_stats();
     let windows = TAB_STATE
         .lock()
         .unwrap()
@@ -107,10 +110,36 @@ fn read_ledgers() -> Ledger {
     Ledger {
         thumbs_items,
         thumbs_bytes,
-        clip_entries,
-        clip_bytes,
+        clip_entries: clip.entries,
+        clip_bytes: clip.resident_bytes,
+        clip_text_bytes: clip.text_bytes,
+        clip_preview_bytes: clip.preview_bytes,
+        clip_metadata_bytes: clip.metadata_bytes,
         windows,
     }
+}
+
+/// 只记录影响内存画像的功能开关,不记录用户内容。
+/// Record only feature switches that affect the memory profile; never record user content.
+fn runtime_profile() -> String {
+    let config = CONFIG.read().unwrap();
+    let clipboard_mode = if !config.clipboard.enabled {
+        "off"
+    } else if config.clipboard.persist {
+        "persistent"
+    } else {
+        "memory"
+    };
+    format!(
+        "mouse:{},thumbs:{},clipboard:{}",
+        if config.mouse.enabled { "on" } else { "off" },
+        if config.layout.thumbnails_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        clipboard_mode,
+    )
 }
 
 /// 采样并打一行日志。vminfo 读取失败(kernel 接口变化)只跳过本拍,不中断循环。
@@ -123,9 +152,11 @@ fn sample_once(started_at: Instant) {
     };
     let peak = track_peak(&vm);
     let ledger = read_ledgers();
+    let profile = runtime_profile();
     log_info!(
-        "[mem] uptime={} footprint={} rss={} footprint_peak_sampled={} rss_peak_kernel={} anon={} compressed={} threads={} | thumbs={} items/{} clip={} entries/{} windows={}",
+        "[mem] uptime={} phase=steady profile={} footprint={} rss={} footprint_peak_sampled={} rss_peak_kernel={} anon={} compressed={} threads={} | thumbs={{items={},ledger={}}} clipboard={{entries={},ledger={},text={},preview={},meta={}}} windows={{count={}}}",
         fmt_uptime(started_at.elapsed()),
+        profile,
         fmt_bytes(vm.phys_footprint),
         fmt_bytes(vm.resident_size),
         fmt_bytes(peak),
@@ -137,6 +168,9 @@ fn sample_once(started_at: Instant) {
         fmt_bytes(ledger.thumbs_bytes),
         ledger.clip_entries,
         fmt_bytes(ledger.clip_bytes),
+        fmt_bytes(ledger.clip_text_bytes),
+        fmt_bytes(ledger.clip_preview_bytes),
+        fmt_bytes(ledger.clip_metadata_bytes),
         ledger.windows,
     );
 }

@@ -299,15 +299,41 @@ const DETAIL_PREVIEW_MAX_DIM: f64 = 1280.0;
 /// 历史列表,最新在前 / history, newest first.
 static CLIP_HISTORY: LazyLock<Mutex<Vec<ClipEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// 内存采样器的账本读数:(条目数, 驻留内存字节预估)。统计结构体本身与各动态缓冲区的
-/// capacity;原始图片字节在磁盘缓存,不计入内存账本。锁只持到读出两个整数。
-/// Ledger reading for the memory sampler: (entry count, estimated resident bytes). Counts the
-/// inline structs and dynamic buffer capacities; original image bytes live in the disk cache
-/// and are excluded. The lock is held only while reading the counters.
-pub(crate) fn history_stats() -> (usize, u64) {
+/// 内存采样器的剪贴板账本。原始图片字节在磁盘缓存,不计入驻留内存;
+/// `resident_bytes` 是结构体和动态缓冲区 capacity 的估算值。
+/// Clipboard ledger for the memory sampler. Original image bytes live in the disk cache and
+/// are excluded from resident memory; `resident_bytes` estimates structs and buffer capacity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HistoryStats {
+    pub(crate) entries: usize,
+    pub(crate) resident_bytes: u64,
+    pub(crate) text_bytes: u64,
+    pub(crate) preview_bytes: u64,
+    pub(crate) metadata_bytes: u64,
+}
+
+/// 锁只持到读出这组整数。/ Hold the lock only while reading these counters.
+pub(crate) fn history_stats() -> HistoryStats {
     let history = CLIP_HISTORY.lock().unwrap();
-    let bytes = history.iter().map(estimated_entry_bytes).sum();
-    (history.len(), bytes)
+    let mut stats = HistoryStats {
+        entries: history.len(),
+        ..HistoryStats::default()
+    };
+    for entry in history.iter() {
+        stats.resident_bytes += estimated_entry_bytes(entry);
+        stats.text_bytes += entry.text.capacity() as u64;
+        stats.metadata_bytes += entry.source_app.capacity() as u64;
+        stats.metadata_bytes += entry.source_key.capacity() as u64;
+        if let Some(image) = &entry.image {
+            stats.metadata_bytes += image.uti.capacity() as u64;
+            stats.metadata_bytes += image.data_path.capacity() as u64;
+            if let Some(source_path) = &image.source_path {
+                stats.metadata_bytes += source_path.capacity() as u64;
+            }
+            stats.preview_bytes += image.preview_png.capacity() as u64;
+        }
+    }
+    stats
 }
 
 /// 估算单个条目的实际驻留内存:结构体本身 + 各动态字段的容量。
