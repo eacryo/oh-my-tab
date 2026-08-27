@@ -1120,6 +1120,7 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
     if let Some(w) = state.windows.get(state.selected) {
         let pid = w.pid;
         let cgwid = w.window_id;
+        let minimized = w.minimized;
         let wt = w.window_title.clone();
         log_debug!(
             "Switching to '{}' (pid={} cgwid={})",
@@ -1151,7 +1152,7 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         // not need; activate_and_raise still submits the variable-latency AX backstop async.
         // vanish has already made the panel transparent and resigned key, so it cannot block the
         // target from taking focus.
-        activate_and_raise(pid, cgwid);
+        activate_and_raise(pid, cgwid, minimized);
         schedule_delayed_order_out();
         state.focus_key = Some((pid, cgwid));
         bump_window_mru(&mut state.mru, pid, cgwid);
@@ -1249,11 +1250,12 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
     if let Some(w) = state.windows.get(idx) {
         let pid = w.pid;
         let cgwid = w.window_id;
+        let minimized = w.minimized;
         vanish_overlay();
         // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释);抬升延迟一拍执行。
         // Same as on_cmd_released: no settings-window handling needed (see comment there);
         // the raise is deferred by one runloop turn so the vanish commits first.
-        schedule_deferred_raise(pid, cgwid);
+        schedule_deferred_raise(pid, cgwid, minimized);
         schedule_delayed_order_out();
         state.focus_key = Some((pid, cgwid));
         bump_window_mru(&mut state.mru, pid, cgwid);
@@ -1528,11 +1530,12 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 if let Some(w) = state.windows.get(state.selected) {
                     let pid = w.pid;
                     let cgwid = w.window_id;
+                    let minimized = w.minimized;
                     vanish_overlay();
                     // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释);抬升延迟一拍执行。
                     // Same as on_cmd_released: no settings-window handling needed (see comment
                     // there); the raise is deferred by one runloop turn so the vanish commits first.
-                    schedule_deferred_raise(pid, cgwid);
+                    schedule_deferred_raise(pid, cgwid, minimized);
                     schedule_delayed_order_out();
                     state.focus_key = Some((pid, cgwid));
                     bump_window_mru(&mut state.mru, pid, cgwid);
@@ -2173,26 +2176,28 @@ pub(crate) extern "C" fn on_deferred_scroll_hover(
 
 /// 立即完成可见的快速抬窗,再把 AX 焦点兜底交给后台序列。
 /// Complete the visible fast raise immediately, then enqueue the AX focus backstop.
-pub(crate) fn activate_and_raise(pid: i32, cgwid: u32) {
+pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
     window_server::note_own_focus(pid, cgwid);
 
-    // SLPS + 合成 key-window 事件只需几毫秒,放在 Command 松开所在的主线程上可以让目标
-    // 窗口立即弹起;耗时不稳定的 AX 查询/写入仍留在后台,避免卡住 UI。
-    // SLPS + the synthetic key-window event normally take only a few milliseconds. Running
-    // them here makes the target window appear immediately; the variable-latency AX query and
-    // mutations remain off the main thread so they cannot block the UI.
-    let fast_started = Instant::now();
-    let (slps_ok, click_ok) = raise_window_fast(pid, cgwid);
-    log_debug!(
-        "[raise] precise fast: pid={} cgwid={} slps={} click={} elapsed={}ms",
-        pid,
-        cgwid,
-        slps_ok,
-        click_ok,
-        fast_started.elapsed().as_millis()
-    );
+    if !minimized {
+        // 普通窗口立即走 SLPS + key-window,随后后台只需 cached AXRaise。最小化窗口必须
+        // 先通过 AX 解除最小化,因此其快速路径由 raiser 在线程里按正确顺序执行。
+        // Normal windows run SLPS + key-window immediately, leaving only cached AXRaise for the
+        // background. Minimized windows must be unminimized first, so the raiser performs their
+        // fast path later in the correct order.
+        let fast_started = Instant::now();
+        let (slps_ok, click_ok) = raise_window_fast(pid, cgwid);
+        log_debug!(
+            "[raise] precise fast: pid={} cgwid={} slps={} click={} elapsed={}ms",
+            pid,
+            cgwid,
+            slps_ok,
+            click_ok,
+            fast_started.elapsed().as_millis()
+        );
+    }
 
-    raise_window_ax_async(pid, cgwid);
+    raise_window_ax_async(pid, cgwid, minimized);
 }
 
 // ========== 浮窗渲染 / overlay rendering ==========
@@ -2530,15 +2535,17 @@ pub(crate) extern "C" fn on_delayed_order_out(_self: *mut c_void, _cmd: Sel, _ar
 struct DeferredRaise {
     pid: i32,
     cgwid: u32,
+    minimized: bool,
     scheduled_at: Instant,
 }
 
 static DEFERRED_RAISE: LazyLock<Mutex<Option<DeferredRaise>>> = LazyLock::new(|| Mutex::new(None));
 
-fn schedule_deferred_raise(pid: i32, cgwid: u32) {
+fn schedule_deferred_raise(pid: i32, cgwid: u32, minimized: bool) {
     *DEFERRED_RAISE.lock().unwrap() = Some(DeferredRaise {
         pid,
         cgwid,
+        minimized,
         scheduled_at: Instant::now(),
     });
     unsafe {
@@ -2567,7 +2574,7 @@ pub(crate) extern "C" fn on_deferred_raise(_self: *mut c_void, _cmd: Sel, _arg: 
         job.cgwid,
         job.scheduled_at.elapsed().as_millis()
     );
-    activate_and_raise(job.pid, job.cgwid);
+    activate_and_raise(job.pid, job.cgwid, job.minimized);
 }
 
 /// 在主线程上延迟 0.2s 执行 orderOut(通过 controller 的 handleDelayedOrderOut:)。

@@ -1176,11 +1176,11 @@ pub(crate) fn close_ax_window(pid: i32, cgwid: u32) -> bool {
 }
 
 /// 抬升前半段:WindowServer 层抬窗(SLPS)+ 合成点击确立 key window。
-/// The caller runs this at commit time before enqueueing the background AX backstop.
+/// 普通窗口在提交时调用;最小化窗口由后台 raiser 在解除最小化后调用。
 ///
 /// First half of the raise: WindowServer-level raise (SLPS) plus the synthetic click that
-/// establishes the key window. It runs on the main thread at commit time so the visible raise
-/// is not delayed by AX.
+/// establishes the key window. Normal windows call it at commit time; minimized windows call it
+/// from the background raiser after being restored.
 pub(crate) fn raise_window_fast(pid: i32, cgwid: u32) -> (bool, bool) {
     if cgwid == 0 {
         return (false, false);
@@ -1219,6 +1219,7 @@ fn raise_intent_current(generation: u64) -> bool {
 struct RaiseJob {
     pid: i32,
     cgwid: u32,
+    minimized: bool,
     generation: u64,
     enqueued_at: Instant,
 }
@@ -1241,13 +1242,14 @@ static RAISE_TX: std::sync::LazyLock<flume::Sender<RaiseJob>> = std::sync::LazyL
     tx
 });
 
-/// 提交后台 AX 精确抬升任务(un-minimize + setFocused + AXRaise)。
-/// Enqueue the serialized AX backstop (un-minimize + setFocused + AXRaise).
+/// 提交后台 AX 精确抬升任务。普通窗口只执行 cached AXRaise;已知最小化窗口先还原。
+/// Enqueue the serialized AX backstop. Normal windows only perform cached AXRaise; known
+/// minimized windows are restored first.
 /// AX 枚举对无响应 App 可能阻塞几十至上百毫秒,绝不能放主线程。
 ///
 /// AX enumeration can block tens to hundreds of milliseconds on an unresponsive app; it must
 /// stay off the main thread.
-pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32) {
+pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32, minimized: bool) {
     if cgwid == 0 {
         return;
     }
@@ -1255,6 +1257,7 @@ pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32) {
     let _ = RAISE_TX.send(RaiseJob {
         pid,
         cgwid,
+        minimized,
         generation,
         enqueued_at: Instant::now(),
     });
@@ -1281,11 +1284,11 @@ fn run_raise_ax_job(job: RaiseJob) {
     }
 }
 
-/// AX 阶段本体:枚举目标 App 的 AXWindows,按 CGWindowID 配对;应用变更前重查意图。
-/// SLPS 与合成 key-window 事件已在提交时同步完成,这里只做后台 AX 兜底。
-/// The AX phase body: enumerate the target app's AXWindows and pair by CGWindowID; re-check
-/// the raise intent right before applying mutations. The synchronous commit path has already
-/// performed SLPS and the synthetic key-window event; this phase is only the AX backstop.
+/// AX 阶段本体:缓存命中时普通窗口只执行 AXRaise;已知最小化窗口先还原并补跑快速路径。
+/// 缓存失效才枚举 AXWindows,按 CGWindowID 重新配对并刷新缓存。
+/// AX phase: on a cache hit, normal windows only perform AXRaise; known minimized windows are
+/// restored first and then run the fast path. Only a stale/missing cache enumerates AXWindows,
+/// pairs by CGWindowID, and refreshes the cache.
 unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
     let app = AXUIElementCreateApplication(job.pid);
     if app.is_null() {
@@ -1301,7 +1304,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
 
     let raise_key = cf_string_new("AXRaise");
     let focused_key = cf_string_new("AXFocusedWindow");
-    let minimized_key = cf_string_new("AXMinimized");
+    let minimized_key = job.minimized.then(|| cf_string_new("AXMinimized"));
 
     // collect_windows 已经为当前窗口保留了 AX 元素。正常切换直接复用它，避免每次都做
     // 一次 AXWindows IPC；只有元素失效时才回退到下面的实时枚举。
@@ -1312,28 +1315,35 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
             CFRelease(element);
             CFRelease(raise_key);
             CFRelease(focused_key);
-            CFRelease(minimized_key);
+            if let Some(minimized_key) = minimized_key {
+                CFRelease(minimized_key);
+            }
             CFRelease(app);
             return;
         }
-        let (is_minimized, minimized_set_err, focused_set_err, raise_err) =
-            raise_ax_element(app, element, minimized_key, focused_key, raise_key);
-        if raise_err != K_AX_INVALID_UI_ELEMENT {
+        let minimized_set_err = prepare_minimized_target(job, element, minimized_key);
+        let (raise_first_err, focused_set_err, raise_retry_err) =
+            raise_ax_element(app, element, focused_key, raise_key);
+        let effective_raise_err = raise_retry_err.unwrap_or(raise_first_err);
+        if effective_raise_err != K_AX_INVALID_UI_ELEMENT {
             log_info!(
-                "[raise] ax raised cached: pid={} cgwid={} minimized={:?} set_minimized={} set_focused={} raise={} waited={}ms total={}ms",
+                "[raise] ax raised cached: pid={} cgwid={} known_minimized={} set_minimized={:?} raise_first={} set_focused={:?} raise_retry={:?} waited={}ms total={}ms",
                 job.pid,
                 job.cgwid,
-                is_minimized,
+                job.minimized,
                 minimized_set_err,
+                raise_first_err,
                 focused_set_err,
-                raise_err,
+                raise_retry_err,
                 job.enqueued_at.elapsed().as_millis(),
                 started.elapsed().as_millis()
             );
             CFRelease(element);
             CFRelease(raise_key);
             CFRelease(focused_key);
-            CFRelease(minimized_key);
+            if let Some(minimized_key) = minimized_key {
+                CFRelease(minimized_key);
+            }
             CFRelease(app);
             return;
         }
@@ -1341,7 +1351,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
             "[raise] cached AX element stale: pid={} cgwid={} raise={} — refreshing",
             job.pid,
             job.cgwid,
-            raise_err
+            effective_raise_err
         );
         invalidate_cached_ax_window_element(job.pid, job.cgwid, element);
         CFRelease(element);
@@ -1354,7 +1364,9 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
     if err != K_AX_SUCCESS || windows_array.is_null() {
         CFRelease(raise_key);
         CFRelease(focused_key);
-        CFRelease(minimized_key);
+        if let Some(minimized_key) = minimized_key {
+            CFRelease(minimized_key);
+        }
         CFRelease(app);
         log_info!(
             "[raise] ax NO MATCH: pid={} cgwid={} ax_query_err={} waited={}ms",
@@ -1391,18 +1403,20 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
             // 找到实时元素后更新缓存,下一次切换就不必重新枚举。
             // Refresh the cache with the live element so the next switch skips enumeration.
             cache_ax_window_element(job.pid, job.cgwid, element);
-            let (is_minimized, minimized_set_err, focused_set_err, raise_err) =
-                raise_ax_element(app, element, minimized_key, focused_key, raise_key);
+            let minimized_set_err = prepare_minimized_target(job, element, minimized_key);
+            let (raise_first_err, focused_set_err, raise_retry_err) =
+                raise_ax_element(app, element, focused_key, raise_key);
             matched = true;
             log_info!(
-                "[raise] ax raised refreshed: pid={} cgwid={} ax_windows={} minimized={:?} set_minimized={} set_focused={} raise={} waited={}ms total={}ms",
+                "[raise] ax raised refreshed: pid={} cgwid={} ax_windows={} known_minimized={} set_minimized={:?} raise_first={} set_focused={:?} raise_retry={:?} waited={}ms total={}ms",
                 job.pid,
                 job.cgwid,
                 count,
-                is_minimized,
+                job.minimized,
                 minimized_set_err,
+                raise_first_err,
                 focused_set_err,
-                raise_err,
+                raise_retry_err,
                 job.enqueued_at.elapsed().as_millis(),
                 started.elapsed().as_millis()
             );
@@ -1421,37 +1435,57 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
     }
     CFRelease(raise_key);
     CFRelease(focused_key);
-    CFRelease(minimized_key);
+    if let Some(minimized_key) = minimized_key {
+        CFRelease(minimized_key);
+    }
     CFRelease(windows_array);
     CFRelease(app);
 }
 
-/// 对一个已经解析出的 AX 窗口执行焦点兜底,返回各次 AX 操作的结果码。
-/// Apply the AX focus backstop to an already-resolved window and return each AX result code.
+/// 已知最小化时先还原窗口,再执行 SLPS + key-window;普通窗口在提交时已经跑过快速路径。
+/// For a known minimized target, restore it before SLPS + key-window. Normal windows already
+/// ran the fast path synchronously at commit time.
+unsafe fn prepare_minimized_target(
+    job: &RaiseJob,
+    element: AXUIElementRef,
+    minimized_key: Option<AXUIElementRef>,
+) -> Option<AXError> {
+    let minimized_key = minimized_key?;
+    let minimized_set_err = AXUIElementSetAttributeValue(element, minimized_key, kCFBooleanFalse);
+    let fast_started = Instant::now();
+    let (slps_ok, click_ok) = raise_window_fast(job.pid, job.cgwid);
+    log_debug!(
+        "[raise] precise fast after unminimize: pid={} cgwid={} slps={} click={} elapsed={}ms",
+        job.pid,
+        job.cgwid,
+        slps_ok,
+        click_ok,
+        fast_started.elapsed().as_millis()
+    );
+    Some(minimized_set_err)
+}
+
+/// 普通路径只执行一次 AXRaise。仅当它明确失败且不是 stale element 时,才设置
+/// AXFocusedWindow 并重试;成功路径不再支付额外 AX IPC。
+/// The normal path performs one AXRaise. Only an explicit non-stale failure sets
+/// AXFocusedWindow and retries; a successful raise pays no extra AX IPC.
 unsafe fn raise_ax_element(
     app: AXUIElementRef,
     element: AXUIElementRef,
-    minimized_key: AXUIElementRef,
     focused_key: AXUIElementRef,
     raise_key: AXUIElementRef,
-) -> (Option<bool>, AXError, AXError, AXError) {
-    let mut minimized_value: *const c_void = std::ptr::null();
-    let minimized_err = AXUIElementCopyAttributeValue(element, minimized_key, &mut minimized_value);
-    let is_minimized = if minimized_err == K_AX_SUCCESS && !minimized_value.is_null() {
-        let value = CFBooleanGetValue(minimized_value);
-        CFRelease(minimized_value);
-        Some(value)
-    } else {
-        None
-    };
-
-    // 先还原最小化(若已最小化),否则 AXRaise 可能只是带到前面而仍停在 Dock。
-    // Un-minimize first (if minimized), otherwise AXRaise may bring it forward without restoring
-    // from the Dock. Setting false on a non-minimized window is a no-op.
-    let minimized_set_err = AXUIElementSetAttributeValue(element, minimized_key, kCFBooleanFalse);
+) -> (AXError, Option<AXError>, Option<AXError>) {
+    let raise_first_err = AXUIElementPerformAction(element, raise_key);
+    if raise_first_err == K_AX_SUCCESS || raise_first_err == K_AX_INVALID_UI_ELEMENT {
+        return (raise_first_err, None, None);
+    }
     let focused_set_err = AXUIElementSetAttributeValue(app, focused_key, element);
-    let raise_err = AXUIElementPerformAction(element, raise_key);
-    (is_minimized, minimized_set_err, focused_set_err, raise_err)
+    let raise_retry_err = AXUIElementPerformAction(element, raise_key);
+    (
+        raise_first_err,
+        Some(focused_set_err),
+        Some(raise_retry_err),
+    )
 }
 
 /// 查一个 PID 的 AX 标准窗口列表。
