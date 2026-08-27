@@ -2255,7 +2255,7 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32) {
         attempts,
         raise_started.elapsed().as_millis()
     );
-    raise_window_ax_async(pid, cgwid);
+    raise_window_ax_async(pid, cgwid, slps_ok && click_ok);
 }
 
 // ========== 浮窗渲染 / overlay rendering ==========

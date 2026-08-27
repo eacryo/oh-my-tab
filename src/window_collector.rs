@@ -1149,6 +1149,7 @@ fn raise_intent_current(generation: u64) -> bool {
 struct RaiseJob {
     pid: i32,
     cgwid: u32,
+    fast_path_ok: bool,
     generation: u64,
     enqueued_at: Instant,
 }
@@ -1171,17 +1172,19 @@ static RAISE_TX: std::sync::LazyLock<flume::Sender<RaiseJob>> = std::sync::LazyL
     tx
 });
 
-/// 提交后台 AX 抬升任务(枚举 + un-minimize + setFocused + AXRaise)。
+/// 提交后台 AX 抬升任务(必要时枚举 + un-minimize + setFocused + AXRaise)。
 /// 由 activate_and_raise 在快速路径(SLPS + 合成点击)完成后调用:
-/// 窗口已在 WindowServer 层抬起,这里只补焦点与还原最小化——即使任务排队或超时,
-/// 切换本身也不受影响。AX 枚举对无响应 App 可能阻塞几十至上百毫秒,绝不能放主线程。
+/// 如果快速路径已成功,这里只检查目标窗口是否最小化;正常窗口不再重复 AXRaise。
+/// 快速路径失败时才补焦点与还原最小化——即使任务排队或超时,切换本身也不受影响。
+/// AX 枚举对无响应 App 可能阻塞几十至上百毫秒,绝不能放主线程。
 ///
-/// Enqueue the background AX raise (enumerate + un-minimize + setFocused + AXRaise).
+/// Enqueue the background AX raise (enumerate + conditionally un-minimize/setFocused/AXRaise).
 /// Called by activate_and_raise after the fast path (SLPS + synthetic click): the window is
-/// already raised at the WindowServer level and this only backfills focus and the minimize
-/// restore -- a queued or timed-out job never affects the switch itself. AX enumeration can
-/// block tens to hundreds of milliseconds on unresponsive apps; it must stay off the main thread.
-pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32) {
+/// already raised at the WindowServer level. A successful fast path only needs AX work for a
+/// minimized target; normal windows skip the duplicate AXRaise. A queued or timed-out job never
+/// affects the switch itself. AX enumeration can block tens to hundreds of milliseconds on
+/// unresponsive apps; it must stay off the main thread.
+pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32, fast_path_ok: bool) {
     if cgwid == 0 {
         return;
     }
@@ -1189,6 +1192,7 @@ pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32) {
     let _ = RAISE_TX.send(RaiseJob {
         pid,
         cgwid,
+        fast_path_ok,
         generation,
         enqueued_at: Instant::now(),
     });
@@ -1215,11 +1219,13 @@ fn run_raise_ax_job(job: RaiseJob) {
     }
 }
 
-/// AX 阶段本体:枚举目标 App 的 AXWindows,按 CGWindowID 配对;应用变更前重查意图,
-/// 再执行 un-minimize + setFocused + AXRaise(顺序对齐 AltTab:SLPS → makeKey → AXRaise)。
+/// AX 阶段本体:枚举目标 App 的 AXWindows,按 CGWindowID 配对;应用变更前重查意图。
+/// 快速路径成功时,正常窗口不再执行任何 AX 抬升;只有最小化窗口才执行
+/// un-minimize + setFocused + AXRaise。快速路径失败时执行完整 AX 兜底。
 /// The AX phase body: enumerate the target app's AXWindows and pair by CGWindowID; re-check
-/// the raise intent right before applying mutations, then un-minimize + setFocused + AXRaise
-/// (order mirrors AltTab: SLPS -> makeKey -> AXRaise).
+/// the raise intent right before applying mutations. After a successful fast path, normal
+/// windows skip all AX raising; only minimized windows use un-minimize + setFocused + AXRaise.
+/// A failed fast path uses the full AX fallback (order mirrors AltTab: SLPS -> makeKey -> AXRaise).
 unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
     let app = AXUIElementCreateApplication(job.pid);
     if app.is_null() {
@@ -1274,18 +1280,49 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
                 );
                 break;
             }
+            let mut minimized_value: *const c_void = std::ptr::null();
+            let minimized_err =
+                AXUIElementCopyAttributeValue(element, minimized_key, &mut minimized_value);
+            let is_minimized = if minimized_err == K_AX_SUCCESS && !minimized_value.is_null() {
+                let value = CFBooleanGetValue(minimized_value);
+                CFRelease(minimized_value);
+                Some(value)
+            } else {
+                None
+            };
+
+            // 快速路径已经同时完成 WindowServer 抬窗和 key-window 点击时,正常窗口无需再
+            // AXRaise。这样避免目标 App 在两个抬升动作之间发生一次额外重绘。
+            // When the fast path already completed both the WindowServer raise and the
+            // key-window click, a normal window needs no AXRaise. This avoids an extra redraw
+            // between two raise operations in the target app.
+            if job.fast_path_ok && is_minimized != Some(true) {
+                matched = true;
+                log_debug!(
+                    "[raise] ax skipped after fast: pid={} cgwid={} minimized={:?} waited={}ms total={}ms",
+                    job.pid,
+                    job.cgwid,
+                    is_minimized,
+                    job.enqueued_at.elapsed().as_millis(),
+                    started.elapsed().as_millis()
+                );
+                break;
+            }
+
             // 先还原最小化(若已最小化),否则 AXRaise 可能只是带到前面而仍停在 Dock。
-            // Un-minimize first (if minimized); otherwise AXRaise may bring it forward
+            // Un-minimize first (if minimized), otherwise AXRaise may bring it forward
             // without restoring from the Dock. Setting false on a non-minimized window is a no-op.
             AXUIElementSetAttributeValue(element, minimized_key, kCFBooleanFalse);
             AXUIElementSetAttributeValue(app, focused_key, element);
             AXUIElementPerformAction(element, raise_key);
             matched = true;
             log_info!(
-                "[raise] ax raised: pid={} cgwid={} ax_windows={} waited={}ms total={}ms",
+                "[raise] ax raised: pid={} cgwid={} ax_windows={} minimized={:?} fast_path={} waited={}ms total={}ms",
                 job.pid,
                 job.cgwid,
                 count,
+                is_minimized,
+                job.fast_path_ok,
                 job.enqueued_at.elapsed().as_millis(),
                 started.elapsed().as_millis()
             );
