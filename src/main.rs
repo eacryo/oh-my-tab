@@ -608,6 +608,13 @@ extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _arg: *mut c
                 .or_else(|| window_collector::owner_pid_for_cgwid(*window_id));
             if let Some(pid) = pid {
                 let frontmost_pid = frontmost_app_info().1;
+                log_debug!(
+                    "[windows] focused event: cgwid={} pid={} displayed={} frontmost={}",
+                    window_id,
+                    pid,
+                    displayed_pid.is_some(),
+                    frontmost_pid == pid
+                );
                 if frontmost_pid == pid {
                     let activation_token = window_server::activation_token(pid);
                     if window_server::focus_should_bump(pid, *window_id) {

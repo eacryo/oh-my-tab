@@ -1190,14 +1190,28 @@ pub(crate) fn raise_window_fast(pid: i32, cgwid: u32) -> (bool, bool) {
         //    mode=0x200 userGenerated），避免 activate(AllWindows) 把该 App 的所有窗口都抬到前面。
         //    Raise only this one window at the WindowServer level (SkyLight private API,
         //    mode=0x200 userGenerated), avoiding activate(AllWindows) raising every window.
+        let fast_started = Instant::now();
+        let slps_started = Instant::now();
         let slps_ok = raise_window_slps(pid, cgwid);
+        let slps_elapsed = slps_started.elapsed().as_micros();
 
         // 1.5 合成鼠标点击确立 key window：SLPS 只负责「抬到前面 + 设为前台进程」，key 状态
         //    必须由这个合成点击授予（macOS 14+ 无公开 API 可跨 App 转移 key 焦点）。
         //    The synthetic click establishes the key window: SLPS only fronts the window and
         //    process; the key state is granted by this click (macOS 14+ has no public API to
         //    move key focus across apps).
+        let click_started = Instant::now();
         let click_ok = make_key_window(pid, cgwid);
+        log_debug!(
+            "[raise] fast stages: pid={} cgwid={} slps={} slps_us={} click={} click_us={} total_us={}",
+            pid,
+            cgwid,
+            slps_ok,
+            slps_elapsed,
+            click_ok,
+            click_started.elapsed().as_micros(),
+            fast_started.elapsed().as_micros()
+        );
         (slps_ok, click_ok)
     }
 }
@@ -1249,9 +1263,9 @@ static RAISE_TX: std::sync::LazyLock<flume::Sender<RaiseJob>> = std::sync::LazyL
 ///
 /// AX enumeration can block tens to hundreds of milliseconds on an unresponsive app; it must
 /// stay off the main thread.
-pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32, minimized: bool) {
+pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32, minimized: bool) -> u64 {
     if cgwid == 0 {
-        return;
+        return 0;
     }
     let generation = RAISE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
     let _ = RAISE_TX.send(RaiseJob {
@@ -1261,6 +1275,7 @@ pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32, minimized: bool) {
         generation,
         enqueued_at: Instant::now(),
     });
+    generation
 }
 
 fn run_raise_ax_job(job: RaiseJob) {
@@ -1274,6 +1289,13 @@ fn run_raise_ax_job(job: RaiseJob) {
         return;
     }
     let started = Instant::now();
+    log_debug!(
+        "[raise] ax job start: pid={} cgwid={} gen={} queue_ms={}",
+        job.pid,
+        job.cgwid,
+        job.generation,
+        job.enqueued_at.elapsed().as_millis()
+    );
     // 后台线程一律包 autorelease pool:当前只用 CF 对象,包一层防将来引入 ObjC 调用后泄漏。
     // Always wrap background work in an autorelease pool: this path only touches CF objects
     // today; the pool guards against leaks if ObjC calls are ever added.
@@ -1290,11 +1312,13 @@ fn run_raise_ax_job(job: RaiseJob) {
 /// restored first and then run the fast path. Only a stale/missing cache enumerates AXWindows,
 /// pairs by CGWindowID, and refreshes the cache.
 unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
+    let app_started = Instant::now();
     let app = AXUIElementCreateApplication(job.pid);
     if app.is_null() {
         log_info!("[raise] ax skipped: no AX app for pid={}", job.pid);
         return;
     }
+    let app_create_us = app_started.elapsed().as_micros();
     // 1s 消息超时:无响应 App 不能把 raiser 线程卡太久(旧同步实现无超时,最坏按默认
     // 超时阻塞主线程);超时只损失焦点兜底,快速路径的 SLPS 抬窗不受影响。
     // 1s messaging timeout: an unresponsive app must not stall the raiser thread for long
@@ -1323,11 +1347,11 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
         }
         let minimized_set_err = prepare_minimized_target(job, element, minimized_key);
         let (raise_first_err, focused_set_err, raise_retry_err) =
-            raise_ax_element(app, element, focused_key, raise_key);
+            raise_ax_element(job.pid, job.cgwid, app, element, focused_key, raise_key);
         let effective_raise_err = raise_retry_err.unwrap_or(raise_first_err);
         if effective_raise_err != K_AX_INVALID_UI_ELEMENT {
             log_info!(
-                "[raise] ax raised cached: pid={} cgwid={} known_minimized={} set_minimized={:?} raise_first={} set_focused={:?} raise_retry={:?} waited={}ms total={}ms",
+                "[raise] ax raised cached: pid={} cgwid={} known_minimized={} set_minimized={:?} raise_first={} set_focused={:?} raise_retry={:?} app_create_us={} waited={}ms total={}ms",
                 job.pid,
                 job.cgwid,
                 job.minimized,
@@ -1335,6 +1359,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
                 raise_first_err,
                 focused_set_err,
                 raise_retry_err,
+                app_create_us,
                 job.enqueued_at.elapsed().as_millis(),
                 started.elapsed().as_millis()
             );
@@ -1405,10 +1430,10 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
             cache_ax_window_element(job.pid, job.cgwid, element);
             let minimized_set_err = prepare_minimized_target(job, element, minimized_key);
             let (raise_first_err, focused_set_err, raise_retry_err) =
-                raise_ax_element(app, element, focused_key, raise_key);
+                raise_ax_element(job.pid, job.cgwid, app, element, focused_key, raise_key);
             matched = true;
             log_info!(
-                "[raise] ax raised refreshed: pid={} cgwid={} ax_windows={} known_minimized={} set_minimized={:?} raise_first={} set_focused={:?} raise_retry={:?} waited={}ms total={}ms",
+                "[raise] ax raised refreshed: pid={} cgwid={} ax_windows={} known_minimized={} set_minimized={:?} raise_first={} set_focused={:?} raise_retry={:?} app_create_us={} waited={}ms total={}ms",
                 job.pid,
                 job.cgwid,
                 count,
@@ -1417,6 +1442,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
                 raise_first_err,
                 focused_set_err,
                 raise_retry_err,
+                app_create_us,
                 job.enqueued_at.elapsed().as_millis(),
                 started.elapsed().as_millis()
             );
@@ -1451,15 +1477,18 @@ unsafe fn prepare_minimized_target(
     minimized_key: Option<AXUIElementRef>,
 ) -> Option<AXError> {
     let minimized_key = minimized_key?;
+    let restore_started = Instant::now();
     let minimized_set_err = AXUIElementSetAttributeValue(element, minimized_key, kCFBooleanFalse);
+    let restore_us = restore_started.elapsed().as_micros();
     let fast_started = Instant::now();
     let (slps_ok, click_ok) = raise_window_fast(job.pid, job.cgwid);
     log_debug!(
-        "[raise] precise fast after unminimize: pid={} cgwid={} slps={} click={} elapsed={}ms",
+        "[raise] precise fast after unminimize: pid={} cgwid={} slps={} click={} restore_us={} elapsed={}ms",
         job.pid,
         job.cgwid,
         slps_ok,
         click_ok,
+        restore_us,
         fast_started.elapsed().as_millis()
     );
     Some(minimized_set_err)
@@ -1470,17 +1499,43 @@ unsafe fn prepare_minimized_target(
 /// The normal path performs one AXRaise. Only an explicit non-stale failure sets
 /// AXFocusedWindow and retries; a successful raise pays no extra AX IPC.
 unsafe fn raise_ax_element(
+    pid: i32,
+    cgwid: u32,
     app: AXUIElementRef,
     element: AXUIElementRef,
     focused_key: AXUIElementRef,
     raise_key: AXUIElementRef,
 ) -> (AXError, Option<AXError>, Option<AXError>) {
+    let raise_started = Instant::now();
     let raise_first_err = AXUIElementPerformAction(element, raise_key);
+    let raise_first_us = raise_started.elapsed().as_micros();
     if raise_first_err == K_AX_SUCCESS || raise_first_err == K_AX_INVALID_UI_ELEMENT {
+        log_debug!(
+            "[raise] AXRaise first: pid={} cgwid={} err={} elapsed_us={}",
+            pid,
+            cgwid,
+            raise_first_err,
+            raise_first_us
+        );
         return (raise_first_err, None, None);
     }
+    let focused_started = Instant::now();
     let focused_set_err = AXUIElementSetAttributeValue(app, focused_key, element);
+    let focused_us = focused_started.elapsed().as_micros();
+    let retry_started = Instant::now();
     let raise_retry_err = AXUIElementPerformAction(element, raise_key);
+    let retry_us = retry_started.elapsed().as_micros();
+    log_debug!(
+        "[raise] AXRaise fallback: pid={} cgwid={} first_err={} first_us={} set_focused={} focused_us={} retry={} retry_us={}",
+        pid,
+        cgwid,
+        raise_first_err,
+        raise_first_us,
+        focused_set_err,
+        focused_us,
+        raise_retry_err,
+        retry_us
+    );
     (
         raise_first_err,
         Some(focused_set_err),

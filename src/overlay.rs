@@ -1122,6 +1122,7 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         let cgwid = w.window_id;
         let minimized = w.minimized;
         let wt = w.window_title.clone();
+        let release_started = Instant::now();
         log_debug!(
             "Switching to '{}' (pid={} cgwid={})",
             w.app_name,
@@ -1153,6 +1154,12 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         // vanish has already made the panel transparent and resigned key, so it cannot block the
         // target from taking focus.
         activate_and_raise(pid, cgwid, minimized);
+        log_debug!(
+            "[raise] release path complete: pid={} cgwid={} elapsed={}ms",
+            pid,
+            cgwid,
+            release_started.elapsed().as_millis()
+        );
         schedule_delayed_order_out();
         state.focus_key = Some((pid, cgwid));
         bump_window_mru(&mut state.mru, pid, cgwid);
@@ -2177,6 +2184,7 @@ pub(crate) extern "C" fn on_deferred_scroll_hover(
 /// 立即完成可见的快速抬窗,再把 AX 焦点兜底交给后台序列。
 /// Complete the visible fast raise immediately, then enqueue the AX focus backstop.
 pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
+    let activation_started = Instant::now();
     window_server::note_own_focus(pid, cgwid);
 
     if !minimized {
@@ -2188,16 +2196,25 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
         let fast_started = Instant::now();
         let (slps_ok, click_ok) = raise_window_fast(pid, cgwid);
         log_debug!(
-            "[raise] precise fast: pid={} cgwid={} slps={} click={} elapsed={}ms",
+            "[raise] precise fast: pid={} cgwid={} slps={} click={} elapsed={}ms total={}ms",
             pid,
             cgwid,
             slps_ok,
             click_ok,
-            fast_started.elapsed().as_millis()
+            fast_started.elapsed().as_millis(),
+            activation_started.elapsed().as_millis()
         );
     }
 
-    raise_window_ax_async(pid, cgwid, minimized);
+    let generation = raise_window_ax_async(pid, cgwid, minimized);
+    log_debug!(
+        "[raise] activation enqueued: pid={} cgwid={} minimized={} gen={} total={}ms",
+        pid,
+        cgwid,
+        minimized,
+        generation,
+        activation_started.elapsed().as_millis()
+    );
 }
 
 // ========== 浮窗渲染 / overlay rendering ==========
