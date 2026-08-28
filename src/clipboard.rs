@@ -1499,22 +1499,36 @@ fn max_entries() -> usize {
 /// the downsampled preview; persistence-off startup wipes it, while persistence-on startup
 /// sweeps unreferenced files. Test builds use a dedicated directory, never the real cache.
 fn clip_image_cache_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     // 冒烟模式(--smoke-clipboard)走专用目录:真实二进制运行时 cfg!(test) 不生效,
     // 不隔离就会把注入的测试条目写进用户的真实历史/缓存(曾污染真实 history 文件)。
     // Smoke mode (--smoke-clipboard) uses a dedicated dir: the smoke runs the REAL binary,
     // so cfg!(test) is off -- without this, injected test entries used to land in the
     // user's real history/cache.
     let name = if SMOKE_MODE.load(Ordering::SeqCst) {
-        "oh-my-tab-clip-images-smoke".to_string()
+        format!("oh-my-tab-clip-images-smoke-{}", std::process::id())
     } else if cfg!(test) {
         format!(
-            "oh-my-tab-clip-images-test-{:?}",
+            "oh-my-tab-clip-images-test-{}-{:?}",
+            std::process::id(),
             std::thread::current().id()
         )
     } else {
         "oh-my-tab-clip-images".to_string()
     };
+
+    if SMOKE_MODE.load(Ordering::SeqCst) || cfg!(test) {
+        // 测试/冒烟数据从 HOME 改放系统临时目录:Codex 沙箱只允许写工作区和临时目录,
+        // 而 $HOME/Library/Caches 可能可读但不可写;否则缓存测试会在 create_dir_all/
+        // rename 处失败。进程+线程后缀保留并行测试隔离,也避免复用上次运行的残留目录。
+        // Keep test/smoke data under the system temp directory instead of HOME: the Codex
+        // sandbox allows writes in the workspace and temp directories, but may allow reads
+        // while denying writes under $HOME/Library/Caches. Otherwise cache tests fail at
+        // create_dir_all/rename. Process+thread suffixes preserve parallel-test isolation
+        // and avoid reusing a directory from an earlier process.
+        return std::env::temp_dir().join(name);
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     std::path::PathBuf::from(format!("{}/Library/Caches/{}", home, name))
 }
 
@@ -1932,22 +1946,19 @@ struct HistoryFile {
 /// 持久化历史文件路径(与 config.toml 同目录;测试构建走测试目录)。
 /// The persisted-history path (same dir as config.toml; test builds use a test dir).
 fn history_file_path() -> std::path::PathBuf {
+    if SMOKE_MODE.load(Ordering::SeqCst) || cfg!(test) {
+        // 测试/冒烟历史与图片缓存必须共用同一临时根目录;从 HOME 移出是因为 Codex
+        // 沙箱对 $HOME/Library/Caches 的写入受限,而持久化测试会直接创建该目录。
+        // Test/smoke history must share the same temp root as the image cache. It is moved
+        // out of HOME because the Codex sandbox restricts writes to $HOME/Library/Caches,
+        // and persistence tests create this directory directly.
+        return clip_image_cache_dir()
+            .join("history")
+            .join("clipboard-history.toml");
+    }
+
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let dir = if SMOKE_MODE.load(Ordering::SeqCst) {
-        format!(
-            "{}/Library/Caches/oh-my-tab-clip-images-smoke/history",
-            home
-        )
-    } else if cfg!(test) {
-        format!(
-            "{}/Library/Caches/oh-my-tab-clip-images-test-{:?}/history",
-            home,
-            std::thread::current().id()
-        )
-    } else {
-        format!("{}/.config/oh-my-tab", home)
-    };
-    std::path::PathBuf::from(dir).join("clipboard-history.toml")
+    std::path::PathBuf::from(format!("{}/.config/oh-my-tab/clipboard-history.toml", home))
 }
 
 /// 当前是否开启历史持久化(从 CONFIG 读)。
