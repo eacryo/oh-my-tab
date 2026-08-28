@@ -1,8 +1,8 @@
 #!/bin/bash
-# 开发重启脚本:优雅退出旧进程 → 编译最新主二进制 → 后台启动新进程 → 校验存活。
+# 开发重启脚本:优雅退出旧进程 → 编译并组装开发版 .app → 启动 .app → 校验存活。
 # 由 agent 在 cargo fmt/check/clippy/test 全绿后执行(见 AGENTS.md 约定)。
-# Dev restart script: gracefully quit the old process -> build the fresh binary ->
-# start it in the background -> verify it is alive. Run by the agent after the
+# Dev restart script: gracefully quit the old process -> build and assemble the dev .app ->
+# start the .app -> verify it is alive. Run by the agent after the
 # fmt/check/clippy/test gates pass (see the AGENTS.md convention).
 
 # Resolve paths from this script, not from the caller's current directory. This
@@ -10,6 +10,9 @@
 # 根据脚本自身位置定位项目根目录,不依赖调用者当前所在的目录。
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_dir="$(dirname -- "$script_dir")"
+dev_app="$repo_dir/dist/Oh-My-Tab-Dev.app"
+dev_app_binary="$dev_app/Contents/MacOS/oh-my-tab"
+dev_bundle_id="com.eacryo.oh-my-tab.dev"
 
 # 移除脚本上一次提交的用户级 launchd 任务,否则 launchd 会在 pkill 后自动拉起旧实例。
 # Remove the user-level launchd job submitted by the previous run; otherwise launchd
@@ -26,8 +29,16 @@ launchctl bootout "$launch_domain/$launch_label" 2>/dev/null || true
 # new features look dead). Exact path matches only; no error when nothing is running.
 pkill -f 'target/debug/oh-my-tab' 2>/dev/null
 pkill -f 'target/release/oh-my-tab' 2>/dev/null
+pkill -f "$dev_app_binary" 2>/dev/null
 pkill -f '/Applications/Oh-My-Tab.app/Contents/MacOS/oh-my-tab' 2>/dev/null
 sleep 0.5
+
+# 每次都删除旧的开发版 .app,避免旧资源或旧 Info.plist 混入新包。
+# Remove the previous dev .app every time so stale resources or Info.plist data cannot leak
+# into the new bundle. The production dist/Oh-My-Tab.app is never touched.
+if [ -d "$dev_app" ]; then
+    rm -rf "$dev_app"
+fi
 
 # cargo check/clippy/test 不产出主二进制,必须显式 build,否则启动的是旧版。
 # cargo check/clippy/test do not produce the main binary; build explicitly or the OLD
@@ -37,10 +48,58 @@ if ! cargo build --manifest-path "$repo_dir/Cargo.toml" 2>&1; then
     exit 1
 fi
 
+# 组装独立的开发版 .app,让 macOS 按 bundle 身份管理 Accessibility / Screen Recording 授权。
+# Assemble a dedicated dev .app so macOS manages Accessibility / Screen Recording grants by
+# the bundle identity.
+mkdir -p "$dev_app/Contents/MacOS" "$dev_app/Contents/Resources"
+cp "$repo_dir/target/debug/oh-my-tab" "$dev_app_binary"
+cp "$repo_dir/assets/Info.plist" "$dev_app/Contents/Info.plist"
+cp "$repo_dir/assets/AppIcon.icns" "$dev_app/Contents/Resources/AppIcon.icns"
+if [ -d "$repo_dir/assets/AppIcon.icon" ]; then
+    cp -R "$repo_dir/assets/AppIcon.icon" "$dev_app/Contents/Resources/AppIcon.icon"
+fi
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $dev_bundle_id" \
+    "$dev_app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleName Oh-My-Tab Dev" \
+    "$dev_app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Oh-My-Tab Dev" \
+    "$dev_app/Contents/Info.plist"
+
+# 优先使用固定签名身份,让 TCC 授权跨重建保持稳定;开发设备没有证书时允许回退 ad-hoc。
+# Prefer a stable signing identity so TCC grants survive rebuilds; allow ad-hoc fallback on
+# development machines that do not have the certificate.
+sign_identity="oh-my-tab-sign"
+require_stable_signing="${OH_MY_TAB_REQUIRE_STABLE_SIGNING:-0}"
+if /usr/bin/codesign --deep --force \
+    --sign "$sign_identity" \
+    --identifier "$dev_bundle_id" \
+    "$dev_app"; then
+    echo "dev app signed with $sign_identity"
+else
+    if [ "$require_stable_signing" = "1" ]; then
+        echo "restart FAILED: code signing identity '$sign_identity' is unavailable"
+        echo "Create a self-signed Code Signing certificate with this exact name in Keychain Access."
+        exit 1
+    fi
+    echo "warning: '$sign_identity' is unavailable; using ad-hoc signing (TCC grants may not survive rebuilds)"
+    if ! /usr/bin/codesign --deep --force \
+        --sign - \
+        --identifier "$dev_bundle_id" \
+        "$dev_app"; then
+        echo "restart FAILED: ad-hoc code signing failed"
+        exit 1
+    fi
+fi
+if ! /usr/bin/codesign --verify --deep --strict "$dev_app"; then
+    echo "restart FAILED: dev app signature verification failed"
+    exit 1
+fi
+
 # 交给用户级 launchd 托管,脱离当前 Shell/执行器生命周期。
 # Submit to the per-user launchd domain so the process survives the shell/executor lifetime.
 if ! launchctl submit -l "$launch_label" -o /dev/null -e /dev/null -- \
-    "$repo_dir/scripts/dev-launchd-wrapper.sh" "$launch_label" "$repo_dir/target/debug/oh-my-tab"; then
+    "$repo_dir/scripts/dev-launchd-wrapper.sh" "$launch_label" \
+    /usr/bin/open -n -W "$dev_app"; then
     echo "restart FAILED: launchctl submit error"
     exit 1
 fi
