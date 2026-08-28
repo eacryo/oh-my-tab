@@ -426,6 +426,21 @@ fn select_index_after_refresh(
 /// Apply a snapshot on the main thread and merge window-level MRU updates made after
 /// the background task started.
 fn apply_window_refresh() {
+    if overlay::card_close_in_progress() {
+        // 关闭卡片正在收窄补位时保留快照,避免刷新重建 view 树打断过渡动画。
+        // Keep the snapshot pending while close reflow runs, so a refresh cannot rebuild the view tree.
+        unsafe {
+            if let Some(controller) = *CONTROLLER.lock().unwrap() {
+                let _: () = msg_send![
+                    controller.0,
+                    performSelector: sel!(handleWindowRefresh:),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    afterDelay: 0.08f64
+                ];
+            }
+        }
+        return;
+    }
     let Some(result) = WINDOW_REFRESH_RESULT.lock().unwrap().take() else {
         WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
         if let Some(pending_request) = take_pending_refresh_request() {
@@ -1427,6 +1442,18 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(closeCard:),
             on_close_card as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleCardCloseFinished:),
+            overlay::on_card_close_finished as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleCardCloseAXResult:),
+            overlay::on_card_close_ax_result as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(

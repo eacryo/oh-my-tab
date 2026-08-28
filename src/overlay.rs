@@ -80,6 +80,9 @@ const SELECTED_CONTENT_NUDGE: f64 = 2.0;
 /// positive upward, so the thumbnail card root uses +1pt and lifts its caption, preview,
 /// and surface as one unit.
 const SELECTED_CARD_LIFT: f64 = 1.0;
+/// 卡片收窄并补位的动画时长;整个过程保持在一次 AppKit 动画事务内。
+/// Duration of the slot-collapse/reflow animation; the whole transition stays in one AppKit transaction.
+const CARD_CLOSE_ANIMATION_DURATION: f64 = 0.16;
 
 // ========== 浮窗相关全局状态 / overlay global state ==========
 
@@ -152,6 +155,21 @@ static THUMB_SCROLLER_HOVER: Mutex<ThumbnailScrollerHover> = Mutex::new(Thumbnai
     viewport: false,
     knob: false,
 });
+
+/// 正在播放退出动画的窗口;使用稳定窗口身份,不依赖动画期间可能失效的数组索引。
+/// Window currently playing its exit animation; uses stable identity instead of a transient index.
+struct PendingCardClose {
+    pid: i32,
+    cgwid: u32,
+    animation_finished: bool,
+    ax_result: Option<bool>,
+    original_frames: HashMap<WindowKey, NSRect>,
+    final_frames: HashMap<WindowKey, NSRect>,
+    final_row_ranges: Vec<Range<usize>>,
+}
+
+static PENDING_CARD_CLOSE: Mutex<Option<PendingCardClose>> = Mutex::new(None);
+type WindowKey = (i32, u32);
 
 fn clear_thumbnail_scroll_drag() {
     *THUMB_SCROLL_DRAG.lock().unwrap() = None;
@@ -1096,10 +1114,104 @@ fn refresh_after_selection_change(backfill_icons: bool) {
     }
 }
 
-/// 卡片右上角关闭按钮的 action(sender = 关闭按钮):取按钮所在卡片(superview)
-/// 的 index,关闭该窗口。浮窗保持打开。
-/// Action of the card's top-right close button (sender = the button): resolve the
-/// card via the button's superview, close that window. The overlay stays open.
+/// 为关闭动画建立稳定身份到卡片视图的映射;索引会在提交时整体重编号。
+/// Build a stable window-key to card-view map; indices are renumbered only at commit time.
+unsafe fn card_views_by_key(windows: &[WindowInfo]) -> HashMap<WindowKey, *mut AnyObject> {
+    let Some(document) = card_document() else {
+        return HashMap::new();
+    };
+    card_views(document)
+        .into_iter()
+        .filter_map(|card| {
+            let index = get_card_index(card)?;
+            let window = windows.get(index)?;
+            Some(((window.pid, window.window_id), card))
+        })
+        .collect()
+}
+
+/// 在一个 AppKit 动画事务中让关闭卡片横向收窄,并让其余卡片直接移动到新槽位。
+/// In one AppKit animation transaction, collapse the closing card horizontally while moving
+/// every surviving card directly into its new slot.
+unsafe fn animate_card_close_reflow(
+    pending: &PendingCardClose,
+    views: &HashMap<WindowKey, *mut AnyObject>,
+) {
+    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
+    let _: () = msg_send![context, setDuration: CARD_CLOSE_ANIMATION_DURATION];
+    let timing_name = make_nsstring("easeInEaseOut");
+    let timing: *mut AnyObject =
+        msg_send![class!(CAMediaTimingFunction), functionWithName: timing_name];
+    if !timing.is_null() {
+        let _: () = msg_send![context, setTimingFunction: timing];
+    }
+    CFRelease(timing_name as *const c_void);
+
+    for (&key, &card) in views {
+        let Some(original) = pending.original_frames.get(&key) else {
+            continue;
+        };
+        let animator: *mut AnyObject = msg_send![card, animator];
+        if key == (pending.pid, pending.cgwid) {
+            // 用 frame 宽度收窄,而不是 transform.scale;这样后面的卡片可以无缝填入空出的槽位。
+            // Collapse the frame width instead of using transform.scale, so following cards can
+            // occupy the released slot without a visual gap.
+            let layer: *mut AnyObject = msg_send![card, layer];
+            if !layer.is_null() {
+                let _: () = msg_send![layer, removeAllAnimations];
+                let _: () = msg_send![layer, setMasksToBounds: true];
+            }
+            let collapsed = NSRect::new(original.origin, NSSize::new(1.0, original.size.height));
+            let _: () = msg_send![animator, setFrame: collapsed];
+            let _: () = msg_send![animator, setAlphaValue: 0.0f64];
+        } else if let Some(final_frame) = pending.final_frames.get(&key) {
+            let _: () = msg_send![animator, setFrame: *final_frame];
+        }
+    }
+    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+}
+
+/// AX 关闭失败时反向播放同一组 frame 动画,让卡片回到关闭前的位置。
+/// If AX rejects the close, reverse the same frame animation to restore every card.
+unsafe fn restore_card_close_reflow(pending: &PendingCardClose) {
+    let views = card_views_by_key(
+        &TAB_STATE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|state| state.windows.clone())
+            .unwrap_or_default(),
+    );
+    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
+    let _: () = msg_send![context, setDuration: CARD_CLOSE_ANIMATION_DURATION];
+    let timing_name = make_nsstring("easeInEaseOut");
+    let timing: *mut AnyObject =
+        msg_send![class!(CAMediaTimingFunction), functionWithName: timing_name];
+    if !timing.is_null() {
+        let _: () = msg_send![context, setTimingFunction: timing];
+    }
+    CFRelease(timing_name as *const c_void);
+    for (&key, &card) in &views {
+        if let Some(frame) = pending.original_frames.get(&key) {
+            let animator: *mut AnyObject = msg_send![card, animator];
+            let _: () = msg_send![animator, setFrame: *frame];
+            let _: () = msg_send![animator, setAlphaValue: 1.0f64];
+            if key == (pending.pid, pending.cgwid) {
+                let layer: *mut AnyObject = msg_send![card, layer];
+                if !layer.is_null() {
+                    let _: () = msg_send![layer, setMasksToBounds: false];
+                }
+            }
+        }
+    }
+    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+    refresh_highlight();
+}
+
+/// 卡片右上角关闭按钮的 action(sender = 关闭按钮):先播放退出动画,再关闭窗口。
+/// Action of the card's top-right close button: animate the card first, then close the window.
 pub(crate) extern "C" fn on_close_card(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     let card: *mut AnyObject = unsafe { msg_send![sender as *mut AnyObject, superview] };
     if card.is_null() {
@@ -1108,10 +1220,349 @@ pub(crate) extern "C" fn on_close_card(_self: *mut c_void, _cmd: Sel, sender: *m
     let Some(idx) = get_card_index(card) else {
         return;
     };
-    close_window_at(idx);
+    begin_close_window_at(idx, card);
+}
+
+/// 关闭动画是否正在进行;窗口刷新和缩略图回调在此期间必须暂缓结构性更新。
+/// Whether a close transition is active; structural refreshes must wait until it commits.
+pub(crate) fn card_close_in_progress() -> bool {
+    PENDING_CARD_CLOSE.lock().unwrap().is_some()
+}
+
+/// 开始卡片收窄与补位动画;真正的 AX 关闭在后台线程执行。
+/// Start the slot-collapse/reflow animation; the actual AX close runs on a worker thread.
+pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
+    if card_close_in_progress() {
+        return;
+    }
+    let (pending, views) = {
+        let state_opt = TAB_STATE.lock().unwrap();
+        let Some(state) = state_opt.as_ref() else {
+            return;
+        };
+        if !state.visible {
+            return;
+        }
+        let Some(window) = state.windows.get(idx) else {
+            return;
+        };
+        let key = (window.pid, window.window_id);
+        let views = unsafe { card_views_by_key(&state.windows) };
+        if views.get(&key).copied() != Some(card) {
+            return;
+        }
+        let original_frames: HashMap<WindowKey, NSRect> = views
+            .values()
+            .map(|&view| {
+                let frame: NSRect = unsafe { msg_send![view, frame] };
+                let key = state
+                    .windows
+                    .iter()
+                    .find_map(|window| {
+                        let candidate = (window.pid, window.window_id);
+                        (views.get(&candidate).copied() == Some(view)).then_some(candidate)
+                    })
+                    .unwrap();
+                (key, frame)
+            })
+            .collect();
+        let panel_w = unsafe {
+            OVERLAY_WINDOW
+                .lock()
+                .unwrap()
+                .map(|window| {
+                    let frame: NSRect = msg_send![window.0, frame];
+                    frame.size.width
+                })
+                .unwrap_or(1.0)
+        };
+        let overflowed = THUMB_ROW_RANGES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|rows| rows.len() > *THUMB_MAX_ROWS.lock().unwrap());
+        let scrollbar_w = if overflowed { THUMB_SCROLLBAR_W } else { 0.0 };
+        let card_area_w = (panel_w - scrollbar_w).max(1.0);
+        let max_inner = (card_area_w - H_PADDING * 2.0).max(1.0);
+        let card_h = original_frames
+            .get(&key)
+            .map(|frame| frame.size.height)
+            .unwrap_or(1.0);
+        let gap = if crate::theme::thumbnails_enabled() {
+            THUMB_ROW_GAP
+        } else {
+            ICON_CARD_GAP
+        };
+        let mut widths = Vec::with_capacity(state.windows.len().saturating_sub(1));
+        let mut survivor_keys = Vec::with_capacity(state.windows.len().saturating_sub(1));
+        for candidate in &state.windows {
+            let candidate_key = (candidate.pid, candidate.window_id);
+            if candidate_key == key {
+                continue;
+            }
+            let Some(frame) = original_frames.get(&candidate_key) else {
+                return;
+            };
+            survivor_keys.push(candidate_key);
+            widths.push(frame.size.width);
+        }
+        let document_h = (*THUMB_DOCUMENT_HEIGHT.lock().unwrap()).max(1.0);
+        let (placements, final_row_ranges) =
+            plan_thumb_close_reflow(&widths, card_h, card_area_w, max_inner, gap, document_h);
+        let final_frames = placements
+            .into_iter()
+            .filter_map(|placement| {
+                let key = *survivor_keys.get(placement.index)?;
+                Some((
+                    key,
+                    NSRect::new(
+                        NSPoint::new(placement.x, placement.y),
+                        NSSize::new(placement.width, card_h),
+                    ),
+                ))
+            })
+            .collect();
+        (
+            PendingCardClose {
+                pid: window.pid,
+                cgwid: window.window_id,
+                animation_finished: false,
+                ax_result: None,
+                original_frames,
+                final_frames,
+                final_row_ranges,
+            },
+            views,
+        )
+    };
+    let close_key = (pending.pid, pending.cgwid);
+    {
+        let mut closing = PENDING_CARD_CLOSE.lock().unwrap();
+        if closing.is_some() {
+            return;
+        }
+        *closing = Some(pending);
+    }
+
+    unsafe {
+        let pending_ref = PENDING_CARD_CLOSE.lock().unwrap();
+        if let Some(pending) = pending_ref.as_ref() {
+            animate_card_close_reflow(pending, &views);
+        }
+        drop(pending_ref);
+        start_async_ax_close(close_key);
+        let Some(controller) = *crate::CONTROLLER.lock().unwrap() else {
+            *PENDING_CARD_CLOSE.lock().unwrap() = None;
+            return;
+        };
+        let _: () = msg_send![
+            controller.0,
+            performSelector: sel!(handleCardCloseFinished:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: CARD_CLOSE_ANIMATION_DURATION
+        ];
+    }
+}
+
+/// 将 AX 关闭放到后台线程,不让可见的卡片动画等待 AX 查询和消息超时。
+/// Run the AX close off the main thread so visible animation frames never wait on AX queries.
+fn start_async_ax_close(key: WindowKey) {
+    std::thread::spawn(move || {
+        let result = crate::window_collector::close_ax_window(key.0, key.1);
+        {
+            let mut closing = PENDING_CARD_CLOSE.lock().unwrap();
+            if let Some(current) = closing
+                .as_mut()
+                .filter(|current| (current.pid, current.cgwid) == key)
+            {
+                current.ax_result = Some(result);
+            } else {
+                return;
+            }
+        }
+        unsafe {
+            let Some(controller) = *crate::CONTROLLER.lock().unwrap() else {
+                return;
+            };
+            let _: () = msg_send![
+                controller.0,
+                performSelectorOnMainThread: sel!(handleCardCloseAXResult:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
+    });
+}
+
+/// 动画与 AX 结果都完成后,按稳定窗口身份提交列表更新和重排。
+/// Commit the list update and reflow only after both the animation and AX result are ready.
+fn finish_pending_card_close() {
+    let pending = {
+        let mut closing = PENDING_CARD_CLOSE.lock().unwrap();
+        let Some(current) = closing.as_ref() else {
+            return;
+        };
+        if !current.animation_finished || current.ax_result.is_none() {
+            return;
+        }
+        closing.take().unwrap()
+    };
+    if !pending.ax_result.unwrap_or(false) {
+        unsafe {
+            restore_card_close_reflow(&pending);
+        }
+        return;
+    }
+    commit_pending_card_close(pending);
+}
+
+/// 退出动画结束回调;AX 可能已完成,也可能仍在后台执行。
+/// Exit-animation completion callback; AX may already be done or still be running in the worker.
+pub(crate) extern "C" fn on_card_close_finished(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    if let Some(pending) = PENDING_CARD_CLOSE.lock().unwrap().as_mut() {
+        pending.animation_finished = true;
+    }
+    finish_pending_card_close();
+}
+
+/// AX 关闭后台结果回调;与动画回调汇合后再触发 UI 重排。
+/// AX worker result callback; joins the animation callback before triggering UI reflow.
+pub(crate) extern "C" fn on_card_close_ax_result(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    finish_pending_card_close();
+}
+
+/// 提交关闭结果时只移除一张 view,其余 view 保持不变并重新绑定新索引。
+/// Commit a successful close by removing one view only; surviving views are reused and rebound
+/// to their new indices.
+fn commit_pending_card_close(pending: PendingCardClose) {
+    let key = (pending.pid, pending.cgwid);
+    let (old_windows, new_windows, selected, was_visible, became_empty) = {
+        let mut state_opt = TAB_STATE.lock().unwrap();
+        let Some(state) = state_opt.as_mut() else {
+            return;
+        };
+        let Some(actual_idx) = state
+            .windows
+            .iter()
+            .position(|window| (window.pid, window.window_id) == key)
+        else {
+            return;
+        };
+        let old_windows = state.windows.clone();
+        let was_visible = state.visible;
+        state.windows.remove(actual_idx);
+        state.mru.remove(&key);
+        state.selected =
+            remove_window_adjust_selection(state.selected, actual_idx, state.windows.len());
+        state.selected_target_key = state
+            .windows
+            .get(state.selected)
+            .map(|window| (window.pid, window.window_id));
+        let became_empty = state.windows.is_empty();
+        if became_empty {
+            state.visible = false;
+        }
+        (
+            old_windows,
+            state.windows.clone(),
+            state.selected,
+            was_visible,
+            became_empty,
+        )
+    };
+
+    let views = unsafe { card_views_by_key(&old_windows) };
+    unsafe {
+        if let Some(closing_card) = views.get(&key).copied() {
+            remove_card_index(closing_card);
+            let _: () = msg_send![closing_card, removeFromSuperview];
+        }
+        for (index, window) in new_windows.iter().enumerate() {
+            let survivor_key = (window.pid, window.window_id);
+            if let Some(card) = views.get(&survivor_key).copied() {
+                set_card_index(card, index);
+                if let Some(frame) = pending.final_frames.get(&survivor_key) {
+                    let _: () = msg_send![card, setFrame: *frame];
+                }
+            }
+        }
+    }
+
+    if became_empty {
+        if was_visible {
+            hide_overlay();
+        }
+        reset_thumbnail_visible_range();
+        reset_thumbnail_scroll();
+        reset_thumbnail_nav_anchor();
+        return;
+    }
+    if !was_visible {
+        return;
+    }
+
+    // 关闭动画期间保持面板几何不变;提交时只更新滚动元数据,避免重新创建卡片造成闪烁。
+    // Keep panel geometry fixed during the transition; update only scroll metadata at commit,
+    // avoiding a card-tree rebuild that would reintroduce flicker.
+    let card_h = pending
+        .original_frames
+        .get(&key)
+        .map(|frame| frame.size.height)
+        .unwrap_or(1.0);
+    let gap = if crate::theme::thumbnails_enabled() {
+        THUMB_ROW_GAP
+    } else {
+        ICON_CARD_GAP
+    };
+    let max_rows = (*THUMB_MAX_ROWS.lock().unwrap()).max(1);
+    let row_count = pending.final_row_ranges.len();
+    let total_content_h =
+        row_count.max(1) as f64 * card_h + row_count.saturating_sub(1) as f64 * gap;
+    let viewport_rows = row_count.max(1).min(max_rows);
+    let teaser_h = if row_count > max_rows {
+        gap + card_h * THUMB_SCROLL_TEASER_RATIO
+    } else {
+        0.0
+    };
+    let viewport_h =
+        viewport_rows as f64 * card_h + viewport_rows.saturating_sub(1) as f64 * gap + teaser_h;
+    let max_offset = (total_content_h - viewport_h).max(0.0);
+    *THUMB_ROW_RANGES.lock().unwrap() = Some(pending.final_row_ranges);
+    *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = max_offset;
+    let offset = {
+        let mut offset = THUMB_SCROLL_OFFSET.lock().unwrap();
+        *offset = (*offset).min(max_offset);
+        *offset
+    };
+    update_thumbnail_scroll_state(offset);
+    unsafe {
+        apply_thumbnail_clip_offset();
+        if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
+            let frame: NSRect = msg_send![window.0, frame];
+            update_thumbnail_scroller(
+                frame.size.width,
+                frame.size.height,
+                row_count > max_rows,
+                row_count,
+                max_rows,
+            );
+        }
+    }
+    refresh_highlight();
+    update_status_label();
+    log_debug!(
+        "[overlay] close reflow committed: pid={} cgwid={} remaining={} selected={}",
+        pending.pid,
+        pending.cgwid,
+        new_windows.len(),
+        selected
+    );
 }
 
 pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    if card_close_in_progress() {
+        return;
+    }
     let mut state_opt = TAB_STATE.lock().unwrap();
     let state = state_opt.as_mut().unwrap();
     if !state.visible {
@@ -1531,7 +1982,16 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 if !state.windows.is_empty() {
                     let idx = state.selected;
                     drop(state_opt);
-                    close_window_at(idx);
+                    let card = card_document().and_then(|document| {
+                        card_views(document)
+                            .into_iter()
+                            .find(|card| get_card_index(*card) == Some(idx))
+                    });
+                    if let Some(card) = card {
+                        begin_close_window_at(idx, card);
+                    } else {
+                        close_window_at(idx);
+                    }
                 }
             }
             KEY_RETURN => {
@@ -1929,6 +2389,9 @@ pub(crate) extern "C" fn overlay_window_can_become_key(_self: *mut c_void, _cmd:
 /// mouse event tap (hopped here via performSelectorOnMainThread), both with the point
 /// already converted into the overlay's window space.
 pub(crate) fn handle_hover_at(loc: NSPoint) {
+    if card_close_in_progress() {
+        return;
+    }
     // 移动本身即"开门"信号,同时按鼠标当前位置补选中。
     // 为什么要补:浮窗打开瞬间鼠标可能已在卡片下,那次 mouseEntered 被门控吞掉且不会
     // 重发(已 inside)——若只靠 mouseEntered,侧键召唤场景 hover 永远不选中(实测)。
@@ -2421,31 +2884,50 @@ fn remove_window_adjust_selection(selected: usize, removed_idx: usize, new_len: 
 }
 
 /// 关闭第 idx 张卡片对应的窗口(小叉按钮 / Backspace 共用):AX 关闭成功后
-/// 从列表移除、调整选中、重建浮窗;失败则列表不动(日志)。全部关完 → 收起浮窗。
+/// 从列表移除并调整选中;没有对应 view 时才使用重建兜底。全部关完 → 收起浮窗。
 /// Close the window of card `idx` (shared by the close button and Backspace): on a
-/// successful AX close, remove it from the list, adjust the selection and rebuild the
-/// overlay; on failure the list stays (logged). Closing the last one dismisses the overlay.
-pub(crate) fn close_window_at(idx: usize) {
-    let (pid, cgwid, title) = {
+/// successful AX close, remove it from the list and adjust selection; rebuild only as a
+/// fallback when no card view exists. Closing the last one dismisses the overlay.
+pub(crate) fn close_window_at(idx: usize) -> bool {
+    let (pid, cgwid) = {
         let state_opt = TAB_STATE.lock().unwrap();
         let state = match state_opt.as_ref() {
             Some(s) => s,
-            None => return,
+            None => return false,
         };
         match state.windows.get(idx) {
-            Some(w) => (w.pid, w.window_id, w.window_title.clone()),
-            None => return,
+            Some(w) => (w.pid, w.window_id),
+            None => return false,
         }
     };
     if !crate::window_collector::close_ax_window(pid, cgwid) {
         log_info!(
-            "close window FAILED (AX close rejected): pid={} cgwid={} title=\"{}\"",
+            "close window FAILED (AX close rejected): pid={} cgwid={}",
             pid,
-            cgwid,
-            title
+            cgwid
         );
-        return;
+        return false;
     }
+    finish_window_close(idx, pid, cgwid)
+}
+
+/// 没有对应卡片时的同步关闭兜底;正常的卡片关闭走 commit_pending_card_close。
+/// Synchronous fallback for a close without a corresponding card; normal card closes use
+/// commit_pending_card_close.
+fn finish_window_close(idx: usize, pid: i32, cgwid: u32) -> bool {
+    let title = {
+        let state_opt = TAB_STATE.lock().unwrap();
+        let Some(state) = state_opt.as_ref() else {
+            return false;
+        };
+        let Some(window) = state.windows.get(idx) else {
+            return false;
+        };
+        if window.pid != pid || window.window_id != cgwid {
+            return false;
+        }
+        window.window_title.clone()
+    };
     log_info!(
         "close window: pid={} cgwid={} title=\"{}\"",
         pid,
@@ -2456,25 +2938,40 @@ pub(crate) fn close_window_at(idx: usize) {
         let mut state_opt = TAB_STATE.lock().unwrap();
         let state = match state_opt.as_mut() {
             Some(s) => s,
-            None => return,
+            None => return false,
         };
-        state.windows.remove(idx);
+        let was_visible = state.visible;
+        let Some(actual_idx) = state
+            .windows
+            .iter()
+            .position(|window| window.pid == pid && window.window_id == cgwid)
+        else {
+            return false;
+        };
+        state.windows.remove(actual_idx);
         state.mru.remove(&(pid, cgwid));
         if state.windows.is_empty() {
             // 全部关完:收起浮窗,不留在空态。
             // All closed: dismiss the overlay, don't linger on an empty state.
-            hide_overlay();
+            if was_visible {
+                hide_overlay();
+            }
             state.visible = false;
-            return;
+            return true;
         }
-        state.selected = remove_window_adjust_selection(state.selected, idx, state.windows.len());
+        state.selected =
+            remove_window_adjust_selection(state.selected, actual_idx, state.windows.len());
+        if !was_visible {
+            return true;
+        }
     }
-    // 全量重建(布局/窗口尺寸可能随行数变化),再刷新高亮。
-    // Full rebuild (layout/window size may change with the row count), then the highlight.
+    // 兜底路径允许完整重建;卡片关闭按钮本身不会走到这里。
+    // The fallback may rebuild the overlay; the card close-button path never reaches it.
     reset_thumbnail_visible_range();
     reset_thumbnail_nav_anchor();
     show_overlay();
     refresh_highlight();
+    true
 }
 
 /// 视觉隐藏浮窗但**不 orderOut**(窗口保持 ordered)。
@@ -2841,7 +3338,7 @@ pub(crate) fn extract_uncached_icons() {
 /// is replaced by a fresh one built from the updated `WindowInfo` (which now has
 /// an icon_path), preserving its frame and card index.
 pub(crate) fn rebuild_cards(indices: &[usize]) {
-    if indices.is_empty() {
+    if indices.is_empty() || card_close_in_progress() {
         return;
     }
     let affected: HashSet<usize> = indices.iter().copied().collect();
@@ -2914,7 +3411,7 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
 /// without rebuilding captions, buttons, tracking areas, or selection layers. One
 /// ready batch scans the container's subviews once.
 pub(crate) fn refresh_thumbnail_previews(indices: &[usize]) {
-    if indices.is_empty() {
+    if indices.is_empty() || card_close_in_progress() {
         return;
     }
     let affected: HashSet<usize> = indices.iter().copied().collect();
@@ -3752,6 +4249,11 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect, f64) {
 }
 
 pub(crate) fn show_overlay() {
+    if card_close_in_progress() {
+        // 关闭补位期间保持现有 view 树稳定,避免刷新重新创建卡片导致闪烁。
+        // Keep the existing view tree stable during close reflow to avoid rebuild flicker.
+        return;
+    }
     unsafe {
         // TIMING-DEBUG 阶段计时:定位 summon 卡顿——卡片构建 / 图标 / resize / 状态栏。
         let t0 = Instant::now();
@@ -3875,6 +4377,12 @@ pub(crate) fn show_overlay() {
         let card_h_use = layout.card_h;
         let document_h = layout.document_h;
         let card_h_outer = card_h_use;
+        let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
+        // 高度上限基于 visibleFrame,垂直居中也必须使用同一坐标空间。
+        // Otherwise an external display's menu bar/Dock or origin offset leaves
+        // asymmetric empty space and makes the overlay appear not to adapt.
+        let y = (screen_visible.size.height - h) / 2.0 + screen_visible.origin.y;
+        let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
         // 截图像素需求必须在流式布局确定卡片实际高度后计算：同一块 2x 屏上，少窗口
         // 从 1.0 放大到 1.5 也会从 512px 升到 640px；屏幕热插拔则由本次实时 scale
         // 自然触发升级。旧高清缓存切回低需求屏时继续复用。
@@ -3925,12 +4433,6 @@ pub(crate) fn show_overlay() {
         }
         let t_cards_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
-        let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
-        // 高度上限基于 visibleFrame,垂直居中也必须使用同一坐标空间。
-        // Otherwise an external display's menu bar/Dock or origin offset leaves
-        // asymmetric empty space and makes the overlay appear not to adapt.
-        let y = (screen_visible.size.height - h) / 2.0 + screen_visible.origin.y;
-        let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
         let _: () = msg_send![window, setFrame: new_frame, display: false];
 
         // wrapper / VFX view / container all have autoresizingMask = 18

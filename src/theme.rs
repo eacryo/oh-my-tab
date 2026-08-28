@@ -652,6 +652,48 @@ fn build_thumb_scroll_layout(
     }
 }
 
+/// 计算关闭一张卡片后的原位重排坐标,保留当前卡片尺寸和 document 顶部锚点。
+/// Plan in-place coordinates after closing one card while keeping the current card size and
+/// document top anchor stable during the transition.
+pub(crate) fn plan_thumb_close_reflow(
+    widths: &[f64],
+    card_h: f64,
+    card_area_w: f64,
+    max_inner: f64,
+    gap: f64,
+    document_h: f64,
+) -> (Vec<ThumbPlacement>, Vec<Range<usize>>) {
+    let rows = pack_rows(widths, max_inner, gap);
+    let row_ranges = rows
+        .iter()
+        .filter_map(|row| Some(row.first().copied()?..row.last().copied()? + 1))
+        .collect::<Vec<_>>();
+    let document_h = document_h.max(1.0);
+    let mut placements = Vec::with_capacity(widths.len());
+    for (row_index, row) in rows.iter().enumerate() {
+        if row.is_empty() {
+            continue;
+        }
+        let row_w = row.iter().map(|&index| widths[index]).sum::<f64>()
+            + row.len().saturating_sub(1) as f64 * gap;
+        let mut x = (card_area_w - row_w) / 2.0;
+        let y = document_h
+            - THUMB_TOP_INSET
+            - (row_index as f64 + 1.0) * card_h
+            - row_index as f64 * gap;
+        for &index in row {
+            placements.push(ThumbPlacement {
+                index,
+                x,
+                y,
+                width: widths[index],
+            });
+            x += widths[index] + gap;
+        }
+    }
+    (placements, row_ranges)
+}
+
 /// 规划缩略图网格：窗口总数先决定 1.0–1.5 倍尺寸，比例宽度随后平衡分行；
 /// 放不下时保持该尺寸并使用从索引 0 开始的稳定分页。
 /// Plan the thumbnail grid: total window count first determines the 1.0–1.5 scale,
@@ -1378,6 +1420,21 @@ mod flow_tests {
             .map(|placement| placement.y)
             .unwrap();
         assert!((boundary_y - before_y - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn close_reflow_keeps_order_and_fills_the_removed_slot() {
+        let widths = vec![100.0; 5];
+        let (placements, rows) = plan_thumb_close_reflow(&widths, 80.0, 350.0, 220.0, 10.0, 180.0);
+
+        assert_eq!(rows, vec![0..2, 2..4, 4..5]);
+        assert_eq!(
+            placements.iter().map(|p| p.index).collect::<Vec<_>>(),
+            (0..5).collect::<Vec<_>>()
+        );
+        assert_eq!(placements[0].x, placements[2].x);
+        assert_eq!(placements[1].x, placements[3].x);
+        assert!(placements[2].y < placements[0].y);
     }
 }
 
