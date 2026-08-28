@@ -4,7 +4,7 @@
 
 <br />
 
-<div align="center"><b>——&nbsp;&nbsp;&nbsp;纯 Rust 的 macOS 应用切换器、剪贴板历史与鼠标控制&nbsp;&nbsp;&nbsp;——</b></div>
+<div align="center"><b>——&nbsp;&nbsp;&nbsp;以 Windows 的方式使用你的 MacBook：带缩略图的窗口切换、历史剪贴板与鼠标反向滚动&nbsp;&nbsp;&nbsp;——</b></div>
 
 <br />
 
@@ -20,13 +20,13 @@
 
 <br />
 
-一个 macOS 窗口切换器 -- 系统 Cmd+Tab 的替代品。它以**菜单栏辅助应用**方式运行(无 Dock 图标),拦截全局快捷键(默认 **Command+Tab**,可切换为 Option+Tab),弹出一个 **Liquid Glass** 风格的浮层,以卡片形式展示当前打开的窗口,松开快捷键时把选中的窗口抬到最前(SkyLight 私有 API + AX)。
+oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:它以**菜单栏辅助应用**方式运行(无 Dock 图标),拦截全局快捷键(默认 **Command+Tab**,可切换为 Option+Tab),弹出一个 **Liquid Glass** 风格的浮层,以卡片形式展示当前打开的窗口,松开快捷键时把选中的窗口抬到最前(SkyLight 私有 API + AX)。
 
 它是纯 Rust 通过 `objc2` FFI 直接调用 AppKit / CoreGraphics / ApplicationServices -- 没有 Swift 桥接,也没有 Rust UI 框架。
 
 - <img height="14" src="docs/icons/stack.svg"> **原生切换增强**:显示应用名与窗口标题,同一应用的多个窗口分列卡片。
 - <img height="14" src="docs/icons/key.svg"> **键盘导航**:按下 Command/Option 后用 Tab、Shift+Tab、方向键或鼠标选择窗口。
-- <img height="14" src="docs/icons/zap.svg"> **轻量**:纯 Rust——1.5MB 体积、约 35MB 基础内存,内存缩略图缓存上限约 64MB,无 Electron/Tauri。
+- <img height="14" src="docs/icons/zap.svg"> **轻量**:纯 Rust——当前 arm64 release 可执行文件约 3.7MB;实际观测中,开启缩略图和持久化剪贴板的典型活动会话,启动后 footprint 约 80MB,缩略图预热后约 140–160MB。内存缩略图缓存上限约 64MB,无 Electron/Tauri。
 - <img height="14" src="docs/icons/star.svg"> **Liquid Glass**:浮层效果(仅 macOS 26;旧版回退 `NSVisualEffectView`)。
 - <img height="14" src="docs/icons/image.svg"> **窗口缩略图**:标题行在上方、下方为 16:10 实时预览(经私有 WindowServer API 截取,仅存内存)——缓存旧帧即时显示、后台异步刷新;单页时平衡排列,溢出时优先填满 MRU 前面的行并连续滚动。需要**屏幕录制**权限——未授权时自动回退为纯图标卡片。关闭缩略图后会立即释放内存中的窗口截图。
 - <img height="14" src="docs/icons/history.svg"> **窗口级 MRU**:切到某个窗口不会把该应用的其他窗口一起带前。
@@ -108,7 +108,7 @@
 > cargo test        # 单元测试;加 -- --ignored 运行 CG/AX 冒烟测试
 > ```
 
-`cargo run` 以**开发模式**跑裸二进制:日志同时输出到 stdout 和日志文件,开机自启不生效(SMAppService 需要 `.app` bundle)。单元测试默认即可运行(无 GUI 依赖);少量**冒烟测试**标记为 `#[ignore]` —— 它们调用真实的 CG/AX 栈,需要 GUI 会话和辅助功能权限(用 `cargo test -- --ignored` 运行)。
+`cargo run` 以**开发模式**跑裸二进制:日志同时输出到 stdout 和日志文件,开机自启不生效(SMAppService 需要 `.app` bundle)。单元测试默认即可运行(无 GUI 依赖);剪贴板图片/历史测试夹具使用按进程、按线程隔离的系统临时目录,不写用户缓存。少量**冒烟测试**标记为 `#[ignore]` —— 它们调用真实的 CG/AX 栈,需要 GUI 会话和辅助功能权限(用 `cargo test -- --ignored` 运行)。
 
 ### Release `.app` + `.dmg`
 
@@ -117,7 +117,9 @@
 > open dist/Oh-My-Tab.dmg     # 安装:把 Oh-My-Tab 拖到 Applications
 > ```
 
-`bundle.sh` 组装 `dist/Oh-My-Tab.app`(二进制 + `Info.plist`)、做签名,再打成 `dist/Oh-My-Tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。代码改动后需要重新跑该脚本(bundle 在构建时拷贝 release 二进制);脚本会自定位仓库根,可从任意目录运行。
+`bundle.sh` 组装 `dist/Oh-My-Tab.app`(release 二进制、`Info.plist` 和应用图标资源)、做签名,再打成 `dist/Oh-My-Tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。代码改动后需要重新跑该脚本(bundle 在构建时拷贝 release 二进制);脚本会自定位仓库根,可从任意目录运行。
+
+作为参考,本次 arm64 构建测得:未签名 release 可执行文件 3,726,864 字节,签名后 `.app` 内普通文件共 4,524,594 字节,生成的 UDZO `.dmg` 为 3,080,950 字节。这些是当前构建产物的实测值,不是固定保证;源码、Rust 工具链和签名方式都可能改变大小。
 
 ### 代码签名
 
@@ -238,7 +240,7 @@ line_count = 3
 - **输出目标**:`cargo run`(开发态)-> 同时输出到 stdout **和**日志文件;打包的 `.app`(生产态)-> 只写日志文件。
 - **默认文件路径**:`~/Library/Logs/oh-my-tab/oh-my-tab-<启动时间戳>.log` -- **每次启动一个文件**。启动时自动删除默认目录中 mtime 超过 30 天的旧日志(单次长时间运行内无按大小轮转)。
 - **自定义路径**:`[logging] file_path`(直接编辑 `config.toml`,不在设置界面暴露)。用户指定路径**原样**使用、append 模式——不加时间戳、不做任何清理,轮转与保留由你自己负责。
-- **内存诊断**:启动约 60 秒后先记录一行,之后每 5 分钟记录一行 `[mem]`,包含当前功能画像(`mouse:on|off`、`thumbs:on|off`、`clipboard:off|memory|persistent`)、进程 footprint/RSS、采样期间 footprint 峰值、线程数,以及缩略图/剪贴板/窗口账本的估算值。剪贴板账本会拆分文本、预览和元数据;磁盘缓存中的图片原图不计入驻留内存。持久化主要改变历史的生命周期和启动时恢复的条目,不会改变单条记录的 RAM 模型。不记录剪贴板内容或窗口画面。
+- **内存诊断**:启动约 60 秒后先记录一行,之后每 5 分钟记录一行 `[mem]`,包含当前功能画像(`mouse:on|off`、`thumbs:on|off`、`clipboard:off|memory|persistent`)、进程 footprint/RSS、采样期间 footprint 峰值、线程数,以及缩略图/剪贴板/窗口账本的估算值。`footprint` 是 macOS 的 physical footprint 指标,对应活动监视器的「内存」列,是判断内存压力的主要数字;`rss` 是当前驻留内存,会随 macOS 压缩或回收页面而下降。`footprint_peak_sampled` 是应用采样得到的峰值,`rss_peak_kernel` 是内核记录的进程生命周期峰值。近期一次 arm64 会话在开启缩略图和持久化剪贴板时,footprint 从启动后的 84MB 上升到缩略图缓存预热后的约 160MB,随后在后续采样中保持稳定;这只是观测值,不是硬性上限。剪贴板账本会拆分文本、预览和元数据;磁盘缓存中的图片原图不计入驻留内存。持久化主要改变历史的生命周期和启动时恢复的条目,不会改变单条记录的 RAM 模型。不记录剪贴板内容或窗口画面。
 - **隐私**:debug 日志绝不记录具体按键。切换器的按键 tap 只记录 `Tab` / `Command` / `Option`(以及召唤组合名);其余按键一律记成 `Other` -- 不记键码、不记修饰位。
 
 ## <img height="16" src="docs/icons/heart.svg">&nbsp;&nbsp;致谢

@@ -4,7 +4,7 @@
 
 <br />
 
-<div align="center"><b>——&nbsp;&nbsp;&nbsp;macOS app switcher, clipboard history &amp; mouse control, in pure Rust&nbsp;&nbsp;&nbsp;——</b></div>
+<div align="center"><b>——&nbsp;&nbsp;&nbsp;Bring the Windows way to your MacBook: thumbnail window switching, clipboard history &amp; reversed mouse scrolling&nbsp;&nbsp;&nbsp;——</b></div>
 
 <br />
 
@@ -20,13 +20,13 @@
 
 <br />
 
-A macOS window switcher — an alternative to the system Cmd+Tab. It runs as a **menu-bar accessory** app (no Dock icon), intercepts a global shortcut (**Command+Tab** by default, toggleable to Option+Tab), shows a floating **Liquid Glass** overlay of cards for currently-open windows, and raises the selected window on release (via a private SkyLight API plus AX).
+oh-my-tab is a macOS window switcher that complements the system Cmd+Tab: it runs as a **menu-bar accessory** app (no Dock icon), intercepts a global shortcut (**Command+Tab** by default, toggleable to Option+Tab), shows a floating **Liquid Glass** overlay of cards for currently-open windows, and raises the selected window on release (via a private SkyLight API plus AX).
 
 It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly through `objc2` FFI — there is no Swift bridge and no Rust UI framework.
 
 - <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names, window titles, one card per window.
 - <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab, Shift+Tab, arrow keys, or mouse after Command/Option.
-- <img height="14" src="docs/icons/zap.svg"> **Featherweight**: pure Rust — 1.5 MB binary, ~35 MB baseline memory, with the in-memory thumbnail cache bounded at ~64 MB. No Electron/Tauri.
+- <img height="14" src="docs/icons/zap.svg"> **Lightweight**: pure Rust — the current arm64 release executable is about 3.7 MB; observed physical footprint is about 80 MB after startup and 140–160 MB after thumbnails warm in a typical active session with thumbnails and persistent clipboard history enabled. The in-memory thumbnail cache is bounded at ~64 MB. No Electron/Tauri.
 - <img height="14" src="docs/icons/star.svg"> **Liquid Glass**: floating overlay (macOS 26; older macOS falls back to `NSVisualEffectView`).
 - <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: caption row above a 16:10 live preview, captured via a private WindowServer API and cached in memory — cached frames render instantly, background refresh keeps them current; balanced centered rows when they fit, leading MRU rows fill first and scroll continuously when overflowing. Requires **Screen Recording** permission — without it the switcher falls back to icon-only cards. Turning thumbnails off immediately releases cached window frames from memory.
 - <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window never drags the app's others forward.
@@ -108,7 +108,7 @@ Dev-only issues (icon staleness under `cargo run`, mouse control under a debugge
 > cargo test        # unit tests; add -- --ignored for the CG/AX smoke tests
 > ```
 
-`cargo run` launches the raw binary in **dev mode**: logs go to both stdout and the log file, and launch-at-login is inactive (SMAppService needs a `.app` bundle). The unit-test suite runs headless by default; the **smoke tests** are marked `#[ignore]` — they exercise the real CG/AX stack and need a GUI session plus an Accessibility grant (run with `cargo test -- --ignored`).
+`cargo run` launches the raw binary in **dev mode**: logs go to both stdout and the log file, and launch-at-login is inactive (SMAppService needs a `.app` bundle). The unit-test suite runs headless by default; clipboard image/history fixtures use per-process, per-thread temporary directories rather than the user's cache. The **smoke tests** are marked `#[ignore]` — they exercise the real CG/AX stack and need a GUI session plus an Accessibility grant (run with `cargo test -- --ignored`).
 
 ### Release `.app` + `.dmg`
 
@@ -117,7 +117,9 @@ Dev-only issues (icon staleness under `cargo run`, mouse control under a debugge
 > open dist/Oh-My-Tab.dmg     # install: drag Oh-My-Tab into Applications
 > ```
 
-`bundle.sh` assembles `dist/Oh-My-Tab.app` (binary + `Info.plist`), signs it, then packages it into `dist/Oh-My-Tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution. Re-run the script after code changes — it copies the release binary at build time, and self-locates the repo root so it can be run from anywhere.
+`bundle.sh` assembles `dist/Oh-My-Tab.app` (release binary, `Info.plist`, and app icon resources), signs it, then packages it into `dist/Oh-My-Tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution. Re-run the script after code changes — it copies the release binary at build time, and self-locates the repo root so it can be run from anywhere.
+
+For reference, the current arm64 build measured 3,726,864 bytes for the unsigned release executable, 4,524,594 bytes of regular files inside the signed `.app`, and 3,080,950 bytes for the generated UDZO `.dmg`. These are build artifacts rather than size guarantees; source changes, the Rust toolchain, and signing can change them.
 
 ### Code signing
 
@@ -242,7 +244,7 @@ Mouse settings are also exposed in the Settings window (a **device picker** list
 - **Destination**: `cargo run` (dev) → both stdout **and** the log file; a packaged `.app` (prod) → log file only.
 - **Default file path**: `~/Library/Logs/oh-my-tab/oh-my-tab-<startup-timestamp>.log` — one file **per app launch**. Files in the default directory older than 30 days are deleted at startup (no size-based rotation within a single run).
 - **Custom path**: `[logging] file_path` (edit `config.toml` directly; not exposed in Settings). A user-supplied path is used **verbatim**, in append mode — no timestamp is added and no cleanup is performed on it; rotation and retention are yours.
-- **Memory diagnostics**: after roughly 60 seconds, then every 5 minutes, the app records one `[mem]` line containing the active feature profile (`mouse:on|off`, `thumbs:on|off`, `clipboard:off|memory|persistent`), process footprint/RSS, sampled footprint peak, thread count, and estimated thumbnail/clipboard/window ledgers. Clipboard memory is split into text, preview, and metadata estimates; original image bytes in the disk cache are not counted as resident memory. Persistence mainly changes history lifetime and startup restoration, not the per-entry RAM model. It does not record clipboard contents or window imagery.
+- **Memory diagnostics**: after roughly 60 seconds, then every 5 minutes, the app records one `[mem]` line containing the active feature profile (`mouse:on|off`, `thumbs:on|off`, `clipboard:off|memory|persistent`), process footprint/RSS, sampled footprint peak, thread count, and estimated thumbnail/clipboard/window ledgers. `footprint` is the macOS physical-footprint metric used for the Activity Monitor Memory column and is the primary number for memory pressure; `rss` is current resident memory and can fall as macOS compresses or reclaims pages. `footprint_peak_sampled` is sampled by the app, while `rss_peak_kernel` is the kernel's lifetime high-water mark. In a recent arm64 session with thumbnails and persistent clipboard history enabled, footprint rose from 84 MB after startup to about 160 MB after the thumbnail cache warmed, then remained flat through the next samples; this is an observation, not a guaranteed limit. Clipboard memory is split into text, preview, and metadata estimates; original image bytes in the disk cache are not counted as resident memory. Persistence mainly changes history lifetime and startup restoration, not the per-entry RAM model. It does not record clipboard contents or window imagery.
 - **Privacy**: debug logs never record actual keystrokes. The switcher's key tap logs only `Tab` / `Command` / `Option` (and the summon combo name); every other key is logged as plain `Other` — no keycodes, no modifier details.
 
 ## <img height="16" src="docs/icons/heart.svg">&nbsp;&nbsp;Credits
