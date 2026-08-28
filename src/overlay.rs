@@ -1307,8 +1307,15 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             widths.push(frame.size.width);
         }
         let document_h = (*THUMB_DOCUMENT_HEIGHT.lock().unwrap()).max(1.0);
-        let (placements, final_row_ranges) =
-            plan_thumb_close_reflow(&widths, card_h, card_area_w, max_inner, gap, document_h);
+        let (placements, final_row_ranges) = plan_thumb_close_reflow(
+            &widths,
+            card_h,
+            card_area_w,
+            max_inner,
+            gap,
+            document_h,
+            overflowed,
+        );
         let final_frames = placements
             .into_iter()
             .filter_map(|placement| {

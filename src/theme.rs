@@ -662,8 +662,15 @@ pub(crate) fn plan_thumb_close_reflow(
     max_inner: f64,
     gap: f64,
     document_h: f64,
+    overflowed: bool,
 ) -> (Vec<ThumbPlacement>, Vec<Range<usize>>) {
-    let rows = pack_rows(widths, max_inner, gap);
+    // 溢出布局必须继续按 MRU 顺序贪心填行,这样关闭后后续卡片会优先补进空位。
+    // Overflow layouts must keep greedy MRU-order packing so following cards fill the released slot first.
+    let rows = if overflowed {
+        pack_rows_greedy(widths, max_inner, gap)
+    } else {
+        pack_rows(widths, max_inner, gap)
+    };
     let row_ranges = rows
         .iter()
         .filter_map(|row| Some(row.first().copied()?..row.last().copied()? + 1))
@@ -1425,7 +1432,8 @@ mod flow_tests {
     #[test]
     fn close_reflow_keeps_order_and_fills_the_removed_slot() {
         let widths = vec![100.0; 5];
-        let (placements, rows) = plan_thumb_close_reflow(&widths, 80.0, 350.0, 220.0, 10.0, 180.0);
+        let (placements, rows) =
+            plan_thumb_close_reflow(&widths, 80.0, 350.0, 220.0, 10.0, 180.0, false);
 
         assert_eq!(rows, vec![0..2, 2..4, 4..5]);
         assert_eq!(
@@ -1435,6 +1443,17 @@ mod flow_tests {
         assert_eq!(placements[0].x, placements[2].x);
         assert_eq!(placements[1].x, placements[3].x);
         assert!(placements[2].y < placements[0].y);
+    }
+
+    #[test]
+    fn overflow_close_reflow_fills_rows_in_window_order() {
+        let widths = vec![100.0; 9];
+        let (placements, rows) =
+            plan_thumb_close_reflow(&widths, 80.0, 430.0, 320.0, 10.0, 260.0, true);
+
+        assert_eq!(rows, vec![0..3, 3..6, 6..9]);
+        assert_eq!(placements[3].y, placements[0].y - 90.0);
+        assert_eq!(placements[6].y, placements[3].y - 90.0);
     }
 }
 
