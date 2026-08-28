@@ -17,6 +17,14 @@ use crate::ffi::{make_nsstring, CFRelease};
 pub(crate) const STATUS_H: f64 = 36.0;
 /// 窗口内水平内边距 / horizontal padding inside the window
 pub(crate) const H_PADDING: f64 = 32.0;
+/// 浮窗宽度的最大屏幕占比;内容不足时仍按自然尺寸收缩。
+/// Maximum overlay width as a share of the screen; it still shrinks to the
+/// natural content size when there is room.
+pub(crate) const PANEL_MAX_WIDTH_RATIO: f64 = 0.92;
+/// 浮窗高度使用目标屏幕的完整可视区域;内容不足时仍按自然尺寸收缩。
+/// Overlay height uses the target screen's complete visible area; it still
+/// shrinks to the natural content size when there is room.
+pub(crate) const PANEL_MAX_HEIGHT_RATIO: f64 = 1.0;
 /// 纯图标模式的固定卡片尺寸;布局只自动计算每行列数,不缩放卡片。
 /// Fixed icon-only card dimensions; layout computes columns but never scales the cards.
 pub(crate) const ICON_CARD_W: f64 = 140.0;
@@ -139,6 +147,9 @@ pub(crate) const THUMB_ROW_GAP: f64 = 14.0;
 /// 滚动缩略图视口右侧滚动条的保留宽度。
 /// Width reserved for the scrollbar at the right edge of the scrolling thumbnail viewport.
 pub(crate) const THUMB_SCROLLBAR_W: f64 = 14.0;
+/// 溢出滚动时在底部露出的下一行比例,用于提示下方仍有内容。
+/// Fraction of the next row exposed at the bottom of an overflowing viewport.
+pub(crate) const THUMB_SCROLL_TEASER_RATIO: f64 = 1.0 / 3.0;
 /// 卡片内边距(设计稿 .item padding 8px)。/ Card inner padding (.item padding 8px).
 pub(crate) const THUMB_PAD: f64 = 8.0;
 /// 标题行高(设计稿 .caption 34px 含 7px 底距,取净高 24)。/ Caption row height.
@@ -518,8 +529,17 @@ fn build_thumb_scroll_layout(
     let row_pitch = constraints.card_h + constraints.gap;
     let total_content_h = all_rows.len().max(1) as f64 * constraints.card_h
         + all_rows.len().saturating_sub(1) as f64 * constraints.gap;
+    // When content overflows, reserve one extra gap plus a third of a card so the next
+    // row is visibly clipped at the bottom of the viewport. This is an intentional
+    // discoverability affordance, not an additional fully visible row.
+    let teaser_h = if overflowed {
+        constraints.gap + constraints.card_h * THUMB_SCROLL_TEASER_RATIO
+    } else {
+        0.0
+    };
     let viewport_h = viewport_row_count as f64 * constraints.card_h
-        + viewport_row_count.saturating_sub(1) as f64 * constraints.gap;
+        + viewport_row_count.saturating_sub(1) as f64 * constraints.gap
+        + teaser_h;
     let max_scroll_offset = (total_content_h - viewport_h).max(0.0);
     let scroll_offset = scroll_offset.clamp(0.0, max_scroll_offset);
     let max_row_start = all_rows.len().saturating_sub(viewport_row_count);
@@ -530,9 +550,9 @@ fn build_thumb_scroll_layout(
     }
     .min(max_row_start);
     let intra_row_offset = (scroll_offset - row_start as f64 * row_pitch).max(0.0);
-    let has_partial_row = overflowed
-        && intra_row_offset > f64::EPSILON
-        && row_start + viewport_row_count < all_rows.len();
+    // The taller viewport exposes the next row even at an exact row boundary;
+    // fractional scrolling continues to use the same clipped-row path.
+    let has_partial_row = overflowed && row_start + viewport_row_count < all_rows.len();
     let rendered_row_count = viewport_row_count + usize::from(has_partial_row);
     let row_end = (row_start + rendered_row_count).min(all_rows.len());
     let visible = match (
@@ -560,6 +580,7 @@ fn build_thumb_scroll_layout(
     let panel_h = THUMB_TOP_INSET
         + rendered_rows as f64 * constraints.card_h
         + rendered_rows.saturating_sub(1) as f64 * constraints.gap
+        + teaser_h
         + STATUS_H;
     let card_area_w = if overflowed {
         (panel_w - scrollbar_w).max(1.0)
@@ -748,8 +769,8 @@ pub(crate) fn plan_icon_scroll_layout(
     scroll_offset: f64,
 ) -> ThumbFlowLayout {
     let gap = ICON_CARD_GAP;
-    let max_panel_w =
-        (screen_width.max(1.0) * 0.92).max(ICON_CARD_W + H_PADDING * 2.0 + scrollbar_w);
+    let max_panel_w = (screen_width.max(1.0) * PANEL_MAX_WIDTH_RATIO)
+        .max(ICON_CARD_W + H_PADDING * 2.0 + scrollbar_w);
     let max_inner = (max_panel_w - H_PADDING * 2.0 - scrollbar_w).max(ICON_CARD_W);
     let max_columns = ((max_inner + gap) / (ICON_CARD_W + gap)).floor().max(1.0) as usize;
     // 少量窗口仍保留旧版三卡宽基线,但卡片本身始终保持固定尺寸。
@@ -807,9 +828,15 @@ pub(crate) fn plan_icon_scroll_layout(
     let total_content_h = THUMB_TOP_INSET
         + visual_row_count as f64 * ICON_CARD_H
         + visual_row_count.saturating_sub(1) as f64 * gap;
+    let teaser_h = if overflowed {
+        gap + ICON_CARD_H * THUMB_SCROLL_TEASER_RATIO
+    } else {
+        0.0
+    };
     let viewport_content_h = THUMB_TOP_INSET
         + viewport_rows as f64 * ICON_CARD_H
-        + viewport_rows.saturating_sub(1) as f64 * gap;
+        + viewport_rows.saturating_sub(1) as f64 * gap
+        + teaser_h;
     let max_scroll_offset = (total_content_h - viewport_content_h).max(0.0);
     let scroll_offset = scroll_offset.clamp(0.0, max_scroll_offset);
     let max_row_start = row_count.saturating_sub(viewport_rows);
@@ -820,8 +847,7 @@ pub(crate) fn plan_icon_scroll_layout(
     }
     .min(max_row_start);
     let intra_row_offset = (scroll_offset - row_start as f64 * row_pitch).max(0.0);
-    let has_partial_row =
-        row_count > 0 && intra_row_offset > f64::EPSILON && row_start + viewport_rows < row_count;
+    let has_partial_row = row_count > 0 && row_start + viewport_rows < row_count;
     let rendered_row_count = viewport_rows + usize::from(has_partial_row);
     let row_end = (row_start + rendered_row_count).min(row_count);
     let visible = match (
@@ -834,6 +860,7 @@ pub(crate) fn plan_icon_scroll_layout(
     let panel_h = THUMB_TOP_INSET
         + viewport_rows as f64 * ICON_CARD_H
         + viewport_rows.saturating_sub(1) as f64 * gap
+        + teaser_h
         + STATUS_H;
     let document_h = total_content_h;
     let document_panel_h = document_h + STATUS_H;
@@ -1220,8 +1247,8 @@ mod flow_tests {
 
         assert!(first.overflowed);
         assert_eq!(first.row_ranges.len(), 5);
-        assert_eq!(first.visible, 0..8);
-        assert_eq!(next.visible, 4..12);
+        assert_eq!(first.visible, 0..12);
+        assert_eq!(next.visible, 4..16);
         assert_eq!(first.panel_w, next.panel_w);
         assert_eq!(first.panel_h, next.panel_h);
         assert_eq!(first.row_ranges, next.row_ranges);
@@ -1230,7 +1257,7 @@ mod flow_tests {
                 .iter()
                 .map(|placement| placement.index)
                 .collect::<Vec<_>>(),
-            (4..12).collect::<Vec<_>>()
+            (4..16).collect::<Vec<_>>()
         );
     }
 
@@ -1251,7 +1278,7 @@ mod flow_tests {
 
         assert!(layout.overflowed);
         assert_eq!(layout.row_ranges, vec![0..4, 4..8, 8..12, 12..13]);
-        assert_eq!(layout.visible, 0..12);
+        assert_eq!(layout.visible, 0..13);
     }
 
     #[test]
@@ -1288,8 +1315,8 @@ mod flow_tests {
             THUMB_SCROLLBAR_W,
             f64::MAX,
         );
-        assert_eq!(layout.row_start, 3);
-        assert_eq!(layout.visible, 12..20);
+        assert_eq!(layout.row_start, 2);
+        assert_eq!(layout.visible, 8..20);
     }
 
     #[test]
@@ -1388,14 +1415,14 @@ mod icon_scroll_tests {
         assert_eq!(layout.row_ranges, vec![0..7, 7..14, 14..15]);
         assert_eq!(layout.max_rows, 2);
         assert!(layout.overflowed);
-        assert_eq!(layout.visible, 0..14);
+        assert_eq!(layout.visible, 0..15);
         assert!(layout.max_scroll_offset > 0.0);
         assert_eq!(layout.document_placements.len(), 15);
 
         let bottom = plan_icon_scroll_layout(15, 1200.0, 500.0, 14.0, layout.max_scroll_offset);
-        assert_eq!(bottom.row_start, 1);
-        assert_eq!(bottom.visible, 7..15);
-        assert_eq!(bottom.placements.len(), 8);
+        assert_eq!(bottom.row_start, 0);
+        assert_eq!(bottom.visible, 0..15);
+        assert_eq!(bottom.placements.len(), 15);
     }
 
     #[test]

@@ -273,8 +273,9 @@ fn visible_range_for_scroll(
     let max_row_start = rows.len().saturating_sub(viewport_rows);
     let row_start = (offset.max(0.0) / row_pitch).floor() as usize;
     let row_start = row_start.min(max_row_start);
-    let intra_row_offset = (offset.max(0.0) - row_start as f64 * row_pitch).max(0.0);
-    let has_partial_row = intra_row_offset > f64::EPSILON && row_start + viewport_rows < rows.len();
+    // The overflowing viewport intentionally exposes a clipped teaser row at
+    // every non-terminal position, including exact row boundaries.
+    let has_partial_row = row_start + viewport_rows < rows.len();
     let row_end = (row_start + viewport_rows + usize::from(has_partial_row)).min(rows.len());
     let visible = rows[row_start].start..rows[row_end - 1].end;
     (visible, row_start)
@@ -3790,13 +3791,18 @@ pub(crate) fn show_overlay() {
 
         // 两种模式都使用同一个完整 document + 可滚动 viewport 模型。
         // Both modes use the same complete-document plus scrollable-viewport model.
-        let max_panel_h = (screen_visible.size.height * 0.85).max(240.0);
+        // 高度使用目标屏幕完整 visibleFrame;内容少时 panel_h 仍由实际行数自然收缩,
+        // 内容过多时才进入滚动视口。
+        // Height uses the target screen's complete visibleFrame; with fewer rows,
+        // panel_h still shrinks to the natural row count, and only larger content scrolls.
+        let max_panel_h = (screen_visible.size.height * PANEL_MAX_HEIGHT_RATIO).max(240.0);
         let scroll_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
         let layout = if use_flow {
             // 缩略图按窗口比例平衡分行,纯图标则固定卡片尺寸并自动算列数。
             // Thumbnails balance rows by window aspect; icon-only mode uses fixed cards and auto columns.
             let screen_inner = (screen_frame.size.width - H_PADDING * 2.0).max(160.0);
-            let max_panel_w = (screen_frame.size.width * 0.92).max(160.0 + H_PADDING * 2.0);
+            let max_panel_w =
+                (screen_frame.size.width * PANEL_MAX_WIDTH_RATIO).max(160.0 + H_PADDING * 2.0);
             let max_inner = (max_panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W)
                 .min(screen_inner)
                 .max(160.0);
@@ -3920,7 +3926,10 @@ pub(crate) fn show_overlay() {
         let t_cards_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
-        let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
+        // 高度上限基于 visibleFrame,垂直居中也必须使用同一坐标空间。
+        // Otherwise an external display's menu bar/Dock or origin offset leaves
+        // asymmetric empty space and makes the overlay appear not to adapt.
+        let y = (screen_visible.size.height - h) / 2.0 + screen_visible.origin.y;
         let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
         let _: () = msg_send![window, setFrame: new_frame, display: false];
 
