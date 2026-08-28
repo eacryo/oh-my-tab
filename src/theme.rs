@@ -701,6 +701,30 @@ pub(crate) fn plan_thumb_close_reflow(
     (placements, row_ranges)
 }
 
+/// 计算关闭重排后的 document 高度;至少覆盖当前 clip view,避免内容变短后出现非法滚动范围。
+/// Compute the post-close document height; it always covers the current clip view so shrinking
+/// content never leaves the clip view with an invalid scroll range.
+pub(crate) fn thumb_document_height_for_rows(row_count: usize, card_h: f64, gap: f64) -> f64 {
+    THUMB_TOP_INSET + row_count.max(1) as f64 * card_h + row_count.saturating_sub(1) as f64 * gap
+}
+
+/// 同步 document 缩放后的最大偏移、当前偏移与坐标平移量。
+/// Reconcile max/current scroll offsets and the coordinate delta after resizing the document.
+pub(crate) fn rebase_thumb_scroll_after_document_resize(
+    old_document_h: f64,
+    new_document_h: f64,
+    viewport_h: f64,
+    old_offset: f64,
+) -> (f64, f64, f64, f64) {
+    let old_document_h = old_document_h.max(1.0);
+    let viewport_h = viewport_h.max(1.0);
+    let new_document_h = new_document_h.max(viewport_h).max(1.0);
+    let max_offset = (new_document_h - viewport_h).max(0.0);
+    let offset = old_offset.clamp(0.0, max_offset);
+    let delta = new_document_h - old_document_h;
+    (new_document_h, max_offset, offset, delta)
+}
+
 /// 规划缩略图网格：窗口总数先决定 1.0–1.5 倍尺寸，比例宽度随后平衡分行；
 /// 放不下时保持该尺寸并使用从索引 0 开始的稳定分页。
 /// Plan the thumbnail grid: total window count first determines the 1.0–1.5 scale,
@@ -1454,6 +1478,41 @@ mod flow_tests {
         assert_eq!(rows, vec![0..3, 3..6, 6..9]);
         assert_eq!(placements[3].y, placements[0].y - 90.0);
         assert_eq!(placements[6].y, placements[3].y - 90.0);
+    }
+
+    #[test]
+    fn close_scroll_rebase_preserves_visible_content_when_document_shrinks() {
+        let (document_h, max_offset, offset, delta) =
+            rebase_thumb_scroll_after_document_resize(500.0, 400.0, 300.0, 0.0);
+
+        assert_eq!(document_h, 400.0);
+        assert_eq!(max_offset, 100.0);
+        assert_eq!(offset, 0.0);
+
+        let old_origin = 500.0 - 300.0;
+        let old_card_y = 420.0;
+        let new_origin = max_offset - offset;
+        let new_card_y = old_card_y + delta;
+        assert!((old_card_y - old_origin - (new_card_y - new_origin)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn close_scroll_rebase_preserves_fractional_offset() {
+        let (_, max_offset, offset, delta) =
+            rebase_thumb_scroll_after_document_resize(700.0, 600.0, 300.0, 180.0);
+
+        assert_eq!(max_offset, 300.0);
+        assert_eq!(offset, 180.0);
+        assert_eq!(delta, -100.0);
+    }
+
+    #[test]
+    fn close_scroll_rebase_clamps_offset_after_document_shrink() {
+        let (_, max_offset, offset, _) =
+            rebase_thumb_scroll_after_document_resize(700.0, 400.0, 300.0, 400.0);
+
+        assert_eq!(max_offset, 100.0);
+        assert_eq!(offset, 100.0);
     }
 }
 

@@ -166,6 +166,8 @@ struct PendingCardClose {
     original_frames: HashMap<WindowKey, NSRect>,
     final_frames: HashMap<WindowKey, NSRect>,
     final_row_ranges: Vec<Range<usize>>,
+    original_document_h: f64,
+    final_document_h: f64,
 }
 
 static PENDING_CARD_CLOSE: Mutex<Option<PendingCardClose>> = Mutex::new(None);
@@ -1316,6 +1318,18 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             document_h,
             overflowed,
         );
+        let viewport_h = unsafe {
+            CONTAINER
+                .lock()
+                .unwrap()
+                .map(|container| {
+                    let bounds: NSRect = msg_send![container.0, bounds];
+                    bounds.size.height
+                })
+                .unwrap_or(1.0)
+        };
+        let content_h = thumb_document_height_for_rows(final_row_ranges.len(), card_h, gap);
+        let final_document_h = content_h.max(viewport_h).max(1.0);
         let final_frames = placements
             .into_iter()
             .filter_map(|placement| {
@@ -1338,6 +1352,8 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
                 original_frames,
                 final_frames,
                 final_row_ranges,
+                original_document_h: document_h,
+                final_document_h,
             },
             views,
         )
@@ -1479,6 +1495,28 @@ fn commit_pending_card_close(pending: PendingCardClose) {
     };
 
     let views = unsafe { card_views_by_key(&old_windows) };
+    // 提交时把卡片与 document 一起平移;二者使用同一个 delta,所以用户看到的内容不会跳变。
+    // Rebase cards and the document together at commit; sharing one delta keeps visible content
+    // stationary instead of making the page jump while the scrollbar stays at its old position.
+    let old_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+    let viewport_h = unsafe {
+        CONTAINER
+            .lock()
+            .unwrap()
+            .map(|container| {
+                let bounds: NSRect = msg_send![container.0, bounds];
+                bounds.size.height
+            })
+            .unwrap_or(1.0)
+    };
+    let (document_h, max_offset, rebased_offset, document_delta) =
+        rebase_thumb_scroll_after_document_resize(
+            pending.original_document_h,
+            pending.final_document_h,
+            viewport_h,
+            old_offset,
+        );
+
     unsafe {
         if let Some(closing_card) = views.get(&key).copied() {
             remove_card_index(closing_card);
@@ -1489,10 +1527,26 @@ fn commit_pending_card_close(pending: PendingCardClose) {
             if let Some(card) = views.get(&survivor_key).copied() {
                 set_card_index(card, index);
                 if let Some(frame) = pending.final_frames.get(&survivor_key) {
-                    let _: () = msg_send![card, setFrame: *frame];
+                    let rebased_frame = NSRect::new(
+                        NSPoint::new(frame.origin.x, frame.origin.y + document_delta),
+                        frame.size,
+                    );
+                    let _: () = msg_send![card, setFrame: rebased_frame];
                 }
             }
         }
+
+        if let Some(document) = card_document() {
+            let frame: NSRect = msg_send![document, frame];
+            let _: () = msg_send![
+                document,
+                setFrame: NSRect::new(
+                    frame.origin,
+                    NSSize::new(frame.size.width, document_h)
+                )
+            ];
+        }
+        *THUMB_DOCUMENT_HEIGHT.lock().unwrap() = document_h;
     }
 
     if became_empty {
@@ -1508,37 +1562,16 @@ fn commit_pending_card_close(pending: PendingCardClose) {
         return;
     }
 
-    // 关闭动画期间保持面板几何不变;提交时只更新滚动元数据,避免重新创建卡片造成闪烁。
-    // Keep panel geometry fixed during the transition; update only scroll metadata at commit,
-    // avoiding a card-tree rebuild that would reintroduce flicker.
-    let card_h = pending
-        .original_frames
-        .get(&key)
-        .map(|frame| frame.size.height)
-        .unwrap_or(1.0);
-    let gap = if crate::theme::thumbnails_enabled() {
-        THUMB_ROW_GAP
-    } else {
-        ICON_CARD_GAP
-    };
+    // 关闭动画期间保持面板几何不变;提交时原子同步 document 和滚动元数据,避免跳变。
+    // Keep panel geometry fixed during the transition; atomically sync the document and scroll
+    // metadata at commit so the content cannot jump independently of the scrollbar.
     let max_rows = (*THUMB_MAX_ROWS.lock().unwrap()).max(1);
     let row_count = pending.final_row_ranges.len();
-    let total_content_h =
-        row_count.max(1) as f64 * card_h + row_count.saturating_sub(1) as f64 * gap;
-    let viewport_rows = row_count.max(1).min(max_rows);
-    let teaser_h = if row_count > max_rows {
-        gap + card_h * THUMB_SCROLL_TEASER_RATIO
-    } else {
-        0.0
-    };
-    let viewport_h =
-        viewport_rows as f64 * card_h + viewport_rows.saturating_sub(1) as f64 * gap + teaser_h;
-    let max_offset = (total_content_h - viewport_h).max(0.0);
     *THUMB_ROW_RANGES.lock().unwrap() = Some(pending.final_row_ranges);
     *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = max_offset;
     let offset = {
         let mut offset = THUMB_SCROLL_OFFSET.lock().unwrap();
-        *offset = (*offset).min(max_offset);
+        *offset = rebased_offset;
         *offset
     };
     update_thumbnail_scroll_state(offset);
