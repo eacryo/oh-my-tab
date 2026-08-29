@@ -54,7 +54,7 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 
 ## <img height="16" src="docs/icons/image.svg">&nbsp;&nbsp;Screenshots
 
-<p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="Main window"></p>
+<p style="text-align: center;"><img src="docs/pictures/main_window_pure_icon.png" width="640" alt="Main window"></p>
 
 <table style="border-collapse: collapse;">
   <tr>

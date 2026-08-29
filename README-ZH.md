@@ -54,7 +54,7 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 
 ## <img height="16" src="docs/icons/image.svg">&nbsp;&nbsp;截图
 
-<p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="主界面"></p>
+<p style="text-align: center;"><img src="docs/pictures/main_window_pure_icon.png" width="640" alt="主界面"></p>
 
 <table style="border-collapse: collapse;">
   <tr>
