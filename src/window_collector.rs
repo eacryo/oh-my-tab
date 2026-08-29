@@ -540,20 +540,41 @@ pub(crate) unsafe fn focused_window_cgwid(pid: i32) -> Option<u32> {
 unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
     let get_psn = match *GET_PROCESS_FOR_PID {
         Some(f) => f,
-        None => return false,
+        None => {
+            log_info!("[raise] SLPS unavailable: GetProcessForPID symbol missing");
+            return false;
+        }
     };
     let set_front = match *SLP_SET_FRONT {
         Some(f) => f,
-        None => return false,
+        None => {
+            log_info!("[raise] SLPS unavailable: _SLPSSetFrontProcessWithOptions symbol missing");
+            return false;
+        }
     };
     let mut psn = ProcessSerialNumber {
         high_long_of_psn: 0,
         low_long_of_psn: 0,
     };
-    if get_psn(pid, &mut psn) != 0 {
+    let psn_status = get_psn(pid, &mut psn);
+    if psn_status != 0 {
+        log_info!(
+            "[raise] SLPS failed: GetProcessForPID pid={} status={}",
+            pid,
+            psn_status
+        );
         return false;
     }
-    set_front(&mut psn, wid, 0x200) == 0 // kCPSUserGenerated; CGError success == 0
+    let status = set_front(&mut psn, wid, 0x200); // kCPSUserGenerated; CGError success == 0
+    if status != 0 {
+        log_info!(
+            "[raise] SLPS failed: _SLPSSetFrontProcessWithOptions pid={} cgwid={} status={}",
+            pid,
+            wid,
+            status
+        );
+    }
+    status == 0
 }
 
 /// 用 SkyLight 私有 API SLPSPostEventRecordTo 向目标窗口投递一次合成鼠标按下事件，
@@ -579,17 +600,29 @@ unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
 unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
     let get_psn = match *GET_PROCESS_FOR_PID {
         Some(f) => f,
-        None => return false,
+        None => {
+            log_info!("[raise] key click unavailable: GetProcessForPID symbol missing");
+            return false;
+        }
     };
     let post = match *SLPS_POST_EVENT_RECORD {
         Some(f) => f,
-        None => return false,
+        None => {
+            log_info!("[raise] key click unavailable: SLPSPostEventRecordTo symbol missing");
+            return false;
+        }
     };
     let mut psn = ProcessSerialNumber {
         high_long_of_psn: 0,
         low_long_of_psn: 0,
     };
-    if get_psn(pid, &mut psn) != 0 {
+    let psn_status = get_psn(pid, &mut psn);
+    if psn_status != 0 {
+        log_info!(
+            "[raise] key click failed: GetProcessForPID pid={} status={}",
+            pid,
+            psn_status
+        );
         return false;
     }
     // 0x100 字节清零缓冲:记录本身声明长度 0xf8(offset 0x04),多分配防止越界读崩溃。
@@ -606,14 +639,37 @@ unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
     // 0x08 = CGSEventType:一次左键按下即可让目标窗口变 key。
     // 0x08 = CGSEventType: one left-mouse-down makes the target window key.
     bytes[0x08] = 0x01;
-    let ok = post(&mut psn, bytes.as_mut_ptr()) == 0;
-    if !ok {
+    let status = post(&mut psn, bytes.as_mut_ptr());
+    if status != 0 {
         log_info!(
-            "make_key_window: SLPSPostEventRecordTo failed (down={})",
-            ok
+            "[raise] key click failed: SLPSPostEventRecordTo pid={} cgwid={} status={}",
+            pid,
+            wid,
+            status
         );
     }
-    ok
+    status == 0
+}
+
+/// Ask AppKit to activate an application without raising all of its windows.
+/// This is used only after the precise WindowServer path reports a transient failure.
+pub(crate) fn activate_pid(pid: i32) -> bool {
+    unsafe {
+        let app: *mut AnyObject =
+            msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+        if app.is_null() {
+            log_info!("[raise] activate fallback: no running app for pid={}", pid);
+            return false;
+        }
+        let activated: bool = msg_send![app, activateWithOptions: 0usize];
+        if !activated {
+            log_info!(
+                "[raise] activate fallback failed: pid={} activateWithOptions=false",
+                pid
+            );
+        }
+        activated
+    }
 }
 
 fn cf_string_new(s: &str) -> *const c_void {
@@ -1234,6 +1290,7 @@ struct RaiseJob {
     pid: i32,
     cgwid: u32,
     minimized: bool,
+    fast_path_ok: bool,
     generation: u64,
     enqueued_at: Instant,
 }
@@ -1263,7 +1320,12 @@ static RAISE_TX: std::sync::LazyLock<flume::Sender<RaiseJob>> = std::sync::LazyL
 ///
 /// AX enumeration can block tens to hundreds of milliseconds on an unresponsive app; it must
 /// stay off the main thread.
-pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32, minimized: bool) -> u64 {
+pub(crate) fn raise_window_ax_async(
+    pid: i32,
+    cgwid: u32,
+    minimized: bool,
+    fast_path_ok: bool,
+) -> u64 {
     if cgwid == 0 {
         return 0;
     }
@@ -1272,6 +1334,7 @@ pub(crate) fn raise_window_ax_async(pid: i32, cgwid: u32, minimized: bool) -> u6
         pid,
         cgwid,
         minimized,
+        fast_path_ok,
         generation,
         enqueued_at: Instant::now(),
     });
@@ -1301,9 +1364,61 @@ fn run_raise_ax_job(job: RaiseJob) {
     // today; the pool guards against leaks if ObjC calls are ever added.
     unsafe {
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-        raise_window_ax_job(&job, started);
+        let force_ax_focus = if job.minimized || job.fast_path_ok {
+            !job.fast_path_ok
+        } else {
+            !retry_failed_fast_path(&job)
+        };
+        raise_window_ax_job(&job, started, force_ax_focus);
         let _: () = msg_send![pool, drain];
     }
+}
+
+/// Recover a failed synchronous raise without blocking the main thread.
+/// The first attempt already ran at commit time; these retries cover the short-lived
+/// process-table/WindowServer race seen when switching away from another application.
+unsafe fn retry_failed_fast_path(job: &RaiseJob) -> bool {
+    const RETRY_DELAYS_MS: [u64; 2] = [8, 20];
+    let started = Instant::now();
+    let activate_ok = activate_pid(job.pid);
+    let mut last = (false, false);
+    let mut attempts = 0;
+    for delay_ms in RETRY_DELAYS_MS {
+        if !raise_intent_current(job.generation) {
+            log_debug!(
+                "[raise] fast recovery superseded: pid={} cgwid={} gen={}",
+                job.pid,
+                job.cgwid,
+                job.generation
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        attempts += 1;
+        last = raise_window_fast(job.pid, job.cgwid);
+        if last.0 && last.1 {
+            log_debug!(
+                "[raise] fast recovery succeeded: pid={} cgwid={} activate={} attempts={} elapsed={}ms",
+                job.pid,
+                job.cgwid,
+                activate_ok,
+                attempts,
+                started.elapsed().as_millis()
+            );
+            return true;
+        }
+    }
+    log_info!(
+        "[raise] fast recovery exhausted: pid={} cgwid={} activate={} slps={} click={} attempts={} elapsed={}ms",
+        job.pid,
+        job.cgwid,
+        activate_ok,
+        last.0,
+        last.1,
+        attempts,
+        started.elapsed().as_millis()
+    );
+    false
 }
 
 /// AX 阶段本体:缓存命中时普通窗口只执行 AXRaise;已知最小化窗口先还原并补跑快速路径。
@@ -1311,7 +1426,7 @@ fn run_raise_ax_job(job: RaiseJob) {
 /// AX phase: on a cache hit, normal windows only perform AXRaise; known minimized windows are
 /// restored first and then run the fast path. Only a stale/missing cache enumerates AXWindows,
 /// pairs by CGWindowID, and refreshes the cache.
-unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
+unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: bool) {
     let app_started = Instant::now();
     let app = AXUIElementCreateApplication(job.pid);
     if app.is_null() {
@@ -1346,8 +1461,15 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
             return;
         }
         let minimized_set_err = prepare_minimized_target(job, element, minimized_key);
-        let (raise_first_err, focused_set_err, raise_retry_err) =
-            raise_ax_element(job.pid, job.cgwid, app, element, focused_key, raise_key);
+        let (raise_first_err, focused_set_err, raise_retry_err) = raise_ax_element(
+            job.pid,
+            job.cgwid,
+            app,
+            element,
+            focused_key,
+            raise_key,
+            force_ax_focus,
+        );
         let effective_raise_err = raise_retry_err.unwrap_or(raise_first_err);
         if effective_raise_err != K_AX_INVALID_UI_ELEMENT {
             log_info!(
@@ -1429,8 +1551,15 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant) {
             // Refresh the cache with the live element so the next switch skips enumeration.
             cache_ax_window_element(job.pid, job.cgwid, element);
             let minimized_set_err = prepare_minimized_target(job, element, minimized_key);
-            let (raise_first_err, focused_set_err, raise_retry_err) =
-                raise_ax_element(job.pid, job.cgwid, app, element, focused_key, raise_key);
+            let (raise_first_err, focused_set_err, raise_retry_err) = raise_ax_element(
+                job.pid,
+                job.cgwid,
+                app,
+                element,
+                focused_key,
+                raise_key,
+                force_ax_focus,
+            );
             matched = true;
             log_info!(
                 "[raise] ax raised refreshed: pid={} cgwid={} ax_windows={} known_minimized={} set_minimized={:?} raise_first={} set_focused={:?} raise_retry={:?} app_create_us={} waited={}ms total={}ms",
@@ -1505,11 +1634,14 @@ unsafe fn raise_ax_element(
     element: AXUIElementRef,
     focused_key: AXUIElementRef,
     raise_key: AXUIElementRef,
+    force_focus: bool,
 ) -> (AXError, Option<AXError>, Option<AXError>) {
     let raise_started = Instant::now();
     let raise_first_err = AXUIElementPerformAction(element, raise_key);
     let raise_first_us = raise_started.elapsed().as_micros();
-    if raise_first_err == K_AX_SUCCESS || raise_first_err == K_AX_INVALID_UI_ELEMENT {
+    if !force_focus
+        && (raise_first_err == K_AX_SUCCESS || raise_first_err == K_AX_INVALID_UI_ELEMENT)
+    {
         log_debug!(
             "[raise] AXRaise first: pid={} cgwid={} err={} elapsed_us={}",
             pid,

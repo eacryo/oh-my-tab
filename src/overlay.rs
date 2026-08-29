@@ -2691,12 +2691,9 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
     let activation_started = Instant::now();
     window_server::note_own_focus(pid, cgwid);
 
-    if !minimized {
-        // 普通窗口立即走 SLPS + key-window,随后后台只需 cached AXRaise。最小化窗口必须
-        // 先通过 AX 解除最小化,因此其快速路径由 raiser 在线程里按正确顺序执行。
-        // Normal windows run SLPS + key-window immediately, leaving only cached AXRaise for the
-        // background. Minimized windows must be unminimized first, so the raiser performs their
-        // fast path later in the correct order.
+    let fast_path_ok = if minimized {
+        false
+    } else {
         let fast_started = Instant::now();
         let (slps_ok, click_ok) = raise_window_fast(pid, cgwid);
         log_debug!(
@@ -2708,9 +2705,10 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
             fast_started.elapsed().as_millis(),
             activation_started.elapsed().as_millis()
         );
-    }
+        slps_ok && click_ok
+    };
 
-    let generation = raise_window_ax_async(pid, cgwid, minimized);
+    let generation = raise_window_ax_async(pid, cgwid, minimized, fast_path_ok);
     log_debug!(
         "[raise] activation enqueued: pid={} cgwid={} minimized={} gen={} total={}ms",
         pid,
