@@ -2818,6 +2818,13 @@ fn hide_settings() {
     crate::set_settings_activation_policy(false);
 }
 
+/// 从窗口切换浮窗关闭本应用的设置窗口,必须在主线程直接执行,不能通过后台 AX 操作回调。
+/// Close this app's settings window from the switcher. This must run directly on the main thread,
+/// rather than indirectly through a background AX action callback.
+pub(crate) fn close_settings_from_switcher() {
+    hide_settings();
+}
+
 /// 弹一个简单的告警框(app 模态),用于显示校验/保存错误。
 /// Show a simple app-modal alert for validation / save errors.
 fn show_alert(title: &str, msg: &str) {

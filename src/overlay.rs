@@ -921,11 +921,13 @@ mod tests {
 
 // ========== 通用控件 helper / generic control helper ==========
 
-/// 创建一个简单(非 attributed)NSTextField 标签,sizeToFit 后在 container_width 内水平居中。
-/// 被 create_card_view 与 main 的 create_overlay_window(状态栏)共用。
-/// Create a simple (non-attributed) NSTextField label, size it to fit text,
-/// then center it horizontally within `container_width`. Shared by create_card_view
-/// and main's create_overlay_window (status bar).
+/// 创建一个简单(非 attributed)NSTextField 标签,sizeToFit 后在 container_width 内水平居中,
+/// 并按字体真实行高在给定区域内垂直居中。NSTextField 默认按顶部绘字,不能直接把 frame
+/// 撑满容器,否则状态栏等区域里的文字会贴近上边界。
+/// Create a simple (non-attributed) NSTextField label, size it to fit text, center it
+/// horizontally within `container_width`, and vertically center the font's real line height in
+/// the requested area. NSTextField draws glyphs from the top by default, so stretching its frame
+/// to the full container would leave status text too close to the upper boundary.
 pub(crate) unsafe fn make_centered_label(
     text: &str,
     font: *mut AnyObject,
@@ -952,7 +954,14 @@ pub(crate) unsafe fn make_centered_label(
     let fitted: NSRect = msg_send![label, frame];
     let text_w = fitted.size.width;
     let center_x = ((container_width - text_w) / 2.0).max(0.0);
-    let _: () = msg_send![label, setFrame: NSRect::new(NSPoint::new(center_x, y), NSSize::new(text_w, height))];
+    let ascender: f64 = msg_send![font, ascender];
+    let descender: f64 = msg_send![font, descender];
+    let line_h = (ascender - descender + 1.0).max(11.0).min(height.max(1.0));
+    let centered_y = y + (height - line_h) / 2.0;
+    let _: () = msg_send![label, setFrame: NSRect::new(
+        NSPoint::new(center_x, centered_y),
+        NSSize::new(text_w, line_h)
+    )];
     label
 }
 
@@ -1390,6 +1399,23 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
 /// 将 AX 关闭放到后台线程,不让可见的卡片动画等待 AX 查询和消息超时。
 /// Run the AX close off the main thread so visible animation frames never wait on AX queries.
 fn start_async_ax_close(key: WindowKey) {
+    // The settings window belongs to this process. Do not invoke its AX close action from the
+    // worker thread: the custom close callback performs AppKit work and must stay on the main
+    // thread. The pending card-close animation will consume this successful result normally.
+    //
+    // 本进程的设置窗口不能在 worker 线程执行 AXPress:自定义关闭回调包含 AppKit 操作,必须
+    // 留在主线程。这里直接关闭设置窗口,后续仍由原有动画流程消费成功结果。
+    if key.0 == std::process::id() as i32 {
+        crate::settings::close_settings_from_switcher();
+        let mut closing = PENDING_CARD_CLOSE.lock().unwrap();
+        if let Some(current) = closing
+            .as_mut()
+            .filter(|current| (current.pid, current.cgwid) == key)
+        {
+            current.ax_result = Some(true);
+        }
+        return;
+    }
     std::thread::spawn(move || {
         let result = crate::window_collector::close_ax_window(key.0, key.1);
         {
@@ -2776,7 +2802,13 @@ pub(crate) fn update_status_label() {
             f.size.width
         };
         let stat_x = ((container_w - stat_w) / 2.0).max(0.0);
-        let _: () = msg_send![status_label, setFrame: NSRect::new(NSPoint::new(stat_x, 0.0), NSSize::new(stat_w, STATUS_H))];
+        let ascender: f64 = msg_send![status_font, ascender];
+        let descender: f64 = msg_send![status_font, descender];
+        let line_h = (ascender - descender + 1.0).clamp(11.0, STATUS_H);
+        let _: () = msg_send![status_label, setFrame: NSRect::new(
+            NSPoint::new(stat_x, (STATUS_H - line_h) / 2.0),
+            NSSize::new(stat_w, line_h)
+        )];
     }
 }
 
@@ -2871,6 +2903,15 @@ unsafe fn overlay_observer() -> *mut AnyObject {
 /// 浮窗失去 key → 取消切换。
 /// The overlay lost key -> cancel the switch.
 extern "C" fn overlay_window_resigned(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
+    // Closing the settings card intentionally hides our settings window and can make the
+    // nonactivating overlay resign key as a side effect. The close transition owns that focus
+    // change; do not mistake it for a click outside and hide the overlay while it is reflowing.
+    //
+    // 关闭设置卡片会主动隐藏设置窗口,可能连带让非激活切换面板失去 key。这个焦点变化属于
+    // 关闭流程本身,不能在补位动画期间误判为点击外部并收起切换浮窗。
+    if card_close_in_progress() {
+        return;
+    }
     // try_lock 是必须的:切换进行中(activate 目标 app → key 转移)会同步重入本回调,
     // 而 on_cmd_released 全程持 TAB_STATE 锁(非重入)——拿不到锁就跳过:切换本来
     // 就在结束浮窗,无需再取消。同理 hide_overlay 的 orderOut 也会触发本回调,
@@ -2938,6 +2979,15 @@ pub(crate) fn close_window_at(idx: usize) -> bool {
             None => return false,
         }
     };
+    // The settings window belongs to this process. Its custom AX close action would re-enter
+    // AppKit from a background close worker and can crash; close it directly on the main thread.
+    //
+    // 本进程的设置窗口不能走后台关闭线程:它的 AX 关闭动作会回调 AppKit,从后台线程重入
+    // UI 可能崩溃。直接在主线程走设置窗口的关闭路径。
+    if pid == std::process::id() as i32 {
+        crate::settings::close_settings_from_switcher();
+        return finish_window_close(idx, pid, cgwid);
+    }
     if !crate::window_collector::close_ax_window(pid, cgwid) {
         log_info!(
             "close window FAILED (AX close rejected): pid={} cgwid={}",
