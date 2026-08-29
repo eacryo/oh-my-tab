@@ -759,17 +759,23 @@ unsafe fn configure_glass_tint_panel(target: *mut AnyObject) {
 /// Close and detach the system color panel so it cannot mutate a dangling color well after the
 /// settings window is destroyed.
 unsafe fn close_glass_tint_panel(well: *mut AnyObject) {
-    if well.is_null() {
-        return;
-    }
-    let active: bool = msg_send![well, isActive];
-    if active {
-        let _: () = msg_send![well, deactivate];
-        let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
-        let _: () = msg_send![panel, orderOut: std::ptr::null::<AnyObject>()];
+    // NSColorPanel.sharedColorPanel is independent from the settings window, and AppKit can
+    // report the color well as inactive while the shared panel is still visible. Always hide the
+    // panel; `isActive` only decides whether the well needs an additional deactivate call.
+    //
+    // NSColorPanel.sharedColorPanel 独立于设置窗口,而且 AppKit 可能在共享面板仍可见时把
+    // color well 报告为非 active。必须无条件隐藏面板;`isActive` 只能决定是否额外停用色块。
+    if !well.is_null() {
+        let active: bool = msg_send![well, isActive];
+        if active {
+            let _: () = msg_send![well, deactivate];
+        }
     }
     let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
-    let _: () = msg_send![panel, setAccessoryView: std::ptr::null::<AnyObject>()];
+    if !panel.is_null() {
+        let _: () = msg_send![panel, orderOut: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![panel, setAccessoryView: std::ptr::null::<AnyObject>()];
+    }
     restore_glass_tint_group();
 }
 
@@ -3276,14 +3282,20 @@ fn collect_settings_config() -> (Config, Vec<String>) {
 
 /// 构建设置窗口(只建一次,存入 SETTINGS_UI,之后复用、隐藏而非销毁)。
 /// Build the settings window once, store it in SETTINGS_UI, then reuse (hide, not destroy).
-// 设置窗口自定义子类 OhMyTabSettingsWindow:重写 performClose:,让红色关闭按钮走 hide_settings
-// (切回 .accessory),而不是默认的 orderOut(那样不会触发激活策略切换,导致 Dock 图标残留)。
+// 设置窗口自定义子类 OhMyTabSettingsWindow:重写 performClose:/close,让红色关闭按钮和
+// 直接关闭路径都走 hide_settings(切回 .accessory),而不是默认的 orderOut(那样不会触发
+// 激活策略切换,导致 Dock 图标残留,也不会清理独立的共享取色面板)。
 // create_settings_window 在 invalidate 后可能被再次调用,故用 OnceLock 守卫只注册一次。
-// Custom settings window subclass overriding performClose: so the red close button routes through
-// hide_settings (which flips activation policy back to .accessory), instead of the default orderOut
-// (which wouldn't trigger the policy switch, leaving the Dock icon around). create_settings_window
-// can be called again after invalidate_settings_window, so registration is guarded with OnceLock.
+// Custom settings window subclass overriding performClose:/close so both the red close button and
+// direct close paths route through hide_settings (which flips activation policy back to
+// .accessory), instead of the default orderOut (which would not trigger the policy switch or
+// clean up the independent shared color panel). create_settings_window can be called again after
+// invalidate_settings_window, so registration is guarded with OnceLock.
 extern "C" fn settings_window_perform_close(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    hide_settings();
+}
+
+extern "C" fn settings_window_close(_self: *mut c_void, _cmd: Sel) {
     hide_settings();
 }
 
@@ -3359,6 +3371,13 @@ fn settings_window_class() -> *mut AnyObject {
                 sel!(performClose:),
                 settings_window_perform_close as *mut c_void,
                 types.as_ptr(),
+            );
+            let types_close = CString::new("v@:").unwrap(); // -close -> void
+            class_addMethod(
+                cls,
+                sel!(close),
+                settings_window_close as *mut c_void,
+                types_close.as_ptr(),
             );
             let types_key = CString::new("B@:@").unwrap(); // -performKeyEquivalent:(NSEvent*) -> BOOL
             class_addMethod(
