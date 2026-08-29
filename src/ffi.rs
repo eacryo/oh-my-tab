@@ -40,6 +40,23 @@ extern "C" {
     pub(crate) fn AXIsProcessTrusted() -> bool;
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWindowLevelForKey(key: i32) -> i32;
+}
+
+/// Return Apple's overlay window level rather than baking in its current numeric value.
+/// `kCGOverlayWindowLevelKey` is the public CoreGraphics level intended for system-style
+/// overlays. On the current macOS it is 102, just above Telegram's media viewer (101).
+///
+/// 返回系统公开的 overlay 窗口层级,不直接硬编码当前数值。`kCGOverlayWindowLevelKey`
+/// 是 CoreGraphics 为系统浮层提供的公开层级;当前 macOS 为 102,刚好高于 Telegram
+/// 媒体查看器的 101。
+pub(crate) fn cg_overlay_window_level() -> isize {
+    // CGWindowLevelKey::kCGOverlayWindowLevelKey has the numeric enum value 15.
+    unsafe { CGWindowLevelForKey(15) as isize }
+}
+
 // ========== 本进程内存指标(task_info) / own-process memory stats (task_info) ==========
 
 /// kernel `task_vm_info` 的 C 数据布局是 372 字节(93 个 u32 word)。Rust 的 `repr(C)`

@@ -1127,8 +1127,30 @@ fn create_overlay_window() -> *mut AnyObject {
         let window: *mut AnyObject = msg_send![window_cls, alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
 
-        // NSFloatingWindowLevel = 3 (should be above normal windows during app switch)
-        let _: () = msg_send![window, setLevel: 3u64];
+        // Telegram's fullscreen media viewer uses the popup-menu level (101), so the old
+        // NSFloatingWindowLevel (3) was composited underneath it. Use CoreGraphics' public
+        // overlay level instead (currently 102): it is the smallest standard level that puts
+        // this short-lived switcher above app-owned overlays without resorting to screen-saver
+        // level or a Telegram-specific exception.
+        //
+        // Telegram 的全屏媒体查看器使用 popup-menu 层级(101),旧的 NSFloatingWindowLevel(3)
+        // 会被 WindowServer 合成在图片下面。改用 CoreGraphics 公开的 overlay 层级(当前为
+        // 102):这是能盖过应用浮层的最小标准层级,不会像 screen-saver 层级那样过高,也不需要
+        // 为 Telegram 写特例。
+        let _: () = msg_send![window, setLevel: cg_overlay_window_level()];
+
+        // Keep the switcher in the active app's fullscreen Space and out of normal window
+        // cycling/Expose. CanJoinAllApplications is available on the project's macOS 13+
+        // minimum and is specifically intended for floating system-style overlays.
+        //
+        // 允许切换器进入当前应用的全屏 Space,同时不参与普通窗口循环/Expose。项目最低支持
+        // macOS 13,因此可以使用专为跨应用系统浮层提供的 CanJoinAllApplications。
+        let collection_behavior: usize = (1 << 0)  // NSWindowCollectionBehaviorCanJoinAllSpaces
+            | (1 << 3) // NSWindowCollectionBehaviorTransient
+            | (1 << 6) // NSWindowCollectionBehaviorIgnoresCycle
+            | (1 << 8) // NSWindowCollectionBehaviorFullScreenAuxiliary
+            | (1 << 18); // NSWindowCollectionBehaviorCanJoinAllApplications (macOS 13+)
+        let _: () = msg_send![window, setCollectionBehavior: collection_behavior];
 
         // ========== Window transparency / Liquid Glass settings ==========
         //

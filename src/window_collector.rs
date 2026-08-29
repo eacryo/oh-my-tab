@@ -1705,6 +1705,19 @@ fn ax_subrole_kept(subrole: Option<&str>, titled: bool) -> bool {
     }
 }
 
+/// Decide whether an AX-only window may be backfilled into the switcher.
+/// A missing CG entry means an orderOut'd window, which AX can legitimately recover; a known
+/// non-zero CG layer means an app-owned overlay/menu and must stay out of the window switcher.
+///
+/// 判断 AX-only 窗口是否可以补回切换器。CG 中完全没有对应项表示 orderOut 的窗口,AX
+/// 仍可能合法地补回;但如果 CG 已知该窗口处于非 0 层,它就是应用浮层/菜单,不能进入切换器。
+fn should_backfill_ax_window(cg_layer: Option<i32>) -> bool {
+    match cg_layer {
+        Some(layer) => layer == 0,
+        None => true,
+    }
+}
+
 /// 查某 PID 的全部标准 AX 窗口:(cgwid, 标题, 是否最小化)。collect_windows 与
 /// 缩略图模块的启动预生成共用。
 /// All standard AX windows for a PID: (cgwid, title, minimized). Shared between
@@ -2007,26 +2020,34 @@ unsafe fn collect_windows_for_pid_inner(
     let mut app_name = String::new();
     let mut shown = HashSet::new();
     let mut current_cg_ids = HashSet::new();
+    let mut cg_window_layers: HashMap<u32, i32> = HashMap::new();
     let mut windows = Vec::new();
     let count = CFArrayGetCount(array);
 
     for i in 0..count {
         let dict = CFArrayGetValueAtIndex(array, i);
-        if dict.is_null() || cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0 {
+        if dict.is_null() {
+            continue;
+        }
+        let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
+        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+        if owner_pid != pid {
+            continue;
+        }
+        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        if cgwid != 0 {
+            cg_window_layers.insert(cgwid, layer);
+        }
+        if layer != 0 {
             continue;
         }
         if cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0) <= 0.0 {
-            continue;
-        }
-        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
-        if owner_pid != pid {
             continue;
         }
         let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
         if owner_name.is_empty() || owner_name == "Dock" {
             continue;
         }
-        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
         if cgwid != 0 {
             current_cg_ids.insert(cgwid);
         }
@@ -2077,6 +2098,9 @@ unsafe fn collect_windows_for_pid_inner(
             if shown.contains(&cgwid) || (!show_minimized && *minimized) {
                 continue;
             }
+            if !should_backfill_ax_window(cg_window_layers.get(&cgwid).copied()) {
+                continue;
+            }
             if window_title.is_empty() && !titleless {
                 continue;
             }
@@ -2123,7 +2147,12 @@ unsafe fn collect_windows_for_pid_inner(
     // they return as "new" windows and lose their ordering history.
     let live_ids: HashSet<u32> = current_cg_ids
         .into_iter()
-        .chain(ax_wid_to_info.keys().copied())
+        .chain(
+            ax_wid_to_info
+                .keys()
+                .copied()
+                .filter(|cgwid| should_backfill_ax_window(cg_window_layers.get(cgwid).copied())),
+        )
         .collect();
     mru.retain(|(entry_pid, window_id), _| *entry_pid != pid || live_ids.contains(window_id));
     sort_windows_by_mru(&mut windows, mru, now);
@@ -2167,15 +2196,15 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     }
 
     // 不再按 PID 排除本应用(own-PID)窗口:设置窗口也是 own-PID,排除它会导致设置
-    // 开着时切不到它。浮窗自己不需要靠 PID 排除--它 setLevel:3(floating,
-    // kCGWindowLayer != 0)已被下面的 layer 过滤挡掉(与枚举模式无关)。设置窗口
+    // 开着时切不到它。浮窗自己不需要靠 PID 排除--它使用非 0 的 overlay 层级,
+    // kCGWindowLayer != 0,已被下面的 layer 过滤挡掉(与枚举模式无关)。设置窗口
     // 关着时 orderOut 离屏,由下文的 own-PID isOnscreen 过滤排除,故
     // "开->显示为卡片、关->不显示"仍然成立。
     //
     // Own-PID windows are no longer excluded by PID: the settings window is own-PID too, and
     // excluding it would make it unswitchable while open. The overlay itself needs no PID
-    // exclusion -- it's setLevel:3 (floating, kCGWindowLayer != 0), already dropped by the
-    // layer check below (independent of the enumeration mode). The settings window, when
+    // exclusion -- it uses a non-zero overlay level and is dropped by the layer check below
+    // (independent of the enumeration mode). The settings window, when
     // closed, is orderOut'd (off-screen) and excluded by the own-PID isOnscreen filter
     // below, so "open -> shown as a card, closed -> hidden" still holds.
     let mut windows: Vec<WindowInfo> = Vec::new();
@@ -2199,6 +2228,10 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // 第一遍遍历：收集所有 PID，用于批量查询 AX 窗口
     // First pass: collect all PIDs to batch query AX windows
     let mut pids: HashSet<i32> = HashSet::new();
+    // Snapshot every CG window's layer so AX backfill can distinguish orderOut'd windows from
+    // app-owned overlays that were intentionally filtered by the normal layer-0 pass.
+    // 记录所有 CG 窗口的层级,让 AX 补漏区分合法 orderOut 窗口和被 layer-0 遍历主动过滤的应用浮层。
+    let mut cg_window_layers: HashMap<(i32, u32), i32> = HashMap::new();
     // TIMING-DEBUG pid -> 应用名(慢 AX 日志用)/ pid -> app name (for the slow-AX log).
     let mut pid_names: HashMap<i32, String> = HashMap::new();
     for i in 0..count {
@@ -2206,12 +2239,16 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         if dict.is_null() {
             continue;
         }
-        let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
-        if layer != 0 {
-            continue;
-        }
         let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
         if owner_pid <= 0 {
+            continue;
+        }
+        let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
+        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        if cgwid != 0 {
+            cg_window_layers.insert((owner_pid, cgwid), layer);
+        }
+        if layer != 0 {
             continue;
         }
         let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
@@ -2468,6 +2505,18 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             if shown.contains(&(pid, cgwid)) {
                 continue;
             }
+            if !should_backfill_ax_window(cg_window_layers.get(&(pid, cgwid)).copied()) {
+                let layer = cg_window_layers[&(pid, cgwid)];
+                log_debug!(
+                    "[collect] ax-only skipped non-normal layer: pid={} app=\"{}\" cgwid={} layer={} title=\"{}\"",
+                    pid,
+                    pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                    cgwid,
+                    layer,
+                    title
+                );
+                continue;
+            }
             // 与 CG 路径同款过滤:最小化由开关控制;空标题(非 titleless)无意义。
             // Same filters as the CG path: minimized gated by the switch; empty titles
             // (not titleless) are meaningless.
@@ -2559,7 +2608,9 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // memory (they would re-sort to the tail as "new" windows next summon).
     for (&pid, wid_map) in ax_wid_to_info.iter() {
         for &cgwid in wid_map.keys() {
-            live_set.insert((pid, cgwid));
+            if should_backfill_ax_window(cg_window_layers.get(&(pid, cgwid)).copied()) {
+                live_set.insert((pid, cgwid));
+            }
         }
     }
     let pruned = prune_mru(mru, &live_set);
@@ -2817,6 +2868,18 @@ mod tests {
         // 无 subrole(部分 App 不设置)→ 视为标准窗口。
         // Missing subrole (some apps don't set it) -> standard.
         assert!(ax_subrole_kept(None, false));
+    }
+
+    #[test]
+    fn ax_backfill_keeps_ordered_out_windows_but_rejects_overlay_layers() {
+        use super::should_backfill_ax_window;
+
+        // A CG entry missing means orderOut/off-screen; AX may legitimately restore it.
+        assert!(should_backfill_ax_window(None));
+        // Layer 0 is a normal window, even if it was skipped for another display filter.
+        assert!(should_backfill_ax_window(Some(0)));
+        // Non-zero layers are app-owned overlays/menus, not switcher targets.
+        assert!(!should_backfill_ax_window(Some(101)));
     }
 
     fn window(pid: i32, wid: u32) -> WindowInfo {
