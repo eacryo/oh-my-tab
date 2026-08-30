@@ -176,6 +176,9 @@ struct WindowRefreshResult {
     mru: MruMap,
     replace_pid: Option<i32>,
     active_key: Option<(i32, u32)>,
+    // Exact frontmost window resolved during a first-summon refresh.  This must be carried
+    // alongside the snapshot so the first frame does not reuse a stale same-PID focus_key.
+    summon_focus_key: Option<(i32, u32)>,
 }
 
 static WINDOW_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -261,6 +264,24 @@ fn request_window_refresh_request(request: WindowRefreshRequest) {
     start_window_refresh(request);
 }
 
+/// Prefer the exact focus key from the current summon snapshot over a cached key.  Both keys
+/// can belong to the same PID when an app opens or focuses another window (for example Edge's
+/// normal and InPrivate windows), so comparing only the PID is insufficient.
+fn select_summon_focus_key(
+    fresh: Option<(i32, u32)>,
+    cached: Option<(i32, u32)>,
+    windows: &[WindowInfo],
+) -> Option<(i32, u32)> {
+    let is_present = |key: (i32, u32)| {
+        windows
+            .iter()
+            .any(|window| (window.pid, window.window_id) == key)
+    };
+    fresh
+        .filter(|key| is_present(*key))
+        .or_else(|| cached.filter(|key| is_present(*key)))
+}
+
 fn start_window_refresh(request: WindowRefreshRequest) {
     let (generation, mru) = {
         let state_opt = TAB_STATE.lock().unwrap();
@@ -290,15 +311,26 @@ fn start_window_refresh(request: WindowRefreshRequest) {
         .spawn(move || {
             let started = std::time::Instant::now();
             let mut mru = mru;
-            let (windows, replace_pid, active_key) = match request {
-                WindowRefreshRequest::Full(reason) => (
-                    window_collector::collect_windows_with_frontmost_bump(
+            let (windows, replace_pid, active_key, summon_focus_key) = match request {
+                WindowRefreshRequest::Full(reason) => {
+                    let bump_frontmost = reason.bumps_frontmost() && allow_bump;
+                    let windows = window_collector::collect_windows_with_frontmost_bump(
                         &mut mru,
-                        reason.bumps_frontmost() && allow_bump,
-                    ),
-                    None,
-                    None,
-                ),
+                        bump_frontmost,
+                    );
+                    // collect_windows_with_frontmost_bump marks the exact frontmost window as
+                    // the first active item after sorting. Preserve that key for first-summon
+                    // selection; lifecycle refreshes intentionally do not provide this value.
+                    let summon_focus_key = if bump_frontmost {
+                        windows
+                            .iter()
+                            .find(|window| window.is_active)
+                            .map(|window| (window.pid, window.window_id))
+                    } else {
+                        None
+                    };
+                    (windows, None, None, summon_focus_key)
+                }
                 WindowRefreshRequest::Focused { pid, window_id } => {
                     match window_collector::collect_windows_for_pid(&mut mru, pid, window_id) {
                         Some(windows) => {
@@ -306,7 +338,7 @@ fn start_window_refresh(request: WindowRefreshRequest) {
                                 .iter()
                                 .any(|window| window.window_id == window_id)
                                 .then_some((pid, window_id));
-                            (windows, Some(pid), active_key)
+                            (windows, Some(pid), active_key, None)
                         }
                         None => {
                             // 定向 AX 查询失败时保留完整快照兜底,避免误删目标 App 的卡片。
@@ -323,6 +355,7 @@ fn start_window_refresh(request: WindowRefreshRequest) {
                                 ),
                                 None,
                                 None,
+                                None,
                             )
                         }
                     }
@@ -334,6 +367,7 @@ fn start_window_refresh(request: WindowRefreshRequest) {
                 mru,
                 replace_pid,
                 active_key,
+                summon_focus_key,
             });
             log_debug!(
                 "[windows] background refresh ready generation={} elapsed={}ms",
@@ -460,6 +494,7 @@ fn apply_window_refresh() {
         return;
     }
 
+    let summon_focus_key = result.summon_focus_key;
     let subscriptions = window_collector::window_server_candidates();
 
     let (was_visible, set_changed) = {
@@ -573,6 +608,16 @@ fn apply_window_refresh() {
         }
     };
     if let Some((backward, release_pending)) = first_show_request {
+        // The snapshot already resolved the current window exactly. Update the persistent focus
+        // key before prepare_first_summon_state runs; otherwise a stale sibling from the same
+        // app (for example Edge's previous normal window) wins over the new focused window.
+        if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
+            if let Some(focus_key) =
+                select_summon_focus_key(summon_focus_key, state.focus_key, &state.windows)
+            {
+                state.focus_key = Some(focus_key);
+            }
+        }
         if release_pending {
             // Cmd was released while the first snapshot was pending. Commit the selected target
             // without ever displaying the panel; on_cmd_released cannot do this itself because
@@ -2438,6 +2483,25 @@ mod tests {
             .collect();
 
         assert_eq!(keys, vec![(20, 200)]);
+    }
+
+    #[test]
+    fn fresh_summon_focus_key_overrides_stale_same_pid_key() {
+        let windows = vec![window(23199, 2837), window(23199, 13512)];
+
+        let selected =
+            super::select_summon_focus_key(Some((23199, 13512)), Some((23199, 2837)), &windows);
+
+        assert_eq!(selected, Some((23199, 13512)));
+    }
+
+    #[test]
+    fn summon_focus_key_falls_back_to_cached_present_key() {
+        let windows = vec![window(23199, 2837), window(23199, 13512)];
+
+        let selected = super::select_summon_focus_key(None, Some((23199, 2837)), &windows);
+
+        assert_eq!(selected, Some((23199, 2837)));
     }
 
     #[test]
