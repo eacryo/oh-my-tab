@@ -341,6 +341,22 @@ unsafe impl Sync for CachedAxElement {}
 static AX_WINDOW_CACHE: LazyLock<Mutex<HashMap<(i32, u32), CachedAxElement>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// A window that was observed at a non-normal CG layer must keep that classification while the
+/// same process instance and CGWindowID are alive. Some apps (notably Pixelmator-style helpers)
+/// briefly report a floating form at layer 8 and later report the same window at layer 0.
+///
+/// PID alone is deliberately not part of the identity: macOS can recycle it. The process start
+/// timestamp makes a new process incarnation unable to inherit the old window classification.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct WindowInstanceKey {
+    pid: i32,
+    process_start_time_us: u64,
+    cgwid: u32,
+}
+
+static KNOWN_NON_NORMAL_WINDOWS: LazyLock<Mutex<HashSet<WindowInstanceKey>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> *const c_void;
@@ -835,6 +851,9 @@ pub(crate) struct AppIdentity {
     /// 可执行文件 mtime(自 UNIX epoch 的秒数)。None 表示无法校验,退化为「文件存在即有效」。
     /// Executable mtime (seconds since UNIX epoch). None means unverified -> "file exists = valid".
     pub(crate) fingerprint: Option<String>,
+    /// 进程启动时间(自 UNIX epoch 起的微秒),用于区分 PID 复用后的不同进程实例。
+    /// Process start time in microseconds since UNIX epoch, used to distinguish PID reuse.
+    pub(crate) process_start_time_us: Option<u64>,
 }
 
 /// 读一个 NSString 到 Rust String(nil -> None)。对象是 autoreleased,调用方需在池内。
@@ -881,8 +900,19 @@ pub(crate) unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
         return AppIdentity {
             key: format!("pid_{}", pid),
             fingerprint: None,
+            process_start_time_us: None,
         };
     }
+
+    let process_start_time_us = {
+        let launch_date: *mut AnyObject = msg_send![app, launchDate];
+        if launch_date.is_null() {
+            None
+        } else {
+            let seconds: f64 = msg_send![launch_date, timeIntervalSince1970];
+            (seconds.is_finite() && seconds >= 0.0).then_some((seconds * 1_000_000.0) as u64)
+        }
+    };
 
     let bid_obj: *mut AnyObject = msg_send![app, bundleIdentifier];
     let bundle_id = read_nsstring(bid_obj);
@@ -913,7 +943,54 @@ pub(crate) unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
         format!("pid_{}", pid)
     };
 
-    AppIdentity { key, fingerprint }
+    AppIdentity {
+        key,
+        fingerprint,
+        process_start_time_us,
+    }
+}
+
+fn window_instance_key(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+    cgwid: u32,
+) -> Option<WindowInstanceKey> {
+    (pid > 0 && cgwid != 0).then_some(WindowInstanceKey {
+        pid,
+        process_start_time_us: process_start_time_us?,
+        cgwid,
+    })
+}
+
+fn remember_non_normal_window(pid: i32, process_start_time_us: Option<u64>, cgwid: u32) {
+    let Some(key) = window_instance_key(pid, process_start_time_us, cgwid) else {
+        return;
+    };
+    let mut known = KNOWN_NON_NORMAL_WINDOWS.lock().unwrap();
+    // A newly observed process incarnation with the same PID supersedes any stale entries from
+    // the old incarnation. This also bounds the cache when a WindowServer destroy notification
+    // is delayed or lost.
+    known.retain(|entry| {
+        entry.pid != key.pid || entry.process_start_time_us == key.process_start_time_us
+    });
+    known.insert(key);
+}
+
+fn is_known_non_normal_window(pid: i32, process_start_time_us: Option<u64>, cgwid: u32) -> bool {
+    window_instance_key(pid, process_start_time_us, cgwid)
+        .is_some_and(|key| KNOWN_NON_NORMAL_WINDOWS.lock().unwrap().contains(&key))
+}
+
+/// Forget a destroyed window's sticky layer classification. CGWindowID is globally unique while
+/// alive, so removing all entries with this ID is safe and prevents stale state on ID reuse.
+pub(crate) fn forget_non_normal_window(cgwid: u32) {
+    if cgwid == 0 {
+        return;
+    }
+    KNOWN_NON_NORMAL_WINDOWS
+        .lock()
+        .unwrap()
+        .retain(|entry| entry.cgwid != cgwid);
 }
 
 /// 缓存 PNG 路径(支持后缀:"" = 切换器大图,".small" = 剪贴板小图)。
@@ -1718,6 +1795,42 @@ fn should_backfill_ax_window(cg_layer: Option<i32>) -> bool {
     }
 }
 
+fn should_backfill_ax_window_for_process(
+    pid: i32,
+    cgwid: u32,
+    process_start_time_us: Option<u64>,
+    cg_layer: Option<i32>,
+) -> bool {
+    should_backfill_ax_window(cg_layer)
+        && !is_known_non_normal_window(pid, process_start_time_us, cgwid)
+}
+
+fn remember_non_normal_cg_windows(
+    cg_window_layers: &HashMap<(i32, u32), i32>,
+    identities: &HashMap<i32, AppIdentity>,
+) {
+    for (&(pid, cgwid), &layer) in cg_window_layers {
+        if layer != 0 {
+            let process_start_time_us = identities
+                .get(&pid)
+                .and_then(|identity| identity.process_start_time_us);
+            remember_non_normal_window(pid, process_start_time_us, cgwid);
+        }
+    }
+}
+
+fn remember_non_normal_cg_windows_for_process(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+    cg_window_layers: &HashMap<u32, i32>,
+) {
+    for (&cgwid, &layer) in cg_window_layers {
+        if layer != 0 {
+            remember_non_normal_window(pid, process_start_time_us, cgwid);
+        }
+    }
+}
+
 /// 查某 PID 的全部标准 AX 窗口:(cgwid, 标题, 是否最小化)。collect_windows 与
 /// 缩略图模块的启动预生成共用。
 /// All standard AX windows for a PID: (cgwid, title, minimized). Shared between
@@ -2041,6 +2154,9 @@ unsafe fn collect_windows_for_pid_inner(
         if layer != 0 {
             continue;
         }
+        if is_known_non_normal_window(pid, identity.process_start_time_us, cgwid) {
+            continue;
+        }
         if cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0) <= 0.0 {
             continue;
         }
@@ -2089,6 +2205,11 @@ unsafe fn collect_windows_for_pid_inner(
         });
         shown.insert(cgwid);
     }
+    remember_non_normal_cg_windows_for_process(
+        pid,
+        identity.process_start_time_us,
+        &cg_window_layers,
+    );
     CFRelease(array);
 
     // CGWindowList 里没有的 AX 窗口仍然是合法窗口,例如 orderOut 的设置对话框。
@@ -2098,7 +2219,12 @@ unsafe fn collect_windows_for_pid_inner(
             if shown.contains(&cgwid) || (!show_minimized && *minimized) {
                 continue;
             }
-            if !should_backfill_ax_window(cg_window_layers.get(&cgwid).copied()) {
+            if !should_backfill_ax_window_for_process(
+                pid,
+                cgwid,
+                identity.process_start_time_us,
+                cg_window_layers.get(&cgwid).copied(),
+            ) {
                 continue;
             }
             if window_title.is_empty() && !titleless {
@@ -2147,12 +2273,14 @@ unsafe fn collect_windows_for_pid_inner(
     // they return as "new" windows and lose their ordering history.
     let live_ids: HashSet<u32> = current_cg_ids
         .into_iter()
-        .chain(
-            ax_wid_to_info
-                .keys()
-                .copied()
-                .filter(|cgwid| should_backfill_ax_window(cg_window_layers.get(cgwid).copied())),
-        )
+        .chain(ax_wid_to_info.keys().copied().filter(|cgwid| {
+            should_backfill_ax_window_for_process(
+                pid,
+                *cgwid,
+                identity.process_start_time_us,
+                cg_window_layers.get(cgwid).copied(),
+            ) || is_known_non_normal_window(pid, identity.process_start_time_us, *cgwid)
+        }))
         .collect();
     mru.retain(|(entry_pid, window_id), _| *entry_pid != pid || live_ids.contains(window_id));
     sort_windows_by_mru(&mut windows, mru, now);
@@ -2327,6 +2455,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // TIMING-DEBUG Wall clock of the parallel AX phase (NOT the sum of per-PID work
     // times anymore; per-PID work shows in each "ax pid=" line's ms value).
     let ax_total_ms = t_ax.elapsed().as_millis();
+    remember_non_normal_cg_windows(&cg_window_layers, &icon_ids);
 
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
@@ -2358,6 +2487,21 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 
         let cg_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
         let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        if is_known_non_normal_window(
+            owner_pid,
+            icon_ids
+                .get(&owner_pid)
+                .and_then(|identity| identity.process_start_time_us),
+            cgwid,
+        ) {
+            log_debug!(
+                "[collect] sticky non-normal layer: pid={} app=\"{}\" cgwid={} -> dropped",
+                owner_pid,
+                owner_name,
+                cgwid
+            );
+            continue;
+        }
         // bounds (x, y, w, h);解析失败时全 0,调用方会回退到主屏幕。
         // bounds (x, y, w, h); all zeros on parse failure, caller falls back to the main screen.
         let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or((0.0, 0.0, 0.0, 0.0));
@@ -2505,10 +2649,18 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             if shown.contains(&(pid, cgwid)) {
                 continue;
             }
-            if !should_backfill_ax_window(cg_window_layers.get(&(pid, cgwid)).copied()) {
-                let layer = cg_window_layers[&(pid, cgwid)];
+            let process_start_time_us = icon_ids
+                .get(&pid)
+                .and_then(|identity| identity.process_start_time_us);
+            if !should_backfill_ax_window_for_process(
+                pid,
+                cgwid,
+                process_start_time_us,
+                cg_window_layers.get(&(pid, cgwid)).copied(),
+            ) {
+                let layer = cg_window_layers.get(&(pid, cgwid)).copied();
                 log_debug!(
-                    "[collect] ax-only skipped non-normal layer: pid={} app=\"{}\" cgwid={} layer={} title=\"{}\"",
+                    "[collect] ax-only skipped non-normal layer: pid={} app=\"{}\" cgwid={} layer={:?} title=\"{}\"",
                     pid,
                     pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
                     cgwid,
@@ -2607,8 +2759,17 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // count as alive too: merge them in, or the MRU prune would wipe their ordering
     // memory (they would re-sort to the tail as "new" windows next summon).
     for (&pid, wid_map) in ax_wid_to_info.iter() {
+        let process_start_time_us = icon_ids
+            .get(&pid)
+            .and_then(|identity| identity.process_start_time_us);
         for &cgwid in wid_map.keys() {
-            if should_backfill_ax_window(cg_window_layers.get(&(pid, cgwid)).copied()) {
+            if should_backfill_ax_window_for_process(
+                pid,
+                cgwid,
+                process_start_time_us,
+                cg_window_layers.get(&(pid, cgwid)).copied(),
+            ) || is_known_non_normal_window(pid, process_start_time_us, cgwid)
+            {
                 live_set.insert((pid, cgwid));
             }
         }

@@ -604,6 +604,7 @@ extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _arg: *mut c
         }
         window_server::WindowServerEvent::Destroyed(window_id) => {
             log_debug!("[windows] WindowServer destroyed cgwid={}", window_id);
+            window_collector::forget_non_normal_window(*window_id);
             true
         }
         window_server::WindowServerEvent::Focused(window_id) => {
