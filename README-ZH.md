@@ -138,7 +138,7 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;权限与运行须知
 
 - 应用需要 **辅助功能** 权限(`AXIsProcessTrusted`),全局按键事件 tap 和 AX 窗口查询都依赖它。在 *系统设置 -> 隐私与安全性 -> 辅助功能* 中授予。重新编译出的二进制需要重新授权 -- 除非用稳定身份签名(见[代码签名](#代码签名)),此时授权跨 rebuild 持续有效。
-- **窗口缩略图**还需要**屏幕录制**权限(使用与 DockDoor/AltTab 相同的私有 WindowServer 截取 API)。未授权时切换器静默保持纯图标渲染;macOS 14+ 可能周期性要求重新确认该权限。画面帧**仅存内存**——绝不落盘。
+- **窗口缩略图**还需要**屏幕录制**权限(系统设置 -> 隐私与安全性 -> 屏幕录制;使用与 DockDoor/AltTab 相同的私有 WindowServer 截取 API)。未授权时切换器静默保持纯图标渲染;稍后授予权限后无需重启即可恢复缩略图捕获。画面帧**仅存内存**——绝不落盘。
 - 如果事件 tap 创建失败,应用会打印一条错误,快捷键静默失效 -- 几乎总是辅助功能权限没给。
 - 运行时配置:`~/.config/oh-my-tab/config.toml`(首次运行自动按默认值创建)。
 - 图标缓存:`~/Library/Caches/oh-my-tab-icons/{bundle-id}.png`(按应用 bundle id 索引,配 `.meta` mtime sidecar;可从菜单清空)。

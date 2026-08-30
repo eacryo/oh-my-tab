@@ -138,7 +138,7 @@ For the full release pipeline (Homebrew cask generation, the signing rationale, 
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;Permissions & runtime caveats
 
 - The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary must be re-granted -- unless you sign with a stable identity (see [Code signing](#code-signing)), in which case the grant persists across rebuilds.
-- **Window thumbnails** additionally require the **Screen Recording** permission (a private WindowServer capture API is used, same as DockDoor/AltTab). Without it the switcher silently keeps icon-only cards; macOS 14+ may periodically re-ask you to re-confirm this permission. Frames are kept **in memory only** — nothing is ever written to disk.
+- **Window thumbnails** additionally require the **Screen Recording** permission (System Settings → Privacy & Security → Screen Recording). A private WindowServer capture API is used, same as DockDoor/AltTab. Without it the switcher silently keeps icon-only cards; granting it later resumes thumbnail capture without restarting. Frames are kept **in memory only** — nothing is ever written to disk.
 - If the event tap fails to create, the app prints an error and the shortcut silently does nothing — almost always a missing Accessibility grant.
 - Runtime config: `~/.config/oh-my-tab/config.toml` (auto-created with defaults on first run).
 - Icon cache: `~/Library/Caches/oh-my-tab-icons/{bundle-id}.png` (keyed by bundle id, with a `.meta` mtime sidecar; clearable from the menu).
