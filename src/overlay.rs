@@ -974,6 +974,18 @@ pub(crate) unsafe fn make_centered_label(
 /// pop the overlay. Called by apply_window_refresh when it consumes pending_first_show so the
 /// render is single-shot — the shown order is already the final one, no "stale then reorder" jump.
 pub(crate) fn show_first_summon(backward: bool) {
+    prepare_first_summon_state(backward);
+    let t_show = Instant::now();
+    show_overlay();
+    // TIMING-DEBUG 端到端:tap 回调 → 收集完成 → show_overlay。
+    log_debug!("[overlay] summon e2e={}ms", t_show.elapsed().as_millis());
+}
+
+/// Prepare the first summon selection without deciding whether the panel should be displayed.
+///
+/// 首帧选中状态的准备与显示分开,这样在等待快照时收到 CmdReleased 可以直接提交目标,
+/// 而不必先短暂显示再隐藏浮窗。
+fn prepare_first_summon_state(backward: bool) {
     let mut state_opt = TAB_STATE.lock().unwrap();
     let state = state_opt.as_mut().unwrap();
     state.visible = true;
@@ -1017,10 +1029,13 @@ pub(crate) fn show_first_summon(backward: bool) {
     reset_thumbnail_nav_anchor();
     MOUSE_MOVED.store(false, Ordering::Relaxed);
     *HOVER_TICK_POS.lock().unwrap() = None;
-    let t_show = Instant::now();
-    show_overlay();
-    // TIMING-DEBUG 端到端:tap 回调 → 收集完成 → show_overlay。
-    log_debug!("[overlay] summon e2e={}ms", t_show.elapsed().as_millis());
+}
+
+/// Commit a first summon whose Cmd release arrived before the first frame was ready.
+/// The target selection is prepared, but the overlay is never ordered on screen.
+pub(crate) fn commit_first_summon(backward: bool) {
+    prepare_first_summon_state(backward);
+    commit_selected_window(false);
 }
 
 fn step_switcher(backward: bool) {
@@ -1054,6 +1069,8 @@ fn step_switcher(backward: bool) {
         state.visible = false;
         state.pending_first_show = true;
         state.pending_first_backward = backward;
+        state.pending_first_release = false;
+        schedule_first_summon_timeout();
         // TIMING-DEBUG 端到端:tap 回调 → 收集完成 → show_first_summon。
         log_debug!("[overlay] first summon pending (awaiting snapshot)");
         drop(state_opt);
@@ -1067,6 +1084,55 @@ fn step_switcher(backward: bool) {
         drop(state_opt);
         reset_thumbnail_nav_anchor();
         refresh_after_selection_change(true);
+    }
+}
+
+const FIRST_SUMMON_FALLBACK_DELAY: f64 = 0.12;
+
+/// Give a slow AX refresh a short deadline so the switcher can still respond to a held/released
+/// Cmd using the last coherent snapshot. A later refresh result reconciles the visible list.
+fn schedule_first_summon_timeout() {
+    unsafe {
+        let Some(controller) = *crate::CONTROLLER.lock().unwrap() else {
+            return;
+        };
+        let _: () = msg_send![
+            controller.0,
+            performSelector: sel!(handleFirstSummonTimeout:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: FIRST_SUMMON_FALLBACK_DELAY
+        ];
+    }
+}
+
+/// Main-thread deadline for a first summon. The callback is harmless when the real snapshot has
+/// already arrived because apply_window_refresh clears pending_first_show first.
+pub(crate) extern "C" fn on_first_summon_timeout(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    let request = {
+        let mut state_opt = TAB_STATE.lock().unwrap();
+        let Some(state) = state_opt.as_mut() else {
+            return;
+        };
+        if !state.pending_first_show {
+            return;
+        }
+        state.pending_first_show = false;
+        let backward = state.pending_first_backward;
+        let release_pending = state.pending_first_release;
+        state.pending_first_release = false;
+        Some((backward, release_pending))
+    };
+
+    if let Some((backward, release_pending)) = request {
+        log_debug!(
+            "[overlay] first summon deadline reached (release_pending={})",
+            release_pending
+        );
+        if release_pending {
+            commit_first_summon(backward);
+        } else {
+            show_first_summon(backward);
+        }
     }
 }
 
@@ -1629,12 +1695,31 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
     if card_close_in_progress() {
         return;
     }
+    {
+        let mut state_opt = TAB_STATE.lock().unwrap();
+        let Some(state) = state_opt.as_mut() else {
+            return;
+        };
+        if !state.visible {
+            if state.pending_first_show {
+                // The bridge delivered CmdReleased before the AX-backed first frame was ready.
+                // Latch it so apply_window_refresh can commit the eventual default target.
+                state.pending_first_release = true;
+                log_debug!("[overlay] CmdReleased latched while first snapshot is pending");
+            }
+            return;
+        }
+    }
+
+    commit_selected_window(true);
+}
+
+fn commit_selected_window(overlay_was_visible: bool) {
     let mut state_opt = TAB_STATE.lock().unwrap();
     let state = state_opt.as_mut().unwrap();
     if !state.visible {
         return;
     }
-
     if let Some(w) = state.windows.get(state.selected) {
         let pid = w.pid;
         let cgwid = w.window_id;
@@ -1654,7 +1739,9 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
         // Ordering out first disrupts WindowServer focus routing, leaving the target's
         // first-responder unset (caret stops blinking, etc.). Mirrors BetterCmdTab's
         // vanish() -> activate() -> dismiss() sequence.
-        vanish_overlay();
+        if overlay_was_visible {
+            vanish_overlay();
+        }
         // 设置窗口无需特殊处理:浮窗是 nonactivating 面板,召唤时 app 未激活,设置窗口
         // 从未被抬升(从别的 App 召唤时被其窗口盖住;从设置召唤时透过玻璃可见),切走后
         // 留在原位。与 BetterCmdTab 行为一致,无 stash/restore 机制。
@@ -1678,7 +1765,9 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
             cgwid,
             release_started.elapsed().as_millis()
         );
-        schedule_delayed_order_out();
+        if overlay_was_visible {
+            schedule_delayed_order_out();
+        }
         state.focus_key = Some((pid, cgwid));
         bump_window_mru(&mut state.mru, pid, cgwid);
         log_debug!(
@@ -1698,7 +1787,9 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
             state.selected,
             state.windows.len()
         );
-        hide_overlay();
+        if overlay_was_visible {
+            hide_overlay();
+        }
     }
     state.visible = false;
 }
@@ -2836,6 +2927,8 @@ pub(crate) fn reset_switcher() {
     hide_overlay();
     if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
         state.visible = false;
+        state.pending_first_show = false;
+        state.pending_first_release = false;
     }
 }
 

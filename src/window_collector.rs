@@ -335,10 +335,33 @@ struct CachedAxElement(AXUIElementRef);
 unsafe impl Send for CachedAxElement {}
 unsafe impl Sync for CachedAxElement {}
 
-/// `(pid, cgwid) -> AXUIElement` 缓存。普通切换直接复用元素,只有 stale element 才重新枚举。
-/// `(pid, cgwid) -> AXUIElement` cache. Normal raises reuse the element; only stale elements
-/// trigger a fresh AXWindows enumeration.
-static AX_WINDOW_CACHE: LazyLock<Mutex<HashMap<(i32, u32), CachedAxElement>>> =
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct AxWindowCacheKey {
+    pid: i32,
+    process_start_time_us: u64,
+    cgwid: u32,
+}
+
+/// `(process instance, cgwid) -> AXUIElement` 缓存。普通切换直接复用元素,只有 stale
+/// element 才重新枚举;不使用 PID 单独作为身份,避免 PID 复用拿到旧 AX 对象。
+/// `(process instance, cgwid) -> AXUIElement` cache. Normal raises reuse the element; only
+/// stale elements trigger a fresh AXWindows enumeration. PID alone is not an identity because
+/// macOS can recycle it.
+static AX_WINDOW_CACHE: LazyLock<Mutex<HashMap<AxWindowCacheKey, CachedAxElement>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone)]
+struct CachedAxSnapshot {
+    process_start_time_us: Option<u64>,
+    refreshed_at: Instant,
+    windows: Vec<(u32, String, bool)>,
+}
+
+// 短 TTL 只用于合并快速连续的召唤/生命周期刷新;过期后仍会重新向 AX 请求权威快照。
+// The short TTL only coalesces rapid summon/lifecycle refreshes; expiry still requests a fresh
+// authoritative AX snapshot.
+const AX_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(750);
+static AX_SNAPSHOT_CACHE: LazyLock<Mutex<HashMap<i32, CachedAxSnapshot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// A window that was observed at a non-normal CG layer must keep that classification while the
@@ -693,39 +716,67 @@ fn cf_string_new(s: &str) -> *const c_void {
     unsafe { CFStringCreateWithCString(std::ptr::null(), c_str.as_ptr(), 0x08000100) }
 }
 
-unsafe fn cache_ax_window_element(pid: i32, cgwid: u32, element: AXUIElementRef) {
+unsafe fn cache_ax_window_element(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+    cgwid: u32,
+    element: AXUIElementRef,
+) {
+    let Some(process_start_time_us) = process_start_time_us else {
+        return;
+    };
     if cgwid == 0 || element.is_null() {
         return;
     }
+    let key = AxWindowCacheKey {
+        pid,
+        process_start_time_us,
+        cgwid,
+    };
     CFRetain(element);
     let old = AX_WINDOW_CACHE
         .lock()
         .unwrap()
-        .insert((pid, cgwid), CachedAxElement(element));
+        .insert(key, CachedAxElement(element));
     if let Some(old) = old {
         CFRelease(old.0);
     }
 }
 
-unsafe fn cached_ax_window_element(pid: i32, cgwid: u32) -> Option<AXUIElementRef> {
-    let cached = AX_WINDOW_CACHE
-        .lock()
-        .unwrap()
-        .get(&(pid, cgwid))
-        .copied()?;
+unsafe fn cached_ax_window_element(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+    cgwid: u32,
+) -> Option<AXUIElementRef> {
+    let key = AxWindowCacheKey {
+        pid,
+        process_start_time_us: process_start_time_us?,
+        cgwid,
+    };
+    let cached = AX_WINDOW_CACHE.lock().unwrap().get(&key).copied()?;
     // The caller owns this temporary retain and must CFRelease it after the AX operations.
     CFRetain(cached.0);
     Some(cached.0)
 }
 
-unsafe fn invalidate_cached_ax_window_element(pid: i32, cgwid: u32, element: AXUIElementRef) {
+unsafe fn invalidate_cached_ax_window_element(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+    cgwid: u32,
+    element: AXUIElementRef,
+) {
+    let Some(process_start_time_us) = process_start_time_us else {
+        return;
+    };
+    let key = AxWindowCacheKey {
+        pid,
+        process_start_time_us,
+        cgwid,
+    };
     let removed = {
         let mut cache = AX_WINDOW_CACHE.lock().unwrap();
-        if cache
-            .get(&(pid, cgwid))
-            .is_some_and(|cached| cached.0 == element)
-        {
-            cache.remove(&(pid, cgwid))
+        if cache.get(&key).is_some_and(|cached| cached.0 == element) {
+            cache.remove(&key)
         } else {
             None
         }
@@ -740,7 +791,7 @@ pub(crate) fn clear_ax_window_cache_for_pid(pid: i32) {
         .lock()
         .unwrap()
         .keys()
-        .filter(|(cached_pid, _)| *cached_pid == pid)
+        .filter(|key| key.pid == pid)
         .copied()
         .collect();
     let removed: Vec<_> = keys
@@ -750,6 +801,40 @@ pub(crate) fn clear_ax_window_cache_for_pid(pid: i32) {
     for element in removed {
         unsafe { CFRelease(element.0) };
     }
+    AX_SNAPSHOT_CACHE.lock().unwrap().remove(&pid);
+}
+
+fn cached_ax_snapshot(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+) -> Option<Vec<(u32, String, bool)>> {
+    let start = process_start_time_us?;
+    let cache = AX_SNAPSHOT_CACHE.lock().unwrap();
+    let snapshot = cache.get(&pid)?;
+    if snapshot.process_start_time_us != Some(start)
+        || snapshot.refreshed_at.elapsed() > AX_SNAPSHOT_CACHE_TTL
+    {
+        return None;
+    }
+    Some(snapshot.windows.clone())
+}
+
+fn cache_ax_snapshot(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+    windows: &[(u32, String, bool)],
+) {
+    if process_start_time_us.is_none() {
+        return;
+    }
+    AX_SNAPSHOT_CACHE.lock().unwrap().insert(
+        pid,
+        CachedAxSnapshot {
+            process_start_time_us,
+            refreshed_at: Instant::now(),
+            windows: windows.to_vec(),
+        },
+    );
 }
 
 fn cf_dict_get_string(dict: *const c_void, key: &str) -> Option<String> {
@@ -1510,6 +1595,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
         log_info!("[raise] ax skipped: no AX app for pid={}", job.pid);
         return;
     }
+    let process_start_time_us = resolve_app_identity(job.pid).process_start_time_us;
     let app_create_us = app_started.elapsed().as_micros();
     // 1s 消息超时:无响应 App 不能把 raiser 线程卡太久(旧同步实现无超时,最坏按默认
     // 超时阻塞主线程);超时只损失焦点兜底,快速路径的 SLPS 抬窗不受影响。
@@ -1526,7 +1612,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
     // 一次 AXWindows IPC；只有元素失效时才回退到下面的实时枚举。
     // collect_windows retains the AX element for the current window. Reuse it for normal
     // switches to avoid an AXWindows IPC round trip; only stale elements use the live scan below.
-    if let Some(element) = cached_ax_window_element(job.pid, job.cgwid) {
+    if let Some(element) = cached_ax_window_element(job.pid, process_start_time_us, job.cgwid) {
         if !raise_intent_current(job.generation) {
             CFRelease(element);
             CFRelease(raise_key);
@@ -1577,7 +1663,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
             job.cgwid,
             effective_raise_err
         );
-        invalidate_cached_ax_window_element(job.pid, job.cgwid, element);
+        invalidate_cached_ax_window_element(job.pid, process_start_time_us, job.cgwid, element);
         CFRelease(element);
     }
 
@@ -1626,7 +1712,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
             }
             // 找到实时元素后更新缓存,下一次切换就不必重新枚举。
             // Refresh the cache with the live element so the next switch skips enumeration.
-            cache_ax_window_element(job.pid, job.cgwid, element);
+            cache_ax_window_element(job.pid, process_start_time_us, job.cgwid, element);
             let minimized_set_err = prepare_minimized_target(job, element, minimized_key);
             let (raise_first_err, focused_set_err, raise_retry_err) = raise_ax_element(
                 job.pid,
@@ -1836,6 +1922,23 @@ fn remember_non_normal_cg_windows_for_process(
 /// All standard AX windows for a PID: (cgwid, title, minimized). Shared between
 /// collect_windows and the thumbnail module's startup pre-generation.
 pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)>> {
+    let process_start_time_us = unsafe { resolve_app_identity(pid).process_start_time_us };
+    get_ax_windows_for_pid_with_identity(pid, process_start_time_us)
+}
+
+fn get_ax_windows_for_pid_with_identity(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+) -> Option<Vec<(u32, String, bool)>> {
+    if let Some(windows) = cached_ax_snapshot(pid, process_start_time_us) {
+        log_debug!(
+            "[collect] ax cache hit: pid={} windows={}",
+            pid,
+            windows.len()
+        );
+        return Some(windows);
+    }
+
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
@@ -1945,13 +2048,14 @@ pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)
             // 保留精确元素供激活路径复用,这样正常切换不必再次读取 AXWindows。
             // Retain the exact element for the activation path so normal raises do not need
             // another AXWindows round trip.
-            cache_ax_window_element(pid, cgwid, element);
+            cache_ax_window_element(pid, process_start_time_us, cgwid, element);
             results.push((cgwid, title, minimized));
         }
         CFRelease(title_key);
         CFRelease(subrole_key);
         CFRelease(minimized_key);
         CFRelease(windows_array);
+        cache_ax_snapshot(pid, process_start_time_us, &results);
         Some(results)
     }
 }
@@ -2017,10 +2121,10 @@ unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> A
     let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
     for &pid in chunk {
         let t_pid = Instant::now();
-        partial
-            .icon_ids
-            .insert(pid, unsafe { resolve_app_identity(pid) });
-        let ax_wins = get_ax_windows_for_pid(pid);
+        let identity = unsafe { resolve_app_identity(pid) };
+        let process_start_time_us = identity.process_start_time_us;
+        partial.icon_ids.insert(pid, identity);
+        let ax_wins = get_ax_windows_for_pid_with_identity(pid, process_start_time_us);
         let pid_ms = t_pid.elapsed().as_millis();
         partial.ax_work_ms += pid_ms;
         // AX 查询结果汇总:定位“一会 1 个一会 2 个”——设置窗口抖动时看 windows 数
@@ -2423,22 +2527,30 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     let t_ax = Instant::now();
     {
         let pid_list: Vec<i32> = pids.iter().copied().collect();
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(pid_list.len())
-            .max(1);
-        let chunk_size = pid_list.len().div_ceil(workers);
-        let partials: Vec<AxPartial> = std::thread::scope(|scope| {
-            let handles: Vec<_> = pid_list
-                .chunks(chunk_size)
-                .map(|chunk| scope.spawn(|| unsafe { ax_collect_chunk(chunk, &pid_names) }))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("ax collect worker panicked"))
-                .collect()
-        });
+        // AX is an IPC service implemented by the target apps, not CPU-bound work. Keep a
+        // small fixed cap so a large PID set does not overload WindowServer/AX servers and turn
+        // the first frame into a synchronized timeout storm.
+        const MAX_AX_WORKERS: usize = 4;
+        let partials: Vec<AxPartial> = if pid_list.is_empty() {
+            Vec::new()
+        } else {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(pid_list.len())
+                .clamp(1, MAX_AX_WORKERS);
+            let chunk_size = pid_list.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = pid_list
+                    .chunks(chunk_size)
+                    .map(|chunk| scope.spawn(|| unsafe { ax_collect_chunk(chunk, &pid_names) }))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("ax collect worker panicked"))
+                    .collect()
+            })
+        };
         // 按 key 合并各分段;ax_wid_to_info 的键互不相交(每 PID 只属于一段),
         // 合并顺序不影响最终内容。
         // Merge chunks by key; ax_wid_to_info keys are disjoint (each PID lives in exactly

@@ -97,6 +97,9 @@ pub(crate) struct AppState {
     // backward flag captured while the first frame is pending, so apply_window_refresh can decide
     // the initial pick direction when it finally shows.
     pub(crate) pending_first_backward: bool,
+    // Cmd release received while the first snapshot is pending; committed when that snapshot
+    // arrives instead of being discarded because the overlay is not visible yet.
+    pub(crate) pending_first_release: bool,
 }
 
 #[repr(u8)]
@@ -162,6 +165,7 @@ impl AppState {
             selected_target_key: None,
             pending_first_show: false,
             pending_first_backward: false,
+            pending_first_release: false,
         }
     }
 }
@@ -557,7 +561,10 @@ fn apply_window_refresh() {
         if let Some(state) = state_opt.as_mut() {
             if state.pending_first_show {
                 state.pending_first_show = false;
-                Some(state.pending_first_backward)
+                let backward = state.pending_first_backward;
+                let release_pending = state.pending_first_release;
+                state.pending_first_release = false;
+                Some((backward, release_pending))
             } else {
                 None
             }
@@ -565,12 +572,23 @@ fn apply_window_refresh() {
             None
         }
     };
-    if let Some(backward) = first_show_request {
-        crate::overlay::show_first_summon(backward);
-        log_debug!(
-            "[overlay] summon e2e: first snapshot shown (backward={})",
-            backward
-        );
+    if let Some((backward, release_pending)) = first_show_request {
+        if release_pending {
+            // Cmd was released while the first snapshot was pending. Commit the selected target
+            // without ever displaying the panel; on_cmd_released cannot do this itself because
+            // the panel is intentionally still invisible until the snapshot is ready.
+            crate::overlay::commit_first_summon(backward);
+            log_debug!(
+                "[overlay] summon e2e: first snapshot committed after pending release (backward={})",
+                backward
+            );
+        } else {
+            crate::overlay::show_first_summon(backward);
+            log_debug!(
+                "[overlay] summon e2e: first snapshot shown (backward={})",
+                backward
+            );
+        }
     }
 
     if set_changed && was_visible {
@@ -1546,6 +1564,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleWindowRefresh:),
             on_window_refresh as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleFirstSummonTimeout:),
+            overlay::on_first_summon_timeout as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
