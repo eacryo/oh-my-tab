@@ -20,6 +20,10 @@
   简体中文 | <a href="README.md">English</a>
 </p>
 
+<p align="center">
+  官方网站：<a href="https://oh-my-tab.app/">https://oh-my-tab.app/</a>
+</p>
+
 <br />
 
 oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:它以**菜单栏辅助应用**方式运行(无 Dock 图标),拦截全局快捷键(默认 **Command+Tab**,可切换为 Option+Tab),弹出一个 **Liquid Glass** 风格的浮层,以卡片形式展示当前打开的窗口,松开快捷键时把选中的窗口抬到最前(SkyLight 私有 API + AX)。

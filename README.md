@@ -20,6 +20,10 @@
   <a href="README-ZH.md">简体中文</a> | English
 </p>
 
+<p align="center">
+  Official Website: <a href="https://oh-my-tab.app/">https://oh-my-tab.app/</a>
+</p>
+
 <br />
 
 oh-my-tab is a macOS window switcher that complements the system Cmd+Tab: it runs as a **menu-bar accessory** app (no Dock icon), intercepts a global shortcut (**Command+Tab** by default, toggleable to Option+Tab), shows a floating **Liquid Glass** overlay of cards for currently-open windows, and raises the selected window on release (via a private SkyLight API plus AX).
