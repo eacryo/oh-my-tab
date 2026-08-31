@@ -1,0 +1,12 @@
+[package]
+name = "oh-my-tab-r2-publisher"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+aws-config = "1"
+# S3 uses regular SigV4 by default; current aws-sdk-s3 releases do not expose a `sigv4` feature
+# (only optional SigV4a exists), so keep the requested Tokio runtime feature explicitly.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "default-https-client"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

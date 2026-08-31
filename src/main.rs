@@ -14,6 +14,7 @@ mod overlay;
 mod settings;
 mod theme;
 mod thumbnail;
+mod updater;
 mod window_collector;
 mod window_server;
 
@@ -1104,6 +1105,12 @@ extern "C" fn on_thumbnail_ready(_self: *mut c_void, _cmd: Sel, _arg: *mut c_voi
     thumbnail::handle_ready_main();
 }
 
+/// AX raise mutations are queued by the background raiser and applied here on AppKit's main
+/// thread.  Some AX actions synchronously enter AppKit, which traps when called off-main.
+extern "C" fn on_ax_raise(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    window_collector::handle_ax_raise_main();
+}
+
 // ========== Class Registration ==========
 
 fn register_classes() {
@@ -1601,6 +1608,12 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(handleAxRaise:),
+            on_ax_raise as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleAppTerminate:),
             on_app_terminated as *mut c_void,
             types_v_obj.as_ptr(),
@@ -1815,6 +1828,18 @@ fn setup_status_bar() {
                 cls,
                 sel!(handleOpenPrivacy:),
                 handle_open_privacy as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleCheckForUpdates:),
+                handle_check_for_updates as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleOpenOfficialWebsite:),
+                handle_open_official_website as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -2203,6 +2228,12 @@ fn main() {
     // 6. Create controller object
     let controller = create_controller();
     *CONTROLLER.lock().unwrap() = Some(ObjPtr(controller));
+
+    // Sparkle is loaded dynamically so a source checkout can still run without the native
+    // framework. Release/dev bundles that contain Contents/Frameworks/Sparkle.framework get the
+    // standard updater UI and automatic checks; the About page reports a clear setup hint when
+    // the framework is not present yet.
+    updater::initialize(CONFIG.read().unwrap().updates.automatically_check);
 
     // 固定 worker 承接 App 激活后的 AX 聚焦查询，避免通知风暴时创建大量线程。
     // Start bounded workers for post-activation AX focus queries so notification bursts do not

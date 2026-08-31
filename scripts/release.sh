@@ -12,25 +12,59 @@
 # Copy it into your homebrew tap repo's Casks/ directory and push.
 set -e
 
+PUSH_R2=0
+DRY_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --push) PUSH_R2=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help)
+      echo "Usage: sh scripts/release.sh [--push] [--dry-run]"
+      echo "  (no flag)  build locally; never contacts R2"
+      echo "  --push     upload ZIP, DMG, then dist/appcast.xml to R2"
+      echo "  --dry-run  print the R2 upload plan without uploading"
+      echo "  RELEASE_REBUILD=1 ... --push  force a fresh build before uploading"
+      exit 0
+      ;;
+    *)
+      echo "❌ Unknown argument: $arg" >&2
+      echo "Usage: sh scripts/release.sh [--push] [--dry-run]" >&2
+      exit 2
+      ;;
+  esac
+done
+
 # 脚本在 scripts/ 下,先切到仓库根再引用相对路径。
 # Script lives in scripts/; cd to the repo root before using relative paths.
 cd "$(dirname "$0")/.."
 
-# 1. 先跑构建脚本(打包 .app + .dmg + 签名)。
-# 1. Run the build script first (build .app + .dmg + sign).
-sh scripts/bundle.sh
-
+APP="dist/Oh-My-Tab.app"
 DMG="dist/Oh-My-Tab.dmg"
+ZIP="dist/Oh-My-Tab.zip"
 OUT="dist/oh-my-tab.rb"
+
+# 1. Build locally. When publishing, reuse an existing bundle/archive so the appcast signature
+# refers to exactly the bytes that will be uploaded; set RELEASE_REBUILD=1 to force a rebuild.
+if [ "$PUSH_R2" -eq 1 ] && [ "${RELEASE_REBUILD:-0}" != "1" ] \
+  && [ -f "$APP/Contents/Info.plist" ] && [ -f "$ZIP" ] && [ -f "$DMG" ]; then
+  echo "ℹ️  Reusing existing release artifacts (set RELEASE_REBUILD=1 to rebuild)."
+else
+  sh scripts/bundle.sh
+fi
 
 if [ ! -f "$DMG" ]; then
   echo "❌ Build failed: $DMG not found" >&2
+  exit 1
+fi
+if [ ! -f "$ZIP" ]; then
+  echo "❌ Build failed: $ZIP not found" >&2
   exit 1
 fi
 
 # 2. 从 Cargo.toml 读 version(与 bundle.sh 同源)。
 # 2. Read version from Cargo.toml (same source as bundle.sh).
 VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)
+BUILD_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' dist/Oh-My-Tab.app/Contents/Info.plist)
 
 # 3. 算 dmg sha256。
 # 3. Compute the dmg sha256.
@@ -63,3 +97,18 @@ EOF
 
 echo "✅ Generated $OUT (version=$VERSION, sha256=$SHA)"
 echo "Copy it to your homebrew tap repo's Casks/ directory, then push."
+
+if [ "$PUSH_R2" -eq 1 ]; then
+  APPCAST_PATH="${R2_APPCAST_PATH:-dist/appcast.xml}"
+  PUBLISH_ARGS="--appcast $APPCAST_PATH --zip $ZIP --dmg $DMG --version $VERSION --build-version $BUILD_VERSION"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    PUBLISH_ARGS="$PUBLISH_ARGS --dry-run"
+  fi
+  # R2 credentials are read only by the isolated publisher from environment variables; they are
+  # never passed as command-line arguments or embedded in the app bundle.
+  cargo run --manifest-path tools/r2-publisher/Cargo.toml --release -- $PUBLISH_ARGS
+elif [ "$DRY_RUN" -eq 1 ]; then
+  echo "ℹ️  --dry-run was provided without --push; no R2 action was needed."
+else
+  echo "ℹ️  R2 upload skipped (pass --push to upload)."
+fi

@@ -18,6 +18,7 @@ pub struct Config {
     pub windows: WindowsSection,
     pub logging: LoggingSection,
     pub startup: StartupSection,
+    pub updates: UpdatesSection,
     pub clipboard: ClipboardSection,
     pub mouse: MouseSection,
 }
@@ -130,6 +131,24 @@ pub struct StartupSection {
     // 开机自启;默认 false,bool::default() 即 false,故 Default 可直接派生。
     // Launch at login; defaults to false (bool::default() is false, so Default derives directly).
     pub launch_at_login: bool,
+}
+
+/// Sparkle 更新设置。
+/// Sparkle update settings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UpdatesSection {
+    /// 是否允许 Sparkle 后台自动检查更新。
+    /// Whether Sparkle may check for updates in the background.
+    pub automatically_check: bool,
+}
+
+impl Default for UpdatesSection {
+    fn default() -> Self {
+        Self {
+            automatically_check: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -879,6 +898,9 @@ impl Config {
         // startup (bool field needs no validation, always valid)
         self.startup = other.startup;
 
+        // updates (bool field needs no validation; Sparkle applies it at runtime).
+        self.updates = other.updates;
+
         // clipboard (enabled 恒有效;max_entries 有校验)
         // clipboard (enabled always valid; max_entries is validated)
         self.clipboard.enabled = other.clipboard.enabled;
@@ -1232,6 +1254,7 @@ pub fn reload_config() -> Vec<String> {
     let (new_cfg, errs) = Config::reload();
     let locale = new_cfg.i18n.locale.clone();
     let log_level = new_cfg.logging.level.clone();
+    let automatically_check = new_cfg.updates.automatically_check;
     if let Ok(mut cfg) = CONFIG.write() {
         *cfg = new_cfg;
     }
@@ -1246,6 +1269,9 @@ pub fn reload_config() -> Vec<String> {
     // 配置变更:失效 per-device 解析缓存(下次 resolve 重新合并 profiles)。
     // Config changed: invalidate the per-device resolve cache (next resolve re-merges profiles).
     crate::mouse::resolve::invalidate_cache();
+    // Apply the update preference to Sparkle when the updater is already running. During early
+    // startup this is a no-op; main initializes Sparkle with the loaded value later.
+    crate::updater::set_automatic_checks(automatically_check);
     errs
 }
 
@@ -1562,6 +1588,7 @@ mod tests {
         cfg.appearance.glass_tint = "11223344".into();
         cfg.keyboard.modifier = "option".into();
         cfg.i18n.locale = "zh-Hans".into();
+        cfg.updates.automatically_check = false;
         cfg.windows.overlay_position = "main".into();
         cfg.windows.show_minimized = true;
         cfg.windows.enabled = false; // 非默认值:验证 roundtrip / non-default: verify the roundtrip
@@ -1595,6 +1622,7 @@ mod tests {
         assert_eq!(loaded.appearance.glass_tint, "11223344");
         assert_eq!(loaded.keyboard.modifier, "option");
         assert_eq!(loaded.i18n.locale, "zh-Hans");
+        assert!(!loaded.updates.automatically_check);
         assert_eq!(loaded.windows.overlay_position, "main");
         assert!(loaded.windows.show_minimized);
         assert!(!loaded.windows.enabled);

@@ -121,11 +121,56 @@ Dev-only issues (icon staleness under `cargo run`, mouse control under a debugge
 ### Release `.app` + `.dmg`
 
 > ```sh
-> sh scripts/bundle.sh        # cargo build --release -> dist/Oh-My-Tab.app -> sign -> dist/Oh-My-Tab.dmg
+> sh scripts/bundle.sh        # cargo build --release -> .app -> sign -> .dmg + Sparkle .zip
 > open dist/Oh-My-Tab.dmg     # install: drag Oh-My-Tab into Applications
 > ```
 
 `bundle.sh` assembles `dist/Oh-My-Tab.app` (release binary, `Info.plist`, and app icon resources), signs it, then packages it into `dist/Oh-My-Tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution. Re-run the script after code changes — it copies the release binary at build time, and self-locates the repo root so it can be run from anywhere.
+`bundle.sh` now produces both `dist/Oh-My-Tab.dmg` and the Sparkle archive `dist/Oh-My-Tab.zip`. `release.sh` builds locally by default; it contacts R2 only when you explicitly pass `--push`:
+
+> ```sh
+> sh scripts/release.sh                    # build only; never contacts R2
+> sh scripts/release.sh --push             # upload ZIP, DMG, then dist/appcast.xml
+> sh scripts/release.sh --push --dry-run  # print the upload plan only
+> ```
+
+The development channel is isolated from production (bundle ID `com.eacryo.oh-my-tab.dev`,
+feed `https://download.oh-my-tab.app/dev_release/appcast.xml`, R2 prefix `dev_release`):
+
+> ```sh
+> sh scripts/release-dev.sh                 # build the dev package only
+> sh scripts/release-dev.sh --push          # upload the dev package and dist/appcast-dev.xml
+> sh scripts/release-dev.sh --push --dry-run
+> ```
+
+To publish a signed appcast, first run the dev script without `--push`, generate the appcast from
+that exact ZIP, save it as `dist/appcast-dev.xml`, then run `sh scripts/release-dev.sh --push`.
+When the three existing dev artifacts are present, `--push` reuses them; set `RELEASE_REBUILD=1`
+only when you intentionally want to rebuild before publishing.
+
+`--push` requires your prepared appcast (`dist/appcast.xml` for production or
+`dist/appcast-dev.xml` for development) and reads `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
+`R2_BUCKET`, and `R2_ENDPOINT` (or `R2_ACCOUNT_ID`) from the environment. The isolated publisher
+lives in `tools/r2-publisher` and never puts credentials in the app or command-line arguments.
+The upload request always goes to the configured R2 S3 endpoint; `download.oh-my-tab.app` is only
+the public HTTPS base written into Sparkle URLs. `R2_PUBLIC_BASE_URL` changes the displayed/public
+URL base only and does not change the upload destination.
+
+### Sparkle automatic updates
+
+The About-page toggle and “Check for Updates” button are wired to Sparkle 2. The updater reads
+`SUFeedURL` from the app bundle; production uses `https://download.oh-my-tab.app/appcast.xml` and
+the dev release script uses `https://download.oh-my-tab.app/dev_release/appcast.xml`. This repository
+intentionally does not include either appcast, release archives, or the Sparkle private key;
+publish those materials to the matching R2 channel later.
+
+Place Sparkle 2's `Sparkle.framework` at `vendor/Sparkle.framework` (or set `SPARKLE_FRAMEWORK_PATH`); `scripts/bundle.sh` and `scripts/dev-restart.sh` copy it into `Contents/Frameworks`. Without the framework the app still starts and the About page explains why update checks are unavailable. The scripts use a UTC timestamp for `CFBundleVersion` by default; set `SPARKLE_BUILD_VERSION` when a deterministic build number is needed. At release time, `SPARKLE_FEED_URL` overrides the feed URL and `SPARKLE_PUBLIC_ED_KEY` writes the appcast verification key into the bundle. Never commit or upload the private key.
+
+Build requirement distinction: `cargo build`, `cargo check`, and the test suite do not require
+Sparkle. A packaged app with working update checks does require the framework at the path above;
+generating appcasts additionally requires Sparkle's `bin/generate_keys` and
+`bin/generate_appcast` tools. The framework is intentionally ignored by Git, so each developer or
+CI job must provide the pinned Sparkle distribution locally.
 
 For reference, the current arm64 build measured 3,726,864 bytes for the unsigned release executable, 4,524,594 bytes of regular files inside the signed `.app`, and 3,080,950 bytes for the generated UDZO `.dmg`. These are build artifacts rather than size guarantees; source changes, the Rust toolchain, and signing can change them.
 
@@ -180,6 +225,9 @@ file_path = ""           # empty = default timestamped path; see Logging below
 
 [startup]
 launch_at_login = false  # launch at login (requires running as a .app bundle; macOS 13+)
+
+[updates]
+automatically_check = true  # automatically check for updates through Sparkle
 
 [clipboard]
 enabled = false          # clipboard history master switch (off by default)

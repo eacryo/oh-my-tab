@@ -1,5 +1,5 @@
 use objc2::runtime::AnyObject;
-use objc2::{class, msg_send};
+use objc2::{class, msg_send, sel};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::{LazyLock, Mutex};
@@ -1457,6 +1457,152 @@ struct RaiseJob {
     enqueued_at: Instant,
 }
 
+/// AX mutations are delivered to AppKit and must run on the main thread.  Keep the potentially
+/// blocking AX lookup on `ax-raiser`, then retain the resolved objects until the main-thread
+/// callback applies the final raise/focus actions.
+struct MainThreadAxRaise {
+    pid: i32,
+    cgwid: u32,
+    app: AXUIElementRef,
+    element: AXUIElementRef,
+    focused_key: AXUIElementRef,
+    raise_key: AXUIElementRef,
+    minimized_key: Option<AXUIElementRef>,
+    force_focus: bool,
+    generation: u64,
+}
+
+unsafe impl Send for MainThreadAxRaise {}
+
+static MAIN_THREAD_AX_RAISES: LazyLock<Mutex<Vec<MainThreadAxRaise>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Drain AX mutations on the AppKit main thread.  `AXUIElementPerformAction` can synchronously
+/// enter AppKit (for example `makeKeyAndOrderFront:`), so invoking it from the background AX
+/// worker triggers macOS's "Must only be used from the main thread" trap.
+pub(crate) fn handle_ax_raise_main() {
+    let jobs = MAIN_THREAD_AX_RAISES
+        .lock()
+        .unwrap()
+        .drain(..)
+        .collect::<Vec<_>>();
+    for job in jobs {
+        unsafe {
+            if !raise_intent_current(job.generation) {
+                release_main_thread_ax_raise(&job);
+                continue;
+            }
+
+            let minimized_set_err = job
+                .minimized_key
+                .map(|key| AXUIElementSetAttributeValue(job.element, key, kCFBooleanFalse));
+            if minimized_set_err.is_some() {
+                let (slps_ok, click_ok) = raise_window_fast(job.pid, job.cgwid);
+                log_debug!(
+                    "[raise] precise fast after main-thread unminimize: pid={} cgwid={} slps={} click={}",
+                    job.pid,
+                    job.cgwid,
+                    slps_ok,
+                    click_ok
+                );
+            }
+            let raise_started = Instant::now();
+            let raise_first_err = AXUIElementPerformAction(job.element, job.raise_key);
+            let raise_first_us = raise_started.elapsed().as_micros();
+            let (focused_set_err, raise_retry_err) = if !job.force_focus
+                && (raise_first_err == K_AX_SUCCESS || raise_first_err == K_AX_INVALID_UI_ELEMENT)
+            {
+                (None, None)
+            } else {
+                let focused_set_err =
+                    AXUIElementSetAttributeValue(job.app, job.focused_key, job.element);
+                let raise_retry_err = AXUIElementPerformAction(job.element, job.raise_key);
+                (Some(focused_set_err), Some(raise_retry_err))
+            };
+            log_debug!(
+                "[raise] AXRaise main: pid={} cgwid={} first_err={} first_us={} set_focused={:?} retry={:?} set_minimized={:?}",
+                job.pid,
+                job.cgwid,
+                raise_first_err,
+                raise_first_us,
+                focused_set_err,
+                raise_retry_err,
+                minimized_set_err
+            );
+            release_main_thread_ax_raise(&job);
+        }
+    }
+}
+
+unsafe fn release_main_thread_ax_raise(job: &MainThreadAxRaise) {
+    CFRelease(job.app);
+    CFRelease(job.element);
+    CFRelease(job.focused_key);
+    CFRelease(job.raise_key);
+    if let Some(key) = job.minimized_key {
+        CFRelease(key);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn enqueue_main_thread_ax_raise(
+    pid: i32,
+    cgwid: u32,
+    app: AXUIElementRef,
+    element: AXUIElementRef,
+    focused_key: AXUIElementRef,
+    raise_key: AXUIElementRef,
+    minimized_key: Option<AXUIElementRef>,
+    force_focus: bool,
+    generation: u64,
+) {
+    if !raise_intent_current(generation) {
+        return;
+    }
+    // The caller retains these objects for its own cleanup.  Take an additional retain for the
+    // queued main-thread job, including the array-borrowed window element.
+    CFRetain(app);
+    CFRetain(element);
+    CFRetain(focused_key);
+    CFRetain(raise_key);
+    if let Some(key) = minimized_key {
+        CFRetain(key);
+    }
+    MAIN_THREAD_AX_RAISES
+        .lock()
+        .unwrap()
+        .push(MainThreadAxRaise {
+            pid,
+            cgwid,
+            app,
+            element,
+            focused_key,
+            raise_key,
+            minimized_key,
+            force_focus,
+            generation,
+        });
+
+    if let Some(controller) = crate::CONTROLLER.lock().unwrap().map(|ptr| ptr.0) {
+        let _: () = msg_send![controller,
+            performSelectorOnMainThread: sel!(handleAxRaise:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    } else {
+        // This can only happen during early shutdown/startup, but do not leave retained AX
+        // objects behind if the controller has already gone away.
+        let pending = MAIN_THREAD_AX_RAISES
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
+        for job in pending {
+            release_main_thread_ax_raise(&job);
+        }
+    }
+}
+
 // 单一专职 raiser 线程:串行 FIFO 消费任务,保证两次切换的 AX 阶段不并发、
 // 完成顺序与提交顺序一致(配合 supersede 检查,最终状态永远是最后一次切换)。
 // A single dedicated raiser thread consumes jobs serially, so AX phases of consecutive
@@ -1623,7 +1769,8 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
             CFRelease(app);
             return;
         }
-        let minimized_set_err = prepare_minimized_target(job, element, minimized_key);
+        // Unminimize is an AX mutation and is performed by the main-thread queue below.
+        let minimized_set_err: Option<AXError> = None;
         let (raise_first_err, focused_set_err, raise_retry_err) = raise_ax_element(
             job.pid,
             job.cgwid,
@@ -1631,7 +1778,9 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
             element,
             focused_key,
             raise_key,
+            minimized_key,
             force_ax_focus,
+            job.generation,
         );
         let effective_raise_err = raise_retry_err.unwrap_or(raise_first_err);
         if effective_raise_err != K_AX_INVALID_UI_ELEMENT {
@@ -1713,7 +1862,8 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
             // 找到实时元素后更新缓存,下一次切换就不必重新枚举。
             // Refresh the cache with the live element so the next switch skips enumeration.
             cache_ax_window_element(job.pid, process_start_time_us, job.cgwid, element);
-            let minimized_set_err = prepare_minimized_target(job, element, minimized_key);
+            // Unminimize is an AX mutation and is performed by the main-thread queue below.
+            let minimized_set_err: Option<AXError> = None;
             let (raise_first_err, focused_set_err, raise_retry_err) = raise_ax_element(
                 job.pid,
                 job.cgwid,
@@ -1721,7 +1871,9 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
                 element,
                 focused_key,
                 raise_key,
+                minimized_key,
                 force_ax_focus,
+                job.generation,
             );
             matched = true;
             log_info!(
@@ -1760,36 +1912,11 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
     CFRelease(app);
 }
 
-/// 已知最小化时先还原窗口,再执行 SLPS + key-window;普通窗口在提交时已经跑过快速路径。
-/// For a known minimized target, restore it before SLPS + key-window. Normal windows already
-/// ran the fast path synchronously at commit time.
-unsafe fn prepare_minimized_target(
-    job: &RaiseJob,
-    element: AXUIElementRef,
-    minimized_key: Option<AXUIElementRef>,
-) -> Option<AXError> {
-    let minimized_key = minimized_key?;
-    let restore_started = Instant::now();
-    let minimized_set_err = AXUIElementSetAttributeValue(element, minimized_key, kCFBooleanFalse);
-    let restore_us = restore_started.elapsed().as_micros();
-    let fast_started = Instant::now();
-    let (slps_ok, click_ok) = raise_window_fast(job.pid, job.cgwid);
-    log_debug!(
-        "[raise] precise fast after unminimize: pid={} cgwid={} slps={} click={} restore_us={} elapsed={}ms",
-        job.pid,
-        job.cgwid,
-        slps_ok,
-        click_ok,
-        restore_us,
-        fast_started.elapsed().as_millis()
-    );
-    Some(minimized_set_err)
-}
-
 /// 普通路径只执行一次 AXRaise。仅当它明确失败且不是 stale element 时,才设置
 /// AXFocusedWindow 并重试;成功路径不再支付额外 AX IPC。
 /// The normal path performs one AXRaise. Only an explicit non-stale failure sets
 /// AXFocusedWindow and retries; a successful raise pays no extra AX IPC.
+#[allow(clippy::too_many_arguments)]
 unsafe fn raise_ax_element(
     pid: i32,
     cgwid: u32,
@@ -1797,45 +1924,28 @@ unsafe fn raise_ax_element(
     element: AXUIElementRef,
     focused_key: AXUIElementRef,
     raise_key: AXUIElementRef,
+    minimized_key: Option<AXUIElementRef>,
     force_focus: bool,
+    generation: u64,
 ) -> (AXError, Option<AXError>, Option<AXError>) {
-    let raise_started = Instant::now();
-    let raise_first_err = AXUIElementPerformAction(element, raise_key);
-    let raise_first_us = raise_started.elapsed().as_micros();
-    if !force_focus
-        && (raise_first_err == K_AX_SUCCESS || raise_first_err == K_AX_INVALID_UI_ELEMENT)
-    {
-        log_debug!(
-            "[raise] AXRaise first: pid={} cgwid={} err={} elapsed_us={}",
-            pid,
-            cgwid,
-            raise_first_err,
-            raise_first_us
-        );
-        return (raise_first_err, None, None);
-    }
-    let focused_started = Instant::now();
-    let focused_set_err = AXUIElementSetAttributeValue(app, focused_key, element);
-    let focused_us = focused_started.elapsed().as_micros();
-    let retry_started = Instant::now();
-    let raise_retry_err = AXUIElementPerformAction(element, raise_key);
-    let retry_us = retry_started.elapsed().as_micros();
     log_debug!(
-        "[raise] AXRaise fallback: pid={} cgwid={} first_err={} first_us={} set_focused={} focused_us={} retry={} retry_us={}",
+        "[raise] AXRaise queued for main thread: pid={} cgwid={} force_focus={}",
         pid,
         cgwid,
-        raise_first_err,
-        raise_first_us,
-        focused_set_err,
-        focused_us,
-        raise_retry_err,
-        retry_us
+        force_focus
     );
-    (
-        raise_first_err,
-        Some(focused_set_err),
-        Some(raise_retry_err),
-    )
+    enqueue_main_thread_ax_raise(
+        pid,
+        cgwid,
+        app,
+        element,
+        focused_key,
+        raise_key,
+        minimized_key,
+        force_focus,
+        generation,
+    );
+    (K_AX_SUCCESS, None, None)
 }
 
 /// 查一个 PID 的 AX 标准窗口列表。

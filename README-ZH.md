@@ -121,11 +121,49 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 ### Release `.app` + `.dmg`
 
 > ```sh
-> sh scripts/bundle.sh        # cargo build --release -> dist/Oh-My-Tab.app -> 签名 -> dist/Oh-My-Tab.dmg
+> sh scripts/bundle.sh        # cargo build --release -> .app -> 签名 -> .dmg + Sparkle .zip
 > open dist/Oh-My-Tab.dmg     # 安装:把 Oh-My-Tab 拖到 Applications
 > ```
 
 `bundle.sh` 组装 `dist/Oh-My-Tab.app`(release 二进制、`Info.plist` 和应用图标资源)、做签名,再打成 `dist/Oh-My-Tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。代码改动后需要重新跑该脚本(bundle 在构建时拷贝 release 二进制);脚本会自定位仓库根,可从任意目录运行。
+`bundle.sh` 现在同时生成 `dist/Oh-My-Tab.dmg` 和 Sparkle 使用的 `dist/Oh-My-Tab.zip`。`release.sh` 默认只在本地构建；只有显式传入 `--push` 才会使用 R2 S3 API 上传，避免普通构建误发布：
+
+> ```sh
+> sh scripts/release.sh                 # 只构建，不访问 R2
+> sh scripts/release.sh --push           # 上传 ZIP、DMG，最后上传 dist/appcast.xml
+> sh scripts/release.sh --push --dry-run # 只打印上传计划
+> ```
+
+开发更新通道与生产完全隔离（Bundle ID 为 `com.eacryo.oh-my-tab.dev`，Feed 为
+`https://download.oh-my-tab.app/dev_release/appcast.xml`，R2 前缀为 `dev_release`）：
+
+> ```sh
+> sh scripts/release-dev.sh                 # 只构建开发包
+> sh scripts/release-dev.sh --push          # 上传开发包和 dist/appcast-dev.xml
+> sh scripts/release-dev.sh --push --dry-run
+> ```
+
+要发布已签名的 appcast，先不带 `--push` 运行开发脚本，再从这次生成的 ZIP 生成 appcast，
+保存为 `dist/appcast-dev.xml`，最后运行 `sh scripts/release-dev.sh --push`。如果三个开发产物
+仍然存在，`--push` 会复用它们；只有明确需要重新构建时才设置 `RELEASE_REBUILD=1`。
+
+`--push` 要求你准备好对应的 appcast（生产为 `dist/appcast.xml`，开发为
+`dist/appcast-dev.xml`），并读取 `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_BUCKET` 以及
+`R2_ENDPOINT`（或 `R2_ACCOUNT_ID`）等环境变量。上传工具位于 `tools/r2-publisher`，不会把
+密钥写入应用或命令行参数。
+上传请求始终发送到环境变量配置的 R2 S3 endpoint；`download.oh-my-tab.app` 只作为 Sparkle
+链接中的公开 HTTPS 地址。`R2_PUBLIC_BASE_URL` 只会改变显示/公开 URL，不会改变实际上传目标。
+
+### Sparkle 自动更新
+
+About 页的开关和“检查更新”按钮已经接入 Sparkle 2。更新器按标准方式读取 `.app` 内的
+`SUFeedURL`：生产通道为 `https://download.oh-my-tab.app/appcast.xml`，开发通道为
+`https://download.oh-my-tab.app/dev_release/appcast.xml`。仓库不包含这两个 appcast、更新压缩包或
+Sparkle 私钥，这些发布材料由你后续分别放到对应的 R2 路径。
+
+把 Sparkle 2 的 `Sparkle.framework` 放到 `vendor/Sparkle.framework`（或设置 `SPARKLE_FRAMEWORK_PATH`），`scripts/bundle.sh` 和 `scripts/dev-restart.sh` 会自动复制到 `Contents/Frameworks`。没有框架时应用仍可启动，About 页会提示该构建未包含 Sparkle。脚本默认用 UTC 时间戳生成 `CFBundleVersion`，也可用 `SPARKLE_BUILD_VERSION` 指定固定值；发布时可通过 `SPARKLE_FEED_URL` 覆盖 feed 地址，通过 `SPARKLE_PUBLIC_ED_KEY` 写入 appcast 验签公钥。私钥不要放进仓库或 R2。
+
+构建要求需要区分：`cargo build`、`cargo check` 和测试套件不依赖 Sparkle；要让打包后的应用真正具备更新检查功能，必须提供上面的 framework。生成 appcast 还需要 Sparkle 发行包中的 `bin/generate_keys` 和 `bin/generate_appcast`。framework 已按设计加入 Git 忽略，因此每台开发机或 CI 都要自行准备固定版本的 Sparkle 发行包。
 
 作为参考,本次 arm64 构建测得:未签名 release 可执行文件 3,726,864 字节,签名后 `.app` 内普通文件共 4,524,594 字节,生成的 UDZO `.dmg` 为 3,080,950 字节。这些是当前构建产物的实测值,不是固定保证;源码、Rust 工具链和签名方式都可能改变大小。
 
@@ -180,6 +218,9 @@ file_path = ""           # 空 = 默认带时间戳路径;见下方「日志」
 
 [startup]
 launch_at_login = false  # 开机自启(需以 .app 方式运行;macOS 13+)
+
+[updates]
+automatically_check = true  # 通过 Sparkle 自动检查更新
 
 [clipboard]
 enabled = false          # 剪贴板历史总开关(默认关闭)

@@ -20,6 +20,12 @@
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <!-- Sparkle 2 update feed. The appcast itself and release archives are published separately. -->
+    <key>SUFeedURL</key>
+    <string>https://download.oh-my-tab.app/appcast.xml</string>
+    <!-- The About-page switch is applied at runtime; this plist value is Sparkle's default. -->
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
     <!-- SMAppService 要求 macOS 13+;本应用不再兼容 13 以下,直接声明最低系统。 -->
     <!-- SMAppService requires macOS 13+; the app no longer supports below 13, so declare the floor. -->
     <key>LSMinimumSystemVersion</key>

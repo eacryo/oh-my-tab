@@ -146,11 +146,13 @@ struct SettingsUi {
     sidebar_switcher: *mut AnyObject, // NSButton: 应用切换浮窗 / App switcher overlay (tag=1)
     sidebar_mouse: *mut AnyObject,   // NSButton: 鼠标控制 / Mouse (tag=2)
     sidebar_clipboard: *mut AnyObject, // NSButton: 剪贴板历史 / Clipboard history (tag=3)
+    sidebar_about: *mut AnyObject,   // NSButton: 关于 / About (tag=4)
     sidebar_highlight: *mut AnyObject, // NSView: 选中行高亮背景 (layer-backed)
     general_view: *mut AnyObject,    // NSView: 通用页容器 / General page container
     switcher_view: *mut AnyObject,   // NSView: 应用切换浮窗页容器 / App switcher page container
     mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
     clipboard_view: *mut AnyObject,  // NSView: 剪贴板历史页容器 / Clipboard page container
+    about_view: *mut AnyObject,      // NSView: 关于页容器 / About page container
     glass_style: *mut AnyObject,     // NSPopUpButton: regular / clear
     glass_tint: *mut AnyObject,      // NSColorWell: 玻璃颜色 / glass tint
     glass_preview_switcher: *mut AnyObject, // NSGlassEffectView: app switcher preview
@@ -189,6 +191,7 @@ struct SettingsUi {
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
+    update_auto_check: *mut AnyObject, // NSSwitch: Sparkle 自动检查开关 / Sparkle auto-check switch
 }
 unsafe impl Send for SettingsUi {}
 
@@ -344,6 +347,69 @@ unsafe fn make_settings_action_button(
     let _: () = msg_send![button, setTarget: target];
     let _: () = msg_send![button, setAction: action];
     button
+}
+
+struct WebsiteLinkButtonClass(*mut AnyObject);
+unsafe impl Send for WebsiteLinkButtonClass {}
+unsafe impl Sync for WebsiteLinkButtonClass {}
+
+static WEBSITE_LINK_BUTTON_CLASS: OnceLock<WebsiteLinkButtonClass> = OnceLock::new();
+
+extern "C" fn website_link_mouse_entered(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let color: *mut AnyObject = msg_send![class!(NSColor), systemBlueColor];
+        let _: () = msg_send![this as *mut AnyObject, setTextColor: color];
+        let cursor: *mut AnyObject = msg_send![class!(NSCursor), pointingHandCursor];
+        let _: () = msg_send![cursor, set];
+    }
+}
+
+extern "C" fn website_link_mouse_exited(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
+        let _: () = msg_send![this as *mut AnyObject, setTextColor: color];
+        let cursor: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
+        let _: () = msg_send![cursor, set];
+    }
+}
+
+extern "C" fn website_link_mouse_down(_this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    handle_open_official_website(
+        std::ptr::null_mut(),
+        sel!(handleOpenOfficialWebsite:),
+        std::ptr::null_mut(),
+    );
+}
+
+fn website_link_button_class() -> *mut AnyObject {
+    WEBSITE_LINK_BUTTON_CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabWebsiteLinkButton").unwrap();
+            let superclass = class!(NSTextField) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseDown:),
+                website_link_mouse_down as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                website_link_mouse_entered as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                website_link_mouse_exited as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            WebsiteLinkButtonClass(cls)
+        })
+        .0
 }
 
 /// 用一个数值/字符串填进文本框,并释放临时 NSString。
@@ -1124,6 +1190,39 @@ pub(crate) extern "C" fn on_settings_open(_self: *mut c_void, _cmd: Sel, _sender
     show_settings();
 }
 
+/// 手动检查更新:把请求交给 Sparkle 的标准更新界面。
+/// Manual update check: hand the request to Sparkle's standard update UI.
+pub(crate) extern "C" fn handle_check_for_updates(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    if !crate::updater::check_for_updates() {
+        show_alert(
+            &t("settings.update_unavailable_title"),
+            &t("settings.update_unavailable_message"),
+        );
+    }
+}
+
+/// 打开项目官方网站。
+/// Open the project's official website in the default browser.
+pub(crate) extern "C" fn handle_open_official_website(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    unsafe {
+        let url_string = make_nsstring("https://oh-my-tab.app");
+        let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_string];
+        CFRelease(url_string as *const c_void);
+        if !url.is_null() {
+            let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let _: bool = msg_send![workspace, openURL: url];
+        }
+    }
+}
+
 /// 记录设置窗口提交的逐字段变更,不记录剪贴板历史内容。
 /// Log field-level changes submitted from Settings without recording clipboard contents.
 fn log_config_changes(old: &Config, new: &Config) {
@@ -1298,6 +1397,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         old.startup.launch_at_login,
         new.startup.launch_at_login
     );
+    changed!(
+        "updates.automatically_check",
+        old.updates.automatically_check,
+        new.updates.automatically_check
+    );
 
     changed!(
         "clipboard.enabled",
@@ -1383,6 +1487,9 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
         return;
     }
     let _ = reload_config();
+    // Sparkle keeps its updater object alive for the process; apply the persisted toggle
+    // immediately so the next automatic-check interval follows the user's choice.
+    crate::updater::set_automatic_checks(cfg.updates.automatically_check);
     // 指针加速设置(禁用/恢复)实时生效,无需重启。
     // Pointer acceleration settings take effect immediately, no restart needed.
     crate::mouse::pointer::apply();
@@ -2664,12 +2771,12 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
     select_sidebar(tag as usize);
 }
 
-/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换四个内容视图显隐、选中项粗体。
-/// Switch the active settings page: align the highlight to the selected button, toggle the four
+/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换五个内容视图显隐、选中项粗体。
+/// Switch the active settings page: align the highlight to the selected button, toggle the five
 /// content views' visibility, and bold the selected item's label.
 fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
-    let idx = if idx > 3 { 0 } else { idx };
+    let idx = if idx > 4 { 0 } else { idx };
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         let ui = match ui.as_ref() {
@@ -2681,12 +2788,14 @@ fn select_sidebar(idx: usize) {
             ui.sidebar_switcher,
             ui.sidebar_mouse,
             ui.sidebar_clipboard,
+            ui.sidebar_about,
         ];
         let views = [
             ui.general_view,
             ui.switcher_view,
             ui.mouse_view,
             ui.clipboard_view,
+            ui.about_view,
         ];
         // 高亮背景对齐到选中按钮的 frame / align the highlight to the selected button's frame
         let frame: NSRect = msg_send![buttons[idx], frame];
@@ -2698,11 +2807,12 @@ fn select_sidebar(idx: usize) {
             t("settings.sidebar_switcher"),
             t("settings.sidebar_mouse"),
             t("settings.sidebar_clipboard"),
+            t("settings.sidebar_about"),
         ];
         for (i, &b) in buttons.iter().enumerate() {
             set_sidebar_title(b, &titles[i], i == idx);
         }
-        // 切换四页显隐 / toggle the four pages' visibility
+        // 切换五页显隐 / toggle the five pages' visibility
         for (i, &v) in views.iter().enumerate() {
             let _: () = msg_send![v, setHidden: i != idx];
         }
@@ -2989,6 +3099,10 @@ fn load_settings_from(cfg: &Config) {
         // launch_at_login:按 CONFIG.startup.launch_at_login 设 switch 状态。
         // launch_at_login: set the switch state from CONFIG.startup.launch_at_login.
         let _: () = msg_send![ui.launch_at_login, setState: if cfg.startup.launch_at_login { 1isize } else { 0isize }];
+        let _: () = msg_send![
+            ui.update_auto_check,
+            setState: if cfg.updates.automatically_check { 1isize } else { 0isize }
+        ];
 
         // ===== 鼠标页:按当前选中设备的有效配置(合并"所有鼠标"+该设备)填充控件 =====
         // Mouse page: populate controls from the effective config of the selected device
@@ -3181,6 +3295,8 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // launch_at_login: switch state (1=on / 0=off).
         let la_state: isize = msg_send![ui.launch_at_login, state];
         cfg.startup.launch_at_login = la_state == 1;
+        let update_state: isize = msg_send![ui.update_auto_check, state];
+        cfg.updates.automatically_check = update_state == 1;
 
         // ===== 鼠标页:把控件值写回当前选中设备的 profile =====
         // Mouse page: write control values back to the selected device's profile.
@@ -3551,11 +3667,13 @@ fn create_settings_window() {
             sidebar_switcher: std::ptr::null_mut(),
             sidebar_mouse: std::ptr::null_mut(),
             sidebar_clipboard: std::ptr::null_mut(),
+            sidebar_about: std::ptr::null_mut(),
             sidebar_highlight: std::ptr::null_mut(),
             general_view: std::ptr::null_mut(),
             switcher_view: std::ptr::null_mut(),
             mouse_view: std::ptr::null_mut(),
             clipboard_view: std::ptr::null_mut(),
+            about_view: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             glass_tint: std::ptr::null_mut(),
             glass_preview_switcher: std::ptr::null_mut(),
@@ -3592,6 +3710,7 @@ fn create_settings_window() {
             device_indicator: std::ptr::null_mut(),
             ok_button: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
+            update_auto_check: std::ptr::null_mut(),
         };
 
         // 内容区 x(卡片右缘 + 10pt 间隙)、宽 / content area x (card right edge + 10pt gap) and width
@@ -3724,6 +3843,15 @@ fn create_settings_window() {
             btn_y0 - 102.0,
             btn_w,
         );
+        ui.sidebar_about = make_sidebar_button(
+            sidebar_view,
+            target,
+            &t("settings.sidebar_about"),
+            4,
+            12.0,
+            btn_y0 - 136.0,
+            btn_w,
+        );
 
         // --- 通用页容器 general page container ---
         let general_view: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -3760,6 +3888,15 @@ fn create_settings_window() {
         let _: () = msg_send![content, addSubview: clipboard_view];
         release_obj(clipboard_view);
         ui.clipboard_view = clipboard_view;
+
+        // --- 关于页容器 about page container(初始隐藏 / initially hidden)---
+        let about_view: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let about_view: *mut AnyObject = msg_send![about_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
+        let _: () = msg_send![about_view, setHidden: true];
+        let _: () = msg_send![about_view, setAutoresizingMask: 18u64];
+        let _: () = msg_send![content, addSubview: about_view];
+        release_obj(about_view);
+        ui.about_view = about_view;
 
         // ===== 通用页内容 general page content =====
         let mut y = layout_h - 12.0; // 顶部光标:下一个元素的底边 y / top cursor (bottom y of next element)
@@ -4480,6 +4617,133 @@ fn create_settings_window() {
         let _: () = msg_send![hint, setEditable: false];
         let _: () = msg_send![clipboard_view, addSubview: hint];
         release_obj(hint);
+
+        // ===== 关于页内容 about page content =====
+        let mut ay = layout_h - 12.0;
+        add_header(
+            about_view,
+            &t("settings.header_about"),
+            12.0,
+            ay - 18.0,
+            content_w - 24.0,
+        );
+        ay -= 18.0 + 10.0 + 30.0;
+
+        let version_text = tf(
+            "settings.version_label",
+            &[("version", env!("CARGO_PKG_VERSION"))],
+        );
+        let about_version: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let about_version: *mut AnyObject = msg_send![
+            about_version,
+            initWithFrame: NSRect::new(
+                NSPoint::new(label_x, ay),
+                NSSize::new(content_w - 24.0, 30.0),
+            )
+        ];
+        set_field(about_version, version_text);
+        let _: () = msg_send![about_version, setBezeled: false];
+        let _: () = msg_send![about_version, setDrawsBackground: false];
+        let _: () = msg_send![about_version, setEditable: false];
+        let about_version_font: *mut AnyObject =
+            msg_send![class!(NSFont), boldSystemFontOfSize: 16.0f64];
+        let _: () = msg_send![about_version, setFont: about_version_font];
+        let _: () = msg_send![about_view, addSubview: about_version];
+        release_obj(about_version);
+        ay -= 8.0 + 30.0;
+
+        let website_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let website_label: *mut AnyObject = msg_send![
+            website_label,
+            initWithFrame: NSRect::new(
+                NSPoint::new(label_x, ay),
+                NSSize::new(130.0, 28.0),
+            )
+        ];
+        set_field(website_label, t("settings.website_label"));
+        let _: () = msg_send![website_label, setBezeled: false];
+        let _: () = msg_send![website_label, setDrawsBackground: false];
+        let _: () = msg_send![website_label, setEditable: false];
+        let _: () = msg_send![website_label, setAlignment: 0isize]; // left
+        let website_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
+        let _: () = msg_send![website_label, setFont: website_font];
+        let _: () = msg_send![about_view, addSubview: website_label];
+        release_obj(website_label);
+
+        // The URL itself is the link: borderless NSButton keeps only the visible address blue
+        // and directly clickable, without a separate "Official Website" button.
+        let website_url: *mut AnyObject = msg_send![website_link_button_class(), alloc];
+        let website_url: *mut AnyObject = msg_send![
+            website_url,
+            initWithFrame: NSRect::new(
+                NSPoint::new(label_x + 130.0, ay),
+                NSSize::new((content_w - 24.0 - 130.0).max(1.0), 28.0),
+            )
+        ];
+        set_field(website_url, t("settings.website_url"));
+        let _: () = msg_send![website_url, setBezeled: false];
+        let _: () = msg_send![website_url, setDrawsBackground: false];
+        let _: () = msg_send![website_url, setEditable: false];
+        let _: () = msg_send![website_url, setSelectable: false];
+        let _: () = msg_send![website_url, setAlignment: 0isize]; // left
+        let website_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
+        let _: () = msg_send![website_url, setFont: website_font];
+        let website_color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
+        let _: () = msg_send![website_url, setTextColor: website_color];
+        let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+        let tracking: *mut AnyObject = msg_send![
+            tracking,
+            initWithRect: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new((content_w - 24.0 - 130.0).max(1.0), 28.0),
+            ),
+            options: 0x01u64 | 0x80u64 | 0x200u64,
+            owner: website_url,
+            userInfo: std::ptr::null::<AnyObject>()
+        ];
+        let _: () = msg_send![website_url, addTrackingArea: tracking];
+        release_obj(tracking);
+        let _: () = msg_send![about_view, addSubview: website_url];
+        release_obj(website_url);
+        ay -= 8.0 + 28.0;
+
+        ui.update_auto_check = add_row(
+            about_view,
+            label_x,
+            ay,
+            225.0,
+            row_h,
+            &t("settings.row_update_auto_check"),
+            make_switch(ctrl_x + ctrl_w, ay, row_h, false),
+        );
+        ay -= 14.0 + row_h;
+
+        let check_button = make_settings_action_button(
+            NSRect::new(NSPoint::new(ctrl_x, ay), NSSize::new(ctrl_w, 28.0)),
+            &t("settings.btn_check_for_updates"),
+            target,
+            sel!(handleCheckForUpdates:),
+        );
+        let _: () = msg_send![about_view, addSubview: check_button];
+        release_obj(check_button);
+        ay -= 8.0 + 28.0;
+
+        let update_hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let update_hint: *mut AnyObject = msg_send![
+            update_hint,
+            initWithFrame: NSRect::new(
+                NSPoint::new(label_x, ay),
+                NSSize::new(content_w - 24.0, row_h),
+            )
+        ];
+        set_field(update_hint, t("settings.update_placeholder_hint"));
+        let _: () = msg_send![update_hint, setBezeled: false];
+        let _: () = msg_send![update_hint, setDrawsBackground: false];
+        let _: () = msg_send![update_hint, setEditable: false];
+        let hint_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        let _: () = msg_send![update_hint, setTextColor: hint_color];
+        let _: () = msg_send![about_view, addSubview: update_hint];
+        release_obj(update_hint);
 
         // banner 最后添加:作为 general_view 的最后一个 subview,保证在内容之上(缺权限时覆盖顶部)。
         // Added last: as general_view's final subview so it floats above the content (when

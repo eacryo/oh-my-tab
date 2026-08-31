@@ -58,12 +58,41 @@ cp "$repo_dir/assets/AppIcon.icns" "$dev_app/Contents/Resources/AppIcon.icns"
 if [ -d "$repo_dir/assets/AppIcon.icon" ]; then
     cp -R "$repo_dir/assets/AppIcon.icon" "$dev_app/Contents/Resources/AppIcon.icon"
 fi
+# Optional local Sparkle framework. Keeping this optional lets the app run from a clean checkout;
+# placing Sparkle.framework under vendor/ enables real update checks in the dev bundle.
+sparkle_framework_path="${SPARKLE_FRAMEWORK_PATH:-$repo_dir/vendor/Sparkle.framework}"
+if [ -d "$sparkle_framework_path" ]; then
+    mkdir -p "$dev_app/Contents/Frameworks"
+    cp -R "$sparkle_framework_path" "$dev_app/Contents/Frameworks/Sparkle.framework"
+    echo "Sparkle: embedded $sparkle_framework_path"
+else
+    echo "warning: Sparkle.framework not found at $sparkle_framework_path; update checks will be unavailable"
+fi
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $dev_bundle_id" \
     "$dev_app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Oh-My-Tab Dev" \
     "$dev_app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Oh-My-Tab Dev" \
     "$dev_app/Contents/Info.plist"
+# Keep the dev bundle's display version aligned with Cargo and give each build a fresh UTC
+# timestamp build number. SPARKLE_BUILD_VERSION remains available for deterministic tests.
+dev_version="$(awk -F'"' '/^version/ {print $2; exit}' "$repo_dir/Cargo.toml")"
+dev_build_version="${SPARKLE_BUILD_VERSION:-$(date -u +%Y%m%d%H%M%S)}"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $dev_version" \
+    "$dev_app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $dev_build_version" \
+    "$dev_app/Contents/Info.plist"
+# Keep the feed configurable for local testing without committing a machine-specific appcast URL
+# or public key. Sparkle's public key is optional here because the framework itself is optional.
+sparkle_feed_url="${SPARKLE_FEED_URL:-https://download.oh-my-tab.app/dev_release/appcast.xml}"
+/usr/libexec/PlistBuddy -c "Set :SUFeedURL $sparkle_feed_url" \
+    "$dev_app/Contents/Info.plist"
+if [ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]; then
+    /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" \
+        "$dev_app/Contents/Info.plist" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Set :SUPublicEDKey $SPARKLE_PUBLIC_ED_KEY" \
+            "$dev_app/Contents/Info.plist"
+fi
 
 # 优先使用固定签名身份,让 TCC 授权跨重建保持稳定;开发设备没有证书时允许回退 ad-hoc。
 # Prefer a stable signing identity so TCC grants survive rebuilds; allow ad-hoc fallback on

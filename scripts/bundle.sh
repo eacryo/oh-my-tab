@@ -15,8 +15,10 @@ trap 'code=$?; [ -n "$STAGING" ] && rm -rf "$STAGING"; [ "$code" -ne 0 ] && echo
 # Script lives in scripts/; cd to the repo root before using relative paths.
 cd "$(dirname "$0")/.."
 
-APP="dist/Oh-My-Tab.app"
-DMG="dist/Oh-My-Tab.dmg"
+APP_BASENAME="${APP_BASENAME:-Oh-My-Tab}"
+APP="dist/${APP_BASENAME}.app"
+DMG="dist/${APP_BASENAME}.dmg"
+ZIP="dist/${APP_BASENAME}.zip"
 
 cargo build --release
 BIN="target/release/oh-my-tab"
@@ -26,6 +28,26 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$BIN" "$APP/Contents/MacOS/oh-my-tab"
 cp assets/Info.plist "$APP/Contents/Info.plist"
 
+# The production defaults remain unchanged; the dev release wrapper overrides these values so
+# both channels can share this packaging implementation without sharing bundle identities.
+BUNDLE_ID="${BUNDLE_ID:-com.eacryo.oh-my-tab}"
+BUNDLE_NAME="${BUNDLE_NAME:-$APP_BASENAME}"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleName $BUNDLE_NAME" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $BUNDLE_NAME" "$APP/Contents/Info.plist"
+
+# Sparkle 2 is loaded by the Rust updater at runtime. Keep the framework out of git and copy a
+# locally downloaded release into the bundle when available. Set SPARKLE_FRAMEWORK_PATH to an
+# alternate checkout path; the default is vendor/Sparkle.framework.
+SPARKLE_FRAMEWORK_PATH="${SPARKLE_FRAMEWORK_PATH:-vendor/Sparkle.framework}"
+if [ -d "$SPARKLE_FRAMEWORK_PATH" ]; then
+  mkdir -p "$APP/Contents/Frameworks"
+  cp -R "$SPARKLE_FRAMEWORK_PATH" "$APP/Contents/Frameworks/Sparkle.framework"
+  echo "Sparkle: embedded $SPARKLE_FRAMEWORK_PATH"
+else
+  echo "warning: Sparkle.framework not found at $SPARKLE_FRAMEWORK_PATH; update checks will be unavailable"
+fi
+
 # 从 Cargo.toml 读 version(唯一事实源),写入 .app 的 Info.plist CFBundleShortVersionString,
 # 让 app 显示版本与 Cargo.toml 一致(不用手动同步 Info.plist)。
 # Read version from Cargo.toml (single source of truth) and write it into the .app's
@@ -33,6 +55,20 @@ cp assets/Info.plist "$APP/Contents/Info.plist"
 # (no manual Info.plist sync needed).
 VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+# Sparkle compares the monotonically increasing CFBundleVersion (build number), not just the
+# display version. Use a UTC timestamp by default so every build gets a fresh value; an explicit
+# SPARKLE_BUILD_VERSION is still available for deterministic release/test builds.
+BUILD_VERSION="${SPARKLE_BUILD_VERSION:-$(date -u +%Y%m%d%H%M%S)}"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_VERSION" "$APP/Contents/Info.plist"
+
+# Optional release-time overrides. The public Ed25519 key is safe to ship in the app; the private
+# signing key must stay outside this repository and is only used when generating appcast.xml.
+SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://download.oh-my-tab.app/appcast.xml}"
+/usr/libexec/PlistBuddy -c "Set :SUFeedURL $SPARKLE_FEED_URL" "$APP/Contents/Info.plist"
+if [ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]; then
+  /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" "$APP/Contents/Info.plist" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Set :SUPublicEDKey $SPARKLE_PUBLIC_ED_KEY" "$APP/Contents/Info.plist"
+fi
 
 # 应用图标:从 assets/AppIcon.icns 拷入 Contents/Resources/(放在 codesign 之前,纳入签名)。
 # 该 icns 由 build-icon-from-png.sh 从 Icon-Default-1024x1024@1x.png 生成并提交进 git;缺失则提示先跑该脚本。
@@ -76,6 +112,11 @@ else
 fi
 rm -f "$SIGN_ERR"
 
+# Sparkle's preferred archive is a zip containing the complete .app bundle. Keep the DMG for
+# manual installation and publish both artifacts from the release script when requested.
+rm -f "$ZIP"
+ditto -c -k --keepParent "$APP" "$ZIP"
+
 # 打 DMG(hdiutil 自带,无额外依赖):staging 里放 .app + Applications 软链,挂载后拖拽安装。
 # Build DMG via hdiutil (no extra deps): staging holds .app + Applications symlink for drag-to-install.
 STAGING="$(mktemp -d)"
@@ -85,6 +126,7 @@ rm -f "$DMG"
 hdiutil create -volname "Oh-My-Tab" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGING"; STAGING=""
 
-echo "Install: open $DMG   then drag Oh-My-Tab to Applications"
+echo "Install: open $DMG   then drag $APP_BASENAME to Applications"
+echo "Sparkle: $ZIP (contains $APP)"
 echo "Dev-run: open $APP   (SMAppService only works when launched as a .app, not via cargo run)"
-echo "✅ Build success: $DMG (contains $APP)"
+echo "✅ Build success: $DMG + $ZIP (both contain $APP)"
