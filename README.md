@@ -16,7 +16,9 @@
 
 <br />
 
-> [简体中文](README-ZH.md) | English
+<p align="center">
+  <a href="README-ZH.md">简体中文</a> | English
+</p>
 
 <br />
 
