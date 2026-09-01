@@ -2632,7 +2632,10 @@ unsafe fn update_thumbnail_scroller(
     }
     let footer_h = status_h();
     let frame = NSRect::new(
-        NSPoint::new(panel_w - H_PADDING - THUMB_SCROLLBAR_W, footer_h),
+        NSPoint::new(
+            panel_w - H_PADDING - THUMB_SCROLLBAR_W + THUMB_SCROLLBAR_W / 2.0,
+            footer_h,
+        ),
         NSSize::new(THUMB_SCROLLBAR_W, (panel_h - footer_h).max(1.0)),
     );
     // 拖拽期间保持命中视图的 frame 不变;卡片重建只刷新胶囊绘制。

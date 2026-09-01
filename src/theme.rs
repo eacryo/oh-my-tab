@@ -583,7 +583,7 @@ fn build_thumb_scroll_layout(
     widths: &[f64],
     scale: f64,
     constraints: ThumbFlowConstraints,
-    max_panel_w: f64,
+    _max_panel_w: f64,
     scrollbar_w: f64,
     scroll_offset: f64,
 ) -> ThumbFlowLayout {
@@ -638,8 +638,14 @@ fn build_thumb_scroll_layout(
                 + row.len().saturating_sub(1) as f64 * constraints.gap
         })
         .fold(0.0f64, f64::max);
+    // 溢出只代表需要纵向滚动,不代表面板必须铺满最大屏幕宽度。之前这里直接
+    // 取 max_panel_w,导致四列卡片被放在近乎整屏的面板中央,左右出现大块空白。
+    // The need for vertical scrolling does not mean the panel must fill the maximum screen
+    // width. Using max_panel_w here put four-card rows in an almost full-screen panel and left
+    // large empty margins on both sides. The row packing already respects max_inner, so the
+    // widest actual row is the natural width; only reserve the scrollbar beside it.
     let panel_w = if overflowed {
-        max_panel_w.max(used_inner_w + H_PADDING * 2.0 + scrollbar_w)
+        used_inner_w + H_PADDING * 2.0 + scrollbar_w
     } else {
         used_inner_w.max(280.0_f64.min(constraints.max_inner)) + H_PADDING * 2.0
     };
@@ -654,6 +660,11 @@ fn build_thumb_scroll_layout(
     } else {
         panel_w
     };
+    // 把卡片网格与右侧滚动条作为一个整体居中。滚动条只占右侧空间时,
+    // 单纯在剩余区域居中会让整个视觉组合向左偏半个滚动条宽度。
+    // Center the card grid together with the right-hand scrollbar. Centering only within
+    // the remaining area shifts the whole visual group left by half the scrollbar width.
+    let scrollbar_centering_offset = if overflowed { scrollbar_w / 2.0 } else { 0.0 };
     let document_h = THUMB_TOP_INSET
         + all_rows.len() as f64 * constraints.card_h
         + all_rows.len().saturating_sub(1) as f64 * constraints.gap;
@@ -662,7 +673,7 @@ fn build_thumb_scroll_layout(
     for (row_index, row) in all_rows.iter().enumerate() {
         let row_w = row.iter().map(|&i| widths[i]).sum::<f64>()
             + row.len().saturating_sub(1) as f64 * constraints.gap;
-        let mut x = (card_area_w - row_w) / 2.0;
+        let mut x = (card_area_w - row_w) / 2.0 + scrollbar_centering_offset;
         let y = document_panel_h
             - THUMB_TOP_INSET
             - (row_index as f64 + 1.0) * constraints.card_h
@@ -681,7 +692,7 @@ fn build_thumb_scroll_layout(
     for (local_row, row) in all_rows[row_start..row_end].iter().enumerate() {
         let row_w = row.iter().map(|&i| widths[i]).sum::<f64>()
             + row.len().saturating_sub(1) as f64 * constraints.gap;
-        let mut x = (card_area_w - row_w) / 2.0;
+        let mut x = (card_area_w - row_w) / 2.0 + scrollbar_centering_offset;
         let y = panel_h
             - THUMB_TOP_INSET
             - (local_row as f64 + 1.0) * constraints.card_h
@@ -750,7 +761,12 @@ pub(crate) fn plan_thumb_close_reflow(
         }
         let row_w = row.iter().map(|&index| widths[index]).sum::<f64>()
             + row.len().saturating_sub(1) as f64 * gap;
-        let mut x = (card_area_w - row_w) / 2.0;
+        let mut x = (card_area_w - row_w) / 2.0
+            + if overflowed {
+                THUMB_SCROLLBAR_W / 2.0
+            } else {
+                0.0
+            };
         let y = document_h
             - THUMB_TOP_INSET
             - (row_index as f64 + 1.0) * card_h
@@ -964,6 +980,7 @@ pub(crate) fn plan_icon_scroll_layout(
     } else {
         panel_w
     };
+    let scrollbar_centering_offset = if overflowed { scrollbar_w / 2.0 } else { 0.0 };
     let row_pitch = card_h + gap;
     let total_content_h = THUMB_TOP_INSET
         + visual_row_count as f64 * card_h
@@ -1007,7 +1024,7 @@ pub(crate) fn plan_icon_scroll_layout(
     let mut document_placements = Vec::with_capacity(count);
     for (row_index, row) in row_ranges.iter().enumerate() {
         let row_w = row.len() as f64 * ICON_CARD_W + row.len().saturating_sub(1) as f64 * gap;
-        let row_x = (card_area_w - row_w) / 2.0;
+        let row_x = (card_area_w - row_w) / 2.0 + scrollbar_centering_offset;
         let y = document_panel_h
             - THUMB_TOP_INSET
             - (row_index as f64 + 1.0) * card_h
@@ -1024,7 +1041,7 @@ pub(crate) fn plan_icon_scroll_layout(
     let mut placements = Vec::new();
     for (local_row, row) in row_ranges[row_start..row_end].iter().enumerate() {
         let row_w = row.len() as f64 * ICON_CARD_W + row.len().saturating_sub(1) as f64 * gap;
-        let row_x = (card_area_w - row_w) / 2.0;
+        let row_x = (card_area_w - row_w) / 2.0 + scrollbar_centering_offset;
         let y =
             panel_h - THUMB_TOP_INSET - (local_row as f64 + 1.0) * card_h - local_row as f64 * gap
                 + intra_row_offset;
@@ -1415,6 +1432,36 @@ mod flow_tests {
                 .collect::<Vec<_>>(),
             (4..16).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn scrolling_layout_width_follows_the_widest_visible_grid_row() {
+        let aspects = vec![1.6; 8];
+        let card_h = thumb_card_h_fixed();
+        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
+        let layout = plan_thumb_scroll_layout(
+            &aspects,
+            900.0,
+            1400.0,
+            max_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            0.0,
+        );
+
+        assert!(layout.overflowed);
+        assert_eq!(layout.row_ranges, vec![0..2, 2..4, 4..6, 6..8]);
+        assert_eq!(
+            layout.panel_w,
+            2.0 * 300.0 + THUMB_ROW_GAP + H_PADDING * 2.0 + THUMB_SCROLLBAR_W
+        );
+        let first = layout.document_placements.first().unwrap();
+        assert_eq!(first.x, H_PADDING + THUMB_SCROLLBAR_W / 2.0);
+        assert_eq!(
+            layout.panel_w - (first.x + first.width * 2.0 + THUMB_ROW_GAP),
+            H_PADDING + THUMB_SCROLLBAR_W / 2.0
+        );
+        assert!(layout.panel_w < 1400.0);
     }
 
     #[test]
