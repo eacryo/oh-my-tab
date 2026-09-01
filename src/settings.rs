@@ -8,7 +8,7 @@
 
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSEdgeInsets, NSPoint, NSRect, NSSize};
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -176,7 +176,9 @@ struct SettingsUi {
     // ---- 按键映射区 / button-mappings section ----
     mapping_scroll: *mut AnyObject, // NSScrollView: 绑定列表滚动容器 / the bindings scroll view
     mapping_doc: *mut AnyObject,    // NSView: 滚动容器里的 document view(行堆叠处)/ document view
-    mapping_rows: Vec<MappingRow>,  // 动态绑定行(标签 + 删除按钮)/ live binding rows
+    mapping_card: *mut AnyObject, // NSVisualEffectView: 按键映射外层卡片 / the mappings outer card
+    mapping_panel: *mut AnyObject, // NSView: 嵌套圆角表格面板 / the nested rounded table panel
+    mapping_rows: Vec<MappingRow>, // 动态绑定行(标签 + 删除按钮)/ live binding rows
     clipboard_enabled: *mut AnyObject, // NSSwitch: 启用剪贴板历史 / enable clipboard history
     clipboard_persist: *mut AnyObject, // NSSwitch: 保存剪贴板历史记录到磁盘 / persist clipboard history
     clipboard_move_used_to_top: *mut AnyObject, // NSSwitch: 使用后移到最前 / move used entries to top
@@ -214,6 +216,7 @@ struct MappingRow {
     desc_label: *mut AnyObject,
     edit: *mut AnyObject,
     delete: *mut AnyObject,
+    separator: *mut AnyObject,
     caps: Vec<*mut AnyObject>,
 }
 unsafe impl Send for MappingRow {}
@@ -221,7 +224,17 @@ unsafe impl Send for MappingRow {}
 /// 映射区行高(独立于全局 row_h;build 的卡片高度与 render 共用)。
 /// Mapping-row height (independent of the global row_h; shared by the card height in build
 /// and by render).
-const MAPPING_ROW_H: f64 = 28.0;
+const MAPPING_HEADER_H: f64 = 32.0;
+const MAPPING_ROW_H: f64 = 38.0;
+
+// 嵌套映射表格(HTML `.mapping-table`)的布局参数。
+// Layout constants for the nested mapping table (HTML `.mapping-table`).
+const MAPPING_PANEL_X: f64 = 10.0; // 子表格在外层卡片内的水平内缩 / sub-table horizontal inset
+const MAPPING_PANEL_TOP: f64 = 10.0; // 子表格顶部内缩 / sub-table top padding
+const MAPPING_CELL_X: f64 = 12.0; // 行内容在子表格内的左内边距 / row content left padding
+const MAPPING_ACTION_TOP: f64 = 12.0; // 添加按钮上方间距 / gap above the add-mapping button
+const MAPPING_ACTION_H: f64 = 34.0; // 添加按钮高度 / add-mapping button height
+const MAPPING_CARD_PAD_BOT: f64 = 10.0; // 卡片底部内边距 / card bottom padding
 
 /// 动作类型下拉的项,index 与语义一一对应(render/变化回调共用)。
 /// The action-type popup items; index maps 1:1 to semantics (shared by render and the
@@ -605,11 +618,12 @@ unsafe fn centered_text_field_cell_class() -> *mut AnyObject {
 
 fn centered_text_field_cell_frame(bounds: NSRect) -> NSRect {
     let text_h = bounds.size.height.min(22.0);
-    // NSTextFieldCell's regular-size baseline sits a few points above the geometric center of
-    // a 22pt drawing rect. Compensate that intrinsic baseline offset after centering the rect in
-    // the 34pt settings row.
+    // The cell draws its baseline a few points above the geometric center of the 22pt rect, so
+    // after centering the rect in the taller settings row a POSITIVE offset shifts the drawing
+    // rect DOWN to compensate (the old +1 left the glyphs a touch high; a negative value pushed
+    // them further up).
     let baseline_offset = if bounds.size.height > text_h {
-        1.0
+        2.0
     } else {
         0.0
     };
@@ -1005,41 +1019,39 @@ unsafe fn make_glass_preview(
     release_obj(glass);
 
     if switcher {
+        let tile_w = ((w - 42.0) / 2.0).max(56.0);
         add_preview_tile(
             content_parent,
-            NSRect::new(NSPoint::new(13.0, 12.0), NSSize::new(42.0, 34.0)),
-            0xFFFFFF18,
-            7.0,
+            NSRect::new(NSPoint::new(14.0, 19.0), NSSize::new(tile_w, 52.0)),
+            0xFFFFFF78,
+            10.0,
         );
         add_preview_tile(
             content_parent,
-            NSRect::new(NSPoint::new(59.0, 8.0), NSSize::new(42.0, 42.0)),
-            0xFFFFFF32,
-            8.0,
-        );
-        add_preview_tile(
-            content_parent,
-            NSRect::new(NSPoint::new(105.0, 12.0), NSSize::new(42.0, 34.0)),
-            0xFFFFFF18,
-            7.0,
+            NSRect::new(
+                NSPoint::new(w - 14.0 - tile_w, 19.0),
+                NSSize::new(tile_w, 52.0),
+            ),
+            0xFFFFFF90,
+            10.0,
         );
     } else {
         add_preview_tile(
             content_parent,
             NSRect::new(NSPoint::new(12.0, h - 22.0), NSSize::new(w - 24.0, 10.0)),
-            0xFFFFFF20,
+            0xFFFFFF70,
             5.0,
         );
         add_preview_tile(
             content_parent,
             NSRect::new(NSPoint::new(12.0, 25.0), NSSize::new(w - 24.0, 12.0)),
-            0xFFFFFF18,
+            0xFFFFFF62,
             5.0,
         );
         add_preview_tile(
             content_parent,
             NSRect::new(NSPoint::new(12.0, 9.0), NSSize::new(w - 42.0, 8.0)),
-            0xFFFFFF12,
+            0xFFFFFF48,
             4.0,
         );
     }
@@ -1054,6 +1066,8 @@ unsafe fn add_preview_tile(parent: *mut AnyObject, frame: NSRect, color_hex: u32
     if !layer.is_null() {
         let _: () = msg_send![layer, setCornerRadius: radius];
         crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(color_hex));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x0000000Au32));
+        let _: () = msg_send![layer, setBorderWidth: 1.0f64];
     }
     let _: () = msg_send![parent, addSubview: tile];
     release_obj(tile);
@@ -1325,10 +1339,9 @@ unsafe fn make_switch(right_x: f64, y: f64, h: f64, checked: bool) -> *mut AnyOb
     let sw: *mut AnyObject = msg_send![class!(NSSwitch), alloc];
     let sw: *mut AnyObject =
         msg_send![sw, initWithFrame: NSRect::new(NSPoint::new(right_x, y), NSSize::new(0.0, 0.0))];
-    // 用 setControlSize: 调小一档(small,regular 约 38x22,small 约 30x19),与设置行更协调。
-    // setControlSize: shrinks the switch by one step (regular ~38x22, small ~30x19) so it fits
-    // the settings rows better. fittingSize 再拿该档位的固有尺寸并垂直居中于行。
-    let _: () = msg_send![sw, setControlSize: 1isize]; // NSControlSizeSmall
+    // Use the regular 38x22 switch from the reference instead of the undersized compact variant.
+    // fittingSize gives the native size and the frame is then vertically centered in the row.
+    let _: () = msg_send![sw, setControlSize: 0isize]; // NSControlSizeRegular
     let fs: NSSize = msg_send![sw, fittingSize];
     let (sw_w, sw_h) = if fs.width > 0.0 {
         (fs.width, fs.height)
@@ -1608,7 +1621,8 @@ unsafe fn add_settings_card(parent: *mut AnyObject, frame: NSRect) {
     if !layer.is_null() {
         layer_set_background(layer, crate::ffi::hex_to_cg_color(0xFFFFFFE0u32));
         let _: () = msg_send![layer, setCornerRadius: 14.0f64];
-        let _: () = msg_send![layer, setMasksToBounds: true];
+        // Keep the outer shadow visible. The card has no child content that needs clipping.
+        let _: () = msg_send![layer, setMasksToBounds: false];
         crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x00000012u32));
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
         let _: () = msg_send![layer, setShadowOpacity: 0.025f32];
@@ -1704,6 +1718,190 @@ unsafe fn add_row_with_label(
     let _: () = msg_send![parent, addSubview: control];
     release_obj(control);
     (label, control)
+}
+
+/// Add a taller settings row with the two-level title/subtitle hierarchy used by the HTML
+/// reference. The caller positions the native control inside the row; this helper only builds
+/// the leading text stack and returns the control after attaching it.
+#[allow(clippy::too_many_arguments)]
+unsafe fn add_described_row(
+    parent: *mut AnyObject,
+    x: f64,
+    y: f64,
+    text_w: f64,
+    row_h: f64,
+    title: &str,
+    subtitle: &str,
+    control: *mut AnyObject,
+) -> *mut AnyObject {
+    let title_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let title_label: *mut AnyObject = msg_send![
+        title_label,
+        initWithFrame: NSRect::new(
+            NSPoint::new(x, y + row_h - 27.0),
+            NSSize::new(text_w, 18.0),
+        )
+    ];
+    set_field(title_label, title);
+    let _: () = msg_send![title_label, setBezeled: false];
+    let _: () = msg_send![title_label, setDrawsBackground: false];
+    let _: () = msg_send![title_label, setEditable: false];
+    let _: () = msg_send![title_label, setUsesSingleLineMode: true];
+    let title_font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.5f64];
+    let _: () = msg_send![title_label, setFont: title_font];
+    let _: () = msg_send![parent, addSubview: title_label];
+    release_obj(title_label);
+
+    let subtitle_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let subtitle_label: *mut AnyObject = msg_send![
+        subtitle_label,
+        initWithFrame: NSRect::new(
+            NSPoint::new(x, y + 7.0),
+            NSSize::new(text_w, 17.0),
+        )
+    ];
+    set_field(subtitle_label, subtitle);
+    let _: () = msg_send![subtitle_label, setBezeled: false];
+    let _: () = msg_send![subtitle_label, setDrawsBackground: false];
+    let _: () = msg_send![subtitle_label, setEditable: false];
+    let _: () = msg_send![subtitle_label, setUsesSingleLineMode: true];
+    let subtitle_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.5f64];
+    let _: () = msg_send![subtitle_label, setFont: subtitle_font];
+    let subtitle_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+    let _: () = msg_send![subtitle_label, setTextColor: subtitle_color];
+    let _: () = msg_send![parent, addSubview: subtitle_label];
+    release_obj(subtitle_label);
+
+    let _: () = msg_send![control, setAutoresizingMask: 10u64];
+    let _: () = msg_send![parent, addSubview: control];
+    release_obj(control);
+    control
+}
+
+/// HTML `.row` at 54pt but single-line: the label is vertically centered and the control
+/// right-aligned. Used for the Device/Scroll-mode rows that have no subtitle.
+#[allow(clippy::too_many_arguments)]
+unsafe fn add_tall_row(
+    parent: *mut AnyObject,
+    label_x: f64,
+    y: f64,
+    label_w: f64,
+    label_text: &str,
+    control: *mut AnyObject,
+) -> (*mut AnyObject, *mut AnyObject) {
+    let h = 54.0; // matched described_row_h
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(label_x, y + (h - 22.0) / 2.0), NSSize::new(label_w, 22.0))];
+    let ns = make_nsstring(label_text);
+    let _: () = msg_send![label, setStringValue: ns];
+    CFRelease(ns as *const c_void);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setAlignment: 0isize]; // left
+    let font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.5f64];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setAutoresizingMask: 12u64];
+    let _: () = msg_send![parent, addSubview: label];
+    release_obj(label);
+    let _: () = msg_send![control, setAutoresizingMask: 10u64];
+    let _: () = msg_send![parent, addSubview: control];
+    release_obj(control);
+    (label, control)
+}
+
+/// Style an NSPopUpButton with the HTML `.field` look: a rounded light-gray surface, no
+/// bezel, so the Device/Scroll-mode dropdowns match the flat reference control.
+unsafe fn style_flat_popup(popup: *mut AnyObject) {
+    let _: () = msg_send![popup, setBezelStyle: 0isize];
+    let _: () = msg_send![popup, setControlSize: 0isize]; // Regular
+    let _: () = msg_send![popup, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![popup, layer];
+    if !layer.is_null() {
+        let _: () = msg_send![layer, setCornerRadius: 9.0f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(0x7676801Du32));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x00000012u32));
+        let _: () = msg_send![layer, setBorderWidth: 1.0f64];
+    }
+}
+
+/// Create one transparent, vertically scrolling settings page above the fixed footer. The
+/// document view keeps AppKit's normal bottom-left coordinate system so the existing layout
+/// code can continue to position controls from a top cursor.
+unsafe fn make_settings_page(
+    parent: *mut AnyObject,
+    frame: NSRect,
+    document_h: f64,
+    hidden: bool,
+) -> (*mut AnyObject, *mut AnyObject) {
+    let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
+    let scroll: *mut AnyObject = msg_send![scroll, initWithFrame: frame];
+    // FullSizeContentView lets the scroll view reach into the title bar, so AppKit auto-adds a
+    // top content inset. Without disabling it, the real scrollable top sits below the geometric
+    // doc top, so scrollToPoint(0, doc_h - clip_h) never lands at the very top (the Mouse title
+    // looks flush yet the scrollbar can still rise). Disable the auto inset and force zero inset.
+    let _: () = msg_send![scroll, setAutomaticallyAdjustsContentInsets: false];
+    let _: () = msg_send![scroll, setContentInsets: NSEdgeInsets { top: 0.0, left: 0.0, bottom: 0.0, right: 0.0 }];
+    let _: () = msg_send![scroll, setBorderType: 0u64];
+    let _: () = msg_send![scroll, setDrawsBackground: false];
+    let _: () = msg_send![scroll, setHasHorizontalScroller: false];
+    let _: () = msg_send![scroll, setHasVerticalScroller: true];
+    let _: () = msg_send![scroll, setAutohidesScrollers: true];
+    let _: () = msg_send![scroll, setScrollerStyle: 1isize]; // overlay
+    let _: () = msg_send![scroll, setAutoresizingMask: 18u64];
+    let _: () = msg_send![scroll, setHidden: hidden];
+
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let _: () = msg_send![clip, setDrawsBackground: false];
+
+    let document: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let document: *mut AnyObject = msg_send![
+        document,
+        initWithFrame: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(frame.size.width, document_h),
+        )
+    ];
+    let _: () = msg_send![document, setAutoresizingMask: 2u64];
+    let _: () = msg_send![scroll, setDocumentView: document];
+    let _: () = msg_send![parent, addSubview: scroll];
+
+    // Scroll to the TOP of the document so the page opens with the title flush at the top edge.
+    // Measure the clip's real bounds height AFTER the doc view is attached (a frame-based guess
+    // can be stale before layout and leaves the scrollbar mid-track).
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    let top_origin = (document_h - clip_bounds.size.height).max(0.0);
+    let _: () = msg_send![clip, scrollToPoint: NSPoint::new(0.0, top_origin)];
+    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+
+    release_obj(document);
+    release_obj(scroll);
+    (scroll, document)
+}
+
+/// Scroll a settings page's clip view to the top. Call this after the window has been laid out:
+/// a frame-time scrollToPoint gets reset by AppKit's first layout pass, leaving the scrollbar
+/// mid-track. The page scroll views are the same views stored on SettingsUi (general_view, etc.).
+unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
+    if scroll.is_null() {
+        return;
+    }
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let doc: *mut AnyObject = msg_send![scroll, documentView];
+    let doc_frame: NSRect = msg_send![doc, frame];
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    let top_origin = (doc_frame.size.height - clip_bounds.size.height).max(0.0);
+    let _: () = msg_send![clip, scrollToPoint: NSPoint::new(0.0, top_origin)];
+    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+    let after: NSRect = msg_send![clip, bounds];
+    log_info!(
+        "[settings] scroll_page_to_top: doc_h={:.1} clip_h={:.1} top_origin={:.1} -> clip_oy_after={:.1}",
+        doc_frame.size.height,
+        clip_bounds.size.height,
+        top_origin,
+        after.origin.y
+    );
 }
 
 // ========== 设置窗口逻辑 / settings window logic ==========
@@ -2375,6 +2573,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             for cap in row.caps {
                 let _: () = msg_send![cap, removeFromSuperview];
             }
+            let _: () = msg_send![row.separator, removeFromSuperview];
         }
         let doc = u.mapping_doc;
         // 列表只显示已绑定的行 + 刚添加未配置的临时行(方案 A 的行内配置,动态行)。
@@ -2393,9 +2592,11 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             items.len()
         );
         items.sort_by_key(|(b, _)| *b);
+        let items_len = items.len();
         let row_h = MAPPING_ROW_H;
-        // 文档恒高卡片高度(行少时行从顶部排起,不留底部空白;行多时滚动)。
-        // The document is always the card height (rows start at the top; scroll when more).
+        // 卡片高度随行数增长(顶部固定):少行时保持 3 行,多行时向下长高,整页滚动。
+        // The card height grows with the row count (top-anchored): it keeps three rows when
+        // short and grows downward when long, the page scroll view handles the overflow.
         // 空状态提示:无行时显示。
         // Empty-state hint: shown when there are no rows.
         let _: () = msg_send![u.mapping_empty, setHidden: !items.is_empty()];
@@ -2404,9 +2605,6 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
         // Resize height only, keeping the initial width: setFrameSize(0.0, doc_h) used to
         // zero the width, and a zero-width document view fails hit-testing -- the delete
         // buttons became unclickable.
-        // 卡片高度固定(build 时定为 3 行);行多时由圆角 + masksToBounds 裁剪。
-        // The card height is fixed (3 rows at build time); extra rows are clipped by the
-        // rounded corner + masksToBounds.
         // flipped:y=0 在顶部,行从顶部依次向下排。
         // Flipped: y=0 is the top; rows stack down from the top.
         let mappings_on = {
@@ -2416,7 +2614,19 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
         // 添加按钮一并置灰(开关关闭时不可添加新映射)。
         // The add button greys out too (no new mappings while off).
         let _: () = msg_send![u.add_mapping_button, setEnabled: mappings_on];
-        let mut y = 0.0;
+        // Rows sit inside the nested table panel: a left content inset and right-aligned actions.
+        let row_x0 = MAPPING_PANEL_X + MAPPING_CELL_X;
+        let card_frame: NSRect = msg_send![doc, frame];
+        let card_w = card_frame.size.width;
+        let row_right = card_w - MAPPING_PANEL_X - MAPPING_CELL_X;
+        let btn_w = 60.0;
+        let btn_gap = 6.0;
+        let ed_x = row_right - (btn_w * 2.0 + btn_gap);
+        let del_x = ed_x + btn_w + btn_gap;
+        let btn_h = 27.0;
+        let desc_x = row_x0 + 74.0;
+        // Rows start below the header band (MAPPING_PANEL_TOP + MAPPING_HEADER_H).
+        let mut y = MAPPING_PANEL_TOP + MAPPING_HEADER_H;
         let target = MENU_TARGET.lock().unwrap().unwrap().0;
         for (btn, desc) in items {
             // 动作类型 index:默认/无/系统动作/快捷键(快捷键 = Key Press)。
@@ -2444,7 +2654,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             // The 13pt text sits toward the TOP of the 28pt field (not vertically centered):
             // shifting the label down 7pt aligns its midline with the buttons' (calibrated).
             let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-            let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(0.0, y + 5.0), NSSize::new(60.0, row_h))];
+            let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(row_x0, y + (row_h - 22.0) / 2.0), NSSize::new(70.0, 22.0))];
             set_field(label, 0);
             let _: () = msg_send![label, setBezeled: false];
             let _: () = msg_send![label, setDrawsBackground: false];
@@ -2458,7 +2668,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             // 动作描述:系统动作/None 显示文本;Key Press 显示键帽胶囊。
             // The action description: text for system actions/None; keycaps for Key Press.
             let desc_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-            let desc_label: *mut AnyObject = msg_send![desc_label, initWithFrame: NSRect::new(NSPoint::new(64.0, y + 5.0), NSSize::new(130.0, row_h))];
+            let desc_label: *mut AnyObject = msg_send![desc_label, initWithFrame: NSRect::new(NSPoint::new(desc_x, y + (row_h - 22.0) / 2.0), NSSize::new((ed_x - desc_x - 8.0).max(1.0), 22.0))];
             set_field(desc_label, 0);
             let _: () = msg_send![desc_label, setBezeled: false];
             let _: () = msg_send![desc_label, setDrawsBackground: false];
@@ -2480,8 +2690,8 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             // 编辑按钮(打开编辑面板)。
             // The edit button (opens the edit panel).
             let edit: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let edit: *mut AnyObject = msg_send![edit, initWithFrame: NSRect::new(NSPoint::new(200.0, y + 2.0), NSSize::new(72.0, 24.0))];
-            style_html_button(edit, 0xFFFFFFADu32, 0x2E2E2EFFu32);
+            let edit: *mut AnyObject = msg_send![edit, initWithFrame: NSRect::new(NSPoint::new(ed_x, y + (row_h - btn_h) / 2.0), NSSize::new(btn_w, btn_h))];
+            style_html_button(edit, 0x7676801Fu32, 0x44444AFFu32);
             let _: () = msg_send![edit, setTag: btn as isize];
             let _: () = msg_send![edit, setEnabled: mappings_on];
             let _: () = msg_send![edit, setTarget: target];
@@ -2494,8 +2704,8 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             // 删除按钮(文字样式,与编辑按钮同款)。
             // The delete button (text style, same look as Edit).
             let delete: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let delete: *mut AnyObject = msg_send![delete, initWithFrame: NSRect::new(NSPoint::new(278.0, y + 2.0), NSSize::new(72.0, 24.0))];
-            style_html_button(delete, 0xFFFFFFADu32, 0x2E2E2EFFu32);
+            let delete: *mut AnyObject = msg_send![delete, initWithFrame: NSRect::new(NSPoint::new(del_x, y + (row_h - btn_h) / 2.0), NSSize::new(btn_w, btn_h))];
+            style_html_button(delete, 0x7676801Fu32, 0x44444AFFu32);
             let _: () = msg_send![delete, setTag: btn as isize];
             let _: () = msg_send![delete, setEnabled: mappings_on];
             let _: () = msg_send![delete, setTarget: target];
@@ -2513,7 +2723,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
                 let key_str = display_shortcut(&desc);
                 let cap_size = 20.0;
                 let cap_y = y + (row_h - cap_size) / 2.0;
-                let mut cap_x = 268.0;
+                let mut cap_x = desc_x + 4.0;
                 for ch in key_str.chars() {
                     let cap: *mut AnyObject = msg_send![class!(NSTextField), alloc];
                     let cap: *mut AnyObject = msg_send![cap, initWithFrame: NSRect::new(NSPoint::new(cap_x, cap_y), NSSize::new(cap_size, cap_size))];
@@ -2542,7 +2752,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             // 行底分隔线(最后一行被卡片底圆角裁掉,无妨)。
             // Row-bottom separator (the last row's line is clipped by the card corner).
             let sep: *mut AnyObject = msg_send![class!(NSView), alloc];
-            let sep: *mut AnyObject = msg_send![sep, initWithFrame: NSRect::new(NSPoint::new(0.0, y + row_h - 1.0), NSSize::new(380.0, 1.0))];
+            let sep: *mut AnyObject = msg_send![sep, initWithFrame: NSRect::new(NSPoint::new(row_x0, y + row_h - 1.0), NSSize::new(row_right - row_x0, 1.0))];
             let _: () = msg_send![sep, setWantsLayer: true];
             let sep_layer: *mut AnyObject = msg_send![sep, layer];
             let sep_color: *mut AnyObject = msg_send![class!(NSColor), separatorColor];
@@ -2554,9 +2764,30 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
                 desc_label,
                 edit,
                 delete,
+                separator: sep,
                 caps,
             });
             y += row_h;
+        }
+        // Grow the nested table + card to fit every row. The panel and the add button track the
+        // growing table; the page scroll view handles any overflow, so nothing is clipped.
+        {
+            let card_frame: NSRect = msg_send![doc, frame];
+            let card_w = card_frame.size.width;
+            let panel_h = (MAPPING_HEADER_H + items_len as f64 * MAPPING_ROW_H)
+                .max(MAPPING_HEADER_H + MAPPING_ROW_H * 3.0);
+            let card_h = MAPPING_PANEL_TOP
+                + panel_h
+                + MAPPING_ACTION_TOP
+                + MAPPING_ACTION_H
+                + MAPPING_CARD_PAD_BOT;
+            let card_top = card_frame.origin.y + card_frame.size.height;
+            let card_bottom = card_top - card_h;
+            // The panel keeps its top-left anchor; its height tracks the rows.
+            let _: () = msg_send![u.mapping_panel, setFrameSize: NSSize::new(card_w - 2.0 * MAPPING_PANEL_X, panel_h)];
+            let _: () = msg_send![doc, setFrame: NSRect::new(NSPoint::new(card_frame.origin.x, card_bottom), NSSize::new(card_w, card_h))];
+            // The add button sits in the action row at the card bottom.
+            let _: () = msg_send![u.add_mapping_button, setFrame: NSRect::new(NSPoint::new(MAPPING_PANEL_X, MAPPING_PANEL_TOP + panel_h + MAPPING_ACTION_TOP), NSSize::new(card_w - 2.0 * MAPPING_PANEL_X, MAPPING_ACTION_H))];
         }
     }
 }
@@ -3343,6 +3574,11 @@ fn select_sidebar(idx: usize) {
         for (i, &v) in views.iter().enumerate() {
             let _: () = msg_send![v, setHidden: i != idx];
         }
+        // 刚显示的页(如从隐藏切出来)需先排版,clip bounds 才会正确,随后滚到顶部。
+        // A just-shown page needs a layout pass first so the clip bounds are correct;
+        // then scroll it to the top. layoutIfNeeded lives on the window, not the scroll view.
+        let _: () = msg_send![ui.window, layoutIfNeeded];
+        scroll_page_to_top(views[idx]);
     }
 }
 
@@ -3424,6 +3660,9 @@ fn show_settings() {
             // resets them.
             let _: () = msg_send![u.window, layoutIfNeeded];
             reposition_traffic_lights(u.window);
+            // Scroll the visible page (General on open) to the top after layout, so the scrollbar
+            // starts at the top of the track instead of the middle.
+            scroll_page_to_top(u.general_view);
             // 清掉默认 first responder,避免打开时焦点落在 Glass color 控件。
             // Clear the default first responder so focus does not land on the Glass color control on open.
             let _: bool = msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
@@ -4101,9 +4340,9 @@ fn create_settings_window() {
         // 保持原来的紧凑窗口尺寸，同时应用 redesign 的字体、间距、控件和分组卡片风格。
         // Give the redesigned detail pane enough room for full labels, links, and wide fields
         // while keeping the sidebar and the existing window height unchanged.
-        let view_w = 760.0;
+        let view_w = 820.0;
         let card_margin = 0.0;
-        let card_w = 195.0;
+        let card_w = 220.0;
         let window_clip_radius = 26.0;
         let card_radius = 0.0;
         let style: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
@@ -4120,7 +4359,7 @@ fn create_settings_window() {
         // NSScreen.mainScreen (it follows the key window, not the primary display; see
         // overlay_target_screen's note).
         let win_w = view_w;
-        let win_h = 690.0;
+        let win_h = 720.0;
         let (win_x, win_y) = {
             let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
             let count: usize = msg_send![screens, count];
@@ -4193,11 +4432,11 @@ fn create_settings_window() {
         let _: () = msg_send![window, setTitlebarAppearsTransparent: true];
         let _: () = msg_send![window, setStyleMask: style | (1 << 15)]; // NSWindowStyleMaskFullSizeContentView
         let _: () = msg_send![window, setTitleVisibility: 1isize]; // NSWindowTitleHidden
-        let layout_rect: NSRect = msg_send![window, contentLayoutRect];
-        let layout_h = layout_rect.size.height.min(content_h);
-        // Keep a modest top inset in the detail pane. The previous 12pt cursor left a visibly
-        // larger gap than the HTML content's 48px padding once the native toolbar was included.
-        let page_top = layout_h + 20.0;
+                                                                   // The scroll region spans from the footer to the window's top edge (fullSizeContentView),
+                                                                   // so the content scrolls all the way up behind the traffic-light strip — matching the
+                                                                   // HTML, where the right panel's scroll area reaches the window border. content_h is the
+                                                                   // full content height (the traffic lights sit over the sidebar, not the detail pane).
+        let page_viewport_h = (content_h - 62.0).max(1.0);
 
         // 窗口圆角:窗口自绘的 opaque 背景(系统默认小圆角)会盖住 contentView 的裁剪,
         // 单靠 layer cornerRadius 圆角出不来。做法:setOpaque:NO 关掉窗口自绘背景,由
@@ -4258,6 +4497,8 @@ fn create_settings_window() {
             disable_pointer_accel: std::ptr::null_mut(),
             mapping_scroll: std::ptr::null_mut(),
             mapping_doc: std::ptr::null_mut(),
+            mapping_card: std::ptr::null_mut(),
+            mapping_panel: std::ptr::null_mut(),
             mapping_rows: Vec::new(),
             clipboard_enabled: std::ptr::null_mut(),
             clipboard_persist: std::ptr::null_mut(),
@@ -4279,15 +4520,18 @@ fn create_settings_window() {
         // backgrounds provide the visual split instead of an inset outer card.
         // 左侧导航和右侧详情直接衔接，通过两种背景色区分，不再使用内缩的外框卡片。
         let content_x = card_w;
-        let content_w = view_w - content_x;
+        let detail_w = view_w - content_x;
+        let page_inset = 32.0;
+        let page_x = content_x + page_inset;
+        let content_w = detail_w - page_inset * 2.0;
         let label_x = 12.0;
-        let label_w = 150.0;
-        let ctrl_x = 170.0;
-        let ctrl_w = content_w - ctrl_x - 12.0;
+        let label_w = 220.0;
+        let ctrl_w = 200.0;
+        let ctrl_x = content_w - ctrl_w - 12.0;
         // HTML `.row` uses a 34pt control and roughly 54pt visual row; the native labels and
         // controls share that rhythm while grouped cards provide the surrounding padding.
         let row_h = 34.0;
-        let row_pitch = 42.0;
+        let described_row_h = 54.0;
 
         let target = match *MENU_TARGET.lock().unwrap() {
             Some(t) => t.0,
@@ -4370,7 +4614,7 @@ fn create_settings_window() {
             main_background,
             initWithFrame: NSRect::new(
                 NSPoint::new(content_x, 0.0),
-                NSSize::new(content_w, content_h)
+                NSSize::new(detail_w, content_h)
             )
         ];
         let _: () = msg_send![main_background, setWantsLayer: true];
@@ -4389,7 +4633,7 @@ fn create_settings_window() {
             footer,
             initWithFrame: NSRect::new(
                 NSPoint::new(content_x, 0.0),
-                NSSize::new(content_w, 62.0),
+                NSSize::new(detail_w, 62.0),
             )
         ];
         let _: () = msg_send![footer, setWantsLayer: true];
@@ -4402,7 +4646,7 @@ fn create_settings_window() {
             footer_line,
             initWithFrame: NSRect::new(
                 NSPoint::new(0.0, 61.0),
-                NSSize::new(content_w, 1.0),
+                NSSize::new(detail_w, 1.0),
             )
         ];
         let _: () = msg_send![footer_line, setWantsLayer: true];
@@ -4568,53 +4812,37 @@ fn create_settings_window() {
         let _: () = msg_send![sidebar_view, addSubview: restore];
         release_obj(restore);
 
-        // --- 通用页容器 general page container ---
-        let general_view: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let general_view: *mut AnyObject = msg_send![general_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
-        // 自适应:宽高随窗口拉伸(WidthSizable|HeightSizable = 2|16 = 18)。
-        let _: () = msg_send![general_view, setAutoresizingMask: 18u64];
-        let _: () = msg_send![content, addSubview: general_view];
-        release_obj(general_view);
-        ui.general_view = general_view;
+        // The scroll view spans from the left gutter to the detail pane's right edge, so the
+        // overlay scrollbar sits flush with the window edge (matching the OK/Cancel footer) and
+        // no longer floats 32pt in from the right. The content keeps its 32pt gutter margins
+        // inside the document, so only the scrollbar's position changes.
+        let page_frame = NSRect::new(
+            NSPoint::new(page_x, 62.0),
+            NSSize::new(detail_w - page_inset, page_viewport_h),
+        );
+        let general_doc_h = 820.0;
+        let switcher_doc_h = 840.0;
+        let mouse_doc_h = 1240.0;
+        let clipboard_doc_h = 700.0;
+        let about_doc_h = 700.0;
 
-        // --- 应用切换浮窗页容器 switcher page container(初始隐藏 / initially hidden)---
-        let switcher_view: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let switcher_view: *mut AnyObject = msg_send![switcher_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
-        let _: () = msg_send![switcher_view, setHidden: true];
-        let _: () = msg_send![switcher_view, setAutoresizingMask: 18u64]; // 同 general_view:宽高拉伸
-        let _: () = msg_send![content, addSubview: switcher_view];
-        release_obj(switcher_view);
-        ui.switcher_view = switcher_view;
-
-        // --- 鼠标页容器 mouse page container(初始隐藏 / initially hidden)---
-        let mouse_view: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let mouse_view: *mut AnyObject = msg_send![mouse_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
-        let _: () = msg_send![mouse_view, setHidden: true];
-        let _: () = msg_send![mouse_view, setAutoresizingMask: 18u64]; // 同 general_view:宽高拉伸
-        let _: () = msg_send![content, addSubview: mouse_view];
-        release_obj(mouse_view);
-        ui.mouse_view = mouse_view;
-
-        // --- 剪贴板历史页容器 clipboard page container(初始隐藏 / initially hidden)---
-        let clipboard_view: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let clipboard_view: *mut AnyObject = msg_send![clipboard_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
-        let _: () = msg_send![clipboard_view, setHidden: true];
-        let _: () = msg_send![clipboard_view, setAutoresizingMask: 18u64]; // 同 general_view:宽高拉伸
-        let _: () = msg_send![content, addSubview: clipboard_view];
-        release_obj(clipboard_view);
-        ui.clipboard_view = clipboard_view;
-
-        // --- 关于页容器 about page container(初始隐藏 / initially hidden)---
-        let about_view: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let about_view: *mut AnyObject = msg_send![about_view, initWithFrame: NSRect::new(NSPoint::new(content_x, 0.0), NSSize::new(content_w, content_h))];
-        let _: () = msg_send![about_view, setHidden: true];
-        let _: () = msg_send![about_view, setAutoresizingMask: 18u64];
-        let _: () = msg_send![content, addSubview: about_view];
-        release_obj(about_view);
-        ui.about_view = about_view;
+        let (general_root, general_view) =
+            make_settings_page(content, page_frame, general_doc_h, false);
+        ui.general_view = general_root;
+        let (switcher_root, switcher_view) =
+            make_settings_page(content, page_frame, switcher_doc_h, true);
+        ui.switcher_view = switcher_root;
+        let (mouse_root, mouse_view) = make_settings_page(content, page_frame, mouse_doc_h, true);
+        ui.mouse_view = mouse_root;
+        let (clipboard_root, clipboard_view) =
+            make_settings_page(content, page_frame, clipboard_doc_h, true);
+        ui.clipboard_view = clipboard_root;
+        let (about_root, about_view) = make_settings_page(content, page_frame, about_doc_h, true);
+        ui.about_view = about_root;
 
         // ===== 通用页内容 general page content =====
-        let mut y = page_top; // 顶部光标:下一个元素的底边 y / top cursor (bottom y of next element)
+        let general_top = general_doc_h - 24.0;
+        let mut y = general_top; // top cursor: bottom edge of the next element
         add_page_title(
             general_view,
             &t("settings.sidebar_general"),
@@ -4637,7 +4865,7 @@ fn create_settings_window() {
         let banner: *mut AnyObject = msg_send![
             banner,
             initWithFrame: NSRect::new(
-                NSPoint::new(0.0, page_top - banner_h),
+                NSPoint::new(0.0, general_top - banner_h),
                 NSSize::new(content_w, banner_h)
             )
         ];
@@ -4697,30 +4925,32 @@ fn create_settings_window() {
             y,
             content_w - 2.0 * label_x,
         );
-        y -= 8.0 + row_h;
-        ui.glass_style = add_row(
+        y -= 8.0 + described_row_h;
+        ui.glass_style = add_described_row(
             general_view,
             label_x,
             y,
-            label_w,
-            row_h,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
             &t("settings.row_glass_style"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &["regular", "clear"], 0),
+            &t("settings.desc_glass_style"),
+            make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &["regular", "clear"], 0),
         );
         let _: () = msg_send![ui.glass_style, setTarget: target];
         let _: () = msg_send![ui.glass_style, setAction: sel!(handleGlassStyleChanged:)];
-        y -= row_pitch;
-        add_row_separator(general_view, 0.0, y + row_h + 3.0, content_w);
-        ui.glass_tint = add_row(
+        y -= described_row_h;
+        add_row_separator(general_view, 0.0, y + described_row_h, content_w);
+        ui.glass_tint = add_described_row(
             general_view,
             label_x,
             y,
-            label_w,
-            row_h,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
             &t("settings.row_glass_tint"),
+            &t("settings.desc_glass_tint"),
             make_color_well(
                 ctrl_x,
-                y,
+                y + 10.0,
                 ctrl_w,
                 row_h,
                 &Config::default().appearance.glass_tint,
@@ -4817,18 +5047,19 @@ fn create_settings_window() {
             y,
             content_w - 2.0 * label_x,
         );
-        y -= 8.0 + row_h;
+        y -= 8.0 + described_row_h;
         // 日志级别下拉框:项 = [debug, info];默认 index 1(info)。
         // Log level popup: items = [debug, info]; default index 1 (info).
         let log_levels: [&str; 2] = ["debug", "info"];
-        ui.log_level = add_row(
+        ui.log_level = add_described_row(
             general_view,
             label_x,
             y,
-            label_w,
-            row_h,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
             &t("settings.row_log_level"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &log_levels, 1),
+            &t("settings.desc_log_level"),
+            make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &log_levels, 1),
         );
         add_settings_card(
             general_view,
@@ -4848,17 +5079,18 @@ fn create_settings_window() {
             y,
             content_w - 2.0 * label_x,
         );
-        y -= 8.0 + row_h;
+        y -= 8.0 + described_row_h;
         // 开机自启开关:标题留空(左侧 row label 已说明),仅放一个 switch。
         // Launch-at-login switch: no title (the row label on the left already describes it).
-        ui.launch_at_login = add_row(
+        ui.launch_at_login = add_described_row(
             general_view,
             label_x,
             y,
-            label_w,
-            row_h,
+            content_w - label_x * 2.0 - 58.0,
+            described_row_h,
             &t("settings.row_launch_at_login"),
-            make_switch(ctrl_x + ctrl_w, y, row_h, false),
+            &t("settings.desc_launch_at_login"),
+            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
         add_settings_card(
             general_view,
@@ -4869,7 +5101,7 @@ fn create_settings_window() {
         );
 
         // ===== 应用切换浮窗页内容 switcher overlay page content =====
-        let mut y = page_top;
+        let mut y = switcher_doc_h - 24.0;
         add_page_title(
             switcher_view,
             &t("settings.sidebar_switcher"),
@@ -4889,35 +5121,35 @@ fn create_settings_window() {
             y,
             content_w - 2.0 * label_x,
         );
-        y -= 8.0 + row_h;
+        y -= 8.0 + described_row_h;
         // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器接管)。
         // App-switcher master switch: off = Cmd+Tab passes through to the system.
-        ui.windows_enabled = add_row(
+        ui.windows_enabled = add_tall_row(
             switcher_view,
             label_x,
             y,
             label_w,
-            row_h,
             &t("settings.row_windows_enabled"),
-            make_switch(ctrl_x + ctrl_w, y, row_h, false),
-        );
-        y -= 8.0 + row_h;
-        add_row_separator(switcher_view, 0.0, y + row_h + 3.0, content_w);
+            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+        )
+        .1;
+        y -= 8.0 + described_row_h;
+        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
         // show_minimized 开关(切换器语义本就只有显/隐两态,用 Toggle 比下拉更直观)。
-        // 英文标签较长,该行标签加宽到 225;开关仍与 popup 右缘对齐。
+        // 英文标签较长,该行标签加宽;开关仍与 popup 右缘对齐。
         // show_minimized is inherently two-state, so a toggle is clearer than a popup. The long
         // English label uses a wider label column, while the switch stays aligned to the popups.
-        ui.show_minimized = add_row(
+        ui.show_minimized = add_tall_row(
             switcher_view,
             label_x,
             y,
-            225.0,
-            row_h,
+            220.0,
             &t("settings.row_show_minimized"),
-            make_switch(ctrl_x + ctrl_w, y, row_h, false),
-        );
-        y -= 8.0 + row_h;
-        add_row_separator(switcher_view, 0.0, y + row_h + 3.0, content_w);
+            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+        )
+        .1;
+        y -= 8.0 + described_row_h;
+        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
         // 窗口显示模式:仅图标或图标和缩略图;配置仍由 thumbnails_enabled 布尔值保存。
         // Window display mode: icons only or icons and thumbnails; the config remains stored as
         // the thumbnails_enabled boolean.
@@ -4929,17 +5161,24 @@ fn create_settings_window() {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        ui.thumbnails_enabled = add_row(
+        ui.thumbnails_enabled = add_tall_row(
             switcher_view,
             label_x,
             y,
-            225.0,
-            row_h,
+            220.0,
             &t("settings.row_window_display_mode"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &window_display_mode_refs, 0),
-        );
-        y -= 8.0 + row_h;
-        add_row_separator(switcher_view, 0.0, y + row_h + 3.0, content_w);
+            make_popup(
+                ctrl_x,
+                y + 10.0,
+                ctrl_w,
+                row_h,
+                &window_display_mode_refs,
+                0,
+            ),
+        )
+        .1;
+        y -= 8.0 + described_row_h;
+        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
         // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0。
         // overlay_position popup: [Follow Active Window, Always on Main Screen]; default index 0.
         let op_labels = [
@@ -4947,26 +5186,26 @@ fn create_settings_window() {
             t("settings.overlay_position_main_screen"),
         ];
         let op_label_refs: Vec<&str> = op_labels.iter().map(|s| s.as_str()).collect();
-        ui.overlay_position = add_row(
+        ui.overlay_position = add_tall_row(
             switcher_view,
             label_x,
             y,
             label_w,
-            row_h,
             &t("settings.row_overlay_position"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &op_label_refs, 0),
-        );
-        y -= 8.0 + row_h;
-        add_row_separator(switcher_view, 0.0, y + row_h + 3.0, content_w);
-        ui.corner_radius = add_row(
+            make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &op_label_refs, 0),
+        )
+        .1;
+        y -= 8.0 + described_row_h;
+        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
+        ui.corner_radius = add_tall_row(
             switcher_view,
             label_x,
             y,
             label_w,
-            row_h,
             &t("settings.row_corner_radius"),
-            make_text_input(ctrl_x, y, ctrl_w, row_h, "64"),
-        );
+            make_text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "64"),
+        )
+        .1;
         add_settings_card(
             switcher_view,
             NSRect::new(
@@ -4985,7 +5224,7 @@ fn create_settings_window() {
             y,
             content_w - 2.0 * label_x,
         );
-        y -= 8.0 + row_h;
+        y -= 8.0 + described_row_h;
         // 修饰键下拉项:显示 Option+Tab / Command+Tab;值由索引映射到 option/command。
         // Modifier popup shows Option+Tab / Command+Tab; the index maps to option/command.
         let mod_labels = [
@@ -4993,15 +5232,15 @@ fn create_settings_window() {
             t("settings.modifier_command"),
         ];
         let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
-        ui.modifier = add_row(
+        ui.modifier = add_tall_row(
             switcher_view,
             label_x,
             y,
             label_w,
-            row_h,
             &t("settings.row_modifier"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0),
-        );
+            make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &mod_label_refs, 0),
+        )
+        .1;
         add_settings_card(
             switcher_view,
             NSRect::new(
@@ -5011,7 +5250,7 @@ fn create_settings_window() {
         );
 
         // ===== 鼠标页内容 mouse page content =====
-        let mut y = page_top;
+        let mut y = mouse_doc_h - 24.0;
         add_page_title(
             mouse_view,
             &t("settings.sidebar_mouse"),
@@ -5022,16 +5261,17 @@ fn create_settings_window() {
         y -= 62.0;
 
         // --- 启用鼠标控制(总开关,置于最顶) / Enable mouse control (topmost) ---
-        y -= 8.0 + row_h;
+        y -= 8.0 + described_row_h;
         let enable_mouse_bottom = y;
-        ui.enable_mouse = add_row(
+        ui.enable_mouse = add_described_row(
             mouse_view,
             label_x,
             y,
-            label_w,
-            row_h,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
             &t("settings.row_enable_mouse"),
-            make_switch(ctrl_x + ctrl_w, y, row_h, false),
+            &t("settings.desc_enable_mouse"),
+            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
         // switch toggle 时实时更新 OK 按钮标题(确认 vs 确认并重启)。
         // Update OK button title in real time when the switch toggles (OK vs OK && Restart).
@@ -5041,7 +5281,7 @@ fn create_settings_window() {
             mouse_view,
             NSRect::new(
                 NSPoint::new(6.0, enable_mouse_bottom - 10.0),
-                NSSize::new(content_w - 12.0, row_h + 20.0),
+                NSSize::new(content_w - 12.0, described_row_h + 20.0),
             ),
         );
 
@@ -5055,44 +5295,47 @@ fn create_settings_window() {
             y,
             content_w - 2.0 * label_x,
         );
-        y -= 8.0 + row_h;
+        y -= 8.0 + described_row_h;
         // 下拉框:items 在 load_settings_values 里动态重建(设备列表可变)。
         // 首次创建放一个占位项,真正的内容在 load_settings_values -> rebuild_device_popup 填入。
         // Popup: items are rebuilt dynamically in load_settings_values (device list is mutable).
         // A placeholder is inserted here; the real items are filled by rebuild_device_popup.
-        let dev_popup = make_popup(ctrl_x, y, ctrl_w, row_h, &[""], 0);
+        let dev_popup = make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &[""], 0);
+        style_flat_popup(dev_popup);
         // 绑定 target/action:选择变化时即时刷新其余控件为该设备的有效值。
         // Bind target/action: on selection change, immediately refresh the other controls with
         // the selected device's effective values.
         let _: () = msg_send![dev_popup, setTarget: target];
         let _: () = msg_send![dev_popup, setAction: sel!(handleDeviceChanged:)];
-        ui.device_indicator = add_row(
+        ui.device_indicator = add_tall_row(
             mouse_view,
             label_x,
             y,
             label_w,
-            row_h,
             &t("settings.header_mouse_device"),
             dev_popup,
-        );
+        )
+        .1;
 
         // --- 滚动模式 / Scroll mode ---
-        y -= 8.0 + row_h;
-        ui.scroll_mode = add_row(
+        y -= 8.0 + described_row_h;
+        let scroll_popup = make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &SCROLL_MODE_LABELS, 0);
+        style_flat_popup(scroll_popup);
+        ui.scroll_mode = add_tall_row(
             mouse_view,
             label_x,
             y,
             label_w,
-            row_h,
             &t("settings.row_scroll_mode"),
-            make_popup(ctrl_x, y, ctrl_w, row_h, &SCROLL_MODE_LABELS, 0),
-        );
+            scroll_popup,
+        )
+        .1;
         // 滚动模式切换时即时刷新"行数"行的条件显隐。
         // Refresh the conditional visibility of the "lines per tick" row on mode switch.
         let _: () = msg_send![ui.scroll_mode, setTarget: target];
         let _: () = msg_send![ui.scroll_mode, setAction: sel!(handleScrollModeChanged:)];
         // The HTML device card contains both rows, with one internal hairline between them.
-        add_row_separator(mouse_view, 0.0, y + row_h + 3.0, content_w);
+        add_row_separator(mouse_view, 0.0, y + described_row_h + 3.0, content_w);
         add_settings_card(
             mouse_view,
             NSRect::new(
@@ -5102,19 +5345,18 @@ fn create_settings_window() {
         );
 
         // --- 行数(按行模式) / Line count (line mode) ---
-        y -= 8.0 + row_h;
-        let (line_label, line_ctrl) = add_row_with_label(
+        y -= 8.0 + described_row_h;
+        let (line_label, line_ctrl) = add_tall_row(
             mouse_view,
             label_x,
             y,
             label_w,
-            row_h,
             &t("settings.row_line_count"),
             // 整数滑块 1..=10(与 config 校验一致;对齐 LinearMouse By Lines 的滑块交互)。
             // 右侧留 ~40pt 放只读数值 label 显示当前值。
             // Integer slider 1..=10 (matches config validation; mirrors LinearMouse's
             // By Lines slider interaction). ~40pt on the right holds a read-only value label.
-            make_slider(ctrl_x, y, ctrl_w - 40.0, row_h, 1, 10, 3),
+            make_slider(ctrl_x, y + 10.0, ctrl_w - 40.0, row_h, 1, 10, 3),
         );
         ui.line_count = line_ctrl;
         ui.line_count_label = line_label;
@@ -5122,7 +5364,7 @@ fn create_settings_window() {
         // Read-only value label right of the slider: shows the current line count, refreshed
         // live as the slider moves.
         let value_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let value_label: *mut AnyObject = msg_send![value_label, initWithFrame: NSRect::new(NSPoint::new(ctrl_x + ctrl_w - 34.0, y), NSSize::new(30.0, row_h))];
+        let value_label: *mut AnyObject = msg_send![value_label, initWithFrame: NSRect::new(NSPoint::new(ctrl_x + ctrl_w - 34.0, y + 10.0), NSSize::new(30.0, row_h))];
         set_field(value_label, 3);
         let _: () = msg_send![value_label, setBezeled: false];
         let _: () = msg_send![value_label, setDrawsBackground: false];
@@ -5138,6 +5380,13 @@ fn create_settings_window() {
         // Refresh the value label live as the slider is dragged.
         let _: () = msg_send![ui.line_count, setTarget: target];
         let _: () = msg_send![ui.line_count, setAction: sel!(handleLineCountChanged:)];
+        add_settings_card(
+            mouse_view,
+            NSRect::new(
+                NSPoint::new(6.0, y - 10.0),
+                NSSize::new(content_w - 12.0, described_row_h + 20.0),
+            ),
+        );
 
         // --- 滚动 Scrolling ---
         y -= 14.0 + 24.0;
@@ -5148,23 +5397,25 @@ fn create_settings_window() {
             y,
             content_w - 2.0 * label_x,
         );
-        y -= 8.0 + row_h;
-        // reverse_scroll 开关:标题留空(左侧 row label 已说明),仅放一个 switch。
-        // reverse_scroll switch: no title (the row label on the left already describes it).
-        ui.reverse_scroll = add_row(
+        y -= 8.0 + described_row_h;
+        // reverse_scroll 开关:标题+副标题描述滚动方向,开关右对齐到 popup 右缘。
+        // reverse_scroll switch: title + subtitle describe the scroll inversion; the switch
+        // right-aligns to the popups' right edge.
+        ui.reverse_scroll = add_described_row(
             mouse_view,
             label_x,
             y,
-            label_w,
-            row_h,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
             &t("settings.row_reverse_scroll"),
-            make_switch(ctrl_x + ctrl_w, y, row_h, false),
+            &t("settings.desc_reverse_scroll"),
+            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
         add_settings_card(
             mouse_view,
             NSRect::new(
                 NSPoint::new(6.0, y - 10.0),
-                NSSize::new(content_w - 12.0, row_h + 20.0),
+                NSSize::new(content_w - 12.0, described_row_h + 20.0),
             ),
         );
 
@@ -5178,23 +5429,21 @@ fn create_settings_window() {
             y,
             content_w - 2.0 * label_x,
         );
-        y -= 8.0 + row_h;
+        y -= 8.0 + described_row_h;
         // disable_pointer_accel 开关:禁用系统鼠标加速,光标 1:1 线性跟踪。
-        // 英文标签 "Disable pointer acceleration (linear tracking)"(269pt)超出默认
-        // label_w=150 会被截断;该行标签加宽到 285。开关与所有开关行一样右对齐到
-        // popup 右缘(ctrl_x + ctrl_w)。
+        // 副标题说明线性跟踪的用途;开关与所有开关行一样右对齐到 popup 右缘。
         // disable_pointer_accel switch: disable system pointer acceleration for 1:1 linear
-        // cursor tracking. The English label (269pt) exceeds the default label_w=150 and would
-        // truncate; this row widens its label to 285. The switch right-aligns to the popups'
-        // right edge (ctrl_x + ctrl_w), like every other switch row.
-        ui.disable_pointer_accel = add_row(
+        // cursor tracking. The subtitle explains linear tracking; the switch right-aligns to
+        // the popups' right edge (ctrl_x + ctrl_w), like every other switch row.
+        ui.disable_pointer_accel = add_described_row(
             mouse_view,
             label_x,
             y,
-            285.0,
-            row_h,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
             &t("settings.row_disable_pointer_accel"),
-            make_switch(ctrl_x + ctrl_w, y, row_h, false),
+            &t("settings.desc_disable_pointer_accel"),
+            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
         add_settings_card(
             mouse_view,
@@ -5205,11 +5454,9 @@ fn create_settings_window() {
         );
 
         // --- 按键映射 Button Mappings ---
-        // 绑定区:header + 滚动列表(固定高度,行溢出时滚动)+ 录制提示 + 添加按钮。
-        // 动态行由 render_mapping_rows 填充(mapping_doc 为 flipped 文档视图)。
-        // Button mappings: header + scroll list (fixed height, scrolls when rows overflow) +
-        // a recording hint + the add button. Rows are filled by render_mapping_rows (mapping_doc
-        // is a flipped document view).
+        // 绑定区:"Enable button mappings" 描述行 + 嵌套表格卡片(圆角子表格 + 添加按钮)。
+        // Button mappings: an "Enable button mappings" described row + a nested table card
+        // (rounded sub-table + the add-mapping button).
         y -= 14.0 + 24.0;
         add_header(
             mouse_view,
@@ -5218,68 +5465,112 @@ fn create_settings_window() {
             y,
             content_w - 2.0 * label_x,
         );
-        // 映射总开关(per-device):header 行右侧的开关(NSSwitch,与设置行同款)。
-        // The mappings master switch (per-device): a switch at the header row's right
-        // (an NSSwitch, same as the settings rows).
-        let ms: *mut AnyObject = make_switch(ctrl_x + ctrl_w, y - 4.0, row_h, true);
-        // 开关变化即时重渲染映射行(关闭时行控件置灰不可点)。
-        // Re-render the mapping rows on toggle (rows grey out and become inert when off).
-        let _: () = msg_send![ms, setTarget: target];
-        let _: () = msg_send![ms, setAction: sel!(handleMappingEnabledChanged:)];
-        let _: () = msg_send![mouse_view, addSubview: ms];
-        release_obj(ms);
-        ui.mapping_enabled = ms;
-        y -= 8.0 + row_h;
-        // 显式坐标布局(不再依赖游标链):卡片顶部 = 当前 y,卡片 [top-list_h, top]。
-        // Explicit coordinates (no cursor chain): card top = current y, card spans
-        // [top-list_h, top] (the content view is NOT flipped, so a frame origin is the
-        // bottom edge).
-        let list_h = MAPPING_ROW_H * 3.0;
-        // 卡片顶部 = 当前 y(非 flipped,origin 是底部)。
-        // Card top = current y (not flipped; a frame origin is the bottom edge).
-        let card_bottom = y - list_h;
+        // "Enable button mappings" 描述行(HTML 卡片顶部),替代原来放在区块标题右侧的开关。
+        // "Enable button mappings" described row (HTML card top), replacing the old switch
+        // that sat on the section-header row's right edge.
+        y -= 8.0 + described_row_h;
+        ui.mapping_enabled = add_described_row(
+            mouse_view,
+            label_x,
+            y,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_mapping_enable"),
+            &t("settings.desc_mapping_enable"),
+            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+        );
+        let _: () = msg_send![ui.mapping_enabled, setTarget: target];
+        let _: () = msg_send![ui.mapping_enabled, setAction: sel!(handleMappingEnabledChanged:)];
+        add_settings_card(
+            mouse_view,
+            NSRect::new(
+                NSPoint::new(6.0, y - 10.0),
+                NSSize::new(content_w - 12.0, described_row_h + 20.0),
+            ),
+        );
+
+        // --- 嵌套表格卡片(nested table card) ---
+        y -= 24.0;
+        let card_top = y;
         let card_w = content_w - 24.0;
-        // 卡片底色:一块独立的圆角背景视图,先 add(mouse_view 上),scroll 盖在它上面。
-        // NSScrollView 的 clipView 白底(及其 layer 透明化)实测都不可靠,干脆在 scroll
-        // 底下垫一块圆角底色,scroll 自身完全透明 —— 与 clip 的绘制彻底解耦。
-        // The card color is a standalone rounded background view added FIRST (on mouse_view),
-        // with the scroll view on top. The clip view's white fill (and its layer
-        // transparency) proved unreliable, so a rounded backdrop sits under the scroll and
-        // the scroll itself is fully transparent -- decoupled from the clip's drawing.
-        // 卡片:一块圆角底色视图,行直接铺在它上面(flipped,行从顶排)。
-        // 不用 NSScrollView —— 它的 clipView 白底反复盖住底色(所有 layer 透明手段
-        // 实测都不可靠),普通视图平铺干净利落;行数少(最多 7 个按钮)无需滚动,
-        // 溢出由圆角 + masksToBounds 裁掉。
-        // The card is one rounded background view with the rows laid directly on it
-        // (flipped; rows stack from the top). No NSScrollView -- its clip view's white fill
-        // kept hiding the background (every layer-transparency trick proved unreliable);
-        // plain views are clean. Row counts are small (≤ 7 buttons) so scrolling is
-        // unnecessary; overflow is clipped by the rounded corner + masksToBounds.
-        // 卡片背景:NSVisualEffectView(material 自绘,跟随主题)。
-        // 不要用 NSView+layer 的 controlBackgroundColor —— 动态系统色的 CGColor 为 nil,
-        // layer 底色不渲染(实测);material 由控件自绘,不依赖 layer 色。
-        // Card background: NSVisualEffectView (material drawn by the control, theme-aware).
-        // Don't use NSView+layer with controlBackgroundColor -- dynamic system colors give
-        // a nil CGColor and the layer fill never renders (verified); the material is drawn
-        // by the control itself, independent of layer colors.
-        let card_bg: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-        let card_bg: *mut AnyObject = msg_send![card_bg, initWithFrame: NSRect::new(NSPoint::new(label_x, card_bottom), NSSize::new(card_w, list_h))];
-        let _: () = msg_send![card_bg, setBlendingMode: 1u64]; // WithinWindow
-        let _: () = msg_send![card_bg, setMaterial: 0u64]; // NSVisualEffectMaterialAppearanceBased(跟随主题)
-        let _: () = msg_send![card_bg, setState: 1u64]; // Active
+        let card_h = MAPPING_PANEL_TOP
+            + (MAPPING_HEADER_H + MAPPING_ROW_H * 3.0)
+            + MAPPING_ACTION_TOP
+            + MAPPING_ACTION_H
+            + MAPPING_CARD_PAD_BOT;
+        let card_bottom = card_top - card_h;
+        // 外层卡片:白色卡片(与其它设置卡片一致),只有嵌套表格和添加按钮是灰色/深色。
+        // The outer card is a white settings card (same as every other card); only the nested
+        // table and the add button carry the gray "dark" treatment from the HTML reference.
+        let card_bg: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let card_bg: *mut AnyObject = msg_send![card_bg, initWithFrame: NSRect::new(NSPoint::new(label_x, card_bottom), NSSize::new(card_w, card_h))];
         let _: () = msg_send![card_bg, setFlipped: true];
+        let _: () = msg_send![card_bg, setAutoresizingMask: 0u64];
         let _: () = msg_send![card_bg, setWantsLayer: true];
         let bg_layer: *mut AnyObject = msg_send![card_bg, layer];
-        let _: () = msg_send![bg_layer, setCornerRadius: 8.0f64];
+        let _: () = msg_send![bg_layer, setCornerRadius: 14.0f64];
         let _: () = msg_send![bg_layer, setMasksToBounds: true];
-        let _: () = msg_send![mouse_view, addSubview: card_bg];
-        release_obj(card_bg);
-        ui.mapping_scroll = std::ptr::null_mut();
-        ui.mapping_doc = card_bg;
-        // 空状态提示(行数为 0 时显示在卡片内;render 时控制显隐)。
-        // Empty-state hint (shown inside the card when there are no rows; toggled by render).
+        crate::ffi::layer_set_background(bg_layer, crate::ffi::hex_to_cg_color(0xFFFFFFE0u32));
+        crate::ffi::layer_set_border(bg_layer, crate::ffi::hex_to_cg_color(0x00000012u32));
+        let _: () = msg_send![bg_layer, setBorderWidth: 1.0f64];
+        // 嵌套的 `.mapping-table`:圆角描边子面板,铺在行后面,让映射区有 HTML 的表格观感。
+        // The nested `.mapping-table`: a rounded, bordered sub-panel behind the rows, giving
+        // the bindings the HTML reference's table look.
+        let panel: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let panel: *mut AnyObject = msg_send![panel, initWithFrame: NSRect::new(NSPoint::new(MAPPING_PANEL_X, MAPPING_PANEL_TOP), NSSize::new(card_w - 2.0 * MAPPING_PANEL_X, MAPPING_HEADER_H + MAPPING_ROW_H * 3.0))];
+        let _: () = msg_send![panel, setWantsLayer: true];
+        let panel_layer: *mut AnyObject = msg_send![panel, layer];
+        let _: () = msg_send![panel_layer, setCornerRadius: 10.0f64];
+        let _: () = msg_send![panel_layer, setMasksToBounds: true];
+        crate::ffi::layer_set_background(panel_layer, crate::ffi::hex_to_cg_color(0x76768010u32));
+        crate::ffi::layer_set_border(panel_layer, crate::ffi::hex_to_cg_color(0x0000000Fu32));
+        let _: () = msg_send![panel_layer, setBorderWidth: 1.0f64];
+        let _: () = msg_send![card_bg, addSubview: panel];
+        ui.mapping_panel = panel;
+        release_obj(panel);
+        // 表头带(.mapping-table thead)。
+        // The header band (.mapping-table thead).
+        let header_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        let header_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 12.0f64];
+        for (hx, hw, htext) in [
+            (
+                MAPPING_PANEL_X + MAPPING_CELL_X,
+                120.0,
+                t("settings.mapping_column_button"),
+            ),
+            (
+                MAPPING_PANEL_X + MAPPING_CELL_X + 80.0,
+                130.0,
+                t("settings.mapping_column_action"),
+            ),
+        ] {
+            let hlabel: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+            let hlabel: *mut AnyObject = msg_send![hlabel, initWithFrame: NSRect::new(NSPoint::new(hx, MAPPING_PANEL_TOP + 7.0), NSSize::new(hw, 18.0))];
+            let hns = make_nsstring(&htext);
+            let _: () = msg_send![hlabel, setStringValue: hns];
+            CFRelease(hns as *const c_void);
+            let _: () = msg_send![hlabel, setBezeled: false];
+            let _: () = msg_send![hlabel, setDrawsBackground: false];
+            let _: () = msg_send![hlabel, setEditable: false];
+            let _: () = msg_send![hlabel, setFont: header_font];
+            let _: () = msg_send![hlabel, setTextColor: header_color];
+            let _: () = msg_send![card_bg, addSubview: hlabel];
+            release_obj(hlabel);
+        }
+        // 表头下方 hairline。
+        // Hairline under the header band.
+        let header_line: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let header_line: *mut AnyObject = msg_send![header_line, initWithFrame: NSRect::new(NSPoint::new(MAPPING_PANEL_X + MAPPING_CELL_X, MAPPING_PANEL_TOP + MAPPING_HEADER_H - 1.0), NSSize::new(card_w - 2.0 * (MAPPING_PANEL_X + MAPPING_CELL_X), 1.0))];
+        let _: () = msg_send![header_line, setWantsLayer: true];
+        let header_line_layer: *mut AnyObject = msg_send![header_line, layer];
+        let header_line_color: *mut AnyObject = msg_send![class!(NSColor), separatorColor];
+        layer_set_background(header_line_layer, ns_color_to_cg(header_line_color));
+        let _: () = msg_send![card_bg, addSubview: header_line];
+        release_obj(header_line);
+        // 空状态提示(无行时显示在子表格内)。
+        // Empty-state hint (inside the sub-table when there are no rows).
         let empty: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let empty: *mut AnyObject = msg_send![empty, initWithFrame: NSRect::new(NSPoint::new(label_x, card_bottom), NSSize::new(card_w, list_h))];
+        let empty: *mut AnyObject = msg_send![empty, initWithFrame: NSRect::new(NSPoint::new(MAPPING_PANEL_X + MAPPING_CELL_X, MAPPING_PANEL_TOP + MAPPING_HEADER_H + (MAPPING_ROW_H * 3.0) / 2.0 - 9.0), NSSize::new(card_w - 2.0 * (MAPPING_PANEL_X + MAPPING_CELL_X), 18.0))];
         set_field(empty, 0);
         let _: () = msg_send![empty, setBezeled: false];
         let _: () = msg_send![empty, setDrawsBackground: false];
@@ -5294,20 +5585,25 @@ fn create_settings_window() {
         let _: () = msg_send![card_bg, addSubview: empty];
         release_obj(empty);
         ui.mapping_empty = empty;
-        // 添加按钮:卡片底部下方 14pt(显式坐标,origin = 底部边)。
-        // Add button: 14pt below the card bottom (explicit coordinate; origin = bottom edge).
-        let btn_bottom = card_bottom - 14.0 - row_h;
+        // 添加按钮:卡片底部 action-row(全宽)。
+        // Add-mapping button: full-width action row at the card bottom.
         let add_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let add_btn: *mut AnyObject = msg_send![add_btn, initWithFrame: NSRect::new(NSPoint::new(label_x, btn_bottom), NSSize::new(card_w, row_h))];
-        style_html_button(add_btn, 0xFFFFFFADu32, 0x2E2E2EFFu32);
+        let add_btn: *mut AnyObject = msg_send![add_btn, initWithFrame: NSRect::new(NSPoint::new(MAPPING_PANEL_X, MAPPING_PANEL_TOP + MAPPING_HEADER_H + MAPPING_ROW_H * 3.0 + MAPPING_ACTION_TOP), NSSize::new(card_w - 2.0 * MAPPING_PANEL_X, MAPPING_ACTION_H))];
+        style_html_button(add_btn, 0x7676801Fu32, 0x2C2C30FFu32);
         let add_title = make_nsstring(&t("settings.row_add_mapping"));
         let _: () = msg_send![add_btn, setTitle: add_title];
         CFRelease(add_title as *const c_void);
         let _: () = msg_send![add_btn, setTarget: target];
         let _: () = msg_send![add_btn, setAction: sel!(handleAddMapping:)];
-        let _: () = msg_send![mouse_view, addSubview: add_btn];
+        let _: () = msg_send![card_bg, addSubview: add_btn];
         release_obj(add_btn);
         ui.add_mapping_button = add_btn;
+        // 外层卡片 add 到页面。
+        let _: () = msg_send![mouse_view, addSubview: card_bg];
+        release_obj(card_bg);
+        ui.mapping_card = card_bg;
+        ui.mapping_scroll = std::ptr::null_mut();
+        ui.mapping_doc = card_bg;
         // 初始渲染当前设备的映射。
         // Render the current device's mappings initially.
         render_mapping_rows();
@@ -5315,7 +5611,7 @@ fn create_settings_window() {
         // ===== 剪贴板历史页内容 clipboard page content =====
         // 独立布局游标(该页内容与鼠标页互不相关)。
         // Independent layout cursor (this page's content is unrelated to the mouse page).
-        let mut cy = page_top;
+        let mut cy = clipboard_doc_h - 24.0;
         add_page_title(
             clipboard_view,
             &t("settings.sidebar_clipboard"),
@@ -5346,7 +5642,7 @@ fn create_settings_window() {
             clipboard_view,
             label_x,
             cy,
-            225.0,
+            220.0,
             row_h,
             &t("settings.row_clipboard_enabled"),
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
@@ -5366,7 +5662,7 @@ fn create_settings_window() {
             clipboard_view,
             label_x,
             cy,
-            225.0,
+            220.0,
             row_h,
             &t("settings.row_clipboard_pin_follow"),
             make_popup(ctrl_x, cy, ctrl_w, row_h, &pin_label_refs, 0),
@@ -5390,7 +5686,7 @@ fn create_settings_window() {
             clipboard_view,
             label_x,
             cy,
-            225.0,
+            220.0,
             row_h,
             &t("settings.row_clipboard_persist"),
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
@@ -5421,7 +5717,7 @@ fn create_settings_window() {
             clipboard_view,
             label_x,
             cy,
-            225.0,
+            220.0,
             row_h,
             &t("settings.row_clipboard_move_used_to_top"),
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
@@ -5470,7 +5766,7 @@ fn create_settings_window() {
         );
 
         // ===== About page: page-header + App and Updates cards from preview (10). =====
-        let header_top = page_top - 12.0;
+        let header_top = about_doc_h - 68.0;
         add_about_app_icon(about_view, label_x, header_top - 58.0);
 
         let about_title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -5620,14 +5916,15 @@ fn create_settings_window() {
         );
         ay -= 27.0;
         let update_row_y = ay - 44.0;
-        ui.update_auto_check = add_row(
+        ui.update_auto_check = add_described_row(
             about_view,
             label_x + 15.0,
             update_row_y,
-            225.0,
-            row_h,
+            (ctrl_x + ctrl_w) - (label_x + 15.0) - 70.0,
+            described_row_h,
             &t("settings.row_update_auto_check"),
-            make_switch(ctrl_x + ctrl_w, update_row_y, row_h, false),
+            &t("settings.desc_update_auto_check"),
+            make_switch(ctrl_x + ctrl_w, update_row_y + 10.0, row_h, false),
         );
         let check_button = make_settings_action_button(
             NSRect::new(
@@ -5667,7 +5964,7 @@ fn create_settings_window() {
             about_view,
             NSRect::new(
                 NSPoint::new(label_x, update_row_y - 91.0),
-                NSSize::new(content_w - 2.0 * label_x, 135.0),
+                NSSize::new(content_w - 2.0 * label_x, 155.0),
             ),
         );
 
@@ -5681,8 +5978,8 @@ fn create_settings_window() {
         // Cancel and OK are children of the detail pane's footer, matching the HTML layout.
         let cancel = make_settings_action_button(
             NSRect::new(
-                NSPoint::new(content_x + content_w - 200.0, 14.0),
-                NSSize::new(80.0, 32.0),
+                NSPoint::new(content_x + detail_w - 202.0, 14.0),
+                NSSize::new(86.0, 32.0),
             ),
             &t("settings.btn_cancel"),
             target,
@@ -5700,8 +5997,8 @@ fn create_settings_window() {
 
         let ok = make_settings_action_button(
             NSRect::new(
-                NSPoint::new(content_x + content_w - 110.0, 14.0),
-                NSSize::new(90.0, 32.0),
+                NSPoint::new(content_x + detail_w - 106.0, 14.0),
+                NSSize::new(86.0, 32.0),
             ),
             &t("settings.btn_ok"),
             target,
