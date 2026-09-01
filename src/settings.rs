@@ -5838,13 +5838,14 @@ fn create_settings_window() {
         let _: () = msg_send![website_label, setFont: website_label_font];
         let _: () = msg_send![about_view, addSubview: website_label];
         release_obj(website_label);
+        let website_url_frame = NSRect::new(
+            NSPoint::new(label_x + 145.0, website_y),
+            NSSize::new((content_w - 2.0 * label_x - 145.0).max(1.0), 28.0),
+        );
         let website_url: *mut AnyObject = msg_send![website_link_button_class(), alloc];
         let website_url: *mut AnyObject = msg_send![
             website_url,
-            initWithFrame: NSRect::new(
-                NSPoint::new(label_x + 145.0, website_y),
-                NSSize::new((content_w - 2.0 * label_x - 145.0).max(1.0), 28.0),
-            )
+            initWithFrame: website_url_frame
         ];
         set_field(website_url, t("settings.website_url"));
         let _: () = msg_send![website_url, setBezeled: false];
@@ -5856,6 +5857,16 @@ fn create_settings_window() {
         let _: () = msg_send![website_url, setFont: website_url_font];
         let website_url_color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
         let _: () = msg_send![website_url, setTextColor: website_url_color];
+        let website_tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+        let website_tracking: *mut AnyObject = msg_send![
+            website_tracking,
+            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), website_url_frame.size),
+            options: 0x01u64 | 0x80u64 | 0x200u64,
+            owner: website_url,
+            userInfo: std::ptr::null::<AnyObject>()
+        ];
+        let _: () = msg_send![website_url, addTrackingArea: website_tracking];
+        release_obj(website_tracking);
         let _: () = msg_send![about_view, addSubview: website_url];
         release_obj(website_url);
         let version_y = website_y - 44.0;
