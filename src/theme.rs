@@ -25,12 +25,16 @@ pub(crate) const PANEL_MAX_WIDTH_RATIO: f64 = 0.92;
 /// Overlay height uses the target screen's complete visible area; it still
 /// shrinks to the natural content size when there is room.
 pub(crate) const PANEL_MAX_HEIGHT_RATIO: f64 = 1.0;
-/// 纯图标模式的固定卡片尺寸;布局只自动计算每行列数,不缩放卡片。
-/// Fixed icon-only card dimensions; layout computes columns but never scales the cards.
+/// 纯图标模式的基准卡片尺寸;宽度固定,高度会为放大的内容自动留出空间。
+/// Base icon-only card dimensions; width stays fixed while height reserves room for larger content.
 pub(crate) const ICON_CARD_W: f64 = 140.0;
 pub(crate) const ICON_CARD_H: f64 = 180.0;
 pub(crate) const ICON_CARD_GAP: f64 = 0.0;
 pub(crate) const ICON_SIZE: f64 = 110.0;
+pub(crate) const CARD_TEXT_BASE_SIZE: f64 = 12.0;
+pub(crate) const CARD_TEXT_SIZE_MIN: f64 = 8.0;
+pub(crate) const CARD_TEXT_SIZE_MAX: f64 = 24.0;
+const STATUS_BAR_TEXT_BASE_SIZE: f64 = 13.0;
 
 // ========== 配色 / colors ==========
 
@@ -114,7 +118,10 @@ pub(crate) fn card_w() -> f64 {
     ICON_CARD_W
 }
 pub(crate) fn card_h() -> f64 {
-    ICON_CARD_H
+    let scale = text_scale();
+    // Keep the default card height stable. When text grows, add room for the two larger
+    // rows below the unchanged large icon.
+    ICON_CARD_H + ((18.0 * scale + 2.0 + 16.0 * scale) - 36.0).max(0.0)
 }
 pub(crate) fn card_gap() -> f64 {
     ICON_CARD_GAP
@@ -124,6 +131,66 @@ pub(crate) fn icon_px() -> f64 {
 }
 pub(crate) fn letter_px() -> f64 {
     icon_px() * 0.5
+}
+
+/// Scale shared by the card's window-title and app-name text.
+pub(crate) fn text_scale() -> f64 {
+    CONFIG
+        .read()
+        .unwrap()
+        .layout
+        .card_text_size
+        .clamp(CARD_TEXT_SIZE_MIN, CARD_TEXT_SIZE_MAX)
+        / CARD_TEXT_BASE_SIZE
+}
+
+pub(crate) fn card_title_font_size() -> f64 {
+    let cfg = CONFIG.read().unwrap();
+    cfg.fonts.title_size
+        * cfg
+            .layout
+            .card_text_size
+            .clamp(CARD_TEXT_SIZE_MIN, CARD_TEXT_SIZE_MAX)
+        / CARD_TEXT_BASE_SIZE
+}
+
+pub(crate) fn card_app_name_font_size() -> f64 {
+    let cfg = CONFIG.read().unwrap();
+    cfg.fonts.app_name_size
+        * cfg
+            .layout
+            .card_text_size
+            .clamp(CARD_TEXT_SIZE_MIN, CARD_TEXT_SIZE_MAX)
+        / CARD_TEXT_BASE_SIZE
+}
+
+/// Bottom title-bar text size, exposed through the switcher settings page.
+pub(crate) fn status_bar_text_size() -> f64 {
+    let size = CONFIG.read().unwrap().fonts.status_bar_size;
+    if size.is_finite() {
+        size.max(8.0)
+    } else {
+        STATUS_BAR_TEXT_BASE_SIZE
+    }
+}
+
+/// The footer grows with its text so the selected window title remains vertically centered.
+pub(crate) fn status_h() -> f64 {
+    status_bar_height_for_text_size(status_bar_text_size())
+}
+
+pub(crate) fn status_bar_height_for_text_size(size: f64) -> f64 {
+    let size = if size.is_finite() {
+        size.max(8.0)
+    } else {
+        STATUS_BAR_TEXT_BASE_SIZE
+    };
+    STATUS_H * size / STATUS_BAR_TEXT_BASE_SIZE
+}
+
+/// Thumbnail captions use the same setting, but grow only as much as their caption row needs.
+pub(crate) fn thumb_caption_h() -> f64 {
+    (THUMB_CAPTION_H * text_scale()).clamp(20.0, 36.0)
 }
 
 /// 窗口缩略图总开关(无屏幕录制权限时 thumbnail 模块内部还会二次休眠)。
@@ -184,7 +251,7 @@ pub(crate) fn thumb_scale_for_count(count: usize) -> f64 {
 /// testable): vertical paddings + caption + gap + a 16:10 preview.
 fn thumb_card_h(card_width: f64) -> f64 {
     let preview_h = (card_width - THUMB_PAD * 2.0) / THUMB_PREVIEW_RATIO;
-    THUMB_PAD * 2.0 + THUMB_CAPTION_H + THUMB_GAP + preview_h
+    THUMB_PAD * 2.0 + thumb_caption_h() + THUMB_GAP + preview_h
 }
 
 /// 流式布局的统一卡片高度:由基准卡宽推导一次,全网格等高。
@@ -205,7 +272,7 @@ pub(crate) fn thumb_card_h_for_scale(scale: f64) -> f64 {
 /// 预览区高度 = 卡片高 - 上下 padding - 标题行 - 间距(纯函数,可测)。
 /// Preview height = card height - vertical paddings - caption - gap (pure, testable).
 pub(crate) fn thumb_preview_h(card_h: f64) -> f64 {
-    (card_h - THUMB_PAD * 2.0 - THUMB_CAPTION_H - THUMB_GAP).max(40.0)
+    (card_h - THUMB_PAD * 2.0 - thumb_caption_h() - THUMB_GAP).max(40.0)
 }
 
 /// 宽高比钳制:窗口可能极端扁/极端高,预览宽度过窄会不可辨认、过宽会霸满一行。
@@ -361,7 +428,7 @@ fn thumb_widths(aspects: &[f64], range: &Range<usize>, card_h: f64, max_inner: f
 }
 
 fn thumb_max_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
-    let available = (max_panel_h - THUMB_TOP_INSET - STATUS_H).max(card_h);
+    let available = (max_panel_h - THUMB_TOP_INSET - status_h()).max(card_h);
     ((available + gap) / (card_h + gap)).floor().max(1.0) as usize
 }
 
@@ -455,7 +522,7 @@ fn build_thumb_layout(
             THUMB_TOP_INSET
                 + max_rows as f64 * card_h
                 + max_rows.saturating_sub(1) as f64 * gap
-                + STATUS_H,
+                + status_h(),
         )
     } else {
         (
@@ -463,7 +530,7 @@ fn build_thumb_layout(
             THUMB_TOP_INSET
                 + n_rows as f64 * card_h
                 + n_rows.saturating_sub(1) as f64 * gap
-                + STATUS_H,
+                + status_h(),
         )
     };
     let mut placements = Vec::with_capacity(visible.len());
@@ -495,7 +562,7 @@ fn build_thumb_layout(
         panel_h,
         card_h,
         document_placements: placements.clone(),
-        document_h: (panel_h - STATUS_H).max(1.0),
+        document_h: (panel_h - status_h()).max(1.0),
         scale,
         visible,
         placements,
@@ -581,7 +648,7 @@ fn build_thumb_scroll_layout(
         + rendered_rows as f64 * constraints.card_h
         + rendered_rows.saturating_sub(1) as f64 * constraints.gap
         + teaser_h
-        + STATUS_H;
+        + status_h();
     let card_area_w = if overflowed {
         (panel_w - scrollbar_w).max(1.0)
     } else {
@@ -590,7 +657,7 @@ fn build_thumb_scroll_layout(
     let document_h = THUMB_TOP_INSET
         + all_rows.len() as f64 * constraints.card_h
         + all_rows.len().saturating_sub(1) as f64 * constraints.gap;
-    let document_panel_h = document_h + STATUS_H;
+    let document_panel_h = document_h + status_h();
     let mut document_placements = Vec::new();
     for (row_index, row) in all_rows.iter().enumerate() {
         let row_w = row.iter().map(|&i| widths[i]).sum::<f64>()
@@ -831,9 +898,9 @@ fn balanced_icon_row_ranges(count: usize, row_count: usize) -> Vec<Range<usize>>
         .collect()
 }
 
-/// 规划固定卡片的纯图标视口:卡片尺寸固定,列数由屏幕宽度自动计算,溢出后连续滚动。
-/// Plan the fixed-card icon-only viewport: card size stays fixed, columns come from screen width,
-/// and overflow becomes continuously scrollable.
+/// 规划纯图标视口:宽度固定,高度随内容设置调整,列数由屏幕宽度计算,溢出后连续滚动。
+/// Plan the icon-only viewport: width stays fixed, height follows the content setting, columns
+/// come from screen width, and overflow becomes continuously scrollable.
 pub(crate) fn plan_icon_scroll_layout(
     count: usize,
     screen_width: f64,
@@ -842,6 +909,7 @@ pub(crate) fn plan_icon_scroll_layout(
     scroll_offset: f64,
 ) -> ThumbFlowLayout {
     let gap = ICON_CARD_GAP;
+    let card_h = card_h();
     let max_panel_w = (screen_width.max(1.0) * PANEL_MAX_WIDTH_RATIO)
         .max(ICON_CARD_W + H_PADDING * 2.0 + scrollbar_w);
     let max_inner = (max_panel_w - H_PADDING * 2.0 - scrollbar_w).max(ICON_CARD_W);
@@ -854,8 +922,7 @@ pub(crate) fn plan_icon_scroll_layout(
     } else {
         count.div_ceil(max_columns)
     };
-    let max_rows = ((max_panel_h - THUMB_TOP_INSET - STATUS_H).max(ICON_CARD_H)
-        / (ICON_CARD_H + gap))
+    let max_rows = ((max_panel_h - THUMB_TOP_INSET - status_h()).max(card_h) / (card_h + gap))
         .floor()
         .max(1.0) as usize;
     let overflowed = minimum_rows > max_rows;
@@ -897,17 +964,17 @@ pub(crate) fn plan_icon_scroll_layout(
     } else {
         panel_w
     };
-    let row_pitch = ICON_CARD_H + gap;
+    let row_pitch = card_h + gap;
     let total_content_h = THUMB_TOP_INSET
-        + visual_row_count as f64 * ICON_CARD_H
+        + visual_row_count as f64 * card_h
         + visual_row_count.saturating_sub(1) as f64 * gap;
     let teaser_h = if overflowed {
-        gap + ICON_CARD_H * THUMB_SCROLL_TEASER_RATIO
+        gap + card_h * THUMB_SCROLL_TEASER_RATIO
     } else {
         0.0
     };
     let viewport_content_h = THUMB_TOP_INSET
-        + viewport_rows as f64 * ICON_CARD_H
+        + viewport_rows as f64 * card_h
         + viewport_rows.saturating_sub(1) as f64 * gap
         + teaser_h;
     let max_scroll_offset = (total_content_h - viewport_content_h).max(0.0);
@@ -931,19 +998,19 @@ pub(crate) fn plan_icon_scroll_layout(
         _ => 0..0,
     };
     let panel_h = THUMB_TOP_INSET
-        + viewport_rows as f64 * ICON_CARD_H
+        + viewport_rows as f64 * card_h
         + viewport_rows.saturating_sub(1) as f64 * gap
         + teaser_h
-        + STATUS_H;
+        + status_h();
     let document_h = total_content_h;
-    let document_panel_h = document_h + STATUS_H;
+    let document_panel_h = document_h + status_h();
     let mut document_placements = Vec::with_capacity(count);
     for (row_index, row) in row_ranges.iter().enumerate() {
         let row_w = row.len() as f64 * ICON_CARD_W + row.len().saturating_sub(1) as f64 * gap;
         let row_x = (card_area_w - row_w) / 2.0;
         let y = document_panel_h
             - THUMB_TOP_INSET
-            - (row_index as f64 + 1.0) * ICON_CARD_H
+            - (row_index as f64 + 1.0) * card_h
             - row_index as f64 * gap;
         for (column, index) in row.clone().enumerate() {
             document_placements.push(ThumbPlacement {
@@ -958,11 +1025,9 @@ pub(crate) fn plan_icon_scroll_layout(
     for (local_row, row) in row_ranges[row_start..row_end].iter().enumerate() {
         let row_w = row.len() as f64 * ICON_CARD_W + row.len().saturating_sub(1) as f64 * gap;
         let row_x = (card_area_w - row_w) / 2.0;
-        let y = panel_h
-            - THUMB_TOP_INSET
-            - (local_row as f64 + 1.0) * ICON_CARD_H
-            - local_row as f64 * gap
-            + intra_row_offset;
+        let y =
+            panel_h - THUMB_TOP_INSET - (local_row as f64 + 1.0) * card_h - local_row as f64 * gap
+                + intra_row_offset;
         for (column, index) in row.clone().enumerate() {
             placements.push(ThumbPlacement {
                 index,
@@ -975,7 +1040,7 @@ pub(crate) fn plan_icon_scroll_layout(
     ThumbFlowLayout {
         panel_w,
         panel_h,
-        card_h: ICON_CARD_H,
+        card_h,
         document_placements,
         document_h,
         scale: 1.0,
@@ -997,7 +1062,7 @@ pub(crate) fn plan_icon_scroll_layout(
 /// Used only for the initial window placeholder; summon-time layout recalculates it.
 fn compute_window_height(count: usize, cards_per_row: usize, card_h: f64) -> f64 {
     let rows = count.max(1).div_ceil(cards_per_row);
-    32.0 + rows as f64 * card_h + STATUS_H
+    32.0 + rows as f64 * card_h + status_h()
 }
 
 /// 纯图标初始浮窗高度;实际布局会按屏幕宽度动态计算列数。
@@ -1030,11 +1095,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn status_bar_height_tracks_text_size() {
+        assert_eq!(status_bar_height_for_text_size(13.0), STATUS_H);
+        assert_eq!(status_bar_height_for_text_size(26.0), STATUS_H * 2.0);
+        assert_eq!(
+            status_bar_height_for_text_size(4.0),
+            STATUS_H * 8.0 / STATUS_BAR_TEXT_BASE_SIZE
+        );
+        assert_eq!(status_bar_height_for_text_size(f64::NAN), STATUS_H);
+    }
+
+    #[test]
     fn height_uses_at_least_one_row() {
         // 0 个窗口:至少一行,高度兜底。
         // Zero windows: at least one row as the floor.
-        assert_eq!(compute_window_height(0, 5, 100.0), 32.0 + 100.0 + STATUS_H);
-        assert_eq!(compute_window_height(1, 5, 100.0), 32.0 + 100.0 + STATUS_H);
+        assert_eq!(
+            compute_window_height(0, 5, 100.0),
+            32.0 + 100.0 + status_h()
+        );
+        assert_eq!(
+            compute_window_height(1, 5, 100.0),
+            32.0 + 100.0 + status_h()
+        );
     }
 
     #[test]
@@ -1043,15 +1125,15 @@ mod tests {
         // Four per row: five windows -> two rows.
         assert_eq!(
             compute_window_height(5, 4, 120.0),
-            32.0 + 2.0 * 120.0 + STATUS_H
+            32.0 + 2.0 * 120.0 + status_h()
         );
         assert_eq!(
             compute_window_height(8, 4, 120.0),
-            32.0 + 2.0 * 120.0 + STATUS_H
+            32.0 + 2.0 * 120.0 + status_h()
         );
         assert_eq!(
             compute_window_height(9, 4, 120.0),
-            32.0 + 3.0 * 120.0 + STATUS_H
+            32.0 + 3.0 * 120.0 + status_h()
         );
     }
 
@@ -1087,7 +1169,7 @@ mod flow_tests {
         let h = thumb_card_h_fixed();
         assert!(h > 100.0, "sanity: {} too small", h);
         let ph = thumb_preview_h(h);
-        assert!((h - (ph + THUMB_PAD * 2.0 + THUMB_CAPTION_H + THUMB_GAP)).abs() < 1e-9);
+        assert!((h - (ph + THUMB_PAD * 2.0 + thumb_caption_h() + THUMB_GAP)).abs() < 1e-9);
         // 预览高有 40pt 下限,极端小配置不塌缩。
         // The 40pt floor keeps extreme configs from collapsing.
         assert!(thumb_preview_h(50.0) >= 40.0);
@@ -1171,7 +1253,7 @@ mod flow_tests {
     fn overflow_uses_stable_pages_instead_of_sliding() {
         let aspects = vec![1.6; 8];
         let base_h = thumb_card_h_fixed();
-        let two_row_panel_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let two_row_panel_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let initial = plan_thumb_flow_layout(&aspects, 1, 900.0, two_row_panel_h, THUMB_ROW_GAP);
         assert!(initial.overflowed);
         assert_eq!(initial.scale, 1.0);
@@ -1204,7 +1286,7 @@ mod flow_tests {
         let aspects = vec![1.6; 12];
         let card_h = thumb_card_h_fixed();
         let three_row_panel_h =
-            THUMB_TOP_INSET + card_h * 3.0 + THUMB_ROW_GAP * 2.0 + STATUS_H + 0.1;
+            THUMB_TOP_INSET + card_h * 3.0 + THUMB_ROW_GAP * 2.0 + status_h() + 0.1;
         let capped = plan_thumb_flow_layout(
             &aspects,
             1,
@@ -1231,7 +1313,7 @@ mod flow_tests {
     fn selecting_any_item_on_a_page_keeps_the_same_page_boundary() {
         let aspects = vec![1.6; 8];
         let base_h = thumb_card_h_fixed();
-        let max_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let max_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         for selected in 4..8 {
             let layout = plan_thumb_flow_layout(&aspects, selected, 614.0, max_h, THUMB_ROW_GAP);
             assert_eq!(layout.visible, 4..8);
@@ -1266,7 +1348,8 @@ mod flow_tests {
                     THUMB_TOP_INSET
                         + constraints.max_rows as f64 * card_h
                         + THUMB_ROW_GAP
-                        + STATUS_H,
+                        + status_h()
+                        + 1.0,
                     THUMB_ROW_GAP,
                 );
                 assert_eq!(&layout.visible, page);
@@ -1278,7 +1361,7 @@ mod flow_tests {
     fn overflow_capacity_adapts_to_mixed_aspects() {
         let aspects = vec![1.6, 1.6, 2.2, 2.2, 2.2, 2.2];
         let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let max_h = 32.0 + card_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let max_h = 32.0 + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let initial = plan_thumb_flow_layout(&aspects, 1, 700.0, max_h, THUMB_ROW_GAP);
         // 两张标准卡可同排，宽卡只能独占一排，因此首段容量自然降为 3。
         // Two standard cards share a row while a wide card occupies its own, so
@@ -1298,7 +1381,7 @@ mod flow_tests {
     fn scrolling_layout_keeps_rows_and_panel_size_stable() {
         let aspects = vec![1.6; 20];
         let card_h = thumb_card_h_fixed();
-        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let first = plan_thumb_scroll_layout(
             &aspects,
             1288.0,
@@ -1338,7 +1421,7 @@ mod flow_tests {
     fn scrolling_overflow_fills_the_initial_viewport_greedily() {
         let aspects = vec![1.6; 13];
         let card_h = thumb_card_h_fixed();
-        let max_h = THUMB_TOP_INSET + card_h * 3.0 + THUMB_ROW_GAP * 2.0 + STATUS_H + 0.1;
+        let max_h = THUMB_TOP_INSET + card_h * 3.0 + THUMB_ROW_GAP * 2.0 + status_h() + 0.1;
         let layout = plan_thumb_scroll_layout(
             &aspects,
             1288.0,
@@ -1358,7 +1441,7 @@ mod flow_tests {
     fn scrolling_layout_keeps_balanced_packing_when_everything_fits() {
         let aspects = vec![2.2, 0.7, 0.7];
         let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let layout = plan_thumb_scroll_layout(
             &aspects,
             800.0,
@@ -1378,7 +1461,7 @@ mod flow_tests {
     fn scrolling_layout_clamps_to_the_last_row() {
         let aspects = vec![1.6; 20];
         let card_h = thumb_card_h_fixed();
-        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let layout = plan_thumb_scroll_layout(
             &aspects,
             1288.0,
@@ -1397,7 +1480,7 @@ mod flow_tests {
         let aspects = vec![1.6; 20];
         let card_h = thumb_card_h_fixed();
         let row_pitch = card_h + THUMB_ROW_GAP;
-        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + STATUS_H + 0.1;
+        let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let layout = plan_thumb_scroll_layout(
             &aspects,
             1288.0,
@@ -1534,7 +1617,7 @@ mod icon_scroll_tests {
         let layout = plan_icon_scroll_layout(2, 1440.0, 900.0, 14.0, 0.0);
 
         assert_eq!(layout.panel_w, 3.0 * ICON_CARD_W + H_PADDING * 2.0);
-        assert_eq!(layout.card_h, ICON_CARD_H);
+        assert_eq!(layout.card_h, card_h());
         assert_eq!(layout.document_placements.len(), 2);
         assert!(layout
             .document_placements

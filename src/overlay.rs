@@ -1038,13 +1038,13 @@ mod tests {
 
 // ========== 通用控件 helper / generic control helper ==========
 
-/// 创建一个简单(非 attributed)NSTextField 标签,sizeToFit 后在 container_width 内水平居中,
-/// 并按字体真实行高在给定区域内垂直居中。NSTextField 默认按顶部绘字,不能直接把 frame
-/// 撑满容器,否则状态栏等区域里的文字会贴近上边界。
-/// Create a simple (non-attributed) NSTextField label, size it to fit text, center it
-/// horizontally within `container_width`, and vertically center the font's real line height in
-/// the requested area. NSTextField draws glyphs from the top by default, so stretching its frame
-/// to the full container would leave status text too close to the upper boundary.
+/// 创建一个简单(非 attributed)NSTextField 标签,固定在 container_width 内水平居中,
+/// 并按字体真实行高在给定区域内垂直居中。固定宽度很重要:长文本必须由 NSTextField
+/// 在这个边界内尾部截断,不能用 sizeToFit 让它越过卡片边缘侵入相邻卡片。
+/// Create a simple (non-attributed) NSTextField label, constrained to `container_width`,
+/// centered horizontally, and vertically centered using the font's real line height. The fixed
+/// width is important: long text must be tail-truncated inside the card instead of sizeToFit
+/// letting it cross the card boundary and overlap the next card.
 pub(crate) unsafe fn make_centered_label(
     text: &str,
     font: *mut AnyObject,
@@ -1064,20 +1064,20 @@ pub(crate) unsafe fn make_centered_label(
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
     let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setUsesSingleLineMode: true];
+    let _: () = msg_send![label, setAlignment: 1isize]; // NSTextAlignmentCenter
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
-    // Size to fit content, then center horizontally
-    let _: () = msg_send![label, sizeToFit];
-    let fitted: NSRect = msg_send![label, frame];
-    let text_w = fitted.size.width;
-    let center_x = ((container_width - text_w) / 2.0).max(0.0);
+    // Keep the label inside its container and truncate at the trailing edge when needed.
+    // 保持标签不越过容器,超宽时从尾部截断。
+    let _: () = msg_send![label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
     let ascender: f64 = msg_send![font, ascender];
     let descender: f64 = msg_send![font, descender];
     let line_h = (ascender - descender + 1.0).max(11.0).min(height.max(1.0));
     let centered_y = y + (height - line_h) / 2.0;
     let _: () = msg_send![label, setFrame: NSRect::new(
-        NSPoint::new(center_x, centered_y),
-        NSSize::new(text_w, line_h)
+        NSPoint::new(0.0, centered_y),
+        NSSize::new(container_width.max(1.0), line_h)
     )];
     label
 }
@@ -2630,9 +2630,10 @@ unsafe fn update_thumbnail_scroller(
         let _: () = msg_send![scroller.0, setHidden: true];
         return;
     }
+    let footer_h = status_h();
     let frame = NSRect::new(
-        NSPoint::new(panel_w - H_PADDING - THUMB_SCROLLBAR_W, STATUS_H),
-        NSSize::new(THUMB_SCROLLBAR_W, (panel_h - STATUS_H).max(1.0)),
+        NSPoint::new(panel_w - H_PADDING - THUMB_SCROLLBAR_W, footer_h),
+        NSSize::new(THUMB_SCROLLBAR_W, (panel_h - footer_h).max(1.0)),
     );
     // 拖拽期间保持命中视图的 frame 不变;卡片重建只刷新胶囊绘制。
     // Keep the hit view's frame stable during dragging; card rebuilds only refresh the capsule.
@@ -2983,6 +2984,7 @@ pub(crate) fn update_status_label() {
         drop(state_opt);
 
         let colors = current_colors();
+        let footer_h = status_h();
         let status_font: *mut AnyObject = {
             let cfg = CONFIG.read().unwrap();
             msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
@@ -3006,9 +3008,9 @@ pub(crate) fn update_status_label() {
         let stat_x = ((container_w - stat_w) / 2.0).max(0.0);
         let ascender: f64 = msg_send![status_font, ascender];
         let descender: f64 = msg_send![status_font, descender];
-        let line_h = (ascender - descender + 1.0).clamp(11.0, STATUS_H);
+        let line_h = (ascender - descender + 1.0).clamp(11.0, footer_h);
         let _: () = msg_send![status_label, setFrame: NSRect::new(
-            NSPoint::new(stat_x, (STATUS_H - line_h) / 2.0),
+            NSPoint::new(stat_x, (footer_h - line_h) / 2.0),
             NSSize::new(stat_w, line_h)
         )];
     }
@@ -3893,11 +3895,21 @@ unsafe fn make_left_label(
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
     let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setUsesSingleLineMode: true];
+    let _: () = msg_send![label, setAlignment: 0isize]; // NSTextAlignmentLeft
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
     // 尾部截断(NSLineBreakByTruncatingTail = 4):超宽自动省略号。
     // Tail truncation (NSLineBreakByTruncatingTail = 4): ellipsis on overflow.
     let _: () = msg_send![label, setLineBreakMode: 4isize];
+    let ascender: f64 = msg_send![font, ascender];
+    let descender: f64 = msg_send![font, descender];
+    let line_h = (ascender - descender + 1.0).max(11.0).min(height.max(1.0));
+    let centered_y = y + (height - line_h) / 2.0;
+    let _: () = msg_send![label, setFrame: NSRect::new(
+        NSPoint::new(x, centered_y),
+        NSSize::new(width, line_h),
+    )];
     label
 }
 
@@ -4125,14 +4137,17 @@ pub(crate) fn create_card_view(
             let _: () = msg_send![view, addSubview: ring];
             release_obj(ring);
 
-            let preview_h = (card_h - THUMB_PAD * 2.0 - THUMB_CAPTION_H - THUMB_GAP).max(40.0);
-            let caption_y = card_h - THUMB_PAD - THUMB_CAPTION_H;
+            let caption_h = thumb_caption_h();
+            let preview_h = thumb_preview_h(card_h);
+            let caption_y = card_h - THUMB_PAD - caption_h;
 
             // --- 标题行:迷你图标 22pt(圆角 5,加载失败用首字母块) ---
             // --- Caption row: 22pt mini icon (radius 5, letter block on failure) ---
-            let mini_sz = 22.0;
+            let mini_sz = (22.0 * text_scale())
+                .clamp(16.0, 30.0)
+                .min((caption_h - 2.0).max(1.0));
             let mini_frame = NSRect::new(
-                NSPoint::new(THUMB_PAD, caption_y + (THUMB_CAPTION_H - mini_sz) / 2.0),
+                NSPoint::new(THUMB_PAD, caption_y + (caption_h - mini_sz) / 2.0),
                 NSSize::new(mini_sz, mini_sz),
             );
             let mut mini_img: Option<*mut AnyObject> = None;
@@ -4160,8 +4175,7 @@ pub(crate) fn create_card_view(
                 None => {
                     layer_set_background(ml, hex_to_cg_color(colors.icon_inner_bg));
                     let init_char = w.app_name.chars().next().unwrap_or('?').to_string();
-                    let font: *mut AnyObject =
-                        msg_send![class!(NSFont), systemFontOfSize: 10.0f64, weight: 0.5f64];
+                    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: (10.0 * text_scale()).clamp(8.0, 16.0), weight: 0.5f64];
                     let label = make_centered_label(
                         &init_char,
                         font,
@@ -4183,18 +4197,19 @@ pub(crate) fn create_card_view(
             let title_x = THUMB_PAD + mini_sz + 8.0;
             let close_sz = 24.0;
             let title_w = (card_width - title_x - close_sz - THUMB_PAD).max(20.0);
+            let title_size = card_title_font_size();
             let title_font: *mut AnyObject = {
                 let cfg = CONFIG.read().unwrap();
-                msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
+                msg_send![class!(NSFont), systemFontOfSize: title_size, weight: cfg.fonts.title_weight]
             };
             let title_label = make_left_label(
                 display_title(&w.window_title, &w.app_name),
                 title_font,
                 hex_to_ns_color(colors.win_title),
                 title_x,
-                caption_y + (THUMB_CAPTION_H - 18.0) / 2.0,
+                caption_y + 2.0,
                 title_w,
-                18.0,
+                (caption_h - 4.0).max(1.0),
             );
             let _: () = msg_send![view, addSubview: title_label];
             release_obj(title_label);
@@ -4332,43 +4347,48 @@ pub(crate) fn create_card_view(
             // 应用名 10px regular 浅色(app_name)。
             // Primary line = window title, secondary = app name: title 12px medium
             // (win_title), app name 10px regular (app_name).
-            let primary_bottom = icon_bottom - text_gap - 18.0; // 64 - 6 - 18 = 40
-                                                                // 次行:16px 高,贴卡片底部。
-                                                                // Secondary line: 16px tall at the bottom.
-            let secondary_bottom = primary_bottom - 2.0 - 16.0; // 40 - 2 - 16 = 22
+            let text_scale = text_scale();
+            let primary_line_h = 18.0 * text_scale;
+            let secondary_line_h = 16.0 * text_scale;
+            let primary_bottom = icon_bottom - text_gap - primary_line_h;
+            // 次行:16px 高,贴卡片底部。
+            // Secondary line: 16px tall at the bottom.
+            let secondary_bottom = primary_bottom - 2.0 - secondary_line_h;
 
             // --- 主行:窗口标题(12px medium 深色)---
             // --- Primary line: window title (12px medium, dark).
+            let primary_font_size = card_title_font_size();
             let primary_font: *mut AnyObject = {
                 let cfg = CONFIG.read().unwrap();
-                msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.title_size, weight: cfg.fonts.title_weight]
+                msg_send![class!(NSFont), systemFontOfSize: primary_font_size, weight: cfg.fonts.title_weight]
             };
             let primary_color = hex_to_ns_color(colors.win_title);
             let title_label = make_centered_label(
-                &truncate_text(display_title(&w.window_title, &w.app_name), 20),
+                display_title(&w.window_title, &w.app_name),
                 primary_font,
                 primary_color,
                 primary_bottom,
                 card_width,
-                18.0,
+                primary_line_h,
             );
             let _: () = msg_send![view, addSubview: title_label];
             release_obj(title_label); // view owns the label; drop our alloc +1
 
             // --- 次行:应用名(10px regular 浅色)---
             // --- Secondary line: app name (10px regular, light).
+            let secondary_font_size = card_app_name_font_size();
             let secondary_font: *mut AnyObject = {
                 let cfg = CONFIG.read().unwrap();
-                msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.app_name_size, weight: cfg.fonts.app_name_weight]
+                msg_send![class!(NSFont), systemFontOfSize: secondary_font_size, weight: cfg.fonts.app_name_weight]
             };
             let secondary_color = hex_to_ns_color(colors.app_name);
             let name_label = make_centered_label(
-                &truncate_text(&w.app_name, 17),
+                &w.app_name,
                 secondary_font,
                 secondary_color,
                 secondary_bottom,
                 card_width,
-                16.0,
+                secondary_line_h,
             );
             let _: () = msg_send![view, addSubview: name_label];
             release_obj(name_label); // view owns the label; drop our alloc +1
@@ -4394,12 +4414,13 @@ pub(crate) fn create_card_view(
         // only the position follows the layout: caption-row right edge (centered)
         // in thumbnail mode, top-right corner in legacy. ---
         let (btn_frame, btn_radius, btn_font_sz) = if use_new {
-            let caption_y = card_h - THUMB_PAD - THUMB_CAPTION_H;
+            let caption_h = thumb_caption_h();
+            let caption_y = card_h - THUMB_PAD - caption_h;
             (
                 NSRect::new(
                     NSPoint::new(
                         card_width - THUMB_PAD - 20.0,
-                        caption_y + (THUMB_CAPTION_H - 20.0) / 2.0,
+                        caption_y + (caption_h - 20.0) / 2.0,
                     ),
                     NSSize::new(20.0, 20.0),
                 ),
@@ -4577,7 +4598,7 @@ unsafe fn reconcile_card_views(
         };
         let key = (window.pid, window.window_id);
         let desired_frame = NSRect::new(
-            NSPoint::new(card_x, card_y - STATUS_H),
+            NSPoint::new(card_x, card_y - status_h()),
             NSSize::new(card_w, card_height),
         );
         let desired_signature =
@@ -4797,8 +4818,8 @@ pub(crate) fn show_overlay() {
         let _: () = msg_send![
             container,
             setFrame: NSRect::new(
-                NSPoint::new(0.0, STATUS_H),
-                NSSize::new(w, (h - STATUS_H).max(1.0))
+                NSPoint::new(0.0, status_h()),
+                NSSize::new(w, (h - status_h()).max(1.0))
             )
         ];
         let _: () = msg_send![

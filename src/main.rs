@@ -1228,6 +1228,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
         let screen_frame: NSRect = msg_send![screen, frame];
         let h = window_height(6); // initial reasonable default
+        let footer_h = status_h();
         let w = window_width(3); // initial three-card baseline; summon recalculates the live width
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
@@ -1524,8 +1525,8 @@ fn create_overlay_window() -> *mut AnyObject {
         // The card container covers only the area above the status footer; NSClipView clips cards
         // as they move continuously across the viewport edges.
         let container: *mut AnyObject = msg_send![container, initWithFrame: NSRect::new(
-            NSPoint::new(0.0, STATUS_H),
-            NSSize::new(w, (h - STATUS_H).max(1.0))
+            NSPoint::new(0.0, footer_h),
+            NSSize::new(w, (h - footer_h).max(1.0))
         )];
         let _: () = msg_send![container, setAutoresizingMask: 18u64];
         let _: () = msg_send![container, setDrawsBackground: false];
@@ -1540,7 +1541,7 @@ fn create_overlay_window() -> *mut AnyObject {
             document,
             initWithFrame: NSRect::new(
                 NSPoint::new(0.0, 0.0),
-                NSSize::new(w, (h - STATUS_H).max(1.0))
+                NSSize::new(w, (h - footer_h).max(1.0))
             )
         ];
         let _: () = msg_send![document, setWantsLayer: false];
@@ -1555,7 +1556,7 @@ fn create_overlay_window() -> *mut AnyObject {
             msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
         };
         let status_color = hex_to_ns_color(0x999999ff);
-        let status_label = make_centered_label("", status_font, status_color, 0.0, w, STATUS_H);
+        let status_label = make_centered_label("", status_font, status_color, 0.0, w, footer_h);
         let _: () = msg_send![content_parent, addSubview: status_label];
         *STATUS_LABEL.lock().unwrap() = Some(ObjPtr(status_label));
 
@@ -1566,8 +1567,8 @@ fn create_overlay_window() -> *mut AnyObject {
         let scroller: *mut AnyObject = msg_send![
             scroller,
             initWithFrame: NSRect::new(
-                NSPoint::new(w - H_PADDING - THUMB_SCROLLBAR_W, STATUS_H),
-                NSSize::new(THUMB_SCROLLBAR_W, (h - STATUS_H).max(1.0))
+                NSPoint::new(w - H_PADDING - THUMB_SCROLLBAR_W, footer_h),
+                NSSize::new(THUMB_SCROLLBAR_W, (h - footer_h).max(1.0))
             )
         ];
         let _: () = msg_send![scroller, setWantsLayer: false];
@@ -1576,7 +1577,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let scroller_tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
         let scroller_tracking: *mut AnyObject = msg_send![
             scroller_tracking,
-            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(THUMB_SCROLLBAR_W, (h - STATUS_H).max(1.0))),
+            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(THUMB_SCROLLBAR_W, (h - footer_h).max(1.0))),
             options: scroller_tracking_opts,
             owner: scroller,
             userInfo: std::ptr::null::<AnyObject>()

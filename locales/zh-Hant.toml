@@ -79,6 +79,10 @@ row_show_minimized = "切換時顯示最小化視窗"
 row_window_display_mode = "視窗顯示模式"
 window_display_mode_icons = "顯示圖示"
 window_display_mode_icons_thumbnails = "顯示圖示和縮圖"
+row_card_text_size = "卡片文字大小"
+desc_card_text_size = "調整視窗標題和應用程式名稱；縮圖模式還會同步調整左側圖示。範圍 8–24pt。"
+row_status_bar_text_size = "底部標題列文字大小"
+desc_status_bar_text_size = "調整應用程式切換浮窗底部目前視窗標題的文字大小，標題列高度會同步調整。最小 8pt。"
 show_minimized_hide = "不顯示"
 show_minimized_show = "顯示"
 row_overlay_position = "視窗顯示位置"
@@ -186,6 +190,7 @@ appearance_glass_tint_invalid = 'appearance.glass_tint: "{value}" 必須是 8 �
 appearance_corner_radius_invalid = "appearance.corner_radius: {value} 必須 >= 0"
 colors_not_hex8 = "{field}: 必須是 8 位十六進位"
 fonts_size_invalid = "{field}: {value} 必須 >= 8"
+layout_card_text_size_invalid = "layout.card_text_size: {value} 必須在 8..=24 之間"
 fonts_weight_invalid = "{field}: {value} 必須 0.0..=1.0"
 keyboard_modifier_invalid = 'keyboard.modifier: "{value}" 不是 option、command 之一'
 i18n_locale_invalid = 'i18n.locale: "{value}" 不是 auto、en、zh-Hans、zh-Hant 之一'

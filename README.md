@@ -205,6 +205,7 @@ corner_radius = 32.0
 
 [layout]
 thumbnails_enabled = true  # window thumbnails on cards; off = icon-only cards
+card_text_size = 16.0      # card text size in points; thumbnail's left icon scales with it (8..=24)
 
 [keyboard]
 modifier = "command"     # "option" (Option+Tab) | "command" (Cmd+Tab)

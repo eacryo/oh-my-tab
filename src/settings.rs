@@ -162,6 +162,8 @@ struct SettingsUi {
     locale: *mut AnyObject,          // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject,  // NSSwitch: 显示最小化窗口 / show minimized windows
     thumbnails_enabled: *mut AnyObject, // NSPopUpButton: 窗口显示模式 / window display mode
+    card_text_size: *mut AnyObject,  // NSTextField: 卡片文字大小 / card text size
+    status_bar_text_size: *mut AnyObject, // NSTextField: 底部标题栏文字大小 / footer text size
     windows_enabled: *mut AnyObject, // NSSwitch: 窗口切换总开关 / app-switcher master switch
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
     log_level: *mut AnyObject,        // NSPopUpButton: trace / debug / info / warn / error
@@ -585,10 +587,11 @@ unsafe fn set_field(field: *mut AnyObject, val: impl std::fmt::Display) {
     CFRelease(ns as *const c_void);
 }
 
-/// NSTextFieldCell keeps a fixed baseline for single-line controls.  Our settings rows are
-/// taller than that standard control height, so use a small cell subclass that gives AppKit a
-/// centered 22pt drawing/editing rect inside the full row.  Both paths are overridden because
-/// the field editor is laid out by `selectWithFrame:` rather than by the drawing method.
+/// NSTextFieldCell keeps a fixed baseline for single-line controls. Our settings rows are taller
+/// than that standard control height, so use a small cell subclass that gives AppKit a centered
+/// 22pt drawing rect inside the full row. The field editor must still receive AppKit's original
+/// bounding rect: `selectWithFrame:` is also used for double-click word selection, and passing the
+/// compact drawing rect makes the editor jump toward the cell's upper-left corner.
 unsafe fn centered_text_field_cell_class() -> *mut AnyObject {
     static CELL_CLASS: OnceLock<ObjPtr> = OnceLock::new();
     CELL_CLASS
@@ -609,6 +612,13 @@ unsafe fn centered_text_field_cell_class() -> *mut AnyObject {
                 sel!(selectWithFrame:inView:editor:delegate:start:length:),
                 centered_text_field_cell_select as *mut c_void,
                 select_types.as_ptr(),
+            );
+            let editor_types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(setUpFieldEditorAttributes:),
+                centered_text_field_cell_setup_editor as *mut c_void,
+                editor_types.as_ptr(),
             );
             objc_registerClassPair(cls);
             ObjPtr(cls)
@@ -710,13 +720,58 @@ extern "C" fn centered_text_field_cell_select(
         send(
             &mut sup,
             sel!(selectWithFrame:inView:editor:delegate:start:length:),
-            centered_text_field_cell_frame(bounds),
+            // `bounds` is the cell's full bounding rectangle. Do not pass the compact drawing
+            // rect here: AppKit reuses this method for double-click selection and positions the
+            // field editor from the rectangle it receives.
+            bounds,
             view,
             editor,
             delegate,
             start,
             length,
         );
+    }
+}
+
+/// Keep AppKit's field editor aligned with the cell's normal drawing baseline. The editor is an
+/// NSTextView and otherwise draws a single-line value from its own top-left origin, which is most
+/// visible after a double-click when AppKit reuses the editor for word selection.
+extern "C" fn centered_text_field_cell_setup_editor(
+    this: *mut c_void,
+    _cmd: Sel,
+    editor: *mut c_void,
+) {
+    unsafe {
+        #[repr(C)]
+        struct ObjcSuper {
+            receiver: *mut c_void,
+            super_class: *mut c_void,
+        }
+        extern "C" {
+            fn objc_msgSendSuper();
+        }
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void) -> ();
+        let super_class =
+            objc2::runtime::AnyClass::get(c"NSTextFieldCell").unwrap() as *const _ as *mut c_void;
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class,
+        };
+        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        send(&mut sup, sel!(setUpFieldEditorAttributes:), editor);
+
+        let editor = editor as *mut AnyObject;
+        if editor.is_null() {
+            return;
+        }
+        let _: () = msg_send![editor, setAlignment: 0isize]; // NSTextAlignmentLeft
+        let _: () = msg_send![editor, setVerticallyResizable: false];
+        let _: () = msg_send![editor, setHorizontallyResizable: true];
+        if msg_send![editor, respondsToSelector: sel!(setTextContainerInset:)] {
+            // The field editor's glyph baseline sits about one point above the cell's normal
+            // drawing baseline; add one point of vertical inset so edit and display states line up.
+            let _: () = msg_send![editor, setTextContainerInset: NSSize::new(8.0, 8.0)];
+        }
     }
 }
 
@@ -2100,6 +2155,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         "layout.thumbnails_enabled",
         old.layout.thumbnails_enabled,
         new.layout.thumbnails_enabled
+    );
+    changed!(
+        "layout.card_text_size",
+        old.layout.card_text_size,
+        new.layout.card_text_size
     );
     changed!(
         "windows.overlay_position",
@@ -3876,6 +3936,8 @@ fn load_settings_from(cfg: &Config) {
         let _: () = msg_send![panel, setColor: tint];
         GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
         set_field(ui.corner_radius, cfg.appearance.corner_radius);
+        set_field(ui.card_text_size, cfg.layout.card_text_size);
+        set_field(ui.status_bar_text_size, cfg.fonts.status_bar_size);
         let mod_idx: isize = if is_cmd { 1 } else { 0 };
         let _: () = msg_send![ui.modifier, selectItemAtIndex: mod_idx];
         // locale:按 CONFIG.i18n.locale 选中对应项,未匹配回退第 0 项(auto)。
@@ -4068,6 +4130,23 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             Err(_) => errs.push(tf(
                 "errors.not_a_number",
                 &[("field", "appearance.corner_radius")],
+            )),
+        }
+        match parse_f64(&nsstring_to_rust(msg_send![ui.card_text_size, stringValue])) {
+            Ok(v) => cfg.layout.card_text_size = v,
+            Err(_) => errs.push(tf(
+                "errors.not_a_number",
+                &[("field", "layout.card_text_size")],
+            )),
+        }
+        match parse_f64(&nsstring_to_rust(msg_send![
+            ui.status_bar_text_size,
+            stringValue
+        ])) {
+            Ok(v) => cfg.fonts.status_bar_size = v,
+            Err(_) => errs.push(tf(
+                "errors.not_a_number",
+                &[("field", "fonts.status_bar_size")],
             )),
         }
         let mod_idx: isize = msg_send![ui.modifier, indexOfSelectedItem];
@@ -4533,6 +4612,8 @@ fn create_settings_window() {
             glass_preview_clipboard: std::ptr::null_mut(),
             corner_radius: std::ptr::null_mut(),
             thumbnails_enabled: std::ptr::null_mut(),
+            card_text_size: std::ptr::null_mut(),
+            status_bar_text_size: std::ptr::null_mut(),
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
             show_minimized: std::ptr::null_mut(),
@@ -4873,7 +4954,7 @@ fn create_settings_window() {
             NSSize::new(detail_w - page_inset, page_viewport_h),
         );
         let general_doc_h = 820.0;
-        let switcher_doc_h = 840.0;
+        let switcher_doc_h = 980.0;
         let mouse_doc_h = 1240.0;
         let clipboard_doc_h = 700.0;
         let about_doc_h = 700.0;
@@ -5229,6 +5310,30 @@ fn create_settings_window() {
             ),
         )
         .1;
+        y -= 8.0 + described_row_h;
+        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
+        ui.card_text_size = add_described_row(
+            switcher_view,
+            label_x,
+            y,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_card_text_size"),
+            &t("settings.desc_card_text_size"),
+            make_text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "16"),
+        );
+        y -= 8.0 + described_row_h;
+        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
+        ui.status_bar_text_size = add_described_row(
+            switcher_view,
+            label_x,
+            y,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_status_bar_text_size"),
+            &t("settings.desc_status_bar_text_size"),
+            make_text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "16"),
+        );
         y -= 8.0 + described_row_h;
         add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
         // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0。

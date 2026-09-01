@@ -198,6 +198,7 @@ corner_radius = 32.0
 
 [layout]
 thumbnails_enabled = true  # 卡片窗口缩略图;关闭 = 纯图标卡片
+card_text_size = 16.0      # 卡片文字大小(点);缩略图模式下左侧图标也按比例缩放,范围 8..=24
 
 [keyboard]
 modifier = "command"     # "option"(Option+Tab)| "command"(Cmd+Tab)

@@ -41,6 +41,10 @@ pub struct Layout {
     // and the thumbnail service never starts. Default on; auto-sleeps without the
     // Screen Recording permission (see the thumbnail module).
     pub thumbnails_enabled: bool,
+    // 卡片文字大小(点):窗口标题和应用名按比例缩放;纯图标模式的大图标不受影响。
+    // Card text size (points): the window title and app name scale proportionally; the large
+    // icon in icon-only mode is unaffected.
+    pub card_text_size: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -430,6 +434,7 @@ impl Default for Layout {
     fn default() -> Self {
         Layout {
             thumbnails_enabled: true,
+            card_text_size: 16.0,
         }
     }
 }
@@ -507,7 +512,7 @@ impl Default for Fonts {
         // not bold); secondary = app name at 10px / regular (CSS omits font-weight =
         // 400 ~= NSFontWeightRegular 0.0).
         Fonts {
-            status_bar_size: 13.0,
+            status_bar_size: 16.0,
             status_bar_weight: 0.23,
             title_size: 12.0,
             title_weight: 0.23,
@@ -627,8 +632,18 @@ impl Config {
             }
         }
 
+        // --- layout ---
+        if !self.layout.card_text_size.is_finite()
+            || !(8.0..=24.0).contains(&self.layout.card_text_size)
+        {
+            errs.push(tf(
+                "errors.layout_card_text_size_invalid",
+                &[("value", &self.layout.card_text_size.to_string())],
+            ));
+        }
+
         // --- fonts ---
-        if self.fonts.status_bar_size < 8.0 {
+        if !self.fonts.status_bar_size.is_finite() || self.fonts.status_bar_size < 8.0 {
             errs.push(tf(
                 "errors.fonts_size_invalid",
                 &[
@@ -808,6 +823,9 @@ impl Config {
             // Booleans are always valid; adopt the loaded value unconditionally
             // (same convention as the other boolean switches).
             self.layout.thumbnails_enabled = other.layout.thumbnails_enabled;
+            if !errs.iter().any(|e| e.starts_with("layout.card_text_size")) {
+                self.layout.card_text_size = other.layout.card_text_size;
+            }
         }
 
         // colors
@@ -1349,6 +1367,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_card_text_size_outside_range() {
+        let mut cfg = Config::default();
+        cfg.layout.card_text_size = 7.9;
+        assert_err_count(&cfg, 1);
+        cfg.layout.card_text_size = 24.1;
+        assert_err_count(&cfg, 1);
+        cfg.layout.card_text_size = 12.0;
+        assert_err_count(&cfg, 0);
+    }
+
+    #[test]
+    fn switcher_text_defaults_to_sixteen_points() {
+        let cfg = Config::default();
+        assert_eq!(cfg.layout.card_text_size, 16.0);
+        assert_eq!(cfg.fonts.status_bar_size, 16.0);
+    }
+
+    #[test]
     fn validate_catches_mouse_profile_ranges() {
         let mut cfg = Config::default();
         cfg.mouse.profiles.push(MouseProfile {
@@ -1376,6 +1412,7 @@ mod tests {
         other.clipboard.persist = true;
         other.clipboard.move_used_to_top = false;
         other.clipboard.pin_follow_selection = false;
+        other.layout.card_text_size = 16.0;
         let mut merged = Config::default();
         merged.merge_valid(other, &[]);
         assert_eq!(merged.appearance.theme, "dark");
@@ -1387,6 +1424,7 @@ mod tests {
         assert!(merged.clipboard.persist);
         assert!(!merged.clipboard.move_used_to_top);
         assert!(!merged.clipboard.pin_follow_selection);
+        assert_eq!(merged.layout.card_text_size, 16.0);
     }
 
     #[test]
