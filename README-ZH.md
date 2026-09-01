@@ -32,10 +32,10 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 
 - <img height="14" src="docs/icons/stack.svg"> **原生切换增强**:显示应用名与窗口标题,同一应用的多个窗口分列卡片。
 - <img height="14" src="docs/icons/key.svg"> **键盘导航**:按下 Command/Option 后用 Tab、Shift+Tab、方向键或鼠标选择窗口。
-- <img height="14" src="docs/icons/zap.svg"> **轻量**:纯 Rust——当前 arm64 release 可执行文件约 3.7MB;实际观测中,开启缩略图和持久化剪贴板的典型活动会话,启动后 footprint 约 80MB,缩略图预热后约 140–160MB。内存缩略图缓存上限约 64MB,无 Electron/Tauri。
-- <img height="14" src="docs/icons/star.svg"> **Liquid Glass**:浮层效果(仅 macOS 26;旧版回退 `NSVisualEffectView`)。
+- <img height="14" src="docs/icons/zap.svg"> **轻量**:纯 Rust,带有上限明确的内存缩略图缓存,无 Electron/Tauri 运行时。
+- <img height="14" src="docs/icons/star.svg"> **Liquid Glass**:系统支持时使用 `NSGlassEffectView`,旧版系统回退到 `NSVisualEffectView`。
 - <img height="14" src="docs/icons/image.svg"> **窗口缩略图**:标题行在上方、下方为 16:10 实时预览(经私有 WindowServer API 截取,仅存内存)——缓存旧帧即时显示、后台异步刷新;单页时平衡排列,溢出时优先填满 MRU 前面的行并连续滚动。需要**屏幕录制**权限——未授权时自动回退为纯图标卡片。关闭缩略图后会立即释放内存中的窗口截图。
-- <img height="14" src="docs/icons/history.svg"> **窗口级 MRU**:切到某个窗口不会把该应用的其他窗口一起带前。
+- <img height="14" src="docs/icons/history.svg"> **窗口级 MRU**:切到某个窗口时,该应用的其他窗口保持原有顺序。
 - <img height="14" src="docs/icons/eye.svg"> **完整窗口可见**:所有真实窗口,含离屏与最小化(可开关)。
 - <img height="14" src="docs/icons/gear.svg"> **TOML 热重载**:配置经校验,菜单一键生效。
 - <img height="14" src="docs/icons/globe.svg"> **零依赖国际化**:英文/简中/繁中,实时跟随系统语言。
@@ -77,10 +77,10 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 | 种类 | 存储内容 | 粘贴行为 |
 |---|---|---|
 | **文本** | 复制的文本,存于内存 | 写回文本并合成 Cmd+V |
-| **图片数据** | 在应用内复制的图片(如右键"复制图片"):原始格式字节按内容哈希存磁盘缓存,内存只留降采样缩略图 | 按**原始 UTI** 写回字节——JPG 粘回 JPG、GIF 动图粘回动图,绝不重编码成 PNG |
+| **图片数据** | 在应用内复制的图片(如右键"复制图片"):原始格式字节按内容哈希存磁盘缓存,内存只留降采样缩略图 | 按**原始 UTI** 写回字节并保留格式:JPG 仍为 JPG、GIF 动图仍为 GIF |
 | **图片文件** | 在访达里复制的图片文件(Cmd+C):复制时**读一次文件**算内容哈希 + 生成缩略图,字节随即丢弃——只保留路径 | 恢复 `public.file-url`(文件语义,同 Windows Win+V / Maccy):Finder 原样复制文件、聊天应用附加文件;源文件已被删除时该条目粘贴跳过 |
 
-> **已知 v1 取舍**——每条历史只记录一种内容:一次复制**同时带文本和图片**时(例如从网页复制图片)只记录文本;**多文件复制与单个非图片文件完全不记录**。同一张图既复制过图片又复制过文件,则保留两条(两者粘贴语义不同)。去重按类进行:文本按全文精确匹配,图片按内容哈希。
+> **已知 v1 取舍**——每条历史只记录一种内容:一次复制**同时带文本和图片**时(例如从网页复制图片)只记录文本;**多文件复制与单个非图片文件会从历史中跳过**。同一张图既复制过图片又复制过文件,则保留两条(两者粘贴语义不同)。去重按类进行:文本按全文精确匹配,图片按内容哈希。
 
 **使用条目默认会重排历史**(同 Maccy):选中条目回车 = 把它写回剪贴板,记录器视为"又一次复制"并移到最前。设置里的**"使用后移到最前"**开关可关闭此行为(同 Windows Win+V)。浮窗"清除全部"保留置顶条目。可选的**"保存剪贴板历史记录到磁盘"**开关把历史持久化、重启不丢——隐私风险见[配置](#配置)中的说明。
 
@@ -88,17 +88,16 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 
 **部分后台应用的窗口缩略图可能暂时白屏**:WindowServer 只能截取应用当前提供的窗口画面。长期处于后台休眠状态的 WebView 应用(例如 Clash Verge Rev)可能只返回标题栏和白色内容区,尤其是在 oh-my-tab 刚启动、内存缩略图缓存为空时。激活该应用并等待内容重新绘制后,后续捕获可以恢复预览。
 
-**Telegram 全屏查看图片时不会显示图片查看器的独立缩略图**:Telegram 的媒体查看器是位于普通窗口之上的特殊高层级浮窗。为避免把它误识别成一个可切换窗口,oh-my-tab 会将其排除在窗口列表和缩略图采集之外,因此此时切换器显示的是 Telegram 主窗口的缩略图,而不是当前查看的图片。这是当前版本的已知限制。
+**Telegram 全屏查看图片时不会显示图片查看器的独立缩略图**:Telegram 的媒体查看器是位于普通窗口之上的特殊高层级浮窗。为避免把它误识别成一个可切换窗口,oh-my-tab 会将其排除在窗口列表和缩略图采集之外。查看器打开时,切换器显示 Telegram 主窗口的缩略图。这是当前版本的已知限制。
 
 **如果应用启动时已有窗口存在,初始排序不保证与原生 Cmd+Tab 完全一致**:oh-my-tab 会先使用 WindowServer 的前后层级顺序建立一个合理的初始近似;启动后再通过实时激活事件逐步修正窗口级 MRU。
 
-**设备识别的问题**:部分特殊鼠标(如 ATK A9 SE,星闪设备)主用途会被系统报错、在系统设置里显示为键盘;设备下拉框按设备完整的 HID usage pairs 匹配,所以仍能识别并配置。HID 描述符虚报指针用途的蓝牙键盘会按蓝牙 GAP appearance 被排除。下拉框插拔/重连实时刷新(插拔事件有防抖但不会丢弃)。
 
-仅影响源码开发的问题(`cargo run` 下的图标失效、调试器下的鼠标控制失效)收录在 [docs/developer-notes.md](docs/developer-notes.md)。
+仅影响开发的问题以及裸二进制调试说明收录在 [docs/developer-notes.md](docs/developer-notes.md)。
 
 ## <img height="16" src="docs/icons/tools.svg">&nbsp;&nbsp;环境要求
 
-- macOS(在 macOS 26 上开发;旧版本通过 `NSVisualEffectView` 回退支持,但不保证其可用性)。
+- macOS 13+ Apple Silicon。
 - 已授予应用 **辅助功能** 权限。
 
 ## <img height="16" src="docs/icons/terminal.svg">&nbsp;&nbsp;构建与运行
@@ -108,13 +107,14 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 ### 开发
 
 > ```sh
+> cargo fmt
 > cargo check       # 快速类型检查
-> cargo run         # 构建并运行(会接管全局快捷键)
-> cargo clippy      # 可用,未接入 CI
+> cargo clippy
 > cargo test        # 单元测试;加 -- --ignored 运行 CG/AX 冒烟测试
+> ./scripts/dev-restart.sh  # 构建、签名并启动开发版 .app
 > ```
 
-`cargo run` 以**开发模式**跑裸二进制:日志同时输出到 stdout 和日志文件,开机自启不生效(SMAppService 需要 `.app` bundle)。单元测试默认即可运行(无 GUI 依赖);剪贴板图片/历史测试夹具使用按进程、按线程隔离的系统临时目录,不写用户缓存。少量**冒烟测试**标记为 `#[ignore]` —— 它们调用真实的 CG/AX 栈,需要 GUI 会话和辅助功能权限(用 `cargo test -- --ignored` 运行)。
+`scripts/dev-restart.sh` 会构建并组装独立签名的开发版 `.app`,再交给用户级 `launchd` 启动。这样辅助功能和屏幕录制权限会绑定到开发版 bundle,并确保实际运行的是最新构建。单元测试默认即可运行(无 GUI 依赖);剪贴板图片/历史测试夹具使用按进程、按线程隔离的系统临时目录,不写用户缓存。少量**冒烟测试**标记为 `#[ignore]` —— 它们调用真实的 CG/AX 栈,需要 GUI 会话和辅助功能权限(用 `cargo test -- --ignored` 运行)。
 
 ### Release `.app` + `.dmg`
 
@@ -127,7 +127,7 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 `bundle.sh` 现在同时生成 `dist/Oh-My-Tab.dmg` 和 Sparkle 使用的 `dist/Oh-My-Tab.zip`。`release.sh` 默认只在本地构建；只有显式传入 `--push` 才会使用 R2 S3 API 上传，避免普通构建误发布：
 
 > ```sh
-> sh scripts/release.sh                 # 只构建，不访问 R2
+> sh scripts/release.sh                 # 只构建，关闭 R2 访问
 > sh scripts/release.sh --push           # 上传 ZIP、DMG，最后上传 dist/appcast.xml
 > sh scripts/release.sh --push --dry-run # 只打印上传计划
 > ```
@@ -147,10 +147,10 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 
 `--push` 要求你准备好对应的 appcast（生产为 `dist/appcast.xml`，开发为
 `dist/appcast-dev.xml`），并读取 `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_BUCKET` 以及
-`R2_ENDPOINT`（或 `R2_ACCOUNT_ID`）等环境变量。上传工具位于 `tools/r2-publisher`，不会把
-密钥写入应用或命令行参数。
+`R2_ENDPOINT`（或 `R2_ACCOUNT_ID`）等环境变量。上传工具位于 `tools/r2-publisher`，会把
+密钥排除在应用和命令行参数之外。
 上传请求始终发送到环境变量配置的 R2 S3 endpoint；`download.oh-my-tab.app` 只作为 Sparkle
-链接中的公开 HTTPS 地址。`R2_PUBLIC_BASE_URL` 只会改变显示/公开 URL，不会改变实际上传目标。
+链接中的公开 HTTPS 地址。`R2_PUBLIC_BASE_URL` 只控制显示/公开 URL,实际上传目标仍由 R2 endpoint 决定。
 
 ### Sparkle 自动更新
 
@@ -161,9 +161,7 @@ Sparkle 私钥，这些发布材料由你后续分别放到对应的 R2 路径�
 
 把 Sparkle 2 的 `Sparkle.framework` 放到 `vendor/Sparkle.framework`（或设置 `SPARKLE_FRAMEWORK_PATH`），`scripts/bundle.sh` 和 `scripts/dev-restart.sh` 会自动复制到 `Contents/Frameworks`。没有框架时应用仍可启动，About 页会提示该构建未包含 Sparkle。脚本默认用 UTC 时间戳生成 `CFBundleVersion`，也可用 `SPARKLE_BUILD_VERSION` 指定固定值；发布时可通过 `SPARKLE_FEED_URL` 覆盖 feed 地址，通过 `SPARKLE_PUBLIC_ED_KEY` 写入 appcast 验签公钥。私钥不要放进仓库或 R2。
 
-构建要求需要区分：`cargo build`、`cargo check` 和测试套件不依赖 Sparkle；要让打包后的应用真正具备更新检查功能，必须提供上面的 framework。生成 appcast 还需要 Sparkle 发行包中的 `bin/generate_keys` 和 `bin/generate_appcast`。framework 已按设计加入 Git 忽略，因此每台开发机或 CI 都要自行准备固定版本的 Sparkle 发行包。
-
-作为参考,本次 arm64 构建测得:未签名 release 可执行文件 3,726,864 字节,签名后 `.app` 内普通文件共 4,524,594 字节,生成的 UDZO `.dmg` 为 3,080,950 字节。这些是当前构建产物的实测值,不是固定保证;源码、Rust 工具链和签名方式都可能改变大小。
+构建要求需要区分：`cargo build`、`cargo check` 和测试套件可以在没有 Sparkle 的情况下运行；要让打包后的应用具备更新检查功能，需要提供上面的 framework。生成 appcast 还需要 Sparkle 发行包中的 `bin/generate_keys` 和 `bin/generate_appcast`。framework 已按设计加入 Git 忽略，因此每台开发机或 CI 都要自行准备固定版本的 Sparkle 发行包。
 
 ### 代码签名
 
@@ -175,19 +173,19 @@ Sparkle 私钥，这些发布材料由你后续分别放到对应的 R2 路径�
 
 若授权变陈旧(比如旧 ad-hoc 安装残留),清除:`tccutil reset Accessibility com.eacryo.oh-my-tab`。注意:自签名证书只稳定 TCC 身份,**不**满足 Gatekeeper 分发 -- 别人装仍是「未识别开发者」,需右键打开;彻底解决需付费的 Apple Developer ID 证书(把 `scripts/bundle.sh` 里的 `SIGN_IDENTITY` 改成那个名字)。
 
-完整发布流水线(Homebrew cask 生成、签名原理、图标再生成)见 [docs/releasing.md](docs/releasing.md);架构说明见 [AGENTS.md](AGENTS.md)。
+完整发布流水线(Homebrew cask 生成、签名原理、图标再生成)见 [docs/releasing.md](docs/releasing.md)。
 
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;权限与运行须知
 
 - 应用需要 **辅助功能** 权限(`AXIsProcessTrusted`),全局按键事件 tap 和 AX 窗口查询都依赖它。在 *系统设置 -> 隐私与安全性 -> 辅助功能* 中授予。重新编译出的二进制需要重新授权 -- 除非用稳定身份签名(见[代码签名](#代码签名)),此时授权跨 rebuild 持续有效。
-- **窗口缩略图**还需要**屏幕录制**权限(系统设置 -> 隐私与安全性 -> 屏幕录制;使用与 DockDoor/AltTab 相同的私有 WindowServer 截取 API)。未授权时切换器静默保持纯图标渲染;稍后授予权限后无需重启即可恢复缩略图捕获。画面帧**仅存内存**——绝不落盘。
+- **窗口缩略图**还需要**屏幕录制**权限(系统设置 -> 隐私与安全性 -> 屏幕录制;使用与 DockDoor/AltTab 相同的私有 WindowServer 截取 API)。未授权时切换器静默保持纯图标渲染;稍后授予权限后无需重启即可恢复缩略图捕获。画面帧**只保存在内存中**。
 - 如果事件 tap 创建失败,应用会打印一条错误,快捷键静默失效 -- 几乎总是辅助功能权限没给。
 - 运行时配置:`~/.config/oh-my-tab/config.toml`(首次运行自动按默认值创建)。
 - 图标缓存:`~/Library/Caches/oh-my-tab-icons/{bundle-id}.png`(按应用 bundle id 索引,配 `.meta` mtime sidecar;可从菜单清空)。
 
 ## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;配置
 
-`~/.config/oh-my-tab/config.toml` -- 首次运行按默认值自动创建。加载是**逐字段容错**的,不是全有或全无:非法字段回退默认值(记日志,绝不致命)。可从菜单(*Reload Config*)运行时热重载,同时重新应用主题并刷新浮窗。常用键:
+`~/.config/oh-my-tab/config.toml` -- 首次运行按默认值自动创建。加载采用**逐字段容错**:非法字段回退默认值并记日志,其余配置继续生效。可从菜单(*Reload Config*)运行时热重载,同时重新应用主题并刷新浮窗。常用键:
 
 ```toml
 [appearance]
@@ -199,6 +197,9 @@ corner_radius = 32.0
 [layout]
 thumbnails_enabled = true  # 卡片窗口缩略图;关闭 = 纯图标卡片
 card_text_size = 16.0      # 卡片文字大小(点);缩略图模式下左侧图标也按比例缩放,范围 8..=24
+
+[fonts]
+status_bar_size = 16.0     # 底部标题栏文字大小(点);标题栏高度随之调整,最小值 8
 
 [keyboard]
 modifier = "command"     # "option"(Option+Tab)| "command"(Cmd+Tab)
@@ -227,7 +228,7 @@ max_entries = 50         # 历史最大条数(1..=100)
 persist = false          # 把历史保存到磁盘,重启不丢(隐私风险见下方说明)
 auto_expire_days = 3     # 非置顶条目超过 N 天自动过期(内存与磁盘同时生效);0 = 关闭
 pin_follow_selection = true # 置顶/取消置顶后选中项是否跟随该条目(关闭 = 保持当前位置)
-move_used_to_top = true  # 粘贴后把用过的条目移到最前(关闭 = 粘贴不重排历史,同 Win+V)
+move_used_to_top = true  # 粘贴后把用过的条目移到最前(关闭 = 粘贴后保持当前顺序,同 Win+V)
 picker_position = "main" # 剪贴板浮窗位置:"mouse"(跟随鼠标)| "main"(主屏居中)
 show_source_app = false  # 条目行是否显示来源应用名(来源始终会记录)
 
@@ -278,18 +279,18 @@ line_count = 3
 > (600 权限只能防其他用户),因此如果你会复制密码、令牌等敏感内容,**不要**开启该开关。
 > 作为防线:带有 nspasteboard.org "Securing Copy" 标准标记
 > (`org.nspasteboard.ConcealedType` / `TransientType` / `AutoGeneratedType`,以及
-> 1Password 标记 `com.agilebits.onepassword`)的内容**绝不会被记录**——密码管理器复制
-> 密码时会打上这些标记,这类内容从一开始就不会进入历史(内存和磁盘都不会)。持久化默认关闭。
+> 1Password 标记 `com.agilebits.onepassword`)的内容会被过滤。密码管理器复制密码时会打上
+> 这些标记,这类内容不会进入历史(内存和磁盘)。持久化默认关闭。
 
 鼠标设置也可以在设置窗口中调整(用**设备下拉框**选中某款已连接的鼠标,编辑它那一层)。按键映射区显示已绑定的行(按钮名 + 动作描述 + 键帽),**点「编辑」弹出编辑面板**(LinearMouse 同款):面板里录制触发侧键、选动作类型(默认/无/自定义按键/Mission Control/Launchpad/显示桌面/App Expose)、自定义按键时录组合键,确认后写入。切换 `mouse.enabled` **立即生效**,无需重启应用。
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;日志
 
-- **输出目标**:`cargo run`(开发态)-> 同时输出到 stdout **和**日志文件;打包的 `.app`(生产态)-> 只写日志文件。
+- **输出目标**:`scripts/dev-restart.sh` 启动的开发版 `.app` 和打包的 `.app` 都写入日志文件。裸 `cargo run` 还会输出到 stdout,但仅适合底层调试,不是常规开发启动方式。
 - **默认文件路径**:`~/Library/Logs/oh-my-tab/oh-my-tab-<启动时间戳>.log` -- **每次启动一个文件**。启动时自动删除默认目录中 mtime 超过 30 天的旧日志(单次长时间运行内无按大小轮转)。
 - **自定义路径**:`[logging] file_path`(直接编辑 `config.toml`,不在设置界面暴露)。用户指定路径**原样**使用、append 模式——不加时间戳、不做任何清理,轮转与保留由你自己负责。
-- **内存诊断**:启动约 60 秒后先记录一行,之后每 5 分钟记录一行 `[mem]`,包含当前功能画像(`mouse:on|off`、`thumbs:on|off`、`clipboard:off|memory|persistent`)、进程 footprint/RSS、采样期间 footprint 峰值、线程数,以及缩略图/剪贴板/窗口账本的估算值。`footprint` 是 macOS 的 physical footprint 指标,对应活动监视器的「内存」列,是判断内存压力的主要数字;`rss` 是当前驻留内存,会随 macOS 压缩或回收页面而下降。`footprint_peak_sampled` 是应用采样得到的峰值,`rss_peak_kernel` 是内核记录的进程生命周期峰值。近期一次 arm64 会话在开启缩略图和持久化剪贴板时,footprint 从启动后的 84MB 上升到缩略图缓存预热后的约 160MB,随后在后续采样中保持稳定;这只是观测值,不是硬性上限。剪贴板账本会拆分文本、预览和元数据;磁盘缓存中的图片原图不计入驻留内存。持久化主要改变历史的生命周期和启动时恢复的条目,不会改变单条记录的 RAM 模型。不记录剪贴板内容或窗口画面。
-- **隐私**:debug 日志绝不记录具体按键。切换器的按键 tap 只记录 `Tab` / `Command` / `Option`(以及召唤组合名);其余按键一律记成 `Other` -- 不记键码、不记修饰位。
+- **内存诊断**:启动约 60 秒后先记录一行,之后每 5 分钟记录一行 `[mem]`,包含当前功能画像(`mouse:on|off`、`thumbs:on|off`、`clipboard:off|memory|persistent`)、进程 footprint/RSS、采样期间 footprint 峰值、线程数,以及缩略图/剪贴板/窗口账本的估算值。`footprint` 是 macOS 的 physical footprint 指标,对应活动监视器的「内存」列,是判断内存压力的主要数字;`rss` 是当前驻留内存,会随 macOS 压缩或回收页面而下降。`footprint_peak_sampled` 是应用采样得到的峰值,`rss_peak_kernel` 是内核记录的进程生命周期峰值。剪贴板账本会拆分文本、预览和元数据;磁盘缓存中的图片原图不计入驻留内存。持久化主要影响历史生命周期和启动时恢复的条目;单条记录的 RAM 模型保持不变。日志不包含剪贴板内容和窗口画面。
+- **隐私**:debug 日志只记录切换器按键 tap 中的 `Tab` / `Command` / `Option`(以及召唤组合名);其余按键一律记成 `Other`,不包含键码和修饰位。
 
 ## <img height="16" src="docs/icons/heart.svg">&nbsp;&nbsp;致谢
 

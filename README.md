@@ -32,10 +32,10 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 
 - <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names, window titles, one card per window.
 - <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab, Shift+Tab, arrow keys, or mouse after Command/Option.
-- <img height="14" src="docs/icons/zap.svg"> **Lightweight**: pure Rust — the current arm64 release executable is about 3.7 MB; observed physical footprint is about 80 MB after startup and 140–160 MB after thumbnails warm in a typical active session with thumbnails and persistent clipboard history enabled. The in-memory thumbnail cache is bounded at ~64 MB. No Electron/Tauri.
-- <img height="14" src="docs/icons/star.svg"> **Liquid Glass**: floating overlay (macOS 26; older macOS falls back to `NSVisualEffectView`).
+- <img height="14" src="docs/icons/zap.svg"> **Lightweight**: pure Rust with a bounded in-memory thumbnail cache — no Electron/Tauri runtime.
+- <img height="14" src="docs/icons/star.svg"> **Liquid Glass**: floating overlay using `NSGlassEffectView` when available, with an `NSVisualEffectView` fallback on older systems.
 - <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: caption row above a 16:10 live preview, captured via a private WindowServer API and cached in memory — cached frames render instantly, background refresh keeps them current; balanced centered rows when they fit, leading MRU rows fill first and scroll continuously when overflowing. Requires **Screen Recording** permission — without it the switcher falls back to icon-only cards. Turning thumbnails off immediately releases cached window frames from memory.
-- <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window never drags the app's others forward.
+- <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window keeps the app's other windows in their existing order.
 - <img height="14" src="docs/icons/eye.svg"> **Full window visibility**: every real window, including off-screen and minimized (toggleable).
 - <img height="14" src="docs/icons/gear.svg"> **Hot-reloadable TOML**: validated config from the menu.
 - <img height="14" src="docs/icons/globe.svg"> **Zero-dependency i18n**: English / Simplified / Traditional Chinese, live system-language follow.
@@ -77,10 +77,10 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 | Kind | What is stored | Paste behavior |
 |---|---|---|
 | **Text** | The copied text, held in memory | The text is written back and Cmd+V is synthesized |
-| **Image data** | An image copied inside an app (e.g. right-click → "Copy Image"): the original-format bytes are hashed and kept in a disk cache; only a downsampled thumbnail stays in RAM | The original bytes are written back under their original UTI — a JPG pastes back as JPG, an animated GIF as a GIF, never a PNG re-encode |
+| **Image data** | An image copied inside an app (e.g. right-click → "Copy Image"): the original-format bytes are hashed and kept in a disk cache; only a downsampled thumbnail stays in RAM | The original bytes are written back under their original UTI, preserving the format: JPG remains JPG and animated GIF remains GIF |
 | **Image file** | An image FILE copied in Finder (Cmd+C): read once at copy time for a content hash and a thumbnail, then the bytes are discarded — only the path is kept | `public.file-url` is restored (file semantics, like Windows Win+V / Maccy): Finder duplicates the file, chat apps attach it. If the source file has been deleted, the paste is skipped |
 
-> **Known v1 tradeoffs** — each entry records exactly one kind of content: a copy carrying **both text and an image** (e.g. copying an image from a web page) records only the text; **multiple-file copies and single non-image file copies are not recorded at all**. The same picture copied both as an image and as a file stays as two separate entries (they answer different paste semantics). Dedup is per-kind: text by exact content, images by content hash.
+> **Known v1 tradeoffs** — each entry records exactly one kind of content: a copy carrying **both text and an image** (e.g. copying an image from a web page) records only the text; **multiple-file copies and single non-image file copies are omitted from history**. The same picture copied both as an image and as a file stays as two separate entries (they answer different paste semantics). Dedup is per-kind: text by exact content, images by content hash.
 
 **Using an entry reorders the history by default** (like Maccy): selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top. The **"Move used entries to top"** switch in Settings turns this off (like Windows Win+V). The picker's "Clear all" keeps pinned entries. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note under [Configuration](#configuration).
 
@@ -88,17 +88,16 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 
 **Some background-app thumbnails may temporarily appear white**: WindowServer can only capture the surface an app currently provides. A long-suspended WebView app (for example, Clash Verge Rev) may return its title bar with a white content area, especially just after oh-my-tab starts with an empty in-memory thumbnail cache. Activating the app and allowing its content to redraw lets a later capture recover the preview.
 
-**Telegram's fullscreen image viewer has no separate thumbnail**: Telegram's media viewer is a special high-level floating window above its normal windows. To avoid treating it as a separate switchable window, oh-my-tab excludes it from the window list and thumbnail capture, so the switcher shows Telegram's main-window thumbnail rather than the image currently being viewed. This is a known limitation of the current version.
+**Telegram's fullscreen image viewer has no separate thumbnail**: Telegram's media viewer is a special high-level floating window above its normal windows. To avoid treating it as a separate switchable window, oh-my-tab excludes it from the window list and thumbnail capture. While the viewer is open, the switcher displays Telegram's main-window thumbnail. This is a known limitation of the current version.
 
-If windows are already open when the app starts, their initial ordering is seeded from WindowServer's front-to-back order. This is a useful approximation, but it is not guaranteed to match the native Cmd+Tab app order; live activation events refine the window-level MRU after launch.
+If windows are already open when the app starts, their initial ordering is seeded from WindowServer's front-to-back order. This provides an initial approximation; live activation events refine the window-level MRU after launch.
 
-**Device recognition caveats**: some exotic mice (e.g. ATK A9 SE, a Nearlink device) report an unexpected primary usage and appear as keyboards in System Settings; the device picker matches against the device's full HID usage pairs, so they are still recognized and configurable. Bluetooth keyboards whose HID descriptor fakes pointer usages are excluded via their Bluetooth GAP appearance. The picker refreshes live on plug/unplug and reconnect (plug events are debounced but never dropped).
 
-Dev-only issues (icon staleness under `cargo run`, mouse control under a debugger) are collected in [docs/developer-notes.md](docs/developer-notes.md).
+Development-only issues and raw-binary debugging notes are collected in [docs/developer-notes.md](docs/developer-notes.md).
 
 ## <img height="16" src="docs/icons/tools.svg">&nbsp;&nbsp;Requirements
 
-- macOS (developed on macOS 26; older versions supported via the `NSVisualEffectView` fallback, but availability is not guaranteed).
+- macOS 13+ on Apple Silicon.
 - **Accessibility** permission granted to the app.
 
 ## <img height="16" src="docs/icons/terminal.svg">&nbsp;&nbsp;Build & run
@@ -108,13 +107,14 @@ Dev-only issues (icon staleness under `cargo run`, mouse control under a debugge
 ### Development
 
 > ```sh
+> cargo fmt
 > cargo check       # fast type-check
-> cargo run         # build + run (takes over the global shortcut)
-> cargo clippy      # available, not wired into CI
+> cargo clippy
 > cargo test        # unit tests; add -- --ignored for the CG/AX smoke tests
+> ./scripts/dev-restart.sh  # build, sign, and launch the development .app
 > ```
 
-`cargo run` launches the raw binary in **dev mode**: logs go to both stdout and the log file, and launch-at-login is inactive (SMAppService needs a `.app` bundle). The unit-test suite runs headless by default; clipboard image/history fixtures use per-process, per-thread temporary directories rather than the user's cache. The **smoke tests** are marked `#[ignore]` — they exercise the real CG/AX stack and need a GUI session plus an Accessibility grant (run with `cargo test -- --ignored`).
+`scripts/dev-restart.sh` builds and assembles a separately signed development `.app`, then launches it through the per-user `launchd` domain. This keeps Accessibility and Screen Recording permissions associated with the development bundle and ensures the running process contains the latest build. The unit-test suite runs headless by default; clipboard image/history fixtures use isolated temporary directories per process and thread. The **smoke tests** are marked `#[ignore]` — they exercise the real CG/AX stack and need a GUI session plus an Accessibility grant (run with `cargo test -- --ignored`).
 
 ### Release `.app` + `.dmg`
 
@@ -127,7 +127,7 @@ Dev-only issues (icon staleness under `cargo run`, mouse control under a debugge
 `bundle.sh` now produces both `dist/Oh-My-Tab.dmg` and the Sparkle archive `dist/Oh-My-Tab.zip`. `release.sh` builds locally by default; it contacts R2 only when you explicitly pass `--push`:
 
 > ```sh
-> sh scripts/release.sh                    # build only; never contacts R2
+> sh scripts/release.sh                    # build only; R2 access is disabled
 > sh scripts/release.sh --push             # upload ZIP, DMG, then dist/appcast.xml
 > sh scripts/release.sh --push --dry-run  # print the upload plan only
 > ```
@@ -149,28 +149,26 @@ only when you intentionally want to rebuild before publishing.
 `--push` requires your prepared appcast (`dist/appcast.xml` for production or
 `dist/appcast-dev.xml` for development) and reads `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
 `R2_BUCKET`, and `R2_ENDPOINT` (or `R2_ACCOUNT_ID`) from the environment. The isolated publisher
-lives in `tools/r2-publisher` and never puts credentials in the app or command-line arguments.
+lives in `tools/r2-publisher` and keeps credentials out of the app and command-line arguments.
 The upload request always goes to the configured R2 S3 endpoint; `download.oh-my-tab.app` is only
 the public HTTPS base written into Sparkle URLs. `R2_PUBLIC_BASE_URL` changes the displayed/public
-URL base only and does not change the upload destination.
+URL base only; the upload destination remains the configured R2 endpoint.
 
 ### Sparkle automatic updates
 
 The About-page toggle and “Check for Updates” button are wired to Sparkle 2. The updater reads
 `SUFeedURL` from the app bundle; production uses `https://download.oh-my-tab.app/appcast.xml` and
 the dev release script uses `https://download.oh-my-tab.app/dev_release/appcast.xml`. This repository
-intentionally does not include either appcast, release archives, or the Sparkle private key;
+repository excludes both appcasts, release archives, and the Sparkle private key;
 publish those materials to the matching R2 channel later.
 
 Place Sparkle 2's `Sparkle.framework` at `vendor/Sparkle.framework` (or set `SPARKLE_FRAMEWORK_PATH`); `scripts/bundle.sh` and `scripts/dev-restart.sh` copy it into `Contents/Frameworks`. Without the framework the app still starts and the About page explains why update checks are unavailable. The scripts use a UTC timestamp for `CFBundleVersion` by default; set `SPARKLE_BUILD_VERSION` when a deterministic build number is needed. At release time, `SPARKLE_FEED_URL` overrides the feed URL and `SPARKLE_PUBLIC_ED_KEY` writes the appcast verification key into the bundle. Never commit or upload the private key.
 
-Build requirement distinction: `cargo build`, `cargo check`, and the test suite do not require
-Sparkle. A packaged app with working update checks does require the framework at the path above;
+Build requirement distinction: `cargo build`, `cargo check`, and the test suite work without
+Sparkle. A packaged app with working update checks requires the framework at the path above;
 generating appcasts additionally requires Sparkle's `bin/generate_keys` and
 `bin/generate_appcast` tools. The framework is intentionally ignored by Git, so each developer or
 CI job must provide the pinned Sparkle distribution locally.
-
-For reference, the current arm64 build measured 3,726,864 bytes for the unsigned release executable, 4,524,594 bytes of regular files inside the signed `.app`, and 3,080,950 bytes for the generated UDZO `.dmg`. These are build artifacts rather than size guarantees; source changes, the Rust toolchain, and signing can change them.
 
 ### Code signing
 
@@ -182,7 +180,7 @@ For reference, the current arm64 build measured 3,726,864 bytes for the unsigned
 
 If grants ever go stale (e.g. leftovers from old ad-hoc installs), clear them: `tccutil reset Accessibility com.eacryo.oh-my-tab`. A self-signed cert only stabilises TCC identity — it does **not** satisfy Gatekeeper for other users; that requires a paid Apple Developer ID certificate (set `SIGN_IDENTITY` in `scripts/bundle.sh`).
 
-For the full release pipeline (Homebrew cask generation, the signing rationale, icon regeneration), see [docs/releasing.md](docs/releasing.md). For architecture notes, see [AGENTS.md](AGENTS.md).
+For the full release pipeline (Homebrew cask generation, the signing rationale, icon regeneration), see [docs/releasing.md](docs/releasing.md).
 
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;Permissions & runtime caveats
 
@@ -194,7 +192,7 @@ For the full release pipeline (Homebrew cask generation, the signing rationale, 
 
 ## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;Configuration
 
-`~/.config/oh-my-tab/config.toml` — auto-created with defaults on first run. Loading is **per-field resilient**, not all-or-nothing: invalid fields fall back to defaults (logged, never fatal). Reloadable at runtime via the menu (*Reload Config*), which also re-applies theme and refreshes the overlay. The commonly edited keys:
+`~/.config/oh-my-tab/config.toml` — auto-created with defaults on first run. Loading is **per-field resilient**: invalid fields fall back to defaults and are logged, while the rest of the configuration remains active. Reloadable at runtime via the menu (*Reload Config*), which also re-applies theme and refreshes the overlay. The commonly edited keys:
 
 ```toml
 [appearance]
@@ -206,6 +204,9 @@ corner_radius = 32.0
 [layout]
 thumbnails_enabled = true  # window thumbnails on cards; off = icon-only cards
 card_text_size = 16.0      # card text size in points; thumbnail's left icon scales with it (8..=24)
+
+[fonts]
+status_bar_size = 16.0     # footer title text size in points; footer height follows it (8+)
 
 [keyboard]
 modifier = "command"     # "option" (Option+Tab) | "command" (Cmd+Tab)
@@ -234,7 +235,7 @@ max_entries = 50         # max history entries (1..=100)
 persist = false          # save history to disk so it survives restarts (see the privacy note below)
 auto_expire_days = 3     # unpinned entries expire after N days (memory AND disk); 0 = off
 pin_follow_selection = true # after pin/unpin, move the selection to the toggled entry (false = keep the current position)
-move_used_to_top = true  # pasting moves the used entry to the top (false = pasting never reorders, like Win+V)
+move_used_to_top = true  # pasting moves the used entry to the top (false = keep the current order, like Win+V)
 picker_position = "main" # picker position: "mouse" (follow the cursor) | "main" (centered on the main screen)
 show_source_app = false  # show the source app name in rows (the source is always recorded either way)
 
@@ -288,19 +289,19 @@ The advanced `[colors]` and `[fonts]` sections (card text colors and sizes per t
 > **not** enable persistence if you copy passwords, tokens, or other secrets. As a safeguard,
 > content marked with the standard `nspasteboard.org` "Securing Copy" markers
 > (`org.nspasteboard.ConcealedType` / `TransientType` / `AutoGeneratedType`, plus the
-> 1Password marker `com.agilebits.onepassword`) is **never recorded** — password managers
-> stamp these markers on password copies, so such content never reaches the history (memory
-> or disk) in the first place. Persistence is off by default.
+> 1Password marker `com.agilebits.onepassword`) is filtered from recording. Password managers
+> stamp these markers on password copies, keeping such content out of the history (memory and
+> disk). Persistence is off by default.
 
 Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). The button-mappings section lists bound rows (button name + action description + keycaps); clicking **Edit** opens an edit panel (same as LinearMouse): record the trigger side button, pick the action type (Default / None / Key Press / Mission Control / Launchpad / Show Desktop / App Expose), and record the combo for Key Press, then confirm. Toggling `mouse.enabled` takes effect immediately — no app restart needed.
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 
-- **Destination**: `cargo run` (dev) → both stdout **and** the log file; a packaged `.app` (prod) → log file only.
+- **Destination**: the development `.app` launched by `scripts/dev-restart.sh` and packaged `.app` builds write to the log file. A raw `cargo run` also writes to stdout and is reserved for low-level debugging.
 - **Default file path**: `~/Library/Logs/oh-my-tab/oh-my-tab-<startup-timestamp>.log` — one file **per app launch**. Files in the default directory older than 30 days are deleted at startup (no size-based rotation within a single run).
 - **Custom path**: `[logging] file_path` (edit `config.toml` directly; not exposed in Settings). A user-supplied path is used **verbatim**, in append mode — no timestamp is added and no cleanup is performed on it; rotation and retention are yours.
-- **Memory diagnostics**: after roughly 60 seconds, then every 5 minutes, the app records one `[mem]` line containing the active feature profile (`mouse:on|off`, `thumbs:on|off`, `clipboard:off|memory|persistent`), process footprint/RSS, sampled footprint peak, thread count, and estimated thumbnail/clipboard/window ledgers. `footprint` is the macOS physical-footprint metric used for the Activity Monitor Memory column and is the primary number for memory pressure; `rss` is current resident memory and can fall as macOS compresses or reclaims pages. `footprint_peak_sampled` is sampled by the app, while `rss_peak_kernel` is the kernel's lifetime high-water mark. In a recent arm64 session with thumbnails and persistent clipboard history enabled, footprint rose from 84 MB after startup to about 160 MB after the thumbnail cache warmed, then remained flat through the next samples; this is an observation, not a guaranteed limit. Clipboard memory is split into text, preview, and metadata estimates; original image bytes in the disk cache are not counted as resident memory. Persistence mainly changes history lifetime and startup restoration, not the per-entry RAM model. It does not record clipboard contents or window imagery.
-- **Privacy**: debug logs never record actual keystrokes. The switcher's key tap logs only `Tab` / `Command` / `Option` (and the summon combo name); every other key is logged as plain `Other` — no keycodes, no modifier details.
+- **Memory diagnostics**: after roughly 60 seconds, then every 5 minutes, the app records one `[mem]` line containing the active feature profile (`mouse:on|off`, `thumbs:on|off`, `clipboard:off|memory|persistent`), process footprint/RSS, sampled footprint peak, thread count, and estimated thumbnail/clipboard/window ledgers. `footprint` is the macOS physical-footprint metric used for the Activity Monitor Memory column and is the primary number for memory pressure; `rss` is current resident memory and can fall as macOS compresses or reclaims pages. `footprint_peak_sampled` is sampled by the app, while `rss_peak_kernel` is the kernel's lifetime high-water mark. Clipboard memory is split into text, preview, and metadata estimates; original image bytes in the disk cache are not counted as resident memory. Persistence mainly changes history lifetime and startup restoration; the per-entry RAM model remains the same. Clipboard contents and window imagery are excluded from the log.
+- **Privacy**: debug logs record only `Tab` / `Command` / `Option` (and the summon combo name) from the switcher's key tap; every other key is logged as plain `Other`, without keycodes or modifier details.
 
 ## <img height="16" src="docs/icons/heart.svg">&nbsp;&nbsp;Credits
 
