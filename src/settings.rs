@@ -3650,6 +3650,40 @@ unsafe fn reposition_traffic_lights(window: *mut AnyObject) {
     }
 }
 
+/// 将设置窗口居中到当前鼠标所在屏幕的可用区域,排除菜单栏和 Dock。
+/// Center the settings window in the visible area of the screen under the cursor, excluding the
+/// menu bar and Dock.
+unsafe fn center_settings_window(window: *mut AnyObject) {
+    let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    let count: usize = msg_send![screens, count];
+    let mut visible_frame: Option<NSRect> = None;
+
+    for i in 0..count {
+        let screen: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
+        let frame: NSRect = msg_send![screen, frame];
+        if cursor.x >= frame.origin.x
+            && cursor.x <= frame.origin.x + frame.size.width
+            && cursor.y >= frame.origin.y
+            && cursor.y <= frame.origin.y + frame.size.height
+        {
+            visible_frame = Some(msg_send![screen, visibleFrame]);
+            break;
+        }
+    }
+
+    let visible = visible_frame.unwrap_or_else(|| {
+        let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+        msg_send![main, visibleFrame]
+    });
+    let window_frame: NSRect = msg_send![window, frame];
+    let origin = NSPoint::new(
+        visible.origin.x + (visible.size.width - window_frame.size.width) / 2.0,
+        visible.origin.y + (visible.size.height - window_frame.size.height) / 2.0,
+    );
+    let _: () = msg_send![window, setFrameOrigin: origin];
+}
+
 fn show_settings() {
     unsafe {
         {
@@ -3671,6 +3705,7 @@ fn show_settings() {
             crate::set_settings_activation_policy(true);
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
+            center_settings_window(u.window);
             let _: () = msg_send![u.window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
             // 红绿灯偏移:必须等窗口完成首次布局后再移动,否则会被 AppKit 重置。
             // Offset the traffic lights only after the window's first layout pass, or AppKit
