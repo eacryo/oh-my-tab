@@ -95,7 +95,13 @@ pub fn init(config: &LogConfig, is_dev: bool) {
     LOG_LEVEL.store(config.level as usize, Ordering::Relaxed);
 
     let file_path = resolve_file_path(config);
-    std::thread::spawn(move || writer_loop(rx, is_dev, file_path));
+    std::thread::Builder::new()
+        .name("log-writer".into())
+        .spawn(move || {
+            crate::performance::set_current_thread_qos(crate::performance::ThreadQos::Background);
+            writer_loop(rx, is_dev, file_path);
+        })
+        .expect("spawn log-writer thread");
     // stderr 重定向到日志管线:NSLog/AppKit 警告(如 Menu_Tracking 内部消息)、
     // panic 等系统输出都走 stderr,不捕获就会漏掉(只出现在终端/统一日志里)。
     // Redirect stderr into the log pipeline: system output like NSLog/AppKit warnings
@@ -172,7 +178,15 @@ fn capture_stderr() {
             return;
         }
         let _ = close(write_fd);
-        std::thread::spawn(move || stderr_reader(read_fd));
+        std::thread::Builder::new()
+            .name("stderr-reader".into())
+            .spawn(move || {
+                crate::performance::set_current_thread_qos(
+                    crate::performance::ThreadQos::Background,
+                );
+                stderr_reader(read_fd);
+            })
+            .expect("spawn stderr-reader thread");
     }
 }
 

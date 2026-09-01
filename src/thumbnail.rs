@@ -872,6 +872,7 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
         std::thread::Builder::new()
             .name("thumb-capture".into())
             .spawn(move || {
+                crate::performance::set_current_thread_qos(crate::performance::ThreadQos::Utility);
                 log_debug!("[thumb] capture worker online");
                 for () in rx.iter() {
                     let Some(job) = CAPTURE_STATE.lock().unwrap().take_next() else {

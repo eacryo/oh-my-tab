@@ -11,6 +11,7 @@ mod mem;
 mod menu;
 mod mouse;
 mod overlay;
+mod performance;
 mod settings;
 mod theme;
 mod thumbnail;
@@ -310,6 +311,13 @@ fn start_window_refresh(request: WindowRefreshRequest) {
     thread::Builder::new()
         .name("window-refresh".into())
         .spawn(move || {
+            performance::set_current_thread_qos(match request {
+                WindowRefreshRequest::Full(WindowRefreshReason::Summon) => {
+                    performance::ThreadQos::UserInitiated
+                }
+                WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle)
+                | WindowRefreshRequest::Focused { .. } => performance::ThreadQos::Utility,
+            });
             let started = std::time::Instant::now();
             let mut mru = mru;
             let (windows, replace_pid, active_key, summon_focus_key) = match request {
@@ -877,6 +885,7 @@ fn start_activation_focus_scheduler() {
         thread::Builder::new()
             .name(format!("activation-focus-{worker}"))
             .spawn(move || {
+                performance::set_current_thread_qos(performance::ThreadQos::Utility);
                 while let Ok(task) = rx.recv() {
                     resolve_activation_focus(task);
                 }
@@ -976,26 +985,30 @@ extern "C" fn on_app_launched(_self: *mut c_void, _cmd: Sel, notification: *mut 
     if pid <= 0 {
         return;
     }
-    thread::spawn(move || unsafe {
-        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-        match extract_icon_to_cache(pid) {
-            Some(_) => log_debug!("app-launch icon cached: pid={}", pid),
-            None => {
-                // 刚启动瞬间 AppKit 的 icon 可能尚未就绪(app.icon 返回 nil),导致
-                // 提取失败且无缓存留下——之后浮窗显示字母占位。延迟 ~1s 重试一次。
-                // The icon may not be ready the instant the app launches (app.icon nil),
-                // silently failing the extract and leaving the letter placeholder in the
-                // switcher. Retry once after ~1s.
-                log_debug!(
-                    "app-launch icon extract failed for pid={}, retrying in 1s",
-                    pid
-                );
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let _ = extract_icon_to_cache(pid);
+    thread::Builder::new()
+        .name("app-launch-icon".into())
+        .spawn(move || unsafe {
+            performance::set_current_thread_qos(performance::ThreadQos::Utility);
+            let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+            match extract_icon_to_cache(pid) {
+                Some(_) => log_debug!("app-launch icon cached: pid={}", pid),
+                None => {
+                    // 刚启动瞬间 AppKit 的 icon 可能尚未就绪(app.icon 返回 nil),导致
+                    // 提取失败且无缓存留下——之后浮窗显示字母占位。延迟 ~1s 重试一次。
+                    // The icon may not be ready the instant the app launches (app.icon nil),
+                    // silently failing the extract and leaving the letter placeholder in the
+                    // switcher. Retry once after ~1s.
+                    log_debug!(
+                        "app-launch icon extract failed for pid={}, retrying in 1s",
+                        pid
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let _ = extract_icon_to_cache(pid);
+                }
             }
-        }
-        let _: () = msg_send![pool, drain];
-    });
+            let _: () = msg_send![pool, drain];
+        })
+        .expect("spawn app-launch-icon thread");
     // 缩略图:给新启动的 App 安装 AXObserver 并预生成其既有窗口。
     // Thumbnails: install the new app's AXObserver and pre-generate its windows.
     thumbnail::app_launched(pid);
@@ -2349,26 +2362,30 @@ fn main() {
     mem::start();
 
     // Bridge thread: flume events → main thread via performSelectorOnMainThread
-    thread::spawn(move || {
-        while let Ok(event) = event_rx.recv() {
-            let action = match event {
-                GlobalEvent::CmdTabPressed => sel!(handleCmdTabPressed:),
-                GlobalEvent::CmdShiftTabPressed => sel!(handleCmdShiftTabPressed:),
-                GlobalEvent::CmdReleased => sel!(handleCmdReleased:),
-                GlobalEvent::ClipboardToggled => sel!(onClipboardToggled:),
-            };
-            // Read controller pointer from static (only written once, safe to read)
-            let ctrl = CONTROLLER.lock().unwrap().unwrap().0;
-            unsafe {
-                let _: () = msg_send![ctrl,
-                    performSelectorOnMainThread: action,
-                    withObject: std::ptr::null::<AnyObject>(),
-                    waitUntilDone: false
-                ];
+    thread::Builder::new()
+        .name("global-event-bridge".into())
+        .spawn(move || {
+            performance::set_current_thread_qos(performance::ThreadQos::UserInteractive);
+            while let Ok(event) = event_rx.recv() {
+                let action = match event {
+                    GlobalEvent::CmdTabPressed => sel!(handleCmdTabPressed:),
+                    GlobalEvent::CmdShiftTabPressed => sel!(handleCmdShiftTabPressed:),
+                    GlobalEvent::CmdReleased => sel!(handleCmdReleased:),
+                    GlobalEvent::ClipboardToggled => sel!(onClipboardToggled:),
+                };
+                // Read controller pointer from static (only written once, safe to read)
+                let ctrl = CONTROLLER.lock().unwrap().unwrap().0;
+                unsafe {
+                    let _: () = msg_send![ctrl,
+                        performSelectorOnMainThread: action,
+                        withObject: std::ptr::null::<AnyObject>(),
+                        waitUntilDone: false
+                    ];
+                }
             }
-        }
-        log_info!("Bridge thread exiting.");
-    });
+            log_info!("Bridge thread exiting.");
+        })
+        .expect("spawn global-event-bridge thread");
 
     // 冒烟测试入口(--smoke-overlay):完整初始化后直接驱动召唤路径，再遍历并循环
     // 一次窗口列表并反向一步，覆盖超量布局的连续滚动/双向回绕；随后泵 2 秒主 runloop 让异步

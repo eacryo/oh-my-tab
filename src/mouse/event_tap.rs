@@ -310,6 +310,7 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         | (1u64 << K_CG_EVENT_SCROLL_WHEEL);
 
     thread::spawn(move || unsafe {
+        crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
         // 新线程首件事:清掉上次运行可能残留的停止标志。
         // First thing in the new thread: clear any stale stop flag from a previous run.
         STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);

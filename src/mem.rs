@@ -207,6 +207,7 @@ pub(crate) fn start() {
     thread::Builder::new()
         .name("mem-sampler".into())
         .spawn(|| {
+            crate::performance::set_current_thread_qos(crate::performance::ThreadQos::Background);
             let started_at = Instant::now();
             // Seed the sampled footprint peak before the delayed baseline, so the peak
             // column does not silently ignore the first minute of initialization.

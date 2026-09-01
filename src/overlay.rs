@@ -1063,6 +1063,7 @@ fn step_switcher(backward: bool) {
         // snapshot is ready (single-shot render). NB: the refresh must be kicked off AFTER dropping
         // TAB_STATE, otherwise request_window_refresh re-locks it and deadlocks the main thread.
         drop(state_opt);
+        crate::performance::begin_switcher_activity();
         request_window_refresh();
         let mut state_opt = TAB_STATE.lock().unwrap();
         let state = state_opt.as_mut().unwrap();
@@ -1792,6 +1793,7 @@ fn commit_selected_window(overlay_was_visible: bool) {
         }
     }
     state.visible = false;
+    crate::performance::end_switcher_activity();
 }
 
 // --- Card View ---
@@ -2912,6 +2914,7 @@ pub(crate) fn hide_overlay() {
             let _: () = msg_send![window.0, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
+    crate::performance::end_switcher_activity();
     // 设置窗口从不被 stash/restore:nonactivating 面板不激活 app,设置窗口全程留在
     // 原位(z-order 不受召唤影响),切换器只负责收它作卡片与抬起目标窗口。
     // The settings window is never stashed/restored: the nonactivating panel never activates

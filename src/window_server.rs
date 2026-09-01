@@ -208,6 +208,7 @@ pub(crate) fn start() {
     std::thread::Builder::new()
         .name("window-server-events".into())
         .spawn(move || {
+            crate::performance::set_current_thread_qos(crate::performance::ThreadQos::Utility);
             while let Ok(event) = receiver.recv() {
                 MAIN_EVENTS.lock().unwrap().push_back(event);
                 schedule_main_delivery();

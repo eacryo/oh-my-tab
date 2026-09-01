@@ -408,6 +408,7 @@ pub(crate) fn start_event_tap_thread(
     on_started: impl FnOnce() + Send + 'static,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || unsafe {
+        crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
         let tap = create_tap_with_retry(
             location,
             placement,
