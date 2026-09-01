@@ -3590,23 +3590,26 @@ fn apply_config_refresh() {
     update_status_label();
 }
 
-/// 红绿灯偏移常量:把系统红绿灯往右下挪一点,与左侧玻璃卡片对齐。
-/// 窗口坐标 y 向上,右下 = x 增大 / y 减小。
-/// Traffic-light offset: nudge the standard buttons down-right to align with the glass card.
-/// Window coordinates point up, so down-right = x+ / y-.
+/// 红绿灯偏移常量:让最左侧红绿灯与下方品牌标题的首字母左边缘对齐。
+/// 窗口坐标 y 向上,上移 = y 增大。
+/// Traffic-light offset: align the left edge of the first button with the first letter of the
+/// brand title below. Window coordinates point up, so upward = y+.
 const TRAFFIC_LIGHT_DX: f64 = 8.0;
-const TRAFFIC_LIGHT_DY: f64 = -6.0;
+const TRAFFIC_LIGHT_DY: f64 = 4.0;
+static TRAFFIC_LIGHT_BASE_ORIGINS: LazyLock<Mutex<HashMap<usize, [Option<NSPoint>; 3]>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 把三个红绿灯按钮往右下偏移:通过公开 API standardWindowButton: 拿到按钮视图直接改 frame
+/// 把三个红绿灯按钮往左上偏移:通过公开 API standardWindowButton: 拿到按钮视图直接改 frame
 /// (没有公开 API 直接设红绿灯位置,旧私有 API setTrafficLightPosition: 等在 macOS 26 已移除,
 /// 实测这是唯一可靠的做法)。
 /// 注意:两参的 +standardWindowButton:forStyleMask: 是类方法,发给实例会被 objc2 的方法
 /// 检查拦截崩掉(此前踩过的坑);必须用一参的实例方法 -standardWindowButton:。
 /// 必须在窗口完成首次布局之后调用 —— 布局前移动会被 AppKit 重置;resize 也会重置,
 /// 所以每次 show 和 resize 后都要重放(见 show_settings 与 resizeSubviewsWithOldSize:)。
+/// 首次布局时记录系统原始坐标,后续始终从原始坐标计算,避免重复 show/resize 时累积偏移。
 /// 按钮为 nil 时静默跳过,旧版 macOS 同样适用。
 ///
-/// Nudge the three traffic-light buttons down-right: grab the button views via the public
+/// Nudge the three traffic-light buttons up-left: grab the button views via the public
 /// -standardWindowButton: and move their frames (no public API sets the traffic light position;
 /// the old private setTrafficLightPosition: etc. are gone on macOS 26, and this is the only
 /// reliable way -- verified on this machine). Note: the two-arg +standardWindowButton:forStyleMask:
@@ -3614,19 +3617,36 @@ const TRAFFIC_LIGHT_DY: f64 = -6.0;
 /// we hit) -- the one-arg instance method -standardWindowButton: must be used. Must run after the
 /// window's first layout pass: moves before layout are reset by AppKit, and resize also resets
 /// them, so the offset is re-applied on every show and resize (see show_settings and
-/// resizeSubviewsWithOldSize:). Skips silently when a button is nil; works on older macOS too.
+/// resizeSubviewsWithOldSize:). Original positions are captured once per window so repeated
+/// calls remain idempotent instead of accumulating the offset. Skips silently when a button is
+/// nil; works on older macOS too.
 unsafe fn reposition_traffic_lights(window: *mut AnyObject) {
     // NSWindowButton: Close=0, Miniaturize=1, Zoom=2
+    let base_origins = {
+        let mut all_origins = TRAFFIC_LIGHT_BASE_ORIGINS.lock().unwrap();
+        let origins = all_origins
+            .entry(window as usize)
+            .or_insert([None, None, None]);
+        for tag in 0..3isize {
+            let btn: *mut AnyObject = msg_send![window, standardWindowButton: tag];
+            if !btn.is_null() && origins[tag as usize].is_none() {
+                let f: NSRect = msg_send![btn, frame];
+                origins[tag as usize] = Some(f.origin);
+            }
+        }
+        *origins
+    };
     for tag in 0..3isize {
         let btn: *mut AnyObject = msg_send![window, standardWindowButton: tag];
-        if btn.is_null() {
-            continue;
+        if let (false, Some(base_origin)) = (btn.is_null(), base_origins[tag as usize]) {
+            let _: () = msg_send![
+                btn,
+                setFrameOrigin: NSPoint::new(
+                    base_origin.x + TRAFFIC_LIGHT_DX,
+                    base_origin.y + TRAFFIC_LIGHT_DY
+                )
+            ];
         }
-        let f: NSRect = msg_send![btn, frame];
-        let _: () = msg_send![
-            btn,
-            setFrameOrigin: NSPoint::new(f.origin.x + TRAFFIC_LIGHT_DX, f.origin.y + TRAFFIC_LIGHT_DY)
-        ];
     }
 }
 
@@ -6036,6 +6056,10 @@ pub(crate) fn invalidate_settings_window() {
     if let Some(u) = ui {
         unsafe {
             close_glass_tint_panel(u.glass_tint);
+            TRAFFIC_LIGHT_BASE_ORIGINS
+                .lock()
+                .unwrap()
+                .remove(&(u.window as usize));
             // 窗口 alloc 是 +1且 setReleasedWhenClosed:false,需手动 release 一次;
             // 其子控件已由父视图持有,随窗口 dealloc 释放。
             // The window is alloc +1 with setReleasedWhenClosed:false, so release once manually;
