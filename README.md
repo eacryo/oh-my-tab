@@ -90,8 +90,6 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 
 **Telegram's fullscreen image viewer has no separate thumbnail**: Telegram's media viewer is a special high-level floating window above its normal windows. To avoid treating it as a separate switchable window, oh-my-tab excludes it from the window list and thumbnail capture, so the switcher shows Telegram's main-window thumbnail rather than the image currently being viewed. This is a known limitation of the current version.
 
-**Closing a window brings the same app's other window forward (macOS-native)**: closing the frontmost window of the active app makes macOS activate the app's remaining window — e.g. closing a Chrome incognito window brings the regular Chrome window to the front. oh-my-tab receives no event at that moment and does nothing; the next summon merely reflects the real frontmost window. This is identical to the behavior of the system Cmd+Tab.
-
 If windows are already open when the app starts, their initial ordering is seeded from WindowServer's front-to-back order. This is a useful approximation, but it is not guaranteed to match the native Cmd+Tab app order; live activation events refine the window-level MRU after launch.
 
 **Device recognition caveats**: some exotic mice (e.g. ATK A9 SE, a Nearlink device) report an unexpected primary usage and appear as keyboards in System Settings; the device picker matches against the device's full HID usage pairs, so they are still recognized and configurable. Bluetooth keyboards whose HID descriptor fakes pointer usages are excluded via their Bluetooth GAP appearance. The picker refreshes live on plug/unplug and reconnect (plug events are debounced but never dropped).
