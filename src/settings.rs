@@ -1382,34 +1382,200 @@ unsafe fn make_popup(
     popup
 }
 
-/// 原生 toggle switch(NSSwitch,开启蓝色/关闭灰色,系统设置同款)。
-/// alloc +1,加入父视图后由调用方 release。
-/// Native toggle switch (NSSwitch: blue when on, grey when off; same as System Settings).
-/// alloc +1; caller releases after adding to parent.
-/// 参数 right_x = 开关的右边界:所有开关右对齐到该边界,与下拉框(popup)的右缘
-/// (ctrl_x + ctrl_w)保持一致,开关行不再左对齐。
-/// The right_x parameter is the switch's RIGHT edge: every switch right-aligns to it, matching
-/// the popups' right edge (ctrl_x + ctrl_w), so switch rows no longer left-align.
+const HTML_SWITCH_W: f64 = 38.0;
+const HTML_SWITCH_H: f64 = 22.0;
+const HTML_SWITCH_KNOB_D: f64 = 18.0;
+const HTML_SWITCH_TRAILING_INSET: f64 = 15.0;
+
+struct HtmlSwitchClass(*mut AnyObject);
+unsafe impl Send for HtmlSwitchClass {}
+unsafe impl Sync for HtmlSwitchClass {}
+
+static HTML_SWITCH_CLASS: OnceLock<HtmlSwitchClass> = OnceLock::new();
+
+unsafe fn html_switch_apply_visual(button: *mut AnyObject, previous_state: Option<isize>) {
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if layer.is_null() {
+        return;
+    }
+    let state: isize = msg_send![button, state];
+    let enabled: bool = msg_send![button, isEnabled];
+    let track_hex = if state != 0 {
+        if enabled {
+            0x0A84FFFF
+        } else {
+            0x0A84FF73
+        }
+    } else if enabled {
+        0xC7C7CCFF
+    } else {
+        0xC7C7CC73
+    };
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(track_hex));
+    let _: () = msg_send![layer, setCornerRadius: HTML_SWITCH_H / 2.0];
+    let _: () = msg_send![layer, setMasksToBounds: false];
+
+    let sublayers: *mut AnyObject = msg_send![layer, sublayers];
+    let count: usize = if sublayers.is_null() {
+        0
+    } else {
+        msg_send![sublayers, count]
+    };
+    let knob: *mut AnyObject = if count > 0 {
+        msg_send![sublayers, objectAtIndex: 0usize]
+    } else {
+        let knob: *mut AnyObject = msg_send![class!(CALayer), layer];
+        crate::ffi::layer_set_background(knob, crate::ffi::hex_to_cg_color(0xFFFFFFF5));
+        let _: () = msg_send![knob, setCornerRadius: HTML_SWITCH_KNOB_D / 2.0];
+        let _: () = msg_send![layer, addSublayer: knob];
+        knob
+    };
+    let knob_y = (HTML_SWITCH_H - HTML_SWITCH_KNOB_D) / 2.0;
+    let to_x = if state != 0 {
+        HTML_SWITCH_W - HTML_SWITCH_KNOB_D - 2.0
+    } else {
+        2.0
+    };
+    let from_x = previous_state.map(|previous| {
+        if previous != 0 {
+            HTML_SWITCH_W - HTML_SWITCH_KNOB_D - 2.0
+        } else {
+            2.0
+        }
+    });
+    let _: () = msg_send![
+        knob,
+        setFrame: NSRect::new(
+            NSPoint::new(to_x, knob_y),
+            NSSize::new(HTML_SWITCH_KNOB_D, HTML_SWITCH_KNOB_D)
+        )
+    ];
+
+    if let Some(from_x) = from_x.filter(|x| *x != to_x) {
+        let key_path = make_nsstring("position.x");
+        let animation: *mut AnyObject = msg_send![
+            class!(CABasicAnimation),
+            animationWithKeyPath: key_path
+        ];
+        CFRelease(key_path as *const c_void);
+        let from_value: *mut AnyObject =
+            msg_send![class!(NSNumber), numberWithDouble: from_x + HTML_SWITCH_KNOB_D / 2.0];
+        let to_value: *mut AnyObject =
+            msg_send![class!(NSNumber), numberWithDouble: to_x + HTML_SWITCH_KNOB_D / 2.0];
+        let _: () = msg_send![animation, setFromValue: from_value];
+        let _: () = msg_send![animation, setToValue: to_value];
+        let _: () = msg_send![animation, setDuration: 0.18f64];
+        let animation_key = make_nsstring("html-switch-position");
+        let _: () = msg_send![knob, addAnimation: animation, forKey: animation_key];
+        CFRelease(animation_key as *const c_void);
+    }
+}
+
+extern "C" fn html_switch_set_state(this: *mut c_void, _cmd: Sel, state: isize) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let previous_state: isize = msg_send![button, state];
+        #[repr(C)]
+        struct ObjcSuper {
+            receiver: *mut c_void,
+            super_class: *mut c_void,
+        }
+        extern "C" {
+            fn objc_msgSendSuper();
+        }
+        type SetState = unsafe extern "C" fn(*mut ObjcSuper, Sel, isize);
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        let send: SetState = std::mem::transmute(objc_msgSendSuper as *const ());
+        send(&mut sup, sel!(setState:), state);
+        html_switch_apply_visual(button, (previous_state != state).then_some(previous_state));
+    }
+}
+
+/// The switch is rendered entirely by its layer, so toggle the state and dispatch the action
+/// explicitly instead of relying on the hidden NSButtonCell drawing/tracking state.
+/// 自绘开关由 Layer 完成视觉呈现,点击时显式切换状态并分发 Action,不依赖隐藏的 Cell 跟踪状态。
+extern "C" fn html_switch_mouse_down(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let enabled: bool = msg_send![button, isEnabled];
+        if !enabled {
+            return;
+        }
+
+        let current: isize = msg_send![button, state];
+        let next = if current == 0 { 1isize } else { 0isize };
+        let _: () = msg_send![button, setState: next];
+
+        // Most settings switches only need their state collected when OK is pressed. The two
+        // switches with live behavior have an explicit target/action; dispatch those here.
+        // 大多数设置开关在点击 OK 时统一读取状态,只有需要实时生效的开关绑定了 target/action。
+        let target: *mut AnyObject = msg_send![button, target];
+        if !target.is_null() {
+            let action: Sel = msg_send![button, action];
+            let _: bool = msg_send![button, sendAction: action, to: target];
+        }
+    }
+}
+
+fn html_switch_class() -> *mut AnyObject {
+    HTML_SWITCH_CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabHtmlSwitch").unwrap();
+            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let state_types = CString::new("v@:q").unwrap();
+            class_addMethod(
+                cls,
+                sel!(setState:),
+                html_switch_set_state as *mut c_void,
+                state_types.as_ptr(),
+            );
+            let mouse_types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseDown:),
+                html_switch_mouse_down as *mut c_void,
+                mouse_types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            HtmlSwitchClass(cls)
+        })
+        .0
+}
+
+/// HTML reference switch implemented as a custom-drawn NSButton.
+/// alloc +1; caller releases after adding to the parent view.
+/// 参数 right_x = 控件列的右边界;开关按参考页面的 15pt 行内右边距向左收进。
+/// The right_x parameter is the control column's right edge; the switch keeps the reference
+/// page's 15pt trailing row inset.
 unsafe fn make_switch(right_x: f64, y: f64, h: f64, checked: bool) -> *mut AnyObject {
-    let sw: *mut AnyObject = msg_send![class!(NSSwitch), alloc];
+    let switch_right_x = right_x - HTML_SWITCH_TRAILING_INSET;
+    let sw: *mut AnyObject = msg_send![html_switch_class(), alloc];
     let sw: *mut AnyObject =
         msg_send![sw, initWithFrame: NSRect::new(NSPoint::new(right_x, y), NSSize::new(0.0, 0.0))];
-    // Use the regular 38x22 switch from the reference instead of the undersized compact variant.
-    // fittingSize gives the native size and the frame is then vertically centered in the row.
-    let _: () = msg_send![sw, setControlSize: 0isize]; // NSControlSizeRegular
-    let fs: NSSize = msg_send![sw, fittingSize];
-    let (sw_w, sw_h) = if fs.width > 0.0 {
-        (fs.width, fs.height)
-    } else {
-        (30.0, 19.0)
-    };
+    let _: () = msg_send![sw, setButtonType: 1isize]; // NSButtonTypePushOnPushOff
+    let empty_title = make_nsstring("");
+    let _: () = msg_send![sw, setTitle: empty_title];
+    CFRelease(empty_title as *const c_void);
+    let _: () = msg_send![sw, setBordered: false];
     let _: () = msg_send![
         sw,
         setFrame: NSRect::new(
-            NSPoint::new(right_x - sw_w, y + (h - sw_h) / 2.0),
-            NSSize::new(sw_w, sw_h)
+            NSPoint::new(
+                switch_right_x - HTML_SWITCH_W,
+                y + (h - HTML_SWITCH_H) / 2.0,
+            ),
+            NSSize::new(HTML_SWITCH_W, HTML_SWITCH_H)
         )
     ];
+    let _: () = msg_send![sw, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![sw, layer];
+    if !layer.is_null() {
+        html_switch_apply_visual(sw, None);
+    }
     let _: () = msg_send![sw, setState: if checked { 1isize } else { 0isize }];
     sw
 }
@@ -5269,7 +5435,7 @@ fn create_settings_window() {
         y -= 8.0 + described_row_h;
         add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
         // show_minimized 开关(切换器语义本就只有显/隐两态,用 Toggle 比下拉更直观)。
-        // 英文标签较长,该行标签加宽;开关仍与 popup 右缘对齐。
+        // 英文标签较长,该行标签加宽;开关保留参考页面的右侧内边距。
         // show_minimized is inherently two-state, so a toggle is clearer than a popup. The long
         // English label uses a wider label column, while the switch stays aligned to the popups.
         ui.show_minimized = add_tall_row(
@@ -5555,9 +5721,9 @@ fn create_settings_window() {
             content_w - 2.0 * label_x,
         );
         y -= 8.0 + described_row_h;
-        // reverse_scroll 开关:标题+副标题描述滚动方向,开关右对齐到 popup 右缘。
+        // reverse_scroll 开关:标题+副标题描述滚动方向,开关保留右侧内边距。
         // reverse_scroll switch: title + subtitle describe the scroll inversion; the switch
-        // right-aligns to the popups' right edge.
+        // keeps the reference page's trailing inset.
         ui.reverse_scroll = add_described_row(
             mouse_view,
             label_x,
@@ -5588,10 +5754,10 @@ fn create_settings_window() {
         );
         y -= 8.0 + described_row_h;
         // disable_pointer_accel 开关:禁用系统鼠标加速,光标 1:1 线性跟踪。
-        // 副标题说明线性跟踪的用途;开关与所有开关行一样右对齐到 popup 右缘。
+        // 副标题说明线性跟踪的用途;开关与所有开关行一样保留右侧内边距。
         // disable_pointer_accel switch: disable system pointer acceleration for 1:1 linear
-        // cursor tracking. The subtitle explains linear tracking; the switch right-aligns to
-        // the popups' right edge (ctrl_x + ctrl_w), like every other switch row.
+        // cursor tracking. The subtitle explains linear tracking; the switch keeps the same
+        // trailing inset as every other switch row.
         ui.disable_pointer_accel = add_described_row(
             mouse_view,
             label_x,
@@ -5832,13 +5998,12 @@ fn create_settings_window() {
         // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。
         // 中文标签"保存剪贴板历史记录到磁盘"(11 字)与英文 "Save clipboard history
         // to disk" 都超出默认 label_w=150(渲染截断),该行加宽到 225——与
-        // show_minimized 行同款处理;开关仍右对齐到 popup 右缘,不重叠。
+        // show_minimized 行同款处理;开关保留右侧内边距,避免与边缘重叠。
         // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
         // privacy implications are documented in the README). The Chinese (11 CJK
         // chars) and English labels both exceed the default label_w=150 (rendered
         // truncated), so this row widens its label to 225 -- same as the
-        // show_minimized row; the switch still right-aligns to the popups' right
-        // edge, no overlap.
+        // show_minimized row; the switch keeps the trailing inset and stays clear of the edge.
         ui.clipboard_persist = add_row(
             clipboard_view,
             label_x,
