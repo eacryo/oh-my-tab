@@ -1784,7 +1784,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
         );
         let effective_raise_err = raise_retry_err.unwrap_or(raise_first_err);
         if effective_raise_err != K_AX_INVALID_UI_ELEMENT {
-            log_info!(
+            log_debug!(
                 "[raise] ax raised cached: pid={} cgwid={} known_minimized={} set_minimized={:?} raise_first={} set_focused={:?} raise_retry={:?} app_create_us={} waited={}ms total={}ms",
                 job.pid,
                 job.cgwid,
@@ -1876,7 +1876,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
                 job.generation,
             );
             matched = true;
-            log_info!(
+            log_debug!(
                 "[raise] ax raised refreshed: pid={} cgwid={} ax_windows={} known_minimized={} set_minimized={:?} raise_first={} set_focused={:?} raise_retry={:?} app_create_us={} waited={}ms total={}ms",
                 job.pid,
                 job.cgwid,
@@ -2742,11 +2742,10 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                     // Pair miss: the CG window has no AX counterpart (a popup, or AX
                     // failed to report it). Logged to pin the Settings-window flicker.
                     log_debug!(
-                        "[collect] ax pair-miss: pid={} app=\"{}\" cgwid={} cg_title=\"{}\" {:.0}x{:.0} -> dropped",
+                        "[collect] ax pair-miss: pid={} app=\"{}\" cgwid={} {:.0}x{:.0} -> dropped",
                         owner_pid,
                         owner_name,
                         cgwid,
-                        cg_title,
                         bounds.2,
                         bounds.3
                     );
@@ -2882,12 +2881,11 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             ) {
                 let layer = cg_window_layers.get(&(pid, cgwid)).copied();
                 log_debug!(
-                    "[collect] ax-only skipped non-normal layer: pid={} app=\"{}\" cgwid={} layer={:?} title=\"{}\"",
+                    "[collect] ax-only skipped non-normal layer: pid={} app=\"{}\" cgwid={} layer={:?}",
                     pid,
                     pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
                     cgwid,
-                    layer,
-                    title
+                    layer
                 );
                 continue;
             }
@@ -2911,11 +2909,10 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             insertion_order += 1;
             let icon_path = icon_ids.get(&pid).and_then(check_cache_for_identity);
             log_debug!(
-                "[collect] ax-only window restored: pid={} app=\"{}\" cgwid={} title=\"{}\"",
+                "[collect] ax-only window restored: pid={} app=\"{}\" cgwid={}",
                 pid,
                 pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
-                cgwid,
-                title
+                cgwid
             );
             windows.push(WindowInfo {
                 pid,
@@ -3042,33 +3039,11 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         }
         if let Some((pid, cgwid)) = frontmost {
             mru.insert((pid, cgwid), now);
-            let w = windows
-                .iter()
-                .find(|w| w.pid == pid && w.window_id == cgwid);
-            log_debug!(
-                "summon-bump frontmost: pid={} app=\"{}\" cgwid={} title=\"{}\"",
-                pid,
-                w.map_or("?", |w| w.app_name.as_str()),
-                cgwid,
-                w.map_or("?", |w| w.window_title.as_str()),
-            );
         } else if let Some((pid, cgwid)) = frontmost_fallback(&windows, front_pid) {
             // 回退严格限制在系统前台 App 内,避免 AX 失败时把其他 App 的 CG 首项误刷为最新。
             // Restrict fallback to the system frontmost app so an AX failure cannot bump another
             // app's first CG item as most recent.
             mru.insert((pid, cgwid), now);
-            if let Some(w) = windows
-                .iter()
-                .find(|w| w.pid == pid && w.window_id == cgwid)
-            {
-                log_debug!(
-                    "summon-bump frontmost (fallback): pid={} app=\"{}\" cgwid={} title=\"{}\"",
-                    w.pid,
-                    w.app_name,
-                    w.window_id,
-                    w.window_title
-                );
-            }
         }
     }
 
@@ -3080,26 +3055,6 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // existing windows are not updated, preventing browser window B from riding A's coattails
     // when switching from app C to browser window A.
     sort_windows_by_mru(&mut windows, mru, now);
-
-    // 每次完整刷新时打印排序后的窗口列表(=下一次显示顺序),含 mru 年龄。`*`标记第 0 个。
-    // Print the sorted window list on every full refresh (= the next display order), with MRU age.
-    // `*` marks index 0.
-    log_debug!("sorted: {} windows", windows.len());
-    for (i, w) in windows.iter().enumerate() {
-        let mru_ms = mru
-            .get(&(w.pid, w.window_id))
-            .map(|t| t.elapsed().as_millis());
-        let mark = if i == 0 { "*" } else { " " };
-        log_debug!(
-            "  {} pid={} app=\"{}\" cgwid={} title=\"{}\" mru_ms={:?}",
-            mark,
-            w.pid,
-            w.app_name,
-            w.window_id,
-            w.window_title,
-            mru_ms
-        );
-    }
 
     if let Some(first) = windows.first_mut() {
         first.is_active = true;

@@ -245,7 +245,7 @@ unsafe fn disable() {
     }
 
     if saved.is_empty() {
-        log_info!("[pointer] no mouse/trackpad devices found; nothing applied");
+        log_debug!("[pointer] no mouse/trackpad devices found; nothing applied");
         CFRelease(services as *const c_void);
         CFRelease(client as *const c_void);
         return;

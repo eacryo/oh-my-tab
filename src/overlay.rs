@@ -1838,7 +1838,6 @@ fn commit_selected_window(overlay_was_visible: bool) {
         let pid = w.pid;
         let cgwid = w.window_id;
         let minimized = w.minimized;
-        let wt = w.window_title.clone();
         let release_started = Instant::now();
         log_debug!(
             "Switching to '{}' (pid={} cgwid={})",
@@ -1885,11 +1884,10 @@ fn commit_selected_window(overlay_was_visible: bool) {
         state.focus_key = Some((pid, cgwid));
         bump_window_mru(&mut state.mru, pid, cgwid);
         log_debug!(
-            "commit: pid={} app=\"{}\" cgwid={} title=\"{}\" selected={}",
+            "commit: pid={} app=\"{}\" cgwid={} selected={}",
             pid,
             w.app_name,
             cgwid,
-            wt,
             state.selected
         );
     } else {
@@ -2013,7 +2011,6 @@ pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _even
         );
         return;
     }
-    log_debug!("[overlay] card {} mouseEntered", idx);
     let mut state_opt = TAB_STATE.lock().unwrap();
     let state = state_opt.as_mut().unwrap();
     if state.selected != idx {
@@ -2849,7 +2846,6 @@ pub(crate) fn stop_hover_timer() {
 }
 
 pub(crate) extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    log_debug!("[overlay] container mouseMoved:");
     // locationInWindow 相对事件源窗口 —— nonactivating 面板下 mouseMoved 事件可能
     // 挂在下方 app 的窗口上,坐标不可靠(实测 loc 不随鼠标移动变化)。改用屏幕坐标
     // (NSEvent.mouseLocation,左下原点)转浮窗窗口坐标,与卡片 frame 同基准。
@@ -3214,7 +3210,7 @@ pub(crate) fn close_window_at(idx: usize) -> bool {
 /// Synchronous fallback for a close without a corresponding card; normal card closes use
 /// commit_pending_card_close.
 fn finish_window_close(idx: usize, pid: i32, cgwid: u32) -> bool {
-    let title = {
+    {
         let state_opt = TAB_STATE.lock().unwrap();
         let Some(state) = state_opt.as_ref() else {
             return false;
@@ -3225,14 +3221,8 @@ fn finish_window_close(idx: usize, pid: i32, cgwid: u32) -> bool {
         if window.pid != pid || window.window_id != cgwid {
             return false;
         }
-        window.window_title.clone()
-    };
-    log_info!(
-        "close window: pid={} cgwid={} title=\"{}\"",
-        pid,
-        cgwid,
-        title
-    );
+    }
+    log_info!("close window: pid={} cgwid={}", pid, cgwid);
     {
         let mut state_opt = TAB_STATE.lock().unwrap();
         let state = match state_opt.as_mut() {

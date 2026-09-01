@@ -2700,7 +2700,7 @@ unsafe fn write_pasteboard_text(text: &str, stamp_marker: bool) {
 /// pasteboard content is not pasted.
 unsafe fn write_pasteboard_image(entry: &ImageEntry) -> bool {
     let Some(data) = cache_read_image(entry.hash) else {
-        log_debug!(
+        log_info!(
             "[clip] image cache miss on paste (hash={:016x}, uti={})",
             entry.hash,
             entry.uti
@@ -3020,7 +3020,7 @@ pub fn start() {
             repeats: true
         ];
         *guard = ObjPtr(timer);
-        log_info!(
+        log_debug!(
             "Clipboard history polling started (every {}s).",
             POLL_INTERVAL
         );
@@ -3039,7 +3039,7 @@ pub fn stop() {
             // scheduledTimerWithTimeInterval: returns +0 (owned by the run loop); it must
             // NOT be released (over-release crashes); invalidate lets the run loop release it.
             *guard = ObjPtr(std::ptr::null_mut());
-            log_info!("Clipboard history polling stopped.");
+            log_debug!("Clipboard history polling stopped.");
         }
     }
 }
@@ -3936,7 +3936,7 @@ unsafe fn register_pasteboard_observer() {
         object: std::ptr::null::<AnyObject>()
     ];
     CFRelease(name as *const c_void);
-    log_info!("Pasteboard change observer registered.");
+    log_debug!("Pasteboard change observer registered.");
 }
 
 /// NSTimer 的 target:NSTimer 会向它发 clipPollTick:。动态注册一个轻量类,方法转发到
@@ -4721,7 +4721,7 @@ unsafe fn run_detail_save_as(entry: &ClipEntry) {
                 return;
             };
             match std::fs::write(&dest, &bytes) {
-                Ok(()) => log_info!("[clip] image saved to {dest}"),
+                Ok(()) => log_debug!("[clip] image saved to {dest}"),
                 Err(e) => log_info!("[clip] image save to {dest} failed: {e}"),
             }
         }
@@ -4732,7 +4732,7 @@ unsafe fn run_detail_save_as(entry: &ClipEntry) {
                 return;
             };
             match std::fs::write(&dest, entry.text.as_bytes()) {
-                Ok(()) => log_info!("[clip] text saved to {dest}"),
+                Ok(()) => log_debug!("[clip] text saved to {dest}"),
                 Err(e) => log_info!("[clip] text save to {dest} failed: {e}"),
             }
         }
@@ -6944,9 +6944,6 @@ unsafe fn rebuild_rows() {
     let mut prev_group: Option<DayGroup> = None;
     for (i, &h_idx) in filtered.iter().enumerate() {
         let y = row_top(i, &pitches);
-        // 日志只打索引/坐标,绝不打条目内容(隐私)。
-        // Log the index/position only, NEVER the entry text (privacy).
-        log_debug!("[clip] row {} created: y={}", i, y);
         let row_w = PICKER_W - PAD_X * 2.0;
         let entry = &hist[h_idx];
         let selected = i == sel_idx;
@@ -8141,9 +8138,6 @@ fn paste_at(idx: usize) {
         hide_picker();
         return;
     };
-    // 日志只打索引,绝不打粘贴内容(隐私)。
-    // Log the index only, NEVER the pasted content (privacy).
-    log_debug!("[clip] paste_at idx={}", idx);
     hide_picker();
     unsafe {
         if let Some(img) = &entry.image {
@@ -8159,7 +8153,7 @@ fn paste_at(idx: usize) {
                     true
                 }
                 PasteKind::Image if img.source_path.is_some() => {
-                    log_debug!("[clip] source file gone ({}), nothing to paste", img.uti);
+                    log_info!("[clip] paste skipped: source file gone (uti={})", img.uti);
                     false
                 }
                 PasteKind::Image => write_pasteboard_image(img),
@@ -8178,7 +8172,6 @@ fn paste_at(idx: usize) {
             synthesize_paste();
         }
     }
-    log_debug!("[clip] pasted entry {}", idx);
 }
 
 /// 粘贴内容判定:文件复制条目且源文件仍存在 → 文件粘贴(恢复 file-url);

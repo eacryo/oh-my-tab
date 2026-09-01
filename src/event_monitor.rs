@@ -30,8 +30,6 @@ const K_CG_EVENT_FLAG_MASK_ALTERNATE: crate::event_tap::CGEventFlags = 0x0008000
 const K_CG_EVENT_FLAG_MASK_CONTROL: crate::event_tap::CGEventFlags = 0x00040000;
 const K_CG_EVENT_FLAG_MASK_SHIFT: crate::event_tap::CGEventFlags = 0x00020000;
 const K_VK_TAB: u16 = 48;
-const K_VK_COMMAND: u16 = 55;
-const K_VK_OPTION: u16 = 58;
 // 历史剪贴板呼出键:Option+V(V 键码 9)。
 // History-clipboard summon key: Option+V (V keycode 9).
 const K_VK_V: u16 = 9;
@@ -121,7 +119,6 @@ unsafe extern "C" fn event_tap_callback(
                     let _ = sender.send(switcher_tab_event(flags));
                     return std::ptr::null_mut();
                 }
-                log_debug!("[kbd] keyDown Tab");
             } else if keycode == K_VK_V && (flags & K_CG_EVENT_FLAG_MASK_ALTERNATE) != 0 {
                 // 历史剪贴板呼出:Option+V(始终走 Option 修饰,不随快捷键模式切换)。
                 // 吞掉事件,与 Win+V 行为一致。只打组合名(隐私约定)。
@@ -147,24 +144,13 @@ unsafe extern "C" fn event_tap_callback(
                 } else if !crate::config::CONFIG.read().unwrap().clipboard.enabled {
                     // 功能关闭时不拦截:其他应用可能需要 Option+V 组合键,必须透传。
                     // When the feature is disabled, do NOT swallow Option+V -- other apps may
-                    // need the combo, so it passes through (falls through to the Other log).
+                    // need the combo, so it passes through untouched.
                     log_debug!("[kbd] Option+V passthrough (clipboard disabled)");
                 } else {
                     log_debug!("[kbd] summon keyDown V+Option (clipboard)");
                     let _ = sender.send(GlobalEvent::ClipboardToggled);
                     return std::ptr::null_mut();
                 }
-            } else if keycode == K_VK_COMMAND || keycode == K_VK_OPTION {
-                // 修饰键本身:固定键位,打按键名即可。
-                // Modifier keys themselves: fixed positions, logged by name.
-                let name = if keycode == K_VK_COMMAND {
-                    "Command"
-                } else {
-                    "Option"
-                };
-                log_debug!("[kbd] keyDown {}", name);
-            } else {
-                log_debug!("[kbd] keyDown Other");
             }
         }
         K_CG_EVENT_FLAGS_CHANGED => {

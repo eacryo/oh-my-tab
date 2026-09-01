@@ -377,7 +377,7 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
         let is_bt_keyboard = !addr.is_empty()
             && appearance_map.get(&addr.to_uppercase()) == Some(&GAP_APPEARANCE_KEYBOARD);
         if is_bt_keyboard {
-            log_info!(
+            log_debug!(
                 "[device] excluding '{}' (Bluetooth GAP appearance = keyboard)",
                 name
             );

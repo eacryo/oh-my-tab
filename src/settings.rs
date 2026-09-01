@@ -1895,7 +1895,7 @@ unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
     let _: () = msg_send![clip, scrollToPoint: NSPoint::new(0.0, top_origin)];
     let _: () = msg_send![scroll, reflectScrolledClipView: clip];
     let after: NSRect = msg_send![clip, bounds];
-    log_info!(
+    log_debug!(
         "[settings] scroll_page_to_top: doc_h={:.1} clip_h={:.1} top_origin={:.1} -> clip_oy_after={:.1}",
         doc_frame.size.height,
         clip_bounds.size.height,
@@ -2171,7 +2171,7 @@ fn log_config_changes(old: &Config, new: &Config) {
     let old_profiles = format!("{:?}", old.mouse.profiles);
     let new_profiles = format!("{:?}", new.mouse.profiles);
     if old_profiles != new_profiles {
-        log_info!(
+        log_debug!(
             "[settings] config changed: mouse.profiles: {:?} -> {:?}",
             old_profiles,
             new_profiles
@@ -2971,11 +2971,11 @@ unsafe fn recording_thread() {
     crate::event_tap::CFRunLoopAddSource(rl, source, crate::event_tap::kCFRunLoopDefaultMode);
     crate::event_tap::CGEventTapEnable(tap, true);
     *REC_TAP.0.lock().unwrap() = Some(tap);
-    log_info!("[mouse] recording tap started");
+    log_debug!("[mouse] recording tap started");
     crate::event_tap::CFRunLoopRun();
     *REC_TAP.0.lock().unwrap() = None;
     *REC_RUNLOOP.0.lock().unwrap() = None;
-    log_info!("[mouse] recording tap stopped");
+    log_debug!("[mouse] recording tap stopped");
 }
 
 /// 删除按钮(tag = 按钮号):移除该映射。
@@ -2990,7 +2990,7 @@ pub(crate) extern "C" fn handle_add_mapping(_self: *mut c_void, _cmd: Sel, _send
         close_mapping_panel();
     }
     open_mapping_panel(None);
-    log_info!("[mouse] mapping panel opened (new mapping)");
+    log_debug!("[mouse] mapping panel opened (new mapping)");
 }
 
 /// 列表行「编辑」回调(tag = 按钮号):打开面板预填该按钮的映射。
@@ -3003,7 +3003,7 @@ pub(crate) extern "C" fn handle_mapping_edit(_self: *mut c_void, _cmd: Sel, send
     }
     let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
     open_mapping_panel(Some(tag as u32));
-    log_info!("[mouse] mapping panel opened (edit button {})", tag);
+    log_debug!("[mouse] mapping panel opened (edit button {})", tag);
 }
 
 /// 面板「录制触发」按钮:录侧键。
@@ -3030,7 +3030,7 @@ pub(crate) extern "C" fn handle_panel_record_trigger(
             let _: () = msg_send![o.0, setEnabled: false];
         }
     }
-    log_info!("[mouse] recording trigger (press a mouse button)");
+    log_debug!("[mouse] recording trigger (press a mouse button)");
     *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
 }
 
@@ -3061,7 +3061,7 @@ pub(crate) extern "C" fn handle_panel_record_combo(
             let _: () = msg_send![o.0, setEnabled: false];
         }
     }
-    log_info!("[mouse] recording combo (press the key combo)");
+    log_debug!("[mouse] recording combo (press the key combo)");
     *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
 }
 
@@ -3128,7 +3128,7 @@ pub(crate) extern "C" fn handle_mapping_confirm(
     drop(edits);
     close_mapping_panel();
     render_mapping_rows();
-    log_info!(
+    log_debug!(
         "[mouse] mapping panel confirmed: button {} -> index {}",
         btn,
         idx
@@ -3143,7 +3143,7 @@ pub(crate) extern "C" fn handle_mapping_cancel(
     _sender: *mut c_void,
 ) {
     close_mapping_panel();
-    log_info!("[mouse] mapping panel cancelled");
+    log_debug!("[mouse] mapping panel cancelled");
 }
 
 /// 映射总开关变化回调:重渲染映射行(关闭时行控件置灰不可点)。
@@ -3154,7 +3154,7 @@ pub(crate) extern "C" fn handle_mapping_enabled_changed(
     _sender: *mut c_void,
 ) {
     render_mapping_rows();
-    log_info!("[mouse] mappings master switch toggled");
+    log_debug!("[mouse] mappings master switch toggled");
 }
 
 // ========== 映射编辑面板实现 / mapping edit panel ==========
@@ -3445,7 +3445,6 @@ unsafe fn update_mapping_panel() {
 /// 关闭映射编辑面板(幂等)。
 /// Close the mapping edit panel (idempotent).
 fn close_mapping_panel() {
-    log_debug!("[mouse] close panel: step 1 (orderOut)");
     // take():if-let scrutinee 的 MutexGuard 会贯穿整个 if 块,块内再 lock 同一把
     // Mutex 就是自死锁(风火轮,实测)。take 拿走值后 guard 立即释放。
     // take(): an if-let scrutinee MutexGuard lives for the WHOLE if block, so locking the
@@ -3456,7 +3455,6 @@ fn close_mapping_panel() {
             let _: () = msg_send![p.0, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
-    log_debug!("[mouse] close panel: step 2 (remove dim)");
     // 移除遮罩。
     // Remove the dim layer.
     if let Some(d) = EDIT_DIM.lock().unwrap().take() {
@@ -3464,7 +3462,6 @@ fn close_mapping_panel() {
             let _: () = msg_send![d.0, removeFromSuperview];
         }
     }
-    log_debug!("[mouse] close panel: step 3 (reset state)");
     *EDIT_BUTTON.lock().unwrap() = None;
     *EDIT_ACTION_IDX.lock().unwrap() = 0;
     EDIT_COMBO.lock().unwrap().clear();
@@ -3476,7 +3473,7 @@ pub(crate) extern "C" fn handle_delete_mapping(_self: *mut c_void, _cmd: Sel, se
     let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
     MAPPING_EDITS.lock().unwrap().remove(&tag.to_string());
     render_mapping_rows();
-    log_info!("[mouse] removed mapping for button {}", tag);
+    log_debug!("[mouse] removed mapping for button {}", tag);
 }
 
 pub(crate) extern "C" fn handle_recording_finished(
@@ -3493,7 +3490,7 @@ pub(crate) extern "C" fn handle_recording_finished(
             unsafe {
                 update_mapping_panel();
             }
-            log_info!("[mouse] panel trigger recorded: button {}", btn);
+            log_debug!("[mouse] panel trigger recorded: button {}", btn);
         }
         // 面板录组合键:更新面板显示(Key Press 动作)。
         // The panel recorded the combo: update the panel (Key Press action).
@@ -3503,7 +3500,7 @@ pub(crate) extern "C" fn handle_recording_finished(
             unsafe {
                 update_mapping_panel();
             }
-            log_info!("[mouse] panel combo recorded: {}", desc);
+            log_debug!("[mouse] panel combo recorded: {}", desc);
         }
     }
 }
@@ -3515,7 +3512,7 @@ pub(crate) extern "C" fn handle_recording_cancelled(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
-    log_info!("[mouse] button-mapping recording cancelled");
+    log_debug!("[mouse] button-mapping recording cancelled");
 }
 
 pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
@@ -3784,7 +3781,7 @@ pub(crate) extern "C" fn handle_restore_defaults(
     // Reset the mouse-page device selection (first device if any; clear if none), then refill.
     *SELECTED_DEVICE.lock().unwrap() = None;
     load_settings_from(&defaults);
-    log_info!("Config form reset to defaults (not saved until OK).");
+    log_debug!("Config form reset to defaults (not saved until OK).");
 }
 
 /// 用当前 CONFIG 填充设置控件(每次打开都刷新,反映外部编辑 + Reload)。

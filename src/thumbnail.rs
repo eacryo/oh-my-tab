@@ -979,14 +979,6 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                     };
                     let queue_ms = job.enqueued_at.elapsed().as_millis() as u64;
                     record_thumb_queue_wait(queue_ms);
-                    log_debug!(
-                        "[thumb] job recv pid={} wid={} target_h={} priority={} queue_ms={}",
-                        job.key.pid,
-                        job.key.wid,
-                        job.target_px_h,
-                        job.priority.label(),
-                        job.enqueued_at.elapsed().as_millis()
-                    );
                     run_capture_job(job);
                     // 捕获期间若来了更高清、更高优先级或更新的 activation 请求，保留
                     // active 并自行补发，避免恢复后的刷新被更早任务吞掉。
@@ -1076,20 +1068,6 @@ fn run_capture_job(job: CaptureJob) {
         );
         return;
     }
-    log_debug!(
-        "[thumb] captured pid={} wid={} src={}x{} out={}x{} target_h={} priority={} capture_ms={} scale_ms={} total_ms={}",
-        key.pid,
-        key.wid,
-        captured.src_w,
-        captured.src_h,
-        captured.thumb.w_px,
-        captured.thumb.h_px,
-        captured.thumb.captured_for_px_h,
-        job.priority.label(),
-        captured.capture_ms,
-        captured.scale_ms,
-        job_started.elapsed().as_millis()
-    );
     record_thumb_capture(job_started.elapsed().as_millis() as u64);
     cache_store(key.pid, key.wid, captured.thumb);
     drop(state);
@@ -1200,11 +1178,6 @@ pub(crate) fn handle_ready_main() {
             ready_keys.len()
         );
         crate::overlay::refresh_thumbnail_previews(&ready_keys);
-    } else {
-        log_debug!(
-            "[perf] thumbnail ready batch={} matched_visible=0",
-            ready_batch_size
-        );
     }
 }
 
@@ -1243,10 +1216,6 @@ fn enqueue_ready_delivery(key: ThumbKey) {
 /// reach tens of MB).
 struct CapturedWindow {
     thumb: CachedThumb,
-    src_w: u32,
-    src_h: u32,
-    capture_ms: u128,
-    scale_ms: u128,
 }
 
 unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CapturedWindow> {
@@ -1264,7 +1233,6 @@ unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CapturedWindow> {
     // Explicitly request native Retina pixels. nominalResolution only returns point-sized
     // content, so small windows stay blurry on 4K/5K displays even with a larger target later.
     let opts = CGS_CAPTURE_BEST_RESOLUTION | CGS_CAPTURE_IGNORE_GLOBAL_CLIP_SHAPE;
-    let capture_started = Instant::now();
     let arr = cap(cid, wids.as_ptr(), 1, opts);
     if arr.is_null() {
         return None;
@@ -1281,13 +1249,10 @@ unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CapturedWindow> {
     }
     CFRetain(raw); // 数组即将释放,自留一份 / the array goes away; keep our own ref
     CFRelease(arr);
-    let capture_ms = capture_started.elapsed().as_millis();
-
     let src_w = CGImageGetWidth(raw) as u32;
     let src_h = CGImageGetHeight(raw) as u32;
     let target_px_h = target_px_h.clamp(BASE_TARGET_PX_H, MAX_TARGET_PX_H);
     let (tw, th) = fit_target(src_w, src_h, target_px_h);
-    let scale_started = Instant::now();
     let img = if tw == src_w && th == src_h {
         raw
     } else {
@@ -1309,10 +1274,6 @@ unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CapturedWindow> {
             captured_for_px_h: target_px_h,
             captured: Instant::now(),
         },
-        src_w,
-        src_h,
-        capture_ms,
-        scale_ms: scale_started.elapsed().as_millis(),
     })
 }
 

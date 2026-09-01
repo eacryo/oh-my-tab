@@ -19,11 +19,11 @@ use crate::event_tap::{
     K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
     K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, K_CG_SESSION_EVENT_TAP, SYNTHETIC_MARKER,
 };
+use crate::log_info;
 use crate::mouse::device;
 use crate::mouse::keysim;
 use crate::mouse::resolve;
 use crate::mouse::scrolling::compute_delta;
-use crate::{log_debug, log_info};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -74,35 +74,6 @@ unsafe fn post_scroll_event(dy: i32, dx: i32, flags: CGEventFlags) {
     CGEventPost(K_CG_SESSION_EVENT_TAP, synthetic);
 }
 
-/// 把事件类型翻译成可读名称,便于日志阅读。
-/// Translate an event type into a readable name for log readability.
-fn event_type_name(t: CGEventType) -> &'static str {
-    match t {
-        K_CG_EVENT_LEFT_MOUSE_DOWN => "left down",
-        K_CG_EVENT_LEFT_MOUSE_UP => "left up",
-        K_CG_EVENT_RIGHT_MOUSE_DOWN => "right down",
-        K_CG_EVENT_RIGHT_MOUSE_UP => "right up",
-        K_CG_EVENT_OTHER_MOUSE_DOWN => "other down",
-        K_CG_EVENT_OTHER_MOUSE_UP => "other up",
-        K_CG_EVENT_SCROLL_WHEEL => "scroll",
-        _ => "other",
-    }
-}
-
-/// 把 buttonNumber(0-based)翻译成可读名称,便于日志阅读。
-/// 0=左,1=右,2=中;3/4=标准 HID 后退/前进侧键;其余用裸数字。
-/// Translate buttonNumber (0-based) to a readable name for log readability.
-fn button_name(button: i64) -> String {
-    match button {
-        0 => "left".to_string(),
-        1 => "right".to_string(),
-        2 => "middle".to_string(),
-        3 => "back".to_string(),
-        4 => "forward".to_string(),
-        n => format!("btn{}", n),
-    }
-}
-
 unsafe extern "C" fn mouse_event_tap_callback(
     _proxy: CGEventTapProxy,
     event_type: CGEventType,
@@ -141,18 +112,6 @@ unsafe extern "C" fn mouse_event_tap_callback(
         // Resolve the effective config for this device (merging "All Mice" + per-device profiles).
         let resolved = resolve::resolve(dev_key);
 
-        // 归因诊断放最前,与普通滚动日志区分开,便于排查 per-device 设置不生效。
-        // Attribution diagnostics lead the line, distinguishing it from plain scroll logs so
-        // per-device settings not applying is easy to spot.
-        log_debug!(
-            "[mouse] scroll dev={:?} dy={} dx={} flags=0x{:x} reverse={}",
-            dev_key,
-            dy,
-            dx,
-            flags,
-            resolved.reverse_scroll
-        );
-
         // Default / Line:计算 delta(透传或行数归一化 + 反转)-> post 合成事件 -> 丢弃原 event。
         // Default / Line: compute delta (passthrough or line-count normalization + reverse) ->
         // post synthetic event -> drop the original.
@@ -161,13 +120,6 @@ unsafe extern "C" fn mouse_event_tap_callback(
         std::ptr::null_mut()
     } else {
         let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
-        log_debug!(
-            "[mouse] {} button={}({}) flags=0x{:x}",
-            event_type_name(event_type),
-            button,
-            button_name(button),
-            flags
-        );
         // 按键映射:仅中键及侧键(button >= 2)参与;左键(0)/右键(1)永不绑定,
         // 防止用户把自己锁死(无法点击)。录制期间跳过执行。
         // Button mappings: only middle/side buttons (>= 2) take part; left (0)/right (1)
@@ -235,16 +187,6 @@ unsafe extern "C" fn mouse_event_tap_callback(
                         log_info!("[mouse] button {}: unparseable binding {:?}", button, desc);
                     }
                 }
-            } else {
-                // 诊断:未命中映射时打印归因与当前设备的映射键,定位"绑定不生效"。
-                // Diagnostic: on a miss, print the attribution and the device's mapping keys
-                // to pinpoint "binding not working".
-                log_debug!(
-                    "[mouse] button {}: no mapping (dev={:?}, keys={:?})",
-                    button,
-                    dev_key,
-                    resolved.button_mappings.keys().collect::<Vec<_>>()
-                );
             }
         }
         event
