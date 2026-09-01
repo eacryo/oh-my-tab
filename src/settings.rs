@@ -11,7 +11,7 @@ use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use crate::config::{reload_config, Config, CONFIG};
@@ -330,6 +330,87 @@ unsafe fn set_control_title(obj: *mut AnyObject, title: &str) {
     CFRelease(ns as *const c_void);
 }
 
+/// Apply the HTML button surface to native NSButton instances.
+unsafe fn style_html_button(button: *mut AnyObject, background_hex: u32, text_hex: u32) {
+    let _: () = msg_send![button, setBezelStyle: 0isize];
+    let _: () = msg_send![button, setBordered: false];
+    let _: () = msg_send![button, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if !layer.is_null() {
+        layer_set_background(layer, crate::ffi::hex_to_cg_color(background_hex));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x00000012u32));
+        let _: () = msg_send![layer, setBorderWidth: 1.0f64];
+        let _: () = msg_send![layer, setCornerRadius: 8.0f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+    }
+    let text_color = crate::ffi::hex_to_ns_color(text_hex);
+    let _: () = msg_send![button, setContentTintColor: text_color];
+}
+
+struct HtmlActionButtonClass(*mut AnyObject);
+unsafe impl Send for HtmlActionButtonClass {}
+unsafe impl Sync for HtmlActionButtonClass {}
+
+static HTML_ACTION_BUTTON_CLASS: OnceLock<HtmlActionButtonClass> = OnceLock::new();
+
+fn html_action_button_class() -> *mut AnyObject {
+    HTML_ACTION_BUTTON_CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabHtmlActionButton").unwrap();
+            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                html_action_button_mouse_entered as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                html_action_button_mouse_exited as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            HtmlActionButtonClass(cls)
+        })
+        .0
+}
+
+extern "C" fn html_action_button_mouse_entered(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let tag: isize = msg_send![button, tag];
+        let hover = match tag {
+            -2 => 0x0077EDFFu32, // HTML footer `.ok:hover`
+            -1 => 0x76768024u32, // HTML footer `button:hover`
+            _ => 0x7676802Bu32,  // HTML small/tiny/full action hover
+        };
+        let layer: *mut AnyObject = msg_send![button, layer];
+        if !layer.is_null() {
+            layer_set_background(layer, crate::ffi::hex_to_cg_color(hover));
+        }
+    }
+}
+
+extern "C" fn html_action_button_mouse_exited(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let tag: isize = msg_send![button, tag];
+        let normal = match tag {
+            -2 => 0x0A84FFFFu32,
+            -1 => 0xFFFFFFC7u32,
+            -3 => 0x7676801Eu32, // HTML `.full-action`
+            _ => 0xFFFFFFADu32,
+        };
+        let layer: *mut AnyObject = msg_send![button, layer];
+        if !layer.is_null() {
+            layer_set_background(layer, crate::ffi::hex_to_cg_color(normal));
+        }
+    }
+}
+
 /// 创建设置窗口统一使用的原生圆角操作按钮;调用方负责尺寸、自适应和父视图归属。
 /// Create the native rounded action button shared by Settings; callers own frame, autoresizing,
 /// and parent-view placement.
@@ -339,11 +420,22 @@ unsafe fn make_settings_action_button(
     target: *mut AnyObject,
     action: Sel,
 ) -> *mut AnyObject {
-    let button: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let button: *mut AnyObject = msg_send![html_action_button_class(), alloc];
     let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
     set_control_title(button, title);
-    let _: () = msg_send![button, setBezelStyle: 1isize]; // NSRoundedBezelStyle
     let _: () = msg_send![button, setControlSize: 0isize]; // NSControlSizeRegular
+                                                           // HTML .small-btn / footer buttons: translucent white surface with a hairline border.
+    style_html_button(button, 0xFFFFFFADu32, 0x2E2E2EFFu32);
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
+        options: 0x01u64 | 0x80u64 | 0x200u64,
+        owner: button,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![button, addTrackingArea: tracking];
+    release_obj(tracking);
     let _: () = msg_send![button, setTarget: target];
     let _: () = msg_send![button, setAction: action];
     button
@@ -354,6 +446,12 @@ unsafe impl Send for WebsiteLinkButtonClass {}
 unsafe impl Sync for WebsiteLinkButtonClass {}
 
 static WEBSITE_LINK_BUTTON_CLASS: OnceLock<WebsiteLinkButtonClass> = OnceLock::new();
+static SIDEBAR_BUTTON_CLASS: OnceLock<SidebarButtonClass> = OnceLock::new();
+static SIDEBAR_SELECTED: AtomicUsize = AtomicUsize::new(0);
+static SIDEBAR_TITLE_LABELS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SIDEBAR_ICON_VIEWS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 extern "C" fn website_link_mouse_entered(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
     unsafe {
@@ -379,6 +477,59 @@ extern "C" fn website_link_mouse_down(_this: *mut c_void, _cmd: Sel, _event: *mu
         sel!(handleOpenOfficialWebsite:),
         std::ptr::null_mut(),
     );
+}
+
+struct SidebarButtonClass(*mut AnyObject);
+unsafe impl Send for SidebarButtonClass {}
+unsafe impl Sync for SidebarButtonClass {}
+
+extern "C" fn sidebar_button_mouse_entered(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let tag: isize = msg_send![button, tag];
+        if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
+            return;
+        }
+        let layer: *mut AnyObject = msg_send![button, layer];
+        if !layer.is_null() {
+            layer_set_background(layer, crate::ffi::hex_to_cg_color(0x76768014u32));
+        }
+    }
+}
+
+extern "C" fn sidebar_button_mouse_exited(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let layer: *mut AnyObject = msg_send![button, layer];
+        if !layer.is_null() {
+            layer_set_background(layer, crate::ffi::hex_to_cg_color(0x00000000u32));
+        }
+    }
+}
+
+fn sidebar_button_class() -> *mut AnyObject {
+    SIDEBAR_BUTTON_CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabSidebarButton").unwrap();
+            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                sidebar_button_mouse_entered as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                sidebar_button_mouse_exited as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            SidebarButtonClass(cls)
+        })
+        .0
 }
 
 fn website_link_button_class() -> *mut AnyObject {
@@ -421,6 +572,140 @@ unsafe fn set_field(field: *mut AnyObject, val: impl std::fmt::Display) {
     CFRelease(ns as *const c_void);
 }
 
+/// NSTextFieldCell keeps a fixed baseline for single-line controls.  Our settings rows are
+/// taller than that standard control height, so use a small cell subclass that gives AppKit a
+/// centered 22pt drawing/editing rect inside the full row.  Both paths are overridden because
+/// the field editor is laid out by `selectWithFrame:` rather than by the drawing method.
+unsafe fn centered_text_field_cell_class() -> *mut AnyObject {
+    static CELL_CLASS: OnceLock<ObjPtr> = OnceLock::new();
+    CELL_CLASS
+        .get_or_init(|| {
+            let name = CString::new("OhMyTabCenteredTextFieldCell").unwrap();
+            let superclass = class!(NSTextFieldCell) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let draw_types = CString::new("v@:{CGRect=dddd}@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(drawInteriorWithFrame:inView:),
+                centered_text_field_cell_draw_interior as *mut c_void,
+                draw_types.as_ptr(),
+            );
+            let select_types = CString::new("v@:{CGRect=dddd}@@@@qq").unwrap();
+            class_addMethod(
+                cls,
+                sel!(selectWithFrame:inView:editor:delegate:start:length:),
+                centered_text_field_cell_select as *mut c_void,
+                select_types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            ObjPtr(cls)
+        })
+        .0
+}
+
+fn centered_text_field_cell_frame(bounds: NSRect) -> NSRect {
+    let text_h = bounds.size.height.min(22.0);
+    // NSTextFieldCell's regular-size baseline sits a few points above the geometric center of
+    // a 22pt drawing rect. Compensate that intrinsic baseline offset after centering the rect in
+    // the 34pt settings row.
+    let baseline_offset = if bounds.size.height > text_h {
+        1.0
+    } else {
+        0.0
+    };
+    let horizontal_inset = bounds.size.width.min(8.0);
+    NSRect::new(
+        NSPoint::new(
+            bounds.origin.x + horizontal_inset,
+            bounds.origin.y + (bounds.size.height - text_h) / 2.0 + baseline_offset,
+        ),
+        NSSize::new(
+            (bounds.size.width - horizontal_inset * 2.0).max(1.0),
+            text_h,
+        ),
+    )
+}
+
+unsafe fn centered_text_field_cell_super_draw(cell: *mut c_void, rect: NSRect, view: *mut c_void) {
+    #[repr(C)]
+    struct ObjcSuper {
+        receiver: *mut c_void,
+        super_class: *mut c_void,
+    }
+    extern "C" {
+        fn objc_msgSendSuper();
+    }
+    type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut c_void) -> ();
+    let super_class =
+        objc2::runtime::AnyClass::get(c"NSTextFieldCell").unwrap() as *const _ as *mut c_void;
+    let mut sup = ObjcSuper {
+        receiver: cell,
+        super_class,
+    };
+    let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+    send(&mut sup, sel!(drawInteriorWithFrame:inView:), rect, view);
+}
+
+extern "C" fn centered_text_field_cell_draw_interior(
+    this: *mut c_void,
+    _cmd: Sel,
+    bounds: NSRect,
+    view: *mut c_void,
+) {
+    unsafe {
+        centered_text_field_cell_super_draw(this, centered_text_field_cell_frame(bounds), view);
+    }
+}
+
+extern "C" fn centered_text_field_cell_select(
+    this: *mut c_void,
+    _cmd: Sel,
+    bounds: NSRect,
+    view: *mut c_void,
+    editor: *mut c_void,
+    delegate: *mut c_void,
+    start: isize,
+    length: isize,
+) {
+    unsafe {
+        #[repr(C)]
+        struct ObjcSuper {
+            receiver: *mut c_void,
+            super_class: *mut c_void,
+        }
+        extern "C" {
+            fn objc_msgSendSuper();
+        }
+        type F = unsafe extern "C" fn(
+            *mut ObjcSuper,
+            Sel,
+            NSRect,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            isize,
+            isize,
+        ) -> ();
+        let super_class =
+            objc2::runtime::AnyClass::get(c"NSTextFieldCell").unwrap() as *const _ as *mut c_void;
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class,
+        };
+        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        send(
+            &mut sup,
+            sel!(selectWithFrame:inView:editor:delegate:start:length:),
+            centered_text_field_cell_frame(bounds),
+            view,
+            editor,
+            delegate,
+            start,
+            length,
+        );
+    }
+}
+
 /// 可编辑文本框(alloc +1,由调用方持有或交给父视图后 release)。
 /// Editable text field (alloc +1; caller owns or releases after adding to a parent).
 unsafe fn make_text_input(x: f64, y: f64, w: f64, h: f64, value: &str) -> *mut AnyObject {
@@ -428,8 +713,44 @@ unsafe fn make_text_input(x: f64, y: f64, w: f64, h: f64, value: &str) -> *mut A
     let field: *mut AnyObject =
         msg_send![field, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
     let ns = make_nsstring(value);
+    let cell: *mut AnyObject = msg_send![centered_text_field_cell_class(), alloc];
+    let cell: *mut AnyObject = msg_send![cell, initTextCell: ns];
+    let _: () = msg_send![field, setCell: cell];
+    release_obj(cell);
     let _: () = msg_send![field, setStringValue: ns];
     CFRelease(ns as *const c_void);
+    let _: () = msg_send![field, setBezeled: false];
+    // Replacing NSTextField's cell resets the field's editability flags on some macOS versions.
+    // Restore them explicitly so a click still opens the field editor and accepts typing.
+    let _: () = msg_send![field, setEditable: true];
+    let _: () = msg_send![field, setSelectable: true];
+    // The HTML input has no native focus ring; keep the caret while removing AppKit's
+    // blue outline that otherwise appears around a borderless NSTextField when editing.
+    let _: () = msg_send![field, setFocusRingType: 1isize]; // NSFocusRingTypeNone
+                                                            // Treat the value as a single line so AppKit centers its baseline in the 34pt row,
+                                                            // matching the vertical alignment of the popup controls beside it.
+    let _: () = msg_send![field, setUsesSingleLineMode: true];
+    // `scrollable` belongs to NSTextFieldCell rather than NSTextField.  A single-line,
+    // scrollable cell uses AppKit's vertically centered editor layout; guard the selector so an
+    // older macOS implementation cannot turn this styling hint into a startup crash.
+    let cell: *mut AnyObject = msg_send![field, cell];
+    if !cell.is_null() {
+        let supports_scrollable: bool = msg_send![cell, respondsToSelector: sel!(setScrollable:)];
+        if supports_scrollable {
+            let _: () = msg_send![cell, setScrollable: true];
+        }
+    }
+    let _: () = msg_send![field, setAlignment: 0isize]; // NSTextAlignmentLeft
+                                                        // The rounded layer below is the sole background surface. Keeping the cell background off
+                                                        // avoids a second, darker strip when the custom cell draws inside its centered rect.
+    let _: () = msg_send![field, setDrawsBackground: false];
+    let _: () = msg_send![field, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![field, layer];
+    if !layer.is_null() {
+        layer_set_background(layer, crate::ffi::hex_to_cg_color(0x7676801Cu32));
+        let _: () = msg_send![layer, setCornerRadius: 9.0f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+    }
     field
 }
 
@@ -979,6 +1300,16 @@ unsafe fn make_popup(
         CFRelease(ns as *const c_void);
     }
     let _: () = msg_send![popup, selectItemAtIndex: selected as isize];
+    let _: () = msg_send![popup, setBezelStyle: 0isize];
+    let _: () = msg_send![popup, setControlSize: 0isize]; // Regular
+    let _: () = msg_send![popup, setBordered: false];
+    let _: () = msg_send![popup, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![popup, layer];
+    if !layer.is_null() {
+        layer_set_background(layer, crate::ffi::hex_to_cg_color(0x7676801Cu32));
+        let _: () = msg_send![layer, setCornerRadius: 9.0f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+    }
     popup
 }
 
@@ -1039,22 +1370,17 @@ unsafe fn make_slider(
     slider
 }
 
-/// 设侧边栏按钮标题为 attributed title:未选中用 labelColor(系统文本色),选中用纯白
-/// (whiteColor,与蓝色选中高亮搭配,原生 source-list 选中行文字观感同款)。
-/// 注意:alternateSelectedControlTextColor 虽语义正确,但在 attributed title 里会被
-/// macOS 26 解析成深色(实测渲染为 0,61,127),不能用;纯白渲染正常。
-/// Set the sidebar button's title as an attributed title: labelColor when unselected, plain
-/// white when selected (matches the accent-blue highlight; same look as native source-list
-/// selection text). Note: alternateSelectedControlTextColor looks right semantically but macOS 26
-/// resolves it to a dark color (measured 0,61,127) inside attributed titles, so plain white is used.
+/// 设侧边栏按钮标题为 attributed title:未选中用 labelColor,选中用系统强调色。
+/// Set the sidebar button title as an attributed title, using the normal label color when
+/// unselected and the system accent color when selected.
 unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selected: bool) {
     let font: *mut AnyObject = if selected {
-        msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64]
+        msg_send![class!(NSFont), boldSystemFontOfSize: 13.5f64]
     } else {
-        msg_send![class!(NSFont), messageFontOfSize: 13.0f64]
+        msg_send![class!(NSFont), messageFontOfSize: 13.5f64]
     };
     let color: *mut AnyObject = if selected {
-        msg_send![class!(NSColor), whiteColor]
+        msg_send![class!(NSColor), controlAccentColor]
     } else {
         msg_send![class!(NSColor), labelColor]
     };
@@ -1069,16 +1395,30 @@ unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selected: bool) {
     let title_ns = make_nsstring(title);
     let attr_str: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
     let attr_str: *mut AnyObject = msg_send![attr_str, initWithString: title_ns, attributes: attrs];
-    let _: () = msg_send![btn, setAttributedTitle: attr_str];
+    let label = SIDEBAR_TITLE_LABELS
+        .lock()
+        .unwrap()
+        .get(&(btn as usize))
+        .map(|p| p.0)
+        .unwrap_or(btn);
+    let _: () = msg_send![label, setStringValue: title_ns];
+    let _: () = msg_send![label, setAttributedStringValue: attr_str];
+    if let Some(icon) = SIDEBAR_ICON_VIEWS
+        .lock()
+        .unwrap()
+        .get(&(btn as usize))
+        .map(|p| p.0)
+    {
+        let _: () = msg_send![icon, setContentTintColor: color];
+    }
+    let _: () = msg_send![btn, setContentTintColor: color];
     CFRelease(title_ns as *const c_void);
     release_obj(attr_str);
     release_obj(attrs);
 }
 
-/// 侧边栏按钮(borderless NSButton,tag 区分页,点击触发 handleSettingsSidebar:)。
-/// Sidebar button (borderless NSButton; tag selects the page; click triggers handleSettingsSidebar:).
-/// 高度固定 28(与行高一致);alloc +1,加入父视图后由调用方 release。
-/// Height is fixed at 28 (matches row height); alloc +1, caller releases after adding to parent.
+/// 侧边栏按钮(borderless NSButton,左对齐图标+文字,tag 区分页)。
+/// Sidebar button (borderless NSButton; left-aligned icon + title; tag selects the page).
 unsafe fn make_sidebar_button(
     parent: *mut AnyObject,
     target: *mut AnyObject,
@@ -1088,14 +1428,91 @@ unsafe fn make_sidebar_button(
     y: f64,
     w: f64,
 ) -> *mut AnyObject {
-    let h = 28.0;
-    let btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let h = 38.0;
+    let btn: *mut AnyObject = msg_send![sidebar_button_class(), alloc];
     let btn: *mut AnyObject =
         msg_send![btn, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
     let _: () = msg_send![btn, setButtonType: 0isize]; // NSPushInPushButton
     let _: () = msg_send![btn, setBordered: false];
+    // NSButton starts with the default title "Button".  The sidebar title is rendered by
+    // the fixed-column NSTextField below, so clear the native title to avoid drawing it twice.
+    let empty_title = make_nsstring("");
+    let _: () = msg_send![btn, setTitle: empty_title];
+    CFRelease(empty_title as *const c_void);
+    let _: () = msg_send![btn, setAlignment: 0isize]; // NSTextAlignmentLeft
+    let _: () = msg_send![btn, setWantsLayer: true];
+    let btn_layer: *mut AnyObject = msg_send![btn, layer];
+    if !btn_layer.is_null() {
+        layer_set_background(btn_layer, crate::ffi::hex_to_cg_color(0x00000000u32));
+        let _: () = msg_send![btn_layer, setCornerRadius: 10.0f64];
+        let _: () = msg_send![btn_layer, setMasksToBounds: true];
+    }
     let _: () = msg_send![btn, setTag: tag];
-    set_control_title(btn, title);
+    let symbol = match tag {
+        0 => "gearshape",
+        1 => "rectangle.on.rectangle",
+        2 => "computermouse",
+        3 => "doc.on.clipboard",
+        4 => "info.circle",
+        _ => "circle",
+    };
+    let symbol_ns = make_nsstring(symbol);
+    let image: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: symbol_ns,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(symbol_ns as *const c_void);
+    if !image.is_null() {
+        let icon_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+        let icon_view: *mut AnyObject = msg_send![
+            icon_view,
+            // SF Symbols have a little optical padding at the bottom; lift the image view
+            // so the glyph's visual center shares the text baseline in the 38pt row.
+            initWithFrame: NSRect::new(NSPoint::new(15.5, 10.0), NSSize::new(17.0, 17.0))
+        ];
+        let _: () = msg_send![icon_view, setImage: image];
+        let _: () = msg_send![icon_view, setImageScaling: 3isize];
+        let _: () = msg_send![icon_view, setEditable: false];
+        let _: () = msg_send![icon_view, setWantsLayer: false];
+        let _: () = msg_send![btn, addSubview: icon_view];
+        SIDEBAR_ICON_VIEWS
+            .lock()
+            .unwrap()
+            .insert(btn as usize, ObjPtr(icon_view));
+        release_obj(icon_view);
+    }
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![
+        label,
+        initWithFrame: NSRect::new(
+            NSPoint::new(44.5, 11.0),
+            NSSize::new((w - 51.0).max(1.0), 24.0),
+        )
+    ];
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setAlignment: 0isize];
+    let _: () = msg_send![label, setUsesSingleLineMode: true];
+    let _: () = msg_send![label, setEnabled: false];
+    let _: () = msg_send![btn, addSubview: label];
+    SIDEBAR_TITLE_LABELS
+        .lock()
+        .unwrap()
+        .insert(btn as usize, ObjPtr(label));
+    release_obj(label);
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
+        options: 0x01u64 | 0x80u64 | 0x200u64,
+        owner: btn,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![btn, addTrackingArea: tracking];
+    release_obj(tracking);
     set_sidebar_title(btn, title, false);
     // 自适应:贴顶、贴左、固定尺寸 / adaptive: top- and left-anchored, fixed size
     let _: () = msg_send![btn, setAutoresizingMask: 12u64];
@@ -1112,19 +1529,121 @@ unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: f64)
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject =
         msg_send![label, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 20.0))];
-    let ns = make_nsstring(text);
+    let section_text = text.to_uppercase();
+    let ns = make_nsstring(&section_text);
     let _: () = msg_send![label, setStringValue: ns];
     CFRelease(ns as *const c_void);
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 11.0f64];
     let _: () = msg_send![label, setFont: font];
+    let color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+    let _: () = msg_send![label, setTextColor: color];
     // 自适应:宽度随父视图拉伸、顶部锚定(MinYMargin)。autoresizing = WidthSizable | MinYMargin = 2|8 = 10。
     // Adaptive: stretch width with the parent, stay top-anchored (MinYMargin).
     let _: () = msg_send![label, setAutoresizingMask: 10u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
+}
+
+/// Add a page title matching the HTML redesign's large, tight heading.
+unsafe fn add_page_title(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: f64) {
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject =
+        msg_send![label, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 32.0))];
+    set_field(label, text);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 25.0f64];
+    let _: () = msg_send![label, setFont: font];
+    let color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
+    let _: () = msg_send![label, setTextColor: color];
+    let _: () = msg_send![label, setAutoresizingMask: 10u64];
+    let _: () = msg_send![parent, addSubview: label];
+    release_obj(label);
+}
+
+/// Build the About header icon from the app's own bundle icon, retaining the reference's
+/// rounded container treatment while avoiding a second hand-drawn logo.
+unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) {
+    let icon: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let icon: *mut AnyObject = msg_send![
+        icon,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(58.0, 58.0))
+    ];
+
+    let image_name = make_nsstring("NSApplicationIcon");
+    let image: *mut AnyObject = msg_send![class!(NSImage), imageNamed: image_name];
+    CFRelease(image_name as *const c_void);
+    if !image.is_null() {
+        let image_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+        let image_view: *mut AnyObject = msg_send![
+            image_view,
+            // Let the app icon occupy the whole slot. The PNG already contains its own
+            // rounded silhouette, so an additional white container would create a visible
+            // border around it.
+            initWithFrame: NSRect::new(NSPoint::new(-2.0, -2.0), NSSize::new(62.0, 62.0))
+        ];
+        let _: () = msg_send![image_view, setImage: image];
+        let _: () = msg_send![image_view, setImageScaling: 3isize];
+        let _: () = msg_send![image_view, setImageFrameStyle: 0isize];
+        let _: () = msg_send![icon, addSubview: image_view];
+        release_obj(image_view);
+    }
+    let _: () = msg_send![parent, addSubview: icon];
+    release_obj(icon);
+}
+
+/// Add a grouped card behind a section, matching the HTML redesign's light card surface.
+unsafe fn add_settings_card(parent: *mut AnyObject, frame: NSRect) {
+    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+        return;
+    }
+    let card: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let card: *mut AnyObject = msg_send![card, initWithFrame: frame];
+    let _: () = msg_send![card, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![card, layer];
+    if !layer.is_null() {
+        layer_set_background(layer, crate::ffi::hex_to_cg_color(0xFFFFFFE0u32));
+        let _: () = msg_send![layer, setCornerRadius: 14.0f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x00000012u32));
+        let _: () = msg_send![layer, setBorderWidth: 1.0f64];
+        let _: () = msg_send![layer, setShadowOpacity: 0.025f32];
+        let _: () = msg_send![layer, setShadowRadius: 8.0f64];
+        let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -2.0)];
+    }
+    // Insert below controls and labels so the card never intercepts their mouse events.
+    let _: () = msg_send![
+        parent,
+        addSubview: card,
+        positioned: -1isize,
+        relativeTo: std::ptr::null::<AnyObject>()
+    ];
+    release_obj(card);
+}
+
+/// Draw the HTML `.row + .row` hairline inside a grouped card.
+unsafe fn add_row_separator(parent: *mut AnyObject, x: f64, y: f64, w: f64) {
+    // Keep the hairline inside the card's rounded frame. Grouped cards are
+    // inset by the same six points, so their row separators need that inset
+    // as well instead of reaching the content pane edge.
+    let line_x = x + 6.0;
+    let line_w = (w - 12.0).max(1.0);
+    let line: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let line: *mut AnyObject = msg_send![
+        line,
+        initWithFrame: NSRect::new(NSPoint::new(line_x, y), NSSize::new(line_w, 1.0))
+    ];
+    let _: () = msg_send![line, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![line, layer];
+    if !layer.is_null() {
+        layer_set_background(layer, crate::ffi::hex_to_cg_color(0x00000016u32));
+    }
+    let _: () = msg_send![parent, addSubview: line];
+    release_obj(line);
 }
 
 /// 加一行:右对齐 label + 控件。控件由调用方创建并传入;加入父视图后 release,返回该控件指针。
@@ -1160,7 +1679,10 @@ unsafe fn add_row_with_label(
     control: *mut AnyObject,
 ) -> (*mut AnyObject, *mut AnyObject) {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(label_x, y), NSSize::new(label_w, h))];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(
+        NSPoint::new(label_x, y),
+        NSSize::new(label_w, (h - 12.0).max(1.0)),
+    )];
     let ns = make_nsstring(label_text);
     let _: () = msg_send![label, setStringValue: ns];
     CFRelease(ns as *const c_void);
@@ -1959,7 +2481,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             // The edit button (opens the edit panel).
             let edit: *mut AnyObject = msg_send![class!(NSButton), alloc];
             let edit: *mut AnyObject = msg_send![edit, initWithFrame: NSRect::new(NSPoint::new(200.0, y + 2.0), NSSize::new(72.0, 24.0))];
-            let _: () = msg_send![edit, setBezelStyle: 2isize]; // NSRoundedBezelStyle
+            style_html_button(edit, 0xFFFFFFADu32, 0x2E2E2EFFu32);
             let _: () = msg_send![edit, setTag: btn as isize];
             let _: () = msg_send![edit, setEnabled: mappings_on];
             let _: () = msg_send![edit, setTarget: target];
@@ -1973,7 +2495,7 @@ unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             // The delete button (text style, same look as Edit).
             let delete: *mut AnyObject = msg_send![class!(NSButton), alloc];
             let delete: *mut AnyObject = msg_send![delete, initWithFrame: NSRect::new(NSPoint::new(278.0, y + 2.0), NSSize::new(72.0, 24.0))];
-            let _: () = msg_send![delete, setBezelStyle: 2isize]; // NSRoundedBezelStyle
+            style_html_button(delete, 0xFFFFFFADu32, 0x2E2E2EFFu32);
             let _: () = msg_send![delete, setTag: btn as isize];
             let _: () = msg_send![delete, setEnabled: mappings_on];
             let _: () = msg_send![delete, setTarget: target];
@@ -2501,7 +3023,7 @@ fn open_mapping_panel(btn: Option<u32>) {
             release_obj(btn_label);
             let rec_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
             let rec_btn: *mut AnyObject = msg_send![rec_btn, initWithFrame: NSRect::new(NSPoint::new(280.0, 190.0), NSSize::new(140.0, 24.0))];
-            let _: () = msg_send![rec_btn, setBezelStyle: 2isize]; // NSRoundedBezelStyle
+            style_html_button(rec_btn, 0xFFFFFFADu32, 0x2E2E2EFFu32);
             let rec_title = make_nsstring(&t("settings.mapping_record"));
             let _: () = msg_send![rec_btn, setTitle: rec_title];
             CFRelease(rec_title as *const c_void);
@@ -2560,7 +3082,7 @@ fn open_mapping_panel(btn: Option<u32>) {
             // The combo row (shown for Key Press).
             let combo_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
             let combo_btn: *mut AnyObject = msg_send![combo_btn, initWithFrame: NSRect::new(NSPoint::new(130.0, 96.0), NSSize::new(140.0, 24.0))];
-            let _: () = msg_send![combo_btn, setBezelStyle: 2isize];
+            style_html_button(combo_btn, 0xFFFFFFADu32, 0x2E2E2EFFu32);
             let combo_title = make_nsstring(&t("settings.mapping_record"));
             let _: () = msg_send![combo_btn, setTitle: combo_title];
             CFRelease(combo_title as *const c_void);
@@ -2582,7 +3104,7 @@ fn open_mapping_panel(btn: Option<u32>) {
             // Cancel/OK.
             let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
             let cancel: *mut AnyObject = msg_send![cancel, initWithFrame: NSRect::new(NSPoint::new(240.0, 24.0), NSSize::new(88.0, 28.0))];
-            let _: () = msg_send![cancel, setBezelStyle: 2isize];
+            style_html_button(cancel, 0xFFFFFFC7u32, 0x2E2E2EFFu32);
             let cancel_ns = make_nsstring(&t("settings.recording_cancel"));
             let _: () = msg_send![cancel, setTitle: cancel_ns];
             CFRelease(cancel_ns as *const c_void);
@@ -2592,7 +3114,7 @@ fn open_mapping_panel(btn: Option<u32>) {
             release_obj(cancel);
             let ok: *mut AnyObject = msg_send![class!(NSButton), alloc];
             let ok: *mut AnyObject = msg_send![ok, initWithFrame: NSRect::new(NSPoint::new(336.0, 24.0), NSSize::new(88.0, 28.0))];
-            let _: () = msg_send![ok, setBezelStyle: 2isize];
+            style_html_button(ok, 0x0A84FFFFu32, 0xFFFFFFFFu32);
             let ok_ns = make_nsstring(&t("settings.ok"));
             let _: () = msg_send![ok, setTitle: ok_ns];
             CFRelease(ok_ns as *const c_void);
@@ -2777,6 +3299,7 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
 fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
     let idx = if idx > 4 { 0 } else { idx };
+    SIDEBAR_SELECTED.store(idx, Ordering::SeqCst);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         let ui = match ui.as_ref() {
@@ -2800,8 +3323,8 @@ fn select_sidebar(idx: usize) {
         // 高亮背景对齐到选中按钮的 frame / align the highlight to the selected button's frame
         let frame: NSRect = msg_send![buttons[idx], frame];
         let _: () = msg_send![ui.sidebar_highlight, setFrame: frame];
-        // 选中项粗体 + 白字(whiteColor),未选中项常规 labelColor。
-        // Bold + white text when selected; regular labelColor otherwise.
+        // 选中项使用强调色粗体，未选中项使用系统常规文本色。
+        // Selected items use an accent-colored bold title; unselected items use the system label color.
         let titles = [
             t("settings.sidebar_general"),
             t("settings.sidebar_switcher"),
@@ -2810,6 +3333,10 @@ fn select_sidebar(idx: usize) {
             t("settings.sidebar_about"),
         ];
         for (i, &b) in buttons.iter().enumerate() {
+            let layer: *mut AnyObject = msg_send![b, layer];
+            if !layer.is_null() {
+                layer_set_background(layer, crate::ffi::hex_to_cg_color(0x00000000u32));
+            }
             set_sidebar_title(b, &titles[i], i == idx);
         }
         // 切换五页显隐 / toggle the five pages' visibility
@@ -3426,6 +3953,44 @@ extern "C" fn settings_window_close(_self: *mut c_void, _cmd: Sel) {
 // Constants for Cmd+Q handling: NSEventModifierFlagCommand = 1 << 20, ANSI Q keyCode = 12.
 const NSEVENT_MODIFIER_FLAG_COMMAND: u64 = 1 << 20;
 const KEYCODE_Q: u16 = 12;
+const NSEVENT_TYPE_LEFT_MOUSE_DOWN: usize = 1;
+
+/// End inline text editing when the user clicks elsewhere in the settings window.
+///
+/// The settings window uses a borderless collection of plain NSViews as its page background.
+/// Those views do not become first responder themselves, so AppKit otherwise leaves an
+/// NSTextField editor active after a click on empty page space. Resigning before dispatching the
+/// mouse event lets the clicked control become first responder again when appropriate.
+extern "C" fn settings_window_send_event(_self: *mut c_void, _cmd: Sel, event: *mut AnyObject) {
+    unsafe {
+        if !event.is_null() {
+            let event_type: usize = msg_send![event, type];
+            if event_type == NSEVENT_TYPE_LEFT_MOUSE_DOWN {
+                let window = _self as *mut AnyObject;
+                let first_responder: *mut AnyObject = msg_send![window, firstResponder];
+                if !first_responder.is_null() {
+                    let is_text_field: bool =
+                        msg_send![first_responder, isKindOfClass: class!(NSTextField)];
+                    // While an NSTextField is being edited, AppKit installs its shared
+                    // NSTextView field editor as the window's first responder.
+                    let is_field_editor: bool =
+                        msg_send![first_responder, isKindOfClass: class!(NSTextView)];
+                    if is_text_field || is_field_editor {
+                        let _: bool =
+                            msg_send![window, makeFirstResponder: std::ptr::null::<AnyObject>()];
+                    }
+                }
+            }
+        }
+        let _: () = msg_send![
+            super(
+                _self as *mut AnyObject,
+                objc2::runtime::AnyClass::get(c"NSWindow").unwrap()
+            ),
+            sendEvent: event
+        ];
+    }
+}
 
 /// 设置窗口的 performKeyEquivalent: 重写:key window 时拦截 Cmd+Q 退出 app。
 /// 组合键(Cmd+...)的分发走 performKeyEquivalent: 链路(key window responder chain 先于
@@ -3502,6 +4067,13 @@ fn settings_window_class() -> *mut AnyObject {
                 settings_window_close as *mut c_void,
                 types_close.as_ptr(),
             );
+            let types_event = CString::new("v@:@").unwrap(); // -sendEvent:(NSEvent*) -> void
+            class_addMethod(
+                cls,
+                sel!(sendEvent:),
+                settings_window_send_event as *mut c_void,
+                types_event.as_ptr(),
+            );
             let types_key = CString::new("B@:@").unwrap(); // -performKeyEquivalent:(NSEvent*) -> BOOL
             class_addMethod(
                 cls,
@@ -3524,37 +4096,24 @@ fn settings_window_class() -> *mut AnyObject {
 
 fn create_settings_window() {
     unsafe {
-        // 窗口宽:玻璃卡片 195(260 的 75%)+ 10 间隙 + 内容 429 + 右缘 12 = 656。
-        // Window width: 195 glass card (75% of 260) + 10pt gap + 429 content + 12pt right
-        // margin = 656.
-        let view_w = 656.0;
-        let card_margin = 10.0;
+        // Keep the original compact settings window dimensions while applying the redesign's
+        // typography, spacing, controls, and grouped-card treatment.
+        // 保持原来的紧凑窗口尺寸，同时应用 redesign 的字体、间距、控件和分组卡片风格。
+        // Give the redesigned detail pane enough room for full labels, links, and wide fields
+        // while keeping the sidebar and the existing window height unchanged.
+        let view_w = 760.0;
+        let card_margin = 0.0;
         let card_w = 195.0;
-        // 圆角分两档:窗口外框大圆角 26(unified 工具栏把主题帧圆角从 16 提到 26,见工具栏
-        // 代码),侧边栏玻璃卡片圆角当前取 16(试调值;LinearMouse 原生是 8,窗口是 26)。
-        // contentView 裁剪必须用 window_clip_radius(与窗口形状一致),否则 8~26 之间会露出
-        // 透明角。
-        // Corner radius comes in two tiers: the window frame is big (26, raised from 16 by the
-        // unified toolbar -- see the toolbar code), while the sidebar glass card currently uses
-        // 16 (a tuning value; LinearMouse's native proportions are 8 for the sidebar and 26 for
-        // the window). The contentView clip must use window_clip_radius to match the window
-        // shape, or the gap between the two radii would show through as transparent corners.
         let window_clip_radius = 26.0;
-        let card_radius = 16.0;
+        let card_radius = 0.0;
         let style: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
         // titled + closable + miniaturizable + resizable(三个红绿灯齐全)。resizable 是绿色 zoom
         // 按钮出现的必要条件;布局是绝对定位不随缩放,故下方用 min=max 固定窗口尺寸。
         // titled + closable + miniaturizable + resizable (all three traffic lights). resizable is
         // required for the green zoom button to appear; the layout is absolute-positioned and
         // doesn't adapt, so the window size is fixed below via min=max.
-        // 窗口加左侧玻璃卡片后:宽 420 -> 580(旧侧边栏 150 + 1pt 分隔 + 内容 429),
-        // 卡片加宽后 -> 721(卡片 260 + 10 间隙 + 内容 429 + 右缘 12),卡片回调后 -> 656
-        // (卡片 195 + 10 间隙 + 内容 429 + 右缘 12)。
-        // 内容拆成「通用 / 实验性」两页后,通用页(6 段 10 行)最高,高 768 -> 600 不够;
-        // 通用页顶部预留 Accessibility 权限警告条,再加 60 -> 660;多出的窗口显示位置行再 +30 -> 690。
-        // Content is split into separate page containers; the General page (6 sections, 10 rows)
-        // is the tallest, so 600 doesn't fit; +60 -> 660 reserves the Accessibility permission
-        // warning banner at the top, and the overlay-position row adds +30 -> 690.
+        // The page content uses generous spacing and grouped cards so the controls remain easy
+        // to scan without compressing the taller sections.
         // 初始位置:主显示器(screens[0])居中。不要用 NSScreen mainScreen(其语义是跟随
         // 键盘焦点窗口的屏幕,不是主屏,见 overlay_target_screen 的注释)。
         // Initial position: centered on the primary display (screens[0]). Don't use
@@ -3636,6 +4195,9 @@ fn create_settings_window() {
         let _: () = msg_send![window, setTitleVisibility: 1isize]; // NSWindowTitleHidden
         let layout_rect: NSRect = msg_send![window, contentLayoutRect];
         let layout_h = layout_rect.size.height.min(content_h);
+        // Keep a modest top inset in the detail pane. The previous 12pt cursor left a visibly
+        // larger gap than the HTML content's 48px padding once the native toolbar was included.
+        let page_top = layout_h + 20.0;
 
         // 窗口圆角:窗口自绘的 opaque 背景(系统默认小圆角)会盖住 contentView 的裁剪,
         // 单靠 layer cornerRadius 圆角出不来。做法:setOpaque:NO 关掉窗口自绘背景,由
@@ -3649,8 +4211,8 @@ fn create_settings_window() {
         // windowBackgroundColor itself (a semantic color) clipped to window_clip_radius (26,
         // matching the window shape). Theme switches invalidate and rebuild the window, so the
         // color is re-captured and never goes stale across light/dark changes. The traffic lights
-        // are window chrome outside contentView (not clipped); the card's 10pt margin and the
-        // version label stay clear of the corner zone.
+        // are window chrome outside contentView (not clipped); the card's 10pt margin stays clear
+        // of the corner zone.
         let _: () = msg_send![window, setOpaque: false];
         let _: () = msg_send![content, setWantsLayer: true];
         let cv_layer: *mut AnyObject = msg_send![content, layer];
@@ -3713,15 +4275,19 @@ fn create_settings_window() {
             update_auto_check: std::ptr::null_mut(),
         };
 
-        // 内容区 x(卡片右缘 + 10pt 间隙)、宽 / content area x (card right edge + 10pt gap) and width
-        let content_x = card_margin + card_w + card_margin; // 10 + 260 + 10 = 280
-        let content_w = view_w - content_x - 12.0; // 721 - 280 - 12 = 429
+        // The sidebar and detail pane meet directly at the original sidebar boundary; their
+        // backgrounds provide the visual split instead of an inset outer card.
+        // 左侧导航和右侧详情直接衔接，通过两种背景色区分，不再使用内缩的外框卡片。
+        let content_x = card_w;
+        let content_w = view_w - content_x;
         let label_x = 12.0;
         let label_w = 150.0;
         let ctrl_x = 170.0;
         let ctrl_w = content_w - ctrl_x - 12.0;
-        let row_h = 22.0;
-        let row_pitch = 28.0;
+        // HTML `.row` uses a 34pt control and roughly 54pt visual row; the native labels and
+        // controls share that rhythm while grouped cards provide the surrounding padding.
+        let row_h = 34.0;
+        let row_pitch = 42.0;
 
         let target = match *MENU_TARGET.lock().unwrap() {
             Some(t) => t.0,
@@ -3731,16 +4297,10 @@ fn create_settings_window() {
         // --- 侧边栏 sidebar(悬浮玻璃卡片,系统设置同款观感)---
         // macOS 26+ 用 NSGlassEffectView(Liquid Glass,不设 tint 用系统默认);
         // 旧版用 NSVisualEffectView + sidebar 材质(经典磨砂侧边栏)。
-        // 卡片宽 195、四周统一 10pt 留白(顶部与底部一致,不顶到窗口边框)、四角圆角 16
-        // (当前试调值,见 card_radius 常量注释)。
-        // 玻璃材质自带视觉边界,原来的 1pt 分隔线随之删除。
-        // --- Sidebar: a floating glass card, same look as System Settings ---
+        // --- Sidebar: a flat navigation column, matching the reference layout ---
         // macOS 26+ uses NSGlassEffectView (Liquid Glass, system default tint);
         // older macOS uses NSVisualEffectView with the sidebar material (classic frosted look).
-        // The card is 195 wide with a uniform 10pt margin all around (top matches the bottom,
-        // not flush with the window frame) and a 16pt corner radius (current tuning value; see
-        // the card_radius constant's comment). The glass material carries its own edge, so the
-        // old 1pt divider is removed.
+        // The glass material supplies the subtle separation from the content pane.
         let card_h = content_h - card_margin * 2.0;
         let sidebar_view: *mut AnyObject = if AnyClass::get(c"NSGlassEffectView").is_some() {
             let cls = AnyClass::get(c"NSGlassEffectView").unwrap();
@@ -3773,46 +4333,171 @@ fn create_settings_window() {
             }
             ve
         };
+        // Keep the navigation pane a distinct light-gray surface, while the detail pane uses the
+        // window background. This mirrors the HTML reference's two-pane split without an inset
+        // border around the whole settings area.
+        let sidebar_layer: *mut AnyObject = msg_send![sidebar_view, layer];
+        if !sidebar_layer.is_null() {
+            layer_set_background(sidebar_layer, crate::ffi::hex_to_cg_color(0xF2F2F4DBu32));
+        }
         // 自适应:左侧锚定、高度随窗口拉伸(HeightSizable|MaxXMargin = 16|4 = 20)。
         // Adaptive: left-anchored, height stretches with the window.
         let _: () = msg_send![sidebar_view, setAutoresizingMask: 20u64];
         let _: () = msg_send![content, addSubview: sidebar_view];
         release_obj(sidebar_view);
 
+        // HTML `.sidebar { border-right: 1px solid rgba(0,0,0,.055) }`.
+        let sidebar_divider: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let sidebar_divider: *mut AnyObject = msg_send![
+            sidebar_divider,
+            initWithFrame: NSRect::new(
+                NSPoint::new(card_w - 1.0, 0.0),
+                NSSize::new(1.0, content_h)
+            )
+        ];
+        let _: () = msg_send![sidebar_divider, setWantsLayer: true];
+        let divider_layer: *mut AnyObject = msg_send![sidebar_divider, layer];
+        if !divider_layer.is_null() {
+            layer_set_background(divider_layer, crate::ffi::hex_to_cg_color(0x0000000Eu32));
+        }
+        let _: () = msg_send![sidebar_divider, setAutoresizingMask: 20u64];
+        let _: () = msg_send![content, addSubview: sidebar_divider];
+        release_obj(sidebar_divider);
+
+        // The right detail pane has its own white surface, directly beside the gray sidebar.
+        let main_background: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let main_background: *mut AnyObject = msg_send![
+            main_background,
+            initWithFrame: NSRect::new(
+                NSPoint::new(content_x, 0.0),
+                NSSize::new(content_w, content_h)
+            )
+        ];
+        let _: () = msg_send![main_background, setWantsLayer: true];
+        let main_layer: *mut AnyObject = msg_send![main_background, layer];
+        if !main_layer.is_null() {
+            layer_set_background(main_layer, crate::ffi::hex_to_cg_color(0xFFFFFFB0u32));
+        }
+        let _: () = msg_send![main_background, setAutoresizingMask: 18u64];
+        let _: () = msg_send![content, addSubview: main_background];
+        release_obj(main_background);
+
+        // HTML `.footer`: a 62pt bottom bar with its own light surface and hairline separator.
+        // It lives inside the detail pane and stays pinned to the bottom while the page grows.
+        let footer: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let footer: *mut AnyObject = msg_send![
+            footer,
+            initWithFrame: NSRect::new(
+                NSPoint::new(content_x, 0.0),
+                NSSize::new(content_w, 62.0),
+            )
+        ];
+        let _: () = msg_send![footer, setWantsLayer: true];
+        let footer_layer: *mut AnyObject = msg_send![footer, layer];
+        if !footer_layer.is_null() {
+            layer_set_background(footer_layer, crate::ffi::hex_to_cg_color(0xF8F8F9D1u32));
+        }
+        let footer_line: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let footer_line: *mut AnyObject = msg_send![
+            footer_line,
+            initWithFrame: NSRect::new(
+                NSPoint::new(0.0, 61.0),
+                NSSize::new(content_w, 1.0),
+            )
+        ];
+        let _: () = msg_send![footer_line, setWantsLayer: true];
+        let footer_line_layer: *mut AnyObject = msg_send![footer_line, layer];
+        if !footer_line_layer.is_null() {
+            layer_set_background(
+                footer_line_layer,
+                crate::ffi::hex_to_cg_color(0x00000012u32),
+            );
+        }
+        let _: () = msg_send![footer, addSubview: footer_line];
+        release_obj(footer_line);
+        let _: () = msg_send![footer, setAutoresizingMask: 18u64];
+        let _: () = msg_send![content, addSubview: footer];
+        release_obj(footer);
+
+        // Sidebar identity block, matching the redesign's app title and subtitle above the nav.
+        let app_title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let app_title: *mut AnyObject = msg_send![
+            app_title,
+            initWithFrame: NSRect::new(
+                // Sidebar content spans the full content view, including the unified toolbar
+                // strip where the traffic lights live. Anchor the identity block to that full
+                // height so it follows the HTML sidebar's compact top padding instead of being
+                // pushed down by the toolbar's contentLayoutRect inset.
+                NSPoint::new(24.0, content_h - 74.0),
+                NSSize::new(card_w - 48.0, 22.0)
+            )
+        ];
+        set_field(app_title, "Oh My Tab");
+        let _: () = msg_send![app_title, setBezeled: false];
+        let _: () = msg_send![app_title, setDrawsBackground: false];
+        let _: () = msg_send![app_title, setEditable: false];
+        let app_title_font: *mut AnyObject =
+            msg_send![class!(NSFont), boldSystemFontOfSize: 15.0f64];
+        let _: () = msg_send![app_title, setFont: app_title_font];
+        let app_title_color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
+        let _: () = msg_send![app_title, setTextColor: app_title_color];
+        let _: () = msg_send![sidebar_view, addSubview: app_title];
+        release_obj(app_title);
+        let app_subtitle: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let app_subtitle: *mut AnyObject = msg_send![
+            app_subtitle,
+            initWithFrame: NSRect::new(
+                NSPoint::new(24.0, content_h - 94.0),
+                NSSize::new(card_w - 48.0, 18.0)
+            )
+        ];
+        set_field(app_subtitle, t("settings.window_title"));
+        let _: () = msg_send![app_subtitle, setBezeled: false];
+        let _: () = msg_send![app_subtitle, setDrawsBackground: false];
+        let _: () = msg_send![app_subtitle, setEditable: false];
+        let app_subtitle_font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: 11.5f64];
+        let _: () = msg_send![app_subtitle, setFont: app_subtitle_font];
+        let app_subtitle_color: *mut AnyObject = msg_send![class!(NSColor), tertiaryLabelColor];
+        let _: () = msg_send![app_subtitle, setTextColor: app_subtitle_color];
+        let _: () = msg_send![sidebar_view, addSubview: app_subtitle];
+        release_obj(app_subtitle);
+
         // 侧边栏选中行的高亮背景(layer-backed NSView,theme 感知色),先于按钮加入以便按钮文字叠在上层。
         // Highlight background for the selected sidebar row (layer-backed NSView, theme-aware color);
         // added before the buttons so button titles draw on top of it.
-        // 卡片内布局:内边距 12;按钮顶边放在 layout_h(条带底)下方 6pt,靠近红绿灯
+        // 卡片内布局:内边距 12;按钮顶边按完整侧边栏高度定位,靠近红绿灯
         // (btn_y0 为卡片坐标系)。
-        // Card-local layout: 12pt inner margins. The buttons' top edge sits 6pt below layout_h
-        // (the strip's bottom) so they stay close to the traffic lights. btn_y0 is in card coords.
-        let btn_w = card_w - 24.0;
-        let btn_h = 28.0;
-        let btn_y0 = layout_h - card_margin - 6.0 - btn_h;
+        // Card-local layout: 12pt inner margins. The buttons stay close to the traffic lights;
+        // btn_y0 is anchored to the full sidebar height rather than the toolbar-inset height.
+        let btn_w = card_w - 28.0;
+        let btn_h = 38.0;
+        // Sidebar navigation is also anchored to the full-height sidebar. Using layout_h here
+        // includes the toolbar inset a second time and leaves a large blank gap above the title.
+        let btn_y0 = content_h - card_margin - 112.0 - btn_h;
         let highlight: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let highlight: *mut AnyObject = msg_send![highlight, initWithFrame: NSRect::new(NSPoint::new(12.0, btn_y0), NSSize::new(btn_w, btn_h))];
+        let highlight: *mut AnyObject = msg_send![highlight, initWithFrame: NSRect::new(NSPoint::new(14.0, btn_y0), NSSize::new(btn_w, btn_h))];
         let _: () = msg_send![highlight, setAutoresizingMask: 12u64]; // 贴顶、贴左 / top- and left-anchored
         let _: () = msg_send![highlight, setWantsLayer: true];
         let hl_layer: *mut AnyObject = msg_send![highlight, layer];
-        let _: () = msg_send![hl_layer, setCornerRadius: 6.0f64];
+        let _: () = msg_send![hl_layer, setCornerRadius: 10.0f64];
         // 选中高亮用系统强调色(controlAccentColor),与 NSSwitch 开启的蓝色一致
         // (LinearMouse 侧边栏选中高亮同款)。
         // Selection highlight uses the system accent color (controlAccentColor), matching the
         // NSSwitch's on-state blue (same as LinearMouse's sidebar selection highlight).
-        let sel_color: *mut AnyObject = msg_send![class!(NSColor), controlAccentColor];
-        layer_set_background(hl_layer, ns_color_to_cg(sel_color));
+        // The redesign uses a soft accent wash for the active row rather than a solid blue fill.
+        layer_set_background(hl_layer, crate::ffi::hex_to_cg_color(0x0A84FF1Fu32));
         let _: () = msg_send![sidebar_view, addSubview: highlight];
         release_obj(highlight);
         ui.sidebar_highlight = highlight;
 
-        // 四个侧边栏按钮(borderless,tag 0..3,点击触发 handleSettingsSidebar:)。
-        // Four sidebar buttons (borderless, tags 0..3; click triggers handleSettingsSidebar:).
+        // Five sidebar buttons (borderless, tags 0..4; click triggers handleSettingsSidebar:).
         ui.sidebar_general = make_sidebar_button(
             sidebar_view,
             target,
             &t("settings.sidebar_general"),
             0,
-            12.0,
+            14.0,
             btn_y0,
             btn_w,
         );
@@ -3821,8 +4506,8 @@ fn create_settings_window() {
             target,
             &t("settings.sidebar_switcher"),
             1,
-            12.0,
-            btn_y0 - 34.0,
+            14.0,
+            btn_y0 - 42.0,
             btn_w,
         );
         ui.sidebar_mouse = make_sidebar_button(
@@ -3830,8 +4515,8 @@ fn create_settings_window() {
             target,
             &t("settings.sidebar_mouse"),
             2,
-            12.0,
-            btn_y0 - 68.0,
+            14.0,
+            btn_y0 - 84.0,
             btn_w,
         );
         ui.sidebar_clipboard = make_sidebar_button(
@@ -3839,8 +4524,8 @@ fn create_settings_window() {
             target,
             &t("settings.sidebar_clipboard"),
             3,
-            12.0,
-            btn_y0 - 102.0,
+            14.0,
+            btn_y0 - 126.0,
             btn_w,
         );
         ui.sidebar_about = make_sidebar_button(
@@ -3848,10 +4533,40 @@ fn create_settings_window() {
             target,
             &t("settings.sidebar_about"),
             4,
-            12.0,
-            btn_y0 - 136.0,
+            14.0,
+            btn_y0 - 168.0,
             btn_w,
         );
+
+        // HTML `.sidebar-footer`: separator plus a compact Restore Defaults button at the
+        // bottom of the navigation column, rather than in the main footer.
+        let sidebar_footer_line: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let sidebar_footer_line: *mut AnyObject = msg_send![
+            sidebar_footer_line,
+            initWithFrame: NSRect::new(
+                NSPoint::new(14.0, 61.0),
+                NSSize::new(card_w - 28.0, 1.0),
+            )
+        ];
+        let _: () = msg_send![sidebar_footer_line, setWantsLayer: true];
+        let sidebar_footer_layer: *mut AnyObject = msg_send![sidebar_footer_line, layer];
+        if !sidebar_footer_layer.is_null() {
+            layer_set_background(
+                sidebar_footer_layer,
+                crate::ffi::hex_to_cg_color(0x0000000Fu32),
+            );
+        }
+        let _: () = msg_send![sidebar_view, addSubview: sidebar_footer_line];
+        release_obj(sidebar_footer_line);
+        let restore = make_settings_action_button(
+            NSRect::new(NSPoint::new(22.0, 20.0), NSSize::new(card_w - 44.0, 30.0)),
+            &t("settings.btn_restore_defaults"),
+            target,
+            sel!(handleRestoreDefaults:),
+        );
+        let _: () = msg_send![restore, setAutoresizingMask: 36u64];
+        let _: () = msg_send![sidebar_view, addSubview: restore];
+        release_obj(restore);
 
         // --- 通用页容器 general page container ---
         let general_view: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -3899,7 +4614,15 @@ fn create_settings_window() {
         ui.about_view = about_view;
 
         // ===== 通用页内容 general page content =====
-        let mut y = layout_h - 12.0; // 顶部光标:下一个元素的底边 y / top cursor (bottom y of next element)
+        let mut y = page_top; // 顶部光标:下一个元素的底边 y / top cursor (bottom y of next element)
+        add_page_title(
+            general_view,
+            &t("settings.sidebar_general"),
+            label_x,
+            y - 34.0,
+            content_w - label_x * 2.0,
+        );
+        y -= 62.0;
 
         // --- Accessibility 权限警告条(通用页顶部覆盖;仅缺权限时显示,show_settings 里按 setHidden 切换) ---
         // --- Accessibility permission warning banner (floats at the top of General; shown only
@@ -3914,7 +4637,7 @@ fn create_settings_window() {
         let banner: *mut AnyObject = msg_send![
             banner,
             initWithFrame: NSRect::new(
-                NSPoint::new(0.0, layout_h - 12.0 - banner_h),
+                NSPoint::new(0.0, page_top - banner_h),
                 NSSize::new(content_w, banner_h)
             )
         ];
@@ -3966,12 +4689,13 @@ fn create_settings_window() {
 
         // --- 外观 Appearance ---
         y -= 12.0;
+        let appearance_header_y = y;
         add_header(
             general_view,
             &t("settings.header_appearance"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         y -= 8.0 + row_h;
         ui.glass_style = add_row(
@@ -3986,6 +4710,7 @@ fn create_settings_window() {
         let _: () = msg_send![ui.glass_style, setTarget: target];
         let _: () = msg_send![ui.glass_style, setAction: sel!(handleGlassStyleChanged:)];
         y -= row_pitch;
+        add_row_separator(general_view, 0.0, y + row_h + 3.0, content_w);
         ui.glass_tint = add_row(
             general_view,
             label_x,
@@ -4009,19 +4734,19 @@ fn create_settings_window() {
         add_header(
             general_view,
             &t("settings.header_preview"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         y -= 8.0 + row_h;
-        let preview_h = 58.0;
+        let preview_h = 90.0;
         let preview_y = y - preview_h;
-        let preview_w = (content_w - 36.0) / 2.0;
-        let right_preview_x = 12.0 + preview_w + 12.0;
+        let preview_w = (content_w - 2.0 * label_x - 12.0) / 2.0;
+        let right_preview_x = label_x + preview_w + 12.0;
         add_preview_caption(
             general_view,
             &t("settings.preview_switcher"),
-            12.0,
+            label_x,
             preview_y + preview_h + 3.0,
             preview_w,
         );
@@ -4033,7 +4758,7 @@ fn create_settings_window() {
             preview_w,
         );
         ui.glass_preview_switcher =
-            make_glass_preview(general_view, 12.0, preview_y, preview_w, preview_h, true);
+            make_glass_preview(general_view, label_x, preview_y, preview_w, preview_h, true);
         ui.glass_preview_clipboard = make_glass_preview(
             general_view,
             right_preview_x,
@@ -4043,15 +4768,26 @@ fn create_settings_window() {
             false,
         );
         y = preview_y;
+        add_settings_card(
+            general_view,
+            NSRect::new(
+                NSPoint::new(6.0, preview_y - 12.0),
+                NSSize::new(
+                    content_w - 12.0,
+                    (appearance_header_y + 2.0) - (preview_y - 12.0),
+                ),
+            ),
+        );
 
         // --- 语言 Language ---
         y -= 14.0 + 24.0;
+        let language_header_y = y;
         add_header(
             general_view,
             &t("settings.header_language"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         y -= 8.0 + row_h;
         ui.locale = add_row(
@@ -4063,15 +4799,23 @@ fn create_settings_window() {
             &t("settings.row_locale"),
             make_popup(ctrl_x, y, ctrl_w, row_h, &LOCALE_LABELS, 0),
         );
+        add_settings_card(
+            general_view,
+            NSRect::new(
+                NSPoint::new(6.0, y - 10.0),
+                NSSize::new(content_w - 12.0, (language_header_y + 2.0) - (y - 10.0)),
+            ),
+        );
 
         // --- 日志 Logging ---
         y -= 14.0 + 24.0;
+        let logging_header_y = y;
         add_header(
             general_view,
             &t("settings.header_logging"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         y -= 8.0 + row_h;
         // 日志级别下拉框:项 = [debug, info];默认 index 1(info)。
@@ -4086,15 +4830,23 @@ fn create_settings_window() {
             &t("settings.row_log_level"),
             make_popup(ctrl_x, y, ctrl_w, row_h, &log_levels, 1),
         );
+        add_settings_card(
+            general_view,
+            NSRect::new(
+                NSPoint::new(6.0, y - 10.0),
+                NSSize::new(content_w - 12.0, (logging_header_y + 2.0) - (y - 10.0)),
+            ),
+        );
 
         // --- 启动 Startup ---
         y -= 14.0 + 24.0;
+        let startup_header_y = y;
         add_header(
             general_view,
             &t("settings.header_startup"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         y -= 8.0 + row_h;
         // 开机自启开关:标题留空(左侧 row label 已说明),仅放一个 switch。
@@ -4108,18 +4860,34 @@ fn create_settings_window() {
             &t("settings.row_launch_at_login"),
             make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
+        add_settings_card(
+            general_view,
+            NSRect::new(
+                NSPoint::new(6.0, y - 10.0),
+                NSSize::new(content_w - 12.0, (startup_header_y + 2.0) - (y - 10.0)),
+            ),
+        );
 
         // ===== 应用切换浮窗页内容 switcher overlay page content =====
-        let mut y = layout_h - 12.0;
+        let mut y = page_top;
+        add_page_title(
+            switcher_view,
+            &t("settings.sidebar_switcher"),
+            label_x,
+            y - 34.0,
+            content_w - label_x * 2.0,
+        );
+        y -= 62.0;
 
         // --- 窗口 Window ---
         y -= 12.0;
+        let windows_header_y = y;
         add_header(
             switcher_view,
             &t("settings.header_windows"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         y -= 8.0 + row_h;
         // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器接管)。
@@ -4134,6 +4902,7 @@ fn create_settings_window() {
             make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
         y -= 8.0 + row_h;
+        add_row_separator(switcher_view, 0.0, y + row_h + 3.0, content_w);
         // show_minimized 开关(切换器语义本就只有显/隐两态,用 Toggle 比下拉更直观)。
         // 英文标签较长,该行标签加宽到 225;开关仍与 popup 右缘对齐。
         // show_minimized is inherently two-state, so a toggle is clearer than a popup. The long
@@ -4148,6 +4917,7 @@ fn create_settings_window() {
             make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
         y -= 8.0 + row_h;
+        add_row_separator(switcher_view, 0.0, y + row_h + 3.0, content_w);
         // 窗口显示模式:仅图标或图标和缩略图;配置仍由 thumbnails_enabled 布尔值保存。
         // Window display mode: icons only or icons and thumbnails; the config remains stored as
         // the thumbnails_enabled boolean.
@@ -4169,6 +4939,7 @@ fn create_settings_window() {
             make_popup(ctrl_x, y, ctrl_w, row_h, &window_display_mode_refs, 0),
         );
         y -= 8.0 + row_h;
+        add_row_separator(switcher_view, 0.0, y + row_h + 3.0, content_w);
         // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0。
         // overlay_position popup: [Follow Active Window, Always on Main Screen]; default index 0.
         let op_labels = [
@@ -4186,6 +4957,7 @@ fn create_settings_window() {
             make_popup(ctrl_x, y, ctrl_w, row_h, &op_label_refs, 0),
         );
         y -= 8.0 + row_h;
+        add_row_separator(switcher_view, 0.0, y + row_h + 3.0, content_w);
         ui.corner_radius = add_row(
             switcher_view,
             label_x,
@@ -4195,15 +4967,23 @@ fn create_settings_window() {
             &t("settings.row_corner_radius"),
             make_text_input(ctrl_x, y, ctrl_w, row_h, "64"),
         );
+        add_settings_card(
+            switcher_view,
+            NSRect::new(
+                NSPoint::new(6.0, y - 10.0),
+                NSSize::new(content_w - 12.0, (windows_header_y + 2.0) - (y - 10.0)),
+            ),
+        );
 
         // --- 键盘 Keyboard ---
         y -= 14.0 + 24.0;
+        let keyboard_header_y = y;
         add_header(
             switcher_view,
             &t("settings.header_keyboard"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         y -= 8.0 + row_h;
         // 修饰键下拉项:显示 Option+Tab / Command+Tab;值由索引映射到 option/command。
@@ -4222,12 +5002,28 @@ fn create_settings_window() {
             &t("settings.row_modifier"),
             make_popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0),
         );
+        add_settings_card(
+            switcher_view,
+            NSRect::new(
+                NSPoint::new(6.0, y - 10.0),
+                NSSize::new(content_w - 12.0, (keyboard_header_y + 2.0) - (y - 10.0)),
+            ),
+        );
 
         // ===== 鼠标页内容 mouse page content =====
-        let mut y = layout_h - 12.0;
+        let mut y = page_top;
+        add_page_title(
+            mouse_view,
+            &t("settings.sidebar_mouse"),
+            label_x,
+            y - 34.0,
+            content_w - label_x * 2.0,
+        );
+        y -= 62.0;
 
         // --- 启用鼠标控制(总开关,置于最顶) / Enable mouse control (topmost) ---
         y -= 8.0 + row_h;
+        let enable_mouse_bottom = y;
         ui.enable_mouse = add_row(
             mouse_view,
             label_x,
@@ -4241,15 +5037,23 @@ fn create_settings_window() {
         // Update OK button title in real time when the switch toggles (OK vs OK && Restart).
         let _: () = msg_send![ui.enable_mouse, setTarget: target];
         let _: () = msg_send![ui.enable_mouse, setAction: sel!(handleEnableMouseToggle:)];
+        add_settings_card(
+            mouse_view,
+            NSRect::new(
+                NSPoint::new(6.0, enable_mouse_bottom - 10.0),
+                NSSize::new(content_w - 12.0, row_h + 20.0),
+            ),
+        );
 
         // --- 设备选择器(内嵌下拉框,切换即时刷新其余控件) / Device picker (inline popup) ---
         y -= 14.0 + 24.0;
+        let device_header_y = y;
         add_header(
             mouse_view,
             &t("settings.header_mouse_device"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         y -= 8.0 + row_h;
         // 下拉框:items 在 load_settings_values 里动态重建(设备列表可变)。
@@ -4287,6 +5091,15 @@ fn create_settings_window() {
         // Refresh the conditional visibility of the "lines per tick" row on mode switch.
         let _: () = msg_send![ui.scroll_mode, setTarget: target];
         let _: () = msg_send![ui.scroll_mode, setAction: sel!(handleScrollModeChanged:)];
+        // The HTML device card contains both rows, with one internal hairline between them.
+        add_row_separator(mouse_view, 0.0, y + row_h + 3.0, content_w);
+        add_settings_card(
+            mouse_view,
+            NSRect::new(
+                NSPoint::new(6.0, y - 10.0),
+                NSSize::new(content_w - 12.0, (device_header_y + 2.0) - (y - 10.0)),
+            ),
+        );
 
         // --- 行数(按行模式) / Line count (line mode) ---
         y -= 8.0 + row_h;
@@ -4331,9 +5144,9 @@ fn create_settings_window() {
         add_header(
             mouse_view,
             &t("settings.header_mouse_scrolling"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         y -= 8.0 + row_h;
         // reverse_scroll 开关:标题留空(左侧 row label 已说明),仅放一个 switch。
@@ -4347,15 +5160,23 @@ fn create_settings_window() {
             &t("settings.row_reverse_scroll"),
             make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
+        add_settings_card(
+            mouse_view,
+            NSRect::new(
+                NSPoint::new(6.0, y - 10.0),
+                NSSize::new(content_w - 12.0, row_h + 20.0),
+            ),
+        );
 
         // --- 指针 Pointer ---
         y -= 14.0 + 24.0;
+        let pointer_header_y = y;
         add_header(
             mouse_view,
             &t("settings.header_mouse_pointer"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         y -= 8.0 + row_h;
         // disable_pointer_accel 开关:禁用系统鼠标加速,光标 1:1 线性跟踪。
@@ -4375,6 +5196,13 @@ fn create_settings_window() {
             &t("settings.row_disable_pointer_accel"),
             make_switch(ctrl_x + ctrl_w, y, row_h, false),
         );
+        add_settings_card(
+            mouse_view,
+            NSRect::new(
+                NSPoint::new(6.0, y - 10.0),
+                NSSize::new(content_w - 12.0, (pointer_header_y + 2.0) - (y - 10.0)),
+            ),
+        );
 
         // --- 按键映射 Button Mappings ---
         // 绑定区:header + 滚动列表(固定高度,行溢出时滚动)+ 录制提示 + 添加按钮。
@@ -4386,9 +5214,9 @@ fn create_settings_window() {
         add_header(
             mouse_view,
             &t("settings.header_mouse_mappings"),
-            12.0,
+            label_x,
             y,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         // 映射总开关(per-device):header 行右侧的开关(NSSwitch,与设置行同款)。
         // The mappings master switch (per-device): a switch at the header row's right
@@ -4471,7 +5299,7 @@ fn create_settings_window() {
         let btn_bottom = card_bottom - 14.0 - row_h;
         let add_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
         let add_btn: *mut AnyObject = msg_send![add_btn, initWithFrame: NSRect::new(NSPoint::new(label_x, btn_bottom), NSSize::new(card_w, row_h))];
-        let _: () = msg_send![add_btn, setBezelStyle: 2isize]; // NSRoundedBezelStyle
+        style_html_button(add_btn, 0xFFFFFFADu32, 0x2E2E2EFFu32);
         let add_title = make_nsstring(&t("settings.row_add_mapping"));
         let _: () = msg_send![add_btn, setTitle: add_title];
         CFRelease(add_title as *const c_void);
@@ -4487,13 +5315,22 @@ fn create_settings_window() {
         // ===== 剪贴板历史页内容 clipboard page content =====
         // 独立布局游标(该页内容与鼠标页互不相关)。
         // Independent layout cursor (this page's content is unrelated to the mouse page).
-        let mut cy = layout_h - 12.0;
+        let mut cy = page_top;
+        add_page_title(
+            clipboard_view,
+            &t("settings.sidebar_clipboard"),
+            label_x,
+            cy - 34.0,
+            content_w - label_x * 2.0,
+        );
+        cy -= 62.0;
+        let clipboard_header_y = cy - 18.0;
         add_header(
             clipboard_view,
             &t("settings.header_clipboard"),
-            12.0,
+            label_x,
             cy - 18.0,
-            content_w - 24.0,
+            content_w - 2.0 * label_x,
         );
         // header 与首行间距与其他页一致(8 + row_h = 30):此前 16pt 挨得太近。
         // Header-to-first-row gap matches the other pages (8 + row_h = 30); it used to be
@@ -4515,6 +5352,7 @@ fn create_settings_window() {
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
         cy -= 8.0 + row_h;
+        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
         // 置顶后选中项位置下拉框:项 = [跟随置顶, 保持当前位置];默认 index 0(跟随置顶),
         // 实际值由 load_settings_from 填充。
         // Pin-selection popup: items = [Follow the Pinned Entry, Keep Current Position];
@@ -4534,6 +5372,7 @@ fn create_settings_window() {
             make_popup(ctrl_x, cy, ctrl_w, row_h, &pin_label_refs, 0),
         );
         cy -= 8.0 + row_h;
+        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
         // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。
         // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
         // privacy implications are documented in the README).
@@ -4557,6 +5396,7 @@ fn create_settings_window() {
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
         cy -= 8.0 + row_h;
+        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
         // 显示来源应用 / show the source app.
         ui.clipboard_show_source_app = add_row(
             clipboard_view,
@@ -4568,6 +5408,7 @@ fn create_settings_window() {
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
         cy -= 8.0 + row_h;
+        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
         // 使用后移到最前(粘贴是否重排历史;默认开 = 保持现状)。
         // Move used entries to the top (whether pasting reorders the history; on by
         // default = current behavior).
@@ -4586,6 +5427,7 @@ fn create_settings_window() {
             make_switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
         cy -= 8.0 + row_h;
+        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
         // 最大条数(数字输入)/ max entries (number input).
         ui.clipboard_max_entries = add_row(
             clipboard_view,
@@ -4597,6 +5439,7 @@ fn create_settings_window() {
             make_text_input(ctrl_x, cy, ctrl_w, row_h, "50"),
         );
         cy -= 8.0 + row_h;
+        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
         // 自动过期天数(数字输入,0 = 关闭)/ auto-expire days (number input, 0 = off).
         ui.clipboard_auto_expire_days = add_row(
             clipboard_view,
@@ -4608,6 +5451,7 @@ fn create_settings_window() {
             make_text_input(ctrl_x, cy, ctrl_w, row_h, "3"),
         );
         cy -= 8.0 + row_h;
+        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
         // 呼出快捷键说明(只读 label)/ shortcut hint (read-only label).
         let hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let hint: *mut AnyObject = msg_send![hint, initWithFrame: NSRect::new(NSPoint::new(label_x, cy), NSSize::new(content_w - 24.0, row_h))];
@@ -4617,46 +5461,78 @@ fn create_settings_window() {
         let _: () = msg_send![hint, setEditable: false];
         let _: () = msg_send![clipboard_view, addSubview: hint];
         release_obj(hint);
-
-        // ===== 关于页内容 about page content =====
-        let mut ay = layout_h - 12.0;
-        add_header(
-            about_view,
-            &t("settings.header_about"),
-            12.0,
-            ay - 18.0,
-            content_w - 24.0,
+        add_settings_card(
+            clipboard_view,
+            NSRect::new(
+                NSPoint::new(6.0, cy - 10.0),
+                NSSize::new(content_w - 12.0, (clipboard_header_y + 2.0) - (cy - 10.0)),
+            ),
         );
-        ay -= 18.0 + 10.0 + 30.0;
 
-        let version_text = tf(
-            "settings.version_label",
-            &[("version", env!("CARGO_PKG_VERSION"))],
-        );
-        let about_version: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let about_version: *mut AnyObject = msg_send![
-            about_version,
+        // ===== About page: page-header + App and Updates cards from preview (10). =====
+        let header_top = page_top - 12.0;
+        add_about_app_icon(about_view, label_x, header_top - 58.0);
+
+        let about_title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let about_title: *mut AnyObject = msg_send![
+            about_title,
             initWithFrame: NSRect::new(
-                NSPoint::new(label_x, ay),
-                NSSize::new(content_w - 24.0, 30.0),
+                NSPoint::new(label_x + 73.0, header_top - 33.0),
+                NSSize::new(content_w - 73.0 - label_x, 28.0),
             )
         ];
-        set_field(about_version, version_text);
-        let _: () = msg_send![about_version, setBezeled: false];
-        let _: () = msg_send![about_version, setDrawsBackground: false];
-        let _: () = msg_send![about_version, setEditable: false];
-        let about_version_font: *mut AnyObject =
-            msg_send![class!(NSFont), boldSystemFontOfSize: 16.0f64];
-        let _: () = msg_send![about_version, setFont: about_version_font];
-        let _: () = msg_send![about_view, addSubview: about_version];
-        release_obj(about_version);
-        ay -= 8.0 + 30.0;
+        set_field(about_title, "Oh My Tab");
+        let _: () = msg_send![about_title, setBezeled: false];
+        let _: () = msg_send![about_title, setDrawsBackground: false];
+        let _: () = msg_send![about_title, setEditable: false];
+        let about_title_font: *mut AnyObject =
+            msg_send![class!(NSFont), boldSystemFontOfSize: 24.0f64];
+        let _: () = msg_send![about_title, setFont: about_title_font];
+        let _: () = msg_send![about_view, addSubview: about_title];
+        release_obj(about_title);
 
+        let about_subtitle: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let about_subtitle: *mut AnyObject = msg_send![
+            about_subtitle,
+            initWithFrame: NSRect::new(
+                NSPoint::new(label_x + 73.0, header_top - 53.0),
+                NSSize::new(content_w - 73.0 - label_x, 18.0),
+            )
+        ];
+        set_field(
+            about_subtitle,
+            tf(
+                "settings.version_label",
+                &[("version", env!("CARGO_PKG_VERSION"))],
+            ),
+        );
+        let _: () = msg_send![about_subtitle, setBezeled: false];
+        let _: () = msg_send![about_subtitle, setDrawsBackground: false];
+        let _: () = msg_send![about_subtitle, setEditable: false];
+        let about_subtitle_font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+        let _: () = msg_send![about_subtitle, setFont: about_subtitle_font];
+        let about_subtitle_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        let _: () = msg_send![about_subtitle, setTextColor: about_subtitle_color];
+        let _: () = msg_send![about_view, addSubview: about_subtitle];
+        release_obj(about_subtitle);
+
+        let mut ay = header_top - 88.0;
+        let app_label_y = ay - 11.0;
+        add_header(
+            about_view,
+            &t("settings.section_app"),
+            label_x + 3.0,
+            app_label_y,
+            content_w - label_x * 2.0,
+        );
+        ay -= 27.0;
+        let website_y = ay - 44.0;
         let website_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let website_label: *mut AnyObject = msg_send![
             website_label,
             initWithFrame: NSRect::new(
-                NSPoint::new(label_x, ay),
+                NSPoint::new(label_x + 15.0, website_y),
                 NSSize::new(130.0, 28.0),
             )
         ];
@@ -4664,20 +5540,17 @@ fn create_settings_window() {
         let _: () = msg_send![website_label, setBezeled: false];
         let _: () = msg_send![website_label, setDrawsBackground: false];
         let _: () = msg_send![website_label, setEditable: false];
-        let _: () = msg_send![website_label, setAlignment: 0isize]; // left
-        let website_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
-        let _: () = msg_send![website_label, setFont: website_font];
+        let website_label_font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+        let _: () = msg_send![website_label, setFont: website_label_font];
         let _: () = msg_send![about_view, addSubview: website_label];
         release_obj(website_label);
-
-        // The URL itself is the link: borderless NSButton keeps only the visible address blue
-        // and directly clickable, without a separate "Official Website" button.
         let website_url: *mut AnyObject = msg_send![website_link_button_class(), alloc];
         let website_url: *mut AnyObject = msg_send![
             website_url,
             initWithFrame: NSRect::new(
-                NSPoint::new(label_x + 130.0, ay),
-                NSSize::new((content_w - 24.0 - 130.0).max(1.0), 28.0),
+                NSPoint::new(label_x + 145.0, website_y),
+                NSSize::new((content_w - 2.0 * label_x - 145.0).max(1.0), 28.0),
             )
         ];
         set_field(website_url, t("settings.website_url"));
@@ -4685,65 +5558,118 @@ fn create_settings_window() {
         let _: () = msg_send![website_url, setDrawsBackground: false];
         let _: () = msg_send![website_url, setEditable: false];
         let _: () = msg_send![website_url, setSelectable: false];
-        let _: () = msg_send![website_url, setAlignment: 0isize]; // left
-        let website_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
-        let _: () = msg_send![website_url, setFont: website_font];
-        let website_color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
-        let _: () = msg_send![website_url, setTextColor: website_color];
-        let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        let tracking: *mut AnyObject = msg_send![
-            tracking,
-            initWithRect: NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new((content_w - 24.0 - 130.0).max(1.0), 28.0),
-            ),
-            options: 0x01u64 | 0x80u64 | 0x200u64,
-            owner: website_url,
-            userInfo: std::ptr::null::<AnyObject>()
-        ];
-        let _: () = msg_send![website_url, addTrackingArea: tracking];
-        release_obj(tracking);
+        let _: () = msg_send![website_url, setAlignment: 0isize];
+        let website_url_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+        let _: () = msg_send![website_url, setFont: website_url_font];
+        let website_url_color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
+        let _: () = msg_send![website_url, setTextColor: website_url_color];
         let _: () = msg_send![about_view, addSubview: website_url];
         release_obj(website_url);
-        ay -= 8.0 + 28.0;
+        let version_y = website_y - 44.0;
+        let version_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let version_label: *mut AnyObject = msg_send![
+            version_label,
+            initWithFrame: NSRect::new(
+                NSPoint::new(label_x + 15.0, version_y),
+                NSSize::new(130.0, 28.0),
+            )
+        ];
+        set_field(version_label, t("settings.version_label_short"));
+        let _: () = msg_send![version_label, setBezeled: false];
+        let _: () = msg_send![version_label, setDrawsBackground: false];
+        let _: () = msg_send![version_label, setEditable: false];
+        let version_label_font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+        let _: () = msg_send![version_label, setFont: version_label_font];
+        let _: () = msg_send![about_view, addSubview: version_label];
+        release_obj(version_label);
+        let version_value: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let version_value: *mut AnyObject = msg_send![
+            version_value,
+            initWithFrame: NSRect::new(
+                NSPoint::new(label_x + 145.0, version_y),
+                NSSize::new(120.0, 28.0),
+            )
+        ];
+        set_field(version_value, env!("CARGO_PKG_VERSION"));
+        let _: () = msg_send![version_value, setBezeled: false];
+        let _: () = msg_send![version_value, setDrawsBackground: false];
+        let _: () = msg_send![version_value, setEditable: false];
+        let version_value_font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+        let _: () = msg_send![version_value, setFont: version_value_font];
+        let version_value_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        let _: () = msg_send![version_value, setTextColor: version_value_color];
+        let _: () = msg_send![about_view, addSubview: version_value];
+        release_obj(version_value);
+        add_settings_card(
+            about_view,
+            NSRect::new(
+                NSPoint::new(label_x, version_y - 15.0),
+                NSSize::new(content_w - 2.0 * label_x, 98.0),
+            ),
+        );
 
+        ay = version_y - 42.0;
+        add_header(
+            about_view,
+            &t("settings.section_updates"),
+            label_x + 3.0,
+            ay - 11.0,
+            content_w - label_x * 2.0,
+        );
+        ay -= 27.0;
+        let update_row_y = ay - 44.0;
         ui.update_auto_check = add_row(
             about_view,
-            label_x,
-            ay,
+            label_x + 15.0,
+            update_row_y,
             225.0,
             row_h,
             &t("settings.row_update_auto_check"),
-            make_switch(ctrl_x + ctrl_w, ay, row_h, false),
+            make_switch(ctrl_x + ctrl_w, update_row_y, row_h, false),
         );
-        ay -= 14.0 + row_h;
-
         let check_button = make_settings_action_button(
-            NSRect::new(NSPoint::new(ctrl_x, ay), NSSize::new(ctrl_w, 28.0)),
+            NSRect::new(
+                NSPoint::new(label_x + 15.0, update_row_y - 46.0),
+                NSSize::new(content_w - 2.0 * label_x - 30.0, 32.0),
+            ),
             &t("settings.btn_check_for_updates"),
             target,
             sel!(handleCheckForUpdates:),
         );
+        let _: () = msg_send![check_button, setTag: -3isize];
+        let check_layer: *mut AnyObject = msg_send![check_button, layer];
+        if !check_layer.is_null() {
+            layer_set_background(check_layer, crate::ffi::hex_to_cg_color(0x7676801Eu32));
+        }
         let _: () = msg_send![about_view, addSubview: check_button];
         release_obj(check_button);
-        ay -= 8.0 + 28.0;
-
         let update_hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let update_hint: *mut AnyObject = msg_send![
             update_hint,
             initWithFrame: NSRect::new(
-                NSPoint::new(label_x, ay),
-                NSSize::new(content_w - 24.0, row_h),
+                NSPoint::new(label_x + 15.0, update_row_y - 80.0),
+                NSSize::new(content_w - 2.0 * label_x - 30.0, 30.0),
             )
         ];
         set_field(update_hint, t("settings.update_placeholder_hint"));
         let _: () = msg_send![update_hint, setBezeled: false];
         let _: () = msg_send![update_hint, setDrawsBackground: false];
         let _: () = msg_send![update_hint, setEditable: false];
-        let hint_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
-        let _: () = msg_send![update_hint, setTextColor: hint_color];
+        let update_hint_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.5f64];
+        let _: () = msg_send![update_hint, setFont: update_hint_font];
+        let update_hint_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        let _: () = msg_send![update_hint, setTextColor: update_hint_color];
         let _: () = msg_send![about_view, addSubview: update_hint];
         release_obj(update_hint);
+        add_settings_card(
+            about_view,
+            NSRect::new(
+                NSPoint::new(label_x, update_row_y - 91.0),
+                NSSize::new(content_w - 2.0 * label_x, 135.0),
+            ),
+        );
 
         // banner 最后添加:作为 general_view 的最后一个 subview,保证在内容之上(缺权限时覆盖顶部)。
         // Added last: as general_view's final subview so it floats above the content (when
@@ -4751,62 +5677,43 @@ fn create_settings_window() {
         let _: () = msg_send![general_view, addSubview: banner];
         release_obj(banner);
 
-        // --- 确认 / 取消(加在 contentView 上,三页都可见)---
-        // Restore Defaults 按钮(玻璃卡片底部内侧,版本号在其下方),与 OK/Cancel 同在
-        // contentView,两页都可见。宽度限制在卡片内(x=12..138,卡片右缘 x=205)。
-        // Restore Defaults button (inside the glass card's bottom, version label below it),
-        // on contentView like OK/Cancel, visible on both pages. Width kept within the card
-        // (x=12..138, card right edge x=205).
-        let restore = make_settings_action_button(
-            NSRect::new(NSPoint::new(12.0, 44.0), NSSize::new(126.0, 28.0)),
-            &t("settings.btn_restore_defaults"),
-            target,
-            sel!(handleRestoreDefaults:),
-        );
-        let _: () = msg_send![restore, setAutoresizingMask: 36u64]; // 贴底、贴左 / bottom- and left-anchored
-        let _: () = msg_send![content, addSubview: restore];
-        release_obj(restore);
-
-        // 版本号(Restore Defaults 下方,玻璃卡片底部内侧)。
-        // x=20 避开卡片左下圆角区(卡片 x=10、圆角 12)。
-        // Version label (below Restore Defaults, inside the glass card's bottom).
-        // x=20 clears the card's bottom-left rounded corner (card x=10, radius 12).
-        let version_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let version_label: *mut AnyObject = msg_send![version_label, initWithFrame: NSRect::new(NSPoint::new(20.0, 14.0), NSSize::new(126.0, 20.0))];
-        let _: () = msg_send![version_label, setAutoresizingMask: 36u64]; // 贴底、贴左
-        let version_text = tf(
-            "settings.version_label",
-            &[("version", env!("CARGO_PKG_VERSION"))],
-        );
-        let version_ns = make_nsstring(&version_text);
-        let _: () = msg_send![version_label, setStringValue: version_ns];
-        CFRelease(version_ns as *const c_void);
-        let _: () = msg_send![version_label, setBezeled: false];
-        let _: () = msg_send![version_label, setDrawsBackground: false];
-        let _: () = msg_send![version_label, setEditable: false];
-        let _: () = msg_send![version_label, setAlignment: 0isize]; // NSTextAlignmentLeft
-        let version_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
-        let _: () = msg_send![version_label, setFont: version_font];
-        let _: () = msg_send![content, addSubview: version_label];
-        release_obj(version_label);
-
-        // OK / Cancel on contentView so they stay visible on both pages.
+        // --- 确认 / 取消(右侧 footer 内,所有页面都可见)---
+        // Cancel and OK are children of the detail pane's footer, matching the HTML layout.
         let cancel = make_settings_action_button(
-            NSRect::new(NSPoint::new(view_w - 200.0, 14.0), NSSize::new(80.0, 28.0)),
+            NSRect::new(
+                NSPoint::new(content_x + content_w - 200.0, 14.0),
+                NSSize::new(80.0, 32.0),
+            ),
             &t("settings.btn_cancel"),
             target,
             sel!(handleSettingsCancel:),
         );
+        let _: () = msg_send![cancel, setTag: -1isize];
+        let cancel_layer: *mut AnyObject = msg_send![cancel, layer];
+        if !cancel_layer.is_null() {
+            // HTML footer buttons use a slightly more opaque white surface than small buttons.
+            layer_set_background(cancel_layer, crate::ffi::hex_to_cg_color(0xFFFFFFC7u32));
+        }
         let _: () = msg_send![cancel, setAutoresizingMask: 33u64]; // 贴底、贴右 / bottom- and right-anchored
         let _: () = msg_send![content, addSubview: cancel];
         release_obj(cancel);
 
         let ok = make_settings_action_button(
-            NSRect::new(NSPoint::new(view_w - 110.0, 14.0), NSSize::new(90.0, 28.0)),
+            NSRect::new(
+                NSPoint::new(content_x + content_w - 110.0, 14.0),
+                NSSize::new(90.0, 32.0),
+            ),
             &t("settings.btn_ok"),
             target,
             sel!(handleSettingsOk:),
         );
+        let _: () = msg_send![ok, setTag: -2isize];
+        let ok_layer: *mut AnyObject = msg_send![ok, layer];
+        if !ok_layer.is_null() {
+            layer_set_background(ok_layer, crate::ffi::hex_to_cg_color(0x0A84FFFFu32));
+        }
+        let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
+        let _: () = msg_send![ok, setContentTintColor: white];
         let _: () = msg_send![ok, setAutoresizingMask: 33u64]; // 贴底、贴右
         let _: () = msg_send![content, addSubview: ok];
         ui.ok_button = ok;
@@ -4836,6 +5743,10 @@ pub(crate) fn invalidate_settings_window() {
         // during a locale change).
         crate::set_settings_activation_policy(false);
     }
+    // Sidebar labels/icons are owned by the invalidated window. Drop their raw-pointer entries
+    // so a rebuilt window can never address a deallocated child view.
+    SIDEBAR_TITLE_LABELS.lock().unwrap().clear();
+    SIDEBAR_ICON_VIEWS.lock().unwrap().clear();
     clear_glass_preview();
 }
 
