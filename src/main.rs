@@ -44,6 +44,7 @@ use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 use event_monitor::{start as start_event_monitor, GlobalEvent};
 use window_collector::{
@@ -192,6 +193,8 @@ static WINDOW_REFRESH_PENDING_FOCUS: LazyLock<Mutex<Option<(i32, u32)>>> =
 static WINDOW_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static WINDOW_REFRESH_RESULT: LazyLock<Mutex<Option<WindowRefreshResult>>> =
     LazyLock::new(|| Mutex::new(None));
+static WINDOW_REFRESH_REQUESTED_AT: LazyLock<Mutex<Option<(u64, Instant)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// 请求一次有界的后台窗口快照；同一时间只允许一个任务，避免快捷键连按制造线程风暴。
 /// Request one bounded background window snapshot; only one task may run at a time,
@@ -285,6 +288,7 @@ fn select_summon_focus_key(
 }
 
 fn start_window_refresh(request: WindowRefreshRequest) {
+    let requested_at = Instant::now();
     let (generation, mru) = {
         let state_opt = TAB_STATE.lock().unwrap();
         let Some(state) = state_opt.as_ref() else {
@@ -296,6 +300,7 @@ fn start_window_refresh(request: WindowRefreshRequest) {
             state.mru.clone(),
         )
     };
+    *WINDOW_REFRESH_REQUESTED_AT.lock().unwrap() = Some((generation, requested_at));
 
     // 浮窗已显示后,summon-bump 不再把前台窗口写回 MRU:否则每次刷新都会把前台窗口顶到第 0 位、
     // 造成已显示的列表重排(跳变)。首帧待显示(visible=false)仍允许 bump 一次,保证首位是真实前台。
@@ -531,7 +536,12 @@ fn apply_window_refresh() {
         }
         return;
     };
+    let generation = result.generation;
     if result.generation != WINDOW_REFRESH_GENERATION.load(Ordering::Acquire) {
+        WINDOW_REFRESH_REQUESTED_AT
+            .lock()
+            .unwrap()
+            .take_if(|(pending_generation, _)| *pending_generation == generation);
         WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
         if let Some(pending_request) = take_pending_refresh_request() {
             request_window_refresh_request(pending_request);
@@ -540,6 +550,11 @@ fn apply_window_refresh() {
     }
 
     let summon_focus_key = result.summon_focus_key;
+    let request_to_apply_ms = WINDOW_REFRESH_REQUESTED_AT
+        .lock()
+        .unwrap()
+        .take_if(|(pending_generation, _)| *pending_generation == generation)
+        .map(|(_, started)| started.elapsed().as_millis());
     let subscriptions = window_collector::window_server_candidates();
 
     let (was_visible, set_changed) = {
@@ -639,6 +654,15 @@ fn apply_window_refresh() {
         (was_visible, set_changed)
     };
     WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+    if let Some(request_to_apply_ms) = request_to_apply_ms {
+        log_debug!(
+            "[perf] window refresh commit generation={} request_to_apply_ms={} visible={} set_changed={}",
+            generation,
+            request_to_apply_ms,
+            was_visible,
+            set_changed
+        );
+    }
     let pending_request = take_pending_refresh_request();
 
     // 首帧快照就绪:消费 pending_first_show,一次性显示(一次成图)。此时窗口列表已是刷新后的

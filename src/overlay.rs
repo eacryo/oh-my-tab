@@ -3028,6 +3028,8 @@ pub(crate) fn hide_overlay() {
         }
     }
     crate::performance::end_switcher_activity();
+    crate::thumbnail::wake_capture_worker();
+    crate::thumbnail::log_capture_metrics("dismiss");
     // 设置窗口从不被 stash/restore:nonactivating 面板不激活 app,设置窗口全程留在
     // 原位(z-order 不受召唤影响),切换器只负责收它作卡片与抬起目标窗口。
     // The settings window is never stashed/restored: the nonactivating panel never activates

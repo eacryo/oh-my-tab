@@ -36,7 +36,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CString};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -715,11 +715,19 @@ impl CaptureState {
         inserted
     }
 
+    #[cfg(test)]
     fn take_next(&mut self) -> Option<CaptureJob> {
+        self.take_next_for(false)
+    }
+
+    fn take_next_for(&mut self, interaction_active: bool) -> Option<CaptureJob> {
         let key = self
             .desired
             .iter()
-            .filter(|(_, pending)| !pending.running)
+            .filter(|(_, pending)| {
+                !pending.running
+                    && (!interaction_active || pending.priority >= CapturePriority::Visible)
+            })
             .min_by_key(|(_, pending)| (Reverse(pending.priority), pending.sequence))
             .map(|(key, _)| *key)?;
         let pending = self.desired.get_mut(&key)?;
@@ -790,6 +798,71 @@ impl CaptureState {
 static CAPTURE_STATE: LazyLock<Mutex<CaptureState>> =
     LazyLock::new(|| Mutex::new(CaptureState::default()));
 static JOB_TX: OnceLock<flume::Sender<()>> = OnceLock::new();
+static THUMB_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+static THUMB_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static THUMB_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static THUMB_QUEUE_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
+static THUMB_QUEUE_MAX_MS: AtomicU64 = AtomicU64::new(0);
+static THUMB_CAPTURE_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
+static THUMB_CAPTURE_MAX_MS: AtomicU64 = AtomicU64::new(0);
+
+fn update_max(metric: &AtomicU64, value: u64) {
+    let mut current = metric.load(Ordering::Relaxed);
+    while value > current {
+        match metric.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn record_thumb_queue_wait(queue_ms: u64) {
+    THUMB_QUEUE_TOTAL_MS.fetch_add(queue_ms, Ordering::Relaxed);
+    update_max(&THUMB_QUEUE_MAX_MS, queue_ms);
+}
+
+fn record_thumb_capture(capture_ms: u64) {
+    THUMB_COMPLETED.fetch_add(1, Ordering::Relaxed);
+    THUMB_CAPTURE_TOTAL_MS.fetch_add(capture_ms, Ordering::Relaxed);
+    update_max(&THUMB_CAPTURE_MAX_MS, capture_ms);
+}
+
+pub(crate) fn log_capture_metrics(context: &str) {
+    let enqueued = THUMB_ENQUEUED.load(Ordering::Relaxed);
+    let completed = THUMB_COMPLETED.load(Ordering::Relaxed);
+    let queue_total = THUMB_QUEUE_TOTAL_MS.load(Ordering::Relaxed);
+    let capture_total = THUMB_CAPTURE_TOTAL_MS.load(Ordering::Relaxed);
+    let avg_queue_ms = queue_total.checked_div(completed.max(1)).unwrap_or(0);
+    let avg_capture_ms = capture_total.checked_div(completed.max(1)).unwrap_or(0);
+    log_debug!(
+        "[perf] thumbnail metrics context={} enqueued={} completed={} deferred={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
+        context,
+        enqueued,
+        completed,
+        THUMB_DEFERRED.load(Ordering::Relaxed),
+        avg_queue_ms,
+        THUMB_QUEUE_MAX_MS.load(Ordering::Relaxed),
+        avg_capture_ms,
+        THUMB_CAPTURE_MAX_MS.load(Ordering::Relaxed)
+    );
+}
+
+/// Wake the capture worker after the interaction gate is lifted so deferred background jobs can
+/// resume without waiting for another thumbnail request.
+pub(crate) fn wake_capture_worker() {
+    if let Some(tx) = JOB_TX.get() {
+        let pending = CAPTURE_STATE
+            .lock()
+            .unwrap()
+            .desired
+            .values()
+            .filter(|capture| !capture.running)
+            .count();
+        for _ in 0..pending.max(1) {
+            let _ = tx.send(());
+        }
+    }
+}
 
 /// 尝试安排一次捕获；返回 false 表示相同窗口已 pending/in-flight，或 worker 已退出。
 /// Try to schedule one capture; false means the same window is already pending/in-flight,
@@ -830,6 +903,7 @@ fn enqueue_activation_job(
     if !accepted {
         return false;
     }
+    THUMB_ENQUEUED.fetch_add(1, Ordering::Relaxed);
     if tx.send(()).is_err() {
         CAPTURE_STATE.lock().unwrap().desired.remove(&key);
         return false;
@@ -858,6 +932,7 @@ fn enqueue_job_inner(
     if !accepted {
         return false;
     }
+    THUMB_ENQUEUED.fetch_add(1, Ordering::Relaxed);
     if tx.send(()).is_err() {
         CAPTURE_STATE.lock().unwrap().desired.remove(&key);
         return false;
@@ -875,9 +950,35 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                 crate::performance::set_current_thread_qos(crate::performance::ThreadQos::Utility);
                 log_debug!("[thumb] capture worker online");
                 for () in rx.iter() {
-                    let Some(job) = CAPTURE_STATE.lock().unwrap().take_next() else {
+                    let interaction_active = crate::performance::switcher_interaction_active();
+                    let Some(job) = CAPTURE_STATE
+                        .lock()
+                        .unwrap()
+                        .take_next_for(interaction_active)
+                    else {
+                        if interaction_active {
+                            let pending_background = CAPTURE_STATE
+                                .lock()
+                                .unwrap()
+                                .desired
+                                .values()
+                                .any(|pending| {
+                                    !pending.running && pending.priority < CapturePriority::Visible
+                                });
+                            if pending_background {
+                                let deferred = THUMB_DEFERRED.fetch_add(1, Ordering::Relaxed) + 1;
+                                if deferred == 1 || deferred.is_multiple_of(16) {
+                                    log_debug!(
+                                        "[perf] thumbnail background work deferred during interaction count={}",
+                                        deferred
+                                    );
+                                }
+                            }
+                        }
                         continue;
                     };
+                    let queue_ms = job.enqueued_at.elapsed().as_millis() as u64;
+                    record_thumb_queue_wait(queue_ms);
                     log_debug!(
                         "[thumb] job recv pid={} wid={} target_h={} priority={} queue_ms={}",
                         job.key.pid,
@@ -989,6 +1090,7 @@ fn run_capture_job(job: CaptureJob) {
         captured.scale_ms,
         job_started.elapsed().as_millis()
     );
+    record_thumb_capture(job_started.elapsed().as_millis() as u64);
     cache_store(key.pid, key.wid, captured.thumb);
     drop(state);
     // 不再按任务来源预先决定是否投递：启动预热也可能在浮窗打开后才完成。
@@ -1066,6 +1168,7 @@ pub(crate) fn handle_ready_main() {
     if keys.is_empty() {
         return;
     }
+    let ready_batch_size = keys.len();
     let visible = crate::overlay::thumbnail_visible_range();
     let keys: HashSet<ThumbKey> = keys.into_iter().collect();
     let ready_keys: Vec<(i32, u32)> = {
@@ -1091,7 +1194,17 @@ pub(crate) fn handle_ready_main() {
             .collect()
     };
     if !ready_keys.is_empty() {
+        log_debug!(
+            "[perf] thumbnail ready batch={} matched_visible={}",
+            ready_batch_size,
+            ready_keys.len()
+        );
         crate::overlay::refresh_thumbnail_previews(&ready_keys);
+    } else {
+        log_debug!(
+            "[perf] thumbnail ready batch={} matched_visible=0",
+            ready_batch_size
+        );
     }
 }
 
@@ -1271,6 +1384,8 @@ fn capture_range_for_visible(visible: Option<Range<usize>>, len: usize) -> Range
 /// is requested first.
 /// The selection is read from TAB_STATE internally; callers just invoke once at
 /// the end of show_overlay.
+type SummonRefreshPlan = (Vec<(i32, u32, CapturePriority)>, usize, usize, usize, usize);
+
 pub(crate) fn refresh_for_summon(required_px_h: u32) {
     if !crate::theme::thumbnails_enabled() {
         return;
@@ -1284,12 +1399,9 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
     // 与 worker 的 overlay_wants 保持锁序：先可见区间，后 TAB_STATE。
     // Match the worker's overlay_wants lock order: visible range before TAB_STATE.
     let visible_snapshot = crate::overlay::thumbnail_visible_range();
-    let (jobs, missing, frontmost_stale, background_last_good): (
-        Vec<(i32, u32, CapturePriority)>,
-        usize,
-        usize,
-        usize,
-    ) = {
+    let interaction_active = crate::performance::switcher_interaction_active();
+    let (jobs, missing, frontmost_stale, background_last_good, deferred_prefetch):
+        SummonRefreshPlan = {
         let state_opt = crate::TAB_STATE.lock().unwrap();
         let Some(state) = state_opt.as_ref() else {
             return;
@@ -1339,6 +1451,7 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
             .iter()
             .filter(|(_, _, _, decision)| *decision == SummonRefreshDecision::BackgroundLastGood)
             .count();
+        let mut deferred_prefetch = 0usize;
         let jobs: Vec<(i32, u32, CapturePriority)> = decisions
             .into_iter()
             .filter(|(_, _, _, decision)| {
@@ -1347,7 +1460,7 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
                     SummonRefreshDecision::Missing | SummonRefreshDecision::FrontmostStale
                 )
             })
-            .map(|(index, pid, wid, _)| {
+            .filter_map(|(index, pid, wid, _)| {
                 let priority = if Some((pid, wid)) == selected {
                     CapturePriority::Selected
                 } else if visible_snapshot
@@ -1358,10 +1471,21 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
                 } else {
                     CapturePriority::Prefetch
                 };
-                (pid, wid, priority)
+                if interaction_active && priority < CapturePriority::Visible {
+                    deferred_prefetch += 1;
+                    None
+                } else {
+                    Some((pid, wid, priority))
+                }
             })
             .collect();
-        (jobs, missing, frontmost_stale, background_last_good)
+        (
+            jobs,
+            missing,
+            frontmost_stale,
+            background_last_good,
+            deferred_prefetch,
+        )
     };
     let requested = jobs.len();
     let mut enqueued = 0;
@@ -1369,14 +1493,17 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
         enqueued += usize::from(enqueue_job(pid, wid, required_px_h, priority));
     }
     log_debug!(
-        "[thumb] summon refresh: missing={} frontmost_stale={} background_last_good={} requested={} enqueued={} target_h={}",
+        "[perf] thumbnail summon: active={} missing={} frontmost_stale={} background_last_good={} deferred_prefetch={} requested={} enqueued={} target_h={}",
+        interaction_active,
         missing,
         frontmost_stale,
         background_last_good,
+        deferred_prefetch,
         requested,
         enqueued,
         required_px_h
     );
+    log_capture_metrics("summon");
 }
 
 fn activation_capture_is_valid(
@@ -1955,6 +2082,21 @@ mod tests {
         assert_eq!(job.key, first);
         assert_eq!(job.priority, CapturePriority::Selected);
         assert_eq!(job.target_px_h, 512);
+    }
+
+    #[test]
+    fn capture_state_defers_background_jobs_during_interaction() {
+        let mut state = CaptureState::default();
+        let startup = ThumbKey { pid: 10, wid: 20 };
+        let visible = ThumbKey { pid: 10, wid: 21 };
+
+        assert!(state.request(startup, 512, CapturePriority::Startup));
+        assert!(state.request(visible, 512, CapturePriority::Visible));
+
+        let job = state.take_next_for(true).unwrap();
+        assert_eq!(job.key, visible);
+        assert!(state.take_next_for(true).is_none());
+        assert_eq!(state.take_next_for(false).unwrap().key, startup);
     }
 
     #[test]

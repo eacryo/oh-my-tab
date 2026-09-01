@@ -9,6 +9,7 @@ use crate::ffi::{make_nsstring, release_obj, CFRelease, ObjPtr};
 use crate::{class, log_debug, msg_send};
 use objc2::runtime::AnyObject;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 /// Darwin QoS classes from `<sys/qos.h>`.
@@ -63,10 +64,12 @@ const NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: u64 =
 /// retain is intentional because `beginActivityWithOptions:reason:` returns an autoreleased
 /// token when called through the raw MRC bridge used by this project.
 static SWITCHER_ACTIVITY: LazyLock<Mutex<Option<ObjPtr>>> = LazyLock::new(|| Mutex::new(None));
+static SWITCHER_INTERACTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Tell App Nap/sudden-termination policy that a user-visible switcher operation is in flight.
 /// Idempotent so multiple key-down paths cannot leak nested activity tokens.
 pub(crate) fn begin_switcher_activity() {
+    SWITCHER_INTERACTION_ACTIVE.store(true, Ordering::Release);
     let mut slot = SWITCHER_ACTIVITY.lock().unwrap();
     if slot.is_some() {
         return;
@@ -100,6 +103,7 @@ pub(crate) fn begin_switcher_activity() {
 
 /// End the current switcher activity.  Safe to call from every dismissal/cancel path.
 pub(crate) fn end_switcher_activity() {
+    SWITCHER_INTERACTION_ACTIVE.store(false, Ordering::Release);
     let token = SWITCHER_ACTIVITY.lock().unwrap().take();
     let Some(token) = token else {
         return;
@@ -112,6 +116,12 @@ pub(crate) fn end_switcher_activity() {
         }
         release_obj(token.0);
     }
+}
+
+/// Whether a user-visible switcher interaction is currently active. Background work can use
+/// this signal to defer non-critical tasks until the overlay is dismissed.
+pub(crate) fn switcher_interaction_active() -> bool {
+    SWITCHER_INTERACTION_ACTIVE.load(Ordering::Acquire)
 }
 
 #[cfg(test)]
