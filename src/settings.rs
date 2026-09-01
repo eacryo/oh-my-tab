@@ -4898,9 +4898,9 @@ fn create_settings_window() {
         add_page_title(
             general_view,
             &t("settings.sidebar_general"),
-            label_x,
+            6.0,
             y - 34.0,
-            content_w - label_x * 2.0,
+            content_w - 12.0,
         );
         y -= 62.0;
 
@@ -5157,9 +5157,9 @@ fn create_settings_window() {
         add_page_title(
             switcher_view,
             &t("settings.sidebar_switcher"),
-            label_x,
+            6.0,
             y - 34.0,
-            content_w - label_x * 2.0,
+            content_w - 12.0,
         );
         y -= 62.0;
 
@@ -5306,9 +5306,9 @@ fn create_settings_window() {
         add_page_title(
             mouse_view,
             &t("settings.sidebar_mouse"),
-            label_x,
+            6.0,
             y - 34.0,
-            content_w - label_x * 2.0,
+            content_w - 12.0,
         );
         y -= 62.0;
 
@@ -5667,9 +5667,9 @@ fn create_settings_window() {
         add_page_title(
             clipboard_view,
             &t("settings.sidebar_clipboard"),
-            label_x,
+            6.0,
             cy - 34.0,
-            content_w - label_x * 2.0,
+            content_w - 12.0,
         );
         cy -= 62.0;
         let clipboard_header_y = cy - 18.0;
