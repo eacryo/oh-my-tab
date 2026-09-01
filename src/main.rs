@@ -39,7 +39,7 @@ use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use settings::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -429,6 +429,42 @@ fn merge_refreshed_windows(
     }
 }
 
+/// Keep the currently visible card order while applying refreshed window data.
+///
+/// MRU sorting is useful when the overlay is summoned, but replacing the order of
+/// `TAB_STATE.windows` while the existing card tree remains in place breaks the
+/// card-index invariant. Rebase the refreshed records onto the current order so
+/// pure refreshes update metadata without moving visible cards.
+fn preserve_existing_window_order(
+    existing: &[WindowInfo],
+    refreshed: Vec<WindowInfo>,
+) -> Vec<WindowInfo> {
+    let refresh_order: Vec<(i32, u32)> = refreshed
+        .iter()
+        .map(|window| (window.pid, window.window_id))
+        .collect();
+    let mut by_key: HashMap<(i32, u32), WindowInfo> = refreshed
+        .into_iter()
+        .map(|window| ((window.pid, window.window_id), window))
+        .collect();
+    let mut ordered = Vec::with_capacity(existing.len() + by_key.len());
+    for current in existing {
+        let key = (current.pid, current.window_id);
+        if let Some(window) = by_key.remove(&key) {
+            ordered.push(window);
+        }
+    }
+    // New windows are not part of a pure reorder, but appending them makes this
+    // helper safe for callers that use it across a concurrent add/remove. Keep
+    // the refreshed order deterministic instead of iterating the hash map.
+    for key in refresh_order {
+        if let Some(window) = by_key.remove(&key) {
+            ordered.push(window);
+        }
+    }
+    ordered
+}
+
 fn selection_index_after_refresh(
     selected_key: Option<(i32, u32)>,
     previous_index: usize,
@@ -527,23 +563,39 @@ fn apply_window_refresh() {
         // 定向刷新只替换目标 PID,其他应用的卡片和窗口顺序记忆保持不变。
         // A directed refresh replaces only the target PID; cards and ordering memory for every
         // other application remain intact.
-        let mut windows = merge_refreshed_windows(&state.windows, replace_pid, result.windows);
-        window_collector::sort_windows_by_mru(&mut windows, &mru, std::time::Instant::now());
+        let mut sorted_windows =
+            merge_refreshed_windows(&state.windows, replace_pid, result.windows);
+        window_collector::sort_windows_by_mru(&mut sorted_windows, &mru, std::time::Instant::now());
         if replace_pid.is_none() {
             // 全量刷新合并旧窗口后重新建立唯一的前台代表，避免旧快照的 is_active 残留。
             // Re-establish one frontmost representative after a full merge so an old snapshot
             // cannot leave multiple stale is_active flags behind.
-            for window in &mut windows {
+            for window in &mut sorted_windows {
                 window.is_active = false;
             }
-            if let Some(first) = windows.first_mut() {
+            if let Some(first) = sorted_windows.first_mut() {
                 first.is_active = true;
             }
         } else if let Some(active_key) = active_key {
-            for window in &mut windows {
+            for window in &mut sorted_windows {
                 window.is_active = (window.pid, window.window_id) == active_key;
             }
         }
+        let set_changed = replace_pid.is_some() || {
+            let old: HashSet<(i32, u32)> =
+                state.windows.iter().map(|w| (w.pid, w.window_id)).collect();
+            let new: HashSet<(i32, u32)> = sorted_windows
+                .iter()
+                .map(|w| (w.pid, w.window_id))
+                .collect();
+            old != new
+        };
+        let was_visible = state.visible;
+        let windows = if was_visible && !set_changed {
+            preserve_existing_window_order(&state.windows, sorted_windows)
+        } else {
+            sorted_windows
+        };
         // 选中跟随「目标窗口」而非「当前列表下标」:
         // - user_picked=true(用户已主动导航):钉住 selected_target_key,列表重排不动它。
         // - user_picked=false(仍是首帧默认落点):锁定首帧选中的目标窗口,刷新不因 MRU
@@ -567,13 +619,6 @@ fn apply_window_refresh() {
         // reorder (MRU bumped by the frontmost, surface flip) only updates data without rebuilding
         // the list — otherwise the overlay "keeps jumping after it opened". A directed refresh
         // (replace_pid) swapping a PID's cards also counts as a set change.
-        let set_changed = replace_pid.is_some() || {
-            let old: HashSet<(i32, u32)> =
-                state.windows.iter().map(|w| (w.pid, w.window_id)).collect();
-            let new: HashSet<(i32, u32)> = windows.iter().map(|w| (w.pid, w.window_id)).collect();
-            old != new
-        };
-        let was_visible = state.visible;
         // 浮窗显示期间发生排序/集合变化:打印变更前后的完整窗口序与选中位置,便于排查
         // 「窗口排序在浮窗显示后被刷新改动」类问题(如 Ghostty tab 表面切换导致的跳变)。
         // Overlay visible and the ordering/set changed: log the full window order and selection
@@ -1476,6 +1521,7 @@ fn create_overlay_window() -> *mut AnyObject {
         ];
         let _: () = msg_send![document, setWantsLayer: false];
         let _: () = msg_send![container, setDocumentView: document];
+        clear_card_indices();
         *CARD_DOCUMENT.lock().unwrap() = Some(ObjPtr(document));
         release_obj(document);
 
@@ -2467,7 +2513,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_refreshed_windows, selection_index_after_refresh, WindowRefreshReason};
+    use super::{
+        merge_refreshed_windows, preserve_existing_window_order, selection_index_after_refresh,
+        WindowRefreshReason,
+    };
     use crate::window_collector::WindowInfo;
 
     fn window(pid: i32, window_id: u32) -> WindowInfo {
@@ -2531,6 +2580,36 @@ mod tests {
             .collect();
 
         assert_eq!(keys, vec![(20, 200)]);
+    }
+
+    #[test]
+    fn visible_refresh_preserves_existing_order_but_uses_refreshed_records() {
+        let existing = vec![window(1, 10), window(2, 20), window(3, 30), window(4, 40)];
+        let mut refreshed = vec![window(4, 40), window(1, 10), window(2, 20), window(3, 30)];
+        refreshed[0].window_title = "updated Edge".into();
+
+        let ordered = preserve_existing_window_order(&existing, refreshed);
+        let keys: Vec<(i32, u32)> = ordered
+            .iter()
+            .map(|window| (window.pid, window.window_id))
+            .collect();
+
+        assert_eq!(keys, vec![(1, 10), (2, 20), (3, 30), (4, 40)]);
+        assert_eq!(ordered[3].window_title, "updated Edge");
+    }
+
+    #[test]
+    fn visible_order_helper_drops_removed_windows_and_appends_new_windows() {
+        let existing = vec![window(1, 10), window(2, 20), window(3, 30)];
+        let refreshed = vec![window(4, 40), window(3, 30), window(1, 10)];
+
+        let ordered = preserve_existing_window_order(&existing, refreshed);
+        let keys: Vec<(i32, u32)> = ordered
+            .iter()
+            .map(|window| (window.pid, window.window_id))
+            .collect();
+
+        assert_eq!(keys, vec![(1, 10), (3, 30), (4, 40)]);
     }
 
     #[test]

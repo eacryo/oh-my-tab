@@ -103,6 +103,15 @@ pub(crate) static CARD_CLASS: Mutex<Option<ObjClassPtr>> = Mutex::new(None);
 /// msg_send! issues on dynamically-registered ObjC classes.
 pub(crate) static CARD_INDEX_MAP: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Maps a card view pointer to its stable window identity.  Unlike the index map, this remains
+/// valid when MRU sorting changes the order of `TAB_STATE.windows` between summons.
+static CARD_KEY_MAP: LazyLock<Mutex<HashMap<usize, WindowKey>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Content/layout signature for each rendered card.  A matching signature allows the view tree
+/// to be reused; changes such as a new title, icon, minimized state, or card dimensions replace
+/// only that card.
+static CARD_SIGNATURES: LazyLock<Mutex<HashMap<usize, CardSignature>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// 缩略图模式当前实际渲染的全局窗口索引区间；窗口列表本身从不截断。
 /// Global window-index range currently rendered in thumbnail mode; the authoritative
 /// window list is never truncated.
@@ -173,6 +182,54 @@ struct PendingCardClose {
 static PENDING_CARD_CLOSE: Mutex<Option<PendingCardClose>> = Mutex::new(None);
 type WindowKey = (i32, u32);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CardSignature {
+    app_name: String,
+    window_title: String,
+    icon_path: Option<String>,
+    minimized: bool,
+    card_width_bits: u64,
+    card_height_bits: u64,
+    thumbnail_layout: bool,
+    thumbnail_capture_allowed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CardReconcileAction {
+    Create,
+    Reuse,
+    Replace,
+}
+
+fn card_reconcile_action(
+    existing: Option<&CardSignature>,
+    desired: &CardSignature,
+) -> CardReconcileAction {
+    match existing {
+        None => CardReconcileAction::Create,
+        Some(current) if current == desired => CardReconcileAction::Reuse,
+        Some(_) => CardReconcileAction::Replace,
+    }
+}
+
+fn card_signature(
+    window: &WindowInfo,
+    frame: NSRect,
+    thumbnail_layout: bool,
+    thumbnail_capture_allowed: bool,
+) -> CardSignature {
+    CardSignature {
+        app_name: window.app_name.clone(),
+        window_title: window.window_title.clone(),
+        icon_path: window.icon_path.clone(),
+        minimized: window.minimized,
+        card_width_bits: frame.size.width.to_bits(),
+        card_height_bits: frame.size.height.to_bits(),
+        thumbnail_layout,
+        thumbnail_capture_allowed,
+    }
+}
+
 fn clear_thumbnail_scroll_drag() {
     *THUMB_SCROLL_DRAG.lock().unwrap() = None;
 }
@@ -217,14 +274,41 @@ pub(crate) fn set_card_index(view: *mut AnyObject, idx: usize) {
     map.insert(view as usize, idx);
 }
 
+fn card_key(view: *mut AnyObject) -> Option<WindowKey> {
+    CARD_KEY_MAP.lock().unwrap().get(&(view as usize)).copied()
+}
+
+fn set_card_key(view: *mut AnyObject, key: WindowKey) {
+    CARD_KEY_MAP.lock().unwrap().insert(view as usize, key);
+}
+
+fn set_card_signature(view: *mut AnyObject, signature: CardSignature) {
+    CARD_SIGNATURES
+        .lock()
+        .unwrap()
+        .insert(view as usize, signature);
+}
+
+fn card_signature_for(view: *mut AnyObject) -> Option<CardSignature> {
+    CARD_SIGNATURES
+        .lock()
+        .unwrap()
+        .get(&(view as usize))
+        .cloned()
+}
+
 pub(crate) fn remove_card_index(view: *mut AnyObject) {
     let mut map = CARD_INDEX_MAP.lock().unwrap();
     map.remove(&(view as usize));
+    CARD_KEY_MAP.lock().unwrap().remove(&(view as usize));
+    CARD_SIGNATURES.lock().unwrap().remove(&(view as usize));
 }
 
 pub(crate) fn clear_card_indices() {
     let mut map = CARD_INDEX_MAP.lock().unwrap();
     map.clear();
+    CARD_KEY_MAP.lock().unwrap().clear();
+    CARD_SIGNATURES.lock().unwrap().clear();
 }
 
 /// 缩略图捕获调度读取的可见区间快照。/ Visible-range snapshot for thumbnail scheduling.
@@ -563,6 +647,7 @@ fn display_title<'a>(title: &'a str, app_name: &'a str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+    use super::card_reconcile_action;
     use super::color_with_alpha;
     use super::display_title;
     use super::edge_row_nav_index;
@@ -574,6 +659,8 @@ mod tests {
     use super::thumbnail_scroller_geometry;
     use super::thumbnail_scroller_knob_contains;
     use super::vertical_nav_index;
+    use super::CardReconcileAction;
+    use super::CardSignature;
     use crate::window_collector::{MruMap, WindowInfo};
     use std::time::Instant;
 
@@ -585,6 +672,36 @@ mod tests {
             .enumerate()
             .map(|(n, &i)| (i, n as f64 * 110.0, y, 100.0))
             .collect()
+    }
+
+    fn signature(title: &str) -> CardSignature {
+        CardSignature {
+            app_name: "App".into(),
+            window_title: title.into(),
+            icon_path: None,
+            minimized: false,
+            card_width_bits: 100.0f64.to_bits(),
+            card_height_bits: 100.0f64.to_bits(),
+            thumbnail_layout: true,
+            thumbnail_capture_allowed: true,
+        }
+    }
+
+    #[test]
+    fn card_reconcile_action_only_replaces_changed_content() {
+        let current = signature("same");
+        assert_eq!(
+            card_reconcile_action(Some(&current), &signature("same")),
+            CardReconcileAction::Reuse
+        );
+        assert_eq!(
+            card_reconcile_action(Some(&current), &signature("changed")),
+            CardReconcileAction::Replace
+        );
+        assert_eq!(
+            card_reconcile_action(None, &signature("new")),
+            CardReconcileAction::Create
+        );
     }
 
     #[test]
@@ -1194,17 +1311,13 @@ fn refresh_after_selection_change(backfill_icons: bool) {
 
 /// 为关闭动画建立稳定身份到卡片视图的映射;索引会在提交时整体重编号。
 /// Build a stable window-key to card-view map; indices are renumbered only at commit time.
-unsafe fn card_views_by_key(windows: &[WindowInfo]) -> HashMap<WindowKey, *mut AnyObject> {
+unsafe fn card_views_by_key(_windows: &[WindowInfo]) -> HashMap<WindowKey, *mut AnyObject> {
     let Some(document) = card_document() else {
         return HashMap::new();
     };
     card_views(document)
         .into_iter()
-        .filter_map(|card| {
-            let index = get_card_index(card)?;
-            let window = windows.get(index)?;
-            Some(((window.pid, window.window_id), card))
-        })
+        .filter_map(|card| card_key(card).map(|key| (key, card)))
         .collect()
 }
 
@@ -3594,12 +3707,12 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
 /// Lightweight post-capture update: refresh only affected cards' preview containers,
 /// without rebuilding captions, buttons, tracking areas, or selection layers. One
 /// ready batch scans the container's subviews once.
-pub(crate) fn refresh_thumbnail_previews(indices: &[usize]) {
-    if indices.is_empty() || card_close_in_progress() {
+pub(crate) fn refresh_thumbnail_previews(keys: &[(i32, u32)]) {
+    if keys.is_empty() || card_close_in_progress() {
         return;
     }
-    let affected: HashSet<usize> = indices.iter().copied().collect();
-    let windows: HashMap<usize, WindowInfo> = {
+    let affected: HashSet<WindowKey> = keys.iter().copied().collect();
+    let windows: HashMap<WindowKey, WindowInfo> = {
         let state = TAB_STATE.lock().unwrap();
         let Some(state) = state.as_ref() else {
             return;
@@ -3607,9 +3720,13 @@ pub(crate) fn refresh_thumbnail_previews(indices: &[usize]) {
         if !state.visible {
             return;
         }
-        affected
+        state
+            .windows
             .iter()
-            .filter_map(|index| state.windows.get(*index).map(|w| (*index, w.clone())))
+            .filter_map(|window| {
+                let key = (window.pid, window.window_id);
+                affected.contains(&key).then(|| (key, window.clone()))
+            })
             .collect()
     };
     if windows.is_empty() {
@@ -3627,10 +3744,10 @@ pub(crate) fn refresh_thumbnail_previews(indices: &[usize]) {
         };
         let mut updated = 0usize;
         for card in card_views(document) {
-            let Some(index) = get_card_index(card) else {
+            let Some(key) = card_key(card) else {
                 continue;
             };
-            let Some(window) = windows.get(&index) else {
+            let Some(window) = windows.get(&key) else {
                 continue;
             };
             let preview: *mut AnyObject = msg_send![card, viewWithTag: THUMB_PREVIEW_TAG];
@@ -3974,6 +4091,11 @@ pub(crate) fn create_card_view(
 
         // Store card index in side map (avoids msg_send! issues on dynamic classes)
         set_card_index(view, index);
+        set_card_key(view, (w.pid, w.window_id));
+        set_card_signature(
+            view,
+            card_signature(w, frame, use_new, thumbnail_capture_allowed),
+        );
 
         let colors = current_colors();
 
@@ -4432,6 +4554,98 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect, f64) {
     }
 }
 
+#[derive(Default)]
+struct CardReconcileStats {
+    reused: usize,
+    created: usize,
+    replaced: usize,
+    removed: usize,
+}
+
+/// Reconcile the persistent card document against the latest window snapshot. Cards are keyed
+/// by `(pid, window_id)` rather than their current MRU index, so a reorder only updates frames
+/// and side-map indices. A card is rebuilt only when its content or geometry signature changes.
+unsafe fn reconcile_card_views(
+    document: *mut AnyObject,
+    windows: &[WindowInfo],
+    placements: &[CardPlacementFrame],
+    card_height: f64,
+    thumbnail_capture_allowed: bool,
+) -> CardReconcileStats {
+    let use_new = crate::theme::thumbnails_enabled();
+    let mut existing: HashMap<WindowKey, *mut AnyObject> = card_views(document)
+        .into_iter()
+        .filter_map(|card| card_key(card).map(|key| (key, card)))
+        .collect();
+    let mut stats = CardReconcileStats::default();
+
+    for &(idx, card_x, card_y, card_w) in placements {
+        let Some(window) = windows.get(idx) else {
+            continue;
+        };
+        let key = (window.pid, window.window_id);
+        let desired_frame = NSRect::new(
+            NSPoint::new(card_x, card_y - STATUS_H),
+            NSSize::new(card_w, card_height),
+        );
+        let desired_signature =
+            card_signature(window, desired_frame, use_new, thumbnail_capture_allowed);
+
+        let card = existing.remove(&key);
+        let action = match card {
+            None => CardReconcileAction::Create,
+            Some(card) => {
+                let signature = card_signature_for(card);
+                card_reconcile_action(signature.as_ref(), &desired_signature)
+            }
+        };
+        match action {
+            CardReconcileAction::Create => {
+                let card = create_card_view(
+                    window,
+                    idx,
+                    desired_frame.size.width,
+                    desired_frame.size.height,
+                    thumbnail_capture_allowed,
+                );
+                let _: () = msg_send![card, setFrame: desired_frame];
+                let _: () = msg_send![document, addSubview: card];
+                release_obj(card);
+                stats.created += 1;
+            }
+            CardReconcileAction::Reuse => {
+                let card = card.unwrap();
+                set_card_index(card, idx);
+                let _: () = msg_send![card, setFrame: desired_frame];
+                stats.reused += 1;
+            }
+            CardReconcileAction::Replace => {
+                let card = card.unwrap();
+                remove_card_index(card);
+                let new_card = create_card_view(
+                    window,
+                    idx,
+                    desired_frame.size.width,
+                    desired_frame.size.height,
+                    thumbnail_capture_allowed,
+                );
+                let _: () = msg_send![new_card, setFrame: desired_frame];
+                let _: () = msg_send![card, removeFromSuperview];
+                let _: () = msg_send![document, addSubview: new_card];
+                release_obj(new_card);
+                stats.replaced += 1;
+            }
+        }
+    }
+
+    for (_, card) in existing {
+        remove_card_index(card);
+        let _: () = msg_send![card, removeFromSuperview];
+        stats.removed += 1;
+    }
+    stats
+}
+
 pub(crate) fn show_overlay() {
     if card_close_in_progress() {
         // 关闭补位期间保持现有 view 树稳定,避免刷新重新创建卡片导致闪烁。
@@ -4450,21 +4664,6 @@ pub(crate) fn show_overlay() {
         let container = CONTAINER.lock().unwrap().unwrap().0;
         let document = CARD_DOCUMENT.lock().unwrap().unwrap().0;
 
-        // Remove old cards from the persistent document, never remove the document itself.
-        // 从持久 document 中移除旧卡片,绝不能移除 document view 本身。
-        let subviews: *mut AnyObject = msg_send![document, subviews];
-        let sv_count: usize = msg_send![subviews, count];
-        // Iterate in reverse since we're removing from the array
-        let mut i = sv_count;
-        while i > 0 {
-            i -= 1;
-            let sv: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            let _: () = msg_send![sv, removeFromSuperview];
-        }
-        let t_remove_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
-
-        // Clear old card index mappings, then create new card views
-        clear_card_indices();
         // 目标屏幕先行计算:流式布局需要屏宽作装箱上限,居中也复用。
         // The target screen comes first: the flow layout needs its width as the
         // packing budget; centering reuses it.
@@ -4587,34 +4786,15 @@ pub(crate) fn show_overlay() {
             );
         }
 
-        let mut cards_total_ms: u128 = 0; // TIMING-DEBUG
-        for (idx, card_x, card_y, card_w_i) in placements {
-            let Some(w) = windows.get(idx) else {
-                continue;
-            };
-            let t_card = Instant::now(); // TIMING-DEBUG
-            let card = create_card_view(w, idx, card_w_i, card_h_outer, thumbnail_capture_allowed);
-            let card_ms = t_card.elapsed().as_millis(); // TIMING-DEBUG
-            cards_total_ms += card_ms;
-            // TIMING-DEBUG 单卡构建 >5ms:标记慢卡(图标加载/文本通常是耗时大头)。
-            if card_ms >= 5 {
-                log_debug!(
-                    "[overlay] card #{} slow: {}ms app=\"{}\"",
-                    idx,
-                    card_ms,
-                    w.app_name
-                );
-            }
-
-            let card_frame = NSRect::new(
-                NSPoint::new(card_x, card_y - STATUS_H),
-                NSSize::new(card_w_i, card_h_outer),
-            );
-            let _: () = msg_send![card, setFrame: card_frame];
-
-            let _: () = msg_send![document, addSubview: card];
-            release_obj(card); // document owns the card; drop create_card_view's alloc +1
-        }
+        let t_reconcile = Instant::now(); // TIMING-DEBUG
+        let reconcile_stats = reconcile_card_views(
+            document,
+            &windows,
+            &placements,
+            card_h_outer,
+            thumbnail_capture_allowed,
+        );
+        let reconcile_ms = t_reconcile.elapsed().as_millis(); // TIMING-DEBUG
         let t_cards_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
         let _: () = msg_send![window, setFrame: new_frame, display: false];
@@ -4740,10 +4920,13 @@ pub(crate) fn show_overlay() {
         // TIMING-DEBUG 汇总:各阶段耗时(排查 summon 卡顿用)。
         let total_ms = t0.elapsed().as_millis();
         log_debug!(
-            "[overlay] show: remove={}ms cards={}ms (sum={}ms) resize+status+highlight={}ms icons={}ms total={}ms",
-            t_remove_ms,
-            t_cards_ms - t_remove_ms,
-            cards_total_ms,
+            "[overlay] show: reconcile={}ms reused={} created={} replaced={} removed={} layout+reconcile={}ms resize+status+highlight={}ms icons={}ms total={}ms",
+            reconcile_ms,
+            reconcile_stats.reused,
+            reconcile_stats.created,
+            reconcile_stats.replaced,
+            reconcile_stats.removed,
+            t_cards_ms,
             t_resize_ms - t_cards_ms,
             t_icons.elapsed().as_millis(),
             total_ms

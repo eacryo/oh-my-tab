@@ -1068,7 +1068,7 @@ pub(crate) fn handle_ready_main() {
     }
     let visible = crate::overlay::thumbnail_visible_range();
     let keys: HashSet<ThumbKey> = keys.into_iter().collect();
-    let indices: Vec<usize> = {
+    let ready_keys: Vec<(i32, u32)> = {
         let state_opt = crate::TAB_STATE.lock().unwrap();
         let state = match state_opt.as_ref() {
             Some(s) => s,
@@ -1087,11 +1087,11 @@ pub(crate) fn handle_ready_main() {
                     wid: window.window_id,
                 }) && visible.as_ref().is_none_or(|range| range.contains(index))
             })
-            .map(|(index, _)| index)
+            .map(|(_, window)| (window.pid, window.window_id))
             .collect()
     };
-    if !indices.is_empty() {
-        crate::overlay::refresh_thumbnail_previews(&indices);
+    if !ready_keys.is_empty() {
+        crate::overlay::refresh_thumbnail_previews(&ready_keys);
     }
 }
 
