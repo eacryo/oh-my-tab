@@ -1830,6 +1830,79 @@ unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) {
     release_obj(icon);
 }
 
+const SETTINGS_CARD_SHADOW_INSET: f64 = 18.0;
+
+/// Draw the settings card shadow into pixels owned by the shadow view itself. This keeps the
+/// blur inside the view's expanded frame instead of relying on a CALayer shadow crossing the
+/// AppKit scroll/document hierarchy.
+/// 在阴影视图自身的像素范围内绘制设置卡片阴影。这样模糊区域位于扩大的视图边界内,
+/// 不再依赖 CALayer 阴影穿过 AppKit 的滚动/文档视图层级。
+extern "C" fn settings_card_shadow_draw_rect(_self: *mut c_void, _cmd: Sel, _rect: NSRect) {
+    unsafe {
+        let view = _self as *mut AnyObject;
+        let bounds: NSRect = msg_send![view, bounds];
+        let card_rect = NSRect::new(
+            NSPoint::new(SETTINGS_CARD_SHADOW_INSET, SETTINGS_CARD_SHADOW_INSET),
+            NSSize::new(
+                (bounds.size.width - SETTINGS_CARD_SHADOW_INSET * 2.0).max(1.0),
+                (bounds.size.height - SETTINGS_CARD_SHADOW_INSET * 2.0).max(1.0),
+            ),
+        );
+        let shadow: *mut AnyObject = msg_send![class!(NSShadow), alloc];
+        let shadow: *mut AnyObject = msg_send![shadow, init];
+        let shadow_color: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.04f64];
+        let _: () = msg_send![shadow, setShadowColor: shadow_color];
+        let _: () = msg_send![shadow, setShadowBlurRadius: 8.0f64];
+        let _: () = msg_send![shadow, setShadowOffset: NSSize::new(0.0, -1.0)];
+        let _: () = msg_send![shadow, set];
+
+        let path: *mut AnyObject = msg_send![
+            class!(NSBezierPath),
+            bezierPathWithRoundedRect: card_rect,
+            xRadius: 14.0f64,
+            yRadius: 14.0f64
+        ];
+        let fill: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
+        let _: () = msg_send![fill, set];
+        let _: () = msg_send![path, fill];
+        release_obj(shadow);
+    }
+}
+
+extern "C" fn settings_card_shadow_hit_test(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _point: NSPoint,
+) -> *mut AnyObject {
+    std::ptr::null_mut()
+}
+
+fn settings_card_shadow_view_class() -> *mut AnyObject {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    *CLASS.get_or_init(|| unsafe {
+        let name = CString::new("OhMyTabSettingsCardShadowView").unwrap();
+        let superclass = class!(NSView) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        let types_draw = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
+        class_addMethod(
+            cls,
+            sel!(drawRect:),
+            settings_card_shadow_draw_rect as *mut c_void,
+            types_draw.as_ptr(),
+        );
+        let types_hit = CString::new("@@:{CGPoint=dd}").unwrap();
+        class_addMethod(
+            cls,
+            sel!(hitTest:),
+            settings_card_shadow_hit_test as *mut c_void,
+            types_hit.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        cls as usize
+    }) as *mut AnyObject
+}
+
 /// Add a grouped card behind a section, matching the HTML redesign's light card surface.
 unsafe fn add_settings_card(parent: *mut AnyObject, frame: NSRect) {
     if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
@@ -1846,9 +1919,6 @@ unsafe fn add_settings_card(parent: *mut AnyObject, frame: NSRect) {
         let _: () = msg_send![layer, setMasksToBounds: false];
         crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x00000012u32));
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
-        let _: () = msg_send![layer, setShadowOpacity: 0.025f32];
-        let _: () = msg_send![layer, setShadowRadius: 8.0f64];
-        let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -2.0)];
     }
     // Insert below controls and labels so the card never intercepts their mouse events.
     let _: () = msg_send![
@@ -1857,6 +1927,31 @@ unsafe fn add_settings_card(parent: *mut AnyObject, frame: NSRect) {
         positioned: -1isize,
         relativeTo: std::ptr::null::<AnyObject>()
     ];
+
+    // Put the self-contained shadow behind the card. Its expanded frame provides enough room
+    // for the blur, while hitTest: keeps the shadow outside the card non-interactive.
+    // 将自包含的阴影视图放在卡片下方。扩大的边界为模糊留出空间,hitTest: 保证卡片外的
+    // 阴影区域不会拦截交互。
+    let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
+    let shadow: *mut AnyObject = msg_send![settings_card_shadow_view_class(), alloc];
+    let shadow: *mut AnyObject = msg_send![
+        shadow,
+        initWithFrame: NSRect::new(
+            NSPoint::new(frame.origin.x - shadow_inset, frame.origin.y - shadow_inset),
+            NSSize::new(
+                frame.size.width + shadow_inset * 2.0,
+                frame.size.height + shadow_inset * 2.0,
+            ),
+        )
+    ];
+    let _: () = msg_send![
+        parent,
+        addSubview: shadow,
+        positioned: -1isize,
+        relativeTo: card
+    ];
+    release_obj(shadow);
+
     release_obj(card);
 }
 
