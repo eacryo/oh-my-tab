@@ -173,8 +173,10 @@ update_check_result_none = "You are using the latest version."
 update_placeholder_hint = "Updates are securely checked over HTTPS using Sparkle."
 update_unavailable_title = "Updates Unavailable"
 update_unavailable_message = "Sparkle.framework is not included in this build. Add it to Contents/Frameworks and restart the app."
-website_url = "oh-my-tab.app ↗"
-website_label = "Official website:"
+website_url = "https://oh-my-tab.app ↗"
+website_label = "Website"
+github_label = "GitHub"
+github_url = "https://github.com/eacryo/oh-my-tab ↗"
 
 [alert]
 config_error_title = "Configuration Error"

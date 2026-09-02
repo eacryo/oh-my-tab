@@ -174,8 +174,10 @@ update_check_result_none = "目前已是最新版本。"
 update_placeholder_hint = "更新由 Sparkle 透過 HTTPS 安全檢查。"
 update_unavailable_title = "更新功能不可用"
 update_unavailable_message = "此版本未包含 Sparkle.framework。請將它放入 Contents/Frameworks 後重新啟動應用程式。"
-website_url = "oh-my-tab.app ↗"
-website_label = "官方網站："
+website_url = "https://oh-my-tab.app ↗"
+website_label = "網站"
+github_label = "GitHub"
+github_url = "https://github.com/eacryo/oh-my-tab ↗"
 
 [alert]
 config_error_title = "設定有誤"

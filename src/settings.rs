@@ -178,6 +178,7 @@ struct SettingsUi {
     line_count_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
     line_count_card: *mut AnyObject,        // NSView: 行数卡片 / line-count card
     line_count_shadow: *mut AnyObject,      // NSView: 行数卡片阴影 / line-count card shadow
+    line_count_separator: *mut AnyObject, // NSView: 行数行上方分割线 / separator above line-count row
     line_count_compact: bool, // 是否已移除条件行占位 / whether the conditional row is compacted
     disable_pointer_accel: *mut AnyObject, // NSSwitch: 禁用指针加速 / disable pointer acceleration
     // ---- 按键映射区 / button-mappings section ----
@@ -249,7 +250,7 @@ const SETTINGS_SECTION_CARD_GAP: f64 = 4.0;
 
 /// Gap between the previous card's bottom edge and the next section header.
 /// 上一张卡片底边到下一组标题之间的统一间距。
-const SETTINGS_SECTION_HEADER_GAP: f64 = 18.0;
+const SETTINGS_SECTION_HEADER_GAP: f64 = 24.0;
 
 /// Optical trailing inset for row controls, matching the text's visible leading inset.
 /// 设置行控件的视觉右侧内边距,与左侧文字的可见起始位置保持一致。
@@ -507,11 +508,11 @@ unsafe fn make_settings_action_button(
     button
 }
 
-struct WebsiteLinkButtonClass(*mut AnyObject);
-unsafe impl Send for WebsiteLinkButtonClass {}
-unsafe impl Sync for WebsiteLinkButtonClass {}
+struct ExternalLinkButtonClass(*mut AnyObject);
+unsafe impl Send for ExternalLinkButtonClass {}
+unsafe impl Sync for ExternalLinkButtonClass {}
 
-static WEBSITE_LINK_BUTTON_CLASS: OnceLock<WebsiteLinkButtonClass> = OnceLock::new();
+static EXTERNAL_LINK_BUTTON_CLASS: OnceLock<ExternalLinkButtonClass> = OnceLock::new();
 static SIDEBAR_BUTTON_CLASS: OnceLock<SidebarButtonClass> = OnceLock::new();
 static SIDEBAR_SELECTED: AtomicUsize = AtomicUsize::new(0);
 static SIDEBAR_TITLE_LABELS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
@@ -519,7 +520,7 @@ static SIDEBAR_TITLE_LABELS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
 static SIDEBAR_ICON_VIEWS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-extern "C" fn website_link_mouse_entered(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn external_link_mouse_entered(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
     unsafe {
         let color: *mut AnyObject = msg_send![class!(NSColor), systemBlueColor];
         let _: () = msg_send![this as *mut AnyObject, setTextColor: color];
@@ -528,7 +529,7 @@ extern "C" fn website_link_mouse_entered(this: *mut c_void, _cmd: Sel, _event: *
     }
 }
 
-extern "C" fn website_link_mouse_exited(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn external_link_mouse_exited(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
     unsafe {
         let color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
         let _: () = msg_send![this as *mut AnyObject, setTextColor: color];
@@ -537,12 +538,23 @@ extern "C" fn website_link_mouse_exited(this: *mut c_void, _cmd: Sel, _event: *m
     }
 }
 
-extern "C" fn website_link_mouse_down(_this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    handle_open_official_website(
-        std::ptr::null_mut(),
-        sel!(handleOpenOfficialWebsite:),
-        std::ptr::null_mut(),
-    );
+extern "C" fn external_link_mouse_down(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let tag: isize = msg_send![this as *mut AnyObject, tag];
+        if tag == 1 {
+            handle_open_github(
+                std::ptr::null_mut(),
+                sel!(handleOpenGithub:),
+                std::ptr::null_mut(),
+            );
+        } else {
+            handle_open_official_website(
+                std::ptr::null_mut(),
+                sel!(handleOpenOfficialWebsite:),
+                std::ptr::null_mut(),
+            );
+        }
+    }
 }
 
 struct SidebarButtonClass(*mut AnyObject);
@@ -601,33 +613,33 @@ fn sidebar_button_class() -> *mut AnyObject {
         .0
 }
 
-fn website_link_button_class() -> *mut AnyObject {
-    WEBSITE_LINK_BUTTON_CLASS
+fn external_link_button_class() -> *mut AnyObject {
+    EXTERNAL_LINK_BUTTON_CLASS
         .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabWebsiteLinkButton").unwrap();
+            let name = CString::new("OhMyTabExternalLinkButton").unwrap();
             let superclass = class!(NSTextField) as *const _ as *mut AnyObject;
             let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
             let types = CString::new("v@:@").unwrap();
             class_addMethod(
                 cls,
                 sel!(mouseDown:),
-                website_link_mouse_down as *mut c_void,
+                external_link_mouse_down as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
                 cls,
                 sel!(mouseEntered:),
-                website_link_mouse_entered as *mut c_void,
+                external_link_mouse_entered as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
                 cls,
                 sel!(mouseExited:),
-                website_link_mouse_exited as *mut c_void,
+                external_link_mouse_exited as *mut c_void,
                 types.as_ptr(),
             );
             objc_registerClassPair(cls);
-            WebsiteLinkButtonClass(cls)
+            ExternalLinkButtonClass(cls)
         })
         .0
 }
@@ -1883,8 +1895,8 @@ unsafe fn add_page_title(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: 
     release_obj(label);
 }
 
-/// Build the About header icon from the app's own bundle icon, retaining the reference's
-/// rounded container treatment while avoiding a second hand-drawn logo.
+/// Build the About header icon directly from the source PNG so AppKit does not reinterpret the
+/// bundled `.icns` representation.
 unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) {
     let icon: *mut AnyObject = msg_send![class!(NSView), alloc];
     let icon: *mut AnyObject = msg_send![
@@ -1892,16 +1904,25 @@ unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) {
         initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(58.0, 58.0))
     ];
 
-    let image_name = make_nsstring("NSApplicationIcon");
-    let image: *mut AnyObject = msg_send![class!(NSImage), imageNamed: image_name];
-    CFRelease(image_name as *const c_void);
+    // 直接使用 PNG，避免 NSApplicationIcon/.icns 在深色背景下产生额外的系统图标边缘。
+    // Use the PNG directly so NSApplicationIcon/.icns cannot add a system-rendered edge on dark backgrounds.
+    let png_bytes: &[u8] = include_bytes!("../assets/Icon-512x512.png");
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: png_bytes.as_ptr() as *const c_void,
+        length: png_bytes.len()
+    ];
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject = msg_send![image, initWithData: data];
+    if !image.is_null() {
+        let _: *mut AnyObject = msg_send![image, autorelease];
+    }
     if !image.is_null() {
         let image_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
         let image_view: *mut AnyObject = msg_send![
             image_view,
-            // Let the app icon occupy the whole slot. The PNG already contains its own
-            // rounded silhouette, so an additional white container would create a visible
-            // border around it.
+            // Let the source PNG occupy the whole slot; it already contains its own rounded silhouette.
+            // 让源 PNG 占满图标槽位；它本身已经包含圆角底座。
             initWithFrame: NSRect::new(NSPoint::new(-2.0, -2.0), NSSize::new(62.0, 62.0))
         ];
         let _: () = msg_send![image_view, setImage: image];
@@ -2050,7 +2071,7 @@ unsafe fn add_settings_card(
 }
 
 /// Draw the HTML `.row + .row` hairline inside a grouped card.
-unsafe fn add_row_separator(parent: *mut AnyObject, x: f64, y: f64, w: f64) {
+unsafe fn add_row_separator(parent: *mut AnyObject, x: f64, y: f64, w: f64) -> *mut AnyObject {
     // Keep the hairline inside the card's rounded frame. Grouped cards are
     // inset by the same six points, so their row separators need that inset
     // as well instead of reaching the content pane edge.
@@ -2071,6 +2092,7 @@ unsafe fn add_row_separator(parent: *mut AnyObject, x: f64, y: f64, w: f64) {
     }
     let _: () = msg_send![parent, addSubview: line];
     release_obj(line);
+    line
 }
 
 /// 加一行:右对齐 label + 控件。控件由调用方创建并传入;加入父视图后 release,返回该控件指针。
@@ -2352,6 +2374,18 @@ pub(crate) extern "C" fn handle_check_for_updates(
     }
 }
 
+/// 在默认浏览器打开外部链接。
+/// Open an external link in the default browser.
+unsafe fn open_external_url(url: &str) {
+    let url_string = make_nsstring(url);
+    let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_string];
+    CFRelease(url_string as *const c_void);
+    if !url.is_null() {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let _: bool = msg_send![workspace, openURL: url];
+    }
+}
+
 /// 打开项目官方网站。
 /// Open the project's official website in the default browser.
 pub(crate) extern "C" fn handle_open_official_website(
@@ -2359,15 +2393,13 @@ pub(crate) extern "C" fn handle_open_official_website(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    unsafe {
-        let url_string = make_nsstring("https://oh-my-tab.app");
-        let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_string];
-        CFRelease(url_string as *const c_void);
-        if !url.is_null() {
-            let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let _: bool = msg_send![workspace, openURL: url];
-        }
-    }
+    unsafe { open_external_url("https://oh-my-tab.app") }
+}
+
+/// 打开项目 GitHub 仓库。
+/// Open the project's GitHub repository in the default browser.
+pub(crate) extern "C" fn handle_open_github(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    unsafe { open_external_url("https://github.com/eacryo/oh-my-tab") }
 }
 
 /// 记录设置窗口提交的逐字段变更,不记录剪贴板历史内容。
@@ -2738,19 +2770,20 @@ unsafe fn update_mode_dependent_visibility(ui: &mut SettingsUi) {
         // 默认模式移除整行及其布局占位,后续分组向上收拢;切回 Line 模式时恢复原位。
         // Remove the whole conditional row and its layout slot in Default mode; move later
         // sections up, then restore their original positions when Line mode returns.
-        // The hidden row occupies its 62pt row slot plus the 38pt transition to the next
-        // section. Move the complete reserved block so the next header keeps the normal gap
-        // after the device card instead of leaving the hidden section's spacing behind.
-        // 隐藏行占用 62pt 行高以及进入下一个分组前的 38pt 间距。移动完整占位区域,避免
-        // 隐藏后仍残留整段分组空白,并保持设备卡片后的正常间距。
-        let removed_section_h = 8.0 + 54.0 + SETTINGS_SECTION_HEADER_GAP + 24.0;
+        // The conditional row occupies one 62pt row slot inside the shared device card.
+        // Shift the following sections by exactly that slot when the row is hidden or restored.
+        // 条件行属于设备卡片,只占用一个 62pt 行位。隐藏或恢复时,后续分组只移动这一行的高度。
+        let removed_section_h = 8.0 + 54.0;
         let shift = if compact {
             removed_section_h
         } else {
             -removed_section_h
         };
         let card_frame: NSRect = msg_send![ui.line_count_card, frame];
-        let subviews: *mut AnyObject = msg_send![ui.mouse_view, subviews];
+        // `mouse_view` is the scroll view; layout children live in its document view.
+        // `mouse_view` 是滚动容器,实际布局子视图都在它的 document view 中。
+        let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
+        let subviews: *mut AnyObject = msg_send![document, subviews];
         let count: usize = msg_send![subviews, count];
         for i in 0..count {
             let view: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
@@ -2768,8 +2801,25 @@ unsafe fn update_mode_dependent_visibility(ui: &mut SettingsUi) {
                 let _: () = msg_send![view, setFrame: frame];
             }
         }
-        let _: () = msg_send![ui.line_count_card, setHidden: compact];
-        let _: () = msg_send![ui.line_count_shadow, setHidden: compact];
+        let mut compact_card_frame = card_frame;
+        compact_card_frame.origin.y += shift;
+        compact_card_frame.size.height -= shift;
+        let _: () = msg_send![ui.line_count_card, setFrame: compact_card_frame];
+        let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
+        let _: () = msg_send![
+            ui.line_count_shadow,
+            setFrame: NSRect::new(
+                NSPoint::new(
+                    compact_card_frame.origin.x - shadow_inset,
+                    compact_card_frame.origin.y - shadow_inset,
+                ),
+                NSSize::new(
+                    compact_card_frame.size.width + shadow_inset * 2.0,
+                    compact_card_frame.size.height + shadow_inset * 2.0,
+                ),
+            )
+        ];
+        let _: () = msg_send![ui.line_count_separator, setHidden: compact];
         ui.line_count_compact = compact;
     }
     let _: () = msg_send![ui.line_count_label, setHidden: !show_line];
@@ -5086,6 +5136,7 @@ fn create_settings_window() {
             line_count_value_label: std::ptr::null_mut(),
             line_count_card: std::ptr::null_mut(),
             line_count_shadow: std::ptr::null_mut(),
+            line_count_separator: std::ptr::null_mut(),
             line_count_compact: false,
             disable_pointer_accel: std::ptr::null_mut(),
             mapping_scroll: std::ptr::null_mut(),
@@ -5790,7 +5841,6 @@ fn create_settings_window() {
                 ),
             ),
         );
-        y -= 8.0 + described_row_h;
         // The remaining window settings form a second card with its own section title.
         // 其余窗口设置单独成卡,并为卡片补充独立的小标题。
         y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
@@ -6040,19 +6090,13 @@ fn create_settings_window() {
         let _: () = msg_send![ui.scroll_mode, setAction: sel!(handleScrollModeChanged:)];
         // The HTML device card contains both rows, with one internal hairline between them.
         add_row_separator(mouse_view, 0.0, y + described_row_h + 3.0, content_w);
-        add_settings_card(
-            mouse_view,
-            NSRect::new(
-                NSPoint::new(6.0, y - 10.0),
-                NSSize::new(
-                    content_w - 12.0,
-                    (device_header_y - SETTINGS_SECTION_CARD_GAP) - (y - 10.0),
-                ),
-            ),
-        );
 
         // --- 行数(按行模式) / Line count (line mode) ---
+        // Keep this conditional row in the same card as Device and Scroll mode.
+        // 将这个条件行放进与 Device、Scroll mode 相同的卡片中。
         y -= 8.0 + described_row_h;
+        ui.line_count_separator =
+            add_row_separator(mouse_view, 0.0, y + described_row_h + 3.0, content_w);
         let (line_label, line_ctrl) = add_tall_row(
             mouse_view,
             label_x,
@@ -6087,15 +6131,18 @@ fn create_settings_window() {
         // Refresh the value label live as the slider is dragged.
         let _: () = msg_send![ui.line_count, setTarget: target];
         let _: () = msg_send![ui.line_count, setAction: sel!(handleLineCountChanged:)];
-        let (line_count_card, line_count_shadow) = add_settings_card(
+        let (device_card, device_shadow) = add_settings_card(
             mouse_view,
             NSRect::new(
                 NSPoint::new(6.0, y - 10.0),
-                NSSize::new(content_w - 12.0, described_row_h + 20.0),
+                NSSize::new(
+                    content_w - 12.0,
+                    (device_header_y - SETTINGS_SECTION_CARD_GAP) - (y - 10.0),
+                ),
             ),
         );
-        ui.line_count_card = line_count_card;
-        ui.line_count_shadow = line_count_shadow;
+        ui.line_count_card = device_card;
+        ui.line_count_shadow = device_shadow;
 
         // --- 滚动 Scrolling ---
         y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
@@ -6390,7 +6437,6 @@ fn create_settings_window() {
                 ),
             ),
         );
-        cy -= 8.0 + described_row_h;
         // Keep the history controls in a second titled card, matching the switcher layout.
         // 其余历史记录设置单独成卡,并与切换器页面使用相同的小标题间距。
         cy -= SETTINGS_SECTION_HEADER_GAP + 24.0;
@@ -6575,13 +6621,15 @@ fn create_settings_window() {
             content_w - 12.0,
         );
         ay -= 27.0;
-        let website_y = ay - 44.0;
+        let about_row_step = 8.0 + row_h;
+        let about_text_h = (row_h - 12.0).max(1.0);
+        let website_y = ay - about_row_step;
         let website_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let website_label: *mut AnyObject = msg_send![
             website_label,
             initWithFrame: NSRect::new(
                 NSPoint::new(label_x, website_y),
-                NSSize::new(130.0, 28.0),
+                NSSize::new(130.0, about_text_h),
             )
         ];
         set_field(website_label, t("settings.website_label"));
@@ -6593,16 +6641,19 @@ fn create_settings_window() {
         let _: () = msg_send![website_label, setFont: website_label_font];
         let _: () = msg_send![about_view, addSubview: website_label];
         release_obj(website_label);
+        // Keep every About row on the same two-column grid: label on the left, value on the right.
+        // About 页面所有行统一使用两列网格：左侧标签，右侧值。
         let website_url_frame = NSRect::new(
             NSPoint::new(label_x + 145.0, website_y),
-            NSSize::new((content_w - 2.0 * label_x - 145.0).max(1.0), 28.0),
+            NSSize::new((content_w - 2.0 * label_x - 145.0).max(1.0), about_text_h),
         );
-        let website_url: *mut AnyObject = msg_send![website_link_button_class(), alloc];
+        let website_url: *mut AnyObject = msg_send![external_link_button_class(), alloc];
         let website_url: *mut AnyObject = msg_send![
             website_url,
             initWithFrame: website_url_frame
         ];
         set_field(website_url, t("settings.website_url"));
+        let _: () = msg_send![website_url, setTag: 0isize];
         let _: () = msg_send![website_url, setBezeled: false];
         let _: () = msg_send![website_url, setDrawsBackground: false];
         let _: () = msg_send![website_url, setEditable: false];
@@ -6624,13 +6675,65 @@ fn create_settings_window() {
         release_obj(website_tracking);
         let _: () = msg_send![about_view, addSubview: website_url];
         release_obj(website_url);
-        let version_y = website_y - 44.0;
+        let github_y = website_y - about_row_step;
+        add_row_separator(about_view, 0.0, github_y + row_h + 3.0, content_w);
+        let github_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let github_label: *mut AnyObject = msg_send![
+            github_label,
+            initWithFrame: NSRect::new(
+                NSPoint::new(label_x, github_y),
+                NSSize::new(130.0, about_text_h),
+            )
+        ];
+        set_field(github_label, t("settings.github_label"));
+        let _: () = msg_send![github_label, setBezeled: false];
+        let _: () = msg_send![github_label, setDrawsBackground: false];
+        let _: () = msg_send![github_label, setEditable: false];
+        let github_label_font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+        let _: () = msg_send![github_label, setFont: github_label_font];
+        let _: () = msg_send![about_view, addSubview: github_label];
+        release_obj(github_label);
+        let github_url_frame = NSRect::new(
+            NSPoint::new(label_x + 145.0, github_y),
+            NSSize::new((content_w - 2.0 * label_x - 145.0).max(1.0), about_text_h),
+        );
+        let github_url: *mut AnyObject = msg_send![external_link_button_class(), alloc];
+        let github_url: *mut AnyObject = msg_send![
+            github_url,
+            initWithFrame: github_url_frame
+        ];
+        set_field(github_url, t("settings.github_url"));
+        let _: () = msg_send![github_url, setTag: 1isize];
+        let _: () = msg_send![github_url, setBezeled: false];
+        let _: () = msg_send![github_url, setDrawsBackground: false];
+        let _: () = msg_send![github_url, setEditable: false];
+        let _: () = msg_send![github_url, setSelectable: false];
+        let _: () = msg_send![github_url, setAlignment: 0isize];
+        let github_url_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+        let _: () = msg_send![github_url, setFont: github_url_font];
+        let github_url_color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
+        let _: () = msg_send![github_url, setTextColor: github_url_color];
+        let github_tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+        let github_tracking: *mut AnyObject = msg_send![
+            github_tracking,
+            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), github_url_frame.size),
+            options: 0x01u64 | 0x80u64 | 0x200u64,
+            owner: github_url,
+            userInfo: std::ptr::null::<AnyObject>()
+        ];
+        let _: () = msg_send![github_url, addTrackingArea: github_tracking];
+        release_obj(github_tracking);
+        let _: () = msg_send![about_view, addSubview: github_url];
+        release_obj(github_url);
+        let version_y = github_y - about_row_step;
+        add_row_separator(about_view, 0.0, version_y + row_h + 3.0, content_w);
         let version_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let version_label: *mut AnyObject = msg_send![
             version_label,
             initWithFrame: NSRect::new(
                 NSPoint::new(label_x, version_y),
-                NSSize::new(130.0, 28.0),
+                NSSize::new(130.0, about_text_h),
             )
         ];
         set_field(version_label, t("settings.version_label_short"));
@@ -6647,7 +6750,7 @@ fn create_settings_window() {
             version_value,
             initWithFrame: NSRect::new(
                 NSPoint::new(label_x + 145.0, version_y),
-                NSSize::new(120.0, 28.0),
+                NSSize::new(120.0, about_text_h),
             )
         ];
         set_field(version_value, env!("CARGO_PKG_VERSION"));
@@ -6661,7 +6764,7 @@ fn create_settings_window() {
         let _: () = msg_send![version_value, setTextColor: version_value_color];
         let _: () = msg_send![about_view, addSubview: version_value];
         release_obj(version_value);
-        let app_card_bottom = version_y - 15.0;
+        let app_card_bottom = version_y - 10.0;
         add_settings_card(
             about_view,
             NSRect::new(
