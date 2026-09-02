@@ -40,6 +40,14 @@ trap cleanup EXIT
 ARCHIVE_NAME="${ARTIFACT_BASENAME}-${VERSION}-${BUILD_VERSION}.zip"
 cp "$ZIP_PATH" "$WORK_DIR/$ARCHIVE_NAME"
 
+# R2 发布器会把归档放到 RELEASE_PREFIX 下，因此 appcast 的 enclosure URL 也必须使用同一前缀。
+# R2 stores archives below RELEASE_PREFIX, so enclosure URLs must use the same prefix.
+if [ -n "$RELEASE_PREFIX" ]; then
+  DOWNLOAD_PREFIX="${PUBLIC_BASE_URL%/}/${RELEASE_PREFIX#/}/"
+else
+  DOWNLOAD_PREFIX="${PUBLIC_BASE_URL%/}/"
+fi
+
 # Prefer a local appcast so an intentional offline release can preserve its feed. On a clean
 # checkout, fetch the public feed before generating so older update entries are retained.
 if [ -f "$APPCAST_PATH" ]; then
@@ -63,8 +71,17 @@ else
   esac
 fi
 
+# 旧 feed 可能在接入频道前缀以前生成。这里只迁移当前归档族，生产和开发 feed 可以独立修复，
+# 不会改动无关的 enclosure URL。
+# Older feeds may predate channel prefixes. Migrate only this artifact family so production and
+# development feeds can be repaired independently without touching unrelated enclosure URLs.
+OLD_DOWNLOAD_PREFIX="${PUBLIC_BASE_URL%/}/"
+if [ -f "$WORK_DIR/appcast.xml" ] && [ "$OLD_DOWNLOAD_PREFIX" != "$DOWNLOAD_PREFIX" ]; then
+  sed -i '' "s|${OLD_DOWNLOAD_PREFIX}${ARTIFACT_BASENAME}-|${DOWNLOAD_PREFIX}${ARTIFACT_BASENAME}-|g" \
+    "$WORK_DIR/appcast.xml"
+fi
+
 mkdir -p "$(dirname "$APPCAST_PATH")"
-DOWNLOAD_PREFIX="${PUBLIC_BASE_URL%/}/${RELEASE_PREFIX#/}"
 
 APPCAST_ARGS=(
   --download-url-prefix "$DOWNLOAD_PREFIX"
@@ -77,4 +94,9 @@ fi
 
 echo "ℹ️  Generating appcast for $ARCHIVE_NAME"
 "$GENERATE_APPCAST" "${APPCAST_ARGS[@]}" "$WORK_DIR"
+EXPECTED_URL="${DOWNLOAD_PREFIX}${ARCHIVE_NAME}"
+if ! grep -Fq "url=\"$EXPECTED_URL\"" "$APPCAST_PATH"; then
+  echo "error: generated appcast does not contain the expected enclosure URL: $EXPECTED_URL" >&2
+  exit 1
+fi
 echo "✅ Generated $APPCAST_PATH"
