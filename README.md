@@ -141,15 +141,17 @@ feed `https://download.oh-my-tab.app/dev_release/appcast.xml`, R2 prefix `dev_re
 > sh scripts/release-dev.sh --push --dry-run
 > ```
 
-To publish a signed appcast, first run the dev script without `--push`, generate the appcast from
-that exact ZIP, save it as `dist/appcast-dev.xml`, then run `sh scripts/release-dev.sh --push`.
-When the three existing dev artifacts are present, `--push` reuses them; set `RELEASE_REBUILD=1`
-only when you intentionally want to rebuild before publishing.
+With `--push`, the release scripts now generate or update the appcast before uploading. They reuse
+an existing local appcast when present; on a clean checkout they fetch the public feed first so
+older entries are retained. If no feed exists yet, a new one is created. The generated feed uses
+the exact immutable ZIP filename that the R2 publisher uploads. Every `--push` invocation rebuilds
+the app and release archives from the current source tree before generating the feed.
 
-`--push` requires your prepared appcast (`dist/appcast.xml` for production or
-`dist/appcast-dev.xml` for development) and reads `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
-`R2_BUCKET`, and `R2_ENDPOINT` (or `R2_ACCOUNT_ID`) from the environment. The isolated publisher
-lives in `tools/r2-publisher` and keeps credentials out of the app and command-line arguments.
+Appcast signing uses the `ed25519` key from the macOS Keychain by default. Set
+`SPARKLE_ED_KEY_FILE` to use an external private-key file; never commit that file. The `--push`
+flow reads `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, and `R2_ENDPOINT` (or
+`R2_ACCOUNT_ID`) from the environment. The isolated publisher lives in `tools/r2-publisher` and
+keeps R2 credentials out of the app and command-line arguments.
 The upload request always goes to the configured R2 S3 endpoint; `download.oh-my-tab.app` is only
 the public HTTPS base written into Sparkle URLs. `R2_PUBLIC_BASE_URL` changes the displayed/public
 URL base only; the upload destination remains the configured R2 endpoint.
@@ -165,10 +167,11 @@ publish those materials to the matching R2 channel later.
 Place Sparkle 2's `Sparkle.framework` at `vendor/Sparkle.framework` (or set `SPARKLE_FRAMEWORK_PATH`); `scripts/bundle.sh` and `scripts/dev-restart.sh` copy it into `Contents/Frameworks`. Without the framework the app still starts and the About page explains why update checks are unavailable. The scripts use a UTC timestamp for `CFBundleVersion` by default; set `SPARKLE_BUILD_VERSION` when a deterministic build number is needed. At release time, `SPARKLE_FEED_URL` overrides the feed URL and `SPARKLE_PUBLIC_ED_KEY` writes the appcast verification key into the bundle. Never commit or upload the private key.
 
 Build requirement distinction: `cargo build`, `cargo check`, and the test suite work without
-Sparkle. A packaged app with working update checks requires the framework at the path above;
-generating appcasts additionally requires Sparkle's `bin/generate_keys` and
-`bin/generate_appcast` tools. The framework is intentionally ignored by Git, so each developer or
-CI job must provide the pinned Sparkle distribution locally.
+Sparkle. A packaged app with working update checks requires the framework at the path above.
+This repository includes the pinned Sparkle 2.9.6 `bin/generate_keys` and `bin/generate_appcast`
+tools under `vendor/Sparkle/`; run them from there when generating appcasts. The pinned framework
+and release-tool subset are both kept in the repository so update-enabled builds and appcast
+generation do not depend on a developer-specific Downloads path.
 
 ### Code signing
 

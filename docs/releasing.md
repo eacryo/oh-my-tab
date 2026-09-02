@@ -20,11 +20,15 @@ sh scripts/release-dev.sh --push          # 上传到 dev_release，并发布 de
 sh scripts/release-dev.sh --push --dry-run
 ```
 
-发布前先运行一次不带 `--push` 的开发脚本。从这次生成的 ZIP 复制出带版本和 build number 的
-文件名，再用 Sparkle 的 `generate_appcast` 生成 appcast，并把结果保存为
-`dist/appcast-dev.xml`。随后运行 `sh scripts/release-dev.sh --push`；脚本会复用现有的
-`.app`、ZIP 和 DMG，避免重新构建导致 appcast 签名与上传文件不一致。确实要强制重建时使用
-`RELEASE_REBUILD=1 sh scripts/release-dev.sh --push`。
+带 `--push` 时，脚本会始终基于当前源码重新构建 `.app`、ZIP 和 DMG，然后调用仓库内固定版本的
+`vendor/Sparkle/bin/generate_appcast`。
+如果本地已有 appcast，脚本会先使用它；在干净 checkout 中会从公开 Feed 读取旧 appcast，
+以保留历史条目。若 Feed 尚不存在，则创建新的 appcast。工具从临时目录中的最终 ZIP
+文件名生成 enclosure URL，确保它和 R2 publisher 随后上传的对象一致。
+
+appcast 默认从 macOS Keychain 读取名为 `ed25519` 的 Ed25519 私钥。也可以通过
+`SPARKLE_ED_KEY_FILE` 指定外部私钥文件；私钥不得提交到仓库。`--push --dry-run` 保持为
+只打印上传计划，不会生成或上传文件。
 
 cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，所以只能安装在 macOS 13+ 的 Apple Silicon 上。它的 `url` 指向 `https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg`，因此 dmg 必须传到一个 tag 为 `v<version>` 的 GitHub release（与 `Cargo.toml` 的 version 一致）。
 
@@ -37,13 +41,13 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 
 第 4 步完成后，`brew install --cask eacryo/tap/oh-my-tab`（或 `brew upgrade --cask`）就能拉到新版本。`brew install --cask` 实际读取的是 tap 仓库里已提交的那份 `Casks/oh-my-tab.rb`；`release.sh` 只是在本地重新生成它，方便拷贝。
 
-`--push` 使用 `tools/r2-publisher`，凭证只从环境变量读取：`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_BUCKET`、`R2_ENDPOINT`（或 `R2_ACCOUNT_ID`）。生产发布前准备 `dist/appcast.xml`；开发发布前准备 `dist/appcast-dev.xml`。工具会先检查 appcast、ZIP 和 DMG，按“归档文件 → appcast”的顺序上传。生产默认对象路径是 `releases/` + `appcast.xml`，开发脚本统一放在 `dev_release/`（归档和 `appcast.xml` 都在这里），并使用 `Oh-My-Tab-Dev-...` 归档名前缀；这些值仍可通过环境变量（包括 `R2_RELEASE_PREFIX`、`R2_APPCAST_KEY`、`R2_ARTIFACT_BASENAME`）覆盖。
+`--push` 使用 `tools/r2-publisher`，凭证只从环境变量读取：`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_BUCKET`、`R2_ENDPOINT`（或 `R2_ACCOUNT_ID`）。工具会先上传 ZIP 和 DMG，最后上传刚生成的 appcast；生产默认对象路径是 `releases/` + `appcast.xml`，开发脚本统一放在 `dev_release/`（归档和 `appcast.xml` 都在这里），并使用 `Oh-My-Tab-Dev-...` 归档名前缀；这些值仍可通过环境变量（包括 `R2_RELEASE_PREFIX`、`R2_APPCAST_KEY`、`R2_ARTIFACT_BASENAME`）覆盖。
 
 上传目标与下载地址分离：上传始终使用 `R2_ENDPOINT`（或 `R2_ACCOUNT_ID` 推导出的 S3 endpoint）和 `R2_BUCKET`；`https://download.oh-my-tab.app` 只用于客户端访问 appcast 和归档文件。`R2_PUBLIC_BASE_URL` 只影响发布计划中显示的公开 URL。
 
 ## Sparkle 更新材料
 
-发布前置条件：普通的 `cargo build` / `cargo test` 不需要 Sparkle；要构建带更新功能的 `.app`，必须把 Sparkle 2 的 framework 放在 `vendor/Sparkle.framework`，或设置 `SPARKLE_FRAMEWORK_PATH`。生成密钥和 appcast 则需要同一发行包中的 `bin/generate_keys`、`bin/generate_appcast`。framework 不提交到 Git，每台开发机或 CI 都应准备固定版本。
+发布前置条件：普通的 `cargo build` / `cargo test` 不需要 Sparkle；仓库已提交固定版本的 Sparkle 2 framework 到 `vendor/Sparkle.framework`，因此默认可构建带更新功能的 `.app`。仓库也包含固定版本 Sparkle 2.9.6 的 `vendor/Sparkle/bin/generate_keys` 和 `vendor/Sparkle/bin/generate_appcast`，用于生成密钥和 appcast；这两个工具是 macOS universal 二进制文件。相关工具许可证见 `vendor/Sparkle/LICENSE`。
 
 更新器代码会在运行时加载 `Contents/Frameworks/Sparkle.framework`。把 Sparkle 2 的框架放到 `vendor/Sparkle.framework`，或设置 `SPARKLE_FRAMEWORK_PATH`，`bundle.sh` / `dev-restart.sh` 会自动拷贝它。生产应用包中的 `SUFeedURL` 默认是 `https://download.oh-my-tab.app/appcast.xml`，开发重启和开发发布脚本默认使用 `https://download.oh-my-tab.app/dev_release/appcast.xml`；也可用 `SPARKLE_FEED_URL` 覆盖。
 

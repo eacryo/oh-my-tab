@@ -23,7 +23,6 @@ for arg in "$@"; do
       echo "  (no flag)  build locally; never contacts R2"
       echo "  --push     upload ZIP, DMG, then dist/appcast.xml to R2"
       echo "  --dry-run  print the R2 upload plan without uploading"
-      echo "  RELEASE_REBUILD=1 ... --push  force a fresh build before uploading"
       exit 0
       ;;
     *)
@@ -43,14 +42,9 @@ DMG="dist/Oh-My-Tab.dmg"
 ZIP="dist/Oh-My-Tab.zip"
 OUT="dist/oh-my-tab.rb"
 
-# 1. Build locally. When publishing, reuse an existing bundle/archive so the appcast signature
-# refers to exactly the bytes that will be uploaded; set RELEASE_REBUILD=1 to force a rebuild.
-if [ "$PUSH_R2" -eq 1 ] && [ "${RELEASE_REBUILD:-0}" != "1" ] \
-  && [ -f "$APP/Contents/Info.plist" ] && [ -f "$ZIP" ] && [ -f "$DMG" ]; then
-  echo "ℹ️  Reusing existing release artifacts (set RELEASE_REBUILD=1 to rebuild)."
-else
-  sh scripts/bundle.sh
-fi
+# 1. Always build fresh release artifacts. This keeps --push tied to the current source tree and
+# gives every release a new build number before the matching appcast is generated.
+sh scripts/bundle.sh
 
 if [ ! -f "$DMG" ]; then
   echo "❌ Build failed: $DMG not found" >&2
@@ -65,6 +59,16 @@ fi
 # 2. Read version from Cargo.toml (same source as bundle.sh).
 VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)
 BUILD_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' dist/Oh-My-Tab.app/Contents/Info.plist)
+
+if [ "$PUSH_R2" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+  # Generate/update the feed before publishing. The helper reuses a local feed or fetches the
+  # public feed on a clean checkout, then generates URLs matching the R2 object names.
+  R2_RELEASE_PREFIX="${R2_RELEASE_PREFIX:-releases}" \
+  R2_ARTIFACT_BASENAME="${R2_ARTIFACT_BASENAME:-Oh-My-Tab}" \
+  R2_PUBLIC_BASE_URL="${R2_PUBLIC_BASE_URL:-https://download.oh-my-tab.app}" \
+  SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://download.oh-my-tab.app/appcast.xml}" \
+  bash scripts/generate-appcast.sh "${R2_APPCAST_PATH:-dist/appcast.xml}" "$ZIP" "$VERSION" "$BUILD_VERSION"
+fi
 
 # 3. 算 dmg sha256。
 # 3. Compute the dmg sha256.

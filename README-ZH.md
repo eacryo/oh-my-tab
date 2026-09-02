@@ -141,14 +141,17 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 > sh scripts/release-dev.sh --push --dry-run
 > ```
 
-要发布已签名的 appcast，先不带 `--push` 运行开发脚本，再从这次生成的 ZIP 生成 appcast，
-保存为 `dist/appcast-dev.xml`，最后运行 `sh scripts/release-dev.sh --push`。如果三个开发产物
-仍然存在，`--push` 会复用它们；只有明确需要重新构建时才设置 `RELEASE_REBUILD=1`。
+带 `--push` 时，发布脚本会先自动生成或更新 appcast，再上传产物。如果本地已有 appcast
+就复用它；在干净 checkout 中会先读取线上 feed，以保留历史版本；如果线上还没有 feed，
+则创建新的 appcast。生成时使用 R2 即将上传的不可变 ZIP 文件名，确保 appcast 中的下载地址
+与实际上传对象一致。每次执行 `--push` 都会基于当前源码重新构建 `.app`、ZIP 和 DMG，
+不会自动复用旧的构建产物。
 
-`--push` 要求你准备好对应的 appcast（生产为 `dist/appcast.xml`，开发为
-`dist/appcast-dev.xml`），并读取 `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_BUCKET` 以及
-`R2_ENDPOINT`（或 `R2_ACCOUNT_ID`）等环境变量。上传工具位于 `tools/r2-publisher`，会把
-密钥排除在应用和命令行参数之外。
+appcast 默认使用 macOS Keychain 中名为 `ed25519` 的密钥签名；也可设置
+`SPARKLE_ED_KEY_FILE` 使用外部私钥文件，但不要将该文件提交到仓库。`--push` 仍需读取
+`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_BUCKET` 以及 `R2_ENDPOINT`（或
+`R2_ACCOUNT_ID`）等环境变量。上传工具位于 `tools/r2-publisher`，会把 R2 密钥排除在应用
+和命令行参数之外。
 上传请求始终发送到环境变量配置的 R2 S3 endpoint；`download.oh-my-tab.app` 只作为 Sparkle
 链接中的公开 HTTPS 地址。`R2_PUBLIC_BASE_URL` 只控制显示/公开 URL,实际上传目标仍由 R2 endpoint 决定。
 
@@ -161,7 +164,7 @@ Sparkle 私钥，这些发布材料由你后续分别放到对应的 R2 路径�
 
 把 Sparkle 2 的 `Sparkle.framework` 放到 `vendor/Sparkle.framework`（或设置 `SPARKLE_FRAMEWORK_PATH`），`scripts/bundle.sh` 和 `scripts/dev-restart.sh` 会自动复制到 `Contents/Frameworks`。没有框架时应用仍可启动，About 页会提示该构建未包含 Sparkle。脚本默认用 UTC 时间戳生成 `CFBundleVersion`，也可用 `SPARKLE_BUILD_VERSION` 指定固定值；发布时可通过 `SPARKLE_FEED_URL` 覆盖 feed 地址，通过 `SPARKLE_PUBLIC_ED_KEY` 写入 appcast 验签公钥。私钥不要放进仓库或 R2。
 
-构建要求需要区分：`cargo build`、`cargo check` 和测试套件可以在没有 Sparkle 的情况下运行；要让打包后的应用具备更新检查功能，需要提供上面的 framework。生成 appcast 还需要 Sparkle 发行包中的 `bin/generate_keys` 和 `bin/generate_appcast`。framework 已按设计加入 Git 忽略，因此每台开发机或 CI 都要自行准备固定版本的 Sparkle 发行包。
+构建要求需要区分：`cargo build`、`cargo check` 和测试套件可以在没有 Sparkle 的情况下运行；要让打包后的应用具备更新检查功能，需要提供上面的 framework。本仓库已将固定版本 Sparkle 2.9.6 的 framework，以及生成 appcast 所需的 `bin/generate_keys` 和 `bin/generate_appcast` 放在 `vendor/` 下，之后直接使用这里的文件即可，不再依赖开发机特定的 Downloads 路径。仓库中的工具许可证见 `vendor/Sparkle/LICENSE`。
 
 ### 代码签名
 

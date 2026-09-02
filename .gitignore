@@ -4,6 +4,5 @@
 .DS_Store
 node_modules/
 dist/
-# Native Sparkle distribution is supplied locally and embedded by the bundle scripts.
-/vendor/Sparkle.framework/
+# Sparkle framework and release tools are vendored under vendor/Sparkle*.
 /tools/r2-publisher/target/

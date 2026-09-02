@@ -14,7 +14,6 @@ for arg in "$@"; do
       echo "  (no flag)  build the dev package locally; never contacts R2"
       echo "  --push     upload the dev ZIP, DMG, then dev appcast to R2"
       echo "  --dry-run  print the R2 upload plan without uploading"
-      echo "  RELEASE_REBUILD=1 ... --push  force a fresh build before uploading"
       exit 0
       ;;
     *)
@@ -42,16 +41,11 @@ APP="dist/${APP_BASENAME}.app"
 ZIP="dist/${APP_BASENAME}.zip"
 DMG="dist/${APP_BASENAME}.dmg"
 
-if [ "$PUSH_R2" -eq 1 ] && [ "${RELEASE_REBUILD:-0}" != "1" ] \
-  && [ -f "$APP/Contents/Info.plist" ] && [ -f "$ZIP" ] && [ -f "$DMG" ]; then
-  echo "ℹ️  Reusing existing dev artifacts (set RELEASE_REBUILD=1 to rebuild)."
-else
-  APP_BASENAME="$APP_BASENAME" \
-  BUNDLE_ID="$BUNDLE_ID" \
-  BUNDLE_NAME="$BUNDLE_NAME" \
-  SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
-  sh scripts/bundle.sh
-fi
+APP_BASENAME="$APP_BASENAME" \
+BUNDLE_ID="$BUNDLE_ID" \
+BUNDLE_NAME="$BUNDLE_NAME" \
+SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
+sh scripts/bundle.sh
 
 if [ ! -f "$APP/Contents/Info.plist" ] || [ ! -f "$ZIP" ] || [ ! -f "$DMG" ]; then
   echo "❌ Build failed: expected $APP, $ZIP, and $DMG" >&2
@@ -63,6 +57,15 @@ BUILD_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Conten
 echo "✅ Dev build ready: $APP (version=$VERSION, build=$BUILD_VERSION)"
 
 if [ "$PUSH_R2" -eq 1 ]; then
+  if [ "$DRY_RUN" -eq 0 ]; then
+    # Generate/update the feed before publishing. The helper reuses a local feed or fetches the
+    # public feed on a clean checkout, then generates URLs matching the R2 object names.
+    R2_RELEASE_PREFIX="$R2_RELEASE_PREFIX" \
+    R2_ARTIFACT_BASENAME="$R2_ARTIFACT_BASENAME" \
+    R2_PUBLIC_BASE_URL="${R2_PUBLIC_BASE_URL:-https://download.oh-my-tab.app}" \
+    SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
+    bash scripts/generate-appcast.sh "$R2_APPCAST_PATH" "$ZIP" "$VERSION" "$BUILD_VERSION"
+  fi
   PUBLISH_ARGS="--appcast $R2_APPCAST_PATH --zip $ZIP --dmg $DMG --version $VERSION --build-version $BUILD_VERSION"
   if [ "$DRY_RUN" -eq 1 ]; then
     PUBLISH_ARGS="$PUBLISH_ARGS --dry-run"
