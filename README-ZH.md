@@ -62,7 +62,8 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 
 <p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="主界面"></p>
 
-<div align="center"><video src="docs/videos/settings_page.mp4" width="560" height="489" style="display: block; max-width: 100%; height: auto; margin: 0 auto;" controls loop muted playsinline></video></div>
+<p align="center"><a href="https://github.com/eacryo/oh-my-tab/raw/master/docs/videos/settings_page.mp4"><img src="docs/videos/settings_page.gif" width="560" alt="设置页面演示"></a></p>
+<p align="center"><sub>点击预览图可打开原始 MP4 视频。</sub></p>
 
 ## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;剪贴板历史
 
