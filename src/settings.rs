@@ -24,6 +24,7 @@ use crate::i18n::{t, tf};
 use crate::menu::{refresh_menu_titles, set_shortcut_mode};
 use crate::mouse::shortcut::{button_name, describe_shortcut, display_shortcut};
 use crate::overlay::{apply_theme, refresh_highlight, update_status_label};
+use crate::theme::{resolved_is_dark, ui_palette, UiPalette};
 use crate::{log_debug, log_info};
 // 跨模块共享状态(由 main.rs 持有)/ cross-module shared state (owned by main.rs)
 use crate::MENU_TARGET;
@@ -153,6 +154,7 @@ struct SettingsUi {
     mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
     clipboard_view: *mut AnyObject,  // NSView: 剪贴板历史页容器 / Clipboard page container
     about_view: *mut AnyObject,      // NSView: 关于页容器 / About page container
+    theme: *mut AnyObject,           // NSPopUpButton: auto / light / dark
     glass_style: *mut AnyObject,     // NSPopUpButton: regular / clear
     glass_tint: *mut AnyObject,      // NSColorWell: 玻璃颜色 / glass tint
     glass_preview_switcher: *mut AnyObject, // NSGlassEffectView: app switcher preview
@@ -345,6 +347,30 @@ unsafe fn set_control_title(obj: *mut AnyObject, title: &str) {
     CFRelease(ns as *const c_void);
 }
 
+fn settings_palette() -> UiPalette {
+    ui_palette()
+}
+
+/// Map legacy HTML reference colors to the corresponding role in the active palette. Keeping
+/// this compatibility layer lets the many settings controls share one dark/light implementation
+/// without changing their layout-specific call sites.
+/// 将旧版 HTML 参考色映射到当前主题的调色板角色,让现有设置控件共享明暗主题实现。
+fn themed_settings_color(hex: u32) -> u32 {
+    let p = settings_palette();
+    if !p.dark {
+        return hex;
+    }
+    match hex {
+        0xFFFFFFAD | 0x7676801F | 0x7676801E => p.button_bg,
+        0xFFFFFFC7 => p.footer_button_bg,
+        0x76768024 | 0x7676802B => p.hover_bg,
+        0x0A84FFFF => p.accent,
+        0x0077EDFF => p.accent_hover,
+        0xFFFFFFFF | 0x2E2E2EFF | 0x2C2C30FF | 0x44444AFF => p.button_text,
+        _ => hex,
+    }
+}
+
 /// Apply the HTML button surface to native NSButton instances.
 unsafe fn style_html_button(button: *mut AnyObject, background_hex: u32, text_hex: u32) {
     let _: () = msg_send![button, setBezelStyle: 0isize];
@@ -352,13 +378,17 @@ unsafe fn style_html_button(button: *mut AnyObject, background_hex: u32, text_he
     let _: () = msg_send![button, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![button, layer];
     if !layer.is_null() {
-        layer_set_background(layer, crate::ffi::hex_to_cg_color(background_hex));
-        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x00000012u32));
+        let palette = settings_palette();
+        layer_set_background(
+            layer,
+            crate::ffi::hex_to_cg_color(themed_settings_color(background_hex)),
+        );
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
         let _: () = msg_send![layer, setCornerRadius: 8.0f64];
         let _: () = msg_send![layer, setMasksToBounds: true];
     }
-    let text_color = crate::ffi::hex_to_ns_color(text_hex);
+    let text_color = crate::ffi::hex_to_ns_color(themed_settings_color(text_hex));
     let _: () = msg_send![button, setContentTintColor: text_color];
 }
 
@@ -404,7 +434,10 @@ extern "C" fn html_action_button_mouse_entered(this: *mut c_void, _cmd: Sel, _ev
         };
         let layer: *mut AnyObject = msg_send![button, layer];
         if !layer.is_null() {
-            layer_set_background(layer, crate::ffi::hex_to_cg_color(hover));
+            layer_set_background(
+                layer,
+                crate::ffi::hex_to_cg_color(themed_settings_color(hover)),
+            );
         }
     }
 }
@@ -421,7 +454,10 @@ extern "C" fn html_action_button_mouse_exited(this: *mut c_void, _cmd: Sel, _eve
         };
         let layer: *mut AnyObject = msg_send![button, layer];
         if !layer.is_null() {
-            layer_set_background(layer, crate::ffi::hex_to_cg_color(normal));
+            layer_set_background(
+                layer,
+                crate::ffi::hex_to_cg_color(themed_settings_color(normal)),
+            );
         }
     }
 }
@@ -507,7 +543,10 @@ extern "C" fn sidebar_button_mouse_entered(this: *mut c_void, _cmd: Sel, _event:
         }
         let layer: *mut AnyObject = msg_send![button, layer];
         if !layer.is_null() {
-            layer_set_background(layer, crate::ffi::hex_to_cg_color(0x76768014u32));
+            layer_set_background(
+                layer,
+                crate::ffi::hex_to_cg_color(settings_palette().hover_bg),
+            );
         }
     }
 }
@@ -813,10 +852,15 @@ unsafe fn make_text_input(x: f64, y: f64, w: f64, h: f64, value: &str) -> *mut A
                                                         // The rounded layer below is the sole background surface. Keeping the cell background off
                                                         // avoids a second, darker strip when the custom cell draws inside its centered rect.
     let _: () = msg_send![field, setDrawsBackground: false];
+    let field_text = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let _: () = msg_send![field, setTextColor: field_text];
     let _: () = msg_send![field, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![field, layer];
     if !layer.is_null() {
-        layer_set_background(layer, crate::ffi::hex_to_cg_color(0x7676801Cu32));
+        layer_set_background(
+            layer,
+            crate::ffi::hex_to_cg_color(settings_palette().field_bg),
+        );
         let _: () = msg_send![layer, setCornerRadius: 9.0f64];
         let _: () = msg_send![layer, setMasksToBounds: true];
     }
@@ -1140,7 +1184,7 @@ unsafe fn add_preview_caption(parent: *mut AnyObject, text: &str, x: f64, y: f64
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+    let color = crate::ffi::hex_to_ns_color(settings_palette().secondary_text);
     let font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 11.0f64];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setFont: font];
@@ -1372,12 +1416,21 @@ unsafe fn make_popup(
     let _: () = msg_send![popup, setBezelStyle: 0isize];
     let _: () = msg_send![popup, setControlSize: 0isize]; // Regular
     let _: () = msg_send![popup, setBordered: false];
+    let palette = settings_palette();
     let _: () = msg_send![popup, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![popup, layer];
     if !layer.is_null() {
-        layer_set_background(layer, crate::ffi::hex_to_cg_color(0x7676801Cu32));
+        layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.field_bg));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
+        let _: () = msg_send![layer, setBorderWidth: 1.0f64];
         let _: () = msg_send![layer, setCornerRadius: 9.0f64];
         let _: () = msg_send![layer, setMasksToBounds: true];
+    }
+    let tint = crate::ffi::hex_to_ns_color(palette.primary_text);
+    let _: () = msg_send![popup, setContentTintColor: tint];
+    let cell: *mut AnyObject = msg_send![popup, cell];
+    if !cell.is_null() && msg_send![cell, respondsToSelector: sel!(setTextColor:)] {
+        let _: () = msg_send![cell, setTextColor: tint];
     }
     popup
 }
@@ -1400,16 +1453,25 @@ unsafe fn html_switch_apply_visual(button: *mut AnyObject, previous_state: Optio
     }
     let state: isize = msg_send![button, state];
     let enabled: bool = msg_send![button, isEnabled];
+    let palette = settings_palette();
     let track_hex = if state != 0 {
         if enabled {
-            0x0A84FFFF
+            palette.accent
         } else {
             0x0A84FF73
         }
     } else if enabled {
-        0xC7C7CCFF
+        if palette.dark {
+            0x636366FF
+        } else {
+            0xC7C7CCFF
+        }
     } else {
-        0xC7C7CC73
+        if palette.dark {
+            0x63636673
+        } else {
+            0xC7C7CC73
+        }
     };
     crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(track_hex));
     let _: () = msg_send![layer, setCornerRadius: HTML_SWITCH_H / 2.0];
@@ -1425,7 +1487,10 @@ unsafe fn html_switch_apply_visual(button: *mut AnyObject, previous_state: Optio
         msg_send![sublayers, objectAtIndex: 0usize]
     } else {
         let knob: *mut AnyObject = msg_send![class!(CALayer), layer];
-        crate::ffi::layer_set_background(knob, crate::ffi::hex_to_cg_color(0xFFFFFFF5));
+        crate::ffi::layer_set_background(
+            knob,
+            crate::ffi::hex_to_cg_color(if palette.dark { 0xF5F5F7F5 } else { 0xFFFFFFF5 }),
+        );
         let _: () = msg_send![knob, setCornerRadius: HTML_SWITCH_KNOB_D / 2.0];
         let _: () = msg_send![layer, addSublayer: knob];
         knob
@@ -1727,6 +1792,8 @@ unsafe fn make_sidebar_button(
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
+    let label_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let _: () = msg_send![label, setTextColor: label_color];
     let _: () = msg_send![label, setSelectable: false];
     let _: () = msg_send![label, setAlignment: 0isize];
     let _: () = msg_send![label, setUsesSingleLineMode: true];
@@ -1850,8 +1917,7 @@ extern "C" fn settings_card_shadow_draw_rect(_self: *mut c_void, _cmd: Sel, _rec
         );
         let shadow: *mut AnyObject = msg_send![class!(NSShadow), alloc];
         let shadow: *mut AnyObject = msg_send![shadow, init];
-        let shadow_color: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.04f64];
+        let shadow_color = crate::ffi::hex_to_ns_color(settings_palette().shadow);
         let _: () = msg_send![shadow, setShadowColor: shadow_color];
         let _: () = msg_send![shadow, setShadowBlurRadius: 8.0f64];
         let _: () = msg_send![shadow, setShadowOffset: NSSize::new(0.0, -1.0)];
@@ -1863,7 +1929,7 @@ extern "C" fn settings_card_shadow_draw_rect(_self: *mut c_void, _cmd: Sel, _rec
             xRadius: 14.0f64,
             yRadius: 14.0f64
         ];
-        let fill: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
+        let fill = crate::ffi::hex_to_ns_color(settings_palette().card_bg);
         let _: () = msg_send![fill, set];
         let _: () = msg_send![path, fill];
         release_obj(shadow);
@@ -1913,11 +1979,12 @@ unsafe fn add_settings_card(parent: *mut AnyObject, frame: NSRect) {
     let _: () = msg_send![card, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![card, layer];
     if !layer.is_null() {
-        layer_set_background(layer, crate::ffi::hex_to_cg_color(0xFFFFFFE0u32));
+        let palette = settings_palette();
+        layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.card_bg));
         let _: () = msg_send![layer, setCornerRadius: 14.0f64];
         // Keep the outer shadow visible. The card has no child content that needs clipping.
         let _: () = msg_send![layer, setMasksToBounds: false];
-        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x00000012u32));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
     }
     // Insert below controls and labels so the card never intercepts their mouse events.
@@ -1970,7 +2037,10 @@ unsafe fn add_row_separator(parent: *mut AnyObject, x: f64, y: f64, w: f64) {
     let _: () = msg_send![line, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![line, layer];
     if !layer.is_null() {
-        layer_set_background(layer, crate::ffi::hex_to_cg_color(0x00000016u32));
+        layer_set_background(
+            layer,
+            crate::ffi::hex_to_cg_color(settings_palette().separator),
+        );
     }
     let _: () = msg_send![parent, addSubview: line];
     release_obj(line);
@@ -2023,8 +2093,10 @@ unsafe fn add_row_with_label(
     // Left-aligned: the row label hugs the content area's left edge (NSTextAlignmentLeft = 0,
     // identical on arm64 and x86_64).
     let _: () = msg_send![label, setAlignment: 0isize]; // NSTextAlignmentLeft
-                                                        // 自适应:标签固定宽、顶部+左侧锚定(MinYMargin|MaxXMargin = 8|4 = 12)。
-                                                        // Adaptive: label keeps fixed width, stays top- and left-anchored.
+    let label_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let _: () = msg_send![label, setTextColor: label_color];
+    // 自适应:标签固定宽、顶部+左侧锚定(MinYMargin|MaxXMargin = 8|4 = 12)。
+    // Adaptive: label keeps fixed width, stays top- and left-anchored.
     let _: () = msg_send![label, setAutoresizingMask: 12u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
@@ -2062,6 +2134,8 @@ unsafe fn add_described_row(
     let _: () = msg_send![title_label, setBezeled: false];
     let _: () = msg_send![title_label, setDrawsBackground: false];
     let _: () = msg_send![title_label, setEditable: false];
+    let title_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let _: () = msg_send![title_label, setTextColor: title_color];
     let _: () = msg_send![title_label, setUsesSingleLineMode: true];
     let title_font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.5f64];
     let _: () = msg_send![title_label, setFont: title_font];
@@ -2083,7 +2157,7 @@ unsafe fn add_described_row(
     let _: () = msg_send![subtitle_label, setUsesSingleLineMode: true];
     let subtitle_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.5f64];
     let _: () = msg_send![subtitle_label, setFont: subtitle_font];
-    let subtitle_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+    let subtitle_color = crate::ffi::hex_to_ns_color(settings_palette().secondary_text);
     let _: () = msg_send![subtitle_label, setTextColor: subtitle_color];
     let _: () = msg_send![parent, addSubview: subtitle_label];
     release_obj(subtitle_label);
@@ -2115,6 +2189,8 @@ unsafe fn add_tall_row(
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
     let _: () = msg_send![label, setAlignment: 0isize]; // left
+    let label_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let _: () = msg_send![label, setTextColor: label_color];
     let font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.5f64];
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setAutoresizingMask: 12u64];
@@ -2136,9 +2212,17 @@ unsafe fn style_flat_popup(popup: *mut AnyObject) {
     if !layer.is_null() {
         let _: () = msg_send![layer, setCornerRadius: 9.0f64];
         let _: () = msg_send![layer, setMasksToBounds: true];
-        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(0x7676801Du32));
-        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x00000012u32));
+        let palette = settings_palette();
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.field_bg));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
+    }
+    let palette = settings_palette();
+    let tint = crate::ffi::hex_to_ns_color(palette.primary_text);
+    let _: () = msg_send![popup, setContentTintColor: tint];
+    let cell: *mut AnyObject = msg_send![popup, cell];
+    if !cell.is_null() && msg_send![cell, respondsToSelector: sel!(setTextColor:)] {
+        let _: () = msg_send![cell, setTextColor: tint];
     }
 }
 
@@ -3528,6 +3612,7 @@ fn open_mapping_panel(btn: Option<u32>) {
             let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(440.0, 240.0));
             let panel: *mut AnyObject = msg_send![class!(NSPanel), alloc];
             let panel: *mut AnyObject = msg_send![panel, initWithContentRect: frame, styleMask: 0u64, backing: 2u64, defer: false];
+            apply_settings_window_appearance(panel);
             let _: () = msg_send![panel, setReleasedWhenClosed: false];
             let _: () = msg_send![panel, setOpaque: false];
             let _: () = msg_send![panel, setLevel: 3isize]; // NSFloatingWindowLevel
@@ -3547,8 +3632,10 @@ fn open_mapping_panel(btn: Option<u32>) {
             let ve_layer: *mut AnyObject = msg_send![ve, layer];
             let _: () = msg_send![ve_layer, setCornerRadius: 10.0f64];
             let _: () = msg_send![ve_layer, setMasksToBounds: true];
-            let bg_ns: *mut AnyObject = msg_send![class!(NSColor), windowBackgroundColor];
-            layer_set_background(ve_layer, ns_color_to_cg(bg_ns));
+            layer_set_background(
+                ve_layer,
+                crate::ffi::hex_to_cg_color(settings_palette().window_bg),
+            );
             let _: () = msg_send![panel, setContentView: ve];
             release_obj(ve);
             let target = MENU_TARGET.lock().unwrap().unwrap().0;
@@ -3906,6 +3993,9 @@ fn apply_config_refresh() {
     refresh_menu_titles();
     invalidate_settings_window();
     crate::clipboard::refresh_localized_ui();
+    unsafe {
+        crate::clipboard::apply_theme();
+    }
     apply_theme();
     refresh_highlight();
     update_status_label();
@@ -4183,6 +4273,12 @@ fn load_settings_from(cfg: &Config) {
             Some(u) => u,
             None => return,
         };
+        let theme_idx: isize = match cfg.appearance.theme.as_str() {
+            "dark" => 0,
+            "light" => 1,
+            _ => 2,
+        };
+        let _: () = msg_send![ui.theme, selectItemAtIndex: theme_idx];
         let gs_idx: isize = if cfg.appearance.glass_style == "clear" {
             1
         } else {
@@ -4376,6 +4472,13 @@ fn collect_settings_config() -> (Config, Vec<String>) {
             Some(u) => u,
             None => return (cfg, vec!["settings UI not ready".into()]),
         };
+        let theme_idx: isize = msg_send![ui.theme, indexOfSelectedItem];
+        cfg.appearance.theme = match theme_idx {
+            0 => "dark",
+            1 => "light",
+            _ => "auto",
+        }
+        .into();
         let gs_idx: isize = msg_send![ui.glass_style, indexOfSelectedItem];
         cfg.appearance.glass_style = if gs_idx == 1 {
             "clear".into()
@@ -4725,8 +4828,24 @@ fn settings_window_class() -> *mut AnyObject {
         .0
 }
 
+/// Apply the resolved appearance to the settings window and its semantic AppKit controls.
+/// 将解析后的主题应用到设置窗口及其依赖语义颜色的 AppKit 控件。
+unsafe fn apply_settings_window_appearance(window: *mut AnyObject) {
+    let name = make_nsstring(if resolved_is_dark() {
+        "NSAppearanceNameDarkAqua"
+    } else {
+        "NSAppearanceNameAqua"
+    });
+    let appearance: *mut AnyObject = msg_send![class!(NSAppearance), appearanceNamed: name];
+    CFRelease(name as *const c_void);
+    if !appearance.is_null() {
+        let _: () = msg_send![window, setAppearance: appearance];
+    }
+}
+
 fn create_settings_window() {
     unsafe {
+        let palette = settings_palette();
         // Keep the original compact settings window dimensions while applying the redesign's
         // typography, spacing, controls, and grouped-card treatment.
         // 保持原来的紧凑窗口尺寸，同时应用 redesign 的字体、间距、控件和分组卡片风格。
@@ -4771,6 +4890,7 @@ fn create_settings_window() {
         let frame = NSRect::new(NSPoint::new(win_x, win_y), NSSize::new(win_w, win_h));
         let window: *mut AnyObject = msg_send![settings_window_class(), alloc];
         let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
+        apply_settings_window_appearance(window);
         let ns_title = make_nsstring(&t("settings.window_title"));
         let _: () = msg_send![window, setTitle: ns_title];
         CFRelease(ns_title as *const c_void);
@@ -4848,8 +4968,7 @@ fn create_settings_window() {
         let _: () = msg_send![content, setWantsLayer: true];
         let cv_layer: *mut AnyObject = msg_send![content, layer];
         if !cv_layer.is_null() {
-            let bg_ns: *mut AnyObject = msg_send![class!(NSColor), windowBackgroundColor];
-            layer_set_background(cv_layer, ns_color_to_cg(bg_ns));
+            layer_set_background(cv_layer, crate::ffi::hex_to_cg_color(palette.window_bg));
             let _: () = msg_send![cv_layer, setCornerRadius: window_clip_radius];
             let _: () = msg_send![cv_layer, setMasksToBounds: true];
         }
@@ -4867,6 +4986,7 @@ fn create_settings_window() {
             mouse_view: std::ptr::null_mut(),
             clipboard_view: std::ptr::null_mut(),
             about_view: std::ptr::null_mut(),
+            theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             glass_tint: std::ptr::null_mut(),
             glass_preview_switcher: std::ptr::null_mut(),
@@ -4976,7 +5096,10 @@ fn create_settings_window() {
         // border around the whole settings area.
         let sidebar_layer: *mut AnyObject = msg_send![sidebar_view, layer];
         if !sidebar_layer.is_null() {
-            layer_set_background(sidebar_layer, crate::ffi::hex_to_cg_color(0xF2F2F4DBu32));
+            layer_set_background(
+                sidebar_layer,
+                crate::ffi::hex_to_cg_color(palette.sidebar_bg),
+            );
         }
         // 自适应:左侧锚定、高度随窗口拉伸(HeightSizable|MaxXMargin = 16|4 = 20)。
         // Adaptive: left-anchored, height stretches with the window.
@@ -4996,7 +5119,10 @@ fn create_settings_window() {
         let _: () = msg_send![sidebar_divider, setWantsLayer: true];
         let divider_layer: *mut AnyObject = msg_send![sidebar_divider, layer];
         if !divider_layer.is_null() {
-            layer_set_background(divider_layer, crate::ffi::hex_to_cg_color(0x0000000Eu32));
+            layer_set_background(
+                divider_layer,
+                crate::ffi::hex_to_cg_color(palette.separator),
+            );
         }
         let _: () = msg_send![sidebar_divider, setAutoresizingMask: 20u64];
         let _: () = msg_send![content, addSubview: sidebar_divider];
@@ -5014,7 +5140,7 @@ fn create_settings_window() {
         let _: () = msg_send![main_background, setWantsLayer: true];
         let main_layer: *mut AnyObject = msg_send![main_background, layer];
         if !main_layer.is_null() {
-            layer_set_background(main_layer, crate::ffi::hex_to_cg_color(0xFFFFFFB0u32));
+            layer_set_background(main_layer, crate::ffi::hex_to_cg_color(palette.detail_bg));
         }
         let _: () = msg_send![main_background, setAutoresizingMask: 18u64];
         let _: () = msg_send![content, addSubview: main_background];
@@ -5033,7 +5159,7 @@ fn create_settings_window() {
         let _: () = msg_send![footer, setWantsLayer: true];
         let footer_layer: *mut AnyObject = msg_send![footer, layer];
         if !footer_layer.is_null() {
-            layer_set_background(footer_layer, crate::ffi::hex_to_cg_color(0xF8F8F9D1u32));
+            layer_set_background(footer_layer, crate::ffi::hex_to_cg_color(palette.footer_bg));
         }
         let footer_line: *mut AnyObject = msg_send![class!(NSView), alloc];
         let footer_line: *mut AnyObject = msg_send![
@@ -5048,7 +5174,7 @@ fn create_settings_window() {
         if !footer_line_layer.is_null() {
             layer_set_background(
                 footer_line_layer,
-                crate::ffi::hex_to_cg_color(0x00000012u32),
+                crate::ffi::hex_to_cg_color(palette.card_border),
             );
         }
         let _: () = msg_send![footer, addSubview: footer_line];
@@ -5077,7 +5203,7 @@ fn create_settings_window() {
         let app_title_font: *mut AnyObject =
             msg_send![class!(NSFont), boldSystemFontOfSize: 15.0f64];
         let _: () = msg_send![app_title, setFont: app_title_font];
-        let app_title_color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
+        let app_title_color = crate::ffi::hex_to_ns_color(palette.primary_text);
         let _: () = msg_send![app_title, setTextColor: app_title_color];
         let _: () = msg_send![sidebar_view, addSubview: app_title];
         release_obj(app_title);
@@ -5096,7 +5222,7 @@ fn create_settings_window() {
         let app_subtitle_font: *mut AnyObject =
             msg_send![class!(NSFont), systemFontOfSize: 11.5f64];
         let _: () = msg_send![app_subtitle, setFont: app_subtitle_font];
-        let app_subtitle_color: *mut AnyObject = msg_send![class!(NSColor), tertiaryLabelColor];
+        let app_subtitle_color = crate::ffi::hex_to_ns_color(palette.muted_text);
         let _: () = msg_send![app_subtitle, setTextColor: app_subtitle_color];
         let _: () = msg_send![sidebar_view, addSubview: app_subtitle];
         release_obj(app_subtitle);
@@ -5124,7 +5250,7 @@ fn create_settings_window() {
         // Selection highlight uses the system accent color (controlAccentColor), matching the
         // NSSwitch's on-state blue (same as LinearMouse's sidebar selection highlight).
         // The redesign uses a soft accent wash for the active row rather than a solid blue fill.
-        layer_set_background(hl_layer, crate::ffi::hex_to_cg_color(0x0A84FF1Fu32));
+        layer_set_background(hl_layer, crate::ffi::hex_to_cg_color(palette.selection_bg));
         let _: () = msg_send![sidebar_view, addSubview: highlight];
         release_obj(highlight);
         ui.sidebar_highlight = highlight;
@@ -5191,7 +5317,7 @@ fn create_settings_window() {
         if !sidebar_footer_layer.is_null() {
             layer_set_background(
                 sidebar_footer_layer,
-                crate::ffi::hex_to_cg_color(0x0000000Fu32),
+                crate::ffi::hex_to_cg_color(palette.separator),
             );
         }
         let _: () = msg_send![sidebar_view, addSubview: sidebar_footer_line];
@@ -5315,11 +5441,29 @@ fn create_settings_window() {
         add_header(
             general_view,
             &t("settings.header_appearance"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         y -= 8.0 + described_row_h;
+        let theme_items = [
+            t("settings.theme_dark"),
+            t("settings.theme_light"),
+            t("settings.theme_auto"),
+        ];
+        let theme_item_refs: Vec<&str> = theme_items.iter().map(String::as_str).collect();
+        ui.theme = add_described_row(
+            general_view,
+            label_x,
+            y,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_theme"),
+            &t("settings.desc_theme"),
+            make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &theme_item_refs, 0),
+        );
+        y -= described_row_h;
+        add_row_separator(general_view, 0.0, y + described_row_h, content_w);
         ui.glass_style = add_described_row(
             general_view,
             label_x,
@@ -5358,9 +5502,9 @@ fn create_settings_window() {
         add_header(
             general_view,
             &t("settings.header_preview"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         y -= 8.0 + row_h;
         let preview_h = 90.0;
@@ -5398,7 +5542,7 @@ fn create_settings_window() {
                 NSPoint::new(6.0, preview_y - 12.0),
                 NSSize::new(
                     content_w - 12.0,
-                    (appearance_header_y + 2.0) - (preview_y - 12.0),
+                    (appearance_header_y - 8.0) - (preview_y - 12.0),
                 ),
             ),
         );
@@ -5409,9 +5553,9 @@ fn create_settings_window() {
         add_header(
             general_view,
             &t("settings.header_language"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         y -= 8.0 + row_h;
         ui.locale = add_row(
@@ -5427,7 +5571,7 @@ fn create_settings_window() {
             general_view,
             NSRect::new(
                 NSPoint::new(6.0, y - 10.0),
-                NSSize::new(content_w - 12.0, (language_header_y + 2.0) - (y - 10.0)),
+                NSSize::new(content_w - 12.0, (language_header_y - 8.0) - (y - 10.0)),
             ),
         );
 
@@ -5437,9 +5581,9 @@ fn create_settings_window() {
         add_header(
             general_view,
             &t("settings.header_logging"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         y -= 8.0 + described_row_h;
         // 日志级别下拉框:项 = [debug, info];默认 index 1(info)。
@@ -5459,7 +5603,7 @@ fn create_settings_window() {
             general_view,
             NSRect::new(
                 NSPoint::new(6.0, y - 10.0),
-                NSSize::new(content_w - 12.0, (logging_header_y + 2.0) - (y - 10.0)),
+                NSSize::new(content_w - 12.0, (logging_header_y - 8.0) - (y - 10.0)),
             ),
         );
 
@@ -5469,9 +5613,9 @@ fn create_settings_window() {
         add_header(
             general_view,
             &t("settings.header_startup"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         y -= 8.0 + described_row_h;
         // 开机自启开关:标题留空(左侧 row label 已说明),仅放一个 switch。
@@ -5490,7 +5634,7 @@ fn create_settings_window() {
             general_view,
             NSRect::new(
                 NSPoint::new(6.0, y - 10.0),
-                NSSize::new(content_w - 12.0, (startup_header_y + 2.0) - (y - 10.0)),
+                NSSize::new(content_w - 12.0, (startup_header_y - 8.0) - (y - 10.0)),
             ),
         );
 
@@ -5511,9 +5655,9 @@ fn create_settings_window() {
         add_header(
             switcher_view,
             &t("settings.header_windows"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         y -= 8.0 + described_row_h;
         // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器接管)。
@@ -5628,7 +5772,7 @@ fn create_settings_window() {
             switcher_view,
             NSRect::new(
                 NSPoint::new(6.0, y - 10.0),
-                NSSize::new(content_w - 12.0, (windows_header_y + 2.0) - (y - 10.0)),
+                NSSize::new(content_w - 12.0, (windows_header_y - 8.0) - (y - 10.0)),
             ),
         );
 
@@ -5638,9 +5782,9 @@ fn create_settings_window() {
         add_header(
             switcher_view,
             &t("settings.header_keyboard"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         y -= 8.0 + described_row_h;
         // 修饰键下拉项:显示 Option+Tab / Command+Tab;值由索引映射到 option/command。
@@ -5663,7 +5807,7 @@ fn create_settings_window() {
             switcher_view,
             NSRect::new(
                 NSPoint::new(6.0, y - 10.0),
-                NSSize::new(content_w - 12.0, (keyboard_header_y + 2.0) - (y - 10.0)),
+                NSSize::new(content_w - 12.0, (keyboard_header_y - 8.0) - (y - 10.0)),
             ),
         );
 
@@ -5709,9 +5853,9 @@ fn create_settings_window() {
         add_header(
             mouse_view,
             &t("settings.header_mouse_device"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         y -= 8.0 + described_row_h;
         // 下拉框:items 在 load_settings_values 里动态重建(设备列表可变)。
@@ -5758,7 +5902,7 @@ fn create_settings_window() {
             mouse_view,
             NSRect::new(
                 NSPoint::new(6.0, y - 10.0),
-                NSSize::new(content_w - 12.0, (device_header_y + 2.0) - (y - 10.0)),
+                NSSize::new(content_w - 12.0, (device_header_y - 8.0) - (y - 10.0)),
             ),
         );
 
@@ -5811,9 +5955,9 @@ fn create_settings_window() {
         add_header(
             mouse_view,
             &t("settings.header_mouse_scrolling"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         y -= 8.0 + described_row_h;
         // reverse_scroll 开关:标题+副标题描述滚动方向,开关保留右侧内边距。
@@ -5843,9 +5987,9 @@ fn create_settings_window() {
         add_header(
             mouse_view,
             &t("settings.header_mouse_pointer"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         y -= 8.0 + described_row_h;
         // disable_pointer_accel 开关:禁用系统鼠标加速,光标 1:1 线性跟踪。
@@ -5867,7 +6011,7 @@ fn create_settings_window() {
             mouse_view,
             NSRect::new(
                 NSPoint::new(6.0, y - 10.0),
-                NSSize::new(content_w - 12.0, (pointer_header_y + 2.0) - (y - 10.0)),
+                NSSize::new(content_w - 12.0, (pointer_header_y - 8.0) - (y - 10.0)),
             ),
         );
 
@@ -5879,9 +6023,9 @@ fn create_settings_window() {
         add_header(
             mouse_view,
             &t("settings.header_mouse_mappings"),
-            label_x,
+            6.0,
             y,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         // "Enable button mappings" 描述行(HTML 卡片顶部),替代原来放在区块标题右侧的开关。
         // "Enable button mappings" described row (HTML card top), replacing the old switch
@@ -5928,8 +6072,9 @@ fn create_settings_window() {
         let bg_layer: *mut AnyObject = msg_send![card_bg, layer];
         let _: () = msg_send![bg_layer, setCornerRadius: 14.0f64];
         let _: () = msg_send![bg_layer, setMasksToBounds: true];
-        crate::ffi::layer_set_background(bg_layer, crate::ffi::hex_to_cg_color(0xFFFFFFE0u32));
-        crate::ffi::layer_set_border(bg_layer, crate::ffi::hex_to_cg_color(0x00000012u32));
+        let palette = settings_palette();
+        crate::ffi::layer_set_background(bg_layer, crate::ffi::hex_to_cg_color(palette.card_bg));
+        crate::ffi::layer_set_border(bg_layer, crate::ffi::hex_to_cg_color(palette.card_border));
         let _: () = msg_send![bg_layer, setBorderWidth: 1.0f64];
         // 嵌套的 `.mapping-table`:圆角描边子面板,铺在行后面,让映射区有 HTML 的表格观感。
         // The nested `.mapping-table`: a rounded, bordered sub-panel behind the rows, giving
@@ -5940,8 +6085,14 @@ fn create_settings_window() {
         let panel_layer: *mut AnyObject = msg_send![panel, layer];
         let _: () = msg_send![panel_layer, setCornerRadius: 10.0f64];
         let _: () = msg_send![panel_layer, setMasksToBounds: true];
-        crate::ffi::layer_set_background(panel_layer, crate::ffi::hex_to_cg_color(0x76768010u32));
-        crate::ffi::layer_set_border(panel_layer, crate::ffi::hex_to_cg_color(0x0000000Fu32));
+        crate::ffi::layer_set_background(
+            panel_layer,
+            crate::ffi::hex_to_cg_color(palette.field_bg),
+        );
+        crate::ffi::layer_set_border(
+            panel_layer,
+            crate::ffi::hex_to_cg_color(palette.card_border),
+        );
         let _: () = msg_send![panel_layer, setBorderWidth: 1.0f64];
         let _: () = msg_send![card_bg, addSubview: panel];
         ui.mapping_panel = panel;
@@ -6042,9 +6193,9 @@ fn create_settings_window() {
         add_header(
             clipboard_view,
             &t("settings.header_clipboard"),
-            label_x,
+            6.0,
             cy - 18.0,
-            content_w - 2.0 * label_x,
+            content_w - 12.0,
         );
         // header 与首行间距与其他页一致(8 + row_h = 30):此前 16pt 挨得太近。
         // Header-to-first-row gap matches the other pages (8 + row_h = 30); it used to be
@@ -6178,7 +6329,7 @@ fn create_settings_window() {
             clipboard_view,
             NSRect::new(
                 NSPoint::new(6.0, cy - 10.0),
-                NSSize::new(content_w - 12.0, (clipboard_header_y + 2.0) - (cy - 10.0)),
+                NSSize::new(content_w - 12.0, (clipboard_header_y - 8.0) - (cy - 10.0)),
             ),
         );
 
@@ -6235,9 +6386,9 @@ fn create_settings_window() {
         add_header(
             about_view,
             &t("settings.section_app"),
-            label_x + 3.0,
+            6.0,
             app_label_y,
-            content_w - label_x * 2.0,
+            content_w - 12.0,
         );
         ay -= 27.0;
         let website_y = ay - 44.0;
@@ -6338,9 +6489,9 @@ fn create_settings_window() {
         add_header(
             about_view,
             &t("settings.section_updates"),
-            label_x + 3.0,
+            6.0,
             ay - 11.0,
-            content_w - label_x * 2.0,
+            content_w - 12.0,
         );
         ay -= 27.0;
         let update_row_y = ay - 44.0;
@@ -6366,7 +6517,10 @@ fn create_settings_window() {
         let _: () = msg_send![check_button, setTag: -3isize];
         let check_layer: *mut AnyObject = msg_send![check_button, layer];
         if !check_layer.is_null() {
-            layer_set_background(check_layer, crate::ffi::hex_to_cg_color(0x7676801Eu32));
+            layer_set_background(
+                check_layer,
+                crate::ffi::hex_to_cg_color(settings_palette().button_bg),
+            );
         }
         let _: () = msg_send![about_view, addSubview: check_button];
         release_obj(check_button);
@@ -6417,7 +6571,10 @@ fn create_settings_window() {
         let cancel_layer: *mut AnyObject = msg_send![cancel, layer];
         if !cancel_layer.is_null() {
             // HTML footer buttons use a slightly more opaque white surface than small buttons.
-            layer_set_background(cancel_layer, crate::ffi::hex_to_cg_color(0xFFFFFFC7u32));
+            layer_set_background(
+                cancel_layer,
+                crate::ffi::hex_to_cg_color(settings_palette().footer_button_bg),
+            );
         }
         let _: () = msg_send![cancel, setAutoresizingMask: 33u64]; // 贴底、贴右 / bottom- and right-anchored
         let _: () = msg_send![content, addSubview: cancel];
@@ -6435,10 +6592,15 @@ fn create_settings_window() {
         let _: () = msg_send![ok, setTag: -2isize];
         let ok_layer: *mut AnyObject = msg_send![ok, layer];
         if !ok_layer.is_null() {
-            layer_set_background(ok_layer, crate::ffi::hex_to_cg_color(0x0A84FFFFu32));
+            // HTML `.footer .ok`: #0a84ff with a subtle rgba(0,0,0,.04) border.
+            // HTML `.footer .ok`: 使用 #0a84ff 和轻微的 rgba(0,0,0,.04) 边框。
+            layer_set_background(ok_layer, crate::ffi::hex_to_cg_color(0x0A84FFFF));
+            crate::ffi::layer_set_border(ok_layer, crate::ffi::hex_to_cg_color(0x0000000A));
+            let _: () = msg_send![ok_layer, setBorderWidth: 1.0f64];
+            let _: () = msg_send![ok_layer, setCornerRadius: 8.0f64];
         }
-        let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
-        let _: () = msg_send![ok, setContentTintColor: white];
+        let ok_text = crate::ffi::hex_to_ns_color(0xFFFFFFFF);
+        let _: () = msg_send![ok, setContentTintColor: ok_text];
         let _: () = msg_send![ok, setAutoresizingMask: 33u64]; // 贴底、贴右
         let _: () = msg_send![content, addSubview: ok];
         ui.ok_button = ok;

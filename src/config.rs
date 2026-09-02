@@ -420,7 +420,10 @@ impl MouseSection {
 impl Default for Appearance {
     fn default() -> Self {
         Appearance {
-            theme: "light".into(),
+            // Follow the system by default while preserving explicit user choices from existing
+            // config files.
+            // 默认跟随系统,已有配置中的显式主题选择保持不变。
+            theme: "auto".into(),
             glass_style: "regular".into(),
             // 默认玻璃浮窗 tint 颜色(RRGGBBAA);设置页可用取色器选择其他颜色。
             // Default Liquid Glass overlay tint (RRGGBBAA); the settings page lets users pick another color.
@@ -1741,7 +1744,7 @@ reverse_scroll = false
         // 不存在的文件:写默认配置并返回之,无错误。
         // Missing file: defaults written and returned, no errors.
         assert!(errs.is_empty());
-        assert_eq!(cfg.appearance.theme, "light");
+        assert_eq!(cfg.appearance.theme, "auto");
         assert!(path.exists());
     }
 

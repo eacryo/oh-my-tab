@@ -3803,10 +3803,7 @@ pub(crate) fn apply_theme() {
         // 主题来源只有 config(界面上的切换入口已移除;手动改 config 仍生效)。
         // The theme now comes from config only (the UI toggle is gone; manual config
         // edits still apply).
-        let is_dark = crate::config::CONFIG
-            .read()
-            .map(|c| c.appearance.theme.as_str() != "light")
-            .unwrap_or(false);
+        let is_dark = crate::theme::resolved_is_dark();
 
         // Update window appearance for blur material tint
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {

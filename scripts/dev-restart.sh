@@ -19,7 +19,32 @@ dev_bundle_id="com.eacryo.oh-my-tab.dev"
 # would automatically respawn the old instance after pkill.
 launch_label="oh-my-tab-dev"
 launch_domain="gui/$(id -u)"
-launchctl bootout "$launch_domain/$launch_label" 2>/dev/null || true
+launch_target="$launch_domain/$launch_label"
+
+# bootout can return before the submitted service disappears from the domain. Wait for the
+# label to be gone before reusing it, otherwise the following submit may collide with the old job.
+# bootout 返回后任务可能还短暂存在于域中。复用标签前等待旧任务消失,避免 submit 发生冲突。
+wait_for_job_gone() {
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        if ! launchctl print "$launch_target" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+bootout_error="$(launchctl bootout "$launch_target" 2>&1)"
+bootout_status=$?
+if [ "$bootout_status" -ne 0 ] && launchctl print "$launch_target" >/dev/null 2>&1; then
+    echo "restart FAILED: could not remove existing launchd job"
+    [ -n "$bootout_error" ] && echo "$bootout_error"
+    exit 1
+fi
+if ! wait_for_job_gone; then
+    echo "restart FAILED: old launchd job did not exit"
+    exit 1
+fi
 
 # 杀掉所有 oh-my-tab 实例:开发二进制 + 打包安装的 .app 都会注册同一个全局快捷键,
 # 两个进程并存时旧版会抢走 Cmd+Tab(用户曾因此误以为新功能没生效)。
@@ -126,11 +151,18 @@ fi
 
 # 交给用户级 launchd 托管,脱离当前 Shell/执行器生命周期。
 # Submit to the per-user launchd domain so the process survives the shell/executor lifetime.
-if ! launchctl submit -l "$launch_label" -o /dev/null -e /dev/null -- \
+submit_error="$(launchctl submit -l "$launch_label" -o /dev/null -e /dev/null -- \
     "$repo_dir/scripts/dev-launchd-wrapper.sh" "$launch_label" \
-    /usr/bin/open -n -W "$dev_app"; then
+    /usr/bin/open -n -W "$dev_app" 2>&1)"
+submit_status=$?
+if [ "$submit_status" -ne 0 ] && ! launchctl print "$launch_target" >/dev/null 2>&1; then
     echo "restart FAILED: launchctl submit error"
+    [ -n "$submit_error" ] && echo "$submit_error"
     exit 1
+fi
+if [ "$submit_status" -ne 0 ]; then
+    echo "warning: launchctl submit returned $submit_status, but the job is active; continuing"
+    [ -n "$submit_error" ] && echo "$submit_error"
 fi
 
 # 轮询等待进程存活(最长 5 秒)。
@@ -138,7 +170,7 @@ fi
 # Read the PID from launchd's service state, then use kill -0 to confirm it is alive.
 for _ in 1 2 3 4 5; do
     sleep 1
-    new_pid="$(launchctl print "$launch_domain/$launch_label" 2>/dev/null \
+    new_pid="$(launchctl print "$launch_target" 2>/dev/null \
         | awk '$1 == "pid" && $2 == "=" { print $3; exit }')"
     if [ -n "$new_pid" ] && kill -0 "$new_pid" 2>/dev/null; then
         echo "restart ok (pid $new_pid)"

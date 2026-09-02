@@ -196,7 +196,7 @@ For the full release pipeline (Homebrew cask generation, the signing rationale, 
 
 ```toml
 [appearance]
-theme = "light"          # "dark" | "light" | "auto"
+theme = "auto"           # "dark" | "light" | "auto"; default follows macOS appearance
 glass_style = "regular"  # "regular" | "clear"
 glass_tint = "eeeeee66"  # RRGGBBAA — default Liquid Glass overlay tint
 corner_radius = 32.0

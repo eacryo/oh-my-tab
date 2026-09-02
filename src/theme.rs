@@ -61,6 +61,84 @@ pub(crate) struct Colors {
     pub(crate) preview_border: u32,
 }
 
+/// Settings and auxiliary panels use custom layer-backed surfaces, so they need a complete
+/// palette instead of relying on AppKit semantic colors for only part of the hierarchy.
+/// 设置界面和辅助面板包含自绘图层,需要完整调色板来保持所有层级的主题一致。
+#[derive(Clone, Copy)]
+pub(crate) struct UiPalette {
+    pub(crate) dark: bool,
+    pub(crate) window_bg: u32,
+    pub(crate) sidebar_bg: u32,
+    pub(crate) detail_bg: u32,
+    pub(crate) footer_bg: u32,
+    pub(crate) card_bg: u32,
+    pub(crate) card_border: u32,
+    pub(crate) separator: u32,
+    pub(crate) field_bg: u32,
+    pub(crate) primary_text: u32,
+    pub(crate) secondary_text: u32,
+    pub(crate) muted_text: u32,
+    pub(crate) button_bg: u32,
+    pub(crate) button_text: u32,
+    pub(crate) footer_button_bg: u32,
+    pub(crate) selection_bg: u32,
+    pub(crate) hover_bg: u32,
+    pub(crate) accent: u32,
+    pub(crate) accent_hover: u32,
+    pub(crate) shadow: u32,
+}
+
+/// Palette for the native settings window and other custom UI surfaces.
+pub(crate) fn ui_palette() -> UiPalette {
+    if resolved_is_dark() {
+        UiPalette {
+            dark: true,
+            window_bg: 0x1C1C1EE8,
+            sidebar_bg: 0x2C2C2EDB,
+            detail_bg: 0x1C1C1EE8,
+            footer_bg: 0x2C2C2EDB,
+            card_bg: 0x2C2C2EEA,
+            card_border: 0xFFFFFF1C,
+            separator: 0xFFFFFF20,
+            field_bg: 0xFFFFFF1C,
+            primary_text: 0xF5F5F7FF,
+            secondary_text: 0xEBEBF5A3,
+            muted_text: 0xEBEBF56B,
+            button_bg: 0xFFFFFF1C,
+            button_text: 0xF5F5F7FF,
+            footer_button_bg: 0xFFFFFF25,
+            selection_bg: 0x0A84FF38,
+            hover_bg: 0xFFFFFF22,
+            accent: 0x0A84FFFF,
+            accent_hover: 0x0077EDFF,
+            shadow: 0x00000042,
+        }
+    } else {
+        UiPalette {
+            dark: false,
+            window_bg: 0xFFFFFFB0,
+            sidebar_bg: 0xF2F2F4DB,
+            detail_bg: 0xFFFFFFB0,
+            footer_bg: 0xF8F8F9D1,
+            card_bg: 0xFFFFFFE0,
+            card_border: 0x00000012,
+            separator: 0x00000016,
+            field_bg: 0x7676801C,
+            primary_text: 0x2C2C30FF,
+            secondary_text: 0x73737AFF,
+            muted_text: 0x9B9BA2FF,
+            button_bg: 0xFFFFFFAD,
+            button_text: 0x2E2E2EFF,
+            footer_button_bg: 0xFFFFFFC7,
+            selection_bg: 0x0A84FF1F,
+            hover_bg: 0x76768024,
+            accent: 0x0A84FFFF,
+            accent_hover: 0x0077EDFF,
+            shadow: 0x0000000A,
+        }
+    }
+}
+
 /// 按 dark/light 从 CONFIG 解析颜色。固定字段(页面背景等)目前写死为透明/占位。
 /// Resolve colors from CONFIG for dark/light. Fixed fields (page bg, etc.) are hard-coded
 /// to transparent / placeholder for now.
@@ -74,8 +152,8 @@ pub(crate) fn colors_from_config(dark: bool) -> Colors {
     Colors {
         page_bg: 0x00000000,
         hint_bg: 0x00000000,
-        hint_text: 0x888888ff,
-        hint_subtext: 0x666666ff,
+        hint_text: if dark { 0xF5F5F7FF } else { 0x888888ff },
+        hint_subtext: if dark { 0xB8B8C0FF } else { 0x666666ff },
         status_bar_bg: 0x00000000,
         status_bar_text: config::parse_hex8(&c.status_bar_text),
         card_bg: 0x00000000,
@@ -101,15 +179,20 @@ pub(crate) fn system_dark_mode() -> bool {
     }
 }
 
-/// 按 CONFIG.appearance.theme 解析当前颜色(theme=auto 时跟随系统明暗)。
-/// Resolve current colors per CONFIG.appearance.theme (auto follows system dark/light).
-pub(crate) fn current_colors() -> Colors {
-    let is_dark = match CONFIG.read().unwrap().appearance.theme.as_str() {
+/// Resolve the effective appearance once so every native panel follows the same light/dark rule.
+/// 统一解析最终外观,让所有原生面板使用相同的浅色/深色判断。
+pub(crate) fn resolved_is_dark() -> bool {
+    match CONFIG.read().unwrap().appearance.theme.as_str() {
         "light" => false,
         "dark" => true,
         _ => system_dark_mode(),
-    };
-    colors_from_config(is_dark)
+    }
+}
+
+/// 按 CONFIG.appearance.theme 解析当前颜色(theme=auto 时跟随系统明暗)。
+/// Resolve current colors per CONFIG.appearance.theme (auto follows system dark/light).
+pub(crate) fn current_colors() -> Colors {
+    colors_from_config(resolved_is_dark())
 }
 
 // ========== 固定布局访问器 / fixed layout accessors ==========

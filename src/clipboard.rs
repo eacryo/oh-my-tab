@@ -69,6 +69,7 @@ use crate::ffi::{
     objc_registerClassPair, release_obj, CFRelease, ObjPtr,
 };
 use crate::i18n::{t, tf};
+use crate::theme::resolved_is_dark;
 use crate::{log_debug, log_info};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
@@ -585,6 +586,21 @@ static DETAIL_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// The macOS 26+ detail glass view and its inactive compensation layer.
 static DETAIL_GLASS: Mutex<Option<ObjPtr>> = Mutex::new(None);
 static DETAIL_GLASS_FILL_LAYER: Mutex<Option<ObjPtr>> = Mutex::new(None);
+
+/// Keep clipboard panels on the same resolved appearance as the settings window and switcher.
+/// 让剪贴板面板与设置窗口、应用切换浮窗使用相同的最终外观。
+unsafe fn apply_panel_appearance(window: *mut AnyObject) {
+    let name = make_nsstring(if resolved_is_dark() {
+        "NSAppearanceNameDarkAqua"
+    } else {
+        "NSAppearanceNameAqua"
+    });
+    let appearance: *mut AnyObject = msg_send![class!(NSAppearance), appearanceNamed: name];
+    CFRelease(name as *const c_void);
+    if !appearance.is_null() {
+        let _: () = msg_send![window, setAppearance: appearance];
+    }
+}
 /// 详情浮窗内容容器(文本滚动视图 / 图片视图所在容器;点击面板任意处 = 关闭)。
 /// The detail panel's content container (hosts the text scroll view / the image view;
 /// clicking anywhere on the panel dismisses it).
@@ -4470,6 +4486,7 @@ unsafe fn ensure_detail_window() {
     };
     let window: *mut AnyObject = msg_send![window_cls, alloc];
     let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
+    apply_panel_appearance(window);
     let _: () = msg_send![window, setLevel: 3u64];
     let _: () = msg_send![window, setOpaque: false];
     let _: () = msg_send![window, setReleasedWhenClosed: false];
@@ -6169,6 +6186,18 @@ pub(crate) unsafe fn apply_glass_properties() {
     }
 }
 
+/// Apply the active light/dark appearance to already-created clipboard panels.
+/// 将当前浅色/深色外观应用到已经创建的剪贴板面板。
+pub(crate) unsafe fn apply_theme() {
+    if let Some(window) = *PICKER_WINDOW.lock().unwrap() {
+        apply_panel_appearance(window.0);
+    }
+    if let Some(window) = *DETAIL_WINDOW.lock().unwrap() {
+        apply_panel_appearance(window.0);
+    }
+    apply_glass_properties();
+}
+
 unsafe fn ensure_picker_window() {
     if PICKER_WINDOW.lock().unwrap().is_some() {
         return;
@@ -6206,6 +6235,7 @@ unsafe fn ensure_picker_window() {
     };
     let window: *mut AnyObject = msg_send![window_cls, alloc];
     let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
+    apply_panel_appearance(window);
     let _: () = msg_send![window, setLevel: 3u64];
     let _: () = msg_send![window, setOpaque: false];
     let _: () = msg_send![window, setReleasedWhenClosed: false];
