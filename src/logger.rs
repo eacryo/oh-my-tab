@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
+use crate::ffi::{localtime_r, Tm};
+
 // ========== 日志级别 / log level ==========
 
 /// 只有两档:Debug(调试细节)/ Info(常规运行信息)。
@@ -298,27 +300,7 @@ fn cleanup_old_logs(dir: &str) {
 }
 
 // ========== 时间戳 / timestamp ==========
-
-type TimeT = i64;
-
-#[repr(C)]
-struct Tm {
-    tm_sec: i32,
-    tm_min: i32,
-    tm_hour: i32,
-    tm_mday: i32,
-    tm_mon: i32,
-    tm_year: i32,
-    tm_wday: i32,
-    tm_yday: i32,
-    tm_isdst: i32,
-    tm_gmtoff: i64,
-    tm_zone: *const i8,
-}
-
-extern "C" {
-    fn localtime_r(time: *const TimeT, result: *mut Tm) -> *mut Tm;
-}
+// Tm 与 localtime_r 已统一到 ffi.rs / Tm and localtime_r live in ffi.rs now
 
 /// 零依赖 ISO-8601 时间戳，精确到毫秒。格式："2025-07-25T17:08:30.123"
 /// Zero-dep ISO-8601 timestamp with milliseconds.
@@ -330,7 +312,7 @@ fn now_timestamp() -> String {
     let ms = now.subsec_millis();
     unsafe {
         let mut tm: Tm = std::mem::zeroed();
-        let s = secs as TimeT;
+        let s = secs as i64;
         localtime_r(&s, &mut tm);
         format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}",
@@ -354,7 +336,7 @@ fn file_timestamp() -> String {
     let secs = now.as_secs();
     unsafe {
         let mut tm: Tm = std::mem::zeroed();
-        let s = secs as TimeT;
+        let s = secs as i64;
         localtime_r(&s, &mut tm);
         format!(
             "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",

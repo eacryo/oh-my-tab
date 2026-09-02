@@ -11,8 +11,9 @@
 
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{msg_send, sel};
-use std::ffi::{c_char, CString};
+use std::ffi::CString;
 
+use crate::ffi::{objc_getClass, objc_msgSend};
 use crate::log_info;
 
 #[link(name = "ServiceManagement", kind = "framework")]
@@ -25,9 +26,6 @@ const STATUS_REGISTERED: isize = 1;
 /// Look up an ObjC class by name via raw objc_getClass, bypassing objc2's `class!` macro
 /// verification. Returns nil if not found.
 unsafe fn cls_id(name: &str) -> *mut AnyObject {
-    extern "C" {
-        fn objc_getClass(name: *const c_char) -> *mut AnyObject;
-    }
     let c_name = CString::new(name).unwrap();
     objc_getClass(c_name.as_ptr())
 }
@@ -36,9 +34,6 @@ unsafe fn cls_id(name: &str) -> *mut AnyObject {
 /// Send a no-arg message (returning id) via raw objc_msgSend, bypassing objc2's msg_send!
 /// verification.
 unsafe fn send_id(recv: *mut AnyObject, cmd: Sel) -> *mut AnyObject {
-    extern "C" {
-        fn objc_msgSend();
-    }
     type F = unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject;
     let f: F = std::mem::transmute(objc_msgSend as *const ());
     f(recv, cmd)
@@ -115,9 +110,6 @@ unsafe fn set_registered(enabled: bool) -> bool {
     let service = main_app();
     if service.is_null() {
         return false;
-    }
-    extern "C" {
-        fn objc_msgSend();
     }
     // Swift 的 register()/unregister() 桥接到 ObjC 是 -registerAndReturnError: /
     // -unregisterAndReturnError:(NSError** 出参),不是 registerWithError: / unregisterWithError:

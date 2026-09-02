@@ -5,8 +5,12 @@
 //! while a bundled `.app` automatically gets the real updater when `Sparkle.framework` is copied
 //! into `Contents/Frameworks`.
 
-use crate::ffi::{class_addMethod, make_nsstring, objc_allocateClassPair, objc_registerClassPair};
+use crate::ffi::{
+    class_addMethod, make_nsstring, objc_allocateClassPair, objc_msgSend, objc_msgSendSuper,
+    objc_registerClassPair, ObjcSuper,
+};
 use crate::i18n::{t, tf};
+use crate::skylight;
 use crate::{ffi::release_obj, log_info};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
@@ -16,13 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const RTLD_NOW: i32 = 2;
-
-extern "C" {
-    fn objc_msgSend();
-    fn objc_msgSendSuper();
-    fn dlopen(filename: *const c_char, mode: i32) -> *mut c_void;
-}
+// objc_msgSend / objc_msgSendSuper / dlopen 已统一到 ffi.rs 与 skylight.rs。
+// objc_msgSend / objc_msgSendSuper / dlopen now live in ffi.rs and skylight.rs.
 
 /// Sparkle keeps the updater and its user driver alive for the lifetime of the process. The
 /// framework handle must remain open as well; unloading an Objective-C framework while its
@@ -174,21 +173,12 @@ unsafe fn load_framework() -> *mut c_void {
 
     for path in framework_candidates() {
         let path_string = path.to_string_lossy();
-        let Ok(c_path) = CString::new(path_string.as_bytes()) else {
-            continue;
-        };
-        let handle = dlopen(c_path.as_ptr(), RTLD_NOW);
+        let handle = skylight::dlopen_path(&path_string);
         if !handle.is_null() {
             return handle;
         }
     }
     std::ptr::null_mut()
-}
-
-#[repr(C)]
-struct ObjcSuper {
-    receiver: *mut c_void,
-    superclass: *mut c_void,
 }
 
 unsafe fn call_super_no_arguments(receiver: *mut c_void, selector: Sel) {
@@ -198,7 +188,7 @@ unsafe fn call_super_no_arguments(receiver: *mut c_void, selector: Sel) {
         .expect("Sparkle custom user-driver superclass is initialized");
     let mut objc_super = ObjcSuper {
         receiver,
-        superclass: superclass as *mut c_void,
+        super_class: superclass as *mut c_void,
     };
     let f: Fn = std::mem::transmute(objc_msgSendSuper as *const ());
     f(&mut objc_super, selector);

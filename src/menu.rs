@@ -18,8 +18,8 @@ use crate::ffi::*;
 use crate::i18n::t;
 use crate::overlay::{apply_theme, extract_uncached_icons, refresh_highlight, update_status_label};
 // invalidate_settings_window 由 settings.rs 提供 / provided by settings.rs
+use crate::icon_cache::clear_icon_cache;
 use crate::settings::invalidate_settings_window;
-use crate::window_collector::clear_icon_cache;
 // 跨模块共享状态(由 main.rs 持有)/ cross-module shared state (owned by main.rs)
 use crate::log_info;
 use crate::TAB_STATE;

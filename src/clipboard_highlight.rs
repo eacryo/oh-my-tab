@@ -2,6 +2,7 @@
 //! Clipboard text classification, code wrapping, and display mapping.
 
 use crate::ffi::{hex_to_ns_color, make_nsstring, release_obj, CFRelease};
+use crate::hash::fnv1a64;
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use objc2_foundation::NSRange;
@@ -193,15 +194,6 @@ static CODE_DISPLAY_CACHE: OnceLock<Mutex<HashMap<CodeDisplayCacheKey, Arc<Prepa
 fn looks_like_json(text: &str) -> bool {
     let starts = text.starts_with('{') || text.starts_with('[');
     starts && (text.contains("\":") || text.contains("\": "))
-}
-
-fn code_fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 pub(crate) fn classify_text(text: &str) -> TextKind {
@@ -411,7 +403,7 @@ impl DisplaySourceMap {
 /// Prepare code display text and its source mapping once; the cache and callers share the
 /// immutable result through Arc.
 pub(crate) fn prepare_code_display(source: &str, max_columns: usize) -> Arc<PreparedCodeDisplay> {
-    let content_hash = code_fnv1a64(source.as_bytes());
+    let content_hash = fnv1a64(source.as_bytes());
     let key = CodeDisplayCacheKey {
         content_hash,
         content_len: source.len(),
@@ -453,7 +445,7 @@ pub(crate) fn prepare_code_for_soft_wrap(
     source: &str,
     max_columns: usize,
 ) -> Arc<PreparedCodeDisplay> {
-    let content_hash = code_fnv1a64(source.as_bytes());
+    let content_hash = fnv1a64(source.as_bytes());
     let key = CodeDisplayCacheKey {
         content_hash,
         content_len: source.len(),
@@ -487,7 +479,7 @@ pub(crate) fn prepare_code_for_soft_wrap(
 /// (行首缩进保留真实空格,与软换行模式观感一致),并携带原文映射供复制还原。
 /// 每个中点按 1:1 替换空格、边界即恒等映射——选中任意子集都还原原文。
 pub(crate) fn prepare_code_no_wrap_display(source: &str) -> Arc<PreparedCodeDisplay> {
-    let content_hash = code_fnv1a64(source.as_bytes());
+    let content_hash = fnv1a64(source.as_bytes());
     let key = CodeDisplayCacheKey {
         content_hash,
         content_len: source.len(),
@@ -1341,8 +1333,8 @@ mod tests {
         // UTF-16 位图:a0 b1 sp2 ·3 ␨4 sp5 ·6 c7 d8 —— 中点在位 3 与位 6。
         // UTF-16 map: a0 b1 sp2 dot3 sep4 sp5 dot6 c7 d8 -- dots at offsets 3 and 6.
         unsafe {
+            use crate::ffi::objc_msgSend;
             extern "C" {
-                fn objc_msgSend();
                 fn NSSelectorFromString(name: *const c_void) -> objc2::runtime::Sel;
             }
             type AttrFn = unsafe extern "C" fn(

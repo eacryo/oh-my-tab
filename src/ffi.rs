@@ -19,6 +19,7 @@ extern "C" {
         encoding: u32,
     ) -> *const c_void;
     pub(crate) fn CFRelease(cf: *const c_void);
+    pub(crate) fn CFRetain(cf: *const c_void);
     // CFEqual:比较两个 CF 对象是否"相等"。IOHIDServiceClient 的相等语义由系统定义
     // (通常按底层对象身份),而非裸指针地址——CopyServiceForRegistryID 返回的对象与
     // CopyServices 枚举出的可能不是同一实例地址,必须用 CFEqual 判断。
@@ -33,16 +34,139 @@ extern "C" {
         return_after_source_handled: u8,
     ) -> i32;
     pub(crate) static kCFRunLoopDefaultMode: *mut c_void;
+
+    // ---- CF 容器与字符串(此前分散在 window_collector / thumbnail) ----
+    // ---- CF containers & strings (previously scattered across window_collector / thumbnail) ----
+    pub(crate) fn CFArrayGetCount(array: *const c_void) -> isize;
+    pub(crate) fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+    pub(crate) fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    pub(crate) fn CFNumberGetValue(
+        number: *const c_void,
+        the_type: isize,
+        value: *mut c_void,
+    ) -> bool;
+    pub(crate) fn CFBooleanGetValue(boolean: *const c_void) -> bool;
+    pub(crate) fn CFStringGetCString(
+        string: *const c_void,
+        buffer: *mut c_char,
+        buffer_size: isize,
+        encoding: u32,
+    ) -> bool;
+    /// CFString 值比较:相等返回 0(kCFCompareEqualTo)。
+    /// CFString value comparison: 0 when equal (kCFCompareEqualTo).
+    pub(crate) fn CFStringCompare(a: *const c_void, b: *const c_void, options: usize) -> isize;
+    pub(crate) static kCFBooleanFalse: *const c_void;
+
+    // ---- CFRunLoop 源(此前在 thumbnail/pregen) ----
+    // ---- CFRunLoop sources (previously in thumbnail/pregen) ----
+    pub(crate) fn CFRunLoopSourceCreate(
+        alloc: *const c_void,
+        order: isize,
+        ctx: *const CFRunLoopSourceContext,
+    ) -> *mut c_void;
+    pub(crate) fn CFRunLoopSourceSignal(src: *mut c_void);
+    pub(crate) fn CFRunLoopRemoveSource(rl: *mut c_void, src: *mut c_void, mode: *const c_void);
+    pub(crate) fn CFRunLoopWakeUp(rl: *mut c_void);
 }
+
+/// CFRunLoopSource 的 perform 回调上下文(只用 perform 字段)。
+/// CFRunLoopSource context (only the perform field is used).
+#[repr(C)]
+pub(crate) struct CFRunLoopSourceContext {
+    pub(crate) version: i64,
+    pub(crate) info: *mut c_void,
+    pub(crate) retain: *const c_void,
+    pub(crate) release: *const c_void,
+    pub(crate) copy_description: *const c_void,
+    pub(crate) equal: *const c_void,
+    pub(crate) hash: *const c_void,
+    pub(crate) schedule: *const c_void,
+    pub(crate) cancel: *const c_void,
+    pub(crate) perform: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+// ========== Accessibility(AX) / Accessibility (AX) ==========
+
+/// AX API 的元素句柄与错误码(此前在 window_collector / thumbnail/pregen 各自定义)。
+/// AX element handle and error codes (previously redefined in window_collector and
+/// thumbnail/pregen).
+pub(crate) type AXUIElementRef = *const c_void;
+pub(crate) type AxObserverRef = *mut c_void;
+pub(crate) type AXError = i32;
+pub(crate) const K_AX_SUCCESS: AXError = 0;
+pub(crate) const K_AX_INVALID_UI_ELEMENT: AXError = -25205;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     pub(crate) fn AXIsProcessTrusted() -> bool;
+    pub(crate) fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+    pub(crate) fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> i32;
+    pub(crate) fn AXUIElementCopyAttributeValue(
+        element: AXUIElementRef,
+        attribute: *const c_void,
+        value: *mut *const c_void,
+    ) -> AXError;
+    pub(crate) fn AXUIElementPerformAction(
+        element: AXUIElementRef,
+        action: *const c_void,
+    ) -> AXError;
+    pub(crate) fn AXUIElementSetAttributeValue(
+        element: AXUIElementRef,
+        attribute: *const c_void,
+        value: *const c_void,
+    ) -> AXError;
+    pub(crate) fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: f64) -> AXError;
+    pub(crate) fn AXObserverCreate(
+        pid: i32,
+        callback: unsafe extern "C" fn(AxObserverRef, *const c_void, *const c_void, *mut c_void),
+        out: *mut AxObserverRef,
+    ) -> i32;
+    pub(crate) fn AXObserverAddNotification(
+        observer: AxObserverRef,
+        element: *const c_void,
+        notification: *const c_void,
+        refcon: *mut c_void,
+    ) -> i32;
+    pub(crate) fn AXObserverGetRunLoopSource(observer: AxObserverRef) -> *mut c_void;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGWindowLevelForKey(key: i32) -> i32;
+    pub(crate) fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32)
+        -> *const c_void;
+
+    // ---- 屏幕录制 TCC 与位图重采样(此前在 thumbnail) ----
+    // ---- Screen-recording TCC and bitmap resampling (previously in thumbnail) ----
+    pub(crate) fn CGPreflightScreenCaptureAccess() -> bool;
+    pub(crate) fn CGRequestScreenCaptureAccess() -> bool;
+    pub(crate) fn CGImageGetWidth(image: *const c_void) -> usize;
+    pub(crate) fn CGImageGetHeight(image: *const c_void) -> usize;
+    pub(crate) fn CGColorSpaceCreateDeviceRGB() -> *const c_void;
+    pub(crate) fn CGBitmapContextCreate(
+        data: *mut c_void,
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bytes_per_row: usize,
+        space: *const c_void,
+        bitmap_info: u32,
+    ) -> *mut c_void;
+    pub(crate) fn CGContextDrawImage(ctx: *mut c_void, rect: CGRect, image: *const c_void);
+    pub(crate) fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *const c_void;
+}
+
+/// CoreGraphics 的 CGRect(C ABI:{origin:(x,y), size:(w,h)} 即 4 个连续 f64;
+/// 平铺字段与 C 布局逐字节一致)。
+/// CoreGraphics CGRect (C ABI: {origin:(x,y), size:(w,h)} -- four contiguous f64;
+/// the flat fields are byte-identical to the C layout).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct CGRect {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) w: f64,
+    pub(crate) h: f64,
 }
 
 /// Return Apple's overlay window level rather than baking in its current numeric value.
@@ -55,6 +179,31 @@ extern "C" {
 pub(crate) fn cg_overlay_window_level() -> isize {
     // CGWindowLevelKey::kCGOverlayWindowLevelKey has the numeric enum value 15.
     unsafe { CGWindowLevelForKey(15) as isize }
+}
+
+// ========== libc:localtime_r(此前在 logger / clipboard 各自定义 Tm) ==========
+// ========== libc: localtime_r (Tm was previously redefined in logger and clipboard) ==========
+
+/// libc `struct tm` 的布局(logger 时间戳与剪贴板"复制于"格式化共用;两者原定义逐字段一致)。
+/// libc `struct tm` layout (shared by the logger's timestamps and the clipboard's
+/// "copied at" formatting; the two previous definitions were field-identical).
+#[repr(C)]
+pub(crate) struct Tm {
+    pub(crate) tm_sec: i32,
+    pub(crate) tm_min: i32,
+    pub(crate) tm_hour: i32,
+    pub(crate) tm_mday: i32,
+    pub(crate) tm_mon: i32,
+    pub(crate) tm_year: i32,
+    pub(crate) tm_wday: i32,
+    pub(crate) tm_yday: i32,
+    pub(crate) tm_isdst: i32,
+    pub(crate) tm_gmtoff: i64,
+    pub(crate) tm_zone: *const c_char,
+}
+
+extern "C" {
+    pub(crate) fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
 }
 
 // ========== 本进程内存指标(task_info) / own-process memory stats (task_info) ==========
@@ -194,6 +343,24 @@ extern "C" {
         imp: *mut c_void,
         types: *const c_char,
     ) -> bool;
+    pub(crate) fn objc_getClass(name: *const c_char) -> *mut AnyObject;
+    // ---- 原始 msgSend(此前散落在 autostart/updater/overlay/clipboard 等处的内联声明) ----
+    // ---- Raw msgSend (previously declared inline across autostart/updater/overlay/clipboard) ----
+    // objc2 的 msg_send! 无法表达全部签名;这些场景由调用方把无类型符号 transmute 成
+    // 具体函数指针后调用。全项目唯一声明处,禁止再在调用方内联 extern。
+    // objc2's msg_send! cannot express every signature; callers transmute the untyped symbol
+    // into a concrete function pointer. This is the single declaration site -- do not inline
+    // new externs at call sites.
+    pub(crate) fn objc_msgSend();
+    pub(crate) fn objc_msgSendSuper();
+}
+
+/// objc_msgSendSuper 的 receiver 结构(objc_super;C ABI 两个指针)。
+/// The objc_msgSendSuper receiver struct (objc_super; two pointers in the C ABI).
+#[repr(C)]
+pub(crate) struct ObjcSuper {
+    pub(crate) receiver: *mut c_void,
+    pub(crate) super_class: *mut c_void,
 }
 
 // ========== 裸指针的 Send/Sync 包装 / Send+Sync wrappers for raw ObjC pointers ==========
