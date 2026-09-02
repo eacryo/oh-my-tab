@@ -145,12 +145,16 @@ pub struct UpdatesSection {
     /// 是否允许 Sparkle 后台自动检查更新。
     /// Whether Sparkle may check for updates in the background.
     pub automatically_check: bool,
+    /// 是否自动下载并安装更新。
+    /// Whether Sparkle automatically downloads and installs updates.
+    pub automatically_download: bool,
 }
 
 impl Default for UpdatesSection {
     fn default() -> Self {
         Self {
             automatically_check: true,
+            automatically_download: false,
         }
     }
 }
@@ -1276,6 +1280,7 @@ pub fn reload_config() -> Vec<String> {
     let locale = new_cfg.i18n.locale.clone();
     let log_level = new_cfg.logging.level.clone();
     let automatically_check = new_cfg.updates.automatically_check;
+    let automatically_download = new_cfg.updates.automatically_download;
     if let Ok(mut cfg) = CONFIG.write() {
         *cfg = new_cfg;
     }
@@ -1290,9 +1295,10 @@ pub fn reload_config() -> Vec<String> {
     // 配置变更:失效 per-device 解析缓存(下次 resolve 重新合并 profiles)。
     // Config changed: invalidate the per-device resolve cache (next resolve re-merges profiles).
     crate::mouse::resolve::invalidate_cache();
-    // Apply the update preference to Sparkle when the updater is already running. During early
+    // Apply the update preferences to Sparkle when the updater is already running. During early
     // startup this is a no-op; main initializes Sparkle with the loaded value later.
     crate::updater::set_automatic_checks(automatically_check);
+    crate::updater::set_automatic_downloads(automatically_download);
     errs
 }
 

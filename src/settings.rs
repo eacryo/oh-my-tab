@@ -202,6 +202,15 @@ struct SettingsUi {
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
     update_auto_check: *mut AnyObject, // NSSwitch: Sparkle 自动检查开关 / Sparkle auto-check switch
+    update_auto_download: *mut AnyObject, // NSSwitch: Sparkle 自动下载开关 / Sparkle auto-download switch
+    update_check_button: *mut AnyObject, // NSButton: 检查更新按钮(状态随流程变化) / check-updates button
+    update_host: *mut AnyObject, // NSView: About 页内更新流程宿主容器 / In-about update flow host container
+    update_host_window: *mut AnyObject, // NSWindow: 宿主所属设置窗口(供更新聚焦拉起) / host's settings window
+    update_card: *mut AnyObject, // NSView: Updates 卡片(展开时撑高) / Updates card (grows when expanded)
+    update_card_shadow: *mut AnyObject, // NSView: Updates 卡片阴影 / Updates card shadow
+    update_card_compact_h: f64,  // 收起时卡片高度 / collapsed card height
+    update_card_expanded: bool,  // 是否已为更新流程展开 / whether expanded for a flow
+    update_host_origin_y: f64,   // 宿主收起时的原点 y(顶边 - 展开高) / host origin y when collapsed
 }
 unsafe impl Send for SettingsUi {}
 
@@ -2357,11 +2366,107 @@ pub(crate) extern "C" fn handle_check_for_updates(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
+    // 点击即进入内联「检查中」:按钮切到该文案并禁用,并启动超时守卫(若 Sparkle 不回调也能恢复)。
+    // Enter the inline checking phase: switch the button and disable it, arming a timeout guard so
+    // the button recovers even if Sparkle never calls back.
+    crate::updater::begin_inline_check();
     if !crate::updater::check_for_updates() {
+        // Sparkle 不可用时恢复默认文案并提示,避免按钮卡在「正在检查更新…」。
+        // When Sparkle is unavailable, restore the default label and alert to avoid the button being
+        // stuck on "Checking…".
+        crate::updater::set_check_button_status(&t("settings.btn_check_for_updates"), true);
         show_alert(
             &t("settings.update_unavailable_title"),
             &t("settings.update_unavailable_message"),
         );
+    }
+}
+
+/// 更新流程开始时展开 About 页 Updates 卡片与文档,容纳内联的更新状态/进度/按钮。
+/// Expand the About page Updates card and document at the start of a flow so inline update
+/// status/progress/buttons fit within the following space.
+pub(crate) fn expand_update_section(window_h: f64) {
+    let mut ui_guard = SETTINGS_UI.lock().unwrap();
+    let Some(ui) = ui_guard.as_mut() else {
+        return;
+    };
+    if ui.update_card.is_null() || ui.update_card_expanded {
+        return;
+    }
+    unsafe {
+        // 卡片撑到当前屏幕所需高度(宿主动态高度),保持宿主顶边固定在提示行下方,
+        // 内容从顶部向下排布,卡片与宿主同高,避免按钮下方大块空白。
+        // Grow the card to the current screen's required height (the host's dynamic height) while
+        // keeping the host top fixed below the hint; the card matches the host so there's no large
+        // blank below the buttons.
+        let host_frame: NSRect = msg_send![ui.update_host, frame];
+        let host_top = host_frame.origin.y + host_frame.size.height;
+        let _: () = msg_send![ui.update_host, setFrame: NSRect::new(NSPoint::new(host_frame.origin.x, host_top - window_h), NSSize::new(host_frame.size.width, window_h))];
+        let _: () = msg_send![ui.update_host, setHidden: false];
+        // 卡片与阴影向下撑高 window_h。
+        // Grow the card and its shadow downward by window_h.
+        let card_frame: NSRect = msg_send![ui.update_card, frame];
+        let new_card = NSRect::new(
+            NSPoint::new(card_frame.origin.x, card_frame.origin.y - window_h),
+            NSSize::new(card_frame.size.width, card_frame.size.height + window_h),
+        );
+        let _: () = msg_send![ui.update_card, setFrame: new_card];
+        let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
+        let _: () = msg_send![
+            ui.update_card_shadow,
+            setFrame: NSRect::new(
+                NSPoint::new(new_card.origin.x - shadow_inset, new_card.origin.y - shadow_inset),
+                NSSize::new(new_card.size.width + shadow_inset * 2.0, new_card.size.height + shadow_inset * 2.0),
+            )
+        ];
+        ui.update_card_expanded = true;
+    }
+}
+
+/// 更新流程结束时收起 About 页 Updates 卡片与文档,恢复默认紧凑布局。
+/// Collapse the About page Updates card and document when a flow ends, restoring the compact look.
+pub(crate) fn collapse_update_section() {
+    let mut ui_guard = SETTINGS_UI.lock().unwrap();
+    let Some(ui) = ui_guard.as_mut() else {
+        return;
+    };
+    if ui.update_card.is_null() || !ui.update_card_expanded {
+        return;
+    }
+    unsafe {
+        let compact_h = ui.update_card_compact_h;
+        // 卡片与阴影恢复紧凑高度。
+        // Restore the card and shadow to their compact height.
+        let card_frame: NSRect = msg_send![ui.update_card, frame];
+        let new_card = NSRect::new(
+            NSPoint::new(
+                card_frame.origin.x,
+                card_frame.origin.y + (card_frame.size.height - compact_h),
+            ),
+            NSSize::new(card_frame.size.width, compact_h),
+        );
+        let _: () = msg_send![ui.update_card, setFrame: new_card];
+        let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
+        let _: () = msg_send![
+            ui.update_card_shadow,
+            setFrame: NSRect::new(
+                NSPoint::new(new_card.origin.x - shadow_inset, new_card.origin.y - shadow_inset),
+                NSSize::new(new_card.size.width + shadow_inset * 2.0, new_card.size.height + shadow_inset * 2.0),
+            )
+        ];
+        // 宿主高度清零、隐藏,并恢复原点,确保下次展开时顶边仍固定在按钮行下方。
+        // Zero the host height, hide it, and restore its origin so the next expand keeps the top
+        // fixed below the check button row.
+        let host_frame: NSRect = msg_send![ui.update_host, frame];
+        let _: () = msg_send![
+            ui.update_host,
+            setFrame: NSRect::new(
+                NSPoint::new(host_frame.origin.x, ui.update_host_origin_y),
+                NSSize::new(host_frame.size.width, 0.0)
+            )
+        ];
+        let _: () = msg_send![ui.update_host, setHidden: true];
+        ui.update_card_expanded = false;
     }
 }
 
@@ -2662,9 +2767,10 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
         return;
     }
     let _ = reload_config();
-    // Sparkle keeps its updater object alive for the process; apply the persisted toggle
-    // immediately so the next automatic-check interval follows the user's choice.
+    // Sparkle keeps its updater object alive for the process; apply the persisted toggles
+    // immediately so the next automatic-check/download follows the user's choice.
     crate::updater::set_automatic_checks(cfg.updates.automatically_check);
+    crate::updater::set_automatic_downloads(cfg.updates.automatically_download);
     // 指针加速设置(禁用/恢复)实时生效,无需重启。
     // Pointer acceleration settings take effect immediately, no restart needed.
     crate::mouse::pointer::apply();
@@ -4457,6 +4563,10 @@ fn load_settings_from(cfg: &Config) {
             ui.update_auto_check,
             setState: if cfg.updates.automatically_check { 1isize } else { 0isize }
         ];
+        let _: () = msg_send![
+            ui.update_auto_download,
+            setState: if cfg.updates.automatically_download { 1isize } else { 0isize }
+        ];
 
         // ===== 鼠标页:按当前选中设备的有效配置(合并"所有鼠标"+该设备)填充控件 =====
         // Mouse page: populate controls from the effective config of the selected device
@@ -4675,6 +4785,8 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         cfg.startup.launch_at_login = la_state == 1;
         let update_state: isize = msg_send![ui.update_auto_check, state];
         cfg.updates.automatically_check = update_state == 1;
+        let download_state: isize = msg_send![ui.update_auto_download, state];
+        cfg.updates.automatically_download = download_state == 1;
 
         // ===== 鼠标页:把控件值写回当前选中设备的 profile =====
         // Mouse page: write control values back to the selected device's profile.
@@ -5149,6 +5261,15 @@ fn create_settings_window() {
             ok_button: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
             update_auto_check: std::ptr::null_mut(),
+            update_auto_download: std::ptr::null_mut(),
+            update_check_button: std::ptr::null_mut(),
+            update_host: std::ptr::null_mut(),
+            update_host_window: std::ptr::null_mut(),
+            update_card: std::ptr::null_mut(),
+            update_card_shadow: std::ptr::null_mut(),
+            update_card_compact_h: 0.0,
+            update_card_expanded: false,
+            update_host_origin_y: 0.0,
         };
 
         // The sidebar and detail pane meet directly at the original sidebar boundary; their
@@ -5465,7 +5586,12 @@ fn create_settings_window() {
         let switcher_doc_h = 980.0;
         let mouse_doc_h = 1240.0;
         let clipboard_doc_h = 700.0;
-        let about_doc_h = 700.0;
+        // About 页文档高度固定且足够高,内容从文档顶部(about_doc_h - 68)向下排布。更新流程
+        // 展开时只撑高卡片和宿主,不再改动文档高度,从而不会让顶部内容错位。
+        // The About document is fixed and tall; content flows down from its top (about_doc_h - 68).
+        // An active update flow grows only the card + host, never the document, so the top content
+        // stays anchored and cannot misalign.
+        let about_doc_h = 1040.0;
 
         let (general_root, general_view) =
             make_settings_page(content, page_frame, general_doc_h, false);
@@ -6788,9 +6914,25 @@ fn create_settings_window() {
             &t("settings.desc_update_auto_check"),
             make_switch(ctrl_x + ctrl_w, update_row_y + 10.0, row_h, false),
         );
+        // 自动下载并安装更新开关,位于「自动检查更新」与「检查更新」之间。
+        // Automatically-download-and-install switch, between auto-check and the check button.
+        let download_row_y = update_row_y - described_row_h;
+        ui.update_auto_download = add_described_row(
+            about_view,
+            label_x,
+            download_row_y,
+            (ctrl_x + ctrl_w) - label_x - 70.0,
+            described_row_h,
+            &t("settings.row_update_auto_download"),
+            &t("settings.desc_update_auto_download"),
+            make_switch(ctrl_x + ctrl_w, download_row_y + 10.0, row_h, false),
+        );
+        // 检查更新:全宽长按钮,标题随流程在「检查更新…/检查中…/已是最新版本」间切换,尺寸不变。
+        // Check for updates: a full-width button whose title switches between "Check for Updates…",
+        // "Checking…", and "You're up to date" without changing size.
         let check_button = make_settings_action_button(
             NSRect::new(
-                NSPoint::new(label_x, update_row_y - 46.0),
+                NSPoint::new(label_x, update_row_y - described_row_h - 46.0),
                 NSSize::new(content_w - 2.0 * label_x, 32.0),
             ),
             &t("settings.btn_check_for_updates"),
@@ -6806,36 +6948,54 @@ fn create_settings_window() {
             );
         }
         let _: () = msg_send![about_view, addSubview: check_button];
+        ui.update_check_button = check_button;
         release_obj(check_button);
-        let update_hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let update_hint: *mut AnyObject = msg_send![
-            update_hint,
+        // 内联更新流程的宿主容器:更新状态/进度/按钮渲染进这个 NSView,不再弹独立窗口。
+        // Inline update-flow host container: update status/progress/buttons render here instead of
+        // a separate NSWindow. Empty and hidden by default, so the About page stays compact; an
+        // active flow expands the card + host via expand_update_section.
+        // 宿主顶边紧贴「检查更新」按钮下方 10pt(update_row_y - described_row_h - 56),内容用顶向下
+        // 坐标向下排布,因此进度/结果紧贴按钮,减少标题上方的空白。初始高度为 0,故 origin.y 即顶边。
+        // The host's TOP sits 10pt below the check button (update_row_y - described_row_h - 56);
+        // content uses top-down coordinates flowing downward, so progress/results sit right below the
+        // button, trimming the blank above the title. With an initial height of 0, origin.y is the top.
+        let compact_host_h = 0.0;
+        let host_origin_y = update_row_y - described_row_h - 56.0;
+        let update_host: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let update_host: *mut AnyObject = msg_send![
+            update_host,
             initWithFrame: NSRect::new(
-                NSPoint::new(label_x, update_row_y - 80.0),
-                NSSize::new(content_w - 2.0 * label_x, 30.0),
+                NSPoint::new(label_x, host_origin_y),
+                NSSize::new(content_w - 2.0 * label_x, compact_host_h),
             )
         ];
-        set_field(update_hint, t("settings.update_placeholder_hint"));
-        let _: () = msg_send![update_hint, setBezeled: false];
-        let _: () = msg_send![update_hint, setDrawsBackground: false];
-        let _: () = msg_send![update_hint, setEditable: false];
-        let update_hint_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.5f64];
-        let _: () = msg_send![update_hint, setFont: update_hint_font];
-        let update_hint_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
-        let _: () = msg_send![update_hint, setTextColor: update_hint_color];
-        let _: () = msg_send![about_view, addSubview: update_hint];
-        release_obj(update_hint);
-        let updates_card_bottom = update_row_y - 91.0;
-        add_settings_card(
+        let _: () = msg_send![update_host, setHidden: true];
+        let _: () = msg_send![update_host, setFlipped: true]; // 子视图 y 自顶向下 / child y origin is top-down
+        let _: () = msg_send![about_view, addSubview: update_host];
+        release_obj(update_host);
+        ui.update_host = update_host;
+        ui.update_host_origin_y = host_origin_y;
+        ui.update_host_window = window;
+        crate::updater::set_update_host(update_host, window, check_button);
+        // 收起时的卡片下沿紧贴「检查更新」按钮下方(update_row_y - described_row_h - 56),
+        // 默认为内联区域预留,避免大块空白。
+        // Collapsed card bottom hugs the check button below (update_row_y - described_row_h - 56);
+        // the inline area is not reserved by default, avoiding a large blank.
+        let compact_card_bottom = update_row_y - described_row_h - 56.0;
+        let (update_card, update_card_shadow) = add_settings_card(
             about_view,
             NSRect::new(
-                NSPoint::new(6.0, updates_card_bottom),
+                NSPoint::new(6.0, compact_card_bottom),
                 NSSize::new(
                     content_w - 12.0,
-                    (updates_label_y - SETTINGS_SECTION_CARD_GAP) - updates_card_bottom,
+                    (updates_label_y - SETTINGS_SECTION_CARD_GAP) - compact_card_bottom,
                 ),
             ),
         );
+        ui.update_card = update_card;
+        ui.update_card_shadow = update_card_shadow;
+        ui.update_card_compact_h =
+            (updates_label_y - SETTINGS_SECTION_CARD_GAP) - compact_card_bottom;
 
         // banner 最后添加:作为 general_view 的最后一个 subview,保证在内容之上(缺权限时覆盖顶部)。
         // Added last: as general_view's final subview so it floats above the content (when
@@ -6909,6 +7069,10 @@ pub(crate) fn invalidate_settings_window() {
                 .lock()
                 .unwrap()
                 .remove(&(u.window as usize));
+            // 先让 update 模块解除对宿主视图的引用,再释放窗口,避免它写入已释放视图。
+            // Detach the updater's host references before releasing the window so it never touches
+            // a deallocated view.
+            crate::updater::clear_update_host();
             // 窗口 alloc 是 +1且 setReleasedWhenClosed:false,需手动 release 一次;
             // 其子控件已由父视图持有,随窗口 dealloc 释放。
             // The window is alloc +1 with setReleasedWhenClosed:false, so release once manually;

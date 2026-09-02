@@ -14,9 +14,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, OnceLock};
-
-/// The stable HTTPS endpoint that will host the appcast on the project's R2 custom domain.
-pub(crate) const FEED_URL: &str = "https://download.oh-my-tab.app/appcast.xml";
+use std::time::{Duration, Instant};
 
 const RTLD_NOW: i32 = 2;
 
@@ -47,6 +45,9 @@ fn state() -> &'static Mutex<Option<UpdaterState>> {
 /// Pointers are represented as usize so the mutex can safely cross Rust's static Sync boundary.
 struct UpdateUiState {
     window: usize,
+    host_view: usize,
+    host_window: usize,
+    check_button: usize,
     cancellation: usize,
     acknowledgement: usize,
     update_reply: usize,
@@ -62,6 +63,9 @@ struct UpdateUiState {
 static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
     Mutex::new(UpdateUiState {
         window: 0,
+        host_view: 0,
+        host_window: 0,
+        check_button: 0,
         cancellation: 0,
         acknowledgement: 0,
         update_reply: 0,
@@ -74,6 +78,13 @@ static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
         received_length: 0,
     })
 });
+
+/// 最近一次内联「检查中」的开始时间;用于超时兜底,防止 Sparkle 无回调时按钮永远卡住。
+/// When the last inline "checking" phase began, for a timeout fallback so the button never gets
+/// stuck if Sparkle never calls back.
+static CHECK_TIMER: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+
+const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The dynamically registered subclass is retained by the Objective-C runtime forever.
 struct CustomDriverClass(*mut AnyObject);
@@ -120,12 +131,6 @@ unsafe fn send_void_bool(receiver: *mut AnyObject, selector: Sel, value: bool) {
     type Fn = unsafe extern "C" fn(*mut AnyObject, Sel, bool);
     let f: Fn = std::mem::transmute(objc_msgSend as *const ());
     f(receiver, selector, value)
-}
-
-unsafe fn send_bool(receiver: *mut AnyObject, selector: Sel) -> bool {
-    type Fn = unsafe extern "C" fn(*mut AnyObject, Sel) -> bool;
-    let f: Fn = std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector)
 }
 
 unsafe fn send_bool_ptr(receiver: *mut AnyObject, selector: Sel, value: *mut c_void) -> bool {
@@ -273,6 +278,21 @@ unsafe fn set_string_value(object: *mut AnyObject, value: &str) {
     crate::ffi::CFRelease(value_ns as *const c_void);
 }
 
+/// 读取当前 bundle Info.plist 的 SUFeedURL；缺失时返回空串。日志用它反映 Sparkle 实际使用的
+/// feed（而非常量,避免误导)——Sparkle 通过 host bundle 的这个键取 feed。
+/// Read the current bundle's SUFeedURL from Info.plist; empty when absent. The log uses this so it
+/// reflects the feed Sparkle actually reads from the host bundle instead of a misleading constant.
+unsafe fn bundle_feed_url() -> String {
+    let bundle = send_id(
+        class!(NSBundle) as *const _ as *mut AnyObject,
+        sel!(mainBundle),
+    );
+    let key_ns = make_nsstring("SUFeedURL");
+    let value: *mut AnyObject = msg_send![bundle, objectForInfoDictionaryKey: key_ns];
+    crate::ffi::CFRelease(key_ns as *const c_void);
+    nsstring_to_string(value)
+}
+
 unsafe fn app_display_name() -> String {
     let bundle = send_id(
         class!(NSBundle) as *const _ as *mut AnyObject,
@@ -290,28 +310,131 @@ unsafe fn app_display_name() -> String {
     "Oh My Tab".to_string()
 }
 
+/// 渲染目标:内联时用 About 页宿主视图,否则用独立窗口。
+/// Render target: the About page host view when inline, else a standalone window.
+#[derive(Clone, Copy)]
+struct RenderTarget {
+    /// 内联时指向宿主视图,否则为 null。
+    /// Points at the host view when inline, null otherwise.
+    host: *mut AnyObject,
+    /// 添加到子视图的父视图(宿主或窗口 contentView)。
+    /// The parent view receiving subviews (host or window contentView).
+    parent: *mut AnyObject,
+    /// 内联宿主宽度;独立窗口时为 0(用窗口原始坐标)。
+    /// Inline host width; 0 for standalone windows (use the window's native coordinates).
+    width: f64,
+}
+
+/// 决定当前渲染目标:有宿主则内联,否则回退独立窗口。内联时把宿主高度设为该屏幕所需高度,
+/// 保持顶边固定在按钮行下方,使顶向下翻转紧凑无空白。
+/// Decide the render target: inline when a host is registered, else fall back to a window. Inline
+/// sizes the host to the screen's required height, keeping its top fixed below the check button
+/// row so the top-down flip is compact without extra blank.
+unsafe fn render_target(window_h: f64) -> RenderTarget {
+    let ui = UPDATE_UI_STATE.lock().unwrap();
+    if ui.host_view != 0 {
+        // Host 坐标从 (0,0) 开始,宽度取宿主帧宽,便于内联排布。
+        // Host coordinates start at (0,0); width is the host frame width, so inline layout fits.
+        // 有宿主(About 页内联)时展开卡片到该屏幕高度,并把宿主设为同高、顶边固定。
+        // When hosted inline, expand the card to this screen's height and size the host to match,
+        // keeping the host top fixed so the top-down flip is exact.
+        crate::settings::expand_update_section(window_h);
+        let frame: NSRect = msg_send![ui.host_view as *mut AnyObject, frame];
+        RenderTarget {
+            host: ui.host_view as *mut AnyObject,
+            parent: ui.host_view as *mut AnyObject,
+            width: frame.size.width,
+        }
+    } else {
+        RenderTarget {
+            host: std::ptr::null_mut(),
+            parent: std::ptr::null_mut(),
+            width: 0.0,
+        }
+    }
+}
+
+/// 把独立窗口的一个 frame 内联映射到宿主宽度(按比例缩放 x 与宽)。
+/// Map a standalone-window frame onto the host width, scaling x and width proportionally.
+fn scale_frame(target: RenderTarget, window_w: f64, frame: NSRect) -> NSRect {
+    if target.host.is_null() || window_w <= 0.0 {
+        return frame;
+    }
+    let scale = target.width / window_w;
+    NSRect::new(
+        NSPoint::new(frame.origin.x * scale, frame.origin.y),
+        NSSize::new(frame.size.width * scale, frame.size.height),
+    )
+}
+
+/// 把一个控件加入渲染目标;内联时按宿主宽度缩放坐标、把宿主高度设为该屏幕高度,并把窗口自底向
+/// 上的 y 翻转为宿主顶向下,使标题贴近宿主顶部、按钮贴近宿主底部,内容从按钮行正下方紧凑排布。
+/// Add a control to the render target; inline scales its frame to the host width, sizes the host to
+/// this screen's height, and flips the window's bottom-up y to the host's top-down so titles sit
+/// near the host top and buttons near the bottom, compactly starting below the check button row.
+unsafe fn add_control(
+    target: RenderTarget,
+    window_w: f64,
+    control: *mut AnyObject,
+    frame: NSRect,
+    parent: *mut AnyObject,
+) {
+    if !target.host.is_null() {
+        let _: () = msg_send![target.host, setHidden: false];
+        let scaled = scale_frame(target, window_w, frame);
+        let host_frame: NSRect = msg_send![target.host, frame];
+        let host_h = host_frame.size.height;
+        // 把窗口自底向上的 y 翻转为宿主顶向下:标题贴近顶部、按钮贴近底部,内容从按钮行下方排布。
+        // Flip the window's bottom-up y to the host's top-down: titles near the top, buttons near
+        // the bottom, content flowing below the check-button row.
+        let flipped = NSRect::new(
+            NSPoint::new(
+                scaled.origin.x,
+                host_h - scaled.origin.y - scaled.size.height,
+            ),
+            scaled.size,
+        );
+        let _: () = msg_send![control, setFrame: flipped];
+    }
+    let _: () = msg_send![parent, addSubview: control];
+}
+
+/// 清除宿主视图内的更新控件(不释放宿主本身,宿主归 About 页父视图所有)。
+/// Clear the update controls inside the host view (the host itself stays owned by the About page).
+unsafe fn clear_host_subviews(host: *mut AnyObject) {
+    if host.is_null() {
+        return;
+    }
+    loop {
+        let subviews: *mut AnyObject = msg_send![host, subviews];
+        let count: usize = if subviews.is_null() {
+            0
+        } else {
+            msg_send![subviews, count]
+        };
+        if count == 0 {
+            break;
+        }
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: 0usize];
+        let _: () = msg_send![child, removeFromSuperview];
+        release_obj(child);
+    }
+}
+
 unsafe fn close_custom_update_window() {
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
-    if ui.window != 0 {
+    if ui.host_view != 0 {
+        // 内联模式:清除宿主内控件,不改动设置窗口。
+        // Inline mode: clear the host's controls, leave the settings window untouched.
+        clear_host_subviews(ui.host_view as *mut AnyObject);
+        ui.window = 0;
+    } else if ui.window != 0 {
         let window = ui.window as *mut AnyObject;
         // 关闭窗口前先解除父视图对控件的引用，再释放 alloc 所有权，避免 AppKit 过度释放。
         // Remove subviews before releasing their alloc ownership to avoid AppKit over-release.
         let content: *mut AnyObject = msg_send![window, contentView];
         if !content.is_null() {
-            loop {
-                let subviews: *mut AnyObject = msg_send![content, subviews];
-                let count: usize = if subviews.is_null() {
-                    0
-                } else {
-                    msg_send![subviews, count]
-                };
-                if count == 0 {
-                    break;
-                }
-                let child: *mut AnyObject = msg_send![subviews, objectAtIndex: 0usize];
-                let _: () = msg_send![child, removeFromSuperview];
-                release_obj(child);
-            }
+            clear_host_subviews(content);
         }
         let _: () = msg_send![window, orderOut: std::ptr::null_mut::<AnyObject>()];
         let _: () = msg_send![window, close];
@@ -335,29 +458,117 @@ unsafe fn close_custom_update_window() {
     ui.received_length = 0;
 }
 
+/// 设置 About 页的 update host 宿主视图与检查按钮(内联渲染入口)。
+/// Register the About page's host view and check-updates button so update steps render inline and
+/// the button can report its state (checking / up to date).
+pub(crate) fn set_update_host(
+    host: *mut AnyObject,
+    window: *mut AnyObject,
+    check_button: *mut AnyObject,
+) {
+    let mut ui = UPDATE_UI_STATE.lock().unwrap();
+    ui.host_view = host as usize;
+    ui.host_window = window as usize;
+    ui.check_button = check_button as usize;
+}
+
+/// 作废 update host 与检查按钮引用;在设置窗口销毁前调用,避免写已释放视图。
+/// Clear the update host and check-button references; called before the settings window is
+/// destroyed so the updater never writes to a deallocated view.
+pub(crate) fn clear_update_host() {
+    unsafe { close_custom_update_window() };
+    let mut ui = UPDATE_UI_STATE.lock().unwrap();
+    ui.host_view = 0;
+    ui.host_window = 0;
+    ui.check_button = 0;
+}
+
+/// 更新 About 页「检查更新」按钮的文案与可用态;按钮尺寸保持不变。
+/// Update the About page check-updates button title and enabled state; its size stays fixed.
+pub(crate) fn set_check_button_status(title: &str, enabled: bool) {
+    let button = UPDATE_UI_STATE.lock().unwrap().check_button;
+    if button == 0 {
+        return;
+    }
+    unsafe {
+        let btn = button as *mut AnyObject;
+        let ns = make_nsstring(title);
+        let _: () = msg_send![btn, setTitle: ns];
+        crate::ffi::CFRelease(ns as *const c_void);
+        let _: () = msg_send![btn, setEnabled: enabled];
+    }
+}
+
+/// 恢复 About 页检查按钮为默认「检查更新…」文案并可用。
+/// Restore the About check button to its default "Check for Updates…" title and enabled state.
+fn reset_check_button() {
+    clear_inline_check();
+    set_check_button_status(&t("settings.btn_check_for_updates"), true);
+}
+
+/// 进入内联「检查中」:把按钮切到该文案并禁用,记录开始时间并启动超时守卫线程。
+/// Enter the inline checking phase: set the button to that label and disable it, record the start
+/// time, and arm a timeout guard thread so the button cannot get stuck if Sparkle is silent.
+pub(crate) fn begin_inline_check() {
+    // 非内联(无 About 检查按钮)时无需计时兜底。
+    // No inline check button means there is nothing to guard.
+    if UPDATE_UI_STATE.lock().unwrap().check_button == 0 {
+        return;
+    }
+    set_check_button_status(&t("settings.update_checking"), false);
+    *CHECK_TIMER.lock().unwrap() = Some(Instant::now());
+    // 守卫生程:若超时后按钮仍处于禁用(即尚无任何回调恢复),恢复为「已是最新版本」。
+    // Guard thread: if the button is still disabled after the timeout (no callback restored it),
+    // restore it to "You're up to date".
+    std::thread::spawn(|| {
+        std::thread::sleep(CHECK_TIMEOUT);
+        let stale = {
+            let timer = CHECK_TIMER.lock().unwrap();
+            match *timer {
+                Some(start) => start.elapsed() >= CHECK_TIMEOUT,
+                None => false,
+            }
+        };
+        if stale {
+            set_check_button_status(&t("settings.btn_up_to_date"), true);
+            clear_inline_check();
+        }
+    });
+}
+
+/// 清除内联「检查中」计时,表示已得到结果(无论成功/失败/无更新)。
+/// Clear the inline checking timer to mark that a result has arrived.
+fn clear_inline_check() {
+    *CHECK_TIMER.lock().unwrap() = None;
+}
+
 unsafe fn make_custom_update_window(driver: *mut c_void, cancellation: *mut c_void) {
     close_custom_update_window();
 
-    let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(520.0, 190.0));
-    // NSWindowStyleMaskTitled = 1; NSBackingStoreBuffered = 2.
-    let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-    let window: *mut AnyObject = msg_send![
-        window,
-        initWithContentRect: window_frame,
-        styleMask: 1u64,
-        backing: 2u64,
-        defer: false
-    ];
-    if window.is_null() {
-        return;
-    }
-    let title = make_nsstring(&t("settings.update_window_title"));
-    let _: () = msg_send![window, setTitle: title];
-    crate::ffi::CFRelease(title as *const c_void);
-    let _: () = msg_send![window, setReleasedWhenClosed: false];
-
-    let content: *mut AnyObject = msg_send![window, contentView];
-
+    let target = render_target(190.0);
+    let window_w = 520.0;
+    let (content, window) = if target.host.is_null() {
+        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, 190.0));
+        // NSWindowStyleMaskTitled = 1; NSBackingStoreBuffered = 2.
+        let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+        let window: *mut AnyObject = msg_send![
+            window,
+            initWithContentRect: window_frame,
+            styleMask: 1u64,
+            backing: 2u64,
+            defer: false
+        ];
+        if window.is_null() {
+            return;
+        }
+        let title = make_nsstring(&t("settings.update_window_title"));
+        let _: () = msg_send![window, setTitle: title];
+        crate::ffi::CFRelease(title as *const c_void);
+        let _: () = msg_send![window, setReleasedWhenClosed: false];
+        (msg_send![window, contentView], window)
+    } else {
+        (target.parent, std::ptr::null_mut())
+    };
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject = msg_send![
         label,
@@ -372,7 +583,13 @@ unsafe fn make_custom_update_window(driver: *mut c_void, cancellation: *mut c_vo
     let _: () = msg_send![label, setSelectable: false];
     let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 18.0f64];
     let _: () = msg_send![label, setFont: font];
-    let _: () = msg_send![content, addSubview: label];
+    add_control(
+        target,
+        window_w,
+        label,
+        NSRect::new(NSPoint::new(32.0, 118.0), NSSize::new(456.0, 28.0)),
+        content,
+    );
 
     let progress: *mut AnyObject = msg_send![class!(NSProgressIndicator), alloc];
     let progress: *mut AnyObject = msg_send![
@@ -381,7 +598,13 @@ unsafe fn make_custom_update_window(driver: *mut c_void, cancellation: *mut c_vo
     ];
     let _: () = msg_send![progress, setIndeterminate: true];
     let _: () = msg_send![progress, startAnimation: std::ptr::null_mut::<AnyObject>()];
-    let _: () = msg_send![content, addSubview: progress];
+    add_control(
+        target,
+        window_w,
+        progress,
+        NSRect::new(NSPoint::new(32.0, 78.0), NSSize::new(456.0, 16.0)),
+        content,
+    );
 
     let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let cancel: *mut AnyObject = msg_send![
@@ -394,13 +617,24 @@ unsafe fn make_custom_update_window(driver: *mut c_void, cancellation: *mut c_vo
     let _: () = msg_send![cancel, setBezelStyle: 1u64];
     let _: () = msg_send![cancel, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![cancel, setAction: sel!(cancelCustomUpdateCheck:)];
-    let _: () = msg_send![content, addSubview: cancel];
+    add_control(
+        target,
+        window_w,
+        cancel,
+        NSRect::new(NSPoint::new(350.0, 24.0), NSSize::new(138.0, 34.0)),
+        content,
+    );
 
-    let _: () = msg_send![window, center];
-    let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    if !window.is_null() {
+        let _: () = msg_send![window, center];
+        let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    }
 
     let copied_cancellation = copy_block(cancellation) as usize;
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
+    // 内联时 window 为 null,ui.window 保持 0(宿主由 host_view 记录);聚焦/标题走 host_window。
+    // Inline: window is null so ui.window stays 0 (the host is tracked via host_view); focus and
+    // title use host_window.
     ui.window = window as usize;
     ui.cancellation = copied_cancellation;
 }
@@ -413,26 +647,30 @@ unsafe fn make_custom_result_window(
 ) {
     close_custom_update_window();
 
-    let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(520.0, 250.0));
-    // NSWindowStyleMaskTitled = 1; NSBackingStoreBuffered = 2.
-    let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-    let window: *mut AnyObject = msg_send![
-        window,
-        initWithContentRect: window_frame,
-        styleMask: 1u64,
-        backing: 2u64,
-        defer: false
-    ];
-    if window.is_null() {
-        return;
-    }
-    let window_title = make_nsstring(&t("settings.update_window_title"));
-    let _: () = msg_send![window, setTitle: window_title];
-    crate::ffi::CFRelease(window_title as *const c_void);
-    let _: () = msg_send![window, setReleasedWhenClosed: false];
-
-    let content: *mut AnyObject = msg_send![window, contentView];
-
+    let target = render_target(250.0);
+    let window_w = 520.0;
+    let (content, window) = if target.host.is_null() {
+        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, 250.0));
+        // NSWindowStyleMaskTitled = 1; NSBackingStoreBuffered = 2.
+        let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+        let window: *mut AnyObject = msg_send![
+            window,
+            initWithContentRect: window_frame,
+            styleMask: 1u64,
+            backing: 2u64,
+            defer: false
+        ];
+        if window.is_null() {
+            return;
+        }
+        let window_title = make_nsstring(&t("settings.update_window_title"));
+        let _: () = msg_send![window, setTitle: window_title];
+        crate::ffi::CFRelease(window_title as *const c_void);
+        let _: () = msg_send![window, setReleasedWhenClosed: false];
+        (msg_send![window, contentView], window)
+    } else {
+        (target.parent, std::ptr::null_mut())
+    };
     let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let title: *mut AnyObject = msg_send![
         title,
@@ -447,7 +685,13 @@ unsafe fn make_custom_result_window(
     let _: () = msg_send![title, setSelectable: false];
     let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 22.0f64];
     let _: () = msg_send![title, setFont: title_font];
-    let _: () = msg_send![content, addSubview: title];
+    add_control(
+        target,
+        window_w,
+        title,
+        NSRect::new(NSPoint::new(32.0, 164.0), NSSize::new(456.0, 32.0)),
+        content,
+    );
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
@@ -465,7 +709,13 @@ unsafe fn make_custom_result_window(
     let _: () = msg_send![message, setFont: message_font];
     let _: () = msg_send![message, setLineBreakMode: 0u64];
     let _: () = msg_send![message, setMaximumNumberOfLines: 0isize];
-    let _: () = msg_send![content, addSubview: message];
+    add_control(
+        target,
+        window_w,
+        message,
+        NSRect::new(NSPoint::new(32.0, 106.0), NSSize::new(456.0, 44.0)),
+        content,
+    );
 
     let ok: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let ok: *mut AnyObject = msg_send![
@@ -478,10 +728,18 @@ unsafe fn make_custom_result_window(
     let _: () = msg_send![ok, setBezelStyle: 1u64];
     let _: () = msg_send![ok, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![ok, setAction: sel!(acknowledgeCustomUpdateResult:)];
-    let _: () = msg_send![content, addSubview: ok];
+    add_control(
+        target,
+        window_w,
+        ok,
+        NSRect::new(NSPoint::new(350.0, 24.0), NSSize::new(138.0, 34.0)),
+        content,
+    );
 
-    let _: () = msg_send![window, center];
-    let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    if !window.is_null() {
+        let _: () = msg_send![window, center];
+        let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    }
 
     let copied_acknowledgement = copy_block(acknowledgement) as usize;
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
@@ -493,23 +751,29 @@ unsafe fn make_custom_result_window(
 /// Build the first-run update permission window without Sparkle's standard icon-bearing UI.
 unsafe fn make_custom_permission_window(driver: *mut c_void, reply: *mut c_void) {
     close_custom_update_window();
-    let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 240.0));
-    let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-    let window: *mut AnyObject = msg_send![
-        window,
-        initWithContentRect: window_frame,
-        styleMask: 1u64,
-        backing: 2u64,
-        defer: false
-    ];
-    if window.is_null() {
-        return;
-    }
-    let window_title = make_nsstring(&t("settings.update_window_title"));
-    let _: () = msg_send![window, setTitle: window_title];
-    crate::ffi::CFRelease(window_title as *const c_void);
-    let _: () = msg_send![window, setReleasedWhenClosed: false];
-    let content: *mut AnyObject = msg_send![window, contentView];
+    let target = render_target(240.0);
+    let window_w = 560.0;
+    let (content, window) = if target.host.is_null() {
+        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, 240.0));
+        let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+        let window: *mut AnyObject = msg_send![
+            window,
+            initWithContentRect: window_frame,
+            styleMask: 1u64,
+            backing: 2u64,
+            defer: false
+        ];
+        if window.is_null() {
+            return;
+        }
+        let window_title = make_nsstring(&t("settings.update_window_title"));
+        let _: () = msg_send![window, setTitle: window_title];
+        crate::ffi::CFRelease(window_title as *const c_void);
+        let _: () = msg_send![window, setReleasedWhenClosed: false];
+        (msg_send![window, contentView], window)
+    } else {
+        (target.parent, std::ptr::null_mut())
+    };
     let app = app_display_name();
 
     let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -524,7 +788,13 @@ unsafe fn make_custom_permission_window(driver: *mut c_void, reply: *mut c_void)
     let _: () = msg_send![title, setSelectable: false];
     let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 20.0f64];
     let _: () = msg_send![title, setFont: title_font];
-    let _: () = msg_send![content, addSubview: title];
+    add_control(
+        target,
+        window_w,
+        title,
+        NSRect::new(NSPoint::new(32.0, 172.0), NSSize::new(496.0, 32.0)),
+        content,
+    );
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
@@ -541,7 +811,13 @@ unsafe fn make_custom_permission_window(driver: *mut c_void, reply: *mut c_void)
     let _: () = msg_send![message, setFont: message_font];
     let _: () = msg_send![message, setLineBreakMode: 0u64];
     let _: () = msg_send![message, setMaximumNumberOfLines: 0isize];
-    let _: () = msg_send![content, addSubview: message];
+    add_control(
+        target,
+        window_w,
+        message,
+        NSRect::new(NSPoint::new(32.0, 112.0), NSSize::new(496.0, 44.0)),
+        content,
+    );
 
     let later: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let later: *mut AnyObject = msg_send![
@@ -554,7 +830,13 @@ unsafe fn make_custom_permission_window(driver: *mut c_void, reply: *mut c_void)
     let _: () = msg_send![later, setBezelStyle: 1u64];
     let _: () = msg_send![later, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![later, setAction: sel!(deferAutomaticUpdate:)];
-    let _: () = msg_send![content, addSubview: later];
+    add_control(
+        target,
+        window_w,
+        later,
+        NSRect::new(NSPoint::new(32.0, 28.0), NSSize::new(180.0, 36.0)),
+        content,
+    );
 
     let enable: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let enable: *mut AnyObject = msg_send![
@@ -567,15 +849,23 @@ unsafe fn make_custom_permission_window(driver: *mut c_void, reply: *mut c_void)
     let _: () = msg_send![enable, setBezelStyle: 1u64];
     let _: () = msg_send![enable, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![enable, setAction: sel!(allowAutomaticUpdate:)];
-    let _: () = msg_send![content, addSubview: enable];
+    add_control(
+        target,
+        window_w,
+        enable,
+        NSRect::new(NSPoint::new(348.0, 28.0), NSSize::new(180.0, 36.0)),
+        content,
+    );
 
     let copied_reply = copy_block(reply) as usize;
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
     ui.window = window as usize;
     ui.permission_reply = copied_reply;
 
-    let _: () = msg_send![window, center];
-    let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    if !window.is_null() {
+        let _: () = msg_send![window, center];
+        let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    }
 }
 
 unsafe fn answer_update_permission(enabled: bool) {
@@ -648,46 +938,34 @@ unsafe fn make_custom_update_found_window(
         &[("app", &app), ("version", &version)],
     );
 
-    let updater = state()
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map_or(std::ptr::null_mut(), |current| current.updater);
-    let automatically_downloads = if updater.is_null() {
-        false
+    let target = render_target(140.0);
+    let window_w = 640.0;
+    let (content, window) = if target.host.is_null() {
+        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, 140.0));
+        // NSWindowStyleMaskTitled = 1; NSBackingStoreBuffered = 2.
+        let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+        let window: *mut AnyObject = msg_send![
+            window,
+            initWithContentRect: window_frame,
+            styleMask: 1u64,
+            backing: 2u64,
+            defer: false
+        ];
+        if window.is_null() {
+            return;
+        }
+        let window_title = make_nsstring(&t("settings.update_window_title"));
+        let _: () = msg_send![window, setTitle: window_title];
+        crate::ffi::CFRelease(window_title as *const c_void);
+        let _: () = msg_send![window, setReleasedWhenClosed: false];
+        (msg_send![window, contentView], window)
     } else {
-        send_bool(updater, sel!(automaticallyDownloadsUpdates))
+        (target.parent, std::ptr::null_mut())
     };
-    let allows_automatic_updates = if updater.is_null() {
-        false
-    } else {
-        send_bool(updater, sel!(allowsAutomaticUpdates))
-    };
-
-    let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(640.0, 292.0));
-    // NSWindowStyleMaskTitled = 1; NSBackingStoreBuffered = 2.
-    let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-    let window: *mut AnyObject = msg_send![
-        window,
-        initWithContentRect: window_frame,
-        styleMask: 1u64,
-        backing: 2u64,
-        defer: false
-    ];
-    if window.is_null() {
-        return;
-    }
-    let window_title = make_nsstring(&t("settings.update_window_title"));
-    let _: () = msg_send![window, setTitle: window_title];
-    crate::ffi::CFRelease(window_title as *const c_void);
-    let _: () = msg_send![window, setReleasedWhenClosed: false];
-
-    let content: *mut AnyObject = msg_send![window, contentView];
-
     let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let title: *mut AnyObject = msg_send![
         title,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 228.0), NSSize::new(576.0, 32.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, 108.0), NSSize::new(576.0, 32.0))
     ];
     let title_ns = make_nsstring(&title_text);
     let _: () = msg_send![title, setStringValue: title_ns];
@@ -696,14 +974,21 @@ unsafe fn make_custom_update_found_window(
     let _: () = msg_send![title, setDrawsBackground: false];
     let _: () = msg_send![title, setEditable: false];
     let _: () = msg_send![title, setSelectable: false];
+    let _: () = msg_send![title, setAlignment: 1isize]; // 居中 / centered
     let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 22.0f64];
     let _: () = msg_send![title, setFont: title_font];
-    let _: () = msg_send![content, addSubview: title];
+    add_control(
+        target,
+        window_w,
+        title,
+        NSRect::new(NSPoint::new(32.0, 108.0), NSSize::new(576.0, 32.0)),
+        content,
+    );
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
         message,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 165.0), NSSize::new(576.0, 48.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, 54.0), NSSize::new(576.0, 44.0))
     ];
     let message_ns = make_nsstring(&message_text);
     let _: () = msg_send![message, setStringValue: message_ns];
@@ -712,36 +997,23 @@ unsafe fn make_custom_update_found_window(
     let _: () = msg_send![message, setDrawsBackground: false];
     let _: () = msg_send![message, setEditable: false];
     let _: () = msg_send![message, setSelectable: false];
+    let _: () = msg_send![message, setAlignment: 1isize]; // 居中 / centered
     let message_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 16.0f64];
     let _: () = msg_send![message, setFont: message_font];
     let _: () = msg_send![message, setLineBreakMode: 0u64];
     let _: () = msg_send![message, setMaximumNumberOfLines: 0isize];
-    let _: () = msg_send![content, addSubview: message];
-
-    let automatic: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let automatic: *mut AnyObject = msg_send![
-        automatic,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 122.0), NSSize::new(576.0, 28.0))
-    ];
-    let automatic_title = make_nsstring(&t("settings.update_automatically_download"));
-    let _: () = msg_send![automatic, setTitle: automatic_title];
-    crate::ffi::CFRelease(automatic_title as *const c_void);
-    // NSButtonTypeSwitch = 3，macOS 原生复选框样式。
-    // NSButtonTypeSwitch = 3, the native macOS checkbox style.
-    let _: () = msg_send![automatic, setButtonType: 3isize];
-    let _: () = msg_send![
-        automatic,
-        setState: if automatically_downloads { 1isize } else { 0isize }
-    ];
-    let _: () = msg_send![automatic, setEnabled: allows_automatic_updates];
-    let _: () = msg_send![automatic, setTarget: driver as *mut AnyObject];
-    let _: () = msg_send![automatic, setAction: sel!(toggleAutomaticUpdate:)];
-    let _: () = msg_send![content, addSubview: automatic];
+    add_control(
+        target,
+        window_w,
+        message,
+        NSRect::new(NSPoint::new(32.0, 54.0), NSSize::new(576.0, 44.0)),
+        content,
+    );
 
     let skip: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let skip: *mut AnyObject = msg_send![
         skip,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 32.0), NSSize::new(166.0, 36.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, 14.0), NSSize::new(166.0, 36.0))
     ];
     let skip_title = make_nsstring(&t("settings.btn_skip_version"));
     let _: () = msg_send![skip, setTitle: skip_title];
@@ -749,12 +1021,18 @@ unsafe fn make_custom_update_found_window(
     let _: () = msg_send![skip, setBezelStyle: 1u64];
     let _: () = msg_send![skip, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![skip, setAction: sel!(skipCustomUpdate:)];
-    let _: () = msg_send![content, addSubview: skip];
+    add_control(
+        target,
+        window_w,
+        skip,
+        NSRect::new(NSPoint::new(32.0, 14.0), NSSize::new(166.0, 36.0)),
+        content,
+    );
 
     let later: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let later: *mut AnyObject = msg_send![
         later,
-        initWithFrame: NSRect::new(NSPoint::new(220.0, 32.0), NSSize::new(166.0, 36.0))
+        initWithFrame: NSRect::new(NSPoint::new(220.0, 14.0), NSSize::new(166.0, 36.0))
     ];
     let later_title = make_nsstring(&t("settings.btn_remind_later"));
     let _: () = msg_send![later, setTitle: later_title];
@@ -762,12 +1040,18 @@ unsafe fn make_custom_update_found_window(
     let _: () = msg_send![later, setBezelStyle: 1u64];
     let _: () = msg_send![later, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![later, setAction: sel!(dismissCustomUpdate:)];
-    let _: () = msg_send![content, addSubview: later];
+    add_control(
+        target,
+        window_w,
+        later,
+        NSRect::new(NSPoint::new(220.0, 14.0), NSSize::new(166.0, 36.0)),
+        content,
+    );
 
     let install: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let install: *mut AnyObject = msg_send![
         install,
-        initWithFrame: NSRect::new(NSPoint::new(408.0, 32.0), NSSize::new(200.0, 36.0))
+        initWithFrame: NSRect::new(NSPoint::new(408.0, 14.0), NSSize::new(200.0, 36.0))
     ];
     let install_title = make_nsstring(&t("settings.btn_install_update"));
     let _: () = msg_send![install, setTitle: install_title];
@@ -778,10 +1062,18 @@ unsafe fn make_custom_update_found_window(
     crate::ffi::CFRelease(key_equivalent as *const c_void);
     let _: () = msg_send![install, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![install, setAction: sel!(installCustomUpdate:)];
-    let _: () = msg_send![content, addSubview: install];
+    add_control(
+        target,
+        window_w,
+        install,
+        NSRect::new(NSPoint::new(408.0, 14.0), NSSize::new(200.0, 36.0)),
+        content,
+    );
 
-    let _: () = msg_send![window, center];
-    let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    if !window.is_null() {
+        let _: () = msg_send![window, center];
+        let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    }
 
     let copied_reply = copy_block(reply) as usize;
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
@@ -838,25 +1130,30 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     close_custom_update_window();
 
     let app = app_display_name();
-    let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 238.0));
-    let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-    let window: *mut AnyObject = msg_send![
-        window,
-        initWithContentRect: window_frame,
-        styleMask: 1u64,
-        backing: 2u64,
-        defer: false
-    ];
-    if window.is_null() {
-        return;
-    }
-    let window_title = tf("settings.update_downloading_window_title", &[("app", &app)]);
-    let window_title_ns = make_nsstring(&window_title);
-    let _: () = msg_send![window, setTitle: window_title_ns];
-    crate::ffi::CFRelease(window_title_ns as *const c_void);
-    let _: () = msg_send![window, setReleasedWhenClosed: false];
-    let content: *mut AnyObject = msg_send![window, contentView];
-
+    let target = render_target(238.0);
+    let window_w = 560.0;
+    let (content, window) = if target.host.is_null() {
+        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, 238.0));
+        let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+        let window: *mut AnyObject = msg_send![
+            window,
+            initWithContentRect: window_frame,
+            styleMask: 1u64,
+            backing: 2u64,
+            defer: false
+        ];
+        if window.is_null() {
+            return;
+        }
+        let window_title = tf("settings.update_downloading_window_title", &[("app", &app)]);
+        let window_title_ns = make_nsstring(&window_title);
+        let _: () = msg_send![window, setTitle: window_title_ns];
+        crate::ffi::CFRelease(window_title_ns as *const c_void);
+        let _: () = msg_send![window, setReleasedWhenClosed: false];
+        (msg_send![window, contentView], window)
+    } else {
+        (target.parent, std::ptr::null_mut())
+    };
     let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let title: *mut AnyObject = msg_send![
         title,
@@ -869,7 +1166,13 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     let _: () = msg_send![title, setSelectable: false];
     let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 22.0f64];
     let _: () = msg_send![title, setFont: title_font];
-    let _: () = msg_send![content, addSubview: title];
+    add_control(
+        target,
+        window_w,
+        title,
+        NSRect::new(NSPoint::new(32.0, 168.0), NSSize::new(496.0, 32.0)),
+        content,
+    );
 
     let progress: *mut AnyObject = msg_send![class!(NSProgressIndicator), alloc];
     let progress: *mut AnyObject = msg_send![
@@ -880,7 +1183,13 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     let _: () = msg_send![progress, setMinValue: 0.0f64];
     let _: () = msg_send![progress, setMaxValue: 1.0f64];
     let _: () = msg_send![progress, setDoubleValue: 0.0f64];
-    let _: () = msg_send![content, addSubview: progress];
+    add_control(
+        target,
+        window_w,
+        progress,
+        NSRect::new(NSPoint::new(32.0, 116.0), NSSize::new(496.0, 18.0)),
+        content,
+    );
 
     let status: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let status: *mut AnyObject = msg_send![
@@ -898,7 +1207,13 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     let _: () = msg_send![status, setSelectable: false];
     let status_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
     let _: () = msg_send![status, setFont: status_font];
-    let _: () = msg_send![content, addSubview: status];
+    add_control(
+        target,
+        window_w,
+        status,
+        NSRect::new(NSPoint::new(32.0, 82.0), NSSize::new(496.0, 24.0)),
+        content,
+    );
 
     let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let cancel: *mut AnyObject = msg_send![
@@ -911,7 +1226,13 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     let _: () = msg_send![cancel, setBezelStyle: 1u64];
     let _: () = msg_send![cancel, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![cancel, setAction: sel!(cancelCustomDownload:)];
-    let _: () = msg_send![content, addSubview: cancel];
+    add_control(
+        target,
+        window_w,
+        cancel,
+        NSRect::new(NSPoint::new(390.0, 28.0), NSSize::new(138.0, 36.0)),
+        content,
+    );
 
     let copied_cancellation = copy_block(cancellation) as usize;
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
@@ -923,8 +1244,10 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     ui.expected_length = 0;
     ui.received_length = 0;
 
-    let _: () = msg_send![window, center];
-    let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    if !window.is_null() {
+        let _: () = msg_send![window, center];
+        let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    }
 }
 
 unsafe fn set_download_status(text: &str, indeterminate: bool) {
@@ -961,10 +1284,12 @@ unsafe fn clear_download_cancellation() {
 }
 
 unsafe fn set_custom_window_title(text: &str) {
-    let window = UPDATE_UI_STATE.lock().unwrap().window;
-    if window != 0 {
+    let ui = UPDATE_UI_STATE.lock().unwrap();
+    // 内联时宿主无窗口标题,直接跳过。
+    // Inline mode has no window title bar, so this is a no-op.
+    if ui.window != 0 {
         let title_ns = make_nsstring(text);
-        let _: () = msg_send![window as *mut AnyObject, setTitle: title_ns];
+        let _: () = msg_send![ui.window as *mut AnyObject, setTitle: title_ns];
         crate::ffi::CFRelease(title_ns as *const c_void);
     }
 }
@@ -978,24 +1303,29 @@ unsafe fn make_custom_choice_window(
     message_text: &str,
 ) {
     close_custom_update_window();
-    let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(580.0, 250.0));
-    let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-    let window: *mut AnyObject = msg_send![
-        window,
-        initWithContentRect: window_frame,
-        styleMask: 1u64,
-        backing: 2u64,
-        defer: false
-    ];
-    if window.is_null() {
-        return;
-    }
-    let window_title = make_nsstring(&t("settings.update_window_title"));
-    let _: () = msg_send![window, setTitle: window_title];
-    crate::ffi::CFRelease(window_title as *const c_void);
-    let _: () = msg_send![window, setReleasedWhenClosed: false];
-    let content: *mut AnyObject = msg_send![window, contentView];
-
+    let target = render_target(250.0);
+    let window_w = 580.0;
+    let (content, window) = if target.host.is_null() {
+        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, 250.0));
+        let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+        let window: *mut AnyObject = msg_send![
+            window,
+            initWithContentRect: window_frame,
+            styleMask: 1u64,
+            backing: 2u64,
+            defer: false
+        ];
+        if window.is_null() {
+            return;
+        }
+        let window_title = make_nsstring(&t("settings.update_window_title"));
+        let _: () = msg_send![window, setTitle: window_title];
+        crate::ffi::CFRelease(window_title as *const c_void);
+        let _: () = msg_send![window, setReleasedWhenClosed: false];
+        (msg_send![window, contentView], window)
+    } else {
+        (target.parent, std::ptr::null_mut())
+    };
     let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let title: *mut AnyObject = msg_send![
         title,
@@ -1008,7 +1338,13 @@ unsafe fn make_custom_choice_window(
     let _: () = msg_send![title, setSelectable: false];
     let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 20.0f64];
     let _: () = msg_send![title, setFont: title_font];
-    let _: () = msg_send![content, addSubview: title];
+    add_control(
+        target,
+        window_w,
+        title,
+        NSRect::new(NSPoint::new(32.0, 178.0), NSSize::new(516.0, 32.0)),
+        content,
+    );
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
@@ -1024,7 +1360,13 @@ unsafe fn make_custom_choice_window(
     let _: () = msg_send![message, setFont: message_font];
     let _: () = msg_send![message, setLineBreakMode: 0u64];
     let _: () = msg_send![message, setMaximumNumberOfLines: 0isize];
-    let _: () = msg_send![content, addSubview: message];
+    add_control(
+        target,
+        window_w,
+        message,
+        NSRect::new(NSPoint::new(32.0, 118.0), NSSize::new(516.0, 44.0)),
+        content,
+    );
 
     let skip: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let skip: *mut AnyObject = msg_send![
@@ -1037,7 +1379,13 @@ unsafe fn make_custom_choice_window(
     let _: () = msg_send![skip, setBezelStyle: 1u64];
     let _: () = msg_send![skip, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![skip, setAction: sel!(skipCustomUpdate:)];
-    let _: () = msg_send![content, addSubview: skip];
+    add_control(
+        target,
+        window_w,
+        skip,
+        NSRect::new(NSPoint::new(32.0, 28.0), NSSize::new(150.0, 36.0)),
+        content,
+    );
 
     let later: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let later: *mut AnyObject = msg_send![
@@ -1050,7 +1398,13 @@ unsafe fn make_custom_choice_window(
     let _: () = msg_send![later, setBezelStyle: 1u64];
     let _: () = msg_send![later, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![later, setAction: sel!(dismissCustomUpdate:)];
-    let _: () = msg_send![content, addSubview: later];
+    add_control(
+        target,
+        window_w,
+        later,
+        NSRect::new(NSPoint::new(194.0, 28.0), NSSize::new(150.0, 36.0)),
+        content,
+    );
 
     let install: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let install: *mut AnyObject = msg_send![
@@ -1063,15 +1417,23 @@ unsafe fn make_custom_choice_window(
     let _: () = msg_send![install, setBezelStyle: 1u64];
     let _: () = msg_send![install, setTarget: driver as *mut AnyObject];
     let _: () = msg_send![install, setAction: sel!(installCustomUpdate:)];
-    let _: () = msg_send![content, addSubview: install];
+    add_control(
+        target,
+        window_w,
+        install,
+        NSRect::new(NSPoint::new(356.0, 28.0), NSSize::new(192.0, 36.0)),
+        content,
+    );
 
     let copied_reply = copy_block(reply) as usize;
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
     ui.window = window as usize;
     ui.update_reply = copied_reply;
 
-    let _: () = msg_send![window, center];
-    let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    if !window.is_null() {
+        let _: () = msg_send![window, center];
+        let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+    }
 }
 
 unsafe fn choose_custom_update(choice: isize) {
@@ -1082,6 +1444,11 @@ unsafe fn choose_custom_update(choice: isize) {
         reply
     };
     close_custom_update_window();
+    // skip(0) / dismiss(2) 会结束更新流程,收起 About 页;install(1) 继续下载,保持展开。
+    // skip(0)/dismiss(2) end the flow and collapse the About page; install(1) continues downloading.
+    if choice != 1 {
+        crate::settings::collapse_update_section();
+    }
     invoke_choice_reply(reply, choice);
     release_block(reply);
 }
@@ -1107,6 +1474,7 @@ extern "C" fn cancel_custom_download(_this: *mut c_void, _cmd: Sel, _sender: *mu
             cancellation
         };
         close_custom_update_window();
+        crate::settings::collapse_update_section();
         invoke_block(cancellation);
         release_block(cancellation);
     }
@@ -1240,7 +1608,14 @@ extern "C" fn show_update_release_notes_failed(_this: *mut c_void, _cmd: Sel, _e
 
 extern "C" fn show_update_in_focus(_this: *mut c_void, _cmd: Sel) {
     unsafe {
-        let window = UPDATE_UI_STATE.lock().unwrap().window;
+        let ui = UPDATE_UI_STATE.lock().unwrap();
+        // 内联时聚焦宿主所属的设置窗口,否则聚焦更新弹窗。
+        // Inline mode focuses the host's settings window; otherwise the update popup.
+        let window = if ui.host_view != 0 {
+            ui.host_window
+        } else {
+            ui.window
+        };
         if window != 0 {
             let window = window as *mut AnyObject;
             let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
@@ -1272,7 +1647,15 @@ extern "C" fn show_user_initiated_update_check(
     _cmd: Sel,
     cancellation: *mut c_void,
 ) {
-    unsafe { make_custom_update_window(this, cancellation) };
+    unsafe {
+        // 内联(About 页)时只把按钮切到「检查中…」并禁用,不弹窗、不加其他信息。
+        // When inline, just switch the button to "Checking…" and disable it; no popup or extras.
+        if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
+            begin_inline_check();
+            return;
+        }
+        make_custom_update_window(this, cancellation)
+    };
 }
 
 extern "C" fn cancel_custom_update_check(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
@@ -1280,6 +1663,8 @@ extern "C" fn cancel_custom_update_check(_this: *mut c_void, _cmd: Sel, _sender:
         let cancellation = UPDATE_UI_STATE.lock().unwrap().cancellation;
         invoke_block(cancellation);
         close_custom_update_window();
+        reset_check_button();
+        crate::settings::collapse_update_section();
     }
 }
 
@@ -1292,6 +1677,7 @@ extern "C" fn acknowledge_custom_update_result(
         let acknowledgement = UPDATE_UI_STATE.lock().unwrap().acknowledgement;
         invoke_block(acknowledgement);
         close_custom_update_window();
+        crate::settings::collapse_update_section();
     }
 }
 
@@ -1303,6 +1689,13 @@ extern "C" fn show_update_found(
     reply: *mut c_void,
 ) {
     unsafe {
+        // 内联(About 页)发现可用更新:结束「检查中」并恢复按钮默认,后续由更新弹窗呈现。
+        // Inline found an update: end the checking phase and restore the button default; the update
+        // popup takes over presentation.
+        if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
+            clear_inline_check();
+            reset_check_button();
+        }
         make_custom_update_found_window(this, item, reply);
     }
 }
@@ -1314,6 +1707,14 @@ extern "C" fn show_update_not_found(
     acknowledgement: *mut c_void,
 ) {
     unsafe {
+        // 内联(About 页)时把按钮切到「已是最新版本」并恢复可用,不弹窗。
+        // When inline, switch the button to "You're up to date" and re-enable it; no popup.
+        if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
+            clear_inline_check();
+            set_check_button_status(&t("settings.btn_up_to_date"), true);
+            crate::settings::collapse_update_section();
+            return;
+        }
         make_custom_result_window(
             this,
             acknowledgement,
@@ -1330,6 +1731,13 @@ extern "C" fn show_updater_error(
     acknowledgement: *mut c_void,
 ) {
     unsafe {
+        // 内联(About 页)时把按钮恢复到默认「检查更新…」并可用,不弹窗。
+        // When inline, restore the button to default and re-enable it; no popup.
+        if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
+            reset_check_button();
+            crate::settings::collapse_update_section();
+            return;
+        }
         make_custom_result_window(
             this,
             acknowledgement,
@@ -1342,6 +1750,7 @@ extern "C" fn show_updater_error(
 extern "C" fn dismiss_update_installation(this: *mut c_void, _cmd: Sel) {
     unsafe {
         close_custom_update_window();
+        crate::settings::collapse_update_section();
         call_super_no_arguments(this, sel!(dismissUpdateInstallation));
     }
 }
@@ -1625,6 +2034,17 @@ pub(crate) fn initialize(automatically_check: bool) -> bool {
             sel!(setAutomaticallyChecksForUpdates:),
             automatically_check,
         );
+        // 应用「自动下载并安装更新」设置。
+        // Apply the "automatically download and install" preference.
+        let automatically_download = crate::config::CONFIG
+            .read()
+            .map(|cfg| cfg.updates.automatically_download)
+            .unwrap_or(false);
+        send_void_bool(
+            updater,
+            sel!(setAutomaticallyDownloadsUpdates:),
+            automatically_download,
+        );
         if !send_bool_ptr(updater, sel!(startUpdater:), std::ptr::null_mut()) {
             log_info!("Sparkle updater failed to start");
             release_obj(updater);
@@ -1636,10 +2056,14 @@ pub(crate) fn initialize(automatically_check: bool) -> bool {
         _framework_handle: framework_handle,
         updater,
     });
+    // Sparkle 实际通过 host bundle 的 SUFeedURL 取 feed；日志读取它,避免打印误导性的常量。
+    // Sparkle reads the feed from the host bundle's SUFeedURL; log that actual value instead of a
+    // misleading constant.
+    let feed_url = unsafe { bundle_feed_url() };
     log_info!(
         "Sparkle updater started with custom progress UI (automatic checks: {}, feed: {})",
         automatically_check,
-        FEED_URL
+        feed_url
     );
     true
 }
@@ -1658,6 +2082,22 @@ pub(crate) fn set_automatic_checks(enabled: bool) {
         );
     }
     log_info!("Sparkle automatic update checks set to {}", enabled);
+}
+
+/// Apply the About-page automatic-download setting to a running Sparkle updater.
+pub(crate) fn set_automatic_downloads(enabled: bool) {
+    let guard = state().lock().unwrap();
+    let Some(current) = guard.as_ref() else {
+        return;
+    };
+    unsafe {
+        send_void_bool(
+            current.updater,
+            sel!(setAutomaticallyDownloadsUpdates:),
+            enabled,
+        );
+    }
+    log_info!("Sparkle automatic update downloads set to {}", enabled);
 }
 
 /// Ask Sparkle to check for updates; the custom user driver presents the update UI.

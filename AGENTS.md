@@ -30,6 +30,8 @@ Choose verification according to the scope of the change:
 
 The app is started through `scripts/dev-restart.sh`, not directly with `cargo run`. After the full gate passes for runtime changes, run the script. It builds the binary, assembles and signs `dist/Oh-My-Tab-Dev.app`, starts it through the user-level launchd wrapper, and verifies that it remains alive. If it reports `restart FAILED`, inspect the newest log under `~/Library/Logs/oh-my-tab/`, diagnose the failure, and repeat the verification and restart.
 
+After every successful restart, `scripts/dev-restart.sh` prints the current timestamp-based `build-version` (the `CFBundleVersion` written into the app bundle). Always report that `build-version` back to the user after a restart so it is clear exactly which build is running.
+
 ## Architecture and invariants
 
 - AppKit UI and dynamically registered Objective-C callbacks belong on the main thread. Global input and device observers run on dedicated threads and marshal events back to the main thread.

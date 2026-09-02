@@ -173,7 +173,12 @@ for _ in 1 2 3 4 5; do
     new_pid="$(launchctl print "$launch_target" 2>/dev/null \
         | awk '$1 == "pid" && $2 == "=" { print $3; exit }')"
     if [ -n "$new_pid" ] && kill -0 "$new_pid" 2>/dev/null; then
+        # 读出本次构建写入的 CFBundleVersion(build-version),便于确认运行的是哪次构建。
+        # Read the CFBundleVersion written by this build so it's clear which build is running.
+        build_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
+            "$dev_app/Contents/Info.plist" 2>/dev/null)"
         echo "restart ok (pid $new_pid)"
+        echo "build-version: ${build_version:-unknown}"
         exit 0
     fi
 done
