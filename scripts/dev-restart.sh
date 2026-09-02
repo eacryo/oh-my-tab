@@ -152,7 +152,7 @@ fi
 # 交给用户级 launchd 托管,脱离当前 Shell/执行器生命周期。
 # Submit to the per-user launchd domain so the process survives the shell/executor lifetime.
 submit_error="$(launchctl submit -l "$launch_label" -o /dev/null -e /dev/null -- \
-    "$repo_dir/scripts/dev-launchd-wrapper.sh" "$launch_label" \
+    /usr/bin/env OH_MY_TAB_LAUNCHD_WRAPPER=1 "$repo_dir/scripts/dev-launchd-wrapper.sh" "$launch_label" \
     /usr/bin/open -n -W "$dev_app" 2>&1)"
 submit_status=$?
 if [ "$submit_status" -ne 0 ] && ! launchctl print "$launch_target" >/dev/null 2>&1; then
