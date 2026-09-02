@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::config::{reload_config, Config, CONFIG};
 use crate::event_monitor::SHORTCUT_IS_CMD;
@@ -154,6 +155,7 @@ struct SettingsUi {
     mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
     clipboard_view: *mut AnyObject,  // NSView: 剪贴板历史页容器 / Clipboard page container
     about_view: *mut AnyObject,      // NSView: 关于页容器 / About page container
+    about_subtitle: *mut AnyObject,  // NSTextField: About 页版本号 / About-page version label
     theme: *mut AnyObject,           // NSPopUpButton: auto / light / dark
     glass_style: *mut AnyObject,     // NSPopUpButton: regular / clear
     glass_tint: *mut AnyObject,      // NSColorWell: 玻璃颜色 / glass tint
@@ -280,6 +282,11 @@ const MAPPING_ACTION_KEYS: [&str; 8] = [
 ];
 unsafe impl Sync for SettingsUi {}
 static SETTINGS_UI: Mutex<Option<SettingsUi>> = Mutex::new(None);
+
+/// About 页头部彩蛋的点击状态;连续点击需在短时间窗口内完成。
+/// Hidden About-header easter-egg click state; consecutive clicks must happen within a short window.
+static ABOUT_HEADER_CLICKS: Mutex<(u8, Option<Instant>)> = Mutex::new((0, None));
+const ABOUT_HEADER_CLICK_WINDOW: Duration = Duration::from_secs(1);
 
 /// 程序同步 color well / color panel 时抑制回调重入。
 /// Suppresses callback re-entry while synchronizing the color well and color panel in code.
@@ -651,6 +658,103 @@ fn external_link_button_class() -> *mut AnyObject {
             ExternalLinkButtonClass(cls)
         })
         .0
+}
+
+struct AboutHeaderClickViewClass(*mut AnyObject);
+unsafe impl Send for AboutHeaderClickViewClass {}
+unsafe impl Sync for AboutHeaderClickViewClass {}
+
+static ABOUT_HEADER_CLICK_VIEW_CLASS: OnceLock<AboutHeaderClickViewClass> = OnceLock::new();
+
+/// 读取当前运行应用 bundle 的 Info.plist 字符串值。
+/// Read a string value from the running app bundle's Info.plist.
+unsafe fn bundle_info_string(key: &str) -> String {
+    let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
+    let key_ns = make_nsstring(key);
+    let value: *mut AnyObject = msg_send![bundle, objectForInfoDictionaryKey: key_ns];
+    CFRelease(key_ns as *const c_void);
+    nsstring_to_rust(value)
+}
+
+fn about_header_click_view_class() -> *mut AnyObject {
+    ABOUT_HEADER_CLICK_VIEW_CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabAboutHeaderClickView").unwrap();
+            let superclass = class!(NSView) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseDown:),
+                about_header_click_view_mouse_down as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            AboutHeaderClickViewClass(cls)
+        })
+        .0
+}
+
+/// 统计 About 头部点击，连续五次后显示 bundle 的 build number。
+/// Count clicks on the About header and reveal the bundle build number after five consecutive clicks.
+pub(crate) extern "C" fn on_about_header_click(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    let now = Instant::now();
+    let revealed = {
+        let mut clicks = ABOUT_HEADER_CLICKS.lock().unwrap();
+        let within_window = clicks
+            .1
+            .is_some_and(|last| now.duration_since(last) <= ABOUT_HEADER_CLICK_WINDOW);
+        clicks.0 = if within_window {
+            clicks.0.saturating_add(1)
+        } else {
+            1
+        };
+        clicks.1 = Some(now);
+        if clicks.0 >= 5 {
+            clicks.0 = 0;
+            clicks.1 = None;
+            true
+        } else {
+            false
+        }
+    };
+
+    if !revealed {
+        return;
+    }
+
+    unsafe {
+        let build_version = bundle_info_string("CFBundleVersion");
+        if build_version.is_empty() {
+            return;
+        }
+        let ui = SETTINGS_UI.lock().unwrap();
+        let Some(ui) = ui.as_ref() else {
+            return;
+        };
+        set_field(
+            ui.about_subtitle,
+            tf(
+                "settings.version_label_with_build",
+                &[
+                    ("version", env!("CARGO_PKG_VERSION")),
+                    ("build", &build_version),
+                ],
+            ),
+        );
+    }
+}
+
+extern "C" fn about_header_click_view_mouse_down(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _event: *mut c_void,
+) {
+    on_about_header_click(std::ptr::null_mut(), sel!(mouseDown:), std::ptr::null_mut());
 }
 
 /// 用一个数值/字符串填进文本框,并释放临时 NSString。
@@ -2371,10 +2475,10 @@ pub(crate) extern "C" fn handle_check_for_updates(
     // the button recovers even if Sparkle never calls back.
     crate::updater::begin_inline_check();
     if !crate::updater::check_for_updates() {
-        // Sparkle 不可用时恢复默认文案并提示,避免按钮卡在「正在检查更新…」。
-        // When Sparkle is unavailable, restore the default label and alert to avoid the button being
+        // Sparkle 不可用时显示「重试检查」并提示,避免按钮卡在「正在检查更新…」。
+        // When Sparkle is unavailable, offer a retry and alert instead of leaving the button
         // stuck on "Checking…".
-        crate::updater::set_check_button_status(&t("settings.btn_check_for_updates"), true);
+        crate::updater::set_check_button_status(&t("settings.btn_retry_update_check"), true);
         show_alert(
             &t("settings.update_unavailable_title"),
             &t("settings.update_unavailable_message"),
@@ -2390,7 +2494,7 @@ pub(crate) fn expand_update_section(window_h: f64) {
     let Some(ui) = ui_guard.as_mut() else {
         return;
     };
-    if ui.update_card.is_null() || ui.update_card_expanded {
+    if ui.update_card.is_null() || ui.update_host.is_null() {
         return;
     }
     unsafe {
@@ -2401,14 +2505,16 @@ pub(crate) fn expand_update_section(window_h: f64) {
         // blank below the buttons.
         let host_frame: NSRect = msg_send![ui.update_host, frame];
         let host_top = host_frame.origin.y + host_frame.size.height;
+        let height_delta = window_h - host_frame.size.height;
         let _: () = msg_send![ui.update_host, setFrame: NSRect::new(NSPoint::new(host_frame.origin.x, host_top - window_h), NSSize::new(host_frame.size.width, window_h))];
         let _: () = msg_send![ui.update_host, setHidden: false];
-        // 卡片与阴影向下撑高 window_h。
-        // Grow the card and its shadow downward by window_h.
+        // 每个 Sparkle 阶段可能需要不同高度;已展开时按差值调整,避免后续控件继续使用旧高度翻转坐标。
+        // Each Sparkle phase may need a different height; resize by the delta so later controls are
+        // flipped against the current host height instead of the previous phase's height.
         let card_frame: NSRect = msg_send![ui.update_card, frame];
         let new_card = NSRect::new(
-            NSPoint::new(card_frame.origin.x, card_frame.origin.y - window_h),
-            NSSize::new(card_frame.size.width, card_frame.size.height + window_h),
+            NSPoint::new(card_frame.origin.x, card_frame.origin.y - height_delta),
+            NSSize::new(card_frame.size.width, card_frame.size.height + height_delta),
         );
         let _: () = msg_send![ui.update_card, setFrame: new_card];
         let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
@@ -2419,6 +2525,9 @@ pub(crate) fn expand_update_section(window_h: f64) {
                 NSSize::new(new_card.size.width + shadow_inset * 2.0, new_card.size.height + shadow_inset * 2.0),
             )
         ];
+        // 更新内容直接替换检查按钮区域,不再把整块内容追加到按钮下方。
+        // The update content replaces the check-button area instead of being appended below it.
+        let _: () = msg_send![ui.update_check_button, setHidden: true];
         ui.update_card_expanded = true;
     }
 }
@@ -2466,6 +2575,7 @@ pub(crate) fn collapse_update_section() {
             )
         ];
         let _: () = msg_send![ui.update_host, setHidden: true];
+        let _: () = msg_send![ui.update_check_button, setHidden: false];
         ui.update_card_expanded = false;
     }
 }
@@ -5215,6 +5325,7 @@ fn create_settings_window() {
             mouse_view: std::ptr::null_mut(),
             clipboard_view: std::ptr::null_mut(),
             about_view: std::ptr::null_mut(),
+            about_subtitle: std::ptr::null_mut(),
             theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             glass_tint: std::ptr::null_mut(),
@@ -6722,6 +6833,21 @@ fn create_settings_window() {
         let _: () = msg_send![about_subtitle, setTextColor: about_subtitle_color];
         let _: () = msg_send![about_view, addSubview: about_subtitle];
         release_obj(about_subtitle);
+        ui.about_subtitle = about_subtitle;
+
+        // Transparent hit area for the five-click build-version easter egg. It is added after
+        // the labels so it receives clicks across the whole header without changing its visuals.
+        // 透明点击区域用于五击显示 build-version 的彩蛋。放在文字之后，覆盖整个头部但不改变外观。
+        let about_header_hit: *mut AnyObject = msg_send![about_header_click_view_class(), alloc];
+        let about_header_hit: *mut AnyObject = msg_send![
+            about_header_hit,
+            initWithFrame: NSRect::new(
+                NSPoint::new(6.0, header_top - 64.0),
+                NSSize::new(content_w - 12.0, 66.0),
+            )
+        ];
+        let _: () = msg_send![about_view, addSubview: about_header_hit];
+        release_obj(about_header_hit);
 
         let mut ay = header_top - 88.0;
         // Keep the App section title close to its card, matching the spacing used by the
@@ -6954,13 +7080,13 @@ fn create_settings_window() {
         // Inline update-flow host container: update status/progress/buttons render here instead of
         // a separate NSWindow. Empty and hidden by default, so the About page stays compact; an
         // active flow expands the card + host via expand_update_section.
-        // 宿主顶边紧贴「检查更新」按钮下方 10pt(update_row_y - described_row_h - 56),内容用顶向下
-        // 坐标向下排布,因此进度/结果紧贴按钮,减少标题上方的空白。初始高度为 0,故 origin.y 即顶边。
-        // The host's TOP sits 10pt below the check button (update_row_y - described_row_h - 56);
-        // content uses top-down coordinates flowing downward, so progress/results sit right below the
-        // button, trimming the blank above the title. With an initial height of 0, origin.y is the top.
+        // 宿主直接占用「检查更新」按钮的 frame(update_row_y - described_row_h - 46),内容用顶向下
+        // 坐标排布,更新状态会替换按钮而不是追加在按钮下方。初始高度为 0,故 origin.y 即顶边。
+        // The host occupies the check-button frame (update_row_y - described_row_h - 46); its
+        // top-down content replaces the button instead of being appended below it. With an initial
+        // height of 0, origin.y is the top.
         let compact_host_h = 0.0;
-        let host_origin_y = update_row_y - described_row_h - 56.0;
+        let host_origin_y = update_row_y - described_row_h - 46.0;
         let update_host: *mut AnyObject = msg_send![class!(NSView), alloc];
         let update_host: *mut AnyObject = msg_send![
             update_host,

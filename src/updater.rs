@@ -85,6 +85,7 @@ static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
 static CHECK_TIMER: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+const INLINE_UPDATE_HEIGHT: f64 = 140.0;
 
 /// The dynamically registered subclass is retained by the Objective-C runtime forever.
 struct CustomDriverClass(*mut AnyObject);
@@ -291,6 +292,79 @@ unsafe fn bundle_feed_url() -> String {
     let value: *mut AnyObject = msg_send![bundle, objectForInfoDictionaryKey: key_ns];
     crate::ffi::CFRelease(key_ns as *const c_void);
     nsstring_to_string(value)
+}
+
+/// 读取当前 bundle 的字符串配置值,用于把实际运行环境写入更新诊断日志。
+/// Read a string value from the current bundle for update diagnostics.
+unsafe fn bundle_info_string(key: &str) -> String {
+    let bundle = send_id(
+        class!(NSBundle) as *const _ as *mut AnyObject,
+        sel!(mainBundle),
+    );
+    let key_ns = make_nsstring(key);
+    let value: *mut AnyObject = msg_send![bundle, objectForInfoDictionaryKey: key_ns];
+    crate::ffi::CFRelease(key_ns as *const c_void);
+    nsstring_to_string(value)
+}
+
+/// 记录 NSError 的关键字段,避免网络失败只能看到一个笼统的「Network Error」。
+/// Record the useful NSError fields so network failures are not reduced to a generic label.
+unsafe fn log_sparkle_error(context: &str, error: *mut c_void) {
+    if error.is_null() {
+        log_info!("Sparkle {}: NSError is nil", context);
+        return;
+    }
+
+    let error = error as *mut AnyObject;
+    let domain: *mut AnyObject = msg_send![error, domain];
+    let code: isize = msg_send![error, code];
+    let localized_description: *mut AnyObject = msg_send![error, localizedDescription];
+    let description: *mut AnyObject = msg_send![error, description];
+    let user_info: *mut AnyObject = msg_send![error, userInfo];
+    let failing_url = if user_info.is_null() {
+        String::new()
+    } else {
+        let key = make_nsstring("NSErrorFailingURLStringKey");
+        let value: *mut AnyObject = msg_send![user_info, objectForKey: key];
+        crate::ffi::CFRelease(key as *const c_void);
+        nsstring_to_string(value)
+    };
+
+    log_info!(
+        "Sparkle {}: NSError domain='{}' code={} localizedDescription='{}' description='{}' failingURL='{}'",
+        context,
+        nsstring_to_string(domain),
+        code,
+        nsstring_to_string(localized_description),
+        nsstring_to_string(description),
+        failing_url
+    );
+}
+
+/// 记录 Sparkle 请求所处的 bundle 与代理环境,但不记录代理地址或潜在凭据。
+/// Record the bundle and proxy environment used by Sparkle without logging proxy URLs or secrets.
+fn log_update_network_context() {
+    let feed_url = unsafe { bundle_feed_url() };
+    let bundle_version = unsafe { bundle_info_string("CFBundleVersion") };
+    let proxy_flags = [
+        ("http", "HTTP_PROXY"),
+        ("https", "HTTPS_PROXY"),
+        ("all", "ALL_PROXY"),
+    ]
+    .into_iter()
+    .filter_map(|(label, variable)| std::env::var_os(variable).map(|_| label))
+    .collect::<Vec<_>>();
+    let proxy_summary = if proxy_flags.is_empty() {
+        "none".to_string()
+    } else {
+        proxy_flags.join(",")
+    };
+    log_info!(
+        "Sparkle update request context: feed={}, bundle-version={}, proxy-env={}",
+        feed_url,
+        bundle_version,
+        proxy_summary
+    );
 }
 
 unsafe fn app_display_name() -> String {
@@ -517,9 +591,9 @@ pub(crate) fn begin_inline_check() {
     }
     set_check_button_status(&t("settings.update_checking"), false);
     *CHECK_TIMER.lock().unwrap() = Some(Instant::now());
-    // 守卫生程:若超时后按钮仍处于禁用(即尚无任何回调恢复),恢复为「已是最新版本」。
+    // 守卫生程:若超时后按钮仍处于禁用(即尚无任何回调恢复),显示「重试检查」而不是误报无更新。
     // Guard thread: if the button is still disabled after the timeout (no callback restored it),
-    // restore it to "You're up to date".
+    // show "Retry Check" instead of incorrectly reporting no update.
     std::thread::spawn(|| {
         std::thread::sleep(CHECK_TIMEOUT);
         let stale = {
@@ -530,7 +604,11 @@ pub(crate) fn begin_inline_check() {
             }
         };
         if stale {
-            set_check_button_status(&t("settings.btn_up_to_date"), true);
+            log_info!(
+                "Sparkle update check timed out after {}s without a completion callback",
+                CHECK_TIMEOUT.as_secs()
+            );
+            set_check_button_status(&t("settings.btn_retry_update_check"), true);
             clear_inline_check();
         }
     });
@@ -938,7 +1016,7 @@ unsafe fn make_custom_update_found_window(
         &[("app", &app), ("version", &version)],
     );
 
-    let target = render_target(140.0);
+    let target = render_target(INLINE_UPDATE_HEIGHT);
     let window_w = 640.0;
     let (content, window) = if target.host.is_null() {
         let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, 140.0));
@@ -1130,10 +1208,13 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     close_custom_update_window();
 
     let app = app_display_name();
-    let target = render_target(238.0);
+    let target = render_target(INLINE_UPDATE_HEIGHT);
     let window_w = 560.0;
     let (content, window) = if target.host.is_null() {
-        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, 238.0));
+        let window_frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(window_w, INLINE_UPDATE_HEIGHT),
+        );
         let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
         let window: *mut AnyObject = msg_send![
             window,
@@ -1157,7 +1238,7 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let title: *mut AnyObject = msg_send![
         title,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 168.0), NSSize::new(496.0, 32.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, 100.0), NSSize::new(496.0, 32.0))
     ];
     set_string_value(title, &t("settings.update_downloading"));
     let _: () = msg_send![title, setBezeled: false];
@@ -1170,14 +1251,14 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
         target,
         window_w,
         title,
-        NSRect::new(NSPoint::new(32.0, 168.0), NSSize::new(496.0, 32.0)),
+        NSRect::new(NSPoint::new(32.0, 100.0), NSSize::new(496.0, 32.0)),
         content,
     );
 
     let progress: *mut AnyObject = msg_send![class!(NSProgressIndicator), alloc];
     let progress: *mut AnyObject = msg_send![
         progress,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 116.0), NSSize::new(496.0, 18.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, 68.0), NSSize::new(496.0, 18.0))
     ];
     let _: () = msg_send![progress, setIndeterminate: false];
     let _: () = msg_send![progress, setMinValue: 0.0f64];
@@ -1187,14 +1268,14 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
         target,
         window_w,
         progress,
-        NSRect::new(NSPoint::new(32.0, 116.0), NSSize::new(496.0, 18.0)),
+        NSRect::new(NSPoint::new(32.0, 68.0), NSSize::new(496.0, 18.0)),
         content,
     );
 
     let status: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let status: *mut AnyObject = msg_send![
         status,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 82.0), NSSize::new(496.0, 24.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, 40.0), NSSize::new(496.0, 24.0))
     ];
     let initial_status = tf(
         "settings.update_download_progress",
@@ -1211,14 +1292,14 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
         target,
         window_w,
         status,
-        NSRect::new(NSPoint::new(32.0, 82.0), NSSize::new(496.0, 24.0)),
+        NSRect::new(NSPoint::new(32.0, 40.0), NSSize::new(496.0, 24.0)),
         content,
     );
 
     let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let cancel: *mut AnyObject = msg_send![
         cancel,
-        initWithFrame: NSRect::new(NSPoint::new(390.0, 28.0), NSSize::new(138.0, 36.0))
+        initWithFrame: NSRect::new(NSPoint::new(390.0, 4.0), NSSize::new(138.0, 30.0))
     ];
     let cancel_title = make_nsstring(&t("settings.btn_cancel"));
     let _: () = msg_send![cancel, setTitle: cancel_title];
@@ -1230,7 +1311,7 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
         target,
         window_w,
         cancel,
-        NSRect::new(NSPoint::new(390.0, 28.0), NSSize::new(138.0, 36.0)),
+        NSRect::new(NSPoint::new(390.0, 4.0), NSSize::new(138.0, 30.0)),
         content,
     );
 
@@ -1303,10 +1384,15 @@ unsafe fn make_custom_choice_window(
     message_text: &str,
 ) {
     close_custom_update_window();
-    let target = render_target(250.0);
-    let window_w = 580.0;
+    let target = render_target(INLINE_UPDATE_HEIGHT);
+    // 与下载阶段共用 560pt 设计宽度,让内联缩放后的内容宽度保持稳定。
+    // Use the same 560pt design width as the download phase so inline content keeps a stable width.
+    let window_w = 560.0;
     let (content, window) = if target.host.is_null() {
-        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, 250.0));
+        let window_frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(window_w, INLINE_UPDATE_HEIGHT),
+        );
         let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
         let window: *mut AnyObject = msg_send![
             window,
@@ -1329,7 +1415,7 @@ unsafe fn make_custom_choice_window(
     let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let title: *mut AnyObject = msg_send![
         title,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 178.0), NSSize::new(516.0, 32.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, 100.0), NSSize::new(496.0, 32.0))
     ];
     set_string_value(title, title_text);
     let _: () = msg_send![title, setBezeled: false];
@@ -1342,14 +1428,14 @@ unsafe fn make_custom_choice_window(
         target,
         window_w,
         title,
-        NSRect::new(NSPoint::new(32.0, 178.0), NSSize::new(516.0, 32.0)),
+        NSRect::new(NSPoint::new(32.0, 100.0), NSSize::new(496.0, 32.0)),
         content,
     );
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
         message,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 118.0), NSSize::new(516.0, 44.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, 54.0), NSSize::new(496.0, 44.0))
     ];
     set_string_value(message, message_text);
     let _: () = msg_send![message, setBezeled: false];
@@ -1364,52 +1450,16 @@ unsafe fn make_custom_choice_window(
         target,
         window_w,
         message,
-        NSRect::new(NSPoint::new(32.0, 118.0), NSSize::new(516.0, 44.0)),
+        NSRect::new(NSPoint::new(32.0, 54.0), NSSize::new(496.0, 44.0)),
         content,
     );
 
-    let skip: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let skip: *mut AnyObject = msg_send![
-        skip,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 28.0), NSSize::new(150.0, 36.0))
-    ];
-    let skip_title = make_nsstring(&t("settings.btn_skip_version"));
-    let _: () = msg_send![skip, setTitle: skip_title];
-    crate::ffi::CFRelease(skip_title as *const c_void);
-    let _: () = msg_send![skip, setBezelStyle: 1u64];
-    let _: () = msg_send![skip, setTarget: driver as *mut AnyObject];
-    let _: () = msg_send![skip, setAction: sel!(skipCustomUpdate:)];
-    add_control(
-        target,
-        window_w,
-        skip,
-        NSRect::new(NSPoint::new(32.0, 28.0), NSSize::new(150.0, 36.0)),
-        content,
-    );
-
-    let later: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let later: *mut AnyObject = msg_send![
-        later,
-        initWithFrame: NSRect::new(NSPoint::new(194.0, 28.0), NSSize::new(150.0, 36.0))
-    ];
-    let later_title = make_nsstring(&t("settings.btn_remind_later"));
-    let _: () = msg_send![later, setTitle: later_title];
-    crate::ffi::CFRelease(later_title as *const c_void);
-    let _: () = msg_send![later, setBezelStyle: 1u64];
-    let _: () = msg_send![later, setTarget: driver as *mut AnyObject];
-    let _: () = msg_send![later, setAction: sel!(dismissCustomUpdate:)];
-    add_control(
-        target,
-        window_w,
-        later,
-        NSRect::new(NSPoint::new(194.0, 28.0), NSSize::new(150.0, 36.0)),
-        content,
-    );
-
+    // 更新已下载完成,此时只保留安装操作;按钮加长并居中。
+    // The update is already downloaded, so keep only the centered, wider install action.
     let install: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let install: *mut AnyObject = msg_send![
         install,
-        initWithFrame: NSRect::new(NSPoint::new(356.0, 28.0), NSSize::new(192.0, 36.0))
+        initWithFrame: NSRect::new(NSPoint::new(130.0, 14.0), NSSize::new(300.0, 36.0))
     ];
     let install_title = make_nsstring(&t("settings.btn_install_update"));
     let _: () = msg_send![install, setTitle: install_title];
@@ -1421,7 +1471,7 @@ unsafe fn make_custom_choice_window(
         target,
         window_w,
         install,
-        NSRect::new(NSPoint::new(356.0, 28.0), NSSize::new(192.0, 36.0)),
+        NSRect::new(NSPoint::new(130.0, 14.0), NSSize::new(300.0, 36.0)),
         content,
     );
 
@@ -1648,6 +1698,8 @@ extern "C" fn show_user_initiated_update_check(
     cancellation: *mut c_void,
 ) {
     unsafe {
+        log_info!("Sparkle update check started");
+        log_update_network_context();
         // 内联(About 页)时只把按钮切到「检查中…」并禁用,不弹窗、不加其他信息。
         // When inline, just switch the button to "Checking…" and disable it; no popup or extras.
         if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
@@ -1707,11 +1759,15 @@ extern "C" fn show_update_not_found(
     acknowledgement: *mut c_void,
 ) {
     unsafe {
+        log_sparkle_error("showUpdateNotFoundWithError", _error);
         // 内联(About 页)时把按钮切到「已是最新版本」并恢复可用,不弹窗。
         // When inline, switch the button to "You're up to date" and re-enable it; no popup.
         if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
             clear_inline_check();
             set_check_button_status(&t("settings.btn_up_to_date"), true);
+            // 内联结果已经展示完毕,必须确认 Sparkle 的 session,否则后续检查会被忽略。
+            // Acknowledge the inline result so Sparkle can finish its session and accept later checks.
+            invoke_block(acknowledgement as usize);
             crate::settings::collapse_update_section();
             return;
         }
@@ -1731,10 +1787,15 @@ extern "C" fn show_updater_error(
     acknowledgement: *mut c_void,
 ) {
     unsafe {
-        // 内联(About 页)时把按钮恢复到默认「检查更新…」并可用,不弹窗。
-        // When inline, restore the button to default and re-enable it; no popup.
+        log_sparkle_error("showUpdaterError", _error);
+        // 内联(About 页)时把按钮切到「重试检查」并可用,不弹窗。
+        // When inline, offer a retry on the button and re-enable it; no popup is shown.
         if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
-            reset_check_button();
+            clear_inline_check();
+            set_check_button_status(&t("settings.btn_retry_update_check"), true);
+            // 内联错误已经展示完毕,必须确认 Sparkle 的 session,否则后续检查会被忽略。
+            // Acknowledge the inline error so Sparkle can finish its session and accept retries.
+            invoke_block(acknowledgement as usize);
             crate::settings::collapse_update_section();
             return;
         }
@@ -2118,6 +2179,7 @@ pub(crate) fn check_for_updates() -> bool {
     let Some(current) = guard.as_ref() else {
         return false;
     };
+    log_info!("Sparkle checkForUpdates selector dispatched");
     unsafe { send_void(current.updater, sel!(checkForUpdates)) };
     true
 }
