@@ -60,10 +60,9 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 
 ## <img height="16" src="docs/icons/image.svg">&nbsp;&nbsp;Screenshots
 
-<p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="Main window"></p>
+<div align="center"><img src="docs/pictures/main_window.png" width="640" alt="Main window"></div>
 
-<p align="center"><a href="https://github.com/eacryo/oh-my-tab/raw/master/docs/videos/settings_page.mp4"><img src="docs/videos/settings_page.gif" width="560" alt="Settings page demo"></a></p>
-<p align="center"><sub>Click the preview to open the original MP4.</sub></p>
+<div align="center"><img src="docs/videos/settings_page.gif" width="560" alt="Settings page demo"></div>
 
 ## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;Clipboard history
 
