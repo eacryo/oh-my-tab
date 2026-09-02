@@ -62,13 +62,7 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 
 <p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="主界面"></p>
 
-<table style="border-collapse: collapse;">
-  <tr>
-    <td style="border: none; padding: 4px;"><img src="docs/pictures/settings.png" style="width: 100%;" alt="设置"></td>
-    <td style="border: none; padding: 4px;"><img src="docs/pictures/mouse.png" style="width: 100%;" alt="鼠标控制"></td>
-    <td style="border: none; padding: 4px;"><img src="docs/pictures/clipboard.png" style="width: 100%;" alt="剪贴板历史"></td>
-  </tr>
-</table>
+<div align="center"><video src="docs/videos/settings_page.mp4" width="560" height="489" style="display: block; max-width: 100%; height: auto; margin: 0 auto;" controls loop muted playsinline></video></div>
 
 ## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;剪贴板历史
 

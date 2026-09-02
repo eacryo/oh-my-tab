@@ -62,13 +62,7 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 
 <p style="text-align: center;"><img src="docs/pictures/main_window.png" width="640" alt="Main window"></p>
 
-<table style="border-collapse: collapse;">
-  <tr>
-    <td style="border: none; padding: 4px;"><img src="docs/pictures/settings.png" style="width: 100%;" alt="Settings"></td>
-    <td style="border: none; padding: 4px;"><img src="docs/pictures/mouse.png" style="width: 100%;" alt="Mouse control"></td>
-    <td style="border: none; padding: 4px;"><img src="docs/pictures/clipboard.png" style="width: 100%;" alt="Clipboard history"></td>
-  </tr>
-</table>
+<div align="center"><video src="docs/videos/settings_page.mp4" width="560" height="489" style="display: block; max-width: 100%; height: auto; margin: 0 auto;" controls loop muted playsinline></video></div>
 
 ## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;Clipboard history
 
