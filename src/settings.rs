@@ -2107,6 +2107,12 @@ unsafe fn add_row_with_label(
     let _: () = msg_send![label, setAutoresizingMask: 12u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
+    // 单行卡片上下各保留约 5pt 内边距,让控件在卡片中垂直居中。
+    // Keep roughly 5pt of vertical inset on both sides of single-row cards so the control is
+    // vertically centered within the card.
+    let mut control_frame: NSRect = msg_send![control, frame];
+    control_frame.origin.y -= 5.0;
+    let _: () = msg_send![control, setFrame: control_frame];
     // 自适应:控件宽度随父视图拉伸、顶部锚定(WidthSizable|MinYMargin = 2|8 = 10)。
     // Adaptive: control stretches its width with the parent, stays top-anchored.
     let _: () = msg_send![control, setAutoresizingMask: 10u64];
@@ -5774,7 +5780,7 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_card_text_size"),
             &t("settings.desc_card_text_size"),
-            make_text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "16"),
+            make_text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "15"),
         );
         y -= 8.0 + described_row_h;
         add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
@@ -5786,7 +5792,7 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_status_bar_text_size"),
             &t("settings.desc_status_bar_text_size"),
-            make_text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "16"),
+            make_text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "15"),
         );
         y -= 8.0 + described_row_h;
         add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);

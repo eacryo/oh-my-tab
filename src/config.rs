@@ -437,7 +437,7 @@ impl Default for Layout {
     fn default() -> Self {
         Layout {
             thumbnails_enabled: true,
-            card_text_size: 16.0,
+            card_text_size: 15.0,
         }
     }
 }
@@ -515,7 +515,7 @@ impl Default for Fonts {
         // not bold); secondary = app name at 10px / regular (CSS omits font-weight =
         // 400 ~= NSFontWeightRegular 0.0).
         Fonts {
-            status_bar_size: 16.0,
+            status_bar_size: 15.0,
             status_bar_weight: 0.23,
             title_size: 12.0,
             title_weight: 0.23,
@@ -1381,10 +1381,10 @@ mod tests {
     }
 
     #[test]
-    fn switcher_text_defaults_to_sixteen_points() {
+    fn switcher_text_defaults_to_fifteen_points() {
         let cfg = Config::default();
-        assert_eq!(cfg.layout.card_text_size, 16.0);
-        assert_eq!(cfg.fonts.status_bar_size, 16.0);
+        assert_eq!(cfg.layout.card_text_size, 15.0);
+        assert_eq!(cfg.fonts.status_bar_size, 15.0);
     }
 
     #[test]
