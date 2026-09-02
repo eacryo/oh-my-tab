@@ -1906,17 +1906,7 @@ unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) {
 
     // 直接使用 PNG，避免 NSApplicationIcon/.icns 在深色背景下产生额外的系统图标边缘。
     // Use the PNG directly so NSApplicationIcon/.icns cannot add a system-rendered edge on dark backgrounds.
-    let png_bytes: &[u8] = include_bytes!("../assets/Icon-512x512.png");
-    let data: *mut AnyObject = msg_send![
-        class!(NSData),
-        dataWithBytes: png_bytes.as_ptr() as *const c_void,
-        length: png_bytes.len()
-    ];
-    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let image: *mut AnyObject = msg_send![image, initWithData: data];
-    if !image.is_null() {
-        let _: *mut AnyObject = msg_send![image, autorelease];
-    }
+    let image = crate::load_embedded_app_icon();
     if !image.is_null() {
         let image_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
         let image_view: *mut AnyObject = msg_send![
@@ -1930,6 +1920,7 @@ unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) {
         let _: () = msg_send![image_view, setImageFrameStyle: 0isize];
         let _: () = msg_send![icon, addSubview: image_view];
         release_obj(image_view);
+        release_obj(image);
     }
     let _: () = msg_send![parent, addSubview: icon];
     release_obj(icon);

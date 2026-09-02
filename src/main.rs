@@ -1725,6 +1725,19 @@ fn create_controller() -> *mut AnyObject {
     }
 }
 
+/// Load the canonical app icon directly from the PNG bundled into the binary.
+/// 从二进制内嵌的 PNG 直接加载应用的统一图标。
+pub(crate) unsafe fn load_embedded_app_icon() -> *mut AnyObject {
+    let png_bytes: &[u8] = include_bytes!("../assets/Icon-512x512.png");
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: png_bytes.as_ptr() as *const c_void,
+        length: png_bytes.len()
+    ];
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    msg_send![image, initWithData: data]
+}
+
 fn init_app() {
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
