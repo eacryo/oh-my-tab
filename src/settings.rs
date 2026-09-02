@@ -176,7 +176,10 @@ struct SettingsUi {
     line_count: *mut AnyObject,       // NSSlider: line count slider
     line_count_label: *mut AnyObject, // NSTextField: line count row 的 label / the row's label
     line_count_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
-    disable_pointer_accel: *mut AnyObject,  // NSSwitch: 禁用指针加速 / disable pointer acceleration
+    line_count_card: *mut AnyObject,        // NSView: 行数卡片 / line-count card
+    line_count_shadow: *mut AnyObject,      // NSView: 行数卡片阴影 / line-count card shadow
+    line_count_compact: bool, // 是否已移除条件行占位 / whether the conditional row is compacted
+    disable_pointer_accel: *mut AnyObject, // NSSwitch: 禁用指针加速 / disable pointer acceleration
     // ---- 按键映射区 / button-mappings section ----
     mapping_scroll: *mut AnyObject, // NSScrollView: 绑定列表滚动容器 / the bindings scroll view
     mapping_doc: *mut AnyObject,    // NSView: 滚动容器里的 document view(行堆叠处)/ document view
@@ -1970,9 +1973,12 @@ fn settings_card_shadow_view_class() -> *mut AnyObject {
 }
 
 /// Add a grouped card behind a section, matching the HTML redesign's light card surface.
-unsafe fn add_settings_card(parent: *mut AnyObject, frame: NSRect) {
+unsafe fn add_settings_card(
+    parent: *mut AnyObject,
+    frame: NSRect,
+) -> (*mut AnyObject, *mut AnyObject) {
     if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
-        return;
+        return (std::ptr::null_mut(), std::ptr::null_mut());
     }
     let card: *mut AnyObject = msg_send![class!(NSView), alloc];
     let card: *mut AnyObject = msg_send![card, initWithFrame: frame];
@@ -2020,6 +2026,7 @@ unsafe fn add_settings_card(parent: *mut AnyObject, frame: NSRect) {
     release_obj(shadow);
 
     release_obj(card);
+    (card, shadow)
 }
 
 /// Draw the HTML `.row + .row` hairline inside a grouped card.
@@ -2670,10 +2677,12 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
 unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
     let state: isize = msg_send![ui.enable_mouse, state];
     let on = state == 1;
-    // 冻结 enable_mouse 以下的所有控件(含设备下拉框)。
-    // Freeze everything below enable_mouse (including the device popup).
+    let device_available = !DEVICE_POPUP_KEYS.lock().unwrap().is_empty();
+    // 无设备时下拉框始终禁用;其余控件仍由总开关控制。
+    // Keep the device popup disabled when no device is connected; the remaining controls follow
+    // the master switch.
+    let _: () = msg_send![ui.device_indicator, setEnabled: on && device_available];
     for &ctrl in &[
-        ui.device_indicator,
         ui.scroll_mode,
         ui.line_count,
         ui.reverse_scroll,
@@ -2695,7 +2704,7 @@ unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
 /// - Default: hidden
 ///
 /// Called by load_settings_values and handle_scroll_mode_changed.
-unsafe fn update_mode_dependent_visibility(ui: &SettingsUi) {
+unsafe fn update_mode_dependent_visibility(ui: &mut SettingsUi) {
     let idx: isize = msg_send![ui.scroll_mode, indexOfSelectedItem];
     let mode = SCROLL_MODE_VALUES
         .get(idx as usize)
@@ -2704,6 +2713,35 @@ unsafe fn update_mode_dependent_visibility(ui: &SettingsUi) {
     // 只有 Line 模式显示行数滑块(Default 不显示)。
     // Only Line mode shows the line-count slider (hidden on Default).
     let show_line = mode == "line";
+    let compact = !show_line;
+    if compact != ui.line_count_compact {
+        // 默认模式移除整行及其布局占位,后续分组向上收拢;切回 Line 模式时恢复原位。
+        // Remove the whole conditional row and its layout slot in Default mode; move later
+        // sections up, then restore their original positions when Line mode returns.
+        let shift = if compact { 62.0 } else { -62.0 };
+        let card_frame: NSRect = msg_send![ui.line_count_card, frame];
+        let subviews: *mut AnyObject = msg_send![ui.mouse_view, subviews];
+        let count: usize = msg_send![subviews, count];
+        for i in 0..count {
+            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
+            if view == ui.line_count
+                || view == ui.line_count_label
+                || view == ui.line_count_value_label
+                || view == ui.line_count_card
+                || view == ui.line_count_shadow
+            {
+                continue;
+            }
+            let mut frame: NSRect = msg_send![view, frame];
+            if frame.origin.y < card_frame.origin.y {
+                frame.origin.y += shift;
+                let _: () = msg_send![view, setFrame: frame];
+            }
+        }
+        let _: () = msg_send![ui.line_count_card, setHidden: compact];
+        let _: () = msg_send![ui.line_count_shadow, setHidden: compact];
+        ui.line_count_compact = compact;
+    }
     let _: () = msg_send![ui.line_count_label, setHidden: !show_line];
     let _: () = msg_send![ui.line_count, setHidden: !show_line];
     // 行数滑块右侧的数值 label 随滑块一起显隐。
@@ -2720,8 +2758,8 @@ pub(crate) extern "C" fn handle_scroll_mode_changed(
     _sender: *mut c_void,
 ) {
     unsafe {
-        let ui = SETTINGS_UI.lock().unwrap();
-        if let Some(u) = ui.as_ref() {
+        let mut ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_mut() {
             // 行数滑块显示当前配置的值(Line 模式的 line_count)。
             // The line-count slider shows the configured value (Line's line_count).
             let shown = {
@@ -2868,7 +2906,15 @@ unsafe fn rebuild_device_popup(ui: &SettingsUi) {
         .unwrap_or(0);
     if !keys.is_empty() {
         let _: () = msg_send![ui.device_indicator, selectItemAtIndex: sel_idx as isize];
+    } else {
+        // 空列表时保留一个明确的不可选提示,避免空白下拉框看起来像加载失败。
+        // Keep one explicit, non-selectable status item when the list is empty so the popup
+        // does not look like a failed or incomplete load.
+        let ns = make_nsstring(&t("settings.no_device_detected"));
+        let _: () = msg_send![ui.device_indicator, addItemWithTitle: ns];
+        CFRelease(ns as *const c_void);
     }
+    let _: () = msg_send![ui.device_indicator, setEnabled: !keys.is_empty()];
 
     *DEVICE_POPUP_KEYS.lock().unwrap() = keys;
 }
@@ -5008,6 +5054,9 @@ fn create_settings_window() {
             line_count: std::ptr::null_mut(),
             line_count_label: std::ptr::null_mut(),
             line_count_value_label: std::ptr::null_mut(),
+            line_count_card: std::ptr::null_mut(),
+            line_count_shadow: std::ptr::null_mut(),
+            line_count_compact: false,
             disable_pointer_accel: std::ptr::null_mut(),
             mapping_scroll: std::ptr::null_mut(),
             mapping_doc: std::ptr::null_mut(),
@@ -5942,13 +5991,15 @@ fn create_settings_window() {
         // Refresh the value label live as the slider is dragged.
         let _: () = msg_send![ui.line_count, setTarget: target];
         let _: () = msg_send![ui.line_count, setAction: sel!(handleLineCountChanged:)];
-        add_settings_card(
+        let (line_count_card, line_count_shadow) = add_settings_card(
             mouse_view,
             NSRect::new(
                 NSPoint::new(6.0, y - 10.0),
                 NSSize::new(content_w - 12.0, described_row_h + 20.0),
             ),
         );
+        ui.line_count_card = line_count_card;
+        ui.line_count_shadow = line_count_shadow;
 
         // --- 滚动 Scrolling ---
         y -= 14.0 + 24.0;
