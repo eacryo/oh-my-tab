@@ -165,6 +165,9 @@ async fn run() -> Result<(), String> {
         &options.build_version,
         "dmg",
     );
+    let latest_dmg_key = env::var("R2_LATEST_DMG_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty());
     // This base is used only for the URLs printed into the release plan. The actual PUT requests
     // below always use R2_ENDPOINT (or the endpoint derived from R2_ACCOUNT_ID) and R2_BUCKET.
     let public_base = env_or("R2_PUBLIC_BASE_URL", "https://download.oh-my-tab.app");
@@ -185,6 +188,13 @@ async fn run() -> Result<(), String> {
         options.dmg.display(),
         public_url(&public_base, &dmg_key)
     );
+    if let Some(key) = latest_dmg_key.as_deref() {
+        println!(
+            "  latest:  {} -> {}",
+            options.dmg.display(),
+            public_url(&public_base, key)
+        );
+    }
 
     if options.dry_run {
         println!("dry run: no files uploaded");
@@ -235,6 +245,18 @@ async fn run() -> Result<(), String> {
         "public, max-age=31536000, immutable",
     )
     .await?;
+    if let Some(key) = latest_dmg_key {
+        // The latest alias is overwritten on every release, so it must not be cached as immutable.
+        upload_file(
+            &client,
+            &bucket,
+            &key,
+            &options.dmg,
+            "application/octet-stream",
+            "no-cache, no-store, must-revalidate",
+        )
+        .await?;
+    }
     upload_file(
         &client,
         &bucket,

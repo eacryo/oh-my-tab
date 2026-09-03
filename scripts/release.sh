@@ -110,6 +110,7 @@ if [ "$PUSH_R2" -eq 1 ]; then
   fi
   # R2 credentials are read only by the isolated publisher from environment variables; they are
   # never passed as command-line arguments or embedded in the app bundle.
+  R2_LATEST_DMG_KEY="${R2_LATEST_DMG_KEY:-Oh-My-Tab.dmg}" \
   cargo run --manifest-path tools/r2-publisher/Cargo.toml --release -- $PUBLISH_ARGS
 elif [ "$DRY_RUN" -eq 1 ]; then
   echo "ℹ️  --dry-run was provided without --push; no R2 action was needed."

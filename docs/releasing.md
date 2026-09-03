@@ -41,7 +41,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 
 第 4 步完成后，`brew install --cask eacryo/tap/oh-my-tab`（或 `brew upgrade --cask`）就能拉到新版本。`brew install --cask` 实际读取的是 tap 仓库里已提交的那份 `Casks/oh-my-tab.rb`；`release.sh` 只是在本地重新生成它，方便拷贝。
 
-`--push` 使用 `tools/r2-publisher`，凭证只从环境变量读取：`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_BUCKET`、`R2_ENDPOINT`（或 `R2_ACCOUNT_ID`）。工具会先上传 ZIP 和 DMG，最后上传刚生成的 appcast；生产默认对象路径是 `releases/` + `appcast.xml`，开发脚本统一放在 `dev_release/`（归档和 `appcast.xml` 都在这里），并使用 `Oh-My-Tab-Dev-...` 归档名前缀；这些值仍可通过环境变量（包括 `R2_RELEASE_PREFIX`、`R2_APPCAST_KEY`、`R2_ARTIFACT_BASENAME`）覆盖。
+`--push` 使用 `tools/r2-publisher`，凭证只从环境变量读取：`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_BUCKET`、`R2_ENDPOINT`（或 `R2_ACCOUNT_ID`）。工具会先上传 ZIP 和 DMG；如果设置了 `R2_LATEST_DMG_KEY`，还会用不可长期缓存的策略覆盖一个最新 DMG 别名，最后上传刚生成的 appcast。生产默认对象路径是 `releases/` + `appcast.xml`，并将根目录 `Oh-My-Tab.dmg` 作为最新 DMG 别名；开发脚本统一放在 `dev_release/`（归档和 `appcast.xml` 都在这里），并使用 `Oh-My-Tab-Dev-...` 归档名前缀；这些值仍可通过环境变量（包括 `R2_RELEASE_PREFIX`、`R2_APPCAST_KEY`、`R2_ARTIFACT_BASENAME`、`R2_LATEST_DMG_KEY`）覆盖。
 
 上传目标与下载地址分离：上传始终使用 `R2_ENDPOINT`（或 `R2_ACCOUNT_ID` 推导出的 S3 endpoint）和 `R2_BUCKET`；`https://download.oh-my-tab.app` 只用于客户端访问 appcast 和归档文件。`R2_PUBLIC_BASE_URL` 只影响发布计划中显示的公开 URL。
 
