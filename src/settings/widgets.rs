@@ -327,15 +327,7 @@ unsafe impl Sync for AboutHeaderClickViewClass {}
 pub(super) static ABOUT_HEADER_CLICK_VIEW_CLASS: OnceLock<AboutHeaderClickViewClass> =
     OnceLock::new();
 
-/// 读取当前运行应用 bundle 的 Info.plist 字符串值。
-/// Read a string value from the running app bundle's Info.plist.
-pub(super) unsafe fn bundle_info_string(key: &str) -> String {
-    let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
-    let key_ns = make_nsstring(key);
-    let value: *mut AnyObject = msg_send![bundle, objectForInfoDictionaryKey: key_ns];
-    CFRelease(key_ns as *const c_void);
-    nsstring_to_rust(value)
-}
+// bundle_info_string 已统一到 ffi.rs / bundle_info_string now lives in ffi.rs
 
 pub(super) fn about_header_click_view_class() -> *mut AnyObject {
     ABOUT_HEADER_CLICK_VIEW_CLASS

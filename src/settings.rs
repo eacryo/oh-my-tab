@@ -402,6 +402,13 @@ pub(crate) extern "C" fn handle_check_for_updates(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
+    start_inline_update_check();
+}
+
+/// 内联检查的公共入口:About 页按钮与更新通知点击共用。
+/// Shared entry of the inline check: used by both the About-page button and the update
+/// notification click.
+fn start_inline_update_check() {
     // 点击即进入内联「检查中」:按钮切到该文案并禁用,并启动超时守卫(若 Sparkle 不回调也能恢复)。
     // Enter the inline checking phase: switch the button and disable it, arming a timeout guard so
     // the button recovers even if Sparkle never calls back.
@@ -416,6 +423,27 @@ pub(crate) extern "C" fn handle_check_for_updates(
             &t("settings.update_unavailable_message"),
         );
     }
+}
+
+/// 更新通知点击落点:打开设置窗口、切到 About 页并发起内联检查。
+/// 设置窗口存在时 host_view 已注册,后续"发现更新"界面会内联渲染进 About 页
+/// (见 updater::render_target),而非独立弹窗。
+/// Landing point of the update-notification click: open the settings window, jump to the
+/// About page, and start an inline check. Once the settings window exists, its host view
+/// is registered, so the "update found" UI renders INLINE in the About page (see
+/// updater::render_target) instead of a standalone window.
+pub(crate) fn open_about_updates() {
+    show_settings();
+    // show_settings 每次打开都复位到通用页,这里再切到 About(tag=4)。
+    // show_settings resets to the General page on every open; switch to About (tag=4) here.
+    select_sidebar(4);
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            scroll_page_to_top(u.about_view);
+        }
+    }
+    start_inline_update_check();
 }
 
 /// 更新流程开始时展开 About 页 Updates 卡片与文档,容纳内联的更新状态/进度/按钮。

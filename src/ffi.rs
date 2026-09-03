@@ -385,6 +385,17 @@ unsafe impl Sync for ObjClassPtr {}
 
 // ========== NSString / 对象生命周期 helper ==========
 
+/// 读取当前运行应用 bundle 的 Info.plist 字符串值(此前 updater 与 settings 各有一份)。
+/// Read a string value from the running app bundle's Info.plist (previously duplicated in
+/// updater and settings).
+pub(crate) unsafe fn bundle_info_string(key: &str) -> String {
+    let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
+    let key_ns = make_nsstring(key);
+    let value: *mut AnyObject = msg_send![bundle, objectForInfoDictionaryKey: key_ns];
+    CFRelease(key_ns as *const c_void);
+    nsstring_to_rust(value)
+}
+
 /// 用 Rust &str 构造一个 NSString(CFStringCreateWithCString 返回 +1,调用方负责 release)。
 /// Build an NSString from a Rust &str (CFStringCreateWithCString returns +1; caller must release).
 pub(crate) fn make_nsstring(s: &str) -> *mut AnyObject {

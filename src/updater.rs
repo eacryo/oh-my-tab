@@ -6,12 +6,12 @@
 //! into `Contents/Frameworks`.
 
 use crate::ffi::{
-    class_addMethod, make_nsstring, objc_allocateClassPair, objc_msgSend, objc_msgSendSuper,
-    objc_registerClassPair, ObjcSuper,
+    bundle_info_string, class_addMethod, make_nsstring, objc_allocateClassPair, objc_msgSend,
+    objc_msgSendSuper, objc_registerClassPair, ObjcSuper,
 };
 use crate::i18n::{t, tf};
 use crate::skylight;
-use crate::{ffi::release_obj, log_info};
+use crate::{ffi::release_obj, log_debug, log_info};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -284,18 +284,7 @@ unsafe fn bundle_feed_url() -> String {
     nsstring_to_string(value)
 }
 
-/// 读取当前 bundle 的字符串配置值,用于把实际运行环境写入更新诊断日志。
-/// Read a string value from the current bundle for update diagnostics.
-unsafe fn bundle_info_string(key: &str) -> String {
-    let bundle = send_id(
-        class!(NSBundle) as *const _ as *mut AnyObject,
-        sel!(mainBundle),
-    );
-    let key_ns = make_nsstring(key);
-    let value: *mut AnyObject = msg_send![bundle, objectForInfoDictionaryKey: key_ns];
-    crate::ffi::CFRelease(key_ns as *const c_void);
-    nsstring_to_string(value)
-}
+// bundle_info_string 已统一到 ffi.rs / bundle_info_string now lives in ffi.rs
 
 /// 记录 NSError 的关键字段,避免网络失败只能看到一个笼统的「Network Error」。
 /// Record the useful NSError fields so network failures are not reduced to a generic label.
@@ -1589,6 +1578,12 @@ extern "C" fn show_installing_update(
     retry_terminating_application: *mut c_void,
 ) {
     unsafe {
+        // 安装从此刻开始:记下当前版本作为"待通知"标记,新实例启动时据此发系统通知
+        // (showUpdateInstalledAndRelaunched 在自动安装流程里不可达,见 update_notice.rs)。
+        // Installation starts: record the current version as the pending marker; the new
+        // instance announces via update_notice at startup (the Sparkle
+        // showUpdateInstalledAndRelaunched callback is unreachable for automatic installs).
+        crate::update_notice::mark_install_started(&bundle_info_string("CFBundleVersion"));
         let app = app_display_name();
         make_custom_download_window(this, std::ptr::null_mut());
         let window_title = tf("settings.update_installing_window_title", &[("app", &app)]);
@@ -1627,6 +1622,15 @@ extern "C" fn show_update_installed(
     acknowledgement: *mut c_void,
 ) {
     unsafe {
+        log_debug!("[update-notice] driver callback showUpdateInstalledAndRelaunched fired (relaunched={})", _relaunched);
+        // Sparkle 在「安装完成并重启」后的新实例里回调本方法;除应用内结果窗口外,
+        // 再发一条系统通知,让菜单栏应用在后台完成更新后也能被用户感知。
+        // Sparkle calls this on the freshly relaunched instance after an install; besides
+        // the in-app result window, post a system notification so a menu-bar app that
+        // updated in the background is still visible to the user.
+        let app = app_display_name();
+        let version = bundle_info_string("CFBundleShortVersionString");
+        crate::update_notice::post_update_installed(&app, &version);
         make_custom_result_window(
             this,
             acknowledgement,
@@ -1727,13 +1731,33 @@ extern "C" fn show_update_found(
     this: *mut c_void,
     _cmd: Sel,
     item: *mut c_void,
-    _state: *mut c_void,
+    state: *mut c_void,
     reply: *mut c_void,
 ) {
     unsafe {
-        // 内联(About 页)发现可用更新:结束「检查中」并恢复按钮默认,后续由更新弹窗呈现。
-        // Inline found an update: end the checking phase and restore the button default; the update
-        // popup takes over presentation.
+        // 后台定时检查发现新版本:不打扰式弹窗,改发系统通知,选择 Later(下次检查再提醒);
+        // 用户点击通知会跳转设置 About 页,发起一次用户级检查并在那里更新。
+        // A scheduled background check that finds an update must not pop a window: post a
+        // system notification instead and reply Later (reminded at the next check). Clicking
+        // the banner opens Settings > About and starts a user-initiated check there.
+        let user_initiated: bool = msg_send![state as *mut AnyObject, userInitiated];
+        let auto_download = crate::config::CONFIG
+            .read()
+            .unwrap()
+            .updates
+            .automatically_download;
+        if !user_initiated && !auto_download {
+            let app = app_display_name();
+            let display_version: *mut AnyObject =
+                msg_send![item as *mut AnyObject, displayVersionString];
+            let display_version = nsstring_to_string(display_version);
+            crate::update_notice::post_update_available(&app, &display_version);
+            invoke_choice_reply(reply as usize, 2); // Later / 稍后提醒
+            return;
+        }
+        // 内联(About 页)发现可用更新:结束「检查中」并恢复按钮默认,后续更新控件仍渲染在 About 页。
+        // Inline found an update: end the checking phase and restore the button default; the
+        // update controls remain rendered in the About page.
         if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
             clear_inline_check();
             reset_check_button();
@@ -2005,6 +2029,29 @@ unsafe fn custom_driver_class() -> *mut AnyObject {
 /// a raw `cargo run` or a dev bundle built before the framework was copied), not that the app
 /// itself failed to start.
 pub(crate) fn initialize(automatically_check: bool) -> bool {
+    // 上次会话若完成了安装,这里发"已更新到 X"的系统通知。
+    // If the previous session completed an update install, announce it here.
+    crate::update_notice::check_pending();
+    // 测试钩子:OH_MY_TAB_TEST_UPDATE_NOTICE=1 时启动即发一条"已更新"通知,
+    // 便于在没有真实 Sparkle 更新的环境里验证通知链路(授权/横幅/i18n 文案)。
+    // Test hook: with OH_MY_TAB_TEST_UPDATE_NOTICE=1, the update notification is posted at
+    // startup so the pipeline (authorization/banner/i18n copy) can be verified without a
+    // real Sparkle update.
+    if let Some(mode) = std::env::var_os("OH_MY_TAB_TEST_UPDATE_NOTICE")
+        .map(|v| v.to_string_lossy().into_owned())
+        .filter(|v| !v.is_empty() && v != "0")
+    {
+        let app = unsafe { app_display_name() };
+        let version = unsafe { bundle_info_string("CFBundleShortVersionString") };
+        // =available:验证「发现新版本」通知(点击横幅会打开更新窗口);其余值:验证安装完成通知。
+        // =available exercises the update-AVAILABLE notice (clicking it opens the update
+        // window); any other value exercises the update-INSTALLED notice.
+        if mode == "available" {
+            crate::update_notice::post_update_available(&app, &version);
+        } else {
+            crate::update_notice::post_update_installed(&app, &version);
+        }
+    }
     let mut guard = state().lock().unwrap();
     if let Some(current) = guard.as_ref() {
         unsafe {

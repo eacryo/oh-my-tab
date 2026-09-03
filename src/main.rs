@@ -18,6 +18,7 @@ mod settings;
 mod skylight;
 mod theme;
 mod thumbnail;
+mod update_notice;
 mod updater;
 mod window_collector;
 mod window_refresh;
