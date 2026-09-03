@@ -3882,155 +3882,69 @@ fn create_settings_window() {
 
         let mut ay = header_top - 88.0;
         // Keep the App section title close to its card, matching the spacing used by the
-        // other settings pages. The About card has two rows, so its content cursor is lower
+        // other settings pages. The About card has three rows, so its content cursor is lower
         // than a normal section header; placing the title at the old cursor left a large void.
-        // 让 App 分组标题贴近下方卡片,与其他设置页保持一致。About 卡片有两行内容,其内容
+        // 让 App 分组标题贴近下方卡片,与其他设置页保持一致。About 卡片有三行内容,其内容
         // 游标比普通区块标题更低;沿用旧游标会在标题和卡片之间留下过大的空白。
         let app_label_y = ay - 35.0;
         ay -= 27.0;
-        let about_row_step = layout.row_gap + row_h;
-        let about_text_h = (row_h - 12.0).max(1.0);
+        let about_row_step = layout.row_gap + described_row_h;
         let website_y = ay - about_row_step;
-        let website_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let website_label: *mut AnyObject = msg_send![
-            website_label,
-            initWithFrame: NSRect::new(
-                NSPoint::new(label_x, website_y),
-                NSSize::new(130.0, about_text_h),
-            )
-        ];
-        set_field(website_label, t("settings.website_label"));
-        let _: () = msg_send![website_label, setBezeled: false];
-        let _: () = msg_send![website_label, setDrawsBackground: false];
-        let _: () = msg_send![website_label, setEditable: false];
-        let website_label_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
-        let _: () = msg_send![website_label, setFont: website_label_font];
-        let _: () = msg_send![about_view, addSubview: website_label];
-        release_obj(website_label);
         // Keep every About row on the same two-column grid: label on the left, value on the right.
         // About 页面所有行统一使用两列网格：左侧标签，右侧值。
-        let website_url_frame = NSRect::new(
-            NSPoint::new(label_x + 145.0, website_y),
-            NSSize::new((content_w - 2.0 * label_x - 145.0).max(1.0), about_text_h),
+        let about_value_x = label_x + 145.0;
+        let about_value_w = (content_w - 2.0 * label_x - 145.0).max(1.0);
+        SettingsRow::plain(
+            about_view,
+            label_x,
+            website_y,
+            label_w,
+            described_row_h,
+            &t("settings.website_label"),
+            SettingsControl::external_link(
+                about_value_x,
+                website_y,
+                about_value_w,
+                row_h,
+                &t("settings.website_url"),
+                0,
+            ),
         );
-        let website_url: *mut AnyObject = msg_send![external_link_button_class(), alloc];
-        let website_url: *mut AnyObject = msg_send![
-            website_url,
-            initWithFrame: website_url_frame
-        ];
-        set_field(website_url, t("settings.website_url"));
-        let _: () = msg_send![website_url, setTag: 0isize];
-        let _: () = msg_send![website_url, setBezeled: false];
-        let _: () = msg_send![website_url, setDrawsBackground: false];
-        let _: () = msg_send![website_url, setEditable: false];
-        let _: () = msg_send![website_url, setSelectable: false];
-        let _: () = msg_send![website_url, setAlignment: 0isize];
-        let website_url_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
-        let _: () = msg_send![website_url, setFont: website_url_font];
-        let website_url_color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
-        let _: () = msg_send![website_url, setTextColor: website_url_color];
-        let website_tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        let website_tracking: *mut AnyObject = msg_send![
-            website_tracking,
-            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), website_url_frame.size),
-            options: 0x01u64 | 0x80u64 | 0x200u64,
-            owner: website_url,
-            userInfo: std::ptr::null::<AnyObject>()
-        ];
-        let _: () = msg_send![website_url, addTrackingArea: website_tracking];
-        release_obj(website_tracking);
-        let _: () = msg_send![about_view, addSubview: website_url];
-        release_obj(website_url);
         let github_y = website_y - about_row_step;
-        SettingsRow::separator(about_view, github_y + row_h + 3.0, content_w);
-        let github_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let github_label: *mut AnyObject = msg_send![
-            github_label,
-            initWithFrame: NSRect::new(
-                NSPoint::new(label_x, github_y),
-                NSSize::new(130.0, about_text_h),
-            )
-        ];
-        set_field(github_label, t("settings.github_label"));
-        let _: () = msg_send![github_label, setBezeled: false];
-        let _: () = msg_send![github_label, setDrawsBackground: false];
-        let _: () = msg_send![github_label, setEditable: false];
-        let github_label_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
-        let _: () = msg_send![github_label, setFont: github_label_font];
-        let _: () = msg_send![about_view, addSubview: github_label];
-        release_obj(github_label);
-        let github_url_frame = NSRect::new(
-            NSPoint::new(label_x + 145.0, github_y),
-            NSSize::new((content_w - 2.0 * label_x - 145.0).max(1.0), about_text_h),
+        SettingsRow::separator(about_view, github_y + described_row_h + 3.0, content_w);
+        SettingsRow::plain(
+            about_view,
+            label_x,
+            github_y,
+            label_w,
+            described_row_h,
+            &t("settings.github_label"),
+            SettingsControl::external_link(
+                about_value_x,
+                github_y,
+                about_value_w,
+                row_h,
+                &t("settings.github_url"),
+                1,
+            ),
         );
-        let github_url: *mut AnyObject = msg_send![external_link_button_class(), alloc];
-        let github_url: *mut AnyObject = msg_send![
-            github_url,
-            initWithFrame: github_url_frame
-        ];
-        set_field(github_url, t("settings.github_url"));
-        let _: () = msg_send![github_url, setTag: 1isize];
-        let _: () = msg_send![github_url, setBezeled: false];
-        let _: () = msg_send![github_url, setDrawsBackground: false];
-        let _: () = msg_send![github_url, setEditable: false];
-        let _: () = msg_send![github_url, setSelectable: false];
-        let _: () = msg_send![github_url, setAlignment: 0isize];
-        let github_url_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
-        let _: () = msg_send![github_url, setFont: github_url_font];
-        let github_url_color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
-        let _: () = msg_send![github_url, setTextColor: github_url_color];
-        let github_tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        let github_tracking: *mut AnyObject = msg_send![
-            github_tracking,
-            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), github_url_frame.size),
-            options: 0x01u64 | 0x80u64 | 0x200u64,
-            owner: github_url,
-            userInfo: std::ptr::null::<AnyObject>()
-        ];
-        let _: () = msg_send![github_url, addTrackingArea: github_tracking];
-        release_obj(github_tracking);
-        let _: () = msg_send![about_view, addSubview: github_url];
-        release_obj(github_url);
         let version_y = github_y - about_row_step;
-        SettingsRow::separator(about_view, version_y + row_h + 3.0, content_w);
-        let version_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let version_label: *mut AnyObject = msg_send![
-            version_label,
-            initWithFrame: NSRect::new(
-                NSPoint::new(label_x, version_y),
-                NSSize::new(130.0, about_text_h),
-            )
-        ];
-        set_field(version_label, t("settings.version_label_short"));
-        let _: () = msg_send![version_label, setBezeled: false];
-        let _: () = msg_send![version_label, setDrawsBackground: false];
-        let _: () = msg_send![version_label, setEditable: false];
-        let version_label_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
-        let _: () = msg_send![version_label, setFont: version_label_font];
-        let _: () = msg_send![about_view, addSubview: version_label];
-        release_obj(version_label);
-        let version_value: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let version_value: *mut AnyObject = msg_send![
-            version_value,
-            initWithFrame: NSRect::new(
-                NSPoint::new(label_x + 145.0, version_y),
-                NSSize::new(120.0, about_text_h),
-            )
-        ];
-        set_field(version_value, env!("CARGO_PKG_VERSION"));
-        let _: () = msg_send![version_value, setBezeled: false];
-        let _: () = msg_send![version_value, setDrawsBackground: false];
-        let _: () = msg_send![version_value, setEditable: false];
-        let version_value_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
-        let _: () = msg_send![version_value, setFont: version_value_font];
-        let version_value_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
-        let _: () = msg_send![version_value, setTextColor: version_value_color];
-        let _: () = msg_send![about_view, addSubview: version_value];
-        release_obj(version_value);
+        SettingsRow::separator(about_view, version_y + described_row_h + 3.0, content_w);
+        SettingsRow::plain(
+            about_view,
+            label_x,
+            version_y,
+            label_w,
+            described_row_h,
+            &t("settings.version_label_short"),
+            SettingsControl::value_label(
+                about_value_x,
+                version_y,
+                120.0,
+                row_h,
+                env!("CARGO_PKG_VERSION"),
+            ),
+        );
         let app_card_bottom = layout.card_bottom(version_y);
         SettingsSection::attach(
             about_view,

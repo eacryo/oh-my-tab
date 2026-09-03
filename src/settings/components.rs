@@ -214,6 +214,23 @@ impl SettingsRow {
         let _: () = objc2::msg_send![child, setFrame: frame];
     }
 
+    /// Center a read-only text control without changing editable field geometry.
+    /// 只对只读文本控件收紧字形 frame；可编辑输入框保留完整控件高度。
+    unsafe fn center_readonly_text_control(child: *mut AnyObject, y: f64, row_h: f64) {
+        if child.is_null() {
+            return;
+        }
+        let is_text_field: bool =
+            objc2::msg_send![child, isKindOfClass: objc2::class!(NSTextField)];
+        if !is_text_field {
+            return;
+        }
+        let editable: bool = objc2::msg_send![child, isEditable];
+        if !editable {
+            Self::center_label(child, y, row_h);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn described(
         parent: *mut AnyObject,
@@ -267,6 +284,7 @@ impl SettingsRow {
         let (label, control) =
             widgets::add_row_with_label(parent, label_x, y, label_w, h, label_text, control);
         Self::center_label(label, y, h);
+        Self::center_readonly_text_control(control, y, h);
         Self::center_control(control, y, h);
         control
     }
@@ -306,6 +324,31 @@ impl SettingsControl {
 
     pub(super) unsafe fn text_input(x: f64, y: f64, w: f64, h: f64, value: &str) -> *mut AnyObject {
         widgets::make_text_input(x, y, w, h, value)
+    }
+
+    /// Build a non-editable value label that can be placed in a `SettingsRow`.
+    /// 构造可放入 `SettingsRow` 的只读值文本。
+    pub(super) unsafe fn value_label(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        value: &str,
+    ) -> *mut AnyObject {
+        widgets::make_value_label(x, y, w, h, value)
+    }
+
+    /// Build an external-link value control with the shared link hover/cursor behavior.
+    /// 构造复用统一链接悬停/光标行为的外部链接值控件。
+    pub(super) unsafe fn external_link(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        title: &str,
+        tag: isize,
+    ) -> *mut AnyObject {
+        widgets::make_external_link(x, y, w, h, title, tag)
     }
 
     #[allow(clippy::too_many_arguments)]

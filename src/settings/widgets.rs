@@ -328,6 +328,76 @@ pub(super) fn external_link_button_class() -> *mut AnyObject {
         .0
 }
 
+/// Build a read-only value label for a standard settings row.
+/// 构造可放入标准设置行的只读值文本。
+pub(super) unsafe fn make_value_label(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    value: &str,
+) -> *mut AnyObject {
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![
+        label,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    ];
+    set_field(label, value);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setUsesSingleLineMode: true];
+    let _: () = msg_send![label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+    let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let _: () = msg_send![label, setFont: font];
+    let color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+    let _: () = msg_send![label, setTextColor: color];
+    label
+}
+
+/// Build a read-only external-link control for a standard settings row.
+/// 构造可放入标准设置行的只读外部链接控件。
+pub(super) unsafe fn make_external_link(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    title: &str,
+    tag: isize,
+) -> *mut AnyObject {
+    let link: *mut AnyObject = msg_send![external_link_button_class(), alloc];
+    let link: *mut AnyObject = msg_send![
+        link,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    ];
+    set_field(link, title);
+    let _: () = msg_send![link, setTag: tag];
+    let _: () = msg_send![link, setBezeled: false];
+    let _: () = msg_send![link, setDrawsBackground: false];
+    let _: () = msg_send![link, setEditable: false];
+    let _: () = msg_send![link, setSelectable: false];
+    let _: () = msg_send![link, setAlignment: -1isize]; // NSTextAlignmentNatural
+    let _: () = msg_send![link, setUsesSingleLineMode: true];
+    let _: () = msg_send![link, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let _: () = msg_send![link, setFont: font];
+    let color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
+    let _: () = msg_send![link, setTextColor: color];
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
+        options: 0x01u64 | 0x80u64 | 0x200u64,
+        owner: link,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![link, addTrackingArea: tracking];
+    release_obj(tracking);
+    link
+}
+
 pub(super) struct AboutHeaderClickViewClass(*mut AnyObject);
 unsafe impl Send for AboutHeaderClickViewClass {}
 unsafe impl Sync for AboutHeaderClickViewClass {}
