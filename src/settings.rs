@@ -305,6 +305,10 @@ const MAPPING_ACTION_SYMBOLS: [&str; 8] = [
 ];
 unsafe impl Sync for SettingsUi {}
 static SETTINGS_UI: Mutex<Option<SettingsUi>> = Mutex::new(None);
+/// A visible settings window cannot be rebuilt during an appearance notification without
+/// discarding unsaved edits; rebuild it immediately after the user closes it instead.
+/// 设置窗口可见时不能在外观通知中直接重建(否则会丢未保存编辑),关闭后再立即重建。
+static SYSTEM_APPEARANCE_REBUILD_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// About 页头部彩蛋的点击状态;连续点击需在短时间窗口内完成。
 /// Hidden About-header easter-egg click state; consecutive clicks must happen within a short window.
@@ -1568,9 +1572,56 @@ fn hide_settings() {
         }
     }
     clear_glass_preview();
+    if SYSTEM_APPEARANCE_REBUILD_PENDING.swap(false, Ordering::SeqCst) {
+        invalidate_settings_window();
+    }
     // 切回 .accessory:设置窗口关闭,回到纯菜单栏(无 Dock 图标)。
     // Switch back to .accessory: the settings window is closed, return to pure menu-bar (no Dock icon).
     crate::set_settings_activation_policy(false);
+}
+
+/// Re-apply the effective system appearance while preserving an in-progress settings edit.
+///
+/// Custom settings layers are painted with concrete palette colors at construction time. When
+/// the window is visible, snapshot the form and current page, rebuild the window, then restore
+/// both; this avoids the mixed light/dark state caused by updating only NSWindow.appearance.
+///
+/// 重新应用系统外观并保留进行中的设置编辑。设置页自绘图层在创建时写入具体调色板颜色,
+/// 所以窗口可见时先保存表单和当前页、重建窗口再恢复,避免只更新 NSWindow appearance 导致
+/// 明暗混杂。窗口隐藏时直接作废缓存,下次打开按新调色板重建。
+pub(crate) fn refresh_system_appearance() {
+    let (window, visible) = SETTINGS_UI
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|ui| unsafe {
+            let visible: bool = msg_send![ui.window, isVisible];
+            (ui.window, visible)
+        })
+        .unwrap_or((std::ptr::null_mut(), false));
+
+    if window.is_null() || !visible {
+        invalidate_settings_window();
+        return;
+    }
+
+    let (snapshot, page, frame) = {
+        let (cfg, _) = collect_settings_config();
+        let page = SIDEBAR_SELECTED.load(Ordering::SeqCst);
+        let frame: NSRect = unsafe { msg_send![window, frame] };
+        (cfg, page, frame)
+    };
+
+    invalidate_settings_window();
+    show_settings();
+    load_settings_from(&snapshot);
+    select_sidebar(page);
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(ui) = ui.as_ref() {
+            let _: () = msg_send![ui.window, setFrame: frame, display: true];
+        }
+    }
 }
 
 /// Run every settings page through the real AppKit layout path and debug validator, then exit.
@@ -4195,6 +4246,7 @@ fn create_settings_window() {
 /// Invalidate the cached settings window (release + set None) so it is rebuilt with the
 /// current locale on next open. 用于 locale 变更后让设置窗口标签换语言。
 pub(crate) fn invalidate_settings_window() {
+    SYSTEM_APPEARANCE_REBUILD_PENDING.store(false, Ordering::SeqCst);
     let ui = SETTINGS_UI.lock().unwrap().take();
     if let Some(u) = ui {
         unsafe {

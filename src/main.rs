@@ -435,6 +435,37 @@ extern "C" fn on_locale_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void
     clipboard::refresh_localized_ui();
 }
 
+/// 系统有效外观变化回调。仅在主题配置为 auto 时跟随系统,并把刷新切回主线程。
+/// Callback for effective-appearance changes. Follow the system only when theme is `auto`,
+/// and marshal all AppKit/UI work back to the main thread.
+extern "C" fn on_appearance_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    unsafe {
+        let is_main: bool = msg_send![class!(NSThread), isMainThread];
+        if !is_main {
+            let _: () = msg_send![_self as *mut AnyObject,
+                performSelectorOnMainThread: sel!(handleAppearanceChanged:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+            return;
+        }
+    }
+
+    let follows_system = CONFIG
+        .read()
+        .map(|config| config.appearance.theme.eq_ignore_ascii_case("auto"))
+        .unwrap_or(true);
+    if !follows_system {
+        return;
+    }
+
+    // Each subsystem owns custom layer colors, so update the native window appearance and
+    // rebuild any visible content through its existing theme refresh path.
+    settings::refresh_system_appearance();
+    unsafe { clipboard::apply_theme() };
+    overlay::apply_theme();
+}
+
 /// 鼠标插拔回调(在鼠标线程执行)经 performSelectorOnMainThread 转到主线程后的重入点:
 /// 设置窗口开着时即时刷新设备下拉框(重连后立即显示,无需点确定/重开)。
 /// Re-entry point after the mouse-thread plug/unplug callback hops to the main thread via
@@ -904,6 +935,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleLocaleChanged:),
             on_locale_changed as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleAppearanceChanged:),
+            on_appearance_changed as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -1653,6 +1690,35 @@ fn main() {
             object: std::ptr::null::<AnyObject>(),
         ];
         CFRelease(locale_name as *const c_void);
+
+        // 监听系统有效外观变化,使 theme=auto 的窗口无需重启即可跟随明暗模式。
+        // Observe effective appearance changes so theme=auto follows light/dark mode without
+        // requiring a restart.
+        let appearance_name =
+            make_nsstring("NSApplicationDidChangeEffectiveAppearanceNotification");
+        let _: () = msg_send![default_nc,
+            addObserver: controller,
+            selector: sel!(handleAppearanceChanged:),
+            name: appearance_name,
+            object: std::ptr::null::<AnyObject>(),
+        ];
+        CFRelease(appearance_name as *const c_void);
+
+        // 窗口显式设置 Aqua/DarkAqua 后,应用自身的 effectiveAppearance 可能不会变化;
+        // macOS 会通过分布式通知广播系统级主题切换,因此同时监听该通知。
+        // Once a window explicitly sets Aqua/DarkAqua, the app's effectiveAppearance may stay
+        // unchanged. macOS broadcasts the system-level theme switch through the distributed
+        // notification center, so observe that notification as well.
+        let distributed_nc: *mut AnyObject =
+            msg_send![class!(NSDistributedNotificationCenter), defaultCenter];
+        let distributed_theme_name = make_nsstring("AppleInterfaceThemeChangedNotification");
+        let _: () = msg_send![distributed_nc,
+            addObserver: controller,
+            selector: sel!(handleAppearanceChanged:),
+            name: distributed_theme_name,
+            object: std::ptr::null::<AnyObject>(),
+        ];
+        CFRelease(distributed_theme_name as *const c_void);
     }
 
     // 7. Start event monitor + bridge thread

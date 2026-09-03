@@ -2847,10 +2847,23 @@ pub(crate) unsafe fn apply_glass_properties() {
 }
 
 pub(crate) fn apply_theme() {
+    // Rebuild visible cards as well as updating the window material. Card labels and preview
+    // layers use concrete colors chosen at creation time, so changing only NSAppearance leaves
+    // existing cards with the previous palette until the overlay is summoned again.
+    // 主题变化除了更新窗口材质,还要重建当前可见卡片。卡片文字和预览图层在创建时写入具体颜色,
+    // 只设置 NSAppearance 会让已存在的卡片继续使用旧调色板,直到下次重新召唤。
+    let visible_indices = TAB_STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|state| state.visible)
+        .map(|state| (0..state.windows.len()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
     unsafe {
-        // 主题来源只有 config(界面上的切换入口已移除;手动改 config 仍生效)。
-        // The theme now comes from config only (the UI toggle is gone; manual config
-        // edits still apply).
+        // 主题来源于 config 的解析结果;显式主题由设置页保存,auto 主题由系统外观通知触发刷新。
+        // The theme comes from the resolved config; explicit themes are saved by Settings, while
+        // auto themes are refreshed from the system appearance notification.
         let is_dark = crate::theme::resolved_is_dark();
 
         // Update window appearance for blur material tint
@@ -2869,8 +2882,14 @@ pub(crate) fn apply_theme() {
         }
 
         apply_glass_properties();
-        refresh_highlight();
     }
+
+    if visible_indices.is_empty() {
+        refresh_highlight();
+    } else {
+        rebuild_cards(&visible_indices);
+    }
+    update_status_label();
 }
 
 /// 把图标烘焙成灰度版:在原图上以 NSCompositeSourceAtop 叠浅灰,灰只落在图标的 alpha
