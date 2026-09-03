@@ -6,7 +6,7 @@
 //! snapshot collector remains authoritative for window data.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,14 +14,13 @@ use std::time::{Duration, Instant};
 use objc2::runtime::AnyObject;
 use objc2::{msg_send, sel};
 
+use crate::skylight;
 use crate::{log_debug, log_info, CONTROLLER};
 
-const RTLD_NOW: i32 = 2;
 const WINDOW_CREATED: u32 = 811;
 const WINDOW_DESTROYED: u32 = 804;
 const WINDOW_FOCUSED: u32 = 808;
 
-type MainConnectionFn = unsafe extern "C" fn() -> i32;
 type NotifyCallback = unsafe extern "C" fn(
     event: u32,
     data: *const c_void,
@@ -98,25 +97,19 @@ fn registry_from_subscriptions(subscriptions: &[(u32, i32)]) -> WindowRegistry {
     registry
 }
 
-static MAIN_CONNECTION: LazyLock<Option<i32>> = LazyLock::new(|| unsafe {
-    let handle = dlopen_path("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight");
-    if handle.is_null() {
-        return None;
-    }
-    let symbol = b"CGSMainConnectionID\0";
-    let pointer = dlsym(handle, symbol.as_ptr() as *const c_char);
-    if pointer.is_null() {
-        return None;
-    }
-    let function: MainConnectionFn = std::mem::transmute(pointer);
-    Some(function())
+// 连接 ID 由 skylight.rs 统一加载并缓存;本模块按接口签名需要 i32。
+// The connection ID is loaded and cached centrally in skylight.rs; this module's
+// interface signatures want it as i32.
+static MAIN_CONNECTION: LazyLock<Option<i32>> =
+    LazyLock::new(|| skylight::cgs_main_connection().map(|c| c as i32));
+
+static REGISTER_NOTIFY: LazyLock<Option<RegisterNotifyFn>> = LazyLock::new(|| unsafe {
+    skylight::load_private_symbol(skylight::SKYLIGHT_PATH, "SLSRegisterConnectionNotifyProc")
 });
 
-static REGISTER_NOTIFY: LazyLock<Option<RegisterNotifyFn>> =
-    LazyLock::new(|| unsafe { load_symbol("SLSRegisterConnectionNotifyProc") });
-
-static REQUEST_NOTIFICATIONS: LazyLock<Option<RequestNotificationsFn>> =
-    LazyLock::new(|| unsafe { load_symbol("SLSRequestNotificationsForWindows") });
+static REQUEST_NOTIFICATIONS: LazyLock<Option<RequestNotificationsFn>> = LazyLock::new(|| unsafe {
+    skylight::load_private_symbol(skylight::SKYLIGHT_PATH, "SLSRequestNotificationsForWindows")
+});
 
 unsafe extern "C" fn window_server_callback(
     event: u32,
@@ -144,25 +137,6 @@ unsafe fn read_window_id(data: *const c_void, data_length: usize) -> Option<u32>
         return None;
     }
     Some(std::ptr::read_unaligned(data.cast::<u32>()))
-}
-
-unsafe fn dlopen_path(path: &str) -> *mut c_void {
-    let path = CString::new(path).unwrap();
-    dlopen(path.as_ptr(), RTLD_NOW)
-}
-
-unsafe fn load_symbol<T>(name: &str) -> Option<T> {
-    let handle = dlopen_path("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight");
-    if handle.is_null() {
-        return None;
-    }
-    let name = CString::new(name).unwrap();
-    let pointer = dlsym(handle, name.as_ptr());
-    if pointer.is_null() {
-        None
-    } else {
-        Some(std::mem::transmute_copy(&pointer))
-    }
 }
 
 pub(crate) fn start() {
@@ -470,10 +444,4 @@ fn schedule_main_delivery() {
             waitUntilDone: false
         ];
     }
-}
-
-#[link(name = "System", kind = "dylib")]
-unsafe extern "C" {
-    fn dlopen(filename: *const c_char, mode: i32) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
