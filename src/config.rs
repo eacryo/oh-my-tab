@@ -641,7 +641,7 @@ impl Config {
 
         // --- layout ---
         if !self.layout.card_text_size.is_finite()
-            || !(8.0..=24.0).contains(&self.layout.card_text_size)
+            || !(13.0..=20.0).contains(&self.layout.card_text_size)
         {
             errs.push(tf(
                 "errors.layout_card_text_size_invalid",
@@ -650,7 +650,9 @@ impl Config {
         }
 
         // --- fonts ---
-        if !self.fonts.status_bar_size.is_finite() || self.fonts.status_bar_size < 8.0 {
+        if !self.fonts.status_bar_size.is_finite()
+            || !(13.0..=20.0).contains(&self.fonts.status_bar_size)
+        {
             errs.push(tf(
                 "errors.fonts_size_invalid",
                 &[
@@ -1378,11 +1380,22 @@ mod tests {
     #[test]
     fn validate_rejects_card_text_size_outside_range() {
         let mut cfg = Config::default();
-        cfg.layout.card_text_size = 7.9;
+        cfg.layout.card_text_size = 12.9;
         assert_err_count(&cfg, 1);
-        cfg.layout.card_text_size = 24.1;
+        cfg.layout.card_text_size = 20.1;
         assert_err_count(&cfg, 1);
-        cfg.layout.card_text_size = 12.0;
+        cfg.layout.card_text_size = 13.0;
+        assert_err_count(&cfg, 0);
+    }
+
+    #[test]
+    fn validate_rejects_status_bar_text_size_outside_range() {
+        let mut cfg = Config::default();
+        cfg.fonts.status_bar_size = 12.9;
+        assert_err_count(&cfg, 1);
+        cfg.fonts.status_bar_size = 20.1;
+        assert_err_count(&cfg, 1);
+        cfg.fonts.status_bar_size = 13.0;
         assert_err_count(&cfg, 0);
     }
 

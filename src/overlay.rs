@@ -2046,8 +2046,8 @@ pub(crate) fn update_status_label() {
         let colors = current_colors();
         let footer_h = status_h();
         let status_font: *mut AnyObject = {
-            let cfg = CONFIG.read().unwrap();
-            msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
+            let status_bar_weight = CONFIG.read().unwrap().fonts.status_bar_weight;
+            msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(), weight: status_bar_weight]
         };
         let status_color = hex_to_ns_color(colors.status_bar_text);
         let ns_stat = make_nsstring(&status_text);

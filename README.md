@@ -200,10 +200,10 @@ corner_radius = 32.0
 
 [layout]
 thumbnails_enabled = true  # window thumbnails on cards; off = icon-only cards
-card_text_size = 15.0      # card text size in points; thumbnail's left icon scales with it (8..=24)
+card_text_size = 15.0      # card text size in points; thumbnail's left icon scales with it (13..=20)
 
 [fonts]
-status_bar_size = 15.0     # footer title text size in points; footer height follows it (8+)
+status_bar_size = 15.0     # footer title text size in points; footer height follows it (13..=20)
 
 [keyboard]
 modifier = "command"     # "option" (Option+Tab) | "command" (Cmd+Tab)

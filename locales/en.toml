@@ -86,9 +86,9 @@ row_window_display_mode = "Window display mode"
 window_display_mode_icons = "Show icons"
 window_display_mode_icons_thumbnails = "Show icons and thumbnails"
 row_card_text_size = "Card text size"
-desc_card_text_size = "Scales the window title and app name; thumbnail mode also scales the icon on their left. Range: 8–24 pt."
+desc_card_text_size = "Scales the window title and app name; thumbnail mode also scales the icon on their left. Range: 13–20 pt."
 row_status_bar_text_size = "Footer text size"
-desc_status_bar_text_size = "Adjusts the selected window title in the bottom footer; the footer height follows the text size. Minimum: 8 pt."
+desc_status_bar_text_size = "Adjusts the selected window title in the bottom footer; the footer height follows the text size. Range: 13–20 pt."
 show_minimized_hide = "Hide"
 show_minimized_show = "Show"
 row_overlay_position = "Overlay Position"
@@ -237,8 +237,8 @@ appearance_glass_style_invalid = 'appearance.glass_style: "{value}" is not one o
 appearance_glass_tint_invalid = 'appearance.glass_tint: "{value}" must be 8 hex digits (RRGGBBAA)'
 appearance_corner_radius_invalid = "appearance.corner_radius: {value} must be >= 0"
 colors_not_hex8 = "{field}: must be 8 hex digits"
-fonts_size_invalid = "{field}: {value} must be >= 8"
-layout_card_text_size_invalid = "layout.card_text_size: {value} must be within 8..=24"
+fonts_size_invalid = "{field}: {value} must be within 13..=20"
+layout_card_text_size_invalid = "layout.card_text_size: {value} must be within 13..=20"
 fonts_weight_invalid = "{field}: {value} must be 0.0..=1.0"
 keyboard_modifier_invalid = 'keyboard.modifier: "{value}" is not one of option, command'
 i18n_locale_invalid = 'i18n.locale: "{value}" is not one of auto, en, zh-Hans, zh-Hant'

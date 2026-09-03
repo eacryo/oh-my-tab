@@ -32,8 +32,8 @@ pub(crate) const ICON_CARD_H: f64 = 180.0;
 pub(crate) const ICON_CARD_GAP: f64 = 0.0;
 pub(crate) const ICON_SIZE: f64 = 110.0;
 pub(crate) const CARD_TEXT_BASE_SIZE: f64 = 12.0;
-pub(crate) const CARD_TEXT_SIZE_MIN: f64 = 8.0;
-pub(crate) const CARD_TEXT_SIZE_MAX: f64 = 24.0;
+pub(crate) const CARD_TEXT_SIZE_MIN: f64 = 13.0;
+pub(crate) const CARD_TEXT_SIZE_MAX: f64 = 20.0;
 const STATUS_BAR_TEXT_BASE_SIZE: f64 = 13.0;
 
 // ========== 配色 / colors ==========
@@ -251,7 +251,7 @@ pub(crate) fn card_app_name_font_size() -> f64 {
 pub(crate) fn status_bar_text_size() -> f64 {
     let size = CONFIG.read().unwrap().fonts.status_bar_size;
     if size.is_finite() {
-        size.max(8.0)
+        size.clamp(13.0, 20.0)
     } else {
         STATUS_BAR_TEXT_BASE_SIZE
     }
@@ -264,7 +264,7 @@ pub(crate) fn status_h() -> f64 {
 
 pub(crate) fn status_bar_height_for_text_size(size: f64) -> f64 {
     let size = if size.is_finite() {
-        size.max(8.0)
+        size.clamp(13.0, 20.0)
     } else {
         STATUS_BAR_TEXT_BASE_SIZE
     };
@@ -1197,10 +1197,17 @@ mod tests {
     #[test]
     fn status_bar_height_tracks_text_size() {
         assert_eq!(status_bar_height_for_text_size(13.0), STATUS_H);
-        assert_eq!(status_bar_height_for_text_size(26.0), STATUS_H * 2.0);
+        assert_eq!(
+            status_bar_height_for_text_size(20.0),
+            STATUS_H * 20.0 / STATUS_BAR_TEXT_BASE_SIZE
+        );
+        assert_eq!(
+            status_bar_height_for_text_size(26.0),
+            status_bar_height_for_text_size(20.0)
+        );
         assert_eq!(
             status_bar_height_for_text_size(4.0),
-            STATUS_H * 8.0 / STATUS_BAR_TEXT_BASE_SIZE
+            STATUS_H * 13.0 / STATUS_BAR_TEXT_BASE_SIZE
         );
         assert_eq!(status_bar_height_for_text_size(f64::NAN), STATUS_H);
     }

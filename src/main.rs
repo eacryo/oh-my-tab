@@ -801,8 +801,8 @@ fn create_overlay_window() -> *mut AnyObject {
 
         // --- Status label at bottom (standard coords: y=0 is bottom) ---
         let status_font: *mut AnyObject = {
-            let cfg = CONFIG.read().unwrap();
-            msg_send![class!(NSFont), systemFontOfSize: cfg.fonts.status_bar_size, weight: cfg.fonts.status_bar_weight]
+            let status_bar_weight = CONFIG.read().unwrap().fonts.status_bar_weight;
+            msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(), weight: status_bar_weight]
         };
         let status_color = hex_to_ns_color(0x999999ff);
         let status_label = make_centered_label("", status_font, status_color, 0.0, w, footer_h);
@@ -1210,6 +1210,18 @@ fn setup_status_bar() {
                 cls,
                 sel!(handleLineCountChanged:),
                 handle_line_count_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleCardTextSizeChanged:),
+                handle_card_text_size_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleStatusBarTextSizeChanged:),
+                handle_status_bar_text_size_changed as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(

@@ -37,6 +37,10 @@ const LOCALE_LABELS: [&str; 4] = ["Auto", "English", "简体中文", "繁體中�
 const SCROLL_MODE_LABELS: [&str; 2] = ["Default", "Line"];
 const SCROLL_MODE_VALUES: [&str; 2] = ["default", "line"];
 const LOCALE_VALUES: [&str; 4] = ["auto", "en", "zh-Hans", "zh-Hant"];
+const TEXT_SIZE_MIN: i64 = 13;
+const TEXT_SIZE_MAX: i64 = 20;
+const TEXT_SIZE_DEFAULT: i64 = 15;
+const TEXT_SIZE_VALUE_W: f64 = 40.0;
 
 // ========== 按键映射录制状态 / button-mapping recording state ==========
 
@@ -166,8 +170,10 @@ struct SettingsUi {
     locale: *mut AnyObject,          // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject,  // NSSwitch: 显示最小化窗口 / show minimized windows
     thumbnails_enabled: *mut AnyObject, // NSPopUpButton: 窗口显示模式 / window display mode
-    card_text_size: *mut AnyObject,  // NSTextField: 卡片文字大小 / card text size
-    status_bar_text_size: *mut AnyObject, // NSTextField: 底部标题栏文字大小 / footer text size
+    card_text_size: *mut AnyObject,  // NSSlider: 卡片文字大小 / card text size
+    card_text_size_value_label: *mut AnyObject, // NSTextField: 卡片字号值 / card text-size value
+    status_bar_text_size: *mut AnyObject, // NSSlider: 底部标题栏文字大小 / footer text size
+    status_bar_text_size_value_label: *mut AnyObject, // NSTextField: 底部字号值 / footer text-size value
     windows_enabled: *mut AnyObject, // NSSwitch: 窗口切换总开关 / app-switcher master switch
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
     log_level: *mut AnyObject,        // NSPopUpButton: trace / debug / info / warn / error
@@ -342,6 +348,37 @@ fn parse_f64(s: &str) -> Result<f64, ()> {
 }
 fn parse_usize(s: &str) -> Result<usize, ()> {
     s.trim().parse::<usize>().map_err(|_| ())
+}
+
+fn text_size_slider_value(value: f64) -> i64 {
+    if value.is_finite() {
+        (value.round() as i64).clamp(TEXT_SIZE_MIN, TEXT_SIZE_MAX)
+    } else {
+        TEXT_SIZE_DEFAULT
+    }
+}
+
+unsafe fn make_text_size_value_label(
+    parent: *mut AnyObject,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    value: i64,
+) -> *mut AnyObject {
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![
+        label,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    ];
+    set_field(label, format!("{value} pt"));
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight
+    let _: () = msg_send![parent, addSubview: label];
+    release_obj(label);
+    label
 }
 
 // ========== 鼠标 profile 读写 helper / mouse profile read/write helpers ==========
@@ -1037,6 +1074,36 @@ pub(crate) extern "C" fn handle_line_count_changed(
     }
 }
 
+unsafe fn update_text_size_value_label(sender: *mut c_void, status_bar: bool) {
+    let slider = sender as *mut AnyObject;
+    let value: isize = msg_send![slider, integerValue];
+    let ui = SETTINGS_UI.lock().unwrap();
+    if let Some(u) = ui.as_ref() {
+        let label = if status_bar {
+            u.status_bar_text_size_value_label
+        } else {
+            u.card_text_size_value_label
+        };
+        set_field(label, format!("{value} pt"));
+    }
+}
+
+pub(crate) extern "C" fn handle_card_text_size_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    unsafe { update_text_size_value_label(sender, false) }
+}
+
+pub(crate) extern "C" fn handle_status_bar_text_size_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    unsafe { update_text_size_value_label(sender, true) }
+}
+
 /// enable_mouse switch toggle 回调:冻结/解冻下方控件。
 /// Callback when the enable_mouse switch is toggled: freeze/unfreeze the controls below.
 pub(crate) extern "C" fn handle_enable_mouse_toggle(
@@ -1603,8 +1670,21 @@ fn load_settings_from(cfg: &Config) {
         let _: () = msg_send![panel, setColor: tint];
         GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
         set_field(ui.corner_radius, cfg.appearance.corner_radius);
-        set_field(ui.card_text_size, cfg.layout.card_text_size);
-        set_field(ui.status_bar_text_size, cfg.fonts.status_bar_size);
+        let card_text_size = text_size_slider_value(cfg.layout.card_text_size);
+        let status_bar_text_size = text_size_slider_value(cfg.fonts.status_bar_size);
+        let _: () = msg_send![ui.card_text_size, setIntegerValue: card_text_size as isize];
+        set_field(
+            ui.card_text_size_value_label,
+            format!("{card_text_size} pt"),
+        );
+        let _: () = msg_send![
+            ui.status_bar_text_size,
+            setIntegerValue: status_bar_text_size as isize
+        ];
+        set_field(
+            ui.status_bar_text_size_value_label,
+            format!("{status_bar_text_size} pt"),
+        );
         let mod_idx: isize = if is_cmd { 1 } else { 0 };
         let _: () = msg_send![ui.modifier, selectItemAtIndex: mod_idx];
         // locale:按 CONFIG.i18n.locale 选中对应项,未匹配回退第 0 项(auto)。
@@ -1810,23 +1890,10 @@ fn collect_settings_config() -> (Config, Vec<String>) {
                 &[("field", "appearance.corner_radius")],
             )),
         }
-        match parse_f64(&nsstring_to_rust(msg_send![ui.card_text_size, stringValue])) {
-            Ok(v) => cfg.layout.card_text_size = v,
-            Err(_) => errs.push(tf(
-                "errors.not_a_number",
-                &[("field", "layout.card_text_size")],
-            )),
-        }
-        match parse_f64(&nsstring_to_rust(msg_send![
-            ui.status_bar_text_size,
-            stringValue
-        ])) {
-            Ok(v) => cfg.fonts.status_bar_size = v,
-            Err(_) => errs.push(tf(
-                "errors.not_a_number",
-                &[("field", "fonts.status_bar_size")],
-            )),
-        }
+        let card_text_size: isize = msg_send![ui.card_text_size, integerValue];
+        cfg.layout.card_text_size = card_text_size as f64;
+        let status_bar_text_size: isize = msg_send![ui.status_bar_text_size, integerValue];
+        cfg.fonts.status_bar_size = status_bar_text_size as f64;
         let mod_idx: isize = msg_send![ui.modifier, indexOfSelectedItem];
         cfg.keyboard.modifier = if mod_idx == 1 {
             "command".into()
@@ -2311,7 +2378,9 @@ fn create_settings_window() {
             corner_radius: std::ptr::null_mut(),
             thumbnails_enabled: std::ptr::null_mut(),
             card_text_size: std::ptr::null_mut(),
+            card_text_size_value_label: std::ptr::null_mut(),
             status_bar_text_size: std::ptr::null_mut(),
+            status_bar_text_size_value_label: std::ptr::null_mut(),
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
             show_minimized: std::ptr::null_mut(),
@@ -3110,8 +3179,29 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_card_text_size"),
             &t("settings.desc_card_text_size"),
-            make_text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "15"),
+            make_slider(
+                ctrl_x,
+                y + 10.0,
+                ctrl_w - TEXT_SIZE_VALUE_W - 6.0,
+                row_h,
+                TEXT_SIZE_MIN,
+                TEXT_SIZE_MAX,
+                TEXT_SIZE_DEFAULT,
+            ),
         );
+        ui.card_text_size_value_label = make_text_size_value_label(
+            switcher_view,
+            ctrl_x + ctrl_w - TEXT_SIZE_VALUE_W,
+            y + 10.0,
+            TEXT_SIZE_VALUE_W,
+            row_h,
+            TEXT_SIZE_DEFAULT,
+        );
+        let _: () = msg_send![ui.card_text_size, setTarget: target];
+        let _: () = msg_send![
+            ui.card_text_size,
+            setAction: sel!(handleCardTextSizeChanged:)
+        ];
         y -= 8.0 + described_row_h;
         add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
         ui.status_bar_text_size = add_described_row(
@@ -3122,8 +3212,29 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_status_bar_text_size"),
             &t("settings.desc_status_bar_text_size"),
-            make_text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "15"),
+            make_slider(
+                ctrl_x,
+                y + 10.0,
+                ctrl_w - TEXT_SIZE_VALUE_W - 6.0,
+                row_h,
+                TEXT_SIZE_MIN,
+                TEXT_SIZE_MAX,
+                TEXT_SIZE_DEFAULT,
+            ),
         );
+        ui.status_bar_text_size_value_label = make_text_size_value_label(
+            switcher_view,
+            ctrl_x + ctrl_w - TEXT_SIZE_VALUE_W,
+            y + 10.0,
+            TEXT_SIZE_VALUE_W,
+            row_h,
+            TEXT_SIZE_DEFAULT,
+        );
+        let _: () = msg_send![ui.status_bar_text_size, setTarget: target];
+        let _: () = msg_send![
+            ui.status_bar_text_size,
+            setAction: sel!(handleStatusBarTextSizeChanged:)
+        ];
         y -= 8.0 + described_row_h;
         add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
         // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0。
