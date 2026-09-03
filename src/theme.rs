@@ -155,7 +155,10 @@ pub(crate) fn colors_from_config(dark: bool) -> Colors {
         hint_text: if dark { 0xF5F5F7FF } else { 0x888888ff },
         hint_subtext: if dark { 0xB8B8C0FF } else { 0x666666ff },
         status_bar_bg: 0x00000000,
-        status_bar_text: config::parse_hex8(&c.status_bar_text),
+        // 底部标题栏与卡片窗口标题使用同一主文本色;应用名仍保留独立的次要文本色。
+        // The footer and card window title share the same primary text color; the app name keeps
+        // its separate secondary text color.
+        status_bar_text: config::parse_hex8(&c.win_title),
         card_bg: 0x00000000,
         card_bg_sel: config::parse_hex8(&c.card_bg_sel),
         card_border_sel: config::parse_hex8(&c.card_border_sel),
