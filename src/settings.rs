@@ -226,6 +226,7 @@ unsafe impl Send for SettingsUi {}
 /// 一行按键映射(只读显示):
 /// - label:按钮名(只读)
 /// - desc_label:动作描述(系统动作名/None 文本;Key Press 时用键帽胶囊)
+/// - action_icon:非键盘动作对应的 SF Symbol
 /// - edit:编辑按钮(tag = 按钮号,点击打开编辑面板)
 /// - delete:删除按钮(tag = 按钮号)
 /// - caps:键帽胶囊(Key Press 时显示)
@@ -234,12 +235,14 @@ unsafe impl Send for SettingsUi {}
 /// - label: the button name
 /// - desc_label: the action description (system-action name / None text; keycaps for Key
 ///   Press)
+/// - action_icon: the SF Symbol for non-keyboard actions
 /// - edit: the edit button (tag = button number; opens the edit panel)
 /// - delete: the delete button (tag = button number)
 /// - caps: keycap pills (shown for Key Press)
 struct MappingRow {
     label: *mut AnyObject,
     desc_label: *mut AnyObject,
+    action_icon: *mut AnyObject,
     edit: *mut AnyObject,
     delete: *mut AnyObject,
     separator: *mut AnyObject,
@@ -287,6 +290,19 @@ const MAPPING_ACTION_KEYS: [&str; 8] = [
     "settings.mapping_action_appexpose",
     "settings.mapping_action_switcher",
 ];
+
+/// 动作下拉与映射列表共用的 SF Symbols，索引与 `MAPPING_ACTION_KEYS` 一一对应。
+/// SF Symbols shared by the action popup and mapping rows; indices match `MAPPING_ACTION_KEYS`.
+const MAPPING_ACTION_SYMBOLS: [&str; 8] = [
+    "dot.circle",
+    "slash.circle",
+    "keyboard",
+    "square.grid.2x2",
+    "square.grid.3x3",
+    "macwindow",
+    "rectangle.on.rectangle",
+    "arrow.left.arrow.right",
+];
 unsafe impl Sync for SettingsUi {}
 static SETTINGS_UI: Mutex<Option<SettingsUi>> = Mutex::new(None);
 
@@ -331,7 +347,7 @@ pub(crate) mod widgets;
 
 use components::{
     SettingsButton, SettingsButtonRole, SettingsCard, SettingsControl, SettingsLayout,
-    SettingsPage, SettingsRow, SettingsSection, SettingsSidebar,
+    SettingsMappingActionIcon, SettingsPage, SettingsRow, SettingsSection, SettingsSidebar,
 };
 use glass_preview::*;
 pub(crate) use glass_preview::{

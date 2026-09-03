@@ -36,6 +36,7 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
         for row in u.mapping_rows.drain(..) {
             let _: () = msg_send![row.label, removeFromSuperview];
             let _: () = msg_send![row.desc_label, removeFromSuperview];
+            let _: () = msg_send![row.action_icon, removeFromSuperview];
             let _: () = msg_send![row.edit, removeFromSuperview];
             let _: () = msg_send![row.delete, removeFromSuperview];
             for cap in row.caps {
@@ -93,6 +94,7 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
         let del_x = ed_x + btn_w + btn_gap;
         let btn_h = 27.0;
         let desc_x = row_x0 + 74.0;
+        let desc_text_x = desc_x + 28.0;
         // Rows start below the header band (MAPPING_PANEL_TOP + MAPPING_HEADER_H).
         let mut y = MAPPING_PANEL_TOP + MAPPING_HEADER_H;
         let target = MENU_TARGET.lock().unwrap().unwrap().0;
@@ -136,7 +138,7 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             // 动作描述:系统动作/None 显示文本;Key Press 显示键帽胶囊。
             // The action description: text for system actions/None; keycaps for Key Press.
             let desc_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-            let desc_label: *mut AnyObject = msg_send![desc_label, initWithFrame: NSRect::new(NSPoint::new(desc_x, y + (row_h - 22.0) / 2.0), NSSize::new((ed_x - desc_x - 8.0).max(1.0), 22.0))];
+            let desc_label: *mut AnyObject = msg_send![desc_label, initWithFrame: NSRect::new(NSPoint::new(desc_text_x, y + (row_h - 22.0) / 2.0), NSSize::new((ed_x - desc_text_x - 8.0).max(1.0), 22.0))];
             set_field(desc_label, 0);
             let _: () = msg_send![desc_label, setBezeled: false];
             let _: () = msg_send![desc_label, setDrawsBackground: false];
@@ -155,6 +157,32 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             }
             let _: () = msg_send![doc, addSubview: desc_label];
             release_obj(desc_label);
+            // 非键盘动作与编辑面板的动作下拉共用同一个 SF Symbol，避免上下文中的动作
+            // 只有文字而缺少语义图标。Key Press 仍使用下方的键帽胶囊显示组合键。
+            // Non-key actions reuse the same SF Symbol as the edit-panel popup so the mapping
+            // row carries the same visual/action cue. Key Press keeps its keycap pills below.
+            let action_icon = if !is_key {
+                let icon = SettingsMappingActionIcon::attach(
+                    doc,
+                    action_idx,
+                    NSRect::new(
+                        NSPoint::new(
+                            desc_x,
+                            y + (row_h - SettingsMappingActionIcon::ROW_SIZE) / 2.0,
+                        ),
+                        NSSize::new(
+                            SettingsMappingActionIcon::ROW_SIZE,
+                            SettingsMappingActionIcon::ROW_SIZE,
+                        ),
+                    ),
+                );
+                // The document view now owns the icon; balance the builder's alloc reference.
+                // 图标已由 document view 持有，平衡 builder 的 alloc 引用。
+                release_obj(icon);
+                icon
+            } else {
+                std::ptr::null_mut()
+            };
             // 编辑按钮(打开编辑面板)。
             // The edit button (opens the edit panel).
             let edit = SettingsButton::action(
@@ -234,6 +262,7 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             u.mapping_rows.push(MappingRow {
                 label,
                 desc_label,
+                action_icon,
                 edit,
                 delete,
                 separator: sep,
@@ -758,25 +787,12 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             // Popup icons (same as the rows).
             let menu: *mut AnyObject = msg_send![action, menu];
             let item_cnt: usize = msg_send![menu, numberOfItems];
-            let icons = [
-                "dot.circle",
-                "slash.circle",
-                "keyboard",
-                "square.grid.2x2",
-                "square.grid.3x3",
-                "macwindow",
-                "rectangle.on.rectangle",
-                "arrow.left.arrow.right",
-            ];
-            for (i, icon) in icons.iter().enumerate().take(item_cnt) {
+            for i in 0..item_cnt {
+                let Some(icon) = SettingsMappingActionIcon::symbol_name(i) else {
+                    continue;
+                };
                 let item: *mut AnyObject = msg_send![menu, itemAtIndex: i as isize];
-                let sym = make_nsstring(icon);
-                let img: *mut AnyObject = msg_send![
-                    class!(NSImage),
-                    imageWithSystemSymbolName: sym,
-                    accessibilityDescription: std::ptr::null::<AnyObject>()
-                ];
-                CFRelease(sym as *const c_void);
+                let img = make_symbol_image(icon, NSSize::new(20.0, 20.0));
                 if !img.is_null() {
                     let _: () = msg_send![item, setImage: img];
                 }

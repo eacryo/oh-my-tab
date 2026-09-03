@@ -379,6 +379,35 @@ impl SettingsControl {
     }
 }
 
+/// Shared action icon component for the action popup and mapping-list rows.
+/// 动作下拉与按键映射列表共用的动作图标组件。
+pub(super) struct SettingsMappingActionIcon;
+
+impl SettingsMappingActionIcon {
+    /// NSPopUpButton menu cells and standalone image views apply different optical scaling.
+    /// `row_size` compensates the latter so both render at the same visible size.
+    /// NSPopUpButton 菜单 cell 与独立 image view 的 optical scaling 不同；`row_size` 对后者
+    /// 做补偿，使两处最终视觉尺寸一致。
+    pub(super) const ROW_SIZE: f64 = 18.0;
+
+    pub(super) fn symbol_name(action_index: usize) -> Option<&'static str> {
+        super::MAPPING_ACTION_SYMBOLS.get(action_index).copied()
+    }
+
+    pub(super) unsafe fn attach(
+        parent: *mut AnyObject,
+        action_index: usize,
+        frame: NSRect,
+    ) -> *mut AnyObject {
+        let Some(symbol) = Self::symbol_name(action_index) else {
+            return std::ptr::null_mut();
+        };
+        let icon = widgets::make_symbol_image_view(symbol, frame);
+        let _: () = objc2::msg_send![parent, addSubview: icon];
+        icon
+    }
+}
+
 /// Semantic roles for clickable settings buttons. The low-level builder owns AppKit tracking;
 /// this role selects the normal surface, text color, and hover behavior without leaking raw color
 /// literals into page construction code.

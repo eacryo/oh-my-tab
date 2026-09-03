@@ -398,6 +398,39 @@ pub(super) unsafe fn make_external_link(
     link
 }
 
+/// Create a system-symbol image with an explicit size shared by menu items and row views.
+/// 构造一个显式指定尺寸、供菜单项和设置行共同复用的 SF Symbol 图像。
+pub(super) unsafe fn make_symbol_image(symbol: &str, size: NSSize) -> *mut AnyObject {
+    let symbol_ns = make_nsstring(symbol);
+    let image: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: symbol_ns,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(symbol_ns as *const c_void);
+    if !image.is_null() {
+        let _: () = msg_send![image, setSize: size];
+    }
+    image
+}
+
+/// Create an image view for a system symbol used inside a settings row.
+/// 构造设置行内使用的 SF Symbol 图标视图。
+pub(super) unsafe fn make_symbol_image_view(symbol: &str, frame: NSRect) -> *mut AnyObject {
+    let image = make_symbol_image(symbol, frame.size);
+    let icon_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+    let icon_view: *mut AnyObject = msg_send![icon_view, initWithFrame: frame];
+    if !image.is_null() {
+        let _: () = msg_send![icon_view, setImage: image];
+    }
+    let _: () = msg_send![icon_view, setImageScaling: 3isize];
+    let _: () = msg_send![icon_view, setEditable: false];
+    let _: () = msg_send![icon_view, setWantsLayer: false];
+    let tint = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let _: () = msg_send![icon_view, setContentTintColor: tint];
+    icon_view
+}
+
 pub(super) struct AboutHeaderClickViewClass(*mut AnyObject);
 unsafe impl Send for AboutHeaderClickViewClass {}
 unsafe impl Sync for AboutHeaderClickViewClass {}
