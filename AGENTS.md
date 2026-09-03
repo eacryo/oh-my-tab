@@ -42,6 +42,7 @@ After every successful restart, `scripts/dev-restart.sh` prints the current time
 - Configuration is loaded per field: invalid values fall back to defaults without discarding valid settings. Runtime reload must preserve this behavior and refresh affected UI.
 - Mouse profiles match devices by VID/PID. The mouse event tap is separate from the switcher event tap, and pointer settings must be reapplied after device reconnects.
 - Clipboard history is optional and disabled by default. When disabled, recording and the Option+V picker are gated off. Sensitive pasteboard markers must never be recorded, and persistence is opt-in because history can contain private plaintext or file references.
+- When modifying the Settings UI, prefer reusing the existing semantic components (`SettingsSection`, `SettingsCard`, `SettingsRow`, `SettingsControl`, and `SettingsButton`) before adding page-specific layout or control code. Extend an existing component when the behavior is shared; only bypass the component layer when the control has genuinely different interaction or rendering semantics.
 
 For detailed subsystem behavior, inspect the relevant module and `docs/developer-notes.md` rather than expanding this file with implementation history.
 
