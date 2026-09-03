@@ -1,8 +1,9 @@
 use flume::{Receiver, Sender};
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::os::raw::c_int;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
@@ -36,7 +37,7 @@ impl LogLevel {
 
 pub struct LogConfig {
     pub level: LogLevel,
-    pub file_path: String, // 空=默认路径 / empty = default path
+    pub file_path: String, // 空=默认滚动路径 / empty = default rolling path
 }
 
 // ========== 全局状态 / global state ==========
@@ -48,6 +49,8 @@ static LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::Info as usize);
 // Bounded channel capacity: ~100KB worst case, far larger than a single summon's burst;
 // logs are dropped only when disk writes stall severely.
 const LOG_CHANNEL_CAPACITY: usize = 512;
+const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const LOG_BACKUP_COUNT: usize = 5;
 
 // ========== 宏（调用侧接口） / macros (caller API) ==========
 
@@ -120,31 +123,124 @@ pub fn reconfigure(level: LogLevel) {
 
 // ========== 内部实现 / internals ==========
 
-fn writer_loop(rx: Receiver<String>, is_dev: bool, file_path: Option<String>) {
-    let mut file: Option<BufWriter<std::fs::File>> = file_path
-        .and_then(|path| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| {
-                    // writer 线程自身出问题时降级到 stderr / fallback to stderr on writer thread failure
-                    eprintln!("[logger] cannot open log file {}: {}", path, e);
-                })
-                .ok()
-        })
-        .map(BufWriter::new);
+fn writer_loop(rx: Receiver<String>, is_dev: bool, file_path: Option<LogDestination>) {
+    let mut file = file_path.and_then(RollingLogFile::open);
+
+    // 每次进程启动写一条边界标记,固定日志文件也能清楚区分不同运行会话。
+    // Write a session boundary marker on every launch so a stable log file still separates runs.
+    let startup = format!("{} INFO  [logger] session started\n", now_timestamp());
+    if is_dev {
+        print!("{}", startup);
+    }
+    if let Some(ref mut f) = file {
+        f.write_line(&startup);
+    }
 
     while let Ok(msg) = rx.recv() {
         if is_dev {
             print!("{}", msg); // stdout,msg 已含 \n / msg already contains \n
         }
         if let Some(ref mut f) = file {
-            let _ = f.write_all(msg.as_bytes());
-            // 每条 flush:崩溃时最多丢 1 条,文件不损坏 / flush each line: at most 1 msg lost on crash
-            let _ = f.flush();
+            f.write_line(&msg);
         }
     }
+}
+
+struct LogDestination {
+    path: PathBuf,
+    rolling: bool,
+}
+
+struct RollingLogFile {
+    writer: BufWriter<std::fs::File>,
+    path: PathBuf,
+    rolling: bool,
+    bytes_written: u64,
+}
+
+impl RollingLogFile {
+    fn open(destination: LogDestination) -> Option<Self> {
+        let bytes_written = match fs::metadata(&destination.path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                eprintln!(
+                    "[logger] cannot inspect log file {}: {}",
+                    destination.path.display(),
+                    error
+                );
+                0
+            }
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&destination.path)
+            .map_err(|e| {
+                // writer 线程自身出问题时降级到 stderr / fallback to stderr on writer thread failure
+                eprintln!(
+                    "[logger] cannot open log file {}: {}",
+                    destination.path.display(),
+                    e
+                );
+            })
+            .ok()?;
+        Some(Self {
+            writer: BufWriter::new(file),
+            path: destination.path,
+            rolling: destination.rolling,
+            bytes_written,
+        })
+    }
+
+    fn write_line(&mut self, msg: &str) {
+        let msg_len = msg.len() as u64;
+        if self.rolling
+            && self.bytes_written > 0
+            && self.bytes_written.saturating_add(msg_len) > LOG_MAX_BYTES
+        {
+            if let Err(error) = self.rotate() {
+                eprintln!(
+                    "[logger] cannot rotate log file {}: {}",
+                    self.path.display(),
+                    error
+                );
+            }
+        }
+        if self.writer.write_all(msg.as_bytes()).is_ok() {
+            self.bytes_written = self.bytes_written.saturating_add(msg_len);
+        }
+        // 每条 flush:崩溃时最多丢 1 条,文件不损坏 / flush each line: at most 1 msg lost on crash
+        let _ = self.writer.flush();
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.writer.flush()?;
+        let oldest = backup_path(&self.path, LOG_BACKUP_COUNT);
+        if oldest.exists() {
+            fs::remove_file(oldest)?;
+        }
+        for index in (1..LOG_BACKUP_COUNT).rev() {
+            let source = backup_path(&self.path, index);
+            if source.exists() {
+                fs::rename(source, backup_path(&self.path, index + 1))?;
+            }
+        }
+        fs::rename(&self.path, backup_path(&self.path, 1))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.writer = BufWriter::new(file);
+        self.bytes_written = 0;
+        Ok(())
+    }
+}
+
+fn backup_path(path: &Path, index: usize) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(format!(".{index}"));
+    PathBuf::from(value)
 }
 
 // ========== stderr 捕获(NSLog/AppKit 系统输出) / stderr capture ==========
@@ -241,38 +337,43 @@ fn emit_stderr_line(line: &[u8]) {
     _log(LogLevel::Info, format_args!("[stderr] {}", s));
 }
 
-fn resolve_file_path(config: &LogConfig) -> Option<String> {
+fn resolve_file_path(config: &LogConfig) -> Option<LogDestination> {
     // dev 模式也写文件:writer_loop 在 is_dev 时同时输出到 stdout 与文件,
     // 便于开发时日志持久化(终端关闭不丢)。30 天清理同样作用于 dev 日志。
     // Dev mode also writes to a file: writer_loop prints to stdout AND the file when is_dev,
     // so dev logs persist (not lost when the terminal closes). The 30-day cleanup applies
     // to dev logs too.
-    // 用户自定义路径:原样使用(append 模式,不加时间戳、不做清理,由用户自行管理轮转)。
+    // 用户自定义路径:原样使用(append 模式,不轮转、不做清理,由用户自行管理)。
     // 我们不会往用户指定的位置写入额外文件,也不会删除其中的任何文件。
-    // User-supplied path: use verbatim (append mode, no timestamp, no cleanup - the user
+    // User-supplied path: use verbatim (append mode, no rotation, no cleanup - the user
     // manages rotation themselves). We never write extra files into, or delete files from,
     // a user-specified location.
     if !config.file_path.is_empty() {
-        return Some(config.file_path.clone());
+        return Some(LogDestination {
+            path: PathBuf::from(&config.file_path),
+            rolling: false,
+        });
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = format!("{}/Library/Logs/oh-my-tab", home);
     let _ = std::fs::create_dir_all(&dir);
-    // 启动时清理 30 天前的旧日志(仅默认目录、仅 oh-my-tab-*.log)。
-    // Prune logs older than 30 days at startup (default dir only, oh-my-tab-*.log only).
-    cleanup_old_logs(&dir);
-    let stamp = file_timestamp();
-    Some(format!("{}/oh-my-tab-{}.log", dir, stamp))
+    // 启动时清理 30 天前的旧日志(仅默认目录、本应用日志);当前文件不删除。
+    // Prune logs older than 30 days at startup (default dir and app-owned logs only); never delete the active file.
+    cleanup_old_logs(Path::new(&dir));
+    Some(LogDestination {
+        path: Path::new(&dir).join("oh-my-tab.log"),
+        rolling: true,
+    })
 }
 
-/// 删除日志目录中修改时间超过 30 天的 oh-my-tab-*.log 文件。
+/// 删除日志目录中修改时间超过 30 天的本应用日志和滚动备份。
 /// 仅按 mtime 判断;正在写入的当前文件 mtime 持续更新,不会被误删。
 /// 仅作用于默认日志目录,不会触碰用户自定义路径所在的目录。
 ///
-/// Delete oh-my-tab-*.log files in the log dir whose mtime is older than 30 days.
+/// Delete app-owned log files and rolling backups in the log dir whose mtime is older than 30 days.
 /// Judged by mtime only; the current file's mtime keeps updating as we write, so it's never pruned.
 /// Only the default log dir is touched - never the directory of a user-supplied path.
-fn cleanup_old_logs(dir: &str) {
+fn cleanup_old_logs(dir: &Path) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -284,9 +385,13 @@ fn cleanup_old_logs(dir: &str) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // 只清理本应用产生的日志,避免误删同目录下的其他文件。
-        // Only touch our own logs; never delete unrelated files in the same dir.
-        if !name.starts_with("oh-my-tab-") || !name.ends_with(".log") {
+        // 当前滚动文件永远保留;历史备份和旧版按启动生成的日志才参与 30 天清理。
+        // Keep the active rolling file; prune backups and legacy per-launch logs by age.
+        let is_backup = name
+            .strip_prefix("oh-my-tab.log.")
+            .is_some_and(|suffix| suffix.parse::<usize>().is_ok());
+        let is_legacy = name.starts_with("oh-my-tab-") && name.ends_with(".log");
+        if name == "oh-my-tab.log" || (!is_backup && !is_legacy) {
             continue;
         }
         if let Ok(meta) = entry.metadata() {
@@ -327,29 +432,6 @@ fn now_timestamp() -> String {
     }
 }
 
-/// 启动时间戳(文件名安全,无冒号),用于给本次运行的日志文件命名。
-/// Startup timestamp (filename-safe, no colons) used to name this run's log file.
-fn file_timestamp() -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    unsafe {
-        let mut tm: Tm = std::mem::zeroed();
-        let s = secs as i64;
-        localtime_r(&s, &mut tm);
-        format!(
-            "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec,
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,20 +445,16 @@ mod tests {
 
     #[test]
     fn timestamps_are_well_formed() {
-        // 时间戳格式:带 T 分隔与毫秒;文件名时间戳无冒号且可排序。
-        // Timestamp format: ISO-ish with T and milliseconds; file timestamp has no colons.
+        // 时间戳格式:带 T 分隔与毫秒。
+        // Timestamp format: ISO-ish with T and milliseconds.
         let ts = now_timestamp();
         assert_eq!(ts.len(), 23); // "YYYY-MM-DDTHH:MM:SS.mmm"
         assert!(ts.contains('T'));
-        let ft = file_timestamp();
-        assert_eq!(ft.len(), 19); // "YYYY-MM-DD_HH-MM-SS"
-        assert!(!ft.contains(':'));
     }
 
     #[test]
     fn cleanup_old_logs_only_touches_stale_own_logs() {
         let dir = tempfile::tempdir().unwrap();
-        let d = dir.path().to_str().unwrap();
         let old = SystemTime::now()
             .checked_sub(Duration::from_secs(31 * 86_400))
             .unwrap();
@@ -394,9 +472,55 @@ mod tests {
         let fresh_log = make("oh-my-tab-2099-01-01_00-00-00.log", fresh);
         // 过期但非本应用的日志:绝不误删 / stale but unrelated: never removed.
         let foreign = make("something-else.log", old);
-        cleanup_old_logs(d);
+        cleanup_old_logs(dir.path());
         assert!(!stale.exists());
         assert!(fresh_log.exists());
         assert!(foreign.exists());
+    }
+
+    #[test]
+    fn rolling_log_rotates_and_keeps_numbered_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oh-my-tab.log");
+        std::fs::write(&path, "active").unwrap();
+        std::fs::write(backup_path(&path, 1), "older").unwrap();
+
+        let destination = LogDestination {
+            path: path.clone(),
+            rolling: true,
+        };
+        let mut log = RollingLogFile::open(destination).unwrap();
+        log.rotate().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&path, 1)).unwrap(),
+            "active"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&path, 2)).unwrap(),
+            "older"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn rolling_log_rotates_before_writing_past_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oh-my-tab.log");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(LOG_MAX_BYTES).unwrap();
+
+        let destination = LogDestination {
+            path: path.clone(),
+            rolling: true,
+        };
+        let mut log = RollingLogFile::open(destination).unwrap();
+        log.write_line("next message\n");
+
+        assert_eq!(
+            std::fs::metadata(backup_path(&path, 1)).unwrap().len(),
+            LOG_MAX_BYTES
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "next message\n");
     }
 }

@@ -211,7 +211,7 @@ overlay_position = "active_window"  # "active_window"(跟随激活窗口所在�
 
 [logging]
 level = "info"           # "debug" | "info"
-file_path = ""           # 空 = 默认带时间戳路径;见下方「日志」
+file_path = ""           # 空 = 默认滚动路径;见下方「日志」
 
 [startup]
 launch_at_login = false  # 开机自启(需以 .app 方式运行;macOS 13+)
@@ -284,7 +284,7 @@ line_count = 3
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;日志
 
 - **输出目标**:`scripts/dev-restart.sh` 启动的开发版 `.app` 和打包的 `.app` 都写入日志文件。裸 `cargo run` 还会输出到 stdout,但仅适合底层调试,不是常规开发启动方式。
-- **默认文件路径**:`~/Library/Logs/oh-my-tab/oh-my-tab-<启动时间戳>.log` -- **每次启动一个文件**。启动时自动删除默认目录中 mtime 超过 30 天的旧日志(单次长时间运行内无按大小轮转)。
+- **默认文件路径**:`~/Library/Logs/oh-my-tab/oh-my-tab.log`。活动文件达到 10 MB 后,依次滚动为 `oh-my-tab.log.1` 到 `oh-my-tab.log.5`,保留最新的 5 个备份。每次启动都会写入会话标记,便于区分不同运行过程。旧版按启动生成的日志和超过 30 天的旧备份会在启动时清理。
 - **自定义路径**:`[logging] file_path`(直接编辑 `config.toml`,不在设置界面暴露)。用户指定路径**原样**使用、append 模式——不加时间戳、不做任何清理,轮转与保留由你自己负责。
 - **内存诊断**:启动约 60 秒后先记录一行,之后每 5 分钟记录一行 `[mem]`,包含当前功能画像(`mouse:on|off`、`thumbs:on|off`、`clipboard:off|memory|persistent`)、进程 footprint/RSS、采样期间 footprint 峰值、线程数,以及缩略图/剪贴板/窗口账本的估算值。`footprint` 是 macOS 的 physical footprint 指标,对应活动监视器的「内存」列,是判断内存压力的主要数字;`rss` 是当前驻留内存,会随 macOS 压缩或回收页面而下降。`footprint_peak_sampled` 是应用采样得到的峰值,`rss_peak_kernel` 是内核记录的进程生命周期峰值。剪贴板账本会拆分文本、预览和元数据;磁盘缓存中的图片原图不计入驻留内存。持久化主要影响历史生命周期和启动时恢复的条目;单条记录的 RAM 模型保持不变。日志不包含剪贴板内容和窗口画面。
 - **隐私**:debug 日志只记录切换器按键 tap 中的 `Tab` / `Command` / `Option`(以及召唤组合名);其余按键一律记成 `Other`,不包含键码和修饰位。

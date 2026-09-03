@@ -183,5 +183,7 @@ for _ in 1 2 3 4 5; do
     fi
 done
 echo "restart FAILED: process exited within 5s -- read the newest log:"
-ls -t "$HOME/Library/Logs/oh-my-tab/"oh-my-tab-*.log 2>/dev/null | head -1
+ls -t "$HOME/Library/Logs/oh-my-tab/oh-my-tab.log" \
+    "$HOME/Library/Logs/oh-my-tab/oh-my-tab.log."* \
+    "$HOME/Library/Logs/oh-my-tab/oh-my-tab-"*.log 2>/dev/null | head -1
 exit 1

@@ -218,7 +218,7 @@ overlay_position = "active_window"  # "active_window" (follow the active window'
 
 [logging]
 level = "info"           # "debug" | "info"
-file_path = ""           # empty = default timestamped path; see Logging below
+file_path = ""           # empty = default rolling path; see Logging below
 
 [startup]
 launch_at_login = false  # launch at login (requires running as a .app bundle; macOS 13+)
@@ -295,7 +295,7 @@ Mouse settings are also exposed in the Settings window (a **device picker** list
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 
 - **Destination**: the development `.app` launched by `scripts/dev-restart.sh` and packaged `.app` builds write to the log file. A raw `cargo run` also writes to stdout and is reserved for low-level debugging.
-- **Default file path**: `~/Library/Logs/oh-my-tab/oh-my-tab-<startup-timestamp>.log` — one file **per app launch**. Files in the default directory older than 30 days are deleted at startup (no size-based rotation within a single run).
+- **Default file path**: `~/Library/Logs/oh-my-tab/oh-my-tab.log`. When the active file reaches 10 MB, it rolls through `oh-my-tab.log.1` to `oh-my-tab.log.5` and keeps the newest five backups. Each launch writes a session marker so runs remain distinguishable. Legacy per-launch logs and stale backups older than 30 days are deleted at startup.
 - **Custom path**: `[logging] file_path` (edit `config.toml` directly; not exposed in Settings). A user-supplied path is used **verbatim**, in append mode — no timestamp is added and no cleanup is performed on it; rotation and retention are yours.
 - **Memory diagnostics**: after roughly 60 seconds, then every 5 minutes, the app records one `[mem]` line containing the active feature profile (`mouse:on|off`, `thumbs:on|off`, `clipboard:off|memory|persistent`), process footprint/RSS, sampled footprint peak, thread count, and estimated thumbnail/clipboard/window ledgers. `footprint` is the macOS physical-footprint metric used for the Activity Monitor Memory column and is the primary number for memory pressure; `rss` is current resident memory and can fall as macOS compresses or reclaims pages. `footprint_peak_sampled` is sampled by the app, while `rss_peak_kernel` is the kernel's lifetime high-water mark. Clipboard memory is split into text, preview, and metadata estimates; original image bytes in the disk cache are not counted as resident memory. Persistence mainly changes history lifetime and startup restoration; the per-entry RAM model remains the same. Clipboard contents and window imagery are excluded from the log.
 - **Privacy**: debug logs record only `Tab` / `Command` / `Option` (and the summon combo name) from the switcher's key tap; every other key is logged as plain `Other`, without keycodes or modifier details.

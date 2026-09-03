@@ -124,8 +124,8 @@ pub struct LoggingSection {
     // 日志级别:"debug","info";默认 "info"(常规档,不刷屏;debug 输出全量调试细节)。
     // Log level: "debug" | "info"; default "info" (normal tier, no spam; debug emits all detail).
     pub level: String,
-    // 日志文件路径;空=使用默认路径 ~/Library/Logs/oh-my-tab/oh-my-tab-<时间戳>.log。
-    // Log file path; empty = use the default (timestamped file under ~/Library/Logs/oh-my-tab/).
+    // 日志文件路径;空=使用默认滚动文件 ~/Library/Logs/oh-my-tab/oh-my-tab.log。
+    // Log file path; empty = use the default rolling file under ~/Library/Logs/oh-my-tab/.
     pub file_path: String,
 }
 

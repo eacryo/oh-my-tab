@@ -50,7 +50,7 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 - Accessibility permission is required for the global event tap and AX window operations. If the shortcut does nothing, check this permission first.
 - Screen Recording permission is required for thumbnail capture; missing permission should degrade to the icon/fallback presentation rather than break switching.
 - Runtime configuration is stored at `~/.config/oh-my-tab/config.toml`.
-- Application logs are written under `~/Library/Logs/oh-my-tab/` unless `logging.file_path` overrides the destination.
+- Application logs default to `~/Library/Logs/oh-my-tab/oh-my-tab.log`; the active file rolls at 10 MB into `.1` through `.5`, and each launch writes a session marker. Legacy logs and stale backups older than 30 days are pruned from the default directory. A non-empty `logging.file_path` overrides this behavior and is appended to verbatim without automatic rotation or cleanup.
 
 ## Editing conventions
 
