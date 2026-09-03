@@ -26,6 +26,7 @@ const EN_TOML: &str = include_str!("../locales/en.toml");
 const ZH_TOML: &str = include_str!("../locales/zh-Hans.toml");
 const ZH_HANT_TOML: &str = include_str!("../locales/zh-Hant.toml");
 const DEFAULT_LOCALE: &str = "en";
+const PSEUDO_LOCALE_ENV: &str = "OH_MY_TAB_PSEUDO_LOCALE";
 
 // 已支持的 locale -> 内嵌 TOML 文本。新增语言只需加文件 + 在此登记。
 // Supported locale -> embedded TOML text. To add a language, add a file + register here.
@@ -104,14 +105,54 @@ static I18N: LazyLock<RwLock<I18nState>> = LazyLock::new(|| {
 /// Simple lookup: current locale -> en fallback -> the key itself.
 pub fn t(key: &str) -> String {
     let g = I18N.read().unwrap();
-    if let Some(v) = g.messages.get(key) {
-        return v.clone();
-    }
+    let value = g
+        .messages
+        .get(key)
+        .cloned()
+        .or_else(|| EN_MESSAGES.get(key).cloned())
+        .unwrap_or_else(|| key.to_string());
     drop(g);
-    if let Some(v) = EN_MESSAGES.get(key) {
-        return v.clone();
+    if pseudo_locale_enabled() {
+        pseudo_localize_text(&value)
+    } else {
+        value
     }
-    key.to_string()
+}
+
+/// Enable long-text layout QA without adding a fake production locale. Set
+/// `OH_MY_TAB_PSEUDO_LOCALE=1` before launching the app; placeholders such as `{count}` remain
+/// byte-for-byte intact so `tf` can still interpolate runtime values.
+/// 通过环境变量开启长文本布局 QA，不新增假的正式语言。启动前设置
+/// `OH_MY_TAB_PSEUDO_LOCALE=1`；`{count}` 等占位符保持原样，`tf` 仍可插入运行时值。
+fn pseudo_locale_enabled() -> bool {
+    matches!(
+        std::env::var(PSEUDO_LOCALE_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+fn pseudo_localize_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2 + 4);
+    out.push('[');
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            out.push(ch);
+            for token in chars.by_ref() {
+                out.push(token);
+                if token == '}' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+        if ch.is_ascii_alphabetic() {
+            out.push('·');
+        }
+    }
+    out.push(']');
+    out
 }
 
 /// 带插值的查表:把模板里的 {name} 替换为 args 提供的值。
@@ -408,5 +449,34 @@ number = 42
                 k, v, hant[k]
             );
         }
+    }
+
+    #[test]
+    fn pseudo_localization_expands_strings_without_corrupting_placeholders() {
+        // Exercise every English UI string with expansion and placeholder preservation so future
+        // layout changes have a deterministic long-text fixture without shipping a fake locale.
+        // 对全部英文 UI 文案做膨胀和占位符保留检查，为布局回归提供稳定的长文本夹具，且不把
+        // 伪语言暴露给正式用户。
+        let mut expanded = 0usize;
+        for (key, value) in EN_MESSAGES.iter() {
+            let pseudo = pseudo_localize_text(value);
+            assert!(pseudo.len() >= value.len(), "pseudo text shrank for {key}");
+            assert_eq!(
+                placeholders(&pseudo),
+                placeholders(value),
+                "placeholder drift for {key}"
+            );
+            if value.chars().count() >= 8 {
+                assert!(
+                    pseudo.chars().count() > value.chars().count(),
+                    "no expansion for {key}"
+                );
+                expanded += 1;
+            }
+        }
+        assert!(
+            expanded > 20,
+            "fixture should cover a broad set of UI strings"
+        );
     }
 }

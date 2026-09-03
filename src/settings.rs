@@ -324,10 +324,15 @@ static SELECTED_DEVICE: Mutex<Option<Option<crate::mouse::device::DeviceKey>>> =
 #[allow(dead_code)]
 static AUTO_SWITCH_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+pub(crate) mod components;
 pub(crate) mod glass_preview;
 pub(crate) mod mapping;
 pub(crate) mod widgets;
 
+use components::{
+    SettingsCard, SettingsControl, SettingsLayout, SettingsPage, SettingsRow, SettingsSection,
+    SettingsSidebar,
+};
 use glass_preview::*;
 pub(crate) use glass_preview::{
     apply_glass_preview, on_glass_style_changed, on_glass_tint_changed,
@@ -528,6 +533,16 @@ pub(crate) fn expand_update_section(window_h: f64) {
         // The update content replaces the check-button area instead of being appended below it.
         let _: () = msg_send![ui.update_check_button, setHidden: true];
         ui.update_card_expanded = true;
+
+        // The compact document was fitted during construction; an expanded Sparkle host may
+        // extend beyond that height, so re-measure the About page after changing the card.
+        // 紧凑文档在构建时已拟合；Sparkle 宿主展开后可能超出原高度，因此卡片变化后重新测量 About 页。
+        let clip: *mut AnyObject = msg_send![ui.about_view, contentView];
+        let clip_bounds: NSRect = msg_send![clip, bounds];
+        let document: *mut AnyObject = msg_send![ui.about_view, documentView];
+        fit_settings_document_height(document, clip_bounds.size.height, 24.0, 32.0);
+        let _: () = msg_send![ui.window, layoutIfNeeded];
+        debug_validate_settings_page(ui.about_view, "about-expanded");
     }
 }
 
@@ -976,10 +991,10 @@ unsafe fn update_mode_dependent_visibility(ui: &mut SettingsUi) {
         // 默认模式移除整行及其布局占位,后续分组向上收拢;切回 Line 模式时恢复原位。
         // Remove the whole conditional row and its layout slot in Default mode; move later
         // sections up, then restore their original positions when Line mode returns.
-        // The conditional row occupies one 62pt row slot inside the shared device card.
+        // The conditional row occupies one standard row slot inside the shared device card.
         // Shift the following sections by exactly that slot when the row is hidden or restored.
-        // 条件行属于设备卡片,只占用一个 62pt 行位。隐藏或恢复时,后续分组只移动这一行的高度。
-        let removed_section_h = 8.0 + 54.0;
+        // 条件行属于设备卡片,只占用一个标准行位。隐藏或恢复时,后续分组只移动这一行的高度。
+        let removed_section_h = 8.0 + SettingsLayout::SINGLE_LINE_ROW_H;
         let shift = if compact {
             removed_section_h
         } else {
@@ -1362,7 +1377,13 @@ fn select_sidebar(idx: usize) {
         // A just-shown page needs a layout pass first so the clip bounds are correct;
         // then scroll it to the top. layoutIfNeeded lives on the window, not the scroll view.
         let _: () = msg_send![ui.window, layoutIfNeeded];
-        scroll_page_to_top(views[idx]);
+        let page = SettingsPage {
+            scroll: views[idx],
+            document: msg_send![views[idx], documentView],
+        };
+        page.scroll_to_top();
+        let page_names = ["general", "switcher", "mouse", "clipboard", "about"];
+        page.validate(page_names[idx]);
     }
 }
 
@@ -1534,6 +1555,42 @@ fn hide_settings() {
     // 切回 .accessory:设置窗口关闭,回到纯菜单栏(无 Dock 图标)。
     // Switch back to .accessory: the settings window is closed, return to pure menu-bar (no Dock icon).
     crate::set_settings_activation_policy(false);
+}
+
+/// Run every settings page through the real AppKit layout path and debug validator, then exit.
+/// This is used by the ignored macOS smoke test; it deliberately exercises the same window
+/// builder as the interactive app instead of constructing a simplified test-only hierarchy.
+/// 在真实 AppKit 布局路径中依次验证所有设置页，然后退出。供 macOS ignored smoke test 使用，
+/// 复用交互应用的窗口构建逻辑，不创建简化的测试专用 view tree。
+pub(crate) fn settings_layout_smoke_runner() -> bool {
+    unsafe {
+        show_settings();
+        let (window, pages) = {
+            let ui = SETTINGS_UI.lock().unwrap();
+            let Some(ui) = ui.as_ref() else {
+                return false;
+            };
+            (
+                ui.window,
+                [
+                    ui.general_view,
+                    ui.switcher_view,
+                    ui.mouse_view,
+                    ui.clipboard_view,
+                    ui.about_view,
+                ],
+            )
+        };
+        let names = ["general", "switcher", "mouse", "clipboard", "about"];
+        for (index, page) in pages.iter().enumerate() {
+            select_sidebar(index);
+            let _: () = msg_send![window, layoutIfNeeded];
+            scroll_page_to_top(*page);
+            debug_validate_settings_page(*page, names[index]);
+        }
+        hide_settings();
+        true
+    }
 }
 
 /// 从窗口切换浮窗关闭本应用的设置窗口,必须在主线程直接执行,不能通过后台 AX 操作回调。
@@ -2433,14 +2490,16 @@ fn create_settings_window() {
         let page_inset = 32.0;
         let page_x = content_x + page_inset;
         let content_w = detail_w - page_inset * 2.0;
-        let label_x = 12.0;
-        let label_w = 220.0;
-        let ctrl_w = 200.0;
-        let ctrl_x = content_w - ctrl_w - SETTINGS_CONTROL_TRAILING_INSET;
-        // HTML `.row` uses a 34pt control and roughly 54pt visual row; the native labels and
-        // controls share that rhythm while grouped cards provide the surrounding padding.
-        let row_h = 34.0;
-        let described_row_h = 54.0;
+        let layout = SettingsLayout::new(content_w);
+        let label_x = layout.label_x;
+        let label_w = layout.label_w;
+        let ctrl_w = layout.control_w;
+        let ctrl_x = layout.control_x;
+        // HTML `.row` uses a 34pt control. All card rows now use a compact 54pt rhythm; detailed
+        // explanatory paragraphs are intentionally omitted from the card interior.
+        // HTML `.row` 控件仍为 34pt；卡片内统一使用紧凑的 54pt 节奏，详细说明不再塞进行内。
+        let row_h = layout.row_h;
+        let described_row_h = layout.described_row_h;
 
         let target = match *MENU_TARGET.lock().unwrap() {
             Some(t) => t.0,
@@ -2615,7 +2674,7 @@ fn create_settings_window() {
         let _: () = msg_send![app_subtitle, setDrawsBackground: false];
         let _: () = msg_send![app_subtitle, setEditable: false];
         let app_subtitle_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 11.5f64];
+            msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
         let _: () = msg_send![app_subtitle, setFont: app_subtitle_font];
         let app_subtitle_color = crate::ffi::hex_to_ns_color(palette.muted_text);
         let _: () = msg_send![app_subtitle, setTextColor: app_subtitle_color];
@@ -2651,51 +2710,17 @@ fn create_settings_window() {
         ui.sidebar_highlight = highlight;
 
         // Five sidebar buttons (borderless, tags 0..4; click triggers handleSettingsSidebar:).
-        ui.sidebar_general = make_sidebar_button(
-            sidebar_view,
-            target,
-            &t("settings.sidebar_general"),
-            0,
-            14.0,
-            btn_y0,
-            btn_w,
-        );
-        ui.sidebar_switcher = make_sidebar_button(
-            sidebar_view,
-            target,
-            &t("settings.sidebar_switcher"),
-            1,
-            14.0,
-            btn_y0 - 42.0,
-            btn_w,
-        );
-        ui.sidebar_mouse = make_sidebar_button(
-            sidebar_view,
-            target,
-            &t("settings.sidebar_mouse"),
-            2,
-            14.0,
-            btn_y0 - 84.0,
-            btn_w,
-        );
-        ui.sidebar_clipboard = make_sidebar_button(
-            sidebar_view,
-            target,
-            &t("settings.sidebar_clipboard"),
-            3,
-            14.0,
-            btn_y0 - 126.0,
-            btn_w,
-        );
-        ui.sidebar_about = make_sidebar_button(
-            sidebar_view,
-            target,
-            &t("settings.sidebar_about"),
-            4,
-            14.0,
-            btn_y0 - 168.0,
-            btn_w,
-        );
+        let sidebar_buttons = SettingsSidebar::build(sidebar_view, target, 14.0, btn_y0, btn_w);
+        [
+            &mut ui.sidebar_general,
+            &mut ui.sidebar_switcher,
+            &mut ui.sidebar_mouse,
+            &mut ui.sidebar_clipboard,
+            &mut ui.sidebar_about,
+        ]
+        .iter_mut()
+        .zip(sidebar_buttons)
+        .for_each(|(slot, button)| **slot = button);
 
         // HTML `.sidebar-footer`: separator plus a compact Restore Defaults button at the
         // bottom of the navigation column, rather than in the main footer.
@@ -2717,7 +2742,7 @@ fn create_settings_window() {
         }
         let _: () = msg_send![sidebar_view, addSubview: sidebar_footer_line];
         release_obj(sidebar_footer_line);
-        let restore = make_settings_action_button(
+        let restore = SettingsControl::action(
             NSRect::new(NSPoint::new(22.0, 20.0), NSSize::new(card_w - 44.0, 30.0)),
             &t("settings.btn_restore_defaults"),
             target,
@@ -2735,29 +2760,36 @@ fn create_settings_window() {
             NSPoint::new(page_x, 62.0),
             NSSize::new(detail_w - page_inset, page_viewport_h),
         );
-        let general_doc_h = 820.0;
-        let switcher_doc_h = 980.0;
-        let mouse_doc_h = 1240.0;
-        let clipboard_doc_h = 700.0;
-        // About 页文档高度固定且足够高,内容从文档顶部(about_doc_h - 68)向下排布。更新流程
-        // 展开时只撑高卡片和宿主,不再改动文档高度,从而不会让顶部内容错位。
-        // The About document is fixed and tall; content flows down from its top (about_doc_h - 68).
-        // An active update flow grows only the card + host, never the document, so the top content
-        // stays anchored and cannot misalign.
-        let about_doc_h = 1040.0;
+        // Build from generous provisional heights. They are intentionally not shrunk after child
+        // frames are assigned: the pages use manual top-anchored coordinates, so post-hoc
+        // shrinking would let AppKit move the children a second time.
+        // 先用宽松的临时高度构建；子视图定位后不再收缩 document，因为页面是手动顶部锚定坐标，
+        // 布局后收缩会让 AppKit 再次移动子视图。
+        let general_doc_h = 1120.0;
+        let switcher_doc_h = 1280.0;
+        let mouse_doc_h = 1540.0;
+        let clipboard_doc_h = 960.0;
+        let about_doc_h = 1300.0;
 
-        let (general_root, general_view) =
-            make_settings_page(content, page_frame, general_doc_h, false);
+        let general_page = SettingsPage::new(content, page_frame, general_doc_h, false);
+        let general_root = general_page.scroll;
+        let general_view = general_page.document;
         ui.general_view = general_root;
-        let (switcher_root, switcher_view) =
-            make_settings_page(content, page_frame, switcher_doc_h, true);
+        let switcher_page = SettingsPage::new(content, page_frame, switcher_doc_h, true);
+        let switcher_root = switcher_page.scroll;
+        let switcher_view = switcher_page.document;
         ui.switcher_view = switcher_root;
-        let (mouse_root, mouse_view) = make_settings_page(content, page_frame, mouse_doc_h, true);
+        let mouse_page = SettingsPage::new(content, page_frame, mouse_doc_h, true);
+        let mouse_root = mouse_page.scroll;
+        let mouse_view = mouse_page.document;
         ui.mouse_view = mouse_root;
-        let (clipboard_root, clipboard_view) =
-            make_settings_page(content, page_frame, clipboard_doc_h, true);
+        let clipboard_page = SettingsPage::new(content, page_frame, clipboard_doc_h, true);
+        let clipboard_root = clipboard_page.scroll;
+        let clipboard_view = clipboard_page.document;
         ui.clipboard_view = clipboard_root;
-        let (about_root, about_view) = make_settings_page(content, page_frame, about_doc_h, true);
+        let about_page = SettingsPage::new(content, page_frame, about_doc_h, true);
+        let about_root = about_page.scroll;
+        let about_view = about_page.document;
         ui.about_view = about_root;
 
         // ===== 通用页内容 general page content =====
@@ -2820,7 +2852,7 @@ fn create_settings_window() {
         release_obj(warning_label);
 
         // 「打开隐私与安全性」按钮 / "Open Privacy & Security" button
-        let open_btn = make_settings_action_button(
+        let open_btn = SettingsControl::action(
             NSRect::new(
                 NSPoint::new(content_w - 150.0, (banner_h - 28.0) / 2.0),
                 NSSize::new(140.0, 28.0),
@@ -2838,21 +2870,14 @@ fn create_settings_window() {
         // --- 外观 Appearance ---
         y -= 12.0;
         let appearance_header_y = y;
-        add_header(
-            general_view,
-            &t("settings.header_appearance"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + described_row_h;
+        y = layout.next_row_cursor(y, described_row_h);
         let theme_items = [
             t("settings.theme_dark"),
             t("settings.theme_light"),
             t("settings.theme_auto"),
         ];
         let theme_item_refs: Vec<&str> = theme_items.iter().map(String::as_str).collect();
-        ui.theme = add_described_row(
+        ui.theme = SettingsRow::described(
             general_view,
             label_x,
             y,
@@ -2860,11 +2885,11 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_theme"),
             &t("settings.desc_theme"),
-            make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &theme_item_refs, 0),
+            SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &theme_item_refs, 0),
         );
         y -= described_row_h;
-        add_row_separator(general_view, 0.0, y + described_row_h, content_w);
-        ui.glass_style = add_described_row(
+        SettingsRow::separator(general_view, y + described_row_h, content_w);
+        ui.glass_style = SettingsRow::described(
             general_view,
             label_x,
             y,
@@ -2872,13 +2897,13 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_glass_style"),
             &t("settings.desc_glass_style"),
-            make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &["Regular", "Clear"], 0),
+            SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &["Regular", "Clear"], 0),
         );
         let _: () = msg_send![ui.glass_style, setTarget: target];
         let _: () = msg_send![ui.glass_style, setAction: sel!(handleGlassStyleChanged:)];
         y -= described_row_h;
-        add_row_separator(general_view, 0.0, y + described_row_h, content_w);
-        ui.glass_tint = add_described_row(
+        SettingsRow::separator(general_view, y + described_row_h, content_w);
+        ui.glass_tint = SettingsRow::described(
             general_view,
             label_x,
             y,
@@ -2896,9 +2921,9 @@ fn create_settings_window() {
             ),
         );
         configure_glass_tint_panel(target);
-        let appearance_card_bottom = y - 10.0;
-        let appearance_card_top = appearance_header_y - SETTINGS_SECTION_CARD_GAP;
-        add_settings_card(
+        let appearance_card_bottom = layout.card_bottom(y);
+        let appearance_card_top = layout.card_top(appearance_header_y);
+        SettingsSection::attach(
             general_view,
             NSRect::new(
                 NSPoint::new(6.0, appearance_card_bottom),
@@ -2907,19 +2932,13 @@ fn create_settings_window() {
                     appearance_card_top - appearance_card_bottom,
                 ),
             ),
+            &t("settings.header_appearance"),
         );
 
         // --- 实时预览 Live preview ---
-        y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        y = layout.next_section_cursor(y);
         let preview_header_y = y;
-        add_header(
-            general_view,
-            &t("settings.header_preview"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + row_h;
+        y = layout.next_row_cursor(y, row_h);
         let preview_h = 90.0;
         let preview_y = y - preview_h;
         let preview_w = (content_w - 2.0 * label_x - 12.0) / 2.0;
@@ -2949,69 +2968,50 @@ fn create_settings_window() {
             false,
         );
         y = preview_y;
-        add_settings_card(
+        SettingsSection::attach(
             general_view,
             NSRect::new(
                 NSPoint::new(6.0, preview_y - 12.0),
                 NSSize::new(
                     content_w - 12.0,
-                    (preview_header_y - SETTINGS_SECTION_CARD_GAP) - (preview_y - 12.0),
+                    (preview_header_y - layout.card_header_gap) - (preview_y - 12.0),
                 ),
             ),
+            &t("settings.header_preview"),
         );
 
         // --- 语言 Language ---
-        y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        y = layout.next_section_cursor(y);
         let language_header_y = y;
-        add_header(
-            general_view,
-            &t("settings.header_language"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + row_h;
-        let language_card_bottom = y - 10.0;
-        let language_card_top = language_header_y - SETTINGS_SECTION_CARD_GAP;
-        ui.locale = add_row(
+        y = layout.next_row_cursor(y, described_row_h);
+        let language_card_bottom = layout.card_bottom(y);
+        let language_card_top = layout.card_top(language_header_y);
+        ui.locale = SettingsRow::plain(
             general_view,
             label_x,
             y,
             label_w,
-            row_h,
+            described_row_h,
             &t("settings.row_locale"),
-            make_popup(
-                ctrl_x,
-                centered_control_y(language_card_bottom, language_card_top, row_h),
-                ctrl_w,
-                row_h,
-                &LOCALE_LABELS,
-                0,
-            ),
+            SettingsControl::popup(ctrl_x, y, ctrl_w, row_h, &LOCALE_LABELS, 0),
         );
-        add_settings_card(
+        SettingsSection::attach(
             general_view,
             NSRect::new(
                 NSPoint::new(6.0, language_card_bottom),
                 NSSize::new(content_w - 12.0, language_card_top - language_card_bottom),
             ),
+            &t("settings.header_language"),
         );
 
         // --- 日志 Logging ---
-        y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        y = layout.next_section_cursor(y);
         let logging_header_y = y;
-        add_header(
-            general_view,
-            &t("settings.header_logging"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + described_row_h;
+        y = layout.next_row_cursor(y, described_row_h);
         // 日志级别下拉框:项 = [debug, info];默认 index 1(info)。
         // Log level popup: items = [debug, info]; default index 1 (info).
         let log_levels: [&str; 2] = ["Debug", "Info"];
-        ui.log_level = add_described_row(
+        ui.log_level = SettingsRow::described(
             general_view,
             label_x,
             y,
@@ -3019,33 +3019,27 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_log_level"),
             &t("settings.desc_log_level"),
-            make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &log_levels, 1),
+            SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &log_levels, 1),
         );
-        add_settings_card(
+        SettingsSection::attach(
             general_view,
             NSRect::new(
-                NSPoint::new(6.0, y - 10.0),
+                NSPoint::new(6.0, layout.card_bottom(y)),
                 NSSize::new(
                     content_w - 12.0,
-                    (logging_header_y - SETTINGS_SECTION_CARD_GAP) - (y - 10.0),
+                    layout.card_top(logging_header_y) - layout.card_bottom(y),
                 ),
             ),
+            &t("settings.header_logging"),
         );
 
         // --- 启动 Startup ---
-        y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        y = layout.next_section_cursor(y);
         let startup_header_y = y;
-        add_header(
-            general_view,
-            &t("settings.header_startup"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + described_row_h;
+        y = layout.next_row_cursor(y, described_row_h);
         // 开机自启开关:标题留空(左侧 row label 已说明),仅放一个 switch。
         // Launch-at-login switch: no title (the row label on the left already describes it).
-        ui.launch_at_login = add_described_row(
+        ui.launch_at_login = SettingsRow::described(
             general_view,
             label_x,
             y,
@@ -3053,17 +3047,18 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_launch_at_login"),
             &t("settings.desc_launch_at_login"),
-            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
-        add_settings_card(
+        SettingsSection::attach(
             general_view,
             NSRect::new(
-                NSPoint::new(6.0, y - 10.0),
+                NSPoint::new(6.0, layout.card_bottom(y)),
                 NSSize::new(
                     content_w - 12.0,
-                    (startup_header_y - SETTINGS_SECTION_CARD_GAP) - (y - 10.0),
+                    layout.card_top(startup_header_y) - layout.card_bottom(y),
                 ),
             ),
+            &t("settings.header_startup"),
         );
 
         // ===== 应用切换浮窗页内容 switcher overlay page content =====
@@ -3080,18 +3075,11 @@ fn create_settings_window() {
         // --- 窗口 Window ---
         y -= 12.0;
         let windows_header_y = y;
-        add_header(
-            switcher_view,
-            &t("settings.header_windows"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + described_row_h;
+        y = layout.next_row_cursor(y, described_row_h);
         // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器接管)。
         // App-switcher master switch: off = Cmd+Tab passes through to the system.
         let windows_master_row_y = y;
-        ui.windows_enabled = add_described_row(
+        ui.windows_enabled = SettingsRow::described(
             switcher_view,
             label_x,
             y,
@@ -3099,45 +3087,39 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_windows_enabled"),
             &t("settings.desc_windows_enabled"),
-            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
-        add_settings_card(
+        SettingsSection::attach(
             switcher_view,
             NSRect::new(
-                NSPoint::new(6.0, windows_master_row_y - 10.0),
+                NSPoint::new(6.0, layout.card_bottom(windows_master_row_y)),
                 NSSize::new(
                     content_w - 12.0,
-                    (windows_header_y - SETTINGS_SECTION_CARD_GAP) - (windows_master_row_y - 10.0),
+                    layout.card_top(windows_header_y) - layout.card_bottom(windows_master_row_y),
                 ),
             ),
+            &t("settings.header_windows"),
         );
         // The remaining window settings form a second card with its own section title.
         // 其余窗口设置单独成卡,并为卡片补充独立的小标题。
-        y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        y = layout.next_section_cursor(y);
         let windows_options_header_y = y;
-        add_header(
-            switcher_view,
-            &t("settings.header_window_options"),
-            6.0,
-            windows_options_header_y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + described_row_h;
+        y = layout.next_row_cursor(y, described_row_h);
         // show_minimized 开关(切换器语义本就只有显/隐两态,用 Toggle 比下拉更直观)。
         // 英文标签较长,该行标签加宽;开关保留参考页面的右侧内边距。
         // show_minimized is inherently two-state, so a toggle is clearer than a popup. The long
         // English label uses a wider label column, while the switch stays aligned to the popups.
-        ui.show_minimized = add_tall_row(
+        ui.show_minimized = SettingsRow::tall(
             switcher_view,
             label_x,
             y,
             220.0,
             &t("settings.row_show_minimized"),
-            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         )
         .1;
-        y -= 8.0 + described_row_h;
-        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
+        y = layout.next_row_cursor(y, described_row_h);
+        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         // 窗口显示模式:仅图标或图标和缩略图;配置仍由 thumbnails_enabled 布尔值保存。
         // Window display mode: icons only or icons and thumbnails; the config remains stored as
         // the thumbnails_enabled boolean.
@@ -3149,13 +3131,13 @@ fn create_settings_window() {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        ui.thumbnails_enabled = add_tall_row(
+        ui.thumbnails_enabled = SettingsRow::tall(
             switcher_view,
             label_x,
             y,
             220.0,
             &t("settings.row_window_display_mode"),
-            make_popup(
+            SettingsControl::popup(
                 ctrl_x,
                 y + 10.0,
                 ctrl_w,
@@ -3165,9 +3147,9 @@ fn create_settings_window() {
             ),
         )
         .1;
-        y -= 8.0 + described_row_h;
-        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
-        ui.card_text_size = add_described_row(
+        y = layout.next_row_cursor(y, described_row_h);
+        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
+        ui.card_text_size = SettingsRow::described(
             switcher_view,
             label_x,
             y,
@@ -3175,7 +3157,7 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_card_text_size"),
             &t("settings.desc_card_text_size"),
-            make_slider(
+            SettingsControl::slider(
                 ctrl_x,
                 y + 10.0,
                 ctrl_w - TEXT_SIZE_VALUE_W - 6.0,
@@ -3199,9 +3181,9 @@ fn create_settings_window() {
             ui.card_text_size,
             setAction: sel!(handleCardTextSizeChanged:)
         ];
-        y -= 8.0 + described_row_h;
-        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
-        ui.status_bar_text_size = add_described_row(
+        y = layout.next_row_cursor(y, described_row_h);
+        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
+        ui.status_bar_text_size = SettingsRow::described(
             switcher_view,
             label_x,
             y,
@@ -3209,7 +3191,7 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_status_bar_text_size"),
             &t("settings.desc_status_bar_text_size"),
-            make_slider(
+            SettingsControl::slider(
                 ctrl_x,
                 y + 10.0,
                 ctrl_w - TEXT_SIZE_VALUE_W - 6.0,
@@ -3233,8 +3215,8 @@ fn create_settings_window() {
             ui.status_bar_text_size,
             setAction: sel!(handleStatusBarTextSizeChanged:)
         ];
-        y -= 8.0 + described_row_h;
-        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
+        y = layout.next_row_cursor(y, described_row_h);
+        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0。
         // overlay_position popup: [Follow Active Window, Always on Main Screen]; default index 0.
         let op_labels = [
@@ -3242,50 +3224,44 @@ fn create_settings_window() {
             t("settings.overlay_position_main_screen"),
         ];
         let op_label_refs: Vec<&str> = op_labels.iter().map(|s| s.as_str()).collect();
-        ui.overlay_position = add_tall_row(
+        ui.overlay_position = SettingsRow::tall(
             switcher_view,
             label_x,
             y,
             label_w,
             &t("settings.row_overlay_position"),
-            make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &op_label_refs, 0),
+            SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &op_label_refs, 0),
         )
         .1;
-        y -= 8.0 + described_row_h;
-        add_row_separator(switcher_view, 0.0, y + described_row_h + 3.0, content_w);
-        ui.corner_radius = add_tall_row(
+        y = layout.next_row_cursor(y, described_row_h);
+        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
+        ui.corner_radius = SettingsRow::tall(
             switcher_view,
             label_x,
             y,
             label_w,
             &t("settings.row_corner_radius"),
-            make_text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "64"),
+            SettingsControl::text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "64"),
         )
         .1;
-        add_settings_card(
+        SettingsSection::attach(
             switcher_view,
             NSRect::new(
-                NSPoint::new(6.0, y - 10.0),
+                NSPoint::new(6.0, layout.card_bottom(y)),
                 NSSize::new(
                     content_w - 12.0,
-                    (windows_options_header_y - SETTINGS_SECTION_CARD_GAP) - (y - 10.0),
+                    layout.card_top(windows_options_header_y) - layout.card_bottom(y),
                 ),
             ),
+            &t("settings.header_window_options"),
         );
 
         // --- 键盘 Keyboard ---
-        y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        y = layout.next_section_cursor(y);
         let keyboard_header_y = y;
-        add_header(
-            switcher_view,
-            &t("settings.header_keyboard"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + described_row_h;
-        let keyboard_card_bottom = y - 10.0;
-        let keyboard_card_top = keyboard_header_y - SETTINGS_SECTION_CARD_GAP;
+        y = layout.next_row_cursor(y, described_row_h);
+        let keyboard_card_bottom = layout.card_bottom(y);
+        let keyboard_card_top = layout.card_top(keyboard_header_y);
         // 修饰键下拉项:显示 Option+Tab / Command+Tab;值由索引映射到 option/command。
         // Modifier popup shows Option+Tab / Command+Tab; the index maps to option/command.
         let mod_labels = [
@@ -3293,28 +3269,22 @@ fn create_settings_window() {
             t("settings.modifier_command"),
         ];
         let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
-        ui.modifier = add_tall_row(
+        ui.modifier = SettingsRow::tall(
             switcher_view,
             label_x,
             y,
             label_w,
             &t("settings.row_modifier"),
-            make_popup(
-                ctrl_x,
-                centered_control_y(keyboard_card_bottom, keyboard_card_top, row_h),
-                ctrl_w,
-                row_h,
-                &mod_label_refs,
-                0,
-            ),
+            SettingsControl::popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0),
         )
         .1;
-        add_settings_card(
+        SettingsSection::attach(
             switcher_view,
             NSRect::new(
                 NSPoint::new(6.0, keyboard_card_bottom),
                 NSSize::new(content_w - 12.0, keyboard_card_top - keyboard_card_bottom),
             ),
+            &t("settings.header_keyboard"),
         );
 
         // ===== 鼠标页内容 mouse page content =====
@@ -3329,9 +3299,9 @@ fn create_settings_window() {
         y -= 62.0;
 
         // --- 启用鼠标控制(总开关,置于最顶) / Enable mouse control (topmost) ---
-        y -= 8.0 + described_row_h;
+        y = layout.next_row_cursor(y, described_row_h);
         let enable_mouse_bottom = y;
-        ui.enable_mouse = add_described_row(
+        ui.enable_mouse = SettingsRow::described(
             mouse_view,
             label_x,
             y,
@@ -3339,43 +3309,39 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_enable_mouse"),
             &t("settings.desc_enable_mouse"),
-            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
         // switch toggle 时实时更新 OK 按钮标题(确认 vs 确认并重启)。
         // Update OK button title in real time when the switch toggles (OK vs OK && Restart).
         let _: () = msg_send![ui.enable_mouse, setTarget: target];
         let _: () = msg_send![ui.enable_mouse, setAction: sel!(handleEnableMouseToggle:)];
-        add_settings_card(
+        SettingsCard::attach(
             mouse_view,
             NSRect::new(
-                NSPoint::new(6.0, enable_mouse_bottom - 10.0),
-                NSSize::new(content_w - 12.0, described_row_h + 20.0),
+                NSPoint::new(6.0, enable_mouse_bottom - layout.card_padding),
+                NSSize::new(
+                    content_w - 12.0,
+                    described_row_h + layout.card_padding * 2.0,
+                ),
             ),
         );
 
         // --- 设备选择器(内嵌下拉框,切换即时刷新其余控件) / Device picker (inline popup) ---
-        y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        y = layout.next_section_cursor(y);
         let device_header_y = y;
-        add_header(
-            mouse_view,
-            &t("settings.header_mouse_device"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + described_row_h;
+        y = layout.next_row_cursor(y, described_row_h);
         // 下拉框:items 在 load_settings_values 里动态重建(设备列表可变)。
         // 首次创建放一个占位项,真正的内容在 load_settings_values -> rebuild_device_popup 填入。
         // Popup: items are rebuilt dynamically in load_settings_values (device list is mutable).
         // A placeholder is inserted here; the real items are filled by rebuild_device_popup.
-        let dev_popup = make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &[""], 0);
+        let dev_popup = SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &[""], 0);
         style_flat_popup(dev_popup);
         // 绑定 target/action:选择变化时即时刷新其余控件为该设备的有效值。
         // Bind target/action: on selection change, immediately refresh the other controls with
         // the selected device's effective values.
         let _: () = msg_send![dev_popup, setTarget: target];
         let _: () = msg_send![dev_popup, setAction: sel!(handleDeviceChanged:)];
-        ui.device_indicator = add_tall_row(
+        ui.device_indicator = SettingsRow::tall(
             mouse_view,
             label_x,
             y,
@@ -3386,10 +3352,11 @@ fn create_settings_window() {
         .1;
 
         // --- 滚动模式 / Scroll mode ---
-        y -= 8.0 + described_row_h;
-        let scroll_popup = make_popup(ctrl_x, y + 10.0, ctrl_w, row_h, &SCROLL_MODE_LABELS, 0);
+        y = layout.next_row_cursor(y, described_row_h);
+        let scroll_popup =
+            SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &SCROLL_MODE_LABELS, 0);
         style_flat_popup(scroll_popup);
-        ui.scroll_mode = add_tall_row(
+        ui.scroll_mode = SettingsRow::tall(
             mouse_view,
             label_x,
             y,
@@ -3403,15 +3370,15 @@ fn create_settings_window() {
         let _: () = msg_send![ui.scroll_mode, setTarget: target];
         let _: () = msg_send![ui.scroll_mode, setAction: sel!(handleScrollModeChanged:)];
         // The HTML device card contains both rows, with one internal hairline between them.
-        add_row_separator(mouse_view, 0.0, y + described_row_h + 3.0, content_w);
+        SettingsRow::separator(mouse_view, y + described_row_h + 3.0, content_w);
 
         // --- 行数(按行模式) / Line count (line mode) ---
         // Keep this conditional row in the same card as Device and Scroll mode.
         // 将这个条件行放进与 Device、Scroll mode 相同的卡片中。
-        y -= 8.0 + described_row_h;
+        y = layout.next_row_cursor(y, described_row_h);
         ui.line_count_separator =
-            add_row_separator(mouse_view, 0.0, y + described_row_h + 3.0, content_w);
-        let (line_label, line_ctrl) = add_tall_row(
+            SettingsRow::separator(mouse_view, y + described_row_h + 3.0, content_w);
+        let (line_label, line_ctrl) = SettingsRow::tall(
             mouse_view,
             label_x,
             y,
@@ -3421,7 +3388,7 @@ fn create_settings_window() {
             // 右侧留 ~40pt 放只读数值 label 显示当前值。
             // Integer slider 1..=10 (matches config validation; mirrors LinearMouse's
             // By Lines slider interaction). ~40pt on the right holds a read-only value label.
-            make_slider(ctrl_x, y + 10.0, ctrl_w - 40.0, row_h, 1, 10, 3),
+            SettingsControl::slider(ctrl_x, y + 10.0, ctrl_w - 40.0, row_h, 1, 10, 3),
         );
         ui.line_count = line_ctrl;
         ui.line_count_label = line_label;
@@ -3444,34 +3411,30 @@ fn create_settings_window() {
         // Refresh the value label live as the slider is dragged.
         let _: () = msg_send![ui.line_count, setTarget: target];
         let _: () = msg_send![ui.line_count, setAction: sel!(handleLineCountChanged:)];
-        let (device_card, device_shadow) = add_settings_card(
+        let device_card_parts = SettingsSection::attach(
             mouse_view,
             NSRect::new(
-                NSPoint::new(6.0, y - 10.0),
+                NSPoint::new(6.0, layout.card_bottom(y)),
                 NSSize::new(
                     content_w - 12.0,
-                    (device_header_y - SETTINGS_SECTION_CARD_GAP) - (y - 10.0),
+                    layout.card_top(device_header_y) - layout.card_bottom(y),
                 ),
             ),
+            &t("settings.header_mouse_device"),
         );
+        let device_card = device_card_parts.card;
+        let device_shadow = device_card_parts.shadow;
         ui.line_count_card = device_card;
         ui.line_count_shadow = device_shadow;
 
         // --- 滚动 Scrolling ---
-        y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        y = layout.next_section_cursor(y);
         let scrolling_header_y = y;
-        add_header(
-            mouse_view,
-            &t("settings.header_mouse_scrolling"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + described_row_h;
+        y = layout.next_row_cursor(y, described_row_h);
         // reverse_scroll 开关:标题+副标题描述滚动方向,开关保留右侧内边距。
         // reverse_scroll switch: title + subtitle describe the scroll inversion; the switch
         // keeps the reference page's trailing inset.
-        ui.reverse_scroll = add_described_row(
+        ui.reverse_scroll = SettingsRow::described(
             mouse_view,
             label_x,
             y,
@@ -3479,36 +3442,30 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_reverse_scroll"),
             &t("settings.desc_reverse_scroll"),
-            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
-        add_settings_card(
+        SettingsSection::attach(
             mouse_view,
             NSRect::new(
-                NSPoint::new(6.0, y - 10.0),
+                NSPoint::new(6.0, layout.card_bottom(y)),
                 NSSize::new(
                     content_w - 12.0,
-                    (scrolling_header_y - SETTINGS_SECTION_CARD_GAP) - (y - 10.0),
+                    layout.card_top(scrolling_header_y) - layout.card_bottom(y),
                 ),
             ),
+            &t("settings.header_mouse_scrolling"),
         );
 
         // --- 指针 Pointer ---
-        y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        y = layout.next_section_cursor(y);
         let pointer_header_y = y;
-        add_header(
-            mouse_view,
-            &t("settings.header_mouse_pointer"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
-        y -= 8.0 + described_row_h;
+        y = layout.next_row_cursor(y, described_row_h);
         // disable_pointer_accel 开关:禁用系统鼠标加速,光标 1:1 线性跟踪。
         // 副标题说明线性跟踪的用途;开关与所有开关行一样保留右侧内边距。
         // disable_pointer_accel switch: disable system pointer acceleration for 1:1 linear
         // cursor tracking. The subtitle explains linear tracking; the switch keeps the same
         // trailing inset as every other switch row.
-        ui.disable_pointer_accel = add_described_row(
+        ui.disable_pointer_accel = SettingsRow::described(
             mouse_view,
             label_x,
             y,
@@ -3516,37 +3473,31 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_disable_pointer_accel"),
             &t("settings.desc_disable_pointer_accel"),
-            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
-        add_settings_card(
+        SettingsSection::attach(
             mouse_view,
             NSRect::new(
-                NSPoint::new(6.0, y - 10.0),
+                NSPoint::new(6.0, layout.card_bottom(y)),
                 NSSize::new(
                     content_w - 12.0,
-                    (pointer_header_y - SETTINGS_SECTION_CARD_GAP) - (y - 10.0),
+                    layout.card_top(pointer_header_y) - layout.card_bottom(y),
                 ),
             ),
+            &t("settings.header_mouse_pointer"),
         );
 
         // --- 按键映射 Button Mappings ---
         // 绑定区:"Enable button mappings" 描述行 + 嵌套表格卡片(圆角子表格 + 添加按钮)。
         // Button mappings: an "Enable button mappings" described row + a nested table card
         // (rounded sub-table + the add-mapping button).
-        y -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        y = layout.next_section_cursor(y);
         let mappings_header_y = y;
-        add_header(
-            mouse_view,
-            &t("settings.header_mouse_mappings"),
-            6.0,
-            y,
-            content_w - 12.0,
-        );
         // "Enable button mappings" 描述行(HTML 卡片顶部),替代原来放在区块标题右侧的开关。
         // "Enable button mappings" described row (HTML card top), replacing the old switch
         // that sat on the section-header row's right edge.
-        y -= 8.0 + described_row_h;
-        ui.mapping_enabled = add_described_row(
+        y = layout.next_row_cursor(y, described_row_h);
+        ui.mapping_enabled = SettingsRow::described(
             mouse_view,
             label_x,
             y,
@@ -3554,19 +3505,20 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_mapping_enable"),
             &t("settings.desc_mapping_enable"),
-            make_switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
         let _: () = msg_send![ui.mapping_enabled, setTarget: target];
         let _: () = msg_send![ui.mapping_enabled, setAction: sel!(handleMappingEnabledChanged:)];
-        add_settings_card(
+        SettingsSection::attach(
             mouse_view,
             NSRect::new(
-                NSPoint::new(6.0, y - 10.0),
+                NSPoint::new(6.0, layout.card_bottom(y)),
                 NSSize::new(
                     content_w - 12.0,
-                    (mappings_header_y - SETTINGS_SECTION_CARD_GAP) - (y - 10.0),
+                    layout.card_top(mappings_header_y) - layout.card_bottom(y),
                 ),
             ),
+            &t("settings.header_mouse_mappings"),
         );
 
         // --- 嵌套表格卡片(nested table card) ---
@@ -3711,17 +3663,10 @@ fn create_settings_window() {
         );
         cy -= 62.0;
         let clipboard_header_y = cy - 18.0;
-        add_header(
-            clipboard_view,
-            &t("settings.header_clipboard"),
-            6.0,
-            cy - 18.0,
-            content_w - 12.0,
-        );
         // header 与首行间距与其他页一致(8 + row_h = 30):此前 16pt 挨得太近。
         // Header-to-first-row gap matches the other pages (8 + row_h = 30); it used to be
         // 16pt, too cramped.
-        cy -= 18.0 + 8.0 + described_row_h;
+        cy = layout.next_row_cursor_with_extra(cy, described_row_h, 18.0);
         // 启用开关 / master switch.
         // 启用开关 / master switch.
         // 英文 "Enable clipboard history"(实测 146pt)+ cell 内边距在 label_w=150 边缘,
@@ -3729,7 +3674,7 @@ fn create_settings_window() {
         // English "Enable clipboard history" (measured 146pt) plus cell padding sits on
         // the label_w=150 edge; widen to 225 along with the persist/move_used_to_top rows.
         let clipboard_master_row_y = cy;
-        ui.clipboard_enabled = add_described_row(
+        ui.clipboard_enabled = SettingsRow::described(
             clipboard_view,
             label_x,
             cy,
@@ -3737,31 +3682,25 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_clipboard_enabled"),
             &t("settings.desc_clipboard_enabled"),
-            make_switch(ctrl_x + ctrl_w, cy, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
-        add_settings_card(
+        SettingsSection::attach(
             clipboard_view,
             NSRect::new(
-                NSPoint::new(6.0, clipboard_master_row_y - 10.0),
+                NSPoint::new(6.0, layout.card_bottom(clipboard_master_row_y)),
                 NSSize::new(
                     content_w - 12.0,
-                    (clipboard_header_y - SETTINGS_SECTION_CARD_GAP)
-                        - (clipboard_master_row_y - 10.0),
+                    layout.card_top(clipboard_header_y)
+                        - layout.card_bottom(clipboard_master_row_y),
                 ),
             ),
+            &t("settings.header_clipboard"),
         );
         // Keep the history controls in a second titled card, matching the switcher layout.
         // 其余历史记录设置单独成卡,并与切换器页面使用相同的小标题间距。
-        cy -= SETTINGS_SECTION_HEADER_GAP + 24.0;
+        cy = layout.next_section_cursor(cy);
         let clipboard_options_header_y = cy;
-        add_header(
-            clipboard_view,
-            &t("settings.header_clipboard_options"),
-            6.0,
-            clipboard_options_header_y,
-            content_w - 12.0,
-        );
-        cy -= 8.0 + row_h;
+        cy = layout.next_row_cursor(cy, described_row_h);
         // 置顶后选中项位置下拉框:项 = [跟随置顶, 保持当前位置];默认 index 0(跟随置顶),
         // 实际值由 load_settings_from 填充。
         // Pin-selection popup: items = [Follow the Pinned Entry, Keep Current Position];
@@ -3771,17 +3710,17 @@ fn create_settings_window() {
             t("settings.pin_keep_position"),
         ];
         let pin_label_refs: Vec<&str> = pin_labels.iter().map(|s| s.as_str()).collect();
-        ui.clipboard_pin_follow = add_row(
+        ui.clipboard_pin_follow = SettingsRow::plain(
             clipboard_view,
             label_x,
             cy,
             220.0,
-            row_h,
+            described_row_h,
             &t("settings.row_clipboard_pin_follow"),
-            make_popup(ctrl_x, cy, ctrl_w, row_h, &pin_label_refs, 0),
+            SettingsControl::popup(ctrl_x, cy, ctrl_w, row_h, &pin_label_refs, 0),
         );
-        cy -= 8.0 + row_h;
-        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
+        cy = layout.next_row_cursor(cy, described_row_h);
+        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
         // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。
         // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
         // privacy implications are documented in the README).
@@ -3794,29 +3733,29 @@ fn create_settings_window() {
         // chars) and English labels both exceed the default label_w=150 (rendered
         // truncated), so this row widens its label to 225 -- same as the
         // show_minimized row; the switch keeps the trailing inset and stays clear of the edge.
-        ui.clipboard_persist = add_row(
+        ui.clipboard_persist = SettingsRow::plain(
             clipboard_view,
             label_x,
             cy,
             220.0,
-            row_h,
+            described_row_h,
             &t("settings.row_clipboard_persist"),
-            make_switch(ctrl_x + ctrl_w, cy, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
-        cy -= 8.0 + row_h;
-        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
+        cy = layout.next_row_cursor(cy, described_row_h);
+        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
         // 显示来源应用 / show the source app.
-        ui.clipboard_show_source_app = add_row(
+        ui.clipboard_show_source_app = SettingsRow::plain(
             clipboard_view,
             label_x,
             cy,
             label_w,
-            row_h,
+            described_row_h,
             &t("settings.row_clipboard_show_source_app"),
-            make_switch(ctrl_x + ctrl_w, cy, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
-        cy -= 8.0 + row_h;
-        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
+        cy = layout.next_row_cursor(cy, described_row_h);
+        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
         // 使用后移到最前(粘贴是否重排历史;默认开 = 保持现状)。
         // Move used entries to the top (whether pasting reorders the history; on by
         // default = current behavior).
@@ -3825,50 +3764,50 @@ fn create_settings_window() {
         // English "Move used entries to top" (measured 150.3pt) exceeds label_w=150 and
         // rendered truncated ("move used entries to" after switching to English), widened
         // to 225.
-        ui.clipboard_move_used_to_top = add_row(
+        ui.clipboard_move_used_to_top = SettingsRow::plain(
             clipboard_view,
             label_x,
             cy,
             220.0,
-            row_h,
+            described_row_h,
             &t("settings.row_clipboard_move_used_to_top"),
-            make_switch(ctrl_x + ctrl_w, cy, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
-        cy -= 8.0 + row_h;
-        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
+        cy = layout.next_row_cursor(cy, described_row_h);
+        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
         // 最大条数(数字输入)/ max entries (number input).
-        ui.clipboard_max_entries = add_row(
+        ui.clipboard_max_entries = SettingsRow::plain(
             clipboard_view,
             label_x,
             cy,
             label_w,
-            row_h,
+            described_row_h,
             &t("settings.row_clipboard_max_entries"),
-            make_text_input(ctrl_x, cy, ctrl_w, row_h, "50"),
+            SettingsControl::text_input(ctrl_x, cy, ctrl_w, row_h, "50"),
         );
-        cy -= 8.0 + row_h;
-        add_row_separator(clipboard_view, 0.0, cy + row_h + 3.0, content_w);
+        cy = layout.next_row_cursor(cy, described_row_h);
+        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
         // 自动过期天数(数字输入,0 = 关闭)/ auto-expire days (number input, 0 = off).
-        ui.clipboard_auto_expire_days = add_row(
+        ui.clipboard_auto_expire_days = SettingsRow::plain(
             clipboard_view,
             label_x,
             cy,
             label_w,
-            row_h,
+            described_row_h,
             &t("settings.row_clipboard_auto_expire_days"),
-            make_text_input(ctrl_x, cy, ctrl_w, row_h, "3"),
+            SettingsControl::text_input(ctrl_x, cy, ctrl_w, row_h, "3"),
         );
-        let clipboard_options_card_bottom = cy - 10.0;
-        add_settings_card(
+        let clipboard_options_card_bottom = layout.card_bottom(cy);
+        SettingsSection::attach(
             clipboard_view,
             NSRect::new(
                 NSPoint::new(6.0, clipboard_options_card_bottom),
                 NSSize::new(
                     content_w - 12.0,
-                    (clipboard_options_header_y - SETTINGS_SECTION_CARD_GAP)
-                        - clipboard_options_card_bottom,
+                    layout.card_top(clipboard_options_header_y) - clipboard_options_card_bottom,
                 ),
             ),
+            &t("settings.header_clipboard_options"),
         );
 
         // ===== About page: page-header + App and Updates cards from preview (10). =====
@@ -3941,15 +3880,8 @@ fn create_settings_window() {
         // 让 App 分组标题贴近下方卡片,与其他设置页保持一致。About 卡片有两行内容,其内容
         // 游标比普通区块标题更低;沿用旧游标会在标题和卡片之间留下过大的空白。
         let app_label_y = ay - 35.0;
-        add_header(
-            about_view,
-            &t("settings.section_app"),
-            6.0,
-            app_label_y,
-            content_w - 12.0,
-        );
         ay -= 27.0;
-        let about_row_step = 8.0 + row_h;
+        let about_row_step = layout.row_gap + row_h;
         let about_text_h = (row_h - 12.0).max(1.0);
         let website_y = ay - about_row_step;
         let website_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -4004,7 +3936,7 @@ fn create_settings_window() {
         let _: () = msg_send![about_view, addSubview: website_url];
         release_obj(website_url);
         let github_y = website_y - about_row_step;
-        add_row_separator(about_view, 0.0, github_y + row_h + 3.0, content_w);
+        SettingsRow::separator(about_view, github_y + row_h + 3.0, content_w);
         let github_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let github_label: *mut AnyObject = msg_send![
             github_label,
@@ -4055,7 +3987,7 @@ fn create_settings_window() {
         let _: () = msg_send![about_view, addSubview: github_url];
         release_obj(github_url);
         let version_y = github_y - about_row_step;
-        add_row_separator(about_view, 0.0, version_y + row_h + 3.0, content_w);
+        SettingsRow::separator(about_view, version_y + row_h + 3.0, content_w);
         let version_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let version_label: *mut AnyObject = msg_send![
             version_label,
@@ -4092,30 +4024,24 @@ fn create_settings_window() {
         let _: () = msg_send![version_value, setTextColor: version_value_color];
         let _: () = msg_send![about_view, addSubview: version_value];
         release_obj(version_value);
-        let app_card_bottom = version_y - 10.0;
-        add_settings_card(
+        let app_card_bottom = layout.card_bottom(version_y);
+        SettingsSection::attach(
             about_view,
             NSRect::new(
                 NSPoint::new(6.0, app_card_bottom),
                 NSSize::new(
                     content_w - 12.0,
-                    (app_label_y - SETTINGS_SECTION_CARD_GAP) - app_card_bottom,
+                    layout.card_top(app_label_y) - app_card_bottom,
                 ),
             ),
+            &t("settings.section_app"),
         );
 
         ay = version_y - 42.0;
         let updates_label_y = ay - 11.0;
-        add_header(
-            about_view,
-            &t("settings.section_updates"),
-            6.0,
-            updates_label_y,
-            content_w - 12.0,
-        );
         ay -= 27.0;
         let update_row_y = ay - 44.0;
-        ui.update_auto_check = add_described_row(
+        ui.update_auto_check = SettingsRow::described(
             about_view,
             label_x,
             update_row_y,
@@ -4123,12 +4049,12 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_update_auto_check"),
             &t("settings.desc_update_auto_check"),
-            make_switch(ctrl_x + ctrl_w, update_row_y + 10.0, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, update_row_y + 10.0, row_h, false),
         );
         // 自动下载并安装更新开关,位于「自动检查更新」与「检查更新」之间。
         // Automatically-download-and-install switch, between auto-check and the check button.
         let download_row_y = update_row_y - described_row_h;
-        ui.update_auto_download = add_described_row(
+        ui.update_auto_download = SettingsRow::described(
             about_view,
             label_x,
             download_row_y,
@@ -4136,12 +4062,16 @@ fn create_settings_window() {
             described_row_h,
             &t("settings.row_update_auto_download"),
             &t("settings.desc_update_auto_download"),
-            make_switch(ctrl_x + ctrl_w, download_row_y + 10.0, row_h, false),
+            SettingsControl::switch(ctrl_x + ctrl_w, download_row_y + 10.0, row_h, false),
         );
+        // Keep the two update toggles visually grouped with the same inset divider used by other
+        // multi-row cards. The rows are contiguous here, so the divider sits at their shared edge.
+        // 两个更新开关属于同一张多行卡片，复用其他卡片的内缩分割线；两行相邻，分割线放在共享边界。
+        SettingsRow::separator(about_view, update_row_y, content_w);
         // 检查更新:全宽长按钮,标题随流程在「检查更新…/检查中…/已是最新版本」间切换,尺寸不变。
         // Check for updates: a full-width button whose title switches between "Check for Updates…",
         // "Checking…", and "You're up to date" without changing size.
-        let check_button = make_settings_action_button(
+        let check_button = SettingsControl::action(
             NSRect::new(
                 NSPoint::new(label_x, update_row_y - described_row_h - 46.0),
                 NSSize::new(content_w - 2.0 * label_x, 32.0),
@@ -4193,20 +4123,25 @@ fn create_settings_window() {
         // Collapsed card bottom hugs the check button below (update_row_y - described_row_h - 56);
         // the inline area is not reserved by default, avoiding a large blank.
         let compact_card_bottom = update_row_y - described_row_h - 56.0;
-        let (update_card, update_card_shadow) = add_settings_card(
+        let update_card_parts = SettingsSection::attach(
             about_view,
             NSRect::new(
                 NSPoint::new(6.0, compact_card_bottom),
                 NSSize::new(
                     content_w - 12.0,
-                    (updates_label_y - SETTINGS_SECTION_CARD_GAP) - compact_card_bottom,
+                    layout.card_top(updates_label_y) - compact_card_bottom,
                 ),
             ),
+            &t("settings.section_updates"),
         );
+        let update_card = update_card_parts.card;
+        let update_card_shadow = update_card_parts.shadow;
         ui.update_card = update_card;
         ui.update_card_shadow = update_card_shadow;
-        ui.update_card_compact_h =
-            (updates_label_y - SETTINGS_SECTION_CARD_GAP) - compact_card_bottom;
+        ui.update_card_compact_h = {
+            let compact_frame: NSRect = msg_send![update_card, frame];
+            compact_frame.size.height
+        };
 
         // banner 最后添加:作为 general_view 的最后一个 subview,保证在内容之上(缺权限时覆盖顶部)。
         // Added last: as general_view's final subview so it floats above the content (when
@@ -4214,9 +4149,57 @@ fn create_settings_window() {
         let _: () = msg_send![general_view, addSubview: banner];
         release_obj(banner);
 
+        // Let AppKit finish its first layout pass before validating the actual view tree. Do not
+        // shrink the provisional documents here: their children are top-anchored with
+        // autoresizing masks, and post-hoc height fitting can move them a second time.
+        // 先让 AppKit 完成首次布局，再校验真实 view tree。这里不收缩临时 document 高度：子视图
+        // 使用顶部锚定 autoresizing，布局后再改高度会触发第二次位移。
+        let _: () = msg_send![window, layoutIfNeeded];
+        for (name, page) in [
+            (
+                "general",
+                SettingsPage {
+                    scroll: general_root,
+                    document: general_view,
+                },
+            ),
+            (
+                "switcher",
+                SettingsPage {
+                    scroll: switcher_root,
+                    document: switcher_view,
+                },
+            ),
+            (
+                "mouse",
+                SettingsPage {
+                    scroll: mouse_root,
+                    document: mouse_view,
+                },
+            ),
+            (
+                "clipboard",
+                SettingsPage {
+                    scroll: clipboard_root,
+                    document: clipboard_view,
+                },
+            ),
+            (
+                "about",
+                SettingsPage {
+                    scroll: about_root,
+                    document: about_view,
+                },
+            ),
+        ] {
+            page.validate(name);
+        }
+        let update_host_frame: NSRect = msg_send![ui.update_host, frame];
+        ui.update_host_origin_y = update_host_frame.origin.y;
+
         // --- 确认 / 取消(右侧 footer 内,所有页面都可见)---
         // Cancel and OK are children of the detail pane's footer, matching the HTML layout.
-        let cancel = make_settings_action_button(
+        let cancel = SettingsControl::action(
             NSRect::new(
                 NSPoint::new(content_x + detail_w - 202.0, 14.0),
                 NSSize::new(86.0, 32.0),
@@ -4238,7 +4221,7 @@ fn create_settings_window() {
         let _: () = msg_send![content, addSubview: cancel];
         release_obj(cancel);
 
-        let ok = make_settings_action_button(
+        let ok = SettingsControl::action(
             NSRect::new(
                 NSPoint::new(content_x + detail_w - 106.0, 14.0),
                 NSSize::new(86.0, 32.0),
@@ -4351,5 +4334,34 @@ mod tests {
             screen.origin.y + GLASS_TINT_SCREEN_MARGIN
         );
         assert!(panel_frame.origin.y + panel.size.height <= screen.origin.y + screen.size.height);
+    }
+
+    /// Exercise the real settings window on the AppKit main thread. This cannot run in the
+    /// normal headless suite because NSWindow construction is GUI/session dependent.
+    /// 在真实 AppKit 主线程中构建并遍历设置窗口；依赖 GUI 会话，因此不进入普通无头测试。
+    #[test]
+    #[ignore]
+    fn settings_layout_smoke() {
+        let exe = std::env::current_exe().expect("current exe");
+        let app = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("oh-my-tab"))
+            .expect("app binary path");
+        assert!(
+            app.exists(),
+            "app binary missing at {}: run `cargo build` first",
+            app.display()
+        );
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-settings-layout")
+            .output()
+            .expect("failed to spawn app");
+        assert!(
+            out.status.success(),
+            "settings layout smoke failed (exit {:?})\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

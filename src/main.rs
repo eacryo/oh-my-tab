@@ -1799,6 +1799,26 @@ fn main() {
         }
     }
 
+    // 设置页冒烟测试入口:在真实 NSApplication 主线程中打开并遍历五个页面,让 runtime
+    // layout validator 检查最终 AppKit view tree。需要 GUI 会话,失败时由 panic/exit code 表示。
+    // Settings layout smoke entry: open and traverse all five pages on the real NSApplication
+    // main thread so the runtime layout validator checks the final AppKit view tree. Requires a
+    // GUI session; a panic/non-zero exit reports a failure.
+    if std::env::args().any(|a| a == "--smoke-settings-layout") {
+        unsafe {
+            std::env::set_var("OH_MY_TAB_LAYOUT_DEBUG", "1");
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            let ok = settings::settings_layout_smoke_runner();
+            if !ok {
+                eprintln!("[smoke-settings-layout] settings window was not created");
+                std::process::exit(1);
+            }
+            log_info!("[smoke-settings-layout] all pages survived");
+            std::process::exit(0);
+        }
+    }
+
     // 8. Run the main event loop (blocks until [NSApp terminate:])
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];

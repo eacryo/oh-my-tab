@@ -559,21 +559,6 @@ pub(crate) fn reset_thumbnail_nav_anchor() {
 
 // ========== 文本 helper / text helpers ==========
 
-/// 截断文本到指定显示宽度(ASCII 计 1、其余计 2),超出加省略号。
-/// Truncate text to a display width (ASCII=1, others=2), appending an ellipsis if exceeded.
-fn truncate_text(text: &str, max_width: usize) -> String {
-    let mut width: usize = 0;
-    for (i, c) in text.char_indices() {
-        let w = if c.is_ascii() { 1 } else { 2 };
-        if width + w > max_width {
-            let t: String = text[..i].chars().collect();
-            return format!("{}…", t);
-        }
-        width += w;
-    }
-    text.to_string()
-}
-
 /// 保留 RRGGBB,只替换 RRGGBBAA 的 alpha。
 /// Preserve RRGGBB and replace only the alpha in RRGGBBAA.
 fn color_with_alpha(color: u32, alpha: u8) -> u32 {
@@ -2032,11 +2017,13 @@ pub(crate) fn update_status_label() {
             match state.windows.get(selected) {
                 // 设计稿 .footer-current:选中的「标题 · 应用名」。
                 // The mockup's .footer-current: the selected "title · app".
-                Some(w) if w.window_title.is_empty() => truncate_text(&w.app_name, 40),
+                Some(w) if w.window_title.is_empty() => {
+                    display_title(&w.window_title, &w.app_name).to_string()
+                }
                 Some(w) => format!(
                     "{} · {}",
-                    truncate_text(display_title(&w.window_title, &w.app_name), 96),
-                    truncate_text(&w.app_name, 40)
+                    display_title(&w.window_title, &w.app_name),
+                    w.app_name
                 ),
                 None => String::new(),
             }
@@ -2055,17 +2042,21 @@ pub(crate) fn update_status_label() {
         CFRelease(ns_stat as *const c_void);
         let _: () = msg_send![status_label, setFont: status_font];
         let _: () = msg_send![status_label, setTextColor: status_color];
-        // Size to fit + recenter horizontally
-        let _: () = msg_send![status_label, sizeToFit];
-        let fitted: NSRect = msg_send![status_label, frame];
-        let stat_w = fitted.size.width;
         let container_w = {
             let container = CONTAINER.lock().unwrap();
             let c = container.unwrap().0;
             let f: NSRect = msg_send![c, frame];
             f.size.width
         };
-        let stat_x = ((container_w - stat_w) / 2.0).max(0.0);
+        // Keep a fixed visual frame so native tail truncation is based on the actual font and
+        // available width. Manual ASCII/CJK width estimates made long titles overflow or cut
+        // Unicode grapheme clusters.
+        // 使用固定可视 frame，让原生控件依据实际字体和可用宽度尾部截断。手工 ASCII/CJK
+        // 宽度估算会导致长标题越界或切断 Unicode 组合字符。
+        let _: () = msg_send![status_label, setUsesSingleLineMode: true];
+        let _: () = msg_send![status_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+        let stat_w = (container_w - H_PADDING * 2.0).max(1.0);
+        let stat_x = H_PADDING;
         let ascender: f64 = msg_send![status_font, ascender];
         let descender: f64 = msg_send![status_font, descender];
         let line_h = (ascender - descender + 1.0).clamp(11.0, footer_h);

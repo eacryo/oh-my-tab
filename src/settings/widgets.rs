@@ -955,6 +955,7 @@ pub(super) unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selecte
         .unwrap_or(btn);
     let _: () = msg_send![label, setStringValue: title_ns];
     let _: () = msg_send![label, setAttributedStringValue: attr_str];
+    center_sidebar_label(label, 38.0);
     if let Some(icon) = SIDEBAR_ICON_VIEWS
         .lock()
         .unwrap()
@@ -969,16 +970,46 @@ pub(super) unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selecte
     release_obj(attrs);
 }
 
+/// Fit the sidebar label to its measured single-line cell height and center that frame in the
+/// 38pt tab. This compensates for AppKit's top-biased text drawing when the label frame is taller
+/// than the actual line height, and is rerun when selection changes the font weight.
+/// 将侧栏文本 frame 收紧到 cell 测得的单行高度，再把它放到 38pt tab 的垂直中心；这样可抵消
+/// AppKit 在大 frame 中偏上绘制文字的问题，并在选中态切换字重后重新计算。
+unsafe fn center_sidebar_label(label: *mut AnyObject, row_h: f64) {
+    if label.is_null() {
+        return;
+    }
+    let cell: *mut AnyObject = msg_send![label, cell];
+    if cell.is_null() {
+        return;
+    }
+    let bounds: NSRect = msg_send![label, bounds];
+    let measured: NSSize = msg_send![cell, cellSizeForBounds: bounds];
+    if !measured.height.is_finite() || measured.height <= 0.0 {
+        return;
+    }
+    let mut frame: NSRect = msg_send![label, frame];
+    frame.origin.y = (row_h - measured.height).max(0.0) / 2.0;
+    frame.size.height = measured.height;
+    let _: () = msg_send![label, setFrame: frame];
+}
+
 /// 侧边栏按钮(borderless NSButton,左对齐图标+文字,tag 区分页)。
 /// Sidebar button (borderless NSButton; left-aligned icon + title; tag selects the page).
+/// The component layer supplies the child frames so every item shares one alignment contract.
+/// 子视图 frame 由组件层传入，保证所有条目遵守同一套对齐契约。
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn make_sidebar_button(
     parent: *mut AnyObject,
     target: *mut AnyObject,
     title: &str,
+    symbol: &str,
     tag: isize,
     x: f64,
     y: f64,
     w: f64,
+    icon_frame: NSRect,
+    label_frame: NSRect,
 ) -> *mut AnyObject {
     let h = 38.0;
     let btn: *mut AnyObject = msg_send![sidebar_button_class(), alloc];
@@ -1000,14 +1031,6 @@ pub(super) unsafe fn make_sidebar_button(
         let _: () = msg_send![btn_layer, setMasksToBounds: true];
     }
     let _: () = msg_send![btn, setTag: tag];
-    let symbol = match tag {
-        0 => "gearshape",
-        1 => "rectangle.on.rectangle",
-        2 => "computermouse",
-        3 => "doc.on.clipboard",
-        4 => "info.circle",
-        _ => "circle",
-    };
     let symbol_ns = make_nsstring(symbol);
     let image: *mut AnyObject = msg_send![
         class!(NSImage),
@@ -1019,9 +1042,7 @@ pub(super) unsafe fn make_sidebar_button(
         let icon_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
         let icon_view: *mut AnyObject = msg_send![
             icon_view,
-            // SF Symbols have a little optical padding at the bottom; lift the image view
-            // so the glyph's visual center shares the text baseline in the 38pt row.
-            initWithFrame: NSRect::new(NSPoint::new(15.5, 10.0), NSSize::new(17.0, 17.0))
+            initWithFrame: icon_frame
         ];
         let _: () = msg_send![icon_view, setImage: image];
         let _: () = msg_send![icon_view, setImageScaling: 3isize];
@@ -1037,10 +1058,7 @@ pub(super) unsafe fn make_sidebar_button(
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject = msg_send![
         label,
-        initWithFrame: NSRect::new(
-            NSPoint::new(44.5, 11.0),
-            NSSize::new((w - 51.0).max(1.0), 24.0),
-        )
+        initWithFrame: label_frame
     ];
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
@@ -1048,8 +1066,15 @@ pub(super) unsafe fn make_sidebar_button(
     let label_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
     let _: () = msg_send![label, setTextColor: label_color];
     let _: () = msg_send![label, setSelectable: false];
-    let _: () = msg_send![label, setAlignment: 0isize];
+    let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
+                                                         // Sidebar tabs are one-line labels. Single-line mode makes NSTextField use its control-size
+                                                         // baseline instead of pinning a multi-line cell's glyphs to the top of the frame.
+                                                         // 侧栏 tab 都是单行标签；单行模式使用控件尺寸决定的 baseline，避免多行 cell 把字形顶到 frame 顶部。
     let _: () = msg_send![label, setUsesSingleLineMode: true];
+    let _: () = msg_send![label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+    if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![label, setMaximumNumberOfLines: 1isize];
+    }
     let _: () = msg_send![label, setEnabled: false];
     let _: () = msg_send![btn, addSubview: label];
     SIDEBAR_TITLE_LABELS
@@ -1083,14 +1108,16 @@ pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject =
         msg_send![label, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 20.0))];
-    let section_text = text.to_uppercase();
-    let ns = make_nsstring(&section_text);
+    // Keep localized wording intact: uppercase is a hierarchy channel English has but CJK does
+    // not. Weight, color, and spacing carry the section level instead.
+    // 保留本地化原文：大写是英文拥有而 CJK 没有的层级通道，区块层级由字重、颜色和间距表达。
+    let ns = make_nsstring(text);
     let _: () = msg_send![label, setStringValue: ns];
     CFRelease(ns as *const c_void);
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 11.0f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 12.0f64];
     let _: () = msg_send![label, setFont: font];
     let color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![label, setTextColor: color];
@@ -1105,13 +1132,19 @@ pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f
 pub(super) unsafe fn add_page_title(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: f64) {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject =
-        msg_send![label, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 32.0))];
+        msg_send![label, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 44.0))];
     set_field(label, text);
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
     let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 25.0f64];
     let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
+    let _: () = msg_send![label, setUsesSingleLineMode: false];
+    let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
+    }
     let color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setAutoresizingMask: 10u64];
@@ -1151,12 +1184,6 @@ pub(super) unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) 
 }
 
 pub(super) const SETTINGS_CARD_SHADOW_INSET: f64 = 18.0;
-
-/// Return the origin that centers a control inside a card's vertical bounds.
-/// 根据卡片上下边界计算控件的垂直居中起点。
-pub(super) fn centered_control_y(card_bottom: f64, card_top: f64, control_h: f64) -> f64 {
-    card_bottom + (card_top - card_bottom - control_h) / 2.0
-}
 
 /// Draw the settings card shadow into pixels owned by the shadow view itself. This keeps the
 /// blur inside the view's expanded frame instead of relying on a CALayer shadow crossing the
@@ -1247,6 +1274,10 @@ pub(super) unsafe fn add_settings_card(
     if !layer.is_null() {
         let palette = settings_palette();
         layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.card_bg));
+        // The card is inserted below its siblings with addSubview:positioned:. Keep its layer at
+        // the default z-position so the border remains visible above the document background.
+        // 卡片通过 addSubview:positioned: 放在 sibling 下方；layer 保持默认 z，确保边框不会
+        // 被 document 背景盖住。
         let _: () = msg_send![layer, setCornerRadius: 14.0f64];
         // Keep the outer shadow visible. The card has no child content that needs clipping.
         let _: () = msg_send![layer, setMasksToBounds: false];
@@ -1319,42 +1350,35 @@ pub(super) unsafe fn add_row_separator(
     line
 }
 
-/// 加一行:右对齐 label + 控件。控件由调用方创建并传入;加入父视图后 release,返回该控件指针。
-/// Add a row: right-aligned label + control. The control is created by the caller;
-/// it is released after being added to the parent. Returns the control pointer.
-pub(super) unsafe fn add_row(
-    parent: *mut AnyObject,
-    label_x: f64,
-    y: f64,
-    label_w: f64,
-    h: f64,
-    label_text: &str,
-    control: *mut AnyObject,
-) -> *mut AnyObject {
-    add_row_with_label(parent, label_x, y, label_w, h, label_text, control).1
+/// Add a standard row and also return its label pointer for conditional visibility.
+/// label/control 加入父视图后由父视图持有,release 后指针仍有效。
+///
+/// The label/control are retained by the parent view after `addSubview`, so the pointers remain
+/// valid after the local ownership is released.
+fn derived_label_width(control_x: f64, label_x: f64, gap: f64) -> f64 {
+    (control_x - label_x - gap).max(1.0)
 }
 
-/// 同 add_row,但额外返回 label 指针(供条件显隐等需要隐藏整行的场景)。
-/// label/control 加入父视图后由父视图持有,release 后指针仍有效(与 add_row 返回 control
-/// 的约定一致)。
-///
-/// Same as add_row, but also returns the label pointer (for cases that need to hide the whole
-/// row, e.g. conditional visibility). The label/control are retained by the parent view after
-/// addSubview, so the pointers remain valid after release (same convention as add_row's
-/// returned control).
 pub(super) unsafe fn add_row_with_label(
     parent: *mut AnyObject,
     label_x: f64,
     y: f64,
-    label_w: f64,
+    _label_w: f64,
     h: f64,
     label_text: &str,
     control: *mut AnyObject,
 ) -> (*mut AnyObject, *mut AnyObject) {
+    // Derive the label's visual width from the control's leading edge. Call sites may pass a
+    // legacy width for compatibility, but translated labels should not depend on per-string
+    // 150/220pt patches.
+    // 根据控件的 leading edge 推导标签可用宽度。调用方传入的旧宽度仅为兼容保留，翻译文案
+    // 不应再依赖每条字符串的 150/220pt 修补值。
+    let control_frame: NSRect = msg_send![control, frame];
+    let effective_label_w = derived_label_width(control_frame.origin.x, label_x, 18.0);
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(
         NSPoint::new(label_x, y),
-        NSSize::new(label_w, (h - 12.0).max(1.0)),
+        NSSize::new(effective_label_w, (h - 8.0).max(1.0)),
     )];
     let ns = make_nsstring(label_text);
     let _: () = msg_send![label, setStringValue: ns];
@@ -1365,9 +1389,14 @@ pub(super) unsafe fn add_row_with_label(
     // 左对齐:设置项标签贴在内容区左侧(NSTextAlignmentLeft = 0,arm64/x86_64 一致)。
     // Left-aligned: the row label hugs the content area's left edge (NSTextAlignmentLeft = 0,
     // identical on arm64 and x86_64).
-    let _: () = msg_send![label, setAlignment: 0isize]; // NSTextAlignmentLeft
+    let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
     let label_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
     let _: () = msg_send![label, setTextColor: label_color];
+    let _: () = msg_send![label, setUsesSingleLineMode: false];
+    let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
+    }
     // 自适应:标签固定宽、顶部+左侧锚定(MinYMargin|MaxXMargin = 8|4 = 12)。
     // Adaptive: label keeps fixed width, stays top- and left-anchored.
     let _: () = msg_send![label, setAutoresizingMask: 12u64];
@@ -1381,9 +1410,9 @@ pub(super) unsafe fn add_row_with_label(
     (label, control)
 }
 
-/// Add a taller settings row with the two-level title/subtitle hierarchy used by the HTML
-/// reference. The caller positions the native control inside the row; this helper only builds
-/// the leading text stack and returns the control after attaching it.
+/// Add a compact settings row. The legacy subtitle argument is intentionally ignored so callers
+/// can migrate incrementally without rendering long explanatory paragraphs inside cards.
+/// 创建紧凑设置行。旧的 subtitle 参数刻意忽略，调用方可以渐进迁移，同时卡片内不再渲染大段说明。
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn add_described_row(
     parent: *mut AnyObject,
@@ -1392,15 +1421,15 @@ pub(super) unsafe fn add_described_row(
     text_w: f64,
     row_h: f64,
     title: &str,
-    subtitle: &str,
+    _subtitle: &str,
     control: *mut AnyObject,
-) -> *mut AnyObject {
+) -> (*mut AnyObject, *mut AnyObject) {
     let title_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let title_label: *mut AnyObject = msg_send![
         title_label,
         initWithFrame: NSRect::new(
-            NSPoint::new(x, y + row_h - 27.0),
-            NSSize::new(text_w, 18.0),
+            NSPoint::new(x, y + 4.0),
+            NSSize::new(text_w, (row_h - 8.0).max(1.0)),
         )
     ];
     set_field(title_label, title);
@@ -1409,63 +1438,51 @@ pub(super) unsafe fn add_described_row(
     let _: () = msg_send![title_label, setEditable: false];
     let title_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
     let _: () = msg_send![title_label, setTextColor: title_color];
+    let _: () = msg_send![title_label, setAlignment: -1isize]; // NSTextAlignmentNatural
     let _: () = msg_send![title_label, setUsesSingleLineMode: true];
+    let _: () = msg_send![title_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
     let title_font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.5f64];
     let _: () = msg_send![title_label, setFont: title_font];
     let _: () = msg_send![parent, addSubview: title_label];
     release_obj(title_label);
 
-    let subtitle_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let subtitle_label: *mut AnyObject = msg_send![
-        subtitle_label,
-        initWithFrame: NSRect::new(
-            NSPoint::new(x, y + 7.0),
-            NSSize::new(text_w, 17.0),
-        )
-    ];
-    set_field(subtitle_label, subtitle);
-    let _: () = msg_send![subtitle_label, setBezeled: false];
-    let _: () = msg_send![subtitle_label, setDrawsBackground: false];
-    let _: () = msg_send![subtitle_label, setEditable: false];
-    let _: () = msg_send![subtitle_label, setUsesSingleLineMode: true];
-    let subtitle_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.5f64];
-    let _: () = msg_send![subtitle_label, setFont: subtitle_font];
-    let subtitle_color = crate::ffi::hex_to_ns_color(settings_palette().secondary_text);
-    let _: () = msg_send![subtitle_label, setTextColor: subtitle_color];
-    let _: () = msg_send![parent, addSubview: subtitle_label];
-    release_obj(subtitle_label);
-
     let _: () = msg_send![control, setAutoresizingMask: 10u64];
     let _: () = msg_send![parent, addSubview: control];
     release_obj(control);
-    control
+    (title_label, control)
 }
 
-/// HTML `.row` at 54pt but single-line: the label is vertically centered and the control
-/// right-aligned. Used for the Device/Scroll-mode rows that have no subtitle.
+/// A single-line settings row; the component layer centers its label and control inside the
+/// shared visual height. Rows that genuinely need wrapping should use a dedicated multi-line layout.
+/// 单行设置 row；组件层会在统一的视觉行高内居中标题和控件。确实需要换行的内容应使用独立的多行布局。
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn add_tall_row(
     parent: *mut AnyObject,
     label_x: f64,
     y: f64,
     label_w: f64,
+    h: f64,
     label_text: &str,
     control: *mut AnyObject,
 ) -> (*mut AnyObject, *mut AnyObject) {
-    let h = 54.0; // matched described_row_h
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(label_x, y + (h - 22.0) / 2.0), NSSize::new(label_w, 22.0))];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(label_x, y + 4.0), NSSize::new(label_w, h - 8.0))];
     let ns = make_nsstring(label_text);
     let _: () = msg_send![label, setStringValue: ns];
     CFRelease(ns as *const c_void);
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let _: () = msg_send![label, setAlignment: 0isize]; // left
+    let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
     let label_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
     let _: () = msg_send![label, setTextColor: label_color];
     let font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.5f64];
     let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setUsesSingleLineMode: false];
+    let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
+    }
     let _: () = msg_send![label, setAutoresizingMask: 12u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
@@ -1553,6 +1570,247 @@ pub(super) unsafe fn make_settings_page(
     (scroll, document)
 }
 
+/// Grow a provisionally-sized page when content exceeds it, without moving existing children.
+/// 页面先按宽松高度构建；内容超出时只增长文档，不整体搬移已有子视图。
+///
+/// This keeps translated rows from being clipped while avoiding a second, conflicting layout
+/// pass with AppKit's top-anchored autoresizing masks. The helper is also safe to call after an
+/// inline update expands a card.
+pub(super) unsafe fn fit_settings_document_height(
+    document: *mut AnyObject,
+    minimum_height: f64,
+    top_padding: f64,
+    bottom_padding: f64,
+) -> f64 {
+    if document.is_null() {
+        return minimum_height.max(1.0);
+    }
+    let subviews: *mut AnyObject = msg_send![document, subviews];
+    let count: usize = if subviews.is_null() {
+        0
+    } else {
+        msg_send![subviews, count]
+    };
+    let mut max_y = 0.0f64;
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        if child.is_null() {
+            continue;
+        }
+        let frame: NSRect = msg_send![child, frame];
+        max_y = max_y.max(frame.origin.y + frame.size.height);
+    }
+    let required_height =
+        required_document_height(max_y, minimum_height, top_padding, bottom_padding);
+    let current_frame: NSRect = msg_send![document, frame];
+    // Do not mutate child frames here. Children use MinYMargin autoresizing masks, so changing
+    // the document frame already gives AppKit an opportunity to reposition them; manually doing
+    // the same shift caused the title and rows to move twice after the first layout pass.
+    // 这里不能再修改子视图 frame。子视图使用 MinYMargin，自身高度变化时 AppKit 已可能重排；
+    // 再手动移动一次会让标题和行在首次布局后发生双重位移。
+    let final_height = stable_document_height(current_frame.size.height, required_height);
+    let final_frame = NSRect::new(
+        current_frame.origin,
+        NSSize::new(current_frame.size.width, final_height),
+    );
+    if (final_height - current_frame.size.height).abs() > 0.5 {
+        let _: () = msg_send![document, setFrame: final_frame];
+    }
+    final_height
+}
+
+/// Pure counterpart of the document fitting rule, kept separate so expansion behavior can be
+/// covered without constructing AppKit views in headless tests.
+/// 文档高度拟合规则的纯函数版本，便于在无 AppKit 的测试中覆盖长文本/短文本两种情况。
+pub(super) fn required_document_height(
+    content_max_y: f64,
+    minimum_height: f64,
+    top_padding: f64,
+    bottom_padding: f64,
+) -> f64 {
+    (content_max_y + bottom_padding)
+        .max(minimum_height)
+        .max(top_padding + bottom_padding + 1.0)
+}
+
+/// Keep an already-laid-out document stable unless content requires growth. Shrinking is unsafe
+/// for top-anchored manual frames because AppKit may apply the autoresizing delta to children.
+/// 已排版的 document 只在内容不足时增长；收缩会触发顶部锚定子视图的自动位移，因此禁止收缩。
+pub(super) fn stable_document_height(current_height: f64, required_height: f64) -> f64 {
+    current_height.max(required_height).max(1.0)
+}
+
+/// Pure rectangle predicates shared by the debug validator and headless layout tests.
+/// 调试验证器和无头布局测试共用的纯矩形判断。
+pub(super) fn rects_overlap(a: NSRect, b: NSRect, epsilon: f64) -> bool {
+    let left = a.origin.x.max(b.origin.x);
+    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
+    let bottom = a.origin.y.max(b.origin.y);
+    let top = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
+    right - left > epsilon && top - bottom > epsilon
+}
+
+pub(super) fn rect_inside(outer: NSRect, inner: NSRect, margin: f64) -> bool {
+    inner.origin.x >= outer.origin.x + margin
+        && inner.origin.y >= outer.origin.y + margin
+        && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width - margin
+        && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height - margin
+}
+
+#[derive(Clone, Copy)]
+struct DebugLayoutEntry {
+    index: usize,
+    frame: NSRect,
+    interactive: bool,
+    text_required_height: Option<f64>,
+}
+
+/// Collect descendant frames in document coordinates. Manual settings layout uses several
+/// nested AppKit views, so comparing each child's local frame against the document directly is
+/// incorrect; accumulating the parent origins mirrors `convertRect:toView:` without introducing
+/// another FFI conversion in the debug-only path.
+/// 递归收集 document 坐标系中的后代 frame。设置页包含多层 AppKit view，不能直接把子 view 的
+/// local frame 与 document 比较；累加父坐标等价于 convertRect:toView:，且只影响 debug 路径。
+unsafe fn collect_debug_layout(
+    view: *mut AnyObject,
+    parent_origin: NSPoint,
+    document_width: f64,
+    entries: &mut Vec<DebugLayoutEntry>,
+    separators: &mut Vec<(usize, NSRect, f64)>,
+) {
+    if view.is_null() {
+        return;
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    let count: usize = if subviews.is_null() {
+        0
+    } else {
+        msg_send![subviews, count]
+    };
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        if child.is_null() || msg_send![child, isHidden] {
+            continue;
+        }
+        let local: NSRect = msg_send![child, frame];
+        let frame = NSRect::new(
+            NSPoint::new(
+                parent_origin.x + local.origin.x,
+                parent_origin.y + local.origin.y,
+            ),
+            local.size,
+        );
+        let interactive = msg_send![child, isKindOfClass: class!(NSButton)]
+            || msg_send![child, isKindOfClass: class!(NSSlider)]
+            || msg_send![child, isKindOfClass: class!(NSColorWell)]
+            || msg_send![child, isKindOfClass: class!(NSPopUpButton)];
+        let is_text = msg_send![child, isKindOfClass: class!(NSTextField)];
+        if interactive || is_text {
+            let text_required_height = if is_text {
+                let cell: *mut AnyObject = msg_send![child, cell];
+                if cell.is_null() {
+                    None
+                } else {
+                    let measured: NSSize = msg_send![cell, cellSizeForBounds: local];
+                    Some(measured.height)
+                }
+            } else {
+                None
+            };
+            entries.push(DebugLayoutEntry {
+                index,
+                frame,
+                interactive,
+                text_required_height,
+            });
+        }
+        if frame.size.height <= 1.5 && frame.size.width > document_width * 0.5 {
+            let z = {
+                let layer: *mut AnyObject = msg_send![child, layer];
+                if layer.is_null() {
+                    0.0
+                } else {
+                    msg_send![layer, zPosition]
+                }
+            };
+            separators.push((index, frame, z));
+        }
+        collect_debug_layout(child, frame.origin, document_width, entries, separators);
+    }
+}
+
+/// Validate the real AppKit page tree when explicitly requested during development. This catches
+/// the failures pure geometry tests cannot see: descendant controls crossing, frames escaping the
+/// document, and separators rendered above content because of view/layer order.
+/// 开发阶段显式开启时验证真实 AppKit 页面树，捕获纯几何测试看不到的问题：后代控件相交、frame 越出
+/// document，以及因 view/layer 顺序错误而绘制到内容上方的分隔线。
+pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: &str) {
+    if !cfg!(debug_assertions) || std::env::var_os("OH_MY_TAB_LAYOUT_DEBUG").is_none() {
+        return;
+    }
+    if scroll.is_null() {
+        panic!("[settings-layout] {name}: scroll view is null");
+    }
+    let document: *mut AnyObject = msg_send![scroll, documentView];
+    if document.is_null() {
+        panic!("[settings-layout] {name}: document view is null");
+    }
+    let document_bounds: NSRect = msg_send![document, bounds];
+    let mut entries = Vec::new();
+    let mut separators = Vec::new();
+    collect_debug_layout(
+        document,
+        NSPoint::new(0.0, 0.0),
+        document_bounds.size.width,
+        &mut entries,
+        &mut separators,
+    );
+    let mut errors = Vec::new();
+    let document_rect = NSRect::new(NSPoint::new(0.0, 0.0), document_bounds.size);
+    for entry in &entries {
+        if !rect_inside(document_rect, entry.frame, -1.0) {
+            errors.push(format!(
+                "view[{}] escapes document: {:?}",
+                entry.index, entry.frame
+            ));
+        }
+        if let Some(required_height) = entry.text_required_height {
+            if required_height > entry.frame.size.height + 1.0 {
+                errors.push(format!(
+                    "text[{0}] needs {1:.1}pt but frame is {2:.1}pt high: {3:?}",
+                    entry.index, required_height, entry.frame.size.height, entry.frame
+                ));
+            }
+        }
+    }
+    for (left_index, left) in entries.iter().enumerate() {
+        for right in entries.iter().skip(left_index + 1) {
+            // Text labels may overlap another label in a deliberately stacked description row,
+            // but an interactive control must never intersect a label or another control.
+            // 描述行中的文字 label 允许按设计上下堆叠；交互控件不能与 label 或其他控件相交。
+            if (left.interactive || right.interactive)
+                && rects_overlap(left.frame, right.frame, 0.5)
+            {
+                errors.push(format!(
+                    "views overlap: [{}] {:?} × [{}] {:?}",
+                    left.index, left.frame, right.index, right.frame
+                ));
+            }
+        }
+    }
+    for (index, frame, z) in separators {
+        if z >= -0.1 {
+            errors.push(format!(
+                "separator[{index}] {:?} zPosition={z:.2} (must be below controls)",
+                frame
+            ));
+        }
+    }
+    if !errors.is_empty() {
+        panic!("[settings-layout] {name}:\n{}", errors.join("\n"));
+    }
+}
+
 /// Scroll a settings page's clip view to the top. Call this after the window has been laid out:
 /// a frame-time scrollToPoint gets reset by AppKit's first layout pass, leaving the scrollbar
 /// mid-track. The page scroll views are the same views stored on SettingsUi (general_view, etc.).
@@ -1575,4 +1833,45 @@ pub(super) unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
         top_origin,
         after.origin.y
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        derived_label_width, rect_inside, rects_overlap, required_document_height,
+        stable_document_height,
+    };
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    #[test]
+    fn label_width_follows_control_leading_edge() {
+        assert_eq!(derived_label_width(319.0, 12.0, 18.0), 289.0);
+        assert_eq!(derived_label_width(20.0, 12.0, 18.0), 1.0);
+    }
+
+    #[test]
+    fn document_height_tracks_content_without_dropping_below_viewport() {
+        assert_eq!(required_document_height(840.0, 600.0, 24.0, 24.0), 864.0);
+        assert_eq!(required_document_height(420.0, 600.0, 24.0, 24.0), 600.0);
+        assert_eq!(required_document_height(0.0, 0.0, 24.0, 24.0), 49.0);
+    }
+
+    #[test]
+    fn stable_document_height_never_shrinks_after_children_are_laid_out() {
+        assert_eq!(stable_document_height(1_120.0, 840.0), 1_120.0);
+        assert_eq!(stable_document_height(700.0, 840.0), 840.0);
+        assert_eq!(stable_document_height(0.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn layout_rect_predicates_catch_crossing_rows_and_escape() {
+        let page = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 300.0));
+        let first = NSRect::new(NSPoint::new(20.0, 100.0), NSSize::new(160.0, 34.0));
+        let second = NSRect::new(NSPoint::new(20.0, 130.0), NSSize::new(160.0, 34.0));
+        let outside = NSRect::new(NSPoint::new(20.0, 280.0), NSSize::new(160.0, 34.0));
+        assert!(rects_overlap(first, second, 0.5));
+        assert!(!rects_overlap(first, outside, 0.5));
+        assert!(rect_inside(page, first, 0.0));
+        assert!(!rect_inside(page, outside, 0.0));
+    }
 }

@@ -5,9 +5,10 @@ use super::*;
 
 // ========== 纯逻辑(可测)/ pure logic (testable) ==========
 
-/// 按显示宽度估算文本的换行行数:ASCII 字符记 1 单位,中文/全角记 2;显式换行符单独成行。
-/// Estimate the wrapped line count by display width: ASCII counts as 1 unit, CJK/full-width
-/// as 2; explicit newlines start a new line.
+/// 详情文档高度的保守回退估算：显式换行符单独成行，字符单位只用于无 AppKit 测量时的
+/// 预估，不参与列表正文的实际截断。
+/// Conservative fallback for detail document height: explicit newlines start a new line. The
+/// character units are only used when AppKit measurement is unavailable and never truncate list content.
 pub(super) fn estimate_lines(text: &str, max_units: usize) -> usize {
     let mut units = 0usize;
     let mut lines = 1usize;
@@ -26,41 +27,6 @@ pub(super) fn estimate_lines(text: &str, max_units: usize) -> usize {
         }
     }
     lines
-}
-
-/// 把文本截断为最多 max_lines 行(按显示宽度),截断处(第 max_lines 行末尾)加省略号。
-/// Truncate the text to at most `max_lines` display lines (by width), appending an ellipsis
-/// at the truncation point (the end of the last kept line).
-pub(super) fn truncate_to_lines(text: &str, max_units: usize, max_lines: usize) -> String {
-    let mut out = String::new();
-    let mut units = 0usize;
-    let mut lines = 1usize;
-    for ch in text.chars() {
-        if ch == '\n' {
-            if lines >= max_lines {
-                out.push('…');
-                return out;
-            }
-            lines += 1;
-            units = 0;
-            out.push('\n');
-            continue;
-        }
-        let w = if ch.is_ascii() { 1 } else { 2 };
-        if units + w > max_units {
-            if lines >= max_lines {
-                out.push('…');
-                return out;
-            }
-            lines += 1;
-            units = w;
-            out.push(ch);
-        } else {
-            units += w;
-            out.push(ch);
-        }
-    }
-    out
 }
 
 /// 详情面板可用宽 → 每行可容纳的显示宽度单位,与行按钮同一估算口径

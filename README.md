@@ -110,6 +110,23 @@ Development-only issues and raw-binary debugging notes are collected in [docs/de
 
 `scripts/dev-restart.sh` builds and assembles a separately signed development `.app`, then launches it through the per-user `launchd` domain. This keeps Accessibility and Screen Recording permissions associated with the development bundle and ensures the running process contains the latest build. The unit-test suite runs headless by default; clipboard image/history fixtures use isolated temporary directories per process and thread. The **smoke tests** are marked `#[ignore]` — they exercise the real CG/AX stack and need a GUI session plus an Accessibility grant (run with `cargo test -- --ignored`).
 
+For localization/layout QA, set `OH_MY_TAB_PSEUDO_LOCALE=1` before launching the dev app to expand
+English strings while preserving placeholders. Set `OH_MY_TAB_LAYOUT_DEBUG=1` in a debug build to
+enable runtime settings-page assertions; overlapping controls, out-of-bounds frames, and separators
+with an invalid layer order fail fast with the page name and offending frames. These checks complement
+visual review instead of requiring it for every layout change.
+
+On a macOS GUI session, the real AppKit settings smoke test can traverse every settings page and
+run the same post-layout checks without manual clicking:
+
+```sh
+cargo build
+cargo test settings_layout_smoke -- --ignored
+```
+
+The smoke test runs the debug binary with `--smoke-settings-layout`, opens the actual settings
+window on the main thread, visits all five pages, validates their descendant view frames, and exits.
+
 ### Release `.app` + `.dmg`
 
 > ```sh

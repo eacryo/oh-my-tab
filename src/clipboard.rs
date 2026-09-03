@@ -177,15 +177,11 @@ const DETAIL_LINE_H: f64 = 18.0;
 /// reuses the list's 11pt top inset, so sizing must include both sides; otherwise exactly
 /// two lines overflow and incorrectly show a scrollbar.
 const DETAIL_TEXT_INSET_H: f64 = ROW_PAD_TOP * 2.0;
-/// 每条文本最多显示的行数(新设计稿 .content.multiline 的 2 行截断)。
-/// Max text lines per entry (the new mockup's .multiline 2-line clamp).
-const MAX_TEXT_LINES: usize = 2;
-/// 单行显示宽度上限(以 ASCII 字符为单位;中文/全角按 2 折算)。行内容宽 ≈ 427pt
-/// (560 - 列表边距 16 - 行内边距 10 - 图标 32 - 图标间隙 11 - 右侧操作区 52 - 内容
-/// 右内边距 12),13pt 字体下每行约 30 个汉字 ≈ 60 单位。
-/// Per-line width cap in ASCII units (CJK counts as 2). The content width is ~427pt
-/// (560 - list margins 16 - row padding 10 - icon 32 - icon gap 11 - actions 52 - main
-/// right padding 12), i.e. ~30 CJK chars per 13pt line ≈ 60 units.
+/// 详情文本高度估算的保守回退单位。列表正文不再使用字符单位截断，而由原生 cell 按
+/// 实际字体和 frame 布局；该值仅用于详情文档高度的 headless-safe 预估。
+/// Conservative fallback units for detail-text height estimation. List content no longer uses
+/// character units for truncation; native cells lay it out from real font metrics. This value
+/// is only used by the headless-safe detail document estimate.
 const LINE_MAX_UNITS: usize = 60;
 /// 列表区左右边距(设计稿 .history padding 0 8px)/ the list's side padding (8px).
 const PAD_X: f64 = 8.0;
@@ -239,8 +235,11 @@ const FILTERS_H: f64 = 36.0;
 const FILTERS_PAD_X: f64 = 20.0;
 /// 筛选项间距(设计稿 gap 17px)/ the gap between filter items (17px).
 const FILTER_GAP: f64 = 17.0;
-/// 底部栏高度(设计稿 43px)/ the footer's height (43px).
-const FOOTER_H: f64 = 43.0;
+/// 底部栏高度(两行快捷键说明)/ the footer's height (two rows for shortcut legends).
+// Two rows leave room for translated shortcut labels at a readable size instead of compressing
+// them into a single colliding line.
+// 两行 footer 为本地化快捷键说明留下可读空间，避免把它们压缩到同一行后互相覆盖。
+const FOOTER_H: f64 = 64.0;
 /// 窗口底部留白 / the window's bottom padding.
 const PAD_Y: f64 = 12.0;
 /// 底部栏左右边距(设计稿 padding 0 16px)/ the footer's side padding (16px).
@@ -2513,7 +2512,7 @@ unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
         NSPoint::new(x - 6.0 - 70.0, 14.0),
         NSSize::new(70.0, 16.0)
     )];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
     let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.5f64];
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
@@ -2751,7 +2750,7 @@ unsafe fn add_detail_chrome(
             NSPoint::new(width - 250.0, height - DETAIL_FOOTER_H + 12.0),
             NSSize::new(235.0, 18.0)
         )];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
         let color: *mut AnyObject =
             msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
         let _: () = msg_send![stats, setFont: font];
@@ -4317,7 +4316,7 @@ unsafe fn ensure_picker_window() {
     // 悬停变红并显示带小圆角的浅红底。
     // Clear history (the new mockup's .clear-history): at the filters row's right (auto
     // margin), transparent, 10px / 28% black; hover turns red with a subtly rounded red fill.
-    let clear_w = localized_string_width(&t("clipboard.clear_all"), 10.0) + 8.0;
+    let clear_w = localized_string_width(&t("clipboard.clear_all"), 12.0) + 8.0;
     let clear_x = PICKER_W - SEARCH_PAD_X - clear_w;
     let clear_btn: *mut AnyObject = msg_send![hover_button_class(), alloc];
     let clear_btn: *mut AnyObject = msg_send![
@@ -4334,7 +4333,7 @@ unsafe fn ensure_picker_window() {
     let _: () = msg_send![clear_btn, setWantsLayer: true];
     let clear_layer: *mut AnyObject = msg_send![clear_btn, layer];
     let _: () = msg_send![clear_layer, setCornerRadius: 5.0f64];
-    let cfont: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+    let cfont: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
     let _: () = msg_send![clear_btn, setFont: cfont];
     let ccolor: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.28f64];
     let _: () = msg_send![clear_btn, setContentTintColor: ccolor];
@@ -4368,7 +4367,7 @@ unsafe fn ensure_picker_window() {
     let _: () = msg_send![toast_label, setEditable: false];
     let _: () = msg_send![toast_label, setSelectable: false];
     let _: () = msg_send![toast_label, setAlignment: 1isize]; // Center on arm64
-    let tf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
+    let tf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
     let _: () = msg_send![toast_label, setFont: tf];
     let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
     let _: () = msg_send![toast_label, setTextColor: white];
@@ -4608,7 +4607,7 @@ unsafe fn rebuild_rows() {
             let _: () = msg_send![g, setEditable: false];
             let _: () = msg_send![g, setSelectable: false];
             let g_font: *mut AnyObject =
-                msg_send![class!(NSFont), systemFontOfSize: 11.0f64, weight: 0.23f64]; // Medium
+                msg_send![class!(NSFont), systemFontOfSize: 12.0f64, weight: 0.23f64]; // Medium
             let _: () = msg_send![g, setFont: g_font];
             let g_color: *mut AnyObject =
                 msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
@@ -4689,25 +4688,30 @@ unsafe fn rebuild_rows() {
             )
         ];
         let _: () = msg_send![content_btn, setBordered: false];
-        let _: () = msg_send![content_btn, setAlignment: 0isize]; // left
+        let _: () = msg_send![content_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
         let cell: *mut AnyObject = msg_send![content_btn, cell];
         let _: () = msg_send![cell, setUsesSingleLineMode: false];
-        let _: () = msg_send![cell, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+        let _: () = msg_send![cell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+        if msg_send![cell, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+            let _: () = msg_send![cell, setMaximumNumberOfLines: 2isize];
+        }
         let row_img = make_row_image(entry);
         if !row_img.is_null() {
             let _: () = msg_send![content_btn, setImage: row_img];
             let _: () = msg_send![content_btn, setImagePosition: 2isize]; // NSImageLeft
             release_obj(row_img);
         }
-        // 内容:图片条目 = 文件名(缩略图缺失时也是文件名);文本条目 = ≤2 行截断。
-        // Content: image rows show the filename; text rows <=2 truncated lines.
-        let content = truncate_to_lines(&entry.text, LINE_MAX_UNITS, MAX_TEXT_LINES);
+        // Keep the full string and let the native cell wrap/truncate using actual font metrics.
+        // Character-count heuristics break on emoji, combining marks, and long unbroken words.
+        // 保留完整字符串，让原生 cell 按实际字体测量换行/截断；字符数启发式会错误处理
+        // emoji、组合字符和无空格长单词。
+        let content = entry.text.as_str();
         let kind = if is_image {
             TextKind::Plain
         } else {
             classify_text(&entry.text)
         };
-        let attr = make_content_attributed(&content, kind);
+        let attr = make_content_attributed(content, kind);
         let _: () = msg_send![content_btn, setAttributedTitle: attr];
         release_obj(attr);
         let _: () = msg_send![content_btn, setTag: i as isize];
@@ -4738,7 +4742,7 @@ unsafe fn rebuild_rows() {
             )
         ];
         let _: () = msg_send![meta_btn, setBordered: false];
-        let _: () = msg_send![meta_btn, setAlignment: 0isize]; // left
+        let _: () = msg_send![meta_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
         let mcell: *mut AnyObject = msg_send![meta_btn, cell];
         let _: () = msg_send![mcell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
         let meta_attr = make_meta_footer_attributed(entry, show_source);
@@ -6145,6 +6149,7 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
         .unwrap_or(content);
     let pstyle: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
     let pstyle: *mut AnyObject = msg_send![pstyle, init];
+    let _: () = msg_send![pstyle, setAlignment: -1isize]; // NSTextAlignmentNatural
     let _: () = msg_send![pstyle, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
 
     let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
@@ -6240,7 +6245,7 @@ unsafe fn make_meta_footer_attributed(entry: &ClipEntry, show_source: bool) -> *
     if !meta.is_empty() {
         let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
         let attrs: *mut AnyObject = msg_send![attrs, init];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
         let color: *mut AnyObject =
             msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
         let font_key = make_nsstring("NSFont");
@@ -6962,7 +6967,7 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     let _: () = msg_send![count_label, setDrawsBackground: false];
     let _: () = msg_send![count_label, setEditable: false];
     let _: () = msg_send![count_label, setSelectable: false];
-    let cf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+    let cf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
     let _: () = msg_send![count_label, setFont: cf];
     let cc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
     let _: () = msg_send![count_label, setTextColor: cc];
@@ -6983,20 +6988,35 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     ];
     let kbd_min_w = 21.0;
     let kbd_h = 19.0;
-    let mut x = w - FOOTER_PAD_X;
+    let hints_min_x = FOOTER_PAD_X + 140.0 + FOOTER_GROUP_GAP;
+    let mut row_x = [w - FOOTER_PAD_X, w - FOOTER_PAD_X];
     for (i, key) in kbd_keys.iter().enumerate() {
-        let label_w = localized_string_width(&kbd_labels[i], 10.0);
+        let row = usize::from(i >= 3);
+        let x = &mut row_x[row];
         // Tab 文字键帽比方向键图标宽;其余维持原 21pt 尺寸。
         // The text keycap for Tab is wider than arrow glyphs; the rest retain 21pt.
         let kbd_w = if *key == "Tab" { 28.0 } else { kbd_min_w };
+        // Reserve the left side for the entry count and cap each hint column. Long translated
+        // labels wrap within their column instead of pushing earlier hints under the count.
+        // 左侧为条目数保留空间，并限制每个提示列宽；长翻译在列内换行，不会挤到条目数下面。
+        let row_count = if row == 0 { 3.0 } else { 2.0 };
+        let row_available = (w - hints_min_x - FOOTER_PAD_X).max(1.0);
+        let max_label_w = (row_available / row_count - kbd_w - 5.0 - FOOTER_GROUP_GAP).max(1.0);
+        let measured_label_w = localized_string_width(&kbd_labels[i], 12.0);
+        let label_w = measured_label_w.min(max_label_w);
         let group_w = kbd_w + 5.0 + label_w;
-        x -= group_w;
+        *x -= group_w;
+        let row_center_y = if row == 0 {
+            FOOTER_H * 0.75
+        } else {
+            FOOTER_H * 0.25
+        };
         // 键帽 / the keycap.
         let cap: *mut AnyObject = msg_send![class!(NSView), alloc];
         let cap: *mut AnyObject = msg_send![
             cap,
             initWithFrame: NSRect::new(
-                NSPoint::new(x, (FOOTER_H - kbd_h) / 2.0),
+                NSPoint::new(*x, row_center_y - kbd_h / 2.0),
                 NSSize::new(kbd_w, kbd_h)
             )
         ];
@@ -7055,16 +7075,13 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         // Give the hint 6pt width slack so cell insets do not clip its tail; its height uses
         // the font's real line height and is centered. The old fixed 16pt NSTextField drew
         // from its top, making the hint sit slightly above the keycap glyph.
-        let hf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
-        let hint_asc: f64 = msg_send![hf, ascender];
-        let hint_desc: f64 = msg_send![hf, descender];
-        let hint_line_h = (hint_asc - hint_desc + 1.0).max(11.0);
+        let hf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
         let hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let hint: *mut AnyObject = msg_send![
             hint,
             initWithFrame: NSRect::new(
-                NSPoint::new(x + kbd_w + 5.0, (FOOTER_H - hint_line_h) / 2.0),
-                NSSize::new(label_w + 6.0, hint_line_h)
+                NSPoint::new(*x + kbd_w + 5.0, row_center_y - 12.0),
+                NSSize::new(label_w + 6.0, 24.0)
             )
         ];
         let _: () = msg_send![hint, setBezeled: false];
@@ -7074,13 +7091,19 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _: () = msg_send![hint, setFont: hf];
         let hc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
         let _: () = msg_send![hint, setTextColor: hc];
+        let _: () = msg_send![hint, setAlignment: -1isize]; // NSTextAlignmentNatural
+        let _: () = msg_send![hint, setUsesSingleLineMode: false];
+        let _: () = msg_send![hint, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+        if msg_send![hint, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+            let _: () = msg_send![hint, setMaximumNumberOfLines: 2isize];
+        }
         let hint_ns = make_nsstring(&kbd_labels[i]);
         let _: () = msg_send![hint, setStringValue: hint_ns];
         CFRelease(hint_ns as *const c_void);
         let _: () = msg_send![parent, addSubview: hint];
         release_obj(hint);
         // 下一组间距 / spacing before the next group.
-        x -= FOOTER_GROUP_GAP;
+        *x -= FOOTER_GROUP_GAP;
         let _ = i;
     }
 }
@@ -7131,7 +7154,7 @@ pub fn refresh_localized_ui() {
                 let title = make_nsstring(&clear_title);
                 let _: () = msg_send![clear.0, setTitle: title];
                 CFRelease(title as *const c_void);
-                let width = localized_string_width(&clear_title, 10.0) + 8.0;
+                let width = localized_string_width(&clear_title, 12.0) + 8.0;
                 let _: () = msg_send![
                     clear.0,
                     setFrame: NSRect::new(
@@ -8795,6 +8818,22 @@ mod tests {
     }
 
     #[test]
+    fn filtered_indices_handles_cjk_emoji_and_combining_input() {
+        use super::{filtered_indices, ClipFilter};
+        let h = vec![
+            entry("中文输入法候选词"),
+            entry("👨‍👩‍👧‍👦 family"),
+            entry("e\u{301} accent"),
+        ];
+        // IME composition results, emoji ZWJ sequences, and combining marks should remain
+        // searchable as ordinary Unicode strings; filtering must not use byte-width heuristics.
+        // 输入法候选词、emoji ZWJ 序列和组合音标都应按普通 Unicode 文本搜索，过滤不能依赖字节宽度。
+        assert_eq!(filtered_indices(&h, "输入法", ClipFilter::All), vec![0]);
+        assert_eq!(filtered_indices(&h, "family", ClipFilter::All), vec![1]);
+        assert_eq!(filtered_indices(&h, "e\u{301}", ClipFilter::All), vec![2]);
+    }
+
+    #[test]
     fn mapped_index_goes_through_the_filtered_list() {
         use super::{filtered_indices, mapped_index, ClipFilter};
         let h = vec![
@@ -8837,19 +8876,18 @@ mod tests {
     }
 
     #[test]
-    fn truncate_to_lines_caps_at_max_lines() {
-        use super::truncate_to_lines;
-        // 短文本原样保留 / short text passes through.
-        assert_eq!(truncate_to_lines("hello", 60, 3), "hello");
-        // 超过 3 行:3 整行 + 省略号(180 字符 + '…')。
-        // More than 3 lines: 3 full lines + the ellipsis (180 chars + '…').
-        let long: String = "a".repeat(200);
-        let t = truncate_to_lines(&long, 60, 3);
-        assert_eq!(t.chars().count(), 181);
-        assert!(t.ends_with('…'));
-        // 显式换行也计入行数 / explicit newlines count toward the cap.
-        let t3 = truncate_to_lines("l1\nl2\nl3\nl4", 60, 3);
-        assert_eq!(t3, "l1\nl2\nl3…");
+    fn estimate_lines_keeps_unicode_grapheme_sequences_in_one_fallback_line() {
+        use super::estimate_lines;
+        // Emoji ZWJ sequences and combining marks must not panic or be treated as truncation
+        // boundaries; this fallback only estimates detail height when AppKit is unavailable.
+        // emoji ZWJ 序列和组合音标不能导致崩溃或被当成截断边界；这里仅用于 AppKit 不可用时的
+        // 详情高度估算，列表正文仍由原生控件完整承载。
+        assert_eq!(estimate_lines("👨‍👩‍👧‍👦", 60), 1);
+        assert_eq!(estimate_lines("e\u{301}", 60), 1);
+        assert_eq!(
+            estimate_lines("https://example.com/".repeat(4).as_str(), 60),
+            2
+        );
     }
 
     #[test]

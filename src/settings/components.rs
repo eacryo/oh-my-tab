@@ -1,0 +1,496 @@
+//! 设置窗口的语义组件层：页面、卡片、行和控件布局指标。
+//! Semantic components for the Settings window: pages, cards, rows, and layout metrics.
+//!
+//! These components intentionally remain thin wrappers around the existing AppKit builders.
+//! Keeping ownership of raw Objective-C pointers in `settings.rs` avoids changing callback and
+//! configuration lifetimes while giving every page one place for shared geometry rules.
+//! 这里的组件刻意保持轻量，底层仍复用现有 AppKit builder。裸 Objective-C 指针的所有权继续由
+//! settings.rs 管理，避免改变回调/配置生命周期，同时让所有页面共享同一套几何规则。
+
+use objc2::runtime::{AnyObject, Sel};
+use objc2_foundation::NSRect;
+
+use crate::i18n::t;
+
+use super::widgets;
+
+/// Shared horizontal and vertical metrics for all settings pages.
+/// 所有设置页共享的水平/垂直布局指标。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SettingsLayout {
+    pub label_x: f64,
+    pub label_w: f64,
+    pub control_x: f64,
+    pub control_w: f64,
+    pub row_h: f64,
+    pub described_row_h: f64,
+    /// Distance from one section cursor to the next section header cursor.
+    /// 相邻区块标题游标之间的距离。
+    pub section_step: f64,
+    /// Vertical gap between rows inside a grouped card.
+    /// 分组卡片内部行与行之间的垂直间距。
+    pub row_gap: f64,
+    /// Legacy page frame inset below the last row; normalized by SettingsSection.
+    /// 页面 frame 在最后一行下方的原始内缩；由 SettingsSection 统一归一化。
+    pub card_bottom_inset: f64,
+    /// Gap between a section header and the card top edge.
+    /// 区块标题与卡片顶部之间的间距。
+    pub card_header_gap: f64,
+    /// Symmetric padding for a standalone card with no section header.
+    /// 没有区块标题的独立卡片使用的对称内边距。
+    pub card_padding: f64,
+}
+
+impl SettingsLayout {
+    /// Standard visual height of one settings row; controls remain shorter and center inside it.
+    /// 设置行的标准视觉高度；控件保持更矮并在其中居中。
+    pub(super) const SINGLE_LINE_ROW_H: f64 = 54.0;
+    pub(super) const CONTROL_H: f64 = 34.0;
+
+    pub(super) fn new(content_w: f64) -> Self {
+        let control_w = 200.0;
+        Self {
+            label_x: 12.0,
+            label_w: 220.0,
+            control_x: content_w - control_w - super::SETTINGS_CONTROL_TRAILING_INSET,
+            control_w,
+            row_h: Self::CONTROL_H,
+            // Detailed subtitles are no longer rendered; described rows use the same compact
+            // height as every other single-line row.
+            // 详细说明已不再渲染；described 行与其他单行 row 统一使用紧凑高度。
+            described_row_h: Self::SINGLE_LINE_ROW_H,
+            section_step: super::SETTINGS_SECTION_HEADER_GAP + 24.0,
+            row_gap: 8.0,
+            card_bottom_inset: 10.0,
+            card_header_gap: super::SETTINGS_SECTION_CARD_GAP,
+            card_padding: 4.0,
+        }
+    }
+
+    pub(super) fn next_section_cursor(self, cursor: f64) -> f64 {
+        cursor - self.section_step
+    }
+
+    pub(super) fn next_row_cursor(self, cursor: f64, row_h: f64) -> f64 {
+        cursor - self.row_gap - row_h
+    }
+
+    pub(super) fn next_row_cursor_with_extra(self, cursor: f64, row_h: f64, extra_gap: f64) -> f64 {
+        cursor - extra_gap - self.row_gap - row_h
+    }
+
+    pub(super) fn card_bottom(self, row_y: f64) -> f64 {
+        row_y - self.card_bottom_inset
+    }
+
+    pub(super) fn card_top(self, header_y: f64) -> f64 {
+        header_y - self.card_header_gap
+    }
+}
+
+/// Ownership-neutral page parts returned by the AppKit page builder.
+/// AppKit 页面 builder 返回的、不负责释放对象的页面部件。
+#[derive(Clone, Copy)]
+pub(super) struct SettingsPage {
+    pub(super) scroll: *mut AnyObject,
+    pub(super) document: *mut AnyObject,
+}
+
+unsafe impl Send for SettingsPage {}
+unsafe impl Sync for SettingsPage {}
+
+impl SettingsPage {
+    pub(super) unsafe fn new(
+        parent: *mut AnyObject,
+        frame: NSRect,
+        document_h: f64,
+        hidden: bool,
+    ) -> Self {
+        let (scroll, document) = widgets::make_settings_page(parent, frame, document_h, hidden);
+        Self { scroll, document }
+    }
+
+    pub(super) unsafe fn scroll_to_top(self) {
+        widgets::scroll_page_to_top(self.scroll);
+    }
+
+    pub(super) unsafe fn validate(self, name: &str) {
+        let actual: *mut AnyObject = objc2::msg_send![self.scroll, documentView];
+        debug_assert_eq!(actual, self.document);
+        widgets::debug_validate_settings_page(self.scroll, name);
+    }
+}
+
+/// Card component. Rows remain siblings of the card background so native controls keep their
+/// normal hit-testing and z-order; the component owns only the card/shadow pair.
+/// 卡片组件。行仍作为卡片背景的 sibling，保证原生控件的命中和层级正常；组件只拥有卡片/阴影对。
+#[derive(Clone, Copy)]
+pub(super) struct SettingsCard {
+    pub(super) card: *mut AnyObject,
+    pub(super) shadow: *mut AnyObject,
+}
+
+unsafe impl Send for SettingsCard {}
+unsafe impl Sync for SettingsCard {}
+
+impl SettingsCard {
+    pub(super) unsafe fn attach(parent: *mut AnyObject, frame: NSRect) -> Self {
+        let (card, shadow) = widgets::add_settings_card(parent, frame);
+        Self { card, shadow }
+    }
+}
+
+/// A titled settings section: the small explanatory heading and its rounded card are one unit.
+/// 带标题的设置区块：左上角说明性小标题与圆角卡片作为一个组件单元。
+pub(super) struct SettingsSection;
+
+impl SettingsSection {
+    // Existing page coordinates reserve 4pt above a section card and 10pt below its last row.
+    // Trim the extra bottom inset here so the row content is centered in the card's visible area
+    // without requiring every page to carry a separate y-offset correction.
+    // 现有页面坐标在区块卡片上方预留 4pt、最后一行下方预留 10pt。组件统一裁掉多出的底部
+    // 6pt，让行内容在卡片可见区域内居中，页面调用方无需各自修正 y 坐标。
+    const EXTRA_BOTTOM_INSET: f64 = 6.0;
+
+    pub(super) unsafe fn attach(
+        parent: *mut AnyObject,
+        frame: NSRect,
+        title: &str,
+    ) -> SettingsCard {
+        let header_y = frame.origin.y + frame.size.height + super::SETTINGS_SECTION_CARD_GAP;
+        widgets::add_header(parent, title, 6.0, header_y, frame.size.width);
+        let mut card_frame = frame;
+        card_frame.origin.y += Self::EXTRA_BOTTOM_INSET;
+        card_frame.size.height = (card_frame.size.height - Self::EXTRA_BOTTOM_INSET).max(1.0);
+        SettingsCard::attach(parent, card_frame)
+    }
+}
+
+/// Semantic row entry points. Every row centers its leading text and trailing control internally;
+/// described rows retain their legacy subtitle parameter only for call-site compatibility.
+/// 语义化 row 入口。每行内部统一居中左侧文字和右侧控件；described 行保留旧 subtitle 参数，
+/// 仅用于兼容现有调用点，不再渲染详细说明。
+pub(super) struct SettingsRow;
+
+impl SettingsRow {
+    /// Add the standard grouped-card divider through the same row component API.
+    /// 通过统一的 row 组件 API 添加分组卡片分割线。
+    pub(super) unsafe fn separator(parent: *mut AnyObject, y: f64, width: f64) -> *mut AnyObject {
+        widgets::add_row_separator(parent, 0.0, y, width)
+    }
+
+    /// Center a native control by its view frame.
+    /// 按控件 view frame 在 row 内垂直居中。
+    unsafe fn center_control(child: *mut AnyObject, y: f64, row_h: f64) {
+        if child.is_null() {
+            return;
+        }
+        let mut frame: NSRect = objc2::msg_send![child, frame];
+        frame.origin.y = y + (row_h - frame.size.height).max(0.0) / 2.0;
+        let _: () = objc2::msg_send![child, setFrame: frame];
+    }
+
+    /// NSTextField's glyphs are top-biased when its frame is taller than the measured cell.
+    /// Fit the frame to the cell's measured height before centering it, so the glyph baseline
+    /// shares the same center line as the trailing control.
+    /// NSTextField 在较高 frame 中会把字形偏上绘制。先收紧到 cell 实际高度，再居中 frame，
+    /// 让字形基线与右侧控件共享同一条中心线。
+    unsafe fn center_label(child: *mut AnyObject, y: f64, row_h: f64) {
+        if child.is_null() {
+            return;
+        }
+        let cell: *mut AnyObject = objc2::msg_send![child, cell];
+        if cell.is_null() {
+            return;
+        }
+        let bounds: NSRect = objc2::msg_send![child, bounds];
+        let measured: objc2_foundation::NSSize = objc2::msg_send![cell, cellSizeForBounds: bounds];
+        if !measured.height.is_finite() || measured.height <= 0.0 {
+            return;
+        }
+        let mut frame: NSRect = objc2::msg_send![child, frame];
+        frame.origin.y = y + (row_h - measured.height).max(0.0) / 2.0;
+        frame.size.height = measured.height;
+        let _: () = objc2::msg_send![child, setFrame: frame];
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn described(
+        parent: *mut AnyObject,
+        x: f64,
+        y: f64,
+        text_w: f64,
+        row_h: f64,
+        title: &str,
+        subtitle: &str,
+        control: *mut AnyObject,
+    ) -> *mut AnyObject {
+        let (label, control) =
+            widgets::add_described_row(parent, x, y, text_w, row_h, title, subtitle, control);
+        Self::center_label(label, y, row_h);
+        Self::center_control(control, y, row_h);
+        control
+    }
+
+    pub(super) unsafe fn tall(
+        parent: *mut AnyObject,
+        label_x: f64,
+        y: f64,
+        label_w: f64,
+        label_text: &str,
+        control: *mut AnyObject,
+    ) -> (*mut AnyObject, *mut AnyObject) {
+        let (label, control) = widgets::add_tall_row(
+            parent,
+            label_x,
+            y,
+            label_w,
+            SettingsLayout::SINGLE_LINE_ROW_H,
+            label_text,
+            control,
+        );
+        Self::center_label(label, y, SettingsLayout::SINGLE_LINE_ROW_H);
+        Self::center_control(control, y, SettingsLayout::SINGLE_LINE_ROW_H);
+        (label, control)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn plain(
+        parent: *mut AnyObject,
+        label_x: f64,
+        y: f64,
+        label_w: f64,
+        h: f64,
+        label_text: &str,
+        control: *mut AnyObject,
+    ) -> *mut AnyObject {
+        let (label, control) =
+            widgets::add_row_with_label(parent, label_x, y, label_w, h, label_text, control);
+        Self::center_label(label, y, h);
+        Self::center_control(control, y, h);
+        control
+    }
+}
+
+/// Native controls shared by settings rows and the window chrome.
+/// 设置行和窗口 chrome 共用的原生控件组件入口。
+pub(super) struct SettingsControl;
+
+impl SettingsControl {
+    pub(super) unsafe fn popup(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        items: &[&str],
+        selected: usize,
+    ) -> *mut AnyObject {
+        widgets::make_popup(x, y, w, h, items, selected)
+    }
+
+    pub(super) unsafe fn switch(right_x: f64, y: f64, h: f64, checked: bool) -> *mut AnyObject {
+        widgets::make_switch(right_x, y, h, checked)
+    }
+
+    pub(super) unsafe fn slider(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        min: i64,
+        max: i64,
+        value: i64,
+    ) -> *mut AnyObject {
+        widgets::make_slider(x, y, w, h, min, max, value)
+    }
+
+    pub(super) unsafe fn text_input(x: f64, y: f64, w: f64, h: f64, value: &str) -> *mut AnyObject {
+        widgets::make_text_input(x, y, w, h, value)
+    }
+
+    pub(super) unsafe fn action(
+        frame: NSRect,
+        title: &str,
+        target: *mut AnyObject,
+        action: Sel,
+    ) -> *mut AnyObject {
+        widgets::make_settings_action_button(frame, title, target, action)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn sidebar(
+        parent: *mut AnyObject,
+        target: *mut AnyObject,
+        title: &str,
+        symbol: &str,
+        tag: isize,
+        x: f64,
+        y: f64,
+        w: f64,
+        icon_frame: NSRect,
+        label_frame: NSRect,
+    ) -> *mut AnyObject {
+        widgets::make_sidebar_button(
+            parent,
+            target,
+            title,
+            symbol,
+            tag,
+            x,
+            y,
+            w,
+            icon_frame,
+            label_frame,
+        )
+    }
+}
+
+/// Sidebar navigation component backed by the shared borderless button builder.
+/// 侧栏导航组件，统一复用无边框按钮 builder。
+pub(super) struct SettingsSidebar;
+
+/// The icon is part of the sidebar item's semantic data, not inferred from a page tag.
+/// 图标属于侧栏条目的语义数据，不再由页面 tag 隐式推断。
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SettingsSidebarIcon {
+    General,
+    Switcher,
+    Mouse,
+    Clipboard,
+    About,
+}
+
+impl SettingsSidebarIcon {
+    fn symbol_name(self) -> &'static str {
+        match self {
+            Self::General => "gearshape",
+            Self::Switcher => "rectangle.on.rectangle",
+            Self::Mouse => "computermouse",
+            // `doc.on.clipboard` has a dark overlapping foreground layer in the system glyph;
+            // use the clean document outline so the sidebar stays visually balanced.
+            // `doc.on.clipboard` 自带深色叠放前景层；改用干净的文档线框保持侧栏一致。
+            Self::Clipboard => "doc.text",
+            Self::About => "info.circle",
+        }
+    }
+}
+
+fn sidebar_item_frames(w: f64) -> (NSRect, NSRect) {
+    const ROW_H: f64 = 38.0;
+    const ICON_X: f64 = 16.0;
+    const ICON_SIZE: f64 = 18.0;
+    const LABEL_X: f64 = 46.0;
+    let icon_frame = NSRect::new(
+        objc2_foundation::NSPoint::new(ICON_X, (ROW_H - ICON_SIZE) / 2.0),
+        objc2_foundation::NSSize::new(ICON_SIZE, ICON_SIZE),
+    );
+    let label_frame = NSRect::new(
+        objc2_foundation::NSPoint::new(LABEL_X, 0.0),
+        objc2_foundation::NSSize::new((w - LABEL_X - 8.0).max(1.0), ROW_H),
+    );
+    (icon_frame, label_frame)
+}
+
+impl SettingsSidebar {
+    pub(super) unsafe fn build(
+        parent: *mut AnyObject,
+        target: *mut AnyObject,
+        x: f64,
+        y0: f64,
+        w: f64,
+    ) -> [*mut AnyObject; 5] {
+        // Add new sidebar entries here: the component owns title keys, icons, tags, and spacing.
+        // 新增侧栏入口只需在这里添加标题 key、图标和 tag；间距与对齐由组件统一处理。
+        let entries = [
+            ("settings.sidebar_general", SettingsSidebarIcon::General),
+            ("settings.sidebar_switcher", SettingsSidebarIcon::Switcher),
+            ("settings.sidebar_mouse", SettingsSidebarIcon::Mouse),
+            ("settings.sidebar_clipboard", SettingsSidebarIcon::Clipboard),
+            ("settings.sidebar_about", SettingsSidebarIcon::About),
+        ];
+        std::array::from_fn(|index| {
+            let (title_key, icon) = entries[index];
+            SettingsSidebarTab::attach(
+                parent,
+                target,
+                &t(title_key),
+                icon,
+                index as isize,
+                x,
+                y0 - index as f64 * 42.0,
+                w,
+            )
+        })
+    }
+}
+
+/// One independently aligned icon-and-label tab inside the sidebar.
+/// 侧栏中一个独立对齐的图标 + 文本 tab。
+pub(super) struct SettingsSidebarTab;
+
+impl SettingsSidebarTab {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn attach(
+        parent: *mut AnyObject,
+        target: *mut AnyObject,
+        title: &str,
+        icon: SettingsSidebarIcon,
+        tag: isize,
+        x: f64,
+        y: f64,
+        w: f64,
+    ) -> *mut AnyObject {
+        // Keep the icon and title on one explicit center line. NSTextField's cell can otherwise
+        // place glyphs near the top of a 28pt frame while SF Symbols use their own optical box.
+        // 用同一条明确的中心线放置图标和文字；否则 NSTextField cell 可能把字形放在 28pt
+        // frame 的偏上位置，而 SF Symbols 又使用自己的 optical box，最终视觉上不对齐。
+        let (icon_frame, label_frame) = sidebar_item_frames(w);
+        SettingsControl::sidebar(
+            parent,
+            target,
+            title,
+            icon.symbol_name(),
+            tag,
+            x,
+            y,
+            w,
+            icon_frame,
+            label_frame,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sidebar_item_frames, SettingsLayout};
+    use crate::settings::SETTINGS_CONTROL_TRAILING_INSET;
+
+    #[test]
+    fn layout_keeps_controls_aligned_to_the_trailing_inset() {
+        let layout = SettingsLayout::new(600.0);
+        assert_eq!(
+            layout.control_x + layout.control_w,
+            600.0 - SETTINGS_CONTROL_TRAILING_INSET
+        );
+        assert_eq!(layout.row_h, 34.0);
+        assert_eq!(layout.described_row_h, 54.0);
+        assert_eq!(SettingsLayout::CONTROL_H, 34.0);
+        assert_eq!(SettingsLayout::SINGLE_LINE_ROW_H, 54.0);
+        assert_eq!(layout.section_step, 48.0);
+        assert_eq!(layout.row_gap, 8.0);
+        assert_eq!(layout.card_bottom(100.0), 90.0);
+        assert_eq!(layout.card_top(100.0), 96.0);
+        assert_eq!(layout.card_padding, 4.0);
+        assert_eq!(layout.next_row_cursor_with_extra(100.0, 54.0, 18.0), 20.0);
+    }
+
+    #[test]
+    fn sidebar_frames_share_the_same_vertical_center() {
+        let (icon, label) = sidebar_item_frames(240.0);
+        let icon_center = icon.origin.y + icon.size.height / 2.0;
+        let label_center = label.origin.y + label.size.height / 2.0;
+        assert_eq!(icon_center, label_center);
+        assert_eq!(icon.origin.x, 16.0);
+        assert_eq!(label.origin.x, 46.0);
+    }
+}
