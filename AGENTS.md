@@ -61,7 +61,7 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 
 ## Git and commits
 
-Never commit, push, stage, or rewrite history on the user's behalf. When a commit message is requested, provide only one Conventional Commits line:
+Unless the user explicitly requests it, do not commit, push, stage, or rewrite history on the user's behalf. When a commit message is requested, provide only one Conventional Commits line:
 
 `type: description`
 
