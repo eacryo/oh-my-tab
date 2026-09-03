@@ -308,15 +308,6 @@ impl SettingsControl {
         widgets::make_text_input(x, y, w, h, value)
     }
 
-    pub(super) unsafe fn action(
-        frame: NSRect,
-        title: &str,
-        target: *mut AnyObject,
-        action: Sel,
-    ) -> *mut AnyObject {
-        widgets::make_settings_action_button(frame, title, target, action)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn sidebar(
         parent: *mut AnyObject,
@@ -341,6 +332,53 @@ impl SettingsControl {
             w,
             icon_frame,
             label_frame,
+        )
+    }
+}
+
+/// Semantic roles for clickable settings buttons. The low-level builder owns AppKit tracking;
+/// this role selects the normal surface, text color, and hover behavior without leaking raw color
+/// literals into page construction code.
+/// 设置页可点击按钮的语义角色。底层 builder 负责 AppKit tracking；这里的 role 统一选择常态
+/// 背景、文字颜色和 hover 行为，页面代码不再散落原始颜色值。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SettingsButtonRole {
+    Action,
+    Compact,
+    Footer,
+    Primary,
+}
+
+impl SettingsButtonRole {
+    fn style(self) -> (u32, u32, isize) {
+        match self {
+            // The generic action uses the translucent light surface shared by small/full actions.
+            Self::Action => (0xFFFFFFAD, 0x2E2E2EFF, -3),
+            // Mapping/edit actions use the denser gray surface but the same generic hover state.
+            Self::Compact => (0x7676801F, 0x44444AFF, 0),
+            Self::Footer => (0xFFFFFFC7, 0x2E2E2EFF, -1),
+            Self::Primary => (0x0A84FFFF, 0xFFFFFFFF, -2),
+        }
+    }
+}
+
+/// Shared semantic button component for settings actions. Specialized controls such as toggles,
+/// sidebar tabs, clipboard actions, and the overlay close button keep their own interaction model.
+/// 设置页操作按钮的统一语义组件。开关、侧边栏 tab、剪贴板操作和浮窗关闭按钮拥有独立交互，
+/// 继续使用各自的专用组件。
+pub(super) struct SettingsButton;
+
+impl SettingsButton {
+    pub(super) unsafe fn action(
+        frame: NSRect,
+        title: &str,
+        target: *mut AnyObject,
+        action: Sel,
+        role: SettingsButtonRole,
+    ) -> *mut AnyObject {
+        let (background, text, hover_tag) = role.style();
+        widgets::make_settings_styled_button(
+            frame, title, target, action, background, text, hover_tag,
         )
     }
 }
@@ -462,7 +500,7 @@ impl SettingsSidebarTab {
 
 #[cfg(test)]
 mod tests {
-    use super::{sidebar_item_frames, SettingsLayout};
+    use super::{sidebar_item_frames, SettingsButtonRole, SettingsLayout};
     use crate::settings::SETTINGS_CONTROL_TRAILING_INSET;
 
     #[test]
@@ -492,5 +530,25 @@ mod tests {
         assert_eq!(icon_center, label_center);
         assert_eq!(icon.origin.x, 16.0);
         assert_eq!(label.origin.x, 46.0);
+    }
+
+    #[test]
+    fn button_roles_keep_normal_and_hover_semantics_distinct() {
+        assert_eq!(
+            SettingsButtonRole::Action.style(),
+            (0xFFFFFFAD, 0x2E2E2EFF, -3)
+        );
+        assert_eq!(
+            SettingsButtonRole::Compact.style(),
+            (0x7676801F, 0x44444AFF, 0)
+        );
+        assert_eq!(
+            SettingsButtonRole::Footer.style(),
+            (0xFFFFFFC7, 0x2E2E2EFF, -1)
+        );
+        assert_eq!(
+            SettingsButtonRole::Primary.style(),
+            (0x0A84FFFF, 0xFFFFFFFF, -2)
+        );
     }
 }

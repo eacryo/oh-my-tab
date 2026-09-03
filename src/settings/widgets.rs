@@ -122,6 +122,7 @@ pub(super) extern "C" fn html_action_button_mouse_exited(
             -2 => 0x0A84FFFFu32,
             -1 => 0xFFFFFFC7u32,
             -3 => 0xFFFFFFADu32, // HTML `.full-action` normal background
+            _ if tag >= 0 => 0x7676801Fu32, // mapping/edit compact action
             _ => 0xFFFFFFADu32,
         };
         let layer: *mut AnyObject = msg_send![button, layer];
@@ -134,21 +135,28 @@ pub(super) extern "C" fn html_action_button_mouse_exited(
     }
 }
 
-/// 创建设置窗口统一使用的原生圆角操作按钮;调用方负责尺寸、自适应和父视图归属。
-/// Create the native rounded action button shared by Settings; callers own frame, autoresizing,
-/// and parent-view placement.
-pub(super) unsafe fn make_settings_action_button(
+/// Create a settings action button with a semantic normal/hover style. All buttons use the same
+/// tracking area and dynamic AppKit subclass; the tag only selects the hover palette and remains
+/// compatible with existing positive tags used by mapping rows.
+/// 创建带语义常态/悬停样式的设置操作按钮。所有按钮共用 tracking area 和动态 AppKit 子类；
+/// tag 只选择 hover 调色板，并兼容按键映射行已有的正数 tag。
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn make_settings_styled_button(
     frame: NSRect,
     title: &str,
     target: *mut AnyObject,
     action: Sel,
+    background_hex: u32,
+    text_hex: u32,
+    hover_tag: isize,
 ) -> *mut AnyObject {
     let button: *mut AnyObject = msg_send![html_action_button_class(), alloc];
     let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
     set_control_title(button, title);
     let _: () = msg_send![button, setControlSize: 0isize]; // NSControlSizeRegular
                                                            // HTML .small-btn / footer buttons: translucent white surface with a hairline border.
-    style_html_button(button, 0xFFFFFFADu32, 0x2E2E2EFFu32);
+    style_html_button(button, background_hex, text_hex);
+    let _: () = msg_send![button, setTag: hover_tag];
     let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
     let tracking: *mut AnyObject = msg_send![
         tracking,

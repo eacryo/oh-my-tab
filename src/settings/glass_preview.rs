@@ -374,7 +374,7 @@ pub(super) unsafe fn configure_glass_tint_panel(target: *mut AnyObject) {
         accessory,
         initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(accessory_w, 34.0))
     ];
-    let reset = make_settings_action_button(
+    let reset = SettingsButton::action(
         NSRect::new(
             NSPoint::new(accessory_margin, 3.0),
             NSSize::new(accessory_w - accessory_margin * 2.0, 28.0),
@@ -382,6 +382,7 @@ pub(super) unsafe fn configure_glass_tint_panel(target: *mut AnyObject) {
         &t("settings.reset_glass_tint"),
         target,
         sel!(handleGlassTintReset:),
+        SettingsButtonRole::Action,
     );
     // 按本地化标题使用原生固有宽度,避免全宽按钮让系统圆角比例失真。
     // Use the native fitting width for the localized title so a full-width button does not distort

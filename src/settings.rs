@@ -330,8 +330,8 @@ pub(crate) mod mapping;
 pub(crate) mod widgets;
 
 use components::{
-    SettingsCard, SettingsControl, SettingsLayout, SettingsPage, SettingsRow, SettingsSection,
-    SettingsSidebar,
+    SettingsButton, SettingsButtonRole, SettingsCard, SettingsControl, SettingsLayout,
+    SettingsPage, SettingsRow, SettingsSection, SettingsSidebar,
 };
 use glass_preview::*;
 pub(crate) use glass_preview::{
@@ -2742,11 +2742,12 @@ fn create_settings_window() {
         }
         let _: () = msg_send![sidebar_view, addSubview: sidebar_footer_line];
         release_obj(sidebar_footer_line);
-        let restore = SettingsControl::action(
+        let restore = SettingsButton::action(
             NSRect::new(NSPoint::new(22.0, 20.0), NSSize::new(card_w - 44.0, 30.0)),
             &t("settings.btn_restore_defaults"),
             target,
             sel!(handleRestoreDefaults:),
+            SettingsButtonRole::Action,
         );
         let _: () = msg_send![restore, setAutoresizingMask: 36u64];
         let _: () = msg_send![sidebar_view, addSubview: restore];
@@ -2852,7 +2853,7 @@ fn create_settings_window() {
         release_obj(warning_label);
 
         // 「打开隐私与安全性」按钮 / "Open Privacy & Security" button
-        let open_btn = SettingsControl::action(
+        let open_btn = SettingsButton::action(
             NSRect::new(
                 NSPoint::new(content_w - 150.0, (banner_h - 28.0) / 2.0),
                 NSSize::new(140.0, 28.0),
@@ -2860,6 +2861,7 @@ fn create_settings_window() {
             &t("settings.btn_open_privacy"),
             target,
             sel!(handleOpenPrivacy:),
+            SettingsButtonRole::Action,
         );
         let _: () = msg_send![banner, addSubview: open_btn];
         release_obj(open_btn);
@@ -3629,14 +3631,19 @@ fn create_settings_window() {
         ui.mapping_empty = empty;
         // 添加按钮:卡片底部 action-row(全宽)。
         // Add-mapping button: full-width action row at the card bottom.
-        let add_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-        let add_btn: *mut AnyObject = msg_send![add_btn, initWithFrame: NSRect::new(NSPoint::new(MAPPING_PANEL_X, MAPPING_PANEL_TOP + MAPPING_HEADER_H + MAPPING_ROW_H * 3.0 + MAPPING_ACTION_TOP), NSSize::new(card_w - 2.0 * MAPPING_PANEL_X, MAPPING_ACTION_H))];
-        style_html_button(add_btn, 0x7676801Fu32, 0x2C2C30FFu32);
-        let add_title = make_nsstring(&t("settings.row_add_mapping"));
-        let _: () = msg_send![add_btn, setTitle: add_title];
-        CFRelease(add_title as *const c_void);
-        let _: () = msg_send![add_btn, setTarget: target];
-        let _: () = msg_send![add_btn, setAction: sel!(handleAddMapping:)];
+        let add_btn = SettingsButton::action(
+            NSRect::new(
+                NSPoint::new(
+                    MAPPING_PANEL_X,
+                    MAPPING_PANEL_TOP + MAPPING_HEADER_H + MAPPING_ROW_H * 3.0 + MAPPING_ACTION_TOP,
+                ),
+                NSSize::new(card_w - 2.0 * MAPPING_PANEL_X, MAPPING_ACTION_H),
+            ),
+            &t("settings.row_add_mapping"),
+            target,
+            sel!(handleAddMapping:),
+            SettingsButtonRole::Compact,
+        );
         let _: () = msg_send![card_bg, addSubview: add_btn];
         release_obj(add_btn);
         ui.add_mapping_button = add_btn;
@@ -4071,7 +4078,7 @@ fn create_settings_window() {
         // 检查更新:全宽长按钮,标题随流程在「检查更新…/检查中…/已是最新版本」间切换,尺寸不变。
         // Check for updates: a full-width button whose title switches between "Check for Updates…",
         // "Checking…", and "You're up to date" without changing size.
-        let check_button = SettingsControl::action(
+        let check_button = SettingsButton::action(
             NSRect::new(
                 NSPoint::new(label_x, update_row_y - described_row_h - 46.0),
                 NSSize::new(content_w - 2.0 * label_x, 32.0),
@@ -4079,6 +4086,7 @@ fn create_settings_window() {
             &t("settings.btn_check_for_updates"),
             target,
             sel!(handleCheckForUpdates:),
+            SettingsButtonRole::Action,
         );
         let _: () = msg_send![check_button, setTag: -3isize];
         let check_layer: *mut AnyObject = msg_send![check_button, layer];
@@ -4199,7 +4207,7 @@ fn create_settings_window() {
 
         // --- 确认 / 取消(右侧 footer 内,所有页面都可见)---
         // Cancel and OK are children of the detail pane's footer, matching the HTML layout.
-        let cancel = SettingsControl::action(
+        let cancel = SettingsButton::action(
             NSRect::new(
                 NSPoint::new(content_x + detail_w - 202.0, 14.0),
                 NSSize::new(86.0, 32.0),
@@ -4207,6 +4215,7 @@ fn create_settings_window() {
             &t("settings.btn_cancel"),
             target,
             sel!(handleSettingsCancel:),
+            SettingsButtonRole::Footer,
         );
         let _: () = msg_send![cancel, setTag: -1isize];
         let cancel_layer: *mut AnyObject = msg_send![cancel, layer];
@@ -4221,7 +4230,7 @@ fn create_settings_window() {
         let _: () = msg_send![content, addSubview: cancel];
         release_obj(cancel);
 
-        let ok = SettingsControl::action(
+        let ok = SettingsButton::action(
             NSRect::new(
                 NSPoint::new(content_x + detail_w - 106.0, 14.0),
                 NSSize::new(86.0, 32.0),
@@ -4229,6 +4238,7 @@ fn create_settings_window() {
             &t("settings.btn_ok"),
             target,
             sel!(handleSettingsOk:),
+            SettingsButtonRole::Primary,
         );
         let _: () = msg_send![ok, setTag: -2isize];
         let ok_layer: *mut AnyObject = msg_send![ok, layer];

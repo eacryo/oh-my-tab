@@ -157,30 +157,34 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             release_obj(desc_label);
             // 编辑按钮(打开编辑面板)。
             // The edit button (opens the edit panel).
-            let edit: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let edit: *mut AnyObject = msg_send![edit, initWithFrame: NSRect::new(NSPoint::new(ed_x, y + (row_h - btn_h) / 2.0), NSSize::new(btn_w, btn_h))];
-            style_html_button(edit, 0x7676801Fu32, 0x44444AFFu32);
+            let edit = SettingsButton::action(
+                NSRect::new(
+                    NSPoint::new(ed_x, y + (row_h - btn_h) / 2.0),
+                    NSSize::new(btn_w, btn_h),
+                ),
+                &t("settings.mapping_edit"),
+                target,
+                sel!(handleMappingEdit:),
+                SettingsButtonRole::Compact,
+            );
             let _: () = msg_send![edit, setTag: btn as isize];
             let _: () = msg_send![edit, setEnabled: mappings_on];
-            let _: () = msg_send![edit, setTarget: target];
-            let _: () = msg_send![edit, setAction: sel!(handleMappingEdit:)];
-            let edit_title = make_nsstring(&t("settings.mapping_edit"));
-            let _: () = msg_send![edit, setTitle: edit_title];
-            CFRelease(edit_title as *const c_void);
             let _: () = msg_send![doc, addSubview: edit];
             release_obj(edit);
             // 删除按钮(文字样式,与编辑按钮同款)。
             // The delete button (text style, same look as Edit).
-            let delete: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let delete: *mut AnyObject = msg_send![delete, initWithFrame: NSRect::new(NSPoint::new(del_x, y + (row_h - btn_h) / 2.0), NSSize::new(btn_w, btn_h))];
-            style_html_button(delete, 0x7676801Fu32, 0x44444AFFu32);
+            let delete = SettingsButton::action(
+                NSRect::new(
+                    NSPoint::new(del_x, y + (row_h - btn_h) / 2.0),
+                    NSSize::new(btn_w, btn_h),
+                ),
+                &t("settings.mapping_delete"),
+                target,
+                sel!(handleDeleteMapping:),
+                SettingsButtonRole::Compact,
+            );
             let _: () = msg_send![delete, setTag: btn as isize];
             let _: () = msg_send![delete, setEnabled: mappings_on];
-            let _: () = msg_send![delete, setTarget: target];
-            let _: () = msg_send![delete, setAction: sel!(handleDeleteMapping:)];
-            let del_title = make_nsstring(&t("settings.mapping_delete"));
-            let _: () = msg_send![delete, setTitle: del_title];
-            CFRelease(del_title as *const c_void);
             let _: () = msg_send![doc, addSubview: delete];
             release_obj(delete);
             // 键帽胶囊:修饰符号 + 主键各一个圆角小方块(像真实键盘键帽)。
@@ -723,14 +727,13 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             let _: () = msg_send![btn_label, setEditable: false];
             let _: () = msg_send![ve, addSubview: btn_label];
             release_obj(btn_label);
-            let rec_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let rec_btn: *mut AnyObject = msg_send![rec_btn, initWithFrame: NSRect::new(NSPoint::new(280.0, 190.0), NSSize::new(140.0, 24.0))];
-            style_html_button(rec_btn, 0xFFFFFFADu32, 0x2E2E2EFFu32);
-            let rec_title = make_nsstring(&t("settings.mapping_record"));
-            let _: () = msg_send![rec_btn, setTitle: rec_title];
-            CFRelease(rec_title as *const c_void);
-            let _: () = msg_send![rec_btn, setTarget: target];
-            let _: () = msg_send![rec_btn, setAction: sel!(handlePanelRecordTrigger:)];
+            let rec_btn = SettingsButton::action(
+                NSRect::new(NSPoint::new(280.0, 190.0), NSSize::new(140.0, 24.0)),
+                &t("settings.mapping_record"),
+                target,
+                sel!(handlePanelRecordTrigger:),
+                SettingsButtonRole::Action,
+            );
             let _: () = msg_send![ve, addSubview: rec_btn];
             release_obj(rec_btn);
             // 动作行。
@@ -782,14 +785,13 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             release_obj(action);
             // 组合键行(Key Press 时显示)。
             // The combo row (shown for Key Press).
-            let combo_btn: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let combo_btn: *mut AnyObject = msg_send![combo_btn, initWithFrame: NSRect::new(NSPoint::new(130.0, 96.0), NSSize::new(140.0, 24.0))];
-            style_html_button(combo_btn, 0xFFFFFFADu32, 0x2E2E2EFFu32);
-            let combo_title = make_nsstring(&t("settings.mapping_record"));
-            let _: () = msg_send![combo_btn, setTitle: combo_title];
-            CFRelease(combo_title as *const c_void);
-            let _: () = msg_send![combo_btn, setTarget: target];
-            let _: () = msg_send![combo_btn, setAction: sel!(handlePanelRecordCombo:)];
+            let combo_btn = SettingsButton::action(
+                NSRect::new(NSPoint::new(130.0, 96.0), NSSize::new(140.0, 24.0)),
+                &t("settings.mapping_record"),
+                target,
+                sel!(handlePanelRecordCombo:),
+                SettingsButtonRole::Action,
+            );
             let _: () = msg_send![combo_btn, setHidden: true];
             let _: () = msg_send![ve, addSubview: combo_btn];
             release_obj(combo_btn);
@@ -804,24 +806,22 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             release_obj(combo_label);
             // 取消/确认。
             // Cancel/OK.
-            let cancel: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let cancel: *mut AnyObject = msg_send![cancel, initWithFrame: NSRect::new(NSPoint::new(240.0, 24.0), NSSize::new(88.0, 28.0))];
-            style_html_button(cancel, 0xFFFFFFC7u32, 0x2E2E2EFFu32);
-            let cancel_ns = make_nsstring(&t("settings.recording_cancel"));
-            let _: () = msg_send![cancel, setTitle: cancel_ns];
-            CFRelease(cancel_ns as *const c_void);
-            let _: () = msg_send![cancel, setTarget: target];
-            let _: () = msg_send![cancel, setAction: sel!(handleMappingCancel:)];
+            let cancel = SettingsButton::action(
+                NSRect::new(NSPoint::new(240.0, 24.0), NSSize::new(88.0, 28.0)),
+                &t("settings.recording_cancel"),
+                target,
+                sel!(handleMappingCancel:),
+                SettingsButtonRole::Footer,
+            );
             let _: () = msg_send![ve, addSubview: cancel];
             release_obj(cancel);
-            let ok: *mut AnyObject = msg_send![class!(NSButton), alloc];
-            let ok: *mut AnyObject = msg_send![ok, initWithFrame: NSRect::new(NSPoint::new(336.0, 24.0), NSSize::new(88.0, 28.0))];
-            style_html_button(ok, 0x0A84FFFFu32, 0xFFFFFFFFu32);
-            let ok_ns = make_nsstring(&t("settings.ok"));
-            let _: () = msg_send![ok, setTitle: ok_ns];
-            CFRelease(ok_ns as *const c_void);
-            let _: () = msg_send![ok, setTarget: target];
-            let _: () = msg_send![ok, setAction: sel!(handleMappingConfirm:)];
+            let ok = SettingsButton::action(
+                NSRect::new(NSPoint::new(336.0, 24.0), NSSize::new(88.0, 28.0)),
+                &t("settings.ok"),
+                target,
+                sel!(handleMappingConfirm:),
+                SettingsButtonRole::Primary,
+            );
             let _: () = msg_send![ve, addSubview: ok];
             release_obj(ok);
             *EDIT_PANEL.lock().unwrap() = Some(ObjPtr(panel));
