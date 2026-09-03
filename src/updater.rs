@@ -47,6 +47,7 @@ struct UpdateUiState {
     host_view: usize,
     host_window: usize,
     check_button: usize,
+    check_loading_indicator: usize,
     cancellation: usize,
     acknowledgement: usize,
     update_reply: usize,
@@ -65,6 +66,7 @@ static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
         host_view: 0,
         host_window: 0,
         check_button: 0,
+        check_loading_indicator: 0,
         cancellation: 0,
         acknowledgement: 0,
         update_reply: 0,
@@ -475,6 +477,8 @@ unsafe fn clear_host_subviews(host: *mut AnyObject) {
 }
 
 unsafe fn close_custom_update_window() {
+    let check_button = UPDATE_UI_STATE.lock().unwrap().check_button as *mut AnyObject;
+    stop_check_loading_indicator(check_button);
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
     if ui.host_view != 0 {
         // 内联模式:清除宿主内控件,不改动设置窗口。
@@ -507,6 +511,7 @@ unsafe fn close_custom_update_window() {
     ui.progress = 0;
     ui.status_label = 0;
     ui.cancel_button = 0;
+    ui.check_loading_indicator = 0;
     ui.expected_length = 0;
     ui.received_length = 0;
 }
@@ -534,6 +539,127 @@ pub(crate) fn clear_update_host() {
     ui.host_view = 0;
     ui.host_window = 0;
     ui.check_button = 0;
+    ui.check_loading_indicator = 0;
+}
+
+/// 停止检查更新按钮上的点阵动画;根图层保留以便下次检查时复用。
+/// Stop the check button's dot animation; keep the root layer for reuse on the next check.
+unsafe fn stop_check_loading_indicator(button: *mut AnyObject) {
+    if button.is_null() {
+        return;
+    }
+    let indicator = UPDATE_UI_STATE.lock().unwrap().check_loading_indicator;
+    if indicator == 0 {
+        return;
+    }
+    let indicator = indicator as *mut AnyObject;
+    let sublayers: *mut AnyObject = msg_send![indicator, sublayers];
+    if !sublayers.is_null() {
+        let count: usize = msg_send![sublayers, count];
+        let animation_key = make_nsstring("oh-my-tab-update-dot-pulse");
+        for index in 0..count {
+            let dot: *mut AnyObject = msg_send![sublayers, objectAtIndex: index];
+            let _: () = msg_send![dot, removeAnimationForKey: animation_key];
+        }
+        crate::ffi::CFRelease(animation_key as *const c_void);
+    }
+    let _: () = msg_send![indicator, setHidden: true];
+}
+
+/// 启动检查更新按钮上的三点呼吸动画,点位跟随本地化按钮标题右侧。
+/// Start a three-dot breathing animation beside the localized button title.
+unsafe fn start_check_loading_indicator(button: *mut AnyObject) {
+    if button.is_null() {
+        return;
+    }
+    let button_layer: *mut AnyObject = msg_send![button, layer];
+    if button_layer.is_null() {
+        return;
+    }
+
+    let indicator = {
+        let mut ui = UPDATE_UI_STATE.lock().unwrap();
+        if ui.check_loading_indicator == 0 {
+            let indicator: *mut AnyObject = msg_send![class!(CALayer), layer];
+            let _: () = msg_send![button_layer, addSublayer: indicator];
+            ui.check_loading_indicator = indicator as usize;
+            indicator
+        } else {
+            ui.check_loading_indicator as *mut AnyObject
+        }
+    };
+
+    let bounds: NSRect = msg_send![button, bounds];
+    // NSButton 的 titleRectForBounds: 可能返回整个内容区域;改用实际富文本标题尺寸,
+    // 才能把点准确放在居中标题的右侧。
+    // NSButton's titleRectForBounds: may return the whole content area; use the actual attributed
+    // title size so the dots land immediately after the centered title.
+    let attributed_title: *mut AnyObject = msg_send![button, attributedTitle];
+    let title_size = if attributed_title.is_null() {
+        NSSize::new(0.0, bounds.size.height)
+    } else {
+        msg_send![attributed_title, size]
+    };
+    let dot_size = 4.0;
+    let dot_gap = 4.0;
+    let indicator_w = dot_size * 3.0 + dot_gap * 2.0;
+    let title_origin_x = bounds.origin.x + (bounds.size.width - title_size.width) / 2.0;
+    let start_x = (title_origin_x + title_size.width + 6.0)
+        .min(bounds.origin.x + bounds.size.width - indicator_w - 8.0);
+    let start_y = bounds.origin.y + (bounds.size.height - dot_size) / 2.0;
+    let _: () = msg_send![indicator, setFrame: bounds];
+    let _: () = msg_send![indicator, setHidden: false];
+
+    let sublayers: *mut AnyObject = msg_send![indicator, sublayers];
+    let animation_key = make_nsstring("oh-my-tab-update-dot-pulse");
+    let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.25f64];
+    let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
+    for index in 0..3usize {
+        let dot: *mut AnyObject = if !sublayers.is_null() {
+            let count: usize = msg_send![sublayers, count];
+            if index < count {
+                msg_send![sublayers, objectAtIndex: index]
+            } else {
+                std::ptr::null_mut()
+            }
+        } else {
+            std::ptr::null_mut()
+        };
+        let dot = if dot.is_null() {
+            let dot: *mut AnyObject = msg_send![class!(CALayer), layer];
+            crate::ffi::layer_set_background(
+                dot,
+                crate::ffi::hex_to_cg_color(crate::theme::ui_palette().button_text),
+            );
+            let _: () = msg_send![dot, setCornerRadius: dot_size / 2.0];
+            let _: () = msg_send![indicator, addSublayer: dot];
+            dot
+        } else {
+            dot
+        };
+        let _: () = msg_send![
+            dot,
+            setFrame: NSRect::new(
+                NSPoint::new(start_x + index as f64 * (dot_size + dot_gap), start_y),
+                NSSize::new(dot_size, dot_size)
+            )
+        ];
+        let _: () = msg_send![dot, removeAnimationForKey: animation_key];
+        let key_path = make_nsstring("opacity");
+        let animation: *mut AnyObject = msg_send![
+            class!(CABasicAnimation),
+            animationWithKeyPath: key_path
+        ];
+        crate::ffi::CFRelease(key_path as *const c_void);
+        let _: () = msg_send![animation, setFromValue: from_value];
+        let _: () = msg_send![animation, setToValue: to_value];
+        let _: () = msg_send![animation, setDuration: 0.45f64];
+        let _: () = msg_send![animation, setAutoreverses: true];
+        let _: () = msg_send![animation, setRepeatCount: f32::INFINITY];
+        let _: () = msg_send![animation, setTimeOffset: index as f64 * 0.15];
+        let _: () = msg_send![dot, addAnimation: animation, forKey: animation_key];
+    }
+    crate::ffi::CFRelease(animation_key as *const c_void);
 }
 
 /// 更新 About 页「检查更新」按钮的文案与可用态;按钮尺寸保持不变。
@@ -549,6 +675,9 @@ pub(crate) fn set_check_button_status(title: &str, enabled: bool) {
         let _: () = msg_send![btn, setTitle: ns];
         crate::ffi::CFRelease(ns as *const c_void);
         let _: () = msg_send![btn, setEnabled: enabled];
+        if enabled {
+            stop_check_loading_indicator(btn);
+        }
     }
 }
 
@@ -569,6 +698,12 @@ pub(crate) fn begin_inline_check() {
         return;
     }
     set_check_button_status(&t("settings.update_checking"), false);
+    let check_button = UPDATE_UI_STATE.lock().unwrap().check_button as *mut AnyObject;
+    unsafe {
+        // 先结束上一条语句,确保取指针时的 MutexGuard 在进入动画函数前已经释放。
+        // End the previous statement so the MutexGuard is released before entering the animator.
+        start_check_loading_indicator(check_button)
+    };
     *CHECK_TIMER.lock().unwrap() = Some(Instant::now());
     // 守卫生程:若超时后按钮仍处于禁用(即尚无任何回调恢复),显示「重试检查」而不是误报无更新。
     // Guard thread: if the button is still disabled after the timeout (no callback restored it),

@@ -121,7 +121,7 @@ pub(super) extern "C" fn html_action_button_mouse_exited(
         let normal = match tag {
             -2 => 0x0A84FFFFu32,
             -1 => 0xFFFFFFC7u32,
-            -3 => 0x7676801Eu32, // HTML `.full-action`
+            -3 => 0xFFFFFFADu32, // HTML `.full-action` normal background
             _ => 0xFFFFFFADu32,
         };
         let layer: *mut AnyObject = msg_send![button, layer];
