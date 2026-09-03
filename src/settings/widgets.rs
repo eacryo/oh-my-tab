@@ -447,7 +447,9 @@ pub(super) unsafe fn centered_text_field_cell_class() -> *mut AnyObject {
                 centered_text_field_cell_select as *mut c_void,
                 select_types.as_ptr(),
             );
-            let editor_types = CString::new("v@:@").unwrap();
+            // AppKit 返回配置后的 NSText；返回值编码和 IMP ABI 必须保持一致。
+            // AppKit returns the configured NSText; its type encoding must match the IMP ABI.
+            let editor_types = CString::new("@@:@").unwrap();
             class_addMethod(
                 cls,
                 sel!(setUpFieldEditorAttributes:),
@@ -562,9 +564,9 @@ pub(super) extern "C" fn centered_text_field_cell_setup_editor(
     this: *mut c_void,
     _cmd: Sel,
     editor: *mut c_void,
-) {
+) -> *mut c_void {
     unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void) -> ();
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void) -> *mut c_void;
         let super_class =
             objc2::runtime::AnyClass::get(c"NSTextFieldCell").unwrap() as *const _ as *mut c_void;
         let mut sup = ObjcSuper {
@@ -572,11 +574,11 @@ pub(super) extern "C" fn centered_text_field_cell_setup_editor(
             super_class,
         };
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        send(&mut sup, sel!(setUpFieldEditorAttributes:), editor);
+        let configured_editor = send(&mut sup, sel!(setUpFieldEditorAttributes:), editor);
 
-        let editor = editor as *mut AnyObject;
+        let editor = configured_editor as *mut AnyObject;
         if editor.is_null() {
-            return;
+            return configured_editor;
         }
         let _: () = msg_send![editor, setAlignment: 0isize]; // NSTextAlignmentLeft
         let _: () = msg_send![editor, setVerticallyResizable: false];
@@ -586,6 +588,7 @@ pub(super) extern "C" fn centered_text_field_cell_setup_editor(
             // drawing baseline; add one point of vertical inset so edit and display states line up.
             let _: () = msg_send![editor, setTextContainerInset: NSSize::new(8.0, 8.0)];
         }
+        configured_editor
     }
 }
 
