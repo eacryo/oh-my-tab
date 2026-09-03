@@ -41,6 +41,7 @@ const TEXT_SIZE_MIN: i64 = 13;
 const TEXT_SIZE_MAX: i64 = 20;
 const TEXT_SIZE_DEFAULT: i64 = 15;
 const TEXT_SIZE_VALUE_W: f64 = 40.0;
+const TEXT_SIZE_VALUE_H: f64 = 18.0;
 
 // ========== 按键映射录制状态 / button-mapping recording state ==========
 
@@ -371,11 +372,12 @@ unsafe fn make_text_size_value_label(
         label,
         initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
     ];
-    set_field(label, format!("{value} pt"));
+    set_field(label, value);
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight
+    let _: () = msg_send![label, setUsesSingleLineMode: true];
+    let _: () = msg_send![label, setAlignment: 1isize]; // NSTextAlignmentCenter
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
     label
@@ -1084,7 +1086,7 @@ unsafe fn update_text_size_value_label(sender: *mut c_void, status_bar: bool) {
         } else {
             u.card_text_size_value_label
         };
-        set_field(label, format!("{value} pt"));
+        set_field(label, value);
     }
 }
 
@@ -1673,18 +1675,12 @@ fn load_settings_from(cfg: &Config) {
         let card_text_size = text_size_slider_value(cfg.layout.card_text_size);
         let status_bar_text_size = text_size_slider_value(cfg.fonts.status_bar_size);
         let _: () = msg_send![ui.card_text_size, setIntegerValue: card_text_size as isize];
-        set_field(
-            ui.card_text_size_value_label,
-            format!("{card_text_size} pt"),
-        );
+        set_field(ui.card_text_size_value_label, card_text_size);
         let _: () = msg_send![
             ui.status_bar_text_size,
             setIntegerValue: status_bar_text_size as isize
         ];
-        set_field(
-            ui.status_bar_text_size_value_label,
-            format!("{status_bar_text_size} pt"),
-        );
+        set_field(ui.status_bar_text_size_value_label, status_bar_text_size);
         let mod_idx: isize = if is_cmd { 1 } else { 0 };
         let _: () = msg_send![ui.modifier, selectItemAtIndex: mod_idx];
         // locale:按 CONFIG.i18n.locale 选中对应项,未匹配回退第 0 项(auto)。
@@ -3189,12 +3185,13 @@ fn create_settings_window() {
                 TEXT_SIZE_DEFAULT,
             ),
         );
+        let text_size_value_y = y + 10.0 + (row_h - TEXT_SIZE_VALUE_H) / 2.0;
         ui.card_text_size_value_label = make_text_size_value_label(
             switcher_view,
             ctrl_x + ctrl_w - TEXT_SIZE_VALUE_W,
-            y + 10.0,
+            text_size_value_y,
             TEXT_SIZE_VALUE_W,
-            row_h,
+            TEXT_SIZE_VALUE_H,
             TEXT_SIZE_DEFAULT,
         );
         let _: () = msg_send![ui.card_text_size, setTarget: target];
@@ -3222,12 +3219,13 @@ fn create_settings_window() {
                 TEXT_SIZE_DEFAULT,
             ),
         );
+        let text_size_value_y = y + 10.0 + (row_h - TEXT_SIZE_VALUE_H) / 2.0;
         ui.status_bar_text_size_value_label = make_text_size_value_label(
             switcher_view,
             ctrl_x + ctrl_w - TEXT_SIZE_VALUE_W,
-            y + 10.0,
+            text_size_value_y,
             TEXT_SIZE_VALUE_W,
-            row_h,
+            TEXT_SIZE_VALUE_H,
             TEXT_SIZE_DEFAULT,
         );
         let _: () = msg_send![ui.status_bar_text_size, setTarget: target];
@@ -3431,15 +3429,14 @@ fn create_settings_window() {
         // Read-only value label right of the slider: shows the current line count, refreshed
         // live as the slider moves.
         let value_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let value_label: *mut AnyObject = msg_send![value_label, initWithFrame: NSRect::new(NSPoint::new(ctrl_x + ctrl_w - 34.0, y + 10.0), NSSize::new(30.0, row_h))];
+        let line_count_value_y = y + 10.0 + (row_h - TEXT_SIZE_VALUE_H) / 2.0;
+        let value_label: *mut AnyObject = msg_send![value_label, initWithFrame: NSRect::new(NSPoint::new(ctrl_x + ctrl_w - 34.0, line_count_value_y), NSSize::new(30.0, TEXT_SIZE_VALUE_H))];
         set_field(value_label, 3);
         let _: () = msg_send![value_label, setBezeled: false];
         let _: () = msg_send![value_label, setDrawsBackground: false];
         let _: () = msg_send![value_label, setEditable: false];
-        // 右对齐:Apple Silicon 上 NSTextAlignment 走 iOS 值分支,Right=2(1 是 Center)。
-        // Right-aligned: on Apple Silicon NSTextAlignment uses the iOS values, Right=2 (1
-        // is Center).
-        let _: () = msg_send![value_label, setAlignment: 2isize]; // NSTextAlignmentRight on arm64
+        let _: () = msg_send![value_label, setUsesSingleLineMode: true];
+        let _: () = msg_send![value_label, setAlignment: 1isize]; // NSTextAlignmentCenter
         let _: () = msg_send![mouse_view, addSubview: value_label];
         release_obj(value_label);
         ui.line_count_value_label = value_label;

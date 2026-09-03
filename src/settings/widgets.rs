@@ -438,7 +438,9 @@ pub(super) unsafe fn centered_text_field_cell_class() -> *mut AnyObject {
                 centered_text_field_cell_draw_interior as *mut c_void,
                 draw_types.as_ptr(),
             );
-            let select_types = CString::new("v@:{CGRect=dddd}@@@@qq").unwrap();
+            // selectWithFrame:... 实际只有 view、editor、delegate 三个对象参数。
+            // The selector has exactly three object parameters: view, editor, and delegate.
+            let select_types = CString::new("v@:{CGRect=dddd}@@@qq").unwrap();
             class_addMethod(
                 cls,
                 sel!(selectWithFrame:inView:editor:delegate:start:length:),
