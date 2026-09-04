@@ -9,10 +9,17 @@
 
 use objc2::runtime::{AnyObject, Sel};
 use objc2_foundation::NSRect;
+use std::sync::{LazyLock, Mutex};
 
 use crate::i18n::t;
 
-use super::widgets;
+use super::{tooltip::SettingsTooltip, widgets};
+
+/// Standard rows keep their label and control as sibling views in the card, so retain the
+/// association here instead of forcing every SettingsUi field to grow a second label pointer.
+/// 标准 row 的标题和控件是卡片里的兄弟 view；在组件层记录关联，避免 SettingsUi 为每个控件
+/// 再增加一个 label 指针。
+static ROW_LABELS: LazyLock<Mutex<Vec<(usize, usize)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Shared horizontal and vertical metrics for all settings pages.
 /// 所有设置页共享的水平/垂直布局指标。
@@ -173,6 +180,83 @@ impl SettingsSection {
 pub(super) struct SettingsRow;
 
 impl SettingsRow {
+    unsafe fn register_label(label: *mut AnyObject, control: *mut AnyObject) {
+        if label.is_null() || control.is_null() {
+            return;
+        }
+        let mut labels = ROW_LABELS.lock().unwrap();
+        let control = control as usize;
+        labels.retain(|(registered_control, _)| *registered_control != control);
+        labels.push((control, label as usize));
+    }
+
+    /// Drop row label associations before the settings views are deallocated.
+    /// 设置 view 释放前清理 row 标题关联。
+    pub(super) fn clear_runtime_registry() {
+        ROW_LABELS.lock().unwrap().clear();
+    }
+
+    /// Apply enabled state, disabled appearance, cursor, and optional tooltip to one view.
+    /// 对单个 view 同时应用启用状态、禁用外观、指针和可选 Tooltip。
+    pub(super) unsafe fn set_view_enabled_with_tooltip(
+        view: *mut AnyObject,
+        enabled: bool,
+        tooltip: Option<&str>,
+    ) {
+        if view.is_null() {
+            return;
+        }
+        if objc2::msg_send![view, respondsToSelector: objc2::sel!(setEnabled:)] {
+            let _: () = objc2::msg_send![view, setEnabled: enabled];
+        }
+
+        let is_text_field: bool = objc2::msg_send![view, isKindOfClass: objc2::class!(NSTextField)];
+        if is_text_field {
+            let color = if enabled {
+                crate::ffi::hex_to_ns_color(crate::theme::ui_palette().primary_text)
+            } else {
+                crate::ffi::hex_to_ns_color(crate::theme::ui_palette().muted_text)
+            };
+            let _: () = objc2::msg_send![view, setTextColor: color];
+        } else if !objc2::msg_send![view, respondsToSelector: objc2::sel!(setEnabled:)]
+            && objc2::msg_send![view, respondsToSelector: objc2::sel!(setAlphaValue:)]
+        {
+            // NSImageView and other decorative views have no enabled property; dim them through
+            // alpha so custom rows still communicate that they are unavailable.
+            // NSImageView 等装饰 view 没有 enabled 属性；通过透明度置灰自定义行。
+            let _: () = objc2::msg_send![view, setAlphaValue: if enabled { 1.0 } else { 0.45 }];
+        }
+        SettingsTooltip::apply(view, enabled, (!enabled).then_some(tooltip).flatten());
+    }
+
+    /// Enable/disable a row and show a native AppKit bubble while it is unavailable.
+    /// 启用/禁用 row；不可用时显示 AppKit 原生小气泡提示。
+    pub(super) unsafe fn set_enabled_with_tooltip(
+        control: *mut AnyObject,
+        enabled: bool,
+        tooltip: &str,
+    ) {
+        Self::set_view_enabled_with_tooltip(control, enabled, Some(tooltip));
+        if control.is_null() {
+            return;
+        }
+        let label = ROW_LABELS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(registered_control, _)| *registered_control == control as usize)
+            .map(|(_, label)| *label as *mut AnyObject);
+        if let Some(label) = label {
+            Self::set_view_enabled_with_tooltip(label, enabled, Some(tooltip));
+        }
+    }
+
+    /// Enable/disable a standard row as one semantic component, including its leading label.
+    /// 以语义组件为单位启用/禁用标准 row，同时处理左侧标题。
+    pub(super) unsafe fn set_enabled(control: *mut AnyObject, enabled: bool) {
+        Self::set_enabled_with_tooltip(control, enabled, "");
+    }
+
     /// Add the standard grouped-card divider through the same row component API.
     /// 通过统一的 row 组件 API 添加分组卡片分割线。
     pub(super) unsafe fn separator(parent: *mut AnyObject, y: f64, width: f64) -> *mut AnyObject {
@@ -246,6 +330,7 @@ impl SettingsRow {
             widgets::add_described_row(parent, x, y, text_w, row_h, title, subtitle, control);
         Self::center_label(label, y, row_h);
         Self::center_control(control, y, row_h);
+        Self::register_label(label, control);
         control
     }
 
@@ -268,6 +353,7 @@ impl SettingsRow {
         );
         Self::center_label(label, y, SettingsLayout::SINGLE_LINE_ROW_H);
         Self::center_control(control, y, SettingsLayout::SINGLE_LINE_ROW_H);
+        Self::register_label(label, control);
         (label, control)
     }
 
@@ -286,6 +372,7 @@ impl SettingsRow {
         Self::center_label(label, y, h);
         Self::center_readonly_text_control(control, y, h);
         Self::center_control(control, y, h);
+        Self::register_label(label, control);
         control
     }
 }

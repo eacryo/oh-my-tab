@@ -923,6 +923,21 @@ pub(super) extern "C" fn html_switch_set_state(this: *mut c_void, _cmd: Sel, sta
     }
 }
 
+/// Refresh the custom switch track whenever its enabled state changes.
+/// 自绘开关的 enabled 状态变化时同步刷新轨道颜色。
+pub(super) extern "C" fn html_switch_set_enabled(this: *mut c_void, _cmd: Sel, enabled: bool) {
+    unsafe {
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        type SetEnabled = unsafe extern "C" fn(*mut ObjcSuper, Sel, bool);
+        let send: SetEnabled = std::mem::transmute(objc_msgSendSuper as *const ());
+        send(&mut sup, sel!(setEnabled:), enabled);
+        html_switch_apply_visual(this as *mut AnyObject, None);
+    }
+}
+
 /// The switch is rendered entirely by its layer, so toggle the state and dispatch the action
 /// explicitly instead of relying on the hidden NSButtonCell drawing/tracking state.
 /// 自绘开关由 Layer 完成视觉呈现,点击时显式切换状态并分发 Action,不依赖隐藏的 Cell 跟踪状态。
@@ -961,6 +976,13 @@ pub(super) fn html_switch_class() -> *mut AnyObject {
                 sel!(setState:),
                 html_switch_set_state as *mut c_void,
                 state_types.as_ptr(),
+            );
+            let enabled_types = CString::new("v@:B").unwrap();
+            class_addMethod(
+                cls,
+                sel!(setEnabled:),
+                html_switch_set_enabled as *mut c_void,
+                enabled_types.as_ptr(),
             );
             let mouse_types = CString::new("v@:@").unwrap();
             class_addMethod(

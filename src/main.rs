@@ -1253,6 +1253,24 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handleWindowsEnabledToggle:),
+                handle_windows_enabled_toggle as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleClipboardEnabledToggle:),
+                handle_clipboard_enabled_toggle as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleWindowControlEnabledToggle:),
+                handle_window_control_enabled_toggle as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleDeviceChanged:),
                 handle_device_changed as *mut c_void,
                 types.as_ptr(),

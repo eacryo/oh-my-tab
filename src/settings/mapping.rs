@@ -19,6 +19,38 @@ pub(super) fn render_mapping_rows() {
     }
 }
 
+/// 根据鼠标总开关和映射总开关,冻结映射区的所有可编辑控件。
+/// Freeze every editable mapping control based on both the mouse and mappings master switches.
+pub(super) unsafe fn update_mapping_controls_enabled(u: &SettingsUi) {
+    let mouse_state: isize = msg_send![u.enable_mouse, state];
+    let mapping_state: isize = msg_send![u.mapping_enabled, state];
+    let mouse_on = mouse_state == 1;
+    let mappings_on = mouse_on && mapping_state == 1;
+    let tooltip = if mouse_on {
+        t("settings.tooltip_mapping_disabled")
+    } else {
+        t("settings.tooltip_mouse_disabled")
+    };
+    SettingsRow::set_enabled_with_tooltip(u.mapping_enabled, mouse_on, &tooltip);
+    let _: () = msg_send![u.add_mapping_button, setEnabled: mappings_on];
+    for row in &u.mapping_rows {
+        for &ctrl in &[
+            row.label,
+            row.desc_label,
+            row.action_icon,
+            row.edit,
+            row.delete,
+        ] {
+            if !ctrl.is_null() {
+                SettingsRow::set_view_enabled_with_tooltip(ctrl, mappings_on, Some(&tooltip));
+            }
+        }
+        for &cap in &row.caps {
+            SettingsRow::set_view_enabled_with_tooltip(cap, mappings_on, Some(&tooltip));
+        }
+    }
+}
+
 /// 持锁版本:调用方已持有 SETTINGS_UI 锁时使用(load_settings_from / handle_device_changed),
 /// 避免对同一把非重入 Mutex 二次加锁自死锁。
 ///
@@ -76,10 +108,15 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
         // buttons became unclickable.
         // flipped:y=0 在顶部,行从顶部依次向下排。
         // Flipped: y=0 is the top; rows stack down from the top.
-        let mappings_on = {
-            let st: isize = msg_send![u.mapping_enabled, state];
+        let mouse_on = {
+            let st: isize = msg_send![u.enable_mouse, state];
             st == 1
         };
+        let mappings_on = {
+            let st: isize = msg_send![u.mapping_enabled, state];
+            mouse_on && st == 1
+        };
+        let _: () = msg_send![u.mapping_enabled, setEnabled: mouse_on];
         // 添加按钮一并置灰(开关关闭时不可添加新映射)。
         // The add button greys out too (no new mappings while off).
         let _: () = msg_send![u.add_mapping_button, setEnabled: mappings_on];
@@ -290,6 +327,10 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             // The add button sits in the action row at the card bottom.
             let _: () = msg_send![u.add_mapping_button, setFrame: NSRect::new(NSPoint::new(MAPPING_PANEL_X, MAPPING_PANEL_TOP + panel_h + MAPPING_ACTION_TOP), NSSize::new(card_w - 2.0 * MAPPING_PANEL_X, MAPPING_ACTION_H))];
         }
+        // Re-apply component state after rebuilding dynamic rows so labels, cursor, and tooltips
+        // match the current mouse/mapping master switches.
+        // 动态行重建后重新应用组件状态，确保标题、指针和 Tooltip 跟随总开关。
+        update_mapping_controls_enabled(u);
     }
 }
 

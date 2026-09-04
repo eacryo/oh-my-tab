@@ -354,6 +354,7 @@ static AUTO_SWITCH_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::At
 pub(crate) mod components;
 pub(crate) mod glass_preview;
 pub(crate) mod mapping;
+pub(crate) mod tooltip;
 pub(crate) mod widgets;
 
 use components::{
@@ -1010,18 +1011,79 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
 unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
     let state: isize = msg_send![ui.enable_mouse, state];
     let on = state == 1;
+    let tooltip = t("settings.tooltip_mouse_disabled");
     let device_available = !DEVICE_POPUP_KEYS.lock().unwrap().is_empty();
     // 无设备时下拉框始终禁用;其余控件仍由总开关控制。
     // Keep the device popup disabled when no device is connected; the remaining controls follow
     // the master switch.
-    let _: () = msg_send![ui.device_indicator, setEnabled: on && device_available];
+    if on {
+        SettingsRow::set_enabled(ui.device_indicator, device_available);
+    } else {
+        SettingsRow::set_enabled_with_tooltip(ui.device_indicator, false, &tooltip);
+    }
     for &ctrl in &[
         ui.scroll_mode,
         ui.line_count,
         ui.reverse_scroll,
         ui.disable_pointer_accel,
     ] {
-        let _: () = msg_send![ctrl, setEnabled: on];
+        SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
+    }
+    update_mapping_controls_enabled(ui);
+}
+
+/// 根据应用切换器总开关状态,冻结其下方的窗口与键盘选项。
+/// Freeze the window and keyboard options below the app-switcher master switch.
+unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
+    let state: isize = msg_send![ui.windows_enabled, state];
+    let on = state == 1;
+    let tooltip = t("settings.tooltip_windows_disabled");
+    for &ctrl in &[
+        ui.show_minimized,
+        ui.thumbnails_enabled,
+        ui.card_text_size,
+        ui.card_text_size_value_label,
+        ui.status_bar_text_size,
+        ui.status_bar_text_size_value_label,
+        ui.overlay_position,
+        ui.corner_radius,
+        ui.modifier,
+    ] {
+        SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
+    }
+}
+
+/// 根据剪贴板历史总开关状态,冻结其下方的历史选项。
+/// Freeze the clipboard-history options below the clipboard master switch.
+unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
+    let state: isize = msg_send![ui.clipboard_enabled, state];
+    let on = state == 1;
+    let tooltip = t("settings.tooltip_clipboard_disabled");
+    for &ctrl in &[
+        ui.clipboard_pin_follow,
+        ui.clipboard_persist,
+        ui.clipboard_show_source_app,
+        ui.clipboard_move_used_to_top,
+        ui.clipboard_max_entries,
+        ui.clipboard_auto_expire_days,
+    ] {
+        SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
+    }
+}
+
+/// 根据窗口控制总开关状态,冻结其下方的四个方向开关。
+/// Freeze the four direction switches below the window-control master switch.
+unsafe fn update_window_control_controls_enabled(ui: &SettingsUi) {
+    let state: isize = msg_send![ui.window_control_enabled, state];
+    let on = state == 1;
+    let tooltip = t("settings.tooltip_window_control_disabled");
+    for &ctrl in &[
+        ui.window_control_up,
+        ui.window_control_down,
+        ui.window_control_left,
+        ui.window_control_right,
+    ] {
+        SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
 }
 
@@ -1192,6 +1254,51 @@ pub(crate) extern "C" fn handle_enable_mouse_toggle(
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
             update_mouse_controls_enabled(u);
+        }
+    }
+}
+
+/// 应用切换器总开关回调:冻结/解冻下方窗口与键盘选项。
+/// Callback for the app-switcher master switch: freeze/unfreeze the options below it.
+pub(crate) extern "C" fn handle_windows_enabled_toggle(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            update_windows_controls_enabled(u);
+        }
+    }
+}
+
+/// 剪贴板历史总开关回调:冻结/解冻下方历史选项。
+/// Callback for the clipboard-history master switch: freeze/unfreeze the options below it.
+pub(crate) extern "C" fn handle_clipboard_enabled_toggle(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            update_clipboard_controls_enabled(u);
+        }
+    }
+}
+
+/// 窗口控制总开关回调:冻结/解冻下方四个方向开关。
+/// Callback for the window-control master switch: freeze/unfreeze its four direction switches.
+pub(crate) extern "C" fn handle_window_control_enabled_toggle(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            update_window_control_controls_enabled(u);
         }
     }
 }
@@ -1912,6 +2019,7 @@ fn load_settings_from(cfg: &Config) {
             ui.update_auto_download,
             setState: if cfg.updates.automatically_download { 1isize } else { 0isize }
         ];
+        update_windows_controls_enabled(ui);
 
         // ===== 鼠标页:按当前选中设备的有效配置(合并"所有鼠标"+该设备)填充控件 =====
         // Mouse page: populate controls from the effective config of the selected device
@@ -2014,6 +2122,8 @@ fn load_settings_from(cfg: &Config) {
             1
         };
         let _: () = msg_send![ui.clipboard_pin_follow, selectItemAtIndex: pin_idx];
+        update_clipboard_controls_enabled(ui);
+        update_window_control_controls_enabled(ui);
     }
     crate::config::set_glass_style_preview(Some(cfg.appearance.glass_style.clone()));
     crate::config::set_glass_tint_preview(Some(cfg.appearance.glass_tint.clone()));
@@ -2296,6 +2406,7 @@ extern "C" fn settings_window_send_event(_self: *mut c_void, _cmd: Sel, event: *
             let event_type: usize = msg_send![event, type];
             if event_type == NSEVENT_TYPE_LEFT_MOUSE_DOWN {
                 let window = _self as *mut AnyObject;
+                tooltip::SettingsTooltip::handle_mouse_down(window, event);
                 let first_responder: *mut AnyObject = msg_send![window, firstResponder];
                 if !first_responder.is_null() {
                     let is_text_field: bool =
@@ -3267,6 +3378,11 @@ fn create_settings_window() {
             &t("settings.desc_windows_enabled"),
             SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
+        let _: () = msg_send![ui.windows_enabled, setTarget: target];
+        let _: () = msg_send![
+            ui.windows_enabled,
+            setAction: sel!(handleWindowsEnabledToggle:)
+        ];
         SettingsSection::attach(
             switcher_view,
             NSRect::new(
@@ -3867,6 +3983,11 @@ fn create_settings_window() {
             &t("settings.desc_clipboard_enabled"),
             SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
+        let _: () = msg_send![ui.clipboard_enabled, setTarget: target];
+        let _: () = msg_send![
+            ui.clipboard_enabled,
+            setAction: sel!(handleClipboardEnabledToggle:)
+        ];
         SettingsSection::attach(
             clipboard_view,
             NSRect::new(
@@ -4022,6 +4143,11 @@ fn create_settings_window() {
             &t("settings.desc_window_control_enabled"),
             SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
         );
+        let _: () = msg_send![ui.window_control_enabled, setTarget: target];
+        let _: () = msg_send![
+            ui.window_control_enabled,
+            setAction: sel!(handleWindowControlEnabledToggle:)
+        ];
         SettingsSection::attach(
             window_control_view,
             NSRect::new(
@@ -4475,6 +4601,8 @@ pub(crate) fn invalidate_settings_window() {
             // Detach the updater's host references before releasing the window so it never touches
             // a deallocated view.
             crate::updater::clear_update_host();
+            SettingsRow::clear_runtime_registry();
+            tooltip::SettingsTooltip::clear_runtime_registries();
             // 窗口 alloc 是 +1且 setReleasedWhenClosed:false,需手动 release 一次;
             // 其子控件已由父视图持有,随窗口 dealloc 释放。
             // The window is alloc +1 with setReleasedWhenClosed:false, so release once manually;
