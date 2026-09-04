@@ -21,6 +21,44 @@ pub struct Config {
     pub updates: UpdatesSection,
     pub clipboard: ClipboardSection,
     pub mouse: MouseSection,
+    pub window_control: WindowControlSection,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WindowControlSection {
+    // 窗口控制总开关(Option+方向键)。默认 false:组合键全局拦截会覆盖其他应用的
+    // Option+方向键(如文本按词移动),必须由用户显式开启。
+    // Window-control master switch (Option + arrow keys). Default false: the global
+    // interception overrides other apps' Option+arrows (e.g. move-by-word in text), so it
+    // must be explicitly opted in.
+    pub enabled: bool,
+    // 方向开关默认 true,保证旧配置仅有 enabled=true 时行为不变。
+    // Direction switches default to true so existing configs with only enabled=true keep working.
+    #[serde(default = "default_window_control_direction_enabled")]
+    pub up: bool,
+    #[serde(default = "default_window_control_direction_enabled")]
+    pub down: bool,
+    #[serde(default = "default_window_control_direction_enabled")]
+    pub left: bool,
+    #[serde(default = "default_window_control_direction_enabled")]
+    pub right: bool,
+}
+
+fn default_window_control_direction_enabled() -> bool {
+    true
+}
+
+impl Default for WindowControlSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            up: true,
+            down: true,
+            left: true,
+            right: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1338,6 +1376,16 @@ mod tests {
     #[test]
     fn defaults_validate_clean() {
         assert_err_count(&Config::default(), 0);
+    }
+
+    #[test]
+    fn window_control_direction_defaults_preserve_existing_configs() {
+        let cfg: Config = toml::from_str("[window_control]\nenabled = true\n").unwrap();
+        assert!(cfg.window_control.enabled);
+        assert!(cfg.window_control.up);
+        assert!(cfg.window_control.down);
+        assert!(cfg.window_control.left);
+        assert!(cfg.window_control.right);
     }
 
     #[test]

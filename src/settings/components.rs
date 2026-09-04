@@ -467,6 +467,7 @@ pub(super) enum SettingsSidebarIcon {
     Switcher,
     Mouse,
     Clipboard,
+    WindowControl,
     About,
 }
 
@@ -480,6 +481,10 @@ impl SettingsSidebarIcon {
             // use the clean document outline so the sidebar stays visually balanced.
             // `doc.on.clipboard` 自带深色叠放前景层；改用干净的文档线框保持侧栏一致。
             Self::Clipboard => "doc.text",
+            // 左右对分的矩形呼应“半屏/四分屏”的窗口控制语义。
+            // A rectangle split into left/right halves mirrors the window-control
+            // half-screen/quarter-snapping semantics.
+            Self::WindowControl => "rectangle.split.2x1",
             Self::About => "info.circle",
         }
     }
@@ -508,14 +513,20 @@ impl SettingsSidebar {
         x: f64,
         y0: f64,
         w: f64,
-    ) -> [*mut AnyObject; 5] {
+    ) -> [*mut AnyObject; 6] {
         // Add new sidebar entries here: the component owns title keys, icons, tags, and spacing.
         // 新增侧栏入口只需在这里添加标题 key、图标和 tag；间距与对齐由组件统一处理。
+        // 窗口控制位于剪贴板历史与关于之间。
+        // Window control sits between Clipboard history and About.
         let entries = [
             ("settings.sidebar_general", SettingsSidebarIcon::General),
             ("settings.sidebar_switcher", SettingsSidebarIcon::Switcher),
             ("settings.sidebar_mouse", SettingsSidebarIcon::Mouse),
             ("settings.sidebar_clipboard", SettingsSidebarIcon::Clipboard),
+            (
+                "settings.sidebar_window_control",
+                SettingsSidebarIcon::WindowControl,
+            ),
             ("settings.sidebar_about", SettingsSidebarIcon::About),
         ];
         std::array::from_fn(|index| {

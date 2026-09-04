@@ -21,6 +21,7 @@ mod thumbnail;
 mod update_notice;
 mod updater;
 mod window_collector;
+mod window_management;
 mod window_refresh;
 mod window_server;
 
@@ -501,6 +502,19 @@ extern "C" fn on_ax_raise(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     window_collector::handle_ax_raise_main();
 }
 
+/// 窗口控制(Option+方向键)主线程入口:arg 是 bridge 打包方向的 NSNumber。
+/// Window-control (Option+arrows) main-thread entry: arg is the bridge's NSNumber carrying
+/// the direction.
+extern "C" fn on_window_control(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
+    if arg.is_null() {
+        return;
+    }
+    let value: isize = unsafe { msg_send![arg as *mut AnyObject, integerValue] };
+    if let Some(dir) = window_management::Direction::from_isize(value) {
+        window_management::apply_direction(dir);
+    }
+}
+
 // ========== Class Registration ==========
 
 fn create_overlay_window() -> *mut AnyObject {
@@ -917,6 +931,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(onClipboardToggled:),
             clipboard::on_clipboard_toggle as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleWindowControl:),
+            on_window_control as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -1736,11 +1756,21 @@ fn main() {
 
     // 7b2. hover 轮询定时器在浮窗显示/隐藏时由 overlay 自行启停(show_overlay 调用
     // start_hover_timer),无需在此启动:主线程 runloop 每 16ms 读全局鼠标位置命中
-    // 卡片,不依赖事件投递(侧键按住期间移动事件无法通过任何 tap/tracking 获取,实测)。
+    // 卡片,不依赖事件投递(侧键按住期间移动事件无法通过任何 tap/trapping 获取,实测)。
     // The hover poll timer is started/stopped by the overlay itself (start_hover_timer
     // from show_overlay): the main-thread runloop reads the global cursor position every
     // 16ms and hit-tests the cards, independent of event delivery (moves while a side
     // button is held can't be obtained via any tap/tracking, verified).
+
+    // 7b3. 窗口控制(Option+方向键)tap:仅在配置启用时启动(start 幂等)。
+    // Window-control (Option+arrows) tap: start only if enabled (idempotent).
+    let winctl_enabled = CONFIG
+        .read()
+        .map(|c| c.window_control.enabled)
+        .unwrap_or(false);
+    if winctl_enabled {
+        window_management::start();
+    }
 
     // 7c. Apply pointer settings (disable system acceleration if configured).
     // 指针设置(配置了禁用系统加速时立即生效)。
@@ -1778,20 +1808,48 @@ fn main() {
         .spawn(move || {
             performance::set_current_thread_qos(performance::ThreadQos::UserInteractive);
             while let Ok(event) = event_rx.recv() {
-                let action = match event {
-                    GlobalEvent::CmdTabPressed => sel!(handleCmdTabPressed:),
-                    GlobalEvent::CmdShiftTabPressed => sel!(handleCmdShiftTabPressed:),
-                    GlobalEvent::CmdReleased => sel!(handleCmdReleased:),
-                    GlobalEvent::ClipboardToggled => sel!(onClipboardToggled:),
+                // (selector, withObject):窗口控制的方向经 NSNumber 携带,其余事件无载荷。
+                // (selector, withObject): the window-control direction rides in an NSNumber;
+                // all other events carry no payload.
+                let (action, arg): (Sel, *mut AnyObject) = match event {
+                    GlobalEvent::CmdTabPressed => {
+                        (sel!(handleCmdTabPressed:), std::ptr::null_mut())
+                    }
+                    GlobalEvent::CmdShiftTabPressed => {
+                        (sel!(handleCmdShiftTabPressed:), std::ptr::null_mut())
+                    }
+                    GlobalEvent::CmdReleased => (sel!(handleCmdReleased:), std::ptr::null_mut()),
+                    GlobalEvent::ClipboardToggled => {
+                        (sel!(onClipboardToggled:), std::ptr::null_mut())
+                    }
+                    GlobalEvent::WindowControl(dir) => {
+                        // alloc+init(非 autorelease):bridge 线程没有 autorelease pool,
+                        // numberWithInteger 的自动释放对象会一直滞留。performSelectorOnMainThread
+                        // 会在执行前 retain 参数,因此这里立即 release 是安全的。
+                        // alloc+init (not autoreleased): the bridge thread has no autorelease
+                        // pool, so numberWithInteger's autoreleased object would linger.
+                        // performSelectorOnMainThread retains the argument until performed,
+                        // so releasing right away here is safe.
+                        let num: *mut AnyObject = unsafe { msg_send![class!(NSNumber), alloc] };
+                        let num: *mut AnyObject =
+                            unsafe { msg_send![num, initWithInteger: dir as isize] };
+                        (sel!(handleWindowControl:), num)
+                    }
                 };
                 // Read controller pointer from static (only written once, safe to read)
                 let ctrl = CONTROLLER.lock().unwrap().unwrap().0;
                 unsafe {
                     let _: () = msg_send![ctrl,
                         performSelectorOnMainThread: action,
-                        withObject: std::ptr::null::<AnyObject>(),
+                        withObject: arg,
                         waitUntilDone: false
                     ];
+                    // 归还本线程持有的引用;主线程执行期间由 perform 机制持有的 retain 保活。
+                    // Give up this thread's reference; perform's own retain keeps the number
+                    // alive until the selector runs on the main thread.
+                    if !arg.is_null() {
+                        let _: () = msg_send![arg, release];
+                    }
                 }
             }
             log_info!("Bridge thread exiting.");

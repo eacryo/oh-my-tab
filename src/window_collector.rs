@@ -606,7 +606,9 @@ pub(crate) fn activate_pid(pid: i32) -> bool {
     }
 }
 
-fn cf_string_new(s: &str) -> *const c_void {
+/// 由 &str 构造 CFString(+1 引用,调用方 CFRelease)。窗口控制模块复用。
+/// Build a CFString from &str (+1 reference; caller CFReleases). Reused by window control.
+pub(crate) fn cf_string_new(s: &str) -> *const c_void {
     let c_str = std::ffi::CString::new(s).unwrap();
     unsafe { CFStringCreateWithCString(std::ptr::null(), c_str.as_ptr(), 0x08000100) }
 }
@@ -1798,7 +1800,9 @@ fn get_ax_windows_for_pid_with_identity(
     }
 }
 
-fn cf_to_rust_string(cf_string: *const c_void) -> Option<String> {
+/// CFString -> Rust String(None = 转换失败)。窗口控制模块复用。
+/// CFString -> Rust String (None = conversion failed). Reused by window control.
+pub(crate) fn cf_to_rust_string(cf_string: *const c_void) -> Option<String> {
     let mut buf = vec![0u8; 1024];
     let ok = unsafe {
         CFStringGetCString(

@@ -153,12 +153,14 @@ struct SettingsUi {
     sidebar_switcher: *mut AnyObject, // NSButton: 应用切换浮窗 / App switcher overlay (tag=1)
     sidebar_mouse: *mut AnyObject,   // NSButton: 鼠标控制 / Mouse (tag=2)
     sidebar_clipboard: *mut AnyObject, // NSButton: 剪贴板历史 / Clipboard history (tag=3)
-    sidebar_about: *mut AnyObject,   // NSButton: 关于 / About (tag=4)
+    sidebar_window_control: *mut AnyObject, // NSButton: 窗口控制 / Window control (tag=4)
+    sidebar_about: *mut AnyObject,   // NSButton: 关于 / About (tag=5)
     sidebar_highlight: *mut AnyObject, // NSView: 选中行高亮背景 (layer-backed)
     general_view: *mut AnyObject,    // NSView: 通用页容器 / General page container
     switcher_view: *mut AnyObject,   // NSView: 应用切换浮窗页容器 / App switcher page container
     mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
     clipboard_view: *mut AnyObject,  // NSView: 剪贴板历史页容器 / Clipboard page container
+    window_control_view: *mut AnyObject, // NSView: 窗口控制页容器 / Window-control page container
     about_view: *mut AnyObject,      // NSView: 关于页容器 / About page container
     about_subtitle: *mut AnyObject,  // NSTextField: About 页版本号 / About-page version label
     theme: *mut AnyObject,           // NSPopUpButton: auto / light / dark
@@ -204,7 +206,12 @@ struct SettingsUi {
     clipboard_show_source_app: *mut AnyObject,  // NSSwitch: 显示来源应用 / show the source app
     clipboard_pin_follow: *mut AnyObject, // NSPopUpButton: 置顶后选中项位置 / selection after pin
     // (follow the pinned entry / keep current position)
-    add_mapping_button: *mut AnyObject, // NSButton: 添加映射 / add-mapping button
+    window_control_enabled: *mut AnyObject, // NSSwitch: 启用窗口控制 / enable window control
+    window_control_up: *mut AnyObject,      // NSSwitch: 启用 Option+上 / enable Option+Up
+    window_control_down: *mut AnyObject,    // NSSwitch: 启用 Option+下 / enable Option+Down
+    window_control_left: *mut AnyObject,    // NSSwitch: 启用 Option+左 / enable Option+Left
+    window_control_right: *mut AnyObject,   // NSSwitch: 启用 Option+右 / enable Option+Right
+    add_mapping_button: *mut AnyObject,     // NSButton: 添加映射 / add-mapping button
     mapping_enabled: *mut AnyObject, // NSSwitch: 按键映射总开关(per-device) / mappings master switch (per-device)
     mapping_empty: *mut AnyObject,   // NSTextField: 空状态提示(卡片内) / empty-state hint (in-card)
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
@@ -498,9 +505,9 @@ fn start_inline_update_check() {
 /// updater::render_target) instead of a standalone window.
 pub(crate) fn open_about_updates() {
     show_settings();
-    // show_settings 每次打开都复位到通用页,这里再切到 About(tag=4)。
-    // show_settings resets to the General page on every open; switch to About (tag=4) here.
-    select_sidebar(4);
+    // show_settings 每次打开都复位到通用页,这里再切到 About(tag=5)。
+    // show_settings resets to the General page on every open; switch to About (tag=5) here.
+    select_sidebar(5);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
@@ -869,6 +876,31 @@ fn log_config_changes(old: &Config, new: &Config) {
     );
 
     changed!("mouse.enabled", old.mouse.enabled, new.mouse.enabled);
+    changed!(
+        "window_control.enabled",
+        old.window_control.enabled,
+        new.window_control.enabled
+    );
+    changed!(
+        "window_control.up",
+        old.window_control.up,
+        new.window_control.up
+    );
+    changed!(
+        "window_control.down",
+        old.window_control.down,
+        new.window_control.down
+    );
+    changed!(
+        "window_control.left",
+        old.window_control.left,
+        new.window_control.left
+    );
+    changed!(
+        "window_control.right",
+        old.window_control.right,
+        new.window_control.right
+    );
 
     // 鼠标配置档包含嵌套映射,用 Debug 快照比较并记录完整旧/新值。
     // Mouse profiles contain nested mappings, so compare and log complete Debug snapshots.
@@ -938,6 +970,14 @@ pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: 
         crate::clipboard::start();
     } else {
         crate::clipboard::stop();
+    }
+
+    // 窗口控制 tap 热切换(无需重启;start/stop 均幂等)。
+    // Window-control tap hot-switch (no restart needed; start/stop are idempotent).
+    if cfg.window_control.enabled {
+        crate::window_management::start();
+    } else {
+        crate::window_management::stop();
     }
 
     // 缩略图服务热切换:start 幂等;关闭时 worker/observer 每任务前检查配置自动休眠,
@@ -1343,12 +1383,12 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
     select_sidebar(tag as usize);
 }
 
-/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换五个内容视图显隐、选中项粗体。
-/// Switch the active settings page: align the highlight to the selected button, toggle the five
+/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换六个内容视图显隐、选中项粗体。
+/// Switch the active settings page: align the highlight to the selected button, toggle the six
 /// content views' visibility, and bold the selected item's label.
 fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
-    let idx = if idx > 4 { 0 } else { idx };
+    let idx = if idx > 5 { 0 } else { idx };
     SIDEBAR_SELECTED.store(idx, Ordering::SeqCst);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
@@ -1361,6 +1401,7 @@ fn select_sidebar(idx: usize) {
             ui.sidebar_switcher,
             ui.sidebar_mouse,
             ui.sidebar_clipboard,
+            ui.sidebar_window_control,
             ui.sidebar_about,
         ];
         let views = [
@@ -1368,6 +1409,7 @@ fn select_sidebar(idx: usize) {
             ui.switcher_view,
             ui.mouse_view,
             ui.clipboard_view,
+            ui.window_control_view,
             ui.about_view,
         ];
         // 高亮背景对齐到选中按钮的 frame / align the highlight to the selected button's frame
@@ -1380,6 +1422,7 @@ fn select_sidebar(idx: usize) {
             t("settings.sidebar_switcher"),
             t("settings.sidebar_mouse"),
             t("settings.sidebar_clipboard"),
+            t("settings.sidebar_window_control"),
             t("settings.sidebar_about"),
         ];
         for (i, &b) in buttons.iter().enumerate() {
@@ -1389,7 +1432,7 @@ fn select_sidebar(idx: usize) {
             }
             set_sidebar_title(b, &titles[i], i == idx);
         }
-        // 切换五页显隐 / toggle the five pages' visibility
+        // 切换六页显隐 / toggle the six pages' visibility
         for (i, &v) in views.iter().enumerate() {
             let _: () = msg_send![v, setHidden: i != idx];
         }
@@ -1402,7 +1445,14 @@ fn select_sidebar(idx: usize) {
             document: msg_send![views[idx], documentView],
         };
         page.scroll_to_top();
-        let page_names = ["general", "switcher", "mouse", "clipboard", "about"];
+        let page_names = [
+            "general",
+            "switcher",
+            "mouse",
+            "clipboard",
+            "window-control",
+            "about",
+        ];
         page.validate(page_names[idx]);
     }
 }
@@ -1644,11 +1694,19 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                     ui.switcher_view,
                     ui.mouse_view,
                     ui.clipboard_view,
+                    ui.window_control_view,
                     ui.about_view,
                 ],
             )
         };
-        let names = ["general", "switcher", "mouse", "clipboard", "about"];
+        let names = [
+            "general",
+            "switcher",
+            "mouse",
+            "clipboard",
+            "window-control",
+            "about",
+        ];
         for (index, page) in pages.iter().enumerate() {
             select_sidebar(index);
             let _: () = msg_send![window, layoutIfNeeded];
@@ -1906,6 +1964,28 @@ fn load_settings_from(cfg: &Config) {
             ui.clipboard_enabled,
             setState: if cfg.clipboard.enabled { 1isize } else { 0isize }
         ];
+        // ===== 窗口控制页:填充启用开关 =====
+        // Window-control page: populate the master and direction switches.
+        let _: () = msg_send![
+            ui.window_control_enabled,
+            setState: if cfg.window_control.enabled { 1isize } else { 0isize }
+        ];
+        let _: () = msg_send![
+            ui.window_control_up,
+            setState: if cfg.window_control.up { 1isize } else { 0isize }
+        ];
+        let _: () = msg_send![
+            ui.window_control_down,
+            setState: if cfg.window_control.down { 1isize } else { 0isize }
+        ];
+        let _: () = msg_send![
+            ui.window_control_left,
+            setState: if cfg.window_control.left { 1isize } else { 0isize }
+        ];
+        let _: () = msg_send![
+            ui.window_control_right,
+            setState: if cfg.window_control.right { 1isize } else { 0isize }
+        ];
         let _: () = msg_send![
             ui.clipboard_persist,
             setState: if cfg.clipboard.persist { 1isize } else { 0isize }
@@ -2130,6 +2210,18 @@ fn collect_settings_config() -> (Config, Vec<String>) {
         // Clipboard page (global config, not per-device).
         let cb_state: isize = msg_send![ui.clipboard_enabled, state];
         cfg.clipboard.enabled = cb_state == 1;
+        // ===== 窗口控制页(全局配置)=====
+        // Window-control page (global config).
+        let wc_state: isize = msg_send![ui.window_control_enabled, state];
+        cfg.window_control.enabled = wc_state == 1;
+        let wc_up_state: isize = msg_send![ui.window_control_up, state];
+        cfg.window_control.up = wc_up_state == 1;
+        let wc_down_state: isize = msg_send![ui.window_control_down, state];
+        cfg.window_control.down = wc_down_state == 1;
+        let wc_left_state: isize = msg_send![ui.window_control_left, state];
+        cfg.window_control.left = wc_left_state == 1;
+        let wc_right_state: isize = msg_send![ui.window_control_right, state];
+        cfg.window_control.right = wc_right_state == 1;
         let persist_state: isize = msg_send![ui.clipboard_persist, state];
         cfg.clipboard.persist = persist_state == 1;
         let src_state: isize = msg_send![ui.clipboard_show_source_app, state];
@@ -2482,12 +2574,14 @@ fn create_settings_window() {
             sidebar_switcher: std::ptr::null_mut(),
             sidebar_mouse: std::ptr::null_mut(),
             sidebar_clipboard: std::ptr::null_mut(),
+            sidebar_window_control: std::ptr::null_mut(),
             sidebar_about: std::ptr::null_mut(),
             sidebar_highlight: std::ptr::null_mut(),
             general_view: std::ptr::null_mut(),
             switcher_view: std::ptr::null_mut(),
             mouse_view: std::ptr::null_mut(),
             clipboard_view: std::ptr::null_mut(),
+            window_control_view: std::ptr::null_mut(),
             about_view: std::ptr::null_mut(),
             about_subtitle: std::ptr::null_mut(),
             theme: std::ptr::null_mut(),
@@ -2525,6 +2619,11 @@ fn create_settings_window() {
             mapping_panel: std::ptr::null_mut(),
             mapping_rows: Vec::new(),
             clipboard_enabled: std::ptr::null_mut(),
+            window_control_enabled: std::ptr::null_mut(),
+            window_control_up: std::ptr::null_mut(),
+            window_control_down: std::ptr::null_mut(),
+            window_control_left: std::ptr::null_mut(),
+            window_control_right: std::ptr::null_mut(),
             clipboard_persist: std::ptr::null_mut(),
             clipboard_move_used_to_top: std::ptr::null_mut(),
             clipboard_max_entries: std::ptr::null_mut(),
@@ -2776,13 +2875,14 @@ fn create_settings_window() {
         release_obj(highlight);
         ui.sidebar_highlight = highlight;
 
-        // Five sidebar buttons (borderless, tags 0..4; click triggers handleSettingsSidebar:).
+        // Six sidebar buttons (borderless, tags 0..5; click triggers handleSettingsSidebar:).
         let sidebar_buttons = SettingsSidebar::build(sidebar_view, target, 14.0, btn_y0, btn_w);
         [
             &mut ui.sidebar_general,
             &mut ui.sidebar_switcher,
             &mut ui.sidebar_mouse,
             &mut ui.sidebar_clipboard,
+            &mut ui.sidebar_window_control,
             &mut ui.sidebar_about,
         ]
         .iter_mut()
@@ -2837,6 +2937,10 @@ fn create_settings_window() {
         let switcher_doc_h = 1280.0;
         let mouse_doc_h = 1540.0;
         let clipboard_doc_h = 960.0;
+        // 窗口控制页包含总开关和四个方向开关,高度留出描述文字的空间。
+        // The window-control page contains the master plus four direction switches, with room
+        // for each row's description.
+        let window_control_doc_h = 760.0;
         let about_doc_h = 1300.0;
 
         let general_page = SettingsPage::new(content, page_frame, general_doc_h, false);
@@ -2855,6 +2959,11 @@ fn create_settings_window() {
         let clipboard_root = clipboard_page.scroll;
         let clipboard_view = clipboard_page.document;
         ui.clipboard_view = clipboard_root;
+        let window_control_page =
+            SettingsPage::new(content, page_frame, window_control_doc_h, true);
+        let window_control_root = window_control_page.scroll;
+        let window_control_view = window_control_page.document;
+        ui.window_control_view = window_control_root;
         let about_page = SettingsPage::new(content, page_frame, about_doc_h, true);
         let about_root = about_page.scroll;
         let about_view = about_page.document;
@@ -3882,6 +3991,113 @@ fn create_settings_window() {
                 ),
             ),
             &t("settings.header_clipboard_options"),
+        );
+
+        // ===== 窗口控制页内容 window control page content =====
+        // 独立布局游标(该页内容与剪贴板页互不相关)。
+        // Independent layout cursor (unrelated to the clipboard page).
+        let mut wy = window_control_doc_h - 24.0;
+        add_page_title(
+            window_control_view,
+            &t("settings.sidebar_window_control"),
+            6.0,
+            wy - 34.0,
+            content_w - 12.0,
+        );
+        wy -= 62.0;
+        let window_control_header_y = wy - 18.0;
+        // header 与首行间距与剪贴板页一致(18 + row_gap)。
+        // Header-to-first-row gap matches the clipboard page (18 + row_gap).
+        wy = layout.next_row_cursor_with_extra(wy, described_row_h, 18.0);
+        // 启用窗口控制(总开关):Option+方向键的全局拦截默认关闭,由用户显式开启。
+        // Enable window control (master switch): the global Option+arrow interception is off
+        // by default and must be explicitly opted in.
+        ui.window_control_enabled = SettingsRow::described(
+            window_control_view,
+            label_x,
+            wy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_window_control_enabled"),
+            &t("settings.desc_window_control_enabled"),
+            SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
+        );
+        SettingsSection::attach(
+            window_control_view,
+            NSRect::new(
+                NSPoint::new(6.0, layout.card_bottom(wy)),
+                NSSize::new(
+                    content_w - 12.0,
+                    layout.card_top(window_control_header_y) - layout.card_bottom(wy),
+                ),
+            ),
+            &t("settings.header_window_control"),
+        );
+
+        // 方向快捷键单独成一块卡片,总开关与具体方向配置互不混排。
+        // Put the direction shortcuts in their own card so the master switch is separate from
+        // the per-direction settings.
+        wy = layout.next_section_cursor(wy);
+        let window_control_shortcuts_header_y = wy;
+        wy = layout.next_row_cursor(wy, described_row_h);
+        ui.window_control_up = SettingsRow::described(
+            window_control_view,
+            label_x,
+            wy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_window_control_up"),
+            &t("settings.desc_window_control_up"),
+            SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
+        );
+        wy = layout.next_row_cursor(wy, described_row_h);
+        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        ui.window_control_down = SettingsRow::described(
+            window_control_view,
+            label_x,
+            wy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_window_control_down"),
+            &t("settings.desc_window_control_down"),
+            SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
+        );
+        wy = layout.next_row_cursor(wy, described_row_h);
+        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        ui.window_control_left = SettingsRow::described(
+            window_control_view,
+            label_x,
+            wy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_window_control_left"),
+            &t("settings.desc_window_control_left"),
+            SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
+        );
+        wy = layout.next_row_cursor(wy, described_row_h);
+        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        ui.window_control_right = SettingsRow::described(
+            window_control_view,
+            label_x,
+            wy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_window_control_right"),
+            &t("settings.desc_window_control_right"),
+            SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
+        );
+        let window_control_shortcuts_card_bottom = layout.card_bottom(wy);
+        SettingsSection::attach(
+            window_control_view,
+            NSRect::new(
+                NSPoint::new(6.0, window_control_shortcuts_card_bottom),
+                NSSize::new(
+                    content_w - 12.0,
+                    layout.card_top(window_control_shortcuts_header_y)
+                        - window_control_shortcuts_card_bottom,
+                ),
+            ),
+            &t("settings.header_window_control_shortcuts"),
         );
 
         // ===== About page: page-header + App and Updates cards from preview (10). =====

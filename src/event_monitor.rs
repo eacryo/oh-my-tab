@@ -18,6 +18,10 @@ pub enum GlobalEvent {
     CmdShiftTabPressed,
     CmdReleased,
     ClipboardToggled,
+    // 窗口控制:Option+方向键(方向经 bridge 的 NSNumber 传到主线程)。
+    // Window control: Option+arrow (the direction crosses to the main thread via NSNumber
+    // in the bridge).
+    WindowControl(crate::window_management::Direction),
 }
 
 // 窗口切换专用常量 / window-switcher-specific constants

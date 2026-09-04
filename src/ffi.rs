@@ -56,6 +56,7 @@ extern "C" {
     /// CFString value comparison: 0 when equal (kCFCompareEqualTo).
     pub(crate) fn CFStringCompare(a: *const c_void, b: *const c_void, options: usize) -> isize;
     pub(crate) static kCFBooleanFalse: *const c_void;
+    pub(crate) static kCFBooleanTrue: *const c_void;
 
     // ---- CFRunLoop 源(此前在 thumbnail/pregen) ----
     // ---- CFRunLoop sources (previously in thumbnail/pregen) ----
@@ -116,6 +117,16 @@ extern "C" {
         value: *const c_void,
     ) -> AXError;
     pub(crate) fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: f64) -> AXError;
+    // AXValue:几何值的包装类型(CGPoint/CGSize)。窗口控制读写 AXPosition/AXSize 用。
+    // AXValue: wrapper type for geometry values (CGPoint/CGSize); used to read/write
+    // AXPosition/AXSize for window control.
+    // kAXValueCGPointType = 1, kAXValueCGSizeType = 2(HIServices 头文件)。
+    pub(crate) fn AXValueCreate(value_type: i32, value_ptr: *const c_void) -> *const c_void;
+    pub(crate) fn AXValueGetValue(
+        value: *const c_void,
+        value_type: i32,
+        value_ptr: *mut c_void,
+    ) -> bool;
     pub(crate) fn AXObserverCreate(
         pid: i32,
         callback: unsafe extern "C" fn(AxObserverRef, *const c_void, *const c_void, *mut c_void),
