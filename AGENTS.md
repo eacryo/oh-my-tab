@@ -66,4 +66,10 @@ Unless the user explicitly requests it, do not commit, push, stage, or rewrite h
 
 `type: description`
 
+Before generating a commit message, inspect all three Git views: `git diff --cached` for staged
+changes, `git diff` for unstaged changes, and `git diff HEAD` for the final combined worktree
+diff. Base the message on the combined `git diff HEAD` result. Do not treat an `AD` status as a
+net addition without checking the combined diff: it may be an index addition that is deleted in
+the worktree.
+
 Use `fix` for corrections to existing visual/UI behavior and `feat` for new visual/UI behavior; reserve `style` for code-formatting or naming-only changes.
