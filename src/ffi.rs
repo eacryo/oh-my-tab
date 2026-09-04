@@ -539,3 +539,15 @@ pub(crate) unsafe fn layer_set_border(layer: *mut AnyObject, cg: *mut c_void) {
     let f: F = std::mem::transmute(objc_msgSend as *const ());
     f(layer as *mut c_void, sel, cg);
 }
+
+/// Set CALayer.shadowColor using raw objc_msgSend (CGColorRef, not NSColor*).
+/// 使用裸 objc_msgSend 设置 CALayer.shadowColor（参数是 CGColorRef，不是 NSColor*）。
+pub(crate) unsafe fn layer_set_shadow_color(layer: *mut AnyObject, cg: *mut c_void) {
+    let sel = sel!(setShadowColor:);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel, cg);
+}

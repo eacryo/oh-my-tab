@@ -826,17 +826,11 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             let _: () = msg_send![action, setAction: sel!(handlePanelActionChanged:)];
             // 下拉图标(与行内同款)。
             // Popup icons (same as the rows).
-            let menu: *mut AnyObject = msg_send![action, menu];
-            let item_cnt: usize = msg_send![menu, numberOfItems];
-            for i in 0..item_cnt {
+            for i in 0..MAPPING_ACTION_KEYS.len() {
                 let Some(icon) = SettingsMappingActionIcon::symbol_name(i) else {
                     continue;
                 };
-                let item: *mut AnyObject = msg_send![menu, itemAtIndex: i as isize];
-                let img = make_symbol_image(icon, NSSize::new(20.0, 20.0));
-                if !img.is_null() {
-                    let _: () = msg_send![item, setImage: img];
-                }
+                settings_select_set_item_symbol(action, i, icon);
             }
             let _: () = msg_send![ve, addSubview: action];
             release_obj(action);

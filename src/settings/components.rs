@@ -381,6 +381,23 @@ impl SettingsRow {
 /// 设置行和窗口 chrome 共用的原生控件组件入口。
 pub(super) struct SettingsControl;
 
+/// Animated select component shared by settings rows and auxiliary edit panels.
+/// 设置行和辅助编辑面板共用的动画选择器组件。
+pub(super) struct SettingsSelect;
+
+impl SettingsSelect {
+    pub(super) unsafe fn create(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        items: &[&str],
+        selected: usize,
+    ) -> *mut AnyObject {
+        widgets::make_popup(x, y, w, h, items, selected)
+    }
+}
+
 impl SettingsControl {
     pub(super) unsafe fn popup(
         x: f64,
@@ -390,7 +407,7 @@ impl SettingsControl {
         items: &[&str],
         selected: usize,
     ) -> *mut AnyObject {
-        widgets::make_popup(x, y, w, h, items, selected)
+        SettingsSelect::create(x, y, w, h, items, selected)
     }
 
     pub(super) unsafe fn switch(right_x: f64, y: f64, h: f64, checked: bool) -> *mut AnyObject {

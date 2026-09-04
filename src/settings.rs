@@ -2406,6 +2406,7 @@ extern "C" fn settings_window_send_event(_self: *mut c_void, _cmd: Sel, event: *
             let event_type: usize = msg_send![event, type];
             if event_type == NSEVENT_TYPE_LEFT_MOUSE_DOWN {
                 let window = _self as *mut AnyObject;
+                widgets::settings_select_handle_window_mouse_down(window, event);
                 tooltip::SettingsTooltip::handle_mouse_down(window, event);
                 let first_responder: *mut AnyObject = msg_send![window, firstResponder];
                 if !first_responder.is_null() {
@@ -4602,6 +4603,7 @@ pub(crate) fn invalidate_settings_window() {
             // a deallocated view.
             crate::updater::clear_update_host();
             SettingsRow::clear_runtime_registry();
+            widgets::clear_settings_select_registry();
             tooltip::SettingsTooltip::clear_runtime_registries();
             // 窗口 alloc 是 +1且 setReleasedWhenClosed:false,需手动 release 一次;
             // 其子控件已由父视图持有,随窗口 dealloc 释放。

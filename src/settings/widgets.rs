@@ -340,7 +340,7 @@ pub(super) unsafe fn make_value_label(
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject = msg_send![
         label,
-        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h.max(34.0)))
     ];
     set_field(label, value);
     let _: () = msg_send![label, setBezeled: false];
@@ -762,8 +762,985 @@ pub(super) unsafe fn make_text_input(
     field
 }
 
-/// 下拉选择控件(alloc +1)。
-/// Pop-up button (alloc +1).
+struct SettingsSelectState {
+    items: Vec<String>,
+    item_symbols: Vec<Option<String>>,
+    selected: isize,
+    panel: usize,
+    open: bool,
+}
+
+static SETTINGS_SELECT_STATES: LazyLock<Mutex<HashMap<usize, SettingsSelectState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SETTINGS_SELECT_ARROW_VIEWS: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static ACTIVE_SETTINGS_SELECT: Mutex<Option<usize>> = Mutex::new(None);
+
+struct SettingsSelectClass(*mut AnyObject);
+unsafe impl Send for SettingsSelectClass {}
+unsafe impl Sync for SettingsSelectClass {}
+
+static SETTINGS_SELECT_CLASS: OnceLock<SettingsSelectClass> = OnceLock::new();
+
+struct SettingsSelectItemClass(*mut AnyObject);
+unsafe impl Send for SettingsSelectItemClass {}
+unsafe impl Sync for SettingsSelectItemClass {}
+
+static SETTINGS_SELECT_ITEM_CLASS: OnceLock<SettingsSelectItemClass> = OnceLock::new();
+
+/// Clear runtime state before the settings window and its controls are destroyed.
+/// 设置窗口及其控件销毁前清理运行时状态。
+pub(super) fn clear_settings_select_registry() {
+    SETTINGS_SELECT_STATES.lock().unwrap().clear();
+    SETTINGS_SELECT_ARROW_VIEWS.lock().unwrap().clear();
+    *ACTIVE_SETTINGS_SELECT.lock().unwrap() = None;
+}
+
+unsafe fn settings_select_set_title(button: *mut AnyObject, title: &str) {
+    // NSButton has no reliable AppKit content-inset API. Keep the native button hit area and
+    // add a small typographic inset to its title instead of shrinking the control frame.
+    // NSButton 没有可靠的 AppKit 内容内边距 API；保留按钮点击区域，只给标题增加轻微字面内缩。
+    let padded_title = format!("   {title}");
+    let title_ns = make_nsstring(&padded_title);
+    let _: () = msg_send![button, setTitle: title_ns];
+    CFRelease(title_ns as *const c_void);
+}
+
+/// Select surfaces deliberately use opaque colors; only the surrounding settings window remains
+/// translucent. 下拉框表面使用不透明颜色，只有外层设置窗口保留透明效果。
+fn settings_select_surface_color(palette: UiPalette) -> u32 {
+    if palette.dark {
+        0x151515FF
+    } else {
+        0xFCFCFCFF
+    }
+}
+
+fn settings_select_item_active_color(palette: UiPalette) -> u32 {
+    if palette.dark {
+        0x1C1C1CFF
+    } else {
+        0xF5F5F5FF
+    }
+}
+
+/// Update the trigger surface and arrow without changing the selected value.
+/// 更新触发器表面和箭头,但不改变选中值。
+unsafe fn settings_select_apply_visual(button: *mut AnyObject, open: bool) {
+    let (title, enabled) = SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .get(&(button as usize))
+        .map(|state| {
+            let title = state
+                .items
+                .get(state.selected.max(0) as usize)
+                .cloned()
+                .unwrap_or_default();
+            (title, msg_send![button, isEnabled])
+        })
+        .unwrap_or_else(|| (String::new(), msg_send![button, isEnabled]));
+    settings_select_set_title(button, &title);
+
+    // Keep one downward chevron and rotate its layer so opening/closing is continuous.
+    // 始终使用同一个向下箭头，通过图层旋转实现连续的展开/收起动画。
+    let symbol = "chevron.down";
+    // Keep the arrow outside NSButton's title/image layout. AppKit otherwise lets the
+    // symbol's intrinsic size affect the button's layout, which can make the arrow huge
+    // and move the title's baseline. 将箭头从 NSButton 的标题/图片布局中分离，避免
+    // SF Symbol 的固有尺寸撑大控件并导致文字基线偏移。
+    let bounds: NSRect = msg_send![button, bounds];
+    let arrow_size = 16.0;
+    let arrow_frame = NSRect::new(
+        NSPoint::new(
+            bounds.origin.x + (bounds.size.width - arrow_size - 12.0).max(0.0),
+            bounds.origin.y + (bounds.size.height - arrow_size).max(0.0) / 2.0,
+        ),
+        NSSize::new(arrow_size, arrow_size),
+    );
+    let existing_arrow_view = SETTINGS_SELECT_ARROW_VIEWS
+        .lock()
+        .unwrap()
+        .get(&(button as usize))
+        .copied()
+        .unwrap_or(0) as *mut AnyObject;
+    let arrow_view = if existing_arrow_view.is_null() {
+        let view = make_symbol_image_view(symbol, arrow_frame);
+        let _: () = msg_send![button, addSubview: view];
+        SETTINGS_SELECT_ARROW_VIEWS
+            .lock()
+            .unwrap()
+            .insert(button as usize, view as usize);
+        release_obj(view);
+        view
+    } else {
+        existing_arrow_view
+    };
+    let _: () = msg_send![arrow_view, setFrame: arrow_frame];
+    let image = make_symbol_image(symbol, NSSize::new(arrow_size, arrow_size));
+    if !image.is_null() {
+        let _: () = msg_send![arrow_view, setImage: image];
+    }
+
+    // Rotate a dedicated layer around the icon center. Without an explicit layer-backed view
+    // and anchor point, AppKit can apply the transform in the parent button's coordinate space.
+    // 使用独立图层并固定中心锚点旋转；否则 AppKit 可能把变换应用到父按钮坐标系，导致箭头跑位。
+    let _: () = msg_send![arrow_view, setWantsLayer: true];
+    let arrow_layer: *mut AnyObject = msg_send![arrow_view, layer];
+    if !arrow_layer.is_null() {
+        let _: () = msg_send![arrow_layer, setAnchorPoint: NSPoint::new(0.5, 0.5)];
+        let _: () = msg_send![
+            arrow_layer,
+            setPosition: NSPoint::new(
+                arrow_frame.origin.x + arrow_frame.size.width / 2.0,
+                arrow_frame.origin.y + arrow_frame.size.height / 2.0,
+            )
+        ];
+        let target_angle = if open { std::f64::consts::PI } else { 0.0 };
+        let key_path = make_nsstring("transform.rotation.z");
+        let target_value: *mut AnyObject =
+            msg_send![class!(NSNumber), numberWithDouble: target_angle];
+        let _: () = msg_send![arrow_layer, setValue: target_value, forKeyPath: key_path];
+
+        if !existing_arrow_view.is_null() {
+            let presentation: *mut AnyObject = msg_send![arrow_layer, presentationLayer];
+            let from_angle = if presentation.is_null() {
+                if open {
+                    0.0
+                } else {
+                    std::f64::consts::PI
+                }
+            } else {
+                let value: *mut AnyObject = msg_send![presentation, valueForKeyPath: key_path];
+                if value.is_null() {
+                    if open {
+                        0.0
+                    } else {
+                        std::f64::consts::PI
+                    }
+                } else {
+                    msg_send![value, doubleValue]
+                }
+            };
+            let from_value: *mut AnyObject =
+                msg_send![class!(NSNumber), numberWithDouble: from_angle];
+            let animation: *mut AnyObject = msg_send![
+                class!(CASpringAnimation),
+                animationWithKeyPath: key_path
+            ];
+            let _: () = msg_send![animation, setFromValue: from_value];
+            let _: () = msg_send![animation, setToValue: target_value];
+            let _: () = msg_send![animation, setMass: 1.0f64];
+            let _: () = msg_send![animation, setStiffness: 300.0f64];
+            let _: () = msg_send![animation, setDamping: 25.0f64];
+            let _: () = msg_send![animation, setInitialVelocity: 0.0f64];
+            let duration: f64 = msg_send![animation, settlingDuration];
+            let _: () = msg_send![animation, setDuration: duration.max(0.32)];
+            let animation_key = make_nsstring("settings-select-arrow-rotation");
+            let _: () = msg_send![arrow_layer, addAnimation: animation, forKey: animation_key];
+            CFRelease(animation_key as *const c_void);
+        }
+        CFRelease(key_path as *const c_void);
+    }
+
+    let palette = settings_palette();
+    let tint = crate::ffi::hex_to_ns_color(if enabled {
+        palette.primary_text
+    } else {
+        palette.muted_text
+    });
+    let _: () = msg_send![button, setContentTintColor: tint];
+    let _: () = msg_send![arrow_view, setContentTintColor: tint];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if !layer.is_null() {
+        let background = settings_select_surface_color(palette);
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
+        let _: () = msg_send![layer, setBorderWidth: 1.0f64];
+        let _: () = msg_send![layer, setCornerRadius: 12.0f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+    }
+}
+
+unsafe fn settings_select_cancel_item_reveals(panel: *mut AnyObject) {
+    let subviews: *mut AnyObject = msg_send![panel, subviews];
+    if subviews.is_null() {
+        return;
+    }
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let item: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+        let _: () = msg_send![
+            class!(NSObject),
+            cancelPreviousPerformRequestsWithTarget: item,
+            selector: sel!(reveal),
+            object: std::ptr::null::<AnyObject>()
+        ];
+    }
+}
+
+unsafe fn settings_select_close(button: *mut AnyObject) {
+    let panel = {
+        let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
+        let Some(state) = states.get_mut(&(button as usize)) else {
+            return;
+        };
+        state.open = false;
+        state.panel as *mut AnyObject
+    };
+    if !panel.is_null() {
+        settings_select_cancel_item_reveals(panel);
+        let panel_layer: *mut AnyObject = msg_send![panel, layer];
+        if !panel_layer.is_null() {
+            let presentation: *mut AnyObject = msg_send![panel_layer, presentationLayer];
+            // CALayer.opacity is a CGFloat on macOS, which is f32 in this objc2 ABI.
+            // CALayer.opacity 在 macOS 上是 CGFloat，在当前 objc2 ABI 中对应 f32。
+            let from_opacity: f32 = if presentation.is_null() {
+                msg_send![panel_layer, opacity]
+            } else {
+                msg_send![presentation, opacity]
+            };
+            let open_key = make_nsstring("settings-select-open");
+            let _: () = msg_send![panel_layer, removeAnimationForKey: open_key];
+            CFRelease(open_key as *const c_void);
+            // Commit the hidden end state to the model layer before adding the fade. This avoids
+            // a one-frame return to opacity 1 when Core Animation removes the animation.
+            // 先把隐藏终态提交到模型层，再添加淡出动画，避免动画移除时闪回不透明。
+            let _: () = msg_send![panel_layer, setOpacity: 0.0f32];
+            let key_path = make_nsstring("opacity");
+            let animation: *mut AnyObject = msg_send![
+                class!(CABasicAnimation),
+                animationWithKeyPath: key_path
+            ];
+            CFRelease(key_path as *const c_void);
+            let from: *mut AnyObject =
+                msg_send![class!(NSNumber), numberWithFloat: from_opacity.clamp(0.0, 1.0)];
+            let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithFloat: 0.0f32];
+            let _: () = msg_send![animation, setFromValue: from];
+            let _: () = msg_send![animation, setToValue: to];
+            let _: () = msg_send![animation, setDuration: 0.16f64];
+            let animation_key = make_nsstring("settings-select-close");
+            let _: () = msg_send![panel_layer, addAnimation: animation, forKey: animation_key];
+            CFRelease(animation_key as *const c_void);
+        }
+        let _: () = msg_send![
+            button,
+            performSelector: sel!(finishClose:),
+            withObject: panel,
+            afterDelay: 0.16f64
+        ];
+    }
+    if ACTIVE_SETTINGS_SELECT
+        .lock()
+        .unwrap()
+        .is_some_and(|active| active == button as usize)
+    {
+        *ACTIVE_SETTINGS_SELECT.lock().unwrap() = None;
+    }
+    settings_select_apply_visual(button, false);
+}
+
+extern "C" fn settings_select_finish_close(this: *mut c_void, _cmd: Sel, panel: *mut c_void) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let panel = panel as *mut AnyObject;
+        let should_remove = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get_mut(&(button as usize))
+            .is_some_and(|state| {
+                if !state.open && state.panel == panel as usize {
+                    state.panel = 0;
+                    true
+                } else {
+                    false
+                }
+            });
+        if should_remove && !panel.is_null() {
+            let _: () = msg_send![panel, removeFromSuperview];
+        }
+    }
+}
+
+/// Paint an option row according to its selected/hovered state.
+/// 根据选中/悬停状态绘制选择器选项行。
+unsafe fn settings_select_item_apply_background(item: *mut AnyObject, hovered: bool) {
+    let select: *mut AnyObject = msg_send![item, target];
+    let index: isize = msg_send![item, tag];
+    let selected = !select.is_null()
+        && SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&(select as usize))
+            .is_some_and(|state| state.selected == index);
+    let layer: *mut AnyObject = msg_send![item, layer];
+    if layer.is_null() {
+        return;
+    }
+    let palette = settings_palette();
+    let background = if selected || hovered {
+        settings_select_item_active_color(palette)
+    } else {
+        0x00000000
+    };
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
+    let tint = crate::ffi::hex_to_ns_color(if selected || hovered {
+        palette.primary_text
+    } else {
+        palette.muted_text
+    });
+    let _: () = msg_send![item, setContentTintColor: tint];
+}
+
+extern "C" fn settings_select_item_mouse_entered(
+    this: *mut c_void,
+    _cmd: Sel,
+    _event: *mut c_void,
+) {
+    unsafe {
+        settings_select_item_apply_background(this as *mut AnyObject, true);
+    }
+}
+
+extern "C" fn settings_select_item_mouse_exited(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        settings_select_item_apply_background(this as *mut AnyObject, false);
+    }
+}
+
+extern "C" fn settings_select_item_reveal(this: *mut c_void, _cmd: Sel, _object: *mut c_void) {
+    unsafe {
+        let item = this as *mut AnyObject;
+        let _: () = msg_send![item, setAlphaValue: 1.0f64];
+        let layer: *mut AnyObject = msg_send![item, layer];
+        if !layer.is_null() {
+            let key_path = make_nsstring("opacity");
+            let animation: *mut AnyObject = msg_send![
+                class!(CABasicAnimation),
+                animationWithKeyPath: key_path
+            ];
+            CFRelease(key_path as *const c_void);
+            let from: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
+            let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
+            let _: () = msg_send![animation, setFromValue: from];
+            let _: () = msg_send![animation, setToValue: to];
+            let _: () = msg_send![animation, setDuration: 0.16f64];
+            let animation_key = make_nsstring("settings-select-item-reveal");
+            let _: () = msg_send![layer, addAnimation: animation, forKey: animation_key];
+            CFRelease(animation_key as *const c_void);
+        }
+    }
+}
+
+fn settings_select_item_class() -> *mut AnyObject {
+    SETTINGS_SELECT_ITEM_CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabSettingsSelectItem").unwrap();
+            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                settings_select_item_mouse_entered as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                settings_select_item_mouse_exited as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(reveal),
+                settings_select_item_reveal as *mut c_void,
+                CString::new("v@:").unwrap().as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            SettingsSelectItemClass(cls)
+        })
+        .0
+}
+
+unsafe fn settings_select_make_item(
+    select: *mut AnyObject,
+    panel: *mut AnyObject,
+    index: usize,
+    title: &str,
+    selected: bool,
+    width: f64,
+    y: f64,
+) {
+    let item: *mut AnyObject = msg_send![settings_select_item_class(), alloc];
+    let item: *mut AnyObject = msg_send![
+        item,
+        initWithFrame: NSRect::new(
+            NSPoint::new(4.0, y),
+            NSSize::new((width - 8.0).max(1.0), 32.0)
+        )
+    ];
+    let _: () = msg_send![item, setButtonType: 0isize];
+    let _: () = msg_send![item, setBordered: false];
+    // The row already starts 4pt inside the panel, so one extra space matches the trigger's
+    // visual inset without pushing option text too far inward.
+    // 选项行已经从面板内缩 4pt，因此只增加一个空格即可与触发器的视觉内边距保持一致。
+    let padded_title = format!(" {title}");
+    let title_ns = make_nsstring(&padded_title);
+    let _: () = msg_send![item, setTitle: title_ns];
+    CFRelease(title_ns as *const c_void);
+    let _: () = msg_send![item, setAlignment: 0isize]; // NSTextAlignmentLeft
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+    let _: () = msg_send![item, setFont: font];
+    let _: () = msg_send![item, setTag: index as isize];
+    let _: () = msg_send![item, setTarget: select];
+    let _: () = msg_send![item, setAction: sel!(selectOption:)];
+    let symbol = SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .get(&(select as usize))
+        .and_then(|state| state.item_symbols.get(index))
+        .and_then(|symbol| symbol.as_deref())
+        .map(str::to_owned);
+    if let Some(symbol) = symbol {
+        let image = make_symbol_image(&symbol, NSSize::new(16.0, 16.0));
+        if !image.is_null() {
+            let _: () = msg_send![item, setImage: image];
+            let _: () = msg_send![item, setImagePosition: 2isize]; // NSImageLeft
+        }
+    }
+    let _: () = msg_send![item, setWantsLayer: true];
+    let item_layer: *mut AnyObject = msg_send![item, layer];
+    if !item_layer.is_null() {
+        let _: () = msg_send![item_layer, setCornerRadius: 8.0f64];
+        let _: () = msg_send![item_layer, setMasksToBounds: true];
+    }
+    settings_select_item_apply_background(item, false);
+    if selected {
+        let check_frame = NSRect::new(
+            NSPoint::new((width - 8.0 - 24.0).max(0.0), 8.0),
+            NSSize::new(14.0, 14.0),
+        );
+        let check = make_symbol_image_view("checkmark", check_frame);
+        let _: () = msg_send![item, addSubview: check];
+        release_obj(check);
+    }
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width - 8.0, 32.0)),
+        options: 0x01u64 | 0x80u64 | 0x200u64,
+        owner: item,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![item, addTrackingArea: tracking];
+    release_obj(tracking);
+    let _: () = msg_send![panel, addSubview: item];
+    let _: () = msg_send![item, setAlphaValue: 0.0f64];
+    let reveal_delay = 0.05 + index as f64 * 0.035;
+    let _: () = msg_send![
+        item,
+        performSelector: sel!(reveal),
+        withObject: std::ptr::null::<AnyObject>(),
+        afterDelay: reveal_delay
+    ];
+    release_obj(item);
+}
+
+unsafe fn settings_select_open(button: *mut AnyObject) {
+    let window: *mut AnyObject = msg_send![button, window];
+    let content: *mut AnyObject = if window.is_null() {
+        std::ptr::null_mut()
+    } else {
+        msg_send![window, contentView]
+    };
+    if content.is_null() {
+        return;
+    }
+
+    if let Some(active) = *ACTIVE_SETTINGS_SELECT.lock().unwrap() {
+        if active != button as usize {
+            settings_select_close(active as *mut AnyObject);
+        }
+    }
+
+    // A fast reopen can happen while the close fade is still pending. Remove only the stale
+    // panel that belongs to this control and cancel its delayed cleanup callback.
+    // 快速重新打开可能发生在关闭淡出尚未结束时；这里只清理本控件的旧面板并取消旧回调。
+    let stale_panel = {
+        let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
+        states
+            .get_mut(&(button as usize))
+            .filter(|state| !state.open)
+            .map(|state| {
+                let panel = state.panel;
+                state.panel = 0;
+                panel as *mut AnyObject
+            })
+            .unwrap_or(std::ptr::null_mut())
+    };
+    if !stale_panel.is_null() {
+        let _: () = msg_send![
+            class!(NSObject),
+            cancelPreviousPerformRequestsWithTarget: button,
+            selector: sel!(finishClose:),
+            object: stale_panel
+        ];
+        let _: () = msg_send![stale_panel, removeFromSuperview];
+    }
+
+    let (items, selected) = {
+        let states = SETTINGS_SELECT_STATES.lock().unwrap();
+        let Some(state) = states.get(&(button as usize)) else {
+            return;
+        };
+        if state.items.is_empty() || state.open {
+            return;
+        }
+        (state.items.clone(), state.selected.max(0) as usize)
+    };
+
+    let bounds: NSRect = msg_send![button, bounds];
+    let trigger: NSRect = msg_send![button, convertRect: bounds, toView: content];
+    let content_bounds: NSRect = msg_send![content, bounds];
+    let row_h = 32.0;
+    let panel_h = items.len() as f64 * row_h + 8.0;
+    let below = trigger.origin.y - content_bounds.origin.y;
+    let above = content_bounds.origin.y + content_bounds.size.height
+        - (trigger.origin.y + trigger.size.height);
+    let opens_above = below < panel_h + 8.0 && above > below;
+    let panel_y = if opens_above {
+        trigger.origin.y + trigger.size.height + 8.0
+    } else {
+        trigger.origin.y - panel_h - 8.0
+    };
+    let panel_y = panel_y.clamp(
+        content_bounds.origin.y + 4.0,
+        (content_bounds.origin.y + content_bounds.size.height - panel_h - 4.0)
+            .max(content_bounds.origin.y + 4.0),
+    );
+    let panel_w = trigger.size.width.max(120.0);
+
+    let panel: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let panel: *mut AnyObject = msg_send![
+        panel,
+        initWithFrame: NSRect::new(
+            NSPoint::new(trigger.origin.x, panel_y),
+            NSSize::new(panel_w, panel_h)
+        )
+    ];
+    let _: () = msg_send![panel, setWantsLayer: true];
+    let panel_layer: *mut AnyObject = msg_send![panel, layer];
+    if !panel_layer.is_null() {
+        let palette = settings_palette();
+        crate::ffi::layer_set_background(
+            panel_layer,
+            crate::ffi::hex_to_cg_color(settings_select_surface_color(palette)),
+        );
+        crate::ffi::layer_set_border(
+            panel_layer,
+            crate::ffi::hex_to_cg_color(palette.card_border),
+        );
+        let _: () = msg_send![panel_layer, setBorderWidth: 1.0f64];
+        let _: () = msg_send![panel_layer, setCornerRadius: 12.0f64];
+        // Keep the panel's shadow outside its bounds; option rows already clip themselves to
+        // their own rounded layers. 让阴影绘制在面板边界外，选项行自行裁剪圆角内容。
+        let _: () = msg_send![panel_layer, setMasksToBounds: false];
+        let shadow_color = crate::ffi::hex_to_cg_color(0x000000FF);
+        crate::ffi::layer_set_shadow_color(panel_layer, shadow_color);
+        let _: () = msg_send![panel_layer, setShadowOpacity: 0.12f32];
+        let _: () = msg_send![panel_layer, setShadowRadius: 8.0f64];
+        let _: () = msg_send![panel_layer, setShadowOffset: NSSize::new(0.0, -4.0)];
+    }
+
+    for (index, title) in items.iter().enumerate() {
+        let item_y = panel_h - 4.0 - (index as f64 + 1.0) * row_h;
+        settings_select_make_item(
+            button,
+            panel,
+            index,
+            title,
+            index == selected,
+            panel_w,
+            item_y,
+        );
+    }
+    let _: () = msg_send![content, addSubview: panel];
+    release_obj(panel);
+    {
+        let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
+        if let Some(state) = states.get_mut(&(button as usize)) {
+            state.panel = panel as usize;
+            state.open = true;
+        }
+    }
+    *ACTIVE_SETTINGS_SELECT.lock().unwrap() = Some(button as usize);
+    settings_select_apply_visual(button, true);
+
+    if !window.is_null() {
+        let _: bool = msg_send![window, makeFirstResponder: button];
+    }
+
+    // The reference unfolds with opacity rather than scaling the whole panel, keeping text and
+    // rounded edges crisp while it appears. 参考组件使用透明度展开而不是整体缩放，避免
+    // 文字和圆角在出现时变糊。
+    if !panel_layer.is_null() {
+        let _: () = msg_send![panel_layer, setOpacity: 0.0f32];
+        let key_path = make_nsstring("opacity");
+        let animation: *mut AnyObject = msg_send![
+            class!(CABasicAnimation),
+            animationWithKeyPath: key_path
+        ];
+        CFRelease(key_path as *const c_void);
+        let from: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
+        let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
+        let _: () = msg_send![animation, setFromValue: from];
+        let _: () = msg_send![animation, setToValue: to];
+        let _: () = msg_send![animation, setDuration: 0.18f64];
+        let _: () = msg_send![panel_layer, setOpacity: 1.0f32];
+        let animation_key = make_nsstring("settings-select-open");
+        let _: () = msg_send![panel_layer, addAnimation: animation, forKey: animation_key];
+        CFRelease(animation_key as *const c_void);
+
+        // Separate the panel from the trigger with a short spring translation, matching the
+        // reference's attached-then-detached unfold without scaling the panel contents.
+        // 用轻微弹性位移让面板先贴合触发器再分离，模拟参考组件的展开而不缩放内容。
+        let key_path = make_nsstring("transform.translation.y");
+        let spring: *mut AnyObject = msg_send![
+            class!(CASpringAnimation),
+            animationWithKeyPath: key_path
+        ];
+        CFRelease(key_path as *const c_void);
+        let from_y = if opens_above { -8.0 } else { 8.0 };
+        let from: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from_y];
+        let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
+        let _: () = msg_send![spring, setFromValue: from];
+        let _: () = msg_send![spring, setToValue: to];
+        let _: () = msg_send![spring, setMass: 1.0f64];
+        let _: () = msg_send![spring, setStiffness: 260.0f64];
+        let _: () = msg_send![spring, setDamping: 24.0f64];
+        let _: () = msg_send![spring, setInitialVelocity: 0.0f64];
+        let duration: f64 = msg_send![spring, settlingDuration];
+        let _: () = msg_send![spring, setDuration: duration.max(0.32)];
+        let animation_key = make_nsstring("settings-select-open-translation");
+        let _: () = msg_send![panel_layer, addAnimation: spring, forKey: animation_key];
+        CFRelease(animation_key as *const c_void);
+    }
+}
+
+pub(super) extern "C" fn settings_select_select_option(
+    this: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    unsafe {
+        let select = this as *mut AnyObject;
+        let item = sender as *mut AnyObject;
+        let index: isize = msg_send![item, tag];
+        let valid = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&(select as usize))
+            .is_some_and(|state| index >= 0 && (index as usize) < state.items.len());
+        if !valid {
+            return;
+        }
+        if let Some(state) = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get_mut(&(select as usize))
+        {
+            state.selected = index;
+        }
+        settings_select_close(select);
+        let target: *mut AnyObject = msg_send![select, target];
+        if !target.is_null() {
+            let action: Sel = msg_send![select, action];
+            let _: bool = msg_send![select, sendAction: action, to: target];
+        }
+    }
+}
+
+extern "C" fn settings_select_mouse_down(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        if !msg_send![button, isEnabled] {
+            return;
+        }
+        let open = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&(button as usize))
+            .is_some_and(|state| state.open);
+        if open {
+            settings_select_close(button);
+        } else {
+            settings_select_open(button);
+        }
+    }
+}
+
+extern "C" fn settings_select_key_down(this: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let key_code: u16 = msg_send![event as *mut AnyObject, keyCode];
+        if matches!(key_code, 36 | 49 | 125 | 126) {
+            let open = SETTINGS_SELECT_STATES
+                .lock()
+                .unwrap()
+                .get(&(button as usize))
+                .is_some_and(|state| state.open);
+            if key_code == 36 || key_code == 49 {
+                if open {
+                    settings_select_close(button);
+                } else {
+                    settings_select_open(button);
+                }
+            } else if !open {
+                settings_select_open(button);
+            }
+            return;
+        }
+        if key_code == 53 {
+            settings_select_close(button);
+            return;
+        }
+        let events: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: event];
+        let _: () = msg_send![button, interpretKeyEvents: events];
+    }
+}
+
+extern "C" fn settings_select_accepts_first_responder(_this: *mut c_void, _cmd: Sel) -> bool {
+    true
+}
+
+extern "C" fn settings_select_index(this: *mut c_void, _cmd: Sel) -> isize {
+    SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .get(&(this as usize))
+        .map(|state| state.selected)
+        .unwrap_or(-1)
+}
+
+extern "C" fn settings_select_set_index(this: *mut c_void, _cmd: Sel, index: isize) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        if let Some(state) = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get_mut(&(button as usize))
+        {
+            if index >= 0 && (index as usize) < state.items.len() {
+                state.selected = index;
+            }
+        }
+        let open = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&(button as usize))
+            .is_some_and(|state| state.open);
+        settings_select_apply_visual(button, open);
+    }
+}
+
+extern "C" fn settings_select_remove_all(this: *mut c_void, _cmd: Sel) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let open = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&(button as usize))
+            .is_some_and(|state| state.open);
+        if open {
+            settings_select_close(button);
+        }
+        if let Some(state) = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get_mut(&(button as usize))
+        {
+            state.items.clear();
+            state.item_symbols.clear();
+            state.selected = -1;
+        }
+        settings_select_apply_visual(button, false);
+    }
+}
+
+extern "C" fn settings_select_add_item(this: *mut c_void, _cmd: Sel, title: *mut c_void) {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let title = nsstring_to_rust(title as *mut AnyObject);
+        if let Some(state) = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get_mut(&(button as usize))
+        {
+            state.items.push(title);
+            state.item_symbols.push(None);
+            if state.selected < 0 {
+                state.selected = 0;
+            }
+        }
+        let open = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&(button as usize))
+            .is_some_and(|state| state.open);
+        settings_select_apply_visual(button, open);
+    }
+}
+
+/// Close the active select when a settings-window click lands outside its trigger or panel.
+/// 设置窗口点击落在触发器和面板之外时关闭当前选择器。
+pub(super) unsafe fn settings_select_handle_window_mouse_down(
+    window: *mut AnyObject,
+    event: *mut AnyObject,
+) {
+    let active = *ACTIVE_SETTINGS_SELECT.lock().unwrap();
+    let Some(active) = active else { return };
+    let button = active as *mut AnyObject;
+    let panel = SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .get(&active)
+        .map(|state| state.panel)
+        .unwrap_or(0) as *mut AnyObject;
+    if panel.is_null() || button.is_null() || window.is_null() {
+        return;
+    }
+    let content: *mut AnyObject = msg_send![window, contentView];
+    if content.is_null() {
+        return;
+    }
+    let location: NSPoint = msg_send![event, locationInWindow];
+    let point: NSPoint = msg_send![
+        content,
+        convertPoint: location,
+        fromView: std::ptr::null::<AnyObject>()
+    ];
+    let panel_frame: NSRect = msg_send![panel, frame];
+    let button_bounds: NSRect = msg_send![button, bounds];
+    let button_frame: NSRect = msg_send![button, convertRect: button_bounds, toView: content];
+    let contains = |frame: NSRect| {
+        point.x >= frame.origin.x
+            && point.x <= frame.origin.x + frame.size.width
+            && point.y >= frame.origin.y
+            && point.y <= frame.origin.y + frame.size.height
+    };
+    if !contains(panel_frame) && !contains(button_frame) {
+        settings_select_close(button);
+    }
+}
+
+/// Attach an optional SF Symbol to one item in the next rendered options panel.
+/// 为下次渲染的指定选项附加可选 SF Symbol。
+pub(super) fn settings_select_set_item_symbol(select: *mut AnyObject, index: usize, symbol: &str) {
+    let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
+    let Some(state) = states.get_mut(&(select as usize)) else {
+        return;
+    };
+    if let Some(slot) = state.item_symbols.get_mut(index) {
+        *slot = Some(symbol.to_owned());
+    }
+}
+
+extern "C" fn settings_select_set_enabled(this: *mut c_void, _cmd: Sel, enabled: bool) {
+    unsafe {
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        type SetEnabled = unsafe extern "C" fn(*mut ObjcSuper, Sel, bool);
+        let send: SetEnabled = std::mem::transmute(objc_msgSendSuper as *const ());
+        send(&mut sup, sel!(setEnabled:), enabled);
+        let open = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&(this as usize))
+            .is_some_and(|state| state.open);
+        settings_select_apply_visual(this as *mut AnyObject, open);
+    }
+}
+
+fn settings_select_class() -> *mut AnyObject {
+    SETTINGS_SELECT_CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabSettingsSelect").unwrap();
+            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types_void_event = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseDown:),
+                settings_select_mouse_down as *mut c_void,
+                types_void_event.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(keyDown:),
+                settings_select_key_down as *mut c_void,
+                types_void_event.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(selectOption:),
+                settings_select_select_option as *mut c_void,
+                types_void_event.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(finishClose:),
+                settings_select_finish_close as *mut c_void,
+                types_void_event.as_ptr(),
+            );
+            let types_bool = CString::new("B@:").unwrap();
+            class_addMethod(
+                cls,
+                sel!(acceptsFirstResponder),
+                settings_select_accepts_first_responder as *mut c_void,
+                types_bool.as_ptr(),
+            );
+            let types_index = CString::new("q@:").unwrap();
+            class_addMethod(
+                cls,
+                sel!(indexOfSelectedItem),
+                settings_select_index as *mut c_void,
+                types_index.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(selectItemAtIndex:),
+                settings_select_set_index as *mut c_void,
+                CString::new("v@:q").unwrap().as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(removeAllItems),
+                settings_select_remove_all as *mut c_void,
+                CString::new("v@:").unwrap().as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(addItemWithTitle:),
+                settings_select_add_item as *mut c_void,
+                types_void_event.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(setEnabled:),
+                settings_select_set_enabled as *mut c_void,
+                CString::new("v@:B").unwrap().as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            SettingsSelectClass(cls)
+        })
+        .0
+}
+
+/// Custom settings select with a bouncy, position-aware options panel (alloc +1).
+/// 自定义设置选择器：带弹性动画、根据空间选择展开方向的选项面板(alloc +1)。
 pub(super) unsafe fn make_popup(
     x: f64,
     y: f64,
@@ -772,32 +1749,33 @@ pub(super) unsafe fn make_popup(
     items: &[&str],
     selected: usize,
 ) -> *mut AnyObject {
-    let popup: *mut AnyObject = msg_send![class!(NSPopUpButton), alloc];
-    let popup: *mut AnyObject = msg_send![popup, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)), pullsDown: false];
-    for &item in items {
-        let ns = make_nsstring(item);
-        let _: () = msg_send![popup, addItemWithTitle: ns];
-        CFRelease(ns as *const c_void);
-    }
-    let _: () = msg_send![popup, selectItemAtIndex: selected as isize];
-    let _: () = msg_send![popup, setBezelStyle: 0isize];
-    let _: () = msg_send![popup, setControlSize: 0isize]; // Regular
+    let popup: *mut AnyObject = msg_send![settings_select_class(), alloc];
+    let popup: *mut AnyObject = msg_send![
+        popup,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    ];
+    let _: () = msg_send![popup, setButtonType: 0isize];
     let _: () = msg_send![popup, setBordered: false];
-    let palette = settings_palette();
+    let _: () = msg_send![popup, setAlignment: 0isize]; // NSTextAlignmentLeft
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let _: () = msg_send![popup, setFont: font];
+    let _: () = msg_send![popup, setFocusRingType: 1isize]; // NSFocusRingTypeNone
     let _: () = msg_send![popup, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![popup, layer];
-    if !layer.is_null() {
-        layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.field_bg));
-        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
-        let _: () = msg_send![layer, setBorderWidth: 1.0f64];
-        let _: () = msg_send![layer, setCornerRadius: 9.0f64];
-        let _: () = msg_send![layer, setMasksToBounds: true];
-    }
-    let tint = crate::ffi::hex_to_ns_color(palette.primary_text);
-    let _: () = msg_send![popup, setContentTintColor: tint];
-    let cell: *mut AnyObject = msg_send![popup, cell];
-    if !cell.is_null() && msg_send![cell, respondsToSelector: sel!(setTextColor:)] {
-        let _: () = msg_send![cell, setTextColor: tint];
+    SETTINGS_SELECT_STATES.lock().unwrap().insert(
+        popup as usize,
+        SettingsSelectState {
+            items: items.iter().map(|item| (*item).to_owned()).collect(),
+            item_symbols: vec![None; items.len()],
+            selected: selected as isize,
+            panel: 0,
+            open: false,
+        },
+    );
+    let _: () = msg_send![popup, setEnabled: true];
+    settings_select_apply_visual(popup, false);
+    if let Some(first) = items.first() {
+        settings_select_set_title(popup, first);
+        let _: () = msg_send![popup, selectItemAtIndex: selected as isize];
     }
     popup
 }
