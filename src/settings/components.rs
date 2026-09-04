@@ -626,7 +626,13 @@ impl SettingsSidebar {
 
     /// Move a layer-backed view's center along the sidebar using one layer position animation.
     /// 使用单个 layer position 动画移动 layer-backed view 在侧栏中的中心位置。
-    unsafe fn spring_move_view(view: *mut AnyObject, frame: NSRect, animation_key_name: &str) {
+    unsafe fn spring_move_view(
+        view: *mut AnyObject,
+        frame: NSRect,
+        animation_key_name: &str,
+        stiffness: f64,
+        damping: f64,
+    ) {
         let layer: *mut AnyObject = objc2::msg_send![view, layer];
         if layer.is_null() {
             Self::set_frame_without_implicit_animation(view, frame);
@@ -669,8 +675,8 @@ impl SettingsSidebar {
         let _: () = objc2::msg_send![animation, setFromValue: from_value];
         let _: () = objc2::msg_send![animation, setToValue: target_value];
         let _: () = objc2::msg_send![animation, setMass: 0.6f64];
-        let _: () = objc2::msg_send![animation, setStiffness: 360.0f64];
-        let _: () = objc2::msg_send![animation, setDamping: 32.0f64];
+        let _: () = objc2::msg_send![animation, setStiffness: stiffness];
+        let _: () = objc2::msg_send![animation, setDamping: damping];
         let _: () = objc2::msg_send![animation, setInitialVelocity: 0.0f64];
         let duration: f64 = objc2::msg_send![animation, settlingDuration];
         let _: () = objc2::msg_send![animation, setDuration: duration];
@@ -729,22 +735,84 @@ impl SettingsSidebar {
             Self::set_frame_without_implicit_animation(highlight, frame);
             return;
         }
-        Self::spring_move_view(highlight, frame, "settings-sidebar-highlight-spring");
+        Self::spring_move_view(
+            highlight,
+            frame,
+            "settings-sidebar-highlight-spring",
+            360.0,
+            32.0,
+        );
     }
 
-    /// Move the shared hover pill, fading it in only on the first item entered.
-    /// 移动共享悬浮气泡，仅在首次进入菜单时淡入。
-    pub(super) unsafe fn move_hover_highlight(hover: *mut AnyObject, frame: NSRect) {
+    /// Move the shared hover pill using the normal sidebar spring.
+    /// 使用侧栏常规 spring 移动共享悬浮气泡。
+    unsafe fn move_hover_highlight_with_spring(
+        hover: *mut AnyObject,
+        frame: NSRect,
+        stiffness: f64,
+        damping: f64,
+    ) {
         if hover.is_null() {
             return;
         }
         let was_visible = widgets::SIDEBAR_HOVER_VISIBLE.swap(true, Ordering::SeqCst);
         if was_visible {
-            Self::spring_move_view(hover, frame, "settings-sidebar-hover-spring");
+            Self::spring_move_view(
+                hover,
+                frame,
+                "settings-sidebar-hover-spring",
+                stiffness,
+                damping,
+            );
         } else {
             Self::set_frame_without_implicit_animation(hover, frame);
             Self::fade_view(hover, 1.0, "settings-sidebar-hover-opacity");
         }
+    }
+
+    /// Move the shared hover pill with the faster re-entry spring.
+    /// 使用更快的重新进入 spring 移动共享悬浮气泡。
+    pub(super) unsafe fn move_hover_highlight(hover: *mut AnyObject, frame: NSRect) {
+        Self::move_hover_highlight_with_spring(hover, frame, 360.0, 32.0);
+    }
+
+    /// Prime the hover pill at the clicked row while keeping it invisible until the next row.
+    /// 将悬停层预置到点击行并保持不可见，等待下一行进入时再播放移动动画。
+    pub(super) unsafe fn prime_hover_highlight(hover: *mut AnyObject, frame: NSRect) {
+        if hover.is_null() {
+            return;
+        }
+        let layer: *mut AnyObject = objc2::msg_send![hover, layer];
+        if layer.is_null() {
+            Self::set_frame_without_implicit_animation(hover, frame);
+            let _: () = objc2::msg_send![hover, setAlphaValue: 0.0f64];
+            return;
+        }
+        let opacity_key = crate::ffi::make_nsstring("settings-sidebar-hover-opacity");
+        let position_key = crate::ffi::make_nsstring("settings-sidebar-hover-spring");
+        let _: () = objc2::msg_send![layer, removeAnimationForKey: opacity_key];
+        let _: () = objc2::msg_send![layer, removeAnimationForKey: position_key];
+        crate::ffi::CFRelease(opacity_key as *const std::ffi::c_void);
+        crate::ffi::CFRelease(position_key as *const std::ffi::c_void);
+        Self::set_frame_without_implicit_animation(hover, frame);
+        let _: () = objc2::msg_send![layer, setOpacity: 0.0f32];
+    }
+
+    /// Move the primed hover pill from the clicked row and reveal it at the next row.
+    /// 将预置在点击行的悬停层移动到下一行并同步淡入。
+    pub(super) unsafe fn move_hover_highlight_after_selection(
+        hover: *mut AnyObject,
+        frame: NSRect,
+    ) {
+        if hover.is_null() {
+            return;
+        }
+        Self::spring_move_view(hover, frame, "settings-sidebar-hover-spring", 360.0, 32.0);
+        Self::fade_view(hover, 1.0, "settings-sidebar-hover-opacity");
+    }
+
+    pub(super) unsafe fn move_hover_highlight_on_reentry(hover: *mut AnyObject, frame: NSRect) {
+        Self::move_hover_highlight_with_spring(hover, frame, 500.0, 30.0);
     }
 
     /// Hide the shared hover pill after the pointer leaves the whole menu.

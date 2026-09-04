@@ -120,11 +120,15 @@ pub(crate) fn ui_palette() -> UiPalette {
     } else {
         UiPalette {
             dark: false,
-            window_bg: 0xFFFFFFB0,
-            sidebar_bg: 0xF2F2F4DB,
-            detail_bg: 0xFFFFFFB0,
+            // Match the light reference surfaces: #f6f7f9 window/detail, #f1f2f4 sidebar,
+            // and rgba(255,255,255,.82) grouped settings rows/cards.
+            // 对齐浅色参考图层：窗口/详情区为 #f6f7f9，侧栏为 #f1f2f4，分组设置条目/卡片为
+            // rgba(255,255,255,.82)。
+            window_bg: 0xF6F7F9FF,
+            sidebar_bg: 0xF1F2F4FF,
+            detail_bg: 0xF6F7F9FF,
             footer_bg: 0xF8F8F9D1,
-            card_bg: 0xFFFFFFE0,
+            card_bg: 0xFFFFFFD1,
             card_border: 0x00000012,
             separator: 0x00000016,
             field_bg: 0x7676801C,

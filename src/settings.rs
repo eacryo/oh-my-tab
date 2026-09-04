@@ -1489,9 +1489,9 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
     let tag: isize = unsafe { msg_send![btn, tag] };
     select_sidebar(tag as usize);
     unsafe {
-        // A clicked row may still carry the shared hover surface until AppKit emits mouseExited.
-        // 点击条目后 AppKit 可能尚未发送 mouseExited，先立即清理共享悬浮层，避免两层背景重叠。
-        widgets::clear_sidebar_hover();
+        // Keep an invisible origin at the clicked row so the next adjacent hover can glide from it.
+        // 点击后保留当前行的不可见起点，让下一次相邻悬停可以从这里滑过去。
+        widgets::prime_sidebar_hover_after_selection(btn);
     }
 }
 
@@ -1696,6 +1696,11 @@ fn show_settings() {
                 create_settings_window();
             }
         }
+        // A window order-out is not guaranteed to deliver mouseExited for its tracking areas;
+        // clear the shared hover state before reusing the settings window.
+        // 窗口 orderOut 不保证会为 tracking area 发送 mouseExited；复用设置窗口前先清理共享
+        // 悬停状态，避免旧条目在重新打开后留下幽灵高亮。
+        widgets::clear_sidebar_hover();
         load_settings_values();
         // 每次打开都复位到通用页(窗口复用、隐藏不销毁)。
         // Reset to the General page on every open (the window is reused / hidden, not destroyed).
@@ -1736,6 +1741,11 @@ fn hide_settings() {
         .map(|u| (u.window, u.glass_tint));
     unsafe {
         if let Some((window, well)) = window_and_well {
+            // orderOut can bypass the sidebar tracking-area exit callback, so do not leave the
+            // shared hover pill pointing at a row while the window is hidden.
+            // orderOut 可能绕过侧栏 tracking area 的退出回调，窗口隐藏前不能留下仍指向旧条目的
+            // 共享悬停气泡。
+            widgets::clear_sidebar_hover();
             // 先释放设置锁再关闭颜色面板,通知回调会重新访问 SETTINGS_UI。
             // Release the settings lock before closing the color panel; its notification callback
             // re-enters SETTINGS_UI.

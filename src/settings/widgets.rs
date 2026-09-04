@@ -226,6 +226,7 @@ pub(super) static SIDEBAR_BUTTON_CLASS: OnceLock<SidebarButtonClass> = OnceLock:
 pub(super) static SIDEBAR_SELECTED: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SIDEBAR_HOVERED: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SIDEBAR_HOVER_VISIBLE: AtomicBool = AtomicBool::new(false);
+pub(super) static SIDEBAR_HOVER_PRIMED: AtomicBool = AtomicBool::new(false);
 pub(super) static SIDEBAR_HOVER_HIGHLIGHT: LazyLock<Mutex<Option<ObjPtr>>> =
     LazyLock::new(|| Mutex::new(None));
 pub(super) static SIDEBAR_TITLE_LABELS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
@@ -315,7 +316,87 @@ pub(super) fn sidebar_button_is_hovered(button: *mut AnyObject) -> bool {
 /// 侧栏点击完成选中态切换后清理悬浮状态。
 pub(super) unsafe fn clear_sidebar_hover() {
     SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+    SIDEBAR_HOVER_PRIMED.store(false, Ordering::SeqCst);
     super::components::SettingsSidebar::hide_hover_highlight_immediately(sidebar_hover_highlight());
+}
+
+/// Keep a hidden hover origin at the clicked row for the next adjacent-row transition.
+/// 点击后在当前行保留不可见的悬停起点，供下一次相邻条目切换使用。
+pub(super) unsafe fn prime_sidebar_hover_after_selection(button: *mut AnyObject) {
+    SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+    let hover = sidebar_hover_highlight();
+    if hover.is_null() || button.is_null() {
+        SIDEBAR_HOVER_PRIMED.store(false, Ordering::SeqCst);
+        return;
+    }
+    let frame: NSRect = msg_send![button, frame];
+    SIDEBAR_HOVER_PRIMED.store(true, Ordering::SeqCst);
+    SIDEBAR_HOVER_VISIBLE.store(true, Ordering::SeqCst);
+    super::components::SettingsSidebar::prime_hover_highlight(hover, frame);
+}
+
+/// Find the visible sidebar button currently under the pointer instead of trusting a possibly
+/// delayed tracking-area callback.
+/// 根据当前指针位置查找可见的侧栏按钮，不直接信任可能延迟到达的 tracking area 回调。
+unsafe fn sidebar_button_under_pointer() -> Option<*mut AnyObject> {
+    let buttons: Vec<*mut AnyObject> = SIDEBAR_TITLE_LABELS
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .map(|button| button as *mut AnyObject)
+        .collect();
+
+    buttons.into_iter().find(|&button| {
+        let window: *mut AnyObject = msg_send![button, window];
+        if window.is_null() {
+            return false;
+        }
+        let visible: bool = msg_send![window, isVisible];
+        let hidden: bool = msg_send![button, isHidden];
+        if !visible || hidden {
+            return false;
+        }
+        let mouse: NSPoint = msg_send![window, mouseLocationOutsideOfEventStream];
+        let local: NSPoint = msg_send![
+            button,
+            convertPoint: mouse,
+            fromView: std::ptr::null::<AnyObject>()
+        ];
+        let bounds: NSRect = msg_send![button, bounds];
+        local.x >= bounds.origin.x
+            && local.x <= bounds.origin.x + bounds.size.width
+            && local.y >= bounds.origin.y
+            && local.y <= bounds.origin.y + bounds.size.height
+    })
+}
+
+/// Reconcile the shared hover pill with one concrete sidebar button.
+/// 将共享悬停气泡与一个确定的侧栏按钮重新同步。
+unsafe fn apply_sidebar_hover(button: *mut AnyObject, reentering_sidebar: bool) {
+    if button.is_null() {
+        return;
+    }
+    let tag: isize = msg_send![button, tag];
+    if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
+        SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+        SIDEBAR_HOVER_PRIMED.store(false, Ordering::SeqCst);
+        super::components::SettingsSidebar::hide_hover_highlight(sidebar_hover_highlight());
+        return;
+    }
+    SIDEBAR_HOVERED.store(button as usize, Ordering::SeqCst);
+    let hover = sidebar_hover_highlight();
+    if !hover.is_null() {
+        let frame: NSRect = msg_send![button, frame];
+        if SIDEBAR_HOVER_PRIMED.swap(false, Ordering::SeqCst) {
+            super::components::SettingsSidebar::move_hover_highlight_after_selection(hover, frame);
+        } else if reentering_sidebar {
+            super::components::SettingsSidebar::move_hover_highlight_on_reentry(hover, frame);
+        } else {
+            super::components::SettingsSidebar::move_hover_highlight(hover, frame);
+        }
+    }
+    set_sidebar_hovered(button, true);
 }
 
 pub(super) extern "C" fn sidebar_hover_tracker_mouse_entered(
@@ -323,9 +404,18 @@ pub(super) extern "C" fn sidebar_hover_tracker_mouse_entered(
     _cmd: Sel,
     _event: *mut c_void,
 ) {
-    // The row callbacks own the current item; the container callback only establishes the
-    // boundary that decides when the shared hover surface may disappear.
-    // 条目回调负责当前条目；容器回调只定义共享悬浮层何时可以消失的边界。
+    unsafe {
+        // Re-entering from the detail pane can skip a child button's mouseEntered callback. Use
+        // the current pointer location to restore the actual row instead of the stale last row.
+        // 从详情区重新进入侧栏时可能漏掉子按钮的 mouseEntered 回调；根据当前指针位置恢复
+        // 真实条目，避免悬停层停留在上一次的最后一栏。
+        if let Some(button) = sidebar_button_under_pointer() {
+            apply_sidebar_hover(button, true);
+        } else {
+            SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+            super::components::SettingsSidebar::hide_hover_highlight(sidebar_hover_highlight());
+        }
+    }
 }
 
 pub(super) extern "C" fn sidebar_hover_tracker_mouse_exited(
@@ -335,6 +425,7 @@ pub(super) extern "C" fn sidebar_hover_tracker_mouse_exited(
 ) {
     unsafe {
         SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+        SIDEBAR_HOVER_PRIMED.store(false, Ordering::SeqCst);
         let hover = sidebar_hover_highlight();
         super::components::SettingsSidebar::hide_hover_highlight(hover);
     }
@@ -404,19 +495,21 @@ pub(super) extern "C" fn sidebar_button_mouse_entered(
 ) {
     unsafe {
         let button = this as *mut AnyObject;
-        let tag: isize = msg_send![button, tag];
-        if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
-            SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
-            super::components::SettingsSidebar::hide_hover_highlight(sidebar_hover_highlight());
+        // Tracking callbacks may arrive after the pointer has moved into another pane or row.
+        // Reconcile against the current pointer before moving the shared hover surface.
+        // tracking 回调可能在指针已移入其他区域或条目后才到达；移动共享悬停层前先按当前
+        // 指针位置重新校准。
+        let current = sidebar_button_under_pointer();
+        if current != Some(button) {
+            if let Some(current) = current {
+                apply_sidebar_hover(current, false);
+            } else {
+                SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+                super::components::SettingsSidebar::hide_hover_highlight(sidebar_hover_highlight());
+            }
             return;
         }
-        SIDEBAR_HOVERED.store(button as usize, Ordering::SeqCst);
-        let hover = sidebar_hover_highlight();
-        if !hover.is_null() {
-            let frame: NSRect = msg_send![button, frame];
-            super::components::SettingsSidebar::move_hover_highlight(hover, frame);
-        }
-        set_sidebar_hovered(button, true);
+        apply_sidebar_hover(button, false);
     }
 }
 
