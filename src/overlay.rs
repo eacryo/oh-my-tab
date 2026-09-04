@@ -3258,7 +3258,7 @@ pub(crate) fn create_card_view(
             // --- 标题(左对齐,尾部截断;应用名沉到底部状态栏) ---
             // --- Title (left-aligned, tail-truncated; the app name sinks into the
             // status footer) ---
-            let title_x = THUMB_PAD + mini_sz + 8.0;
+            let title_x = THUMB_PAD + mini_sz + THUMB_CAPTION_ICON_GAP;
             let close_sz = 24.0;
             let title_w = (card_width - title_x - close_sz - THUMB_PAD).max(20.0);
             let title_size = card_title_font_size();

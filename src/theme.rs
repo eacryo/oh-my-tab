@@ -320,6 +320,8 @@ pub(crate) const THUMB_SCROLL_TEASER_RATIO: f64 = 1.0 / 3.0;
 pub(crate) const THUMB_PAD: f64 = 8.0;
 /// 标题行高(设计稿 .caption 34px 含 7px 底距,取净高 24)。/ Caption row height.
 pub(crate) const THUMB_CAPTION_H: f64 = 24.0;
+/// 标题行内小图标与窗口标题的间距。/ Gap between the caption icon and window title.
+pub(crate) const THUMB_CAPTION_ICON_GAP: f64 = 6.0;
 /// 标题行与预览区的间距。/ Gap between caption and preview.
 pub(crate) const THUMB_GAP: f64 = 6.0;
 /// 预览区宽高比(设计稿 aspect-ratio 16/10)。/ Preview aspect ratio (16/10).
