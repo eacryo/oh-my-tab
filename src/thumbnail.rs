@@ -310,6 +310,12 @@ impl<K: Eq + Clone, V: Clone> Lru<K, V> {
         self.items.len()
     }
 
+    /// 快照当前缓存键,不改变 LRU 顺序。
+    /// Snapshot current cache keys without changing LRU order.
+    pub(crate) fn keys(&self) -> Vec<K> {
+        self.items.iter().map(|(key, _)| key.clone()).collect()
+    }
+
     /// 记账总成本(驱逐判定用的同一计数;内存采样器直接读)。
     /// Total accounted cost (the same counter the eviction check uses; the memory
     /// sampler reads it directly).
@@ -1416,6 +1422,81 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
         required_px_h
     );
     log_capture_metrics("summon");
+}
+
+/// 主题切换后强制重拍当前窗口集合,不使用召唤期的 TTL/前台判断。
+/// Force a recapture of the current window set after a theme change, bypassing
+/// summon-time TTL and frontmost/background freshness decisions.
+///
+/// The cache stores real window pixels, so changing the system appearance can
+/// leave a dark/light surface stale even though the card itself is rebuilt.
+pub(crate) fn refresh_for_theme(required_px_h: u32) {
+    if !crate::theme::thumbnails_enabled() {
+        return;
+    }
+    if !capture_allowed() {
+        request_permission_once();
+        return;
+    }
+
+    // Snapshot keys before enqueueing: enqueue_job takes CAPTURE_STATE and may
+    // wake the worker, so never hold TAB_STATE across the queue operations.
+    // 入队前先快照 key,避免持有 TAB_STATE 时进入捕获队列锁并唤醒 worker。
+    let (selected, state_keys): (Option<ThumbKey>, Vec<ThumbKey>) = {
+        let state_opt = crate::TAB_STATE.lock().unwrap();
+        match state_opt.as_ref() {
+            Some(state) => {
+                let selected = state.windows.get(state.selected).map(|window| ThumbKey {
+                    pid: window.pid,
+                    wid: window.window_id,
+                });
+                let keys = state
+                    .windows
+                    .iter()
+                    .filter(|window| {
+                        !window.minimized && window.bounds.2 > 0.0 && window.bounds.3 > 0.0
+                    })
+                    .map(|window| ThumbKey {
+                        pid: window.pid,
+                        wid: window.window_id,
+                    })
+                    .collect();
+                (selected, keys)
+            }
+            None => (None, Vec::new()),
+        }
+    };
+
+    // Include pre-generated/cache-only windows as well. The settings window can change theme
+    // before the first switcher summon, when TAB_STATE has no current snapshot yet.
+    // 同时纳入启动预热或仅存在于缓存中的窗口:用户可能在首次召唤切换器前就切换主题,
+    // 此时 TAB_STATE 还没有窗口快照。
+    let keys: Vec<ThumbKey> = {
+        let mut keys: HashSet<ThumbKey> = state_keys.into_iter().collect();
+        keys.extend(CACHE.lock().unwrap().keys());
+        keys.into_iter().collect()
+    };
+
+    let target_px_h = required_px_h.max(BASE_TARGET_PX_H);
+    let requested = keys.len();
+    let mut enqueued = 0usize;
+    for key in keys {
+        let priority = if selected == Some(key) {
+            CapturePriority::Selected
+        } else {
+            // Visible priority deliberately bypasses the interaction gate so
+            // every card is refreshed as part of one theme transition.
+            CapturePriority::Visible
+        };
+        enqueued += usize::from(enqueue_job(key.pid, key.wid, target_px_h, priority));
+    }
+    log_debug!(
+        "[thumb] theme refresh: requested={} enqueued={} target_h={}",
+        requested,
+        enqueued,
+        target_px_h
+    );
+    log_capture_metrics("theme");
 }
 
 fn activation_capture_is_valid(

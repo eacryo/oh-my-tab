@@ -165,6 +165,10 @@ static THUMB_DOCUMENT_HEIGHT: Mutex<f64> = Mutex::new(0.0);
 /// 当前卡片预览所需的像素高度,滚动进入新行时复用同一捕获规格。
 /// Current preview pixel demand, reused when scrolling into a new row.
 static THUMB_CAPTURE_TARGET_PX_H: Mutex<u32> = Mutex::new(512);
+/// Last resolved palette used by `apply_theme`; prevents unrelated config changes from forcing
+/// a full thumbnail recapture when the effective light/dark appearance is unchanged.
+/// `apply_theme` 使用的上一次最终调色板;有效明暗未变化时,普通配置热重载不应触发全量重拍。
+static LAST_APPLIED_THEME_DARK: Mutex<Option<bool>> = Mutex::new(None);
 /// 当前完整布局的行间距(卡片高度 + 行间距),供键盘整行导航复用。
 /// Current full-layout row pitch (card height + row gap), reused by whole-row keyboard navigation.
 static THUMB_SCROLL_ROW_PITCH: Mutex<f64> = Mutex::new(1.0);
@@ -216,6 +220,9 @@ struct CardSignature {
     window_title: String,
     icon_path: Option<String>,
     minimized: bool,
+    /// Resolved light/dark state used when the card's text and layers were painted.
+    /// 卡片文字和图层绘制时采用的最终明暗状态。
+    theme_dark: bool,
     card_width_bits: u64,
     card_height_bits: u64,
     thumbnail_layout: bool,
@@ -251,6 +258,7 @@ fn card_signature(
         window_title: window.window_title.clone(),
         icon_path: window.icon_path.clone(),
         minimized: window.minimized,
+        theme_dark: crate::theme::resolved_is_dark(),
         card_width_bits: frame.size.width.to_bits(),
         card_height_bits: frame.size.height.to_bits(),
         thumbnail_layout,
@@ -704,6 +712,7 @@ mod tests {
             window_title: title.into(),
             icon_path: None,
             minimized: false,
+            theme_dark: false,
             card_width_bits: 100.0f64.to_bits(),
             card_height_bits: 100.0f64.to_bits(),
             thumbnail_layout: true,
@@ -2860,12 +2869,18 @@ pub(crate) fn apply_theme() {
         .map(|state| (0..state.windows.len()).collect::<Vec<_>>())
         .unwrap_or_default();
 
+    let is_dark = crate::theme::resolved_is_dark();
+    let theme_changed = {
+        let mut last = LAST_APPLIED_THEME_DARK.lock().unwrap();
+        let changed = *last != Some(is_dark);
+        *last = Some(is_dark);
+        changed
+    };
+
     unsafe {
         // 主题来源于 config 的解析结果;显式主题由设置页保存,auto 主题由系统外观通知触发刷新。
         // The theme comes from the resolved config; explicit themes are saved by Settings, while
         // auto themes are refreshed from the system appearance notification.
-        let is_dark = crate::theme::resolved_is_dark();
-
         // Update window appearance for blur material tint
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
             let appearance_name = if is_dark {
@@ -2888,6 +2903,15 @@ pub(crate) fn apply_theme() {
         refresh_highlight();
     } else {
         rebuild_cards(&visible_indices);
+    }
+    // Theme changes also alter the pixels inside captured application windows. Rebuild the card
+    // tree immediately and force a fresh capture for every known window so the next preview does
+    // not keep a frame from the previous light/dark appearance.
+    // 主题变化也会改变应用窗口截图中的像素。先立即重建卡片树,再强制重拍所有已知窗口,
+    // 避免预览继续显示切换前的明暗主题。
+    if theme_changed {
+        let target_px_h = *THUMB_CAPTURE_TARGET_PX_H.lock().unwrap();
+        crate::thumbnail::refresh_for_theme(target_px_h);
     }
     update_status_label();
 }
