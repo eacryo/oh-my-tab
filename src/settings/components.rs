@@ -571,7 +571,7 @@ impl SettingsSidebarIcon {
             // 左右对分的矩形呼应“半屏/四分屏”的窗口控制语义。
             // A rectangle split into left/right halves mirrors the window-control
             // half-screen/quarter-snapping semantics.
-            Self::WindowControl => "rectangle.split.2x1",
+            Self::WindowControl => "rectangle.split.2x2",
             Self::About => "info.circle",
         }
     }

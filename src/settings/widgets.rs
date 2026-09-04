@@ -808,12 +808,35 @@ pub(super) const HTML_SWITCH_KNOB_D: f64 = 18.0;
 // Keep switches on the same trailing edge as popup fields in the settings column.
 // 开关与设置列中的下拉框共用同一条右侧边界。
 pub(super) const HTML_SWITCH_TRAILING_INSET: f64 = 0.0;
+const HTML_SWITCH_SPRING_MASS: f64 = 4.0;
+const HTML_SWITCH_SPRING_STIFFNESS: f64 = 800.0;
+const HTML_SWITCH_SPRING_DAMPING: f64 = 80.0;
+const HTML_SWITCH_PRESS_SCALE: f64 = 0.9;
 
 pub(super) struct HtmlSwitchClass(*mut AnyObject);
 unsafe impl Send for HtmlSwitchClass {}
 unsafe impl Sync for HtmlSwitchClass {}
 
 pub(super) static HTML_SWITCH_CLASS: OnceLock<HtmlSwitchClass> = OnceLock::new();
+
+/// Return the custom knob layer after the switch has been initialized.
+/// 返回开关初始化后创建的自定义滑块图层。
+unsafe fn html_switch_knob(button: *mut AnyObject) -> *mut AnyObject {
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if layer.is_null() {
+        return std::ptr::null_mut();
+    }
+    let sublayers: *mut AnyObject = msg_send![layer, sublayers];
+    if sublayers.is_null() {
+        return std::ptr::null_mut();
+    }
+    let count: usize = msg_send![sublayers, count];
+    if count == 0 {
+        std::ptr::null_mut()
+    } else {
+        msg_send![sublayers, objectAtIndex: 0usize]
+    }
+}
 
 pub(super) unsafe fn html_switch_apply_visual(
     button: *mut AnyObject,
@@ -891,7 +914,7 @@ pub(super) unsafe fn html_switch_apply_visual(
     if let Some(from_x) = from_x.filter(|x| *x != to_x) {
         let key_path = make_nsstring("position.x");
         let animation: *mut AnyObject = msg_send![
-            class!(CABasicAnimation),
+            class!(CASpringAnimation),
             animationWithKeyPath: key_path
         ];
         CFRelease(key_path as *const c_void);
@@ -901,11 +924,46 @@ pub(super) unsafe fn html_switch_apply_visual(
             msg_send![class!(NSNumber), numberWithDouble: to_x + HTML_SWITCH_KNOB_D / 2.0];
         let _: () = msg_send![animation, setFromValue: from_value];
         let _: () = msg_send![animation, setToValue: to_value];
-        let _: () = msg_send![animation, setDuration: 0.18f64];
+        let _: () = msg_send![animation, setMass: HTML_SWITCH_SPRING_MASS];
+        let _: () = msg_send![animation, setStiffness: HTML_SWITCH_SPRING_STIFFNESS];
+        let _: () = msg_send![animation, setDamping: HTML_SWITCH_SPRING_DAMPING];
+        let _: () = msg_send![animation, setInitialVelocity: 0.0f64];
+        let settling_duration: f64 = msg_send![animation, settlingDuration];
+        let _: () = msg_send![animation, setDuration: settling_duration.max(0.18)];
         let animation_key = make_nsstring("html-switch-position");
         let _: () = msg_send![knob, addAnimation: animation, forKey: animation_key];
         CFRelease(animation_key as *const c_void);
     }
+}
+
+/// Give the knob a short press-and-release response when the custom button is clicked.
+/// 自绘开关点击时让滑块短暂压缩并回弹,提供轻微的按下反馈。
+unsafe fn html_switch_animate_press(button: *mut AnyObject) {
+    let knob = html_switch_knob(button);
+    if knob.is_null() {
+        return;
+    }
+
+    // A keyframe keeps the model transform unchanged, so the switch is ready for the next
+    // click even if the next state change arrives before this feedback finishes.
+    // 使用关键帧而不修改模型变换,即使下一次点击提前到来,也不会累积缩放状态。
+    let key_path = make_nsstring("transform.scale");
+    let animation: *mut AnyObject = msg_send![
+        class!(CAKeyframeAnimation),
+        animationWithKeyPath: key_path
+    ];
+    CFRelease(key_path as *const c_void);
+
+    let values: *mut AnyObject = msg_send![class!(NSMutableArray), array];
+    for scale in [1.0, HTML_SWITCH_PRESS_SCALE, 1.0] {
+        let value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: scale];
+        let _: () = msg_send![values, addObject: value];
+    }
+    let _: () = msg_send![animation, setValues: values];
+    let _: () = msg_send![animation, setDuration: 0.22f64];
+    let animation_key = make_nsstring("html-switch-press");
+    let _: () = msg_send![knob, addAnimation: animation, forKey: animation_key];
+    CFRelease(animation_key as *const c_void);
 }
 
 pub(super) extern "C" fn html_switch_set_state(this: *mut c_void, _cmd: Sel, state: isize) {
@@ -951,6 +1009,7 @@ pub(super) extern "C" fn html_switch_mouse_down(this: *mut c_void, _cmd: Sel, _e
 
         let current: isize = msg_send![button, state];
         let next = if current == 0 { 1isize } else { 0isize };
+        html_switch_animate_press(button);
         let _: () = msg_send![button, setState: next];
 
         // Most settings switches only need their state collected when OK is pressed. The two

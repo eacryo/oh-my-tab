@@ -268,7 +268,7 @@ impl SettingsTooltip {
             let _: () = objc2::msg_send![layer, setBorderWidth: 1.0f64];
         }
 
-        let icon_frame = NSRect::new(NSPoint::new(14.0, 10.0), NSSize::new(16.0, 16.0));
+        let mut icon_view: *mut AnyObject = std::ptr::null_mut();
         let symbol_ns = crate::ffi::make_nsstring("info.circle.fill");
         let image: *mut AnyObject = objc2::msg_send![
             objc2::class!(NSImage),
@@ -278,12 +278,16 @@ impl SettingsTooltip {
         crate::ffi::CFRelease(symbol_ns as *const c_void);
         if !image.is_null() {
             let icon: *mut AnyObject = objc2::msg_send![objc2::class!(NSImageView), alloc];
-            let icon: *mut AnyObject = objc2::msg_send![icon, initWithFrame: icon_frame];
+            let icon: *mut AnyObject = objc2::msg_send![
+                icon,
+                initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(16.0, 16.0))
+            ];
             let _: () = objc2::msg_send![icon, setImage: image];
             let _: () = objc2::msg_send![icon, setImageScaling: 3isize];
             let tint = crate::ffi::hex_to_ns_color(palette.accent);
             let _: () = objc2::msg_send![icon, setContentTintColor: tint];
             let _: () = objc2::msg_send![bubble, addSubview: icon];
+            icon_view = icon;
             crate::ffi::release_obj(icon);
         }
 
@@ -291,11 +295,8 @@ impl SettingsTooltip {
         let label: *mut AnyObject = objc2::msg_send![
             label,
             initWithFrame: NSRect::new(
-                // Keep the single-line field close to the font's line height; a taller field
-                // makes AppKit place the baseline visibly above the bubble's center.
-                // 单行文本框高度贴近字体行高；frame 过高会让 AppKit 的基线明显偏向气泡上方。
-                NSPoint::new(38.0, 10.0),
-                NSSize::new(bubble_size.width - 52.0, 16.0),
+                NSPoint::new(0.0, 10.0),
+                NSSize::new(bubble_size.width, 16.0),
             )
         ];
         let text_ns = crate::ffi::make_nsstring(text);
@@ -304,7 +305,7 @@ impl SettingsTooltip {
         let _: () = objc2::msg_send![label, setBezeled: false];
         let _: () = objc2::msg_send![label, setDrawsBackground: false];
         let _: () = objc2::msg_send![label, setEditable: false];
-        let _: () = objc2::msg_send![label, setAlignment: 1isize];
+        let _: () = objc2::msg_send![label, setAlignment: 0isize];
         let _: () = objc2::msg_send![label, setUsesSingleLineMode: true];
         let _: () = objc2::msg_send![label, setLineBreakMode: 4isize];
         let font: *mut AnyObject = objc2::msg_send![
@@ -315,6 +316,39 @@ impl SettingsTooltip {
         let _: () = objc2::msg_send![label, setFont: font];
         let color = crate::ffi::hex_to_ns_color(palette.primary_text);
         let _: () = objc2::msg_send![label, setTextColor: color];
+
+        // Center the icon and the measured text as one group, keeping their gap stable for every
+        // localized message instead of centering the text in the remaining bubble width.
+        // 将图标和按实际宽度测量出的文本作为整体居中，避免不同语言下文本在剩余宽度中单独居中。
+        let cell: *mut AnyObject = objc2::msg_send![label, cell];
+        let measured: NSSize = if cell.is_null() {
+            NSSize::new(0.0, 0.0)
+        } else {
+            objc2::msg_send![
+                cell,
+                cellSizeForBounds: NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(1000.0, 16.0),
+                )
+            ]
+        };
+        let max_text_width = bubble_size.width - 28.0 - 16.0 - 7.0;
+        let text_width = measured.width.clamp(1.0, max_text_width);
+        let group_width = 16.0 + 7.0 + text_width;
+        let group_x = ((bubble_size.width - group_width) / 2.0).max(14.0);
+        if !icon_view.is_null() {
+            let _: () = objc2::msg_send![
+                icon_view,
+                setFrame: NSRect::new(NSPoint::new(group_x, 10.0), NSSize::new(16.0, 16.0))
+            ];
+        }
+        let _: () = objc2::msg_send![
+            label,
+            setFrame: NSRect::new(
+                NSPoint::new(group_x + 23.0, 10.0),
+                NSSize::new(text_width, 16.0),
+            )
+        ];
         let _: () = objc2::msg_send![bubble, addSubview: label];
         crate::ffi::release_obj(label);
         let _: () = objc2::msg_send![content, addSubview: bubble];
