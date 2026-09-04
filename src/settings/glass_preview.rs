@@ -335,7 +335,7 @@ pub(super) unsafe fn add_preview_caption(
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let color = crate::ffi::hex_to_ns_color(settings_palette().secondary_text);
+    let color = settings_text_color(SettingsTextRole::Secondary);
     let font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 11.0f64];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setFont: font];

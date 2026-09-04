@@ -166,6 +166,7 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             let _: () = msg_send![label, setBezeled: false];
             let _: () = msg_send![label, setDrawsBackground: false];
             let _: () = msg_send![label, setEditable: false];
+            apply_settings_text_role(label, SettingsTextRole::Primary);
             let name_ns = make_nsstring(&button_name(btn));
             let _: () = msg_send![label, setStringValue: name_ns];
             CFRelease(name_ns as *const c_void);
@@ -180,6 +181,7 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             let _: () = msg_send![desc_label, setBezeled: false];
             let _: () = msg_send![desc_label, setDrawsBackground: false];
             let _: () = msg_send![desc_label, setEditable: false];
+            apply_settings_text_role(desc_label, SettingsTextRole::Primary);
             let _: () = msg_send![desc_label, setEnabled: mappings_on];
             if !is_key && action_idx > 0 {
                 // 系统动作/None 的动作名文本(用 i18n 标签)。
@@ -268,6 +270,7 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
                     let _: () = msg_send![cap, setBezeled: false];
                     let _: () = msg_send![cap, setDrawsBackground: false];
                     let _: () = msg_send![cap, setEditable: false];
+                    apply_settings_text_role(cap, SettingsTextRole::Primary);
                     let _: () = msg_send![cap, setAlignment: 1isize]; // center
                     let _: () = msg_send![cap, setEnabled: mappings_on];
                     let ch_ns = make_nsstring(&ch.to_string());
@@ -784,6 +787,7 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             let _: () = msg_send![t_label, setBezeled: false];
             let _: () = msg_send![t_label, setDrawsBackground: false];
             let _: () = msg_send![t_label, setEditable: false];
+            apply_settings_text_role(t_label, SettingsTextRole::Secondary);
             let t_label_ns = make_nsstring(&t("settings.mapping_panel_trigger"));
             let _: () = msg_send![t_label, setStringValue: t_label_ns];
             CFRelease(t_label_ns as *const c_void);
@@ -795,6 +799,7 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             let _: () = msg_send![btn_label, setBezeled: false];
             let _: () = msg_send![btn_label, setDrawsBackground: false];
             let _: () = msg_send![btn_label, setEditable: false];
+            apply_settings_text_role(btn_label, SettingsTextRole::Primary);
             let _: () = msg_send![ve, addSubview: btn_label];
             release_obj(btn_label);
             let rec_btn = SettingsButton::action(
@@ -814,6 +819,7 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             let _: () = msg_send![a_label, setBezeled: false];
             let _: () = msg_send![a_label, setDrawsBackground: false];
             let _: () = msg_send![a_label, setEditable: false];
+            apply_settings_text_role(a_label, SettingsTextRole::Secondary);
             let a_label_ns = make_nsstring(&t("settings.mapping_panel_action"));
             let _: () = msg_send![a_label, setStringValue: a_label_ns];
             CFRelease(a_label_ns as *const c_void);
@@ -852,6 +858,7 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             let _: () = msg_send![combo_label, setBezeled: false];
             let _: () = msg_send![combo_label, setDrawsBackground: false];
             let _: () = msg_send![combo_label, setEditable: false];
+            apply_settings_text_role(combo_label, SettingsTextRole::Primary);
             let _: () = msg_send![combo_label, setHidden: true];
             let _: () = msg_send![ve, addSubview: combo_label];
             release_obj(combo_label);

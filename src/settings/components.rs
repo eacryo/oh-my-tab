@@ -213,12 +213,12 @@ impl SettingsRow {
 
         let is_text_field: bool = objc2::msg_send![view, isKindOfClass: objc2::class!(NSTextField)];
         if is_text_field {
-            let color = if enabled {
-                crate::ffi::hex_to_ns_color(crate::theme::ui_palette().primary_text)
+            let role = if enabled {
+                widgets::SettingsTextRole::Primary
             } else {
-                crate::ffi::hex_to_ns_color(crate::theme::ui_palette().muted_text)
+                widgets::SettingsTextRole::Disabled
             };
-            let _: () = objc2::msg_send![view, setTextColor: color];
+            widgets::apply_settings_text_role(view, role);
         } else if !objc2::msg_send![view, respondsToSelector: objc2::sel!(setEnabled:)]
             && objc2::msg_send![view, respondsToSelector: objc2::sel!(setAlphaValue:)]
         {

@@ -15,6 +15,51 @@ pub(super) fn settings_palette() -> UiPalette {
     ui_palette()
 }
 
+/// Semantic text roles used by every settings label and control.
+/// 设置界面所有文字和控件统一使用语义化颜色角色。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SettingsTextRole {
+    Primary,
+    Secondary,
+    Sidebar,
+    Muted,
+    Disabled,
+    Accent,
+    AccentHover,
+    OnAccent,
+}
+
+/// Resolve one text role from the active light/dark palette.
+/// 从当前明暗主题调色板解析一个文字角色。
+pub(super) fn settings_text_color(role: SettingsTextRole) -> *mut AnyObject {
+    let palette = settings_palette();
+    let color = match role {
+        SettingsTextRole::Primary => palette.primary_text,
+        SettingsTextRole::Secondary => palette.secondary_text,
+        SettingsTextRole::Sidebar => palette.sidebar_text,
+        SettingsTextRole::Muted => palette.muted_text,
+        SettingsTextRole::Disabled => palette.disabled_text,
+        SettingsTextRole::Accent => palette.accent,
+        SettingsTextRole::AccentHover => palette.accent_hover,
+        SettingsTextRole::OnAccent => 0xFFFFFFFF,
+    };
+    crate::ffi::hex_to_ns_color(color)
+}
+
+/// Apply a semantic text role to a text-bearing AppKit view.
+/// 将语义化文字颜色应用到承载文字的 AppKit view。
+pub(super) unsafe fn apply_settings_text_role(view: *mut AnyObject, role: SettingsTextRole) {
+    if view.is_null() {
+        return;
+    }
+    let color = settings_text_color(role);
+    if msg_send![view, respondsToSelector: sel!(setTextColor:)] {
+        let _: () = msg_send![view, setTextColor: color];
+    } else if msg_send![view, respondsToSelector: sel!(setContentTintColor:)] {
+        let _: () = msg_send![view, setContentTintColor: color];
+    }
+}
+
 /// Map legacy HTML reference colors to the corresponding role in the active palette. Keeping
 /// this compatibility layer lets the many settings controls share one dark/light implementation
 /// without changing their layout-specific call sites.
@@ -194,7 +239,7 @@ pub(super) extern "C" fn external_link_mouse_entered(
     _event: *mut c_void,
 ) {
     unsafe {
-        let color: *mut AnyObject = msg_send![class!(NSColor), systemBlueColor];
+        let color = settings_text_color(SettingsTextRole::AccentHover);
         let _: () = msg_send![this as *mut AnyObject, setTextColor: color];
         let cursor: *mut AnyObject = msg_send![class!(NSCursor), pointingHandCursor];
         let _: () = msg_send![cursor, set];
@@ -207,7 +252,7 @@ pub(super) extern "C" fn external_link_mouse_exited(
     _event: *mut c_void,
 ) {
     unsafe {
-        let color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
+        let color = settings_text_color(SettingsTextRole::Accent);
         let _: () = msg_send![this as *mut AnyObject, setTextColor: color];
         let cursor: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
         let _: () = msg_send![cursor, set];
@@ -473,8 +518,7 @@ pub(super) unsafe fn make_value_label(
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
     let _: () = msg_send![label, setFont: font];
-    let color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
-    let _: () = msg_send![label, setTextColor: color];
+    apply_settings_text_role(label, SettingsTextRole::Primary);
     label
 }
 
@@ -504,8 +548,7 @@ pub(super) unsafe fn make_external_link(
     let _: () = msg_send![link, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
     let _: () = msg_send![link, setFont: font];
-    let color: *mut AnyObject = msg_send![class!(NSColor), linkColor];
-    let _: () = msg_send![link, setTextColor: color];
+    apply_settings_text_role(link, SettingsTextRole::Accent);
     let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
     let tracking: *mut AnyObject = msg_send![
         tracking,
@@ -868,7 +911,7 @@ pub(super) unsafe fn make_text_input(
                                                         // The rounded layer below is the sole background surface. Keeping the cell background off
                                                         // avoids a second, darker strip when the custom cell draws inside its centered rect.
     let _: () = msg_send![field, setDrawsBackground: false];
-    let field_text = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let field_text = settings_text_color(SettingsTextRole::Primary);
     let _: () = msg_send![field, setTextColor: field_text];
     let _: () = msg_send![field, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![field, layer];
@@ -2244,11 +2287,11 @@ pub(super) unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selecte
     } else {
         msg_send![class!(NSFont), messageFontOfSize: 13.5f64]
     };
-    let color: *mut AnyObject = if selected {
-        msg_send![class!(NSColor), controlAccentColor]
+    let color = settings_text_color(if selected {
+        SettingsTextRole::Accent
     } else {
-        crate::ffi::hex_to_ns_color(settings_palette().secondary_text)
-    };
+        SettingsTextRole::Sidebar
+    });
     set_sidebar_title_appearance(btn, title, font, color);
     if let Some(icon) = SIDEBAR_ICON_VIEWS
         .lock()
@@ -2272,11 +2315,10 @@ unsafe fn set_sidebar_hovered(btn: *mut AnyObject, hovered: bool) {
     if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
         return;
     }
-    let palette = settings_palette();
-    let color = crate::ffi::hex_to_ns_color(if hovered {
-        palette.primary_text
+    let color = settings_text_color(if hovered {
+        SettingsTextRole::Primary
     } else {
-        palette.secondary_text
+        SettingsTextRole::Sidebar
     });
     let label = SIDEBAR_TITLE_LABELS
         .lock()
@@ -2431,7 +2473,7 @@ pub(super) unsafe fn make_sidebar_button(
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let label_color = crate::ffi::hex_to_ns_color(settings_palette().secondary_text);
+    let label_color = settings_text_color(SettingsTextRole::Sidebar);
     let _: () = msg_send![label, setTextColor: label_color];
     let _: () = msg_send![label, setSelectable: false];
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
@@ -2487,8 +2529,7 @@ pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f
     let _: () = msg_send![label, setEditable: false];
     let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 12.0f64];
     let _: () = msg_send![label, setFont: font];
-    let color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
-    let _: () = msg_send![label, setTextColor: color];
+    apply_settings_text_role(label, SettingsTextRole::Secondary);
     // 自适应:宽度随父视图拉伸、顶部锚定(MinYMargin)。autoresizing = WidthSizable | MinYMargin = 2|8 = 10。
     // Adaptive: stretch width with the parent, stay top-anchored (MinYMargin).
     let _: () = msg_send![label, setAutoresizingMask: 10u64];
@@ -2513,8 +2554,7 @@ pub(super) unsafe fn add_page_title(parent: *mut AnyObject, text: &str, x: f64, 
     if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
         let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
     }
-    let color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
-    let _: () = msg_send![label, setTextColor: color];
+    apply_settings_text_role(label, SettingsTextRole::Primary);
     let _: () = msg_send![label, setAutoresizingMask: 10u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
@@ -2758,7 +2798,7 @@ pub(super) unsafe fn add_row_with_label(
     // Left-aligned: the row label hugs the content area's left edge (NSTextAlignmentLeft = 0,
     // identical on arm64 and x86_64).
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
-    let label_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let label_color = settings_text_color(SettingsTextRole::Primary);
     let _: () = msg_send![label, setTextColor: label_color];
     let _: () = msg_send![label, setUsesSingleLineMode: false];
     let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
@@ -2804,7 +2844,7 @@ pub(super) unsafe fn add_described_row(
     let _: () = msg_send![title_label, setBezeled: false];
     let _: () = msg_send![title_label, setDrawsBackground: false];
     let _: () = msg_send![title_label, setEditable: false];
-    let title_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let title_color = settings_text_color(SettingsTextRole::Primary);
     let _: () = msg_send![title_label, setTextColor: title_color];
     let _: () = msg_send![title_label, setAlignment: -1isize]; // NSTextAlignmentNatural
     let _: () = msg_send![title_label, setUsesSingleLineMode: true];
@@ -2842,7 +2882,7 @@ pub(super) unsafe fn add_tall_row(
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
-    let label_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let label_color = settings_text_color(SettingsTextRole::Primary);
     let _: () = msg_send![label, setTextColor: label_color];
     let font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.5f64];
     let _: () = msg_send![label, setFont: font];

@@ -2950,7 +2950,7 @@ fn create_settings_window() {
         let app_title_font: *mut AnyObject =
             msg_send![class!(NSFont), boldSystemFontOfSize: 15.0f64];
         let _: () = msg_send![app_title, setFont: app_title_font];
-        let app_title_color = crate::ffi::hex_to_ns_color(palette.primary_text);
+        let app_title_color = settings_text_color(SettingsTextRole::Primary);
         let _: () = msg_send![app_title, setTextColor: app_title_color];
         let _: () = msg_send![sidebar_view, addSubview: app_title];
         release_obj(app_title);
@@ -2969,7 +2969,7 @@ fn create_settings_window() {
         let app_subtitle_font: *mut AnyObject =
             msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
         let _: () = msg_send![app_subtitle, setFont: app_subtitle_font];
-        let app_subtitle_color = crate::ffi::hex_to_ns_color(palette.muted_text);
+        let app_subtitle_color = settings_text_color(SettingsTextRole::Muted);
         let _: () = msg_send![app_subtitle, setTextColor: app_subtitle_color];
         let _: () = msg_send![sidebar_view, addSubview: app_subtitle];
         release_obj(app_subtitle);
@@ -3882,7 +3882,7 @@ fn create_settings_window() {
         release_obj(panel);
         // 表头带(.mapping-table thead)。
         // The header band (.mapping-table thead).
-        let header_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        let header_color = settings_text_color(SettingsTextRole::Secondary);
         let header_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 12.0f64];
         for (hx, hw, htext) in [
             (
@@ -3931,7 +3931,7 @@ fn create_settings_window() {
         let empty_ns = make_nsstring(&t("settings.mapping_empty"));
         let _: () = msg_send![empty, setStringValue: empty_ns];
         CFRelease(empty_ns as *const c_void);
-        let empty_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        let empty_color = settings_text_color(SettingsTextRole::Muted);
         let _: () = msg_send![empty, setTextColor: empty_color];
         let _: () = msg_send![empty, setHidden: true];
         let _: () = msg_send![card_bg, addSubview: empty];
@@ -4285,7 +4285,7 @@ fn create_settings_window() {
         let about_subtitle_font: *mut AnyObject =
             msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
         let _: () = msg_send![about_subtitle, setFont: about_subtitle_font];
-        let about_subtitle_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+        let about_subtitle_color = settings_text_color(SettingsTextRole::Muted);
         let _: () = msg_send![about_subtitle, setTextColor: about_subtitle_color];
         let _: () = msg_send![about_view, addSubview: about_subtitle];
         release_obj(about_subtitle);
@@ -4589,7 +4589,7 @@ fn create_settings_window() {
             let _: () = msg_send![ok_layer, setBorderWidth: 1.0f64];
             let _: () = msg_send![ok_layer, setCornerRadius: 8.0f64];
         }
-        let ok_text = crate::ffi::hex_to_ns_color(0xFFFFFFFF);
+        let ok_text = settings_text_color(SettingsTextRole::OnAccent);
         let _: () = msg_send![ok, setContentTintColor: ok_text];
         let _: () = msg_send![ok, setAutoresizingMask: 33u64]; // 贴底、贴右
         let _: () = msg_send![content, addSubview: ok];
