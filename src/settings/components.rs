@@ -8,7 +8,7 @@
 //! settings.rs 管理，避免改变回调/配置生命周期，同时让所有页面共享同一套几何规则。
 
 use objc2::runtime::{AnyObject, Sel};
-use objc2_foundation::{NSPoint, NSRect};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 
@@ -524,6 +524,7 @@ pub(super) enum SettingsButtonRole {
     Compact,
     Footer,
     Primary,
+    Destructive,
 }
 
 impl SettingsButtonRole {
@@ -535,6 +536,7 @@ impl SettingsButtonRole {
             Self::Compact => (0x7676801F, 0x44444AFF, 0),
             Self::Footer => (0xFFFFFFC7, 0x2E2E2EFF, -1),
             Self::Primary => (0x0A84FFFF, 0xFFFFFFFF, -2),
+            Self::Destructive => (0xFF3B30FF, 0xFFFFFFFF, -4),
         }
     }
 }
@@ -557,6 +559,718 @@ impl SettingsButton {
         widgets::make_settings_styled_button(
             frame, title, target, action, background, text, hover_tag,
         )
+    }
+}
+
+/// Restore-defaults footer control: one compact trigger that morphs into confirm/cancel rows.
+/// 恢复默认设置 footer 控件：单个紧凑触发按钮 morph 成确认/取消两行。
+///
+/// The control owns the view graph and animation geometry; settings.rs only coordinates the
+/// business action and keeps this component in SettingsUi. This keeps the raw-pointer lifetime
+/// with the settings window while making the whole lower-left control one semantic component.
+/// 控件统一管理 view 层级和动画几何；settings.rs 只负责业务动作并将组件存入 SettingsUi。
+/// 裸指针生命周期仍归设置窗口所有，同时让左下角控件成为一个完整语义组件。
+#[derive(Clone, Copy)]
+pub(super) struct RestoreDefaultsControl {
+    pub(super) trigger: *mut AnyObject,
+    pub(super) confirm: *mut AnyObject,
+    pub(super) cancel: *mut AnyObject,
+    pub(super) surface: *mut AnyObject,
+    pub(super) container: *mut AnyObject,
+    pub(super) separator: *mut AnyObject,
+    pub(super) expanded: bool,
+}
+
+unsafe impl Send for RestoreDefaultsControl {}
+unsafe impl Sync for RestoreDefaultsControl {}
+
+impl RestoreDefaultsControl {
+    pub(super) fn empty() -> Self {
+        Self {
+            trigger: std::ptr::null_mut(),
+            confirm: std::ptr::null_mut(),
+            cancel: std::ptr::null_mut(),
+            surface: std::ptr::null_mut(),
+            container: std::ptr::null_mut(),
+            separator: std::ptr::null_mut(),
+            expanded: false,
+        }
+    }
+
+    pub(super) unsafe fn build(
+        parent: *mut AnyObject,
+        target: *mut AnyObject,
+        sidebar_width: f64,
+    ) -> Self {
+        let button_frame = NSRect::new(
+            NSPoint::new(8.0, 6.0),
+            objc2_foundation::NSSize::new(sidebar_width - 44.0, 30.0),
+        );
+        let separator: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
+        let separator: *mut AnyObject = objc2::msg_send![
+            separator,
+            initWithFrame: NSRect::new(
+                NSPoint::new(26.0, 61.0),
+                objc2_foundation::NSSize::new(sidebar_width - 52.0, 1.0),
+            )
+        ];
+        let _: () = objc2::msg_send![separator, setWantsLayer: true];
+        let separator_layer: *mut AnyObject = objc2::msg_send![separator, layer];
+        if !separator_layer.is_null() {
+            crate::ffi::layer_set_background(
+                separator_layer,
+                crate::ffi::hex_to_cg_color(widgets::settings_palette().separator),
+            );
+        }
+        let _: () = objc2::msg_send![parent, addSubview: separator];
+
+        // The expanded card is a separate surface behind the buttons. Keeping it outside the
+        // button container lets the compact trigger retain its original look while the card
+        // fades/grows in as one rounded surface.
+        // 展开卡片是位于按钮后方的独立表面。将它与按钮容器分开，收起时保留原按钮外观，
+        // 展开时再让圆角卡片作为整体淡入并长大。
+        let surface: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
+        let surface: *mut AnyObject = objc2::msg_send![
+            surface,
+            initWithFrame: NSRect::new(
+                NSPoint::new(22.0, 20.0),
+                objc2_foundation::NSSize::new(sidebar_width - 44.0, 30.0),
+            )
+        ];
+        let _: () = objc2::msg_send![surface, setWantsLayer: true];
+        let surface_layer: *mut AnyObject = objc2::msg_send![surface, layer];
+        if !surface_layer.is_null() {
+            let palette = widgets::settings_palette();
+            crate::ffi::layer_set_background(
+                surface_layer,
+                crate::ffi::hex_to_cg_color(palette.card_bg),
+            );
+            crate::ffi::layer_set_border(
+                surface_layer,
+                crate::ffi::hex_to_cg_color(palette.card_border),
+            );
+            let _: () = objc2::msg_send![surface_layer, setBorderWidth: 1.0f64];
+            let _: () = objc2::msg_send![surface_layer, setCornerRadius: 14.0f64];
+            let _: () = objc2::msg_send![surface_layer, setMasksToBounds: false];
+            let _: () = objc2::msg_send![surface_layer, setShadowOpacity: 0.0f32];
+            let _: () = objc2::msg_send![surface_layer, setShadowRadius: 8.0f64];
+            let _: () = objc2::msg_send![surface_layer, setShadowOffset: NSSize::new(0.0, -1.0)];
+        }
+        // In the compact state the shell sits exactly behind the trigger, so its card outline is
+        // not exposed as a stray ring. It becomes visible naturally as the shell grows outward.
+        // 收起态的外壳与触发按钮完全重合，避免卡片轮廓露成一圈；向外展开时再自然显现。
+        let _: () = objc2::msg_send![surface, setAlphaValue: 1.0f64];
+        let _: () = objc2::msg_send![parent, addSubview: surface];
+
+        let container: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
+        let container: *mut AnyObject = objc2::msg_send![
+            container,
+            initWithFrame: NSRect::new(
+                NSPoint::new(14.0, 14.0),
+                objc2_foundation::NSSize::new(sidebar_width - 28.0, 42.0),
+            )
+        ];
+        let _: () = objc2::msg_send![container, setAutoresizingMask: 36u64];
+        let _: () = objc2::msg_send![container, setWantsLayer: true];
+        let container_layer: *mut AnyObject = objc2::msg_send![container, layer];
+        if !container_layer.is_null() {
+            // Match the reference root's `overflow-hidden`: the upper row is revealed only as
+            // the shell grows past it.
+            // 对齐参考根节点的 `overflow-hidden`：上排按钮只会在外壳长到对应高度后显现。
+            let _: () = objc2::msg_send![container_layer, setMasksToBounds: true];
+            let _: () = objc2::msg_send![container_layer, setCornerRadius: 14.0f64];
+        }
+        let _: () = objc2::msg_send![parent, addSubview: container];
+
+        let trigger = SettingsButton::action(
+            button_frame,
+            &t("settings.btn_restore_defaults"),
+            target,
+            objc2::sel!(handleRestoreDefaults:),
+            SettingsButtonRole::Action,
+        );
+        let _: () = objc2::msg_send![trigger, setAutoresizingMask: 36u64];
+        let _: () = objc2::msg_send![container, addSubview: trigger];
+
+        let confirm = SettingsButton::action(
+            button_frame,
+            &t("settings.btn_confirm"),
+            target,
+            objc2::sel!(handleRestoreDefaultsConfirm:),
+            SettingsButtonRole::Destructive,
+        );
+        let _: () = objc2::msg_send![confirm, setAutoresizingMask: 36u64];
+        let _: () = objc2::msg_send![confirm, setHidden: true];
+        let _: () = objc2::msg_send![confirm, setAlphaValue: 0.0f64];
+        let _: () = objc2::msg_send![container, addSubview: confirm];
+
+        let cancel = SettingsButton::action(
+            button_frame,
+            &t("settings.btn_cancel"),
+            target,
+            objc2::sel!(handleRestoreDefaultsCancel:),
+            SettingsButtonRole::Action,
+        );
+        let _: () = objc2::msg_send![cancel, setAutoresizingMask: 36u64];
+        let _: () = objc2::msg_send![cancel, setHidden: true];
+        let _: () = objc2::msg_send![cancel, setAlphaValue: 0.0f64];
+        let _: () = objc2::msg_send![container, addSubview: cancel];
+
+        crate::ffi::CFRelease(separator as *const std::ffi::c_void);
+        crate::ffi::CFRelease(surface as *const std::ffi::c_void);
+        crate::ffi::CFRelease(container as *const std::ffi::c_void);
+        crate::ffi::CFRelease(trigger as *const std::ffi::c_void);
+        crate::ffi::CFRelease(confirm as *const std::ffi::c_void);
+        crate::ffi::CFRelease(cancel as *const std::ffi::c_void);
+
+        Self {
+            trigger,
+            confirm,
+            cancel,
+            surface,
+            container,
+            separator,
+            expanded: false,
+        }
+    }
+
+    pub(super) fn is_ready(self) -> bool {
+        !self.trigger.is_null()
+            && !self.confirm.is_null()
+            && !self.cancel.is_null()
+            && !self.surface.is_null()
+            && !self.container.is_null()
+            && !self.separator.is_null()
+    }
+
+    /// Toggle the component as one animated unit; the bottom row remains anchored in place.
+    /// 将整个控件作为一个动画单元切换；底部一行始终保持锚定。
+    pub(super) unsafe fn set_expanded(&mut self, expanded: bool, animated: bool) {
+        if !self.is_ready() || self.expanded == expanded {
+            return;
+        }
+        self.expanded = expanded;
+        let animated = animated && !Self::accessibility_reduce_motion();
+
+        let trigger_frame: NSRect = objc2::msg_send![self.trigger, frame];
+        let container_frame: NSRect = objc2::msg_send![self.container, frame];
+        // The card is only slightly wider than the original trigger; both expanded rows keep the
+        // trigger's original width and horizontal inset. The top padding is intentionally compact
+        // so the card does not leave a large empty panel above Confirm.
+        // 卡片只比原触发按钮略宽；展开后的两行继续使用原按钮宽度和水平内边距。顶部留白
+        // 有意收紧，避免 Confirm 上方出现大块空白区域。
+        let expanded_row_width = trigger_frame.size.width;
+        let cancel_frame = NSRect::new(
+            // Keep Cancel exactly where the collapsed Restore Defaults trigger lives. The card
+            // grows upward around this fixed bottom anchor.
+            // 取消按钮始终与收起态的恢复默认按钮完全同位；卡片围绕这个固定底部锚点向上展开。
+            trigger_frame.origin,
+            objc2_foundation::NSSize::new(expanded_row_width, 30.0),
+        );
+        let confirm_frame = NSRect::new(
+            NSPoint::new(trigger_frame.origin.x, 54.0),
+            objc2_foundation::NSSize::new(expanded_row_width, 30.0),
+        );
+        let separator_frame: NSRect = objc2::msg_send![self.separator, frame];
+        let target_separator = NSRect::new(
+            separator_frame.origin,
+            objc2_foundation::NSSize::new(separator_frame.size.width, separator_frame.size.height),
+        );
+        let target_separator_y = if expanded {
+            separator_frame.origin.y + 51.0
+        } else {
+            separator_frame.origin.y - 51.0
+        };
+        let target_separator = NSRect::new(
+            NSPoint::new(target_separator.origin.x, target_separator_y),
+            target_separator.size,
+        );
+        let target_container = NSRect::new(
+            container_frame.origin,
+            objc2_foundation::NSSize::new(
+                container_frame.size.width,
+                if expanded { 110.0 } else { 42.0 },
+            ),
+        );
+        // The shell starts exactly behind the trigger and grows outward by 8pt on each side,
+        // while its bottom edge stays fixed. This also keeps the compact outline fully covered.
+        // 外壳从触发按钮正后方开始，左右各向外长 8pt，同时底边保持固定；收起时轮廓会
+        // 被按钮完整遮住。
+        let collapsed_surface = NSRect::new(
+            NSPoint::new(
+                container_frame.origin.x + trigger_frame.origin.x,
+                container_frame.origin.y + trigger_frame.origin.y,
+            ),
+            trigger_frame.size,
+        );
+        let target_surface = if expanded {
+            target_container
+        } else {
+            collapsed_surface
+        };
+
+        if expanded {
+            let _: () = objc2::msg_send![self.trigger, setHidden: false];
+            let _: () = objc2::msg_send![self.cancel, setHidden: false];
+            let _: () = objc2::msg_send![self.confirm, setHidden: false];
+            let _: () = objc2::msg_send![self.confirm, setFrame: confirm_frame];
+            let _: () = objc2::msg_send![self.cancel, setFrame: cancel_frame];
+            // Cancel takes the fixed dock slot while Restore Defaults fades beneath it.
+            // 取消按钮占据固定 dock 位置，恢复默认按钮在其下方淡出。
+            let _: () = objc2::msg_send![
+                self.container,
+                addSubview: self.cancel,
+                positioned: 1isize,
+                relativeTo: std::ptr::null::<AnyObject>()
+            ];
+            if animated {
+                Self::animate_basic_opacity(self.trigger, 0.0, 0.16, "restore-trigger-close");
+                Self::animate_spring_opacity(
+                    self.cancel,
+                    1.0,
+                    0.38,
+                    350.0,
+                    36.0,
+                    "restore-cancel-open",
+                );
+                Self::animate_content_open(self.confirm);
+            } else {
+                let _: () = objc2::msg_send![self.trigger, setAlphaValue: 0.0f64];
+                let _: () = objc2::msg_send![self.cancel, setAlphaValue: 1.0f64];
+                Self::set_content_model(self.confirm, 1.0, 0.0, 1.0);
+            }
+        } else {
+            let _: () = objc2::msg_send![self.trigger, setHidden: false];
+            let _: () = objc2::msg_send![self.cancel, setHidden: false];
+            let _: () = objc2::msg_send![self.confirm, setHidden: false];
+            // Reorder the trigger above the transparent closing controls so repeated Cancel/open
+            // cycles cannot leave an invisible button swallowing clicks.
+            // 将触发按钮移到正在淡出的透明控件之上，避免重复取消/展开后被不可见按钮吞掉点击。
+            let _: () = objc2::msg_send![
+                self.container,
+                addSubview: self.trigger,
+                positioned: 1isize,
+                relativeTo: std::ptr::null::<AnyObject>()
+            ];
+            if animated {
+                Self::animate_content_exit(self.confirm);
+                Self::animate_basic_opacity(self.cancel, 0.0, 0.16, "restore-cancel-close");
+                Self::animate_spring_opacity(
+                    self.trigger,
+                    1.0,
+                    0.38,
+                    350.0,
+                    36.0,
+                    "restore-trigger-open",
+                );
+            } else {
+                let _: () = objc2::msg_send![self.trigger, setAlphaValue: 1.0f64];
+                let _: () = objc2::msg_send![self.cancel, setAlphaValue: 0.0f64];
+                Self::set_content_model(self.confirm, 0.0, 6.0, 0.98);
+            }
+        }
+
+        if animated {
+            // Exact beUI timing: shell spring 0.58s with a restrained 0.06 bounce. The native
+            // stiffness/damping pair is calibrated to that low-bounce duration.
+            // 严格采用 beUI 的外壳时长：0.58 秒、0.06 低回弹；原生刚度/阻尼按该曲线校准。
+            Self::spring_view_frame(
+                self.surface,
+                target_surface,
+                0.58,
+                160.0,
+                24.0,
+                "restore-shell",
+            );
+            let surface_layer: *mut AnyObject = objc2::msg_send![self.surface, layer];
+            if !surface_layer.is_null() {
+                let target_shadow = if expanded { 0.12 } else { 0.0 };
+                let from_shadow = Self::presentation_scalar(
+                    surface_layer,
+                    "shadowOpacity",
+                    if expanded { 0.0 } else { 0.12 },
+                );
+                Self::animate_spring_scalar(
+                    surface_layer,
+                    "shadowOpacity",
+                    from_shadow,
+                    target_shadow,
+                    0.58,
+                    160.0,
+                    24.0,
+                    "restore-shell-shadow",
+                );
+            }
+            Self::spring_view_frame(
+                self.container,
+                target_container,
+                0.58,
+                160.0,
+                24.0,
+                "restore-clip",
+            );
+            Self::spring_view_frame(
+                self.separator,
+                target_separator,
+                0.58,
+                160.0,
+                24.0,
+                "restore-divider",
+            );
+        } else {
+            let _: () = objc2::msg_send![self.surface, setFrame: target_surface];
+            let surface_layer: *mut AnyObject = objc2::msg_send![self.surface, layer];
+            if !surface_layer.is_null() {
+                let shadow_opacity = if expanded { 0.12f32 } else { 0.0f32 };
+                let _: () = objc2::msg_send![surface_layer, setShadowOpacity: shadow_opacity];
+            }
+            let _: () = objc2::msg_send![self.container, setFrame: target_container];
+            let _: () = objc2::msg_send![self.separator, setFrame: target_separator];
+        }
+    }
+
+    unsafe fn accessibility_reduce_motion() -> bool {
+        let workspace: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
+        if workspace.is_null()
+            || !objc2::msg_send![workspace, respondsToSelector: objc2::sel!(accessibilityDisplayShouldReduceMotion)]
+        {
+            return false;
+        }
+        objc2::msg_send![workspace, accessibilityDisplayShouldReduceMotion]
+    }
+
+    unsafe fn spring_view_frame(
+        view: *mut AnyObject,
+        target_frame: NSRect,
+        duration: f64,
+        stiffness: f64,
+        damping: f64,
+        key_prefix: &str,
+    ) {
+        let layer: *mut AnyObject = objc2::msg_send![view, layer];
+        if layer.is_null() {
+            let _: () = objc2::msg_send![view, setFrame: target_frame];
+            return;
+        }
+
+        let presentation: *mut AnyObject = objc2::msg_send![layer, presentationLayer];
+        let from_bounds: NSRect = if presentation.is_null() {
+            objc2::msg_send![layer, bounds]
+        } else {
+            objc2::msg_send![presentation, bounds]
+        };
+        let from_position: NSPoint = if presentation.is_null() {
+            objc2::msg_send![layer, position]
+        } else {
+            objc2::msg_send![presentation, position]
+        };
+
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+        let _: () = objc2::msg_send![view, setFrame: target_frame];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+
+        let to_bounds: NSRect = objc2::msg_send![layer, bounds];
+        let to_position: NSPoint = objc2::msg_send![layer, position];
+        let from_bounds_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSValue), valueWithRect: from_bounds];
+        let to_bounds_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSValue), valueWithRect: to_bounds];
+        Self::add_spring_value(
+            layer,
+            "bounds",
+            from_bounds_value,
+            to_bounds_value,
+            duration,
+            stiffness,
+            damping,
+            &format!("{key_prefix}-bounds"),
+        );
+
+        let from_position_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSValue), valueWithPoint: from_position];
+        let to_position_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSValue), valueWithPoint: to_position];
+        Self::add_spring_value(
+            layer,
+            "position",
+            from_position_value,
+            to_position_value,
+            duration,
+            stiffness,
+            damping,
+            &format!("{key_prefix}-position"),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn add_spring_value(
+        layer: *mut AnyObject,
+        key_path: &str,
+        from: *mut AnyObject,
+        to: *mut AnyObject,
+        duration: f64,
+        stiffness: f64,
+        damping: f64,
+        animation_key: &str,
+    ) {
+        let key_path = crate::ffi::make_nsstring(key_path);
+        let animation: *mut AnyObject = objc2::msg_send![
+            objc2::class!(CASpringAnimation),
+            animationWithKeyPath: key_path
+        ];
+        crate::ffi::CFRelease(key_path as *const std::ffi::c_void);
+        let _: () = objc2::msg_send![animation, setFromValue: from];
+        let _: () = objc2::msg_send![animation, setToValue: to];
+        let _: () = objc2::msg_send![animation, setMass: 1.0f64];
+        let _: () = objc2::msg_send![animation, setStiffness: stiffness];
+        let _: () = objc2::msg_send![animation, setDamping: damping];
+        let _: () = objc2::msg_send![animation, setInitialVelocity: 0.0f64];
+        let _: () = objc2::msg_send![animation, setDuration: duration];
+        let animation_key = crate::ffi::make_nsstring(animation_key);
+        let _: () = objc2::msg_send![layer, addAnimation: animation, forKey: animation_key];
+        crate::ffi::CFRelease(animation_key as *const std::ffi::c_void);
+    }
+
+    unsafe fn set_layer_scalar(layer: *mut AnyObject, key_path: &str, value: f64) {
+        let value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: value];
+        let key_path = crate::ffi::make_nsstring(key_path);
+        let _: () = objc2::msg_send![layer, setValue: value, forKeyPath: key_path];
+        crate::ffi::CFRelease(key_path as *const std::ffi::c_void);
+    }
+
+    unsafe fn presentation_scalar(layer: *mut AnyObject, key_path: &str, fallback: f64) -> f64 {
+        let presentation: *mut AnyObject = objc2::msg_send![layer, presentationLayer];
+        if presentation.is_null() {
+            return fallback;
+        }
+        let key_path = crate::ffi::make_nsstring(key_path);
+        let value: *mut AnyObject = objc2::msg_send![presentation, valueForKeyPath: key_path];
+        crate::ffi::CFRelease(key_path as *const std::ffi::c_void);
+        if value.is_null() {
+            fallback
+        } else {
+            objc2::msg_send![value, doubleValue]
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn animate_spring_scalar(
+        layer: *mut AnyObject,
+        key_path: &str,
+        from: f64,
+        to: f64,
+        duration: f64,
+        stiffness: f64,
+        damping: f64,
+        animation_key: &str,
+    ) {
+        let from: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: from];
+        let to_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: to];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+        Self::set_layer_scalar(layer, key_path, to);
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+        Self::add_spring_value(
+            layer,
+            key_path,
+            from,
+            to_value,
+            duration,
+            stiffness,
+            damping,
+            animation_key,
+        );
+    }
+
+    unsafe fn animate_spring_opacity(
+        view: *mut AnyObject,
+        target: f64,
+        duration: f64,
+        stiffness: f64,
+        damping: f64,
+        animation_key: &str,
+    ) {
+        let layer: *mut AnyObject = objc2::msg_send![view, layer];
+        if layer.is_null() {
+            let _: () = objc2::msg_send![view, setAlphaValue: target];
+            return;
+        }
+        let fallback: f64 = objc2::msg_send![view, alphaValue];
+        let from = Self::presentation_scalar(layer, "opacity", fallback);
+        Self::animate_spring_scalar(
+            layer,
+            "opacity",
+            from,
+            target,
+            duration,
+            stiffness,
+            damping,
+            animation_key,
+        );
+    }
+
+    unsafe fn animate_basic_opacity(
+        view: *mut AnyObject,
+        target: f64,
+        duration: f64,
+        animation_key: &str,
+    ) {
+        let layer: *mut AnyObject = objc2::msg_send![view, layer];
+        if layer.is_null() {
+            let _: () = objc2::msg_send![view, setAlphaValue: target];
+            return;
+        }
+        let fallback: f64 = objc2::msg_send![view, alphaValue];
+        let from = Self::presentation_scalar(layer, "opacity", fallback);
+        Self::animate_basic_scalar(layer, "opacity", from, target, duration, animation_key);
+    }
+
+    unsafe fn animate_basic_scalar(
+        layer: *mut AnyObject,
+        key_path: &str,
+        from: f64,
+        to: f64,
+        duration: f64,
+        animation_key: &str,
+    ) {
+        let from_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: from];
+        let to_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: to];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+        Self::set_layer_scalar(layer, key_path, to);
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+        let key_path = crate::ffi::make_nsstring(key_path);
+        let animation: *mut AnyObject = objc2::msg_send![
+            objc2::class!(CABasicAnimation),
+            animationWithKeyPath: key_path
+        ];
+        crate::ffi::CFRelease(key_path as *const std::ffi::c_void);
+        let _: () = objc2::msg_send![animation, setFromValue: from_value];
+        let _: () = objc2::msg_send![animation, setToValue: to_value];
+        let _: () = objc2::msg_send![animation, setDuration: duration];
+        // `functionWithControlPoints::::` has unlabeled selector segments that `msg_send!`
+        // cannot express, so call it through the typed Objective-C entry point.
+        // `functionWithControlPoints::::` 包含无标签 selector 段，`msg_send!` 无法表达，
+        // 因此通过带类型的 Objective-C 入口调用。
+        extern "C" {
+            fn objc_msgSend();
+        }
+        type TimingFunction =
+            unsafe extern "C" fn(*mut AnyObject, Sel, f32, f32, f32, f32) -> *mut AnyObject;
+        let make_timing: TimingFunction = std::mem::transmute(objc_msgSend as *const ());
+        let timing = make_timing(
+            objc2::class!(CAMediaTimingFunction) as *const _ as *mut AnyObject,
+            objc2::sel!(functionWithControlPoints::::),
+            0.16,
+            1.0,
+            0.3,
+            1.0,
+        );
+        if !timing.is_null() {
+            let _: () = objc2::msg_send![animation, setTimingFunction: timing];
+        }
+        let animation_key = crate::ffi::make_nsstring(animation_key);
+        let _: () = objc2::msg_send![layer, addAnimation: animation, forKey: animation_key];
+        crate::ffi::CFRelease(animation_key as *const std::ffi::c_void);
+    }
+
+    unsafe fn set_content_model(view: *mut AnyObject, opacity: f64, y: f64, scale: f64) {
+        let layer: *mut AnyObject = objc2::msg_send![view, layer];
+        if layer.is_null() {
+            let _: () = objc2::msg_send![view, setAlphaValue: opacity];
+            return;
+        }
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+        Self::set_layer_scalar(layer, "opacity", opacity);
+        Self::set_layer_scalar(layer, "transform.translation.y", y);
+        Self::set_layer_scalar(layer, "transform.scale", scale);
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+    }
+
+    unsafe fn animate_content_open(view: *mut AnyObject) {
+        let layer: *mut AnyObject = objc2::msg_send![view, layer];
+        if layer.is_null() {
+            let _: () = objc2::msg_send![view, setAlphaValue: 1.0f64];
+            return;
+        }
+        Self::set_content_model(view, 1.0, 0.0, 1.0);
+        // Exact CONTENT_VARIANTS + CONTENT_SPRING mapping from the reference. AppKit's positive
+        // Y points upward, so CSS y:-8 maps to native y:+8.
+        // 严格映射参考组件的 CONTENT_VARIANTS 与 CONTENT_SPRING。AppKit 正 Y 向上，
+        // 因此 CSS y:-8 对应原生 y:+8。
+        Self::animate_spring_scalar(
+            layer,
+            "opacity",
+            0.0,
+            1.0,
+            0.46,
+            266.0,
+            30.0,
+            "restore-content-opacity",
+        );
+        Self::animate_spring_scalar(
+            layer,
+            "transform.translation.y",
+            8.0,
+            0.0,
+            0.46,
+            266.0,
+            30.0,
+            "restore-content-y",
+        );
+        Self::animate_spring_scalar(
+            layer,
+            "transform.scale",
+            0.98,
+            1.0,
+            0.46,
+            266.0,
+            30.0,
+            "restore-content-scale",
+        );
+    }
+
+    unsafe fn animate_content_exit(view: *mut AnyObject) {
+        let layer: *mut AnyObject = objc2::msg_send![view, layer];
+        if layer.is_null() {
+            let _: () = objc2::msg_send![view, setAlphaValue: 0.0f64];
+            return;
+        }
+        let opacity = Self::presentation_scalar(layer, "opacity", 1.0);
+        let y = Self::presentation_scalar(layer, "transform.translation.y", 0.0);
+        let scale = Self::presentation_scalar(layer, "transform.scale", 1.0);
+        Self::animate_basic_scalar(
+            layer,
+            "opacity",
+            opacity,
+            0.0,
+            0.08,
+            "restore-content-opacity",
+        );
+        Self::animate_basic_scalar(
+            layer,
+            "transform.translation.y",
+            y,
+            6.0,
+            0.08,
+            "restore-content-y",
+        );
+        Self::animate_basic_scalar(
+            layer,
+            "transform.scale",
+            scale,
+            0.98,
+            0.08,
+            "restore-content-scale",
+        );
     }
 }
 
@@ -977,6 +1691,10 @@ mod tests {
         assert_eq!(
             SettingsButtonRole::Primary.style(),
             (0x0A84FFFF, 0xFFFFFFFF, -2)
+        );
+        assert_eq!(
+            SettingsButtonRole::Destructive.style(),
+            (0xFF3B30FF, 0xFFFFFFFF, -4)
         );
     }
 }

@@ -87,6 +87,8 @@ pub(crate) struct UiPalette {
     pub(crate) hover_bg: u32,
     pub(crate) accent: u32,
     pub(crate) accent_hover: u32,
+    pub(crate) destructive: u32,
+    pub(crate) destructive_hover: u32,
     pub(crate) shadow: u32,
 }
 
@@ -115,6 +117,8 @@ pub(crate) fn ui_palette() -> UiPalette {
             hover_bg: 0xFFFFFF22,
             accent: 0x0A84FFFF,
             accent_hover: 0x0077EDFF,
+            destructive: 0xFF453AFF,
+            destructive_hover: 0xD93630FF,
             shadow: 0x00000042,
         }
     } else {
@@ -147,6 +151,8 @@ pub(crate) fn ui_palette() -> UiPalette {
             hover_bg: 0x76768024,
             accent: 0x0A84FFFF,
             accent_hover: 0x0077EDFF,
+            destructive: 0xFF3B30FF,
+            destructive_hover: 0xD70015FF,
             shadow: 0x0000000A,
         }
     }

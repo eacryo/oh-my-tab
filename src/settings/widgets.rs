@@ -75,6 +75,8 @@ pub(super) fn themed_settings_color(hex: u32) -> u32 {
         0x76768024 | 0x7676802B => p.hover_bg,
         0x0A84FFFF => p.accent,
         0x0077EDFF => p.accent_hover,
+        0xFF3B30FF => p.destructive,
+        0xD70015FF => p.destructive_hover,
         0xFFFFFFFF | 0x2E2E2EFF | 0x2C2C30FF | 0x44444AFF => p.button_text,
         _ => hex,
     }
@@ -143,6 +145,7 @@ pub(super) extern "C" fn html_action_button_mouse_entered(
         let hover = match tag {
             -2 => 0x0077EDFFu32, // HTML footer `.ok:hover`
             -1 => 0x76768024u32, // HTML footer `button:hover`
+            -4 => 0xD70015FFu32, // destructive confirmation hover
             _ => 0x7676802Bu32,  // HTML small/tiny/full action hover
         };
         let layer: *mut AnyObject = msg_send![button, layer];
@@ -167,6 +170,7 @@ pub(super) extern "C" fn html_action_button_mouse_exited(
             -2 => 0x0A84FFFFu32,
             -1 => 0xFFFFFFC7u32,
             -3 => 0xFFFFFFADu32, // HTML `.full-action` normal background
+            -4 => 0xFF3B30FFu32, // destructive confirmation
             _ if tag >= 0 => 0x7676801Fu32, // mapping/edit compact action
             _ => 0xFFFFFFADu32,
         };

@@ -1229,6 +1229,18 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handleRestoreDefaultsConfirm:),
+                handle_restore_defaults_confirm as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleRestoreDefaultsCancel:),
+                handle_restore_defaults_cancel as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleOpenPrivacy:),
                 handle_open_privacy as *mut c_void,
                 types.as_ptr(),

@@ -215,6 +215,7 @@ struct SettingsUi {
     mapping_enabled: *mut AnyObject, // NSSwitch: 按键映射总开关(per-device) / mappings master switch (per-device)
     mapping_empty: *mut AnyObject,   // NSTextField: 空状态提示(卡片内) / empty-state hint (in-card)
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
+    restore_defaults: RestoreDefaultsControl, // 左下角恢复默认组件 / restore-defaults control
     ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
     update_auto_check: *mut AnyObject, // NSSwitch: Sparkle 自动检查开关 / Sparkle auto-check switch
@@ -358,8 +359,9 @@ pub(crate) mod tooltip;
 pub(crate) mod widgets;
 
 use components::{
-    SettingsButton, SettingsButtonRole, SettingsCard, SettingsControl, SettingsLayout,
-    SettingsMappingActionIcon, SettingsPage, SettingsRow, SettingsSection, SettingsSidebar,
+    RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard, SettingsControl,
+    SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsRow, SettingsSection,
+    SettingsSidebar,
 };
 use glass_preview::*;
 pub(crate) use glass_preview::{
@@ -1485,6 +1487,9 @@ pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, se
 // Sidebar click callback: read the sender's tag and switch to that page.
 
 pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
+    // Navigating away also cancels an unfinished destructive confirmation.
+    // 切换到其他页面时同时取消尚未确认的危险操作。
+    set_restore_confirmation_expanded(false, true);
     let btn = sender as *mut AnyObject;
     let tag: isize = unsafe { msg_send![btn, tag] };
     select_sidebar(tag as usize);
@@ -1696,6 +1701,9 @@ fn show_settings() {
                 create_settings_window();
             }
         }
+        // 每次打开设置都从收起态开始,避免上次未完成的确认状态残留。
+        // Always reopen in the collapsed state so an unfinished confirmation never lingers.
+        set_restore_confirmation_expanded(false, false);
         // A window order-out is not guaranteed to deliver mouseExited for its tracking areas;
         // clear the shared hover state before reusing the settings window.
         // 窗口 orderOut 不保证会为 tracking area 发送 mouseExited；复用设置窗口前先清理共享
@@ -1734,6 +1742,9 @@ fn show_settings() {
 }
 
 fn hide_settings() {
+    // 关闭设置时丢弃未确认的恢复动作,下次打开重新从单按钮开始。
+    // Closing settings discards any unconfirmed restore action and resets to one button.
+    set_restore_confirmation_expanded(false, false);
     let window_and_well = SETTINGS_UI
         .lock()
         .unwrap()
@@ -1906,26 +1917,34 @@ pub(crate) fn confirm_alert(
     }
 }
 
-/// 恢复默认设置:确认 -> 只把表单控件重填为代码默认值(不写盘)。
-/// 用户点"确认(并重启)"时经 on_settings_ok 统一保存 + 应用;点"取消"则关窗,
-/// 磁盘配置未被改动,天然撤销。
-///
-/// Restore defaults: confirm -> only repopulate the form controls with code defaults (no write).
-/// The user then clicks OK (or OK && Restart) which saves + applies via on_settings_ok; clicking
-/// Cancel just closes the window with the on-disk config untouched, i.e. a natural undo.
+/// 展开恢复默认设置的内联确认按钮,不再启动 app-modal alert。
+/// Expand the inline restore-defaults confirmation instead of starting an app-modal alert.
 pub(crate) extern "C" fn handle_restore_defaults(
     _self: *mut c_void,
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    if !confirm_alert(
-        &t("alert.restore_title"),
-        &t("alert.restore_msg"),
-        &t("alert.btn_restore"),
-        &t("alert.btn_cancel"),
-    ) {
-        return;
-    }
+    set_restore_confirmation_expanded(true, true);
+}
+
+/// 收起恢复默认设置的内联确认按钮,不修改任何表单值。
+/// Collapse the inline restore-defaults confirmation without changing form values.
+pub(crate) extern "C" fn handle_restore_defaults_cancel(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    set_restore_confirmation_expanded(false, true);
+}
+
+/// 确认恢复默认设置:只重填表单,写盘仍由右下角 OK 统一完成。
+/// Confirm restore defaults: refill the form only; the bottom-right OK still performs the save.
+pub(crate) extern "C" fn handle_restore_defaults_confirm(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    set_restore_confirmation_expanded(false, true);
     // 构造默认配置,但保留 launch_at_login -- 它是系统级登录项开关,不属于外观/布局/
     // 快捷键这类设置,不该被恢复默认重置(否则会注销用户已勾选的登录项)。
     // 这里不写盘:仅用于预览填充;实际写盘在用户点 OK 后由 on_settings_ok 完成。
@@ -1941,6 +1960,19 @@ pub(crate) extern "C" fn handle_restore_defaults(
     *SELECTED_DEVICE.lock().unwrap() = None;
     load_settings_from(&defaults);
     log_debug!("Config form reset to defaults (not saved until OK).");
+}
+
+/// 将恢复确认区域切换到展开或收起状态。底部按钮保持锚定,确认按钮向上展开。
+/// Toggle the restore confirmation area. The bottom action stays anchored while confirmation
+/// grows upward into the available footer space.
+fn set_restore_confirmation_expanded(expanded: bool, animated: bool) {
+    let mut ui_guard = SETTINGS_UI.lock().unwrap();
+    let Some(ui) = ui_guard.as_mut() else {
+        return;
+    };
+    unsafe {
+        ui.restore_defaults.set_expanded(expanded, animated);
+    }
 }
 
 /// 用当前 CONFIG 填充设置控件(每次打开都刷新,反映外部编辑 + Reload)。
@@ -2771,6 +2803,7 @@ fn create_settings_window() {
             mapping_enabled: std::ptr::null_mut(),
             mapping_empty: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
+            restore_defaults: RestoreDefaultsControl::empty(),
             ok_button: std::ptr::null_mut(),
             accessibility_warning_view: std::ptr::null_mut(),
             update_auto_check: std::ptr::null_mut(),
@@ -3026,36 +3059,10 @@ fn create_settings_window() {
         .zip(sidebar_buttons)
         .for_each(|(slot, button)| **slot = button);
 
-        // HTML `.sidebar-footer`: separator plus a compact Restore Defaults button at the
-        // bottom of the navigation column, rather than in the main footer.
-        let sidebar_footer_line: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let sidebar_footer_line: *mut AnyObject = msg_send![
-            sidebar_footer_line,
-            initWithFrame: NSRect::new(
-                NSPoint::new(14.0, 61.0),
-                NSSize::new(card_w - 28.0, 1.0),
-            )
-        ];
-        let _: () = msg_send![sidebar_footer_line, setWantsLayer: true];
-        let sidebar_footer_layer: *mut AnyObject = msg_send![sidebar_footer_line, layer];
-        if !sidebar_footer_layer.is_null() {
-            layer_set_background(
-                sidebar_footer_layer,
-                crate::ffi::hex_to_cg_color(palette.separator),
-            );
-        }
-        let _: () = msg_send![sidebar_view, addSubview: sidebar_footer_line];
-        release_obj(sidebar_footer_line);
-        let restore = SettingsButton::action(
-            NSRect::new(NSPoint::new(22.0, 20.0), NSSize::new(card_w - 44.0, 30.0)),
-            &t("settings.btn_restore_defaults"),
-            target,
-            sel!(handleRestoreDefaults:),
-            SettingsButtonRole::Action,
-        );
-        let _: () = msg_send![restore, setAutoresizingMask: 36u64];
-        let _: () = msg_send![sidebar_view, addSubview: restore];
-        release_obj(restore);
+        // HTML `.sidebar-footer`: the complete restore control is one semantic component, with
+        // its separator and morphing confirm/cancel rows owned together.
+        // HTML `.sidebar-footer`:整个恢复控件作为一个语义组件，统一管理分割线和 morph 确认/取消行。
+        ui.restore_defaults = RestoreDefaultsControl::build(sidebar_view, target, card_w);
 
         // The scroll view spans from the left gutter to the detail pane's right edge, so the
         // overlay scrollbar sits flush with the window edge (matching the OK/Cancel footer) and
