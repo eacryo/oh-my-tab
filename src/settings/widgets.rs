@@ -179,6 +179,10 @@ unsafe impl Sync for ExternalLinkButtonClass {}
 pub(super) static EXTERNAL_LINK_BUTTON_CLASS: OnceLock<ExternalLinkButtonClass> = OnceLock::new();
 pub(super) static SIDEBAR_BUTTON_CLASS: OnceLock<SidebarButtonClass> = OnceLock::new();
 pub(super) static SIDEBAR_SELECTED: AtomicUsize = AtomicUsize::new(0);
+pub(super) static SIDEBAR_HOVERED: AtomicUsize = AtomicUsize::new(0);
+pub(super) static SIDEBAR_HOVER_VISIBLE: AtomicBool = AtomicBool::new(false);
+pub(super) static SIDEBAR_HOVER_HIGHLIGHT: LazyLock<Mutex<Option<ObjPtr>>> =
+    LazyLock::new(|| Mutex::new(None));
 pub(super) static SIDEBAR_TITLE_LABELS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 pub(super) static SIDEBAR_ICON_VIEWS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
@@ -237,6 +241,117 @@ pub(super) struct SidebarButtonClass(*mut AnyObject);
 unsafe impl Send for SidebarButtonClass {}
 unsafe impl Sync for SidebarButtonClass {}
 
+pub(super) struct SidebarHoverTrackerClass(*mut AnyObject);
+unsafe impl Send for SidebarHoverTrackerClass {}
+unsafe impl Sync for SidebarHoverTrackerClass {}
+
+pub(super) static SIDEBAR_HOVER_TRACKER_CLASS: OnceLock<SidebarHoverTrackerClass> = OnceLock::new();
+pub(super) static SIDEBAR_HOVER_TRACKER: LazyLock<Mutex<Option<ObjPtr>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Return the shared hover view without duplicating its ownership logic at each event site.
+/// 读取共享悬浮 view，避免每个事件回调重复处理指针状态。
+unsafe fn sidebar_hover_highlight() -> *mut AnyObject {
+    SIDEBAR_HOVER_HIGHLIGHT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|p| p.0)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Check whether a sidebar button is the item currently carrying the hover surface.
+/// 判断指定侧栏按钮是否正承载当前悬停背景。
+pub(super) fn sidebar_button_is_hovered(button: *mut AnyObject) -> bool {
+    !button.is_null() && SIDEBAR_HOVERED.load(Ordering::SeqCst) == button as usize
+}
+
+/// Clear hover state after a sidebar click has established the selected row.
+/// 侧栏点击完成选中态切换后清理悬浮状态。
+pub(super) unsafe fn clear_sidebar_hover() {
+    SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+    super::components::SettingsSidebar::hide_hover_highlight_immediately(sidebar_hover_highlight());
+}
+
+pub(super) extern "C" fn sidebar_hover_tracker_mouse_entered(
+    _this: *mut c_void,
+    _cmd: Sel,
+    _event: *mut c_void,
+) {
+    // The row callbacks own the current item; the container callback only establishes the
+    // boundary that decides when the shared hover surface may disappear.
+    // 条目回调负责当前条目；容器回调只定义共享悬浮层何时可以消失的边界。
+}
+
+pub(super) extern "C" fn sidebar_hover_tracker_mouse_exited(
+    _this: *mut c_void,
+    _cmd: Sel,
+    _event: *mut c_void,
+) {
+    unsafe {
+        SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+        let hover = sidebar_hover_highlight();
+        super::components::SettingsSidebar::hide_hover_highlight(hover);
+    }
+}
+
+pub(super) fn sidebar_hover_tracker_class() -> *mut AnyObject {
+    SIDEBAR_HOVER_TRACKER_CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabSidebarHoverTracker").unwrap();
+            let superclass = class!(NSObject) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                sidebar_hover_tracker_mouse_entered as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                sidebar_hover_tracker_mouse_exited as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            SidebarHoverTrackerClass(cls)
+        })
+        .0
+}
+
+/// Track the whole row group so gaps between buttons do not start a hide animation.
+/// 跟踪整个条目区域，避免按钮间隙触发隐藏动画。
+pub(super) unsafe fn make_sidebar_hover_tracking(parent: *mut AnyObject, x: f64, y: f64, w: f64) {
+    let tracker: *mut AnyObject = msg_send![sidebar_hover_tracker_class(), alloc];
+    let tracker: *mut AnyObject = msg_send![tracker, init];
+    let rows_h = 38.0 + 5.0 * 42.0;
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::new(
+            NSPoint::new(x, y - 5.0 * 42.0),
+            NSSize::new(w, rows_h)
+        ),
+        options: 0x01u64 | 0x80u64,
+        owner: tracker,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![parent, addTrackingArea: tracking];
+    release_obj(tracking);
+
+    // NSTrackingArea does not provide ownership suitable for this raw-pointer registry; keep one
+    // explicit +1 until the next sidebar is built, then release the previous tracker.
+    // NSTrackingArea 不提供适合裸指针 registry 的所有权；显式保留一个 +1，重建侧栏时释放旧 tracker。
+    if let Some(previous) = SIDEBAR_HOVER_TRACKER
+        .lock()
+        .unwrap()
+        .replace(ObjPtr(tracker))
+    {
+        release_obj(previous.0);
+    }
+}
+
 pub(super) extern "C" fn sidebar_button_mouse_entered(
     this: *mut c_void,
     _cmd: Sel,
@@ -246,15 +361,17 @@ pub(super) extern "C" fn sidebar_button_mouse_entered(
         let button = this as *mut AnyObject;
         let tag: isize = msg_send![button, tag];
         if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
+            SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+            super::components::SettingsSidebar::hide_hover_highlight(sidebar_hover_highlight());
             return;
         }
-        let layer: *mut AnyObject = msg_send![button, layer];
-        if !layer.is_null() {
-            layer_set_background(
-                layer,
-                crate::ffi::hex_to_cg_color(settings_palette().hover_bg),
-            );
+        SIDEBAR_HOVERED.store(button as usize, Ordering::SeqCst);
+        let hover = sidebar_hover_highlight();
+        if !hover.is_null() {
+            let frame: NSRect = msg_send![button, frame];
+            super::components::SettingsSidebar::move_hover_highlight(hover, frame);
         }
+        set_sidebar_hovered(button, true);
     }
 }
 
@@ -265,10 +382,14 @@ pub(super) extern "C" fn sidebar_button_mouse_exited(
 ) {
     unsafe {
         let button = this as *mut AnyObject;
-        let layer: *mut AnyObject = msg_send![button, layer];
-        if !layer.is_null() {
-            layer_set_background(layer, crate::ffi::hex_to_cg_color(0x00000000u32));
+        let tag: isize = msg_send![button, tag];
+        if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
+            return;
         }
+        set_sidebar_hovered(button, false);
+        SIDEBAR_HOVERED
+            .compare_exchange(button as usize, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .ok();
     }
 }
 
@@ -2092,8 +2213,30 @@ pub(super) unsafe fn make_slider(
     slider
 }
 
-/// 设侧边栏按钮标题为 attributed title:未选中用 labelColor,选中用系统强调色。
-/// Set the sidebar button title as an attributed title, using the normal label color when
+/// Apply a sidebar title's font/color and refresh the label's vertical optical alignment.
+/// 应用侧边栏标题的字形/颜色，并刷新文字的垂直光学对齐。
+unsafe fn set_sidebar_title_appearance(
+    btn: *mut AnyObject,
+    title: &str,
+    font: *mut AnyObject,
+    color: *mut AnyObject,
+) {
+    let title_ns = make_nsstring(title);
+    let label = SIDEBAR_TITLE_LABELS
+        .lock()
+        .unwrap()
+        .get(&(btn as usize))
+        .map(|p| p.0)
+        .unwrap_or(btn);
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setTextColor: color];
+    let _: () = msg_send![label, setStringValue: title_ns];
+    center_sidebar_label(label, 38.0);
+    CFRelease(title_ns as *const c_void);
+}
+
+/// 设侧边栏按钮标题为 attributed title:未选中用次要文本色,选中用系统强调色。
+/// Set the sidebar button title as an attributed title, using the secondary text color when
 /// unselected and the system accent color when selected.
 pub(super) unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selected: bool) {
     let font: *mut AnyObject = if selected {
@@ -2104,28 +2247,9 @@ pub(super) unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selecte
     let color: *mut AnyObject = if selected {
         msg_send![class!(NSColor), controlAccentColor]
     } else {
-        msg_send![class!(NSColor), labelColor]
+        crate::ffi::hex_to_ns_color(settings_palette().secondary_text)
     };
-    let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-    let attrs: *mut AnyObject = msg_send![attrs, init];
-    let k_font = make_nsstring("NSFont");
-    let _: () = msg_send![attrs, setObject: font, forKey: k_font];
-    CFRelease(k_font as *const c_void);
-    let k_color = make_nsstring("NSColor");
-    let _: () = msg_send![attrs, setObject: color, forKey: k_color];
-    CFRelease(k_color as *const c_void);
-    let title_ns = make_nsstring(title);
-    let attr_str: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-    let attr_str: *mut AnyObject = msg_send![attr_str, initWithString: title_ns, attributes: attrs];
-    let label = SIDEBAR_TITLE_LABELS
-        .lock()
-        .unwrap()
-        .get(&(btn as usize))
-        .map(|p| p.0)
-        .unwrap_or(btn);
-    let _: () = msg_send![label, setStringValue: title_ns];
-    let _: () = msg_send![label, setAttributedStringValue: attr_str];
-    center_sidebar_label(label, 38.0);
+    set_sidebar_title_appearance(btn, title, font, color);
     if let Some(icon) = SIDEBAR_ICON_VIEWS
         .lock()
         .unwrap()
@@ -2135,9 +2259,46 @@ pub(super) unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selecte
         let _: () = msg_send![icon, setContentTintColor: color];
     }
     let _: () = msg_send![btn, setContentTintColor: color];
-    CFRelease(title_ns as *const c_void);
-    release_obj(attr_str);
-    release_obj(attrs);
+}
+
+/// Apply the sidebar hover surface and foreground transition. The selected item owns its highlight
+/// and is intentionally left untouched by hover tracking.
+/// 应用侧栏悬浮背景和前景色过渡；选中项由自己的高亮状态控制，悬浮事件不改动它。
+unsafe fn set_sidebar_hovered(btn: *mut AnyObject, hovered: bool) {
+    if btn.is_null() {
+        return;
+    }
+    let tag: isize = msg_send![btn, tag];
+    if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let palette = settings_palette();
+    let color = crate::ffi::hex_to_ns_color(if hovered {
+        palette.primary_text
+    } else {
+        palette.secondary_text
+    });
+    let label = SIDEBAR_TITLE_LABELS
+        .lock()
+        .unwrap()
+        .get(&(btn as usize))
+        .map(|p| p.0);
+    if let Some(label) = label {
+        // Only change the existing label color. Rebuilding attributed strings and measuring the
+        // cell on every mouse event blocks the main thread and makes the shared pill stutter.
+        // 这里只更新现有 label 的颜色；每次鼠标事件重建 attributed string 并测量 cell 会阻塞主线程，
+        // 导致共享悬浮层卡顿。
+        let _: () = msg_send![label, setTextColor: color];
+    }
+    if let Some(icon) = SIDEBAR_ICON_VIEWS
+        .lock()
+        .unwrap()
+        .get(&(btn as usize))
+        .map(|p| p.0)
+    {
+        let _: () = msg_send![icon, setContentTintColor: color];
+    }
+    let _: () = msg_send![btn, setContentTintColor: color];
 }
 
 /// Fit the sidebar label to its measured single-line cell height and center that frame in the
@@ -2162,6 +2323,43 @@ unsafe fn center_sidebar_label(label: *mut AnyObject, row_h: f64) {
     frame.origin.y = (row_h - measured.height).max(0.0) / 2.0;
     frame.size.height = measured.height;
     let _: () = msg_send![label, setFrame: frame];
+}
+
+/// Create the single shared hover surface used by all sidebar rows.
+/// 创建由所有侧栏条目共用的悬浮背景层。
+pub(super) unsafe fn make_sidebar_hover_highlight(
+    parent: *mut AnyObject,
+    x: f64,
+    y: f64,
+    w: f64,
+) -> *mut AnyObject {
+    // Keep the hover surface below the buttons so it is purely visual and never intercepts input.
+    // 将悬浮层放在按钮下方，使其只负责视觉效果，不拦截按钮输入。
+    let hover: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let hover: *mut AnyObject = msg_send![
+        hover,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 38.0))
+    ];
+    let _: () = msg_send![hover, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![hover, layer];
+    if !layer.is_null() {
+        layer_set_background(
+            layer,
+            crate::ffi::hex_to_cg_color(settings_palette().hover_bg),
+        );
+        let _: () = msg_send![layer, setCornerRadius: 10.0f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+    }
+    let _: () = msg_send![hover, setAlphaValue: 0.0f64];
+    let _: () = msg_send![parent, addSubview: hover];
+    SIDEBAR_HOVER_HIGHLIGHT
+        .lock()
+        .unwrap()
+        .replace(ObjPtr(hover));
+    SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+    SIDEBAR_HOVER_VISIBLE.store(false, Ordering::SeqCst);
+    release_obj(hover);
+    hover
 }
 
 /// 侧边栏按钮(borderless NSButton,左对齐图标+文字,tag 区分页)。
@@ -2233,7 +2431,7 @@ pub(super) unsafe fn make_sidebar_button(
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let label_color = crate::ffi::hex_to_ns_color(settings_palette().primary_text);
+    let label_color = crate::ffi::hex_to_ns_color(settings_palette().secondary_text);
     let _: () = msg_send![label, setTextColor: label_color];
     let _: () = msg_send![label, setSelectable: false];
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural

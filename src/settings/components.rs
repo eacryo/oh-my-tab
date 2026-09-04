@@ -8,7 +8,8 @@
 //! settings.rs 管理，避免改变回调/配置生命周期，同时让所有页面共享同一套几何规则。
 
 use objc2::runtime::{AnyObject, Sel};
-use objc2_foundation::NSRect;
+use objc2_foundation::{NSPoint, NSRect};
+use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 
 use crate::i18n::t;
@@ -611,6 +612,176 @@ fn sidebar_item_frames(w: f64) -> (NSRect, NSRect) {
 }
 
 impl SettingsSidebar {
+    /// Set a view frame without allowing AppKit's implicit layer action to race the explicit motion.
+    /// 设置 view frame 时关闭 AppKit 隐式 layer 动画，避免与显式动效争抢控制权。
+    unsafe fn set_frame_without_implicit_animation(view: *mut AnyObject, frame: NSRect) {
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![
+            objc2::class!(CATransaction),
+            setDisableActions: true
+        ];
+        let _: () = objc2::msg_send![view, setFrame: frame];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+    }
+
+    /// Move a layer-backed view's center along the sidebar using one layer position animation.
+    /// 使用单个 layer position 动画移动 layer-backed view 在侧栏中的中心位置。
+    unsafe fn spring_move_view(view: *mut AnyObject, frame: NSRect, animation_key_name: &str) {
+        let layer: *mut AnyObject = objc2::msg_send![view, layer];
+        if layer.is_null() {
+            Self::set_frame_without_implicit_animation(view, frame);
+            return;
+        }
+        // NSView backing layers are not guaranteed to use a centered anchor point. Derive the
+        // target from the layer's actual anchor so `position` remains equivalent to this frame.
+        // NSView backing layer 不保证使用中心锚点；根据实际 anchor 计算目标，让 position 与 frame 等价。
+        let anchor: NSPoint = objc2::msg_send![layer, anchorPoint];
+        let target_x = frame.origin.x + frame.size.width * anchor.x;
+        let target_y = frame.origin.y + frame.size.height * anchor.y;
+        let presentation: *mut AnyObject = objc2::msg_send![layer, presentationLayer];
+        let from_position: NSPoint = if presentation.is_null() {
+            objc2::msg_send![layer, position]
+        } else {
+            objc2::msg_send![presentation, position]
+        };
+        let animation_key = crate::ffi::make_nsstring(animation_key_name);
+        let _: () = objc2::msg_send![layer, removeAnimationForKey: animation_key];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![
+            objc2::class!(CATransaction),
+            setDisableActions: true
+        ];
+        let _: () = objc2::msg_send![
+            layer,
+            setPosition: NSPoint::new(target_x, target_y)
+        ];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+
+        let key_path = crate::ffi::make_nsstring("position.y");
+        let from_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: from_position.y];
+        let target_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: target_y];
+        let animation: *mut AnyObject = objc2::msg_send![
+            objc2::class!(CASpringAnimation),
+            animationWithKeyPath: key_path
+        ];
+        let _: () = objc2::msg_send![animation, setFromValue: from_value];
+        let _: () = objc2::msg_send![animation, setToValue: target_value];
+        let _: () = objc2::msg_send![animation, setMass: 0.6f64];
+        let _: () = objc2::msg_send![animation, setStiffness: 360.0f64];
+        let _: () = objc2::msg_send![animation, setDamping: 32.0f64];
+        let _: () = objc2::msg_send![animation, setInitialVelocity: 0.0f64];
+        let duration: f64 = objc2::msg_send![animation, settlingDuration];
+        let _: () = objc2::msg_send![animation, setDuration: duration];
+        let _: () = objc2::msg_send![layer, addAnimation: animation, forKey: animation_key];
+        crate::ffi::CFRelease(key_path as *const std::ffi::c_void);
+        crate::ffi::CFRelease(animation_key as *const std::ffi::c_void);
+    }
+
+    /// Fade a sidebar background layer from its current presentation opacity to the target.
+    /// 将侧栏背景图层从当前 presentation opacity 淡入或淡出到目标值。
+    unsafe fn fade_view(view: *mut AnyObject, target_opacity: f32, animation_key_name: &str) {
+        let layer: *mut AnyObject = objc2::msg_send![view, layer];
+        if layer.is_null() {
+            let _: () = objc2::msg_send![view, setAlphaValue: target_opacity as f64];
+            return;
+        }
+        let presentation: *mut AnyObject = objc2::msg_send![layer, presentationLayer];
+        let from_opacity: f32 = if presentation.is_null() {
+            objc2::msg_send![layer, opacity]
+        } else {
+            objc2::msg_send![presentation, opacity]
+        };
+        let animation_key = crate::ffi::make_nsstring(animation_key_name);
+        let _: () = objc2::msg_send![layer, removeAnimationForKey: animation_key];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![
+            objc2::class!(CATransaction),
+            setDisableActions: true
+        ];
+        let _: () = objc2::msg_send![layer, setOpacity: target_opacity];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+        let key_path = crate::ffi::make_nsstring("opacity");
+        let animation: *mut AnyObject = objc2::msg_send![
+            objc2::class!(CABasicAnimation),
+            animationWithKeyPath: key_path
+        ];
+        let from: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithFloat: from_opacity];
+        let to: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithFloat: target_opacity];
+        let _: () = objc2::msg_send![animation, setFromValue: from];
+        let _: () = objc2::msg_send![animation, setToValue: to];
+        let _: () = objc2::msg_send![animation, setDuration: 0.15f64];
+        let _: () = objc2::msg_send![layer, addAnimation: animation, forKey: animation_key];
+        crate::ffi::CFRelease(key_path as *const std::ffi::c_void);
+        crate::ffi::CFRelease(animation_key as *const std::ffi::c_void);
+    }
+
+    /// Move the active-row background with beUI's shared-layout spring.
+    /// 使用 beUI 共享布局背景同款的 spring 移动选中行高亮。
+    pub(super) unsafe fn move_highlight(highlight: *mut AnyObject, frame: NSRect, animated: bool) {
+        if highlight.is_null() {
+            return;
+        }
+        if !animated {
+            Self::set_frame_without_implicit_animation(highlight, frame);
+            return;
+        }
+        Self::spring_move_view(highlight, frame, "settings-sidebar-highlight-spring");
+    }
+
+    /// Move the shared hover pill, fading it in only on the first item entered.
+    /// 移动共享悬浮气泡，仅在首次进入菜单时淡入。
+    pub(super) unsafe fn move_hover_highlight(hover: *mut AnyObject, frame: NSRect) {
+        if hover.is_null() {
+            return;
+        }
+        let was_visible = widgets::SIDEBAR_HOVER_VISIBLE.swap(true, Ordering::SeqCst);
+        if was_visible {
+            Self::spring_move_view(hover, frame, "settings-sidebar-hover-spring");
+        } else {
+            Self::set_frame_without_implicit_animation(hover, frame);
+            Self::fade_view(hover, 1.0, "settings-sidebar-hover-opacity");
+        }
+    }
+
+    /// Hide the shared hover pill after the pointer leaves the whole menu.
+    /// 指针离开整个菜单后隐藏共享悬浮气泡。
+    pub(super) unsafe fn hide_hover_highlight(hover: *mut AnyObject) {
+        if hover.is_null() {
+            return;
+        }
+        if widgets::SIDEBAR_HOVER_VISIBLE.swap(false, Ordering::SeqCst) {
+            Self::fade_view(hover, 0.0, "settings-sidebar-hover-opacity");
+        }
+    }
+
+    /// Remove the hover surface immediately when a click promotes that row to selected.
+    /// 点击将条目提升为选中态时立即移除悬浮层，避免与选中背景短暂重叠。
+    pub(super) unsafe fn hide_hover_highlight_immediately(hover: *mut AnyObject) {
+        if hover.is_null() {
+            return;
+        }
+        widgets::SIDEBAR_HOVER_VISIBLE.store(false, Ordering::SeqCst);
+        let layer: *mut AnyObject = objc2::msg_send![hover, layer];
+        if layer.is_null() {
+            let _: () = objc2::msg_send![hover, setAlphaValue: 0.0f64];
+            return;
+        }
+        let opacity_key = crate::ffi::make_nsstring("settings-sidebar-hover-opacity");
+        let position_key = crate::ffi::make_nsstring("settings-sidebar-hover-spring");
+        let _: () = objc2::msg_send![layer, removeAnimationForKey: opacity_key];
+        let _: () = objc2::msg_send![layer, removeAnimationForKey: position_key];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+        let _: () = objc2::msg_send![layer, setOpacity: 0.0f32];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+        crate::ffi::CFRelease(opacity_key as *const std::ffi::c_void);
+        crate::ffi::CFRelease(position_key as *const std::ffi::c_void);
+    }
+
     pub(super) unsafe fn build(
         parent: *mut AnyObject,
         target: *mut AnyObject,
@@ -633,6 +804,8 @@ impl SettingsSidebar {
             ),
             ("settings.sidebar_about", SettingsSidebarIcon::About),
         ];
+        widgets::make_sidebar_hover_highlight(parent, x, y0, w);
+        widgets::make_sidebar_hover_tracking(parent, x, y0, w);
         std::array::from_fn(|index| {
             let (title_key, icon) = entries[index];
             SettingsSidebarTab::attach(

@@ -1488,6 +1488,11 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
     let btn = sender as *mut AnyObject;
     let tag: isize = unsafe { msg_send![btn, tag] };
     select_sidebar(tag as usize);
+    unsafe {
+        // A clicked row may still carry the shared hover surface until AppKit emits mouseExited.
+        // 点击条目后 AppKit 可能尚未发送 mouseExited，先立即清理共享悬浮层，避免两层背景重叠。
+        widgets::clear_sidebar_hover();
+    }
 }
 
 /// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换六个内容视图显隐、选中项粗体。
@@ -1496,7 +1501,7 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
 fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
     let idx = if idx > 5 { 0 } else { idx };
-    SIDEBAR_SELECTED.store(idx, Ordering::SeqCst);
+    let previous_idx = SIDEBAR_SELECTED.swap(idx, Ordering::SeqCst);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         let ui = match ui.as_ref() {
@@ -1521,7 +1526,17 @@ fn select_sidebar(idx: usize) {
         ];
         // 高亮背景对齐到选中按钮的 frame / align the highlight to the selected button's frame
         let frame: NSRect = msg_send![buttons[idx], frame];
-        let _: () = msg_send![ui.sidebar_highlight, setFrame: frame];
+        // 鼠标已经停在目标 tab 上时,悬停背景已完成定位；点击只需同步选中态,避免重复播放
+        // 一段明显的位移动画。键盘切换或非悬停切换仍保留完整 spring。
+        // When the pointer is already over the target tab, the hover background is in place;
+        // clicking only synchronizes selection instead of replaying a conspicuous glide.
+        // Keyboard and non-hovered selection changes keep the full spring.
+        let target_is_hovered = widgets::sidebar_button_is_hovered(buttons[idx]);
+        SettingsSidebar::move_highlight(
+            ui.sidebar_highlight,
+            frame,
+            previous_idx != idx && !target_is_hovered,
+        );
         // 选中项使用强调色粗体，未选中项使用系统常规文本色。
         // Selected items use an accent-colored bold title; unselected items use the system label color.
         let titles = [
