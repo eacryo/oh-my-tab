@@ -4424,13 +4424,15 @@ fn create_settings_window() {
         // multi-row cards. The rows are contiguous here, so the divider sits at their shared edge.
         // 两个更新开关属于同一张多行卡片，复用其他卡片的内缩分割线；两行相邻，分割线放在共享边界。
         SettingsRow::separator(about_view, update_row_y, content_w);
-        // 检查更新:全宽长按钮,标题随流程在「检查更新…/检查中…/已是最新版本」间切换,尺寸不变。
-        // Check for updates: a full-width button whose title switches between "Check for Updates…",
-        // "Checking…", and "You're up to date" without changing size.
+        // 检查更新:加高的全宽按钮,标题随流程在「检查更新…/检查中…/已是最新版本」间切换。
+        // Check for updates: a taller full-width button whose title switches between
+        // "Check for Updates…", "Checking…", and "You're up to date".
+        let check_button_h = 38.0;
+        let check_button_y = download_row_y - 14.0 - check_button_h;
         let check_button = SettingsButton::action(
             NSRect::new(
-                NSPoint::new(label_x, update_row_y - described_row_h - 46.0),
-                NSSize::new(content_w - 2.0 * label_x, 32.0),
+                NSPoint::new(label_x, check_button_y),
+                NSSize::new(content_w - 2.0 * label_x, check_button_h),
             ),
             &t("settings.btn_check_for_updates"),
             target,
@@ -4452,13 +4454,12 @@ fn create_settings_window() {
         // Inline update-flow host container: update status/progress/buttons render here instead of
         // a separate NSWindow. Empty and hidden by default, so the About page stays compact; an
         // active flow expands the card + host via expand_update_section.
-        // 宿主直接占用「检查更新」按钮的 frame(update_row_y - described_row_h - 46),内容用顶向下
-        // 坐标排布,更新状态会替换按钮而不是追加在按钮下方。初始高度为 0,故 origin.y 即顶边。
-        // The host occupies the check-button frame (update_row_y - described_row_h - 46); its
-        // top-down content replaces the button instead of being appended below it. With an initial
-        // height of 0, origin.y is the top.
+        // 宿主直接占用「检查更新」按钮的位置,内容用顶向下坐标排布,更新状态会替换按钮而不是
+        // 追加在按钮下方。初始高度为 0,故 origin.y 即顶边。
+        // The host occupies the check button's position; its top-down content replaces the button
+        // instead of being appended below it. With an initial height of 0, origin.y is the top.
         let compact_host_h = 0.0;
-        let host_origin_y = update_row_y - described_row_h - 46.0;
+        let host_origin_y = check_button_y;
         let update_host: *mut AnyObject = msg_send![class!(NSView), alloc];
         let update_host: *mut AnyObject = msg_send![
             update_host,
@@ -4475,11 +4476,10 @@ fn create_settings_window() {
         ui.update_host_origin_y = host_origin_y;
         ui.update_host_window = window;
         crate::updater::set_update_host(update_host, window, check_button);
-        // 收起时的卡片下沿紧贴「检查更新」按钮下方(update_row_y - described_row_h - 56),
-        // 默认为内联区域预留,避免大块空白。
-        // Collapsed card bottom hugs the check button below (update_row_y - described_row_h - 56);
-        // the inline area is not reserved by default, avoiding a large blank.
-        let compact_card_bottom = update_row_y - described_row_h - 56.0;
+        // 收起时的卡片下沿紧贴「检查更新」按钮下方 10pt,默认不为内联区域预留大块空白。
+        // The collapsed card bottom hugs the check button with a 10pt inset; the inline area is
+        // not reserved by default, avoiding a large blank.
+        let compact_card_bottom = check_button_y - 10.0;
         let update_card_parts = SettingsSection::attach(
             about_view,
             NSRect::new(

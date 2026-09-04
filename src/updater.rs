@@ -7,14 +7,14 @@
 
 use crate::ffi::{
     bundle_info_string, class_addMethod, make_nsstring, objc_allocateClassPair, objc_msgSend,
-    objc_msgSendSuper, objc_registerClassPair, ObjcSuper,
+    objc_msgSendSuper, objc_registerClassPair, ObjPtr, ObjcSuper,
 };
 use crate::i18n::{t, tf};
 use crate::skylight;
 use crate::{ffi::release_obj, log_debug, log_info};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -47,7 +47,8 @@ struct UpdateUiState {
     host_view: usize,
     host_window: usize,
     check_button: usize,
-    check_loading_indicator: usize,
+    check_loading_timer: usize,
+    check_loading_frame: usize,
     cancellation: usize,
     acknowledgement: usize,
     update_reply: usize,
@@ -66,7 +67,8 @@ static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
         host_view: 0,
         host_window: 0,
         check_button: 0,
-        check_loading_indicator: 0,
+        check_loading_timer: 0,
+        check_loading_frame: 0,
         cancellation: 0,
         acknowledgement: 0,
         update_reply: 0,
@@ -87,6 +89,8 @@ static CHECK_TIMER: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::n
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 const INLINE_UPDATE_HEIGHT: f64 = 140.0;
+const CHECK_LOADING_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+const CHECK_LOADING_CYCLE_SECONDS: f64 = 1.0;
 
 /// The dynamically registered subclass is retained by the Objective-C runtime forever.
 struct CustomDriverClass(*mut AnyObject);
@@ -96,6 +100,7 @@ unsafe impl Sync for CustomDriverClass {}
 
 static CUSTOM_DRIVER_CLASS: OnceLock<CustomDriverClass> = OnceLock::new();
 static CUSTOM_DRIVER_SUPERCLASS: OnceLock<usize> = OnceLock::new();
+static CHECK_LOADING_TIMER_TARGET: OnceLock<ObjPtr> = OnceLock::new();
 
 unsafe fn send_id(receiver: *mut AnyObject, selector: Sel) -> *mut AnyObject {
     type Fn = unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject;
@@ -511,7 +516,8 @@ unsafe fn close_custom_update_window() {
     ui.progress = 0;
     ui.status_label = 0;
     ui.cancel_button = 0;
-    ui.check_loading_indicator = 0;
+    ui.check_loading_timer = 0;
+    ui.check_loading_frame = 0;
     ui.expected_length = 0;
     ui.received_length = 0;
 }
@@ -539,131 +545,147 @@ pub(crate) fn clear_update_host() {
     ui.host_view = 0;
     ui.host_window = 0;
     ui.check_button = 0;
-    ui.check_loading_indicator = 0;
+    ui.check_loading_timer = 0;
+    ui.check_loading_frame = 0;
 }
 
-/// 停止检查更新按钮上的点阵动画;根图层保留以便下次检查时复用。
-/// Stop the check button's dot animation; keep the root layer for reuse on the next check.
+/// 停止检查更新按钮上的 Braille 字符动画。
+/// Stop the Braille glyph animation on the check-updates button.
 unsafe fn stop_check_loading_indicator(button: *mut AnyObject) {
     if button.is_null() {
         return;
     }
-    let indicator = UPDATE_UI_STATE.lock().unwrap().check_loading_indicator;
-    if indicator == 0 {
-        return;
+    let timer = {
+        let mut ui = UPDATE_UI_STATE.lock().unwrap();
+        ui.check_loading_frame = 0;
+        std::mem::take(&mut ui.check_loading_timer)
+    };
+    if timer != 0 {
+        let _: () = msg_send![timer as *mut AnyObject, invalidate];
     }
-    let indicator = indicator as *mut AnyObject;
-    let sublayers: *mut AnyObject = msg_send![indicator, sublayers];
-    if !sublayers.is_null() {
-        let count: usize = msg_send![sublayers, count];
-        let animation_key = make_nsstring("oh-my-tab-update-dot-pulse");
-        for index in 0..count {
-            let dot: *mut AnyObject = msg_send![sublayers, objectAtIndex: index];
-            let _: () = msg_send![dot, removeAnimationForKey: animation_key];
-        }
-        crate::ffi::CFRelease(animation_key as *const c_void);
-    }
-    let _: () = msg_send![indicator, setHidden: true];
 }
 
-/// 启动检查更新按钮上的三点呼吸动画,点位跟随本地化按钮标题右侧。
-/// Start a three-dot breathing animation beside the localized button title.
+fn check_loading_title(frame: usize, label: &str) -> String {
+    format!(
+        "{} {label}",
+        CHECK_LOADING_FRAMES[frame % CHECK_LOADING_FRAMES.len()]
+    )
+}
+
+unsafe fn set_check_loading_frame(button: *mut AnyObject, frame: usize) {
+    if button.is_null() {
+        return;
+    }
+    let title = make_nsstring(&check_loading_title(frame, &t("settings.update_checking")));
+    let _: () = msg_send![button, setTitle: title];
+    crate::ffi::CFRelease(title as *const c_void);
+
+    // Braille 字符与中文会落到不同字体；复用按钮生成的富文本属性，仅把首字符换成稍大的
+    // 等宽字形并上移 1pt，校正视觉中心而不改变整组标题的水平居中。
+    // Braille and CJK resolve to different fonts. Preserve the button-generated attributes, then
+    // give only the first glyph a slightly larger monospaced font and a 1pt upward optical shift.
+    let attributed: *mut AnyObject = msg_send![button, attributedTitle];
+    if attributed.is_null() {
+        return;
+    }
+    let adjusted: *mut AnyObject = msg_send![attributed, mutableCopy];
+    if adjusted.is_null() {
+        return;
+    }
+    let button_font: *mut AnyObject = msg_send![button, font];
+    let button_font_size: f64 = if button_font.is_null() {
+        13.0
+    } else {
+        msg_send![button_font, pointSize]
+    };
+    let loader_font: *mut AnyObject = msg_send![
+        class!(NSFont),
+        monospacedSystemFontOfSize: button_font_size + 1.0,
+        weight: 0.0f64
+    ];
+    let baseline_offset: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
+    let font_key = make_nsstring("NSFont");
+    let baseline_key = make_nsstring("NSBaselineOffset");
+    let loader_range = NSRange::new(0, 1);
+    let _: () =
+        msg_send![adjusted, addAttribute: font_key, value: loader_font, range: loader_range];
+    let _: () = msg_send![adjusted, addAttribute: baseline_key, value: baseline_offset, range: loader_range];
+    crate::ffi::CFRelease(font_key as *const c_void);
+    crate::ffi::CFRelease(baseline_key as *const c_void);
+    let _: () = msg_send![button, setAttributedTitle: adjusted];
+    release_obj(adjusted);
+}
+
+extern "C" fn advance_check_loading_frame(_this: *mut c_void, _cmd: Sel, _timer: *mut c_void) {
+    let (button, frame) = {
+        let mut ui = UPDATE_UI_STATE.lock().unwrap();
+        if ui.check_loading_timer == 0 || ui.check_button == 0 {
+            return;
+        }
+        let frame = ui.check_loading_frame;
+        ui.check_loading_frame = (frame + 1) % CHECK_LOADING_FRAMES.len();
+        (ui.check_button as *mut AnyObject, frame)
+    };
+    unsafe { set_check_loading_frame(button, frame) };
+}
+
+/// 用于在主运行循环中轮换按钮 Braille 字符的 NSTimer target。
+/// NSTimer target used to cycle the button's Braille glyph on the main run loop.
+unsafe fn check_loading_timer_target() -> *mut AnyObject {
+    CHECK_LOADING_TIMER_TARGET
+        .get_or_init(|| {
+            let name = CString::new("OhMyTabUpdateCheckLoadingTimerTarget").unwrap();
+            let superclass = class!(NSObject) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(advanceCheckLoadingFrame:),
+                advance_check_loading_frame as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            let target: *mut AnyObject = msg_send![cls as *const AnyObject, new];
+            ObjPtr(target)
+        })
+        .0
+}
+
+/// 启动检查更新按钮上的 ASCII Braille 动画,字符与本地化状态文案一起居中。
+/// Start the ASCII Braille animation centered together with the localized status label.
 unsafe fn start_check_loading_indicator(button: *mut AnyObject) {
     if button.is_null() {
         return;
     }
-    let button_layer: *mut AnyObject = msg_send![button, layer];
-    if button_layer.is_null() {
-        return;
-    }
+    stop_check_loading_indicator(button);
+    set_check_loading_frame(button, 0);
+    let accessibility_label = make_nsstring(&t("settings.update_checking"));
+    let _: () = msg_send![button, setAccessibilityLabel: accessibility_label];
+    crate::ffi::CFRelease(accessibility_label as *const c_void);
 
-    let indicator = {
-        let mut ui = UPDATE_UI_STATE.lock().unwrap();
-        if ui.check_loading_indicator == 0 {
-            let indicator: *mut AnyObject = msg_send![class!(CALayer), layer];
-            let _: () = msg_send![button_layer, addSublayer: indicator];
-            ui.check_loading_indicator = indicator as usize;
-            indicator
-        } else {
-            ui.check_loading_indicator as *mut AnyObject
-        }
-    };
-
-    let bounds: NSRect = msg_send![button, bounds];
-    // NSButton 的 titleRectForBounds: 可能返回整个内容区域;改用实际富文本标题尺寸,
-    // 才能把点准确放在居中标题的右侧。
-    // NSButton's titleRectForBounds: may return the whole content area; use the actual attributed
-    // title size so the dots land immediately after the centered title.
-    let attributed_title: *mut AnyObject = msg_send![button, attributedTitle];
-    let title_size = if attributed_title.is_null() {
-        NSSize::new(0.0, bounds.size.height)
+    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+    let reduce_motion: bool = msg_send![workspace, accessibilityDisplayShouldReduceMotion];
+    let cycle_seconds = if reduce_motion {
+        CHECK_LOADING_CYCLE_SECONDS * 2.5
     } else {
-        msg_send![attributed_title, size]
+        CHECK_LOADING_CYCLE_SECONDS
     };
-    let dot_size = 4.0;
-    let dot_gap = 4.0;
-    let indicator_w = dot_size * 3.0 + dot_gap * 2.0;
-    let title_origin_x = bounds.origin.x + (bounds.size.width - title_size.width) / 2.0;
-    let start_x = (title_origin_x + title_size.width + 6.0)
-        .min(bounds.origin.x + bounds.size.width - indicator_w - 8.0);
-    let start_y = bounds.origin.y + (bounds.size.height - dot_size) / 2.0;
-    let _: () = msg_send![indicator, setFrame: bounds];
-    let _: () = msg_send![indicator, setHidden: false];
-
-    let sublayers: *mut AnyObject = msg_send![indicator, sublayers];
-    let animation_key = make_nsstring("oh-my-tab-update-dot-pulse");
-    let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.25f64];
-    let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
-    for index in 0..3usize {
-        let dot: *mut AnyObject = if !sublayers.is_null() {
-            let count: usize = msg_send![sublayers, count];
-            if index < count {
-                msg_send![sublayers, objectAtIndex: index]
-            } else {
-                std::ptr::null_mut()
-            }
-        } else {
-            std::ptr::null_mut()
-        };
-        let dot = if dot.is_null() {
-            let dot: *mut AnyObject = msg_send![class!(CALayer), layer];
-            crate::ffi::layer_set_background(
-                dot,
-                crate::ffi::hex_to_cg_color(crate::theme::ui_palette().button_text),
-            );
-            let _: () = msg_send![dot, setCornerRadius: dot_size / 2.0];
-            let _: () = msg_send![indicator, addSublayer: dot];
-            dot
-        } else {
-            dot
-        };
-        let _: () = msg_send![
-            dot,
-            setFrame: NSRect::new(
-                NSPoint::new(start_x + index as f64 * (dot_size + dot_gap), start_y),
-                NSSize::new(dot_size, dot_size)
-            )
-        ];
-        let _: () = msg_send![dot, removeAnimationForKey: animation_key];
-        let key_path = make_nsstring("opacity");
-        let animation: *mut AnyObject = msg_send![
-            class!(CABasicAnimation),
-            animationWithKeyPath: key_path
-        ];
-        crate::ffi::CFRelease(key_path as *const c_void);
-        let _: () = msg_send![animation, setFromValue: from_value];
-        let _: () = msg_send![animation, setToValue: to_value];
-        let _: () = msg_send![animation, setDuration: 0.45f64];
-        let _: () = msg_send![animation, setAutoreverses: true];
-        let _: () = msg_send![animation, setRepeatCount: f32::INFINITY];
-        let _: () = msg_send![animation, setTimeOffset: index as f64 * 0.15];
-        let _: () = msg_send![dot, addAnimation: animation, forKey: animation_key];
-    }
-    crate::ffi::CFRelease(animation_key as *const c_void);
+    let interval = cycle_seconds / CHECK_LOADING_FRAMES.len() as f64;
+    UPDATE_UI_STATE.lock().unwrap().check_loading_frame = 1;
+    let timer: *mut AnyObject = msg_send![
+        class!(NSTimer),
+        scheduledTimerWithTimeInterval: interval,
+        target: check_loading_timer_target(),
+        selector: sel!(advanceCheckLoadingFrame:),
+        userInfo: std::ptr::null::<AnyObject>(),
+        repeats: true
+    ];
+    let _: () = msg_send![timer, setTolerance: interval * 0.15];
+    UPDATE_UI_STATE.lock().unwrap().check_loading_timer = timer as usize;
 }
 
-/// 更新 About 页「检查更新」按钮的文案与可用态;按钮尺寸保持不变。
-/// Update the About page check-updates button title and enabled state; its size stays fixed.
+/// 更新 About 页「检查更新」按钮的文案与可用态。
+/// Update the About page check-updates button title and enabled state.
 pub(crate) fn set_check_button_status(title: &str, enabled: bool) {
     let button = UPDATE_UI_STATE.lock().unwrap().check_button;
     if button == 0 {
@@ -671,13 +693,14 @@ pub(crate) fn set_check_button_status(title: &str, enabled: bool) {
     }
     unsafe {
         let btn = button as *mut AnyObject;
-        let ns = make_nsstring(title);
-        let _: () = msg_send![btn, setTitle: ns];
-        crate::ffi::CFRelease(ns as *const c_void);
-        let _: () = msg_send![btn, setEnabled: enabled];
         if enabled {
             stop_check_loading_indicator(btn);
         }
+        let ns = make_nsstring(title);
+        let _: () = msg_send![btn, setTitle: ns];
+        let _: () = msg_send![btn, setAccessibilityLabel: ns];
+        crate::ffi::CFRelease(ns as *const c_void);
+        let _: () = msg_send![btn, setEnabled: enabled];
     }
 }
 
