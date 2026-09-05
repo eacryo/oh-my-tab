@@ -87,3 +87,7 @@ the worktree.
 
 Note that the Style word only used for code style change, not UI style change.
 UI style change usually use feat or fix.
+
+If the user replies exactly "allow commit" after a commit message was provided in this conversation, inspect git status and all three Git diff views first. Commit only the intended changes with that exact message; do not stage unrelated changes. Ask if the scope is ambiguous.
+
+If the user replies exactly "allow push" after a commit message was provided in this conversation, inspect the worktree first, commit only the intended changes with that exact message, then push the current branch to its configured upstream. Ask if the scope or upstream is ambiguous.
