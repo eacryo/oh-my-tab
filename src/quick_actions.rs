@@ -94,13 +94,13 @@ fn action_enabled(action: QuickAction) -> bool {
 
 /// tap 回调:只关心 Option+I/E/D(不带其他修饰键)。启用时吞掉 keyDown/keyUp 并把非
 /// 自动重复的 keyDown 投递给主线程;关闭时全部透传(功能关闭 = 组合键还给系统)。
-/// 自己是前台 App 时也透传,设置窗口文本框不受影响。
+/// 自己是前台 App 时,仅在设置文本框正在编辑时透传,避免把整个设置窗口误判为输入场景。
 ///
 /// The tap callback: only cares about Option+I/E/D (no extra modifiers). When enabled it
 /// swallows matching keyDown/keyUp and forwards non-autorepeat keyDowns to the main thread;
 /// when disabled everything passes through (a disabled feature returns the combo to the
-/// system). Also passes through when we are the frontmost app, keeping our own settings
-/// text fields intact.
+/// system). When our app is frontmost, it passes through only while a settings text field is
+/// actively editing, rather than exempting the entire settings window.
 unsafe extern "C" fn quick_actions_tap_callback(
     _proxy: CGEventTapProxy,
     event_type: CGEventType,
@@ -130,7 +130,7 @@ unsafe extern "C" fn quick_actions_tap_callback(
         return event;
     }
     let (_name, pid) = crate::ffi::frontmost_app_info();
-    if pid == std::process::id() as i32 {
+    if pid == std::process::id() as i32 && crate::settings::is_text_input_active() {
         return event;
     }
     if event_type == K_CG_EVENT_KEY_DOWN {

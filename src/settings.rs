@@ -343,6 +343,22 @@ const MAPPING_ACTION_SYMBOLS: [&str; 8] = [
 ];
 unsafe impl Sync for SettingsUi {}
 static SETTINGS_UI: Mutex<Option<SettingsUi>> = Mutex::new(None);
+/// Whether an editable settings text field currently owns keyboard input.
+/// 设置窗口中是否有可编辑文本框当前持有键盘输入。
+static TEXT_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Update the cross-thread text-input hint used by the quick-action event tap.
+/// 更新快捷操作事件 tap 跨线程读取的文本输入状态提示。
+pub(crate) fn set_text_input_active(active: bool) {
+    TEXT_INPUT_ACTIVE.store(active, Ordering::Release);
+}
+
+/// Read whether the settings window currently has an editable text input.
+/// 读取设置窗口当前是否有可编辑文本输入。
+pub(crate) fn is_text_input_active() -> bool {
+    TEXT_INPUT_ACTIVE.load(Ordering::Acquire)
+}
+
 /// A visible settings window cannot be rebuilt during an appearance notification without
 /// discarding unsaved edits; rebuild it immediately after the user closes it instead.
 /// 设置窗口可见时不能在外观通知中直接重建(否则会丢未保存编辑),关闭后再立即重建。
@@ -2556,6 +2572,7 @@ fn show_settings_inner(
             // 清掉默认 first responder,避免打开时焦点落在 Glass color 控件。
             // Clear the default first responder so focus does not land on the Glass color control on open.
             let _: bool = msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
+            set_text_input_active(false);
             // 按当前权限刷新警告条显隐(有权限就隐藏)/ refresh banner visibility by current permission
             let _: () =
                 msg_send![u.accessibility_warning_view, setHidden: has_accessibility_permission()];
@@ -2568,6 +2585,7 @@ fn hide_settings() {
     // Defensive: wrap up any in-progress recording / edit panel when the window closes.
     cancel_recording_from_main();
     close_mapping_panel();
+    set_text_input_active(false);
     // 关闭设置时丢弃未确认的恢复动作,下次打开重新从单按钮开始(两套确认卡片)。
     // Closing settings discards any unconfirmed restore action and resets to one button (both
     // cards).
@@ -3319,6 +3337,25 @@ const NSEVENT_MODIFIER_FLAG_COMMAND: u64 = 1 << 20;
 const KEYCODE_Q: u16 = 12;
 const NSEVENT_TYPE_LEFT_MOUSE_DOWN: usize = 1;
 
+/// Refresh the cross-thread hint for the quick-action tap from the window's current responder.
+/// 根据窗口当前 first responder 刷新快捷操作 tap 使用的跨线程状态提示。
+unsafe fn refresh_text_input_state(window: *mut AnyObject) {
+    let responder: *mut AnyObject = msg_send![window, firstResponder];
+    if responder.is_null() {
+        set_text_input_active(false);
+        return;
+    }
+    let is_text_field: bool = msg_send![responder, isKindOfClass: class!(NSTextField)];
+    let is_field_editor: bool = msg_send![responder, isKindOfClass: class!(NSTextView)];
+    let active = if is_text_field || is_field_editor {
+        let editable: bool = msg_send![responder, isEditable];
+        editable
+    } else {
+        false
+    };
+    set_text_input_active(active);
+}
+
 /// End inline text editing when the user clicks elsewhere in the settings window.
 ///
 /// The settings window uses a borderless collection of plain NSViews as its page background.
@@ -3356,6 +3393,9 @@ extern "C" fn settings_window_send_event(_self: *mut c_void, _cmd: Sel, event: *
             ),
             sendEvent: event
         ];
+        if !_self.is_null() {
+            refresh_text_input_state(_self as *mut AnyObject);
+        }
     }
 }
 
@@ -5761,6 +5801,7 @@ unsafe fn detach_settings_window_runtime(ui: &SettingsUi, remove_traffic_light_o
 /// current locale on next open. 用于 locale 变更后让设置窗口标签换语言。
 pub(crate) fn invalidate_settings_window() {
     SYSTEM_APPEARANCE_REBUILD_PENDING.store(false, Ordering::SeqCst);
+    set_text_input_active(false);
     let ui = SETTINGS_UI.lock().unwrap().take();
     if let Some(u) = ui {
         unsafe {
