@@ -914,6 +914,22 @@ impl RestoreDefaultsControl {
             && !self.container.is_null()
     }
 
+    /// Test whether a hit-tested settings view belongs to the expanded restore card.
+    /// 判断设置窗口命中的 view 是否属于当前展开的恢复卡片。
+    pub(super) unsafe fn contains_hit_view(self, hit_view: *mut AnyObject) -> bool {
+        if !self.is_ready() || !self.expanded || hit_view.is_null() {
+            return false;
+        }
+        let mut view = hit_view;
+        while !view.is_null() {
+            if view == self.container || view == self.surface {
+                return true;
+            }
+            view = objc2::msg_send![view, superview];
+        }
+        false
+    }
+
     /// Toggle the component as one animated unit; the bottom row remains anchored in place.
     /// 将整个控件作为一个动画单元切换；底部一行始终保持锚定。
     pub(super) unsafe fn set_expanded(&mut self, expanded: bool, animated: bool) {

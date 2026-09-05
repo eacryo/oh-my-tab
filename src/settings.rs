@@ -2736,6 +2736,46 @@ fn collapse_restore_confirmations(animated: bool) {
     set_page_restore_confirmation_expanded(false, animated);
 }
 
+/// 点击所有恢复确认组件之外的区域时收起确认卡片,恢复原始恢复按钮。
+/// Collapse the confirmation card when a click lands outside every restore control, returning
+/// each control to its original restore button.
+fn collapse_restore_confirmations_on_external_click(window: *mut AnyObject, event: *mut AnyObject) {
+    if window.is_null() || event.is_null() {
+        return;
+    }
+    unsafe {
+        let location: NSPoint = msg_send![event, locationInWindow];
+        let ui_guard = SETTINGS_UI.lock().unwrap();
+        let Some(ui) = ui_guard.as_ref() else {
+            return;
+        };
+        let any_expanded =
+            ui.restore_defaults.expanded || ui.page_restores.iter().any(|control| control.expanded);
+        if !any_expanded {
+            return;
+        }
+        let content: *mut AnyObject = msg_send![window, contentView];
+        if content.is_null() {
+            return;
+        }
+        let point: NSPoint = msg_send![
+            content,
+            convertPoint: location,
+            fromView: std::ptr::null::<AnyObject>()
+        ];
+        let hit_view: *mut AnyObject = msg_send![content, hitTest: point];
+        let inside_restore = ui.restore_defaults.contains_hit_view(hit_view)
+            || ui
+                .page_restores
+                .iter()
+                .any(|control| control.contains_hit_view(hit_view));
+        drop(ui_guard);
+        if !inside_restore {
+            collapse_restore_confirmations(true);
+        }
+    }
+}
+
 /// 将整应用恢复确认区域切换到展开或收起状态。底部按钮保持锚定,确认按钮向上展开。
 /// Toggle the whole-app restore confirmation area. The bottom action stays anchored while
 /// confirmation grows upward into the available space.
@@ -3188,6 +3228,7 @@ extern "C" fn settings_window_send_event(_self: *mut c_void, _cmd: Sel, event: *
             let event_type: usize = msg_send![event, type];
             if event_type == NSEVENT_TYPE_LEFT_MOUSE_DOWN {
                 let window = _self as *mut AnyObject;
+                collapse_restore_confirmations_on_external_click(window, event);
                 widgets::settings_select_handle_window_mouse_down(window, event);
                 tooltip::SettingsTooltip::handle_mouse_down(window, event);
                 let first_responder: *mut AnyObject = msg_send![window, firstResponder];
