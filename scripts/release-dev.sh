@@ -31,6 +31,7 @@ cd "$(dirname "$0")/.."
 APP_BASENAME="${APP_BASENAME:-Oh-My-Tab-Dev}"
 BUNDLE_ID="${BUNDLE_ID:-com.eacryo.oh-my-tab.dev}"
 BUNDLE_NAME="${BUNDLE_NAME:-Oh-My-Tab Dev}"
+CARGO_BUILD_FEATURES="dev-long-text"
 SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://download.oh-my-tab.app/dev_release/appcast.xml}"
 R2_RELEASE_PREFIX="${R2_RELEASE_PREFIX:-dev_release}"
 R2_APPCAST_KEY="${R2_APPCAST_KEY:-dev_release/appcast.xml}"
@@ -44,6 +45,7 @@ DMG="dist/${APP_BASENAME}.dmg"
 APP_BASENAME="$APP_BASENAME" \
 BUNDLE_ID="$BUNDLE_ID" \
 BUNDLE_NAME="$BUNDLE_NAME" \
+CARGO_BUILD_FEATURES="$CARGO_BUILD_FEATURES" \
 SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
 sh scripts/bundle.sh
 

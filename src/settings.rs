@@ -33,11 +33,30 @@ use crate::{log_debug, log_info};
 use crate::MENU_TARGET;
 
 // locale 下拉项:显示用各语言原生写法(语言选择器的通用约定),值对应 config.i18n.locale。
-// Locale popup items: displayed in each language's own script (convention for language pickers);
-// values map to config.i18n.locale.
+// debug 构建额外提供长英语夹具,生产构建完全不包含该项。
+// Locale popup items are displayed in each language's own script (the usual language-picker
+// convention); debug builds add a long-English fixture, while production builds omit it.
+#[cfg(any(debug_assertions, feature = "dev-long-text"))]
+const LOCALE_LABELS: [&str; 5] = [
+    "Auto",
+    "English",
+    "简体中文",
+    "繁體中文",
+    "[TEST] English x3",
+];
+#[cfg(not(any(debug_assertions, feature = "dev-long-text")))]
 const LOCALE_LABELS: [&str; 4] = ["Auto", "English", "简体中文", "繁體中文"];
 const SCROLL_MODE_LABELS: [&str; 2] = ["Default", "Line"];
 const SCROLL_MODE_VALUES: [&str; 2] = ["default", "line"];
+#[cfg(any(debug_assertions, feature = "dev-long-text"))]
+const LOCALE_VALUES: [&str; 5] = [
+    "auto",
+    "en",
+    "zh-Hans",
+    "zh-Hant",
+    crate::i18n::TEST_LONG_LOCALE,
+];
+#[cfg(not(any(debug_assertions, feature = "dev-long-text")))]
 const LOCALE_VALUES: [&str; 4] = ["auto", "en", "zh-Hans", "zh-Hant"];
 const TEXT_SIZE_MIN: i64 = 13;
 const TEXT_SIZE_MAX: i64 = 20;
@@ -372,7 +391,7 @@ pub(crate) mod widgets;
 use components::{
     RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard, SettingsControl,
     SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsRow, SettingsSection,
-    SettingsSidebar,
+    SettingsSelect, SettingsSidebar,
 };
 use glass_preview::*;
 pub(crate) use glass_preview::{
@@ -4046,39 +4065,57 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // --- 外观 Appearance ---
         y -= 12.0;
         let appearance_header_y = y;
-        y = layout.next_row_cursor(y, described_row_h);
         let theme_items = [
             t("settings.theme_dark"),
             t("settings.theme_light"),
             t("settings.theme_auto"),
         ];
         let theme_item_refs: Vec<&str> = theme_items.iter().map(String::as_str).collect();
+        let theme_metrics =
+            SettingsSelect::metrics(ctrl_w, &theme_item_refs, row_h, described_row_h);
+        y = layout.next_row_cursor(y, theme_metrics.row_h);
         ui.theme = SettingsRow::described(
             general_view,
             label_x,
             y,
             ctrl_x - label_x - 18.0,
-            described_row_h,
+            theme_metrics.row_h,
             &t("settings.row_theme"),
             &t("settings.desc_theme"),
-            SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &theme_item_refs, 0),
+            SettingsControl::popup(
+                ctrl_x,
+                y + 10.0,
+                ctrl_w,
+                theme_metrics.control_h,
+                &theme_item_refs,
+                0,
+            ),
         );
         bind_control(target, ui.theme);
-        y -= described_row_h;
-        SettingsRow::separator(general_view, y + described_row_h, content_w);
+        y -= theme_metrics.row_h;
+        SettingsRow::separator(general_view, y + theme_metrics.row_h, content_w);
+        let glass_style_metrics =
+            SettingsSelect::metrics(ctrl_w, &["Regular", "Clear"], row_h, described_row_h);
         ui.glass_style = SettingsRow::described(
             general_view,
             label_x,
             y,
             ctrl_x - label_x - 18.0,
-            described_row_h,
+            glass_style_metrics.row_h,
             &t("settings.row_glass_style"),
             &t("settings.desc_glass_style"),
-            SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &["Regular", "Clear"], 0),
+            SettingsControl::popup(
+                ctrl_x,
+                y + 10.0,
+                ctrl_w,
+                glass_style_metrics.control_h,
+                &["Regular", "Clear"],
+                0,
+            ),
         );
         bind_control(target, ui.glass_style);
-        y -= described_row_h;
-        SettingsRow::separator(general_view, y + described_row_h, content_w);
+        y -= glass_style_metrics.row_h;
+        SettingsRow::separator(general_view, y + glass_style_metrics.row_h, content_w);
         ui.glass_tint = SettingsRow::described(
             general_view,
             label_x,
@@ -4159,7 +4196,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // --- 语言 Language ---
         y = layout.next_section_cursor(y);
         let language_header_y = y;
-        y = layout.next_row_cursor(y, described_row_h);
+        let locale_metrics =
+            SettingsSelect::metrics(ctrl_w, &LOCALE_LABELS, row_h, described_row_h);
+        y = layout.next_row_cursor(y, locale_metrics.row_h);
         let language_card_bottom = layout.card_bottom(y);
         let language_card_top = layout.card_top(language_header_y);
         ui.locale = SettingsRow::plain(
@@ -4167,9 +4206,16 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             label_x,
             y,
             label_w,
-            described_row_h,
+            locale_metrics.row_h,
             &t("settings.row_locale"),
-            SettingsControl::popup(ctrl_x, y, ctrl_w, row_h, &LOCALE_LABELS, 0),
+            SettingsControl::popup(
+                ctrl_x,
+                y,
+                ctrl_w,
+                locale_metrics.control_h,
+                &LOCALE_LABELS,
+                0,
+            ),
         );
         bind_control(target, ui.locale);
         SettingsSection::attach(
@@ -4184,19 +4230,28 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // --- 日志 Logging ---
         y = layout.next_section_cursor(y);
         let logging_header_y = y;
-        y = layout.next_row_cursor(y, described_row_h);
         // 日志级别下拉框:项 = [debug, info];默认 index 1(info)。
         // Log level popup: items = [debug, info]; default index 1 (info).
         let log_levels: [&str; 2] = ["Debug", "Info"];
+        let log_level_metrics =
+            SettingsSelect::metrics(ctrl_w, &log_levels, row_h, described_row_h);
+        y = layout.next_row_cursor(y, log_level_metrics.row_h);
         ui.log_level = SettingsRow::described(
             general_view,
             label_x,
             y,
             ctrl_x - label_x - 18.0,
-            described_row_h,
+            log_level_metrics.row_h,
             &t("settings.row_log_level"),
             &t("settings.desc_log_level"),
-            SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &log_levels, 1),
+            SettingsControl::popup(
+                ctrl_x,
+                y + 10.0,
+                ctrl_w,
+                log_level_metrics.control_h,
+                &log_levels,
+                1,
+            ),
         );
         bind_control(target, ui.log_level);
         SettingsSection::attach(
@@ -4304,8 +4359,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         )
         .1;
         bind_control(target, ui.show_minimized);
-        y = layout.next_row_cursor(y, described_row_h);
-        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         // 窗口显示模式:仅图标或图标和缩略图;配置仍由 thumbnails_enabled 布尔值保存。
         // Window display mode: icons only or icons and thumbnails; the config remains stored as
         // the thumbnails_enabled boolean.
@@ -4317,25 +4370,38 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        ui.thumbnails_enabled = SettingsRow::tall(
+        let display_mode_metrics =
+            SettingsSelect::metrics(ctrl_w, &window_display_mode_refs, row_h, described_row_h);
+        y = layout.next_row_cursor(y, display_mode_metrics.row_h);
+        SettingsRow::separator(
+            switcher_view,
+            y + display_mode_metrics.row_h + 3.0,
+            content_w,
+        );
+        ui.thumbnails_enabled = SettingsRow::tall_with_height(
             switcher_view,
             label_x,
             y,
             220.0,
+            display_mode_metrics.row_h,
             &t("settings.row_window_display_mode"),
             SettingsControl::popup(
                 ctrl_x,
                 y + 10.0,
                 ctrl_w,
-                row_h,
+                display_mode_metrics.control_h,
                 &window_display_mode_refs,
                 0,
             ),
         )
         .1;
         bind_control(target, ui.thumbnails_enabled);
-        y = layout.next_row_cursor(y, described_row_h);
-        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
+        y = layout.next_row_cursor(y, display_mode_metrics.row_h);
+        SettingsRow::separator(
+            switcher_view,
+            y + display_mode_metrics.row_h + 3.0,
+            content_w,
+        );
         ui.card_text_size = SettingsRow::described(
             switcher_view,
             label_x,
@@ -4394,8 +4460,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             TEXT_SIZE_DEFAULT,
         );
         bind_control(target, ui.status_bar_text_size);
-        y = layout.next_row_cursor(y, described_row_h);
-        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0。
         // overlay_position popup: [Follow Active Window, Always on Main Screen]; default index 0.
         let op_labels = [
@@ -4403,18 +4467,29 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             t("settings.overlay_position_main_screen"),
         ];
         let op_label_refs: Vec<&str> = op_labels.iter().map(|s| s.as_str()).collect();
-        ui.overlay_position = SettingsRow::tall(
+        let op_metrics = SettingsSelect::metrics(ctrl_w, &op_label_refs, row_h, described_row_h);
+        y = layout.next_row_cursor(y, op_metrics.row_h);
+        SettingsRow::separator(switcher_view, y + op_metrics.row_h + 3.0, content_w);
+        ui.overlay_position = SettingsRow::tall_with_height(
             switcher_view,
             label_x,
             y,
             label_w,
+            op_metrics.row_h,
             &t("settings.row_overlay_position"),
-            SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &op_label_refs, 0),
+            SettingsControl::popup(
+                ctrl_x,
+                y + (op_metrics.row_h - op_metrics.control_h) / 2.0,
+                ctrl_w,
+                op_metrics.control_h,
+                &op_label_refs,
+                0,
+            ),
         )
         .1;
         bind_control(target, ui.overlay_position);
-        y = layout.next_row_cursor(y, described_row_h);
-        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
+        y = layout.next_row_cursor(y, op_metrics.row_h);
+        SettingsRow::separator(switcher_view, y + op_metrics.row_h + 3.0, content_w);
         ui.corner_radius = SettingsRow::tall(
             switcher_view,
             label_x,
@@ -4439,9 +4514,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // --- 键盘 Keyboard ---
         y = layout.next_section_cursor(y);
         let keyboard_header_y = y;
-        y = layout.next_row_cursor(y, described_row_h);
-        let keyboard_card_bottom = layout.card_bottom(y);
-        let keyboard_card_top = layout.card_top(keyboard_header_y);
         // 修饰键下拉项:显示 Option+Tab / Command+Tab;值由索引映射到 option/command。
         // Modifier popup shows Option+Tab / Command+Tab; the index maps to option/command.
         let mod_labels = [
@@ -4449,13 +4521,25 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             t("settings.modifier_command"),
         ];
         let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
-        ui.modifier = SettingsRow::tall(
+        let mod_metrics = SettingsSelect::metrics(ctrl_w, &mod_label_refs, row_h, described_row_h);
+        y = layout.next_row_cursor(y, mod_metrics.row_h);
+        let keyboard_card_bottom = layout.card_bottom(y);
+        let keyboard_card_top = layout.card_top(keyboard_header_y);
+        ui.modifier = SettingsRow::tall_with_height(
             switcher_view,
             label_x,
             y,
             label_w,
+            mod_metrics.row_h,
             &t("settings.row_modifier"),
-            SettingsControl::popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0),
+            SettingsControl::popup(
+                ctrl_x,
+                y + (mod_metrics.row_h - mod_metrics.control_h) / 2.0,
+                ctrl_w,
+                mod_metrics.control_h,
+                &mod_label_refs,
+                0,
+            ),
         )
         .1;
         bind_control(target, ui.modifier);
@@ -4510,50 +4594,78 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // --- 设备选择器(内嵌下拉框,切换即时刷新其余控件) / Device picker (inline popup) ---
         y = layout.next_section_cursor(y);
         let device_header_y = y;
-        y = layout.next_row_cursor(y, described_row_h);
         // 下拉框:items 在 load_settings_values 里动态重建(设备列表可变)。
         // 首次创建放一个占位项,真正的内容在 load_settings_values -> rebuild_device_popup 填入。
         // Popup: items are rebuilt dynamically in load_settings_values (device list is mutable).
         // A placeholder is inserted here; the real items are filled by rebuild_device_popup.
-        let dev_popup = SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &[""], 0);
+        let device_labels: Vec<String> = crate::mouse::device::connected_devices()
+            .iter()
+            .map(|d| format!("{} ({:#x}:{:#x})", d.name, d.vendor_id, d.product_id))
+            .collect();
+        let device_label_refs: Vec<&str> = if device_labels.is_empty() {
+            vec![""]
+        } else {
+            device_labels.iter().map(|s| s.as_str()).collect()
+        };
+        let device_metrics =
+            SettingsSelect::metrics(ctrl_w, &device_label_refs, row_h, described_row_h);
+        y = layout.next_row_cursor(y, device_metrics.row_h);
+        let dev_popup = SettingsControl::popup(
+            ctrl_x,
+            y + (device_metrics.row_h - device_metrics.control_h) / 2.0,
+            ctrl_w,
+            device_metrics.control_h,
+            &device_label_refs,
+            0,
+        );
         style_flat_popup(dev_popup);
         // 绑定 target/action:选择变化时即时刷新其余控件为该设备的有效值。
         // Bind target/action: on selection change, immediately refresh the other controls with
         // the selected device's effective values.
         let _: () = msg_send![dev_popup, setTarget: target];
         let _: () = msg_send![dev_popup, setAction: sel!(handleDeviceChanged:)];
-        ui.device_indicator = SettingsRow::tall(
+        ui.device_indicator = SettingsRow::tall_with_height(
             mouse_view,
             label_x,
             y,
             label_w,
+            device_metrics.row_h,
             &t("settings.header_mouse_device"),
             dev_popup,
         )
         .1;
 
         // --- 滚动模式 / Scroll mode ---
-        y = layout.next_row_cursor(y, described_row_h);
-        let scroll_popup =
-            SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &SCROLL_MODE_LABELS, 0);
+        let scroll_metrics =
+            SettingsSelect::metrics(ctrl_w, &SCROLL_MODE_LABELS, row_h, described_row_h);
+        y = layout.next_row_cursor(y, scroll_metrics.row_h);
+        let scroll_popup = SettingsControl::popup(
+            ctrl_x,
+            y + (scroll_metrics.row_h - scroll_metrics.control_h) / 2.0,
+            ctrl_w,
+            scroll_metrics.control_h,
+            &SCROLL_MODE_LABELS,
+            0,
+        );
         style_flat_popup(scroll_popup);
-        ui.scroll_mode = SettingsRow::tall(
+        ui.scroll_mode = SettingsRow::tall_with_height(
             mouse_view,
             label_x,
             y,
             label_w,
+            scroll_metrics.row_h,
             &t("settings.row_scroll_mode"),
             scroll_popup,
         )
         .1;
         bind_control(target, ui.scroll_mode);
         // The HTML device card contains both rows, with one internal hairline between them.
-        SettingsRow::separator(mouse_view, y + described_row_h + 3.0, content_w);
+        SettingsRow::separator(mouse_view, y + scroll_metrics.row_h + 3.0, content_w);
 
         // --- 行数(按行模式) / Line count (line mode) ---
         // Keep this conditional row in the same card as Device and Scroll mode.
         // 将这个条件行放进与 Device、Scroll mode 相同的卡片中。
-        y = layout.next_row_cursor(y, described_row_h);
+        y = layout.next_row_cursor(y, scroll_metrics.row_h);
         ui.line_count_separator =
             SettingsRow::separator(mouse_view, y + described_row_h + 3.0, content_w);
         let (line_label, line_ctrl) = SettingsRow::tall(
@@ -4888,7 +5000,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // 其余历史记录设置单独成卡,并与切换器页面使用相同的小标题间距。
         cy = layout.next_section_cursor(cy);
         let clipboard_options_header_y = cy;
-        cy = layout.next_row_cursor(cy, described_row_h);
         // 置顶后选中项位置下拉框:项 = [跟随置顶, 保持当前位置];默认 index 0(跟随置顶),
         // 实际值由 load_settings_from 填充。
         // Pin-selection popup: items = [Follow the Pinned Entry, Keep Current Position];
@@ -4898,18 +5009,27 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             t("settings.pin_keep_position"),
         ];
         let pin_label_refs: Vec<&str> = pin_labels.iter().map(|s| s.as_str()).collect();
+        let pin_metrics = SettingsSelect::metrics(ctrl_w, &pin_label_refs, row_h, described_row_h);
+        cy = layout.next_row_cursor(cy, pin_metrics.row_h);
         ui.clipboard_pin_follow = SettingsRow::plain(
             clipboard_view,
             label_x,
             cy,
             220.0,
-            described_row_h,
+            pin_metrics.row_h,
             &t("settings.row_clipboard_pin_follow"),
-            SettingsControl::popup(ctrl_x, cy, ctrl_w, row_h, &pin_label_refs, 0),
+            SettingsControl::popup(
+                ctrl_x,
+                cy + (pin_metrics.row_h - pin_metrics.control_h) / 2.0,
+                ctrl_w,
+                pin_metrics.control_h,
+                &pin_label_refs,
+                0,
+            ),
         );
         bind_control(target, ui.clipboard_pin_follow);
-        cy = layout.next_row_cursor(cy, described_row_h);
-        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
+        cy = layout.next_row_cursor(cy, pin_metrics.row_h);
+        SettingsRow::separator(clipboard_view, cy + pin_metrics.row_h + 3.0, content_w);
         // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。
         // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
         // privacy implications are documented in the README).

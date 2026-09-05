@@ -1411,6 +1411,7 @@ fn setup_status_bar() {
         CFRelease(settings_title as *const c_void);
         CFRelease(settings_key as *const c_void);
         let _: () = msg_send![settings_item, setTarget: menu_target];
+        set_menu_item_title(settings_item, &t("menu.settings"));
         let _: () = msg_send![menu, addItem: settings_item];
         // 设置与下方操作项之间的分隔线,样式与退出项上方一致。
         // Separate Settings from the action items below, matching the separator above Quit.
@@ -1425,6 +1426,7 @@ fn setup_status_bar() {
         CFRelease(shortcut_title as *const c_void);
         CFRelease(shortcut_key as *const c_void);
         let _: () = msg_send![shortcut_item, setTarget: menu_target];
+        set_menu_item_title(shortcut_item, &t("menu.toggle_shortcut.cmd"));
         let _: () = msg_send![menu, addItem: shortcut_item];
         *SHORTCUT_ITEM.lock().unwrap() = Some(ShortcutState {
             item: shortcut_item,
@@ -1444,6 +1446,7 @@ fn setup_status_bar() {
         CFRelease(thumbnail_title as *const c_void);
         CFRelease(thumbnail_key as *const c_void);
         let _: () = msg_send![thumbnail_item, setTarget: menu_target];
+        set_menu_item_title(thumbnail_item, &t(thumbnail_title_key));
         let _: () = msg_send![menu, addItem: thumbnail_item];
         *THUMBNAIL_ITEM.lock().unwrap() = Some(ThumbnailState {
             item: thumbnail_item,
@@ -1457,6 +1460,7 @@ fn setup_status_bar() {
         CFRelease(reload_title as *const c_void);
         CFRelease(reload_key as *const c_void);
         let _: () = msg_send![reload_item, setTarget: menu_target];
+        set_menu_item_title(reload_item, &t("menu.reload_config"));
         let _: () = msg_send![menu, addItem: reload_item];
 
         // Clear Icon Cache item
@@ -1467,6 +1471,7 @@ fn setup_status_bar() {
         CFRelease(clear_cache_title as *const c_void);
         CFRelease(clear_cache_key as *const c_void);
         let _: () = msg_send![clear_cache_item, setTarget: menu_target];
+        set_menu_item_title(clear_cache_item, &t("menu.clear_icon_cache"));
         let _: () = msg_send![menu, addItem: clear_cache_item];
 
         // Separator
@@ -1485,6 +1490,7 @@ fn setup_status_bar() {
         CFRelease(quit_title as *const c_void);
         CFRelease(quit_key as *const c_void);
         let _: () = msg_send![quit_item, setTarget: menu_target];
+        set_menu_item_title(quit_item, &t("menu.quit"));
         let _: () = msg_send![menu, addItem: quit_item];
 
         // 登记固定标题项,供热重载 locale 时批量重设标题 / register fixed-title items for locale hot-reload

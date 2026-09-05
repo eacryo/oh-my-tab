@@ -20,6 +20,11 @@ sh scripts/release-dev.sh --push          # 上传到 dev_release，并发布 de
 sh scripts/release-dev.sh --push --dry-run
 ```
 
+`release-dev.sh` 仍使用 Release 优化构建，但会专门启用 `dev-long-text` Cargo feature，因此
+开发发布包的语言下拉框包含 `[TEST] English x3`，用于验证超长文案的下拉框、设置行和卡片布局。
+正式 `release.sh` 以及直接调用 `bundle.sh` 的生产路径不启用该 feature，生产包不会包含这个
+测试选项。
+
 带 `--push` 时，脚本会始终基于当前源码重新构建 `.app`、ZIP 和 DMG，然后调用仓库内固定版本的
 `vendor/Sparkle/bin/generate_appcast`。
 如果本地已有 appcast，脚本会先使用它；在干净 checkout 中会从公开 Feed 读取旧 appcast，

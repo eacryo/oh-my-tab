@@ -789,7 +789,11 @@ impl Config {
         }
 
         // --- i18n ---
-        if !["auto", "en", "zh-Hans", "zh-Hant"].contains(&self.i18n.locale.as_str()) {
+        let locale_valid =
+            ["auto", "en", "zh-Hans", "zh-Hant"].contains(&self.i18n.locale.as_str());
+        #[cfg(any(debug_assertions, feature = "dev-long-text"))]
+        let locale_valid = locale_valid || self.i18n.locale == i18n::TEST_LONG_LOCALE;
+        if !locale_valid {
             errs.push(tf(
                 "errors.i18n_locale_invalid",
                 &[("value", &self.i18n.locale)],

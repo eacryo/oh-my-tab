@@ -20,7 +20,15 @@ APP="dist/${APP_BASENAME}.app"
 DMG="dist/${APP_BASENAME}.dmg"
 ZIP="dist/${APP_BASENAME}.zip"
 
-cargo build --release
+# release-dev.sh sets CARGO_BUILD_FEATURES=dev-long-text so its optimized package keeps the
+# long-text layout fixture. The production release script leaves this unset.
+# release-dev.sh 设置 CARGO_BUILD_FEATURES=dev-long-text，让优化后的 Dev 包保留长文本夹具；
+# 正式 release 脚本不设置该变量。
+if [ -n "${CARGO_BUILD_FEATURES:-}" ]; then
+  cargo build --release --features "$CARGO_BUILD_FEATURES"
+else
+  cargo build --release
+fi
 BIN="target/release/oh-my-tab"
 
 rm -rf "$APP"

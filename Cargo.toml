@@ -3,6 +3,12 @@ name = "oh-my-tab"
 version = "0.1.8"
 edition = "2021"
 
+[features]
+default = []
+# Release-dev enables this compile-time layout fixture; production release does not.
+# release-dev 启用这个编译期布局夹具；正式 release 不启用。
+dev-long-text = []
+
 [dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"

@@ -8,6 +8,7 @@
 
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
@@ -52,6 +53,97 @@ unsafe impl Send for FixedMenuItems {}
 unsafe impl Sync for FixedMenuItems {}
 pub(crate) static FIXED_MENU_ITEMS: Mutex<Option<FixedMenuItems>> = Mutex::new(None);
 
+const MENU_TITLE_MIN_WIDTH: f64 = 72.0;
+const MENU_TITLE_MAX_WIDTH: f64 = 280.0;
+
+fn capped_menu_title_width(natural_width: f64) -> f64 {
+    if natural_width.is_finite() {
+        natural_width
+            .ceil()
+            .clamp(MENU_TITLE_MIN_WIDTH, MENU_TITLE_MAX_WIDTH)
+    } else {
+        MENU_TITLE_MIN_WIDTH
+    }
+}
+
+/// Measure a title using the native menu font without attaching a custom view to the item.
+/// 使用原生菜单字体测量标题,但不向菜单项附加自定义 view。
+unsafe fn menu_title_width(title: &str) -> f64 {
+    let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let field: *mut AnyObject = msg_send![
+        field,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 20.0))
+    ];
+    if field.is_null() {
+        return MENU_TITLE_MIN_WIDTH;
+    }
+    let title_ns = make_nsstring(title);
+    let _: () = msg_send![field, setStringValue: title_ns];
+    CFRelease(title_ns as *const c_void);
+    let _: () = msg_send![field, setUsesSingleLineMode: true];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+    let _: () = msg_send![field, setFont: font];
+    let cell: *mut AnyObject = msg_send![field, cell];
+    let size: NSSize = if cell.is_null() {
+        NSSize::new(MENU_TITLE_MIN_WIDTH, 16.0)
+    } else {
+        msg_send![cell, cellSize]
+    };
+    release_obj(field);
+    size.width
+}
+
+/// Keep menu titles compact while retaining the full title in the item's tooltip.
+/// 保持菜单标题紧凑,同时把完整标题保存在菜单项 tooltip 中。
+fn compact_menu_title(title: &str) -> String {
+    if capped_menu_title_width(unsafe { menu_title_width(title) }) <= MENU_TITLE_MAX_WIDTH {
+        return title.to_string();
+    }
+
+    let chars: Vec<char> = title.chars().collect();
+    let mut low = 0usize;
+    let mut high = chars.len();
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let prefix: String = chars[..mid].iter().collect();
+        let candidate = format!("{prefix}…");
+        if capped_menu_title_width(unsafe { menu_title_width(&candidate) }) <= MENU_TITLE_MAX_WIDTH
+        {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    if low == 0 {
+        "…".to_string()
+    } else {
+        let prefix: String = chars[..low].iter().collect();
+        format!("{prefix}…")
+    }
+}
+
+/// Set a menu item's native title, truncating only oversized localized text.
+/// 设置菜单项的原生标题,只截断超出宽度的本地化文本。
+pub(crate) unsafe fn set_menu_item_title(item: *mut AnyObject, title: &str) {
+    if item.is_null() {
+        return;
+    }
+
+    let display_title = compact_menu_title(title);
+    let title_ns = make_nsstring(&display_title);
+    let _: () = msg_send![item, setTitle: title_ns];
+    CFRelease(title_ns as *const c_void);
+
+    if display_title == title {
+        let _: () = msg_send![item, setToolTip: std::ptr::null::<AnyObject>()];
+    } else {
+        let tooltip_ns = make_nsstring(title);
+        let _: () = msg_send![item, setToolTip: tooltip_ns];
+        CFRelease(tooltip_ns as *const c_void);
+    }
+}
+
 // ========== 菜单动作 / menu actions ==========
 
 /// 设置快捷键模式(Cmd / Opt),同步运行时状态 SHORTCUT_IS_CMD 与菜单标签。
@@ -65,9 +157,7 @@ pub(crate) fn set_shortcut_mode(is_cmd: bool) {
     };
     if let Some(ref s) = *SHORTCUT_ITEM.lock().unwrap() {
         unsafe {
-            let ns_title = make_nsstring(&t(key));
-            let _: () = msg_send![s.item, setTitle: ns_title];
-            CFRelease(ns_title as *const c_void);
+            set_menu_item_title(s.item, &t(key));
         }
     }
 }
@@ -82,9 +172,7 @@ pub(crate) fn set_thumbnail_mode(thumbnails_enabled: bool) {
     };
     if let Some(ref s) = *THUMBNAIL_ITEM.lock().unwrap() {
         unsafe {
-            let ns_title = make_nsstring(&t(key));
-            let _: () = msg_send![s.item, setTitle: ns_title];
-            CFRelease(ns_title as *const c_void);
+            set_menu_item_title(s.item, &t(key));
         }
     }
 }
@@ -103,9 +191,7 @@ pub(crate) fn refresh_menu_titles() {
             "menu.toggle_shortcut.cmd"
         };
         if let Some(ref s) = *SHORTCUT_ITEM.lock().unwrap() {
-            let ns_title = make_nsstring(&t(sc_key));
-            let _: () = msg_send![s.item, setTitle: ns_title];
-            CFRelease(ns_title as *const c_void);
+            set_menu_item_title(s.item, &t(sc_key));
         }
         // 固定标题项 / fixed-title items
         if let Some(ref items) = *FIXED_MENU_ITEMS.lock().unwrap() {
@@ -115,9 +201,7 @@ pub(crate) fn refresh_menu_titles() {
                 (items.clear_cache, "menu.clear_icon_cache"),
                 (items.quit, "menu.quit"),
             ] {
-                let ns_title = make_nsstring(&t(key));
-                let _: () = msg_send![item, setTitle: ns_title];
-                CFRelease(ns_title as *const c_void);
+                set_menu_item_title(item, &t(key));
             }
         }
     }
@@ -263,4 +347,17 @@ pub(crate) extern "C" fn handle_clear_icon_cache(
     // Re-extract icons for currently-collected windows only (not all running apps).
     extract_uncached_icons();
     log_info!("Icon cache cleared.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capped_menu_title_width, MENU_TITLE_MAX_WIDTH, MENU_TITLE_MIN_WIDTH};
+
+    #[test]
+    fn menu_title_width_stays_compact_until_the_maximum() {
+        assert_eq!(capped_menu_title_width(40.0), MENU_TITLE_MIN_WIDTH);
+        assert_eq!(capped_menu_title_width(120.4), 121.0);
+        assert_eq!(capped_menu_title_width(10_000.0), MENU_TITLE_MAX_WIDTH);
+        assert_eq!(capped_menu_title_width(f64::NAN), MENU_TITLE_MIN_WIDTH);
+    }
 }

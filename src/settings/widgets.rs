@@ -2202,6 +2202,52 @@ pub(super) unsafe fn make_popup(
     popup
 }
 
+/// Measure the largest trigger height required by a select's candidate values.
+/// 测量下拉框所有候选值中所需的最大触发器高度。
+pub(super) unsafe fn settings_select_required_control_height(
+    width: f64,
+    items: &[&str],
+    minimum_height: f64,
+) -> f64 {
+    let label_width = (width - 12.0 - 16.0 - 8.0 - 12.0).max(1.0);
+    let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let field: *mut AnyObject = msg_send![
+        field,
+        initWithFrame: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(label_width, minimum_height.max(1.0)),
+        )
+    ];
+    let _: () = msg_send![field, setBezeled: false];
+    let _: () = msg_send![field, setDrawsBackground: false];
+    let _: () = msg_send![field, setEditable: false];
+    let _: () = msg_send![field, setSelectable: false];
+    let _: () = msg_send![field, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    let _: () = msg_send![field, setUsesSingleLineMode: false];
+    if msg_send![field, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![field, setMaximumNumberOfLines: 0isize];
+    }
+    let _: () = msg_send![field, setPreferredMaxLayoutWidth: label_width];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let _: () = msg_send![field, setFont: font];
+
+    let mut required_height = minimum_height.max(1.0);
+    for item in items {
+        let item_ns = make_nsstring(item);
+        let _: () = msg_send![field, setStringValue: item_ns];
+        CFRelease(item_ns as *const c_void);
+        let measured: NSSize = msg_send![
+            field,
+            sizeThatFits: NSSize::new(label_width, 10_000.0)
+        ];
+        if measured.height.is_finite() && measured.height > 0.0 {
+            required_height = required_height.max(measured.height.ceil());
+        }
+    }
+    release_obj(field);
+    required_height
+}
+
 pub(super) const HTML_SWITCH_W: f64 = 38.0;
 pub(super) const HTML_SWITCH_H: f64 = 22.0;
 pub(super) const HTML_SWITCH_KNOB_D: f64 = 18.0;

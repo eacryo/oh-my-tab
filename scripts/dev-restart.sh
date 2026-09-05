@@ -158,7 +158,14 @@ fi
 if [ -n "${OH_MY_TAB_PSEUDO_LOCALE:-}" ]; then
     launch_env_args+=("OH_MY_TAB_PSEUDO_LOCALE=$OH_MY_TAB_PSEUDO_LOCALE")
 fi
-submit_error="$(launchctl submit -l "$launch_label" -o /dev/null -e /dev/null -- \
+# Keep LaunchServices' diagnostics separate from the app log. `open -W` is the process
+# launchd waits on, so an alive wrapper alone is not proof that the app executable started.
+# 保存 LaunchServices 的诊断,不要再丢到 /dev/null。`open -W` 是 launchd 等待的进程,
+# 包装脚本存活本身不能证明真正的应用二进制已经启动。
+launch_output_dir="$HOME/Library/Logs/oh-my-tab"
+mkdir -p "$launch_output_dir"
+launch_output="$launch_output_dir/dev-launchd-open.log"
+submit_error="$(launchctl submit -l "$launch_label" -o "$launch_output" -e "$launch_output" -- \
     /usr/bin/env OH_MY_TAB_LAUNCHD_WRAPPER=1 "${launch_env_args[@]}" \
     "$repo_dir/scripts/dev-launchd-wrapper.sh" "$launch_label" \
     /usr/bin/open -n -W "$dev_app" 2>&1)"
@@ -173,24 +180,36 @@ if [ "$submit_status" -ne 0 ]; then
     [ -n "$submit_error" ] && echo "$submit_error"
 fi
 
-# 轮询等待进程存活(最长 5 秒)。
-# 从 launchd 服务状态取得 PID,再用 kill -0 确认进程实际存活。
-# Read the PID from launchd's service state, then use kill -0 to confirm it is alive.
+# 轮询等待真实应用进程存活(最长 5 秒)。
+# 不能只检查 wrapper PID:它可能仍在等待 `open -W`,即使应用本身已经退出。
+# Poll for the real app process (up to 5 seconds). Checking only the wrapper PID is a
+# false positive because it can remain blocked in `open -W` after the app exits.
+find_dev_app_pid() {
+    /usr/bin/pgrep -f "$dev_app_binary" 2>/dev/null | awk 'NR == 1 { print; exit }'
+}
+
 for _ in 1 2 3 4 5; do
     sleep 1
-    new_pid="$(launchctl print "$launch_target" 2>/dev/null \
+    app_pid="$(find_dev_app_pid)"
+    if [ -n "$app_pid" ] && kill -0 "$app_pid" 2>/dev/null; then
+        wrapper_pid="$(launchctl print "$launch_target" 2>/dev/null \
         | awk '$1 == "pid" && $2 == "=" { print $3; exit }')"
-    if [ -n "$new_pid" ] && kill -0 "$new_pid" 2>/dev/null; then
         # 读出本次构建写入的 CFBundleVersion(build-version),便于确认运行的是哪次构建。
         # Read the CFBundleVersion written by this build so it's clear which build is running.
         build_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
             "$dev_app/Contents/Info.plist" 2>/dev/null)"
-        echo "restart ok (pid $new_pid)"
+        echo "restart ok (app pid $app_pid${wrapper_pid:+, wrapper pid $wrapper_pid})"
         echo "build-version: ${build_version:-unknown}"
         exit 0
     fi
 done
-echo "restart FAILED: process exited within 5s -- read the newest log:"
+echo "restart FAILED: app executable was not alive within 5s -- launch diagnostics:"
+if [ -s "$launch_output" ]; then
+    tail -40 "$launch_output"
+else
+    echo "(no LaunchServices output in $launch_output)"
+fi
+echo "-- newest app log:"
 ls -t "$HOME/Library/Logs/oh-my-tab/oh-my-tab.log" \
     "$HOME/Library/Logs/oh-my-tab/oh-my-tab.log."* \
     "$HOME/Library/Logs/oh-my-tab/oh-my-tab-"*.log 2>/dev/null | head -1

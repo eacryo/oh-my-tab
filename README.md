@@ -110,8 +110,13 @@ Development-only issues and raw-binary debugging notes are collected in [docs/de
 
 `scripts/dev-restart.sh` builds and assembles a separately signed development `.app`, then launches it through the per-user `launchd` domain. This keeps Accessibility and Screen Recording permissions associated with the development bundle and ensures the running process contains the latest build. The unit-test suite runs headless by default; clipboard image/history fixtures use isolated temporary directories per process and thread. The **smoke tests** are marked `#[ignore]` — they exercise the real CG/AX stack and need a GUI session plus an Accessibility grant (run with `cargo test -- --ignored`).
 
-For localization/layout QA, set `OH_MY_TAB_PSEUDO_LOCALE=1` before launching the dev app to expand
-English strings while preserving placeholders. Set `OH_MY_TAB_LAYOUT_DEBUG=1` in a debug build to
+For localization/layout QA, the Debug app built by `scripts/dev-restart.sh` adds a
+`[TEST] English x3` option to the language selector. Selecting it repeats every English UI string
+three times, so long dropdown values and their surrounding rows/cards can be checked in the real
+settings window. The optimized development package built by `scripts/release-dev.sh` includes the
+same fixture through the `dev-long-text` Cargo feature; the production release scripts do not.
+The older `OH_MY_TAB_PSEUDO_LOCALE=1` switch is still available for debug-only punctuation-based
+expansion. Set `OH_MY_TAB_LAYOUT_DEBUG=1` in a debug build to
 enable runtime settings-page assertions; overlapping controls, out-of-bounds frames, and separators
 with an invalid layer order fail fast with the page name and offending frames. These checks complement
 visual review instead of requiring it for every layout change.
@@ -151,6 +156,11 @@ feed `https://download.oh-my-tab.app/dev_release/appcast.xml`, R2 prefix `dev_re
 > sh scripts/release-dev.sh --push          # upload the dev package and dist/appcast-dev.xml
 > sh scripts/release-dev.sh --push --dry-run
 > ```
+
+`release-dev.sh` builds an optimized Release package with the `dev-long-text` Cargo feature, so
+the `[TEST] English x3` layout fixture is available in the development package. `release.sh` and
+the direct production `bundle.sh` path do not enable that feature; the test option is absent from
+production builds.
 
 With `--push`, the release scripts now generate or update the appcast before uploading. They reuse
 an existing local appcast when present; on a clean checkout they fetch the public feed first so

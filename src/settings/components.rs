@@ -343,7 +343,7 @@ impl SettingsRow {
         label_text: &str,
         control: *mut AnyObject,
     ) -> (*mut AnyObject, *mut AnyObject) {
-        let (label, control) = widgets::add_tall_row(
+        Self::tall_with_height(
             parent,
             label_x,
             y,
@@ -351,9 +351,22 @@ impl SettingsRow {
             SettingsLayout::SINGLE_LINE_ROW_H,
             label_text,
             control,
-        );
-        Self::center_label(label, y, SettingsLayout::SINGLE_LINE_ROW_H);
-        Self::center_control(control, y, SettingsLayout::SINGLE_LINE_ROW_H);
+        )
+    }
+
+    pub(super) unsafe fn tall_with_height(
+        parent: *mut AnyObject,
+        label_x: f64,
+        y: f64,
+        label_w: f64,
+        row_h: f64,
+        label_text: &str,
+        control: *mut AnyObject,
+    ) -> (*mut AnyObject, *mut AnyObject) {
+        let (label, control) =
+            widgets::add_tall_row(parent, label_x, y, label_w, row_h, label_text, control);
+        Self::center_label(label, y, row_h);
+        Self::center_control(control, y, row_h);
         Self::register_label(label, control);
         (label, control)
     }
@@ -386,7 +399,29 @@ pub(super) struct SettingsControl;
 /// 设置行和辅助编辑面板共用的动画选择器组件。
 pub(super) struct SettingsSelect;
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SettingsSelectMetrics {
+    pub(super) control_h: f64,
+    pub(super) row_h: f64,
+}
+
 impl SettingsSelect {
+    /// Reserve enough row space for the longest candidate without changing height on selection.
+    /// 按最长候选值预留行高，避免切换选项时控件突然覆盖相邻内容。
+    pub(super) unsafe fn metrics(
+        width: f64,
+        items: &[&str],
+        minimum_control_h: f64,
+        minimum_row_h: f64,
+    ) -> SettingsSelectMetrics {
+        let control_h =
+            widgets::settings_select_required_control_height(width, items, minimum_control_h);
+        SettingsSelectMetrics {
+            control_h,
+            row_h: minimum_row_h.max(control_h + 20.0),
+        }
+    }
+
     pub(super) unsafe fn create(
         x: f64,
         y: f64,
