@@ -61,8 +61,9 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 - Keep user-visible strings in `t()`/`tf()` and add translation keys to all supported locale files. Developer logs remain in English; dynamic window/application titles are data, not UI chrome.
 
 ## Git and commits
-
-Unless the user explicitly requests it, do not commit, push, stage, or rewrite history on the user's behalf. When a commit message is requested, provide only one Conventional Commits line:
+If user only input "cmsg", then give user a commit message follow below rule:
+Unless the user explicitly requests it, do not commit, push, stage, or rewrite history on the user's behalf. 
+When a commit message is requested, provide only one Conventional Commits line:
 
 `type: description`
 
@@ -72,4 +73,5 @@ diff. Base the message on the combined `git diff HEAD` result. Do not treat an `
 net addition without checking the combined diff: it may be an index addition that is deleted in
 the worktree.
 
-Use `fix` for corrections to existing visual/UI behavior and `feat` for new visual/UI behavior; reserve `style` for code-formatting or naming-only changes.
+Note that the Style word only used for code style change, not UI style change.
+UI style change usually use feat or fix.
