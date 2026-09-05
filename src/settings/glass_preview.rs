@@ -467,13 +467,12 @@ pub(crate) fn apply_glass_preview() {
     }
 }
 
-pub(super) fn clear_glass_preview() {
-    crate::config::set_glass_style_preview(None);
-    crate::config::set_glass_tint_preview(None);
-    apply_glass_preview();
-}
-
-pub(super) unsafe fn update_glass_tint_from_color(color: *mut AnyObject, sync_well: bool) {
+/// 取色器/颜色面板的统一写入路径:把新颜色写进 CONFIG 并调度防抖落盘,
+/// 随后把预览应用到真实浮窗与设置页内的两个模拟浮窗。
+/// The shared write path for the color well/panel: store the new color in CONFIG, schedule a
+/// debounced persist, then apply it to the real overlays and the two in-settings mock
+/// overlays.
+unsafe fn update_glass_tint_from_color(color: *mut AnyObject, sync_well: bool) {
     if GLASS_UI_UPDATE.load(Ordering::SeqCst) {
         return;
     }
@@ -487,7 +486,10 @@ pub(super) unsafe fn update_glass_tint_from_color(color: *mut AnyObject, sync_we
             GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
         }
     }
-    crate::config::set_glass_tint_preview(Some(hex));
+    if let Ok(mut w) = crate::config::CONFIG.write() {
+        w.appearance.glass_tint = hex;
+    }
+    crate::config::schedule_config_persist();
     apply_glass_preview();
 }
 
@@ -526,23 +528,12 @@ pub(crate) extern "C" fn on_glass_tint_reset(_self: *mut c_void, _cmd: Sel, _sen
         let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
         let _: () = msg_send![panel, setColor: color];
         GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
-        crate::config::set_glass_tint_preview(Some(default_hex));
-        apply_glass_preview();
-    }
-}
-
-pub(crate) extern "C" fn on_glass_style_changed(
-    _self: *mut c_void,
-    _cmd: Sel,
-    sender: *mut c_void,
-) {
-    unsafe {
-        let idx: isize = msg_send![sender as *mut AnyObject, indexOfSelectedItem];
-        crate::config::set_glass_style_preview(Some(if idx == 1 {
-            "clear".into()
-        } else {
-            "regular".into()
-        }));
+        // 重置 = 立即写回 CONFIG 默认值(与即时生效语义一致)。
+        // Reset = write the default straight back to CONFIG (matching live-apply semantics).
+        if let Ok(mut w) = crate::config::CONFIG.write() {
+            w.appearance.glass_tint = default_hex;
+        }
+        crate::config::persist_config_now();
         apply_glass_preview();
     }
 }

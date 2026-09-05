@@ -14,6 +14,7 @@ mod menu;
 mod mouse;
 mod overlay;
 mod performance;
+mod quick_actions;
 mod settings;
 mod skylight;
 mod theme;
@@ -515,6 +516,18 @@ extern "C" fn on_window_control(_self: *mut c_void, _cmd: Sel, arg: *mut c_void)
     }
 }
 
+/// 主线程:执行快捷操作(bridge 投递过来的动作编号)。
+/// Main thread: run one quick action (an action id delivered by the bridge).
+extern "C" fn on_quick_action(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
+    if arg.is_null() {
+        return;
+    }
+    let value: isize = unsafe { msg_send![arg as *mut AnyObject, integerValue] };
+    if let Some(action) = quick_actions::QuickAction::from_isize(value) {
+        quick_actions::apply_action(action);
+    }
+}
+
 // ========== Class Registration ==========
 
 fn create_overlay_window() -> *mut AnyObject {
@@ -941,6 +954,12 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(handleQuickAction:),
+            on_quick_action as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleAppActivation:),
             on_app_activated as *mut c_void,
             types_v_obj.as_ptr(),
@@ -1175,18 +1194,6 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
-                sel!(handleSettingsOk:),
-                on_settings_ok as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleSettingsCancel:),
-                on_settings_cancel as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
                 sel!(handleGlassTintChanged:),
                 on_glass_tint_changed as *mut c_void,
                 types.as_ptr(),
@@ -1207,12 +1214,6 @@ fn setup_status_bar() {
                 cls,
                 sel!(handleGlassTintReset:),
                 on_glass_tint_reset as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleGlassStyleChanged:),
-                on_glass_style_changed as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -1283,32 +1284,50 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handleControlChanged:),
+                on_control_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleControlTextDidChange:),
+                on_control_text_did_change as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleControlTextDidEndEditing:),
+                on_control_text_did_end_editing as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handlePageRestoreDefaults:),
+                handle_page_restore_defaults as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handlePageRestoreDefaultsConfirm:),
+                handle_page_restore_defaults_confirm as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handlePageRestoreDefaultsCancel:),
+                handle_page_restore_defaults_cancel as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleDeviceChanged:),
                 handle_device_changed as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
                 cls,
-                sel!(handleScrollModeChanged:),
-                handle_scroll_mode_changed as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleLineCountChanged:),
-                handle_line_count_changed as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleCardTextSizeChanged:),
-                handle_card_text_size_changed as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleStatusBarTextSizeChanged:),
-                handle_status_bar_text_size_changed as *mut c_void,
+                sel!(handleQuickActionsEnabledToggle:),
+                handle_quick_actions_enabled_toggle as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -1802,6 +1821,16 @@ fn main() {
         window_management::start();
     }
 
+    // 7b4. 快捷操作(Option+I/E/D)tap:仅在配置启用时启动(start 幂等)。
+    // Quick-actions (Option+I/E/D) tap: start only if enabled (idempotent).
+    let quick_actions_enabled = CONFIG
+        .read()
+        .map(|c| c.quick_actions.enabled)
+        .unwrap_or(false);
+    if quick_actions_enabled {
+        quick_actions::start();
+    }
+
     // 7c. Apply pointer settings (disable system acceleration if configured).
     // 指针设置(配置了禁用系统加速时立即生效)。
     mouse::pointer::apply();
@@ -1864,6 +1893,14 @@ fn main() {
                         let num: *mut AnyObject =
                             unsafe { msg_send![num, initWithInteger: dir as isize] };
                         (sel!(handleWindowControl:), num)
+                    }
+                    GlobalEvent::QuickAction(action) => {
+                        // 与 WindowControl 同模式:动作编号经 NSNumber 传到主线程。
+                        // Same pattern as WindowControl: the action id rides in an NSNumber.
+                        let num: *mut AnyObject = unsafe { msg_send![class!(NSNumber), alloc] };
+                        let num: *mut AnyObject =
+                            unsafe { msg_send![num, initWithInteger: action as isize] };
+                        (sel!(handleQuickAction:), num)
                     }
                 };
                 // Read controller pointer from static (only written once, safe to read)

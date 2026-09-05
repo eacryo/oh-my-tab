@@ -26,7 +26,6 @@ pub(super) enum SettingsTextRole {
     Disabled,
     Accent,
     AccentHover,
-    OnAccent,
 }
 
 /// Resolve one text role from the active light/dark palette.
@@ -41,7 +40,6 @@ pub(super) fn settings_text_color(role: SettingsTextRole) -> *mut AnyObject {
         SettingsTextRole::Disabled => palette.disabled_text,
         SettingsTextRole::Accent => palette.accent,
         SettingsTextRole::AccentHover => palette.accent_hover,
-        SettingsTextRole::OnAccent => 0xFFFFFFFF,
     };
     crate::ffi::hex_to_ns_color(color)
 }
@@ -2343,6 +2341,10 @@ pub(super) unsafe fn make_slider(
     let slider: *mut AnyObject = msg_send![class!(NSSlider), alloc];
     let slider: *mut AnyObject =
         msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
+    // 拖动过程中连续发送 action:即时生效模式下运行时效果需实时跟随拖动。
+    // Send the action continuously while dragging: in live-apply mode runtime effects must
+    // follow the drag in real time.
+    let _: () = msg_send![slider, setContinuous: true];
     let _: () = msg_send![slider, setMinValue: min as f64];
     let _: () = msg_send![slider, setMaxValue: max as f64];
     // 整数步进:1 格 = 1 个单位(线性 Mouse By Lines 滑块同款:0...10 step 1)。

@@ -578,6 +578,14 @@ pub(super) struct RestoreDefaultsControl {
     pub(super) surface: *mut AnyObject,
     pub(super) container: *mut AnyObject,
     pub(super) separator: *mut AnyObject,
+    // 展开几何(侧边栏与 footer 变体尺寸不同,构建时确定):
+    // confirm_y = 确认按钮在容器内的 y;collapsed/expanded_h = 容器收起/展开高度。
+    // Expanded geometry (sidebar vs footer variants differ; fixed at build time):
+    // confirm_y = the confirm row's y inside the container; collapsed/expanded_h = the
+    // container's collapsed/expanded height.
+    confirm_y: f64,
+    collapsed_h: f64,
+    expanded_h: f64,
     pub(super) expanded: bool,
 }
 
@@ -593,6 +601,9 @@ impl RestoreDefaultsControl {
             surface: std::ptr::null_mut(),
             container: std::ptr::null_mut(),
             separator: std::ptr::null_mut(),
+            confirm_y: 0.0,
+            collapsed_h: 0.0,
+            expanded_h: 0.0,
             expanded: false,
         }
     }
@@ -656,10 +667,14 @@ impl RestoreDefaultsControl {
             let _: () = objc2::msg_send![surface_layer, setShadowRadius: 8.0f64];
             let _: () = objc2::msg_send![surface_layer, setShadowOffset: NSSize::new(0.0, -1.0)];
         }
-        // In the compact state the shell sits exactly behind the trigger, so its card outline is
-        // not exposed as a stray ring. It becomes visible naturally as the shell grows outward.
-        // 收起态的外壳与触发按钮完全重合，避免卡片轮廓露成一圈；向外展开时再自然显现。
-        let _: () = objc2::msg_send![surface, setAlphaValue: 1.0f64];
+        // Collapsed state: the shell stays fully hidden. It shares the trigger's frame, and its
+        // own hairline border composites with the trigger's border into a muddy double ring
+        // (most visible on hover when the trigger fill turns translucent). It is revealed only
+        // while expanding.
+        // 收起态外壳完全隐藏：它与触发按钮同框，自身描边会和按钮描边叠成浊环（悬停时按钮
+        // 变半透明灰后最明显），只在展开时才显示。
+        let _: () = objc2::msg_send![surface, setHidden: true];
+        let _: () = objc2::msg_send![surface, setAlphaValue: 0.0f64];
         let _: () = objc2::msg_send![parent, addSubview: surface];
 
         let container: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
@@ -730,17 +745,165 @@ impl RestoreDefaultsControl {
             surface,
             container,
             separator,
+            confirm_y: 54.0,
+            collapsed_h: 42.0,
+            expanded_h: 110.0,
+            expanded: false,
+        }
+    }
+
+    /// 页面变体:内嵌到某页文档内容末尾的「恢复本页默认设置」控件(无分割线)。
+    /// Page variant: a "Restore Page Defaults" control embedded at the end of one page's
+    /// scrolling document (no separator).
+    ///
+    /// `(x, y_bottom)` 是控件收起态容器在文档坐标系中的左下角(y 向上),`width` 为控件
+    /// 全宽(与卡片同宽)。展开卡片向上生长,盖在页面内容之上(控件是文档的最后子视图)。
+    /// `(x, y_bottom)` is the collapsed container's bottom-left corner in the document's
+    /// coordinate space (y up); `width` is the control's full width (matching the cards). The
+    /// expanded card grows upward, drawing over page content (the control is the document's
+    /// last subview).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn build_for_page(
+        parent: *mut AnyObject,
+        target: *mut AnyObject,
+        x: f64,
+        y_bottom: f64,
+        width: f64,
+    ) -> Self {
+        let row_h = 30.0;
+        let container_frame = NSRect::new(
+            NSPoint::new(x, y_bottom),
+            objc2_foundation::NSSize::new(width, 42.0),
+        );
+        let container: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
+        // initWithFrame: 返回对象本身;objc2 在 debug 下校验返回类型编码,必须绑定返回值。
+        // initWithFrame: returns the object; objc2 validates the return type encoding in debug
+        // builds, so the return value must be bound.
+        let container: *mut AnyObject = objc2::msg_send![container, initWithFrame: container_frame];
+        // 文档宽度固定,不留自适应掩码;随内容一起滚动。
+        // The document width is fixed: no autoresizing mask; it simply scrolls with the content.
+        let _: () = objc2::msg_send![container, setAutoresizingMask: 0u64];
+        let _: () = objc2::msg_send![container, setWantsLayer: true];
+        let container_layer: *mut AnyObject = objc2::msg_send![container, layer];
+        if !container_layer.is_null() {
+            // 对齐参考根节点的 `overflow-hidden`:上排按钮只会在外壳长到对应高度后显现。
+            // Match the reference root's `overflow-hidden`: the upper row is revealed only as
+            // the shell grows past it.
+            let _: () = objc2::msg_send![container_layer, setMasksToBounds: true];
+            let _: () = objc2::msg_send![container_layer, setCornerRadius: 14.0f64];
+        }
+
+        // 触发按钮全宽(与卡片同宽,左右各留 8pt 内边距)。
+        // The trigger is full width (matching the cards, with 8pt side insets).
+        let trigger = SettingsButton::action(
+            NSRect::new(
+                NSPoint::new(8.0, 6.0),
+                objc2_foundation::NSSize::new(width - 16.0, row_h),
+            ),
+            &t("settings.btn_restore_page_defaults"),
+            target,
+            objc2::sel!(handlePageRestoreDefaults:),
+            SettingsButtonRole::Action,
+        );
+
+        // 展开卡片是位于按钮后方的独立表面,展开时作为整体淡入并向上生长。
+        // The expanded card is a separate surface behind the buttons that fades in and grows
+        // upward as one rounded unit.
+        // 收起态外壳完全隐藏(避免与按钮描边叠成浊环,见侧边栏变体说明)。
+        // Collapsed shell stays hidden (same double-ring reason as the sidebar variant).
+        let surface: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
+        let surface: *mut AnyObject = objc2::msg_send![surface, initWithFrame: NSRect::new(
+            NSPoint::new(x + 8.0, y_bottom + 6.0),
+            objc2_foundation::NSSize::new(width - 16.0, row_h),
+        )];
+        let _: () = objc2::msg_send![surface, setHidden: true];
+        let _: () = objc2::msg_send![surface, setAlphaValue: 0.0f64];
+        let _: () = objc2::msg_send![surface, setWantsLayer: true];
+        let surface_layer: *mut AnyObject = objc2::msg_send![surface, layer];
+        if !surface_layer.is_null() {
+            let palette = widgets::settings_palette();
+            crate::ffi::layer_set_background(
+                surface_layer,
+                crate::ffi::hex_to_cg_color(palette.card_bg),
+            );
+            crate::ffi::layer_set_border(
+                surface_layer,
+                crate::ffi::hex_to_cg_color(palette.card_border),
+            );
+            let _: () = objc2::msg_send![surface_layer, setBorderWidth: 1.0f64];
+            let _: () = objc2::msg_send![surface_layer, setCornerRadius: 14.0f64];
+            let _: () = objc2::msg_send![surface_layer, setMasksToBounds: false];
+            let _: () = objc2::msg_send![surface_layer, setShadowOpacity: 0.0f32];
+            let _: () = objc2::msg_send![surface_layer, setShadowRadius: 8.0f64];
+            let _: () = objc2::msg_send![surface_layer, setShadowOffset: NSSize::new(0.0, -1.0)];
+        }
+        let _: () = objc2::msg_send![parent, addSubview: surface];
+        // container(含按钮)必须加到 surface 之上，否则按钮会被外壳盖住。
+        // The container (with the buttons) must join the hierarchy ABOVE the surface.
+        let _: () = objc2::msg_send![parent, addSubview: container];
+
+        let confirm = SettingsButton::action(
+            NSRect::new(
+                NSPoint::new(8.0, 54.0),
+                objc2_foundation::NSSize::new(width - 16.0, row_h),
+            ),
+            &t("settings.btn_confirm"),
+            target,
+            objc2::sel!(handlePageRestoreDefaultsConfirm:),
+            SettingsButtonRole::Destructive,
+        );
+        let _: () = objc2::msg_send![confirm, setHidden: true];
+        let _: () = objc2::msg_send![confirm, setAlphaValue: 0.0f64];
+        let _: () = objc2::msg_send![container, addSubview: confirm];
+
+        let cancel = SettingsButton::action(
+            NSRect::new(
+                NSPoint::new(8.0, 6.0),
+                objc2_foundation::NSSize::new(width - 16.0, row_h),
+            ),
+            &t("settings.btn_cancel"),
+            target,
+            objc2::sel!(handlePageRestoreDefaultsCancel:),
+            SettingsButtonRole::Action,
+        );
+        let _: () = objc2::msg_send![cancel, setHidden: true];
+        let _: () = objc2::msg_send![cancel, setAlphaValue: 0.0f64];
+        let _: () = objc2::msg_send![container, addSubview: cancel];
+
+        let _: () = objc2::msg_send![container, addSubview: trigger];
+
+        crate::ffi::CFRelease(surface as *const std::ffi::c_void);
+        crate::ffi::CFRelease(container as *const std::ffi::c_void);
+        crate::ffi::CFRelease(trigger as *const std::ffi::c_void);
+        crate::ffi::CFRelease(confirm as *const std::ffi::c_void);
+        crate::ffi::CFRelease(cancel as *const std::ffi::c_void);
+
+        Self {
+            trigger,
+            confirm,
+            cancel,
+            surface,
+            container,
+            separator: std::ptr::null_mut(),
+            // 取消行与触发按钮同位(y=6),确认行在其上方;展开高度 = 确认行顶 + 8pt 余量。
+            // The cancel row shares the trigger's position (y=6); the confirm row sits above;
+            // expanded height = the confirm row's top + an 8pt margin.
+            confirm_y: 54.0,
+            collapsed_h: 42.0,
+            expanded_h: 110.0,
             expanded: false,
         }
     }
 
     pub(super) fn is_ready(self) -> bool {
+        // separator 仅侧边栏变体存在(footer 变体为空),不参与就绪判定。
+        // The separator only exists in the sidebar variant (null for footer); it is not part
+        // of the readiness check.
         !self.trigger.is_null()
             && !self.confirm.is_null()
             && !self.cancel.is_null()
             && !self.surface.is_null()
             && !self.container.is_null()
-            && !self.separator.is_null()
     }
 
     /// Toggle the component as one animated unit; the bottom row remains anchored in place.
@@ -761,35 +924,45 @@ impl RestoreDefaultsControl {
         // 有意收紧，避免 Confirm 上方出现大块空白区域。
         let expanded_row_width = trigger_frame.size.width;
         let cancel_frame = NSRect::new(
-            // Keep Cancel exactly where the collapsed Restore Defaults trigger lives. The card
-            // grows upward around this fixed bottom anchor.
-            // 取消按钮始终与收起态的恢复默认按钮完全同位；卡片围绕这个固定底部锚点向上展开。
+            // Keep Cancel exactly where the collapsed trigger lives. The card grows upward
+            // around this fixed bottom anchor.
+            // 取消按钮始终与收起态的触发按钮完全同位；卡片围绕这个固定底部锚点向上展开。
             trigger_frame.origin,
-            objc2_foundation::NSSize::new(expanded_row_width, 30.0),
+            objc2_foundation::NSSize::new(expanded_row_width, trigger_frame.size.height),
         );
         let confirm_frame = NSRect::new(
-            NSPoint::new(trigger_frame.origin.x, 54.0),
-            objc2_foundation::NSSize::new(expanded_row_width, 30.0),
+            NSPoint::new(trigger_frame.origin.x, self.confirm_y),
+            objc2_foundation::NSSize::new(expanded_row_width, trigger_frame.size.height),
         );
-        let separator_frame: NSRect = objc2::msg_send![self.separator, frame];
-        let target_separator = NSRect::new(
-            separator_frame.origin,
-            objc2_foundation::NSSize::new(separator_frame.size.width, separator_frame.size.height),
-        );
-        let target_separator_y = if expanded {
-            separator_frame.origin.y + 51.0
+        // footer 变体没有分割线(separator 为空),跳过分割线动画。
+        // The footer variant has no separator (null); skip the separator animation.
+        let separator_frame: NSRect = if self.separator.is_null() {
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
         } else {
-            separator_frame.origin.y - 51.0
+            objc2::msg_send![self.separator, frame]
         };
-        let target_separator = NSRect::new(
-            NSPoint::new(target_separator.origin.x, target_separator_y),
-            target_separator.size,
-        );
+        let target_separator = if self.separator.is_null() {
+            separator_frame
+        } else {
+            let target_separator_y = if expanded {
+                separator_frame.origin.y + 51.0
+            } else {
+                separator_frame.origin.y - 51.0
+            };
+            NSRect::new(
+                NSPoint::new(separator_frame.origin.x, target_separator_y),
+                separator_frame.size,
+            )
+        };
         let target_container = NSRect::new(
             container_frame.origin,
             objc2_foundation::NSSize::new(
                 container_frame.size.width,
-                if expanded { 110.0 } else { 42.0 },
+                if expanded {
+                    self.expanded_h
+                } else {
+                    self.collapsed_h
+                },
             ),
         );
         // The shell starts exactly behind the trigger and grows outward by 8pt on each side,
@@ -810,9 +983,21 @@ impl RestoreDefaultsControl {
         };
 
         if expanded {
+            // Reveal the shell for the expanded card (it stays hidden while collapsed; see the
+            // build sites).
+            // 展开时先显示外壳（收起态保持隐藏，见构建处）。
+            let _: () = objc2::msg_send![self.surface, setHidden: false];
             let _: () = objc2::msg_send![self.trigger, setHidden: false];
             let _: () = objc2::msg_send![self.cancel, setHidden: false];
             let _: () = objc2::msg_send![self.confirm, setHidden: false];
+            if animated {
+                Self::animate_basic_opacity(self.surface, 1.0, 0.25, "restore-shell-reveal");
+                // 同步视图模型值,保证与后续非动画路径(setAlphaValue)读写一致。
+                // Sync the view model value so later non-animated paths stay consistent.
+                let _: () = objc2::msg_send![self.surface, setAlphaValue: 1.0f64];
+            } else {
+                let _: () = objc2::msg_send![self.surface, setAlphaValue: 1.0f64];
+            }
             let _: () = objc2::msg_send![self.confirm, setFrame: confirm_frame];
             let _: () = objc2::msg_send![self.cancel, setFrame: cancel_frame];
             // Cancel takes the fixed dock slot while Restore Defaults fades beneath it.
@@ -863,10 +1048,17 @@ impl RestoreDefaultsControl {
                     36.0,
                     "restore-trigger-open",
                 );
+                // Fade the shell with the shrink so it never ends up painting behind the
+                // trigger in the collapsed state.
+                // 外壳随收缩淡出，避免收起态结束时仍画在按钮后面。
+                Self::animate_basic_opacity(self.surface, 0.0, 0.45, "restore-shell-hide");
+                let _: () = objc2::msg_send![self.surface, setAlphaValue: 0.0f64];
             } else {
                 let _: () = objc2::msg_send![self.trigger, setAlphaValue: 1.0f64];
                 let _: () = objc2::msg_send![self.cancel, setAlphaValue: 0.0f64];
                 Self::set_content_model(self.confirm, 0.0, 6.0, 0.98);
+                let _: () = objc2::msg_send![self.surface, setAlphaValue: 0.0f64];
+                let _: () = objc2::msg_send![self.surface, setHidden: true];
             }
         }
 
@@ -909,14 +1101,16 @@ impl RestoreDefaultsControl {
                 24.0,
                 "restore-clip",
             );
-            Self::spring_view_frame(
-                self.separator,
-                target_separator,
-                0.58,
-                160.0,
-                24.0,
-                "restore-divider",
-            );
+            if !self.separator.is_null() {
+                Self::spring_view_frame(
+                    self.separator,
+                    target_separator,
+                    0.58,
+                    160.0,
+                    24.0,
+                    "restore-divider",
+                );
+            }
         } else {
             let _: () = objc2::msg_send![self.surface, setFrame: target_surface];
             let surface_layer: *mut AnyObject = objc2::msg_send![self.surface, layer];
@@ -925,7 +1119,9 @@ impl RestoreDefaultsControl {
                 let _: () = objc2::msg_send![surface_layer, setShadowOpacity: shadow_opacity];
             }
             let _: () = objc2::msg_send![self.container, setFrame: target_container];
-            let _: () = objc2::msg_send![self.separator, setFrame: target_separator];
+            if !self.separator.is_null() {
+                let _: () = objc2::msg_send![self.separator, setFrame: target_separator];
+            }
         }
     }
 
@@ -1287,6 +1483,7 @@ pub(super) enum SettingsSidebarIcon {
     Mouse,
     Clipboard,
     WindowControl,
+    QuickActions,
     About,
 }
 
@@ -1304,6 +1501,9 @@ impl SettingsSidebarIcon {
             // A rectangle split into left/right halves mirrors the window-control
             // half-screen/quarter-snapping semantics.
             Self::WindowControl => "rectangle.split.2x2",
+            // 闪电符号呼应“一键直达”的快捷操作语义。
+            // A bolt mirrors the quick-actions "jump straight there" semantics.
+            Self::QuickActions => "bolt.circle",
             Self::About => "info.circle",
         }
     }
@@ -1570,11 +1770,11 @@ impl SettingsSidebar {
         x: f64,
         y0: f64,
         w: f64,
-    ) -> [*mut AnyObject; 6] {
+    ) -> [*mut AnyObject; 7] {
         // Add new sidebar entries here: the component owns title keys, icons, tags, and spacing.
         // 新增侧栏入口只需在这里添加标题 key、图标和 tag；间距与对齐由组件统一处理。
-        // 窗口控制位于剪贴板历史与关于之间。
-        // Window control sits between Clipboard history and About.
+        // 快捷操作位于窗口控制与关于之间。
+        // Quick actions sits between Window control and About.
         let entries = [
             ("settings.sidebar_general", SettingsSidebarIcon::General),
             ("settings.sidebar_switcher", SettingsSidebarIcon::Switcher),
@@ -1583,6 +1783,10 @@ impl SettingsSidebar {
             (
                 "settings.sidebar_window_control",
                 SettingsSidebarIcon::WindowControl,
+            ),
+            (
+                "settings.sidebar_quick_actions",
+                SettingsSidebarIcon::QuickActions,
             ),
             ("settings.sidebar_about", SettingsSidebarIcon::About),
         ];

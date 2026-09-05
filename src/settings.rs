@@ -1,10 +1,12 @@
-//! 设置窗口:SettingsUi 状态、控件构造器(text/popup/header/row)、窗口构建/显示/收集、
-//! 校验告警、以及配置热应用(apply_config_refresh)。invalidate_settings_window 作废缓存
-//! 窗口供 locale 变更后重建。
+//! 设置窗口:SettingsUi 状态、控件构造器(text/popup/header/row)、窗口构建/显示、
+//! 即时生效的字段调度器(所有修改实时写内存 CONFIG + 防抖落盘)、以及恢复默认
+//! (整页/整应用)。invalidate_settings_window 作废缓存窗口供 locale/主题变更后重建。
 //!
 //! Settings window: SettingsUi state, control builders (text/popup/header/row), window
-//! build/show/collect, validation alerts, and hot config application (apply_config_refresh).
-//! invalidate_settings_window drops the cached window so it rebuilds after a locale change.
+//! build/show, the live-apply control dispatcher (every change writes the in-memory CONFIG
+//! immediately + persists to disk with a debounce), and restore-defaults (per page / whole
+//! app). invalidate_settings_window drops the cached window so it rebuilds after a locale or
+//! theme change.
 
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
@@ -15,13 +17,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::config::{reload_config, Config, CONFIG};
+use crate::config::{persist_config_now, schedule_config_persist, Config, CONFIG};
 use crate::event_monitor::SHORTCUT_IS_CMD;
 use crate::event_tap::{
     CGEventGetFlags, CGEventGetIntegerValueField, CGEventRef, CGEventTapProxy, CGEventType,
 };
 use crate::ffi::*;
-use crate::i18n::{t, tf};
+use crate::i18n::{apply_config_locale, t, tf};
 use crate::menu::{refresh_menu_titles, set_shortcut_mode};
 use crate::mouse::shortcut::{button_name, describe_shortcut, display_shortcut};
 use crate::overlay::{apply_theme, refresh_highlight, update_status_label};
@@ -154,13 +156,15 @@ struct SettingsUi {
     sidebar_mouse: *mut AnyObject,   // NSButton: 鼠标控制 / Mouse (tag=2)
     sidebar_clipboard: *mut AnyObject, // NSButton: 剪贴板历史 / Clipboard history (tag=3)
     sidebar_window_control: *mut AnyObject, // NSButton: 窗口控制 / Window control (tag=4)
-    sidebar_about: *mut AnyObject,   // NSButton: 关于 / About (tag=5)
+    sidebar_quick_actions: *mut AnyObject, // NSButton: 快捷操作 / Quick actions (tag=5)
+    sidebar_about: *mut AnyObject,   // NSButton: 关于 / About (tag=6)
     sidebar_highlight: *mut AnyObject, // NSView: 选中行高亮背景 (layer-backed)
     general_view: *mut AnyObject,    // NSView: 通用页容器 / General page container
     switcher_view: *mut AnyObject,   // NSView: 应用切换浮窗页容器 / App switcher page container
     mouse_view: *mut AnyObject,      // NSView: 鼠标页容器 / Mouse page container
     clipboard_view: *mut AnyObject,  // NSView: 剪贴板历史页容器 / Clipboard page container
     window_control_view: *mut AnyObject, // NSView: 窗口控制页容器 / Window-control page container
+    quick_actions_view: *mut AnyObject, // NSView: 快捷操作页容器 / Quick-actions page container
     about_view: *mut AnyObject,      // NSView: 关于页容器 / About page container
     about_subtitle: *mut AnyObject,  // NSTextField: About 页版本号 / About-page version label
     theme: *mut AnyObject,           // NSPopUpButton: auto / light / dark
@@ -211,12 +215,19 @@ struct SettingsUi {
     window_control_down: *mut AnyObject,    // NSSwitch: 启用 Option+下 / enable Option+Down
     window_control_left: *mut AnyObject,    // NSSwitch: 启用 Option+左 / enable Option+Left
     window_control_right: *mut AnyObject,   // NSSwitch: 启用 Option+右 / enable Option+Right
+    quick_actions_enabled: *mut AnyObject,  // NSSwitch: 启用快捷操作 / enable quick actions
+    quick_actions_open_settings: *mut AnyObject, // NSSwitch: Option+I 打开设置 / open settings
+    quick_actions_open_finder: *mut AnyObject, // NSSwitch: Option+E 打开访达 / open Finder
+    quick_actions_show_desktop: *mut AnyObject, // NSSwitch: Option+D 显示桌面 / show desktop
     add_mapping_button: *mut AnyObject,     // NSButton: 添加映射 / add-mapping button
     mapping_enabled: *mut AnyObject, // NSSwitch: 按键映射总开关(per-device) / mappings master switch (per-device)
     mapping_empty: *mut AnyObject,   // NSTextField: 空状态提示(卡片内) / empty-state hint (in-card)
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
     restore_defaults: RestoreDefaultsControl, // 左下角恢复默认组件 / restore-defaults control
-    ok_button: *mut AnyObject,        // NSButton: 确认按钮 / OK button
+    // 每页一个「恢复本页默认设置」控件(内嵌各页文档内容末尾,随滚动)。
+    // One "Restore Page Defaults" control per page (embedded at the end of each page's
+    // scrolling document).
+    page_restores: [RestoreDefaultsControl; 7],
     accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
     update_auto_check: *mut AnyObject, // NSSwitch: Sparkle 自动检查开关 / Sparkle auto-check switch
     update_auto_download: *mut AnyObject, // NSSwitch: Sparkle 自动下载开关 / Sparkle auto-download switch
@@ -365,8 +376,8 @@ use components::{
 };
 use glass_preview::*;
 pub(crate) use glass_preview::{
-    apply_glass_preview, on_glass_style_changed, on_glass_tint_changed,
-    on_glass_tint_panel_changed, on_glass_tint_panel_will_close, on_glass_tint_reset,
+    apply_glass_preview, on_glass_tint_changed, on_glass_tint_panel_changed,
+    on_glass_tint_panel_will_close, on_glass_tint_reset,
 };
 use mapping::*;
 pub(crate) use mapping::{
@@ -508,9 +519,9 @@ fn start_inline_update_check() {
 /// updater::render_target) instead of a standalone window.
 pub(crate) fn open_about_updates() {
     show_settings();
-    // show_settings 每次打开都复位到通用页,这里再切到 About(tag=5)。
-    // show_settings resets to the General page on every open; switch to About (tag=5) here.
-    select_sidebar(5);
+    // show_settings 每次打开都复位到通用页,这里再切到 About(tag=6)。
+    // show_settings resets to the General page on every open; switch to About (tag=6) here.
+    select_sidebar(6);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
@@ -563,6 +574,7 @@ pub(crate) fn expand_update_section(window_h: f64) {
         // The update content replaces the check-button area instead of being appended below it.
         let _: () = msg_send![ui.update_check_button, setHidden: true];
         ui.update_card_expanded = true;
+        set_about_restore_control_visible(false);
 
         // The compact document was fitted during construction; an expanded Sparkle host may
         // extend beyond that height, so re-measure the About page after changing the card.
@@ -578,6 +590,22 @@ pub(crate) fn expand_update_section(window_h: f64) {
 
 /// 更新流程结束时收起 About 页 Updates 卡片与文档,恢复默认紧凑布局。
 /// Collapse the About page Updates card and document when a flow ends, restoring the compact look.
+/// 更新流程展开/收起时同步隐藏/显示 About 页的恢复本页默认控件,
+/// 避免展开的更新卡片与该控件在页面底部相互遮挡。
+/// Hide/show the About page's restore control while the inline update card is expanded, so
+/// the grown card and the control don't overlap at the page bottom.
+fn set_about_restore_control_visible(visible: bool) {
+    let mut ui_guard = SETTINGS_UI.lock().unwrap();
+    let Some(ui) = ui_guard.as_mut() else {
+        return;
+    };
+    let control = &mut ui.page_restores[6];
+    unsafe {
+        let _: () = msg_send![control.container, setHidden: !visible];
+        let _: () = msg_send![control.surface, setHidden: !visible];
+    }
+}
+
 pub(crate) fn collapse_update_section() {
     let mut ui_guard = SETTINGS_UI.lock().unwrap();
     let Some(ui) = ui_guard.as_mut() else {
@@ -621,6 +649,7 @@ pub(crate) fn collapse_update_section() {
         let _: () = msg_send![ui.update_host, setHidden: true];
         let _: () = msg_send![ui.update_check_button, setHidden: false];
         ui.update_card_expanded = false;
+        set_about_restore_control_visible(true);
     }
 }
 
@@ -918,90 +947,826 @@ fn log_config_changes(old: &Config, new: &Config) {
     }
 }
 
-pub(crate) extern "C" fn on_settings_ok(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // 防御:点 OK 时若仍在录制,先收尾(复位 RECORDING);关闭编辑面板。
-    // Defensive: wrap up any in-progress recording on OK; close the edit panel.
-    cancel_recording_from_main();
-    close_mapping_panel();
-    let (cfg, errs) = collect_settings_config();
-    if !errs.is_empty() {
-        show_alert(&t("alert.config_error_title"), &errs.join("\n"));
-        return;
-    }
+// ========== 即时生效字段调度器 / live-apply control dispatcher ==========
+// 所有设置修改即时写入内存 CONFIG 并调度防抖落盘;不再存在“点确认才生效”的
+// pending/staged 状态。数字文本框允许输入过程中的临时非法值(仅合法时应用),
+// 滑块拖动实时生效、磁盘写入防抖。
+// Every change is written to the in-memory CONFIG immediately with a debounced disk write;
+// no pending/staged state exists anymore. Numeric text fields may hold transient invalid
+// values while typing (applied only when valid); sliders take effect live while drags
+// persist with a debounce.
 
-    // 检查是否需要重启:对比新旧 mouse.enabled。按钮标题已在 switch toggle 时实时更新。
-    // Check if restart needed: button title already updated in real time when the switch toggled.
-    let old_cfg = CONFIG.read().unwrap().clone();
-    let needs_restart = old_cfg.mouse.enabled != cfg.mouse.enabled;
+/// 可编辑控件标识。控件指针 → 字段的映射见 control_field_of。
+/// Editable control ids. The pointer → field mapping lives in control_field_of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlField {
+    Theme,
+    GlassStyle,
+    GlassTint,
+    Locale,
+    LogLevel,
+    LaunchAtLogin,
+    WindowsEnabled,
+    ShowMinimized,
+    ThumbnailsEnabled,
+    CardTextSize,
+    StatusBarTextSize,
+    OverlayPosition,
+    CornerRadius,
+    Modifier,
+    MouseEnabled,
+    ReverseScroll,
+    ScrollMode,
+    LineCount,
+    DisablePointerAccel,
+    MappingEnabled,
+    ClipboardEnabled,
+    ClipboardPersist,
+    ClipboardShowSourceApp,
+    ClipboardMoveUsedToTop,
+    ClipboardMaxEntries,
+    ClipboardAutoExpireDays,
+    ClipboardPinFollow,
+    WindowControlEnabled,
+    WindowControlUp,
+    WindowControlDown,
+    WindowControlLeft,
+    WindowControlRight,
+    QuickActionsEnabled,
+    QuickActionOpenSettings,
+    QuickActionOpenFinder,
+    QuickActionShowDesktop,
+    UpdateAutoCheck,
+    UpdateAutoDownload,
+}
 
-    // 窗口切换开关被关闭:收起可能正开着的浮窗并复位状态,避免残留。
-    // The switcher switch was turned off: dismiss a possibly-open overlay and reset
-    // the state, so nothing stale lingers.
-    if !cfg.windows.enabled {
-        crate::overlay::reset_switcher();
-    }
-
-    if let Err(e) = cfg.save() {
-        show_alert(&t("alert.save_failed_title"), &e);
-        return;
-    }
-    let _ = reload_config();
-    // Sparkle keeps its updater object alive for the process; apply the persisted toggles
-    // immediately so the next automatic-check/download follows the user's choice.
-    crate::updater::set_automatic_checks(cfg.updates.automatically_check);
-    crate::updater::set_automatic_downloads(cfg.updates.automatically_download);
-    // 指针加速设置(禁用/恢复)实时生效,无需重启。
-    // Pointer acceleration settings take effect immediately, no restart needed.
-    crate::mouse::pointer::apply();
-    set_shortcut_mode(cfg.keyboard.modifier == "command");
-    apply_config_refresh();
-    hide_settings();
-
-    if needs_restart {
-        // 运行时热切换鼠标 event tap,不再 spawn 新进程(避免孤儿进程)。
-        // Hot-switch the mouse event tap at runtime; no more process spawn (avoids orphans).
-        if cfg.mouse.enabled {
-            crate::mouse::start();
+/// 按控件指针识别字段(设置窗口复用,指针稳定)。
+/// Identify a field by its control pointer (the window is reused, pointers are stable).
+unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
+    let ui = SETTINGS_UI.lock().unwrap();
+    let u = ui.as_ref()?;
+    let ptr = sender as usize;
+    let m = |ctrl: *mut AnyObject, field: ControlField| {
+        if ptr == ctrl as usize {
+            Some(field)
         } else {
-            crate::mouse::stop();
+            None
+        }
+    };
+    m(u.theme, ControlField::Theme)
+        .or_else(|| m(u.glass_style, ControlField::GlassStyle))
+        .or_else(|| m(u.glass_tint, ControlField::GlassTint))
+        .or_else(|| m(u.locale, ControlField::Locale))
+        .or_else(|| m(u.log_level, ControlField::LogLevel))
+        .or_else(|| m(u.launch_at_login, ControlField::LaunchAtLogin))
+        .or_else(|| m(u.windows_enabled, ControlField::WindowsEnabled))
+        .or_else(|| m(u.show_minimized, ControlField::ShowMinimized))
+        .or_else(|| m(u.thumbnails_enabled, ControlField::ThumbnailsEnabled))
+        .or_else(|| m(u.card_text_size, ControlField::CardTextSize))
+        .or_else(|| m(u.status_bar_text_size, ControlField::StatusBarTextSize))
+        .or_else(|| m(u.overlay_position, ControlField::OverlayPosition))
+        .or_else(|| m(u.corner_radius, ControlField::CornerRadius))
+        .or_else(|| m(u.modifier, ControlField::Modifier))
+        .or_else(|| m(u.enable_mouse, ControlField::MouseEnabled))
+        .or_else(|| m(u.reverse_scroll, ControlField::ReverseScroll))
+        .or_else(|| m(u.scroll_mode, ControlField::ScrollMode))
+        .or_else(|| m(u.line_count, ControlField::LineCount))
+        .or_else(|| m(u.disable_pointer_accel, ControlField::DisablePointerAccel))
+        .or_else(|| m(u.mapping_enabled, ControlField::MappingEnabled))
+        .or_else(|| m(u.clipboard_enabled, ControlField::ClipboardEnabled))
+        .or_else(|| m(u.clipboard_persist, ControlField::ClipboardPersist))
+        .or_else(|| {
+            m(
+                u.clipboard_show_source_app,
+                ControlField::ClipboardShowSourceApp,
+            )
+        })
+        .or_else(|| {
+            m(
+                u.clipboard_move_used_to_top,
+                ControlField::ClipboardMoveUsedToTop,
+            )
+        })
+        .or_else(|| m(u.clipboard_max_entries, ControlField::ClipboardMaxEntries))
+        .or_else(|| {
+            m(
+                u.clipboard_auto_expire_days,
+                ControlField::ClipboardAutoExpireDays,
+            )
+        })
+        .or_else(|| m(u.clipboard_pin_follow, ControlField::ClipboardPinFollow))
+        .or_else(|| m(u.window_control_enabled, ControlField::WindowControlEnabled))
+        .or_else(|| m(u.window_control_up, ControlField::WindowControlUp))
+        .or_else(|| m(u.window_control_down, ControlField::WindowControlDown))
+        .or_else(|| m(u.window_control_left, ControlField::WindowControlLeft))
+        .or_else(|| m(u.window_control_right, ControlField::WindowControlRight))
+        .or_else(|| m(u.quick_actions_enabled, ControlField::QuickActionsEnabled))
+        .or_else(|| {
+            m(
+                u.quick_actions_open_settings,
+                ControlField::QuickActionOpenSettings,
+            )
+        })
+        .or_else(|| {
+            m(
+                u.quick_actions_open_finder,
+                ControlField::QuickActionOpenFinder,
+            )
+        })
+        .or_else(|| {
+            m(
+                u.quick_actions_show_desktop,
+                ControlField::QuickActionShowDesktop,
+            )
+        })
+        .or_else(|| m(u.update_auto_check, ControlField::UpdateAutoCheck))
+        .or_else(|| m(u.update_auto_download, ControlField::UpdateAutoDownload))
+}
+
+/// 给控件绑定统一回调(开关/下拉/滑块)。
+/// Bind a control to the unified change callback (switches/popups/sliders).
+unsafe fn bind_control(target: *mut AnyObject, ctrl: *mut AnyObject) {
+    let _: () = msg_send![ctrl, setTarget: target];
+    let _: () = msg_send![ctrl, setAction: sel!(handleControlChanged:)];
+}
+
+/// 统一控件回调(开关/下拉/滑块/取色器):识别字段后应用其值。
+/// The unified control callback (switches/popups/sliders/color well): identify the field and
+/// apply its value.
+pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
+    unsafe {
+        let ctrl = sender as *mut AnyObject;
+        // 滑块右侧数值 label 先行刷新(与旧回调一致)。
+        // Refresh the slider value labels first (same as the old callbacks).
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            if ctrl == u.line_count {
+                let val: isize = msg_send![ctrl, integerValue];
+                set_field(u.line_count_value_label, val);
+            } else if ctrl == u.card_text_size || ctrl == u.status_bar_text_size {
+                let val: isize = msg_send![ctrl, integerValue];
+                let label = if ctrl == u.card_text_size {
+                    u.card_text_size_value_label
+                } else {
+                    u.status_bar_text_size_value_label
+                };
+                set_field(label, val);
+            }
+        }
+        drop(ui);
+        let Some(field) = control_field_of(ctrl) else {
+            log_debug!("[settings] control change from an unknown sender ignored");
+            return;
+        };
+        apply_control_field(field);
+    }
+}
+
+/// 读取控件值写入内存 CONFIG + 调度防抖落盘 + 即时副作用。
+/// Read the control value into the in-memory CONFIG, schedule the debounced persist, and run
+/// the field's immediate side effects.
+fn apply_control_field(field: ControlField) {
+    // 鼠标页 per-device 字段走 profile 通道(写选中设备档)。
+    // Mouse-page per-device fields go through the profile channel (the selected device's profile).
+    match field {
+        ControlField::ReverseScroll
+        | ControlField::ScrollMode
+        | ControlField::LineCount
+        | ControlField::DisablePointerAccel
+        | ControlField::MappingEnabled => {
+            unsafe { apply_mouse_profile_field(field) };
+            return;
+        }
+        _ => {}
+    }
+    let mut rebuild_window = false;
+    let mut cfg = CONFIG.read().unwrap().clone();
+    {
+        let ui = SETTINGS_UI.lock().unwrap();
+        let Some(u) = ui.as_ref() else {
+            return;
+        };
+        unsafe {
+            match field {
+                ControlField::Theme => {
+                    let idx: isize = msg_send![u.theme, indexOfSelectedItem];
+                    cfg.appearance.theme = match idx {
+                        0 => "dark",
+                        1 => "light",
+                        _ => "auto",
+                    }
+                    .into();
+                    rebuild_window = true;
+                }
+                ControlField::GlassStyle => {
+                    let idx: isize = msg_send![u.glass_style, indexOfSelectedItem];
+                    cfg.appearance.glass_style = if idx == 1 { "clear" } else { "regular" }.into();
+                }
+                ControlField::GlassTint => {
+                    let color: *mut AnyObject = msg_send![u.glass_tint, color];
+                    if let Some(hex) = ns_color_to_hex(color) {
+                        cfg.appearance.glass_tint = hex;
+                    }
+                }
+                ControlField::Locale => {
+                    let idx: isize = msg_send![u.locale, indexOfSelectedItem];
+                    cfg.i18n.locale = LOCALE_VALUES
+                        .get(idx as usize)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "auto".into());
+                    rebuild_window = true;
+                }
+                ControlField::LogLevel => {
+                    let idx: isize = msg_send![u.log_level, indexOfSelectedItem];
+                    cfg.logging.level = match idx {
+                        0 => "debug",
+                        _ => "info",
+                    }
+                    .into();
+                }
+                ControlField::LaunchAtLogin => {
+                    let state: isize = msg_send![u.launch_at_login, state];
+                    cfg.startup.launch_at_login = state == 1;
+                }
+                ControlField::WindowsEnabled => {
+                    let state: isize = msg_send![u.windows_enabled, state];
+                    cfg.windows.enabled = state == 1;
+                }
+                ControlField::ShowMinimized => {
+                    let state: isize = msg_send![u.show_minimized, state];
+                    cfg.windows.show_minimized = state == 1;
+                }
+                ControlField::ThumbnailsEnabled => {
+                    let idx: isize = msg_send![u.thumbnails_enabled, indexOfSelectedItem];
+                    cfg.layout.thumbnails_enabled = idx == 1;
+                }
+                ControlField::CardTextSize => {
+                    let val: isize = msg_send![u.card_text_size, integerValue];
+                    cfg.layout.card_text_size = val as f64;
+                }
+                ControlField::StatusBarTextSize => {
+                    let val: isize = msg_send![u.status_bar_text_size, integerValue];
+                    cfg.fonts.status_bar_size = val as f64;
+                }
+                ControlField::OverlayPosition => {
+                    let idx: isize = msg_send![u.overlay_position, indexOfSelectedItem];
+                    cfg.windows.overlay_position = match idx {
+                        1 => "main",
+                        _ => "active_window",
+                    }
+                    .into();
+                }
+                ControlField::CornerRadius => {
+                    // 圆角是数字文本框,走 NSControlText 通知路径,不应出现在这里。
+                    // Corner radius is a numeric text field on the notification path; it
+                    // should never arrive via target/action.
+                    log_debug!("[settings] corner radius via unexpected action path ignored");
+                    return;
+                }
+                ControlField::Modifier => {
+                    let idx: isize = msg_send![u.modifier, indexOfSelectedItem];
+                    cfg.keyboard.modifier = if idx == 1 { "command" } else { "option" }.into();
+                }
+                ControlField::MouseEnabled => {
+                    let state: isize = msg_send![u.enable_mouse, state];
+                    cfg.mouse.enabled = state == 1;
+                }
+                ControlField::ReverseScroll
+                | ControlField::ScrollMode
+                | ControlField::LineCount
+                | ControlField::DisablePointerAccel
+                | ControlField::MappingEnabled => {
+                    // 这些字段已在函数入口分流到 profile 通道。
+                    // These fields are routed to the profile channel at the top.
+                    log_debug!("[settings] mouse field via unexpected action path ignored");
+                    return;
+                }
+                ControlField::ClipboardEnabled => {
+                    let state: isize = msg_send![u.clipboard_enabled, state];
+                    cfg.clipboard.enabled = state == 1;
+                }
+                ControlField::ClipboardPersist => {
+                    let state: isize = msg_send![u.clipboard_persist, state];
+                    cfg.clipboard.persist = state == 1;
+                }
+                ControlField::ClipboardShowSourceApp => {
+                    let state: isize = msg_send![u.clipboard_show_source_app, state];
+                    cfg.clipboard.show_source_app = state == 1;
+                }
+                ControlField::ClipboardMoveUsedToTop => {
+                    let state: isize = msg_send![u.clipboard_move_used_to_top, state];
+                    cfg.clipboard.move_used_to_top = state == 1;
+                }
+                ControlField::ClipboardMaxEntries | ControlField::ClipboardAutoExpireDays => {
+                    // 数字文本框走 NSControlText 通知路径。
+                    // Numeric text fields ride the NSControlText notification path.
+                    log_debug!("[settings] numeric field via unexpected action path ignored");
+                    return;
+                }
+                ControlField::ClipboardPinFollow => {
+                    let idx: isize = msg_send![u.clipboard_pin_follow, indexOfSelectedItem];
+                    cfg.clipboard.pin_follow_selection = idx != 1;
+                }
+                ControlField::WindowControlEnabled => {
+                    let state: isize = msg_send![u.window_control_enabled, state];
+                    cfg.window_control.enabled = state == 1;
+                }
+                ControlField::WindowControlUp => {
+                    let state: isize = msg_send![u.window_control_up, state];
+                    cfg.window_control.up = state == 1;
+                }
+                ControlField::WindowControlDown => {
+                    let state: isize = msg_send![u.window_control_down, state];
+                    cfg.window_control.down = state == 1;
+                }
+                ControlField::WindowControlLeft => {
+                    let state: isize = msg_send![u.window_control_left, state];
+                    cfg.window_control.left = state == 1;
+                }
+                ControlField::WindowControlRight => {
+                    let state: isize = msg_send![u.window_control_right, state];
+                    cfg.window_control.right = state == 1;
+                }
+                ControlField::QuickActionsEnabled => {
+                    let state: isize = msg_send![u.quick_actions_enabled, state];
+                    cfg.quick_actions.enabled = state == 1;
+                }
+                ControlField::QuickActionOpenSettings => {
+                    let state: isize = msg_send![u.quick_actions_open_settings, state];
+                    cfg.quick_actions.open_settings = state == 1;
+                }
+                ControlField::QuickActionOpenFinder => {
+                    let state: isize = msg_send![u.quick_actions_open_finder, state];
+                    cfg.quick_actions.open_finder = state == 1;
+                }
+                ControlField::QuickActionShowDesktop => {
+                    let state: isize = msg_send![u.quick_actions_show_desktop, state];
+                    cfg.quick_actions.show_desktop = state == 1;
+                }
+                ControlField::UpdateAutoCheck => {
+                    let state: isize = msg_send![u.update_auto_check, state];
+                    cfg.updates.automatically_check = state == 1;
+                }
+                ControlField::UpdateAutoDownload => {
+                    let state: isize = msg_send![u.update_auto_download, state];
+                    cfg.updates.automatically_download = state == 1;
+                }
+            }
         }
     }
-
-    // 剪贴板历史轮询热切换(无需重启)。
-    // Clipboard-history polling hot-switch (no restart needed).
-    if cfg.clipboard.enabled {
-        crate::clipboard::start();
-    } else {
-        crate::clipboard::stop();
+    if let Ok(mut w) = CONFIG.write() {
+        *w = cfg;
     }
+    schedule_config_persist();
+    apply_field_effects(field, rebuild_window);
+}
 
-    // 窗口控制 tap 热切换(无需重启;start/stop 均幂等)。
-    // Window-control tap hot-switch (no restart needed; start/stop are idempotent).
-    if cfg.window_control.enabled {
-        crate::window_management::start();
-    } else {
-        crate::window_management::stop();
+/// 鼠标页 per-device 字段:读控件 → 写选中设备 profile(无档则创建)→ 落盘 + 副作用。
+/// Mouse-page per-device fields: read the control → write the selected device's profile
+/// (created if absent) → persist + side effects.
+unsafe fn apply_mouse_profile_field(field: ControlField) {
+    let mut ui = SETTINGS_UI.lock().unwrap();
+    let Some(u) = ui.as_mut() else {
+        return;
+    };
+    let mut cfg = CONFIG.read().unwrap().clone();
+    match field {
+        ControlField::ReverseScroll => {
+            let state: isize = msg_send![u.reverse_scroll, state];
+            write_selected_profile(&mut cfg, move |p| p.reverse_scroll = Some(state == 1));
+        }
+        ControlField::ScrollMode => {
+            let idx: isize = msg_send![u.scroll_mode, indexOfSelectedItem];
+            let mode = SCROLL_MODE_VALUES
+                .get(idx as usize)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "default".into());
+            let is_line = mode == "line";
+            // Line 模式才读滑块值;Default 模式保留已有行数。
+            // Read the slider only in Line mode; Default keeps the existing line count.
+            let lc: Option<isize> = if is_line {
+                Some(msg_send![u.line_count, integerValue])
+            } else {
+                None
+            };
+            write_selected_profile(&mut cfg, move |p| {
+                p.scroll_mode = Some(mode);
+                // 仅 Line 模式写回行数;Default 保留已有值。
+                // Write the line count only in Line mode; Default keeps the existing value.
+                if let Some(lc) = lc {
+                    p.line_count = Some(lc.clamp(1, 10) as u32);
+                }
+            });
+        }
+        ControlField::LineCount => {
+            let lc: isize = msg_send![u.line_count, integerValue];
+            write_selected_profile(&mut cfg, move |p| {
+                p.line_count = Some(lc.clamp(1, 10) as u32)
+            });
+        }
+        ControlField::DisablePointerAccel => {
+            let state: isize = msg_send![u.disable_pointer_accel, state];
+            write_selected_profile(&mut cfg, move |p| {
+                p.pointer = Some(PartialPointerSection {
+                    disable_acceleration: Some(state == 1),
+                })
+            });
+        }
+        ControlField::MappingEnabled => {
+            let state: isize = msg_send![u.mapping_enabled, state];
+            write_selected_profile(&mut cfg, move |p| {
+                p.button_mappings_enabled = Some(state == 1)
+            });
+        }
+        _ => {}
     }
-
-    // 缩略图服务热切换:start 幂等;关闭时 worker/observer 每任务前检查配置自动休眠,
-    // 同时立即释放内存中的窗口截图(线程本身保留,便于重新开启)。
-    // Thumbnail-service hot-switch: start is idempotent; when off, the worker and
-    // observer re-check the config per job and sleep on their own; clear the in-memory
-    // window-image cache immediately when the mode is disabled.
-    if cfg.layout.thumbnails_enabled {
-        crate::thumbnail::start();
-    } else {
-        crate::thumbnail::clear_runtime_cache();
+    if let Ok(mut w) = CONFIG.write() {
+        *w = cfg;
     }
+    schedule_config_persist();
+    // 配置变更:失效 per-device 解析缓存;加速开关变化时立即重设系统指针行为。
+    // Config changed: invalidate the per-device resolve cache; re-apply pointer behavior
+    // right away when the acceleration flag changes.
+    crate::mouse::resolve::invalidate_cache();
+    if field == ControlField::DisablePointerAccel {
+        crate::mouse::pointer::apply();
+    }
+    if field == ControlField::ScrollMode {
+        // 滚动模式切换后,行数滑块显示当前生效值并刷新条件显隐。
+        // After a mode switch the line-count slider shows the effective value and the
+        // conditional row visibility refreshes.
+        let cfg_now = CONFIG.read().unwrap().clone();
+        let shown = resolve_selected_from(&cfg_now).line_count;
+        let _: () = msg_send![u.line_count, setIntegerValue: shown as isize];
+        set_field(u.line_count_value_label, shown);
+        update_mode_dependent_visibility(u);
+    }
+}
 
-    // persist 热切换:开启 → 从磁盘加载并合并历史(与 start() 的加载去重互幂等);
-    // 关闭 → 删除磁盘历史文件(内存历史保留到本次退出)。
-    // Persist hot-switch: ON -> load and merge the history from disk (idempotent with
-    // start()'s load, dedup makes the double-merge harmless); OFF -> delete the history
-    // file (the in-memory history stays until this session ends).
-    crate::clipboard::apply_persist_toggle(cfg.clipboard.persist);
-    log_config_changes(&old_cfg, &cfg);
-    log_info!("[settings] configuration saved and applied from settings window");
+/// 把选中设备的 profile 交给回调修改(不存在则创建一个)。
+/// Hand the selected device's profile to the callback (creating one when absent).
+fn write_selected_profile(cfg: &mut Config, f: impl FnOnce(&mut MouseProfile)) {
+    let dev = current_selected_device();
+    let idx = find_profile_index(cfg, dev);
+    let idx = match idx {
+        Some(i) => i,
+        None => {
+            // 若 profile 不存在,新建一个并插入。
+            // If the profile doesn't exist, create and insert one.
+            let new_p = MouseProfile {
+                device: match dev {
+                    Some((vid, pid)) => DeviceMatcher {
+                        vendor_id: Some(vid),
+                        product_id: Some(pid),
+                    },
+                    None => DeviceMatcher::default(),
+                },
+                ..Default::default()
+            };
+            cfg.mouse.profiles.push(new_p);
+            cfg.mouse.profiles.len() - 1
+        }
+    };
+    f(&mut cfg.mouse.profiles[idx]);
+}
+
+/// 按字段执行即时副作用(幂等、廉价;恢复默认路径复用)。
+/// Run a field's immediate side effects (idempotent and cheap; reused by restore paths).
+fn apply_field_effects(field: ControlField, rebuild_window: bool) {
+    let cfg = CONFIG.read().unwrap().clone();
+    match field {
+        ControlField::Theme => {
+            // 主题变化:浮窗/剪贴板 UI/菜单标题跟着刷新;窗口重建交给 rebuild。
+            // Theme change: refresh the overlay, clipboard UI, and menu titles; the window
+            // rebuild is handled by `rebuild_window`.
+            apply_theme_and_locale_refresh();
+        }
+        ControlField::Locale => {
+            // locale 先应用,后续 t() 才能取到新语言文案。
+            // Apply the locale first so later t() calls pick up the new language.
+            apply_config_locale(&cfg.i18n.locale);
+            apply_theme_and_locale_refresh();
+        }
+        ControlField::GlassStyle | ControlField::GlassTint => {
+            apply_glass_preview();
+        }
+        ControlField::ReverseScroll
+        | ControlField::ScrollMode
+        | ControlField::LineCount
+        | ControlField::MappingEnabled => {
+            // 恢复默认等批量路径也走这里:失效 per-device 解析缓存。
+            // Batch paths (restore defaults) land here too: invalidate the resolve cache.
+            crate::mouse::resolve::invalidate_cache();
+        }
+        ControlField::DisablePointerAccel => {
+            crate::mouse::resolve::invalidate_cache();
+            crate::mouse::pointer::apply();
+        }
+        ControlField::LogLevel => {
+            let lvl = match cfg.logging.level.as_str() {
+                "debug" => crate::logger::LogLevel::Debug,
+                _ => crate::logger::LogLevel::Info,
+            };
+            crate::logger::reconfigure(lvl);
+        }
+        ControlField::LaunchAtLogin => {
+            crate::autostart::sync(cfg.startup.launch_at_login);
+        }
+        ControlField::WindowsEnabled => {
+            // 窗口切换开关被关闭:收起可能正开着的浮窗并复位状态,避免残留。
+            // The switcher switch was turned off: dismiss a possibly-open overlay and reset.
+            if !cfg.windows.enabled {
+                crate::overlay::reset_switcher();
+            }
+        }
+        ControlField::ThumbnailsEnabled => {
+            if cfg.layout.thumbnails_enabled {
+                crate::thumbnail::start();
+            } else {
+                crate::thumbnail::clear_runtime_cache();
+            }
+        }
+        ControlField::StatusBarTextSize => {
+            update_status_label();
+        }
+        ControlField::Modifier => {
+            set_shortcut_mode(cfg.keyboard.modifier == "command");
+        }
+        ControlField::MouseEnabled => {
+            if cfg.mouse.enabled {
+                crate::mouse::start();
+            } else {
+                crate::mouse::stop();
+            }
+        }
+        ControlField::ClipboardEnabled => {
+            if cfg.clipboard.enabled {
+                crate::clipboard::start();
+            } else {
+                crate::clipboard::stop();
+            }
+        }
+        ControlField::ClipboardPersist => {
+            crate::clipboard::apply_persist_toggle(cfg.clipboard.persist);
+        }
+        ControlField::WindowControlEnabled => {
+            if cfg.window_control.enabled {
+                crate::window_management::start();
+            } else {
+                crate::window_management::stop();
+            }
+        }
+        ControlField::QuickActionsEnabled => {
+            if cfg.quick_actions.enabled {
+                crate::quick_actions::start();
+            } else {
+                crate::quick_actions::stop();
+            }
+        }
+        ControlField::UpdateAutoCheck => {
+            crate::updater::set_automatic_checks(cfg.updates.automatically_check);
+        }
+        ControlField::UpdateAutoDownload => {
+            crate::updater::set_automatic_downloads(cfg.updates.automatically_download);
+        }
+        // 其余字段由消费方在下次使用时读取(浮窗构建/剪贴板面板打开等),无需即时副作用。
+        // Remaining fields are read by their consumers on next use (overlay build, clipboard
+        // picker open, ...), so no immediate side effect is needed.
+        _ => {}
+    }
+    if rebuild_window {
+        // 主题/locale 影响设置窗口自绘配色与文案:原位重建窗口(保留页签与位置)。
+        // Theme/locale affect the settings window's baked palette and strings: rebuild the
+        // window in place (page and frame preserved).
+        refresh_system_appearance();
+    }
+}
+
+/// 恢复默认等批量路径:应用一个 Tab 的全部副作用(不刷新设置窗口自身)。
+/// Batch path for restore-defaults: apply every side effect of one tab (excluding the
+/// settings window's own refresh).
+fn apply_tab_effects(tab: usize) {
+    let fields: &[ControlField] = match tab {
+        0 => &[
+            ControlField::Theme,
+            ControlField::GlassStyle,
+            ControlField::GlassTint,
+            ControlField::Locale,
+            ControlField::LogLevel,
+            ControlField::LaunchAtLogin,
+        ],
+        1 => &[
+            ControlField::WindowsEnabled,
+            ControlField::ShowMinimized,
+            ControlField::ThumbnailsEnabled,
+            ControlField::CardTextSize,
+            ControlField::StatusBarTextSize,
+            ControlField::OverlayPosition,
+            ControlField::Modifier,
+        ],
+        2 => &[
+            ControlField::MouseEnabled,
+            ControlField::ReverseScroll,
+            ControlField::ScrollMode,
+            ControlField::LineCount,
+            ControlField::DisablePointerAccel,
+            ControlField::MappingEnabled,
+        ],
+        3 => &[
+            ControlField::ClipboardEnabled,
+            ControlField::ClipboardPersist,
+            ControlField::ClipboardShowSourceApp,
+            ControlField::ClipboardMoveUsedToTop,
+            ControlField::ClipboardMaxEntries,
+            ControlField::ClipboardAutoExpireDays,
+            ControlField::ClipboardPinFollow,
+        ],
+        4 => &[
+            ControlField::WindowControlEnabled,
+            ControlField::WindowControlUp,
+            ControlField::WindowControlDown,
+            ControlField::WindowControlLeft,
+            ControlField::WindowControlRight,
+        ],
+        5 => &[
+            ControlField::QuickActionsEnabled,
+            ControlField::QuickActionOpenSettings,
+            ControlField::QuickActionOpenFinder,
+            ControlField::QuickActionShowDesktop,
+        ],
+        _ => &[
+            ControlField::UpdateAutoCheck,
+            ControlField::UpdateAutoDownload,
+        ],
+    };
+    for &f in fields {
+        apply_field_effects(f, false);
+    }
+}
+
+/// 全部 Tab 的副作用(整应用恢复默认用)。
+/// Side effects for every tab (used by the whole-app restore).
+fn apply_all_tab_effects() {
+    for tab in 0..7 {
+        apply_tab_effects(tab);
+    }
+}
+
+/// 数字文本框输入中(NSControlTextDidChange):值合法才应用,非法值保留内存配置不动,
+/// 磁盘写入走防抖。允许输入过程中的临时非法状态。
+/// While typing in a numeric text field (NSControlTextDidChange): apply only when the value
+/// is valid; invalid input leaves the in-memory config untouched and persistence goes
+/// through the debounce. Transient invalid states are allowed while typing.
+pub(crate) extern "C" fn on_control_text_did_change(
+    _self: *mut c_void,
+    _cmd: Sel,
+    notification: *mut c_void,
+) {
+    unsafe {
+        let obj: *mut AnyObject = msg_send![notification as *mut AnyObject, object];
+        let field = match text_field_of(obj) {
+            Some(f) => f,
+            None => return,
+        };
+        let Some((value, raw)) = parse_text_field(field) else {
+            return;
+        };
+        let _ = raw;
+        write_text_field_config(field, value);
+        schedule_config_persist();
+        log_debug!(
+            "[settings] numeric field {:?} applied (debounced persist)",
+            field
+        );
+    }
+}
+
+/// 数字文本框失焦 / 回车(NSControlTextDidEndEditing):立即提交并立即落盘;
+/// 仍为非法值时把显示恢复为内存配置值。
+/// On blur / Enter (NSControlTextDidEndEditing): commit immediately and persist now; when
+/// still invalid, restore the displayed value from the in-memory config.
+pub(crate) extern "C" fn on_control_text_did_end_editing(
+    _self: *mut c_void,
+    _cmd: Sel,
+    notification: *mut c_void,
+) {
+    unsafe {
+        let obj: *mut AnyObject = msg_send![notification as *mut AnyObject, object];
+        let field = match text_field_of(obj) {
+            Some(f) => f,
+            None => return,
+        };
+        match parse_text_field(field) {
+            Some((value, _)) => {
+                write_text_field_config(field, value);
+                persist_config_now();
+                log_debug!(
+                    "[settings] numeric field {:?} committed on end editing",
+                    field
+                );
+            }
+            None => {
+                // 非法值不提交,把输入框恢复为最近一次生效的配置值。
+                // Do not commit invalid values; restore the last effective config value.
+                let cfg = CONFIG.read().unwrap().clone();
+                let text = match field {
+                    TextField::CornerRadius => cfg.appearance.corner_radius.to_string(),
+                    TextField::ClipboardMaxEntries => cfg.clipboard.max_entries.to_string(),
+                    TextField::ClipboardAutoExpireDays => {
+                        cfg.clipboard.auto_expire_days.to_string()
+                    }
+                };
+                let ui = SETTINGS_UI.lock().unwrap();
+                if let Some(u) = ui.as_ref() {
+                    let ctrl = match field {
+                        TextField::CornerRadius => u.corner_radius,
+                        TextField::ClipboardMaxEntries => u.clipboard_max_entries,
+                        TextField::ClipboardAutoExpireDays => u.clipboard_auto_expire_days,
+                    };
+                    set_field(ctrl, text);
+                }
+            }
+        }
+    }
+}
+
+/// 数字文本框标识(与 ControlField 分离:文本框走通知回调而非 target/action)。
+/// Numeric text-field ids (separate from ControlField: they use notification callbacks, not
+/// target/action).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextField {
+    CornerRadius,
+    ClipboardMaxEntries,
+    ClipboardAutoExpireDays,
+}
+
+unsafe fn text_field_of(obj: *mut AnyObject) -> Option<TextField> {
+    let ui = SETTINGS_UI.lock().unwrap();
+    let u = ui.as_ref()?;
+    let ptr = obj as usize;
+    if ptr == u.corner_radius as usize {
+        Some(TextField::CornerRadius)
+    } else if ptr == u.clipboard_max_entries as usize {
+        Some(TextField::ClipboardMaxEntries)
+    } else if ptr == u.clipboard_auto_expire_days as usize {
+        Some(TextField::ClipboardAutoExpireDays)
+    } else {
+        None
+    }
+}
+
+/// 解析数字文本框:返回 (归一化后的数值, 原始文本)。非法返回 None。
+/// Parse a numeric text field: returns (normalized value, raw text); None when invalid.
+unsafe fn parse_text_field(field: TextField) -> Option<(TextFieldValue, String)> {
+    let ui = SETTINGS_UI.lock().unwrap();
+    let u = ui.as_ref()?;
+    let (ctrl, bounds): (*mut AnyObject, (f64, f64)) = match field {
+        TextField::CornerRadius => (u.corner_radius, (0.0, 500.0)),
+        TextField::ClipboardMaxEntries => (u.clipboard_max_entries, (1.0, 100.0)),
+        TextField::ClipboardAutoExpireDays => (u.clipboard_auto_expire_days, (0.0, 365.0)),
+    };
+    let raw = nsstring_to_rust(msg_send![ctrl, stringValue]);
+    let value = match field {
+        TextField::CornerRadius => match parse_f64(&raw) {
+            Ok(v) if v.is_finite() && v >= bounds.0 && v <= bounds.1 => TextFieldValue::F64(v),
+            _ => return None,
+        },
+        TextField::ClipboardMaxEntries => match parse_usize(&raw) {
+            Ok(v) if (bounds.0 as usize..=bounds.1 as usize).contains(&v) => {
+                TextFieldValue::U32(v as u32)
+            }
+            _ => return None,
+        },
+        TextField::ClipboardAutoExpireDays => match parse_usize(&raw) {
+            Ok(v) if (bounds.0 as usize..=bounds.1 as usize).contains(&v) => {
+                TextFieldValue::U32(v as u32)
+            }
+            _ => return None,
+        },
+    };
+    Some((value, raw))
+}
+
+enum TextFieldValue {
+    F64(f64),
+    U32(u32),
+}
+
+/// 把合法的数字值写入内存 CONFIG。
+/// Write a valid numeric value into the in-memory CONFIG.
+fn write_text_field_config(field: TextField, value: TextFieldValue) {
+    let mut cfg = CONFIG.read().unwrap().clone();
+    match (field, value) {
+        (TextField::CornerRadius, TextFieldValue::F64(v)) => cfg.appearance.corner_radius = v,
+        (TextField::ClipboardMaxEntries, TextFieldValue::U32(v)) => cfg.clipboard.max_entries = v,
+        (TextField::ClipboardAutoExpireDays, TextFieldValue::U32(v)) => {
+            cfg.clipboard.auto_expire_days = v
+        }
+        _ => {}
+    }
+    if let Ok(mut w) = CONFIG.write() {
+        *w = cfg;
+    }
 }
 
 /// 根据 enable_mouse switch 状态,冻结或解冻其下方的所有鼠标控件。
@@ -1174,84 +1939,15 @@ unsafe fn update_mode_dependent_visibility(ui: &mut SettingsUi) {
     let _: () = msg_send![ui.line_count_value_label, setHidden: !show_line];
 }
 
-/// scroll_mode 下拉框切换回调:即时刷新行数行的条件显隐。
-/// Scroll-mode popup changed callback: refresh the conditional visibility of the
-/// lines-per-tick row immediately.
-pub(crate) extern "C" fn handle_scroll_mode_changed(
-    _self: *mut c_void,
-    _cmd: Sel,
-    _sender: *mut c_void,
-) {
-    unsafe {
-        let mut ui = SETTINGS_UI.lock().unwrap();
-        if let Some(u) = ui.as_mut() {
-            // 行数滑块显示当前配置的值(Line 模式的 line_count)。
-            // The line-count slider shows the configured value (Line's line_count).
-            let shown = {
-                let cfg = CONFIG.read().unwrap().clone();
-                resolve_selected_from(&cfg).line_count
-            };
-            let _: () = msg_send![u.line_count, setIntegerValue: shown as isize];
-            set_field(u.line_count_value_label, shown);
-            update_mode_dependent_visibility(u);
-        }
-    }
-}
-
-/// line_count 滑块拖动回调:实时刷新右侧数值 label。
-/// Line-count slider drag callback: refresh the value label on the right live.
-pub(crate) extern "C" fn handle_line_count_changed(
-    _self: *mut c_void,
-    _cmd: Sel,
-    sender: *mut c_void,
-) {
-    unsafe {
-        let slider = sender as *mut AnyObject;
-        let val: isize = msg_send![slider, integerValue];
-        let ui = SETTINGS_UI.lock().unwrap();
-        if let Some(u) = ui.as_ref() {
-            set_field(u.line_count_value_label, val);
-        }
-    }
-}
-
-unsafe fn update_text_size_value_label(sender: *mut c_void, status_bar: bool) {
-    let slider = sender as *mut AnyObject;
-    let value: isize = msg_send![slider, integerValue];
-    let ui = SETTINGS_UI.lock().unwrap();
-    if let Some(u) = ui.as_ref() {
-        let label = if status_bar {
-            u.status_bar_text_size_value_label
-        } else {
-            u.card_text_size_value_label
-        };
-        set_field(label, value);
-    }
-}
-
-pub(crate) extern "C" fn handle_card_text_size_changed(
-    _self: *mut c_void,
-    _cmd: Sel,
-    sender: *mut c_void,
-) {
-    unsafe { update_text_size_value_label(sender, false) }
-}
-
-pub(crate) extern "C" fn handle_status_bar_text_size_changed(
-    _self: *mut c_void,
-    _cmd: Sel,
-    sender: *mut c_void,
-) {
-    unsafe { update_text_size_value_label(sender, true) }
-}
-
-/// enable_mouse switch toggle 回调:冻结/解冻下方控件。
-/// Callback when the enable_mouse switch is toggled: freeze/unfreeze the controls below.
+/// enable_mouse switch toggle 回调:即时应用 + 冻结/解冻下方控件。
+/// Callback when the enable_mouse switch is toggled: apply immediately, then freeze/unfreeze
+/// the controls below.
 pub(crate) extern "C" fn handle_enable_mouse_toggle(
     _self: *mut c_void,
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
+    apply_control_field(ControlField::MouseEnabled);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
@@ -1260,13 +1956,15 @@ pub(crate) extern "C" fn handle_enable_mouse_toggle(
     }
 }
 
-/// 应用切换器总开关回调:冻结/解冻下方窗口与键盘选项。
-/// Callback for the app-switcher master switch: freeze/unfreeze the options below it.
+/// 应用切换器总开关回调:即时应用 + 冻结/解冻下方窗口与键盘选项。
+/// Callback for the app-switcher master switch: apply immediately, then freeze/unfreeze the
+/// window and keyboard options below.
 pub(crate) extern "C" fn handle_windows_enabled_toggle(
     _self: *mut c_void,
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
+    apply_control_field(ControlField::WindowsEnabled);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
@@ -1275,13 +1973,15 @@ pub(crate) extern "C" fn handle_windows_enabled_toggle(
     }
 }
 
-/// 剪贴板历史总开关回调:冻结/解冻下方历史选项。
-/// Callback for the clipboard-history master switch: freeze/unfreeze the options below it.
+/// 剪贴板历史总开关回调:即时应用 + 冻结/解冻下方历史选项。
+/// Callback for the clipboard-history master switch: apply immediately, then freeze/unfreeze
+/// the history options below.
 pub(crate) extern "C" fn handle_clipboard_enabled_toggle(
     _self: *mut c_void,
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
+    apply_control_field(ControlField::ClipboardEnabled);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
@@ -1290,13 +1990,15 @@ pub(crate) extern "C" fn handle_clipboard_enabled_toggle(
     }
 }
 
-/// 窗口控制总开关回调:冻结/解冻下方四个方向开关。
-/// Callback for the window-control master switch: freeze/unfreeze its four direction switches.
+/// 窗口控制总开关回调:即时应用 + 冻结/解冻下方四个方向开关。
+/// Callback for the window-control master switch: apply immediately, then freeze/unfreeze its
+/// four direction switches.
 pub(crate) extern "C" fn handle_window_control_enabled_toggle(
     _self: *mut c_void,
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
+    apply_control_field(ControlField::WindowControlEnabled);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
@@ -1305,12 +2007,36 @@ pub(crate) extern "C" fn handle_window_control_enabled_toggle(
     }
 }
 
-pub(crate) extern "C" fn on_settings_cancel(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // 防御:点取消时若仍在录制,先收尾(复位 RECORDING);关闭编辑面板。
-    // Defensive: wrap up any in-progress recording on cancel; close the edit panel.
-    cancel_recording_from_main();
-    close_mapping_panel();
-    hide_settings();
+/// 快捷操作总开关回调:即时应用 + 冻结/解冻下方三个动作开关。
+/// Callback for the quick-actions master switch: apply immediately, then freeze/unfreeze the
+/// three action switches below.
+pub(crate) extern "C" fn handle_quick_actions_enabled_toggle(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    apply_control_field(ControlField::QuickActionsEnabled);
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(u) = ui.as_ref() {
+            update_quick_actions_controls_enabled(u);
+        }
+    }
+}
+
+/// 根据快捷操作总开关状态,冻结/解冻下方三个动作开关。
+/// Freeze/unfreeze the three action switches below the quick-actions master switch.
+unsafe fn update_quick_actions_controls_enabled(ui: &SettingsUi) {
+    let state: isize = msg_send![ui.quick_actions_enabled, state];
+    let on = state == 1;
+    let tooltip = t("settings.tooltip_quick_actions_disabled");
+    for &ctrl in &[
+        ui.quick_actions_open_settings,
+        ui.quick_actions_open_finder,
+        ui.quick_actions_show_desktop,
+    ] {
+        SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
+    }
 }
 
 /// 设备下拉框的项与 DeviceKey 的映射(与 popup items 一一对应),供 handle_device_changed
@@ -1488,8 +2214,8 @@ pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, se
 
 pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     // Navigating away also cancels an unfinished destructive confirmation.
-    // 切换到其他页面时同时取消尚未确认的危险操作。
-    set_restore_confirmation_expanded(false, true);
+    // 切换到其他页面时同时取消尚未确认的危险操作(整页与整应用两套确认卡片)。
+    collapse_restore_confirmations(true);
     let btn = sender as *mut AnyObject;
     let tag: isize = unsafe { msg_send![btn, tag] };
     select_sidebar(tag as usize);
@@ -1500,12 +2226,12 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
     }
 }
 
-/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换六个内容视图显隐、选中项粗体。
-/// Switch the active settings page: align the highlight to the selected button, toggle the six
-/// content views' visibility, and bold the selected item's label.
+/// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换七个内容视图显隐、选中项粗体。
+/// Switch the active settings page: align the highlight to the selected button, toggle the
+/// seven content views' visibility, and bold the selected item's label.
 fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
-    let idx = if idx > 5 { 0 } else { idx };
+    let idx = if idx > 6 { 0 } else { idx };
     let previous_idx = SIDEBAR_SELECTED.swap(idx, Ordering::SeqCst);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
@@ -1519,6 +2245,7 @@ fn select_sidebar(idx: usize) {
             ui.sidebar_mouse,
             ui.sidebar_clipboard,
             ui.sidebar_window_control,
+            ui.sidebar_quick_actions,
             ui.sidebar_about,
         ];
         let views = [
@@ -1527,6 +2254,7 @@ fn select_sidebar(idx: usize) {
             ui.mouse_view,
             ui.clipboard_view,
             ui.window_control_view,
+            ui.quick_actions_view,
             ui.about_view,
         ];
         // 高亮背景对齐到选中按钮的 frame / align the highlight to the selected button's frame
@@ -1550,6 +2278,7 @@ fn select_sidebar(idx: usize) {
             t("settings.sidebar_mouse"),
             t("settings.sidebar_clipboard"),
             t("settings.sidebar_window_control"),
+            t("settings.sidebar_quick_actions"),
             t("settings.sidebar_about"),
         ];
         for (i, &b) in buttons.iter().enumerate() {
@@ -1559,7 +2288,7 @@ fn select_sidebar(idx: usize) {
             }
             set_sidebar_title(b, &titles[i], i == idx);
         }
-        // 切换六页显隐 / toggle the six pages' visibility
+        // 切换七页显隐 / toggle the seven pages' visibility
         for (i, &v) in views.iter().enumerate() {
             let _: () = msg_send![v, setHidden: i != idx];
         }
@@ -1578,17 +2307,20 @@ fn select_sidebar(idx: usize) {
             "mouse",
             "clipboard",
             "window-control",
+            "quick-actions",
             "about",
         ];
         page.validate(page_names[idx]);
     }
 }
 
-/// 同步主题菜单标签并立即应用配置(主题/浮窗)。
-/// Sync menu labels and apply the config immediately (theme / overlay).
-fn apply_config_refresh() {
+/// 主题/语言变化后的全量刷新:菜单、剪贴板 UI、浮窗主题、高亮与状态栏标签。
+/// 不含设置窗口自身重建(由调用方按需调用 refresh_system_appearance)。
+/// Full refresh after a theme/locale change: menu, clipboard UI, overlay theme, highlight and
+/// the status-bar label. Does not rebuild the settings window itself (callers invoke
+/// refresh_system_appearance when needed).
+fn apply_theme_and_locale_refresh() {
     refresh_menu_titles();
-    invalidate_settings_window();
     crate::clipboard::refresh_localized_ui();
     unsafe {
         crate::clipboard::apply_theme();
@@ -1701,9 +2433,9 @@ fn show_settings() {
                 create_settings_window();
             }
         }
-        // 每次打开设置都从收起态开始,避免上次未完成的确认状态残留。
-        // Always reopen in the collapsed state so an unfinished confirmation never lingers.
-        set_restore_confirmation_expanded(false, false);
+        // 每次打开设置都从收起态开始,避免上次未完成的确认状态残留(两套确认卡片)。
+        // Always reopen in the collapsed state so no unfinished confirmation lingers (both cards).
+        collapse_restore_confirmations(false);
         // A window order-out is not guaranteed to deliver mouseExited for its tracking areas;
         // clear the shared hover state before reusing the settings window.
         // 窗口 orderOut 不保证会为 tracking area 发送 mouseExited；复用设置窗口前先清理共享
@@ -1742,9 +2474,14 @@ fn show_settings() {
 }
 
 fn hide_settings() {
-    // 关闭设置时丢弃未确认的恢复动作,下次打开重新从单按钮开始。
-    // Closing settings discards any unconfirmed restore action and resets to one button.
-    set_restore_confirmation_expanded(false, false);
+    // 防御:关闭设置时若仍在录制/编辑面板,先收尾(复位 RECORDING);关闭编辑面板。
+    // Defensive: wrap up any in-progress recording / edit panel when the window closes.
+    cancel_recording_from_main();
+    close_mapping_panel();
+    // 关闭设置时丢弃未确认的恢复动作,下次打开重新从单按钮开始(两套确认卡片)。
+    // Closing settings discards any unconfirmed restore action and resets to one button (both
+    // cards).
+    collapse_restore_confirmations(false);
     let window_and_well = SETTINGS_UI
         .lock()
         .unwrap()
@@ -1764,7 +2501,6 @@ fn hide_settings() {
             let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
-    clear_glass_preview();
     if SYSTEM_APPEARANCE_REBUILD_PENDING.swap(false, Ordering::SeqCst) {
         invalidate_settings_window();
     }
@@ -1773,15 +2509,18 @@ fn hide_settings() {
     crate::set_settings_activation_policy(false);
 }
 
-/// Re-apply the effective system appearance while preserving an in-progress settings edit.
+/// Re-apply the effective appearance from the current CONFIG while preserving page and frame.
 ///
 /// Custom settings layers are painted with concrete palette colors at construction time. When
-/// the window is visible, snapshot the form and current page, rebuild the window, then restore
-/// both; this avoids the mixed light/dark state caused by updating only NSWindow.appearance.
+/// the window is visible, remember the current page and frame, rebuild the window (controls
+/// refill from CONFIG), then restore both; this avoids the mixed light/dark state caused by
+/// updating only NSWindow.appearance. Immediate-apply writes CONFIG before calling this, so
+/// the refill already shows the new values.
 ///
-/// 重新应用系统外观并保留进行中的设置编辑。设置页自绘图层在创建时写入具体调色板颜色,
-/// 所以窗口可见时先保存表单和当前页、重建窗口再恢复,避免只更新 NSWindow appearance 导致
-/// 明暗混杂。窗口隐藏时直接作废缓存,下次打开按新调色板重建。
+/// 按当前 CONFIG 重新应用外观,同时保留页签与窗口位置。设置页自绘图层在创建时写入具体
+/// 调色板颜色,所以窗口可见时先记住当前页与位置、重建窗口(控件从 CONFIG 重填)再恢复,
+/// 避免只更新 NSWindow appearance 导致明暗混杂。即时生效路径先写 CONFIG 再调用本函数,
+/// 因此重填后的控件已经展示新值。
 pub(crate) fn refresh_system_appearance() {
     let (window, visible) = SETTINGS_UI
         .lock()
@@ -1798,16 +2537,14 @@ pub(crate) fn refresh_system_appearance() {
         return;
     }
 
-    let (snapshot, page, frame) = {
-        let (cfg, _) = collect_settings_config();
+    let (page, frame) = {
         let page = SIDEBAR_SELECTED.load(Ordering::SeqCst);
         let frame: NSRect = unsafe { msg_send![window, frame] };
-        (cfg, page, frame)
+        (page, frame)
     };
 
     invalidate_settings_window();
     show_settings();
-    load_settings_from(&snapshot);
     select_sidebar(page);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();
@@ -1838,6 +2575,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                     ui.mouse_view,
                     ui.clipboard_view,
                     ui.window_control_view,
+                    ui.quick_actions_view,
                     ui.about_view,
                 ],
             )
@@ -1848,6 +2586,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             "mouse",
             "clipboard",
             "window-control",
+            "quick-actions",
             "about",
         ];
         for (index, page) in pages.iter().enumerate() {
@@ -1917,18 +2656,21 @@ pub(crate) fn confirm_alert(
     }
 }
 
-/// 展开恢复默认设置的内联确认按钮,不再启动 app-modal alert。
-/// Expand the inline restore-defaults confirmation instead of starting an app-modal alert.
+/// 展开「恢复默认设置」(左下角,整应用)的内联确认卡片;同时收起本页确认卡片,
+/// 保证同一时间只有一个恢复确认卡片。
+/// Expand the "Restore Defaults" (bottom-left, whole app) inline confirmation card; collapse
+/// the per-page card first so only one restore confirmation is open at a time.
 pub(crate) extern "C" fn handle_restore_defaults(
     _self: *mut c_void,
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
+    set_page_restore_confirmation_expanded(false, true);
     set_restore_confirmation_expanded(true, true);
 }
 
-/// 收起恢复默认设置的内联确认按钮,不修改任何表单值。
-/// Collapse the inline restore-defaults confirmation without changing form values.
+/// 收起「恢复默认设置」的内联确认卡片,不修改任何设置值。
+/// Collapse the whole-app restore confirmation without changing any values.
 pub(crate) extern "C" fn handle_restore_defaults_cancel(
     _self: *mut c_void,
     _cmd: Sel,
@@ -1937,34 +2679,66 @@ pub(crate) extern "C" fn handle_restore_defaults_cancel(
     set_restore_confirmation_expanded(false, true);
 }
 
-/// 确认恢复默认设置:只重填表单,写盘仍由右下角 OK 统一完成。
-/// Confirm restore defaults: refill the form only; the bottom-right OK still performs the save.
+/// 确认恢复默认设置(整应用):一次性写入默认配置、刷新 UI/运行时/持久化。
+/// Confirm whole-app restore: write the default config in one shot and refresh the UI,
+/// runtime, and persisted state together.
 pub(crate) extern "C" fn handle_restore_defaults_confirm(
     _self: *mut c_void,
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    set_restore_confirmation_expanded(false, true);
-    // 构造默认配置,但保留 launch_at_login -- 它是系统级登录项开关,不属于外观/布局/
-    // 快捷键这类设置,不该被恢复默认重置(否则会注销用户已勾选的登录项)。
-    // 这里不写盘:仅用于预览填充;实际写盘在用户点 OK 后由 on_settings_ok 完成。
-    // Build defaults, preserving launch_at_login -- it's a system-level login-item toggle, not
-    // an appearance/layout/shortcut setting, so Restore Defaults must not reset it. Not saved
-    // here: only used to preview-fill the form; the real save happens in on_settings_ok.
-    let preserved_launch_at_login = CONFIG.read().unwrap().startup.launch_at_login;
-    let mut defaults = Config::default();
-    defaults.startup.launch_at_login = preserved_launch_at_login;
-
-    // 鼠标页设备选择复位(有设备则回退第一个;无设备则清空),再重填表单。
-    // Reset the mouse-page device selection (first device if any; clear if none), then refill.
-    *SELECTED_DEVICE.lock().unwrap() = None;
-    load_settings_from(&defaults);
-    log_debug!("Config form reset to defaults (not saved until OK).");
+    // 收起不播动画:确认后窗口可能因主题/locale 默认值变化而重建,动画没有意义。
+    // Collapse without animation: the window may be rebuilt right after (theme/locale
+    // defaults), so animating is pointless.
+    set_restore_confirmation_expanded(false, false);
+    restore_all_defaults();
 }
 
-/// 将恢复确认区域切换到展开或收起状态。底部按钮保持锚定,确认按钮向上展开。
-/// Toggle the restore confirmation area. The bottom action stays anchored while confirmation
-/// grows upward into the available footer space.
+/// 展开「恢复本页默认设置」(右下角,当前 Tab)的内联确认卡片;同时收起整应用确认卡片,
+/// 保证同一时间只有一个恢复确认卡片。
+/// Expand the "Restore Page Defaults" (bottom-right, current tab) inline confirmation card;
+/// collapse the whole-app card first so only one restore confirmation is open at a time.
+pub(crate) extern "C" fn handle_page_restore_defaults(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    set_restore_confirmation_expanded(false, true);
+    set_page_restore_confirmation_expanded(true, true);
+}
+
+/// 收起「恢复本页默认设置」的内联确认卡片,不修改任何设置值。
+/// Collapse the per-page restore confirmation without changing any values.
+pub(crate) extern "C" fn handle_page_restore_defaults_cancel(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    set_page_restore_confirmation_expanded(false, true);
+}
+
+/// 确认恢复本页默认设置:一次性恢复当前 Sidebar Tab 对应的全部设置并立即生效。
+/// Confirm per-page restore: reset every setting of the current sidebar tab in one shot and
+/// apply immediately.
+pub(crate) extern "C" fn handle_page_restore_defaults_confirm(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    set_page_restore_confirmation_expanded(false, false);
+    restore_tab_defaults(SIDEBAR_SELECTED.load(Ordering::SeqCst));
+}
+
+/// 收起两套恢复确认卡片(切页/开关设置窗口时调用)。
+/// Collapse both restore confirmation cards (page switch / window hide).
+fn collapse_restore_confirmations(animated: bool) {
+    set_restore_confirmation_expanded(false, animated);
+    set_page_restore_confirmation_expanded(false, animated);
+}
+
+/// 将整应用恢复确认区域切换到展开或收起状态。底部按钮保持锚定,确认按钮向上展开。
+/// Toggle the whole-app restore confirmation area. The bottom action stays anchored while
+/// confirmation grows upward into the available space.
 fn set_restore_confirmation_expanded(expanded: bool, animated: bool) {
     let mut ui_guard = SETTINGS_UI.lock().unwrap();
     let Some(ui) = ui_guard.as_mut() else {
@@ -1972,6 +2746,148 @@ fn set_restore_confirmation_expanded(expanded: bool, animated: bool) {
     };
     unsafe {
         ui.restore_defaults.set_expanded(expanded, animated);
+    }
+}
+
+/// 将全部「恢复本页默认设置」确认卡片切换到展开或收起状态。
+/// 只有点中页的卡片可能处于展开态,遍历全部实例保证无残留。
+/// Toggle every per-page restore confirmation card. Only the selected page's card can be
+/// expanded; iterating all instances guarantees no stale state.
+fn set_page_restore_confirmation_expanded(expanded: bool, animated: bool) {
+    let mut ui_guard = SETTINGS_UI.lock().unwrap();
+    let Some(ui) = ui_guard.as_mut() else {
+        return;
+    };
+    unsafe {
+        for control in ui.page_restores.iter_mut() {
+            control.set_expanded(expanded, animated);
+        }
+    }
+}
+
+/// 一次性恢复整个应用的全部默认设置并立即生效(保留 launch_at_login)。
+/// Restore the whole app's defaults in one atomic update (launch_at_login preserved).
+fn restore_all_defaults() {
+    let old = CONFIG.read().unwrap().clone();
+    // 保留 launch_at_login -- 它是系统级登录项开关,不属于外观/布局/快捷键这类设置,
+    // 不该被恢复默认重置(否则会注销用户已勾选的登录项)。
+    // Preserve launch_at_login -- it's a system-level login-item toggle, not an
+    // appearance/layout/shortcut setting, so Restore Defaults must not reset it.
+    let preserved_launch_at_login = old.startup.launch_at_login;
+    let mut defaults = Config::default();
+    defaults.startup.launch_at_login = preserved_launch_at_login;
+    if let Ok(mut w) = CONFIG.write() {
+        *w = defaults;
+    }
+    log_config_changes(&old, &CONFIG.read().unwrap());
+    persist_config_now();
+    log_info!("[settings] all settings restored to defaults");
+
+    // 鼠标页设备选择复位(有设备则回退第一个;无设备则清空)。
+    // Reset the mouse-page device selection (first device if any; clear if none).
+    *SELECTED_DEVICE.lock().unwrap() = None;
+    // 一次性应用全部 Tab 的运行时副作用,再原位重建设置窗口(主题/locale 可能变化)。
+    // Apply every tab's runtime side effects in one pass, then rebuild the settings window
+    // in place (theme/locale may have changed).
+    apply_all_tab_effects();
+    refresh_system_appearance();
+}
+
+/// 一次性恢复当前 Tab 的全部默认设置并立即生效(原子更新,不影响其他 Tab)。
+/// Restore every default of the current tab in one atomic update (other tabs untouched).
+fn restore_tab_defaults(tab: usize) {
+    let old = CONFIG.read().unwrap().clone();
+    let mut cfg = old.clone();
+    let d = Config::default();
+    // 每个 Tab 的配置范围:按页面归属划分,严格限定在本 Tab,不触碰其他 Tab 的字段。
+    // Per-tab config scope: partitioned by page ownership, strictly limited to this tab.
+    match tab {
+        0 => {
+            // 通用页:外观 + 语言 + 日志。launch_at_login 是系统级登录项开关,保留。
+            // General: appearance + locale + logging. launch_at_login (system-level) is kept.
+            cfg.appearance = d.appearance;
+            cfg.i18n = d.i18n;
+            cfg.logging = d.logging;
+        }
+        1 => {
+            // 应用切换浮窗页:窗口/布局/字体/快捷键 + 位于本页的圆角。
+            // Switcher page: windows/layout/fonts/keyboard + corner radius (lives on this page).
+            cfg.windows = d.windows;
+            cfg.layout = d.layout;
+            cfg.fonts = d.fonts;
+            cfg.keyboard = d.keyboard;
+            cfg.appearance.corner_radius = d.appearance.corner_radius;
+        }
+        2 => {
+            // 鼠标页:总开关 + 选中设备档的全部字段(无专属档则创建显式默认档,
+            // 使本页显示与生效值回到默认,同时不影响其他设备)。
+            // Mouse page: master switch + every field of the selected device's profile (an
+            // explicit default profile is created when absent, so this page's visible and
+            // effective values return to defaults without touching other devices).
+            cfg.mouse.enabled = d.mouse.enabled;
+            let dev = current_selected_device();
+            let idx = find_profile_index(&cfg, dev);
+            let idx = match idx {
+                Some(i) => i,
+                None => {
+                    let new_p = MouseProfile {
+                        device: match dev {
+                            Some((vid, pid)) => DeviceMatcher {
+                                vendor_id: Some(vid),
+                                product_id: Some(pid),
+                            },
+                            None => DeviceMatcher::default(),
+                        },
+                        ..Default::default()
+                    };
+                    cfg.mouse.profiles.push(new_p);
+                    cfg.mouse.profiles.len() - 1
+                }
+            };
+            // 默认配置含一个「所有鼠标」档,字段即默认生效值。
+            // The default config has one "All Mice" profile whose fields are the default
+            // effective values.
+            if let Some(dp) = d.mouse.profiles.first().cloned() {
+                let prof = &mut cfg.mouse.profiles[idx];
+                prof.reverse_scroll = dp.reverse_scroll;
+                prof.scroll_mode = dp.scroll_mode;
+                prof.line_count = dp.line_count;
+                prof.pointer = dp.pointer;
+                prof.button_mappings = Default::default();
+                prof.button_mappings_enabled = dp.button_mappings_enabled;
+            }
+        }
+        3 => {
+            cfg.clipboard = d.clipboard;
+        }
+        4 => {
+            cfg.window_control = d.window_control;
+        }
+        5 => {
+            cfg.quick_actions = d.quick_actions;
+        }
+        _ => {
+            cfg.updates = d.updates;
+        }
+    }
+    if let Ok(mut w) = CONFIG.write() {
+        *w = cfg;
+    }
+    log_config_changes(&old, &CONFIG.read().unwrap());
+    persist_config_now();
+    log_debug!("[settings] tab {} restored to defaults", tab);
+    if tab == 0 {
+        // 通用页涉及主题/locale 默认值:应用副作用后原位重建设置窗口。
+        // The General page involves theme/locale defaults: apply effects, then rebuild the
+        // settings window in place.
+        apply_tab_effects(0);
+        refresh_system_appearance();
+    } else {
+        // 其余 Tab:重填控件(冻结态/条件显隐随 load_settings_from 刷新)+ 应用副作用。
+        // Other tabs: refill the controls (freeze states / conditional visibility refresh
+        // with load_settings_from) and apply the tab's side effects.
+        load_settings_values();
+        apply_tab_effects(tab);
     }
 }
 
@@ -1985,11 +2901,9 @@ fn load_settings_values() {
     load_settings_from(&cfg);
 }
 
-/// 用指定配置填充设置控件。
-/// 供正常打开(读 CONFIG)与恢复默认预览(传 Config::default())共用。
-///
-/// Populate settings controls from a given config. Shared by normal open (reads CONFIG) and
-/// restore-defaults preview (passes Config::default()).
+/// 用指定配置填充设置控件(正常打开 / 恢复默认后重填共用)。
+/// Populate settings controls from a given config (shared by normal open and post-restore
+/// refill).
 fn load_settings_from(cfg: &Config) {
     let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
     unsafe {
@@ -2179,12 +3093,28 @@ fn load_settings_from(cfg: &Config) {
             1
         };
         let _: () = msg_send![ui.clipboard_pin_follow, selectItemAtIndex: pin_idx];
+        // ===== 快捷操作页:填充总开关与三个动作开关 =====
+        // Quick-actions page: populate the master and three action switches.
+        let _: () = msg_send![
+            ui.quick_actions_enabled,
+            setState: if cfg.quick_actions.enabled { 1isize } else { 0isize }
+        ];
+        let _: () = msg_send![
+            ui.quick_actions_open_settings,
+            setState: if cfg.quick_actions.open_settings { 1isize } else { 0isize }
+        ];
+        let _: () = msg_send![
+            ui.quick_actions_open_finder,
+            setState: if cfg.quick_actions.open_finder { 1isize } else { 0isize }
+        ];
+        let _: () = msg_send![
+            ui.quick_actions_show_desktop,
+            setState: if cfg.quick_actions.show_desktop { 1isize } else { 0isize }
+        ];
         update_clipboard_controls_enabled(ui);
         update_window_control_controls_enabled(ui);
+        update_quick_actions_controls_enabled(ui);
     }
-    crate::config::set_glass_style_preview(Some(cfg.appearance.glass_style.clone()));
-    crate::config::set_glass_tint_preview(Some(cfg.appearance.glass_tint.clone()));
-    apply_glass_preview();
 }
 
 /// 填充鼠标页的 per-device 控件(反转/禁用加速/模式/行数/平滑预设)。
@@ -2219,211 +3149,6 @@ unsafe fn fill_mouse_device_controls(
     // 映射总开关:用有效值(合并"所有鼠标"档后的生效值)。
     // The mappings master switch: the effective value (merged across profiles).
     let _: () = msg_send![ui.mapping_enabled, setState: if resolved.button_mappings_enabled { 1isize } else { 0isize }];
-}
-
-/// 从控件收集成 Config(克隆当前 CONFIG,只覆盖表单内字段),并收集错误。
-/// Collect a Config from the controls (clone current CONFIG, overwrite only in-form
-/// fields) and gather parse + validation errors.
-fn collect_settings_config() -> (Config, Vec<String>) {
-    let mut cfg = CONFIG.read().unwrap().clone();
-    let mut errs: Vec<String> = Vec::new();
-    unsafe {
-        let ui = SETTINGS_UI.lock().unwrap();
-        let ui = match ui.as_ref() {
-            Some(u) => u,
-            None => return (cfg, vec!["settings UI not ready".into()]),
-        };
-        let theme_idx: isize = msg_send![ui.theme, indexOfSelectedItem];
-        cfg.appearance.theme = match theme_idx {
-            0 => "dark",
-            1 => "light",
-            _ => "auto",
-        }
-        .into();
-        let gs_idx: isize = msg_send![ui.glass_style, indexOfSelectedItem];
-        cfg.appearance.glass_style = if gs_idx == 1 {
-            "clear".into()
-        } else {
-            "regular".into()
-        };
-        let color: *mut AnyObject = msg_send![ui.glass_tint, color];
-        if let Some(hex) = ns_color_to_hex(color) {
-            cfg.appearance.glass_tint = hex;
-        }
-        match parse_f64(&nsstring_to_rust(msg_send![ui.corner_radius, stringValue])) {
-            Ok(v) => cfg.appearance.corner_radius = v,
-            Err(_) => errs.push(tf(
-                "errors.not_a_number",
-                &[("field", "appearance.corner_radius")],
-            )),
-        }
-        let card_text_size: isize = msg_send![ui.card_text_size, integerValue];
-        cfg.layout.card_text_size = card_text_size as f64;
-        let status_bar_text_size: isize = msg_send![ui.status_bar_text_size, integerValue];
-        cfg.fonts.status_bar_size = status_bar_text_size as f64;
-        let mod_idx: isize = msg_send![ui.modifier, indexOfSelectedItem];
-        cfg.keyboard.modifier = if mod_idx == 1 {
-            "command".into()
-        } else {
-            "option".into()
-        };
-        // locale:下拉项顺序与 LOCALE_VALUES 对应;越界回退 auto。
-        // locale: popup order matches LOCALE_VALUES; out-of-range falls back to auto.
-        let loc_idx: isize = msg_send![ui.locale, indexOfSelectedItem];
-        cfg.i18n.locale = LOCALE_VALUES
-            .get(loc_idx as usize)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "auto".into());
-        // windows_enabled / show_minimized:switch state(1=on / 0=off)。
-        // windows_enabled / show_minimized: switch state (1=on / 0=off).
-        let we_state: isize = msg_send![ui.windows_enabled, state];
-        cfg.windows.enabled = we_state == 1;
-        let sm_state: isize = msg_send![ui.show_minimized, state];
-        cfg.windows.show_minimized = sm_state == 1;
-        // 窗口显示模式 index 0 = 仅图标, 1 = 图标和缩略图。
-        // Window display mode index 0 = icons only, 1 = icons and thumbnails.
-        let th_idx: isize = msg_send![ui.thumbnails_enabled, indexOfSelectedItem];
-        cfg.layout.thumbnails_enabled = th_idx == 1;
-        // overlay_position:下拉框 index 0 = 跟随激活窗口, 1 = 主屏幕。
-        // overlay_position: popup index 0 = follow active window, 1 = main.
-        let op_idx: isize = msg_send![ui.overlay_position, indexOfSelectedItem];
-        cfg.windows.overlay_position = match op_idx {
-            1 => "main",
-            _ => "active_window", // index 0 or out-of-range
-        }
-        .into();
-        // log_level:下拉框 index 0..1 对应 debug,info。
-        // log_level: popup index 0..1 = debug, info.
-        let ll_idx: isize = msg_send![ui.log_level, indexOfSelectedItem];
-        cfg.logging.level = match ll_idx {
-            0 => "debug",
-            _ => "info", // index 1 or out-of-range
-        }
-        .into();
-        // launch_at_login:switch state(1=on / 0=off)。
-        // launch_at_login: switch state (1=on / 0=off).
-        let la_state: isize = msg_send![ui.launch_at_login, state];
-        cfg.startup.launch_at_login = la_state == 1;
-        let update_state: isize = msg_send![ui.update_auto_check, state];
-        cfg.updates.automatically_check = update_state == 1;
-        let download_state: isize = msg_send![ui.update_auto_download, state];
-        cfg.updates.automatically_download = download_state == 1;
-
-        // ===== 鼠标页:把控件值写回当前选中设备的 profile =====
-        // Mouse page: write control values back to the selected device's profile.
-        // enable_mouse(总开关)始终写全局。
-        // enable_mouse (master switch) always writes the global flag.
-        let em_state: isize = msg_send![ui.enable_mouse, state];
-        cfg.mouse.enabled = em_state == 1;
-
-        // 其余字段写入选中设备的 profile(不存在则创建)。
-        // The remaining fields go into the selected device's profile (creating it if absent).
-        let dev = current_selected_device();
-        let idx = find_profile_index(&cfg, dev);
-        // 若 profile 不存在,新建一个并插入。
-        // If the profile doesn't exist, create and insert one.
-        if idx.is_none() {
-            let new_p = MouseProfile {
-                device: match dev {
-                    Some((vid, pid)) => DeviceMatcher {
-                        vendor_id: Some(vid),
-                        product_id: Some(pid),
-                    },
-                    None => DeviceMatcher::default(),
-                },
-                ..Default::default()
-            };
-            cfg.mouse.profiles.push(new_p);
-        }
-        let idx = idx.unwrap_or(cfg.mouse.profiles.len() - 1);
-        let p = &mut cfg.mouse.profiles[idx];
-
-        // reverse_scroll:switch state(1=on / 0=off)。
-        // reverse_scroll: switch state (1=on / 0=off).
-        let ns_state: isize = msg_send![ui.reverse_scroll, state];
-        p.reverse_scroll = Some(ns_state == 1);
-        // disable_pointer_accel:switch state(1=on / 0=off)。
-        // disable_pointer_accel: switch state (1=on / 0=off).
-        let dpa_state: isize = msg_send![ui.disable_pointer_accel, state];
-        p.pointer = Some(PartialPointerSection {
-            disable_acceleration: Some(dpa_state == 1),
-        });
-        // scroll_mode:下拉框 index 对应 SCROLL_MODE_VALUES。
-        // scroll_mode: popup index matches SCROLL_MODE_VALUES.
-        let sm_idx: isize = msg_send![ui.scroll_mode, indexOfSelectedItem];
-        p.scroll_mode = Some(
-            SCROLL_MODE_VALUES
-                .get(sm_idx as usize)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "default".into()),
-        );
-        // line_count:滑块(整数,天然在 1..=10 内,无需 clamp/解析)。
-        // 仅 Line 模式写回;Default 不写,保留已有值。
-        // line_count: slider (integer, naturally within 1..=10; no clamp/parse needed).
-        // Written only in Line mode; Default leaves it untouched.
-        if p.scroll_mode.as_deref() == Some("line") {
-            let lc_val: isize = msg_send![ui.line_count, integerValue];
-            p.line_count = Some(lc_val.clamp(1, 10) as u32);
-        }
-        // 按键映射:编辑态写回当前设备的专属 profile(整体替换)。
-        // Button mappings: the in-edit state replaces the selected device's own profile.
-        p.button_mappings = MAPPING_EDITS.lock().unwrap().clone();
-        // 映射总开关:写当前设备档(不同鼠标可以不同值)。
-        // The mappings master switch: written to the current device's profile (per-device).
-        let me_state: isize = msg_send![ui.mapping_enabled, state];
-        p.button_mappings_enabled = Some(me_state == 1);
-
-        // ===== 剪贴板历史页(全局配置,不随设备)=====
-        // Clipboard page (global config, not per-device).
-        let cb_state: isize = msg_send![ui.clipboard_enabled, state];
-        cfg.clipboard.enabled = cb_state == 1;
-        // ===== 窗口控制页(全局配置)=====
-        // Window-control page (global config).
-        let wc_state: isize = msg_send![ui.window_control_enabled, state];
-        cfg.window_control.enabled = wc_state == 1;
-        let wc_up_state: isize = msg_send![ui.window_control_up, state];
-        cfg.window_control.up = wc_up_state == 1;
-        let wc_down_state: isize = msg_send![ui.window_control_down, state];
-        cfg.window_control.down = wc_down_state == 1;
-        let wc_left_state: isize = msg_send![ui.window_control_left, state];
-        cfg.window_control.left = wc_left_state == 1;
-        let wc_right_state: isize = msg_send![ui.window_control_right, state];
-        cfg.window_control.right = wc_right_state == 1;
-        let persist_state: isize = msg_send![ui.clipboard_persist, state];
-        cfg.clipboard.persist = persist_state == 1;
-        let src_state: isize = msg_send![ui.clipboard_show_source_app, state];
-        cfg.clipboard.show_source_app = src_state == 1;
-        let move_top_state: isize = msg_send![ui.clipboard_move_used_to_top, state];
-        cfg.clipboard.move_used_to_top = move_top_state == 1;
-        match parse_usize(&nsstring_to_rust(msg_send![
-            ui.clipboard_max_entries,
-            stringValue
-        ])) {
-            Ok(v) => cfg.clipboard.max_entries = v as u32,
-            Err(_) => errs.push(tf(
-                "errors.not_an_integer",
-                &[("field", "clipboard.max_entries")],
-            )),
-        }
-        match parse_usize(&nsstring_to_rust(msg_send![
-            ui.clipboard_auto_expire_days,
-            stringValue
-        ])) {
-            Ok(v) => cfg.clipboard.auto_expire_days = v as u32,
-            Err(_) => errs.push(tf(
-                "errors.not_an_integer",
-                &[("field", "clipboard.auto_expire_days")],
-            )),
-        }
-        // pin_follow_selection:下拉框 index 0 = 跟随置顶, 1 = 保持当前位置。
-        // pin_follow_selection: popup index 0 = follow, 1 = keep.
-        let pin_idx: isize = msg_send![ui.clipboard_pin_follow, indexOfSelectedItem];
-        cfg.clipboard.pin_follow_selection = pin_idx != 1;
-    }
-    for e in cfg.validate() {
-        errs.push(e);
-    }
-    (cfg, errs)
 }
 
 /// 构建设置窗口(只建一次,存入 SETTINGS_UI,之后复用、隐藏而非销毁)。
@@ -2708,11 +3433,10 @@ fn create_settings_window() {
         let _: () = msg_send![window, setTitlebarAppearsTransparent: true];
         let _: () = msg_send![window, setStyleMask: style | (1 << 15)]; // NSWindowStyleMaskFullSizeContentView
         let _: () = msg_send![window, setTitleVisibility: 1isize]; // NSWindowTitleHidden
-                                                                   // The scroll region spans from the footer to the window's top edge (fullSizeContentView),
-                                                                   // so the content scrolls all the way up behind the traffic-light strip — matching the
-                                                                   // HTML, where the right panel's scroll area reaches the window border. content_h is the
-                                                                   // full content height (the traffic lights sit over the sidebar, not the detail pane).
-        let page_viewport_h = (content_h - 62.0).max(1.0);
+                                                                   // The scroll region spans the full window height (fullSizeContentView), so the content
+                                                                   // scrolls all the way up behind the traffic-light strip. There is no bottom footer bar
+                                                                   // anymore: each page embeds its own restore control at the end of its content.
+        let page_viewport_h = content_h;
 
         // 窗口圆角:窗口自绘的 opaque 背景(系统默认小圆角)会盖住 contentView 的裁剪,
         // 单靠 layer cornerRadius 圆角出不来。做法:setOpaque:NO 关掉窗口自绘背景,由
@@ -2744,6 +3468,7 @@ fn create_settings_window() {
             sidebar_mouse: std::ptr::null_mut(),
             sidebar_clipboard: std::ptr::null_mut(),
             sidebar_window_control: std::ptr::null_mut(),
+            sidebar_quick_actions: std::ptr::null_mut(),
             sidebar_about: std::ptr::null_mut(),
             sidebar_highlight: std::ptr::null_mut(),
             general_view: std::ptr::null_mut(),
@@ -2751,6 +3476,7 @@ fn create_settings_window() {
             mouse_view: std::ptr::null_mut(),
             clipboard_view: std::ptr::null_mut(),
             window_control_view: std::ptr::null_mut(),
+            quick_actions_view: std::ptr::null_mut(),
             about_view: std::ptr::null_mut(),
             about_subtitle: std::ptr::null_mut(),
             theme: std::ptr::null_mut(),
@@ -2793,6 +3519,10 @@ fn create_settings_window() {
             window_control_down: std::ptr::null_mut(),
             window_control_left: std::ptr::null_mut(),
             window_control_right: std::ptr::null_mut(),
+            quick_actions_enabled: std::ptr::null_mut(),
+            quick_actions_open_settings: std::ptr::null_mut(),
+            quick_actions_open_finder: std::ptr::null_mut(),
+            quick_actions_show_desktop: std::ptr::null_mut(),
             clipboard_persist: std::ptr::null_mut(),
             clipboard_move_used_to_top: std::ptr::null_mut(),
             clipboard_max_entries: std::ptr::null_mut(),
@@ -2804,7 +3534,7 @@ fn create_settings_window() {
             mapping_empty: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
             restore_defaults: RestoreDefaultsControl::empty(),
-            ok_button: std::ptr::null_mut(),
+            page_restores: std::array::from_fn(|_| RestoreDefaultsControl::empty()),
             accessibility_warning_view: std::ptr::null_mut(),
             update_auto_check: std::ptr::null_mut(),
             update_auto_download: std::ptr::null_mut(),
@@ -2936,43 +3666,6 @@ fn create_settings_window() {
         let _: () = msg_send![content, addSubview: main_background];
         release_obj(main_background);
 
-        // HTML `.footer`: a 62pt bottom bar with its own light surface and hairline separator.
-        // It lives inside the detail pane and stays pinned to the bottom while the page grows.
-        let footer: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let footer: *mut AnyObject = msg_send![
-            footer,
-            initWithFrame: NSRect::new(
-                NSPoint::new(content_x, 0.0),
-                NSSize::new(detail_w, 62.0),
-            )
-        ];
-        let _: () = msg_send![footer, setWantsLayer: true];
-        let footer_layer: *mut AnyObject = msg_send![footer, layer];
-        if !footer_layer.is_null() {
-            layer_set_background(footer_layer, crate::ffi::hex_to_cg_color(palette.footer_bg));
-        }
-        let footer_line: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let footer_line: *mut AnyObject = msg_send![
-            footer_line,
-            initWithFrame: NSRect::new(
-                NSPoint::new(0.0, 61.0),
-                NSSize::new(detail_w, 1.0),
-            )
-        ];
-        let _: () = msg_send![footer_line, setWantsLayer: true];
-        let footer_line_layer: *mut AnyObject = msg_send![footer_line, layer];
-        if !footer_line_layer.is_null() {
-            layer_set_background(
-                footer_line_layer,
-                crate::ffi::hex_to_cg_color(palette.card_border),
-            );
-        }
-        let _: () = msg_send![footer, addSubview: footer_line];
-        release_obj(footer_line);
-        let _: () = msg_send![footer, setAutoresizingMask: 18u64];
-        let _: () = msg_send![content, addSubview: footer];
-        release_obj(footer);
-
         // Sidebar identity block, matching the redesign's app title and subtitle above the nav.
         let app_title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let app_title: *mut AnyObject = msg_send![
@@ -3045,7 +3738,7 @@ fn create_settings_window() {
         release_obj(highlight);
         ui.sidebar_highlight = highlight;
 
-        // Six sidebar buttons (borderless, tags 0..5; click triggers handleSettingsSidebar:).
+        // Seven sidebar buttons (borderless, tags 0..6; click triggers handleSettingsSidebar:).
         let sidebar_buttons = SettingsSidebar::build(sidebar_view, target, 14.0, btn_y0, btn_w);
         [
             &mut ui.sidebar_general,
@@ -3053,6 +3746,7 @@ fn create_settings_window() {
             &mut ui.sidebar_mouse,
             &mut ui.sidebar_clipboard,
             &mut ui.sidebar_window_control,
+            &mut ui.sidebar_quick_actions,
             &mut ui.sidebar_about,
         ]
         .iter_mut()
@@ -3069,7 +3763,7 @@ fn create_settings_window() {
         // no longer floats 32pt in from the right. The content keeps its 32pt gutter margins
         // inside the document, so only the scrollbar's position changes.
         let page_frame = NSRect::new(
-            NSPoint::new(page_x, 62.0),
+            NSPoint::new(page_x, 0.0),
             NSSize::new(detail_w - page_inset, page_viewport_h),
         );
         // Build from generous provisional heights. They are intentionally not shrunk after child
@@ -3085,6 +3779,10 @@ fn create_settings_window() {
         // The window-control page contains the master plus four direction switches, with room
         // for each row's description.
         let window_control_doc_h = 760.0;
+        // 快捷操作页:总开关 + 三个动作开关,结构与窗口控制页一致(少一行)。
+        // Quick-actions page: master plus three action switches, mirroring the window-control
+        // page (one row fewer).
+        let quick_actions_doc_h = 710.0;
         let about_doc_h = 1300.0;
 
         let general_page = SettingsPage::new(content, page_frame, general_doc_h, false);
@@ -3108,6 +3806,10 @@ fn create_settings_window() {
         let window_control_root = window_control_page.scroll;
         let window_control_view = window_control_page.document;
         ui.window_control_view = window_control_root;
+        let quick_actions_page = SettingsPage::new(content, page_frame, quick_actions_doc_h, true);
+        let quick_actions_root = quick_actions_page.scroll;
+        let quick_actions_view = quick_actions_page.document;
+        ui.quick_actions_view = quick_actions_root;
         let about_page = SettingsPage::new(content, page_frame, about_doc_h, true);
         let about_root = about_page.scroll;
         let about_view = about_page.document;
@@ -3209,6 +3911,7 @@ fn create_settings_window() {
             &t("settings.desc_theme"),
             SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &theme_item_refs, 0),
         );
+        bind_control(target, ui.theme);
         y -= described_row_h;
         SettingsRow::separator(general_view, y + described_row_h, content_w);
         ui.glass_style = SettingsRow::described(
@@ -3221,8 +3924,7 @@ fn create_settings_window() {
             &t("settings.desc_glass_style"),
             SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &["Regular", "Clear"], 0),
         );
-        let _: () = msg_send![ui.glass_style, setTarget: target];
-        let _: () = msg_send![ui.glass_style, setAction: sel!(handleGlassStyleChanged:)];
+        bind_control(target, ui.glass_style);
         y -= described_row_h;
         SettingsRow::separator(general_view, y + described_row_h, content_w);
         ui.glass_tint = SettingsRow::described(
@@ -3317,6 +4019,7 @@ fn create_settings_window() {
             &t("settings.row_locale"),
             SettingsControl::popup(ctrl_x, y, ctrl_w, row_h, &LOCALE_LABELS, 0),
         );
+        bind_control(target, ui.locale);
         SettingsSection::attach(
             general_view,
             NSRect::new(
@@ -3343,6 +4046,7 @@ fn create_settings_window() {
             &t("settings.desc_log_level"),
             SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &log_levels, 1),
         );
+        bind_control(target, ui.log_level);
         SettingsSection::attach(
             general_view,
             NSRect::new(
@@ -3371,6 +4075,7 @@ fn create_settings_window() {
             &t("settings.desc_launch_at_login"),
             SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
+        bind_control(target, ui.launch_at_login);
         SettingsSection::attach(
             general_view,
             NSRect::new(
@@ -3382,6 +4087,7 @@ fn create_settings_window() {
             ),
             &t("settings.header_startup"),
         );
+        let general_content_bottom = layout.card_bottom(y);
 
         // ===== 应用切换浮窗页内容 switcher overlay page content =====
         let mut y = switcher_doc_h - 24.0;
@@ -3445,6 +4151,7 @@ fn create_settings_window() {
             SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         )
         .1;
+        bind_control(target, ui.show_minimized);
         y = layout.next_row_cursor(y, described_row_h);
         SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         // 窗口显示模式:仅图标或图标和缩略图;配置仍由 thumbnails_enabled 布尔值保存。
@@ -3474,6 +4181,7 @@ fn create_settings_window() {
             ),
         )
         .1;
+        bind_control(target, ui.thumbnails_enabled);
         y = layout.next_row_cursor(y, described_row_h);
         SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         ui.card_text_size = SettingsRow::described(
@@ -3503,11 +4211,7 @@ fn create_settings_window() {
             TEXT_SIZE_VALUE_H,
             TEXT_SIZE_DEFAULT,
         );
-        let _: () = msg_send![ui.card_text_size, setTarget: target];
-        let _: () = msg_send![
-            ui.card_text_size,
-            setAction: sel!(handleCardTextSizeChanged:)
-        ];
+        bind_control(target, ui.card_text_size);
         y = layout.next_row_cursor(y, described_row_h);
         SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         ui.status_bar_text_size = SettingsRow::described(
@@ -3537,11 +4241,7 @@ fn create_settings_window() {
             TEXT_SIZE_VALUE_H,
             TEXT_SIZE_DEFAULT,
         );
-        let _: () = msg_send![ui.status_bar_text_size, setTarget: target];
-        let _: () = msg_send![
-            ui.status_bar_text_size,
-            setAction: sel!(handleStatusBarTextSizeChanged:)
-        ];
+        bind_control(target, ui.status_bar_text_size);
         y = layout.next_row_cursor(y, described_row_h);
         SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         // overlay_position 下拉框:项 = [跟随激活窗口, 始终显示在主屏幕];默认 index 0。
@@ -3560,6 +4260,7 @@ fn create_settings_window() {
             SettingsControl::popup(ctrl_x, y + 10.0, ctrl_w, row_h, &op_label_refs, 0),
         )
         .1;
+        bind_control(target, ui.overlay_position);
         y = layout.next_row_cursor(y, described_row_h);
         SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         ui.corner_radius = SettingsRow::tall(
@@ -3605,6 +4306,7 @@ fn create_settings_window() {
             SettingsControl::popup(ctrl_x, y, ctrl_w, row_h, &mod_label_refs, 0),
         )
         .1;
+        bind_control(target, ui.modifier);
         SettingsSection::attach(
             switcher_view,
             NSRect::new(
@@ -3692,10 +4394,7 @@ fn create_settings_window() {
             scroll_popup,
         )
         .1;
-        // 滚动模式切换时即时刷新"行数"行的条件显隐。
-        // Refresh the conditional visibility of the "lines per tick" row on mode switch.
-        let _: () = msg_send![ui.scroll_mode, setTarget: target];
-        let _: () = msg_send![ui.scroll_mode, setAction: sel!(handleScrollModeChanged:)];
+        bind_control(target, ui.scroll_mode);
         // The HTML device card contains both rows, with one internal hairline between them.
         SettingsRow::separator(mouse_view, y + described_row_h + 3.0, content_w);
 
@@ -3734,10 +4433,7 @@ fn create_settings_window() {
         let _: () = msg_send![mouse_view, addSubview: value_label];
         release_obj(value_label);
         ui.line_count_value_label = value_label;
-        // 滑块拖动时实时刷新数值 label。
-        // Refresh the value label live as the slider is dragged.
-        let _: () = msg_send![ui.line_count, setTarget: target];
-        let _: () = msg_send![ui.line_count, setAction: sel!(handleLineCountChanged:)];
+        bind_control(target, ui.line_count);
         let device_card_parts = SettingsSection::attach(
             mouse_view,
             NSRect::new(
@@ -3771,6 +4467,7 @@ fn create_settings_window() {
             &t("settings.desc_reverse_scroll"),
             SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
+        bind_control(target, ui.reverse_scroll);
         SettingsSection::attach(
             mouse_view,
             NSRect::new(
@@ -3802,6 +4499,7 @@ fn create_settings_window() {
             &t("settings.desc_disable_pointer_accel"),
             SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
+        bind_control(target, ui.disable_pointer_accel);
         SettingsSection::attach(
             mouse_view,
             NSRect::new(
@@ -3978,6 +4676,7 @@ fn create_settings_window() {
         ui.mapping_card = card_bg;
         ui.mapping_scroll = std::ptr::null_mut();
         ui.mapping_doc = card_bg;
+        let mouse_content_bottom = card_bottom;
         // 初始渲染当前设备的映射。
         // Render the current device's mappings initially.
         render_mapping_rows();
@@ -4056,6 +4755,7 @@ fn create_settings_window() {
             &t("settings.row_clipboard_pin_follow"),
             SettingsControl::popup(ctrl_x, cy, ctrl_w, row_h, &pin_label_refs, 0),
         );
+        bind_control(target, ui.clipboard_pin_follow);
         cy = layout.next_row_cursor(cy, described_row_h);
         SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
         // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。
@@ -4079,6 +4779,7 @@ fn create_settings_window() {
             &t("settings.row_clipboard_persist"),
             SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
+        bind_control(target, ui.clipboard_persist);
         cy = layout.next_row_cursor(cy, described_row_h);
         SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
         // 显示来源应用 / show the source app.
@@ -4091,6 +4792,7 @@ fn create_settings_window() {
             &t("settings.row_clipboard_show_source_app"),
             SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
+        bind_control(target, ui.clipboard_show_source_app);
         cy = layout.next_row_cursor(cy, described_row_h);
         SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
         // 使用后移到最前(粘贴是否重排历史;默认开 = 保持现状)。
@@ -4110,6 +4812,7 @@ fn create_settings_window() {
             &t("settings.row_clipboard_move_used_to_top"),
             SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
+        bind_control(target, ui.clipboard_move_used_to_top);
         cy = layout.next_row_cursor(cy, described_row_h);
         SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
         // 最大条数(数字输入)/ max entries (number input).
@@ -4209,6 +4912,7 @@ fn create_settings_window() {
             &t("settings.desc_window_control_up"),
             SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
         );
+        bind_control(target, ui.window_control_up);
         wy = layout.next_row_cursor(wy, described_row_h);
         SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
         ui.window_control_down = SettingsRow::described(
@@ -4221,6 +4925,7 @@ fn create_settings_window() {
             &t("settings.desc_window_control_down"),
             SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
         );
+        bind_control(target, ui.window_control_down);
         wy = layout.next_row_cursor(wy, described_row_h);
         SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
         ui.window_control_left = SettingsRow::described(
@@ -4233,6 +4938,7 @@ fn create_settings_window() {
             &t("settings.desc_window_control_left"),
             SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
         );
+        bind_control(target, ui.window_control_left);
         wy = layout.next_row_cursor(wy, described_row_h);
         SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
         ui.window_control_right = SettingsRow::described(
@@ -4245,6 +4951,7 @@ fn create_settings_window() {
             &t("settings.desc_window_control_right"),
             SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
         );
+        bind_control(target, ui.window_control_right);
         let window_control_shortcuts_card_bottom = layout.card_bottom(wy);
         SettingsSection::attach(
             window_control_view,
@@ -4257,6 +4964,108 @@ fn create_settings_window() {
                 ),
             ),
             &t("settings.header_window_control_shortcuts"),
+        );
+
+        // ===== 快捷操作页内容 quick actions page content =====
+        // 独立布局游标(该页内容与窗口控制页互不相关)。
+        // Independent layout cursor (unrelated to the window-control page).
+        let mut qy = quick_actions_doc_h - 24.0;
+        add_page_title(
+            quick_actions_view,
+            &t("settings.sidebar_quick_actions"),
+            6.0,
+            qy - 34.0,
+            content_w - 12.0,
+        );
+        qy -= 62.0;
+        let quick_actions_header_y = qy - 18.0;
+        // header 与首行间距与窗口控制页一致(18 + row_gap)。
+        // Header-to-first-row gap matches the window-control page (18 + row_gap).
+        qy = layout.next_row_cursor_with_extra(qy, described_row_h, 18.0);
+        // 启用快捷操作(总开关):Option+I/E/D 全局拦截默认关闭,由用户显式开启。
+        // Enable quick actions (master switch): the global Option+I/E/D interception is off
+        // by default and must be explicitly opted in.
+        ui.quick_actions_enabled = SettingsRow::described(
+            quick_actions_view,
+            label_x,
+            qy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_quick_actions_enabled"),
+            &t("settings.desc_quick_actions_enabled"),
+            SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
+        );
+        let _: () = msg_send![ui.quick_actions_enabled, setTarget: target];
+        let _: () = msg_send![
+            ui.quick_actions_enabled,
+            setAction: sel!(handleQuickActionsEnabledToggle:)
+        ];
+        SettingsSection::attach(
+            quick_actions_view,
+            NSRect::new(
+                NSPoint::new(6.0, layout.card_bottom(qy)),
+                NSSize::new(
+                    content_w - 12.0,
+                    layout.card_top(quick_actions_header_y) - layout.card_bottom(qy),
+                ),
+            ),
+            &t("settings.header_quick_actions"),
+        );
+
+        // 三个动作开关单独成块卡片,总开关与具体动作互不混排(与窗口控制页一致)。
+        // Put the three action switches in their own card so the master switch stays separate
+        // from the per-action settings (matching the window-control page).
+        qy = layout.next_section_cursor(qy);
+        let quick_actions_shortcuts_header_y = qy;
+        qy = layout.next_row_cursor(qy, described_row_h);
+        ui.quick_actions_open_settings = SettingsRow::described(
+            quick_actions_view,
+            label_x,
+            qy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_quick_action_open_settings"),
+            &t("settings.desc_quick_action_open_settings"),
+            SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
+        );
+        bind_control(target, ui.quick_actions_open_settings);
+        qy = layout.next_row_cursor(qy, described_row_h);
+        SettingsRow::separator(quick_actions_view, qy + described_row_h + 3.0, content_w);
+        ui.quick_actions_open_finder = SettingsRow::described(
+            quick_actions_view,
+            label_x,
+            qy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_quick_action_open_finder"),
+            &t("settings.desc_quick_action_open_finder"),
+            SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
+        );
+        bind_control(target, ui.quick_actions_open_finder);
+        qy = layout.next_row_cursor(qy, described_row_h);
+        SettingsRow::separator(quick_actions_view, qy + described_row_h + 3.0, content_w);
+        ui.quick_actions_show_desktop = SettingsRow::described(
+            quick_actions_view,
+            label_x,
+            qy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_quick_action_show_desktop"),
+            &t("settings.desc_quick_action_show_desktop"),
+            SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
+        );
+        bind_control(target, ui.quick_actions_show_desktop);
+        let quick_actions_card_bottom = layout.card_bottom(qy);
+        SettingsSection::attach(
+            quick_actions_view,
+            NSRect::new(
+                NSPoint::new(6.0, quick_actions_card_bottom),
+                NSSize::new(
+                    content_w - 12.0,
+                    layout.card_top(quick_actions_shortcuts_header_y) - quick_actions_card_bottom,
+                ),
+            ),
+            &t("settings.header_quick_actions_shortcuts"),
         );
 
         // ===== About page: page-header + App and Updates cards from preview (10). =====
@@ -4414,6 +5223,7 @@ fn create_settings_window() {
             &t("settings.desc_update_auto_check"),
             SettingsControl::switch(ctrl_x + ctrl_w, update_row_y + 10.0, row_h, false),
         );
+        bind_control(target, ui.update_auto_check);
         // 自动下载并安装更新开关,位于「自动检查更新」与「检查更新」之间。
         // Automatically-download-and-install switch, between auto-check and the check button.
         let download_row_y = update_row_y - described_row_h;
@@ -4427,6 +5237,7 @@ fn create_settings_window() {
             &t("settings.desc_update_auto_download"),
             SettingsControl::switch(ctrl_x + ctrl_w, download_row_y + 10.0, row_h, false),
         );
+        bind_control(target, ui.update_auto_download);
         // Keep the two update toggles visually grouped with the same inset divider used by other
         // multi-row cards. The rows are contiguous here, so the divider sits at their shared edge.
         // 两个更新开关属于同一张多行卡片，复用其他卡片的内缩分割线；两行相邻，分割线放在共享边界。
@@ -4549,6 +5360,13 @@ fn create_settings_window() {
                 },
             ),
             (
+                "quick-actions",
+                SettingsPage {
+                    scroll: quick_actions_root,
+                    document: quick_actions_view,
+                },
+            ),
+            (
                 "about",
                 SettingsPage {
                     scroll: about_root,
@@ -4561,57 +5379,82 @@ fn create_settings_window() {
         let update_host_frame: NSRect = msg_send![ui.update_host, frame];
         ui.update_host_origin_y = update_host_frame.origin.y;
 
-        // --- 确认 / 取消(右侧 footer 内,所有页面都可见)---
-        // Cancel and OK are children of the detail pane's footer, matching the HTML layout.
-        let cancel = SettingsButton::action(
-            NSRect::new(
-                NSPoint::new(content_x + detail_w - 202.0, 14.0),
-                NSSize::new(86.0, 32.0),
-            ),
-            &t("settings.btn_cancel"),
-            target,
-            sel!(handleSettingsCancel:),
-            SettingsButtonRole::Footer,
-        );
-        let _: () = msg_send![cancel, setTag: -1isize];
-        let cancel_layer: *mut AnyObject = msg_send![cancel, layer];
-        if !cancel_layer.is_null() {
-            // HTML footer buttons use a slightly more opaque white surface than small buttons.
-            layer_set_background(
-                cancel_layer,
-                crate::ffi::hex_to_cg_color(settings_palette().footer_button_bg),
+        // --- 恢复本页默认设置(每页内容末尾各一个,随页面滚动)---
+        // Each page embeds its own "Restore Page Defaults" control at the end of its content,
+        // so it scrolls with the page. Only the selected page's control is visible/clickable
+        // (pages toggle visibility), so the confirm handler can act on the selected tab.
+        // 每页文档只在自己被选中时可见可点,确认回调因此可以按当前选中页处理。
+        let page_roots = [
+            general_root,
+            switcher_root,
+            mouse_root,
+            clipboard_root,
+            window_control_root,
+            quick_actions_root,
+            about_root,
+        ];
+        let page_bottoms = [
+            general_content_bottom,
+            keyboard_card_bottom,
+            mouse_content_bottom,
+            clipboard_options_card_bottom,
+            window_control_shortcuts_card_bottom,
+            quick_actions_card_bottom,
+            compact_card_bottom,
+        ];
+        for (index, root) in page_roots.iter().enumerate() {
+            let document: *mut AnyObject = msg_send![*root, documentView];
+            ui.page_restores[index] = RestoreDefaultsControl::build_for_page(
+                document,
+                target,
+                6.0,
+                page_bottoms[index] - 16.0 - 42.0,
+                content_w - 12.0,
             );
         }
-        let _: () = msg_send![cancel, setAutoresizingMask: 33u64]; // 贴底、贴右 / bottom- and right-anchored
-        let _: () = msg_send![content, addSubview: cancel];
-        release_obj(cancel);
 
-        let ok = SettingsButton::action(
-            NSRect::new(
-                NSPoint::new(content_x + detail_w - 106.0, 14.0),
-                NSSize::new(86.0, 32.0),
-            ),
-            &t("settings.btn_ok"),
-            target,
-            sel!(handleSettingsOk:),
-            SettingsButtonRole::Primary,
-        );
-        let _: () = msg_send![ok, setTag: -2isize];
-        let ok_layer: *mut AnyObject = msg_send![ok, layer];
-        if !ok_layer.is_null() {
-            // HTML `.footer .ok`: #0a84ff with a subtle rgba(0,0,0,.04) border.
-            // HTML `.footer .ok`: 使用 #0a84ff 和轻微的 rgba(0,0,0,.04) 边框。
-            layer_set_background(ok_layer, crate::ffi::hex_to_cg_color(0x0A84FFFF));
-            crate::ffi::layer_set_border(ok_layer, crate::ffi::hex_to_cg_color(0x0000000A));
-            let _: () = msg_send![ok_layer, setBorderWidth: 1.0f64];
-            let _: () = msg_send![ok_layer, setCornerRadius: 8.0f64];
+        // --- 数字文本框通知:输入中防抖应用,失焦/回车立即提交 ---
+        // --- Numeric text-field notifications: debounced apply while typing, immediate commit
+        // on blur / Enter ---
+        {
+            let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+            for (field_ptr, change_sel, end_sel) in [
+                (
+                    ui.corner_radius,
+                    sel!(handleControlTextDidChange:),
+                    sel!(handleControlTextDidEndEditing:),
+                ),
+                (
+                    ui.clipboard_max_entries,
+                    sel!(handleControlTextDidChange:),
+                    sel!(handleControlTextDidEndEditing:),
+                ),
+                (
+                    ui.clipboard_auto_expire_days,
+                    sel!(handleControlTextDidChange:),
+                    sel!(handleControlTextDidEndEditing:),
+                ),
+            ] {
+                let change_name = make_nsstring("NSControlTextDidChangeNotification");
+                let _: () = msg_send![
+                    center,
+                    addObserver: target,
+                    selector: change_sel,
+                    name: change_name,
+                    object: field_ptr
+                ];
+                CFRelease(change_name as *const c_void);
+                let end_name = make_nsstring("NSControlTextDidEndEditingNotification");
+                let _: () = msg_send![
+                    center,
+                    addObserver: target,
+                    selector: end_sel,
+                    name: end_name,
+                    object: field_ptr
+                ];
+                CFRelease(end_name as *const c_void);
+            }
         }
-        let ok_text = settings_text_color(SettingsTextRole::OnAccent);
-        let _: () = msg_send![ok, setContentTintColor: ok_text];
-        let _: () = msg_send![ok, setAutoresizingMask: 33u64]; // 贴底、贴右
-        let _: () = msg_send![content, addSubview: ok];
-        ui.ok_button = ok;
-        release_obj(ok);
 
         *SETTINGS_UI.lock().unwrap() = Some(ui);
     }
@@ -4653,7 +5496,6 @@ pub(crate) fn invalidate_settings_window() {
     // so a rebuilt window can never address a deallocated child view.
     SIDEBAR_TITLE_LABELS.lock().unwrap().clear();
     SIDEBAR_ICON_VIEWS.lock().unwrap().clear();
-    clear_glass_preview();
 }
 
 #[cfg(test)]

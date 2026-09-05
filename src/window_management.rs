@@ -569,6 +569,84 @@ pub(crate) fn apply_direction(dir: Direction) {
     }
 }
 
+/// 快捷操作:读取指定进程焦点窗口的 CGWindowID(无焦点窗口 / 读取失败时 None)。
+/// 用于把 Cmd+N 刚创建的新窗口与旧窗口区分开。
+/// Quick actions: read the CGWindowID of the process's focused window (None when it has no
+/// focused window or the read fails). Used to tell the freshly created window from the old.
+pub(crate) fn focused_cgwid_of_pid(pid: i32) -> Option<u32> {
+    if pid <= 0 {
+        return None;
+    }
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.3);
+        let win = copy_attribute(app, K_AX_FOCUSED_WINDOW);
+        CFRelease(app);
+        let cgwid = win.and_then(|w| ax_window_cgwid(w));
+        if let Some(w) = win {
+            CFRelease(w);
+        }
+        cgwid
+    }
+}
+
+/// 快捷操作:把指定进程的焦点窗口最大化(等效绿色缩放按钮,非全屏)。
+/// 不经过窗口控制总开关;已是最大化/原生全屏的窗口原样保留(Option+E 连按不抖动)。
+/// 返回是否找到并处理了焦点窗口。
+///
+/// Quick actions: maximize the process's focused window (zoom, NOT fullscreen). Bypasses the
+/// window-control master switch; already-maximized / native-fullscreen windows are left as
+/// they are (repeated Option+E never flickers). Returns whether a focused window was found
+/// and handled.
+pub(crate) fn maximize_focused_window_of_pid(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.3);
+        let Some(win) = copy_attribute(app, K_AX_FOCUSED_WINDOW) else {
+            CFRelease(app);
+            return false;
+        };
+        // 原生全屏窗口跳过(全屏有自己的空间管理,设置 frame 无意义),视为已处理。
+        // Skip native fullscreen windows (they manage their own space); treat as handled.
+        if let Some(subrole) = copy_string(win, K_AX_SUBROLE) {
+            if subrole == K_AX_SUBROLE_FULL_SCREEN {
+                CFRelease(win);
+                CFRelease(app);
+                return true;
+            }
+        }
+        let mut handled = false;
+        if let Some(frame) = read_frame(win) {
+            let screens = screens_in_ax_space();
+            if !screens.is_empty() {
+                let cur = screen_index_for(frame, &screens);
+                if infer_state(frame, screens[cur].visible) != SnapState::Maximized {
+                    let target = snap_frames(screens[cur].visible).max;
+                    if !set_frame(win, target) {
+                        // AX 精确写被拒时退回原生缩放按钮(与窗口控制同策略)。
+                        // Fall back to the native zoom button when the exact AX write is
+                        // rejected (same policy as window control).
+                        press_native_zoom(win);
+                    }
+                }
+                handled = true;
+            }
+        }
+        CFRelease(win);
+        CFRelease(app);
+        handled
+    }
+}
+
 /// 执行主线程动作(AX 调用;错误只记 debug 日志,不打断流程)。
 /// Run a main-thread plan (AX calls; errors are debug-logged and never interrupt the flow).
 unsafe fn execute(plan: Plan, win: AXUIElementRef, dir: Direction) {

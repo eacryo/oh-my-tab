@@ -11,6 +11,43 @@ use super::*;
 /// Render the selected device's button-mapping rows into the scroll container (called after
 /// recording / deletion / device switch). Old rows are removed first, then rebuilt sorted by
 /// button number; mapping_doc is flipped, so rows stack top-down.
+/// 把 MAPPING_EDITS 写回选中设备的专属 profile(无档则创建)并调度防抖落盘。
+/// 即时生效模式:映射编辑不再等待设置窗口右下角的确认,编辑确认/删除后立即写内存配置。
+/// Flush MAPPING_EDITS into the selected device's own profile (created if absent) and
+/// schedule a debounced persist. Live-apply mode: mapping edits no longer wait for a
+/// bottom-right confirm; they hit the in-memory config as soon as they are confirmed/deleted.
+pub(super) fn commit_mapping_edits() {
+    let edits = MAPPING_EDITS.lock().unwrap().clone();
+    let mut cfg = crate::config::CONFIG.read().unwrap().clone();
+    let dev = current_selected_device();
+    let idx = find_profile_index(&cfg, dev);
+    let idx = match idx {
+        Some(i) => i,
+        None => {
+            let new_p = MouseProfile {
+                device: match dev {
+                    Some((vid, pid)) => DeviceMatcher {
+                        vendor_id: Some(vid),
+                        product_id: Some(pid),
+                    },
+                    None => DeviceMatcher::default(),
+                },
+                ..Default::default()
+            };
+            cfg.mouse.profiles.push(new_p);
+            cfg.mouse.profiles.len() - 1
+        }
+    };
+    cfg.mouse.profiles[idx].button_mappings = edits;
+    if let Ok(mut w) = crate::config::CONFIG.write() {
+        *w = cfg;
+    }
+    crate::config::schedule_config_persist();
+    // 配置变更:失效 per-device 解析缓存(下次 resolve 重新合并 profiles)。
+    // Config changed: invalidate the per-device resolve cache (next resolve re-merges).
+    crate::mouse::resolve::invalidate_cache();
+}
+
 pub(super) fn render_mapping_rows() {
     unsafe {
         let mut guard = SETTINGS_UI.lock().unwrap();
@@ -671,6 +708,7 @@ pub(crate) extern "C" fn handle_mapping_confirm(
         }
     }
     drop(edits);
+    commit_mapping_edits();
     close_mapping_panel();
     render_mapping_rows();
     log_debug!(
@@ -698,6 +736,10 @@ pub(crate) extern "C" fn handle_mapping_enabled_changed(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
+    // 映射总开关是 per-device 值:即时写回选中设备档并调度落盘,再重渲染行控件状态。
+    // The mappings master switch is per-device: write it back to the selected device's profile
+    // immediately (with a debounced persist), then re-render the row states.
+    unsafe { apply_mouse_profile_field(ControlField::MappingEnabled) };
     render_mapping_rows();
     log_debug!("[mouse] mappings master switch toggled");
 }
@@ -1001,6 +1043,7 @@ pub(super) fn close_mapping_panel() {
 pub(crate) extern "C" fn handle_delete_mapping(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
     MAPPING_EDITS.lock().unwrap().remove(&tag.to_string());
+    commit_mapping_edits();
     render_mapping_rows();
     log_debug!("[mouse] removed mapping for button {}", tag);
 }

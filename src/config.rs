@@ -22,6 +22,41 @@ pub struct Config {
     pub clipboard: ClipboardSection,
     pub mouse: MouseSection,
     pub window_control: WindowControlSection,
+    pub quick_actions: QuickActionsSection,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct QuickActionsSection {
+    // 快捷操作总开关(Option+I/E/D 全局热键)。默认 false:全局拦截会覆盖其他应用的
+    // Option+字母组合(部分布局下是死键/特殊字符),必须由用户显式开启。
+    // Quick-actions master switch (Option+I/E/D global hotkeys). Default false: the global
+    // interception overrides other apps' Option+letters (dead keys / special chars on some
+    // layouts), so it must be explicitly opted in.
+    pub enabled: bool,
+    // 子开关默认 true,保证旧配置仅有 enabled=true 时行为不变。
+    // Sub-switches default to true so existing configs with only enabled=true keep working.
+    #[serde(default = "default_quick_action_enabled")]
+    pub open_settings: bool,
+    #[serde(default = "default_quick_action_enabled")]
+    pub open_finder: bool,
+    #[serde(default = "default_quick_action_enabled")]
+    pub show_desktop: bool,
+}
+
+fn default_quick_action_enabled() -> bool {
+    true
+}
+
+impl Default for QuickActionsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            open_settings: true,
+            open_finder: true,
+            show_desktop: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1267,13 +1302,6 @@ impl Config {
 
 // ========== Global singleton ==========
 
-// 设置窗口实时预览期间的临时玻璃覆盖值,不写入磁盘配置。
-// Temporary glass overrides used by the live settings preview; never persisted to disk.
-static GLASS_STYLE_PREVIEW: std::sync::LazyLock<RwLock<Option<String>>> =
-    std::sync::LazyLock::new(|| RwLock::new(None));
-static GLASS_TINT_PREVIEW: std::sync::LazyLock<RwLock<Option<String>>> =
-    std::sync::LazyLock::new(|| RwLock::new(None));
-
 pub static CONFIG: std::sync::LazyLock<RwLock<Config>> = std::sync::LazyLock::new(|| {
     let (cfg, _errs) = Config::load_or_default();
     // 应用 config 里的 locale 覆盖(I18N 初始化时只用了系统语言)。
@@ -1284,34 +1312,111 @@ pub static CONFIG: std::sync::LazyLock<RwLock<Config>> = std::sync::LazyLock::ne
     RwLock::new(cfg)
 });
 
-/// 返回当前生效的玻璃样式,优先使用设置页的临时预览值。
-/// Return the effective glass style, preferring the settings page's temporary preview value.
+/// 返回当前生效的玻璃样式。
+/// Return the effective glass style.
 pub fn effective_glass_style() -> String {
-    if let Some(value) = GLASS_STYLE_PREVIEW.read().unwrap().clone() {
-        return value;
-    }
     CONFIG.read().unwrap().appearance.glass_style.clone()
 }
 
-/// 返回当前生效的玻璃颜色,优先使用设置页的临时预览值。
-/// Return the effective glass tint, preferring the settings page's temporary preview value.
+/// 返回当前生效的玻璃颜色。
+/// Return the effective glass tint.
 pub fn effective_glass_tint() -> String {
-    if let Some(value) = GLASS_TINT_PREVIEW.read().unwrap().clone() {
-        return value;
-    }
     CONFIG.read().unwrap().appearance.glass_tint.clone()
 }
 
-/// 设置或清除玻璃样式的临时预览值。
-/// Set or clear the temporary glass-style preview value.
-pub fn set_glass_style_preview(value: Option<String>) {
-    *GLASS_STYLE_PREVIEW.write().unwrap() = value;
+// ========== 配置落盘防抖调度器 / debounced config persistence scheduler ==========
+
+/// 落盘防抖窗口:连续修改(拖动滑块、连续输入)只在该静默期结束后写一次磁盘。
+/// Persistence debounce window: bursts of changes (slider drags, fast typing) coalesce into
+/// one disk write after this quiet period.
+const PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+
+enum PersistMsg {
+    Schedule,
+    Flush,
 }
 
-/// 设置或清除玻璃颜色的临时预览值。
-/// Set or clear the temporary glass-tint preview value.
-pub fn set_glass_tint_preview(value: Option<String>) {
-    *GLASS_TINT_PREVIEW.write().unwrap() = value;
+/// 后台落盘线程的消息通道(懒启动;主线程控制回调与恢复默认都会发消息)。
+/// The background persistence thread's channel (lazy; control callbacks and restores send).
+static PERSIST_TX: LazySender = LazySender::new();
+
+/// std::sync::mpsc::Sender 的懒初始化包装(线程随通道一起创建)。
+/// A lazy wrapper for the mpsc Sender (the thread spawns with the channel).
+struct LazySender(std::sync::Mutex<Option<std::sync::mpsc::Sender<PersistMsg>>>);
+
+impl LazySender {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    fn send(&self, msg: PersistMsg) {
+        let mut guard = self.0.lock().unwrap();
+        if guard.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("config-persist".into())
+                .spawn(move || persist_thread(rx))
+                .expect("spawn config-persist thread");
+            *guard = Some(tx);
+        }
+        // 发送失败仅意味着线程已退出(接收端关闭),丢消息比 panic 安全。
+        // A send failure only means the thread exited (receiver dropped); dropping the
+        // message is safer than panicking.
+        let _ = guard.as_ref().unwrap().send(msg);
+    }
+}
+
+/// 落盘线程主体:Schedule 进入防抖窗口(静默 400ms 后写一次);Flush 立即写一次。
+/// 读取的是最新 CONFIG 快照,重复消息天然合并成一次写。
+/// The persistence thread: Schedule opens a debounce window (write once after 400ms of
+/// quiet); Flush writes immediately. It always snapshots the newest CONFIG, so bursts
+/// naturally coalesce into a single write.
+fn persist_thread(rx: std::sync::mpsc::Receiver<PersistMsg>) {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            PersistMsg::Flush => persist_now(),
+            PersistMsg::Schedule => {
+                loop {
+                    match rx.recv_timeout(PERSIST_DEBOUNCE) {
+                        // 窗口内又有新修改:继续等下一个静默期(合并连续变更)。
+                        // Another change inside the window: keep waiting for quiet (bursts
+                        // coalesce).
+                        Ok(PersistMsg::Schedule) => continue,
+                        // 窗口中途收到 Flush:直接落盘(与静默期结束同等效果)。
+                        // A mid-window Flush: write immediately (same as quiet elapsed).
+                        Ok(PersistMsg::Flush) => break,
+                        // 超时 = 静默期结束,落盘一次。
+                        // Timeout = quiet period elapsed; write once.
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                persist_now();
+            }
+        }
+    }
+}
+
+/// 把当前 CONFIG 立即写入磁盘(落盘线程内执行;失败只记日志)。
+/// Write the current CONFIG to disk immediately (runs on the persist thread; failures log).
+fn persist_now() {
+    let cfg = CONFIG.read().unwrap().clone();
+    if let Err(e) = cfg.save() {
+        eprintln!("[config] persist failed: {}", e);
+    }
+}
+
+/// 设置修改后调用:调度一次防抖落盘(立即生效与磁盘写入分离,避免拖动/连打时大量 IO)。
+/// Call after a setting change: schedule one debounced disk write (immediate effect and disk
+/// persistence are decoupled to avoid burst IO while dragging/typing).
+pub fn schedule_config_persist() {
+    PERSIST_TX.send(PersistMsg::Schedule);
+}
+
+/// 立即落盘一次(恢复默认 / 失焦提交等需要确定性写入的路径)。
+/// Persist once immediately (restore defaults / blur-commit paths that need a durable write).
+pub fn persist_config_now() {
+    PERSIST_TX.send(PersistMsg::Flush);
 }
 
 /// Reload config from disk and apply. Returns validation errors (empty = success).
