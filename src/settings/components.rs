@@ -579,9 +579,9 @@ pub(super) struct RestoreDefaultsControl {
     pub(super) container: *mut AnyObject,
     pub(super) separator: *mut AnyObject,
     // 展开几何(侧边栏与 footer 变体尺寸不同,构建时确定):
-    // confirm_y = 确认按钮在容器内的 y;collapsed/expanded_h = 容器收起/展开高度。
+    // confirm_y = 展开态确认按钮的 y;collapsed/expanded_h = 容器收起/展开高度。
     // Expanded geometry (sidebar vs footer variants differ; fixed at build time):
-    // confirm_y = the confirm row's y inside the container; collapsed/expanded_h = the
+    // confirm_y = the expanded confirm row's y inside the container; collapsed/expanded_h = the
     // container's collapsed/expanded height.
     confirm_y: f64,
     collapsed_h: f64,
@@ -745,9 +745,9 @@ impl RestoreDefaultsControl {
             surface,
             container,
             separator,
-            confirm_y: 54.0,
+            confirm_y: 50.0,
             collapsed_h: 42.0,
-            expanded_h: 110.0,
+            expanded_h: 92.0,
             expanded: false,
         }
     }
@@ -893,12 +893,12 @@ impl RestoreDefaultsControl {
             surface,
             container,
             separator: std::ptr::null_mut(),
-            // 取消行与触发按钮同位(y=6),确认行在其上方;展开高度 = 确认行顶 + 8pt 余量。
-            // The cancel row shares the trigger's position (y=6); the confirm row sits above;
-            // expanded height = the confirm row's top + an 8pt margin.
-            confirm_y: 54.0,
+            // 取消行与触发按钮同位(y=6),两行之间保留 14pt;顶部再留 12pt 余量。
+            // The cancel row shares the trigger's position (y=6); the rows keep a 14pt gap
+            // with 12pt of top padding above Confirm.
+            confirm_y: 50.0,
             collapsed_h: 42.0,
-            expanded_h: 110.0,
+            expanded_h: 92.0,
             expanded: false,
         }
     }
@@ -956,6 +956,18 @@ impl RestoreDefaultsControl {
         );
         let confirm_frame = NSRect::new(
             NSPoint::new(trigger_frame.origin.x, self.confirm_y),
+            objc2_foundation::NSSize::new(expanded_row_width, trigger_frame.size.height),
+        );
+        // The reference keeps panel content attached to the shell's moving top edge. In an
+        // AppKit layer animation, subview layout does not reflow from the presentation bounds, so
+        // explicitly animate Confirm from the collapsed top position to its expanded position.
+        // 参考组件的内容始终贴着外壳移动的顶部。AppKit 的 layer 动画不会根据 presentation
+        // bounds 重新布局子视图，因此显式让确认按钮从收起态顶部位置移动到展开位置。
+        let confirm_collapsed_frame = NSRect::new(
+            NSPoint::new(
+                trigger_frame.origin.x,
+                self.confirm_y + self.collapsed_h - self.expanded_h,
+            ),
             objc2_foundation::NSSize::new(expanded_row_width, trigger_frame.size.height),
         );
         // footer 变体没有分割线(separator 为空),跳过分割线动画。
@@ -1022,7 +1034,13 @@ impl RestoreDefaultsControl {
             } else {
                 let _: () = objc2::msg_send![self.surface, setAlphaValue: 1.0f64];
             }
-            let _: () = objc2::msg_send![self.confirm, setFrame: confirm_frame];
+            // Start the panel content below the collapsed shell and let it rise with the shell,
+            // matching the reference's top-docked content reveal.
+            // 让面板内容从收起外壳下方开始，随着外壳向上展开，匹配参考组件贴顶内容的显现。
+            let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+            let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+            let _: () = objc2::msg_send![self.confirm, setFrame: confirm_collapsed_frame];
+            let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
             let _: () = objc2::msg_send![self.cancel, setFrame: cancel_frame];
             // Cancel takes the fixed dock slot while Restore Defaults fades beneath it.
             // 取消按钮占据固定 dock 位置，恢复默认按钮在其下方淡出。
@@ -1135,6 +1153,18 @@ impl RestoreDefaultsControl {
                     "restore-divider",
                 );
             }
+            Self::spring_view_frame(
+                self.confirm,
+                if expanded {
+                    confirm_frame
+                } else {
+                    confirm_collapsed_frame
+                },
+                0.46,
+                266.0,
+                30.0,
+                "restore-confirm-frame",
+            );
         } else {
             let _: () = objc2::msg_send![self.surface, setFrame: target_surface];
             let surface_layer: *mut AnyObject = objc2::msg_send![self.surface, layer];
@@ -1146,6 +1176,14 @@ impl RestoreDefaultsControl {
             if !self.separator.is_null() {
                 let _: () = objc2::msg_send![self.separator, setFrame: target_separator];
             }
+            let _: () = objc2::msg_send![
+                self.confirm,
+                setFrame: if expanded {
+                    confirm_frame
+                } else {
+                    confirm_collapsed_frame
+                }
+            ];
         }
     }
 
