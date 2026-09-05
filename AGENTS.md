@@ -56,9 +56,21 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 ## Editing conventions
 
 - Preserve unrelated user changes in a dirty worktree.
-- Use `apply_patch` for local file edits and avoid destructive Git commands unless explicitly requested.
+- Avoid destructive Git commands (e.g. `reset`/`checkout`/`clean` that discard modifications) unless explicitly requested.
 - Add bilingual comments (Chinese first, English second) only for non-obvious logic, important design decisions, FFI/Objective-C subtleties, and workarounds.
 - Keep user-visible strings in `t()`/`tf()` and add translation keys to all supported locale files. Developer logs remain in English; dynamic window/application titles are data, not UI chrome.
+
+## File editing
+
+Prefer the harness's native file-editing tools (e.g. Edit, Write, or apply_patch) when modifying source code.
+
+- Use Edit/apply_patch for targeted changes to existing files.
+- Use Write when creating new files or intentionally replacing an entire file.
+- Do not use Python, shell scripts, sed, perl, or similar tools for ordinary source-code edits or simple text replacement.
+- Scripts are acceptable for genuinely programmatic or bulk transformations, code generation, migrations, or changes spanning many files where scripted editing is clearly safer and more efficient.
+- Before running a script that modifies files, leave an escape hatch: back up the target files (e.g. `cp file file.bak`) or confirm the current state is recoverable via Git.
+- Scripts must fail loudly: assert that every anchor/marker was found before editing, and abort (re-reading the file) when any is missing. Never continue with default or empty bounds from a failed search.
+- When using a script to modify source files, inspect the resulting diff (`git diff`) before considering the task complete.
 
 ## Git and commits
 If user only input "cmsg", then give user a commit message follow below rule:
