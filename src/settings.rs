@@ -2425,6 +2425,16 @@ unsafe fn center_settings_window(window: *mut AnyObject) {
 }
 
 fn show_settings() {
+    show_settings_inner(None, 0);
+}
+
+/// Show the settings window, optionally preserving its frame and selected page.
+/// 显示设置窗口,可选地保留窗口位置和当前页。
+fn show_settings_preserving(frame: NSRect, page: usize) {
+    show_settings_inner(Some(frame), page);
+}
+
+fn show_settings_inner(preserved_frame: Option<NSRect>, page: usize) {
     unsafe {
         {
             let ui = SETTINGS_UI.lock().unwrap();
@@ -2442,9 +2452,9 @@ fn show_settings() {
         // 悬停状态，避免旧条目在重新打开后留下幽灵高亮。
         widgets::clear_sidebar_hover();
         load_settings_values();
-        // 每次打开都复位到通用页(窗口复用、隐藏不销毁)。
-        // Reset to the General page on every open (the window is reused / hidden, not destroyed).
-        select_sidebar(0);
+        // 普通打开回到通用页;无缝刷新时保留用户当前页。
+        // Normal opens return to General; seamless refreshes preserve the current page.
+        select_sidebar(page);
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
             // 切到 .regular:让设置窗口能正常激活抬升(从别的 App 顶部弹出来),关闭时切回。
@@ -2453,7 +2463,14 @@ fn show_settings() {
             crate::set_settings_activation_policy(true);
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
-            center_settings_window(u.window);
+            if let Some(frame) = preserved_frame {
+                // 在窗口仍隐藏时设置 frame,避免新窗口先出现在默认位置再跳到旧位置。
+                // Set the frame while the replacement is hidden so it never visibly jumps from
+                // its default position to the preserved position.
+                let _: () = msg_send![u.window, setFrame: frame, display: false];
+            } else {
+                center_settings_window(u.window);
+            }
             let _: () = msg_send![u.window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
             // 红绿灯偏移:必须等窗口完成首次布局后再移动,否则会被 AppKit 重置。
             // Offset the traffic lights only after the window's first layout pass, or AppKit
@@ -2512,17 +2529,17 @@ fn hide_settings() {
 /// Re-apply the effective appearance from the current CONFIG while preserving page and frame.
 ///
 /// Custom settings layers are painted with concrete palette colors at construction time. When
-/// the window is visible, remember the current page and frame, rebuild the window (controls
-/// refill from CONFIG), then restore both; this avoids the mixed light/dark state caused by
-/// updating only NSWindow.appearance. Immediate-apply writes CONFIG before calling this, so
-/// the refill already shows the new values.
+/// the window is visible, remember the current page and frame, clear and rebuild the content
+/// hierarchy inside the same NSWindow, then restore the page and frame. This avoids the visible
+/// order-out/reappear gap and the mixed state caused by updating only NSWindow.appearance.
+/// Immediate-apply writes CONFIG before calling this, so the redraw already shows the new values.
 ///
 /// 按当前 CONFIG 重新应用外观,同时保留页签与窗口位置。设置页自绘图层在创建时写入具体
-/// 调色板颜色,所以窗口可见时先记住当前页与位置、重建窗口(控件从 CONFIG 重填)再恢复,
-/// 避免只更新 NSWindow appearance 导致明暗混杂。即时生效路径先写 CONFIG 再调用本函数,
-/// 因此重填后的控件已经展示新值。
+/// 调色板颜色,所以窗口可见时先记住当前页与位置,在同一个 NSWindow 内清空并重建内容层级,
+/// 再恢复页面和位置,避免先消失再出现的可见空档,也避免只更新 NSWindow appearance 导致
+/// 明暗混杂。即时生效路径先写 CONFIG 再调用本函数,因此重绘后的界面已经展示新值。
 pub(crate) fn refresh_system_appearance() {
-    let (window, visible) = SETTINGS_UI
+    let (old_window, visible) = SETTINGS_UI
         .lock()
         .unwrap()
         .as_ref()
@@ -2532,25 +2549,32 @@ pub(crate) fn refresh_system_appearance() {
         })
         .unwrap_or((std::ptr::null_mut(), false));
 
-    if window.is_null() || !visible {
+    if old_window.is_null() || !visible {
         invalidate_settings_window();
         return;
     }
 
     let (page, frame) = {
         let page = SIDEBAR_SELECTED.load(Ordering::SeqCst);
-        let frame: NSRect = unsafe { msg_send![window, frame] };
+        let frame: NSRect = unsafe { msg_send![old_window, frame] };
         (page, frame)
     };
 
-    invalidate_settings_window();
-    show_settings();
-    select_sidebar(page);
+    let old_ui = SETTINGS_UI.lock().unwrap().take();
+    let Some(old_ui) = old_ui else {
+        invalidate_settings_window();
+        return;
+    };
+
     unsafe {
-        let ui = SETTINGS_UI.lock().unwrap();
-        if let Some(ui) = ui.as_ref() {
-            let _: () = msg_send![ui.window, setFrame: frame, display: true];
-        }
+        // Detach callbacks and registries, then redraw the content hierarchy inside the same
+        // visible NSWindow. The window never orders out, changes identity, or changes focus.
+        // 解除回调和运行时注册表后,在同一个可见 NSWindow 内重绘内容层级;窗口不隐藏、不换对象、
+        // 也不改变焦点。
+        widgets::clear_sidebar_hover();
+        detach_settings_window_runtime(&old_ui);
+        rebuild_settings_content(old_ui.window);
+        show_settings_preserving(frame, page);
     }
 }
 
@@ -3374,6 +3398,16 @@ unsafe fn apply_settings_window_appearance(window: *mut AnyObject) {
 }
 
 fn create_settings_window() {
+    create_settings_window_for(None);
+}
+
+/// Rebuild the settings content in an existing window without replacing the window itself.
+/// 在现有窗口内重建设置内容,不替换窗口对象本身。
+fn rebuild_settings_content(window: *mut AnyObject) {
+    create_settings_window_for(Some(window));
+}
+
+fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
     unsafe {
         let palette = settings_palette();
         // Keep the original compact settings window dimensions while applying the redesign's
@@ -3401,56 +3435,73 @@ fn create_settings_window() {
         // overlay_target_screen's note).
         let win_w = view_w;
         let win_h = 720.0;
-        let (win_x, win_y) = {
-            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-            let count: usize = msg_send![screens, count];
-            if count > 0 {
-                // objectAtIndex: 的参数编码是 'q'(signed long),必须传 isize。
-                // objectAtIndex: expects 'q' (signed long); pass isize.
-                let s: *mut AnyObject = msg_send![screens, objectAtIndex: 0isize];
-                let f: NSRect = msg_send![s, frame];
-                (
-                    f.origin.x + (f.size.width - win_w) / 2.0,
-                    f.origin.y + (f.size.height - win_h) / 2.0,
-                )
-            } else {
-                (220.0, 180.0)
-            }
+        let window = if let Some(window) = existing_window {
+            window
+        } else {
+            let (win_x, win_y) = {
+                let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+                let count: usize = msg_send![screens, count];
+                if count > 0 {
+                    // objectAtIndex: 的参数编码是 'q'(signed long),必须传 isize。
+                    // objectAtIndex: expects 'q' (signed long); pass isize.
+                    let s: *mut AnyObject = msg_send![screens, objectAtIndex: 0isize];
+                    let f: NSRect = msg_send![s, frame];
+                    (
+                        f.origin.x + (f.size.width - win_w) / 2.0,
+                        f.origin.y + (f.size.height - win_h) / 2.0,
+                    )
+                } else {
+                    (220.0, 180.0)
+                }
+            };
+            let frame = NSRect::new(NSPoint::new(win_x, win_y), NSSize::new(win_w, win_h));
+            let window: *mut AnyObject = msg_send![settings_window_class(), alloc];
+            msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false]
         };
-        let frame = NSRect::new(NSPoint::new(win_x, win_y), NSSize::new(win_w, win_h));
-        let window: *mut AnyObject = msg_send![settings_window_class(), alloc];
-        let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
         apply_settings_window_appearance(window);
         let ns_title = make_nsstring(&t("settings.window_title"));
         let _: () = msg_send![window, setTitle: ns_title];
         CFRelease(ns_title as *const c_void);
-        let _: () = msg_send![window, setReleasedWhenClosed: false];
-        // 固定宽度:min/max 宽都等于设计宽度,高度可调 —— 系统设置同款(宽度不能左右调整)。
-        // Fixed width: min and max width both equal the designed width, height stays adjustable --
-        // same as System Settings (the width cannot be dragged).
-        let _: () = msg_send![window, setMinSize: NSSize::new(view_w, 400.0)];
-        let _: () = msg_send![window, setMaxSize: NSSize::new(view_w, 10000.0)];
+        if existing_window.is_none() {
+            let _: () = msg_send![window, setReleasedWhenClosed: false];
+            // 固定宽度:min/max 宽都等于设计宽度,高度可调 —— 系统设置同款(宽度不能左右调整)。
+            // Fixed width: min and max width both equal the designed width, height stays adjustable --
+            // same as System Settings (the width cannot be dragged).
+            let _: () = msg_send![window, setMinSize: NSSize::new(view_w, 400.0)];
+            let _: () = msg_send![window, setMaxSize: NSSize::new(view_w, 10000.0)];
 
-        // 空 unified 工具栏:unified 工具栏(NSWindowToolbarStyleUnified=3)会把窗口主题帧
-        // 圆角从 16 提到 26(实测;LinearMouse 的设置窗口就是这么做的),顶部条带随之变为
-        // 玻璃材质条带、红绿灯在其中垂直居中。空工具栏不加入任何响应者,不影响
-        // performKeyEquivalent:(Cmd+Q)与页面切换。必须在 contentLayoutRect 测量之前设置,
-        // 布局高度会自动减去工具栏条带(658 -> 624)。
-        // Empty unified toolbar: NSWindowToolbarStyleUnified (3) raises the theme frame's corner
-        // radius from 16 to 26 (measured; that's how LinearMouse's settings window does it), and
-        // the top strip becomes a glass material strip with the traffic lights centered in it.
-        // An empty toolbar adds no responders, so performKeyEquivalent: (Cmd+Q) and page switching
-        // are unaffected. Must be set before measuring contentLayoutRect, which then automatically
-        // accounts for the toolbar strip (658 -> 624).
-        let tb: *mut AnyObject = msg_send![class!(NSToolbar), alloc];
-        let tb_id = make_nsstring("OhMyTabSettingsToolbar");
-        let tb: *mut AnyObject = msg_send![tb, initWithIdentifier: tb_id];
-        CFRelease(tb_id as *const c_void);
-        let _: () = msg_send![window, setToolbar: tb];
-        let _: () = msg_send![window, setToolbarStyle: 3isize]; // NSWindowToolbarStyleUnified
-        release_obj(tb);
+            // 空 unified 工具栏:unified 工具栏(NSWindowToolbarStyleUnified=3)会把窗口主题帧
+            // 圆角从 16 提到 26(实测;LinearMouse 的设置窗口就是这么做的),顶部条带随之变为
+            // 玻璃材质条带、红绿灯在其中垂直居中。空工具栏不加入任何响应者,不影响
+            // performKeyEquivalent:(Cmd+Q)与页面切换。必须在 contentLayoutRect 测量之前设置,
+            // 布局高度会自动减去工具栏条带(658 -> 624)。
+            // Empty unified toolbar: NSWindowToolbarStyleUnified (3) raises the theme frame's corner
+            // radius from 16 to 26 (measured; that's how LinearMouse's settings window does it), and
+            // the top strip becomes a glass material strip with the traffic lights centered in it.
+            // An empty toolbar adds no responders, so performKeyEquivalent: (Cmd+Q) and page switching
+            // are unaffected. Must be set before measuring contentLayoutRect, which then automatically
+            // accounts for the toolbar strip (658 -> 624).
+            let tb: *mut AnyObject = msg_send![class!(NSToolbar), alloc];
+            let tb_id = make_nsstring("OhMyTabSettingsToolbar");
+            let tb: *mut AnyObject = msg_send![tb, initWithIdentifier: tb_id];
+            CFRelease(tb_id as *const c_void);
+            let _: () = msg_send![window, setToolbar: tb];
+            let _: () = msg_send![window, setToolbarStyle: 3isize]; // NSWindowToolbarStyleUnified
+            release_obj(tb);
+        }
 
         let content: *mut AnyObject = msg_send![window, contentView];
+        if existing_window.is_some() {
+            // Remove only the old content hierarchy; keep the NSWindow, its frame, and key status
+            // intact so a locale/theme refresh is an in-place redraw.
+            // 只移除旧内容层级;保留 NSWindow、窗口位置和焦点状态,让语言/主题刷新成为原位重绘。
+            let subviews: *mut AnyObject = msg_send![content, subviews];
+            let count: usize = msg_send![subviews, count];
+            for index in (0..count).rev() {
+                let subview: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+                let _: () = msg_send![subview, removeFromSuperview];
+            }
+        }
         // content_h 只用于容器视图的满高尺寸(翻转 mask 后覆盖整个窗口);
         // 顶部锚定行的有效高度在翻转后用 layout_h 取(见下)。
         // content_h is only used for full-height containers (they cover the whole window after
@@ -5501,6 +5552,25 @@ fn create_settings_window() {
     }
 }
 
+/// Detach global references owned by a settings window before it is released or replaced.
+/// 在释放或替换设置窗口前,解除由该窗口持有的全局引用。
+unsafe fn detach_settings_window_runtime(ui: &SettingsUi) {
+    close_glass_tint_panel(ui.glass_tint);
+    TRAFFIC_LIGHT_BASE_ORIGINS
+        .lock()
+        .unwrap()
+        .remove(&(ui.window as usize));
+    // 先让 update 模块解除对宿主视图的引用,再释放窗口,避免它写入已释放视图。
+    // Detach the updater's host references before releasing the window so it never touches
+    // a deallocated view.
+    crate::updater::clear_update_host();
+    SettingsRow::clear_runtime_registry();
+    widgets::clear_settings_select_registry();
+    tooltip::SettingsTooltip::clear_runtime_registries();
+    SIDEBAR_TITLE_LABELS.lock().unwrap().clear();
+    SIDEBAR_ICON_VIEWS.lock().unwrap().clear();
+}
+
 /// 作废缓存的设置窗口(释放并置 None),下次打开时按当前 locale 重建。
 /// Invalidate the cached settings window (release + set None) so it is rebuilt with the
 /// current locale on next open. 用于 locale 变更后让设置窗口标签换语言。
@@ -5509,18 +5579,7 @@ pub(crate) fn invalidate_settings_window() {
     let ui = SETTINGS_UI.lock().unwrap().take();
     if let Some(u) = ui {
         unsafe {
-            close_glass_tint_panel(u.glass_tint);
-            TRAFFIC_LIGHT_BASE_ORIGINS
-                .lock()
-                .unwrap()
-                .remove(&(u.window as usize));
-            // 先让 update 模块解除对宿主视图的引用,再释放窗口,避免它写入已释放视图。
-            // Detach the updater's host references before releasing the window so it never touches
-            // a deallocated view.
-            crate::updater::clear_update_host();
-            SettingsRow::clear_runtime_registry();
-            widgets::clear_settings_select_registry();
-            tooltip::SettingsTooltip::clear_runtime_registries();
+            detach_settings_window_runtime(&u);
             // 窗口 alloc 是 +1且 setReleasedWhenClosed:false,需手动 release 一次;
             // 其子控件已由父视图持有,随窗口 dealloc 释放。
             // The window is alloc +1 with setReleasedWhenClosed:false, so release once manually;
@@ -5533,10 +5592,6 @@ pub(crate) fn invalidate_settings_window() {
         // during a locale change).
         crate::set_settings_activation_policy(false);
     }
-    // Sidebar labels/icons are owned by the invalidated window. Drop their raw-pointer entries
-    // so a rebuilt window can never address a deallocated child view.
-    SIDEBAR_TITLE_LABELS.lock().unwrap().clear();
-    SIDEBAR_ICON_VIEWS.lock().unwrap().clear();
 }
 
 #[cfg(test)]

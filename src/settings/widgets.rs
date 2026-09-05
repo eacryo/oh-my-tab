@@ -1712,6 +1712,25 @@ pub(super) extern "C" fn settings_select_select_option(
             state.selected = index;
         }
         settings_select_close(select);
+        // Defer the target/action callback until the option's mouse event has fully unwound.
+        // Locale changes rebuild the settings window; doing that inside the old popup's event
+        // stack lets AppKit order the newly rebuilt window out again when menu tracking ends.
+        // 将 target/action 回调延迟到选项鼠标事件完全退出后执行。语言切换会重建设置窗口，
+        // 如果仍在旧下拉菜单的事件栈中重建，AppKit 结束菜单追踪时会再次把新窗口压到后台。
+        let _: () = msg_send![
+            select,
+            performSelector: sel!(sendPendingAction),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: 0.0f64
+        ];
+    }
+}
+
+/// Dispatch a select action after the popup event has returned to the run loop.
+/// 在下拉菜单事件返回 run loop 后派发控件 action。
+extern "C" fn settings_select_send_pending_action(this: *mut c_void, _cmd: Sel) {
+    unsafe {
+        let select = this as *mut AnyObject;
         let target: *mut AnyObject = msg_send![select, target];
         if !target.is_null() {
             let action: Sel = msg_send![select, action];
@@ -1947,6 +1966,12 @@ fn settings_select_class() -> *mut AnyObject {
                 sel!(selectOption:),
                 settings_select_select_option as *mut c_void,
                 types_void_event.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(sendPendingAction),
+                settings_select_send_pending_action as *mut c_void,
+                CString::new("v@:").unwrap().as_ptr(),
             );
             class_addMethod(
                 cls,
