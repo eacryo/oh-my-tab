@@ -1029,7 +1029,28 @@ struct SettingsSelectState {
     open: bool,
 }
 
+fn settings_select_needs_wrap(
+    natural_width: f64,
+    available_width: f64,
+    has_explicit_newline: bool,
+) -> bool {
+    has_explicit_newline
+        || (natural_width.is_finite() && natural_width > available_width.max(1.0) + 0.5)
+}
+
+fn settings_select_centered_text_geometry(control_height: f64, measured_height: f64) -> (f64, f64) {
+    let control_height = control_height.max(1.0);
+    let text_height = if measured_height.is_finite() {
+        measured_height.max(1.0).min(control_height)
+    } else {
+        control_height
+    };
+    ((control_height - text_height).max(0.0) / 2.0, text_height)
+}
+
 static SETTINGS_SELECT_STATES: LazyLock<Mutex<HashMap<usize, SettingsSelectState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SETTINGS_SELECT_LABEL_VIEWS: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SETTINGS_SELECT_ARROW_VIEWS: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1051,18 +1072,134 @@ static SETTINGS_SELECT_ITEM_CLASS: OnceLock<SettingsSelectItemClass> = OnceLock:
 /// 设置窗口及其控件销毁前清理运行时状态。
 pub(super) fn clear_settings_select_registry() {
     SETTINGS_SELECT_STATES.lock().unwrap().clear();
+    SETTINGS_SELECT_LABEL_VIEWS.lock().unwrap().clear();
     SETTINGS_SELECT_ARROW_VIEWS.lock().unwrap().clear();
     *ACTIVE_SETTINGS_SELECT.lock().unwrap() = None;
 }
 
 unsafe fn settings_select_set_title(button: *mut AnyObject, title: &str) {
-    // NSButton has no reliable AppKit content-inset API. Keep the native button hit area and
-    // add a small typographic inset to its title instead of shrinking the control frame.
-    // NSButton 没有可靠的 AppKit 内容内边距 API；保留按钮点击区域，只给标题增加轻微字面内缩。
-    let padded_title = format!("   {title}");
-    let title_ns = make_nsstring(&padded_title);
-    let _: () = msg_send![button, setTitle: title_ns];
+    // Render the value in a dedicated label so the trailing arrow always has its own reserved
+    // column. A native NSButton title has no reliable content width once a child arrow is added,
+    // so long values can otherwise paint underneath the arrow.
+    // 使用独立文本标签绘制值，为右侧箭头预留固定列。NSButton 原生标题在添加箭头子视图后
+    // 没有可靠的可用内容宽度，长文本会因此画到箭头下面。
+    let bounds: NSRect = msg_send![button, bounds];
+    let label_frame = NSRect::new(
+        // Use the complete control height: the cell centers single-line values, while the
+        // remaining height is available for a wrapped second line.
+        // 使用完整控件高度：由 cell 将单行文本垂直居中，同时为换行后的第二行留出空间。
+        NSPoint::new(12.0, 0.0),
+        NSSize::new(
+            (bounds.size.width - 12.0 - 16.0 - 8.0 - 12.0).max(1.0),
+            bounds.size.height.max(1.0),
+        ),
+    );
+    let existing_label = SETTINGS_SELECT_LABEL_VIEWS
+        .lock()
+        .unwrap()
+        .get(&(button as usize))
+        .copied()
+        .unwrap_or(0) as *mut AnyObject;
+    let label = if existing_label.is_null() {
+        let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let label: *mut AnyObject = msg_send![label, initWithFrame: label_frame];
+        let _: () = msg_send![label, setBezeled: false];
+        let _: () = msg_send![label, setDrawsBackground: false];
+        let _: () = msg_send![label, setEditable: false];
+        let _: () = msg_send![label, setSelectable: false];
+        let _: () = msg_send![label, setAlignment: 0isize]; // NSTextAlignmentLeft
+        let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+        if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+            let _: () = msg_send![label, setMaximumNumberOfLines: 0isize];
+        }
+        let _: () = msg_send![label, setAutoresizingMask: 2u64]; // width sizable
+        let _: () = msg_send![button, addSubview: label];
+        SETTINGS_SELECT_LABEL_VIEWS
+            .lock()
+            .unwrap()
+            .insert(button as usize, label as usize);
+        release_obj(label);
+        label
+    } else {
+        existing_label
+    };
+    let _: () = msg_send![label, setFrame: label_frame];
+    let title_ns = make_nsstring(title);
+    let _: () = msg_send![label, setStringValue: title_ns];
     CFRelease(title_ns as *const c_void);
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setPreferredMaxLayoutWidth: label_frame.size.width];
+
+    // AppKit's single-line cell has the correct baseline, while its multi-line cell is top-biased.
+    // Use the cell's unconstrained natural width to decide whether wrapping is needed; fittingSize
+    // is already constrained by preferredMaxLayoutWidth and cannot make that decision reliably.
+    // AppKit 的单行 cell 使用正确的 baseline，而多行 cell 会偏向顶部。用 cell 不受约束的自然
+    // 宽度判断是否需要换行；fittingSize 已受 preferredMaxLayoutWidth 限制，不能可靠做这个判断。
+    let _: () = msg_send![label, setUsesSingleLineMode: true];
+    if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![label, setMaximumNumberOfLines: 1isize];
+    }
+    let cell: *mut AnyObject = msg_send![label, cell];
+    let natural_size = if cell.is_null() {
+        NSSize::new(0.0, 0.0)
+    } else {
+        msg_send![cell, cellSize]
+    };
+    let needs_wrap = settings_select_needs_wrap(
+        natural_size.width,
+        label_frame.size.width,
+        title.contains('\n'),
+    );
+
+    if !needs_wrap {
+        // A fixed baseline alone does not center a child NSTextField whose frame spans the whole
+        // button. Shrink the field to the natural line height and center that frame explicitly.
+        // 仅使用固定 baseline 仍不会让占满按钮高度的子 NSTextField 居中；把文本框收紧到自然
+        // 行高，再显式居中它的 frame。
+        let mut centered_frame = label_frame;
+        let (text_y, text_height) =
+            settings_select_centered_text_geometry(bounds.size.height, natural_size.height);
+        centered_frame.origin.y = text_y;
+        centered_frame.size.height = text_height;
+        let _: () = msg_send![label, setFrame: centered_frame];
+    } else {
+        let _: () = msg_send![label, setUsesSingleLineMode: false];
+        if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+            let _: () = msg_send![label, setMaximumNumberOfLines: 0isize];
+        }
+        let wrapped_size: NSSize = msg_send![
+            label,
+            sizeThatFits: NSSize::new(label_frame.size.width, 10_000.0)
+        ];
+        // Fit the multi-line label to its measured height so its text block is centered as a unit.
+        // 多行标签收紧到测得的高度，再将整个文本块居中。
+        let mut centered_frame = label_frame;
+        let (text_y, text_height) = settings_select_centered_text_geometry(
+            bounds.size.height,
+            wrapped_size.height.max(natural_size.height),
+        );
+        centered_frame.origin.y = text_y;
+        centered_frame.size.height = text_height;
+        let _: () = msg_send![label, setFrame: centered_frame];
+    }
+    let empty_title = make_nsstring("");
+    let _: () = msg_send![button, setTitle: empty_title];
+    CFRelease(empty_title as *const c_void);
+    // The native title is kept empty; its visible value is the wrapped label above.
+    // 原生标题保持为空，实际显示由上面的可换行标签负责。
+}
+
+unsafe fn settings_select_set_label_color(button: *mut AnyObject, color: *mut AnyObject) {
+    let label = SETTINGS_SELECT_LABEL_VIEWS
+        .lock()
+        .unwrap()
+        .get(&(button as usize))
+        .copied()
+        .unwrap_or(0) as *mut AnyObject;
+    if !label.is_null() {
+        let _: () = msg_send![label, setTextColor: color];
+    }
 }
 
 /// Select surfaces deliberately use opaque colors; only the surrounding settings window remains
@@ -1209,6 +1346,7 @@ unsafe fn settings_select_apply_visual(button: *mut AnyObject, open: bool) {
         palette.muted_text
     });
     let _: () = msg_send![button, setContentTintColor: tint];
+    settings_select_set_label_color(button, tint);
     let _: () = msg_send![arrow_view, setContentTintColor: tint];
     let layer: *mut AnyObject = msg_send![button, layer];
     if !layer.is_null() {
@@ -3371,7 +3509,7 @@ pub(super) unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
 mod tests {
     use super::{
         derived_label_width, rect_inside, rects_overlap, required_document_height,
-        stable_document_height,
+        settings_select_centered_text_geometry, settings_select_needs_wrap, stable_document_height,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -3379,6 +3517,21 @@ mod tests {
     fn label_width_follows_control_leading_edge() {
         assert_eq!(derived_label_width(319.0, 12.0, 18.0), 289.0);
         assert_eq!(derived_label_width(20.0, 12.0, 18.0), 1.0);
+    }
+
+    #[test]
+    fn settings_select_centers_single_line_and_wraps_only_when_needed() {
+        assert!(!settings_select_needs_wrap(98.0, 152.0, false));
+        assert!(settings_select_needs_wrap(175.0, 152.0, false));
+        assert!(settings_select_needs_wrap(40.0, 152.0, true));
+        assert_eq!(
+            settings_select_centered_text_geometry(34.0, 16.0),
+            (9.0, 16.0)
+        );
+        assert_eq!(
+            settings_select_centered_text_geometry(34.0, 32.0),
+            (1.0, 32.0)
+        );
     }
 
     #[test]
