@@ -56,9 +56,6 @@ pub(crate) struct Colors {
     pub(crate) icon_text: u32,
     pub(crate) app_name: u32,
     pub(crate) win_title: u32,
-    /// 预览区 1px 描边(设计稿 rgba(15,22,32,.10);暗色取白色低透明度)。
-    /// The preview's 1px border (mockup rgba(15,22,32,.10); dark uses dim white).
-    pub(crate) preview_border: u32,
 }
 
 /// Settings and auxiliary panels use custom layer-backed surfaces, so they need a complete
@@ -182,7 +179,6 @@ pub(crate) fn colors_from_config(dark: bool) -> Colors {
         icon_text: config::parse_hex8(&c.icon_text),
         app_name: config::parse_hex8(&c.app_name),
         win_title: config::parse_hex8(&c.win_title),
-        preview_border: if dark { 0xFFFFFF24 } else { 0x0F16201A },
     }
 }
 
@@ -521,13 +517,29 @@ pub(crate) struct ThumbFlowLayout {
     pub(crate) max_scroll_offset: f64,
 }
 
+#[cfg(test)]
 fn thumb_widths(aspects: &[f64], range: &Range<usize>, card_h: f64, max_inner: f64) -> Vec<f64> {
+    thumb_widths_with_max_card_w(aspects, range, card_h, max_inner, f64::INFINITY)
+}
+
+fn thumb_widths_with_max_card_w(
+    aspects: &[f64],
+    range: &Range<usize>,
+    card_h: f64,
+    max_inner: f64,
+    max_card_w: f64,
+) -> Vec<f64> {
+    let max_card_w = max_card_w.max(1.0);
     aspects[range.clone()]
         .iter()
         // 极窄屏幕下钳制单卡宽度；图片仍按 aspect-fit 完整显示，只增加留白。
         // Clamp a single card on exceptionally narrow screens; the image remains
         // fully visible via aspect-fit and merely gains letterboxing.
-        .map(|&aspect| thumb_card_w_for_aspect(card_h, aspect).min(max_inner))
+        .map(|&aspect| {
+            thumb_card_w_for_aspect(card_h, aspect)
+                .min(max_inner)
+                .min(max_card_w)
+        })
         .collect()
 }
 
@@ -982,6 +994,7 @@ pub(crate) fn plan_thumb_flow_layout(
 /// overflows, fill leading rows in MRU order so the initial viewport shows as many windows as
 /// possible. The complete row plan stays unchanged, while point-based scrolling lets cards pass
 /// smoothly through the viewport edges.
+#[cfg(test)]
 pub(crate) fn plan_thumb_scroll_layout(
     aspects: &[f64],
     max_inner: f64,
@@ -990,6 +1003,31 @@ pub(crate) fn plan_thumb_scroll_layout(
     gap: f64,
     scrollbar_w: f64,
     scroll_offset: f64,
+) -> ThumbFlowLayout {
+    plan_thumb_scroll_layout_with_max_card_w(
+        aspects,
+        max_inner,
+        max_panel_w,
+        max_panel_h,
+        gap,
+        scrollbar_w,
+        scroll_offset,
+        f64::INFINITY,
+    )
+}
+
+/// 规划连续滚动的缩略图视口,并限制单张卡片的最大宽度。
+/// Plan the continuous thumbnail viewport with an explicit per-card width cap.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_thumb_scroll_layout_with_max_card_w(
+    aspects: &[f64],
+    max_inner: f64,
+    max_panel_w: f64,
+    max_panel_h: f64,
+    gap: f64,
+    scrollbar_w: f64,
+    scroll_offset: f64,
+    max_card_w: f64,
 ) -> ThumbFlowLayout {
     let max_inner = max_inner.max(1.0);
     let scale = thumb_scale_for_count(aspects.len());
@@ -1000,7 +1038,8 @@ pub(crate) fn plan_thumb_scroll_layout(
         max_rows: thumb_max_rows(card_h, max_panel_h, gap),
         gap,
     };
-    let widths = thumb_widths(aspects, &(0..aspects.len()), card_h, max_inner);
+    let widths =
+        thumb_widths_with_max_card_w(aspects, &(0..aspects.len()), card_h, max_inner, max_card_w);
     let balanced_rows = pack_rows(&widths, max_inner, gap);
     let rows = if balanced_rows.len() > constraints.max_rows {
         pack_rows_greedy(&widths, max_inner, gap)
@@ -1514,6 +1553,34 @@ mod flow_tests {
         // Two standard cards share a row while a wide card occupies its own, so
         // the leading slice naturally drops to three items.
         assert_eq!(initial.visible, 0..3);
+    }
+
+    #[test]
+    fn scroll_layout_caps_wide_cards_to_the_reference_width() {
+        let layout = plan_thumb_scroll_layout_with_max_card_w(
+            &[1.6, 5.0, 10.0],
+            900.0,
+            1000.0,
+            1000.0,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            0.0,
+            320.0,
+        );
+
+        assert!(layout
+            .document_placements
+            .iter()
+            .all(|placement| placement.width <= 320.0));
+        assert_eq!(
+            layout
+                .document_placements
+                .iter()
+                .map(|placement| placement.width)
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap(),
+            320.0
+        );
     }
 
     #[test]

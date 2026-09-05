@@ -72,7 +72,6 @@ const SELECTION_GLOW_OPACITY: f32 = 0.35;
 const SELECTION_GLOW_RADIUS: f64 = 4.0;
 /// 设计稿选中预览描边 = rgba(...,.34),换算为 8 位 alpha。
 /// Mockup selected-preview border = rgba(...,.34), converted to 8-bit alpha.
-const SELECTED_PREVIEW_BORDER_ALPHA: u8 = 0x57;
 /// 旧版纯图标模式选中时仅图标上移的距离。
 /// Distance that only the icon moves upward in legacy icon-only mode.
 const SELECTED_CONTENT_NUDGE: f64 = 2.0;
@@ -2592,22 +2591,10 @@ pub(crate) fn refresh_highlight() {
             }
 
             // 缩略图模式:预览区自身不再单独位移，整卡根层已携带标题与预览共同上浮；
-            // 此处只切换设计稿中的选中预览描边。
+            // 预览容器保持透明且无固定描边,选中态仅由卡片外圈表达。
             // Thumbnail mode: the preview no longer moves independently because the card
-            // root now lifts the caption and preview together; only its selected border
-            // changes here.
-            if !preview.is_null() {
-                // 设计稿选中时把预览区 1px 描边切为 accent 34%;未选中恢复中性描边。
-                // The mockup switches the preview's 1px border to accent at 34% when
-                // selected; restore the neutral border otherwise.
-                let preview_layer: *mut AnyObject = msg_send![preview, layer];
-                let preview_border = if is_selected {
-                    color_with_alpha(colors.card_border_sel, SELECTED_PREVIEW_BORDER_ALPHA)
-                } else {
-                    colors.preview_border
-                };
-                layer_set_border(preview_layer, hex_to_cg_color(preview_border));
-            }
+            // root now lifts the caption and preview together; the transparent, borderless
+            // preview is represented by the card's outer selection ring only.
 
             // ⌫ 关闭按钮随选中态显隐:选中卡片显示、其余隐藏(选中即出现,
             // 不限于鼠标悬停——键盘导航选中同样可见)。
@@ -3127,7 +3114,10 @@ unsafe fn populate_thumbnail_preview(
     };
     let iv: *mut AnyObject = msg_send![class!(NSImageView), alloc];
     let iv: *mut AnyObject = msg_send![iv, initWithFrame: NSRect::new(
-        NSPoint::new((pw - cw) / 2.0, (ph - ch) / 2.0),
+        // 横向细长的窗口使用 aspect-fit 时，多余高度统一留在预览区下方，避免截图上下悬空。
+        // For wide aspect-fit windows, keep leftover height below the image instead of
+        // centering it vertically, so the thumbnail stays visually anchored at the top.
+        NSPoint::new((pw - cw) / 2.0, (ph - ch).max(0.0)),
         NSSize::new(cw, ch)
     )];
     let _: () = msg_send![iv, setImage: shown];
@@ -3299,8 +3289,8 @@ pub(crate) fn create_card_view(
             let _: () = msg_send![view, addSubview: title_label];
             release_obj(title_label);
 
-            // --- 预览区(16:10,圆角 4,1px 描边) ---
-            // --- Preview area (16:10, radius 4, 1px border) ---
+            // --- 预览区(16:10,圆角 4,透明背景) ---
+            // --- Preview area (16:10, radius 4, transparent background) ---
             let preview_frame = NSRect::new(
                 NSPoint::new(THUMB_PAD, THUMB_PAD),
                 NSSize::new(card_width - THUMB_PAD * 2.0, preview_h),
@@ -3321,17 +3311,17 @@ pub(crate) fn create_card_view(
             let _: () = msg_send![container, setWantsLayer: true];
             let cl: *mut AnyObject = msg_send![container, layer];
             // 预览区圆角 4pt:预览是缩小的窗口(约 1/8 缩放),macOS 窗口真实圆角
-            // (Tahoe 16pt / Sequoia 10pt)在此缩放下等效 ~2pt,加 1px 描边的视觉
-            // 补偿取 4pt——10pt 会显得比窗口本身圆得多(实测反馈)。
+            // (Tahoe 16pt / Sequoia 10pt)在此缩放下等效 ~2pt,取 4pt 作为裁剪半径。
             // Preview corner radius of 4pt: the preview is a shrunken window (~1/8
             // scale), where a real macOS window corner (Tahoe 16pt / Sequoia 10pt)
-            // equates to ~2pt; 4pt adds compensation for the 1px border. 10pt read
-            // far rounder than the window itself (user-reported).
+            // equates to ~2pt; use 4pt as the clipping radius.
             let _: () = msg_send![cl, setCornerRadius: 4.0f64];
             let _: () = msg_send![cl, setMasksToBounds: true];
-            let _: () = msg_send![cl, setBorderWidth: 1.0f64];
-            layer_set_border(cl, hex_to_cg_color(colors.preview_border));
-            layer_set_background(cl, hex_to_cg_color(colors.icon_inner_bg));
+            // 预览容器本身保持透明且不绘制固定边框，缩略图下方的剩余区域直接透出切换浮窗背景。
+            // Keep the preview container transparent and borderless so leftover space below a
+            // thumbnail shows the switcher's glass background directly.
+            let _: () = msg_send![cl, setBorderWidth: 0.0f64];
+            layer_set_background(cl, std::ptr::null_mut());
 
             populate_thumbnail_preview(container, w, &colors, thumbnail_capture_allowed);
 
@@ -3652,6 +3642,34 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect, f64) {
     }
 }
 
+/// 找到当前布局可用的最大化窗口卡片宽度,作为细长窗口的上限。
+/// Find the widest card represented by a currently maximized window, and use it as
+/// the cap for unusually wide window thumbnails.
+fn thumbnail_max_card_width(
+    windows: &[WindowInfo],
+    card_h: f64,
+    max_inner: f64,
+    screen_frame: NSRect,
+    screen_visible: NSRect,
+) -> f64 {
+    let fallback = thumb_card_w_for_aspect(card_h, THUMB_PREVIEW_RATIO).min(max_inner);
+    let screen_w = screen_frame.size.width.max(1.0);
+    let visible_h = screen_visible.size.height.max(1.0);
+
+    windows
+        .iter()
+        .filter_map(|window| {
+            let (_, _, width, height) = window.bounds;
+            // A maximized window should nearly fill the screen width and the usable height.
+            // This deliberately avoids treating half-screen and ordinary resized windows as
+            // the reference, even when their aspect ratio is unusually wide.
+            let maximized = width >= screen_w * 0.90 && height >= visible_h * 0.80;
+            maximized.then(|| thumb_card_w_for_aspect(card_h, width / height).min(max_inner))
+        })
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(fallback)
+}
+
 #[derive(Default)]
 struct CardReconcileStats {
     reused: usize,
@@ -3789,6 +3807,9 @@ pub(crate) fn show_overlay() {
             let max_inner = (max_panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W)
                 .min(screen_inner)
                 .max(160.0);
+            let card_h = thumb_card_h_for_scale(thumb_scale_for_count(windows.len()));
+            let max_card_w =
+                thumbnail_max_card_width(&windows, card_h, max_inner, screen_frame, screen_visible);
             let aspects: Vec<f64> = windows
                 .iter()
                 .map(|wi| {
@@ -3800,7 +3821,7 @@ pub(crate) fn show_overlay() {
                     }
                 })
                 .collect();
-            plan_thumb_scroll_layout(
+            plan_thumb_scroll_layout_with_max_card_w(
                 &aspects,
                 max_inner,
                 max_panel_w,
@@ -3808,6 +3829,7 @@ pub(crate) fn show_overlay() {
                 THUMB_ROW_GAP,
                 THUMB_SCROLLBAR_W,
                 scroll_offset,
+                max_card_w,
             )
         } else {
             plan_icon_scroll_layout(
