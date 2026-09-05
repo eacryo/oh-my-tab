@@ -2330,16 +2330,16 @@ fn apply_theme_and_locale_refresh() {
     update_status_label();
 }
 
-/// 红绿灯偏移常量:让最左侧红绿灯与下方品牌标题的首字母左边缘对齐。
-/// 窗口坐标 y 向上,上移 = y 增大。
-/// Traffic-light offset: align the left edge of the first button with the first letter of the
-/// brand title below. Window coordinates point up, so upward = y+.
+/// 红绿灯偏移常量:恢复原来的右下偏移位置。
+/// 窗口坐标 y 向上,右下 = x 增大 / y 减小。
+/// Traffic-light offset: restore the original down-right position.
+/// Window coordinates point up, so down-right = x+ / y-.
 const TRAFFIC_LIGHT_DX: f64 = 8.0;
-const TRAFFIC_LIGHT_DY: f64 = 4.0;
+const TRAFFIC_LIGHT_DY: f64 = -6.0;
 static TRAFFIC_LIGHT_BASE_ORIGINS: LazyLock<Mutex<HashMap<usize, [Option<NSPoint>; 3]>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 把三个红绿灯按钮往左上偏移:通过公开 API standardWindowButton: 拿到按钮视图直接改 frame
+/// 把三个红绿灯按钮往右下偏移:通过公开 API standardWindowButton: 拿到按钮视图直接改 frame
 /// (没有公开 API 直接设红绿灯位置,旧私有 API setTrafficLightPosition: 等在 macOS 26 已移除,
 /// 实测这是唯一可靠的做法)。
 /// 注意:两参的 +standardWindowButton:forStyleMask: 是类方法,发给实例会被 objc2 的方法
@@ -2349,7 +2349,7 @@ static TRAFFIC_LIGHT_BASE_ORIGINS: LazyLock<Mutex<HashMap<usize, [Option<NSPoint
 /// 首次布局时记录系统原始坐标,后续始终从原始坐标计算,避免重复 show/resize 时累积偏移。
 /// 按钮为 nil 时静默跳过,旧版 macOS 同样适用。
 ///
-/// Nudge the three traffic-light buttons up-left: grab the button views via the public
+/// Nudge the three traffic-light buttons down-right: grab the button views via the public
 /// -standardWindowButton: and move their frames (no public API sets the traffic light position;
 /// the old private setTrafficLightPosition: etc. are gone on macOS 26, and this is the only
 /// reliable way -- verified on this machine). Note: the two-arg +standardWindowButton:forStyleMask:
