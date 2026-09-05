@@ -756,12 +756,13 @@ impl RestoreDefaultsControl {
     /// Page variant: a "Restore Page Defaults" control embedded at the end of one page's
     /// scrolling document (no separator).
     ///
-    /// `(x, y_bottom)` 是控件收起态容器在文档坐标系中的左下角(y 向上),`width` 为控件
-    /// 全宽(与卡片同宽)。展开卡片向上生长,盖在页面内容之上(控件是文档的最后子视图)。
-    /// `(x, y_bottom)` is the collapsed container's bottom-left corner in the document's
-    /// coordinate space (y up); `width` is the control's full width (matching the cards). The
-    /// expanded card grows upward, drawing over page content (the control is the document's
-    /// last subview).
+    /// `(x, y_bottom)` 是可用区域左下角在文档坐标系中的位置(y 向上),`width` 为可用区域
+    /// 宽度。按钮及其展开容器固定贴在该区域右侧；展开卡片向上生长,盖在页面内容之上
+    /// (控件是文档的最后子视图)。
+    /// `(x, y_bottom)` is the available area's bottom-left corner in document coordinates (y up),
+    /// and `width` is its available width. The button and its expanding container are pinned to
+    /// the area's trailing edge; the expanded card grows upward over the page content (the
+    /// control is the document's last subview).
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn build_for_page(
         parent: *mut AnyObject,
@@ -771,9 +772,12 @@ impl RestoreDefaultsControl {
         width: f64,
     ) -> Self {
         let row_h = 30.0;
+        let button_w = width.clamp(1.0, 180.0);
+        let horizontal_inset = 8.0;
+        let container_w = button_w + horizontal_inset * 2.0;
         let container_frame = NSRect::new(
-            NSPoint::new(x, y_bottom),
-            objc2_foundation::NSSize::new(width, 42.0),
+            NSPoint::new(x + width - container_w, y_bottom),
+            objc2_foundation::NSSize::new(container_w, 42.0),
         );
         let container: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         // initWithFrame: 返回对象本身;objc2 在 debug 下校验返回类型编码,必须绑定返回值。
@@ -793,12 +797,13 @@ impl RestoreDefaultsControl {
             let _: () = objc2::msg_send![container_layer, setCornerRadius: 14.0f64];
         }
 
-        // 触发按钮全宽(与卡片同宽,左右各留 8pt 内边距)。
-        // The trigger is full width (matching the cards, with 8pt side insets).
+        // 触发按钮保持紧凑尺寸并贴在页面内容右下角；展开时确认/取消按钮复用该宽度。
+        // Keep the trigger compact and pinned to the page content's bottom-right; the expanded
+        // confirm/cancel rows reuse the same width.
         let trigger = SettingsButton::action(
             NSRect::new(
-                NSPoint::new(8.0, 6.0),
-                objc2_foundation::NSSize::new(width - 16.0, row_h),
+                NSPoint::new(horizontal_inset, 6.0),
+                objc2_foundation::NSSize::new(button_w, row_h),
             ),
             &t("settings.btn_restore_page_defaults"),
             target,
@@ -813,8 +818,11 @@ impl RestoreDefaultsControl {
         // Collapsed shell stays hidden (same double-ring reason as the sidebar variant).
         let surface: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         let surface: *mut AnyObject = objc2::msg_send![surface, initWithFrame: NSRect::new(
-            NSPoint::new(x + 8.0, y_bottom + 6.0),
-            objc2_foundation::NSSize::new(width - 16.0, row_h),
+            NSPoint::new(
+                container_frame.origin.x + horizontal_inset,
+                y_bottom + 6.0,
+            ),
+            objc2_foundation::NSSize::new(button_w, row_h),
         )];
         let _: () = objc2::msg_send![surface, setHidden: true];
         let _: () = objc2::msg_send![surface, setAlphaValue: 0.0f64];
@@ -844,8 +852,8 @@ impl RestoreDefaultsControl {
 
         let confirm = SettingsButton::action(
             NSRect::new(
-                NSPoint::new(8.0, 54.0),
-                objc2_foundation::NSSize::new(width - 16.0, row_h),
+                NSPoint::new(horizontal_inset, 54.0),
+                objc2_foundation::NSSize::new(button_w, row_h),
             ),
             &t("settings.btn_confirm"),
             target,
@@ -858,8 +866,8 @@ impl RestoreDefaultsControl {
 
         let cancel = SettingsButton::action(
             NSRect::new(
-                NSPoint::new(8.0, 6.0),
-                objc2_foundation::NSSize::new(width - 16.0, row_h),
+                NSPoint::new(horizontal_inset, 6.0),
+                objc2_foundation::NSSize::new(button_w, row_h),
             ),
             &t("settings.btn_cancel"),
             target,
