@@ -2425,16 +2425,55 @@ unsafe fn center_settings_window(window: *mut AnyObject) {
 }
 
 fn show_settings() {
-    show_settings_inner(None, 0);
+    show_settings_inner(None, 0, None);
 }
 
 /// Show the settings window, optionally preserving its frame and selected page.
 /// 显示设置窗口,可选地保留窗口位置和当前页。
-fn show_settings_preserving(frame: NSRect, page: usize) {
-    show_settings_inner(Some(frame), page);
+fn show_settings_preserving(frame: NSRect, page: usize, scroll_offsets: [NSPoint; 7]) {
+    show_settings_inner(Some(frame), page, Some(scroll_offsets));
 }
 
-fn show_settings_inner(preserved_frame: Option<NSRect>, page: usize) {
+unsafe fn capture_settings_scroll_offsets(ui: &SettingsUi) -> [NSPoint; 7] {
+    let scrolls = [
+        ui.general_view,
+        ui.switcher_view,
+        ui.mouse_view,
+        ui.clipboard_view,
+        ui.window_control_view,
+        ui.quick_actions_view,
+        ui.about_view,
+    ];
+    scrolls.map(|scroll| {
+        let clip: *mut AnyObject = msg_send![scroll, contentView];
+        let bounds: NSRect = msg_send![clip, bounds];
+        bounds.origin
+    })
+}
+
+unsafe fn restore_settings_scroll_offset(scroll: *mut AnyObject, origin: NSPoint) {
+    if scroll.is_null() {
+        return;
+    }
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let document: *mut AnyObject = msg_send![scroll, documentView];
+    if clip.is_null() || document.is_null() {
+        return;
+    }
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    let document_frame: NSRect = msg_send![document, frame];
+    let max_x = (document_frame.size.width - clip_bounds.size.width).max(0.0);
+    let max_y = (document_frame.size.height - clip_bounds.size.height).max(0.0);
+    let target = NSPoint::new(origin.x.clamp(0.0, max_x), origin.y.clamp(0.0, max_y));
+    let _: () = msg_send![clip, scrollToPoint: target];
+    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+}
+
+fn show_settings_inner(
+    preserved_frame: Option<NSRect>,
+    page: usize,
+    preserved_scroll_offsets: Option<[NSPoint; 7]>,
+) {
     unsafe {
         {
             let ui = SETTINGS_UI.lock().unwrap();
@@ -2477,9 +2516,24 @@ fn show_settings_inner(preserved_frame: Option<NSRect>, page: usize) {
             // resets them.
             let _: () = msg_send![u.window, layoutIfNeeded];
             reposition_traffic_lights(u.window);
-            // Scroll the visible page (General on open) to the top after layout, so the scrollbar
-            // starts at the top of the track instead of the middle.
-            scroll_page_to_top(u.general_view);
+            if let Some(offsets) = preserved_scroll_offsets {
+                let scrolls = [
+                    u.general_view,
+                    u.switcher_view,
+                    u.mouse_view,
+                    u.clipboard_view,
+                    u.window_control_view,
+                    u.quick_actions_view,
+                    u.about_view,
+                ];
+                for (scroll, origin) in scrolls.into_iter().zip(offsets) {
+                    restore_settings_scroll_offset(scroll, origin);
+                }
+            } else {
+                // Scroll the visible page (General on open) to the top after layout, so the
+                // scrollbar starts at the top of the track instead of the middle.
+                scroll_page_to_top(u.general_view);
+            }
             // 清掉默认 first responder,避免打开时焦点落在 Glass color 控件。
             // Clear the default first responder so focus does not land on the Glass color control on open.
             let _: bool = msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
@@ -2554,10 +2608,16 @@ pub(crate) fn refresh_system_appearance() {
         return;
     }
 
-    let (page, frame) = {
+    let (page, frame, scroll_offsets) = {
         let page = SIDEBAR_SELECTED.load(Ordering::SeqCst);
         let frame: NSRect = unsafe { msg_send![old_window, frame] };
-        (page, frame)
+        let scroll_offsets = SETTINGS_UI
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|ui| unsafe { capture_settings_scroll_offsets(ui) })
+            .unwrap_or([NSPoint::new(0.0, 0.0); 7]);
+        (page, frame, scroll_offsets)
     };
 
     let old_ui = SETTINGS_UI.lock().unwrap().take();
@@ -2572,9 +2632,9 @@ pub(crate) fn refresh_system_appearance() {
         // 解除回调和运行时注册表后,在同一个可见 NSWindow 内重绘内容层级;窗口不隐藏、不换对象、
         // 也不改变焦点。
         widgets::clear_sidebar_hover();
-        detach_settings_window_runtime(&old_ui);
+        detach_settings_window_runtime(&old_ui, false);
         rebuild_settings_content(old_ui.window);
-        show_settings_preserving(frame, page);
+        show_settings_preserving(frame, page, scroll_offsets);
     }
 }
 
@@ -5553,13 +5613,18 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 }
 
 /// Detach global references owned by a settings window before it is released or replaced.
-/// 在释放或替换设置窗口前,解除由该窗口持有的全局引用。
-unsafe fn detach_settings_window_runtime(ui: &SettingsUi) {
+/// Keep the traffic-light baseline for in-place redraws; remove it only when the window is
+/// actually released.
+/// 在释放或替换设置窗口前,解除由该窗口持有的全局引用。原位重绘时保留红绿灯基准,
+/// 只有窗口真正释放时才移除。
+unsafe fn detach_settings_window_runtime(ui: &SettingsUi, remove_traffic_light_origin: bool) {
     close_glass_tint_panel(ui.glass_tint);
-    TRAFFIC_LIGHT_BASE_ORIGINS
-        .lock()
-        .unwrap()
-        .remove(&(ui.window as usize));
+    if remove_traffic_light_origin {
+        TRAFFIC_LIGHT_BASE_ORIGINS
+            .lock()
+            .unwrap()
+            .remove(&(ui.window as usize));
+    }
     // 先让 update 模块解除对宿主视图的引用,再释放窗口,避免它写入已释放视图。
     // Detach the updater's host references before releasing the window so it never touches
     // a deallocated view.
@@ -5579,7 +5644,7 @@ pub(crate) fn invalidate_settings_window() {
     let ui = SETTINGS_UI.lock().unwrap().take();
     if let Some(u) = ui {
         unsafe {
-            detach_settings_window_runtime(&u);
+            detach_settings_window_runtime(&u, true);
             // 窗口 alloc 是 +1且 setReleasedWhenClosed:false,需手动 release 一次;
             // 其子控件已由父视图持有,随窗口 dealloc 释放。
             // The window is alloc +1 with setReleasedWhenClosed:false, so release once manually;
