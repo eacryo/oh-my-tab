@@ -39,7 +39,7 @@ type RequestNotificationsFn =
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WindowServerEvent {
-    Created(u32),
+    Created,
     Destroyed(u32),
     Focused(u32),
 }
@@ -61,6 +61,7 @@ struct OwnFocusIntent {
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 static DELIVERY_SCHEDULED: AtomicBool = AtomicBool::new(false);
+static SUBSCRIPTION_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 static EVENT_TX: OnceLock<flume::Sender<WindowServerEvent>> = OnceLock::new();
 static MAIN_EVENTS: LazyLock<Mutex<VecDeque<WindowServerEvent>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
@@ -122,7 +123,7 @@ unsafe extern "C" fn window_server_callback(
         return;
     };
     let event = match event {
-        WINDOW_CREATED => WindowServerEvent::Created(window_id),
+        WINDOW_CREATED => WindowServerEvent::Created,
         WINDOW_DESTROYED => WindowServerEvent::Destroyed(window_id),
         WINDOW_FOCUSED => WindowServerEvent::Focused(window_id),
         _ => return,
@@ -329,11 +330,15 @@ pub(crate) fn update_subscriptions(subscriptions: &[(u32, i32)]) {
     };
     let result = unsafe { request(connection, window_ptr, window_count) };
     if result != 0 {
-        log_info!(
-            "WindowServer lifecycle subscription update failed: windows={} status={}",
-            ids.len(),
-            result
-        );
+        if !SUBSCRIPTION_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+            log_info!(
+                "WindowServer lifecycle subscription update failed: windows={} status={}",
+                ids.len(),
+                result
+            );
+        }
+    } else {
+        SUBSCRIPTION_FAILURE_LOGGED.store(false, Ordering::Relaxed);
     }
 }
 

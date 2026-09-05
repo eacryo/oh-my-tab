@@ -229,7 +229,7 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
         // Re-check the stop flag after storing the RunLoop to close the store-vs-run race.
         *runloop_static().lock().unwrap() = Some(rl);
         if !STOP_REQUESTED.load(Ordering::Relaxed) {
-            log_info!("Quick actions event tap started.");
+            log_debug!("Quick actions event tap started.");
             event_tap::CFRunLoopRun();
         }
         *runloop_static().lock().unwrap() = None;

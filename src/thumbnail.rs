@@ -36,7 +36,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -46,8 +46,8 @@ use crate::ffi::{
     CGContextDrawImage, CGImageGetHeight, CGImageGetWidth, CGPreflightScreenCaptureAccess, CGRect,
     CGRequestScreenCaptureAccess,
 };
-use crate::log_debug;
 use crate::skylight;
+use crate::{log_debug, log_info};
 
 mod pregen;
 pub(crate) use pregen::{app_launched, app_terminated, start};
@@ -117,11 +117,26 @@ const BITMAP_PREMULTIPLIED_LAST: u32 = 1;
 // ========== 屏幕录制权限(TCC) ==========
 
 static PERMISSION_PROMPTED: AtomicBool = AtomicBool::new(false);
+static LAST_CAPTURE_PERMISSION: AtomicU8 = AtomicU8::new(0);
+
+fn report_capture_permission(allowed: bool) {
+    let state = if allowed { 2 } else { 1 };
+    if LAST_CAPTURE_PERMISSION.swap(state, Ordering::Relaxed) == state {
+        return;
+    }
+    if allowed {
+        log_info!("[thumb] Screen Recording permission available; thumbnail capture enabled");
+    } else {
+        log_info!("[thumb] Screen Recording permission unavailable; using icon-only presentation");
+    }
+}
 
 /// 是否已授予屏幕录制权限(preflight,廉价可反复调用)。
 /// Whether Screen Recording is granted (cheap preflight, safe to call often).
 pub(crate) fn capture_allowed() -> bool {
-    unsafe { CGPreflightScreenCaptureAccess() }
+    let allowed = unsafe { CGPreflightScreenCaptureAccess() };
+    report_capture_permission(allowed);
+    allowed
 }
 
 /// 未授权时的主动申请:每次启动至多弹一次系统授权框,之后静默休眠。

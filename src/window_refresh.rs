@@ -16,7 +16,6 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
-use std::time::Instant;
 
 use crate::ffi::frontmost_app_info;
 use crate::overlay;
@@ -84,8 +83,6 @@ static WINDOW_REFRESH_PENDING_FOCUS: LazyLock<Mutex<Option<(i32, u32)>>> =
     LazyLock::new(|| Mutex::new(None));
 static WINDOW_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static WINDOW_REFRESH_RESULT: LazyLock<Mutex<Option<WindowRefreshResult>>> =
-    LazyLock::new(|| Mutex::new(None));
-static WINDOW_REFRESH_REQUESTED_AT: LazyLock<Mutex<Option<(u64, Instant)>>> =
     LazyLock::new(|| Mutex::new(None));
 
 /// 请求一次有界的后台窗口快照；同一时间只允许一个任务，避免快捷键连按制造线程风暴。
@@ -180,7 +177,6 @@ fn select_summon_focus_key(
 }
 
 fn start_window_refresh(request: WindowRefreshRequest) {
-    let requested_at = Instant::now();
     let (generation, mru) = {
         let state_opt = TAB_STATE.lock().unwrap();
         let Some(state) = state_opt.as_ref() else {
@@ -192,8 +188,6 @@ fn start_window_refresh(request: WindowRefreshRequest) {
             state.mru.clone(),
         )
     };
-    *WINDOW_REFRESH_REQUESTED_AT.lock().unwrap() = Some((generation, requested_at));
-
     // 浮窗已显示后,summon-bump 不再把前台窗口写回 MRU:否则每次刷新都会把前台窗口顶到第 0 位、
     // 造成已显示的列表重排(跳变)。首帧待显示(visible=false)仍允许 bump 一次,保证首位是真实前台。
     // Once the overlay is shown, summon-bump must NOT rewrite the frontmost window into MRU:
@@ -215,7 +209,6 @@ fn start_window_refresh(request: WindowRefreshRequest) {
                 WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle)
                 | WindowRefreshRequest::Focused { .. } => performance::ThreadQos::Utility,
             });
-            let started = std::time::Instant::now();
             let mut mru = mru;
             let (windows, replace_pid, active_key, summon_focus_key) = match request {
                 WindowRefreshRequest::Full(reason) => {
@@ -270,12 +263,6 @@ fn start_window_refresh(request: WindowRefreshRequest) {
                 active_key,
                 summon_focus_key,
             });
-            log_debug!(
-                "[windows] background refresh ready generation={} elapsed={}ms",
-                generation,
-                started.elapsed().as_millis()
-            );
-
             let controller = CONTROLLER.lock().unwrap().map(|ptr| ptr.0);
             if let Some(controller) = controller {
                 unsafe {
@@ -423,12 +410,7 @@ fn apply_window_refresh() {
         }
         return;
     };
-    let generation = result.generation;
     if result.generation != WINDOW_REFRESH_GENERATION.load(Ordering::Acquire) {
-        WINDOW_REFRESH_REQUESTED_AT
-            .lock()
-            .unwrap()
-            .take_if(|(pending_generation, _)| *pending_generation == generation);
         WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
         if let Some(pending_request) = take_pending_refresh_request() {
             request_window_refresh_request(pending_request);
@@ -437,11 +419,6 @@ fn apply_window_refresh() {
     }
 
     let summon_focus_key = result.summon_focus_key;
-    let request_to_apply_ms = WINDOW_REFRESH_REQUESTED_AT
-        .lock()
-        .unwrap()
-        .take_if(|(pending_generation, _)| *pending_generation == generation)
-        .map(|(_, started)| started.elapsed().as_millis());
     let subscriptions = window_server_candidates();
 
     let (was_visible, set_changed) = {
@@ -513,7 +490,6 @@ fn apply_window_refresh() {
             state.selected,
             &windows,
         );
-        let changed = state.windows != windows;
         // 集合级变化(窗口增删):只有这个才需要整树重建浮窗。仅排序变化(MRU 被前台 bump 改写、
         // 表面切换)只更新数据,不重建列表——否则用户看到「打开了还在跳」。定向刷新(replace_pid)
         // 替换了目标 PID 的卡片,也视为集合变化。
@@ -521,35 +497,15 @@ fn apply_window_refresh() {
         // reorder (MRU bumped by the frontmost, surface flip) only updates data without rebuilding
         // the list — otherwise the overlay "keeps jumping after it opened". A directed refresh
         // (replace_pid) swapping a PID's cards also counts as a set change.
-        // 浮窗显示期间发生排序/集合变化:打印变更前后的完整窗口序与选中位置,便于排查
-        // 「窗口排序在浮窗显示后被刷新改动」类问题(如 Ghostty tab 表面切换导致的跳变)。
-        // Overlay visible and the ordering/set changed: log the full window order and selection
-        // before and after, so a "reorder-after-show" drift (e.g. a Ghostty tab-surface flip) is
-        // visible in the log.
-        if changed && was_visible {
-            log_window_ordering("refresh before", &state.windows, &mru, state.selected);
-        }
         state.windows = windows;
         state.selected = selected;
         state.mru = mru;
         if state.windows.is_empty() {
             state.visible = false;
         }
-        if changed && was_visible {
-            log_window_ordering("refresh after", &state.windows, &state.mru, state.selected);
-        }
         (was_visible, set_changed)
     };
     WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-    if let Some(request_to_apply_ms) = request_to_apply_ms {
-        log_debug!(
-            "[perf] window refresh commit generation={} request_to_apply_ms={} visible={} set_changed={}",
-            generation,
-            request_to_apply_ms,
-            was_visible,
-            set_changed
-        );
-    }
     let pending_request = take_pending_refresh_request();
 
     // 首帧快照就绪:消费 pending_first_show,一次性显示(一次成图)。此时窗口列表已是刷新后的
@@ -626,12 +582,8 @@ pub(crate) extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _
         return;
     }
     let should_refresh = events.iter().any(|event| match event {
-        window_server::WindowServerEvent::Created(window_id) => {
-            log_debug!("[windows] WindowServer created cgwid={}", window_id);
-            true
-        }
+        window_server::WindowServerEvent::Created => true,
         window_server::WindowServerEvent::Destroyed(window_id) => {
-            log_debug!("[windows] WindowServer destroyed cgwid={}", window_id);
             forget_non_normal_window(*window_id);
             true
         }
@@ -714,42 +666,6 @@ pub(crate) fn best_effort_bump_focus_key(state: &mut AppState, pid: i32, cgwid: 
         .any(|window| window.pid == pid && window.window_id == cgwid);
     if shown {
         state.focus_key = Some((pid, cgwid));
-    }
-}
-
-/// 诊断:打印当前窗口排序 + 选中标记。`>` = 当前选中项,`*` = active(前台代理)项。
-/// 排序列与 select 位置同时可见,便于定位「Command+Tab 一次却漂移一格」类问题。
-/// Diagnostic: print the window ordering plus the selection marker. `>` = the currently
-/// selected entry, `*` = the active (frontmost proxy) entry. Order and selection position are
-/// both visible, which makes a one-press-Tab-drifts-a-slot bug easy to pinpoint.
-pub(crate) fn log_window_ordering(
-    label: &str,
-    windows: &[WindowInfo],
-    mru: &MruMap,
-    selected: usize,
-) {
-    log_debug!(
-        "[order] {}: {} windows (selected={})",
-        label,
-        windows.len(),
-        selected
-    );
-    for (i, w) in windows.iter().enumerate() {
-        let mru_ms = mru
-            .get(&(w.pid, w.window_id))
-            .map(|t| t.elapsed().as_millis());
-        let selected_mark = if i == selected { ">" } else { " " };
-        let active_mark = if w.is_active { "*" } else { " " };
-        log_debug!(
-            "  {}{} pid={} app=\"{}\" cgwid={} title=\"{}\" mru_ms={:?}",
-            selected_mark,
-            active_mark,
-            w.pid,
-            w.app_name,
-            w.window_id,
-            w.window_title,
-            mru_ms
-        );
     }
 }
 

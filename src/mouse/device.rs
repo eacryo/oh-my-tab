@@ -319,7 +319,7 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
 
     let services = IOHIDEventSystemClientCopyServices(reg.client);
     if services.is_null() {
-        log_info!("[device] no services returned");
+        log_debug!("[device] no services returned");
         reg.devices.clear();
         return;
     }
@@ -777,7 +777,7 @@ pub(crate) unsafe fn start_plug_monitor(runloop: crate::event_tap::CFRunLoopRef)
         crate::event_tap::kCFRunLoopDefaultMode,
     );
     *m = manager_obj;
-    log_info!("[device] plug/unplug monitor started.");
+    log_debug!("[device] plug/unplug monitor started.");
 }
 
 // ========== 归因 / attribution ==========

@@ -157,7 +157,7 @@ unsafe fn disable() {
 
     let services = IOHIDEventSystemClientCopyServices(client);
     if services.is_null() {
-        log_info!("[pointer] no services returned by IOHIDEventSystemClient");
+        log_debug!("[pointer] no services returned by IOHIDEventSystemClient");
         CFRelease(client as *const c_void);
         return;
     }

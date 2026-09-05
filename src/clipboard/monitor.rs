@@ -97,12 +97,10 @@ pub(super) fn poll_clipboard() {
             };
             if let Some(img) = &file_img {
                 if record_image(&mut hist, img, &source, &source_key, max_entries()) {
-                    // 文件复制 = 纯引用:日志只打来源路径 + UTI,绝不读文件内容。
-                    // A file copy is a pure reference: the log carries the source path + UTI
-                    // only, never the file's content.
+                    // 文件复制只记录类型和计数,不记录来源路径或文件内容。
+                    // File copies log only their type and count, never the source path or content.
                     log_debug!(
-                        "[clip] recorded file ref ({}, uti={}, total {})",
-                        img.source_path.as_deref().unwrap_or(""),
+                        "[clip] recorded file ref (uti={}, total {})",
                         img.uti,
                         hist.len()
                     );

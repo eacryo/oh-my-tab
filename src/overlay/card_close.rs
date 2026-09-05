@@ -54,6 +54,10 @@ pub(super) unsafe fn animate_card_close_reflow(
             let _: () = msg_send![animator, setFrame: *final_frame];
         }
     }
+    if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
+        let animator: *mut AnyObject = msg_send![window.0, animator];
+        let _: () = msg_send![animator, setFrame: pending.final_panel_frame, display: true];
+    }
     let _: () = msg_send![class!(NSAnimationContext), endGrouping];
 }
 
@@ -151,16 +155,14 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
                 (key, frame)
             })
             .collect();
-        let panel_w = unsafe {
+        let panel_frame = unsafe {
             OVERLAY_WINDOW
                 .lock()
                 .unwrap()
-                .map(|window| {
-                    let frame: NSRect = msg_send![window.0, frame];
-                    frame.size.width
-                })
-                .unwrap_or(1.0)
+                .map(|window| msg_send![window.0, frame])
+                .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)))
         };
+        let panel_w = panel_frame.size.width;
         let overflowed = THUMB_ROW_RANGES
             .lock()
             .unwrap()
@@ -192,15 +194,11 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             widths.push(frame.size.width);
         }
         let document_h = (*THUMB_DOCUMENT_HEIGHT.lock().unwrap()).max(1.0);
-        let (placements, final_row_ranges) = plan_thumb_close_reflow(
-            &widths,
-            card_h,
-            card_area_w,
-            max_inner,
-            gap,
-            document_h,
-            overflowed,
-        );
+        let max_rows = (*THUMB_MAX_ROWS.lock().unwrap()).max(1);
+        let (placements, final_row_ranges, final_panel_w, final_overflowed) =
+            plan_thumb_close_reflow(
+                &widths, card_h, max_inner, gap, document_h, overflowed, max_rows,
+            );
         let viewport_h = unsafe {
             CONTAINER
                 .lock()
@@ -226,6 +224,13 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
                 ))
             })
             .collect();
+        let final_panel_frame = NSRect::new(
+            NSPoint::new(
+                panel_frame.origin.x + (panel_frame.size.width - final_panel_w) / 2.0,
+                panel_frame.origin.y,
+            ),
+            NSSize::new(final_panel_w, panel_frame.size.height),
+        );
         (
             PendingCardClose {
                 pid: window.pid,
@@ -235,6 +240,8 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
                 original_frames,
                 final_frames,
                 final_row_ranges,
+                final_panel_frame,
+                final_overflowed,
                 original_document_h: document_h,
                 final_document_h,
             },
@@ -418,6 +425,19 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
         );
 
     unsafe {
+        if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
+            let _: () = msg_send![window.0, setFrame: pending.final_panel_frame, display: false];
+        }
+        if let Some(container) = *CONTAINER.lock().unwrap() {
+            let frame: NSRect = msg_send![container.0, frame];
+            let _: () = msg_send![
+                container.0,
+                setFrame: NSRect::new(
+                    frame.origin,
+                    NSSize::new(pending.final_panel_frame.size.width, frame.size.height)
+                )
+            ];
+        }
         if let Some(closing_card) = views.get(&key).copied() {
             remove_card_index(closing_card);
             let _: () = msg_send![closing_card, removeFromSuperview];
@@ -442,7 +462,7 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
                 document,
                 setFrame: NSRect::new(
                     frame.origin,
-                    NSSize::new(frame.size.width, document_h)
+                    NSSize::new(pending.final_panel_frame.size.width, document_h)
                 )
             ];
         }
@@ -462,9 +482,9 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
         return;
     }
 
-    // 关闭动画期间保持面板几何不变;提交时原子同步 document 和滚动元数据,避免跳变。
-    // Keep panel geometry fixed during the transition; atomically sync the document and scroll
-    // metadata at commit so the content cannot jump independently of the scrollbar.
+    // 关闭动画期间同步缩放面板;提交时原子同步 document 和滚动元数据,避免跳变。
+    // Animate the panel resize together with the close transition; atomically sync the document
+    // and scroll metadata at commit so the content cannot jump independently of the scrollbar.
     let max_rows = (*THUMB_MAX_ROWS.lock().unwrap()).max(1);
     let row_count = pending.final_row_ranges.len();
     *THUMB_ROW_RANGES.lock().unwrap() = Some(pending.final_row_ranges);
@@ -482,7 +502,7 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
             update_thumbnail_scroller(
                 frame.size.width,
                 frame.size.height,
-                row_count > max_rows,
+                pending.final_overflowed,
                 row_count,
                 max_rows,
             );

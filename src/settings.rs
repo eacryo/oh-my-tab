@@ -724,7 +724,7 @@ fn log_config_changes(old: &Config, new: &Config) {
             let old_value = &$old;
             let new_value = &$new;
             if old_value != new_value {
-                log_info!(
+                log_debug!(
                     "[settings] config changed: {}: {:?} -> {:?}",
                     $name,
                     old_value,

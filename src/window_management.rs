@@ -660,7 +660,7 @@ unsafe fn execute(plan: Plan, win: AXUIElementRef, dir: Direction) {
                 // 系统级最大化,避免出现“窗口只移到顶端、底部没铺满”的半成功状态。
                 // Some apps accept AXPosition but reject AXSize; the native zoom button can
                 // still perform the system-level maximize and avoids a position-only result.
-                log_info!("[winctl] exact maximize frame rejected; trying native zoom fallback");
+                log_debug!("[winctl] exact maximize frame rejected; trying native zoom fallback");
                 let zoom_err = press_native_zoom(win);
                 if zoom_err != K_AX_SUCCESS {
                     log_info!("[winctl] native zoom fallback failed: {}", zoom_err);
@@ -812,10 +812,10 @@ unsafe fn set_frame(win: AXUIElementRef, r: AxRect) -> bool {
         }
     }
     if size_err != K_AX_SUCCESS {
-        log_info!("[winctl] set AXSize failed: {} target={:?}", size_err, r);
+        log_debug!("[winctl] set AXSize failed: {} target={:?}", size_err, r);
     }
     if pos_err != K_AX_SUCCESS {
-        log_info!("[winctl] set AXPosition failed: {} target={:?}", pos_err, r);
+        log_debug!("[winctl] set AXPosition failed: {} target={:?}", pos_err, r);
     }
     let Some(actual) = read_frame(win) else {
         log_info!(
@@ -848,7 +848,7 @@ unsafe fn set_minimized(win: AXUIElementRef, minimized: bool) {
     };
     let err = AXUIElementSetAttributeValue(win, key, value);
     if err != K_AX_SUCCESS {
-        log_debug!("[winctl] set AXMinimized failed: {}", err);
+        log_info!("[winctl] set AXMinimized failed: {}", err);
     }
     CFRelease(key);
 }
@@ -1051,7 +1051,7 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
         // Re-check the stop flag after storing the RunLoop to close the store-vs-run race.
         *runloop_static().lock().unwrap() = Some(rl);
         if !STOP_REQUESTED.load(Ordering::Relaxed) {
-            log_info!("Window control event tap started.");
+            log_debug!("Window control event tap started.");
             event_tap::CFRunLoopRun();
         }
         *runloop_static().lock().unwrap() = None;

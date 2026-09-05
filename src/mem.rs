@@ -10,7 +10,7 @@
 use crate::clipboard;
 use crate::ffi::{task_vm_info, TaskVmInfo};
 use crate::thumbnail;
-use crate::{log_info, CONFIG, TAB_STATE};
+use crate::{log_debug, log_info, CONFIG, TAB_STATE};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -147,7 +147,7 @@ fn runtime_profile() -> String {
 /// this tick; the loop continues.
 fn sample_once(started_at: Instant) {
     let Some(vm) = task_vm_info() else {
-        log_info!("[mem] sample skipped: task_vm_info unavailable");
+        log_debug!("[mem] sample skipped: task_vm_info unavailable");
         return;
     };
     let peak = track_peak(&vm);

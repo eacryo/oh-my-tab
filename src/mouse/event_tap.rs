@@ -19,11 +19,11 @@ use crate::event_tap::{
     K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
     K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, K_CG_SESSION_EVENT_TAP, SYNTHETIC_MARKER,
 };
-use crate::log_info;
 use crate::mouse::device;
 use crate::mouse::keysim;
 use crate::mouse::resolve;
 use crate::mouse::scrolling::compute_delta;
+use crate::{log_debug, log_info};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -299,7 +299,7 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         // CFRunLoopStop works, or reads None and the thread's check catches it).
         *runloop_static().lock().unwrap() = Some(rl);
         if !STOP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-            log_info!("Mouse event tap started.");
+            log_debug!("Mouse event tap started.");
             // 阻塞运行 RunLoop,直到 stop() 触发 CFRunLoopStop 或线程被终止。
             // Block on the RunLoop until stop() fires CFRunLoopStop or the thread is killed.
             event_tap::CFRunLoopRun();

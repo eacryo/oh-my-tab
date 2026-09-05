@@ -174,11 +174,7 @@ pub(super) fn save_history() {
         log_info!("Clipboard history save failed: write error.");
         return;
     }
-    log_debug!(
-        "[clip] history saved ({} entries, {})",
-        entries.len(),
-        path.display()
-    );
+    log_debug!("[clip] history saved ({} entries)", entries.len());
 }
 
 /// 从磁盘加载历史并**合并**进当前内存(去重规则复用;置顶条目进置顶区,其余按

@@ -2,6 +2,7 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,16 @@ use crate::hash::fnv1a64_hex;
 use crate::icon_cache::check_cache_for_identity;
 use crate::skylight;
 use crate::{log_debug, log_info};
+
+static SLPS_GET_PROCESS_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
+static SLPS_SET_FRONT_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
+static SLPS_POST_EVENT_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn log_missing_slps_symbol(logged: &AtomicBool, message: &str) {
+    if !logged.swap(true, Ordering::Relaxed) {
+        log_info!("{}", message);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowInfo {
@@ -475,14 +486,20 @@ unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
     let get_psn = match *GET_PROCESS_FOR_PID {
         Some(f) => f,
         None => {
-            log_info!("[raise] SLPS unavailable: GetProcessForPID symbol missing");
+            log_missing_slps_symbol(
+                &SLPS_GET_PROCESS_MISSING_LOGGED,
+                "[raise] SLPS unavailable: GetProcessForPID symbol missing",
+            );
             return false;
         }
     };
     let set_front = match *SLP_SET_FRONT {
         Some(f) => f,
         None => {
-            log_info!("[raise] SLPS unavailable: _SLPSSetFrontProcessWithOptions symbol missing");
+            log_missing_slps_symbol(
+                &SLPS_SET_FRONT_MISSING_LOGGED,
+                "[raise] SLPS unavailable: _SLPSSetFrontProcessWithOptions symbol missing",
+            );
             return false;
         }
     };
@@ -492,7 +509,7 @@ unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
     };
     let psn_status = get_psn(pid, &mut psn);
     if psn_status != 0 {
-        log_info!(
+        log_debug!(
             "[raise] SLPS failed: GetProcessForPID pid={} status={}",
             pid,
             psn_status
@@ -501,7 +518,7 @@ unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
     }
     let status = set_front(&mut psn, wid, 0x200); // kCPSUserGenerated; CGError success == 0
     if status != 0 {
-        log_info!(
+        log_debug!(
             "[raise] SLPS failed: _SLPSSetFrontProcessWithOptions pid={} cgwid={} status={}",
             pid,
             wid,
@@ -535,14 +552,20 @@ unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
     let get_psn = match *GET_PROCESS_FOR_PID {
         Some(f) => f,
         None => {
-            log_info!("[raise] key click unavailable: GetProcessForPID symbol missing");
+            log_missing_slps_symbol(
+                &SLPS_GET_PROCESS_MISSING_LOGGED,
+                "[raise] key click unavailable: GetProcessForPID symbol missing",
+            );
             return false;
         }
     };
     let post = match *SLPS_POST_EVENT_RECORD {
         Some(f) => f,
         None => {
-            log_info!("[raise] key click unavailable: SLPSPostEventRecordTo symbol missing");
+            log_missing_slps_symbol(
+                &SLPS_POST_EVENT_MISSING_LOGGED,
+                "[raise] key click unavailable: SLPSPostEventRecordTo symbol missing",
+            );
             return false;
         }
     };
@@ -552,7 +575,7 @@ unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
     };
     let psn_status = get_psn(pid, &mut psn);
     if psn_status != 0 {
-        log_info!(
+        log_debug!(
             "[raise] key click failed: GetProcessForPID pid={} status={}",
             pid,
             psn_status
@@ -575,7 +598,7 @@ unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
     bytes[0x08] = 0x01;
     let status = post(&mut psn, bytes.as_mut_ptr());
     if status != 0 {
-        log_info!(
+        log_debug!(
             "[raise] key click failed: SLPSPostEventRecordTo pid={} cgwid={} status={}",
             pid,
             wid,
@@ -592,12 +615,12 @@ pub(crate) fn activate_pid(pid: i32) -> bool {
         let app: *mut AnyObject =
             msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
         if app.is_null() {
-            log_info!("[raise] activate fallback: no running app for pid={}", pid);
+            log_debug!("[raise] activate fallback: no running app for pid={}", pid);
             return false;
         }
         let activated: bool = msg_send![app, activateWithOptions: 0usize];
         if !activated {
-            log_info!(
+            log_debug!(
                 "[raise] activate fallback failed: pid={} activateWithOptions=false",
                 pid
             );
@@ -1346,7 +1369,7 @@ unsafe fn retry_failed_fast_path(job: &RaiseJob) -> bool {
             return true;
         }
     }
-    log_info!(
+    log_debug!(
         "[raise] fast recovery exhausted: pid={} cgwid={} activate={} slps={} click={} attempts={} elapsed={}ms",
         job.pid,
         job.cgwid,
@@ -1671,11 +1694,6 @@ fn get_ax_windows_for_pid_with_identity(
     process_start_time_us: Option<u64>,
 ) -> Option<Vec<(u32, String, bool)>> {
     if let Some(windows) = cached_ax_snapshot(pid, process_start_time_us) {
-        log_debug!(
-            "[collect] ax cache hit: pid={} windows={}",
-            pid,
-            windows.len()
-        );
         return Some(windows);
     }
 
@@ -1830,6 +1848,7 @@ pub(crate) fn cf_to_rust_string(cf_string: *const c_void) -> Option<String> {
 struct AxPartial {
     icon_ids: HashMap<i32, AppIdentity>,
     ax_queried_pids: HashSet<i32>,
+    ax_failed_pids: Vec<i32>,
     ax_wid_to_info: HashMap<i32, HashMap<u32, (String, bool)>>,
     titleless_pids: HashSet<i32>,
     /// 本段所有 PID 的 AX 查询工作耗时之和(诊断用;墙钟由调用方测)。
@@ -1853,6 +1872,7 @@ unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> A
     let mut partial = AxPartial {
         icon_ids: HashMap::new(),
         ax_queried_pids: HashSet::new(),
+        ax_failed_pids: Vec::new(),
         ax_wid_to_info: HashMap::new(),
         titleless_pids: HashSet::new(),
         ax_work_ms: 0,
@@ -1869,28 +1889,8 @@ unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> A
         let ax_wins = get_ax_windows_for_pid_with_identity(pid, process_start_time_us);
         let pid_ms = t_pid.elapsed().as_millis();
         partial.ax_work_ms += pid_ms;
-        // AX 查询结果汇总:定位“一会 1 个一会 2 个”——设置窗口抖动时看 windows 数
-        // 是否变化(缺窗口/失败/超时)。多线程下日志行可能交错,但每行自带 pid/app
-        // 标识,logger 的 flume 通道保证行内原子输出。
-        // AX query summary: pin down the 1-vs-2 flicker -- watch whether the window count
-        // changes (missing windows / failure / timeout). Lines from parallel workers may
-        // interleave, but each carries its own pid/app tag, and the logger's flume channel
-        // keeps every line atomic.
-        match &ax_wins {
-            Some(w) => log_debug!(
-                "[collect] ax pid={} app=\"{}\" windows={} ({}ms)",
-                pid,
-                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
-                w.len(),
-                pid_ms
-            ),
-            None => log_debug!(
-                "[collect] ax pid={} app=\"{}\" FAILED (CG fallback, {}ms)",
-                pid,
-                pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
-                pid_ms
-            ),
-        }
+        // 只记录慢 AX 查询;正常查询保持静默,避免每次召唤刷屏。
+        // Log only slow AX queries; successful queries stay silent to avoid flooding every summon.
         // TIMING-DEBUG 慢 AX 查询(≥20ms)单独标记:定位卡顿来自哪个应用(如 Ghostty)。
         // TIMING-DEBUG Flag slow AX queries (>=20ms) individually: pin down which app stalls
         // the summon.
@@ -1924,7 +1924,7 @@ unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> A
             }
             // AX 查询失败(无 AX 数据):保留 CG 回退路径。
             // AX query failed (no AX data): keep the CG fallback path.
-            None => {}
+            None => partial.ax_failed_pids.push(pid),
         }
     }
     let _: () = msg_send![pool, drain];
@@ -2260,6 +2260,10 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // allows the CG fallback. This fixes the BetterDisplay invisible-window bug: an AX query
     // that succeeds but yields no standard windows must not be treated as "no AX data".
     let mut ax_queried_pids: HashSet<i32> = HashSet::new();
+    // 每轮聚合 AX 查询失败,保留 CG 回退的诊断证据,同时避免逐应用成功日志刷屏。
+    // Aggregate AX query failures once per collection so CG fallback remains diagnosable
+    // without restoring noisy per-app success logs.
+    let mut ax_failed_pids: Vec<i32> = Vec::new();
     // AX 窗口「全部」为空标题的 App（如 Microsoft To Do：自绘标题栏 -> AXTitle 为空）。
     // 这类 App 的空标题窗口是真实主窗口，不能被当作弹出面板丢弃。
     // Apps whose AX windows are ALL untitled (e.g. Microsoft To Do, which has a
@@ -2300,14 +2304,34 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         for p in partials {
             icon_ids.extend(p.icon_ids);
             ax_queried_pids.extend(p.ax_queried_pids);
+            ax_failed_pids.extend(p.ax_failed_pids);
             ax_wid_to_info.extend(p.ax_wid_to_info);
             titleless_pids.extend(p.titleless_pids);
         }
     }
-    // TIMING-DEBUG AX 阶段墙钟(并行后 ≠ 各 PID 工作耗时之和;单 PID 工作耗时见
-    // 各 "ax pid=" 行的 ms 值)。
-    // TIMING-DEBUG Wall clock of the parallel AX phase (NOT the sum of per-PID work
-    // times anymore; per-PID work shows in each "ax pid=" line's ms value).
+    ax_failed_pids.sort_unstable();
+    ax_failed_pids.dedup();
+    if !ax_failed_pids.is_empty() {
+        let failed = ax_failed_pids
+            .iter()
+            .map(|pid| {
+                format!(
+                    "{}:\"{}\"",
+                    pid,
+                    pid_names.get(pid).map(String::as_str).unwrap_or("?")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        log_debug!(
+            "[collect] ax fallback: failed_pids={} [{}]",
+            ax_failed_pids.len(),
+            failed
+        );
+    }
+    // TIMING-DEBUG AX 阶段墙钟(并行后不等于各 PID 工作耗时之和;慢查询会单独记录)。
+    // TIMING-DEBUG Wall clock of the parallel AX phase (not the sum of per-PID work;
+    // slow queries are logged individually).
     let ax_total_ms = t_ax.elapsed().as_millis();
     remember_non_normal_cg_windows(&cg_window_layers, &icon_ids);
 
@@ -2369,18 +2393,9 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             match wid_map.get(&cgwid) {
                 Some((t, m)) => (t.clone(), *m),
                 None => {
-                    // 配对失败:CG 窗口在 AX 列表里没有(弹出面板 或 AX 漏报)。
-                    // 记日志定位设置窗口“时有时无”:抖动时这里应出现它的 cgwid。
-                    // Pair miss: the CG window has no AX counterpart (a popup, or AX
-                    // failed to report it). Logged to pin the Settings-window flicker.
-                    log_debug!(
-                        "[collect] ax pair-miss: pid={} app=\"{}\" cgwid={} {:.0}x{:.0} -> dropped",
-                        owner_pid,
-                        owner_name,
-                        cgwid,
-                        bounds.2,
-                        bounds.3
-                    );
+                    // 配对失败的 CG 窗口通常是菜单栏/弹出层,属于正常过滤路径,不逐条记录。
+                    // CG windows without an AX pair are usually menu bars/popups and are
+                    // normal filtering, so keep this path silent instead of logging each one.
                     continue; // CG 窗口在 AX 里没有 -> 弹出面板，跳过 / popup, skip
                 }
             }

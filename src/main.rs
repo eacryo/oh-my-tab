@@ -1925,7 +1925,7 @@ fn main() {
                     }
                 }
             }
-            log_info!("Bridge thread exiting.");
+            log_debug!("Bridge thread exiting.");
         })
         .expect("spawn global-event-bridge thread");
 

@@ -534,5 +534,5 @@ pub(super) unsafe fn write_pasteboard_file(path: &str) {
     }
     CFRelease(url_str_ns as *const c_void);
     stamp_paste_marker(pb);
-    log_debug!("[clip] write back file ({})", path);
+    log_debug!("[clip] write back file");
 }

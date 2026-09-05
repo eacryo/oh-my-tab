@@ -297,7 +297,6 @@ unsafe fn bundle_feed_url() -> String {
 /// Record the useful NSError fields so network failures are not reduced to a generic label.
 unsafe fn log_sparkle_error(context: &str, error: *mut c_void) {
     if error.is_null() {
-        log_info!("Sparkle {}: NSError is nil", context);
         return;
     }
 
@@ -345,7 +344,7 @@ fn log_update_network_context() {
     } else {
         proxy_flags.join(",")
     };
-    log_info!(
+    log_debug!(
         "Sparkle update request context: feed={}, bundle-version={}, proxy-env={}",
         feed_url,
         bundle_version,
@@ -1850,7 +1849,7 @@ extern "C" fn show_user_initiated_update_check(
     cancellation: *mut c_void,
 ) {
     unsafe {
-        log_info!("Sparkle update check started");
+        log_debug!("Sparkle update check started");
         log_update_network_context();
         // 内联(About 页)时只把按钮切到「检查中…」并禁用,不弹窗、不加其他信息。
         // When inline, just switch the button to "Checking…" and disable it; no popup or extras.
@@ -2316,7 +2315,7 @@ pub(crate) fn initialize(automatically_check: bool) -> bool {
     // Sparkle reads the feed from the host bundle's SUFeedURL; log that actual value instead of a
     // misleading constant.
     let feed_url = unsafe { bundle_feed_url() };
-    log_info!(
+    log_debug!(
         "Sparkle updater started with custom progress UI (automatic checks: {}, feed: {})",
         automatically_check,
         feed_url
@@ -2337,7 +2336,7 @@ pub(crate) fn set_automatic_checks(enabled: bool) {
             enabled,
         );
     }
-    log_info!("Sparkle automatic update checks set to {}", enabled);
+    log_debug!("Sparkle automatic update checks set to {}", enabled);
 }
 
 /// Apply the About-page automatic-download setting to a running Sparkle updater.
@@ -2353,7 +2352,7 @@ pub(crate) fn set_automatic_downloads(enabled: bool) {
             enabled,
         );
     }
-    log_info!("Sparkle automatic update downloads set to {}", enabled);
+    log_debug!("Sparkle automatic update downloads set to {}", enabled);
 }
 
 /// Ask Sparkle to check for updates; the custom user driver presents the update UI.
@@ -2374,7 +2373,7 @@ pub(crate) fn check_for_updates() -> bool {
     let Some(current) = guard.as_ref() else {
         return false;
     };
-    log_info!("Sparkle checkForUpdates selector dispatched");
+    log_debug!("Sparkle checkForUpdates selector dispatched");
     unsafe { send_void(current.updater, sel!(checkForUpdates)) };
     true
 }

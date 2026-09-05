@@ -30,7 +30,7 @@ use crate::window_collector::{
 };
 use crate::window_server;
 // 跨模块共享状态(由 main.rs 持有,这里读写)/ cross-module shared state (owned by main.rs)
-use crate::window_refresh::{log_window_ordering, request_window_refresh};
+use crate::window_refresh::request_window_refresh;
 use crate::AppState;
 use crate::TAB_STATE;
 use crate::{log_debug, log_info};
@@ -207,6 +207,8 @@ struct PendingCardClose {
     original_frames: HashMap<WindowKey, NSRect>,
     final_frames: HashMap<WindowKey, NSRect>,
     final_row_ranges: Vec<Range<usize>>,
+    final_panel_frame: NSRect,
+    final_overflowed: bool,
     original_document_h: f64,
     final_document_h: f64,
 }
@@ -1166,12 +1168,6 @@ fn prepare_first_summon_state(backward: bool) {
         focus_key,
         state.selected,
         state.windows.len()
-    );
-    log_window_ordering(
-        "first summon order",
-        &state.windows,
-        &state.mru,
-        state.selected,
     );
     drop(state_opt);
     reset_thumbnail_visible_range();
@@ -2712,7 +2708,8 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
     }
 
     unsafe {
-        let thumbnail_capture_allowed = crate::thumbnail::capture_allowed();
+        let thumbnail_capture_allowed =
+            crate::theme::thumbnails_enabled() && crate::thumbnail::capture_allowed();
         let document = match card_document() {
             Some(document) => document,
             None => return,
