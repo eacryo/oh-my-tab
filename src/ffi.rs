@@ -165,6 +165,7 @@ extern "C" {
     ) -> *mut c_void;
     pub(crate) fn CGContextDrawImage(ctx: *mut c_void, rect: CGRect, image: *const c_void);
     pub(crate) fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *const c_void;
+    pub(crate) fn CGBitmapContextGetData(ctx: *mut c_void) -> *mut c_void;
 }
 
 /// CoreGraphics 的 CGRect(C ABI:{origin:(x,y), size:(w,h)} 即 4 个连续 f64;

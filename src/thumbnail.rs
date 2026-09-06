@@ -8,6 +8,12 @@
 //!    的过期帧入队；后台 App 保留最后一张有效帧，完成后主线程原位换卡
 //! 4. 激活刷新:NSWorkspace 确认焦点窗口后延迟补拍，等 Web 内容完成恢复/重绘
 //!
+//! 5. 空白帧门控:WKWebView(Tauri/Electron 等)的页面由独立 WebContent 进程
+//!    渲染,窗口长时间后台后该进程被挂起、内容表面被 WindowServer 丢弃,截出来
+//!    只剩"标题栏(红绿灯)+纯色白屏"。此类帧在入缓存前被识别并丢弃,保住最后
+//!    一张有效帧(AltTab 同策略);从未渲染过的窗口回落图标卡;激活补拍仍空白
+//!    时延迟重试一次,给 WebContent 进程恢复重绘留时间。
+//!
 //! 无屏幕录制权限(TCC)时整个模块休眠,浮窗保持纯图标渲染;运行中授权后
 //! 下一个捕获任务自动恢复(worker 每个任务前都重新 preflight)。
 //!
@@ -26,6 +32,14 @@
 //! 4. activation refresh: after NSWorkspace resolves the focused window, capture it with a
 //!    short delay so restored web content has time to redraw.
 //!
+//! 5. blank-frame gating: WKWebView-based apps (Tauri/Electron et al.) render in a
+//!    separate WebContent process; once the window stays in the background that process
+//!    is suspended and WindowServer drops the content surface, so a capture degrades to
+//!    "title bar (traffic lights) + solid white". Such frames are detected before
+//!    caching and dropped so the last-known-good frame survives (AltTab's strategy);
+//!    never-rendered windows fall back to the icon card, and a still-blank activation
+//!    refresh retries once after a delay to give the WebContent process time to redraw.
+//!
 //! Without the Screen Recording TCC permission the whole module sleeps and the
 //! overlay keeps rendering icons only; granting permission mid-run resumes
 //! automatically (the worker re-preflights before every capture).
@@ -42,9 +56,9 @@ use std::time::{Duration, Instant};
 
 use crate::ffi::{
     CFArrayGetCount, CFArrayGetValueAtIndex, CFRelease, CFRetain, CFStringCompare,
-    CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpaceCreateDeviceRGB,
-    CGContextDrawImage, CGImageGetHeight, CGImageGetWidth, CGPreflightScreenCaptureAccess, CGRect,
-    CGRequestScreenCaptureAccess,
+    CGBitmapContextCreate, CGBitmapContextCreateImage, CGBitmapContextGetData,
+    CGColorSpaceCreateDeviceRGB, CGContextDrawImage, CGImageGetHeight, CGImageGetWidth,
+    CGPreflightScreenCaptureAccess, CGRect, CGRequestScreenCaptureAccess,
 };
 use crate::skylight;
 use crate::{log_debug, log_info};
@@ -440,6 +454,7 @@ pub(crate) fn clear_runtime_cache() {
     // Drop queued UI updates so a later re-enable cannot consume an old batch.
     READY_QUEUE.lock().unwrap().clear();
     READY_DELIVERY_SCHEDULED.store(false, Ordering::Release);
+    PENDING_BLANK_RETRIES.lock().unwrap().clear();
     log_debug!(
         "[thumb] runtime cache cleared: frames_released={}",
         released
@@ -1023,6 +1038,56 @@ fn run_capture_job(job: CaptureJob) {
         );
         return;
     }
+    record_thumb_capture(job_started.elapsed().as_millis() as u64);
+    // 空白帧门控:后台挂起的 WKWebView(Tauri/Electron 等)截出来只剩"标题栏+
+    // 纯色内容",这样的帧绝不能覆盖缓存里的最后一张有效帧;前台窗口的空白是
+    // 用户眼前的真实画面,如实保留。
+    // Blank-frame gating: a background-suspended WKWebView (Tauri/Electron et al.)
+    // captures as title bar + solid content only; such a frame must never clobber
+    // the cached last-known-good image. A blank frontmost window is real and is
+    // stored as-is.
+    if unsafe { frame_blankness(captured.thumb.img, captured.thumb.w_px, captured.thumb.h_px) }
+        .unwrap_or(false)
+    {
+        let frontmost = pid_is_frontmost(key.pid);
+        let cache_has_frame = CACHE.lock().unwrap().peek(&key).is_some();
+        let retry_slot_acquired = job.activation_at.is_some()
+            && frontmost
+            && cache_has_frame
+            && PENDING_BLANK_RETRIES.lock().unwrap().insert(key);
+        match blank_frame_action(
+            frontmost,
+            job.activation_at.is_some(),
+            cache_has_frame,
+            retry_slot_acquired,
+        ) {
+            BlankFrameAction::Store => {}
+            BlankFrameAction::DiscardKeepLastGood => {
+                unsafe {
+                    CFRelease(captured.thumb.img);
+                }
+                log_debug!(
+                    "[thumb] blank frame discarded, keeping last-known-good pid={} wid={} priority={}",
+                    key.pid,
+                    key.wid,
+                    job.priority.label()
+                );
+                return;
+            }
+            BlankFrameAction::DiscardRetryActivation => {
+                unsafe {
+                    CFRelease(captured.thumb.img);
+                }
+                schedule_blank_activation_retry(job);
+                log_debug!(
+                    "[thumb] blank activation frame discarded, retry scheduled pid={} wid={}",
+                    key.pid,
+                    key.wid
+                );
+                return;
+            }
+        }
+    }
     // 生命周期校验与缓存写入共用 CAPTURE_STATE 锁。终止路径按同一锁序取消任务并
     // 清缓存，因此结果不可能在 Remove 之后重新插入。
     // Validate lifecycle and write the cache while holding CAPTURE_STATE. Termination
@@ -1041,7 +1106,12 @@ fn run_capture_job(job: CaptureJob) {
         );
         return;
     }
-    record_thumb_capture(job_started.elapsed().as_millis() as u64);
+    // 帧最终入库:激活补拍链的重试名额随之释放(空白帧"如实入库"路径同样到此为止)。
+    // The frame is finally stored: the activation chain's retry slot is released with
+    // it (the store-blank-as-truth path also ends here).
+    if job.activation_at.is_some() {
+        PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
+    }
     cache_store(key.pid, key.wid, captured.thumb);
     drop(state);
     // 不再按任务来源预先决定是否投递：启动预热也可能在浮窗打开后才完成。
@@ -1054,10 +1124,19 @@ fn run_capture_job(job: CaptureJob) {
     }
 }
 
+/// 激活补拍的有效性:激活 token 未过时,且该 App 此刻仍是系统前台。
+/// Activation refresh validity: the activation token is current AND the app is
+/// still the system-frontmost one right now.
 fn activation_capture_is_valid_now(pid: i32, activated_at: Instant) -> bool {
-    if !crate::window_collector::app_activation_is_current(pid, activated_at) {
-        return false;
-    }
+    crate::window_collector::app_activation_is_current(pid, activated_at) && pid_is_frontmost(pid)
+}
+
+/// 查询 NSWorkspace 当前前台 App 是否就是指定 PID。捕获 worker 与延迟补拍线程
+/// 都会调用;NSWorkspace 的这类只读消息发送线程安全,不依赖 AppKit 主线程。
+/// Whether NSWorkspace currently reports the given PID as the frontmost app.
+/// Called from the capture worker and delayed refresh threads; these read-only
+/// NSWorkspace messages are thread-safe and do not require the AppKit main thread.
+fn pid_is_frontmost(pid: i32) -> bool {
     unsafe {
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
         let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
@@ -1256,12 +1335,7 @@ unsafe fn downscale_cgimage(src: *const c_void, tw: u32, th: u32) -> *const c_vo
     if tw == 0 || th == 0 {
         return std::ptr::null();
     }
-    // Device RGB 色彩空间不可变且线程安全，进程级复用；每帧创建/释放没有收益。
-    // Device RGB color spaces are immutable and thread-safe, so reuse one for the
-    // process instead of creating and releasing it for every frame.
-    static RGB_COLOR_SPACE: LazyLock<ConstPtr> =
-        LazyLock::new(|| ConstPtr(unsafe { CGColorSpaceCreateDeviceRGB() }));
-    let cs = RGB_COLOR_SPACE.0;
+    let cs = DEVICE_RGB_COLOR_SPACE.0;
     let ctx = CGBitmapContextCreate(
         std::ptr::null_mut(),
         tw as usize,
@@ -1290,6 +1364,193 @@ unsafe fn downscale_cgimage(src: *const c_void, tw: u32, th: u32) -> *const c_vo
 }
 
 static CONNECTION_ID: OnceLock<u32> = OnceLock::new();
+
+// ========== 空白帧检测(后台挂起的 WKWebView 窗口) ==========
+// WKWebView(Tauri/Electron/wry 等)的页面由独立 WebContent 进程渲染;窗口长时间
+// 后台/被遮挡后 macOS 挂起该进程并丢弃 WindowServer 侧的内容表面,此时截窗口
+// 只剩宿主进程绘制的标题栏(红绿灯),内容区域退化为逐像素一致的纯色(通常白)。
+// macOS 没有任何公开 API 能强制别的进程重渲染,AltTab 的结论是唯一可行策略:
+// 前台时捕获 + 最后一张有效帧永不被空白帧覆盖(alt-tab-macos WindowThumbnails.swift)。
+// 本模块在缓存写入前对每帧做空白判定:
+// - 后台窗口的空白帧直接丢弃(保留旧帧;无旧帧则卡片回落图标)
+// - 前台窗口的空白帧如实入缓存(用户眼前就是空白画面)
+// - 激活补拍仍空白说明 Web 内容尚未恢复重绘完,延迟再补拍一次
+//
+// Blank-frame detection for background-suspended WKWebView windows: the page of a
+// WKWebView-based app (Tauri/Electron/wry) renders in a separate WebContent
+// process; once the window stays backgrounded/occluded, macOS suspends it and drops
+// the WindowServer-side content surface, so captures degrade to the host-drawn
+// title bar (traffic lights) over a pixel-uniform solid body (usually white). No
+// public API can force another process to redraw; AltTab's proven answer is the
+// one adopted here: capture while frontmost and never let a blank frame overwrite
+// the last-known-good thumbnail (alt-tab-macos WindowThumbnails.swift). Before any
+// cache write each frame is classified:
+// - blank + background window: dropped (keep the old frame; icon card if none)
+// - blank + frontmost window: stored as-is (the user is literally looking at it)
+// - blank + activation refresh: Web content has not finished restoring; retry once
+//   after a delay.
+
+/// Device RGB 色彩空间不可变且线程安全,进程级复用;降采样与空白判定共用。
+/// The Device RGB color space is immutable and thread-safe; one process-wide
+/// instance is shared by downscaling and blank analysis.
+static DEVICE_RGB_COLOR_SPACE: LazyLock<ConstPtr> =
+    LazyLock::new(|| ConstPtr(unsafe { CGColorSpaceCreateDeviceRGB() }));
+
+/// 空白判定的采样最长边:把帧重绘到 ≤64px 的 RGBA 小位图再统计,单帧开销微秒级。
+/// Sampling longest edge for blank analysis: the frame is redrawn into a small
+/// (<=64px) RGBA bitmap first; per-frame cost stays in the microsecond range.
+const BLANK_SAMPLE_MAX_DIM: u32 = 64;
+/// 内容区从标题栏/工具条之下开始统计:挂起 WebView 的标题栏由宿主进程绘制,仍是
+/// 正常画面,必须排除在"内容近纯色"判定外。28pt 标题栏在 400~1200pt 高的窗口中
+/// 占 2.3%~7%,取 12% 覆盖标题栏加常见工具条。
+/// Content rows start below the title bar / toolbar strip: a suspended WebView's
+/// title bar is host-drawn and still renders normally, so it must be excluded from
+/// the near-uniform test. A 28pt title bar spans 2.3%~7% of 400~1200pt-tall windows;
+/// 12% covers the bar plus a common toolbar.
+const BLANK_TITLE_STRIP_FRACTION: f64 = 0.12;
+/// 单一颜色桶覆盖率 ≥99% 判为空白:挂起 WebView 的内容区逐像素一致,覆盖率≈1.0;
+/// 真实 UI(侧栏/文本/控件/边框)远达不到 99%。桶按通道 5bit 量化,轻微压缩
+/// 噪声不会造成假阴性。
+/// A single quantized color bucket covering >=99% of content rows classifies as
+/// blank: suspended WebView bodies are pixel-uniform (coverage ~1.0) while real UIs
+/// (sidebars/text/controls/borders) never approach 99%. Buckets quantize channels
+/// to 5 bits so mild compression noise cannot fake a negative.
+const BLANK_MODAL_COVERAGE_MIN: f64 = 0.99;
+/// 激活补拍遇到空白帧后的重试延迟:给 WebContent 进程恢复并完成一轮重绘的时间
+/// (首拍 350ms 仍白说明恢复偏慢,重试给到约 1.25s 总窗口)。
+/// Retry delay after a blank activation refresh: gives the WebContent process time
+/// to restore and finish a redraw pass (a blank frame at the initial 350ms means
+/// restoration is slow; the retry lands at a ~1.25s total window).
+const ACTIVATION_BLANK_RETRY_MS: u64 = 900;
+
+/// 已安排延迟重试的窗口键。名额在帧最终入库、重试因失焦/换代放弃或 App 退出时
+/// 释放;同一激活补拍链至多重试一次,防止空白-重拍死循环。
+/// Window keys with a delayed retry scheduled. A slot is released when a frame is
+/// finally stored, the retry is abandoned (focus lost / generation changed), or the
+/// app terminates; each activation chain retries at most once so blank-recapture
+/// cannot loop forever.
+static PENDING_BLANK_RETRIES: LazyLock<Mutex<HashSet<ThumbKey>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 内容区(跳过顶部标题条带后)单一颜色桶的覆盖率;None = 没有可统计像素。
+/// 纯函数:输入 RGBA 字节流,便于单元测试。
+/// Coverage of the single most common color bucket over the content rows (below the
+/// title strip); None when there is nothing to measure. Pure function over an RGBA
+/// byte buffer so it is unit-testable without CoreGraphics.
+fn blank_modal_coverage(rgba: &[u8], w: usize, skip_rows: usize, h: usize) -> Option<f64> {
+    if w == 0 || h <= skip_rows || rgba.len() < w * h * 4 {
+        return None;
+    }
+    let mut counts: HashMap<u16, usize> = HashMap::new();
+    let mut total = 0usize;
+    for y in skip_rows..h {
+        let row = y * w * 4;
+        for x in 0..w {
+            let i = row + x * 4;
+            let bucket = (((rgba[i] as u16) >> 3) << 10)
+                | (((rgba[i + 1] as u16) >> 3) << 5)
+                | ((rgba[i + 2] as u16) >> 3);
+            *counts.entry(bucket).or_default() += 1;
+            total += 1;
+        }
+    }
+    let modal = counts.values().copied().max()?;
+    Some(modal as f64 / total as f64)
+}
+
+/// 空白帧的处理决策(纯函数,便于矩阵化测试)。
+/// What to do with a blank frame (pure function for matrix testing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlankFrameAction {
+    /// 前台窗口的空白是用户眼前的真实画面,如实入缓存。
+    /// A blank FRONTMOST window is what the user literally sees; store it.
+    Store,
+    /// 后台窗口的空白帧 = 挂起 WebView;丢弃,保住缓存里的最后一张有效帧
+    /// (无缓存则卡片回落图标)。
+    /// A blank BACKGROUND frame means a suspended WebView; drop it and keep the
+    /// cached last-known-good image (the card falls back to its icon without one).
+    DiscardKeepLastGood,
+    /// 前台激活补拍仍空白 = Web 内容尚未重绘完成;丢弃并安排一次延迟重拍。
+    /// A blank frame on an activation refresh means Web content has not repainted
+    /// yet; drop it and schedule one delayed recapture.
+    DiscardRetryActivation,
+}
+
+fn blank_frame_action(
+    frontmost: bool,
+    activation_job: bool,
+    cache_has_frame: bool,
+    retry_slot_acquired: bool,
+) -> BlankFrameAction {
+    if !frontmost {
+        return BlankFrameAction::DiscardKeepLastGood;
+    }
+    if activation_job && cache_has_frame && retry_slot_acquired {
+        BlankFrameAction::DiscardRetryActivation
+    } else {
+        BlankFrameAction::Store
+    }
+}
+
+/// 把帧重绘进 ≤64px 的 RGBA 位图后做空白判定;分析不可用时返回 None,调用方按
+/// 非空白处理(保守起见维持原入缓存行为)。
+/// Redraw the frame into a small (<=64px) RGBA bitmap and run the blank test.
+/// Analysis failures return None and the caller treats the frame as non-blank
+/// (conservatively preserving the original store behavior).
+unsafe fn frame_blankness(img: *const c_void, w_px: u32, h_px: u32) -> Option<bool> {
+    if img.is_null() || w_px == 0 || h_px == 0 {
+        return None;
+    }
+    let scale = BLANK_SAMPLE_MAX_DIM as f64 / u32::max(w_px, h_px) as f64;
+    let sw = (((w_px as f64) * scale).round() as usize).max(1);
+    let sh = (((h_px as f64) * scale).round() as usize).max(1);
+    let ctx = CGBitmapContextCreate(
+        std::ptr::null_mut(),
+        sw,
+        sh,
+        8,
+        sw * 4,
+        DEVICE_RGB_COLOR_SPACE.0,
+        BITMAP_PREMULTIPLIED_LAST,
+    );
+    if ctx.is_null() {
+        return None;
+    }
+    CGContextDrawImage(
+        ctx,
+        CGRect {
+            x: 0.0,
+            y: 0.0,
+            w: sw as f64,
+            h: sh as f64,
+        },
+        img,
+    );
+    let data = CGBitmapContextGetData(ctx) as *const u8;
+    let coverage = if data.is_null() {
+        None
+    } else {
+        let skip_rows = ((sh as f64) * BLANK_TITLE_STRIP_FRACTION).round() as usize;
+        blank_modal_coverage(
+            std::slice::from_raw_parts(data, sw * sh * 4),
+            sw,
+            skip_rows,
+            sh,
+        )
+    };
+    CFRelease(ctx);
+    Some(coverage.is_some_and(|c| c >= BLANK_MODAL_COVERAGE_MIN))
+}
+
+/// App 退出时一并丢弃其挂起的空白重试名额(pregen 的终止路径调用)。
+/// Drop a terminated app's pending blank-retry slots (called from pregen's
+/// termination path).
+pub(crate) fn forget_blank_retries_for_pid(pid: i32) {
+    PENDING_BLANK_RETRIES
+        .lock()
+        .unwrap()
+        .retain(|key| key.pid != pid);
+}
 
 // ========== 召唤期刷新(show_overlay 尾部调用) ==========
 
@@ -1514,6 +1775,10 @@ pub(crate) fn refresh_for_theme(required_px_h: u32) {
     log_capture_metrics("theme");
 }
 
+/// 激活补拍门控的纯逻辑(供单元测试;运行时走 activation_capture_is_valid_now)。
+/// Pure gating logic for activation refreshes (unit tests; runtime goes through
+/// activation_capture_is_valid_now).
+#[cfg(test)]
 fn activation_capture_is_valid(
     pid: i32,
     activation_is_current: bool,
@@ -1534,20 +1799,9 @@ pub(crate) fn refresh_after_activation(pid: i32, wid: u32, activated_at: Instant
     let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
     let _ = std::thread::Builder::new()
         .name("oh-my-tab-thumb-activation".into())
-        .spawn(move || unsafe {
+        .spawn(move || {
             std::thread::sleep(Duration::from_millis(ACTIVATION_CAPTURE_DELAY_MS));
-            let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-            let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let front_app: *mut AnyObject = msg_send![workspace, frontmostApplication];
-            let frontmost_pid = if front_app.is_null() {
-                None
-            } else {
-                let current_pid: i32 = msg_send![front_app, processIdentifier];
-                Some(current_pid)
-            };
-            let activation_is_current =
-                crate::window_collector::app_activation_is_current(pid, activated_at);
-            if activation_capture_is_valid(pid, activation_is_current, frontmost_pid) {
+            if activation_capture_is_valid_now(pid, activated_at) {
                 let target_px_h = cached_target_px_height(pid, wid);
                 let enqueued =
                     enqueue_activation_job(pid, wid, target_px_h, activated_at, pid_generation);
@@ -1565,8 +1819,53 @@ pub(crate) fn refresh_after_activation(pid: i32, wid: u32, activated_at: Instant
                     wid
                 );
             }
-            let _: () = msg_send![pool, drain];
         });
+}
+
+/// 激活补拍仍得到空白帧:WebContent 进程尚未完成恢复重绘。延迟 ACTIVATION_BLANK_RETRY_MS
+/// 后再走一次激活补拍(仍要求前台且激活 token 未过时)。每条激活链至多重试一次,
+/// 名额在帧入库、重试放弃或 App 退出时释放。
+/// The activation refresh still produced a blank frame: the WebContent process has
+/// not finished restoring/redrawing. After ACTIVATION_BLANK_RETRY_MS one more
+/// activation refresh runs (still gated on frontmost + current activation token).
+/// Each activation chain retries at most once; the slot is released when a frame is
+/// stored, the retry is abandoned, or the app terminates.
+fn schedule_blank_activation_retry(job: CaptureJob) {
+    let key = job.key;
+    let Some(activated_at) = job.activation_at else {
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("oh-my-tab-thumb-blank-retry".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(ACTIVATION_BLANK_RETRY_MS));
+            if !activation_capture_is_valid_now(key.pid, activated_at) {
+                PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
+                log_debug!(
+                    "[thumb] blank retry skipped (no longer frontmost) pid={} wid={}",
+                    key.pid,
+                    key.wid
+                );
+                return;
+            }
+            let target_px_h = cached_target_px_height(key.pid, key.wid);
+            let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(key.pid);
+            let enqueued =
+                enqueue_activation_job(key.pid, key.wid, target_px_h, activated_at, pid_generation);
+            // 合并进已有任务时名额交给该任务完成时释放;独立入队则由入库路径释放。
+            // Merged into an already-pending job, the slot is released when that job
+            // finishes; an independent queue entry is released by the store path.
+            log_debug!(
+                "[thumb] blank retry: pid={} wid={} enqueued={} target_h={}",
+                key.pid,
+                key.wid,
+                enqueued,
+                target_px_h
+            );
+        });
+    if spawned.is_err() {
+        PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
+    }
 }
 
 // ========== 单元测试 ==========
@@ -1898,6 +2197,116 @@ mod tests {
         assert!(!activation_capture_is_valid(42, false, Some(42)));
         assert!(!activation_capture_is_valid(42, true, Some(7)));
         assert!(!activation_capture_is_valid(42, true, None));
+    }
+
+    #[test]
+    fn blank_modal_coverage_detects_suspended_webview_frames() {
+        // 挂起 WebView 特征:内容区逐像素一致的纯白,标题条带内有红绿灯——
+        // 红绿灯在被跳过的标题条带里,不影响内容区覆盖率 1.0。
+        // Suspended-WebView signature: a pixel-uniform white body plus traffic
+        // lights inside the skipped title strip -- coverage over content rows is 1.0.
+        let (w, h) = (16usize, 16usize);
+        let mut rgba = vec![0xFFu8; w * h * 4];
+        for (x, rgb) in [(2, (237, 106, 94)), (5, (245, 191, 79)), (8, (99, 197, 84))] {
+            let i = x * 4;
+            rgba[i] = rgb.0;
+            rgba[i + 1] = rgb.1;
+            rgba[i + 2] = rgb.2;
+        }
+        let coverage = blank_modal_coverage(&rgba, w, 2, h).unwrap();
+        assert_eq!(coverage, 1.0);
+        assert!(coverage >= BLANK_MODAL_COVERAGE_MIN);
+    }
+
+    #[test]
+    fn blank_modal_coverage_accepts_realistic_ui() {
+        // 侧栏 + 白底 + 文本行的真实 UI:多颜色桶分摊,单一桶覆盖率远低于阈值。
+        // A realistic UI (sidebar + white canvas + text rows) spreads across many
+        // buckets; no single bucket approaches the threshold.
+        let (w, h) = (16usize, 16usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                if x < 5 {
+                    rgba[i] = 40;
+                    rgba[i + 1] = 40;
+                    rgba[i + 2] = 46;
+                } else if y % 2 == 0 {
+                    rgba[i] = 255;
+                    rgba[i + 1] = 255;
+                    rgba[i + 2] = 255;
+                } else {
+                    rgba[i] = 200;
+                    rgba[i + 1] = 210;
+                    rgba[i + 2] = 220;
+                }
+                rgba[i + 3] = 255;
+            }
+        }
+        let coverage = blank_modal_coverage(&rgba, w, 2, h).unwrap();
+        assert!(coverage < BLANK_MODAL_COVERAGE_MIN);
+    }
+
+    #[test]
+    fn blank_modal_coverage_flags_uniform_dark_content() {
+        // 暗色主题的挂起帧同样判空白:内容区是逐像素一致的深色,桶覆盖率 1.0。
+        // A dark-theme suspended frame is blank too: the body is a pixel-uniform
+        // dark color with bucket coverage 1.0.
+        let (w, h) = (8usize, 8usize);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for _ in 0..w * h {
+            rgba.extend_from_slice(&[10, 10, 12, 255]);
+        }
+        assert!(blank_modal_coverage(&rgba, w, 1, h).unwrap() >= BLANK_MODAL_COVERAGE_MIN);
+    }
+
+    #[test]
+    fn blank_modal_coverage_quantizes_mild_noise_and_rejects_empty_region() {
+        // 5bit 量化把 250 与 255 归入同桶:轻微压缩噪声不会把空白帧误判为正常。
+        // 5-bit quantization buckets 250 with 255: mild compression noise cannot
+        // hide a blank frame.
+        let (w, h) = (8usize, 8usize);
+        let mut rgba = vec![255u8; w * h * 4];
+        for y in 1..h {
+            rgba[(y * w + 1) * 4] = 250;
+        }
+        assert!(blank_modal_coverage(&rgba, w, 1, h).unwrap() >= BLANK_MODAL_COVERAGE_MIN);
+        // 没有内容行可统计时返回 None。
+        // No content rows to measure -> None.
+        assert!(blank_modal_coverage(&rgba, w, h, h).is_none());
+        assert!(blank_modal_coverage(&[], 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn blank_frame_action_matrix() {
+        use BlankFrameAction::*;
+        // 后台窗口的空白帧一律保底最后有效帧(挂起 WebView 的唯一可靠策略)。
+        // A blank background frame always keeps the last-known-good image (the only
+        // reliable strategy for suspended WebViews).
+        assert_eq!(
+            blank_frame_action(false, false, false, false),
+            DiscardKeepLastGood
+        );
+        assert_eq!(
+            blank_frame_action(false, true, true, true),
+            DiscardKeepLastGood
+        );
+        // 前台空白是用户眼前的真实画面,如实入缓存(包括激活补拍无旧帧可保时)。
+        // A blank frontmost frame is what the user sees; store it (also when an
+        // activation refresh has no good frame to protect).
+        assert_eq!(blank_frame_action(true, false, false, false), Store);
+        assert_eq!(blank_frame_action(true, true, false, true), Store);
+        // 前台激活补拍仍空白且已有旧帧:丢弃并延迟重试一次。
+        // A blank frontmost activation refresh with an existing frame: drop it and
+        // schedule one delayed retry.
+        assert_eq!(
+            blank_frame_action(true, true, true, true),
+            DiscardRetryActivation
+        );
+        // 重试名额已占用:不再无限重试,如实入缓存。
+        // Retry slot already taken: stop retrying and store the truth.
+        assert_eq!(blank_frame_action(true, true, true, false), Store);
     }
 
     #[test]
