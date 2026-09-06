@@ -235,11 +235,8 @@ const FILTERS_H: f64 = 36.0;
 const FILTERS_PAD_X: f64 = 20.0;
 /// 筛选项间距(设计稿 gap 17px)/ the gap between filter items (17px).
 const FILTER_GAP: f64 = 17.0;
-/// 底部栏高度(两行快捷键说明)/ the footer's height (two rows for shortcut legends).
-// Two rows leave room for translated shortcut labels at a readable size instead of compressing
-// them into a single colliding line.
-// 两行 footer 为本地化快捷键说明留下可读空间，避免把它们压缩到同一行后互相覆盖。
-const FOOTER_H: f64 = 64.0;
+/// 底部栏高度(设计稿 43px)/ the footer's height (43px).
+const FOOTER_H: f64 = 43.0;
 /// 窗口底部留白 / the window's bottom padding.
 const PAD_Y: f64 = 12.0;
 /// 底部栏左右边距(设计稿 padding 0 16px)/ the footer's side padding (16px).
@@ -6967,7 +6964,7 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     let _: () = msg_send![count_label, setDrawsBackground: false];
     let _: () = msg_send![count_label, setEditable: false];
     let _: () = msg_send![count_label, setSelectable: false];
-    let cf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+    let cf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
     let _: () = msg_send![count_label, setFont: cf];
     let cc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
     let _: () = msg_send![count_label, setTextColor: cc];
@@ -6975,9 +6972,8 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     release_obj(count_label);
     *FOOTER_COUNT.lock().unwrap() = Some(ObjPtr(count_label));
 
-    // 快捷键图例(kbd 键帽 + 说明),从右往左排;Tab 分类切换位于这组提示最左侧。
-    // The shortcut legends (kbd keycap + label) are laid out right-to-left; the Tab filter
-    // cycle sits at the left edge of this hint group.
+    // 快捷键图例(kbd 键帽 + 说明)从右往左排在同一行。
+    // The shortcut legends (kbd keycap + label) are laid out right-to-left on one row.
     let kbd_keys = ["↵", "⌫", "→", "←", "Tab"];
     let kbd_labels = [
         t("clipboard.kbd_paste"),
@@ -6988,35 +6984,18 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     ];
     let kbd_min_w = 21.0;
     let kbd_h = 19.0;
-    let hints_min_x = FOOTER_PAD_X + 140.0 + FOOTER_GROUP_GAP;
-    let mut row_x = [w - FOOTER_PAD_X, w - FOOTER_PAD_X];
+    let mut x = w - FOOTER_PAD_X;
     for (i, key) in kbd_keys.iter().enumerate() {
-        let row = usize::from(i >= 3);
-        let x = &mut row_x[row];
-        // Tab 文字键帽比方向键图标宽;其余维持原 21pt 尺寸。
-        // The text keycap for Tab is wider than arrow glyphs; the rest retain 21pt.
         let kbd_w = if *key == "Tab" { 28.0 } else { kbd_min_w };
-        // Reserve the left side for the entry count and cap each hint column. Long translated
-        // labels wrap within their column instead of pushing earlier hints under the count.
-        // 左侧为条目数保留空间，并限制每个提示列宽；长翻译在列内换行，不会挤到条目数下面。
-        let row_count = if row == 0 { 3.0 } else { 2.0 };
-        let row_available = (w - hints_min_x - FOOTER_PAD_X).max(1.0);
-        let max_label_w = (row_available / row_count - kbd_w - 5.0 - FOOTER_GROUP_GAP).max(1.0);
-        let measured_label_w = localized_string_width(&kbd_labels[i], 12.0);
-        let label_w = measured_label_w.min(max_label_w);
+        let label_w = localized_string_width(&kbd_labels[i], 10.0);
         let group_w = kbd_w + 5.0 + label_w;
-        *x -= group_w;
-        let row_center_y = if row == 0 {
-            FOOTER_H * 0.75
-        } else {
-            FOOTER_H * 0.25
-        };
+        x -= group_w;
         // 键帽 / the keycap.
         let cap: *mut AnyObject = msg_send![class!(NSView), alloc];
         let cap: *mut AnyObject = msg_send![
             cap,
             initWithFrame: NSRect::new(
-                NSPoint::new(*x, row_center_y - kbd_h / 2.0),
+                NSPoint::new(x, (FOOTER_H - kbd_h) / 2.0),
                 NSSize::new(kbd_w, kbd_h)
             )
         ];
@@ -7075,13 +7054,16 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         // Give the hint 6pt width slack so cell insets do not clip its tail; its height uses
         // the font's real line height and is centered. The old fixed 16pt NSTextField drew
         // from its top, making the hint sit slightly above the keycap glyph.
-        let hf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+        let hf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+        let hint_asc: f64 = msg_send![hf, ascender];
+        let hint_desc: f64 = msg_send![hf, descender];
+        let hint_line_h = (hint_asc - hint_desc + 1.0).max(11.0);
         let hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let hint: *mut AnyObject = msg_send![
             hint,
             initWithFrame: NSRect::new(
-                NSPoint::new(*x + kbd_w + 5.0, row_center_y - 12.0),
-                NSSize::new(label_w + 6.0, 24.0)
+                NSPoint::new(x + kbd_w + 5.0, (FOOTER_H - hint_line_h) / 2.0),
+                NSSize::new(label_w + 6.0, hint_line_h)
             )
         ];
         let _: () = msg_send![hint, setBezeled: false];
@@ -7091,19 +7073,13 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _: () = msg_send![hint, setFont: hf];
         let hc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
         let _: () = msg_send![hint, setTextColor: hc];
-        let _: () = msg_send![hint, setAlignment: -1isize]; // NSTextAlignmentNatural
-        let _: () = msg_send![hint, setUsesSingleLineMode: false];
-        let _: () = msg_send![hint, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
-        if msg_send![hint, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
-            let _: () = msg_send![hint, setMaximumNumberOfLines: 2isize];
-        }
         let hint_ns = make_nsstring(&kbd_labels[i]);
         let _: () = msg_send![hint, setStringValue: hint_ns];
         CFRelease(hint_ns as *const c_void);
         let _: () = msg_send![parent, addSubview: hint];
         release_obj(hint);
         // 下一组间距 / spacing before the next group.
-        *x -= FOOTER_GROUP_GAP;
+        x -= FOOTER_GROUP_GAP;
         let _ = i;
     }
 }
