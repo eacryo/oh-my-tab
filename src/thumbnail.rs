@@ -10,9 +10,14 @@
 //!
 //! 5. 空白帧门控:WKWebView(Tauri/Electron 等)的页面由独立 WebContent 进程
 //!    渲染,窗口长时间后台后该进程被挂起、内容表面被 WindowServer 丢弃,截出来
-//!    只剩"标题栏(红绿灯)+纯色白屏"。此类帧在入缓存前被识别并丢弃,保住最后
-//!    一张有效帧(AltTab 同策略);从未渲染过的窗口回落图标卡;激活补拍仍空白
-//!    时延迟重试一次,给 WebContent 进程恢复重绘留时间。
+//!    只剩"标题栏(红绿灯)+纯色白屏"。此类帧按场景分流(AltTab 同策略):
+//!    - 后台 + 缓存有帧:丢弃,保住最后一张有效帧(升级单向,永不回退)
+//!    - 后台 + 缓存为空:入缓存作为占位种子(好过图标卡;激活后自动升级)
+//!    - 前台:如实入缓存(用户眼前的真实画面)
+//!    - 激活补拍仍空白:丢弃并延迟重试一次,给 WebContent 恢复重绘留时间
+//!    - 外观(明暗)切换重拍:空白也覆盖——旧外观帧与新主题不协调比占位更刺眼
+//!    - 切换器自己切过去的窗口:激活补拍在 backstop 静默出口放行;同应用窗口切换
+//!      (无激活通知、808 被静音)在 raise 时铸造 token 直接调度,到达即刷新
 //!
 //! 无屏幕录制权限(TCC)时整个模块休眠,浮窗保持纯图标渲染;运行中授权后
 //! 下一个捕获任务自动恢复(worker 每个任务前都重新 preflight)。
@@ -35,10 +40,21 @@
 //! 5. blank-frame gating: WKWebView-based apps (Tauri/Electron et al.) render in a
 //!    separate WebContent process; once the window stays in the background that process
 //!    is suspended and WindowServer drops the content surface, so a capture degrades to
-//!    "title bar (traffic lights) + solid white". Such frames are detected before
-//!    caching and dropped so the last-known-good frame survives (AltTab's strategy);
-//!    never-rendered windows fall back to the icon card, and a still-blank activation
-//!    refresh retries once after a delay to give the WebContent process time to redraw.
+//!    "title bar (traffic lights) + solid white". Such frames are routed by scenario
+//!    (AltTab's strategy):
+//!    - background + cached frame: dropped, keeping the last-known-good image (the
+//!      upgrade to a real frame is one-way and never regresses)
+//!    - background + empty cache: stored as a placeholder seed (beats an icon card;
+//!      any frontmost capture upgrades it automatically)
+//!    - frontmost: stored as-is (what the user literally sees)
+//!    - still blank on an activation refresh: dropped with one delayed retry so the
+//!      WebContent process gets time to redraw
+//!    - appearance (light/dark) transition recaptures: blank overwrites too -- a
+//!      stale-appearance frame amid the new theme looks worse than a placeholder
+//!    - windows switched to via our own switcher: the activation refresh is let
+//!      through at the backstop's silent exit; same-app window switches (no
+//!      activation notification, 808 silenced) mint a token at raise time and
+//!      schedule the refresh directly, so arriving refreshes the thumbnail
 //!
 //! Without the Screen Recording TCC permission the whole module sleeps and the
 //! overlay keeps rendering icons only; granting permission mid-run resumes
@@ -404,6 +420,15 @@ struct CachedThumb {
     /// but the same target must not trigger endless retries.
     captured_for_px_h: u32,
     captured: Instant,
+    /// 全局递增的帧版本号(cache_store 时分配)。浮窗卡片签名携带它,帧在浮窗关闭
+    /// 期间被替换(种子→真实、激活补拍、外观重拍)后,下一次召唤签名失配走 Replace
+    /// 重建,复用路径不会永远展示旧图。
+    /// Globally increasing frame version (assigned in cache_store). Overlay card
+    /// signatures carry it: after a frame is replaced while the overlay is closed
+    /// (seed -> real, activation refresh, appearance recapture), the next summon's
+    /// signature mismatch forces a Replace rebuild, so the reuse path can never keep
+    /// showing the stale image forever.
+    epoch: u64,
 }
 
 /// CachedThumb 内含裸 CGImageRef,需要 Send+Sync 才能放进跨线程 static;
@@ -537,7 +562,11 @@ fn cached_target_px_height(pid: i32, wid: u32) -> u32 {
         .unwrap_or(BASE_TARGET_PX_H)
 }
 
-fn cache_store(pid: i32, wid: u32, t: CachedThumb) {
+fn cache_store(pid: i32, wid: u32, mut t: CachedThumb) {
+    // 帧版本号在唯一入库点分配,所有存储路径(预热/召唤/激活/外观)都会推进。
+    // The frame version is assigned at the single store point; every path (prewarm /
+    // summon / activation / appearance) advances it.
+    t.epoch = FRAME_EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     // 释放大型 CGImage 可能回收 IOSurface/位图存储；先放开缓存锁，避免主线程
     // lookup 在释放期间被无谓阻塞。
     // Releasing a large CGImage may reclaim IOSurface/bitmap storage. Drop the
@@ -548,6 +577,24 @@ fn cache_store(pid: i32, wid: u32, t: CachedThumb) {
             CFRelease(evicted.img);
         }
     }
+}
+
+/// 全局帧版本计数器(cache_store 内部分配;从 1 开始,0 表示无帧)。
+/// Global frame version counter (assigned inside cache_store; starts at 1, 0 = none).
+static FRAME_EPOCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 当前缓存帧的版本号(只读探测,不改变 LRU 次序;0 = 无缓存帧)。卡片签名用它
+/// 感知"浮窗关闭期间帧被替换",签名失配触发 Replace 重建。
+/// The cached frame's current version (read-only probe, LRU order untouched;
+/// 0 = no frame). Card signatures use it to notice frames replaced while the
+/// overlay was closed; the signature mismatch then triggers a Replace rebuild.
+pub(crate) fn frame_epoch(pid: i32, wid: u32) -> u64 {
+    CACHE
+        .lock()
+        .unwrap()
+        .peek(&ThumbKey { pid, wid })
+        .map(|t| t.epoch)
+        .unwrap_or(0)
 }
 
 // ========== 捕获管线(flume 队列 + 单 worker 串行限流) ==========
@@ -591,6 +638,12 @@ struct PendingCapture {
     freshness_sequence: u64,
     enqueued_at: Instant,
     running: bool,
+    /// 外观(明暗主题)切换触发的重拍:允许空白帧覆盖已有帧——旧帧是旧外观像素,
+    /// 与其他卡片不一致比暂时空白更刺眼。合并请求时按"或"传播。
+    /// Appearance (light/dark) transition recapture: blank frames MAY overwrite the
+    /// cached frame -- a stale-appearance frame clashes with every other card worse
+    /// than a temporary blank. Merging requests propagates the flag with OR.
+    appearance_refresh: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -603,6 +656,7 @@ struct CaptureJob {
     activation_at: Option<Instant>,
     freshness_sequence: u64,
     enqueued_at: Instant,
+    appearance_refresh: bool,
 }
 
 /// 同时记录 queued/in-flight 请求的最高目标、最高优先级和生命周期 token。
@@ -630,9 +684,10 @@ impl CaptureState {
         *counter
     }
 
+    #[cfg(test)]
     fn request(&mut self, key: ThumbKey, target_px_h: u32, priority: CapturePriority) -> bool {
         let pid_generation = self.pid_generations.get(&key.pid).copied().unwrap_or(0);
-        self.request_for_generation(key, target_px_h, priority, pid_generation)
+        self.request_for_generation(key, target_px_h, priority, pid_generation, false)
     }
 
     fn request_for_generation(
@@ -641,6 +696,7 @@ impl CaptureState {
         target_px_h: u32,
         priority: CapturePriority,
         pid_generation: u64,
+        appearance_refresh: bool,
     ) -> bool {
         if self.terminated_pids.contains(&key.pid)
             || self.pid_generations.get(&key.pid).copied().unwrap_or(0) != pid_generation
@@ -662,6 +718,7 @@ impl CaptureState {
                     freshness_sequence: 0,
                     enqueued_at: Instant::now(),
                     running: false,
+                    appearance_refresh,
                 });
                 true
             }
@@ -669,6 +726,7 @@ impl CaptureState {
                 let pending = entry.get_mut();
                 pending.target_px_h = pending.target_px_h.max(target_px_h);
                 pending.priority = pending.priority.max(priority);
+                pending.appearance_refresh |= appearance_refresh;
                 if priority == CapturePriority::Selected && pending.activation_at.take().is_some() {
                     pending.freshness_sequence = freshness_sequence;
                 }
@@ -694,11 +752,22 @@ impl CaptureState {
             target_px_h,
             CapturePriority::Activation,
             pid_generation,
+            false,
         );
-        let freshness_sequence = Self::next_counter(&mut self.next_freshness_sequence);
         if let Some(pending) = self.desired.get_mut(&key) {
-            pending.activation_at = Some(activated_at);
-            pending.freshness_sequence = freshness_sequence;
+            // 同一激活 token 的重复调度(外部激活时 808 路径与 backstop 路径先后
+            // 到达)不得推进新鲜度:否则会为正在执行的任务追加一次多余的 follow-up
+            // 重拍。真正的新激活(不同 token)照常推进。
+            // Duplicate scheduling of the SAME activation token (the 808 path and
+            // the backstop path arriving within one external activation) must not
+            // advance freshness: it would append a redundant follow-up capture to
+            // the running job. A genuinely new activation (different token) still
+            // advances it.
+            if pending.activation_at != Some(activated_at) {
+                let freshness_sequence = Self::next_counter(&mut self.next_freshness_sequence);
+                pending.activation_at = Some(activated_at);
+                pending.freshness_sequence = freshness_sequence;
+            }
         }
         inserted
     }
@@ -729,6 +798,7 @@ impl CaptureState {
             activation_at: pending.activation_at,
             freshness_sequence: pending.freshness_sequence,
             enqueued_at: pending.enqueued_at,
+            appearance_refresh: pending.appearance_refresh,
         })
     }
 
@@ -750,6 +820,13 @@ impl CaptureState {
         if pending.target_px_h > job.target_px_h
             || pending.priority > job.priority
             || pending.freshness_sequence > job.freshness_sequence
+            // 外观刷新合入正在执行的任务时不改变分辨率/优先级/新鲜度,必须单列,
+            // 否则主题重拍会被 finish 静默吞掉,该窗口残留旧主题帧。
+            // An appearance refresh merging into a running job changes none of the
+            // three fields above, so it needs its own check -- otherwise finish()
+            // silently swallows the theme recapture and the window keeps a
+            // stale-appearance frame.
+            || (pending.appearance_refresh && !job.appearance_refresh)
         {
             pending.running = false;
             pending.enqueued_at = Instant::now();
@@ -856,7 +933,14 @@ pub(crate) fn wake_capture_worker() {
 /// Try to schedule one capture; false means the same window is already pending/in-flight,
 /// or the worker has exited.
 fn enqueue_job(pid: i32, wid: u32, target_px_h: u32, priority: CapturePriority) -> bool {
-    enqueue_job_inner(pid, wid, target_px_h, priority, None)
+    enqueue_job_inner(pid, wid, target_px_h, priority, None, false)
+}
+
+/// 外观(明暗主题)切换的重拍:空白帧允许覆盖已有帧(旧外观像素比暂时空白更刺眼)。
+/// Appearance (light/dark) transition recapture: blank frames may overwrite the
+/// cached frame (stale-appearance pixels clash harder than a temporary blank).
+fn enqueue_appearance_job(pid: i32, wid: u32, target_px_h: u32, priority: CapturePriority) -> bool {
+    enqueue_job_inner(pid, wid, target_px_h, priority, None, true)
 }
 
 /// 仅当 PID 仍处于生产者观察到的 generation 时入队，阻止终止前的延迟任务污染
@@ -870,7 +954,7 @@ fn enqueue_job_for_generation(
     priority: CapturePriority,
     pid_generation: u64,
 ) -> bool {
-    enqueue_job_inner(pid, wid, target_px_h, priority, Some(pid_generation))
+    enqueue_job_inner(pid, wid, target_px_h, priority, Some(pid_generation), false)
 }
 
 fn enqueue_activation_job(
@@ -905,17 +989,19 @@ fn enqueue_job_inner(
     target_px_h: u32,
     priority: CapturePriority,
     expected_generation: Option<u64>,
+    appearance_refresh: bool,
 ) -> bool {
     let key = ThumbKey { pid, wid };
     let tx = ensure_capture_worker();
     let accepted = {
         let mut state = CAPTURE_STATE.lock().unwrap();
-        match expected_generation {
-            Some(generation) => {
-                state.request_for_generation(key, target_px_h, priority, generation)
-            }
-            None => state.request(key, target_px_h, priority),
-        }
+        // 无预期 generation 时按当前值解析(等价于原 request();terminated 判定仍在
+        // request_for_generation 内生效)。
+        // Without an expected generation, resolve the current one (equivalent to the
+        // old request(); the terminated check still applies inside
+        // request_for_generation).
+        let generation = expected_generation.unwrap_or_else(|| state.pid_generation(key.pid));
+        state.request_for_generation(key, target_px_h, priority, generation, appearance_refresh)
     };
     if !accepted {
         return false;
@@ -1060,8 +1146,23 @@ fn run_capture_job(job: CaptureJob) {
             job.activation_at.is_some(),
             cache_has_frame,
             retry_slot_acquired,
+            job.appearance_refresh,
         ) {
             BlankFrameAction::Store => {}
+            BlankFrameAction::StoreSeed => {
+                log_debug!(
+                    "[thumb] blank first frame stored as placeholder seed pid={} wid={}",
+                    key.pid,
+                    key.wid
+                );
+            }
+            BlankFrameAction::StoreAppearanceRefresh => {
+                log_debug!(
+                    "[thumb] blank frame stored for appearance refresh pid={} wid={}",
+                    key.pid,
+                    key.wid
+                );
+            }
             BlankFrameAction::DiscardKeepLastGood => {
                 unsafe {
                     CFRelease(captured.thumb.img);
@@ -1324,6 +1425,9 @@ unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CapturedWindow> {
             h_px: th,
             captured_for_px_h: target_px_h,
             captured: Instant::now(),
+            // 占位值;实际版本号由 cache_store 统一分配。
+            // Placeholder; the real version is assigned centrally in cache_store.
+            epoch: 0,
         },
     })
 }
@@ -1372,9 +1476,11 @@ static CONNECTION_ID: OnceLock<u32> = OnceLock::new();
 // macOS 没有任何公开 API 能强制别的进程重渲染,AltTab 的结论是唯一可行策略:
 // 前台时捕获 + 最后一张有效帧永不被空白帧覆盖(alt-tab-macos WindowThumbnails.swift)。
 // 本模块在缓存写入前对每帧做空白判定:
-// - 后台窗口的空白帧直接丢弃(保留旧帧;无旧帧则卡片回落图标)
-// - 前台窗口的空白帧如实入缓存(用户眼前就是空白画面)
-// - 激活补拍仍空白说明 Web 内容尚未恢复重绘完,延迟再补拍一次
+// - 后台窗口 + 已有缓存帧:丢弃,保住最后一张有效帧(升级单向)
+// - 后台窗口 + 缓存为空:入缓存作为占位种子(之后前台补拍自动升级)
+// - 前台窗口:如实入缓存(用户眼前就是空白画面)
+// - 激活补拍仍空白:丢弃并延迟重拍一次(Web 内容尚未恢复重绘完)
+// - 外观切换重拍:空白也覆盖(旧外观帧与新主题不协调比占位更刺眼)
 //
 // Blank-frame detection for background-suspended WKWebView windows: the page of a
 // WKWebView-based app (Tauri/Electron/wry) renders in a separate WebContent
@@ -1385,10 +1491,13 @@ static CONNECTION_ID: OnceLock<u32> = OnceLock::new();
 // one adopted here: capture while frontmost and never let a blank frame overwrite
 // the last-known-good thumbnail (alt-tab-macos WindowThumbnails.swift). Before any
 // cache write each frame is classified:
-// - blank + background window: dropped (keep the old frame; icon card if none)
-// - blank + frontmost window: stored as-is (the user is literally looking at it)
-// - blank + activation refresh: Web content has not finished restoring; retry once
-//   after a delay.
+// - background + cached frame: dropped, keeping the last-known-good image (one-way)
+// - background + empty cache: stored as a placeholder seed (frontmost captures
+//   upgrade it automatically afterwards)
+// - frontmost: stored as-is (the user is literally looking at it)
+// - still blank on an activation refresh: dropped with one delayed retry
+// - appearance-transition recapture: blank overwrites too (a stale-appearance
+//   frame amid the new theme looks worse than a placeholder)
 
 /// Device RGB 色彩空间不可变且线程安全,进程级复用;降采样与空白判定共用。
 /// The Device RGB color space is immutable and thread-safe; one process-wide
@@ -1465,10 +1574,24 @@ enum BlankFrameAction {
     /// 前台窗口的空白是用户眼前的真实画面,如实入缓存。
     /// A blank FRONTMOST window is what the user literally sees; store it.
     Store,
-    /// 后台窗口的空白帧 = 挂起 WebView;丢弃,保住缓存里的最后一张有效帧
-    /// (无缓存则卡片回落图标)。
+    /// 后台窗口的首帧(缓存为空):入缓存作为占位种子。挂起 WebView 只能截到
+    /// "标题栏+纯色内容",但一张占位帧好过图标卡——之后任何一次前台补拍
+    /// (激活/前台召唤)都会把它升级成真实画面,而门控保证升级不可逆。
+    /// The FIRST frame of a background window (empty cache): store as a placeholder
+    /// seed. A suspended WebView only yields title bar + solid body, yet a
+    /// placeholder beats an icon card -- any later frontmost capture (activation /
+    /// frontmost summon) upgrades it to the real page, and the gating makes that
+    /// upgrade one-way.
+    StoreSeed,
+    /// 外观(明暗主题)切换的重拍:空白帧也覆盖。旧帧是旧外观像素,与其他卡片
+    /// 不一致比暂时空白更刺眼;真实画面在下次前台时自然补回。
+    /// Appearance (light/dark) transition recapture: blank overwrites too. The old
+    /// frame carries stale-appearance pixels that clash with every other card worse
+    /// than a temporary blank; the real page returns on the next frontmost capture.
+    StoreAppearanceRefresh,
+    /// 后台窗口的空白帧 = 挂起 WebView;丢弃,保住缓存里的最后一张有效帧。
     /// A blank BACKGROUND frame means a suspended WebView; drop it and keep the
-    /// cached last-known-good image (the card falls back to its icon without one).
+    /// cached last-known-good image.
     DiscardKeepLastGood,
     /// 前台激活补拍仍空白 = Web 内容尚未重绘完成;丢弃并安排一次延迟重拍。
     /// A blank frame on an activation refresh means Web content has not repainted
@@ -1481,15 +1604,34 @@ fn blank_frame_action(
     activation_job: bool,
     cache_has_frame: bool,
     retry_slot_acquired: bool,
+    appearance_refresh: bool,
 ) -> BlankFrameAction {
+    // 激活补拍的空白重试优先于外观覆盖:重试拍到的真实帧同样满足外观一致性,
+    // 而直接入库会跳过 1.4s 兜底重试,把"还没画完"的画面定格成占位帧(主题任务
+    // 与激活请求合并时两个标志会同帧出现,必须在此处分出先后)。
+    // The activation blank retry outranks the appearance overwrite: the retried
+    // real frame satisfies appearance consistency too, while storing now would
+    // skip the 1.4s backstop retry and freeze an unfinished repaint as the
+    // placeholder (a theme job merged with an activation request carries both
+    // flags on one frame, so the order must be settled here).
+    if frontmost && activation_job && cache_has_frame && retry_slot_acquired {
+        return BlankFrameAction::DiscardRetryActivation;
+    }
+    if appearance_refresh {
+        // 外观一致性优先于内容保真:即使前台空白会走 Store,后台空白也会覆盖
+        // 有效帧,统一由本分支放行。
+        // Appearance consistency wins over content fidelity: blank frames store for
+        // both the frontmost and background cases through this single branch.
+        return BlankFrameAction::StoreAppearanceRefresh;
+    }
     if !frontmost {
-        return BlankFrameAction::DiscardKeepLastGood;
+        return if cache_has_frame {
+            BlankFrameAction::DiscardKeepLastGood
+        } else {
+            BlankFrameAction::StoreSeed
+        };
     }
-    if activation_job && cache_has_frame && retry_slot_acquired {
-        BlankFrameAction::DiscardRetryActivation
-    } else {
-        BlankFrameAction::Store
-    }
+    BlankFrameAction::Store
 }
 
 /// 把帧重绘进 ≤64px 的 RGBA 位图后做空白判定;分析不可用时返回 None,调用方按
@@ -1706,6 +1848,12 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
 ///
 /// The cache stores real window pixels, so changing the system appearance can
 /// leave a dark/light surface stale even though the card itself is rebuilt.
+/// These jobs carry the appearance-refresh permit: a blank recapture of a
+/// suspended WebView still replaces the old frame -- one stale-appearance card
+/// amid the new theme looks worse than a temporary placeholder.
+/// 缓存的是真实窗口像素,系统外观切换后即使卡片树重建,缓存帧可能仍是旧明暗。
+/// 这批任务携带外观刷新许可:挂起 WebView 的空白重截也覆盖旧帧——新主题下
+/// 独独一张旧外观卡片比暂时占位更刺眼。
 pub(crate) fn refresh_for_theme(required_px_h: u32) {
     if !crate::theme::thumbnails_enabled() {
         return;
@@ -1764,7 +1912,17 @@ pub(crate) fn refresh_for_theme(required_px_h: u32) {
             // every card is refreshed as part of one theme transition.
             CapturePriority::Visible
         };
-        enqueued += usize::from(enqueue_job(key.pid, key.wid, target_px_h, priority));
+        // 外观任务携带空白覆盖许可:挂起 WebView 重截回的白板(新外观标题栏)也
+        // 要替换旧外观的有效帧,避免一张浅色帧混在深色卡片中间。
+        // Appearance jobs carry the blank-overwrite permit: even a suspended
+        // WebView's blank recapture (new-appearance title bar) must replace the
+        // stale-appearance frame, or one light frame lingers among dark cards.
+        enqueued += usize::from(enqueue_appearance_job(
+            key.pid,
+            key.wid,
+            target_px_h,
+            priority,
+        ));
     }
     log_debug!(
         "[thumb] theme refresh: requested={} enqueued={} target_h={}",
@@ -1820,6 +1978,29 @@ pub(crate) fn refresh_after_activation(pid: i32, wid: u32, activated_at: Instant
                 );
             }
         });
+}
+
+/// 同应用窗口切换的到达补拍:目标应用已是前台时,raise 它的某个窗口既不会带来
+/// 新的 App 激活通知(应用本就活跃),808 又被 own-focus 静音,激活补拍链完全不会
+/// 启动。这里在 raise 时铸造新 token 并直接调度一次激活补拍(仍受 350ms 后的前台
+/// 校验与空白重试约束);跨应用切换不满足前台前提,函数内部短路,仍走激活通知驱动
+/// 的补拍链。
+/// Arrival refresh for SAME-APP window switches: with the target app already
+/// frontmost, raising one of its windows brings no new app-activation notification
+/// (the app is already active) and its 808 is silenced as an own-focus echo, so the
+/// activation-refresh chain never starts. Mint a fresh token at raise time and
+/// schedule the activation refresh directly (still gated by the frontmost checks at
+/// +350ms and by the blank retry). Cross-app switches fail the frontmost
+/// precondition inside and keep using the notification-driven chain.
+pub(crate) fn refresh_after_same_app_switch(pid: i32, wid: u32) {
+    if !crate::theme::thumbnails_enabled() {
+        return;
+    }
+    if !pid_is_frontmost(pid) {
+        return;
+    }
+    let activated_at = crate::window_collector::note_app_activated(pid);
+    refresh_after_activation(pid, wid, activated_at);
 }
 
 /// 激活补拍仍得到空白帧:WebContent 进程尚未完成恢复重绘。延迟 ACTIVATION_BLANK_RETRY_MS
@@ -2016,6 +2197,7 @@ mod tests {
             512,
             CapturePriority::NewWindow,
             old_generation,
+            false,
         ));
         assert!(state.request(running_key, 640, CapturePriority::Selected));
         assert!(!state.finish(running));
@@ -2281,32 +2463,161 @@ mod tests {
     #[test]
     fn blank_frame_action_matrix() {
         use BlankFrameAction::*;
-        // 后台窗口的空白帧一律保底最后有效帧(挂起 WebView 的唯一可靠策略)。
-        // A blank background frame always keeps the last-known-good image (the only
-        // reliable strategy for suspended WebViews).
+        // 后台 + 缓存为空:首帧入缓存作为占位种子(替代原先的图标回落)。
+        // Background + empty cache: the first frame is stored as a placeholder
+        // seed (replacing the old icon fallback).
         assert_eq!(
-            blank_frame_action(false, false, false, false),
+            blank_frame_action(false, false, false, false, false),
+            StoreSeed
+        );
+        assert_eq!(
+            blank_frame_action(false, true, false, false, false),
+            StoreSeed
+        );
+        // 后台 + 已有帧:空白帧一律丢弃保住最后有效帧(升级单向)。
+        // Background + cached frame: blanks are always dropped to keep the
+        // last-known-good image (one-way upgrade).
+        assert_eq!(
+            blank_frame_action(false, false, true, false, false),
             DiscardKeepLastGood
         );
         assert_eq!(
-            blank_frame_action(false, true, true, true),
+            blank_frame_action(false, true, true, true, false),
             DiscardKeepLastGood
         );
         // 前台空白是用户眼前的真实画面,如实入缓存(包括激活补拍无旧帧可保时)。
         // A blank frontmost frame is what the user sees; store it (also when an
         // activation refresh has no good frame to protect).
-        assert_eq!(blank_frame_action(true, false, false, false), Store);
-        assert_eq!(blank_frame_action(true, true, false, true), Store);
+        assert_eq!(blank_frame_action(true, false, false, false, false), Store);
+        assert_eq!(blank_frame_action(true, true, false, true, false), Store);
         // 前台激活补拍仍空白且已有旧帧:丢弃并延迟重试一次。
         // A blank frontmost activation refresh with an existing frame: drop it and
         // schedule one delayed retry.
         assert_eq!(
-            blank_frame_action(true, true, true, true),
+            blank_frame_action(true, true, true, true, false),
             DiscardRetryActivation
         );
         // 重试名额已占用:不再无限重试,如实入缓存。
         // Retry slot already taken: stop retrying and store the truth.
-        assert_eq!(blank_frame_action(true, true, true, false), Store);
+        assert_eq!(blank_frame_action(true, true, true, false, false), Store);
+        // 外观切换重拍:空白覆盖后台保护。
+        // Appearance-transition recaptures: blank overwrites the background
+        // protection.
+        assert_eq!(
+            blank_frame_action(false, false, true, false, true),
+            StoreAppearanceRefresh
+        );
+        assert_eq!(
+            blank_frame_action(false, false, false, false, true),
+            StoreAppearanceRefresh
+        );
+        // 激活重试仍优先于外观覆盖(主题任务与激活请求合并时):先走 1.4s 兜底,
+        // 重试拍到的真实帧同样满足外观一致性。
+        // The activation retry still outranks the appearance overwrite (a theme
+        // job merged with an activation request): take the 1.4s backstop first --
+        // the retried real frame satisfies appearance consistency too.
+        assert_eq!(
+            blank_frame_action(true, true, true, true, true),
+            DiscardRetryActivation
+        );
+        // 重试名额已占用的激活任务携带外观标志:如实入库(外观语义)。
+        // An activation job with the appearance flag but no retry slot left:
+        // store as truth (appearance semantics).
+        assert_eq!(
+            blank_frame_action(true, true, true, false, true),
+            StoreAppearanceRefresh
+        );
+    }
+
+    #[test]
+    fn capture_state_propagates_appearance_refresh_flag() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+
+        // 独立的外观任务:标志随任务带出。
+        // A standalone appearance request: the flag rides out with the job.
+        assert!(state.request_for_generation(key, 512, CapturePriority::Visible, 0, true));
+        let job = state.take_next().unwrap();
+        assert!(job.appearance_refresh);
+        assert!(!state.finish(job));
+
+        // 普通任务默认不带标志。
+        // Ordinary jobs carry no flag by default.
+        assert!(state.request(key, 512, CapturePriority::Startup));
+        let job = state.take_next().unwrap();
+        assert!(!job.appearance_refresh);
+        assert!(!state.finish(job));
+
+        // 外观请求合并进已 pending 的普通任务:标志点亮(OR 语义)。
+        // An appearance request merging into a pending ordinary job lights the
+        // flag up (OR semantics).
+        assert!(state.request(key, 512, CapturePriority::Startup));
+        assert!(!state.request_for_generation(key, 512, CapturePriority::Visible, 0, true));
+        let job = state.take_next().unwrap();
+        assert!(job.appearance_refresh);
+        assert_eq!(job.priority, CapturePriority::Visible);
+        assert!(!state.finish(job));
+
+        // 激活补拍路径永不携带外观标志。
+        // The activation path never carries the appearance flag.
+        assert!(state.request_activation(key, 512, Instant::now(), 0));
+        let job = state.take_next().unwrap();
+        assert!(!job.appearance_refresh);
+    }
+
+    #[test]
+    fn capture_state_requeues_when_appearance_refresh_merges_into_running_job() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+
+        // 同优先级的普通任务已开始执行;主题刷新此时合入,三个常规字段都不变。
+        // An ordinary job of the SAME priority is already running when the theme
+        // refresh merges in -- none of the three regular fields change.
+        assert!(state.request(key, 512, CapturePriority::Visible));
+        let running = state.take_next().unwrap();
+        assert!(!running.appearance_refresh);
+        assert!(!state.request_for_generation(key, 512, CapturePriority::Visible, 0, true));
+
+        // 旧任务完成时必须保留 pending 触发外观补拍,而不是静默删除。
+        // Finishing the old job must keep the pending entry for the appearance
+        // recapture instead of silently dropping it.
+        assert!(state.finish(running));
+        let follow_up = state.take_next().unwrap();
+        assert!(follow_up.appearance_refresh);
+
+        // 补拍任务自身携带标志,完成时不再循环。
+        // The follow-up carries the flag itself, so finishing it does not loop.
+        assert!(!state.finish(follow_up));
+        assert!(state.take_next().is_none());
+    }
+
+    #[test]
+    fn capture_state_ignores_duplicate_activation_scheduling_for_the_same_token() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+        let activated_at = Instant::now();
+
+        assert!(state.request_activation(key, 512, activated_at, 0));
+        let running = state.take_next().unwrap();
+        assert_eq!(running.activation_at, Some(activated_at));
+
+        // 同 token 的第二次调度(808 与 backstop 双路径)合入运行中任务:不推进
+        // 新鲜度,任务完成时不得追加多余的 follow-up 重拍。
+        // A second scheduling of the SAME token (the 808 + backstop dual paths)
+        // merges into the running job without advancing freshness; finishing it
+        // must not append a redundant follow-up capture.
+        assert!(!state.request_activation(key, 512, activated_at, 0));
+        assert!(!state.finish(running));
+        assert!(state.take_next().is_none());
+
+        // 真正的新激活(不同 token)仍推进新鲜度并触发补拍。
+        // A genuinely new activation (different token) still advances freshness.
+        let later = activated_at + Duration::from_millis(1);
+        assert!(state.request_activation(key, 512, later, 0));
+        let job = state.take_next().unwrap();
+        assert_eq!(job.activation_at, Some(later));
+        assert!(!state.finish(job));
+        assert!(state.take_next().is_none());
     }
 
     #[test]

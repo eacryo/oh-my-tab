@@ -279,6 +279,18 @@ fn resolve_activation_focus(task: ActivationFocusTask) {
             }
             if let Some(cgwid) = focused_window_cgwid(task.pid) {
                 if !window_server::ax_focus_backstop_allowed(task.pid) {
+                    // 该分支 = 焦点槽位已被占用:多数是切换器自己 raise 引起的回声
+                    // (MRU 已由 commit 提交,backstop 不得重复 bump),也可能是外部
+                    // 激活的 808 先到。两条路的缩略图激活补拍此前都被这里静默吞掉,
+                    // 导致"切换器切过去"后缩略图不刷新;MRU 静音照旧,只放行补拍。
+                    // This branch = the focus slot is already consumed: usually the
+                    // echo of our own switcher raise (MRU was committed by the commit
+                    // path; the backstop must not bump again), sometimes an external
+                    // activation whose 808 arrived first. Both used to silently lose
+                    // the post-activation thumbnail refresh, leaving a just-switched-to
+                    // window without one; the MRU silencing stays, only the refresh is
+                    // let through.
+                    thumbnail::refresh_after_activation(task.pid, cgwid, task.activated_at);
                     bumped = true;
                     break;
                 }

@@ -621,9 +621,15 @@ pub(crate) extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _
                             // undisplayed CG surface (the other Ghostty tab) must not be anchored.
                             best_effort_bump_focus_key(state, pid, *window_id);
                         }
-                        if let Some(activated_at) = activation_token {
-                            thumbnail::refresh_after_activation(pid, *window_id, activated_at);
-                        }
+                        // 同应用窗口切换不会有新的 App 激活通知,激活 token 可能已过期清除;
+                        // 现场补铸一个,保证外部方式的窗口切换也触发缩略图激活补拍。
+                        // A same-app window switch brings no new app-activation
+                        // notification, so the activation token may have expired away;
+                        // mint one here so externally driven window switches also
+                        // refresh the thumbnail.
+                        let activated_at = activation_token
+                            .unwrap_or_else(|| crate::window_collector::note_app_activated(pid));
+                        thumbnail::refresh_after_activation(pid, *window_id, activated_at);
                     }
                     if displayed_pid.is_none() {
                         // 未显示的 CG 窗口也参与焦点追踪,但只有定向 AX 刷新确认后才进入卡片。

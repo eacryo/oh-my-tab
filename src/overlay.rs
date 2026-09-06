@@ -228,6 +228,10 @@ struct CardSignature {
     card_height_bits: u64,
     thumbnail_layout: bool,
     thumbnail_capture_allowed: bool,
+    /// Cached-thumbnail version the card was painted with; a bump means the frame
+    /// changed since and the card must be rebuilt instead of reused.
+    /// 卡片绘制时所用的缓存帧版本;版本前进意味着帧已更换,必须重建而非复用。
+    thumb_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +268,13 @@ fn card_signature(
         card_height_bits: frame.size.height.to_bits(),
         thumbnail_layout,
         thumbnail_capture_allowed,
+        // 帧版本入签名:种子→真实、激活补拍、外观重拍等任何一次换帧都会让下一次
+        // 召唤的签名失配走 Replace,杜绝复用路径冻结旧图(图标模式下恒为 0,无扰动)。
+        // The frame version joins the signature: any frame replacement (seed ->
+        // real, activation refresh, appearance recapture) mismatches the next
+        // summon's signature and forces a Replace, so reuse can never freeze a
+        // stale image (constant 0 in icon mode, no churn).
+        thumb_epoch: crate::thumbnail::frame_epoch(window.pid, window.window_id),
     }
 }
 
@@ -343,6 +354,19 @@ fn card_signature_for(view: *mut AnyObject) -> Option<CardSignature> {
         .unwrap()
         .get(&(view as usize))
         .cloned()
+}
+
+/// 原位刷新预览后,把已展示帧的版本号同步进签名,避免下一次召唤做多余的
+/// Replace 重建(期间若又有新帧入库,签名只会偏旧一版,至多多重建一次,自愈)。
+/// After an in-place preview refresh, sync the displayed frame's version into the
+/// signature so the next summon skips a redundant Replace rebuild (a newer frame
+/// landing in between leaves the signature one version behind -- at most one extra
+/// rebuild, always self-correcting).
+fn sync_card_signature_epoch(view: *mut AnyObject, epoch: u64) {
+    let mut signatures = CARD_SIGNATURES.lock().unwrap();
+    if let Some(signature) = signatures.get_mut(&(view as usize)) {
+        signature.thumb_epoch = epoch;
+    }
 }
 
 pub(crate) fn remove_card_index(view: *mut AnyObject) {
@@ -718,6 +742,7 @@ mod tests {
             card_height_bits: 100.0f64.to_bits(),
             thumbnail_layout: true,
             thumbnail_capture_allowed: true,
+            thumb_epoch: 0,
         }
     }
 
@@ -735,6 +760,37 @@ mod tests {
         assert_eq!(
             card_reconcile_action(None, &signature("new")),
             CardReconcileAction::Create
+        );
+    }
+
+    #[test]
+    fn card_reconcile_action_replaces_when_only_the_frame_epoch_advanced() {
+        // 缓存帧在浮窗关闭期间被替换(种子→真实/激活补拍/外观重拍):其余字段全同,
+        // 仅帧版本前进,也必须 Replace 重建,否则复用路径会永远展示旧图。
+        // The cached frame was replaced while the overlay was closed (seed -> real /
+        // activation refresh / appearance recapture): with every other field equal,
+        // the frame version alone must still force a Replace, or the reuse path
+        // keeps showing the stale image forever.
+        let mut painted = signature("same");
+        painted.thumb_epoch = 3;
+        let mut current = signature("same");
+        current.thumb_epoch = 3;
+        assert_eq!(
+            card_reconcile_action(Some(&painted), &current),
+            CardReconcileAction::Reuse
+        );
+        current.thumb_epoch = 4;
+        assert_eq!(
+            card_reconcile_action(Some(&painted), &current),
+            CardReconcileAction::Replace
+        );
+        // 缓存被清空(LRU 驱逐/关闭缩略图):版本回落到 0 同样触发重建。
+        // Cache emptied (LRU eviction / thumbnails off): the version falling back
+        // to 0 must rebuild as well.
+        current.thumb_epoch = 0;
+        assert_eq!(
+            card_reconcile_action(Some(&painted), &current),
+            CardReconcileAction::Replace
         );
     }
 
@@ -1968,6 +2024,14 @@ pub(crate) extern "C" fn overlay_window_can_become_key(_self: *mut c_void, _cmd:
 pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
     let activation_started = Instant::now();
     window_server::note_own_focus(pid, cgwid);
+    // 同应用窗口切换不会有 App 激活通知,808 又被 own-focus 静音,这里直接调度
+    // 缩略图到达补拍;跨应用切换在函数内部因前台前提不成立而短路,仍走激活通知
+    // 驱动的补拍链。
+    // A same-app window switch produces no app-activation notification and its 808
+    // is silenced as an own-focus echo, so schedule the thumbnail arrival refresh
+    // right here; cross-app switches short-circuit inside (frontmost precondition
+    // fails) and keep using the notification-driven refresh chain.
+    crate::thumbnail::refresh_after_same_app_switch(pid, cgwid);
 
     let fast_path_ok = if minimized {
         false
@@ -2792,7 +2856,14 @@ pub(crate) fn refresh_thumbnail_previews(keys: &[(i32, u32)]) {
             if preview.is_null() {
                 continue;
             }
+            // 填充前记录帧版本,填充后同步进签名;竞态下签名至多偏旧一版,
+            // 下一次召唤 Replace 自愈。
+            // Snapshot the frame version before populating and sync it into the
+            // signature afterwards; under a race the signature lags at most one
+            // version and the next summon self-heals via Replace.
+            let epoch = crate::thumbnail::frame_epoch(key.0, key.1);
             populate_thumbnail_preview(preview, window, &colors, capture_allowed);
+            sync_card_signature_epoch(card, epoch);
             updated += 1;
         }
         log_debug!(
