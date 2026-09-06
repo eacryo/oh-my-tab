@@ -364,8 +364,12 @@ pub(crate) fn check_pending() {
         return;
     }
     unsafe { defaults_remove(PENDING_MARKER_KEY) };
-    let current = unsafe { bundle_info_string("CFBundleVersion") };
-    if current.is_empty() || current == from_version {
+    // CFBundleVersion(时间戳 build)只用于判定「确实换上了新构建」;
+    // 展示给用户的版本要读 CFBundleShortVersionString(如 0.1.9),否则通知里会冒出时间戳。
+    // The timestamped CFBundleVersion only proves a new build actually arrived; the version
+    // shown to the user comes from CFBundleShortVersionString (e.g. 0.1.9) instead of the build.
+    let current_build = unsafe { bundle_info_string("CFBundleVersion") };
+    if current_build.is_empty() || current_build == from_version {
         // 安装未完成/版本未变(异常路径):只清标记,不打扰。
         // Install aborted or version unchanged: consume the marker quietly.
         log_debug!("[update-notice] pending marker consumed without version change");
@@ -379,12 +383,21 @@ pub(crate) fn check_pending() {
             display
         }
     };
+    let shown_version = unsafe {
+        let short = bundle_info_string("CFBundleShortVersionString");
+        if short.is_empty() {
+            current_build.clone()
+        } else {
+            short
+        }
+    };
     log_debug!(
-        "[update-notice] pending marker matched: {} -> {}, posting",
+        "[update-notice] pending marker matched: {} -> {} (build {}), posting",
         from_version,
-        current
+        shown_version,
+        current_build
     );
-    post_update_installed(&app, &current);
+    post_update_installed(&app, &shown_version);
 }
 
 /// 更新安装并重启后发一条系统通知(仅 bundled app;未授权时由系统弹一次性授权框)。
