@@ -2281,6 +2281,9 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
 fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
     let idx = if idx > 6 { 0 } else { idx };
+    // 切换页面时清理上一页的禁用提示，避免提示气泡跨 Tab 残留。
+    // Dismiss the previous page's disabled hint so the bubble cannot remain across tabs.
+    unsafe { tooltip::SettingsTooltip::dismiss() };
     let previous_idx = SIDEBAR_SELECTED.swap(idx, Ordering::SeqCst);
     unsafe {
         let ui = SETTINGS_UI.lock().unwrap();

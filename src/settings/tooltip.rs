@@ -410,6 +410,12 @@ impl SettingsTooltip {
         }
     }
 
+    /// Dismiss the current hint when navigation changes the visible settings page.
+    /// 切换当前可见设置页时关闭已有提示，避免上一页的气泡残留。
+    pub(super) unsafe fn dismiss() {
+        Self::hide_bubble();
+    }
+
     /// Show the hint when a click lands on a disabled settings view; any other click hides it.
     /// 点击禁用设置项时显示提示，点击其它位置时隐藏提示。
     pub(super) unsafe fn handle_mouse_down(window: *mut AnyObject, event: *mut AnyObject) {
@@ -439,8 +445,27 @@ impl SettingsTooltip {
             if view_window != window {
                 continue;
             }
-            let bounds: NSRect = objc2::msg_send![view, bounds];
-            let rect: NSRect = objc2::msg_send![view, convertRect: bounds, toView: content];
+
+            // All settings pages share the same window and are hidden rather than destroyed.
+            // Skip controls whose page is hidden, otherwise a hidden page can win this manual
+            // coordinate lookup because its frame overlaps the visible page.
+            // 所有设置页共用同一个窗口，只通过隐藏切页。跳过隐藏页面中的控件，否则隐藏页的
+            // frame 可能与当前页面重叠并在手动坐标命中时抢先匹配。
+            let hidden: bool = objc2::msg_send![view, isHiddenOrHasHiddenAncestor];
+            if hidden {
+                continue;
+            }
+
+            // Use the part that survives ancestor clipping instead of the full local bounds.
+            // This keeps a scrolled-out or partially clipped control from claiming clicks in
+            // content that the user cannot currently see.
+            // 使用经过父级裁切后仍可见的区域，而不是完整 bounds，避免滚出视口或被裁切的控件
+            // 抢占用户当前看不到的区域。
+            let visible_rect: NSRect = objc2::msg_send![view, visibleRect];
+            if visible_rect.size.width <= 0.0 || visible_rect.size.height <= 0.0 {
+                continue;
+            }
+            let rect: NSRect = objc2::msg_send![view, convertRect: visible_rect, toView: content];
             let inside = content_point.x >= rect.origin.x
                 && content_point.x <= rect.origin.x + rect.size.width
                 && content_point.y >= rect.origin.y
