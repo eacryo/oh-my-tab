@@ -128,12 +128,6 @@ unsafe fn send_id4(
     f(receiver, selector, first, second, third, fourth)
 }
 
-unsafe fn send_void(receiver: *mut AnyObject, selector: Sel) {
-    type Fn = unsafe extern "C" fn(*mut AnyObject, Sel);
-    let f: Fn = std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, selector)
-}
-
 unsafe fn send_void_bool(receiver: *mut AnyObject, selector: Sel, value: bool) {
     type Fn = unsafe extern "C" fn(*mut AnyObject, Sel, bool);
     let f: Fn = std::mem::transmute(objc_msgSend as *const ());
@@ -643,6 +637,13 @@ unsafe fn check_loading_timer_target() -> *mut AnyObject {
                 advance_check_loading_frame as *mut c_void,
                 types.as_ptr(),
             );
+            let timeout_types = CString::new("v@:").unwrap();
+            class_addMethod(
+                cls,
+                sel!(handleUpdateCheckTimeout),
+                handle_update_check_timeout as *mut c_void,
+                timeout_types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             let target: *mut AnyObject = msg_send![cls as *const AnyObject, new];
             ObjPtr(target)
@@ -719,18 +720,13 @@ pub(crate) fn begin_inline_check() {
     if UPDATE_UI_STATE.lock().unwrap().check_button == 0 {
         return;
     }
-    set_check_button_status(&t("settings.update_checking"), false);
-    let check_button = UPDATE_UI_STATE.lock().unwrap().check_button as *mut AnyObject;
-    unsafe {
-        // 先结束上一条语句,确保取指针时的 MutexGuard 在进入动画函数前已经释放。
-        // End the previous statement so the MutexGuard is released before entering the animator.
-        start_check_loading_indicator(check_button)
-    };
+
+    // Arm the guard before touching AppKit so a stuck UI update cannot prevent the fallback from
+    // ever being scheduled.
+    // 先启动守卫再操作 AppKit，避免 UI 更新卡住时连兜底线程都无法创建。
     *CHECK_TIMER.lock().unwrap() = Some(Instant::now());
-    // 守卫生程:若超时后按钮仍处于禁用(即尚无任何回调恢复),显示「重试检查」而不是误报无更新。
-    // Guard thread: if the button is still disabled after the timeout (no callback restored it),
-    // show "Retry Check" instead of incorrectly reporting no update.
-    std::thread::spawn(|| {
+    let timeout_target = unsafe { check_loading_timer_target() } as usize;
+    std::thread::spawn(move || {
         std::thread::sleep(CHECK_TIMEOUT);
         let stale = {
             let timer = CHECK_TIMER.lock().unwrap();
@@ -741,13 +737,40 @@ pub(crate) fn begin_inline_check() {
         };
         if stale {
             log_info!(
-                "Sparkle update check timed out after {}s without a completion callback",
+                "Sparkle update check timed out after {}s; scheduling main-thread recovery",
                 CHECK_TIMEOUT.as_secs()
             );
-            set_check_button_status(&t("settings.btn_retry_update_check"), true);
-            clear_inline_check();
+            unsafe {
+                let target = timeout_target as *mut AnyObject;
+                if !target.is_null() {
+                    let _: () = msg_send![
+                        target,
+                        performSelectorOnMainThread: sel!(handleUpdateCheckTimeout),
+                        withObject: std::ptr::null::<AnyObject>(),
+                        waitUntilDone: false
+                    ];
+                }
+            }
         }
     });
+
+    set_check_button_status(&t("settings.update_checking"), false);
+    let check_button = UPDATE_UI_STATE.lock().unwrap().check_button as *mut AnyObject;
+    unsafe {
+        // 先结束上一条语句,确保取指针时的 MutexGuard 在进入动画函数前已经释放。
+        // End the previous statement so the MutexGuard is released before entering the animator.
+        start_check_loading_indicator(check_button)
+    };
+}
+
+/// Recover the inline check on the main thread after Sparkle stays silent.
+/// Sparkle 长时间无回调时，在主线程恢复内联检查按钮。
+extern "C" fn handle_update_check_timeout(_this: *mut c_void, _cmd: Sel) {
+    if CHECK_TIMER.lock().unwrap().is_none() {
+        return;
+    }
+    clear_inline_check();
+    set_check_button_status(&t("settings.btn_retry_update_check"), true);
 }
 
 /// 清除内联「检查中」计时,表示已得到结果(无论成功/失败/无更新)。
@@ -931,17 +954,13 @@ unsafe fn make_custom_result_window(
         content,
     );
 
-    let ok: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let ok: *mut AnyObject = msg_send![
-        ok,
-        initWithFrame: NSRect::new(NSPoint::new(350.0, 24.0), NSSize::new(138.0, 34.0))
-    ];
-    let ok_title = make_nsstring(&t("settings.btn_ok"));
-    let _: () = msg_send![ok, setTitle: ok_title];
-    crate::ffi::CFRelease(ok_title as *const c_void);
-    let _: () = msg_send![ok, setBezelStyle: 1u64];
-    let _: () = msg_send![ok, setTarget: driver as *mut AnyObject];
-    let _: () = msg_send![ok, setAction: sel!(acknowledgeCustomUpdateResult:)];
+    let ok = crate::settings::components::SettingsButton::action(
+        NSRect::new(NSPoint::new(350.0, 24.0), NSSize::new(138.0, 34.0)),
+        &t("settings.btn_ok"),
+        driver as *mut AnyObject,
+        sel!(acknowledgeCustomUpdateResult:),
+        crate::settings::components::SettingsButtonRole::Action,
+    );
     add_control(
         target,
         window_w,
@@ -949,6 +968,7 @@ unsafe fn make_custom_result_window(
         NSRect::new(NSPoint::new(350.0, 24.0), NSSize::new(138.0, 34.0)),
         content,
     );
+    crate::settings::widgets::refresh_settings_button_tracking(ok);
 
     if !window.is_null() {
         let _: () = msg_send![window, center];
@@ -1152,10 +1172,70 @@ unsafe fn make_custom_update_found_window(
         &[("app", &app), ("version", &version)],
     );
 
-    let target = render_target(INLINE_UPDATE_HEIGHT);
     let window_w = 640.0;
+    let button_y = 14.0;
+    let button_gap = 4.0;
+    let message_h = 44.0;
+    let title_h = 32.0;
+    let layout_scale = {
+        let ui = UPDATE_UI_STATE.lock().unwrap();
+        if ui.host_view == 0 {
+            1.0
+        } else {
+            let frame: NSRect = msg_send![ui.host_view as *mut AnyObject, frame];
+            (frame.size.width / window_w).max(0.1)
+        }
+    };
+    let skip_w = 166.0 * layout_scale;
+    let later_w = 166.0 * layout_scale;
+    let install_w = 200.0 * layout_scale;
+
+    // Measure all actions through the shared settings button helper. The three buttons stay the
+    // same height, so a long localized action cannot make only one control look misaligned.
+    // 三个操作按钮统一复用设置页的换行测量逻辑，并取最高值，避免长本地化文案只撑高其中一个按钮。
+    let skip_title = t("settings.btn_skip_version");
+    let skip = crate::settings::components::SettingsButton::action(
+        NSRect::new(NSPoint::new(32.0, button_y), NSSize::new(166.0, 36.0)),
+        &skip_title,
+        driver as *mut AnyObject,
+        sel!(skipCustomUpdate:),
+        crate::settings::components::SettingsButtonRole::Action,
+    );
+    let skip_h = crate::settings::widgets::configure_settings_button_wrapping(skip, skip_w, 3);
+
+    let later_title = t("settings.btn_remind_later");
+    let later = crate::settings::components::SettingsButton::action(
+        NSRect::new(NSPoint::new(220.0, button_y), NSSize::new(166.0, 36.0)),
+        &later_title,
+        driver as *mut AnyObject,
+        sel!(dismissCustomUpdate:),
+        crate::settings::components::SettingsButtonRole::Action,
+    );
+    let later_h = crate::settings::widgets::configure_settings_button_wrapping(later, later_w, 3);
+
+    let install_title = t("settings.btn_install_update");
+    let install = crate::settings::components::SettingsButton::action(
+        NSRect::new(NSPoint::new(408.0, button_y), NSSize::new(200.0, 36.0)),
+        &install_title,
+        driver as *mut AnyObject,
+        sel!(installCustomUpdate:),
+        crate::settings::components::SettingsButtonRole::Primary,
+    );
+    let key_equivalent = make_nsstring("\r");
+    let _: () = msg_send![install, setKeyEquivalent: key_equivalent];
+    crate::ffi::CFRelease(key_equivalent as *const c_void);
+    let install_h =
+        crate::settings::widgets::configure_settings_button_wrapping(install, install_w, 3);
+
+    let button_h = [skip_h, later_h, install_h]
+        .into_iter()
+        .fold(36.0f64, f64::max);
+    let message_y = button_y + button_h + button_gap;
+    let title_y = message_y + message_h + 10.0;
+    let window_h = title_y + title_h;
+    let target = render_target(window_h);
     let (content, window) = if target.host.is_null() {
-        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, 140.0));
+        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, window_h));
         // NSWindowStyleMaskTitled = 1; NSBackingStoreBuffered = 2.
         let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
         let window: *mut AnyObject = msg_send![
@@ -1179,7 +1259,7 @@ unsafe fn make_custom_update_found_window(
     let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let title: *mut AnyObject = msg_send![
         title,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 108.0), NSSize::new(576.0, 32.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, title_y), NSSize::new(576.0, title_h))
     ];
     let title_ns = make_nsstring(&title_text);
     let _: () = msg_send![title, setStringValue: title_ns];
@@ -1195,14 +1275,14 @@ unsafe fn make_custom_update_found_window(
         target,
         window_w,
         title,
-        NSRect::new(NSPoint::new(32.0, 108.0), NSSize::new(576.0, 32.0)),
+        NSRect::new(NSPoint::new(32.0, title_y), NSSize::new(576.0, title_h)),
         content,
     );
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
         message,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 54.0), NSSize::new(576.0, 44.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, message_y), NSSize::new(576.0, message_h))
     ];
     let message_ns = make_nsstring(&message_text);
     let _: () = msg_send![message, setStringValue: message_ns];
@@ -1220,69 +1300,24 @@ unsafe fn make_custom_update_found_window(
         target,
         window_w,
         message,
-        NSRect::new(NSPoint::new(32.0, 54.0), NSSize::new(576.0, 44.0)),
+        NSRect::new(NSPoint::new(32.0, message_y), NSSize::new(576.0, message_h)),
         content,
     );
 
-    let skip: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let skip: *mut AnyObject = msg_send![
-        skip,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 14.0), NSSize::new(166.0, 36.0))
-    ];
-    let skip_title = make_nsstring(&t("settings.btn_skip_version"));
-    let _: () = msg_send![skip, setTitle: skip_title];
-    crate::ffi::CFRelease(skip_title as *const c_void);
-    let _: () = msg_send![skip, setBezelStyle: 1u64];
-    let _: () = msg_send![skip, setTarget: driver as *mut AnyObject];
-    let _: () = msg_send![skip, setAction: sel!(skipCustomUpdate:)];
-    add_control(
-        target,
-        window_w,
-        skip,
-        NSRect::new(NSPoint::new(32.0, 14.0), NSSize::new(166.0, 36.0)),
-        content,
-    );
+    let skip_frame = NSRect::new(NSPoint::new(32.0, button_y), NSSize::new(166.0, button_h));
+    let _: () = msg_send![skip, setFrame: skip_frame];
+    add_control(target, window_w, skip, skip_frame, content);
+    crate::settings::widgets::center_settings_button_label(skip, button_h);
 
-    let later: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let later: *mut AnyObject = msg_send![
-        later,
-        initWithFrame: NSRect::new(NSPoint::new(220.0, 14.0), NSSize::new(166.0, 36.0))
-    ];
-    let later_title = make_nsstring(&t("settings.btn_remind_later"));
-    let _: () = msg_send![later, setTitle: later_title];
-    crate::ffi::CFRelease(later_title as *const c_void);
-    let _: () = msg_send![later, setBezelStyle: 1u64];
-    let _: () = msg_send![later, setTarget: driver as *mut AnyObject];
-    let _: () = msg_send![later, setAction: sel!(dismissCustomUpdate:)];
-    add_control(
-        target,
-        window_w,
-        later,
-        NSRect::new(NSPoint::new(220.0, 14.0), NSSize::new(166.0, 36.0)),
-        content,
-    );
+    let later_frame = NSRect::new(NSPoint::new(220.0, button_y), NSSize::new(166.0, button_h));
+    let _: () = msg_send![later, setFrame: later_frame];
+    add_control(target, window_w, later, later_frame, content);
+    crate::settings::widgets::center_settings_button_label(later, button_h);
 
-    let install: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let install: *mut AnyObject = msg_send![
-        install,
-        initWithFrame: NSRect::new(NSPoint::new(408.0, 14.0), NSSize::new(200.0, 36.0))
-    ];
-    let install_title = make_nsstring(&t("settings.btn_install_update"));
-    let _: () = msg_send![install, setTitle: install_title];
-    crate::ffi::CFRelease(install_title as *const c_void);
-    let _: () = msg_send![install, setBezelStyle: 1u64];
-    let key_equivalent = make_nsstring("\r");
-    let _: () = msg_send![install, setKeyEquivalent: key_equivalent];
-    crate::ffi::CFRelease(key_equivalent as *const c_void);
-    let _: () = msg_send![install, setTarget: driver as *mut AnyObject];
-    let _: () = msg_send![install, setAction: sel!(installCustomUpdate:)];
-    add_control(
-        target,
-        window_w,
-        install,
-        NSRect::new(NSPoint::new(408.0, 14.0), NSSize::new(200.0, 36.0)),
-        content,
-    );
+    let install_frame = NSRect::new(NSPoint::new(408.0, button_y), NSSize::new(200.0, button_h));
+    let _: () = msg_send![install, setFrame: install_frame];
+    add_control(target, window_w, install, install_frame, content);
+    crate::settings::widgets::center_settings_button_label(install, button_h);
 
     if !window.is_null() {
         let _: () = msg_send![window, center];
@@ -1520,15 +1555,40 @@ unsafe fn make_custom_choice_window(
     message_text: &str,
 ) {
     close_custom_update_window();
-    let target = render_target(INLINE_UPDATE_HEIGHT);
     // 与下载阶段共用 560pt 设计宽度,让内联缩放后的内容宽度保持稳定。
     // Use the same 560pt design width as the download phase so inline content keeps a stable width.
     let window_w = 560.0;
+    let layout_scale = {
+        let ui = UPDATE_UI_STATE.lock().unwrap();
+        if ui.host_view == 0 {
+            1.0
+        } else {
+            let frame: NSRect = msg_send![ui.host_view as *mut AnyObject, frame];
+            (frame.size.width / window_w).max(0.1)
+        }
+    };
+    let button_y = 14.0;
+    let button_w = 300.0 * layout_scale;
+    let button = crate::settings::components::SettingsButton::action(
+        NSRect::new(NSPoint::new(130.0, button_y), NSSize::new(300.0, 36.0)),
+        &t("settings.btn_install_update"),
+        driver as *mut AnyObject,
+        sel!(installCustomUpdate:),
+        crate::settings::components::SettingsButtonRole::Primary,
+    );
+    let button_h =
+        crate::settings::widgets::configure_settings_button_wrapping(button, button_w, 3).max(36.0);
+    let message_h = 44.0;
+    let title_h = 32.0;
+    let message_y = button_y + button_h + 4.0;
+    let title_y = message_y + message_h + 10.0;
+    // Keep a small top inset after the title instead of reserving the old empty check-button
+    // area above the ready-to-install content.
+    // 标题上方只保留少量内边距，不再为旧的检查按钮区域预留空白。
+    let window_h = title_y + title_h + 8.0;
+    let target = render_target(window_h);
     let (content, window) = if target.host.is_null() {
-        let window_frame = NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(window_w, INLINE_UPDATE_HEIGHT),
-        );
+        let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, window_h));
         let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
         let window: *mut AnyObject = msg_send![
             window,
@@ -1551,7 +1611,7 @@ unsafe fn make_custom_choice_window(
     let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let title: *mut AnyObject = msg_send![
         title,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 100.0), NSSize::new(496.0, 32.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, title_y), NSSize::new(496.0, title_h))
     ];
     set_string_value(title, title_text);
     let _: () = msg_send![title, setBezeled: false];
@@ -1564,14 +1624,14 @@ unsafe fn make_custom_choice_window(
         target,
         window_w,
         title,
-        NSRect::new(NSPoint::new(32.0, 100.0), NSSize::new(496.0, 32.0)),
+        NSRect::new(NSPoint::new(32.0, title_y), NSSize::new(496.0, title_h)),
         content,
     );
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
         message,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 54.0), NSSize::new(496.0, 44.0))
+        initWithFrame: NSRect::new(NSPoint::new(32.0, message_y), NSSize::new(496.0, message_h))
     ];
     set_string_value(message, message_text);
     let _: () = msg_send![message, setBezeled: false];
@@ -1586,30 +1646,18 @@ unsafe fn make_custom_choice_window(
         target,
         window_w,
         message,
-        NSRect::new(NSPoint::new(32.0, 54.0), NSSize::new(496.0, 44.0)),
+        NSRect::new(NSPoint::new(32.0, message_y), NSSize::new(496.0, message_h)),
         content,
     );
 
     // 更新已下载完成,此时只保留安装操作;按钮加长并居中。
     // The update is already downloaded, so keep only the centered, wider install action.
-    let install: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let install: *mut AnyObject = msg_send![
-        install,
-        initWithFrame: NSRect::new(NSPoint::new(130.0, 14.0), NSSize::new(300.0, 36.0))
-    ];
-    let install_title = make_nsstring(&t("settings.btn_install_update"));
-    let _: () = msg_send![install, setTitle: install_title];
-    crate::ffi::CFRelease(install_title as *const c_void);
-    let _: () = msg_send![install, setBezelStyle: 1u64];
-    let _: () = msg_send![install, setTarget: driver as *mut AnyObject];
-    let _: () = msg_send![install, setAction: sel!(installCustomUpdate:)];
-    add_control(
-        target,
-        window_w,
-        install,
-        NSRect::new(NSPoint::new(130.0, 14.0), NSSize::new(300.0, 36.0)),
-        content,
-    );
+    let install = button;
+    let install_frame = NSRect::new(NSPoint::new(130.0, button_y), NSSize::new(300.0, button_h));
+    let _: () = msg_send![install, setFrame: install_frame];
+    add_control(target, window_w, install, install_frame, content);
+    crate::settings::widgets::center_settings_button_label(install, button_h);
+    crate::settings::widgets::refresh_settings_button_tracking(install);
 
     let copied_reply = copy_block(reply) as usize;
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
@@ -1629,6 +1677,9 @@ unsafe fn choose_custom_update(choice: isize) {
         ui.update_reply = 0;
         reply
     };
+    // An explicit choice acknowledges the update marker even while the About page remains open.
+    // 用户明确选择后即视为已处理更新提示，即使 About 页面仍保持打开也清除红点。
+    crate::settings::set_update_available(false);
     close_custom_update_window();
     // skip(0) / dismiss(2) 会结束更新流程,收起 About 页;install(1) 继续下载,保持展开。
     // skip(0)/dismiss(2) end the flow and collapse the About page; install(1) continues downloading.
@@ -1780,6 +1831,7 @@ extern "C" fn show_update_installed(
 ) {
     unsafe {
         log_debug!("[update-notice] driver callback showUpdateInstalledAndRelaunched fired (relaunched={})", _relaunched);
+        crate::settings::set_update_available(false);
         // Sparkle 在「安装完成并重启」后的新实例里回调本方法;除应用内结果窗口外,
         // 再发一条系统通知,让菜单栏应用在后台完成更新后也能被用户感知。
         // Sparkle calls this on the freshly relaunched instance after an install; besides
@@ -1892,6 +1944,10 @@ extern "C" fn show_update_found(
     reply: *mut c_void,
 ) {
     unsafe {
+        // Keep the marker for both background and user-initiated checks until the update is
+        // explicitly handled, so opening About does not make an actionable update disappear.
+        // 后台检查和手动检查都保留红点，直到用户明确处理更新，避免打开 About 后提示凭空消失。
+        crate::settings::set_update_available(true);
         // 后台定时检查发现新版本:不打扰式弹窗,改发系统通知,选择 Later(下次检查再提醒);
         // 用户点击通知会跳转设置 About 页,发起一次用户级检查并在那里更新。
         // A scheduled background check that finds an update must not pop a window: post a
@@ -1931,6 +1987,7 @@ extern "C" fn show_update_not_found(
 ) {
     unsafe {
         log_sparkle_error("showUpdateNotFoundWithError", _error);
+        crate::settings::set_update_available(false);
         // 内联(About 页)时把按钮切到「已是最新版本」并恢复可用,不弹窗。
         // When inline, switch the button to "You're up to date" and re-enable it; no popup.
         if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
@@ -2369,11 +2426,26 @@ pub(crate) fn check_for_updates() -> bool {
             return false;
         }
     }
-    let guard = state().lock().unwrap();
-    let Some(current) = guard.as_ref() else {
+    let updater = state()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|current| current.updater);
+    let Some(updater) = updater else {
         return false;
     };
-    log_debug!("Sparkle checkForUpdates selector dispatched");
-    unsafe { send_void(current.updater, sel!(checkForUpdates)) };
+    // Do not invoke Sparkle synchronously from the button action. A feed/network stall must not
+    // keep the AppKit event handler on the stack; Sparkle still receives the call on main.
+    // 不要在按钮 action 中同步调用 Sparkle；feed/网络卡住时不能阻塞 AppKit 事件处理器，
+    // 但仍保证 Sparkle 在主线程收到调用。
+    log_debug!("Sparkle checkForUpdates selector scheduled");
+    unsafe {
+        let _: () = msg_send![
+            updater,
+            performSelectorOnMainThread: sel!(checkForUpdates),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
     true
 }

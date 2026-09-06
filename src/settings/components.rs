@@ -560,7 +560,7 @@ impl SettingsMappingActionIcon {
 /// 设置页可点击按钮的语义角色。底层 builder 负责 AppKit tracking；这里的 role 统一选择常态
 /// 背景、文字颜色和 hover 行为，页面代码不再散落原始颜色值。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SettingsButtonRole {
+pub(crate) enum SettingsButtonRole {
     Action,
     Compact,
     Footer,
@@ -586,10 +586,10 @@ impl SettingsButtonRole {
 /// sidebar tabs, clipboard actions, and the overlay close button keep their own interaction model.
 /// 设置页操作按钮的统一语义组件。开关、侧边栏 tab、剪贴板操作和浮窗关闭按钮拥有独立交互，
 /// 继续使用各自的专用组件。
-pub(super) struct SettingsButton;
+pub(crate) struct SettingsButton;
 
 impl SettingsButton {
-    pub(super) unsafe fn action(
+    pub(crate) unsafe fn action(
         frame: NSRect,
         title: &str,
         target: *mut AnyObject,
@@ -693,6 +693,7 @@ impl RestoreDefaultsControl {
         );
         for button in [trigger, confirm, cancel] {
             let _: () = objc2::msg_send![button, setFrame: button_frame];
+            widgets::center_settings_button_label(button, button_h);
             widgets::refresh_settings_button_tracking(button);
         }
         let collapsed_h = button_h + 12.0;
@@ -902,6 +903,7 @@ impl RestoreDefaultsControl {
             let mut frame: NSRect = objc2::msg_send![button, frame];
             frame.size.height = button_h;
             let _: () = objc2::msg_send![button, setFrame: frame];
+            widgets::center_settings_button_label(button, button_h);
             widgets::refresh_settings_button_tracking(button);
         }
 

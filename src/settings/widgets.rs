@@ -15,6 +15,30 @@ pub(super) fn settings_palette() -> UiPalette {
     ui_palette()
 }
 
+/// Return a flipped NSView class for embedded flows that use top-down child coordinates.
+/// 为使用自顶向下子坐标的内嵌流程提供真正 flipped 的 NSView 类。
+pub(crate) fn flipped_settings_view_class() -> *mut AnyObject {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    *CLASS.get_or_init(|| unsafe {
+        let name = CString::new("OhMyTabFlippedSettingsView").unwrap();
+        let superclass = class!(NSView) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        let types = CString::new("B@:").unwrap();
+        class_addMethod(
+            cls,
+            sel!(isFlipped),
+            flipped_settings_view_is_flipped as *mut c_void,
+            types.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        cls as usize
+    }) as *mut AnyObject
+}
+
+extern "C" fn flipped_settings_view_is_flipped(_this: *mut c_void, _cmd: Sel) -> bool {
+    true
+}
+
 /// Semantic text roles used by every settings label and control.
 /// 设置界面所有文字和控件统一使用语义化颜色角色。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,11 +244,11 @@ pub(super) unsafe fn make_settings_styled_button(
 }
 
 /// Configure a settings button to show wrapped text, returning the height needed for at most
-/// `max_lines` lines. The button cell owns the text drawing, so configure the cell rather than
-/// adding a second label that could interfere with native button hit testing.
-/// 将设置按钮配置为换行文本，并返回最多 `max_lines` 行所需的高度。文本由按钮 cell 自己绘制，
-/// 因此直接配置 cell，避免额外 label 干扰原生按钮的命中测试。
-pub(super) unsafe fn configure_settings_button_wrapping(
+/// `max_lines` lines. The native cell keeps the button interaction/bezel, while a disabled child
+/// label owns multiline drawing so AppKit cannot collapse the title back to one line.
+/// 将设置按钮配置为换行文本，并返回最多 `max_lines` 行所需的高度。原生 cell 继续负责按钮
+/// 交互和背景，禁用的子 label 负责多行绘制，避免 AppKit 把标题重新压回单行。
+pub(crate) unsafe fn configure_settings_button_wrapping(
     button: *mut AnyObject,
     width: f64,
     max_lines: usize,
@@ -232,26 +256,71 @@ pub(super) unsafe fn configure_settings_button_wrapping(
     if button.is_null() {
         return 30.0;
     }
-    let cell: *mut AnyObject = msg_send![button, cell];
-    if cell.is_null() {
-        return 30.0;
-    }
-
-    let _: () = msg_send![cell, setWraps: true];
-    let _: () = msg_send![cell, setUsesSingleLineMode: false];
-    let _: () = msg_send![cell, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
-    if msg_send![cell, respondsToSelector: sel!(setTruncatesLastVisibleLine:)] {
-        let _: () = msg_send![cell, setTruncatesLastVisibleLine: true];
-    }
-
-    let single_line: NSSize = msg_send![cell, cellSize];
-    let measured: NSSize = msg_send![
-        cell,
-        cellSizeForBounds: NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(width.max(1.0), 10_000.0),
-        )
+    let title: *mut AnyObject = msg_send![button, title];
+    let title_utf8: *const std::ffi::c_char = msg_send![title, UTF8String];
+    let title = if title_utf8.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(title_utf8)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let label_w = (width - 16.0).max(1.0);
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![
+        label,
+        initWithFrame: NSRect::new(NSPoint::new(8.0, 0.0), NSSize::new(label_w, 36.0))
     ];
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setEnabled: false];
+    let _: () = msg_send![label, setAlignment: 1isize]; // NSTextAlignmentCenter
+    let _: () = msg_send![label, setUsesSingleLineMode: false];
+    let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![label, setMaximumNumberOfLines: max_lines.max(1) as isize];
+    }
+    if msg_send![label, respondsToSelector: sel!(setTruncatesLastVisibleLine:)] {
+        let _: () = msg_send![label, setTruncatesLastVisibleLine: false];
+    }
+    let _: () = msg_send![label, setPreferredMaxLayoutWidth: label_w];
+    let title_ns = make_nsstring(&title);
+    let _: () = msg_send![label, setStringValue: title_ns];
+    CFRelease(title_ns as *const c_void);
+
+    let button_cell: *mut AnyObject = msg_send![button, cell];
+    if !button_cell.is_null() && msg_send![button_cell, respondsToSelector: sel!(font)] {
+        let font: *mut AnyObject = msg_send![button_cell, font];
+        if !font.is_null() {
+            let _: () = msg_send![label, setFont: font];
+        }
+    }
+    let tint: *mut AnyObject = msg_send![button, contentTintColor];
+    if !tint.is_null() {
+        let _: () = msg_send![label, setTextColor: tint];
+    }
+    let label_cell: *mut AnyObject = msg_send![label, cell];
+    if !label_cell.is_null()
+        && msg_send![label_cell, respondsToSelector: sel!(setVerticalAlignment:)]
+    {
+        let _: () = msg_send![label_cell, setVerticalAlignment: 1isize];
+    }
+    let _: () = msg_send![button, addSubview: label];
+    release_obj(label);
+    let empty_title = make_nsstring("");
+    let _: () = msg_send![button, setTitle: empty_title];
+    CFRelease(empty_title as *const c_void);
+
+    if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![label, setMaximumNumberOfLines: 1isize];
+    }
+    let single_line: NSSize = msg_send![label, sizeThatFits: NSSize::new(label_w, 10_000.0)];
+    if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![label, setMaximumNumberOfLines: max_lines.max(1) as isize];
+    }
+    let measured: NSSize = msg_send![label, sizeThatFits: NSSize::new(label_w, 10_000.0)];
     let line_height = if single_line.height.is_finite() && single_line.height > 0.0 {
         single_line.height
     } else {
@@ -264,12 +333,57 @@ pub(super) unsafe fn configure_settings_button_wrapping(
     } else {
         30.0
     };
-    measured_height.clamp(30.0, max_height.max(30.0))
+    let required_height = measured_height.clamp(30.0, max_height.max(30.0));
+    center_settings_button_label_for_width(button, width, required_height);
+    required_height
+}
+
+/// Center the shared multiline label inside the button's final frame.
+/// 将共享的多行 label 在按钮最终 frame 内垂直居中。
+pub(crate) unsafe fn center_settings_button_label(button: *mut AnyObject, height: f64) {
+    if button.is_null() {
+        return;
+    }
+    let bounds: NSRect = msg_send![button, bounds];
+    center_settings_button_label_for_width(button, bounds.size.width, height);
+}
+
+unsafe fn center_settings_button_label_for_width(button: *mut AnyObject, width: f64, height: f64) {
+    if button.is_null() {
+        return;
+    }
+    let subviews: *mut AnyObject = msg_send![button, subviews];
+    if subviews.is_null() {
+        return;
+    }
+    let count: usize = msg_send![subviews, count];
+    let label = (0..count).find_map(|index| {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        if msg_send![child, isKindOfClass: class!(NSTextField)] {
+            Some(child)
+        } else {
+            None
+        }
+    });
+    let Some(label) = label else { return };
+
+    let label_w = (width - 16.0).max(1.0);
+    let measured: NSSize = msg_send![label, sizeThatFits: NSSize::new(label_w, 10_000.0)];
+    let text_h = if measured.height.is_finite() && measured.height > 0.0 {
+        measured.height.min(height.max(1.0))
+    } else {
+        height.max(1.0)
+    };
+    let label_frame = NSRect::new(
+        NSPoint::new(8.0, (height - text_h).max(0.0) / 2.0),
+        NSSize::new(label_w, text_h),
+    );
+    let _: () = msg_send![label, setFrame: label_frame];
 }
 
 /// Rebuild the styled button's tracking area after its frame changes.
 /// 按钮 frame 变化后重建 styled button 的 tracking area。
-pub(super) unsafe fn refresh_settings_button_tracking(button: *mut AnyObject) {
+pub(crate) unsafe fn refresh_settings_button_tracking(button: *mut AnyObject) {
     if button.is_null() {
         return;
     }
@@ -309,6 +423,8 @@ pub(super) static SIDEBAR_HOVER_HIGHLIGHT: LazyLock<Mutex<Option<ObjPtr>>> =
 pub(super) static SIDEBAR_TITLE_LABELS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 pub(super) static SIDEBAR_ICON_VIEWS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub(super) static SIDEBAR_UPDATE_DOTS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(super) extern "C" fn external_link_mouse_entered(
@@ -2894,6 +3010,76 @@ unsafe fn center_sidebar_label(label: *mut AnyObject, row_h: f64) {
     frame.origin.y = (row_h - measured.height).max(0.0) / 2.0;
     frame.size.height = measured.height;
     let _: () = msg_send![label, setFrame: frame];
+}
+
+/// Show or hide the small update marker attached to a sidebar button's icon.
+/// 在侧边栏按钮图标右上角显示或隐藏小型更新标记。
+pub(super) unsafe fn set_sidebar_update_indicator(btn: *mut AnyObject, visible: bool) {
+    if btn.is_null() {
+        return;
+    }
+
+    let key = btn as usize;
+    if let Some(dot) = SIDEBAR_UPDATE_DOTS.lock().unwrap().get(&key).map(|p| p.0) {
+        let _: () = msg_send![dot, setHidden: !visible];
+        return;
+    }
+    if !visible {
+        return;
+    }
+
+    let icon_view = SIDEBAR_ICON_VIEWS
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|p| p.0)
+        .unwrap_or(std::ptr::null_mut());
+    let dot_size = 6.0;
+    // Use a sublayer instead of a subview so the marker stays purely visual and never steals
+    // clicks from the sidebar button beneath it.
+    // 使用子 layer 而不是子 view，让标记只负责显示，不会拦截底层侧边栏按钮的点击。
+    let dot: *mut AnyObject = msg_send![class!(CALayer), layer];
+    let (dot_parent, dot_frame) = if !icon_view.is_null() {
+        let _: () = msg_send![icon_view, setWantsLayer: true];
+        let icon_layer: *mut AnyObject = msg_send![icon_view, layer];
+        let bounds: NSRect = msg_send![icon_view, bounds];
+        (
+            icon_layer,
+            NSRect::new(
+                // The icon's backing layer uses a bottom-up y axis; the larger y places the dot
+                // at the icon's visual top edge rather than beside its vertical center.
+                // 图标 backing layer 的 y 轴从底部向上，使用较大的 y 才会落在视觉右上角。
+                NSPoint::new(
+                    bounds.size.width - dot_size * 0.7,
+                    bounds.size.height - dot_size * 0.7,
+                ),
+                NSSize::new(dot_size, dot_size),
+            ),
+        )
+    } else {
+        let bounds: NSRect = msg_send![btn, bounds];
+        (
+            msg_send![btn, layer],
+            NSRect::new(
+                NSPoint::new(
+                    bounds.size.width - dot_size * 2.0,
+                    bounds.size.height - dot_size * 2.0,
+                ),
+                NSSize::new(dot_size, dot_size),
+            ),
+        )
+    };
+    if dot_parent.is_null() {
+        return;
+    }
+    let _: () = msg_send![dot, setFrame: dot_frame];
+    let _: () = msg_send![dot, setCornerRadius: dot_size / 2.0];
+    layer_set_background(
+        dot,
+        crate::ffi::hex_to_cg_color(settings_palette().destructive),
+    );
+    let _: () = msg_send![dot_parent, addSublayer: dot];
+    SIDEBAR_UPDATE_DOTS.lock().unwrap().insert(key, ObjPtr(dot));
 }
 
 /// Create the single shared hover surface used by all sidebar rows.

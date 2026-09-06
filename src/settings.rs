@@ -255,9 +255,10 @@ struct SettingsUi {
     update_host_window: *mut AnyObject, // NSWindow: 宿主所属设置窗口(供更新聚焦拉起) / host's settings window
     update_card: *mut AnyObject, // NSView: Updates 卡片(展开时撑高) / Updates card (grows when expanded)
     update_card_shadow: *mut AnyObject, // NSView: Updates 卡片阴影 / Updates card shadow
-    update_card_compact_h: f64,  // 收起时卡片高度 / collapsed card height
-    update_card_expanded: bool,  // 是否已为更新流程展开 / whether expanded for a flow
-    update_host_origin_y: f64,   // 宿主收起时的原点 y(顶边 - 展开高) / host origin y when collapsed
+    update_divider: *mut AnyObject, // NSView: 更新设置与结果之间的分割线 / divider between update settings and result
+    update_card_compact_h: f64,     // 收起时卡片高度 / collapsed card height
+    update_card_expanded: bool,     // 是否已为更新流程展开 / whether expanded for a flow
+    update_host_origin_y: f64, // 宿主收起时的原点 y(顶边 - 展开高) / host origin y when collapsed
 }
 unsafe impl Send for SettingsUi {}
 
@@ -343,9 +344,24 @@ const MAPPING_ACTION_SYMBOLS: [&str; 8] = [
 ];
 unsafe impl Sync for SettingsUi {}
 static SETTINGS_UI: Mutex<Option<SettingsUi>> = Mutex::new(None);
+/// Whether a background update check found a version the user has not opened yet.
+/// 后台检查是否发现了用户尚未打开查看的新版本。
+static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
 /// Whether an editable settings text field currently owns keyboard input.
 /// 设置窗口中是否有可编辑文本框当前持有键盘输入。
 static TEXT_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Update the About-tab marker and retain the state until the settings window is created.
+/// 更新 About 标签标记；设置窗口尚未创建时保留状态，待创建后再显示。
+pub(crate) fn set_update_available(available: bool) {
+    UPDATE_AVAILABLE.store(available, Ordering::SeqCst);
+    unsafe {
+        let ui = SETTINGS_UI.lock().unwrap();
+        if let Some(ui) = ui.as_ref() {
+            widgets::set_sidebar_update_indicator(ui.sidebar_about, available);
+        }
+    }
+}
 
 /// Update the cross-thread text-input hint used by the quick-action event tap.
 /// 更新快捷操作事件 tap 跨线程读取的文本输入状态提示。
@@ -588,6 +604,7 @@ pub(crate) fn expand_update_section(window_h: f64) {
         let height_delta = window_h - host_frame.size.height;
         let _: () = msg_send![ui.update_host, setFrame: NSRect::new(NSPoint::new(host_frame.origin.x, host_top - window_h), NSSize::new(host_frame.size.width, window_h))];
         let _: () = msg_send![ui.update_host, setHidden: false];
+        let _: () = msg_send![ui.update_divider, setHidden: false];
         // 每个 Sparkle 阶段可能需要不同高度;已展开时按差值调整,避免后续控件继续使用旧高度翻转坐标。
         // Each Sparkle phase may need a different height; resize by the delta so later controls are
         // flipped against the current host height instead of the previous phase's height.
@@ -609,7 +626,7 @@ pub(crate) fn expand_update_section(window_h: f64) {
         // The update content replaces the check-button area instead of being appended below it.
         let _: () = msg_send![ui.update_check_button, setHidden: true];
         ui.update_card_expanded = true;
-        set_about_restore_control_visible(false);
+        set_about_restore_control_visible_for_ui(ui, false);
 
         // The compact document was fitted during construction; an expanded Sparkle host may
         // extend beyond that height, so re-measure the About page after changing the card.
@@ -629,16 +646,12 @@ pub(crate) fn expand_update_section(window_h: f64) {
 /// 避免展开的更新卡片与该控件在页面底部相互遮挡。
 /// Hide/show the About page's restore control while the inline update card is expanded, so
 /// the grown card and the control don't overlap at the page bottom.
-fn set_about_restore_control_visible(visible: bool) {
-    let mut ui_guard = SETTINGS_UI.lock().unwrap();
-    let Some(ui) = ui_guard.as_mut() else {
-        return;
-    };
+/// Update the About restore control while the caller already owns the settings UI guard.
+/// 调用方已经持有设置 UI 锁时，直接更新 About 恢复控件，避免递归获取同一把锁。
+unsafe fn set_about_restore_control_visible_for_ui(ui: &mut SettingsUi, visible: bool) {
     let control = &mut ui.page_restores[6];
-    unsafe {
-        let _: () = msg_send![control.container, setHidden: !visible];
-        let _: () = msg_send![control.surface, setHidden: !visible];
-    }
+    let _: () = msg_send![control.container, setHidden: !visible];
+    let _: () = msg_send![control.surface, setHidden: !visible];
 }
 
 pub(crate) fn collapse_update_section() {
@@ -682,9 +695,10 @@ pub(crate) fn collapse_update_section() {
             )
         ];
         let _: () = msg_send![ui.update_host, setHidden: true];
+        let _: () = msg_send![ui.update_divider, setHidden: true];
         let _: () = msg_send![ui.update_check_button, setHidden: false];
         ui.update_card_expanded = false;
-        set_about_restore_control_visible(true);
+        set_about_restore_control_visible_for_ui(ui, true);
     }
 }
 
@@ -3754,6 +3768,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             update_host_window: std::ptr::null_mut(),
             update_card: std::ptr::null_mut(),
             update_card_shadow: std::ptr::null_mut(),
+            update_divider: std::ptr::null_mut(),
             update_card_compact_h: 0.0,
             update_card_expanded: false,
             update_host_origin_y: 0.0,
@@ -3964,6 +3979,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         .iter_mut()
         .zip(sidebar_buttons)
         .for_each(|(slot, button)| **slot = button);
+        widgets::set_sidebar_update_indicator(
+            ui.sidebar_about,
+            UPDATE_AVAILABLE.load(Ordering::SeqCst),
+        );
 
         // HTML `.sidebar-footer`: the complete restore control is one semantic component, with
         // its separator and morphing confirm/cancel rows owned together.
@@ -5559,7 +5578,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // Check for updates: a taller full-width button whose title switches between
         // "Check for Updates…", "Checking…", and "You're up to date".
         let check_button_h = 38.0;
-        let check_button_y = download_row_y - 14.0 - check_button_h;
+        // Keep the check button directly below the second toggle. When the inline update host
+        // replaces it, the result content can then start directly at the divider without retaining
+        // the old button's vertical slot or its extra 14pt spacer.
+        // 检查更新按钮紧贴第二个开关行下方。内联更新宿主替换按钮后，结果内容直接从分割线开始，
+        // 不再保留旧按钮的高度占位和额外 14pt 间距。
+        let check_button_y = download_row_y - check_button_h;
         let check_button = SettingsButton::action(
             NSRect::new(
                 NSPoint::new(label_x, check_button_y),
@@ -5591,7 +5615,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // instead of being appended below it. With an initial height of 0, origin.y is the top.
         let compact_host_h = 0.0;
         let host_origin_y = check_button_y;
-        let update_host: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let update_host: *mut AnyObject = msg_send![widgets::flipped_settings_view_class(), alloc];
         let update_host: *mut AnyObject = msg_send![
             update_host,
             initWithFrame: NSRect::new(
@@ -5600,7 +5624,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             )
         ];
         let _: () = msg_send![update_host, setHidden: true];
-        let _: () = msg_send![update_host, setFlipped: true]; // 子视图 y 自顶向下 / child y origin is top-down
         let _: () = msg_send![about_view, addSubview: update_host];
         release_obj(update_host);
         ui.update_host = update_host;
@@ -5626,6 +5649,14 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let update_card_shadow = update_card_parts.shadow;
         ui.update_card = update_card;
         ui.update_card_shadow = update_card_shadow;
+        // Reuse the same full-width card divider as the boundary between grouped settings rows.
+        // It is hidden while compact and revealed only when the inline update result replaces the
+        // check button area, so the collapsed About page does not gain an empty separator.
+        // 复用分组设置行之间的整宽卡片分割线。收起时隐藏，内联更新结果替换检查按钮区域后才显示，
+        // 避免紧凑的 About 页面凭空多出一条空分割线。
+        let update_divider = SettingsRow::separator(about_view, download_row_y, content_w);
+        let _: () = msg_send![update_divider, setHidden: true];
+        ui.update_divider = update_divider;
         ui.update_card_compact_h = {
             let compact_frame: NSRect = msg_send![update_card, frame];
             compact_frame.size.height
@@ -5795,6 +5826,7 @@ unsafe fn detach_settings_window_runtime(ui: &SettingsUi, remove_traffic_light_o
     tooltip::SettingsTooltip::clear_runtime_registries();
     SIDEBAR_TITLE_LABELS.lock().unwrap().clear();
     SIDEBAR_ICON_VIEWS.lock().unwrap().clear();
+    SIDEBAR_UPDATE_DOTS.lock().unwrap().clear();
 }
 
 /// 作废缓存的设置窗口(释放并置 None),下次打开时按当前 locale 重建。
