@@ -288,7 +288,11 @@ impl SettingsRow {
         if cell.is_null() {
             return;
         }
-        let bounds: NSRect = objc2::msg_send![child, bounds];
+        // Measure against the full row height; a previous centering pass may have already
+        // shrunk the label frame to one line, which would otherwise hide later wrapped text.
+        // 使用完整 row 高度测量；之前的居中可能已把 label frame 收紧为单行，否则后续换行文本会被隐藏。
+        let mut bounds: NSRect = objc2::msg_send![child, bounds];
+        bounds.size.height = row_h.max(1.0);
         let measured: objc2_foundation::NSSize = objc2::msg_send![cell, cellSizeForBounds: bounds];
         if !measured.height.is_finite() || measured.height <= 0.0 {
             return;
@@ -501,6 +505,7 @@ impl SettingsControl {
         x: f64,
         y: f64,
         w: f64,
+        row_h: f64,
         icon_frame: NSRect,
         label_frame: NSRect,
     ) -> *mut AnyObject {
@@ -513,6 +518,7 @@ impl SettingsControl {
             x,
             y,
             w,
+            row_h,
             icon_frame,
             label_frame,
         )
@@ -648,15 +654,56 @@ impl RestoreDefaultsControl {
         target: *mut AnyObject,
         sidebar_width: f64,
     ) -> Self {
+        let button_w = (sidebar_width - 44.0).max(1.0);
         let button_frame = NSRect::new(
             NSPoint::new(8.0, 6.0),
-            objc2_foundation::NSSize::new(sidebar_width - 44.0, 30.0),
+            objc2_foundation::NSSize::new(button_w, 30.0),
         );
+        let trigger_title = t("settings.btn_restore_defaults");
+        let confirm_title = t("settings.btn_confirm");
+        let cancel_title = t("settings.btn_cancel");
+        let trigger = SettingsButton::action(
+            button_frame,
+            &trigger_title,
+            target,
+            objc2::sel!(handleRestoreDefaults:),
+            SettingsButtonRole::Action,
+        );
+        let confirm = SettingsButton::action(
+            button_frame,
+            &confirm_title,
+            target,
+            objc2::sel!(handleRestoreDefaultsConfirm:),
+            SettingsButtonRole::Destructive,
+        );
+        let cancel = SettingsButton::action(
+            button_frame,
+            &cancel_title,
+            target,
+            objc2::sel!(handleRestoreDefaultsCancel:),
+            SettingsButtonRole::Action,
+        );
+        let button_h = [trigger, confirm, cancel]
+            .into_iter()
+            .map(|button| widgets::configure_settings_button_wrapping(button, button_w, 3))
+            .fold(30.0f64, f64::max);
+        let button_frame = NSRect::new(
+            button_frame.origin,
+            objc2_foundation::NSSize::new(button_w, button_h),
+        );
+        for button in [trigger, confirm, cancel] {
+            let _: () = objc2::msg_send![button, setFrame: button_frame];
+            widgets::refresh_settings_button_tracking(button);
+        }
+        let collapsed_h = button_h + 12.0;
+        let expanded_h = button_h * 2.0 + 32.0;
+        let confirm_y = button_h + 20.0;
+        let container_y = 14.0;
         let separator: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         let separator: *mut AnyObject = objc2::msg_send![
             separator,
             initWithFrame: NSRect::new(
-                NSPoint::new(26.0, 61.0),
+                NSPoint::new(26.0, container_y + collapsed_h + 5.0),
                 objc2_foundation::NSSize::new(sidebar_width - 52.0, 1.0),
             )
         ];
@@ -679,8 +726,8 @@ impl RestoreDefaultsControl {
         let surface: *mut AnyObject = objc2::msg_send![
             surface,
             initWithFrame: NSRect::new(
-                NSPoint::new(22.0, 20.0),
-                objc2_foundation::NSSize::new(sidebar_width - 44.0, 30.0),
+                NSPoint::new(22.0, container_y + 6.0),
+                objc2_foundation::NSSize::new(button_w, button_h),
             )
         ];
         let _: () = objc2::msg_send![surface, setWantsLayer: true];
@@ -716,8 +763,8 @@ impl RestoreDefaultsControl {
         let container: *mut AnyObject = objc2::msg_send![
             container,
             initWithFrame: NSRect::new(
-                NSPoint::new(14.0, 14.0),
-                objc2_foundation::NSSize::new(sidebar_width - 28.0, 42.0),
+                NSPoint::new(container_y, container_y),
+                objc2_foundation::NSSize::new(sidebar_width - 28.0, collapsed_h),
             )
         ];
         let _: () = objc2::msg_send![container, setAutoresizingMask: 36u64];
@@ -732,35 +779,14 @@ impl RestoreDefaultsControl {
         }
         let _: () = objc2::msg_send![parent, addSubview: container];
 
-        let trigger = SettingsButton::action(
-            button_frame,
-            &t("settings.btn_restore_defaults"),
-            target,
-            objc2::sel!(handleRestoreDefaults:),
-            SettingsButtonRole::Action,
-        );
         let _: () = objc2::msg_send![trigger, setAutoresizingMask: 36u64];
         let _: () = objc2::msg_send![container, addSubview: trigger];
 
-        let confirm = SettingsButton::action(
-            button_frame,
-            &t("settings.btn_confirm"),
-            target,
-            objc2::sel!(handleRestoreDefaultsConfirm:),
-            SettingsButtonRole::Destructive,
-        );
         let _: () = objc2::msg_send![confirm, setAutoresizingMask: 36u64];
         let _: () = objc2::msg_send![confirm, setHidden: true];
         let _: () = objc2::msg_send![confirm, setAlphaValue: 0.0f64];
         let _: () = objc2::msg_send![container, addSubview: confirm];
 
-        let cancel = SettingsButton::action(
-            button_frame,
-            &t("settings.btn_cancel"),
-            target,
-            objc2::sel!(handleRestoreDefaultsCancel:),
-            SettingsButtonRole::Action,
-        );
         let _: () = objc2::msg_send![cancel, setAutoresizingMask: 36u64];
         let _: () = objc2::msg_send![cancel, setHidden: true];
         let _: () = objc2::msg_send![cancel, setAlphaValue: 0.0f64];
@@ -780,9 +806,9 @@ impl RestoreDefaultsControl {
             surface,
             container,
             separator,
-            confirm_y: 50.0,
-            collapsed_h: 42.0,
-            expanded_h: 92.0,
+            confirm_y,
+            collapsed_h,
+            expanded_h,
             expanded: false,
         }
     }
@@ -806,13 +832,50 @@ impl RestoreDefaultsControl {
         y_bottom: f64,
         width: f64,
     ) -> Self {
-        let row_h = 30.0;
         let button_w = width.clamp(1.0, 180.0);
         let horizontal_inset = 8.0;
         let container_w = button_w + horizontal_inset * 2.0;
+        let button_frame = NSRect::new(
+            NSPoint::new(horizontal_inset, 6.0),
+            objc2_foundation::NSSize::new(button_w, 30.0),
+        );
+        let trigger_title = t("settings.btn_restore_page_defaults");
+        let confirm_title = t("settings.btn_confirm");
+        let cancel_title = t("settings.btn_cancel");
+        let trigger = SettingsButton::action(
+            button_frame,
+            &trigger_title,
+            target,
+            objc2::sel!(handlePageRestoreDefaults:),
+            SettingsButtonRole::Action,
+        );
+        let confirm = SettingsButton::action(
+            NSRect::new(
+                NSPoint::new(horizontal_inset, 54.0),
+                objc2_foundation::NSSize::new(button_w, 30.0),
+            ),
+            &confirm_title,
+            target,
+            objc2::sel!(handlePageRestoreDefaultsConfirm:),
+            SettingsButtonRole::Destructive,
+        );
+        let cancel = SettingsButton::action(
+            button_frame,
+            &cancel_title,
+            target,
+            objc2::sel!(handlePageRestoreDefaultsCancel:),
+            SettingsButtonRole::Action,
+        );
+        let button_h = [trigger, confirm, cancel]
+            .into_iter()
+            .map(|button| widgets::configure_settings_button_wrapping(button, button_w, 3))
+            .fold(30.0f64, f64::max);
+        let collapsed_h = button_h + 12.0;
+        let expanded_h = button_h * 2.0 + 32.0;
+        let confirm_y = button_h + 20.0;
         let container_frame = NSRect::new(
-            NSPoint::new(x + width - container_w, y_bottom),
-            objc2_foundation::NSSize::new(container_w, 42.0),
+            NSPoint::new(x + width - container_w, y_bottom - collapsed_h),
+            objc2_foundation::NSSize::new(container_w, collapsed_h),
         );
         let container: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         // initWithFrame: 返回对象本身;objc2 在 debug 下校验返回类型编码,必须绑定返回值。
@@ -835,16 +898,12 @@ impl RestoreDefaultsControl {
         // 触发按钮保持紧凑尺寸并贴在页面内容右下角；展开时确认/取消按钮复用该宽度。
         // Keep the trigger compact and pinned to the page content's bottom-right; the expanded
         // confirm/cancel rows reuse the same width.
-        let trigger = SettingsButton::action(
-            NSRect::new(
-                NSPoint::new(horizontal_inset, 6.0),
-                objc2_foundation::NSSize::new(button_w, row_h),
-            ),
-            &t("settings.btn_restore_page_defaults"),
-            target,
-            objc2::sel!(handlePageRestoreDefaults:),
-            SettingsButtonRole::Action,
-        );
+        for button in [trigger, confirm, cancel] {
+            let mut frame: NSRect = objc2::msg_send![button, frame];
+            frame.size.height = button_h;
+            let _: () = objc2::msg_send![button, setFrame: frame];
+            widgets::refresh_settings_button_tracking(button);
+        }
 
         // 展开卡片是位于按钮后方的独立表面,展开时作为整体淡入并向上生长。
         // The expanded card is a separate surface behind the buttons that fades in and grows
@@ -855,9 +914,9 @@ impl RestoreDefaultsControl {
         let surface: *mut AnyObject = objc2::msg_send![surface, initWithFrame: NSRect::new(
             NSPoint::new(
                 container_frame.origin.x + horizontal_inset,
-                y_bottom + 6.0,
+                container_frame.origin.y + 6.0,
             ),
-            objc2_foundation::NSSize::new(button_w, row_h),
+            objc2_foundation::NSSize::new(button_w, button_h),
         )];
         let _: () = objc2::msg_send![surface, setHidden: true];
         let _: () = objc2::msg_send![surface, setAlphaValue: 0.0f64];
@@ -885,30 +944,10 @@ impl RestoreDefaultsControl {
         // The container (with the buttons) must join the hierarchy ABOVE the surface.
         let _: () = objc2::msg_send![parent, addSubview: container];
 
-        let confirm = SettingsButton::action(
-            NSRect::new(
-                NSPoint::new(horizontal_inset, 54.0),
-                objc2_foundation::NSSize::new(button_w, row_h),
-            ),
-            &t("settings.btn_confirm"),
-            target,
-            objc2::sel!(handlePageRestoreDefaultsConfirm:),
-            SettingsButtonRole::Destructive,
-        );
         let _: () = objc2::msg_send![confirm, setHidden: true];
         let _: () = objc2::msg_send![confirm, setAlphaValue: 0.0f64];
         let _: () = objc2::msg_send![container, addSubview: confirm];
 
-        let cancel = SettingsButton::action(
-            NSRect::new(
-                NSPoint::new(horizontal_inset, 6.0),
-                objc2_foundation::NSSize::new(button_w, row_h),
-            ),
-            &t("settings.btn_cancel"),
-            target,
-            objc2::sel!(handlePageRestoreDefaultsCancel:),
-            SettingsButtonRole::Action,
-        );
         let _: () = objc2::msg_send![cancel, setHidden: true];
         let _: () = objc2::msg_send![cancel, setAlphaValue: 0.0f64];
         let _: () = objc2::msg_send![container, addSubview: cancel];
@@ -931,9 +970,9 @@ impl RestoreDefaultsControl {
             // 取消行与触发按钮同位(y=6),两行之间保留 14pt;顶部再留 12pt 余量。
             // The cancel row shares the trigger's position (y=6); the rows keep a 14pt gap
             // with 12pt of top padding above Confirm.
-            confirm_y: 50.0,
-            collapsed_h: 42.0,
-            expanded_h: 92.0,
+            confirm_y,
+            collapsed_h,
+            expanded_h,
             expanded: false,
         }
     }
@@ -1606,23 +1645,37 @@ impl SettingsSidebarIcon {
     }
 }
 
-fn sidebar_item_frames(w: f64) -> (NSRect, NSRect) {
-    const ROW_H: f64 = 38.0;
+fn sidebar_item_frames(w: f64, row_h: f64) -> (NSRect, NSRect) {
     const ICON_X: f64 = 16.0;
     const ICON_SIZE: f64 = 18.0;
     const LABEL_X: f64 = 46.0;
     let icon_frame = NSRect::new(
-        objc2_foundation::NSPoint::new(ICON_X, (ROW_H - ICON_SIZE) / 2.0),
+        objc2_foundation::NSPoint::new(ICON_X, (row_h - ICON_SIZE) / 2.0),
         objc2_foundation::NSSize::new(ICON_SIZE, ICON_SIZE),
     );
     let label_frame = NSRect::new(
         objc2_foundation::NSPoint::new(LABEL_X, 0.0),
-        objc2_foundation::NSSize::new((w - LABEL_X - 8.0).max(1.0), ROW_H),
+        objc2_foundation::NSSize::new((w - LABEL_X - 8.0).max(1.0), row_h),
     );
     (icon_frame, label_frame)
 }
 
 impl SettingsSidebar {
+    /// Measure one shared row height for every localized sidebar title.
+    /// 为所有本地化侧栏标题测量一套统一的行高。
+    pub(super) unsafe fn row_height(w: f64) -> f64 {
+        let titles = [
+            t("settings.sidebar_general"),
+            t("settings.sidebar_switcher"),
+            t("settings.sidebar_mouse"),
+            t("settings.sidebar_clipboard"),
+            t("settings.sidebar_window_control"),
+            t("settings.sidebar_quick_actions"),
+            t("settings.sidebar_about"),
+        ];
+        widgets::settings_sidebar_required_row_height(w, &titles)
+    }
+
     /// Set a view frame without allowing AppKit's implicit layer action to race the explicit motion.
     /// 设置 view frame 时关闭 AppKit 隐式 layer 动画，避免与显式动效争抢控制权。
     unsafe fn set_frame_without_implicit_animation(view: *mut AnyObject, frame: NSRect) {
@@ -1867,6 +1920,7 @@ impl SettingsSidebar {
         x: f64,
         y0: f64,
         w: f64,
+        row_h: f64,
     ) -> [*mut AnyObject; 7] {
         // Add new sidebar entries here: the component owns title keys, icons, tags, and spacing.
         // 新增侧栏入口只需在这里添加标题 key、图标和 tag；间距与对齐由组件统一处理。
@@ -1887,8 +1941,9 @@ impl SettingsSidebar {
             ),
             ("settings.sidebar_about", SettingsSidebarIcon::About),
         ];
-        widgets::make_sidebar_hover_highlight(parent, x, y0, w);
-        widgets::make_sidebar_hover_tracking(parent, x, y0, w);
+        let row_step = row_h + 4.0;
+        widgets::make_sidebar_hover_highlight(parent, x, y0, w, row_h);
+        widgets::make_sidebar_hover_tracking(parent, x, y0, w, row_h);
         std::array::from_fn(|index| {
             let (title_key, icon) = entries[index];
             SettingsSidebarTab::attach(
@@ -1898,8 +1953,9 @@ impl SettingsSidebar {
                 icon,
                 index as isize,
                 x,
-                y0 - index as f64 * 42.0,
+                y0 - index as f64 * row_step,
                 w,
+                row_h,
             )
         })
     }
@@ -1920,12 +1976,13 @@ impl SettingsSidebarTab {
         x: f64,
         y: f64,
         w: f64,
+        row_h: f64,
     ) -> *mut AnyObject {
         // Keep the icon and title on one explicit center line. NSTextField's cell can otherwise
         // place glyphs near the top of a 28pt frame while SF Symbols use their own optical box.
         // 用同一条明确的中心线放置图标和文字；否则 NSTextField cell 可能把字形放在 28pt
         // frame 的偏上位置，而 SF Symbols 又使用自己的 optical box，最终视觉上不对齐。
-        let (icon_frame, label_frame) = sidebar_item_frames(w);
+        let (icon_frame, label_frame) = sidebar_item_frames(w, row_h);
         SettingsControl::sidebar(
             parent,
             target,
@@ -1935,6 +1992,7 @@ impl SettingsSidebarTab {
             x,
             y,
             w,
+            row_h,
             icon_frame,
             label_frame,
         )
@@ -1967,7 +2025,7 @@ mod tests {
 
     #[test]
     fn sidebar_frames_share_the_same_vertical_center() {
-        let (icon, label) = sidebar_item_frames(240.0);
+        let (icon, label) = sidebar_item_frames(240.0, 38.0);
         let icon_center = icon.origin.y + icon.size.height / 2.0;
         let label_center = label.origin.y + label.size.height / 2.0;
         assert_eq!(icon_center, label_center);

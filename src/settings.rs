@@ -3929,7 +3929,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // Card-local layout: 12pt inner margins. The buttons stay close to the traffic lights;
         // btn_y0 is anchored to the full sidebar height rather than the toolbar-inset height.
         let btn_w = card_w - 28.0;
-        let btn_h = 38.0;
+        let btn_h = SettingsSidebar::row_height(btn_w);
         // Sidebar navigation is also anchored to the full-height sidebar. Using layout_h here
         // includes the toolbar inset a second time and leaves a large blank gap above the title.
         let btn_y0 = content_h - card_margin - 112.0 - btn_h;
@@ -3950,7 +3950,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         ui.sidebar_highlight = highlight;
 
         // Seven sidebar buttons (borderless, tags 0..6; click triggers handleSettingsSidebar:).
-        let sidebar_buttons = SettingsSidebar::build(sidebar_view, target, 14.0, btn_y0, btn_w);
+        let sidebar_buttons =
+            SettingsSidebar::build(sidebar_view, target, 14.0, btn_y0, btn_w, btn_h);
         [
             &mut ui.sidebar_general,
             &mut ui.sidebar_switcher,
@@ -4029,14 +4030,14 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // ===== 通用页内容 general page content =====
         let general_top = general_doc_h - 24.0;
         let mut y = general_top; // top cursor: bottom edge of the next element
-        add_page_title(
+        let general_title_h = add_page_title(
             general_view,
             &t("settings.sidebar_general"),
             6.0,
-            y - 34.0,
+            y,
             content_w - 12.0,
         );
-        y -= 62.0;
+        y -= general_title_h + 18.0;
 
         // --- Accessibility 权限警告条(通用页顶部覆盖;仅缺权限时显示,show_settings 里按 setHidden 切换) ---
         // --- Accessibility permission warning banner (floats at the top of General; shown only
@@ -4338,14 +4339,14 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 
         // ===== 应用切换浮窗页内容 switcher overlay page content =====
         let mut y = switcher_doc_h - 24.0;
-        add_page_title(
+        let switcher_title_h = add_page_title(
             switcher_view,
             &t("settings.sidebar_switcher"),
             6.0,
-            y - 34.0,
+            y,
             content_w - 12.0,
         );
-        y -= 62.0;
+        y -= switcher_title_h + 18.0;
 
         // --- 窗口 Window ---
         y -= 12.0;
@@ -4594,14 +4595,14 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 
         // ===== 鼠标页内容 mouse page content =====
         let mut y = mouse_doc_h - 24.0;
-        add_page_title(
+        let mouse_title_h = add_page_title(
             mouse_view,
             &t("settings.sidebar_mouse"),
             6.0,
-            y - 34.0,
+            y,
             content_w - 12.0,
         );
-        y -= 62.0;
+        y -= mouse_title_h + 18.0;
 
         // --- 启用鼠标控制(总开关,置于最顶) / Enable mouse control (topmost) ---
         y = layout.next_row_cursor(y, described_row_h);
@@ -4989,14 +4990,14 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // 独立布局游标(该页内容与鼠标页互不相关)。
         // Independent layout cursor (this page's content is unrelated to the mouse page).
         let mut cy = clipboard_doc_h - 24.0;
-        add_page_title(
+        let clipboard_title_h = add_page_title(
             clipboard_view,
             &t("settings.sidebar_clipboard"),
             6.0,
-            cy - 34.0,
+            cy,
             content_w - 12.0,
         );
-        cy -= 62.0;
+        cy -= clipboard_title_h + 18.0;
         let clipboard_header_y = cy - 18.0;
         // header 与首行间距与其他页一致(8 + row_h = 30):此前 16pt 挨得太近。
         // Header-to-first-row gap matches the other pages (8 + row_h = 30); it used to be
@@ -5166,14 +5167,14 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // 独立布局游标(该页内容与剪贴板页互不相关)。
         // Independent layout cursor (unrelated to the clipboard page).
         let mut wy = window_control_doc_h - 24.0;
-        add_page_title(
+        let window_control_title_h = add_page_title(
             window_control_view,
             &t("settings.sidebar_window_control"),
             6.0,
-            wy - 34.0,
+            wy,
             content_w - 12.0,
         );
-        wy -= 62.0;
+        wy -= window_control_title_h + 18.0;
         let window_control_header_y = wy - 18.0;
         // header 与首行间距与剪贴板页一致(18 + row_gap)。
         // Header-to-first-row gap matches the clipboard page (18 + row_gap).
@@ -5282,14 +5283,14 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // 独立布局游标(该页内容与窗口控制页互不相关)。
         // Independent layout cursor (unrelated to the window-control page).
         let mut qy = quick_actions_doc_h - 24.0;
-        add_page_title(
+        let quick_actions_title_h = add_page_title(
             quick_actions_view,
             &t("settings.sidebar_quick_actions"),
             6.0,
-            qy - 34.0,
+            qy,
             content_w - 12.0,
         );
-        qy -= 62.0;
+        qy -= quick_actions_title_h + 18.0;
         let quick_actions_header_y = qy - 18.0;
         // header 与首行间距与窗口控制页一致(18 + row_gap)。
         // Header-to-first-row gap matches the window-control page (18 + row_gap).
@@ -5720,7 +5721,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 document,
                 target,
                 6.0,
-                page_bottoms[index] - 16.0 - 42.0,
+                page_bottoms[index] - 16.0,
                 content_w - 12.0,
             );
         }

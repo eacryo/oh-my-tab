@@ -219,6 +219,81 @@ pub(super) unsafe fn make_settings_styled_button(
     button
 }
 
+/// Configure a settings button to show wrapped text, returning the height needed for at most
+/// `max_lines` lines. The button cell owns the text drawing, so configure the cell rather than
+/// adding a second label that could interfere with native button hit testing.
+/// 将设置按钮配置为换行文本，并返回最多 `max_lines` 行所需的高度。文本由按钮 cell 自己绘制，
+/// 因此直接配置 cell，避免额外 label 干扰原生按钮的命中测试。
+pub(super) unsafe fn configure_settings_button_wrapping(
+    button: *mut AnyObject,
+    width: f64,
+    max_lines: usize,
+) -> f64 {
+    if button.is_null() {
+        return 30.0;
+    }
+    let cell: *mut AnyObject = msg_send![button, cell];
+    if cell.is_null() {
+        return 30.0;
+    }
+
+    let _: () = msg_send![cell, setWraps: true];
+    let _: () = msg_send![cell, setUsesSingleLineMode: false];
+    let _: () = msg_send![cell, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    if msg_send![cell, respondsToSelector: sel!(setTruncatesLastVisibleLine:)] {
+        let _: () = msg_send![cell, setTruncatesLastVisibleLine: true];
+    }
+
+    let single_line: NSSize = msg_send![cell, cellSize];
+    let measured: NSSize = msg_send![
+        cell,
+        cellSizeForBounds: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(width.max(1.0), 10_000.0),
+        )
+    ];
+    let line_height = if single_line.height.is_finite() && single_line.height > 0.0 {
+        single_line.height
+    } else {
+        17.0
+    };
+    let max_lines = max_lines.max(1) as f64;
+    let max_height = (line_height * max_lines + 8.0).ceil();
+    let measured_height = if measured.height.is_finite() && measured.height > 0.0 {
+        (measured.height + 8.0).ceil()
+    } else {
+        30.0
+    };
+    measured_height.clamp(30.0, max_height.max(30.0))
+}
+
+/// Rebuild the styled button's tracking area after its frame changes.
+/// 按钮 frame 变化后重建 styled button 的 tracking area。
+pub(super) unsafe fn refresh_settings_button_tracking(button: *mut AnyObject) {
+    if button.is_null() {
+        return;
+    }
+    let areas: *mut AnyObject = msg_send![button, trackingAreas];
+    if !areas.is_null() {
+        let count: usize = msg_send![areas, count];
+        for index in (0..count).rev() {
+            let area: *mut AnyObject = msg_send![areas, objectAtIndex: index as isize];
+            let _: () = msg_send![button, removeTrackingArea: area];
+        }
+    }
+    let bounds: NSRect = msg_send![button, bounds];
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: bounds,
+        options: 0x01u64 | 0x80u64 | 0x200u64,
+        owner: button,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![button, addTrackingArea: tracking];
+    release_obj(tracking);
+}
+
 pub(super) struct ExternalLinkButtonClass(*mut AnyObject);
 unsafe impl Send for ExternalLinkButtonClass {}
 unsafe impl Sync for ExternalLinkButtonClass {}
@@ -458,17 +533,70 @@ pub(super) fn sidebar_hover_tracker_class() -> *mut AnyObject {
         .0
 }
 
-/// Track the whole row group so gaps between buttons do not start a hide animation.
-/// 跟踪整个条目区域，避免按钮间隙触发隐藏动画。
-pub(super) unsafe fn make_sidebar_hover_tracking(parent: *mut AnyObject, x: f64, y: f64, w: f64) {
+/// Measure one shared row height for all localized sidebar titles.
+/// 为所有本地化侧栏标题测量一套统一的行高。
+pub(super) unsafe fn settings_sidebar_required_row_height(width: f64, titles: &[String]) -> f64 {
+    let label_width = (width - 46.0 - 8.0).max(1.0);
+    let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let field: *mut AnyObject = msg_send![
+        field,
+        initWithFrame: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(label_width, 38.0),
+        )
+    ];
+    let _: () = msg_send![field, setBezeled: false];
+    let _: () = msg_send![field, setDrawsBackground: false];
+    let _: () = msg_send![field, setEditable: false];
+    let _: () = msg_send![field, setSelectable: false];
+    let _: () = msg_send![field, setUsesSingleLineMode: false];
+    let _: () = msg_send![field, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    if msg_send![field, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![field, setMaximumNumberOfLines: 2isize];
+    }
+    let _: () = msg_send![field, setPreferredMaxLayoutWidth: label_width];
+
+    let mut required_height = 38.0f64;
+    for title in titles {
+        let title_ns = make_nsstring(title);
+        let _: () = msg_send![field, setStringValue: title_ns];
+        CFRelease(title_ns as *const c_void);
+        let fonts: [*mut AnyObject; 2] = [
+            msg_send![class!(NSFont), messageFontOfSize: 13.5f64],
+            msg_send![class!(NSFont), boldSystemFontOfSize: 13.5f64],
+        ];
+        for font in fonts {
+            let _: () = msg_send![field, setFont: font];
+            let measured: NSSize =
+                msg_send![field, sizeThatFits: NSSize::new(label_width, 10_000.0)];
+            if measured.height.is_finite() && measured.height > 0.0 {
+                // Keep a little vertical breathing room around two wrapped lines, while the
+                // 38pt floor preserves the existing one-line sidebar rhythm.
+                // 为两行文本保留少量上下空间，同时用 38pt 下限保持现有单行侧栏节奏。
+                required_height = required_height.max((measured.height + 8.0).ceil());
+            }
+        }
+    }
+    release_obj(field);
+    required_height
+}
+
+pub(super) unsafe fn make_sidebar_hover_tracking(
+    parent: *mut AnyObject,
+    x: f64,
+    y: f64,
+    w: f64,
+    row_h: f64,
+) {
     let tracker: *mut AnyObject = msg_send![sidebar_hover_tracker_class(), alloc];
     let tracker: *mut AnyObject = msg_send![tracker, init];
-    let rows_h = 38.0 + 5.0 * 42.0;
+    let row_step = row_h + 4.0;
+    let rows_h = row_h + 5.0 * row_step;
     let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
     let tracking: *mut AnyObject = msg_send![
         tracking,
         initWithRect: NSRect::new(
-            NSPoint::new(x, y - 5.0 * 42.0),
+            NSPoint::new(x, y - 5.0 * row_step),
             NSSize::new(w, rows_h)
         ),
         options: 0x01u64 | 0x80u64,
@@ -1054,6 +1182,8 @@ static SETTINGS_SELECT_LABEL_VIEWS: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SETTINGS_SELECT_ARROW_VIEWS: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static SETTINGS_SELECT_ITEM_LABEL_VIEWS: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_SETTINGS_SELECT: Mutex<Option<usize>> = Mutex::new(None);
 
 struct SettingsSelectClass(*mut AnyObject);
@@ -1074,6 +1204,7 @@ pub(super) fn clear_settings_select_registry() {
     SETTINGS_SELECT_STATES.lock().unwrap().clear();
     SETTINGS_SELECT_LABEL_VIEWS.lock().unwrap().clear();
     SETTINGS_SELECT_ARROW_VIEWS.lock().unwrap().clear();
+    SETTINGS_SELECT_ITEM_LABEL_VIEWS.lock().unwrap().clear();
     *ACTIVE_SETTINGS_SELECT.lock().unwrap() = None;
 }
 
@@ -1454,6 +1585,7 @@ extern "C" fn settings_select_finish_close(this: *mut c_void, _cmd: Sel, panel: 
                 }
             });
         if should_remove && !panel.is_null() {
+            settings_select_remove_item_labels(panel);
             let _: () = msg_send![panel, removeFromSuperview];
         }
     }
@@ -1487,6 +1619,15 @@ unsafe fn settings_select_item_apply_background(item: *mut AnyObject, hovered: b
         palette.muted_text
     });
     let _: () = msg_send![item, setContentTintColor: tint];
+    let label = SETTINGS_SELECT_ITEM_LABEL_VIEWS
+        .lock()
+        .unwrap()
+        .get(&(item as usize))
+        .copied()
+        .unwrap_or(0) as *mut AnyObject;
+    if !label.is_null() {
+        let _: () = msg_send![label, setTextColor: tint];
+    }
 }
 
 extern "C" fn settings_select_item_mouse_entered(
@@ -1529,6 +1670,22 @@ extern "C" fn settings_select_item_reveal(this: *mut c_void, _cmd: Sel, _object:
     }
 }
 
+unsafe fn settings_select_remove_item_labels(panel: *mut AnyObject) {
+    if panel.is_null() {
+        return;
+    }
+    let subviews: *mut AnyObject = msg_send![panel, subviews];
+    if subviews.is_null() {
+        return;
+    }
+    let count: usize = msg_send![subviews, count];
+    let mut labels = SETTINGS_SELECT_ITEM_LABEL_VIEWS.lock().unwrap();
+    for index in 0..count {
+        let item: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+        labels.remove(&(item as usize));
+    }
+}
+
 fn settings_select_item_class() -> *mut AnyObject {
     SETTINGS_SELECT_ITEM_CLASS
         .get_or_init(|| unsafe {
@@ -1560,6 +1717,7 @@ fn settings_select_item_class() -> *mut AnyObject {
         .0
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn settings_select_make_item(
     select: *mut AnyObject,
     panel: *mut AnyObject,
@@ -1568,26 +1726,24 @@ unsafe fn settings_select_make_item(
     selected: bool,
     width: f64,
     y: f64,
+    row_h: f64,
 ) {
+    let item_w = (width - 8.0).max(1.0);
     let item: *mut AnyObject = msg_send![settings_select_item_class(), alloc];
     let item: *mut AnyObject = msg_send![
         item,
         initWithFrame: NSRect::new(
             NSPoint::new(4.0, y),
-            NSSize::new((width - 8.0).max(1.0), 32.0)
+            NSSize::new(item_w, row_h)
         )
     ];
     let _: () = msg_send![item, setButtonType: 0isize];
     let _: () = msg_send![item, setBordered: false];
-    // The row already starts 4pt inside the panel, so one extra space matches the trigger's
-    // visual inset without pushing option text too far inward.
-    // 选项行已经从面板内缩 4pt，因此只增加一个空格即可与触发器的视觉内边距保持一致。
-    let padded_title = format!(" {title}");
-    let title_ns = make_nsstring(&padded_title);
+    let title_ns = make_nsstring("");
     let _: () = msg_send![item, setTitle: title_ns];
     CFRelease(title_ns as *const c_void);
     let _: () = msg_send![item, setAlignment: 0isize]; // NSTextAlignmentLeft
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
     let _: () = msg_send![item, setFont: font];
     let _: () = msg_send![item, setTag: index as isize];
     let _: () = msg_send![item, setTarget: select];
@@ -1599,6 +1755,7 @@ unsafe fn settings_select_make_item(
         .and_then(|state| state.item_symbols.get(index))
         .and_then(|symbol| symbol.as_deref())
         .map(str::to_owned);
+    let has_symbol = symbol.is_some();
     if let Some(symbol) = symbol {
         let image = make_symbol_image(&symbol, NSSize::new(16.0, 16.0));
         if !image.is_null() {
@@ -1606,6 +1763,56 @@ unsafe fn settings_select_make_item(
             let _: () = msg_send![item, setImagePosition: 2isize]; // NSImageLeft
         }
     }
+    // Use the same wrapped text treatment as the selected value above instead of the native
+    // NSButton title, whose cell remains single-line and clips long options.
+    // 与上方选中值使用相同的换行文本处理；原生 NSButton title 的 cell 仍是单行，会截断长选项。
+    let label_x = if has_symbol { 28.0 } else { 8.0 };
+    let label_w = (item_w - label_x - 30.0).max(1.0);
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![
+        label,
+        initWithFrame: NSRect::new(
+            NSPoint::new(label_x, 0.0),
+            NSSize::new(label_w, row_h.max(1.0))
+        )
+    ];
+    let title_ns = make_nsstring(title);
+    let _: () = msg_send![label, setStringValue: title_ns];
+    CFRelease(title_ns as *const c_void);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setAlignment: 0isize]; // NSTextAlignmentLeft
+    let _: () = msg_send![label, setUsesSingleLineMode: false];
+    let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![label, setMaximumNumberOfLines: 0isize];
+    }
+    let _: () = msg_send![label, setPreferredMaxLayoutWidth: label_w];
+    let cell: *mut AnyObject = msg_send![label, cell];
+    if !cell.is_null() && msg_send![cell, respondsToSelector: sel!(setTruncatesLastVisibleLine:)] {
+        let _: () = msg_send![cell, setTruncatesLastVisibleLine: false];
+    }
+    let wrapped_size: NSSize = msg_send![label, sizeThatFits: NSSize::new(label_w, 10_000.0)];
+    let text_h = if wrapped_size.height.is_finite() && wrapped_size.height > 0.0 {
+        wrapped_size.height.min(row_h).max(1.0)
+    } else {
+        row_h.max(1.0)
+    };
+    let _: () = msg_send![
+        label,
+        setFrame: NSRect::new(
+            NSPoint::new(label_x, (row_h - text_h).max(0.0) / 2.0),
+            NSSize::new(label_w, text_h)
+        )
+    ];
+    let _: () = msg_send![item, addSubview: label];
+    SETTINGS_SELECT_ITEM_LABEL_VIEWS
+        .lock()
+        .unwrap()
+        .insert(item as usize, label as usize);
+    release_obj(label);
     let _: () = msg_send![item, setWantsLayer: true];
     let item_layer: *mut AnyObject = msg_send![item, layer];
     if !item_layer.is_null() {
@@ -1615,7 +1822,7 @@ unsafe fn settings_select_make_item(
     settings_select_item_apply_background(item, false);
     if selected {
         let check_frame = NSRect::new(
-            NSPoint::new((width - 8.0 - 24.0).max(0.0), 8.0),
+            NSPoint::new((item_w - 24.0).max(0.0), (row_h - 14.0).max(0.0) / 2.0),
             NSSize::new(14.0, 14.0),
         );
         let check = make_symbol_image_view("checkmark", check_frame);
@@ -1625,7 +1832,7 @@ unsafe fn settings_select_make_item(
     let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
     let tracking: *mut AnyObject = msg_send![
         tracking,
-        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width - 8.0, 32.0)),
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(item_w, row_h)),
         options: 0x01u64 | 0x80u64 | 0x200u64,
         owner: item,
         userInfo: std::ptr::null::<AnyObject>()
@@ -1683,6 +1890,7 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
             selector: sel!(finishClose:),
             object: stale_panel
         ];
+        settings_select_remove_item_labels(stale_panel);
         let _: () = msg_send![stale_panel, removeFromSuperview];
     }
 
@@ -1700,7 +1908,8 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
     let bounds: NSRect = msg_send![button, bounds];
     let trigger: NSRect = msg_send![button, convertRect: bounds, toView: content];
     let content_bounds: NSRect = msg_send![content, bounds];
-    let row_h = 32.0;
+    let panel_w = trigger.size.width.max(120.0);
+    let row_h = settings_select_required_option_row_height(panel_w, &items);
     let panel_h = items.len() as f64 * row_h + 8.0;
     let below = trigger.origin.y - content_bounds.origin.y;
     let above = content_bounds.origin.y + content_bounds.size.height
@@ -1716,8 +1925,6 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
         (content_bounds.origin.y + content_bounds.size.height - panel_h - 4.0)
             .max(content_bounds.origin.y + 4.0),
     );
-    let panel_w = trigger.size.width.max(120.0);
-
     let panel: *mut AnyObject = msg_send![class!(NSView), alloc];
     let panel: *mut AnyObject = msg_send![
         panel,
@@ -1760,6 +1967,7 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
             index == selected,
             panel_w,
             item_y,
+            row_h,
         );
     }
     let _: () = msg_send![content, addSubview: panel];
@@ -2248,6 +2456,14 @@ pub(super) unsafe fn settings_select_required_control_height(
     required_height
 }
 
+/// Measure one shared option-row height for every value in a select's menu.
+/// 为下拉菜单中的所有候选值测量一套统一的选项行高度。
+unsafe fn settings_select_required_option_row_height(width: f64, items: &[String]) -> f64 {
+    let items: Vec<&str> = items.iter().map(String::as_str).collect();
+    let text_height = settings_select_required_control_height(width, &items, 1.0);
+    (text_height + 8.0).ceil().max(32.0)
+}
+
 pub(super) const HTML_SWITCH_W: f64 = 38.0;
 pub(super) const HTML_SWITCH_H: f64 = 22.0;
 pub(super) const HTML_SWITCH_KNOB_D: f64 = 18.0;
@@ -2582,7 +2798,8 @@ unsafe fn set_sidebar_title_appearance(
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setStringValue: title_ns];
-    center_sidebar_label(label, 38.0);
+    let button_frame: NSRect = msg_send![btn, frame];
+    center_sidebar_label(label, button_frame.size.height);
     CFRelease(title_ns as *const c_void);
 }
 
@@ -2651,11 +2868,11 @@ unsafe fn set_sidebar_hovered(btn: *mut AnyObject, hovered: bool) {
     let _: () = msg_send![btn, setContentTintColor: color];
 }
 
-/// Fit the sidebar label to its measured single-line cell height and center that frame in the
-/// 38pt tab. This compensates for AppKit's top-biased text drawing when the label frame is taller
-/// than the actual line height, and is rerun when selection changes the font weight.
-/// 将侧栏文本 frame 收紧到 cell 测得的单行高度，再把它放到 38pt tab 的垂直中心；这样可抵消
-/// AppKit 在大 frame 中偏上绘制文字的问题，并在选中态切换字重后重新计算。
+/// Fit the sidebar label to its measured cell height and center that frame in the shared row.
+/// This compensates for AppKit's top-biased text drawing and is rerun when selection changes the
+/// font weight.
+/// 将侧栏文本 frame 收紧到 cell 测得的高度，再放到统一行高的垂直中心；这样可抵消 AppKit
+/// 在大 frame 中偏上绘制文字的问题，并在选中态切换字重后重新计算。
 unsafe fn center_sidebar_label(label: *mut AnyObject, row_h: f64) {
     if label.is_null() {
         return;
@@ -2665,6 +2882,10 @@ unsafe fn center_sidebar_label(label: *mut AnyObject, row_h: f64) {
         return;
     }
     let bounds: NSRect = msg_send![label, bounds];
+    let bounds = NSRect::new(
+        bounds.origin,
+        NSSize::new(bounds.size.width, row_h.max(1.0)),
+    );
     let measured: NSSize = msg_send![cell, cellSizeForBounds: bounds];
     if !measured.height.is_finite() || measured.height <= 0.0 {
         return;
@@ -2682,13 +2903,14 @@ pub(super) unsafe fn make_sidebar_hover_highlight(
     x: f64,
     y: f64,
     w: f64,
+    row_h: f64,
 ) -> *mut AnyObject {
     // Keep the hover surface below the buttons so it is purely visual and never intercepts input.
     // 将悬浮层放在按钮下方，使其只负责视觉效果，不拦截按钮输入。
     let hover: *mut AnyObject = msg_send![class!(NSView), alloc];
     let hover: *mut AnyObject = msg_send![
         hover,
-        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 38.0))
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, row_h))
     ];
     let _: () = msg_send![hover, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![hover, layer];
@@ -2726,10 +2948,11 @@ pub(super) unsafe fn make_sidebar_button(
     x: f64,
     y: f64,
     w: f64,
+    row_h: f64,
     icon_frame: NSRect,
     label_frame: NSRect,
 ) -> *mut AnyObject {
-    let h = 38.0;
+    let h = row_h;
     let btn: *mut AnyObject = msg_send![sidebar_button_class(), alloc];
     let btn: *mut AnyObject =
         msg_send![btn, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
@@ -2785,14 +3008,15 @@ pub(super) unsafe fn make_sidebar_button(
     let _: () = msg_send![label, setTextColor: label_color];
     let _: () = msg_send![label, setSelectable: false];
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
-                                                         // Sidebar tabs are one-line labels. Single-line mode makes NSTextField use its control-size
-                                                         // baseline instead of pinning a multi-line cell's glyphs to the top of the frame.
-                                                         // 侧栏 tab 都是单行标签；单行模式使用控件尺寸决定的 baseline，避免多行 cell 把字形顶到 frame 顶部。
-    let _: () = msg_send![label, setUsesSingleLineMode: true];
-    let _: () = msg_send![label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+                                                         // Keep every sidebar row at the same measured height, while allowing its label to use at
+                                                         // most two lines. Longer localized titles are truncated only after the shared row is full.
+                                                         // 所有侧栏行使用统一测量高度，同时允许标题最多显示两行；更长的本地化标题只在两行后截断。
+    let _: () = msg_send![label, setUsesSingleLineMode: false];
+    let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
     if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
-        let _: () = msg_send![label, setMaximumNumberOfLines: 1isize];
+        let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
     }
+    let _: () = msg_send![label, setPreferredMaxLayoutWidth: label_frame.size.width];
     let _: () = msg_send![label, setEnabled: false];
     let _: () = msg_send![btn, addSubview: label];
     SIDEBAR_TITLE_LABELS
@@ -2845,11 +3069,25 @@ pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f
     release_obj(label);
 }
 
-/// Add a page title matching the HTML redesign's large, tight heading.
-pub(super) unsafe fn add_page_title(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: f64) {
+/// Add a page title matching the HTML redesign's large, tight heading and return its height.
+/// 添加符合 HTML 设计的大号紧凑页面标题，并返回标题实际高度。
+///
+/// `top_cursor` is the cursor used by the page layout. The title keeps the same top inset while
+/// growing downward when the localized text needs additional wrapped lines.
+/// `top_cursor` 是页面布局使用的游标。标题需要换行时保持顶部内缩不变，向下增长。
+pub(super) unsafe fn add_page_title(
+    parent: *mut AnyObject,
+    text: &str,
+    x: f64,
+    top_cursor: f64,
+    w: f64,
+) -> f64 {
+    const MIN_HEIGHT: f64 = 44.0;
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let label: *mut AnyObject =
-        msg_send![label, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 44.0))];
+    let label: *mut AnyObject = msg_send![
+        label,
+        initWithFrame: NSRect::new(NSPoint::new(x, 0.0), NSSize::new(w, MIN_HEIGHT))
+    ];
     set_field(label, text);
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
@@ -2860,12 +3098,31 @@ pub(super) unsafe fn add_page_title(parent: *mut AnyObject, text: &str, x: f64, 
     let _: () = msg_send![label, setUsesSingleLineMode: false];
     let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
     if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
-        let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
+        let _: () = msg_send![label, setMaximumNumberOfLines: 3isize];
     }
+    let _: () = msg_send![label, setPreferredMaxLayoutWidth: w.max(1.0)];
+    let cell: *mut AnyObject = msg_send![label, cell];
+    if !cell.is_null() && msg_send![cell, respondsToSelector: sel!(setTruncatesLastVisibleLine:)] {
+        let _: () = msg_send![cell, setTruncatesLastVisibleLine: true];
+    }
+    let measured: NSSize = msg_send![label, sizeThatFits: NSSize::new(w.max(1.0), 10_000.0)];
+    let title_height = if measured.height.is_finite() && measured.height > 0.0 {
+        measured.height.ceil().max(MIN_HEIGHT)
+    } else {
+        MIN_HEIGHT
+    };
+    let _: () = msg_send![
+        label,
+        setFrame: NSRect::new(
+            NSPoint::new(x, top_cursor + 10.0 - title_height),
+            NSSize::new(w, title_height),
+        )
+    ];
     apply_settings_text_role(label, SettingsTextRole::Primary);
     let _: () = msg_send![label, setAutoresizingMask: 10u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
+    title_height
 }
 
 /// Build the About header icon directly from the source PNG so AppKit does not reinterpret the
@@ -3155,8 +3412,20 @@ pub(super) unsafe fn add_described_row(
     let title_color = settings_text_color(SettingsTextRole::Primary);
     let _: () = msg_send![title_label, setTextColor: title_color];
     let _: () = msg_send![title_label, setAlignment: -1isize]; // NSTextAlignmentNatural
-    let _: () = msg_send![title_label, setUsesSingleLineMode: true];
-    let _: () = msg_send![title_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+                                                               // Long translated row titles use the shared row height as a bounded multi-line text block.
+                                                               // 超长的翻译标题在统一 row 高度内使用有界多行文本块，避免单行尾部直接截断。
+    let _: () = msg_send![title_label, setUsesSingleLineMode: false];
+    let _: () = msg_send![title_label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    if msg_send![title_label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![title_label, setMaximumNumberOfLines: 3isize];
+    }
+    let _: () = msg_send![title_label, setPreferredMaxLayoutWidth: text_w.max(1.0)];
+    let title_cell: *mut AnyObject = msg_send![title_label, cell];
+    if !title_cell.is_null()
+        && msg_send![title_cell, respondsToSelector: sel!(setTruncatesLastVisibleLine:)]
+    {
+        let _: () = msg_send![title_cell, setTruncatesLastVisibleLine: false];
+    }
     let title_font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.5f64];
     let _: () = msg_send![title_label, setFont: title_font];
     let _: () = msg_send![parent, addSubview: title_label];
