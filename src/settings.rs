@@ -2477,13 +2477,13 @@ unsafe fn center_settings_window(window: *mut AnyObject) {
 }
 
 fn show_settings() {
-    show_settings_inner(None, 0, None);
+    show_settings_inner(None, 0, None, true);
 }
 
 /// Show the settings window, optionally preserving its frame and selected page.
 /// 显示设置窗口,可选地保留窗口位置和当前页。
 fn show_settings_preserving(frame: NSRect, page: usize, scroll_offsets: [NSPoint; 7]) {
-    show_settings_inner(Some(frame), page, Some(scroll_offsets));
+    show_settings_inner(Some(frame), page, Some(scroll_offsets), false);
 }
 
 unsafe fn capture_settings_scroll_offsets(ui: &SettingsUi) -> [NSPoint; 7] {
@@ -2525,6 +2525,7 @@ fn show_settings_inner(
     preserved_frame: Option<NSRect>,
     page: usize,
     preserved_scroll_offsets: Option<[NSPoint; 7]>,
+    present_window: bool,
 ) {
     unsafe {
         {
@@ -2548,21 +2549,29 @@ fn show_settings_inner(
         select_sidebar(page);
         let ui = SETTINGS_UI.lock().unwrap();
         if let Some(u) = ui.as_ref() {
-            // 切到 .regular:让设置窗口能正常激活抬升(从别的 App 顶部弹出来),关闭时切回。
-            // Switch to .regular so the settings window can activate and raise itself above
-            // the active app; reverted on close.
-            crate::set_settings_activation_policy(true);
-            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-            let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
-            if let Some(frame) = preserved_frame {
-                // 在窗口仍隐藏时设置 frame,避免新窗口先出现在默认位置再跳到旧位置。
-                // Set the frame while the replacement is hidden so it never visibly jumps from
-                // its default position to the preserved position.
+            if present_window {
+                // 切到 .regular:让设置窗口能正常激活抬升(从别的 App 顶部弹出来),关闭时切回。
+                // Switch to .regular so the settings window can activate and raise itself above
+                // the active app; reverted on close.
+                crate::set_settings_activation_policy(true);
+                let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+                let _: () = msg_send![nsapp, activateIgnoringOtherApps: true];
+                if let Some(frame) = preserved_frame {
+                    // 在窗口仍隐藏时设置 frame,避免新窗口先出现在默认位置再跳到旧位置。
+                    // Set the frame while the replacement is hidden so it never visibly jumps from
+                    // its default position to the preserved position.
+                    let _: () = msg_send![u.window, setFrame: frame, display: false];
+                } else {
+                    center_settings_window(u.window);
+                }
+                let _: () =
+                    msg_send![u.window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+            } else if let Some(frame) = preserved_frame {
+                // 主题刷新只更新同一窗口的内容,保持其后台层级与焦点,不触发应用激活。
+                // Theme refresh only replaces content in the same window, preserving its
+                // background order and focus without activating the app.
                 let _: () = msg_send![u.window, setFrame: frame, display: false];
-            } else {
-                center_settings_window(u.window);
             }
-            let _: () = msg_send![u.window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
             // 红绿灯偏移:必须等窗口完成首次布局后再移动,否则会被 AppKit 重置。
             // Offset the traffic lights only after the window's first layout pass, or AppKit
             // resets them.
@@ -2586,10 +2595,13 @@ fn show_settings_inner(
                 // scrollbar starts at the top of the track instead of the middle.
                 scroll_page_to_top(u.general_view);
             }
-            // 清掉默认 first responder,避免打开时焦点落在 Glass color 控件。
-            // Clear the default first responder so focus does not land on the Glass color control on open.
-            let _: bool = msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
-            set_text_input_active(false);
+            if present_window {
+                // 清掉默认 first responder,避免打开时焦点落在 Glass color 控件。
+                // Clear the default first responder so focus does not land on the Glass color control on open.
+                let _: bool =
+                    msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
+                set_text_input_active(false);
+            }
             // 按当前权限刷新警告条显隐(有权限就隐藏)/ refresh banner visibility by current permission
             let _: () =
                 msg_send![u.accessibility_warning_view, setHidden: has_accessibility_permission()];
