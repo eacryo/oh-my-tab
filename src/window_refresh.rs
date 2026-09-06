@@ -557,10 +557,27 @@ fn apply_window_refresh() {
         }
     }
 
+    // 显示器配置变化后的重排:窗口集合未变(set_changed=false),但屏幕几何与窗口
+    // bounds 已变;浮窗可见时也要按新比例重排一次。滚动位置保留(show_overlay 内部
+    // clamp 到新范围),集合未变时卡片索引不漂移,无需重置导航锚点。
+    // Post-display-reconfiguration relayout: the window set is unchanged
+    // (set_changed=false) yet screen geometry and window bounds moved; a visible
+    // overlay must still re-layout to the new aspects. Scroll position is kept
+    // (show_overlay clamps it into the new range) and, with the set unchanged,
+    // card indices do not drift, so navigation anchors need no reset.
+    let relayout_for_display_change = was_visible && overlay::take_display_relayout_pending();
+    if relayout_for_display_change {
+        log_debug!(
+            "[display] post-reconfiguration relayout applying refreshed bounds (set_changed={})",
+            set_changed
+        );
+    }
     if set_changed && was_visible {
         overlay::reset_thumbnail_visible_range();
         overlay::reset_thumbnail_scroll();
         overlay::reset_thumbnail_nav_anchor();
+    }
+    if was_visible && (set_changed || relayout_for_display_change) {
         overlay::show_overlay();
         overlay::refresh_highlight();
     }

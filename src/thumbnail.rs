@@ -2103,6 +2103,85 @@ pub(crate) fn refresh_for_theme(required_px_h: u32) {
     log_capture_metrics("theme");
 }
 
+/// 显示器配置变化(外接/内建切换、分辨率调整)后的强制重拍。
+/// 缓存帧携带旧屏幕配置下的窗口宽高比与像素高度:分辨率变化会改写窗口 bounds,
+/// 显示器切换会改变 backing scale,旧帧塞进按新比例布局的卡片会被错误留白。
+/// 与主题重拍不同,这批任务走普通通道:挂起 WebView 的空白帧不得覆盖最后一张
+/// 有效帧(旧比例的真实画面好过新比例的白板),几何守卫也会丢弃动画中的畸变帧。
+/// Forced recapture after a display reconfiguration (external/built-in switch or
+/// resolution change). Cached frames carry the old configuration's window aspect and
+/// pixel height: a resolution change rewrites window bounds and a display switch
+/// changes the backing scale, so an old frame letterboxes wrongly inside a card laid
+/// out for the new aspect. Unlike the theme refresh these jobs use the normal
+/// channel: a suspended WebView's blank frame must NOT overwrite the last-known-good
+/// image (a real frame with the old aspect beats a correctly-shaped blank), and the
+/// geometry guard still drops frames captured mid-animation.
+pub(crate) fn refresh_for_display_change(required_px_h: u32) {
+    if !crate::theme::thumbnails_enabled() {
+        return;
+    }
+    if !capture_allowed() {
+        request_permission_once();
+        return;
+    }
+
+    // 与 refresh_for_theme 相同的键收集:TAB_STATE 里未最小化且有 bounds 的窗口,
+    // 并上仅存在于缓存中的窗口(预生成帧),覆盖浮窗未召唤时的全部已知目标。
+    // Same key collection as refresh_for_theme: non-minimized windows with bounds
+    // from TAB_STATE, unioned with cache-only windows (pre-generated frames), so
+    // every known target is covered while the overlay is not summoned.
+    let (selected, state_keys): (Option<ThumbKey>, Vec<ThumbKey>) = {
+        let state_opt = crate::TAB_STATE.lock().unwrap();
+        match state_opt.as_ref() {
+            Some(state) => {
+                let selected = state.windows.get(state.selected).map(|window| ThumbKey {
+                    pid: window.pid,
+                    wid: window.window_id,
+                });
+                let keys = state
+                    .windows
+                    .iter()
+                    .filter(|window| {
+                        !window.minimized && window.bounds.2 > 0.0 && window.bounds.3 > 0.0
+                    })
+                    .map(|window| ThumbKey {
+                        pid: window.pid,
+                        wid: window.window_id,
+                    })
+                    .collect();
+                (selected, keys)
+            }
+            None => (None, Vec::new()),
+        }
+    };
+    let keys: Vec<ThumbKey> = {
+        let mut keys: HashSet<ThumbKey> = state_keys.into_iter().collect();
+        keys.extend(CACHE.lock().unwrap().keys());
+        keys.into_iter().collect()
+    };
+
+    let target_px_h = required_px_h.max(BASE_TARGET_PX_H);
+    let requested = keys.len();
+    let mut enqueued = 0usize;
+    for key in keys {
+        // Selected/Visible 优先级均不受切换交互门控约束,任务不会被推迟丢弃。
+        // Both Selected and Visible priorities bypass the interaction gate, so
+        // these jobs are never deferred away.
+        let priority = if selected == Some(key) {
+            CapturePriority::Selected
+        } else {
+            CapturePriority::Visible
+        };
+        enqueued += usize::from(enqueue_job(key.pid, key.wid, target_px_h, priority));
+    }
+    log_debug!(
+        "[thumb] display-change refresh: requested={} enqueued={} target_h={}",
+        requested,
+        enqueued,
+        target_px_h
+    );
+}
+
 /// 激活补拍门控的纯逻辑(供单元测试;运行时走 activation_capture_is_valid_now)。
 /// Pure gating logic for activation refreshes (unit tests; runtime goes through
 /// activation_capture_is_valid_now).

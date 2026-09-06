@@ -2971,6 +2971,122 @@ pub(crate) fn apply_theme() {
     update_status_label();
 }
 
+// ========== 显示器配置变化 / display reconfiguration ==========
+
+/// 显示器配置变化后延迟处理的去抖窗口:等窗口迁移/缩放动画收敛并合并连续通知
+/// (一次模式切换可能连发多条),再执行一次完整刷新。
+/// Debounce window before handling a display reconfiguration: let window
+/// migration/scaling animations settle and coalesce notification bursts (one mode
+/// switch may post several), then run a single full refresh.
+const DISPLAY_RECONFIG_DELAY: f64 = 0.45;
+/// 已调度去抖刷新的标记;刷新触发时清除,期间重复通知直接合并。
+/// Marks a debounced refresh as already scheduled; cleared when it fires, so
+/// repeated notifications within the window coalesce into one pass.
+static DISPLAY_RECONFIG_REFRESH_SCHEDULED: AtomicBool = AtomicBool::new(false);
+/// 窗口 bounds 后台快照落地后需要按新几何重排浮窗的标记(见 handle_display_reconfiguration)。
+/// Set when the next background window-snapshot apply should re-lay out the overlay
+/// against the new display geometry (see handle_display_reconfiguration).
+static DISPLAY_RECONFIG_RELAYOUT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 通知入口(main 线程):去抖调度一次显示器配置变化后的完整刷新。
+/// Notification entry point (main thread): schedule one debounced full refresh
+/// after a display reconfiguration.
+pub(crate) fn schedule_display_reconfiguration_refresh() {
+    if DISPLAY_RECONFIG_REFRESH_SCHEDULED.swap(true, Ordering::SeqCst) {
+        log_debug!("[display] reconfiguration refresh already pending; notification coalesced");
+        return;
+    }
+    unsafe {
+        let Some(controller) = *crate::CONTROLLER.lock().unwrap() else {
+            DISPLAY_RECONFIG_REFRESH_SCHEDULED.store(false, Ordering::SeqCst);
+            return;
+        };
+        log_debug!(
+            "[display] reconfiguration refresh scheduled in {:.2}s",
+            DISPLAY_RECONFIG_DELAY
+        );
+        let _: () = msg_send![
+            controller.0,
+            performSelector: sel!(handleDisplayReconfiguration:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: DISPLAY_RECONFIG_DELAY
+        ];
+    }
+}
+
+/// 去抖定时器到期(main 线程):执行显示器配置变化后的完整刷新。
+/// Debounce timer fired (main thread): run the full post-reconfiguration refresh.
+pub(crate) extern "C" fn on_display_reconfiguration(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _arg: *mut c_void,
+) {
+    DISPLAY_RECONFIG_REFRESH_SCHEDULED.store(false, Ordering::SeqCst);
+    handle_display_reconfiguration();
+}
+
+/// 显示器配置变化(外接/内建切换、分辨率调整)后的统一刷新入口:
+/// 1. 发起一次后台窗口快照,让 TAB_STATE 拿到变化后的窗口 bounds(宽高比/所属屏
+///    会变);浮窗可见时标记快照落地后重排,卡片宽度按新比例精修。
+/// 2. 浮窗可见时立即 show_overlay 重排:面板宽高与居中全部按实时屏幕几何重算
+///    (拔掉显示器后面板可能悬在旧位置),滚动偏移在内部 clamp 到新范围。
+/// 3. 强制重拍全部已知窗口缩略图:缓存帧是旧配置下的比例与像素高度,重拍后由
+///    thumbnailReady 原位换卡。
+///
+/// Single refresh entry after a display reconfiguration (external/built-in
+/// switch or resolution change):
+/// 1. Kick a background window snapshot so TAB_STATE receives post-change
+///    bounds (aspect and owning screen may change); when the overlay is
+///    visible, mark the apply to re-layout so card widths follow the new
+///    aspects.
+/// 2. When visible, re-layout via show_overlay immediately: panel width/height
+///    and centering are recomputed from live screen geometry (after an unplug
+///    the panel could otherwise hover where the old screen was); the scroll
+///    offset is clamped to the new range inside.
+/// 3. Force a recapture of every known window thumbnail: cached frames carry
+///    the old configuration's aspect and pixel height; deliveries swap cards
+///    in place.
+pub(crate) fn handle_display_reconfiguration() {
+    let overlay_visible = TAB_STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|state| state.visible);
+    log_info!(
+        "[overlay] display reconfiguration: overlay_visible={} screens={}",
+        overlay_visible,
+        unsafe {
+            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+            let count: usize = msg_send![screens, count];
+            count
+        }
+    );
+    // 必须在不持有 TAB_STATE 时发起快照(request_window_refresh 内部会再锁它)。
+    // The snapshot request must run WITHOUT holding TAB_STATE (the refresh locks it again).
+    request_window_refresh();
+    if overlay_visible {
+        // 先精修 bounds 再重排:快照落地时消费该标记,即使用户窗口集合未变也重排。
+        // Refine bounds first: the snapshot apply consumes this flag and re-lays
+        // out even when the window set itself is unchanged.
+        DISPLAY_RECONFIG_RELAYOUT_PENDING.store(true, Ordering::SeqCst);
+        // 立即按实时屏幕几何重排(bounds 仍是旧值,但面板尺寸/位置/捕获像素需求
+        // 已经正确);落地后的第二次重排修正卡片比例。
+        // Re-layout against live screen geometry right away (bounds are stale but
+        // panel size/position and capture pixel demand are already correct); the
+        // post-snapshot second pass corrects card aspects.
+        show_overlay();
+    }
+    let target_px_h = *THUMB_CAPTURE_TARGET_PX_H.lock().unwrap();
+    crate::thumbnail::refresh_for_display_change(target_px_h);
+}
+
+/// 快照落地路径消费:显示器配置变化后即使窗口集合未变也要重排一次浮窗。
+/// Consumed by the snapshot-apply path: after a display reconfiguration the overlay
+/// must re-layout once even when the window set is unchanged.
+pub(crate) fn take_display_relayout_pending() -> bool {
+    DISPLAY_RECONFIG_RELAYOUT_PENDING.swap(false, Ordering::SeqCst)
+}
+
 /// 把图标烘焙成灰度版:在原图上以 NSCompositeSourceAtop 叠浅灰,灰只落在图标的 alpha
 /// 区域,不会在透明边缘形成方框。用于最小化窗口的图标视觉变灰。
 /// Bake a grayed version: composite a light gray over the original with NSCompositeSourceAtop,

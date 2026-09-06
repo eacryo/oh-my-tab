@@ -480,6 +480,33 @@ extern "C" fn on_appearance_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_
     overlay::apply_theme();
 }
 
+/// 屏幕参数变化回调(NSApplicationDidChangeScreenParametersNotification:外接/内建
+/// 显示器插拔、分辨率或缩放调整)。缓存缩略图携带旧配置下的窗口比例与像素高度,
+/// 浮窗面板宽高也随屏幕几何变化;统一交给 overlay 的去抖入口处理。
+/// Callback for screen-parameter changes (NSApplicationDidChangeScreenParametersNotification:
+/// external/built-in display plug/unplug, resolution or scaling adjustments). Cached
+/// thumbnails carry the old configuration's window aspect and pixel height, and the
+/// overlay panel's size follows screen geometry; both go through overlay's debounced
+/// entry point.
+extern "C" fn on_screen_parameters_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    unsafe {
+        // 该通知由 NSApplication 在主线程投递,但沿用既有防御:非主线程时跳回主线程。
+        // NSApplication posts this on the main thread; keep the existing defensive
+        // hop anyway -- marshal back to main when delivered elsewhere.
+        let is_main: bool = msg_send![class!(NSThread), isMainThread];
+        if !is_main {
+            let _: () = msg_send![_self as *mut AnyObject,
+                performSelectorOnMainThread: sel!(handleScreenParametersChanged:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+            return;
+        }
+    }
+    log_debug!("[display] screen parameters change notification received");
+    overlay::schedule_display_reconfiguration_refresh();
+}
+
 /// 鼠标插拔回调(在鼠标线程执行)经 performSelectorOnMainThread 转到主线程后的重入点:
 /// 设置窗口开着时即时刷新设备下拉框(重连后立即显示,无需点确定/重开)。
 /// Re-entry point after the mouse-thread plug/unplug callback hops to the main thread via
@@ -992,6 +1019,18 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleAppearanceChanged:),
             on_appearance_changed as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleScreenParametersChanged:),
+            on_screen_parameters_changed as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleDisplayReconfiguration:),
+            overlay::on_display_reconfiguration as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -1806,6 +1845,21 @@ fn main() {
             object: std::ptr::null::<AnyObject>(),
         ];
         CFRelease(distributed_theme_name as *const c_void);
+
+        // 监听屏幕参数变化(外接/内建显示器插拔、分辨率调整):缩略图缓存与浮窗布局
+        // 都依赖屏幕几何,变化后经 overlay 的去抖入口强制刷新一次。
+        // Observe screen-parameter changes (display plug/unplug, resolution changes):
+        // both the thumbnail cache and the overlay layout depend on screen geometry;
+        // a change forces one debounced refresh through overlay's entry point.
+        let screen_params_name =
+            make_nsstring("NSApplicationDidChangeScreenParametersNotification");
+        let _: () = msg_send![default_nc,
+            addObserver: controller,
+            selector: sel!(handleScreenParametersChanged:),
+            name: screen_params_name,
+            object: std::ptr::null::<AnyObject>(),
+        ];
+        CFRelease(screen_params_name as *const c_void);
     }
 
     // 7. Start event monitor + bridge thread
