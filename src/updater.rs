@@ -89,8 +89,11 @@ static CHECK_TIMER: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::n
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 const INLINE_UPDATE_HEIGHT: f64 = 140.0;
+const UPDATE_RELEASE_NOTES_MAX_HEIGHT: f64 = 180.0;
 const CHECK_LOADING_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const CHECK_LOADING_CYCLE_SECONDS: f64 = 1.0;
+
+const RELEASE_NOTES_LOCALE_END: &str = "<!-- /locale -->";
 
 /// The dynamically registered subclass is retained by the Objective-C runtime forever.
 struct CustomDriverClass(*mut AnyObject);
@@ -1144,6 +1147,258 @@ extern "C" fn defer_automatic_update(_this: *mut c_void, _cmd: Sel, _sender: *mu
     unsafe { answer_update_permission(false) };
 }
 
+/// Build the custom update window's release-notes view from Sparkle's appcast item description.
+/// 从 Sparkle appcast item 的 description 构建自定义更新窗口的更新日志视图。
+unsafe fn make_release_notes_view(
+    item: *mut AnyObject,
+    width: f64,
+) -> Option<(*mut AnyObject, f64)> {
+    if item.is_null() {
+        return None;
+    }
+
+    let description: *mut AnyObject = msg_send![item, itemDescription];
+    let description = nsstring_to_string(description);
+    let description = select_release_notes_locale(&description, &crate::i18n::current_locale());
+    if description.trim().is_empty() {
+        return None;
+    }
+
+    let format: *mut AnyObject = msg_send![item, itemDescriptionFormat];
+    let format = nsstring_to_string(format);
+    let document = if format.eq_ignore_ascii_case("markdown") {
+        render_release_notes_markdown(&description)
+    } else {
+        ReleaseNotesDocument {
+            text: description,
+            heading_ranges: Vec::new(),
+        }
+    };
+    if document.text.trim().is_empty() {
+        return None;
+    }
+
+    let source = make_nsstring(&document.text);
+    let attributed: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+    let attributed: *mut AnyObject = msg_send![attributed, initWithString: source];
+    crate::ffi::CFRelease(source as *const c_void);
+    if attributed.is_null() {
+        return None;
+    }
+
+    let length: usize = msg_send![attributed, length];
+    if length > 0 {
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
+        let color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
+        let font_key = make_nsstring("NSFont");
+        let color_key = make_nsstring("NSForegroundColor");
+        let _: () = msg_send![
+            attributed,
+            addAttribute: font_key,
+            value: font,
+            range: NSRange::new(0, length)
+        ];
+        let _: () = msg_send![
+            attributed,
+            addAttribute: color_key,
+            value: color,
+            range: NSRange::new(0, length)
+        ];
+        for heading in &document.heading_ranges {
+            let size = if heading.level == 1 { 18.0 } else { 16.0 };
+            let heading_font: *mut AnyObject =
+                msg_send![class!(NSFont), boldSystemFontOfSize: size];
+            let _: () = msg_send![
+                attributed,
+                addAttribute: font_key,
+                value: heading_font,
+                range: heading.range
+            ];
+        }
+        crate::ffi::CFRelease(font_key as *const c_void);
+        crate::ffi::CFRelease(color_key as *const c_void);
+    }
+
+    let text_view: *mut AnyObject = msg_send![class!(NSTextView), alloc];
+    let text_view: *mut AnyObject = msg_send![
+        text_view,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 1.0))
+    ];
+    if text_view.is_null() {
+        release_obj(attributed);
+        return None;
+    }
+    let _: () = msg_send![text_view, setEditable: false];
+    let _: () = msg_send![text_view, setSelectable: true];
+    let _: () = msg_send![text_view, setDrawsBackground: false];
+    let _: () = msg_send![text_view, setTextContainerInset: NSSize::new(0.0, 0.0)];
+    let text_container: *mut AnyObject = msg_send![text_view, textContainer];
+    let _: () = msg_send![text_container, setLineFragmentPadding: 0.0f64];
+    let _: () = msg_send![text_container, setWidthTracksTextView: true];
+    let _: () = msg_send![text_container, setContainerSize: NSSize::new(width, 1_000_000.0)];
+    let _: () = msg_send![text_view, setHorizontallyResizable: false];
+    let _: () = msg_send![text_view, setVerticallyResizable: true];
+    // NSTextView receives rich text through its text storage; it has no setAttributedString:
+    // selector of its own.
+    // NSTextView 的富文本必须设置到 textStorage；NSTextView 本身没有 setAttributedString: 消息。
+    let text_storage: *mut AnyObject = msg_send![text_view, textStorage];
+    let _: () = msg_send![text_storage, setAttributedString: attributed];
+    release_obj(attributed);
+
+    let layout: *mut AnyObject = msg_send![text_view, layoutManager];
+    let _: () = msg_send![layout, ensureLayoutForTextContainer: text_container];
+    let used: NSRect = msg_send![layout, usedRectForTextContainer: text_container];
+    let content_height = (used.size.height.ceil() + 4.0).max(24.0);
+    let visible_height = content_height.min(UPDATE_RELEASE_NOTES_MAX_HEIGHT);
+
+    let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
+    let scroll: *mut AnyObject = msg_send![
+        scroll,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, visible_height))
+    ];
+    if scroll.is_null() {
+        release_obj(text_view);
+        return None;
+    }
+    let _: () = msg_send![scroll, setBorderType: 0u64];
+    let _: () = msg_send![scroll, setDrawsBackground: false];
+    let _: () = msg_send![scroll, setHasHorizontalScroller: false];
+    let _: () = msg_send![scroll, setHasVerticalScroller: content_height > visible_height];
+    let _: () = msg_send![scroll, setAutohidesScrollers: true];
+    let _: () = msg_send![scroll, setScrollerStyle: 1isize];
+    let _: () = msg_send![text_view, setFrameSize: NSSize::new(width, content_height)];
+    let _: () = msg_send![text_view, setVerticallyResizable: false];
+    let _: () = msg_send![scroll, setDocumentView: text_view];
+    release_obj(text_view);
+    Some((scroll, visible_height))
+}
+
+struct ReleaseNotesDocument {
+    text: String,
+    heading_ranges: Vec<ReleaseNotesHeadingRange>,
+}
+
+struct ReleaseNotesHeadingRange {
+    range: NSRange,
+    level: u8,
+}
+
+/// Render the block-level Markdown used by release notes with explicit line breaks and styles.
+/// 将更新日志使用的块级 Markdown 渲染为带真实换行和标题范围的文本。
+///
+/// Foundation's Markdown initializer stores headings and lists as presentation-intent
+/// attributes. A plain NSTextView does not consistently lay those attributes out, so the
+/// release-note subset is normalized here before it enters TextKit.
+/// Foundation 的 Markdown 初始化器会把标题和列表保存为 presentation-intent 属性；普通
+/// NSTextView 不一定能正确布局这些属性，因此在交给 TextKit 前显式整理更新日志子集。
+fn render_release_notes_markdown(source: &str) -> ReleaseNotesDocument {
+    let mut text = String::new();
+    let mut heading_ranges = Vec::new();
+
+    for line in source.lines() {
+        let (line, heading_level) = markdown_heading(line);
+        let (line, is_list) = markdown_list_item(line);
+        let line = if is_list {
+            format!("• {line}")
+        } else {
+            line.to_string()
+        };
+        let start = text.encode_utf16().count();
+        text.push_str(&line);
+        let length = line.encode_utf16().count();
+        if let Some(level) = heading_level {
+            heading_ranges.push(ReleaseNotesHeadingRange {
+                range: NSRange::new(start, length),
+                level,
+            });
+        }
+        text.push('\n');
+    }
+
+    ReleaseNotesDocument {
+        text,
+        heading_ranges,
+    }
+}
+
+fn markdown_heading(line: &str) -> (&str, Option<u8>) {
+    let hash_count = line.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&hash_count) {
+        return (line, None);
+    }
+    let Some(rest) = line.get(hash_count..) else {
+        return (line, None);
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return (line, None);
+    }
+    (rest.trim_start(), Some(hash_count as u8))
+}
+
+fn markdown_list_item(line: &str) -> (&str, bool) {
+    if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        (rest, true)
+    } else {
+        (line, false)
+    }
+}
+
+/// Select one locale section from a combined release-notes Markdown document.
+/// 从合并的多语言 Markdown 更新日志中选择一个 locale 区块。
+///
+/// Sections use HTML comments so the complete document can be embedded in Sparkle's single
+/// `<description>` element without adding visible marker text to the rendered Markdown:
+/// `<!-- locale: zh-Hans -->` ... `<!-- /locale -->`.
+fn select_release_notes_locale(source: &str, locale: &str) -> String {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut active: Option<(String, String)> = None;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(tag) = trimmed.strip_prefix("<!-- locale:").and_then(|rest| {
+            rest.strip_suffix("-->")
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+        }) {
+            if let Some(section) = active.take() {
+                sections.push(section);
+            }
+            active = Some((tag.to_string(), String::new()));
+            continue;
+        }
+        if trimmed == RELEASE_NOTES_LOCALE_END {
+            if let Some(section) = active.take() {
+                sections.push(section);
+            }
+            continue;
+        }
+        if let Some((_, content)) = active.as_mut() {
+            content.push_str(line);
+            content.push('\n');
+        }
+    }
+    if let Some(section) = active {
+        sections.push(section);
+    }
+
+    // A legacy single-language document remains valid and is displayed as-is.
+    // 兼容旧的单语言文档，未检测到区块标记时原样显示。
+    if sections.is_empty() {
+        return source.to_string();
+    }
+
+    let locale_matches = |tag: &str, wanted: &str| {
+        tag.eq_ignore_ascii_case(wanted) || (wanted == "zh-Hans" && tag.eq_ignore_ascii_case("zh"))
+    };
+    sections
+        .iter()
+        .find(|(tag, _)| locale_matches(tag, locale))
+        .or_else(|| sections.iter().find(|(tag, _)| locale_matches(tag, "en")))
+        .or_else(|| sections.first())
+        .map(|(_, content)| content.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// 创建自定义更新提示，完全绕过 Sparkle 默认会显示应用图标的弹窗。
 /// Build the update-available prompt without using Sparkle's standard alert.
 unsafe fn make_custom_update_found_window(
@@ -1230,9 +1485,16 @@ unsafe fn make_custom_update_found_window(
     let button_h = [skip_h, later_h, install_h]
         .into_iter()
         .fold(36.0f64, f64::max);
-    let message_y = button_y + button_h + button_gap;
+    let release_notes = make_release_notes_view(item, 576.0);
+    let release_notes_h = release_notes.map_or(0.0, |(_, height)| height);
+    let release_notes_y = button_y + button_h + button_gap;
+    let message_y = if release_notes_h > 0.0 {
+        release_notes_y + release_notes_h + button_gap
+    } else {
+        release_notes_y
+    };
     let title_y = message_y + message_h + 10.0;
-    let window_h = title_y + title_h;
+    let window_h = title_y + title_h + 8.0;
     let target = render_target(window_h);
     let (content, window) = if target.host.is_null() {
         let window_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_w, window_h));
@@ -1303,6 +1565,21 @@ unsafe fn make_custom_update_found_window(
         NSRect::new(NSPoint::new(32.0, message_y), NSSize::new(576.0, message_h)),
         content,
     );
+
+    if let Some((release_notes, release_notes_h)) = release_notes {
+        let release_notes_frame = NSRect::new(
+            NSPoint::new(32.0, release_notes_y),
+            NSSize::new(576.0, release_notes_h),
+        );
+        let _: () = msg_send![release_notes, setFrame: release_notes_frame];
+        add_control(
+            target,
+            window_w,
+            release_notes,
+            release_notes_frame,
+            content,
+        );
+    }
 
     let skip_frame = NSRect::new(NSPoint::new(32.0, button_y), NSSize::new(166.0, button_h));
     let _: () = msg_send![skip, setFrame: skip_frame];
@@ -2448,4 +2725,53 @@ pub(crate) fn check_for_updates() -> bool {
         ];
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_release_notes_markdown, select_release_notes_locale};
+
+    #[test]
+    fn renders_release_note_blocks_with_real_line_breaks() {
+        let document = render_release_notes_markdown(
+            "# 0.1.8 Dev\n\n## What's New\n\n- First change\n- Second change",
+        );
+
+        assert_eq!(
+            document.text,
+            "0.1.8 Dev\n\nWhat's New\n\n• First change\n• Second change\n"
+        );
+        assert_eq!(document.heading_ranges.len(), 2);
+        assert_eq!(document.heading_ranges[0].level, 1);
+        assert_eq!(document.heading_ranges[1].level, 2);
+    }
+
+    #[test]
+    fn selects_requested_locale_from_combined_notes() {
+        let source = "<!-- locale: en -->\nEnglish\n<!-- /locale -->\n\n<!-- locale: zh-Hans -->\n简体中文\n<!-- /locale -->";
+
+        assert_eq!(select_release_notes_locale(source, "zh-Hans"), "简体中文");
+        assert_eq!(select_release_notes_locale(source, "en"), "English");
+    }
+
+    #[test]
+    fn falls_back_to_english_then_first_section() {
+        let with_english = "<!-- locale: zh-Hans -->\n简体中文\n<!-- /locale -->\n<!-- locale: en -->\nEnglish\n<!-- /locale -->";
+        let without_english = "<!-- locale: zh-Hant -->\n繁體中文\n<!-- /locale -->";
+
+        assert_eq!(
+            select_release_notes_locale(with_english, "zh-Hant"),
+            "English"
+        );
+        assert_eq!(
+            select_release_notes_locale(without_english, "en"),
+            "繁體中文"
+        );
+    }
+
+    #[test]
+    fn keeps_legacy_single_language_notes_unchanged() {
+        let source = "# Release notes\n\n- One change";
+        assert_eq!(select_release_notes_locale(source, "zh-Hans"), source);
+    }
 }

@@ -58,6 +58,10 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 
 `appcast.xml` 和更新归档由发布者自行上传到 R2。生成 appcast 时使用 Sparkle 的 Ed25519 私钥；打包时只需把对应公钥通过 `SPARKLE_PUBLIC_ED_KEY` 注入 `SUPublicEDKey`。Sparkle 比较 `CFBundleVersion`（build number），脚本默认用 UTC 时间戳生成它；需要可复现的测试时再设置 `SPARKLE_BUILD_VERSION`。`CFBundleShortVersionString` 仍负责展示给用户的版本。私钥不要提交到仓库、不要放进应用包，也不要上传到 R2。
 
+发布说明必须放在版本对应的目录中：生产构建使用 `release_doc/<version>.md`，开发构建使用 `release_doc_dev/<version>.md`。例如当前版本为 `0.1.8` 时，需要同时存在 `release_doc/0.1.8.md` 和 `release_doc_dev/0.1.8.md`；缺少任一文件时，对应构建会在编译前失败。发布脚本会将完整 Markdown 内嵌到新生成的 appcast item 中。
+
+同一个 Markdown 文件可以包含多个语言区块。使用 `<!-- locale: en -->`、`<!-- locale: zh-Hans -->` 开始，并使用 `<!-- /locale -->` 结束。应用读取 Sparkle 的单个 `<description>` 后，会根据当前 UI locale 选择对应区块；找不到翻译时回退到英文，再回退到文件中的第一个区块。旧的单语言 Markdown 文件仍然兼容。
+
 ## 代码签名：为什么自签证书能让授权稳定
 
 `bundle.sh` 优先用自签名身份 **`oh-my-tab-sign`** 签名，证书缺失或签名失败时退回 ad-hoc（`codesign -s -`）。

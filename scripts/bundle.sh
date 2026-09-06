@@ -20,6 +20,19 @@ APP="dist/${APP_BASENAME}.app"
 DMG="dist/${APP_BASENAME}.dmg"
 ZIP="dist/${APP_BASENAME}.zip"
 
+# Release notes are part of the release contract, not an optional publishing extra. Validate the
+# version-specific document before compiling so a release can never produce an archive without its
+# matching changelog.
+# 发布说明是发布契约的一部分，不是可选的上传附属物。在编译前校验版本文档，避免生成没有
+# 对应更新日志的安装包。
+VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)
+RELEASE_DOC_DIR="${RELEASE_DOC_DIR:-release_doc}"
+RELEASE_DOC="${RELEASE_DOC_DIR}/${VERSION}.md"
+if [ ! -s "$RELEASE_DOC" ]; then
+  echo "error: release notes not found for version $VERSION: $RELEASE_DOC" >&2
+  exit 1
+fi
+
 # release-dev.sh sets CARGO_BUILD_FEATURES=dev-long-text so its optimized package keeps the
 # long-text layout fixture. The production release script leaves this unset.
 # release-dev.sh 设置 CARGO_BUILD_FEATURES=dev-long-text，让优化后的 Dev 包保留长文本夹具；
@@ -61,7 +74,6 @@ fi
 # Read version from Cargo.toml (single source of truth) and write it into the .app's
 # Info.plist CFBundleShortVersionString so the displayed version matches Cargo.toml
 # (no manual Info.plist sync needed).
-VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
 # Sparkle compares the monotonically increasing CFBundleVersion (build number), not just the
 # display version. Use a UTC timestamp by default so every build gets a fresh value; an explicit

@@ -32,6 +32,7 @@ APP_BASENAME="${APP_BASENAME:-Oh-My-Tab-Dev}"
 BUNDLE_ID="${BUNDLE_ID:-com.eacryo.oh-my-tab.dev}"
 BUNDLE_NAME="${BUNDLE_NAME:-Oh-My-Tab Dev}"
 CARGO_BUILD_FEATURES="dev-long-text"
+RELEASE_DOC_DIR="release_doc_dev"
 SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://download.oh-my-tab.app/dev_release/appcast.xml}"
 R2_RELEASE_PREFIX="${R2_RELEASE_PREFIX:-dev_release}"
 R2_APPCAST_KEY="${R2_APPCAST_KEY:-dev_release/appcast.xml}"
@@ -46,6 +47,7 @@ APP_BASENAME="$APP_BASENAME" \
 BUNDLE_ID="$BUNDLE_ID" \
 BUNDLE_NAME="$BUNDLE_NAME" \
 CARGO_BUILD_FEATURES="$CARGO_BUILD_FEATURES" \
+RELEASE_DOC_DIR="$RELEASE_DOC_DIR" \
 SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
 sh scripts/bundle.sh
 
@@ -56,6 +58,7 @@ fi
 
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
 BUILD_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")
+RELEASE_NOTES="$RELEASE_DOC_DIR/${VERSION}.md"
 echo "✅ Dev build ready: $APP (version=$VERSION, build=$BUILD_VERSION)"
 
 if [ "$PUSH_R2" -eq 1 ]; then
@@ -66,7 +69,7 @@ if [ "$PUSH_R2" -eq 1 ]; then
     R2_ARTIFACT_BASENAME="$R2_ARTIFACT_BASENAME" \
     R2_PUBLIC_BASE_URL="${R2_PUBLIC_BASE_URL:-https://download.oh-my-tab.app}" \
     SPARKLE_FEED_URL="$SPARKLE_FEED_URL" \
-    bash scripts/generate-appcast.sh "$R2_APPCAST_PATH" "$ZIP" "$VERSION" "$BUILD_VERSION"
+    bash scripts/generate-appcast.sh "$R2_APPCAST_PATH" "$ZIP" "$VERSION" "$BUILD_VERSION" "$RELEASE_NOTES"
   fi
   PUBLISH_ARGS="--appcast $R2_APPCAST_PATH --zip $ZIP --dmg $DMG --version $VERSION --build-version $BUILD_VERSION"
   if [ "$DRY_RUN" -eq 1 ]; then

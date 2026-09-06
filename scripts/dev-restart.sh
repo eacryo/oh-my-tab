@@ -13,6 +13,12 @@ repo_dir="$(dirname -- "$script_dir")"
 dev_app="$repo_dir/dist/Oh-My-Tab-Dev.app"
 dev_app_binary="$dev_app/Contents/MacOS/oh-my-tab"
 dev_bundle_id="com.eacryo.oh-my-tab.dev"
+dev_version="$(awk -F'"' '/^version/ {print $2; exit}' "$repo_dir/Cargo.toml")"
+dev_release_doc="$repo_dir/release_doc_dev/${dev_version}.md"
+if [ ! -s "$dev_release_doc" ]; then
+    echo "restart FAILED: release notes not found for version $dev_version: $dev_release_doc"
+    exit 1
+fi
 
 # 移除脚本上一次提交的用户级 launchd 任务,否则 launchd 会在 pkill 后自动拉起旧实例。
 # Remove the user-level launchd job submitted by the previous run; otherwise launchd
@@ -101,7 +107,6 @@ fi
     "$dev_app/Contents/Info.plist"
 # Keep the dev bundle's display version aligned with Cargo and give each build a fresh UTC
 # timestamp build number. SPARKLE_BUILD_VERSION remains available for deterministic tests.
-dev_version="$(awk -F'"' '/^version/ {print $2; exit}' "$repo_dir/Cargo.toml")"
 dev_build_version="${SPARKLE_BUILD_VERSION:-$(date -u +%Y%m%d%H%M%S)}"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $dev_version" \
     "$dev_app/Contents/Info.plist"

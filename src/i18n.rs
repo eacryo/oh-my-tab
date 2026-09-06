@@ -136,6 +136,12 @@ pub fn t(key: &str) -> String {
     value
 }
 
+/// Return the resolved locale currently used for localized UI strings.
+/// 返回当前 UI 使用的最终 locale。
+pub fn current_locale() -> String {
+    I18N.read().unwrap().locale.clone()
+}
+
 /// Enable long-text layout QA without adding a fake production locale. Set
 /// `OH_MY_TAB_PSEUDO_LOCALE=1` before launching the app; placeholders such as `{count}` remain
 /// byte-for-byte intact so `tf` can still interpolate runtime values.

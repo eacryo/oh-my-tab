@@ -44,7 +44,7 @@ OUT="dist/oh-my-tab.rb"
 
 # 1. Always build fresh release artifacts. This keeps --push tied to the current source tree and
 # gives every release a new build number before the matching appcast is generated.
-sh scripts/bundle.sh
+RELEASE_DOC_DIR="release_doc" sh scripts/bundle.sh
 
 if [ ! -f "$DMG" ]; then
   echo "❌ Build failed: $DMG not found" >&2
@@ -59,6 +59,7 @@ fi
 # 2. Read version from Cargo.toml (same source as bundle.sh).
 VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)
 BUILD_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' dist/Oh-My-Tab.app/Contents/Info.plist)
+RELEASE_NOTES="release_doc/${VERSION}.md"
 
 if [ "$PUSH_R2" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
   # Generate/update the feed before publishing. The helper reuses a local feed or fetches the
@@ -67,7 +68,7 @@ if [ "$PUSH_R2" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
   R2_ARTIFACT_BASENAME="${R2_ARTIFACT_BASENAME:-Oh-My-Tab}" \
   R2_PUBLIC_BASE_URL="${R2_PUBLIC_BASE_URL:-https://download.oh-my-tab.app}" \
   SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://download.oh-my-tab.app/appcast.xml}" \
-  bash scripts/generate-appcast.sh "${R2_APPCAST_PATH:-dist/appcast.xml}" "$ZIP" "$VERSION" "$BUILD_VERSION"
+  bash scripts/generate-appcast.sh "${R2_APPCAST_PATH:-dist/appcast.xml}" "$ZIP" "$VERSION" "$BUILD_VERSION" "$RELEASE_NOTES"
 fi
 
 # 3. 算 dmg sha256。

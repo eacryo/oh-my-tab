@@ -3,8 +3,8 @@
 # 为即将上传的精确归档生成 appcast，避免 appcast 中的 URL 和上传对象不一致。
 set -euo pipefail
 
-if [ "$#" -ne 4 ]; then
-  echo "Usage: $0 APPCAST_PATH ZIP_PATH VERSION BUILD_VERSION" >&2
+if [ "$#" -ne 5 ]; then
+  echo "Usage: $0 APPCAST_PATH ZIP_PATH VERSION BUILD_VERSION RELEASE_NOTES_PATH" >&2
   exit 2
 fi
 
@@ -12,6 +12,7 @@ APPCAST_PATH="$1"
 ZIP_PATH="$2"
 VERSION="$3"
 BUILD_VERSION="$4"
+RELEASE_NOTES_PATH="$5"
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 GENERATE_APPCAST="$REPO_DIR/vendor/Sparkle/bin/generate_appcast"
@@ -28,6 +29,10 @@ if [ ! -f "$ZIP_PATH" ]; then
   echo "error: update archive not found: $ZIP_PATH" >&2
   exit 1
 fi
+if [ ! -s "$RELEASE_NOTES_PATH" ]; then
+  echo "error: release notes not found or empty: $RELEASE_NOTES_PATH" >&2
+  exit 1
+fi
 
 WORK_DIR="$(mktemp -d)"
 cleanup() {
@@ -39,6 +44,8 @@ trap cleanup EXIT
 # so the enclosure URL in appcast points at the object that will actually be uploaded.
 ARCHIVE_NAME="${ARTIFACT_BASENAME}-${VERSION}-${BUILD_VERSION}.zip"
 cp "$ZIP_PATH" "$WORK_DIR/$ARCHIVE_NAME"
+RELEASE_NOTES_NAME="${ARCHIVE_NAME%.zip}.md"
+cp "$RELEASE_NOTES_PATH" "$WORK_DIR/$RELEASE_NOTES_NAME"
 
 # R2 发布器会把归档放到 RELEASE_PREFIX 下，因此 appcast 的 enclosure URL 也必须使用同一前缀。
 # R2 stores archives below RELEASE_PREFIX, so enclosure URLs must use the same prefix.
@@ -85,6 +92,7 @@ mkdir -p "$(dirname "$APPCAST_PATH")"
 
 APPCAST_ARGS=(
   --download-url-prefix "$DOWNLOAD_PREFIX"
+  --embed-release-notes
   --link "https://github.com/eacryo/oh-my-tab"
   -o "$APPCAST_PATH"
 )
