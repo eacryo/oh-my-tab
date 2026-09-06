@@ -1662,6 +1662,25 @@ fn sidebar_item_frames(w: f64, row_h: f64) -> (NSRect, NSRect) {
     (icon_frame, label_frame)
 }
 
+/// 整条侧栏 hover tracker 的矩形:从首行顶边铺到末行底边。行数由调用方传入并与
+/// 按钮创建共用同一来源(entries.len()),新增侧栏条目时自动跟随——此前硬编码
+/// 6 行,加入第 7 个条目后末行落在 tracker 之外,从末行底部离开侧栏时没有退出
+/// 事件来隐藏共享悬停胶囊,胶囊卡在末行不消失。
+/// Rect of the whole-sidebar hover tracker: from the first row's top edge down to
+/// the last row's bottom edge. The row count comes from the caller and shares its
+/// source with button creation (entries.len()), so adding a sidebar entry keeps the
+/// tracker in sync automatically -- the previous hardcoded 6-row rect left the 7th
+/// entry outside the tracker, so leaving the sidebar through that last row produced
+/// no exit event and the shared hover pill stuck on it.
+fn sidebar_tracking_rect(x: f64, y_top: f64, w: f64, row_h: f64, row_count: usize) -> NSRect {
+    let row_step = row_h + 4.0;
+    let spanned = row_count.saturating_sub(1) as f64;
+    NSRect::new(
+        objc2_foundation::NSPoint::new(x, y_top - spanned * row_step),
+        objc2_foundation::NSSize::new(w, row_h + spanned * row_step),
+    )
+}
+
 impl SettingsSidebar {
     /// Measure one shared row height for every localized sidebar title.
     /// 为所有本地化侧栏标题测量一套统一的行高。
@@ -1945,7 +1964,10 @@ impl SettingsSidebar {
         ];
         let row_step = row_h + 4.0;
         widgets::make_sidebar_hover_highlight(parent, x, y0, w, row_h);
-        widgets::make_sidebar_hover_tracking(parent, x, y0, w, row_h);
+        widgets::make_sidebar_hover_tracking(
+            parent,
+            sidebar_tracking_rect(x, y0, w, row_h, entries.len()),
+        );
         std::array::from_fn(|index| {
             let (title_key, icon) = entries[index];
             SettingsSidebarTab::attach(
@@ -2003,8 +2025,26 @@ impl SettingsSidebarTab {
 
 #[cfg(test)]
 mod tests {
-    use super::{sidebar_item_frames, SettingsButtonRole, SettingsLayout};
+    use super::{sidebar_item_frames, sidebar_tracking_rect, SettingsButtonRole, SettingsLayout};
     use crate::settings::SETTINGS_CONTROL_TRAILING_INSET;
+
+    #[test]
+    fn sidebar_tracking_rect_spans_every_row() {
+        let row_h = 38.0;
+        let row_step = row_h + 4.0;
+        let y0 = 300.0;
+        let rect = sidebar_tracking_rect(0.0, y0, 240.0, row_h, 7);
+        // 顶边 = 首行顶边;底边 = 第 7 行(索引 6)的底边,末行不再漏出 tracker。
+        // Top edge = row 0's top; bottom edge = row 6's bottom -- the last row is covered.
+        assert_eq!(rect.origin.y + rect.size.height, y0 + row_h);
+        assert_eq!(rect.origin.y, y0 - 6.0 * row_step);
+        assert_eq!(rect.size.width, 240.0);
+        // 单行侧栏只覆盖自身,不越过首行。
+        // A one-row sidebar covers exactly that row.
+        let single = sidebar_tracking_rect(0.0, y0, 240.0, row_h, 1);
+        assert_eq!(single.origin.y, y0);
+        assert_eq!(single.size.height, row_h);
+    }
 
     #[test]
     fn layout_keeps_controls_aligned_to_the_trailing_inset() {

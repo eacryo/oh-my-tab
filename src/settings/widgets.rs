@@ -697,24 +697,21 @@ pub(super) unsafe fn settings_sidebar_required_row_height(width: f64, titles: &[
     required_height
 }
 
-pub(super) unsafe fn make_sidebar_hover_tracking(
-    parent: *mut AnyObject,
-    x: f64,
-    y: f64,
-    w: f64,
-    row_h: f64,
-) {
+/// The tracker rect arrives precomputed against the live entry count (see
+/// sidebar_tracking_rect in the component layer), so it can never drift behind the
+/// sidebar's rows again -- the previous hardcoded 6-row rect left the 7th entry
+/// outside the tracker, and leaving the sidebar through that last row stranded the
+/// shared hover pill (no tracker exit fired to hide it).
+/// tracker 矩形由调用方按实际条目数预先算好(见组件层的 sidebar_tracking_rect),
+/// 不会再落后于侧栏行数——此前硬编码 6 行,第 7 个条目落在 tracker 之外,从末行
+/// 底部离开侧栏时没有退出事件,共享悬停胶囊卡在末行不消失。
+pub(super) unsafe fn make_sidebar_hover_tracking(parent: *mut AnyObject, rect: NSRect) {
     let tracker: *mut AnyObject = msg_send![sidebar_hover_tracker_class(), alloc];
     let tracker: *mut AnyObject = msg_send![tracker, init];
-    let row_step = row_h + 4.0;
-    let rows_h = row_h + 5.0 * row_step;
     let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
     let tracking: *mut AnyObject = msg_send![
         tracking,
-        initWithRect: NSRect::new(
-            NSPoint::new(x, y - 5.0 * row_step),
-            NSSize::new(w, rows_h)
-        ),
+        initWithRect: rect,
         options: 0x01u64 | 0x80u64,
         owner: tracker,
         userInfo: std::ptr::null::<AnyObject>()
