@@ -82,7 +82,7 @@ pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
     if let Some(tx) = LOG_TX.get() {
         let ts = now_timestamp();
         let msg = format!("{} {} {}\n", ts, level.as_str(), args);
-        // 有界通道:满时丢弃最新日志,绝不阻塞调用线程(日志不应拖慢 UI/事件循环)。
+        // 有界通道:满时丢弃最新日志,调用线程不在这里等待(日志不应拖慢 UI/事件循环)。
         // Bounded channel: drop the newest entry when full; never block the caller
         // (logging must not stall the UI / event loop).
         let _ = tx.try_send(msg);
@@ -385,7 +385,7 @@ fn cleanup_old_logs(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // 当前滚动文件永远保留;历史备份和旧版按启动生成的日志才参与 30 天清理。
+        // 当前滚动文件保留;历史备份和旧版按启动生成的日志才参与 30 天清理。
         // Keep the active rolling file; prune backups and legacy per-launch logs by age.
         let is_backup = name
             .strip_prefix("oh-my-tab.log.")
@@ -470,7 +470,7 @@ mod tests {
         let stale = make("oh-my-tab-2020-01-01_00-00-00.log", old);
         // 新本应用日志:保留 / fresh own log: kept.
         let fresh_log = make("oh-my-tab-2099-01-01_00-00-00.log", fresh);
-        // 过期但非本应用的日志:绝不误删 / stale but unrelated: never removed.
+        // 过期但非本应用的日志:跳过删除 / stale but unrelated: skipped during cleanup.
         let foreign = make("something-else.log", old);
         cleanup_old_logs(dir.path());
         assert!(!stale.exists());

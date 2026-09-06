@@ -766,7 +766,7 @@ mod tests {
     #[test]
     fn card_reconcile_action_replaces_when_only_the_frame_epoch_advanced() {
         // 缓存帧在浮窗关闭期间被替换(种子→真实/激活补拍/外观重拍):其余字段全同,
-        // 仅帧版本前进,也必须 Replace 重建,否则复用路径会永远展示旧图。
+        // 仅帧版本前进,也必须 Replace 重建,否则复用路径会持续展示旧图。
         // The cached frame was replaced while the overlay was closed (seed -> real /
         // activation refresh / appearance recapture): with every other field equal,
         // the frame version alone must still force a Replace, or the reuse path
@@ -1258,7 +1258,7 @@ fn step_switcher(backward: bool) {
     if first_show {
         // 首帧:不再先显示旧快照,而是发起后台刷新并标记「待显示」,等 apply_window_refresh
         // 拿到首帧快照后一次性显示(一次成图)。注意:发起刷新必须释放 TAB_STATE 锁,否则
-        // request_window_refresh 内部同样要锁 TAB_STATE,造成自死锁(主线程永远阻塞)。
+        // request_window_refresh 内部同样要锁 TAB_STATE,造成自死锁(主线程发生阻塞)。
         // First frame: don't show the stale startup snapshot first. Kick off a background refresh
         // and mark pending_first_show; apply_window_refresh consumes it and shows once the first
         // snapshot is ready (single-shot render). NB: the refresh must be kicked off AFTER dropping
@@ -4047,7 +4047,7 @@ pub(crate) fn show_overlay() {
 
         // App 未激活时 NSView 的 mouseMoved: 可能不投递(即使面板是 key),所以给容器加一个
         // activeAlways 的 tracking area(mouseMoved|activeAlways|inVisibleRect)兜底,保证
-        // MOUSE_MOVED 标志能置位——否则悬停门控永远不开启。对齐 BetterCmdTab 的做法
+        // MOUSE_MOVED 标志能置位——否则悬停门控无法开启。对齐 BetterCmdTab 的做法
         // (SwitcherView 用 .mouseMoved + .activeAlways)。
         // When the app is inactive, NSView mouseMoved: may not be delivered even to the key
         // panel, so add an activeAlways tracking area (mouseMoved|activeAlways|inVisibleRect)
@@ -4055,7 +4055,7 @@ pub(crate) fn show_overlay() {
         // never enables. Same approach as BetterCmdTab's SwitcherView (.mouseMoved + .activeAlways).
         // App 未激活时 NSView 的 mouseMoved: 可能不投递(即使面板是 key),所以给容器加一个
         // activeAlways 的 tracking area(mouseMoved|activeAlways|inVisibleRect)兜底,保证
-        // MOUSE_MOVED 标志能置位——否则悬停门控永远不开启。对齐 BetterCmdTab 的做法
+        // MOUSE_MOVED 标志能置位——否则悬停门控无法开启。对齐 BetterCmdTab 的做法
         // (SwitcherView 用 .mouseMoved + .activeAlways)。
         // When the app is inactive, NSView mouseMoved: may not be delivered even to the key
         // panel, so add an activeAlways tracking area (mouseMoved|activeAlways|inVisibleRect)

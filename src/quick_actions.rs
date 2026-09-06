@@ -379,7 +379,7 @@ unsafe fn find_finder_app() -> *mut AnyObject {
     for i in 0..count {
         let app: *mut AnyObject = msg_send![apps, objectAtIndex: i as isize];
         // bundleIdentifier 是 copy 属性的 getter,返回 +0 引用(不归调用者所有),
-        // 绝不能 CFRelease(提前释放会在池排空时二次释放,段错误)。
+        // 不应 CFRelease(提前释放会在池排空时二次释放,段错误)。
         // bundleIdentifier is a copy-property getter returning a +0 reference we do NOT own;
         // never CFRelease it (early release double-frees when the pool drains).
         let bundle: *mut AnyObject = msg_send![app, bundleIdentifier];

@@ -261,7 +261,7 @@ pub struct ClipboardSection {
     // When off, pasting does not reorder the history (like Windows Win+V). Default true.
     pub move_used_to_top: bool,
     // 自动过期天数:非置顶条目超过 N 天自动从历史(内存与持久化)清除,置顶条目
-    // 永不过期。0 = 关闭。默认 3 天。
+    // 不参与过期。0 = 关闭。默认 3 天。
     // Auto-expire days: unpinned entries older than N days are removed from the history
     // (memory AND persistence); pinned entries never expire. 0 = off. Default 3 days.
     pub auto_expire_days: u32,
@@ -1176,7 +1176,7 @@ impl Config {
     /// 组合(title 11/0.23 + app_name 13/0.5,以及旧配色对)在新层级下会颠倒主次
     /// (次行比主行还大)。仅当**全部四个字体值**与旧默认完全一致时才改写为新默认;
     /// 配色同理按"成对精确匹配旧暗色/旧亮色默认"改写——用户自定义过任意一项则
-    /// 整体跳过(保守迁移,绝不覆盖定制值)。幂等:新默认组合不匹配旧值,再次调用
+    /// 整体跳过(保守迁移,避免覆盖定制值)。幂等:新默认组合不匹配旧值,再次调用
     /// 无操作。返回是否有改动。
     /// One-time migration for the card text style: after the content swap (window title
     /// as primary line, app name as secondary), the OLD default combo (title 11/0.23 +
@@ -1467,7 +1467,7 @@ mod tests {
 
     #[test]
     fn parse_hex8_invalid_inputs_fall_back_to_zero() {
-        // 非法/空串/超长统一回退 0,绝不 panic。
+        // 非法/空串/超长统一回退 0,避免 panic。
         // Invalid/empty/overlong inputs all fall back to 0, never panic.
         assert_eq!(parse_hex8(""), 0);
         assert_eq!(parse_hex8("xyz"), 0);

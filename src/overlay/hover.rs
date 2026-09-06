@@ -16,7 +16,7 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
     }
     // 移动本身即"开门"信号,同时按鼠标当前位置补选中。
     // 为什么要补:浮窗打开瞬间鼠标可能已在卡片下,那次 mouseEntered 被门控吞掉且不会
-    // 重发(已 inside)——若只靠 mouseEntered,侧键召唤场景 hover 永远不选中(实测)。
+    // 重发(已 inside)——若只靠 mouseEntered,侧键召唤场景 hover 无法选中(实测)。
     // A move is itself the "gate open" signal; also select the card under the cursor.
     // Why: the overlay may open with the cursor already over a card -- that mouseEntered
     // gets swallowed by the gate and never re-fires (already inside), so side-button
@@ -128,7 +128,7 @@ pub(super) unsafe extern "C" fn hover_tick_callback(
     match *last {
         // 首次 tick:last 还没基准,只记录位置不选中(保持"移动后才选中"的门控
         // 语义,浮窗打开瞬间鼠标下的卡片不被误选)。原实现用 map_or(pos) 计算 dx,
-        // None 时 dx=dy=0 永远被 <4.0 挡掉,last 永不更新、选中永不触发(实测)。
+        // None 时 dx=dy=0 会被 <4.0 挡掉,last 无法更新、选中也无法触发(实测)。
         // First tick: no baseline yet -- record the position without selecting (keeping
         // the "select only after a move" gate; the card under the cursor at summon time
         // isn't auto-selected). The old code computed dx via map_or(pos), which made

@@ -120,7 +120,7 @@ unsafe extern "C" fn mouse_event_tap_callback(
         std::ptr::null_mut()
     } else {
         let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
-        // 按键映射:仅中键及侧键(button >= 2)参与;左键(0)/右键(1)永不绑定,
+        // 按键映射:仅中键及侧键(button >= 2)参与;左键(0)/右键(1)不绑定,
         // 防止用户把自己锁死(无法点击)。录制期间跳过执行。
         // Button mappings: only middle/side buttons (>= 2) take part; left (0)/right (1)
         // are never bound so the user can't lock themselves out of clicking. Skipped while

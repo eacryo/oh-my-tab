@@ -126,7 +126,7 @@ unsafe fn set_registered(enabled: bool) -> bool {
     let f: F = std::mem::transmute(objc_msgSend as *const ());
     let mut err: *mut AnyObject = std::ptr::null_mut();
     let ok = f(service, sel, &mut err);
-    // NSError** 出参按 Cocoa 约定是 autoreleased,调用方不持有,绝不能 release——
+    // NSError** 出参按 Cocoa 约定是 autoreleased,调用方不持有,不应 release——
     // 之前这里 release(err) 会过度释放,run loop 排空 autorelease pool 时再次释放已 dealloc 的
     // NSError -> SIGSEGV(zombie)。点「恢复默认设置」就触发:restore 调 autostart::sync(false)
     // -> unregisterAndReturnError: 返回 autoreleased NSError -> 被 release -> 崩。

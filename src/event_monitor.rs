@@ -79,7 +79,7 @@ unsafe extern "C" fn event_tap_callback(
                     as u16;
             let flags = crate::event_tap::CGEventGetFlags(event);
 
-            // 隐私:debug 日志绝不记录用户的按键内容——除 Tab / Command / Option 外的
+            // 隐私:debug 日志不记录用户的按键内容——除 Tab / Command / Option 外的
             // 按键一律只打 "Other"(不记键码、不记修饰位),密码、正文等输入不会泄漏
             // 到日志文件。其余行仍承担原诊断职责:有 keyDown 行 = tap 存活;有召唤行
             // 但没反应 = 下游(bridge/主线程)问题。

@@ -82,7 +82,7 @@ static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
     })
 });
 
-/// 最近一次内联「检查中」的开始时间;用于超时兜底,防止 Sparkle 无回调时按钮永远卡住。
+/// 最近一次内联「检查中」的开始时间;用于超时兜底,防止 Sparkle 无回调时按钮持续卡住。
 /// When the last inline "checking" phase began, for a timeout fallback so the button never gets
 /// stuck if Sparkle never calls back.
 static CHECK_TIMER: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));

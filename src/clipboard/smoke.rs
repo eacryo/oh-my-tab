@@ -1,5 +1,5 @@
 //! 剪贴板子系统 · 冒烟模式:--smoke-clipboard 启动的端到端 GUI 冒烟。
-//! 历史文件与图片缓存重定向到专用目录,绝不触碰真实用户数据。
+//! 历史文件与图片缓存重定向到专用目录,避免触碰真实用户数据。
 //!
 //! The clipboard subsystem's smoke mode: the --smoke-clipboard end-to-end GUI run.
 //! History file and image cache are redirected to a dedicated directory, never
@@ -9,7 +9,7 @@ use super::*;
 
 // ========== 冒烟模式 / smoke mode ==========
 
-/// 冒烟模式(--smoke-clipboard):历史文件与图片缓存重定向到专用目录,绝不触碰
+/// 冒烟模式(--smoke-clipboard):历史文件与图片缓存重定向到专用目录,避免触碰
 /// 真实用户数据(真实二进制运行时 cfg!(test) 不生效,这是唯一的隔离手段)。
 /// Smoke mode (--smoke-clipboard): the history file and the image cache are redirected to
 /// a dedicated directory, never touching real user data (cfg!(test) is off in the real
@@ -217,7 +217,7 @@ pub(crate) fn smoke_runner() -> bool {
                 "the detail must stay open while navigating"
             );
             // 溢出文本详情必须使用稳定的完整布局 + 原生 scroller,打开即处于 AppKit
-            // 真实顶部。再模拟 bounds 越过上下端点,通知回调只刷新胶囊、绝不能改写
+            // 真实顶部。再模拟 bounds 越过上下端点,通知回调只刷新胶囊、不改写
             // clipView(橡皮筋是原生 elasticity 的职责)。
             // An overflowing text detail must use stable full layout plus the native scroller
             // and open at AppKit's actual top. Simulate bounds crossing both endpoints; the
@@ -345,7 +345,7 @@ pub(crate) fn smoke_runner() -> bool {
             );
             assert!(!noncontiguous, "detail layout must be contiguous");
             assert!(!background, "detail background layout must be disabled");
-            // 越界原点是橡皮筋的合法状态:bounds 通知回调只刷新胶囊,绝不能改写
+            // 越界原点是橡皮筋的合法状态:bounds 通知回调只刷新胶囊、不改写
             // clipView——两端各验证一次"回调后越界原点保持原样"。
             // Out-of-range origins are legal rubber-band state: the notification callback
             // only refreshes capsules and must not touch the clip view -- verified at both

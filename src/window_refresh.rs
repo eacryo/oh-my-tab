@@ -288,7 +288,7 @@ fn merge_refreshed_windows(
     replace_pid: Option<i32>,
     mut refreshed: Vec<WindowInfo>,
 ) -> Vec<WindowInfo> {
-    // AX 是权威:窗口只在当前快照被 AX 确认时才进入列表,绝不从旧列表复活。
+    // AX 是权威:窗口只在当前快照被 AX 确认时才进入列表,不会从旧列表恢复。
     // AX 对 tab 多表面应用(如 Ghostty)只报当前聚焦窗口,保留旧列表会把未聚焦的 tab 表面
     // 当成独立窗口重新塞进来,导致一张窗口显示成多张卡片。
     // AX is authoritative: a window enters the list only if the current snapshot's AX confirms

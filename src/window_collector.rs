@@ -52,7 +52,7 @@ pub struct WindowInfo {
 pub type MruMap = HashMap<(i32, u32), Instant>;
 
 /// PID → 最后一次 App 激活时间（通过 NSWorkspace 通知）。
-/// 仅作为新窗口第一次进入 MRU 表时的启动种子；已有窗口永不随 App 激活整体更新。
+/// 仅作为新窗口第一次进入 MRU 表时的启动种子；已有窗口不会随 App 激活整体更新。
 /// PID → last app activation time (via NSWorkspace notification).
 /// Used only to seed a window the first time it enters the MRU map; existing windows
 /// are never updated together when their app activates.
@@ -1134,7 +1134,7 @@ pub(crate) fn raise_window_fast(pid: i32, cgwid: u32) -> (bool, bool) {
 // ========== AX 阶段后台化(专职 raiser 线程) / background AX phase (dedicated raiser) ==========
 
 // 最新抬升意图代号:每次提交切换自增;后台任务在应用 AX 变更前重查,已被更新的切换
-// 取代就中止——快速连续切换时,旧任务绝不能把旧窗口又抬回新窗口上面(乱序回跳)。
+// 取代就中止——快速连续切换时,避免旧任务把旧窗口又抬回新窗口上面(乱序回跳)。
 // Generation of the latest raise intent: bumped on every committed switch. Background jobs
 // re-check before applying AX mutations and abort once a newer switch supersedes them --
 // during rapid consecutive switches, a stale job must never re-raise an old window over the
@@ -1301,7 +1301,7 @@ unsafe fn enqueue_main_thread_ax_raise(
 }
 
 // 单一专职 raiser 线程:串行 FIFO 消费任务,保证两次切换的 AX 阶段不并发、
-// 完成顺序与提交顺序一致(配合 supersede 检查,最终状态永远是最后一次切换)。
+// 完成顺序与提交顺序一致(配合 supersede 检查,最终状态保持为最后一次切换)。
 // A single dedicated raiser thread consumes jobs serially, so AX phases of consecutive
 // switches never overlap and completion order equals commit order (combined with the
 // supersede check, the final state is always the last switch).
@@ -1321,7 +1321,7 @@ static RAISE_TX: std::sync::LazyLock<flume::Sender<RaiseJob>> = std::sync::LazyL
 /// 提交后台 AX 精确抬升任务。普通窗口只执行 cached AXRaise;已知最小化窗口先还原。
 /// Enqueue the serialized AX backstop. Normal windows only perform cached AXRaise; known
 /// minimized windows are restored first.
-/// AX 枚举对无响应 App 可能阻塞几十至上百毫秒,绝不能放主线程。
+/// AX 枚举对无响应 App 可能阻塞几十至上百毫秒,应放在后台线程执行。
 ///
 /// AX enumeration can block tens to hundreds of milliseconds on an unresponsive app; it must
 /// stay off the main thread.
@@ -2497,7 +2497,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 
         // mru 按 (pid, CGWindowID) 索引——CGWindowID 在窗口生命周期内稳定不变，
         // 比 title 更可靠（title 会随浏览器标签页切换而变）。新窗口优先以 App 最近
-        // 激活时间初始化；已有条目绝不覆盖，因此旧同 App 窗口不会搭便车。
+        // 激活时间初始化；已有条目不覆盖，因此旧同 App 窗口不会搭便车。
         // Key mru by (pid, CGWindowID) — CGWindowID is stable for the window's
         // lifetime, more reliable than title (which changes with browser tabs). New windows
         // prefer the app's latest activation as their seed; existing entries are never
@@ -2536,7 +2536,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 
     // AX 补漏:AX 窗口列表报、但 CG 枚举没有的窗口。例:JetBrains 系 IDE 在“主窗口
     // 被激活”时把设置对话框 orderOut(隐藏但保留窗口对象)——orderOut 的窗口不在
-    // CGWindowList 里(optionAll 也只含屏上窗口),按 CG 遍历永远看不到它;但 AX 仍
+    // CGWindowList 里(optionAll 也只含屏上窗口),按 CG 遍历无法发现它;但 AX 仍
     // 报它,且它是合法可切换窗口(BetterCmdTab 以 AX 列表为主数据源,故稳定显示)。
     // 这里用 AX 的标题/minimized 补出条目;bounds 未知(离屏),调用方回退主屏幕。
     // AX backfill: windows AX reports but the CG enumeration lacks. E.g. JetBrains IDEs

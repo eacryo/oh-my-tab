@@ -299,7 +299,7 @@ pub(super) struct ClipEntry {
     /// pid). Empty = no identity (e.g. legacy entries) -> no icon in the header.
     pub(super) source_key: String,
     /// 复制时间戳(unix 秒):自动过期的依据,去重移前时刷新为最近一次复制时间。
-    /// None = 旧版本条目(无时间戳),不参与过期——保守迁移,绝不误删。
+    /// None = 旧版本条目(无时间戳),不参与过期——保守迁移,避免误删。
     /// The copy timestamp (unix seconds): the basis of auto-expiry; refreshed to the
     /// latest copy time on dedup-move-to-front. None = a legacy entry (no timestamp),
     /// exempt from expiry -- a conservative migration, never wrongly deleted.
@@ -386,7 +386,7 @@ pub(super) fn ttl_secs() -> Option<u64> {
 }
 
 /// 清理过期条目(纯函数,同步):非置顶且 copied_at 存在且 `now - copied_at >= ttl`
-/// → 删除;置顶永不过期;无时间戳(旧条目)不过期。图片缓存按引用规则同步清理
+/// → 删除;置顶条目不参与过期;无时间戳(旧条目)不过期。图片缓存按引用规则同步清理
 /// (与 delete/truncate 一致:hash 仍被幸存条目引用则保留)。ttl_secs = None 表示
 /// 关闭,直接返回 0。返回删除条数。
 /// Expire entries (pure, synchronous): unpinned entries with a timestamp whose
@@ -483,7 +483,7 @@ pub(super) fn find_by_text(history: &[ClipEntry], text: &str) -> Option<usize> {
 }
 
 /// 把已存在的条目提到最前:保留其置顶状态——置顶条目移到置顶区顶部,
-/// 未置顶条目移到非置顶区顶部(即"最新位置")。列表因此永不重复。
+/// 未置顶条目移到非置顶区顶部(即"最新位置")。列表因此保持唯一。
 /// Move an existing entry to the front, KEEPING its pinned state: pinned entries go to the
 /// top of the pinned block, unpinned ones to the top of the unpinned block (the newest
 /// slot). The list therefore never holds duplicates.

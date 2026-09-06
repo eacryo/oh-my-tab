@@ -7,7 +7,7 @@
 //!   显示/关闭浮窗;Tab 循环切换分类,↑↓/←/→/Enter/Esc/点击导航:↑↓ 选择,← 置顶,
 //!   → 展开详情浮窗(完整文本 / 图片大图,内容跟随 ↑↓ 浏览实时刷新;打开时再按 →
 //!   关闭)。Enter 或点击 = 写回剪贴板 + 合成 Cmd+V 自动粘贴(行为同 Windows 的
-//!   Win+V)。详情浮窗是被动展示面板(永不成为 key,键盘焦点留在列表),点击面板任意
+//!   Win+V)。详情浮窗是被动展示面板(不会成为 key,键盘焦点留在列表),点击面板任意
 //!   处/Esc 关闭,随主浮窗隐藏。
 //! - 文本条目存原文;**图片数据**条目原始字节落盘(`~/Library/Caches/oh-my-tab-clip-images/`,
 //!   按内容哈希命名),内存只留降采样 PNG 预览;粘贴时按需读回,按原始 UTI 写回
@@ -1236,7 +1236,7 @@ unsafe fn scroll_detail_to_top(scroll: *mut AnyObject) {
 }
 
 /// 详情原生滚动视图的 bounds 变化 → 只更新自定义滚动条胶囊。端点越界(橡皮筋)
-/// 属于原生 elasticity 的职责,绝不能在这里改写 clipView bounds——手势进行中的
+/// 属于原生 elasticity 的职责,不应在这里改写 clipView bounds——手势进行中的
 /// 同步硬钳会污染 NSScrollView 的动量累加基准,让后续惯性事件从脏基准重新施加
 /// delta,两端反复拉锯直到惯性耗尽,屏幕上就是滚动条"抽搐一下"。橡皮筋期间
 /// 指示器几何把进度 clamp 到 0..1,滑块自然钉在端点,与系统滚动条表现一致。
@@ -1611,7 +1611,7 @@ fn screen_containing(cursor: NSPoint, frames: &[NSRect]) -> Option<NSRect> {
 }
 
 /// 纯逻辑:计算浮窗 frame——光标右下偏移,右侧/下方空间不足时翻转到左侧/上方,
-/// 仍不足则贴屏边缘 clamp,永不越出屏幕。
+/// 仍不足则贴屏边缘 clamp,避免越出屏幕。
 ///
 /// Pure: compute the picker frame -- offset to the cursor's bottom-right; flip to the
 /// left/top when the right/bottom side lacks room; clamp to the screen edge otherwise.
@@ -1653,7 +1653,7 @@ fn picker_frame_for(cursor: NSPoint, screen: NSRect, w: f64, h: f64) -> NSRect {
 }
 
 /// 纯逻辑:详情始终在主浮窗右侧,并在其垂直边界内对齐选中行;因此详情上下边缘
-/// 永远不会越出主浮窗。
+/// 布局结果会限制在主浮窗范围内。
 ///
 /// Pure: keep the detail panel on the picker's right and align it to the selected row within
 /// the picker's vertical bounds, so neither detail edge can exceed the picker.
@@ -1849,7 +1849,7 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
 fn show_picker() {
     unsafe {
         // 呼出前清理过期条目(长时间不复制时,历史里的过期条目在此清除;rebuild_rows
-        // 随后按新列表渲染)。置顶永不过期。
+        // 随后按新列表渲染)。置顶条目不参与过期。
         // Expire before summon (entries that aged out while the user wasn't copying are
         // removed here; rebuild_rows renders the fresh list). Pinned never expire.
         {
@@ -2058,7 +2058,7 @@ fn hide_detail() {
 }
 
 /// 构建详情浮窗窗口(一次):Nonactivating NSPanel + 与主浮窗同款玻璃背景。
-/// **关键**:重写 canBecomeKeyWindow = NO,面板永不成为 key——键盘焦点始终留在
+/// **关键**:重写 canBecomeKeyWindow = NO,面板不会成为 key——键盘焦点始终留在
 /// 主浮窗容器(↑/↓/←/→/Enter/Esc 全部继续走 container_key_down),详情只是被动展示。
 ///
 /// Build the detail panel window (once): a Nonactivating NSPanel with the same glass
@@ -2220,7 +2220,7 @@ unsafe fn ensure_detail_window() {
     *DETAIL_WINDOW.lock().unwrap() = Some(ObjPtr(window));
 }
 
-/// 详情面板永不成为 key(键盘焦点保持留在主浮窗容器)。
+/// 详情面板不会成为 key(键盘焦点保持留在主浮窗容器)。
 /// The detail panel never becomes key (keyboard focus stays in the picker's container).
 extern "C" fn detail_window_can_not_become_key(_self: *mut c_void, _cmd: Sel) -> bool {
     false
@@ -2283,7 +2283,7 @@ unsafe fn run_save_panel(suggested_name: &str) -> Option<String> {
     let resp: isize = msg_send![panel, runModal]; // NSModalResponseOK == 1
     let result = if resp == 1 {
         // URL/path 都是属性 getter,按 Cocoa 惯例返回 +0(autoreleased),已挂进上面的
-        // 池子——**绝不能**再手动 release:提前归零会立即析构,drain 时对悬垂指针再发
+        // 池子——**不应**再手动 release:提前归零会立即析构,drain 时对悬垂指针再发
         // release 直接 SIGSEGV(与 stringForType: 处同口径)。
         // URL/path come from property getters that return +0 (autoreleased) per Cocoa
         // convention and are registered in the pool above -- NEVER release them manually:
@@ -2379,7 +2379,7 @@ extern "C" fn detail_save_as_action(_self: *mut c_void, _cmd: Sel, _sender: *mut
     let Some(entry) = CLIP_HISTORY.lock().unwrap().get(h_idx).cloned() else {
         return;
     };
-    // 本 action 在 NSCell trackMouse 的鼠标追踪会话内被同步调用;runModal 绝不能
+    // 本 action 在 NSCell trackMouse 的鼠标追踪会话内被同步调用;runModal 不应
     // 在这里启动(嵌套模态会让保存面板的文件名框拿不到键盘焦点)。存槽 + 跳下一轮
     // runloop,追踪结束后由 detail_save_as_deferred 执行。
     // This action is invoked synchronously inside the button's mouseDown tracking
@@ -2466,7 +2466,7 @@ unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
     let share_x = width - 42.0;
     // 自绘迷你开关(轨道 + 白色滑块两层 CALayer)。详情面板是非激活 NSPanel
     // (canBecomeKeyWindow = false),AppKit 对非 key 窗口的原生控件统一降饱和——
-    // 系统 NSSwitch 在这里永远画不出蓝色开启态;层颜色由我们直接设置,与焦点无关。
+    // 系统 NSSwitch 在这里无法稳定画出蓝色开启态;层颜色由我们直接设置,与焦点无关。
     // Custom-drawn mini switch (track layer + white knob sublayer). The detail panel is a
     // passive non-activating NSPanel (canBecomeKeyWindow = false); AppKit desaturates native
     // controls in non-key windows, so a stock NSSwitch never shows its blue on-state here.
@@ -2802,7 +2802,7 @@ unsafe fn show_detail_for_sel() {
     let picker_frame: NSRect = msg_send![picker_win, frame];
     let max_detail_h = detail_max_height(picker_frame);
 
-    // 清除旧内容:removeFromSuperview 即释放(父视图持有,绝不二次 release,
+    // 清除旧内容:removeFromSuperview 即释放(父视图持有,不应二次 release,
     // 与 rebuild_rows 同一条纪律)。详情文本视图指针一并清空(防悬空)。
     // Clear the old content: removeFromSuperview releases it (parent-owned; never released
     // again -- the same discipline as rebuild_rows). The detail text-view pointer is
@@ -3462,7 +3462,7 @@ unsafe fn add_detail_text(
     *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr(tv));
 
     // 详情滚动条由自定义胶囊绘制;bounds 通知只负责刷新胶囊位置,端点橡皮筋由原生
-    // elasticity 处理,这里绝不改写 bounds(改写会在手势中与动量拉锯,导致抽搐)。
+    // elasticity 处理,这里不改写 bounds(改写会在手势中与动量拉锯,导致抽搐)。
     // Detail scrollbars are drawn by the custom capsules; the bounds notification only
     // refreshes capsule positions. Endpoint rubber banding is handled by native
     // elasticity -- never rewrite bounds here (doing so fights momentum mid-gesture and
@@ -3544,7 +3544,7 @@ unsafe fn add_detail_text(
     release_obj(scroll);
 
     // 详情文本上显示 I-beam 输入光标:非 key 窗口里 cursor rect 不生效(NSTextView
-    // 自带的 I-beam 矩形只在 key 窗口激活,详情面板永远不是 key → 之前一直箭头)。
+    // 自带的 I-beam 矩形只在 key 窗口激活,详情面板不会成为 key → 之前一直箭头)。
     // 用与行悬停同款的 mouseEntered/Exited + ActiveAlways tracking area 手动设置
     // NSCursor;cursorUpdate 选项明确不支持 ActiveAlways(见 NSTrackingArea.h),
     // 所以走 enter/exit 路径。tracking area 放在固定大小的滚动视图上——每次打开
@@ -3731,7 +3731,7 @@ fn copy_detail_selection() {
             })
         };
         let text = if let Some((source, source_range)) = mapped {
-            // 代码详情可能插入了显示换行;按映射从原文提取,绝不把格式化字符复制出去。
+            // 代码详情可能插入了显示换行;按映射从原文提取,避免把格式化字符复制出去。
             // Code details may contain display-only breaks; extract from the source mapping
             // so formatting characters are never copied.
             let source_ns = make_nsstring(&source);
@@ -3989,7 +3989,7 @@ unsafe fn ensure_picker_window() {
     };
 
     // NSScrollView:滚轮滚动 + 自定义滚动指示器(去掉系统滚动条,视觉更贴合玻璃)。
-    // 只占头部条以下的区域:列表在自身区域内滚动,永不与搜索行重叠。
+    // 只占头部条以下的区域:列表在自身区域内滚动,避免与搜索行重叠。
     // NSScrollView: wheel scrolling + a custom scroll indicator (the system scroller is
     // replaced for a cleaner look on the glass). It only occupies the area below the header
     // strip: the list scrolls within its own region and can never overlap the search row.
@@ -4426,7 +4426,7 @@ unsafe fn rebuild_rows() {
 
     // 移除旧行 / remove old rows.
     // 注意:按钮 alloc +1 已在 addSubview 后 release(由父视图持有);
-    // removeFromSuperview 会让父视图释放引用(计数归零、对象 dealloc),绝不能
+    // removeFromSuperview 会让父视图释放引用(计数归零、对象 dealloc),不应
     // 再对其 release——否则二次释放 use-after-free(曾导致第二次呼出 segfault)。
     // Note: the button's alloc +1 was released after addSubview (owned by the parent view);
     // removeFromSuperview drops the parent's reference (refcount hits zero, object deallocs),
@@ -4437,7 +4437,7 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![b.0, removeFromSuperview];
     }
     rows.clear();
-    // 背景块与按钮同生命周期:同样由父视图持有,removeFromSuperview 即释放,绝不二次
+    // 背景块与按钮同生命周期:同样由父视图持有,removeFromSuperview 即释放,不应二次
     // release(同按钮的 UAF 教训)。
     // Tiles share the buttons' lifecycle: parent-owned, released by removeFromSuperview,
     // never released again (same UAF lesson as the buttons).
@@ -4912,7 +4912,7 @@ unsafe fn search_cell_class() -> *mut AnyObject {
                 types.as_ptr(),
             );
             // 编辑启动时直接定位字段编辑器:drawingRectForBounds: 对编辑器无效
-            // (原生 NSSearchFieldCell 返回整框高度,覆写条件永不成立,文本始终贴顶,
+            // (原生 NSSearchFieldCell 返回整框高度,覆写条件不会成立,文本始终贴顶,
             // 实测光标顶端与字段上缘仅差 0.5pt)。在 selectWithFrame: 里把编辑器
             // frame 垂直居中,光标与输入文字随行框一起居中。
             // The field editor is positioned directly at edit start: drawingRectForBounds:
@@ -5521,7 +5521,7 @@ extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *m
         // 悬停只更新 hover 行(轻底,0.032),**不改选中**——选中(0.050 + 左条)只由
         // 键盘方向键/点击驱动。两个状态因此能同时可见,对应设计稿里独立的
         // .item:hover 与 .item.selected(悬停即选中会让悬停行恒为选中样式,
-        // 轻悬停底永远看不到,两种状态看着就一样)。
+        // 轻悬停底无法显示,两种状态看着就一样)。
         // Hovering only sets the hovered row (the light 0.032 fill) and does NOT move the
         // selection (0.050 + the left bar) -- the selection moves via the keyboard arrows
         // / clicks only. The two states stay independently visible, matching the mockup's
@@ -5877,7 +5877,7 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
         // reaches here -- a natural no-op.
         let mods: u64 = msg_send![event as *mut AnyObject, modifierFlags];
         // Cmd+C(键码 8):详情打开时复制选中范围(无选中 = 复制全文)。键盘路径与
-        // 详情底部的"复制所选"按钮等价——详情面板永不成为 key,系统 Cmd+C 路由
+        // 详情底部的"复制所选"按钮等价——详情面板不会成为 key,系统 Cmd+C 路由
         // 到主浮窗,这里手动转发。搜索框聚焦时按键由字段编辑器消化,天然不冲突。
         // Cmd+C (keycode 8): with the detail open, copy the selection (full text when
         // nothing is selected) -- the keyboard twin of the detail's "copy selection"
@@ -6222,7 +6222,7 @@ unsafe fn make_meta_footer_attributed(entry: &ClipEntry, show_source: bool) -> *
             NSPoint::new(0.0, -2.0),
             NSSize::new(META_ICON, META_ICON)
         )];
-        // attributedStringWithAttachment: 返回 +0(autoreleased)对象,绝不能 release
+        // attributedStringWithAttachment: 返回 +0(autoreleased)对象,不应 release
         // ——额外释放会在池回收时二次释放崩溃(与 rebuild_search_hint 同款纪律)。
         // attributedStringWithAttachment: returns a +0 (autoreleased) object; releasing it
         // over-releases and crashes on pool drain (same discipline as rebuild_search_hint).
@@ -7216,7 +7216,7 @@ unsafe fn add_hover_tracking(view: *mut AnyObject) {
     // MouseEnteredAndExited(0x01) | ActiveAlways(0x80),矩形 = 视图 bounds,与切换浮窗
     // 完全同款。两条 load-bearing:
     // - nonactivating 面板宿主 app 未激活 → ActiveInActiveApp(0x40) 不投递 hover,
-    //   必须 ActiveAlways(曾误用 0x40,悬停永不触发)。
+    //   必须 ActiveAlways(曾误用 0x40,悬停不会触发)。
     // - 不用 InVisibleRect:滚动容器里的可见区计算不可靠,直接给显式 bounds。
     // MouseEnteredAndExited (0x01) | ActiveAlways (0x80), the rect is the view's bounds --
     // exactly the switcher overlay's setup. Two load-bearing points: (1) the picker's host
@@ -8134,7 +8134,7 @@ mod tests {
     #[test]
     fn paste_writeback_skip_only_when_toggle_off_and_marker_present() {
         use super::should_skip_paste_writeback;
-        // 开关开(默认)→ 永不跳过(维持"使用后置顶"现状)。
+        // 开关开(默认)→ 不跳过(维持"使用后置顶"现状)。
         // Toggle on (default) -> never skip (used entries keep moving to the top).
         assert!(!should_skip_paste_writeback(true, false));
         assert!(!should_skip_paste_writeback(true, true));
@@ -8251,7 +8251,7 @@ mod tests {
             cache_read_image, cache_read_preview, cache_write_preview, delete_entry, record_image,
         };
         // 文件条目 + 数据条目,同内容同 hash,跨类共存(各自按类去重,不互相合并)。
-        // 删除文件条目时**绝不能**误删共享的 `{hash}` 数据字节与 `{hash}.preview`
+        // 删除文件条目时应避免误删共享的 `{hash}` 数据字节与 `{hash}.preview`
         // (数据条目仍需要它们);两条都删光后缓存才清理。
         // A file entry and a data entry with identical content (same hash) coexist across
         // classes. Deleting the FILE entry must NOT wipe the shared `{hash}` data bytes and
@@ -9156,7 +9156,7 @@ mod tests {
         // renders no rows, so no highlight concern).
         assert_eq!(clamp_selection(0, 0), 0);
         assert_eq!(clamp_selection(3, 0), 3);
-        // 无选中哨兵(搜索框聚焦):绝不恢复高光。
+        // 无选中哨兵(搜索框聚焦):不恢复高光。
         // The no-selection sentinel (search-field focus): never resurrect a highlight.
         assert_eq!(clamp_selection(NO_SELECTION, 3), NO_SELECTION);
         // 大幅越界(多次删除累积)→ 直接末条。

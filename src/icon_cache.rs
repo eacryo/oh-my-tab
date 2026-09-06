@@ -20,7 +20,7 @@ use crate::window_collector::{resolve_app_identity, AppIdentity};
 fn icon_cache_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     // 测试构建使用与真实缓存同级的专用目录:冒烟测试里的 clear_icon_cache()
-    // 只清测试目录,绝不触碰用户的真实图标缓存(曾清空真实缓存导致下次
+    // 只清测试目录,避免触碰用户的真实图标缓存(曾清空真实缓存导致下次
     // summon 全部重提取,卡 ~400ms)。
     // Test builds use a dedicated sibling directory: the smoke tests' clear_icon_cache()
     // only clears the test dir, never the user's real icon cache (clearing the real one
@@ -74,7 +74,7 @@ pub fn ensure_icon_cache_dir() {
 }
 
 /// 一次性迁移:删除旧版按 PID 命名的缓存文件(文件名 stem 纯数字)。
-/// 新版键为 bundle id(含字母/点)或 `exec_`/`pid_` 前缀,绝不会是纯数字,故不会误删。
+/// 新版键为 bundle id(含字母/点)或 `exec_`/`pid_` 前缀,不会是纯数字,可降低误删风险。
 /// One-shot migration: remove legacy PID-named cache files (purely-numeric filename stem).
 /// New keys are bundle ids (letters/dots) or `exec_`/`pid_`-prefixed, never purely numeric,
 /// so nothing legitimate is touched.

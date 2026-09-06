@@ -6,7 +6,7 @@ use super::*;
 // ========== 图片磁盘缓存 / image disk cache ==========
 
 /// 图片字节缓存目录:原始格式字节全部落盘,内存只留降采样预览;持久化关闭时启动清空,
-/// 持久化开启时按历史引用扫描孤儿文件。测试构建使用专用目录,绝不触碰真实缓存。
+/// 持久化开启时按历史引用扫描孤儿文件。测试构建使用专用目录,避免触碰真实缓存。
 /// The image-byte cache directory: original-format bytes live on disk and memory only keeps
 /// the downsampled preview; persistence-off startup wipes it, while persistence-on startup
 /// sweeps unreferenced files. Test builds use a dedicated directory, never the real cache.
@@ -317,7 +317,7 @@ pub(super) fn request_detail_preview(img: &ImageEntry, deliver: bool) {
     }
 }
 
-/// 为图片条目取详情展示字节(同步三态,**绝不阻塞**):
+/// 为图片条目取详情展示字节(同步三态,**设计为不阻塞**):
 /// ① 后台刚生成的单槽命中 → 消费清空;
 /// ② `{hash}.detail` 磁盘缓存 → 同步读(毫秒级);
 /// ③ 内存 480px 预览立即返回,同时投递后台生成(deliver=true),完成后由

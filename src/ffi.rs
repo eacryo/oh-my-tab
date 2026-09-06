@@ -222,7 +222,7 @@ extern "C" {
 
 /// kernel `task_vm_info` 的 C 数据布局是 372 字节(93 个 u32 word)。Rust 的 `repr(C)`
 /// 会在末尾按自身 8 字节对齐补 4 字节,所以不能从 `size_of::<TaskVmInfo>()` 推导 count;
-/// Mach count 必须按 C 布局明确写成 93。缓冲区保留额外尾部空间,绝不会被写穿。
+/// Mach count 必须按 C 布局明确写成 93。缓冲区保留额外尾部空间,避免写越界。
 /// The kernel `task_vm_info` C data layout is 372 bytes (93 u32 words). Rust's `repr(C)`
 /// adds 4 bytes of trailing 8-byte alignment padding, so the Mach count must be based on
 /// the C layout rather than `size_of::<TaskVmInfo>()`. The buffer has extra tail space and

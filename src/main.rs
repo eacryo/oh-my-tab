@@ -1592,7 +1592,7 @@ fn main() {
         unsafe {
             let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
             init_app();
-            // 冒烟模式:历史/缓存隔离到专用目录,绝不能写入用户的真实数据。
+            // 冒烟模式:历史/缓存隔离到专用目录,避免写入用户的真实数据。
             // Smoke mode: isolate the history/cache into a dedicated directory so the
             // injected entries can never touch the user's real data.
             clipboard::set_smoke_mode();

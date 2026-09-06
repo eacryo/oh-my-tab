@@ -145,7 +145,7 @@ pub(super) fn preferred_uti(present: &[&str]) -> Option<&'static str> {
 }
 
 /// 敏感/临时剪贴板标记(nspasteboard.org "Securing Copy" 协议):带这些标记的内容
-/// **绝不记录进历史**(内存与磁盘都不会)——密码管理器(1Password 等)复制密码时会
+/// **不记录进历史**(内存与磁盘都不会)——密码管理器(1Password 等)复制密码时会
 /// 打上 ConcealedType,让剪贴板历史应用跳过。与 Maccy 的处理一致。
 /// Sensitive/transient pasteboard markers (the nspasteboard.org "Securing Copy"
 /// protocol): content carrying these markers is NEVER recorded (not in memory, not on
@@ -321,7 +321,7 @@ pub(super) fn is_image_extension(path: &str) -> bool {
 }
 
 /// 剪贴板是否携带文件复制标记(public.file-url 存在)。文件复制(含多文件)时,
-/// 剪贴板文本只是文件名(列表),绝不能按普通文本记录。
+/// 剪贴板文本只是文件名(列表),应避免按普通文本记录。
 /// Whether the pasteboard carries a file-copy marker (public.file-url present). On a
 /// file copy (including multi-file selections) the text is just the filename(s) and
 /// must never be recorded as plain text.
@@ -439,7 +439,7 @@ pub(super) unsafe fn write_pasteboard_text(text: &str, stamp_marker: bool) {
     if stamp_marker {
         stamp_paste_marker(pb);
     }
-    // 日志只打元数据,绝不打剪贴板内容(隐私:内容可能是密码/正文)。
+    // 日志只打元数据,不记录剪贴板内容(隐私:内容可能是密码/正文)。
     // Log metadata only, NEVER the clipboard text (privacy: it may be a password/body text).
     log_debug!(
         "[clip] write back {} chars (setString ok={}, stamp={})",

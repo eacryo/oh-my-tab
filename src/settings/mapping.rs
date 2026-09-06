@@ -97,7 +97,7 @@ pub(super) unsafe fn update_mapping_controls_enabled(u: &SettingsUi) {
 pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
     unsafe {
         // removeFromSuperview 已释放父视图持有的引用;创建时的 alloc +1 已在 addSubview 后
-        // 用 release_obj 平衡过。这里绝不能再次 release —— 双重释放会 EXC_BAD_ACCESS。
+        // 用 release_obj 平衡过。这里不应再次 release —— 双重释放会 EXC_BAD_ACCESS。
         // removeFromSuperview already drops the superview's reference; the alloc +1 was
         // balanced by release_obj right after addSubview. Re-releasing here would double-free
         // (EXC_BAD_ACCESS).
@@ -139,7 +139,7 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
         // Empty-state hint: shown when there are no rows.
         let _: () = msg_send![u.mapping_empty, setHidden: !items.is_empty()];
         // 只改高度,宽度保持初始值:曾用 setFrameSize(0.0, doc_h) 把宽清零,
-        // 宽度为 0 的文档视图 hit-test 失败 —— 行内删除按钮永远点不到。
+        // 宽度为 0 的文档视图 hit-test 失败 —— 行内删除按钮无法点击。
         // Resize height only, keeping the initial width: setFrameSize(0.0, doc_h) used to
         // zero the width, and a zero-width document view fails hit-testing -- the delete
         // buttons became unclickable.

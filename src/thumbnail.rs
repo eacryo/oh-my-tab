@@ -11,7 +11,7 @@
 //! 5. 空白帧门控:WKWebView(Tauri/Electron 等)的页面由独立 WebContent 进程
 //!    渲染,窗口长时间后台后该进程被挂起、内容表面被 WindowServer 丢弃,截出来
 //!    只剩"标题栏(红绿灯)+纯色白屏"。此类帧按场景分流(AltTab 同策略):
-//!    - 后台 + 缓存有帧:丢弃,保住最后一张有效帧(升级单向,永不回退)
+//!    - 后台 + 缓存有帧:丢弃,保住最后一张有效帧(升级单向,避免回退)
 //!    - 后台 + 缓存为空:入缓存作为占位种子(好过图标卡;激活后自动升级)
 //!    - 前台:如实入缓存(用户眼前的真实画面)
 //!    - 激活补拍仍空白:丢弃并延迟重试一次,给 WebContent 恢复重绘留时间
@@ -205,7 +205,7 @@ pub(crate) fn fit_size(content_w: f64, content_h: f64, box_w: f64, box_h: f64) -
     (content_w * s, content_h * s)
 }
 
-/// 目标像素尺寸:按最大高度等比缩小(绝不放大);退化输入原样返回。
+/// 目标像素尺寸:按最大高度等比缩小(不放大);退化输入原样返回。
 /// Target pixel size: proportional shrink to a max height (never upscale);
 /// degenerate inputs pass through.
 fn fit_target(src_w: u32, src_h: u32, max_h: u32) -> (u32, u32) {
@@ -422,7 +422,7 @@ struct CachedThumb {
     captured: Instant,
     /// 全局递增的帧版本号(cache_store 时分配)。浮窗卡片签名携带它,帧在浮窗关闭
     /// 期间被替换(种子→真实、激活补拍、外观重拍)后,下一次召唤签名失配走 Replace
-    /// 重建,复用路径不会永远展示旧图。
+    /// 重建,复用路径不会持续展示旧图。
     /// Globally increasing frame version (assigned in cache_store). Overlay card
     /// signatures carry it: after a frame is replaced while the overlay is closed
     /// (seed -> real, activation refresh, appearance recapture), the next summon's
@@ -618,7 +618,7 @@ pub(crate) fn frame_epoch(pid: i32, wid: u32) -> u64 {
 
 // ========== 捕获管线(flume 队列 + 单 worker 串行限流) ==========
 
-/// 捕获优先级。值越大越先执行；同优先级保持首次入队 FIFO。启动预热永远可被
+/// 捕获优先级。值越大越先执行；同优先级保持首次入队 FIFO。启动预热可被
 /// 后续召唤的选中/可见请求原地提升，不需要复制第二份任务。
 /// Capture priority. Higher values run first; equal priorities retain initial FIFO
 /// order. Startup prewarm work can be promoted in place by later selected/visible
@@ -1286,7 +1286,7 @@ fn run_capture_job(job: CaptureJob) {
     }
     record_thumb_capture(job_started.elapsed().as_millis() as u64);
     // 空白帧门控:后台挂起的 WKWebView(Tauri/Electron 等)截出来只剩"标题栏+
-    // 纯色内容",这样的帧绝不能覆盖缓存里的最后一张有效帧;前台窗口的空白是
+    // 纯色内容",这样的帧不应覆盖缓存里的最后一张有效帧;前台窗口的空白是
     // 用户眼前的真实画面,如实保留。
     // Blank-frame gating: a background-suspended WKWebView (Tauri/Electron et al.)
     // captures as title bar + solid content only; such a frame must never clobber
@@ -1638,7 +1638,7 @@ static CONNECTION_ID: OnceLock<u32> = OnceLock::new();
 // 后台/被遮挡后 macOS 挂起该进程并丢弃 WindowServer 侧的内容表面,此时截窗口
 // 只剩宿主进程绘制的标题栏(红绿灯),内容区域退化为逐像素一致的纯色(通常白)。
 // macOS 没有任何公开 API 能强制别的进程重渲染,AltTab 的结论是唯一可行策略:
-// 前台时捕获 + 最后一张有效帧永不被空白帧覆盖(alt-tab-macos WindowThumbnails.swift)。
+// 前台时捕获 + 保留最后一张有效帧,避免被空白帧覆盖(alt-tab-macos WindowThumbnails.swift)。
 // 本模块在缓存写入前对每帧做空白判定:
 // - 后台窗口 + 已有缓存帧:丢弃,保住最后一张有效帧(升级单向)
 // - 后台窗口 + 缓存为空:入缓存作为占位种子(之后前台补拍自动升级)
@@ -2765,7 +2765,7 @@ mod tests {
         assert_eq!(job.priority, CapturePriority::Visible);
         assert!(!state.finish(job));
 
-        // 激活补拍路径永不携带外观标志。
+        // 激活补拍路径不携带外观标志。
         // The activation path never carries the appearance flag.
         assert!(state.request_activation(key, 512, Instant::now(), 0));
         let job = state.take_next().unwrap();

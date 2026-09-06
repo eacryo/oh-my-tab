@@ -5,7 +5,7 @@
 // Zero new deps (toml/serde already present); locale files are embedded at compile time;
 // the active locale is config-driven and hot-reloadable.
 //
-// 循环依赖说明:本模块绝不读取 CONFIG,只读系统语言(NSLocale)。这样 CONFIG 的
+// 循环依赖说明:本模块不读取 CONFIG,只读系统语言(NSLocale)。这样 CONFIG 的
 // LazyLock 初始化期间若调用 validate() -> t() -> I18N 初始化,不会形成死锁。
 // config.rs 在 CONFIG 初始化与 reload 后单向调用 apply_config_locale() 应用配置覆盖。
 //

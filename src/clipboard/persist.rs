@@ -141,7 +141,7 @@ pub(super) fn save_history() {
         return;
     }
     let mut hist = CLIP_HISTORY.lock().unwrap();
-    // 写盘前清理过期条目:磁盘文件永不残留过期条目(内存与持久化同步过期)。
+    // 写盘前清理过期条目:同步减少磁盘文件中的过期条目(内存与持久化同步过期)。
     // Expire before writing: the disk file never keeps expired entries (expiry applies
     // to memory and persistence alike).
     expire_entries(&mut hist, now_secs(), ttl_secs());
