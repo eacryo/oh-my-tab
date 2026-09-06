@@ -890,6 +890,116 @@ static THUMB_QUEUE_MAX_MS: AtomicU64 = AtomicU64::new(0);
 static THUMB_CAPTURE_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
 static THUMB_CAPTURE_MAX_MS: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Default)]
+struct ShowDesktopProbeState {
+    space_signature: Vec<u32>,
+    unstable_streak: u8,
+    stable_streak: u8,
+    active: bool,
+}
+
+/// 基于当前 Space 的窗口变换判断 Show Desktop/动画阶段。
+/// The detector is intentionally heuristic: private CGS geometry is sampled together
+/// with the public current-Space window set, so a Space change resets the detector.
+static SHOW_DESKTOP_PROBE: LazyLock<Mutex<ShowDesktopProbeState>> =
+    LazyLock::new(|| Mutex::new(ShowDesktopProbeState::default()));
+
+/// 在当前 Space 里取最多三个普通窗口，判断它们是否同时发生了明显的异常变换。
+/// Sample up to three ordinary windows in the current Space and detect simultaneous
+/// abnormal transforms. Two consecutive normal samples are required to leave the state.
+fn show_desktop_probe_active() -> bool {
+    let windows = crate::window_collector::ordinary_onscreen_window_bounds();
+    let mut signature: Vec<u32> = windows.iter().map(|(wid, _)| *wid).collect();
+    signature.sort_unstable();
+    let Some(connection) = skylight::cgs_main_connection() else {
+        return false;
+    };
+
+    let mut abnormal_count = 0usize;
+    for (window_id, bounds) in &windows {
+        let Some((transform, onscreen_bounds)) =
+            skylight::cgs_window_presentation_geometry(connection, *window_id)
+        else {
+            return false;
+        };
+        let normal_area = bounds.2.max(0.0) * bounds.3.max(0.0);
+        let visible_area = onscreen_bounds.w.max(0.0) * onscreen_bounds.h.max(0.0);
+        let normal_center = (bounds.0 + bounds.2 / 2.0, bounds.1 + bounds.3 / 2.0);
+        let visible_center = (
+            onscreen_bounds.x + onscreen_bounds.w / 2.0,
+            onscreen_bounds.y + onscreen_bounds.h / 2.0,
+        );
+        let center_shift = (visible_center.0 - normal_center.0).abs() > (bounds.2 * 0.25).max(80.0)
+            || (visible_center.1 - normal_center.1).abs() > (bounds.3 * 0.25).max(80.0);
+        let transform_changed = (transform.a - 1.0).abs()
+            + (transform.d - 1.0).abs()
+            + transform.b.abs()
+            + transform.c.abs()
+            > 0.15;
+        let heavily_clipped = normal_area > 0.0 && visible_area / normal_area < 0.25;
+        if center_shift || transform_changed || heavily_clipped {
+            abnormal_count += 1;
+        }
+    }
+
+    let mut state = SHOW_DESKTOP_PROBE.lock().unwrap();
+    if state.space_signature != signature {
+        // Space 变化会自然改变窗口集合，不能把普通 Space 切换误认为 Show Desktop。
+        // A Space change changes the window set; never carry Show Desktop evidence across it.
+        state.space_signature = signature;
+        state.unstable_streak = 0;
+        state.stable_streak = 0;
+        state.active = false;
+    }
+
+    if abnormal_count >= 2 {
+        state.unstable_streak = state.unstable_streak.saturating_add(1);
+        state.stable_streak = 0;
+        if !state.active {
+            state.active = true;
+            log_debug!(
+                "[show-desktop] geometry probe active abnormal_windows={} sample_streak={}",
+                abnormal_count,
+                state.unstable_streak
+            );
+        }
+    } else if state.active && abnormal_count == 0 {
+        state.stable_streak = state.stable_streak.saturating_add(1);
+        if state.stable_streak >= 2 {
+            state.active = false;
+            state.unstable_streak = 0;
+            log_debug!("[show-desktop] geometry probe inactive after stable samples");
+        }
+    } else {
+        state.stable_streak = 0;
+    }
+    state.active
+}
+
+/// 拒绝 WindowServer 在动画中返回的细长/裁剪源帧，避免污染已有缓存。
+/// Reject thin or clipped source frames returned during WindowServer animations.
+fn capture_geometry_is_plausible(key: ThumbKey, captured: &CapturedWindow) -> bool {
+    if captured.source_w_px < 64 || captured.source_h_px < 64 {
+        return false;
+    }
+    let source_aspect = captured.source_w_px as f64 / captured.source_h_px as f64;
+    if !(0.08..=12.0).contains(&source_aspect) {
+        return false;
+    }
+    let expected_bounds = crate::window_collector::ordinary_onscreen_window_bounds()
+        .into_iter()
+        .find_map(|(wid, bounds)| (wid == key.wid).then_some(bounds));
+    let Some((_, _, expected_w, expected_h)) = expected_bounds else {
+        return true;
+    };
+    if expected_w <= 0.0 || expected_h <= 0.0 {
+        return true;
+    }
+    let expected_aspect = expected_w / expected_h;
+    let aspect_ratio = source_aspect / expected_aspect;
+    (0.25..=4.0).contains(&aspect_ratio)
+}
+
 fn update_max(metric: &AtomicU64, value: u64) {
     let mut current = metric.load(Ordering::Relaxed);
     while value > current {
@@ -1073,11 +1183,6 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                     let queue_ms = job.enqueued_at.elapsed().as_millis() as u64;
                     record_thumb_queue_wait(queue_ms);
                     run_capture_job(job);
-                    // 捕获期间若来了更高清、更高优先级或更新的 activation 请求，保留
-                    // active 并自行补发，避免恢复后的刷新被更早任务吞掉。
-                    // If a higher-resolution, higher-priority, or newer activation request
-                    // arrived during capture, keep the key active and self-enqueue a follow-up
-                    // so an earlier job cannot swallow the post-resume refresh.
                     let follow_up = CAPTURE_STATE.lock().unwrap().finish(job);
                     if follow_up && retry_tx.send(()).is_err() {
                         CAPTURE_STATE.lock().unwrap().desired.remove(&job.key);
@@ -1094,6 +1199,18 @@ fn run_capture_job(job: CaptureJob) {
     if !CAPTURE_STATE.lock().unwrap().is_current(job) {
         log_debug!(
             "[thumb] job skipped stale pid={} wid={} priority={}",
+            key.pid,
+            key.wid,
+            job.priority.label()
+        );
+        return;
+    }
+    // 在真正捕获前再次探测，覆盖任务取出后到调用 WindowServer 之间的动画竞态。
+    // Probe again immediately before capture to cover the race between job selection
+    // and the WindowServer call when the animation starts.
+    if show_desktop_probe_active() {
+        log_debug!(
+            "[thumb] capture skipped during Show Desktop geometry transition pid={} wid={} priority={}",
             key.pid,
             key.wid,
             job.priority.label()
@@ -1129,6 +1246,30 @@ fn run_capture_job(job: CaptureJob) {
         log_debug!("[thumb] capture failed pid={} wid={}", key.pid, key.wid);
         return;
     };
+    log_debug!(
+        "[thumb] capture result pid={} wid={} source={}x{} cached={}x{} target_h={}",
+        key.pid,
+        key.wid,
+        captured.source_w_px,
+        captured.source_h_px,
+        captured.thumb.w_px,
+        captured.thumb.h_px,
+        job.target_px_h
+    );
+    if !capture_geometry_is_plausible(key, &captured) {
+        unsafe {
+            CFRelease(captured.thumb.img);
+        }
+        log_debug!(
+            "[thumb] captured result discarded by geometry guard pid={} wid={} source={}x{} priority={}",
+            key.pid,
+            key.wid,
+            captured.source_w_px,
+            captured.source_h_px,
+            job.priority.label()
+        );
+        return;
+    }
     if job
         .activation_at
         .is_some_and(|activated_at| !activation_capture_is_valid_now(key.pid, activated_at))
@@ -1387,6 +1528,8 @@ fn enqueue_ready_delivery(key: ThumbKey) {
 /// proportionally downscale to the target pixel height (native retina frames can
 /// reach tens of MB).
 struct CapturedWindow {
+    source_w_px: u32,
+    source_h_px: u32,
     thumb: CachedThumb,
 }
 
@@ -1438,6 +1581,8 @@ unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CapturedWindow> {
         return None;
     }
     Some(CapturedWindow {
+        source_w_px: src_w,
+        source_h_px: src_h,
         thumb: CachedThumb {
             img,
             w_px: tw,

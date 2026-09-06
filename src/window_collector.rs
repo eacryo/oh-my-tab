@@ -142,6 +142,50 @@ pub(crate) fn window_server_candidates() -> Vec<(u32, i32)> {
     }
 }
 
+/// 获取当前 Space 中可见的普通窗口及其公开 bounds，供缩略图的 Show Desktop
+/// 几何探针使用。这里不走 AX，避免在捕获 worker 中触碰主线程 UI 状态。
+/// Get visible ordinary windows and their public bounds in the current Space for the
+/// thumbnail Show Desktop geometry probe. This avoids AX and main-thread UI state.
+pub(crate) fn ordinary_onscreen_window_bounds() -> Vec<(u32, (f64, f64, f64, f64))> {
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
+
+    unsafe {
+        let array = CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP_ELEMENTS, 0);
+        if array.is_null() {
+            return Vec::new();
+        }
+        let own_pid = std::process::id() as i32;
+        let count = CFArrayGetCount(array);
+        let mut windows = Vec::new();
+        for i in 0..count {
+            let dict = CFArrayGetValueAtIndex(array, i);
+            if dict.is_null()
+                || cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0
+                || cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1) == own_pid
+                || cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(0.0) <= 0.0
+                || !cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false)
+            {
+                continue;
+            }
+            let window_id = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+            let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default();
+            if window_id == 0 || bounds.2 < 160.0 || bounds.3 < 120.0 {
+                continue;
+            }
+            windows.push((window_id, bounds));
+        }
+        CFRelease(array);
+        windows.sort_by(|(_, a), (_, b)| {
+            (b.2 * b.3)
+                .partial_cmp(&(a.2 * a.3))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        windows.truncate(3);
+        windows
+    }
+}
+
 /// 从当前 CG 快照反查一个未订阅窗口的 owner PID，作为订阅索引失效时的兜底。
 /// Resolve an unindexed window's owner PID from a fresh CG snapshot when the subscription index
 /// cannot answer it.
