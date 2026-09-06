@@ -520,18 +520,30 @@ enum SummonRefreshDecision {
 
 /// 后台窗口即使 TTL 过期或分辨率偏低也保留已有帧，避免休眠 WebView 的白色
 /// 内容层覆盖最后一张正常画面；完全缺失时仍允许首次预热。
+/// 焦点窗口例外:它的内容随用户操作随时变化(切标签页/滚动/播放视频),时间上的
+/// "新鲜"不代表内容正确——系统层面没有任何事件通知这些变化,所以每次召唤都
+/// 无条件重截,预览始终是实时画面(单窗 ~30ms,异步完成)。
 /// Keep an existing background frame even when stale or undersized so a suspended
-/// WebView's white content layer cannot replace the last-known-good image. A wholly
+/// WebView's white content layer cannot replace the last-known-good image; a wholly
 /// missing frame may still be pre-warmed.
+/// The focused window is the exception: its content changes with every user action
+/// (tab switches / scrolling / video playback), so temporal freshness does not mean
+/// correct content -- no system event announces those changes. It is recaptured
+/// unconditionally on every summon so its preview is always live (~30ms per window,
+/// completed asynchronously).
 fn summon_refresh_decision(
     cached: Option<(Instant, u32)>,
     required_px_h: u32,
     now: Instant,
     is_frontmost: bool,
+    is_focused: bool,
 ) -> SummonRefreshDecision {
     let Some((captured, captured_for_px_h)) = cached else {
         return SummonRefreshDecision::Missing;
     };
+    if is_frontmost && is_focused {
+        return SummonRefreshDecision::FrontmostStale;
+    }
     if cached_frame_is_usable(captured, captured_for_px_h, required_px_h, now) {
         SummonRefreshDecision::Fresh
     } else if is_frontmost {
@@ -546,12 +558,19 @@ fn cached_summon_refresh_decision(
     wid: u32,
     required_px_h: u32,
     is_frontmost: bool,
+    is_focused: bool,
 ) -> SummonRefreshDecision {
     let cache = CACHE.lock().unwrap();
     let cached = cache
         .peek(&ThumbKey { pid, wid })
         .map(|t| (t.captured, t.captured_for_px_h));
-    summon_refresh_decision(cached, required_px_h, Instant::now(), is_frontmost)
+    summon_refresh_decision(
+        cached,
+        required_px_h,
+        Instant::now(),
+        is_frontmost,
+        is_focused,
+    )
 }
 
 fn cached_target_px_height(pid: i32, wid: u32) -> u32 {
@@ -1771,6 +1790,12 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
                         w.window_id,
                         required_px_h,
                         frontmost_pid == Some(w.pid),
+                        // 焦点窗口(is_active)无视 TTL 每次召唤重截;同 PID 兄弟窗口
+                        // 仍按 TTL 判定,避免多窗口 App 召唤时成串重截。
+                        // The focused window (is_active) ignores the TTL and is
+                        // recaptured on every summon; same-PID siblings keep the
+                        // TTL rules so multi-window apps do not recapture in bulk.
+                        w.is_active,
                     ),
                 )
             })
@@ -2356,19 +2381,56 @@ mod tests {
         let fresh = now - Duration::from_millis(100);
 
         assert_eq!(
-            summon_refresh_decision(None, 640, now, false),
+            summon_refresh_decision(None, 640, now, false, false),
             SummonRefreshDecision::Missing
         );
         assert_eq!(
-            summon_refresh_decision(Some((stale, 512)), 640, now, false),
+            summon_refresh_decision(Some((stale, 512)), 640, now, false, false),
             SummonRefreshDecision::BackgroundLastGood
         );
         assert_eq!(
-            summon_refresh_decision(Some((stale, 512)), 640, now, true),
+            summon_refresh_decision(Some((stale, 512)), 640, now, true, false),
             SummonRefreshDecision::FrontmostStale
         );
         assert_eq!(
-            summon_refresh_decision(Some((fresh, 640)), 640, now, false),
+            summon_refresh_decision(Some((fresh, 640)), 640, now, false, false),
+            SummonRefreshDecision::Fresh
+        );
+    }
+
+    #[test]
+    fn summon_refresh_recaptures_the_focused_window_regardless_of_ttl() {
+        let now = Instant::now();
+        let stale = now - Duration::from_millis(FRESH_TTL_MS as u64);
+        let fresh = now - Duration::from_millis(100);
+
+        // 焦点窗口内容随用户操作随时变化(切标签页/滚动/播放),TTL 内的"新鲜"帧
+        // 也可能内容已过时:每次召唤一律重截,预览保持实时。
+        // The focused window's content changes with user actions at any moment
+        // (tab switches / scrolling / playback); even a TTL-"fresh" frame can be
+        // outdated content -- recapture unconditionally at every summon.
+        assert_eq!(
+            summon_refresh_decision(Some((fresh, 640)), 640, now, true, true),
+            SummonRefreshDecision::FrontmostStale
+        );
+        assert_eq!(
+            summon_refresh_decision(Some((stale, 512)), 640, now, true, true),
+            SummonRefreshDecision::FrontmostStale
+        );
+        assert_eq!(
+            summon_refresh_decision(None, 640, now, true, true),
+            SummonRefreshDecision::Missing
+        );
+        // 同 PID 的兄弟窗口与后台窗口不受影响:TTL 内依旧 Fresh,不随焦点窗口
+        // 成串重截。
+        // Same-PID siblings and background windows are unaffected: still Fresh
+        // within the TTL, no bulk recapture piggybacking on the focused window.
+        assert_eq!(
+            summon_refresh_decision(Some((fresh, 640)), 640, now, true, false),
+            SummonRefreshDecision::Fresh
+        );
+        assert_eq!(
+            summon_refresh_decision(Some((fresh, 640)), 640, now, false, true),
             SummonRefreshDecision::Fresh
         );
     }
