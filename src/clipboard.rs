@@ -255,6 +255,18 @@ const SEL_TILE_R: f64 = 8.0;
 const SEL_BAR_W: f64 = 2.0;
 const SEL_BAR_X: f64 = 1.0;
 const SEL_BAR_INSET_Y: f64 = 10.0;
+
+/// Resolve the shared settings/overlay palette for clipboard surfaces and controls.
+/// 剪贴板面板和控件统一从设置页/浮层共用的调色板取色。
+fn clipboard_palette() -> crate::theme::UiPalette {
+    crate::theme::ui_palette()
+}
+
+/// Keep a palette color's hue while choosing a role-specific alpha for a subtle surface.
+/// 保留调色板颜色的色相，仅为轻量背景选择语义化透明度。
+fn clipboard_color_with_alpha(color: u32, alpha: u8) -> u32 {
+    (color & 0xFFFF_FF00) | u32::from(alpha)
+}
 /// 自定义滚动指示器的可见宽度 / visible custom scroll indicator width.
 const SCROLL_INDICATOR_W: f64 = 6.0;
 /// 指示器实际鼠标命中宽度;透明两侧扩大拖拽区域,不改变可见胶囊宽度。
@@ -311,6 +323,12 @@ const DETAIL_IMAGE_MAX_W: f64 = DETAIL_MAX_W - DETAIL_PAD * 2.0;
 /// once on the first detail open and cached as `{hash}.detail`, never held in RAM (RAM
 /// still keeps only the 480px thumbnail).
 const DETAIL_PREVIEW_MAX_DIM: f64 = 1280.0;
+/// 详情面板展开/收起时长;只作用于剪贴板详情浮窗,避免影响其它面板。
+/// Open/close duration for the detail panel; scoped to the clipboard detail window.
+const DETAIL_PANEL_ANIMATION_DURATION: f64 = 0.24;
+/// 详情正文进入时的横向起始偏移,配合面板从左向右展开。
+/// Initial horizontal content offset while the panel expands from left to right.
+const DETAIL_CONTENT_ANIMATION_OFFSET: f64 = 10.0;
 
 // ========== 状态 / state ==========
 
@@ -498,8 +516,7 @@ unsafe fn rebuild_search_hint() {
     let icon_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let icon_attrs: *mut AnyObject = msg_send![icon_attrs, init];
     let icon_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 18.0f64];
-    let icon_color: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.42f64];
+    let icon_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
     let _: () = msg_send![icon_attrs, setObject: icon_font, forKey: font_key];
@@ -523,10 +540,9 @@ unsafe fn rebuild_search_hint() {
     let _: () = msg_send![ph_text_attrs, setObject: font, forKey: font_key];
     CFRelease(font_key as *const c_void);
     let color_key = make_nsstring("NSColor");
-    // 新设计稿 .search-input::placeholder:14px、40% 黑。
-    // The new mockup's placeholder: 14px, 40% black.
-    let ph_color: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.40f64];
+    // Placeholder text follows the same muted role used by settings labels.
+    // 占位文字复用设置页标签使用的 muted 语义颜色。
+    let ph_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
     let _: () = msg_send![ph_text_attrs, setObject: ph_color, forKey: color_key];
     CFRelease(color_key as *const c_void);
     let ph_ns = make_nsstring(&t("clipboard.search_placeholder"));
@@ -1438,13 +1454,17 @@ extern "C" fn search_field_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut
 /// 搜索框底/描边样式助手(层背景走 raw FFI)。聚焦只加强内描边,保持稳定的磨砂底色。
 /// The search field's fill/ring helper (raw FFI for the layer background). Focus strengthens
 /// only the inner ring and keeps the frosted fill stable.
-unsafe fn style_search_field(field: *mut AnyObject, bg_alpha: f64, ring_alpha: f64) {
+unsafe fn style_search_field(field: *mut AnyObject, focused: bool) {
     let layer: *mut AnyObject = msg_send![field, layer];
-    let bg: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha];
-    crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
-    let ring: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: ring_alpha];
-    crate::ffi::layer_set_border(layer, crate::ffi::ns_color_to_cg(ring));
+    let palette = clipboard_palette();
+    let background = crate::ffi::hex_to_cg_color(palette.field_bg);
+    crate::ffi::layer_set_background(layer, background);
+    let ring = if focused {
+        palette.accent
+    } else {
+        palette.card_border
+    };
+    crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(ring));
 }
 
 /// 编辑开始:保持默认 4.5% 磨砂底,仅使用 10% 内描边指示焦点,避免输入时突变白色。
@@ -1454,7 +1474,7 @@ extern "C" fn search_focus_began(_self: *mut c_void, _cmd: Sel, note: *mut c_voi
     unsafe {
         let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
         if !field.is_null() {
-            style_search_field(field, 0.045, 0.10);
+            style_search_field(field, true);
             // 聚焦态切换必须显式重绘 cell:占位提示由 cell 自绘,聚焦即隐(IME 组合
             // 期间 stringValue 仍为空,若不重绘会与拼音预编辑串叠加)。图层底色变化
             // 不会触发 cell 重绘。
@@ -1472,7 +1492,7 @@ extern "C" fn search_focus_ended(_self: *mut c_void, _cmd: Sel, note: *mut c_voi
     unsafe {
         let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
         if !field.is_null() {
-            style_search_field(field, 0.045, 0.035);
+            style_search_field(field, false);
             // 与 search_focus_began 同理:失焦后恢复占位提示需要立即重绘。
             // Same as search_focus_began: restoring the placeholder on blur needs an
             // immediate redraw.
@@ -1821,6 +1841,179 @@ fn reposition_detail() {
     }
 }
 
+/// 取消尚未完成的详情收起回调,保证快速重新打开时旧回调不会隐藏新面板。
+/// Cancel a pending detail-close callback so a quick reopen cannot hide the new panel.
+unsafe fn cancel_detail_close(window: *mut AnyObject) {
+    let _: () = msg_send![
+        class!(NSObject),
+        cancelPreviousPerformRequestsWithTarget: window,
+        selector: sel!(finishDetailClose:),
+        object: std::ptr::null::<AnyObject>()
+    ];
+}
+
+/// 在已有详情内容上播放轻量的横向滑入/滑出,不重建视图或图片。
+/// Animate the existing detail content horizontally without rebuilding views or images.
+unsafe fn animate_detail_content(content: *mut AnyObject, opening: bool) {
+    let _: () = msg_send![content, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![content, layer];
+    if layer.is_null() {
+        return;
+    }
+
+    let transform_key = make_nsstring("transform.translation.x");
+    let opacity_key = make_nsstring("opacity");
+    let transform_animation_key = make_nsstring("clipboard-detail-content-slide");
+    let opacity_animation_key = make_nsstring("clipboard-detail-content-fade");
+    let _: () = msg_send![layer, removeAnimationForKey: transform_animation_key];
+    let _: () = msg_send![layer, removeAnimationForKey: opacity_animation_key];
+
+    let (from_x, to_x, from_opacity, to_opacity) = if opening {
+        (DETAIL_CONTENT_ANIMATION_OFFSET, 0.0, 0.0f32, 1.0f32)
+    } else {
+        (0.0, DETAIL_CONTENT_ANIMATION_OFFSET, 1.0f32, 0.0f32)
+    };
+    let from_x_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from_x];
+    let to_x_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: to_x];
+    let _: () = msg_send![layer, setValue: from_x_value, forKeyPath: transform_key];
+    let _: () = msg_send![layer, setOpacity: from_opacity];
+
+    let transform_animation: *mut AnyObject = msg_send![
+        class!(CABasicAnimation),
+        animationWithKeyPath: transform_key
+    ];
+    let _: () = msg_send![transform_animation, setFromValue: from_x_value];
+    let _: () = msg_send![transform_animation, setToValue: to_x_value];
+    let _: () = msg_send![
+        transform_animation,
+        setDuration: DETAIL_PANEL_ANIMATION_DURATION
+    ];
+
+    let from_opacity_value: *mut AnyObject =
+        msg_send![class!(NSNumber), numberWithFloat: from_opacity];
+    let to_opacity_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithFloat: to_opacity];
+    let opacity_animation: *mut AnyObject = msg_send![
+        class!(CABasicAnimation),
+        animationWithKeyPath: opacity_key
+    ];
+    let _: () = msg_send![opacity_animation, setFromValue: from_opacity_value];
+    let _: () = msg_send![opacity_animation, setToValue: to_opacity_value];
+    let _: () = msg_send![
+        opacity_animation,
+        setDuration: DETAIL_PANEL_ANIMATION_DURATION
+    ];
+
+    // 先提交最终模型值,再挂载显式动画,避免动画结束时图层闪回起点。
+    // Commit final model values before adding explicit animations so the layer does not snap
+    // back to its starting point when Core Animation removes them.
+    let _: () = msg_send![layer, setValue: to_x_value, forKeyPath: transform_key];
+    let _: () = msg_send![layer, setOpacity: to_opacity];
+    let _: () =
+        msg_send![layer, addAnimation: transform_animation, forKey: transform_animation_key];
+    let _: () = msg_send![layer, addAnimation: opacity_animation, forKey: opacity_animation_key];
+
+    CFRelease(transform_key as *const c_void);
+    CFRelease(opacity_key as *const c_void);
+    CFRelease(transform_animation_key as *const c_void);
+    CFRelease(opacity_animation_key as *const c_void);
+}
+
+/// 详情面板打开时从一条窄面板横向展开,主浮窗同步移动到组合布局目标位置。
+/// Open the detail panel by expanding a narrow panel horizontally while the picker moves to
+/// the final combined layout.
+unsafe fn animate_detail_open(
+    picker_window: *mut AnyObject,
+    detail_window: *mut AnyObject,
+    detail_content: *mut AnyObject,
+    target_picker_frame: NSRect,
+    target_detail_frame: NSRect,
+) {
+    let collapsed_frame = NSRect::new(
+        target_detail_frame.origin,
+        NSSize::new(1.0, target_detail_frame.size.height),
+    );
+    let _: () = msg_send![detail_window, setFrame: collapsed_frame, display: false];
+    let _: () = msg_send![detail_window, setAlphaValue: 0.0f64];
+    let _: () = msg_send![detail_window, orderFrontRegardless];
+
+    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
+    let _: () = msg_send![context, setDuration: DETAIL_PANEL_ANIMATION_DURATION];
+    let timing_name = make_nsstring("easeOut");
+    let timing: *mut AnyObject =
+        msg_send![class!(CAMediaTimingFunction), functionWithName: timing_name];
+    if !timing.is_null() {
+        let _: () = msg_send![context, setTimingFunction: timing];
+    }
+    CFRelease(timing_name as *const c_void);
+
+    let picker_animator: *mut AnyObject = msg_send![picker_window, animator];
+    let _: () = msg_send![picker_animator, setFrame: target_picker_frame, display: true];
+    let detail_animator: *mut AnyObject = msg_send![detail_window, animator];
+    let _: () = msg_send![detail_animator, setFrame: target_detail_frame, display: true];
+    let _: () = msg_send![detail_animator, setAlphaValue: 1.0f64];
+    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+
+    animate_detail_content(detail_content, true);
+}
+
+/// 详情面板关闭时收窄到一条细线并淡出,完成后再 orderOut。
+/// Close the detail panel by shrinking it to a sliver and fading it out before orderOut.
+unsafe fn animate_detail_close(
+    picker_window: *mut AnyObject,
+    detail_window: *mut AnyObject,
+    detail_content: *mut AnyObject,
+    restored_picker_frame: Option<NSRect>,
+) {
+    let current_detail_frame: NSRect = msg_send![detail_window, frame];
+    let collapsed_frame = NSRect::new(
+        current_detail_frame.origin,
+        NSSize::new(1.0, current_detail_frame.size.height),
+    );
+
+    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
+    let _: () = msg_send![context, setDuration: DETAIL_PANEL_ANIMATION_DURATION];
+    let timing_name = make_nsstring("easeInEaseOut");
+    let timing: *mut AnyObject =
+        msg_send![class!(CAMediaTimingFunction), functionWithName: timing_name];
+    if !timing.is_null() {
+        let _: () = msg_send![context, setTimingFunction: timing];
+    }
+    CFRelease(timing_name as *const c_void);
+
+    if let Some(frame) = restored_picker_frame {
+        let picker_animator: *mut AnyObject = msg_send![picker_window, animator];
+        let _: () = msg_send![picker_animator, setFrame: frame, display: true];
+    }
+    let detail_animator: *mut AnyObject = msg_send![detail_window, animator];
+    let _: () = msg_send![detail_animator, setFrame: collapsed_frame, display: true];
+    let _: () = msg_send![detail_animator, setAlphaValue: 0.0f64];
+    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+
+    animate_detail_content(detail_content, false);
+    let _: () = msg_send![
+        detail_window,
+        performSelector: sel!(finishDetailClose:),
+        withObject: std::ptr::null::<AnyObject>(),
+        afterDelay: DETAIL_PANEL_ANIMATION_DURATION
+    ];
+}
+
+/// 收起动画结束后隐藏详情窗口;若期间重新打开,可见标记会阻止旧回调误隐藏新面板。
+/// Hide the detail window after the close animation; reopening during the delay keeps the old
+/// callback from hiding the new panel.
+extern "C" fn detail_finish_close(this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        let window = this as *mut AnyObject;
+        let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![window, setAlphaValue: 1.0f64];
+    }
+}
+
 /// Toggle the picker on Option+V (called on the main thread by the bridge).
 pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     // 总开关关闭时忽略呼出(设置里关闭后 Option+V 不应再显示浮窗)。
@@ -2015,16 +2208,6 @@ fn hide_detail() {
     // The picker may have shifted left for the combined layout; restore its original origin
     // while preserving its current height.
     let original_origin = DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap().take();
-    if let Some(origin) = original_origin {
-        let picker = *PICKER_WINDOW.lock().unwrap();
-        unsafe {
-            if let Some(picker) = picker {
-                let current: NSRect = msg_send![picker.0, frame];
-                let restored = NSRect::new(origin, current.size);
-                let _: () = msg_send![picker.0, setFrame: restored, display: true];
-            }
-        }
-    }
     // 面板关闭后旧内容视图会被移除,文本视图指针必须一并清空(防 Cmd+C 悬空)。
     // The content views get removed once the panel hides; clear the text-view pointer so
     // Cmd+C never dereferences a dangling one.
@@ -2032,8 +2215,11 @@ fn hide_detail() {
     *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = None;
     *DETAIL_SOURCE_MAP.lock().unwrap() = None;
     let win = *DETAIL_WINDOW.lock().unwrap();
+    let content = *DETAIL_CONTENT.lock().unwrap();
     unsafe {
-        if let Some(w) = win {
+        if let (Some(w), Some(picker), Some(content)) =
+            (win, *PICKER_WINDOW.lock().unwrap(), content)
+        {
             // 面板隐藏时若光标仍停在文本上,显式恢复箭头(cursor region 只在鼠标
             // 移动时重算,这里兜底);光标在别处则不动,避免踩掉搜索框自身的 I-beam。
             // If the cursor still sits on the text as the panel hides, restore the arrow
@@ -2049,6 +2235,13 @@ fn hide_detail() {
                 let arrow: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
                 let _: () = msg_send![arrow, set];
             }
+            let current_picker: NSRect = msg_send![picker.0, frame];
+            let restored_picker =
+                original_origin.map(|origin| NSRect::new(origin, current_picker.size));
+            cancel_detail_close(w.0);
+            animate_detail_close(picker.0, w.0, content.0, restored_picker);
+        } else if let Some(w) = win {
+            cancel_detail_close(w.0);
             let _: () = msg_send![w.0, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
@@ -2088,6 +2281,13 @@ unsafe fn ensure_detail_window() {
             sel!(canBecomeKeyWindow),
             detail_window_can_not_become_key as *mut c_void,
             types_bool.as_ptr(),
+        );
+        let types_finish = CString::new("v@:@").unwrap();
+        class_addMethod(
+            cls,
+            sel!(finishDetailClose:),
+            detail_finish_close as *mut c_void,
+            types_finish.as_ptr(),
         );
         objc_registerClassPair(cls);
         cls
@@ -2207,6 +2407,7 @@ unsafe fn ensure_detail_window() {
             content,
             initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
         ];
+        let _: () = msg_send![content, setWantsLayer: true];
         let _: () = msg_send![content, setAutoresizingMask: 18u64];
         let _: () = msg_send![content_parent, addSubview: content];
         release_obj(content);
@@ -2782,6 +2983,7 @@ unsafe fn show_detail_for_sel() {
     let Some(entry) = entry else {
         return;
     };
+    let detail_was_visible = DETAIL_VISIBLE.load(Ordering::SeqCst);
     ensure_detail_window();
     let window = match *DETAIL_WINDOW.lock().unwrap() {
         Some(w) => w.0,
@@ -2791,6 +2993,7 @@ unsafe fn show_detail_for_sel() {
         Some(c) => c.0,
         None => return,
     };
+    cancel_detail_close(window);
     let picker_win = match *PICKER_WINDOW.lock().unwrap() {
         Some(w) => w.0,
         None => return,
@@ -2936,7 +3139,7 @@ unsafe fn show_detail_for_sel() {
     let Some(align_top_y) = selected_row_screen_y(picker_frame) else {
         return;
     };
-    if !DETAIL_VISIBLE.load(Ordering::SeqCst) {
+    if !detail_was_visible {
         *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(picker_frame.origin);
     }
     // 先计算主浮窗 + 详情的整体布局,详情始终在主浮窗右侧并与选中行对齐。
@@ -2944,7 +3147,7 @@ unsafe fn show_detail_for_sel() {
     // the selected row.
     let center_on_main = CONFIG.read().unwrap().clipboard.picker_position == "main";
     let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-    let (picker_frame, frame) = detail_group_frames(
+    let (target_picker_frame, target_detail_frame) = detail_group_frames(
         picker_frame,
         align_top_y,
         screen_frame,
@@ -2953,20 +3156,30 @@ unsafe fn show_detail_for_sel() {
         center_on_main,
         cursor.x,
     );
-    let _: () = msg_send![picker_win, setFrame: picker_frame, display: true];
+    if detail_was_visible {
+        let _: () = msg_send![picker_win, setFrame: target_picker_frame, display: true];
+        let _: () = msg_send![window, setFrame: target_detail_frame, display: true];
+        let _: () = msg_send![window, orderFrontRegardless];
+    } else {
+        animate_detail_open(
+            picker_win,
+            window,
+            content,
+            target_picker_frame,
+            target_detail_frame,
+        );
+    }
     log_debug!(
         "[clip] detail group: picker=({:.0},{:.0}) detail=({:.0},{:.0}) {}x{}",
-        picker_frame.origin.x,
-        picker_frame.origin.y,
-        frame.origin.x,
-        frame.origin.y,
-        frame.size.width,
-        frame.size.height
+        target_picker_frame.origin.x,
+        target_picker_frame.origin.y,
+        target_detail_frame.origin.x,
+        target_detail_frame.origin.y,
+        target_detail_frame.size.width,
+        target_detail_frame.size.height
     );
-    let _: () = msg_send![window, setFrame: frame, display: true];
     // orderFrontRegardless:不抢 key(面板 canBecomeKeyWindow=NO,主浮窗保持 key)。
     // orderFrontRegardless: never takes key (canBecomeKeyWindow=NO keeps the picker key).
-    let _: () = msg_send![window, orderFrontRegardless];
     DETAIL_VISIBLE.store(true, Ordering::SeqCst);
     // 文档完整布局和窗口最终 frame 都已生效后,无条件设置到 AppKit 约束出的真实顶部。
     // 鼠标详情按钮、键盘 →、以及详情打开后的 ↑/↓ 切换最终都汇聚到这里,行为完全一致。
@@ -4191,19 +4404,15 @@ unsafe fn ensure_picker_window() {
                                                        // 输入态必须与 ↓ 后手绘的保留查询统一为 14pt,避免焦点切换时字号突变。
                                                        // Match the 14pt hand-drawn retained query after ↓, avoiding a font-size jump on focus change.
     let _: () = msg_send![search, setFont: search_font];
-    // 磨砂化:去掉系统描边/bezel,换成 4.5% 黑底 + 1px 内描边;保留的系统 × 已直连
-    // clearSearch:，不会因响应链而失效。
-    // Frosted: drop the system bezel for a 4.5% black fill + a 1px inner ring; any
-    // remaining system × is bound directly to clearSearch:, not the responder chain.
+    // 磨砂化:去掉系统描边/bezel,换成共享 field surface + 1px 内描边;保留的系统 ×
+    // 已直连 clearSearch:，不会因响应链而失效。
+    // Frosted: drop the system bezel and use the shared field surface/ring; the remaining
+    // system × is bound directly to clearSearch:, not the responder chain.
     let _: () = msg_send![search, setBezeled: false];
     let _: () = msg_send![search, setDrawsBackground: false];
     let _: () = msg_send![search, setWantsLayer: true];
     let search_layer: *mut AnyObject = msg_send![search, layer];
-    let s_bg: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.045f64];
-    crate::ffi::layer_set_background(search_layer, crate::ffi::ns_color_to_cg(s_bg));
-    let s_ring: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.035f64];
-    crate::ffi::layer_set_border(search_layer, crate::ffi::ns_color_to_cg(s_ring));
+    style_search_field(search, false);
     let _: () = msg_send![search_layer, setBorderWidth: 1.0f64];
     let _: () = msg_send![search_layer, setCornerRadius: SEARCH_R];
     // delegate = observer()(复用通知单例):↓ 命令拦截(字段编辑器转发 moveDown:)。
@@ -4332,7 +4541,7 @@ unsafe fn ensure_picker_window() {
     let _: () = msg_send![clear_layer, setCornerRadius: 5.0f64];
     let cfont: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
     let _: () = msg_send![clear_btn, setFont: cfont];
-    let ccolor: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.28f64];
+    let ccolor = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
     let _: () = msg_send![clear_btn, setContentTintColor: ccolor];
     let title_ns = make_nsstring(&t("clipboard.clear_all"));
     let _: () = msg_send![clear_btn, setTitle: title_ns];
@@ -4528,8 +4737,7 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![label, setEditable: false];
         // 空态样式按新设计稿 .empty-state:12px、30% 黑。
         // The empty state follows the new mockup's .empty-state: 12px, 30% black.
-        let text_color: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
+        let text_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
         let _: () = msg_send![label, setTextColor: text_color];
         let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
         let _: () = msg_send![label, setFont: font];
@@ -4606,8 +4814,7 @@ unsafe fn rebuild_rows() {
             let g_font: *mut AnyObject =
                 msg_send![class!(NSFont), systemFontOfSize: 12.0f64, weight: 0.23f64]; // Medium
             let _: () = msg_send![g, setFont: g_font];
-            let g_color: *mut AnyObject =
-                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
+            let g_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
             let _: () = msg_send![g, setTextColor: g_color];
             let _: () = msg_send![container, addSubview: g];
             release_obj(g);
@@ -4619,8 +4826,7 @@ unsafe fn rebuild_rows() {
         // The row backdrop (two distinct styles): hovered (not selected) = 0.032 black
         // with NO bar; selected = 0.050 black + a 2px left bar. The new mockup's
         // .item:hover vs .item.selected.
-        let hover_bg = 0.032;
-        let sel_bg = 0.050;
+        let palette = clipboard_palette();
         let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
         let tile: *mut AnyObject = msg_send![
             tile,
@@ -4628,20 +4834,18 @@ unsafe fn rebuild_rows() {
         ];
         let _: () = msg_send![tile, setWantsLayer: true];
         let tile_layer: *mut AnyObject = msg_send![tile, layer];
-        let bg_alpha = if selected {
-            sel_bg
+        let bg_hex = if selected {
+            palette.selection_bg
         } else if hovered {
-            hover_bg
+            palette.hover_bg
         } else {
-            0.0
+            0x00000000
         };
-        let bg: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha];
         // layer_set_background 走 raw objc_msgSend:objc2 的 msg_send! 无法编码
         // CGColor 参数/返回(参数编码 '^{CGColor=}' 与 *mut c_void 的 '^v' 不匹配)。
         // layer_set_background goes through raw objc_msgSend: objc2's msg_send! can't encode
         // CGColor args/returns ('^{CGColor=}' vs '^v').
-        crate::ffi::layer_set_background(tile_layer, crate::ffi::ns_color_to_cg(bg));
+        crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(bg_hex));
         let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
         // 每行都预建左侧 2px 指示条并按选中状态隐藏,这样方向键切换只需切换可见性。
         // Prebuild the 2px selection bar for every row and hide it when unselected, so arrow
@@ -4656,9 +4860,7 @@ unsafe fn rebuild_rows() {
         ];
         let _: () = msg_send![bar, setWantsLayer: true];
         let bar_layer: *mut AnyObject = msg_send![bar, layer];
-        let bar_bg: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.42f64];
-        crate::ffi::layer_set_background(bar_layer, crate::ffi::ns_color_to_cg(bar_bg));
+        crate::ffi::layer_set_background(bar_layer, crate::ffi::hex_to_cg_color(palette.accent));
         let _: () = msg_send![bar_layer, setCornerRadius: SEL_BAR_W / 2.0];
         let _: () = msg_send![bar, setHidden: !selected];
         let _: () = msg_send![tile, addSubview: bar];
@@ -4957,7 +5159,7 @@ unsafe fn draw_search_keycap(cell_frame: NSRect) {
         xRadius: 5.0,
         yRadius: 5.0
     ];
-    let cap_bg: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.055];
+    let cap_bg = crate::ffi::hex_to_ns_color(clipboard_palette().field_bg);
     let _: () = msg_send![cap_bg, set];
     let _: () = msg_send![path, fill];
     let chip_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
@@ -4966,8 +5168,7 @@ unsafe fn draw_search_keycap(cell_frame: NSRect) {
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
     let _: () = msg_send![chip_attrs, setObject: chip_font, forKey: font_key];
-    let chip_color: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.38f64];
+    let chip_color = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
     let _: () = msg_send![chip_attrs, setObject: chip_color, forKey: color_key];
     CFRelease(font_key as *const c_void);
     CFRelease(color_key as *const c_void);
@@ -5117,7 +5318,7 @@ unsafe fn draw_retained_search_query(cell_frame: NSRect, query: *mut AnyObject) 
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: SEARCH_FONT_SIZE];
-    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.82f64];
+    let color = crate::ffi::hex_to_ns_color(clipboard_palette().primary_text);
     let _: () = msg_send![attrs, setObject: font, forKey: font_key];
     let _: () = msg_send![attrs, setObject: color, forKey: color_key];
     CFRelease(font_key as *const c_void);
@@ -6157,16 +6358,11 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
         }
         _ => msg_send![class!(NSFont), systemFontOfSize: 14.0f64],
     };
-    let color: *mut AnyObject = match kind {
-        TextKind::Url => {
-            msg_send![class!(NSColor), colorWithSRGBRed: 32.0f64 / 255.0, green: 91.0f64 / 255.0, blue: 166.0f64 / 255.0, alpha: 0.72f64]
-        }
-        TextKind::Code => {
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.72f64]
-        }
-        TextKind::Plain => {
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.84f64]
-        }
+    let palette = clipboard_palette();
+    let color = match kind {
+        TextKind::Url => crate::ffi::hex_to_ns_color(palette.accent),
+        TextKind::Code => crate::ffi::hex_to_ns_color(palette.secondary_text),
+        TextKind::Plain => crate::ffi::hex_to_ns_color(palette.primary_text),
     };
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
@@ -6243,8 +6439,7 @@ unsafe fn make_meta_footer_attributed(entry: &ClipEntry, show_source: bool) -> *
         let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
         let attrs: *mut AnyObject = msg_send![attrs, init];
         let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-        let color: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
+        let color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
         let font_key = make_nsstring("NSFont");
         let color_key = make_nsstring("NSColor");
         let _: () = msg_send![attrs, setObject: font, forKey: font_key];
@@ -6318,8 +6513,10 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
     let target: *mut AnyObject = msg_send![target, initWithSize: NSSize::new(THUMB_W, THUMB_H)];
     let _: () = msg_send![target, lockFocus];
-    // 盒底浅灰(设计稿渐变的中值近似)/ the box fill (a flat approximation of the gradient).
-    let fill: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.05f64];
+    // 缩略图盒复用设置页 field surface,避免在浅深色主题中出现不同的灰度体系。
+    // Reuse the settings field surface for thumbnail boxes so light and dark themes share one
+    // grayscale system.
+    let fill = crate::ffi::hex_to_ns_color(clipboard_palette().field_bg);
     let _: () = msg_send![fill, set];
     let box_path: *mut AnyObject = msg_send![
         class!(NSBezierPath),
@@ -6338,7 +6535,7 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     let op: usize = 1; // NSCompositingOperationCopy
     let _: () = msg_send![im, drawInRect: dst, fromRect: src_rect, operation: op, fraction: 1.0f64];
     // 内描边(设计稿 inset ring)/ the inset ring.
-    let ring: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.045f64];
+    let ring = crate::ffi::hex_to_ns_color(clipboard_palette().card_border);
     let _: () = msg_send![ring, set];
     let _: () = msg_send![box_path, setLineWidth: 1.0f64];
     let _: () = msg_send![box_path, stroke];
@@ -6543,57 +6740,27 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
             set_detail_action_style(b, active, true);
             return;
         }
-        if action == sel!(deleteEntry:) {
-            let c: *mut AnyObject = msg_send![
-                class!(NSColor),
-                colorWithSRGBRed: 210.0f64 / 255.0,
-                green: 45.0f64 / 255.0,
-                blue: 40.0f64 / 255.0,
-                alpha: 0.85f64
-            ];
+        if action == sel!(deleteEntry:) || action == sel!(clearClipboardHistory:) {
+            let palette = clipboard_palette();
+            let c = crate::ffi::hex_to_ns_color(palette.destructive);
             let _: () = msg_send![b, setContentTintColor: c];
-            let bg: *mut AnyObject = msg_send![
-                class!(NSColor),
-                colorWithSRGBRed: 210.0f64 / 255.0,
-                green: 45.0f64 / 255.0,
-                blue: 40.0f64 / 255.0,
-                alpha: 0.07f64
-            ];
             let layer: *mut AnyObject = msg_send![b, layer];
-            crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
-        } else if action == sel!(clearClipboardHistory:) {
-            let c: *mut AnyObject = msg_send![
-                class!(NSColor),
-                colorWithSRGBRed: 190.0f64 / 255.0,
-                green: 35.0f64 / 255.0,
-                blue: 35.0f64 / 255.0,
-                alpha: 0.78f64
-            ];
-            let _: () = msg_send![b, setContentTintColor: c];
-            let bg: *mut AnyObject = msg_send![
-                class!(NSColor),
-                colorWithSRGBRed: 190.0f64 / 255.0,
-                green: 35.0f64 / 255.0,
-                blue: 35.0f64 / 255.0,
-                alpha: 0.07f64
-            ];
-            let layer: *mut AnyObject = msg_send![b, layer];
-            crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
+            crate::ffi::layer_set_background(
+                layer,
+                crate::ffi::hex_to_cg_color(clipboard_color_with_alpha(palette.destructive, 0x18)),
+            );
         } else if action == sel!(togglePin:) {
             // 置顶行内悬停(新设计稿 .action:hover):变深 + 浅底。详情改用专属 SVG
             // 图标的空心/实心状态,已在本函数开头提前处理。
             // Pin hover darkens with a faint fill. Details use their dedicated SVG-style
             // outlined/filled states and were handled at this function's start.
-            let c: *mut AnyObject =
-                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.72f64];
+            let palette = clipboard_palette();
+            let c = crate::ffi::hex_to_ns_color(palette.primary_text);
             let _: () = msg_send![b, setContentTintColor: c];
-            let bg: *mut AnyObject =
-                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.055f64];
             let layer: *mut AnyObject = msg_send![b, layer];
-            crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
+            crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.hover_bg));
         } else if action == sel!(filterPillClicked:) {
-            let c: *mut AnyObject =
-                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.62f64];
+            let c = crate::ffi::hex_to_ns_color(clipboard_palette().primary_text);
             let _: () = msg_send![b, setContentTintColor: c];
         }
     }
@@ -6629,7 +6796,7 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_
             set_detail_action_style(b, active, false);
             return;
         }
-        let c: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.32f64];
+        let c = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
         let _: () = msg_send![b, setContentTintColor: c];
         let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
         let layer: *mut AnyObject = msg_send![b, layer];
@@ -6688,7 +6855,7 @@ unsafe fn make_action_button(
     let _: () = msg_send![b, setAction: action];
     // 着色 = 新设计稿 .action 的 32% 黑;显隐由透明度表达。
     // Tint = the new mockup's .action 32% black; visibility is carried by alpha.
-    let tint: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.32f64];
+    let tint = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
     let _: () = msg_send![b, setContentTintColor: tint];
     let _: () = msg_send![b, setAlphaValue: alpha];
     add_hover_tracking(b);
@@ -6754,14 +6921,15 @@ fn update_filter_pill_style() {
             ClipFilter::Code => 4,
         };
         let mut active_frame: Option<NSRect> = None;
+        let palette = clipboard_palette();
         let pills = FILTER_PILLS.lock().unwrap();
         for p in pills.iter() {
             let tag: isize = msg_send![p.0, tag];
             let color: *mut AnyObject = if tag == active_tag {
                 active_frame = Some(msg_send![p.0, frame]);
-                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.78f64]
+                crate::ffi::hex_to_ns_color(palette.primary_text)
             } else {
-                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.38f64]
+                crate::ffi::hex_to_ns_color(palette.secondary_text)
             };
             let _: () = msg_send![p.0, setContentTintColor: color];
         }
@@ -6797,9 +6965,10 @@ fn update_filter_pill_style() {
                 ];
                 let _: () = msg_send![u, setWantsLayer: true];
                 let ulayer: *mut AnyObject = msg_send![u, layer];
-                let ubg: *mut AnyObject =
-                    msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.45f64];
-                crate::ffi::layer_set_background(ulayer, crate::ffi::ns_color_to_cg(ubg));
+                crate::ffi::layer_set_background(
+                    ulayer,
+                    crate::ffi::hex_to_cg_color(palette.secondary_text),
+                );
                 let _: () = msg_send![ulayer, setCornerRadius: 1.0f64];
                 let _: () = msg_send![parent, addSubview: u];
                 release_obj(u);
@@ -6946,8 +7115,10 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     ];
     let _: () = msg_send![line, setWantsLayer: true];
     let llayer: *mut AnyObject = msg_send![line, layer];
-    let lbg: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.055f64];
-    crate::ffi::layer_set_background(llayer, crate::ffi::ns_color_to_cg(lbg));
+    crate::ffi::layer_set_background(
+        llayer,
+        crate::ffi::hex_to_cg_color(clipboard_palette().separator),
+    );
     let _: () = msg_send![parent, addSubview: line];
     release_obj(line);
 
@@ -6966,7 +7137,7 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     let _: () = msg_send![count_label, setSelectable: false];
     let cf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
     let _: () = msg_send![count_label, setFont: cf];
-    let cc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
+    let cc = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
     let _: () = msg_send![count_label, setTextColor: cc];
     let _: () = msg_send![parent, addSubview: count_label];
     release_obj(count_label);
@@ -7001,12 +7172,9 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         ];
         let _: () = msg_send![cap, setWantsLayer: true];
         let clayer: *mut AnyObject = msg_send![cap, layer];
-        let cbg: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.045f64];
-        crate::ffi::layer_set_background(clayer, crate::ffi::ns_color_to_cg(cbg));
-        let cring: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.035f64];
-        crate::ffi::layer_set_border(clayer, crate::ffi::ns_color_to_cg(cring));
+        let palette = clipboard_palette();
+        crate::ffi::layer_set_background(clayer, crate::ffi::hex_to_cg_color(palette.field_bg));
+        crate::ffi::layer_set_border(clayer, crate::ffi::hex_to_cg_color(palette.card_border));
         let _: () = msg_send![clayer, setBorderWidth: 1.0f64];
         let _: () = msg_send![clayer, setCornerRadius: 4.0f64];
         // 键帽文字 / the keycap's glyph.
@@ -7038,7 +7206,7 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
             NSPoint::new(0.0, (kbd_h - line_h) / 2.0),
             NSSize::new(kbd_w, line_h)
         )];
-        let kc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.48f64];
+        let kc = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
         let _: () = msg_send![key_label, setTextColor: kc];
         let key_ns = make_nsstring(key);
         let _: () = msg_send![key_label, setStringValue: key_ns];
