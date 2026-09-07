@@ -1976,16 +1976,11 @@ impl SettingsSidebar {
         Self::fade_view(hover, 1.0, "settings-sidebar-hover-opacity");
     }
 
-    /// Re-entry (pointer returning to the sidebar from the detail pane / window edges) plays
-    /// at the ORIGINAL hover speed. It used a stiffer 500/30 spring, but since the hover
-    /// tracker started covering every sidebar row, essentially all entries route here, and
-    /// the everyday hover motion read as "sped up" -- so the reentry path keeps the normal
-    /// 360/32 feel while remaining a distinct tuning point.
-    /// 重入(指针从详情区/窗口边缘回到侧栏)恢复原始悬停速度。此前用更硬的 500/30
-    /// 弹簧,但自 hover tracker 覆盖全部侧栏行后,几乎所有进入动作都走这里,日常
-    /// 悬停观感变成"加快了"——重入路径保留独立调参点,速度回到常规 360/32。
+    /// Re-entry (pointer returning to the sidebar from the detail pane / window edges) keeps the
+    /// pre-refinement tuning used before the tracker change.
+    /// 重入(指针从详情区/窗口边缘回到侧栏)恢复 tracker 调整前使用的速度参数。
     pub(super) unsafe fn move_hover_highlight_on_reentry(hover: *mut AnyObject, frame: NSRect) {
-        Self::move_hover_highlight_with_spring(hover, frame, 360.0, 32.0);
+        Self::move_hover_highlight_with_spring(hover, frame, 500.0, 30.0);
     }
 
     /// Hide the shared hover pill after the pointer leaves the whole menu.
