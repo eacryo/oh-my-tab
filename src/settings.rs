@@ -531,6 +531,25 @@ pub(crate) extern "C" fn on_settings_open(_self: *mut c_void, _cmd: Sel, _sender
     show_settings();
 }
 
+/// 构造供其他原生面板复用的设置页开关组件,并绑定调用方的动作。
+/// Build the settings switch component for reuse by other native panels and bind the caller's
+/// target/action.
+pub(crate) unsafe fn make_shared_switch(
+    right_x: f64,
+    y: f64,
+    h: f64,
+    checked: bool,
+    target: *mut AnyObject,
+    action: Sel,
+) -> *mut AnyObject {
+    let switch = SettingsControl::switch(right_x, y, h, checked);
+    if !switch.is_null() {
+        let _: () = msg_send![switch, setTarget: target];
+        let _: () = msg_send![switch, setAction: action];
+    }
+    switch
+}
+
 /// 手动检查更新:把请求交给 Sparkle 的标准更新界面。
 /// Manual update check: hand the request to Sparkle's standard update UI.
 pub(crate) extern "C" fn handle_check_for_updates(
