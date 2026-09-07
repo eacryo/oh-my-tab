@@ -1,10 +1,11 @@
-//! 快捷操作模块:Option+I 打开设置、Option+E 打开访达、Option+D 显示桌面、Option+L 锁屏。
+//! 快捷操作模块:Option+I 打开设置、Option+E 打开访达、Option+D 显示桌面、Option+L 锁屏、双击 Control 显示鼠标位置。
 //! 独立 session 层 event tap(专用线程)拦截 Option+字母,事件经既有 bridge
 //! (GlobalEvent -> performSelectorOnMainThread)投递到主线程执行动作。
 //! 结构与 window_management.rs 相同:专用线程 + RunLoop 引用 + 停止标志。
 //!
 //! Quick-actions module: Option+I opens Settings, Option+E opens Finder, Option+D shows the
-//! desktop, and Option+L locks the screen. A dedicated session-level event tap (own thread) intercepts Option+letters; events
+//! desktop, Option+L locks the screen, and double-Control locates the pointer. A dedicated
+//! session-level event tap (own thread) intercepts Option+letters and Control transitions; events
 //! travel through the existing bridge (GlobalEvent -> performSelectorOnMainThread) and run on
 //! the main thread. Same shape as window_management.rs: dedicated thread + RunLoop reference +
 //! stop flag.
@@ -23,8 +24,9 @@ use crate::ffi::{make_nsstring, CFRelease};
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 // ========== 键盘事件常量 / keyboard event constants ==========
 // 键码来自 Carbon HIToolbox Events.h(kVK_ANSI_I/E/D/L)。
@@ -37,6 +39,7 @@ const K_VK_I: u16 = 34;
 const K_VK_E: u16 = 14;
 const K_VK_D: u16 = 2;
 const K_VK_L: u16 = 37;
+const K_CG_EVENT_FLAGS_CHANGED: CGEventType = 12;
 // 修饰键位掩码:必须恰好是 Option(带其他修饰键的组合透传,与 Option+方向键同规则)。
 // Modifier masks: exactly Option is required; combos with extra modifiers pass through
 // (same rule as Option+arrows).
@@ -44,6 +47,10 @@ const K_FLAG_OPTION: CGEventFlags = 0x00080000;
 const K_FLAG_COMMAND: CGEventFlags = 0x00100000;
 const K_FLAG_SHIFT: CGEventFlags = 0x00020000;
 const K_FLAG_CONTROL: CGEventFlags = 0x00040000;
+const K_DOUBLE_CONTROL_INTERVAL: Duration = Duration::from_millis(350);
+
+static CONTROL_DOWN: AtomicBool = AtomicBool::new(false);
+static LAST_CONTROL_PRESS: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 
 /// 快捷动作。数值顺序经 NSNumber 跨线程传递(bridge -> 主线程),只能追加不能重排。
 /// Quick actions. The numeric order crosses threads via NSNumber (bridge -> main thread);
@@ -54,6 +61,7 @@ pub(crate) enum QuickAction {
     OpenFinder = 1,
     ShowDesktop = 2,
     LockScreen = 3,
+    LocatePointer = 4,
 }
 
 impl QuickAction {
@@ -65,6 +73,7 @@ impl QuickAction {
             1 => Some(Self::OpenFinder),
             2 => Some(Self::ShowDesktop),
             3 => Some(Self::LockScreen),
+            4 => Some(Self::LocatePointer),
             _ => None,
         }
     }
@@ -92,26 +101,55 @@ fn action_enabled(action: QuickAction) -> bool {
                     QuickAction::OpenFinder => c.quick_actions.open_finder,
                     QuickAction::ShowDesktop => c.quick_actions.show_desktop,
                     QuickAction::LockScreen => c.quick_actions.lock_screen,
+                    QuickAction::LocatePointer => c.quick_actions.locate_pointer,
                 }
         })
         .unwrap_or(false)
 }
 
-/// tap 回调:只关心 Option+I/E/D/L(不带其他修饰键)。启用时吞掉 keyDown/keyUp 并把非
-/// 自动重复的 keyDown 投递给主线程;关闭时全部透传(功能关闭 = 组合键还给系统)。
+/// tap 回调:处理 Option+I/E/D/L 与双击 Control。Option 组合启用时吞掉 keyDown/keyUp
+/// 并把非自动重复的 keyDown 投递给主线程;Control flagsChanged 始终透传给系统。
 /// 自己是前台 App 时,仅在设置文本框正在编辑时透传,避免把整个设置窗口误判为输入场景。
 ///
-/// The tap callback: only cares about Option+I/E/D/L (no extra modifiers). When enabled it
-/// swallows matching keyDown/keyUp and forwards non-autorepeat keyDowns to the main thread;
-/// when disabled everything passes through (a disabled feature returns the combo to the
-/// system). When our app is frontmost, it passes through only while a settings text field is
-/// actively editing, rather than exempting the entire settings window.
+/// The tap callback handles Option+I/E/D/L and double-Control. Enabled Option combos are
+/// swallowed and non-autorepeat keyDowns are forwarded to the main thread; Control
+/// flagsChanged events always pass through to the system. When our app is frontmost, it passes
+/// through only while a settings text field is actively editing.
 unsafe extern "C" fn quick_actions_tap_callback(
     _proxy: CGEventTapProxy,
     event_type: CGEventType,
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
+    if event_type == K_CG_EVENT_FLAGS_CHANGED {
+        let flags = CGEventGetFlags(event);
+        let control_down = flags & K_FLAG_CONTROL != 0;
+        let was_down = CONTROL_DOWN.swap(control_down, Ordering::Relaxed);
+        if control_down && !was_down {
+            let no_other_modifiers = flags & (K_FLAG_OPTION | K_FLAG_COMMAND | K_FLAG_SHIFT) == 0;
+            if no_other_modifiers && action_enabled(QuickAction::LocatePointer) {
+                let now = Instant::now();
+                let mut last = LAST_CONTROL_PRESS.lock().unwrap();
+                let is_double = last.is_some_and(|previous| {
+                    now.duration_since(previous) <= K_DOUBLE_CONTROL_INTERVAL
+                });
+                if is_double {
+                    *last = None;
+                    if let Some(tx) = crate::STATUS_EVENT_TX.get() {
+                        log_debug!("[quick] double-Control locate pointer");
+                        let _ = tx.send(GlobalEvent::QuickAction(QuickAction::LocatePointer as u8));
+                    } else {
+                        log_info!("[quick] double-Control dropped: event bridge unavailable");
+                    }
+                } else {
+                    *last = Some(now);
+                }
+            } else {
+                *LAST_CONTROL_PRESS.lock().unwrap() = None;
+            }
+        }
+        return event;
+    }
     if event_type != K_CG_EVENT_KEY_DOWN && event_type != K_CG_EVENT_KEY_UP {
         return event;
     }
@@ -168,6 +206,8 @@ pub(crate) fn start() {
     if guard.as_ref().is_some_and(|h| !h.is_finished()) {
         return;
     }
+    CONTROL_DOWN.store(false, Ordering::Relaxed);
+    *LAST_CONTROL_PRESS.lock().unwrap() = None;
     *guard = Some(spawn_tap_thread());
     log_info!("Quick actions enabled.");
 }
@@ -201,9 +241,11 @@ fn runloop_static() -> &'static Mutex<Option<CFRunLoopRef>> {
 }
 
 fn spawn_tap_thread() -> thread::JoinHandle<()> {
-    // 监听掩码:keyDown + keyUp。
-    // Listen mask: keyDown + keyUp.
-    let mask: CGEventMask = (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_KEY_UP);
+    // 监听掩码:keyDown + keyUp + flagsChanged(Control 双击边沿)。
+    // Listen mask: keyDown + keyUp + flagsChanged (the double-Control edge).
+    let mask: CGEventMask = (1u64 << K_CG_EVENT_KEY_DOWN)
+        | (1u64 << K_CG_EVENT_KEY_UP)
+        | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
     thread::spawn(move || unsafe {
         crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
         // 新线程首件事:清掉上次运行残留的停止标志。
@@ -268,6 +310,7 @@ pub(crate) fn apply_action(action: QuickAction) {
             crate::mouse::system_action::fire("com.apple.showdesktop.awake");
         }
         QuickAction::LockScreen => lock_screen(),
+        QuickAction::LocatePointer => crate::pointer_locator::show(),
     }
 }
 

@@ -14,6 +14,7 @@ mod menu;
 mod mouse;
 mod overlay;
 mod performance;
+mod pointer_locator;
 mod quick_actions;
 mod settings;
 mod skylight;
@@ -1893,8 +1894,8 @@ fn main() {
         window_management::start();
     }
 
-    // 7b4. 快捷操作(Option+I/E/D)tap:仅在配置启用时启动(start 幂等)。
-    // Quick-actions (Option+I/E/D) tap: start only if enabled (idempotent).
+    // 7b4. 快捷操作(Option+I/E/D/L 与双击 Control)tap:仅在配置启用时启动(start 幂等)。
+    // Quick-actions (Option+I/E/D/L and double-Control) tap: start only if enabled (idempotent).
     let quick_actions_enabled = CONFIG
         .read()
         .map(|c| c.quick_actions.enabled)

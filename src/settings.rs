@@ -240,7 +240,8 @@ struct SettingsUi {
     quick_actions_open_finder: *mut AnyObject, // NSSwitch: Option+E 打开访达 / open Finder
     quick_actions_show_desktop: *mut AnyObject, // NSSwitch: Option+D 显示桌面 / show desktop
     quick_actions_lock_screen: *mut AnyObject, // NSSwitch: Option+L 锁屏 / lock screen
-    add_mapping_button: *mut AnyObject,     // NSButton: 添加映射 / add-mapping button
+    quick_actions_locate_pointer: *mut AnyObject, // NSSwitch: 双击 Control 显示鼠标位置 / double-Control pointer locator
+    add_mapping_button: *mut AnyObject,           // NSButton: 添加映射 / add-mapping button
     mapping_enabled: *mut AnyObject, // NSSwitch: 按键映射总开关(per-device) / mappings master switch (per-device)
     mapping_empty: *mut AnyObject,   // NSTextField: 空状态提示(卡片内) / empty-state hint (in-card)
     device_indicator: *mut AnyObject, // NSButton: 当前选中设备指示器(点击打开选择器) / device indicator (opens picker)
@@ -1073,6 +1074,7 @@ enum ControlField {
     QuickActionOpenFinder,
     QuickActionShowDesktop,
     QuickActionLockScreen,
+    QuickActionLocatePointer,
     UpdateAutoCheck,
     UpdateAutoDownload,
 }
@@ -1161,6 +1163,12 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             m(
                 u.quick_actions_lock_screen,
                 ControlField::QuickActionLockScreen,
+            )
+        })
+        .or_else(|| {
+            m(
+                u.quick_actions_locate_pointer,
+                ControlField::QuickActionLocatePointer,
             )
         })
         .or_else(|| m(u.update_auto_check, ControlField::UpdateAutoCheck))
@@ -1398,6 +1406,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::QuickActionLockScreen => {
                     let state: isize = msg_send![u.quick_actions_lock_screen, state];
                     cfg.quick_actions.lock_screen = state == 1;
+                }
+                ControlField::QuickActionLocatePointer => {
+                    let state: isize = msg_send![u.quick_actions_locate_pointer, state];
+                    cfg.quick_actions.locate_pointer = state == 1;
                 }
                 ControlField::UpdateAutoCheck => {
                     let state: isize = msg_send![u.update_auto_check, state];
@@ -1691,6 +1703,7 @@ fn apply_tab_effects(tab: usize) {
             ControlField::QuickActionOpenFinder,
             ControlField::QuickActionShowDesktop,
             ControlField::QuickActionLockScreen,
+            ControlField::QuickActionLocatePointer,
         ],
         _ => &[
             ControlField::UpdateAutoCheck,
@@ -2106,9 +2119,9 @@ pub(crate) extern "C" fn handle_window_control_enabled_toggle(
     }
 }
 
-/// 快捷操作总开关回调:即时应用 + 冻结/解冻下方四个动作开关。
+/// 快捷操作总开关回调:即时应用 + 冻结/解冻下方五个动作开关。
 /// Callback for the quick-actions master switch: apply immediately, then freeze/unfreeze the
-/// four action switches below.
+/// five action switches below.
 pub(crate) extern "C" fn handle_quick_actions_enabled_toggle(
     _self: *mut c_void,
     _cmd: Sel,
@@ -2123,8 +2136,8 @@ pub(crate) extern "C" fn handle_quick_actions_enabled_toggle(
     }
 }
 
-/// 根据快捷操作总开关状态,冻结/解冻下方四个动作开关。
-/// Freeze/unfreeze the four action switches below the quick-actions master switch.
+/// 根据快捷操作总开关状态,冻结/解冻下方五个动作开关。
+/// Freeze/unfreeze the five action switches below the quick-actions master switch.
 unsafe fn update_quick_actions_controls_enabled(ui: &SettingsUi) {
     let state: isize = msg_send![ui.quick_actions_enabled, state];
     let on = state == 1;
@@ -2134,6 +2147,7 @@ unsafe fn update_quick_actions_controls_enabled(ui: &SettingsUi) {
         ui.quick_actions_open_finder,
         ui.quick_actions_show_desktop,
         ui.quick_actions_lock_screen,
+        ui.quick_actions_locate_pointer,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
@@ -3363,6 +3377,10 @@ fn load_settings_from(cfg: &Config) {
             ui.quick_actions_lock_screen,
             setState: if cfg.quick_actions.lock_screen { 1isize } else { 0isize }
         ];
+        let _: () = msg_send![
+            ui.quick_actions_locate_pointer,
+            setState: if cfg.quick_actions.locate_pointer { 1isize } else { 0isize }
+        ];
         update_clipboard_controls_enabled(ui);
         update_window_control_controls_enabled(ui);
         update_quick_actions_controls_enabled(ui);
@@ -3879,6 +3897,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             quick_actions_open_finder: std::ptr::null_mut(),
             quick_actions_show_desktop: std::ptr::null_mut(),
             quick_actions_lock_screen: std::ptr::null_mut(),
+            quick_actions_locate_pointer: std::ptr::null_mut(),
             clipboard_persist: std::ptr::null_mut(),
             clipboard_move_used_to_top: std::ptr::null_mut(),
             clipboard_max_entries: std::ptr::null_mut(),
@@ -4156,10 +4175,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // The window-control page contains the master plus four direction switches, with room
         // for each row's description.
         let window_control_doc_h = 778.0;
-        // 快捷操作页:总开关 + 四个动作开关,结构与窗口控制页一致。
-        // Quick-actions page: master plus four action switches, mirroring the window-control
+        // 快捷操作页:总开关 + 五个动作开关,结构与窗口控制页一致。
+        // Quick-actions page: master plus five action switches, mirroring the window-control
         // page.
-        let quick_actions_doc_h = 778.0;
+        let quick_actions_doc_h = 854.0;
         let about_doc_h = 1300.0;
 
         let general_page = SettingsPage::new(content, page_frame, general_doc_h, false);
@@ -5577,6 +5596,19 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
         );
         bind_control(target, ui.quick_actions_lock_screen);
+        qy = layout.next_row_cursor(qy, described_row_h);
+        SettingsRow::separator(quick_actions_view, qy + described_row_h + 3.0, content_w);
+        ui.quick_actions_locate_pointer = SettingsRow::described(
+            quick_actions_view,
+            label_x,
+            qy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_quick_action_locate_pointer"),
+            &t("settings.desc_quick_action_locate_pointer"),
+            SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
+        );
+        bind_control(target, ui.quick_actions_locate_pointer);
         let quick_actions_card_bottom = layout.card_bottom(qy);
         SettingsSection::attach(
             quick_actions_view,
