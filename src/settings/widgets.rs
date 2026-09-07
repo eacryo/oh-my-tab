@@ -3098,10 +3098,17 @@ pub(super) unsafe fn make_sidebar_hover_highlight(
     let _: () = msg_send![hover, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![hover, layer];
     if !layer.is_null() {
-        layer_set_background(
-            layer,
-            crate::ffi::hex_to_cg_color(settings_palette().hover_bg),
-        );
+        // HTML `.nav button:hover` = rgba(0,0,0,.045):4.5% black. palette.hover_bg is shared
+        // with generic buttons' dark hover mapping, so the sidebar pill keeps its own token;
+        // the dark palette (no HTML reference) keeps the previous white wash.
+        // HTML `.nav button:hover` = rgba(0,0,0,.045):4.5% 黑。palette.hover_bg 与通用按钮的
+        // 深色 hover 映射共用,侧栏胶囊改用自己的色值;深色无 HTML 参考,维持原白色浅底。
+        let pill_hex = if settings_palette().dark {
+            0xFFFFFF22u32
+        } else {
+            0x0000000Bu32
+        };
+        layer_set_background(layer, crate::ffi::hex_to_cg_color(pill_hex));
         let _: () = msg_send![layer, setCornerRadius: 10.0f64];
         let _: () = msg_send![layer, setMasksToBounds: true];
     }
@@ -3253,7 +3260,11 @@ pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f
 }
 
 /// Add a page title matching the HTML redesign's large, tight heading and return its height.
-/// 添加符合 HTML 设计的大号紧凑页面标题，并返回标题实际高度。
+/// The 30pt size mirrors the mockup's `h1 { font-size: 30px }`; the top-padding metric itself
+/// lives in the SettingsPageHeader component, which passes the adjusted cursor here.
+/// 添加符合 HTML 设计的大号紧凑页面标题,并返回标题实际高度。30pt 对应设计稿的
+/// `h1 { font-size: 30px }`;顶部留白度量归 SettingsPageHeader 组件所有,由其换算游标
+/// 后传入。
 ///
 /// `top_cursor` is the cursor used by the page layout. The title keeps the same top inset while
 /// growing downward when the localized text needs additional wrapped lines.
@@ -3275,7 +3286,7 @@ pub(super) unsafe fn add_page_title(
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 25.0f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 30.0f64];
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
     let _: () = msg_send![label, setUsesSingleLineMode: false];
@@ -3339,13 +3350,17 @@ pub(super) unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) 
     release_obj(icon);
 }
 
-pub(super) const SETTINGS_CARD_SHADOW_INSET: f64 = 18.0;
+// Shadow clearance = key-shadow offset (8) + blur (24) = 32pt; 36 leaves margin.
+// 阴影余量 = 主阴影偏移(8) + 模糊(24) = 32pt;取 36 留出余量。
+pub(super) const SETTINGS_CARD_SHADOW_INSET: f64 = 36.0;
 
 /// Draw the settings card shadow into pixels owned by the shadow view itself. This keeps the
 /// blur inside the view's expanded frame instead of relying on a CALayer shadow crossing the
-/// AppKit scroll/document hierarchy.
+/// AppKit scroll/document hierarchy. Two layers mirror the HTML `.group` shadow:
+/// `0 1px 2px rgba(0,0,0,.025)` (ambient) + `0 8px 24px rgba(0,0,0,.035)` (key).
 /// 在阴影视图自身的像素范围内绘制设置卡片阴影。这样模糊区域位于扩大的视图边界内,
-/// 不再依赖 CALayer 阴影穿过 AppKit 的滚动/文档视图层级。
+/// 不再依赖 CALayer 阴影穿过 AppKit 的滚动/文档视图层级。双层对应 HTML `.group` 阴影:
+/// `0 1px 2px rgba(0,0,0,.025)`(环境)+ `0 8px 24px rgba(0,0,0,.035)`(主)。
 pub(super) extern "C" fn settings_card_shadow_draw_rect(
     _self: *mut c_void,
     _cmd: Sel,
@@ -3361,14 +3376,6 @@ pub(super) extern "C" fn settings_card_shadow_draw_rect(
                 (bounds.size.height - SETTINGS_CARD_SHADOW_INSET * 2.0).max(1.0),
             ),
         );
-        let shadow: *mut AnyObject = msg_send![class!(NSShadow), alloc];
-        let shadow: *mut AnyObject = msg_send![shadow, init];
-        let shadow_color = crate::ffi::hex_to_ns_color(settings_palette().shadow);
-        let _: () = msg_send![shadow, setShadowColor: shadow_color];
-        let _: () = msg_send![shadow, setShadowBlurRadius: 8.0f64];
-        let _: () = msg_send![shadow, setShadowOffset: NSSize::new(0.0, -1.0)];
-        let _: () = msg_send![shadow, set];
-
         let path: *mut AnyObject = msg_send![
             class!(NSBezierPath),
             bezierPathWithRoundedRect: card_rect,
@@ -3377,8 +3384,28 @@ pub(super) extern "C" fn settings_card_shadow_draw_rect(
         ];
         let fill = crate::ffi::hex_to_ns_color(settings_palette().card_bg);
         let _: () = msg_send![fill, set];
-        let _: () = msg_send![path, fill];
-        release_obj(shadow);
+        // AppKit 的 y 轴向上,CSS 的 "0 Npx" 向下阴影对应 dy = -N。
+        // 环境阴影固定 2.5% 黑;主阴影走 palette.shadow(浅色 0x0000000A ≈ 3.9%,即
+        // HTML 的 .035;深色自动取更重的黑)。
+        // AppKit's y axis points up, so a CSS "0 Npx" downward shadow maps to dy = -N.
+        // The ambient layer is fixed 2.5% black; the key layer uses palette.shadow (light
+        // 0x0000000A ≈ 3.9%, i.e. the HTML's .035; dark resolves to the heavier black).
+        let key_color = crate::ffi::hex_to_ns_color(settings_palette().shadow);
+        for (offset_y, blur, ambient) in [(-1.0f64, 2.0f64, true), (-8.0, 24.0, false)] {
+            let shadow: *mut AnyObject = msg_send![class!(NSShadow), alloc];
+            let shadow: *mut AnyObject = msg_send![shadow, init];
+            let shadow_color = if ambient {
+                crate::ffi::hex_to_ns_color(0x00000006u32)
+            } else {
+                key_color
+            };
+            let _: () = msg_send![shadow, setShadowColor: shadow_color];
+            let _: () = msg_send![shadow, setShadowBlurRadius: blur];
+            let _: () = msg_send![shadow, setShadowOffset: NSSize::new(0.0, offset_y)];
+            let _: () = msg_send![shadow, set];
+            let _: () = msg_send![path, fill];
+            release_obj(shadow);
+        }
     }
 }
 
@@ -3415,7 +3442,108 @@ pub(super) fn settings_card_shadow_view_class() -> *mut AnyObject {
     }) as *mut AnyObject
 }
 
+/// Radial white highlight at the detail pane's top-right, mirroring the HTML `.main`
+/// background: `radial-gradient(circle at 82% 0%, rgba(255,255,255,.96), transparent 34%)`.
+/// The layer's flat `detail_bg` fill stays underneath; drawRect composites the glow over it.
+/// 详情区右上角的径向白色高光,对应 HTML `.main` 背景:
+/// `radial-gradient(circle at 82% 0%, rgba(255,255,255,.96), transparent 34%)`。
+/// layer 的纯色 detail_bg 填充保留在下层,drawRect 把光斑叠在其上。
+pub(super) extern "C" fn settings_pane_highlight_draw_rect(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _rect: NSRect,
+) {
+    unsafe {
+        let bounds: NSRect = msg_send![_self as *mut AnyObject, bounds];
+        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+            return;
+        }
+        let gfx: *mut AnyObject = msg_send![class!(NSGraphicsContext), currentContext];
+        if gfx.is_null() {
+            return;
+        }
+        // CGContext getter 返回 '^{CGContext=}',objc2 的 msg_send! 会为 *mut c_void 编出
+        // '^v' 并在运行时编码校验中 panic(extern "C" drawRect 内 panic 即 abort);
+        // 照 nsimage_from_cgimage 的惯例走裸 objc_msgSend 绕过校验。
+        // The CGContext getter returns '^{CGContext=}', while objc2's msg_send! encodes a
+        // *mut c_void return as '^v' and the runtime encoding check panics (a panic inside an
+        // extern "C" drawRect aborts the process). Follow nsimage_from_cgimage's raw
+        // objc_msgSend convention to bypass the check.
+        let sel_cg_context = sel!(CGContext);
+        type CGContextGetter = unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut c_void;
+        let send: CGContextGetter = std::mem::transmute(crate::ffi::objc_msgSend as *const ());
+        let ctx: *mut c_void = send(gfx, sel_cg_context);
+        if ctx.is_null() {
+            return;
+        }
+        // drawRect 坐标系原点在左下;圆心在 82% 宽、顶边(y = h)。
+        // drawRect's origin is bottom-left; the center sits at 82% width on the top edge.
+        let center = crate::ffi::CGPoint {
+            x: bounds.size.width * 0.82,
+            y: bounds.size.height,
+        };
+        // CSS `circle` 默认射线 = 到最远角的距离(左下角);34% 色标 → endRadius。
+        // CSS `circle`'s default ray reaches the farthest corner (bottom-left here);
+        // the 34% color stop maps to endRadius.
+        let farthest = (center.x * center.x + center.y * center.y).sqrt();
+        let end_radius = farthest * 0.34;
+        // 白 .96 → 白 0;option 2 = kCGGradientDrawsAfterEndLocation(终点外保持透明)。
+        // White .96 → white 0; option 2 = kCGGradientDrawsAfterEndLocation (transparent beyond).
+        let components: [f64; 8] = [1.0, 1.0, 1.0, 0.96, 1.0, 1.0, 1.0, 0.0];
+        let space = crate::ffi::CGColorSpaceCreateDeviceRGB();
+        let gradient = crate::ffi::CGGradientCreateWithColorComponents(
+            space,
+            components.as_ptr(),
+            std::ptr::null(),
+            2,
+        );
+        if !gradient.is_null() {
+            crate::ffi::CGContextDrawRadialGradient(
+                ctx, gradient, center, 0.0, center, end_radius, 2,
+            );
+            crate::ffi::CGGradientRelease(gradient);
+        }
+        crate::ffi::CFRelease(space);
+    }
+}
+
+pub(super) fn settings_pane_highlight_view_class() -> *mut AnyObject {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    *CLASS.get_or_init(|| unsafe {
+        let name = CString::new("OhMyTabSettingsPaneHighlightView").unwrap();
+        let superclass = class!(NSView) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        let types_draw = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
+        class_addMethod(
+            cls,
+            sel!(drawRect:),
+            settings_pane_highlight_draw_rect as *mut c_void,
+            types_draw.as_ptr(),
+        );
+        // 纯背景装饰:hitTest 返回 nil,绝不拦截内容区的鼠标事件。
+        // Pure background decoration: hitTest returns nil so it never intercepts input.
+        class_addMethod(
+            cls,
+            sel!(hitTest:),
+            settings_card_shadow_hit_test as *mut c_void,
+            CString::new("@@:{CGPoint=dd}").unwrap().as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        cls as usize
+    }) as *mut AnyObject
+}
+
 /// Add a grouped card behind a section, matching the HTML redesign's light card surface.
+/// The translucent white fill + hairline border live on the card's own layer; the two-layer
+/// shadow (HTML `0 1px 2px` + `0 8px 24px`) is drawn by the dedicated shadow view behind it.
+/// The HTML also stacks a backdrop blur under the surface, but a live blur on every scrolling
+/// card re-samples the backdrop every frame and drags scrolling/window dragging down, while
+/// over the pane's flat backdrop the blur is visually invisible anyway -- deliberately
+/// omitted (the Plan-A tradeoff).
+/// 在区块后添加分组卡片,对应 HTML 重设计的浅色卡片:半透明白填充 + 发丝边框由卡片自身
+/// layer 承载;双层阴影(HTML `0 1px 2px` + `0 8px 24px`)由背后的专用阴影视图绘制。
+/// HTML 在表面下还有 backdrop 模糊,但滚动卡片上的实时模糊每帧都要重新采样背景,拖累
+/// 滚动和窗口拖动,而面板纯色背景下模糊本身在视觉上不可见——按方案 A 刻意省略。
 pub(super) unsafe fn add_settings_card(
     parent: *mut AnyObject,
     frame: NSRect,
@@ -3423,24 +3551,22 @@ pub(super) unsafe fn add_settings_card(
     if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
         return (std::ptr::null_mut(), std::ptr::null_mut());
     }
+    let palette = settings_palette();
     let card: *mut AnyObject = msg_send![class!(NSView), alloc];
     let card: *mut AnyObject = msg_send![card, initWithFrame: frame];
     let _: () = msg_send![card, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![card, layer];
     if !layer.is_null() {
-        let palette = settings_palette();
         layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.card_bg));
-        // The card is inserted below its siblings with addSubview:positioned:. Keep its layer at
-        // the default z-position so the border remains visible above the document background.
-        // 卡片通过 addSubview:positioned: 放在 sibling 下方；layer 保持默认 z，确保边框不会
-        // 被 document 背景盖住。
         let _: () = msg_send![layer, setCornerRadius: 14.0f64];
-        // Keep the outer shadow visible. The card has no child content that needs clipping.
+        // The outer shadow is a separate view, so the layer needs no clipping.
+        // 外层阴影是独立视图,layer 自身无需裁切。
         let _: () = msg_send![layer, setMasksToBounds: false];
         crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
     }
     // Insert below controls and labels so the card never intercepts their mouse events.
+    // 整张卡片放在控件与标签下方,避免拦截它们的鼠标事件。
     let _: () = msg_send![
         parent,
         addSubview: card,
@@ -3714,6 +3840,13 @@ pub(super) unsafe fn make_settings_page(
     let _: () = msg_send![clip, setDrawsBackground: false];
 
     let document: *mut AnyObject = msg_send![class!(NSView), alloc];
+    // 文档必须不低于视口:非翻转文档若矮于 clip 会被 AppKit 贴在视口底部,内容整体
+    // 下移 (视口高-文档高)(快捷操作页 728<窗口 752 时整页下移 24pt 即此因)。
+    // The document must never be shorter than the viewport: a non-flipped document shorter
+    // than its clip gets pinned to the clip's BOTTOM by AppKit, shifting all content down by
+    // (clip - document) -- the quick-actions page (728 < window 752) shifted 24pt for exactly
+    // this reason.
+    let document_h = document_h.max(frame.size.height);
     let document: *mut AnyObject = msg_send![
         document,
         initWithFrame: NSRect::new(

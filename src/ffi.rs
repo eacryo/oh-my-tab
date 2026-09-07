@@ -166,6 +166,34 @@ extern "C" {
     pub(crate) fn CGContextDrawImage(ctx: *mut c_void, rect: CGRect, image: *const c_void);
     pub(crate) fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *const c_void;
     pub(crate) fn CGBitmapContextGetData(ctx: *mut c_void) -> *mut c_void;
+
+    // ---- 径向渐变(设置主区的径向高光) ----
+    // ---- Radial gradients (the settings pane's radial highlight) ----
+    pub(crate) fn CGGradientCreateWithColorComponents(
+        space: *const c_void,
+        components: *const f64,
+        locations: *const f64,
+        count: usize,
+    ) -> *const c_void;
+    pub(crate) fn CGGradientRelease(gradient: *const c_void);
+    pub(crate) fn CGContextDrawRadialGradient(
+        ctx: *mut c_void,
+        gradient: *const c_void,
+        start_center: CGPoint,
+        start_radius: f64,
+        end_center: CGPoint,
+        end_radius: f64,
+        options: u32,
+    );
+}
+
+/// CoreGraphics 的 CGPoint(与 CGRect 同源的平铺双 f64 布局)。
+/// CoreGraphics CGPoint (flat two-f64 layout matching CGRect's convention).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct CGPoint {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
 }
 
 /// CoreGraphics 的 CGRect(C ABI:{origin:(x,y), size:(w,h)} 即 4 个连续 f64;

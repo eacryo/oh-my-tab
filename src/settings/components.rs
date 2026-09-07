@@ -129,6 +129,55 @@ impl SettingsPage {
     }
 }
 
+/// Page header component: the mockup's big page title (`h1 { font-size: 30px }`) plus its
+/// distance from the pane top (`.content { padding: 42px 0 72px }`). Owns both mockup metrics
+/// so pages neither hardcode them nor drift apart; returns the height consumed from the page
+/// document's top edge so callers can keep their cursor arithmetic.
+/// 页头组件:设计稿的大号页标题(`h1 { font-size: 30px }`)及其与面板顶部的距离
+/// (`.content { padding: 42px 0 72px }`)。两处度量都归组件所有,页面不各自硬编码;
+/// 返回自文档顶边起消耗的高度,调用方按原样续接布局游标。
+pub(super) struct SettingsPageHeader;
+
+impl SettingsPageHeader {
+    /// HTML `.content`'s top padding — the title block's distance from the pane top.
+    /// HTML `.content` 的顶部内边距,即标题块与面板顶部的距离。
+    const TOP_PADDING: f64 = 42.0;
+
+    /// Build the header and return the height consumed from `doc_top` (padding + title).
+    /// 构建页头,返回自 `doc_top` 起消耗的高度(顶部留白 + 标题)。
+    pub(super) unsafe fn attach(
+        parent: *mut AnyObject,
+        title: &str,
+        x: f64,
+        doc_top: f64,
+        w: f64,
+    ) -> f64 {
+        // 页面文档可能被 make_settings_page 按视口高度撑大；布局调用方传入的预设高度
+        // 此时不再是文档顶边。以实际 frame 高度锚定标题，并把高度差折算进返回值，
+        // 让后续区块继续从同一个真实顶边计算。
+        // make_settings_page may grow the document to the viewport height, so the caller's
+        // provisional height is no longer the document's top edge. Anchor the title to the
+        // actual frame height and fold the delta into the returned consumption so following
+        // sections continue calculating from that same real top edge.
+        let frame: NSRect = objc2::msg_send![parent, frame];
+        let actual_doc_top = if frame.size.height.is_finite() && frame.size.height > 0.0 {
+            frame.size.height.max(doc_top)
+        } else {
+            doc_top
+        };
+        // widgets::add_page_title places the title's top edge at cursor + 10.
+        // widgets::add_page_title 将标题顶边放在 cursor + 10 处。
+        let title_h = widgets::add_page_title(
+            parent,
+            title,
+            x,
+            actual_doc_top - Self::TOP_PADDING - 10.0,
+            w,
+        );
+        Self::TOP_PADDING + title_h - (actual_doc_top - doc_top)
+    }
+}
+
 /// Card component. Rows remain siblings of the card background so native controls keep their
 /// normal hit-testing and z-order; the component owns only the card/shadow pair.
 /// 卡片组件。行仍作为卡片背景的 sibling，保证原生控件的命中和层级正常；组件只拥有卡片/阴影对。
@@ -1896,8 +1945,16 @@ impl SettingsSidebar {
         Self::fade_view(hover, 1.0, "settings-sidebar-hover-opacity");
     }
 
+    /// Re-entry (pointer returning to the sidebar from the detail pane / window edges) plays
+    /// at the ORIGINAL hover speed. It used a stiffer 500/30 spring, but since the hover
+    /// tracker started covering every sidebar row, essentially all entries route here, and
+    /// the everyday hover motion read as "sped up" -- so the reentry path keeps the normal
+    /// 360/32 feel while remaining a distinct tuning point.
+    /// 重入(指针从详情区/窗口边缘回到侧栏)恢复原始悬停速度。此前用更硬的 500/30
+    /// 弹簧,但自 hover tracker 覆盖全部侧栏行后,几乎所有进入动作都走这里,日常
+    /// 悬停观感变成"加快了"——重入路径保留独立调参点,速度回到常规 360/32。
     pub(super) unsafe fn move_hover_highlight_on_reentry(hover: *mut AnyObject, frame: NSRect) {
-        Self::move_hover_highlight_with_spring(hover, frame, 500.0, 30.0);
+        Self::move_hover_highlight_with_spring(hover, frame, 360.0, 32.0);
     }
 
     /// Hide the shared hover pill after the pointer leaves the whole menu.

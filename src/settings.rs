@@ -422,8 +422,8 @@ pub(crate) mod widgets;
 
 use components::{
     RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard, SettingsControl,
-    SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsRow, SettingsSection,
-    SettingsSelect, SettingsSidebar,
+    SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader, SettingsRow,
+    SettingsSection, SettingsSelect, SettingsSidebar,
 };
 use glass_preview::*;
 pub(crate) use glass_preview::{
@@ -3474,6 +3474,58 @@ extern "C" fn settings_window_resize_subviews(_self: *mut c_void, _cmd: Sel, old
             resizeSubviewsWithOldSize: old_size
         ];
         reposition_traffic_lights(_self as *mut AnyObject);
+        grow_short_page_documents();
+    }
+}
+
+/// 窗口变高时把矮于视口的页文档长高:非翻转文档矮于 clip 时会被 AppKit 贴在视口
+/// 底部,整页内容统一下移 (视口高-文档高)——快捷操作页文档 728pt 在 752pt 高的
+/// 窗口里整页下移 24pt 即此因。只增长不收缩;刚长高的可见页回顶,其余滚动位置
+/// 不动(拖拽缩放期间幂等,无布局循环风险)。
+/// When the window grows, raise any page document shorter than its viewport: AppKit
+/// bottom-pins a non-flipped document shorter than its clip, shifting the whole page down
+/// by (clip - document) -- the quick-actions page (728pt doc in a 752pt window) dropped
+/// 24pt for exactly this reason. Grow-only; a just-grown visible page re-scrolls to the
+/// top while other scroll offsets stay untouched (idempotent per resize tick, no layout
+/// loop risk).
+unsafe fn grow_short_page_documents() {
+    let ui_guard = SETTINGS_UI.lock().unwrap();
+    let Some(ui) = ui_guard.as_ref() else {
+        return;
+    };
+    let scrolls = [
+        ui.general_view,
+        ui.switcher_view,
+        ui.mouse_view,
+        ui.clipboard_view,
+        ui.window_control_view,
+        ui.quick_actions_view,
+        ui.about_view,
+    ];
+    let selected = widgets::SIDEBAR_SELECTED.load(Ordering::SeqCst);
+    for (index, &scroll) in scrolls.iter().enumerate() {
+        if scroll.is_null() {
+            continue;
+        }
+        let clip: *mut AnyObject = msg_send![scroll, contentView];
+        if clip.is_null() {
+            continue;
+        }
+        let doc: *mut AnyObject = msg_send![scroll, documentView];
+        if doc.is_null() {
+            continue;
+        }
+        let clip_bounds: NSRect = msg_send![clip, bounds];
+        let doc_frame: NSRect = msg_send![doc, frame];
+        if doc_frame.size.height < clip_bounds.size.height {
+            let _: () = msg_send![doc, setFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(doc_frame.size.width, clip_bounds.size.height),
+            )];
+            if index == selected {
+                widgets::scroll_page_to_top(scroll);
+            }
+        }
     }
 }
 
@@ -3890,7 +3942,11 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         release_obj(sidebar_divider);
 
         // The right detail pane has its own white surface, directly beside the gray sidebar.
-        let main_background: *mut AnyObject = msg_send![class!(NSView), alloc];
+        // The custom class adds the HTML `.main` radial highlight (82% 0%) over the flat fill.
+        // 右侧详情区自有浅色表面,紧邻灰色侧栏。自定义类在纯色填充之上叠加
+        // HTML `.main` 的径向高光(82% 0%)。
+        let main_background: *mut AnyObject =
+            msg_send![widgets::settings_pane_highlight_view_class(), alloc];
         let main_background: *mut AnyObject = msg_send![
             main_background,
             initWithFrame: NSRect::new(
@@ -3916,8 +3972,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 // strip where the traffic lights live. Anchor the identity block to that full
                 // height so it follows the HTML sidebar's compact top padding instead of being
                 // pushed down by the toolbar's contentLayoutRect inset.
-                NSPoint::new(24.0, content_h - 74.0),
-                NSSize::new(card_w - 48.0, 22.0)
+                // Title 20pt/700 matches the HTML `.brand-title` (font-size:20px; weight:700).
+                NSPoint::new(24.0, content_h - 78.0),
+                NSSize::new(card_w - 48.0, 26.0)
             )
         ];
         set_field(app_title, "Oh My Tab");
@@ -3925,17 +3982,21 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let _: () = msg_send![app_title, setDrawsBackground: false];
         let _: () = msg_send![app_title, setEditable: false];
         let app_title_font: *mut AnyObject =
-            msg_send![class!(NSFont), boldSystemFontOfSize: 15.0f64];
+            msg_send![class!(NSFont), boldSystemFontOfSize: 20.0f64];
         let _: () = msg_send![app_title, setFont: app_title_font];
         let app_title_color = settings_text_color(SettingsTextRole::Primary);
         let _: () = msg_send![app_title, setTextColor: app_title_color];
+        // 贴顶、贴左:窗口高度可调,身份区必须跟随红绿灯条带而不是漂向底部。
+        // Top- and left-anchored: the window height is adjustable, so the identity block must
+        // follow the traffic-light strip instead of drifting downward.
+        let _: () = msg_send![app_title, setAutoresizingMask: 12u64];
         let _: () = msg_send![sidebar_view, addSubview: app_title];
         release_obj(app_title);
         let app_subtitle: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let app_subtitle: *mut AnyObject = msg_send![
             app_subtitle,
             initWithFrame: NSRect::new(
-                NSPoint::new(24.0, content_h - 94.0),
+                NSPoint::new(24.0, content_h - 102.0),
                 NSSize::new(card_w - 48.0, 18.0)
             )
         ];
@@ -3948,6 +4009,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let _: () = msg_send![app_subtitle, setFont: app_subtitle_font];
         let app_subtitle_color = settings_text_color(SettingsTextRole::Muted);
         let _: () = msg_send![app_subtitle, setTextColor: app_subtitle_color];
+        let _: () = msg_send![app_subtitle, setAutoresizingMask: 12u64];
         let _: () = msg_send![sidebar_view, addSubview: app_subtitle];
         release_obj(app_subtitle);
 
@@ -4017,18 +4079,23 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // shrinking would let AppKit move the children a second time.
         // 先用宽松的临时高度构建；子视图定位后不再收缩 document，因为页面是手动顶部锚定坐标，
         // 布局后收缩会让 AppKit 再次移动子视图。
-        let general_doc_h = 1120.0;
-        let switcher_doc_h = 1280.0;
-        let mouse_doc_h = 1540.0;
-        let clipboard_doc_h = 960.0;
+        // 各页高度含 SettingsPageHeader 的 42pt 顶部留白(较旧版 24pt 多 18)。
+        // Built from generous provisional heights. They are intentionally not shrunk after child
+        // frames are assigned: the pages use manual top-anchored coordinates, so post-hoc
+        // shrinking would let AppKit move the children a second time. Every height includes
+        // SettingsPageHeader's 42pt top padding (18 more than the old 24pt inset).
+        let general_doc_h = 1138.0;
+        let switcher_doc_h = 1298.0;
+        let mouse_doc_h = 1558.0;
+        let clipboard_doc_h = 978.0;
         // 窗口控制页包含总开关和四个方向开关,高度留出描述文字的空间。
         // The window-control page contains the master plus four direction switches, with room
         // for each row's description.
-        let window_control_doc_h = 760.0;
+        let window_control_doc_h = 778.0;
         // 快捷操作页:总开关 + 三个动作开关,结构与窗口控制页一致(少一行)。
         // Quick-actions page: master plus three action switches, mirroring the window-control
         // page (one row fewer).
-        let quick_actions_doc_h = 710.0;
+        let quick_actions_doc_h = 728.0;
         let about_doc_h = 1300.0;
 
         let general_page = SettingsPage::new(content, page_frame, general_doc_h, false);
@@ -4063,12 +4130,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 
         // ===== 通用页内容 general page content =====
         let general_top = general_doc_h - 24.0;
-        let mut y = general_top; // top cursor: bottom edge of the next element
-        let general_title_h = add_page_title(
+        let mut y = general_doc_h; // top cursor: bottom edge of the next element
+        let general_title_h = SettingsPageHeader::attach(
             general_view,
             &t("settings.sidebar_general"),
             6.0,
-            y,
+            general_doc_h,
             content_w - 12.0,
         );
         y -= general_title_h + 18.0;
@@ -4372,12 +4439,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let general_content_bottom = layout.card_bottom(y);
 
         // ===== 应用切换浮窗页内容 switcher overlay page content =====
-        let mut y = switcher_doc_h - 24.0;
-        let switcher_title_h = add_page_title(
+        let mut y = switcher_doc_h;
+        let switcher_title_h = SettingsPageHeader::attach(
             switcher_view,
             &t("settings.sidebar_switcher"),
             6.0,
-            y,
+            switcher_doc_h,
             content_w - 12.0,
         );
         y -= switcher_title_h + 18.0;
@@ -4628,12 +4695,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
 
         // ===== 鼠标页内容 mouse page content =====
-        let mut y = mouse_doc_h - 24.0;
-        let mouse_title_h = add_page_title(
+        let mut y = mouse_doc_h;
+        let mouse_title_h = SettingsPageHeader::attach(
             mouse_view,
             &t("settings.sidebar_mouse"),
             6.0,
-            y,
+            mouse_doc_h,
             content_w - 12.0,
         );
         y -= mouse_title_h + 18.0;
@@ -5023,12 +5090,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // ===== 剪贴板历史页内容 clipboard page content =====
         // 独立布局游标(该页内容与鼠标页互不相关)。
         // Independent layout cursor (this page's content is unrelated to the mouse page).
-        let mut cy = clipboard_doc_h - 24.0;
-        let clipboard_title_h = add_page_title(
+        let mut cy = clipboard_doc_h;
+        let clipboard_title_h = SettingsPageHeader::attach(
             clipboard_view,
             &t("settings.sidebar_clipboard"),
             6.0,
-            cy,
+            clipboard_doc_h,
             content_w - 12.0,
         );
         cy -= clipboard_title_h + 18.0;
@@ -5200,12 +5267,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // ===== 窗口控制页内容 window control page content =====
         // 独立布局游标(该页内容与剪贴板页互不相关)。
         // Independent layout cursor (unrelated to the clipboard page).
-        let mut wy = window_control_doc_h - 24.0;
-        let window_control_title_h = add_page_title(
+        let mut wy = window_control_doc_h;
+        let window_control_title_h = SettingsPageHeader::attach(
             window_control_view,
             &t("settings.sidebar_window_control"),
             6.0,
-            wy,
+            window_control_doc_h,
             content_w - 12.0,
         );
         wy -= window_control_title_h + 18.0;
@@ -5316,12 +5383,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // ===== 快捷操作页内容 quick actions page content =====
         // 独立布局游标(该页内容与窗口控制页互不相关)。
         // Independent layout cursor (unrelated to the window-control page).
-        let mut qy = quick_actions_doc_h - 24.0;
-        let quick_actions_title_h = add_page_title(
+        let mut qy = quick_actions_doc_h;
+        let quick_actions_title_h = SettingsPageHeader::attach(
             quick_actions_view,
             &t("settings.sidebar_quick_actions"),
             6.0,
-            qy,
+            quick_actions_doc_h,
             content_w - 12.0,
         );
         qy -= quick_actions_title_h + 18.0;
