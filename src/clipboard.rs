@@ -262,11 +262,6 @@ fn clipboard_palette() -> crate::theme::UiPalette {
     crate::theme::ui_palette()
 }
 
-/// Keep a palette color's hue while choosing a role-specific alpha for a subtle surface.
-/// 保留调色板颜色的色相，仅为轻量背景选择语义化透明度。
-fn clipboard_color_with_alpha(color: u32, alpha: u8) -> u32 {
-    (color & 0xFFFF_FF00) | u32::from(alpha)
-}
 /// 自定义滚动指示器的可见宽度 / visible custom scroll indicator width.
 const SCROLL_INDICATOR_W: f64 = 6.0;
 /// 指示器实际鼠标命中宽度;透明两侧扩大拖拽区域,不改变可见胶囊宽度。
@@ -4993,8 +4988,8 @@ unsafe fn rebuild_rows() {
             act_y,
             act_alpha,
         );
-        // 详情已展开且本行被选中时,详情按钮显示实心圆 + 白色 i 的激活图标。
-        // When detail is open for this selected row, show the active filled-circle + white-i icon.
+        // 详情已展开且本行被选中时,详情按钮显示激活图标与独立圆角底。
+        // When detail is open for this selected row, show its active icon and own rounded fill.
         set_detail_action_style(
             details_btn,
             detail_action_is_active(DETAIL_VISIBLE.load(Ordering::SeqCst), sel_idx, i),
@@ -5879,13 +5874,17 @@ extern "C" fn show_item_details_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c
         return;
     }
     let mut sel = PICKER_SELECTION.lock().unwrap();
+    let previous = *sel;
     // 已打开且点的是当前选中行 → 本次点击是"取消详情"。
     // Detail already open AND the click is on the selected row -> this click cancels it.
     let close = DETAIL_VISIBLE.load(Ordering::SeqCst) && *sel == idx as usize;
     *sel = idx as usize;
     drop(sel);
     unsafe {
-        rebuild_rows();
+        // 详情按钮点击只需要更新前后两行的视觉状态,无需同步重建整个剪贴板列表。
+        // A detail-button click only needs the incremental visual update for the old and new
+        // selection; rebuilding the entire clipboard list here made mouse opening feel slow.
+        refresh_selection(previous, idx as usize);
         if close {
             hide_detail();
         } else {
@@ -6622,10 +6621,33 @@ unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject
     image
 }
 
-/// 用普通/悬停/激活状态替换详情按钮的自绘图标。图标自身携带颜色,按钮底色保持透明,
-/// 与 HTML `.action.details` 规则一致。
-/// Replace the detail action's drawn icon for its normal/hover/active state. The image carries
-/// its own colors and the button background remains transparent, matching HTML `.action.details`.
+/// 用统一的剪贴板操作按钮状态绘制自身的圆角悬停背景。
+/// Apply the shared clipboard action-button state to its own rounded hover background.
+/// 详情是否展开只影响图标,不改变按钮底色。/ Detail activation changes only the icon,
+/// never the button background.
+unsafe fn set_action_button_surface(button: *mut AnyObject, hovered: bool) {
+    if button.is_null() {
+        return;
+    }
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if layer.is_null() {
+        return;
+    }
+    let palette = clipboard_palette();
+    let action: Sel = msg_send![button, action];
+    let background = if action == sel!(deleteEntry:) && hovered {
+        (palette.destructive & 0xFFFF_FF00) | 0x18
+    } else if hovered {
+        palette.hover_bg
+    } else {
+        0x00000000
+    };
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
+}
+
+/// 用普通/悬停/激活状态替换详情按钮的自绘图标,并复用单按钮的圆角状态样式。
+/// Replace the detail icon for its normal/hover/active state and reuse the single-button
+/// rounded state styling.
 unsafe fn set_detail_action_style(button: *mut AnyObject, active: bool, hovered: bool) {
     if button.is_null() {
         return;
@@ -6637,9 +6659,7 @@ unsafe fn set_detail_action_style(button: *mut AnyObject, active: bool, hovered:
     let _: () = msg_send![button, setImage: icon];
     let _: () = msg_send![button, setImagePosition: 1isize]; // NSImageOnly
     release_obj(icon);
-    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-    let layer: *mut AnyObject = msg_send![button, layer];
-    crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(clear));
+    set_action_button_surface(button, hovered);
 }
 
 /// 详情开关不会重建列表,因此单独刷新已有详情按钮的激活态。
@@ -6744,11 +6764,7 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
             let palette = clipboard_palette();
             let c = crate::ffi::hex_to_ns_color(palette.destructive);
             let _: () = msg_send![b, setContentTintColor: c];
-            let layer: *mut AnyObject = msg_send![b, layer];
-            crate::ffi::layer_set_background(
-                layer,
-                crate::ffi::hex_to_cg_color(clipboard_color_with_alpha(palette.destructive, 0x18)),
-            );
+            set_action_button_surface(b, true);
         } else if action == sel!(togglePin:) {
             // 置顶行内悬停(新设计稿 .action:hover):变深 + 浅底。详情改用专属 SVG
             // 图标的空心/实心状态,已在本函数开头提前处理。
@@ -6757,8 +6773,7 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
             let palette = clipboard_palette();
             let c = crate::ffi::hex_to_ns_color(palette.primary_text);
             let _: () = msg_send![b, setContentTintColor: c];
-            let layer: *mut AnyObject = msg_send![b, layer];
-            crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.hover_bg));
+            set_action_button_surface(b, true);
         } else if action == sel!(filterPillClicked:) {
             let c = crate::ffi::hex_to_ns_color(clipboard_palette().primary_text);
             let _: () = msg_send![b, setContentTintColor: c];
@@ -6796,11 +6811,11 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_
             set_detail_action_style(b, active, false);
             return;
         }
+        if action == sel!(deleteEntry:) || action == sel!(togglePin:) {
+            set_action_button_surface(b, false);
+        }
         let c = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
         let _: () = msg_send![b, setContentTintColor: c];
-        let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-        let layer: *mut AnyObject = msg_send![b, layer];
-        crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(clear));
     }
 }
 
@@ -6858,6 +6873,10 @@ unsafe fn make_action_button(
     let tint = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
     let _: () = msg_send![b, setContentTintColor: tint];
     let _: () = msg_send![b, setAlphaValue: alpha];
+    // 三个按钮都从同一套组件状态初始化,后续由悬停回调只切换自身状态。
+    // Initialize all three buttons through the same component state; hover callbacks then
+    // change only the button under the pointer.
+    set_action_button_surface(b, false);
     add_hover_tracking(b);
     b
 }
