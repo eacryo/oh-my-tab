@@ -726,6 +726,9 @@ pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _even
     let Some(idx) = get_card_index(_self as *mut AnyObject) else {
         return;
     };
+    if !activates_on_hover() {
+        return;
+    }
     if !MOUSE_MOVED.load(Ordering::Relaxed) {
         log_debug!(
             "[overlay] card {} mouseEntered (gated, mouse not moved yet)",

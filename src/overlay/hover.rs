@@ -14,6 +14,9 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
     if card_close_in_progress() {
         return;
     }
+    if !activates_on_hover() {
+        return;
+    }
     // 移动本身即"开门"信号,同时按鼠标当前位置补选中。
     // 为什么要补:浮窗打开瞬间鼠标可能已在卡片下,那次 mouseEntered 被门控吞掉且不会
     // 重发(已 inside)——若只靠 mouseEntered,侧键召唤场景 hover 无法选中(实测)。

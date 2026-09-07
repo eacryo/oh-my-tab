@@ -182,6 +182,10 @@ pub struct WindowsSection {
     // Overlay display position: "active_window" = follow the active window's screen,
     // "main" = always on the main screen. Defaults to following the active window.
     pub overlay_position: String,
+    // 窗口激活方式:"hover" = 鼠标悬停时激活,"click" = 点击窗口时激活。默认悬停。
+    // Window activation mode: "hover" activates on hover; "click" activates on click.
+    // Defaults to hover.
+    pub activation_mode: String,
 }
 
 impl Default for WindowsSection {
@@ -190,6 +194,7 @@ impl Default for WindowsSection {
             enabled: true,
             show_minimized: false,
             overlay_position: "active_window".to_string(),
+            activation_mode: "hover".to_string(),
         }
     }
 }
@@ -818,6 +823,12 @@ impl Config {
                 &[("value", &self.windows.overlay_position)],
             ));
         }
+        if !["hover", "click"].contains(&self.windows.activation_mode.as_str()) {
+            errs.push(tf(
+                "errors.windows_activation_mode_invalid",
+                &[("value", &self.windows.activation_mode)],
+            ));
+        }
 
         // --- clipboard ---
         if !(1..=100).contains(&self.clipboard.max_entries) {
@@ -987,6 +998,12 @@ impl Config {
                 .any(|e| e.starts_with("windows.overlay_position"))
             {
                 self.windows.overlay_position = other.windows.overlay_position;
+            }
+            if !errs
+                .iter()
+                .any(|e| e.starts_with("windows.activation_mode"))
+            {
+                self.windows.activation_mode = other.windows.activation_mode;
             }
         }
 
@@ -1534,7 +1551,8 @@ mod tests {
         cfg.i18n.locale = "fr".into();
         cfg.logging.level = "verbose".into();
         cfg.windows.overlay_position = "nowhere".into();
-        assert_err_count(&cfg, 4);
+        cfg.windows.activation_mode = "double_click".into();
+        assert_err_count(&cfg, 5);
     }
 
     #[test]
@@ -1810,6 +1828,7 @@ mod tests {
         cfg.i18n.locale = "zh-Hans".into();
         cfg.updates.automatically_check = false;
         cfg.windows.overlay_position = "main".into();
+        cfg.windows.activation_mode = "click".into();
         cfg.windows.show_minimized = true;
         cfg.windows.enabled = false; // 非默认值:验证 roundtrip / non-default: verify the roundtrip
         cfg.mouse.enabled = true;
@@ -1844,6 +1863,7 @@ mod tests {
         assert_eq!(loaded.i18n.locale, "zh-Hans");
         assert!(!loaded.updates.automatically_check);
         assert_eq!(loaded.windows.overlay_position, "main");
+        assert_eq!(loaded.windows.activation_mode, "click");
         assert!(loaded.windows.show_minimized);
         assert!(!loaded.windows.enabled);
         // mouse profiles 原样保留(通配档 + per-device 档各一条)。

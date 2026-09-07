@@ -95,6 +95,9 @@ show_minimized_show = "Show"
 row_overlay_position = "Overlay Position"
 overlay_position_follow_active = "Follow Active Window"
 overlay_position_main_screen = "Always on Main Screen"
+row_activation_mode = "Window Activation"
+activation_mode_hover = "Activate on Hover"
+activation_mode_click = "Activate on Click"
 row_log_level = "Log level"
 desc_log_level = "Change this only when troubleshooting."
 header_startup = "Startup options"
@@ -282,4 +285,5 @@ clipboard_max_entries_invalid = "clipboard.max_entries: {value} must be 1..=100"
 clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} must be 0..=365 (0 = off)"
 mouse_line_count_invalid = "line_count: {value} must be 1..=10"
 windows_overlay_position_invalid = 'windows.overlay_position: "{value}" is not one of active_window, main'
+windows_activation_mode_invalid = 'windows.activation_mode: "{value}" is not one of hover, click'
 clipboard_picker_position_invalid = 'clipboard.picker_position: "{value}" is not one of mouse, main'

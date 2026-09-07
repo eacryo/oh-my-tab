@@ -202,12 +202,13 @@ struct SettingsUi {
     status_bar_text_size_value_label: *mut AnyObject, // NSTextField: 底部字号值 / footer text-size value
     windows_enabled: *mut AnyObject, // NSSwitch: 窗口切换总开关 / app-switcher master switch
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
-    log_level: *mut AnyObject,        // NSPopUpButton: trace / debug / info / warn / error
-    launch_at_login: *mut AnyObject,  // NSSwitch: 开机自启 / launch at login
-    reverse_scroll: *mut AnyObject,   // NSSwitch: 反转滚动 / reverse scrolling
-    enable_mouse: *mut AnyObject,     // NSSwitch: 启用鼠标控制 / enable mouse control
-    scroll_mode: *mut AnyObject,      // NSPopUpButton: default/line
-    line_count: *mut AnyObject,       // NSSlider: line count slider
+    activation_mode: *mut AnyObject, // NSPopUpButton: 悬停激活 / 点击激活 / activation mode (hover / click)
+    log_level: *mut AnyObject,       // NSPopUpButton: trace / debug / info / warn / error
+    launch_at_login: *mut AnyObject, // NSSwitch: 开机自启 / launch at login
+    reverse_scroll: *mut AnyObject,  // NSSwitch: 反转滚动 / reverse scrolling
+    enable_mouse: *mut AnyObject,    // NSSwitch: 启用鼠标控制 / enable mouse control
+    scroll_mode: *mut AnyObject,     // NSPopUpButton: default/line
+    line_count: *mut AnyObject,      // NSSlider: line count slider
     line_count_label: *mut AnyObject, // NSTextField: line count row 的 label / the row's label
     line_count_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
     line_count_card: *mut AnyObject,        // NSView: 行数卡片 / line-count card
@@ -918,6 +919,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         old.windows.overlay_position,
         new.windows.overlay_position
     );
+    changed!(
+        "windows.activation_mode",
+        old.windows.activation_mode,
+        new.windows.activation_mode
+    );
     changed!("logging.level", old.logging.level, new.logging.level);
     changed!(
         "logging.file_path",
@@ -1041,6 +1047,7 @@ enum ControlField {
     CardTextSize,
     StatusBarTextSize,
     OverlayPosition,
+    ActivationMode,
     CornerRadius,
     Modifier,
     MouseEnabled,
@@ -1095,6 +1102,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
         .or_else(|| m(u.card_text_size, ControlField::CardTextSize))
         .or_else(|| m(u.status_bar_text_size, ControlField::StatusBarTextSize))
         .or_else(|| m(u.overlay_position, ControlField::OverlayPosition))
+        .or_else(|| m(u.activation_mode, ControlField::ActivationMode))
         .or_else(|| m(u.corner_radius, ControlField::CornerRadius))
         .or_else(|| m(u.modifier, ControlField::Modifier))
         .or_else(|| m(u.enable_mouse, ControlField::MouseEnabled))
@@ -1289,6 +1297,14 @@ fn apply_control_field(field: ControlField) {
                     cfg.windows.overlay_position = match idx {
                         1 => "main",
                         _ => "active_window",
+                    }
+                    .into();
+                }
+                ControlField::ActivationMode => {
+                    let idx: isize = msg_send![u.activation_mode, indexOfSelectedItem];
+                    cfg.windows.activation_mode = match idx {
+                        1 => "click",
+                        _ => "hover",
                     }
                     .into();
                 }
@@ -1642,6 +1658,7 @@ fn apply_tab_effects(tab: usize) {
             ControlField::CardTextSize,
             ControlField::StatusBarTextSize,
             ControlField::OverlayPosition,
+            ControlField::ActivationMode,
             ControlField::Modifier,
         ],
         2 => &[
@@ -1894,6 +1911,7 @@ unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
         ui.status_bar_text_size,
         ui.status_bar_text_size_value_label,
         ui.overlay_position,
+        ui.activation_mode,
         ui.corner_radius,
         ui.modifier,
     ] {
@@ -3195,6 +3213,13 @@ fn load_settings_from(cfg: &Config) {
             _ => 0, // "active_window" (default)
         };
         let _: () = msg_send![ui.overlay_position, selectItemAtIndex: op_idx as isize];
+        // activation_mode:下拉框 index 0 = 悬停激活(hover), 1 = 点击激活(click)。
+        // activation_mode: popup index 0 = activate on hover (hover), 1 = activate on click (click).
+        let activation_idx = match cfg.windows.activation_mode.as_str() {
+            "click" => 1,
+            _ => 0,
+        };
+        let _: () = msg_send![ui.activation_mode, selectItemAtIndex: activation_idx as isize];
         // log_level:下拉框 index 0..1 对应 debug,info;默认 index 1(info)。
         // log_level: popup index 0..1 = debug, info; default index 1 (info).
         let ll_idx = match cfg.logging.level.as_str() {
@@ -3824,6 +3849,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             show_minimized: std::ptr::null_mut(),
             windows_enabled: std::ptr::null_mut(),
             overlay_position: std::ptr::null_mut(),
+            activation_mode: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
@@ -4123,7 +4149,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // shrinking would let AppKit move the children a second time. Every height includes
         // SettingsPageHeader's 42pt top padding (18 more than the old 24pt inset).
         let general_doc_h = 1138.0;
-        let switcher_doc_h = 1298.0;
+        let switcher_doc_h = 1370.0;
         let mouse_doc_h = 1558.0;
         let clipboard_doc_h = 978.0;
         // 窗口控制页包含总开关和四个方向开关,高度留出描述文字的空间。
@@ -4668,8 +4694,39 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         )
         .1;
         bind_control(target, ui.overlay_position);
-        y = layout.next_row_cursor(y, op_metrics.row_h);
-        SettingsRow::separator(switcher_view, y + op_metrics.row_h + 3.0, content_w);
+        // 窗口激活方式下拉框: index 0 = 鼠标悬停时激活, 1 = 点击窗口时激活;默认 index 0。
+        // Window activation mode popup: index 0 = activate on hover, 1 = activate on click;
+        // default index 0.
+        let activation_labels = [
+            t("settings.activation_mode_hover"),
+            t("settings.activation_mode_click"),
+        ];
+        let activation_label_refs: Vec<&str> =
+            activation_labels.iter().map(|s| s.as_str()).collect();
+        let activation_metrics =
+            SettingsSelect::metrics(ctrl_w, &activation_label_refs, row_h, described_row_h);
+        y = layout.next_row_cursor(y, activation_metrics.row_h);
+        SettingsRow::separator(switcher_view, y + activation_metrics.row_h + 3.0, content_w);
+        ui.activation_mode = SettingsRow::tall_with_height(
+            switcher_view,
+            label_x,
+            y,
+            label_w,
+            activation_metrics.row_h,
+            &t("settings.row_activation_mode"),
+            SettingsControl::popup(
+                ctrl_x,
+                y + (activation_metrics.row_h - activation_metrics.control_h) / 2.0,
+                ctrl_w,
+                activation_metrics.control_h,
+                &activation_label_refs,
+                0,
+            ),
+        )
+        .1;
+        bind_control(target, ui.activation_mode);
+        y = layout.next_row_cursor(y, activation_metrics.row_h);
+        SettingsRow::separator(switcher_view, y + activation_metrics.row_h + 3.0, content_w);
         ui.corner_radius = SettingsRow::tall(
             switcher_view,
             label_x,

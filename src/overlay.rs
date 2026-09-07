@@ -290,6 +290,15 @@ type CardPlacementFrame = (usize, f64, f64, f64);
 /// opens. Reset on a fresh summon and flipped to true on the first mouse move.
 pub(crate) static MOUSE_MOVED: AtomicBool = AtomicBool::new(false);
 
+/// 当前浮窗的鼠标激活方式是否为悬停。
+/// Whether the overlay currently activates windows on hover.
+pub(crate) fn activates_on_hover() -> bool {
+    crate::config::CONFIG
+        .read()
+        .map(|config| config.windows.activation_mode != "click")
+        .unwrap_or(true)
+}
+
 pub(crate) fn thumbnail_scroller() -> Option<ObjPtr> {
     *THUMB_SCROLLER.lock().unwrap()
 }
