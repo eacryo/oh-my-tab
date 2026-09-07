@@ -683,6 +683,20 @@ unsafe impl Send for RestoreDefaultsControl {}
 unsafe impl Sync for RestoreDefaultsControl {}
 
 impl RestoreDefaultsControl {
+    // 与参考组件一致的两条时间轴:外壳负责尺寸 morph,内容负责进入/退出。
+    // Two timelines matching the reference component: the shell morphs its size, while the
+    // content handles its own enter/exit motion.
+    const SHELL_DURATION: f64 = 0.58;
+    const SHELL_STIFFNESS: f64 = 160.0;
+    const SHELL_DAMPING: f64 = 24.0;
+    const CONTENT_DURATION: f64 = 0.46;
+    const CONTENT_STIFFNESS: f64 = 266.0;
+    const CONTENT_DAMPING: f64 = 30.0;
+    const LABEL_OPEN_DURATION: f64 = 0.38;
+    const LABEL_OPEN_STIFFNESS: f64 = 350.0;
+    const LABEL_OPEN_DAMPING: f64 = 36.0;
+    const LABEL_CLOSE_DURATION: f64 = 0.16;
+
     pub(super) fn empty() -> Self {
         Self {
             trigger: std::ptr::null_mut(),
@@ -1152,9 +1166,11 @@ impl RestoreDefaultsControl {
             let _: () = objc2::msg_send![self.cancel, setHidden: false];
             let _: () = objc2::msg_send![self.confirm, setHidden: false];
             if animated {
-                Self::animate_basic_opacity(self.surface, 1.0, 0.25, "restore-shell-reveal");
-                // 同步视图模型值,保证与后续非动画路径(setAlphaValue)读写一致。
-                // Sync the view model value so later non-animated paths stay consistent.
+                // 参考组件的外壳在整个 morph 过程中持续存在;这里只同步显示状态,不再叠加
+                // 一条独立的淡入时间轴,避免背景比尺寸动画晚出现。
+                // The reference shell remains present for the whole morph; synchronize its
+                // visible state without adding a separate fade timeline that would lag the size
+                // animation.
                 let _: () = objc2::msg_send![self.surface, setAlphaValue: 1.0f64];
             } else {
                 let _: () = objc2::msg_send![self.surface, setAlphaValue: 1.0f64];
@@ -1176,13 +1192,18 @@ impl RestoreDefaultsControl {
                 relativeTo: std::ptr::null::<AnyObject>()
             ];
             if animated {
-                Self::animate_basic_opacity(self.trigger, 0.0, 0.16, "restore-trigger-close");
+                Self::animate_basic_opacity(
+                    self.trigger,
+                    0.0,
+                    Self::LABEL_CLOSE_DURATION,
+                    "restore-trigger-close",
+                );
                 Self::animate_spring_opacity(
                     self.cancel,
                     1.0,
-                    0.38,
-                    350.0,
-                    36.0,
+                    Self::LABEL_OPEN_DURATION,
+                    Self::LABEL_OPEN_STIFFNESS,
+                    Self::LABEL_OPEN_DAMPING,
                     "restore-cancel-open",
                 );
                 Self::animate_content_open(self.confirm);
@@ -1206,19 +1227,29 @@ impl RestoreDefaultsControl {
             ];
             if animated {
                 Self::animate_content_exit(self.confirm);
-                Self::animate_basic_opacity(self.cancel, 0.0, 0.16, "restore-cancel-close");
+                Self::animate_basic_opacity(
+                    self.cancel,
+                    0.0,
+                    Self::LABEL_CLOSE_DURATION,
+                    "restore-cancel-close",
+                );
                 Self::animate_spring_opacity(
                     self.trigger,
                     1.0,
-                    0.38,
-                    350.0,
-                    36.0,
+                    Self::LABEL_OPEN_DURATION,
+                    Self::LABEL_OPEN_STIFFNESS,
+                    Self::LABEL_OPEN_DAMPING,
                     "restore-trigger-open",
                 );
                 // Fade the shell with the shrink so it never ends up painting behind the
                 // trigger in the collapsed state.
                 // 外壳随收缩淡出，避免收起态结束时仍画在按钮后面。
-                Self::animate_basic_opacity(self.surface, 0.0, 0.45, "restore-shell-hide");
+                Self::animate_basic_opacity(
+                    self.surface,
+                    0.0,
+                    Self::SHELL_DURATION,
+                    "restore-shell-hide",
+                );
                 let _: () = objc2::msg_send![self.surface, setAlphaValue: 0.0f64];
             } else {
                 let _: () = objc2::msg_send![self.trigger, setAlphaValue: 1.0f64];
@@ -1236,9 +1267,9 @@ impl RestoreDefaultsControl {
             Self::spring_view_frame(
                 self.surface,
                 target_surface,
-                0.58,
-                160.0,
-                24.0,
+                Self::SHELL_DURATION,
+                Self::SHELL_STIFFNESS,
+                Self::SHELL_DAMPING,
                 "restore-shell",
             );
             let surface_layer: *mut AnyObject = objc2::msg_send![self.surface, layer];
@@ -1254,27 +1285,27 @@ impl RestoreDefaultsControl {
                     "shadowOpacity",
                     from_shadow,
                     target_shadow,
-                    0.58,
-                    160.0,
-                    24.0,
+                    Self::SHELL_DURATION,
+                    Self::SHELL_STIFFNESS,
+                    Self::SHELL_DAMPING,
                     "restore-shell-shadow",
                 );
             }
             Self::spring_view_frame(
                 self.container,
                 target_container,
-                0.58,
-                160.0,
-                24.0,
+                Self::SHELL_DURATION,
+                Self::SHELL_STIFFNESS,
+                Self::SHELL_DAMPING,
                 "restore-clip",
             );
             if !self.separator.is_null() {
                 Self::spring_view_frame(
                     self.separator,
                     target_separator,
-                    0.58,
-                    160.0,
-                    24.0,
+                    Self::SHELL_DURATION,
+                    Self::SHELL_STIFFNESS,
+                    Self::SHELL_DAMPING,
                     "restore-divider",
                 );
             }
@@ -1285,9 +1316,9 @@ impl RestoreDefaultsControl {
                 } else {
                     confirm_collapsed_frame
                 },
-                0.46,
-                266.0,
-                30.0,
+                Self::CONTENT_DURATION,
+                Self::CONTENT_STIFFNESS,
+                Self::CONTENT_DAMPING,
                 "restore-confirm-frame",
             );
         } else {
@@ -1594,9 +1625,9 @@ impl RestoreDefaultsControl {
             "opacity",
             0.0,
             1.0,
-            0.46,
-            266.0,
-            30.0,
+            Self::CONTENT_DURATION,
+            Self::CONTENT_STIFFNESS,
+            Self::CONTENT_DAMPING,
             "restore-content-opacity",
         );
         Self::animate_spring_scalar(
@@ -1604,9 +1635,9 @@ impl RestoreDefaultsControl {
             "transform.translation.y",
             8.0,
             0.0,
-            0.46,
-            266.0,
-            30.0,
+            Self::CONTENT_DURATION,
+            Self::CONTENT_STIFFNESS,
+            Self::CONTENT_DAMPING,
             "restore-content-y",
         );
         Self::animate_spring_scalar(
@@ -1614,9 +1645,9 @@ impl RestoreDefaultsControl {
             "transform.scale",
             0.98,
             1.0,
-            0.46,
-            266.0,
-            30.0,
+            Self::CONTENT_DURATION,
+            Self::CONTENT_STIFFNESS,
+            Self::CONTENT_DAMPING,
             "restore-content-scale",
         );
     }
