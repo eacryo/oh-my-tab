@@ -6595,6 +6595,8 @@ unsafe fn set_action_button_surface(button: *mut AnyObject, hovered: bool) {
     let action: Sel = msg_send![button, action];
     let background = if action == sel!(deleteEntry:) && hovered {
         (palette.destructive & 0xFFFF_FF00) | 0x18
+    } else if action == sel!(clearClipboardHistory:) && hovered {
+        (palette.destructive_hover & 0xFFFF_FF00) | 0x18
     } else if hovered {
         palette.hover_bg
     } else {
@@ -6714,7 +6716,12 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
             set_detail_action_style(b, active, true);
             return;
         }
-        if action == sel!(deleteEntry:) || action == sel!(clearClipboardHistory:) {
+        if action == sel!(clearClipboardHistory:) {
+            let palette = clipboard_palette();
+            let c = crate::ffi::hex_to_ns_color(palette.destructive_hover);
+            let _: () = msg_send![b, setContentTintColor: c];
+            set_action_button_surface(b, true);
+        } else if action == sel!(deleteEntry:) {
             let palette = clipboard_palette();
             let c = crate::ffi::hex_to_ns_color(palette.destructive);
             let _: () = msg_send![b, setContentTintColor: c];
@@ -6776,7 +6783,10 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_
             set_detail_action_style(b, active, false);
             return;
         }
-        if action == sel!(deleteEntry:) || action == sel!(togglePin:) {
+        if action == sel!(deleteEntry:)
+            || action == sel!(clearClipboardHistory:)
+            || action == sel!(togglePin:)
+        {
             set_action_button_surface(b, false);
         }
         let c = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
