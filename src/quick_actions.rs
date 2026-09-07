@@ -1,10 +1,10 @@
-//! 快捷操作模块:Option+I 打开设置、Option+E 打开访达、Option+D 显示桌面。
+//! 快捷操作模块:Option+I 打开设置、Option+E 打开访达、Option+D 显示桌面、Option+L 锁屏。
 //! 独立 session 层 event tap(专用线程)拦截 Option+字母,事件经既有 bridge
 //! (GlobalEvent -> performSelectorOnMainThread)投递到主线程执行动作。
 //! 结构与 window_management.rs 相同:专用线程 + RunLoop 引用 + 停止标志。
 //!
 //! Quick-actions module: Option+I opens Settings, Option+E opens Finder, Option+D shows the
-//! desktop. A dedicated session-level event tap (own thread) intercepts Option+letters; events
+//! desktop, and Option+L locks the screen. A dedicated session-level event tap (own thread) intercepts Option+letters; events
 //! travel through the existing bridge (GlobalEvent -> performSelectorOnMainThread) and run on
 //! the main thread. Same shape as window_management.rs: dedicated thread + RunLoop reference +
 //! stop flag.
@@ -16,7 +16,7 @@ use crate::event_monitor::GlobalEvent;
 use crate::event_tap::{
     self, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent, CFRunLoopRef,
     CGEventCreateKeyboardEvent, CGEventFlags, CGEventGetFlags, CGEventGetIntegerValueField,
-    CGEventMask, CGEventRef, CGEventSetFlags, CGEventTapProxy, CGEventType,
+    CGEventMask, CGEventPost, CGEventRef, CGEventSetFlags, CGEventTapProxy, CGEventType,
     K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
 };
 use crate::ffi::{make_nsstring, CFRelease};
@@ -27,8 +27,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 // ========== 键盘事件常量 / keyboard event constants ==========
-// 键码来自 Carbon HIToolbox Events.h(kVK_ANSI_I/E/D)。
-// Keycodes are from Carbon HIToolbox Events.h (kVK_ANSI_I/E/D).
+// 键码来自 Carbon HIToolbox Events.h(kVK_ANSI_I/E/D/L)。
+// Keycodes are from Carbon HIToolbox Events.h (kVK_ANSI_I/E/D/L).
 const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
 const K_CG_EVENT_KEY_UP: CGEventType = 11;
 const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
@@ -36,6 +36,7 @@ const K_CG_KEYBOARD_EVENT_AUTOREPEAT: i32 = 8;
 const K_VK_I: u16 = 34;
 const K_VK_E: u16 = 14;
 const K_VK_D: u16 = 2;
+const K_VK_L: u16 = 37;
 // 修饰键位掩码:必须恰好是 Option(带其他修饰键的组合透传,与 Option+方向键同规则)。
 // Modifier masks: exactly Option is required; combos with extra modifiers pass through
 // (same rule as Option+arrows).
@@ -52,6 +53,7 @@ pub(crate) enum QuickAction {
     OpenSettings = 0,
     OpenFinder = 1,
     ShowDesktop = 2,
+    LockScreen = 3,
 }
 
 impl QuickAction {
@@ -62,6 +64,7 @@ impl QuickAction {
             0 => Some(Self::OpenSettings),
             1 => Some(Self::OpenFinder),
             2 => Some(Self::ShowDesktop),
+            3 => Some(Self::LockScreen),
             _ => None,
         }
     }
@@ -71,6 +74,7 @@ impl QuickAction {
             K_VK_I => Some(Self::OpenSettings),
             K_VK_E => Some(Self::OpenFinder),
             K_VK_D => Some(Self::ShowDesktop),
+            K_VK_L => Some(Self::LockScreen),
             _ => None,
         }
     }
@@ -87,16 +91,17 @@ fn action_enabled(action: QuickAction) -> bool {
                     QuickAction::OpenSettings => c.quick_actions.open_settings,
                     QuickAction::OpenFinder => c.quick_actions.open_finder,
                     QuickAction::ShowDesktop => c.quick_actions.show_desktop,
+                    QuickAction::LockScreen => c.quick_actions.lock_screen,
                 }
         })
         .unwrap_or(false)
 }
 
-/// tap 回调:只关心 Option+I/E/D(不带其他修饰键)。启用时吞掉 keyDown/keyUp 并把非
+/// tap 回调:只关心 Option+I/E/D/L(不带其他修饰键)。启用时吞掉 keyDown/keyUp 并把非
 /// 自动重复的 keyDown 投递给主线程;关闭时全部透传(功能关闭 = 组合键还给系统)。
 /// 自己是前台 App 时,仅在设置文本框正在编辑时透传,避免把整个设置窗口误判为输入场景。
 ///
-/// The tap callback: only cares about Option+I/E/D (no extra modifiers). When enabled it
+/// The tap callback: only cares about Option+I/E/D/L (no extra modifiers). When enabled it
 /// swallows matching keyDown/keyUp and forwards non-autorepeat keyDowns to the main thread;
 /// when disabled everything passes through (a disabled feature returns the combo to the
 /// system). When our app is frontmost, it passes through only while a settings text field is
@@ -262,7 +267,32 @@ pub(crate) fn apply_action(action: QuickAction) {
             // system's Show Desktop.
             crate::mouse::system_action::fire("com.apple.showdesktop.awake");
         }
+        QuickAction::LockScreen => lock_screen(),
     }
+}
+
+/// 合成系统的 Control+Command+Q 锁屏快捷键并立即返回,避免阻塞主线程。
+/// Synthesize macOS's Control+Command+Q lock-screen shortcut without blocking the main thread.
+fn lock_screen() {
+    // macOS 26 已移除旧版 CGSession 命令路径,使用公开 CoreGraphics 事件接口触发系统快捷键。
+    // macOS 26 removed the legacy CGSession path, so use the public CoreGraphics event API.
+    const KEYCODE_Q: u16 = 12;
+    const K_FLAG_COMMAND_CONTROL: CGEventFlags = K_FLAG_COMMAND | K_FLAG_CONTROL;
+    unsafe {
+        let down = CGEventCreateKeyboardEvent(std::ptr::null(), KEYCODE_Q, true);
+        let up = CGEventCreateKeyboardEvent(std::ptr::null(), KEYCODE_Q, false);
+        if down.is_null() || up.is_null() {
+            log_info!("[quick] lock screen failed: could not create keyboard event");
+            return;
+        }
+        CGEventSetFlags(down, K_FLAG_COMMAND_CONTROL);
+        CGEventSetFlags(up, K_FLAG_COMMAND_CONTROL);
+        CGEventPost(tap_location::SESSION_EVENT_TAP, down);
+        CGEventPost(tap_location::SESSION_EVENT_TAP, up);
+        CFRelease(down as *const c_void);
+        CFRelease(up as *const c_void);
+    }
+    log_debug!("[quick] lock screen requested");
 }
 
 /// 打开系统设置:x-apple.systempreferences: URL scheme,LaunchServices 拉起/置前系统设置。

@@ -28,9 +28,9 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct QuickActionsSection {
-    // 快捷操作总开关(Option+I/E/D 全局热键)。默认 false:全局拦截会覆盖其他应用的
+    // 快捷操作总开关(Option+I/E/D/L 全局热键)。默认 false:全局拦截会覆盖其他应用的
     // Option+字母组合(部分布局下是死键/特殊字符),必须由用户显式开启。
-    // Quick-actions master switch (Option+I/E/D global hotkeys). Default false: the global
+    // Quick-actions master switch (Option+I/E/D/L global hotkeys). Default false: the global
     // interception overrides other apps' Option+letters (dead keys / special chars on some
     // layouts), so it must be explicitly opted in.
     pub enabled: bool,
@@ -42,6 +42,8 @@ pub struct QuickActionsSection {
     pub open_finder: bool,
     #[serde(default = "default_quick_action_enabled")]
     pub show_desktop: bool,
+    #[serde(default = "default_quick_action_enabled")]
+    pub lock_screen: bool,
 }
 
 fn default_quick_action_enabled() -> bool {
@@ -55,6 +57,7 @@ impl Default for QuickActionsSection {
             open_settings: true,
             open_finder: true,
             show_desktop: true,
+            lock_screen: true,
         }
     }
 }

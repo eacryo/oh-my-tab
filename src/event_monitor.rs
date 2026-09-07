@@ -22,8 +22,8 @@ pub enum GlobalEvent {
     // Window control: Option+arrow (the direction crosses to the main thread via NSNumber
     // in the bridge).
     WindowControl(crate::window_management::Direction),
-    // 快捷操作:Option+I/E/D(动作编号经 bridge 的 NSNumber 传到主线程)。
-    // Quick actions: Option+I/E/D (the action id crosses to the main thread via NSNumber
+    // 快捷操作:Option+I/E/D/L(动作编号经 bridge 的 NSNumber 传到主线程)。
+    // Quick actions: Option+I/E/D/L (the action id crosses to the main thread via NSNumber
     // in the bridge).
     QuickAction(u8),
 }
