@@ -235,6 +235,11 @@ const FILTERS_H: f64 = 36.0;
 const FILTERS_PAD_X: f64 = 20.0;
 /// 筛选项间距(设计稿 gap 17px)/ the gap between filter items (17px).
 const FILTER_GAP: f64 = 17.0;
+/// 筛选下划线的固定尺寸与动画时长;切换时只移动中心点,不改变长度。
+/// Fixed underline dimensions and animation duration; tab changes move its center only.
+const FILTER_UNDERLINE_W: f64 = 16.0;
+const FILTER_UNDERLINE_H: f64 = 2.0;
+const FILTER_UNDERLINE_ANIMATION_DURATION: f64 = 0.20;
 /// 底部栏高度(设计稿 43px)/ the footer's height (43px).
 const FOOTER_H: f64 = 43.0;
 /// 窗口底部留白 / the window's bottom padding.
@@ -4464,7 +4469,7 @@ unsafe fn ensure_picker_window() {
         FILTER_PILLS.lock().unwrap().push(ObjPtr(pill));
         fx += w + FILTER_GAP;
     }
-    update_filter_pill_style();
+    update_filter_pill_style(false);
 
     // 清空历史(新设计稿 .clear-history):筛选行右侧(间距 auto),透明、10px、28% 黑,
     // 悬停变红并显示带小圆角的浅红底。
@@ -6730,9 +6735,9 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
     }
 }
 
-/// 悬停退出:恢复基础色(筛选交给 update_filter_pill_style 保持选中态)。
-/// Hover exit: restore the base color (filters delegate to update_filter_pill_style so the
-/// active state survives).
+/// 悬停退出:恢复基础色;筛选项只更新自己的文字色,不触碰共享下划线。
+/// Hover exit: restore the base color; a filter only updates its own tint and never touches
+/// the shared underline.
 extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
     unsafe {
         let b = _self as *mut AnyObject;
@@ -6742,7 +6747,22 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_
             return;
         }
         if action == sel!(filterPillClicked:) {
-            update_filter_pill_style();
+            let tag: isize = msg_send![b, tag];
+            let active_tag = match *CLIP_FILTER.lock().unwrap() {
+                ClipFilter::All => 0isize,
+                ClipFilter::Text => 1,
+                ClipFilter::Image => 2,
+                ClipFilter::Link => 3,
+                ClipFilter::Code => 4,
+            };
+            let palette = clipboard_palette();
+            let tint = if tag == active_tag {
+                palette.primary_text
+            } else {
+                palette.secondary_text
+            };
+            let c = crate::ffi::hex_to_ns_color(tint);
+            let _: () = msg_send![b, setContentTintColor: c];
             return;
         }
         if action == sel!(showItemDetails:) {
@@ -6874,7 +6894,75 @@ unsafe fn make_filter_pill(label: &str, tag: isize, x: f64, y: f64, w: f64) -> *
 /// Refresh the filter styling: the active item is 78% black with a 16x2 underline below;
 /// the rest are 38% black (the mockup's .filter). The underline is one shared little view
 /// repositioned under the active button (created on the first style pass).
-fn update_filter_pill_style() {
+unsafe fn animate_filter_underline(underline: *mut AnyObject, target_frame: NSRect) {
+    let layer: *mut AnyObject = msg_send![underline, layer];
+    if layer.is_null() {
+        let _: () = msg_send![underline, setFrame: target_frame];
+        return;
+    }
+
+    // Use the layer's actual anchor point so the animation target matches the view frame even
+    // when AppKit changes the backing-layer geometry.
+    // 使用 layer 的实际锚点,即使 AppKit 改变 backing layer 几何信息,动画目标仍与 view frame 一致。
+    let anchor: NSPoint = msg_send![layer, anchorPoint];
+    let target_position = NSPoint::new(
+        target_frame.origin.x + target_frame.size.width * anchor.x,
+        target_frame.origin.y + target_frame.size.height * anchor.y,
+    );
+
+    // Read the presentation position first so rapid Tab presses continue from the visible
+    // position instead of jumping back to the previous model position.
+    // 先读取 presentation 位置,让快速连续按 Tab 时从当前可见位置继续移动,避免跳回旧位置。
+    let presentation: *mut AnyObject = msg_send![layer, presentationLayer];
+    let from_position: NSPoint = if presentation.is_null() {
+        msg_send![layer, position]
+    } else {
+        msg_send![presentation, position]
+    };
+
+    let animation_key = make_nsstring("clipboard-filter-underline");
+    let _: () = msg_send![layer, removeAnimationForKey: animation_key];
+    if (from_position.x - target_position.x).abs() < 0.1 {
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+        let _: () = msg_send![layer, setPosition: target_position];
+        let _: () = msg_send![class!(CATransaction), commit];
+        CFRelease(animation_key as *const c_void);
+        return;
+    }
+
+    // Keep the model position and the explicit animation in one transaction. Updating the
+    // NSView frame separately lets AppKit briefly expose a second geometry transition.
+    // 在同一个事务中更新 model position 和显式动画。单独更新 NSView frame 会让 AppKit
+    // 短暂暴露第二条几何过渡,从而产生抽动。
+    let _: () = msg_send![class!(CATransaction), begin];
+    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+    let _: () = msg_send![layer, setPosition: target_position];
+    let _: () = msg_send![class!(CATransaction), commit];
+
+    let key_path = make_nsstring("position.x");
+    let animation: *mut AnyObject =
+        msg_send![class!(CABasicAnimation), animationWithKeyPath: key_path];
+    CFRelease(key_path as *const c_void);
+    let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from_position.x];
+    let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: target_position.x];
+    let _: () = msg_send![animation, setFromValue: from_value];
+    let _: () = msg_send![animation, setToValue: to_value];
+    let _: () = msg_send![animation, setDuration: FILTER_UNDERLINE_ANIMATION_DURATION];
+    let timing_name = make_nsstring("easeInEaseOut");
+    let timing: *mut AnyObject = msg_send![
+        class!(CAMediaTimingFunction),
+        functionWithName: timing_name
+    ];
+    CFRelease(timing_name as *const c_void);
+    if !timing.is_null() {
+        let _: () = msg_send![animation, setTimingFunction: timing];
+    }
+    let _: () = msg_send![layer, addAnimation: animation, forKey: animation_key];
+    CFRelease(animation_key as *const c_void);
+}
+
+fn update_filter_pill_style(animate_underline: bool) {
     let active = *CLIP_FILTER.lock().unwrap();
     unsafe {
         let active_tag = match active {
@@ -6905,26 +6993,29 @@ fn update_filter_pill_style() {
                 let p0 = FILTER_PILLS.lock().unwrap()[0];
                 msg_send![p0.0, superview]
             };
-            let underline_w = 16.0;
-            let underline_h = 2.0;
-            let ux = frame.origin.x + (frame.size.width - underline_w) / 2.0;
+            let ux = frame.origin.x + (frame.size.width - FILTER_UNDERLINE_W) / 2.0;
             // flipped 坐标:按钮高 38,文字垂直居中,下划线在文字下方 9px ≈ 行底 -3。
             // Flipped coords: the button is 38pt tall with centered text; the underline
             // sits 9px under the text ≈ 3pt above the row's bottom.
             let uy = frame.origin.y + FILTERS_H - 3.0;
             let mut guard = FILTER_UNDERLINE.lock().unwrap();
             if let Some(u) = *guard {
-                let _: () = msg_send![u.0, setFrame: NSRect::new(
+                let target_frame = NSRect::new(
                     NSPoint::new(ux, uy),
-                    NSSize::new(underline_w, underline_h)
-                )];
+                    NSSize::new(FILTER_UNDERLINE_W, FILTER_UNDERLINE_H),
+                );
+                if animate_underline {
+                    animate_filter_underline(u.0, target_frame);
+                } else {
+                    let _: () = msg_send![u.0, setFrame: target_frame];
+                }
             } else {
                 let u: *mut AnyObject = msg_send![class!(NSView), alloc];
                 let u: *mut AnyObject = msg_send![
                     u,
                     initWithFrame: NSRect::new(
                         NSPoint::new(ux, uy),
-                        NSSize::new(underline_w, underline_h)
+                        NSSize::new(FILTER_UNDERLINE_W, FILTER_UNDERLINE_H)
                     )
                 ];
                 let _: () = msg_send![u, setWantsLayer: true];
@@ -7255,7 +7346,7 @@ pub fn refresh_localized_ui() {
                 ];
                 x += width + FILTER_GAP;
             }
-            update_filter_pill_style();
+            update_filter_pill_style(false);
 
             if let Some(clear) = *CLEAR_HISTORY_BUTTON.lock().unwrap() {
                 let clear_title = t("clipboard.clear_all");
@@ -7297,7 +7388,7 @@ fn apply_clip_filter(filter: ClipFilter) {
         hide_detail();
     }
     *CLIP_FILTER.lock().unwrap() = filter;
-    update_filter_pill_style();
+    update_filter_pill_style(true);
     unsafe { rebuild_rows() };
 }
 
