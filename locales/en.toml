@@ -282,6 +282,7 @@ keyboard_modifier_invalid = 'keyboard.modifier: "{value}" is not one of option, 
 i18n_locale_invalid = 'i18n.locale: "{value}" is not one of auto, en, zh-Hans, zh-Hant'
 logging_level_invalid = "logging.level: '{value}' is invalid (expect: debug, info)"
 config_read_failed = "cannot read config: {error}"
+config_field_type_invalid = "{field}: invalid type {actual} (expected {expected}); using default"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line'
 clipboard_max_entries_invalid = "clipboard.max_entries: {value} must be 1..=100"
 clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} must be 0..=365 (0 = off)"

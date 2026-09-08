@@ -283,6 +283,7 @@ keyboard_modifier_invalid = 'keyboard.modifier: "{value}" 不是 option、comman
 i18n_locale_invalid = 'i18n.locale: "{value}" 不是 auto、en、zh-Hans、zh-Hant 之一'
 logging_level_invalid = "logging.level: '{value}' 無效（期望: debug, info）"
 config_read_failed = "無法讀取設定: {error}"
+config_field_type_invalid = "{field}：類型 {actual} 無效（應為 {expected}），將使用預設值"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line 之一'
 clipboard_max_entries_invalid = "clipboard.max_entries: {value} 必須 1..=100"
 clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} 必須 0..=365(0 = 關閉)"

@@ -1156,6 +1156,252 @@ impl Config {
 
 // ========== Load / Save ==========
 
+/// 返回覆盖所有配置字段类型形状的 TOML 值。
+/// Return a TOML value containing the expected type shape for every configuration field.
+///
+/// `serde(default)` 可处理缺失字段,但单个字段类型错误会让 Serde 拒绝整个结构体。
+/// 此 schema 允许加载器逐字段检查。可选字段只填入 schema(不填入兜底值),这样类型错误
+/// 会回落到 `None`,与运行时“未配置”语义一致。
+/// `serde(default)` handles missing fields, but Serde rejects a whole struct when one field
+/// has the wrong TOML type. The schema below lets the loader inspect fields independently.
+/// Optional fields are populated only in the schema (not in the fallback value), so a type
+/// error still falls back to `None` where that is the runtime meaning of an omitted field.
+fn config_type_schema() -> toml::Value {
+    let mut schema = Config::default();
+    for profile in &mut schema.mouse.profiles {
+        profile.device.vendor_id = Some(0);
+        profile.device.product_id = Some(0);
+        profile.button_mappings_enabled = Some(true);
+    }
+    schema.mouse.reverse_scroll = Some(false);
+    schema.mouse.scroll_mode = Some("default".to_string());
+    schema.mouse.line_count = Some(3);
+    schema.mouse.pointer = Some(PointerSection::default());
+
+    let mut value = toml::to_string(&schema)
+        .expect("default config must serialize")
+        .parse::<toml::Value>()
+        .expect("serialized default config must parse as TOML");
+
+    // 旧版鼠标字段序列化时刻意跳过,但读取旧文件时仍需接受,所以必须加入类型 schema。
+    // Legacy mouse fields are intentionally skipped during serialization, but they are still
+    // accepted while reading old files and therefore need to be present in the type schema.
+    if let Some(mouse) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("mouse"))
+        .and_then(toml::Value::as_table_mut)
+    {
+        mouse.insert("reverse_scroll".into(), toml::Value::Boolean(false));
+        mouse.insert("scroll_mode".into(), toml::Value::String("default".into()));
+        mouse.insert("line_count".into(), toml::Value::Integer(3));
+        mouse.insert(
+            "pointer".into(),
+            toml::Value::Table(
+                [("disable_acceleration".into(), toml::Value::Boolean(false))]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+    }
+    value
+}
+
+fn toml_value_type(value: &toml::Value) -> &'static str {
+    match value {
+        toml::Value::String(_) => "string",
+        toml::Value::Integer(_) => "integer",
+        toml::Value::Float(_) => "float",
+        toml::Value::Boolean(_) => "boolean",
+        toml::Value::Datetime(_) => "datetime",
+        toml::Value::Array(_) => "array",
+        toml::Value::Table(_) => "table",
+    }
+}
+
+fn toml_path_child(path: &str, key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{path}.{key}")
+    }
+}
+
+fn toml_path_index(path: &str, index: usize) -> String {
+    format!("{path}[{index}]")
+}
+
+fn type_error(path: &str, actual: &toml::Value, expected: &toml::Value) -> String {
+    let field = if path.is_empty() { "<root>" } else { path };
+    tf(
+        "errors.config_field_type_invalid",
+        &[
+            ("field", field),
+            ("actual", toml_value_type(actual)),
+            ("expected", toml_value_type(expected)),
+        ],
+    )
+}
+
+/// 按预期类型形状清洗一个 TOML 值,同时保留同级的合法字段。
+/// Sanitize one TOML value against the expected type shape while preserving valid siblings.
+///
+/// 返回 `None` 表示错误的可选字段应被移除,让 Serde 应用正常默认值。未知字段原样保留,
+/// 由 Serde 忽略。
+/// The return value is `None` when a malformed optional field should be omitted so Serde can
+/// apply its normal default. Unknown fields remain untouched and are ignored by Serde.
+fn sanitize_config_value(
+    actual: &toml::Value,
+    fallback: Option<&toml::Value>,
+    schema: &toml::Value,
+    path: &str,
+    errors: &mut Vec<String>,
+) -> Option<toml::Value> {
+    // `button_mappings` 是动态字符串 map,空的默认表无法描述 value 类型,因此逐项校验,
+    // 不添加虚假的 schema key。
+    // `button_mappings` is a dynamic string map, so an empty default table cannot describe its
+    // value type. Validate each value explicitly instead of adding a fake schema key.
+    if path.ends_with(".button_mappings") {
+        let Some(table) = actual.as_table() else {
+            errors.push(type_error(path, actual, schema));
+            return fallback.cloned();
+        };
+        let mut sanitized = table.clone();
+        for (key, value) in table {
+            if !value.is_str() {
+                let entry_path = format!("{path}[{key}]");
+                let expected = toml::Value::String(String::new());
+                errors.push(type_error(&entry_path, value, &expected));
+                sanitized.remove(key);
+            }
+        }
+        return Some(toml::Value::Table(sanitized));
+    }
+
+    match (actual, schema) {
+        (toml::Value::Table(actual_table), toml::Value::Table(schema_table)) => {
+            let fallback_table = fallback.and_then(toml::Value::as_table);
+            let mut sanitized = actual_table.clone();
+            for (key, schema_child) in schema_table {
+                let Some(actual_child) = actual_table.get(key) else {
+                    continue;
+                };
+                let child_path = toml_path_child(path, key);
+                let fallback_child = fallback_table.and_then(|table| table.get(key));
+                match sanitize_config_value(
+                    actual_child,
+                    fallback_child,
+                    schema_child,
+                    &child_path,
+                    errors,
+                ) {
+                    Some(value) => {
+                        sanitized.insert(key.clone(), value);
+                    }
+                    None => {
+                        sanitized.remove(key);
+                    }
+                }
+            }
+            Some(toml::Value::Table(sanitized))
+        }
+        (toml::Value::Array(actual_array), toml::Value::Array(schema_array)) => {
+            let Some(schema_item) = schema_array.first() else {
+                return Some(toml::Value::Array(actual_array.clone()));
+            };
+            let fallback_array = fallback.and_then(toml::Value::as_array);
+            let mut sanitized = Vec::with_capacity(actual_array.len());
+            for (index, actual_item) in actual_array.iter().enumerate() {
+                let item_path = toml_path_index(path, index);
+                let item_fallback = if path == "mouse.profiles" && index > 0 {
+                    // 只有第一个 profile 是显式通配默认档。设备档中的错误可选字段必须省略,
+                    // 不能意外继承通配档的具体值。
+                    // Only the first profile is the explicit wildcard default. A malformed
+                    // optional field in a per-device profile must fall back to omission, not
+                    // accidentally inherit the wildcard profile's concrete value.
+                    None
+                } else {
+                    fallback_array.and_then(|items| items.first())
+                };
+                if let Some(value) = sanitize_config_value(
+                    actual_item,
+                    item_fallback,
+                    schema_item,
+                    &item_path,
+                    errors,
+                ) {
+                    sanitized.push(value);
+                }
+            }
+            Some(toml::Value::Array(sanitized))
+        }
+        (toml::Value::String(_), toml::Value::String(_))
+        | (toml::Value::Integer(_), toml::Value::Integer(_))
+        | (toml::Value::Boolean(_), toml::Value::Boolean(_))
+        | (toml::Value::Datetime(_), toml::Value::Datetime(_))
+        | (toml::Value::Float(_), toml::Value::Float(_))
+        // TOML integers are accepted by Serde when loading an f64 field.
+        | (toml::Value::Integer(_), toml::Value::Float(_)) => Some(actual.clone()),
+        _ => {
+            errors.push(type_error(path, actual, schema));
+            fallback.cloned()
+        }
+    }
+}
+
+/// 解析并清洗一个配置文件。布尔值表示修复/迁移后的结果是否应写回磁盘;语法错误刻意
+/// 返回 `false`,以保留原文件供诊断。
+/// Parse and sanitize one config file. The boolean says whether the repaired/migrated value
+/// should be persisted back to disk; syntax errors deliberately return `false` to preserve the
+/// original file for diagnosis.
+fn parse_config_content(content: &str) -> (Config, Vec<String>, bool) {
+    let actual = match content.parse::<toml::Value>() {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                Config::default(),
+                vec![tf(
+                    "errors.config_read_failed",
+                    &[("error", &error.to_string())],
+                )],
+                false,
+            );
+        }
+    };
+    let defaults = toml::to_string(&Config::default())
+        .expect("default config must serialize")
+        .parse::<toml::Value>()
+        .expect("serialized default config must parse as TOML");
+    let schema = config_type_schema();
+    let mut errors = Vec::new();
+    let sanitized = sanitize_config_value(&actual, Some(&defaults), &schema, "", &mut errors)
+        .unwrap_or(defaults.clone());
+    let mut loaded: Config = match sanitized.try_into() {
+        Ok(config) => config,
+        Err(error) => {
+            // 防御未来新增字段导致 schema 不匹配;正常路径应保证每个字段都可独立反序列化。
+            // This is a defensive guard for a schema mismatch introduced by a future field.
+            // The normal path above should make every field independently deserializable.
+            errors.push(tf(
+                "errors.config_read_failed",
+                &[("error", &error.to_string())],
+            ));
+            return (Config::default(), errors, false);
+        }
+    };
+
+    let mut needs_persist = !errors.is_empty();
+    needs_persist |= loaded.mouse.migrate_legacy();
+    needs_persist |= loaded.migrate_card_text_style();
+    errors.extend(loaded.validate());
+    if !errors.is_empty() {
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        (merged, errors, true)
+    } else {
+        (loaded, errors, needs_persist)
+    }
+}
+
 fn config_path() -> std::path::PathBuf {
     config_path_in(&std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
 }
@@ -1254,31 +1500,11 @@ impl Config {
     fn load_or_default_from(path: &std::path::Path) -> (Self, Vec<String>) {
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                let mut loaded: Config = toml::from_str(&content).unwrap_or_default();
-                // 迁移旧 [mouse] 扁平字段为 profiles(幂等);返回值 = 是否有改动,
-                // 有改动才写回磁盘(新格式配置不再因 serde 兜底值误触发写盘)。
-                // Migrate legacy flat [mouse] fields into profiles (idempotent); the return
-                // value signals a change so only actual changes rewrite the file (new-format
-                // configs no longer trigger a rewrite via serde-backfilled defaults).
-                let mut needs_persist = loaded.mouse.migrate_legacy();
-                // 卡片文字样式迁移(见 migrate_card_text_style):有改动才写盘。
-                // Card text style migration (see migrate_card_text_style): persist only on change.
-                needs_persist |= loaded.migrate_card_text_style();
-                let errs = loaded.validate();
-                if !errs.is_empty() {
-                    // Start from defaults, merge only valid fields
-                    let mut merged = Config::default();
-                    merged.merge_valid(loaded, &errs);
-                    let _ = merged.save_to(path);
-                    (merged, errs)
-                } else {
-                    // 迁移后写回磁盘(一次性,之后 migrate_legacy 不再改动)。
-                    // Persist the migrated config (one-time; migrate_legacy is a no-op afterwards).
-                    if needs_persist {
-                        let _ = loaded.save_to(path);
-                    }
-                    (loaded, Vec::new())
+                let (loaded, errs, needs_persist) = parse_config_content(&content);
+                if needs_persist {
+                    let _ = loaded.save_to(path);
                 }
+                (loaded, errs)
             }
             Err(_) => {
                 // File doesn't exist — write defaults
@@ -1295,23 +1521,11 @@ impl Config {
         let path = config_path();
         match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let mut loaded: Config = toml::from_str(&content).unwrap_or_default();
-                let mut needs_persist = loaded.mouse.migrate_legacy();
-                // 卡片文字样式迁移(见 migrate_card_text_style):有改动才写盘。
-                // Card text style migration (see migrate_card_text_style): persist only on change.
-                needs_persist |= loaded.migrate_card_text_style();
-                let errs = loaded.validate();
-                if !errs.is_empty() {
-                    let mut merged = Config::default();
-                    merged.merge_valid(loaded, &errs);
-                    let _ = merged.save_to(&path);
-                    (merged, errs)
-                } else {
-                    if needs_persist {
-                        let _ = loaded.save_to(&path);
-                    }
-                    (loaded, Vec::new())
+                let (loaded, errs, needs_persist) = parse_config_content(&content);
+                if needs_persist {
+                    let _ = loaded.save_to(&path);
                 }
+                (loaded, errs)
             }
             Err(e) => {
                 let defaults = Config::default();
@@ -1972,6 +2186,139 @@ glass_tint = "zzzzzzzz"
             cfg.appearance.glass_tint,
             Config::default().appearance.glass_tint
         );
+    }
+
+    #[test]
+    fn load_type_error_keeps_valid_siblings_and_persists_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[appearance]
+theme = "dark"
+corner_radius = "not-a-number"
+
+[keyboard]
+modifier = "option"
+"#,
+        )
+        .unwrap();
+
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.iter().any(|error| {
+            error.contains("appearance.corner_radius") && error.contains("string")
+        }));
+        assert_eq!(cfg.appearance.theme, "dark");
+        assert_eq!(cfg.keyboard.modifier, "option");
+        assert_eq!(
+            cfg.appearance.corner_radius,
+            Config::default().appearance.corner_radius
+        );
+
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("theme = \"dark\""));
+        assert!(!persisted.contains("not-a-number"));
+    }
+
+    #[test]
+    fn load_type_errors_are_isolated_per_mouse_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[mouse]
+enabled = true
+
+[[mouse.profiles]]
+reverse_scroll = true
+scroll_mode = 123
+line_count = 5
+
+[[mouse.profiles]]
+device_vendor_id = 1133
+device_product_id = 17492
+scroll_mode = 456
+reverse_scroll = false
+"#,
+        )
+        .unwrap();
+
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs
+            .iter()
+            .any(|error| error.contains("mouse.profiles[0].scroll_mode")));
+        assert!(errs
+            .iter()
+            .any(|error| error.contains("mouse.profiles[1].scroll_mode")));
+        assert!(cfg.mouse.enabled);
+        assert_eq!(cfg.mouse.profiles.len(), 2);
+        assert_eq!(cfg.mouse.profiles[0].reverse_scroll, Some(true));
+        assert_eq!(cfg.mouse.profiles[0].line_count, Some(5));
+        assert_eq!(cfg.mouse.profiles[0].scroll_mode, None);
+        assert_eq!(cfg.mouse.profiles[1].device.vendor_id, Some(1133));
+        assert_eq!(cfg.mouse.profiles[1].device.product_id, Some(17492));
+        assert_eq!(cfg.mouse.profiles[1].reverse_scroll, Some(false));
+        assert_eq!(cfg.mouse.profiles[1].scroll_mode, None);
+    }
+
+    #[test]
+    fn load_type_error_drops_only_invalid_button_mapping_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[mouse]
+
+[[mouse.profiles]]
+[mouse.profiles.button_mappings]
+"2" = "cmd+v"
+"3" = 42
+"#,
+        )
+        .unwrap();
+
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs
+            .iter()
+            .any(|error| error.contains("mouse.profiles[0].button_mappings[3]")));
+        let mappings = &cfg.mouse.profiles[0].button_mappings;
+        assert_eq!(mappings.get("2").map(String::as_str), Some("cmd+v"));
+        assert!(!mappings.contains_key("3"));
+    }
+
+    #[test]
+    fn load_syntax_error_reports_without_overwriting_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[appearance\ntheme = \"dark\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(!errs.is_empty());
+        assert_eq!(cfg.appearance.theme, Config::default().appearance.theme);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn load_unknown_fields_keeps_known_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[appearance]
+theme = "dark"
+future_option = "kept for forward compatibility"
+"#,
+        )
+        .unwrap();
+
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty());
+        assert_eq!(cfg.appearance.theme, "dark");
     }
 
     #[test]
