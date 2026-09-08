@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, RwLock};
 
 use crate::i18n::{self, tf};
 
@@ -1419,21 +1420,62 @@ pub fn parse_hex8(s: &str) -> u32 {
     u32::from_str_radix(s, 16).unwrap_or(0)
 }
 
-impl Config {
-    /// 把当前配置序列化为 TOML 写回 `~/.config/oh-my-tab/config.toml`。
-    /// Serialize this config to TOML and write it back to the config file.
-    pub fn save(&self) -> Result<(), String> {
-        let path = config_path();
-        self.save_to(&path)
-    }
+static ATOMIC_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// 使用同目录临时文件 + fsync + rename 原子替换配置,避免半写文件或跨线程覆盖。
+/// Write through a same-directory temp file, fsync, and atomically rename it into place so a
+/// reader never observes a partial file and stale writers cannot truncate a newer file.
+fn atomic_write(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("config path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("create config directory {}: {}", parent.display(), e))?;
+
+    let serial = ATOMIC_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config"),
+        std::process::id(),
+        serial
+    ));
+    let result = (|| {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+            .map_err(|e| format!("create {}: {}", temp.display(), e))?;
+        file.write_all(contents)
+            .map_err(|e| format!("write {}: {}", temp.display(), e))?;
+        file.sync_all()
+            .map_err(|e| format!("sync {}: {}", temp.display(), e))?;
+        drop(file);
+        std::fs::rename(&temp, path).map_err(|e| format!("replace {}: {}", path.display(), e))?;
+        // Best effort directory sync: the rename is durable on filesystems that support it.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+impl Config {
     /// 序列化到指定路径(纯逻辑,测试注入临时目录)。
     /// Serialize to a given path (pure logic; tests inject a temp dir).
     fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
         let toml_str =
             toml::to_string_pretty(self).map_err(|e| format!("serialize config: {}", e))?;
-        std::fs::write(path, toml_str).map_err(|e| format!("write {}: {}", path.display(), e))?;
-        Ok(())
+        atomic_write(path, toml_str.as_bytes())
     }
 
     pub fn load_or_default() -> (Self, Vec<String>) {
@@ -1509,23 +1551,18 @@ impl Config {
             Err(_) => {
                 // File doesn't exist — write defaults
                 let defaults = Config::default();
-                if let Ok(toml_str) = toml::to_string_pretty(&defaults) {
-                    let _ = std::fs::write(path, toml_str);
-                }
+                let _ = defaults.save_to(path);
                 (defaults, Vec::new())
             }
         }
     }
 
-    pub fn reload() -> (Self, Vec<String>) {
+    pub fn reload() -> (Self, Vec<String>, bool) {
         let path = config_path();
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let (loaded, errs, needs_persist) = parse_config_content(&content);
-                if needs_persist {
-                    let _ = loaded.save_to(&path);
-                }
-                (loaded, errs)
+                (loaded, errs, needs_persist)
             }
             Err(e) => {
                 let defaults = Config::default();
@@ -1535,6 +1572,7 @@ impl Config {
                         "errors.config_read_failed",
                         &[("error", &e.to_string())],
                     )],
+                    false,
                 )
             }
         }
@@ -1573,9 +1611,18 @@ pub fn effective_glass_tint() -> String {
 const PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
 
 enum PersistMsg {
-    Schedule,
-    Flush,
+    Schedule {
+        snapshot: Config,
+        revision: u64,
+    },
+    Flush {
+        snapshot: Config,
+        revision: u64,
+        ack: Option<mpsc::Sender<Result<(), String>>>,
+    },
 }
+
+static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
 
 /// 后台落盘线程的消息通道(懒启动;主线程控制回调与恢复默认都会发消息)。
 /// The background persistence thread's channel (lazy; control callbacks and restores send).
@@ -1590,7 +1637,7 @@ impl LazySender {
         Self(std::sync::Mutex::new(None))
     }
 
-    fn send(&self, msg: PersistMsg) {
+    fn send(&self, msg: PersistMsg) -> Result<(), String> {
         let mut guard = self.0.lock().unwrap();
         if guard.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1603,7 +1650,11 @@ impl LazySender {
         // 发送失败仅意味着线程已退出(接收端关闭),丢消息比 panic 安全。
         // A send failure only means the thread exited (receiver dropped); dropping the
         // message is safer than panicking.
-        let _ = guard.as_ref().unwrap().send(msg);
+        guard
+            .as_ref()
+            .unwrap()
+            .send(msg)
+            .map_err(|_| "config persistence writer stopped".to_string())
     }
 }
 
@@ -1613,56 +1664,126 @@ impl LazySender {
 /// quiet); Flush writes immediately. It always snapshots the newest CONFIG, so bursts
 /// naturally coalesce into a single write.
 fn persist_thread(rx: std::sync::mpsc::Receiver<PersistMsg>) {
+    let mut persisted_revision = 0;
     while let Ok(msg) = rx.recv() {
         match msg {
-            PersistMsg::Flush => persist_now(),
-            PersistMsg::Schedule => {
+            PersistMsg::Flush {
+                snapshot,
+                revision,
+                ack,
+            } => {
+                let result = persist_if_newer(snapshot, revision, &mut persisted_revision);
+                if let Some(ack) = ack {
+                    let _ = ack.send(result);
+                }
+            }
+            PersistMsg::Schedule { snapshot, revision } => {
+                let mut latest = (snapshot, revision);
                 loop {
                     match rx.recv_timeout(PERSIST_DEBOUNCE) {
-                        // 窗口内又有新修改:继续等下一个静默期(合并连续变更)。
-                        // Another change inside the window: keep waiting for quiet (bursts
-                        // coalesce).
-                        Ok(PersistMsg::Schedule) => continue,
-                        // 窗口中途收到 Flush:直接落盘(与静默期结束同等效果)。
-                        // A mid-window Flush: write immediately (same as quiet elapsed).
-                        Ok(PersistMsg::Flush) => break,
+                        Ok(PersistMsg::Schedule { snapshot, revision }) => {
+                            if revision > latest.1 {
+                                latest = (snapshot, revision);
+                            }
+                        }
+                        Ok(PersistMsg::Flush {
+                            snapshot,
+                            revision,
+                            ack,
+                        }) => {
+                            if revision > latest.1 {
+                                latest = (snapshot, revision);
+                            }
+                            let result = persist_if_newer(
+                                latest.0.clone(),
+                                latest.1,
+                                &mut persisted_revision,
+                            );
+                            if let Some(ack) = ack {
+                                let _ = ack.send(result);
+                            }
+                            break;
+                        }
                         // 超时 = 静默期结束,落盘一次。
                         // Timeout = quiet period elapsed; write once.
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let _ = persist_if_newer(
+                                latest.0.clone(),
+                                latest.1,
+                                &mut persisted_revision,
+                            );
+                            break;
+                        }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                persist_now();
             }
         }
     }
 }
 
-/// 把当前 CONFIG 立即写入磁盘(落盘线程内执行;失败只记日志)。
-/// Write the current CONFIG to disk immediately (runs on the persist thread; failures log).
-fn persist_now() {
-    let cfg = CONFIG.read().unwrap().clone();
-    if let Err(e) = cfg.save() {
-        eprintln!("[config] persist failed: {}", e);
+fn persist_if_newer(
+    snapshot: Config,
+    revision: u64,
+    persisted_revision: &mut u64,
+) -> Result<(), String> {
+    if revision <= *persisted_revision {
+        return Ok(());
     }
+    let result = snapshot.save_to(&config_path());
+    if result.is_ok() {
+        *persisted_revision = revision;
+    }
+    result
+}
+
+fn snapshot_with_revision() -> (Config, u64) {
+    let snapshot = CONFIG.read().unwrap().clone();
+    let revision = CONFIG_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
+    (snapshot, revision)
 }
 
 /// 设置修改后调用:调度一次防抖落盘(立即生效与磁盘写入分离,避免拖动/连打时大量 IO)。
 /// Call after a setting change: schedule one debounced disk write (immediate effect and disk
 /// persistence are decoupled to avoid burst IO while dragging/typing).
 pub fn schedule_config_persist() {
-    PERSIST_TX.send(PersistMsg::Schedule);
+    let (snapshot, revision) = snapshot_with_revision();
+    if let Err(e) = PERSIST_TX.send(PersistMsg::Schedule { snapshot, revision }) {
+        eprintln!("[config] persist schedule failed: {}", e);
+    }
 }
 
-/// 立即落盘一次(恢复默认 / 失焦提交等需要确定性写入的路径)。
-/// Persist once immediately (restore defaults / blur-commit paths that need a durable write).
+/// 将一次立即写请求送入 writer(恢复默认 / 失焦提交等需要尽快落盘的路径)。
+/// Queue an immediate write request for the writer (restore-default / blur-commit paths).
 pub fn persist_config_now() {
-    PERSIST_TX.send(PersistMsg::Flush);
+    let (snapshot, revision) = snapshot_with_revision();
+    if let Err(e) = PERSIST_TX.send(PersistMsg::Flush {
+        snapshot,
+        revision,
+        ack: None,
+    }) {
+        eprintln!("[config] persist request failed: {}", e);
+    }
+}
+
+/// 同步等待最新配置写入完成,用于退出前保证防抖队列已落盘。
+/// Synchronously wait until the newest configuration snapshot is durable, used before quitting.
+pub fn flush_config_sync() -> Result<(), String> {
+    let (snapshot, revision) = snapshot_with_revision();
+    let (ack_tx, ack_rx) = mpsc::channel();
+    PERSIST_TX.send(PersistMsg::Flush {
+        snapshot,
+        revision,
+        ack: Some(ack_tx),
+    })?;
+    ack_rx
+        .recv()
+        .map_err(|_| "config persistence writer stopped".to_string())?
 }
 
 /// Reload config from disk and apply. Returns validation errors (empty = success).
 pub fn reload_config() -> Vec<String> {
-    let (new_cfg, errs) = Config::reload();
+    let (new_cfg, errs, needs_persist) = Config::reload();
     let old_cfg = CONFIG.read().unwrap().clone();
     if let Ok(mut cfg) = CONFIG.write() {
         *cfg = new_cfg.clone();
@@ -1672,6 +1793,12 @@ pub fn reload_config() -> Vec<String> {
         &new_cfg,
         crate::runtime_config::ConfigChangeSource::Reload,
     );
+    if needs_persist {
+        // Reload 回调不直接写磁盘;修复/迁移后的快照进入统一 writer。
+        // Reload callbacks never write synchronously; repaired/migrated snapshots go through
+        // the single writer.
+        persist_config_now();
+    }
     errs
 }
 
@@ -2087,6 +2214,21 @@ mod tests {
         assert_eq!(d.device.vendor_id, Some(1133));
         assert_eq!(d.device.product_id, Some(17492));
         assert_eq!(d.reverse_scroll, Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_sets_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save_to(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("[appearance]"));
     }
 
     #[test]

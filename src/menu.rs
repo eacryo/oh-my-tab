@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
-use crate::config::{persist_config_now, reload_config, CONFIG};
+use crate::config::{flush_config_sync, persist_config_now, reload_config, CONFIG};
 use crate::event_monitor::SHORTCUT_IS_CMD;
 use crate::ffi::*;
 use crate::i18n::t;
@@ -207,6 +207,9 @@ pub(crate) fn refresh_menu_titles() {
 
 pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     log_info!("User quit via menu bar.");
+    if let Err(e) = flush_config_sync() {
+        log_info!("Config flush before quit failed: {}", e);
+    }
     // 退出前恢复指针加速设置(否则系统鼠标保持线性,直到用户手动重置)。
     // Restore pointer acceleration settings before quitting (otherwise the mouse stays
     // linear until the user resets it manually).
