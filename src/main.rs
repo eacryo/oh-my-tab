@@ -893,6 +893,14 @@ fn on_window_control_inner(arg: *mut c_void) {
     }
 }
 
+/// 跨屏窗口移动的延迟 frame 校验入口。
+/// Main-thread entry for deferred cross-display frame verification.
+extern "C" fn on_display_move_retry(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
+    callback_guard::void("on_display_move_retry", || {
+        window_management::on_display_move_retry(arg)
+    });
+}
+
 /// 主线程:执行快捷操作(bridge 投递过来的动作编号)。
 /// Main thread: run one quick action (an action id delivered by the bridge).
 extern "C" fn on_quick_action(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
@@ -1331,6 +1339,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleWindowControl:),
             on_window_control as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleDisplayMoveRetry:),
+            on_display_move_retry as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(

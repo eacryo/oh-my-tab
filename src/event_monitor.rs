@@ -21,8 +21,8 @@ pub enum GlobalEvent {
     // Window control: Option+arrow (the direction crosses to the main thread via the bounded
     // input aggregator).
     WindowControl(crate::window_management::Direction),
-    // 显示器移动:Option+Shift+左右键(方向经有界输入聚合器传到主线程)。
-    // Display move: Option+Shift+Left/Right (the direction crosses to the main thread via the
+    // 显示器移动:Option+Shift+四方向键(方向经有界输入聚合器传到主线程)。
+    // Display move: Option+Shift+arrow keys (the direction crosses to the main thread via the
     // bounded input aggregator).
     WindowDisplayMove(crate::window_management::Direction),
     // 快捷操作:Option+I/E/D/L(动作编号经有界输入聚合器传到主线程)。

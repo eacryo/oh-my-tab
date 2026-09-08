@@ -1,11 +1,11 @@
-//! 窗口控制模块:Option+方向键模拟 Windows 的 Win+方向键窗口管理,Option+Shift+左右键跨显示器移动。
-//! 独立 session 层 event tap(专用线程)拦截 Option+方向键及 Option+Shift+左右键,事件经有界输入聚合器
+//! 窗口控制模块:Option+方向键模拟 Windows 的 Win+方向键窗口管理,Option+Shift+方向键跨显示器移动。
+//! 独立 session 层 event tap(专用线程)拦截 Option+方向键及 Option+Shift+方向键,事件经有界输入聚合器
 //! (GlobalEvent -> performSelectorOnMainThread)投递到主线程执行 AX 移动/缩放/最小化。
 //! 状态(普通/最大化/上下半屏/左右半屏/四分屏)按当前 frame 与目标矩形匹配推断,无需持久状态;
 //! 「原尺寸」在首次从普通状态进入 snap 时按 CGWindowID 记录,供后续恢复逻辑使用。
 //!
 //! Window control module: Option+arrow keys emulate Windows' Win+arrow window management, while
-//! Option+Shift+Left/Right moves a window to an adjacent display. A dedicated session-level event
+//! Option+Shift+arrow keys move a window to an adjacent display. A dedicated session-level event
 //! tap (own thread) intercepts these combinations; events travel
 //! through the bounded input aggregator (GlobalEvent -> performSelectorOnMainThread) and run on the main
 //! thread, which moves/resizes/minimizes windows via AX. Snap states (normal/maximized/top-bottom
@@ -14,7 +14,7 @@
 //! persisted; the "original size" is recorded per CGWindowID when a normal window first snaps.
 
 use objc2::runtime::AnyObject;
-use objc2::{class, msg_send};
+use objc2::{class, msg_send, sel};
 use objc2_foundation::NSRect;
 
 use crate::event_monitor::GlobalEvent;
@@ -32,9 +32,10 @@ use crate::ffi::{
 use crate::window_collector::{ax_window_cgwid, cf_string_new, cf_to_rust_string};
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 // ========== 键盘事件常量 / keyboard event constants ==========
 // 见 CGEventTypes.h;键码来自 Carbon HIToolbox Events.h。
@@ -48,8 +49,8 @@ const K_VK_LEFT: u16 = 123;
 const K_VK_RIGHT: u16 = 124;
 const K_VK_DOWN: u16 = 125;
 const K_VK_UP: u16 = 126;
-// 修饰键位掩码:Option 为基础;Shift 仅用于跨显示器左右移动,Command/Control 组合透传。
-// Modifier masks: Option is required; Shift selects cross-display left/right movement, while
+// 修饰键位掩码:Option 为基础;Shift 用于跨显示器移动,Command/Control 组合透传。
+// Modifier masks: Option is required; Shift selects cross-display movement, while
 // Command/Control combinations pass through.
 const K_FLAG_OPTION: CGEventFlags = 0x00080000;
 const K_FLAG_COMMAND: CGEventFlags = 0x00100000;
@@ -305,9 +306,9 @@ pub(crate) fn infer_state(frame: AxRect, visible: AxRect) -> SnapState {
 }
 
 /// 找 dir 方向上的相邻屏幕(纯函数,单测覆盖)。
-/// 左:完全在当前屏左侧的屏里取最靠右的;右:完全在右侧的屏里取最靠左的。
-/// Find the neighbor screen in `dir` (pure; unit-tested). Left: the rightmost screen fully to
-/// the left of the current one; Right: the leftmost fully to the right.
+/// 水平按 x 轴、垂直按 y 轴选择完全位于当前屏对应方向的最近屏幕。
+/// Find the neighbor screen in `dir` (pure; unit-tested). Select the nearest screen fully in the
+/// requested direction, using the x axis horizontally and the y axis vertically.
 pub(crate) fn neighbor_screen(
     screens: &[ScreenGeometry],
     cur: usize,
@@ -318,6 +319,12 @@ pub(crate) fn neighbor_screen(
         a.frame
             .x
             .partial_cmp(&b.frame.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let by_y = |a: &ScreenGeometry, b: &ScreenGeometry| {
+        a.frame
+            .y
+            .partial_cmp(&b.frame.y)
             .unwrap_or(std::cmp::Ordering::Equal)
     };
     match dir {
@@ -333,7 +340,20 @@ pub(crate) fn neighbor_screen(
             .filter(|(i, s)| *i != cur && s.frame.x >= c.x + c.w - FRAME_EPSILON)
             .min_by(|a, b| by_x(a.1, b.1))
             .map(|(i, _)| i),
-        _ => None,
+        // AX 坐标 y 向下,因此上方屏幕的底边不超过当前屏顶边。
+        // AX coordinates grow downward, so an upper screen ends no lower than the current top.
+        Direction::Up => screens
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| *i != cur && s.frame.y + s.frame.h <= c.y + FRAME_EPSILON)
+            .max_by(|a, b| by_y(a.1, b.1))
+            .map(|(i, _)| i),
+        Direction::Down => screens
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| *i != cur && s.frame.y >= c.y + c.h - FRAME_EPSILON)
+            .min_by(|a, b| by_y(a.1, b.1))
+            .map(|(i, _)| i),
     }
 }
 
@@ -479,6 +499,19 @@ fn translated_frame(frame: AxRect, from: AxRect, to: AxRect) -> AxRect {
     AxRect { x, y, w, h }
 }
 
+fn display_move_staging_frame(
+    state: SnapState,
+    frame: AxRect,
+    from: AxRect,
+    to: AxRect,
+    target: AxRect,
+) -> AxRect {
+    match state {
+        SnapState::Normal | SnapState::Minimized => target,
+        _ => translated_frame(frame, from, to),
+    }
+}
+
 /// 计算跨显示器移动后的目标 frame。
 /// 最大化及各类 snap 状态在目标屏幕保持同一状态;普通窗口保留大小和相对位置。
 /// Compute the target frame for a cross-display move. Maximized and snapped states keep the
@@ -530,12 +563,199 @@ fn display_move_enabled(dir: Direction) -> bool {
         .map(|c| {
             c.window_control.enabled
                 && match dir {
+                    Direction::Up => c.window_control.display_up,
+                    Direction::Down => c.window_control.display_down,
                     Direction::Left => c.window_control.display_left,
                     Direction::Right => c.window_control.display_right,
-                    Direction::Up | Direction::Down => false,
                 }
         })
         .unwrap_or(false)
+}
+
+/// 跨屏 frame 写入后的延迟校验任务。跨屏时 AppKit/目标 App 可能在 AX setter 返回成功后
+/// 仍异步调整窗口尺寸，因此任务必须带窗口身份和 token，避免迟到回调改动新窗口。
+/// A deferred cross-display frame verification. AppKit/the target app may resize asynchronously
+/// after AX setters report success, so the job carries window identity and a token to prevent a
+/// late callback from touching a different or newer window.
+#[derive(Clone, Copy)]
+struct PendingDisplayMove {
+    token: u64,
+    pid: i32,
+    cgwid: u32,
+    state: SnapState,
+    target_screen_frame: AxRect,
+    target_frame: AxRect,
+    attempt: u8,
+    created_at: Instant,
+}
+
+static PENDING_DISPLAY_MOVE: LazyLock<Mutex<Option<PendingDisplayMove>>> =
+    LazyLock::new(|| Mutex::new(None));
+static NEXT_DISPLAY_MOVE_TOKEN: AtomicU64 = AtomicU64::new(1);
+const MAX_DISPLAY_MOVE_RETRIES: u8 = 2;
+const DISPLAY_MOVE_PENDING_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn pending_display_state(
+    pid: i32,
+    cgwid: Option<u32>,
+    current_screen: usize,
+    screens: &[ScreenGeometry],
+) -> Option<SnapState> {
+    let cgwid = cgwid?;
+    let job = PENDING_DISPLAY_MOVE.lock().unwrap().as_ref().copied()?;
+    if job.pid != pid
+        || job.cgwid != cgwid
+        || job.created_at.elapsed() > DISPLAY_MOVE_PENDING_TTL
+        || !rect_close(job.target_screen_frame, screens.get(current_screen)?.frame)
+    {
+        return None;
+    }
+    Some(job.state)
+}
+
+fn cancel_pending_display_move(pid: i32, cgwid: Option<u32>) {
+    let Some(cgwid) = cgwid else {
+        return;
+    };
+    let mut pending = PENDING_DISPLAY_MOVE.lock().unwrap();
+    if pending
+        .as_ref()
+        .is_some_and(|job| job.pid == pid && job.cgwid == cgwid)
+    {
+        *pending = None;
+    }
+}
+
+fn update_pending_attempt(token: u64, attempt: u8) -> bool {
+    let mut pending = PENDING_DISPLAY_MOVE.lock().unwrap();
+    let Some(job) = pending.as_mut() else {
+        return false;
+    };
+    if job.token != token {
+        return false;
+    }
+    job.attempt = attempt;
+    true
+}
+
+fn clear_pending_display_move(token: u64) {
+    let mut pending = PENDING_DISPLAY_MOVE.lock().unwrap();
+    if pending.as_ref().is_some_and(|job| job.token == token) {
+        *pending = None;
+    }
+}
+
+fn schedule_display_move_retry(token: u64, delay: f64) {
+    let Some(ctrl) = crate::CONTROLLER.lock().unwrap().map(|target| target.0) else {
+        clear_pending_display_move(token);
+        return;
+    };
+    unsafe {
+        let token: *mut AnyObject = msg_send![
+            class!(NSNumber),
+            numberWithUnsignedLongLong: token
+        ];
+        let _: () = msg_send![
+            ctrl,
+            performSelector: sel!(handleDisplayMoveRetry:),
+            withObject: token,
+            afterDelay: delay
+        ];
+    }
+}
+
+/// 延迟校验跨屏 frame；只在主线程执行，且最多进行两次重试。
+/// Verify a cross-display frame after a delay on the main thread, with at most two retries.
+pub(crate) fn on_display_move_retry(arg: *mut c_void) {
+    if arg.is_null() {
+        return;
+    }
+    let token: u64 = unsafe { msg_send![arg as *mut AnyObject, unsignedLongLongValue] };
+    let Some(job) = PENDING_DISPLAY_MOVE.lock().unwrap().as_ref().copied() else {
+        return;
+    };
+    if job.token != token {
+        return;
+    }
+
+    unsafe {
+        let app = AXUIElementCreateApplication(job.pid);
+        if app.is_null() {
+            clear_pending_display_move(token);
+            return;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.3);
+        let win = copy_attribute(app, K_AX_FOCUSED_WINDOW);
+        CFRelease(app);
+        let Some(win) = win else {
+            clear_pending_display_move(token);
+            return;
+        };
+        let same_window = ax_window_cgwid(win) == Some(job.cgwid);
+        let is_fullscreen = copy_string(win, K_AX_SUBROLE)
+            .is_some_and(|subrole| subrole == K_AX_SUBROLE_FULL_SCREEN);
+        let Some(actual) = read_frame(win) else {
+            CFRelease(win);
+            clear_pending_display_move(token);
+            return;
+        };
+        let screens = screens_in_ax_space();
+        let target_exists = screens
+            .iter()
+            .any(|screen| rect_close(screen.frame, job.target_screen_frame));
+        if !same_window || is_fullscreen || !target_exists {
+            log_debug!(
+                "[winctl] display move retry cancelled: token={} same_window={} fullscreen={} target_exists={}",
+                token,
+                same_window,
+                is_fullscreen,
+                target_exists
+            );
+            CFRelease(win);
+            clear_pending_display_move(token);
+            return;
+        }
+        if rect_close(actual, job.target_frame) {
+            log_debug!(
+                "[winctl] display move settled: token={} attempts={} frame={:?}",
+                token,
+                job.attempt,
+                actual
+            );
+            CFRelease(win);
+            clear_pending_display_move(token);
+            return;
+        }
+        if job.attempt >= MAX_DISPLAY_MOVE_RETRIES {
+            log_info!(
+                "[winctl] display move remained mismatched after retries: token={} target={:?} actual={:?}",
+                token,
+                job.target_frame,
+                actual
+            );
+            CFRelease(win);
+            clear_pending_display_move(token);
+            return;
+        }
+        let next_attempt = job.attempt + 1;
+        log_debug!(
+            "[winctl] display move retry: token={} attempt={} target={:?} actual={:?}",
+            token,
+            next_attempt,
+            job.target_frame,
+            actual
+        );
+        let _ = set_frame(win, job.target_frame);
+        CFRelease(win);
+        if update_pending_attempt(token, next_attempt) {
+            let delay = if next_attempt == MAX_DISPLAY_MOVE_RETRIES {
+                0.10
+            } else {
+                0.04
+            };
+            schedule_display_move_retry(token, delay);
+        }
+    }
 }
 
 /// 主线程:执行一次窗口控制(bridge 投递过来的方向)。
@@ -580,6 +800,7 @@ pub(crate) fn apply_direction(dir: Direction) {
             }
         }
         let cgwid = ax_window_cgwid(win);
+        cancel_pending_display_move(pid, cgwid);
         let Some(frame) = read_frame(win) else {
             log_debug!("[winctl] failed to read window frame");
             CFRelease(win);
@@ -655,6 +876,7 @@ pub(crate) fn apply_display_move(dir: Direction) {
                 return;
             }
         }
+        let cgwid = ax_window_cgwid(win);
         let Some(frame) = read_frame(win) else {
             log_debug!("[winctl] failed to read window frame for display move");
             CFRelease(win);
@@ -667,11 +889,21 @@ pub(crate) fn apply_display_move(dir: Direction) {
             return;
         }
         let cur_screen = screen_index_for(frame, &screens);
+        let pending_state = if minimized {
+            None
+        } else {
+            pending_display_state(pid, cgwid, cur_screen, &screens)
+        };
         let state = if minimized {
             SnapState::Normal
+        } else if let Some(pending_state) = pending_state {
+            pending_state
         } else {
             infer_state(frame, screens[cur_screen].visible)
         };
+        if pending_state.is_none() {
+            cancel_pending_display_move(pid, cgwid);
+        }
         let Some((target_screen, target_frame)) =
             display_move_target(state, frame, cur_screen, dir, &screens)
         else {
@@ -695,11 +927,47 @@ pub(crate) fn apply_display_move(dir: Direction) {
             state,
             target_frame
         );
-        if !set_frame(win, target_frame) {
-            log_info!(
-                "[winctl] display move frame rejected: target={:?}",
+        // 对需要保持 snap 状态的窗口先只迁移当前尺寸,让目标 App 先完成屏幕归属切换。
+        // For snapped windows, first move the current size to the destination so the target app
+        // can settle its screen association before we apply the destination snap rectangle.
+        let staging_frame = display_move_staging_frame(
+            state,
+            frame,
+            screens[cur_screen].visible,
+            screens[target_screen].visible,
+            target_frame,
+        );
+        let applied = set_frame(win, staging_frame);
+        if !applied {
+            log_debug!(
+                "[winctl] display move staging frame mismatch; deferred target may be scheduled: cgwid={:?} staging={:?} target={:?}",
+                cgwid,
+                staging_frame,
                 target_frame
             );
+        }
+        if let Some(cgwid) = cgwid {
+            if !matches!(state, SnapState::Normal | SnapState::Minimized) {
+                let token = NEXT_DISPLAY_MOVE_TOKEN.fetch_add(1, Ordering::Relaxed);
+                let job = PendingDisplayMove {
+                    token,
+                    pid,
+                    cgwid,
+                    state,
+                    target_screen_frame: screens[target_screen].frame,
+                    target_frame,
+                    attempt: 0,
+                    created_at: Instant::now(),
+                };
+                // 即使第一次读取已经匹配,也延迟校验一次,防止目标 App 在 AX 返回后异步覆盖尺寸。
+                // Verify once even after an immediate match, because the target app may asynchronously
+                // overwrite the frame after the AX call returns.
+                {
+                    let mut pending = PENDING_DISPLAY_MOVE.lock().unwrap();
+                    *pending = Some(job);
+                }
+                schedule_display_move_retry(token, if applied { 0.06 } else { 0.03 });
+            }
         }
         CFRelease(win);
     }
@@ -1061,11 +1329,11 @@ fn runloop_static() -> &'static Mutex<Option<CFRunLoopRef>> {
     &RUNLOOP.get_or_init(|| RunLoopMutex(Mutex::new(None))).0
 }
 
-/// tap 回调:关心 Option+方向键及 Option+Shift+左右键。启用时吞掉 keyDown/keyUp 并把
+/// tap 回调:关心 Option+方向键及 Option+Shift+四方向键。启用时吞掉 keyDown/keyUp 并把
 /// 非自动重复的 keyDown 投递给主线程;关闭时全部透传(功能关闭 = 组合键还给系统)。
 /// 自己是前台 App 时也透传,设置窗口文本框的按词移动不受影响。
 ///
-/// The tap callback: handles Option+arrows and Option+Shift+Left/Right. When enabled it
+/// The tap callback: handles Option+arrows and Option+Shift+arrow keys. When enabled it
 /// swallows matching keyDown/keyUp and forwards non-autorepeat keyDowns to the main thread;
 /// when disabled everything passes through (a disabled feature returns the combo to the
 /// system). Also passes through when we are the frontmost app, keeping move-by-word intact in
@@ -1088,11 +1356,6 @@ unsafe extern "C" fn window_control_tap_callback(
         return event;
     }
     let display_move = flags & K_FLAG_SHIFT != 0;
-    // 只为左右键提供跨显示器移动;Option+Shift+上下仍交给系统/应用处理。
-    // Cross-display movement is only defined for left/right; pass Option+Shift+Up/Down through.
-    if display_move && !matches!(dir, Direction::Left | Direction::Right) {
-        return event;
-    }
     // 本应用合成的组合键(鼠标映射 Key Press post 到 HID 层后会回到 session tap):
     // 必须透传,否则映射了 Option+方向键的侧键会被这里劫持。
     // Our own synthesized combos (mouse Key Press mappings post at HID level and loop back
@@ -1101,7 +1364,12 @@ unsafe extern "C" fn window_control_tap_callback(
     if CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA) == SYNTHETIC_MARKER {
         return event;
     }
-    if !direction_enabled(dir) {
+    let enabled = if display_move {
+        display_move_enabled(dir)
+    } else {
+        direction_enabled(dir)
+    };
+    if !enabled {
         return event;
     }
     let (_name, pid) = crate::ffi::frontmost_app_info();
@@ -1199,8 +1467,8 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        infer_state, neighbor_screen, plan, snap_frames, AxRect, Direction, Plan, ScreenGeometry,
-        SnapState,
+        display_move_staging_frame, display_move_target, infer_state, neighbor_screen, plan,
+        snap_frames, AxRect, Direction, Plan, ScreenGeometry, SnapState,
     };
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> AxRect {
@@ -1215,6 +1483,16 @@ mod tests {
             visible: rect(x, 25.0, 1920.0, 1055.0),
         };
         vec![mk(-1920.0), mk(0.0), mk(1920.0)]
+    }
+
+    /// 三块屏幕:主屏 (0,1112),上方屏 y=0,下方屏 y=1112(AX 坐标 y 向下)。
+    /// Three stacked screens: primary at (0,1112), upper at y=0, lower at y=1112 (AX y grows down).
+    fn stacked_screens() -> Vec<ScreenGeometry> {
+        let mk = |y: f64| ScreenGeometry {
+            frame: rect(0.0, y, 1920.0, 1112.0),
+            visible: rect(0.0, y + 25.0, 1920.0, 1055.0),
+        };
+        vec![mk(0.0), mk(1112.0), mk(2224.0)]
     }
 
     #[test]
@@ -1443,5 +1721,57 @@ mod tests {
         assert_eq!(neighbor_screen(&screens, 0, Direction::Left), None);
         assert_eq!(neighbor_screen(&screens, 2, Direction::Right), None);
         assert_eq!(neighbor_screen(&screens, 1, Direction::Up), None);
+    }
+
+    #[test]
+    fn neighbor_screens_support_vertical_layouts() {
+        let screens = stacked_screens();
+        assert_eq!(neighbor_screen(&screens, 1, Direction::Up), Some(0));
+        assert_eq!(neighbor_screen(&screens, 1, Direction::Down), Some(2));
+        assert_eq!(neighbor_screen(&screens, 0, Direction::Up), None);
+        assert_eq!(neighbor_screen(&screens, 2, Direction::Down), None);
+    }
+
+    #[test]
+    fn display_move_preserves_snap_state_on_vertical_layouts() {
+        let screens = stacked_screens();
+        let current = snap_frames(screens[1].visible);
+        let target = snap_frames(screens[0].visible);
+        assert_eq!(
+            display_move_target(
+                SnapState::Maximized,
+                current.max,
+                1,
+                Direction::Up,
+                &screens,
+            ),
+            Some((0, target.max))
+        );
+        assert_eq!(
+            display_move_target(
+                SnapState::BottomRight,
+                current.bottom_right,
+                1,
+                Direction::Up,
+                &screens,
+            ),
+            Some((0, target.bottom_right))
+        );
+    }
+
+    #[test]
+    fn display_move_stages_snapped_windows_before_resizing() {
+        let from = rect(0.0, 30.0, 1470.0, 923.0);
+        let to = rect(0.0, 30.0, 1920.0, 1050.0);
+        let current = from;
+        let target = snap_frames(to).max;
+        assert_eq!(
+            display_move_staging_frame(SnapState::Maximized, current, from, to, target),
+            current
+        );
+        assert_eq!(
+            display_move_staging_frame(SnapState::Normal, current, from, to, target),
+            target
+        );
     }
 }
