@@ -23,14 +23,14 @@ use crate::event_tap::{
 use crate::log_debug;
 
 use super::{
-    capture_allowed, enqueue_job_for_generation, CFStringCompare, CapturePriority, ConstPtr,
+    capture_allowed, enqueue_job_for_generation, CFStringCompare, CapturePriority, RetainedCf,
     BASE_TARGET_PX_H, CACHE, CAPTURE_STATE, STARTUP_PREWARM_MAX,
 };
 use crate::ffi::{
     make_nsstring, AXObserverAddNotification, AXObserverCreate, AXObserverGetRunLoopSource,
-    AXUIElementCreateApplication, AXUIElementGetPid, AxObserverRef, CFRelease,
+    AXUIElementCreateApplication, AXUIElementGetPid, AxObserverHandle, AxObserverRef, CFRelease,
     CFRunLoopRemoveSource, CFRunLoopSourceContext, CFRunLoopSourceCreate, CFRunLoopSourceSignal,
-    CFRunLoopWakeUp,
+    CFRunLoopWakeUp, RunLoopHandle, RunLoopSourceHandle,
 };
 
 // ========== 常驻监视线程(AXObserver + 自有 CFRunLoop) ==========
@@ -38,19 +38,15 @@ use crate::ffi::{
 static STARTED: AtomicBool = AtomicBool::new(false);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// 裸 CFRunLoopRef 的 Send+Sync 包装(static 存储要求;指针只在观察者线程解引用,
-/// 其他线程仅用于 CFRunLoopWakeUp 唤醒——CFWakeUp 线程安全)。
-/// Send+Sync wrapper for the raw CFRunLoopRef (required for statics). The pointer
-/// is only dereferenced on the observer thread; other threads merely use it for
-/// CFRunLoopWakeUp, which is thread-safe.
-struct RunLoopSlot(Mutex<Option<*mut c_void>>);
-unsafe impl Send for RunLoopSlot {}
-unsafe impl Sync for RunLoopSlot {}
+/// CFRunLoop 的跨线程句柄只允许 WakeUp；run-loop source 仍由观察者线程管理。
+/// Cross-thread CFRunLoop handle: only WakeUp is allowed; source management stays on the observer thread.
+struct RunLoopSlot(Mutex<Option<RunLoopHandle>>);
 static OBSERVER_RL: RunLoopSlot = RunLoopSlot(Mutex::new(None));
 /// 命令注入源(观察者线程创建后存入,任意线程 Signal 唤醒命令处理)。
 /// The command-injection source (stashed once the observer thread creates it; any
 /// thread signals it to wake command processing).
-static CMD_SOURCE: RunLoopSlot = RunLoopSlot(Mutex::new(None));
+struct SourceSlot(Mutex<Option<RunLoopSourceHandle>>);
+static CMD_SOURCE: SourceSlot = SourceSlot(Mutex::new(None));
 
 /// 观察者线程命令:安装/卸载某 PID 的 observer(NSWorkspace 通知跨线程转发而来)。
 /// Observer-thread commands: install/uninstall a PID's observer (forwarded across
@@ -67,7 +63,7 @@ static CMD_RX: OnceLock<flume::Receiver<ObsCmd>> = OnceLock::new();
 /// Installed observers: pid -> (AXObserverRef, runloop source); removed as a pair.
 /// Raw pointers again -- needs the Send+Sync wrapper (inserts/removes happen on
 /// the observer thread; lookups from any thread).
-struct InstalledMap(Mutex<HashMap<i32, (AxObserverRef, *mut c_void)>>);
+struct InstalledMap(Mutex<HashMap<i32, (AxObserverHandle, RunLoopSourceHandle)>>);
 unsafe impl Send for InstalledMap {}
 unsafe impl Sync for InstalledMap {}
 static INSTALLED: LazyLock<InstalledMap> =
@@ -87,12 +83,12 @@ static INSTALLED: LazyLock<InstalledMap> =
 /// fail -- verified empirically), but AX notification names compare by STRING
 /// VALUE, so the literal "AXWindowCreated" is semantically identical for both
 /// registration and callback matching.
-static AX_WINDOW_CREATED: LazyLock<ConstPtr> = LazyLock::new(|| unsafe {
+static AX_WINDOW_CREATED: LazyLock<RetainedCf<c_void>> = LazyLock::new(|| unsafe {
     // make_nsstring +1 常驻(静态持有);转 *const c_void 与 CF API 对接。
     // make_nsstring +1 lives for the process lifetime (statically held); cast
     // to *const c_void for the CF APIs.
     let s = make_nsstring("AXWindowCreated");
-    ConstPtr(std::mem::transmute::<*mut AnyObject, *const c_void>(s))
+    RetainedCf::from_retained(std::mem::transmute::<*mut AnyObject, *const c_void>(s))
 });
 
 /// 启动常驻监视线程(幂等)。线程职责:为现有运行中 App 装 AXObserver → 对已有
@@ -167,9 +163,9 @@ pub(crate) fn start() {
             let rl = CFRunLoopGetCurrent();
             if !src.is_null() {
                 CFRunLoopAddSource(rl, src, kCFRunLoopDefaultMode);
-                *CMD_SOURCE.0.lock().unwrap() = Some(src);
+                *CMD_SOURCE.0.lock().unwrap() = Some(RunLoopSourceHandle(src));
             }
-            *OBSERVER_RL.0.lock().unwrap() = Some(rl);
+            *OBSERVER_RL.0.lock().unwrap() = Some(RunLoopHandle(rl));
             // source 发布前极小窗口内到达的命令没有机会 signal；主动清空一次补上。
             // Commands arriving in the tiny window before source publication could not
             // signal it, so explicitly drain once after publication.
@@ -213,8 +209,8 @@ unsafe extern "C" fn drain_obs_commands(_info: *mut c_void) {
             ObsCmd::Remove(pid) => {
                 if let Some((obs, src)) = INSTALLED.0.lock().unwrap().remove(&pid) {
                     let rl = CFRunLoopGetCurrent();
-                    CFRunLoopRemoveSource(rl, src, kCFRunLoopDefaultMode);
-                    CFRelease(obs as *const c_void);
+                    CFRunLoopRemoveSource(rl, src.0, kCFRunLoopDefaultMode);
+                    CFRelease(obs.0 as *const c_void);
                 }
                 // 该 App 的缓存帧一并驱逐:死 App 的帧不会再被展示,占着 LRU 槽位
                 // 只会挤掉活窗口的帧。
@@ -298,14 +294,14 @@ fn signal_observer_runloop() {
     let src = CMD_SOURCE.0.lock().unwrap();
     if let Some(src) = *src {
         unsafe {
-            CFRunLoopSourceSignal(src);
+            CFRunLoopSourceSignal(src.0);
         }
     }
     drop(src);
     let rl = OBSERVER_RL.0.lock().unwrap();
     if let Some(rl) = *rl {
         unsafe {
-            CFRunLoopWakeUp(rl);
+            CFRunLoopWakeUp(rl.0);
         }
     }
 }
@@ -357,7 +353,7 @@ unsafe fn install_observer_for_pid(pid: i32) {
         CFRelease(obs as *const c_void);
         return;
     }
-    let err = AXObserverAddNotification(obs, app_el, AX_WINDOW_CREATED.0, std::ptr::null_mut());
+    let err = AXObserverAddNotification(obs, app_el, AX_WINDOW_CREATED.ptr, std::ptr::null_mut());
     if err != 0 {
         log_debug!(
             "[thumb] add kAXWindowCreated failed for pid={} err={}",
@@ -372,7 +368,11 @@ unsafe fn install_observer_for_pid(pid: i32) {
     let rl = CFRunLoopGetCurrent();
     CFRunLoopAddSource(rl, src, kCFRunLoopDefaultMode);
     CFRelease(app_el); // observer 已持有所需引用 / the observer holds what it needs
-    INSTALLED.0.lock().unwrap().insert(pid, (obs, src));
+    INSTALLED
+        .0
+        .lock()
+        .unwrap()
+        .insert(pid, (AxObserverHandle(obs), RunLoopSourceHandle(src)));
 }
 
 /// 启动预热直接复用 AppState 已完成 AX 配对的 MRU 快照，避免按 PID 再做一轮 AX
@@ -456,7 +456,7 @@ unsafe extern "C" fn thumb_ax_observer(
     // Notification names compare by string value (the literal equals the system
     // constant; see AX_WINDOW_CREATED).
     if !notification.is_null()
-        && unsafe { CFStringCompare(notification, AX_WINDOW_CREATED.0, 0) } == 0
+        && unsafe { CFStringCompare(notification, AX_WINDOW_CREATED.ptr, 0) } == 0
     {
         let mut wid: u32 = 0;
         if crate::window_collector::ax_window_cgwid(element).is_some_and(|resolved| {

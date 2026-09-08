@@ -5,12 +5,11 @@
 //! centralized here: only short, user-visible paths are promoted and background work is
 //! deliberately left at Utility/Background QoS.
 
-use crate::ffi::{make_nsstring, release_obj, CFRelease, ObjPtr};
+use crate::ffi::{make_nsstring, release_obj, CFRelease, MainThreadSlot, ObjPtr};
 use crate::{class, log_debug, msg_send};
 use objc2::runtime::AnyObject;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
 
 /// Darwin QoS classes from `<sys/qos.h>`.
 ///
@@ -63,7 +62,7 @@ const NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: u64 =
 /// The activity token is owned by this process and only touched on the main thread.  The extra
 /// retain is intentional because `beginActivityWithOptions:reason:` returns an autoreleased
 /// token when called through the raw MRC bridge used by this project.
-static SWITCHER_ACTIVITY: LazyLock<Mutex<Option<ObjPtr>>> = LazyLock::new(|| Mutex::new(None));
+static SWITCHER_ACTIVITY: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static SWITCHER_INTERACTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Tell App Nap/sudden-termination policy that a user-visible switcher operation is in flight.
@@ -97,7 +96,7 @@ pub(crate) fn begin_switcher_activity() {
             log_debug!("[perf] retaining switcher activity token failed");
             return;
         }
-        *slot = Some(ObjPtr(retained));
+        *slot = Some(ObjPtr::new(retained));
     }
 }
 

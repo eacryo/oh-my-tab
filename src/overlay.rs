@@ -87,19 +87,19 @@ const CARD_CLOSE_ANIMATION_DURATION: f64 = 0.16;
 
 // ========== 浮窗相关全局状态 / overlay global state ==========
 
-pub(crate) static OVERLAY_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
-pub(crate) static CONTAINER: Mutex<Option<ObjPtr>> = Mutex::new(None);
+pub(crate) static OVERLAY_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(crate) static CONTAINER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 持久的卡片 document view;滚动时只移动 CONTAINER 的 bounds,不重建卡片树。
 /// Persistent card document view; scrolling moves CONTAINER bounds instead of rebuilding cards.
-pub(crate) static CARD_DOCUMENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
-pub(crate) static STATUS_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
+pub(crate) static CARD_DOCUMENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(crate) static STATUS_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 缩略图溢出时显示的原生竖向滚动条。
 /// Native vertical scroller shown when the thumbnail rows overflow the viewport.
-pub(crate) static THUMB_SCROLLER: Mutex<Option<ObjPtr>> = Mutex::new(None);
+pub(crate) static THUMB_SCROLLER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// macOS 26+ 的 NSGlassEffectView 指针(用于设置热重载时重新应用玻璃属性)。
 /// Pointer to the NSGlassEffectView on macOS 26+ (used to re-apply glass properties on hot reload).
-pub(crate) static GLASS_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
-pub(crate) static CARD_CLASS: Mutex<Option<ObjClassPtr>> = Mutex::new(None);
+pub(crate) static GLASS_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(crate) static CARD_CLASS: Mutex<Option<StaticClass>> = Mutex::new(None);
 
 /// 注册 OhMyTabCardView 卡片类(此前在 main.rs 注册、本模块使用,归属已收回)。
 /// Register the OhMyTabCardView class (registration used to live in main.rs while
@@ -123,7 +123,7 @@ pub(crate) fn register_card_class() {
             types_v_obj.as_ptr(),
         );
         objc_registerClassPair(cls);
-        *CARD_CLASS.lock().unwrap() = Some(ObjClassPtr(cls as *const objc2::runtime::AnyClass));
+        *CARD_CLASS.lock().unwrap() = Some(StaticClass(cls as *const objc2::runtime::AnyClass));
     }
 }
 /// Maps card view pointer (as usize) -> card index, avoiding property accessor
@@ -2199,7 +2199,7 @@ pub(crate) fn install_click_to_cancel() {
 /// overlay 专用的通知观察者单例(只承载 resign-key 回调)。
 /// Singleton notification observer for the overlay (carries the resign-key callback only).
 unsafe fn overlay_observer() -> *mut AnyObject {
-    static OBSERVER: OnceLock<ObjPtr> = OnceLock::new();
+    static OBSERVER: OnceLock<CallbackTarget> = OnceLock::new();
     OBSERVER
         .get_or_init(|| {
             let name = CString::new("OhMyTabOverlayObserver").unwrap();
@@ -2214,7 +2214,7 @@ unsafe fn overlay_observer() -> *mut AnyObject {
             );
             objc_registerClassPair(cls);
             let inst: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-            ObjPtr(inst)
+            CallbackTarget::new(inst)
         })
         .0
 }

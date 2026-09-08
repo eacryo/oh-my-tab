@@ -923,12 +923,12 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             );
             let _: () = msg_send![ve, addSubview: ok];
             release_obj(ok);
-            *EDIT_PANEL.lock().unwrap() = Some(ObjPtr(panel));
-            *EDIT_PANEL_BTN_LABEL.lock().unwrap() = Some(ObjPtr(btn_label));
-            *EDIT_PANEL_ACTION.lock().unwrap() = Some(ObjPtr(action));
-            *EDIT_PANEL_COMBO_BTN.lock().unwrap() = Some(ObjPtr(combo_btn));
-            *EDIT_PANEL_COMBO_LABEL.lock().unwrap() = Some(ObjPtr(combo_label));
-            *EDIT_PANEL_OK.lock().unwrap() = Some(ObjPtr(ok));
+            *EDIT_PANEL.lock().unwrap() = Some(ObjPtr::new(panel));
+            *EDIT_PANEL_BTN_LABEL.lock().unwrap() = Some(ObjPtr::new(btn_label));
+            *EDIT_PANEL_ACTION.lock().unwrap() = Some(ObjPtr::new(action));
+            *EDIT_PANEL_COMBO_BTN.lock().unwrap() = Some(ObjPtr::new(combo_btn));
+            *EDIT_PANEL_COMBO_LABEL.lock().unwrap() = Some(ObjPtr::new(combo_label));
+            *EDIT_PANEL_OK.lock().unwrap() = Some(ObjPtr::new(ok));
             panel
         };
         // 更新面板显示。
@@ -957,7 +957,7 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
         layer_set_background(dim_layer, hex_to_cg_color(0x00000040));
         let _: () = msg_send![content, addSubview: dim];
         release_obj(dim);
-        *EDIT_DIM.lock().unwrap() = Some(ObjPtr(dim));
+        *EDIT_DIM.lock().unwrap() = Some(ObjPtr::new(dim));
         let _: () = msg_send![panel, orderFrontRegardless];
     }
 }

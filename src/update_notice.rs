@@ -30,7 +30,9 @@ use objc2::{class, msg_send, sel};
 use std::ffi::c_void;
 use std::sync::{Mutex, Once, OnceLock};
 
-use crate::ffi::{bundle_info_string, make_nsstring, nsstring_to_rust, objc_msgSend, release_obj};
+use crate::ffi::{
+    bundle_info_string, make_nsstring, nsstring_to_rust, objc_msgSend, release_obj, CallbackTarget,
+};
 use crate::i18n::tf;
 use crate::log_debug;
 
@@ -212,7 +214,7 @@ unsafe extern "C" fn will_present_notification(
 /// Register the delegate class/instance once (center.delegate is weak, so the instance
 /// must outlive the call).
 unsafe fn ensure_delegate_registered() -> *mut AnyObject {
-    static DELEGATE: OnceLock<crate::ffi::ObjPtr> = OnceLock::new();
+    static DELEGATE: OnceLock<CallbackTarget> = OnceLock::new();
     DELEGATE_REGISTERED.call_once(|| {
         let name = std::ffi::CString::new("OhMyTabUpdateNoticeDelegate").unwrap();
         let superclass = class!(NSObject) as *const _ as *mut AnyObject;
@@ -252,7 +254,7 @@ unsafe fn ensure_delegate_registered() -> *mut AnyObject {
         );
         crate::ffi::objc_registerClassPair(cls);
         let obj: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-        let _ = DELEGATE.set(crate::ffi::ObjPtr(obj));
+        let _ = DELEGATE.set(CallbackTarget::new(obj));
     });
     DELEGATE.get().map(|p| p.0).unwrap_or(std::ptr::null_mut())
 }

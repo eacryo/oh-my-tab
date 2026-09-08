@@ -74,26 +74,13 @@ use crate::ffi::{
     CFArrayGetCount, CFArrayGetValueAtIndex, CFRelease, CFRetain, CFStringCompare,
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGBitmapContextGetData,
     CGColorSpaceCreateDeviceRGB, CGContextDrawImage, CGImageGetHeight, CGImageGetWidth,
-    CGPreflightScreenCaptureAccess, CGRect, CGRequestScreenCaptureAccess,
+    CGPreflightScreenCaptureAccess, CGRect, CGRequestScreenCaptureAccess, RetainedCf,
 };
 use crate::skylight;
 use crate::{log_debug, log_info};
 
 mod pregen;
 pub(crate) use pregen::{app_launched, app_terminated, start};
-
-/// 裸 CF 指针的 Send+Sync 包装(值只在 LazyLock 初始化时解析一次,只读使用)。
-/// Send+Sync wrapper for the raw CF pointer (resolved once at LazyLock init,
-/// read-only afterwards).
-struct ConstPtr(*const c_void);
-unsafe impl Send for ConstPtr {}
-unsafe impl Sync for ConstPtr {}
-impl Clone for ConstPtr {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl Copy for ConstPtr {}
 
 /// 缩略图缓存键:(进程 ID, CG 窗口 ID)。两者组合才能防 PID 复用串图。
 /// Thumbnail cache key: (process id, CG window id). The pair guards against
@@ -1585,7 +1572,7 @@ unsafe fn downscale_cgimage(src: *const c_void, tw: u32, th: u32) -> *const c_vo
     if tw == 0 || th == 0 {
         return std::ptr::null();
     }
-    let cs = DEVICE_RGB_COLOR_SPACE.0;
+    let cs = DEVICE_RGB_COLOR_SPACE.ptr;
     let ctx = CGBitmapContextCreate(
         std::ptr::null_mut(),
         tw as usize,
@@ -1648,8 +1635,8 @@ static CONNECTION_ID: OnceLock<u32> = OnceLock::new();
 /// Device RGB 色彩空间不可变且线程安全,进程级复用;降采样与空白判定共用。
 /// The Device RGB color space is immutable and thread-safe; one process-wide
 /// instance is shared by downscaling and blank analysis.
-static DEVICE_RGB_COLOR_SPACE: LazyLock<ConstPtr> =
-    LazyLock::new(|| ConstPtr(unsafe { CGColorSpaceCreateDeviceRGB() }));
+static DEVICE_RGB_COLOR_SPACE: LazyLock<RetainedCf<c_void>> =
+    LazyLock::new(|| unsafe { RetainedCf::from_retained(CGColorSpaceCreateDeviceRGB()) });
 
 /// 空白判定的采样最长边:把帧重绘到 ≤64px 的 RGBA 小位图再统计,单帧开销微秒级。
 /// Sampling longest edge for blank analysis: the frame is redrawn into a small
@@ -1798,7 +1785,7 @@ unsafe fn frame_blankness(img: *const c_void, w_px: u32, h_px: u32) -> Option<bo
         sh,
         8,
         sw * 4,
-        DEVICE_RGB_COLOR_SPACE.0,
+        DEVICE_RGB_COLOR_SPACE.ptr,
         BITMAP_PREMULTIPLIED_LAST,
     );
     if ctx.is_null() {

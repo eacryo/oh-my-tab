@@ -189,7 +189,8 @@ pub(super) extern "C" fn clip_poll_tick(_self: *mut c_void, _cmd: Sel, _timer: *
 /// pasteboard once immediately.
 pub(crate) fn start() {
     unsafe {
-        let timer_holder = POLL_TIMER.get_or_init(|| Mutex::new(ObjPtr(std::ptr::null_mut())));
+        let timer_holder =
+            POLL_TIMER.get_or_init(|| MainThreadSlot::new(ObjPtr::new(std::ptr::null_mut())));
         let mut guard = timer_holder.lock().unwrap();
         if !guard.0.is_null() {
             return; // 已在跑 / already running
@@ -246,7 +247,7 @@ pub(crate) fn start() {
             userInfo: std::ptr::null::<AnyObject>(),
             repeats: true
         ];
-        *guard = ObjPtr(timer);
+        *guard = ObjPtr::new(timer);
         log_debug!(
             "Clipboard history polling started (every {}s).",
             POLL_INTERVAL
@@ -257,7 +258,8 @@ pub(crate) fn start() {
 /// 停止轮询(幂等)。/ Stop polling (idempotent).
 pub(crate) fn stop() {
     unsafe {
-        let timer_holder = POLL_TIMER.get_or_init(|| Mutex::new(ObjPtr(std::ptr::null_mut())));
+        let timer_holder =
+            POLL_TIMER.get_or_init(|| MainThreadSlot::new(ObjPtr::new(std::ptr::null_mut())));
         let mut guard = timer_holder.lock().unwrap();
         if !guard.0.is_null() {
             let _: () = msg_send![guard.0, invalidate];
@@ -265,7 +267,7 @@ pub(crate) fn stop() {
             // (over-release 会崩溃);invalidate 后 runloop 自行释放。
             // scheduledTimerWithTimeInterval: returns +0 (owned by the run loop); it must
             // NOT be released (over-release crashes); invalidate lets the run loop release it.
-            *guard = ObjPtr(std::ptr::null_mut());
+            *guard = ObjPtr::new(std::ptr::null_mut());
             log_debug!("Clipboard history polling stopped.");
         }
     }

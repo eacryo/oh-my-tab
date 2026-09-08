@@ -8,15 +8,15 @@ use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::ffi::{cg_overlay_window_level, release_obj, ObjPtr};
+use crate::ffi::{cg_overlay_window_level, release_obj, CallbackTarget};
 
 const SPOTLIGHT_DIAMETER: f64 = 144.0;
 const MASK_ALPHA: f64 = 0.62;
 const POINTER_POLL_INTERVAL: f64 = 0.016;
 
 struct Locator {
-    window: ObjPtr,
-    content: ObjPtr,
+    window: CallbackTarget,
+    content: CallbackTarget,
 }
 
 static LOCATOR: OnceLock<Locator> = OnceLock::new();
@@ -153,8 +153,8 @@ unsafe fn create_locator() -> Locator {
     release_obj(content);
 
     Locator {
-        window: ObjPtr(panel),
-        content: ObjPtr(content),
+        window: CallbackTarget::new(panel),
+        content: CallbackTarget::new(content),
     }
 }
 

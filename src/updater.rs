@@ -7,7 +7,7 @@
 
 use crate::ffi::{
     bundle_info_string, class_addMethod, make_nsstring, objc_allocateClassPair, objc_msgSend,
-    objc_msgSendSuper, objc_registerClassPair, ObjPtr, ObjcSuper,
+    objc_msgSendSuper, objc_registerClassPair, CallbackTarget, ObjcSuper,
 };
 use crate::i18n::{t, tf};
 use crate::skylight;
@@ -103,7 +103,7 @@ unsafe impl Sync for CustomDriverClass {}
 
 static CUSTOM_DRIVER_CLASS: OnceLock<CustomDriverClass> = OnceLock::new();
 static CUSTOM_DRIVER_SUPERCLASS: OnceLock<usize> = OnceLock::new();
-static CHECK_LOADING_TIMER_TARGET: OnceLock<ObjPtr> = OnceLock::new();
+static CHECK_LOADING_TIMER_TARGET: OnceLock<CallbackTarget> = OnceLock::new();
 
 unsafe fn send_id(receiver: *mut AnyObject, selector: Sel) -> *mut AnyObject {
     type Fn = unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject;
@@ -649,7 +649,7 @@ unsafe fn check_loading_timer_target() -> *mut AnyObject {
             );
             objc_registerClassPair(cls);
             let target: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-            ObjPtr(target)
+            CallbackTarget::new(target)
         })
         .0
 }

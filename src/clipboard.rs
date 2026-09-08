@@ -67,7 +67,8 @@ use crate::event_tap::{
 };
 use crate::ffi::{
     class_addMethod, localtime_r, make_nsstring, nsstring_to_rust, objc_allocateClassPair,
-    objc_msgSendSuper, objc_registerClassPair, release_obj, CFRelease, ObjPtr, ObjcSuper, Tm,
+    objc_msgSendSuper, objc_registerClassPair, release_obj, CFRelease, CallbackTarget,
+    MainThreadSlot, ObjPtr, ObjcSuper, StaticClass, Tm,
 };
 use crate::hash::fnv1a64;
 use crate::i18n::{t, tf};
@@ -398,7 +399,7 @@ fn estimated_entry_bytes(entry: &ClipEntry) -> u64 {
 static LAST_CHANGE_COUNT: LazyLock<Mutex<i64>> = LazyLock::new(|| Mutex::new(-1));
 
 /// 轮询 timer(主线程)/ the polling timer (main thread).
-static POLL_TIMER: OnceLock<Mutex<ObjPtr>> = OnceLock::new();
+static POLL_TIMER: OnceLock<MainThreadSlot<ObjPtr>> = OnceLock::new();
 
 /// 浮窗是否可见 / whether the picker is visible.
 static PICKER_VISIBLE: AtomicBool = AtomicBool::new(false);
@@ -479,29 +480,29 @@ struct RowHoverViews {
     details: ObjPtr,
     del: ObjPtr,
 }
-static ROW_HOVER_VIEWS: Mutex<Vec<RowHoverViews>> = Mutex::new(Vec::new());
+static ROW_HOVER_VIEWS: MainThreadSlot<Vec<RowHoverViews>> = MainThreadSlot::new(Vec::new());
 
 /// 浮窗窗口 / the picker window.
-static PICKER_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static PICKER_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// 浮窗容器(接收键盘)/ the picker container (receives key events).
-static PICKER_CONTAINER: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static PICKER_CONTAINER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// 浮窗内容父视图(重建本地化 footer 时使用)。/ The picker content parent, used to rebuild
 /// the localized footer in place.
-static PICKER_CONTENT_PARENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static PICKER_CONTENT_PARENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// macOS 26+ 的 picker 玻璃视图,供设置页实时刷新 tint/style。
 /// The macOS 26+ picker glass view, used for live tint/style preview updates.
-static PICKER_GLASS: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static PICKER_GLASS: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// 每行按钮指针(按行索引,供高亮/点击)/ row button pointers by index (highlight / click).
-static ROW_BUTTONS: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static ROW_BUTTONS: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
 
 /// 每行背景块视图(与 ROW_BUTTONS 一一对应、同顺序;选中行不创建)。
 /// Per-row background tiles (one per entry, same order as ROW_BUTTONS; skipped for the
 /// selected row).
-static ROW_TILES: LazyLock<Mutex<Vec<ObjPtr>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static ROW_TILES: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
 
 /// 每行的实际行距(按钮高 + 间距,随换行行数变化)/ per-row pitch (button height + gap,
 /// varies with the wrapped line count).
@@ -509,15 +510,15 @@ static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec:
 
 /// 筛选 pill(全部/文本/图片/链接)按钮指针(与 tag 一一对应;切换/重建时重设样式)。
 /// The filter pills' button pointers (one per tag; restyled on change/rebuild).
-static FILTER_PILLS: Mutex<Vec<ObjPtr>> = Mutex::new(Vec::new());
+static FILTER_PILLS: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
 
 /// 清空历史按钮指针(语言切换时更新标题和按英文宽度重排)。
 /// The clear-history button, whose title and frame are relaid out on locale changes.
-static CLEAR_HISTORY_BUTTON: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static CLEAR_HISTORY_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// 筛选选中项的下划线小视图(共享单例,随选中项移动)。
 /// The active filter's underline (one shared view, moved under the active item).
-static FILTER_UNDERLINE: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static FILTER_UNDERLINE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 fn localized_filter_labels() -> [String; 5] {
     [
@@ -530,18 +531,18 @@ fn localized_filter_labels() -> [String; 5] {
 }
 
 /// 顶部搜索框指针 / the top search field.
-static SEARCH_FIELD: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static SEARCH_FIELD: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 搜索框清除叉号的悬停状态。/ The search field clear × hover state.
 static SEARCH_CLEAR_HOVERED: AtomicBool = AtomicBool::new(false);
 /// 覆盖自绘 × 的真实点击按钮;绘制仍由 cell 完成。
 /// The real click button over the hand-drawn ×; rendering remains in the cell.
-static SEARCH_CLEAR_BUTTON: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static SEARCH_CLEAR_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 居中占位的"放大镜 + 搜索提示"富文本(手绘;字段本身不设 placeholder 属性,避免
 /// 字段编辑器在聚焦空字段时把占位画在左侧)。
 /// The centered "magnifier + search hint" attributed string (hand-drawn; the field itself
 /// carries NO placeholder property, so the field editor never draws the placeholder
 /// left-aligned on a focused-but-empty field).
-static SEARCH_HINT_TEXT: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static SEARCH_HINT_TEXT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// 重建搜索框占位提示(放大镜 + "搜索剪贴板",15pt):占位不挂到字段上(字段编辑器
 /// 会在聚焦空字段时把它画在左侧),存入静态由 cell 手绘在字段左侧(见
@@ -605,7 +606,7 @@ unsafe fn rebuild_search_hint() {
     if let Some(old) = *hint {
         release_obj(old.0);
     }
-    *hint = Some(ObjPtr(ph_m));
+    *hint = Some(ObjPtr::new(ph_m));
 }
 
 /// 当前搜索词(空 = 不过滤)。/ The current search query (empty = no filtering).
@@ -625,16 +626,17 @@ unsafe fn rebuild_search_hint() {
 static PENDING_SAVE_AS: Mutex<Option<ClipEntry>> = Mutex::new(None);
 
 /// 滚动视图 / the scroll view.
-static SCROLL_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static SCROLL_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// 自定义滚动指示器 / the custom scroll indicator view.
-static SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// 详情文本滚动视图及其自定义指示器;图片详情没有滚动区域。
 /// The detail text scroll view and its custom indicator; image details have no scroll area.
-static DETAIL_SCROLL_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
-static DETAIL_SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
-static DETAIL_HORIZONTAL_SCROLL_INDICATOR: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static DETAIL_SCROLL_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DETAIL_SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DETAIL_HORIZONTAL_SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> =
+    MainThreadSlot::new(None);
 
 /// 自定义滚动指示器拖拽状态;系统滚动条被关闭后,NSView 不会自动处理拖拽。
 /// Drag state for the custom scroll indicator; once the system scroller is disabled, an
@@ -658,11 +660,11 @@ struct ScrollDragState {
 static SCROLL_DRAG: Mutex<Option<ScrollDragState>> = Mutex::new(None);
 
 /// 详情浮窗窗口(→ 展开详情)/ the detail panel window (right-arrow expands).
-static DETAIL_WINDOW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static DETAIL_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// macOS 26+ 的详情玻璃视图及其 inactive 补偿层。
 /// The macOS 26+ detail glass view and its inactive compensation layer.
-static DETAIL_GLASS: Mutex<Option<ObjPtr>> = Mutex::new(None);
-static DETAIL_GLASS_FILL_LAYER: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static DETAIL_GLASS: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DETAIL_GLASS_FILL_LAYER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// Keep clipboard panels on the same resolved appearance as the settings window and switcher.
 /// 让剪贴板面板与设置窗口、应用切换浮窗使用相同的最终外观。
@@ -681,7 +683,7 @@ unsafe fn apply_panel_appearance(window: *mut AnyObject) {
 /// 详情浮窗内容容器(文本滚动视图 / 图片视图所在容器;点击面板任意处 = 关闭)。
 /// The detail panel's content container (hosts the text scroll view / the image view;
 /// clicking anywhere on the panel dismisses it).
-static DETAIL_CONTENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static DETAIL_CONTENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 详情浮窗是否可见 / whether the detail panel is visible.
 /// 详情高清预览单槽:后台线程刚生成的 ≤1280px PNG(hash, bytes)。show_detail_for_sel
 /// 取数的第一优先级——命中即消费清空,避免再读盘;未命中走磁盘缓存/480 预览。
@@ -712,11 +714,11 @@ static DETAIL_PICKER_ORIGINAL_ORIGIN: Mutex<Option<NSPoint>> = Mutex::new(None);
 /// The detail panel's current text view (selectable; feeds "copy selection"). MUST be
 /// cleared when the old content is removed / the panel hides, or a dangling pointer would
 /// be dereferenced on Cmd+C (use-after-free).
-static DETAIL_TEXT_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static DETAIL_TEXT_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 当前启用软换行装饰的代码文本视图;箭头装饰只绘制,U+2028 分隔符由原文映射剥离。
 /// The code text view using soft-wrap decorations; arrows are drawing-only, while U+2028
 /// separators are stripped through the source map.
-static DETAIL_SOFT_WRAP_TEXT_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static DETAIL_SOFT_WRAP_TEXT_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 代码详情显示文本到原文的共享映射,保证 U+2028 和其它显示字符不会进入复制结果。
 /// Shared mapping from detail display text to source, ensuring U+2028 and other display-only
 /// characters never enter copied content.
@@ -750,7 +752,7 @@ static REBUILDING: AtomicBool = AtomicBool::new(false);
 ///   every change, so no event is lost.
 /// - NSWindowDidResignKeyNotification: the picker loses key (a click outside) -> hide.
 unsafe fn observer() -> *mut AnyObject {
-    static OBSERVER: OnceLock<ObjPtr> = OnceLock::new();
+    static OBSERVER: OnceLock<CallbackTarget> = OnceLock::new();
     OBSERVER
         .get_or_init(|| {
             let name = CString::new("OhMyTabClipboardObserver").unwrap();
@@ -875,7 +877,7 @@ unsafe fn observer() -> *mut AnyObject {
             // Instance alloc (+1): process-level singleton, never released (matches the
             // static's lifetime).
             let obj: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-            ObjPtr(obj)
+            CallbackTarget::new(obj)
         })
         .0
 }
@@ -1631,7 +1633,7 @@ unsafe fn register_pasteboard_observer() {
 /// The NSTimer target: NSTimer sends clipPollTick: to it. A tiny dynamic class forwards the
 /// method to clip_poll_tick; the class is registered once, and an instance is created per start.
 unsafe fn timer_target() -> *mut AnyObject {
-    static TIMER_CLS: OnceLock<ObjPtr> = OnceLock::new();
+    static TIMER_CLS: OnceLock<StaticClass> = OnceLock::new();
     let cls = *TIMER_CLS.get_or_init(|| {
         let name = CString::new("OhMyTabClipTimerTarget").unwrap();
         let superclass = class!(NSObject) as *const _ as *mut AnyObject;
@@ -1644,7 +1646,7 @@ unsafe fn timer_target() -> *mut AnyObject {
             types.as_ptr(),
         );
         objc_registerClassPair(cls);
-        ObjPtr(cls)
+        StaticClass(cls as *const objc2::runtime::AnyClass)
     });
     let obj: *mut AnyObject = msg_send![cls.0 as *const AnyObject, new];
     obj
@@ -2392,7 +2394,7 @@ unsafe fn ensure_detail_window() {
         let fill_layer: *mut AnyObject = msg_send![fill, layer];
         let compensation_hex = (tint_hex & 0xFFFF_FF00) | DETAIL_INACTIVE_GLASS_COMPENSATION_A;
         crate::ffi::layer_set_background(fill_layer, crate::ffi::hex_to_cg_color(compensation_hex));
-        *DETAIL_GLASS_FILL_LAYER.lock().unwrap() = Some(ObjPtr(fill_layer));
+        *DETAIL_GLASS_FILL_LAYER.lock().unwrap() = Some(ObjPtr::new(fill_layer));
         let _: () = msg_send![fill, setAutoresizingMask: 18u64];
         let _: () = msg_send![inner, addSubview: fill];
         release_obj(fill);
@@ -2406,7 +2408,7 @@ unsafe fn ensure_detail_window() {
             let _: () = msg_send![glass_layer, setCornerRadius: CORNER_R];
             let _: () = msg_send![glass_layer, setMasksToBounds: true];
         }
-        *DETAIL_GLASS.lock().unwrap() = Some(ObjPtr(glass));
+        *DETAIL_GLASS.lock().unwrap() = Some(ObjPtr::new(glass));
         release_obj(glass);
         content_parent = inner;
     } else {
@@ -2457,8 +2459,8 @@ unsafe fn ensure_detail_window() {
         content
     };
 
-    *DETAIL_CONTENT.lock().unwrap() = Some(ObjPtr(content));
-    *DETAIL_WINDOW.lock().unwrap() = Some(ObjPtr(window));
+    *DETAIL_CONTENT.lock().unwrap() = Some(ObjPtr::new(content));
+    *DETAIL_WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
 }
 
 /// 详情面板不会成为 key(键盘焦点保持留在主浮窗容器)。
@@ -3294,8 +3296,8 @@ extern "C" fn detail_text_view_copy(_self: *mut c_void, _cmd: Sel, _sender: *mut
 }
 
 struct SoftWrapGlyphs {
-    end: ObjPtr,
-    continuation: ObjPtr,
+    end: CallbackTarget,
+    continuation: CallbackTarget,
     end_size: NSSize,
     continuation_size: NSSize,
 }
@@ -3332,8 +3334,8 @@ unsafe fn soft_wrap_glyphs() -> &'static SoftWrapGlyphs {
         CFRelease(continuation_ns as *const c_void);
         release_obj(attrs);
         SoftWrapGlyphs {
-            end: ObjPtr(end),
-            continuation: ObjPtr(continuation),
+            end: CallbackTarget::new(end),
+            continuation: CallbackTarget::new(continuation),
             end_size: msg_send![end, size],
             continuation_size: msg_send![continuation, size],
         }
@@ -3566,7 +3568,7 @@ unsafe fn add_detail_text(
         tv,
         initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(scroll_w, body_h))
     ];
-    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = code_soft_wrap.then_some(ObjPtr(tv));
+    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = code_soft_wrap.then_some(ObjPtr::new(tv));
     // 详情必须在显示前完成完整布局。非连续/后台布局会在面板出现后分批增大
     // documentView,NSClipView 为维持旧可见区域会同步改变 bounds.origin.y,这正是
     // 滚动条打开后向下跳的根因。
@@ -3661,7 +3663,7 @@ unsafe fn add_detail_text(
     let _: () = msg_send![tv, setSelectedRange: NSRange::new(0, 0)];
     let _: () = msg_send![scroll, setDocumentView: tv];
     release_obj(tv);
-    *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr(tv));
+    *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr::new(tv));
 
     // 详情滚动条由自定义胶囊绘制;bounds 通知只负责刷新胶囊位置,端点橡皮筋由原生
     // elasticity 处理,这里不改写 bounds(改写会在手势中与动量拉锯,导致抽搐)。
@@ -3681,7 +3683,7 @@ unsafe fn add_detail_text(
         object: clip
     ];
     CFRelease(bounds_name as *const c_void);
-    *DETAIL_SCROLL_VIEW.lock().unwrap() = Some(ObjPtr(scroll));
+    *DETAIL_SCROLL_VIEW.lock().unwrap() = Some(ObjPtr::new(scroll));
 
     // 系统滚动条已完全关闭;实际滚动仍由 NSScrollView/NSClipView 处理,自定义视图只负责视觉
     // 与拖拽映射,因此不会出现两层滚动条。
@@ -3707,7 +3709,7 @@ unsafe fn add_detail_text(
         false,
     );
     let _: () = msg_send![scroll, addSubview: vertical_indicator];
-    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(vertical_indicator));
+    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr::new(vertical_indicator));
     release_obj(vertical_indicator);
 
     if no_wrap {
@@ -3733,7 +3735,8 @@ unsafe fn add_detail_text(
             true,
         );
         let _: () = msg_send![scroll, addSubview: horizontal_indicator];
-        *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(horizontal_indicator));
+        *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() =
+            Some(ObjPtr::new(horizontal_indicator));
         release_obj(horizontal_indicator);
     } else {
         *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() = None;
@@ -4096,7 +4099,7 @@ unsafe fn ensure_picker_window() {
             let _: () = msg_send![glass_layer, setCornerRadius: radius];
             let _: () = msg_send![glass_layer, setMasksToBounds: true];
         }
-        *PICKER_GLASS.lock().unwrap() = Some(ObjPtr(glass));
+        *PICKER_GLASS.lock().unwrap() = Some(ObjPtr::new(glass));
         content_parent = inner;
     } else {
         let content: *mut AnyObject = msg_send![window, contentView];
@@ -4113,7 +4116,7 @@ unsafe fn ensure_picker_window() {
         content_parent = ve;
     }
 
-    *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr(content_parent));
+    *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr::new(content_parent));
 
     // 容器(接收键盘事件;flipped,行从顶部往下排,最新条目在顶)。
     // Container (receives key events; flipped so rows stack top-down, newest on top).
@@ -4253,8 +4256,8 @@ unsafe fn ensure_picker_window() {
         object: clip
     ];
     CFRelease(bounds_name as *const c_void);
-    *SCROLL_VIEW.lock().unwrap() = Some(ObjPtr(scroll));
-    *SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr(indicator));
+    *SCROLL_VIEW.lock().unwrap() = Some(ObjPtr::new(scroll));
+    *SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr::new(indicator));
 
     // 顶部搜索框(NSSearchField 子类):模糊过滤条目。不自动聚焦(用户点击才开始搜索)。
     // 子类只重写 cancelOperation:(Esc)——编辑期间的按键由字段编辑器处理,↓ 等命令经
@@ -4454,9 +4457,9 @@ unsafe fn ensure_picker_window() {
     let _: () = msg_send![clear_button, setHidden: true];
     let _: () = msg_send![header_strip, addSubview: clear_button];
     release_obj(clear_button);
-    *SEARCH_CLEAR_BUTTON.lock().unwrap() = Some(ObjPtr(clear_button));
+    *SEARCH_CLEAR_BUTTON.lock().unwrap() = Some(ObjPtr::new(clear_button));
     release_obj(search);
-    *SEARCH_FIELD.lock().unwrap() = Some(ObjPtr(search));
+    *SEARCH_FIELD.lock().unwrap() = Some(ObjPtr::new(search));
     // 文本变化(含系统清除按钮/NSSearchField 的 Esc 清空)→ 实时过滤。
     // Text changes (including the system clear button / NSSearchField's Esc clear) filter live.
     let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
@@ -4505,7 +4508,7 @@ unsafe fn ensure_picker_window() {
         let pill = make_filter_pill(lab, i as isize, fx, filters_y, w);
         let _: () = msg_send![header_strip, addSubview: pill];
         release_obj(pill);
-        FILTER_PILLS.lock().unwrap().push(ObjPtr(pill));
+        FILTER_PILLS.lock().unwrap().push(ObjPtr::new(pill));
         fx += w + FILTER_GAP;
     }
     update_filter_pill_style(false);
@@ -4543,7 +4546,7 @@ unsafe fn ensure_picker_window() {
     add_hover_tracking(clear_btn);
     let _: () = msg_send![header_strip, addSubview: clear_btn];
     release_obj(clear_btn);
-    *CLEAR_HISTORY_BUTTON.lock().unwrap() = Some(ObjPtr(clear_btn));
+    *CLEAR_HISTORY_BUTTON.lock().unwrap() = Some(ObjPtr::new(clear_btn));
 
     // 底部栏(新设计稿 .footer):43pt,顶部分隔线 + 条目数 + 快捷键图例(清空已移到
     // 筛选行)。/ The footer: a top hairline + the entry count + the shortcut legends
@@ -4578,7 +4581,7 @@ unsafe fn ensure_picker_window() {
     let _: () = msg_send![toast_label, setHidden: true];
     let _: () = msg_send![content_parent, addSubview: toast_label];
     release_obj(toast_label);
-    *TOAST_LABEL.lock().unwrap() = Some(ObjPtr(toast_label));
+    *TOAST_LABEL.lock().unwrap() = Some(ObjPtr::new(toast_label));
 
     // 点击外部(浮窗失去 key)→ 自动隐藏。Win+V 同款行为:呼出后点任何地方即消失。
     // Outside clicks (the picker resigns key) -> auto-hide. Same as Win+V: any click after
@@ -4593,8 +4596,8 @@ unsafe fn ensure_picker_window() {
         object: window
     ];
     CFRelease(resign_name as *const c_void);
-    *PICKER_CONTAINER.lock().unwrap() = Some(ObjPtr(container));
-    *PICKER_WINDOW.lock().unwrap() = Some(ObjPtr(window));
+    *PICKER_CONTAINER.lock().unwrap() = Some(ObjPtr::new(container));
+    *PICKER_WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
 }
 
 /// 根据当前历史重建行按钮(选中行高亮 + 圆角背景块)。
@@ -4734,7 +4737,7 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![label, setFont: font];
         let _: () = msg_send![container, addSubview: label];
         release_obj(label);
-        rows.push(ObjPtr(label));
+        rows.push(ObjPtr::new(label));
         REBUILDING.store(false, Ordering::SeqCst);
         return;
     }
@@ -4809,7 +4812,7 @@ unsafe fn rebuild_rows() {
             let _: () = msg_send![g, setTextColor: g_color];
             let _: () = msg_send![container, addSubview: g];
             release_obj(g);
-            rows.push(ObjPtr(g));
+            rows.push(ObjPtr::new(g));
         }
 
         // 行底(两种不同样式):悬停(未选中)= 0.032 黑(**没有**左条);选中 = 0.050 黑 +
@@ -4858,7 +4861,7 @@ unsafe fn rebuild_rows() {
         release_obj(bar);
         let _: () = msg_send![container, addSubview: tile];
         release_obj(tile);
-        tiles.push(ObjPtr(tile));
+        tiles.push(ObjPtr::new(tile));
 
         // 内容按钮:占行的上部(61pt),整块可点击(粘贴)+ 悬停;图片行左侧是 72×44
         // 缩略图画布 + 文件名;文本行是 ≤2 行、按类型着色的内容。无边框、无背景。
@@ -4910,7 +4913,7 @@ unsafe fn rebuild_rows() {
         add_hover_tracking(content_btn);
         let _: () = msg_send![container, addSubview: content_btn];
         release_obj(content_btn);
-        rows.push(ObjPtr(content_btn));
+        rows.push(ObjPtr::new(content_btn));
 
         // 底部 meta 按钮:17pt 栏,左侧是 [13px 来源图标]·应用名·时间,整块可可点
         // (点击 = 粘贴)、悬停选中;右侧悬浮着操作按钮。
@@ -4944,7 +4947,7 @@ unsafe fn rebuild_rows() {
         add_hover_tracking(meta_btn);
         let _: () = msg_send![container, addSubview: meta_btn];
         release_obj(meta_btn);
-        rows.push(ObjPtr(meta_btn));
+        rows.push(ObjPtr::new(meta_btn));
 
         // 操作按钮(置顶 ☆/★ · 详情 ⓘ · 删除 ⌫):**置顶条目常显**,非置顶条目仅
         // 悬停/选中时显现(设计稿 .actions opacity 0→1)。独立于内容/meta 按钮,点击
@@ -4974,7 +4977,7 @@ unsafe fn rebuild_rows() {
         if !pin_btn.is_null() {
             let _: () = msg_send![container, addSubview: pin_btn];
             release_obj(pin_btn);
-            rows.push(ObjPtr(pin_btn));
+            rows.push(ObjPtr::new(pin_btn));
         }
         let details_btn = make_action_button(
             "ⓘ",
@@ -4994,24 +4997,24 @@ unsafe fn rebuild_rows() {
         if !details_btn.is_null() {
             let _: () = msg_send![container, addSubview: details_btn];
             release_obj(details_btn);
-            rows.push(ObjPtr(details_btn));
+            rows.push(ObjPtr::new(details_btn));
         }
         let del_btn =
             make_action_button("⌫", sel!(deleteEntry:), i as isize, x_del, act_y, act_alpha);
         if !del_btn.is_null() {
             let _: () = msg_send![container, addSubview: del_btn];
             release_obj(del_btn);
-            rows.push(ObjPtr(del_btn));
+            rows.push(ObjPtr::new(del_btn));
         }
         // 记录本行的悬停相关视图(底块 + 操作按钮),供悬停变化时增量刷新。
         // Record this row's hover-dependent views (tile + action buttons) for the
         // incremental hover refresh.
         ROW_HOVER_VIEWS.lock().unwrap().push(RowHoverViews {
-            tile: ObjPtr(tile),
-            bar: ObjPtr(bar),
-            pin: ObjPtr(pin_btn),
-            details: ObjPtr(details_btn),
-            del: ObjPtr(del_btn),
+            tile: ObjPtr::new(tile),
+            bar: ObjPtr::new(bar),
+            pin: ObjPtr::new(pin_btn),
+            details: ObjPtr::new(details_btn),
+            del: ObjPtr::new(del_btn),
         });
     }
 
@@ -5037,7 +5040,7 @@ extern "C" fn container_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
 /// 行按钮类(NSButton 子类,重写 mouseEntered: 实现悬停选中)。
 /// Row-button class (NSButton subclass; mouseEntered: implements hover selection).
 unsafe fn row_button_class() -> *mut AnyObject {
-    static ROW_BTN_CLS: OnceLock<ObjPtr> = OnceLock::new();
+    static ROW_BTN_CLS: OnceLock<StaticClass> = OnceLock::new();
     ROW_BTN_CLS
         .get_or_init(|| {
             let name = CString::new("OhMyTabClipboardRowButton").unwrap();
@@ -5057,9 +5060,9 @@ unsafe fn row_button_class() -> *mut AnyObject {
                 types.as_ptr(),
             );
             objc_registerClassPair(cls);
-            ObjPtr(cls)
+            StaticClass(cls as *const objc2::runtime::AnyClass)
         })
-        .0
+        .0 as *mut AnyObject
 }
 
 /// 搜索框 cell 类(NSSearchFieldCell 子类,覆写 drawInteriorWithFrame:inView:)。
@@ -5072,7 +5075,7 @@ unsafe fn row_button_class() -> *mut AnyObject {
 /// stock layout (icon pinned left + text after it) cannot center, and `centersPlaceholder`
 /// no longer exists on macOS 26.
 unsafe fn search_cell_class() -> *mut AnyObject {
-    static CELL_CLS: OnceLock<ObjPtr> = OnceLock::new();
+    static CELL_CLS: OnceLock<StaticClass> = OnceLock::new();
     CELL_CLS
         .get_or_init(|| {
             let name = CString::new("OhMyTabClipSearchCell").unwrap();
@@ -5118,9 +5121,9 @@ unsafe fn search_cell_class() -> *mut AnyObject {
                 types_sel.as_ptr(),
             );
             objc_registerClassPair(cls);
-            ObjPtr(cls)
+            StaticClass(cls as *const objc2::runtime::AnyClass)
         })
-        .0
+        .0 as *mut AnyObject
 }
 
 /// 当前搜索是否需要显示右侧清除叉号。
@@ -6676,7 +6679,7 @@ fn refresh_detail_action_visuals() {
 /// delete/clear turn red, filters only darken. On exit the state is restored (filters go
 /// through update_filter_pill_style so the active tint is never clobbered).
 unsafe fn hover_button_class() -> *mut AnyObject {
-    static HOVER_BTN_CLS: OnceLock<ObjPtr> = OnceLock::new();
+    static HOVER_BTN_CLS: OnceLock<StaticClass> = OnceLock::new();
     HOVER_BTN_CLS
         .get_or_init(|| {
             let name = CString::new("OhMyTabClipHoverButton").unwrap();
@@ -6702,9 +6705,9 @@ unsafe fn hover_button_class() -> *mut AnyObject {
                 types.as_ptr(),
             );
             objc_registerClassPair(cls);
-            ObjPtr(cls)
+            StaticClass(cls as *const objc2::runtime::AnyClass)
         })
-        .0
+        .0 as *mut AnyObject
 }
 
 unsafe fn set_detail_share_style(button: *mut AnyObject, tint_alpha: f64, bg_alpha: u32) {
@@ -7054,25 +7057,25 @@ fn update_filter_pill_style(animate_underline: bool) {
                 let _: () = msg_send![ulayer, setCornerRadius: 1.0f64];
                 let _: () = msg_send![parent, addSubview: u];
                 release_obj(u);
-                *guard = Some(ObjPtr(u));
+                *guard = Some(ObjPtr::new(u));
             }
         }
     }
 }
 
 /// 底部栏条目数标签 / the footer's entry-count label.
-static FOOTER_COUNT: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static FOOTER_COUNT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 底部栏根视图:语言切换时整栏重建,以按新文本宽度重新排版快捷键图例。
 /// The footer root: rebuilt on locale changes so shortcut legends reflow to their new widths.
-static FOOTER_VIEW: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static FOOTER_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// toast 提示标签(新设计稿 .toast)/ the toast label (the new mockup's .toast).
-static TOAST_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static TOAST_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// toast 的自动隐藏 timer(取消防抖)/ the toast's auto-hide timer.
-static TOAST_TIMER: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static TOAST_TIMER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// toast owner 单例(实现 dismissToast: 供 NSTimer 回调)。/ the toast timer's target.
 unsafe fn toast_owner() -> *mut AnyObject {
-    static TOAST_OWNER: OnceLock<ObjPtr> = OnceLock::new();
+    static TOAST_OWNER: OnceLock<CallbackTarget> = OnceLock::new();
     TOAST_OWNER
         .get_or_init(|| {
             let name = CString::new("OhMyTabClipToast").unwrap();
@@ -7087,7 +7090,7 @@ unsafe fn toast_owner() -> *mut AnyObject {
             );
             objc_registerClassPair(cls);
             let obj: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-            ObjPtr(obj)
+            CallbackTarget::new(obj)
         })
         .0
 }
@@ -7147,7 +7150,7 @@ fn show_toast(msg: &str) {
             userInfo: std::ptr::null::<AnyObject>(),
             repeats: false
         ];
-        *TOAST_TIMER.lock().unwrap() = Some(ObjPtr(timer));
+        *TOAST_TIMER.lock().unwrap() = Some(ObjPtr::new(timer));
     }
 }
 
@@ -7183,7 +7186,7 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     ];
     let _: () = msg_send![parent, addSubview: footer];
     release_obj(footer);
-    *FOOTER_VIEW.lock().unwrap() = Some(ObjPtr(footer));
+    *FOOTER_VIEW.lock().unwrap() = Some(ObjPtr::new(footer));
     let parent = footer;
 
     // 顶部分隔线 / the top hairline.
@@ -7223,7 +7226,7 @@ unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     let _: () = msg_send![count_label, setTextColor: cc];
     let _: () = msg_send![parent, addSubview: count_label];
     release_obj(count_label);
-    *FOOTER_COUNT.lock().unwrap() = Some(ObjPtr(count_label));
+    *FOOTER_COUNT.lock().unwrap() = Some(ObjPtr::new(count_label));
 
     // 快捷键图例(kbd 键帽 + 说明)从右往左排在同一行。
     // The shortcut legends (kbd keycap + label) are laid out right-to-left on one row.
@@ -7473,7 +7476,7 @@ unsafe fn add_hover_tracking(view: *mut AnyObject) {
 /// rebuild would leak forever; one instance per process lives until exit, and the buttons'
 /// weak reference to it stays valid.
 unsafe fn row_target() -> *mut AnyObject {
-    static ROW_TARGET: OnceLock<ObjPtr> = OnceLock::new();
+    static ROW_TARGET: OnceLock<CallbackTarget> = OnceLock::new();
     ROW_TARGET
         .get_or_init(|| {
             let name = CString::new("OhMyTabClipboardRowTarget").unwrap();
@@ -7509,7 +7512,7 @@ unsafe fn row_target() -> *mut AnyObject {
             // Instance alloc (+1): process-level singleton, never released (matches the
             // static's lifetime).
             let obj: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-            ObjPtr(obj)
+            CallbackTarget::new(obj)
         })
         .0
 }

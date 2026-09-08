@@ -140,16 +140,16 @@ static EDIT_ACTION_IDX: Mutex<isize> = Mutex::new(0);
 static EDIT_COMBO: Mutex<String> = Mutex::new(String::new());
 /// 面板窗口与控件。
 /// The panel window and its controls.
-static EDIT_PANEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
-static EDIT_PANEL_BTN_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
-static EDIT_PANEL_ACTION: Mutex<Option<ObjPtr>> = Mutex::new(None);
-static EDIT_PANEL_COMBO_BTN: Mutex<Option<ObjPtr>> = Mutex::new(None);
-static EDIT_PANEL_COMBO_LABEL: Mutex<Option<ObjPtr>> = Mutex::new(None);
-static EDIT_PANEL_OK: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static EDIT_PANEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static EDIT_PANEL_BTN_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static EDIT_PANEL_ACTION: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static EDIT_PANEL_COMBO_BTN: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static EDIT_PANEL_COMBO_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static EDIT_PANEL_OK: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 面板打开时的窗口遮罩(半透明灰层,modal 调暗设置窗口)。
 /// The window dim layer while the panel is open (a translucent gray overlay that dims the
 /// settings window, modal-style).
-static EDIT_DIM: Mutex<Option<ObjPtr>> = Mutex::new(None);
+static EDIT_DIM: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// 录制取消标志:取消时置位。既是 tap 创建重试的提前退出信号(录制线程可能还卡在
 /// 缺权限的重试 sleep 里,此时 CFRunLoopStop 无效 —— 没有这个标志 tap 会常驻吞键),

@@ -643,7 +643,7 @@ pub(super) unsafe fn set_close_button_hover_style(button: *mut AnyObject, hovere
 /// 关闭按钮的动态 ObjC 子类,用于实现 HTML 参考中的悬停红色反馈。
 /// Dynamic ObjC subclass for the close button, providing the HTML reference's red hover feedback.
 pub(super) fn close_button_class() -> *mut AnyObject {
-    static CLOSE_BUTTON_CLASS: OnceLock<ObjClassPtr> = OnceLock::new();
+    static CLOSE_BUTTON_CLASS: OnceLock<StaticClass> = OnceLock::new();
     CLOSE_BUTTON_CLASS
         .get_or_init(|| unsafe {
             let name = CString::new("OhMyTabCloseButton").unwrap();
@@ -663,7 +663,7 @@ pub(super) fn close_button_class() -> *mut AnyObject {
                 types_v_obj.as_ptr(),
             );
             objc_registerClassPair(cls);
-            ObjClassPtr(cls as *const objc2::runtime::AnyClass)
+            StaticClass(cls as *const objc2::runtime::AnyClass)
         })
         .0 as *mut AnyObject
 }

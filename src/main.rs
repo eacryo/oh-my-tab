@@ -151,7 +151,7 @@ impl AppState {
 
 // Colors 结构已移至 `theme.rs` / moved to `theme.rs`
 
-// ObjPtr / ObjClassPtr 已移至 `ffi.rs` / moved to `ffi.rs`
+// ObjPtr / StaticClass 已移至 `ffi.rs` / moved to `ffi.rs`
 
 // ========== Main-thread runtime ==========
 
@@ -188,11 +188,13 @@ pub(crate) fn debug_assert_main_thread() {
 /// Main-thread-published window-count snapshot. Background diagnostics read this value
 /// instead of touching the switcher runtime.
 pub(crate) static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static CONTROLLER: Mutex<Option<ObjPtr>> = Mutex::new(None);
+/// Cross-thread callback target used only to schedule work back onto AppKit's main thread.
+/// 跨线程回调 target 仅用于把工作投递回 AppKit 主线程，不暴露 UI 状态访问能力。
+pub(crate) static CONTROLLER: Mutex<Option<CallbackTarget>> = Mutex::new(None);
 
 /// 菜单项与设置按钮共用的 ObjC target 对象（OhMyTabMenuTarget2 实例）。
 /// Shared ObjC target object for menu items and settings buttons.
-pub(crate) static MENU_TARGET: Mutex<Option<ObjPtr>> = Mutex::new(None);
+pub(crate) static MENU_TARGET: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 const GLOBAL_INPUT_CAPACITY: usize = 32;
 
 /// 全局输入 tap 的有界聚合状态。Tab 按键保留顺序，release 单独记账，低价值控制事件
@@ -970,8 +972,8 @@ fn create_overlay_window() -> *mut AnyObject {
             let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
             let glass: *mut AnyObject = msg_send![glass_cls, alloc];
             let glass: *mut AnyObject = msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-            *GLASS_VIEW.lock().unwrap() = Some(ObjPtr(glass)); // 保存指针，供热重载重新应用 / save for hot reload
-                                                               // (4) Corner radius — native NSGlassEffectView property, from config.
+            *GLASS_VIEW.lock().unwrap() = Some(ObjPtr::new(glass)); // 保存指针，供热重载重新应用 / save for hot reload
+                                                                    // (4) Corner radius — native NSGlassEffectView property, from config.
             let _: () =
                 msg_send![glass, setCornerRadius: CONFIG.read().unwrap().appearance.corner_radius];
             // (5) Glass style — "regular" (0) or "clear" (1), from config.
@@ -1151,7 +1153,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let _: () = msg_send![container, setAutoresizingMask: 18u64];
         let _: () = msg_send![container, setDrawsBackground: false];
         let _: () = msg_send![content_parent, addSubview: container];
-        *CONTAINER.lock().unwrap() = Some(ObjPtr(container));
+        *CONTAINER.lock().unwrap() = Some(ObjPtr::new(container));
 
         // NSClipView 只负责可视窗口;卡片全部挂在持久 document view 上,滚动时只移动 bounds。
         // NSClipView is only the viewport; all cards live in a persistent document view and
@@ -1167,7 +1169,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let _: () = msg_send![document, setWantsLayer: false];
         let _: () = msg_send![container, setDocumentView: document];
         clear_card_indices();
-        *CARD_DOCUMENT.lock().unwrap() = Some(ObjPtr(document));
+        *CARD_DOCUMENT.lock().unwrap() = Some(ObjPtr::new(document));
         release_obj(document);
 
         // --- Status label at bottom (standard coords: y=0 is bottom) ---
@@ -1178,7 +1180,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let status_color = hex_to_ns_color(0x999999ff);
         let status_label = make_centered_label("", status_font, status_color, 0.0, w, footer_h);
         let _: () = msg_send![content_parent, addSubview: status_label];
-        *STATUS_LABEL.lock().unwrap() = Some(ObjPtr(status_label));
+        *STATUS_LABEL.lock().unwrap() = Some(ObjPtr::new(status_label));
 
         // 指示器放在卡片容器外层,卡片重建不会改变它的 z-order 或中断显式拖拽。
         // Keep the indicator above the card container; rebuilding cards cannot change its z-order
@@ -1205,7 +1207,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let _: () = msg_send![scroller, addTrackingArea: scroller_tracking];
         release_obj(scroller_tracking);
         let _: () = msg_send![content_parent, addSubview: scroller];
-        *THUMB_SCROLLER.lock().unwrap() = Some(ObjPtr(scroller));
+        *THUMB_SCROLLER.lock().unwrap() = Some(ObjPtr::new(scroller));
 
         window
     }
@@ -1737,7 +1739,7 @@ fn setup_status_bar() {
             cls
         };
         let menu_target: *mut AnyObject = msg_send![action_cls as *const AnyObject, new];
-        *MENU_TARGET.lock().unwrap() = Some(ObjPtr(menu_target));
+        *MENU_TARGET.lock().unwrap() = Some(ObjPtr::new(menu_target));
 
         // 设置 item 放在菜单第一项,用于打开设置窗口。
         // Settings item comes first and opens the settings window.
@@ -2010,7 +2012,7 @@ fn main() {
 
     // 5. Create overlay window (hidden initially)
     let window = create_overlay_window();
-    *OVERLAY_WINDOW.lock().unwrap() = Some(ObjPtr(window));
+    *OVERLAY_WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
     // Hide initially
     hide_overlay();
     // 点击浮窗外部 → 取消切换(面板失去 key 时收起,同 Esc 语义)。
@@ -2019,7 +2021,7 @@ fn main() {
 
     // 6. Create controller object
     let controller = create_controller();
-    *CONTROLLER.lock().unwrap() = Some(ObjPtr(controller));
+    *CONTROLLER.lock().unwrap() = Some(CallbackTarget::new(controller));
 
     // Sparkle is loaded dynamically so a source checkout can still run without the native
     // framework. Release/dev bundles that contain Contents/Frameworks/Sparkle.framework get the

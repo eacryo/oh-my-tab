@@ -418,14 +418,14 @@ pub(super) static SIDEBAR_SELECTED: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SIDEBAR_HOVERED: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SIDEBAR_HOVER_VISIBLE: AtomicBool = AtomicBool::new(false);
 pub(super) static SIDEBAR_HOVER_PRIMED: AtomicBool = AtomicBool::new(false);
-pub(super) static SIDEBAR_HOVER_HIGHLIGHT: LazyLock<Mutex<Option<ObjPtr>>> =
-    LazyLock::new(|| Mutex::new(None));
-pub(super) static SIDEBAR_TITLE_LABELS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-pub(super) static SIDEBAR_ICON_VIEWS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-pub(super) static SIDEBAR_UPDATE_DOTS: LazyLock<Mutex<HashMap<usize, ObjPtr>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub(super) static SIDEBAR_HOVER_HIGHLIGHT: MainThreadSlot<Option<ObjPtr>> =
+    MainThreadSlot::new(None);
+pub(super) static SIDEBAR_TITLE_LABELS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
+    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+pub(super) static SIDEBAR_ICON_VIEWS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
+    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+pub(super) static SIDEBAR_UPDATE_DOTS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
+    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
 
 pub(super) extern "C" fn external_link_mouse_entered(
     this: *mut c_void,
@@ -485,8 +485,7 @@ unsafe impl Send for SidebarHoverTrackerClass {}
 unsafe impl Sync for SidebarHoverTrackerClass {}
 
 pub(super) static SIDEBAR_HOVER_TRACKER_CLASS: OnceLock<SidebarHoverTrackerClass> = OnceLock::new();
-pub(super) static SIDEBAR_HOVER_TRACKER: LazyLock<Mutex<Option<ObjPtr>>> =
-    LazyLock::new(|| Mutex::new(None));
+pub(super) static SIDEBAR_HOVER_TRACKER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// Return the shared hover view without duplicating its ownership logic at each event site.
 /// 读取共享悬浮 view，避免每个事件回调重复处理指针状态。
@@ -725,7 +724,7 @@ pub(super) unsafe fn make_sidebar_hover_tracking(parent: *mut AnyObject, rect: N
     if let Some(previous) = SIDEBAR_HOVER_TRACKER
         .lock()
         .unwrap()
-        .replace(ObjPtr(tracker))
+        .replace(ObjPtr::new(tracker))
     {
         release_obj(previous.0);
     }
@@ -1037,7 +1036,7 @@ pub(super) unsafe fn set_field(field: *mut AnyObject, val: impl std::fmt::Displa
 /// bounding rect: `selectWithFrame:` is also used for double-click word selection, and passing the
 /// compact drawing rect makes the editor jump toward the cell's upper-left corner.
 pub(super) unsafe fn centered_text_field_cell_class() -> *mut AnyObject {
-    static CELL_CLASS: OnceLock<ObjPtr> = OnceLock::new();
+    static CELL_CLASS: OnceLock<StaticClass> = OnceLock::new();
     CELL_CLASS
         .get_or_init(|| {
             let name = CString::new("OhMyTabCenteredTextFieldCell").unwrap();
@@ -1069,9 +1068,9 @@ pub(super) unsafe fn centered_text_field_cell_class() -> *mut AnyObject {
                 editor_types.as_ptr(),
             );
             objc_registerClassPair(cls);
-            ObjPtr(cls)
+            StaticClass(cls as *const objc2::runtime::AnyClass)
         })
-        .0
+        .0 as *mut AnyObject
 }
 
 pub(super) fn centered_text_field_cell_frame(bounds: NSRect) -> NSRect {
@@ -3077,7 +3076,10 @@ pub(super) unsafe fn set_sidebar_update_indicator(btn: *mut AnyObject, visible: 
         crate::ffi::hex_to_cg_color(settings_palette().destructive),
     );
     let _: () = msg_send![dot_parent, addSublayer: dot];
-    SIDEBAR_UPDATE_DOTS.lock().unwrap().insert(key, ObjPtr(dot));
+    SIDEBAR_UPDATE_DOTS
+        .lock()
+        .unwrap()
+        .insert(key, ObjPtr::new(dot));
 }
 
 /// Create the single shared hover surface used by all sidebar rows.
@@ -3118,7 +3120,7 @@ pub(super) unsafe fn make_sidebar_hover_highlight(
     SIDEBAR_HOVER_HIGHLIGHT
         .lock()
         .unwrap()
-        .replace(ObjPtr(hover));
+        .replace(ObjPtr::new(hover));
     SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
     SIDEBAR_HOVER_VISIBLE.store(false, Ordering::SeqCst);
     release_obj(hover);
@@ -3184,7 +3186,7 @@ pub(super) unsafe fn make_sidebar_button(
         SIDEBAR_ICON_VIEWS
             .lock()
             .unwrap()
-            .insert(btn as usize, ObjPtr(icon_view));
+            .insert(btn as usize, ObjPtr::new(icon_view));
         release_obj(icon_view);
     }
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -3213,7 +3215,7 @@ pub(super) unsafe fn make_sidebar_button(
     SIDEBAR_TITLE_LABELS
         .lock()
         .unwrap()
-        .insert(btn as usize, ObjPtr(label));
+        .insert(btn as usize, ObjPtr::new(label));
     release_obj(label);
     let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
     let tracking: *mut AnyObject = msg_send![

@@ -7,7 +7,10 @@
 use crate::log_info;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
+use std::cell::{BorrowMutError, RefCell, RefMut};
 use std::ffi::{c_char, c_void, CString};
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 // ========== FFI 外部函数声明 / FFI extern declarations ==========
 
@@ -403,25 +406,142 @@ pub(crate) struct ObjcSuper {
     pub(crate) super_class: *mut c_void,
 }
 
-// ========== 裸指针的 Send/Sync 包装 / Send+Sync wrappers for raw ObjC pointers ==========
+// ========== 裸指针的线程亲和包装 / Thread-affine wrappers for raw ObjC pointers ==========
 
-/// 线程安全的 ObjC 对象指针包装。所有访问由 Mutex 守卫,仅为静态存储实现 Send/Sync。
-/// 字段 pub(crate):各模块通过 .0 取裸指针,或用 ObjPtr(x) 构造。
+/// 只允许主线程持有和使用的 ObjC 对象指针。
 ///
-/// Thread-safe wrapper for raw ObjC object pointers.
-/// All accesses are guarded by a Mutex - only Send/Sync for static storage.
-/// Field is pub(crate): modules read the raw pointer via .0 or construct via ObjPtr(x).
+/// `Rc` marker deliberately makes this type neither `Send` nor `Sync`; putting it in a
+/// [`MainThreadSlot`] keeps the ownership boundary explicit without claiming that an
+/// arbitrary Objective-C object is thread-safe.
+///
+/// Main-thread-only Objective-C object pointer. The `Rc` marker deliberately makes this type
+/// neither `Send` nor `Sync`; storing it in [`MainThreadSlot`] keeps the ownership boundary
+/// explicit without claiming that an arbitrary Objective-C object is thread-safe.
+///
 #[derive(Clone, Copy)]
-pub(crate) struct ObjPtr(pub(crate) *mut AnyObject);
-unsafe impl Send for ObjPtr {}
-unsafe impl Sync for ObjPtr {}
+pub(crate) struct ObjPtr(pub(crate) *mut AnyObject, PhantomData<Rc<()>>);
 
-/// 线程安全的 ObjC 类指针包装。
-/// Thread-safe wrapper for raw ObjC class pointers.
+impl ObjPtr {
+    pub(crate) const fn new(ptr: *mut AnyObject) -> Self {
+        Self(ptr, PhantomData)
+    }
+}
+
+/// A process-lifetime Objective-C class pointer. Dynamic classes are registered once and are
+/// retained by the Objective-C runtime for the life of the process, so the class identity itself
+/// is safe to share across threads; instances created from it remain main-thread objects.
+/// 进程生命周期内的 Objective-C Class 指针。动态类注册后由运行时持有到进程结束，类身份可跨线程共享；
+/// 由其创建的实例仍然只能在主线程使用。
 #[derive(Clone, Copy)]
-pub(crate) struct ObjClassPtr(pub(crate) *const objc2::runtime::AnyClass);
-unsafe impl Send for ObjClassPtr {}
-unsafe impl Sync for ObjClassPtr {}
+pub(crate) struct StaticClass(pub(crate) *const objc2::runtime::AnyClass);
+unsafe impl Send for StaticClass {}
+unsafe impl Sync for StaticClass {}
+
+/// Main-thread slot for UI objects that must remain in a `static` registry for callback lookup.
+/// The slot is synchronized by the main-thread invariant, not by a cross-thread mutex.
+///
+/// 主线程 UI 对象的静态槽。它依赖主线程所有权保证，而不是跨线程 Mutex；`lock` 保留原有调用
+/// 形状，便于逐步迁移旧的指针注册表，同时在运行时检测重入借用。
+pub(crate) struct MainThreadSlot<T> {
+    value: RefCell<T>,
+}
+
+impl<T> MainThreadSlot<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self {
+            value: RefCell::new(value),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
+        crate::debug_assert_main_thread();
+        self.value.try_borrow_mut()
+    }
+}
+
+// The wrapper is only reachable through main-thread callbacks; the contained value is never
+// moved out to a worker thread. This is the one narrowly-scoped synchronization boundary for
+// legacy static UI registries, instead of marking every raw pointer as Send/Sync.
+// 该包装器只能通过主线程回调访问，内部值不会被移交后台线程；这是旧 UI 静态注册表唯一且收窄的同步边界。
+unsafe impl<T> Sync for MainThreadSlot<T> {}
+// The slot itself is a process-global registry cell and is never moved after initialization;
+// only its borrow guard is exposed. This permits `LazyLock`/`OnceLock` initialization while the
+// contained UI object remains non-Send.
+// 槽本身在初始化后不会再移动，只暴露借用 guard；因此可用于 LazyLock/OnceLock 初始化，而内部 UI 对象仍不可 Send。
+unsafe impl<T> Send for MainThreadSlot<T> {}
+
+/// A retained Objective-C callback target whose identity is handed to AppKit APIs such as
+/// `NSTimer`/`NSNotificationCenter`. The runtime owns the object for the process lifetime;
+/// callbacks themselves are still required to marshal UI work to the main thread.
+/// 跨 API 边界传递的常驻 Objective-C 回调 target。对象由运行时持有到进程结束，回调中的 UI 工作仍必须回到主线程。
+#[derive(Clone, Copy)]
+pub(crate) struct CallbackTarget(pub(crate) *mut AnyObject);
+unsafe impl Send for CallbackTarget {}
+unsafe impl Sync for CallbackTarget {}
+
+impl CallbackTarget {
+    pub(crate) const fn new(ptr: *mut AnyObject) -> Self {
+        Self(ptr)
+    }
+}
+
+/// Ownership-bearing Core Foundation reference. The constructor is only for APIs documented to
+/// return a +1 object; `Drop` balances that retain exactly once.
+/// 带所有权语义的 Core Foundation 引用。构造函数仅用于文档明确返回 +1 的 API，Drop 恰好释放一次 retain。
+pub(crate) struct RetainedCf<T> {
+    pub(crate) ptr: *const T,
+    _marker: PhantomData<T>,
+}
+
+/// Marker implemented only for CF object categories whose APIs are documented as immutable and
+/// thread-safe in this project. Add a new implementation only after auditing that category.
+/// 仅为项目中已确认不可变且可跨线程使用的 CF 类型实现此 marker；新增类型前必须单独审计。
+pub(crate) trait ThreadSafeCf {}
+impl ThreadSafeCf for c_void {}
+
+unsafe impl<T: ThreadSafeCf> Send for RetainedCf<T> {}
+unsafe impl<T: ThreadSafeCf> Sync for RetainedCf<T> {}
+
+impl<T> RetainedCf<T> {
+    pub(crate) const unsafe fn from_retained(ptr: *const T) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T> Drop for RetainedCf<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { CFRelease(self.ptr as *const c_void) };
+        }
+    }
+}
+
+/// Cross-thread handle for a CFRunLoop. Other threads may only signal/wake it; dereferencing
+/// and source management remain confined to the owning run-loop thread.
+/// CFRunLoop 的跨线程句柄。其他线程只能 signal/wake，解引用和 source 管理由所属线程完成。
+#[derive(Clone, Copy)]
+pub(crate) struct RunLoopHandle(pub(crate) *mut c_void);
+unsafe impl Send for RunLoopHandle {}
+unsafe impl Sync for RunLoopHandle {}
+
+/// Cross-thread handle for a CFRunLoopSource. Other threads may signal it, while source
+/// installation/removal remains on the observer thread.
+/// CFRunLoopSource 的跨线程句柄。其他线程只能 signal，安装和移除仍由观察者线程完成。
+#[derive(Clone, Copy)]
+pub(crate) struct RunLoopSourceHandle(pub(crate) *mut c_void);
+unsafe impl Send for RunLoopSourceHandle {}
+unsafe impl Sync for RunLoopSourceHandle {}
+
+/// Handle for an AXObserver retained by the observer run-loop thread. It is only moved through
+/// the observer registry; AX messages and release remain on that owning thread.
+/// 由观察者 run-loop 线程持有的 AXObserver 句柄。仅在观察者注册表中移动，AX 调用和释放仍在所属线程完成。
+#[derive(Clone, Copy)]
+pub(crate) struct AxObserverHandle(pub(crate) *mut c_void);
+unsafe impl Send for AxObserverHandle {}
+unsafe impl Sync for AxObserverHandle {}
 
 // ========== NSString / 对象生命周期 helper ==========
 
