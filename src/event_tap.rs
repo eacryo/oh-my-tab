@@ -9,7 +9,7 @@ use crate::ffi::has_accessibility_permission;
 use crate::log_info;
 use std::ffi::c_void;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ========== 类型别名 / type aliases ==========
 
@@ -24,6 +24,18 @@ pub(crate) type CFAllocatorRef = *mut c_void;
 pub(crate) type CGEventType = u32;
 pub(crate) type CGEventFlags = u64;
 pub(crate) type CGEventMask = u64;
+
+/// 由 CGEventTapCreate 与 CFMachPortCreateRunLoopSource 创建的一对 Core Foundation 对象。
+/// 调用方负责在线程退出前通过 teardown_event_tap() 移除并释放。
+///
+/// The Core Foundation objects created by CGEventTapCreate and
+/// CFMachPortCreateRunLoopSource. The caller must remove and release them through
+/// teardown_event_tap() before its thread exits.
+#[derive(Clone, Copy)]
+pub(crate) struct CreatedEventTap {
+    pub(crate) tap: CFMachPortRef,
+    pub(crate) source: CFRunLoopSourceRef,
+}
 
 pub(crate) type CGEventTapCallBack = Option<
     unsafe extern "C" fn(
@@ -239,7 +251,22 @@ extern "C" {
 // limit is exhausted, log and give up. The cap avoids infinite polling; once granted, the next retry
 // succeeds - no restart needed.
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
+const RETRY_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const RETRY_MAX: u32 = 40;
+
+fn wait_for_retry_or_cancel(cancel: Option<&'static std::sync::atomic::AtomicBool>) -> bool {
+    let deadline = Instant::now() + RETRY_INTERVAL;
+    loop {
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep((deadline - now).min(RETRY_CANCEL_POLL_INTERVAL));
+    }
+}
 
 /// 创建 event tap 并加入当前线程的 CFRunLoop。失败时按 RETRY_INTERVAL/RETRY_MAX 重试。
 /// 返回创建好的 tap(或 None 表示重试耗尽)。
@@ -268,7 +295,7 @@ pub(crate) unsafe fn create_tap_with_retry(
     user_info: *mut c_void,
     log_name: &str,
     cancel: Option<&'static std::sync::atomic::AtomicBool>,
-) -> Option<CFMachPortRef> {
+) -> Option<CreatedEventTap> {
     let mut tap = CGEventTapCreate(location, placement, options, mask, callback, user_info);
 
     // 首次创建失败(通常是缺 Accessibility 权限):有限次重试,给用户时间去系统设置授权。
@@ -284,10 +311,10 @@ pub(crate) unsafe fn create_tap_with_retry(
         );
         let mut granted = false;
         for _ in 0..RETRY_MAX {
-            std::thread::sleep(RETRY_INTERVAL);
-            // 取消请求(运行时停用):立即放弃,线程正常结束。
-            // Stop requested (runtime disable): bail out so the thread exits promptly.
-            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            // 分片等待并轮询取消请求,避免运行时停用被完整的 3 秒重试间隔拖住。
+            // Wait in short slices while polling cancellation so runtime disable is not held up
+            // by the full three-second retry interval.
+            if wait_for_retry_or_cancel(cancel) {
                 log_info!("[{}] Event tap cancelled by stop request.", log_name);
                 return None;
             }
@@ -316,9 +343,31 @@ pub(crate) unsafe fn create_tap_with_retry(
     }
 
     let source = CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
+    if source.is_null() {
+        crate::ffi::CFRelease(tap as *const c_void);
+        log_info!("[{}] Failed to create event tap run-loop source.", log_name);
+        return None;
+    }
     CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
     CGEventTapEnable(tap, true);
-    Some(tap)
+    Some(CreatedEventTap { tap, source })
+}
+
+/// 同步禁用并释放一个 event tap 及其 RunLoop Source。
+/// Disable and release an event tap and its RunLoop source synchronously.
+///
+/// # Safety
+/// `created` 必须仍由 `run_loop` 持有且只能清理一次。
+/// `created` must still belong to `run_loop` and may be torn down only once.
+pub(crate) unsafe fn teardown_event_tap(run_loop: CFRunLoopRef, created: CreatedEventTap) {
+    CGEventTapEnable(created.tap, false);
+    crate::ffi::CFRunLoopRemoveSource(
+        run_loop,
+        created.source,
+        kCFRunLoopDefaultMode as *const c_void,
+    );
+    crate::ffi::CFRelease(created.source as *const c_void);
+    crate::ffi::CFRelease(created.tap as *const c_void);
 }
 
 // ========== tap 看门狗 / tap watchdog ==========
@@ -359,7 +408,7 @@ unsafe extern "C" fn tap_watchdog_callback(_timer: CFRunLoopTimerRef, info: *mut
 
 /// 在 tap 所在线程挂一个 3s 周期的看门狗定时器(info = tap 指针)。
 /// Attach a 3s-period watchdog timer to the tap's thread (info = the tap pointer).
-unsafe fn start_tap_watchdog(tap: CFMachPortRef) {
+unsafe fn start_tap_watchdog(tap: CFMachPortRef) -> CFRunLoopTimerRef {
     let ctx = CFRunLoopTimerContext {
         version: 0,
         info: tap,
@@ -379,6 +428,7 @@ unsafe fn start_tap_watchdog(tap: CFMachPortRef) {
     if !timer.is_null() {
         CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
     }
+    timer
 }
 
 /// 在专用线程上启动一个 CGEventTap + CFRunLoop。
@@ -409,7 +459,7 @@ pub(crate) fn start_event_tap_thread(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || unsafe {
         crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
-        let tap = create_tap_with_retry(
+        let created = create_tap_with_retry(
             location,
             placement,
             options,
@@ -422,16 +472,21 @@ pub(crate) fn start_event_tap_thread(
             None,
         );
 
-        if tap.is_none() {
+        let Some(created) = created else {
             return;
-        }
+        };
 
         // 看门狗:系统可能在启动期/调试器下禁用 tap,挂定时器定期检查并自愈。
         // Watchdog: the system may disable the tap during busy startup or under a debugger;
         // attach a periodic check that self-heals it.
-        start_tap_watchdog(tap.unwrap());
+        let watchdog = start_tap_watchdog(created.tap);
         on_started();
         CFRunLoopRun();
+        if !watchdog.is_null() {
+            CFRunLoopTimerInvalidate(watchdog);
+            crate::ffi::CFRelease(watchdog as *const c_void);
+        }
+        teardown_event_tap(CFRunLoopGetCurrent(), created);
     })
 }
 

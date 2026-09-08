@@ -1029,7 +1029,7 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
         // session 层 tap:与切换器同层,能拦截真实硬件按键;DEFAULT_TAP 才能吞事件。
         // Session-level tap: same layer as the switcher, sees real hardware keys; DEFAULT_TAP
         // is required to swallow events.
-        let tap = event_tap::create_tap_with_retry(
+        let created = event_tap::create_tap_with_retry(
             tap_location::SESSION_EVENT_TAP,
             tap_placement::HEAD_INSERT,
             tap_options::DEFAULT_TAP,
@@ -1039,14 +1039,11 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
             "winctl",
             Some(&STOP_REQUESTED),
         );
-        let tap = match tap {
-            Some(t) => t,
+        let created = match created {
+            Some(created) => created,
             None => return,
         };
         let rl = CFRunLoopGetCurrent();
-        let source = event_tap::CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
-        event_tap::CFRunLoopAddSource(rl, source, event_tap::kCFRunLoopDefaultMode);
-        event_tap::CGEventTapEnable(tap, true);
         // 存入 RunLoop 后复查停止标志,关闭“存入后、run 前置位”的竞态窗口。
         // Re-check the stop flag after storing the RunLoop to close the store-vs-run race.
         *runloop_static().lock().unwrap() = Some(rl);
@@ -1055,6 +1052,7 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
             event_tap::CFRunLoopRun();
         }
         *runloop_static().lock().unwrap() = None;
+        event_tap::teardown_event_tap(rl, created);
     })
 }
 

@@ -193,21 +193,29 @@ unsafe extern "C" fn mouse_event_tap_callback(
     }
 }
 
-/// 鼠标事件线程的 RunLoop 引用,供 stop() 调 CFRunLoopStop。
-/// 由 start() 的线程在进入 CFRunLoopRun 前存入、结束后清空。
+/// 鼠标事件线程当前的 tap 与 RunLoop,供 stop() 先同步禁用 tap、再停止 RunLoop。
+/// 由 start() 的线程在进入 CFRunLoopRun 前存入、结束前清空。
 /// 用 Send+Sync 包装的 Mutex(static 需要 Send+Sync,与 device.rs 的 ManagerMutex 同模式)。
 ///
-/// The mouse thread's RunLoop reference, for stop() to call CFRunLoopStop on.
-/// Stored by the start() thread before CFRunLoopRun and cleared when it exits.
+/// The mouse thread's active tap and RunLoop, allowing stop() to disable the tap synchronously
+/// before stopping its RunLoop. Stored before CFRunLoopRun and cleared before the thread exits.
 /// Wrapped Mutex with Send+Sync (same pattern as device.rs's ManagerMutex; statics need it).
-struct RunLoopMutex(Mutex<Option<event_tap::CFRunLoopRef>>);
-unsafe impl Send for RunLoopMutex {}
-unsafe impl Sync for RunLoopMutex {}
+#[derive(Default)]
+struct TapControl {
+    tap: Option<event_tap::CFMachPortRef>,
+    run_loop: Option<event_tap::CFRunLoopRef>,
+}
 
-static RUNLOOP: OnceLock<RunLoopMutex> = OnceLock::new();
+struct TapControlMutex(Mutex<TapControl>);
+unsafe impl Send for TapControlMutex {}
+unsafe impl Sync for TapControlMutex {}
 
-fn runloop_static() -> &'static Mutex<Option<event_tap::CFRunLoopRef>> {
-    &RUNLOOP.get_or_init(|| RunLoopMutex(Mutex::new(None))).0
+static TAP_CONTROL: OnceLock<TapControlMutex> = OnceLock::new();
+
+fn tap_control() -> &'static Mutex<TapControl> {
+    &TAP_CONTROL
+        .get_or_init(|| TapControlMutex(Mutex::new(TapControl::default())))
+        .0
 }
 
 /// 运行时停止请求标志:stop() 置位后,重试循环(thread::sleep 阻塞期)醒来即放弃,
@@ -229,9 +237,15 @@ pub(crate) fn stop() {
     // Set the flag first, then stop the RunLoop: during the retry window the thread sees the
     // flag on wake-up (no RunLoop involved yet).
     STOP_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    let rl = runloop_static().lock().unwrap().take();
-    if let Some(rl) = rl {
-        unsafe {
+    let control = tap_control().lock().unwrap();
+    unsafe {
+        // 先同步禁用 HID tap,确保当前点击返回后下一次物理点击不会进入已停止的 RunLoop。
+        // Disable the HID tap synchronously first, ensuring the next physical click cannot enter
+        // a RunLoop that is already stopping.
+        if let Some(tap) = control.tap {
+            event_tap::CGEventTapEnable(tap, false);
+        }
+        if let Some(rl) = control.run_loop {
             event_tap::CFRunLoopStop(rl);
         }
     }
@@ -251,19 +265,20 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         | (1u64 << K_CG_EVENT_OTHER_MOUSE_UP)
         | (1u64 << K_CG_EVENT_SCROLL_WHEEL);
 
+    // 在线程启动前清掉旧停止标志；之后发生的 stop() 不会被新线程覆盖。
+    // Clear the stale stop flag before spawning; a subsequent stop() can no longer be overwritten
+    // by the new thread starting late.
+    STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+
     thread::spawn(move || unsafe {
         crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
-        // 新线程首件事:清掉上次运行可能残留的停止标志。
-        // First thing in the new thread: clear any stale stop flag from a previous run.
-        STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
-
         // 启动时枚举一次已连接设备(惰性:归因失败时也会重枚举)。
         // Enumerate connected devices once at startup (also lazily re-done on attribution failure).
         device::ensure_enumerated();
         // 创建 event tap(HID 层,可修改/丢弃事件)。传取消标志:停止请求(缺权限重试期)提前退出。
         // Create event tap (HID level, mutable). Pass the cancel flag: bails out early on a
         // stop request (even during the missing-permission retry window).
-        let tap = event_tap::create_tap_with_retry(
+        let created = event_tap::create_tap_with_retry(
             tap_location::HID_EVENT_TAP,
             tap_placement::HEAD_INSERT,
             tap_options::DEFAULT_TAP,
@@ -274,15 +289,12 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             Some(&STOP_REQUESTED),
         );
 
-        let tap = match tap {
-            Some(t) => t,
+        let created = match created {
+            Some(created) => created,
             None => return,
         };
 
         let rl = CFRunLoopGetCurrent();
-        let source = event_tap::CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
-        event_tap::CFRunLoopAddSource(rl, source, event_tap::kCFRunLoopDefaultMode);
-        event_tap::CGEventTapEnable(tap, true);
 
         // 设备插拔监听:蓝牙断连重连时事件驱动地重建注册表(避免旧 client 缓存过期
         // 导致归因链失效,滚动方向/档位错乱)。回调与 event tap 同线程,安全。
@@ -297,13 +309,28 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         // Store the RunLoop for stop(); re-check the stop flag after storing to close the race
         // where the flag is set between the store and the run (stop() either reads Some and
         // CFRunLoopStop works, or reads None and the thread's check catches it).
-        *runloop_static().lock().unwrap() = Some(rl);
+        {
+            let mut control = tap_control().lock().unwrap();
+            control.tap = Some(created.tap);
+            control.run_loop = Some(rl);
+        }
         if !STOP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
             log_debug!("Mouse event tap started.");
             // 阻塞运行 RunLoop,直到 stop() 触发 CFRunLoopStop 或线程被终止。
             // Block on the RunLoop until stop() fires CFRunLoopStop or the thread is killed.
             event_tap::CFRunLoopRun();
         }
-        *runloop_static().lock().unwrap() = None;
+        // RunLoop 返回后先禁用 tap,再从共享状态移除并释放 CF 对象。
+        // Once the RunLoop returns, disable the tap before removing it from shared state and
+        // releasing its Core Foundation objects.
+        event_tap::CGEventTapEnable(created.tap, false);
+        {
+            let mut control = tap_control().lock().unwrap();
+            if control.tap == Some(created.tap) {
+                control.tap = None;
+                control.run_loop = None;
+            }
+        }
+        event_tap::teardown_event_tap(rl, created);
     })
 }

@@ -530,7 +530,7 @@ pub(super) unsafe fn recording_thread() {
     *REC_RUNLOOP.0.lock().unwrap() = Some(rl);
     // otherMouseDown(25) | keyDown(10) | flagsChanged(12)
     let mask: crate::event_tap::CGEventMask = (1u64 << 25) | (1u64 << 10) | (1u64 << 12);
-    let tap = crate::event_tap::create_tap_with_retry(
+    let created = crate::event_tap::create_tap_with_retry(
         crate::event_tap::tap_location::HID_EVENT_TAP,
         crate::event_tap::tap_placement::HEAD_INSERT,
         crate::event_tap::tap_options::DEFAULT_TAP,
@@ -540,7 +540,7 @@ pub(super) unsafe fn recording_thread() {
         "rec",
         Some(&REC_CANCEL),
     );
-    let Some(tap) = tap else {
+    let Some(created) = created else {
         // tap 创建失败(缺权限等):复位状态,让主线程提示取消。
         // Tap creation failed (missing permission etc.): reset state, notify cancel.
         *REC_STAGE.lock().unwrap() = RecStage::Idle;
@@ -549,14 +549,12 @@ pub(super) unsafe fn recording_thread() {
         notify_main(sel!(handleRecordingCancelled:));
         return;
     };
-    let source = crate::event_tap::CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
-    crate::event_tap::CFRunLoopAddSource(rl, source, crate::event_tap::kCFRunLoopDefaultMode);
-    crate::event_tap::CGEventTapEnable(tap, true);
-    *REC_TAP.0.lock().unwrap() = Some(tap);
+    *REC_TAP.0.lock().unwrap() = Some(created.tap);
     log_debug!("[mouse] recording tap started");
     crate::event_tap::CFRunLoopRun();
     *REC_TAP.0.lock().unwrap() = None;
     *REC_RUNLOOP.0.lock().unwrap() = None;
+    crate::event_tap::teardown_event_tap(rl, created);
     log_debug!("[mouse] recording tap stopped");
 }
 
