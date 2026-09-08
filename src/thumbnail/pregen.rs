@@ -104,13 +104,46 @@ pub(crate) fn start() {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let (tx, rx) = flume::unbounded::<ObsCmd>();
+    // start() is called from the main-thread runtime configuration path. Capture the initial
+    // window keys here, before spawning the observer thread, so the worker never reads TAB_STATE.
+    // start() 由主线程运行时配置入口调用。在线程启动前快照初始窗口 key，避免观察线程读取
+    // TAB_STATE。
+    let startup_jobs = {
+        let state = crate::TAB_STATE.lock().unwrap();
+        match state.as_ref() {
+            Some(state) => {
+                let capture_state = CAPTURE_STATE.lock().unwrap();
+                state
+                    .windows
+                    .iter()
+                    .filter(|window| {
+                        !window.minimized
+                            && window.window_id != 0
+                            && window.bounds.2 > 0.0
+                            && window.bounds.3 > 0.0
+                    })
+                    .map(|window| {
+                        (
+                            window.pid,
+                            window.window_id,
+                            capture_state.pid_generation(window.pid),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+            None => Vec::new(),
+        }
+    };
+    // 生命周期命令低频但必须有界;runloop source 会很快清空,容量足以吸收启动抖动。
+    // Lifecycle commands are low-volume but still bounded; the runloop source drains them
+    // promptly, and this capacity absorbs startup bursts without unbounded retention.
+    let (tx, rx) = flume::bounded::<ObsCmd>(64);
     let _ = CMD_TX.set(tx);
     let _ = CMD_RX.set(rx);
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     std::thread::Builder::new()
         .name("thumb-observer".into())
-        .spawn(|| unsafe {
+        .spawn(move || unsafe {
             let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
             // 先发布命令 source/runloop，再做 AX 安装与预热。启动期间到达的
             // Launch/Terminate 命令会保持 source signaled，进入 runloop 后立即处理，
@@ -158,7 +191,7 @@ pub(crate) fn start() {
                 pids.len(),
                 capture_allowed()
             );
-            pregen_startup_windows();
+            pregen_startup_windows(startup_jobs);
             if !STOP_REQUESTED.load(Ordering::SeqCst) {
                 CFRunLoopRun();
             }
@@ -211,8 +244,15 @@ pub(crate) fn app_launched(pid: i32) {
         return;
     }
     if let Some(tx) = CMD_TX.get() {
-        let _ = tx.send(ObsCmd::Install(pid));
-        signal_observer_runloop();
+        match tx.try_send(ObsCmd::Install(pid)) {
+            Ok(()) => signal_observer_runloop(),
+            Err(flume::TrySendError::Full(_)) => {
+                log_debug!("[thumb] observer install command dropped (queue full) pid={pid}");
+            }
+            Err(flume::TrySendError::Disconnected(_)) => {
+                log_debug!("[thumb] observer install command dropped (worker stopped) pid={pid}");
+            }
+        }
     }
 }
 
@@ -241,8 +281,15 @@ pub(crate) fn app_terminated(pid: i32) {
     // The terminated app's pending blank-retry slots become moot as well.
     super::forget_blank_retries_for_pid(pid);
     if let Some(tx) = CMD_TX.get() {
-        let _ = tx.send(ObsCmd::Remove(pid));
-        signal_observer_runloop();
+        match tx.try_send(ObsCmd::Remove(pid)) {
+            Ok(()) => signal_observer_runloop(),
+            Err(flume::TrySendError::Full(_)) => {
+                log_debug!("[thumb] observer remove command dropped (queue full) pid={pid}");
+            }
+            Err(flume::TrySendError::Disconnected(_)) => {
+                log_debug!("[thumb] observer remove command dropped (worker stopped) pid={pid}");
+            }
+        }
     }
 }
 
@@ -336,41 +383,16 @@ unsafe fn install_observer_for_pid(pid: i32) {
 /// Startup prewarming reuses AppState's already AX-paired MRU snapshot instead of
 /// repeating one AX query per PID. It takes only the first STARTUP_PREWARM_MAX
 /// non-minimized windows with usable bounds.
-unsafe fn pregen_startup_windows() {
+unsafe fn pregen_startup_windows(startup_jobs: Vec<(i32, u32, u64)>) {
     if !crate::theme::thumbnails_enabled() || !capture_allowed() {
         log_debug!("[thumb] startup prewarm skipped (disabled or unauthorized)");
         return;
     }
-    let (jobs, eligible) = {
-        let state = crate::TAB_STATE.lock().unwrap();
-        let Some(state) = state.as_ref() else {
-            return;
-        };
-        let capture_state = CAPTURE_STATE.lock().unwrap();
-        let eligible: Vec<(i32, u32, u64)> = state
-            .windows
-            .iter()
-            .filter(|window| {
-                !window.minimized
-                    && window.window_id != 0
-                    && window.bounds.2 > 0.0
-                    && window.bounds.3 > 0.0
-            })
-            .map(|window| {
-                (
-                    window.pid,
-                    window.window_id,
-                    capture_state.pid_generation(window.pid),
-                )
-            })
-            .collect();
-        let jobs = eligible
-            .iter()
-            .copied()
-            .take(STARTUP_PREWARM_MAX)
-            .collect::<Vec<_>>();
-        (jobs, eligible.len())
-    };
+    let eligible = startup_jobs.len();
+    let jobs = startup_jobs
+        .into_iter()
+        .take(STARTUP_PREWARM_MAX)
+        .collect::<Vec<_>>();
     let mut queued = 0;
     for (pid, wid, pid_generation) in &jobs {
         queued += usize::from(enqueue_job_for_generation(

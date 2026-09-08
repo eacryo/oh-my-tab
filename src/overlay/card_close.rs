@@ -265,6 +265,7 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
         drop(pending_ref);
         start_async_ax_close(close_key);
         let Some(controller) = *crate::CONTROLLER.lock().unwrap() else {
+            *CARD_CLOSE_AX_RESULT.lock().unwrap() = None;
             *PENDING_CARD_CLOSE.lock().unwrap() = None;
             return;
         };
@@ -299,17 +300,10 @@ pub(super) fn start_async_ax_close(key: WindowKey) {
     }
     std::thread::spawn(move || {
         let result = crate::window_collector::close_ax_window(key.0, key.1);
-        {
-            let mut closing = PENDING_CARD_CLOSE.lock().unwrap();
-            if let Some(current) = closing
-                .as_mut()
-                .filter(|current| (current.pid, current.cgwid) == key)
-            {
-                current.ax_result = Some(result);
-            } else {
-                return;
-            }
-        }
+        // 只发布值类型结果;主线程回调负责校验 key 并合并到动画状态。
+        // Publish only a value result; the main-thread callback validates the key and merges it
+        // into the animation state.
+        *CARD_CLOSE_AX_RESULT.lock().unwrap() = Some((key, result));
         unsafe {
             let Some(controller) = *crate::CONTROLLER.lock().unwrap() else {
                 return;
@@ -358,6 +352,14 @@ pub(crate) extern "C" fn on_card_close_finished(_self: *mut c_void, _cmd: Sel, _
 /// AX 关闭后台结果回调;与动画回调汇合后再触发 UI 重排。
 /// AX worker result callback; joins the animation callback before triggering UI reflow.
 pub(crate) extern "C" fn on_card_close_ax_result(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    let Some((key, result)) = CARD_CLOSE_AX_RESULT.lock().unwrap().take() else {
+        return;
+    };
+    if let Some(pending) = PENDING_CARD_CLOSE.lock().unwrap().as_mut() {
+        if (pending.pid, pending.cgwid) == key {
+            pending.ax_result = Some(result);
+        }
+    }
     finish_pending_card_close();
 }
 
@@ -381,6 +383,7 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
         let old_windows = state.windows.clone();
         let was_visible = state.visible;
         state.windows.remove(actual_idx);
+        crate::WINDOW_COUNT.store(state.windows.len(), std::sync::atomic::Ordering::Release);
         state.mru.remove(&key);
         state.selected =
             remove_window_adjust_selection(state.selected, actual_idx, state.windows.len());

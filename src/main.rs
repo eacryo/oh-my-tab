@@ -48,8 +48,9 @@ use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use settings::*;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::{c_void, CString};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
@@ -154,13 +155,173 @@ impl AppState {
 // ========== Global State ==========
 
 pub(crate) static TAB_STATE: Mutex<Option<AppState>> = Mutex::new(None);
+/// 主线程维护的窗口数量快照。后台诊断只读取这个值，不直接触碰 TAB_STATE。
+/// Main-thread-published window-count snapshot. Background diagnostics read this value
+/// instead of touching TAB_STATE directly.
+pub(crate) static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static CONTROLLER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
 /// 菜单项与设置按钮共用的 ObjC target 对象（OhMyTabMenuTarget2 实例）。
 /// Shared ObjC target object for menu items and settings buttons.
 pub(crate) static MENU_TARGET: Mutex<Option<ObjPtr>> = Mutex::new(None);
-pub(crate) static STATUS_EVENT_TX: std::sync::OnceLock<flume::Sender<GlobalEvent>> =
-    std::sync::OnceLock::new();
+const GLOBAL_INPUT_CAPACITY: usize = 32;
+
+/// 全局输入 tap 的有界聚合状态。Tab 按键保留顺序，release 单独记账，低价值控制事件
+/// 只保留有限队列，避免主线程阻塞时 CGEventTap 无限堆积。
+/// Bounded aggregate for global input events. Tab presses keep order, release is latched
+/// separately, and low-value control events use a finite queue so a blocked main thread cannot
+/// cause the CGEventTap backlog to grow without bound.
+struct PendingGlobalInput {
+    tab_steps: VecDeque<bool>,
+    release_pending: bool,
+    clipboard_pending: bool,
+    other: VecDeque<GlobalEvent>,
+}
+
+impl PendingGlobalInput {
+    fn push(&mut self, event: GlobalEvent) {
+        match event {
+            GlobalEvent::CmdTabPressed | GlobalEvent::CmdShiftTabPressed => {
+                let backward = matches!(event, GlobalEvent::CmdShiftTabPressed);
+                if self.tab_steps.len() >= GLOBAL_INPUT_CAPACITY {
+                    self.tab_steps.pop_front();
+                    log_debug!("[kbd] coalesced oldest tab step (input queue full)");
+                }
+                self.tab_steps.push_back(backward);
+            }
+            GlobalEvent::CmdReleased => {
+                // release 不能丢；即使对应的按下事件被合并，主线程也必须看到释放。
+                // Release must not be dropped: even when presses are coalesced, the main thread
+                // must observe the modifier release.
+                self.release_pending = true;
+            }
+            GlobalEvent::ClipboardToggled => {
+                self.clipboard_pending = true;
+            }
+            GlobalEvent::WindowControl(_) | GlobalEvent::QuickAction(_) => {
+                if self.other.len() >= GLOBAL_INPUT_CAPACITY {
+                    self.other.pop_front();
+                    log_debug!("[kbd] dropped oldest auxiliary input (queue full)");
+                }
+                self.other.push_back(event);
+            }
+        }
+    }
+}
+
+static PENDING_GLOBAL_INPUT: OnceLock<Mutex<PendingGlobalInput>> = OnceLock::new();
+static GLOBAL_INPUT_DRAIN_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 从 event tap 线程非阻塞地聚合输入，并只安排一个主线程 drain 回调。
+/// Non-blockingly aggregate input on the event-tap thread and schedule at most one main-thread
+/// drain callback.
+pub(crate) fn enqueue_global_event(event: GlobalEvent) {
+    let pending = PENDING_GLOBAL_INPUT.get_or_init(|| {
+        Mutex::new(PendingGlobalInput {
+            tab_steps: VecDeque::new(),
+            release_pending: false,
+            clipboard_pending: false,
+            other: VecDeque::new(),
+        })
+    });
+    pending.lock().unwrap().push(event);
+    schedule_global_input_drain();
+}
+
+fn schedule_global_input_drain() {
+    if GLOBAL_INPUT_DRAIN_SCHEDULED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let Some(controller) = CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+        GLOBAL_INPUT_DRAIN_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![
+            controller,
+            performSelectorOnMainThread: sel!(handleGlobalInputDrain:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
+
+/// 主线程一次消费当前输入批次；release 在最后执行，保证快速 Tab 后的提交语义不变。
+/// Main-thread consumer for one input batch; release is applied last so rapid Tab presses retain
+/// their existing commit semantics.
+extern "C" fn on_global_input_drain(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    let Some(pending) = PENDING_GLOBAL_INPUT.get() else {
+        return;
+    };
+    let (tab_steps, clipboard_pending, other, release_pending) = {
+        let mut state = pending.lock().unwrap();
+        let tab_steps = std::mem::take(&mut state.tab_steps);
+        let clipboard_pending = state.clipboard_pending;
+        state.clipboard_pending = false;
+        let other = std::mem::take(&mut state.other);
+        let release_pending = state.release_pending;
+        state.release_pending = false;
+        GLOBAL_INPUT_DRAIN_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+        (tab_steps, clipboard_pending, other, release_pending)
+    };
+
+    for backward in tab_steps {
+        if backward {
+            on_cmd_shift_tab_pressed(
+                std::ptr::null_mut(),
+                sel!(handleCmdShiftTabPressed:),
+                std::ptr::null_mut(),
+            );
+        } else {
+            on_cmd_tab_pressed(
+                std::ptr::null_mut(),
+                sel!(handleCmdTabPressed:),
+                std::ptr::null_mut(),
+            );
+        }
+    }
+    if clipboard_pending {
+        clipboard::on_clipboard_toggle(
+            std::ptr::null_mut(),
+            sel!(onClipboardToggled:),
+            std::ptr::null_mut(),
+        );
+    }
+    for event in other {
+        match event {
+            GlobalEvent::WindowControl(direction) => window_management::apply_direction(direction),
+            GlobalEvent::QuickAction(action) => {
+                if let Some(action) = quick_actions::QuickAction::from_isize(action as isize) {
+                    quick_actions::apply_action(action);
+                }
+            }
+            GlobalEvent::CmdTabPressed
+            | GlobalEvent::CmdShiftTabPressed
+            | GlobalEvent::CmdReleased
+            | GlobalEvent::ClipboardToggled => {}
+        }
+    }
+    if release_pending {
+        on_cmd_released(
+            std::ptr::null_mut(),
+            sel!(handleCmdReleased:),
+            std::ptr::null_mut(),
+        );
+    }
+
+    let has_pending = {
+        let state = pending.lock().unwrap();
+        !state.tab_steps.is_empty()
+            || state.clipboard_pending
+            || !state.other.is_empty()
+            || state.release_pending
+    };
+    if !has_pending {
+        return;
+    }
+    schedule_global_input_drain();
+}
 
 // ========== Helper Functions ==========
 // make_nsstring / release_obj / has_accessibility_permission / hex_to_*color / layer_set_* 已移至 `ffi.rs`
@@ -224,12 +385,28 @@ struct ActivationFocusTask {
 
 static ACTIVATION_FOCUS_TX: OnceLock<flume::Sender<ActivationFocusTask>> = OnceLock::new();
 
+/// 后台 AX 查询完成后只把值类型结果投递回主线程；窗口 MRU/焦点状态不再由工作线程修改。
+/// Value-only result delivered back to the main thread after the background AX query; worker
+/// threads never mutate window MRU/focus state directly.
+#[derive(Clone, Copy)]
+struct ActivationFocusResult {
+    pid: i32,
+    cgwid: u32,
+    activated_at: std::time::Instant,
+    attempt: usize,
+}
+
+static ACTIVATION_FOCUS_RESULTS: OnceLock<Mutex<Vec<ActivationFocusResult>>> = OnceLock::new();
+static ACTIVATION_FOCUS_RESULT_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 启动固定大小的 AX 焦点查询队列，避免连续 App 激活创建无限短命线程。
 /// Start a fixed-size AX focus queue so repeated app activations cannot create an
 /// unbounded number of short-lived threads.
 fn start_activation_focus_scheduler() {
     let (tx, rx) = flume::bounded::<ActivationFocusTask>(32);
     let _ = ACTIVATION_FOCUS_TX.set(tx);
+    let _ = ACTIVATION_FOCUS_RESULTS.set(Mutex::new(Vec::new()));
     for worker in 0..2 {
         let rx = rx.clone();
         thread::Builder::new()
@@ -241,6 +418,78 @@ fn start_activation_focus_scheduler() {
                 }
             })
             .expect("spawn activation-focus worker");
+    }
+}
+
+/// 安排一次主线程回调来消费激活焦点结果；多个 worker 结果合并到同一批次。
+/// Schedule one main-thread callback to consume activation-focus results; results from
+/// multiple workers are coalesced into one batch.
+fn schedule_activation_focus_result(result: ActivationFocusResult) {
+    let Some(results) = ACTIVATION_FOCUS_RESULTS.get() else {
+        return;
+    };
+    results.lock().unwrap().push(result);
+    if ACTIVATION_FOCUS_RESULT_SCHEDULED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let Some(controller) = CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+        ACTIVATION_FOCUS_RESULT_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![
+            controller,
+            performSelectorOnMainThread: sel!(handleActivationFocusResult:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
+
+/// 主线程消费后台焦点查询结果，统一更新 AppState 并启动缩略图激活补拍。
+/// Main-thread consumer for background focus-query results. It updates AppState and starts
+/// the activation thumbnail refresh from one serialized state transition.
+extern "C" fn on_activation_focus_result(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    let Some(results) = ACTIVATION_FOCUS_RESULTS.get() else {
+        return;
+    };
+    let batch = {
+        let mut pending = results.lock().unwrap();
+        let batch = std::mem::take(&mut *pending);
+        ACTIVATION_FOCUS_RESULT_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+        batch
+    };
+    for result in batch {
+        if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
+            window_refresh::best_effort_bump_focus_key(state, result.pid, result.cgwid);
+            log_debug!(
+                "app-activated bump: pid={} cgwid={} attempt={}",
+                result.pid,
+                result.cgwid,
+                result.attempt
+            );
+        }
+        thumbnail::refresh_after_activation(result.pid, result.cgwid, result.activated_at);
+    }
+    // 结果可能恰好在 take 后到达，检查并补发下一批，避免 flag 清零窗口丢通知。
+    // A result may arrive just after take; check and schedule another batch so the flag
+    // transition cannot strand a notification.
+    if results.lock().unwrap().is_empty() {
+        return;
+    }
+    if !ACTIVATION_FOCUS_RESULT_SCHEDULED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let Some(controller) = CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+            ACTIVATION_FOCUS_RESULT_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        unsafe {
+            let _: () = msg_send![
+                controller,
+                performSelectorOnMainThread: sel!(handleActivationFocusResult:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
     }
 }
 
@@ -296,22 +545,12 @@ fn resolve_activation_focus(task: ActivationFocusTask) {
                     bumped = true;
                     break;
                 }
-                let mut state_opt = TAB_STATE.lock().unwrap();
-                if let Some(ref mut state) = *state_opt {
-                    // 同 on_window_server_event:AX 查到的窗口只有确实在显示列表里才记 focus_key,
-                    // 避免未确认的 CG surface 污染焦点锚点。
-                    // Same guard as on_window_server_event: anchor the focus key only when the
-                    // AX-resolved window is actually shown, so an unconfirmed CG surface cannot
-                    // poison the focus anchor.
-                    window_refresh::best_effort_bump_focus_key(state, task.pid, cgwid);
-                    log_debug!(
-                        "app-activated bump: pid={} cgwid={} attempt={}",
-                        task.pid,
-                        cgwid,
-                        attempt + 1
-                    );
-                }
-                thumbnail::refresh_after_activation(task.pid, cgwid, task.activated_at);
+                schedule_activation_focus_result(ActivationFocusResult {
+                    pid: task.pid,
+                    cgwid,
+                    activated_at: task.activated_at,
+                    attempt: attempt + 1,
+                });
                 bumped = true;
                 break;
             }
@@ -1003,6 +1242,18 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleAppActivation:),
             on_app_activated as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleActivationFocusResult:),
+            on_activation_focus_result as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleGlobalInputDrain:),
+            on_global_input_drain as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -1714,7 +1965,9 @@ fn main() {
         }
     }
 
-    *TAB_STATE.lock().unwrap() = Some(AppState::new());
+    let initial_state = AppState::new();
+    WINDOW_COUNT.store(initial_state.windows.len(), Ordering::Release);
+    *TAB_STATE.lock().unwrap() = Some(initial_state);
 
     // 5. Create overlay window (hidden initially)
     let window = create_overlay_window();
@@ -1841,10 +2094,8 @@ fn main() {
         CFRelease(screen_params_name as *const c_void);
     }
 
-    // 7. Start event monitor + bridge thread
-    let (event_tx, event_rx) = flume::unbounded();
-    let _monitor = start_event_monitor(event_tx.clone());
-    STATUS_EVENT_TX.set(event_tx).ok();
+    // 7. Start event monitor; input is coalesced into one main-thread drain callback.
+    let _monitor = start_event_monitor();
 
     // 7b2. hover 轮询定时器在浮窗显示/隐藏时由 overlay 自行启停(show_overlay 调用
     // start_hover_timer),无需在此启动:主线程 runloop 每 16ms 读全局鼠标位置命中
@@ -1868,67 +2119,7 @@ fn main() {
     // complete feature profile.
     mem::start();
 
-    // Bridge thread: flume events → main thread via performSelectorOnMainThread
-    thread::Builder::new()
-        .name("global-event-bridge".into())
-        .spawn(move || {
-            performance::set_current_thread_qos(performance::ThreadQos::UserInteractive);
-            while let Ok(event) = event_rx.recv() {
-                // (selector, withObject):窗口控制的方向经 NSNumber 携带,其余事件无载荷。
-                // (selector, withObject): the window-control direction rides in an NSNumber;
-                // all other events carry no payload.
-                let (action, arg): (Sel, *mut AnyObject) = match event {
-                    GlobalEvent::CmdTabPressed => {
-                        (sel!(handleCmdTabPressed:), std::ptr::null_mut())
-                    }
-                    GlobalEvent::CmdShiftTabPressed => {
-                        (sel!(handleCmdShiftTabPressed:), std::ptr::null_mut())
-                    }
-                    GlobalEvent::CmdReleased => (sel!(handleCmdReleased:), std::ptr::null_mut()),
-                    GlobalEvent::ClipboardToggled => {
-                        (sel!(onClipboardToggled:), std::ptr::null_mut())
-                    }
-                    GlobalEvent::WindowControl(dir) => {
-                        // alloc+init(非 autorelease):bridge 线程没有 autorelease pool,
-                        // numberWithInteger 的自动释放对象会一直滞留。performSelectorOnMainThread
-                        // 会在执行前 retain 参数,因此这里立即 release 是安全的。
-                        // alloc+init (not autoreleased): the bridge thread has no autorelease
-                        // pool, so numberWithInteger's autoreleased object would linger.
-                        // performSelectorOnMainThread retains the argument until performed,
-                        // so releasing right away here is safe.
-                        let num: *mut AnyObject = unsafe { msg_send![class!(NSNumber), alloc] };
-                        let num: *mut AnyObject =
-                            unsafe { msg_send![num, initWithInteger: dir as isize] };
-                        (sel!(handleWindowControl:), num)
-                    }
-                    GlobalEvent::QuickAction(action) => {
-                        // 与 WindowControl 同模式:动作编号经 NSNumber 传到主线程。
-                        // Same pattern as WindowControl: the action id rides in an NSNumber.
-                        let num: *mut AnyObject = unsafe { msg_send![class!(NSNumber), alloc] };
-                        let num: *mut AnyObject =
-                            unsafe { msg_send![num, initWithInteger: action as isize] };
-                        (sel!(handleQuickAction:), num)
-                    }
-                };
-                // Read controller pointer from static (only written once, safe to read)
-                let ctrl = CONTROLLER.lock().unwrap().unwrap().0;
-                unsafe {
-                    let _: () = msg_send![ctrl,
-                        performSelectorOnMainThread: action,
-                        withObject: arg,
-                        waitUntilDone: false
-                    ];
-                    // 归还本线程持有的引用;主线程执行期间由 perform 机制持有的 retain 保活。
-                    // Give up this thread's reference; perform's own retain keeps the number
-                    // alive until the selector runs on the main thread.
-                    if !arg.is_null() {
-                        let _: () = msg_send![arg, release];
-                    }
-                }
-            }
-            log_debug!("Bridge thread exiting.");
-        })
-        .expect("spawn global-event-bridge thread");
+    // Global input is drained by handleGlobalInputDrain:; no bridge thread is needed.
 
     // 冒烟测试入口(--smoke-overlay):完整初始化后直接驱动召唤路径，再遍历并循环
     // 一次窗口列表并反向一步，覆盖超量布局的连续滚动/双向回绕；随后泵 2 秒主 runloop 让异步

@@ -1265,10 +1265,10 @@ unsafe fn enqueue_main_thread_ax_raise(
     if let Some(key) = minimized_key {
         CFRetain(key);
     }
-    MAIN_THREAD_AX_RAISES
-        .lock()
-        .unwrap()
-        .push(MainThreadAxRaise {
+    let pending = {
+        let mut pending = MAIN_THREAD_AX_RAISES.lock().unwrap();
+        let old = std::mem::take(&mut *pending);
+        pending.push(MainThreadAxRaise {
             pid,
             cgwid,
             app,
@@ -1279,6 +1279,14 @@ unsafe fn enqueue_main_thread_ax_raise(
             force_focus,
             generation,
         });
+        old
+    };
+    // 主线程尚未消费时只保留最新 generation，旧任务的 retained AX 对象立即释放。
+    // Keep only the newest generation while the main thread is busy; release retained AX
+    // objects from superseded jobs immediately.
+    for old in pending {
+        release_main_thread_ax_raise(&old);
+    }
 
     if let Some(controller) = crate::CONTROLLER.lock().unwrap().map(|ptr| ptr.0) {
         let _: () = msg_send![controller,
@@ -1305,17 +1313,23 @@ unsafe fn enqueue_main_thread_ax_raise(
 // A single dedicated raiser thread consumes jobs serially, so AX phases of consecutive
 // switches never overlap and completion order equals commit order (combined with the
 // supersede check, the final state is always the last switch).
-static RAISE_TX: std::sync::LazyLock<flume::Sender<RaiseJob>> = std::sync::LazyLock::new(|| {
-    let (tx, rx) = flume::unbounded::<RaiseJob>();
+struct RaiseQueue {
+    tx: flume::Sender<RaiseJob>,
+    rx: flume::Receiver<RaiseJob>,
+}
+
+static RAISE_QUEUE: std::sync::LazyLock<RaiseQueue> = std::sync::LazyLock::new(|| {
+    let (tx, rx) = flume::bounded::<RaiseJob>(1);
+    let worker_rx = rx.clone();
     std::thread::Builder::new()
         .name("ax-raiser".into())
         .spawn(move || {
-            for job in rx.iter() {
+            for job in worker_rx.iter() {
                 run_raise_ax_job(job);
             }
         })
         .expect("spawn ax-raiser thread");
-    tx
+    RaiseQueue { tx, rx }
 });
 
 /// 提交后台 AX 精确抬升任务。普通窗口只执行 cached AXRaise;已知最小化窗口先还原。
@@ -1335,14 +1349,29 @@ pub(crate) fn raise_window_ax_async(
         return 0;
     }
     let generation = RAISE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-    let _ = RAISE_TX.send(RaiseJob {
+    let job = RaiseJob {
         pid,
         cgwid,
         minimized,
         fast_path_ok,
         generation,
         enqueued_at: Instant::now(),
-    });
+    };
+    match RAISE_QUEUE.tx.try_send(job) {
+        Ok(()) => {}
+        Err(flume::TrySendError::Full(job)) => {
+            // 队列满表示旧任务尚未开始；移除它并保留最新 generation。
+            // A full slot means the old job has not started; replace it with the latest
+            // generation instead of letting stale raises accumulate.
+            let _ = RAISE_QUEUE.rx.try_recv();
+            if RAISE_QUEUE.tx.try_send(job).is_err() {
+                log_debug!("[raise] latest job could not replace queued job");
+            }
+        }
+        Err(flume::TrySendError::Disconnected(_)) => {
+            log_debug!("[raise] ax-raiser queue disconnected");
+        }
+    }
     generation
 }
 

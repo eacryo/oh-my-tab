@@ -135,12 +135,10 @@ unsafe extern "C" fn quick_actions_tap_callback(
                 });
                 if is_double {
                     *last = None;
-                    if let Some(tx) = crate::STATUS_EVENT_TX.get() {
-                        log_debug!("[quick] double-Control locate pointer");
-                        let _ = tx.send(GlobalEvent::QuickAction(QuickAction::LocatePointer as u8));
-                    } else {
-                        log_info!("[quick] double-Control dropped: event bridge unavailable");
-                    }
+                    log_debug!("[quick] double-Control locate pointer");
+                    crate::enqueue_global_event(GlobalEvent::QuickAction(
+                        QuickAction::LocatePointer as u8,
+                    ));
                 } else {
                     *last = Some(now);
                 }
@@ -183,14 +181,7 @@ unsafe extern "C" fn quick_actions_tap_callback(
         let autorepeat = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT);
         if autorepeat == 0 {
             log_debug!("[quick] keyDown Option+{:?}", action);
-            if let Some(tx) = crate::STATUS_EVENT_TX.get() {
-                let _ = tx.send(GlobalEvent::QuickAction(action as u8));
-            } else {
-                log_info!(
-                    "[quick] keyDown Option+{:?} dropped: event bridge unavailable",
-                    action
-                );
-            }
+            crate::enqueue_global_event(GlobalEvent::QuickAction(action as u8));
         }
     }
     // 吞掉匹配的 keyDown/keyUp(含自动重复),应用看不到这组组合键。

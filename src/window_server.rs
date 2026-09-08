@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ type RegisterNotifyFn = unsafe extern "C" fn(
 type RequestNotificationsFn =
     unsafe extern "C" fn(connection: i32, window_list: *mut u32, window_count: i32) -> i32;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WindowServerEvent {
     Created,
     Destroyed(u32),
@@ -62,9 +62,12 @@ struct OwnFocusIntent {
 static STARTED: AtomicBool = AtomicBool::new(false);
 static DELIVERY_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static SUBSCRIPTION_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
+static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
 static EVENT_TX: OnceLock<flume::Sender<WindowServerEvent>> = OnceLock::new();
 static MAIN_EVENTS: LazyLock<Mutex<VecDeque<WindowServerEvent>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
+const EVENT_CHANNEL_CAPACITY: usize = 64;
+const MAIN_EVENT_CAPACITY: usize = 128;
 static ACTIVATIONS: LazyLock<Mutex<HashMap<i32, ActivationState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static OWN_FOCUS_INTENT: LazyLock<Mutex<Option<OwnFocusIntent>>> =
@@ -129,7 +132,15 @@ unsafe extern "C" fn window_server_callback(
         _ => return,
     };
     if let Some(sender) = EVENT_TX.get() {
-        let _ = sender.send(event);
+        // WindowServer callbacks must never wait for the bridge thread. Lifecycle refreshes
+        // provide a later authoritative snapshot if a low-value duplicate is dropped.
+        // WindowServer 回调绝不能等待桥接线程；后续生命周期刷新会补齐被丢弃的低价值重复事件。
+        if let Err(flume::TrySendError::Full(_)) = sender.try_send(event) {
+            let dropped = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped == 1 || dropped.is_multiple_of(64) {
+                log_debug!("[windows] event bridge queue full; dropped={}", dropped);
+            }
+        }
     }
 }
 
@@ -160,7 +171,7 @@ pub(crate) fn start() {
         return;
     };
 
-    let (sender, receiver) = flume::unbounded();
+    let (sender, receiver) = flume::bounded(EVENT_CHANNEL_CAPACITY);
     let _ = EVENT_TX.set(sender);
     for event in [WINDOW_CREATED, WINDOW_DESTROYED, WINDOW_FOCUSED] {
         let result = unsafe {
@@ -185,7 +196,7 @@ pub(crate) fn start() {
         .spawn(move || {
             crate::performance::set_current_thread_qos(crate::performance::ThreadQos::Utility);
             while let Ok(event) = receiver.recv() {
-                MAIN_EVENTS.lock().unwrap().push_back(event);
+                enqueue_main_event(event);
                 schedule_main_delivery();
             }
         })
@@ -196,6 +207,56 @@ pub(crate) fn start() {
     // degrade after registration succeeds.
     let _ = request;
     log_debug!("WindowServer lifecycle notifications started");
+}
+
+/// 将 WindowServer 事件合并到有界主线程队列。
+/// Coalesce WindowServer events into a bounded main-thread queue.
+fn enqueue_main_event(event: WindowServerEvent) {
+    let mut events = MAIN_EVENTS.lock().unwrap();
+    match event {
+        WindowServerEvent::Created => {
+            if events
+                .iter()
+                .any(|queued| matches!(queued, WindowServerEvent::Created))
+            {
+                return;
+            }
+        }
+        WindowServerEvent::Destroyed(window_id) => {
+            // Destroyed is terminal for this window; remove stale Focused notifications so a
+            // delayed focus cannot overwrite the destruction in the same drain batch.
+            events.retain(
+                |queued| !matches!(queued, WindowServerEvent::Focused(id) if *id == window_id),
+            );
+        }
+        WindowServerEvent::Focused(window_id) => {
+            if events.iter().any(
+                |queued| matches!(queued, WindowServerEvent::Destroyed(id) if *id == window_id),
+            ) {
+                return;
+            }
+            if let Some(existing) = events
+                .iter_mut()
+                .find(|queued| matches!(queued, WindowServerEvent::Focused(id) if *id == window_id))
+            {
+                *existing = event;
+                return;
+            }
+        }
+    }
+
+    if events.len() >= MAIN_EVENT_CAPACITY {
+        // Keep destruction events preferentially; drop the oldest non-terminal event first.
+        if let Some(index) = events
+            .iter()
+            .position(|queued| !matches!(queued, WindowServerEvent::Destroyed(_)))
+        {
+            events.remove(index);
+        } else {
+            events.pop_front();
+        }
+    }
+    events.push_back(event);
 }
 
 /// 记录一次由切换器发起的目标窗口聚焦，避免后续 808 被误判成外部激活。

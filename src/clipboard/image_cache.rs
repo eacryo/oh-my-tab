@@ -157,10 +157,10 @@ pub(super) fn detail_result_still_wanted(
     detail_visible && current_hash == Some(job_hash)
 }
 
-/// 当前选中图片条目的 hash(工作线程也会调用;全部经 Mutex,跨线程安全)。
+/// 当前选中图片条目的 hash(主线程入队快照与主线程回调使用;全部经 Mutex)。
 /// 无选中 / 条目非图片 → None。
-/// The selected image entry's hash (also called from the worker thread; everything goes
-/// through Mutexes, so this is thread-safe). None without a selection / for text entries.
+/// The selected image entry's hash (used for main-thread enqueue snapshots and completion
+/// validation; all access goes through Mutexes). None without a selection / for text entries.
 pub(super) fn detail_current_hash() -> Option<u64> {
     let sel = *PICKER_SELECTION.lock().unwrap();
     if sel == NO_SELECTION {
@@ -184,6 +184,11 @@ pub(super) struct DetailPreviewJob {
     hash: u64,
     source_path: Option<String>,
     deliver: bool,
+    // 主线程入队时快照时效条件; worker 不直接读取 picker/UI 静态。
+    // Freshness inputs snapshotted by the main thread at enqueue time; the worker never
+    // reads picker/UI statics directly.
+    detail_visible: bool,
+    selected_hash: Option<u64>,
 }
 
 /// 详情预览工作线程的发件端(懒启动常驻循环)。flume recv 阻塞等待;线程随进程
@@ -195,7 +200,12 @@ pub(super) fn detail_job_sender() -> flume::Sender<DetailPreviewJob> {
     static SENDER: OnceLock<flume::Sender<DetailPreviewJob>> = OnceLock::new();
     SENDER
         .get_or_init(|| {
-            let (tx, rx) = flume::unbounded::<DetailPreviewJob>();
+            // 详情预览按 hash 去重，少量有界槽位足以吸收用户快速切换；队列满时
+            // 直接回滚在途标记，下一次打开详情会重试，不让剪贴板内容无限堆积。
+            // Detail requests are deduplicated by hash, so a small bounded queue is enough.
+            // When full, roll back the in-flight marker and retry on the next detail open
+            // instead of allowing clipboard payloads to accumulate without bound.
+            let (tx, rx) = flume::bounded::<DetailPreviewJob>(4);
             // 线程名带模块前缀,便于日志/调试器识别。
             // The thread name carries the module prefix for logs/debuggers.
             std::thread::Builder::new()
@@ -224,18 +234,12 @@ pub(super) unsafe fn run_detail_preview_job(job: &DetailPreviewJob) {
         DETAIL_INFLIGHT.lock().unwrap().remove(&job.hash);
         return;
     }
-    // 取件时效:按需任务出队时用户可能已经 ↑↓ 切走——跳过省一次解码+编码。
-    // 最终防线仍在主线程回调(生成期间也可能切走)。
-    // Dequeue freshness: the user may have arrowed away before an on-demand job starts --
-    // skipping saves a decode+encode. The final guard stays in the main-thread callback
-    // (the user can also navigate away mid-generation).
-    if job.deliver
-        && !detail_result_still_wanted(
-            DETAIL_VISIBLE.load(Ordering::SeqCst),
-            detail_current_hash(),
-            job.hash,
-        )
-    {
+    // 入队时效快照:worker 只使用主线程传入的值做廉价丢弃判断,不直接读取 picker/UI
+    // 静态。最终防线仍在主线程回调(生成期间也可能切走)。
+    // Enqueue-time freshness snapshot: the worker uses only values supplied by the main
+    // thread for this cheap discard check, never picker/UI statics. The final guard remains
+    // in the main-thread callback because the user can navigate away during generation.
+    if job.deliver && !detail_result_still_wanted(job.detail_visible, job.selected_hash, job.hash) {
         DETAIL_INFLIGHT.lock().unwrap().remove(&job.hash);
         return;
     }
@@ -305,14 +309,24 @@ pub(super) fn request_detail_preview(img: &ImageEntry, deliver: bool) {
             return;
         }
     }
-    if detail_job_sender()
-        .send(DetailPreviewJob {
+    let (detail_visible, selected_hash) = if deliver {
+        // 按需预览从主线程调用;在交给 worker 前快照 UI 时效条件。
+        // On-demand previews are requested from the main thread; snapshot UI freshness
+        // inputs before handing the job to the worker.
+        (DETAIL_VISIBLE.load(Ordering::SeqCst), detail_current_hash())
+    } else {
+        (false, None)
+    };
+    if matches!(
+        detail_job_sender().try_send(DetailPreviewJob {
             hash: img.hash,
             source_path: img.source_path.clone(),
             deliver,
-        })
-        .is_err()
-    {
+            detail_visible,
+            selected_hash,
+        }),
+        Err(flume::TrySendError::Disconnected(_)) | Err(flume::TrySendError::Full(_))
+    ) {
         DETAIL_INFLIGHT.lock().unwrap().remove(&img.hash);
     }
 }

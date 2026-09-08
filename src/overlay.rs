@@ -33,7 +33,7 @@ use crate::window_server;
 use crate::window_refresh::request_window_refresh;
 use crate::AppState;
 use crate::TAB_STATE;
-use crate::{log_debug, log_info};
+use crate::{log_debug, log_info, WINDOW_COUNT};
 
 // ========== 键盘键码 / keyboard key codes ==========
 
@@ -212,8 +212,12 @@ struct PendingCardClose {
     final_document_h: f64,
 }
 
-static PENDING_CARD_CLOSE: Mutex<Option<PendingCardClose>> = Mutex::new(None);
 type WindowKey = (i32, u32);
+static PENDING_CARD_CLOSE: Mutex<Option<PendingCardClose>> = Mutex::new(None);
+/// 后台 AX 关闭结果的单槽值类型消息;worker 不直接修改主线程动画状态。
+/// Single-slot value result from the background AX close; the worker never mutates the
+/// main-thread animation state directly.
+static CARD_CLOSE_AX_RESULT: Mutex<Option<(WindowKey, bool)>> = Mutex::new(None);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CardSignature {
@@ -2368,6 +2372,7 @@ fn finish_window_close(idx: usize, pid: i32, cgwid: u32) -> bool {
             return false;
         };
         state.windows.remove(actual_idx);
+        WINDOW_COUNT.store(state.windows.len(), std::sync::atomic::Ordering::Release);
         state.mru.remove(&(pid, cgwid));
         if state.windows.is_empty() {
             // 全部关完:收起浮窗,不留在空态。

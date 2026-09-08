@@ -1,12 +1,12 @@
 //! 窗口控制模块:Option+方向键模拟 Windows 的 Win+方向键窗口管理。
-//! 独立 session 层 event tap(专用线程)拦截 Option+方向键,事件经既有 bridge
+//! 独立 session 层 event tap(专用线程)拦截 Option+方向键,事件经有界输入聚合器
 //! (GlobalEvent -> performSelectorOnMainThread)投递到主线程执行 AX 移动/缩放/最小化。
 //! 状态(普通/最大化/上下半屏/左右半屏/四分屏)按当前 frame 与目标矩形匹配推断,无需持久状态;
 //! 「原尺寸」在首次从普通状态进入 snap 时按 CGWindowID 记录,供后续恢复逻辑使用。
 //!
 //! Window control module: Option+arrow keys emulate Windows' Win+arrow window management.
 //! A dedicated session-level event tap (own thread) intercepts Option+arrows; events travel
-//! through the existing bridge (GlobalEvent -> performSelectorOnMainThread) and run on the main
+//! through the bounded input aggregator (GlobalEvent -> performSelectorOnMainThread) and run on the main
 //! thread, which moves/resizes/minimizes windows via AX. Snap states (normal/maximized/top-bottom
 //! halves/left-right halves/quarters) are inferred by matching the current frame against target
 //! rectangles, so nothing is
@@ -973,14 +973,7 @@ unsafe extern "C" fn window_control_tap_callback(
         let autorepeat = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT);
         if autorepeat == 0 {
             log_debug!("[winctl] keyDown Option+{:?}", dir);
-            if let Some(tx) = crate::STATUS_EVENT_TX.get() {
-                let _ = tx.send(GlobalEvent::WindowControl(dir));
-            } else {
-                log_info!(
-                    "[winctl] keyDown Option+{:?} dropped: event bridge unavailable",
-                    dir
-                );
-            }
+            crate::enqueue_global_event(GlobalEvent::WindowControl(dir));
         }
     }
     // 吞掉匹配的 keyDown/keyUp(含自动重复),应用看不到这组组合键。

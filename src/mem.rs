@@ -10,7 +10,7 @@
 use crate::clipboard;
 use crate::ffi::{task_vm_info, TaskVmInfo};
 use crate::thumbnail;
-use crate::{log_debug, log_info, CONFIG, TAB_STATE};
+use crate::{log_debug, log_info, CONFIG, WINDOW_COUNT};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -101,12 +101,7 @@ struct Ledger {
 fn read_ledgers() -> Ledger {
     let (thumbs_items, thumbs_bytes) = thumbnail::cache_stats();
     let clip = clipboard::history_stats();
-    let windows = TAB_STATE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|state| state.windows.len())
-        .unwrap_or(0);
+    let windows = WINDOW_COUNT.load(Ordering::Acquire);
     Ledger {
         thumbs_items,
         thumbs_bytes,

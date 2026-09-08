@@ -33,7 +33,7 @@ use crate::event_tap::{
     CGEventSetIntegerValueField, CGEventSetType, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
 };
 use crate::mouse::shortcut::{FLAG_ALT, FLAG_CMD, FLAG_CTRL, FLAG_SHIFT};
-use crate::{log_debug, STATUS_EVENT_TX};
+use crate::{enqueue_global_event, log_debug};
 use std::sync::atomic::Ordering;
 
 /// 侧键按下:合成目标组合的 keyDown(修饰位附着),post 到 HID 层。
@@ -131,16 +131,14 @@ fn internal_dispatch(keycode: u16, flags: u32, down: bool) -> bool {
         FLAG_ALT
     };
     if keycode == 48 && flags == sw_mod {
-        if let Some(tx) = STATUS_EVENT_TX.get() {
-            if down {
-                let _ = tx.send(GlobalEvent::CmdTabPressed);
-            } else {
-                // 切换器在松开时提交切换(与键盘释放修饰键的语义一致)。
-                // The switcher commits on release (same semantics as releasing the modifier).
-                let _ = tx.send(GlobalEvent::CmdReleased);
-            }
-            return true;
+        if down {
+            enqueue_global_event(GlobalEvent::CmdTabPressed);
+        } else {
+            // 切换器在松开时提交切换(与键盘释放修饰键的语义一致)。
+            // The switcher commits on release (same semantics as releasing the modifier).
+            enqueue_global_event(GlobalEvent::CmdReleased);
         }
+        return true;
     }
     // 剪贴板呼出:Option+V(仅当功能启用;按下即 toggle,松开无动作)。
     // Clipboard summon: Option+V (only while enabled; toggles on press, nothing on release).
@@ -150,10 +148,8 @@ fn internal_dispatch(keycode: u16, flags: u32, down: bool) -> bool {
             .map(|c| c.clipboard.enabled)
             .unwrap_or(false);
         if enabled {
-            if let Some(tx) = STATUS_EVENT_TX.get() {
-                let _ = tx.send(GlobalEvent::ClipboardToggled);
-                return true;
-            }
+            enqueue_global_event(GlobalEvent::ClipboardToggled);
+            return true;
         }
     }
     false

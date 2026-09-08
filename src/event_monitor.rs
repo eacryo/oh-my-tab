@@ -8,7 +8,6 @@
 
 use crate::event_tap::{self, tap_location, tap_options, tap_placement};
 use crate::{log_debug, log_info};
-use flume::Sender;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,13 +17,13 @@ pub enum GlobalEvent {
     CmdShiftTabPressed,
     CmdReleased,
     ClipboardToggled,
-    // 窗口控制:Option+方向键(方向经 bridge 的 NSNumber 传到主线程)。
-    // Window control: Option+arrow (the direction crosses to the main thread via NSNumber
-    // in the bridge).
+    // 窗口控制:Option+方向键(方向经有界输入聚合器传到主线程)。
+    // Window control: Option+arrow (the direction crosses to the main thread via the bounded
+    // input aggregator).
     WindowControl(crate::window_management::Direction),
-    // 快捷操作:Option+I/E/D/L(动作编号经 bridge 的 NSNumber 传到主线程)。
-    // Quick actions: Option+I/E/D/L (the action id crosses to the main thread via NSNumber
-    // in the bridge).
+    // 快捷操作:Option+I/E/D/L(动作编号经有界输入聚合器传到主线程)。
+    // Quick actions: Option+I/E/D/L (the action id crosses to the main thread via the bounded
+    // input aggregator).
     QuickAction(u8),
 }
 
@@ -68,10 +67,8 @@ unsafe extern "C" fn event_tap_callback(
     _proxy: crate::event_tap::CGEventTapProxy,
     event_type: crate::event_tap::CGEventType,
     event: crate::event_tap::CGEventRef,
-    user_info: *mut c_void,
+    _user_info: *mut c_void,
 ) -> crate::event_tap::CGEventRef {
-    let sender = &*(user_info as *const Sender<GlobalEvent>);
-
     match event_type {
         K_CG_EVENT_KEY_DOWN => {
             let keycode =
@@ -124,7 +121,7 @@ unsafe extern "C" fn event_tap_callback(
                     let combo = if is_cmd { "Tab+Command" } else { "Tab+Option" };
                     log_debug!("[kbd] summon keyDown {}", combo);
                     TAB_PRESSED.store(true, Ordering::SeqCst);
-                    let _ = sender.send(switcher_tab_event(flags));
+                    crate::enqueue_global_event(switcher_tab_event(flags));
                     return std::ptr::null_mut();
                 }
             } else if keycode == K_VK_V && (flags & K_CG_EVENT_FLAG_MASK_ALTERNATE) != 0 {
@@ -156,7 +153,7 @@ unsafe extern "C" fn event_tap_callback(
                     log_debug!("[kbd] Option+V passthrough (clipboard disabled)");
                 } else {
                     log_debug!("[kbd] summon keyDown V+Option (clipboard)");
-                    let _ = sender.send(GlobalEvent::ClipboardToggled);
+                    crate::enqueue_global_event(GlobalEvent::ClipboardToggled);
                     return std::ptr::null_mut();
                 }
             }
@@ -169,7 +166,7 @@ unsafe extern "C" fn event_tap_callback(
                 K_CG_EVENT_FLAG_MASK_ALTERNATE
             };
             if (flags & mod_mask) == 0 && TAB_PRESSED.swap(false, Ordering::SeqCst) {
-                let _ = sender.send(GlobalEvent::CmdReleased);
+                crate::enqueue_global_event(GlobalEvent::CmdReleased);
             }
         }
         _ => {}
@@ -178,9 +175,7 @@ unsafe extern "C" fn event_tap_callback(
     event
 }
 
-pub fn start(sender: Sender<GlobalEvent>) -> std::thread::JoinHandle<()> {
-    let sender_ptr = Box::into_raw(Box::new(sender)) as *mut c_void;
-
+pub fn start() -> std::thread::JoinHandle<()> {
     let mask: crate::event_tap::CGEventMask =
         (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
 
@@ -198,7 +193,7 @@ pub fn start(sender: Sender<GlobalEvent>) -> std::thread::JoinHandle<()> {
         tap_options::DEFAULT_TAP,
         mask,
         Some(event_tap_callback),
-        sender_ptr as usize,
+        0,
         "kbd",
         || {
             // 快捷键可能被菜单/设置切换,按当前 SHORTCUT_IS_CMD 打印实际监听的组合键。

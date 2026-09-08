@@ -27,7 +27,7 @@ use crate::window_collector::{
     MruMap, WindowInfo,
 };
 use crate::window_server;
-use crate::{log_debug, AppState, CONTROLLER, TAB_STATE};
+use crate::{log_debug, AppState, CONTROLLER, TAB_STATE, WINDOW_COUNT};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -498,6 +498,7 @@ fn apply_window_refresh() {
         // the list — otherwise the overlay "keeps jumping after it opened". A directed refresh
         // (replace_pid) swapping a PID's cards also counts as a set change.
         state.windows = windows;
+        WINDOW_COUNT.store(state.windows.len(), std::sync::atomic::Ordering::Release);
         state.selected = selected;
         state.mru = mru;
         if state.windows.is_empty() {

@@ -1045,16 +1045,11 @@ pub(crate) fn log_capture_metrics(context: &str) {
 /// resume without waiting for another thumbnail request.
 pub(crate) fn wake_capture_worker() {
     if let Some(tx) = JOB_TX.get() {
-        let pending = CAPTURE_STATE
-            .lock()
-            .unwrap()
-            .desired
-            .values()
-            .filter(|capture| !capture.running)
-            .count();
-        for _ in 0..pending.max(1) {
-            let _ = tx.send(());
-        }
+        // 单个 wake 足以让 worker 持续从 CaptureState 取任务；不按 pending 数量复制
+        // 唤醒令牌，避免交互结束时一次性灌入大量过期 wake。
+        // One wake is enough: the worker drains CaptureState itself. Do not enqueue one token
+        // per pending job, which would replay a burst of stale wakes after interaction ends.
+        let _ = tx.try_send(());
     }
 }
 
@@ -1105,7 +1100,7 @@ fn enqueue_activation_job(
         return false;
     }
     THUMB_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-    if tx.send(()).is_err() {
+    if matches!(tx.try_send(()), Err(flume::TrySendError::Disconnected(_))) {
         CAPTURE_STATE.lock().unwrap().desired.remove(&key);
         return false;
     }
@@ -1136,7 +1131,7 @@ fn enqueue_job_inner(
         return false;
     }
     THUMB_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-    if tx.send(()).is_err() {
+    if matches!(tx.try_send(()), Err(flume::TrySendError::Disconnected(_))) {
         CAPTURE_STATE.lock().unwrap().desired.remove(&key);
         return false;
     }
@@ -1145,8 +1140,7 @@ fn enqueue_job_inner(
 
 fn ensure_capture_worker() -> &'static flume::Sender<()> {
     JOB_TX.get_or_init(|| {
-        let (tx, rx) = flume::unbounded::<()>();
-        let retry_tx = tx.clone();
+        let (tx, rx) = flume::bounded::<()>(1);
         std::thread::Builder::new()
             .name("thumb-capture".into())
             .spawn(move || {
@@ -1154,38 +1148,46 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                 log_debug!("[thumb] capture worker online");
                 for () in rx.iter() {
                     let interaction_active = crate::performance::switcher_interaction_active();
-                    let Some(job) = CAPTURE_STATE
-                        .lock()
-                        .unwrap()
-                        .take_next_for(interaction_active)
-                    else {
-                        if interaction_active {
-                            let pending_background = CAPTURE_STATE
-                                .lock()
-                                .unwrap()
-                                .desired
-                                .values()
-                                .any(|pending| {
-                                    !pending.running && pending.priority < CapturePriority::Visible
-                                });
-                            if pending_background {
-                                let deferred = THUMB_DEFERRED.fetch_add(1, Ordering::Relaxed) + 1;
-                                if deferred == 1 || deferred.is_multiple_of(16) {
-                                    log_debug!(
-                                        "[perf] thumbnail background work deferred during interaction count={}",
-                                        deferred
-                                    );
+                    // 一个 wake 令牌只负责启动一次 drain;bounded channel 会合并后续
+                    // wake,因此必须在同一轮持续消费 CaptureState,否则启动预热只会处理
+                    // 前一两项,其余任务虽仍在 desired 中却再也收不到令牌。
+                    // One wake token starts a drain. Because the bounded channel coalesces
+                    // later wakes, keep consuming CaptureState in this round; otherwise
+                    // startup prewarm processes only the first couple of jobs while the rest
+                    // remain in `desired` with no token left to wake the worker.
+                    loop {
+                        let Some(job) = CAPTURE_STATE
+                            .lock()
+                            .unwrap()
+                            .take_next_for(interaction_active)
+                        else {
+                            if interaction_active {
+                                let pending_background = CAPTURE_STATE
+                                    .lock()
+                                    .unwrap()
+                                    .desired
+                                    .values()
+                                    .any(|pending| {
+                                        !pending.running
+                                            && pending.priority < CapturePriority::Visible
+                                    });
+                                if pending_background {
+                                    let deferred =
+                                        THUMB_DEFERRED.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if deferred == 1 || deferred.is_multiple_of(16) {
+                                        log_debug!(
+                                            "[perf] thumbnail background work deferred during interaction count={}",
+                                            deferred
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        continue;
-                    };
-                    let queue_ms = job.enqueued_at.elapsed().as_millis() as u64;
-                    record_thumb_queue_wait(queue_ms);
-                    run_capture_job(job);
-                    let follow_up = CAPTURE_STATE.lock().unwrap().finish(job);
-                    if follow_up && retry_tx.send(()).is_err() {
-                        CAPTURE_STATE.lock().unwrap().desired.remove(&job.key);
+                            break;
+                        };
+                        let queue_ms = job.enqueued_at.elapsed().as_millis() as u64;
+                        record_thumb_queue_wait(queue_ms);
+                        run_capture_job(job);
+                        let _ = CAPTURE_STATE.lock().unwrap().finish(job);
                     }
                 }
             })
@@ -1378,11 +1380,11 @@ fn run_capture_job(job: CaptureJob) {
     // 不再按任务来源预先决定是否投递：启动预热也可能在浮窗打开后才完成。
     // Do not decide delivery from the request source: startup pre-generation may
     // also finish after the overlay has opened.
-    if overlay_wants(key.pid, key.wid) {
-        // 先写队列再跳主线程(handler 消费时有完整缓存)。
-        // Queue before hopping to main (the handler sees complete cache entries).
-        enqueue_ready_delivery(key);
-    }
+    // 结果统一交给主线程做可见性和卡片存在性校验。捕获 worker 不再读取 TAB_STATE，
+    // 避免后台线程直接观察主线程运行时状态；隐藏浮窗时主线程会快速丢弃这批通知。
+    // Let the main thread validate visibility and card membership. The capture worker no longer
+    // reads TAB_STATE, and the main-thread handler quickly drops notifications while hidden.
+    enqueue_ready_delivery(key);
 }
 
 /// 激活补拍的有效性:激活 token 未过时,且该 App 此刻仍是系统前台。
@@ -1410,26 +1412,6 @@ fn pid_is_frontmost(pid: i32) -> bool {
         };
         let _: () = msg_send![pool, drain];
         frontmost
-    }
-}
-
-/// 浮窗是否可见且该窗口当前确实有卡片(投递时效双重校验的 worker 半段)。
-/// Whether the overlay is visible AND the window currently has a rendered card
-/// (the worker half of the delivery-freshness double check).
-fn overlay_wants(pid: i32, wid: u32) -> bool {
-    if !crate::theme::thumbnails_enabled() {
-        return false;
-    }
-    let visible = crate::overlay::thumbnail_visible_range();
-    let state_opt = crate::TAB_STATE.lock().unwrap();
-    match state_opt.as_ref() {
-        Some(s) if s.visible => s
-            .windows
-            .iter()
-            .position(|w| w.pid == pid && w.window_id == wid)
-            .is_some_and(|index| visible.as_ref().is_none_or(|range| range.contains(&index))),
-        None => false,
-        Some(_) => false,
     }
 }
 
