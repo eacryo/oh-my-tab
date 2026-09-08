@@ -242,7 +242,9 @@ impl PendingGlobalInput {
             GlobalEvent::ClipboardToggled => {
                 self.clipboard_pending = true;
             }
-            GlobalEvent::WindowControl(_) | GlobalEvent::QuickAction(_) => {
+            GlobalEvent::WindowControl(_)
+            | GlobalEvent::WindowDisplayMove(_)
+            | GlobalEvent::QuickAction(_) => {
                 if self.other.len() >= GLOBAL_INPUT_CAPACITY {
                     self.other.pop_front();
                     log_debug!("[kbd] dropped oldest auxiliary input (queue full)");
@@ -341,6 +343,9 @@ fn on_global_input_drain_inner() {
     for event in other {
         match event {
             GlobalEvent::WindowControl(direction) => window_management::apply_direction(direction),
+            GlobalEvent::WindowDisplayMove(direction) => {
+                window_management::apply_display_move(direction)
+            }
             GlobalEvent::QuickAction(action) => {
                 if let Some(action) = quick_actions::QuickAction::from_isize(action as isize) {
                     quick_actions::apply_action(action);

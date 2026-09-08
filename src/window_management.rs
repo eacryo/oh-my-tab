@@ -1,11 +1,12 @@
-//! 窗口控制模块:Option+方向键模拟 Windows 的 Win+方向键窗口管理。
-//! 独立 session 层 event tap(专用线程)拦截 Option+方向键,事件经有界输入聚合器
+//! 窗口控制模块:Option+方向键模拟 Windows 的 Win+方向键窗口管理,Option+Shift+左右键跨显示器移动。
+//! 独立 session 层 event tap(专用线程)拦截 Option+方向键及 Option+Shift+左右键,事件经有界输入聚合器
 //! (GlobalEvent -> performSelectorOnMainThread)投递到主线程执行 AX 移动/缩放/最小化。
 //! 状态(普通/最大化/上下半屏/左右半屏/四分屏)按当前 frame 与目标矩形匹配推断,无需持久状态;
 //! 「原尺寸」在首次从普通状态进入 snap 时按 CGWindowID 记录,供后续恢复逻辑使用。
 //!
-//! Window control module: Option+arrow keys emulate Windows' Win+arrow window management.
-//! A dedicated session-level event tap (own thread) intercepts Option+arrows; events travel
+//! Window control module: Option+arrow keys emulate Windows' Win+arrow window management, while
+//! Option+Shift+Left/Right moves a window to an adjacent display. A dedicated session-level event
+//! tap (own thread) intercepts these combinations; events travel
 //! through the bounded input aggregator (GlobalEvent -> performSelectorOnMainThread) and run on the main
 //! thread, which moves/resizes/minimizes windows via AX. Snap states (normal/maximized/top-bottom
 //! halves/left-right halves/quarters) are inferred by matching the current frame against target
@@ -47,9 +48,9 @@ const K_VK_LEFT: u16 = 123;
 const K_VK_RIGHT: u16 = 124;
 const K_VK_DOWN: u16 = 125;
 const K_VK_UP: u16 = 126;
-// 修饰键位掩码:必须恰好是 Option(带其他修饰键的组合透传,与 Option+V 同规则)。
-// Modifier masks: exactly Option is required; combos with extra modifiers pass through
-// (same rule as Option+V).
+// 修饰键位掩码:Option 为基础;Shift 仅用于跨显示器左右移动,Command/Control 组合透传。
+// Modifier masks: Option is required; Shift selects cross-display left/right movement, while
+// Command/Control combinations pass through.
 const K_FLAG_OPTION: CGEventFlags = 0x00080000;
 const K_FLAG_COMMAND: CGEventFlags = 0x00100000;
 const K_FLAG_SHIFT: CGEventFlags = 0x00020000;
@@ -467,6 +468,47 @@ fn screen_index_for(frame: AxRect, screens: &[ScreenGeometry]) -> usize {
     best
 }
 
+/// 将普通窗口平移到目标屏幕,保留相对位置并限制在目标可视区内。
+/// Translate a normal window to the target display, preserving relative position and clamping
+/// it inside the target visible area.
+fn translated_frame(frame: AxRect, from: AxRect, to: AxRect) -> AxRect {
+    let w = frame.w.min(to.w);
+    let h = frame.h.min(to.h);
+    let x = (to.x + frame.x - from.x).clamp(to.x, to.x + to.w - w);
+    let y = (to.y + frame.y - from.y).clamp(to.y, to.y + to.h - h);
+    AxRect { x, y, w, h }
+}
+
+/// 计算跨显示器移动后的目标 frame。
+/// 最大化及各类 snap 状态在目标屏幕保持同一状态;普通窗口保留大小和相对位置。
+/// Compute the target frame for a cross-display move. Maximized and snapped states keep the
+/// same state on the destination display; normal windows preserve size and relative position.
+pub(crate) fn display_move_target(
+    state: SnapState,
+    frame: AxRect,
+    cur_screen: usize,
+    dir: Direction,
+    screens: &[ScreenGeometry],
+) -> Option<(usize, AxRect)> {
+    let target = neighbor_screen(screens, cur_screen, dir)?;
+    let from = screens.get(cur_screen)?.visible;
+    let to = screens.get(target)?.visible;
+    let target_frames = snap_frames(to);
+    let target_frame = match state {
+        SnapState::Maximized => target_frames.max,
+        SnapState::TopHalf => target_frames.top,
+        SnapState::BottomHalf => target_frames.bottom,
+        SnapState::LeftHalf => target_frames.left,
+        SnapState::RightHalf => target_frames.right,
+        SnapState::TopLeft => target_frames.top_left,
+        SnapState::TopRight => target_frames.top_right,
+        SnapState::BottomLeft => target_frames.bottom_left,
+        SnapState::BottomRight => target_frames.bottom_right,
+        SnapState::Normal | SnapState::Minimized => translated_frame(frame, from, to),
+    };
+    Some((target, target_frame))
+}
+
 fn direction_enabled(dir: Direction) -> bool {
     crate::config::CONFIG
         .read()
@@ -477,6 +519,20 @@ fn direction_enabled(dir: Direction) -> bool {
                     Direction::Down => c.window_control.down,
                     Direction::Left => c.window_control.left,
                     Direction::Right => c.window_control.right,
+                }
+        })
+        .unwrap_or(false)
+}
+
+fn display_move_enabled(dir: Direction) -> bool {
+    crate::config::CONFIG
+        .read()
+        .map(|c| {
+            c.window_control.enabled
+                && match dir {
+                    Direction::Left => c.window_control.display_left,
+                    Direction::Right => c.window_control.display_right,
+                    Direction::Up | Direction::Down => false,
                 }
         })
         .unwrap_or(false)
@@ -565,6 +621,86 @@ pub(crate) fn apply_direction(dir: Direction) {
             p
         );
         execute(p, win, dir);
+        CFRelease(win);
+    }
+}
+
+/// 主线程:将前台窗口移动到相邻显示器,最大化窗口在目标屏幕保持最大化。
+/// Main thread: move the frontmost window to an adjacent display, keeping maximized windows
+/// maximized on the destination display.
+pub(crate) fn apply_display_move(dir: Direction) {
+    if !display_move_enabled(dir) {
+        return;
+    }
+    let (app_name, pid) = crate::ffi::frontmost_app_info();
+    if pid <= 0 || pid == std::process::id() as i32 {
+        return;
+    }
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.3);
+        let win = copy_attribute(app, K_AX_FOCUSED_WINDOW);
+        CFRelease(app);
+        let Some(win) = win else {
+            log_debug!("[winctl] no focused window for display move pid {}", pid);
+            return;
+        };
+        if let Some(subrole) = copy_string(win, K_AX_SUBROLE) {
+            if subrole == K_AX_SUBROLE_FULL_SCREEN {
+                log_debug!("[winctl] skip native fullscreen display move");
+                CFRelease(win);
+                return;
+            }
+        }
+        let Some(frame) = read_frame(win) else {
+            log_debug!("[winctl] failed to read window frame for display move");
+            CFRelease(win);
+            return;
+        };
+        let minimized = read_bool(win, K_AX_MINIMIZED).unwrap_or(false);
+        let screens = screens_in_ax_space();
+        if screens.is_empty() {
+            CFRelease(win);
+            return;
+        }
+        let cur_screen = screen_index_for(frame, &screens);
+        let state = if minimized {
+            SnapState::Normal
+        } else {
+            infer_state(frame, screens[cur_screen].visible)
+        };
+        let Some((target_screen, target_frame)) =
+            display_move_target(state, frame, cur_screen, dir, &screens)
+        else {
+            log_debug!("[winctl] no adjacent display for {:?}", dir);
+            CFRelease(win);
+            return;
+        };
+        if minimized {
+            // 只有确认存在目标屏幕后才解除最小化,单屏按键不应改变窗口状态。
+            // Restore only after confirming a destination display; a single-display no-op must
+            // not change the window state.
+            set_minimized(win, false);
+        }
+        log_debug!(
+            "[winctl] display move app={:?} dir={:?} pid={} from={} to={} state={:?} frame={:?}",
+            app_name,
+            dir,
+            pid,
+            cur_screen,
+            target_screen,
+            state,
+            target_frame
+        );
+        if !set_frame(win, target_frame) {
+            log_info!(
+                "[winctl] display move frame rejected: target={:?}",
+                target_frame
+            );
+        }
         CFRelease(win);
     }
 }
@@ -925,11 +1061,11 @@ fn runloop_static() -> &'static Mutex<Option<CFRunLoopRef>> {
     &RUNLOOP.get_or_init(|| RunLoopMutex(Mutex::new(None))).0
 }
 
-/// tap 回调:只关心 Option+方向键(不带其他修饰键)。启用时吞掉 keyDown/keyUp 并把
+/// tap 回调:关心 Option+方向键及 Option+Shift+左右键。启用时吞掉 keyDown/keyUp 并把
 /// 非自动重复的 keyDown 投递给主线程;关闭时全部透传(功能关闭 = 组合键还给系统)。
 /// 自己是前台 App 时也透传,设置窗口文本框的按词移动不受影响。
 ///
-/// The tap callback: only cares about Option+arrows (no extra modifiers). When enabled it
+/// The tap callback: handles Option+arrows and Option+Shift+Left/Right. When enabled it
 /// swallows matching keyDown/keyUp and forwards non-autorepeat keyDowns to the main thread;
 /// when disabled everything passes through (a disabled feature returns the combo to the
 /// system). Also passes through when we are the frontmost app, keeping move-by-word intact in
@@ -948,7 +1084,13 @@ unsafe extern "C" fn window_control_tap_callback(
         return event;
     };
     let flags = CGEventGetFlags(event);
-    if flags & K_FLAG_OPTION == 0 || flags & (K_FLAG_COMMAND | K_FLAG_SHIFT | K_FLAG_CONTROL) != 0 {
+    if flags & K_FLAG_OPTION == 0 || flags & (K_FLAG_COMMAND | K_FLAG_CONTROL) != 0 {
+        return event;
+    }
+    let display_move = flags & K_FLAG_SHIFT != 0;
+    // 只为左右键提供跨显示器移动;Option+Shift+上下仍交给系统/应用处理。
+    // Cross-display movement is only defined for left/right; pass Option+Shift+Up/Down through.
+    if display_move && !matches!(dir, Direction::Left | Direction::Right) {
         return event;
     }
     // 本应用合成的组合键(鼠标映射 Key Press post 到 HID 层后会回到 session tap):
@@ -972,8 +1114,13 @@ unsafe extern "C" fn window_control_tap_callback(
         // physical presses act.
         let autorepeat = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT);
         if autorepeat == 0 {
-            log_debug!("[winctl] keyDown Option+{:?}", dir);
-            crate::enqueue_global_event(GlobalEvent::WindowControl(dir));
+            if display_move {
+                log_debug!("[winctl] keyDown Option+Shift+{:?}", dir);
+                crate::enqueue_global_event(GlobalEvent::WindowDisplayMove(dir));
+            } else {
+                log_debug!("[winctl] keyDown Option+{:?}", dir);
+                crate::enqueue_global_event(GlobalEvent::WindowControl(dir));
+            }
         }
     }
     // 吞掉匹配的 keyDown/keyUp(含自动重复),应用看不到这组组合键。

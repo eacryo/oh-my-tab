@@ -85,6 +85,12 @@ pub struct WindowControlSection {
     pub left: bool,
     #[serde(default = "default_window_control_direction_enabled")]
     pub right: bool,
+    // 跨显示器快捷键默认开启,与方向快捷键保持一致。
+    // Cross-display shortcuts default to enabled, matching the direction shortcuts.
+    #[serde(default = "default_window_control_direction_enabled")]
+    pub display_left: bool,
+    #[serde(default = "default_window_control_direction_enabled")]
+    pub display_right: bool,
 }
 
 fn default_window_control_direction_enabled() -> bool {
@@ -99,6 +105,8 @@ impl Default for WindowControlSection {
             down: true,
             left: true,
             right: true,
+            display_left: true,
+            display_right: true,
         }
     }
 }
@@ -1846,6 +1854,8 @@ mod tests {
         assert!(cfg.window_control.down);
         assert!(cfg.window_control.left);
         assert!(cfg.window_control.right);
+        assert!(cfg.window_control.display_left);
+        assert!(cfg.window_control.display_right);
     }
 
     #[test]

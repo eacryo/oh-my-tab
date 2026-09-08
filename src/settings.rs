@@ -239,11 +239,13 @@ pub(super) struct SettingsUi {
     window_control_down: *mut AnyObject,    // NSSwitch: 启用 Option+下 / enable Option+Down
     window_control_left: *mut AnyObject,    // NSSwitch: 启用 Option+左 / enable Option+Left
     window_control_right: *mut AnyObject,   // NSSwitch: 启用 Option+右 / enable Option+Right
-    quick_actions_enabled: *mut AnyObject,  // NSSwitch: 启用快捷操作 / enable quick actions
-    quick_actions_open_settings: *mut AnyObject, // NSSwitch: Option+I 打开设置 / open settings
-    quick_actions_open_finder: *mut AnyObject, // NSSwitch: Option+E 打开访达 / open Finder
-    quick_actions_show_desktop: *mut AnyObject, // NSSwitch: Option+D 显示桌面 / show desktop
-    quick_actions_lock_screen: *mut AnyObject, // NSSwitch: Option+L 锁屏 / lock screen
+    window_control_display_left: *mut AnyObject, // NSSwitch: Option+Shift+左移显示器 / move to previous display
+    window_control_display_right: *mut AnyObject, // NSSwitch: Option+Shift+右移显示器 / move to next display
+    quick_actions_enabled: *mut AnyObject,        // NSSwitch: 启用快捷操作 / enable quick actions
+    quick_actions_open_settings: *mut AnyObject,  // NSSwitch: Option+I 打开设置 / open settings
+    quick_actions_open_finder: *mut AnyObject,    // NSSwitch: Option+E 打开访达 / open Finder
+    quick_actions_show_desktop: *mut AnyObject,   // NSSwitch: Option+D 显示桌面 / show desktop
+    quick_actions_lock_screen: *mut AnyObject,    // NSSwitch: Option+L 锁屏 / lock screen
     quick_actions_locate_pointer: *mut AnyObject, // NSSwitch: 双击 Control 显示鼠标位置 / double-Control pointer locator
     add_mapping_button: *mut AnyObject,           // NSButton: 添加映射 / add-mapping button
     mapping_enabled: *mut AnyObject, // NSSwitch: 按键映射总开关(per-device) / mappings master switch (per-device)
@@ -1032,6 +1034,16 @@ fn log_config_changes(old: &Config, new: &Config) {
         old.window_control.right,
         new.window_control.right
     );
+    changed!(
+        "window_control.display_left",
+        old.window_control.display_left,
+        new.window_control.display_left
+    );
+    changed!(
+        "window_control.display_right",
+        old.window_control.display_right,
+        new.window_control.display_right
+    );
 
     // 鼠标配置档包含嵌套映射,用 Debug 快照比较并记录完整旧/新值。
     // Mouse profiles contain nested mappings, so compare and log complete Debug snapshots.
@@ -1092,6 +1104,8 @@ enum ControlField {
     WindowControlDown,
     WindowControlLeft,
     WindowControlRight,
+    WindowControlDisplayLeft,
+    WindowControlDisplayRight,
     QuickActionsEnabled,
     QuickActionOpenSettings,
     QuickActionOpenFinder,
@@ -1157,6 +1171,18 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             .or_else(|| m(u.window_control_down, ControlField::WindowControlDown))
             .or_else(|| m(u.window_control_left, ControlField::WindowControlLeft))
             .or_else(|| m(u.window_control_right, ControlField::WindowControlRight))
+            .or_else(|| {
+                m(
+                    u.window_control_display_left,
+                    ControlField::WindowControlDisplayLeft,
+                )
+            })
+            .or_else(|| {
+                m(
+                    u.window_control_display_right,
+                    ControlField::WindowControlDisplayRight,
+                )
+            })
             .or_else(|| m(u.quick_actions_enabled, ControlField::QuickActionsEnabled))
             .or_else(|| {
                 m(
@@ -1398,6 +1424,14 @@ fn apply_control_field(field: ControlField) {
                 ControlField::WindowControlRight => {
                     let state: isize = msg_send![u.window_control_right, state];
                     cfg.window_control.right = state == 1;
+                }
+                ControlField::WindowControlDisplayLeft => {
+                    let state: isize = msg_send![u.window_control_display_left, state];
+                    cfg.window_control.display_left = state == 1;
+                }
+                ControlField::WindowControlDisplayRight => {
+                    let state: isize = msg_send![u.window_control_display_right, state];
+                    cfg.window_control.display_right = state == 1;
                 }
                 ControlField::QuickActionsEnabled => {
                     let state: isize = msg_send![u.quick_actions_enabled, state];
@@ -1783,8 +1817,8 @@ unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
     }
 }
 
-/// 根据窗口控制总开关状态,冻结其下方的四个方向开关。
-/// Freeze the four direction switches below the window-control master switch.
+/// 根据窗口控制总开关状态,冻结其下方的六个快捷键开关。
+/// Freeze the six shortcut switches below the window-control master switch.
 unsafe fn update_window_control_controls_enabled(ui: &SettingsUi) {
     let state: isize = msg_send![ui.window_control_enabled, state];
     let on = state == 1;
@@ -1794,6 +1828,8 @@ unsafe fn update_window_control_controls_enabled(ui: &SettingsUi) {
         ui.window_control_down,
         ui.window_control_left,
         ui.window_control_right,
+        ui.window_control_display_left,
+        ui.window_control_display_right,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
@@ -1938,9 +1974,9 @@ pub(crate) extern "C" fn handle_clipboard_enabled_toggle(
     }
 }
 
-/// 窗口控制总开关回调:即时应用 + 冻结/解冻下方四个方向开关。
+/// 窗口控制总开关回调:即时应用 + 冻结/解冻下方六个快捷键开关。
 /// Callback for the window-control master switch: apply immediately, then freeze/unfreeze its
-/// four direction switches.
+/// six shortcut switches.
 pub(crate) extern "C" fn handle_window_control_enabled_toggle(
     _self: *mut c_void,
     _cmd: Sel,
@@ -2839,6 +2875,14 @@ fn load_settings_from(cfg: &Config) {
                 setState: if cfg.window_control.right { 1isize } else { 0isize }
             ];
             let _: () = msg_send![
+                ui.window_control_display_left,
+                setState: if cfg.window_control.display_left { 1isize } else { 0isize }
+            ];
+            let _: () = msg_send![
+                ui.window_control_display_right,
+                setState: if cfg.window_control.display_right { 1isize } else { 0isize }
+            ];
+            let _: () = msg_send![
                 ui.clipboard_persist,
                 setState: if cfg.clipboard.persist { 1isize } else { 0isize }
             ];
@@ -3405,6 +3449,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             window_control_down: std::ptr::null_mut(),
             window_control_left: std::ptr::null_mut(),
             window_control_right: std::ptr::null_mut(),
+            window_control_display_left: std::ptr::null_mut(),
+            window_control_display_right: std::ptr::null_mut(),
             quick_actions_enabled: std::ptr::null_mut(),
             quick_actions_open_settings: std::ptr::null_mut(),
             quick_actions_open_finder: std::ptr::null_mut(),
@@ -3684,10 +3730,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let switcher_doc_h = 1370.0;
         let mouse_doc_h = 1558.0;
         let clipboard_doc_h = 978.0;
-        // 窗口控制页包含总开关和四个方向开关,高度留出描述文字的空间。
-        // The window-control page contains the master plus four direction switches, with room
-        // for each row's description.
-        let window_control_doc_h = 778.0;
+        // 窗口控制页包含总开关、四个方向开关和两个跨显示器开关。
+        // The window-control page contains the master, four direction switches, and two
+        // cross-display switches.
+        let window_control_doc_h = 940.0;
         // 快捷操作页:总开关 + 五个动作开关,结构与窗口控制页一致。
         // Quick-actions page: master plus five action switches, mirroring the window-control
         // page.
@@ -4993,6 +5039,32 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
         );
         bind_control(target, ui.window_control_right);
+        wy = layout.next_row_cursor(wy, described_row_h);
+        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        ui.window_control_display_left = SettingsRow::described(
+            window_control_view,
+            label_x,
+            wy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_window_control_display_left"),
+            &t("settings.desc_window_control_display_left"),
+            SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
+        );
+        bind_control(target, ui.window_control_display_left);
+        wy = layout.next_row_cursor(wy, described_row_h);
+        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        ui.window_control_display_right = SettingsRow::described(
+            window_control_view,
+            label_x,
+            wy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_window_control_display_right"),
+            &t("settings.desc_window_control_display_right"),
+            SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
+        );
+        bind_control(target, ui.window_control_display_right);
         let window_control_shortcuts_card_bottom = layout.card_bottom(wy);
         SettingsSection::attach(
             window_control_view,
