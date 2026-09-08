@@ -5,7 +5,7 @@ use crate::i18n::{self, tf};
 
 // ========== Structs ==========
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 #[derive(Default)]
 pub struct Config {
@@ -25,7 +25,7 @@ pub struct Config {
     pub quick_actions: QuickActionsSection,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct QuickActionsSection {
     // 快捷操作总开关(Option+I/E/D/L 与双击 Control 全局热键)。默认 false:全局拦截会覆盖其他应用的
@@ -65,7 +65,7 @@ impl Default for QuickActionsSection {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct WindowControlSection {
     // 窗口控制总开关(Option+方向键)。默认 false:组合键全局拦截会覆盖其他应用的
@@ -102,7 +102,7 @@ impl Default for WindowControlSection {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Appearance {
     pub theme: String,
@@ -111,7 +111,7 @@ pub struct Appearance {
     pub corner_radius: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Layout {
     // 窗口缩略图总开关:关闭后浮窗保持纯图标渲染,缩略图服务不启动。默认开;
@@ -126,14 +126,14 @@ pub struct Layout {
     pub card_text_size: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ColorsSection {
     pub dark: ThemeColors,
     pub light: ThemeColors,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ThemeColors {
     pub status_bar_text: String,
@@ -145,7 +145,7 @@ pub struct ThemeColors {
     pub card_border_sel: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Fonts {
     pub status_bar_size: f64,
@@ -156,19 +156,19 @@ pub struct Fonts {
     pub app_name_weight: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Keyboard {
     pub modifier: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct I18nSection {
     pub locale: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct WindowsSection {
     // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器恢复),tap 不再拦截。
@@ -202,7 +202,7 @@ impl Default for WindowsSection {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct LoggingSection {
     // 日志级别:"debug","info";默认 "info"(常规档,不刷屏;debug 输出全量调试细节)。
@@ -213,7 +213,7 @@ pub struct LoggingSection {
     pub file_path: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct StartupSection {
     // 开机自启;默认 false,bool::default() 即 false,故 Default 可直接派生。
@@ -223,7 +223,7 @@ pub struct StartupSection {
 
 /// Sparkle 更新设置。
 /// Sparkle update settings.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct UpdatesSection {
     /// 是否允许 Sparkle 后台自动检查更新。
@@ -243,7 +243,7 @@ impl Default for UpdatesSection {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ClipboardSection {
     // 历史剪贴板总开关;默认 false(不启动剪贴板轮询)。
@@ -303,7 +303,7 @@ impl Default for ClipboardSection {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct PointerSection {
     // 禁用系统鼠标加速,光标 1:1 线性跟踪。默认 false。
@@ -313,7 +313,7 @@ pub struct PointerSection {
 
 /// 设备匹配器(None = 通配,即"所有鼠标")。配置按 VID+PID 匹配设备。
 /// Device matcher (None = wildcard, i.e. "All Mice"). Config matches devices by VID+PID.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct DeviceMatcher {
     // 扁平序列化为 device_vendor_id / device_product_id(顶层标量,便于手写 TOML)。
@@ -326,7 +326,7 @@ pub struct DeviceMatcher {
 
 /// 指针覆盖(部分字段,None = 继承下层档)。
 /// Pointer override (partial; None = inherit from the lower layer).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct PartialPointerSection {
     pub disable_acceleration: Option<bool>,
@@ -334,7 +334,7 @@ pub struct PartialPointerSection {
 
 /// 单个配置档。device = None 即"所有鼠标"档(默认层)。
 /// A single profile. device = None is the "All Mice" profile (the default layer).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct MouseProfile {
     /// 设备匹配器;None = 匹配所有鼠标(作为默认层)。
@@ -369,7 +369,7 @@ pub struct MouseProfile {
     pub button_mappings_enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct MouseSection {
     // 启用鼠标控制功能(总开关)。默认 false(不启用,不创建 event tap)。
@@ -1663,28 +1663,15 @@ pub fn persist_config_now() {
 /// Reload config from disk and apply. Returns validation errors (empty = success).
 pub fn reload_config() -> Vec<String> {
     let (new_cfg, errs) = Config::reload();
-    let locale = new_cfg.i18n.locale.clone();
-    let log_level = new_cfg.logging.level.clone();
-    let automatically_check = new_cfg.updates.automatically_check;
-    let automatically_download = new_cfg.updates.automatically_download;
+    let old_cfg = CONFIG.read().unwrap().clone();
     if let Ok(mut cfg) = CONFIG.write() {
-        *cfg = new_cfg;
+        *cfg = new_cfg.clone();
     }
-    // locale 可能随 reload 改变,重新应用 / locale may change on reload, re-apply
-    i18n::apply_config_locale(&locale);
-    // 热更新日志级别 / hot-reload log level
-    let lvl = match log_level.as_str() {
-        "debug" => crate::logger::LogLevel::Debug,
-        _ => crate::logger::LogLevel::Info,
-    };
-    crate::logger::reconfigure(lvl);
-    // 配置变更:失效 per-device 解析缓存(下次 resolve 重新合并 profiles)。
-    // Config changed: invalidate the per-device resolve cache (next resolve re-merges profiles).
-    crate::mouse::resolve::invalidate_cache();
-    // Apply the update preferences to Sparkle when the updater is already running. During early
-    // startup this is a no-op; main initializes Sparkle with the loaded value later.
-    crate::updater::set_automatic_checks(automatically_check);
-    crate::updater::set_automatic_downloads(automatically_download);
+    crate::runtime_config::apply_config_change(
+        &old_cfg,
+        &new_cfg,
+        crate::runtime_config::ConfigChangeSource::Reload,
+    );
     errs
 }
 

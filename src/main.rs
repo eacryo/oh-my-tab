@@ -16,6 +16,7 @@ mod overlay;
 mod performance;
 mod pointer_locator;
 mod quick_actions;
+mod runtime_config;
 mod settings;
 mod skylight;
 mod theme;
@@ -1682,29 +1683,6 @@ fn main() {
     // 3. Setup status bar menu
     setup_status_bar();
 
-    // 3a. 按配置初始化快捷键模式:SHORTCUT_IS_CMD 默认 false(Option),启动时必须从 config 读回,
-    //     否则设置里改的 modifier 重启后会丢失。放在 refresh_menu_titles 之前,让菜单标题刷新时
-    //     读到的已是正确值。
-    // Initialize shortcut mode from config: SHORTCUT_IS_CMD defaults to false (Option) and must be
-    // read back at startup, otherwise the modifier chosen in Settings is lost on restart. Runs
-    // before refresh_menu_titles so the label refresh sees the correct value.
-    set_shortcut_mode(CONFIG.read().unwrap().keyboard.modifier == "command");
-
-    // 同步开机自启(SMAppService):TOML [startup] launch_at_login 为唯一事实源。
-    // 仅以 .app 方式启动时生效(cargo run 裸二进制下 mainApp 不可用,会记 warn,不影响其它功能)。
-    // Sync launch-at-login (SMAppService): TOML's [startup] launch_at_login is the source of truth.
-    // Only effective when launched as a .app (raw `cargo run` has no main bundle -> logs a warn, no other impact).
-    autostart::sync(CONFIG.read().unwrap().startup.launch_at_login);
-
-    // 3b. 按实际主题修正初始菜单标签。setup_status_bar 用占位标题(is_dark=false +
-    //     "切换深色");若 config 主题为 dark/auto,这里修正为正确的 toggle 标签。
-    //     locale 已在 2b 应用,菜单文本本身已正确,此处只修正 toggle 方向。
-    // Fix initial menu labels against the real theme. setup_status_bar used a placeholder
-    // (is_dark=false + "switch to dark"); if the config theme is dark/auto this corrects the
-    // toggle direction. Locale was applied in 2b so text is already correct; this only fixes
-    // the toggle direction.
-    refresh_menu_titles();
-
     // 4. Initialize state
     ensure_icon_cache_dir();
     // 一次性清理旧版按 PID 命名的缓存文件(纯数字 stem 的 .png),它们对新版无用、只会占地方。
@@ -1868,14 +1846,6 @@ fn main() {
     let _monitor = start_event_monitor(event_tx.clone());
     STATUS_EVENT_TX.set(event_tx).ok();
 
-    // 7b. Start the mouse event tap only if enabled in config.
-    // 鼠标事件 tap:仅在配置启用时启动(start 幂等,日志在 mouse::start 内)。
-    // Mouse event tap: start only if enabled (start is idempotent; logging lives inside).
-    let mouse_enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
-    if mouse_enabled {
-        mouse::start();
-    }
-
     // 7b2. hover 轮询定时器在浮窗显示/隐藏时由 overlay 自行启停(show_overlay 调用
     // start_hover_timer),无需在此启动:主线程 runloop 每 16ms 读全局鼠标位置命中
     // 卡片,不依赖事件投递(侧键按住期间移动事件无法通过任何 tap/trapping 获取,实测)。
@@ -1884,50 +1854,14 @@ fn main() {
     // 16ms and hit-tests the cards, independent of event delivery (moves while a side
     // button is held can't be obtained via any tap/tracking, verified).
 
-    // 7b3. 窗口控制(Option+方向键)tap:仅在配置启用时启动(start 幂等)。
-    // Window-control (Option+arrows) tap: start only if enabled (idempotent).
-    let winctl_enabled = CONFIG
-        .read()
-        .map(|c| c.window_control.enabled)
-        .unwrap_or(false);
-    if winctl_enabled {
-        window_management::start();
-    }
-
-    // 7b4. 快捷操作(Option+I/E/D/L 与双击 Control)tap:仅在配置启用时启动(start 幂等)。
-    // Quick-actions (Option+I/E/D/L and double-Control) tap: start only if enabled (idempotent).
-    let quick_actions_enabled = CONFIG
-        .read()
-        .map(|c| c.quick_actions.enabled)
-        .unwrap_or(false);
-    if quick_actions_enabled {
-        quick_actions::start();
-    }
-
-    // 7c. Apply pointer settings (disable system acceleration if configured).
-    // 指针设置(配置了禁用系统加速时立即生效)。
-    mouse::pointer::apply();
-
-    // 7d. Start the clipboard-history poller only if enabled in config.
-    // 剪贴板历史轮询:仅在配置启用时启动(幂等)。
-    // Clipboard-history polling: start only if enabled (idempotent).
-    let clip_enabled = CONFIG.read().map(|c| c.clipboard.enabled).unwrap_or(false);
-    if clip_enabled {
-        clipboard::start();
-    }
-
-    // 7e. 窗口缩略图服务:有界启动预热 + 常驻 AXObserver + 内存 LRU。无屏幕录制
-    // 权限时启动预热跳过、worker 每任务前 preflight,浮窗保持纯图标渲染。
-    // Window thumbnails: bounded startup prewarming + resident AXObserver + memory
-    // LRU. Without Screen Recording permission startup prewarming is skipped and
-    // the worker preflights each job, while the overlay keeps icon-only rendering.
-    let thumbs_enabled = CONFIG
-        .read()
-        .map(|c| c.layout.thumbnails_enabled)
-        .unwrap_or(false);
-    if thumbs_enabled {
-        thumbnail::start();
-    }
+    // 7b. 统一应用启动配置及所有可选运行时服务。
+    // Apply startup configuration and every optional runtime service through one entry point.
+    let startup_cfg = CONFIG.read().unwrap().clone();
+    runtime_config::apply_config_change(
+        &config::Config::default(),
+        &startup_cfg,
+        runtime_config::ConfigChangeSource::Startup,
+    );
 
     // 内存采样线程放在可选模块启动之后,这样 60s 基线对应完整的功能画像。
     // Start memory sampling after optional modules so the 60s baseline represents the

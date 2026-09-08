@@ -23,10 +23,11 @@ use crate::event_tap::{
     CGEventGetFlags, CGEventGetIntegerValueField, CGEventRef, CGEventTapProxy, CGEventType,
 };
 use crate::ffi::*;
-use crate::i18n::{apply_config_locale, t, tf};
-use crate::menu::{refresh_menu_titles, set_shortcut_mode};
+use crate::i18n::{t, tf};
+use crate::menu::refresh_menu_titles;
 use crate::mouse::shortcut::{button_name, describe_shortcut, display_shortcut};
 use crate::overlay::{apply_theme, refresh_highlight, update_status_label};
+use crate::runtime_config::{apply_config_change, ConfigChangeSource};
 use crate::theme::{resolved_is_dark, ui_palette, UiPalette};
 use crate::{log_debug, log_info};
 // 跨模块共享状态(由 main.rs 持有)/ cross-module shared state (owned by main.rs)
@@ -1231,8 +1232,8 @@ fn apply_control_field(field: ControlField) {
         }
         _ => {}
     }
-    let mut rebuild_window = false;
-    let mut cfg = CONFIG.read().unwrap().clone();
+    let old_cfg = CONFIG.read().unwrap().clone();
+    let mut cfg = old_cfg.clone();
     {
         let ui = SETTINGS_UI.lock().unwrap();
         let Some(u) = ui.as_ref() else {
@@ -1248,7 +1249,6 @@ fn apply_control_field(field: ControlField) {
                         _ => "auto",
                     }
                     .into();
-                    rebuild_window = true;
                 }
                 ControlField::GlassStyle => {
                     let idx: isize = msg_send![u.glass_style, indexOfSelectedItem];
@@ -1266,7 +1266,6 @@ fn apply_control_field(field: ControlField) {
                         .get(idx as usize)
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "auto".into());
-                    rebuild_window = true;
                 }
                 ControlField::LogLevel => {
                     let idx: isize = msg_send![u.log_level, indexOfSelectedItem];
@@ -1423,10 +1422,13 @@ fn apply_control_field(field: ControlField) {
         }
     }
     if let Ok(mut w) = CONFIG.write() {
-        *w = cfg;
+        *w = cfg.clone();
     }
     schedule_config_persist();
-    apply_field_effects(field, rebuild_window);
+    apply_config_change(&old_cfg, &cfg, ConfigChangeSource::Settings);
+    if matches!(field, ControlField::GlassStyle | ControlField::GlassTint) {
+        apply_glass_preview();
+    }
 }
 
 /// 鼠标页 per-device 字段:读控件 → 写选中设备 profile(无档则创建)→ 落盘 + 副作用。
@@ -1437,7 +1439,8 @@ unsafe fn apply_mouse_profile_field(field: ControlField) {
     let Some(u) = ui.as_mut() else {
         return;
     };
-    let mut cfg = CONFIG.read().unwrap().clone();
+    let old_cfg = CONFIG.read().unwrap().clone();
+    let mut cfg = old_cfg.clone();
     match field {
         ControlField::ReverseScroll => {
             let state: isize = msg_send![u.reverse_scroll, state];
@@ -1489,16 +1492,10 @@ unsafe fn apply_mouse_profile_field(field: ControlField) {
         _ => {}
     }
     if let Ok(mut w) = CONFIG.write() {
-        *w = cfg;
+        *w = cfg.clone();
     }
     schedule_config_persist();
-    // 配置变更:失效 per-device 解析缓存;加速开关变化时立即重设系统指针行为。
-    // Config changed: invalidate the per-device resolve cache; re-apply pointer behavior
-    // right away when the acceleration flag changes.
-    crate::mouse::resolve::invalidate_cache();
-    if field == ControlField::DisablePointerAccel {
-        crate::mouse::pointer::apply();
-    }
+    apply_config_change(&old_cfg, &cfg, ConfigChangeSource::Settings);
     if field == ControlField::ScrollMode {
         // 滚动模式切换后,行数滑块显示当前生效值并刷新条件显隐。
         // After a mode switch the line-count slider shows the effective value and the
@@ -1538,191 +1535,6 @@ fn write_selected_profile(cfg: &mut Config, f: impl FnOnce(&mut MouseProfile)) {
     f(&mut cfg.mouse.profiles[idx]);
 }
 
-/// 按字段执行即时副作用(幂等、廉价;恢复默认路径复用)。
-/// Run a field's immediate side effects (idempotent and cheap; reused by restore paths).
-fn apply_field_effects(field: ControlField, rebuild_window: bool) {
-    let cfg = CONFIG.read().unwrap().clone();
-    match field {
-        ControlField::Theme => {
-            // 主题变化:浮窗/剪贴板 UI/菜单标题跟着刷新;窗口重建交给 rebuild。
-            // Theme change: refresh the overlay, clipboard UI, and menu titles; the window
-            // rebuild is handled by `rebuild_window`.
-            apply_theme_and_locale_refresh();
-        }
-        ControlField::Locale => {
-            // locale 先应用,后续 t() 才能取到新语言文案。
-            // Apply the locale first so later t() calls pick up the new language.
-            apply_config_locale(&cfg.i18n.locale);
-            apply_theme_and_locale_refresh();
-        }
-        ControlField::GlassStyle | ControlField::GlassTint => {
-            apply_glass_preview();
-        }
-        ControlField::ReverseScroll
-        | ControlField::ScrollMode
-        | ControlField::LineCount
-        | ControlField::MappingEnabled => {
-            // 恢复默认等批量路径也走这里:失效 per-device 解析缓存。
-            // Batch paths (restore defaults) land here too: invalidate the resolve cache.
-            crate::mouse::resolve::invalidate_cache();
-        }
-        ControlField::DisablePointerAccel => {
-            crate::mouse::resolve::invalidate_cache();
-            crate::mouse::pointer::apply();
-        }
-        ControlField::LogLevel => {
-            let lvl = match cfg.logging.level.as_str() {
-                "debug" => crate::logger::LogLevel::Debug,
-                _ => crate::logger::LogLevel::Info,
-            };
-            crate::logger::reconfigure(lvl);
-        }
-        ControlField::LaunchAtLogin => {
-            crate::autostart::sync(cfg.startup.launch_at_login);
-        }
-        ControlField::WindowsEnabled => {
-            // 窗口切换开关被关闭:收起可能正开着的浮窗并复位状态,避免残留。
-            // The switcher switch was turned off: dismiss a possibly-open overlay and reset.
-            if !cfg.windows.enabled {
-                crate::overlay::reset_switcher();
-            }
-        }
-        ControlField::ThumbnailsEnabled => {
-            if cfg.layout.thumbnails_enabled {
-                crate::thumbnail::start();
-            } else {
-                crate::thumbnail::clear_runtime_cache();
-            }
-        }
-        ControlField::StatusBarTextSize => {
-            update_status_label();
-        }
-        ControlField::Modifier => {
-            set_shortcut_mode(cfg.keyboard.modifier == "command");
-        }
-        ControlField::MouseEnabled => {
-            if cfg.mouse.enabled {
-                crate::mouse::start();
-            } else {
-                crate::mouse::stop();
-            }
-        }
-        ControlField::ClipboardEnabled => {
-            if cfg.clipboard.enabled {
-                crate::clipboard::start();
-            } else {
-                crate::clipboard::stop();
-            }
-        }
-        ControlField::ClipboardPersist => {
-            crate::clipboard::apply_persist_toggle(cfg.clipboard.persist);
-        }
-        ControlField::WindowControlEnabled => {
-            if cfg.window_control.enabled {
-                crate::window_management::start();
-            } else {
-                crate::window_management::stop();
-            }
-        }
-        ControlField::QuickActionsEnabled => {
-            if cfg.quick_actions.enabled {
-                crate::quick_actions::start();
-            } else {
-                crate::quick_actions::stop();
-            }
-        }
-        ControlField::UpdateAutoCheck => {
-            crate::updater::set_automatic_checks(cfg.updates.automatically_check);
-        }
-        ControlField::UpdateAutoDownload => {
-            crate::updater::set_automatic_downloads(cfg.updates.automatically_download);
-        }
-        // 其余字段由消费方在下次使用时读取(浮窗构建/剪贴板面板打开等),无需即时副作用。
-        // Remaining fields are read by their consumers on next use (overlay build, clipboard
-        // picker open, ...), so no immediate side effect is needed.
-        _ => {}
-    }
-    if rebuild_window {
-        // 主题/locale 影响设置窗口自绘配色与文案:原位重建窗口(保留页签与位置)。
-        // Theme/locale affect the settings window's baked palette and strings: rebuild the
-        // window in place (page and frame preserved).
-        refresh_system_appearance();
-    }
-}
-
-/// 恢复默认等批量路径:应用一个 Tab 的全部副作用(不刷新设置窗口自身)。
-/// Batch path for restore-defaults: apply every side effect of one tab (excluding the
-/// settings window's own refresh).
-fn apply_tab_effects(tab: usize) {
-    let fields: &[ControlField] = match tab {
-        0 => &[
-            ControlField::Theme,
-            ControlField::GlassStyle,
-            ControlField::GlassTint,
-            ControlField::Locale,
-            ControlField::LogLevel,
-            ControlField::LaunchAtLogin,
-        ],
-        1 => &[
-            ControlField::WindowsEnabled,
-            ControlField::ShowMinimized,
-            ControlField::ThumbnailsEnabled,
-            ControlField::CardTextSize,
-            ControlField::StatusBarTextSize,
-            ControlField::OverlayPosition,
-            ControlField::ActivationMode,
-            ControlField::Modifier,
-        ],
-        2 => &[
-            ControlField::MouseEnabled,
-            ControlField::ReverseScroll,
-            ControlField::ScrollMode,
-            ControlField::LineCount,
-            ControlField::DisablePointerAccel,
-            ControlField::MappingEnabled,
-        ],
-        3 => &[
-            ControlField::ClipboardEnabled,
-            ControlField::ClipboardPersist,
-            ControlField::ClipboardShowSourceApp,
-            ControlField::ClipboardMoveUsedToTop,
-            ControlField::ClipboardMaxEntries,
-            ControlField::ClipboardAutoExpireDays,
-            ControlField::ClipboardPinFollow,
-        ],
-        4 => &[
-            ControlField::WindowControlEnabled,
-            ControlField::WindowControlUp,
-            ControlField::WindowControlDown,
-            ControlField::WindowControlLeft,
-            ControlField::WindowControlRight,
-        ],
-        5 => &[
-            ControlField::QuickActionsEnabled,
-            ControlField::QuickActionOpenSettings,
-            ControlField::QuickActionOpenFinder,
-            ControlField::QuickActionShowDesktop,
-            ControlField::QuickActionLockScreen,
-            ControlField::QuickActionLocatePointer,
-        ],
-        _ => &[
-            ControlField::UpdateAutoCheck,
-            ControlField::UpdateAutoDownload,
-        ],
-    };
-    for &f in fields {
-        apply_field_effects(f, false);
-    }
-}
-
-/// 全部 Tab 的副作用(整应用恢复默认用)。
-/// Side effects for every tab (used by the whole-app restore).
-fn apply_all_tab_effects() {
-    for tab in 0..7 {
-        apply_tab_effects(tab);
-    }
-}
-
 /// 数字文本框输入中(NSControlTextDidChange):值合法才应用,非法值保留内存配置不动,
 /// 磁盘写入走防抖。允许输入过程中的临时非法状态。
 /// While typing in a numeric text field (NSControlTextDidChange): apply only when the value
@@ -1743,7 +1555,7 @@ pub(crate) extern "C" fn on_control_text_did_change(
             return;
         };
         let _ = raw;
-        write_text_field_config(field, value);
+        write_text_field_config(field, value, false);
         schedule_config_persist();
         log_debug!(
             "[settings] numeric field {:?} applied (debounced persist)",
@@ -1769,7 +1581,7 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
         };
         match parse_text_field(field) {
             Some((value, _)) => {
-                write_text_field_config(field, value);
+                write_text_field_config(field, value, true);
                 persist_config_now();
                 log_debug!(
                     "[settings] numeric field {:?} committed on end editing",
@@ -1865,8 +1677,9 @@ enum TextFieldValue {
 
 /// 把合法的数字值写入内存 CONFIG。
 /// Write a valid numeric value into the in-memory CONFIG.
-fn write_text_field_config(field: TextField, value: TextFieldValue) {
-    let mut cfg = CONFIG.read().unwrap().clone();
+fn write_text_field_config(field: TextField, value: TextFieldValue, apply_runtime: bool) {
+    let old_cfg = CONFIG.read().unwrap().clone();
+    let mut cfg = old_cfg.clone();
     match (field, value) {
         (TextField::CornerRadius, TextFieldValue::F64(v)) => cfg.appearance.corner_radius = v,
         (TextField::ClipboardMaxEntries, TextFieldValue::U32(v)) => cfg.clipboard.max_entries = v,
@@ -1876,7 +1689,10 @@ fn write_text_field_config(field: TextField, value: TextFieldValue) {
         _ => {}
     }
     if let Ok(mut w) = CONFIG.write() {
-        *w = cfg;
+        *w = cfg.clone();
+    }
+    if apply_runtime {
+        apply_config_change(&old_cfg, &cfg, ConfigChangeSource::Settings);
     }
 }
 
@@ -2436,7 +2252,7 @@ fn select_sidebar(idx: usize) {
 /// Full refresh after a theme/locale change: menu, clipboard UI, overlay theme, highlight and
 /// the status-bar label. Does not rebuild the settings window itself (callers invoke
 /// refresh_system_appearance when needed).
-fn apply_theme_and_locale_refresh() {
+pub(crate) fn apply_theme_and_locale_refresh() {
     refresh_menu_titles();
     crate::clipboard::refresh_localized_ui();
     unsafe {
@@ -3032,7 +2848,7 @@ fn restore_all_defaults() {
     let mut defaults = Config::default();
     defaults.startup.launch_at_login = preserved_launch_at_login;
     if let Ok(mut w) = CONFIG.write() {
-        *w = defaults;
+        *w = defaults.clone();
     }
     log_config_changes(&old, &CONFIG.read().unwrap());
     persist_config_now();
@@ -3044,8 +2860,7 @@ fn restore_all_defaults() {
     // 一次性应用全部 Tab 的运行时副作用,再原位重建设置窗口(主题/locale 可能变化)。
     // Apply every tab's runtime side effects in one pass, then rebuild the settings window
     // in place (theme/locale may have changed).
-    apply_all_tab_effects();
-    refresh_system_appearance();
+    apply_config_change(&old, &defaults, ConfigChangeSource::RestoreDefaults);
 }
 
 /// 一次性恢复当前 Tab 的全部默认设置并立即生效(原子更新,不影响其他 Tab)。
@@ -3126,7 +2941,7 @@ fn restore_tab_defaults(tab: usize) {
         }
     }
     if let Ok(mut w) = CONFIG.write() {
-        *w = cfg;
+        *w = cfg.clone();
     }
     log_config_changes(&old, &CONFIG.read().unwrap());
     persist_config_now();
@@ -3135,14 +2950,13 @@ fn restore_tab_defaults(tab: usize) {
         // 通用页涉及主题/locale 默认值:应用副作用后原位重建设置窗口。
         // The General page involves theme/locale defaults: apply effects, then rebuild the
         // settings window in place.
-        apply_tab_effects(0);
-        refresh_system_appearance();
+        apply_config_change(&old, &cfg, ConfigChangeSource::RestoreDefaults);
     } else {
         // 其余 Tab:重填控件(冻结态/条件显隐随 load_settings_from 刷新)+ 应用副作用。
         // Other tabs: refill the controls (freeze states / conditional visibility refresh
         // with load_settings_from) and apply the tab's side effects.
         load_settings_values();
-        apply_tab_effects(tab);
+        apply_config_change(&old, &cfg, ConfigChangeSource::RestoreDefaults);
     }
 }
 
