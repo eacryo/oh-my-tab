@@ -227,6 +227,12 @@ pub(crate) fn refresh_menu_titles() {
 
 pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     log_info!("User quit via menu bar.");
+    quit_application();
+}
+
+/// Flush state, restore system pointer settings, and terminate the accessory application.
+/// Flush 状态、恢复系统指针设置并退出辅助应用。
+pub(crate) fn quit_application() {
     if let Err(e) = flush_config_sync() {
         log_info!("Config flush before quit failed: {}", e);
     }

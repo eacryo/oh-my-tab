@@ -21,6 +21,7 @@ mod settings;
 mod skylight;
 mod theme;
 mod thumbnail;
+mod ui_coordinator;
 mod update_notice;
 mod updater;
 mod window_collector;
@@ -183,6 +184,16 @@ pub(crate) fn debug_assert_main_thread() {
             "main-thread runtime accessed off the AppKit main thread"
         );
     }
+}
+
+/// Neutral app-level entry points used to avoid UI-module dependency cycles.
+/// 用于解除 UI 模块循环依赖的中性应用级入口。
+pub(crate) fn close_settings_for_switcher() {
+    settings::close_settings_from_switcher();
+}
+
+pub(crate) fn quit_from_settings() {
+    menu::quit_application();
 }
 
 /// Main-thread-published window-count snapshot. Background diagnostics read this value

@@ -69,7 +69,7 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         // UI 刷新必须在主线程调用;所有入口(设置、菜单、Reload、启动)都在主线程。
         // UI refresh must run on the main thread; every caller (settings, menu, reload, startup)
         // enters from the main thread.
-        crate::settings::apply_theme_and_locale_refresh();
+        crate::ui_coordinator::apply_theme_and_locale_refresh();
         crate::settings::refresh_system_appearance();
     }
 

@@ -2291,7 +2291,7 @@ pub(crate) fn close_window_at(idx: usize) -> bool {
     // 本进程的设置窗口不能走后台关闭线程:它的 AX 关闭动作会回调 AppKit,从后台线程重入
     // UI 可能崩溃。直接在主线程走设置窗口的关闭路径。
     if pid == std::process::id() as i32 {
-        crate::settings::close_settings_from_switcher();
+        crate::close_settings_for_switcher();
         return finish_window_close(idx, pid, cgwid);
     }
     if !crate::window_collector::close_ax_window(pid, cgwid) {
