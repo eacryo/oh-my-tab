@@ -638,6 +638,18 @@ fn run_recheck(force_rebuild: bool) {
 /// acceleration" silently breaks until the user re-toggles it in Settings. Callbacks
 /// swallowed by the debounce are covered by the delayed recheck (see LAST_PLUG_HANDLE).
 unsafe extern "C" fn device_change_callback(
+    context: *mut c_void,
+    result: i32,
+    sender: *mut c_void,
+    callback: *mut c_void,
+    is_removal: bool,
+) {
+    crate::callback_guard::void("device_change_callback", || unsafe {
+        device_change_callback_inner(context, result, sender, callback, is_removal);
+    });
+}
+
+unsafe fn device_change_callback_inner(
     _context: *mut c_void,
     _result: i32,
     _sender: *mut c_void,

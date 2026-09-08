@@ -592,10 +592,14 @@ fn apply_window_refresh() {
 }
 
 pub(crate) extern "C" fn on_window_refresh(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    apply_window_refresh();
+    crate::callback_guard::void("on_window_refresh", apply_window_refresh);
 }
 
 pub(crate) extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    crate::callback_guard::void("on_window_server_event", on_window_server_event_inner);
+}
+
+fn on_window_server_event_inner() {
     let events = window_server::drain_main();
     if events.is_empty() {
         return;

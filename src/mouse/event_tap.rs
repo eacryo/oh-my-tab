@@ -75,6 +75,17 @@ unsafe fn post_scroll_event(dy: i32, dx: i32, flags: CGEventFlags) {
 }
 
 unsafe extern "C" fn mouse_event_tap_callback(
+    proxy: CGEventTapProxy,
+    event_type: CGEventType,
+    event: CGEventRef,
+    user_info: *mut c_void,
+) -> CGEventRef {
+    crate::callback_guard::event("mouse_event_tap_callback", event, || unsafe {
+        mouse_event_tap_callback_inner(proxy, event_type, event, user_info)
+    })
+}
+
+unsafe fn mouse_event_tap_callback_inner(
     _proxy: CGEventTapProxy,
     event_type: CGEventType,
     event: CGEventRef,

@@ -181,7 +181,7 @@ pub(super) fn poll_clipboard() {
 /// timer tick 回调(主线程):继续轮询。
 /// Timer tick callback (main thread): keep polling.
 pub(super) extern "C" fn clip_poll_tick(_self: *mut c_void, _cmd: Sel, _timer: *mut c_void) {
-    poll_clipboard();
+    crate::callback_guard::void("clip_poll_tick", poll_clipboard);
 }
 
 /// 启动轮询(幂等):创建主线程 NSTimer,并立刻记录一次当前剪贴板。

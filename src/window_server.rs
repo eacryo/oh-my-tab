@@ -119,6 +119,18 @@ unsafe extern "C" fn window_server_callback(
     event: u32,
     data: *const c_void,
     data_length: usize,
+    context: *mut c_void,
+    connection: i32,
+) {
+    crate::callback_guard::void("window_server_callback", || unsafe {
+        window_server_callback_inner(event, data, data_length, context, connection);
+    });
+}
+
+unsafe fn window_server_callback_inner(
+    event: u32,
+    data: *const c_void,
+    data_length: usize,
     _context: *mut c_void,
     _connection: i32,
 ) {

@@ -1,4 +1,5 @@
 mod autostart;
+mod callback_guard;
 mod clipboard;
 mod clipboard_highlight;
 mod config;
@@ -293,6 +294,12 @@ fn schedule_global_input_drain() {
 /// Main-thread consumer for one input batch; release is applied last so rapid Tab presses retain
 /// their existing commit semantics.
 extern "C" fn on_global_input_drain(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    callback_guard::void("on_global_input_drain", || {
+        on_global_input_drain_inner();
+    });
+}
+
+fn on_global_input_drain_inner() {
     let Some(pending) = PENDING_GLOBAL_INPUT.get() else {
         return;
     };
@@ -379,6 +386,10 @@ extern "C" fn on_global_input_drain(_self: *mut c_void, _cmd: Sel, _arg: *mut c_
 // --- Controller ---
 
 extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
+    callback_guard::void("on_app_activated", || on_app_activated_inner(notification));
+}
+
+fn on_app_activated_inner(notification: *mut c_void) {
     unsafe {
         let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
         if user_info.is_null() {
@@ -610,6 +621,10 @@ fn resolve_activation_focus(task: ActivationFocusTask) {
 }
 
 extern "C" fn on_app_launched(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
+    callback_guard::void("on_app_launched", || on_app_launched_inner(notification));
+}
+
+fn on_app_launched_inner(notification: *mut c_void) {
     // Pre-cache the launched app's icon so it's on disk before the user summons
     // the switcher. Run off the main thread (with an autorelease pool) so the
     // launch notification doesn't block the UI; extract_icon_to_cache is
@@ -665,6 +680,12 @@ extern "C" fn on_app_launched(_self: *mut c_void, _cmd: Sel, notification: *mut 
 /// thread): tells the thumbnail module to cancel captures, clear cached frames,
 /// and uninstall that app's observer.
 extern "C" fn on_app_terminated(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
+    callback_guard::void("on_app_terminated", || {
+        on_app_terminated_inner(notification)
+    });
+}
+
+fn on_app_terminated_inner(notification: *mut c_void) {
     let pid: i32 = unsafe {
         let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
         if user_info.is_null() {
@@ -708,6 +729,10 @@ extern "C" fn on_app_terminated(_self: *mut c_void, _cmd: Sel, notification: *mu
 }
 
 extern "C" fn on_locale_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    callback_guard::void("on_locale_changed", || on_locale_changed_inner(_self));
+}
+
+fn on_locale_changed_inner(_self: *mut c_void) {
     unsafe {
         // 通知投递线程不保证是主线程,而刷新 UI 必须在主线程;非主线程时转到主线程重入本方法。
         // Notification delivery thread isn't guaranteed to be main, but UI refresh must run on
@@ -740,6 +765,12 @@ extern "C" fn on_locale_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void
 /// Callback for effective-appearance changes. Follow the system only when theme is `auto`,
 /// and marshal all AppKit/UI work back to the main thread.
 extern "C" fn on_appearance_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    callback_guard::void("on_appearance_changed", || {
+        on_appearance_changed_inner(_self)
+    });
+}
+
+fn on_appearance_changed_inner(_self: *mut c_void) {
     unsafe {
         let is_main: bool = msg_send![class!(NSThread), isMainThread];
         if !is_main {
@@ -776,6 +807,12 @@ extern "C" fn on_appearance_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_
 /// overlay panel's size follows screen geometry; both go through overlay's debounced
 /// entry point.
 extern "C" fn on_screen_parameters_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    callback_guard::void("on_screen_parameters_changed", || {
+        on_screen_parameters_changed_inner(_self);
+    });
+}
+
+fn on_screen_parameters_changed_inner(_self: *mut c_void) {
     unsafe {
         // 该通知由 NSApplication 在主线程投递,但沿用既有防御:非主线程时跳回主线程。
         // NSApplication posts this on the main thread; keep the existing defensive
@@ -800,6 +837,10 @@ extern "C" fn on_screen_parameters_changed(_self: *mut c_void, _cmd: Sel, _arg: 
 /// performSelectorOnMainThread: refresh the settings device popup live (a reconnect shows
 /// immediately, no OK/reopen needed).
 extern "C" fn on_devices_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    callback_guard::void("on_devices_changed", || on_devices_changed_inner(_self));
+}
+
+fn on_devices_changed_inner(_self: *mut c_void) {
     unsafe {
         let is_main: bool = msg_send![class!(NSThread), isMainThread];
         if !is_main {
@@ -820,19 +861,23 @@ extern "C" fn on_devices_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_voi
 /// performSelectorOnMainThread): drains the pending queue and rebuilds the
 /// affected cards in place.
 extern "C" fn on_thumbnail_ready(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    thumbnail::handle_ready_main();
+    callback_guard::void("on_thumbnail_ready", thumbnail::handle_ready_main);
 }
 
 /// AX raise mutations are queued by the background raiser and applied here on AppKit's main
 /// thread.  Some AX actions synchronously enter AppKit, which traps when called off-main.
 extern "C" fn on_ax_raise(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    window_collector::handle_ax_raise_main();
+    callback_guard::void("on_ax_raise", window_collector::handle_ax_raise_main);
 }
 
 /// 窗口控制(Option+方向键)主线程入口:arg 是 bridge 打包方向的 NSNumber。
 /// Window-control (Option+arrows) main-thread entry: arg is the bridge's NSNumber carrying
 /// the direction.
 extern "C" fn on_window_control(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
+    callback_guard::void("on_window_control", || on_window_control_inner(arg));
+}
+
+fn on_window_control_inner(arg: *mut c_void) {
     if arg.is_null() {
         return;
     }
@@ -845,6 +890,10 @@ extern "C" fn on_window_control(_self: *mut c_void, _cmd: Sel, arg: *mut c_void)
 /// 主线程:执行快捷操作(bridge 投递过来的动作编号)。
 /// Main thread: run one quick action (an action id delivered by the bridge).
 extern "C" fn on_quick_action(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
+    callback_guard::void("on_quick_action", || on_quick_action_inner(arg));
+}
+
+fn on_quick_action_inner(arg: *mut c_void) {
     if arg.is_null() {
         return;
     }

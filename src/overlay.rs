@@ -1652,7 +1652,7 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
 }
 
 pub(crate) extern "C" fn container_accepts_first_responder(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
+    crate::callback_guard::bool("container_accepts_first_responder", false, || true)
 }
 
 /// 两种布局都接收鼠标滚轮和触控板滚动,保留 point 级增量而不是量化为整行。
