@@ -21,7 +21,7 @@ static DISABLED_TOOLTIPS: LazyLock<Mutex<HashMap<usize, String>>> =
 
 /// At most one custom bubble is visible in the settings window at a time.
 /// 设置窗口同一时间最多显示一个自绘气泡。
-static ACTIVE_BUBBLE: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+static ACTIVE_BUBBLE: Mutex<Option<usize>> = Mutex::new(None);
 
 /// The current dismissal timer; a new click replaces the old timer instead of racing it.
 /// 当前自动消失定时器；新的点击会替换旧定时器，避免旧定时器误关新提示。
@@ -110,6 +110,20 @@ extern "C" fn tooltip_timeout(_self: *mut c_void, _cmd: Sel, timer: *mut c_void)
     }
 }
 
+/// Remove a bubble after its exit animation has finished.
+/// 在退出动画结束后移除气泡。
+extern "C" fn tooltip_remove_bubble(_self: *mut c_void, _cmd: Sel, timer: *mut c_void) {
+    unsafe {
+        let timer = timer as *mut AnyObject;
+        let bubble: *mut AnyObject = objc2::msg_send![timer, userInfo];
+        if bubble.is_null() {
+            return;
+        }
+        let _: () = objc2::msg_send![bubble, setAlphaValue: 0.0f64];
+        let _: () = objc2::msg_send![bubble, removeFromSuperview];
+    }
+}
+
 fn disabled_cursor_target() -> *mut AnyObject {
     DISABLED_CURSOR_TARGET
         .get_or_init(|| unsafe {
@@ -133,6 +147,12 @@ fn disabled_cursor_target() -> *mut AnyObject {
                 cls,
                 objc2::sel!(hideTooltip:),
                 tooltip_timeout as *mut c_void,
+                types.as_ptr(),
+            );
+            crate::ffi::class_addMethod(
+                cls,
+                objc2::sel!(removeTooltipBubble:),
+                tooltip_remove_bubble as *mut c_void,
                 types.as_ptr(),
             );
             crate::ffi::objc_registerClassPair(cls);
@@ -187,38 +207,174 @@ impl SettingsTooltip {
         }
     }
 
-    unsafe fn remove_bubble() {
+    unsafe fn remove_bubble_now() {
         let active = ACTIVE_BUBBLE.lock().unwrap().take();
-        if let Some((_, bubble)) = active {
+        if let Some(bubble) = active {
             let bubble = bubble as *mut AnyObject;
+            let _: () = objc2::msg_send![bubble, setAlphaValue: 0.0f64];
             let _: () = objc2::msg_send![bubble, removeFromSuperview];
         }
     }
 
     unsafe fn hide_bubble() {
         Self::cancel_timer();
-        Self::remove_bubble();
+        Self::dismiss_bubble();
     }
 
     /// Hide and remove the current bubble atomically so dismissal cannot flash a stale frame.
     /// 原子地隐藏并移除当前气泡，避免消失时闪回旧的可见帧。
     unsafe fn dismiss_bubble() {
         let active = ACTIVE_BUBBLE.lock().unwrap().take();
-        let Some((_, bubble)) = active else {
+        let Some(bubble) = active else {
             return;
         };
         let bubble = bubble as *mut AnyObject;
-        let _: () = objc2::msg_send![bubble, setAlphaValue: 0.0f64];
-        let _: () = objc2::msg_send![bubble, removeFromSuperview];
+        let layer: *mut AnyObject = objc2::msg_send![bubble, layer];
+        if layer.is_null() || Self::accessibility_reduce_motion() {
+            let _: () = objc2::msg_send![bubble, setAlphaValue: 0.0f64];
+            let _: () = objc2::msg_send![bubble, removeFromSuperview];
+            return;
+        }
+
+        let opacity = Self::presentation_scalar(layer, "opacity", 1.0);
+        let y = Self::presentation_scalar(layer, "transform.translation.y", 0.0);
+        let scale = Self::presentation_scalar(layer, "transform.scale", 1.0);
+        Self::set_layer_model(layer, "opacity", 0.0);
+        Self::set_layer_model(layer, "transform.translation.y", -4.0);
+        Self::set_layer_model(layer, "transform.scale", 0.99);
+        Self::add_basic_animation(
+            layer,
+            "opacity",
+            opacity,
+            0.0,
+            0.14,
+            "settings-tooltip-exit-opacity",
+        );
+        Self::add_basic_animation(
+            layer,
+            "transform.translation.y",
+            y,
+            -4.0,
+            0.14,
+            "settings-tooltip-exit-y",
+        );
+        Self::add_basic_animation(
+            layer,
+            "transform.scale",
+            scale,
+            0.99,
+            0.14,
+            "settings-tooltip-exit-scale",
+        );
+
+        let _: *mut AnyObject = objc2::msg_send![
+            objc2::class!(NSTimer),
+            scheduledTimerWithTimeInterval: 0.14f64,
+            target: disabled_cursor_target(),
+            selector: objc2::sel!(removeTooltipBubble:),
+            // Retain the bubble through the timer so a rapid replacement or window rebuild
+            // cannot leave the exit callback with a dangling pointer.
+            // 让 timer 持有 bubble，避免快速替换或重建窗口后退出回调访问悬空指针。
+            userInfo: bubble,
+            repeats: false
+        ];
+    }
+
+    unsafe fn set_layer_model(layer: *mut AnyObject, key_path: &str, value: f64) {
+        let number: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: value];
+        let key_path = crate::ffi::make_nsstring(key_path);
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+        let _: () = objc2::msg_send![layer, setValue: number, forKeyPath: key_path];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+        crate::ffi::CFRelease(key_path as *const c_void);
+    }
+
+    unsafe fn presentation_scalar(layer: *mut AnyObject, key_path: &str, fallback: f64) -> f64 {
+        let presentation: *mut AnyObject = objc2::msg_send![layer, presentationLayer];
+        if presentation.is_null() {
+            return fallback;
+        }
+        let key_path = crate::ffi::make_nsstring(key_path);
+        let value: *mut AnyObject = objc2::msg_send![presentation, valueForKeyPath: key_path];
+        crate::ffi::CFRelease(key_path as *const c_void);
+        if value.is_null() {
+            fallback
+        } else {
+            objc2::msg_send![value, doubleValue]
+        }
+    }
+
+    unsafe fn add_basic_animation(
+        layer: *mut AnyObject,
+        key_path: &str,
+        from: f64,
+        to: f64,
+        duration: f64,
+        animation_key: &str,
+    ) {
+        let key_path_ns = crate::ffi::make_nsstring(key_path);
+        let animation: *mut AnyObject = objc2::msg_send![
+            objc2::class!(CABasicAnimation),
+            animationWithKeyPath: key_path_ns
+        ];
+        crate::ffi::CFRelease(key_path_ns as *const c_void);
+        let from_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: from];
+        let to_value: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: to];
+        let _: () = objc2::msg_send![animation, setFromValue: from_value];
+        let _: () = objc2::msg_send![animation, setToValue: to_value];
+        let _: () = objc2::msg_send![animation, setDuration: duration];
+        let timing_name = crate::ffi::make_nsstring("easeOut");
+        let timing: *mut AnyObject = objc2::msg_send![
+            objc2::class!(CAMediaTimingFunction),
+            functionWithName: timing_name
+        ];
+        crate::ffi::CFRelease(timing_name as *const c_void);
+        if !timing.is_null() {
+            let _: () = objc2::msg_send![animation, setTimingFunction: timing];
+        }
+        let animation_key = crate::ffi::make_nsstring(animation_key);
+        let _: () = objc2::msg_send![layer, addAnimation: animation, forKey: animation_key];
+        crate::ffi::CFRelease(animation_key as *const c_void);
+    }
+
+    unsafe fn accessibility_reduce_motion() -> bool {
+        let workspace: *mut AnyObject =
+            objc2::msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
+        if workspace.is_null()
+            || !objc2::msg_send![
+                workspace,
+                respondsToSelector: objc2::sel!(accessibilityDisplayShouldReduceMotion)
+            ]
+        {
+            return false;
+        }
+        objc2::msg_send![workspace, accessibilityDisplayShouldReduceMotion]
     }
 
     unsafe fn show_bubble(view: *mut AnyObject, text: &str) {
-        if view.is_null() || text.is_empty() {
+        if view.is_null() {
+            return;
+        }
+        let window: *mut AnyObject = objc2::msg_send![view, window];
+        Self::show_bubble_in_window(window, text, false);
+    }
+
+    /// Show a transient success message in the settings window.
+    /// 在设置窗口中显示短暂的成功提示。
+    pub(super) unsafe fn show_success_bubble(window: *mut AnyObject, text: &str) {
+        Self::show_bubble_in_window(window, text, true);
+    }
+
+    unsafe fn show_bubble_in_window(window: *mut AnyObject, text: &str, success: bool) {
+        if window.is_null() || text.is_empty() {
             return;
         }
         Self::hide_bubble();
 
-        let window: *mut AnyObject = objc2::msg_send![view, window];
         let content: *mut AnyObject = if window.is_null() {
             std::ptr::null_mut()
         } else {
@@ -228,15 +384,20 @@ impl SettingsTooltip {
             return;
         }
 
-        // Keep the bubble centered at the bottom of the whole settings window, above the footer,
-        // rather than following the pointer or the clicked control.
-        // 气泡固定在整个设置窗口底部、footer 上方，不跟随鼠标或被点击的控件。
+        // Keep the bubble centered at the bottom of the right detail pane, above the footer,
+        // rather than centering it across the navigation sidebar or following the clicked control.
+        // 气泡固定在右侧详情区底部、footer 上方，不跨左侧导航栏居中，也不跟随被点击的控件。
         let content_bounds: NSRect = objc2::msg_send![content, bounds];
         let palette = crate::theme::ui_palette();
         let bubble_width = 248.0;
         let bubble_size = NSSize::new(bubble_width, 36.0);
-        let x = content_bounds.origin.x
-            + ((content_bounds.size.width - bubble_size.width) / 2.0).clamp(8.0, f64::MAX);
+        let detail_left = content_bounds.origin.x + super::SETTINGS_SIDEBAR_WIDTH;
+        let detail_right = content_bounds.origin.x + content_bounds.size.width;
+        let detail_width = (detail_right - detail_left).max(0.0);
+        let centered_x = detail_left + (detail_width - bubble_size.width) / 2.0;
+        let min_x = detail_left + 8.0;
+        let max_x = (detail_right - bubble_size.width - 8.0).max(min_x);
+        let x = centered_x.clamp(min_x, max_x);
         let y = (content_bounds.origin.y + 74.0).clamp(
             content_bounds.origin.y + 8.0,
             (content_bounds.origin.y + content_bounds.size.height - bubble_size.height - 8.0)
@@ -257,6 +418,25 @@ impl SettingsTooltip {
         let _: () = objc2::msg_send![bubble, setWantsLayer: true];
         let layer: *mut AnyObject = objc2::msg_send![bubble, layer];
         if !layer.is_null() {
+            // Explicitly anchor the transform at the bubble's bottom center so scale grows
+            // upward from the footer instead of depending on the backing layer's default anchor.
+            // 明确将变换原点设为气泡底部中心，让缩放从 footer 正上方向上展开，不依赖 backing
+            // layer 的默认锚点。更新锚点时补偿 position，避免改变最终 frame 位置。
+            let bounds: NSRect = objc2::msg_send![layer, bounds];
+            let old_anchor: NSPoint = objc2::msg_send![layer, anchorPoint];
+            let old_position: NSPoint = objc2::msg_send![layer, position];
+            let anchor = NSPoint::new(0.5, 0.0);
+            let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+            let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+            let _: () = objc2::msg_send![layer, setAnchorPoint: anchor];
+            let _: () = objc2::msg_send![
+                layer,
+                setPosition: NSPoint::new(
+                    old_position.x + (anchor.x - old_anchor.x) * bounds.size.width,
+                    old_position.y + (anchor.y - old_anchor.y) * bounds.size.height,
+                )
+            ];
+            let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
             let background = if palette.dark { 0x3A3A3FDD } else { 0xF8F8F8D9 };
             crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
             let _: () = objc2::msg_send![layer, setCornerRadius: 10.0f64];
@@ -269,7 +449,11 @@ impl SettingsTooltip {
         }
 
         let mut icon_view: *mut AnyObject = std::ptr::null_mut();
-        let symbol_ns = crate::ffi::make_nsstring("info.circle.fill");
+        let symbol_ns = crate::ffi::make_nsstring(if success {
+            "checkmark.circle.fill"
+        } else {
+            "info.circle.fill"
+        });
         let image: *mut AnyObject = objc2::msg_send![
             objc2::class!(NSImage),
             imageWithSystemSymbolName: symbol_ns,
@@ -284,7 +468,16 @@ impl SettingsTooltip {
             ];
             let _: () = objc2::msg_send![icon, setImage: image];
             let _: () = objc2::msg_send![icon, setImageScaling: 3isize];
-            let tint = crate::ffi::hex_to_ns_color(palette.accent);
+            let tint_hex = if success {
+                if palette.dark {
+                    0x30D158FF
+                } else {
+                    0x34C759FF
+                }
+            } else {
+                palette.accent
+            };
+            let tint = crate::ffi::hex_to_ns_color(tint_hex);
             let _: () = objc2::msg_send![icon, setContentTintColor: tint];
             let _: () = objc2::msg_send![bubble, addSubview: icon];
             icon_view = icon;
@@ -353,29 +546,44 @@ impl SettingsTooltip {
         crate::ffi::release_obj(label);
         let _: () = objc2::msg_send![content, addSubview: bubble];
         crate::ffi::release_obj(bubble);
-        *ACTIVE_BUBBLE.lock().unwrap() = Some((view as usize, bubble as usize));
+        *ACTIVE_BUBBLE.lock().unwrap() = Some(bubble as usize);
 
-        // A short opacity animation makes the click feedback feel attached to the setting row
-        // without moving the bubble away from its fixed bottom position.
-        // 用短暂透明度动画反馈点击，同时保持气泡固定在窗口底部而不跟随鼠标移动。
+        // Enter from just below the final position with a small scale change. The final frame
+        // remains the same centered position; the motion only makes the transient feedback feel
+        // attached to the click without competing with the settings page.
+        // 从最终位置下方轻微上浮并伴随极小缩放。最终 frame 仍保持居中位置，动效只用于让
+        // 临时提示与点击建立联系，不抢设置页本身的注意力。
         let layer: *mut AnyObject = objc2::msg_send![bubble, layer];
         if !layer.is_null() {
-            let key_path = crate::ffi::make_nsstring("opacity");
-            let animation: *mut AnyObject = objc2::msg_send![
-                objc2::class!(CABasicAnimation),
-                animationWithKeyPath: key_path
-            ];
-            crate::ffi::CFRelease(key_path as *const c_void);
-            let from_value: *mut AnyObject =
-                objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: 0.0f64];
-            let to_value: *mut AnyObject =
-                objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: 1.0f64];
-            let _: () = objc2::msg_send![animation, setFromValue: from_value];
-            let _: () = objc2::msg_send![animation, setToValue: to_value];
-            let _: () = objc2::msg_send![animation, setDuration: 0.12f64];
-            let key = crate::ffi::make_nsstring("settings-tooltip-appear");
-            let _: () = objc2::msg_send![layer, addAnimation: animation, forKey: key];
-            crate::ffi::CFRelease(key as *const c_void);
+            Self::set_layer_model(layer, "opacity", 1.0);
+            Self::set_layer_model(layer, "transform.translation.y", 0.0);
+            Self::set_layer_model(layer, "transform.scale", 1.0);
+            if !Self::accessibility_reduce_motion() {
+                Self::add_basic_animation(
+                    layer,
+                    "opacity",
+                    0.0,
+                    1.0,
+                    0.2,
+                    "settings-tooltip-enter-opacity",
+                );
+                Self::add_basic_animation(
+                    layer,
+                    "transform.translation.y",
+                    -8.0,
+                    0.0,
+                    0.2,
+                    "settings-tooltip-enter-y",
+                );
+                Self::add_basic_animation(
+                    layer,
+                    "transform.scale",
+                    0.98,
+                    1.0,
+                    0.2,
+                    "settings-tooltip-enter-scale",
+                );
+            }
         }
 
         let timer: *mut AnyObject = objc2::msg_send![
@@ -439,6 +647,12 @@ impl SettingsTooltip {
             .iter()
             .map(|(view, text)| (*view, text.clone()))
             .collect();
+        // Resolve the actual AppKit hit view before checking candidates. Comparing the click
+        // point with every disabled label's converted frame is too broad: a label can span most
+        // of a row and overlap an unrelated action button (for example, Restore Defaults).
+        // 先通过 AppKit 命中测试得到真实点击 view，再检查候选项。逐一比较所有禁用 label 的
+        // 转换 frame 范围过于宽泛：label 可能覆盖整行，从而误判旁边的恢复默认按钮。
+        let hit_view: *mut AnyObject = objc2::msg_send![content, hitTest: content_point];
         for (view_address, text) in candidates {
             let view = view_address as *mut AnyObject;
             let view_window: *mut AnyObject = objc2::msg_send![view, window];
@@ -456,23 +670,26 @@ impl SettingsTooltip {
                 continue;
             }
 
-            // Use the part that survives ancestor clipping instead of the full local bounds.
-            // This keeps a scrolled-out or partially clipped control from claiming clicks in
-            // content that the user cannot currently see.
-            // 使用经过父级裁切后仍可见的区域，而不是完整 bounds，避免滚出视口或被裁切的控件
-            // 抢占用户当前看不到的区域。
-            let visible_rect: NSRect = objc2::msg_send![view, visibleRect];
-            if visible_rect.size.width <= 0.0 || visible_rect.size.height <= 0.0 {
-                continue;
-            }
-            let rect: NSRect = objc2::msg_send![view, convertRect: visible_rect, toView: content];
-            let inside = content_point.x >= rect.origin.x
-                && content_point.x <= rect.origin.x + rect.size.width
-                && content_point.y >= rect.origin.y
-                && content_point.y <= rect.origin.y + rect.size.height;
-            if inside {
-                Self::show_bubble(view, &text);
-                return;
+            // A row label or a wrapped button title may be a child of the registered control,
+            // so walk up from the hit view instead of requiring pointer equality.
+            // 行 label 或换行按钮标题可能是已注册控件的子 view，因此从命中 view 向上遍历，
+            // 不要求指针必须完全相等。
+            let mut ancestor = hit_view;
+            while !ancestor.is_null() {
+                if ancestor == view {
+                    let enabled = if objc2::msg_send![view, respondsToSelector: objc2::sel!(isEnabled)]
+                    {
+                        objc2::msg_send![view, isEnabled]
+                    } else {
+                        false
+                    };
+                    if !enabled {
+                        Self::show_bubble(view, &text);
+                        return;
+                    }
+                    break;
+                }
+                ancestor = objc2::msg_send![ancestor, superview];
             }
         }
         Self::hide_bubble();
@@ -481,7 +698,10 @@ impl SettingsTooltip {
     /// Drop tracking state before settings views are deallocated.
     /// 设置 view 释放前清理 tracking 状态。
     pub(super) fn clear_runtime_registries() {
-        unsafe { Self::hide_bubble() };
+        unsafe {
+            Self::cancel_timer();
+            Self::remove_bubble_now();
+        }
         DISABLED_TRACKING_AREAS.lock().unwrap().clear();
         DISABLED_TOOLTIPS.lock().unwrap().clear();
     }

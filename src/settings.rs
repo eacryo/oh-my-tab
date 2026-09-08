@@ -65,6 +65,10 @@ const TEXT_SIZE_DEFAULT: i64 = 15;
 const TEXT_SIZE_VALUE_W: f64 = 40.0;
 const TEXT_SIZE_VALUE_H: f64 = 18.0;
 
+/// Fixed width of the settings navigation pane, shared by layout and transient feedback.
+/// 设置导航栏固定宽度，供页面布局和临时反馈提示共用。
+pub(crate) const SETTINGS_SIDEBAR_WIDTH: f64 = 220.0;
+
 // ========== 按键映射录制状态 / button-mapping recording state ==========
 
 /// 录制阶段。
@@ -2723,6 +2727,7 @@ pub(crate) extern "C" fn handle_restore_defaults_confirm(
     // defaults), so animating is pointless.
     set_restore_confirmation_expanded(false, false);
     restore_all_defaults();
+    show_restore_success(false);
 }
 
 /// 展开「恢复本页默认设置」(右下角,当前 Tab)的内联确认卡片;同时收起整应用确认卡片,
@@ -2758,6 +2763,26 @@ pub(crate) extern "C" fn handle_page_restore_defaults_confirm(
 ) {
     set_page_restore_confirmation_expanded(false, false);
     restore_tab_defaults(SIDEBAR_SELECTED.load(Ordering::SeqCst));
+    show_restore_success(true);
+}
+
+/// Show the post-reset success feedback after configuration and UI refreshes have completed.
+/// 在配置与设置界面刷新完成后显示恢复默认成功提示。
+fn show_restore_success(page_only: bool) {
+    let text = if page_only {
+        t("settings.toast_page_defaults_restored")
+    } else {
+        t("settings.toast_all_defaults_restored")
+    };
+    let window = SETTINGS_UI
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|ui| ui.window)
+        .unwrap_or(std::ptr::null_mut());
+    unsafe {
+        tooltip::SettingsTooltip::show_success_bubble(window, &text);
+    }
 }
 
 /// 收起两套恢复确认卡片(切页/开关设置窗口时调用)。
@@ -3511,7 +3536,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // while keeping the sidebar and the existing window height unchanged.
         let view_w = 820.0;
         let card_margin = 0.0;
-        let card_w = 220.0;
+        let card_w = SETTINGS_SIDEBAR_WIDTH;
         let window_clip_radius = 26.0;
         let card_radius = 0.0;
         let style: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
