@@ -237,11 +237,11 @@ impl SettingsTooltip {
         }
 
         let opacity = Self::presentation_scalar(layer, "opacity", 1.0);
-        let y = Self::presentation_scalar(layer, "transform.translation.y", 0.0);
+        let x = Self::presentation_scalar(layer, "transform.translation.x", 0.0);
         let scale = Self::presentation_scalar(layer, "transform.scale", 1.0);
         Self::set_layer_model(layer, "opacity", 0.0);
-        Self::set_layer_model(layer, "transform.translation.y", -4.0);
-        Self::set_layer_model(layer, "transform.scale", 0.99);
+        Self::set_layer_model(layer, "transform.translation.x", 32.0);
+        Self::set_layer_model(layer, "transform.scale", 0.96);
         Self::add_basic_animation(
             layer,
             "opacity",
@@ -252,24 +252,24 @@ impl SettingsTooltip {
         );
         Self::add_basic_animation(
             layer,
-            "transform.translation.y",
-            y,
-            -4.0,
-            0.14,
-            "settings-tooltip-exit-y",
+            "transform.translation.x",
+            x,
+            32.0,
+            0.18,
+            "settings-tooltip-exit-x",
         );
         Self::add_basic_animation(
             layer,
             "transform.scale",
             scale,
-            0.99,
-            0.14,
+            0.96,
+            0.18,
             "settings-tooltip-exit-scale",
         );
 
         let _: *mut AnyObject = objc2::msg_send![
             objc2::class!(NSTimer),
-            scheduledTimerWithTimeInterval: 0.14f64,
+            scheduledTimerWithTimeInterval: 0.18f64,
             target: disabled_cursor_target(),
             selector: objc2::sel!(removeTooltipBubble:),
             // Retain the bubble through the timer so a rapid replacement or window rebuild
@@ -327,12 +327,22 @@ impl SettingsTooltip {
         let _: () = objc2::msg_send![animation, setFromValue: from_value];
         let _: () = objc2::msg_send![animation, setToValue: to_value];
         let _: () = objc2::msg_send![animation, setDuration: duration];
-        let timing_name = crate::ffi::make_nsstring("easeOut");
-        let timing: *mut AnyObject = objc2::msg_send![
-            objc2::class!(CAMediaTimingFunction),
-            functionWithName: timing_name
-        ];
-        crate::ffi::CFRelease(timing_name as *const c_void);
+        // Match the reference toast's fast-out, gentle-settle cubic curve.
+        // 匹配参考 Toast 的快速出场、柔和落位三次贝塞尔曲线。
+        extern "C" {
+            fn objc_msgSend();
+        }
+        type TimingFunction =
+            unsafe extern "C" fn(*mut AnyObject, Sel, f32, f32, f32, f32) -> *mut AnyObject;
+        let make_timing: TimingFunction = std::mem::transmute(objc_msgSend as *const ());
+        let timing = make_timing(
+            objc2::class!(CAMediaTimingFunction) as *const _ as *mut AnyObject,
+            objc2::sel!(functionWithControlPoints::::),
+            0.22,
+            1.0,
+            0.36,
+            1.0,
+        );
         if !timing.is_null() {
             let _: () = objc2::msg_send![animation, setTimingFunction: timing];
         }
@@ -384,19 +394,21 @@ impl SettingsTooltip {
             return;
         }
 
-        // Keep the bubble centered at the bottom of the right detail pane, above the footer,
-        // rather than centering it across the navigation sidebar or following the clicked control.
-        // 气泡固定在右侧详情区底部、footer 上方，不跨左侧导航栏居中，也不跟随被点击的控件。
+        // Center the bubble across the entire settings window and keep it near the lower edge,
+        // matching the toast placement in the reference while staying above the footer area.
+        // 气泡相对于整个设置窗口水平居中并靠近底部，匹配参考 Toast 的位置，同时避开 footer 区域。
         let content_bounds: NSRect = objc2::msg_send![content, bounds];
         let palette = crate::theme::ui_palette();
-        let bubble_width = 248.0;
-        let bubble_size = NSSize::new(bubble_width, 36.0);
-        let detail_left = content_bounds.origin.x + super::SETTINGS_SIDEBAR_WIDTH;
-        let detail_right = content_bounds.origin.x + content_bounds.size.width;
-        let detail_width = (detail_right - detail_left).max(0.0);
-        let centered_x = detail_left + (detail_width - bubble_size.width) / 2.0;
-        let min_x = detail_left + 8.0;
-        let max_x = (detail_right - bubble_size.width - 8.0).max(min_x);
+        // The example toast is 360x82; use roughly 80% of that footprint for this window.
+        // 示例 Toast 尺寸约为 360×82，这里取其约 80% 的占地。
+        let bubble_width = 288.0;
+        let bubble_size = NSSize::new(bubble_width, 66.0);
+        let horizontal_padding = 28.0;
+        let centered_x =
+            content_bounds.origin.x + (content_bounds.size.width - bubble_size.width) / 2.0;
+        let min_x = content_bounds.origin.x + 8.0;
+        let max_x = (content_bounds.origin.x + content_bounds.size.width - bubble_size.width - 8.0)
+            .max(min_x);
         let x = centered_x.clamp(min_x, max_x);
         let y = (content_bounds.origin.y + 74.0).clamp(
             content_bounds.origin.y + 8.0,
@@ -437,23 +449,29 @@ impl SettingsTooltip {
                 )
             ];
             let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
-            let background = if palette.dark { 0x3A3A3FDD } else { 0xF8F8F8D9 };
+            // Match the reference card: a near-opaque surface, large radius, and a soft
+            // downward shadow that remains visible outside the bubble bounds.
+            // 匹配参考卡片：接近不透明的表面、较大圆角，以及向下延伸到气泡边界外的柔和阴影。
+            let background = if palette.dark { 0x3A3A3FF2 } else { 0xF8F8F8F2 };
             crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
-            let _: () = objc2::msg_send![layer, setCornerRadius: 10.0f64];
-            let _: () = objc2::msg_send![layer, setMasksToBounds: true];
+            let _: () = objc2::msg_send![layer, setCornerRadius: 16.0f64];
+            let _: () = objc2::msg_send![layer, setMasksToBounds: false];
             crate::ffi::layer_set_border(
                 layer,
-                crate::ffi::hex_to_cg_color(if palette.dark { 0xFFFFFF2A } else { 0x00000016 }),
+                crate::ffi::hex_to_cg_color(if palette.dark { 0xFFFFFF20 } else { 0x00000010 }),
             );
             let _: () = objc2::msg_send![layer, setBorderWidth: 1.0f64];
+            crate::ffi::layer_set_shadow_color(layer, crate::ffi::hex_to_cg_color(0x000000FF));
+            let _: () = objc2::msg_send![layer, setShadowOpacity: 0.25f32];
+            let _: () = objc2::msg_send![layer, setShadowRadius: 25.0f64];
+            let _: () = objc2::msg_send![layer, setShadowOffset: NSSize::new(0.0, -12.0)];
         }
 
         let mut icon_view: *mut AnyObject = std::ptr::null_mut();
-        let symbol_ns = crate::ffi::make_nsstring(if success {
-            "checkmark.circle.fill"
-        } else {
-            "info.circle.fill"
-        });
+        let icon_size = 28.0;
+        let icon_inner_size = 14.0;
+        let icon_gap = 12.0;
+        let symbol_ns = crate::ffi::make_nsstring(if success { "checkmark" } else { "info" });
         let image: *mut AnyObject = objc2::msg_send![
             objc2::class!(NSImage),
             imageWithSystemSymbolName: symbol_ns,
@@ -461,13 +479,6 @@ impl SettingsTooltip {
         ];
         crate::ffi::CFRelease(symbol_ns as *const c_void);
         if !image.is_null() {
-            let icon: *mut AnyObject = objc2::msg_send![objc2::class!(NSImageView), alloc];
-            let icon: *mut AnyObject = objc2::msg_send![
-                icon,
-                initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(16.0, 16.0))
-            ];
-            let _: () = objc2::msg_send![icon, setImage: image];
-            let _: () = objc2::msg_send![icon, setImageScaling: 3isize];
             let tint_hex = if success {
                 if palette.dark {
                     0x30D158FF
@@ -478,18 +489,58 @@ impl SettingsTooltip {
                 palette.accent
             };
             let tint = crate::ffi::hex_to_ns_color(tint_hex);
+            let icon_container: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
+            let icon_container: *mut AnyObject = objc2::msg_send![
+                icon_container,
+                initWithFrame: NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(icon_size, icon_size),
+                )
+            ];
+            let _: () = objc2::msg_send![icon_container, setWantsLayer: true];
+            let icon_layer: *mut AnyObject = objc2::msg_send![icon_container, layer];
+            if !icon_layer.is_null() {
+                let tint_hex = if success {
+                    if palette.dark {
+                        0x30D15826
+                    } else {
+                        0x34C75920
+                    }
+                } else if palette.dark {
+                    palette.accent & 0xFFFFFF00 | 0x26
+                } else {
+                    palette.accent & 0xFFFFFF00 | 0x20
+                };
+                crate::ffi::layer_set_background(icon_layer, crate::ffi::hex_to_cg_color(tint_hex));
+                let _: () = objc2::msg_send![icon_layer, setCornerRadius: 14.0f64];
+            }
+            let icon: *mut AnyObject = objc2::msg_send![objc2::class!(NSImageView), alloc];
+            let icon: *mut AnyObject = objc2::msg_send![
+                icon,
+                initWithFrame: NSRect::new(
+                    NSPoint::new(
+                        (icon_size - icon_inner_size) / 2.0,
+                        (icon_size - icon_inner_size) / 2.0,
+                    ),
+                    NSSize::new(icon_inner_size, icon_inner_size),
+                )
+            ];
+            let _: () = objc2::msg_send![icon, setImage: image];
+            let _: () = objc2::msg_send![icon, setImageScaling: 3isize];
             let _: () = objc2::msg_send![icon, setContentTintColor: tint];
-            let _: () = objc2::msg_send![bubble, addSubview: icon];
-            icon_view = icon;
+            let _: () = objc2::msg_send![icon_container, addSubview: icon];
             crate::ffi::release_obj(icon);
+            let _: () = objc2::msg_send![bubble, addSubview: icon_container];
+            icon_view = icon_container;
+            crate::ffi::release_obj(icon_container);
         }
 
         let label: *mut AnyObject = objc2::msg_send![objc2::class!(NSTextField), alloc];
         let label: *mut AnyObject = objc2::msg_send![
             label,
             initWithFrame: NSRect::new(
-                NSPoint::new(0.0, 10.0),
-                NSSize::new(bubble_size.width, 16.0),
+                NSPoint::new(0.0, (bubble_size.height - 20.0) / 2.0),
+                NSSize::new(bubble_size.width, 20.0),
             )
         ];
         let text_ns = crate::ffi::make_nsstring(text);
@@ -503,7 +554,7 @@ impl SettingsTooltip {
         let _: () = objc2::msg_send![label, setLineBreakMode: 4isize];
         let font: *mut AnyObject = objc2::msg_send![
             objc2::class!(NSFont),
-            systemFontOfSize: 12.5f64,
+            systemFontOfSize: 14.0f64,
             weight: 0.23f64
         ];
         let _: () = objc2::msg_send![label, setFont: font];
@@ -521,25 +572,28 @@ impl SettingsTooltip {
                 cell,
                 cellSizeForBounds: NSRect::new(
                     NSPoint::new(0.0, 0.0),
-                    NSSize::new(1000.0, 16.0),
+                    NSSize::new(1000.0, 20.0),
                 )
             ]
         };
-        let max_text_width = bubble_size.width - 28.0 - 16.0 - 7.0;
+        let max_text_width = bubble_size.width - horizontal_padding - icon_size - icon_gap;
         let text_width = measured.width.clamp(1.0, max_text_width);
-        let group_width = 16.0 + 7.0 + text_width;
-        let group_x = ((bubble_size.width - group_width) / 2.0).max(14.0);
+        let group_width = icon_size + icon_gap + text_width;
+        let group_x = ((bubble_size.width - group_width) / 2.0).max(horizontal_padding / 2.0);
         if !icon_view.is_null() {
             let _: () = objc2::msg_send![
                 icon_view,
-                setFrame: NSRect::new(NSPoint::new(group_x, 10.0), NSSize::new(16.0, 16.0))
+                setFrame: NSRect::new(
+                    NSPoint::new(group_x, (bubble_size.height - icon_size) / 2.0),
+                    NSSize::new(icon_size, icon_size),
+                )
             ];
         }
         let _: () = objc2::msg_send![
             label,
             setFrame: NSRect::new(
-                NSPoint::new(group_x + 23.0, 10.0),
-                NSSize::new(text_width, 16.0),
+                NSPoint::new(group_x + icon_size + icon_gap, (bubble_size.height - 20.0) / 2.0),
+                NSSize::new(text_width, 20.0),
             )
         ];
         let _: () = objc2::msg_send![bubble, addSubview: label];
@@ -548,11 +602,8 @@ impl SettingsTooltip {
         crate::ffi::release_obj(bubble);
         *ACTIVE_BUBBLE.lock().unwrap() = Some(bubble as usize);
 
-        // Enter from just below the final position with a small scale change. The final frame
-        // remains the same centered position; the motion only makes the transient feedback feel
-        // attached to the click without competing with the settings page.
-        // 从最终位置下方轻微上浮并伴随极小缩放。最终 frame 仍保持居中位置，动效只用于让
-        // 临时提示与点击建立联系，不抢设置页本身的注意力。
+        // Enter from below with the same scale/offset profile as the reference toast.
+        // 从下方以与参考 Toast 一致的缩放和位移轮廓进入。
         let layer: *mut AnyObject = objc2::msg_send![bubble, layer];
         if !layer.is_null() {
             Self::set_layer_model(layer, "opacity", 1.0);
@@ -564,23 +615,23 @@ impl SettingsTooltip {
                     "opacity",
                     0.0,
                     1.0,
-                    0.2,
+                    0.4,
                     "settings-tooltip-enter-opacity",
                 );
                 Self::add_basic_animation(
                     layer,
                     "transform.translation.y",
-                    -8.0,
+                    -22.0,
                     0.0,
-                    0.2,
+                    0.4,
                     "settings-tooltip-enter-y",
                 );
                 Self::add_basic_animation(
                     layer,
                     "transform.scale",
-                    0.98,
+                    0.96,
                     1.0,
-                    0.2,
+                    0.4,
                     "settings-tooltip-enter-scale",
                 );
             }
