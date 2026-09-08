@@ -49,16 +49,22 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
             let Some(idx) = get_card_index(sv) else {
                 continue;
             };
-            let mut state_opt = TAB_STATE.lock().unwrap();
-            if let Some(state) = state_opt.as_mut() {
-                if state.selected != idx {
-                    log_debug!("[overlay] mm select {} -> {}", state.selected, idx);
-                    state.selected = idx;
-                    drop(state_opt);
-                    reset_thumbnail_nav_anchor();
-                    refresh_highlight();
-                    update_status_label();
+            let changed = with_tab_state(|state_opt| {
+                let Some(state) = state_opt.as_mut() else {
+                    return false;
+                };
+                if state.selected == idx {
+                    return false;
                 }
+                log_debug!("[overlay] mm select {} -> {}", state.selected, idx);
+                state.selected = idx;
+                mark_user_picked(state);
+                true
+            });
+            if changed {
+                reset_thumbnail_nav_anchor();
+                refresh_highlight();
+                update_status_label();
             }
             break;
         }
@@ -256,11 +262,7 @@ pub(crate) extern "C" fn on_deferred_scroll_hover(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
-    let visible = TAB_STATE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|state| state.visible);
+    let visible = with_tab_state(|state_opt| state_opt.as_ref().is_some_and(|state| state.visible));
     if visible {
         container_mouse_moved(
             std::ptr::null_mut(),

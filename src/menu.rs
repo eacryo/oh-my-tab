@@ -9,9 +9,9 @@
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 
 use crate::config::{flush_config_sync, persist_config_now, reload_config, CONFIG};
 use crate::event_monitor::SHORTCUT_IS_CMD;
@@ -21,23 +21,17 @@ use crate::icon_cache::clear_icon_cache;
 use crate::overlay::extract_uncached_icons;
 // 跨模块共享状态(由 main.rs 持有)/ cross-module shared state (owned by main.rs)
 use crate::log_info;
-use crate::TAB_STATE;
+use crate::with_tab_state;
 
 // ========== 菜单项状态 / menu-item state ==========
 
 pub(crate) struct ShortcutState {
     pub(crate) item: *mut AnyObject,
 }
-unsafe impl Send for ShortcutState {}
-unsafe impl Sync for ShortcutState {}
-pub(crate) static SHORTCUT_ITEM: Mutex<Option<ShortcutState>> = Mutex::new(None);
 
 pub(crate) struct ThumbnailState {
     pub(crate) item: *mut AnyObject,
 }
-unsafe impl Send for ThumbnailState {}
-unsafe impl Sync for ThumbnailState {}
-pub(crate) static THUMBNAIL_ITEM: Mutex<Option<ThumbnailState>> = Mutex::new(None);
 
 // 固定标题的菜单项(settings / reload / clear_cache / quit)。locale 变更时由 refresh_menu_titles 批量重设标题。
 // Fixed-title menu items (settings / reload / clear_cache / quit); re-titled in bulk by refresh_menu_titles on locale change.
@@ -47,9 +41,27 @@ pub(crate) struct FixedMenuItems {
     pub(crate) clear_cache: *mut AnyObject,
     pub(crate) quit: *mut AnyObject,
 }
-unsafe impl Send for FixedMenuItems {}
-unsafe impl Sync for FixedMenuItems {}
-pub(crate) static FIXED_MENU_ITEMS: Mutex<Option<FixedMenuItems>> = Mutex::new(None);
+
+/// Menu controls are AppKit objects and therefore belong to the main-thread runtime.
+/// 菜单控件是 AppKit 对象，只归属主线程 runtime。
+pub(crate) struct MenuUi {
+    pub(crate) shortcut: Option<ShortcutState>,
+    pub(crate) thumbnail: Option<ThumbnailState>,
+    pub(crate) fixed: Option<FixedMenuItems>,
+}
+
+thread_local! {
+    static MENU_UI: RefCell<MenuUi> = const { RefCell::new(MenuUi {
+        shortcut: None,
+        thumbnail: None,
+        fixed: None,
+    }) };
+}
+
+pub(crate) fn with_menu_ui<R>(f: impl FnOnce(&mut MenuUi) -> R) -> R {
+    crate::debug_assert_main_thread();
+    MENU_UI.with(|ui| f(&mut ui.borrow_mut()))
+}
 
 const MENU_TITLE_MIN_WIDTH: f64 = 72.0;
 const MENU_TITLE_MAX_WIDTH: f64 = 280.0;
@@ -153,9 +165,10 @@ pub(crate) fn set_shortcut_mode(is_cmd: bool) {
     } else {
         "menu.toggle_shortcut.cmd"
     };
-    if let Some(ref s) = *SHORTCUT_ITEM.lock().unwrap() {
+    let item = with_menu_ui(|ui| ui.shortcut.as_ref().map(|state| state.item));
+    if let Some(item) = item {
         unsafe {
-            set_menu_item_title(s.item, &t(key));
+            set_menu_item_title(item, &t(key));
         }
     }
 }
@@ -168,9 +181,10 @@ pub(crate) fn set_thumbnail_mode(thumbnails_enabled: bool) {
     } else {
         "menu.toggle_thumbnail_mode.to_thumbnails"
     };
-    if let Some(ref s) = *THUMBNAIL_ITEM.lock().unwrap() {
+    let item = with_menu_ui(|ui| ui.thumbnail.as_ref().map(|state| state.item));
+    if let Some(item) = item {
         unsafe {
-            set_menu_item_title(s.item, &t(key));
+            set_menu_item_title(item, &t(key));
         }
     }
 }
@@ -188,16 +202,22 @@ pub(crate) fn refresh_menu_titles() {
         } else {
             "menu.toggle_shortcut.cmd"
         };
-        if let Some(ref s) = *SHORTCUT_ITEM.lock().unwrap() {
-            set_menu_item_title(s.item, &t(sc_key));
+        let shortcut = with_menu_ui(|ui| ui.shortcut.as_ref().map(|state| state.item));
+        if let Some(item) = shortcut {
+            set_menu_item_title(item, &t(sc_key));
         }
         // 固定标题项 / fixed-title items
-        if let Some(ref items) = *FIXED_MENU_ITEMS.lock().unwrap() {
+        let fixed = with_menu_ui(|ui| {
+            ui.fixed
+                .as_ref()
+                .map(|items| (items.settings, items.reload, items.clear_cache, items.quit))
+        });
+        if let Some((settings, reload, clear_cache, quit)) = fixed {
             for (item, key) in [
-                (items.settings, "menu.settings"),
-                (items.reload, "menu.reload_config"),
-                (items.clear_cache, "menu.clear_icon_cache"),
-                (items.quit, "menu.quit"),
+                (settings, "menu.settings"),
+                (reload, "menu.reload_config"),
+                (clear_cache, "menu.clear_icon_cache"),
+                (quit, "menu.quit"),
             ] {
                 set_menu_item_title(item, &t(key));
             }
@@ -316,14 +336,13 @@ pub(crate) extern "C" fn handle_clear_icon_cache(
     clear_icon_cache();
     // 内存里的 icon_path 仍指向已删除的文件,置 None 让卡片重新走提取流程。
     // in-memory icon_path still points at deleted files; reset to None so cards re-extract.
-    {
-        let mut state_opt = TAB_STATE.lock().unwrap();
-        if let Some(ref mut state) = *state_opt {
-            for w in state.windows.iter_mut() {
-                w.icon_path = None;
+    with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_mut() {
+            for window in &mut state.windows {
+                window.icon_path = None;
             }
         }
-    }
+    });
     // 立即重新提取当前窗口的图标(仅当前已收集的窗口,非全部运行中 App)。
     // Re-extract icons for currently-collected windows only (not all running apps).
     extract_uncached_icons();

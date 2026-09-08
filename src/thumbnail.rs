@@ -1444,27 +1444,27 @@ pub(crate) fn handle_ready_main() {
     let ready_batch_size = keys.len();
     let visible = crate::overlay::thumbnail_visible_range();
     let keys: HashSet<ThumbKey> = keys.into_iter().collect();
-    let ready_keys: Vec<(i32, u32)> = {
-        let state_opt = crate::TAB_STATE.lock().unwrap();
-        let state = match state_opt.as_ref() {
-            Some(s) => s,
-            None => return,
-        };
+    let Some(ready_keys) = crate::with_tab_state(|state_opt| {
+        let state = state_opt.as_ref()?;
         if !state.visible {
-            return;
+            return None;
         }
-        state
-            .windows
-            .iter()
-            .enumerate()
-            .filter(|(index, window)| {
-                keys.contains(&ThumbKey {
-                    pid: window.pid,
-                    wid: window.window_id,
-                }) && visible.as_ref().is_none_or(|range| range.contains(index))
-            })
-            .map(|(_, window)| (window.pid, window.window_id))
-            .collect()
+        Some(
+            state
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(index, window)| {
+                    keys.contains(&ThumbKey {
+                        pid: window.pid,
+                        wid: window.window_id,
+                    }) && visible.as_ref().is_none_or(|range| range.contains(index))
+                })
+                .map(|(_, window)| (window.pid, window.window_id))
+                .collect::<Vec<_>>(),
+        )
+    }) else {
+        return;
     };
     if !ready_keys.is_empty() {
         log_debug!(
@@ -1866,8 +1866,6 @@ fn capture_range_for_visible(visible: Option<Range<usize>>, len: usize) -> Range
 /// is requested first.
 /// The selection is read from TAB_STATE internally; callers just invoke once at
 /// the end of show_overlay.
-type SummonRefreshPlan = (Vec<(i32, u32, CapturePriority)>, usize, usize, usize, usize);
-
 pub(crate) fn refresh_for_summon(required_px_h: u32) {
     if !crate::theme::thumbnails_enabled() {
         return;
@@ -1882,98 +1880,100 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
     // Match the worker's overlay_wants lock order: visible range before TAB_STATE.
     let visible_snapshot = crate::overlay::thumbnail_visible_range();
     let interaction_active = crate::performance::switcher_interaction_active();
-    let (jobs, missing, frontmost_stale, background_last_good, deferred_prefetch):
-        SummonRefreshPlan = {
-        let state_opt = crate::TAB_STATE.lock().unwrap();
-        let Some(state) = state_opt.as_ref() else {
-            return;
-        };
-        if !state.visible {
-            return;
-        }
-        let selected = state
-            .windows
-            .get(state.selected)
-            .map(|w| (w.pid, w.window_id));
-        // is_active 只标记前台 App 的一个代表窗口；同 PID 的其他窗口也应允许刷新。
-        // is_active marks one representative window only; sibling windows from the
-        // same frontmost PID must be eligible for refresh too.
-        let frontmost_pid = state.windows.iter().find(|w| w.is_active).map(|w| w.pid);
-        let capture_range =
-            capture_range_for_visible(visible_snapshot.clone(), state.windows.len());
-        let decisions: Vec<(usize, i32, u32, SummonRefreshDecision)> = state
-            .windows
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| capture_range.contains(index))
-            .filter(|(_, w)| !w.minimized && w.bounds.2 > 0.0 && w.bounds.3 > 0.0)
-            .map(|(index, w)| {
-                (
-                    index,
-                    w.pid,
-                    w.window_id,
-                    cached_summon_refresh_decision(
+    let Some((jobs, missing, frontmost_stale, background_last_good, deferred_prefetch)) =
+        crate::with_tab_state(|state_opt| {
+            let state = state_opt.as_ref()?;
+            if !state.visible {
+                return None;
+            }
+            let selected = state
+                .windows
+                .get(state.selected)
+                .map(|w| (w.pid, w.window_id));
+            // is_active 只标记前台 App 的一个代表窗口；同 PID 的其他窗口也应允许刷新。
+            // is_active marks one representative window only; sibling windows from the
+            // same frontmost PID must be eligible for refresh too.
+            let frontmost_pid = state.windows.iter().find(|w| w.is_active).map(|w| w.pid);
+            let capture_range =
+                capture_range_for_visible(visible_snapshot.clone(), state.windows.len());
+            let decisions: Vec<(usize, i32, u32, SummonRefreshDecision)> = state
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| capture_range.contains(index))
+                .filter(|(_, w)| !w.minimized && w.bounds.2 > 0.0 && w.bounds.3 > 0.0)
+                .map(|(index, w)| {
+                    (
+                        index,
                         w.pid,
                         w.window_id,
-                        required_px_h,
-                        frontmost_pid == Some(w.pid),
-                        // 焦点窗口(is_active)无视 TTL 每次召唤重截;同 PID 兄弟窗口
-                        // 仍按 TTL 判定,避免多窗口 App 召唤时成串重截。
-                        // The focused window (is_active) ignores the TTL and is
-                        // recaptured on every summon; same-PID siblings keep the
-                        // TTL rules so multi-window apps do not recapture in bulk.
-                        w.is_active,
-                    ),
-                )
-            })
-            .collect();
-        let missing = decisions
-            .iter()
-            .filter(|(_, _, _, decision)| *decision == SummonRefreshDecision::Missing)
-            .count();
-        let frontmost_stale = decisions
-            .iter()
-            .filter(|(_, _, _, decision)| *decision == SummonRefreshDecision::FrontmostStale)
-            .count();
-        let background_last_good = decisions
-            .iter()
-            .filter(|(_, _, _, decision)| *decision == SummonRefreshDecision::BackgroundLastGood)
-            .count();
-        let mut deferred_prefetch = 0usize;
-        let jobs: Vec<(i32, u32, CapturePriority)> = decisions
-            .into_iter()
-            .filter(|(_, _, _, decision)| {
-                matches!(
-                    decision,
-                    SummonRefreshDecision::Missing | SummonRefreshDecision::FrontmostStale
-                )
-            })
-            .filter_map(|(index, pid, wid, _)| {
-                let priority = if Some((pid, wid)) == selected {
-                    CapturePriority::Selected
-                } else if visible_snapshot
-                    .as_ref()
-                    .is_some_and(|range| range.contains(&index))
-                {
-                    CapturePriority::Visible
-                } else {
-                    CapturePriority::Prefetch
-                };
-                if interaction_active && priority < CapturePriority::Visible {
-                    deferred_prefetch += 1;
-                    None
-                } else {
-                    Some((pid, wid, priority))
-                }
-            })
-            .collect();
-        (
-            jobs,
-            missing,
-            frontmost_stale,
-            background_last_good,
-            deferred_prefetch,
-        )
+                        cached_summon_refresh_decision(
+                            w.pid,
+                            w.window_id,
+                            required_px_h,
+                            frontmost_pid == Some(w.pid),
+                            // 焦点窗口(is_active)无视 TTL 每次召唤重截;同 PID 兄弟窗口
+                            // 仍按 TTL 判定,避免多窗口 App 召唤时成串重截。
+                            // The focused window (is_active) ignores the TTL and is
+                            // recaptured on every summon; same-PID siblings keep the
+                            // TTL rules so multi-window apps do not recapture in bulk.
+                            w.is_active,
+                        ),
+                    )
+                })
+                .collect();
+            let missing = decisions
+                .iter()
+                .filter(|(_, _, _, decision)| *decision == SummonRefreshDecision::Missing)
+                .count();
+            let frontmost_stale = decisions
+                .iter()
+                .filter(|(_, _, _, decision)| *decision == SummonRefreshDecision::FrontmostStale)
+                .count();
+            let background_last_good = decisions
+                .iter()
+                .filter(|(_, _, _, decision)| {
+                    *decision == SummonRefreshDecision::BackgroundLastGood
+                })
+                .count();
+            let mut deferred_prefetch = 0usize;
+            let jobs: Vec<(i32, u32, CapturePriority)> = decisions
+                .into_iter()
+                .filter(|(_, _, _, decision)| {
+                    matches!(
+                        decision,
+                        SummonRefreshDecision::Missing | SummonRefreshDecision::FrontmostStale
+                    )
+                })
+                .filter_map(|(index, pid, wid, _)| {
+                    let priority = if Some((pid, wid)) == selected {
+                        CapturePriority::Selected
+                    } else if visible_snapshot
+                        .as_ref()
+                        .is_some_and(|range| range.contains(&index))
+                    {
+                        CapturePriority::Visible
+                    } else {
+                        CapturePriority::Prefetch
+                    };
+                    if interaction_active && priority < CapturePriority::Visible {
+                        deferred_prefetch += 1;
+                        None
+                    } else {
+                        Some((pid, wid, priority))
+                    }
+                })
+                .collect();
+            Some((
+                jobs,
+                missing,
+                frontmost_stale,
+                background_last_good,
+                deferred_prefetch,
+            ))
+        })
+    else {
+        return;
     };
     let requested = jobs.len();
     let mut enqueued = 0;
@@ -2018,9 +2018,8 @@ pub(crate) fn refresh_for_theme(required_px_h: u32) {
     // Snapshot keys before enqueueing: enqueue_job takes CAPTURE_STATE and may
     // wake the worker, so never hold TAB_STATE across the queue operations.
     // 入队前先快照 key,避免持有 TAB_STATE 时进入捕获队列锁并唤醒 worker。
-    let (selected, state_keys): (Option<ThumbKey>, Vec<ThumbKey>) = {
-        let state_opt = crate::TAB_STATE.lock().unwrap();
-        match state_opt.as_ref() {
+    let (selected, state_keys): (Option<ThumbKey>, Vec<ThumbKey>) =
+        crate::with_tab_state(|state_opt| match state_opt.as_ref() {
             Some(state) => {
                 let selected = state.windows.get(state.selected).map(|window| ThumbKey {
                     pid: window.pid,
@@ -2040,8 +2039,7 @@ pub(crate) fn refresh_for_theme(required_px_h: u32) {
                 (selected, keys)
             }
             None => (None, Vec::new()),
-        }
-    };
+        });
 
     // Include pre-generated/cache-only windows as well. The settings window can change theme
     // before the first switcher summon, when TAB_STATE has no current snapshot yet.
@@ -2112,9 +2110,8 @@ pub(crate) fn refresh_for_display_change(required_px_h: u32) {
     // Same key collection as refresh_for_theme: non-minimized windows with bounds
     // from TAB_STATE, unioned with cache-only windows (pre-generated frames), so
     // every known target is covered while the overlay is not summoned.
-    let (selected, state_keys): (Option<ThumbKey>, Vec<ThumbKey>) = {
-        let state_opt = crate::TAB_STATE.lock().unwrap();
-        match state_opt.as_ref() {
+    let (selected, state_keys): (Option<ThumbKey>, Vec<ThumbKey>) =
+        crate::with_tab_state(|state_opt| match state_opt.as_ref() {
             Some(state) => {
                 let selected = state.windows.get(state.selected).map(|window| ThumbKey {
                     pid: window.pid,
@@ -2134,8 +2131,7 @@ pub(crate) fn refresh_for_display_change(required_px_h: u32) {
                 (selected, keys)
             }
             None => (None, Vec::new()),
-        }
-    };
+        });
     let keys: Vec<ThumbKey> = {
         let mut keys: HashSet<ThumbKey> = state_keys.into_iter().collect();
         keys.extend(CACHE.lock().unwrap().keys());

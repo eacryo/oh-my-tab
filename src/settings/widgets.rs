@@ -996,20 +996,21 @@ pub(crate) extern "C" fn on_about_header_click(
         if build_version.is_empty() {
             return;
         }
-        let ui = SETTINGS_UI.lock().unwrap();
-        let Some(ui) = ui.as_ref() else {
-            return;
-        };
-        set_field(
-            ui.about_subtitle,
-            tf(
-                "settings.version_label_with_build",
-                &[
-                    ("version", env!("CARGO_PKG_VERSION")),
-                    ("build", &build_version),
-                ],
-            ),
-        );
+        super::with_settings_ui(|ui| {
+            let Some(ui) = ui.as_ref() else {
+                return;
+            };
+            set_field(
+                ui.about_subtitle,
+                tf(
+                    "settings.version_label_with_build",
+                    &[
+                        ("version", env!("CARGO_PKG_VERSION")),
+                        ("build", &build_version),
+                    ],
+                ),
+            );
+        });
     }
 }
 

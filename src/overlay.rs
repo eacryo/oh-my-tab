@@ -31,8 +31,8 @@ use crate::window_collector::{
 use crate::window_server;
 // 跨模块共享状态(由 main.rs 持有,这里读写)/ cross-module shared state (owned by main.rs)
 use crate::window_refresh::request_window_refresh;
+use crate::with_tab_state;
 use crate::AppState;
-use crate::TAB_STATE;
 use crate::{log_debug, log_info, WINDOW_COUNT};
 
 // ========== 键盘键码 / keyboard key codes ==========
@@ -1206,38 +1206,38 @@ pub(crate) fn show_first_summon(backward: bool) {
 /// 首帧选中状态的准备与显示分开,这样在等待快照时收到 CmdReleased 可以直接提交目标,
 /// 而不必先短暂显示再隐藏浮窗。
 fn prepare_first_summon_state(backward: bool) {
-    let mut state_opt = TAB_STATE.lock().unwrap();
-    let state = state_opt.as_mut().unwrap();
-    state.visible = true;
-    let (_, frontmost_pid) = frontmost_app_info();
-    let frontmost_pid = (frontmost_pid > 0).then_some(frontmost_pid);
-    let focus_key = state
-        .focus_key
-        .filter(|(pid, _)| frontmost_pid == Some(*pid));
-    state.selected = prepare_first_summon(
-        &mut state.windows,
-        &mut state.mru,
-        backward,
-        frontmost_pid,
-        focus_key,
-        Instant::now(),
-    );
-    // 记录召唤瞬间的窗口 key 集合:浮窗打开后的刷新只知道哪些窗口「召唤时就在场」。
-    state.summon_keys = Some(state.windows.iter().map(|w| (w.pid, w.window_id)).collect());
-    // 首帧默认选中:锁定到「召唤时选中的目标窗口」,刷新不因 MRU 排序变化改选。
-    state.user_picked = false;
-    state.selected_target_key = state
-        .windows
-        .get(state.selected)
-        .map(|w| (w.pid, w.window_id));
-    log_debug!(
-        "[overlay] first summon: frontmost_pid={:?} focus_key={:?} selected={} windows={}",
-        frontmost_pid,
-        focus_key,
-        state.selected,
-        state.windows.len()
-    );
-    drop(state_opt);
+    with_tab_state(|state_opt| {
+        let state = state_opt.as_mut().unwrap();
+        state.visible = true;
+        let (_, frontmost_pid) = frontmost_app_info();
+        let frontmost_pid = (frontmost_pid > 0).then_some(frontmost_pid);
+        let focus_key = state
+            .focus_key
+            .filter(|(pid, _)| frontmost_pid == Some(*pid));
+        state.selected = prepare_first_summon(
+            &mut state.windows,
+            &mut state.mru,
+            backward,
+            frontmost_pid,
+            focus_key,
+            Instant::now(),
+        );
+        // 记录召唤瞬间的窗口 key 集合:浮窗打开后的刷新只知道哪些窗口「召唤时就在场」。
+        state.summon_keys = Some(state.windows.iter().map(|w| (w.pid, w.window_id)).collect());
+        // 首帧默认选中:锁定到「召唤时选中的目标窗口」,刷新不因 MRU 排序变化改选。
+        state.user_picked = false;
+        state.selected_target_key = state
+            .windows
+            .get(state.selected)
+            .map(|w| (w.pid, w.window_id));
+        log_debug!(
+            "[overlay] first summon: frontmost_pid={:?} focus_key={:?} selected={} windows={}",
+            frontmost_pid,
+            focus_key,
+            state.selected,
+            state.windows.len()
+        );
+    });
     reset_thumbnail_visible_range();
     reset_thumbnail_scroll();
     reset_thumbnail_nav_anchor();
@@ -1253,10 +1253,13 @@ pub(crate) fn commit_first_summon(backward: bool) {
 }
 
 fn step_switcher(backward: bool) {
-    let mut state_opt = TAB_STATE.lock().unwrap();
-    let state_ref = state_opt.as_ref().unwrap();
-    let pending = state_ref.pending_first_show;
-    let first_show = !state_ref.visible && !pending;
+    let (pending, first_show) = with_tab_state(|state_opt| {
+        let state = state_opt.as_ref().unwrap();
+        (
+            state.pending_first_show,
+            !state.visible && !state.pending_first_show,
+        )
+    });
 
     if pending {
         // 首帧快照仍在后台收集:本次浮窗尚未显示,重复 Tab 无法基于旧快照定位,先忽略,
@@ -1276,27 +1279,27 @@ fn step_switcher(backward: bool) {
         // and mark pending_first_show; apply_window_refresh consumes it and shows once the first
         // snapshot is ready (single-shot render). NB: the refresh must be kicked off AFTER dropping
         // TAB_STATE, otherwise request_window_refresh re-locks it and deadlocks the main thread.
-        drop(state_opt);
         crate::performance::begin_switcher_activity();
         request_window_refresh();
-        let mut state_opt = TAB_STATE.lock().unwrap();
-        let state = state_opt.as_mut().unwrap();
-        state.visible = false;
-        state.pending_first_show = true;
-        state.pending_first_backward = backward;
-        state.pending_first_release = false;
+        with_tab_state(|state_opt| {
+            let state = state_opt.as_mut().unwrap();
+            state.visible = false;
+            state.pending_first_show = true;
+            state.pending_first_backward = backward;
+            state.pending_first_release = false;
+        });
         schedule_first_summon_timeout();
         // TIMING-DEBUG 端到端:tap 回调 → 收集完成 → show_first_summon。
         log_debug!("[overlay] first summon pending (awaiting snapshot)");
-        drop(state_opt);
     } else {
         // 用户主动导航(重复按 Tab):选中不再是首帧默认落点,标记 user_picked 并钉住当前目标。
         // User-initiated navigation (repeated Tab): the pick is no longer the first-frame default;
         // mark user_picked and pin to the current target.
-        let state = state_opt.as_mut().unwrap();
-        state.selected = horizontal_nav_index(state.selected, state.windows.len(), backward);
-        mark_user_picked(state);
-        drop(state_opt);
+        with_tab_state(|state_opt| {
+            let state = state_opt.as_mut().unwrap();
+            state.selected = horizontal_nav_index(state.selected, state.windows.len(), backward);
+            mark_user_picked(state);
+        });
         reset_thumbnail_nav_anchor();
         refresh_after_selection_change(true);
     }
@@ -1323,20 +1326,17 @@ fn schedule_first_summon_timeout() {
 /// Main-thread deadline for a first summon. The callback is harmless when the real snapshot has
 /// already arrived because apply_window_refresh clears pending_first_show first.
 pub(crate) extern "C" fn on_first_summon_timeout(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    let request = {
-        let mut state_opt = TAB_STATE.lock().unwrap();
-        let Some(state) = state_opt.as_mut() else {
-            return;
-        };
+    let request = with_tab_state(|state_opt| {
+        let state = state_opt.as_mut()?;
         if !state.pending_first_show {
-            return;
+            return None;
         }
         state.pending_first_show = false;
         let backward = state.pending_first_backward;
         let release_pending = state.pending_first_release;
         state.pending_first_release = false;
         Some((backward, release_pending))
-    };
+    });
 
     if let Some((backward, release_pending)) = request {
         log_debug!(
@@ -1380,11 +1380,7 @@ pub(crate) extern "C" fn on_cmd_shift_tab_pressed(
 /// Move clip bounds when selection leaves the viewport; both layouts share this path and never
 /// rebuild the card tree.
 fn refresh_after_selection_change(backfill_icons: bool) {
-    let selected = TAB_STATE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|state| state.selected);
+    let selected = with_tab_state(|state| state.as_ref().map(|state| state.selected));
     let needs_relayout = selected.is_some_and(|index| {
         !THUMB_VISIBLE_RANGE
             .lock()
@@ -1506,24 +1502,22 @@ fn edge_row_nav_index(rects: &[(usize, f64, f64, f64)], top: bool, anchor_x: f64
 /// Vertical navigation for both layouts uses the complete document and a stable horizontal
 /// anchor; crossing the viewport only moves clip bounds.
 unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool) {
-    let mut state_opt = TAB_STATE.lock().unwrap();
-    let Some(state) = state_opt.as_mut() else {
-        return;
-    };
-    if !state.visible || state.windows.is_empty() {
-        return;
-    }
-    let Some(current_center) = card_center_x(rects, state.selected) else {
-        return;
-    };
-    let anchor_x = {
-        let mut anchor = THUMB_NAV_ANCHOR_X.lock().unwrap();
-        *anchor.get_or_insert(current_center)
-    };
-    if let Some(index) = vertical_nav_index(rects, state.selected, up, anchor_x) {
+    let selected = with_tab_state(|state_opt| {
+        let state = state_opt.as_mut()?;
+        if !state.visible || state.windows.is_empty() {
+            return None;
+        }
+        let current_center = card_center_x(rects, state.selected)?;
+        let anchor_x = {
+            let mut anchor = THUMB_NAV_ANCHOR_X.lock().unwrap();
+            *anchor.get_or_insert(current_center)
+        };
+        let index = vertical_nav_index(rects, state.selected, up, anchor_x)?;
         state.selected = index;
         mark_user_picked(state);
-        drop(state_opt);
+        Some(index)
+    });
+    if let Some(index) = selected {
         if ensure_thumbnail_selection_visible(index) {
             apply_thumbnail_scroll_offset();
         }
@@ -1564,110 +1558,95 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
         let key_code: u16 = msg_send![event as *mut AnyObject, keyCode];
         let modifier_flags: u64 = msg_send![event as *mut AnyObject, modifierFlags];
         let shift_pressed = modifier_flags & NSEVENT_MODIFIER_FLAG_SHIFT != 0;
-        // 几何导航的 frame 收集先于 TAB_STATE 加锁:避免 CONTAINER/TAB_STATE 交叉
-        // 持有(锁序与其他路径相反会造成理论死锁)。
-        // Collect nav frames BEFORE taking TAB_STATE: avoids holding CONTAINER and
-        // TAB_STATE across each other (inverted lock order vs other paths).
+        // Collect navigation frames before borrowing runtime; reentrant AppKit calls happen
+        // only after the state borrow has been released.
+        // 几何导航的 frame 收集先于借用 runtime；可能同步重入 AppKit 的调用均在释放借用后执行。
         let nav_rects = collect_card_rects();
-        let mut state_opt = TAB_STATE.lock().unwrap();
-        let state = state_opt.as_mut().unwrap();
-
-        if !state.visible {
-            return;
+        enum KeyAction {
+            None,
+            RefreshSelection,
+            Vertical(bool),
+            Close(usize),
+            Activate {
+                pid: i32,
+                cgwid: u32,
+                minimized: bool,
+            },
+            Hide,
         }
-
-        match key_code {
-            KEY_TAB => {
-                if !state.windows.is_empty() {
+        let action = with_tab_state(|state_opt| {
+            let state = state_opt.as_mut().unwrap();
+            if !state.visible {
+                return KeyAction::None;
+            }
+            match key_code {
+                KEY_TAB | KEY_RIGHT | KEY_LEFT if !state.windows.is_empty() => {
+                    let backward = key_code == KEY_LEFT || (key_code == KEY_TAB && shift_pressed);
                     state.selected =
-                        horizontal_nav_index(state.selected, state.windows.len(), shift_pressed);
+                        horizontal_nav_index(state.selected, state.windows.len(), backward);
                     mark_user_picked(state);
-                    drop(state_opt);
-                    reset_thumbnail_nav_anchor();
-                    refresh_after_selection_change(false);
+                    KeyAction::RefreshSelection
                 }
-            }
-            KEY_RIGHT => {
-                if !state.windows.is_empty() {
-                    state.selected =
-                        horizontal_nav_index(state.selected, state.windows.len(), false);
-                    mark_user_picked(state);
-                    drop(state_opt);
-                    reset_thumbnail_nav_anchor();
-                    refresh_after_selection_change(false);
-                }
-            }
-            KEY_LEFT => {
-                if !state.windows.is_empty() {
-                    state.selected =
-                        horizontal_nav_index(state.selected, state.windows.len(), true);
-                    mark_user_picked(state);
-                    drop(state_opt);
-                    reset_thumbnail_nav_anchor();
-                    refresh_after_selection_change(false);
-                }
-            }
-            KEY_UP => {
-                if state.windows.is_empty() {
-                    return;
-                }
-                drop(state_opt);
-                navigate_thumbnail_vertical(&nav_rects, true);
-            }
-            KEY_DOWN => {
-                if state.windows.is_empty() {
-                    return;
-                }
-                drop(state_opt);
-                navigate_thumbnail_vertical(&nav_rects, false);
-            }
-            KEY_DELETE => {
-                // Backspace:关闭选中卡片对应的窗口,浮窗保持打开。
-                // Backspace: close the selected card's window; the overlay stays open.
-                if !state.windows.is_empty() {
-                    let idx = state.selected;
-                    drop(state_opt);
-                    let card = card_document().and_then(|document| {
-                        card_views(document)
-                            .into_iter()
-                            .find(|card| get_card_index(*card) == Some(idx))
-                    });
-                    if let Some(card) = card {
-                        begin_close_window_at(idx, card);
+                KEY_UP if !state.windows.is_empty() => KeyAction::Vertical(true),
+                KEY_DOWN if !state.windows.is_empty() => KeyAction::Vertical(false),
+                KEY_DELETE if !state.windows.is_empty() => KeyAction::Close(state.selected),
+                KEY_RETURN => {
+                    if let Some(w) = state.windows.get(state.selected) {
+                        let action = KeyAction::Activate {
+                            pid: w.pid,
+                            cgwid: w.window_id,
+                            minimized: w.minimized,
+                        };
+                        state.focus_key = Some((w.pid, w.window_id));
+                        bump_window_mru(&mut state.mru, w.pid, w.window_id);
+                        state.visible = false;
+                        action
                     } else {
-                        close_window_at(idx);
+                        state.visible = false;
+                        KeyAction::Hide
                     }
                 }
-            }
-            KEY_RETURN => {
-                if let Some(w) = state.windows.get(state.selected) {
-                    let pid = w.pid;
-                    let cgwid = w.window_id;
-                    let minimized = w.minimized;
-                    vanish_overlay();
-                    // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释);抬升延迟一拍执行。
-                    // Same as on_cmd_released: no settings-window handling needed (see comment
-                    // there); the raise is deferred by one runloop turn so the vanish commits first.
-                    schedule_deferred_raise(pid, cgwid, minimized);
-                    schedule_delayed_order_out();
-                    state.focus_key = Some((pid, cgwid));
-                    bump_window_mru(&mut state.mru, pid, cgwid);
-                } else {
-                    // 空窗口/选中越界:无目标,直接收起浮窗(防御,与 on_cmd_released 一致)。
-                    // Empty list / out-of-range: no target, dismiss the overlay (defensive,
-                    // same as on_cmd_released).
-                    hide_overlay();
+                KEY_ESCAPE => {
+                    state.visible = false;
+                    KeyAction::Hide
                 }
-                state.visible = false;
+                _ => KeyAction::None,
             }
-            KEY_ESCAPE => {
-                state.visible = false;
-                hide_overlay();
-                // 取消:设置窗口从未被触碰(nonactivating 面板不激活 app),无需恢复。
-                // Cancelled: the settings window was never touched (the nonactivating panel
-                // never activated the app), so nothing to restore.
+        });
+        match action {
+            KeyAction::RefreshSelection => {
+                reset_thumbnail_nav_anchor();
+                refresh_after_selection_change(false);
             }
-            _ => {}
+            KeyAction::Vertical(up) => navigate_thumbnail_vertical(&nav_rects, up),
+            KeyAction::Close(idx) => {
+                // Backspace:关闭选中卡片对应的窗口,浮窗保持打开。
+                // Backspace: close the selected card's window; the overlay stays open.
+                let card = card_document().and_then(|document| {
+                    card_views(document)
+                        .into_iter()
+                        .find(|card| get_card_index(*card) == Some(idx))
+                });
+                if let Some(card) = card {
+                    begin_close_window_at(idx, card);
+                } else {
+                    close_window_at(idx);
+                }
+            }
+            KeyAction::Activate {
+                pid,
+                cgwid,
+                minimized,
+            } => {
+                vanish_overlay();
+                // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释);抬升延迟一拍执行。
+                // Same as on_cmd_released: no settings-window handling needed (see comment
+                // there); the raise is deferred by one runloop turn so the vanish commits first.
+                schedule_deferred_raise(pid, cgwid, minimized);
+                schedule_delayed_order_out();
+            }
+            KeyAction::Hide => hide_overlay(),
+            KeyAction::None => {}
         }
     }
 }
@@ -2082,34 +2061,31 @@ pub(crate) fn update_status_label() {
             Some(l) => l.0,
             None => return,
         };
-        let state_opt = TAB_STATE.lock().unwrap();
-        let state = match state_opt.as_ref() {
-            Some(s) => s,
-            None => return,
-        };
-        let selected = state.selected;
-        // status_text 是窗口下面那一行长的应用名称;窗口列表为空时显示"没有可切换的窗口"提示
-        // (召唤空窗口态,见 show_overlay)。
-        // status_text is the long app/window title line below the cards; with an empty window
-        // list it shows the "no windows to switch" hint (the empty-overlay state, see show_overlay).
-        let status_text = if state.windows.is_empty() {
-            t("overlay.no_windows")
-        } else {
-            match state.windows.get(selected) {
-                // 设计稿 .footer-current:选中的「标题 · 应用名」。
-                // The mockup's .footer-current: the selected "title · app".
-                Some(w) if w.window_title.is_empty() => {
-                    display_title(&w.window_title, &w.app_name).to_string()
+        let Some(status_text) = with_tab_state(|state_opt| {
+            let state = state_opt.as_ref()?;
+            let selected = state.selected;
+            // status_text 是窗口下面那一行长的应用名称;窗口列表为空时显示"没有可切换的窗口"提示
+            // (召唤空窗口态,见 show_overlay)。
+            // status_text is the long app/window title line below the cards; with an empty window
+            // list it shows the "no windows to switch" hint (the empty-overlay state).
+            Some(if state.windows.is_empty() {
+                t("overlay.no_windows")
+            } else {
+                match state.windows.get(selected) {
+                    Some(w) if w.window_title.is_empty() => {
+                        display_title(&w.window_title, &w.app_name).to_string()
+                    }
+                    Some(w) => format!(
+                        "{} · {}",
+                        display_title(&w.window_title, &w.app_name),
+                        w.app_name
+                    ),
+                    None => String::new(),
                 }
-                Some(w) => format!(
-                    "{} · {}",
-                    display_title(&w.window_title, &w.app_name),
-                    w.app_name
-                ),
-                None => String::new(),
-            }
+            })
+        }) else {
+            return;
         };
-        drop(state_opt);
 
         let colors = current_colors();
         let footer_h = status_h();
@@ -2173,11 +2149,13 @@ pub(crate) fn hide_overlay() {
 /// and reset TAB_STATE.visible, so no stale state trips the next re-enable.
 pub(crate) fn reset_switcher() {
     hide_overlay();
-    if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
-        state.visible = false;
-        state.pending_first_show = false;
-        state.pending_first_release = false;
-    }
+    with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_mut() {
+            state.visible = false;
+            state.pending_first_show = false;
+            state.pending_first_release = false;
+        }
+    });
 }
 
 // ========== 点击外部取消 / click-outside cancel ==========
@@ -2253,25 +2231,17 @@ extern "C" fn overlay_window_resigned(_self: *mut c_void, _cmd: Sel, _note: *mut
     if card_close_in_progress() {
         return;
     }
-    // try_lock 是必须的:切换进行中(activate 目标 app → key 转移)会同步重入本回调,
-    // 而 on_cmd_released 全程持 TAB_STATE 锁(非重入)——拿不到锁就跳过:切换本来
-    // 就在结束浮窗,无需再取消。同理 hide_overlay 的 orderOut 也会触发本回调,
-    // visible 已置 false 后重入直接返回。
-    // try_lock is required: an in-flight switch (activating the target app steals key)
-    // re-enters this callback synchronously while on_cmd_released holds the non-reentrant
-    // TAB_STATE lock -- skip when busy, since the switch is dismissing the overlay anyway.
-    // hide_overlay's orderOut also fires this callback; the re-entry returns early once
-    // visible is false.
-    let should_hide = match TAB_STATE.try_lock() {
-        Ok(mut s) => match s.as_mut() {
-            Some(st) if st.visible => {
-                st.visible = false;
-                true
-            }
-            _ => false,
-        },
-        Err(_) => return,
-    };
+    // Read and update the visibility in one short borrow. The release handler clears `visible`
+    // before any AppKit call, so this callback can safely be re-entered by `hide_overlay`.
+    // 在一次短借用中读取并更新可见状态。释放回调会在调用 AppKit 前先清除 `visible`，因此
+    // 即使 `hide_overlay` 同步重入本回调也不会再次借用 runtime。
+    let should_hide = with_tab_state(|state_opt| match state_opt.as_mut() {
+        Some(state) if state.visible => {
+            state.visible = false;
+            true
+        }
+        _ => false,
+    });
     if should_hide {
         log_debug!("[overlay] cancelled by click outside (window resigned key)");
         hide_overlay();
@@ -2309,16 +2279,11 @@ fn remove_window_adjust_selection(selected: usize, removed_idx: usize, new_len: 
 /// successful AX close, remove it from the list and adjust selection; rebuild only as a
 /// fallback when no card view exists. Closing the last one dismisses the overlay.
 pub(crate) fn close_window_at(idx: usize) -> bool {
-    let (pid, cgwid) = {
-        let state_opt = TAB_STATE.lock().unwrap();
-        let state = match state_opt.as_ref() {
-            Some(s) => s,
-            None => return false,
-        };
-        match state.windows.get(idx) {
-            Some(w) => (w.pid, w.window_id),
-            None => return false,
-        }
+    let Some((pid, cgwid)) = with_tab_state(|state_opt| {
+        let state = state_opt.as_ref()?;
+        state.windows.get(idx).map(|w| (w.pid, w.window_id))
+    }) else {
+        return false;
     };
     // The settings window belongs to this process. Its custom AX close action would re-enter
     // AppKit from a background close worker and can crash; close it directly on the main thread.
@@ -2344,24 +2309,23 @@ pub(crate) fn close_window_at(idx: usize) -> bool {
 /// Synchronous fallback for a close without a corresponding card; normal card closes use
 /// commit_pending_card_close.
 fn finish_window_close(idx: usize, pid: i32, cgwid: u32) -> bool {
-    {
-        let state_opt = TAB_STATE.lock().unwrap();
+    let valid = with_tab_state(|state_opt| {
         let Some(state) = state_opt.as_ref() else {
             return false;
         };
         let Some(window) = state.windows.get(idx) else {
             return false;
         };
-        if window.pid != pid || window.window_id != cgwid {
-            return false;
-        }
+        window.pid == pid && window.window_id == cgwid
+    });
+    if !valid {
+        return false;
     }
     log_info!("close window: pid={} cgwid={}", pid, cgwid);
-    {
-        let mut state_opt = TAB_STATE.lock().unwrap();
+    let close_result = with_tab_state(|state_opt| {
         let state = match state_opt.as_mut() {
             Some(s) => s,
-            None => return false,
+            None => return (false, false),
         };
         let was_visible = state.visible;
         let Some(actual_idx) = state
@@ -2369,7 +2333,7 @@ fn finish_window_close(idx: usize, pid: i32, cgwid: u32) -> bool {
             .iter()
             .position(|window| window.pid == pid && window.window_id == cgwid)
         else {
-            return false;
+            return (false, false);
         };
         state.windows.remove(actual_idx);
         WINDOW_COUNT.store(state.windows.len(), std::sync::atomic::Ordering::Release);
@@ -2377,17 +2341,22 @@ fn finish_window_close(idx: usize, pid: i32, cgwid: u32) -> bool {
         if state.windows.is_empty() {
             // 全部关完:收起浮窗,不留在空态。
             // All closed: dismiss the overlay, don't linger on an empty state.
-            if was_visible {
-                hide_overlay();
-            }
             state.visible = false;
-            return true;
+            return (true, was_visible);
         }
         state.selected =
             remove_window_adjust_selection(state.selected, actual_idx, state.windows.len());
         if !was_visible {
-            return true;
+            return (true, false);
         }
+        (true, false)
+    });
+    if !close_result.0 {
+        return false;
+    }
+    if close_result.1 {
+        hide_overlay();
+        return true;
     }
     // 兜底路径允许完整重建;卡片关闭按钮本身不会走到这里。
     // The fallback may rebuild the overlay; the card close-button path never reaches it.
@@ -2543,15 +2512,12 @@ pub(crate) fn refresh_highlight() {
             Some(document) => document,
             None => return,
         };
-        let state_opt = TAB_STATE.lock().unwrap();
-        let state = match state_opt.as_ref() {
-            Some(s) => s,
-            None => return,
-        };
-        if !state.visible {
+        let Some(selected) = with_tab_state(|state_opt| {
+            let state = state_opt.as_ref()?;
+            state.visible.then_some(state.selected)
+        }) else {
             return;
-        }
-        let selected = state.selected;
+        };
         let colors = current_colors();
         // 选中态采用 HTML 参考中的轻量背景和 1.5px 内描边,不再使用厚重的蓝色边框。
         // Match the HTML reference with a subtle background and 1.5px inset-style border instead of
@@ -2688,9 +2654,8 @@ pub(crate) fn refresh_highlight() {
 }
 
 pub(crate) fn extract_uncached_icons() {
-    let uncached: Vec<i32> = {
-        let state_opt = TAB_STATE.lock().unwrap();
-        if let Some(ref state) = *state_opt {
+    let uncached: Vec<i32> = with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_ref() {
             state
                 .windows
                 .iter()
@@ -2700,9 +2665,9 @@ pub(crate) fn extract_uncached_icons() {
                 .into_iter()
                 .collect()
         } else {
-            return;
+            Vec::new()
         }
-    };
+    });
 
     // Record which window indices got a freshly cached icon so we can re-render
     // just those cards in place (otherwise the on-screen letter icons wouldn't
@@ -2714,15 +2679,16 @@ pub(crate) fn extract_uncached_icons() {
         let t_icon = Instant::now(); // TIMING-DEBUG
         if let Some(ref path) = extract_icon_to_cache(pid) {
             let path = path.clone();
-            let mut state_opt = TAB_STATE.lock().unwrap();
-            if let Some(ref mut state) = *state_opt {
-                for (i, w) in state.windows.iter_mut().enumerate() {
-                    if w.pid == pid && w.icon_path.is_none() {
-                        w.icon_path = Some(path.clone());
-                        updated_indices.push(i);
+            with_tab_state(|state_opt| {
+                if let Some(state) = state_opt.as_mut() {
+                    for (i, w) in state.windows.iter_mut().enumerate() {
+                        if w.pid == pid && w.icon_path.is_none() {
+                            w.icon_path = Some(path.clone());
+                            updated_indices.push(i);
+                        }
                     }
                 }
-            }
+            });
         }
         let icon_ms = t_icon.elapsed().as_millis(); // TIMING-DEBUG
         icons_total_ms += icon_ms;
@@ -2754,20 +2720,18 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
         return;
     }
     let affected: HashSet<usize> = indices.iter().copied().collect();
-    let to_rebuild: HashMap<usize, WindowInfo> = {
-        let state_opt = TAB_STATE.lock().unwrap();
-        let state = match state_opt.as_ref() {
-            Some(s) => s,
-            None => return,
+    let to_rebuild: HashMap<usize, WindowInfo> = with_tab_state(|state_opt| {
+        let Some(state) = state_opt.as_ref() else {
+            return HashMap::new();
         };
         if !state.visible {
-            return;
+            return HashMap::new();
         }
         affected
             .iter()
             .filter_map(|&i| state.windows.get(i).map(|w| (i, w.clone())))
             .collect()
-    };
+    });
     if to_rebuild.is_empty() {
         return;
     }
@@ -2828,13 +2792,12 @@ pub(crate) fn refresh_thumbnail_previews(keys: &[(i32, u32)]) {
         return;
     }
     let affected: HashSet<WindowKey> = keys.iter().copied().collect();
-    let windows: HashMap<WindowKey, WindowInfo> = {
-        let state = TAB_STATE.lock().unwrap();
-        let Some(state) = state.as_ref() else {
-            return;
+    let windows: HashMap<WindowKey, WindowInfo> = with_tab_state(|state_opt| {
+        let Some(state) = state_opt.as_ref() else {
+            return HashMap::new();
         };
         if !state.visible {
-            return;
+            return HashMap::new();
         }
         state
             .windows
@@ -2844,7 +2807,7 @@ pub(crate) fn refresh_thumbnail_previews(keys: &[(i32, u32)]) {
                 affected.contains(&key).then(|| (key, window.clone()))
             })
             .collect()
-    };
+    });
     if windows.is_empty() {
         return;
     }
@@ -2930,13 +2893,13 @@ pub(crate) fn apply_theme() {
     // existing cards with the previous palette until the overlay is summoned again.
     // 主题变化除了更新窗口材质,还要重建当前可见卡片。卡片文字和预览图层在创建时写入具体颜色,
     // 只设置 NSAppearance 会让已存在的卡片继续使用旧调色板,直到下次重新召唤。
-    let visible_indices = TAB_STATE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|state| state.visible)
-        .map(|state| (0..state.windows.len()).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let visible_indices = with_tab_state(|state_opt| {
+        state_opt
+            .as_ref()
+            .filter(|state| state.visible)
+            .map(|state| (0..state.windows.len()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    });
 
     let is_dark = crate::theme::resolved_is_dark();
     let theme_changed = {
@@ -3061,11 +3024,8 @@ pub(crate) extern "C" fn on_display_reconfiguration(
 ///    the old configuration's aspect and pixel height; deliveries swap cards
 ///    in place.
 pub(crate) fn handle_display_reconfiguration() {
-    let overlay_visible = TAB_STATE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|state| state.visible);
+    let overlay_visible =
+        with_tab_state(|state_opt| state_opt.as_ref().is_some_and(|state| state.visible));
     log_info!(
         "[overlay] display reconfiguration: overlay_visible={} screens={}",
         overlay_visible,
@@ -3972,10 +3932,12 @@ pub(crate) fn show_overlay() {
     unsafe {
         // TIMING-DEBUG 阶段计时:定位 summon 卡顿——卡片构建 / 图标 / resize / 状态栏。
         let t0 = Instant::now();
-        let state_opt = TAB_STATE.lock().unwrap();
-        let state = state_opt.as_ref().unwrap();
-        let windows = state.windows.clone();
-        drop(state_opt);
+        let windows = with_tab_state(|state_opt| {
+            state_opt
+                .as_ref()
+                .map(|state| state.windows.clone())
+                .unwrap_or_default()
+        });
 
         let window = OVERLAY_WINDOW.lock().unwrap().unwrap().0;
         let container = CONTAINER.lock().unwrap().unwrap().0;

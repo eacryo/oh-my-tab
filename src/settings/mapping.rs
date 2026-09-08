@@ -50,9 +50,10 @@ pub(super) fn commit_mapping_edits() {
 
 pub(super) fn render_mapping_rows() {
     unsafe {
-        let mut guard = SETTINGS_UI.lock().unwrap();
-        let Some(u) = guard.as_mut() else { return };
-        render_mapping_rows_locked(u);
+        super::with_settings_ui(|ui| {
+            let Some(u) = ui.as_mut() else { return };
+            render_mapping_rows_locked(u);
+        });
     }
 }
 
@@ -935,7 +936,7 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
         update_mapping_panel();
         // 定位:相对外层设置窗口居中(不随屏幕位置漂移)。
         // Position: centered on the settings window (does not drift with the screen).
-        let win = SETTINGS_UI.lock().unwrap().as_ref().unwrap().window;
+        let win = super::with_settings_ui(|ui| ui.as_ref().unwrap().window);
         let win_frame: NSRect = msg_send![win, frame];
         let pf: NSRect = msg_send![panel, frame];
         let _: () = msg_send![panel, setFrameOrigin: NSPoint::new(

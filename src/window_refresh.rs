@@ -27,7 +27,7 @@ use crate::window_collector::{
     MruMap, WindowInfo,
 };
 use crate::window_server;
-use crate::{log_debug, AppState, CONTROLLER, TAB_STATE, WINDOW_COUNT};
+use crate::{log_debug, with_tab_state, AppState, CONTROLLER, WINDOW_COUNT};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,16 +177,17 @@ fn select_summon_focus_key(
 }
 
 fn start_window_refresh(request: WindowRefreshRequest) {
-    let (generation, mru) = {
-        let state_opt = TAB_STATE.lock().unwrap();
+    let Some((generation, mru)) = with_tab_state(|state_opt| {
         let Some(state) = state_opt.as_ref() else {
             WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-            return;
+            return None;
         };
-        (
+        Some((
             WINDOW_REFRESH_GENERATION.fetch_add(1, Ordering::AcqRel) + 1,
             state.mru.clone(),
-        )
+        ))
+    }) else {
+        return;
     };
     // 浮窗已显示后,summon-bump 不再把前台窗口写回 MRU:否则每次刷新都会把前台窗口顶到第 0 位、
     // 造成已显示的列表重排(跳变)。首帧待显示(visible=false)仍允许 bump 一次,保证首位是真实前台。
@@ -194,10 +195,8 @@ fn start_window_refresh(request: WindowRefreshRequest) {
     // otherwise every refresh hoists it to index 0 and reorders the displayed list (the jump).
     // The not-yet-shown first frame (visible=false) still may bump once so the head is the real
     // frontmost.
-    let allow_bump = {
-        let state_opt = TAB_STATE.lock().unwrap();
-        !state_opt.as_ref().is_some_and(|s| s.visible)
-    };
+    let allow_bump =
+        with_tab_state(|state_opt| !state_opt.as_ref().is_some_and(|state| state.visible));
 
     thread::Builder::new()
         .name("window-refresh".into())
@@ -421,11 +420,10 @@ fn apply_window_refresh() {
     let summon_focus_key = result.summon_focus_key;
     let subscriptions = window_server_candidates();
 
-    let (was_visible, set_changed) = {
-        let mut state_opt = TAB_STATE.lock().unwrap();
+    let Some((was_visible, set_changed)) = with_tab_state(|state_opt| {
         let Some(state) = state_opt.as_mut() else {
             WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-            return;
+            return None;
         };
         let selected_key = state
             .windows
@@ -504,7 +502,9 @@ fn apply_window_refresh() {
         if state.windows.is_empty() {
             state.visible = false;
         }
-        (was_visible, set_changed)
+        Some((was_visible, set_changed))
+    }) else {
+        return;
     };
     WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
     let pending_request = take_pending_refresh_request();
@@ -513,8 +513,7 @@ fn apply_window_refresh() {
     // 最终排序,不会再出现「先显示旧快照、再重排」的两段跳变。
     // First snapshot ready: consume pending_first_show and show once (single-shot render). The
     // list is already the final post-refresh order, so the "stale then reorder" jump is gone.
-    let first_show_request = {
-        let mut state_opt = TAB_STATE.lock().unwrap();
+    let first_show_request = with_tab_state(|state_opt| {
         if let Some(state) = state_opt.as_mut() {
             if state.pending_first_show {
                 state.pending_first_show = false;
@@ -528,18 +527,20 @@ fn apply_window_refresh() {
         } else {
             None
         }
-    };
+    });
     if let Some((backward, release_pending)) = first_show_request {
         // The snapshot already resolved the current window exactly. Update the persistent focus
         // key before prepare_first_summon_state runs; otherwise a stale sibling from the same
         // app (for example Edge's previous normal window) wins over the new focused window.
-        if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
-            if let Some(focus_key) =
-                select_summon_focus_key(summon_focus_key, state.focus_key, &state.windows)
-            {
-                state.focus_key = Some(focus_key);
+        with_tab_state(|state_opt| {
+            if let Some(state) = state_opt.as_mut() {
+                if let Some(focus_key) =
+                    select_summon_focus_key(summon_focus_key, state.focus_key, &state.windows)
+                {
+                    state.focus_key = Some(focus_key);
+                }
             }
-        }
+        });
         if release_pending {
             // Cmd was released while the first snapshot was pending. Commit the selected target
             // without ever displaying the panel; on_cmd_released cannot do this itself because
@@ -606,17 +607,17 @@ pub(crate) extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _
             true
         }
         window_server::WindowServerEvent::Focused(window_id) => {
-            let displayed_pid = TAB_STATE
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|state| {
-                    state
-                        .windows
-                        .iter()
-                        .find(|window| window.window_id == *window_id)
-                })
-                .map(|window| window.pid);
+            let displayed_pid = with_tab_state(|state_opt| {
+                state_opt
+                    .as_ref()
+                    .and_then(|state| {
+                        state
+                            .windows
+                            .iter()
+                            .find(|window| window.window_id == *window_id)
+                    })
+                    .map(|window| window.pid)
+            });
             let pid = displayed_pid
                 .or_else(|| window_server::owner_for_window(*window_id))
                 .or_else(|| owner_pid_for_cgwid(*window_id));
@@ -632,13 +633,15 @@ pub(crate) extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _
                 if frontmost_pid == pid {
                     let activation_token = window_server::activation_token(pid);
                     if window_server::focus_should_bump(pid, *window_id) {
-                        if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
-                            // 只把「AX 已确认且显示在列表里」的窗口记为焦点 key;未显示的 CG
-                            // surface(Ghostty 单窗口双 tab 的另一个 tab)不该成为焦点锚点。
-                            // Anchor the focus key only for an AX-confirmed, shown window; an
-                            // undisplayed CG surface (the other Ghostty tab) must not be anchored.
-                            best_effort_bump_focus_key(state, pid, *window_id);
-                        }
+                        with_tab_state(|state_opt| {
+                            if let Some(state) = state_opt.as_mut() {
+                                // 只把「AX 已确认且显示在列表里」的窗口记为焦点 key;未显示的 CG
+                                // surface(Ghostty 单窗口双 tab 的另一个 tab)不该成为焦点锚点。
+                                // Anchor the focus key only for an AX-confirmed, shown window; an
+                                // undisplayed CG surface (the other Ghostty tab) must not be anchored.
+                                best_effort_bump_focus_key(state, pid, *window_id);
+                            }
+                        });
                         // 同应用窗口切换不会有新的 App 激活通知,激活 token 可能已过期清除;
                         // 现场补铸一个,保证外部方式的窗口切换也触发缩略图激活补拍。
                         // A same-app window switch brings no new app-activation

@@ -64,14 +64,13 @@ pub(super) unsafe fn animate_card_close_reflow(
 /// AX 关闭失败时反向播放同一组 frame 动画,让卡片回到关闭前的位置。
 /// If AX rejects the close, reverse the same frame animation to restore every card.
 pub(super) unsafe fn restore_card_close_reflow(pending: &PendingCardClose) {
-    let views = card_views_by_key(
-        &TAB_STATE
-            .lock()
-            .unwrap()
+    let windows = with_tab_state(|state_opt| {
+        state_opt
             .as_ref()
             .map(|state| state.windows.clone())
-            .unwrap_or_default(),
-    );
+            .unwrap_or_default()
+    });
+    let views = card_views_by_key(&windows);
     let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
     let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
     let _: () = msg_send![context, setDuration: CARD_CLOSE_ANIMATION_DURATION];
@@ -124,21 +123,16 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
     if card_close_in_progress() {
         return;
     }
-    let (pending, views) = {
-        let state_opt = TAB_STATE.lock().unwrap();
-        let Some(state) = state_opt.as_ref() else {
-            return;
-        };
+    let Some((pending, views)) = with_tab_state(|state_opt| {
+        let state = state_opt.as_ref()?;
         if !state.visible {
-            return;
+            return None;
         }
-        let Some(window) = state.windows.get(idx) else {
-            return;
-        };
+        let window = state.windows.get(idx)?;
         let key = (window.pid, window.window_id);
         let views = unsafe { card_views_by_key(&state.windows) };
         if views.get(&key).copied() != Some(card) {
-            return;
+            return None;
         }
         let original_frames: HashMap<WindowKey, NSRect> = views
             .values()
@@ -187,9 +181,7 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             if candidate_key == key {
                 continue;
             }
-            let Some(frame) = original_frames.get(&candidate_key) else {
-                return;
-            };
+            let frame = original_frames.get(&candidate_key)?;
             survivor_keys.push(candidate_key);
             widths.push(frame.size.width);
         }
@@ -231,7 +223,7 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             ),
             NSSize::new(final_panel_w, panel_frame.size.height),
         );
-        (
+        Some((
             PendingCardClose {
                 pid: window.pid,
                 cgwid: window.window_id,
@@ -246,7 +238,9 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
                 final_document_h,
             },
             views,
-        )
+        ))
+    }) else {
+        return;
     };
     let close_key = (pending.pid, pending.cgwid);
     {
@@ -368,40 +362,38 @@ pub(crate) extern "C" fn on_card_close_ax_result(_self: *mut c_void, _cmd: Sel, 
 /// to their new indices.
 pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
     let key = (pending.pid, pending.cgwid);
-    let (old_windows, new_windows, selected, was_visible, became_empty) = {
-        let mut state_opt = TAB_STATE.lock().unwrap();
-        let Some(state) = state_opt.as_mut() else {
-            return;
-        };
-        let Some(actual_idx) = state
-            .windows
-            .iter()
-            .position(|window| (window.pid, window.window_id) == key)
-        else {
-            return;
-        };
-        let old_windows = state.windows.clone();
-        let was_visible = state.visible;
-        state.windows.remove(actual_idx);
-        crate::WINDOW_COUNT.store(state.windows.len(), std::sync::atomic::Ordering::Release);
-        state.mru.remove(&key);
-        state.selected =
-            remove_window_adjust_selection(state.selected, actual_idx, state.windows.len());
-        state.selected_target_key = state
-            .windows
-            .get(state.selected)
-            .map(|window| (window.pid, window.window_id));
-        let became_empty = state.windows.is_empty();
-        if became_empty {
-            state.visible = false;
-        }
-        (
-            old_windows,
-            state.windows.clone(),
-            state.selected,
-            was_visible,
-            became_empty,
-        )
+    let Some((old_windows, new_windows, selected, was_visible, became_empty)) =
+        with_tab_state(|state_opt| {
+            let state = state_opt.as_mut()?;
+            let actual_idx = state
+                .windows
+                .iter()
+                .position(|window| (window.pid, window.window_id) == key)?;
+            let old_windows = state.windows.clone();
+            let was_visible = state.visible;
+            state.windows.remove(actual_idx);
+            crate::WINDOW_COUNT.store(state.windows.len(), std::sync::atomic::Ordering::Release);
+            state.mru.remove(&key);
+            state.selected =
+                remove_window_adjust_selection(state.selected, actual_idx, state.windows.len());
+            state.selected_target_key = state
+                .windows
+                .get(state.selected)
+                .map(|window| (window.pid, window.window_id));
+            let became_empty = state.windows.is_empty();
+            if became_empty {
+                state.visible = false;
+            }
+            Some((
+                old_windows,
+                state.windows.clone(),
+                state.selected,
+                was_visible,
+                became_empty,
+            ))
+        })
+    else {
+        return;
     };
 
     let views = unsafe { card_views_by_key(&old_windows) };
@@ -526,10 +518,9 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
     if card_close_in_progress() {
         return;
     }
-    {
-        let mut state_opt = TAB_STATE.lock().unwrap();
+    let visible = with_tab_state(|state_opt| {
         let Some(state) = state_opt.as_mut() else {
-            return;
+            return false;
         };
         if !state.visible {
             if state.pending_first_show {
@@ -538,89 +529,91 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
                 state.pending_first_release = true;
                 log_debug!("[overlay] CmdReleased latched while first snapshot is pending");
             }
-            return;
+            return false;
         }
+        true
+    });
+    if !visible {
+        return;
     }
 
     commit_selected_window(true);
 }
 
 pub(super) fn commit_selected_window(overlay_was_visible: bool) {
-    let mut state_opt = TAB_STATE.lock().unwrap();
-    let state = state_opt.as_mut().unwrap();
-    if !state.visible {
-        return;
-    }
-    if let Some(w) = state.windows.get(state.selected) {
-        let pid = w.pid;
-        let cgwid = w.window_id;
-        let minimized = w.minimized;
-        let release_started = Instant::now();
-        log_debug!(
-            "Switching to '{}' (pid={} cgwid={})",
-            w.app_name,
-            pid,
-            cgwid
-        );
-        // 先视觉隐藏(不 orderOut),再激活目标窗口,最后延迟 orderOut。
-        // 先 orderOut 会干扰 WindowServer 焦点路由,导致目标窗口的 first-responder 未确立
-        // (光标停止闪烁等)。对齐 BetterCmdTab 的 vanish() -> activate() -> dismiss() 时序。
-        // Vanish first (no orderOut), then activate the target, then delay orderOut.
-        // Ordering out first disrupts WindowServer focus routing, leaving the target's
-        // first-responder unset (caret stops blinking, etc.). Mirrors BetterCmdTab's
-        // vanish() -> activate() -> dismiss() sequence.
-        if overlay_was_visible {
-            vanish_overlay();
+    let target = with_tab_state(|state_opt| {
+        let state = state_opt.as_mut()?;
+        if !state.visible {
+            return None;
         }
-        // 设置窗口无需特殊处理:浮窗是 nonactivating 面板,召唤时 app 未激活,设置窗口
-        // 从未被抬升(从别的 App 召唤时被其窗口盖住;从设置召唤时透过玻璃可见),切走后
-        // 留在原位。与 BetterCmdTab 行为一致,无 stash/restore 机制。
-        // No settings-window handling needed: the overlay is a nonactivating panel, so the app
-        // stays inactive during summon and the settings window is never raised (covered by the
-        // active app's windows when summoning from elsewhere; visible through the glass when
-        // summoning from settings). It stays put after the switch. Matches BetterCmdTab --
-        // no stash/restore machinery.
-        // 快速抬升只包含毫秒级的 WindowServer 调用,在当前释放回调中立即执行,避免原生
-        // Cmd+Tab 不需要的额外 RunLoop turn;耗时不稳定的 AX 兜底仍由 activate_and_raise
-        // 异步提交。vanish 已经把面板设为透明且 resignKey,不会再阻塞目标窗口拿焦点。
-        // The fast raise only contains millisecond-scale WindowServer calls, so run it in this
-        // release callback instead of paying for an extra RunLoop turn that native Cmd+Tab does
-        // not need; activate_and_raise still submits the variable-latency AX backstop async.
-        // vanish has already made the panel transparent and resigned key, so it cannot block the
-        // target from taking focus.
-        activate_and_raise(pid, cgwid, minimized);
-        log_debug!(
-            "[raise] release path complete: pid={} cgwid={} elapsed={}ms",
-            pid,
-            cgwid,
-            release_started.elapsed().as_millis()
+        let selected = state.selected;
+        let w = state.windows.get(selected)?;
+        let target = (
+            w.pid,
+            w.window_id,
+            w.minimized,
+            w.app_name.clone(),
+            selected,
         );
-        if overlay_was_visible {
-            schedule_delayed_order_out();
-        }
-        state.focus_key = Some((pid, cgwid));
-        bump_window_mru(&mut state.mru, pid, cgwid);
-        log_debug!(
-            "commit: pid={} app=\"{}\" cgwid={} selected={}",
-            pid,
-            w.app_name,
-            cgwid,
-            state.selected
-        );
-    } else {
-        // 空窗口/选中越界:没有可切换的目标,直接收起浮窗(否则会停留在桌面上)。
-        // Empty list / out-of-range selection: no switchable target, dismiss the overlay
-        // (otherwise it would stay stuck on the desktop).
-        log_info!(
-            "CmdReleased: selected index {} out of bounds (windows={})",
-            state.selected,
-            state.windows.len()
-        );
-        if overlay_was_visible {
+        state.focus_key = Some((w.pid, w.window_id));
+        bump_window_mru(&mut state.mru, w.pid, w.window_id);
+        state.visible = false;
+        Some(target)
+    });
+    let Some((pid, cgwid, minimized, app_name, selected)) = target else {
+        let hidden = with_tab_state(|state_opt| {
+            let Some(state) = state_opt.as_mut() else {
+                return false;
+            };
+            if !state.visible {
+                return false;
+            }
+            log_info!(
+                "CmdReleased: selected index {} out of bounds (windows={})",
+                state.selected,
+                state.windows.len()
+            );
+            state.visible = false;
+            true
+        });
+        if hidden && overlay_was_visible {
             hide_overlay();
         }
+        crate::performance::end_switcher_activity();
+        return;
+    };
+    let release_started = Instant::now();
+    log_debug!("Switching to '{}' (pid={} cgwid={})", app_name, pid, cgwid);
+    // 先视觉隐藏(不 orderOut),再激活目标窗口,最后延迟 orderOut。
+    // 先 orderOut 会干扰 WindowServer 焦点路由,导致目标窗口的 first-responder 未确立
+    // (光标停止闪烁等)。对齐 BetterCmdTab 的 vanish() -> activate() -> dismiss() 时序。
+    // Vanish first (no orderOut), then activate the target, then delay orderOut.
+    // Ordering out first disrupts WindowServer focus routing, leaving the target's
+    // first-responder unset (caret stops blinking, etc.). Mirrors BetterCmdTab's
+    // vanish() -> activate() -> dismiss() sequence.
+    if overlay_was_visible {
+        vanish_overlay();
     }
-    state.visible = false;
+    // 设置窗口无需特殊处理:浮窗是 nonactivating 面板,设置窗口从未被抬升,切走后留在原位。
+    // No settings-window handling is needed: this nonactivating panel never raises the settings
+    // window, which remains in place after switching.
+    activate_and_raise(pid, cgwid, minimized);
+    log_debug!(
+        "[raise] release path complete: pid={} cgwid={} elapsed={}ms",
+        pid,
+        cgwid,
+        release_started.elapsed().as_millis()
+    );
+    if overlay_was_visible {
+        schedule_delayed_order_out();
+    }
+    log_debug!(
+        "commit: pid={} app=\"{}\" cgwid={} selected={}",
+        pid,
+        app_name,
+        cgwid,
+        selected
+    );
     crate::performance::end_switcher_activity();
 }
 
@@ -699,27 +692,33 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
     let Some(idx) = get_card_index(_self as *mut AnyObject) else {
         return;
     };
-    let mut state_opt = TAB_STATE.lock().unwrap();
-    let state = state_opt.as_mut().unwrap();
-    if let Some(w) = state.windows.get(idx) {
-        let pid = w.pid;
-        let cgwid = w.window_id;
-        let minimized = w.minimized;
+    let action = with_tab_state(|state_opt| {
+        let state = state_opt.as_mut().unwrap();
+        if let Some(w) = state.windows.get(idx) {
+            let pid = w.pid;
+            let cgwid = w.window_id;
+            let minimized = w.minimized;
+            state.focus_key = Some((pid, cgwid));
+            bump_window_mru(&mut state.mru, pid, cgwid);
+            state.visible = false;
+            Some((pid, cgwid, minimized))
+        } else {
+            state.visible = false;
+            None
+        }
+    });
+    if let Some((pid, cgwid, minimized)) = action {
         vanish_overlay();
         // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释);抬升延迟一拍执行。
         // Same as on_cmd_released: no settings-window handling needed (see comment there);
         // the raise is deferred by one runloop turn so the vanish commits first.
         schedule_deferred_raise(pid, cgwid, minimized);
         schedule_delayed_order_out();
-        state.focus_key = Some((pid, cgwid));
-        bump_window_mru(&mut state.mru, pid, cgwid);
-        state.visible = false;
     } else {
         // 空窗口时无卡片可点,理论上不可达;防御性收起浮窗(与 on_cmd_released 一致)。
         // Unreachable in practice (no cards when the list is empty); defensive dismiss,
         // same as on_cmd_released.
         hide_overlay();
-        state.visible = false;
     }
 }
 
@@ -739,16 +738,19 @@ pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _even
         );
         return;
     }
-    let mut state_opt = TAB_STATE.lock().unwrap();
-    let state = state_opt.as_mut().unwrap();
-    if state.selected != idx {
-        state.selected = idx;
-        mark_user_picked(state);
-        drop(state_opt);
+    let changed = with_tab_state(|state_opt| {
+        let state = state_opt.as_mut().unwrap();
+        if state.selected != idx {
+            state.selected = idx;
+            mark_user_picked(state);
+            true
+        } else {
+            false
+        }
+    });
+    if changed {
         reset_thumbnail_nav_anchor();
         refresh_highlight();
         update_status_label();
-    } else {
-        drop(state_opt);
     }
 }

@@ -77,6 +77,7 @@ use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -403,14 +404,61 @@ static POLL_TIMER: OnceLock<Mutex<ObjPtr>> = OnceLock::new();
 static PICKER_VISIBLE: AtomicBool = AtomicBool::new(false);
 
 /// 当前选中行索引 / the currently selected row index.
-static PICKER_SELECTION: Mutex<usize> = Mutex::new(0);
-
 /// 无选中行的哨兵值:焦点在搜索框时使用(↑ 从列表顶跳入搜索框 / 点击搜索框),
 /// 此时列表不该有高光;↓ 回列表时 search_field_do_command 重置为 0。
 /// Sentinel for "no selected row": used while the search field is focused (↑ from the list
 /// top into the search field, or a click on it), so no row keeps its highlight; ↓ back into
 /// the list resets it to 0 in search_field_do_command.
 const NO_SELECTION: usize = usize::MAX;
+
+/// 剪贴板浮窗的交互状态只在主线程消费；后台监听线程只通过既有入口投递数据。
+/// Clipboard picker interaction state is main-thread owned; background monitors deliver
+/// data through the existing entry points instead of touching this state directly.
+struct ClipboardUiState {
+    picker_selection: usize,
+    search_query: String,
+    filtered: Vec<usize>,
+    detail_visible: bool,
+}
+
+thread_local! {
+    static CLIPBOARD_UI: RefCell<ClipboardUiState> = const { RefCell::new(ClipboardUiState {
+        picker_selection: 0,
+        search_query: String::new(),
+        filtered: Vec::new(),
+        detail_visible: false,
+    }) };
+}
+
+fn with_clipboard_ui<R>(f: impl FnOnce(&mut ClipboardUiState) -> R) -> R {
+    #[cfg(not(test))]
+    crate::debug_assert_main_thread();
+    CLIPBOARD_UI.with(|ui| f(&mut ui.borrow_mut()))
+}
+
+fn picker_selection() -> usize {
+    with_clipboard_ui(|ui| ui.picker_selection)
+}
+
+fn set_picker_selection(selection: usize) {
+    with_clipboard_ui(|ui| ui.picker_selection = selection);
+}
+
+fn detail_visible() -> bool {
+    with_clipboard_ui(|ui| ui.detail_visible)
+}
+
+fn set_detail_visible(visible: bool) {
+    with_clipboard_ui(|ui| ui.detail_visible = visible);
+}
+
+fn take_detail_visible() -> bool {
+    with_clipboard_ui(|ui| {
+        let visible = ui.detail_visible;
+        ui.detail_visible = false;
+        visible
+    })
+}
 
 /// 当前鼠标悬停的行(显示浅灰 hover 底;与选中独立——键盘导航时鼠标可停在别的行)。
 /// 无悬停 = NO_SELECTION。由 mouseEntered/mouseExited 维护。
@@ -561,12 +609,8 @@ unsafe fn rebuild_search_hint() {
 }
 
 /// 当前搜索词(空 = 不过滤)。/ The current search query (empty = no filtering).
-static SEARCH_QUERY: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
-
 /// 当前显示列表:历史索引(过滤后的顺序)。空查询时 = 全部索引。
 /// The current display list: history indices (filtered order). All indices when no query.
-static FILTERED: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-
 /// 待另存为的条目:detail_save_as_action 在按钮 mouseDown 追踪循环内被调用,而
 /// runModal 的嵌套模态循环不能在追踪上下文里启动(面板文件名框拿不到键盘焦点,
 /// 无法编辑)。动作先把条目存这里,经 performSelectorOnMainThread 跳到下一轮
@@ -639,7 +683,6 @@ unsafe fn apply_panel_appearance(window: *mut AnyObject) {
 /// clicking anywhere on the panel dismisses it).
 static DETAIL_CONTENT: Mutex<Option<ObjPtr>> = Mutex::new(None);
 /// 详情浮窗是否可见 / whether the detail panel is visible.
-static DETAIL_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// 详情高清预览单槽:后台线程刚生成的 ≤1280px PNG(hash, bytes)。show_detail_for_sel
 /// 取数的第一优先级——命中即消费清空,避免再读盘;未命中走磁盘缓存/480 预览。
 /// 单槽有界(~2MB),被下一条目投递覆盖;过期内容由 detail_preview_ready 清空。
@@ -1319,7 +1362,7 @@ unsafe fn set_search_clear_button_visible(visible: bool) {
 }
 
 fn clear_search() {
-    SEARCH_QUERY.lock().unwrap().clear();
+    with_clipboard_ui(|ui| ui.search_query.clear());
     SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
     unsafe { set_search_clear_button_visible(false) };
     if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
@@ -1342,7 +1385,7 @@ extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_v
     let s: *mut AnyObject = unsafe { msg_send![field, stringValue] };
     let q = unsafe { nsstring_to_rust(s) };
     let has_query = !q.is_empty();
-    *SEARCH_QUERY.lock().unwrap() = q;
+    with_clipboard_ui(|ui| ui.search_query = q);
     if !has_query {
         SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
     }
@@ -1366,7 +1409,7 @@ extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_v
 /// NSSearchField's Esc (cancelOperation:): a query gets cleared and the full list restored
 /// (scheme A, level one); with no query the picker closes (level two).
 extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
-    let has_query = !SEARCH_QUERY.lock().unwrap().is_empty();
+    let has_query = with_clipboard_ui(|ui| !ui.search_query.is_empty());
     if has_query {
         clear_search();
         // 焦点仍在搜索框,保持无选中(高光不恢复)。
@@ -1531,7 +1574,7 @@ extern "C" fn search_field_do_command(
         // The query/filter stays; only focus and the selection move to the list.
         // ↓ = the newest entry (first row); ↑ = the oldest (the display list's tail,
         // scrolled into view afterwards).
-        let display_len = FILTERED.lock().unwrap().len();
+        let display_len = with_clipboard_ui(|ui| ui.filtered.len());
         let sel = if command_selector == sel!(moveUp:) {
             // 空列表:0(无行可选中,无高光;saturating_sub 防下溢)。
             // Empty list: 0 (no row to select, no highlight; saturating_sub guards).
@@ -1539,7 +1582,7 @@ extern "C" fn search_field_do_command(
         } else {
             0
         };
-        *PICKER_SELECTION.lock().unwrap() = sel;
+        set_picker_selection(sel);
         rebuild_rows();
         // ↑ 选中末行时视口还停在顶部:用确定性的偏移计算滚动到选中行可见。
         // With ↑ the tail is selected while the viewport is still at the top: use the
@@ -1753,7 +1796,7 @@ unsafe fn picker_screen_frame(picker_win: *mut AnyObject) -> NSRect {
 /// current scroll offset. Locks are taken only to copy pointers/values, never held
 /// across msg_send calls.
 fn selected_row_screen_y(picker: NSRect) -> Option<f64> {
-    let sel = *PICKER_SELECTION.lock().unwrap();
+    let sel = picker_selection();
     if sel == NO_SELECTION {
         return None;
     }
@@ -1766,7 +1809,7 @@ fn selected_row_screen_y(picker: NSRect) -> Option<f64> {
     // The group header is part of the row pitch but not the record content; align the detail
     // with the content block instead of the top of the group header.
     let group_header_h = {
-        let filtered = FILTERED.lock().unwrap().clone();
+        let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
         let history = CLIP_HISTORY.lock().unwrap();
         let &history_idx = filtered.get(row_idx)?;
         let entry = history.get(history_idx)?;
@@ -1818,7 +1861,7 @@ fn selected_row_screen_y(picker: NSRect) -> Option<f64> {
 /// scroll restore fires the notification synchronously while ROW_PITCHES is still held,
 /// and locking it here would self-deadlock on the same non-reentrant mutex.
 fn reposition_detail() {
-    if !DETAIL_VISIBLE.load(Ordering::SeqCst) || REBUILDING.load(Ordering::SeqCst) {
+    if !detail_visible() || REBUILDING.load(Ordering::SeqCst) {
         return;
     }
     unsafe {
@@ -2004,7 +2047,7 @@ unsafe fn animate_detail_close(
 /// Hide the detail window after the close animation; reopening during the delay keeps the old
 /// callback from hiding the new panel.
 extern "C" fn detail_finish_close(this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+    if detail_visible() {
         return;
     }
     unsafe {
@@ -2030,7 +2073,7 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
     // 历史为空也显示浮窗(空状态提示,见 rebuild_rows 的空分支)。
     // Show the picker even with an empty history (the empty-state hint lives in
     // rebuild_rows' empty branch).
-    *PICKER_SELECTION.lock().unwrap() = 0;
+    set_picker_selection(0);
     show_picker();
 }
 
@@ -2198,7 +2241,7 @@ fn hide_picker() {
 /// panel never becomes key so orderOut fires no resign-key notification, but the
 /// pointer-outside-the-lock discipline is kept anyway).
 fn hide_detail() {
-    if !DETAIL_VISIBLE.swap(false, Ordering::SeqCst) {
+    if !take_detail_visible() {
         return;
     }
     // 关闭后撤掉对应行的实心详情图标,无需重建整个列表。
@@ -2567,7 +2610,7 @@ unsafe fn run_detail_save_as(entry: &ClipEntry) {
 
 /// 另存为动作:详情跟随主列表选中条目,文本写 txt、图片按来源落盘。
 extern "C" fn detail_save_as_action(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
-    let sel = *PICKER_SELECTION.lock().unwrap();
+    let sel = picker_selection();
     if sel == NO_SELECTION {
         return;
     }
@@ -2632,11 +2675,7 @@ extern "C" fn detail_preview_ready(_self: *mut c_void, _cmd: Sel, _sender: *mut 
         Some((h, _)) => h,
         None => return,
     };
-    if !detail_result_still_wanted(
-        DETAIL_VISIBLE.load(Ordering::SeqCst),
-        detail_current_hash(),
-        job_hash,
-    ) {
+    if !detail_result_still_wanted(detail_visible(), detail_current_hash(), job_hash) {
         // 过期:释放槽内字节(磁盘缓存已写,后续打开不依赖槽位)。
         // Stale: release the slot bytes (the disk cache is written; later opens do not
         // need the slot).
@@ -2910,7 +2949,7 @@ unsafe fn add_detail_chrome(
 unsafe fn show_detail_for_sel() {
     // 无选中(焦点在搜索框)/ 空列表时不动作。
     // No-op without a selection (search-field focus) or an empty list.
-    let sel = *PICKER_SELECTION.lock().unwrap();
+    let sel = picker_selection();
     if sel == NO_SELECTION {
         return;
     }
@@ -2924,7 +2963,7 @@ unsafe fn show_detail_for_sel() {
     let Some(entry) = entry else {
         return;
     };
-    let detail_was_visible = DETAIL_VISIBLE.load(Ordering::SeqCst);
+    let detail_was_visible = detail_visible();
     ensure_detail_window();
     let window = match *DETAIL_WINDOW.lock().unwrap() {
         Some(w) => w.0,
@@ -3133,7 +3172,7 @@ unsafe fn show_detail_for_sel() {
     );
     // orderFrontRegardless:不抢 key(面板 canBecomeKeyWindow=NO,主浮窗保持 key)。
     // orderFrontRegardless: never takes key (canBecomeKeyWindow=NO keeps the picker key).
-    DETAIL_VISIBLE.store(true, Ordering::SeqCst);
+    set_detail_visible(true);
     // 文档完整布局和窗口最终 frame 都已生效后,无条件设置到 AppKit 约束出的真实顶部。
     // 鼠标详情按钮、键盘 →、以及详情打开后的 ↑/↓ 切换最终都汇聚到这里,行为完全一致。
     // Once full document layout and the final window frame are both applied, unconditionally
@@ -3842,12 +3881,12 @@ fn refresh_open_picker_after_detail_copy(source_detail_text: Option<&str>) {
     if let Some(text) = source_detail_text {
         let selection = {
             let history = CLIP_HISTORY.lock().unwrap();
-            let query = SEARCH_QUERY.lock().unwrap();
+            let query = with_clipboard_ui(|ui| ui.search_query.clone());
             let filter = *CLIP_FILTER.lock().unwrap();
             visible_selection_for_text(&history, &query, filter, text)
         };
         if let Some(selection) = selection {
-            *PICKER_SELECTION.lock().unwrap() = selection;
+            set_picker_selection(selection);
         }
     }
     unsafe { rebuild_rows() };
@@ -3872,7 +3911,7 @@ fn copy_detail_selection() {
         None => return,
     };
     let source_detail_text = {
-        let sel = *PICKER_SELECTION.lock().unwrap();
+        let sel = picker_selection();
         mapped_index(sel).and_then(|history_idx| {
             CLIP_HISTORY
                 .lock()
@@ -4618,12 +4657,11 @@ unsafe fn rebuild_rows() {
     refresh_footer_count(total);
     // 重建当前显示列表(按搜索词 + 筛选项过滤)。
     // Rebuild the display list (filtered by the query AND the kind filter).
-    *FILTERED.lock().unwrap() = filtered_indices(
-        &hist,
-        &SEARCH_QUERY.lock().unwrap(),
-        *CLIP_FILTER.lock().unwrap(),
-    );
-    let filtered = FILTERED.lock().unwrap();
+    let query = with_clipboard_ui(|ui| ui.search_query.clone());
+    let filter = *CLIP_FILTER.lock().unwrap();
+    let filtered_indices = filtered_indices(&hist, &query, filter);
+    with_clipboard_ui(|ui| ui.filtered = filtered_indices);
+    let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
 
     // 删除/裁剪后把选中索引钳到新显示列表内(越界 → 末条;NO_SELECTION 不动)。
     // 所有重建路径自愈——修复"删除最后一条后高亮消失"(删除路径此前用删除前的脏
@@ -4633,8 +4671,8 @@ unsafe fn rebuild_rows() {
     // after deleting the last row (the delete paths used to clamp against the stale
     // pre-delete FILTERED / history lengths, leaving the selection past the new list).
     {
-        let mut sel = PICKER_SELECTION.lock().unwrap();
-        *sel = clamp_selection(*sel, filtered.len());
+        let sel = picker_selection();
+        set_picker_selection(clamp_selection(sel, filtered.len()));
     }
 
     // 空态:历史为空 → "暂无历史";有搜索词但无匹配 → "无匹配结果"。共用提示渲染。
@@ -4712,7 +4750,7 @@ unsafe fn rebuild_rows() {
         .max(PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H);
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
 
-    let sel_idx = *PICKER_SELECTION.lock().unwrap();
+    let sel_idx = picker_selection();
     // 鼠标悬停行(与选中独立:键盘导航时鼠标停在别的行上 → 两态并存)。
     // The hovered row (independent of the selection: with keyboard navigation the mouse
     // may park on another row -> both states coexist, like the mockup's :hover/.selected).
@@ -4950,7 +4988,7 @@ unsafe fn rebuild_rows() {
         // When detail is open for this selected row, show its active icon and own rounded fill.
         set_detail_action_style(
             details_btn,
-            detail_action_is_active(DETAIL_VISIBLE.load(Ordering::SeqCst), sel_idx, i),
+            detail_action_is_active(detail_visible(), sel_idx, i),
             false,
         );
         if !details_btn.is_null() {
@@ -5088,7 +5126,7 @@ unsafe fn search_cell_class() -> *mut AnyObject {
 /// 当前搜索是否需要显示右侧清除叉号。
 /// Whether the current search needs its right-side clear ×.
 fn search_has_query() -> bool {
-    !SEARCH_QUERY.lock().unwrap().is_empty()
+    with_clipboard_ui(|ui| !ui.search_query.is_empty())
 }
 
 /// 绘制设计稿的 ⌘F 键帽;用户开始输入后隐藏,由右侧清除叉号取代。
@@ -5608,10 +5646,10 @@ extern "C" fn search_cell_select_with_frame(
 /// under a stationary cursor, firing one mouseEntered per row -- a full rebuild per event
 /// was the source of the scroll jank.
 fn update_hover_visuals(prev: usize, new: usize) {
-    let sel = *PICKER_SELECTION.lock().unwrap();
+    let sel = picker_selection();
     let views = ROW_HOVER_VIEWS.lock().unwrap();
     let hist = CLIP_HISTORY.lock().unwrap();
-    let filtered = FILTERED.lock().unwrap();
+    let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
     // 与建行时的样式常量保持一致(选中 0.050 优先于悬停 0.032)。
     // Keep in sync with the constants at row creation (selected 0.050 beats hovered 0.032).
     const SEL_BG: f64 = 0.050;
@@ -5772,7 +5810,7 @@ extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     // 置顶会改变条目在列表中的位置;详情面板按选中行重新定位并刷新内容。
     // Pinning changes the row position; reposition and refresh the detail panel from the
     // current selection so it follows the reordered row.
-    if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+    if detail_visible() {
         unsafe { show_detail_for_sel() };
     }
     let msg = if now_pinned {
@@ -5807,9 +5845,9 @@ fn selection_after_pin(new_h_idx: usize) -> bool {
     if !CONFIG.read().unwrap().clipboard.pin_follow_selection {
         return false;
     }
-    let filtered = FILTERED.lock().unwrap();
+    let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
     if let Some(pos) = filtered.iter().position(|&h| h == new_h_idx) {
-        *PICKER_SELECTION.lock().unwrap() = pos;
+        set_picker_selection(pos);
         true
     } else {
         false
@@ -5831,13 +5869,11 @@ extern "C" fn show_item_details_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c
     if idx < 0 {
         return;
     }
-    let mut sel = PICKER_SELECTION.lock().unwrap();
-    let previous = *sel;
+    let previous = picker_selection();
     // 已打开且点的是当前选中行 → 本次点击是"取消详情"。
     // Detail already open AND the click is on the selected row -> this click cancels it.
-    let close = DETAIL_VISIBLE.load(Ordering::SeqCst) && *sel == idx as usize;
-    *sel = idx as usize;
-    drop(sel);
+    let close = detail_visible() && previous == idx as usize;
+    set_picker_selection(idx as usize);
     unsafe {
         // 详情按钮点击只需要更新前后两行的视觉状态,无需同步重建整个剪贴板列表。
         // A detail-button click only needs the incremental visual update for the old and new
@@ -5872,19 +5908,18 @@ extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void
     // to clamp the display index against hist.len(): correct only by coincidence without a
     // search query, dimensionally wrong under a filter, and still past the list after
     // deleting the tail (the lost highlight).
-    let mut sel = PICKER_SELECTION.lock().unwrap();
-    let deleted_selected = *sel != NO_SELECTION && *sel == idx as usize;
-    if *sel != NO_SELECTION && (idx as usize) < *sel {
-        *sel -= 1;
+    let previous = picker_selection();
+    let deleted_selected = previous != NO_SELECTION && previous == idx as usize;
+    if previous != NO_SELECTION && (idx as usize) < previous {
+        set_picker_selection(previous - 1);
     }
-    drop(sel);
     drop(hist);
     save_history();
     unsafe { rebuild_rows() };
     // 详情面板跟随选中条目;若删的正是选中条目则关闭它(避免残留已删内容)。
     // The detail panel follows the selected entry; when the deleted row WAS the selection,
     // close the panel (no stale content).
-    if deleted_selected && DETAIL_VISIBLE.load(Ordering::SeqCst) {
+    if deleted_selected && detail_visible() {
         hide_detail();
     }
 }
@@ -6039,7 +6074,7 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
         // button. The detail never becomes key, so the system routes Cmd+C to the picker;
         // we forward it here. With the search field focused the key goes to the field
         // editor first, so no conflict.
-        if keycode == 8 && (mods & 0x0010_0000) != 0 && DETAIL_VISIBLE.load(Ordering::SeqCst) {
+        if keycode == 8 && (mods & 0x0010_0000) != 0 && detail_visible() {
             copy_detail_selection();
             return;
         }
@@ -6058,15 +6093,14 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
         // 可选中范围是当前显示列表(搜索过滤后;超出可视部分靠滚动查看)。
         // The selectable range is the current display list (post-filter; scrolling reveals
         // the rest).
-        let display_len = FILTERED.lock().unwrap().len();
-        let mut sel = PICKER_SELECTION.lock().unwrap();
+        let display_len = with_clipboard_ui(|ui| ui.filtered.len());
+        let sel = picker_selection();
         match keycode {
             48 => {
                 // Tab(48):按固定顺序循环筛选分类;详情若已展开则先关闭,避免筛选后
                 // 详情遗留一条不属于当前列表的陈旧内容。
                 // Tab(48): cycle filters in the fixed order. Close an open detail first so
                 // filtering cannot leave stale content that no longer belongs to the list.
-                drop(sel);
                 let next = {
                     let active = CLIP_FILTER.lock().unwrap();
                     next_clip_filter(*active)
@@ -6077,8 +6111,7 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // ←(123):无论详情是否打开,都切换当前选中条目的置顶状态。
                 // Left: toggle the selected entry's pinned state whether or not the detail
                 // panel is open.
-                let idx = *sel;
-                drop(sel);
+                let idx = sel;
                 let Some(h_idx) = mapped_index(idx) else {
                     return;
                 };
@@ -6096,7 +6129,7 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // 置顶会改变条目在列表中的位置;详情保持打开并跟随新的选中行。
                 // Pinning changes the row position; keep the detail open and follow the new
                 // selected row.
-                if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+                if detail_visible() {
                     show_detail_for_sel();
                 }
                 let msg = if now_pinned {
@@ -6111,13 +6144,11 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // (完整文本 / 图片大图)。
                 // Right: closes the detail panel when it is open (same as ←); otherwise
                 // expands the selected entry's details (full text / large image).
-                if DETAIL_VISIBLE.load(Ordering::SeqCst) {
-                    drop(sel);
+                if detail_visible() {
                     hide_detail();
                     return;
                 }
-                let idx = *sel;
-                drop(sel);
+                let idx = sel;
                 if idx == NO_SELECTION {
                     return;
                 }
@@ -6129,10 +6160,9 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // Up (126): at the first list entry (or no selection), jump focus back to the
                 // search field; clear the selection BEFORE entering so the highlight goes away
                 // (the controlTextDidBeginEditing: delegate also clears - belt and braces).
-                if keycode == 126 && (*sel == 0 || *sel == NO_SELECTION) {
+                if keycode == 126 && (sel == 0 || sel == NO_SELECTION) {
                     if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
-                        drop(sel);
-                        *PICKER_SELECTION.lock().unwrap() = NO_SELECTION;
+                        set_picker_selection(NO_SELECTION);
                         rebuild_rows();
                         let window = match *PICKER_WINDOW.lock().unwrap() {
                             Some(w) => w.0,
@@ -6144,12 +6174,13 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                         return;
                     }
                 }
-                let previous = *sel;
-                if let Some(next) = nav_arrow(keycode, *sel, display_len) {
-                    *sel = next;
-                }
-                let idx = *sel;
-                drop(sel);
+                let previous = sel;
+                let idx = if let Some(next) = nav_arrow(keycode, sel, display_len) {
+                    set_picker_selection(next);
+                    next
+                } else {
+                    sel
+                };
                 refresh_selection(previous, idx);
                 // 滚动到选中行可见 / scroll the selection into view.
                 if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
@@ -6158,21 +6189,19 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // 详情打开时跟随选中条目实时刷新(浏览体验,类似 Quick Look)。
                 // The detail panel follows the selection live while open (Quick-Look-style
                 // browsing).
-                if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+                if detail_visible() {
                     show_detail_for_sel();
                 }
             }
             36 => {
                 // Enter
-                let idx = *sel;
-                drop(sel);
+                let idx = sel;
                 paste_at(idx);
             }
             51 => {
                 // Backspace(删除键):删除选中条目并刷新。
                 // Backspace (delete): remove the selected entry and refresh.
-                let idx = *sel;
-                drop(sel);
+                let idx = sel;
                 let Some(h_idx) = mapped_index(idx) else {
                     return;
                 };
@@ -6198,8 +6227,7 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // Esc:详情打开时第一级 = 关闭详情(浮窗与搜索词保持不动)。
                 // Esc: with the detail open, the first press closes the detail (the picker
                 // and the query stay untouched).
-                if DETAIL_VISIBLE.load(Ordering::SeqCst) {
-                    drop(sel);
+                if detail_visible() {
                     hide_detail();
                     return;
                 }
@@ -6208,17 +6236,14 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // Esc: a query gets cleared first (restoring the full list), a second press
                 // closes. The search-field-focused first level is handled by the
                 // NSSearchField subclass's cancelOperation:; this handles list focus.
-                let mut q = SEARCH_QUERY.lock().unwrap();
-                if !q.is_empty() {
-                    q.clear();
-                    drop(q);
-                    // rebuild_rows 会重锁 PICKER_SELECTION,必须先释放 sel。
-                    // rebuild_rows re-locks PICKER_SELECTION; sel must be dropped first.
-                    drop(sel);
+                let had_query = with_clipboard_ui(|ui| {
+                    let had_query = !ui.search_query.is_empty();
+                    ui.search_query.clear();
+                    had_query
+                });
+                if had_query {
                     rebuild_rows();
                 } else {
-                    drop(q);
-                    drop(sel);
                     hide_picker();
                 }
             }
@@ -6625,8 +6650,8 @@ unsafe fn set_detail_action_style(button: *mut AnyObject, active: bool, hovered:
 /// 详情开关不会重建列表,因此单独刷新已有详情按钮的激活态。
 /// Toggling detail does not rebuild the list, so refresh existing detail-action active states.
 fn refresh_detail_action_visuals() {
-    let visible = DETAIL_VISIBLE.load(Ordering::SeqCst);
-    let selected = *PICKER_SELECTION.lock().unwrap();
+    let visible = detail_visible();
+    let selected = picker_selection();
     let views = ROW_HOVER_VIEWS.lock().unwrap();
     unsafe {
         for (row, view) in views.iter().enumerate() {
@@ -6708,11 +6733,7 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
         if action == sel!(showItemDetails:) {
             let tag: isize = msg_send![b, tag];
             let active = tag >= 0
-                && detail_action_is_active(
-                    DETAIL_VISIBLE.load(Ordering::SeqCst),
-                    *PICKER_SELECTION.lock().unwrap(),
-                    tag as usize,
-                );
+                && detail_action_is_active(detail_visible(), picker_selection(), tag as usize);
             set_detail_action_style(b, active, true);
             return;
         }
@@ -6775,11 +6796,7 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_
         if action == sel!(showItemDetails:) {
             let tag: isize = msg_send![b, tag];
             let active = tag >= 0
-                && detail_action_is_active(
-                    DETAIL_VISIBLE.load(Ordering::SeqCst),
-                    *PICKER_SELECTION.lock().unwrap(),
-                    tag as usize,
-                );
+                && detail_action_is_active(detail_visible(), picker_selection(), tag as usize);
             set_detail_action_style(b, active, false);
             return;
         }
@@ -7394,7 +7411,7 @@ pub fn refresh_localized_ui() {
 /// Apply a new filter and rebuild the list. An open detail closes first so it never displays
 /// a stale entry outside the filtered result.
 fn apply_clip_filter(filter: ClipFilter) {
-    if DETAIL_VISIBLE.load(Ordering::SeqCst) {
+    if detail_visible() {
         hide_detail();
     }
     *CLIP_FILTER.lock().unwrap() = filter;
@@ -9058,7 +9075,7 @@ mod tests {
         assert_eq!(filtered, expected);
         // mapped_index 需要 FILTERED 是当前列表——直接构造验证边界行为。
         // mapped_index reads the global FILTERED; construct it to verify boundary behavior.
-        *super::FILTERED.lock().unwrap() = filtered.clone();
+        super::CLIPBOARD_UI.with(|ui| ui.borrow_mut().filtered = filtered.clone());
         assert_eq!(mapped_index(0), Some(0));
         assert_eq!(mapped_index(2), Some(3));
         assert_eq!(mapped_index(3), None);

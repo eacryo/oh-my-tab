@@ -162,7 +162,7 @@ pub(super) fn detail_result_still_wanted(
 /// The selected image entry's hash (used for main-thread enqueue snapshots and completion
 /// validation; all access goes through Mutexes). None without a selection / for text entries.
 pub(super) fn detail_current_hash() -> Option<u64> {
-    let sel = *PICKER_SELECTION.lock().unwrap();
+    let sel = picker_selection();
     if sel == NO_SELECTION {
         return None;
     }
@@ -313,7 +313,7 @@ pub(super) fn request_detail_preview(img: &ImageEntry, deliver: bool) {
         // 按需预览从主线程调用;在交给 worker 前快照 UI 时效条件。
         // On-demand previews are requested from the main thread; snapshot UI freshness
         // inputs before handing the job to the worker.
-        (DETAIL_VISIBLE.load(Ordering::SeqCst), detail_current_hash())
+        (detail_visible(), detail_current_hash())
     } else {
         (false, None)
     };

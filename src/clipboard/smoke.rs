@@ -111,7 +111,7 @@ pub(crate) fn smoke_runner() -> bool {
     // Search smoke: set a query -> rebuild (filtered display) -> arrow navigation within the
     // filtered list -> clear restores everything.
     unsafe {
-        *SEARCH_QUERY.lock().unwrap() = "apple".to_string();
+        super::with_clipboard_ui(|ui| ui.search_query = "apple".to_string());
         rebuild_rows();
         let c_opt = *PICKER_CONTAINER.lock().unwrap();
         if let Some(c) = c_opt {
@@ -146,7 +146,7 @@ pub(crate) fn smoke_runner() -> bool {
         // Assert: after focus enters the search field the selection is cleared (no row
         // highlight).
         assert_eq!(
-            *PICKER_SELECTION.lock().unwrap(),
+            super::picker_selection(),
             NO_SELECTION,
             "selection must clear when focus moves into the search field"
         );
@@ -194,7 +194,7 @@ pub(crate) fn smoke_runner() -> bool {
     // keeping the detail open, and → closes it; an image entry's → opens its detail (lazy
     // .detail generation); with the detail open, Esc's level one closes the detail only.
     unsafe {
-        *PICKER_SELECTION.lock().unwrap() = 0;
+        super::set_picker_selection(0);
         rebuild_rows();
         let c_opt = *PICKER_CONTAINER.lock().unwrap();
         if let Some(c) = c_opt {
@@ -204,7 +204,7 @@ pub(crate) fn smoke_runner() -> bool {
             let ev = make_key_event(124);
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
             assert!(
-                DETAIL_VISIBLE.load(Ordering::SeqCst),
+                super::detail_visible(),
                 "right arrow must open the detail panel"
             );
             // ↓:详情跟随选中条目(不关闭);选中切到文本条目 → 完整文本分支。
@@ -213,7 +213,7 @@ pub(crate) fn smoke_runner() -> bool {
             let ev = make_key_event(125);
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
             assert!(
-                DETAIL_VISIBLE.load(Ordering::SeqCst),
+                super::detail_visible(),
                 "the detail must stay open while navigating"
             );
             // 溢出文本详情必须使用稳定的完整布局 + 原生 scroller,打开即处于 AppKit
@@ -384,7 +384,7 @@ pub(crate) fn smoke_runner() -> bool {
             // ←:详情打开时直接置顶当前选中条目,详情保持打开并跟随重排后的位置。
             // Left: pin the selected entry while the detail stays open and follows its new row.
             let pinned_text = {
-                let sel_idx = *PICKER_SELECTION.lock().unwrap();
+                let sel_idx = super::picker_selection();
                 let hist = CLIP_HISTORY.lock().unwrap();
                 mapped_index(sel_idx)
                     .and_then(|h| hist.get(h))
@@ -393,7 +393,7 @@ pub(crate) fn smoke_runner() -> bool {
             let ev = make_key_event(123);
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
             assert!(
-                DETAIL_VISIBLE.load(Ordering::SeqCst),
+                super::detail_visible(),
                 "left arrow must keep the detail panel open"
             );
             {
@@ -410,31 +410,28 @@ pub(crate) fn smoke_runner() -> bool {
             let ev = make_key_event(124);
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
             assert!(
-                !DETAIL_VISIBLE.load(Ordering::SeqCst),
+                !super::detail_visible(),
                 "right arrow must close the detail when it is open"
             );
             // →:再次展开详情,再按 → 关闭,覆盖详情 toggle 路径。
             // Reopen with →, then close with → again to cover the detail toggle path.
             let ev = make_key_event(124);
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
-            assert!(DETAIL_VISIBLE.load(Ordering::SeqCst));
+            assert!(super::detail_visible());
             let ev = make_key_event(124);
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
             assert!(
-                !DETAIL_VISIBLE.load(Ordering::SeqCst),
+                !super::detail_visible(),
                 "right arrow must close the detail when it is open"
             );
             // Esc:详情打开时第一级 = 关闭详情,浮窗与搜索词保持。
             // Esc with the detail open: level one closes the detail; the picker stays.
             let ev = make_key_event(124);
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
-            assert!(DETAIL_VISIBLE.load(Ordering::SeqCst));
+            assert!(super::detail_visible());
             let ev = make_key_event(53);
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
-            assert!(
-                !DETAIL_VISIBLE.load(Ordering::SeqCst),
-                "Esc must close the detail first"
-            );
+            assert!(!super::detail_visible(), "Esc must close the detail first");
         }
         // 图片条目:定位其显示索引,→ 展开详情 → .detail 大图懒生成落盘。
         // Image entry: locate its display index, → expands it -> the lazy .detail preview is
@@ -444,18 +441,15 @@ pub(crate) fn smoke_runner() -> bool {
             hist.iter().position(|e| e.image.is_some())
         };
         if let Some(h_idx) = img_h {
-            let d_idx = FILTERED.lock().unwrap().iter().position(|&h| h == h_idx);
+            let d_idx = super::with_clipboard_ui(|ui| ui.filtered.iter().position(|&h| h == h_idx));
             if let Some(d_idx) = d_idx {
-                *PICKER_SELECTION.lock().unwrap() = d_idx;
+                super::set_picker_selection(d_idx);
                 rebuild_rows();
                 let c_opt = *PICKER_CONTAINER.lock().unwrap();
                 if let Some(c) = c_opt {
                     let ev = make_key_event(124);
                     container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
-                    assert!(
-                        DETAIL_VISIBLE.load(Ordering::SeqCst),
-                        "image detail must open"
-                    );
+                    assert!(super::detail_visible(), "image detail must open");
                     assert!(
                         cache_read_detail_preview(tiny_hash).is_some(),
                         "the lazy .detail preview must be generated on first open"

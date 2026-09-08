@@ -108,32 +108,29 @@ pub(crate) fn start() {
     // window keys here, before spawning the observer thread, so the worker never reads TAB_STATE.
     // start() 由主线程运行时配置入口调用。在线程启动前快照初始窗口 key，避免观察线程读取
     // TAB_STATE。
-    let startup_jobs = {
-        let state = crate::TAB_STATE.lock().unwrap();
-        match state.as_ref() {
-            Some(state) => {
-                let capture_state = CAPTURE_STATE.lock().unwrap();
-                state
-                    .windows
-                    .iter()
-                    .filter(|window| {
-                        !window.minimized
-                            && window.window_id != 0
-                            && window.bounds.2 > 0.0
-                            && window.bounds.3 > 0.0
-                    })
-                    .map(|window| {
-                        (
-                            window.pid,
-                            window.window_id,
-                            capture_state.pid_generation(window.pid),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            }
-            None => Vec::new(),
+    let startup_jobs = crate::with_tab_state(|state_opt| match state_opt.as_ref() {
+        Some(state) => {
+            let capture_state = CAPTURE_STATE.lock().unwrap();
+            state
+                .windows
+                .iter()
+                .filter(|window| {
+                    !window.minimized
+                        && window.window_id != 0
+                        && window.bounds.2 > 0.0
+                        && window.bounds.3 > 0.0
+                })
+                .map(|window| {
+                    (
+                        window.pid,
+                        window.window_id,
+                        capture_state.pid_generation(window.pid),
+                    )
+                })
+                .collect::<Vec<_>>()
         }
-    };
+        None => Vec::new(),
+    });
     // 生命周期命令低频但必须有界;runloop source 会很快清空,容量足以吸收启动抖动。
     // Lifecycle commands are low-volume but still bounded; the runloop source drains them
     // promptly, and this capacity absorbs startup bursts without unbounded retention.

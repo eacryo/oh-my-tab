@@ -787,7 +787,7 @@ pub(super) fn filtered_indices(
 /// 显示索引 → 历史索引(经当前过滤列表映射;越界返回 None)。
 /// Display index -> history index (via the current filtered list; None when out of range).
 pub(super) fn mapped_index(display_idx: usize) -> Option<usize> {
-    FILTERED.lock().unwrap().get(display_idx).copied()
+    super::with_clipboard_ui(|ui| ui.filtered.get(display_idx).copied())
 }
 
 /// 当前生效的最大条数(从 CONFIG 读,设置保存后下次轮询生效)。

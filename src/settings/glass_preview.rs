@@ -122,10 +122,8 @@ pub(super) unsafe fn glass_tint_screen_frame(window: *mut AnyObject) -> NSRect {
 /// Move the settings window left before opening the color panel so the two windows are centered
 /// as one group.
 pub(super) unsafe fn position_glass_tint_group(save_original: bool) {
-    let window = match SETTINGS_UI.lock().unwrap().as_ref() {
-        Some(ui) => ui.window,
-        None => return,
-    };
+    let window = super::with_settings_ui(|ui| ui.as_ref().map(|ui| ui.window));
+    let Some(window) = window else { return };
     let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
     if panel.is_null() {
         return;
@@ -153,7 +151,7 @@ pub(crate) fn restore_glass_tint_group() {
     let original = GLASS_TINT_GROUP_ORIGINAL_ORIGIN.lock().unwrap().take();
     let Some(origin) = original else { return };
     unsafe {
-        let window = SETTINGS_UI.lock().unwrap().as_ref().map(|ui| ui.window);
+        let window = super::with_settings_ui(|ui| ui.as_ref().map(|ui| ui.window));
         if let Some(window) = window {
             let _: () = msg_send![window, setFrameOrigin: origin];
         }
@@ -440,21 +438,22 @@ pub(super) unsafe fn update_settings_preview_views() {
     let tint = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(
         &crate::config::effective_glass_tint(),
     ));
-    let ui = SETTINGS_UI.lock().unwrap();
-    let Some(ui) = ui.as_ref() else { return };
-    for preview in [ui.glass_preview_switcher, ui.glass_preview_clipboard] {
-        if preview.is_null() {
-            continue;
+    super::with_settings_ui(|ui| {
+        let Some(ui) = ui.as_ref() else { return };
+        for preview in [ui.glass_preview_switcher, ui.glass_preview_clipboard] {
+            if preview.is_null() {
+                continue;
+            }
+            let supports_style: bool = msg_send![preview, respondsToSelector: sel!(setStyle:)];
+            if supports_style {
+                let _: () = msg_send![preview, setStyle: style];
+            }
+            let supports_tint: bool = msg_send![preview, respondsToSelector: sel!(setTintColor:)];
+            if supports_tint {
+                let _: () = msg_send![preview, setTintColor: tint];
+            }
         }
-        let supports_style: bool = msg_send![preview, respondsToSelector: sel!(setStyle:)];
-        if supports_style {
-            let _: () = msg_send![preview, setStyle: style];
-        }
-        let supports_tint: bool = msg_send![preview, respondsToSelector: sel!(setTintColor:)];
-        if supports_tint {
-            let _: () = msg_send![preview, setTintColor: tint];
-        }
-    }
+    });
 }
 
 /// 应用临时玻璃预览到真实浮窗和设置页内的两个模拟浮窗。
@@ -480,11 +479,13 @@ unsafe fn update_glass_tint_from_color(color: *mut AnyObject, sync_well: bool) {
         return;
     };
     if sync_well {
-        if let Some(ui) = SETTINGS_UI.lock().unwrap().as_ref() {
-            GLASS_UI_UPDATE.store(true, Ordering::SeqCst);
-            let _: () = msg_send![ui.glass_tint, setColor: color];
-            GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
-        }
+        super::with_settings_ui(|ui| {
+            if let Some(ui) = ui.as_ref() {
+                GLASS_UI_UPDATE.store(true, Ordering::SeqCst);
+                let _: () = msg_send![ui.glass_tint, setColor: color];
+                GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
+            }
+        });
     }
     if let Ok(mut w) = crate::config::CONFIG.write() {
         w.appearance.glass_tint = hex;
@@ -522,9 +523,11 @@ pub(crate) extern "C" fn on_glass_tint_reset(_self: *mut c_void, _cmd: Sel, _sen
         let default_hex = Config::default().appearance.glass_tint;
         let color = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(&default_hex));
         GLASS_UI_UPDATE.store(true, Ordering::SeqCst);
-        if let Some(ui) = SETTINGS_UI.lock().unwrap().as_ref() {
-            let _: () = msg_send![ui.glass_tint, setColor: color];
-        }
+        super::with_settings_ui(|ui| {
+            if let Some(ui) = ui.as_ref() {
+                let _: () = msg_send![ui.glass_tint, setColor: color];
+            }
+        });
         let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
         let _: () = msg_send![panel, setColor: color];
         GLASS_UI_UPDATE.store(false, Ordering::SeqCst);

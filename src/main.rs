@@ -48,6 +48,7 @@ use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use settings::*;
+use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -152,12 +153,40 @@ impl AppState {
 
 // ObjPtr / ObjClassPtr 已移至 `ffi.rs` / moved to `ffi.rs`
 
-// ========== Global State ==========
+// ========== Main-thread runtime ==========
 
-pub(crate) static TAB_STATE: Mutex<Option<AppState>> = Mutex::new(None);
-/// 主线程维护的窗口数量快照。后台诊断只读取这个值，不直接触碰 TAB_STATE。
+/// Runtime state owned exclusively by the AppKit main thread.
+/// 只由 AppKit 主线程独占的运行时状态容器。
+pub(crate) struct AppRuntime {
+    pub(crate) switcher: Option<AppState>,
+}
+
+thread_local! {
+    static APP_RUNTIME: RefCell<AppRuntime> = const { RefCell::new(AppRuntime { switcher: None }) };
+}
+
+/// Borrow the main-thread runtime for one short, synchronous state transition.
+/// 借用主线程 runtime 执行一次短生命周期、同步完成的状态迁移。
+pub(crate) fn with_tab_state<R>(f: impl FnOnce(&mut Option<AppState>) -> R) -> R {
+    debug_assert_main_thread();
+    APP_RUNTIME.with(|runtime| f(&mut runtime.borrow_mut().switcher))
+}
+
+/// UI runtime must never be accessed from a worker thread.
+/// UI runtime 不得从后台线程访问。
+pub(crate) fn debug_assert_main_thread() {
+    #[cfg(debug_assertions)]
+    unsafe {
+        let is_main: bool = msg_send![class!(NSThread), isMainThread];
+        debug_assert!(
+            is_main,
+            "main-thread runtime accessed off the AppKit main thread"
+        );
+    }
+}
+
 /// Main-thread-published window-count snapshot. Background diagnostics read this value
-/// instead of touching TAB_STATE directly.
+/// instead of touching the switcher runtime.
 pub(crate) static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static CONTROLLER: Mutex<Option<ObjPtr>> = Mutex::new(None);
 
@@ -460,15 +489,17 @@ extern "C" fn on_activation_focus_result(_self: *mut c_void, _cmd: Sel, _arg: *m
         batch
     };
     for result in batch {
-        if let Some(state) = TAB_STATE.lock().unwrap().as_mut() {
-            window_refresh::best_effort_bump_focus_key(state, result.pid, result.cgwid);
-            log_debug!(
-                "app-activated bump: pid={} cgwid={} attempt={}",
-                result.pid,
-                result.cgwid,
-                result.attempt
-            );
-        }
+        with_tab_state(|state_opt| {
+            if let Some(state) = state_opt.as_mut() {
+                window_refresh::best_effort_bump_focus_key(state, result.pid, result.cgwid);
+                log_debug!(
+                    "app-activated bump: pid={} cgwid={} attempt={}",
+                    result.pid,
+                    result.cgwid,
+                    result.attempt
+                );
+            }
+        });
         thumbnail::refresh_after_activation(result.pid, result.cgwid, result.activated_at);
     }
     // 结果可能恰好在 take 后到达，检查并补发下一批，避免 flag 清零窗口丢通知。
@@ -641,22 +672,24 @@ extern "C" fn on_app_terminated(_self: *mut c_void, _cmd: Sel, notification: *mu
         // invalidating in-flight retries and preventing PID/CGWindowID reuse contamination.
         note_app_terminated(pid);
         clear_ax_window_cache_for_pid(pid);
-        if let Some(ref mut state) = *TAB_STATE.lock().unwrap() {
-            let removed = remove_pid_mru(&mut state.mru, pid);
-            if state
-                .focus_key
-                .is_some_and(|(focus_pid, _)| focus_pid == pid)
-            {
-                state.focus_key = None;
+        with_tab_state(|state_opt| {
+            if let Some(state) = state_opt.as_mut() {
+                let removed = remove_pid_mru(&mut state.mru, pid);
+                if state
+                    .focus_key
+                    .is_some_and(|(focus_pid, _)| focus_pid == pid)
+                {
+                    state.focus_key = None;
+                }
+                if removed > 0 {
+                    log_debug!(
+                        "app-terminated MRU cleanup: pid={} removed={}",
+                        pid,
+                        removed
+                    );
+                }
             }
-            if removed > 0 {
-                log_debug!(
-                    "app-terminated MRU cleanup: pid={} removed={}",
-                    pid,
-                    removed
-                );
-            }
-        }
+        });
         thumbnail::app_terminated(pid);
     }
 }
@@ -1732,8 +1765,10 @@ fn setup_status_bar() {
         let _: () = msg_send![shortcut_item, setTarget: menu_target];
         set_menu_item_title(shortcut_item, &t("menu.toggle_shortcut.cmd"));
         let _: () = msg_send![menu, addItem: shortcut_item];
-        *SHORTCUT_ITEM.lock().unwrap() = Some(ShortcutState {
-            item: shortcut_item,
+        with_menu_ui(|ui| {
+            ui.shortcut = Some(ShortcutState {
+                item: shortcut_item,
+            });
         });
 
         // 缩略图/纯图标模式切换项,紧跟快捷键模式切换项。
@@ -1752,8 +1787,10 @@ fn setup_status_bar() {
         let _: () = msg_send![thumbnail_item, setTarget: menu_target];
         set_menu_item_title(thumbnail_item, &t(thumbnail_title_key));
         let _: () = msg_send![menu, addItem: thumbnail_item];
-        *THUMBNAIL_ITEM.lock().unwrap() = Some(ThumbnailState {
-            item: thumbnail_item,
+        with_menu_ui(|ui| {
+            ui.thumbnail = Some(ThumbnailState {
+                item: thumbnail_item,
+            });
         });
 
         // Reload Config item
@@ -1798,11 +1835,13 @@ fn setup_status_bar() {
         let _: () = msg_send![menu, addItem: quit_item];
 
         // 登记固定标题项,供热重载 locale 时批量重设标题 / register fixed-title items for locale hot-reload
-        *FIXED_MENU_ITEMS.lock().unwrap() = Some(FixedMenuItems {
-            settings: settings_item,
-            reload: reload_item,
-            clear_cache: clear_cache_item,
-            quit: quit_item,
+        with_menu_ui(|ui| {
+            ui.fixed = Some(FixedMenuItems {
+                settings: settings_item,
+                reload: reload_item,
+                clear_cache: clear_cache_item,
+                quit: quit_item,
+            });
         });
 
         let _: () = msg_send![status_item, setMenu: menu];
@@ -1967,7 +2006,7 @@ fn main() {
 
     let initial_state = AppState::new();
     WINDOW_COUNT.store(initial_state.windows.len(), Ordering::Release);
-    *TAB_STATE.lock().unwrap() = Some(initial_state);
+    with_tab_state(|state| *state = Some(initial_state));
 
     // 5. Create overlay window (hidden initially)
     let window = create_overlay_window();
@@ -2156,11 +2195,8 @@ fn main() {
                     geometry.map_or(0.0, |g| g.knob_h)
                 );
             }
-            let window_count = TAB_STATE
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map_or(0, |state| state.windows.len());
+            let window_count =
+                with_tab_state(|state| state.as_ref().map_or(0, |state| state.windows.len()));
             for _ in 0..window_count.saturating_add(1) {
                 on_cmd_tab_pressed(
                     std::ptr::null_mut(),
