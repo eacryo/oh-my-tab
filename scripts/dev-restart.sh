@@ -52,16 +52,14 @@ if ! wait_for_job_gone; then
     exit 1
 fi
 
-# 杀掉所有 oh-my-tab 实例:开发二进制 + 打包安装的 .app 都会注册同一个全局快捷键,
+# 杀掉所有 oh-my-tab 实例:开发二进制 + 任意位置的打包 .app 都会注册同一个全局快捷键,
 # 两个进程并存时旧版会抢走 Cmd+Tab(用户曾因此误以为新功能没生效)。
-# 精确匹配路径,避免误杀同名进程;无旧进程也不报错。
+# 按完整进程名匹配,覆盖 /Applications、dist 和其它副本;无旧进程也不报错。
 # Kill every oh-my-tab instance: both the dev binary and the packaged .app register the
 # same global shortcut -- with two running, the older one hijacks Cmd+Tab (which once made
-# new features look dead). Exact path matches only; no error when nothing is running.
-pkill -f 'target/debug/oh-my-tab' 2>/dev/null
-pkill -f 'target/release/oh-my-tab' 2>/dev/null
-pkill -f "$dev_app_binary" 2>/dev/null
-pkill -f '/Applications/Oh-My-Tab.app/Contents/MacOS/oh-my-tab' 2>/dev/null
+# new features look dead). Match the complete process name so copies under /Applications,
+# dist, and other locations are all covered; no error when nothing is running.
+pkill -x 'oh-my-tab' 2>/dev/null
 sleep 0.5
 
 # 每次都删除旧的开发版 .app,避免旧资源或旧 Info.plist 混入新包。
@@ -173,7 +171,7 @@ launch_output="$launch_output_dir/dev-launchd-open.log"
 submit_error="$(launchctl submit -l "$launch_label" -o "$launch_output" -e "$launch_output" -- \
     /usr/bin/env OH_MY_TAB_LAUNCHD_WRAPPER=1 "${launch_env_args[@]}" \
     "$repo_dir/scripts/dev-launchd-wrapper.sh" "$launch_label" \
-    /usr/bin/open -n -W "$dev_app" 2>&1)"
+    /usr/bin/open -W "$dev_app" 2>&1)"
 submit_status=$?
 if [ "$submit_status" -ne 0 ] && ! launchctl print "$launch_target" >/dev/null 2>&1; then
     echo "restart FAILED: launchctl submit error"

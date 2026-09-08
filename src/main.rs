@@ -19,6 +19,7 @@ mod pointer_locator;
 mod quick_actions;
 mod runtime_config;
 mod settings;
+mod single_instance;
 mod skylight;
 mod theme;
 mod thumbnail;
@@ -1974,6 +1975,23 @@ fn prompt_accessibility_if_needed() {
 }
 
 fn main() {
+    // GUI 冒烟入口是测试子进程，允许它们与开发版并行；所有正常启动渠道共用同一把锁。
+    // GUI smoke entry points are test subprocesses and may run alongside the development app;
+    // every normal launch channel shares one lock.
+    let is_gui_smoke_process =
+        std::env::args().any(|arg| arg == "--smoke-clipboard" || arg == "--smoke-settings-layout");
+    let _instance_guard = if is_gui_smoke_process {
+        None
+    } else {
+        match single_instance::acquire() {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                eprintln!("[single-instance] startup refused: {error}");
+                return;
+            }
+        }
+    };
+
     // 冒烟测试入口(--smoke-clipboard):在真实主线程 + NSApplication 环境里两次显示
     // 剪贴板浮窗(覆盖 rebuild_rows 行清理路径),成功 exit(0)。由 clipboard 模块的
     // #[ignore] 测试以子进程方式调用——测试 harness 的工作线程会被 AppKit 主线程限制拦下。

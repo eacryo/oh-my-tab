@@ -16,6 +16,10 @@
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- 同一 bundle 交给 LaunchServices 启动时只允许一个进程；应用内进程锁负责跨开发/正式渠道兜底。 -->
+    <!-- Allow only one process per bundle through LaunchServices; the in-app lock also covers dev/release channels. -->
+    <key>LSMultipleInstancesProhibited</key>
+    <true/>
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
