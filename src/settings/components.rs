@@ -1165,16 +1165,11 @@ impl RestoreDefaultsControl {
             let _: () = objc2::msg_send![self.trigger, setHidden: false];
             let _: () = objc2::msg_send![self.cancel, setHidden: false];
             let _: () = objc2::msg_send![self.confirm, setHidden: false];
-            if animated {
-                // 参考组件的外壳在整个 morph 过程中持续存在;这里只同步显示状态,不再叠加
-                // 一条独立的淡入时间轴,避免背景比尺寸动画晚出现。
-                // The reference shell remains present for the whole morph; synchronize its
-                // visible state without adding a separate fade timeline that would lag the size
-                // animation.
-                let _: () = objc2::msg_send![self.surface, setAlphaValue: 1.0f64];
-            } else {
-                let _: () = objc2::msg_send![self.surface, setAlphaValue: 1.0f64];
-            }
+            // 参考组件的外壳在整个 morph 过程中持续存在;这里只同步显示状态,不再叠加
+            // 一条独立的淡入时间轴,避免背景比尺寸动画晚出现。
+            // The reference shell remains present for the whole morph; synchronize its visible
+            // state without adding a separate fade timeline that would lag the size animation.
+            Self::set_opacity_model(self.surface, 1.0);
             // Start the panel content below the collapsed shell and let it rise with the shell,
             // matching the reference's top-docked content reveal.
             // 让面板内容从收起外壳下方开始，随着外壳向上展开，匹配参考组件贴顶内容的显现。
@@ -1208,8 +1203,8 @@ impl RestoreDefaultsControl {
                 );
                 Self::animate_content_open(self.confirm);
             } else {
-                let _: () = objc2::msg_send![self.trigger, setAlphaValue: 0.0f64];
-                let _: () = objc2::msg_send![self.cancel, setAlphaValue: 1.0f64];
+                Self::set_opacity_model(self.trigger, 0.0);
+                Self::set_opacity_model(self.cancel, 1.0);
                 Self::set_content_model(self.confirm, 1.0, 0.0, 1.0);
             }
         } else {
@@ -1250,12 +1245,22 @@ impl RestoreDefaultsControl {
                     Self::SHELL_DURATION,
                     "restore-shell-hide",
                 );
-                let _: () = objc2::msg_send![self.surface, setAlphaValue: 0.0f64];
             } else {
-                let _: () = objc2::msg_send![self.trigger, setAlphaValue: 1.0f64];
-                let _: () = objc2::msg_send![self.cancel, setAlphaValue: 0.0f64];
+                // 确认操作会走无动画收起路径；先取消仍在运行的展开动画，避免旧的
+                // presentation layer 继续显示“取消”并遮住已恢复的触发按钮。
+                // Confirmation collapses without animation. Cancel any in-flight opening
+                // animations first so their presentation layers cannot keep Cancel visible over
+                // the restored trigger.
+                for view in [self.trigger, self.cancel, self.confirm, self.surface] {
+                    let layer: *mut AnyObject = objc2::msg_send![view, layer];
+                    if !layer.is_null() {
+                        let _: () = objc2::msg_send![layer, removeAllAnimations];
+                    }
+                }
+                Self::set_opacity_model(self.trigger, 1.0);
+                Self::set_opacity_model(self.cancel, 0.0);
                 Self::set_content_model(self.confirm, 0.0, 6.0, 0.98);
-                let _: () = objc2::msg_send![self.surface, setAlphaValue: 0.0f64];
+                Self::set_opacity_model(self.surface, 0.0);
                 let _: () = objc2::msg_send![self.surface, setHidden: true];
             }
         }
@@ -1516,6 +1521,11 @@ impl RestoreDefaultsControl {
         }
         let fallback: f64 = objc2::msg_send![view, alphaValue];
         let from = Self::presentation_scalar(layer, "opacity", fallback);
+        // AppKit 不会可靠地把直接写入 CALayer 的 opacity 回写到 alphaValue。两边都更新，
+        // 才能保证后续动画/无动画状态切换从同一个模型值开始。
+        // AppKit does not reliably mirror direct CALayer opacity writes back to alphaValue.
+        // Update both so later animated and immediate transitions share one model value.
+        let _: () = objc2::msg_send![view, setAlphaValue: target];
         Self::animate_spring_scalar(
             layer,
             "opacity",
@@ -1541,7 +1551,20 @@ impl RestoreDefaultsControl {
         }
         let fallback: f64 = objc2::msg_send![view, alphaValue];
         let from = Self::presentation_scalar(layer, "opacity", fallback);
+        let _: () = objc2::msg_send![view, setAlphaValue: target];
         Self::animate_basic_scalar(layer, "opacity", from, target, duration, animation_key);
+    }
+
+    unsafe fn set_opacity_model(view: *mut AnyObject, opacity: f64) {
+        let _: () = objc2::msg_send![view, setAlphaValue: opacity];
+        let layer: *mut AnyObject = objc2::msg_send![view, layer];
+        if layer.is_null() {
+            return;
+        }
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+        Self::set_layer_scalar(layer, "opacity", opacity);
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
     }
 
     unsafe fn animate_basic_scalar(
@@ -1596,9 +1619,9 @@ impl RestoreDefaultsControl {
     }
 
     unsafe fn set_content_model(view: *mut AnyObject, opacity: f64, y: f64, scale: f64) {
+        Self::set_opacity_model(view, opacity);
         let layer: *mut AnyObject = objc2::msg_send![view, layer];
         if layer.is_null() {
-            let _: () = objc2::msg_send![view, setAlphaValue: opacity];
             return;
         }
         let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
@@ -1661,6 +1684,7 @@ impl RestoreDefaultsControl {
         let opacity = Self::presentation_scalar(layer, "opacity", 1.0);
         let y = Self::presentation_scalar(layer, "transform.translation.y", 0.0);
         let scale = Self::presentation_scalar(layer, "transform.scale", 1.0);
+        let _: () = objc2::msg_send![view, setAlphaValue: 0.0f64];
         Self::animate_basic_scalar(
             layer,
             "opacity",
