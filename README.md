@@ -84,6 +84,8 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 
 **Telegram's fullscreen image viewer has no separate thumbnail**: Telegram's media viewer is a special high-level floating window above its normal windows. To avoid treating it as a separate switchable window, oh-my-tab excludes it from the window list and thumbnail capture. While the viewer is open, the switcher displays Telegram's main-window thumbnail. This is a known limitation of the current version.
 
+**Some application windows may be unavailable to thumbnail capture**: Certain applications mark editor or other protected windows as non-shareable, or render their content on a protected surface. Screen Recording permission can be granted while other windows from the same application still capture normally. In this case the window remains switchable, but its thumbnail may stay on the placeholder or last valid frame. This is an application/WindowServer sharing limitation, not necessarily an incorrect window ID.
+
 If windows are already open when the app starts, their initial ordering is seeded from WindowServer's front-to-back order. This provides an initial approximation; live activation events refine the window-level MRU after launch.
 
 
