@@ -141,6 +141,10 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         crate::updater::set_automatic_checks(new.updates.automatically_check);
         crate::updater::set_automatic_downloads(new.updates.automatically_download);
     }
+
+    // Keep the status-bar service toggles current for changes made in Settings or by reload.
+    // 保证设置页或重新加载配置后，状态栏中的功能大类开关立即同步。
+    crate::menu::refresh_service_menu();
 }
 
 #[cfg(test)]

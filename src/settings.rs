@@ -2116,6 +2116,33 @@ unsafe fn update_quick_actions_controls_enabled(ui: &SettingsUi) {
     }
 }
 
+/// Refresh top-level service switches when they are changed from the status-bar menu.
+/// 当状态栏菜单修改功能大类开关时，同步设置页中的总开关状态。
+pub(crate) fn refresh_service_controls_from_config() {
+    let cfg = CONFIG.read().unwrap().clone();
+    unsafe {
+        with_settings_ui(|ui| {
+            let Some(u) = ui.as_ref() else {
+                return;
+            };
+            for (ctrl, value) in [
+                (u.windows_enabled, cfg.windows.enabled),
+                (u.enable_mouse, cfg.mouse.enabled),
+                (u.clipboard_enabled, cfg.clipboard.enabled),
+                (u.window_control_enabled, cfg.window_control.enabled),
+                (u.quick_actions_enabled, cfg.quick_actions.enabled),
+            ] {
+                let _: () = msg_send![ctrl, setState: if value { 1isize } else { 0isize }];
+            }
+            update_windows_controls_enabled(u);
+            update_mouse_controls_enabled(u);
+            update_clipboard_controls_enabled(u);
+            update_window_control_controls_enabled(u);
+            update_quick_actions_controls_enabled(u);
+        });
+    }
+}
+
 /// 设备下拉框的项与 DeviceKey 的映射(与 popup items 一一对应),供 handle_device_changed
 /// 按 indexOfSelectedItem 反查。每次 rebuild_device_popup 重建。
 /// 只有具体设备项,无"所有鼠标"通配项。

@@ -7,7 +7,7 @@
 //! switching, and menu-title refresh. setup_status_bar stays in main.rs (setup wiring).
 
 use objc2::runtime::{AnyObject, Sel};
-use objc2::{class, msg_send};
+use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -33,6 +33,10 @@ pub(crate) struct ThumbnailState {
     pub(crate) item: *mut AnyObject,
 }
 
+pub(crate) struct ServiceMenuState {
+    pub(crate) items: [*mut AnyObject; 5],
+}
+
 // 固定标题的菜单项(settings / reload / clear_cache / quit)。locale 变更时由 refresh_menu_titles 批量重设标题。
 // Fixed-title menu items (settings / reload / clear_cache / quit); re-titled in bulk by refresh_menu_titles on locale change.
 pub(crate) struct FixedMenuItems {
@@ -47,6 +51,7 @@ pub(crate) struct FixedMenuItems {
 pub(crate) struct MenuUi {
     pub(crate) shortcut: Option<ShortcutState>,
     pub(crate) thumbnail: Option<ThumbnailState>,
+    pub(crate) services: Option<ServiceMenuState>,
     pub(crate) fixed: Option<FixedMenuItems>,
 }
 
@@ -54,6 +59,7 @@ thread_local! {
     static MENU_UI: RefCell<MenuUi> = const { RefCell::new(MenuUi {
         shortcut: None,
         thumbnail: None,
+        services: None,
         fixed: None,
     }) };
 }
@@ -189,11 +195,181 @@ pub(crate) fn set_thumbnail_mode(thumbnails_enabled: bool) {
     }
 }
 
+const SERVICE_MENU_TITLE_KEYS: [&str; 5] = [
+    "menu.service_windows",
+    "menu.service_mouse",
+    "menu.service_clipboard",
+    "menu.service_window_control",
+    "menu.service_quick_actions",
+];
+
+const SERVICE_MENU_SYMBOLS: [&str; 5] = [
+    "rectangle.on.rectangle",
+    "computermouse",
+    "doc.text",
+    "rectangle.split.2x2",
+    "bolt.circle",
+];
+
+#[derive(Clone, Copy)]
+enum ServiceToggle {
+    Windows,
+    Mouse,
+    Clipboard,
+    WindowControl,
+    QuickActions,
+}
+
+impl ServiceToggle {
+    fn from_tag(tag: isize) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Windows),
+            1 => Some(Self::Mouse),
+            2 => Some(Self::Clipboard),
+            3 => Some(Self::WindowControl),
+            4 => Some(Self::QuickActions),
+            _ => None,
+        }
+    }
+
+    fn enabled(self, cfg: &crate::config::Config) -> bool {
+        match self {
+            Self::Windows => cfg.windows.enabled,
+            Self::Mouse => cfg.mouse.enabled,
+            Self::Clipboard => cfg.clipboard.enabled,
+            Self::WindowControl => cfg.window_control.enabled,
+            Self::QuickActions => cfg.quick_actions.enabled,
+        }
+    }
+
+    fn set_enabled(self, cfg: &mut crate::config::Config, enabled: bool) {
+        match self {
+            Self::Windows => cfg.windows.enabled = enabled,
+            Self::Mouse => cfg.mouse.enabled = enabled,
+            Self::Clipboard => cfg.clipboard.enabled = enabled,
+            Self::WindowControl => cfg.window_control.enabled = enabled,
+            Self::QuickActions => cfg.quick_actions.enabled = enabled,
+        }
+    }
+}
+
+unsafe fn set_menu_item_symbol(item: *mut AnyObject, symbol: &str) {
+    let symbol_ns = make_nsstring(symbol);
+    let image: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: symbol_ns,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(symbol_ns as *const c_void);
+    if !image.is_null() {
+        let _: () = msg_send![image, setTemplate: true];
+        let _: () = msg_send![item, setImage: image];
+    }
+}
+
+unsafe fn make_menu_item(
+    target: *mut AnyObject,
+    title: &str,
+    action: Sel,
+    tag: isize,
+    symbol: Option<&str>,
+) -> *mut AnyObject {
+    let title_ns = make_nsstring(title);
+    let key_ns = make_nsstring("");
+    let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+    let item: *mut AnyObject =
+        msg_send![item, initWithTitle: title_ns, action: action, keyEquivalent: key_ns];
+    CFRelease(title_ns as *const c_void);
+    CFRelease(key_ns as *const c_void);
+    let _: () = msg_send![item, setTarget: target];
+    let _: () = msg_send![item, setTag: tag];
+    set_menu_item_title(item, title);
+    if let Some(symbol) = symbol {
+        set_menu_item_symbol(item, symbol);
+    }
+    item
+}
+
+/// Build the directly expanded service-toggle section between Settings and shortcut mode.
+/// 构建位于“设置”和快捷键模式之间、直接展开的五个大类开关。
+pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyObject) {
+    let items: [*mut AnyObject; 5] = std::array::from_fn(|index| {
+        let item = make_menu_item(
+            target,
+            &t(SERVICE_MENU_TITLE_KEYS[index]),
+            sel!(handleToggleService:),
+            index as isize,
+            Some(SERVICE_MENU_SYMBOLS[index]),
+        );
+        // 使用原生 NSMenuItem image/title/state，交由 AppKit 统一处理列对齐、悬停和点击。
+        // Use native NSMenuItem image/title/state so AppKit owns column alignment, hover, and clicks.
+        let _: () = msg_send![item, setState: 0isize];
+        let _: () = msg_send![menu, addItem: item];
+        item
+    });
+    with_menu_ui(|ui| {
+        ui.services = Some(ServiceMenuState { items });
+    });
+    refresh_service_menu();
+}
+
+pub(crate) fn refresh_service_menu() {
+    let enabled: [bool; 5] = {
+        let cfg = CONFIG.read().unwrap();
+        std::array::from_fn(|index| {
+            ServiceToggle::from_tag(index as isize)
+                .expect("service menu index")
+                .enabled(&cfg)
+        })
+    };
+    let Some(items) = with_menu_ui(|ui| ui.services.as_ref().map(|state| state.items)) else {
+        return;
+    };
+    unsafe {
+        for (index, item) in items.into_iter().enumerate() {
+            let title = t(SERVICE_MENU_TITLE_KEYS[index]);
+            set_menu_item_title(item, &title);
+            let _: () = msg_send![item, setState: if enabled[index] { 1isize } else { 0isize }];
+        }
+    }
+}
+
+pub(crate) extern "C" fn handle_toggle_service(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
+    if sender.is_null() {
+        return;
+    }
+    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+    let Some(service) = ServiceToggle::from_tag(tag) else {
+        return;
+    };
+    let old_cfg = CONFIG.read().unwrap().clone();
+    let mut new_cfg = old_cfg.clone();
+    let enabled = !service.enabled(&old_cfg);
+    service.set_enabled(&mut new_cfg, enabled);
+    if let Ok(mut current) = CONFIG.write() {
+        *current = new_cfg.clone();
+    }
+    persist_config_now();
+    crate::runtime_config::apply_config_change(
+        &old_cfg,
+        &new_cfg,
+        crate::runtime_config::ConfigChangeSource::Menu,
+    );
+    crate::settings::refresh_service_controls_from_config();
+    refresh_service_menu();
+    log_info!(
+        "Service {:?}: {}",
+        tag,
+        if enabled { "enabled" } else { "disabled" }
+    );
+}
+
 /// 用当前 locale 与状态重设全部菜单项标题。用于 locale 变更(reload)与启动时修正初始标签。
 /// Re-title all menu items from the current locale and state. Used on locale change (reload)
 /// and at startup to fix the initial labels.
 pub(crate) fn refresh_menu_titles() {
     set_thumbnail_mode(CONFIG.read().unwrap().layout.thumbnails_enabled);
+    refresh_service_menu();
     unsafe {
         // shortcut item
         let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);

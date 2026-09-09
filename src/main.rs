@@ -1601,6 +1601,12 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handleToggleService:),
+                handle_toggle_service as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleReloadConfig:),
                 handle_reload_config as *mut c_void,
                 types.as_ptr(),
@@ -1842,6 +1848,15 @@ fn setup_status_bar() {
         // Separate Settings from the action items below, matching the separator above Quit.
         let settings_separator: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![menu, addItem: settings_separator];
+
+        // 五个功能大类开关,紧跟设置项并位于快捷键模式切换之前；图标沿用设置侧栏语义图标。
+        // Five top-level service toggles, between Settings and shortcut-mode switching; icons
+        // reuse the semantic symbols from the settings sidebar.
+        let service_separator: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![menu, addItem: service_separator];
+        build_service_menu(menu, menu_target);
+        let service_separator: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![menu, addItem: service_separator];
 
         // Shortcut toggle item
         let shortcut_title = make_nsstring(&t("menu.toggle_shortcut.cmd"));
