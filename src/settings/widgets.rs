@@ -3491,8 +3491,12 @@ pub(super) extern "C" fn settings_pane_highlight_draw_rect(
         let farthest = (center.x * center.x + center.y * center.y).sqrt();
         let end_radius = farthest * 0.34;
         // 白 .96 → 白 0;option 2 = kCGGradientDrawsAfterEndLocation(终点外保持透明)。
-        // White .96 → white 0; option 2 = kCGGradientDrawsAfterEndLocation (transparent beyond).
-        let components: [f64; 8] = [1.0, 1.0, 1.0, 0.96, 1.0, 1.0, 1.0, 0.0];
+        // 深色模式降到 5%:同样的白斑画在深底上是刺眼的白块,保留为极淡的一层冷光。
+        // White .96 → white 0; option 2 = kCGGradientDrawsAfterEndLocation (transparent
+        // beyond). Dark mode dials the start alpha down to 5%: the same blob reads as a
+        // glaring white patch on the dark backdrop, so keep only a faint cool glow there.
+        let start_alpha = if settings_palette().dark { 0.05 } else { 0.96 };
+        let components: [f64; 8] = [1.0, 1.0, 1.0, start_alpha, 1.0, 1.0, 1.0, 0.0];
         let space = crate::ffi::CGColorSpaceCreateDeviceRGB();
         let gradient = crate::ffi::CGGradientCreateWithColorComponents(
             space,
