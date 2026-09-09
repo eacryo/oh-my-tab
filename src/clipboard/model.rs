@@ -370,8 +370,8 @@ pub(super) fn save_stamp_for(entry: &ClipEntry) -> String {
     format_save_stamp(entry.copied_at.unwrap_or_else(now_secs))
 }
 
-/// 自动过期 TTL(秒):0 天 = 关闭 → None。从 CONFIG 实时读(设置热重载即生效)。
-/// The auto-expiry TTL in seconds: 0 days = off -> None. Read live from CONFIG (a hot
+/// 自动过期 TTL(秒):0 天 = 永不过期 → None。从 CONFIG 实时读(设置热重载即生效)。
+/// The auto-expiry TTL in seconds: 0 days = never -> None. Read live from CONFIG (a hot
 /// reload takes effect immediately).
 pub(super) fn ttl_secs() -> Option<u64> {
     let days = CONFIG

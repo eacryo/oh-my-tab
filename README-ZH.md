@@ -225,7 +225,7 @@ automatically_check = true  # 通过 Sparkle 自动检查更新
 enabled = false          # 剪贴板历史总开关(默认关闭)
 max_entries = 50         # 历史最大条数(1..=100)
 persist = false          # 把历史保存到磁盘,重启不丢(隐私风险见下方说明)
-auto_expire_days = 3     # 非置顶条目超过 N 天自动过期(内存与磁盘同时生效);0 = 关闭
+auto_expire_days = 3     # 非置顶条目超过 N 天自动删除(0-7,内存与磁盘同时生效);0 = 永不删除
 pin_follow_selection = true # 置顶/取消置顶后选中项是否跟随该条目(关闭 = 保持当前位置)
 move_used_to_top = true  # 粘贴后把用过的条目移到最前(关闭 = 粘贴后保持当前顺序,同 Win+V)
 delete_after_paste = false # Option+回车或 Option+点击会粘贴并从历史中删除条目(一次性粘贴)

@@ -133,7 +133,7 @@ desc_clipboard_clear_system_pasteboard_after_paste = "僅在啟用「貼上後�
 tooltip_clipboard_delete_after_paste_disabled = "請先啟用「貼上後刪除項目」。"
 row_clipboard_show_source_app = "顯示來源應用"
 row_clipboard_max_entries = "最大條數"
-row_clipboard_auto_expire_days = "自動過期(天)"
+row_clipboard_auto_expire_days = "自動刪除天數，0表示永不刪除"
 row_clipboard_pin_follow = "置頂後選中項位置"
 pin_follow_entry = "跟隨置頂"
 pin_keep_position = "保持目前位置"
@@ -300,7 +300,7 @@ config_read_failed = "無法讀取設定: {error}"
 config_field_type_invalid = "{field}：類型 {actual} 無效（應為 {expected}），將使用預設值"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line 之一'
 clipboard_max_entries_invalid = "clipboard.max_entries: {value} 必須 1..=100"
-clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} 必須 0..=365(0 = 關閉)"
+clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} 必須 0..=7(0 = 永不過期)"
 mouse_line_count_invalid = "line_count: {value} 必須 1..=10"
 windows_overlay_position_invalid = 'windows.overlay_position: "{value}" 不是 active_window、main 之一'
 windows_activation_mode_invalid = 'windows.activation_mode: "{value}" 不是 hover、click 之一'

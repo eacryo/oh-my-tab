@@ -63,6 +63,9 @@ const TEXT_SIZE_MAX: i64 = 20;
 const TEXT_SIZE_DEFAULT: i64 = 15;
 const TEXT_SIZE_VALUE_W: f64 = 40.0;
 const TEXT_SIZE_VALUE_H: f64 = 18.0;
+const CLIPBOARD_AUTO_EXPIRE_MIN: i64 = 0;
+const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
+const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
 
 /// Fixed width of the settings navigation pane, shared by layout and transient feedback.
 /// 设置导航栏固定宽度，供页面布局和临时反馈提示共用。
@@ -232,8 +235,9 @@ pub(super) struct SettingsUi {
     clipboard_delete_after_paste: *mut AnyObject, // NSSwitch: 粘贴后删除条目 / delete entry after paste
     clipboard_clear_system_pasteboard_after_paste: *mut AnyObject, // NSSwitch: 粘贴后清空系统剪贴板 / clear system pasteboard after paste
     clipboard_max_entries: *mut AnyObject, // NSTextField: 历史最大条数 / max history entries
-    clipboard_auto_expire_days: *mut AnyObject, // NSTextField: 自动过期天数(0=关闭)/ auto-expire days (0 = off)
-    clipboard_show_source_app: *mut AnyObject,  // NSSwitch: 显示来源应用 / show the source app
+    clipboard_auto_expire_days: *mut AnyObject, // NSSlider: 自动过期天数(0=永不过期)/ auto-expire days (0 = never)
+    clipboard_auto_expire_days_value_label: *mut AnyObject, // NSTextField: 自动过期值 / auto-expire value
+    clipboard_show_source_app: *mut AnyObject, // NSSwitch: 显示来源应用 / show the source app
     clipboard_pin_follow: *mut AnyObject, // NSPopUpButton: 置顶后选中项位置 / selection after pin
     // (follow the pinned entry / keep current position)
     window_control_enabled: *mut AnyObject, // NSSwitch: 启用窗口控制 / enable window control
@@ -1299,6 +1303,9 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
                         u.status_bar_text_size_value_label
                     };
                     set_field(label, val);
+                } else if ctrl == u.clipboard_auto_expire_days {
+                    let val: isize = msg_send![ctrl, integerValue];
+                    set_field(u.clipboard_auto_expire_days_value_label, val);
                 }
             }
         });
@@ -1468,7 +1475,14 @@ fn apply_control_field(field: ControlField) {
                         msg_send![u.clipboard_clear_system_pasteboard_after_paste, state];
                     cfg.clipboard.clear_system_pasteboard_after_paste = state == 1;
                 }
-                ControlField::ClipboardMaxEntries | ControlField::ClipboardAutoExpireDays => {
+                ControlField::ClipboardAutoExpireDays => {
+                    let value: isize = msg_send![u.clipboard_auto_expire_days, integerValue];
+                    cfg.clipboard.auto_expire_days = value.clamp(
+                        CLIPBOARD_AUTO_EXPIRE_MIN as isize,
+                        CLIPBOARD_AUTO_EXPIRE_MAX as isize,
+                    ) as u32;
+                }
+                ControlField::ClipboardMaxEntries => {
                     // 数字文本框走 NSControlText 通知路径。
                     // Numeric text fields ride the NSControlText notification path.
                     log_debug!("[settings] numeric field via unexpected action path ignored");
@@ -1723,16 +1737,12 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
                 let text = match field {
                     TextField::CornerRadius => cfg.appearance.corner_radius.to_string(),
                     TextField::ClipboardMaxEntries => cfg.clipboard.max_entries.to_string(),
-                    TextField::ClipboardAutoExpireDays => {
-                        cfg.clipboard.auto_expire_days.to_string()
-                    }
                 };
                 with_settings_ui(|ui| {
                     if let Some(u) = ui.as_ref() {
                         let ctrl = match field {
                             TextField::CornerRadius => u.corner_radius,
                             TextField::ClipboardMaxEntries => u.clipboard_max_entries,
-                            TextField::ClipboardAutoExpireDays => u.clipboard_auto_expire_days,
                         };
                         set_field(ctrl, text);
                     }
@@ -1749,7 +1759,6 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
 enum TextField {
     CornerRadius,
     ClipboardMaxEntries,
-    ClipboardAutoExpireDays,
 }
 
 unsafe fn text_field_of(obj: *mut AnyObject) -> Option<TextField> {
@@ -1760,8 +1769,6 @@ unsafe fn text_field_of(obj: *mut AnyObject) -> Option<TextField> {
             Some(TextField::CornerRadius)
         } else if ptr == u.clipboard_max_entries as usize {
             Some(TextField::ClipboardMaxEntries)
-        } else if ptr == u.clipboard_auto_expire_days as usize {
-            Some(TextField::ClipboardAutoExpireDays)
         } else {
             None
         }
@@ -1776,7 +1783,6 @@ unsafe fn parse_text_field(field: TextField) -> Option<(TextFieldValue, String)>
         let (ctrl, bounds): (*mut AnyObject, (f64, f64)) = match field {
             TextField::CornerRadius => (u.corner_radius, (0.0, 500.0)),
             TextField::ClipboardMaxEntries => (u.clipboard_max_entries, (1.0, 100.0)),
-            TextField::ClipboardAutoExpireDays => (u.clipboard_auto_expire_days, (0.0, 365.0)),
         };
         let raw = nsstring_to_rust(msg_send![ctrl, stringValue]);
         let value = match field {
@@ -1785,12 +1791,6 @@ unsafe fn parse_text_field(field: TextField) -> Option<(TextFieldValue, String)>
                 _ => return None,
             },
             TextField::ClipboardMaxEntries => match parse_usize(&raw) {
-                Ok(v) if (bounds.0 as usize..=bounds.1 as usize).contains(&v) => {
-                    TextFieldValue::U32(v as u32)
-                }
-                _ => return None,
-            },
-            TextField::ClipboardAutoExpireDays => match parse_usize(&raw) {
                 Ok(v) if (bounds.0 as usize..=bounds.1 as usize).contains(&v) => {
                     TextFieldValue::U32(v as u32)
                 }
@@ -1814,9 +1814,6 @@ fn write_text_field_config(field: TextField, value: TextFieldValue, apply_runtim
     match (field, value) {
         (TextField::CornerRadius, TextFieldValue::F64(v)) => cfg.appearance.corner_radius = v,
         (TextField::ClipboardMaxEntries, TextFieldValue::U32(v)) => cfg.clipboard.max_entries = v,
-        (TextField::ClipboardAutoExpireDays, TextFieldValue::U32(v)) => {
-            cfg.clipboard.auto_expire_days = v
-        }
         _ => {}
     }
     if let Ok(mut w) = CONFIG.write() {
@@ -1893,6 +1890,7 @@ unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
         ui.clipboard_delete_after_paste,
         ui.clipboard_max_entries,
         ui.clipboard_auto_expire_days,
+        ui.clipboard_auto_expire_days_value_label,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
@@ -3009,10 +3007,13 @@ fn load_settings_from(cfg: &Config) {
                 ui.clipboard_max_entries,
                 cfg.clipboard.max_entries.to_string(),
             );
-            set_field(
+            let auto_expire_days = (cfg.clipboard.auto_expire_days as i64)
+                .clamp(CLIPBOARD_AUTO_EXPIRE_MIN, CLIPBOARD_AUTO_EXPIRE_MAX);
+            let _: () = msg_send![
                 ui.clipboard_auto_expire_days,
-                cfg.clipboard.auto_expire_days.to_string(),
-            );
+                setIntegerValue: auto_expire_days as isize
+            ];
+            set_field(ui.clipboard_auto_expire_days_value_label, auto_expire_days);
             // pin_follow_selection:下拉框 index 0 = 跟随置顶, 1 = 保持当前位置。
             // pin_follow_selection: popup index 0 = follow, 1 = keep.
             let pin_idx: isize = if cfg.clipboard.pin_follow_selection {
@@ -3576,6 +3577,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             clipboard_clear_system_pasteboard_after_paste: std::ptr::null_mut(),
             clipboard_max_entries: std::ptr::null_mut(),
             clipboard_auto_expire_days: std::ptr::null_mut(),
+            clipboard_auto_expire_days_value_label: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
             clipboard_pin_follow: std::ptr::null_mut(),
             add_mapping_button: std::ptr::null_mut(),
@@ -5063,16 +5065,36 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         cy = layout.next_row_cursor(cy, described_row_h);
         SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
-        // 自动过期天数(数字输入,0 = 关闭)/ auto-expire days (number input, 0 = off).
-        ui.clipboard_auto_expire_days = SettingsRow::plain(
+        // 自动过期天数滑块:0..=7,0 = 永不过期;右侧显示当前值。
+        // Auto-expire days slider: 0..=7, where 0 means never; the current value is shown on
+        // the right.
+        let (_, auto_expire_slider) = SettingsRow::tall(
             clipboard_view,
             label_x,
             cy,
             label_w,
-            described_row_h,
             &t("settings.row_clipboard_auto_expire_days"),
-            SettingsControl::text_input(ctrl_x, cy, ctrl_w, row_h, "3"),
+            SettingsControl::slider(
+                ctrl_x,
+                cy + 10.0,
+                ctrl_w - 40.0,
+                row_h,
+                CLIPBOARD_AUTO_EXPIRE_MIN,
+                CLIPBOARD_AUTO_EXPIRE_MAX,
+                CLIPBOARD_AUTO_EXPIRE_DEFAULT,
+            ),
         );
+        ui.clipboard_auto_expire_days = auto_expire_slider;
+        let auto_expire_value_y = cy + 10.0 + (row_h - TEXT_SIZE_VALUE_H) / 2.0;
+        ui.clipboard_auto_expire_days_value_label = make_text_size_value_label(
+            clipboard_view,
+            ctrl_x + ctrl_w - 34.0,
+            auto_expire_value_y,
+            30.0,
+            TEXT_SIZE_VALUE_H,
+            CLIPBOARD_AUTO_EXPIRE_DEFAULT,
+        );
+        bind_control(target, ui.clipboard_auto_expire_days);
         let clipboard_options_card_bottom = layout.card_bottom(cy);
         SettingsSection::attach(
             clipboard_view,
@@ -5752,11 +5774,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 ),
                 (
                     ui.clipboard_max_entries,
-                    sel!(handleControlTextDidChange:),
-                    sel!(handleControlTextDidEndEditing:),
-                ),
-                (
-                    ui.clipboard_auto_expire_days,
                     sel!(handleControlTextDidChange:),
                     sel!(handleControlTextDidEndEditing:),
                 ),

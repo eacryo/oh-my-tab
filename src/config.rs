@@ -297,9 +297,10 @@ pub struct ClipboardSection {
     // delete_after_paste is also enabled. Default false.
     pub clear_system_pasteboard_after_paste: bool,
     // 自动过期天数:非置顶条目超过 N 天自动从历史(内存与持久化)清除,置顶条目
-    // 不参与过期。0 = 关闭。默认 3 天。
+    // 不参与过期。范围 0..=7,0 = 永不过期。默认 3 天。
     // Auto-expire days: unpinned entries older than N days are removed from the history
-    // (memory AND persistence); pinned entries never expire. 0 = off. Default 3 days.
+    // (memory AND persistence); pinned entries never expire. Range 0..=7; 0 = never.
+    // Default 3 days.
     pub auto_expire_days: u32,
     // 剪贴板浮窗位置:"mouse" = 跟随鼠标,"main" = 主屏幕居中。默认主屏幕居中。
     // The clipboard picker position: "mouse" = follows the cursor, "main" = centered on
@@ -867,7 +868,7 @@ impl Config {
                 &[("value", &self.clipboard.max_entries.to_string())],
             ));
         }
-        if self.clipboard.auto_expire_days > 365 {
+        if self.clipboard.auto_expire_days > 7 {
             errs.push(tf(
                 "errors.clipboard_auto_expire_days_invalid",
                 &[("value", &self.clipboard.auto_expire_days.to_string())],
@@ -2037,17 +2038,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_auto_expire_days_0_to_365() {
-        // 自动过期天数:0(关闭)与 365 合法,366 非法。
-        // Auto-expire days: 0 (off) and 365 are valid, 366 is rejected.
+    fn validate_accepts_auto_expire_days_0_to_7() {
+        // 自动过期天数:0(永不过期)与 7 合法,8 非法。
+        // Auto-expire days: 0 (never) and 7 are valid, 8 is rejected.
         let mut cfg = Config::default();
         assert_eq!(cfg.clipboard.auto_expire_days, 3, "default is 3 days");
         assert_err_count(&cfg, 0);
         cfg.clipboard.auto_expire_days = 0;
         assert_err_count(&cfg, 0);
-        cfg.clipboard.auto_expire_days = 365;
+        cfg.clipboard.auto_expire_days = 7;
         assert_err_count(&cfg, 0);
-        cfg.clipboard.auto_expire_days = 366;
+        cfg.clipboard.auto_expire_days = 8;
         assert_err_count(&cfg, 1);
     }
 

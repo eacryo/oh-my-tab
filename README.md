@@ -259,7 +259,7 @@ automatically_check = true  # automatically check for updates through Sparkle
 enabled = false          # clipboard history master switch (off by default)
 max_entries = 50         # max history entries (1..=100)
 persist = false          # save history to disk so it survives restarts (see the privacy note below)
-auto_expire_days = 3     # unpinned entries expire after N days (memory AND disk); 0 = off
+auto_expire_days = 3     # unpinned entries are deleted after N days (0-7, memory AND disk); 0 = never delete
 pin_follow_selection = true # after pin/unpin, move the selection to the toggled entry (false = keep the current position)
 move_used_to_top = true  # pasting moves the used entry to the top (false = keep the current order, like Win+V)
 delete_after_paste = false # Option+Enter or Option+click pastes the entry AND removes it from the history (one-shot paste)
