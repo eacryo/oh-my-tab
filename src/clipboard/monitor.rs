@@ -16,7 +16,7 @@ pub(super) fn poll_clipboard() {
     if !CONFIG.read().unwrap().clipboard.enabled {
         return;
     }
-    let changed = unsafe {
+    let new_cc: Option<i64> = unsafe {
         let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
         if pb.is_null() {
             return;
@@ -29,9 +29,25 @@ pub(super) fn poll_clipboard() {
         let prev = *last;
         *last = cc;
         log_debug!("[clip] pasteboard changeCount {} -> {}", prev, cc);
-        true
+        Some(cc)
     };
-    if !changed {
+    let cc = if let Some(cc) = new_cc {
+        cc
+    } else {
+        return;
+    };
+    // "粘贴并删除"写回拦截:布防目标恰中的变化,或仍带自家 marker 的后续变化,
+    // 都是我们的焚后写回,直接跳过(无论 move_used_to_top 开关)。若计数错位且没有
+    // marker,视为抑制已过期,不吞掉后续真实复制。
+    // Paste-and-delete interception: a change hitting the exact armed target is our own
+    // burn-after-paste write-back -- skip it regardless of move_used_to_top (the entry is
+    // already deleted and must not resurrect via re-recording). If the count is misaligned,
+    // the marker fallback still recognizes our write; without either signal the token is
+    // stale and a genuine copy is never swallowed.
+    let stored = PASTE_DELETE_SUPPRESS_CC.lock().unwrap().take();
+    let marker_present = stored.is_some() && unsafe { pasteboard_has_paste_marker() };
+    if paste_delete_suppression_hit(stored, cc, marker_present) {
+        log_debug!("[clip] change skipped: our own paste-and-delete write-back");
         return;
     }
     // 敏感标记拦截:密码管理器等打上 ConcealedType/TransientType 的内容直接跳过,

@@ -76,7 +76,7 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 
 > **Known v1 tradeoffs** — each entry records exactly one kind of content: a copy carrying **both text and an image** (e.g. copying an image from a web page) records only the text; **multiple-file copies and single non-image file copies are omitted from history**. The same picture copied both as an image and as a file stays as two separate entries (they answer different paste semantics). Dedup is per-kind: text by exact content, images by content hash.
 
-**Using an entry reorders the history by default** (like Maccy): selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top. The **"Move used entries to top"** switch in Settings turns this off (like Windows Win+V). The picker's "Clear all" keeps pinned entries. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note under [Configuration](#configuration).
+**Using an entry reorders the history by default** (like Maccy): selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top. The **"Move used entries to top"** switch in Settings turns this off (like Windows Win+V). With the optional **"Delete entry after paste"** switch on, holding **Option** while pressing Enter or clicking a row pastes the entry and removes it from the history right away (one-shot paste). Its dependent **"Also delete the corresponding system clipboard item"** switch additionally removes the corresponding clipboard content after a short delay, if no newer copy replaced it. The picker's "Clear all" keeps pinned entries. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note under [Configuration](#configuration).
 
 ## <img height="16" src="docs/icons/alert.svg">&nbsp;&nbsp;Known Issues
 
@@ -262,6 +262,8 @@ persist = false          # save history to disk so it survives restarts (see the
 auto_expire_days = 3     # unpinned entries expire after N days (memory AND disk); 0 = off
 pin_follow_selection = true # after pin/unpin, move the selection to the toggled entry (false = keep the current position)
 move_used_to_top = true  # pasting moves the used entry to the top (false = keep the current order, like Win+V)
+delete_after_paste = false # Option+Enter or Option+click pastes the entry AND removes it from the history (one-shot paste)
+clear_system_pasteboard_after_paste = false # when delete_after_paste is on, delete the corresponding system clipboard item after pasting
 picker_position = "main" # picker position: "mouse" (follow the cursor) | "main" (centered on the main screen)
 show_source_app = false  # show the source app name in rows (the source is always recorded either way)
 

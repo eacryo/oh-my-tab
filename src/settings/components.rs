@@ -307,6 +307,29 @@ impl SettingsRow {
         Self::set_enabled_with_tooltip(control, enabled, "");
     }
 
+    /// Enable a row only when every parent control is enabled, using the first failed
+    /// dependency's tooltip. This keeps linked settings' visual state and explanation in the
+    /// shared component layer.
+    /// 仅当所有父控件都开启时启用 row，并使用第一个未满足依赖的 Tooltip。联动设置的置灰、
+    /// 标题状态和解释统一由组件层处理。
+    pub(super) unsafe fn set_enabled_when_all(
+        control: *mut AnyObject,
+        dependencies: &[(*mut AnyObject, &str)],
+    ) {
+        let failed = dependencies.iter().find(|(parent, _)| {
+            if parent.is_null() {
+                return true;
+            }
+            let state: isize = objc2::msg_send![*parent, state];
+            state != 1
+        });
+        if let Some((_, tooltip)) = failed {
+            Self::set_enabled_with_tooltip(control, false, tooltip);
+        } else {
+            Self::set_enabled_with_tooltip(control, true, "");
+        }
+    }
+
     /// Add the standard grouped-card divider through the same row component API.
     /// 通过统一的 row 组件 API 添加分组卡片分割线。
     pub(super) unsafe fn separator(parent: *mut AnyObject, y: f64, width: f64) -> *mut AnyObject {

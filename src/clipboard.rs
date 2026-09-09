@@ -400,6 +400,53 @@ fn estimated_entry_bytes(entry: &ClipEntry) -> u64 {
 /// 上次读到的 changeCount(变化才读剪贴板)/ last observed changeCount (read only on change).
 static LAST_CHANGE_COUNT: LazyLock<Mutex<i64>> = LazyLock::new(|| Mutex::new(-1));
 
+/// "粘贴并删除"写回的一次性抑制目标 changeCount。同步通知时精确计数可立即命中;
+/// 若通知延迟或计数跳跃,仍用自家 marker 兜底识别写回,避免刚删条目复活。
+/// One-shot suppression target for "paste and delete" write-backs. An exact count handles
+/// synchronous notifications; if notification delivery is delayed or counts jump, the
+/// paste marker is used as a fallback so the deleted entry cannot be resurrected.
+static PASTE_DELETE_SUPPRESS_CC: LazyLock<Mutex<Option<i64>>> = LazyLock::new(|| Mutex::new(None));
+
+/// 待执行的系统剪贴板清空任务:记录写回后的 changeCount,延迟回调时据此确认仍是我们的内容。
+/// Pending system-pasteboard clear task: records the post-write changeCount so the delayed
+/// callback can confirm that our content is still present.
+static PENDING_SYSTEM_PASTEBOARD_CLEAR: LazyLock<Mutex<Option<i64>>> =
+    LazyLock::new(|| Mutex::new(None));
+const SYSTEM_PASTEBOARD_CLEAR_DELAY: f64 = 0.35;
+
+/// 布防"粘贴并删除"抑制:必须在写回剪贴板**之前**调用——若粘贴板变化通知同步
+/// 重入轮询,布防必须已经就位。目标值 = 当前 changeCount + 1;计数错位时由 marker 兜底。
+/// Arm the paste-and-delete suppression: MUST be called BEFORE the write-back -- if the
+/// pasteboard-change notification re-enters the poll synchronously, the suppression has
+/// to be in place already. The target is the current changeCount + 1; the paste marker is
+/// the fallback when notification delivery observes a different count.
+pub(super) fn arm_paste_delete_suppression() {
+    let mut suppression = PASTE_DELETE_SUPPRESS_CC.lock().unwrap();
+    let cc: i64 = unsafe {
+        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        if pb.is_null() {
+            *suppression = None;
+            return;
+        }
+        msg_send![pb, changeCount]
+    };
+    *suppression = Some(cc + 1);
+}
+
+/// 撤防(写回失败、未发生写回时调用,避免抑制误吞下一次真实复制)。
+/// Disarm (call when the write-back failed or never happened, so the suppression cannot
+/// swallow the next genuine copy).
+pub(super) fn disarm_paste_delete_suppression() {
+    *PASTE_DELETE_SUPPRESS_CC.lock().unwrap() = None;
+}
+
+/// 抑制判定(纯函数,便于单测):精确命中计数或仍带自家 marker 都算我们的写回。
+/// Suppression verdict (pure, unit-tested): an exact count hit or our marker still being
+/// present identifies our own write-back.
+fn paste_delete_suppression_hit(stored: Option<i64>, cc: i64, marker_present: bool) -> bool {
+    stored == Some(cc) || (stored.is_some() && marker_present)
+}
+
 /// 轮询 timer(主线程)/ the polling timer (main thread).
 static POLL_TIMER: OnceLock<MainThreadSlot<ObjPtr>> = OnceLock::new();
 
@@ -775,6 +822,12 @@ unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(clearSystemPasteboardIfOwned:),
+                clear_system_pasteboard_if_owned as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(scrollIndicatorBoundsChanged:),
                 scroll_indicator_bounds_changed as *mut c_void,
                 types.as_ptr(),
@@ -888,6 +941,64 @@ unsafe fn observer() -> *mut AnyObject {
 /// Pasteboard-change notification callback (any thread): record the current text immediately.
 extern "C" fn pasteboard_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
     poll_clipboard();
+}
+
+/// 延迟清空一次性粘贴写回的系统剪贴板;若期间 changeCount 或 marker 变化则放弃。
+/// Delayed cleanup for a one-shot paste write-back; abort if changeCount or our marker changed.
+extern "C" fn clear_system_pasteboard_if_owned(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
+    let Some(note) = (!note.is_null()).then_some(note as *mut AnyObject) else {
+        return;
+    };
+    let scheduled: i64 = unsafe { msg_send![note, longLongValue] };
+    // Each delayed selector carries its own changeCount. An older queued callback must not
+    // consume the token belonging to a newer one-shot paste.
+    // 每个延迟 selector 都携带自己的 changeCount；旧回调不能误消费较新单次粘贴的 token。
+    if *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() != Some(scheduled) {
+        log_debug!("[clip] system pasteboard clear skipped: stale task");
+        return;
+    }
+    if !clear_system_pasteboard_after_paste() {
+        *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
+        log_debug!("[clip] system pasteboard clear skipped: setting disabled");
+        return;
+    }
+    unsafe {
+        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        let current: i64 = if pb.is_null() {
+            -1
+        } else {
+            msg_send![pb, changeCount]
+        };
+        let marker_present = !pb.is_null() && pasteboard_has_paste_marker();
+        if pb.is_null() || !marker_present || current != scheduled {
+            *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
+            log_debug!("[clip] system pasteboard clear skipped: ownership changed");
+            return;
+        }
+        let _: isize = msg_send![pb, clearContents];
+    }
+    *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
+    log_debug!("[clip] system pasteboard cleared after one-shot paste");
+}
+
+/// 在主线程安排延迟清空,并记录写回后的 changeCount 作为所有权凭据。
+/// Schedule delayed cleanup on the main thread and record the post-write changeCount as the
+/// ownership proof.
+unsafe fn schedule_system_pasteboard_clear() {
+    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pb.is_null() {
+        return;
+    }
+    let cc: i64 = msg_send![pb, changeCount];
+    *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = Some(cc);
+    let target = observer();
+    let token: *mut AnyObject = msg_send![class!(NSNumber), numberWithLongLong: cc];
+    let _: () = msg_send![
+        target,
+        performSelector: sel!(clearSystemPasteboardIfOwned:),
+        withObject: token,
+        afterDelay: SYSTEM_PASTEBOARD_CLEAR_DELAY
+    ];
 }
 
 /// 浮窗失去 key 通知回调(主线程):点击外部等场景自动隐藏。
@@ -5199,12 +5310,42 @@ extern "C" fn row_button_mouse_exited(_self: *mut c_void, _cmd: Sel, event: *mut
     }
 }
 
-/// 行点击(按钮 tag = 行索引)→ 粘贴该行。
-/// Row click (button tag = row index) -> paste that row.
+/// 行点击(按钮 tag = 行索引)→ 粘贴该行;Option+点击(设置开启)= 粘贴并删除。
+/// 修饰键从 currentEvent 读:action 在 mouseUp 时触发,currentEvent 就是这一次点击
+/// (与 keyboard 路径的 Option+Enter 等价;开关关闭时 Option 被忽略,普通粘贴)。
+/// Row click (button tag = row index) -> paste that row; Option+click (when the setting
+/// is on) = paste and delete. The modifiers come from currentEvent: the action fires on
+/// mouseUp, so currentEvent IS this click (equivalent to Option+Enter on the keyboard
+/// path; with the toggle off Option is ignored and the normal paste runs).
 extern "C" fn handle_clipboard_row_click(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
     if idx >= 0 {
-        paste_at(idx as usize);
+        // NSEventModifierFlagOption = 1 << 19(Alternate)= 0x08_0000。currentEvent 是
+        // NSApplication 的**实例**方法,必须先取 sharedApplication——直接发给 Class
+        // 对象会抛 unrecognized selector,异常炸穿 AppKit 事件循环,把浮窗卡死。
+        // NSEventModifierFlagOption (Alternate) = 1 << 19 = 0x08_0000. currentEvent is an
+        // INSTANCE method on NSApplication: go through sharedApplication first. Sending it
+        // to the Class object raises an unrecognized-selector exception that unwinds
+        // through AppKit's event loop and wedges the picker.
+        let option_held = unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let ev: *mut AnyObject = if nsapp.is_null() {
+                std::ptr::null_mut()
+            } else {
+                msg_send![nsapp, currentEvent]
+            };
+            if ev.is_null() {
+                false
+            } else {
+                let flags: u64 = msg_send![ev, modifierFlags];
+                (flags & 0x0008_0000) != 0
+            }
+        };
+        if option_held {
+            paste_at_ex(idx as usize, true);
+        } else {
+            paste_at(idx as usize);
+        }
     }
 }
 
@@ -5350,6 +5491,15 @@ extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void
 /// Paste the entry at display `idx` (mapped through FILTERED): close the picker + write back
 /// to the pasteboard + synthesize Cmd+V.
 fn paste_at(idx: usize) {
+    paste_at_ex(idx, false);
+}
+
+/// paste_at 的焚后变体:粘贴成功后立即从历史中删除该条目(Option+回车/点击,
+/// 一次性粘贴)。删除走 delete_entry(图片缓存文件一并清理),置顶条目同样可焚。
+/// The burn-after-paste variant of paste_at: on a successful paste the entry is removed
+/// from the history right away (Option+Enter/click, one-shot paste). Removal goes through
+/// delete_entry (the image cache file goes too); pinned entries burn all the same.
+fn paste_at_ex(idx: usize, delete_after: bool) {
     let Some(h_idx) = mapped_index(idx) else {
         log_debug!("[clip] paste index {} out of range", idx);
         hide_picker();
@@ -5364,6 +5514,16 @@ fn paste_at(idx: usize) {
         hide_picker();
         return;
     };
+    // 实际生效 = 手势 ∧ 设置:开关关闭时 Option 只是普通粘贴(修饰键被忽略)。
+    // Effective = gesture AND setting: with the toggle off, Option falls back to a plain
+    // paste (the modifier is ignored).
+    let burn = delete_after && delete_after_paste();
+    if burn {
+        // 布防必须在写回之前(同步通知重入场景,见布防函数注释)。
+        // Arm BEFORE the write-back (the synchronous-notification re-entry case; see the
+        // arming function's comment).
+        arm_paste_delete_suppression();
+    }
     hide_picker();
     unsafe {
         if let Some(img) = &entry.image {
@@ -5374,10 +5534,7 @@ fn paste_at(idx: usize) {
             // is deleted/moved, skip the paste (a file entry stores no bytes to fall back
             // to).
             let ok = match paste_kind(img) {
-                PasteKind::File(path) => {
-                    write_pasteboard_file(&path);
-                    true
-                }
+                PasteKind::File(path) => write_pasteboard_file(&path),
                 PasteKind::Image if img.source_path.is_some() => {
                     log_info!("[clip] paste skipped: source file gone (uti={})", img.uti);
                     false
@@ -5388,16 +5545,95 @@ fn paste_at(idx: usize) {
             // On a failed write-back (e.g. cache miss) skip the synthesized Cmd+V, so the
             // OLD pasteboard content is not pasted.
             if ok {
-                synthesize_paste();
+                let pasted = synthesize_paste();
+                if burn && pasted {
+                    delete_burned_entry(&entry);
+                    if clear_system_pasteboard_after_paste() {
+                        schedule_system_pasteboard_clear();
+                    }
+                } else if burn {
+                    log_info!("[clip] paste-and-delete skipped: Cmd+V event creation failed");
+                    disarm_paste_delete_suppression();
+                }
+            } else {
+                // 写回失败 = 没发生写回,撤防抑制,条目保留(不能"没粘上还丢了记录")。
+                // A failed write-back means nothing was written: disarm so the suppression
+                // cannot swallow the next genuine copy, and keep the entry (never lose the
+                // record without a paste).
+                if burn {
+                    disarm_paste_delete_suppression();
+                }
             }
         } else {
             // 粘贴回写:打 marker(轮询跳过,防止粘贴被当成新复制移动条目)。
             // Paste write-back: stamp the marker (the poll skips it, so a paste is never
             // re-captured as a fresh copy that reorders the history).
-            write_pasteboard_text(&entry.text, true);
-            synthesize_paste();
+            let ok = write_pasteboard_text(&entry.text, true);
+            if ok {
+                let pasted = synthesize_paste();
+                if burn && pasted {
+                    delete_burned_entry(&entry);
+                    if clear_system_pasteboard_after_paste() {
+                        schedule_system_pasteboard_clear();
+                    }
+                } else if burn {
+                    log_info!("[clip] paste-and-delete skipped: Cmd+V event creation failed");
+                    disarm_paste_delete_suppression();
+                }
+            } else if burn {
+                log_info!("[clip] paste-and-delete skipped: text write-back failed");
+                disarm_paste_delete_suppression();
+            }
         }
     }
+}
+
+/// 焚后粘贴的删除步骤:条目移出历史(图片缓存文件一并删除)并落盘;日志只记类型
+/// 与计数,不记条目内容。
+/// The removal step of burn-after-paste: drop the entry from the history (the image cache
+/// file goes too) and persist; logs record only the kind and count, never the content.
+fn same_clip_entry_identity(a: &ClipEntry, b: &ClipEntry) -> bool {
+    match (&a.image, &b.image) {
+        (None, None) => a.text == b.text,
+        (Some(ai), Some(bi)) => {
+            if ai.source_path.is_some() != bi.source_path.is_some() {
+                return false;
+            }
+            if ai.hash != 0 && bi.hash != 0 {
+                ai.hash == bi.hash
+            } else {
+                ai.source_path == bi.source_path
+            }
+        }
+        _ => false,
+    }
+}
+
+fn delete_burned_entry(target: &ClipEntry) {
+    let kind = {
+        let mut hist = CLIP_HISTORY.lock().unwrap();
+        let Some(h_idx) = hist
+            .iter()
+            .position(|entry| same_clip_entry_identity(entry, target))
+        else {
+            log_debug!("[clip] paste-and-delete: entry already gone");
+            return;
+        };
+        let kind = match hist.get(h_idx) {
+            Some(e) if e.image.is_some() => "image",
+            Some(_) => "text",
+            None => "gone",
+        };
+        if kind != "gone" {
+            delete_entry(&mut hist, h_idx);
+        }
+        kind
+    };
+    save_history();
+    log_info!(
+        "[clip] pasted and deleted (burn after paste, kind={})",
+        kind
+    );
 }
 
 /// 粘贴内容判定:文件复制条目且源文件仍存在 → 文件粘贴(恢复 file-url);
@@ -5427,17 +5663,20 @@ fn paste_kind(img: &ImageEntry) -> PasteKind {
 /// synthesized key event would be routed to the panel's app (us) and never reach the input
 /// field; once ordered out, the panel resigns key, the system key window returns to the
 /// previous app, and the synthesized Cmd+V lands in the user's input field.
-unsafe fn synthesize_paste() {
+unsafe fn synthesize_paste() -> bool {
     let down = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, true);
-    if !down.is_null() {
-        CGEventSetFlags(down, K_CG_EVENT_FLAG_MASK_COMMAND);
-        CGEventPost(K_CG_SESSION_EVENT_TAP, down);
-    }
+    let Some(down) = (!down.is_null()).then_some(down) else {
+        return false;
+    };
+    CGEventSetFlags(down, K_CG_EVENT_FLAG_MASK_COMMAND);
+    CGEventPost(K_CG_SESSION_EVENT_TAP, down);
     let up = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, false);
-    if !up.is_null() {
-        CGEventSetFlags(up, K_CG_EVENT_FLAG_MASK_COMMAND);
-        CGEventPost(K_CG_SESSION_EVENT_TAP, up);
-    }
+    let Some(up) = (!up.is_null()).then_some(up) else {
+        return false;
+    };
+    CGEventSetFlags(up, K_CG_EVENT_FLAG_MASK_COMMAND);
+    CGEventPost(K_CG_SESSION_EVENT_TAP, up);
+    true
 }
 
 /// 方向键导航纯逻辑:↑(126)/↓(125) 返回新的选中索引(循环);其它键返回 None。
@@ -5616,9 +5855,18 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 }
             }
             36 => {
-                // Enter
+                // Enter;Option+Enter(设置开启)= 粘贴并删除(一次性粘贴)。
+                // 修饰掩码沿用本函数顶部的 NSEventModifierFlags 位:Command=0x10_0000,
+                // Option(Alternate)=0x08_0000。
+                // Enter; Option+Enter (when the setting is on) = paste and delete (one-shot
+                // paste). Modifier bits follow NSEventModifierFlags as at the top of this
+                // function: Command=0x10_0000, Option (Alternate)=0x08_0000.
                 let idx = sel;
-                paste_at(idx);
+                if (mods & 0x0008_0000) != 0 {
+                    paste_at_ex(idx, true);
+                } else {
+                    paste_at(idx);
+                }
             }
             51 => {
                 // Backspace(删除键):删除选中条目并刷新。
@@ -7791,6 +8039,28 @@ mod tests {
         // (a genuine copy) -> record normally.
         assert!(should_skip_paste_writeback(false, true));
         assert!(!should_skip_paste_writeback(false, false));
+    }
+
+    #[test]
+    fn paste_delete_suppression_hits_the_armed_count_or_marker() {
+        use super::paste_delete_suppression_hit;
+        assert!(paste_delete_suppression_hit(Some(41), 41, false));
+        assert!(paste_delete_suppression_hit(Some(41), 42, true));
+        assert!(!paste_delete_suppression_hit(None, 41, true));
+        assert!(!paste_delete_suppression_hit(Some(41), 42, false));
+        assert!(!paste_delete_suppression_hit(Some(42), 41, false));
+    }
+
+    #[test]
+    fn paste_delete_identity_ignores_reorder_metadata() {
+        use super::same_clip_entry_identity;
+        let target = entry("secret");
+        let mut current = entry_with_source("secret", "Other App");
+        current.pinned = true;
+        current.copied_at = Some(123);
+        assert!(same_clip_entry_identity(&target, &current));
+        assert!(!same_clip_entry_identity(&target, &entry("different")));
+        assert!(!same_clip_entry_identity(&target, &entry_image(b"secret")));
     }
 
     #[test]

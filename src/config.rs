@@ -286,6 +286,16 @@ pub struct ClipboardSection {
     // front (a side effect: the write-back is re-captured by the poll as another copy).
     // When off, pasting does not reorder the history (like Windows Win+V). Default true.
     pub move_used_to_top: bool,
+    // 粘贴后删除:开启后,按住 Option 点按或回车 = 粘贴该条目并立即从历史中删除
+    // (一次性粘贴)。默认 false——销毁性手势,显式选择加入。
+    // Delete after paste: when on, Option+click or Option+Enter pastes the entry and
+    // removes it from the history right away (one-shot paste). Default false -- a
+    // destructive gesture, strictly opt-in.
+    pub delete_after_paste: bool,
+    // 粘贴后清空当前系统剪贴板:仅在 delete_after_paste 同时开启时生效。默认 false。
+    // Clear the current system pasteboard after pasting: effective only when
+    // delete_after_paste is also enabled. Default false.
+    pub clear_system_pasteboard_after_paste: bool,
     // 自动过期天数:非置顶条目超过 N 天自动从历史(内存与持久化)清除,置顶条目
     // 不参与过期。0 = 关闭。默认 3 天。
     // Auto-expire days: unpinned entries older than N days are removed from the history
@@ -311,6 +321,8 @@ impl Default for ClipboardSection {
             show_source_app: false,
             persist: false,
             move_used_to_top: true,
+            delete_after_paste: false,
+            clear_system_pasteboard_after_paste: false,
             auto_expire_days: 3,
             picker_position: "main".to_string(),
             pin_follow_selection: true,
@@ -1046,11 +1058,16 @@ impl Config {
         // clipboard (enabled 恒有效;max_entries 有校验)
         // clipboard (enabled always valid; max_entries is validated)
         self.clipboard.enabled = other.clipboard.enabled;
-        // show_source_app / persist / move_used_to_top 是布尔,恒有效。
-        // show_source_app / persist / move_used_to_top are bools, always valid.
+        // show_source_app / persist / move_used_to_top / delete_after_paste /
+        // clear_system_pasteboard_after_paste 是布尔,恒有效。
+        // show_source_app / persist / move_used_to_top / delete_after_paste /
+        // clear_system_pasteboard_after_paste are bools, always valid.
         self.clipboard.show_source_app = other.clipboard.show_source_app;
         self.clipboard.persist = other.clipboard.persist;
         self.clipboard.move_used_to_top = other.clipboard.move_used_to_top;
+        self.clipboard.delete_after_paste = other.clipboard.delete_after_paste;
+        self.clipboard.clear_system_pasteboard_after_paste =
+            other.clipboard.clear_system_pasteboard_after_paste;
         if !errs.iter().any(|e| e.starts_with("clipboard.max_entries")) {
             self.clipboard.max_entries = other.clipboard.max_entries;
         }
@@ -1960,6 +1977,8 @@ mod tests {
         other.clipboard.max_entries = 30;
         other.clipboard.persist = true;
         other.clipboard.move_used_to_top = false;
+        other.clipboard.delete_after_paste = true;
+        other.clipboard.clear_system_pasteboard_after_paste = true;
         other.clipboard.pin_follow_selection = false;
         other.layout.card_text_size = 16.0;
         let mut merged = Config::default();
@@ -1972,6 +1991,8 @@ mod tests {
         assert_eq!(merged.clipboard.max_entries, 30);
         assert!(merged.clipboard.persist);
         assert!(!merged.clipboard.move_used_to_top);
+        assert!(merged.clipboard.delete_after_paste);
+        assert!(merged.clipboard.clear_system_pasteboard_after_paste);
         assert!(!merged.clipboard.pin_follow_selection);
         assert_eq!(merged.layout.card_text_size, 16.0);
     }

@@ -202,6 +202,26 @@ pub(super) fn move_used_to_top() -> bool {
         .unwrap_or(true)
 }
 
+/// 是否开启"粘贴后删除"(从 CONFIG 实时读,设置保存后立即生效)。
+/// Whether "delete after paste" is on (read live from CONFIG; takes effect immediately
+/// after settings are saved).
+pub(super) fn delete_after_paste() -> bool {
+    CONFIG
+        .read()
+        .map(|c| c.clipboard.delete_after_paste)
+        .unwrap_or(false)
+}
+
+/// 是否在一次性粘贴后清空当前系统剪贴板(依赖 delete_after_paste)。
+/// Whether to clear the current system pasteboard after a one-shot paste (depends on
+/// delete_after_paste).
+pub(super) fn clear_system_pasteboard_after_paste() -> bool {
+    CONFIG
+        .read()
+        .map(|c| c.clipboard.delete_after_paste && c.clipboard.clear_system_pasteboard_after_paste)
+        .unwrap_or(false)
+}
+
 /// 是否应跳过本次 changeCount 变化:关闭"使用后移到最前"且剪贴板带自家粘贴标记
 /// (即本次变化是我们自己的写回,不是用户的新复制)。纯函数,便于单测。
 /// Whether this changeCount bump should be skipped: "move used to top" is off AND the
@@ -417,10 +437,10 @@ pub(super) unsafe fn file_copy_image(text: &str) -> Option<ImageEntry> {
 /// poll reads this same text, but record_text's dedup (same as the top entry) skips it.
 /// The own-paste marker is stamped too (so the poll can skip the change when "move used
 /// entries to top" is off).
-pub(super) unsafe fn write_pasteboard_text(text: &str, stamp_marker: bool) {
+pub(super) unsafe fn write_pasteboard_text(text: &str, stamp_marker: bool) -> bool {
     let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
     if pb.is_null() {
-        return;
+        return false;
     }
     // 标准写入流程:先 clearContents 声明所有权,再 setString——单独调用 setString
     // 在某些场景会返回 NO(实测曾失败,导致 Cmd+V 粘贴的是剪贴板旧内容)。
@@ -436,7 +456,7 @@ pub(super) unsafe fn write_pasteboard_text(text: &str, stamp_marker: bool) {
     // The paste write-back stamps the marker (the poll must not re-record the paste as a
     // fresh copy / reorder history); a USER-INITIATED selection copy does NOT stamp it --
     // it is a genuine copy that should enter the history normally.
-    if stamp_marker {
+    if ok && stamp_marker {
         stamp_paste_marker(pb);
     }
     // 日志只打元数据,不记录剪贴板内容(隐私:内容可能是密码/正文)。
@@ -449,6 +469,7 @@ pub(super) unsafe fn write_pasteboard_text(text: &str, stamp_marker: bool) {
     );
     CFRelease(type_ns as *const c_void);
     CFRelease(ns as *const c_void);
+    ok
 }
 
 /// 把图片按**原始格式**写回剪贴板(图片粘贴路径):先 clearContents 再 setData,
@@ -482,7 +503,9 @@ pub(super) unsafe fn write_pasteboard_image(entry: &ImageEntry) -> bool {
         length: data.len()
     ];
     let ok: bool = msg_send![pb, setData: data_obj, forType: type_ns];
-    stamp_paste_marker(pb);
+    if ok {
+        stamp_paste_marker(pb);
+    }
     log_debug!(
         "[clip] write back image ({} bytes, uti={}, setData ok={})",
         data.len(),
@@ -502,10 +525,10 @@ pub(super) unsafe fn write_pasteboard_image(entry: &ImageEntry) -> bool {
 /// into Finder duplicates the original file (GIF etc. untouched), pasting into a chat app
 /// attaches the file; instead of pasting image data as a bare image (which Finder ignores
 /// and some apps re-encode into PNG).
-pub(super) unsafe fn write_pasteboard_file(path: &str) {
+pub(super) unsafe fn write_pasteboard_file(path: &str) -> bool {
     let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
     if pb.is_null() {
-        return;
+        return false;
     }
     let _: isize = msg_send![pb, clearContents];
     // 文件名文本(与 Finder 复制文件时剪贴板上的字符串一致)。
@@ -513,7 +536,7 @@ pub(super) unsafe fn write_pasteboard_file(path: &str) {
     let name = path.rsplit('/').next().unwrap_or("");
     let name_ns = make_nsstring(name);
     let type_ns = make_nsstring(NSPASTEBOARD_TYPE_STRING);
-    let _: bool = msg_send![pb, setString: name_ns, forType: type_ns];
+    let name_ok: bool = msg_send![pb, setString: name_ns, forType: type_ns];
     CFRelease(type_ns as *const c_void);
     CFRelease(name_ns as *const c_void);
     // file:// URL(file-url + url 两种类型都写,兼容不同读取方)。
@@ -522,17 +545,30 @@ pub(super) unsafe fn write_pasteboard_file(path: &str) {
     let url: *mut AnyObject = msg_send![class!(NSURL), fileURLWithPath: path_ns];
     CFRelease(path_ns as *const c_void);
     if url.is_null() {
-        return;
+        return false;
     }
     let abs: *mut AnyObject = msg_send![url, absoluteString];
+    if abs.is_null() {
+        return false;
+    }
     let url_str = nsstring_to_rust(abs);
     let url_str_ns = make_nsstring(&url_str);
+    let mut urls_ok = true;
     for uti in [NSPASTEBOARD_TYPE_FILE_URL, NSPASTEBOARD_TYPE_URL] {
         let type_ns = make_nsstring(uti);
-        let _: bool = msg_send![pb, setString: url_str_ns, forType: type_ns];
+        let ok: bool = msg_send![pb, setString: url_str_ns, forType: type_ns];
+        urls_ok &= ok;
         CFRelease(type_ns as *const c_void);
     }
     CFRelease(url_str_ns as *const c_void);
-    stamp_paste_marker(pb);
-    log_debug!("[clip] write back file");
+    let ok = name_ok && urls_ok;
+    if ok {
+        stamp_paste_marker(pb);
+    }
+    log_debug!(
+        "[clip] write back file (name ok={}, urls ok={})",
+        name_ok,
+        urls_ok
+    );
+    ok
 }

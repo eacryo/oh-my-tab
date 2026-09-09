@@ -229,7 +229,9 @@ pub(super) struct SettingsUi {
     clipboard_enabled: *mut AnyObject, // NSSwitch: 启用剪贴板历史 / enable clipboard history
     clipboard_persist: *mut AnyObject, // NSSwitch: 保存剪贴板历史记录到磁盘 / persist clipboard history
     clipboard_move_used_to_top: *mut AnyObject, // NSSwitch: 使用后移到最前 / move used entries to top
-    clipboard_max_entries: *mut AnyObject,      // NSTextField: 历史最大条数 / max history entries
+    clipboard_delete_after_paste: *mut AnyObject, // NSSwitch: 粘贴后删除条目 / delete entry after paste
+    clipboard_clear_system_pasteboard_after_paste: *mut AnyObject, // NSSwitch: 粘贴后清空系统剪贴板 / clear system pasteboard after paste
+    clipboard_max_entries: *mut AnyObject, // NSTextField: 历史最大条数 / max history entries
     clipboard_auto_expire_days: *mut AnyObject, // NSTextField: 自动过期天数(0=关闭)/ auto-expire days (0 = off)
     clipboard_show_source_app: *mut AnyObject,  // NSSwitch: 显示来源应用 / show the source app
     clipboard_pin_follow: *mut AnyObject, // NSPopUpButton: 置顶后选中项位置 / selection after pin
@@ -995,6 +997,16 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.clipboard.move_used_to_top
     );
     changed!(
+        "clipboard.delete_after_paste",
+        old.clipboard.delete_after_paste,
+        new.clipboard.delete_after_paste
+    );
+    changed!(
+        "clipboard.clear_system_pasteboard_after_paste",
+        old.clipboard.clear_system_pasteboard_after_paste,
+        new.clipboard.clear_system_pasteboard_after_paste
+    );
+    changed!(
         "clipboard.auto_expire_days",
         old.clipboard.auto_expire_days,
         new.clipboard.auto_expire_days
@@ -1108,6 +1120,8 @@ enum ControlField {
     ClipboardPersist,
     ClipboardShowSourceApp,
     ClipboardMoveUsedToTop,
+    ClipboardDeleteAfterPaste,
+    ClipboardClearSystemPasteboardAfterPaste,
     ClipboardMaxEntries,
     ClipboardAutoExpireDays,
     ClipboardPinFollow,
@@ -1170,6 +1184,18 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                 m(
                     u.clipboard_move_used_to_top,
                     ControlField::ClipboardMoveUsedToTop,
+                )
+            })
+            .or_else(|| {
+                m(
+                    u.clipboard_delete_after_paste,
+                    ControlField::ClipboardDeleteAfterPaste,
+                )
+            })
+            .or_else(|| {
+                m(
+                    u.clipboard_clear_system_pasteboard_after_paste,
+                    ControlField::ClipboardClearSystemPasteboardAfterPaste,
                 )
             })
             .or_else(|| m(u.clipboard_max_entries, ControlField::ClipboardMaxEntries))
@@ -1281,6 +1307,17 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
             return;
         };
         apply_control_field(field);
+        if matches!(
+            field,
+            ControlField::ClipboardDeleteAfterPaste
+                | ControlField::ClipboardClearSystemPasteboardAfterPaste
+        ) {
+            with_settings_ui(|ui| {
+                if let Some(u) = ui.as_ref() {
+                    update_clipboard_controls_enabled(u);
+                }
+            });
+        }
     }
 }
 
@@ -1421,6 +1458,15 @@ fn apply_control_field(field: ControlField) {
                 ControlField::ClipboardMoveUsedToTop => {
                     let state: isize = msg_send![u.clipboard_move_used_to_top, state];
                     cfg.clipboard.move_used_to_top = state == 1;
+                }
+                ControlField::ClipboardDeleteAfterPaste => {
+                    let state: isize = msg_send![u.clipboard_delete_after_paste, state];
+                    cfg.clipboard.delete_after_paste = state == 1;
+                }
+                ControlField::ClipboardClearSystemPasteboardAfterPaste => {
+                    let state: isize =
+                        msg_send![u.clipboard_clear_system_pasteboard_after_paste, state];
+                    cfg.clipboard.clear_system_pasteboard_after_paste = state == 1;
                 }
                 ControlField::ClipboardMaxEntries | ControlField::ClipboardAutoExpireDays => {
                     // 数字文本框走 NSControlText 通知路径。
@@ -1844,11 +1890,20 @@ unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
         ui.clipboard_persist,
         ui.clipboard_show_source_app,
         ui.clipboard_move_used_to_top,
+        ui.clipboard_delete_after_paste,
         ui.clipboard_max_entries,
         ui.clipboard_auto_expire_days,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
+    let delete_tooltip = t("settings.tooltip_clipboard_delete_after_paste_disabled");
+    SettingsRow::set_enabled_when_all(
+        ui.clipboard_clear_system_pasteboard_after_paste,
+        &[
+            (ui.clipboard_enabled, tooltip.as_str()),
+            (ui.clipboard_delete_after_paste, delete_tooltip.as_str()),
+        ],
+    );
 }
 
 /// 根据窗口控制总开关状态,冻结其下方的八个快捷键开关。
@@ -2938,6 +2993,18 @@ fn load_settings_from(cfg: &Config) {
                 ui.clipboard_move_used_to_top,
                 setState: if cfg.clipboard.move_used_to_top { 1isize } else { 0isize }
             ];
+            let _: () = msg_send![
+                ui.clipboard_delete_after_paste,
+                setState: if cfg.clipboard.delete_after_paste { 1isize } else { 0isize }
+            ];
+            let _: () = msg_send![
+                ui.clipboard_clear_system_pasteboard_after_paste,
+                setState: if cfg.clipboard.clear_system_pasteboard_after_paste {
+                    1isize
+                } else {
+                    0isize
+                }
+            ];
             set_field(
                 ui.clipboard_max_entries,
                 cfg.clipboard.max_entries.to_string(),
@@ -3505,6 +3572,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             quick_actions_locate_pointer: std::ptr::null_mut(),
             clipboard_persist: std::ptr::null_mut(),
             clipboard_move_used_to_top: std::ptr::null_mut(),
+            clipboard_delete_after_paste: std::ptr::null_mut(),
+            clipboard_clear_system_pasteboard_after_paste: std::ptr::null_mut(),
             clipboard_max_entries: std::ptr::null_mut(),
             clipboard_auto_expire_days: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
@@ -4946,6 +5015,40 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
         bind_control(target, ui.clipboard_move_used_to_top);
+        cy = layout.next_row_cursor(cy, described_row_h);
+        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
+        // 粘贴后删除(Option+回车/点击 = 一次性粘贴)。默认关——销毁性手势,显式选择
+        // 加入。说明副标题已不再渲染(见 add_described_row 的 _subtitle),手势提示
+        // 直接并入标签;文本宽度沿用总开关 described 行的全宽,避免长标签截断。
+        // Delete after paste (Option+Enter/click = one-shot paste). Off by default -- a
+        // destructive gesture, strictly opt-in. Row subtitles are no longer rendered (see
+        // add_described_row's _subtitle), so the gesture hint lives in the label itself;
+        // the text width follows the master described row's full width so the long label
+        // never truncates.
+        ui.clipboard_delete_after_paste = SettingsRow::described(
+            clipboard_view,
+            label_x,
+            cy,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_clipboard_delete_after_paste"),
+            "",
+            SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
+        );
+        bind_control(target, ui.clipboard_delete_after_paste);
+        cy = layout.next_row_cursor(cy, described_row_h);
+        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
+        ui.clipboard_clear_system_pasteboard_after_paste = SettingsRow::described(
+            clipboard_view,
+            label_x + 18.0,
+            cy,
+            ctrl_x - label_x - 36.0,
+            described_row_h,
+            &t("settings.row_clipboard_clear_system_pasteboard_after_paste"),
+            &t("settings.desc_clipboard_clear_system_pasteboard_after_paste"),
+            SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
+        );
+        bind_control(target, ui.clipboard_clear_system_pasteboard_after_paste);
         cy = layout.next_row_cursor(cy, described_row_h);
         SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
         // 最大条数(数字输入)/ max entries (number input).
