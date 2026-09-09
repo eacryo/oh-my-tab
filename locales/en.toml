@@ -52,7 +52,7 @@ service_clipboard = "Clipboard History"
 service_window_control = "Window Control"
 service_quick_actions = "Quick Actions"
 reload_config = "Reload Config"
-clear_icon_cache = "Clear Icon Cache"
+clear_caches = "Clear Icon and Thumbnail Cache"
 quit = "Quit"
 
 [overlay]

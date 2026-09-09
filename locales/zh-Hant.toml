@@ -53,7 +53,7 @@ service_clipboard = "剪貼板歷史"
 service_window_control = "視窗控制"
 service_quick_actions = "快捷操作"
 reload_config = "重新載入設定"
-clear_icon_cache = "清空圖示快取"
+clear_caches = "清空圖示與縮圖快取"
 quit = "結束"
 
 [overlay]

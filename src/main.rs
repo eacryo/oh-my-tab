@@ -1613,8 +1613,8 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
-                sel!(handleClearIconCache:),
-                handle_clear_icon_cache as *mut c_void,
+                sel!(handleClearCaches:),
+                handle_clear_caches as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -1908,14 +1908,14 @@ fn setup_status_bar() {
         let _: () = msg_send![menu, addItem: reload_item];
 
         // Clear Icon Cache item
-        let clear_cache_title = make_nsstring(&t("menu.clear_icon_cache"));
+        let clear_cache_title = make_nsstring(&t("menu.clear_caches"));
         let clear_cache_key = make_nsstring("");
         let clear_cache_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
-        let clear_cache_item: *mut AnyObject = msg_send![clear_cache_item, initWithTitle: clear_cache_title, action: sel!(handleClearIconCache:), keyEquivalent: clear_cache_key];
+        let clear_cache_item: *mut AnyObject = msg_send![clear_cache_item, initWithTitle: clear_cache_title, action: sel!(handleClearCaches:), keyEquivalent: clear_cache_key];
         CFRelease(clear_cache_title as *const c_void);
         CFRelease(clear_cache_key as *const c_void);
         let _: () = msg_send![clear_cache_item, setTarget: menu_target];
-        set_menu_item_title(clear_cache_item, &t("menu.clear_icon_cache"));
+        set_menu_item_title(clear_cache_item, &t("menu.clear_caches"));
         let _: () = msg_send![menu, addItem: clear_cache_item];
 
         // Separator

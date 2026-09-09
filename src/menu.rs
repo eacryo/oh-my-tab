@@ -37,8 +37,8 @@ pub(crate) struct ServiceMenuState {
     pub(crate) items: [*mut AnyObject; 5],
 }
 
-// 固定标题的菜单项(settings / reload / clear_cache / quit)。locale 变更时由 refresh_menu_titles 批量重设标题。
-// Fixed-title menu items (settings / reload / clear_cache / quit); re-titled in bulk by refresh_menu_titles on locale change.
+// 固定标题的菜单项(settings / reload / clear_caches / quit)。locale 变更时由 refresh_menu_titles 批量重设标题。
+// Fixed-title menu items (settings / reload / clear_caches / quit); re-titled in bulk by refresh_menu_titles on locale change.
 pub(crate) struct FixedMenuItems {
     pub(crate) settings: *mut AnyObject,
     pub(crate) reload: *mut AnyObject,
@@ -392,7 +392,7 @@ pub(crate) fn refresh_menu_titles() {
             for (item, key) in [
                 (settings, "menu.settings"),
                 (reload, "menu.reload_config"),
-                (clear_cache, "menu.clear_icon_cache"),
+                (clear_cache, "menu.clear_caches"),
                 (quit, "menu.quit"),
             ] {
                 set_menu_item_title(item, &t(key));
@@ -504,18 +504,13 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
     }
 }
 
-/// 清空图标缓存:删除缓存目录里所有缓存文件({key}.png + {key}.meta),失效内存里的 icon_path,
-/// 并立即重新提取当前窗口的图标(浮窗可见时 rebuild_cards 会就地刷新卡片)。
+/// 清空图标与缩略图缓存:删除图标磁盘缓存并清掉窗口缩略图内存缓存,然后重新提取当前窗口图标。
+/// Clear icon and thumbnail caches: remove disk icons, clear in-memory window thumbnails, then
+/// re-extract icons for currently collected windows.
 ///
-/// Clear the icon cache: remove all cached files ({key}.png + {key}.meta) from the cache dir,
-/// invalidate in-memory icon_path, and re-extract icons for current windows immediately
-/// (rebuild_cards refreshes the cards in place if the overlay is visible).
-pub(crate) extern "C" fn handle_clear_icon_cache(
-    _self: *mut c_void,
-    _cmd: Sel,
-    _sender: *mut c_void,
-) {
+pub(crate) extern "C" fn handle_clear_caches(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     clear_icon_cache();
+    crate::thumbnail::clear_runtime_cache();
     // 内存里的 icon_path 仍指向已删除的文件,置 None 让卡片重新走提取流程。
     // in-memory icon_path still points at deleted files; reset to None so cards re-extract.
     with_tab_state(|state_opt| {
@@ -528,7 +523,7 @@ pub(crate) extern "C" fn handle_clear_icon_cache(
     // 立即重新提取当前窗口的图标(仅当前已收集的窗口,非全部运行中 App)。
     // Re-extract icons for currently-collected windows only (not all running apps).
     extract_uncached_icons();
-    log_info!("Icon cache cleared.");
+    log_info!("Icon and thumbnail caches cleared.");
 }
 
 #[cfg(test)]
