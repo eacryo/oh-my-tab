@@ -131,6 +131,10 @@ fn internal_dispatch(keycode: u16, flags: u32, down: bool) -> bool {
         FLAG_ALT
     };
     if keycode == 48 && flags == sw_mod {
+        log_debug!(
+            "[mouse] switcher key mapping internally dispatched: phase={}",
+            if down { "down" } else { "up" }
+        );
         if down {
             enqueue_global_event(GlobalEvent::CmdTabPressed);
         } else {

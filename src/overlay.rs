@@ -48,6 +48,8 @@ pub(crate) const KEY_DELETE: u16 = 51; // Backspace
 /// NSEventModifierFlagShift，与 CGEvent 的 Shift 位一致。
 /// NSEventModifierFlagShift; it shares the Shift bit with CGEvent flags.
 const NSEVENT_MODIFIER_FLAG_SHIFT: u64 = 0x0002_0000;
+const NSEVENT_MODIFIER_FLAG_OPTION: u64 = 0x0008_0000;
+const NSEVENT_MODIFIER_FLAG_COMMAND: u64 = 0x0010_0000;
 /// 卡片右上角关闭按钮的 tag(hover 显隐查找用;卡片 index 不存 tag)。
 /// The close-button tag on a card (used to find it for hover show/hide; the card
 /// index is NOT stored in the tag).
@@ -313,7 +315,8 @@ mod hover;
 use card_close::*;
 pub(crate) use card_close::{
     begin_close_window_at, card_close_in_progress, card_mouse_down, card_mouse_entered,
-    on_card_close_ax_result, on_card_close_finished, on_close_card, on_cmd_released,
+    on_card_close_ax_result, on_card_close_finished, on_close_card, on_cmd_release_diagnostic,
+    on_cmd_released,
 };
 use hover::*;
 pub(crate) use hover::{container_mouse_moved, on_deferred_scroll_hover};
@@ -2243,7 +2246,53 @@ extern "C" fn overlay_window_resigned(_self: *mut c_void, _cmd: Sel, _note: *mut
         _ => false,
     });
     if should_hide {
-        log_debug!("[overlay] cancelled by click outside (window resigned key)");
+        // resign-key 不等于点击外部:系统面板、前台应用临时窗口或 AppKit 焦点重分配
+        // 都可能让 nonactivating panel 失去 key。记录足以区分这些场景的非敏感状态。
+        // Resigning key is not synonymous with an outside click: a system panel, a transient
+        // foreground-app window, or AppKit focus reassignment can all displace a nonactivating
+        // panel. Capture only the non-sensitive state needed to distinguish those cases.
+        unsafe {
+            let window = OVERLAY_WINDOW.lock().unwrap().map(|window| window.0);
+            let pointer_inside = window.is_some_and(|window| {
+                let frame: NSRect = msg_send![window, frame];
+                let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+                mouse.x >= frame.origin.x
+                    && mouse.x <= frame.origin.x + frame.size.width
+                    && mouse.y >= frame.origin.y
+                    && mouse.y <= frame.origin.y + frame.size.height
+            });
+            let pressed_mouse_buttons: usize = msg_send![class!(NSEvent), pressedMouseButtons];
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let app_active: bool = msg_send![nsapp, isActive];
+            let current_event: *mut AnyObject = msg_send![nsapp, currentEvent];
+            let current_event_type: Option<usize> = if current_event.is_null() {
+                None
+            } else {
+                Some(msg_send![current_event, type])
+            };
+            let own_key_window: *mut AnyObject = msg_send![nsapp, keyWindow];
+            let own_key = match window {
+                Some(window) if own_key_window == window => "overlay",
+                _ if own_key_window.is_null() => "none",
+                _ => "other",
+            };
+            let live_flags = event_tap::combined_session_flags();
+            let command_down = live_flags & NSEVENT_MODIFIER_FLAG_COMMAND != 0;
+            let option_down = live_flags & NSEVENT_MODIFIER_FLAG_OPTION != 0;
+            let (frontmost_app, frontmost_pid) = frontmost_app_info();
+            log_debug!(
+                "[overlay] cancelled after key loss: pointer_inside={} mouse_buttons=0x{:x} current_event_type={:?} command_down={} option_down={} app_active={} own_key={} frontmost_pid={} frontmost_app=\"{}\"",
+                pointer_inside,
+                pressed_mouse_buttons,
+                current_event_type,
+                command_down,
+                option_down,
+                app_active,
+                own_key,
+                frontmost_pid,
+                frontmost_app
+            );
+        }
         hide_overlay();
     }
 }

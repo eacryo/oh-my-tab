@@ -164,12 +164,28 @@ unsafe extern "C" fn event_tap_callback(
         }
         K_CG_EVENT_FLAGS_CHANGED => {
             let flags = crate::event_tap::CGEventGetFlags(event);
-            let mod_mask = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
+            let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
+            let mod_mask = if is_cmd {
                 K_CG_EVENT_FLAG_MASK_COMMAND
             } else {
                 K_CG_EVENT_FLAG_MASK_ALTERNATE
             };
             if (flags & mod_mask) == 0 && TAB_PRESSED.swap(false, Ordering::SeqCst) {
+                // 只记录修饰键类别,不记录普通按键。事件通过 session tap 后的稳定状态由
+                // on_cmd_release_diagnostic 延迟采样;这里立即读系统 flags 会得到变化前的旧值。
+                // Record only the modifier category, never ordinary keys. The stable state after
+                // the event clears the session tap is sampled later by on_cmd_release_diagnostic;
+                // reading system flags here would observe the pre-change value.
+                let modifier_keycode = crate::event_tap::CGEventGetIntegerValueField(
+                    event,
+                    K_CG_KEYBOARD_EVENT_KEYCODE,
+                ) as u16;
+                let changed_key = modifier_key_name(modifier_keycode);
+                log_debug!(
+                    "[kbd] switcher modifier release detected: shortcut={} changed_key={}",
+                    if is_cmd { "command" } else { "option" },
+                    changed_key
+                );
                 crate::enqueue_global_event(GlobalEvent::CmdReleased);
             }
         }
@@ -177,6 +193,21 @@ unsafe extern "C" fn event_tap_callback(
     }
 
     event
+}
+
+/// flagsChanged 只会携带修饰键;使用类别名而不是裸键码,既便于诊断也不扩大按键日志范围。
+/// flagsChanged carries modifier keys only; category names make diagnostics useful without
+/// widening keystroke logging to raw key codes.
+fn modifier_key_name(keycode: u16) -> &'static str {
+    match keycode {
+        54 | 55 => "command",
+        56 | 60 => "shift",
+        57 => "caps_lock",
+        58 | 61 => "option",
+        59 | 62 => "control",
+        63 => "function",
+        _ => "other_modifier",
+    }
 }
 
 pub fn start() -> std::thread::JoinHandle<()> {
@@ -236,5 +267,12 @@ mod tests {
     fn only_autorepeat_tab_events_are_ignored() {
         assert!(!should_ignore_tab_autorepeat(0));
         assert!(should_ignore_tab_autorepeat(1));
+    }
+
+    #[test]
+    fn modifier_key_names_do_not_expose_raw_keycodes() {
+        assert_eq!(modifier_key_name(54), "command");
+        assert_eq!(modifier_key_name(61), "option");
+        assert_eq!(modifier_key_name(999), "other_modifier");
     }
 }

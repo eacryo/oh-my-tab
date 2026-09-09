@@ -120,6 +120,10 @@ extern "C" {
     pub(crate) fn CGEventSetDoubleValueField(event: CGEventRef, field: i32, value: f64);
     pub(crate) fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
     pub(crate) fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
+    // 查询组合会话当前的真实修饰键状态,用于诊断事件自身 flags 与系统状态是否不一致。
+    // Query the combined session's current modifier state so diagnostics can compare an
+    // event's flags with the system-wide state.
+    pub(crate) fn CGEventSourceFlagsState(state_id: i32) -> CGEventFlags;
     // 修改事件的类型(如把键盘事件改成 flagsChanged,用于合成修饰键状态变化)。
     // 当前无调用方(按键合成不再发 flagsChanged);保留供未来合成修饰键状态用。
     // Change an event's type (e.g. turn a keyboard event into flagsChanged, for synthesizing
@@ -173,6 +177,13 @@ extern "C" {
     // depending on the mouseMoved stream (while a side button is held the system emits no
     // mouseMoved, freezing NSEvent.mouseLocation -- verified).
     pub(crate) fn CGEventCreate(source: *const c_void) -> CGEventRef;
+}
+
+/// kCGEventSourceStateCombinedSessionState。集中封装裸枚举值,避免诊断调用方重复硬编码。
+/// kCGEventSourceStateCombinedSessionState. Keep the raw enum value in one place rather than
+/// duplicating it across diagnostic callers.
+pub(crate) fn combined_session_flags() -> CGEventFlags {
+    unsafe { CGEventSourceFlagsState(0) }
 }
 
 /// CGPoint 的 Rust 表示(与 CoreGraphics 的 CGPoint 同布局)。

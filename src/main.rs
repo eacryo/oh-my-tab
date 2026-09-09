@@ -1313,6 +1313,12 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(handleCmdReleaseDiagnostic:),
+            on_cmd_release_diagnostic as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(closeCard:),
             on_close_card as *mut c_void,
             types_v_obj.as_ptr(),

@@ -515,6 +515,7 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
 }
 
 pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    schedule_cmd_release_diagnostic();
     if card_close_in_progress() {
         return;
     }
@@ -538,6 +539,46 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
     }
 
     commit_selected_window(true);
+}
+
+const CMD_RELEASE_DIAGNOSTIC_DELAY: f64 = 0.03;
+
+/// 释放事件离开 session tap 后延迟采样修饰键状态。只延迟日志,不延迟提交行为。
+/// Sample the modifier state after the release event has cleared the session tap. Only the
+/// diagnostic is delayed; committing the selected window remains immediate.
+fn schedule_cmd_release_diagnostic() {
+    unsafe {
+        let Some(controller) = *crate::CONTROLLER.lock().unwrap() else {
+            return;
+        };
+        let _: () = msg_send![
+            controller.0,
+            performSelector: sel!(handleCmdReleaseDiagnostic:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: CMD_RELEASE_DIAGNOSTIC_DELAY
+        ];
+    }
+}
+
+pub(crate) extern "C" fn on_cmd_release_diagnostic(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _arg: *mut c_void,
+) {
+    let is_cmd = crate::event_monitor::SHORTCUT_IS_CMD.load(Ordering::SeqCst);
+    let live_flags = event_tap::combined_session_flags();
+    let live_down = live_flags
+        & if is_cmd {
+            NSEVENT_MODIFIER_FLAG_COMMAND
+        } else {
+            NSEVENT_MODIFIER_FLAG_OPTION
+        }
+        != 0;
+    log_debug!(
+        "[overlay] post-release modifier state: shortcut={} down={} delay_ms=30",
+        if is_cmd { "command" } else { "option" },
+        live_down
+    );
 }
 
 pub(super) fn commit_selected_window(overlay_was_visible: bool) {

@@ -179,10 +179,15 @@ unsafe fn mouse_event_tap_callback_inner(
                         // commits -- same semantics as holding Cmd+Tab (selection while
                         // held, commit on release).
                         if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN {
+                            log_debug!(
+                                "[mouse] switcher source event: button={} phase=down",
+                                button
+                            );
                             crate::enqueue_global_event(
                                 crate::event_monitor::GlobalEvent::CmdTabPressed,
                             );
                         } else if event_type == K_CG_EVENT_OTHER_MOUSE_UP {
+                            log_debug!("[mouse] switcher source event: button={} phase=up", button);
                             crate::enqueue_global_event(
                                 crate::event_monitor::GlobalEvent::CmdReleased,
                             );
