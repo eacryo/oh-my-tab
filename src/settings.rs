@@ -2143,6 +2143,41 @@ pub(crate) fn refresh_service_controls_from_config() {
     }
 }
 
+/// Refresh the switcher controls when an external surface changes them.
+///
+/// This intentionally updates the existing controls in place instead of rebuilding the settings
+/// window. That preserves unsaved text edits and, like the appearance refresh path, never brings
+/// a hidden settings window to the foreground.
+///
+/// 当其他界面修改切换器设置时刷新设置页控件。
+///
+/// 这里刻意只原位更新现有控件,不重建设置窗口:这样不会丢失尚未提交的文本编辑,也不会像
+/// 打开设置那样把隐藏的设置窗口带到前台。
+pub(crate) fn refresh_switcher_controls_from_config() {
+    let cfg = CONFIG.read().unwrap().clone();
+    unsafe {
+        with_settings_ui(|ui| {
+            let Some(u) = ui.as_ref() else {
+                return;
+            };
+            let visible: bool = msg_send![u.window, isVisible];
+            if !visible {
+                return;
+            }
+
+            let modifier_idx: isize = if cfg.keyboard.modifier == "command" {
+                1
+            } else {
+                0
+            };
+            let _: () = msg_send![u.modifier, selectItemAtIndex: modifier_idx];
+
+            let thumbnail_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };
+            let _: () = msg_send![u.thumbnails_enabled, selectItemAtIndex: thumbnail_idx];
+        });
+    }
+}
+
 /// 设备下拉框的项与 DeviceKey 的映射(与 popup items 一一对应),供 handle_device_changed
 /// 按 indexOfSelectedItem 反查。每次 rebuild_device_popup 重建。
 /// 只有具体设备项,无"所有鼠标"通配项。

@@ -100,6 +100,13 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         }
     }
 
+    if flags.modifier || flags.thumbnails {
+        // 菜单或设置页修改后,原位同步已打开的设置窗口,不激活应用也不重建窗口。
+        // Keep an already-open settings window in sync in place, without activating the app or
+        // rebuilding the window.
+        crate::settings::refresh_switcher_controls_from_config();
+    }
+
     if flags.mouse {
         crate::mouse::resolve::invalidate_cache();
         crate::mouse::pointer::apply();
