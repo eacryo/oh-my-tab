@@ -71,7 +71,7 @@ use crate::ffi::{
     MainThreadSlot, ObjPtr, ObjcSuper, StaticClass, Tm,
 };
 use crate::hash::fnv1a64;
-use crate::i18n::{t, tf};
+use crate::i18n::{t, t_count, tf};
 use crate::theme::resolved_is_dark;
 use crate::{log_debug, log_info};
 use objc2::runtime::{AnyClass, AnyObject, Sel};
@@ -3036,10 +3036,10 @@ unsafe fn add_detail_chrome(
     release_obj(source);
 
     if entry.image.is_none() {
-        let line_count = entry.text.split('\n').count().max(1).to_string();
-        let char_count = entry.text.chars().count().to_string();
-        let lines = tf("clipboard.detail_lines", &[("count", &line_count)]);
-        let chars = tf("clipboard.detail_chars", &[("count", &char_count)]);
+        let line_count = entry.text.split('\n').count().max(1);
+        let char_count = entry.text.chars().count();
+        let lines = t_count("clipboard.detail_lines", line_count);
+        let chars = t_count("clipboard.detail_chars", char_count);
         let stats_text = format!("{lines}  ·  {chars}");
         let stats_ns = make_nsstring(&stats_text);
         let stats: *mut AnyObject = msg_send![
@@ -6960,7 +6960,7 @@ fn refresh_footer_count(total: usize) {
             Some(l) => l.0,
             None => return,
         };
-        let text = tf("clipboard.footer_count", &[("count", &total.to_string())]);
+        let text = t_count("clipboard.footer_count", total);
         let ns = make_nsstring(&text);
         let _: () = msg_send![label, setStringValue: ns];
         CFRelease(ns as *const c_void);

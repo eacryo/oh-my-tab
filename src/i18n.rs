@@ -199,6 +199,18 @@ pub fn tf(key: &str, args: &[(&str, &str)]) -> String {
     s
 }
 
+/// 带数量的查表:count == 1 用 "{key}_one",否则用 "{key}_other",并插入 {count}。
+/// 英文单复数为区分形式,中文等其他语言两份值相同也在 locale 文件里各写一条,
+/// 这样 `all_locales_share_identical_key_sets` 的 key 一致性检查仍能覆盖它们。
+///
+/// Count-aware lookup: count == 1 selects "{key}_one", otherwise "{key}_other", and
+/// interpolates {count}. Languages without a plural distinction (e.g. Chinese) still declare
+/// both keys with the same value so the locale key-parity test keeps covering them.
+pub fn t_count(key: &str, count: usize) -> String {
+    let suffix = if count == 1 { "_one" } else { "_other" };
+    tf(&format!("{key}{suffix}"), &[("count", &count.to_string())])
+}
+
 /// 应用 config 里的 locale 配置(由 config.rs 在 CONFIG 初始化与 reload 后调用)。
 /// locale_cfg 为 "auto" 表示跟随系统语言;其它值须在支持列表内,否则回退 auto。
 ///
@@ -421,6 +433,45 @@ number = 42
         // A missing argument leaves the placeholder untouched.
         let s2 = tf("settings.version_label", &[]);
         assert!(s2.contains('{'));
+    }
+
+    #[test]
+    fn count_keys_exist_with_distinct_singular_and_plural_forms() {
+        // 单复数必须是两条不同的英文文案,否则 "1 items" 这类错误会悄悄回归。
+        // Singular and plural must be distinct English strings, otherwise a "1 items"
+        // regression would slip through unnoticed.
+        for key in [
+            "clipboard.footer_count",
+            "clipboard.detail_lines",
+            "clipboard.detail_chars",
+        ] {
+            let one = EN_MESSAGES
+                .get(&format!("{key}_one"))
+                .unwrap_or_else(|| panic!("missing {key}_one"));
+            let other = EN_MESSAGES
+                .get(&format!("{key}_other"))
+                .unwrap_or_else(|| panic!("missing {key}_other"));
+            assert_ne!(one, other, "{key} needs distinct singular/plural forms");
+            assert_eq!(
+                placeholders(one),
+                placeholders(other),
+                "{key} placeholder drift"
+            );
+        }
+    }
+
+    #[test]
+    fn t_count_interpolates_the_count_placeholder() {
+        // 不依赖当前 locale:两种形式都必须把 {count} 替换掉(中文两份值相同也成立)。
+        // Locale-independent: both forms must resolve {count} (true even where they are equal).
+        for count in [0usize, 1, 2] {
+            let s = t_count("clipboard.detail_lines", count);
+            assert!(!s.contains('{'), "unresolved placeholder for {count}: {s}");
+            assert!(
+                s.contains(&count.to_string()),
+                "missing count for {count}: {s}"
+            );
+        }
     }
 
     #[test]
