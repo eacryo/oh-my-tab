@@ -8,7 +8,7 @@
 //! read-only sampling: no AppKit, all locks held only momentarily.
 
 use crate::clipboard;
-use crate::ffi::{task_vm_info, TaskVmInfo};
+use crate::ffi::{bundle_info_string, task_vm_info, TaskVmInfo};
 use crate::thumbnail;
 use crate::{log_debug, log_info, CONFIG, WINDOW_COUNT};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -148,9 +148,51 @@ fn sample_once(started_at: Instant) {
     let peak = track_peak(&vm);
     let ledger = read_ledgers();
     let profile = runtime_profile();
+    let build = unsafe { bundle_info_string("CFBundleVersion") };
     log_info!(
-        "[mem] uptime={} phase=steady profile={} footprint={} rss={} footprint_peak_sampled={} rss_peak_kernel={} anon={} compressed={} threads={} | thumbs={{items={},ledger={}}} clipboard={{entries={},ledger={},text={},preview={},meta={}}} windows={{count={}}}",
+        "[mem] pid={} build={} uptime={} phase=steady profile={} footprint={} rss={} footprint_peak_sampled={} rss_peak_kernel={} anon={} compressed={} threads={} | thumbs={{items={},ledger={}}} clipboard={{entries={},ledger={},text={},preview={},meta={}}} windows={{count={}}}",
+        std::process::id(),
+        build,
         fmt_uptime(started_at.elapsed()),
+        profile,
+        fmt_bytes(vm.phys_footprint),
+        fmt_bytes(vm.resident_size),
+        fmt_bytes(peak),
+        fmt_bytes(vm.resident_size_peak),
+        fmt_bytes(vm.internal),
+        fmt_bytes(vm.compressed),
+        thread_count(),
+        ledger.thumbs_items,
+        fmt_bytes(ledger.thumbs_bytes),
+        ledger.clip_entries,
+        fmt_bytes(ledger.clip_bytes),
+        fmt_bytes(ledger.clip_text_bytes),
+        fmt_bytes(ledger.clip_preview_bytes),
+        fmt_bytes(ledger.clip_metadata_bytes),
+        ledger.windows,
+    );
+}
+
+/// 事件型内存快照:只在缩略图批次/缓存清理边界调用,避免提高常规采样频率。
+/// Event memory snapshot: called only at thumbnail-batch/cache-clear boundaries so the
+/// normal sampler frequency stays unchanged.
+pub(crate) fn log_debug_snapshot(context: &str) {
+    let Some(vm) = task_vm_info() else {
+        log_debug!(
+            "[mem] event={} snapshot skipped: task_vm_info unavailable",
+            context
+        );
+        return;
+    };
+    let peak = track_peak(&vm);
+    let ledger = read_ledgers();
+    let profile = runtime_profile();
+    let build = unsafe { bundle_info_string("CFBundleVersion") };
+    log_debug!(
+        "[mem] pid={} build={} event={} profile={} footprint={} rss={} footprint_peak_sampled={} rss_peak_kernel={} anon={} compressed={} threads={} | thumbs={{items={},ledger={}}} clipboard={{entries={},ledger={},text={},preview={},meta={}}} windows={{count={}}}",
+        std::process::id(),
+        build,
+        context,
         profile,
         fmt_bytes(vm.phys_footprint),
         fmt_bytes(vm.resident_size),

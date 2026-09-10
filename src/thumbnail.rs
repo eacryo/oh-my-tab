@@ -442,10 +442,23 @@ pub(crate) fn cache_stats() -> (usize, u64) {
     (cache.len(), cache.total_cost())
 }
 
+/// 捕获管线的轻量状态:待处理、进行中和主线程待交付的 key 数量。
+/// Lightweight capture-pipeline state: queued, in-flight, and keys awaiting main-thread delivery.
+fn capture_pipeline_stats() -> (usize, usize, usize) {
+    let (pending, in_flight) = {
+        let state = CAPTURE_STATE.lock().unwrap();
+        let in_flight = state.desired.values().filter(|job| job.running).count();
+        (state.desired.len().saturating_sub(in_flight), in_flight)
+    };
+    let ready = READY_QUEUE.lock().unwrap().len();
+    (pending, in_flight, ready)
+}
+
 /// 关闭缩略图模式时清掉进程内所有窗口截图,并使排队/进行中的捕获失效。
 /// The thumbnail service stays resident for a cheap re-enable, but disabling the mode
 /// releases all cached window images and invalidates queued/in-flight captures.
 pub(crate) fn clear_runtime_cache() {
+    crate::mem::log_debug_snapshot("thumb-cache-clear-before");
     // 与 app_terminated 使用相同的锁序:先失效任务,再清缓存。这样正在捕获的迟到结果
     // 在写入缓存前会发现 token 已失效,不会在关闭后把截图重新塞回来。
     // Keep the same lock order as app_terminated: invalidate jobs, then clear the cache. An
@@ -467,10 +480,18 @@ pub(crate) fn clear_runtime_cache() {
     READY_QUEUE.lock().unwrap().clear();
     READY_DELIVERY_SCHEDULED.store(false, Ordering::Release);
     PENDING_BLANK_RETRIES.lock().unwrap().clear();
+    let (cache_items, cache_bytes) = cache_stats();
+    let (pending, in_flight, ready) = capture_pipeline_stats();
     log_debug!(
-        "[thumb] runtime cache cleared: frames_released={}",
-        released
+        "[thumb] runtime cache cleared: frames_released={} cache_items={} cache_bytes={} pending={} in_flight={} ready={}",
+        released,
+        cache_items,
+        cache_bytes,
+        pending,
+        in_flight,
+        ready,
     );
+    crate::mem::log_debug_snapshot("thumb-cache-clear-after");
 }
 
 /// 取缩略图(+1 返回,调用方用完必须 CFRelease;缓存自己的引用不受影响)。
@@ -872,6 +893,7 @@ static JOB_TX: OnceLock<flume::Sender<()>> = OnceLock::new();
 static THUMB_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static THUMB_DEFERRED: AtomicU64 = AtomicU64::new(0);
 static THUMB_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static THUMB_CAPTURE_FAILED: AtomicU64 = AtomicU64::new(0);
 static THUMB_QUEUE_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
 static THUMB_QUEUE_MAX_MS: AtomicU64 = AtomicU64::new(0);
 static THUMB_CAPTURE_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
@@ -1008,6 +1030,10 @@ fn record_thumb_capture(capture_ms: u64) {
     update_max(&THUMB_CAPTURE_MAX_MS, capture_ms);
 }
 
+fn record_thumb_capture_failed() {
+    THUMB_CAPTURE_FAILED.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn log_capture_metrics(context: &str) {
     let enqueued = THUMB_ENQUEUED.load(Ordering::Relaxed);
     let completed = THUMB_COMPLETED.load(Ordering::Relaxed);
@@ -1016,10 +1042,11 @@ pub(crate) fn log_capture_metrics(context: &str) {
     let avg_queue_ms = queue_total.checked_div(completed.max(1)).unwrap_or(0);
     let avg_capture_ms = capture_total.checked_div(completed.max(1)).unwrap_or(0);
     log_debug!(
-        "[perf] thumbnail metrics context={} enqueued={} completed={} deferred={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
+        "[perf] thumbnail metrics context={} enqueued={} completed={} failed={} deferred={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
         context,
         enqueued,
         completed,
+        THUMB_CAPTURE_FAILED.load(Ordering::Relaxed),
         THUMB_DEFERRED.load(Ordering::Relaxed),
         avg_queue_ms,
         THUMB_QUEUE_MAX_MS.load(Ordering::Relaxed),
@@ -1135,6 +1162,8 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                 log_debug!("[thumb] capture worker online");
                 for () in rx.iter() {
                     let interaction_active = crate::performance::switcher_interaction_active();
+                    let drain_started = Instant::now();
+                    let mut drained_jobs = 0usize;
                     // 一个 wake 令牌只负责启动一次 drain;bounded channel 会合并后续
                     // wake,因此必须在同一轮持续消费 CaptureState,否则启动预热只会处理
                     // 前一两项,其余任务虽仍在 desired 中却再也收不到令牌。
@@ -1175,6 +1204,23 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                         record_thumb_queue_wait(queue_ms);
                         run_capture_job(job);
                         let _ = CAPTURE_STATE.lock().unwrap().finish(job);
+                        drained_jobs += 1;
+                    }
+                    if drained_jobs > 0 {
+                        let (pending, in_flight, ready) = capture_pipeline_stats();
+                        let (cache_items, cache_bytes) = cache_stats();
+                        log_debug!(
+                            "[perf] thumbnail drain complete jobs={} elapsed_ms={} pending={} in_flight={} ready={} cache_items={} cache_bytes={}",
+                            drained_jobs,
+                            drain_started.elapsed().as_millis(),
+                            pending,
+                            in_flight,
+                            ready,
+                            cache_items,
+                            cache_bytes,
+                        );
+                        log_capture_metrics("drain");
+                        crate::mem::log_debug_snapshot("thumb-drain-complete");
                     }
                 }
             })
@@ -1232,6 +1278,7 @@ fn run_capture_job(job: CaptureJob) {
     }
     let job_started = Instant::now();
     let Some(captured) = (unsafe { capture_window(key.wid, job.target_px_h) }) else {
+        record_thumb_capture_failed();
         log_debug!("[thumb] capture failed pid={} wid={}", key.pid, key.wid);
         return;
     };
@@ -1963,6 +2010,19 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
         return;
     };
     let requested = jobs.len();
+    let (pending_before, in_flight_before, ready_before) = capture_pipeline_stats();
+    let (cache_items_before, cache_bytes_before) = cache_stats();
+    log_debug!(
+        "[perf] thumbnail summon start requested={} target_h={} cache_items={} cache_bytes={} pending={} in_flight={} ready={}",
+        requested,
+        required_px_h,
+        cache_items_before,
+        cache_bytes_before,
+        pending_before,
+        in_flight_before,
+        ready_before,
+    );
+    crate::mem::log_debug_snapshot("thumb-summon-before-enqueue");
     let mut enqueued = 0;
     for (pid, wid, priority) in jobs {
         enqueued += usize::from(enqueue_job(pid, wid, required_px_h, priority));
@@ -1979,6 +2039,7 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
         required_px_h
     );
     log_capture_metrics("summon");
+    crate::mem::log_debug_snapshot("thumb-summon-after-enqueue");
 }
 
 /// 主题切换后强制重拍当前窗口集合,不使用召唤期的 TTL/前台判断。
@@ -2040,6 +2101,19 @@ pub(crate) fn refresh_for_theme(required_px_h: u32) {
 
     let target_px_h = required_px_h.max(BASE_TARGET_PX_H);
     let requested = keys.len();
+    let (pending_before, in_flight_before, ready_before) = capture_pipeline_stats();
+    let (cache_items_before, cache_bytes_before) = cache_stats();
+    log_debug!(
+        "[perf] thumbnail theme start requested={} target_h={} cache_items={} cache_bytes={} pending={} in_flight={} ready={}",
+        requested,
+        target_px_h,
+        cache_items_before,
+        cache_bytes_before,
+        pending_before,
+        in_flight_before,
+        ready_before,
+    );
+    crate::mem::log_debug_snapshot("thumb-theme-before-enqueue");
     let mut enqueued = 0usize;
     for key in keys {
         let priority = if selected == Some(key) {
@@ -2068,6 +2142,7 @@ pub(crate) fn refresh_for_theme(required_px_h: u32) {
         target_px_h
     );
     log_capture_metrics("theme");
+    crate::mem::log_debug_snapshot("thumb-theme-after-enqueue");
 }
 
 /// 显示器配置变化(外接/内建切换、分辨率调整)后的强制重拍。
@@ -2127,6 +2202,19 @@ pub(crate) fn refresh_for_display_change(required_px_h: u32) {
 
     let target_px_h = required_px_h.max(BASE_TARGET_PX_H);
     let requested = keys.len();
+    let (pending_before, in_flight_before, ready_before) = capture_pipeline_stats();
+    let (cache_items_before, cache_bytes_before) = cache_stats();
+    log_debug!(
+        "[perf] thumbnail display-change start requested={} target_h={} cache_items={} cache_bytes={} pending={} in_flight={} ready={}",
+        requested,
+        target_px_h,
+        cache_items_before,
+        cache_bytes_before,
+        pending_before,
+        in_flight_before,
+        ready_before,
+    );
+    crate::mem::log_debug_snapshot("thumb-display-change-before-enqueue");
     let mut enqueued = 0usize;
     for key in keys {
         // Selected/Visible 优先级均不受切换交互门控约束,任务不会被推迟丢弃。
@@ -2145,6 +2233,8 @@ pub(crate) fn refresh_for_display_change(required_px_h: u32) {
         enqueued,
         target_px_h
     );
+    log_capture_metrics("display-change");
+    crate::mem::log_debug_snapshot("thumb-display-change-after-enqueue");
 }
 
 /// 激活补拍门控的纯逻辑(供单元测试;运行时走 activation_capture_is_valid_now)。
