@@ -78,6 +78,38 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
 /// summon time isn't auto-selected).
 pub(super) static HOVER_TICK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
+/// 将 CG 全局坐标转换为 AppKit 全局坐标。CG 的原点固定在主屏左上角，AppKit 的原点在
+/// 主屏左下角；副屏的位置和高度已经编码在全局 y 中，因此只能用主屏顶部作为翻转基准。
+/// Convert a global CG point to a global AppKit point. CG's origin is fixed at the primary
+/// display's top-left while AppKit's origin is at its bottom-left; secondary-display placement
+/// and height are already encoded in the global y coordinate, so the primary display's top is
+/// the only correct flip baseline.
+fn cg_to_appkit_point(point: NSPoint, primary_frame: NSRect) -> NSPoint {
+    NSPoint::new(
+        point.x,
+        primary_frame.origin.y + primary_frame.size.height - point.y,
+    )
+}
+
+/// 读取真正的主显示器 frame。不要使用 NSScreen.mainScreen，它会随 key window 跟随副屏。
+/// Read the actual primary display frame. Do not use NSScreen.mainScreen, which follows the key
+/// window and can move to a secondary display.
+unsafe fn primary_screen_frame() -> Option<NSRect> {
+    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    if screens.is_null() {
+        return None;
+    }
+    let count: usize = msg_send![screens, count];
+    if count == 0 {
+        return None;
+    }
+    let primary: *mut AnyObject = msg_send![screens, objectAtIndex: 0isize];
+    if primary.is_null() {
+        return None;
+    }
+    Some(msg_send![primary, frame])
+}
+
 /// hover 轮询定时器(主线程 runloop)。浮窗显示期间每 16ms 读一次 NSEvent.mouseLocation
 /// 命中卡片——不依赖任何事件投递(侧键按住期间移动事件是 OtherMouseDragged 且投递给
 /// 非浮窗目标,所有 tap/tracking 方案都收不到,实测;轮询直接查全局鼠标位置,与按钮
@@ -113,18 +145,17 @@ pub(super) unsafe extern "C" fn hover_tick_callback(
     let pos = event_tap::CGEventGetLocation(ev);
     CFRelease(ev as *const c_void);
     // CGEventGetLocation 是 CG 坐标系(主屏左上原点),浮窗 frame 是 AppKit 坐标系
-    // (主屏左下原点)——y 轴必须翻转,否则鼠标在上半屏时命中的是下半屏对称位置的
-    // 卡片(实测错位)。
-    // CGEventGetLocation uses the CG coordinate space (main-display top-left origin),
-    // while window frames use the AppKit space (main-display bottom-left origin) -- the
-    // y axis must be flipped, or the cursor in the upper half hits the mirrored card in
-    // the lower half (verified misalignment).
-    let main_h: f64 = {
-        let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-        let mf: NSRect = msg_send![main, frame];
-        mf.size.height
+    // (主屏左下原点)。必须使用 NSScreen.screens[0] 的顶部翻转 y，不能使用会随 key
+    // window 漂移的 NSScreen.mainScreen；否则切到副屏后两个 hover 来源会命中不同卡片。
+    // CGEventGetLocation uses the CG coordinate space (primary-display top-left origin),
+    // while window frames use AppKit's primary-display bottom-left origin. Flip y around the
+    // top of NSScreen.screens[0], never NSScreen.mainScreen (which follows the key window);
+    // otherwise the two hover sources hit different cards after switching to a secondary display.
+    let primary_frame = match primary_screen_frame() {
+        Some(frame) => frame,
+        None => return,
     };
-    let pos = NSPoint::new(pos.x, main_h - pos.y);
+    let pos = cg_to_appkit_point(NSPoint::new(pos.x, pos.y), primary_frame);
     let container = match *CONTAINER.lock().unwrap() {
         Some(c) => c.0,
         None => return,
@@ -233,6 +264,61 @@ pub(crate) extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _e
         );
         update_thumbnail_pointer_state(loc);
         handle_hover_at(loc);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cg_to_appkit_point;
+    use crate::{NSPoint, NSRect, NSSize};
+
+    fn assert_point_eq(actual: NSPoint, expected: NSPoint) {
+        assert!((actual.x - expected.x).abs() < f64::EPSILON);
+        assert!((actual.y - expected.y).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cg_to_appkit_flips_against_primary_display_top() {
+        let primary = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(2560.0, 1440.0));
+
+        assert_point_eq(
+            cg_to_appkit_point(NSPoint::new(100.0, 0.0), primary),
+            NSPoint::new(100.0, 1440.0),
+        );
+        assert_point_eq(
+            cg_to_appkit_point(NSPoint::new(100.0, 1440.0), primary),
+            NSPoint::new(100.0, 0.0),
+        );
+    }
+
+    #[test]
+    fn cg_to_appkit_preserves_horizontal_secondary_display_position() {
+        let primary = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0));
+
+        // 左侧显示器的全局 x 为负数；x 不能被镜像或额外偏移。
+        // A display to the left has a negative global x; x must not be mirrored or offset.
+        assert_point_eq(
+            cg_to_appkit_point(NSPoint::new(-1280.0, 300.0), primary),
+            NSPoint::new(-1280.0, 780.0),
+        );
+    }
+
+    #[test]
+    fn cg_to_appkit_handles_vertical_displays_with_different_heights() {
+        let primary = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(2560.0, 1440.0));
+
+        // 主屏上方 900 点显示器占 AppKit y=1440..2340，对应 Quartz y=-900..0；主屏下方
+        // 1200 点显示器占 AppKit y=-1200..0。
+        // A 900-point display above the primary occupies AppKit y=1440..2340, which is
+        // Quartz y=-900..0. A 1200-point display below occupies AppKit y=-1200..0.
+        assert_point_eq(
+            cg_to_appkit_point(NSPoint::new(500.0, -450.0), primary),
+            NSPoint::new(500.0, 1890.0),
+        );
+        assert_point_eq(
+            cg_to_appkit_point(NSPoint::new(500.0, 1800.0), primary),
+            NSPoint::new(500.0, -360.0),
+        );
     }
 }
 
