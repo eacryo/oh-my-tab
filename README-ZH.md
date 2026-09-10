@@ -120,7 +120,7 @@ oh-my-tab 是一个 macOS 窗口切换器,补充系统 Cmd+Tab 的使用体验:�
 > ```
 
 `bundle.sh` 组装 `dist/Oh-My-Tab.app`(release 二进制、`Info.plist` 和应用图标资源)、做签名,再打成 `dist/Oh-My-Tab.dmg`(含 `Applications` 软链,拖拽安装)。两个产物都在 `dist/`(已 gitignore),放在 `target/` 之外,这样 logger 把它识别为生产态(写文件日志,而非 stdout)。运行 `.app` 是开机自启(SMAppService)和文件日志的前提;`.dmg` 用于分发。代码改动后需要重新跑该脚本(bundle 在构建时拷贝 release 二进制);脚本会自定位仓库根,可从任意目录运行。
-`bundle.sh` 现在同时生成 `dist/Oh-My-Tab.dmg` 和 Sparkle 使用的 `dist/Oh-My-Tab.zip`。`release.sh` 默认只在本地构建；只有显式传入 `--push` 才会使用 R2 S3 API 上传，避免普通构建误发布：
+`bundle.sh` 同时生成 `dist/Oh-My-Tab.dmg` 和 Sparkle 使用的 `dist/Oh-My-Tab.zip`。`release.sh` 默认只在本地构建；只有显式传入 `--push` 才会使用 R2 S3 API 上传，避免普通构建误发布：
 
 > ```sh
 > sh scripts/release.sh                 # 只构建，关闭 R2 访问
@@ -158,7 +158,7 @@ About 页的开关和“检查更新”按钮已经接入 Sparkle 2。更新器�
 `https://download.oh-my-tab.app/dev_release/appcast.xml`。仓库不包含这两个 appcast、更新压缩包或
 Sparkle 私钥，这些发布材料由你后续分别放到对应的 R2 路径。
 
-把 Sparkle 2 的 `Sparkle.framework` 放到 `vendor/Sparkle.framework`（或设置 `SPARKLE_FRAMEWORK_PATH`），`scripts/bundle.sh` 和 `scripts/dev-restart.sh` 会自动复制到 `Contents/Frameworks`。没有框架时应用仍可启动，About 页会提示该构建未包含 Sparkle。脚本默认用 UTC 时间戳生成 `CFBundleVersion`，也可用 `SPARKLE_BUILD_VERSION` 指定固定值；发布时可通过 `SPARKLE_FEED_URL` 覆盖 feed 地址，通过 `SPARKLE_PUBLIC_ED_KEY` 写入 appcast 验签公钥。私钥不要放进仓库或 R2。
+仓库已把 Sparkle 2 的 `Sparkle.framework` 提交在 `vendor/Sparkle.framework`（可用 `SPARKLE_FRAMEWORK_PATH` 覆盖路径），`scripts/bundle.sh` 和 `scripts/dev-restart.sh` 会自动复制到 `Contents/Frameworks`。没有框架时应用仍可启动，About 页会提示该构建未包含 Sparkle。脚本默认用 UTC 时间戳生成 `CFBundleVersion`，也可用 `SPARKLE_BUILD_VERSION` 指定固定值；发布时可通过 `SPARKLE_FEED_URL` 覆盖 feed 地址，通过 `SPARKLE_PUBLIC_ED_KEY` 写入 appcast 验签公钥。私钥不要放进仓库或 R2。
 
 构建要求需要区分：`cargo build`、`cargo check` 和测试套件可以在没有 Sparkle 的情况下运行；要让打包后的应用具备更新检查功能，需要提供上面的 framework。本仓库已将固定版本 Sparkle 2.9.6 的 framework，以及生成 appcast 所需的 `bin/generate_keys` 和 `bin/generate_appcast` 放在 `vendor/` 下，之后直接使用这里的文件即可，不再依赖开发机特定的 Downloads 路径。仓库中的工具许可证见 `vendor/Sparkle/LICENSE`。
 
@@ -166,7 +166,7 @@ Sparkle 私钥，这些发布材料由你后续分别放到对应的 R2 路径�
 
 `bundle.sh` 优先用自签名身份 **`oh-my-tab-sign`** 签名,没有该证书时退回 ad-hoc(`codesign -s -`)。**强烈建议**一次性创建该证书 -- 它能让辅助功能授权在反复 rebuild 后仍然稳定(ad-hoc 签名每次 rebuild 都变,授权也随之失效):
 
-1. *钥匙串访问 -> 证书助理 -> 创建证书…*
+1. *钥匙串访问 → 证书助理 → 创建证书…*
 2. 名称:`oh-my-tab-sign`,身份类型:**自签名根**,证书类型:**代码签名**。
 3. 创建,然后重新打包、重装。(首次跑 `bundle.sh` 可能弹钥匙串访问提示 -- 点「始终允许」。)
 
@@ -176,8 +176,8 @@ Sparkle 私钥，这些发布材料由你后续分别放到对应的 R2 路径�
 
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;权限与运行须知
 
-- 应用需要 **辅助功能** 权限(`AXIsProcessTrusted`),全局按键事件 tap 和 AX 窗口查询都依赖它。在 *系统设置 -> 隐私与安全性 -> 辅助功能* 中授予。重新编译出的二进制需要重新授权 -- 除非用稳定身份签名(见[代码签名](#代码签名)),此时授权跨 rebuild 持续有效。
-- **窗口缩略图**还需要**屏幕录制**权限(系统设置 -> 隐私与安全性 -> 屏幕录制;使用与 DockDoor/AltTab 相同的私有 WindowServer 截取 API)。未授权时切换器静默保持纯图标渲染;稍后授予权限后无需重启即可恢复缩略图捕获。画面帧**只保存在内存中**。
+- 应用需要 **辅助功能** 权限(`AXIsProcessTrusted`),全局按键事件 tap 和 AX 窗口查询都依赖它。在 *系统设置 → 隐私与安全性 → 辅助功能* 中授予。重新编译出的二进制需要重新授权 -- 除非用稳定身份签名(见[代码签名](#代码签名)),此时授权跨 rebuild 持续有效。
+- **窗口缩略图**还需要**屏幕录制**权限(系统设置 → 隐私与安全性 → 屏幕录制;使用与 DockDoor/AltTab 相同的私有 WindowServer 截取 API)。未授权时切换器静默保持纯图标渲染;稍后授予权限后无需重启即可恢复缩略图捕获。画面帧**只保存在内存中**。
 - 如果事件 tap 创建失败,应用会打印一条错误,快捷键静默失效 -- 几乎总是辅助功能权限没给。
 - 运行时配置:`~/.config/oh-my-tab/config.toml`(首次运行自动按默认值创建)。
 - 图标缓存:`~/Library/Caches/oh-my-tab-icons/{bundle-id}.png`(按应用 bundle id 索引,配 `.meta` mtime sidecar;可从菜单清空)。
@@ -270,7 +270,7 @@ line_count = 3
 
 高级段落 `[colors]` 与 `[fonts]`(按主题的卡片文字颜色与字号)会连同默认值一起写进自动创建的配置文件——直接在那儿改即可。
 
-> **剪贴板历史持久化与隐私** — 开启 `persist`(或设置里的"保存剪贴板历史记录"开关)会把
+> **剪贴板历史持久化与隐私** — 开启 `persist`(或设置里的"保存剪贴板历史记录到磁盘"开关)会把
 > 剪贴板历史——复制的文本、文件名、图片字节——写入磁盘,重启应用后仍然保留:
 >
 > - `~/.config/oh-my-tab/clipboard-history.toml`(文本、文件名、来源与元数据;权限 600)

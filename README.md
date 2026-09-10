@@ -34,7 +34,7 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 - <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab, Shift+Tab, arrow keys, or mouse after Command/Option.
 - <img height="14" src="docs/icons/zap.svg"> **Lightweight**: pure Rust with a bounded in-memory thumbnail cache — no Electron/Tauri runtime.
 - <img height="14" src="docs/icons/star.svg"> **Liquid Glass**: floating overlay using `NSGlassEffectView` when available, with an `NSVisualEffectView` fallback on older systems.
-- <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: caption row above a 16:10 live preview, captured via a private WindowServer API and cached in memory — cached frames render instantly, background refresh keeps them current; balanced centered rows when they fit, leading MRU rows fill first and scroll continuously when overflowing. Requires **Screen Recording** permission — without it the switcher falls back to icon-only cards. Turning thumbnails off immediately releases cached window frames from memory.
+- <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: caption row above a 16:10 live preview, captured via a private WindowServer API and cached in memory — cached frames render instantly and a background refresh keeps them current; rows are balanced when they fit, and when they overflow the grid fills in MRU order and scrolls continuously. Requires **Screen Recording** permission — without it the switcher falls back to icon-only cards. Turning thumbnails off immediately releases cached window frames from memory.
 - <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window keeps the app's other windows in their existing order.
 - <img height="14" src="docs/icons/eye.svg"> **Full window visibility**: every real window, including off-screen and minimized (toggleable).
 - <img height="14" src="docs/icons/gear.svg"> **Hot-reloadable TOML**: validated config from the menu.
@@ -76,7 +76,7 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 
 > **Known v1 tradeoffs** — each entry records exactly one kind of content: a copy carrying **both text and an image** (e.g. copying an image from a web page) records only the text; **multiple-file copies and single non-image file copies are omitted from history**. The same picture copied both as an image and as a file stays as two separate entries (they answer different paste semantics). Dedup is per-kind: text by exact content, images by content hash.
 
-**Using an entry reorders the history by default** (like Maccy): selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top. The **"Move used entries to top"** switch in Settings turns this off (like Windows Win+V). With the optional **"Delete entry after paste"** switch on, holding **Option** while pressing Enter or clicking a row pastes the entry and removes it from the history right away (one-shot paste). Its dependent **"Also delete the corresponding system clipboard item"** switch additionally removes the corresponding clipboard content after a short delay, if no newer copy replaced it. The picker's "Clear all" keeps pinned entries. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note under [Configuration](#configuration).
+**Using an entry reorders the history by default** (like Maccy): selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top. The **"Move used entries to the top"** switch in Settings turns this off (like Windows Win+V). With the optional **"Delete entry after paste"** switch on, holding **Option** while pressing Enter or clicking a row pastes the entry and removes it from the history right away (one-shot paste). Its dependent **"Also delete the corresponding system clipboard item"** switch additionally removes the corresponding clipboard content after a short delay, if no newer copy replaced it. The picker's "Clear history" keeps pinned entries. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note under [Configuration](#configuration).
 
 ## <img height="16" src="docs/icons/alert.svg">&nbsp;&nbsp;Known Issues
 
@@ -132,7 +132,7 @@ cargo test settings_layout_smoke -- --ignored
 ```
 
 The smoke test runs the debug binary with `--smoke-settings-layout`, opens the actual settings
-window on the main thread, visits all five pages, validates their descendant view frames, and exits.
+window on the main thread, visits all seven pages, validates their descendant view frames, and exits.
 
 ### Release `.app` + `.dmg`
 
@@ -142,7 +142,7 @@ window on the main thread, visits all five pages, validates their descendant vie
 > ```
 
 `bundle.sh` assembles `dist/Oh-My-Tab.app` (release binary, `Info.plist`, and app icon resources), signs it, then packages it into `dist/Oh-My-Tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution. Re-run the script after code changes — it copies the release binary at build time, and self-locates the repo root so it can be run from anywhere.
-`bundle.sh` now produces both `dist/Oh-My-Tab.dmg` and the Sparkle archive `dist/Oh-My-Tab.zip`. `release.sh` builds locally by default; it contacts R2 only when you explicitly pass `--push`:
+`bundle.sh` produces both `dist/Oh-My-Tab.dmg` and the Sparkle archive `dist/Oh-My-Tab.zip`. `release.sh` builds locally by default; it contacts R2 only when you explicitly pass `--push`:
 
 > ```sh
 > sh scripts/release.sh                    # build only; R2 access is disabled
@@ -164,7 +164,7 @@ the `[TEST] English x3` layout fixture is available in the development package. 
 the direct production `bundle.sh` path do not enable that feature; the test option is absent from
 production builds.
 
-With `--push`, the release scripts now generate or update the appcast before uploading. They reuse
+With `--push`, the release scripts generate or update the appcast before uploading. They reuse
 an existing local appcast when present; on a clean checkout they fetch the public feed first so
 older entries are retained. If no feed exists yet, a new one is created. The generated feed uses
 the exact immutable ZIP filename that the R2 publisher uploads. Every `--push` invocation rebuilds
@@ -184,12 +184,12 @@ URL base only; the upload destination remains the configured R2 endpoint.
 The About-page toggle and “Check for Updates” button are wired to Sparkle 2. The updater reads
 `SUFeedURL` from the app bundle; production uses `https://download.oh-my-tab.app/appcast.xml` and
 the dev release script uses `https://download.oh-my-tab.app/dev_release/appcast.xml`. This repository
-repository excludes both appcasts, release archives, and the Sparkle private key;
+does not include the appcasts, the release archives, or the Sparkle private key;
 publish those materials to the matching R2 channel later.
 
-Place Sparkle 2's `Sparkle.framework` at `vendor/Sparkle.framework` (or set `SPARKLE_FRAMEWORK_PATH`); `scripts/bundle.sh` and `scripts/dev-restart.sh` copy it into `Contents/Frameworks`. Without the framework the app still starts and the About page explains why update checks are unavailable. The scripts use a UTC timestamp for `CFBundleVersion` by default; set `SPARKLE_BUILD_VERSION` when a deterministic build number is needed. At release time, `SPARKLE_FEED_URL` overrides the feed URL and `SPARKLE_PUBLIC_ED_KEY` writes the appcast verification key into the bundle. Never commit or upload the private key.
+Sparkle 2's `Sparkle.framework` is committed at `vendor/Sparkle.framework` (override the location with `SPARKLE_FRAMEWORK_PATH`); `scripts/bundle.sh` and `scripts/dev-restart.sh` copy it into `Contents/Frameworks`. Without the framework the app still starts and the About page explains why update checks are unavailable. The scripts use a UTC timestamp for `CFBundleVersion` by default; set `SPARKLE_BUILD_VERSION` when a deterministic build number is needed. At release time, `SPARKLE_FEED_URL` overrides the feed URL and `SPARKLE_PUBLIC_ED_KEY` writes the appcast verification key into the bundle. Never commit or upload the private key.
 
-Build requirement distinction: `cargo build`, `cargo check`, and the test suite work without
+Build requirements: `cargo build`, `cargo check`, and the test suite all work without
 Sparkle. A packaged app with working update checks requires the framework at the path above.
 This repository includes the pinned Sparkle 2.9.6 `bin/generate_keys` and `bin/generate_appcast`
 tools under `vendor/Sparkle/`; run them from there when generating appcasts. The pinned framework
@@ -200,7 +200,7 @@ generation do not depend on a developer-specific Downloads path.
 
 `bundle.sh` signs with the self-signed identity **`oh-my-tab-sign`** when present, falling back to ad-hoc (`codesign -s -`) if not. Creating this cert once is **strongly recommended** — it keeps the Accessibility grant stable across rebuilds (an ad-hoc signature changes on every rebuild, invalidating the grant each time):
 
-1. *Keychain Access -> Certificate Assistant -> Create a Certificate...*
+1. *Keychain Access → Certificate Assistant → Create a Certificate...*
 2. Name: `oh-my-tab-sign`, Identity Type: **Self Signed Root**, Certificate Type: **Code Signing**.
 3. Create, then rebuild and reinstall. (The first `bundle.sh` run may prompt for keychain access — click *Always Allow*.)
 
@@ -306,7 +306,7 @@ line_count = 3
 The advanced `[colors]` and `[fonts]` sections (card text colors and sizes per theme) are written to the auto-created config file with their defaults — edit them there.
 
 > **Clipboard-history persistence & privacy** — enabling `persist` (or the "Save clipboard
-> history" switch in Settings) writes your clipboard history — copied text, filenames, and
+> history to disk" switch in Settings) writes your clipboard history — copied text, filenames, and
 > image bytes — to disk so it survives app restarts:
 >
 > - `~/.config/oh-my-tab/clipboard-history.toml` (text, filenames, sources, metadata; mode 600)
@@ -321,7 +321,7 @@ The advanced `[colors]` and `[fonts]` sections (card text colors and sizes per t
 > stamp these markers on password copies, keeping such content out of the history (memory and
 > disk). Persistence is off by default.
 
-Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). The button-mappings section lists bound rows (button name + action description + keycaps); clicking **Edit** opens an edit panel (same as LinearMouse): record the trigger side button, pick the action type (Default / None / Key Press / Mission Control / Launchpad / Show Desktop / App Expose), and record the combo for Key Press, then confirm. Toggling `mouse.enabled` takes effect immediately — no app restart needed.
+Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). The button-mappings section lists bound rows (button name + action description + keycaps); clicking **Edit** opens an edit panel (same as LinearMouse): record the trigger side button, pick the action type (Default / None / Key Press / Mission Control / Launchpad / Show Desktop / App Exposé), and record the combo for Key Press, then confirm. Toggling `mouse.enabled` takes effect immediately — no app restart needed.
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 

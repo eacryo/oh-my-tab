@@ -2344,9 +2344,9 @@ fn main() {
         }
     }
 
-    // 设置页冒烟测试入口:在真实 NSApplication 主线程中打开并遍历五个页面,让 runtime
+    // 设置页冒烟测试入口:在真实 NSApplication 主线程中打开并遍历七个页面,让 runtime
     // layout validator 检查最终 AppKit view tree。需要 GUI 会话,失败时由 panic/exit code 表示。
-    // Settings layout smoke entry: open and traverse all five pages on the real NSApplication
+    // Settings layout smoke entry: open and traverse all seven pages on the real NSApplication
     // main thread so the runtime layout validator checks the final AppKit view tree. Requires a
     // GUI session; a panic/non-zero exit reports a failure.
     if std::env::args().any(|a| a == "--smoke-settings-layout") {

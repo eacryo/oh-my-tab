@@ -58,7 +58,7 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 - Preserve unrelated user changes in a dirty worktree.
 - Avoid destructive Git commands (e.g. `reset`/`checkout`/`clean` that discard modifications) unless explicitly requested.
 - Add bilingual comments (Chinese first, English second) only for non-obvious logic, important design decisions, FFI/Objective-C subtleties, and workarounds.
-- Keep user-visible strings in `t()`/`tf()` and add translation keys to all supported locale files. Developer logs remain in English; dynamic window/application titles are data, not UI chrome.
+- Keep user-visible strings in `t()`/`tf()`/`t_count()` and add translation keys to all supported locale files. Use `t_count()` for counts that need singular/plural forms. Developer logs remain in English; dynamic window/application titles are data, not UI chrome.
 
 ## File editing
 
@@ -73,8 +73,9 @@ Prefer the harness's native file-editing tools (e.g. Edit, Write, or apply_patch
 - When using a script to modify source files, inspect the resulting diff (`git diff`) before considering the task complete.
 
 ## Git and commits
-If user only input "cmsg", then give user a commit message follow below rule:
-Unless the user explicitly requests it, do not commit, push, stage, or rewrite history on the user's behalf. 
+
+If the user's input is only "cmsg", provide a commit message following the rule below.
+Unless the user explicitly requests it, do not commit, push, stage, or rewrite history on the user's behalf.
 When a commit message is requested, provide only one Conventional Commits line:
 
 `type: description`
@@ -85,8 +86,8 @@ diff. Base the message on the combined `git diff HEAD` result. Do not treat an `
 net addition without checking the combined diff: it may be an index addition that is deleted in
 the worktree.
 
-Note that the Style word only used for code style change, not UI style change.
-UI style change usually use feat or fix.
+Note that the `style` type is only used for code style changes, not UI style changes.
+UI style changes usually use `feat` or `fix`.
 
 If the user replies exactly "allow commit" after a commit message was provided in this conversation, inspect git status and all three Git diff views first. Commit only the intended changes with that exact message; do not stage unrelated changes. Ask if the scope is ambiguous.
 
