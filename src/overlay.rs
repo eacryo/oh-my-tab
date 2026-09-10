@@ -721,6 +721,7 @@ fn display_title<'a>(title: &'a str, app_name: &'a str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::card_reconcile_action;
+    use super::cg_window_center_to_appkit_point;
     use super::color_with_alpha;
     use super::display_title;
     use super::edge_row_nav_index;
@@ -735,6 +736,7 @@ mod tests {
     use super::CardReconcileAction;
     use super::CardSignature;
     use crate::window_collector::{MruMap, WindowInfo};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::time::Instant;
 
     /// 构造一行卡片的 rects:y 固定,x 依次排开(宽 100 间距 10)。
@@ -820,6 +822,25 @@ mod tests {
     fn thumbnail_selection_lifts_the_whole_card_by_one_point() {
         assert_eq!(super::thumbnail_card_lift_y(true), 1.0);
         assert_eq!(super::thumbnail_card_lift_y(false), 0.0);
+    }
+
+    #[test]
+    fn cg_window_center_converts_to_appkit_space_for_offset_display() {
+        // 主屏较高、副屏底部对齐时,副屏的 AppKit y 原点高于主屏;直接比较 CG y
+        // 会把副屏上方窗口误判为主屏或触发主屏回退。
+        // When a shorter secondary display is bottom-aligned with a taller primary display,
+        // its AppKit y origin is above the primary's; comparing CG y directly would misroute
+        // an upper secondary window to the primary or trigger the primary fallback.
+        let primary = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1512.0, 1440.0));
+        let secondary = NSRect::new(NSPoint::new(1512.0, 458.0), NSSize::new(2560.0, 982.0));
+        let center = cg_window_center_to_appkit_point((1512.0, 0.0, 1000.0, 400.0), primary);
+
+        assert_eq!(center.x, 2012.0);
+        assert_eq!(center.y, 1240.0);
+        assert!(center.x >= secondary.origin.x);
+        assert!(center.x <= secondary.origin.x + secondary.size.width);
+        assert!(center.y >= secondary.origin.y);
+        assert!(center.y <= secondary.origin.y + secondary.size.height);
     }
 
     #[test]
@@ -3788,6 +3809,18 @@ pub(crate) fn create_card_view(
 /// Returns (target screen frame, visibleFrame, backingScaleFactor). The NSScreen object is
 /// never cached across summons, so display hot-plug/unplug and scaling-mode changes use the
 /// new live scale on the next summon.
+fn cg_window_center_to_appkit_point(
+    bounds: (f64, f64, f64, f64),
+    primary_frame: NSRect,
+) -> NSPoint {
+    let (bx, by, bw, bh) = bounds;
+    let primary_top = primary_frame.origin.y + primary_frame.size.height;
+    // CG 的 y 原点在主屏顶部,AppKit 的 y 原点在主屏底部;转换基准必须是主屏顶部。
+    // CG's y origin is at the primary display's top, while AppKit's is at its bottom;
+    // the conversion must use the primary display's top edge as the shared baseline.
+    NSPoint::new(bx + bw / 2.0, primary_top - (by + bh / 2.0))
+}
+
 fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect, f64) {
     unsafe {
         let metrics = |screen: *mut AnyObject| {
@@ -3821,14 +3854,14 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect, f64) {
         let Some(active) = windows.iter().find(|w| w.is_active) else {
             return metrics(main_screen_obj);
         };
-        let (bx, by, bw, bh) = active.bounds;
+        let primary_frame: NSRect = msg_send![main_screen_obj, frame];
+        let (_, _, bw, bh) = active.bounds;
         // bounds 全 0 = 未获取到,无法定位,回退主屏。
         // All-zero bounds = unavailable, can't locate, fall back to the main screen.
         if bw <= 0.0 || bh <= 0.0 {
             return metrics(main_screen_obj);
         }
-        let cx = bx + bw / 2.0;
-        let cy = by + bh / 2.0;
+        let center = cg_window_center_to_appkit_point(active.bounds, primary_frame);
         // 遍历所有屏幕,找包含激活窗口中心的那个。
         // Iterate all screens, find the one containing the active window's center.
         let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
@@ -3839,10 +3872,10 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect, f64) {
             // Same as line 934: objectAtIndex: wants 'q'; usize ('Q') would fail the check too.
             let s: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
             let f: NSRect = msg_send![s, frame];
-            if cx >= f.origin.x
-                && cx <= f.origin.x + f.size.width
-                && cy >= f.origin.y
-                && cy <= f.origin.y + f.size.height
+            if center.x >= f.origin.x
+                && center.x <= f.origin.x + f.size.width
+                && center.y >= f.origin.y
+                && center.y <= f.origin.y + f.size.height
             {
                 return metrics(s);
             }
