@@ -2196,6 +2196,10 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
 /// Show the picker (built once, reused; the window height follows the visible row count).
 fn show_picker() {
     unsafe {
+        // 每次重新呼出都从无悬停开始;旧行已被移除,不能让旧索引污染新列表。
+        // Start each summon without a hovered row; the old rows are gone, so their index must
+        // never leak into the rebuilt list.
+        *HOVER_ROW.lock().unwrap() = NO_SELECTION;
         // 呼出前清理过期条目(长时间不复制时,历史里的过期条目在此清除;rebuild_rows
         // 随后按新列表渲染)。置顶条目不参与过期。
         // Expire before summon (entries that aged out while the user wasn't copying are
@@ -2336,6 +2340,10 @@ fn show_picker() {
 fn hide_picker() {
     PICKER_VISIBLE.store(false, Ordering::SeqCst);
     *SCROLL_DRAG.lock().unwrap() = None;
+    // 隐藏时不会可靠地为每个子按钮派发 mouseExited;显式清掉行悬停状态。
+    // Hiding does not reliably deliver mouseExited to every child button; clear the row hover
+    // state explicitly.
+    *HOVER_ROW.lock().unwrap() = NO_SELECTION;
     hide_detail();
 
     // 锁内只取指针,orderOut 放到锁外:orderOut 会同步触发 NSWindowDidResignKeyNotification,
@@ -3958,6 +3966,13 @@ fn effective_hover_row(pointer_in_window: bool, hover_row: usize) -> usize {
     }
 }
 
+fn rect_contains_point(rect: NSRect, point: NSPoint) -> bool {
+    point.x >= rect.origin.x
+        && point.x <= rect.origin.x + rect.size.width
+        && point.y >= rect.origin.y
+        && point.y <= rect.origin.y + rect.size.height
+}
+
 /// 指针当前是否位于浮窗窗口内。NSEvent.mouseLocation 与窗口 frame 同为全局屏坐标
 /// (底部原点),可直接包含判定。
 /// Whether the pointer is currently inside the picker window. NSEvent.mouseLocation and
@@ -3969,10 +3984,7 @@ unsafe fn pointer_in_picker_window() -> bool {
     };
     let frame: NSRect = msg_send![w.0, frame];
     let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-    mouse.x >= frame.origin.x
-        && mouse.x <= frame.origin.x + frame.size.width
-        && mouse.y >= frame.origin.y
-        && mouse.y <= frame.origin.y + frame.size.height
+    rect_contains_point(frame, mouse)
 }
 
 /// 详情内复制后立即重建已打开的历史列表。不能等下一次呼出:轮询虽会写入内存,
@@ -4157,6 +4169,11 @@ unsafe fn ensure_picker_window() {
     let window: *mut AnyObject = msg_send![window_cls, alloc];
     let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
     apply_panel_appearance(window);
+    // 浮窗级 tracking area 需要持续收到 mouseMoved,才能在正文按钮之外的行内留白
+    // 重新核对悬停行。
+    // The picker-wide tracking area needs mouseMoved continuously so hover can be reconciled
+    // while the pointer is over row padding outside the content buttons.
+    let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
     let _: () = msg_send![window, setLevel: 3u64];
     let _: () = msg_send![window, setOpaque: false];
     let _: () = msg_send![window, setReleasedWhenClosed: false];
@@ -4244,6 +4261,24 @@ unsafe fn ensure_picker_window() {
             container_key_down as *mut c_void,
             types_key.as_ptr(),
         );
+        class_addMethod(
+            cls,
+            sel!(mouseMoved:),
+            container_mouse_moved as *mut c_void,
+            types_key.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(mouseEntered:),
+            container_mouse_moved as *mut c_void,
+            types_key.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(mouseExited:),
+            container_mouse_exited as *mut c_void,
+            types_key.as_ptr(),
+        );
         let types_bool = CString::new("B@:").unwrap();
         class_addMethod(
             cls,
@@ -4271,6 +4306,7 @@ unsafe fn ensure_picker_window() {
     // The document view's height is set dynamically by rebuild_rows; it must NOT stretch
     // with the scroll view.
     let _: () = msg_send![container, setAutoresizingMask: 0u64];
+    add_picker_hover_tracking(content_parent, container);
 
     // 固定头部条:搜索框 + 清除按钮所在行,不随列表滚动(滚动时文字曾从半透明 tile
     // 底下穿过形成重叠)。flipped 坐标系让搜索框/清除按钮的既有 frame 直接可用。
@@ -4721,6 +4757,10 @@ unsafe fn rebuild_rows() {
         Some(c) => c.0,
         None => return,
     };
+    // 重建会拆除旧行,期间的 enter/exit 事件会被门控;先丢弃旧索引,避免它落到新行。
+    // Rebuild tears down the old rows and gates enter/exit events; discard the old index first
+    // so it cannot land on an unrelated new row.
+    *HOVER_ROW.lock().unwrap() = NO_SELECTION;
     // 重建期间忽略 mouseEntered(见 REBUILDING 注释)。
     // Ignore mouseEntered during the rebuild (see the REBUILDING note).
     REBUILDING.store(true, Ordering::SeqCst);
@@ -5150,6 +5190,74 @@ extern "C" fn container_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
     true
 }
 
+/// 按事件坐标解析当前真正位于鼠标下方的可见行。先限制在列表滚动区内,避免头部或
+/// 底部坐标转换后误命中滚动文档中的行。
+/// Resolve the visible row actually under the event. Gate on the list scroll view first so
+/// header/footer coordinates cannot convert into an accidental row hit in the document view.
+unsafe fn hover_row_at_event(event: *mut c_void) -> usize {
+    if event.is_null() {
+        return NO_SELECTION;
+    }
+    let scroll = match *SCROLL_VIEW.lock().unwrap() {
+        Some(scroll) => scroll.0,
+        None => return NO_SELECTION,
+    };
+    let container = match *PICKER_CONTAINER.lock().unwrap() {
+        Some(container) => container.0,
+        None => return NO_SELECTION,
+    };
+    let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+    let scroll_point: NSPoint = msg_send![
+        scroll,
+        convertPoint: location,
+        fromView: std::ptr::null::<AnyObject>()
+    ];
+    let scroll_bounds: NSRect = msg_send![scroll, bounds];
+    if !rect_contains_point(scroll_bounds, scroll_point) {
+        return NO_SELECTION;
+    }
+
+    let point: NSPoint = msg_send![
+        container,
+        convertPoint: location,
+        fromView: std::ptr::null::<AnyObject>()
+    ];
+    ROW_HOVER_VIEWS
+        .lock()
+        .unwrap()
+        .iter()
+        .position(|row| {
+            if row.tile.0.is_null() {
+                return false;
+            }
+            let frame: NSRect = msg_send![row.tile.0, frame];
+            rect_contains_point(frame, point)
+        })
+        .unwrap_or(NO_SELECTION)
+}
+
+/// 浮窗内任意鼠标移动都按整行背景重新核对悬停状态。这样正文按钮退出到行内留白后,
+/// 继续移出浮窗也不会因 tracking owner 缺失而留下幽灵样式。
+/// Reconcile hover against the whole row backdrop on every picker mouse move. This prevents
+/// a stale style when the pointer leaves a content button through row padding and then exits.
+extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    if REBUILDING.load(Ordering::SeqCst) {
+        return;
+    }
+    let row = unsafe { hover_row_at_event(event) };
+    set_hover_row(row);
+}
+
+/// 鼠标离开整个浮窗时兜底清空;此事件由固定父视图的 InVisibleRect tracking area
+/// 提供,不依赖任何行内按钮是否收到 mouseExited。
+/// Clear hover when leaving the whole picker. The fixed parent's InVisibleRect tracking area
+/// supplies this event independently of whether any row button receives mouseExited.
+extern "C" fn container_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    if !REBUILDING.load(Ordering::SeqCst) {
+        set_hover_row(NO_SELECTION);
+    }
+}
+
 /// 行按钮类(NSButton 子类,重写 mouseEntered: 实现悬停选中)。
 /// Row-button class (NSButton subclass; mouseEntered: implements hover selection).
 unsafe fn row_button_class() -> *mut AnyObject {
@@ -5229,6 +5337,17 @@ fn update_hover_visuals(prev: usize, new: usize) {
     }
 }
 
+fn set_hover_row(new: usize) {
+    let mut hover = HOVER_ROW.lock().unwrap();
+    let prev = *hover;
+    if prev == new {
+        return;
+    }
+    *hover = new;
+    drop(hover);
+    update_hover_visuals(prev, new);
+}
+
 /// 搜索框聚焦时列表没有键盘选中项,但过滤后的条目仍应显示独立的鼠标悬停样式。
 /// With search focus, the list has no keyboard-selected row, but filtered entries must still
 /// show their independent mouse-hover style.
@@ -5249,13 +5368,9 @@ extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *m
         // / clicks only. The two states stay independently visible, matching the mockup's
         // separate .item:hover and .item.selected rules (auto-select-on-hover would always
         // render the hovered row as the selected style, making them look identical).
-        let mut hover = HOVER_ROW.lock().unwrap();
-        let prev = *hover;
-        *hover = idx as usize;
-        drop(hover);
         // 增量刷新悬停视觉,不重建。
         // Incremental hover visuals, no rebuild.
-        update_hover_visuals(prev, idx as usize);
+        set_hover_row(idx as usize);
     }
 }
 
@@ -5283,10 +5398,16 @@ unsafe fn mouse_inside_row(event: *mut c_void, idx: usize) -> bool {
         fromView: std::ptr::null::<AnyObject>()
     ];
     let frame: NSRect = msg_send![row.tile.0, frame];
-    point.x >= frame.origin.x
-        && point.x <= frame.origin.x + frame.size.width
-        && point.y >= frame.origin.y
-        && point.y <= frame.origin.y + frame.size.height
+    rect_contains_point(frame, point)
+}
+
+/// 清除指定行的悬停状态,并同步收起该行的 hover 视觉。
+/// Clear a row's hover state and synchronously collapse its hover visuals.
+fn clear_hover_row_if(idx: usize) {
+    let hovered = *HOVER_ROW.lock().unwrap();
+    if hovered == idx {
+        set_hover_row(NO_SELECTION);
+    }
 }
 
 /// 鼠标离开行按钮:仅在真正离开整行时清除悬停,避免移向右下角操作按钮时消失。
@@ -5301,12 +5422,7 @@ extern "C" fn row_button_mouse_exited(_self: *mut c_void, _cmd: Sel, event: *mut
         if unsafe { mouse_inside_row(event, idx as usize) } {
             return;
         }
-        let mut hover = HOVER_ROW.lock().unwrap();
-        if *hover == idx as usize {
-            *hover = NO_SELECTION;
-            drop(hover);
-            update_hover_visuals(idx as usize, NO_SELECTION);
-        }
+        clear_hover_row_if(idx as usize);
     }
 }
 
@@ -6436,10 +6552,24 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
 /// 悬停退出:恢复基础色;筛选项只更新自己的文字色,不触碰共享下划线。
 /// Hover exit: restore the base color; a filter only updates its own tint and never touches
 /// the shared underline.
-extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
+        if (action == sel!(showItemDetails:)
+            || action == sel!(deleteEntry:)
+            || action == sel!(togglePin:))
+            && !REBUILDING.load(Ordering::SeqCst)
+        {
+            // 操作按钮是行的独立兄弟视图,离开它不会触发行按钮的 mouseExited;
+            // 只有确认指针已离开整行时才清除行 hover。
+            // Action buttons are sibling views of the row, so leaving one does not trigger the
+            // row button's mouseExited; clear row hover only after the whole row is left.
+            let tag: isize = msg_send![b, tag];
+            if tag >= 0 && (event.is_null() || !mouse_inside_row(event, tag as usize)) {
+                clear_hover_row_if(tag as usize);
+            }
+        }
         if action == sel!(detailSaveAs:) {
             set_detail_share_style(b, 0.34, 0x00000000);
             return;
@@ -7134,6 +7264,26 @@ unsafe fn add_hover_tracking(view: *mut AnyObject) {
     release_obj(ta);
 }
 
+/// 给固定的浮窗内容父视图挂一块自动随可见区域更新的 tracking area,事件交给列表
+/// 容器统一解析整行 hover。父视图不会随滚动文档高度变化,InVisibleRect 在这里可靠。
+/// Attach an auto-resizing tracking area to the fixed picker content parent and deliver its
+/// events to the list container, which resolves whole-row hover. InVisibleRect is reliable
+/// here because this parent does not track the scrolling document height.
+unsafe fn add_picker_hover_tracking(view: *mut AnyObject, owner: *mut AnyObject) {
+    // MouseEnteredAndExited | MouseMoved | ActiveAlways | InVisibleRect.
+    let opts: u64 = 0x01 | 0x02 | 0x80 | 0x200;
+    let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let ta: *mut AnyObject = msg_send![
+        ta,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
+        options: opts,
+        owner: owner,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![view, addTrackingArea: ta];
+    release_obj(ta);
+}
+
 /// 行按钮的 target(响应 handleClipboardRowClick:)。
 /// 单例:NSControl 的 setTarget: 是弱引用(不 retain),每次 rebuild 都 new 新实例会
 /// 永久泄漏;进程内只创建一次,实例存活到进程结束,按钮弱引用它始终有效。
@@ -7189,10 +7339,21 @@ unsafe fn row_target() -> *mut AnyObject {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_hover_row, estimated_entry_bytes, scroll_indicator_geometry, ClipEntry,
-        ImageEntry, NO_SELECTION, NSPASTEBOARD_TYPE_PNG, SCROLL_INDICATOR_CORNER_RESERVE,
-        SCROLL_INDICATOR_EDGE,
+        effective_hover_row, estimated_entry_bytes, rect_contains_point, scroll_indicator_geometry,
+        ClipEntry, ImageEntry, NO_SELECTION, NSPASTEBOARD_TYPE_PNG,
+        SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE,
     };
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    #[test]
+    fn row_hover_hit_test_includes_edges_and_rejects_padding_outside() {
+        let rect = NSRect::new(NSPoint::new(10.0, 20.0), NSSize::new(100.0, 40.0));
+        assert!(rect_contains_point(rect, NSPoint::new(10.0, 20.0)));
+        assert!(rect_contains_point(rect, NSPoint::new(110.0, 60.0)));
+        assert!(rect_contains_point(rect, NSPoint::new(55.0, 35.0)));
+        assert!(!rect_contains_point(rect, NSPoint::new(9.9, 35.0)));
+        assert!(!rect_contains_point(rect, NSPoint::new(55.0, 60.1)));
+    }
 
     #[test]
     fn estimated_entry_bytes_counts_capacity_once() {
