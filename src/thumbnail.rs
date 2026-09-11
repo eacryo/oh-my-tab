@@ -18,6 +18,8 @@
 //!    - 外观(明暗)切换重拍:空白也覆盖——旧外观帧与新主题不协调比占位更刺眼
 //!    - 切换器自己切过去的窗口:激活补拍在 backstop 静默出口放行;同应用窗口切换
 //!      (无激活通知、808 被静音)在 raise 时铸造 token 直接调度,到达即刷新
+//! 6. WindowServer 几何过渡:显示器/Space/窗口动画期间延迟捕获并有界退避重试;
+//!    scheduler 为进程级单例,随进程结束
 //!
 //! 无屏幕录制权限(TCC)时整个模块休眠,浮窗保持纯图标渲染;运行中授权后
 //! 下一个捕获任务自动恢复(worker 每个任务前都重新 preflight)。
@@ -55,6 +57,9 @@
 //!      through at the backstop's silent exit; same-app window switches (no
 //!      activation notification, 808 silenced) mint a token at raise time and
 //!      schedule the refresh directly, so arriving refreshes the thumbnail
+//! 6. WindowServer geometry transitions: defer captures during display/Space/window
+//!    animations and retry with bounded backoff; the scheduler is process-wide and
+//!    exits with the process.
 //!
 //! Without the Screen Recording TCC permission the whole module sleeps and the
 //! overlay keeps rendering icons only; granting permission mid-run resumes
@@ -62,7 +67,7 @@
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
-use std::cmp::Reverse;
+use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::ops::Range;
@@ -664,7 +669,11 @@ struct PendingCapture {
     activation_at: Option<Instant>,
     freshness_sequence: u64,
     enqueued_at: Instant,
+    ready_since: Instant,
     running: bool,
+    geometry_retry_not_before: Option<Instant>,
+    geometry_retry_attempts: u8,
+    geometry_retry_started_at: Option<Instant>,
     /// 外观(明暗主题)切换触发的重拍:允许空白帧覆盖已有帧——旧帧是旧外观像素,
     /// 与其他卡片不一致比暂时空白更刺眼。合并请求时按"或"传播。
     /// Appearance (light/dark) transition recapture: blank frames MAY overwrite the
@@ -683,7 +692,52 @@ struct CaptureJob {
     activation_at: Option<Instant>,
     freshness_sequence: u64,
     enqueued_at: Instant,
+    ready_since: Instant,
     appearance_refresh: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureJobResult {
+    Finished,
+    GeometryDeferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq)]
+struct GeometryRetryDeadline {
+    deadline: Instant,
+    sequence: u64,
+    attempt: u8,
+}
+
+impl PartialEq for GeometryRetryDeadline {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.sequence == other.sequence
+    }
+}
+
+// `attempt` is diagnostic metadata only; equality and ordering identify a wake by
+// deadline and sequence. `attempt` 仅用于诊断,不参与 deadline 的身份和排序。
+
+impl Ord for GeometryRetryDeadline {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| self.sequence.cmp(&other.sequence))
+    }
+}
+
+impl PartialOrd for GeometryRetryDeadline {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeometryDeferResult {
+    Deferred(GeometryRetryDeadline),
+    Exhausted,
+    Stale,
 }
 
 /// 同时记录 queued/in-flight 请求的最高目标、最高优先级和生命周期 token。
@@ -735,6 +789,7 @@ impl CaptureState {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let sequence = Self::next_counter(&mut self.next_sequence);
                 let token = Self::next_counter(&mut self.next_token);
+                let now = Instant::now();
                 entry.insert(PendingCapture {
                     target_px_h,
                     priority,
@@ -743,8 +798,12 @@ impl CaptureState {
                     pid_generation,
                     activation_at: None,
                     freshness_sequence: 0,
-                    enqueued_at: Instant::now(),
+                    enqueued_at: now,
+                    ready_since: now,
                     running: false,
+                    geometry_retry_not_before: None,
+                    geometry_retry_attempts: 0,
+                    geometry_retry_started_at: None,
                     appearance_refresh,
                 });
                 true
@@ -804,18 +863,31 @@ impl CaptureState {
         self.take_next_for(false)
     }
 
+    #[cfg(test)]
     fn take_next_for(&mut self, interaction_active: bool) -> Option<CaptureJob> {
+        self.take_next_for_at(interaction_active, Instant::now())
+    }
+
+    fn geometry_retry_ready(pending: &PendingCapture, now: Instant) -> bool {
+        pending
+            .geometry_retry_not_before
+            .is_none_or(|not_before| not_before <= now)
+    }
+
+    fn take_next_for_at(&mut self, interaction_active: bool, now: Instant) -> Option<CaptureJob> {
         let key = self
             .desired
             .iter()
             .filter(|(_, pending)| {
                 !pending.running
                     && (!interaction_active || pending.priority >= CapturePriority::Visible)
+                    && Self::geometry_retry_ready(pending, now)
             })
             .min_by_key(|(_, pending)| (Reverse(pending.priority), pending.sequence))
             .map(|(key, _)| *key)?;
         let pending = self.desired.get_mut(&key)?;
         pending.running = true;
+        pending.geometry_retry_not_before = None;
         Some(CaptureJob {
             key,
             target_px_h: pending.target_px_h,
@@ -825,6 +897,7 @@ impl CaptureState {
             activation_at: pending.activation_at,
             freshness_sequence: pending.freshness_sequence,
             enqueued_at: pending.enqueued_at,
+            ready_since: pending.ready_since,
             appearance_refresh: pending.appearance_refresh,
         })
     }
@@ -835,6 +908,39 @@ impl CaptureState {
                 .desired
                 .get(&job.key)
                 .is_some_and(|pending| pending.token == job.token)
+    }
+
+    fn defer_geometry_transition(&mut self, job: CaptureJob, now: Instant) -> GeometryDeferResult {
+        if !self.is_current(job) {
+            return GeometryDeferResult::Stale;
+        }
+        let Some(pending) = self.desired.get_mut(&job.key) else {
+            return GeometryDeferResult::Stale;
+        };
+        if !pending.running {
+            return GeometryDeferResult::Stale;
+        }
+        // 几何过渡期间只恢复同一个有效任务；token/generation 任一失配都不能复活旧任务。
+        // Restore only the same live job during a geometry transition; a token or generation
+        // mismatch must never resurrect stale or cancelled work.
+        let started_at = *pending.geometry_retry_started_at.get_or_insert(now);
+        if pending.geometry_retry_attempts >= GEOMETRY_RETRY_MAX_ATTEMPTS
+            || now.duration_since(started_at) >= GEOMETRY_RETRY_BUDGET
+        {
+            self.desired.remove(&job.key);
+            return GeometryDeferResult::Exhausted;
+        }
+        let attempt = pending.geometry_retry_attempts;
+        pending.geometry_retry_attempts += 1;
+        let deadline = now + geometry_retry_delay(attempt);
+        pending.running = false;
+        pending.geometry_retry_not_before = Some(deadline);
+        pending.ready_since = deadline;
+        GeometryDeferResult::Deferred(GeometryRetryDeadline {
+            deadline,
+            sequence: next_geometry_retry_sequence(),
+            attempt: attempt + 1,
+        })
     }
 
     fn finish(&mut self, job: CaptureJob) -> bool {
@@ -856,12 +962,29 @@ impl CaptureState {
             || (pending.appearance_refresh && !job.appearance_refresh)
         {
             pending.running = false;
-            pending.enqueued_at = Instant::now();
+            pending.ready_since = Instant::now();
+            pending.geometry_retry_not_before = None;
+            pending.geometry_retry_attempts = 0;
+            pending.geometry_retry_started_at = None;
             true
         } else {
             self.desired.remove(&job.key);
             false
         }
+    }
+
+    fn discard_deferred(&mut self, job: CaptureJob) -> bool {
+        if !self.is_current(job) {
+            return false;
+        }
+        let Some(pending) = self.desired.get(&job.key) else {
+            return false;
+        };
+        if pending.running || pending.geometry_retry_not_before.is_none() {
+            return false;
+        }
+        self.desired.remove(&job.key);
+        true
     }
 
     fn cancel_pid(&mut self, pid: i32) {
@@ -891,71 +1014,143 @@ static CAPTURE_STATE: LazyLock<Mutex<CaptureState>> =
     LazyLock::new(|| Mutex::new(CaptureState::default()));
 static JOB_TX: OnceLock<flume::Sender<()>> = OnceLock::new();
 static THUMB_ENQUEUED: AtomicU64 = AtomicU64::new(0);
-static THUMB_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static THUMB_INTERACTION_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static THUMB_GEOMETRY_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static THUMB_GEOMETRY_RETRY_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 static THUMB_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static THUMB_CAPTURE_FAILED: AtomicU64 = AtomicU64::new(0);
 static THUMB_QUEUE_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
 static THUMB_QUEUE_MAX_MS: AtomicU64 = AtomicU64::new(0);
+static THUMB_QUEUE_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static THUMB_CAPTURE_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
 static THUMB_CAPTURE_MAX_MS: AtomicU64 = AtomicU64::new(0);
+static GEOMETRY_RETRY_SCHEDULER: OnceLock<flume::Sender<GeometryRetryDeadline>> = OnceLock::new();
+static GEOMETRY_RETRY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const GEOMETRY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(300);
+const GEOMETRY_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+const GEOMETRY_RETRY_MAX_ATTEMPTS: u8 = 6;
+const GEOMETRY_RETRY_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
-struct ShowDesktopProbeState {
+struct GeometryTransitionProbeState {
     space_signature: Vec<u32>,
     unstable_streak: u8,
     stable_streak: u8,
     active: bool,
 }
 
-/// 基于当前 Space 的窗口变换判断 Show Desktop/动画阶段。
+#[derive(Clone, Debug, Default)]
+struct GeometryProbeSnapshot {
+    active: bool,
+    abnormal_windows: HashSet<u32>,
+    abnormal_details: HashMap<u32, GeometryAnomaly>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct GeometryAnomaly {
+    center_residual: (f64, f64),
+    center_shift: bool,
+    transform_changed: bool,
+    heavily_clipped: bool,
+}
+
+/// 将 CGS presentation bounds 的原点归一化到公开 CG window bounds 的坐标空间。
+/// CGSGetOnscreenWindowBounds 在当前 macOS 上返回与 kCGWindowBounds 相反的原点，
+/// 因此不能直接比较两个矩形的中心；宽高仍直接使用 presentation bounds 的值。
+///
+/// Normalize the CGS presentation bounds into the public CG window-bounds space.
+/// On current macOS, CGSGetOnscreenWindowBounds returns the opposite origin from
+/// kCGWindowBounds, so their centers must not be compared directly; presentation
+/// width and height are still used as reported.
+fn normalized_presentation_center(presentation_bounds: CGRect) -> (f64, f64) {
+    (
+        -presentation_bounds.x + presentation_bounds.w / 2.0,
+        -presentation_bounds.y + presentation_bounds.h / 2.0,
+    )
+}
+
+/// 返回归一化 presentation center 相对公开 bounds center 的残差。
+/// Return the residual between the normalized presentation center and public center.
+fn normalized_center_residual(
+    public_bounds: (f64, f64, f64, f64),
+    presentation_bounds: CGRect,
+) -> (f64, f64) {
+    let public_center = (
+        public_bounds.0 + public_bounds.2 / 2.0,
+        public_bounds.1 + public_bounds.3 / 2.0,
+    );
+    let presentation_center = normalized_presentation_center(presentation_bounds);
+    (
+        presentation_center.0 - public_center.0,
+        presentation_center.1 - public_center.1,
+    )
+}
+
+fn center_shift_exceeds(bounds: (f64, f64, f64, f64), residual: (f64, f64)) -> bool {
+    residual.0.abs() > (bounds.2 * 0.25).max(80.0) || residual.1.abs() > (bounds.3 * 0.25).max(80.0)
+}
+
+fn presentation_is_heavily_clipped(
+    public_bounds: (f64, f64, f64, f64),
+    presentation_bounds: CGRect,
+) -> bool {
+    let normal_area = public_bounds.2.max(0.0) * public_bounds.3.max(0.0);
+    let visible_area = presentation_bounds.w.max(0.0) * presentation_bounds.h.max(0.0);
+    normal_area > 0.0 && visible_area / normal_area < 0.25
+}
+
+fn geometry_anomaly(
+    public_bounds: (f64, f64, f64, f64),
+    transform: skylight::CGAffineTransform,
+    presentation_bounds: CGRect,
+) -> Option<GeometryAnomaly> {
+    let center_residual = normalized_center_residual(public_bounds, presentation_bounds);
+    let center_shift = center_shift_exceeds(public_bounds, center_residual);
+    let transform_changed = (transform.a - 1.0).abs()
+        + (transform.d - 1.0).abs()
+        + transform.b.abs()
+        + transform.c.abs()
+        > 0.15;
+    let heavily_clipped = presentation_is_heavily_clipped(public_bounds, presentation_bounds);
+    (center_shift || transform_changed || heavily_clipped).then_some(GeometryAnomaly {
+        center_residual,
+        center_shift,
+        transform_changed,
+        heavily_clipped,
+    })
+}
+
+fn geometry_capture_should_defer(snapshot: &GeometryProbeSnapshot, window_id: u32) -> bool {
+    // 全局过渡期间保护所有窗口;退出 hysteresis 后只保护本轮仍异常的目标窗口。
+    // During a global transition guard every window; after hysteresis exits, guard only
+    // the target window still abnormal in this sample.
+    snapshot.active || snapshot.abnormal_windows.contains(&window_id)
+}
+
+/// 基于当前 Space 的窗口变换判断 WindowServer geometry transition 阶段。
 /// The detector is intentionally heuristic: private CGS geometry is sampled together
-/// with the public current-Space window set, so a Space change resets the detector.
-static SHOW_DESKTOP_PROBE: LazyLock<Mutex<ShowDesktopProbeState>> =
-    LazyLock::new(|| Mutex::new(ShowDesktopProbeState::default()));
+/// with the public current-Space window set. A Space change clears only the old window
+/// set's evidence; the current set may still activate on its own sample.
+static GEOMETRY_TRANSITION_PROBE: LazyLock<Mutex<GeometryTransitionProbeState>> =
+    LazyLock::new(|| Mutex::new(GeometryTransitionProbeState::default()));
 
-/// 在当前 Space 里取最多三个普通窗口，判断它们是否同时发生了明显的异常变换。
-/// Sample up to three ordinary windows in the current Space and detect simultaneous
-/// abnormal transforms. Two consecutive normal samples are required to leave the state.
-fn show_desktop_probe_active() -> bool {
-    let windows = crate::window_collector::ordinary_onscreen_window_bounds();
-    let mut signature: Vec<u32> = windows.iter().map(|(wid, _)| *wid).collect();
-    signature.sort_unstable();
-    let Some(connection) = skylight::cgs_main_connection() else {
-        return false;
-    };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeometryProbeTransition {
+    None,
+    Activated,
+    Deactivated,
+}
 
-    let mut abnormal_count = 0usize;
-    for (window_id, bounds) in &windows {
-        let Some((transform, onscreen_bounds)) =
-            skylight::cgs_window_presentation_geometry(connection, *window_id)
-        else {
-            return false;
-        };
-        let normal_area = bounds.2.max(0.0) * bounds.3.max(0.0);
-        let visible_area = onscreen_bounds.w.max(0.0) * onscreen_bounds.h.max(0.0);
-        let normal_center = (bounds.0 + bounds.2 / 2.0, bounds.1 + bounds.3 / 2.0);
-        let visible_center = (
-            onscreen_bounds.x + onscreen_bounds.w / 2.0,
-            onscreen_bounds.y + onscreen_bounds.h / 2.0,
-        );
-        let center_shift = (visible_center.0 - normal_center.0).abs() > (bounds.2 * 0.25).max(80.0)
-            || (visible_center.1 - normal_center.1).abs() > (bounds.3 * 0.25).max(80.0);
-        let transform_changed = (transform.a - 1.0).abs()
-            + (transform.d - 1.0).abs()
-            + transform.b.abs()
-            + transform.c.abs()
-            > 0.15;
-        let heavily_clipped = normal_area > 0.0 && visible_area / normal_area < 0.25;
-        if center_shift || transform_changed || heavily_clipped {
-            abnormal_count += 1;
-        }
-    }
-
-    let mut state = SHOW_DESKTOP_PROBE.lock().unwrap();
+fn update_geometry_probe_state(
+    state: &mut GeometryTransitionProbeState,
+    signature: &[u32],
+    abnormal_count: usize,
+) -> GeometryProbeTransition {
     if state.space_signature != signature {
-        // Space 变化会自然改变窗口集合，不能把普通 Space 切换误认为 Show Desktop。
-        // A Space change changes the window set; never carry Show Desktop evidence across it.
-        state.space_signature = signature;
+        // Space 变化会清除旧窗口集合的证据;当前新集合若本次异常数达到阈值仍可独立激活。
+        // A Space change clears evidence for the old window set; the current new set may
+        // still activate independently if this sample reaches the abnormality threshold.
+        state.space_signature = signature.to_vec();
         state.unstable_streak = 0;
         state.stable_streak = 0;
         state.active = false;
@@ -966,23 +1161,83 @@ fn show_desktop_probe_active() -> bool {
         state.stable_streak = 0;
         if !state.active {
             state.active = true;
-            log_debug!(
-                "[show-desktop] geometry probe active abnormal_windows={} sample_streak={}",
-                abnormal_count,
-                state.unstable_streak
-            );
+            return GeometryProbeTransition::Activated;
         }
-    } else if state.active && abnormal_count == 0 {
+    } else if state.active {
         state.stable_streak = state.stable_streak.saturating_add(1);
         if state.stable_streak >= 2 {
             state.active = false;
             state.unstable_streak = 0;
-            log_debug!("[show-desktop] geometry probe inactive after stable samples");
+            return GeometryProbeTransition::Deactivated;
         }
     } else {
         state.stable_streak = 0;
     }
-    state.active
+    GeometryProbeTransition::None
+}
+
+/// 在当前 Space 里取最多三个普通窗口，判断它们是否同时发生了明显的异常变换。
+/// Sample up to three ordinary windows in the current Space and detect simultaneous
+/// abnormal transforms. Two consecutive samples below the abnormal threshold are required
+/// to leave the state; a Space change clears only the old set's evidence.
+fn window_server_geometry_transition_snapshot() -> GeometryProbeSnapshot {
+    let windows = crate::window_collector::ordinary_onscreen_window_bounds();
+    let mut signature: Vec<u32> = windows.iter().map(|(wid, _)| *wid).collect();
+    signature.sort_unstable();
+    let Some(connection) = skylight::cgs_main_connection() else {
+        return GeometryProbeSnapshot::default();
+    };
+
+    let mut abnormal_windows = HashSet::new();
+    let mut abnormal_details = HashMap::new();
+    for (window_id, bounds) in &windows {
+        let Some((transform, onscreen_bounds)) =
+            skylight::cgs_window_presentation_geometry(connection, *window_id)
+        else {
+            return GeometryProbeSnapshot::default();
+        };
+        if let Some(anomaly) = geometry_anomaly(*bounds, transform, onscreen_bounds) {
+            abnormal_windows.insert(*window_id);
+            abnormal_details.insert(*window_id, anomaly);
+        }
+    }
+
+    let abnormal_count = abnormal_windows.len();
+    let mut state = GEOMETRY_TRANSITION_PROBE.lock().unwrap();
+    let transition = update_geometry_probe_state(&mut state, &signature, abnormal_count);
+    match transition {
+        GeometryProbeTransition::Activated => {
+            let center_count = abnormal_details
+                .values()
+                .filter(|detail| detail.center_shift)
+                .count();
+            let transform_count = abnormal_details
+                .values()
+                .filter(|detail| detail.transform_changed)
+                .count();
+            let clipped_count = abnormal_details
+                .values()
+                .filter(|detail| detail.heavily_clipped)
+                .count();
+            log_debug!(
+                "[geometry-transition] WindowServer geometry transition active abnormal_windows={} center={} transform={} clipped={} sample_streak={}",
+                abnormal_count,
+                center_count,
+                transform_count,
+                clipped_count,
+                state.unstable_streak
+            )
+        }
+        GeometryProbeTransition::Deactivated => {
+            log_debug!("[geometry-transition] WindowServer geometry transition inactive after below-threshold samples")
+        }
+        GeometryProbeTransition::None => {}
+    }
+    GeometryProbeSnapshot {
+        active: state.active,
+        abnormal_windows,
+        abnormal_details,
+    }
 }
 
 /// 拒绝 WindowServer 在动画中返回的细长/裁剪源帧，避免污染已有缓存。
@@ -1020,6 +1275,7 @@ fn update_max(metric: &AtomicU64, value: u64) {
 }
 
 fn record_thumb_queue_wait(queue_ms: u64) {
+    THUMB_QUEUE_SAMPLES.fetch_add(1, Ordering::Relaxed);
     THUMB_QUEUE_TOTAL_MS.fetch_add(queue_ms, Ordering::Relaxed);
     update_max(&THUMB_QUEUE_MAX_MS, queue_ms);
 }
@@ -1034,20 +1290,125 @@ fn record_thumb_capture_failed() {
     THUMB_CAPTURE_FAILED.fetch_add(1, Ordering::Relaxed);
 }
 
+fn geometry_retry_delay(attempt: u8) -> Duration {
+    match attempt {
+        0 => GEOMETRY_RETRY_INITIAL_DELAY,
+        1 => Duration::from_millis(600),
+        2 => Duration::from_millis(1_200),
+        _ => GEOMETRY_RETRY_MAX_DELAY,
+    }
+}
+
+fn next_geometry_retry_sequence() -> u64 {
+    let mut current = GEOMETRY_RETRY_SEQUENCE.load(Ordering::Relaxed);
+    loop {
+        let next = current.wrapping_add(1).max(1);
+        match GEOMETRY_RETRY_SEQUENCE.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn run_geometry_retry_scheduler(
+    rx: flume::Receiver<GeometryRetryDeadline>,
+    job_tx: flume::Sender<()>,
+) {
+    let mut deadlines = std::collections::BinaryHeap::new();
+    loop {
+        let Some(next) = deadlines.peek().copied() else {
+            match rx.recv() {
+                Ok(deadline) => deadlines.push(deadline),
+                Err(_) => return,
+            }
+            continue;
+        };
+
+        let wait = next.deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(wait) {
+            Ok(deadline) => deadlines.push(deadline),
+            Err(flume::RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                let mut due = false;
+                while deadlines
+                    .peek()
+                    .is_some_and(|deadline| deadline.deadline <= now)
+                {
+                    deadlines.pop();
+                    due = true;
+                }
+                if due {
+                    // 调度器只负责唤醒；是否仍然有效由 CaptureState 的 token、generation
+                    // 和 retry_not_before 决定，过期 deadline 的额外 wake 是安全的。
+                    // The scheduler only wakes the worker; CaptureState remains authoritative
+                    // for token, generation, and retry_not_before, so stale deadlines are safe.
+                    // `Full` means a wake is already queued. The worker drains CaptureState
+                    // and rereads Instant::now() every round, so coalescing this wake is safe.
+                    // `Full` 表示已有 wake;worker 每轮 drain 都重读 Instant,合并唤醒是安全的。
+                    match job_tx.try_send(()) {
+                        Ok(()) | Err(flume::TrySendError::Full(_)) => {}
+                        Err(flume::TrySendError::Disconnected(_)) => return,
+                    }
+                }
+            }
+            Err(flume::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn schedule_geometry_retry(deadline: GeometryRetryDeadline, job_tx: flume::Sender<()>) -> bool {
+    if let Some(scheduler) = GEOMETRY_RETRY_SCHEDULER.get() {
+        return scheduler.send(deadline).is_ok();
+    }
+    let (scheduler_tx, rx) = flume::unbounded();
+    if std::thread::Builder::new()
+        .name("thumb-geometry-scheduler".into())
+        .spawn(move || run_geometry_retry_scheduler(rx, job_tx))
+        .is_err()
+    {
+        log_debug!(
+            "[geometry-transition] failed to start retry scheduler; deferred job will be dropped"
+        );
+        return false;
+    }
+    let _ = GEOMETRY_RETRY_SCHEDULER.set(scheduler_tx);
+    let Some(scheduler) = GEOMETRY_RETRY_SCHEDULER.get() else {
+        log_debug!("[geometry-transition] retry scheduler became unavailable; deferred job will be dropped");
+        return false;
+    };
+    if scheduler.send(deadline).is_err() {
+        log_debug!(
+            "[geometry-transition] retry scheduler rejected deadline; deferred job will be dropped"
+        );
+        false
+    } else {
+        true
+    }
+}
+
 pub(crate) fn log_capture_metrics(context: &str) {
     let enqueued = THUMB_ENQUEUED.load(Ordering::Relaxed);
     let completed = THUMB_COMPLETED.load(Ordering::Relaxed);
     let queue_total = THUMB_QUEUE_TOTAL_MS.load(Ordering::Relaxed);
     let capture_total = THUMB_CAPTURE_TOTAL_MS.load(Ordering::Relaxed);
-    let avg_queue_ms = queue_total.checked_div(completed.max(1)).unwrap_or(0);
+    let queue_samples = THUMB_QUEUE_SAMPLES.load(Ordering::Relaxed);
+    let avg_queue_ms = queue_total.checked_div(queue_samples.max(1)).unwrap_or(0);
     let avg_capture_ms = capture_total.checked_div(completed.max(1)).unwrap_or(0);
     log_debug!(
-        "[perf] thumbnail metrics context={} enqueued={} completed={} failed={} deferred={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
+        "[perf] thumbnail metrics context={} enqueued={} completed={} failed={} queue_samples={} interaction_deferred={} geometry_deferred={} geometry_retry_exhausted={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
         context,
         enqueued,
         completed,
         THUMB_CAPTURE_FAILED.load(Ordering::Relaxed),
-        THUMB_DEFERRED.load(Ordering::Relaxed),
+        queue_samples,
+        THUMB_INTERACTION_DEFERRED.load(Ordering::Relaxed),
+        THUMB_GEOMETRY_DEFERRED.load(Ordering::Relaxed),
+        THUMB_GEOMETRY_RETRY_EXHAUSTED.load(Ordering::Relaxed),
         avg_queue_ms,
         THUMB_QUEUE_MAX_MS.load(Ordering::Relaxed),
         avg_capture_ms,
@@ -1155,6 +1516,7 @@ fn enqueue_job_inner(
 fn ensure_capture_worker() -> &'static flume::Sender<()> {
     JOB_TX.get_or_init(|| {
         let (tx, rx) = flume::bounded::<()>(1);
+        let worker_tx = tx.clone();
         std::thread::Builder::new()
             .name("thumb-capture".into())
             .spawn(move || {
@@ -1172,10 +1534,11 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                     // startup prewarm processes only the first couple of jobs while the rest
                     // remain in `desired` with no token left to wake the worker.
                     loop {
+                        let now = Instant::now();
                         let Some(job) = CAPTURE_STATE
                             .lock()
                             .unwrap()
-                            .take_next_for(interaction_active)
+                            .take_next_for_at(interaction_active, now)
                         else {
                             if interaction_active {
                                 let pending_background = CAPTURE_STATE
@@ -1186,10 +1549,12 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                                     .any(|pending| {
                                         !pending.running
                                             && pending.priority < CapturePriority::Visible
+                                            && CaptureState::geometry_retry_ready(pending, now)
                                     });
                                 if pending_background {
                                     let deferred =
-                                        THUMB_DEFERRED.fetch_add(1, Ordering::Relaxed) + 1;
+                                        THUMB_INTERACTION_DEFERRED.fetch_add(1, Ordering::Relaxed)
+                                            + 1;
                                     if deferred == 1 || deferred.is_multiple_of(16) {
                                         log_debug!(
                                             "[perf] thumbnail background work deferred during interaction count={}",
@@ -1200,10 +1565,71 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                             }
                             break;
                         };
-                        let queue_ms = job.enqueued_at.elapsed().as_millis() as u64;
-                        record_thumb_queue_wait(queue_ms);
-                        run_capture_job(job);
-                        let _ = CAPTURE_STATE.lock().unwrap().finish(job);
+                        // Measure only the time spent waiting until this attempt became ready;
+                        // capture execution time is recorded separately by run_capture_job.
+                        // 只统计任务 ready 后到 worker 取出的等待时间,捕获耗时单独统计。
+                        record_thumb_queue_wait(
+                            Instant::now()
+                                .saturating_duration_since(job.ready_since)
+                                .as_millis() as u64,
+                        );
+                        match run_capture_job(job) {
+                            CaptureJobResult::Finished => {
+                                let mut state = CAPTURE_STATE.lock().unwrap();
+                                let _ = state.finish(job);
+                            }
+                            CaptureJobResult::GeometryDeferred => {
+                                let result = CAPTURE_STATE.lock().unwrap().defer_geometry_transition(
+                                    job,
+                                    Instant::now(),
+                                );
+                                match result {
+                                    GeometryDeferResult::Deferred(deadline) => {
+                                        let deferred = THUMB_GEOMETRY_DEFERRED
+                                            .fetch_add(1, Ordering::Relaxed)
+                                            + 1;
+                                        if deferred == 1 || deferred.is_multiple_of(16) {
+                                            log_debug!(
+                                                "[geometry-transition] thumbnail capture deferred during WindowServer geometry transition count={} retry_attempt={}",
+                                                deferred,
+                                                deadline.attempt
+                                            );
+                                        }
+                                        if !schedule_geometry_retry(deadline, worker_tx.clone()) {
+                                            let removed = CAPTURE_STATE
+                                                .lock()
+                                                .unwrap()
+                                                .discard_deferred(job);
+                                            log_debug!(
+                                                "[geometry-transition] retry scheduling failed pid={} wid={} deferred_job_removed={}",
+                                                job.key.pid,
+                                                job.key.wid,
+                                                removed
+                                            );
+                                        }
+                                    }
+                                    GeometryDeferResult::Exhausted => {
+                                        let exhausted = THUMB_GEOMETRY_RETRY_EXHAUSTED
+                                            .fetch_add(1, Ordering::Relaxed)
+                                            + 1;
+                                        log_debug!(
+                                            "[geometry-transition] thumbnail capture retry budget exhausted pid={} wid={} elapsed_ms={} count={}",
+                                            job.key.pid,
+                                            job.key.wid,
+                                            job.enqueued_at.elapsed().as_millis(),
+                                            exhausted
+                                        );
+                                    }
+                                    GeometryDeferResult::Stale => {
+                                        log_debug!(
+                                            "[geometry-transition] stale deferred thumbnail job dropped pid={} wid={}",
+                                            job.key.pid,
+                                            job.key.wid
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         drained_jobs += 1;
                     }
                     if drained_jobs > 0 {
@@ -1229,7 +1655,7 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
     })
 }
 
-fn run_capture_job(job: CaptureJob) {
+fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
     let key = job.key;
     if !CAPTURE_STATE.lock().unwrap().is_current(job) {
         log_debug!(
@@ -1238,19 +1664,32 @@ fn run_capture_job(job: CaptureJob) {
             key.wid,
             job.priority.label()
         );
-        return;
+        return CaptureJobResult::Finished;
     }
     // 在真正捕获前再次探测，覆盖任务取出后到调用 WindowServer 之间的动画竞态。
     // Probe again immediately before capture to cover the race between job selection
     // and the WindowServer call when the animation starts.
-    if show_desktop_probe_active() {
+    let geometry = window_server_geometry_transition_snapshot();
+    if geometry_capture_should_defer(&geometry, key.wid) {
+        let anomaly = geometry
+            .abnormal_details
+            .get(&key.wid)
+            .copied()
+            .unwrap_or_default();
         log_debug!(
-            "[thumb] capture skipped during Show Desktop geometry transition pid={} wid={} priority={}",
+            "[geometry-transition] capture deferred during WindowServer geometry transition pid={} wid={} priority={} global_active={} target_abnormal={} center_shift={} center_residual=({:.1},{:.1}) transform_changed={} clipped={}",
             key.pid,
             key.wid,
-            job.priority.label()
+            job.priority.label(),
+            geometry.active,
+            geometry.abnormal_windows.contains(&key.wid),
+            anomaly.center_shift,
+            anomaly.center_residual.0,
+            anomaly.center_residual.1,
+            anomaly.transform_changed,
+            anomaly.heavily_clipped
         );
-        return;
+        return CaptureJobResult::GeometryDeferred;
     }
     // 每个任务前重新 preflight:未授权时静默跳过(运行中授权后自动恢复)。
     // Re-preflight per job: silently skip while unauthorized (auto-resumes once
@@ -1263,7 +1702,7 @@ fn run_capture_job(job: CaptureJob) {
             allowed,
             enabled
         );
-        return;
+        return CaptureJobResult::Finished;
     }
     if job
         .activation_at
@@ -1274,13 +1713,13 @@ fn run_capture_job(job: CaptureJob) {
             key.pid,
             key.wid
         );
-        return;
+        return CaptureJobResult::Finished;
     }
     let job_started = Instant::now();
     let Some(captured) = (unsafe { capture_window(key.wid, job.target_px_h) }) else {
         record_thumb_capture_failed();
         log_debug!("[thumb] capture failed pid={} wid={}", key.pid, key.wid);
-        return;
+        return CaptureJobResult::Finished;
     };
     log_debug!(
         "[thumb] capture result pid={} wid={} source={}x{} cached={}x{} target_h={}",
@@ -1304,7 +1743,7 @@ fn run_capture_job(job: CaptureJob) {
             captured.source_h_px,
             job.priority.label()
         );
-        return;
+        return CaptureJobResult::Finished;
     }
     if job
         .activation_at
@@ -1318,7 +1757,7 @@ fn run_capture_job(job: CaptureJob) {
             key.pid,
             key.wid
         );
-        return;
+        return CaptureJobResult::Finished;
     }
     record_thumb_capture(job_started.elapsed().as_millis() as u64);
     // 空白帧门控:后台挂起的 WKWebView(Tauri/Electron 等)截出来只剩"标题栏+
@@ -1369,7 +1808,7 @@ fn run_capture_job(job: CaptureJob) {
                     key.wid,
                     job.priority.label()
                 );
-                return;
+                return CaptureJobResult::Finished;
             }
             BlankFrameAction::DiscardRetryActivation => {
                 unsafe {
@@ -1381,7 +1820,7 @@ fn run_capture_job(job: CaptureJob) {
                     key.pid,
                     key.wid
                 );
-                return;
+                return CaptureJobResult::Finished;
             }
         }
     }
@@ -1401,7 +1840,7 @@ fn run_capture_job(job: CaptureJob) {
             key.wid,
             job.priority.label()
         );
-        return;
+        return CaptureJobResult::Finished;
     }
     // 帧最终入库:激活补拍链的重试名额随之释放(空白帧"如实入库"路径同样到此为止)。
     // The frame is finally stored: the activation chain's retry slot is released with
@@ -1419,6 +1858,7 @@ fn run_capture_job(job: CaptureJob) {
     // Let the main thread validate visibility and card membership. The capture worker no longer
     // reads TAB_STATE, and the main-thread handler quickly drops notifications while hidden.
     enqueue_ready_delivery(key);
+    CaptureJobResult::Finished
 }
 
 /// 激活补拍的有效性:激活 token 未过时,且该 App 此刻仍是系统前台。
@@ -2425,6 +2865,384 @@ mod tests {
         let activation = state.take_next().unwrap();
         assert_eq!(activation.target_px_h, 512);
         assert_eq!(activation.priority, CapturePriority::Activation);
+    }
+
+    #[test]
+    fn capture_state_defers_geometry_transition_and_retrieves_same_job() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+        let now = Instant::now();
+
+        assert!(state.request(key, 640, CapturePriority::Visible));
+        let job = state.take_next_for_at(false, now).unwrap();
+        let deadline = match state.defer_geometry_transition(job, now) {
+            GeometryDeferResult::Deferred(deadline) => deadline,
+            result => panic!("unexpected defer result: {result:?}"),
+        };
+        assert!(state.is_current(job));
+        assert_eq!(
+            state.desired.get(&key).unwrap().ready_since,
+            deadline.deadline
+        );
+
+        // 未到截止时间的几何任务不可阻塞其他就绪任务；到期后保留原 token/generation。
+        // A not-yet-due geometry retry must not block other ready work; once due it keeps
+        // the original token and PID generation.
+        let other = ThumbKey { pid: 10, wid: 21 };
+        assert!(state.request(other, 640, CapturePriority::Visible));
+        let ready = state.take_next_for_at(false, now).unwrap();
+        assert_eq!(ready.key, other);
+        assert!(!state.finish(ready));
+        assert!(state.take_next_for_at(false, now).is_none());
+        let retry = state.take_next_for_at(false, deadline.deadline).unwrap();
+        assert_eq!(retry.key, job.key);
+        assert_eq!(retry.token, job.token);
+        assert_eq!(retry.pid_generation, job.pid_generation);
+        assert_eq!(retry.enqueued_at, job.enqueued_at);
+        assert_eq!(retry.ready_since, deadline.deadline);
+        assert!(!state.finish(retry));
+    }
+
+    #[test]
+    fn capture_state_does_not_revive_stale_or_cancelled_geometry_job() {
+        let key = ThumbKey { pid: 10, wid: 20 };
+
+        let mut stale_state = CaptureState::default();
+        assert!(stale_state.request(key, 512, CapturePriority::Visible));
+        let stale_job = stale_state.take_next().unwrap();
+        stale_state.cancel_all();
+        assert_eq!(
+            stale_state.defer_geometry_transition(stale_job, Instant::now()),
+            GeometryDeferResult::Stale
+        );
+        assert!(stale_state.take_next().is_none());
+
+        let mut cancelled_state = CaptureState::default();
+        assert!(cancelled_state.request(key, 512, CapturePriority::Visible));
+        let cancelled_job = cancelled_state.take_next().unwrap();
+        cancelled_state.cancel_pid(key.pid);
+        assert_eq!(
+            cancelled_state.defer_geometry_transition(cancelled_job, Instant::now()),
+            GeometryDeferResult::Stale
+        );
+        assert!(cancelled_state.take_next().is_none());
+    }
+
+    #[test]
+    fn normalized_presentation_center_matches_public_bounds_for_offset_displays() {
+        let identity = skylight::CGAffineTransform {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        let cases = [
+            ((265.0, 144.0, 940.0, 701.0), (-265.0, -144.0)),
+            // 左侧副显示器: public x 为负, presentation x 为正。
+            ((-1600.0, 144.0, 940.0, 701.0), (1600.0, -144.0)),
+            // 纵向显示器同时覆盖负 y 和正 y 的情况。
+            ((-900.0, -1200.0, 940.0, 701.0), (900.0, 1200.0)),
+            ((265.0, 1200.0, 940.0, 701.0), (-265.0, -1200.0)),
+        ];
+
+        for (public_bounds, (presentation_x, presentation_y)) in cases {
+            let presentation_bounds = CGRect {
+                x: presentation_x,
+                y: presentation_y,
+                w: public_bounds.2,
+                h: public_bounds.3,
+            };
+            let residual = normalized_center_residual(public_bounds, presentation_bounds);
+            assert!(residual.0.abs() < 0.001, "x residual={:?}", residual);
+            assert!(residual.1.abs() < 0.001, "y residual={:?}", residual);
+            assert!(!center_shift_exceeds(public_bounds, residual));
+            assert!(geometry_anomaly(public_bounds, identity, presentation_bounds).is_none());
+        }
+    }
+
+    #[test]
+    fn normalized_center_residual_detects_real_motion_and_handles_size_change() {
+        let public_bounds = (265.0, 144.0, 940.0, 701.0);
+        let shifted = CGRect {
+            x: -515.0,
+            y: -144.0,
+            w: 940.0,
+            h: 701.0,
+        };
+        let residual = normalized_center_residual(public_bounds, shifted);
+        assert_eq!(residual, (250.0, 0.0));
+        assert!(center_shift_exceeds(public_bounds, residual));
+        let identity = skylight::CGAffineTransform {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        let anomaly = geometry_anomaly(public_bounds, identity, shifted).unwrap();
+        assert!(anomaly.center_shift);
+        assert_eq!(anomaly.center_residual, residual);
+
+        // 只改变 presentation 尺寸时，中心变化按半个尺寸差计算；小变化不应误报。
+        // A small presentation-size change moves the center by half the size delta and
+        // should remain below the existing relative/absolute threshold.
+        let resized = CGRect {
+            x: -265.0,
+            y: -144.0,
+            w: 1_100.0,
+            h: 701.0,
+        };
+        let resize_residual = normalized_center_residual(public_bounds, resized);
+        assert_eq!(resize_residual, (80.0, 0.0));
+        assert!(!center_shift_exceeds(public_bounds, resize_residual));
+    }
+
+    #[test]
+    fn geometry_anomaly_reasons_keep_clipping_guard_independent() {
+        let public_bounds = (0.0, 33.0, 960.0, 640.0);
+        let clipped = CGRect {
+            x: -280.0,
+            y: -253.0,
+            w: 400.0,
+            h: 200.0,
+        };
+        let residual = normalized_center_residual(public_bounds, clipped);
+        assert!(!center_shift_exceeds(public_bounds, residual));
+        assert!(presentation_is_heavily_clipped(public_bounds, clipped));
+        let identity = skylight::CGAffineTransform {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        let anomaly = geometry_anomaly(public_bounds, identity, clipped).unwrap();
+        assert!(!anomaly.center_shift);
+        assert!(anomaly.heavily_clipped);
+    }
+
+    #[test]
+    fn target_specific_snapshot_ignores_stable_offset_and_defers_real_target() {
+        let public_bounds = (265.0, 144.0, 940.0, 701.0);
+        let stable_presentation = CGRect {
+            x: -265.0,
+            y: -144.0,
+            w: 940.0,
+            h: 701.0,
+        };
+        let identity = skylight::CGAffineTransform {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        assert!(geometry_anomaly(public_bounds, identity, stable_presentation).is_none());
+        let stable_snapshot = GeometryProbeSnapshot::default();
+        assert!(!geometry_capture_should_defer(&stable_snapshot, 194));
+
+        let moving_presentation = CGRect {
+            x: -515.0,
+            y: stable_presentation.y,
+            w: stable_presentation.w,
+            h: stable_presentation.h,
+        };
+        let anomaly = geometry_anomaly(public_bounds, identity, moving_presentation).unwrap();
+        let moving_snapshot = GeometryProbeSnapshot {
+            abnormal_windows: HashSet::from([194]),
+            abnormal_details: HashMap::from([(194, anomaly)]),
+            ..GeometryProbeSnapshot::default()
+        };
+        assert!(geometry_capture_should_defer(&moving_snapshot, 194));
+        assert!(!geometry_capture_should_defer(&moving_snapshot, 10));
+    }
+
+    #[test]
+    fn geometry_probe_leaves_after_two_consecutive_normal_samples() {
+        let mut state = GeometryTransitionProbeState::default();
+        let signature = [10, 20];
+
+        assert_eq!(
+            update_geometry_probe_state(&mut state, &signature, 2),
+            GeometryProbeTransition::Activated
+        );
+        assert!(state.active);
+        assert_eq!(
+            update_geometry_probe_state(&mut state, &signature, 1),
+            GeometryProbeTransition::None
+        );
+        assert!(state.active);
+        assert_eq!(
+            update_geometry_probe_state(&mut state, &signature, 1),
+            GeometryProbeTransition::Deactivated
+        );
+        assert!(!state.active);
+    }
+
+    #[test]
+    fn geometry_probe_keeps_lone_abnormal_target_guarded_after_global_exit() {
+        let mut state = GeometryTransitionProbeState::default();
+        let signature = [10, 20];
+        assert_eq!(
+            update_geometry_probe_state(&mut state, &signature, 2),
+            GeometryProbeTransition::Activated
+        );
+        assert_eq!(
+            update_geometry_probe_state(&mut state, &signature, 1),
+            GeometryProbeTransition::None
+        );
+        assert_eq!(
+            update_geometry_probe_state(&mut state, &signature, 1),
+            GeometryProbeTransition::Deactivated
+        );
+        let snapshot = GeometryProbeSnapshot {
+            active: state.active,
+            abnormal_windows: HashSet::from([20]),
+            abnormal_details: HashMap::from([(
+                20,
+                GeometryAnomaly {
+                    center_residual: (250.0, 0.0),
+                    center_shift: true,
+                    ..GeometryAnomaly::default()
+                },
+            )]),
+        };
+        assert!(geometry_capture_should_defer(&snapshot, 20));
+        assert!(!geometry_capture_should_defer(&snapshot, 10));
+    }
+
+    #[test]
+    fn geometry_retry_budget_is_bounded_and_fresh_request_can_reenter() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+        let mut now = Instant::now();
+        assert!(state.request(key, 512, CapturePriority::Visible));
+
+        for attempt in 0..GEOMETRY_RETRY_MAX_ATTEMPTS {
+            let job = state.take_next_for_at(false, now).unwrap();
+            let deferred = state.defer_geometry_transition(job, now);
+            let deadline = match deferred {
+                GeometryDeferResult::Deferred(deadline) => deadline,
+                result => panic!("attempt {attempt} unexpectedly returned {result:?}"),
+            };
+            assert_eq!(
+                deadline.deadline.duration_since(now),
+                geometry_retry_delay(attempt)
+            );
+            assert!(state.take_next_for_at(false, now).is_none());
+            now = deadline.deadline;
+        }
+
+        let exhausted_job = state.take_next_for_at(false, now).unwrap();
+        assert_eq!(
+            state.defer_geometry_transition(exhausted_job, now),
+            GeometryDeferResult::Exhausted
+        );
+        assert!(state.take_next_for_at(false, now).is_none());
+        assert!(state.request(key, 512, CapturePriority::Selected));
+        assert!(state.take_next_for_at(false, now).is_some());
+    }
+
+    #[test]
+    fn geometry_retry_heap_keeps_later_deadlines_after_earlier_wake() {
+        let now = Instant::now();
+        let later = GeometryRetryDeadline {
+            deadline: now + Duration::from_secs(2),
+            sequence: 2,
+            attempt: 2,
+        };
+        let earlier = GeometryRetryDeadline {
+            deadline: now + Duration::from_millis(300),
+            sequence: 1,
+            attempt: 1,
+        };
+        let mut heap = std::collections::BinaryHeap::new();
+        heap.push(later);
+        heap.push(earlier);
+        assert_eq!(heap.pop().unwrap().sequence, 1);
+        assert_eq!(heap.pop().unwrap().sequence, 2);
+    }
+
+    #[test]
+    fn geometry_retry_scheduler_wakes_earlier_and_later_deadlines_and_exits_on_disconnect() {
+        let (deadline_tx, deadline_rx) = flume::unbounded();
+        let (job_tx, job_rx) = flume::bounded(1);
+        let scheduler =
+            std::thread::spawn(move || run_geometry_retry_scheduler(deadline_rx, job_tx));
+        let now = Instant::now();
+        deadline_tx
+            .send(GeometryRetryDeadline {
+                deadline: now + Duration::from_millis(350),
+                sequence: 2,
+                attempt: 2,
+            })
+            .unwrap();
+        deadline_tx
+            .send(GeometryRetryDeadline {
+                deadline: now + Duration::from_millis(100),
+                sequence: 1,
+                attempt: 1,
+            })
+            .unwrap();
+
+        assert!(job_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        assert!(job_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        drop(deadline_tx);
+        scheduler.join().unwrap();
+    }
+
+    #[test]
+    fn geometry_retry_deadline_eq_matches_ordering_equality() {
+        let now = Instant::now();
+        let same = GeometryRetryDeadline {
+            deadline: now,
+            sequence: 7,
+            attempt: 1,
+        };
+        let same_ordering = GeometryRetryDeadline {
+            deadline: now,
+            sequence: 7,
+            attempt: 4,
+        };
+        let different_deadline = GeometryRetryDeadline {
+            deadline: now + Duration::from_millis(1),
+            sequence: 7,
+            attempt: 1,
+        };
+        assert_eq!(same, same_ordering);
+        assert_eq!(same.cmp(&same_ordering), CmpOrdering::Equal);
+        assert_ne!(same, different_deadline);
+        assert_ne!(same.cmp(&different_deadline), CmpOrdering::Equal);
+    }
+
+    #[test]
+    fn finishing_geometry_retry_follow_up_resets_retry_budget() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+        let now = Instant::now();
+        assert!(state.request(key, 512, CapturePriority::Visible));
+        let first = state.take_next_for_at(false, now).unwrap();
+        let deadline = match state.defer_geometry_transition(first, now) {
+            GeometryDeferResult::Deferred(deadline) => deadline.deadline,
+            result => panic!("unexpected defer result: {result:?}"),
+        };
+        let retry = state.take_next_for_at(false, deadline).unwrap();
+        assert!(!state.request(key, 640, CapturePriority::Selected));
+        let before_finish = Instant::now();
+        assert!(state.finish(retry));
+
+        let pending = state.desired.get(&key).unwrap();
+        assert_eq!(pending.geometry_retry_not_before, None);
+        assert_eq!(pending.geometry_retry_attempts, 0);
+        assert_eq!(pending.geometry_retry_started_at, None);
+        assert!(pending.ready_since >= before_finish);
+        let follow_up = state.take_next_for_at(false, deadline).unwrap();
+        assert_eq!(follow_up.target_px_h, 640);
     }
 
     #[test]
