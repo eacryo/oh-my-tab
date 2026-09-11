@@ -37,10 +37,10 @@ It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly thr
 - <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: caption row above a 16:10 live preview, captured via a private WindowServer API and cached in memory — cached frames render instantly and a background refresh keeps them current; rows are balanced when they fit, and when they overflow the grid fills in MRU order and scrolls continuously. Requires **Screen Recording** permission — without it the switcher falls back to icon-only cards. Turning thumbnails off immediately releases cached window frames from memory.
 - <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window keeps the app's other windows in their existing order.
 - <img height="14" src="docs/icons/eye.svg"> **Full window visibility**: every real window, including off-screen and minimized (toggleable).
-- <img height="14" src="docs/icons/gear.svg"> **Hot-reloadable TOML**: validated config from the menu.
+- <img height="14" src="docs/icons/gear.svg"> **Settings**: configure appearance and features from the Settings window, with changes applied immediately.
 - <img height="14" src="docs/icons/globe.svg"> **Zero-dependency i18n**: English / Simplified / Traditional Chinese, live system-language follow.
 - <img height="14" src="docs/icons/note.svg"> **Per-launch logs**: 30-day retention ([Logging](#logging)).
-- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration, and **side-button → shortcut mapping** ([Configuration](#configuration)).
+- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration, and **side-button → shortcut mapping**.
 - <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images, file copies — search, pin, delete, expiry, persistence ([Clipboard history](#clipboard-history)).
 
 <br />
@@ -76,7 +76,7 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 
 > **Known v1 tradeoffs** — each entry records exactly one kind of content: a copy carrying **both text and an image** (e.g. copying an image from a web page) records only the text; **multiple-file copies and single non-image file copies are omitted from history**. The same picture copied both as an image and as a file stays as two separate entries (they answer different paste semantics). Dedup is per-kind: text by exact content, images by content hash.
 
-**Using an entry reorders the history by default** (like Maccy): selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top. The **"Move used entries to the top"** switch in Settings turns this off (like Windows Win+V). With the optional **"Delete entry after paste"** switch on, holding **Option** while pressing Enter or clicking a row pastes the entry and removes it from the history right away (one-shot paste). Its dependent **"Also delete the corresponding system clipboard item"** switch additionally removes the corresponding clipboard content after a short delay, if no newer copy replaced it. The picker's "Clear history" keeps pinned entries. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note under [Configuration](#configuration).
+**Using an entry reorders the history by default** (like Maccy): selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top. The **"Move used entries to the top"** switch in Settings turns this off (like Windows Win+V). With the optional **"Delete entry after paste"** switch on, holding **Option** while pressing Enter or clicking a row pastes the entry and removes it from the history right away (one-shot paste). Its dependent **"Also delete the corresponding system clipboard item"** switch additionally removes the corresponding clipboard content after a short delay, if no newer copy replaced it. The picker's "Clear history" keeps pinned entries. An optional **"Save clipboard history to disk"** switch persists the history across restarts; see the privacy note above.
 
 ## <img height="16" src="docs/icons/alert.svg">&nbsp;&nbsp;Known Issues
 
@@ -89,7 +89,7 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 If windows are already open when the app starts, their initial ordering is seeded from WindowServer's front-to-back order. This provides an initial approximation; live activation events refine the window-level MRU after launch.
 
 
-Development-only issues and raw-binary debugging notes are collected in [docs/developer-notes.md](docs/developer-notes.md).
+Development-only issues and raw-binary debugging notes are collected in [docs/developer-notes-en.md](docs/developer-notes-en.md).
 
 ## <img height="16" src="docs/icons/tools.svg">&nbsp;&nbsp;Requirements
 
@@ -206,128 +206,24 @@ generation do not depend on a developer-specific Downloads path.
 
 If grants ever go stale (e.g. leftovers from old ad-hoc installs), clear them: `tccutil reset Accessibility com.eacryo.oh-my-tab`. A self-signed cert only stabilises TCC identity — it does **not** satisfy Gatekeeper for other users; that requires a paid Apple Developer ID certificate (set `SIGN_IDENTITY` in `scripts/bundle.sh`).
 
-For the full release pipeline (Homebrew cask generation, the signing rationale, icon regeneration), see [docs/releasing.md](docs/releasing.md).
+For the full release pipeline (Homebrew cask generation, the signing rationale, icon regeneration), see [docs/releasing-en.md](docs/releasing-en.md).
 
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;Permissions & runtime caveats
 
 - The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary must be re-granted -- unless you sign with a stable identity (see [Code signing](#code-signing)), in which case the grant persists across rebuilds.
 - **Window thumbnails** additionally require the **Screen Recording** permission (System Settings → Privacy & Security → Screen Recording). A private WindowServer capture API is used, same as DockDoor/AltTab. Without it the switcher silently keeps icon-only cards; granting it later resumes thumbnail capture without restarting. Frames are kept **in memory only** — nothing is ever written to disk.
 - If the event tap fails to create, the app prints an error and the shortcut silently does nothing — almost always a missing Accessibility grant.
-- Runtime config: `~/.config/oh-my-tab/config.toml` (auto-created with defaults on first run).
 - Icon cache: `~/Library/Caches/oh-my-tab-icons/{bundle-id}.png` (keyed by bundle id, with a `.meta` mtime sidecar; clearable from the menu).
 
-## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;Configuration
+## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;Settings
 
-`~/.config/oh-my-tab/config.toml` — auto-created with defaults on first run. Loading is **per-field resilient**: invalid fields fall back to defaults and are logged, while the rest of the configuration remains active. Reloadable at runtime via the menu (*Reload Config*), which also re-applies theme and refreshes the overlay. The commonly edited keys:
-
-```toml
-[appearance]
-theme = "auto"           # "dark" | "light" | "auto"; default follows macOS appearance
-glass_style = "regular"  # "regular" | "clear"
-glass_tint = "eeeeee66"  # RRGGBBAA — default Liquid Glass overlay tint
-corner_radius = 32.0
-
-[layout]
-thumbnails_enabled = true  # window thumbnails on cards; off = icon-only cards
-card_text_size = 15.0      # card text size in points; thumbnail's left icon scales with it (13..=20)
-
-[fonts]
-status_bar_size = 15.0     # footer title text size in points; footer height follows it (13..=20)
-
-[keyboard]
-modifier = "command"     # "option" (Option+Tab) | "command" (Cmd+Tab)
-
-[i18n]
-locale = "auto"          # "auto" | "en" | "zh-Hans" | "zh-Hant"
-
-[windows]
-enabled = true            # app-switcher master switch (off = Cmd+Tab passes through to the system)
-show_minimized = false    # show minimized windows in the overlay
-overlay_position = "active_window"  # "active_window" (follow the active window's screen) | "main" (always the main screen)
-
-[logging]
-level = "info"           # "debug" | "info"
-file_path = ""           # empty = default rolling path; see Logging below
-
-[startup]
-launch_at_login = false  # launch at login (requires running as a .app bundle; macOS 13+)
-
-[updates]
-automatically_check = true  # automatically check for updates through Sparkle
-
-[clipboard]
-enabled = false          # clipboard history master switch (off by default)
-max_entries = 50         # max history entries (1..=100)
-persist = false          # save history to disk so it survives restarts (see the privacy note below)
-auto_expire_days = 3     # unpinned entries are deleted after N days (0-7, memory AND disk); 0 = never delete
-pin_follow_selection = true # after pin/unpin, move the selection to the toggled entry (false = keep the current position)
-move_used_to_top = true  # pasting moves the used entry to the top (false = keep the current order, like Win+V)
-delete_after_paste = false # Option+Enter or Option+click pastes the entry AND removes it from the history (one-shot paste)
-clear_system_pasteboard_after_paste = false # when delete_after_paste is on, delete the corresponding system clipboard item after pasting
-picker_position = "main" # picker position: "mouse" (follow the cursor) | "main" (centered on the main screen)
-show_source_app = false  # show the source app name in rows (the source is always recorded either way)
-
-[mouse]
-enabled = false          # master switch for the mouse-control event tap
-
-# The first profile without device_* fields is the default ("all mice") layer.
-# Additional profiles match a specific device by VID/PID and override the default
-# per-field. Effective config = default layer merged with the matching device layer.
-[[mouse.profiles]]
-reverse_scroll = false   # flip scroll direction relative to the system
-scroll_mode = "default"  # "default" | "line" (fixed lines per tick)
-line_count = 3           # lines per tick in "line" mode (1..=10)
-button_mappings_enabled = true  # per-profile mappings master switch (default true)
-
-[mouse.profiles.pointer]
-disable_acceleration = false  # disable system pointer acceleration (linear tracking)
-
-# Button mappings: bind middle/side buttons (button number >= 2) to actions.
-# Left (0) / right (1) can't be bound (you'd lock yourself out of clicking).
-# Button numbers: 2 = middle, 3 = back, 4 = forward, 5+ = other side/macro
-# buttons (they vary per mouse -- configure per device). Values can be a shortcut
-# ("cmd+shift+v"), a system action ("missioncontrol"/"launchpad"/"showdesktop"/
-# "appexpose", fired via Dock's private notification -- immune to system-shortcut
-# occupancy), or "none" (swallow the button; it becomes inert). Binding Cmd+Tab /
-# Option+V opens OUR overlay / clipboard (dispatched internally, no synthesized events).
-[mouse.profiles.button_mappings]
-"3" = "cmd+shift+v"
-"4" = "alt+tab"
-
-# Example per-device override layer (Logitech MCHOSE G3 V2):
-[[mouse.profiles]]
-device_vendor_id = 10007
-device_product_id = 12976
-reverse_scroll = true
-scroll_mode = "line"
-line_count = 3
-```
-
-The advanced `[colors]` and `[fonts]` sections (card text colors and sizes per theme) are written to the auto-created config file with their defaults — edit them there.
-
-> **Clipboard-history persistence & privacy** — enabling `persist` (or the "Save clipboard
-> history to disk" switch in Settings) writes your clipboard history — copied text, filenames, and
-> image bytes — to disk so it survives app restarts:
->
-> - `~/.config/oh-my-tab/clipboard-history.toml` (text, filenames, sources, metadata; mode 600)
-> - `~/Library/Caches/oh-my-tab-clip-images/` (image bytes and previews, keyed by content hash)
->
-> These files are stored in **plain text / unencrypted**. The history file is readable by
-> **any application running as your user** (mode 600 only blocks other user accounts), so do
-> **not** enable persistence if you copy passwords, tokens, or other secrets. As a safeguard,
-> content marked with the standard `nspasteboard.org` "Securing Copy" markers
-> (`org.nspasteboard.ConcealedType` / `TransientType` / `AutoGeneratedType`, plus the
-> 1Password marker `com.agilebits.onepassword`) is filtered from recording. Password managers
-> stamp these markers on password copies, keeping such content out of the history (memory and
-> disk). Persistence is off by default.
-
-Mouse settings are also exposed in the Settings window (a **device picker** lists each connected mouse; pick one to edit its layer). The button-mappings section lists bound rows (button name + action description + keycaps); clicking **Edit** opens an edit panel (same as LinearMouse): record the trigger side button, pick the action type (Default / None / Key Press / Mission Control / Launchpad / Show Desktop / App Exposé), and record the combo for Key Press, then confirm. Toggling `mouse.enabled` takes effect immediately — no app restart needed.
+All options are managed from the in-app Settings window and apply immediately. It covers appearance, window switching, window control, quick actions, clipboard history, mouse control, startup, and updates.
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 
 - **Destination**: the development `.app` launched by `scripts/dev-restart.sh` and packaged `.app` builds write to the log file. A raw `cargo run` also writes to stdout and is reserved for low-level debugging.
 - **Default file path**: `~/Library/Logs/oh-my-tab/oh-my-tab.log`. When the active file reaches 10 MB, it rolls through `oh-my-tab.log.1` to `oh-my-tab.log.5` and keeps the newest five backups. Each launch writes a session marker so runs remain distinguishable. Legacy per-launch logs and stale backups older than 30 days are deleted at startup.
-- **Custom path**: `[logging] file_path` (edit `config.toml` directly; not exposed in Settings). A user-supplied path is used **verbatim**, in append mode — no timestamp is added and no cleanup is performed on it; rotation and retention are yours.
+- **Log level**: can be changed from the Settings window when troubleshooting is needed.
 - **Memory diagnostics**: at the `info` log level, after roughly 60 seconds and then every 5 minutes, the app records one `[mem]` line containing the active feature profile (`mouse:on|off`, `thumbs:on|off`, `clipboard:off|memory|persistent`), process footprint/RSS, sampled footprint peak, thread count, and estimated thumbnail/clipboard/window ledgers. `footprint` is the macOS physical-footprint metric used for the Activity Monitor Memory column and is the primary number for memory pressure; `rss` is current resident memory and can fall as macOS compresses or reclaims pages. `footprint_peak_sampled` is sampled by the app, while `rss_peak_kernel` is the kernel's lifetime high-water mark. Clipboard memory is split into text, preview, and metadata estimates; original image bytes in the disk cache are not counted as resident memory. Persistence mainly changes history lifetime and startup restoration; the per-entry RAM model remains the same. Clipboard contents and window imagery are excluded from the log.
 - **Privacy**: debug logs record only `Tab` / `Command` / `Option` (and the summon combo name) from the switcher's key tap; every other key is logged as plain `Other`, without keycodes or modifier details.
 
