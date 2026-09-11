@@ -7,9 +7,9 @@
 `scripts/release.sh` 是完整的发布流水线：先跑 `bundle.sh`（构建 .app + .dmg + Sparkle .zip + 签名），再生成 `dist/oh-my-tab.rb` —— 一个 Homebrew cask 文件，内含 dmg 的 `sha256`、从 `Cargo.toml` 读出的 `version`，以及 `zap trash:` 块（`brew uninstall --cask` 会一并清理图标缓存、日志和配置）。默认不会上传；只有显式传入 `--push` 才会调用 R2 发布工具。
 
 ```sh
-sh scripts/release.sh                  # 本地构建，不访问 R2
-sh scripts/release.sh --push          # 构建后上传 ZIP、DMG、appcast.xml
-sh scripts/release.sh --push --dry-run  # 检查并打印上传计划
+sh scripts/release.sh                    # 本地构建，不访问 R2
+sh scripts/release.sh --push             # 构建后上传 ZIP、DMG、appcast.xml
+sh scripts/release.sh --push --dry-run   # 检查并打印上传计划
 ```
 
 开发通道使用独立的 Bundle ID、Feed、R2 前缀和包名前缀，不会混入生产更新：
@@ -54,7 +54,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 
 发布前置条件：普通的 `cargo build` / `cargo test` 不需要 Sparkle；仓库已提交固定版本的 Sparkle 2 framework 到 `vendor/Sparkle.framework`，因此默认可构建带更新功能的 `.app`。仓库也包含固定版本 Sparkle 2.9.6 的 `vendor/Sparkle/bin/generate_keys` 和 `vendor/Sparkle/bin/generate_appcast`，用于生成密钥和 appcast；这两个工具是 macOS universal 二进制文件。相关工具许可证见 `vendor/Sparkle/LICENSE`。
 
-更新器代码会在运行时加载 `Contents/Frameworks/Sparkle.framework`。把 Sparkle 2 的框架放到 `vendor/Sparkle.framework`，或设置 `SPARKLE_FRAMEWORK_PATH`，`bundle.sh` / `dev-restart.sh` 会自动拷贝它。生产应用包中的 `SUFeedURL` 默认是 `https://download.oh-my-tab.app/appcast.xml`，开发重启和开发发布脚本默认使用 `https://download.oh-my-tab.app/dev_release/appcast.xml`；也可用 `SPARKLE_FEED_URL` 覆盖。
+更新器代码会在运行时加载 `Contents/Frameworks/Sparkle.framework`。框架已提交在 `vendor/Sparkle.framework`（可用 `SPARKLE_FRAMEWORK_PATH` 覆盖路径），`bundle.sh` / `dev-restart.sh` 会自动拷贝它。生产应用包中的 `SUFeedURL` 默认是 `https://download.oh-my-tab.app/appcast.xml`，开发重启和开发发布脚本默认使用 `https://download.oh-my-tab.app/dev_release/appcast.xml`；也可用 `SPARKLE_FEED_URL` 覆盖。
 
 `appcast.xml` 和更新归档由发布者自行上传到 R2。生成 appcast 时使用 Sparkle 的 Ed25519 私钥；打包时只需把对应公钥通过 `SPARKLE_PUBLIC_ED_KEY` 注入 `SUPublicEDKey`。Sparkle 比较 `CFBundleVersion`（build number），脚本默认用 UTC 时间戳生成它；需要可复现的测试时再设置 `SPARKLE_BUILD_VERSION`。`CFBundleShortVersionString` 仍负责展示给用户的版本。私钥不要提交到仓库、不要放进应用包，也不要上传到 R2。
 
@@ -72,7 +72,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 
 1. *钥匙串访问 → 证书助理 → 创建证书…*
 2. 名称：`oh-my-tab-sign`，身份类型：**自签名根**，证书类型：**代码签名**。
-3. 创建。（首次跑 `bundle.sh` 可能弹钥匙串访问提示 -- 点「始终允许」。）
+3. 创建。（首次跑 `bundle.sh` 可能弹钥匙串访问提示——点「始终允许」。）
 
 然后重新打包、重装、授予辅助功能一次。之后每次 rebuild 用的是同一个证书身份，无需再重新授权。若授权变陈旧（比如旧 ad-hoc 安装残留），清除：
 
@@ -80,7 +80,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 tccutil reset Accessibility com.eacryo.oh-my-tab
 ```
 
-**注意：** 自签名证书只稳定 TCC 身份，**不**满足 Gatekeeper 分发 -- 别人装仍是「未识别开发者」，需右键打开。要彻底解决分发得用付费的 Apple **Developer ID Application** 证书；有的话把 `scripts/bundle.sh` 里的 `SIGN_IDENTITY` 改成那个名字。
+**注意：** 自签名证书只稳定 TCC 身份，**不**满足 Gatekeeper 分发——别人装仍是「未识别开发者」，需右键打开。要彻底解决分发得用付费的 Apple **Developer ID Application** 证书；有的话把 `scripts/bundle.sh` 里的 `SIGN_IDENTITY` 改成那个名字。
 
 ## 应用图标
 

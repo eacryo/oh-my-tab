@@ -28,20 +28,22 @@
 
 oh-my-tab is a macOS window switcher that complements the system Cmd+Tab: it runs as a **menu-bar accessory** app (no Dock icon), intercepts a global shortcut (**Command+Tab** by default, toggleable to Option+Tab), shows a floating **Liquid Glass** overlay of cards for currently-open windows, and raises the selected window on release (via a private SkyLight API plus AX).
 
-It is pure Rust calling AppKit / CoreGraphics / ApplicationServices directly through `objc2` FFI — there is no Swift bridge and no Rust UI framework.
+It is written in pure Rust, calling AppKit / CoreGraphics / ApplicationServices directly through `objc2` FFI — there is no Swift bridge and no Rust UI framework.
 
-- <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names, window titles, one card per window.
-- <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab, Shift+Tab, arrow keys, or mouse after Command/Option.
-- <img height="14" src="docs/icons/zap.svg"> **Lightweight**: pure Rust with a bounded in-memory thumbnail cache — no Electron/Tauri runtime.
-- <img height="14" src="docs/icons/star.svg"> **Liquid Glass**: floating overlay using `NSGlassEffectView` when available, with an `NSVisualEffectView` fallback on older systems.
+- <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names, window titles, one card per window, across multiple displays.
 - <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: caption row above a 16:10 live preview, captured via a private WindowServer API and cached in memory — cached frames render instantly and a background refresh keeps them current; rows are balanced when they fit, and when they overflow the grid fills in MRU order and scrolls continuously. Requires **Screen Recording** permission — without it the switcher falls back to icon-only cards. Turning thumbnails off immediately releases cached window frames from memory.
 - <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window keeps the app's other windows in their existing order.
 - <img height="14" src="docs/icons/eye.svg"> **Full window visibility**: every real window, including off-screen and minimized (toggleable).
-- <img height="14" src="docs/icons/gear.svg"> **Settings**: configure appearance and features from the Settings window, with changes applied immediately.
-- <img height="14" src="docs/icons/globe.svg"> **Zero-dependency i18n**: English / Simplified / Traditional Chinese, live system-language follow.
-- <img height="14" src="docs/icons/note.svg"> **Per-launch logs**: 30-day retention ([Logging](#logging)).
-- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration, and **side-button → shortcut mapping**.
+- <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab, Shift+Tab, arrow keys, or mouse after Command/Option; the shortcut can be switched to Option+Tab.
+- <img height="14" src="docs/icons/tools.svg"> **Window control**: maximize, snap to halves or quarters, or minimize with Option+arrow keys, and move windows across displays with Option+Shift+arrow keys.
+- <img height="14" src="docs/icons/zap.svg"> **Quick actions**: Option+I opens Settings, Option+E opens Finder, Option+D shows the desktop, Option+L locks the screen, and double-tapping Control locates the pointer.
 - <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images, file copies — search, pin, delete, expiry, persistence ([Clipboard history](#clipboard-history)).
+- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration, and **side-button → shortcut mapping**.
+- <img height="14" src="docs/icons/star.svg"> **Appearance**: light, dark, or system theme, plus Liquid Glass styling (`NSGlassEffectView`, with an `NSVisualEffectView` fallback), tint, corner radius, and font size.
+- <img height="14" src="docs/icons/gear.svg"> **Settings**: configure appearance and features from the Settings window, with changes applied immediately.
+- <img height="14" src="docs/icons/globe.svg"> **Zero-dependency i18n**: English / Simplified / Traditional Chinese, following the system language live.
+- <img height="14" src="docs/icons/package.svg"> **Lightweight**: pure Rust with a bounded in-memory thumbnail cache — no Electron/Tauri runtime.
+- <img height="14" src="docs/icons/note.svg"> **Per-launch logs**: 30-day retention ([Logging](#logging)).
 
 <br />
 
@@ -64,6 +66,12 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 
 <div align="center"><img src="docs/videos/settings_page.gif" width="560" alt="Settings page demo"></div>
 
+## Quick start
+
+- **Window switching**: hold Command (or Option, if configured), press Tab / Shift+Tab or the arrow keys to pick a window, then release the modifier to switch.
+- **Clipboard history**: once enabled, press **Option+V** to summon it; it supports both keyboard and mouse, and closes when you click outside.
+- **Permissions**: window switching needs Accessibility permission; thumbnails need Screen Recording. Without Screen Recording, switching still works and cards simply fall back to icons.
+
 ## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;Clipboard history
 
 Optional (off by default). Summon with **Option+V**, navigate with the arrow keys / Enter / Esc / Backspace, or click; clicking outside closes it. Extra keys: **← pins/unpins** the selected entry; **→ opens a detail panel** beside the picker showing the full untruncated text or a large image preview (it follows ↑/↓ browsing live; Esc, ←, →, or a click on it closes it). The history records **three kinds of entries**:
@@ -76,15 +84,17 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 
 > **Known v1 tradeoffs** — each entry records exactly one kind of content: a copy carrying **both text and an image** (e.g. copying an image from a web page) records only the text; **multiple-file copies and single non-image file copies are omitted from history**. The same picture copied both as an image and as a file stays as two separate entries (they answer different paste semantics). Dedup is per-kind: text by exact content, images by content hash.
 
-**Using an entry reorders the history by default** (like Maccy): selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top. The **"Move used entries to the top"** switch in Settings turns this off (like Windows Win+V). With the optional **"Delete entry after paste"** switch on, holding **Option** while pressing Enter or clicking a row pastes the entry and removes it from the history right away (one-shot paste). Its dependent **"Also delete the corresponding system clipboard item"** switch additionally removes the corresponding clipboard content after a short delay, if no newer copy replaced it. The picker's "Clear history" keeps pinned entries. An optional **"Save clipboard history to disk"** switch persists the history across restarts; see the privacy note above.
+**Using an entry reorders the history by default** (like Maccy): selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top. The **"Move used entries to the top"** switch in Settings turns this off (like Windows Win+V). With the optional **"Delete entry after paste"** switch on, holding **Option** while pressing Enter or clicking a row pastes the entry and removes it from the history right away (one-shot paste). Its dependent **"Also delete the corresponding system clipboard item"** switch additionally removes the corresponding clipboard content after a short delay, if no newer copy replaced it. The picker's "Clear history" keeps pinned entries. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note below.
+
+> **Clipboard persistence is off by default.** Enabling it writes copied text, filenames, and image data to disk in plain text, so do not enable it if you copy passwords or tokens. See the [official website](https://oh-my-tab.app/) for details.
 
 ## <img height="16" src="docs/icons/alert.svg">&nbsp;&nbsp;Known Issues
 
 ~~**Some background-app thumbnails may temporarily appear white**: WindowServer can only capture the surface an app currently provides. A long-suspended WebView app (for example, Clash Verge Rev) may return its title bar with a white content area, especially just after oh-my-tab starts with an empty in-memory thumbnail cache. Activating the app and allowing its content to redraw lets a later capture recover the preview.~~ **Resolved**: blank captures are detected before caching and never overwrite a real thumbnail — the only exception is light/dark appearance changes, which re-capture every card (blank placeholder included) so no stale-theme frame lingers. A suspended WebView window keeps its last real frame; before its first activation the card shows a placeholder frame instead, and switching to the window (across apps or between windows of the same app) refreshes it automatically.
 
-**Telegram's fullscreen image viewer has no separate thumbnail**: Telegram's media viewer is a special high-level floating window above its normal windows. To avoid treating it as a separate switchable window, oh-my-tab excludes it from the window list and thumbnail capture. While the viewer is open, the switcher displays Telegram's main-window thumbnail. This is a known limitation of the current version.
+**Telegram's fullscreen image viewer has no separate thumbnail**: Telegram's media viewer is a special high-level floating window above its normal windows. To avoid treating it as a separate switchable window, oh-my-tab excludes it from the window list and thumbnail capture. While the viewer is open, the switcher displays Telegram's main-window thumbnail.
 
-**Some application windows may be unavailable to thumbnail capture**: Certain applications mark editor or other protected windows as non-shareable, or render their content on a protected surface. Screen Recording permission can be granted while other windows from the same application still capture normally. In this case the window remains switchable, but its thumbnail may stay on the placeholder or last valid frame. This is an application/WindowServer sharing limitation, not necessarily an incorrect window ID.
+**Some application windows may be unavailable to thumbnail capture**: Certain applications mark editor or other protected windows as non-shareable, or render their content on a protected surface. Even with Screen Recording permission granted, other windows from the same application still capture normally. In this case the window remains switchable, but its thumbnail may stay on the placeholder or last valid frame. This is a limitation of how the application or WindowServer shares window content, not a window-identification bug.
 
 If windows are already open when the app starts, their initial ordering is seeded from WindowServer's front-to-back order. This provides an initial approximation; live activation events refine the window-level MRU after launch.
 
@@ -110,114 +120,29 @@ Development-only issues and raw-binary debugging notes are collected in [docs/de
 > ./scripts/dev-restart.sh  # build, sign, and launch the development .app
 > ```
 
-`scripts/dev-restart.sh` builds and assembles a separately signed development `.app`, then launches it through the per-user `launchd` domain. This keeps Accessibility and Screen Recording permissions associated with the development bundle and ensures the running process contains the latest build. The unit-test suite runs headless by default; clipboard image/history fixtures use isolated temporary directories per process and thread. The **smoke tests** are marked `#[ignore]` — they exercise the real CG/AX stack and need a GUI session plus an Accessibility grant (run with `cargo test -- --ignored`).
+`scripts/dev-restart.sh` builds and assembles a separately signed development `.app`, then launches it through the per-user `launchd` domain. This keeps Accessibility and Screen Recording permissions associated with the development bundle and ensures the running process contains the latest build. Layout QA fixtures, the debug-only layout assertions, and the GUI smoke test are documented in [docs/developer-notes-en.md](docs/developer-notes-en.md).
 
-For localization/layout QA, the Debug app built by `scripts/dev-restart.sh` adds a
-`[TEST] English x3` option to the language selector. Selecting it repeats every English UI string
-three times, so long dropdown values and their surrounding rows/cards can be checked in the real
-settings window. The optimized development package built by `scripts/release-dev.sh` includes the
-same fixture through the `dev-long-text` Cargo feature; the production release scripts do not.
-The older `OH_MY_TAB_PSEUDO_LOCALE=1` switch is still available for debug-only punctuation-based
-expansion. Set `OH_MY_TAB_LAYOUT_DEBUG=1` in a debug build to
-enable runtime settings-page assertions; overlapping controls, out-of-bounds frames, and separators
-with an invalid layer order fail fast with the page name and offending frames. These checks complement
-visual review instead of requiring it for every layout change.
-
-On a macOS GUI session, the real AppKit settings smoke test can traverse every settings page and
-run the same post-layout checks without manual clicking:
-
-```sh
-cargo build
-cargo test settings_layout_smoke -- --ignored
-```
-
-The smoke test runs the debug binary with `--smoke-settings-layout`, opens the actual settings
-window on the main thread, visits all seven pages, validates their descendant view frames, and exits.
-
-### Release `.app` + `.dmg`
+### Release
 
 > ```sh
 > sh scripts/bundle.sh        # cargo build --release -> .app -> sign -> .dmg + Sparkle .zip
 > open dist/Oh-My-Tab.dmg     # install: drag Oh-My-Tab into Applications
 > ```
 
-`bundle.sh` assembles `dist/Oh-My-Tab.app` (release binary, `Info.plist`, and app icon resources), signs it, then packages it into `dist/Oh-My-Tab.dmg` (with an `Applications` symlink for drag-to-install). Both outputs live in `dist/` (gitignored), outside `target/` so the logger treats it as production (file logging, not stdout). Running the `.app` is required for launch-at-login (SMAppService) and for file logging; the `.dmg` is for distribution. Re-run the script after code changes — it copies the release binary at build time, and self-locates the repo root so it can be run from anywhere.
-`bundle.sh` produces both `dist/Oh-My-Tab.dmg` and the Sparkle archive `dist/Oh-My-Tab.zip`. `release.sh` builds locally by default; it contacts R2 only when you explicitly pass `--push`:
+`bundle.sh` assembles `dist/Oh-My-Tab.app` (release binary, `Info.plist`, and app icon resources), signs it, then packages `dist/Oh-My-Tab.dmg` (with an `Applications` symlink for drag-to-install) and the Sparkle archive `dist/Oh-My-Tab.zip`. The outputs live in `dist/` (gitignored), outside `target/`, so the logger treats them as production builds (file logging, not stdout); running the `.app` is what enables launch-at-login (SMAppService) and file logging. Re-run the script after code changes — it copies the release binary at build time and self-locates the repo root.
 
-> ```sh
-> sh scripts/release.sh                    # build only; R2 access is disabled
-> sh scripts/release.sh --push             # upload ZIP, DMG, then dist/appcast.xml
-> sh scripts/release.sh --push --dry-run  # print the upload plan only
-> ```
-
-The development channel is isolated from production (bundle ID `com.eacryo.oh-my-tab.dev`,
-feed `https://download.oh-my-tab.app/dev_release/appcast.xml`, R2 prefix `dev_release`):
-
-> ```sh
-> sh scripts/release-dev.sh                 # build the dev package only
-> sh scripts/release-dev.sh --push          # upload the dev package and dist/appcast-dev.xml
-> sh scripts/release-dev.sh --push --dry-run
-> ```
-
-`release-dev.sh` builds an optimized Release package with the `dev-long-text` Cargo feature, so
-the `[TEST] English x3` layout fixture is available in the development package. `release.sh` and
-the direct production `bundle.sh` path do not enable that feature; the test option is absent from
-production builds.
-
-With `--push`, the release scripts generate or update the appcast before uploading. They reuse
-an existing local appcast when present; on a clean checkout they fetch the public feed first so
-older entries are retained. If no feed exists yet, a new one is created. The generated feed uses
-the exact immutable ZIP filename that the R2 publisher uploads. Every `--push` invocation rebuilds
-the app and release archives from the current source tree before generating the feed.
-
-Appcast signing uses the `ed25519` key from the macOS Keychain by default. Set
-`SPARKLE_ED_KEY_FILE` to use an external private-key file; never commit that file. The `--push`
-flow reads `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, and `R2_ENDPOINT` (or
-`R2_ACCOUNT_ID`) from the environment. The isolated publisher lives in `tools/r2-publisher` and
-keeps R2 credentials out of the app and command-line arguments.
-The upload request always goes to the configured R2 S3 endpoint; `download.oh-my-tab.app` is only
-the public HTTPS base written into Sparkle URLs. `R2_PUBLIC_BASE_URL` changes the displayed/public
-URL base only; the upload destination remains the configured R2 endpoint.
-
-### Sparkle automatic updates
-
-The About-page toggle and “Check for Updates” button are wired to Sparkle 2. The updater reads
-`SUFeedURL` from the app bundle; production uses `https://download.oh-my-tab.app/appcast.xml` and
-the dev release script uses `https://download.oh-my-tab.app/dev_release/appcast.xml`. This repository
-does not include the appcasts, the release archives, or the Sparkle private key;
-publish those materials to the matching R2 channel later.
-
-Sparkle 2's `Sparkle.framework` is committed at `vendor/Sparkle.framework` (override the location with `SPARKLE_FRAMEWORK_PATH`); `scripts/bundle.sh` and `scripts/dev-restart.sh` copy it into `Contents/Frameworks`. Without the framework the app still starts and the About page explains why update checks are unavailable. The scripts use a UTC timestamp for `CFBundleVersion` by default; set `SPARKLE_BUILD_VERSION` when a deterministic build number is needed. At release time, `SPARKLE_FEED_URL` overrides the feed URL and `SPARKLE_PUBLIC_ED_KEY` writes the appcast verification key into the bundle. Never commit or upload the private key.
-
-Build requirements: `cargo build`, `cargo check`, and the test suite all work without
-Sparkle. A packaged app with working update checks requires the framework at the path above.
-This repository includes the pinned Sparkle 2.9.6 `bin/generate_keys` and `bin/generate_appcast`
-tools under `vendor/Sparkle/`; run them from there when generating appcasts. The pinned framework
-and release-tool subset are both kept in the repository so update-enabled builds and appcast
-generation do not depend on a developer-specific Downloads path.
-
-### Code signing
-
-`bundle.sh` signs with the self-signed identity **`oh-my-tab-sign`** when present, falling back to ad-hoc (`codesign -s -`) if not. Creating this cert once is **strongly recommended** — it keeps the Accessibility grant stable across rebuilds (an ad-hoc signature changes on every rebuild, invalidating the grant each time):
-
-1. *Keychain Access → Certificate Assistant → Create a Certificate...*
-2. Name: `oh-my-tab-sign`, Identity Type: **Self Signed Root**, Certificate Type: **Code Signing**.
-3. Create, then rebuild and reinstall. (The first `bundle.sh` run may prompt for keychain access — click *Always Allow*.)
-
-If grants ever go stale (e.g. leftovers from old ad-hoc installs), clear them: `tccutil reset Accessibility com.eacryo.oh-my-tab`. A self-signed cert only stabilises TCC identity — it does **not** satisfy Gatekeeper for other users; that requires a paid Apple Developer ID certificate (set `SIGN_IDENTITY` in `scripts/bundle.sh`).
-
-For the full release pipeline (Homebrew cask generation, the signing rationale, icon regeneration), see [docs/releasing-en.md](docs/releasing-en.md).
+The full release pipeline (`release.sh` / `release-dev.sh`, including `--push`), the isolated development channel (bundle ID `com.eacryo.oh-my-tab.dev`), the R2 upload flow, Sparkle automatic updates, and code signing are documented in [docs/releasing-en.md](docs/releasing-en.md).
 
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;Permissions & runtime caveats
 
-- The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary must be re-granted -- unless you sign with a stable identity (see [Code signing](#code-signing)), in which case the grant persists across rebuilds.
+- The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary must be re-granted — unless you sign with a stable identity (see [Code signing](docs/releasing-en.md#code-signing-why-a-self-signed-certificate-stabilizes-permissions)), in which case the grant persists across rebuilds.
 - **Window thumbnails** additionally require the **Screen Recording** permission (System Settings → Privacy & Security → Screen Recording). A private WindowServer capture API is used, same as DockDoor/AltTab. Without it the switcher silently keeps icon-only cards; granting it later resumes thumbnail capture without restarting. Frames are kept **in memory only** — nothing is ever written to disk.
 - If the event tap fails to create, the app prints an error and the shortcut silently does nothing — almost always a missing Accessibility grant.
 - Icon cache: `~/Library/Caches/oh-my-tab-icons/{bundle-id}.png` (keyed by bundle id, with a `.meta` mtime sidecar; clearable from the menu).
 
 ## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;Settings
 
-All options are managed from the in-app Settings window and apply immediately. It covers appearance, window switching, window control, quick actions, clipboard history, mouse control, startup, and updates.
+All options are managed from the in-app Settings window and apply immediately. The window covers appearance, window switching, window control, quick actions, clipboard history, mouse control, startup, and updates.
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 
@@ -229,6 +154,6 @@ All options are managed from the in-app Settings window and apply immediately. I
 
 ## <img height="16" src="docs/icons/heart.svg">&nbsp;&nbsp;Credits
 
-The **mouse control** feature (scroll reversal, scroll modes, per-device configuration, and pointer-acceleration control) is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse). We re-implemented its core features from scratch in pure Rust (via `objc2` FFI, no Swift bridge) and integrated them into oh-my-tab's configuration model. Many thanks to the original author and the LinearMouse project for the excellent work.
+The **mouse control** feature (scroll reversal, scroll modes, per-device configuration, and pointer-acceleration control) is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse). We re-implemented its core features from scratch in pure Rust (via `objc2` FFI, no Swift bridge) and integrated them into oh-my-tab's configuration model. Many thanks to the original author and the LinearMouse project for their work.
 
-The **window switcher** (overlay design, card-based selection, Liquid Glass styling) draws inspiration from [BetterCmdTab](https://github.com/rokartur/BetterCmdTab). We re-implemented the ideas from scratch in pure Rust (via `objc2` FFI, no Swift bridge). Many thanks to the author for the excellent work.
+The **window switcher** (overlay design, card-based selection, Liquid Glass styling) draws inspiration from [BetterCmdTab](https://github.com/rokartur/BetterCmdTab). We re-implemented the ideas from scratch in pure Rust (via `objc2` FFI, no Swift bridge). Many thanks to the author.
