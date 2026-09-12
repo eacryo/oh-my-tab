@@ -401,10 +401,6 @@ fn start_window_refresh(request: WindowRefreshRequest, in_flight: InFlightGuard)
                     }
                 }
             };
-            // Event delivery is only a fast path; the App-level AXWindows snapshot is the
-            // Space-independent authority for removing cached frames of truly closed windows.
-            // 事件只是快速路径;App 级 AXWindows 是跨 Space 判断窗口确已关闭并清理帧的权威。
-            thumbnail::reconcile_cached_windows_with_ax();
             *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
                 generation,
                 windows,

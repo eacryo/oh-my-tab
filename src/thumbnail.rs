@@ -695,47 +695,6 @@ pub(crate) fn touch_cached_frame(pid: i32, wid: u32) -> bool {
     CACHE.lock().unwrap().touch(&ThumbKey { pid, wid })
 }
 
-fn capture_keys() -> Vec<ThumbKey> {
-    let mut keys = CAPTURE_STATE
-        .lock()
-        .unwrap()
-        .desired
-        .keys()
-        .copied()
-        .collect::<HashSet<_>>();
-    keys.extend(CACHE.lock().unwrap().keys());
-    keys.into_iter().collect()
-}
-
-/// 以 App 级 AXWindows 作为窗口存活兜底。AX 查询失败时保守保留,避免把其他 Space 的
-/// 窗口帧误删;只有 AX 明确不再包含该窗口时才清理缓存和排队任务。
-/// Reconcile cached windows against app-level AXWindows as a lifecycle backstop. Preserve
-/// entries when AX itself fails, and remove only windows explicitly absent from the app's
-/// Space-independent AX list.
-pub(crate) fn reconcile_cached_windows_with_ax() {
-    let keys = capture_keys();
-    let pids = keys.iter().map(|key| key.pid).collect::<HashSet<_>>();
-    for pid in pids {
-        let Some(ax_windows) = crate::window_collector::get_ax_windows_for_pid(pid) else {
-            continue;
-        };
-        let live = ax_windows
-            .into_iter()
-            .map(|(wid, _, _)| wid)
-            .collect::<HashSet<_>>();
-        for key in keys.iter().filter(|key| key.pid == pid) {
-            if key.wid != 0 && !live.contains(&key.wid) {
-                log_debug!(
-                    "[thumb] AX lifetime sweep removed stale window pid={} wid={}",
-                    key.pid,
-                    key.wid
-                );
-                forget_destroyed_window(key.pid, key.wid);
-            }
-        }
-    }
-}
-
 /// 是否新鲜(召唤端及启动诊断用；过期帧仍可继续渲染)。
 /// Freshness probe for summon decisions and startup diagnostics; stale frames
 /// remain renderable.
