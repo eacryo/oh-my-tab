@@ -1,14 +1,15 @@
 //! 窗口缩略图:私有 SkyLight API `SLSHWCaptureWindowList` 截取窗口画面,
 //! **纯内存 LRU** 缓存(刻意不落盘——屏幕内容明文落盘有隐私风险,BetterCmdTab/
-//! DockDoor 同样只保留内存)。四条生产线:
+//! DockDoor 同样只保留内存)。五条生产线:
 //! 1. 启动预生成:监视线程启动时枚举所有运行中 App 的标准窗口补拍
 //! 2. 常驻监听:每 PID 一个 AXObserver 订阅 kAXWindowCreatedNotification,
 //!    新窗口防抖 300ms 后预生成(等窗口完成初始化,避免拍到白屏)
 //! 3. 召唤补拍:show_overlay 时对可见区间及两侧预取项中的缺失帧、前台 App
 //!    的过期帧入队；后台 App 保留最后一张有效帧，完成后主线程原位换卡
 //! 4. 激活刷新:NSWorkspace 确认焦点窗口后延迟补拍，等 Web 内容完成恢复/重绘
+//! 5. 前台预热:浮窗关闭时仅对当前前台窗口低频补拍，减少视频/动态页面在召唤时使用旧帧
 //!
-//! 5. 空白帧门控:WKWebView(Tauri/Electron 等)的页面由独立 WebContent 进程
+//! 6. 空白帧门控:WKWebView(Tauri/Electron 等)的页面由独立 WebContent 进程
 //!    渲染,窗口长时间后台后该进程被挂起、内容表面被 WindowServer 丢弃,截出来
 //!    只剩"标题栏(红绿灯)+纯色白屏"。此类帧按场景分流(AltTab 同策略):
 //!    - 后台 + 缓存有帧:丢弃,保住最后一张有效帧(升级单向,避免回退)
@@ -18,7 +19,7 @@
 //!    - 外观(明暗)切换重拍:空白也覆盖——旧外观帧与新主题不协调比占位更刺眼
 //!    - 切换器自己切过去的窗口:激活补拍在 backstop 静默出口放行;同应用窗口切换
 //!      (无激活通知、808 被静音)在 raise 时铸造 token 直接调度,到达即刷新
-//! 6. WindowServer 几何过渡:显示器/Space/窗口动画期间延迟捕获并有界退避重试;
+//! 7. WindowServer 几何过渡:显示器/Space/窗口动画期间延迟捕获并有界退避重试;
 //!    scheduler 为进程级单例,随进程结束
 //!
 //! 无屏幕录制权限(TCC)时整个模块休眠,浮窗保持纯图标渲染;运行中授权后
@@ -28,7 +29,7 @@
 //! Window thumbnails: capture window imagery via the private SkyLight API
 //! `SLSHWCaptureWindowList`, cached in a **memory-only LRU** (deliberately never
 //! written to disk -- plaintext screen content in ~/Library/Caches is a privacy
-//! risk; BetterCmdTab/DockDoor likewise keep frames in RAM only). Four producers:
+//! risk; BetterCmdTab/DockDoor likewise keep frames in RAM only). Five producers:
 //! 1. startup pre-generation: enumerate every running app's standard windows
 //! 2. resident listener: one AXObserver per PID watching kAXWindowCreatedNotification;
 //!    a new window debounces 300ms (letting it finish initializing, avoiding a white
@@ -38,8 +39,10 @@
 //!    their last-known-good frame, and results swap affected cards in place on the main thread
 //! 4. activation refresh: after NSWorkspace resolves the focused window, capture it with a
 //!    short delay so restored web content has time to redraw.
+//! 5. focused prewarm: while the overlay is hidden, recapture only the current frontmost
+//!    window at a low rate so video/dynamic pages are less stale at summon time.
 //!
-//! 5. blank-frame gating: WKWebView-based apps (Tauri/Electron et al.) render in a
+//! 6. blank-frame gating: WKWebView-based apps (Tauri/Electron et al.) render in a
 //!    separate WebContent process; once the window stays in the background that process
 //!    is suspended and WindowServer drops the content surface, so a capture degrades to
 //!    "title bar (traffic lights) + solid white". Such frames are routed by scenario
@@ -57,7 +60,7 @@
 //!      through at the backstop's silent exit; same-app window switches (no
 //!      activation notification, 808 silenced) mint a token at raise time and
 //!      schedule the refresh directly, so arriving refreshes the thumbnail
-//! 6. WindowServer geometry transitions: defer captures during display/Space/window
+//! 7. WindowServer geometry transitions: defer captures during display/Space/window
 //!    animations and retry with bounded backoff; the scheduler is process-wide and
 //!    exits with the process.
 //!
@@ -71,8 +74,9 @@ use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::ops::Range;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::ffi::{
@@ -378,6 +382,12 @@ const FRESH_TTL_MS: u128 = 2000;
 /// App 激活后等待内容进程恢复并完成一轮重绘，再补拍焦点窗口。
 /// Wait for a restored content process to redraw once before refreshing the focused window.
 const ACTIVATION_CAPTURE_DELAY_MS: u64 = 350;
+/// 浮窗关闭时前台窗口预热的最小间隔；激活补拍仍走 350ms 快速路径。
+/// Hidden-overlay prewarm interval; activation refreshes retain their separate 350ms fast path.
+/// Several seconds between thumbnail-sized captures avoids turning a video surface into a
+/// continuous full-resolution stream while keeping summon-time content reasonably fresh.
+const FOCUSED_PREWARM_INTERVAL_MS: u64 = 5_000;
+const FOCUSED_PREWARM_MAX_FAILURES: u8 = 3;
 /// 启动预热与新窗口后台预生成使用的基准高度；召唤时按实际卡片与屏幕倍率升级。
 /// Baseline height for startup/new-window pre-generation; summon-time demand upgrades it
 /// from the actual card size and target screen scale.
@@ -497,6 +507,15 @@ pub(crate) fn clear_runtime_cache() {
         ready,
     );
     crate::mem::log_debug_snapshot("thumb-cache-clear-after");
+}
+
+/// Drop a prewarm target when its process terminates; PID reuse must not inherit it.
+/// 进程退出时清理预热目标，避免 PID 复用继承旧目标。
+pub(super) fn forget_focused_prewarm_for_pid(pid: i32) {
+    let _ = invalidate_focused_prewarm_target(
+        |target| target.is_some_and(|target| target.pid == pid),
+        "process-terminated",
+    );
 }
 
 /// 取缩略图(+1 返回,调用方用完必须 CFRelease;缓存自己的引用不受影响)。
@@ -639,6 +658,7 @@ pub(crate) fn frame_epoch(pid: i32, wid: u32) -> u64 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum CapturePriority {
     Startup,
+    FocusedPrewarm,
     NewWindow,
     Prefetch,
     Visible,
@@ -651,11 +671,163 @@ impl CapturePriority {
         match self {
             Self::Startup => "startup",
             Self::NewWindow => "new-window",
+            Self::FocusedPrewarm => "focused-prewarm",
             Self::Prefetch => "prefetch",
             Self::Visible => "visible",
             Self::Activation => "activation",
             Self::Selected => "selected",
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FocusedPrewarmTarget {
+    pid: i32,
+    wid: u32,
+    pid_generation: u64,
+    target_revision: u64,
+    needs_resolution: bool,
+    consecutive_failures: u8,
+    next_attempt: Instant,
+}
+
+/// The hidden-overlay prewarm has one resident utility thread and one latest target;
+/// it never creates a thread per capture and stale PID generations are rejected by the
+/// normal capture-state gate.
+/// 浮窗关闭时的预热只保留一个常驻 utility 线程和一个最新目标；每次捕获不会新建线程,
+/// 旧 PID generation 仍由现有捕获状态门控拒绝。
+static FOCUSED_PREWARM_TARGET: LazyLock<Mutex<Option<FocusedPrewarmTarget>>> =
+    LazyLock::new(|| Mutex::new(None));
+static FOCUSED_PREWARM_TARGET_REVISION: AtomicU64 = AtomicU64::new(0);
+static FOCUSED_PREWARM_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+static FOCUSED_PREWARM_EPOCH: AtomicU64 = AtomicU64::new(0);
+static FOCUSED_PREWARM_ACTIVE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static FOCUSED_PREWARM_WAKE: LazyLock<(Mutex<()>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(()), Condvar::new()));
+
+fn focused_prewarm_enabled() -> bool {
+    crate::config::focused_thumbnail_prewarm_enabled() && crate::theme::thumbnails_enabled()
+}
+
+fn next_focused_prewarm_target_revision() -> u64 {
+    FOCUSED_PREWARM_TARGET_REVISION
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)
+        .max(1)
+}
+
+fn focused_prewarm_revision_is_current(revision: Option<u64>) -> bool {
+    revision
+        .is_none_or(|revision| FOCUSED_PREWARM_TARGET_REVISION.load(Ordering::Acquire) == revision)
+}
+
+fn invalidate_focused_prewarm_target(
+    should_clear: impl FnOnce(Option<&FocusedPrewarmTarget>) -> bool,
+    reason: &str,
+) -> bool {
+    let mut target_guard = FOCUSED_PREWARM_TARGET.lock().unwrap();
+    if !should_clear(target_guard.as_ref()) {
+        return false;
+    }
+    let cleared = target_guard.take();
+    let revision = next_focused_prewarm_target_revision();
+    if let Some(target) = cleared {
+        log_debug!(
+            "[thumb] focused prewarm target invalidated pid={} wid={} revision={} reason={}",
+            target.pid,
+            target.wid,
+            revision,
+            reason
+        );
+    } else {
+        log_debug!(
+            "[thumb] focused prewarm target invalidated revision={} reason={}",
+            revision,
+            reason
+        );
+    }
+    true
+}
+
+fn focused_prewarm_due(now: Instant, last_capture: Option<Instant>, next_attempt: Instant) -> bool {
+    focused_prewarm_ready_at(last_capture, next_attempt) <= now
+}
+
+fn focused_prewarm_ready_at(last_capture: Option<Instant>, next_attempt: Instant) -> Instant {
+    last_capture
+        .map(|captured| captured + Duration::from_millis(FOCUSED_PREWARM_INTERVAL_MS))
+        .map_or(next_attempt, |cache_ready| cache_ready.max(next_attempt))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusedPrewarmExitAction {
+    Stopped,
+    Restart,
+}
+
+fn focused_prewarm_exit_action(
+    worker_epoch: u64,
+    current_epoch: u64,
+    prewarm_enabled: bool,
+    target_present: bool,
+) -> FocusedPrewarmExitAction {
+    if prewarm_enabled && target_present && worker_epoch != current_epoch {
+        // A changed epoch means stop/re-enable raced with cleanup. Panic exits are deliberately
+        // fail-stop: a poisoned mutex must not trigger an automatic restart loop.
+        // 代际变化表示停止/重新启用与清理发生竞态。panic 则故意安全停机，避免中毒的互斥锁
+        // 触发自动重启循环。
+        return FocusedPrewarmExitAction::Restart;
+    }
+    FocusedPrewarmExitAction::Stopped
+}
+
+fn claim_focused_prewarm_worker(epoch: u64) -> bool {
+    if FOCUSED_PREWARM_WORKER_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    let active_generation = epoch.wrapping_add(1).max(1);
+    FOCUSED_PREWARM_ACTIVE_GENERATION.store(active_generation, Ordering::Release);
+    true
+}
+
+fn release_focused_prewarm_worker(worker_generation: u64) -> bool {
+    let active_generation = worker_generation.wrapping_add(1).max(1);
+    if FOCUSED_PREWARM_ACTIVE_GENERATION
+        .compare_exchange(active_generation, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // A different generation owns the worker slot; an old worker must not clear it.
+        // 新代际已经接管 worker 槽位，旧 worker 不能清掉新代际的状态。
+        return false;
+    }
+    FOCUSED_PREWARM_WORKER_STARTED
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+fn finish_focused_prewarm_worker(worker_generation: u64, panicked: bool) {
+    if !release_focused_prewarm_worker(worker_generation) {
+        return;
+    }
+    if panicked {
+        // Do not touch any mutex after a worker panic: the panic may have poisoned the lock that
+        // caused it. A later activation can create a fresh target and explicitly retry.
+        // worker panic 后不再访问任何互斥锁：触发 panic 的锁可能已经中毒。后续激活会创建新
+        // 目标并显式重试。
+        log_info!("[thumb] focused prewarm worker panicked; automatic restart disabled");
+        return;
+    }
+    let action = focused_prewarm_exit_action(
+        worker_generation,
+        FOCUSED_PREWARM_EPOCH.load(Ordering::Acquire),
+        focused_prewarm_enabled(),
+        FOCUSED_PREWARM_TARGET.lock().unwrap().is_some(),
+    );
+    if action == FocusedPrewarmExitAction::Restart {
+        start_focused_prewarm_worker();
     }
 }
 
@@ -674,6 +846,7 @@ struct PendingCapture {
     geometry_retry_not_before: Option<Instant>,
     geometry_retry_attempts: u8,
     geometry_retry_started_at: Option<Instant>,
+    focused_target_revision: Option<u64>,
     /// 外观(明暗主题)切换触发的重拍:允许空白帧覆盖已有帧——旧帧是旧外观像素,
     /// 与其他卡片不一致比暂时空白更刺眼。合并请求时按"或"传播。
     /// Appearance (light/dark) transition recapture: blank frames MAY overwrite the
@@ -694,6 +867,7 @@ struct CaptureJob {
     enqueued_at: Instant,
     ready_since: Instant,
     appearance_refresh: bool,
+    focused_target_revision: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -804,6 +978,7 @@ impl CaptureState {
                     geometry_retry_not_before: None,
                     geometry_retry_attempts: 0,
                     geometry_retry_started_at: None,
+                    focused_target_revision: None,
                     appearance_refresh,
                 });
                 true
@@ -817,6 +992,14 @@ impl CaptureState {
                     pending.freshness_sequence = freshness_sequence;
                 }
                 false
+            }
+        }
+    }
+
+    fn set_focused_target_revision(&mut self, key: ThumbKey, target_revision: u64) {
+        if let Some(pending) = self.desired.get_mut(&key) {
+            if pending.priority == CapturePriority::FocusedPrewarm {
+                pending.focused_target_revision = Some(target_revision);
             }
         }
     }
@@ -899,6 +1082,7 @@ impl CaptureState {
             enqueued_at: pending.enqueued_at,
             ready_since: pending.ready_since,
             appearance_refresh: pending.appearance_refresh,
+            focused_target_revision: pending.focused_target_revision,
         })
     }
 
@@ -1024,6 +1208,10 @@ static THUMB_QUEUE_MAX_MS: AtomicU64 = AtomicU64::new(0);
 static THUMB_QUEUE_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static THUMB_CAPTURE_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
 static THUMB_CAPTURE_MAX_MS: AtomicU64 = AtomicU64::new(0);
+static THUMB_GEOMETRY_REJECTED: AtomicU64 = AtomicU64::new(0);
+static THUMB_GEOMETRY_TOO_SMALL: AtomicU64 = AtomicU64::new(0);
+static THUMB_GEOMETRY_SOURCE_ASPECT: AtomicU64 = AtomicU64::new(0);
+static THUMB_GEOMETRY_EXPECTED_ASPECT: AtomicU64 = AtomicU64::new(0);
 static GEOMETRY_RETRY_SCHEDULER: OnceLock<flume::Sender<GeometryRetryDeadline>> = OnceLock::new();
 static GEOMETRY_RETRY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const GEOMETRY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(300);
@@ -1240,28 +1428,73 @@ fn window_server_geometry_transition_snapshot() -> GeometryProbeSnapshot {
     }
 }
 
-/// 拒绝 WindowServer 在动画中返回的细长/裁剪源帧，避免污染已有缓存。
-/// Reject thin or clipped source frames returned during WindowServer animations.
-fn capture_geometry_is_plausible(key: ThumbKey, captured: &CapturedWindow) -> bool {
-    if captured.source_w_px < 64 || captured.source_h_px < 64 {
-        return false;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeometryRejectReason {
+    SourceTooSmall,
+    SourceAspect,
+    ExpectedAspect,
+}
+
+impl GeometryRejectReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SourceTooSmall => "source-too-small",
+            Self::SourceAspect => "source-aspect",
+            Self::ExpectedAspect => "expected-aspect",
+        }
     }
-    let source_aspect = captured.source_w_px as f64 / captured.source_h_px as f64;
+}
+
+fn geometry_reject_reason(
+    source_w_px: u32,
+    source_h_px: u32,
+    expected_bounds: Option<(f64, f64, f64, f64)>,
+) -> Option<GeometryRejectReason> {
+    if source_w_px < 64 || source_h_px < 64 {
+        return Some(GeometryRejectReason::SourceTooSmall);
+    }
+    let source_aspect = source_w_px as f64 / source_h_px as f64;
     if !(0.08..=12.0).contains(&source_aspect) {
-        return false;
+        return Some(GeometryRejectReason::SourceAspect);
     }
-    let expected_bounds = crate::window_collector::ordinary_onscreen_window_bounds()
-        .into_iter()
-        .find_map(|(wid, bounds)| (wid == key.wid).then_some(bounds));
-    let Some((_, _, expected_w, expected_h)) = expected_bounds else {
-        return true;
-    };
+    let (_, _, expected_w, expected_h) = expected_bounds?;
     if expected_w <= 0.0 || expected_h <= 0.0 {
-        return true;
+        return None;
     }
     let expected_aspect = expected_w / expected_h;
     let aspect_ratio = source_aspect / expected_aspect;
-    (0.25..=4.0).contains(&aspect_ratio)
+    if (0.25..=4.0).contains(&aspect_ratio) {
+        None
+    } else {
+        Some(GeometryRejectReason::ExpectedAspect)
+    }
+}
+
+/// 拒绝 WindowServer 在动画中返回的细长/裁剪源帧，并按原因分别统计。
+/// Reject thin or clipped source frames and keep independent counters per reason.
+fn capture_geometry_reject_reason(
+    key: ThumbKey,
+    captured: &CapturedWindow,
+) -> Option<GeometryRejectReason> {
+    let expected_bounds = crate::window_collector::ordinary_onscreen_window_bounds()
+        .into_iter()
+        .find_map(|(wid, bounds)| (wid == key.wid).then_some(bounds));
+    geometry_reject_reason(captured.source_w_px, captured.source_h_px, expected_bounds)
+}
+
+fn record_geometry_rejection(reason: GeometryRejectReason) {
+    THUMB_GEOMETRY_REJECTED.fetch_add(1, Ordering::Relaxed);
+    match reason {
+        GeometryRejectReason::SourceTooSmall => {
+            THUMB_GEOMETRY_TOO_SMALL.fetch_add(1, Ordering::Relaxed);
+        }
+        GeometryRejectReason::SourceAspect => {
+            THUMB_GEOMETRY_SOURCE_ASPECT.fetch_add(1, Ordering::Relaxed);
+        }
+        GeometryRejectReason::ExpectedAspect => {
+            THUMB_GEOMETRY_EXPECTED_ASPECT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 fn update_max(metric: &AtomicU64, value: u64) {
@@ -1400,11 +1633,15 @@ pub(crate) fn log_capture_metrics(context: &str) {
     let avg_queue_ms = queue_total.checked_div(queue_samples.max(1)).unwrap_or(0);
     let avg_capture_ms = capture_total.checked_div(completed.max(1)).unwrap_or(0);
     log_debug!(
-        "[perf] thumbnail metrics context={} enqueued={} completed={} failed={} queue_samples={} interaction_deferred={} geometry_deferred={} geometry_retry_exhausted={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
+        "[perf] thumbnail metrics context={} enqueued={} completed={} failed={} geometry_rejected={} geometry_too_small={} geometry_source_aspect={} geometry_expected_aspect={} queue_samples={} interaction_deferred={} geometry_deferred={} geometry_retry_exhausted={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
         context,
         enqueued,
         completed,
         THUMB_CAPTURE_FAILED.load(Ordering::Relaxed),
+        THUMB_GEOMETRY_REJECTED.load(Ordering::Relaxed),
+        THUMB_GEOMETRY_TOO_SMALL.load(Ordering::Relaxed),
+        THUMB_GEOMETRY_SOURCE_ASPECT.load(Ordering::Relaxed),
+        THUMB_GEOMETRY_EXPECTED_ASPECT.load(Ordering::Relaxed),
         queue_samples,
         THUMB_INTERACTION_DEFERRED.load(Ordering::Relaxed),
         THUMB_GEOMETRY_DEFERRED.load(Ordering::Relaxed),
@@ -1432,14 +1669,14 @@ pub(crate) fn wake_capture_worker() {
 /// Try to schedule one capture; false means the same window is already pending/in-flight,
 /// or the worker has exited.
 fn enqueue_job(pid: i32, wid: u32, target_px_h: u32, priority: CapturePriority) -> bool {
-    enqueue_job_inner(pid, wid, target_px_h, priority, None, false)
+    enqueue_job_inner(pid, wid, target_px_h, priority, None, false, None)
 }
 
 /// 外观(明暗主题)切换的重拍:空白帧允许覆盖已有帧(旧外观像素比暂时空白更刺眼)。
 /// Appearance (light/dark) transition recapture: blank frames may overwrite the
 /// cached frame (stale-appearance pixels clash harder than a temporary blank).
 fn enqueue_appearance_job(pid: i32, wid: u32, target_px_h: u32, priority: CapturePriority) -> bool {
-    enqueue_job_inner(pid, wid, target_px_h, priority, None, true)
+    enqueue_job_inner(pid, wid, target_px_h, priority, None, true, None)
 }
 
 /// 仅当 PID 仍处于生产者观察到的 generation 时入队，阻止终止前的延迟任务污染
@@ -1453,7 +1690,303 @@ fn enqueue_job_for_generation(
     priority: CapturePriority,
     pid_generation: u64,
 ) -> bool {
-    enqueue_job_inner(pid, wid, target_px_h, priority, Some(pid_generation), false)
+    enqueue_job_inner(
+        pid,
+        wid,
+        target_px_h,
+        priority,
+        Some(pid_generation),
+        false,
+        None,
+    )
+}
+
+fn enqueue_focused_prewarm_job(target: &FocusedPrewarmTarget, target_px_h: u32) -> bool {
+    if !focused_prewarm_revision_is_current(Some(target.target_revision)) {
+        return false;
+    }
+    enqueue_job_inner(
+        target.pid,
+        target.wid,
+        target_px_h,
+        CapturePriority::FocusedPrewarm,
+        Some(target.pid_generation),
+        false,
+        Some(target.target_revision),
+    )
+}
+
+fn current_frontmost_pid() -> Option<i32> {
+    let pid = crate::ffi::frontmost_app_info().1;
+    (pid > 0).then_some(pid)
+}
+
+/// 记录当前前台 App 的 PID/焦点窗口提示，并启动唯一的预热线程。
+/// Record the frontmost PID/focused-window hint and start the single prewarm worker.
+pub(crate) fn schedule_focused_prewarm(pid: i32, wid: u32) {
+    if !focused_prewarm_enabled() {
+        return;
+    }
+
+    // 激活回调可能运行在主线程；这里只记录轻量提示，窗口解析和可捕获性校验交给 worker。
+    // Activation callbacks may run on the main thread; record only a cheap hint here and let
+    // the worker resolve switchability and captureability off the main thread.
+    let frontmost_pid = current_frontmost_pid().unwrap_or(pid);
+    let target_pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(frontmost_pid);
+    let mut target_guard = FOCUSED_PREWARM_TARGET.lock().unwrap();
+    let same_target = target_guard.as_ref().filter(|target| {
+        target.pid == frontmost_pid
+            && target.wid == wid
+            && target.pid_generation == target_pid_generation
+    });
+    let target_revision = same_target
+        .map(|target| target.target_revision)
+        .unwrap_or_else(next_focused_prewarm_target_revision);
+    let needs_resolution = same_target.is_none_or(|target| target.needs_resolution);
+    *target_guard = Some(FocusedPrewarmTarget {
+        pid: frontmost_pid,
+        wid,
+        pid_generation: target_pid_generation,
+        target_revision,
+        needs_resolution,
+        consecutive_failures: 0,
+        next_attempt: Instant::now(),
+    });
+    drop(target_guard);
+    start_focused_prewarm_worker();
+}
+
+/// 启动后台预热线程(目标由最近一次激活记录);设置开关运行时开启时也可调用。
+/// Start the prewarm worker for the most recently recorded target; this is also used when the
+/// setting is enabled at runtime.
+pub(crate) fn start_focused_prewarm_worker() {
+    if !focused_prewarm_enabled() || FOCUSED_PREWARM_TARGET.lock().unwrap().is_none() {
+        return;
+    }
+    let epoch = FOCUSED_PREWARM_EPOCH.load(Ordering::Acquire);
+    if !claim_focused_prewarm_worker(epoch) {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("oh-my-tab-thumb-prewarm".into())
+        .spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| run_focused_prewarm(epoch)));
+            let panicked = result.is_err();
+            finish_focused_prewarm_worker(epoch, panicked);
+        })
+        .is_err()
+    {
+        let _ = release_focused_prewarm_worker(epoch);
+        FOCUSED_PREWARM_EPOCH.fetch_add(1, Ordering::AcqRel);
+        log_debug!("[thumb] failed to start focused prewarm worker");
+    }
+}
+
+/// Stop promptly and leave the target intact so enabling the setting can restart the worker.
+/// 及时停止 worker，但保留目标；重新开启设置后可以无须等待新的激活事件而重启。
+pub(crate) fn stop_focused_prewarm_worker() {
+    FOCUSED_PREWARM_EPOCH.fetch_add(1, Ordering::AcqRel);
+    // Keep the started bit reserved until the worker observes the epoch. If the setting is
+    // re-enabled immediately, that same worker adopts the new epoch; two workers cannot overlap.
+    // 保留 started 标记直到 worker 观察到 epoch；若立即重新开启，由同一个 worker 接管新 epoch，
+    // 从而不会出现两个并发 worker。
+    FOCUSED_PREWARM_WAKE.1.notify_all();
+}
+
+fn focused_prewarm_failure_backoff(consecutive_failures: u8) -> Option<Duration> {
+    if consecutive_failures == 0 || consecutive_failures >= FOCUSED_PREWARM_MAX_FAILURES {
+        None
+    } else {
+        Some(Duration::from_millis(
+            FOCUSED_PREWARM_INTERVAL_MS
+                .saturating_mul(1u64 << consecutive_failures.saturating_sub(1).min(5)),
+        ))
+    }
+}
+
+fn note_focused_prewarm_failure(key: ThumbKey, reason: &str) {
+    let mut target_guard = FOCUSED_PREWARM_TARGET.lock().unwrap();
+    let Some(target) = target_guard.as_mut() else {
+        return;
+    };
+    if target.pid != key.pid || target.wid != key.wid {
+        return;
+    }
+    target.consecutive_failures = target.consecutive_failures.saturating_add(1);
+    // The failure counter is one-based; the third consecutive failure reaches the convergence
+    // limit and clears the target immediately.
+    // 失败计数从 1 开始；第三次连续失败立即达到收敛上限并清理目标。
+    let Some(backoff) = focused_prewarm_failure_backoff(target.consecutive_failures) else {
+        let consecutive_failures = target.consecutive_failures;
+        drop(target_guard);
+        let cleared = invalidate_focused_prewarm_target(
+            |target| target.is_some_and(|target| target.pid == key.pid && target.wid == key.wid),
+            "failure-limit",
+        );
+        if cleared {
+            log_debug!(
+                "[thumb] focused prewarm target cleared after {} consecutive failures pid={} wid={} reason={}",
+                consecutive_failures,
+                key.pid,
+                key.wid,
+                reason
+            );
+        }
+        return;
+    };
+    target.next_attempt = Instant::now() + backoff;
+    log_debug!(
+        "[thumb] focused prewarm failure pid={} wid={} count={} backoff_ms={} reason={}",
+        key.pid,
+        key.wid,
+        target.consecutive_failures,
+        backoff.as_millis(),
+        reason
+    );
+}
+
+fn note_focused_prewarm_success(key: ThumbKey) {
+    let mut target_guard = FOCUSED_PREWARM_TARGET.lock().unwrap();
+    if let Some(target) = target_guard.as_mut() {
+        if target.pid == key.pid && target.wid == key.wid {
+            target.consecutive_failures = 0;
+            target.next_attempt =
+                Instant::now() + Duration::from_millis(FOCUSED_PREWARM_INTERVAL_MS);
+        }
+    }
+}
+
+fn clear_focused_prewarm_if(key: ThumbKey, reason: &str) {
+    let _ = invalidate_focused_prewarm_target(
+        |target| target.is_some_and(|target| target.pid == key.pid && target.wid == key.wid),
+        reason,
+    );
+}
+
+fn update_focused_prewarm_target_if_current(
+    expected: &FocusedPrewarmTarget,
+    selected_wid: u32,
+) -> Option<FocusedPrewarmTarget> {
+    let mut target_guard = FOCUSED_PREWARM_TARGET.lock().unwrap();
+    let target = target_guard.as_mut()?;
+    if target.pid != expected.pid
+        || target.wid != expected.wid
+        || target.target_revision != expected.target_revision
+    {
+        return None;
+    }
+    if selected_wid != target.wid {
+        target.wid = selected_wid;
+        target.consecutive_failures = 0;
+        target.next_attempt = Instant::now();
+        target.target_revision = next_focused_prewarm_target_revision();
+        log_debug!(
+            "[thumb] focused prewarm target switched to live AX window pid={} wid={}",
+            target.pid,
+            target.wid
+        );
+    }
+    target.needs_resolution = false;
+    Some(target.clone())
+}
+
+fn run_focused_prewarm(epoch: u64) {
+    crate::performance::set_current_thread_qos(crate::performance::ThreadQos::Utility);
+    let mut epoch = epoch;
+    let mut wait_for = Duration::from_millis(FOCUSED_PREWARM_INTERVAL_MS);
+    loop {
+        let guard = FOCUSED_PREWARM_WAKE.0.lock().unwrap();
+        let _ = FOCUSED_PREWARM_WAKE
+            .1
+            .wait_timeout(guard, wait_for)
+            .unwrap();
+        wait_for = Duration::from_millis(FOCUSED_PREWARM_INTERVAL_MS);
+        let current_epoch = FOCUSED_PREWARM_EPOCH.load(Ordering::Acquire);
+        if current_epoch != epoch {
+            if focused_prewarm_enabled() {
+                epoch = current_epoch;
+            } else {
+                return;
+            }
+        }
+        if !focused_prewarm_enabled() {
+            // Leave STARTED owned until finish_focused_prewarm_worker performs the generation-checked
+            // handoff. Clearing it here would let immediate re-enable race with this exit and
+            // strand the enabled target without a worker.
+            // 在 finish_focused_prewarm_worker 做完代际检查和交接前保留 STARTED；此处清除会让
+            // 立即重新开启与退出竞态，导致已开启目标没有 worker。
+            return;
+        }
+        if crate::performance::switcher_interaction_active() || !capture_allowed() {
+            continue;
+        }
+
+        let Some(frontmost_pid) = current_frontmost_pid() else {
+            continue;
+        };
+        let Some(target) = FOCUSED_PREWARM_TARGET.lock().unwrap().clone() else {
+            continue;
+        };
+        if target.pid != frontmost_pid {
+            continue;
+        }
+        let last_capture = CACHE
+            .lock()
+            .unwrap()
+            .peek(&ThumbKey {
+                pid: target.pid,
+                wid: target.wid,
+            })
+            .map(|thumb| thumb.captured);
+        let now = Instant::now();
+        if !target.needs_resolution && !focused_prewarm_due(now, last_capture, target.next_attempt)
+        {
+            // 捕获在独立 worker 上异步完成，完成时间通常比本线程上次入队晚几十毫秒；
+            // 下一轮按真实截止时间补等这段差值，避免固定 5 秒轮询错过后整轮变成 10 秒。
+            // Capture finishes asynchronously a few milliseconds after this thread enqueues it.
+            // Wait only until the exact freshness deadline so a near miss does not turn a
+            // five-second interval into ten seconds.
+            wait_for = focused_prewarm_ready_at(last_capture, target.next_attempt)
+                .saturating_duration_since(now);
+            continue;
+        }
+
+        // Re-enumerate the switchable AX windows and current CG geometry. This rejects a
+        // disappeared/thin helper surface and follows an in-app window change without trusting
+        // the stale focus-tracking id alone.
+        // 重新枚举 AX 切换窗口和当前 CG 几何；淘汰消失或过细的辅助窗口，并跟随应用内窗口
+        // 切换，不再单独信任可能过期的焦点跟踪 id。
+        let Some(window) =
+            crate::window_collector::switchable_capture_window_for_pid(frontmost_pid, target.wid)
+        else {
+            note_focused_prewarm_failure(
+                ThumbKey {
+                    pid: target.pid,
+                    wid: target.wid,
+                },
+                "no captureable switchable window",
+            );
+            continue;
+        };
+        let selected_wid = window.window_id;
+        let Some(target) = update_focused_prewarm_target_if_current(&target, selected_wid) else {
+            log_debug!(
+                "[thumb] focused prewarm target changed during window enumeration; capture skipped"
+            );
+            continue;
+        };
+        // Recheck the revision immediately before enqueueing. The target mutex is released
+        // before entering CAPTURE_STATE to preserve the existing lock order.
+        // 入队前再次检查 revision；进入 CAPTURE_STATE 前释放目标锁，保持现有锁顺序。
+        if !focused_prewarm_revision_is_current(Some(target.target_revision)) {
+            continue;
+        }
+        // Hidden prewarm deliberately stays at the baseline thumbnail height; summon/activation
+        // paths separately request the larger display-specific target when the user needs it.
+        // 隐藏状态预热固定使用基准缩略图高度；召唤/激活路径在用户需要时再请求显示器对应的高清尺寸。
+        let target_px_h = cached_target_px_height(target.pid, target.wid).min(BASE_TARGET_PX_H);
+        let _ = enqueue_focused_prewarm_job(&target, target_px_h);
+    }
 }
 
 fn enqueue_activation_job(
@@ -1489,6 +2022,7 @@ fn enqueue_job_inner(
     priority: CapturePriority,
     expected_generation: Option<u64>,
     appearance_refresh: bool,
+    focused_target_revision: Option<u64>,
 ) -> bool {
     let key = ThumbKey { pid, wid };
     let tx = ensure_capture_worker();
@@ -1500,7 +2034,17 @@ fn enqueue_job_inner(
         // old request(); the terminated check still applies inside
         // request_for_generation).
         let generation = expected_generation.unwrap_or_else(|| state.pid_generation(key.pid));
-        state.request_for_generation(key, target_px_h, priority, generation, appearance_refresh)
+        let accepted = state.request_for_generation(
+            key,
+            target_px_h,
+            priority,
+            generation,
+            appearance_refresh,
+        );
+        if let Some(target_revision) = focused_target_revision {
+            state.set_focused_target_revision(key, target_revision);
+        }
+        accepted
     };
     if !accepted {
         return false;
@@ -1666,6 +2210,30 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         );
         return CaptureJobResult::Finished;
     }
+    if job.priority == CapturePriority::FocusedPrewarm
+        && crate::performance::switcher_interaction_active()
+    {
+        return CaptureJobResult::Finished;
+    }
+    if job.priority == CapturePriority::FocusedPrewarm {
+        if !focused_prewarm_revision_is_current(job.focused_target_revision) {
+            log_debug!(
+                "[thumb] focused prewarm job skipped after target revision changed pid={} wid={}",
+                key.pid,
+                key.wid
+            );
+            return CaptureJobResult::Finished;
+        }
+        // The live target was selected from the AX switchable set plus current geometry. Do not
+        // require AXFocusedWindow to remain equal here: browsers can report a thin helper as
+        // focused while their real content window is the capture target.
+        // 目标已由 AX 可切换集合和当前几何共同选出；这里不能要求 AXFocusedWindow 仍完全相等，
+        // 因为浏览器可能把细条辅助窗口报告为焦点，而真正内容窗口才是捕获目标。
+        if !pid_is_frontmost(key.pid) {
+            clear_focused_prewarm_if(key, "app-no-longer-frontmost");
+            return CaptureJobResult::Finished;
+        }
+    }
     // 在真正捕获前再次探测，覆盖任务取出后到调用 WindowServer 之间的动画竞态。
     // Probe again immediately before capture to cover the race between job selection
     // and the WindowServer call when the animation starts.
@@ -1718,29 +2286,43 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
     let job_started = Instant::now();
     let Some(captured) = (unsafe { capture_window(key.wid, job.target_px_h) }) else {
         record_thumb_capture_failed();
-        log_debug!("[thumb] capture failed pid={} wid={}", key.pid, key.wid);
+        if job.priority == CapturePriority::FocusedPrewarm {
+            note_focused_prewarm_failure(key, "capture-failed");
+        }
+        log_debug!(
+            "[thumb] capture failed pid={} wid={} priority={}",
+            key.pid,
+            key.wid,
+            job.priority.label()
+        );
         return CaptureJobResult::Finished;
     };
     log_debug!(
-        "[thumb] capture result pid={} wid={} source={}x{} cached={}x{} target_h={}",
+        "[thumb] capture result pid={} wid={} source={}x{} cached={}x{} target_h={} priority={}",
         key.pid,
         key.wid,
         captured.source_w_px,
         captured.source_h_px,
         captured.thumb.w_px,
         captured.thumb.h_px,
-        job.target_px_h
+        job.target_px_h,
+        job.priority.label()
     );
-    if !capture_geometry_is_plausible(key, &captured) {
+    if let Some(reason) = capture_geometry_reject_reason(key, &captured) {
         unsafe {
             CFRelease(captured.thumb.img);
         }
+        record_geometry_rejection(reason);
+        if job.priority == CapturePriority::FocusedPrewarm {
+            note_focused_prewarm_failure(key, reason.label());
+        }
         log_debug!(
-            "[thumb] captured result discarded by geometry guard pid={} wid={} source={}x{} priority={}",
+            "[thumb] captured result discarded by geometry guard pid={} wid={} source={}x{} reason={} priority={}",
             key.pid,
             key.wid,
             captured.source_w_px,
             captured.source_h_px,
+            reason.label(),
             job.priority.label()
         );
         return CaptureJobResult::Finished;
@@ -1808,6 +2390,9 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
                     key.wid,
                     job.priority.label()
                 );
+                if job.priority == CapturePriority::FocusedPrewarm {
+                    note_focused_prewarm_failure(key, "blank-background");
+                }
                 return CaptureJobResult::Finished;
             }
             BlankFrameAction::DiscardRetryActivation => {
@@ -1820,6 +2405,9 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
                     key.pid,
                     key.wid
                 );
+                if job.priority == CapturePriority::FocusedPrewarm {
+                    note_focused_prewarm_failure(key, "blank-activation");
+                }
                 return CaptureJobResult::Finished;
             }
         }
@@ -1849,6 +2437,9 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
     }
     cache_store(key.pid, key.wid, captured.thumb);
+    if job.priority == CapturePriority::FocusedPrewarm {
+        note_focused_prewarm_success(key);
+    }
     drop(state);
     // 不再按任务来源预先决定是否投递：启动预热也可能在浮窗打开后才完成。
     // Do not decide delivery from the request source: startup pre-generation may
@@ -2329,6 +2920,37 @@ fn capture_range_for_visible(visible: Option<Range<usize>>, len: usize) -> Range
             .min(len)
 }
 
+/// 在浮窗真正 order-in 前先提交选中窗口的最高优先级捕获，让它有机会在首帧显示前完成；
+/// 完整的可见区间刷新仍由 show_overlay 显示后执行。
+/// Submit the selected window at the highest priority before the panel orders in, giving
+/// the capture a chance to finish before the first visible frame; show_overlay still
+/// performs the complete visible-range refresh after showing.
+pub(crate) fn refresh_selected_for_summon(required_px_h: u32) {
+    if !crate::theme::thumbnails_enabled() || !capture_allowed() {
+        return;
+    }
+    let Some((pid, wid)) = crate::with_tab_state(|state_opt| {
+        let state = state_opt.as_ref()?;
+        if !state.visible {
+            return None;
+        }
+        state
+            .windows
+            .get(state.selected)
+            .map(|window| (window.pid, window.window_id))
+    }) else {
+        return;
+    };
+    let enqueued = enqueue_job(pid, wid, required_px_h, CapturePriority::Selected);
+    log_debug!(
+        "[perf] thumbnail summon selected prequeue pid={} wid={} enqueued={} target_h={}",
+        pid,
+        wid,
+        enqueued,
+        required_px_h
+    );
+}
+
 /// 召唤期补拍:对当前可见区间及两侧预取范围中非最小化、有 bounds 的窗口检查
 /// 缓存状态。缺失帧和前台 App 的过期帧异步重截；后台 App 的已有帧不因 TTL
 /// 或屏幕倍率变化而覆盖。pending/in-flight 键由 enqueue_job 合并；选中窗口排最前。
@@ -2698,6 +3320,7 @@ pub(crate) fn refresh_after_activation(pid: i32, wid: u32, activated_at: Instant
     if !crate::theme::thumbnails_enabled() {
         return;
     }
+    schedule_focused_prewarm(pid, wid);
     let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
     let _ = std::thread::Builder::new()
         .name("oh-my-tab-thumb-activation".into())
@@ -2798,6 +3421,167 @@ fn schedule_blank_activation_retry(job: CaptureJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static FOCUSED_PREWARM_LIFECYCLE_TEST_LOCK: LazyLock<Mutex<()>> =
+        LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn focused_prewarm_failures_back_off_and_converge() {
+        assert_eq!(focused_prewarm_failure_backoff(0), None);
+        assert_eq!(
+            focused_prewarm_failure_backoff(1),
+            Some(Duration::from_millis(5_000))
+        );
+        assert_eq!(
+            focused_prewarm_failure_backoff(2),
+            Some(Duration::from_millis(10_000))
+        );
+        assert_eq!(focused_prewarm_failure_backoff(3), None);
+        // Three consecutive failures clear the target in note_focused_prewarm_failure; there is
+        // no seconds-scale infinite retry loop.
+        // 连续三次失败会清理目标，不会形成数秒级无限重试。
+    }
+
+    #[test]
+    fn focused_prewarm_worker_cas_handoff_rejects_stale_cleanup() {
+        let _guard = FOCUSED_PREWARM_LIFECYCLE_TEST_LOCK.lock().unwrap();
+        let old_epoch = 41;
+        let replacement_epoch = old_epoch + 1;
+        FOCUSED_PREWARM_EPOCH.store(old_epoch, Ordering::Release);
+        FOCUSED_PREWARM_WORKER_STARTED.store(false, Ordering::Release);
+        FOCUSED_PREWARM_ACTIVE_GENERATION.store(0, Ordering::Release);
+
+        assert!(claim_focused_prewarm_worker(old_epoch));
+        assert!(!claim_focused_prewarm_worker(old_epoch));
+        assert_eq!(
+            FOCUSED_PREWARM_ACTIVE_GENERATION.load(Ordering::Acquire),
+            old_epoch + 1
+        );
+
+        // Stop/re-enable advances the epoch; the old cleanup releases its slot and the real
+        // restart decision hands ownership to exactly one replacement worker.
+        // 停止/重新启用会推进代际；旧清理释放槽位，真实重启判定只交接给一个新 worker。
+        FOCUSED_PREWARM_EPOCH.store(replacement_epoch, Ordering::Release);
+        assert!(release_focused_prewarm_worker(old_epoch));
+        assert_eq!(
+            focused_prewarm_exit_action(old_epoch, replacement_epoch, true, true),
+            FocusedPrewarmExitAction::Restart
+        );
+        assert!(claim_focused_prewarm_worker(replacement_epoch));
+
+        // A late cleanup from the old generation cannot clear the replacement worker.
+        // 旧代际迟到的清理不能清掉新 worker。
+        assert!(!release_focused_prewarm_worker(old_epoch));
+        assert!(FOCUSED_PREWARM_WORKER_STARTED.load(Ordering::Acquire));
+        assert_eq!(
+            FOCUSED_PREWARM_ACTIVE_GENERATION.load(Ordering::Acquire),
+            replacement_epoch + 1
+        );
+        assert!(release_focused_prewarm_worker(replacement_epoch));
+        assert!(!FOCUSED_PREWARM_WORKER_STARTED.load(Ordering::Acquire));
+        assert_eq!(FOCUSED_PREWARM_ACTIVE_GENERATION.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn focused_prewarm_throttle_uses_cache_age_and_next_deadline() {
+        let now = Instant::now();
+        let due = now - Duration::from_millis(FOCUSED_PREWARM_INTERVAL_MS);
+        let too_fresh = now - Duration::from_millis(FOCUSED_PREWARM_INTERVAL_MS - 1);
+        assert!(focused_prewarm_due(now, None, due));
+        assert!(focused_prewarm_due(now, Some(due), due));
+        assert!(!focused_prewarm_due(now, Some(too_fresh), due));
+        assert!(!focused_prewarm_due(
+            now,
+            Some(due),
+            now + Duration::from_secs(1)
+        ));
+        assert_eq!(
+            focused_prewarm_ready_at(Some(too_fresh), due),
+            now + Duration::from_millis(1)
+        );
+        assert_eq!(
+            focused_prewarm_ready_at(Some(due), now + Duration::from_secs(1)),
+            now + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn focused_prewarm_target_revision_rejects_an_old_enumeration() {
+        let _guard = FOCUSED_PREWARM_LIFECYCLE_TEST_LOCK.lock().unwrap();
+        let expected = FocusedPrewarmTarget {
+            pid: 10,
+            wid: 20,
+            pid_generation: 3,
+            target_revision: next_focused_prewarm_target_revision(),
+            needs_resolution: false,
+            consecutive_failures: 0,
+            next_attempt: Instant::now(),
+        };
+        let mut replacement = expected.clone();
+        replacement.wid = 21;
+        replacement.target_revision = next_focused_prewarm_target_revision();
+        *FOCUSED_PREWARM_TARGET.lock().unwrap() = Some(replacement.clone());
+
+        assert!(update_focused_prewarm_target_if_current(&expected, 22).is_none());
+        assert!(!focused_prewarm_revision_is_current(Some(
+            expected.target_revision
+        )));
+        assert!(focused_prewarm_revision_is_current(Some(
+            replacement.target_revision
+        )));
+        assert_eq!(
+            FOCUSED_PREWARM_TARGET.lock().unwrap().as_ref(),
+            Some(&replacement)
+        );
+        *FOCUSED_PREWARM_TARGET.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn clearing_focused_prewarm_target_invalidates_queued_job_revision() {
+        let _guard = FOCUSED_PREWARM_LIFECYCLE_TEST_LOCK.lock().unwrap();
+        let old_revision = next_focused_prewarm_target_revision();
+        *FOCUSED_PREWARM_TARGET.lock().unwrap() = Some(FocusedPrewarmTarget {
+            pid: 10,
+            wid: 20,
+            pid_generation: 3,
+            target_revision: old_revision,
+            needs_resolution: false,
+            consecutive_failures: 0,
+            next_attempt: Instant::now(),
+        });
+
+        assert!(focused_prewarm_revision_is_current(Some(old_revision)));
+        assert!(invalidate_focused_prewarm_target(|_| true, "test-clear"));
+        assert!(FOCUSED_PREWARM_TARGET.lock().unwrap().is_none());
+        assert!(!focused_prewarm_revision_is_current(Some(old_revision)));
+    }
+
+    #[test]
+    fn new_window_priority_beats_focused_prewarm() {
+        let mut state = CaptureState::default();
+        let prewarm = ThumbKey { pid: 10, wid: 20 };
+        let new_window = ThumbKey { pid: 10, wid: 21 };
+        assert!(state.request(prewarm, 512, CapturePriority::FocusedPrewarm));
+        assert!(state.request(new_window, 512, CapturePriority::NewWindow));
+        assert_eq!(state.take_next().unwrap().key, new_window);
+    }
+
+    #[test]
+    fn geometry_plausibility_reports_independent_reasons() {
+        assert_eq!(
+            geometry_reject_reason(32, 32, None),
+            Some(GeometryRejectReason::SourceTooSmall)
+        );
+        assert_eq!(
+            geometry_reject_reason(1_000, 64, None),
+            Some(GeometryRejectReason::SourceAspect)
+        );
+        assert_eq!(
+            geometry_reject_reason(1_000, 500, Some((0.0, 0.0, 20.0, 100.0))),
+            Some(GeometryRejectReason::ExpectedAspect)
+        );
+        assert_eq!(geometry_reject_reason(1_000, 500, None), None);
+    }
 
     #[test]
     fn capture_state_coalesces_pending_and_in_flight_requests() {

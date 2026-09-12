@@ -273,6 +273,7 @@ pub(crate) fn app_terminated(pid: i32) {
     // 终止 App 挂起的空白重试名额一并失效。
     // The terminated app's pending blank-retry slots become moot as well.
     super::forget_blank_retries_for_pid(pid);
+    super::forget_focused_prewarm_for_pid(pid);
     if let Some(tx) = CMD_TX.get() {
         match tx.try_send(ObsCmd::Remove(pid)) {
             Ok(()) => signal_observer_runloop(),

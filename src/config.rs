@@ -135,6 +135,10 @@ pub struct Layout {
     // and the thumbnail service never starts. Default on; auto-sleeps without the
     // Screen Recording permission (see the thumbnail module).
     pub thumbnails_enabled: bool,
+    // 前台窗口缩略图后台预热:开启后在浮窗隐藏时低频刷新当前前台窗口;默认关以控制后台开销。
+    // Focused-window thumbnail prewarm: when enabled, refresh the frontmost window at a low rate
+    // while the overlay is hidden. Default off to keep background work bounded.
+    pub focused_thumbnail_prewarm: bool,
     // 卡片文字大小(点):窗口标题和应用名按比例缩放;纯图标模式的大图标不受影响。
     // Card text size (points): the window title and app name scale proportionally; the large
     // icon in icon-only mode is unaffected.
@@ -553,6 +557,7 @@ impl Default for Layout {
     fn default() -> Self {
         Layout {
             thumbnails_enabled: true,
+            focused_thumbnail_prewarm: false,
             card_text_size: 15.0,
         }
     }
@@ -954,6 +959,7 @@ impl Config {
             // Booleans are always valid; adopt the loaded value unconditionally
             // (same convention as the other boolean switches).
             self.layout.thumbnails_enabled = other.layout.thumbnails_enabled;
+            self.layout.focused_thumbnail_prewarm = other.layout.focused_thumbnail_prewarm;
             if !errs.iter().any(|e| e.starts_with("layout.card_text_size")) {
                 self.layout.card_text_size = other.layout.card_text_size;
             }
@@ -1633,6 +1639,12 @@ pub fn effective_glass_style() -> String {
 /// Return the effective glass tint.
 pub fn effective_glass_tint() -> String {
     CONFIG.read().unwrap().appearance.glass_tint.clone()
+}
+
+/// 返回是否启用前台窗口缩略图后台预热。
+/// Return whether focused-window thumbnail prewarming is enabled.
+pub(crate) fn focused_thumbnail_prewarm_enabled() -> bool {
+    CONFIG.read().unwrap().layout.focused_thumbnail_prewarm
 }
 
 // ========== 配置落盘防抖调度器 / debounced config persistence scheduler ==========

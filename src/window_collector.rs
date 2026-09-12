@@ -2021,6 +2021,47 @@ pub(crate) fn collect_windows_for_pid(
     }
 }
 
+/// Find a switchable, capture-sized window for a frontmost app.
+/// 为前台应用查找可切换且足够进行缩略图捕获的窗口。
+///
+/// AX remains the authority for membership in the switcher; the CG snapshot only supplies
+/// current geometry. A stale or auxiliary focused-window id therefore cannot force a thin
+/// helper surface to become the prewarm target.
+/// AX 仍是切换器成员资格的权威，CG 快照只提供当前几何信息；过期或辅助窗口的焦点 id
+/// 不会再强行成为预热目标。
+pub(crate) fn choose_switchable_capture_window(
+    windows: &[WindowInfo],
+    focused_cgwid: Option<u32>,
+    preferred_cgwid: u32,
+) -> Option<WindowInfo> {
+    let preferred = focused_cgwid.unwrap_or(preferred_cgwid);
+    windows
+        .iter()
+        .filter(|window| {
+            !window.minimized
+                && window.window_id != 0
+                && window.bounds.2 >= 160.0
+                && window.bounds.3 >= 120.0
+        })
+        .max_by_key(|window| {
+            (
+                window.window_id == preferred,
+                (window.bounds.2 * window.bounds.3) as u64,
+            )
+        })
+        .cloned()
+}
+
+pub(crate) fn switchable_capture_window_for_pid(
+    pid: i32,
+    preferred_cgwid: u32,
+) -> Option<WindowInfo> {
+    let focused_cgwid = unsafe { focused_window_cgwid(pid) };
+    let mut mru = MruMap::new();
+    let windows = collect_windows_for_pid(&mut mru, pid, focused_cgwid.unwrap_or(preferred_cgwid))?;
+    choose_switchable_capture_window(&windows, focused_cgwid, preferred_cgwid)
+}
+
 unsafe fn collect_windows_for_pid_inner(
     mru: &mut MruMap,
     pid: i32,
@@ -2852,6 +2893,36 @@ mod tests {
             minimized: false,
             bounds: (0.0, 0.0, 0.0, 0.0),
         }
+    }
+
+    #[test]
+    fn choose_switchable_capture_window_prefers_focus_and_rejects_thin_windows() {
+        let mut focused = window(10, 101);
+        focused.bounds = (0.0, 0.0, 900.0, 600.0);
+        let mut larger = window(10, 102);
+        larger.bounds = (0.0, 0.0, 1200.0, 800.0);
+        let mut tiny = window(10, 103);
+        tiny.bounds = (0.0, 0.0, 80.0, 80.0);
+        let mut minimized = window(10, 104);
+        minimized.bounds = (0.0, 0.0, 1200.0, 800.0);
+        minimized.minimized = true;
+        let windows = vec![focused.clone(), larger, tiny.clone(), minimized];
+
+        assert_eq!(
+            choose_switchable_capture_window(&windows, Some(101), 999)
+                .map(|window| window.window_id),
+            Some(101)
+        );
+        assert_eq!(
+            choose_switchable_capture_window(&windows, Some(999), 999)
+                .map(|window| window.window_id),
+            Some(102)
+        );
+        assert_eq!(choose_switchable_capture_window(&[tiny], None, 0), None);
+        assert_eq!(
+            choose_switchable_capture_window(&[focused], None, 101).map(|window| window.window_id),
+            Some(101)
+        );
     }
 
     #[test]

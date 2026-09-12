@@ -4151,6 +4151,15 @@ pub(crate) fn show_overlay() {
             );
         }
 
+        // Queue the selected thumbnail immediately after layout has resolved its target size,
+        // before card reconciliation does any per-card AppKit work. Capture remains asynchronous;
+        // this only gives the worker the earliest safe head start for the first visible frame.
+        // 在布局确定目标尺寸后、卡片 reconcile 的逐卡 AppKit 工作前立即排队选中缩略图。
+        // 捕获仍是异步的；这里只提供首帧最早的安全提前量，不阻塞主线程。
+        if let Some(target_px_h) = capture_target_px_h {
+            crate::thumbnail::refresh_selected_for_summon(target_px_h);
+        }
+
         let t_reconcile = Instant::now(); // TIMING-DEBUG
         let reconcile_stats = reconcile_card_views(
             document,

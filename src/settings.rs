@@ -203,9 +203,10 @@ pub(super) struct SettingsUi {
     locale: *mut AnyObject,          // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject,  // NSSwitch: 显示最小化窗口 / show minimized windows
     thumbnails_enabled: *mut AnyObject, // NSPopUpButton: 窗口显示模式 / window display mode
-    card_text_size: *mut AnyObject,  // NSSlider: 卡片文字大小 / card text size
+    focused_thumbnail_prewarm: *mut AnyObject, // NSSwitch: 前台窗口缩略图后台预热 / focused thumbnail prewarm
+    card_text_size: *mut AnyObject,            // NSSlider: 卡片文字大小 / card text size
     card_text_size_value_label: *mut AnyObject, // NSTextField: 卡片字号值 / card text-size value
-    status_bar_text_size: *mut AnyObject, // NSSlider: 底部标题栏文字大小 / footer text size
+    status_bar_text_size: *mut AnyObject,      // NSSlider: 底部标题栏文字大小 / footer text size
     status_bar_text_size_value_label: *mut AnyObject, // NSTextField: 底部字号值 / footer text-size value
     windows_enabled: *mut AnyObject, // NSSwitch: 窗口切换总开关 / app-switcher master switch
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
@@ -944,6 +945,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.layout.thumbnails_enabled
     );
     changed!(
+        "layout.focused_thumbnail_prewarm",
+        old.layout.focused_thumbnail_prewarm,
+        new.layout.focused_thumbnail_prewarm
+    );
+    changed!(
         "layout.card_text_size",
         old.layout.card_text_size,
         new.layout.card_text_size
@@ -1108,6 +1114,7 @@ enum ControlField {
     WindowsEnabled,
     ShowMinimized,
     ThumbnailsEnabled,
+    FocusedThumbnailPrewarm,
     CardTextSize,
     StatusBarTextSize,
     OverlayPosition,
@@ -1164,6 +1171,12 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             .or_else(|| m(u.windows_enabled, ControlField::WindowsEnabled))
             .or_else(|| m(u.show_minimized, ControlField::ShowMinimized))
             .or_else(|| m(u.thumbnails_enabled, ControlField::ThumbnailsEnabled))
+            .or_else(|| {
+                m(
+                    u.focused_thumbnail_prewarm,
+                    ControlField::FocusedThumbnailPrewarm,
+                )
+            })
             .or_else(|| m(u.card_text_size, ControlField::CardTextSize))
             .or_else(|| m(u.status_bar_text_size, ControlField::StatusBarTextSize))
             .or_else(|| m(u.overlay_position, ControlField::OverlayPosition))
@@ -1402,6 +1415,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::ThumbnailsEnabled => {
                     let idx: isize = msg_send![u.thumbnails_enabled, indexOfSelectedItem];
                     cfg.layout.thumbnails_enabled = idx == 1;
+                }
+                ControlField::FocusedThumbnailPrewarm => {
+                    let state: isize = msg_send![u.focused_thumbnail_prewarm, state];
+                    cfg.layout.focused_thumbnail_prewarm = state == 1;
                 }
                 ControlField::CardTextSize => {
                     let val: isize = msg_send![u.card_text_size, integerValue];
@@ -1863,6 +1880,7 @@ unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
     for &ctrl in &[
         ui.show_minimized,
         ui.thumbnails_enabled,
+        ui.focused_thumbnail_prewarm,
         ui.card_text_size,
         ui.card_text_size_value_label,
         ui.status_bar_text_size,
@@ -2174,6 +2192,12 @@ pub(crate) fn refresh_switcher_controls_from_config() {
 
             let thumbnail_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };
             let _: () = msg_send![u.thumbnails_enabled, selectItemAtIndex: thumbnail_idx];
+            let prewarm_state = if cfg.layout.focused_thumbnail_prewarm {
+                1isize
+            } else {
+                0isize
+            };
+            let _: () = msg_send![u.focused_thumbnail_prewarm, setState: prewarm_state];
         });
     }
 }
@@ -2919,6 +2943,12 @@ fn load_settings_from(cfg: &Config) {
             // Window display mode index 0 = icons only, 1 = icons and thumbnails.
             let th_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };
             let _: () = msg_send![ui.thumbnails_enabled, selectItemAtIndex: th_idx];
+            let prewarm_state = if cfg.layout.focused_thumbnail_prewarm {
+                1isize
+            } else {
+                0isize
+            };
+            let _: () = msg_send![ui.focused_thumbnail_prewarm, setState: prewarm_state];
             // overlay_position:下拉框 index 0 = 跟随激活窗口(active_window), 1 = 主屏幕(main)。
             // overlay_position: popup index 0 = follow active window (active_window), 1 = main (main).
             let op_idx = match cfg.windows.overlay_position.as_str() {
@@ -3589,6 +3619,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             glass_preview_clipboard: std::ptr::null_mut(),
             corner_radius: std::ptr::null_mut(),
             thumbnails_enabled: std::ptr::null_mut(),
+            focused_thumbnail_prewarm: std::ptr::null_mut(),
             card_text_size: std::ptr::null_mut(),
             card_text_size_value_label: std::ptr::null_mut(),
             status_bar_text_size: std::ptr::null_mut(),
@@ -4335,12 +4366,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             .collect();
         let display_mode_metrics =
             SettingsSelect::metrics(ctrl_w, &window_display_mode_refs, row_h, described_row_h);
-        y = layout.next_row_cursor(y, display_mode_metrics.row_h);
-        SettingsRow::separator(
-            switcher_view,
-            y + display_mode_metrics.row_h + 3.0,
-            content_w,
-        );
+        // The preceding show-minimized row uses the shared described-row height; do not let
+        // the next popup's measured height move its separator.
+        // 前一行“显示最小化窗口”使用统一 described 行高；不能让下一行下拉框的动态高度
+        // 改变这一行的游标和分隔线位置。
+        y = layout.next_row_cursor(y, described_row_h);
+        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         ui.thumbnails_enabled = SettingsRow::tall_with_height(
             switcher_view,
             label_x,
@@ -4360,11 +4391,26 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         .1;
         bind_control(target, ui.thumbnails_enabled);
         y = layout.next_row_cursor(y, display_mode_metrics.row_h);
+        // The popup row may be taller than the standard described row in long locales.
+        // 下拉行在长文案语言下可能高于标准 described 行，分隔线必须复用实际行高。
         SettingsRow::separator(
             switcher_view,
             y + display_mode_metrics.row_h + 3.0,
             content_w,
         );
+        ui.focused_thumbnail_prewarm = SettingsRow::described(
+            switcher_view,
+            label_x,
+            y,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_focused_thumbnail_prewarm"),
+            &t("settings.desc_focused_thumbnail_prewarm"),
+            SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+        );
+        bind_control(target, ui.focused_thumbnail_prewarm);
+        y = layout.next_row_cursor(y, described_row_h);
+        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         ui.card_text_size = SettingsRow::described(
             switcher_view,
             label_x,

@@ -23,6 +23,7 @@ struct ChangeFlags {
     logging: bool,
     windows_disabled: bool,
     thumbnails: bool,
+    focused_thumbnail_prewarm: bool,
     mouse: bool,
     clipboard_enabled: bool,
     clipboard_persist: bool,
@@ -45,6 +46,8 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         windows_disabled: !new.windows.enabled
             && (startup || old.windows.enabled != new.windows.enabled),
         thumbnails: startup || old.layout.thumbnails_enabled != new.layout.thumbnails_enabled,
+        focused_thumbnail_prewarm: startup
+            || old.layout.focused_thumbnail_prewarm != new.layout.focused_thumbnail_prewarm,
         mouse: startup || old.mouse != new.mouse,
         clipboard_enabled: startup || old.clipboard.enabled != new.clipboard.enabled,
         clipboard_persist: old.clipboard.persist != new.clipboard.persist,
@@ -97,10 +100,19 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
             crate::thumbnail::start();
         } else {
             crate::thumbnail::clear_runtime_cache();
+            crate::thumbnail::stop_focused_prewarm_worker();
         }
     }
 
-    if flags.modifier || flags.thumbnails {
+    if flags.focused_thumbnail_prewarm || flags.thumbnails {
+        if new.layout.focused_thumbnail_prewarm && new.layout.thumbnails_enabled {
+            crate::thumbnail::start_focused_prewarm_worker();
+        } else {
+            crate::thumbnail::stop_focused_prewarm_worker();
+        }
+    }
+
+    if flags.modifier || flags.thumbnails || flags.focused_thumbnail_prewarm {
         // 菜单或设置页修改后,原位同步已打开的设置窗口,不激活应用也不重建窗口。
         // Keep an already-open settings window in sync in place, without activating the app or
         // rebuilding the window.
