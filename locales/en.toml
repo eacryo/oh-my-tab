@@ -40,6 +40,8 @@ detail_save_image_name = "Clipboard Image"
 detail_share = "Share"
 detail_lines_one = "{count} line"
 detail_lines_other = "{count} lines"
+meta_lines_one = "{count} line"
+meta_lines_other = "{count} lines"
 detail_chars_one = "{count} char"
 detail_chars_other = "{count} chars"
 

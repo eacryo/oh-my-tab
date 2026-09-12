@@ -9129,6 +9129,31 @@ mod tests {
     }
 
     #[test]
+    fn build_meta_text_reports_source_line_count_after_time() {
+        use super::build_meta_text;
+        let mut e = entry_with_source("long text\n    ", "Safari");
+        e.copied_at = Some(super::now_secs() - 5);
+        let m = build_meta_text(&e, true);
+        assert!(m.starts_with("Safari · "));
+        let line_label = super::tf("clipboard.meta_lines_other", &[("count", "2")]);
+        assert!(m.ends_with(&line_label), "got {m}");
+        assert!(m.find(&line_label).unwrap() > m.find(" · ").unwrap());
+
+        // Soft wrapping from a long single line is not a source line break.
+        let single = entry_with_source(&"长".repeat(200), "Safari");
+        assert!(!build_meta_text(&single, true).contains(&line_label));
+    }
+
+    #[test]
+    fn physical_line_count_preserves_trailing_and_empty_lines() {
+        use super::physical_line_count;
+        assert_eq!(physical_line_count("single"), None);
+        assert_eq!(physical_line_count("first\nsecond"), Some(2));
+        assert_eq!(physical_line_count("first\n    "), Some(2));
+        assert_eq!(physical_line_count("first\n\n"), Some(3));
+    }
+
+    #[test]
     fn format_copied_at_is_mm_dd_hh_mm() {
         use super::format_copied_at;
         // 本地时区无关的结构断言:长度 11,形如 "MM-dd HH:mm"。

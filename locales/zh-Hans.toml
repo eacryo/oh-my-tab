@@ -41,6 +41,8 @@ detail_save_image_name = "剪贴板图片"
 detail_share = "分享"
 detail_lines_one = "{count} 行"
 detail_lines_other = "{count} 行"
+meta_lines_one = "共 {count} 行"
+meta_lines_other = "共 {count} 行"
 detail_chars_one = "{count} 字符"
 detail_chars_other = "{count} 字符"
 

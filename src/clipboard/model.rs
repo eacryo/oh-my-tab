@@ -60,10 +60,10 @@ pub(super) fn should_show_source_icon(show_source: bool, entry: &ClipEntry) -> b
     show_source && !entry.source_key.is_empty()
 }
 
-/// 行内副信息(应用名 · 相对时间):正文下方的小字,按设计稿 10px 浅灰。
+/// 行内副信息(应用名 · 相对时间 · 行数):正文下方的小字,按设计稿 10px 浅灰。
 /// 类型提示改由正文本身的着色/字体表达(URL 蓝、代码等宽),副信息不再挂角标。
-/// The row's meta line (app · relative time): the small text below the content, 10px
-/// light gray per the mockup. The kind cue moved INTO the content itself (blue URLs,
+/// The row's meta line (app · relative time · line count): the small text below the content,
+/// 10px light gray per the mockup. The kind cue moved INTO the content itself (blue URLs,
 /// monospaced code); the meta line carries no badge.
 pub(super) fn build_meta_text(entry: &ClipEntry, show_source: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -77,7 +77,31 @@ pub(super) fn build_meta_text(entry: &ClipEntry, show_source: bool) -> String {
     if let Some(ts) = entry.copied_at {
         parts.push(relative_time_label(ts, now_secs()));
     }
+    // 只报告原文的真实换行,不把列表控件的自动折行误报成多行。
+    // Report only source line breaks; never mistake the list cell's soft wrapping for them.
+    if entry.image.is_none() {
+        if let Some(count) = physical_line_count(&entry.text) {
+            parts.push(tf(
+                if count == 1 {
+                    "clipboard.meta_lines_one"
+                } else {
+                    "clipboard.meta_lines_other"
+                },
+                &[("count", &count.to_string())],
+            ));
+        }
+    }
     parts.join(" · ")
+}
+
+/// 含真实换行时返回物理行数;单行文本返回 None,以免污染普通条目的 meta 行。
+/// Return physical line count when source newlines exist; omit it for ordinary single-line text.
+pub(super) fn physical_line_count(text: &str) -> Option<usize> {
+    if text.contains('\n') {
+        Some(text.split('\n').count().max(1))
+    } else {
+        None
+    }
 }
 
 /// 相对时间:刚刚 / 今天 HH:mm / 昨天 HH:mm / 更早 MM-dd HH:mm(本地时区)。
