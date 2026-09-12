@@ -204,6 +204,7 @@ fn schedule_deferred_refresh_watchdog(generation: u64) -> bool {
             generation,
             error
         );
+        return false;
     }
     true
 }
