@@ -86,6 +86,56 @@ static WINDOW_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static WINDOW_REFRESH_RESULT: LazyLock<Mutex<Option<WindowRefreshResult>>> =
     LazyLock::new(|| Mutex::new(None));
 static LIFECYCLE_BACKSTOP_STARTED: OnceLock<()> = OnceLock::new();
+static DEFERRED_REFRESH_HANDOFF_TOKEN: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_REFRESH_HANDOFF_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const DEFERRED_REFRESH_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// 「刷新进行中」标志的移交看门狗:标志在请求处置位,释放职责用 hand_off() 逐段转交
+/// (请求方 → 后台 worker → 主线程 apply → apply 在卡片收窄过渡中安排的重入);任何一段
+/// 在转交前 panic 或提前返回,Drop 都立即复位。panic 的代价因此被限制为「损失一次刷新」,
+/// 而不会让 WINDOW_REFRESH_IN_FLIGHT 永久停在 true 使整条刷新管线静默失效 —— 幽灵卡片
+/// 即由此产生。
+///
+/// 可 panic 的向量不止一种,guard 对它们一视同仁:实测到的是 backstop 从自己的线程直接
+/// 进入请求路径时触发的 debug 主线程断言;worker 段 `lock().unwrap()` 的中毒锁、collector
+/// 或排序等纯 Rust 代码里的 panic 属于同类。
+/// Hand-off watchdog for the in-flight flag: the flag is set by the request path and the
+/// release duty is passed along in stages (requester -> worker -> main-thread apply -> the
+/// deferred re-entry apply schedules during a card-close transition) via hand_off(); if any
+/// stage panics or returns early before passing it on, Drop resets the flag at once. A panic
+/// therefore costs one refresh instead of parking WINDOW_REFRESH_IN_FLIGHT at true and silently
+/// disabling the whole refresh pipeline -- which is what produced the ghost card.
+///
+/// The panic vectors are not limited to one, and the guard treats them alike: the one measured
+/// in practice was the debug main-thread assertion raised when the backstop entered the request
+/// path from its own thread; a poisoned `lock().unwrap()` in the worker stage or a panic inside
+/// plain Rust (collection, sorting) belongs to the same class.
+struct InFlightGuard {
+    armed: bool,
+}
+
+impl InFlightGuard {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    /// 放弃本次释放:释放职责转交后续阶段(worker 投递后的主线程 apply,或 apply 在卡片
+    /// 收窄过渡中安排的重入)。标志保持置位,若该阶段自己再 panic,由它自己的 guard 兜底。
+    /// Give up this release: the duty moves to a later stage (the main-thread apply after the
+    /// worker posts, or the re-entry apply schedules during a card-close transition). The flag
+    /// stays set; if that stage panics in turn, its own guard covers it.
+    fn hand_off(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        }
+    }
+}
 
 /// 请求一次有界的后台窗口快照；同一时间只允许一个任务，避免快捷键连按制造线程风暴。
 /// Request one bounded background window snapshot; only one task may run at a time,
@@ -121,6 +171,69 @@ pub(crate) fn start_lifecycle_backstop() {
 
 pub(crate) extern "C" fn on_lifecycle_backstop(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     crate::callback_guard::void("on_lifecycle_backstop", request_lifecycle_window_refresh);
+}
+
+fn schedule_deferred_refresh_watchdog(generation: u64) -> bool {
+    let token = {
+        let _handoff = DEFERRED_REFRESH_HANDOFF_LOCK.lock().unwrap();
+        let token = DEFERRED_REFRESH_HANDOFF_TOKEN.fetch_add(1, Ordering::AcqRel) + 1;
+        let controller = CONTROLLER.lock().unwrap().map(|ptr| ptr.0);
+        let Some(controller) = controller else {
+            return false;
+        };
+        unsafe {
+            let _: () = msg_send![
+                controller,
+                performSelector: sel!(handleWindowRefresh:),
+                withObject: std::ptr::null::<AnyObject>(),
+                afterDelay: 0.08f64
+            ];
+        }
+        token
+    };
+
+    if let Err(error) = thread::Builder::new()
+        .name("window-refresh-watchdog".into())
+        .spawn(move || {
+            thread::sleep(DEFERRED_REFRESH_WATCHDOG_TIMEOUT);
+            recover_stalled_deferred_refresh(generation, token);
+        })
+    {
+        log_debug!(
+            "[windows] deferred refresh watchdog unavailable generation={} error={}",
+            generation,
+            error
+        );
+    }
+    true
+}
+
+fn recover_stalled_deferred_refresh(generation: u64, token: u64) -> bool {
+    let _handoff = DEFERRED_REFRESH_HANDOFF_LOCK.lock().unwrap();
+    if DEFERRED_REFRESH_HANDOFF_TOKEN.load(Ordering::Acquire) != token
+        || !WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    let removed = {
+        let mut result = WINDOW_REFRESH_RESULT.lock().unwrap();
+        if result
+            .as_ref()
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            result.take().is_some()
+        } else {
+            false
+        }
+    };
+    if removed {
+        WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        log_debug!(
+            "[windows] deferred refresh watchdog recovered stalled result generation={}",
+            generation
+        );
+    }
+    removed
 }
 
 fn request_lifecycle_window_refresh() {
@@ -186,7 +299,10 @@ fn request_window_refresh_request(request: WindowRefreshRequest) {
         return;
     }
 
-    start_window_refresh(request);
+    // 标志已置位,此后由 guard 兜底:任何没走到主线程 apply 阶段的退出都会复位它。
+    // The flag is now set and owned by the guard, which resets it on any exit that never
+    // reaches the main-thread apply stage.
+    start_window_refresh(request, InFlightGuard::new());
 }
 
 /// Prefer the exact focus key from the current summon snapshot over a cached key.  Both keys
@@ -207,12 +323,11 @@ fn select_summon_focus_key(
         .or_else(|| cached.filter(|key| is_present(*key)))
 }
 
-fn start_window_refresh(request: WindowRefreshRequest) {
+fn start_window_refresh(request: WindowRefreshRequest, in_flight: InFlightGuard) {
+    // 状态未就绪时直接返回:guard 在 Drop 中复位标志,不留下卡死状态。
+    // Return without state: the guard resets the flag on Drop instead of leaving it stuck.
     let Some((generation, mru)) = with_tab_state(|state_opt| {
-        let Some(state) = state_opt.as_ref() else {
-            WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-            return None;
-        };
+        let state = state_opt.as_ref()?;
         Some((
             WINDOW_REFRESH_GENERATION.fetch_add(1, Ordering::AcqRel) + 1,
             state.mru.clone(),
@@ -306,9 +421,15 @@ fn start_window_refresh(request: WindowRefreshRequest) {
                         waitUntilDone: false
                     ];
                 }
+                // 结果已交给主线程 apply 阶段,标志由其释放。
+                // The result is handed to the main-thread apply stage, which releases the flag.
+                in_flight.hand_off();
             } else {
                 WINDOW_REFRESH_RESULT.lock().unwrap().take();
-                WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+                // 无人接收结果:先由 guard 复位标志,再重新发起排队中的请求。
+                // Nobody will consume the result: the guard resets the flag first, then the
+                // queued request is re-issued.
+                drop(in_flight);
                 if let Some(pending_request) = take_pending_refresh_request() {
                     request_window_refresh_request(pending_request);
                 }
@@ -422,30 +543,54 @@ fn select_index_after_refresh(
 /// Apply a snapshot on the main thread and merge window-level MRU updates made after
 /// the background task started.
 fn apply_window_refresh() {
+    run_apply_with_in_flight_guard(apply_window_refresh_inner);
+}
+
+fn run_apply_with_in_flight_guard(apply: impl FnOnce(InFlightGuard)) {
+    apply(InFlightGuard::new());
+}
+
+fn apply_window_refresh_inner(in_flight: InFlightGuard) {
+    // 标志由请求处置位、经 hand_off() 逐段转交到这里,guard 兜底本阶段的任何 panic:否则
+    // callback_guard 会把 panic 吞成一行日志,而标志永久停在 true —— 正是上面修掉的那个
+    // bug 的镜像形态。
+    // The flag was set by the request path and handed off stage by stage to here; this guard
+    // covers any panic in this stage. Without it, callback_guard would swallow the panic into a
+    // single log line while the flag stayed true forever -- the exact mirror of the bug fixed
+    // above.
     if overlay::card_close_in_progress() {
         // 关闭卡片正在收窄补位时保留快照,避免刷新重建 view 树打断过渡动画。
         // Keep the snapshot pending while close reflow runs, so a refresh cannot rebuild the view tree.
-        unsafe {
-            if let Some(controller) = *CONTROLLER.lock().unwrap() {
-                let _: () = msg_send![
-                    controller.0,
-                    performSelector: sel!(handleWindowRefresh:),
-                    withObject: std::ptr::null::<AnyObject>(),
-                    afterDelay: 0.08f64
-                ];
-            }
+        let generation = WINDOW_REFRESH_RESULT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|result| result.generation);
+        let deferred = generation.is_some_and(schedule_deferred_refresh_watchdog);
+        if deferred {
+            // 快照保留待 0.08s 后的重入消费,该次重入会持有标志并再次兜底。
+            // The snapshot stays pending for the re-entry 0.08s later, which holds the flag and
+            // guards itself in turn.
+            in_flight.hand_off();
         }
         return;
     }
     let Some(result) = WINDOW_REFRESH_RESULT.lock().unwrap().take() else {
-        WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-        if let Some(pending_request) = take_pending_refresh_request() {
+        // 先复位标志,再发起排队中的请求(顺序不能反)。
+        // Reset the flag first, then re-issue the queued request (the order matters).
+        // If a timed-out delayed callback arrives after a newer worker has claimed the flag,
+        // preserve that newer hand-off instead of clearing its in-flight state.
+        // 若超时的延迟回调晚到且新 worker 已接管标志,不能清掉新一轮刷新。
+        if WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire) {
+            in_flight.hand_off();
+        } else if let Some(pending_request) = take_pending_refresh_request() {
+            drop(in_flight);
             request_window_refresh_request(pending_request);
         }
         return;
     };
     if result.generation != WINDOW_REFRESH_GENERATION.load(Ordering::Acquire) {
-        WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        drop(in_flight);
         if let Some(pending_request) = take_pending_refresh_request() {
             request_window_refresh_request(pending_request);
         }
@@ -456,10 +601,9 @@ fn apply_window_refresh() {
     let subscriptions = window_server_candidates();
 
     let Some((was_visible, set_changed)) = with_tab_state(|state_opt| {
-        let Some(state) = state_opt.as_mut() else {
-            WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-            return None;
-        };
+        // 没有可写入的状态:走到下面的 else 返回时由 guard 复位标志。
+        // Nothing to apply into: the guard resets the flag when the else branch returns.
+        let state = state_opt.as_mut()?;
         let selected_key = state
             .windows
             .get(state.selected)
@@ -541,7 +685,10 @@ fn apply_window_refresh() {
     }) else {
         return;
     };
-    WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+    // 快照已应用,标志可以放开了:后面的重建浮窗、更新订阅即使 panic 也不会再卡住管线。
+    // The snapshot is applied, so the flag can go: a panic in the rebuild/subscription steps
+    // below can no longer wedge the pipeline.
+    drop(in_flight);
     let pending_request = take_pending_refresh_request();
 
     // 首帧快照就绪:消费 pending_first_show,一次性显示(一次成图)。此时窗口列表已是刷新后的
@@ -755,10 +902,14 @@ pub(crate) fn best_effort_bump_focus_key(state: &mut AppState, pid: i32, cgwid: 
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_refreshed_windows, preserve_existing_window_order, selection_index_after_refresh,
-        WindowRefreshReason,
+        merge_refreshed_windows, preserve_existing_window_order, run_apply_with_in_flight_guard,
+        selection_index_after_refresh, WindowRefreshReason, WindowRefreshResult,
     };
     use crate::window_collector::WindowInfo;
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    static IN_FLIGHT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn window(pid: i32, window_id: u32) -> WindowInfo {
         WindowInfo {
@@ -771,6 +922,107 @@ mod tests {
             minimized: false,
             bounds: (0.0, 0.0, 100.0, 100.0),
         }
+    }
+
+    #[test]
+    fn in_flight_guard_releases_the_flag_unless_it_is_handed_off() {
+        use super::{InFlightGuard, WINDOW_REFRESH_IN_FLIGHT};
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::atomic::Ordering;
+
+        let _lock = IN_FLIGHT_TEST_LOCK.lock().unwrap();
+
+        // 交接前 panic(主线程专用状态的 debug 断言即此形态)必须复位标志,否则一次
+        // panic 会让刷新管线永久静默——死掉 App 的卡片就会一直留在切换界面里。
+        // A panic before the hand-off (the shape the main-thread debug assertion takes) must
+        // reset the flag; otherwise one panic silences the pipeline for good and a dead app's
+        // card stays in the switcher.
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            WINDOW_REFRESH_IN_FLIGHT.store(true, Ordering::Release);
+            let _guard = InFlightGuard::new();
+            panic!("simulated refresh setup failure");
+        }));
+        assert!(panicked.is_err());
+        assert!(!WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire));
+
+        // 正常交接后标志保持置位,交给下一段释放:worker 投递给主线程 apply,或 apply 在
+        // 卡片收窄过渡中交给 0.08s 后的重入。apply 自身也用同一个 guard 兜底,所以
+        // 「交接之后」的那一段同样不会卡死。
+        // After a successful hand-off the flag stays set for the next stage to release: the
+        // worker to the main-thread apply, or apply to its deferred re-entry during a card-close
+        // transition. Apply wraps itself in the same guard, so the post-hand-off stage cannot
+        // wedge either.
+        WINDOW_REFRESH_IN_FLIGHT.store(true, Ordering::Release);
+        InFlightGuard::new().hand_off();
+        assert!(WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire));
+        WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn deferred_refresh_watchdog_recovers_only_the_matching_result() {
+        use super::{
+            recover_stalled_deferred_refresh, DEFERRED_REFRESH_HANDOFF_TOKEN,
+            WINDOW_REFRESH_IN_FLIGHT, WINDOW_REFRESH_RESULT,
+        };
+        use std::sync::atomic::Ordering;
+
+        let _lock = IN_FLIGHT_TEST_LOCK.lock().unwrap();
+        let generation = 41;
+        let token = 7;
+        DEFERRED_REFRESH_HANDOFF_TOKEN.store(token, Ordering::Release);
+        WINDOW_REFRESH_IN_FLIGHT.store(true, Ordering::Release);
+        *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
+            generation,
+            windows: Vec::new(),
+            mru: HashMap::new(),
+            replace_pid: None,
+            active_key: None,
+            summon_focus_key: None,
+        });
+
+        assert!(recover_stalled_deferred_refresh(generation, token));
+        assert!(!WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire));
+        assert!(WINDOW_REFRESH_RESULT.lock().unwrap().is_none());
+
+        WINDOW_REFRESH_IN_FLIGHT.store(true, Ordering::Release);
+        *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
+            generation,
+            windows: Vec::new(),
+            mru: HashMap::new(),
+            replace_pid: None,
+            active_key: None,
+            summon_focus_key: None,
+        });
+        assert!(!recover_stalled_deferred_refresh(generation, token + 1));
+        assert!(WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire));
+        WINDOW_REFRESH_RESULT.lock().unwrap().take();
+        WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn apply_guard_releases_after_an_apply_panic_and_preserves_new_handoff() {
+        use super::{InFlightGuard, WINDOW_REFRESH_IN_FLIGHT};
+        use std::sync::atomic::Ordering;
+
+        let _lock = IN_FLIGHT_TEST_LOCK.lock().unwrap();
+        WINDOW_REFRESH_IN_FLIGHT.store(true, Ordering::Release);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_apply_with_in_flight_guard(|_in_flight| {
+                panic!("simulated apply failure");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert!(!WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire));
+
+        // A delayed callback with no result must not clear a newer hand-off.
+        // 没有结果的延迟回调不能清掉新一轮已经接管的刷新。
+        WINDOW_REFRESH_IN_FLIGHT.store(true, Ordering::Release);
+        let guard = InFlightGuard::new();
+        if WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire) {
+            guard.hand_off();
+        }
+        assert!(WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire));
+        WINDOW_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
     }
 
     #[test]
