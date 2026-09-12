@@ -5,7 +5,6 @@
 
 [clipboard]
 clear_all = "清空歷史"
-toast_cleared = "已清空歷史"
 toast_pinned = "已置頂"
 toast_unpinned = "已取消置頂"
 empty = "暫無剪貼板歷史"

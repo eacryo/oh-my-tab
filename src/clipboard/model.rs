@@ -208,6 +208,13 @@ pub(super) fn header_strip_h() -> f64 {
     TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y + FILTERS_H
 }
 
+/// 浮窗最小高度按三条同组记录的完整布局计算,所有状态共用,避免布局调整后出现漂移。
+/// Calculate the picker minimum from three same-group records and use it for every state, so it
+/// stays aligned when row or surrounding-region dimensions change.
+pub(super) fn picker_min_height() -> f64 {
+    (header_strip_h() + GROUP_H + ROW_H * 3.0 + FOOTER_H + PAD_Y).max(PICKER_MIN_HEIGHT)
+}
+
 /// 文档内行列表的顶部偏移:仅保留与头部条的间距(头部条已不在滚动区内,
 /// 不再需要为它让位 38pt——那会留下"第一条与搜索框之间的奇怪空白")。
 /// The row list's top offset INSIDE the document: just the gap to the header strip (the

@@ -160,7 +160,7 @@ const POLL_INTERVAL: f64 = 0.5;
 /// paddings ≈ 720pt, ~73% of a 1080p screen's usable height; more entries scroll. Small
 /// screens shrink it further (see show_picker).
 const PICKER_MAX_HEIGHT: f64 = 720.0;
-/// 浮窗最小高度(内容再少也不低于此)/ the picker's minimum height (never smaller).
+/// 浮窗最小高度(普通列表内容再少也不低于此)/ the picker's minimum height for regular lists.
 const PICKER_MIN_HEIGHT: f64 = 250.0;
 /// 浮窗宽度(按设计稿 720px 折算到 560pt,保持内容可读性与信息密度平衡)。
 /// Picker width (the mockup's 720px scaled to 560pt -- readable content without losing
@@ -1459,13 +1459,11 @@ extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *m
     );
     drop(hist);
     save_history();
-    // 顺带清空搜索词与搜索框文本;浮窗保持打开显示空态,并弹 toast(新设计稿行为)。
+    // 顺带清空搜索词与搜索框文本;浮窗保持打开并显示空态。
     // Also clear the search query and the search field's text; the picker STAYS open
-    // showing the empty state with a toast (the new mockup's behavior).
+    // showing the empty state.
     clear_search();
     unsafe { rebuild_rows() };
-    let msg = t("clipboard.toast_cleared");
-    show_toast(&msg);
 }
 
 /// 清空搜索词 + 搜索框文本(不重建;调用方按需 rebuild)。
@@ -2284,9 +2282,9 @@ fn show_picker() {
         } else {
             pitches.iter().take(visible).sum::<f64>()
         };
-        // 最小高度兜底(内容再少也不低于 PICKER_MIN_HEIGHT,含空历史态)。
-        // Floor at the minimum height (never smaller, empty state included).
-        let h = (header_strip_h() + list_h + FOOTER_H + PAD_Y).max(PICKER_MIN_HEIGHT);
+        // 最小高度统一按三条记录的视觉空间兜底,即使只有一条或没有记录也不变矮。
+        // Use the same three-record visual minimum for every state, including one or zero rows.
+        let h = (header_strip_h() + list_h + FOOTER_H + PAD_Y).max(picker_min_height());
 
         let frame = if center_on_main {
             // 始终在主屏幕正中间(设计稿 .window 居中展示);不翻转。
@@ -3932,7 +3930,7 @@ extern "C" fn detail_tv_cursor_exited(_self: *mut c_void, _cmd: Sel, _event: *mu
 /// The empty-state document covers at least the minimum list area, otherwise exactly the
 /// live visible height so its hint is truly centered.
 fn empty_state_doc_height(visible_h: f64) -> f64 {
-    visible_h.max(PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H)
+    visible_h.max(picker_min_height() - header_strip_h() - FOOTER_H)
 }
 
 fn visible_selection_for_text(
@@ -4849,7 +4847,7 @@ unsafe fn rebuild_rows() {
         // minimum would incorrectly place the hint near the top.
         let clip: *mut AnyObject = msg_send![container, superview];
         let visible_h = if clip.is_null() {
-            PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H
+            picker_min_height() - header_strip_h() - FOOTER_H
         } else {
             let bounds: NSRect = msg_send![clip, bounds];
             bounds.size.height
@@ -4903,7 +4901,7 @@ unsafe fn rebuild_rows() {
     // visible area hangs off the clip view's bottom (the clip isn't flipped), pushing the
     // rows against the bottom edge.
     let doc_h = (rows_top_offset() + pitches.iter().take(filtered.len()).sum::<f64>() + PAD_Y)
-        .max(PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H);
+        .max(picker_min_height() - header_strip_h() - FOOTER_H);
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
 
     let sel_idx = picker_selection();
@@ -8568,8 +8566,13 @@ mod tests {
 
     #[test]
     fn empty_state_hint_uses_the_live_viewport_height() {
-        use super::{empty_state_doc_height, header_strip_h, FOOTER_H, PICKER_MIN_HEIGHT};
-        let min_list_h = PICKER_MIN_HEIGHT - header_strip_h() - FOOTER_H;
+        use super::{empty_state_doc_height, header_strip_h, picker_min_height, FOOTER_H};
+        // 空态最小高度与三条同组记录的完整窗口高度一致(含首个分组头)。
+        // The empty-state minimum matches a full window containing three same-group records,
+        // including the first group's header.
+        let min_h = picker_min_height();
+        assert_eq!(min_h, 410.0);
+        let min_list_h = min_h - header_strip_h() - FOOTER_H;
         assert_eq!(empty_state_doc_height(min_list_h - 20.0), min_list_h);
         // 分类筛空时主窗口仍可能很高;提示文档必须跟着可视区扩展才能居中。
         // When a category filters to no results, the picker can remain tall; the hint document
