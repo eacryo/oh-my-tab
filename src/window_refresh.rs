@@ -14,8 +14,9 @@ use objc2::{msg_send, sel};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use crate::ffi::frontmost_app_info;
 use crate::overlay;
@@ -84,12 +85,42 @@ static WINDOW_REFRESH_PENDING_FOCUS: LazyLock<Mutex<Option<(i32, u32)>>> =
 static WINDOW_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static WINDOW_REFRESH_RESULT: LazyLock<Mutex<Option<WindowRefreshResult>>> =
     LazyLock::new(|| Mutex::new(None));
+static LIFECYCLE_BACKSTOP_STARTED: OnceLock<()> = OnceLock::new();
 
 /// 请求一次有界的后台窗口快照；同一时间只允许一个任务，避免快捷键连按制造线程风暴。
 /// Request one bounded background window snapshot; only one task may run at a time,
 /// preventing rapid shortcut presses from creating a thread storm.
 pub(crate) fn request_window_refresh() {
     request_window_refresh_for(WindowRefreshReason::Summon);
+}
+
+/// Periodically reconcile the window/thumbnail set when private WindowServer lifecycle
+/// notifications are unavailable or an event is dropped.
+/// 当私有 WindowServer 生命周期通知不可用或事件丢失时,定期重扫窗口和缩略图集合。
+pub(crate) fn start_lifecycle_backstop() {
+    if LIFECYCLE_BACKSTOP_STARTED.set(()).is_err() {
+        return;
+    }
+    thread::Builder::new()
+        .name("window-lifecycle-backstop".into())
+        .spawn(|| loop {
+            thread::sleep(Duration::from_secs(5));
+            let controller = CONTROLLER.lock().unwrap().map(|ptr| ptr.0);
+            if let Some(controller) = controller {
+                unsafe {
+                    let _: () = msg_send![controller,
+                        performSelectorOnMainThread: sel!(handleLifecycleBackstop:),
+                        withObject: std::ptr::null::<AnyObject>(),
+                        waitUntilDone: false
+                    ];
+                }
+            }
+        })
+        .expect("spawn window-lifecycle-backstop thread");
+}
+
+pub(crate) extern "C" fn on_lifecycle_backstop(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    crate::callback_guard::void("on_lifecycle_backstop", request_lifecycle_window_refresh);
 }
 
 fn request_lifecycle_window_refresh() {
@@ -254,6 +285,10 @@ fn start_window_refresh(request: WindowRefreshRequest) {
                     }
                 }
             };
+            // Event delivery is only a fast path; the App-level AXWindows snapshot is the
+            // Space-independent authority for removing cached frames of truly closed windows.
+            // 事件只是快速路径;App 级 AXWindows 是跨 Space 判断窗口确已关闭并清理帧的权威。
+            thumbnail::reconcile_cached_windows_with_ax();
             *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
                 generation,
                 windows,
@@ -604,12 +639,29 @@ fn on_window_server_event_inner() {
     if events.is_empty() {
         return;
     }
-    let should_refresh = events.iter().any(|event| match event {
-        window_server::WindowServerEvent::Created => true,
-        window_server::WindowServerEvent::Destroyed(window_id) => {
+    // Process every destruction before the short-circuiting refresh check: a Created
+    // event earlier in this batch must not prevent a later window's cache cleanup.
+    // 先处理本批次所有销毁事件；不能让前面的 Created 使后面的清理被 any 短路。
+    for event in &events {
+        if let window_server::WindowServerEvent::Destroyed(window_id) = event {
+            // 先从当前订阅索引读取 owner;窗口销毁后 CG 反查通常已经失效,不能猜 PID。
+            // Read the owner from the current subscription index first; CG lookup usually fails
+            // after destruction, so never guess a PID for cleanup.
+            if let Some(pid) = window_server::owner_for_destroyed_window(*window_id) {
+                thumbnail::forget_destroyed_window(pid, *window_id);
+            } else {
+                log_debug!(
+                    "[windows] destroyed cgwid={} has no indexed owner PID; thumbnail cleanup skipped",
+                    window_id
+                );
+            }
+            window_server::forget_destroyed_window_owner(*window_id);
             forget_non_normal_window(*window_id);
-            true
         }
+    }
+    let should_refresh = events.iter().any(|event| match event {
+        window_server::WindowServerEvent::Created
+        | window_server::WindowServerEvent::Destroyed(_) => true,
         window_server::WindowServerEvent::Focused(window_id) => {
             let displayed_pid = with_tab_state(|state_opt| {
                 state_opt

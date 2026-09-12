@@ -84,6 +84,10 @@ struct WindowRegistry {
 static WINDOW_REGISTRY: LazyLock<Mutex<WindowRegistry>> =
     LazyLock::new(|| Mutex::new(WindowRegistry::default()));
 
+const OWNER_HISTORY_TTL: Duration = Duration::from_secs(30);
+static WINDOW_OWNER_HISTORY: LazyLock<Mutex<HashMap<u32, (i32, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn registry_from_subscriptions(subscriptions: &[(u32, i32)]) -> WindowRegistry {
     let mut by_window = HashMap::new();
     for &(window_id, pid) in subscriptions {
@@ -387,6 +391,13 @@ pub(crate) fn ax_focus_backstop_allowed(pid: i32) -> bool {
 pub(crate) fn update_subscriptions(subscriptions: &[(u32, i32)]) {
     let registry = registry_from_subscriptions(subscriptions);
     let mut ids: Vec<u32> = registry.by_window.keys().copied().collect();
+    {
+        let mut history = WINDOW_OWNER_HISTORY.lock().unwrap();
+        history.retain(|_, (_, seen_at)| seen_at.elapsed() <= OWNER_HISTORY_TTL);
+        for (&window_id, &pid) in &registry.by_window {
+            history.insert(window_id, (pid, Instant::now()));
+        }
+    }
     *WINDOW_REGISTRY.lock().unwrap() = registry;
 
     let Some(connection) = *MAIN_CONNECTION else {
@@ -422,6 +433,29 @@ pub(crate) fn owner_for_window(window_id: u32) -> Option<i32> {
         .by_window
         .get(&window_id)
         .copied()
+}
+
+/// Resolve a destroyed window from the live subscription index or its short-lived history.
+/// 销毁通知可能晚于一次订阅刷新到达,所以在短 TTL 内保留最近 owner,不凭 CG 反查猜 PID。
+/// Resolve a destroyed window from the live subscription index or its short-lived history.
+/// Destruction can arrive after a subscription refresh, so retain the recent owner briefly
+/// instead of guessing a PID from a post-destruction CG lookup.
+pub(crate) fn owner_for_destroyed_window(window_id: u32) -> Option<i32> {
+    if let Some(pid) = owner_for_window(window_id) {
+        return Some(pid);
+    }
+    let mut history = WINDOW_OWNER_HISTORY.lock().unwrap();
+    let (pid, seen_at) = history.get(&window_id).copied()?;
+    if seen_at.elapsed() > OWNER_HISTORY_TTL {
+        history.remove(&window_id);
+        None
+    } else {
+        Some(pid)
+    }
+}
+
+pub(crate) fn forget_destroyed_window_owner(window_id: u32) {
+    WINDOW_OWNER_HISTORY.lock().unwrap().remove(&window_id);
 }
 
 pub(crate) fn window_ids_for_pid(pid: i32) -> Vec<u32> {

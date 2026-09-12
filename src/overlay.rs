@@ -3976,6 +3976,9 @@ unsafe fn reconcile_card_views(
                 let card = card.unwrap();
                 set_card_index(card, idx);
                 let _: () = msg_send![card, setFrame: desired_frame];
+                if use_new && thumbnail_capture_allowed {
+                    crate::thumbnail::touch_cached_frame(window.pid, window.window_id);
+                }
                 stats.reused += 1;
             }
             CardReconcileAction::Replace => {

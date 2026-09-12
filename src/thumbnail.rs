@@ -255,6 +255,23 @@ pub(crate) struct Lru<K: Eq + Clone, V: Clone> {
     items: VecDeque<(K, V)>, // 队尾 = 最近使用 / back = most recently used
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LruPutOperation {
+    Insert,
+    Replace,
+}
+
+struct LruPutResult<K, V> {
+    key: K,
+    cost: u64,
+    operation: LruPutOperation,
+    replaced_cost: Option<u64>,
+    replaced: Option<V>,
+    evicted: Vec<(K, V)>,
+    count_over_limit: bool,
+    cost_over_limit: bool,
+}
+
 impl<K: Eq + Clone, V: Clone> Lru<K, V> {
     pub(crate) fn new(max_items: usize, max_cost: u64, cost: fn(&V) -> u64) -> Self {
         Self {
@@ -274,6 +291,18 @@ impl<K: Eq + Clone, V: Clone> Lru<K, V> {
         let (k, v) = self.items.remove(idx).unwrap();
         self.items.push_back((k, v.clone()));
         Some(v)
+    }
+
+    /// 只刷新访问次序,不克隆值。用于已经显示且复用的卡片,避免为 CGImageRef 做无意义的浅拷贝。
+    /// Touch recency without cloning the value. Used by already-visible reused cards so a
+    /// CGImageRef does not incur an unnecessary shallow clone.
+    pub(crate) fn touch(&mut self, key: &K) -> bool {
+        let Some(idx) = self.items.iter().position(|(k, _)| k == key) else {
+            return false;
+        };
+        let item = self.items.remove(idx).unwrap();
+        self.items.push_back(item);
+        true
     }
 
     /// 只读元数据探测:不改变 LRU 次序。新鲜度/目标尺寸检查不能把未渲染条目
@@ -296,35 +325,101 @@ impl<K: Eq + Clone, V: Clone> Lru<K, V> {
     /// just-inserted back item is protected: a cost overrun only evicts older
     /// frames (an over-budget single frame keeps the newest and sacrifices the
     /// old), and only the item-count cap can evict the newcomer itself.
-    pub(crate) fn put(&mut self, key: K, val: V) -> Vec<V> {
-        let mut evicted: Vec<V> = Vec::new();
+    #[cfg(test)]
+    fn put_detailed(&mut self, key: K, val: V) -> LruPutResult<K, V> {
+        self.put_detailed_with_priority(key, val, |_| false)
+    }
+
+    fn put_detailed_with_priority(
+        &mut self,
+        key: K,
+        val: V,
+        is_recent_workset: impl Fn(&K) -> bool,
+    ) -> LruPutResult<K, V> {
+        let inserted_key = key.clone();
+        let inserted_cost = (self.cost)(&val);
+        let mut replaced_cost = None;
+        let mut replaced = None;
+        let operation;
         if let Some(idx) = self.items.iter().position(|(k, _)| *k == key) {
             let (_, old) = self.items.remove(idx).unwrap();
-            self.total_cost = self.total_cost.saturating_sub((self.cost)(&old));
-            evicted.push(old);
+            let old_cost = (self.cost)(&old);
+            self.total_cost = self.total_cost.saturating_sub(old_cost);
+            replaced_cost = Some(old_cost);
+            replaced = Some(old);
+            operation = LruPutOperation::Replace;
+        } else {
+            operation = LruPutOperation::Insert;
         }
-        self.total_cost = self.total_cost.saturating_add((self.cost)(&val));
+        self.total_cost = self.total_cost.saturating_add(inserted_cost);
         self.items.push_back((key, val));
+        let count_over_limit = self.items.len() > self.max_items;
+        let cost_over_limit = self.total_cost > self.max_cost;
+        let mut evicted = Vec::new();
         // 先挤旧帧;队尾新帧只在条目数超限时才参与驱逐(见函数注释)。
         // Evict old frames first; the back item only participates when the item
         // count itself is over the cap (see the fn doc).
         while self.items.len() > 1
             && (self.items.len() > self.max_items || self.total_cost > self.max_cost)
         {
-            let Some((_, v)) = self.items.pop_front() else {
+            let Some((evicted_key, v)) =
+                self.pop_oldest_eviction_candidate(&is_recent_workset, false)
+            else {
                 break;
             };
             self.total_cost = self.total_cost.saturating_sub((self.cost)(&v));
-            evicted.push(v);
+            evicted.push((evicted_key, v));
         }
         while self.items.len() > self.max_items {
-            let Some((_, v)) = self.items.pop_front() else {
+            let Some((evicted_key, v)) =
+                self.pop_oldest_eviction_candidate(&is_recent_workset, true)
+            else {
                 break;
             };
             self.total_cost = self.total_cost.saturating_sub((self.cost)(&v));
-            evicted.push(v);
+            evicted.push((evicted_key, v));
         }
-        evicted
+        LruPutResult {
+            key: inserted_key,
+            cost: inserted_cost,
+            operation,
+            replaced_cost,
+            replaced,
+            evicted,
+            count_over_limit,
+            cost_over_limit,
+        }
+    }
+
+    fn pop_oldest_eviction_candidate(
+        &mut self,
+        is_recent_workset: &impl Fn(&K) -> bool,
+        allow_newest: bool,
+    ) -> Option<(K, V)> {
+        let eligible_end = if allow_newest {
+            self.items.len()
+        } else {
+            self.items.len().saturating_sub(1)
+        };
+        if eligible_end == 0 {
+            return None;
+        }
+        // Tier 1: old entries outside the recent summon workset. Tier 2: old workset entries.
+        // 分两级淘汰:先淘汰近期召唤工作集之外的旧帧,再淘汰工作集内的旧帧。
+        let index = (0..eligible_end)
+            .find(|&index| !is_recent_workset(&self.items[index].0))
+            .or(Some(0))?;
+        self.items.remove(index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put(&mut self, key: K, val: V) -> Vec<V> {
+        let result = self.put_detailed(key, val);
+        result
+            .replaced
+            .into_iter()
+            .chain(result.evicted.into_iter().map(|(_, value)| value))
+            .collect()
     }
 
     /// 条件删除(如按 pid 清退),返回被删值供释放。
@@ -404,6 +499,10 @@ const VISIBLE_PREFETCH_MARGIN: usize = 4;
 /// capture-then-immediate-eviction when the window count exceeds cache capacity. The
 /// rest are captured at high priority when they actually enter a visible page.
 const STARTUP_PREWARM_MAX: usize = 24;
+/// Only compare evictions with a recent summon workset; older snapshots may describe a
+/// different Space or window ordering and would make the diagnostic misleading.
+/// 只把淘汰与近期召唤工作集比较；过期快照可能来自另一个 Space 或窗口顺序。
+const WORKSET_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(2);
 
 /// Clone 为浅拷贝(CGImageRef 位拷贝),所有权纪律:缓存持有 +1,克隆方仅在
 /// 显式 CFRetain 后才能长期持有(见 lookup_retained)。
@@ -446,6 +545,64 @@ fn thumb_cost(t: &CachedThumb) -> u64 {
 
 static CACHE: LazyLock<Mutex<Lru<ThumbKey, CachedThumb>>> =
     LazyLock::new(|| Mutex::new(Lru::new(CACHE_MAX_ITEMS, CACHE_MAX_COST, thumb_cost)));
+
+#[derive(Default)]
+struct WorksetSnapshot {
+    keys: HashSet<ThumbKey>,
+    updated_at: Option<Instant>,
+}
+
+static LAST_SUMMON_WORKSET: LazyLock<Mutex<WorksetSnapshot>> =
+    LazyLock::new(|| Mutex::new(WorksetSnapshot::default()));
+
+fn update_summon_workset(keys: impl IntoIterator<Item = ThumbKey>) {
+    let mut snapshot = LAST_SUMMON_WORKSET.lock().unwrap();
+    snapshot.keys.clear();
+    snapshot.keys.extend(keys);
+    snapshot.updated_at = Some(Instant::now());
+}
+
+fn clear_summon_workset() {
+    let mut snapshot = LAST_SUMMON_WORKSET.lock().unwrap();
+    snapshot.keys.clear();
+    snapshot.updated_at = None;
+}
+
+fn recent_workset_membership(key: ThumbKey) -> Option<bool> {
+    let snapshot = LAST_SUMMON_WORKSET.lock().unwrap();
+    recent_workset_membership_at(&snapshot, key, Instant::now())
+}
+
+fn recent_workset_membership_at(
+    snapshot: &WorksetSnapshot,
+    key: ThumbKey,
+    now: Instant,
+) -> Option<bool> {
+    let updated_at = snapshot.updated_at?;
+    if now.duration_since(updated_at) > WORKSET_SNAPSHOT_MAX_AGE {
+        return None;
+    }
+    Some(snapshot.keys.contains(&key))
+}
+
+fn recent_workset_keys() -> HashSet<ThumbKey> {
+    let snapshot = LAST_SUMMON_WORKSET.lock().unwrap();
+    if snapshot
+        .updated_at
+        .is_some_and(|updated_at| updated_at.elapsed() <= WORKSET_SNAPSHOT_MAX_AGE)
+    {
+        snapshot.keys.clone()
+    } else {
+        HashSet::new()
+    }
+}
+
+fn format_workset(keys: &[ThumbKey]) -> String {
+    keys.iter()
+        .map(|key| format!("{}:{}", key.pid, key.wid))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// 内存采样器的账本读数:(条目数, 记账成本字节)。只取统计字段,不触碰 CGImageRef,
 /// 不改变 LRU 次序(锁只持到读出两个整数)。
@@ -495,6 +652,7 @@ pub(crate) fn clear_runtime_cache() {
     READY_QUEUE.lock().unwrap().clear();
     READY_DELIVERY_SCHEDULED.store(false, Ordering::Release);
     PENDING_BLANK_RETRIES.lock().unwrap().clear();
+    clear_summon_workset();
     let (cache_items, cache_bytes) = cache_stats();
     let (pending, in_flight, ready) = capture_pipeline_stats();
     log_debug!(
@@ -528,6 +686,54 @@ pub(crate) fn lookup_retained(pid: i32, wid: u32) -> Option<(*const c_void, u32,
         CFRetain(t.img);
     }
     Some((t.img, t.w_px, t.h_px))
+}
+
+/// 已显示卡片被复用时只推进 LRU 次序,不复制或保留 CGImageRef。
+/// Touch the LRU entry when an already-displayed card is reused, without copying or retaining
+/// its CGImageRef.
+pub(crate) fn touch_cached_frame(pid: i32, wid: u32) -> bool {
+    CACHE.lock().unwrap().touch(&ThumbKey { pid, wid })
+}
+
+fn capture_keys() -> Vec<ThumbKey> {
+    let mut keys = CAPTURE_STATE
+        .lock()
+        .unwrap()
+        .desired
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    keys.extend(CACHE.lock().unwrap().keys());
+    keys.into_iter().collect()
+}
+
+/// 以 App 级 AXWindows 作为窗口存活兜底。AX 查询失败时保守保留,避免把其他 Space 的
+/// 窗口帧误删;只有 AX 明确不再包含该窗口时才清理缓存和排队任务。
+/// Reconcile cached windows against app-level AXWindows as a lifecycle backstop. Preserve
+/// entries when AX itself fails, and remove only windows explicitly absent from the app's
+/// Space-independent AX list.
+pub(crate) fn reconcile_cached_windows_with_ax() {
+    let keys = capture_keys();
+    let pids = keys.iter().map(|key| key.pid).collect::<HashSet<_>>();
+    for pid in pids {
+        let Some(ax_windows) = crate::window_collector::get_ax_windows_for_pid(pid) else {
+            continue;
+        };
+        let live = ax_windows
+            .into_iter()
+            .map(|(wid, _, _)| wid)
+            .collect::<HashSet<_>>();
+        for key in keys.iter().filter(|key| key.pid == pid) {
+            if key.wid != 0 && !live.contains(&key.wid) {
+                log_debug!(
+                    "[thumb] AX lifetime sweep removed stale window pid={} wid={}",
+                    key.pid,
+                    key.wid
+                );
+                forget_destroyed_window(key.pid, key.wid);
+            }
+        }
+    }
 }
 
 /// 是否新鲜(召唤端及启动诊断用；过期帧仍可继续渲染)。
@@ -622,11 +828,78 @@ fn cache_store(pid: i32, wid: u32, mut t: CachedThumb) {
     // lookup 在释放期间被无谓阻塞。
     // Releasing a large CGImage may reclaim IOSurface/bitmap storage. Drop the
     // cache lock first so main-thread lookups are not blocked by destruction.
-    let evicted = CACHE.lock().unwrap().put(ThumbKey { pid, wid }, t);
-    for evicted in evicted {
+    let recent_keys = recent_workset_keys();
+    let result =
+        CACHE
+            .lock()
+            .unwrap()
+            .put_detailed_with_priority(ThumbKey { pid, wid }, t, |key| recent_keys.contains(key));
+    log_debug!(
+        "[thumb] cache store operation={:?} pid={} wid={} cost={} replaced_cost={:?} evicted={} count_over_limit={} cost_over_limit={}",
+        result.operation,
+        pid,
+        wid,
+        result.cost,
+        result.replaced_cost,
+        result.evicted.len(),
+        result.count_over_limit,
+        result.cost_over_limit,
+    );
+    for (evicted_key, evicted) in &result.evicted {
+        log_debug!(
+            "[thumb] cache eviction inserted_pid={} inserted_wid={} inserted_cost={} evicted_pid={} evicted_wid={} evicted_cost={} evicted_in_recent_workset={:?} trigger_count={} trigger_cost={}",
+            result.key.pid,
+            result.key.wid,
+            result.cost,
+            evicted_key.pid,
+            evicted_key.wid,
+            thumb_cost(evicted),
+            recent_workset_membership(*evicted_key),
+            result.count_over_limit,
+            result.cost_over_limit,
+        );
+    }
+    if let Some(replaced) = result.replaced {
+        unsafe {
+            CFRelease(replaced.img);
+        }
+    }
+    for (_, evicted) in result.evicted {
         unsafe {
             CFRelease(evicted.img);
         }
+    }
+}
+
+pub(crate) fn forget_destroyed_window(pid: i32, wid: u32) {
+    let key = ThumbKey { pid, wid };
+    // 与 cache_store/clear_runtime_cache 使用相同的锁序:先使任务失效,再移除缓存。
+    // Keep the same lock order as cache_store/clear_runtime_cache: invalidate jobs first,
+    // then remove the cached frame.
+    let mut state = CAPTURE_STATE.lock().unwrap();
+    let invalidated = state.invalidate_window(key);
+    let retry_cleared = PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
+    let removed = CACHE
+        .lock()
+        .unwrap()
+        .remove_where(|(candidate, _)| *candidate == key);
+    drop(state);
+
+    let removed_count = removed.len();
+    for thumb in removed {
+        unsafe {
+            CFRelease(thumb.img);
+        }
+    }
+    if invalidated || retry_cleared || removed_count > 0 {
+        log_debug!(
+            "[thumb] destroyed window cleanup pid={} wid={} invalidated={} retry_cleared={} removed={}",
+            pid,
+            wid,
+            invalidated,
+            retry_cleared,
+            removed_count,
+        );
     }
 }
 
@@ -853,6 +1126,10 @@ struct PendingCapture {
     /// cached frame -- a stale-appearance frame clashes with every other card worse
     /// than a temporary blank. Merging requests propagates the flag with OR.
     appearance_refresh: bool,
+    /// 空白重试名额归属于该任务；任务以非入库终止时由 worker 释放。
+    /// The task owns a blank-retry slot; the worker releases it when the task terminates
+    /// without reaching the normal cache-store path.
+    blank_retry: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -868,12 +1145,28 @@ struct CaptureJob {
     ready_since: Instant,
     appearance_refresh: bool,
     focused_target_revision: Option<u64>,
+    blank_retry: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureJobResult {
     Finished,
+    BlankRetryScheduled,
     GeometryDeferred,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationRequestResult {
+    Enqueued,
+    Merged { running: bool },
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlankRetryEnqueueResult {
+    Enqueued,
+    Merged,
+    Dropped,
 }
 
 #[derive(Clone, Copy, Debug, Eq)]
@@ -980,6 +1273,7 @@ impl CaptureState {
                     geometry_retry_started_at: None,
                     focused_target_revision: None,
                     appearance_refresh,
+                    blank_retry: false,
                 });
                 true
             }
@@ -1010,11 +1304,11 @@ impl CaptureState {
         target_px_h: u32,
         activated_at: Instant,
         pid_generation: u64,
-    ) -> bool {
+    ) -> ActivationRequestResult {
         if self.terminated_pids.contains(&key.pid)
             || self.pid_generations.get(&key.pid).copied().unwrap_or(0) != pid_generation
         {
-            return false;
+            return ActivationRequestResult::Rejected;
         }
         let inserted = self.request_for_generation(
             key,
@@ -1038,7 +1332,16 @@ impl CaptureState {
                 pending.freshness_sequence = freshness_sequence;
             }
         }
-        inserted
+        if inserted {
+            ActivationRequestResult::Enqueued
+        } else {
+            ActivationRequestResult::Merged {
+                running: self
+                    .desired
+                    .get(&key)
+                    .is_some_and(|pending| pending.running),
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1083,6 +1386,7 @@ impl CaptureState {
             ready_since: pending.ready_since,
             appearance_refresh: pending.appearance_refresh,
             focused_target_revision: pending.focused_target_revision,
+            blank_retry: pending.blank_retry,
         })
     }
 
@@ -1157,6 +1461,21 @@ impl CaptureState {
         }
     }
 
+    fn clear_blank_retry_marker(&mut self, job: CaptureJob) -> bool {
+        if !job.blank_retry {
+            return false;
+        }
+        let Some(pending) = self.desired.get_mut(&job.key) else {
+            return false;
+        };
+        if pending.token != job.token || pending.pid_generation != job.pid_generation {
+            return false;
+        }
+        let was_set = pending.blank_retry;
+        pending.blank_retry = false;
+        was_set
+    }
+
     fn discard_deferred(&mut self, job: CaptureJob) -> bool {
         if !self.is_current(job) {
             return false;
@@ -1176,6 +1495,10 @@ impl CaptureState {
         *generation = generation.wrapping_add(1);
         self.terminated_pids.insert(pid);
         self.desired.retain(|key, _| key.pid != pid);
+    }
+
+    fn invalidate_window(&mut self, key: ThumbKey) -> bool {
+        self.desired.remove(&key).is_some()
     }
 
     fn activate_pid(&mut self, pid: i32) {
@@ -1998,21 +2321,73 @@ fn enqueue_activation_job(
 ) -> bool {
     let key = ThumbKey { pid, wid };
     let tx = ensure_capture_worker();
-    let accepted = CAPTURE_STATE.lock().unwrap().request_activation(
+    let request = CAPTURE_STATE.lock().unwrap().request_activation(
         key,
         target_px_h,
         activated_at,
         pid_generation,
     );
-    if !accepted {
+    if matches!(request, ActivationRequestResult::Rejected) {
         return false;
     }
     THUMB_ENQUEUED.fetch_add(1, Ordering::Relaxed);
     if matches!(tx.try_send(()), Err(flume::TrySendError::Disconnected(_))) {
-        CAPTURE_STATE.lock().unwrap().desired.remove(&key);
+        if matches!(request, ActivationRequestResult::Enqueued) {
+            CAPTURE_STATE.lock().unwrap().desired.remove(&key);
+        }
         return false;
     }
     true
+}
+
+/// Enqueue a delayed blank-frame retry only while its slot still belongs to this window.
+/// The lifecycle lock is acquired before the retry-slot lock so window destruction can race
+/// safely with the sleeper: either the retry is queued and then invalidated, or it is skipped.
+/// 只有重试名额仍属于该窗口时才入队；先拿生命周期锁再拿名额锁，和销毁清理保持一致，
+/// 这样延迟线程与窗口销毁并发时，要么入队后被失效，要么直接跳过。
+fn enqueue_blank_retry_job(
+    key: ThumbKey,
+    target_px_h: u32,
+    activated_at: Instant,
+    pid_generation: u64,
+) -> Option<BlankRetryEnqueueResult> {
+    let tx = ensure_capture_worker();
+    let mut state = CAPTURE_STATE.lock().unwrap();
+    if !PENDING_BLANK_RETRIES.lock().unwrap().contains(&key) {
+        return None;
+    }
+    let request = state.request_activation(key, target_px_h, activated_at, pid_generation);
+    if matches!(request, ActivationRequestResult::Rejected) {
+        PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
+        return Some(BlankRetryEnqueueResult::Dropped);
+    }
+    let merged_running = matches!(request, ActivationRequestResult::Merged { running: true });
+    if merged_running {
+        // 运行中的任务已经拿走了自己的 CaptureJob，无法再接管 blank_retry 标记；
+        // 让它继续完成，但当前延迟重试名额必须立即归还。
+        // A running task already owns its copied CaptureJob and cannot take over the
+        // blank_retry marker; let it finish, but release this delayed slot now.
+        PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
+        return Some(BlankRetryEnqueueResult::Merged);
+    }
+    let Some(pending) = state.desired.get_mut(&key) else {
+        PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
+        return Some(BlankRetryEnqueueResult::Dropped);
+    };
+    pending.blank_retry = true;
+    THUMB_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+    if matches!(tx.try_send(()), Err(flume::TrySendError::Disconnected(_))) {
+        if matches!(request, ActivationRequestResult::Enqueued) {
+            state.desired.remove(&key);
+        }
+        PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
+        return Some(BlankRetryEnqueueResult::Dropped);
+    }
+    Some(if matches!(request, ActivationRequestResult::Enqueued) {
+        BlankRetryEnqueueResult::Enqueued
+    } else {
+        BlankRetryEnqueueResult::Merged
+    })
 }
 
 fn enqueue_job_inner(
@@ -2121,6 +2496,22 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                             CaptureJobResult::Finished => {
                                 let mut state = CAPTURE_STATE.lock().unwrap();
                                 let _ = state.finish(job);
+                                if job.blank_retry {
+                                    state.clear_blank_retry_marker(job);
+                                }
+                                drop(state);
+                                if job.blank_retry {
+                                    PENDING_BLANK_RETRIES.lock().unwrap().remove(&job.key);
+                                }
+                            }
+                            CaptureJobResult::BlankRetryScheduled => {
+                                let mut state = CAPTURE_STATE.lock().unwrap();
+                                let _ = state.finish(job);
+                                // The delayed retry owns the slot now; clear the marker on the
+                                // completed job so a merged follow-up cannot release that slot.
+                                // 延迟重试已接管名额;清掉已完成任务的标记,避免合入的后续任务
+                                // 误释放仍属于延迟重试的名额。
+                                state.clear_blank_retry_marker(job);
                             }
                             CaptureJobResult::GeometryDeferred => {
                                 let result = CAPTURE_STATE.lock().unwrap().defer_geometry_transition(
@@ -2140,10 +2531,13 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                                             );
                                         }
                                         if !schedule_geometry_retry(deadline, worker_tx.clone()) {
-                                            let removed = CAPTURE_STATE
-                                                .lock()
-                                                .unwrap()
-                                                .discard_deferred(job);
+                                            let mut state = CAPTURE_STATE.lock().unwrap();
+                                            let removed = state.discard_deferred(job);
+                                            state.clear_blank_retry_marker(job);
+                                            drop(state);
+                                            if job.blank_retry {
+                                                PENDING_BLANK_RETRIES.lock().unwrap().remove(&job.key);
+                                            }
                                             log_debug!(
                                                 "[geometry-transition] retry scheduling failed pid={} wid={} deferred_job_removed={}",
                                                 job.key.pid,
@@ -2153,6 +2547,14 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                                         }
                                     }
                                     GeometryDeferResult::Exhausted => {
+                                        if job.blank_retry {
+                                            let mut state = CAPTURE_STATE.lock().unwrap();
+                                            state.clear_blank_retry_marker(job);
+                                            drop(state);
+                                        }
+                                        if job.blank_retry {
+                                            PENDING_BLANK_RETRIES.lock().unwrap().remove(&job.key);
+                                        }
                                         let exhausted = THUMB_GEOMETRY_RETRY_EXHAUSTED
                                             .fetch_add(1, Ordering::Relaxed)
                                             + 1;
@@ -2165,6 +2567,14 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                                         );
                                     }
                                     GeometryDeferResult::Stale => {
+                                        if job.blank_retry {
+                                            let mut state = CAPTURE_STATE.lock().unwrap();
+                                            state.clear_blank_retry_marker(job);
+                                            drop(state);
+                                        }
+                                        if job.blank_retry {
+                                            PENDING_BLANK_RETRIES.lock().unwrap().remove(&job.key);
+                                        }
                                         log_debug!(
                                             "[geometry-transition] stale deferred thumbnail job dropped pid={} wid={}",
                                             job.key.pid,
@@ -2408,7 +2818,7 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
                 if job.priority == CapturePriority::FocusedPrewarm {
                     note_focused_prewarm_failure(key, "blank-activation");
                 }
-                return CaptureJobResult::Finished;
+                return CaptureJobResult::BlankRetryScheduled;
             }
         }
     }
@@ -2417,7 +2827,7 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
     // Validate lifecycle and write the cache while holding CAPTURE_STATE. Termination
     // takes the same lock before cancellation/cache eviction, so a result cannot be
     // inserted again after removal.
-    let state = CAPTURE_STATE.lock().unwrap();
+    let mut state = CAPTURE_STATE.lock().unwrap();
     if !state.is_current(job) {
         unsafe {
             CFRelease(captured.thumb.img);
@@ -2430,11 +2840,12 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         );
         return CaptureJobResult::Finished;
     }
-    // 帧最终入库:激活补拍链的重试名额随之释放(空白帧"如实入库"路径同样到此为止)。
-    // The frame is finally stored: the activation chain's retry slot is released with
-    // it (the store-blank-as-truth path also ends here).
-    if job.activation_at.is_some() {
+    // 只有真正携带 blank_retry 归属标记的任务才能释放名额;普通激活任务不能误删别人的名额。
+    // Only a task carrying the explicit blank_retry ownership marker may release the slot;
+    // an ordinary activation task must not clear another task's slot.
+    if job.blank_retry {
         PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
+        state.clear_blank_retry_marker(job);
     }
     cache_store(key.pid, key.wid, captured.thumb);
     if job.priority == CapturePriority::FocusedPrewarm {
@@ -2743,12 +3154,11 @@ const BLANK_MODAL_COVERAGE_MIN: f64 = 0.99;
 /// restoration is slow; the retry lands at a ~1.25s total window).
 const ACTIVATION_BLANK_RETRY_MS: u64 = 900;
 
-/// 已安排延迟重试的窗口键。名额在帧最终入库、重试因失焦/换代放弃或 App 退出时
-/// 释放;同一激活补拍链至多重试一次,防止空白-重拍死循环。
-/// Window keys with a delayed retry scheduled. A slot is released when a frame is
-/// finally stored, the retry is abandoned (focus lost / generation changed), or the
-/// app terminates; each activation chain retries at most once so blank-recapture
-/// cannot loop forever.
+/// 已安排延迟重试的窗口键。名额在帧最终入库、任务以失败/失效终止、重试因失焦/换代
+/// 放弃或 App 退出时释放;同一激活补拍链至多重试一次,防止空白-重拍死循环。
+/// Window keys with a delayed retry scheduled. A slot is released when a frame is finally
+/// stored, the task terminates unsuccessfully/stale, the retry is abandoned (focus lost /
+/// generation changed), or the app terminates; each activation chain retries at most once.
 static PENDING_BLANK_RETRIES: LazyLock<Mutex<HashSet<ThumbKey>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -2976,7 +3386,7 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
     // Match the worker's overlay_wants lock order: visible range before TAB_STATE.
     let visible_snapshot = crate::overlay::thumbnail_visible_range();
     let interaction_active = crate::performance::switcher_interaction_active();
-    let Some((jobs, missing, frontmost_stale, background_last_good, deferred_prefetch)) =
+    let Some((jobs, missing, frontmost_stale, background_last_good, deferred_prefetch, workset)) =
         crate::with_tab_state(|state_opt| {
             let state = state_opt.as_ref()?;
             if !state.visible {
@@ -3032,6 +3442,13 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
                     *decision == SummonRefreshDecision::BackgroundLastGood
                 })
                 .count();
+            let workset = decisions
+                .iter()
+                .map(|(_, pid, wid, _)| ThumbKey {
+                    pid: *pid,
+                    wid: *wid,
+                })
+                .collect::<Vec<_>>();
             let mut deferred_prefetch = 0usize;
             let jobs: Vec<(i32, u32, CapturePriority)> = decisions
                 .into_iter()
@@ -3066,6 +3483,7 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
                 frontmost_stale,
                 background_last_good,
                 deferred_prefetch,
+                workset,
             ))
         })
     else {
@@ -3074,6 +3492,14 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
     let requested = jobs.len();
     let (pending_before, in_flight_before, ready_before) = capture_pipeline_stats();
     let (cache_items_before, cache_bytes_before) = cache_stats();
+    update_summon_workset(workset.iter().copied());
+    if requested > 1 || cache_bytes_before >= CACHE_MAX_COST.saturating_mul(3) / 4 {
+        log_debug!(
+            "[perf] thumbnail summon workset count={} keys={}",
+            workset.len(),
+            format_workset(&workset),
+        );
+    }
     log_debug!(
         "[perf] thumbnail summon start requested={} target_h={} cache_items={} cache_bytes={} pending={} in_flight={} ready={}",
         requested,
@@ -3377,7 +3803,8 @@ pub(crate) fn refresh_after_same_app_switch(pid: i32, wid: u32) {
 /// not finished restoring/redrawing. After ACTIVATION_BLANK_RETRY_MS one more
 /// activation refresh runs (still gated on frontmost + current activation token).
 /// Each activation chain retries at most once; the slot is released when a frame is
-/// stored, the retry is abandoned, or the app terminates.
+/// stored, the retry task terminates unsuccessfully, the retry is abandoned, or the
+/// app terminates.
 fn schedule_blank_activation_retry(job: CaptureJob) {
     let key = job.key;
     let Some(activated_at) = job.activation_at else {
@@ -3398,16 +3825,24 @@ fn schedule_blank_activation_retry(job: CaptureJob) {
             }
             let target_px_h = cached_target_px_height(key.pid, key.wid);
             let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(key.pid);
-            let enqueued =
-                enqueue_activation_job(key.pid, key.wid, target_px_h, activated_at, pid_generation);
-            // 合并进已有任务时名额交给该任务完成时释放;独立入队则由入库路径释放。
-            // Merged into an already-pending job, the slot is released when that job
-            // finishes; an independent queue entry is released by the store path.
+            let Some(result) =
+                enqueue_blank_retry_job(key, target_px_h, activated_at, pid_generation)
+            else {
+                log_debug!(
+                    "[thumb] blank retry skipped (slot cleared) pid={} wid={}",
+                    key.pid,
+                    key.wid
+                );
+                return;
+            };
+            // 结果明确区分独立入队、合入排队任务和未入队；后者在 helper 内已归还名额。
+            // Distinguish an independent enqueue, a merge into a queued task, and a
+            // dropped retry; the helper releases the slot for the last case.
             log_debug!(
-                "[thumb] blank retry: pid={} wid={} enqueued={} target_h={}",
+                "[thumb] blank retry: pid={} wid={} result={:?} target_h={}",
                 key.pid,
                 key.wid,
-                enqueued,
+                result,
                 target_px_h
             );
         });
@@ -4036,9 +4471,15 @@ mod tests {
         let first_activation = Instant::now();
         let later_activation = first_activation + Duration::from_millis(1);
 
-        assert!(state.request_activation(key, 512, first_activation, 0));
+        assert_eq!(
+            state.request_activation(key, 512, first_activation, 0),
+            ActivationRequestResult::Enqueued
+        );
         let first = state.take_next().unwrap();
-        assert!(!state.request_activation(key, 512, later_activation, 0));
+        assert_eq!(
+            state.request_activation(key, 512, later_activation, 0),
+            ActivationRequestResult::Merged { running: true }
+        );
         assert!(state.finish(first));
         let later = state.take_next().unwrap();
         assert_eq!(later.activation_at, Some(later_activation));
@@ -4110,6 +4551,24 @@ mod tests {
         let replacement = state.take_next().unwrap();
         assert_eq!(replacement.target_px_h, 640);
         assert!(state.is_current(replacement));
+    }
+
+    #[test]
+    fn capture_state_invalidates_queued_and_in_flight_jobs_by_window() {
+        let mut state = CaptureState::default();
+        let running_key = ThumbKey { pid: 10, wid: 20 };
+        let queued_key = ThumbKey { pid: 10, wid: 21 };
+        assert!(state.request(running_key, 512, CapturePriority::Visible));
+        assert!(state.request(queued_key, 512, CapturePriority::Startup));
+        let running = state.take_next().unwrap();
+        assert!(state.is_current(running));
+
+        assert!(state.invalidate_window(running_key));
+        assert!(!state.is_current(running));
+        assert!(state.take_next().is_some());
+        assert!(state.invalidate_window(queued_key));
+        assert!(state.take_next().is_none());
+        assert!(!state.invalidate_window(running_key));
     }
 
     #[test]
@@ -4207,6 +4666,74 @@ mod tests {
         assert!(lru.get(&3).is_some());
         assert!(lru.get(&1).is_none());
         assert!(lru.get(&2).is_none());
+    }
+
+    #[test]
+    fn lru_detailed_insert_reports_capacity_eviction_without_replacement() {
+        let mut lru: Lru<u32, u64> = Lru::new(2, u64::MAX, |v| *v);
+        lru.put_detailed(1, 10);
+        lru.put_detailed(2, 20);
+        let result = lru.put_detailed(3, 30);
+
+        assert_eq!(result.key, 3);
+        assert_eq!(result.cost, 30);
+        assert_eq!(result.operation, LruPutOperation::Insert);
+        assert!(result.replaced.is_none());
+        assert_eq!(result.evicted, vec![(1, 10)]);
+        assert!(result.count_over_limit);
+        assert!(!result.cost_over_limit);
+    }
+
+    #[test]
+    fn lru_detailed_replacement_can_evict_for_increased_cost() {
+        let mut lru: Lru<u32, u64> = Lru::new(3, 30, |v| *v);
+        lru.put_detailed(1, 10);
+        lru.put_detailed(2, 10);
+        let result = lru.put_detailed(1, 25);
+
+        assert_eq!(result.operation, LruPutOperation::Replace);
+        assert_eq!(result.replaced_cost, Some(10));
+        assert_eq!(result.replaced, Some(10));
+        assert_eq!(result.evicted, vec![(2, 10)]);
+        assert!(!result.count_over_limit);
+        assert!(result.cost_over_limit);
+        assert_eq!(lru.get(&1), Some(25));
+        assert!(lru.get(&2).is_none());
+    }
+
+    #[test]
+    fn lru_priority_evicts_outside_recent_workset_first() {
+        let mut lru: Lru<u32, u64> = Lru::new(2, u64::MAX, |v| *v);
+        lru.put_detailed_with_priority(1, 10, |_| false);
+        lru.put_detailed_with_priority(2, 20, |_| true);
+        let result = lru.put_detailed_with_priority(3, 30, |key| *key != 1);
+
+        assert_eq!(result.evicted, vec![(1, 10)]);
+        assert!(lru.get(&2).is_some());
+        assert!(lru.get(&3).is_some());
+    }
+
+    #[test]
+    fn recent_workset_membership_expires_after_ttl() {
+        let key = ThumbKey { pid: 10, wid: 20 };
+        let now = Instant::now();
+        let fresh = WorksetSnapshot {
+            keys: HashSet::from([key]),
+            updated_at: Some(now - WORKSET_SNAPSHOT_MAX_AGE),
+        };
+        assert_eq!(recent_workset_membership_at(&fresh, key, now), Some(true));
+
+        let expired = WorksetSnapshot {
+            keys: HashSet::from([key]),
+            updated_at: Some(now - WORKSET_SNAPSHOT_MAX_AGE - Duration::from_millis(1)),
+        };
+        assert_eq!(recent_workset_membership_at(&expired, key, now), None);
+    }
+
+    #[test]
+    fn format_workset_uses_pid_and_window_id_pairs() {
+        let keys = [ThumbKey { pid: 10, wid: 20 }, ThumbKey { pid: 11, wid: 21 }];
+        assert_eq!(format_workset(&keys), "10:20,11:21");
     }
 
     #[test]
@@ -4503,7 +5030,10 @@ mod tests {
 
         // 激活补拍路径不携带外观标志。
         // The activation path never carries the appearance flag.
-        assert!(state.request_activation(key, 512, Instant::now(), 0));
+        assert_eq!(
+            state.request_activation(key, 512, Instant::now(), 0),
+            ActivationRequestResult::Enqueued
+        );
         let job = state.take_next().unwrap();
         assert!(!job.appearance_refresh);
     }
@@ -4540,7 +5070,10 @@ mod tests {
         let key = ThumbKey { pid: 10, wid: 20 };
         let activated_at = Instant::now();
 
-        assert!(state.request_activation(key, 512, activated_at, 0));
+        assert_eq!(
+            state.request_activation(key, 512, activated_at, 0),
+            ActivationRequestResult::Enqueued
+        );
         let running = state.take_next().unwrap();
         assert_eq!(running.activation_at, Some(activated_at));
 
@@ -4549,18 +5082,75 @@ mod tests {
         // A second scheduling of the SAME token (the 808 + backstop dual paths)
         // merges into the running job without advancing freshness; finishing it
         // must not append a redundant follow-up capture.
-        assert!(!state.request_activation(key, 512, activated_at, 0));
+        assert_eq!(
+            state.request_activation(key, 512, activated_at, 0),
+            ActivationRequestResult::Merged { running: true }
+        );
         assert!(!state.finish(running));
         assert!(state.take_next().is_none());
 
         // 真正的新激活(不同 token)仍推进新鲜度并触发补拍。
         // A genuinely new activation (different token) still advances freshness.
         let later = activated_at + Duration::from_millis(1);
-        assert!(state.request_activation(key, 512, later, 0));
+        assert_eq!(
+            state.request_activation(key, 512, later, 0),
+            ActivationRequestResult::Enqueued
+        );
         let job = state.take_next().unwrap();
         assert_eq!(job.activation_at, Some(later));
         assert!(!state.finish(job));
         assert!(state.take_next().is_none());
+    }
+
+    #[test]
+    fn activation_request_reports_merge_and_rejection_separately() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+        let activated_at = Instant::now();
+
+        assert_eq!(
+            state.request_activation(key, 512, activated_at, 0),
+            ActivationRequestResult::Enqueued
+        );
+        assert_eq!(
+            state.request_activation(key, 512, activated_at, 0),
+            ActivationRequestResult::Merged { running: false }
+        );
+
+        let running = state.take_next().unwrap();
+        assert_eq!(
+            state.request_activation(key, 512, activated_at, 0),
+            ActivationRequestResult::Merged { running: true }
+        );
+        assert!(!state.finish(running));
+
+        state.cancel_pid(key.pid);
+        assert_eq!(
+            state.request_activation(key, 512, activated_at, 1),
+            ActivationRequestResult::Rejected
+        );
+    }
+
+    #[test]
+    fn blank_retry_marker_is_cleared_only_for_its_captured_job() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+        assert_eq!(
+            state.request_activation(key, 512, Instant::now(), 0),
+            ActivationRequestResult::Enqueued
+        );
+        state.desired.get_mut(&key).unwrap().blank_retry = true;
+        let job = state.take_next().unwrap();
+        assert!(state.clear_blank_retry_marker(job));
+        assert!(!state.desired.get(&key).unwrap().blank_retry);
+
+        let stale = CaptureJob {
+            token: job.token.wrapping_add(1),
+            ..job
+        };
+        state.desired.get_mut(&key).unwrap().blank_retry = true;
+        assert!(!state.clear_blank_retry_marker(stale));
+        assert!(state.desired.get(&key).unwrap().blank_retry);
     }
 
     #[test]

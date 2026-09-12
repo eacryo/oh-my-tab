@@ -1470,6 +1470,12 @@ fn create_controller() -> *mut AnyObject {
             window_refresh::on_window_server_event as *mut c_void,
             types_v_obj.as_ptr(),
         );
+        class_addMethod(
+            cls,
+            sel!(handleLifecycleBackstop:),
+            window_refresh::on_lifecycle_backstop as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
         objc_registerClassPair(cls);
         msg_send![cls, new]
     }
@@ -2154,6 +2160,7 @@ fn main() {
     window_server::start();
     let initial_subscriptions = window_collector::window_server_candidates();
     window_server::update_subscriptions(&initial_subscriptions);
+    window_refresh::start_lifecycle_backstop();
 
     // 6b. Listen for system app activation so MRU stays in sync
     // when the user switches apps via Dock, Cmd+Tab, etc.
