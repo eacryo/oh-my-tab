@@ -2,6 +2,8 @@
 //! 史
 
 use super::*;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
 // ========== 历史持久化 / history persistence ==========
 
@@ -49,6 +51,93 @@ pub(super) fn serialize_history(entries: &[ClipEntry]) -> Option<String> {
         entries: entries.to_vec(),
     };
     toml::to_string(&payload).ok()
+}
+
+struct PersistJob {
+    generation: u64,
+    path: std::path::PathBuf,
+    entries: Vec<ClipEntry>,
+}
+
+/// 单一后台写线程把连续的快照合并为最后一个,避免复制时阻塞主线程。
+/// One serial worker coalesces consecutive snapshots to the newest one, keeping copy events
+/// from blocking the main thread on TOML serialization and filesystem I/O.
+static PERSIST_SENDER: OnceLock<Sender<PersistJob>> = OnceLock::new();
+static PERSIST_GENERATION: AtomicU64 = AtomicU64::new(0);
+static PERSIST_IO_LOCK: Mutex<()> = Mutex::new(());
+
+fn persist_sender() -> &'static Sender<PersistJob> {
+    PERSIST_SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("oh-my-tab-clipboard-persist".to_string())
+            .spawn(|| persist_worker(receiver))
+            .expect("failed to start clipboard persistence worker");
+        sender
+    })
+}
+
+fn persist_worker(receiver: Receiver<PersistJob>) {
+    while let Ok(mut job) = receiver.recv() {
+        // 连续复制可能在队列里留下多个完整快照,只保留最新快照降低序列化和写盘次数。
+        // A burst of copies can queue several full snapshots; keep only the newest to reduce
+        // serialization and filesystem work.
+        while let Ok(newer) = receiver.try_recv() {
+            job = newer;
+        }
+        write_history_snapshot(job);
+    }
+}
+
+fn write_history_snapshot(job: PersistJob) {
+    let Some(text) = serialize_history(&job.entries) else {
+        log_info!("Clipboard history save failed: serialize error.");
+        return;
+    };
+    let Some(dir) = job.path.parent() else {
+        return;
+    };
+
+    // 与关闭 persist 共用同一把 I/O 锁:关闭操作拿锁后删除文件,不会被旧快照写回。
+    // Share the I/O lock with the persist-off path so disabling persistence deletes the file
+    // after any in-progress write and prevents an older snapshot from being restored.
+    let _io = PERSIST_IO_LOCK.lock().unwrap();
+    if !persist_enabled() || PERSIST_GENERATION.load(Ordering::Acquire) != job.generation {
+        return;
+    }
+    if std::fs::create_dir_all(dir).is_err() {
+        log_info!("Clipboard history save failed: cannot create dir.");
+        return;
+    }
+    let tmp = dir.join(format!(
+        "clipboard-history.toml.tmp{}-{}",
+        std::process::id(),
+        job.generation
+    ));
+    let ok = std::fs::write(&tmp, text.as_bytes()).is_ok();
+    if ok {
+        // 权限 600:仅当前用户可读写。
+        // Mode 600: owner-only access.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    // 再次检查代数,丢弃排队期间已经过时的快照,避免旧内容覆盖新内容。
+    // Check the generation again before rename so a snapshot invalidated while preparing the
+    // file is discarded instead of replacing newer history.
+    let current = persist_enabled() && PERSIST_GENERATION.load(Ordering::Acquire) == job.generation;
+    let ok = ok && current && std::fs::rename(&tmp, &job.path).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        if current {
+            log_info!("Clipboard history save failed: write error.");
+        }
+        return;
+    }
+    log_debug!(
+        "[clip] history saved asynchronously ({} entries, generation={})",
+        job.entries.len(),
+        job.generation
+    );
 }
 
 /// 解析历史文件文本:损坏或版本不匹配 → None(调用方按空历史处理)。
@@ -147,34 +236,15 @@ pub(super) fn save_history() {
     expire_entries(&mut hist, now_secs(), ttl_secs());
     let entries = hist.clone();
     drop(hist);
-    let Some(text) = serialize_history(&entries) else {
-        log_info!("Clipboard history save failed: serialize error.");
-        return;
+    let generation = PERSIST_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let job = PersistJob {
+        generation,
+        path: history_file_path(),
+        entries,
     };
-    let path = history_file_path();
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(dir).is_err() {
-        log_info!("Clipboard history save failed: cannot create dir.");
-        return;
+    if persist_sender().send(job).is_err() {
+        log_info!("Clipboard history save failed: persistence worker stopped.");
     }
-    let tmp = dir.join(format!("clipboard-history.toml.tmp{}", std::process::id()));
-    let ok = std::fs::write(&tmp, text.as_bytes()).is_ok();
-    if ok {
-        // 权限 600:仅当前用户可读写(防其他用户;同用户其他应用仍可读,加密见 README)。
-        // Mode 600: owner-only (blocks other users; same-user apps can still read it --
-        // encryption is out of scope, see the README).
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    let ok = ok && std::fs::rename(&tmp, &path).is_ok();
-    if !ok {
-        let _ = std::fs::remove_file(&tmp);
-        log_info!("Clipboard history save failed: write error.");
-        return;
-    }
-    log_debug!("[clip] history saved ({} entries)", entries.len());
 }
 
 /// 从磁盘加载历史并**合并**进当前内存(去重规则复用;置顶条目进置顶区,其余按
@@ -310,6 +380,8 @@ pub(crate) fn apply_persist_toggle(on: bool) {
         load_history();
         schedule_picker_refresh();
     } else {
+        PERSIST_GENERATION.fetch_add(1, Ordering::AcqRel);
+        let _io = PERSIST_IO_LOCK.lock().unwrap();
         let path = history_file_path();
         if path.exists() {
             let _ = std::fs::remove_file(path);

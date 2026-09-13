@@ -457,6 +457,9 @@ static PICKER_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// 剪贴板历史刷新是否已排队 / whether a clipboard-history UI refresh is already queued.
 static PICKER_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// 搜索输入后的行重建是否已排队 / whether a search-triggered row rebuild is queued.
+static PICKER_SEARCH_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// 历史模型的单调版本;行树快照比较无需重新扫描文本和预览字节。
 /// Monotonic history-model version; row-snapshot comparisons avoid rescanning text and preview bytes.
 static HISTORY_REVISION: AtomicU64 = AtomicU64::new(0);
@@ -534,8 +537,18 @@ struct ContentAttributedKey {
     accent: u32,
 }
 
-static CONTENT_ATTRIBUTED_CACHE: LazyLock<MainThreadSlot<HashMap<ContentAttributedKey, ObjPtr>>> =
-    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+static CONTENT_ATTRIBUTED_CACHE: LazyLock<
+    MainThreadSlot<HashMap<ContentAttributedKey, CachedUiObject>>,
+> = LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+
+const UI_CACHE_CAPACITY: usize = 128;
+static UI_CACHE_RECENCY: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct CachedUiObject {
+    object: ObjPtr,
+    last_used: u64,
+}
 
 fn picker_rows_key(
     revision: u64,
@@ -670,8 +683,12 @@ struct RowImageKey {
     card_border: u32,
 }
 
-static ROW_IMAGE_CACHE: LazyLock<MainThreadSlot<HashMap<RowImageKey, ObjPtr>>> =
+static ROW_IMAGE_CACHE: LazyLock<MainThreadSlot<HashMap<RowImageKey, CachedUiObject>>> =
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+
+fn next_ui_cache_recency() -> u64 {
+    UI_CACHE_RECENCY.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// 每行的实际行距(按钮高 + 间距,随换行行数变化)/ per-row pitch (button height + gap,
 /// varies with the wrapped line count).
@@ -1005,6 +1022,12 @@ unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(refreshPickerSearchRows:),
+                picker_refresh_search_rows as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(refreshPickerVisibleRows:),
                 picker_refresh_visible_rows as *mut c_void,
                 types.as_ptr(),
@@ -1102,6 +1125,49 @@ extern "C" fn picker_refresh_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_vo
     unsafe {
         rebuild_rows();
     }
+}
+
+/// 搜索输入合并后的主线程刷新:连续按键只在停顿后重建一次可视行。
+/// Main-thread refresh after coalescing search input: consecutive keystrokes rebuild the
+/// visible rows only once after typing pauses.
+extern "C" fn picker_refresh_search_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    PICKER_SEARCH_REFRESH_PENDING.store(false, Ordering::SeqCst);
+    if !PICKER_VISIBLE.load(Ordering::SeqCst)
+        || REBUILDING.load(Ordering::SeqCst)
+        || PICKER_WINDOW.lock().unwrap().is_none()
+    {
+        return;
+    }
+    let filter = *CLIP_FILTER.lock().unwrap();
+    let show_source = show_source_app();
+    let query = with_clipboard_ui(|ui| ui.search_query.clone());
+    let key = picker_rows_key(history_revision(), &query, filter, show_source);
+    let rows_current = with_clipboard_ui(|ui| {
+        ui.rendered_rows
+            .as_ref()
+            .is_some_and(|current| current == &key)
+    });
+    if !rows_current {
+        unsafe {
+            rebuild_rows();
+        }
+    }
+}
+
+/// 合并连续搜索通知,让文本编辑器保持流畅,同时在短暂停顿后更新列表。
+/// Coalesce consecutive search notifications so the editor stays responsive while the list
+/// catches up shortly after typing pauses.
+unsafe fn schedule_picker_search_refresh() {
+    if PICKER_SEARCH_REFRESH_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let target = observer();
+    let _: () = msg_send![
+        target,
+        performSelector: sel!(refreshPickerSearchRows:),
+        withObject: std::ptr::null::<AnyObject>(),
+        afterDelay: 0.05f64
+    ];
 }
 
 /// 在滚动事件批次结束后补齐可视行,避免每个 bounds-change 都同步拆建整组控件。
@@ -1824,7 +1890,7 @@ extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_v
     // Do NOT reset the selection: while editing (focus in the search field) it stays
     // "no selection"; returning to the list (↓) resets it to the first entry in
     // search_field_do_command.
-    unsafe { rebuild_rows() };
+    unsafe { schedule_picker_search_refresh() };
 }
 
 /// NSSearchField 的 Esc(cancelOperation:):有搜索词 → 清空并恢复全列表(方案 A 第一级);
@@ -6873,9 +6939,10 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
         secondary_text: palette.secondary_text,
         accent: palette.accent,
     };
-    if let Some(cached) = CONTENT_ATTRIBUTED_CACHE.lock().unwrap().get(&key) {
-        CFRetain(cached.0 as *const c_void);
-        return cached.0;
+    if let Some(cached) = CONTENT_ATTRIBUTED_CACHE.lock().unwrap().get_mut(&key) {
+        cached.last_used = next_ui_cache_recency();
+        CFRetain(cached.object.0 as *const c_void);
+        return cached.object.0;
     }
     let prepared_code = (kind == TextKind::Code).then(|| prepare_code_display(content, usize::MAX));
     let display_content = prepared_code
@@ -6921,10 +6988,33 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
         apply_link_color(attr, display_content, kind);
     }
     CFRetain(attr as *const c_void);
-    CONTENT_ATTRIBUTED_CACHE
-        .lock()
-        .unwrap()
-        .insert(key, ObjPtr::new(attr));
+    let mut released = Vec::new();
+    {
+        let mut cache = CONTENT_ATTRIBUTED_CACHE.lock().unwrap();
+        if let Some(old) = cache.insert(
+            key,
+            CachedUiObject {
+                object: ObjPtr::new(attr),
+                last_used: next_ui_cache_recency(),
+            },
+        ) {
+            released.push(old.object);
+        }
+        if cache.len() > UI_CACHE_CAPACITY {
+            let evicted_key = cache
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(key, _)| key.clone());
+            if let Some(evicted_key) = evicted_key {
+                if let Some(evicted) = cache.remove(&evicted_key) {
+                    released.push(evicted.object);
+                }
+            }
+        }
+    }
+    for object in released {
+        release_obj(object.0);
+    }
     attr
 }
 
@@ -7077,9 +7167,10 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
         field_bg: palette.field_bg,
         card_border: palette.card_border,
     };
-    if let Some(cached) = ROW_IMAGE_CACHE.lock().unwrap().get(&key) {
-        CFRetain(cached.0 as *const c_void);
-        return cached.0;
+    if let Some(cached) = ROW_IMAGE_CACHE.lock().unwrap().get_mut(&key) {
+        cached.last_used = next_ui_cache_recency();
+        CFRetain(cached.object.0 as *const c_void);
+        return cached.object.0;
     }
     let data: *mut AnyObject = msg_send![
         class!(NSData),
@@ -7132,10 +7223,33 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     let _: () = msg_send![target, unlockFocus];
     release_obj(im);
     CFRetain(target as *const c_void);
-    ROW_IMAGE_CACHE
-        .lock()
-        .unwrap()
-        .insert(key, ObjPtr::new(target));
+    let mut released = Vec::new();
+    {
+        let mut cache = ROW_IMAGE_CACHE.lock().unwrap();
+        if let Some(old) = cache.insert(
+            key,
+            CachedUiObject {
+                object: ObjPtr::new(target),
+                last_used: next_ui_cache_recency(),
+            },
+        ) {
+            released.push(old.object);
+        }
+        if cache.len() > UI_CACHE_CAPACITY {
+            let evicted_key = cache
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(key, _)| *key);
+            if let Some(evicted_key) = evicted_key {
+                if let Some(evicted) = cache.remove(&evicted_key) {
+                    released.push(evicted.object);
+                }
+            }
+        }
+    }
+    for object in released {
+        release_obj(object.0);
+    }
     target
 }
 
