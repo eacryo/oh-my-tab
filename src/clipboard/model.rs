@@ -433,7 +433,8 @@ pub(super) fn expire_entries(
     let Some(ttl) = ttl_secs else {
         return 0;
     };
-    let mut dropped: Vec<ClipEntry> = Vec::new();
+    let mut dropped = 0;
+    let mut dropped_image_hashes = Vec::new();
     history.retain(|e| {
         // 时间回拨(now < copied_at):saturating_sub 为 0,未到 ttl,天然安全。
         // Clock rollback (now < copied_at): saturating_sub yields 0, under ttl, safe.
@@ -442,14 +443,24 @@ pub(super) fn expire_entries(
                 .map(|t| now_secs.saturating_sub(t) >= ttl)
                 .unwrap_or(false);
         if expired {
-            dropped.push(e.clone());
+            dropped += 1;
+            if let Some(hash) = e.image.as_ref().map(|image| image.hash) {
+                if hash != 0 {
+                    dropped_image_hashes.push(hash);
+                }
+            }
         }
         !expired
     });
-    for d in &dropped {
-        cache_delete_for_removed(history, d);
+    dropped_image_hashes.sort_unstable();
+    dropped_image_hashes.dedup();
+    for hash in dropped_image_hashes {
+        cache_delete_for_hash(history, hash);
     }
-    dropped.len()
+    if dropped > 0 {
+        super::bump_history_revision();
+    }
+    dropped
 }
 
 // 图片去重哈希已在 crate::hash 统一实现;下方注释块为第二阶段(内容哈希)预案。
@@ -565,6 +576,7 @@ pub(super) fn record_text(
         // the most recent copy, not the first one.
         history[idx].copied_at = Some(now_secs());
         move_entry_to_front(history, idx);
+        super::bump_history_revision();
         return true;
     }
     let pos = insert_position(history);
@@ -590,6 +602,7 @@ pub(super) fn record_text(
         }
         history.truncate(max);
     }
+    super::bump_history_revision();
     true
 }
 
@@ -665,6 +678,7 @@ pub(super) fn record_image(
             history[idx].image.as_mut().unwrap().source_path = image.source_path.clone();
         }
         move_entry_to_front(history, idx);
+        super::bump_history_revision();
         return true;
     }
     let pos = insert_position(history);
@@ -699,6 +713,7 @@ pub(super) fn record_image(
         }
         history.truncate(max);
     }
+    super::bump_history_revision();
     true
 }
 
@@ -712,6 +727,7 @@ pub(super) fn pin_entry(history: &mut Vec<ClipEntry>, idx: usize) -> usize {
     let mut e = history.remove(idx);
     e.pinned = true;
     history.insert(0, e);
+    super::bump_history_revision();
     0
 }
 
@@ -727,6 +743,7 @@ pub(super) fn unpin_entry(history: &mut Vec<ClipEntry>, idx: usize) -> usize {
     e.pinned = false;
     let pos = insert_position(history);
     history.insert(pos, e);
+    super::bump_history_revision();
     pos
 }
 
@@ -756,6 +773,7 @@ pub(super) fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     if idx < history.len() {
         let removed = history.remove(idx);
         cache_delete_for_removed(history, &removed);
+        super::bump_history_revision();
     }
 }
 
@@ -772,6 +790,13 @@ pub(super) enum ClipFilter {
 
 /// 当前生效的筛选项 / the active filter.
 pub(super) static CLIP_FILTER: Mutex<ClipFilter> = Mutex::new(ClipFilter::All);
+
+#[cfg(not(test))]
+type FilterTextLowerCache = Option<(u64, Vec<String>)>;
+
+#[cfg(not(test))]
+static FILTER_TEXT_LOWER_CACHE: LazyLock<Mutex<FilterTextLowerCache>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Tab 键的分类循环顺序:全部 → 文本 → 图片 → 链接 → 代码 → 全部。
 /// The Tab filter cycle: All -> Text -> Image -> Link -> Code -> All.
@@ -805,6 +830,43 @@ pub(super) fn filtered_indices(
     filter: ClipFilter,
 ) -> Vec<usize> {
     let q = query.to_lowercase();
+
+    if q.is_empty() {
+        return history
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches_filter(e, filter))
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    #[cfg(not(test))]
+    {
+        // 搜索输入变化时复用按 history revision 构建的小写文本;避免每个按键都为整本
+        // 历史分配并扫描一遍 lowercase 副本。
+        // Reuse lowercase text built for the current history revision so each keystroke
+        // avoids allocating and scanning a lowercase copy for every history entry.
+        let revision = super::history_revision();
+        let mut cache = FILTER_TEXT_LOWER_CACHE.lock().unwrap();
+        let rebuild = cache.as_ref().is_none_or(|(cached_revision, texts)| {
+            *cached_revision != revision || texts.len() != history.len()
+        });
+        if rebuild {
+            *cache = Some((
+                revision,
+                history.iter().map(|e| e.text.to_lowercase()).collect(),
+            ));
+        }
+        let texts = &cache.as_ref().unwrap().1;
+        history
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| matches_filter(e, filter) && texts[*i].contains(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[cfg(test)]
     history
         .iter()
         .enumerate()

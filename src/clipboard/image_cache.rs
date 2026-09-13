@@ -377,6 +377,14 @@ pub(super) fn hash_referenced_by<'a>(
     survivors.any(|e| e.image.as_ref().is_some_and(|i| i.hash == hash))
 }
 
+/// 按 hash 清理已移除图片的缓存,但先确认幸存条目没有共享该文件。
+/// Remove a removed image's cache by hash, after confirming no survivor shares the file.
+pub(super) fn cache_delete_for_hash(history: &[ClipEntry], hash: u64) {
+    if hash != 0 && !hash_referenced_by(history.iter(), hash) {
+        cache_delete_image(hash);
+    }
+}
+
 /// 删除一个条目时清理它的缓存文件(数据字节 + 预览一并删除),但**仅当该 hash 不再
 /// 被任何幸存条目引用**;退化条目(hash=0)无文件可删。
 /// Delete a removed entry's cache files (data bytes + preview together), but ONLY when
@@ -386,9 +394,7 @@ pub(super) fn cache_delete_for_removed(history: &[ClipEntry], removed: &ClipEntr
     let Some(img) = &removed.image else {
         return;
     };
-    if img.hash != 0 && !hash_referenced_by(history.iter(), img.hash) {
-        cache_delete_image(img.hash);
-    }
+    cache_delete_for_hash(history, img.hash);
 }
 
 /// 清空整个图片缓存目录(启动时调用:历史不持久化,残留文件必为孤儿)。

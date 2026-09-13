@@ -193,10 +193,12 @@ pub(super) fn poll_clipboard() {
             None => log_debug!("[clip] change but no text/image (non-pasteboard content?)"),
         },
     }
-    // 历史有变更(记录/去重移前/裁剪)→ persist 开启时落盘。
-    // The history changed (record/dedup-move/trim) -> persist when enabled.
-    save_history();
+    // 只有模型真正变化才序列化并落盘;无文本/图片等无操作变化不应触发整本历史的
+    // clone + TOML 序列化 + 原子写入。
+    // Serialize and persist only after a real model change; no-op pasteboard changes must
+    // not clone, serialize, and atomically rewrite the entire history.
     if history_changed {
+        save_history();
         schedule_picker_refresh();
     }
 }

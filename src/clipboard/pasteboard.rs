@@ -281,6 +281,16 @@ pub(super) unsafe fn read_pasteboard_image() -> Option<ImageEntry> {
         }
         Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
     };
+    let has_type = |t: &str| -> bool {
+        let types: *mut AnyObject = msg_send![pb, types];
+        if types.is_null() {
+            return false;
+        }
+        let type_ns = make_nsstring(t);
+        let present: bool = msg_send![types, containsObject: type_ns];
+        CFRelease(type_ns as *const c_void);
+        present
+    };
     // 先收集剪贴板上实际存在的类型(按优先级序),再逐个尝试:优先挑 GIF/WebP 等
     // 原始格式;选中类型解码/落盘失败则试下一个(同图往往还有 TIFF 可解码)。
     // Collect the types actually present (in priority order), then try them one by one:
@@ -289,7 +299,7 @@ pub(super) unsafe fn read_pasteboard_image() -> Option<ImageEntry> {
     let mut present: Vec<&str> = PASTEBOARD_IMAGE_UTIS
         .iter()
         .copied()
-        .filter(|uti| bytes_for_type(uti).is_some())
+        .filter(|uti| has_type(uti))
         .collect();
     while let Some(uti) = preferred_uti(&present) {
         present.retain(|u| *u != uti);

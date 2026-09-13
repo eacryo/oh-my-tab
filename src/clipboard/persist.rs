@@ -209,6 +209,7 @@ pub(super) fn load_history() {
     };
     let mut hist = CLIP_HISTORY.lock().unwrap();
     let max = max_entries();
+    let mut history_changed = false;
     // 过期条目直接跳过:不进入内存(磁盘文件随后由 save_history 回写清理)。
     // Expired entries are skipped outright: they never reach memory (the disk file is
     // cleaned up afterwards by the save_history rewrite).
@@ -269,6 +270,7 @@ pub(super) fn load_history() {
         } else {
             hist.push(entry);
         }
+        history_changed = true;
     }
     if hist.len() > max {
         // 被裁条目的缓存文件一并删除——但仅当其 hash 不再被幸存条目引用。
@@ -278,6 +280,10 @@ pub(super) fn load_history() {
             cache_delete_for_removed(&hist[..max], dropped);
         }
         hist.truncate(max);
+        history_changed = true;
+    }
+    if history_changed {
+        super::bump_history_revision();
     }
     let swept = sweep_clip_image_cache(&hist);
     let total = hist.len();

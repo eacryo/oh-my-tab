@@ -81,8 +81,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -458,6 +457,18 @@ static PICKER_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// 剪贴板历史刷新是否已排队 / whether a clipboard-history UI refresh is already queued.
 static PICKER_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// 历史模型的单调版本;行树快照比较无需重新扫描文本和预览字节。
+/// Monotonic history-model version; row-snapshot comparisons avoid rescanning text and preview bytes.
+static HISTORY_REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn history_revision() -> u64 {
+    HISTORY_REVISION.load(Ordering::Relaxed)
+}
+
+pub(super) fn bump_history_revision() {
+    HISTORY_REVISION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// 可视行槽位刷新是否已排队 / whether a virtual-row viewport refresh is already queued.
 static PICKER_VISIBLE_ROWS_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -527,33 +538,13 @@ static CONTENT_ATTRIBUTED_CACHE: LazyLock<MainThreadSlot<HashMap<ContentAttribut
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
 
 fn picker_rows_key(
-    history: &[ClipEntry],
+    revision: u64,
     query: &str,
     filter: ClipFilter,
     show_source: bool,
 ) -> PickerRowsKey {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    history.len().hash(&mut hasher);
-    for entry in history {
-        entry.text.hash(&mut hasher);
-        entry.pinned.hash(&mut hasher);
-        entry.source_app.hash(&mut hasher);
-        entry.source_key.hash(&mut hasher);
-        entry.copied_at.hash(&mut hasher);
-        match &entry.image {
-            None => 0u8.hash(&mut hasher),
-            Some(image) => {
-                1u8.hash(&mut hasher);
-                image.uti.hash(&mut hasher);
-                image.hash.hash(&mut hasher);
-                image.data_path.hash(&mut hasher);
-                image.preview_png.hash(&mut hasher);
-                image.source_path.hash(&mut hasher);
-            }
-        }
-    }
     PickerRowsKey {
-        history_signature: hasher.finish(),
+        history_signature: revision,
         filter,
         query: query.to_string(),
         show_source,
@@ -635,6 +626,16 @@ static PICKER_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None)
 /// 浮窗容器(接收键盘)/ the picker container (receives key events).
 static PICKER_CONTAINER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
+/// 复制容器裸指针后立即结束槽位借用;调用 AppKit 前不得持有 MainThreadSlot 的 RefMut。
+/// Copy the container pointer and end the slot borrow immediately; never hold a
+/// MainThreadSlot RefMut across an AppKit call.
+fn picker_container_ptr() -> Option<*mut AnyObject> {
+    PICKER_CONTAINER
+        .lock()
+        .unwrap()
+        .map(|container| container.0)
+}
+
 /// 浮窗内容父视图(重建本地化 footer 时使用)。/ The picker content parent, used to rebuild
 /// the localized footer in place.
 static PICKER_CONTENT_PARENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -665,7 +666,6 @@ static SOURCE_ICON_CACHE: LazyLock<MainThreadSlot<HashMap<(String, u64), CachedS
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct RowImageKey {
     image_hash: u64,
-    preview_hash: u64,
     field_bg: u32,
     card_border: u32,
 }
@@ -1089,15 +1089,12 @@ extern "C" fn picker_refresh_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_vo
     let filter = *CLIP_FILTER.lock().unwrap();
     let show_source = show_source_app();
     let query = with_clipboard_ui(|ui| ui.search_query.clone());
-    let rows_current = {
-        let history = CLIP_HISTORY.lock().unwrap();
-        let key = picker_rows_key(&history, &query, filter, show_source);
-        with_clipboard_ui(|ui| {
-            ui.rendered_rows
-                .as_ref()
-                .is_some_and(|current| current == &key)
-        })
-    };
+    let key = picker_rows_key(history_revision(), &query, filter, show_source);
+    let rows_current = with_clipboard_ui(|ui| {
+        ui.rendered_rows
+            .as_ref()
+            .is_some_and(|current| current == &key)
+    });
     if rows_current {
         return;
     }
@@ -1636,7 +1633,7 @@ unsafe fn picker_visible_row_range(pitches: &[f64], row_count: usize) -> (usize,
         return (0, 0);
     }
     let fallback_end = row_count.min(12);
-    let Some(container) = *PICKER_CONTAINER.lock().unwrap() else {
+    let Some(container) = picker_container_ptr() else {
         return (0, fallback_end);
     };
     let Some(scroll) = *SCROLL_VIEW.lock().unwrap() else {
@@ -1648,7 +1645,7 @@ unsafe fn picker_visible_row_range(pitches: &[f64], row_count: usize) -> (usize,
     }
     let clip_bounds: NSRect = msg_send![clip, bounds];
     let visible_rect: NSRect = msg_send![
-        container.0,
+        container,
         convertRect: clip_bounds,
         fromView: clip
     ];
@@ -1753,6 +1750,7 @@ extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *m
     // share the cache).
     let mut hist = CLIP_HISTORY.lock().unwrap();
     let kept = hist.iter().filter(|e| e.pinned).count();
+    let removed = hist.len().saturating_sub(kept);
     for dropped in hist.iter().filter(|e| !e.pinned) {
         let Some(img) = &dropped.image else {
             continue;
@@ -1762,6 +1760,9 @@ extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *m
         }
     }
     hist.retain(|e| e.pinned);
+    if removed > 0 {
+        bump_history_revision();
+    }
     log_info!(
         "Clipboard history cleared by user ({} pinned entries kept).",
         kept
@@ -2009,17 +2010,17 @@ extern "C" fn search_field_do_command(
         // ↑ 选中末行时视口还停在顶部:用确定性的偏移计算滚动到选中行可见。
         // With ↑ the tail is selected while the viewport is still at the top: use the
         // deterministic offset calculation to bring the selected row into view.
-        if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
-            scroll_selection_into_view(c.0, sel);
+        if let Some(container) = picker_container_ptr() {
+            scroll_selection_into_view(container, sel);
         }
-        if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
+        if let Some(container) = picker_container_ptr() {
             let window = match *PICKER_WINDOW.lock().unwrap() {
                 Some(w) => w.0,
                 None => return true,
             };
             // makeFirstResponder: 返回 BOOL('B')。
             // makeFirstResponder: returns BOOL ('B').
-            let _: bool = msg_send![window, makeFirstResponder: c.0];
+            let _: bool = msg_send![window, makeFirstResponder: container];
         }
     }
     true
@@ -2533,10 +2534,7 @@ fn show_picker() {
         let filter = *CLIP_FILTER.lock().unwrap();
         let show_source = show_source_app();
         let render_key_started = Instant::now();
-        let render_key = {
-            let hist = CLIP_HISTORY.lock().unwrap();
-            picker_rows_key(&hist, "", filter, show_source)
-        };
+        let render_key = picker_rows_key(history_revision(), "", filter, show_source);
         let render_key_ms = render_key_started.elapsed().as_millis();
         let rows_ready = with_clipboard_ui(|ui| {
             ui.rendered_rows
@@ -2665,8 +2663,8 @@ fn show_picker() {
         // 每次呼出滚动到顶部(最新条目)。
         // Scroll to the top on every summon (the newest entry).
         let display_prep_started = Instant::now();
-        if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
-            let _: () = msg_send![c.0, scrollPoint: NSPoint::new(0.0, 0.0)];
+        if let Some(container) = picker_container_ptr() {
+            let _: () = msg_send![container, scrollPoint: NSPoint::new(0.0, 0.0)];
         }
         // 隐藏期间可能保留了底部视口的物理槽位;回到顶部后补齐顶部可视行。
         // Hidden refreshes may leave physical slots for the old bottom viewport; materialize
@@ -2694,14 +2692,14 @@ fn show_picker() {
         // 键盘焦点给容器(方向键/Enter/Esc)。
         // Keyboard focus to the container (arrows / Enter / Esc).
         let first_responder_lock_started = Instant::now();
-        let container = *PICKER_CONTAINER.lock().unwrap();
+        let container = picker_container_ptr();
         let first_responder_lock_ms = first_responder_lock_started.elapsed().as_millis();
         let mut make_first_responder_ms = 0;
         if let Some(c) = container {
             // makeFirstResponder: 返回 BOOL('B')。
             // makeFirstResponder: returns BOOL ('B').
             let make_first_responder_started = Instant::now();
-            let _: bool = msg_send![window, makeFirstResponder: c.0];
+            let _: bool = msg_send![window, makeFirstResponder: c];
             make_first_responder_ms = make_first_responder_started.elapsed().as_millis();
         }
         let visible_store_started = Instant::now();
@@ -5175,7 +5173,7 @@ unsafe fn ensure_picker_window() {
 unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     let rebuild_started = Instant::now();
     let hist = CLIP_HISTORY.lock().unwrap();
-    let container = (*PICKER_CONTAINER.lock().unwrap())?.0;
+    let container = picker_container_ptr()?;
     // 重建会拆除旧行,期间的 enter/exit 事件会被门控;先丢弃旧索引,避免它落到新行。
     // Rebuild tears down the old rows and gates enter/exit events; discard the old index first
     // so it cannot land on an unrelated new row.
@@ -5327,7 +5325,7 @@ unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
         rows.push(ObjPtr::new(label));
         let build_rows_ms = build_rows_started.elapsed().as_millis();
         let finalize_started = Instant::now();
-        let rendered_key = picker_rows_key(&hist, &query, filter, show_source);
+        let rendered_key = picker_rows_key(history_revision(), &query, filter, show_source);
         let finalize_ms = finalize_started.elapsed().as_millis();
         let summary = PickerTimingSummary {
             elapsed_ms: rebuild_started.elapsed().as_millis(),
@@ -5674,7 +5672,7 @@ unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     }
     let build_rows_ms = build_rows_started.elapsed().as_millis();
     let finalize_started = Instant::now();
-    let rendered_key = picker_rows_key(&hist, &query, filter, show_source);
+    let rendered_key = picker_rows_key(history_revision(), &query, filter, show_source);
     let finalize_ms = finalize_started.elapsed().as_millis();
     let summary = PickerTimingSummary {
         elapsed_ms: rebuild_started.elapsed().as_millis(),
@@ -5916,12 +5914,12 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
         );
     }
 
-    if let Some(container) = *PICKER_CONTAINER.lock().unwrap() {
+    if let Some(container) = picker_container_ptr() {
         let document_h = (rows_top_offset() + pitches.iter().sum::<f64>() + PAD_Y)
             .max(picker_min_height() - header_strip_h() - FOOTER_H);
-        let _: () = msg_send![container.0, setFrameSize: NSSize::new(PICKER_W, document_h)];
+        let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, document_h)];
     }
-    let rendered_key = picker_rows_key(&hist, &query, filter, show_source);
+    let rendered_key = picker_rows_key(history_revision(), &query, filter, show_source);
     with_clipboard_ui(|ui| ui.rendered_rows = Some(rendered_key));
     REBUILDING.store(false, Ordering::SeqCst);
     true
@@ -5951,9 +5949,8 @@ unsafe fn hover_row_at_event(event: *mut c_void) -> usize {
         Some(scroll) => scroll.0,
         None => return NO_SELECTION,
     };
-    let container = match *PICKER_CONTAINER.lock().unwrap() {
-        Some(container) => container.0,
-        None => return NO_SELECTION,
+    let Some(container) = picker_container_ptr() else {
+        return NO_SELECTION;
     };
     let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
     let scroll_point: NSPoint = msg_send![
@@ -6135,9 +6132,8 @@ unsafe fn mouse_inside_row(event: *mut c_void, idx: usize) -> bool {
     if row.tile.0.is_null() {
         return false;
     }
-    let container = match *PICKER_CONTAINER.lock().unwrap() {
-        Some(c) => c.0,
-        None => return false,
+    let Some(container) = picker_container_ptr() else {
+        return false;
     };
     // locationInWindow 使用窗口基准坐标;fromView 必须是 NSView,不能误传 NSWindow。
     // locationInWindow uses the window-base coordinate system; fromView must be an NSView,
@@ -6714,8 +6710,8 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 };
                 refresh_selection(previous, idx);
                 // 滚动到选中行可见 / scroll the selection into view.
-                if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
-                    scroll_selection_into_view(c.0, idx);
+                if let Some(container) = picker_container_ptr() {
+                    scroll_selection_into_view(container, idx);
                 }
                 // 详情打开时跟随选中条目实时刷新(浏览体验,类似 Quick Look)。
                 // The detail panel follows the selection live while open (Quick-Look-style
@@ -7078,7 +7074,6 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     let palette = clipboard_palette();
     let key = RowImageKey {
         image_hash: img.hash,
-        preview_hash: fnv1a64(&img.preview_png),
         field_bg: palette.field_bg,
         card_border: palette.card_border,
     };
@@ -8326,9 +8321,8 @@ mod tests {
     fn picker_rows_key_changes_when_rendered_inputs_change() {
         use super::{picker_rows_key, ClipFilter};
 
-        let history = vec![entry("first")];
-        let base = picker_rows_key(&history, "", ClipFilter::All, false);
-        let same = picker_rows_key(&history, "", ClipFilter::All, false);
+        let base = picker_rows_key(1, "", ClipFilter::All, false);
+        let same = picker_rows_key(1, "", ClipFilter::All, false);
         assert_eq!(
             base.history_signature, same.history_signature,
             "unchanged history should have the same render signature"
@@ -8337,17 +8331,10 @@ mod tests {
         assert_eq!(base.query, same.query);
         assert_eq!(base.show_source, same.show_source);
 
-        let changed_history = vec![entry("second")];
-        assert_ne!(
-            base,
-            picker_rows_key(&changed_history, "", ClipFilter::All, false)
-        );
-        assert_ne!(
-            base,
-            picker_rows_key(&history, "query", ClipFilter::All, false)
-        );
-        assert_ne!(base, picker_rows_key(&history, "", ClipFilter::Text, false));
-        assert_ne!(base, picker_rows_key(&history, "", ClipFilter::All, true));
+        assert_ne!(base, picker_rows_key(2, "", ClipFilter::All, false));
+        assert_ne!(base, picker_rows_key(1, "query", ClipFilter::All, false));
+        assert_ne!(base, picker_rows_key(1, "", ClipFilter::Text, false));
+        assert_ne!(base, picker_rows_key(1, "", ClipFilter::All, true));
     }
 
     /// 测试用的 3 参便捷包装(来源与图标键留空,既有用例不受签名变化影响)。
