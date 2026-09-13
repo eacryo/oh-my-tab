@@ -107,6 +107,118 @@ pub(crate) fn smoke_runner() -> bool {
     // 第二次显示:rebuild_rows 会先移除旧行(曾经的 UAF 路径)。
     // Second show: rebuild_rows removes the old rows first (the former UAF path).
     show_picker();
+    // 删除/撤销 GUI 冒烟:真实列表焦点路径删除顶部图片,再用 Cmd+Z 恢复;缓存必须在
+    // 撤销窗口内保持可用,且恢复后不能重复插入。
+    // Delete/undo GUI smoke: delete the top image through the real list-focus path, then use
+    // Cmd+Z to restore it; its cache must survive the undo window without duplication.
+    unsafe {
+        let c_opt = *PICKER_CONTAINER.lock().unwrap();
+        if let Some(c) = c_opt {
+            set_picker_selection(0);
+            rebuild_rows();
+            let original = {
+                let hist = CLIP_HISTORY.lock().unwrap();
+                hist.iter().find(|entry| entry.image.is_some()).cloned()
+            }
+            .expect("clipboard smoke must contain an image entry");
+            let hash = original.image.as_ref().unwrap().hash;
+            let ev_delete = make_key_event(51);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev_delete as *mut c_void);
+            assert!(
+                !CLIP_HISTORY
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| same_clip_entry_identity(entry, &original)),
+                "backspace must remove the selected clipboard entry"
+            );
+            let ev_undo = make_key_event_with_modifiers(6, 0x0010_0000);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev_undo as *mut c_void);
+            let hist = CLIP_HISTORY.lock().unwrap();
+            assert_eq!(
+                hist.iter()
+                    .filter(|entry| same_clip_entry_identity(entry, &original))
+                    .count(),
+                1,
+                "Cmd+Z must restore exactly one entry"
+            );
+            assert!(
+                cache_read_image(hash).is_some(),
+                "undo must retain image bytes"
+            );
+        }
+    }
+    // 清空入口 GUI 冒烟:点击入口仅展示确认卡片,取消后历史不变;实际清空范围由纯逻辑
+    // 测试覆盖,避免这个 smoke 为后续详情路径丢失全部 fixture。
+    // Clear-entry GUI smoke: opening the entry point only shows the confirmation card, and
+    // cancel leaves history unchanged; clear scopes are covered by pure logic tests so this
+    // smoke retains all fixtures for the subsequent detail path.
+    let before_cancel = CLIP_HISTORY.lock().unwrap().len();
+    unsafe {
+        clear_clipboard_history(
+            observer() as *mut c_void,
+            sel!(clearClipboardHistory:),
+            std::ptr::null_mut(),
+        );
+    }
+    assert!(clear_history_confirmation_expanded());
+    unsafe {
+        let confirmation = (*CLEAR_HISTORY_CONFIRMATION.lock().unwrap())
+            .expect("clear confirmation views must be built");
+        let frames: [NSRect; 3] = [confirmation.unpinned, confirmation.all, confirmation.cancel]
+            .map(|button| msg_send![button.0, frame]);
+        assert_eq!(frames[0].origin.x, frames[1].origin.x);
+        assert_eq!(frames[1].origin.x, frames[2].origin.x);
+        assert!(frames[0].origin.y < frames[1].origin.y);
+        assert!(frames[1].origin.y < frames[2].origin.y);
+        let parent: *mut AnyObject = msg_send![confirmation.surface.0, superview];
+        let clear = (*CLEAR_HISTORY_BUTTON.lock().unwrap()).expect("clear trigger must exist");
+        let header: *mut AnyObject = msg_send![clear.0, superview];
+        let header_parent: *mut AnyObject = msg_send![header, superview];
+        assert_eq!(
+            parent, header_parent,
+            "confirmation must share the header's parent"
+        );
+        let header_frame: NSRect = msg_send![header, frame];
+        for button in [confirmation.unpinned, confirmation.all] {
+            let bounds: NSRect = msg_send![button.0, bounds];
+            let in_parent: NSRect = msg_send![button.0, convertRect: bounds, toView: parent];
+            let center = NSPoint::new(
+                in_parent.origin.x + in_parent.size.width / 2.0,
+                in_parent.origin.y + in_parent.size.height / 2.0,
+            );
+            assert!(
+                center.y < header_frame.origin.y,
+                "red button must extend below the header"
+            );
+            let hit: *mut AnyObject = msg_send![parent, hitTest: center];
+            assert_eq!(
+                hit, button.0,
+                "red button must receive hits beyond the header"
+            );
+        }
+        let pills: Vec<*mut AnyObject> = FILTER_PILLS
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pill| pill.0)
+            .collect();
+        assert!(
+            pills.iter().all(|pill| {
+                let hidden: bool = msg_send![*pill, isHidden];
+                !hidden
+            }),
+            "filter tabs must remain visible while the confirmation card is expanded"
+        );
+
+        clear_clipboard_cancel(
+            observer() as *mut c_void,
+            sel!(clearClipboardCancel:),
+            std::ptr::null_mut(),
+        );
+    }
+    assert!(!clear_history_confirmation_expanded());
+    assert_eq!(CLIP_HISTORY.lock().unwrap().len(), before_cancel);
     // 搜索冒烟:设置搜索词 → 重建(过滤显示)→ 方向键在过滤列表内导航 → 清空恢复。
     // Search smoke: set a query -> rebuild (filtered display) -> arrow navigation within the
     // filtered list -> clear restores everything.
@@ -345,15 +457,18 @@ pub(crate) fn smoke_runner() -> bool {
             );
             assert!(!noncontiguous, "detail layout must be contiguous");
             assert!(!background, "detail background layout must be disabled");
-            // 越界原点是橡皮筋的合法状态:bounds 通知回调只刷新胶囊、不改写
-            // clipView——两端各验证一次"回调后越界原点保持原样"。
-            // Out-of-range origins are legal rubber-band state: the notification callback
-            // only refreshes capsules and must not touch the clip view -- verified at both
-            // endpoints by asserting the overscrolled origin survives the callback.
+            // bounds 通知回调只刷新胶囊、不改写 clipView。某些 macOS 版本会在同步
+            // setBoundsOrigin 时先自行钳位,所以比较回调前后的实际原点,不假设一定能
+            // 构造出越界橡皮筋状态。
+            // The bounds callback may update only the capsule, never the clip view. Some
+            // macOS versions synchronously clamp setBoundsOrigin, so compare the actual
+            // origin before and after the callback instead of assuming overscroll can always
+            // be constructed.
             let _: () = msg_send![
                 detail_clip,
                 setBoundsOrigin: NSPoint::new(opened_bounds.origin.x, min_y - 30.0)
             ];
+            let top_before_callback: NSRect = msg_send![detail_clip, bounds];
             detail_scroll_indicator_bounds_changed(
                 observer() as *mut c_void,
                 sel!(detailScrollIndicatorBoundsChanged:),
@@ -361,14 +476,14 @@ pub(crate) fn smoke_runner() -> bool {
             );
             let top_bounds: NSRect = msg_send![detail_clip, bounds];
             assert_eq!(
-                top_bounds.origin.y,
-                min_y - 30.0,
-                "top overscroll belongs to native rubber banding and must survive"
+                top_bounds.origin.y, top_before_callback.origin.y,
+                "top bounds callback must not rewrite the clip view"
             );
             let _: () = msg_send![
                 detail_clip,
                 setBoundsOrigin: NSPoint::new(opened_bounds.origin.x, max_y + 30.0)
             ];
+            let bottom_before_callback: NSRect = msg_send![detail_clip, bounds];
             detail_scroll_indicator_bounds_changed(
                 observer() as *mut c_void,
                 sel!(detailScrollIndicatorBoundsChanged:),
@@ -376,9 +491,8 @@ pub(crate) fn smoke_runner() -> bool {
             );
             let bottom_bounds: NSRect = msg_send![detail_clip, bounds];
             assert_eq!(
-                bottom_bounds.origin.y,
-                max_y + 30.0,
-                "bottom overscroll belongs to native rubber banding and must survive"
+                bottom_bounds.origin.y, bottom_before_callback.origin.y,
+                "bottom bounds callback must not rewrite the clip view"
             );
             scroll_detail_to_top(detail_scroll);
             // ←:详情打开时直接置顶当前选中条目,详情保持打开并跟随重排后的位置。
@@ -450,6 +564,16 @@ pub(crate) fn smoke_runner() -> bool {
                     let ev = make_key_event(124);
                     container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
                     assert!(super::detail_visible(), "image detail must open");
+                    // 详情高清图由后台线程生成;给 worker 一个短窗口完成落盘,不把异步
+                    // 投递误判成 UI 失败。
+                    // The hi-res detail image is generated on a worker; allow a short window
+                    // for disk delivery so asynchronous work is not mistaken for a UI failure.
+                    for _ in 0..20 {
+                        if cache_read_detail_preview(tiny_hash).is_some() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
                     assert!(
                         cache_read_detail_preview(tiny_hash).is_some(),
                         "the lazy .detail preview must be generated on first open"
@@ -464,6 +588,11 @@ pub(crate) fn smoke_runner() -> bool {
 
 /// 构造一个方向键 NSEvent(冒烟用)。/ Build an arrow-key NSEvent (for the smoke run).
 unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
+    make_key_event_with_modifiers(keycode, 0)
+}
+
+/// 构造带修饰键的 NSEvent(冒烟用)。/ Build an NSEvent with modifier flags for smoke tests.
+unsafe fn make_key_event_with_modifiers(keycode: u16, modifiers: u64) -> *mut AnyObject {
     let chars = make_nsstring("x");
     // keyEventWithType: 参数依次为 NSEventType(unsigned long)、location、modifierFlags、
     // timestamp、windowNumber(NSInteger)、context、characters、charactersIgnoringModifiers、
@@ -475,7 +604,7 @@ unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
         class!(NSEvent),
         keyEventWithType: 10u64,
         location: NSPoint::new(0.0, 0.0),
-        modifierFlags: 0u64,
+        modifierFlags: modifiers,
         timestamp: 0.0f64,
         windowNumber: 0isize,
         context: std::ptr::null::<AnyObject>(),

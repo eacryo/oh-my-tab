@@ -4,6 +4,10 @@
 
 [clipboard]
 clear_all = "Clear history"
+clear_confirm_unpinned = "Clear unpinned"
+clear_confirm_all = "Clear all"
+clear_confirm_cancel = "Cancel"
+toast_undo_delete = "Deletion undone"
 toast_pinned = "Pinned"
 toast_unpinned = "Unpinned"
 empty = "No clipboard history yet"

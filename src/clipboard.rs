@@ -83,7 +83,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod image_cache;
 mod model;
@@ -256,6 +256,20 @@ const FOOTER_GROUP_GAP: f64 = 16.0;
 /// 列表顶部与头部条的间距(设计稿 .history padding-top 2px)。
 /// The list's top offset inside the document (mockup 2px).
 const CLEAR_BTN_GAP: f64 = 2.0;
+/// 清空确认卡片的固定几何;三个操作纵向排列并共享同一宽度。
+/// Fixed geometry for the clear-confirmation card; the three actions are stacked vertically
+/// and share one width.
+const CLEAR_CONFIRM_BUTTON_W: f64 = (PICKER_W - 2.0 * FILTERS_PAD_X) / 3.0 - 8.0;
+const CLEAR_CONFIRM_BUTTON_H: f64 = 26.0;
+const CLEAR_CONFIRM_GAP: f64 = 6.0;
+const CLEAR_CONFIRM_CARD_PAD_X: f64 = 8.0;
+const CLEAR_CONFIRM_CARD_PAD_Y: f64 = 6.0;
+const CLEAR_CONFIRM_CARD_H: f64 =
+    CLEAR_CONFIRM_CARD_PAD_Y * 2.0 + CLEAR_CONFIRM_BUTTON_H * 3.0 + CLEAR_CONFIRM_GAP * 2.0;
+const CLEAR_CONFIRM_CARD_W: f64 = CLEAR_CONFIRM_BUTTON_W + CLEAR_CONFIRM_CARD_PAD_X * 2.0;
+const CLEAR_CONFIRM_SHELL_DURATION: f64 = 0.58;
+const CLEAR_CONFIRM_CONTENT_DURATION: f64 = 0.46;
+const NSEVENT_TYPE_LEFT_MOUSE_DOWN: usize = 1;
 /// 玻璃圆角(设计稿 16px)/ the glass panel's corner radius (16px).
 const CORNER_R: f64 = 16.0;
 /// 行选中高亮圆角(设计稿 8px)/ the row highlight's corner radius (8px).
@@ -702,6 +716,41 @@ static FILTER_PILLS: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new(
 /// The clear-history button, whose title and frame are relaid out on locale changes.
 static CLEAR_HISTORY_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
+const CLIPBOARD_UNDO_WINDOW: Duration = Duration::from_secs(30);
+
+fn clipboard_undo_expired(expires_at: Instant, now: Instant) -> bool {
+    expires_at <= now
+}
+
+fn is_clipboard_undo_shortcut(keycode: u16, modifiers: u64) -> bool {
+    const COMMAND: u64 = 0x0010_0000;
+    const SECONDARY: u64 = 0x000E_0000;
+    keycode == 6 && (modifiers & COMMAND) != 0 && (modifiers & SECONDARY) == 0
+}
+
+struct DeletedClipboardEntry {
+    entry: ClipEntry,
+    original_index: usize,
+    expires_at: Instant,
+    generation: u64,
+}
+
+static DELETED_CLIPBOARD_ENTRY: LazyLock<Mutex<Option<DeletedClipboardEntry>>> =
+    LazyLock::new(|| Mutex::new(None));
+static DELETED_CLIPBOARD_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct ClearHistoryConfirmationViews {
+    surface: ObjPtr,
+    unpinned: ObjPtr,
+    all: ObjPtr,
+    cancel: ObjPtr,
+}
+
+static CLEAR_HISTORY_CONFIRMATION: MainThreadSlot<Option<ClearHistoryConfirmationViews>> =
+    MainThreadSlot::new(None);
+static CLEAR_HISTORY_CONFIRMATION_EXPANDED: AtomicBool = AtomicBool::new(false);
+
 /// 筛选选中项的下划线小视图(共享单例,随选中项移动)。
 /// The active filter's underline (one shared view, moved under the active item).
 static FILTER_UNDERLINE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -1016,6 +1065,36 @@ unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(clearClipboardUnpinned:),
+                clear_clipboard_unpinned as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(clearClipboardAll:),
+                clear_clipboard_all as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(clearClipboardCancel:),
+                clear_clipboard_cancel as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(finishClearHistoryCollapse:),
+                finish_clear_history_collapse as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(expireClipboardUndo:),
+                expire_clipboard_undo as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(refreshPickerRows:),
                 picker_refresh_rows as *mut c_void,
                 types.as_ptr(),
@@ -1290,6 +1369,65 @@ unsafe fn schedule_system_pasteboard_clear() {
 /// Picker resign-key notification callback (main thread): auto-hide on outside clicks, etc.
 extern "C" fn window_did_resign_key(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
     hide_picker();
+}
+
+unsafe fn clear_confirmation_contains_hit_view(hit_view: *mut AnyObject) -> bool {
+    if hit_view.is_null() {
+        return false;
+    }
+    let Some(confirmation) = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() else {
+        return false;
+    };
+    let mut view = hit_view;
+    while !view.is_null() {
+        if view == confirmation.surface.0 {
+            return true;
+        }
+        view = msg_send![view, superview];
+    }
+    false
+}
+
+unsafe fn collapse_clear_confirmation_on_external_click(
+    window: *mut AnyObject,
+    event: *mut AnyObject,
+) {
+    if !clear_history_confirmation_expanded() || window.is_null() || event.is_null() {
+        return;
+    }
+    let content: *mut AnyObject = msg_send![window, contentView];
+    if content.is_null() {
+        return;
+    }
+    let location: NSPoint = msg_send![event, locationInWindow];
+    let point: NSPoint = msg_send![
+        content,
+        convertPoint: location,
+        fromView: std::ptr::null::<AnyObject>()
+    ];
+    let hit_view: *mut AnyObject = msg_send![content, hitTest: point];
+    if !clear_confirmation_contains_hit_view(hit_view) {
+        set_clear_history_confirmation_expanded(false);
+    }
+}
+
+extern "C" fn clipboard_window_send_event(_self: *mut c_void, _cmd: Sel, event: *mut AnyObject) {
+    unsafe {
+        let window = _self as *mut AnyObject;
+        if !event.is_null() {
+            let event_type: usize = msg_send![event, type];
+            if event_type == NSEVENT_TYPE_LEFT_MOUSE_DOWN {
+                collapse_clear_confirmation_on_external_click(window, event);
+            }
+        }
+        type SendEvent = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
+        let mut sup = ObjcSuper {
+            receiver: window as *mut c_void,
+            super_class: class!(NSPanel) as *const _ as *mut c_void,
+        };
+        let send_event: SendEvent = std::mem::transmute(objc_msgSendSuper as *const ());
+        send_event(&mut sup, sel!(sendEvent:), event);
+    }
 }
 
 /// 主列表和详情共用同一个自定义指示器类;只通过目标滚动视图区分状态。
@@ -1803,43 +1941,471 @@ extern "C" fn detail_scroll_indicator_bounds_changed(
         update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
     }
 }
-/// "清除全部"按钮回调:清空剪贴板历史并关闭浮窗(空历史呼出会被忽略)。
-/// "Clear all" button callback: empty the clipboard history and close the picker (an empty
-/// history is ignored on summon).
-extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // 清除全部时保留置顶条目(置顶 = 用户主动保存的常用内容),被丢弃条目的
-    // 缓存文件一并删除——但仅当其 hash 不再被幸存的置顶条目引用(同 hash 的
-    // 文件/数据条目可能共存,共享缓存)。
-    // "Clear all" keeps the pinned entries (pinned = content the user deliberately saved);
-    // the dropped entries' cache files go too -- but only when the hash is no longer
-    // referenced by a surviving pinned entry (same-hash file/data entries may coexist and
-    // share the cache).
-    let mut hist = CLIP_HISTORY.lock().unwrap();
-    let kept = hist.iter().filter(|e| e.pinned).count();
-    let removed = hist.len().saturating_sub(kept);
-    for dropped in hist.iter().filter(|e| !e.pinned) {
-        let Some(img) = &dropped.image else {
-            continue;
-        };
-        if img.hash != 0 && !hash_referenced_by(hist.iter().filter(|e| e.pinned), img.hash) {
-            cache_delete_image(img.hash);
+fn cancel_clipboard_undo_timer() {
+    unsafe {
+        let target = observer();
+        let _: () = msg_send![
+            class!(NSObject),
+            cancelPreviousPerformRequestsWithTarget: target,
+            selector: sel!(expireClipboardUndo:),
+            object: std::ptr::null::<AnyObject>()
+        ];
+    }
+}
+
+fn discard_deleted_clipboard_entry() {
+    let pending = DELETED_CLIPBOARD_ENTRY.lock().unwrap().take();
+    let Some(pending) = pending else {
+        return;
+    };
+    let history = CLIP_HISTORY.lock().unwrap();
+    cache_delete_for_removed(&history, &pending.entry);
+}
+
+fn schedule_clipboard_undo_expiry() {
+    cancel_clipboard_undo_timer();
+    unsafe {
+        let target = observer();
+        let _: () = msg_send![
+            target,
+            performSelector: sel!(expireClipboardUndo:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: CLIPBOARD_UNDO_WINDOW.as_secs_f64()
+        ];
+    }
+}
+
+fn remember_deleted_clipboard_entry(entry: ClipEntry, original_index: usize) {
+    discard_deleted_clipboard_entry();
+    let generation = DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    *DELETED_CLIPBOARD_ENTRY.lock().unwrap() = Some(DeletedClipboardEntry {
+        entry,
+        original_index,
+        expires_at: Instant::now() + CLIPBOARD_UNDO_WINDOW,
+        generation,
+    });
+    schedule_clipboard_undo_expiry();
+}
+
+fn expire_deleted_clipboard_entry() {
+    let generation = DELETED_CLIPBOARD_GENERATION.load(Ordering::Acquire);
+    let expired = DELETED_CLIPBOARD_ENTRY
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|pending| {
+            pending.generation == generation
+                && clipboard_undo_expired(pending.expires_at, Instant::now())
+        });
+    if expired {
+        discard_deleted_clipboard_entry();
+        DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+extern "C" fn expire_clipboard_undo(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    expire_deleted_clipboard_entry();
+}
+
+fn undo_deleted_clipboard_entry() -> Option<ClipEntry> {
+    let pending = DELETED_CLIPBOARD_ENTRY.lock().unwrap().take()?;
+    cancel_clipboard_undo_timer();
+    if clipboard_undo_expired(pending.expires_at, Instant::now()) {
+        let history = CLIP_HISTORY.lock().unwrap();
+        cache_delete_for_removed(&history, &pending.entry);
+        return None;
+    }
+    let restored = pending.entry.clone();
+    let mut history = CLIP_HISTORY.lock().unwrap();
+    let (_, inserted) = restore_entry_at(&mut history, pending.entry, pending.original_index);
+    let max = max_entries();
+    if history.len() > max {
+        let dropped: Vec<ClipEntry> = history.drain(max..).collect();
+        for entry in &dropped {
+            cache_delete_for_removed(&history, entry);
         }
     }
-    hist.retain(|e| e.pinned);
-    if removed > 0 {
-        bump_history_revision();
+    let restored_h_idx = history
+        .iter()
+        .position(|entry| same_clip_entry_identity(entry, &restored));
+    let present = restored_h_idx.is_some();
+    if let Some(h_idx) = restored_h_idx {
+        let query = with_clipboard_ui(|ui| ui.search_query.clone());
+        let filter = *CLIP_FILTER.lock().unwrap();
+        let filtered = filtered_indices(&history, &query, filter);
+        if let Some(display_idx) = filtered.iter().position(|&idx| idx == h_idx) {
+            set_picker_selection(display_idx);
+        }
     }
-    log_info!(
-        "Clipboard history cleared by user ({} pinned entries kept).",
-        kept
+    drop(history);
+    DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
+    if inserted || present {
+        save_history();
+    }
+    present.then_some(restored)
+}
+
+fn picker_filters_y() -> f64 {
+    TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y
+}
+
+fn clear_history_confirmation_layout(anchor: NSRect) -> (NSRect, [NSRect; 3]) {
+    let surface = NSRect::new(
+        NSPoint::new(
+            anchor.origin.x + anchor.size.width - CLEAR_CONFIRM_CARD_W,
+            anchor.origin.y,
+        ),
+        NSSize::new(CLEAR_CONFIRM_CARD_W, CLEAR_CONFIRM_CARD_H),
     );
-    drop(hist);
+    let buttons = std::array::from_fn(|index| {
+        NSRect::new(
+            NSPoint::new(
+                (surface.size.width - CLEAR_CONFIRM_BUTTON_W) / 2.0,
+                CLEAR_CONFIRM_CARD_PAD_Y
+                    + index as f64 * (CLEAR_CONFIRM_BUTTON_H + CLEAR_CONFIRM_GAP),
+            ),
+            NSSize::new(CLEAR_CONFIRM_BUTTON_W, CLEAR_CONFIRM_BUTTON_H),
+        )
+    });
+    (surface, buttons)
+}
+
+unsafe fn clear_confirmation_reduce_motion() -> bool {
+    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+    !workspace.is_null()
+        && msg_send![workspace, respondsToSelector: sel!(accessibilityDisplayShouldReduceMotion)]
+        && msg_send![workspace, accessibilityDisplayShouldReduceMotion]
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn clear_confirmation_spring_value(
+    layer: *mut AnyObject,
+    key_path: &str,
+    from: *mut AnyObject,
+    to: *mut AnyObject,
+    duration: f64,
+    stiffness: f64,
+    damping: f64,
+    animation_key: &str,
+) {
+    let path = make_nsstring(key_path);
+    let animation: *mut AnyObject =
+        msg_send![class!(CASpringAnimation), animationWithKeyPath: path];
+    CFRelease(path as *const c_void);
+    let _: () = msg_send![animation, setFromValue: from];
+    let _: () = msg_send![animation, setToValue: to];
+    let _: () = msg_send![animation, setMass: 1.0f64];
+    let _: () = msg_send![animation, setStiffness: stiffness];
+    let _: () = msg_send![animation, setDamping: damping];
+    let _: () = msg_send![animation, setInitialVelocity: 0.0f64];
+    let _: () = msg_send![animation, setDuration: duration];
+    let key = make_nsstring(animation_key);
+    let _: () = msg_send![layer, addAnimation: animation, forKey: key];
+    CFRelease(key as *const c_void);
+}
+
+unsafe fn clear_confirmation_spring_frame(view: *mut AnyObject, target: NSRect) {
+    let layer: *mut AnyObject = msg_send![view, layer];
+    if layer.is_null() {
+        let _: () = msg_send![view, setFrame: target];
+        return;
+    }
+    let presentation: *mut AnyObject = msg_send![layer, presentationLayer];
+    let current = if presentation.is_null() {
+        layer
+    } else {
+        presentation
+    };
+    let from_bounds: NSRect = msg_send![current, bounds];
+    let from_position: NSPoint = msg_send![current, position];
+    let _: () = msg_send![class!(CATransaction), begin];
+    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+    let _: () = msg_send![view, setFrame: target];
+    let _: () = msg_send![class!(CATransaction), commit];
+    let to_bounds: NSRect = msg_send![layer, bounds];
+    let to_position: NSPoint = msg_send![layer, position];
+    for (path, from, to, key) in [
+        (
+            "bounds",
+            msg_send![class!(NSValue), valueWithRect: from_bounds],
+            msg_send![class!(NSValue), valueWithRect: to_bounds],
+            "clipboard-clear-shell-bounds",
+        ),
+        (
+            "position",
+            msg_send![class!(NSValue), valueWithPoint: from_position],
+            msg_send![class!(NSValue), valueWithPoint: to_position],
+            "clipboard-clear-shell-position",
+        ),
+    ] {
+        clear_confirmation_spring_value(
+            layer,
+            path,
+            from,
+            to,
+            CLEAR_CONFIRM_SHELL_DURATION,
+            160.0,
+            24.0,
+            key,
+        );
+    }
+}
+
+unsafe fn clear_confirmation_animate_opacity(view: *mut AnyObject, visible: bool) {
+    let layer: *mut AnyObject = msg_send![view, layer];
+    let target = if visible { 1.0 } else { 0.0 };
+    if layer.is_null() {
+        let _: () = msg_send![view, setAlphaValue: target];
+        return;
+    }
+    let presentation: *mut AnyObject = msg_send![layer, presentationLayer];
+    let from: f64 = if presentation.is_null() {
+        msg_send![view, alphaValue]
+    } else {
+        // CALayer opacity is a CGFloat-compatible Objective-C `float`, not an `f64` return.
+        // CALayer 的 opacity 返回类型是 Objective-C `float`，不能按 `f64` 接收。
+        let opacity: f32 = msg_send![presentation, opacity];
+        opacity as f64
+    };
+    let _: () = msg_send![class!(CATransaction), begin];
+    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+    let _: () = msg_send![view, setAlphaValue: target];
+    let _: () = msg_send![class!(CATransaction), commit];
+    let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from];
+    let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: target];
+    clear_confirmation_spring_value(
+        layer,
+        "opacity",
+        from_value,
+        to_value,
+        if visible {
+            CLEAR_CONFIRM_CONTENT_DURATION
+        } else {
+            0.16
+        },
+        if visible { 266.0 } else { 350.0 },
+        if visible { 30.0 } else { 36.0 },
+        "clipboard-clear-opacity",
+    );
+}
+
+unsafe fn clear_confirmation_animate_content_open(button: *mut AnyObject) {
+    clear_confirmation_animate_opacity(button, true);
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if layer.is_null() {
+        return;
+    }
+    // 与设置页一致,内容从轻微上移和缩小的状态弹入展开的外壳。
+    // Match the settings control's content entrance: a small upward offset and scale
+    // settle into the expanding shell.
+    for (path, from, to, key) in [
+        (
+            "transform.translation.y",
+            8.0,
+            0.0,
+            "clipboard-clear-content-y",
+        ),
+        (
+            "transform.scale",
+            0.98,
+            1.0,
+            "clipboard-clear-content-scale",
+        ),
+    ] {
+        let key_path = make_nsstring(path);
+        let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from];
+        let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: to];
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+        let _: () = msg_send![layer, setValue: to_value, forKeyPath: key_path];
+        let _: () = msg_send![class!(CATransaction), commit];
+        CFRelease(key_path as *const c_void);
+        clear_confirmation_spring_value(
+            layer,
+            path,
+            from_value,
+            to_value,
+            CLEAR_CONFIRM_CONTENT_DURATION,
+            266.0,
+            30.0,
+            key,
+        );
+    }
+}
+
+/// 设置清空确认卡片的展开状态;状态切换只操作已缓存的视图指针,不触发历史变更。
+/// Toggle the clear-history confirmation card; this only changes cached views and never
+/// mutates clipboard history.
+fn set_clear_history_confirmation_expanded(expanded: bool) {
+    if CLEAR_HISTORY_CONFIRMATION_EXPANDED.swap(expanded, Ordering::SeqCst) == expanded {
+        return;
+    }
+    let views = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap();
+    let clear_button = *CLEAR_HISTORY_BUTTON.lock().unwrap();
+    let Some(views) = views else {
+        return;
+    };
+
+    unsafe {
+        let parent: *mut AnyObject = msg_send![views.surface.0, superview];
+        let Some(clear) = clear_button else {
+            return;
+        };
+        let header: *mut AnyObject = msg_send![clear.0, superview];
+        let anchor: NSRect = msg_send![clear.0, frame];
+        let (expanded_in_header, _) = clear_history_confirmation_layout(anchor);
+        let expanded_frame: NSRect =
+            msg_send![header, convertRect: expanded_in_header, toView: parent];
+        let collapsed_frame: NSRect = msg_send![header, convertRect: anchor, toView: parent];
+        let animated = !clear_confirmation_reduce_motion();
+        let target = observer();
+        let _: () = msg_send![
+            class!(NSObject),
+            cancelPreviousPerformRequestsWithTarget: target,
+            selector: sel!(finishClearHistoryCollapse:),
+            object: std::ptr::null::<AnyObject>()
+        ];
+        if expanded {
+            // 卡片与 header 同级,超出 header 的下两行仍能被 AppKit 命中并收到 hover。
+            // Keep the card alongside the header so its lower rows remain hit-testable beyond
+            // the header's bounds. Bring the card above the scroll view when it opens.
+            let _: () = msg_send![
+                parent,
+                addSubview: views.surface.0,
+                positioned: 1isize,
+                relativeTo: std::ptr::null::<AnyObject>()
+            ];
+            let hidden: bool = msg_send![views.surface.0, isHidden];
+            if hidden {
+                let layer: *mut AnyObject = msg_send![views.surface.0, layer];
+                if !layer.is_null() {
+                    let _: () = msg_send![layer, removeAllAnimations];
+                }
+                let _: () = msg_send![class!(CATransaction), begin];
+                let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+                let _: () = msg_send![views.surface.0, setFrame: collapsed_frame];
+                let _: () = msg_send![class!(CATransaction), commit];
+            }
+            let _: () = msg_send![views.surface.0, setHidden: false];
+            let _: () = msg_send![clear.0, setHidden: true];
+        } else {
+            // 收起时让入口和筛选 tab 位于正在缩小的卡片上层,避免透明层吞掉点击。
+            // Keep the trigger and filters above the collapsing card so its fading shell
+            // cannot intercept the next click.
+            let _: () = msg_send![clear.0, setHidden: false];
+            let _: () = msg_send![
+                parent,
+                addSubview: header,
+                positioned: 1isize,
+                relativeTo: std::ptr::null::<AnyObject>()
+            ];
+        }
+        for button in [views.unpinned.0, views.all.0, views.cancel.0] {
+            let _: () = msg_send![button, setHidden: false];
+            if !animated {
+                let layer: *mut AnyObject = msg_send![button, layer];
+                if !layer.is_null() {
+                    let _: () = msg_send![layer, removeAllAnimations];
+                }
+                let _: () = msg_send![button, setAlphaValue: if expanded { 1.0 } else { 0.0 }];
+            } else if expanded {
+                clear_confirmation_animate_content_open(button);
+            } else {
+                clear_confirmation_animate_opacity(button, false);
+            }
+        }
+        if animated {
+            clear_confirmation_spring_frame(
+                views.surface.0,
+                if expanded {
+                    expanded_frame
+                } else {
+                    collapsed_frame
+                },
+            );
+        } else {
+            let _: () = msg_send![views.surface.0, setFrame: if expanded { expanded_frame } else { collapsed_frame }];
+        }
+        if expanded {
+            let _: () = msg_send![views.surface.0, setAlphaValue: 1.0f64];
+        } else if animated {
+            let _: () = msg_send![
+                target,
+                performSelector: sel!(finishClearHistoryCollapse:),
+                withObject: std::ptr::null::<AnyObject>(),
+                afterDelay: CLEAR_CONFIRM_SHELL_DURATION
+            ];
+        } else {
+            let _: () = msg_send![views.surface.0, setHidden: true];
+        }
+    }
+}
+
+fn clear_history_confirmation_expanded() -> bool {
+    CLEAR_HISTORY_CONFIRMATION_EXPANDED.load(Ordering::SeqCst)
+}
+
+extern "C" fn finish_clear_history_collapse(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    if clear_history_confirmation_expanded() {
+        return;
+    }
+    let views = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap();
+    let Some(views) = views else {
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![views.surface.0, setHidden: true];
+        for button in [views.unpinned.0, views.all.0, views.cancel.0] {
+            let _: () = msg_send![button, setHidden: true];
+        }
+    }
+}
+
+fn clear_clipboard_history_scope(clear_all: bool) {
+    discard_deleted_clipboard_entry();
+    cancel_clipboard_undo_timer();
+    DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
+    let mut history = CLIP_HISTORY.lock().unwrap();
+    let removed_entries = remove_history_scope(&mut history, clear_all);
+    let removed_hashes: HashSet<u64> = removed_entries
+        .iter()
+        .filter_map(|entry| entry.image.as_ref().map(|image| image.hash))
+        .filter(|hash| *hash != 0)
+        .collect();
+    for hash in removed_hashes {
+        cache_delete_for_hash(&history, hash);
+    }
+    let kept_count = history.len();
+    drop(history);
     save_history();
-    // 顺带清空搜索词与搜索框文本;浮窗保持打开并显示空态。
-    // Also clear the search query and the search field's text; the picker STAYS open
-    // showing the empty state.
     clear_search();
+    hide_detail();
     unsafe { rebuild_rows() };
+    log_info!(
+        "Clipboard history cleared by user (clear_all={}, kept_entries={})",
+        clear_all,
+        kept_count
+    );
+}
+
+/// 点击清空入口只展开确认卡片,不改变历史。
+/// Clicking the clear entry point only expands the confirmation card; history is untouched.
+extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    set_clear_history_confirmation_expanded(true);
+}
+
+extern "C" fn clear_clipboard_unpinned(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    set_clear_history_confirmation_expanded(false);
+    clear_clipboard_history_scope(false);
+}
+
+extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    set_clear_history_confirmation_expanded(false);
+    clear_clipboard_history_scope(true);
+}
+
+extern "C" fn clear_clipboard_cancel(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    set_clear_history_confirmation_expanded(false);
 }
 
 /// 清空搜索词 + 搜索框文本(不重建;调用方按需 rebuild)。
@@ -2824,6 +3390,7 @@ fn show_picker() {
 /// 隐藏浮窗。/ Hide the picker.
 fn hide_picker() {
     PICKER_VISIBLE.store(false, Ordering::SeqCst);
+    set_clear_history_confirmation_expanded(false);
     *SCROLL_DRAG.lock().unwrap() = None;
     // 隐藏时不会可靠地为每个子按钮派发 mouseExited;显式清掉行悬停状态。
     // Hiding does not reliably deliver mouseExited to every child button; clear the row hover
@@ -4614,6 +5181,7 @@ pub(crate) unsafe fn apply_theme() {
         apply_panel_appearance(window.0);
     }
     apply_glass_properties();
+    apply_clear_history_confirmation_theme();
 }
 
 unsafe fn ensure_picker_window() {
@@ -4647,6 +5215,13 @@ unsafe fn ensure_picker_window() {
             sel!(canBecomeKeyWindow),
             picker_window_can_become_key as *mut c_void,
             types_bool.as_ptr(),
+        );
+        let types_event = CString::new("v@:@").unwrap();
+        class_addMethod(
+            cls,
+            sel!(sendEvent:),
+            clipboard_window_send_event as *mut c_void,
+            types_event.as_ptr(),
         );
         objc_registerClassPair(cls);
         cls
@@ -4864,7 +5439,10 @@ unsafe fn ensure_picker_window() {
         indicator,
         initWithFrame: NSRect::new(
             NSPoint::new(w - SCROLL_INDICATOR_HIT_W - 3.0, 3.0),
-            NSSize::new(SCROLL_INDICATOR_HIT_W, h - header_strip_h() - FOOTER_H - 6.0)
+            NSSize::new(
+                SCROLL_INDICATOR_HIT_W,
+                h - header_strip_h() - FOOTER_H - 6.0,
+            )
         )
     ];
     // 透明命中区域比可见胶囊更宽;不要把背景设到父层,否则会把 10pt 全部画出来。
@@ -5132,7 +5710,7 @@ unsafe fn ensure_picker_window() {
     // The filters row (the mockup's .filters): bare 12pt text; the active one darkens and
     // gains a 16x2 underline.
     let filter_labels = localized_filter_labels();
-    let filters_y = TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y;
+    let filters_y = picker_filters_y();
     *FILTER_PILLS.lock().unwrap() = Vec::new();
     let mut fx = FILTERS_PAD_X;
     for (i, lab) in filter_labels.iter().enumerate() {
@@ -5153,13 +5731,14 @@ unsafe fn ensure_picker_window() {
     // margin), transparent, 10px / 28% black; hover turns red with a subtly rounded red fill.
     let clear_w = localized_string_width(&t("clipboard.clear_all"), 12.0) + 8.0;
     let clear_x = PICKER_W - SEARCH_PAD_X - clear_w;
+    let clear_frame = NSRect::new(
+        NSPoint::new(clear_x, filters_y + 8.0),
+        NSSize::new(clear_w, 20.0),
+    );
     let clear_btn: *mut AnyObject = msg_send![hover_button_class(), alloc];
     let clear_btn: *mut AnyObject = msg_send![
         clear_btn,
-        initWithFrame: NSRect::new(
-            NSPoint::new(clear_x, filters_y + 8.0),
-            NSSize::new(clear_w, 20.0)
-        )
+        initWithFrame: clear_frame
     ];
     let _: () = msg_send![clear_btn, setBordered: false];
     // 悬停底色绘制在 CALayer 上;设置小圆角以免矩形底色露出直角。
@@ -5181,6 +5760,7 @@ unsafe fn ensure_picker_window() {
     let _: () = msg_send![header_strip, addSubview: clear_btn];
     release_obj(clear_btn);
     *CLEAR_HISTORY_BUTTON.lock().unwrap() = Some(ObjPtr::new(clear_btn));
+    build_clear_history_confirmation(header_strip, clear_frame);
 
     // 底部栏(新设计稿 .footer):43pt,顶部分隔线 + 条目数 + 快捷键图例(清空已移到
     // 筛选行)。/ The footer: a top hairline + the entry count + the shortcut legends
@@ -6388,7 +6968,9 @@ extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void
         return;
     };
     let mut hist = CLIP_HISTORY.lock().unwrap();
-    delete_entry(&mut hist, h_idx);
+    let Some(removed_entry) = remove_entry_for_undo(&mut hist, h_idx) else {
+        return;
+    };
     // 被删行在选中行上方 → 选中下移一格(保持指向同一条);被删行即选中行或在其下方
     // → 不动(前者指向原下一条)。无选中哨兵(搜索框聚焦)不动。越界钳制统一交给
     // rebuild_rows 在 FILTERED 重算后处理——此前用 hist.len() 钳制显示索引:无搜索词
@@ -6406,6 +6988,7 @@ extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void
         set_picker_selection(previous - 1);
     }
     drop(hist);
+    remember_deleted_clipboard_entry(removed_entry, h_idx);
     let incremental = unsafe { try_delete_picker_row_incremental(idx as usize) };
     save_history();
     if !incremental {
@@ -6524,23 +7107,6 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
 /// 与计数,不记条目内容。
 /// The removal step of burn-after-paste: drop the entry from the history (the image cache
 /// file goes too) and persist; logs record only the kind and count, never the content.
-fn same_clip_entry_identity(a: &ClipEntry, b: &ClipEntry) -> bool {
-    match (&a.image, &b.image) {
-        (None, None) => a.text == b.text,
-        (Some(ai), Some(bi)) => {
-            if ai.source_path.is_some() != bi.source_path.is_some() {
-                return false;
-            }
-            if ai.hash != 0 && bi.hash != 0 {
-                ai.hash == bi.hash
-            } else {
-                ai.source_path == bi.source_path
-            }
-        }
-        _ => false,
-    }
-}
-
 fn delete_burned_entry(target: &ClipEntry) {
     let kind = {
         let mut hist = CLIP_HISTORY.lock().unwrap();
@@ -6659,6 +7225,16 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
         // When the field is already focused, the key goes to the field editor and never
         // reaches here -- a natural no-op.
         let mods: u64 = msg_send![event as *mut AnyObject, modifierFlags];
+        // Cmd+Z(键码 6)只由列表容器处理;搜索框的 field editor 会先接收它,保留文本撤销。
+        // Cmd+Z (keycode 6) is handled only by the list container; the search field's field
+        // editor receives it first, preserving native text-editing undo.
+        if is_clipboard_undo_shortcut(keycode, mods) {
+            if undo_deleted_clipboard_entry().is_some() {
+                rebuild_rows();
+                show_toast(&t("clipboard.toast_undo_delete"));
+            }
+            return;
+        }
         // Cmd+C(键码 8):详情打开时复制选中范围(无选中 = 复制全文)。键盘路径与
         // 详情底部的"复制所选"按钮等价——详情面板不会成为 key,系统 Cmd+C 路由
         // 到主浮窗,这里手动转发。搜索框聚焦时按键由字段编辑器消化,天然不冲突。
@@ -6808,7 +7384,9 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                     return;
                 };
                 let mut hist = CLIP_HISTORY.lock().unwrap();
-                delete_entry(&mut hist, h_idx);
+                let Some(removed_entry) = remove_entry_for_undo(&mut hist, h_idx) else {
+                    return;
+                };
                 // 删除的是选中行本身 → 选中保持原位(指向原下一条);删末条后越界则由
                 // rebuild_rows 在 FILTERED 重算后钳到新末条——此前用删除前的脏
                 // FILTERED 长度钳制,删末条后选中越界、无行命中高亮,高亮消失。
@@ -6818,6 +7396,7 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // clamped against the stale pre-delete FILTERED length, so the selection
                 // stayed past the new list, no row matched, and the highlight vanished.
                 drop(hist);
+                remember_deleted_clipboard_entry(removed_entry, h_idx);
                 let incremental = try_delete_picker_row_incremental(idx);
                 save_history();
                 if !incremental {
@@ -6829,6 +7408,10 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 hide_detail();
             }
             53 => {
+                if clear_history_confirmation_expanded() {
+                    set_clear_history_confirmation_expanded(false);
+                    return;
+                }
                 // Esc:详情打开时第一级 = 关闭详情(浮窗与搜索词保持不动)。
                 // Esc: with the detail open, the first press closes the detail (the picker
                 // and the query stay untouched).
@@ -7335,6 +7918,75 @@ unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject
 /// Apply the shared clipboard action-button state to its own rounded hover background.
 /// 详情是否展开只影响图标,不改变按钮底色。/ Detail activation changes only the icon,
 /// never the button background.
+fn is_clear_history_destructive_action(action: Sel) -> bool {
+    action == sel!(clearClipboardHistory:)
+        || action == sel!(clearClipboardUnpinned:)
+        || action == sel!(clearClipboardAll:)
+}
+
+fn confirmation_surface_background(palette: crate::theme::UiPalette) -> u32 {
+    // 使用主题卡片色,避免 field_bg 的中性灰在叠加后把确认卡片压得过暗。
+    // Use the theme card color so field_bg's darker neutral gray cannot make the confirmation
+    // surface look muddy after compositing.
+    let alpha = if palette.dark { 0xE0 } else { 0xEC };
+    (palette.card_bg & 0xFFFF_FF00) | alpha
+}
+
+fn clear_confirmation_destructive_colors(palette: crate::theme::UiPalette) -> (u32, u32) {
+    // 确认卡片使用较柔和的红色,避免大面积纯高饱和红色过于刺眼。
+    // Use softer confirmation reds so the large destructive surfaces are less harsh than the
+    // shared settings/action destructive color.
+    if palette.dark {
+        (0xD95A52FF, 0xB94A45FF)
+    } else {
+        (0xD95C55FF, 0xBC4C47FF)
+    }
+}
+
+unsafe fn is_clear_confirmation_button(button: *mut AnyObject) -> bool {
+    if button.is_null() {
+        return false;
+    }
+    let Some(confirmation) = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() else {
+        return false;
+    };
+    let parent: *mut AnyObject = msg_send![button, superview];
+    parent == confirmation.surface.0
+}
+
+unsafe fn set_clear_confirmation_button_style(button: *mut AnyObject, hovered: bool) {
+    if button.is_null() {
+        return;
+    }
+    let action: Sel = msg_send![button, action];
+    let destructive = is_clear_history_destructive_action(action);
+    let palette = clipboard_palette();
+    let (destructive_color, destructive_hover_color) =
+        clear_confirmation_destructive_colors(palette);
+    let background = if destructive {
+        if hovered {
+            destructive_hover_color
+        } else {
+            destructive_color
+        }
+    } else if hovered {
+        palette.hover_bg
+    } else {
+        palette.button_bg
+    };
+    let text = if destructive {
+        0xFFFF_FFFF
+    } else {
+        palette.primary_text
+    };
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if !layer.is_null() {
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
+    }
+    let _: () = msg_send![button, setContentTintColor: crate::ffi::hex_to_ns_color(text)];
+}
+
 unsafe fn set_action_button_surface(button: *mut AnyObject, hovered: bool) {
     if button.is_null() {
         return;
@@ -7347,7 +7999,7 @@ unsafe fn set_action_button_surface(button: *mut AnyObject, hovered: bool) {
     let action: Sel = msg_send![button, action];
     let background = if action == sel!(deleteEntry:) && hovered {
         (palette.destructive & 0xFFFF_FF00) | 0x18
-    } else if action == sel!(clearClipboardHistory:) && hovered {
+    } else if is_clear_history_destructive_action(action) && hovered {
         (palette.destructive_hover & 0xFFFF_FF00) | 0x18
     } else if hovered {
         palette.hover_bg
@@ -7455,6 +8107,10 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
+        if is_clear_confirmation_button(b) {
+            set_clear_confirmation_button_style(b, true);
+            return;
+        }
         if action == sel!(detailSaveAs:) {
             // HTML .icon-button:hover:68% 图标 + 5% 黑底。
             // HTML .icon-button:hover: 68% icon tint with a 5% black fill.
@@ -7468,7 +8124,7 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
             set_detail_action_style(b, active, true);
             return;
         }
-        if action == sel!(clearClipboardHistory:) {
+        if is_clear_history_destructive_action(action) {
             let palette = clipboard_palette();
             let c = crate::ffi::hex_to_ns_color(palette.destructive_hover);
             let _: () = msg_send![b, setContentTintColor: c];
@@ -7501,6 +8157,10 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_v
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
+        if is_clear_confirmation_button(b) {
+            set_clear_confirmation_button_style(b, false);
+            return;
+        }
         if (action == sel!(showItemDetails:)
             || action == sel!(deleteEntry:)
             || action == sel!(togglePin:))
@@ -7546,7 +8206,7 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_v
             return;
         }
         if action == sel!(deleteEntry:)
-            || action == sel!(clearClipboardHistory:)
+            || is_clear_history_destructive_action(action)
             || action == sel!(togglePin:)
         {
             set_action_button_surface(b, false);
@@ -7659,6 +8319,124 @@ unsafe fn make_filter_pill(label: &str, tag: isize, x: f64, y: f64, w: f64) -> *
     // 悬停变深(设计稿 .filter:hover)/ hover darkens (the mockup's .filter:hover).
     add_hover_tracking(b);
     b
+}
+
+/// 创建清空历史的确认卡片;与固定 header 同级,展开时覆盖列表。
+/// Build the clear-history confirmation card alongside the fixed header so its lower rows
+/// remain interactive while it overlays the list.
+unsafe fn build_clear_history_confirmation(header_strip: *mut AnyObject, anchor: NSRect) {
+    let (surface_in_header, button_frames) = clear_history_confirmation_layout(anchor);
+    let parent: *mut AnyObject = msg_send![header_strip, superview];
+    let surface_frame: NSRect =
+        msg_send![header_strip, convertRect: surface_in_header, toView: parent];
+    let surface: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let surface: *mut AnyObject = msg_send![
+        surface,
+        initWithFrame: surface_frame
+    ];
+    let _: () = msg_send![surface, setWantsLayer: true];
+    // 父视图高度随 picker 变化;卡片仍需贴着顶部清空入口。
+    // The picker parent resizes, so keep the card pinned to its top-aligned trigger.
+    let _: () = msg_send![surface, setAutoresizingMask: 8u64];
+    let layer: *mut AnyObject = msg_send![surface, layer];
+    let palette = clipboard_palette();
+    // 使用主题卡片底色,与主界面保持一致。
+    // Use the theme card surface to match the surrounding picker.
+    crate::ffi::layer_set_background(
+        layer,
+        crate::ffi::hex_to_cg_color(confirmation_surface_background(palette)),
+    );
+    crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
+    let _: () = msg_send![layer, setCornerRadius: 8.0f64];
+    let _: () = msg_send![layer, setMasksToBounds: true];
+    let _: () = msg_send![surface, setHidden: true];
+    let _: () = msg_send![surface, setAlphaValue: 0.0f64];
+    let _: () = msg_send![parent, addSubview: surface];
+
+    let labels = [
+        t("clipboard.clear_confirm_unpinned"),
+        t("clipboard.clear_confirm_all"),
+        t("clipboard.clear_confirm_cancel"),
+    ];
+    let actions = [
+        sel!(clearClipboardUnpinned:),
+        sel!(clearClipboardAll:),
+        sel!(clearClipboardCancel:),
+    ];
+    let (destructive_color, _) = clear_confirmation_destructive_colors(palette);
+    let mut buttons = [std::ptr::null_mut(); 3];
+    for i in 0..3 {
+        let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+        let button: *mut AnyObject = msg_send![
+            button,
+            initWithFrame: button_frames[i]
+        ];
+        let _: () = msg_send![button, setBordered: false];
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
+        let _: () = msg_send![button, setFont: font];
+        let title = make_nsstring(&labels[i]);
+        let _: () = msg_send![button, setTitle: title];
+        CFRelease(title as *const c_void);
+        let _: () = msg_send![button, setTarget: observer()];
+        let _: () = msg_send![button, setAction: actions[i]];
+        let _: () = msg_send![button, setWantsLayer: true];
+        let button_layer: *mut AnyObject = msg_send![button, layer];
+        if !button_layer.is_null() {
+            crate::ffi::layer_set_border(
+                button_layer,
+                crate::ffi::hex_to_cg_color(palette.card_border),
+            );
+            let _: () = msg_send![button_layer, setBorderWidth: 1.0f64];
+            let _: () = msg_send![button_layer, setCornerRadius: 8.0f64];
+            let _: () = msg_send![button_layer, setMasksToBounds: true];
+        }
+        let background = if i == 2 {
+            palette.button_bg
+        } else {
+            destructive_color
+        };
+        let text = if i == 2 {
+            palette.primary_text
+        } else {
+            0xFFFF_FFFF
+        };
+        if !button_layer.is_null() {
+            crate::ffi::layer_set_background(button_layer, crate::ffi::hex_to_cg_color(background));
+        }
+        let _: () = msg_send![button, setContentTintColor: crate::ffi::hex_to_ns_color(text)];
+        let _: () = msg_send![button, setHidden: true];
+        let _: () = msg_send![button, setAlphaValue: 0.0f64];
+        add_hover_tracking(button);
+        let _: () = msg_send![surface, addSubview: button];
+        release_obj(button);
+        buttons[i] = button;
+    }
+    release_obj(surface);
+    *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() = Some(ClearHistoryConfirmationViews {
+        surface: ObjPtr::new(surface),
+        unpinned: ObjPtr::new(buttons[0]),
+        all: ObjPtr::new(buttons[1]),
+        cancel: ObjPtr::new(buttons[2]),
+    });
+}
+
+unsafe fn apply_clear_history_confirmation_theme() {
+    let Some(confirmation) = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() else {
+        return;
+    };
+    let layer: *mut AnyObject = msg_send![confirmation.surface.0, layer];
+    if layer.is_null() {
+        return;
+    }
+    let palette = clipboard_palette();
+    crate::ffi::layer_set_background(
+        layer,
+        crate::ffi::hex_to_cg_color(confirmation_surface_background(palette)),
+    );
+    crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
+    for button in [confirmation.unpinned, confirmation.all, confirmation.cancel] {
+        set_clear_confirmation_button_style(button.0, false);
+    }
 }
 
 /// 刷新筛选样式:选中项 78% 黑 + 底部 16×2 下划线;未选中 38% 黑(设计稿 .filter)。
@@ -8134,6 +8912,20 @@ pub fn refresh_localized_ui() {
                     )
                 ];
             }
+            if let Some(confirmation) = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() {
+                for (button, label) in [
+                    (
+                        confirmation.unpinned.0,
+                        t("clipboard.clear_confirm_unpinned"),
+                    ),
+                    (confirmation.all.0, t("clipboard.clear_confirm_all")),
+                    (confirmation.cancel.0, t("clipboard.clear_confirm_cancel")),
+                ] {
+                    let title = make_nsstring(&label);
+                    let _: () = msg_send![button, setTitle: title];
+                    CFRelease(title as *const c_void);
+                }
+            }
         }
 
         // footer 的英文提示宽度与中文不同;整体替换以重走从右向左的图例布局。
@@ -8284,11 +9076,43 @@ unsafe fn row_target() -> *mut AnyObject {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_hover_row, estimated_entry_bytes, rect_contains_point, scroll_indicator_geometry,
-        ClipEntry, ImageEntry, NO_SELECTION, NSPASTEBOARD_TYPE_PNG,
-        SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE,
+        clear_history_confirmation_layout, effective_hover_row, estimated_entry_bytes,
+        header_strip_h, rect_contains_point, scroll_indicator_geometry, ClipEntry, ImageEntry,
+        NO_SELECTION, NSPASTEBOARD_TYPE_PNG, SCROLL_INDICATOR_CORNER_RESERVE,
+        SCROLL_INDICATOR_EDGE,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    #[test]
+    fn clear_confirmation_buttons_are_stacked_inside_the_expanded_header() {
+        let anchor = NSRect::new(NSPoint::new(420.0, 66.0), NSSize::new(60.0, 20.0));
+        let (surface, buttons) = clear_history_confirmation_layout(anchor);
+
+        assert_eq!(buttons[0].origin.x, buttons[1].origin.x);
+        assert_eq!(buttons[1].origin.x, buttons[2].origin.x);
+        assert_eq!(buttons[0].size.width, buttons[1].size.width);
+        assert_eq!(buttons[1].size.width, buttons[2].size.width);
+        assert!(buttons[0].origin.y < buttons[1].origin.y);
+        assert!(buttons[1].origin.y < buttons[2].origin.y);
+        assert_eq!(
+            buttons[1].origin.y - (buttons[0].origin.y + buttons[0].size.height),
+            super::CLEAR_CONFIRM_GAP
+        );
+        assert_eq!(
+            buttons[2].origin.y - (buttons[1].origin.y + buttons[1].size.height),
+            super::CLEAR_CONFIRM_GAP
+        );
+        for button in buttons {
+            assert!(button.origin.x >= 0.0);
+            assert!(button.origin.x + button.size.width <= surface.size.width);
+            assert!(button.origin.y + button.size.height <= surface.size.height);
+        }
+
+        let surface_bottom = surface.origin.y + surface.size.height;
+        assert!(surface.origin.x + surface.size.width <= anchor.origin.x + anchor.size.width);
+        assert!(surface.origin.y >= anchor.origin.y);
+        assert!(surface_bottom > header_strip_h());
+    }
 
     #[test]
     fn row_hover_hit_test_includes_edges_and_rejects_padding_outside() {
@@ -9224,6 +10048,89 @@ mod tests {
         assert!(same_clip_entry_identity(&target, &current));
         assert!(!same_clip_entry_identity(&target, &entry("different")));
         assert!(!same_clip_entry_identity(&target, &entry_image(b"secret")));
+    }
+
+    #[test]
+    fn explicit_delete_restore_preserves_metadata_and_original_position() {
+        use super::{remove_entry_for_undo, restore_entry_at};
+        let mut removed = entry_with_source("restore me", "Safari");
+        removed.pinned = true;
+        removed.source_key = "com.apple.Safari".to_string();
+        removed.copied_at = Some(1234);
+        let original = removed.clone();
+        let mut history = vec![removed, entry("other")];
+
+        let deleted = remove_entry_for_undo(&mut history, 0).expect("entry must be removed");
+        assert_eq!(deleted, original);
+        let (index, inserted) = restore_entry_at(&mut history, deleted, 0);
+        assert!(inserted);
+        assert_eq!(index, 0);
+        assert_eq!(history[0], original);
+    }
+
+    #[test]
+    fn undo_removal_keeps_image_cache_available_for_restore() {
+        use super::{cache_read_image, remove_entry_for_undo, restore_entry_at};
+        let image_entry = entry_image(b"undo-cache-bytes");
+        let hash = image_entry.image.as_ref().unwrap().hash;
+        let mut history = vec![image_entry.clone()];
+        let removed = remove_entry_for_undo(&mut history, 0).unwrap();
+        assert!(cache_read_image(hash).is_some());
+        let (_, inserted) = restore_entry_at(&mut history, removed, 0);
+        assert!(inserted);
+        assert_eq!(history, vec![image_entry]);
+        assert!(cache_read_image(hash).is_some());
+    }
+
+    #[test]
+    fn restore_respects_pinned_boundary_and_deduplicates() {
+        use super::{remove_entry_for_undo, restore_entry_at};
+        let mut pinned = entry("pinned");
+        pinned.pinned = true;
+        let mut history = vec![pinned.clone(), entry("newest")];
+        let unpinned = history.pop().unwrap();
+        let (index, inserted) = restore_entry_at(&mut history, unpinned.clone(), 0);
+        assert!(inserted);
+        assert_eq!(index, 1, "unpinned entries must stay below pinned entries");
+
+        let (duplicate_index, duplicate_inserted) = restore_entry_at(&mut history, unpinned, 0);
+        assert_eq!(duplicate_index, 1);
+        assert!(!duplicate_inserted);
+        assert_eq!(history.len(), 2);
+
+        let deleted = remove_entry_for_undo(&mut history, 0).unwrap();
+        let (pinned_index, pinned_inserted) = restore_entry_at(&mut history, deleted, 99);
+        assert!(pinned_inserted);
+        assert_eq!(pinned_index, 0);
+    }
+
+    #[test]
+    fn clear_scope_keeps_pinned_only_when_requested() {
+        use super::remove_history_scope;
+        let mut pinned = entry("keep");
+        pinned.pinned = true;
+        let mut history = vec![pinned, entry("drop")];
+        let removed = remove_history_scope(&mut history, false);
+        assert_eq!(texts(&history), vec!["keep"]);
+        assert_eq!(texts(&removed), vec!["drop"]);
+
+        let removed = remove_history_scope(&mut history, true);
+        assert!(history.is_empty());
+        assert_eq!(texts(&removed), vec!["keep"]);
+    }
+
+    #[test]
+    fn clipboard_undo_window_and_shortcut_are_strict() {
+        use super::{clipboard_undo_expired, is_clipboard_undo_shortcut};
+        let now = std::time::Instant::now();
+        assert!(!clipboard_undo_expired(
+            now + std::time::Duration::from_secs(1),
+            now
+        ));
+        assert!(clipboard_undo_expired(now, now));
+        assert!(is_clipboard_undo_shortcut(6, 0x0010_0000));
+        assert!(!is_clipboard_undo_shortcut(6, 0x0010_0000 | 0x0002_0000));
+        assert!(!is_clipboard_undo_shortcut(7, 0x0010_0000));
     }
 
     #[test]

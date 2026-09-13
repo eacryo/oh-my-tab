@@ -310,10 +310,12 @@ pub(super) fn request_detail_preview(img: &ImageEntry, deliver: bool) {
         }
     }
     let (detail_visible, selected_hash) = if deliver {
-        // 按需预览从主线程调用;在交给 worker 前快照 UI 时效条件。
-        // On-demand previews are requested from the main thread; snapshot UI freshness
-        // inputs before handing the job to the worker.
-        (detail_visible(), detail_current_hash())
+        // ensure_detail_preview 只在当前详情内容已确定为该图片时调用;此时面板的
+        // visible 标记可能尚未在 show_detail_for_sel 的末尾置真,不能把首开任务误丢。
+        // ensure_detail_preview is called only after the current detail content is known to
+        // be this image. The visible flag may not be set until show_detail_for_sel finishes,
+        // so do not discard the first-open job based on that not-yet-updated flag.
+        (true, Some(img.hash))
     } else {
         (false, None)
     };

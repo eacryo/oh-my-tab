@@ -542,6 +542,81 @@ pub(super) fn move_entry_to_front(history: &mut Vec<ClipEntry>, idx: usize) {
     history.insert(pos, e);
 }
 
+/// 判断两条历史记录是否代表同一个可恢复条目(忽略来源与时间等展示元数据)。
+/// Identify whether two history entries represent the same restorable item, ignoring
+/// presentation metadata such as source and timestamp.
+pub(super) fn same_clip_entry_identity(a: &ClipEntry, b: &ClipEntry) -> bool {
+    match (&a.image, &b.image) {
+        (None, None) => a.text == b.text,
+        (Some(ai), Some(bi)) => {
+            if ai.source_path.is_some() != bi.source_path.is_some() {
+                return false;
+            }
+            if ai.hash != 0 && bi.hash != 0 {
+                ai.hash == bi.hash
+            } else {
+                ai.source_path == bi.source_path
+            }
+        }
+        _ => false,
+    }
+}
+
+/// 从历史移除条目但暂不删除图片缓存,供短时撤销使用。
+/// Remove an entry without deleting its image cache, so a short-lived undo can restore it.
+pub(super) fn remove_entry_for_undo(history: &mut Vec<ClipEntry>, idx: usize) -> Option<ClipEntry> {
+    let removed = history.get(idx).cloned()?;
+    history.remove(idx);
+    super::bump_history_revision();
+    Some(removed)
+}
+
+/// 在遵守置顶区边界的前提下恢复条目;已存在同一条目时不重复插入。
+/// Restore an entry while respecting the pinned boundary; never insert a duplicate.
+pub(super) fn restore_entry_at(
+    history: &mut Vec<ClipEntry>,
+    entry: ClipEntry,
+    original_index: usize,
+) -> (usize, bool) {
+    if let Some(existing) = history
+        .iter()
+        .position(|item| same_clip_entry_identity(item, &entry))
+    {
+        return (existing, false);
+    }
+    let pinned_count = insert_position(history);
+    let pos = if entry.pinned {
+        original_index.min(pinned_count)
+    } else {
+        original_index.max(pinned_count).min(history.len())
+    };
+    history.insert(pos, entry);
+    super::bump_history_revision();
+    (pos, true)
+}
+
+/// 按用户确认的范围移除历史;返回被移除条目供缓存引用检查使用。
+/// Remove the confirmed history scope and return dropped entries for cache-reference checks.
+pub(super) fn remove_history_scope(
+    history: &mut Vec<ClipEntry>,
+    clear_all: bool,
+) -> Vec<ClipEntry> {
+    let mut removed = Vec::new();
+    let mut kept = Vec::with_capacity(history.len());
+    for entry in history.drain(..) {
+        if clear_all || !entry.pinned {
+            removed.push(entry);
+        } else {
+            kept.push(entry);
+        }
+    }
+    *history = kept;
+    if !removed.is_empty() {
+        super::bump_history_revision();
+    }
+    removed
+}
+
 /// 把新文本记入历史。规则:
 /// - 空文本忽略
 /// - 全表查重:文本已存在 → 把旧条目提到最前(保留置顶状态,见 move_entry_to_front),
@@ -770,10 +845,8 @@ pub(super) fn toggle_pin_on(history: &mut Vec<ClipEntry>, idx: usize) -> (bool, 
 /// 删除第 idx 条(越界忽略),图片条目的缓存文件一并删除。
 /// Delete entry `idx` (out of range is ignored); an image entry's cache file goes too.
 pub(super) fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
-    if idx < history.len() {
-        let removed = history.remove(idx);
+    if let Some(removed) = remove_entry_for_undo(history, idx) {
         cache_delete_for_removed(history, &removed);
-        super::bump_history_revision();
     }
 }
 
