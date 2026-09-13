@@ -70,6 +70,7 @@ pub(super) fn poll_clipboard() {
         log_debug!("[clip] change skipped: our own paste write-back (move_used_to_top off)");
         return;
     }
+    let mut history_changed = false;
     match unsafe { read_pasteboard_text() } {
         Some(text) => {
             // 来源 = 复制瞬间的前台应用(始终记录;显示与否由 CONFIG 的
@@ -113,6 +114,7 @@ pub(super) fn poll_clipboard() {
             };
             if let Some(img) = &file_img {
                 if record_image(&mut hist, img, &source, &source_key, max_entries()) {
+                    history_changed = true;
                     // 文件复制只记录类型和计数,不记录来源路径或文件内容。
                     // File copies log only their type and count, never the source path or content.
                     log_debug!(
@@ -132,6 +134,7 @@ pub(super) fn poll_clipboard() {
                     text.chars().count()
                 );
             } else if record_text(&mut hist, &text, &source, &source_key, max_entries()) {
+                history_changed = true;
                 log_debug!(
                     "[clip] recorded text ({} chars, total {})",
                     text.chars().count(),
@@ -147,7 +150,7 @@ pub(super) fn poll_clipboard() {
             // 记录后顺手清理过期条目(懒清理,无额外定时器;呼出时还会再清一次)。
             // Expire right after recording (lazy, no extra timer; the picker summon
             // cleans again).
-            expire_entries(&mut hist, now_secs(), ttl_secs());
+            history_changed |= expire_entries(&mut hist, now_secs(), ttl_secs()) > 0;
         }
         // 无文本 → 尝试图片(图文同存时文本优先,第一版取舍)。
         // No text -> try an image (text wins when both are present; a v1 tradeoff).
@@ -164,6 +167,7 @@ pub(super) fn poll_clipboard() {
                 };
                 let mut hist = CLIP_HISTORY.lock().unwrap();
                 if record_image(&mut hist, &img, &source, &source_key, max_entries()) {
+                    history_changed = true;
                     log_debug!(
                         "[clip] recorded image (hash={:016x}, uti={}, total {})",
                         img.hash,
@@ -184,7 +188,7 @@ pub(super) fn poll_clipboard() {
                 }
                 // 记录后顺手清理过期条目(与文本分支一致)。
                 // Expire right after recording (same as the text branch).
-                expire_entries(&mut hist, now_secs(), ttl_secs());
+                history_changed |= expire_entries(&mut hist, now_secs(), ttl_secs()) > 0;
             }
             None => log_debug!("[clip] change but no text/image (non-pasteboard content?)"),
         },
@@ -192,6 +196,9 @@ pub(super) fn poll_clipboard() {
     // 历史有变更(记录/去重移前/裁剪)→ persist 开启时落盘。
     // The history changed (record/dedup-move/trim) -> persist when enabled.
     save_history();
+    if history_changed {
+        schedule_picker_refresh();
+    }
 }
 
 /// timer tick 回调(主线程):继续轮询。
@@ -251,6 +258,19 @@ pub(crate) fn start() {
         // 再记录当前剪贴板,否则首次呼出历史为空。
         // Then record the current pasteboard, or the first summon would show an empty list.
         poll_clipboard();
+        // 按 Maccy 的做法在后台完成长驻面板和初始行树;快捷键只负责显示已经准备好的内容。
+        // Following Maccy's model, warm the long-lived panel and initial row tree while hidden;
+        // the shortcut only presents content that is already ready.
+        PICKER_REFRESH_PENDING.store(false, Ordering::SeqCst);
+        ensure_picker_window();
+        rebuild_rows();
+        // 启动阶段面板保持隐藏,先完成一次 backing-store 绘制,避免首次呼出时由
+        // orderFrontRegardless 同步承担整棵列表和玻璃背景的首次渲染。
+        // The panel remains hidden during startup; draw it once into its backing store so the
+        // first summon does not make orderFrontRegardless pay for the entire list and glass.
+        if let Some(window) = *PICKER_WINDOW.lock().unwrap() {
+            let _: () = msg_send![window.0, displayIfNeeded];
+        }
         // 注册剪贴板变化通知:每次变化即时记录,轮询间隔内的快速连续复制不丢失。
         // Register the pasteboard-change notification: instant recording on every change, so
         // rapid consecutive copies between polling samples are not lost.

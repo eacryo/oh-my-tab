@@ -67,7 +67,7 @@ use crate::event_tap::{
 };
 use crate::ffi::{
     class_addMethod, localtime_r, make_nsstring, nsstring_to_rust, objc_allocateClassPair,
-    objc_msgSendSuper, objc_registerClassPair, release_obj, CFRelease, CallbackTarget,
+    objc_msgSendSuper, objc_registerClassPair, release_obj, CFRelease, CFRetain, CallbackTarget,
     MainThreadSlot, ObjPtr, ObjcSuper, StaticClass, Tm,
 };
 use crate::hash::fnv1a64;
@@ -79,10 +79,12 @@ use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::Instant;
 
 mod image_cache;
 mod model;
@@ -453,6 +455,12 @@ static POLL_TIMER: OnceLock<MainThreadSlot<ObjPtr>> = OnceLock::new();
 /// 浮窗是否可见 / whether the picker is visible.
 static PICKER_VISIBLE: AtomicBool = AtomicBool::new(false);
 
+/// 剪贴板历史刷新是否已排队 / whether a clipboard-history UI refresh is already queued.
+static PICKER_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 可视行槽位刷新是否已排队 / whether a virtual-row viewport refresh is already queued.
+static PICKER_VISIBLE_ROWS_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// 当前选中行索引 / the currently selected row index.
 /// 无选中行的哨兵值:焦点在搜索框时使用(↑ 从列表顶跳入搜索框 / 点击搜索框),
 /// 此时列表不该有高光;↓ 回列表时 search_field_do_command 重置为 0。
@@ -469,6 +477,88 @@ struct ClipboardUiState {
     search_query: String,
     filtered: Vec<usize>,
     detail_visible: bool,
+    rendered_rows: Option<PickerRowsKey>,
+    last_rebuild_timing: Option<PickerTimingSummary>,
+}
+
+const CLIPBOARD_SLOW_PATH_MS: u128 = 100;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PickerTimingSummary {
+    elapsed_ms: u128,
+    history_len: usize,
+    filtered_len: usize,
+    image_rows: usize,
+    code_rows: usize,
+    remove_old_ms: u128,
+    prepare_ms: u128,
+    build_rows_ms: u128,
+    image_ms: u128,
+    content_attributed_ms: u128,
+    meta_ms: u128,
+    finalize_ms: u128,
+    slowest_row_ms: u128,
+    slowest_row_index: Option<usize>,
+    empty: bool,
+}
+
+/// 当前行视图对应的输入快照;快照不变时再次呼出只需显示已有 AppKit 视图。
+/// Snapshot of the inputs represented by the current row views; an unchanged snapshot lets a
+/// subsequent summon show the existing AppKit views without rebuilding them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PickerRowsKey {
+    history_signature: u64,
+    filter: ClipFilter,
+    query: String,
+    show_source: bool,
+    minute_bucket: u64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ContentAttributedKey {
+    content: String,
+    kind: u8,
+    primary_text: u32,
+    secondary_text: u32,
+    accent: u32,
+}
+
+static CONTENT_ATTRIBUTED_CACHE: LazyLock<MainThreadSlot<HashMap<ContentAttributedKey, ObjPtr>>> =
+    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+
+fn picker_rows_key(
+    history: &[ClipEntry],
+    query: &str,
+    filter: ClipFilter,
+    show_source: bool,
+) -> PickerRowsKey {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    history.len().hash(&mut hasher);
+    for entry in history {
+        entry.text.hash(&mut hasher);
+        entry.pinned.hash(&mut hasher);
+        entry.source_app.hash(&mut hasher);
+        entry.source_key.hash(&mut hasher);
+        entry.copied_at.hash(&mut hasher);
+        match &entry.image {
+            None => 0u8.hash(&mut hasher),
+            Some(image) => {
+                1u8.hash(&mut hasher);
+                image.uti.hash(&mut hasher);
+                image.hash.hash(&mut hasher);
+                image.data_path.hash(&mut hasher);
+                image.preview_png.hash(&mut hasher);
+                image.source_path.hash(&mut hasher);
+            }
+        }
+    }
+    PickerRowsKey {
+        history_signature: hasher.finish(),
+        filter,
+        query: query.to_string(),
+        show_source,
+        minute_bucket: now_secs() / 60,
+    }
 }
 
 thread_local! {
@@ -477,6 +567,8 @@ thread_local! {
         search_query: String::new(),
         filtered: Vec::new(),
         detail_visible: false,
+        rendered_rows: None,
+        last_rebuild_timing: None,
     }) };
 }
 
@@ -517,19 +609,25 @@ fn take_detail_visible() -> bool {
 /// when nothing is hovered. Maintained by mouseEntered/mouseExited.
 static HOVER_ROW: Mutex<usize> = Mutex::new(NO_SELECTION);
 
-/// 每行的增量视觉视图(底块、选中标记 + 3 个操作按钮),按显示行索引。
-/// 悬停和方向键选中只刷新受影响的行,不再全量重建列表。
-/// Per-row incremental visual views (tile, selection bar + 3 action buttons), indexed by
-/// display row. Hover and arrow-key selection update only affected rows instead of rebuilding
-/// the whole list.
+/// 已物化行的增量视觉视图(底块、选中标记 + 3 个操作按钮);索引由 ROW_VIEW_INDICES 映射。
+/// Incremental visual views for materialized rows (tile, selection bar + 3 action buttons);
+/// ROW_VIEW_INDICES maps them back to the full display list.
+#[derive(Clone, Copy)]
 struct RowHoverViews {
+    group_label: Option<ObjPtr>,
     tile: ObjPtr,
     bar: ObjPtr,
+    content: ObjPtr,
+    meta: ObjPtr,
     pin: ObjPtr,
     details: ObjPtr,
     del: ObjPtr,
 }
 static ROW_HOVER_VIEWS: MainThreadSlot<Vec<RowHoverViews>> = MainThreadSlot::new(Vec::new());
+
+/// 已物化行视图对应的完整过滤列表索引;视口外的行没有 AppKit 子视图。
+/// Display indices for materialized row views; rows outside the viewport have no AppKit views.
+static ROW_VIEW_INDICES: MainThreadSlot<Vec<usize>> = MainThreadSlot::new(Vec::new());
 
 /// 浮窗窗口 / the picker window.
 static PICKER_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -552,6 +650,28 @@ static ROW_BUTTONS: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new()
 /// Per-row background tiles (one per entry, same order as ROW_BUTTONS; skipped for the
 /// selected row).
 static ROW_TILES: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
+
+/// 剪贴板行内来源图标的进程级缓存;避免每次重建都从磁盘重新解码同一张小图。
+/// Process-lifetime cache for clipboard source icons; avoids decoding the same small icon from
+/// disk again on every row rebuild.
+struct CachedSourceIcon {
+    image: ObjPtr,
+    modified: Option<std::time::SystemTime>,
+}
+
+static SOURCE_ICON_CACHE: LazyLock<MainThreadSlot<HashMap<(String, u64), CachedSourceIcon>>> =
+    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct RowImageKey {
+    image_hash: u64,
+    preview_hash: u64,
+    field_bg: u32,
+    card_border: u32,
+}
+
+static ROW_IMAGE_CACHE: LazyLock<MainThreadSlot<HashMap<RowImageKey, ObjPtr>>> =
+    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
 
 /// 每行的实际行距(按钮高 + 间距,随换行行数变化)/ per-row pitch (button height + gap,
 /// varies with the wrapped line count).
@@ -879,6 +999,18 @@ unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(refreshPickerRows:),
+                picker_refresh_rows as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(refreshPickerVisibleRows:),
+                picker_refresh_visible_rows as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(searchFieldChanged:),
                 search_field_changed as *mut c_void,
                 types.as_ptr(),
@@ -935,6 +1067,96 @@ unsafe fn observer() -> *mut AnyObject {
             CallbackTarget::new(obj)
         })
         .0
+}
+
+/// 在主线程维护长驻的列表视图;剪贴板监听线程只排队一次刷新。
+/// Keep the long-lived row view tree current on the main thread; the pasteboard observer only
+/// queues one coalesced refresh.
+extern "C" fn picker_refresh_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    PICKER_REFRESH_PENDING.store(false, Ordering::SeqCst);
+    if PICKER_WINDOW.lock().unwrap().is_none() {
+        return;
+    }
+    // 面板隐藏时只保留模型变化;延迟到下一次显示前统一刷新,避免剪贴板监听占用主线程
+    // 并拖慢应用切换浮窗。
+    // While hidden, keep only the model change and refresh before the next presentation so the
+    // pasteboard observer cannot occupy the main thread and slow the app switcher.
+    if !PICKER_VISIBLE.load(Ordering::SeqCst) {
+        with_clipboard_ui(|ui| ui.rendered_rows = None);
+        return;
+    }
+
+    let filter = *CLIP_FILTER.lock().unwrap();
+    let show_source = show_source_app();
+    let query = with_clipboard_ui(|ui| ui.search_query.clone());
+    let rows_current = {
+        let history = CLIP_HISTORY.lock().unwrap();
+        let key = picker_rows_key(&history, &query, filter, show_source);
+        with_clipboard_ui(|ui| {
+            ui.rendered_rows
+                .as_ref()
+                .is_some_and(|current| current == &key)
+        })
+    };
+    if rows_current {
+        return;
+    }
+
+    unsafe {
+        rebuild_rows();
+    }
+}
+
+/// 在滚动事件批次结束后补齐可视行,避免每个 bounds-change 都同步拆建整组控件。
+/// Materialize the new viewport after a scroll-event burst instead of tearing down and
+/// rebuilding the whole physical row set for every bounds-change callback.
+extern "C" fn picker_refresh_visible_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    PICKER_VISIBLE_ROWS_REFRESH_PENDING.store(false, Ordering::SeqCst);
+    if !PICKER_VISIBLE.load(Ordering::SeqCst) || REBUILDING.load(Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        if picker_materialized_range_changed() {
+            rebuild_rows();
+        }
+    }
+}
+
+/// 合并连续滚动通知,给 AppKit 一个短暂的 run-loop 窗口完成滚动绘制。
+/// Coalesce consecutive scroll notifications, giving AppKit a short run-loop window to finish
+/// scrolling before the visible row set is rebuilt.
+unsafe fn schedule_picker_visible_rows_refresh() {
+    if PICKER_VISIBLE_ROWS_REFRESH_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let target = observer();
+    let _: () = msg_send![
+        target,
+        performSelector: sel!(refreshPickerVisibleRows:),
+        withObject: std::ptr::null::<AnyObject>(),
+        afterDelay: 0.05f64
+    ];
+}
+
+/// 浮窗可见时把历史变化投递到主线程;隐藏时延迟到下一次呼出前刷新。
+/// Deliver history changes to the main thread while the picker is visible; while hidden, defer
+/// the refresh until the next summon.
+fn schedule_picker_refresh() {
+    if PICKER_WINDOW.lock().unwrap().is_none()
+        || !PICKER_VISIBLE.load(Ordering::SeqCst)
+        || PICKER_REFRESH_PENDING.swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    unsafe {
+        let target = observer();
+        let _: () = msg_send![
+            target,
+            performSelectorOnMainThread: sel!(refreshPickerRows:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
 }
 
 /// 剪贴板变化通知回调(任意线程):即时记录当前文本。
@@ -1364,7 +1586,94 @@ extern "C" fn scroll_indicator_mouse_up(_self: *mut c_void, _cmd: Sel, _event: *
 /// scroll would leave the detail misaligned with its row).
 extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
     update_scroll_indicator();
+    if !REBUILDING.load(Ordering::SeqCst) && PICKER_VISIBLE.load(Ordering::SeqCst) {
+        unsafe {
+            if picker_materialized_range_changed() {
+                schedule_picker_visible_rows_refresh();
+            }
+        }
+    }
     reposition_detail();
+}
+
+/// 判断一行是否与可视区(含 overscan)相交。
+/// Check whether a row intersects the viewport, including overscan.
+fn picker_row_is_drawable(row: NSRect, viewport: NSRect, overscan: f64) -> bool {
+    row.origin.y + row.size.height >= viewport.origin.y - overscan
+        && row.origin.y <= viewport.origin.y + viewport.size.height + overscan
+}
+
+/// 根据完整行高计算需要物化的显示索引范围,保留少量上下缓冲以避免滚动边界闪烁。
+/// Compute the materialized display-index range from all row heights, retaining a small
+/// overscan on both sides to avoid flashing at scroll boundaries.
+fn picker_visible_range(pitches: &[f64], viewport: NSRect, overscan: f64) -> (usize, usize) {
+    if pitches.is_empty() || viewport.size.height <= 0.0 {
+        return (0, 0);
+    }
+    let mut start = None;
+    let mut end = 0;
+    for (index, &height) in pitches.iter().enumerate() {
+        let row = NSRect::new(
+            NSPoint::new(0.0, row_top(index, pitches)),
+            NSSize::new(PICKER_W, height),
+        );
+        if picker_row_is_drawable(row, viewport, overscan) {
+            start.get_or_insert(index);
+            end = index + 1;
+        }
+    }
+    match start {
+        Some(start) => (start, end),
+        None => (0, pitches.len().min(1)),
+    }
+}
+
+/// 取当前列表视口;布局尚未完成时只预热顶部少量行,避免首开一次性创建整表。
+/// Read the current list viewport; before layout completes, warm only a small top slice so
+/// the first presentation never creates the entire list synchronously.
+unsafe fn picker_visible_row_range(pitches: &[f64], row_count: usize) -> (usize, usize) {
+    if row_count == 0 {
+        return (0, 0);
+    }
+    let fallback_end = row_count.min(12);
+    let Some(container) = *PICKER_CONTAINER.lock().unwrap() else {
+        return (0, fallback_end);
+    };
+    let Some(scroll) = *SCROLL_VIEW.lock().unwrap() else {
+        return (0, fallback_end);
+    };
+    let clip: *mut AnyObject = msg_send![scroll.0, contentView];
+    if clip.is_null() {
+        return (0, fallback_end);
+    }
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    let visible_rect: NSRect = msg_send![
+        container.0,
+        convertRect: clip_bounds,
+        fromView: clip
+    ];
+    if visible_rect.size.width <= 0.0 || visible_rect.size.height <= 0.0 {
+        return (0, fallback_end);
+    }
+    picker_visible_range(pitches, visible_rect, ROW_H * 1.5)
+}
+
+/// 判断当前物理行槽位是否覆盖视口所需范围。
+/// Check whether the current physical row slots cover the range needed by the viewport.
+unsafe fn picker_materialized_range_changed() -> bool {
+    let pitches = ROW_PITCHES.lock().unwrap().clone();
+    let filtered_len = with_clipboard_ui(|ui| ui.filtered.len());
+    let (start, end) = picker_visible_row_range(&pitches, filtered_len);
+    let indices = ROW_VIEW_INDICES.lock().unwrap();
+    !indices.iter().copied().eq(start..end)
+}
+
+fn row_view_for_display_index(index: usize) -> Option<RowHoverViews> {
+    let indices = ROW_VIEW_INDICES.lock().unwrap();
+    let slot = indices
+        .iter()
+        .position(|&display_index| display_index == index)?;
+    ROW_HOVER_VIEWS.lock().unwrap().get(slot).copied()
 }
 
 /// 返回详情 NSClipView 的实时合法纵向范围。NSTextView 的 textContainerInset 会让
@@ -2194,6 +2503,7 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
 /// Show the picker (built once, reused; the window height follows the visible row count).
 fn show_picker() {
     unsafe {
+        let show_started = Instant::now();
         // 每次重新呼出都从无悬停开始;旧行已被移除,不能让旧索引污染新列表。
         // Start each summon without a hovered row; the old rows are gone, so their index must
         // never leak into the rebuilt list.
@@ -2209,7 +2519,9 @@ fn show_picker() {
                 log_debug!("[clip] show picker: expired {} entries", removed);
             }
         }
+        let ensure_started = Instant::now();
         ensure_picker_window();
+        let ensure_window_ms = ensure_started.elapsed().as_millis();
         // 每次呼出重置搜索(干净起点);上次遗留的详情浮窗一并收起。
         // Reset the search on every summon (a clean slate); a stale detail panel goes too.
         hide_detail();
@@ -2218,9 +2530,23 @@ fn show_picker() {
             Some(w) => w.0,
             None => return,
         };
+        let filter = *CLIP_FILTER.lock().unwrap();
+        let show_source = show_source_app();
+        let render_key_started = Instant::now();
+        let render_key = {
+            let hist = CLIP_HISTORY.lock().unwrap();
+            picker_rows_key(&hist, "", filter, show_source)
+        };
+        let render_key_ms = render_key_started.elapsed().as_millis();
+        let rows_ready = with_clipboard_ui(|ui| {
+            ui.rendered_rows
+                .as_ref()
+                .is_some_and(|key| key == &render_key)
+        });
         let hist_len = CLIP_HISTORY.lock().unwrap().len();
         log_debug!("[clip] show picker: history={} entries", hist_len);
 
+        let frame_started = Instant::now();
         // 窗口高度 = 上下留白 + 可视行的行距之和(行距由各条文本的换行行数决定)。
         // Window height = paddings + the sum of the visible rows' pitches (each pitch follows
         // the entry's wrapped line count).
@@ -2310,27 +2636,124 @@ fn show_picker() {
             center_on_main
         );
         let _: () = msg_send![window, setFrame: frame, display: true];
+        let frame_ms = frame_started.elapsed().as_millis();
 
-        rebuild_rows();
+        let render_summary = if rows_ready {
+            log_debug!("[clip] picker rows reused");
+            let cached = with_clipboard_ui(|ui| ui.last_rebuild_timing);
+            cached.map(|cached| PickerTimingSummary {
+                // 复用行在本次呼出中没有重建;只保留当前缓存视图的数量,不复用上次重建的耗时。
+                // Reused rows were not rebuilt during this summon; retain only the counts of
+                // the currently cached view, not the previous rebuild's timing measurements.
+                elapsed_ms: 0,
+                history_len: cached.history_len,
+                filtered_len: cached.filtered_len,
+                image_rows: cached.image_rows,
+                code_rows: cached.code_rows,
+                empty: cached.empty,
+                ..PickerTimingSummary::default()
+            })
+        } else {
+            // 数据模型可能刚刚在后台监听线程更新;在显示前补齐长驻行树,避免先露出
+            // 旧列表或空白列表。行树已经在启动和每次历史变化后预热,这里只是竞态兜底。
+            // The model may have just changed on the pasteboard-monitor path; finish the
+            // long-lived row tree before showing it, so stale or empty rows never flash.
+            // The tree is warmed at startup and after every history change; this is only a
+            // race fallback.
+            rebuild_rows()
+        };
         // 每次呼出滚动到顶部(最新条目)。
         // Scroll to the top on every summon (the newest entry).
+        let display_prep_started = Instant::now();
         if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
             let _: () = msg_send![c.0, scrollPoint: NSPoint::new(0.0, 0.0)];
+        }
+        // 隐藏期间可能保留了底部视口的物理槽位;回到顶部后补齐顶部可视行。
+        // Hidden refreshes may leave physical slots for the old bottom viewport; materialize
+        // the top viewport after resetting the scroll position.
+        if picker_materialized_range_changed() {
+            rebuild_rows();
         }
         // 首次呼出即更新滚动指示器(内容溢出时右侧立即显示,不必等滚动触发)。
         // Update the scroll indicator right on the first summon (shown immediately when the
         // content overflows, not only after scrolling).
         update_scroll_indicator();
+        // 启动时和隐藏期间的行树可能尚未进入 backing store;先在不可见状态完成绘制,避免
+        // orderFrontRegardless 在首次展示时同步承担整棵玻璃视图的绘制成本。
+        // The row tree may not yet be in the backing store after startup or a hidden refresh;
+        // draw it before ordering front so the first presentation does not pay that cost.
+        let _: () = msg_send![window, displayIfNeeded];
+        let display_prep_ms = display_prep_started.elapsed().as_millis();
+        let order_front_started = Instant::now();
+        let order_front_call_started = Instant::now();
         let _: () = msg_send![window, orderFrontRegardless];
+        let order_front_call_ms = order_front_call_started.elapsed().as_millis();
+        let make_key_window_started = Instant::now();
         let _: () = msg_send![window, makeKeyWindow];
+        let make_key_window_ms = make_key_window_started.elapsed().as_millis();
         // 键盘焦点给容器(方向键/Enter/Esc)。
         // Keyboard focus to the container (arrows / Enter / Esc).
-        if let Some(c) = *PICKER_CONTAINER.lock().unwrap() {
+        let first_responder_lock_started = Instant::now();
+        let container = *PICKER_CONTAINER.lock().unwrap();
+        let first_responder_lock_ms = first_responder_lock_started.elapsed().as_millis();
+        let mut make_first_responder_ms = 0;
+        if let Some(c) = container {
             // makeFirstResponder: 返回 BOOL('B')。
             // makeFirstResponder: returns BOOL ('B').
+            let make_first_responder_started = Instant::now();
             let _: bool = msg_send![window, makeFirstResponder: c.0];
+            make_first_responder_ms = make_first_responder_started.elapsed().as_millis();
         }
+        let visible_store_started = Instant::now();
         PICKER_VISIBLE.store(true, Ordering::SeqCst);
+        let visible_store_ms = visible_store_started.elapsed().as_millis();
+        let order_front_ms = order_front_started.elapsed().as_millis();
+        let order_front_residual_ms = order_front_ms.saturating_sub(
+            order_front_call_ms
+                + make_key_window_ms
+                + first_responder_lock_ms
+                + make_first_responder_ms
+                + visible_store_ms,
+        );
+
+        let elapsed_ms = show_started.elapsed().as_millis();
+        if elapsed_ms >= CLIPBOARD_SLOW_PATH_MS {
+            let filtered_len = with_clipboard_ui(|ui| ui.filtered.len());
+            let summary = render_summary.unwrap_or(PickerTimingSummary {
+                history_len: hist_len,
+                filtered_len,
+                empty: filtered_len == 0,
+                ..PickerTimingSummary::default()
+            });
+            let slowest_row_index = summary
+                .slowest_row_index
+                .map_or_else(|| "none".to_owned(), |index| index.to_string());
+            log_debug!(
+                "[clip] picker_show_slow elapsed_ms={} ensure_window_ms={} render_key_ms={} frame_ms={} rebuild_rows_ms={} display_prep_ms={} order_front_ms={} order_front_call_ms={} make_key_window_ms={} first_responder_lock_ms={} make_first_responder_ms={} visible_store_ms={} order_front_residual_ms={} history_len={} filtered_len={} image_rows={} code_rows={} counts_scope={} reused={} empty={} slowest_row_ms={} slowest_row_index={}",
+                elapsed_ms,
+                ensure_window_ms,
+                render_key_ms,
+                frame_ms,
+                summary.elapsed_ms,
+                display_prep_ms,
+                order_front_ms,
+                order_front_call_ms,
+                make_key_window_ms,
+                first_responder_lock_ms,
+                make_first_responder_ms,
+                visible_store_ms,
+                order_front_residual_ms,
+                summary.history_len,
+                summary.filtered_len,
+                summary.image_rows,
+                summary.code_rows,
+                if rows_ready { "cached_view" } else { "rebuilt_view" },
+                rows_ready,
+                summary.empty,
+                summary.slowest_row_ms,
+                slowest_row_index,
+            );
+        }
     }
 }
 
@@ -4749,12 +5172,10 @@ unsafe fn ensure_picker_window() {
 
 /// 根据当前历史重建行按钮(选中行高亮 + 圆角背景块)。
 /// Rebuild the row buttons from history (selected row highlighted with a rounded tile).
-unsafe fn rebuild_rows() {
+unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
+    let rebuild_started = Instant::now();
     let hist = CLIP_HISTORY.lock().unwrap();
-    let container = match *PICKER_CONTAINER.lock().unwrap() {
-        Some(c) => c.0,
-        None => return,
-    };
+    let container = (*PICKER_CONTAINER.lock().unwrap())?.0;
     // 重建会拆除旧行,期间的 enter/exit 事件会被门控;先丢弃旧索引,避免它落到新行。
     // Rebuild tears down the old rows and gates enter/exit events; discard the old index first
     // so it cannot land on an unrelated new row.
@@ -4784,6 +5205,7 @@ unsafe fn rebuild_rows() {
     // removeFromSuperview drops the parent's reference (refcount hits zero, object deallocs),
     // so it must NOT be released again -- a second release was a use-after-free that crashed
     // on the second summon.
+    let remove_old_started = Instant::now();
     let mut rows = ROW_BUTTONS.lock().unwrap();
     for &b in rows.iter() {
         let _: () = msg_send![b.0, removeFromSuperview];
@@ -4799,8 +5221,12 @@ unsafe fn rebuild_rows() {
     }
     tiles.clear();
     ROW_HOVER_VIEWS.lock().unwrap().clear();
+    ROW_VIEW_INDICES.lock().unwrap().clear();
     let mut pitches = ROW_PITCHES.lock().unwrap();
     pitches.clear();
+    let remove_old_ms = remove_old_started.elapsed().as_millis();
+
+    let prepare_started = Instant::now();
     // 每行的按钮高/行距由文本换行行数决定。
     // Each row's button height / pitch derives from its wrapped line count.
     *pitches = compute_pitches(&hist);
@@ -4816,6 +5242,7 @@ unsafe fn rebuild_rows() {
     let filtered_indices = filtered_indices(&hist, &query, filter);
     with_clipboard_ui(|ui| ui.filtered = filtered_indices);
     let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
+    let show_source = show_source_app();
 
     // 删除/裁剪后把选中索引钳到新显示列表内(越界 → 末条;NO_SELECTION 不动)。
     // 所有重建路径自愈——修复"删除最后一条后高亮消失"(删除路径此前用删除前的脏
@@ -4839,6 +5266,15 @@ unsafe fn rebuild_rows() {
     } else {
         String::new()
     };
+    let prepare_ms = prepare_started.elapsed().as_millis();
+    let build_rows_started = Instant::now();
+    let mut image_rows = 0;
+    let mut code_rows = 0;
+    let mut image_ms = 0;
+    let mut content_attributed_ms = 0;
+    let mut meta_ms = 0;
+    let mut slowest_row_ms = 0;
+    let mut slowest_row_index = None;
     if !empty_hint.is_empty() {
         // 容器高度必须取当前 clip view 的实际可视高度,而不是最小窗口高度:筛选后
         // 虽然没有结果,主窗口仍保留原有的较大高度;若用最小值提示会错误地偏到上方。
@@ -4889,8 +5325,44 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![container, addSubview: label];
         release_obj(label);
         rows.push(ObjPtr::new(label));
+        let build_rows_ms = build_rows_started.elapsed().as_millis();
+        let finalize_started = Instant::now();
+        let rendered_key = picker_rows_key(&hist, &query, filter, show_source);
+        let finalize_ms = finalize_started.elapsed().as_millis();
+        let summary = PickerTimingSummary {
+            elapsed_ms: rebuild_started.elapsed().as_millis(),
+            history_len: total,
+            filtered_len: filtered.len(),
+            remove_old_ms,
+            prepare_ms,
+            build_rows_ms,
+            finalize_ms,
+            empty: true,
+            ..PickerTimingSummary::default()
+        };
+        with_clipboard_ui(|ui| {
+            ui.rendered_rows = Some(rendered_key);
+            ui.last_rebuild_timing = Some(summary);
+        });
         REBUILDING.store(false, Ordering::SeqCst);
-        return;
+        if summary.elapsed_ms >= CLIPBOARD_SLOW_PATH_MS {
+            log_debug!(
+                "[clip] picker_rebuild_slow elapsed_ms={} history_len={} filtered_len={} image_rows={} code_rows={} reused=false remove_old_ms={} prepare_ms={} build_rows_ms={} image_ms={} content_attributed_ms={} meta_ms={} finalize_ms={} slowest_row_ms=0 slowest_row_index=none empty=true",
+                summary.elapsed_ms,
+                summary.history_len,
+                summary.filtered_len,
+                summary.image_rows,
+                summary.code_rows,
+                summary.remove_old_ms,
+                summary.prepare_ms,
+                summary.build_rows_ms,
+                summary.image_ms,
+                summary.content_attributed_ms,
+                summary.meta_ms,
+                summary.finalize_ms,
+            );
+        }
+        return Some(summary);
     }
 
     // 文档高度 = 全部显示条目(滚动区域),由 NSScrollView 滚动。
@@ -4903,6 +5375,7 @@ unsafe fn rebuild_rows() {
     let doc_h = (rows_top_offset() + pitches.iter().take(filtered.len()).sum::<f64>() + PAD_Y)
         .max(picker_min_height() - header_strip_h() - FOOTER_H);
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
+    let (visible_start, visible_end) = picker_visible_row_range(&pitches, filtered.len());
 
     let sel_idx = picker_selection();
     // 鼠标悬停行(与选中独立:键盘导航时鼠标停在别的行上 → 两态并存)。
@@ -4920,12 +5393,15 @@ unsafe fn rebuild_rows() {
         hover_idx = effective_hover_row(false, hover_idx);
         *HOVER_ROW.lock().unwrap() = hover_idx;
     }
-    // 读一次配置:meta 行是否显示应用名(记录始终进行,开关只控制名称)。
-    // Read the toggle once: whether the meta line shows the app name (recording never
-    // stops; the toggle only gates the name).
-    let show_source = show_source_app();
-    let mut prev_group: Option<DayGroup> = None;
+    let mut prev_group: Option<DayGroup> = visible_start
+        .checked_sub(1)
+        .and_then(|index| filtered.get(index))
+        .map(|&history_index| day_group(hist[history_index].copied_at));
     for (i, &h_idx) in filtered.iter().enumerate() {
+        if i < visible_start || i >= visible_end {
+            continue;
+        }
+        let row_started = Instant::now();
         let y = row_top(i, &pitches);
         let row_w = PICKER_W - PAD_X * 2.0;
         let entry = &hist[h_idx];
@@ -4940,6 +5416,7 @@ unsafe fn rebuild_rows() {
 
         // 分组头:一行 11px medium 小字(新设计稿 .group-title,27px 高,垂直居中,
         // 左内边距 13)。/ The group header: 11px medium text, 27px tall, centered.
+        let mut row_group_label = None;
         if has_hdr {
             let g_label = make_nsstring(&group_label(group));
             let g: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -4964,6 +5441,7 @@ unsafe fn rebuild_rows() {
             let _: () = msg_send![container, addSubview: g];
             release_obj(g);
             rows.push(ObjPtr::new(g));
+            row_group_label = Some(ObjPtr::new(g));
         }
 
         // 行底(两种不同样式):悬停(未选中)= 0.032 黑(**没有**左条);选中 = 0.050 黑 +
@@ -5024,6 +5502,9 @@ unsafe fn rebuild_rows() {
         let content_h = row_h - META_FOOTER_H; // 底部留给 meta 栏 / the meta bar takes the bottom.
         let content_btn: *mut AnyObject = msg_send![row_button_class(), alloc];
         let is_image = entry.image.is_some();
+        if is_image {
+            image_rows += 1;
+        }
         let content_btn: *mut AnyObject = msg_send![
             content_btn,
             initWithFrame: NSRect::new(
@@ -5039,7 +5520,9 @@ unsafe fn rebuild_rows() {
         if msg_send![cell, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
             let _: () = msg_send![cell, setMaximumNumberOfLines: 2isize];
         }
+        let image_started = Instant::now();
         let row_img = make_row_image(entry);
+        image_ms += image_started.elapsed().as_millis();
         if !row_img.is_null() {
             let _: () = msg_send![content_btn, setImage: row_img];
             let _: () = msg_send![content_btn, setImagePosition: 2isize]; // NSImageLeft
@@ -5055,7 +5538,12 @@ unsafe fn rebuild_rows() {
         } else {
             classify_text(&entry.text)
         };
+        if kind == TextKind::Code {
+            code_rows += 1;
+        }
+        let content_attributed_started = Instant::now();
         let attr = make_content_attributed(content, kind);
+        content_attributed_ms += content_attributed_started.elapsed().as_millis();
         let _: () = msg_send![content_btn, setAttributedTitle: attr];
         release_obj(attr);
         let _: () = msg_send![content_btn, setTag: i as isize];
@@ -5089,7 +5577,9 @@ unsafe fn rebuild_rows() {
         let _: () = msg_send![meta_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
         let mcell: *mut AnyObject = msg_send![meta_btn, cell];
         let _: () = msg_send![mcell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+        let meta_started = Instant::now();
         let meta_attr = make_meta_footer_attributed(entry, show_source);
+        meta_ms += meta_started.elapsed().as_millis();
         let _: () = msg_send![meta_btn, setAttributedTitle: meta_attr];
         release_obj(meta_attr);
         let _: () = msg_send![meta_btn, setTag: i as isize];
@@ -5161,19 +5651,280 @@ unsafe fn rebuild_rows() {
         // Record this row's hover-dependent views (tile + action buttons) for the
         // incremental hover refresh.
         ROW_HOVER_VIEWS.lock().unwrap().push(RowHoverViews {
+            group_label: row_group_label,
             tile: ObjPtr::new(tile),
             bar: ObjPtr::new(bar),
+            content: ObjPtr::new(content_btn),
+            meta: ObjPtr::new(meta_btn),
             pin: ObjPtr::new(pin_btn),
             details: ObjPtr::new(details_btn),
             del: ObjPtr::new(del_btn),
         });
+        ROW_VIEW_INDICES.lock().unwrap().push(i);
+        let row_ms = row_started.elapsed().as_millis();
+        if row_ms > slowest_row_ms {
+            slowest_row_ms = row_ms;
+            slowest_row_index = Some(i);
+        }
     }
 
     // 恢复滚动位置 / restore the scroll position.
     if scroll_offset > 0.0 {
         let _: () = msg_send![container, scrollPoint: NSPoint::new(0.0, scroll_offset)];
     }
+    let build_rows_ms = build_rows_started.elapsed().as_millis();
+    let finalize_started = Instant::now();
+    let rendered_key = picker_rows_key(&hist, &query, filter, show_source);
+    let finalize_ms = finalize_started.elapsed().as_millis();
+    let summary = PickerTimingSummary {
+        elapsed_ms: rebuild_started.elapsed().as_millis(),
+        history_len: total,
+        filtered_len: filtered.len(),
+        image_rows,
+        code_rows,
+        remove_old_ms,
+        prepare_ms,
+        build_rows_ms,
+        image_ms,
+        content_attributed_ms,
+        meta_ms,
+        finalize_ms,
+        slowest_row_ms,
+        slowest_row_index,
+        empty: false,
+    };
+    with_clipboard_ui(|ui| {
+        ui.rendered_rows = Some(rendered_key);
+        ui.last_rebuild_timing = Some(summary);
+    });
     REBUILDING.store(false, Ordering::SeqCst);
+    if summary.elapsed_ms >= CLIPBOARD_SLOW_PATH_MS {
+        let slowest_row_index = summary
+            .slowest_row_index
+            .map_or_else(|| "none".to_owned(), |index| index.to_string());
+        log_debug!(
+            "[clip] picker_rebuild_slow elapsed_ms={} history_len={} filtered_len={} image_rows={} code_rows={} reused=false remove_old_ms={} prepare_ms={} build_rows_ms={} image_ms={} content_attributed_ms={} meta_ms={} finalize_ms={} slowest_row_ms={} slowest_row_index={} empty=false",
+            summary.elapsed_ms,
+            summary.history_len,
+            summary.filtered_len,
+            summary.image_rows,
+            summary.code_rows,
+            summary.remove_old_ms,
+            summary.prepare_ms,
+            summary.build_rows_ms,
+            summary.image_ms,
+            summary.content_attributed_ms,
+            summary.meta_ms,
+            summary.finalize_ms,
+            summary.slowest_row_ms,
+            slowest_row_index,
+        );
+    }
+    Some(summary)
+}
+
+/// 删除一行时只移除并重排已有视图;日期分组结构变化时交给完整重建处理。
+/// Remove and relayout existing views for a single deletion; fall back to a full rebuild when
+/// the date-group structure changes.
+unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
+    let old_views = ROW_HOVER_VIEWS.lock().unwrap().clone();
+    let Some(_) = old_views.get(idx) else {
+        return false;
+    };
+    let filter = *CLIP_FILTER.lock().unwrap();
+    let query = with_clipboard_ui(|ui| ui.search_query.clone());
+    let show_source = show_source_app();
+    let hist = CLIP_HISTORY.lock().unwrap();
+    let filtered = filtered_indices(&hist, &query, filter);
+    // 虚拟列表只物化视口附近的行;删除时让下一次可见刷新重新绑定槽位,避免把物理槽位
+    // 错当成完整过滤列表索引。小列表仍可走原有的无闪烁增量路径。
+    // A virtualized list materializes only rows near the viewport; let the next visible
+    // refresh rebind its slots instead of treating physical slots as full-list indices.
+    // Small lists can still use the existing no-flash incremental path.
+    let materialized_indices = ROW_VIEW_INDICES.lock().unwrap().clone();
+    if materialized_indices != (0..old_views.len()).collect::<Vec<_>>() {
+        return false;
+    }
+    if filtered.len() + 1 != old_views.len() {
+        return false;
+    }
+
+    let mut previous_group = None;
+    for (new_idx, &history_idx) in filtered.iter().enumerate() {
+        let group = day_group(hist[history_idx].copied_at);
+        let has_header = previous_group.is_none() || previous_group != Some(group);
+        previous_group = Some(group);
+        let old_idx = if new_idx < idx { new_idx } else { new_idx + 1 };
+        if old_views[old_idx].group_label.is_some() != has_header {
+            return false;
+        }
+    }
+
+    REBUILDING.store(true, Ordering::SeqCst);
+    let removed = ROW_HOVER_VIEWS.lock().unwrap().remove(idx);
+    ROW_VIEW_INDICES.lock().unwrap().remove(idx);
+    for view in [
+        removed.group_label,
+        Some(removed.tile),
+        Some(removed.bar),
+        Some(removed.content),
+        Some(removed.meta),
+        Some(removed.pin),
+        Some(removed.details),
+        Some(removed.del),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !view.0.is_null() {
+            let _: () = msg_send![view.0, removeFromSuperview];
+        }
+    }
+
+    let old_hover = *HOVER_ROW.lock().unwrap();
+    let new_hover = if old_hover == idx {
+        NO_SELECTION
+    } else if old_hover > idx && old_hover != NO_SELECTION {
+        old_hover - 1
+    } else {
+        old_hover
+    };
+    *HOVER_ROW.lock().unwrap() = new_hover;
+    with_clipboard_ui(|ui| {
+        ui.filtered = filtered.clone();
+        ui.picker_selection = clamp_selection(ui.picker_selection, filtered.len());
+    });
+
+    let mut pitches = Vec::with_capacity(filtered.len());
+    let mut previous_group = None;
+    for &history_idx in &filtered {
+        let entry = &hist[history_idx];
+        let group = day_group(entry.copied_at);
+        let header = if previous_group.is_none() || previous_group != Some(group) {
+            GROUP_H
+        } else {
+            0.0
+        };
+        previous_group = Some(group);
+        pitches.push(header + row_content_h(entry));
+    }
+    *ROW_PITCHES.lock().unwrap() = pitches.clone();
+    refresh_footer_count(hist.len());
+
+    let views = ROW_HOVER_VIEWS.lock().unwrap().clone();
+    {
+        let mut rows = ROW_BUTTONS.lock().unwrap();
+        rows.clear();
+        let mut tiles = ROW_TILES.lock().unwrap();
+        tiles.clear();
+        for view in &views {
+            if let Some(group_label) = view.group_label {
+                rows.push(group_label);
+            }
+            rows.extend([view.content, view.meta]);
+            for button in [view.pin, view.details, view.del] {
+                if !button.0.is_null() {
+                    rows.push(button);
+                }
+            }
+            tiles.push(view.tile);
+        }
+    }
+
+    let selection = picker_selection();
+    let palette = clipboard_palette();
+    let mut previous_group = None;
+    for (i, (&history_idx, view)) in filtered.iter().zip(views.iter()).enumerate() {
+        let entry = &hist[history_idx];
+        let group = day_group(entry.copied_at);
+        let has_header = previous_group.is_none() || previous_group != Some(group);
+        previous_group = Some(group);
+        let y = row_top(i, &pitches);
+        let row_w = PICKER_W - PAD_X * 2.0;
+        let header_h = if has_header { GROUP_H } else { 0.0 };
+        let content_y = y + header_h;
+        let row_h = pitches[i] - header_h;
+        if let Some(group_label) = view.group_label {
+            let _: () = msg_send![group_label.0, setFrame: NSRect::new(
+                NSPoint::new(PAD_X + ROW_PAD_L, y + GROUP_LABEL_PAD),
+                NSSize::new(row_w - PAD_X, GROUP_H - GROUP_LABEL_PAD)
+            )];
+        }
+        let _: () = msg_send![view.tile.0, setFrame: NSRect::new(
+            NSPoint::new(PAD_X, content_y),
+            NSSize::new(row_w, row_h)
+        )];
+        let _: () = msg_send![view.bar.0, setFrame: NSRect::new(
+            NSPoint::new(SEL_BAR_X, SEL_BAR_INSET_Y),
+            NSSize::new(SEL_BAR_W, row_h - SEL_BAR_INSET_Y * 2.0)
+        )];
+        let content_x = PAD_X + ROW_PAD_L;
+        let content_w = row_w - ROW_PAD_L - ROW_PAD_R;
+        let content_h = row_h - META_FOOTER_H;
+        let _: () = msg_send![view.content.0, setFrame: NSRect::new(
+            NSPoint::new(content_x, content_y + ROW_PAD_TOP),
+            NSSize::new(content_w, content_h - ROW_PAD_TOP - ROW_PAD_BOT)
+        )];
+        let meta_y = content_y + row_h - META_FOOTER_H - ROW_PAD_BOT;
+        let meta_w = row_w - ROW_PAD_L - ROW_PAD_R - ACTIONS_W - 4.0;
+        let _: () = msg_send![view.meta.0, setFrame: NSRect::new(
+            NSPoint::new(content_x, meta_y),
+            NSSize::new(meta_w, META_FOOTER_H)
+        )];
+        let act_y = meta_y + (META_FOOTER_H - ACTION_H) / 2.0;
+        let x_del = PICKER_W - PAD_X - ROW_PAD_R - ACTION_BTN;
+        let x_details = x_del - ACTION_GAP - ACTION_BTN;
+        let x_pin = x_details - ACTION_GAP - ACTION_BTN;
+        for (button, x) in [
+            (view.pin, x_pin),
+            (view.details, x_details),
+            (view.del, x_del),
+        ] {
+            if !button.0.is_null() {
+                let _: () = msg_send![button.0, setFrame: NSRect::new(
+                    NSPoint::new(x, act_y),
+                    NSSize::new(ACTION_BTN, ACTION_H)
+                )];
+                let _: () = msg_send![button.0, setTag: i as isize];
+            }
+        }
+
+        let selected = i == selection;
+        let hovered = i == new_hover;
+        let background = if selected {
+            palette.selection_bg
+        } else if hovered {
+            palette.hover_bg
+        } else {
+            0x00000000
+        };
+        let tile_layer: *mut AnyObject = msg_send![view.tile.0, layer];
+        crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(background));
+        let _: () = msg_send![view.bar.0, setHidden: !selected];
+        if !entry.pinned {
+            let alpha = if selected || hovered { 1.0 } else { 0.0 };
+            for button in [view.pin, view.details, view.del] {
+                if !button.0.is_null() {
+                    let _: () = msg_send![button.0, setAlphaValue: alpha];
+                }
+            }
+        }
+        set_detail_action_style(
+            view.details.0,
+            detail_action_is_active(detail_visible(), selection, i),
+            false,
+        );
+    }
+
+    if let Some(container) = *PICKER_CONTAINER.lock().unwrap() {
+        let document_h = (rows_top_offset() + pitches.iter().sum::<f64>() + PAD_Y)
+            .max(picker_min_height() - header_strip_h() - FOOTER_H);
+        let _: () = msg_send![container.0, setFrameSize: NSSize::new(PICKER_W, document_h)];
+    }
+    let rendered_key = picker_rows_key(&hist, &query, filter, show_source);
+    with_clipboard_ui(|ui| ui.rendered_rows = Some(rendered_key));
+    REBUILDING.store(false, Ordering::SeqCst);
+    true
 }
 
 /// 头部条 flipped:搜索框/清除按钮按顶部坐标布局。
@@ -5220,6 +5971,7 @@ unsafe fn hover_row_at_event(event: *mut c_void) -> usize {
         convertPoint: location,
         fromView: std::ptr::null::<AnyObject>()
     ];
+    let indices = ROW_VIEW_INDICES.lock().unwrap().clone();
     ROW_HOVER_VIEWS
         .lock()
         .unwrap()
@@ -5231,6 +5983,7 @@ unsafe fn hover_row_at_event(event: *mut c_void) -> usize {
             let frame: NSRect = msg_send![row.tile.0, frame];
             rect_contains_point(frame, point)
         })
+        .and_then(|slot| indices.get(slot).copied())
         .unwrap_or(NO_SELECTION)
 }
 
@@ -5286,7 +6039,6 @@ unsafe fn row_button_class() -> *mut AnyObject {
 
 fn update_hover_visuals(prev: usize, new: usize) {
     let sel = picker_selection();
-    let views = ROW_HOVER_VIEWS.lock().unwrap();
     let hist = CLIP_HISTORY.lock().unwrap();
     let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
     // 与建行时的样式常量保持一致(选中 0.050 优先于悬停 0.032)。
@@ -5295,10 +6047,12 @@ fn update_hover_visuals(prev: usize, new: usize) {
     const HOVER_BG: f64 = 0.032;
     unsafe {
         for i in [prev, new] {
-            if i == NO_SELECTION || i >= views.len() {
+            if i == NO_SELECTION {
                 continue;
             }
-            let rv = &views[i];
+            let Some(rv) = row_view_for_display_index(i) else {
+                continue;
+            };
             let selected = i == sel;
             let hovered = i == new;
             let bg_alpha = if selected {
@@ -5375,8 +6129,7 @@ extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *m
 /// 判断鼠标是否仍在整行区域内,包括右侧独立的操作按钮。
 /// Check whether the pointer is still inside the whole row, including its separate action buttons.
 unsafe fn mouse_inside_row(event: *mut c_void, idx: usize) -> bool {
-    let views = ROW_HOVER_VIEWS.lock().unwrap();
-    let Some(row) = views.get(idx) else {
+    let Some(row) = row_view_for_display_index(idx) else {
         return false;
     };
     if row.tile.0.is_null() {
@@ -5591,8 +6344,11 @@ extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void
         set_picker_selection(previous - 1);
     }
     drop(hist);
+    let incremental = unsafe { try_delete_picker_row_incremental(idx as usize) };
     save_history();
-    unsafe { rebuild_rows() };
+    if !incremental {
+        schedule_picker_refresh();
+    }
     // 详情面板跟随选中条目;若删的正是选中条目则关闭它(避免残留已删内容)。
     // The detail panel follows the selected entry; when the deleted row WAS the selection,
     // close the panel (no stale content).
@@ -6000,8 +6756,11 @@ extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_vo
                 // clamped against the stale pre-delete FILTERED length, so the selection
                 // stayed past the new list, no row matched, and the highlight vanished.
                 drop(hist);
+                let incremental = try_delete_picker_row_incremental(idx);
                 save_history();
-                rebuild_rows();
+                if !incremental {
+                    schedule_picker_refresh();
+                }
                 // 详情面板跟随选中条目,而选中条目刚被删除 → 关闭,避免残留已删内容。
                 // The detail panel follows the selected entry, which was just deleted ->
                 // close it, so no stale content lingers.
@@ -6106,6 +6865,22 @@ extern "C" fn picker_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> boo
 /// 行标题(attributed):选中 = 白字粗体,未选 = labelColor。
 /// Row title (attributed): selected = white bold, unselected = labelColor.
 unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObject {
+    let palette = clipboard_palette();
+    let key = ContentAttributedKey {
+        content: content.to_owned(),
+        kind: match kind {
+            TextKind::Plain => 0,
+            TextKind::Url => 1,
+            TextKind::Code => 2,
+        },
+        primary_text: palette.primary_text,
+        secondary_text: palette.secondary_text,
+        accent: palette.accent,
+    };
+    if let Some(cached) = CONTENT_ATTRIBUTED_CACHE.lock().unwrap().get(&key) {
+        CFRetain(cached.0 as *const c_void);
+        return cached.0;
+    }
     let prepared_code = (kind == TextKind::Code).then(|| prepare_code_display(content, usize::MAX));
     let display_content = prepared_code
         .as_ref()
@@ -6124,7 +6899,6 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
         }
         _ => msg_send![class!(NSFont), systemFontOfSize: 14.0f64],
     };
-    let palette = clipboard_palette();
     let color = match kind {
         TextKind::Url => crate::ffi::hex_to_ns_color(palette.accent),
         TextKind::Code => crate::ffi::hex_to_ns_color(palette.secondary_text),
@@ -6150,6 +6924,11 @@ unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObje
     } else {
         apply_link_color(attr, display_content, kind);
     }
+    CFRetain(attr as *const c_void);
+    CONTENT_ATTRIBUTED_CACHE
+        .lock()
+        .unwrap()
+        .insert(key, ObjPtr::new(attr));
     attr
 }
 
@@ -6230,8 +7009,39 @@ unsafe fn load_source_icon(entry: &ClipEntry, size: f64) -> *mut AnyObject {
         return std::ptr::null_mut();
     }
     let icon_path = crate::icon_cache::small_icon_path_for_key(&entry.source_key);
-    if !std::path::Path::new(&icon_path).exists() {
+    let metadata = match std::fs::metadata(&icon_path) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            let key = (entry.source_key.clone(), size.to_bits());
+            if let Some(cached) = SOURCE_ICON_CACHE.lock().unwrap().remove(&key) {
+                release_obj(cached.image.0);
+            }
+            return std::ptr::null_mut();
+        }
+    };
+    let modified = metadata.modified().ok();
+    if !metadata.is_file() {
+        let key = (entry.source_key.clone(), size.to_bits());
+        if let Some(cached) = SOURCE_ICON_CACHE.lock().unwrap().remove(&key) {
+            release_obj(cached.image.0);
+        }
         return std::ptr::null_mut();
+    }
+
+    let key = (entry.source_key.clone(), size.to_bits());
+    {
+        let cache = SOURCE_ICON_CACHE.lock().unwrap();
+        if let Some(cached) = cache.get(&key) {
+            if cached.modified == modified {
+                let image = cached.image.0;
+                let _: *mut AnyObject = msg_send![image, retain];
+                return image;
+            }
+        }
+    }
+
+    if let Some(cached) = SOURCE_ICON_CACHE.lock().unwrap().remove(&key) {
+        release_obj(cached.image.0);
     }
     let ns_path = make_nsstring(&icon_path);
     let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
@@ -6239,6 +7049,14 @@ unsafe fn load_source_icon(entry: &ClipEntry, size: f64) -> *mut AnyObject {
     CFRelease(ns_path as *const c_void);
     if !img.is_null() {
         let _: () = msg_send![img, setSize: NSSize::new(size, size)];
+        SOURCE_ICON_CACHE.lock().unwrap().insert(
+            key,
+            CachedSourceIcon {
+                image: ObjPtr::new(img),
+                modified,
+            },
+        );
+        let _: *mut AnyObject = msg_send![img, retain];
     }
     img
 }
@@ -6256,6 +7074,17 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     };
     if img.preview_png.is_empty() {
         return std::ptr::null_mut();
+    }
+    let palette = clipboard_palette();
+    let key = RowImageKey {
+        image_hash: img.hash,
+        preview_hash: fnv1a64(&img.preview_png),
+        field_bg: palette.field_bg,
+        card_border: palette.card_border,
+    };
+    if let Some(cached) = ROW_IMAGE_CACHE.lock().unwrap().get(&key) {
+        CFRetain(cached.0 as *const c_void);
+        return cached.0;
     }
     let data: *mut AnyObject = msg_send![
         class!(NSData),
@@ -6282,7 +7111,7 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     // 缩略图盒复用设置页 field surface,避免在浅深色主题中出现不同的灰度体系。
     // Reuse the settings field surface for thumbnail boxes so light and dark themes share one
     // grayscale system.
-    let fill = crate::ffi::hex_to_ns_color(clipboard_palette().field_bg);
+    let fill = crate::ffi::hex_to_ns_color(palette.field_bg);
     let _: () = msg_send![fill, set];
     let box_path: *mut AnyObject = msg_send![
         class!(NSBezierPath),
@@ -6301,12 +7130,17 @@ unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     let op: usize = 1; // NSCompositingOperationCopy
     let _: () = msg_send![im, drawInRect: dst, fromRect: src_rect, operation: op, fraction: 1.0f64];
     // 内描边(设计稿 inset ring)/ the inset ring.
-    let ring = crate::ffi::hex_to_ns_color(clipboard_palette().card_border);
+    let ring = crate::ffi::hex_to_ns_color(palette.card_border);
     let _: () = msg_send![ring, set];
     let _: () = msg_send![box_path, setLineWidth: 1.0f64];
     let _: () = msg_send![box_path, stroke];
     let _: () = msg_send![target, unlockFocus];
     release_obj(im);
+    CFRetain(target as *const c_void);
+    ROW_IMAGE_CACHE
+        .lock()
+        .unwrap()
+        .insert(key, ObjPtr::new(target));
     target
 }
 
@@ -6436,9 +7270,13 @@ unsafe fn set_detail_action_style(button: *mut AnyObject, active: bool, hovered:
 fn refresh_detail_action_visuals() {
     let visible = detail_visible();
     let selected = picker_selection();
-    let views = ROW_HOVER_VIEWS.lock().unwrap();
+    let indices = ROW_VIEW_INDICES.lock().unwrap().clone();
+    let views = ROW_HOVER_VIEWS.lock().unwrap().clone();
     unsafe {
-        for (row, view) in views.iter().enumerate() {
+        for (slot, view) in views.iter().enumerate() {
+            let Some(&row) = indices.get(slot) else {
+                continue;
+            };
             set_detail_action_style(
                 view.details.0,
                 detail_action_is_active(visible, selected, row),
@@ -7445,6 +8283,71 @@ mod tests {
         assert_eq!(effective_hover_row(false, 0), NO_SELECTION);
         assert_eq!(effective_hover_row(false, 7), NO_SELECTION);
         assert_eq!(effective_hover_row(false, NO_SELECTION), NO_SELECTION);
+    }
+
+    #[test]
+    fn picker_row_visibility_keeps_overscan_rows_drawable() {
+        use super::picker_row_is_drawable;
+
+        let viewport = NSRect::new(NSPoint::new(0.0, 100.0), NSSize::new(560.0, 600.0));
+        let overscan = 117.0;
+        assert!(picker_row_is_drawable(
+            NSRect::new(NSPoint::new(0.0, -95.0), NSSize::new(560.0, 78.0)),
+            viewport,
+            overscan
+        ));
+        assert!(!picker_row_is_drawable(
+            NSRect::new(NSPoint::new(0.0, -96.0), NSSize::new(560.0, 78.0)),
+            viewport,
+            overscan
+        ));
+        assert!(picker_row_is_drawable(
+            NSRect::new(NSPoint::new(0.0, 817.0), NSSize::new(560.0, 78.0)),
+            viewport,
+            overscan
+        ));
+        assert!(!picker_row_is_drawable(
+            NSRect::new(NSPoint::new(0.0, 818.0), NSSize::new(560.0, 78.0)),
+            viewport,
+            overscan
+        ));
+    }
+
+    #[test]
+    fn picker_visible_range_materializes_only_viewport_rows_with_overscan() {
+        use super::picker_visible_range;
+
+        let pitches = vec![100.0; 10];
+        let viewport = NSRect::new(NSPoint::new(0.0, 350.0), NSSize::new(560.0, 100.0));
+        assert_eq!(picker_visible_range(&pitches, viewport, 50.0), (2, 5));
+    }
+
+    #[test]
+    fn picker_rows_key_changes_when_rendered_inputs_change() {
+        use super::{picker_rows_key, ClipFilter};
+
+        let history = vec![entry("first")];
+        let base = picker_rows_key(&history, "", ClipFilter::All, false);
+        let same = picker_rows_key(&history, "", ClipFilter::All, false);
+        assert_eq!(
+            base.history_signature, same.history_signature,
+            "unchanged history should have the same render signature"
+        );
+        assert_eq!(base.filter, same.filter);
+        assert_eq!(base.query, same.query);
+        assert_eq!(base.show_source, same.show_source);
+
+        let changed_history = vec![entry("second")];
+        assert_ne!(
+            base,
+            picker_rows_key(&changed_history, "", ClipFilter::All, false)
+        );
+        assert_ne!(
+            base,
+            picker_rows_key(&history, "query", ClipFilter::All, false)
+        );
+        assert_ne!(base, picker_rows_key(&history, "", ClipFilter::Text, false));
+        assert_ne!(base, picker_rows_key(&history, "", ClipFilter::All, true));
     }
 
     /// 测试用的 3 参便捷包装(来源与图标键留空,既有用例不受签名变化影响)。

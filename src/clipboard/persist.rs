@@ -302,6 +302,7 @@ pub(super) fn load_history() {
 pub(crate) fn apply_persist_toggle(on: bool) {
     if on {
         load_history();
+        schedule_picker_refresh();
     } else {
         let path = history_file_path();
         if path.exists() {
