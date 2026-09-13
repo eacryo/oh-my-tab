@@ -1683,20 +1683,19 @@ unsafe fn raise_ax_element(
 /// Some(vec) = query succeeded, possibly empty after subrole filtering (no standard windows =
 /// Mission Control won't show it; skip entirely).
 /// AX 窗口角色白名单:标准窗口(AXStandardWindow)任意;对话框(AXDialog——
-/// JetBrains 系 IDE 的主窗口角色)必须有非空标题;其余角色(弹窗/面板/隐形窗口)
-/// 一律过滤;无 subrole 视为标准窗口(部分 App 不设置此属性)。空标题的 AXDialog
-/// 仍被过滤——BetterDisplay 隐形窗口防线的一部分(隐形窗口无标题,无论 subrole
-/// 是什么都不该进入列表)。纯函数,单测覆盖。
+/// JetBrains 系 IDE 的主窗口角色)必须有非空标题;部分 App(如 Xcode)的普通窗口
+/// 报告 AXUnknown,只有同时具备 AXWindow role 和非空标题才放行;其余角色(弹窗/面板/
+/// 隐形窗口)一律过滤;无 subrole 视为标准窗口。纯函数,单测覆盖。
 /// AX-window subrole keep-rule: standard windows always pass; AXDialog (the subrole
-/// JetBrains IDEs use for their MAIN windows) only when titled; everything else
-/// (popups/panels/invisible windows) is filtered; a missing subrole counts as standard
-/// (some apps don't set it). Untitled AXDialog stays filtered -- part of the
-/// BetterDisplay invisible-window defense (invisible windows are untitled, so whatever
-/// their subrole, they must not enter the list). Pure function, unit-tested.
-fn ax_subrole_kept(subrole: Option<&str>, titled: bool) -> bool {
+/// JetBrains IDEs use for their MAIN windows) only when titled; some apps (such as Xcode)
+/// report ordinary windows as AXUnknown, so allow that only with AXWindow role and a non-empty
+/// title. Everything else (popups/panels/invisible windows) is filtered; a missing subrole
+/// counts as standard. Pure function, unit-tested.
+fn ax_subrole_kept(subrole: Option<&str>, role: Option<&str>, titled: bool) -> bool {
     match subrole {
         Some("AXStandardWindow") => true,
         Some("AXDialog") => titled,
+        Some("AXUnknown") => role == Some("AXWindow") && titled,
         Some(_) => false,
         // 无 subrole → 视为标准窗口(部分 App 不设置此属性)。
         // A missing subrole counts as standard (some apps don't set it).
@@ -1794,6 +1793,7 @@ fn get_ax_windows_for_pid_with_identity(
 
         let count = CFArrayGetCount(windows_array);
         let title_key = cf_string_new("AXTitle");
+        let role_key = cf_string_new("AXRole");
         let subrole_key = cf_string_new("AXSubrole");
         let minimized_key = cf_string_new("AXMinimized");
         let mut results = Vec::with_capacity(count as usize);
@@ -1804,14 +1804,11 @@ fn get_ax_windows_for_pid_with_identity(
                 continue;
             }
 
-            // 只保留标准窗口(AXStandardWindow)+ 有标题的对话框(AXDialog),过滤弹出
-            // 面板/下拉菜单等非标准窗口。AXDialog 是 JetBrains 系 IDE 主窗口的角色
-            // (WebStorm 实测),必须放行;空标题的 AXDialog 仍按弹出面板过滤(见
-            // ax_subrole_kept 注释:BetterDisplay 隐形窗口防线)。
-            // Keep AXStandardWindow + TITLED AXDialog; filter popups/panels/dropdowns.
-            // AXDialog is the subrole JetBrains IDEs use for their main windows (measured
-            // on WebStorm) and must pass; an UNTITLED AXDialog stays filtered (see
-            // ax_subrole_kept: the BetterDisplay invisible-window defense).
+            // 只保留标准窗口/有标题的对话框,以及 role=AXWindow 且有标题的 AXUnknown
+            // 普通窗口(如 Xcode);过滤弹出面板/下拉菜单等非标准窗口。
+            // Keep standard windows, titled dialogs, and titled AXUnknown elements whose
+            // role is AXWindow (ordinary windows in apps such as Xcode); filter popups,
+            // panels, and other non-standard elements.
             let mut subrole_value: *const c_void = std::ptr::null();
             let kept = if AXUIElementCopyAttributeValue(element, subrole_key, &mut subrole_value)
                 == K_AX_SUCCESS
@@ -1819,11 +1816,21 @@ fn get_ax_windows_for_pid_with_identity(
             {
                 let s = cf_to_rust_string(subrole_value);
                 CFRelease(subrole_value);
-                // AXDialog 需额外判断标题(见 ax_subrole_kept:JetBrains 主窗口有标题,
-                // 空标题对话框按弹出面板过滤)。
-                // AXDialog needs the extra title check (see ax_subrole_kept: JetBrains
-                // main windows are titled; untitled dialogs stay filtered as popups).
-                let titled = if s.as_deref() == Some("AXDialog") {
+                let mut role_value: *const c_void = std::ptr::null();
+                let role = if AXUIElementCopyAttributeValue(element, role_key, &mut role_value)
+                    == K_AX_SUCCESS
+                    && !role_value.is_null()
+                {
+                    let role = cf_to_rust_string(role_value);
+                    CFRelease(role_value);
+                    role
+                } else {
+                    None
+                };
+                // AXDialog/AXUnknown 需额外判断标题;无标题元素按弹出/隐形窗口过滤。
+                // AXDialog/AXUnknown require a non-empty title; untitled elements stay
+                // filtered as popups/invisible windows.
+                let titled = if matches!(s.as_deref(), Some("AXDialog") | Some("AXUnknown")) {
                     let mut title_value: *const c_void = std::ptr::null();
                     if AXUIElementCopyAttributeValue(element, title_key, &mut title_value)
                         == K_AX_SUCCESS
@@ -1838,7 +1845,7 @@ fn get_ax_windows_for_pid_with_identity(
                 } else {
                     false
                 };
-                ax_subrole_kept(s.as_deref(), titled)
+                ax_subrole_kept(s.as_deref(), role.as_deref(), titled)
             } else {
                 // 无 subrole → 视为标准窗口(部分 App 不设置此属性)。
                 // No subrole means standard window for apps that don't set it.
@@ -2854,20 +2861,31 @@ mod tests {
     fn ax_subrole_keep_rule_accepts_standard_and_titled_dialog() {
         use super::ax_subrole_kept;
         // 标准窗口:任意标题。/ Standard windows: any title.
-        assert!(ax_subrole_kept(Some("AXStandardWindow"), false));
-        assert!(ax_subrole_kept(Some("AXStandardWindow"), true));
+        assert!(ax_subrole_kept(
+            Some("AXStandardWindow"),
+            Some("AXWindow"),
+            false
+        ));
+        assert!(ax_subrole_kept(
+            Some("AXStandardWindow"),
+            Some("AXWindow"),
+            true
+        ));
         // AXDialog(JetBrains 主窗口):必须带非空标题。
         // AXDialog (JetBrains main windows): must be titled.
-        assert!(ax_subrole_kept(Some("AXDialog"), true));
-        assert!(!ax_subrole_kept(Some("AXDialog"), false));
+        assert!(ax_subrole_kept(Some("AXDialog"), Some("AXWindow"), true));
+        assert!(!ax_subrole_kept(Some("AXDialog"), Some("AXWindow"), false));
+        // Xcode reports ordinary windows as AXUnknown, but only with AXWindow role and title.
+        assert!(ax_subrole_kept(Some("AXUnknown"), Some("AXWindow"), true));
+        assert!(!ax_subrole_kept(Some("AXUnknown"), Some("AXWindow"), false));
+        assert!(!ax_subrole_kept(Some("AXUnknown"), Some("AXButton"), true));
         // 弹窗/面板/隐形窗口:一律过滤。
         // Popups/panels/invisible windows: always filtered.
-        assert!(!ax_subrole_kept(Some("AXUnknown"), true));
-        assert!(!ax_subrole_kept(Some("AXSheet"), true));
-        assert!(!ax_subrole_kept(Some("AXDrawer"), true));
+        assert!(!ax_subrole_kept(Some("AXSheet"), Some("AXWindow"), true));
+        assert!(!ax_subrole_kept(Some("AXDrawer"), Some("AXWindow"), true));
         // 无 subrole(部分 App 不设置)→ 视为标准窗口。
         // Missing subrole (some apps don't set it) -> standard.
-        assert!(ax_subrole_kept(None, false));
+        assert!(ax_subrole_kept(None, None, false));
     }
 
     #[test]
