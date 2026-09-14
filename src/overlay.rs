@@ -103,6 +103,31 @@ pub(crate) static THUMB_SCROLLER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlo
 pub(crate) static GLASS_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 pub(crate) static CARD_CLASS: Mutex<Option<StaticClass>> = Mutex::new(None);
 
+/// Copy a main-thread UI pointer out of its slot before calling AppKit.
+///
+/// 在调用 AppKit 前先把主线程 UI 指针复制出来并结束槽位借用。AppKit 的部分方法会同步
+/// 触发 Objective-C 通知回调；如果回调再次访问同一个 `MainThreadSlot`，持有 `RefMut`
+/// 就会触发 `BorrowMutError`。
+///
+/// Copy the main-thread UI pointer out of its slot before calling AppKit. Some AppKit methods
+/// synchronously deliver Objective-C notifications; keeping the `RefMut` alive across such a
+/// call lets a re-entered callback hit the same slot and panic with `BorrowMutError`.
+pub(super) fn overlay_window_ptr() -> Option<*mut AnyObject> {
+    OVERLAY_WINDOW
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|window| window.0)
+}
+
+pub(super) fn overlay_container_ptr() -> Option<*mut AnyObject> {
+    CONTAINER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|container| container.0)
+}
+
 /// 注册 OhMyTabCardView 卡片类(此前在 main.rs 注册、本模块使用,归属已收回)。
 /// Register the OhMyTabCardView class (registration used to live in main.rs while
 /// the class is owned/used here; ownership is now local).
@@ -723,6 +748,7 @@ mod tests {
     use super::card_reconcile_action;
     use super::cg_window_center_to_appkit_point;
     use super::color_with_alpha;
+    use super::delayed_order_out_should_hide;
     use super::display_title;
     use super::edge_row_nav_index;
     use super::horizontal_nav_index;
@@ -1161,6 +1187,12 @@ mod tests {
         assert_eq!(display_title("Safari — Apple", "Safari"), "Safari — Apple");
         assert_eq!(display_title("x", "App"), "x");
     }
+
+    #[test]
+    fn stale_delayed_order_out_does_not_hide_a_new_summon() {
+        assert!(delayed_order_out_should_hide(false));
+        assert!(!delayed_order_out_should_hide(true));
+    }
 }
 
 // ========== 通用控件 helper / generic control helper ==========
@@ -1230,6 +1262,7 @@ pub(crate) fn show_first_summon(backward: bool) {
 /// 首帧选中状态的准备与显示分开,这样在等待快照时收到 CmdReleased 可以直接提交目标,
 /// 而不必先短暂显示再隐藏浮窗。
 fn prepare_first_summon_state(backward: bool) {
+    cancel_scheduled_order_out();
     with_tab_state(|state_opt| {
         let state = state_opt.as_mut().unwrap();
         state.visible = true;
@@ -2152,9 +2185,12 @@ pub(crate) fn hide_overlay() {
     stop_hover_timer();
     clear_thumbnail_scroll_drag();
     set_thumbnail_scroller_hover(false, false);
+    // Drop the slot borrow before orderOut: AppKit can synchronously deliver resign-key here.
+    // 在 orderOut 前结束槽位借用:AppKit 可能在这里同步派发 resign-key 通知。
+    let window = overlay_window_ptr();
     unsafe {
-        if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
-            let _: () = msg_send![window.0, orderOut: std::ptr::null::<AnyObject>()];
+        if let Some(window) = window {
+            let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
     crate::performance::end_switcher_activity();
@@ -2246,6 +2282,12 @@ unsafe fn overlay_observer() -> *mut AnyObject {
 /// 浮窗失去 key → 取消切换。
 /// The overlay lost key -> cancel the switch.
 extern "C" fn overlay_window_resigned(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
+    crate::callback_guard::void("overlay_window_resigned", || {
+        overlay_window_resigned_inner();
+    });
+}
+
+fn overlay_window_resigned_inner() {
     // Closing the settings card intentionally hides our settings window and can make the
     // nonactivating overlay resign key as a side effect. The close transition owns that focus
     // change; do not mistake it for a click outside and hide the overlay while it is reflowing.
@@ -2273,7 +2315,9 @@ extern "C" fn overlay_window_resigned(_self: *mut c_void, _cmd: Sel, _note: *mut
         // foreground-app window, or AppKit focus reassignment can all displace a nonactivating
         // panel. Capture only the non-sensitive state needed to distinguish those cases.
         unsafe {
-            let window = OVERLAY_WINDOW.lock().unwrap().map(|window| window.0);
+            // The helper ends the slot borrow before any AppKit query can re-enter us.
+            // helper 会在调用 AppKit 查询前结束槽位借用,避免回调重入时再次借用。
+            let window = overlay_window_ptr();
             let pointer_inside = window.is_some_and(|window| {
                 let frame: NSRect = msg_send![window, frame];
                 let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
@@ -2450,18 +2494,22 @@ pub(crate) fn vanish_overlay() {
     stop_hover_timer();
     clear_thumbnail_scroll_drag();
     set_thumbnail_scroller_hover(false, false);
+    // Copy both pointers before any AppKit call; resignKeyWindow can synchronously notify us.
+    // 在调用 AppKit 前复制两个指针;resignKeyWindow 可能同步触发通知回调。
+    let window = overlay_window_ptr();
+    let container = overlay_container_ptr();
     unsafe {
-        if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
+        if let Some(window) = window {
             // alphaValue=0 + contentView hidden:即时视觉消失,但窗口保持 ordered。
             // alphaValue=0 + contentView hidden: instant visual hide, window stays ordered.
-            let _: () = msg_send![window.0, setAlphaValue: 0.0f64];
-            if let Some(container) = *CONTAINER.lock().unwrap() {
-                let _: () = msg_send![container.0, setHidden: true];
+            let _: () = msg_send![window, setAlphaValue: 0.0f64];
+            if let Some(container) = container {
+                let _: () = msg_send![container, setHidden: true];
             }
             // 忽略鼠标事件,防止隐形面板吞点击(直到 delayed orderOut 真正移除它)。
             // Ignore mouse events so the invisible panel doesn't swallow clicks (until the
             // delayed orderOut actually removes it).
-            let _: () = msg_send![window.0, setIgnoresMouseEvents: true];
+            let _: () = msg_send![window, setIgnoresMouseEvents: true];
             // 释放面板的 key window 状态:否则 0.2s 后 orderOut 时 AppKit 会把 key 提升给
             // 我们 app 的下一个可见窗口(设置窗口),重新激活我们,把目标窗口的焦点抢走
             // (目标红绿灯变灰,日志里可见切换后我们 app 的激活通知反复出现)。
@@ -2471,7 +2519,7 @@ pub(crate) fn vanish_overlay() {
             // re-activating us and stealing focus from the target (grey traffic lights; the log
             // shows our app's activation notification repeatedly following switches). Resigning
             // key before activating the target lets the target take key focus cleanly.
-            let _: () = msg_send![window.0, resignKeyWindow];
+            let _: () = msg_send![window, resignKeyWindow];
         }
     }
 }
@@ -2483,17 +2531,36 @@ pub(crate) fn vanish_overlay() {
 /// vanish_overlay, removing the overlay for real once the target window's activation has
 /// settled and WindowServer focus routing is stable.
 pub(crate) extern "C" fn on_delayed_order_out(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    hide_overlay();
+    crate::callback_guard::void("on_delayed_order_out", on_delayed_order_out_inner);
+}
+
+fn delayed_order_out_should_hide(overlay_visible: bool) -> bool {
+    !overlay_visible
+}
+
+fn on_delayed_order_out_inner() {
+    let overlay_visible =
+        with_tab_state(|state_opt| state_opt.as_ref().is_some_and(|state| state.visible));
+    if !delayed_order_out_should_hide(overlay_visible) {
+        // A new summon can happen before an older delayed callback fires. Do not order out the
+        // new overlay; only restore the visual state left by the previous vanish.
+        // 旧回调可能在新一轮召唤后才触发。不能收起新的浮窗,这里只恢复上一次 vanish 留下的显示状态。
+        log_debug!("[overlay] skipped stale delayed orderOut while overlay is visible");
+    } else {
+        hide_overlay();
+    }
     // 恢复浮窗的 alphaValue / contentView 可见性 / 鼠标事件,下次 show_overlay 时正常显示。
     // Restore the overlay's alphaValue / contentView visibility / mouse events for the next
     // show_overlay call.
+    let window = overlay_window_ptr();
+    let container = overlay_container_ptr();
     unsafe {
-        if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
-            let _: () = msg_send![window.0, setAlphaValue: 1.0f64];
-            let _: () = msg_send![window.0, setIgnoresMouseEvents: false];
+        if let Some(window) = window {
+            let _: () = msg_send![window, setAlphaValue: 1.0f64];
+            let _: () = msg_send![window, setIgnoresMouseEvents: false];
         }
-        if let Some(container) = *CONTAINER.lock().unwrap() {
-            let _: () = msg_send![container.0, setHidden: false];
+        if let Some(container) = container {
+            let _: () = msg_send![container, setHidden: false];
         }
     }
 }
@@ -2553,6 +2620,24 @@ pub(crate) extern "C" fn on_deferred_raise(_self: *mut c_void, _cmd: Sel, _arg: 
         job.scheduled_at.elapsed().as_millis()
     );
     activate_and_raise(job.pid, job.cgwid, job.minimized);
+}
+
+fn cancel_scheduled_order_out() {
+    unsafe {
+        let Some(ctrl) = crate::CONTROLLER
+            .lock()
+            .unwrap()
+            .map(|controller| controller.0)
+        else {
+            return;
+        };
+        let _: () = msg_send![
+            class!(NSObject),
+            cancelPreviousPerformRequestsWithTarget: ctrl,
+            selector: sel!(handleDelayedOrderOut:),
+            object: std::ptr::null::<AnyObject>()
+        ];
+    }
 }
 
 /// 在主线程上延迟 0.2s 执行 orderOut(通过 controller 的 handleDelayedOrderOut:)。
