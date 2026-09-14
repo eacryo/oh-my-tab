@@ -148,53 +148,34 @@ pub(crate) fn smoke_runner() -> bool {
             );
         }
     }
-    // 清空入口 GUI 冒烟:点击入口仅展示确认卡片,取消后历史不变;实际清空范围由纯逻辑
+    // 清空入口 GUI 冒烟:两个清除操作始终并排显示,不再展开确认卡片;实际清空范围由纯逻辑
     // 测试覆盖,避免这个 smoke 为后续详情路径丢失全部 fixture。
-    // Clear-entry GUI smoke: opening the entry point only shows the confirmation card, and
-    // cancel leaves history unchanged; clear scopes are covered by pure logic tests so this
-    // smoke retains all fixtures for the subsequent detail path.
-    let before_cancel = CLIP_HISTORY.lock().unwrap().len();
+    // Clear-entry GUI smoke: both clear actions remain visible side by side without an
+    // expansion card; clear scopes are covered by pure logic tests so this smoke retains all
+    // fixtures for the subsequent detail path.
     unsafe {
-        clear_clipboard_history(
-            observer() as *mut c_void,
-            sel!(clearClipboardHistory:),
-            std::ptr::null_mut(),
-        );
-    }
-    assert!(clear_history_confirmation_expanded());
-    unsafe {
-        let confirmation = (*CLEAR_HISTORY_CONFIRMATION.lock().unwrap())
-            .expect("clear confirmation views must be built");
-        let frames: [NSRect; 3] = [confirmation.unpinned, confirmation.all, confirmation.cancel]
-            .map(|button| msg_send![button.0, frame]);
-        assert_eq!(frames[0].origin.x, frames[1].origin.x);
-        assert_eq!(frames[1].origin.x, frames[2].origin.x);
-        assert!(frames[0].origin.y < frames[1].origin.y);
-        assert!(frames[1].origin.y < frames[2].origin.y);
-        let parent: *mut AnyObject = msg_send![confirmation.surface.0, superview];
-        let clear = (*CLEAR_HISTORY_BUTTON.lock().unwrap()).expect("clear trigger must exist");
-        let header: *mut AnyObject = msg_send![clear.0, superview];
-        let header_parent: *mut AnyObject = msg_send![header, superview];
+        let buttons = (*CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap())
+            .expect("persistent clear action buttons must be built");
+        let frames: [NSRect; 2] = buttons.map(|button| msg_send![button.0, frame]);
+        assert!(frames[0].origin.x < frames[1].origin.x);
+        assert_eq!(frames[0].origin.y, frames[1].origin.y);
         assert_eq!(
-            parent, header_parent,
-            "confirmation must share the header's parent"
+            frames[1].origin.x - (frames[0].origin.x + frames[0].size.width),
+            10.0
         );
-        let header_frame: NSRect = msg_send![header, frame];
-        for button in [confirmation.unpinned, confirmation.all] {
+        let header: *mut AnyObject = msg_send![buttons[0].0, superview];
+        let parent: *mut AnyObject = msg_send![header, superview];
+        for button in buttons {
             let bounds: NSRect = msg_send![button.0, bounds];
             let in_parent: NSRect = msg_send![button.0, convertRect: bounds, toView: parent];
             let center = NSPoint::new(
                 in_parent.origin.x + in_parent.size.width / 2.0,
                 in_parent.origin.y + in_parent.size.height / 2.0,
             );
-            assert!(
-                center.y < header_frame.origin.y,
-                "red button must extend below the header"
-            );
             let hit: *mut AnyObject = msg_send![parent, hitTest: center];
             assert_eq!(
                 hit, button.0,
-                "red button must receive hits beyond the header"
+                "clear action button must remain directly hit-testable"
             );
         }
         let pills: Vec<*mut AnyObject> = FILTER_PILLS
@@ -208,17 +189,11 @@ pub(crate) fn smoke_runner() -> bool {
                 let hidden: bool = msg_send![*pill, isHidden];
                 !hidden
             }),
-            "filter tabs must remain visible while the confirmation card is expanded"
+            "filter tabs must remain visible beside clear actions"
         );
 
-        clear_clipboard_cancel(
-            observer() as *mut c_void,
-            sel!(clearClipboardCancel:),
-            std::ptr::null_mut(),
-        );
+        assert!(CLEAR_HISTORY_CONFIRMATION.lock().unwrap().is_none());
     }
-    assert!(!clear_history_confirmation_expanded());
-    assert_eq!(CLIP_HISTORY.lock().unwrap().len(), before_cancel);
     // 搜索冒烟:设置搜索词 → 重建(过滤显示)→ 方向键在过滤列表内导航 → 清空恢复。
     // Search smoke: set a query -> rebuild (filtered display) -> arrow navigation within the
     // filtered list -> clear restores everything.

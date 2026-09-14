@@ -256,20 +256,17 @@ const FOOTER_GROUP_GAP: f64 = 16.0;
 /// 列表顶部与头部条的间距(设计稿 .history padding-top 2px)。
 /// The list's top offset inside the document (mockup 2px).
 const CLEAR_BTN_GAP: f64 = 2.0;
-/// 清空确认卡片的固定几何;三个操作纵向排列并共享同一宽度。
-/// Fixed geometry for the clear-confirmation card; the three actions are stacked vertically
-/// and share one width.
-const CLEAR_CONFIRM_BUTTON_W: f64 = (PICKER_W - 2.0 * FILTERS_PAD_X) / 3.0 - 8.0;
-const CLEAR_CONFIRM_BUTTON_H: f64 = 26.0;
-const CLEAR_CONFIRM_GAP: f64 = 6.0;
+/// 清空确认卡片的固定几何;两个文字操作横向排列并共享同一基线。
+/// Fixed geometry for the clear-confirmation card; two text actions share one horizontal baseline.
+const CLEAR_CONFIRM_BUTTON_H: f64 = 24.0;
+const CLEAR_CONFIRM_BUTTON_PAD_X: f64 = 8.0;
+const CLEAR_CONFIRM_GAP: f64 = 10.0;
 const CLEAR_CONFIRM_CARD_PAD_X: f64 = 8.0;
 const CLEAR_CONFIRM_CARD_PAD_Y: f64 = 6.0;
-const CLEAR_CONFIRM_CARD_H: f64 =
-    CLEAR_CONFIRM_CARD_PAD_Y * 2.0 + CLEAR_CONFIRM_BUTTON_H * 3.0 + CLEAR_CONFIRM_GAP * 2.0;
-const CLEAR_CONFIRM_CARD_W: f64 = CLEAR_CONFIRM_BUTTON_W + CLEAR_CONFIRM_CARD_PAD_X * 2.0;
+const CLEAR_CONFIRM_CARD_H: f64 = CLEAR_CONFIRM_CARD_PAD_Y * 2.0 + CLEAR_CONFIRM_BUTTON_H;
+const CLEAR_CONFIRM_BUTTON_FONT_SIZE: f64 = 11.0;
 const CLEAR_CONFIRM_SHELL_DURATION: f64 = 0.46;
 const CLEAR_CONFIRM_CONTENT_DURATION: f64 = 0.36;
-const NSEVENT_TYPE_LEFT_MOUSE_DOWN: usize = 1;
 /// 玻璃圆角(设计稿 16px)/ the glass panel's corner radius (16px).
 const CORNER_R: f64 = 16.0;
 /// 行选中高亮圆角(设计稿 8px)/ the row highlight's corner radius (8px).
@@ -712,9 +709,10 @@ static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec:
 /// The filter pills' button pointers (one per tag; restyled on change/rebuild).
 static FILTER_PILLS: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
 
-/// 清空历史按钮指针(语言切换时更新标题和按英文宽度重排)。
-/// The clear-history button, whose title and frame are relaid out on locale changes.
-static CLEAR_HISTORY_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// 清空历史操作按钮指针(语言切换时更新标题和按英文宽度重排)。
+/// Persistent clear-history action buttons, relaid out when the locale changes.
+static CLEAR_HISTORY_ACTION_BUTTONS: MainThreadSlot<Option<[ObjPtr; 2]>> =
+    MainThreadSlot::new(None);
 
 const CLIPBOARD_UNDO_WINDOW: Duration = Duration::from_secs(30);
 
@@ -739,14 +737,16 @@ static DELETED_CLIPBOARD_ENTRY: LazyLock<Mutex<Option<DeletedClipboardEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 static DELETED_CLIPBOARD_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Legacy confirmation views retained for compatibility with the existing collapse animation.
+/// The normal picker now uses persistent action buttons and never creates this card.
 #[derive(Clone, Copy)]
 struct ClearHistoryConfirmationViews {
     surface: ObjPtr,
     unpinned: ObjPtr,
     all: ObjPtr,
-    cancel: ObjPtr,
 }
 
+static CLEAR_HISTORY_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static CLEAR_HISTORY_CONFIRMATION: MainThreadSlot<Option<ClearHistoryConfirmationViews>> =
     MainThreadSlot::new(None);
 static CLEAR_HISTORY_CONFIRMATION_EXPANDED: AtomicBool = AtomicBool::new(false);
@@ -1077,12 +1077,6 @@ unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
-                sel!(clearClipboardCancel:),
-                clear_clipboard_cancel as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
                 sel!(finishClearHistoryCollapse:),
                 finish_clear_history_collapse as *mut c_void,
                 types.as_ptr(),
@@ -1371,55 +1365,9 @@ extern "C" fn window_did_resign_key(_self: *mut c_void, _cmd: Sel, _note: *mut c
     hide_picker();
 }
 
-unsafe fn clear_confirmation_contains_hit_view(hit_view: *mut AnyObject) -> bool {
-    if hit_view.is_null() {
-        return false;
-    }
-    let Some(confirmation) = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() else {
-        return false;
-    };
-    let mut view = hit_view;
-    while !view.is_null() {
-        if view == confirmation.surface.0 {
-            return true;
-        }
-        view = msg_send![view, superview];
-    }
-    false
-}
-
-unsafe fn collapse_clear_confirmation_on_external_click(
-    window: *mut AnyObject,
-    event: *mut AnyObject,
-) {
-    if !clear_history_confirmation_expanded() || window.is_null() || event.is_null() {
-        return;
-    }
-    let content: *mut AnyObject = msg_send![window, contentView];
-    if content.is_null() {
-        return;
-    }
-    let location: NSPoint = msg_send![event, locationInWindow];
-    let point: NSPoint = msg_send![
-        content,
-        convertPoint: location,
-        fromView: std::ptr::null::<AnyObject>()
-    ];
-    let hit_view: *mut AnyObject = msg_send![content, hitTest: point];
-    if !clear_confirmation_contains_hit_view(hit_view) {
-        set_clear_history_confirmation_expanded(false);
-    }
-}
-
 extern "C" fn clipboard_window_send_event(_self: *mut c_void, _cmd: Sel, event: *mut AnyObject) {
     unsafe {
         let window = _self as *mut AnyObject;
-        if !event.is_null() {
-            let event_type: usize = msg_send![event, type];
-            if event_type == NSEVENT_TYPE_LEFT_MOUSE_DOWN {
-                collapse_clear_confirmation_on_external_click(window, event);
-            }
-        }
         type SendEvent = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
         let mut sup = ObjcSuper {
             receiver: window as *mut c_void,
@@ -2049,22 +1997,31 @@ fn picker_filters_y() -> f64 {
     TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y
 }
 
-fn clear_history_confirmation_layout(anchor: NSRect) -> (NSRect, [NSRect; 3]) {
+fn clear_history_confirmation_layout(anchor: NSRect) -> (NSRect, [NSRect; 2]) {
+    let labels = [
+        t("clipboard.clear_confirm_unpinned"),
+        t("clipboard.clear_confirm_all"),
+    ];
+    let button_widths = labels.map(|label| {
+        localized_string_width(&label, CLEAR_CONFIRM_BUTTON_FONT_SIZE)
+            + CLEAR_CONFIRM_BUTTON_PAD_X * 2.0
+    });
+    let card_width =
+        CLEAR_CONFIRM_CARD_PAD_X * 2.0 + button_widths.iter().sum::<f64>() + CLEAR_CONFIRM_GAP;
     let surface = NSRect::new(
         NSPoint::new(
-            anchor.origin.x + anchor.size.width - CLEAR_CONFIRM_CARD_W,
+            anchor.origin.x + anchor.size.width - card_width,
             anchor.origin.y,
         ),
-        NSSize::new(CLEAR_CONFIRM_CARD_W, CLEAR_CONFIRM_CARD_H),
+        NSSize::new(card_width, CLEAR_CONFIRM_CARD_H),
     );
     let buttons = std::array::from_fn(|index| {
+        let x = CLEAR_CONFIRM_CARD_PAD_X
+            + button_widths[..index].iter().sum::<f64>()
+            + index as f64 * CLEAR_CONFIRM_GAP;
         NSRect::new(
-            NSPoint::new(
-                (surface.size.width - CLEAR_CONFIRM_BUTTON_W) / 2.0,
-                CLEAR_CONFIRM_CARD_PAD_Y
-                    + index as f64 * (CLEAR_CONFIRM_BUTTON_H + CLEAR_CONFIRM_GAP),
-            ),
-            NSSize::new(CLEAR_CONFIRM_BUTTON_W, CLEAR_CONFIRM_BUTTON_H),
+            NSPoint::new(x, CLEAR_CONFIRM_CARD_PAD_Y),
+            NSSize::new(button_widths[index], CLEAR_CONFIRM_BUTTON_H),
         )
     });
     (surface, buttons)
@@ -2300,7 +2257,7 @@ fn set_clear_history_confirmation_expanded(expanded: bool) {
                 relativeTo: std::ptr::null::<AnyObject>()
             ];
         }
-        for button in [views.unpinned.0, views.all.0, views.cancel.0] {
+        for button in [views.unpinned.0, views.all.0] {
             let _: () = msg_send![button, setHidden: false];
             if !animated {
                 let layer: *mut AnyObject = msg_send![button, layer];
@@ -2355,7 +2312,7 @@ extern "C" fn finish_clear_history_collapse(_self: *mut c_void, _cmd: Sel, _send
     };
     unsafe {
         let _: () = msg_send![views.surface.0, setHidden: true];
-        for button in [views.unpinned.0, views.all.0, views.cancel.0] {
+        for button in [views.unpinned.0, views.all.0] {
             let _: () = msg_send![button, setHidden: true];
         }
     }
@@ -2402,10 +2359,6 @@ extern "C" fn clear_clipboard_unpinned(_self: *mut c_void, _cmd: Sel, _sender: *
 extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     set_clear_history_confirmation_expanded(false);
     clear_clipboard_history_scope(true);
-}
-
-extern "C" fn clear_clipboard_cancel(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    set_clear_history_confirmation_expanded(false);
 }
 
 /// 清空搜索词 + 搜索框文本(不重建;调用方按需 rebuild)。
@@ -5182,6 +5135,11 @@ pub(crate) unsafe fn apply_theme() {
     }
     apply_glass_properties();
     apply_clear_history_confirmation_theme();
+    if let Some(buttons) = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() {
+        for button in buttons {
+            set_clear_confirmation_button_style(button.0, false);
+        }
+    }
 }
 
 unsafe fn ensure_picker_window() {
@@ -5725,42 +5683,49 @@ unsafe fn ensure_picker_window() {
     }
     update_filter_pill_style(false);
 
-    // 清空历史(新设计稿 .clear-history):筛选行右侧(间距 auto),透明、10px、28% 黑,
-    // 悬停变红并显示带小圆角的浅红底。
-    // Clear history (the new mockup's .clear-history): at the filters row's right (auto
-    // margin), transparent, 10px / 28% black; hover turns red with a subtly rounded red fill.
-    let clear_w = localized_string_width(&t("clipboard.clear_all"), 12.0) + 8.0;
-    let clear_x = PICKER_W - SEARCH_PAD_X - clear_w;
-    let clear_frame = NSRect::new(
-        NSPoint::new(clear_x, filters_y + 8.0),
-        NSSize::new(clear_w, 20.0),
-    );
-    let clear_btn: *mut AnyObject = msg_send![hover_button_class(), alloc];
-    let clear_btn: *mut AnyObject = msg_send![
-        clear_btn,
-        initWithFrame: clear_frame
+    // 清空历史:筛选行右侧始终显示两个紧凑文字按钮,不再先展开确认卡片。
+    // Clear history: keep two compact text actions visible beside the filters instead of
+    // expanding a separate confirmation card first.
+    let clear_labels = [
+        t("clipboard.clear_confirm_unpinned"),
+        t("clipboard.clear_confirm_all"),
     ];
-    let _: () = msg_send![clear_btn, setBordered: false];
-    // 悬停底色绘制在 CALayer 上;设置小圆角以免矩形底色露出直角。
-    // The hover fill is drawn on the CALayer; use a small radius so its rectangle has no
-    // exposed sharp corners.
-    let _: () = msg_send![clear_btn, setWantsLayer: true];
-    let clear_layer: *mut AnyObject = msg_send![clear_btn, layer];
-    let _: () = msg_send![clear_layer, setCornerRadius: 5.0f64];
-    let cfont: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-    let _: () = msg_send![clear_btn, setFont: cfont];
-    let ccolor = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
-    let _: () = msg_send![clear_btn, setContentTintColor: ccolor];
-    let title_ns = make_nsstring(&t("clipboard.clear_all"));
-    let _: () = msg_send![clear_btn, setTitle: title_ns];
-    CFRelease(title_ns as *const c_void);
-    let _: () = msg_send![clear_btn, setTarget: observer()];
-    let _: () = msg_send![clear_btn, setAction: sel!(clearClipboardHistory:)];
-    add_hover_tracking(clear_btn);
-    let _: () = msg_send![header_strip, addSubview: clear_btn];
-    release_obj(clear_btn);
-    *CLEAR_HISTORY_BUTTON.lock().unwrap() = Some(ObjPtr::new(clear_btn));
-    build_clear_history_confirmation(header_strip, clear_frame);
+    let clear_actions = [sel!(clearClipboardUnpinned:), sel!(clearClipboardAll:)];
+    let clear_widths: [f64; 2] =
+        std::array::from_fn(|i| localized_string_width(&clear_labels[i], 12.0) + 8.0);
+    let clear_total_w = clear_widths.iter().sum::<f64>() + CLEAR_CONFIRM_GAP;
+    let mut clear_x = PICKER_W - SEARCH_PAD_X - clear_total_w;
+    let mut clear_buttons = [std::ptr::null_mut(); 2];
+    for i in 0..2 {
+        let frame = NSRect::new(
+            NSPoint::new(clear_x, filters_y + 8.0),
+            NSSize::new(clear_widths[i], 20.0),
+        );
+        let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+        let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
+        let _: () = msg_send![button, setBordered: false];
+        let _: () = msg_send![button, setWantsLayer: true];
+        let button_layer: *mut AnyObject = msg_send![button, layer];
+        if !button_layer.is_null() {
+            let _: () = msg_send![button_layer, setCornerRadius: 5.0f64];
+        }
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+        let _: () = msg_send![button, setFont: font];
+        let title = make_nsstring(&clear_labels[i]);
+        let _: () = msg_send![button, setTitle: title];
+        CFRelease(title as *const c_void);
+        let _: () = msg_send![button, setTarget: observer()];
+        let _: () = msg_send![button, setAction: clear_actions[i]];
+        set_clear_confirmation_button_style(button, false);
+        add_hover_tracking(button);
+        let _: () = msg_send![header_strip, addSubview: button];
+        release_obj(button);
+        clear_buttons[i] = button;
+        clear_x += clear_widths[i] + CLEAR_CONFIRM_GAP;
+    }
+    *CLEAR_HISTORY_BUTTON.lock().unwrap() = None;
+    *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() =
+        Some([ObjPtr::new(clear_buttons[0]), ObjPtr::new(clear_buttons[1])]);
 
     // 底部栏(新设计稿 .footer):43pt,顶部分隔线 + 条目数 + 快捷键图例(清空已移到
     // 筛选行)。/ The footer: a top hairline + the entry count + the shortcut legends
@@ -7932,17 +7897,6 @@ fn confirmation_surface_background(palette: crate::theme::UiPalette) -> u32 {
     (palette.card_bg & 0xFFFF_FF00) | alpha
 }
 
-fn clear_confirmation_destructive_colors(palette: crate::theme::UiPalette) -> (u32, u32) {
-    // 确认卡片使用较柔和的红色,避免大面积纯高饱和红色过于刺眼。
-    // Use softer confirmation reds so the large destructive surfaces are less harsh than the
-    // shared settings/action destructive color.
-    if palette.dark {
-        (0xD95A52FF, 0xB94A45FF)
-    } else {
-        (0xD95C55FF, 0xBC4C47FF)
-    }
-}
-
 unsafe fn is_clear_confirmation_button(button: *mut AnyObject) -> bool {
     if button.is_null() {
         return false;
@@ -7954,35 +7908,36 @@ unsafe fn is_clear_confirmation_button(button: *mut AnyObject) -> bool {
     parent == confirmation.surface.0
 }
 
+unsafe fn is_clear_history_action_button(button: *mut AnyObject) -> bool {
+    CLEAR_HISTORY_ACTION_BUTTONS
+        .lock()
+        .unwrap()
+        .map(|buttons| buttons.iter().any(|candidate| candidate.0 == button))
+        .unwrap_or(false)
+}
+
 unsafe fn set_clear_confirmation_button_style(button: *mut AnyObject, hovered: bool) {
     if button.is_null() {
         return;
     }
     let action: Sel = msg_send![button, action];
-    let destructive = is_clear_history_destructive_action(action);
     let palette = clipboard_palette();
-    let (destructive_color, destructive_hover_color) =
-        clear_confirmation_destructive_colors(palette);
-    let background = if destructive {
-        if hovered {
-            destructive_hover_color
-        } else {
-            destructive_color
-        }
-    } else if hovered {
-        palette.hover_bg
+    let background = if hovered {
+        // 只给文字按钮一层很浅的悬停反馈,避免恢复成实心危险按钮。
+        // Give text buttons only a faint hover wash instead of restoring a solid destructive fill.
+        (palette.hover_bg & 0xFFFF_FF00) | if palette.dark { 0x28 } else { 0x18 }
     } else {
-        palette.button_bg
+        0x00000000
     };
-    let text = if destructive {
-        0xFFFF_FFFF
+    let text = if action == sel!(clearClipboardAll:) {
+        palette.destructive
     } else {
-        palette.primary_text
+        palette.secondary_text
     };
     let layer: *mut AnyObject = msg_send![button, layer];
     if !layer.is_null() {
         crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
-        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x00000000));
     }
     let _: () = msg_send![button, setContentTintColor: crate::ffi::hex_to_ns_color(text)];
 }
@@ -8107,7 +8062,7 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
-        if is_clear_confirmation_button(b) {
+        if is_clear_confirmation_button(b) || is_clear_history_action_button(b) {
             set_clear_confirmation_button_style(b, true);
             return;
         }
@@ -8157,7 +8112,7 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_v
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
-        if is_clear_confirmation_button(b) {
+        if is_clear_confirmation_button(b) || is_clear_history_action_button(b) {
             set_clear_confirmation_button_style(b, false);
             return;
         }
@@ -8324,6 +8279,7 @@ unsafe fn make_filter_pill(label: &str, tag: isize, x: f64, y: f64, w: f64) -> *
 /// 创建清空历史的确认卡片;与固定 header 同级,展开时覆盖列表。
 /// Build the clear-history confirmation card alongside the fixed header so its lower rows
 /// remain interactive while it overlays the list.
+#[allow(dead_code)]
 unsafe fn build_clear_history_confirmation(header_strip: *mut AnyObject, anchor: NSRect) {
     let (surface_in_header, button_frames) = clear_history_confirmation_layout(anchor);
     let parent: *mut AnyObject = msg_send![header_strip, superview];
@@ -8356,16 +8312,10 @@ unsafe fn build_clear_history_confirmation(header_strip: *mut AnyObject, anchor:
     let labels = [
         t("clipboard.clear_confirm_unpinned"),
         t("clipboard.clear_confirm_all"),
-        t("clipboard.clear_confirm_cancel"),
     ];
-    let actions = [
-        sel!(clearClipboardUnpinned:),
-        sel!(clearClipboardAll:),
-        sel!(clearClipboardCancel:),
-    ];
-    let (destructive_color, _) = clear_confirmation_destructive_colors(palette);
-    let mut buttons = [std::ptr::null_mut(); 3];
-    for i in 0..3 {
+    let actions = [sel!(clearClipboardUnpinned:), sel!(clearClipboardAll:)];
+    let mut buttons = [std::ptr::null_mut(); 2];
+    for i in 0..2 {
         let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
         let button: *mut AnyObject = msg_send![
             button,
@@ -8382,28 +8332,15 @@ unsafe fn build_clear_history_confirmation(header_strip: *mut AnyObject, anchor:
         let _: () = msg_send![button, setWantsLayer: true];
         let button_layer: *mut AnyObject = msg_send![button, layer];
         if !button_layer.is_null() {
-            crate::ffi::layer_set_border(
-                button_layer,
-                crate::ffi::hex_to_cg_color(palette.card_border),
-            );
-            let _: () = msg_send![button_layer, setBorderWidth: 1.0f64];
-            let _: () = msg_send![button_layer, setCornerRadius: 8.0f64];
+            crate::ffi::layer_set_border(button_layer, crate::ffi::hex_to_cg_color(0x00000000));
+            let _: () = msg_send![button_layer, setBorderWidth: 0.0f64];
+            let _: () = msg_send![button_layer, setCornerRadius: 5.0f64];
             let _: () = msg_send![button_layer, setMasksToBounds: true];
         }
-        let background = if i == 2 {
-            palette.button_bg
-        } else {
-            destructive_color
-        };
-        let text = if i == 2 {
-            palette.primary_text
-        } else {
-            0xFFFF_FFFF
-        };
         if !button_layer.is_null() {
-            crate::ffi::layer_set_background(button_layer, crate::ffi::hex_to_cg_color(background));
+            crate::ffi::layer_set_background(button_layer, crate::ffi::hex_to_cg_color(0x00000000));
         }
-        let _: () = msg_send![button, setContentTintColor: crate::ffi::hex_to_ns_color(text)];
+        set_clear_confirmation_button_style(button, false);
         let _: () = msg_send![button, setHidden: true];
         let _: () = msg_send![button, setAlphaValue: 0.0f64];
         add_hover_tracking(button);
@@ -8416,7 +8353,6 @@ unsafe fn build_clear_history_confirmation(header_strip: *mut AnyObject, anchor:
         surface: ObjPtr::new(surface),
         unpinned: ObjPtr::new(buttons[0]),
         all: ObjPtr::new(buttons[1]),
-        cancel: ObjPtr::new(buttons[2]),
     });
 }
 
@@ -8434,7 +8370,7 @@ unsafe fn apply_clear_history_confirmation_theme() {
         crate::ffi::hex_to_cg_color(confirmation_surface_background(palette)),
     );
     crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
-    for button in [confirmation.unpinned, confirmation.all, confirmation.cancel] {
+    for button in [confirmation.unpinned, confirmation.all] {
         set_clear_confirmation_button_style(button.0, false);
     }
 }
@@ -8898,32 +8834,26 @@ pub fn refresh_localized_ui() {
             }
             update_filter_pill_style(false);
 
-            if let Some(clear) = *CLEAR_HISTORY_BUTTON.lock().unwrap() {
-                let clear_title = t("clipboard.clear_all");
-                let title = make_nsstring(&clear_title);
-                let _: () = msg_send![clear.0, setTitle: title];
-                CFRelease(title as *const c_void);
-                let width = localized_string_width(&clear_title, 12.0) + 8.0;
-                let _: () = msg_send![
-                    clear.0,
-                    setFrame: NSRect::new(
-                        NSPoint::new(PICKER_W - SEARCH_PAD_X - width, filters_y + 8.0),
-                        NSSize::new(width, 20.0)
-                    )
+            if let Some(buttons) = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() {
+                let labels = [
+                    t("clipboard.clear_confirm_unpinned"),
+                    t("clipboard.clear_confirm_all"),
                 ];
-            }
-            if let Some(confirmation) = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() {
-                for (button, label) in [
-                    (
-                        confirmation.unpinned.0,
-                        t("clipboard.clear_confirm_unpinned"),
-                    ),
-                    (confirmation.all.0, t("clipboard.clear_confirm_all")),
-                    (confirmation.cancel.0, t("clipboard.clear_confirm_cancel")),
-                ] {
-                    let title = make_nsstring(&label);
-                    let _: () = msg_send![button, setTitle: title];
+                let widths: [f64; 2] =
+                    std::array::from_fn(|i| localized_string_width(&labels[i], 12.0) + 8.0);
+                let total_width = widths.iter().sum::<f64>() + CLEAR_CONFIRM_GAP;
+                let mut x = PICKER_W - SEARCH_PAD_X - total_width;
+                for (index, button) in buttons.iter().enumerate() {
+                    let label = &labels[index];
+                    let title = make_nsstring(label);
+                    let _: () = msg_send![button.0, setTitle: title];
                     CFRelease(title as *const c_void);
+                    let frame = NSRect::new(
+                        NSPoint::new(x, filters_y + 8.0),
+                        NSSize::new(widths[index], 20.0),
+                    );
+                    let _: () = msg_send![button.0, setFrame: frame];
+                    x += widths[index] + CLEAR_CONFIRM_GAP;
                 }
             }
         }
@@ -9084,22 +9014,14 @@ mod tests {
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     #[test]
-    fn clear_confirmation_buttons_are_stacked_inside_the_expanded_header() {
+    fn clear_confirmation_buttons_are_compact_and_horizontal() {
         let anchor = NSRect::new(NSPoint::new(420.0, 66.0), NSSize::new(60.0, 20.0));
         let (surface, buttons) = clear_history_confirmation_layout(anchor);
 
-        assert_eq!(buttons[0].origin.x, buttons[1].origin.x);
-        assert_eq!(buttons[1].origin.x, buttons[2].origin.x);
-        assert_eq!(buttons[0].size.width, buttons[1].size.width);
-        assert_eq!(buttons[1].size.width, buttons[2].size.width);
-        assert!(buttons[0].origin.y < buttons[1].origin.y);
-        assert!(buttons[1].origin.y < buttons[2].origin.y);
+        assert!(buttons[0].origin.x < buttons[1].origin.x);
+        assert_eq!(buttons[0].origin.y, buttons[1].origin.y);
         assert_eq!(
-            buttons[1].origin.y - (buttons[0].origin.y + buttons[0].size.height),
-            super::CLEAR_CONFIRM_GAP
-        );
-        assert_eq!(
-            buttons[2].origin.y - (buttons[1].origin.y + buttons[1].size.height),
+            buttons[1].origin.x - (buttons[0].origin.x + buttons[0].size.width),
             super::CLEAR_CONFIRM_GAP
         );
         for button in buttons {

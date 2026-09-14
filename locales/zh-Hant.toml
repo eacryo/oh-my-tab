@@ -7,7 +7,6 @@
 clear_all = "清空歷史"
 clear_confirm_unpinned = "清除未置頂"
 clear_confirm_all = "全部清除"
-clear_confirm_cancel = "取消"
 toast_undo_delete = "已撤銷刪除"
 toast_pinned = "已置頂"
 toast_unpinned = "已取消置頂"
