@@ -72,19 +72,10 @@ pub(super) unsafe fn update_mapping_controls_enabled(u: &SettingsUi) {
     SettingsRow::set_enabled_with_tooltip(u.mapping_enabled, mouse_on, &tooltip);
     let _: () = msg_send![u.add_mapping_button, setEnabled: mappings_on];
     for row in &u.mapping_rows {
-        for &ctrl in &[
-            row.label,
-            row.desc_label,
-            row.action_icon,
-            row.edit,
-            row.delete,
-        ] {
+        for ctrl in row.interactive_views() {
             if !ctrl.is_null() {
                 SettingsRow::set_view_enabled_with_tooltip(ctrl, mappings_on, Some(&tooltip));
             }
-        }
-        for &cap in &row.caps {
-            SettingsRow::set_view_enabled_with_tooltip(cap, mappings_on, Some(&tooltip));
         }
     }
 }
@@ -104,6 +95,16 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
         // (EXC_BAD_ACCESS).
         let stale = u.mapping_rows.len();
         for row in u.mapping_rows.drain(..) {
+            // 先注销再销毁。禁用提示/tracking 注册表以裸 view 地址为键且不持有所有权,漏注销会
+            // 留下悬垂键:设置窗口的下一次鼠标按下经 sendEvent → handle_mouse_down 给已释放
+            // 对象发消息,直接 EXC_BREAKPOINT(2026-09-15 的崩溃报告即此路径)。
+            // Unregister BEFORE destroying. The disabled-hint/tracking registries are keyed by the
+            // raw view address and hold no ownership, so a missed unregister leaves a dangling key:
+            // the next settings click then goes sendEvent -> handle_mouse_down -> message to freed
+            // memory and traps with EXC_BREAKPOINT (the 2026-09-15 crash report is this path).
+            for ctrl in row.interactive_views() {
+                SettingsRow::forget(ctrl);
+            }
             let _: () = msg_send![row.label, removeFromSuperview];
             let _: () = msg_send![row.desc_label, removeFromSuperview];
             let _: () = msg_send![row.action_icon, removeFromSuperview];

@@ -307,6 +307,27 @@ struct MappingRow {
 }
 unsafe impl Send for MappingRow {}
 
+impl MappingRow {
+    /// 该行参与「可用性 / 禁用提示」注册的全部 view(action_icon 在 Key Press 行上为 null)。
+    /// 注册与注销共用这一份清单,防止两侧漂移后在注册表里留下悬垂地址(见 SettingsRow::forget)。
+    ///
+    /// Every view of this row that takes part in the availability / disabled-hint registry
+    /// (action_icon is null on Key Press rows). Registration and unregistration share this list
+    /// so the two sides cannot drift apart and leave a dangling registry entry behind
+    /// (see SettingsRow::forget).
+    fn interactive_views(&self) -> impl Iterator<Item = *mut AnyObject> + '_ {
+        [
+            self.label,
+            self.desc_label,
+            self.action_icon,
+            self.edit,
+            self.delete,
+        ]
+        .into_iter()
+        .chain(self.caps.iter().copied())
+    }
+}
+
 /// 映射区行高(独立于全局 row_h;build 的卡片高度与 render 共用)。
 /// Mapping-row height (independent of the global row_h; shared by the card height in build
 /// and by render).
@@ -6261,6 +6282,34 @@ mod tests {
         assert_eq!(rgba_hex_from_components(0.0, 0.5, 1.0, 0.25), "0080ff40");
         assert_eq!(rgba_hex_from_components(-1.0, 2.0, 0.1, 0.9), "00ff1ae6");
         assert_eq!(color_component_to_byte(0.501), 128);
+    }
+
+    #[test]
+    fn mapping_row_interactive_views_match_the_registry_contract() {
+        // 注册(mapping::update_mapping_controls_enabled)与注销(mapping::render_mapping_rows_locked)
+        // 共用 MappingRow::interactive_views。该清单必须覆盖所有参与可用性注册的 view,并排除
+        // 从不注册的 separator:少一个就会在注册表里留下悬垂地址,下一次设置窗口点击即崩溃。
+        // Registration (mapping::update_mapping_controls_enabled) and unregistration
+        // (mapping::render_mapping_rows_locked) share MappingRow::interactive_views. It must
+        // cover every view that takes part in availability registration and exclude the
+        // never-registered separator: a missing view leaves a dangling registry address that
+        // crashes the next settings click.
+        let p = |n: usize| n as *mut objc2::runtime::AnyObject;
+        let row = super::MappingRow {
+            label: p(1),
+            desc_label: p(2),
+            action_icon: p(3),
+            edit: p(4),
+            delete: p(5),
+            separator: p(6),
+            caps: vec![p(7), p(8)],
+        };
+        assert_eq!(
+            row.interactive_views()
+                .map(|view| view as usize)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 7, 8]
+        );
     }
 
     #[test]

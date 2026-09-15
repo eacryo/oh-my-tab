@@ -279,6 +279,16 @@ impl SettingsRow {
         SettingsTooltip::apply(view, enabled, (!enabled).then_some(tooltip).flatten());
     }
 
+    /// Unregister a view that is about to be removed from the hierarchy and released.
+    /// Call this before `removeFromSuperview`, never after: the registry lookups are keyed by
+    /// the view's address, so a stale entry turns the next settings click into a message to
+    /// freed memory.
+    /// 注销一个即将从视图层级移除并释放的 view。必须在 removeFromSuperview 之前调用：注册表
+    /// 以 view 地址为键，残留条目会让设置窗口的下一次点击给已释放内存发消息。
+    pub(super) unsafe fn forget(view: *mut AnyObject) {
+        SettingsTooltip::forget(view);
+    }
+
     /// Enable/disable a row and show a native AppKit bubble while it is unavailable.
     /// 启用/禁用 row；不可用时显示 AppKit 原生小气泡提示。
     pub(super) unsafe fn set_enabled_with_tooltip(

@@ -669,6 +669,25 @@ impl SettingsTooltip {
         }
     }
 
+    /// Drop a view from the disabled-hint and tracking registries before it is destroyed.
+    ///
+    /// Both registries are keyed by the view's raw address and hold no ownership, so a view that
+    /// is torn down without this call leaves a dangling key behind: the next mouse-down in the
+    /// settings window (`handle_mouse_down`) then messages the freed object and traps.
+    /// 销毁 view 前必须先清掉它在禁用提示与 tracking 注册表里的条目。两张注册表都以裸地址为键、
+    /// 不持有所有权，漏清理会留下悬垂键：设置窗口的下一次鼠标按下会走到 handle_mouse_down，
+    /// 对已释放对象发消息并触发 EXC_BREAKPOINT。
+    pub(super) unsafe fn forget(view: *mut AnyObject) {
+        if view.is_null() {
+            return;
+        }
+        DISABLED_TOOLTIPS.lock().unwrap().remove(&(view as usize));
+        // 还需在 view 存活时移除 tracking area(否则它会随 view 一起消失,但注册表仍留着键)。
+        // The tracking area must also be removed while the view is alive, or the registry keeps
+        // a key for it after the view goes away.
+        Self::set_disabled_tracking(view, false);
+    }
+
     /// Dismiss the current hint when navigation changes the visible settings page.
     /// 切换当前可见设置页时关闭已有提示，避免上一页的气泡残留。
     pub(super) unsafe fn dismiss() {
