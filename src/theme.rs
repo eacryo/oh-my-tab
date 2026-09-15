@@ -298,6 +298,12 @@ pub(crate) fn thumbnails_enabled() -> bool {
     CONFIG.read().unwrap().layout.thumbnails_enabled
 }
 
+/// 缩略图卡片标题行是否在窗口标题前显示应用名(以 " · " 分隔)。
+/// Whether the thumbnail card's caption prefixes the app name before the window title.
+pub(crate) fn show_app_name_in_cards() -> bool {
+    CONFIG.read().unwrap().layout.show_app_name_in_cards
+}
+
 // ========== 缩略图卡片布局(HTML 设计稿 preview (6).html)/ thumbnail card layout ==========
 
 /// 流式布局基准卡宽,代码内写死、与旧版图标网格的 card_width 完全独立:

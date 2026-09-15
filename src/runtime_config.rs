@@ -24,6 +24,7 @@ struct ChangeFlags {
     windows_disabled: bool,
     thumbnails: bool,
     focused_thumbnail_prewarm: bool,
+    show_app_name_in_cards: bool,
     mouse: bool,
     clipboard_enabled: bool,
     clipboard_persist: bool,
@@ -48,6 +49,8 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         thumbnails: startup || old.layout.thumbnails_enabled != new.layout.thumbnails_enabled,
         focused_thumbnail_prewarm: startup
             || old.layout.focused_thumbnail_prewarm != new.layout.focused_thumbnail_prewarm,
+        show_app_name_in_cards: old.layout.show_app_name_in_cards
+            != new.layout.show_app_name_in_cards,
         mouse: startup || old.mouse != new.mouse,
         clipboard_enabled: startup || old.clipboard.enabled != new.clipboard.enabled,
         clipboard_persist: old.clipboard.persist != new.clipboard.persist,
@@ -110,6 +113,13 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         } else {
             crate::thumbnail::stop_focused_prewarm_worker();
         }
+    }
+
+    if flags.show_app_name_in_cards {
+        // 卡片标题格式变了:收起当前浮窗,下次召唤按新签名重建卡片(旧卡片复用会保留旧标题)。
+        // The caption format changed: dismiss the overlay so the next summon rebuilds the
+        // cards from the new signature (reusing them would keep the old captions).
+        crate::overlay::reset_switcher();
     }
 
     if flags.modifier || flags.thumbnails || flags.focused_thumbnail_prewarm {

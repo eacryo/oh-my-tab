@@ -258,6 +258,10 @@ struct CardSignature {
     card_width_bits: u64,
     card_height_bits: u64,
     thumbnail_layout: bool,
+    /// 卡片标题行是否包含应用名;开关变化必须走 Replace,否则复用会让旧标题留存。
+    /// Whether the caption includes the app name; a toggle must force Replace, or reuse
+    /// would keep the old caption.
+    show_app_name_in_cards: bool,
     thumbnail_capture_allowed: bool,
     /// Cached-thumbnail version the card was painted with; a bump means the frame
     /// changed since and the card must be rebuilt instead of reused.
@@ -298,6 +302,7 @@ fn card_signature(
         card_width_bits: frame.size.width.to_bits(),
         card_height_bits: frame.size.height.to_bits(),
         thumbnail_layout,
+        show_app_name_in_cards: crate::theme::show_app_name_in_cards(),
         thumbnail_capture_allowed,
         // 帧版本入签名:种子→真实、激活补拍、外观重拍等任何一次换帧都会让下一次
         // 召唤的签名失配走 Replace,杜绝复用路径冻结旧图(图标模式下恒为 0,无扰动)。
@@ -743,8 +748,22 @@ fn display_title<'a>(title: &'a str, app_name: &'a str) -> &'a str {
     }
 }
 
+/// 缩略图卡片的标题行文本:开启「卡片显示应用名」后,应用名前置并以 " · " 与窗口标题
+/// 分隔(与底部状态栏同一分隔符);窗口无标题时只显示应用名,避免 "App · App"。
+/// The thumbnail card's caption text: with "show app name in cards" enabled the app name
+/// precedes the window title, separated by " · " (the footer's separator); a titleless
+/// window shows the app name alone, never "App · App".
+fn card_caption(title: &str, app_name: &str, show_app_name: bool) -> String {
+    if show_app_name && !title.is_empty() {
+        format!("{} · {}", app_name, title)
+    } else {
+        display_title(title, app_name).to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::card_caption;
     use super::card_reconcile_action;
     use super::cg_window_center_to_appkit_point;
     use super::color_with_alpha;
@@ -785,6 +804,7 @@ mod tests {
             card_width_bits: 100.0f64.to_bits(),
             card_height_bits: 100.0f64.to_bits(),
             thumbnail_layout: true,
+            show_app_name_in_cards: false,
             thumbnail_capture_allowed: true,
             thumb_epoch: 0,
         }
@@ -1186,6 +1206,31 @@ mod tests {
     fn non_empty_title_passes_through() {
         assert_eq!(display_title("Safari — Apple", "Safari"), "Safari — Apple");
         assert_eq!(display_title("x", "App"), "x");
+    }
+
+    #[test]
+    fn caption_prepends_app_name_only_when_enabled() {
+        assert_eq!(card_caption("Inbox", "Mail", false), "Inbox");
+        assert_eq!(card_caption("Inbox", "Mail", true), "Mail · Inbox");
+        // 无标题窗口不重复显示应用名(避免 "Mail · Mail")。
+        // A titleless window never repeats the app name ("Mail · Mail").
+        assert_eq!(card_caption("", "Mail", true), "Mail");
+        assert_eq!(card_caption("", "Mail", false), "Mail");
+    }
+
+    #[test]
+    fn card_reconcile_action_replaces_when_the_caption_flag_changes() {
+        // 开关变化必须重建卡片:复用路径不会重绘标题行,旧标题会一直留存。
+        // A toggle must rebuild the card: reuse never repaints the caption, so the old
+        // title would linger.
+        let mut painted = signature("same");
+        painted.show_app_name_in_cards = false;
+        let mut current = signature("same");
+        current.show_app_name_in_cards = true;
+        assert_eq!(
+            card_reconcile_action(Some(&painted), &current),
+            CardReconcileAction::Replace
+        );
     }
 
     #[test]
@@ -3594,7 +3639,11 @@ pub(crate) fn create_card_view(
                 msg_send![class!(NSFont), systemFontOfSize: title_size, weight: cfg.fonts.title_weight]
             };
             let title_label = make_left_label(
-                display_title(&w.window_title, &w.app_name),
+                &card_caption(
+                    &w.window_title,
+                    &w.app_name,
+                    crate::theme::show_app_name_in_cards(),
+                ),
                 title_font,
                 hex_to_ns_color(colors.win_title),
                 title_x,

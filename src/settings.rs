@@ -204,9 +204,10 @@ pub(super) struct SettingsUi {
     show_minimized: *mut AnyObject,  // NSSwitch: 显示最小化窗口 / show minimized windows
     thumbnails_enabled: *mut AnyObject, // NSPopUpButton: 窗口显示模式 / window display mode
     focused_thumbnail_prewarm: *mut AnyObject, // NSSwitch: 前台窗口缩略图后台预热 / focused thumbnail prewarm
-    card_text_size: *mut AnyObject,            // NSSlider: 卡片文字大小 / card text size
+    show_app_name_in_cards: *mut AnyObject, // NSSwitch: 卡片标题显示应用名 / app name in card titles
+    card_text_size: *mut AnyObject,         // NSSlider: 卡片文字大小 / card text size
     card_text_size_value_label: *mut AnyObject, // NSTextField: 卡片字号值 / card text-size value
-    status_bar_text_size: *mut AnyObject,      // NSSlider: 底部标题栏文字大小 / footer text size
+    status_bar_text_size: *mut AnyObject,   // NSSlider: 底部标题栏文字大小 / footer text size
     status_bar_text_size_value_label: *mut AnyObject, // NSTextField: 底部字号值 / footer text-size value
     windows_enabled: *mut AnyObject, // NSSwitch: 窗口切换总开关 / app-switcher master switch
     overlay_position: *mut AnyObject, // NSPopUpButton: 跟随激活窗口 / 主屏幕 / overlay position (follow active window / main screen)
@@ -950,6 +951,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.layout.focused_thumbnail_prewarm
     );
     changed!(
+        "layout.show_app_name_in_cards",
+        old.layout.show_app_name_in_cards,
+        new.layout.show_app_name_in_cards
+    );
+    changed!(
         "layout.card_text_size",
         old.layout.card_text_size,
         new.layout.card_text_size
@@ -1115,6 +1121,7 @@ enum ControlField {
     ShowMinimized,
     ThumbnailsEnabled,
     FocusedThumbnailPrewarm,
+    ShowAppNameInCards,
     CardTextSize,
     StatusBarTextSize,
     OverlayPosition,
@@ -1177,6 +1184,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                     ControlField::FocusedThumbnailPrewarm,
                 )
             })
+            .or_else(|| m(u.show_app_name_in_cards, ControlField::ShowAppNameInCards))
             .or_else(|| m(u.card_text_size, ControlField::CardTextSize))
             .or_else(|| m(u.status_bar_text_size, ControlField::StatusBarTextSize))
             .or_else(|| m(u.overlay_position, ControlField::OverlayPosition))
@@ -1419,6 +1427,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::FocusedThumbnailPrewarm => {
                     let state: isize = msg_send![u.focused_thumbnail_prewarm, state];
                     cfg.layout.focused_thumbnail_prewarm = state == 1;
+                }
+                ControlField::ShowAppNameInCards => {
+                    let state: isize = msg_send![u.show_app_name_in_cards, state];
+                    cfg.layout.show_app_name_in_cards = state == 1;
                 }
                 ControlField::CardTextSize => {
                     let val: isize = msg_send![u.card_text_size, integerValue];
@@ -1881,6 +1893,7 @@ unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
         ui.show_minimized,
         ui.thumbnails_enabled,
         ui.focused_thumbnail_prewarm,
+        ui.show_app_name_in_cards,
         ui.card_text_size,
         ui.card_text_size_value_label,
         ui.status_bar_text_size,
@@ -3016,6 +3029,12 @@ fn load_settings_from(cfg: &Config) {
                 0isize
             };
             let _: () = msg_send![ui.focused_thumbnail_prewarm, setState: prewarm_state];
+            let app_name_state = if cfg.layout.show_app_name_in_cards {
+                1isize
+            } else {
+                0isize
+            };
+            let _: () = msg_send![ui.show_app_name_in_cards, setState: app_name_state];
             // overlay_position:下拉框 index 0 = 跟随激活窗口(active_window), 1 = 主屏幕(main)。
             // overlay_position: popup index 0 = follow active window (active_window), 1 = main (main).
             let op_idx = match cfg.windows.overlay_position.as_str() {
@@ -3861,6 +3880,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             corner_radius: std::ptr::null_mut(),
             thumbnails_enabled: std::ptr::null_mut(),
             focused_thumbnail_prewarm: std::ptr::null_mut(),
+            show_app_name_in_cards: std::ptr::null_mut(),
             card_text_size: std::ptr::null_mut(),
             card_text_size_value_label: std::ptr::null_mut(),
             status_bar_text_size: std::ptr::null_mut(),
@@ -4188,7 +4208,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // shrinking would let AppKit move the children a second time. Every height includes
         // SettingsPageHeader's 42pt top padding (18 more than the old 24pt inset).
         let general_doc_h = 1138.0;
-        let switcher_doc_h = 1370.0;
+        let switcher_doc_h = 1432.0;
         let mouse_doc_h = 1558.0;
         let clipboard_doc_h = 978.0;
         // 窗口控制页包含总开关、四个方向开关和四个跨显示器开关。
@@ -4660,6 +4680,23 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
         bind_control(target, ui.focused_thumbnail_prewarm);
+        // 卡片标题中的应用名:开关决定缩略图卡片标题行是否在窗口标题前显示应用名,
+        // 两者以 " · " 分隔;纯图标模式的应用名本就在标题下方单独一行,不受该开关影响。
+        // App name in card titles: the switch controls whether the thumbnail card's caption
+        // shows the app name before the window title, separated by " · "; icon-only mode
+        // already shows the app name on its own line below the title, so it is unaffected.
+        y = layout.next_row_cursor(y, described_row_h);
+        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
+        ui.show_app_name_in_cards = SettingsRow::tall(
+            switcher_view,
+            label_x,
+            y,
+            220.0,
+            &t("settings.row_show_app_name_in_cards"),
+            SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+        )
+        .1;
+        bind_control(target, ui.show_app_name_in_cards);
         y = layout.next_row_cursor(y, described_row_h);
         SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
         ui.card_text_size = SettingsRow::described(

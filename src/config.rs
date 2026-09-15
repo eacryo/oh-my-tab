@@ -139,6 +139,12 @@ pub struct Layout {
     // Focused-window thumbnail prewarm: when enabled, refresh the frontmost window at a low rate
     // while the overlay is hidden. Default off to keep background work bounded.
     pub focused_thumbnail_prewarm: bool,
+    // 卡片标题中的应用名:开启后在缩略图卡片的标题行显示应用名,与窗口标题以 " · " 分隔;
+    // 窗口无标题时只显示应用名。默认关(仅窗口标题)。
+    // App name in card titles: when enabled the thumbnail card's caption shows the app name
+    // before the window title, separated by " · "; a titleless window shows the app name alone.
+    // Default off (window title only).
+    pub show_app_name_in_cards: bool,
     // 卡片文字大小(点):窗口标题和应用名按比例缩放;纯图标模式的大图标不受影响。
     // Card text size (points): the window title and app name scale proportionally; the large
     // icon in icon-only mode is unaffected.
@@ -558,6 +564,7 @@ impl Default for Layout {
         Layout {
             thumbnails_enabled: true,
             focused_thumbnail_prewarm: false,
+            show_app_name_in_cards: false,
             card_text_size: 15.0,
         }
     }
@@ -960,6 +967,7 @@ impl Config {
             // (same convention as the other boolean switches).
             self.layout.thumbnails_enabled = other.layout.thumbnails_enabled;
             self.layout.focused_thumbnail_prewarm = other.layout.focused_thumbnail_prewarm;
+            self.layout.show_app_name_in_cards = other.layout.show_app_name_in_cards;
             if !errs.iter().any(|e| e.starts_with("layout.card_text_size")) {
                 self.layout.card_text_size = other.layout.card_text_size;
             }
