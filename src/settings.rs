@@ -2823,6 +2823,73 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         }) else {
             return false;
         };
+        let _: () = msg_send![window, layoutIfNeeded];
+        let opaque: bool = msg_send![window, isOpaque];
+        if opaque {
+            log_info!("[smoke-settings-layout] settings window unexpectedly opaque");
+            hide_settings();
+            return false;
+        }
+        let host: *mut AnyObject = msg_send![window, contentView];
+        let root = settings_root_view_for_host(host);
+        let root_layer: *mut AnyObject = if root.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_send![root, layer]
+        };
+        let root_clips: bool = if root_layer.is_null() {
+            false
+        } else {
+            msg_send![root_layer, masksToBounds]
+        };
+        if !root_clips {
+            log_info!("[smoke-settings-layout] settings root is not clipping rounded corners");
+            hide_settings();
+            return false;
+        }
+        let frame_before: NSRect = msg_send![window, frame];
+        let radius_before: f64 = if root_layer.is_null() {
+            0.0
+        } else {
+            msg_send![root_layer, cornerRadius]
+        };
+        let mut resized_frame = frame_before;
+        resized_frame.size.height += 48.0;
+        let _: () = msg_send![window, setFrame: resized_frame, display: true];
+        let _: () = msg_send![window, layoutIfNeeded];
+        refresh_settings_root_corner(window);
+        let radius_after: f64 = if root_layer.is_null() {
+            0.0
+        } else {
+            msg_send![root_layer, cornerRadius]
+        };
+        let radius_stable = radius_before.is_finite()
+            && radius_after.is_finite()
+            && radius_before >= 0.0
+            && radius_after >= 0.0;
+        if !radius_stable {
+            log_info!("[smoke-settings-layout] root corner radius became invalid after resize");
+            hide_settings();
+            return false;
+        }
+        if !root.is_null() && AnyClass::get(c"NSGlassEffectView").is_some() {
+            let children: *mut AnyObject = msg_send![root, subviews];
+            let child_count: usize = msg_send![children, count];
+            let mut glass_content_ok = false;
+            for index in 0..child_count {
+                let child: *mut AnyObject = msg_send![children, objectAtIndex: index as isize];
+                if msg_send![child, isKindOfClass: class!(NSGlassEffectView)] {
+                    let glass_content: *mut AnyObject = msg_send![child, contentView];
+                    glass_content_ok = !glass_content.is_null();
+                    break;
+                }
+            }
+            if !glass_content_ok {
+                log_info!("[smoke-settings-layout] Liquid Glass sidebar has no contentView");
+                hide_settings();
+                return false;
+            }
+        }
         let names = [
             "general",
             "switcher",
@@ -3314,6 +3381,7 @@ extern "C" fn settings_window_resize_subviews(_self: *mut c_void, _cmd: Sel, old
             resizeSubviewsWithOldSize: old_size
         ];
         reposition_traffic_lights(_self as *mut AnyObject);
+        refresh_settings_root_corner(_self as *mut AnyObject);
         grow_short_page_documents();
     }
 }
@@ -3373,6 +3441,168 @@ unsafe fn grow_short_page_documents() {
 struct SettingsWindowClass(*mut AnyObject);
 unsafe impl Send for SettingsWindowClass {}
 unsafe impl Sync for SettingsWindowClass {}
+
+/// Root view used by the settings window so AppKit can resolve macOS 27's container-relative
+/// corner radii while the layer still clips every custom child into the same surface.
+/// 设置窗口根视图：让 AppKit 在 macOS 27 上解析相对于窗口的圆角，同时由同一图层裁切所有自绘子视图。
+struct SettingsRootViewClass(*mut AnyObject);
+unsafe impl Send for SettingsRootViewClass {}
+unsafe impl Sync for SettingsRootViewClass {}
+
+static SETTINGS_ROOT_VIEW_CLS: OnceLock<SettingsRootViewClass> = OnceLock::new();
+
+fn settings_effective_corner_radius(radii: Option<[f64; 4]>, fallback: f64) -> f64 {
+    let Some(radii) = radii else {
+        return fallback;
+    };
+    if radii.iter().all(|radius| radius.is_finite()) {
+        radii.iter().copied().fold(0.0, f64::max).max(0.0)
+    } else {
+        fallback
+    }
+}
+
+extern "C" fn settings_root_corner_configuration(_self: *mut c_void, _cmd: Sel) -> *mut AnyObject {
+    unsafe {
+        let Some(radius_cls) = AnyClass::get(c"NSViewCornerRadius") else {
+            return std::ptr::null_mut();
+        };
+        let Some(config_cls) = AnyClass::get(c"NSViewCornerConfiguration") else {
+            return std::ptr::null_mut();
+        };
+        let radius: *mut AnyObject = msg_send![
+            radius_cls,
+            containerConcentricRadiusWithMinimum: 0.0f64
+        ];
+        if radius.is_null() {
+            return std::ptr::null_mut();
+        }
+        msg_send![config_cls, configurationWithRadius: radius]
+    }
+}
+
+extern "C" fn settings_root_view_did_change_effective_corner_radii(this: *mut c_void, _cmd: Sel) {
+    unsafe {
+        let view = this as *mut AnyObject;
+        let radii: *mut AnyObject = msg_send![view, effectiveCornerRadii];
+        let radius = if radii.is_null() {
+            settings_effective_corner_radius(None, 26.0)
+        } else {
+            let top_left: f64 = msg_send![radii, topLeft];
+            let top_right: f64 = msg_send![radii, topRight];
+            let bottom_left: f64 = msg_send![radii, bottomLeft];
+            let bottom_right: f64 = msg_send![radii, bottomRight];
+            settings_effective_corner_radius(
+                Some([top_left, top_right, bottom_left, bottom_right]),
+                26.0,
+            )
+        };
+        let layer: *mut AnyObject = msg_send![view, layer];
+        if !layer.is_null() {
+            let _: () = msg_send![layer, setCornerRadius: radius];
+            let _: () = msg_send![layer, setMasksToBounds: true];
+        }
+    }
+}
+
+fn settings_root_view_class() -> *mut AnyObject {
+    SETTINGS_ROOT_VIEW_CLS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabSettingsRootView").unwrap();
+            let superclass = class!(NSView) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            if AnyClass::get(c"NSViewCornerConfiguration").is_some()
+                && AnyClass::get(c"NSViewCornerRadius").is_some()
+            {
+                class_addMethod(
+                    cls,
+                    sel!(cornerConfiguration),
+                    settings_root_corner_configuration as *mut c_void,
+                    CString::new("@@:").unwrap().as_ptr(),
+                );
+                class_addMethod(
+                    cls,
+                    sel!(viewDidChangeEffectiveCornerRadii),
+                    settings_root_view_did_change_effective_corner_radii as *mut c_void,
+                    CString::new("v@:").unwrap().as_ptr(),
+                );
+            }
+            objc_registerClassPair(cls);
+            SettingsRootViewClass(cls)
+        })
+        .0
+}
+
+unsafe fn settings_root_view_for_host(host: *mut AnyObject) -> *mut AnyObject {
+    if host.is_null() {
+        return std::ptr::null_mut();
+    }
+    let subviews: *mut AnyObject = msg_send![host, subviews];
+    if subviews.is_null() {
+        return std::ptr::null_mut();
+    }
+    let root_class = settings_root_view_class();
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let subview: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        if !subview.is_null() && msg_send![subview, isKindOfClass: root_class] {
+            return subview;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+unsafe fn settings_root_view_for_window(window: *mut AnyObject) -> *mut AnyObject {
+    if window.is_null() {
+        return std::ptr::null_mut();
+    }
+    let host: *mut AnyObject = msg_send![window, contentView];
+    settings_root_view_for_host(host)
+}
+
+/// Reapply the dynamic corner result after AppKit lays out a resized window.
+/// 窗口 resize 后重新应用 AppKit 计算出的动态圆角。
+unsafe fn refresh_settings_root_corner(window: *mut AnyObject) {
+    if AnyClass::get(c"NSViewCornerConfiguration").is_none()
+        || AnyClass::get(c"NSViewCornerRadius").is_none()
+    {
+        return;
+    }
+    let root = settings_root_view_for_window(window);
+    if root.is_null() {
+        return;
+    }
+    let _: () = msg_send![root, invalidateCornerConfiguration];
+    let _: () = msg_send![root, layoutSubtreeIfNeeded];
+    settings_root_view_did_change_effective_corner_radii(
+        root as *mut c_void,
+        sel!(viewDidChangeEffectiveCornerRadii),
+    );
+}
+
+unsafe fn apply_settings_root_surface(
+    window: *mut AnyObject,
+    content: *mut AnyObject,
+    palette: UiPalette,
+    fallback_radius: f64,
+) {
+    let _: () = msg_send![window, setOpaque: false];
+    let clear_color: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+    let _: () = msg_send![window, setBackgroundColor: clear_color];
+    let _: () = msg_send![content, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![content, layer];
+    if layer.is_null() {
+        return;
+    }
+    layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.window_bg));
+    let supports_concentric = AnyClass::get(c"NSViewCornerConfiguration").is_some()
+        && AnyClass::get(c"NSViewCornerRadius").is_some();
+    refresh_settings_root_corner(window);
+    if !supports_concentric {
+        let _: () = msg_send![layer, setCornerRadius: fallback_radius];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+    }
+}
 
 static SETTINGS_WINDOW_CLS: OnceLock<SettingsWindowClass> = OnceLock::new();
 
@@ -3531,7 +3761,35 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             release_obj(tb);
         }
 
-        let content: *mut AnyObject = msg_send![window, contentView];
+        let host: *mut AnyObject = msg_send![window, contentView];
+        let content: *mut AnyObject = if existing_window.is_none() {
+            let host_bounds: NSRect = msg_send![host, bounds];
+            let root: *mut AnyObject = msg_send![settings_root_view_class(), alloc];
+            let root: *mut AnyObject = msg_send![root, initWithFrame: host_bounds];
+            let _: () = msg_send![root, setAutoresizingMask: 18u64];
+            let _: () = msg_send![host, addSubview: root];
+            // Keep one custom root under the system content host. It is the only layer that
+            // paints the settings background and clips child surfaces to the window shape.
+            // 在系统 content host 下保留一个自定义根视图，由它统一绘制背景并按窗口形状裁切子视图。
+            release_obj(root);
+            root
+        } else {
+            settings_root_view_for_host(host)
+        };
+        // The existing settings window should always retain the custom root. If AppKit replaced
+        // the content host's children during a style transition, recreate it before rebuilding.
+        // 复用窗口时系统可能在样式切换中替换 content host 的子视图；若根视图丢失则重新创建。
+        let content: *mut AnyObject = if content.is_null() {
+            let host_bounds: NSRect = msg_send![host, bounds];
+            let root: *mut AnyObject = msg_send![settings_root_view_class(), alloc];
+            let root: *mut AnyObject = msg_send![root, initWithFrame: host_bounds];
+            let _: () = msg_send![root, setAutoresizingMask: 18u64];
+            let _: () = msg_send![host, addSubview: root];
+            release_obj(root);
+            root
+        } else {
+            content
+        };
         if existing_window.is_some() {
             // Remove only the old content hierarchy; keep the NSWindow, its frame, and key status
             // intact so a locale/theme refresh is an in-place redraw.
@@ -3571,28 +3829,11 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                                                                    // anymore: each page embeds its own restore control at the end of its content.
         let page_viewport_h = content_h;
 
-        // 窗口圆角:窗口自绘的 opaque 背景(系统默认小圆角)会盖住 contentView 的裁剪,
-        // 单靠 layer cornerRadius 圆角出不来。做法:setOpaque:NO 关掉窗口自绘背景,由
-        // contentView 的 layer 自己铺 windowBackgroundColor(深浅色语义色)并裁成
-        // window_clip_radius(26,与窗口形状一致)圆角。主题切换会 invalidate 重建窗口,
-        // 背景色随重建重取,不会在深浅色切换后过时。红绿灯是窗口 chrome、不在
-        // contentView 内,不受裁剪;卡片 10pt 留白与版本号也都在圆角区之外。
-        // Window corners: the window's own opaque background (system-default small rounding)
-        // paints over contentView's clipping, so layer cornerRadius alone didn't round the window.
-        // Fix: setOpaque:NO turns off the window-drawn background, and contentView's layer paints
-        // windowBackgroundColor itself (a semantic color) clipped to window_clip_radius (26,
-        // matching the window shape). Theme switches invalidate and rebuild the window, so the
-        // color is re-captured and never goes stale across light/dark changes. The traffic lights
-        // are window chrome outside contentView (not clipped); the card's 10pt margin stays clear
-        // of the corner zone.
-        let _: () = msg_send![window, setOpaque: false];
-        let _: () = msg_send![content, setWantsLayer: true];
-        let cv_layer: *mut AnyObject = msg_send![content, layer];
-        if !cv_layer.is_null() {
-            layer_set_background(cv_layer, crate::ffi::hex_to_cg_color(palette.window_bg));
-            let _: () = msg_send![cv_layer, setCornerRadius: window_clip_radius];
-            let _: () = msg_send![cv_layer, setMasksToBounds: true];
-        }
+        // The root surface owns the window background and clipping. On macOS 27 it follows the
+        // system's toolbar-window radius through container concentricity; older systems use the
+        // measured fallback radius.
+        // 根表面统一负责窗口背景与裁剪。macOS 27 通过容器同心圆角跟随工具栏窗口形状，旧系统使用固定回退值。
+        apply_settings_root_surface(window, content, palette, window_clip_radius);
 
         let mut ui = SettingsUi {
             window,
@@ -3725,22 +3966,26 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // older macOS uses NSVisualEffectView with the sidebar material (classic frosted look).
         // The glass material supplies the subtle separation from the content pane.
         let card_h = content_h - card_margin * 2.0;
+        let sidebar_content: *mut AnyObject;
         let sidebar_view: *mut AnyObject = if AnyClass::get(c"NSGlassEffectView").is_some() {
             let cls = AnyClass::get(c"NSGlassEffectView").unwrap();
             let g: *mut AnyObject = msg_send![cls, alloc];
             let g: *mut AnyObject = msg_send![g, initWithFrame: NSRect::new(NSPoint::new(card_margin, card_margin), NSSize::new(card_w, card_h))];
             let _: () = msg_send![g, setStyle: 0i64]; // NSGlassEffectViewStyleRegular
             let _: () = msg_send![g, setCornerRadius: card_radius];
-            // cornerRadius 属性只圆了着色/外观,背景模糊需 layer masksToBounds 一并裁剪
-            // (与 main.rs 的 overlay 同款做法)。
-            // The cornerRadius property only rounds the tint/appearance; the layer must also
-            // clip the backdrop blur via masksToBounds (same trick as the overlay in main.rs).
-            let _: () = msg_send![g, setWantsLayer: true];
-            let g_layer: *mut AnyObject = msg_send![g, layer];
-            if !g_layer.is_null() {
-                let _: () = msg_send![g_layer, setCornerRadius: card_radius];
-                let _: () = msg_send![g_layer, setMasksToBounds: true];
-            }
+            // AppKit only guarantees Liquid Glass composition for the assigned contentView.
+            // NSGlassEffectView 的玻璃合成只保证作用于显式设置的 contentView。
+            let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let inner: *mut AnyObject = msg_send![
+                inner,
+                initWithFrame: NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(card_w, card_h)
+                )
+            ];
+            let _: () = msg_send![inner, setAutoresizingMask: 18u64];
+            let _: () = msg_send![g, setContentView: inner];
+            sidebar_content = inner;
             g
         } else {
             let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
@@ -3754,6 +3999,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 let _: () = msg_send![ve_layer, setCornerRadius: card_radius];
                 let _: () = msg_send![ve_layer, setMasksToBounds: true];
             }
+            sidebar_content = ve;
             ve
         };
         // Keep the navigation pane a distinct light-gray surface, while the detail pane uses the
@@ -3802,8 +4048,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let main_background: *mut AnyObject = msg_send![
             main_background,
             initWithFrame: NSRect::new(
-                NSPoint::new(content_x, 0.0),
-                NSSize::new(detail_w, content_h)
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(view_w, content_h)
             )
         ];
         let _: () = msg_send![main_background, setWantsLayer: true];
@@ -3812,7 +4058,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             layer_set_background(main_layer, crate::ffi::hex_to_cg_color(palette.detail_bg));
         }
         let _: () = msg_send![main_background, setAutoresizingMask: 18u64];
-        let _: () = msg_send![content, addSubview: main_background];
+        let _: () = msg_send![
+            content,
+            addSubview: main_background,
+            positioned: -1isize,
+            relativeTo: sidebar_view
+        ];
         release_obj(main_background);
 
         // Sidebar identity block, matching the redesign's app title and subtitle above the nav.
@@ -3842,7 +4093,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // Top- and left-anchored: the window height is adjustable, so the identity block must
         // follow the traffic-light strip instead of drifting downward.
         let _: () = msg_send![app_title, setAutoresizingMask: 12u64];
-        let _: () = msg_send![sidebar_view, addSubview: app_title];
+        let _: () = msg_send![sidebar_content, addSubview: app_title];
         release_obj(app_title);
         let app_subtitle: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let app_subtitle: *mut AnyObject = msg_send![
@@ -3862,7 +4113,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let app_subtitle_color = settings_text_color(SettingsTextRole::Muted);
         let _: () = msg_send![app_subtitle, setTextColor: app_subtitle_color];
         let _: () = msg_send![app_subtitle, setAutoresizingMask: 12u64];
-        let _: () = msg_send![sidebar_view, addSubview: app_subtitle];
+        let _: () = msg_send![sidebar_content, addSubview: app_subtitle];
         release_obj(app_subtitle);
 
         // 侧边栏选中行的高亮背景(layer-backed NSView,theme 感知色),先于按钮加入以便按钮文字叠在上层。
@@ -3889,13 +4140,13 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // NSSwitch's on-state blue (same as LinearMouse's sidebar selection highlight).
         // The redesign uses a soft accent wash for the active row rather than a solid blue fill.
         layer_set_background(hl_layer, crate::ffi::hex_to_cg_color(palette.selection_bg));
-        let _: () = msg_send![sidebar_view, addSubview: highlight];
+        let _: () = msg_send![sidebar_content, addSubview: highlight];
         release_obj(highlight);
         ui.sidebar_highlight = highlight;
 
         // Seven sidebar buttons (borderless, tags 0..6; click triggers handleSettingsSidebar:).
         let sidebar_buttons =
-            SettingsSidebar::build(sidebar_view, target, 14.0, btn_y0, btn_w, btn_h);
+            SettingsSidebar::build(sidebar_content, target, 14.0, btn_y0, btn_w, btn_h);
         [
             &mut ui.sidebar_general,
             &mut ui.sidebar_switcher,
@@ -3916,7 +4167,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // HTML `.sidebar-footer`: the complete restore control is one semantic component, with
         // its separator and morphing confirm/cancel rows owned together.
         // HTML `.sidebar-footer`:整个恢复控件作为一个语义组件，统一管理分割线和 morph 确认/取消行。
-        ui.restore_defaults = RestoreDefaultsControl::build(sidebar_view, target, card_w);
+        ui.restore_defaults = RestoreDefaultsControl::build(sidebar_content, target, card_w);
 
         // The scroll view spans from the left gutter to the detail pane's right edge, so the
         // overlay scrollbar sits flush with the window edge (matching the OK/Cancel footer) and
@@ -5964,7 +6215,7 @@ pub(crate) fn invalidate_settings_window() {
 mod tests {
     use super::{
         color_component_to_byte, glass_tint_group_frames, rgba_hex_from_components,
-        GLASS_TINT_GROUP_GAP, GLASS_TINT_SCREEN_MARGIN,
+        settings_effective_corner_radius, GLASS_TINT_GROUP_GAP, GLASS_TINT_SCREEN_MARGIN,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -6008,6 +6259,23 @@ mod tests {
             screen.origin.y + GLASS_TINT_SCREEN_MARGIN
         );
         assert!(panel_frame.origin.y + panel.size.height <= screen.origin.y + screen.size.height);
+    }
+
+    #[test]
+    fn settings_corner_radius_uses_the_largest_effective_corner() {
+        assert_eq!(
+            settings_effective_corner_radius(Some([18.0, 26.0, 20.0, 24.0]), 12.0),
+            26.0
+        );
+    }
+
+    #[test]
+    fn settings_corner_radius_falls_back_for_missing_or_invalid_values() {
+        assert_eq!(settings_effective_corner_radius(None, 26.0), 26.0);
+        assert_eq!(
+            settings_effective_corner_radius(Some([18.0, f64::NAN, 20.0, 24.0]), 26.0),
+            26.0
+        );
     }
 
     /// Exercise the real settings window on the AppKit main thread. This cannot run in the
