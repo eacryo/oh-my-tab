@@ -140,10 +140,10 @@ pub struct Layout {
     // while the overlay is hidden. Default off to keep background work bounded.
     pub focused_thumbnail_prewarm: bool,
     // 卡片标题中的应用名:开启后在缩略图卡片的标题行显示应用名,与窗口标题以 " · " 分隔;
-    // 窗口无标题时只显示应用名。默认关(仅窗口标题)。
+    // 窗口无标题、或标题与应用名文本相同时只显示一份。默认关(仅窗口标题)。
     // App name in card titles: when enabled the thumbnail card's caption shows the app name
-    // before the window title, separated by " · "; a titleless window shows the app name alone.
-    // Default off (window title only).
+    // before the window title, separated by " · "; a titleless window, or one whose title equals
+    // the app name, shows a single copy. Default off (window title only).
     pub show_app_name_in_cards: bool,
     // 卡片文字大小(点):窗口标题和应用名按比例缩放;纯图标模式的大图标不受影响。
     // Card text size (points): the window title and app name scale proportionally; the large

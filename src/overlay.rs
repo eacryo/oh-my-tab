@@ -748,13 +748,15 @@ fn display_title<'a>(title: &'a str, app_name: &'a str) -> &'a str {
     }
 }
 
-/// 缩略图卡片的标题行文本:开启「卡片显示应用名」后,应用名前置并以 " · " 与窗口标题
-/// 分隔(与底部状态栏同一分隔符);窗口无标题时只显示应用名,避免 "App · App"。
+/// 缩略图卡片的标题行文本:开启「卡片显示应用名」后,应用名前置并以 " · " 与窗口标题分隔
+/// (与底部状态栏同一分隔符)。窗口无标题、或标题与应用名文本完全相同(如访达的窗口)时
+/// 只显示一份,不出现 "App · App"。
 /// The thumbnail card's caption text: with "show app name in cards" enabled the app name
-/// precedes the window title, separated by " · " (the footer's separator); a titleless
-/// window shows the app name alone, never "App · App".
+/// precedes the window title, separated by " · " (the footer's separator). A titleless window,
+/// or one whose title is textually identical to the app name (e.g. a Finder window), renders a
+/// single copy so it never reads "App · App".
 fn card_caption(title: &str, app_name: &str, show_app_name: bool) -> String {
-    if show_app_name && !title.is_empty() {
+    if show_app_name && !title.is_empty() && title != app_name {
         format!("{} · {}", app_name, title)
     } else {
         display_title(title, app_name).to_string()
@@ -1216,6 +1218,11 @@ mod tests {
         // A titleless window never repeats the app name ("Mail · Mail").
         assert_eq!(card_caption("", "Mail", true), "Mail");
         assert_eq!(card_caption("", "Mail", false), "Mail");
+        // 标题与应用名文本相同时同样只显示一份,且不带分隔点(如访达的窗口)。
+        // An identical title and app name also render a single copy, with no separator
+        // (e.g. a Finder window).
+        assert_eq!(card_caption("Finder", "Finder", true), "Finder");
+        assert_eq!(card_caption("Finder", "Finder", false), "Finder");
     }
 
     #[test]
