@@ -932,6 +932,33 @@ pub(crate) fn thumb_document_height_for_rows(row_count: usize, card_h: f64, gap:
     THUMB_TOP_INSET + row_count.max(1) as f64 * card_h + row_count.saturating_sub(1) as f64 * gap
 }
 
+/// 计算关闭重排后的面板高度,与正常滚动布局保持相同的视口/预告行规则。
+/// Compute the post-close panel height using the same viewport and teaser-row rules as the
+/// normal scrolling layout.
+pub(crate) fn thumb_panel_height_for_rows(
+    row_count: usize,
+    viewport_rows: usize,
+    card_h: f64,
+    gap: f64,
+    overflowed: bool,
+) -> f64 {
+    let visible_rows = if overflowed {
+        viewport_rows.max(1)
+    } else {
+        row_count.max(1)
+    };
+    let teaser_h = if overflowed {
+        gap + card_h * THUMB_SCROLL_TEASER_RATIO
+    } else {
+        0.0
+    };
+    THUMB_TOP_INSET
+        + visible_rows as f64 * card_h
+        + visible_rows.saturating_sub(1) as f64 * gap
+        + teaser_h
+        + status_h()
+}
+
 /// 同步 document 缩放后的最大偏移、当前偏移与坐标平移量。
 /// Reconcile max/current scroll offsets and the coordinate delta after resizing the document.
 pub(crate) fn rebase_thumb_scroll_after_document_resize(
@@ -1815,6 +1842,15 @@ mod flow_tests {
         assert_eq!(placements[6].y, placements[3].y - 90.0);
         assert_eq!(panel_w, 398.0);
         assert!(overflowed);
+    }
+
+    #[test]
+    fn close_reflow_panel_height_shrinks_when_overflow_ends() {
+        let overflowing = thumb_panel_height_for_rows(3, 2, 80.0, 10.0, true);
+        let fitting = thumb_panel_height_for_rows(2, 2, 80.0, 10.0, false);
+
+        assert!(overflowing > fitting);
+        assert_eq!(fitting, THUMB_TOP_INSET + 2.0 * 80.0 + 10.0 + status_h());
     }
 
     #[test]

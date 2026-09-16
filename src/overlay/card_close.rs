@@ -191,18 +191,16 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             plan_thumb_close_reflow(
                 &widths, card_h, max_inner, gap, document_h, overflowed, max_rows,
             );
-        let viewport_h = unsafe {
-            CONTAINER
-                .lock()
-                .unwrap()
-                .map(|container| {
-                    let bounds: NSRect = msg_send![container.0, bounds];
-                    bounds.size.height
-                })
-                .unwrap_or(1.0)
-        };
+        let final_panel_h = thumb_panel_height_for_rows(
+            final_row_ranges.len(),
+            max_rows,
+            card_h,
+            gap,
+            final_overflowed,
+        );
         let content_h = thumb_document_height_for_rows(final_row_ranges.len(), card_h, gap);
-        let final_document_h = content_h.max(viewport_h).max(1.0);
+        let final_viewport_h = (final_panel_h - status_h()).max(1.0);
+        let final_document_h = content_h.max(final_viewport_h).max(1.0);
         let final_frames = placements
             .into_iter()
             .filter_map(|placement| {
@@ -219,9 +217,9 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
         let final_panel_frame = NSRect::new(
             NSPoint::new(
                 panel_frame.origin.x + (panel_frame.size.width - final_panel_w) / 2.0,
-                panel_frame.origin.y,
+                panel_frame.origin.y + (panel_frame.size.height - final_panel_h) / 2.0,
             ),
-            NSSize::new(final_panel_w, panel_frame.size.height),
+            NSSize::new(final_panel_w, final_panel_h),
         );
         Some((
             PendingCardClose {
@@ -401,16 +399,7 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
     // Rebase cards and the document together at commit; sharing one delta keeps visible content
     // stationary instead of making the page jump while the scrollbar stays at its old position.
     let old_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
-    let viewport_h = unsafe {
-        CONTAINER
-            .lock()
-            .unwrap()
-            .map(|container| {
-                let bounds: NSRect = msg_send![container.0, bounds];
-                bounds.size.height
-            })
-            .unwrap_or(1.0)
-    };
+    let viewport_h = (pending.final_panel_frame.size.height - status_h()).max(1.0);
     let (document_h, max_offset, rebased_offset, document_delta) =
         rebase_thumb_scroll_after_document_resize(
             pending.original_document_h,
@@ -428,8 +417,8 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
             let _: () = msg_send![
                 container.0,
                 setFrame: NSRect::new(
-                    frame.origin,
-                    NSSize::new(pending.final_panel_frame.size.width, frame.size.height)
+                    NSPoint::new(frame.origin.x, status_h()),
+                    NSSize::new(pending.final_panel_frame.size.width, viewport_h),
                 )
             ];
         }
