@@ -399,7 +399,20 @@ static AX_WINDOW_CACHE: LazyLock<Mutex<HashMap<AxWindowCacheKey, CachedAxElement
 struct CachedAxSnapshot {
     process_start_time_us: Option<u64>,
     refreshed_at: Instant,
-    windows: Vec<(u32, String, bool)>,
+    windows: Vec<AxWindowInfo>,
+}
+
+/// AX semantic facts needed after pairing with the WindowServer snapshot.
+/// The AX role/subrole answers what a surface is; WindowServer layer and bounds answer where
+/// it is and whether a custom root is substantial enough to be a switch destination.
+#[derive(Clone, Debug)]
+struct AxWindowInfo {
+    cgwid: u32,
+    title: String,
+    minimized: bool,
+    is_main: bool,
+    is_fullscreen: bool,
+    is_custom_root: bool,
 }
 
 // 短 TTL 只用于合并快速连续的召唤/生命周期刷新;过期后仍会重新向 AX 请求权威快照。
@@ -768,10 +781,7 @@ pub(crate) fn clear_ax_window_cache_for_pid(pid: i32) {
     AX_SNAPSHOT_CACHE.lock().unwrap().remove(&pid);
 }
 
-fn cached_ax_snapshot(
-    pid: i32,
-    process_start_time_us: Option<u64>,
-) -> Option<Vec<(u32, String, bool)>> {
+fn cached_ax_snapshot(pid: i32, process_start_time_us: Option<u64>) -> Option<Vec<AxWindowInfo>> {
     let start = process_start_time_us?;
     let cache = AX_SNAPSHOT_CACHE.lock().unwrap();
     let snapshot = cache.get(&pid)?;
@@ -783,11 +793,7 @@ fn cached_ax_snapshot(
     Some(snapshot.windows.clone())
 }
 
-fn cache_ax_snapshot(
-    pid: i32,
-    process_start_time_us: Option<u64>,
-    windows: &[(u32, String, bool)],
-) {
+fn cache_ax_snapshot(pid: i32, process_start_time_us: Option<u64>, windows: &[AxWindowInfo]) {
     if process_start_time_us.is_none() {
         return;
     }
@@ -1703,6 +1709,26 @@ fn ax_subrole_kept(subrole: Option<&str>, role: Option<&str>, titled: bool) -> b
     }
 }
 
+// Match AltTab's substantial custom-window boundary. Standard windows and titled dialogs do
+// not use this size gate; it only prevents an untitled/unknown custom root from becoming a
+// switch destination when it is merely a tiny auxiliary surface.
+// 与 AltTab 的自定义窗口边界保持一致。标准窗口和有标题的对话框不走此尺寸门槛；仅防止
+// AXUnknown 自定义根元素在很小时被当成可切换窗口。
+const CUSTOM_WINDOW_MIN_WIDTH: f64 = 100.0;
+const CUSTOM_WINDOW_MIN_HEIGHT: f64 = 50.0;
+
+fn admissible_window_placement(layer: i32, is_main: bool, is_fullscreen: bool) -> bool {
+    layer == 0 || is_main || is_fullscreen
+}
+
+fn custom_window_is_substantial(bounds: (f64, f64, f64, f64)) -> bool {
+    bounds.2 >= CUSTOM_WINDOW_MIN_WIDTH && bounds.3 >= CUSTOM_WINDOW_MIN_HEIGHT
+}
+
+fn is_attached_surface(parent_id: Option<u32>) -> bool {
+    parent_id.is_some_and(|parent| parent != 0)
+}
+
 /// Decide whether an AX-only window may be backfilled into the switcher.
 /// A missing CG entry means an orderOut'd window, which AX can legitimately recover; a known
 /// non-zero CG layer means an app-owned overlay/menu and must stay out of the window switcher.
@@ -1729,9 +1755,18 @@ fn should_backfill_ax_window_for_process(
 fn remember_non_normal_cg_windows(
     cg_window_layers: &HashMap<(i32, u32), i32>,
     identities: &HashMap<i32, AppIdentity>,
+    ax_windows: &HashMap<i32, HashMap<u32, AxWindowInfo>>,
+    parent_ids: &HashMap<u32, u32>,
 ) {
     for (&(pid, cgwid), &layer) in cg_window_layers {
-        if layer != 0 {
+        if is_attached_surface(parent_ids.get(&cgwid).copied()) {
+            continue;
+        }
+        let is_main_or_fullscreen = ax_windows
+            .get(&pid)
+            .and_then(|windows| windows.get(&cgwid))
+            .is_some_and(|window| window.is_main || window.is_fullscreen);
+        if layer != 0 && !is_main_or_fullscreen {
             let process_start_time_us = identities
                 .get(&pid)
                 .and_then(|identity| identity.process_start_time_us);
@@ -1744,9 +1779,17 @@ fn remember_non_normal_cg_windows_for_process(
     pid: i32,
     process_start_time_us: Option<u64>,
     cg_window_layers: &HashMap<u32, i32>,
+    ax_windows: &HashMap<u32, AxWindowInfo>,
+    parent_ids: &HashMap<u32, u32>,
 ) {
     for (&cgwid, &layer) in cg_window_layers {
-        if layer != 0 {
+        if is_attached_surface(parent_ids.get(&cgwid).copied()) {
+            continue;
+        }
+        let is_main_or_fullscreen = ax_windows
+            .get(&cgwid)
+            .is_some_and(|window| window.is_main || window.is_fullscreen);
+        if layer != 0 && !is_main_or_fullscreen {
             remember_non_normal_window(pid, process_start_time_us, cgwid);
         }
     }
@@ -1758,13 +1801,18 @@ fn remember_non_normal_cg_windows_for_process(
 /// collect_windows and the thumbnail module's startup pre-generation.
 pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)>> {
     let process_start_time_us = unsafe { resolve_app_identity(pid).process_start_time_us };
-    get_ax_windows_for_pid_with_identity(pid, process_start_time_us)
+    get_ax_windows_for_pid_with_identity(pid, process_start_time_us).map(|windows| {
+        windows
+            .into_iter()
+            .map(|window| (window.cgwid, window.title, window.minimized))
+            .collect()
+    })
 }
 
 fn get_ax_windows_for_pid_with_identity(
     pid: i32,
     process_start_time_us: Option<u64>,
-) -> Option<Vec<(u32, String, bool)>> {
+) -> Option<Vec<AxWindowInfo>> {
     if let Some(windows) = cached_ax_snapshot(pid, process_start_time_us) {
         return Some(windows);
     }
@@ -1796,6 +1844,8 @@ fn get_ax_windows_for_pid_with_identity(
         let role_key = cf_string_new("AXRole");
         let subrole_key = cf_string_new("AXSubrole");
         let minimized_key = cf_string_new("AXMinimized");
+        let main_key = cf_string_new("AXMain");
+        let fullscreen_key = cf_string_new("AXFullScreen");
         let mut results = Vec::with_capacity(count as usize);
 
         for i in 0..count {
@@ -1810,12 +1860,17 @@ fn get_ax_windows_for_pid_with_identity(
             // role is AXWindow (ordinary windows in apps such as Xcode); filter popups,
             // panels, and other non-standard elements.
             let mut subrole_value: *const c_void = std::ptr::null();
-            let kept = if AXUIElementCopyAttributeValue(element, subrole_key, &mut subrole_value)
+            let subrole = if AXUIElementCopyAttributeValue(element, subrole_key, &mut subrole_value)
                 == K_AX_SUCCESS
                 && !subrole_value.is_null()
             {
                 let s = cf_to_rust_string(subrole_value);
                 CFRelease(subrole_value);
+                s
+            } else {
+                None
+            };
+            let kept = if subrole.is_some() {
                 let mut role_value: *const c_void = std::ptr::null();
                 let role = if AXUIElementCopyAttributeValue(element, role_key, &mut role_value)
                     == K_AX_SUCCESS
@@ -1830,7 +1885,7 @@ fn get_ax_windows_for_pid_with_identity(
                 // AXDialog/AXUnknown 需额外判断标题;无标题元素按弹出/隐形窗口过滤。
                 // AXDialog/AXUnknown require a non-empty title; untitled elements stay
                 // filtered as popups/invisible windows.
-                let titled = if matches!(s.as_deref(), Some("AXDialog") | Some("AXUnknown")) {
+                let titled = if matches!(subrole.as_deref(), Some("AXDialog") | Some("AXUnknown")) {
                     let mut title_value: *const c_void = std::ptr::null();
                     if AXUIElementCopyAttributeValue(element, title_key, &mut title_value)
                         == K_AX_SUCCESS
@@ -1845,7 +1900,7 @@ fn get_ax_windows_for_pid_with_identity(
                 } else {
                     false
                 };
-                ax_subrole_kept(s.as_deref(), role.as_deref(), titled)
+                ax_subrole_kept(subrole.as_deref(), role.as_deref(), titled)
             } else {
                 // 无 subrole → 视为标准窗口(部分 App 不设置此属性)。
                 // No subrole means standard window for apps that don't set it.
@@ -1881,17 +1936,51 @@ fn get_ax_windows_for_pid_with_identity(
                     false
                 }
             };
+            let is_main = {
+                let mut main_value: *const c_void = std::ptr::null();
+                if AXUIElementCopyAttributeValue(element, main_key, &mut main_value) == K_AX_SUCCESS
+                    && !main_value.is_null()
+                {
+                    let value = CFBooleanGetValue(main_value);
+                    CFRelease(main_value);
+                    value
+                } else {
+                    false
+                }
+            };
+            let is_fullscreen = {
+                let mut fullscreen_value: *const c_void = std::ptr::null();
+                if AXUIElementCopyAttributeValue(element, fullscreen_key, &mut fullscreen_value)
+                    == K_AX_SUCCESS
+                    && !fullscreen_value.is_null()
+                {
+                    let value = CFBooleanGetValue(fullscreen_value);
+                    CFRelease(fullscreen_value);
+                    value
+                } else {
+                    false
+                }
+            };
             // 取该 AX 窗口的 CGWindowID（私有 API），用于和 CG 窗口精确配对。
             let cgwid = ax_window_cgwid(element).unwrap_or(0);
             // 保留精确元素供激活路径复用,这样正常切换不必再次读取 AXWindows。
             // Retain the exact element for the activation path so normal raises do not need
             // another AXWindows round trip.
             cache_ax_window_element(pid, process_start_time_us, cgwid, element);
-            results.push((cgwid, title, minimized));
+            results.push(AxWindowInfo {
+                cgwid,
+                title,
+                minimized,
+                is_main,
+                is_fullscreen,
+                is_custom_root: subrole.as_deref() == Some("AXUnknown"),
+            });
         }
         CFRelease(title_key);
         CFRelease(subrole_key);
         CFRelease(minimized_key);
+        CFRelease(main_key);
+        CFRelease(fullscreen_key);
         CFRelease(windows_array);
         cache_ax_snapshot(pid, process_start_time_us, &results);
         Some(results)
@@ -1929,7 +2018,7 @@ struct AxPartial {
     icon_ids: HashMap<i32, AppIdentity>,
     ax_queried_pids: HashSet<i32>,
     ax_failed_pids: Vec<i32>,
-    ax_wid_to_info: HashMap<i32, HashMap<u32, (String, bool)>>,
+    ax_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>>,
     titleless_pids: HashSet<i32>,
     /// 本段所有 PID 的 AX 查询工作耗时之和(诊断用;墙钟由调用方测)。
     /// Sum of AX query work time for this chunk (diagnostics; wall clock is measured by the caller).
@@ -1985,13 +2074,13 @@ unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> A
         match ax_wins {
             Some(wins) if !wins.is_empty() => {
                 partial.ax_queried_pids.insert(pid);
-                if wins.iter().all(|(_, t, _)| t.is_empty()) {
+                if wins.iter().all(|window| window.title.is_empty()) {
                     partial.titleless_pids.insert(pid);
                 }
-                let mut wid_map: HashMap<u32, (String, bool)> = HashMap::new();
-                for (cgwid, title, minimized) in &wins {
-                    if *cgwid != 0 {
-                        wid_map.insert(*cgwid, (title.clone(), *minimized));
+                let mut wid_map: HashMap<u32, AxWindowInfo> = HashMap::new();
+                for window in wins {
+                    if window.cgwid != 0 {
+                        wid_map.insert(window.cgwid, window);
                     }
                 }
                 partial.ax_wid_to_info.insert(pid, wid_map);
@@ -2080,18 +2169,17 @@ unsafe fn collect_windows_for_pid_inner(
         return None;
     }
 
-    let Some(ax_wins) = get_ax_windows_for_pid(pid) else {
+    let identity = resolve_app_identity(pid);
+    let Some(ax_wins) = get_ax_windows_for_pid_with_identity(pid, identity.process_start_time_us)
+    else {
         CFRelease(array);
         return None;
     };
-    let ax_wid_to_info: HashMap<u32, (String, bool)> = ax_wins
+    let ax_wid_to_info: HashMap<u32, AxWindowInfo> = ax_wins
         .iter()
-        .filter_map(|(window_id, title, minimized)| {
-            (*window_id != 0).then_some((*window_id, (title.clone(), *minimized)))
-        })
+        .filter_map(|window| (window.cgwid != 0).then_some((window.cgwid, window.clone())))
         .collect();
-    let titleless = !ax_wins.is_empty() && ax_wins.iter().all(|(_, title, _)| title.is_empty());
-    let identity = resolve_app_identity(pid);
+    let titleless = !ax_wins.is_empty() && ax_wins.iter().all(|window| window.title.is_empty());
     let icon_path = check_cache_for_identity(&identity);
     let last_activated = LAST_ACTIVATED.lock().unwrap().get(&pid).copied();
     let now = Instant::now();
@@ -2103,6 +2191,23 @@ unsafe fn collect_windows_for_pid_inner(
     let mut cg_window_layers: HashMap<u32, i32> = HashMap::new();
     let mut windows = Vec::new();
     let count = CFArrayGetCount(array);
+    let mut cg_window_ids = Vec::new();
+    for i in 0..count {
+        let dict = CFArrayGetValueAtIndex(array, i);
+        if !dict.is_null() {
+            let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+            let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+            if owner_pid == pid && cgwid != 0 {
+                cg_window_ids.push(cgwid);
+            }
+        }
+    }
+    let parent_ids: HashMap<u32, u32> = skylight::window_parent_ids(&cg_window_ids);
+    let focused_cgwid = parent_ids
+        .get(&focused_cgwid)
+        .copied()
+        .filter(|parent| *parent != 0)
+        .unwrap_or(focused_cgwid);
 
     for i in 0..count {
         let dict = CFArrayGetValueAtIndex(array, i);
@@ -2118,10 +2223,7 @@ unsafe fn collect_windows_for_pid_inner(
         if cgwid != 0 {
             cg_window_layers.insert(cgwid, layer);
         }
-        if layer != 0 {
-            continue;
-        }
-        if is_known_non_normal_window(pid, identity.process_start_time_us, cgwid) {
+        if is_attached_surface(parent_ids.get(&cgwid).copied()) {
             continue;
         }
         if cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0) <= 0.0 {
@@ -2135,18 +2237,24 @@ unsafe fn collect_windows_for_pid_inner(
             current_cg_ids.insert(cgwid);
         }
         let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or((0.0, 0.0, 0.0, 0.0));
-        let Some((window_title, minimized)) = ax_wid_to_info.get(&cgwid) else {
+        let Some(ax_info) = ax_wid_to_info.get(&cgwid) else {
             continue;
         };
+        if !admissible_window_placement(layer, ax_info.is_main, ax_info.is_fullscreen) {
+            continue;
+        }
+        if ax_info.is_custom_root && !custom_window_is_substantial(bounds) && !ax_info.is_main {
+            continue;
+        }
         if pid == std::process::id() as i32
             && !cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false)
         {
             continue;
         }
-        if !show_minimized && *minimized {
+        if !show_minimized && ax_info.minimized {
             continue;
         }
-        if window_title.is_empty() && !titleless {
+        if ax_info.title.is_empty() && !titleless {
             continue;
         }
 
@@ -2164,10 +2272,10 @@ unsafe fn collect_windows_for_pid_inner(
             pid,
             window_id: cgwid,
             app_name: app_name.clone(),
-            window_title: window_title.clone(),
+            window_title: ax_info.title.clone(),
             icon_path: icon_path.clone(),
             is_active: false,
-            minimized: *minimized,
+            minimized: ax_info.minimized,
             bounds,
         });
         shown.insert(cgwid);
@@ -2176,14 +2284,19 @@ unsafe fn collect_windows_for_pid_inner(
         pid,
         identity.process_start_time_us,
         &cg_window_layers,
+        &ax_wid_to_info,
+        &parent_ids,
     );
     CFRelease(array);
 
     // CGWindowList 里没有的 AX 窗口仍然是合法窗口,例如 orderOut 的设置对话框。
     // AX-only windows remain valid, for example orderOut'd settings dialogs absent from CG.
     if pid != std::process::id() as i32 {
-        for (&cgwid, (window_title, minimized)) in &ax_wid_to_info {
-            if shown.contains(&cgwid) || (!show_minimized && *minimized) {
+        for (&cgwid, ax_info) in &ax_wid_to_info {
+            if shown.contains(&cgwid) || (!show_minimized && ax_info.minimized) {
+                continue;
+            }
+            if is_attached_surface(parent_ids.get(&cgwid).copied()) {
                 continue;
             }
             if !should_backfill_ax_window_for_process(
@@ -2194,7 +2307,10 @@ unsafe fn collect_windows_for_pid_inner(
             ) {
                 continue;
             }
-            if window_title.is_empty() && !titleless {
+            if ax_info.is_custom_root && !ax_info.is_main {
+                continue;
+            }
+            if ax_info.title.is_empty() && !titleless {
                 continue;
             }
             initialize_window_mru(
@@ -2210,10 +2326,10 @@ unsafe fn collect_windows_for_pid_inner(
                 pid,
                 window_id: cgwid,
                 app_name: app_name.clone(),
-                window_title: window_title.clone(),
+                window_title: ax_info.title.clone(),
                 icon_path: icon_path.clone(),
                 is_active: false,
-                minimized: *minimized,
+                minimized: ax_info.minimized,
                 bounds: (0.0, 0.0, 0.0, 0.0),
             });
         }
@@ -2241,12 +2357,13 @@ unsafe fn collect_windows_for_pid_inner(
     let live_ids: HashSet<u32> = current_cg_ids
         .into_iter()
         .chain(ax_wid_to_info.keys().copied().filter(|cgwid| {
-            should_backfill_ax_window_for_process(
-                pid,
-                *cgwid,
-                identity.process_start_time_us,
-                cg_window_layers.get(cgwid).copied(),
-            ) || is_known_non_normal_window(pid, identity.process_start_time_us, *cgwid)
+            !is_attached_surface(parent_ids.get(cgwid).copied())
+                && (should_backfill_ax_window_for_process(
+                    pid,
+                    *cgwid,
+                    identity.process_start_time_us,
+                    cg_window_layers.get(cgwid).copied(),
+                ) || is_known_non_normal_window(pid, identity.process_start_time_us, *cgwid))
         }))
         .collect();
     mru.retain(|(entry_pid, window_id), _| *entry_pid != pid || live_ids.contains(window_id));
@@ -2292,14 +2409,14 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 
     // 不再按 PID 排除本应用(own-PID)窗口:设置窗口也是 own-PID,排除它会导致设置
     // 开着时切不到它。浮窗自己不需要靠 PID 排除--它使用非 0 的 overlay 层级,
-    // kCGWindowLayer != 0,已被下面的 layer 过滤挡掉(与枚举模式无关)。设置窗口
+    // kCGWindowLayer != 0,且没有 AXMain/全屏语义,会被下面的准入规则挡掉。设置窗口
     // 关着时 orderOut 离屏,由下文的 own-PID isOnscreen 过滤排除,故
     // "开->显示为卡片、关->不显示"仍然成立。
     //
     // Own-PID windows are no longer excluded by PID: the settings window is own-PID too, and
     // excluding it would make it unswitchable while open. The overlay itself needs no PID
-    // exclusion -- it uses a non-zero overlay level and is dropped by the layer check below
-    // (independent of the enumeration mode). The settings window, when
+    // exclusion -- it uses a non-zero overlay level and no AXMain/fullscreen semantics, so the
+    // admission gate below drops it. The settings window, when
     // closed, is orderOut'd (off-screen) and excluded by the own-PID isOnscreen filter
     // below, so "open -> shown as a card, closed -> hidden" still holds.
     let mut windows: Vec<WindowInfo> = Vec::new();
@@ -2329,6 +2446,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     let mut cg_window_layers: HashMap<(i32, u32), i32> = HashMap::new();
     // TIMING-DEBUG pid -> 应用名(慢 AX 日志用)/ pid -> app name (for the slow-AX log).
     let mut pid_names: HashMap<i32, String> = HashMap::new();
+    let mut cg_window_ids = Vec::new();
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
         if dict.is_null() {
@@ -2342,9 +2460,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
         if cgwid != 0 {
             cg_window_layers.insert((owner_pid, cgwid), layer);
-        }
-        if layer != 0 {
-            continue;
+            cg_window_ids.push(cgwid);
         }
         let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
         if owner_name.is_empty() || owner_name == "Dock" {
@@ -2353,6 +2469,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         pid_names.insert(owner_pid, owner_name);
         pids.insert(owner_pid);
     }
+    let parent_ids: HashMap<u32, u32> = skylight::window_parent_ids(&cg_window_ids);
 
     // 以 AX 窗口列表为主数据源（macOS App Switcher 的做法）
     // Use AX window list as primary source (same as macOS App Switcher)
@@ -2372,7 +2489,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // by key into a result identical to the serial version. Wall clock drops from "sum of
     // all PIDs" to "slowest single PID" (apps like WeChat that stall on every AX question
     // used to dominate serial totals; up to 1.5s for one PID in logs).
-    let mut ax_wid_to_info: HashMap<i32, HashMap<u32, (String, bool)>> = HashMap::new();
+    let mut ax_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>> = HashMap::new();
     // AX 查询「成功」的 pid 集合:成功但无标准窗口的 App 应整体跳过(调度中心不显示它),
     // 只有查询失败(None)才允许走 CG 回退。这是 BetterDisplay 隐形窗口 bug 的根因修复:
     // AX 成功但 subrole 过滤后为空,不能等同于「无 AX 数据」。
@@ -2454,7 +2571,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // TIMING-DEBUG Wall clock of the parallel AX phase (not the sum of per-PID work;
     // slow queries are logged individually).
     let ax_total_ms = t_ax.elapsed().as_millis();
-    remember_non_normal_cg_windows(&cg_window_layers, &icon_ids);
+    remember_non_normal_cg_windows(&cg_window_layers, &icon_ids, &ax_wid_to_info, &parent_ids);
 
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
@@ -2463,9 +2580,6 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         }
 
         let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
-        if layer != 0 {
-            continue;
-        }
 
         // 全透明窗口(alpha=0)不可见,调度中心不显示,跳过。
         // Fully transparent windows (alpha=0) are invisible; Mission Control doesn't show them.
@@ -2486,19 +2600,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 
         let cg_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
         let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
-        if is_known_non_normal_window(
-            owner_pid,
-            icon_ids
-                .get(&owner_pid)
-                .and_then(|identity| identity.process_start_time_us),
-            cgwid,
-        ) {
-            log_debug!(
-                "[collect] sticky non-normal layer: pid={} app=\"{}\" cgwid={} -> dropped",
-                owner_pid,
-                owner_name,
-                cgwid
-            );
+        if is_attached_surface(parent_ids.get(&cgwid).copied()) {
             continue;
         }
         // bounds (x, y, w, h);解析失败时全 0,调用方会回退到主屏幕。
@@ -2510,9 +2612,9 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         // Pair the AX title by CGWindowID (no more order/string guessing).
         // AX is authoritative: a CG window is kept only if AX has a window with
         // the same CGWindowID.
-        let (window_title, minimized) = if let Some(wid_map) = ax_wid_to_info.get(&owner_pid) {
+        let ax_info = if let Some(wid_map) = ax_wid_to_info.get(&owner_pid) {
             match wid_map.get(&cgwid) {
-                Some((t, m)) => (t.clone(), *m),
+                Some(info) => Some(info),
                 None => {
                     // 配对失败的 CG 窗口通常是菜单栏/弹出层,属于正常过滤路径,不逐条记录。
                     // CG windows without an AX pair are usually menu bars/popups and are
@@ -2530,8 +2632,43 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         } else {
             // 该 App 无 AX 数据 -> 退回 CG 标题,最小化状态未知按 false。
             // No AX data -> fall back to CG title; minimized status unknown, assume false.
-            (cg_title, false)
+            None
         };
+
+        let (window_title, minimized, is_main, is_fullscreen, is_custom_root) = ax_info
+            .map(|info| {
+                (
+                    info.title.clone(),
+                    info.minimized,
+                    info.is_main,
+                    info.is_fullscreen,
+                    info.is_custom_root,
+                )
+            })
+            .unwrap_or((cg_title, false, false, false, false));
+
+        if !admissible_window_placement(layer, is_main, is_fullscreen) {
+            continue;
+        }
+        if is_custom_root && !custom_window_is_substantial(bounds) && !is_main {
+            continue;
+        }
+        if is_known_non_normal_window(
+            owner_pid,
+            icon_ids
+                .get(&owner_pid)
+                .and_then(|identity| identity.process_start_time_us),
+            cgwid,
+        ) && !is_main
+        {
+            log_debug!(
+                "[collect] sticky non-normal layer: pid={} app=\"{}\" cgwid={} -> dropped",
+                owner_pid,
+                owner_name,
+                cgwid
+            );
+            continue;
+        }
 
         // 枚举已改为 All(见 cg_option 注释),离屏窗口(orderOut 的对话框/最小化/其他
         // Space)全部在列表里,显示与否由以下规则决定:
@@ -2631,11 +2768,14 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         if pid == std::process::id() as i32 {
             continue;
         }
-        let mut entries: Vec<(u32, &String, bool)> =
-            wid_map.iter().map(|(w, (t, m))| (*w, t, *m)).collect();
-        entries.sort_by_key(|(w, _, _)| *w);
-        for (cgwid, title, minimized) in entries {
+        let mut entries: Vec<(u32, &AxWindowInfo)> =
+            wid_map.iter().map(|(w, info)| (*w, info)).collect();
+        entries.sort_by_key(|(w, _)| *w);
+        for (cgwid, ax_info) in entries {
             if shown.contains(&(pid, cgwid)) {
+                continue;
+            }
+            if is_attached_surface(parent_ids.get(&cgwid).copied()) {
                 continue;
             }
             let process_start_time_us = icon_ids
@@ -2660,10 +2800,13 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             // 与 CG 路径同款过滤:最小化由开关控制;空标题(非 titleless)无意义。
             // Same filters as the CG path: minimized gated by the switch; empty titles
             // (not titleless) are meaningless.
-            if !show_minimized && minimized {
+            if !show_minimized && ax_info.minimized {
                 continue;
             }
-            if title.is_empty() && !titleless_pids.contains(&pid) {
+            if ax_info.is_custom_root && !ax_info.is_main {
+                continue;
+            }
+            if ax_info.title.is_empty() && !titleless_pids.contains(&pid) {
                 continue;
             }
             initialize_window_mru(
@@ -2686,10 +2829,10 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 pid,
                 window_id: cgwid,
                 app_name: pid_names.get(&pid).cloned().unwrap_or_default(),
-                window_title: title.clone(),
+                window_title: ax_info.title.clone(),
                 icon_path,
                 is_active: false,
-                minimized,
+                minimized: ax_info.minimized,
                 bounds: (0.0, 0.0, 0.0, 0.0),
             });
         }
@@ -2699,7 +2842,8 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // 不用显示列表——OnScreenOnly 看不到最小化窗口,按显示列表修剪会清掉它们的
     // 排序记忆。已关闭窗口的残留条目不清的话,系统复用 CGWindowID 时新窗口会
     // or_insert 命中旧时间戳、按旧窗口的时间排序(继承污染)。存活集只做最保守
-    // 过滤(layer 0 + 有效 pid),宁全勿缺;显示层的过滤(AX 配对/Dock/alpha)不适用。
+    // 过滤(layer 0,或 AX 确认的 main/fullscreen 窗口,+ 有效 pid),宁全勿缺;显示层的过滤
+    // (AX 配对/Dock/alpha)不适用。
     // 代价:show_minimized 关闭时每次 summon 补一次 All 枚举(亚毫秒级)。
     //
     // Prune MRU to the live window set. The live set is enumerated in All mode (includes
@@ -2707,7 +2851,8 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // minimized windows, so pruning against the display list would wipe their ordering
     // memory. Without pruning, a recycled CGWindowID would make a new window or_insert
     // the dead window's timestamp (inheritance pollution). The live set uses only the most
-    // conservative filters (layer 0 + valid pid) -- better to keep than to drop; display
+    // conservative filters (layer 0, or an AX-confirmed main/fullscreen window, + valid pid)
+    // -- better to keep than to drop; display
     // filters (AX pairing / Dock / alpha) don't apply here. Cost: one extra All-mode
     // enumeration per summon when show_minimized is off (sub-millisecond).
     let mut live_set: HashSet<(i32, u32)> = {
@@ -2724,14 +2869,22 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 if dict.is_null() {
                     continue;
                 }
-                if cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0 {
-                    continue;
-                }
+                let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
                 let pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
                 if pid <= 0 {
                     continue;
                 }
                 let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+                if is_attached_surface(parent_ids.get(&cgwid).copied()) {
+                    continue;
+                }
+                let is_main_or_fullscreen = ax_wid_to_info
+                    .get(&pid)
+                    .and_then(|windows| windows.get(&cgwid))
+                    .is_some_and(|window| window.is_main || window.is_fullscreen);
+                if layer != 0 && !is_main_or_fullscreen {
+                    continue;
+                }
                 s.insert((pid, cgwid));
             }
         }
@@ -2898,6 +3051,28 @@ mod tests {
         assert!(should_backfill_ax_window(Some(0)));
         // Non-zero layers are app-owned overlays/menus, not switcher targets.
         assert!(!should_backfill_ax_window(Some(101)));
+    }
+
+    #[test]
+    fn non_normal_windows_need_main_or_fullscreen_semantics() {
+        assert!(admissible_window_placement(0, false, false));
+        assert!(admissible_window_placement(3, true, false));
+        assert!(admissible_window_placement(101, false, true));
+        assert!(!admissible_window_placement(3, false, false));
+    }
+
+    #[test]
+    fn custom_roots_use_alt_tab_substantial_boundary() {
+        assert!(custom_window_is_substantial((0.0, 0.0, 100.0, 50.0)));
+        assert!(!custom_window_is_substantial((0.0, 0.0, 99.0, 50.0)));
+        assert!(!custom_window_is_substantial((0.0, 0.0, 100.0, 49.0)));
+    }
+
+    #[test]
+    fn attached_surfaces_are_not_independent_destinations() {
+        assert!(!is_attached_surface(None));
+        assert!(!is_attached_surface(Some(0)));
+        assert!(is_attached_surface(Some(94)));
     }
 
     fn window(pid: i32, wid: u32) -> WindowInfo {

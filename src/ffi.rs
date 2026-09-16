@@ -40,9 +40,20 @@ extern "C" {
 
     // ---- CF 容器与字符串(此前分散在 window_collector / thumbnail) ----
     // ---- CF containers & strings (previously scattered across window_collector / thumbnail) ----
+    pub(crate) fn CFArrayCreate(
+        alloc: *const c_void,
+        values: *const *const c_void,
+        num_values: isize,
+        callbacks: *const c_void,
+    ) -> *const c_void;
     pub(crate) fn CFArrayGetCount(array: *const c_void) -> isize;
     pub(crate) fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
     pub(crate) fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    pub(crate) fn CFNumberCreate(
+        alloc: *const c_void,
+        number_type: isize,
+        value_ptr: *const c_void,
+    ) -> *const c_void;
     pub(crate) fn CFNumberGetValue(
         number: *const c_void,
         the_type: isize,
