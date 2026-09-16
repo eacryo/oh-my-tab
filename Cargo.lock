@@ -233,6 +233,7 @@ dependencies = [
 name = "oh-my-tab"
 version = "0.2.1"
 dependencies = [
+ "block2",
  "flume",
  "objc2",
  "objc2-foundation",

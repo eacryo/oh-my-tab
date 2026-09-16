@@ -10,6 +10,7 @@ default = []
 dev-long-text = []
 
 [dependencies]
+block2 = "0.6"
 objc2 = "0.6"
 objc2-foundation = "0.3"
 flume = "0.11"

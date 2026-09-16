@@ -1,6 +1,8 @@
 //! 切换器浮窗 · 卡片关闭管线:关闭按钮类、关闭动画/补位重排、异步 AX 关闭与提交。
 //! Card-close pipeline: close button class, close animation/reflow, async AX close, and commit.
 
+use block2::RcBlock;
+
 use super::*;
 
 pub(super) unsafe fn card_views_by_key(
@@ -33,6 +35,20 @@ pub(super) unsafe fn animate_card_close_reflow(
     }
     CFRelease(timing_name as *const c_void);
 
+    // 动画阶段直接使用提交后的 document 坐标,并同步调整父级视口和 document。
+    // Use post-commit document coordinates during the animation and animate the containing
+    // viewport and document alongside the cards.
+    let document_delta = pending.final_document_h - pending.original_document_h;
+    if let Some(container) = *CONTAINER.lock().unwrap() {
+        let _: () = msg_send![container.0, setAutoresizingMask: 0u64];
+        let animator: *mut AnyObject = msg_send![container.0, animator];
+        let _: () = msg_send![animator, setFrame: pending.final_container_frame];
+        let _: () = msg_send![animator, setBoundsOrigin: pending.final_bounds_origin];
+    }
+    if let Some(document) = *CARD_DOCUMENT.lock().unwrap() {
+        let animator: *mut AnyObject = msg_send![document.0, animator];
+        let _: () = msg_send![animator, setFrame: pending.final_document_frame];
+    }
     for (&key, &card) in views {
         let Some(original) = pending.original_frames.get(&key) else {
             continue;
@@ -51,13 +67,28 @@ pub(super) unsafe fn animate_card_close_reflow(
             let _: () = msg_send![animator, setFrame: collapsed];
             let _: () = msg_send![animator, setAlphaValue: 0.0f64];
         } else if let Some(final_frame) = pending.final_frames.get(&key) {
-            let _: () = msg_send![animator, setFrame: *final_frame];
+            let rebased_frame = NSRect::new(
+                NSPoint::new(final_frame.origin.x, final_frame.origin.y + document_delta),
+                final_frame.size,
+            );
+            let _: () = msg_send![animator, setFrame: rebased_frame];
         }
     }
     if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
         let animator: *mut AnyObject = msg_send![window.0, animator];
         let _: () = msg_send![animator, setFrame: pending.final_panel_frame, display: true];
     }
+    let completion: RcBlock<dyn Fn()> = RcBlock::new(|| {
+        // NSAnimationContext completion handlers run on the main thread, so invoke the
+        // registered Rust callback directly instead of sending performSelector:withObject:.
+        // 这里已经在主线程,直接调用 Rust 回调,避免把 Objective-C 的 id 返回值误判为 void。
+        on_card_close_finished(
+            std::ptr::null_mut(),
+            sel!(handleCardCloseFinished:),
+            std::ptr::null_mut(),
+        );
+    });
+    let _: () = msg_send![context, setCompletionHandler: &*completion];
     let _: () = msg_send![class!(NSAnimationContext), endGrouping];
 }
 
@@ -81,6 +112,20 @@ pub(super) unsafe fn restore_card_close_reflow(pending: &PendingCardClose) {
         let _: () = msg_send![context, setTimingFunction: timing];
     }
     CFRelease(timing_name as *const c_void);
+    if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
+        let animator: *mut AnyObject = msg_send![window.0, animator];
+        let _: () = msg_send![animator, setFrame: pending.original_panel_frame, display: true];
+    }
+    if let Some(container) = *CONTAINER.lock().unwrap() {
+        let _: () = msg_send![container.0, setAutoresizingMask: 0u64];
+        let animator: *mut AnyObject = msg_send![container.0, animator];
+        let _: () = msg_send![animator, setFrame: pending.original_container_frame];
+        let _: () = msg_send![animator, setBoundsOrigin: pending.original_bounds_origin];
+    }
+    if let Some(document) = *CARD_DOCUMENT.lock().unwrap() {
+        let animator: *mut AnyObject = msg_send![document.0, animator];
+        let _: () = msg_send![animator, setFrame: pending.original_document_frame];
+    }
     for (&key, &card) in &views {
         if let Some(frame) = pending.original_frames.get(&key) {
             let animator: *mut AnyObject = msg_send![card, animator];
@@ -93,6 +138,9 @@ pub(super) unsafe fn restore_card_close_reflow(pending: &PendingCardClose) {
                 }
             }
         }
+    }
+    if let Some(container) = *CONTAINER.lock().unwrap() {
+        let _: () = msg_send![container.0, setAutoresizingMask: 18u64];
     }
     let _: () = msg_send![class!(NSAnimationContext), endGrouping];
     refresh_highlight();
@@ -156,6 +204,23 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
                 .map(|window| msg_send![window.0, frame])
                 .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)))
         };
+        let (original_container_frame, original_document_frame, original_bounds_origin) = unsafe {
+            let container = CONTAINER.lock().unwrap().map(|container| container.0);
+            let document = CARD_DOCUMENT.lock().unwrap().map(|document| document.0);
+            let container_frame = container
+                .map(|container| msg_send![container, frame])
+                .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)));
+            let document_frame = document
+                .map(|document| msg_send![document, frame])
+                .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)));
+            let bounds_origin = container
+                .map(|container| {
+                    let bounds: NSRect = msg_send![container, bounds];
+                    bounds.origin
+                })
+                .unwrap_or(NSPoint::new(0.0, 0.0));
+            (container_frame, document_frame, bounds_origin)
+        };
         let panel_w = panel_frame.size.width;
         let overflowed = THUMB_ROW_RANGES
             .lock()
@@ -201,6 +266,19 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
         let content_h = thumb_document_height_for_rows(final_row_ranges.len(), card_h, gap);
         let final_viewport_h = (final_panel_h - status_h()).max(1.0);
         let final_document_h = content_h.max(final_viewport_h).max(1.0);
+        let old_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+        let (final_document_h, final_scroll_max_offset, final_scroll_offset, _) =
+            rebase_thumb_scroll_after_document_resize(
+                document_h,
+                final_document_h,
+                final_viewport_h,
+                old_offset,
+            );
+        let final_bounds_origin = NSPoint::new(
+            original_bounds_origin.x,
+            (final_scroll_max_offset - final_scroll_offset)
+                .clamp(0.0, final_scroll_max_offset.max(0.0)),
+        );
         let final_frames = placements
             .into_iter()
             .filter_map(|placement| {
@@ -221,19 +299,36 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             ),
             NSSize::new(final_panel_w, final_panel_h),
         );
+        let final_container_frame = NSRect::new(
+            NSPoint::new(original_container_frame.origin.x, status_h()),
+            NSSize::new(final_panel_w, final_viewport_h),
+        );
+        let final_document_frame = NSRect::new(
+            original_document_frame.origin,
+            NSSize::new(final_panel_w, final_document_h),
+        );
         Some((
             PendingCardClose {
                 pid: window.pid,
                 cgwid: window.window_id,
                 animation_finished: false,
                 ax_result: None,
+                original_panel_frame: panel_frame,
+                original_container_frame,
+                original_document_frame,
+                original_bounds_origin,
                 original_frames,
                 final_frames,
                 final_row_ranges,
                 final_panel_frame,
+                final_container_frame,
+                final_document_frame,
+                final_bounds_origin,
                 final_overflowed,
                 original_document_h: document_h,
                 final_document_h,
+                final_scroll_max_offset,
+                final_scroll_offset,
             },
             views,
         ))
@@ -256,17 +351,6 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
         }
         drop(pending_ref);
         start_async_ax_close(close_key);
-        let Some(controller) = *crate::CONTROLLER.lock().unwrap() else {
-            *CARD_CLOSE_AX_RESULT.lock().unwrap() = None;
-            *PENDING_CARD_CLOSE.lock().unwrap() = None;
-            return;
-        };
-        let _: () = msg_send![
-            controller.0,
-            performSelector: sel!(handleCardCloseFinished:),
-            withObject: std::ptr::null::<AnyObject>(),
-            afterDelay: CARD_CLOSE_ANIMATION_DURATION
-        ];
     }
 }
 
@@ -398,29 +482,25 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
     // 提交时把卡片与 document 一起平移;二者使用同一个 delta,所以用户看到的内容不会跳变。
     // Rebase cards and the document together at commit; sharing one delta keeps visible content
     // stationary instead of making the page jump while the scrollbar stays at its old position.
-    let old_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
-    let viewport_h = (pending.final_panel_frame.size.height - status_h()).max(1.0);
-    let (document_h, max_offset, rebased_offset, document_delta) =
-        rebase_thumb_scroll_after_document_resize(
-            pending.original_document_h,
-            pending.final_document_h,
-            viewport_h,
-            old_offset,
-        );
+    let document_h = pending.final_document_h;
+    let max_offset = pending.final_scroll_max_offset;
+    let rebased_offset = pending.final_scroll_offset;
+    let document_delta = pending.final_document_h - pending.original_document_h;
 
     unsafe {
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
             let _: () = msg_send![window.0, setFrame: pending.final_panel_frame, display: false];
         }
         if let Some(container) = *CONTAINER.lock().unwrap() {
-            let frame: NSRect = msg_send![container.0, frame];
             let _: () = msg_send![
                 container.0,
                 setFrame: NSRect::new(
-                    NSPoint::new(frame.origin.x, status_h()),
-                    NSSize::new(pending.final_panel_frame.size.width, viewport_h),
+                    pending.final_container_frame.origin,
+                    pending.final_container_frame.size,
                 )
             ];
+            let _: () = msg_send![container.0, setBoundsOrigin: pending.final_bounds_origin];
+            let _: () = msg_send![container.0, setAutoresizingMask: 18u64];
         }
         if let Some(closing_card) = views.get(&key).copied() {
             remove_card_index(closing_card);
@@ -441,14 +521,7 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
         }
 
         if let Some(document) = card_document() {
-            let frame: NSRect = msg_send![document, frame];
-            let _: () = msg_send![
-                document,
-                setFrame: NSRect::new(
-                    frame.origin,
-                    NSSize::new(pending.final_panel_frame.size.width, document_h)
-                )
-            ];
+            let _: () = msg_send![document, setFrame: pending.final_document_frame];
         }
         *THUMB_DOCUMENT_HEIGHT.lock().unwrap() = document_h;
     }

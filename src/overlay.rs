@@ -230,13 +230,22 @@ struct PendingCardClose {
     cgwid: u32,
     animation_finished: bool,
     ax_result: Option<bool>,
+    original_panel_frame: NSRect,
+    original_container_frame: NSRect,
+    original_document_frame: NSRect,
+    original_bounds_origin: NSPoint,
     original_frames: HashMap<WindowKey, NSRect>,
     final_frames: HashMap<WindowKey, NSRect>,
     final_row_ranges: Vec<Range<usize>>,
     final_panel_frame: NSRect,
+    final_container_frame: NSRect,
+    final_document_frame: NSRect,
+    final_bounds_origin: NSPoint,
     final_overflowed: bool,
     original_document_h: f64,
     final_document_h: f64,
+    final_scroll_max_offset: f64,
+    final_scroll_offset: f64,
 }
 
 type WindowKey = (i32, u32);
