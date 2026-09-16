@@ -12,7 +12,8 @@ use crate::ffi::{
     AXUIElementPerformAction, AXUIElementRef, AXUIElementSetAttributeValue,
     AXUIElementSetMessagingTimeout, CFArrayGetCount, CFArrayGetValueAtIndex, CFBooleanGetValue,
     CFDictionaryGetValue, CFNumberGetValue, CFRelease, CFRetain, CFStringCreateWithCString,
-    CFStringGetCString, CGWindowListCopyWindowInfo, K_AX_INVALID_UI_ELEMENT, K_AX_SUCCESS,
+    CFStringGetCString, CGWindowListCopyWindowInfo, K_AX_CANNOT_COMPLETE, K_AX_INVALID_UI_ELEMENT,
+    K_AX_SUCCESS,
 };
 use crate::hash::fnv1a64_hex;
 use crate::icon_cache::check_cache_for_identity;
@@ -421,6 +422,22 @@ struct AxWindowInfo {
 const AX_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(750);
 static AX_SNAPSHOT_CACHE: LazyLock<Mutex<HashMap<i32, CachedAxSnapshot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 每个 AX 窗口元素的消息超时。`AXUIElementSetMessagingTimeout` 是按元素生效的,而且**不会**
+/// 被窗口元素继承:只在 app 元素上设超时时,从 AXWindows 取出的窗口元素查询(AXTitle/AXRole 等)
+/// 仍走系统默认值,实测约 1.5s——一个无响应 App 就能让整轮采集卡 1.5s。
+/// Per-element AX messaging timeout. `AXUIElementSetMessagingTimeout` applies per element and is
+/// NOT inherited: with the timeout set only on the app element, the queries on the window elements
+/// taken from AXWindows (AXTitle/AXRole/...) still use the system default of ~1.5s measured -- one
+/// unresponsive app was enough to stall a whole collection pass by that much.
+const AX_WINDOW_MESSAGING_TIMEOUT: f64 = 0.2;
+
+/// 抬窗路径的 AX 在主线程上执行,超时必须比采集路径更紧:超时只损失焦点兜底,已有的 SLPS
+/// 快速抬窗不受影响,而主线程被占住会让整个界面(含下一次 Cmd+Tab)都停摆。
+/// The raise path runs its AX on the main thread, so its timeout is tighter than the collection
+/// path: a timeout only loses the focus backstop (the SLPS fast raise already ran), whereas a
+/// blocked main thread freezes the whole UI, including the next Cmd+Tab.
+const AX_RAISE_MESSAGING_TIMEOUT: f64 = 0.25;
 
 /// A window that was observed at a non-normal CG layer must keep that classification while the
 /// same process instance and CGWindowID are alive. Some apps (notably Pixelmator-style helpers)
@@ -1212,8 +1229,18 @@ pub(crate) fn handle_ax_raise_main() {
             let raise_started = Instant::now();
             let raise_first_err = AXUIElementPerformAction(job.element, job.raise_key);
             let raise_first_us = raise_started.elapsed().as_micros();
-            let (focused_set_err, raise_retry_err) = if !job.force_focus
-                && (raise_first_err == K_AX_SUCCESS || raise_first_err == K_AX_INVALID_UI_ELEMENT)
+            // 对端超时(-25204)时不再做 focus 兜底与重试:这两次调用同样只会再各等一个超时,
+            // 实测 first/set_focused/retry 三次全是 -25204,主线程被占住约 4.5s。快速路径的 SLPS
+            // 抬窗已经生效,这里直接放弃 AX 兜底,把这 3 段超时压成 1 段。
+            // Drop the focus backstop and its retry once the target times out (-25204): both calls
+            // would only wait out another timeout each -- the log shows first/set_focused/retry all
+            // returning -25204 with the main thread blocked for ~4.5s. The SLPS fast raise already
+            // ran, so give up the AX backstop and collapse three timeouts into one.
+            let timed_out = raise_first_err == K_AX_CANNOT_COMPLETE;
+            let (focused_set_err, raise_retry_err) = if timed_out
+                || (!job.force_focus
+                    && (raise_first_err == K_AX_SUCCESS
+                        || raise_first_err == K_AX_INVALID_UI_ELEMENT))
             {
                 (None, None)
             } else {
@@ -1475,12 +1502,11 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
     }
     let process_start_time_us = resolve_app_identity(job.pid).process_start_time_us;
     let app_create_us = app_started.elapsed().as_micros();
-    // 1s 消息超时:无响应 App 不能把 raiser 线程卡太久(旧同步实现无超时,最坏按默认
-    // 超时阻塞主线程);超时只损失焦点兜底,快速路径的 SLPS 抬窗不受影响。
-    // 1s messaging timeout: an unresponsive app must not stall the raiser thread for long
-    // (the old sync path had no timeout and could block the main thread for the default
-    // timeout). A timeout only loses the focus backstop; the fast path's SLPS raise stands.
-    AXUIElementSetMessagingTimeout(app, 1.0);
+    // 抬窗路径的 AX 全部按 AX_RAISE_MESSAGING_TIMEOUT 限时:窗口元素在 raise_ax_element 里
+    // 单独设置,app 元素在这里设置(它不传递给子元素)。
+    // Every AX call on the raise path is bounded by AX_RAISE_MESSAGING_TIMEOUT: the window element
+    // is set inside raise_ax_element, the app element here (it is not inherited by children).
+    AXUIElementSetMessagingTimeout(app, AX_RAISE_MESSAGING_TIMEOUT);
 
     let raise_key = cf_string_new("AXRaise");
     let focused_key = cf_string_new("AXFocusedWindow");
@@ -1576,6 +1602,12 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
         if element.is_null() {
             continue;
         }
+        // 同采集路径:窗口元素不继承 app 元素超时,逐个设,否则匹配遍历会在无响应 App 上
+        // 每次读属性都等满系统默认超时。
+        // Same as the collection path: window elements do not inherit the app element's timeout,
+        // so set it per element or the match loop waits out the system default on each attribute
+        // read against an unresponsive app.
+        AXUIElementSetMessagingTimeout(element, AX_RAISE_MESSAGING_TIMEOUT);
         if ax_window_cgwid(element) == Some(job.cgwid) {
             // 应用变更前的最后一道 supersede 闸:枚举期间若来了更新的切换,本任务整体
             // 放弃(枚举结果作废),由新任务重新执行。
@@ -1666,6 +1698,13 @@ unsafe fn raise_ax_element(
         cgwid,
         force_focus
     );
+    // AXRaise 打的是窗口元素,而 app 元素上的超时不会传给它(见 AX_WINDOW_MESSAGING_TIMEOUT 注释)。
+    // 下面这些 AX 调用都在主线程执行,漏设超时就会按系统默认值(约 1.5s)冻结界面。
+    // AXRaise targets the window element, which does not inherit the app element's timeout
+    // (see the AX_WINDOW_MESSAGING_TIMEOUT note). Every AX call below runs on the main thread, so
+    // a missing timeout freezes the UI for the system default (~1.5s).
+    AXUIElementSetMessagingTimeout(element, AX_RAISE_MESSAGING_TIMEOUT);
+    AXUIElementSetMessagingTimeout(app, AX_RAISE_MESSAGING_TIMEOUT);
     enqueue_main_thread_ax_raise(
         pid,
         cgwid,
@@ -1853,6 +1892,12 @@ fn get_ax_windows_for_pid_with_identity(
             if element.is_null() {
                 continue;
             }
+            // app 元素上的 50ms 不会传给窗口元素;逐个设超时,否则无响应 App 的窗口查询会
+            // 走系统默认值(约 1.5s),把整轮采集拖住。
+            // The 50ms on the app element does not carry over to the window elements; set it per
+            // element, or an unresponsive app's window queries fall back to the system default
+            // (~1.5s) and stall the whole collection pass.
+            AXUIElementSetMessagingTimeout(element, AX_WINDOW_MESSAGING_TIMEOUT);
 
             // 只保留标准窗口/有标题的对话框,以及 role=AXWindow 且有标题的 AXUnknown
             // 普通窗口(如 Xcode);过滤弹出面板/下拉菜单等非标准窗口。

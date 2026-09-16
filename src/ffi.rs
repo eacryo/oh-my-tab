@@ -110,6 +110,12 @@ pub(crate) type AxObserverRef = *mut c_void;
 pub(crate) type AXError = i32;
 pub(crate) const K_AX_SUCCESS: AXError = 0;
 pub(crate) const K_AX_INVALID_UI_ELEMENT: AXError = -25205;
+/// kAXErrorCannotComplete:目标 App 未在消息超时内应答。无响应 App 的 AX 调用返回的就是这个码
+/// (实测 2026-09-16:PeachPic 每次 AX 查询都等满超时后返回 -25204)。
+/// kAXErrorCannotComplete: the target app did not answer within the messaging timeout. This is
+/// the code an unresponsive app returns (measured 2026-09-16: every AX query against PeachPic
+/// burned the full timeout and came back -25204).
+pub(crate) const K_AX_CANNOT_COMPLETE: AXError = -25204;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
