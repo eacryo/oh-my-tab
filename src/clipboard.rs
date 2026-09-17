@@ -1733,7 +1733,16 @@ extern "C" fn scroll_indicator_mouse_up(_self: *mut c_void, _cmd: Sel, _event: *
 /// Clip-view bounds-change notification callback (scrolling) -> update the indicator; with
 /// the detail open, move it along so it keeps following the selected row (otherwise a
 /// scroll would leave the detail misaligned with its row).
+/// C 回调的 panic 边界:panic 穿不过 extern "C" 帧(会 abort 整个进程),这里统一接住。
+/// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
+/// aborts the process), so it is contained here.
 extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
+    crate::callback_guard::void("scroll_indicator_bounds_changed", || unsafe {
+        scroll_indicator_bounds_changed_inner(_self, _cmd, _note)
+    });
+}
+
+unsafe fn scroll_indicator_bounds_changed_inner(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
     update_scroll_indicator();
     if !REBUILDING.load(Ordering::SeqCst) && PICKER_VISIBLE.load(Ordering::SeqCst) {
         unsafe {
@@ -7187,7 +7196,16 @@ fn clamp_selection(sel: usize, len: usize) -> usize {
 /// Enter 粘贴,Esc 关闭。
 /// Keyboard navigation: Tab cycles filters; up/down select, left pins, right expands
 /// details (with the detail open, right closes it), Enter pastes, Esc closes.
+/// C 回调的 panic 边界:panic 穿不过 extern "C" 帧(会 abort 整个进程),这里统一接住。
+/// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
+/// aborts the process), so it is contained here.
 extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    crate::callback_guard::void("container_key_down", || unsafe {
+        container_key_down_inner(_self, _cmd, event)
+    });
+}
+
+unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let keycode: u16 = msg_send![event as *mut AnyObject, keyCode];
         // Cmd+F(键码 3 + Command 修饰 0x100000):聚焦顶部搜索框。搜索框已聚焦时
@@ -8180,7 +8198,16 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_v
 /// 分享按钮按下时使用 HTML 的 7.5% 底色;其它按钮完全沿用 NSButton 原行为。
 /// The share button uses the HTML mockup's 7.5% pressed fill; all other buttons retain native
 /// NSButton behavior.
+/// C 回调的 panic 边界:panic 穿不过 extern "C" 帧(会 abort 整个进程),这里统一接住。
+/// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
+/// aborts the process), so it is contained here.
 extern "C" fn hover_button_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    crate::callback_guard::void("hover_button_mouse_down", || unsafe {
+        hover_button_mouse_down_inner(_self, _cmd, event)
+    });
+}
+
+unsafe fn hover_button_mouse_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
     unsafe {
         let button = _self as *mut AnyObject;
         let action: Sel = msg_send![button, action];

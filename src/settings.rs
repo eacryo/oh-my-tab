@@ -3447,7 +3447,16 @@ unsafe fn refresh_text_input_state(window: *mut AnyObject) {
 /// Those views do not become first responder themselves, so AppKit otherwise leaves an
 /// NSTextField editor active after a click on empty page space. Resigning before dispatching the
 /// mouse event lets the clicked control become first responder again when appropriate.
+/// C 回调的 panic 边界:panic 穿不过 extern "C" 帧(会 abort 整个进程),这里统一接住。
+/// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
+/// aborts the process), so it is contained here.
 extern "C" fn settings_window_send_event(_self: *mut c_void, _cmd: Sel, event: *mut AnyObject) {
+    crate::callback_guard::void("settings_window_send_event", || unsafe {
+        settings_window_send_event_inner(_self, _cmd, event)
+    });
+}
+
+unsafe fn settings_window_send_event_inner(_self: *mut c_void, _cmd: Sel, event: *mut AnyObject) {
     unsafe {
         if !event.is_null() {
             let event_type: usize = msg_send![event, type];
@@ -3943,6 +3952,16 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             // Remove only the old content hierarchy; keep the NSWindow, its frame, and key status
             // intact so a locale/theme refresh is an in-place redraw.
             // 只移除旧内容层级;保留 NSWindow、窗口位置和焦点状态,让语言/主题刷新成为原位重绘。
+            //
+            // 整棵旧层级即将销毁:先清空 tooltip 注册表(键是 view 地址)。残留的旧地址活到下一次
+            // 点击时,新控件往往复用同一块内存——那时就是给已释放对象发消息(2026-09-15 22:19 的
+            // SIGTRAP 崩溃正是这条路径:settings_window_send_event → tooltip 命中旧地址)。
+            // The whole old hierarchy is about to be destroyed: clear the tooltip registries first
+            // (their keys are view addresses). A stale address surviving into the next click is
+            // usually reused by a new control -- i.e. a message to a freed object (exactly the
+            // 2026-09-15 22:19 SIGTRAP crash path: settings_window_send_event -> tooltip hits a
+            // stale address).
+            tooltip::SettingsTooltip::clear_runtime_registries();
             let subviews: *mut AnyObject = msg_send![content, subviews];
             let count: usize = msg_send![subviews, count];
             for index in (0..count).rev() {

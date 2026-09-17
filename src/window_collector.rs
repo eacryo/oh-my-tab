@@ -2121,7 +2121,30 @@ unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> A
         let identity = unsafe { resolve_app_identity(pid) };
         let process_start_time_us = identity.process_start_time_us;
         partial.icon_ids.insert(pid, identity);
-        let ax_wins = get_ax_windows_for_pid_with_identity(pid, process_start_time_us);
+        // ObjC 异常边界(HIServices 的 AX 内部会抛 NSException)。这类异常穿过 Rust 栈时,
+        // 线程级 catch_unwind 接不住"外来异常"(`__rust_foreign_exception` → 整个进程 abort,
+        // 实测 2026-09-17 22:20 的崩溃正是如此)。接住后把该 pid 当作"无窗口"降级,记下异常
+        // 名/原因,采集继续——进程级崩溃降级为某个 app 的卡片缺失。
+        // ObjC exception boundary (AX internals in HIServices do throw NSExceptions). Such an
+        // exception unwinds through Rust frames, and the thread-level catch_unwind cannot catch a
+        // foreign exception (`__rust_foreign_exception` aborts the whole process; measured in the
+        // 2026-09-17 22:20 crash). Caught here, that pid degrades to "no windows" with the
+        // exception's name/reason logged, and the collection continues -- a process-wide crash
+        // becomes one missing card.
+        let ax_wins = match objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            get_ax_windows_for_pid_with_identity(pid, process_start_time_us)
+        })) {
+            Ok(windows) => windows,
+            Err(exception) => {
+                log_info!(
+                    "[collect] ax exception: pid={} app=\"{}\" {:?}",
+                    pid,
+                    pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                    exception
+                );
+                None
+            }
+        };
         let pid_ms = t_pid.elapsed().as_millis();
         partial.ax_work_ms += pid_ms;
         // 只记录慢 AX 查询;正常查询保持静默,避免每次召唤刷屏。
@@ -2593,7 +2616,29 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             std::thread::scope(|scope| {
                 let handles: Vec<_> = pid_list
                     .chunks(chunk_size)
-                    .map(|chunk| scope.spawn(|| unsafe { ax_collect_chunk(chunk, &pid_names) }))
+                    .map(|chunk| {
+                        scope.spawn(|| {
+                            // 兜底:整块采集再包一层异常边界(覆盖身份解析等非 AX 的 ObjC 调用),
+                            // 异常时退化成"这一块没有数据"而不是终止进程。
+                            // Safety net: wrap the whole chunk too (covering non-AX ObjC calls such
+                            // as identity resolution); on an exception the chunk degrades to "no
+                            // data" instead of terminating the process.
+                            objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+                                ax_collect_chunk(chunk, &pid_names)
+                            }))
+                            .unwrap_or_else(|exception| {
+                                log_info!("[collect] ax exception (chunk) {:?}", exception);
+                                AxPartial {
+                                    icon_ids: HashMap::new(),
+                                    ax_queried_pids: HashSet::new(),
+                                    ax_failed_pids: Vec::new(),
+                                    ax_wid_to_info: HashMap::new(),
+                                    titleless_pids: HashSet::new(),
+                                    ax_work_ms: 0,
+                                }
+                            })
+                        })
+                    })
                     .collect();
                 handles
                     .into_iter()
@@ -3078,6 +3123,51 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 冒烟(GUI/ObjC 运行时):确认 objc2 的异常边界真的能接住 ObjC 异常。
+    /// 这条机制是 AX 采集路径的崩溃兜底:没有它,异常会以 `__rust_foreign_exception` 终止进程
+    /// (见 2026-09-17 22:20 的崩溃报告)。需要图形会话,故标 ignore;
+    /// 跑法:`cargo test -- --ignored objc_exception_guard_contains_a_raise`。
+    ///
+    /// Smoke (GUI/ObjC runtime): verifies that objc2's exception boundary really contains an
+    /// Objective-C exception. This is the crash backstop of the AX collection path: without it the
+    /// exception terminates the process via `__rust_foreign_exception` (see the 2026-09-17 22:20
+    /// crash report). Requires a GUI session, hence #[ignore]; run with
+    /// `cargo test -- --ignored objc_exception_guard_contains_a_raise`.
+    #[test]
+    #[ignore]
+    fn objc_exception_guard_contains_a_raise() {
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send};
+        unsafe {
+            let name = crate::ffi::make_nsstring("OhMyTabSmokeException");
+            let reason = crate::ffi::make_nsstring("raised by the smoke test");
+            let exception: *mut AnyObject = msg_send![
+                class!(NSException),
+                exceptionWithName: name,
+                reason: reason,
+                userInfo: std::ptr::null_mut::<AnyObject>()
+            ];
+            crate::ffi::CFRelease(name as *const c_void);
+            crate::ffi::CFRelease(reason as *const c_void);
+            assert!(!exception.is_null(), "NSException must be constructible");
+
+            let caught = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                let _: () = msg_send![exception, raise];
+                "unreachable"
+            }));
+            let err =
+                caught.expect_err("the raised exception must be caught, not abort the process");
+            // Debug 里带 NSException 的 name,便于日志定位(采集路径同样打印它)。
+            // The Debug output carries the NSException's name for log-based diagnosis (the
+            // collection path logs the same way).
+            let text = format!("{err:?}");
+            assert!(
+                text.contains("OhMyTabSmokeException"),
+                "exception name must surface in the log text: {text}"
+            );
+        }
+    }
 
     #[test]
     fn icon_miss_log_is_rate_limited_per_identity() {
