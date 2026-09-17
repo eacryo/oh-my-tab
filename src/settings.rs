@@ -218,18 +218,21 @@ pub(super) struct SettingsUi {
     line_count: *mut AnyObject,      // NSSlider: line count slider
     line_count_label: *mut AnyObject, // NSTextField: line count row 的 label / the row's label
     line_count_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
-    line_count_card: *mut AnyObject,        // NSView: 行数卡片 / line-count card
-    line_count_shadow: *mut AnyObject,      // NSView: 行数卡片阴影 / line-count card shadow
-    line_count_separator: *mut AnyObject, // NSView: 行数行上方分割线 / separator above line-count row
-    line_count_compact: bool, // 是否已移除条件行占位 / whether the conditional row is compacted
+    // 行数行是条件行:整块显隐由 CollapsibleRows 负责(卡片/阴影/分割线都在里面)。
+    // The line-count row is conditional: CollapsibleRows owns the show/hide (card, shadow, and
+    // divider included).
+    line_count_block: CollapsibleRows,
     disable_pointer_accel: *mut AnyObject, // NSSwitch: 禁用指针加速 / disable pointer acceleration
-    pointer_accel_slider: *mut AnyObject, // NSSlider: 跟踪速度 0..=40
-    pointer_accel_label: *mut AnyObject, // NSTextField: 该行标题 / the row's label
+    pointer_accel_slider: *mut AnyObject,  // NSSlider: 跟踪速度 0..=40
+    pointer_accel_label: *mut AnyObject,   // NSTextField: 该行标题 / the row's label
     pointer_accel_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
-    pointer_accel_separator: *mut AnyObject,   // NSView: 该行上方分割线 / separator above the row
-    pointer_accel_card: *mut AnyObject,        // NSView: 指针卡片 / the pointer card
-    pointer_accel_shadow: *mut AnyObject,      // NSView: 指针卡片阴影 / the pointer card shadow
-    pointer_accel_compact: bool, // 是否已移除条件行占位 / whether the conditional row is compacted
+    // 跟踪速度行是条件行:同上,整块显隐由组件负责。
+    // The tracking-speed row is conditional: same deal, the component owns show/hide.
+    pointer_accel_block: CollapsibleRows,
+    // 仅"图标和缩略图"模式才相关的两行(前台预热 + 缩略图上的应用名),整块显隐。
+    // The two rows that only apply in icons-and-thumbnails mode (focused prewarm + app name on
+    // thumbnails), shown/hidden as one block.
+    thumbnail_only_block: CollapsibleRows,
     // ---- 按键映射区 / button-mappings section ----
     mapping_scroll: *mut AnyObject, // NSScrollView: 绑定列表滚动容器 / the bindings scroll view
     mapping_doc: *mut AnyObject,    // NSView: 滚动容器里的 document view(行堆叠处)/ document view
@@ -241,6 +244,10 @@ pub(super) struct SettingsUi {
     clipboard_move_used_to_top: *mut AnyObject, // NSSwitch: 使用后移到最前 / move used entries to top
     clipboard_delete_after_paste: *mut AnyObject, // NSSwitch: 粘贴后删除条目 / delete entry after paste
     clipboard_clear_system_pasteboard_after_paste: *mut AnyObject, // NSSwitch: 粘贴后清空系统剪贴板 / clear system pasteboard after paste
+    // "同时删除系统剪贴板中对应条目"是"粘贴后删除条目"的子项:只有后者打开时才出现。
+    // "Clear the matching system-pasteboard entry" is a child of "delete entry after paste": it
+    // only appears while the latter is on.
+    clipboard_delete_block: CollapsibleRows,
     clipboard_max_entries: *mut AnyObject, // NSTextField: 历史最大条数 / max history entries
     clipboard_auto_expire_days: *mut AnyObject, // NSSlider: 自动过期天数(0=永不过期)/ auto-expire days (0 = never)
     clipboard_auto_expire_days_value_label: *mut AnyObject, // NSTextField: 自动过期值 / auto-expire value
@@ -474,9 +481,9 @@ pub(crate) mod tooltip;
 pub(crate) mod widgets;
 
 use components::{
-    RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard, SettingsControl,
-    SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader, SettingsRow,
-    SettingsSection, SettingsSelect, SettingsSidebar,
+    CollapsibleRows, RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard,
+    SettingsControl, SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader,
+    SettingsRow, SettingsSection, SettingsSelect, SettingsSidebar,
 };
 use glass_preview::*;
 pub(crate) use glass_preview::{
@@ -1356,6 +1363,16 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
                 }
             });
         }
+        if matches!(field, ControlField::ClipboardDeleteAfterPaste) {
+            // "粘贴后删除条目"切换:它的子项(同时删除系统剪贴板条目)随之显隐。
+            // The "delete entry after paste" switch flipped: its child option (clear the matching
+            // system-pasteboard entry) follows.
+            with_settings_ui(|ui| {
+                if let Some(u) = ui.as_ref() {
+                    update_clipboard_delete_dependent_visibility(u);
+                }
+            });
+        }
         if matches!(field, ControlField::DisablePointerAccel) {
             // 开关切换:跟踪速度行随之显隐(打开=线性跟踪时才出现)。
             // The switch flipped: the tracking-speed row follows (it only appears while linear
@@ -1363,6 +1380,15 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
             with_settings_ui(|ui| {
                 if let Some(u) = ui.as_mut() {
                     update_pointer_accel_visibility(u);
+                }
+            });
+        }
+        if matches!(field, ControlField::ThumbnailsEnabled) {
+            // 显示模式切换:仅缩略图模式的两行随之显隐。
+            // The display mode flipped: the thumbnail-only pair follows.
+            with_settings_ui(|ui| {
+                if let Some(u) = ui.as_mut() {
+                    update_display_mode_dependent_visibility(u);
                 }
             });
         }
@@ -1963,26 +1989,24 @@ unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
     let state: isize = msg_send![ui.clipboard_enabled, state];
     let on = state == 1;
     let tooltip = t("settings.tooltip_clipboard_disabled");
+    // "同时删除系统剪贴板中对应条目"也在列表里:它只受总开关影响(是否显示由"粘贴后删除条目"
+    // 决定,见 update_clipboard_delete_dependent_visibility),所以不再需要按后者叠加置灰。
+    // "Clear the matching system-pasteboard entry" is in this list too: only the master switch
+    // greys it out (whether it shows at all is decided by "delete entry after paste", see
+    // update_clipboard_delete_dependent_visibility), so it no longer stacks a second condition.
     for &ctrl in &[
         ui.clipboard_pin_follow,
         ui.clipboard_persist,
         ui.clipboard_show_source_app,
         ui.clipboard_move_used_to_top,
         ui.clipboard_delete_after_paste,
+        ui.clipboard_clear_system_pasteboard_after_paste,
         ui.clipboard_max_entries,
         ui.clipboard_auto_expire_days,
         ui.clipboard_auto_expire_days_value_label,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
-    let delete_tooltip = t("settings.tooltip_clipboard_delete_after_paste_disabled");
-    SettingsRow::set_enabled_when_all(
-        ui.clipboard_clear_system_pasteboard_after_paste,
-        &[
-            (ui.clipboard_enabled, tooltip.as_str()),
-            (ui.clipboard_delete_after_paste, delete_tooltip.as_str()),
-        ],
-    );
 }
 
 /// 根据窗口控制总开关状态,冻结其下方的八个快捷键开关。
@@ -2027,71 +2051,11 @@ fn pointer_accel_display(value: f64) -> String {
 /// speed under linear tracking and the acceleration curve's strength otherwise, a different
 /// meaning (see the module comment in mouse/pointer.rs) -- so it is neither shared nor shown
 /// while off.
-unsafe fn update_pointer_accel_visibility(ui: &mut SettingsUi) {
+unsafe fn update_pointer_accel_visibility(ui: &SettingsUi) {
     let state: isize = msg_send![ui.disable_pointer_accel, state];
-    let show = state == 1;
-    let compact = !show;
-    if compact != ui.pointer_accel_compact {
-        // 与"行数"条件行同一套机制:该行占指针卡片最后一行位,隐藏时卡片底边上收一行高,
-        // 其下方所有分组同步上移;恢复时反向。
-        // Same mechanism as the line-count conditional row: the row occupies the pointer card's
-        // last row slot, so hiding it raises the card's bottom edge by one row height and shifts
-        // every section below up; reversed when it returns.
-        let removed_section_h = 8.0 + SettingsLayout::SINGLE_LINE_ROW_H;
-        let shift = if compact {
-            removed_section_h
-        } else {
-            -removed_section_h
-        };
-        let card_frame: NSRect = msg_send![ui.pointer_accel_card, frame];
-        let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
-        let subviews: *mut AnyObject = msg_send![document, subviews];
-        let count: usize = msg_send![subviews, count];
-        for i in 0..count {
-            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            if view == ui.pointer_accel_slider
-                || view == ui.pointer_accel_label
-                || view == ui.pointer_accel_value_label
-                || view == ui.pointer_accel_card
-                || view == ui.pointer_accel_shadow
-            {
-                continue;
-            }
-            let mut frame: NSRect = msg_send![view, frame];
-            if frame.origin.y < card_frame.origin.y {
-                frame.origin.y += shift;
-                let _: () = msg_send![view, setFrame: frame];
-            }
-        }
-        let mut compact_card_frame = card_frame;
-        compact_card_frame.origin.y += shift;
-        compact_card_frame.size.height -= shift;
-        let _: () = msg_send![ui.pointer_accel_card, setFrame: compact_card_frame];
-        let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
-        let _: () = msg_send![
-            ui.pointer_accel_shadow,
-            setFrame: NSRect::new(
-                NSPoint::new(
-                    compact_card_frame.origin.x - shadow_inset,
-                    compact_card_frame.origin.y - shadow_inset,
-                ),
-                NSSize::new(
-                    compact_card_frame.size.width + shadow_inset * 2.0,
-                    compact_card_frame.size.height + shadow_inset * 2.0,
-                ),
-            )
-        ];
-        // 分割线也跟着藏:只剩"禁用指针加速"一行时,卡片底部不该留一条悬空的线。
-        // The separator hides along with it: with only the disable-acceleration row left, a
-        // dangling line at the card's bottom edge would look wrong.
-        let _: () = msg_send![ui.pointer_accel_separator, setHidden: compact];
-        ui.pointer_accel_compact = compact;
-    }
-    let _: () = msg_send![ui.pointer_accel_label, setHidden: !show];
-    let _: () = msg_send![ui.pointer_accel_slider, setHidden: !show];
-    // 滑块右侧的数值 label 随滑块一起显隐。
-    // The slider's value label hides with the slider.
-    let _: () = msg_send![ui.pointer_accel_value_label, setHidden: !show];
+    // 整块收放(卡片底边上收、下方分组上移、分割线一起藏)由 CollapsibleRows 负责。
+    // CollapsibleRows owns the whole collapse (card bottom edge, sections below, divider).
+    ui.pointer_accel_block.set_visible(state == 1);
 }
 
 /// 根据当前滚动模式(Default/Line)刷新"行数"行的条件显隐:
@@ -2106,77 +2070,49 @@ unsafe fn update_pointer_accel_visibility(ui: &mut SettingsUi) {
 /// - Default: hidden
 ///
 /// Called by load_settings_values and handle_scroll_mode_changed.
-unsafe fn update_mode_dependent_visibility(ui: &mut SettingsUi) {
+unsafe fn update_mode_dependent_visibility(ui: &SettingsUi) {
     let idx: isize = msg_send![ui.scroll_mode, indexOfSelectedItem];
     let mode = SCROLL_MODE_VALUES
         .get(idx as usize)
         .copied()
         .unwrap_or("default");
-    // 只有 Line 模式显示行数滑块(Default 不显示)。
-    // Only Line mode shows the line-count slider (hidden on Default).
-    let show_line = mode == "line";
-    let compact = !show_line;
-    if compact != ui.line_count_compact {
-        // 默认模式移除整行及其布局占位,后续分组向上收拢;切回 Line 模式时恢复原位。
-        // Remove the whole conditional row and its layout slot in Default mode; move later
-        // sections up, then restore their original positions when Line mode returns.
-        // The conditional row occupies one standard row slot inside the shared device card.
-        // Shift the following sections by exactly that slot when the row is hidden or restored.
-        // 条件行属于设备卡片,只占用一个标准行位。隐藏或恢复时,后续分组只移动这一行的高度。
-        let removed_section_h = 8.0 + SettingsLayout::SINGLE_LINE_ROW_H;
-        let shift = if compact {
-            removed_section_h
-        } else {
-            -removed_section_h
-        };
-        let card_frame: NSRect = msg_send![ui.line_count_card, frame];
-        // `mouse_view` is the scroll view; layout children live in its document view.
-        // `mouse_view` 是滚动容器,实际布局子视图都在它的 document view 中。
-        let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
-        let subviews: *mut AnyObject = msg_send![document, subviews];
-        let count: usize = msg_send![subviews, count];
-        for i in 0..count {
-            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
-            if view == ui.line_count
-                || view == ui.line_count_label
-                || view == ui.line_count_value_label
-                || view == ui.line_count_card
-                || view == ui.line_count_shadow
-            {
-                continue;
-            }
-            let mut frame: NSRect = msg_send![view, frame];
-            if frame.origin.y < card_frame.origin.y {
-                frame.origin.y += shift;
-                let _: () = msg_send![view, setFrame: frame];
-            }
-        }
-        let mut compact_card_frame = card_frame;
-        compact_card_frame.origin.y += shift;
-        compact_card_frame.size.height -= shift;
-        let _: () = msg_send![ui.line_count_card, setFrame: compact_card_frame];
-        let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
-        let _: () = msg_send![
-            ui.line_count_shadow,
-            setFrame: NSRect::new(
-                NSPoint::new(
-                    compact_card_frame.origin.x - shadow_inset,
-                    compact_card_frame.origin.y - shadow_inset,
-                ),
-                NSSize::new(
-                    compact_card_frame.size.width + shadow_inset * 2.0,
-                    compact_card_frame.size.height + shadow_inset * 2.0,
-                ),
-            )
-        ];
-        let _: () = msg_send![ui.line_count_separator, setHidden: compact];
-        ui.line_count_compact = compact;
-    }
-    let _: () = msg_send![ui.line_count_label, setHidden: !show_line];
-    let _: () = msg_send![ui.line_count, setHidden: !show_line];
-    // 行数滑块右侧的数值 label 随滑块一起显隐。
-    // The line-count slider's value label hides with the slider.
-    let _: () = msg_send![ui.line_count_value_label, setHidden: !show_line];
+    // 只有 Line 模式显示行数滑块(Default 不显示);整块收放由 CollapsibleRows 负责。
+    // Only Line mode shows the line-count slider (hidden on Default); CollapsibleRows owns the
+    // collapse (card bottom edge, sections below, divider).
+    ui.line_count_block.set_visible(mode == "line");
+}
+
+/// 根据窗口显示模式刷新"仅缩略图"两行的条件显隐:
+/// - 图标和缩略图(index 1):显示前台预热与"缩略图上显示应用名"
+/// - 仅图标(index 0):两行一起隐藏(没有缩略图时两者都无意义)
+///
+/// Refresh the visibility of the thumbnail-only pair from the window display mode:
+/// - icons and thumbnails (index 1): show focused prewarm and "app name on thumbnails"
+/// - icons only (index 0): hide both (neither means anything without thumbnails)
+unsafe fn update_display_mode_dependent_visibility(ui: &SettingsUi) {
+    let idx: isize = msg_send![ui.thumbnails_enabled, indexOfSelectedItem];
+    // 下拉 index 0 = 仅图标, 1 = 图标和缩略图(与配置里的 thumbnails_enabled 布尔值同义)。
+    // Popup index 0 = icons only, 1 = icons and thumbnails (same as the layout.thumbnails_enabled
+    // boolean).
+    ui.thumbnail_only_block.set_visible(idx == 1);
+}
+
+/// "同时删除系统剪贴板中对应条目"只在"粘贴后删除条目"打开时出现(它是后者的子项)。
+/// Show the "clear the matching system-pasteboard entry" row only while "delete entry after
+/// paste" is on (it is that switch's child option).
+unsafe fn update_clipboard_delete_dependent_visibility(ui: &SettingsUi) {
+    let state: isize = msg_send![ui.clipboard_delete_after_paste, state];
+    ui.clipboard_delete_block.set_visible(state == 1);
+}
+
+/// 条件行区块一起重算。幂等(状态由实时 frame 推出),可在窗口显示前后各调一次。
+/// Recompute all conditional row blocks. Idempotent (the state comes from the live frames),
+/// so it is safe both before and after the window is on screen.
+unsafe fn update_conditional_rows(ui: &SettingsUi) {
+    update_mode_dependent_visibility(ui);
+    update_pointer_accel_visibility(ui);
+    update_display_mode_dependent_visibility(ui);
+    update_clipboard_delete_dependent_visibility(ui);
 }
 
 /// enable_mouse switch toggle 回调:即时应用 + 冻结/解冻下方控件。
@@ -2327,7 +2263,7 @@ pub(crate) fn refresh_switcher_controls_from_config() {
     let cfg = CONFIG.read().unwrap().clone();
     unsafe {
         with_settings_ui(|ui| {
-            let Some(u) = ui.as_ref() else {
+            let Some(u) = ui.as_mut() else {
                 return;
             };
             let visible: bool = msg_send![u.window, isVisible];
@@ -2350,6 +2286,9 @@ pub(crate) fn refresh_switcher_controls_from_config() {
                 0isize
             };
             let _: () = msg_send![u.focused_thumbnail_prewarm, setState: prewarm_state];
+            // 显示模式可能刚变过:仅缩略图的两行跟着重算显隐。
+            // The display mode may have just changed: recompute the thumbnail-only pair.
+            update_display_mode_dependent_visibility(u);
         });
     }
 }
@@ -2819,6 +2758,15 @@ fn show_settings_inner(
                     }
                     let _: () =
                         msg_send![u.window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+                    // 条件行在窗口显示后再算一次:AppKit 首次显示窗口时可能按 autoresizing
+                    // 重排子视图,把加载阶段（窗口仍隐藏）做的补位冲掉。组件按实时 frame 判断
+                    // 当前状态,重复调用是幂等的,不会二次位移。
+                    // Recompute the conditional rows after the window is on screen: AppKit may
+                    // re-place subviews by their autoresizing masks the first time a window is
+                    // displayed, undoing the compaction done while it was still hidden. The
+                    // component derives its state from the live frames, so this call is idempotent
+                    // and never shifts twice.
+                    update_conditional_rows(u);
                 } else if let Some(frame) = preserved_frame {
                     // 主题刷新只更新同一窗口的内容,保持其后台层级与焦点,不触发应用激活。
                     // Theme refresh only replaces content in the same window, preserving its
@@ -3249,12 +3197,10 @@ fn load_settings_from(cfg: &Config) {
             // 根据 enable_mouse 状态冻结/解冻下方控件。
             // Freeze/unfreeze the controls below based on the enable_mouse state.
             update_mouse_controls_enabled(ui);
-            // 根据滚动模式刷新行数行的条件显隐。
-            // Refresh the conditional visibility of the lines-per-tick row by mode.
-            update_mode_dependent_visibility(ui);
-            // 根据"禁用指针加速"开关刷新跟踪速度行的条件显隐。
-            // Refresh the tracking-speed row's conditional visibility from the switch.
-            update_pointer_accel_visibility(ui);
+            // 三个条件行区块(行数/跟踪速度/仅缩略图两行)按各自条件重算显隐。
+            // Recompute the three conditional row blocks (line count, tracking speed, the
+            // thumbnail-only pair) from their own conditions.
+            update_conditional_rows(ui);
 
             // ===== 剪贴板历史页:填充全局配置 =====
             // Clipboard page: populate from the global config.
@@ -4066,18 +4012,13 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             line_count: std::ptr::null_mut(),
             line_count_label: std::ptr::null_mut(),
             line_count_value_label: std::ptr::null_mut(),
-            line_count_card: std::ptr::null_mut(),
-            line_count_shadow: std::ptr::null_mut(),
-            line_count_separator: std::ptr::null_mut(),
-            line_count_compact: false,
+            line_count_block: CollapsibleRows::empty(),
             disable_pointer_accel: std::ptr::null_mut(),
             pointer_accel_slider: std::ptr::null_mut(),
             pointer_accel_label: std::ptr::null_mut(),
             pointer_accel_value_label: std::ptr::null_mut(),
-            pointer_accel_separator: std::ptr::null_mut(),
-            pointer_accel_card: std::ptr::null_mut(),
-            pointer_accel_shadow: std::ptr::null_mut(),
-            pointer_accel_compact: false,
+            pointer_accel_block: CollapsibleRows::empty(),
+            thumbnail_only_block: CollapsibleRows::empty(),
             mapping_scroll: std::ptr::null_mut(),
             mapping_doc: std::ptr::null_mut(),
             mapping_card: std::ptr::null_mut(),
@@ -4103,6 +4044,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             clipboard_move_used_to_top: std::ptr::null_mut(),
             clipboard_delete_after_paste: std::ptr::null_mut(),
             clipboard_clear_system_pasteboard_after_paste: std::ptr::null_mut(),
+            clipboard_delete_block: CollapsibleRows::empty(),
             clipboard_max_entries: std::ptr::null_mut(),
             clipboard_auto_expire_days: std::ptr::null_mut(),
             clipboard_auto_expire_days_value_label: std::ptr::null_mut(),
@@ -4838,17 +4780,27 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         y = layout.next_row_cursor(y, display_mode_metrics.row_h);
         // The popup row may be taller than the standard described row in long locales.
         // 下拉行在长文案语言下可能高于标准 described 行，分隔线必须复用实际行高。
-        SettingsRow::separator_above_row(switcher_view, y, display_mode_metrics.row_h, content_w);
-        ui.focused_thumbnail_prewarm = SettingsRow::described(
+        let prewarm_separator = SettingsRow::separator_above_row(
+            switcher_view,
+            y,
+            display_mode_metrics.row_h,
+            content_w,
+        );
+        // 这两行只在"图标和缩略图"模式下有意义:纯图标模式没有缩略图可预热,应用名也本就
+        // 单独一行显示(见下面注释),因此整块随显示模式显隐。
+        // These two rows only mean something in icons-and-thumbnails mode: there is no thumbnail
+        // to prewarm in icon-only mode, and the app name already gets its own line there (see
+        // below), so the whole block follows the display mode.
+        let (prewarm_label, prewarm_switch) = SettingsRow::tall_with_height(
             switcher_view,
             label_x,
             y,
             ctrl_x - label_x - 18.0,
             described_row_h,
             &t("settings.row_focused_thumbnail_prewarm"),
-            &t("settings.desc_focused_thumbnail_prewarm"),
             SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
+        ui.focused_thumbnail_prewarm = prewarm_switch;
         bind_control(target, ui.focused_thumbnail_prewarm);
         // 卡片标题中的应用名:开关决定缩略图卡片标题行是否在窗口标题前显示应用名,
         // 两者以 " · " 分隔;纯图标模式的应用名本就在标题下方单独一行,不受该开关影响。
@@ -4856,16 +4808,17 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // shows the app name before the window title, separated by " · "; icon-only mode
         // already shows the app name on its own line below the title, so it is unaffected.
         y = layout.next_row_cursor(y, described_row_h);
-        SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-        ui.show_app_name_in_cards = SettingsRow::tall(
+        let app_name_separator =
+            SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+        let (app_name_label, app_name_switch) = SettingsRow::tall(
             switcher_view,
             label_x,
             y,
             220.0,
             &t("settings.row_show_app_name_in_cards"),
             SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-        )
-        .1;
+        );
+        ui.show_app_name_in_cards = app_name_switch;
         bind_control(target, ui.show_app_name_in_cards);
         y = layout.next_row_cursor(y, described_row_h);
         SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
@@ -4986,7 +4939,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsControl::text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "64"),
         )
         .1;
-        SettingsSection::attach(
+        let options_card_parts = SettingsSection::attach(
             switcher_view,
             NSRect::new(
                 NSPoint::new(6.0, layout.card_bottom(y)),
@@ -4996,6 +4949,22 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 ),
             ),
             &t("settings.header_window_options"),
+        );
+        // 仅缩略图模式的两行:整块两行高(每行 row_gap + described_row_h),连同各自上方的
+        // 分割线一起显隐。
+        // The thumbnail-only pair: a block two rows tall (row_gap + described_row_h each), with
+        // each row's own divider going along with it.
+        ui.thumbnail_only_block = CollapsibleRows::new(
+            options_card_parts.card,
+            options_card_parts.shadow,
+            vec![
+                prewarm_label,
+                prewarm_switch,
+                app_name_label,
+                app_name_switch,
+            ],
+            vec![prewarm_separator, app_name_separator],
+            2.0 * (layout.row_gap + SettingsLayout::SINGLE_LINE_ROW_H),
         );
 
         // --- 键盘 Keyboard ---
@@ -5153,7 +5122,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // Keep this conditional row in the same card as Device and Scroll mode.
         // 将这个条件行放进与 Device、Scroll mode 相同的卡片中。
         y = layout.next_row_cursor(y, scroll_metrics.row_h);
-        ui.line_count_separator =
+        let line_count_separator =
             SettingsRow::separator_above_row(mouse_view, y, described_row_h, content_w);
         let (line_label, line_ctrl) = SettingsRow::tall(
             mouse_view,
@@ -5196,8 +5165,20 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         let device_card = device_card_parts.card;
         let device_shadow = device_card_parts.shadow;
-        ui.line_count_card = device_card;
-        ui.line_count_shadow = device_shadow;
+        // 行数行是条件行(只在 Line 模式显示):卡片是共用的设备卡片,隐藏时它的底边随之上收。
+        // The line-count row is conditional (Line mode only): the card is the shared device card,
+        // whose bottom edge rises when the row goes away.
+        ui.line_count_block = CollapsibleRows::new(
+            device_card,
+            device_shadow,
+            vec![
+                ui.line_count,
+                ui.line_count_label,
+                ui.line_count_value_label,
+            ],
+            vec![line_count_separator],
+            layout.row_gap + SettingsLayout::SINGLE_LINE_ROW_H,
+        );
 
         // --- 滚动 Scrolling ---
         y = layout.next_section_cursor(y);
@@ -5291,7 +5272,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         ui.pointer_accel_label = pointer_accel_label;
         ui.pointer_accel_slider = pointer_accel_slider;
-        ui.pointer_accel_separator = pointer_accel_separator;
         // 滑块右侧的只读数值 label:显示释放时的取值(2 位小数)。
         // Read-only value label right of the slider: shows the value on release (2 decimals).
         ui.pointer_accel_value_label = SettingsRow::attach_slider_readout(
@@ -5312,8 +5292,20 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             ),
             &t("settings.header_mouse_pointer"),
         );
-        ui.pointer_accel_card = pointer_card_parts.card;
-        ui.pointer_accel_shadow = pointer_card_parts.shadow;
+        // 跟踪速度行是条件行:把卡片、阴影、它自己的三个 view 与上方分割线交给组件管。
+        // The tracking-speed row is conditional: hand the card, its shadow, the row's three views,
+        // and the divider above it to the component.
+        ui.pointer_accel_block = CollapsibleRows::new(
+            pointer_card_parts.card,
+            pointer_card_parts.shadow,
+            vec![
+                ui.pointer_accel_label,
+                ui.pointer_accel_slider,
+                ui.pointer_accel_value_label,
+            ],
+            vec![pointer_accel_separator],
+            layout.row_gap + SettingsLayout::SINGLE_LINE_ROW_H,
+        );
 
         // --- 按键映射 Button Mappings ---
         // 绑定区:"Enable button mappings" 描述行 + 嵌套表格卡片(圆角子表格 + 添加按钮)。
@@ -5646,17 +5638,23 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.clipboard_delete_after_paste);
         cy = layout.next_row_cursor(cy, described_row_h);
-        SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
-        ui.clipboard_clear_system_pasteboard_after_paste = SettingsRow::described(
+        let clear_pasteboard_separator =
+            SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
+        // 这一行是上面开关的子项(标签内缩):它只在"粘贴后删除条目"打开时出现,所以走条件行
+        // 组件(整行显隐 + 下方分组补位),而不是置灰。
+        // This row is a child of the switch above (indented label): it only appears while "delete
+        // entry after paste" is on, so it goes through the conditional-row component (whole row
+        // shown/hidden, sections below closing the gap) rather than being greyed out.
+        let (clear_pasteboard_label, clear_pasteboard_switch) = SettingsRow::tall_with_height(
             clipboard_view,
             label_x + 18.0,
             cy,
             ctrl_x - label_x - 36.0,
             described_row_h,
             &t("settings.row_clipboard_clear_system_pasteboard_after_paste"),
-            &t("settings.desc_clipboard_clear_system_pasteboard_after_paste"),
             SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
         );
+        ui.clipboard_clear_system_pasteboard_after_paste = clear_pasteboard_switch;
         bind_control(target, ui.clipboard_clear_system_pasteboard_after_paste);
         cy = layout.next_row_cursor(cy, described_row_h);
         SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
@@ -5699,7 +5697,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.clipboard_auto_expire_days);
         let clipboard_options_card_bottom = layout.card_bottom(cy);
-        SettingsSection::attach(
+        let clipboard_options_card_parts = SettingsSection::attach(
             clipboard_view,
             NSRect::new(
                 NSPoint::new(6.0, clipboard_options_card_bottom),
@@ -5709,6 +5707,16 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 ),
             ),
             &t("settings.header_clipboard_options"),
+        );
+        // "同时删除系统剪贴板中对应条目"整行随"粘贴后删除条目"显隐(单行高)。
+        // The "clear the matching system-pasteboard entry" row follows "delete entry after paste"
+        // (one row tall).
+        ui.clipboard_delete_block = CollapsibleRows::new(
+            clipboard_options_card_parts.card,
+            clipboard_options_card_parts.shadow,
+            vec![clear_pasteboard_label, clear_pasteboard_switch],
+            vec![clear_pasteboard_separator],
+            layout.row_gap + SettingsLayout::SINGLE_LINE_ROW_H,
         );
 
         // ===== 窗口控制页内容 window control page content =====

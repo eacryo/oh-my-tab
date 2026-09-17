@@ -14,6 +14,7 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::ffi::release_obj;
 use crate::i18n::t;
+use crate::log_debug;
 
 use super::{tooltip::SettingsTooltip, widgets};
 
@@ -29,6 +30,258 @@ const SLIDER_READOUT_H: f64 = 18.0;
 /// Gap between a card's internal divider and the top edge of the row below it (`separator_above_row`).
 /// 卡片内部分割线与"下方那一行"顶边之间的间距(`separator_above_row`)。
 const SEPARATOR_ABOVE_ROW_GAP: f64 = 3.0;
+
+/// A block of rows inside a card that appears and disappears as a unit.
+/// 卡片里"整块出现/消失"的条件行区块。
+///
+/// Hiding a block is not just `setHidden`: the card's bottom edge must rise by the block's height,
+/// its shadow must follow, every section below the card must move up by the same amount, and any
+/// dividers inside the block must go with it. Showing it reverses all of that. Keeping the
+/// bookkeeping here means a call site is one line and can never get the arithmetic (or the "does
+/// this view belong to the block?" question) wrong.
+///
+/// 隐藏一块行不能只 `setHidden`:卡片底边要上收整块高度、阴影要跟着、卡片下方所有分组要同步上移,
+/// 区块内的分割线也要一起藏;显示时反向。把这套账收在这里,调用点就是一行,也不会再算错高度或
+/// 搞混"这个 view 属不属于本区块"。
+pub(super) struct CollapsibleRows {
+    card: *mut AnyObject,
+    shadow: *mut AnyObject,
+    /// 区块自己的 view(行标题/控件/读数):隐藏它们,但不参与位移。
+    /// The block's own views (labels/controls/readouts): hidden, never shifted.
+    views: Vec<*mut AnyObject>,
+    /// 区块上方的分割线:随区块一起藏。
+    /// Dividers above the block: hidden along with it.
+    separators: Vec<*mut AnyObject>,
+    /// 整块占用的高度(每行 row_gap + row_h 之和)。
+    /// The block's total height (row_gap + row_h summed over its rows).
+    height: f64,
+    /// 区块底边(展开时的位置)。区块自己的 view 从不位移,所以它是个稳定基准:低于它的视图
+    /// 才需要补位。
+    /// The block's bottom edge (as built). Its own views never move, so this is a stable
+    /// threshold: only what sits below it needs to close the gap.
+    expanded_bottom: f64,
+    /// 构建时的卡片高度。当前是否收起由实时卡片高度反推(只有本组件会改它),不存布尔量:
+    /// 万一 AppKit 在窗口显示等时机复位了子视图 frame,下一次调用会自动纠正。
+    /// The card height as built. The collapsed state is derived from the live card height (only
+    /// this component changes it) instead of a remembered flag, so a layout reset (e.g. AppKit
+    /// re-placing subviews when the window is first displayed) self-corrects on the next call.
+    expanded_card_height: f64,
+    /// 收起时实际位移过的视图及其**原始** frame。展开时按原始值精确定位回去,而不是按同一个
+    /// 增量反推:期间若有外力改过其中某个 view 的 frame(实测发生过,表现为只还原了一部分、
+    /// 剩下的叠在原位),按原值还原依然准确。
+    /// The views actually shifted while collapsed, with their ORIGINAL frames. Expanding restores
+    /// those exact frames instead of re-deriving from the delta: if something else moved one of
+    /// them in the meantime -- measured in practice, where only part of the layout came back --
+    /// restoring the recorded values still lands correctly.
+    shifted: std::cell::RefCell<Vec<(*mut AnyObject, NSRect)>>,
+}
+
+impl CollapsibleRows {
+    /// 尚未绑定到任何卡片的空区块(构建设置窗口之前)。
+    /// An unbound block (before the settings window is built).
+    pub(super) const fn empty() -> Self {
+        Self {
+            card: std::ptr::null_mut(),
+            shadow: std::ptr::null_mut(),
+            views: Vec::new(),
+            separators: Vec::new(),
+            height: 0.0,
+            expanded_bottom: 0.0,
+            expanded_card_height: 0.0,
+            shifted: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(super) unsafe fn new(
+        card: *mut AnyObject,
+        shadow: *mut AnyObject,
+        views: Vec<*mut AnyObject>,
+        separators: Vec<*mut AnyObject>,
+        height: f64,
+    ) -> Self {
+        let mut block = Self {
+            card,
+            shadow,
+            views,
+            separators,
+            height,
+            expanded_bottom: 0.0,
+            expanded_card_height: 0.0,
+            shifted: std::cell::RefCell::new(Vec::new()),
+        };
+        block.expanded_bottom = block.block_bottom().unwrap_or(0.0);
+        let card_frame: NSRect = objc2::msg_send![card, frame];
+        block.expanded_card_height = card_frame.size.height;
+        block
+    }
+
+    /// 整块显隐。父视图取自卡片的 superview,调用方不需要传坐标。
+    /// Show or hide the whole block. The parent comes from the card's superview, so callers pass
+    /// no coordinates.
+    pub(super) unsafe fn set_visible(&self, visible: bool) {
+        if self.card.is_null() || self.views.is_empty() {
+            return;
+        }
+        let card_frame: NSRect = objc2::msg_send![self.card, frame];
+        // 当前是不是收起态,由实时卡片高度反推(见 expanded_card_height)。
+        // Whether the layout is currently collapsed comes from the live card height (see
+        // expanded_card_height).
+        let currently_compacted =
+            card_frame.size.height < self.expanded_card_height - self.height / 2.0;
+        if currently_compacted != !visible {
+            // 判定基准是**区块自身的底边**,不是卡片底边:区块可能位于卡片中间(下面还有别的行),
+            // 那些行同样要补位。低于该基准的视图分两级都要挪——卡片内的兄弟行、卡片外的后续分组。
+            // The threshold is the BLOCK's own bottom edge, not the card's: a block can sit in the
+            // middle of a card, and the rows after it must close the gap too. Views below that
+            // threshold move at both levels -- sibling rows inside the card and the sections
+            // outside it.
+            let shift = if visible { -self.height } else { self.height };
+            let parent: *mut AnyObject = objc2::msg_send![self.card, superview];
+            let moved = if visible {
+                // 展开:按收起时记下的原始 frame 精确还原,不再按增量反推(见 `shifted`)。
+                // Expanding: restore the frames recorded while collapsed (see `shifted`) instead of
+                // re-deriving the delta.
+                self.restore_shifted()
+            } else {
+                // 收起:先把要位移的视图连同原始 frame 记下来,再位移。
+                // Collapsing: record the views to move (with their original frames) before moving
+                // them.
+                let mut recorded = Vec::new();
+                let moved =
+                    self.shift_views_below(self.card, self.expanded_bottom, shift, &mut recorded)
+                        + self.shift_views_below(
+                            parent,
+                            self.expanded_bottom,
+                            shift,
+                            &mut recorded,
+                        );
+                self.shifted.replace(recorded);
+                moved
+            };
+            // 卡片顶边不动,只让底边收放。
+            // The card's top edge stays put; only its bottom edge moves.
+            let mut compact_frame = card_frame;
+            compact_frame.origin.y += shift;
+            compact_frame.size.height -= shift;
+            let _: () = objc2::msg_send![self.card, setFrame: compact_frame];
+            let inset = widgets::SETTINGS_CARD_SHADOW_INSET;
+            let _: () = objc2::msg_send![
+                self.shadow,
+                setFrame: NSRect::new(
+                    NSPoint::new(
+                        compact_frame.origin.x - inset,
+                        compact_frame.origin.y - inset,
+                    ),
+                    NSSize::new(
+                        compact_frame.size.width + inset * 2.0,
+                        compact_frame.size.height + inset * 2.0,
+                    ),
+                )
+            ];
+            for &separator in &self.separators {
+                let _: () = objc2::msg_send![separator, setHidden: !visible];
+            }
+            log_debug!(
+                "[settings] row block: visible={} shift={:.1} moved={} card_h={:.1}",
+                visible,
+                shift,
+                moved,
+                compact_frame.size.height
+            );
+        }
+        for &view in &self.views {
+            let _: () = objc2::msg_send![view, setHidden: !visible];
+        }
+    }
+
+    /// 区块自身底边(区块内最低那个 view 的 origin.y),作为"需要补位"的判定基准。
+    /// The block's own bottom edge (the lowest origin.y among its views), used as the threshold
+    /// for what needs to close the gap.
+    unsafe fn block_bottom(&self) -> Option<f64> {
+        self.views
+            .iter()
+            .filter(|view| !view.is_null())
+            .map(|&view| {
+                let frame: NSRect = objc2::msg_send![view, frame];
+                frame.origin.y
+            })
+            .fold(None, |lowest: Option<f64>, y| {
+                Some(lowest.map_or(y, |low| low.min(y)))
+            })
+    }
+
+    /// 把 `parent` 里低于 `threshold` 的 view 整体位移,顺手把它们连同**原始** frame 记进
+    /// `recorded`,返回挪动的个数。区块自己的 view、卡片、阴影都不在位移之列。
+    ///
+    /// Shift every view in `parent` that sits below `threshold`, recording each with its ORIGINAL
+    /// frame, and return how many moved. The block's own views, the card, and the shadow never
+    /// take part.
+    unsafe fn shift_views_below(
+        &self,
+        parent: *mut AnyObject,
+        threshold: f64,
+        shift: f64,
+        recorded: &mut Vec<(*mut AnyObject, NSRect)>,
+    ) -> usize {
+        if parent.is_null() {
+            return 0;
+        }
+        let subviews: *mut AnyObject = objc2::msg_send![parent, subviews];
+        let count: usize = objc2::msg_send![subviews, count];
+        let mut moved = 0;
+        for index in 0..count {
+            let view: *mut AnyObject = objc2::msg_send![subviews, objectAtIndex: index];
+            if view == self.card || view == self.shadow || self.views.contains(&view) {
+                continue;
+            }
+            // origin.y 更小的视图在屏幕上更低。
+            // A smaller origin.y is lower on screen.
+            let mut frame: NSRect = objc2::msg_send![view, frame];
+            if frame.origin.y < threshold {
+                recorded.push((view, frame));
+                frame.origin.y += shift;
+                let _: () = objc2::msg_send![view, setFrame: frame];
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// 按收起时记下的原始 frame 精确还原。顺手核对"期间有没有别人动过这些 view":
+    /// 实测出现过只还原一部分的情况,这条日志用来定位是谁动的。
+    ///
+    /// Restore the frames recorded while collapsed. It also checks whether anything else moved
+    /// those views in the meantime -- a partly restored layout was measured in practice, and this
+    /// line exists to identify the actor.
+    unsafe fn restore_shifted(&self) -> usize {
+        let recorded = self.shifted.replace(Vec::new());
+        let mut drifted = 0;
+        for &(view, original) in &recorded {
+            if view.is_null() {
+                continue;
+            }
+            let current: NSRect = objc2::msg_send![view, frame];
+            let expected = original.origin.y + self.height;
+            if (current.origin.y - expected).abs() > 0.5 {
+                drifted += 1;
+                log_debug!(
+                    "[settings] row block: view moved by something else while collapsed: y={:.1} expected={:.1}",
+                    current.origin.y,
+                    expected
+                );
+            }
+            let _: () = objc2::msg_send![view, setFrame: original];
+        }
+        if drifted > 0 {
+            log_debug!(
+                "[settings] row block: {} of {} recorded view(s) drifted while collapsed",
+                drifted,
+                recorded.len()
+            );
+        }
+        recorded.len()
+    }
+}
 
 /// Standard rows keep their label and control as sibling views in the card, so retain the
 /// association here instead of forcing every SettingsUi field to grow a second label pointer.
@@ -329,29 +582,6 @@ impl SettingsRow {
     /// 以语义组件为单位启用/禁用标准 row，同时处理左侧标题。
     pub(super) unsafe fn set_enabled(control: *mut AnyObject, enabled: bool) {
         Self::set_enabled_with_tooltip(control, enabled, "");
-    }
-
-    /// Enable a row only when every parent control is enabled, using the first failed
-    /// dependency's tooltip. This keeps linked settings' visual state and explanation in the
-    /// shared component layer.
-    /// 仅当所有父控件都开启时启用 row，并使用第一个未满足依赖的 Tooltip。联动设置的置灰、
-    /// 标题状态和解释统一由组件层处理。
-    pub(super) unsafe fn set_enabled_when_all(
-        control: *mut AnyObject,
-        dependencies: &[(*mut AnyObject, &str)],
-    ) {
-        let failed = dependencies.iter().find(|(parent, _)| {
-            if parent.is_null() {
-                return true;
-            }
-            let state: isize = objc2::msg_send![*parent, state];
-            state != 1
-        });
-        if let Some((_, tooltip)) = failed {
-            Self::set_enabled_with_tooltip(control, false, tooltip);
-        } else {
-            Self::set_enabled_with_tooltip(control, true, "");
-        }
     }
 
     /// Add a card divider at an absolute y (the low-level primitive).
