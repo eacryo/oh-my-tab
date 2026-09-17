@@ -403,6 +403,34 @@ extern "C" {
         imp: *mut c_void,
         types: *const c_char,
     ) -> bool;
+    /// 注册类之前给动态子类加实例变量(设置滑杆用它挂"双击恢复的默认值")。
+    /// `alignment` 是 2 的对数(f64 → 3);`types` 用 ObjC 编码("d" = double)。
+    /// Add an instance variable to a dynamic subclass BEFORE registering the class (the settings
+    /// slider uses it to carry its double-click default). `alignment` is log2 (f64 -> 3) and
+    /// `types` is the ObjC encoding ("d" = double).
+    pub(crate) fn class_addIvar(
+        cls: *mut AnyObject,
+        name: *const c_char,
+        size: usize,
+        alignment: u8,
+        types: *const c_char,
+    ) -> bool;
+    /// 取 ivar 句柄与它在实例内的字节偏移,供调用方按类型直接读写。
+    ///
+    /// 刻意不用已废弃的 `object_set/getInstanceVariable`:那两个函数把 ivar 当成 `id`
+    /// (存/取的是**指针**而不是按声明类型拷贝值),对标量 ivar 会把栈地址写进去
+    /// (实测:double ivar 读出 3e-314 这种反常态值)。
+    /// Ivar lookup + its byte offset inside the instance, for typed direct access.
+    ///
+    /// The deprecated `object_set/getInstanceVariable` pair is deliberately avoided: it treats the
+    /// ivar as an `id` (stores/returns a *pointer* instead of copying the declared type), which
+    /// writes a stack address into a scalar ivar (measured: a double ivar read back as a
+    /// denormal like 3e-314).
+    pub(crate) fn class_getInstanceVariable(
+        cls: *mut AnyObject,
+        name: *const c_char,
+    ) -> *mut c_void;
+    pub(crate) fn ivar_getOffset(ivar: *mut c_void) -> isize;
     pub(crate) fn objc_getClass(name: *const c_char) -> *mut AnyObject;
     // ---- 原始 msgSend(此前散落在 autostart/updater/overlay/clipboard 等处的内联声明) ----
     // ---- Raw msgSend (previously declared inline across autostart/updater/overlay/clipboard) ----

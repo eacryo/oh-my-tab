@@ -351,16 +351,19 @@ pub struct PointerSection {
 
 /// 指针加速 / 跟踪速度的合法区间:**0..=10**。
 ///
-/// 平台属性本身的取值域是 [0, 40] ∪ {-1},但**可用区间只有约 0.3~3**(macOS 系统默认 0.6875;
-/// 实测 10 已经快到难以使用),10 以上的行程纯属浪费、还让线性滑杆彻底失去精度。因此这里把
-/// 产品接受范围收窄到 0..=10;若将来有低 DPI 设备确实需要更大的乘数,再放宽这一处即可。
-/// 语义提醒:0 是正常区间的最低端(最慢,真实生效),-1 才是"禁用加速与灵敏度"的哨兵(旧系统
-/// 回退路径用);只有"未设置"(None)表示不改动设备现值。
+/// 平台属性本身的取值域是 [0, 40] ∪ {-1},但**可用区间只有约 0.3~3**(macOS 给鼠标键的默认是
+/// 1.00,给触控板/指针键的是 0.6875;实测 10 已经快到难以使用),10 以上的行程纯属浪费、还让
+/// 线性滑杆失去精度。因此这里把产品接受范围收窄到 0..=10;若将来有低 DPI 设备确实需要更大的
+/// 乘数,再放宽这一处即可。语义提醒:-1 是平台的"禁用加速与灵敏度"哨兵(旧系统回退路径用),
+/// 但本产品不接受该值(不在 UI 暴露),0 是正常区间的最低端(最慢,真实生效);只有"未设置"
+/// (None)表示不改动设备现值;默认值(未配置时的兜底/双击恢复)是 1.00,即 macOS 给鼠标键的出厂
+/// 默认。
 ///
 /// The valid range for pointer acceleration / tracking speed: **0..=10**.
 ///
 /// The platform property's own domain is [0, 40] ∪ {-1}, but the usable band is only ~0.3-3
-/// (macOS's default is 0.6875; a value of 10 already feels unusably fast), so anything above 10 is
+/// (macOS ships 1.00 for the mouse key and 0.6875 for the trackpad/pointer key; a value of 10
+/// already feels unusably fast), so anything above 10 is
 /// wasted travel that also destroys a linear slider's precision. The accepted range is therefore
 /// narrowed to 0..=10; should a low-DPI device ever need a larger multiplier, widening this single
 /// constant is enough. Semantics: 0 is the bottom of the normal range (slowest, and it really

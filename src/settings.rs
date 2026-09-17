@@ -1343,7 +1343,10 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
                     // Pointer acceleration / tracking speed: the read-only value follows the drag
                     // in real time (2 decimals).
                     let val: f64 = msg_send![ctrl, doubleValue];
-                    set_field(u.pointer_accel_value_label, pointer_accel_display(val));
+                    set_field(
+                        u.pointer_accel_value_label,
+                        pointer_accel_display(pointer_accel_from_slider(val)),
+                    );
                 }
             }
         });
@@ -1705,22 +1708,11 @@ unsafe fn apply_mouse_profile_field(field: ControlField) {
                 });
             }
             ControlField::PointerAcceleration => {
-                let value: f64 = msg_send![u.pointer_accel_slider, doubleValue];
-                // 非有限值(理论不可达)按兜底值写入,避免把 NaN/Inf 落进配置。
-                // A non-finite value (unreachable in theory) falls back so NaN/Inf never reaches
-                // the config.
-                let value = if value.is_finite() {
-                    value.clamp(
-                        crate::config::MOUSE_ACCELERATION_MIN,
-                        crate::config::MOUSE_ACCELERATION_MAX,
-                    )
-                } else {
-                    crate::mouse::pointer::FALLBACK_ACCELERATION
-                };
-                // 保留 2 位小数(与只读数值 label 的显示一致,避免把浮点噪声写进配置)。
-                // Keep 2 decimals (matching the read-only value label, and keeping floating-point
-                // noise out of the config).
-                let value = (value * 100.0).round() / 100.0;
+                let raw: f64 = msg_send![u.pointer_accel_slider, doubleValue];
+                // 夹到 0..=10、取 2 位小数,非有限值退兜底(见 pointer_accel_from_slider)。
+                // Clamped to 0..=10 with 2 decimals; a non-finite value falls back (see
+                // pointer_accel_from_slider).
+                let value = pointer_accel_from_slider(raw);
                 write_selected_profile(&mut cfg, move |p| {
                     let mut ptr = p.pointer.take().unwrap_or_default();
                     ptr.acceleration = Some(value);
@@ -2033,6 +2025,23 @@ unsafe fn update_window_control_controls_enabled(ui: &SettingsUi) {
 /// The slider value's display format (2 decimals, matching the read-only value label).
 fn pointer_accel_display(value: f64) -> String {
     format!("{value:.2}")
+}
+
+/// 滑杆原始值 -> 配置值:夹到 0..=10 并保留 2 位小数;非有限值退兜底。
+/// Slider raw value -> config value: clamped to 0..=10 with 2 decimals; non-finite input falls
+/// back.
+fn pointer_accel_from_slider(value: f64) -> f64 {
+    if !value.is_finite() {
+        return crate::mouse::pointer::FALLBACK_ACCELERATION;
+    }
+    let clamped = value.clamp(
+        crate::config::MOUSE_ACCELERATION_MIN,
+        crate::config::MOUSE_ACCELERATION_MAX,
+    );
+    // 保留 2 位小数(与只读数值 label 的显示一致,避免把浮点噪声写进配置)。
+    // Keep 2 decimals (matching the read-only value label, and keeping floating-point noise out
+    // of the config).
+    (clamped * 100.0).round() / 100.0
 }
 
 /// 根据"禁用指针加速(线性跟踪)"开关状态刷新跟踪速度行的条件显隐:
@@ -3373,11 +3382,10 @@ unsafe fn fill_mouse_device_controls(
         .acceleration
         .or_else(|| source_device.and_then(crate::mouse::pointer::read_acceleration))
         .unwrap_or(crate::mouse::pointer::FALLBACK_ACCELERATION);
-    // 滑杆是线性取值(0..=10);越界值(设备现值可能来自别的工具)夹到区间内,保证读数与
-    // 滑块位置一致——我们的配置与写入都限定在 0..=10。
+    // 滑杆是线性取值(0..=10);越界值(设备现值可能来自别的工具)夹到区间内,保证读数与滑块
+    // 位置一致。
     // The slider is linear (0..=10); a value outside the range (the device value may come from
-    // another tool) is clamped so the readout and the handle stay consistent -- our config and
-    // writes are limited to 0..=10.
+    // another tool) is clamped so the readout and the handle stay consistent.
     let acceleration = acceleration.clamp(
         crate::config::MOUSE_ACCELERATION_MIN,
         crate::config::MOUSE_ACCELERATION_MAX,
@@ -4847,6 +4855,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 TEXT_SIZE_MIN,
                 TEXT_SIZE_MAX,
                 TEXT_SIZE_DEFAULT,
+                // 双击恢复默认字号(15pt)。
+                // Double-click restores the default size (15pt).
+                Some(TEXT_SIZE_DEFAULT as f64),
             ),
         );
         ui.card_text_size_value_label =
@@ -4870,6 +4881,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 TEXT_SIZE_MIN,
                 TEXT_SIZE_MAX,
                 TEXT_SIZE_DEFAULT,
+                // 双击恢复默认字号(15pt)。
+                // Double-click restores the default size (15pt).
+                Some(TEXT_SIZE_DEFAULT as f64),
             ),
         );
         ui.status_bar_text_size_value_label = SettingsRow::attach_slider_readout(
@@ -5152,6 +5166,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 1,
                 10,
                 3,
+                // 双击恢复默认行数(3)。
+                // Double-click restores the default line count (3).
+                Some(3.0),
             ),
         );
         ui.line_count = line_ctrl;
@@ -5243,7 +5260,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // --- 跟踪速度(仅"禁用指针加速(线性跟踪)"打开时显示)---
         // 线性跟踪下 HIDPointerAcceleration 的语义就是跟踪速度;开关关闭时该属性是加速
         // 曲线的强度,含义不同,所以这一行只在开关打开时出现(见 mouse/pointer.rs 模块注释)。
-        // 0..=40 连续滑块(无刻度吸附)+ 右侧只读数值。
+        // 0..=10 的连续滑块(无刻度吸附)+ 右侧只读数值。
         //
         // Tracking speed (shown only while "Disable pointer acceleration (linear tracking)" is
         // on). Under linear tracking HIDPointerAcceleration *is* the tracking speed; with the
@@ -5277,6 +5294,11 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 crate::config::MOUSE_ACCELERATION_MIN,
                 crate::config::MOUSE_ACCELERATION_MAX,
                 crate::mouse::pointer::FALLBACK_ACCELERATION,
+                // 双击恢复默认跟踪速度(1.00 = macOS 给鼠标键的出厂默认,也是本功能上线前的
+                // 手感)。
+                // Double-click restores the default tracking speed (1.00 = macOS's factory default
+                // for the mouse key, i.e. what the pointer felt like before this setting existed).
+                Some(crate::mouse::pointer::FALLBACK_ACCELERATION),
             ),
         );
         ui.pointer_accel_label = pointer_accel_label;
@@ -5696,6 +5718,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 CLIPBOARD_AUTO_EXPIRE_MIN,
                 CLIPBOARD_AUTO_EXPIRE_MAX,
                 CLIPBOARD_AUTO_EXPIRE_DEFAULT,
+                // 双击恢复默认天数(3 天)。
+                // Double-click restores the default (3 days).
+                Some(CLIPBOARD_AUTO_EXPIRE_DEFAULT as f64),
             ),
         );
         ui.clipboard_auto_expire_days = auto_expire_slider;
@@ -6474,10 +6499,39 @@ pub(crate) fn invalidate_settings_window() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pointer_accel_slider_clamps_and_rounds() {
+        assert_eq!(pointer_accel_from_slider(0.0), 0.0);
+        assert_eq!(pointer_accel_from_slider(0.6875), 0.69);
+        assert_eq!(pointer_accel_from_slider(1.0), 1.0);
+        assert_eq!(pointer_accel_from_slider(1.234), 1.23);
+        // 下界 0、上界 10(线性滑杆的端点);负值(理论上拖不到)夹到 0。
+        // Bottom 0 and top 10 (the linear slider's ends); a negative value (unreachable in theory)
+        // clamps to 0.
+        assert_eq!(pointer_accel_from_slider(-0.42), 0.0);
+        assert_eq!(pointer_accel_from_slider(99.0), MOUSE_ACCELERATION_MAX);
+        assert_eq!(
+            pointer_accel_from_slider(f64::NAN),
+            crate::mouse::pointer::FALLBACK_ACCELERATION
+        );
+    }
+
+    #[test]
+    fn pointer_accel_readout_shows_two_decimals() {
+        assert_eq!(pointer_accel_display(0.0), "0.00");
+        // 默认值 1.00 = macOS 给鼠标键的出厂默认(功能上线前的手感)。
+        // The 1.00 default is macOS's factory default for the mouse key (what the pointer felt like
+        // before this setting existed).
+        assert_eq!(pointer_accel_display(1.0), "1.00");
+        assert_eq!(pointer_accel_display(0.6875), "0.69");
+    }
+
     use super::{
         color_component_to_byte, glass_tint_group_frames, rgba_hex_from_components,
         settings_effective_corner_radius, GLASS_TINT_GROUP_GAP, GLASS_TINT_SCREEN_MARGIN,
     };
+    use super::{pointer_accel_display, pointer_accel_from_slider};
+    use crate::config::MOUSE_ACCELERATION_MAX;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     #[test]

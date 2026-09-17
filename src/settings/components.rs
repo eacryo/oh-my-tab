@@ -850,6 +850,9 @@ impl SettingsControl {
         widgets::make_switch(right_x, y, h, checked)
     }
 
+    /// `default_value`: 双击恢复的默认值(None = 不接管双击)。
+    /// `default_value`: the value a double-click restores (None = double-click untouched).
+    #[allow(clippy::too_many_arguments)] // 与 widgets::make_* 同一参数表。 / same parameter list as widgets::make_*.
     pub(super) unsafe fn slider(
         x: f64,
         y: f64,
@@ -858,12 +861,16 @@ impl SettingsControl {
         min: i64,
         max: i64,
         value: i64,
+        default_value: Option<f64>,
     ) -> *mut AnyObject {
-        widgets::make_slider(x, y, w, h, min, max, value)
+        widgets::make_slider(x, y, w, h, min, max, value, default_value)
     }
 
     /// Build a continuous (fractional) slider.
     /// 构造连续取值(小数)的滑块。
+    /// `default_value`: 双击恢复的默认值(None = 不接管双击)。
+    /// `default_value`: the value a double-click restores (None = double-click untouched).
+    #[allow(clippy::too_many_arguments)] // 与 widgets::make_* 同一参数表。 / same parameter list as widgets::make_*.
     pub(super) unsafe fn double_slider(
         x: f64,
         y: f64,
@@ -872,8 +879,9 @@ impl SettingsControl {
         min: f64,
         max: f64,
         value: f64,
+        default_value: Option<f64>,
     ) -> *mut AnyObject {
-        widgets::make_double_slider(x, y, w, h, min, max, value)
+        widgets::make_double_slider(x, y, w, h, min, max, value, default_value)
     }
 
     pub(super) unsafe fn text_input(x: f64, y: f64, w: f64, h: f64, value: &str) -> *mut AnyObject {

@@ -2867,7 +2867,11 @@ pub(super) unsafe fn make_switch(right_x: f64, y: f64, h: f64, checked: bool) ->
 }
 
 /// 整数滑块(NSSlider, min..=max, step 1)。alloc +1,加入父视图后由调用方 release。
+/// `default_value`:双击要恢复的默认值(None = 该行没有默认值,双击不特殊处理)。
 /// Integer slider (NSSlider, min..=max, step 1). alloc +1; caller releases after adding to parent.
+/// `default_value`: the value a double-click restores (None = this row has no default and a
+/// double-click is left alone).
+#[allow(clippy::too_many_arguments)] // 几何 + 区间 + 当前值 + 双击默认值,超过 7 个参数上限。/ geometry + range + value + default exceeds the 7-arg limit.
 pub(super) unsafe fn make_slider(
     x: f64,
     y: f64,
@@ -2876,8 +2880,9 @@ pub(super) unsafe fn make_slider(
     min: i64,
     max: i64,
     value: i64,
+    default_value: Option<f64>,
 ) -> *mut AnyObject {
-    let slider: *mut AnyObject = msg_send![class!(NSSlider), alloc];
+    let slider: *mut AnyObject = msg_send![settings_slider_class(), alloc];
     let slider: *mut AnyObject =
         msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
     // 拖动过程中连续发送 action:即时生效模式下运行时效果需实时跟随拖动。
@@ -2891,6 +2896,7 @@ pub(super) unsafe fn make_slider(
     let _: () = msg_send![slider, setNumberOfTickMarks: (max - min + 1) as isize];
     let _: () = msg_send![slider, setAllowsTickMarkValuesOnly: true];
     let _: () = msg_send![slider, setIntegerValue: value];
+    apply_slider_default(slider, default_value);
     slider
 }
 
@@ -2909,6 +2915,7 @@ pub(super) unsafe fn make_slider(
 /// system client and waits ~30ms for asynchronous matching. Firing that on every mouse-dragged
 /// event would stall the whole drag, so the value applies once on release (or on a track click)
 /// -- which is also the better moment for a hardware property.
+#[allow(clippy::too_many_arguments)] // 几何 + 区间 + 当前值 + 双击默认值,超过 7 个参数上限。/ geometry + range + value + default exceeds the 7-arg limit.
 pub(super) unsafe fn make_double_slider(
     x: f64,
     y: f64,
@@ -2917,8 +2924,9 @@ pub(super) unsafe fn make_double_slider(
     min: f64,
     max: f64,
     value: f64,
+    default_value: Option<f64>,
 ) -> *mut AnyObject {
-    let slider: *mut AnyObject = msg_send![class!(NSSlider), alloc];
+    let slider: *mut AnyObject = msg_send![settings_slider_class(), alloc];
     let slider: *mut AnyObject =
         msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
     let _: () = msg_send![slider, setContinuous: false];
@@ -2928,7 +2936,209 @@ pub(super) unsafe fn make_double_slider(
     // No tick marks: NSSlider is continuous by default, and allowsTickMarkValuesOnly would
     // snap it to integers.
     let _: () = msg_send![slider, setDoubleValue: value];
+    apply_slider_default(slider, default_value);
     slider
+}
+
+// ========== 滑杆:双击恢复默认值 / sliders: double-click restores the default ==========
+
+/// NSSlider 的动态子类:双击(clickCount == 2)把值恢复为创建时登记的默认值,并复用既有的
+/// target/action 链路(落盘 + 右侧只读读数刷新都由 handleControlChanged: 完成)。
+///
+/// 默认值存在 ObjC ivar(`ohMyTabDefaultValue`,f64)里,跟着控件生命周期走:不需要全局
+/// 指针表,也就没有"滑杆销毁后指针复用读到脏默认值"的清理耦合。未登记默认值的滑杆,
+/// 双击行为与普通 NSSlider 完全一致。
+///
+/// A dynamic NSSlider subclass: a double-click (clickCount == 2) restores the default registered
+/// at creation and reuses the existing target/action chain (persisting the value and refreshing
+/// the read-only readout both happen in handleControlChanged:).
+///
+/// The default lives in an ObjC ivar (`ohMyTabDefaultValue`, f64) so it follows the control's
+/// lifetime -- no global pointer table, hence no cleanup coupling and no stale default if a
+/// pointer is recycled. Sliders without a registered default behave exactly like a plain NSSlider.
+static SETTINGS_SLIDER_CLS: OnceLock<usize> = OnceLock::new();
+static SETTINGS_SLIDER_SUPERCLASS: OnceLock<usize> = OnceLock::new();
+
+/// 默认值 ivar 名(注册类时添加);判"登记过默认值"用同名的 has-flag ivar。
+/// The default-value ivar name (added at class registration); a has-flag ivar of the sibling name
+/// distinguishes "registered a default" from "just a zeroed slot".
+const SLIDER_DEFAULT_IVAR: &str = "ohMyTabDefaultValue";
+const SLIDER_HAS_DEFAULT_IVAR: &str = "ohMyTabHasDefault";
+
+/// 两个 ivar 在实例内的字节偏移(注册类后固定,一次性解析)。
+/// 用偏移直访而不是 object_set/getInstanceVariable(见 ffi.rs 的说明)。
+/// The two ivars' byte offsets inside the instance (fixed after registration, resolved once).
+/// Direct offset access instead of object_set/getInstanceVariable (see the note in ffi.rs).
+static SLIDER_IVAR_OFFSETS: OnceLock<(isize, isize)> = OnceLock::new();
+
+fn settings_slider_class() -> *mut AnyObject {
+    let cls = *SETTINGS_SLIDER_CLS.get_or_init(|| unsafe {
+        let name = CString::new("OhMyTabSlider").unwrap();
+        let superclass = class!(NSSlider) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        // ivar 必须在 objc_registerClassPair 之前添加(对齐 8 字节 → log2 = 3;char 对齐 1)。
+        // Ivars must be added before objc_registerClassPair (8-byte alignment -> log2 = 3;
+        // char alignment 1).
+        class_addIvar(
+            cls,
+            CString::new(SLIDER_DEFAULT_IVAR).unwrap().as_ptr(),
+            std::mem::size_of::<f64>(),
+            3,
+            CString::new("d").unwrap().as_ptr(),
+        );
+        class_addIvar(
+            cls,
+            CString::new(SLIDER_HAS_DEFAULT_IVAR).unwrap().as_ptr(),
+            1,
+            0,
+            CString::new("c").unwrap().as_ptr(),
+        );
+        let types = CString::new("v@:@").unwrap(); // -mouseDown:(NSEvent*) -> void
+        class_addMethod(
+            cls,
+            sel!(mouseDown:),
+            settings_slider_mouse_down as *mut c_void,
+            types.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        let _ = SETTINGS_SLIDER_SUPERCLASS.set(superclass as usize);
+        // 注册后解析偏移(注册前 ivar_getOffset 不可用)。
+        // Resolve the offsets after registration (ivar_getOffset needs a registered class).
+        let value_ivar =
+            class_getInstanceVariable(cls, CString::new(SLIDER_DEFAULT_IVAR).unwrap().as_ptr());
+        let flag_ivar =
+            class_getInstanceVariable(cls, CString::new(SLIDER_HAS_DEFAULT_IVAR).unwrap().as_ptr());
+        assert!(
+            !value_ivar.is_null() && !flag_ivar.is_null(),
+            "settings slider ivars must exist after registration"
+        );
+        let _ = SLIDER_IVAR_OFFSETS.set((ivar_getOffset(flag_ivar), ivar_getOffset(value_ivar)));
+        cls as usize
+    });
+    cls as *mut AnyObject
+}
+
+/// 双击是否应恢复默认值(纯函数,便于单测):只有"确实是双击"且"登记过默认值"才接管。
+/// Whether a double-click should restore the default (pure, for unit tests): we only take over
+/// when it really is a double-click AND a default was registered.
+fn slider_should_reset(click_count: isize, has_default: bool) -> bool {
+    click_count == 2 && has_default
+}
+
+/// 默认值槽位(实例基址 + 偏移);类未初始化时返回 None。
+/// The default-value slot (instance base + offset); None before the class is initialized.
+unsafe fn slider_default_slot(slider: *mut AnyObject) -> Option<(*mut u8, *mut f64)> {
+    let (flag_offset, value_offset) = *SLIDER_IVAR_OFFSETS.get()?;
+    let base = slider as *mut u8;
+    Some((
+        base.offset(flag_offset),
+        base.offset(value_offset) as *mut f64,
+    ))
+}
+
+/// 读控件上登记的默认值(未登记 = None)。
+/// Read the default registered on the control (None when absent).
+unsafe fn slider_default_value(slider: *mut AnyObject) -> Option<f64> {
+    let (flag, value) = slider_default_slot(slider)?;
+    if *flag == 0 {
+        None
+    } else {
+        Some(*value)
+    }
+}
+
+/// 把默认值写进控件,并挂一条原生 tooltip 说明手势(双击是隐形手势,需要可发现性)。
+/// Write the default into the control and attach a native tooltip describing the gesture
+/// (a double-click is invisible, so it needs discoverability).
+unsafe fn apply_slider_default(slider: *mut AnyObject, default_value: Option<f64>) {
+    let Some(value) = default_value else {
+        return;
+    };
+    if let Some((flag, slot)) = slider_default_slot(slider) {
+        *slot = value;
+        *flag = 1;
+    }
+    let text = tf(
+        "settings.hint_double_click_default",
+        &[("value", &settings_slider_display(value))],
+    );
+    let ns = make_nsstring(&text);
+    let _: () = msg_send![slider, setToolTip: ns];
+    CFRelease(ns as *const c_void);
+}
+
+/// 默认值的显示文本:整数值不带小数(3),否则保留 2 位(0.69)——与右侧读数风格一致。
+/// Display text for the default: integral values without decimals (3), otherwise 2 decimals
+/// (0.69) -- matching the readout's style.
+fn settings_slider_display(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{}", value as i64)
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+/// mouseDown: 重写 —— 双击恢复默认值;其余情况交回 NSSlider(拖拽 / 点击轨道跳值)。
+/// The `mouseDown:` override -- a double-click restores the default; everything else goes back to
+/// NSSlider (dragging / jump-to-click).
+extern "C" fn settings_slider_mouse_down(this: *mut c_void, _cmd: Sel, event: *mut AnyObject) {
+    crate::callback_guard::void("settings_slider_mouse_down", || unsafe {
+        let slider = this as *mut AnyObject;
+        let click_count: isize = msg_send![event, clickCount];
+        let default = slider_default_value(slider);
+        if slider_should_reset(click_count, default.is_some()) {
+            if let Some(value) = default {
+                let _: () = msg_send![slider, setDoubleValue: value];
+                // 走既有 action 链路:apply_control_field 落盘、on_control_changed 刷新读数。
+                // 注意双击的第一次点击已经按普通点击生效过一次(可能有一次瞬时写入),这里
+                // 的写入才是最终状态。action/target 实际都已绑定(见 bind_control),为空则跳过。
+                // Reuse the existing action chain: apply_control_field persists the value and
+                // on_control_changed refreshes the readout. Note the first click of the
+                // double-click already took effect as a normal click (possibly one transient
+                // write); this write is the final state. action/target are always bound in practice
+                // (see bind_control); skip when either is null.
+                let target: *mut AnyObject = msg_send![slider, target];
+                // objc2 会按静态类型校验返回编码(`action` 是 SEL,编码 ':',不能用 `*const c_void`
+                // 读),这里用原始 msgSend 取 action:既能拿到 nil(滑杆未绑定 action),也不触发校验。
+                // objc2 validates the declared return encoding (`action` returns a SEL whose code is
+                // ':', so it cannot be read as `*const c_void`). A raw msgSend both tolerates nil
+                // (an unbound slider) and skips that check.
+                type ActionFn = unsafe extern "C" fn(*mut AnyObject, Sel) -> *const c_void;
+                let read_action: ActionFn = std::mem::transmute(objc_msgSend as *const ());
+                let action: *const c_void = read_action(slider, sel!(action));
+                if !action.is_null() && !target.is_null() {
+                    // objc2 的 Sel 表示不了空选择器,这里把 action 按原始指针透传
+                    // (该槽位本身就是 SEL)。
+                    // objc2's Sel cannot represent a null selector, so the action is passed through
+                    // as a raw pointer (the slot itself is a SEL).
+                    type SendActionFn = unsafe extern "C" fn(
+                        *mut AnyObject,
+                        Sel,
+                        *const c_void,
+                        *mut AnyObject,
+                        *mut AnyObject,
+                    ) -> bool;
+                    let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+                    let f: SendActionFn = std::mem::transmute(objc_msgSend as *const ());
+                    f(app, sel!(sendAction:to:from:), action, target, slider);
+                }
+            }
+            // 不调 super:避免又开始一次拖拽跟踪。
+            // Do not call super: that would start another drag-tracking loop.
+            return;
+        }
+        type MouseDownFn = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
+        let superclass = *SETTINGS_SLIDER_SUPERCLASS
+            .get()
+            .expect("settings slider superclass is initialized")
+            as *mut c_void;
+        let mut objc_super = ObjcSuper {
+            receiver: this,
+            super_class: superclass,
+        };
+        let f: MouseDownFn = std::mem::transmute(objc_msgSendSuper as *const ());
+        f(&mut objc_super, sel!(mouseDown:), event);
+    });
 }
 
 /// Apply a sidebar title's font/color and refresh the label's vertical optical alignment.
@@ -4185,9 +4395,83 @@ pub(super) unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
 mod tests {
     use super::{
         derived_label_width, rect_inside, rects_overlap, required_document_height,
-        settings_select_centered_text_geometry, settings_select_needs_wrap, stable_document_height,
+        settings_select_centered_text_geometry, settings_select_needs_wrap, slider_should_reset,
+        stable_document_height,
     };
+    // 冒烟测试需要直接发 ObjC 消息(构造 NSEvent、驱动 mouseDown:)。
+    // The smoke test sends ObjC messages directly (building an NSEvent, driving mouseDown:).
+    use crate::ffi::release_obj;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send, sel};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use std::ffi::c_void;
+
+    #[test]
+    fn slider_double_click_reset_only_applies_to_double_clicks_with_a_default() {
+        // 只有"确实是双击"且"登记过默认值"才接管;其余情况交给 NSSlider 自己。
+        // Only a real double-click with a registered default takes over; everything else goes to
+        // NSSlider itself.
+        assert!(slider_should_reset(2, true));
+        assert!(!slider_should_reset(1, true));
+        assert!(!slider_should_reset(3, true));
+        assert!(!slider_should_reset(2, false));
+        assert!(!slider_should_reset(0, false));
+    }
+
+    /// 冒烟(GUI/需要 AppKit):默认值 ivar 往返 + 由真实 NSEvent 驱动的双击恢复。
+    /// 需要图形会话,故标 ignore;用 `cargo test -- --ignored slider_double_click_smoke` 跑。
+    ///
+    /// Smoke (GUI/AppKit): the default-value ivar round-trips and a real NSEvent double-click
+    /// restores it. Requires a GUI session, hence #[ignore]; run with
+    /// `cargo test -- --ignored slider_double_click_smoke`.
+    #[test]
+    #[ignore]
+    fn slider_double_click_smoke() {
+        unsafe {
+            let slider = super::make_slider(0.0, 0.0, 120.0, 20.0, 0, 10, 7, Some(3.0));
+            assert_eq!(super::slider_default_value(slider), Some(3.0));
+
+            // 双击(clickCount = 2):值回到默认 3。
+            // A double-click (clickCount = 2) restores the default 3.
+            let double = make_click_event(2);
+            super::settings_slider_mouse_down(slider as *mut c_void, sel!(mouseDown:), double);
+            let value: f64 = msg_send![slider, doubleValue];
+            assert_eq!(value, 3.0, "double-click must restore the default");
+
+            // 单击仍交给 NSSlider(值不变;无窗口环境下超类只是不接收事件)。
+            // A single click still goes to NSSlider (the value is untouched; with no window the
+            // superclass simply does not track anything).
+            let _: () = msg_send![slider, setDoubleValue: 7.0f64];
+            let single = make_click_event(1);
+            super::settings_slider_mouse_down(slider as *mut c_void, sel!(mouseDown:), single);
+            let value: f64 = msg_send![slider, doubleValue];
+            assert_eq!(value, 7.0, "a single click must not reset");
+
+            // NSEvent 来自工厂方法(+0,autoreleased),不能手动释放;测试里没有 autorelease 池,
+            // 这点泄漏对单次冒烟无影响。
+            // The NSEvents come from a factory method (+0, autoreleased) and must not be released
+            // manually; a test has no autorelease pool, and this one-off leak is irrelevant.
+            release_obj(slider);
+        }
+    }
+
+    /// 造一个左键按下事件(clickCount 可指定),供冒烟测试驱动 mouseDown:。
+    /// Build a left-mouse-down event (with the given clickCount) for the smoke test to feed into
+    /// mouseDown:.
+    unsafe fn make_click_event(click_count: isize) -> *mut AnyObject {
+        msg_send![
+            class!(NSEvent),
+            mouseEventWithType: 1isize, // NSEventTypeLeftMouseDown
+            location: objc2_foundation::NSPoint::new(0.0, 0.0),
+            modifierFlags: 0u64,
+            timestamp: 0.0f64,
+            windowNumber: 0isize,
+            context: std::ptr::null_mut::<AnyObject>(),
+            eventNumber: 0isize,
+            clickCount: click_count,
+            pressure: 1.0f32,
+        ]
+    }
 
     #[test]
     fn label_width_follows_control_leading_edge() {

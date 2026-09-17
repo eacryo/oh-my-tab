@@ -72,10 +72,21 @@ use std::sync::Mutex;
 /// The IOFixed scaling factor: property value × 65536 (same as LinearMouse's PointerKit).
 const IOFIXED_SCALE: f64 = 65536.0;
 
-/// 读不到设备现值时的兜底显示值(macOS 的系统默认加速值,LinearMouse 同款 fallback)。
-/// Fallback shown when the device's live value can't be read (macOS's system default
-/// acceleration, the same fallback LinearMouse uses).
-pub(crate) const FALLBACK_ACCELERATION: f64 = 0.6875;
+/// 默认跟踪速度:**1.00**,即 macOS 给鼠标键(HIDMouseAcceleration)的出厂默认值——功能上线
+/// 前不写该属性,手感就是这个值(触发路径:滑杆初值、双击恢复默认、读不到设备/系统值时的兜底)。
+///
+/// 注意与 LinearMouse 的 `fallbackPointerAcceleration = 0.6875` 区分:那是它"连系统值都读不到"
+/// 时的最后兜底,数值正好等于**触控板/指针键**(HIDPointerAcceleration/HIDTrackpadAcceleration)
+/// 的默认 45056;拿它当鼠标的默认会偏慢约 31%。
+/// The default tracking speed: **1.00**, macOS's factory default for the mouse key
+/// (HIDMouseAcceleration) -- what the pointer felt like before this setting existed (it is used as
+/// the slider's initial value, the double-click reset target, and the last-resort fallback when
+/// neither the device nor the system value can be read).
+///
+/// Distinct from LinearMouse's `fallbackPointerAcceleration = 0.6875`: that is its last-resort
+/// constant and equals the *trackpad/pointer* key default (45056); using it as a mouse default is
+/// ~31% slower than the factory feel.
+pub(crate) const FALLBACK_ACCELERATION: f64 = 1.0;
 
 /// 指针加速 / 跟踪速度 -> IOFixed 原始值(四舍五入)。
 /// 配置层已校验并 clamp,这里再兜一层(与 scrolling 的 line_count clamp 同一考虑)。
@@ -695,8 +706,11 @@ mod tests {
 
     #[test]
     fn iofixed_roundtrip() {
-        // 0.6875 是 macOS 系统默认值,×65536 = 45056(整数,无精度损失)。
-        // 0.6875 is macOS's default; ×65536 = 45056 (integral, no precision loss).
+        // 0.6875(触控板/指针键默认)×65536 = 45056;1.00(鼠标键默认)×65536 = 65536。
+        // 0.6875 (the trackpad/pointer key default) × 65536 = 45056; 1.00 (the mouse key default)
+        // × 65536 = 65536.
+        assert_eq!(acceleration_to_iofixed(FALLBACK_ACCELERATION), 65_536);
+        assert_eq!(iofixed_to_acceleration(65_536), 1.0);
         assert_eq!(acceleration_to_iofixed(0.6875), 45056);
         assert_eq!(iofixed_to_acceleration(45056), 0.6875);
         assert_eq!(acceleration_to_iofixed(0.0), 0);
