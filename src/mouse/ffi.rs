@@ -6,20 +6,21 @@ use std::ffi::c_void;
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
     // IORegistryEntryFromPath 返回 +1,用完 IOObjectRelease。
+    // 注意 io_registry_entry_t / io_object_t 都是 mach_port_t(u32),不是指针:声明成
+    // 指针会让"高 32 位未定义"的返回值被当成指针读(实测能跑,但属于未定义行为)。
     // IORegistryEntryFromPath returns +1; release with IOObjectRelease.
-    pub(crate) fn IORegistryEntryFromPath(
-        main_port: u32,
-        path: *const std::ffi::c_char,
-    ) -> *mut c_void;
+    // Note io_registry_entry_t / io_object_t are mach_port_t (u32), not pointers: declaring them
+    // as pointers reads a 32-bit return as a 64-bit pointer (works in practice, but is UB).
+    pub(crate) fn IORegistryEntryFromPath(main_port: u32, path: *const std::ffi::c_char) -> u32;
     // properties 返回 +1(CFMutableDictionaryRef)。
     // properties comes back +1 (CFMutableDictionaryRef).
     pub(crate) fn IORegistryEntryCreateCFProperties(
-        entry: *mut c_void,
+        entry: u32,
         properties: *mut *mut c_void,
         allocator: *const c_void,
         options: u32,
     ) -> i32;
-    pub(crate) fn IOObjectRelease(object: *mut c_void) -> i32;
+    pub(crate) fn IOObjectRelease(object: u32) -> i32;
     // IOHIDEventSystemClient:设备枚举入口(LinearMouse PointerDeviceManager 同款)。
     // IOHIDEventSystemClient: device enumeration entry (same as LinearMouse's PointerDeviceManager).
     pub(crate) fn IOHIDEventSystemClientCreate(allocator: *const c_void) -> *mut c_void;
@@ -51,6 +52,50 @@ extern "C" {
         runloop: crate::event_tap::CFRunLoopRef,
         mode: *const c_void,
     );
+}
+
+// ========== HID 系统参数(IOHIDSystem / kIOHIDParamConnectType) ==========
+// 读取 macOS **系统级**指针参数(即「系统设置」里的值),用于把设备上的
+// 加速/线性开关恢复成系统值——LinearMouse DeviceManager.getSystemProperty 同款链路
+// (IORegistryEntryFromPath → IOServiceOpen(kIOHIDParamConnectType) → IOHIDCopyCFTypeParameter)。
+//
+// HID system parameters: read the macOS **system-level** pointer values (what System Settings
+// holds) so device properties can be restored to the system value -- the same chain LinearMouse
+// uses in DeviceManager.getSystemProperty.
+//
+// 注意 IOKit 的 io_service_t / io_connect_t 都是 mach_port_t(u32),不是指针:
+// 这里用 u32 声明(现有 IORegistryEntryFromPath 的 *mut c_void 版本是设备模块的历史声明,
+// 这里用 `link_name` 另起一个类型正确的别名,避免混用)。
+// Note io_service_t / io_connect_t are mach_port_t (u32), not pointers: declared as u32 here.
+// (The existing *mut c_void IORegistryEntryFromPath belongs to the device module; this module
+// declares its own correctly-typed alias via link_name rather than mixing the two.)
+
+/// kIOHIDParamConnectType
+pub(crate) const K_IOHID_PARAM_CONNECT_TYPE: u32 = 1;
+/// KERN_SUCCESS
+pub(crate) const KERN_SUCCESS: i32 = 0;
+/// IOHIDSystem 的 IORegistry 路径。
+/// IORegistry path of IOHIDSystem.
+pub(crate) const IOSERVICE_IOHID_SYSTEM_PATH: &str = "IOService:/IOResources/IOHIDSystem";
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    pub(crate) fn IOServiceOpen(
+        service: u32,
+        owning_task: u32,
+        connect_type: u32,
+        connection: *mut u32,
+    ) -> i32;
+    pub(crate) fn IOServiceClose(connection: u32) -> i32;
+    /// 读系统参数(CFTypeRef +1)。KERN_SUCCESS 且返回指针非空时调用方负责 CFRelease。
+    /// Read a system parameter (CFTypeRef +1). On KERN_SUCCESS with a non-null pointer the
+    /// caller owns the reference.
+    pub(crate) fn IOHIDCopyCFTypeParameter(
+        handle: u32,
+        key: *const c_void,
+        value: *mut *mut c_void,
+    ) -> i32;
+    pub(crate) fn mach_task_self() -> u32;
 }
 
 // ========== 事件归因:IOHIDEvent sender ID(私有 SPI)/ Event attribution ==========
@@ -167,6 +212,14 @@ pub(crate) const KEY_POINTER_ACCEL: &str = "HIDPointerAcceleration";
 /// 鼠标加速类型键(旧系统回退)。
 /// Mouse acceleration type key (legacy fallback).
 pub(crate) const KEY_MOUSE_ACCEL: &str = "HIDMouseAcceleration";
+/// 设备声明的"哪个键才是我的加速属性"(字符串,如 "HIDMouseAcceleration" /
+/// "HIDTrackpadAcceleration")。macOS 按它取值/写值——写声明之外的键不会生效
+/// (实测 MCHOSE G3 V2 声明 HIDMouseAcceleration,写 HIDPointerAcceleration 无效)。
+/// The device-declared "which key holds my acceleration" property (a string such as
+/// "HIDMouseAcceleration" / "HIDTrackpadAcceleration"). macOS reads/writes that key; writing
+/// any other key has no effect (measured on a MCHOSE G3 V2, which declares
+/// HIDMouseAcceleration while a HIDPointerAcceleration write did nothing).
+pub(crate) const KEY_ACCEL_TYPE: &str = "HIDPointerAccelerationType";
 /// 设备主用途页(matching 用:按 Generic Desktop 页过滤后,再用 ConformsTo 判定指针设备)。
 /// Device primary usage page (for matching: filter to the Generic Desktop page, then decide
 /// pointer devices via ConformsTo).

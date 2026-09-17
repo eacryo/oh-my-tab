@@ -680,6 +680,20 @@ fn on_app_launched_inner(notification: *mut c_void) {
     thumbnail::app_launched(pid);
 }
 
+/// NSApplicationWillTerminateNotification 转发点(main 线程):退出前把指针加速/跟踪速度
+/// 恢复成 macOS 系统值,对齐 LinearMouse 的 applicationWillTerminate 行为——否则设备上会
+/// 一直留着线性开关与我们的速度值(Cmd+Q、注销、关机都会走这里;菜单退出路径另有等价调用)。
+///
+/// Forwarding point for NSApplicationWillTerminateNotification (main thread): restore the macOS
+/// system pointer values before quitting, matching LinearMouse's applicationWillTerminate --
+/// otherwise the linear switch and our tracking speed stay on the device (Cmd+Q, logout and
+/// shutdown all land here; the menu-quit path has an equivalent call of its own).
+extern "C" fn on_will_terminate(_self: *mut c_void, _cmd: Sel, _notification: *mut c_void) {
+    callback_guard::void("on_will_terminate", || {
+        crate::mouse::pointer::restore();
+    });
+}
+
 /// NSWorkspaceDidTerminateApplicationNotification 转发点(main 线程):
 /// 通知缩略图模块取消捕获、清缓存并卸载该 App 的 observer。
 /// Forwarding point for NSWorkspaceDidTerminateApplicationNotification (main
@@ -1450,6 +1464,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleAppTerminate:),
             on_app_terminated as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleWillTerminate:),
+            on_will_terminate as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -2258,6 +2278,22 @@ fn main() {
             object: std::ptr::null::<AnyObject>(),
         ];
         CFRelease(screen_params_name as *const c_void);
+
+        // 本进程即将退出:把指针加速/跟踪速度恢复成系统值(对齐 LinearMouse 的
+        // applicationWillTerminate)。Cmd+Q / 注销 / 关机都会投递这个通知;崩溃(SIGABRT)
+        // 不会,那种情况由下次启动时"未配置即写回系统值"的逻辑自愈。
+        // This process is about to quit: restore the system pointer values (same as LinearMouse's
+        // applicationWillTerminate). Cmd+Q / logout / shutdown post this; a crash (SIGABRT) does
+        // not -- that case self-heals on the next launch through the "unset writes the system
+        // value back" logic.
+        let will_terminate_name = make_nsstring("NSApplicationWillTerminateNotification");
+        let _: () = msg_send![default_nc,
+            addObserver: controller,
+            selector: sel!(handleWillTerminate:),
+            name: will_terminate_name,
+            object: std::ptr::null::<AnyObject>(),
+        ];
+        CFRelease(will_terminate_name as *const c_void);
     }
 
     // 7. Start event monitor; input is coalesced into one main-thread drain callback.

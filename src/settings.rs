@@ -3373,6 +3373,15 @@ unsafe fn fill_mouse_device_controls(
         .acceleration
         .or_else(|| source_device.and_then(crate::mouse::pointer::read_acceleration))
         .unwrap_or(crate::mouse::pointer::FALLBACK_ACCELERATION);
+    // 滑杆是线性取值(0..=10);越界值(设备现值可能来自别的工具)夹到区间内,保证读数与
+    // 滑块位置一致——我们的配置与写入都限定在 0..=10。
+    // The slider is linear (0..=10); a value outside the range (the device value may come from
+    // another tool) is clamped so the readout and the handle stay consistent -- our config and
+    // writes are limited to 0..=10.
+    let acceleration = acceleration.clamp(
+        crate::config::MOUSE_ACCELERATION_MIN,
+        crate::config::MOUSE_ACCELERATION_MAX,
+    );
     let _: () = msg_send![ui.pointer_accel_slider, setDoubleValue: acceleration];
     set_field(
         ui.pointer_accel_value_label,

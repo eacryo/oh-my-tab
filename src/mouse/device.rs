@@ -176,7 +176,7 @@ fn bluetooth_appearance_map() -> HashMap<String, u16> {
             Err(_) => return map,
         };
         let entry = IORegistryEntryFromPath(0, path.as_ptr());
-        if entry.is_null() {
+        if entry == 0 {
             return map;
         }
         let mut props: *mut c_void = std::ptr::null_mut();
@@ -469,6 +469,32 @@ pub(crate) fn device_int_property(key: DeviceKey, property: &str) -> Option<i64>
         .iter()
         .find(|d| (d.identity.vendor_id, d.identity.product_id) == key)?;
     unsafe { prop_int(device.service_client, property) }
+}
+
+/// 读取某个设备当前生效的字符串属性(与 `device_int_property` 同一套保活/加锁约定);
+/// 空字符串与非字符串属性都返回 None。
+///
+/// Read a device's current string property (same keep-alive/locking rules as
+/// `device_int_property`); empty strings and non-string properties both yield None.
+pub(crate) fn device_string_property(key: DeviceKey, property: &str) -> Option<String> {
+    {
+        let reg = registry().lock().unwrap();
+        if reg.devices.is_empty() {
+            drop(reg);
+            ensure_enumerated();
+        }
+    }
+    let reg = registry().lock().unwrap();
+    let device = reg
+        .devices
+        .iter()
+        .find(|d| (d.identity.vendor_id, d.identity.product_id) == key)?;
+    let s = unsafe { prop_string(device.service_client, property) };
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 // ========== 设备插拔监听 / device plug/unplug monitoring ==========

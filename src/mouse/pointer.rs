@@ -4,12 +4,22 @@
 //! - macOS 14+ (Sonoma):设 HIDUseLinearScalingMouseAcceleration = 1
 //! - 旧系统回退:设 HIDPointerAcceleration = -1(IOFixed 编码,值 × 65536;"acceleration and sensitivity are disabled")
 //!
-//! 跟踪速度写的是同一个 HIDPointerAcceleration 属性(IOFixed,值 × 65536),但**只在线性跟踪
-//! 开启时才有意义**:线性缩放下这个属性就是跟踪速度本身;开关关闭时它是 macOS 加速曲线的
-//! 强度,含义不同,因此那种情况下完全不写它(保持/恢复系统原值)。旧系统回退路径同样不支持
-//! 该数值(那里 -1 已同时禁用加速与灵敏度)。
+//! **加速属性键必须取设备声明的那个**(`HIDPointerAccelerationType`,通常是
+//! HIDMouseAcceleration 或 HIDTrackpadAcceleration):macOS 按声明取值/写值,写声明之外的键
+//! 不会生效——旧版本写死 HIDPointerAcceleration,在声明 HIDMouseAcceleration 的鼠标上
+//! 完全是空操作("跟踪速度没生效"的根因)。选择逻辑见 `choose_accel_key`。
 //!
-//! 应用前保存每设备的原值,禁用配置或退出时恢复。
+//! 跟踪速度写的是同一个加速属性(IOFixed,值 × 65536),但**只在线性跟踪开启时才有意义**:
+//! 线性缩放下这个属性就是跟踪速度本身;开关关闭时它是 macOS 加速曲线的强度,含义不同,因此
+//! 那种情况下完全不写它(保持/恢复系统原值)。旧系统回退路径同样不支持该数值(那里 -1 已
+//! 同时禁用加速与灵敏度)。
+//!
+//! 取值区间 [0, 40] ∪ {-1}(与 LinearMouse PointerKit 一致):**-1 才是"禁用加速与灵敏度"
+//! 的哨兵值,0 是正常区间的最低端(最慢)**。0 会真实生效,所以它不是"未设置"——
+//! `None`(配置未设置)才表示不动设备现值。
+//!
+//! 应用前保存每设备的原值,禁用配置或退出时恢复;**我们自己创建出来的属性在恢复时删除**
+//! (而不是写 0 —— 那会凭空造出一个假的"最慢"状态,见 `restore`)。
 //!
 //! Pointer settings: disable macOS pointer acceleration for 1:1 linear cursor tracking, plus
 //! the tracking speed used in that linear mode. Mirrors LinearMouse's
@@ -19,15 +29,34 @@
 //! - Legacy fallback: set HIDPointerAcceleration = -1 (IOFixed encoding, value × 65536;
 //!   "-1 means acceleration and sensitivity are disabled")
 //!
-//! The tracking speed writes that same HIDPointerAcceleration property (IOFixed, value × 65536)
-//! but **only means something while linear tracking is on**: under linear scaling the property is
-//! the tracking speed itself, whereas with the switch off it is the strength of macOS's
-//! acceleration curve -- a different meaning, so it is not written at all in that case (the
-//! original system value is kept/restored). The legacy fallback path does not support the number
-//! either (its -1 already disables acceleration and sensitivity).
+//! **The acceleration property key must be the one the device declares**
+//! (`HIDPointerAccelerationType`, usually HIDMouseAcceleration or HIDTrackpadAcceleration):
+//! macOS reads/writes that key, and a write to any other key has no effect -- the old version
+//! hard-coded HIDPointerAcceleration, which was a no-op on a mouse declaring HIDMouseAcceleration
+//! (the root cause of "tracking speed has no effect"). See `choose_accel_key`.
 //!
-//! Original property values are saved before applying and restored when the config is
-//! disabled or the app quits.
+//! The tracking speed writes that same property (IOFixed, value × 65536) but **only means
+//! something while linear tracking is on**: under linear scaling the property is the tracking
+//! speed itself, whereas with the switch off it is the strength of macOS's acceleration curve --
+//! a different meaning, so a configured value is never written in that case; the system value is
+//! written back instead. The legacy fallback path does not support the number either (its -1
+//! already disables acceleration and sensitivity).
+//!
+//! Value range [0, 40] ∪ {-1} (same as LinearMouse's PointerKit): **-1 is the "acceleration and
+//! sensitivity disabled" sentinel while 0 is the bottom of the normal range (slowest)**. 0 does
+//! take effect, so it is not "unset" -- only `None` (no configured value) writes the system value
+//! back instead of a configured one.
+//!
+//! **Unset means "write the macOS system value back", not "leave the device alone"** (the same
+//! semantics as LinearMouse's `restorePointerAcceleration()` / `disablePointerAcceleration = false`):
+//! any property this feature could have written is actively reset to the system value whenever the
+//! config has nothing to say about that device. That is what makes values left behind by a
+//! previous run -- including one that crashed -- disappear on the next apply instead of sticking
+//! to the device forever.
+//!
+//! Original property values are saved before applying and restored when the config is disabled
+//! or the app quits; a property **we created** is removed on restore (instead of being written
+//! as 0, which fabricates a fake "slowest" state -- see `restore`).
 
 use crate::config::{CONFIG, MOUSE_ACCELERATION_MAX, MOUSE_ACCELERATION_MIN};
 use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
@@ -74,9 +103,14 @@ struct SavedProp {
     /// NSString 属性键(+1,restore 时 release)。
     /// NSString property key (+1, released on restore).
     key: *mut AnyObject,
-    /// 原值(+1,restore 时 set 回再 release);None = 属性原本不存在。
-    /// Original value (+1, set back then released on restore); None = property didn't exist.
-    original: Option<*mut c_void>,
+    /// 我们写入前该属性是否已存在:false = 这个键是我们创建出来的,恢复时应删除它。
+    /// 注意这里**不保存原值**:恢复写回的是"现场读到的 macOS 系统值"(见 restore),
+    /// 对齐 LinearMouse;快照崩溃后就没了,而系统值永远可读。
+    /// Whether the property existed before we wrote it: false = we created the key, so restore
+    /// should remove it. Note the original **value** is deliberately not kept: restore writes the
+    /// live macOS system value (see `restore`), same as LinearMouse -- a snapshot dies with the
+    /// process, the system value is always readable.
+    existed_before: bool,
 }
 
 /// 已应用的指针状态:持有 event system client 与 services 数组(保活 service client),外加 saved 列表。
@@ -140,9 +174,153 @@ unsafe fn prop_exists(service: *mut c_void, key: &str) -> bool {
 /// Set an integer property.
 unsafe fn set_prop_int(service: *mut c_void, key: &str, value: i64) -> bool {
     let k = make_nsstring(key);
-    let n: *mut AnyObject = msg_send![class!(NSNumber), numberWithLongLong: value];
+    let n = nsnumber(value);
     let ok = IOHIDServiceClientSetProperty(service, k as *const c_void, n as *mut c_void);
     CFRelease(k as *const c_void);
+    ok
+}
+
+/// NSNumber(长整型)。CFNumber 与 NSNumber toll-free 互通,IOHIDServiceClientSetProperty 两处都用它。
+/// An NSNumber (long long). CFNumber and NSNumber are toll-free bridged; used for both
+/// IOHIDServiceClientSetProperty and the system-parameter writes.
+unsafe fn nsnumber(value: i64) -> *mut AnyObject {
+    msg_send![class!(NSNumber), numberWithLongLong: value]
+}
+
+/// 读 HID 系统参数(IOHIDSystem / kIOHIDParamConnectType 连接)——即「系统设置」里的值。
+/// LinearMouse DeviceManager.getSystemProperty 同款链路;read-only,失败返回 None。
+///
+/// Read an HID system parameter (the IOHIDSystem kIOHIDParamConnectType connection) -- i.e. the
+/// value System Settings holds. Same chain as LinearMouse's DeviceManager.getSystemProperty;
+/// read-only, None on failure.
+unsafe fn system_hid_param(key: &str) -> Option<i64> {
+    let path = std::ffi::CString::new(IOSERVICE_IOHID_SYSTEM_PATH).ok()?;
+    let service = IORegistryEntryFromPath(0, path.as_ptr());
+    if service == 0 {
+        return None;
+    }
+    let mut handle: u32 = 0;
+    let kr = IOServiceOpen(
+        service,
+        mach_task_self(),
+        K_IOHID_PARAM_CONNECT_TYPE,
+        &mut handle,
+    );
+    IOObjectRelease(service);
+    if kr != KERN_SUCCESS || handle == 0 {
+        return None;
+    }
+    let k = make_nsstring(key);
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let kr = IOHIDCopyCFTypeParameter(handle, k as *const c_void, &mut out);
+    CFRelease(k as *const c_void);
+    IOServiceClose(handle);
+    if kr != KERN_SUCCESS || out.is_null() {
+        return None;
+    }
+    // CFNumber/CFBoolean 都是 NSNumber 家族,longLongValue 通用。
+    // CFNumber/CFBoolean both belong to the NSNumber family; longLongValue works for both.
+    let v: i64 = msg_send![out as *mut AnyObject, longLongValue];
+    CFRelease(out);
+    Some(v)
+}
+
+/// 系统级加速值(原始 IOFixed):按设备声明的键读系统值(LinearMouse 读与设备同键的系统值),
+/// 读不到再退到鼠标键;都读不到用 macOS 默认 0.6875(LinearMouse 同款兜底)。
+///
+/// The system-level acceleration (raw IOFixed): read the system value for the device's declared
+/// key (LinearMouse reads the system value of the same key the device uses), fall back to the
+/// mouse key, then to macOS's default 0.6875 (LinearMouse's fallback).
+unsafe fn system_acceleration_raw(accel_key: &str) -> i64 {
+    system_hid_param(accel_key)
+        .or_else(|| system_hid_param(KEY_MOUSE_ACCEL))
+        .unwrap_or_else(|| acceleration_to_iofixed(FALLBACK_ACCELERATION))
+}
+
+/// 系统级线性缩放开关(0/1)。读不到回退 0(系统默认:加速开启)。
+/// The system-level linear-scaling switch (0/1); falls back to 0 (acceleration on) when unreadable.
+unsafe fn system_linear_flag() -> i64 {
+    if system_hid_param(KEY_LINEAR_SCALING).unwrap_or(0) != 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// 单台设备的目标属性值(纯计算,便于单测;均为原始 IOFixed/整数)。
+/// The desired property values for one device (pure, for unit tests; raw IOFixed/integers).
+#[derive(Debug, PartialEq)]
+struct DesiredPointerValues {
+    /// HIDUseLinearScalingMouseAcceleration 的目标值。
+    /// Target value for HIDUseLinearScalingMouseAcceleration.
+    linear: i64,
+    /// 设备声明的加速键的目标值。
+    /// Target value for the device's declared acceleration key.
+    accel: i64,
+    /// 配置了跟踪速度但因未启用线性模式而被忽略(仅用于日志说明)。
+    /// A configured tracking speed was ignored because linear mode is off (for logging only).
+    accel_ignored: bool,
+}
+
+/// 计算目标值(对齐 LinearMouse 的 DeviceManager.updatePointerSpeed):
+/// - 要求禁用加速:线性开关 = 1;跟踪速度 = 配置值,未配置则写回系统值;
+/// - 否则:线性开关与加速值**都写回系统值**。LinearMouse 对未配置项就是"写回系统值"
+///   (`restorePointerAcceleration()` / `disablePointerAcceleration = false`),不是"不动设备":
+///   这样上一轮(甚至崩溃前)残留在设备上的值会在下次应用时被清掉。
+///   注意未启用线性模式时即使配置了跟踪速度也不写该数值——此时加速属性是 macOS 加速曲线的
+///   强度,语义不同(见模块头),写系统值保持"该设置未生效"的诚实状态。
+///
+/// Compute the target values (same as LinearMouse's DeviceManager.updatePointerSpeed):
+/// - acceleration disabled: linear switch = 1; tracking speed = configured value, or the system
+///   value when unconfigured;
+/// - otherwise: **both the linear switch and the acceleration are written back to the system
+///   values**. LinearMouse treats "unset" exactly that way (`restorePointerAcceleration()` /
+///   `disablePointerAcceleration = false`) rather than leaving the device alone, so values left by
+///   a previous run (even a crashed one) get cleared on the next apply. Note a configured tracking
+///   speed is not written while linear mode is off -- the property is then the strength of macOS's
+///   acceleration curve, a different meaning (see the module docs) -- writing the system value
+///   keeps the honest "that setting has no effect" state.
+fn desired_pointer_values(
+    disable_acceleration: bool,
+    configured_accel: Option<f64>,
+    system_linear: i64,
+    system_accel_raw: i64,
+) -> DesiredPointerValues {
+    if disable_acceleration {
+        DesiredPointerValues {
+            linear: 1,
+            accel: configured_accel
+                .map(acceleration_to_iofixed)
+                .unwrap_or(system_accel_raw),
+            accel_ignored: false,
+        }
+    } else {
+        DesiredPointerValues {
+            linear: system_linear,
+            accel: system_accel_raw,
+            accel_ignored: configured_accel.is_some(),
+        }
+    }
+}
+
+/// 写入一个属性并记录(供恢复用)。返回是否写成功。
+/// Write one property and record it (for restore). Returns whether the write succeeded.
+unsafe fn write_and_record(
+    service: *mut c_void,
+    key: &str,
+    value: i64,
+    label: &str,
+    device: &str,
+    saved: &mut Vec<SavedProp>,
+) -> bool {
+    let existed_before = prop_exists(service, key);
+    let ok = set_prop_int(service, key, value);
+    log_debug!("[pointer] {}: {} via {} (ok={})", device, label, key, ok);
+    saved.push(SavedProp {
+        service,
+        key: make_nsstring(key),
+        existed_before,
+    });
     ok
 }
 
@@ -159,15 +337,57 @@ unsafe fn device_name(service: *mut c_void) -> String {
     }
 }
 
-/// 定位设备的加速属性键:优先现代键 HIDPointerAcceleration,不存在则回退 HIDMouseAcceleration。
-/// Resolve a device's acceleration property key: prefer the modern HIDPointerAcceleration,
-/// falling back to HIDMouseAcceleration.
-unsafe fn accel_property_key(service: *mut c_void) -> &'static str {
-    if prop_exists(service, KEY_POINTER_ACCEL) {
-        KEY_POINTER_ACCEL
+/// 读取字符串属性(NSString);不存在/非字符串返回 None。
+/// Read a string property (NSString); None when absent or not a string.
+unsafe fn copy_prop_string(service: *mut c_void, key: &str) -> Option<String> {
+    let v = copy_prop(service, key)?;
+    let s = nsstring_to_rust(v as *mut AnyObject);
+    CFRelease(v as *const c_void);
+    if s.is_empty() {
+        None
     } else {
-        KEY_MOUSE_ACCEL
+        Some(s)
     }
+}
+
+/// 选择加速属性键(纯函数,便于单测):设备声明的键 > LinearMouse 式猜测。
+///
+/// 平台按设备自己的 `HIDPointerAccelerationType` 声明取值/写值,声明之外的键写了也不生效:
+/// 实测 MCHOSE G3 V2 声明 `HIDMouseAcceleration`,而旧版本写死的 `HIDPointerAcceleration`
+/// 完全不起作用("跟踪速度没生效"的根因)。因此:
+/// 1. 设备声明了就用它(LinearMouse PointerDevice.pointerAccelerationType 同款);
+/// 2. 没声明时才猜:存在 `HIDPointerAcceleration` 就用它;
+/// 3. 否则回退 `HIDMouseAcceleration`(鼠标的惯例键)。
+///
+/// Pick the acceleration property key (pure, for unit tests): the device-declared key wins,
+/// then the LinearMouse-style guess.
+///
+/// macOS reads/writes the key named by the device's own `HIDPointerAccelerationType`
+/// declaration; a write to any other key has no effect (measured on a MCHOSE G3 V2: it declares
+/// `HIDMouseAcceleration` and the previously hard-coded `HIDPointerAcceleration` write did
+/// nothing -- the root cause of "tracking speed has no effect"). So:
+/// 1. use the declared key when present (same as LinearMouse's
+///    `PointerDevice.pointerAccelerationType`);
+/// 2. only guess when nothing is declared: `HIDPointerAcceleration` when it exists;
+/// 3. otherwise fall back to `HIDMouseAcceleration` (the mouse convention).
+fn choose_accel_key(declared: Option<&str>, pointer_accel_exists: bool) -> String {
+    if let Some(key) = declared.filter(|k| !k.is_empty()) {
+        return key.to_string();
+    }
+    if pointer_accel_exists {
+        KEY_POINTER_ACCEL.to_string()
+    } else {
+        KEY_MOUSE_ACCEL.to_string()
+    }
+}
+
+/// 定位设备的加速属性键:见 `choose_accel_key`。
+/// Resolve a device's acceleration property key; see `choose_accel_key`.
+unsafe fn accel_property_key(service: *mut c_void) -> String {
+    choose_accel_key(
+        copy_prop_string(service, KEY_ACCEL_TYPE).as_deref(),
+        prop_exists(service, KEY_POINTER_ACCEL),
+    )
 }
 
 /// 禁用鼠标加速:枚举鼠标/触控板设备,保存原值并设线性开关。
@@ -246,90 +466,97 @@ unsafe fn disable() {
         let vid = prop_int(service, KEY_VENDOR_ID) as u32;
         let pid = prop_int(service, KEY_PRODUCT_ID) as u32;
         let resolved = resolve::resolve(Some((vid, pid)));
-        // 未启用"禁用指针加速"时没有可做的改动:跟踪速度只在线性跟踪下才有意义,
-        // 关闭时该属性是加速曲线强度,不属于这个设置的语义,一律不动(保留系统默认)。
-        // With "disable pointer acceleration" off there is nothing to do: the tracking speed only
-        // means something under linear tracking, and the property is otherwise the acceleration
-        // curve's strength -- outside this setting's meaning, so it is left alone (system default
-        // kept).
-        if !resolved.disable_acceleration {
-            log_debug!(
-                "[pointer] {}: keeping acceleration (vid={:#x} pid={:#x})",
+        let accel_key = accel_property_key(service);
+        let desired = desired_pointer_values(
+            resolved.disable_acceleration,
+            resolved.acceleration,
+            system_linear_flag(),
+            system_acceleration_raw(&accel_key),
+        );
+
+        if desired.accel_ignored {
+            log_info!(
+                "[pointer] {}: tracking speed ignored while linear tracking is off (vid={:#x} pid={:#x})",
                 name,
                 vid,
                 pid
             );
-            continue;
         }
 
-        // macOS 14+ (Sonoma):线性缩放开关。
-        // macOS 14+ (Sonoma): the linear-scaling switch.
+        // macOS 14+ (Sonoma) 有线性缩放开关;老系统只有加速属性(下面走 -1 回退)。
+        // macOS 14+ (Sonoma) has the linear-scaling switch; older systems only expose the
+        // acceleration property (the -1 fallback below).
         if prop_exists(service, KEY_LINEAR_SCALING) {
-            let original = copy_prop(service, KEY_LINEAR_SCALING).unwrap();
-            let ok = set_prop_int(service, KEY_LINEAR_SCALING, 1);
-            log_debug!(
-                "[pointer] {}: linear scaling ON (original saved, ok={})",
-                name,
-                ok
-            );
-            saved.push(SavedProp {
+            // 线性开关:要求禁用 -> 1;否则写回系统值(通常是 0)——把上一轮/上个版本遗留在
+            // 设备上的 1 清掉(对齐 LinearMouse 的 disablePointerAcceleration = false)。
+            // Linear switch: 1 when disabling is requested, otherwise the system value (usually 0),
+            // which clears a 1 left behind by a previous run/version (same as LinearMouse's
+            // disablePointerAcceleration = false).
+            write_and_record(
                 service,
-                key: make_nsstring(KEY_LINEAR_SCALING),
-                original: Some(original),
-            });
+                KEY_LINEAR_SCALING,
+                desired.linear,
+                &format!("linear scaling -> {}", desired.linear),
+                &name,
+                &mut saved,
+            );
+            // 加速 / 跟踪速度:线性模式下 = 配置值(未配置 -> 系统值);非线模式 -> 系统值。
+            // Acceleration / tracking speed: in linear mode the configured value (unconfigured ->
+            // the system value); with linear mode off, the system value.
+            if resolved.disable_acceleration && resolved.acceleration == Some(0.0) {
+                // 0 = 平台区间 [0,40] 的最低端(最慢),不是 -1 那种"禁用"哨兵;它真的会生效,
+                // 所以打印时把单位语义一并写清楚,便于排查"指针几乎不动"的反馈。
+                // 0 is the bottom of the platform's [0,40] range (slowest), not the -1 "disabled"
+                // sentinel; it does take effect, so the log spells the meaning out for
+                // "pointer barely moves" reports.
+                log_info!(
+                    "[pointer] {}: tracking speed 0 = slowest setting in linear mode",
+                    name
+                );
+            }
+            // 人读值:线性模式下是配置的跟踪速度,否则是"系统值"(跟踪速度未生效)。
+            // Human-readable value: the configured tracking speed in linear mode, else "system
+            // value" (the tracking speed has no effect).
+            let accel_desc = match (resolved.disable_acceleration, resolved.acceleration) {
+                (true, Some(v)) => format!("tracking speed {v}"),
+                _ => "acceleration -> system value".to_string(),
+            };
+            write_and_record(
+                service,
+                &accel_key,
+                desired.accel,
+                &format!("{accel_desc} (raw {})", desired.accel),
+                &name,
+                &mut saved,
+            );
         } else {
-            // 旧系统回退:加速属性 = -1 (IOFixed:值 × 65536)。优先 HIDPointerAcceleration,
-            // 不存在则用 HIDMouseAcceleration。
+            // 旧系统回退:要求禁用 -> 加速属性 = -1(IOFixed:值 × 65536);否则写回系统值。
             // 该路径下 -1 同时禁用加速与灵敏度,不存在"线性 + 可调速度"的语义,
             // 因此配置里的跟踪速度在此不生效(与 LinearMouse 一致:旧系统不提供该控件)。
             //
-            // Legacy fallback: acceleration = -1 (IOFixed: value × 65536). Prefers
-            // HIDPointerAcceleration, else HIDMouseAcceleration. On this path -1 disables both
-            // acceleration and sensitivity, so there is no "linear + adjustable speed" notion
-            // and the configured tracking speed does not apply (same as LinearMouse, which
-            // hides the control on older systems).
-            let accel_key = accel_property_key(service);
-            let original = copy_prop(service, accel_key);
-            let ok = set_prop_int(service, accel_key, -IOFIXED_SCALE as i64);
-            log_debug!(
-                "[pointer] {}: acceleration -> -1 via {} (ok={})",
-                name,
-                accel_key,
-                ok
-            );
-            saved.push(SavedProp {
-                service,
-                key: make_nsstring(accel_key),
-                original,
-            });
-            if resolved.acceleration.is_some() {
+            // Legacy fallback: -1 (IOFixed: value × 65536) when disabling is requested; otherwise
+            // the system value. The key comes from the device's declaration (see
+            // `choose_accel_key`). On this path -1 disables both acceleration and sensitivity, so
+            // there is no "linear + adjustable speed" notion and a configured tracking speed does
+            // not apply (same as LinearMouse, which hides the control on older systems).
+            let disabling = resolved.disable_acceleration;
+            let value = if disabling {
+                -IOFIXED_SCALE as i64
+            } else {
+                desired.accel
+            };
+            let label = if disabling {
+                format!("acceleration -> -1 (raw {value}, legacy)")
+            } else {
+                format!("acceleration -> system value (raw {value}, legacy)")
+            };
+            write_and_record(service, &accel_key, value, &label, &name, &mut saved);
+            if disabling && resolved.acceleration.is_some() {
                 log_debug!(
                     "[pointer] {}: tracking speed ignored (no linear-scaling property on this system)",
                     name
                 );
             }
-            continue;
-        }
-
-        // 跟踪速度:线性跟踪已开启,写入配置值。
-        // Tracking speed: linear tracking is on, write the configured value.
-        if let Some(acceleration) = resolved.acceleration {
-            let accel_key = accel_property_key(service);
-            let original = copy_prop(service, accel_key);
-            let raw = acceleration_to_iofixed(acceleration);
-            let ok = set_prop_int(service, accel_key, raw);
-            log_debug!(
-                "[pointer] {}: acceleration/tracking speed -> {} via {} (ok={})",
-                name,
-                acceleration,
-                accel_key,
-                ok
-            );
-            saved.push(SavedProp {
-                service,
-                key: make_nsstring(accel_key),
-                original,
-            });
         }
     }
 
@@ -361,8 +588,16 @@ unsafe fn disable() {
     });
 }
 
-/// 恢复原始加速设置(禁用配置、Reload 或退出时调用)。
-/// Restore the original acceleration settings (called on config disable, reload, or quit).
+/// 恢复系统指针设置(禁用配置、Reload 或退出时调用):把改动过的属性**写回现场读到的
+/// macOS 系统值**,而不是进程内快照——对齐 LinearMouse 的
+/// `restorePointerAcceleration()`:系统值永远可读,而快照会随进程(尤其是崩溃)消失;
+/// 写回系统值还能顺手清掉设备上遗留的旧值。我们创建出来的键则删除(回到"从未存在")。
+///
+/// Restore the system pointer settings (called on config disable, reload, or quit): write the
+/// **live macOS system values** back instead of an in-process snapshot -- same as LinearMouse's
+/// `restorePointerAcceleration()`: the system value is always readable while a snapshot dies with
+/// the process (crashes included), and writing it back also clears stale values on the device.
+/// Keys we created are removed (back to "never existed").
 pub(crate) fn restore() {
     let mut guard = POINTER_STATE.lock().unwrap();
     let Some(state) = guard.take() else {
@@ -371,26 +606,39 @@ pub(crate) fn restore() {
     unsafe {
         for sp in state.saved {
             let key_cf = sp.key as *const c_void;
-            match sp.original {
-                Some(orig) => {
-                    let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, orig);
-                    log_debug!("[pointer] restored original property (ok={})", ok);
-                    CFRelease(orig as *const c_void);
-                }
-                None => {
-                    // 原值不存在:设 0(等效关闭我们设置的开关);极少见的旧系统边界情况。
-                    // Original didn't exist: set 0 (equivalent to disabling what we set);
-                    // a rare legacy edge case.
-                    let zero: *mut AnyObject = msg_send![class!(NSNumber), numberWithInt: 0];
-                    IOHIDServiceClientSetProperty(sp.service, key_cf, zero as *mut c_void);
-                }
+            let key = nsstring_to_rust(sp.key);
+            if sp.existed_before {
+                let value = if key == KEY_LINEAR_SCALING {
+                    system_linear_flag()
+                } else {
+                    system_acceleration_raw(&key)
+                };
+                let n = nsnumber(value);
+                let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, n as *mut c_void);
+                log_debug!(
+                    "[pointer] restored system value for {} (value={}, ok={})",
+                    key,
+                    value,
+                    ok
+                );
+            } else {
+                // 这个键是我们首次创建出来的 -> 删除属性,而不是写 0。
+                // 写 0 会凭空造出一个"最慢/无加速"的假状态:旧版本对 HIDPointerAcceleration
+                // 就是写 0,导致设备上留下一个从未生效过的 0,又反过来被设置页当作"设备现值"
+                // 读出来(0.00)。
+                // We created this key -> remove the property instead of writing 0. Writing 0
+                // fabricates a "slowest/no-acceleration" state out of nothing: the old version did
+                // exactly that for HIDPointerAcceleration, leaving a never-effective 0 on the
+                // device that the settings page then read back as the "live" device value (0.00).
+                let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, std::ptr::null_mut());
+                log_debug!("[pointer] removed property we created: {} (ok={})", key, ok);
             }
             CFRelease(key_cf);
         }
         CFRelease(state.services as *const c_void);
         CFRelease(state.client as *const c_void);
     }
-    log_debug!("[pointer] restored original acceleration settings.");
+    log_debug!("[pointer] restored system acceleration settings.");
 }
 
 /// 根据当前配置应用或恢复指针设置。
@@ -424,8 +672,17 @@ pub(crate) fn apply() {
 /// and yields None, keeping it out of the slider's 0..=40 range; a missing device or property
 /// is None as well.
 pub(crate) fn read_acceleration(device: crate::mouse::device::DeviceKey) -> Option<f64> {
-    let raw = crate::mouse::device::device_int_property(device, KEY_POINTER_ACCEL)
-        .or_else(|| crate::mouse::device::device_int_property(device, KEY_MOUSE_ACCEL))?;
+    // 键的选择必须与写入端(`accel_property_key`)一致:否则会读到我们写错键留下的值,
+    // 把"从未生效的 0"当成设备现值显示给用户(设置页显示 0.00 的由来)。
+    // The key choice must match the write path (`accel_property_key`): otherwise this reads the
+    // value left in the wrong key and shows a never-effective 0 to the user as the device's live
+    // value (how the settings page ended up displaying 0.00).
+    let declared = crate::mouse::device::device_string_property(device, KEY_ACCEL_TYPE);
+    let key = choose_accel_key(
+        declared.as_deref(),
+        crate::mouse::device::device_int_property(device, KEY_POINTER_ACCEL).is_some(),
+    );
+    let raw = crate::mouse::device::device_int_property(device, &key)?;
     if raw < 0 {
         return None;
     }
@@ -443,7 +700,7 @@ mod tests {
         assert_eq!(acceleration_to_iofixed(0.6875), 45056);
         assert_eq!(iofixed_to_acceleration(45056), 0.6875);
         assert_eq!(acceleration_to_iofixed(0.0), 0);
-        assert_eq!(acceleration_to_iofixed(40.0), 2_621_440);
+        assert_eq!(acceleration_to_iofixed(10.0), 655_360);
     }
 
     #[test]
@@ -452,9 +709,110 @@ mod tests {
         // Non-integral multiples round to the nearest IOFixed.
         assert_eq!(acceleration_to_iofixed(1.25), 81920);
         assert_eq!(acceleration_to_iofixed(0.0001), 7);
-        // 越界值被 clamp 到 0..=40(配置层已校验,这里是兜底)。
-        // Out-of-range values clamp to 0..=40 (the config layer validates; this is a backstop).
+        // 越界值被 clamp 到 0..=10(配置层已校验,这里是兜底)。
+        // Out-of-range values clamp to 0..=10 (the config layer validates; this is a backstop).
         assert_eq!(acceleration_to_iofixed(-5.0), 0);
-        assert_eq!(acceleration_to_iofixed(1000.0), 2_621_440);
+        assert_eq!(acceleration_to_iofixed(1000.0), 655_360);
+    }
+
+    #[test]
+    fn accel_key_prefers_the_device_declaration() {
+        // 实测场景(MCHOSE G3 V2):设备声明 HIDMouseAcceleration,而 HIDPointerAcceleration
+        // 也存在(旧版本自己写出来的)——必须用声明键,否则写入无效。
+        // Measured case (MCHOSE G3 V2): the device declares HIDMouseAcceleration while
+        // HIDPointerAcceleration also exists (created by the old version) -- the declared key
+        // must win or the write is a no-op.
+        assert_eq!(
+            choose_accel_key(Some(KEY_MOUSE_ACCEL), true),
+            KEY_MOUSE_ACCEL.to_string()
+        );
+        // 触控板声明 HIDTrackpadAcceleration 时同理。
+        // Same for a trackpad declaring HIDTrackpadAcceleration.
+        assert_eq!(
+            choose_accel_key(Some("HIDTrackpadAcceleration"), false),
+            "HIDTrackpadAcceleration".to_string()
+        );
+    }
+
+    #[test]
+    fn accel_key_falls_back_like_linearmouse() {
+        // 无声明:存在 HIDPointerAcceleration 就用它,否则回退 HIDMouseAcceleration
+        // (LinearMouse PointerDevice.pointerAccelerationType 的猜测顺序)。
+        // Nothing declared: HIDPointerAcceleration when present, else HIDMouseAcceleration (the
+        // guess order of LinearMouse's PointerDevice.pointerAccelerationType).
+        assert_eq!(choose_accel_key(None, true), KEY_POINTER_ACCEL.to_string());
+        assert_eq!(choose_accel_key(None, false), KEY_MOUSE_ACCEL.to_string());
+        // 空声明(空字符串)等同"未声明"。
+        // An empty declaration counts as "not declared".
+        assert_eq!(
+            choose_accel_key(Some(""), true),
+            KEY_POINTER_ACCEL.to_string()
+        );
+    }
+
+    #[test]
+    fn desired_values_disable_path_uses_config_then_system() {
+        let sys = acceleration_to_iofixed(0.6875);
+        // 要求禁用 + 配置了跟踪速度 -> 线性开关 1,写入配置值。
+        // Disable requested with a configured tracking speed -> linear 1, write the configured value.
+        assert_eq!(
+            desired_pointer_values(true, Some(3.5), 0, sys),
+            DesiredPointerValues {
+                linear: 1,
+                accel: acceleration_to_iofixed(3.5),
+                accel_ignored: false,
+            }
+        );
+        // 要求禁用但未配置跟踪速度 -> 写系统值(LinearMouse 的 restorePointerAcceleration)。
+        // Disable requested without a configured speed -> the system value (LinearMouse's
+        // restorePointerAcceleration).
+        assert_eq!(
+            desired_pointer_values(true, None, 0, sys),
+            DesiredPointerValues {
+                linear: 1,
+                accel: sys,
+                accel_ignored: false,
+            }
+        );
+    }
+
+    #[test]
+    fn desired_values_unset_restores_system_values() {
+        let sys = acceleration_to_iofixed(0.6875);
+        // 未启用禁用:开关与加速都写回系统值(不是"不动设备")——设备上残留的 1 会被清成
+        // 系统值 0,残留的速度值也会被系统值覆盖。
+        // Not disabling: both the switch and the acceleration go back to the system values (not
+        // "leave the device alone") -- a leftover 1 on the device is cleared to the system's 0 and
+        // a leftover speed is overwritten by the system value.
+        assert_eq!(
+            desired_pointer_values(false, None, 0, sys),
+            DesiredPointerValues {
+                linear: 0,
+                accel: sys,
+                accel_ignored: false,
+            }
+        );
+        // 系统自身把线性缩放打开时,我们照样跟随系统值(不强行关掉别人的设置)。
+        // When the system itself has linear scaling on, we follow the system value (never override
+        // someone else's setting).
+        assert_eq!(
+            desired_pointer_values(false, None, 1, sys),
+            DesiredPointerValues {
+                linear: 1,
+                accel: sys,
+                accel_ignored: false,
+            }
+        );
+        // 未启用禁用 + 配置了数值:仍然写系统值,并标记该数值被忽略(非线性模式下语义不同)。
+        // Not disabling with a configured value: still the system value, flagged as ignored (the
+        // value has a different meaning while linear tracking is off).
+        assert_eq!(
+            desired_pointer_values(false, Some(2.5), 0, sys),
+            DesiredPointerValues {
+                linear: 0,
+                accel: sys,
+                accel_ignored: true,
+            }
+        );
     }
 }

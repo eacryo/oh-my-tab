@@ -349,10 +349,25 @@ pub struct PointerSection {
     pub disable_acceleration: bool,
 }
 
-/// 指针加速 / 跟踪速度的合法区间(HIDPointerAcceleration 本身的取值范围)。
-/// The valid range for pointer acceleration / tracking speed (HIDPointerAcceleration's own range).
+/// 指针加速 / 跟踪速度的合法区间:**0..=10**。
+///
+/// 平台属性本身的取值域是 [0, 40] ∪ {-1},但**可用区间只有约 0.3~3**(macOS 系统默认 0.6875;
+/// 实测 10 已经快到难以使用),10 以上的行程纯属浪费、还让线性滑杆彻底失去精度。因此这里把
+/// 产品接受范围收窄到 0..=10;若将来有低 DPI 设备确实需要更大的乘数,再放宽这一处即可。
+/// 语义提醒:0 是正常区间的最低端(最慢,真实生效),-1 才是"禁用加速与灵敏度"的哨兵(旧系统
+/// 回退路径用);只有"未设置"(None)表示不改动设备现值。
+///
+/// The valid range for pointer acceleration / tracking speed: **0..=10**.
+///
+/// The platform property's own domain is [0, 40] ∪ {-1}, but the usable band is only ~0.3-3
+/// (macOS's default is 0.6875; a value of 10 already feels unusably fast), so anything above 10 is
+/// wasted travel that also destroys a linear slider's precision. The accepted range is therefore
+/// narrowed to 0..=10; should a low-DPI device ever need a larger multiplier, widening this single
+/// constant is enough. Semantics: 0 is the bottom of the normal range (slowest, and it really
+/// takes effect), -1 is the "acceleration and sensitivity disabled" sentinel (used by the legacy
+/// fallback path); only "unset" (None) leaves the device value alone.
 pub const MOUSE_ACCELERATION_MIN: f64 = 0.0;
-pub const MOUSE_ACCELERATION_MAX: f64 = 40.0;
+pub const MOUSE_ACCELERATION_MAX: f64 = 10.0;
 
 /// 设备匹配器(None = 通配,即"所有鼠标")。配置按 VID+PID 匹配设备。
 /// Device matcher (None = wildcard, i.e. "All Mice"). Config matches devices by VID+PID.
@@ -931,8 +946,8 @@ impl Config {
                     errs.push(format!("{prefix}.line_count: {msg}"));
                 }
             }
-            // 指针加速 / 跟踪速度:0..=40(HIDPointerAcceleration 的合法区间)。
-            // Pointer acceleration / tracking speed: 0..=40 (HIDPointerAcceleration's range).
+            // 指针加速 / 跟踪速度:0..=10(见 MOUSE_ACCELERATION_MAX 的说明)。
+            // Pointer acceleration / tracking speed: 0..=10 (see MOUSE_ACCELERATION_MAX).
             if let Some(acc) = p.pointer.as_ref().and_then(|ptr| ptr.acceleration) {
                 if !(MOUSE_ACCELERATION_MIN..=MOUSE_ACCELERATION_MAX).contains(&acc) {
                     let msg = tf(
