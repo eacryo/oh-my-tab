@@ -55,7 +55,6 @@
 //!   removes orphan files. Files are also removed in sync with delete/clear-all/trim. A separate `{hash}.detail` preview (longest
 //!   edge <= 1280px, pregenerated in the background at record time with a first-open
 //!   fallback, never held in RAM) feeds the detail panel and shares the same deletion lifecycle.
-
 use crate::clipboard_highlight::{
     apply_code_paragraph_styles, apply_link_color, apply_visible_space_markers, classify_text,
     prepare_code_display, prepare_code_for_soft_wrap, prepare_code_no_wrap_display,
@@ -84,30 +83,37 @@ use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
+mod detail;
 mod image_cache;
 mod model;
 mod monitor;
+mod notifications;
 mod pasteboard;
 mod persist;
+mod picker;
 mod search;
 mod smoke;
-
+mod text_style;
+use detail::*;
 use image_cache::*;
 use model::*;
 use monitor::*;
+use notifications::*;
 use pasteboard::*;
 use persist::*;
+use picker::*;
 use search::*;
 use smoke::*;
+use text_style::*;
 // 对 crate 其他模块暴露的入口(内部子模块实现)。
 // Entry points exposed to the rest of the crate (implemented in the child modules).
+pub(crate) use detail::{apply_glass_properties, apply_theme};
 pub(crate) use monitor::{start, stop};
 pub(crate) use persist::apply_persist_toggle;
+pub(crate) use picker::on_clipboard_toggle;
 pub(crate) use smoke::{set_smoke_mode, smoke_runner};
-
+pub(crate) use text_style::refresh_localized_ui;
 // ========== 常量 / constants ==========
-
 /// 剪贴板文件 URL 类型(Finder 文件复制携带;粘贴时恢复它 = 文件语义)。
 /// The pasteboard file-URL type (carried by Finder file copies; restoring it on paste =
 /// file semantics).
@@ -276,13 +282,11 @@ const SEL_TILE_R: f64 = 8.0;
 const SEL_BAR_W: f64 = 2.0;
 const SEL_BAR_X: f64 = 1.0;
 const SEL_BAR_INSET_Y: f64 = 10.0;
-
 /// Resolve the shared settings/overlay palette for clipboard surfaces and controls.
 /// 剪贴板面板和控件统一从设置页/浮层共用的调色板取色。
 fn clipboard_palette() -> crate::theme::UiPalette {
     crate::theme::ui_palette()
 }
-
 /// 自定义滚动指示器的可见宽度 / visible custom scroll indicator width.
 const SCROLL_INDICATOR_W: f64 = 6.0;
 /// 指示器实际鼠标命中宽度;透明两侧扩大拖拽区域,不改变可见胶囊宽度。
@@ -345,12 +349,9 @@ const DETAIL_PANEL_ANIMATION_DURATION: f64 = 0.24;
 /// 详情正文进入时的横向起始偏移,配合面板从左向右展开。
 /// Initial horizontal content offset while the panel expands from left to right.
 const DETAIL_CONTENT_ANIMATION_OFFSET: f64 = 10.0;
-
 // ========== 状态 / state ==========
-
 /// 历史列表,最新在前 / history, newest first.
 static CLIP_HISTORY: LazyLock<Mutex<Vec<ClipEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-
 /// 内存采样器的剪贴板账本。原始图片字节在磁盘缓存,不计入驻留内存;
 /// `resident_bytes` 是结构体和动态缓冲区 capacity 的估算值。
 /// Clipboard ledger for the memory sampler. Original image bytes live in the disk cache and
@@ -363,7 +364,6 @@ pub(crate) struct HistoryStats {
     pub(crate) preview_bytes: u64,
     pub(crate) metadata_bytes: u64,
 }
-
 /// 锁只持到读出这组整数。/ Hold the lock only while reading these counters.
 pub(crate) fn history_stats() -> HistoryStats {
     let history = CLIP_HISTORY.lock().unwrap();
@@ -387,7 +387,6 @@ pub(crate) fn history_stats() -> HistoryStats {
     }
     stats
 }
-
 /// 估算单个条目的实际驻留内存:结构体本身 + 各动态字段的容量。
 /// 不把磁盘中的原始图片数据计入;这里只统计当前进程持有的 Vec/String 缓冲区。
 /// Estimate one entry's resident memory: the inline structs plus the capacities of dynamic
@@ -408,24 +407,20 @@ fn estimated_entry_bytes(entry: &ClipEntry) -> u64 {
     }
     bytes
 }
-
 /// 上次读到的 changeCount(变化才读剪贴板)/ last observed changeCount (read only on change).
 static LAST_CHANGE_COUNT: LazyLock<Mutex<i64>> = LazyLock::new(|| Mutex::new(-1));
-
 /// "粘贴并删除"写回的一次性抑制目标 changeCount。同步通知时精确计数可立即命中;
 /// 若通知延迟或计数跳跃,仍用自家 marker 兜底识别写回,避免刚删条目复活。
 /// One-shot suppression target for "paste and delete" write-backs. An exact count handles
 /// synchronous notifications; if notification delivery is delayed or counts jump, the
 /// paste marker is used as a fallback so the deleted entry cannot be resurrected.
 static PASTE_DELETE_SUPPRESS_CC: LazyLock<Mutex<Option<i64>>> = LazyLock::new(|| Mutex::new(None));
-
 /// 待执行的系统剪贴板清空任务:记录写回后的 changeCount,延迟回调时据此确认仍是我们的内容。
 /// Pending system-pasteboard clear task: records the post-write changeCount so the delayed
 /// callback can confirm that our content is still present.
 static PENDING_SYSTEM_PASTEBOARD_CLEAR: LazyLock<Mutex<Option<i64>>> =
     LazyLock::new(|| Mutex::new(None));
 const SYSTEM_PASTEBOARD_CLEAR_DELAY: f64 = 0.35;
-
 /// 布防"粘贴并删除"抑制:必须在写回剪贴板**之前**调用——若粘贴板变化通知同步
 /// 重入轮询,布防必须已经就位。目标值 = 当前 changeCount + 1;计数错位时由 marker 兜底。
 /// Arm the paste-and-delete suppression: MUST be called BEFORE the write-back -- if the
@@ -444,48 +439,37 @@ pub(super) fn arm_paste_delete_suppression() {
     };
     *suppression = Some(cc + 1);
 }
-
 /// 撤防(写回失败、未发生写回时调用,避免抑制误吞下一次真实复制)。
 /// Disarm (call when the write-back failed or never happened, so the suppression cannot
 /// swallow the next genuine copy).
 pub(super) fn disarm_paste_delete_suppression() {
     *PASTE_DELETE_SUPPRESS_CC.lock().unwrap() = None;
 }
-
 /// 抑制判定(纯函数,便于单测):精确命中计数或仍带自家 marker 都算我们的写回。
 /// Suppression verdict (pure, unit-tested): an exact count hit or our marker still being
 /// present identifies our own write-back.
 fn paste_delete_suppression_hit(stored: Option<i64>, cc: i64, marker_present: bool) -> bool {
     stored == Some(cc) || (stored.is_some() && marker_present)
 }
-
 /// 轮询 timer(主线程)/ the polling timer (main thread).
 static POLL_TIMER: OnceLock<MainThreadSlot<ObjPtr>> = OnceLock::new();
-
 /// 浮窗是否可见 / whether the picker is visible.
 static PICKER_VISIBLE: AtomicBool = AtomicBool::new(false);
-
 /// 剪贴板历史刷新是否已排队 / whether a clipboard-history UI refresh is already queued.
 static PICKER_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
-
 /// 搜索输入后的行重建是否已排队 / whether a search-triggered row rebuild is queued.
 static PICKER_SEARCH_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
-
 /// 历史模型的单调版本;行树快照比较无需重新扫描文本和预览字节。
 /// Monotonic history-model version; row-snapshot comparisons avoid rescanning text and preview bytes.
 static HISTORY_REVISION: AtomicU64 = AtomicU64::new(0);
-
 pub(super) fn history_revision() -> u64 {
     HISTORY_REVISION.load(Ordering::Relaxed)
 }
-
 pub(super) fn bump_history_revision() {
     HISTORY_REVISION.fetch_add(1, Ordering::Relaxed);
 }
-
 /// 可视行槽位刷新是否已排队 / whether a virtual-row viewport refresh is already queued.
 static PICKER_VISIBLE_ROWS_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
-
 /// 当前选中行索引 / the currently selected row index.
 /// 无选中行的哨兵值:焦点在搜索框时使用(↑ 从列表顶跳入搜索框 / 点击搜索框),
 /// 此时列表不该有高光;↓ 回列表时 search_field_do_command 重置为 0。
@@ -493,7 +477,6 @@ static PICKER_VISIBLE_ROWS_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 /// top into the search field, or a click on it), so no row keeps its highlight; ↓ back into
 /// the list resets it to 0 in search_field_do_command.
 const NO_SELECTION: usize = usize::MAX;
-
 /// 剪贴板浮窗的交互状态只在主线程消费；后台监听线程只通过既有入口投递数据。
 /// Clipboard picker interaction state is main-thread owned; background monitors deliver
 /// data through the existing entry points instead of touching this state directly.
@@ -505,9 +488,7 @@ struct ClipboardUiState {
     rendered_rows: Option<PickerRowsKey>,
     last_rebuild_timing: Option<PickerTimingSummary>,
 }
-
 const CLIPBOARD_SLOW_PATH_MS: u128 = 100;
-
 #[derive(Clone, Copy, Debug, Default)]
 struct PickerTimingSummary {
     elapsed_ms: u128,
@@ -526,7 +507,6 @@ struct PickerTimingSummary {
     slowest_row_index: Option<usize>,
     empty: bool,
 }
-
 /// 当前行视图对应的输入快照;快照不变时再次呼出只需显示已有 AppKit 视图。
 /// Snapshot of the inputs represented by the current row views; an unchanged snapshot lets a
 /// subsequent summon show the existing AppKit views without rebuilding them.
@@ -538,7 +518,6 @@ struct PickerRowsKey {
     show_source: bool,
     minute_bucket: u64,
 }
-
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ContentAttributedKey {
     content: String,
@@ -547,20 +526,16 @@ struct ContentAttributedKey {
     secondary_text: u32,
     accent: u32,
 }
-
 static CONTENT_ATTRIBUTED_CACHE: LazyLock<
     MainThreadSlot<HashMap<ContentAttributedKey, CachedUiObject>>,
 > = LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
-
 const UI_CACHE_CAPACITY: usize = 128;
 static UI_CACHE_RECENCY: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Clone, Copy)]
 struct CachedUiObject {
     object: ObjPtr,
     last_used: u64,
 }
-
 fn picker_rows_key(
     revision: u64,
     query: &str,
@@ -575,7 +550,6 @@ fn picker_rows_key(
         minute_bucket: now_secs() / 60,
     }
 }
-
 thread_local! {
     static CLIPBOARD_UI: RefCell<ClipboardUiState> = const { RefCell::new(ClipboardUiState {
         picker_selection: 0,
@@ -586,29 +560,23 @@ thread_local! {
         last_rebuild_timing: None,
     }) };
 }
-
 fn with_clipboard_ui<R>(f: impl FnOnce(&mut ClipboardUiState) -> R) -> R {
     #[cfg(not(test))]
     crate::debug_assert_main_thread();
     CLIPBOARD_UI.with(|ui| f(&mut ui.borrow_mut()))
 }
-
 fn picker_selection() -> usize {
     with_clipboard_ui(|ui| ui.picker_selection)
 }
-
 fn set_picker_selection(selection: usize) {
     with_clipboard_ui(|ui| ui.picker_selection = selection);
 }
-
 fn detail_visible() -> bool {
     with_clipboard_ui(|ui| ui.detail_visible)
 }
-
 fn set_detail_visible(visible: bool) {
     with_clipboard_ui(|ui| ui.detail_visible = visible);
 }
-
 fn take_detail_visible() -> bool {
     with_clipboard_ui(|ui| {
         let visible = ui.detail_visible;
@@ -616,14 +584,12 @@ fn take_detail_visible() -> bool {
         visible
     })
 }
-
 /// 当前鼠标悬停的行(显示浅灰 hover 底;与选中独立——键盘导航时鼠标可停在别的行)。
 /// 无悬停 = NO_SELECTION。由 mouseEntered/mouseExited 维护。
 /// The row currently under the cursor (shows the faint hover backdrop; independent of the
 /// selection -- with keyboard navigation the mouse may park on another row). NO_SELECTION
 /// when nothing is hovered. Maintained by mouseEntered/mouseExited.
 static HOVER_ROW: Mutex<usize> = Mutex::new(NO_SELECTION);
-
 /// 已物化行的增量视觉视图(底块、选中标记 + 3 个操作按钮);索引由 ROW_VIEW_INDICES 映射。
 /// Incremental visual views for materialized rows (tile, selection bar + 3 action buttons);
 /// ROW_VIEW_INDICES maps them back to the full display list.
@@ -639,17 +605,13 @@ struct RowHoverViews {
     del: ObjPtr,
 }
 static ROW_HOVER_VIEWS: MainThreadSlot<Vec<RowHoverViews>> = MainThreadSlot::new(Vec::new());
-
 /// 已物化行视图对应的完整过滤列表索引;视口外的行没有 AppKit 子视图。
 /// Display indices for materialized row views; rows outside the viewport have no AppKit views.
 static ROW_VIEW_INDICES: MainThreadSlot<Vec<usize>> = MainThreadSlot::new(Vec::new());
-
 /// 浮窗窗口 / the picker window.
 static PICKER_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-
 /// 浮窗容器(接收键盘)/ the picker container (receives key events).
 static PICKER_CONTAINER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-
 /// 复制容器裸指针后立即结束槽位借用;调用 AppKit 前不得持有 MainThreadSlot 的 RefMut。
 /// Copy the container pointer and end the slot borrow immediately; never hold a
 /// MainThreadSlot RefMut across an AppKit call.
@@ -659,23 +621,18 @@ fn picker_container_ptr() -> Option<*mut AnyObject> {
         .unwrap()
         .map(|container| container.0)
 }
-
 /// 浮窗内容父视图(重建本地化 footer 时使用)。/ The picker content parent, used to rebuild
 /// the localized footer in place.
 static PICKER_CONTENT_PARENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-
 /// macOS 26+ 的 picker 玻璃视图,供设置页实时刷新 tint/style。
 /// The macOS 26+ picker glass view, used for live tint/style preview updates.
 static PICKER_GLASS: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-
 /// 每行按钮指针(按行索引,供高亮/点击)/ row button pointers by index (highlight / click).
 static ROW_BUTTONS: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
-
 /// 每行背景块视图(与 ROW_BUTTONS 一一对应、同顺序;选中行不创建)。
 /// Per-row background tiles (one per entry, same order as ROW_BUTTONS; skipped for the
 /// selected row).
 static ROW_TILES: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
-
 /// 剪贴板行内来源图标的进程级缓存;避免每次重建都从磁盘重新解码同一张小图。
 /// Process-lifetime cache for clipboard source icons; avoids decoding the same small icon from
 /// disk again on every row rebuild.
@@ -683,60 +640,47 @@ struct CachedSourceIcon {
     image: ObjPtr,
     modified: Option<std::time::SystemTime>,
 }
-
 static SOURCE_ICON_CACHE: LazyLock<MainThreadSlot<HashMap<(String, u64), CachedSourceIcon>>> =
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
-
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct RowImageKey {
     image_hash: u64,
     field_bg: u32,
     card_border: u32,
 }
-
 static ROW_IMAGE_CACHE: LazyLock<MainThreadSlot<HashMap<RowImageKey, CachedUiObject>>> =
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
-
 fn next_ui_cache_recency() -> u64 {
     UI_CACHE_RECENCY.fetch_add(1, Ordering::Relaxed) + 1
 }
-
 /// 每行的实际行距(按钮高 + 间距,随换行行数变化)/ per-row pitch (button height + gap,
 /// varies with the wrapped line count).
 static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-
 /// 筛选 pill(全部/文本/图片/链接)按钮指针(与 tag 一一对应;切换/重建时重设样式)。
 /// The filter pills' button pointers (one per tag; restyled on change/rebuild).
 static FILTER_PILLS: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
-
 /// 清空历史操作按钮指针(语言切换时更新标题和按英文宽度重排)。
 /// Persistent clear-history action buttons, relaid out when the locale changes.
 static CLEAR_HISTORY_ACTION_BUTTONS: MainThreadSlot<Option<[ObjPtr; 2]>> =
     MainThreadSlot::new(None);
-
 const CLIPBOARD_UNDO_WINDOW: Duration = Duration::from_secs(30);
-
 fn clipboard_undo_expired(expires_at: Instant, now: Instant) -> bool {
     expires_at <= now
 }
-
 fn is_clipboard_undo_shortcut(keycode: u16, modifiers: u64) -> bool {
     const COMMAND: u64 = 0x0010_0000;
     const SECONDARY: u64 = 0x000E_0000;
     keycode == 6 && (modifiers & COMMAND) != 0 && (modifiers & SECONDARY) == 0
 }
-
 struct DeletedClipboardEntry {
     entry: ClipEntry,
     original_index: usize,
     expires_at: Instant,
     generation: u64,
 }
-
 static DELETED_CLIPBOARD_ENTRY: LazyLock<Mutex<Option<DeletedClipboardEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 static DELETED_CLIPBOARD_GENERATION: AtomicU64 = AtomicU64::new(0);
-
 /// Legacy confirmation views retained for compatibility with the existing collapse animation.
 /// The normal picker now uses persistent action buttons and never creates this card.
 #[derive(Clone, Copy)]
@@ -745,16 +689,13 @@ struct ClearHistoryConfirmationViews {
     unpinned: ObjPtr,
     all: ObjPtr,
 }
-
 static CLEAR_HISTORY_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static CLEAR_HISTORY_CONFIRMATION: MainThreadSlot<Option<ClearHistoryConfirmationViews>> =
     MainThreadSlot::new(None);
 static CLEAR_HISTORY_CONFIRMATION_EXPANDED: AtomicBool = AtomicBool::new(false);
-
 /// 筛选选中项的下划线小视图(共享单例,随选中项移动)。
 /// The active filter's underline (one shared view, moved under the active item).
 static FILTER_UNDERLINE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-
 fn localized_filter_labels() -> [String; 5] {
     [
         t("clipboard.filter_all"),
@@ -764,7 +705,6 @@ fn localized_filter_labels() -> [String; 5] {
         t("clipboard.filter_code"),
     ]
 }
-
 /// 顶部搜索框指针 / the top search field.
 static SEARCH_FIELD: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 搜索框清除叉号的悬停状态。/ The search field clear × hover state.
@@ -778,7 +718,6 @@ static SEARCH_CLEAR_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new
 /// carries NO placeholder property, so the field editor never draws the placeholder
 /// left-aligned on a focused-but-empty field).
 static SEARCH_HINT_TEXT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-
 /// 重建搜索框占位提示(放大镜 + "搜索剪贴板",15pt):占位不挂到字段上(字段编辑器
 /// 会在聚焦空字段时把它画在左侧),存入静态由 cell 手绘在字段左侧(见
 /// search_cell_draw_interior)。
@@ -795,7 +734,6 @@ unsafe fn rebuild_search_hint() {
     let empty_ns2 = make_nsstring("");
     let ph_m: *mut AnyObject = msg_send![ph_m, initWithString: empty_ns2];
     CFRelease(empty_ns2 as *const c_void);
-
     // 图标段 / the icon run.
     let icon_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let icon_attrs: *mut AnyObject = msg_send![icon_attrs, init];
@@ -815,7 +753,6 @@ unsafe fn rebuild_search_hint() {
     release_obj(icon_attrs);
     let _: () = msg_send![ph_m, appendAttributedString: icon_part];
     release_obj(icon_part);
-
     // 占位文字段 / the placeholder run.
     let ph_text_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let ph_text_attrs: *mut AnyObject = msg_send![ph_text_attrs, init];
@@ -843,7 +780,6 @@ unsafe fn rebuild_search_hint() {
     }
     *hint = Some(ObjPtr::new(ph_m));
 }
-
 /// 当前搜索词(空 = 不过滤)。/ The current search query (empty = no filtering).
 /// 当前显示列表:历史索引(过滤后的顺序)。空查询时 = 全部索引。
 /// The current display list: history indices (filtered order). All indices when no query.
@@ -859,20 +795,16 @@ unsafe fn rebuild_search_hint() {
 /// it and runs the save with tracking unwound. At most one pending entry at a time (the
 /// modal blocks input while up).
 static PENDING_SAVE_AS: Mutex<Option<ClipEntry>> = Mutex::new(None);
-
 /// 滚动视图 / the scroll view.
 static SCROLL_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-
 /// 自定义滚动指示器 / the custom scroll indicator view.
 static SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-
 /// 详情文本滚动视图及其自定义指示器;图片详情没有滚动区域。
 /// The detail text scroll view and its custom indicator; image details have no scroll area.
 static DETAIL_SCROLL_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static DETAIL_SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static DETAIL_HORIZONTAL_SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> =
     MainThreadSlot::new(None);
-
 /// 自定义滚动指示器拖拽状态;系统滚动条被关闭后,NSView 不会自动处理拖拽。
 /// Drag state for the custom scroll indicator; once the system scroller is disabled, an
 /// NSView does not implement thumb dragging for us.
@@ -882,7 +814,6 @@ enum ScrollTarget {
     Detail,
     DetailHorizontal,
 }
-
 #[derive(Clone, Copy)]
 struct ScrollDragState {
     target: ScrollTarget,
@@ -891,16 +822,13 @@ struct ScrollDragState {
     max_offset: f64,
     thumb_travel: f64,
 }
-
 static SCROLL_DRAG: Mutex<Option<ScrollDragState>> = Mutex::new(None);
-
 /// 详情浮窗窗口(→ 展开详情)/ the detail panel window (right-arrow expands).
 static DETAIL_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// macOS 26+ 的详情玻璃视图及其 inactive 补偿层。
 /// The macOS 26+ detail glass view and its inactive compensation layer.
 static DETAIL_GLASS: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static DETAIL_GLASS_FILL_LAYER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-
 /// Keep clipboard panels on the same resolved appearance as the settings window and switcher.
 /// 让剪贴板面板与设置窗口、应用切换浮窗使用相同的最终外观。
 unsafe fn apply_panel_appearance(window: *mut AnyObject) {
@@ -958,7 +886,6 @@ static DETAIL_SOFT_WRAP_TEXT_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSl
 /// Shared mapping from detail display text to source, ensuring U+2028 and other display-only
 /// characters never enter copied content.
 static DETAIL_SOURCE_MAP: Mutex<Option<Arc<DisplaySourceMap>>> = Mutex::new(None);
-
 /// 行列表重建进行中:重建期间 addSubview 的新行按钮会因鼠标恰好在区域内而立即派发
 /// mouseEntered(ActiveInKeyWindow + InVisibleRect 的 tracking area),若该回调再触发
 /// rebuild_rows 就是无限递归(窗口为 key 时键盘导航触发 rebuild 必现,曾导致进程挂起)。
@@ -971,8071 +898,7 @@ static DETAIL_SOURCE_MAP: Mutex<Option<Arc<DisplaySourceMap>>> = Mutex::new(None
 /// mouseEntered events dispatched during a rebuild are ignored; real cursor movement after
 /// the rebuild is handled normally.
 static REBUILDING: AtomicBool = AtomicBool::new(false);
-
-// ========== 通知观察者 / notification observer ==========
-
-/// 通知观察者单例,承载两个回调:
-/// - NSPasteboardDidChangeNotification:剪贴板每次变化即时记录——轮询只在 0.5s 间隔
-///   采样一次"当前值",两次采样间的快速连续复制会被跳过(历史只剩最近一条);
-///   通知在每次变化时都回调,事件不丢。
-/// - NSWindowDidResignKeyNotification:浮窗失去 key(点击了外部)→ 自动隐藏。
-///
-/// A singleton notification observer carrying two callbacks:
-/// - NSPasteboardDidChangeNotification: record on every pasteboard change. Polling samples
-///   the current value once per 0.5s interval, so rapid consecutive copies between samples
-///   are skipped (history ends up with only the newest entry); the notification fires on
-///   every change, so no event is lost.
-/// - NSWindowDidResignKeyNotification: the picker loses key (a click outside) -> hide.
-unsafe fn observer() -> *mut AnyObject {
-    static OBSERVER: OnceLock<CallbackTarget> = OnceLock::new();
-    OBSERVER
-        .get_or_init(|| {
-            let name = CString::new("OhMyTabClipboardObserver").unwrap();
-            let superclass = class!(NSObject) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(clipboardPasteboardChanged:),
-                pasteboard_changed as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(clipboardWindowResigned:),
-                window_did_resign_key as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(clearSystemPasteboardIfOwned:),
-                clear_system_pasteboard_if_owned as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(scrollIndicatorBoundsChanged:),
-                scroll_indicator_bounds_changed as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(detailScrollIndicatorBoundsChanged:),
-                detail_scroll_indicator_bounds_changed as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(toggleDetailSoftWrap:),
-                toggle_detail_soft_wrap as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(detailSaveAs:),
-                detail_save_as_action as *mut c_void,
-                types.as_ptr(),
-            );
-            // 另存为的主线程重入点:动作在按钮追踪循环内只存槽 + 跳转,真正弹
-            // NSSavePanel 在这里(见 PENDING_SAVE_AS 注释)。
-            // Main-thread re-entry for save-as: the action only stashes and hops from
-            // inside the button tracking loop; the NSSavePanel is presented here (see
-            // the PENDING_SAVE_AS comment).
-            class_addMethod(
-                cls,
-                sel!(detailSaveAsDeferred:),
-                detail_save_as_deferred as *mut c_void,
-                types.as_ptr(),
-            );
-            // 详情高清预览生成完成(后台线程 → performSelectorOnMainThread):时效
-            // 复核后重建详情面板升级为高清图。
-            // Detail hi-res preview finished (worker -> performSelectorOnMainThread):
-            // re-validate freshness, then rebuild the detail panel to upgrade to hi-res.
-            class_addMethod(
-                cls,
-                sel!(detailPreviewReady:),
-                detail_preview_ready as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(clearClipboardHistory:),
-                clear_clipboard_history as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(clearClipboardUnpinned:),
-                clear_clipboard_unpinned as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(clearClipboardAll:),
-                clear_clipboard_all as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(finishClearHistoryCollapse:),
-                finish_clear_history_collapse as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(expireClipboardUndo:),
-                expire_clipboard_undo as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(refreshPickerRows:),
-                picker_refresh_rows as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(refreshPickerSearchRows:),
-                picker_refresh_search_rows as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(refreshPickerVisibleRows:),
-                picker_refresh_visible_rows as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(searchFieldChanged:),
-                search_field_changed as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(filterPillClicked:),
-                filter_pill_clicked as *mut c_void,
-                types.as_ptr(),
-            );
-            // 详情文本光标(owner = observer 的 tracking area 投递):进入 = I-beam,
-            // 离开 = 箭头。见 detail_tv_cursor_entered 注释。
-            // The detail-text cursor (delivered by the tracking area owned by this
-            // observer): enter -> I-beam, exit -> arrow. See detail_tv_cursor_entered.
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                detail_tv_cursor_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                detail_tv_cursor_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(searchFocusBegan:),
-                search_focus_began as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(searchFocusEnded:),
-                search_focus_ended as *mut c_void,
-                types.as_ptr(),
-            );
-            // 搜索框 delegate:拦截字段编辑器翻译出的命令(如 ↓ → moveDown:)。
-            // Search-field delegate: intercepts commands the field editor translates
-            // (e.g. ↓ -> moveDown:).
-            let types_cmd = CString::new("B@:@@:").unwrap();
-            class_addMethod(
-                cls,
-                sel!(control:textView:doCommandBySelector:),
-                search_field_do_command as *mut c_void,
-                types_cmd.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            // 实例 alloc(+1):进程级单例,不释放(与静态生命周期一致)。
-            // Instance alloc (+1): process-level singleton, never released (matches the
-            // static's lifetime).
-            let obj: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-            CallbackTarget::new(obj)
-        })
-        .0
-}
-
-/// 在主线程维护长驻的列表视图;剪贴板监听线程只排队一次刷新。
-/// Keep the long-lived row view tree current on the main thread; the pasteboard observer only
-/// queues one coalesced refresh.
-extern "C" fn picker_refresh_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    PICKER_REFRESH_PENDING.store(false, Ordering::SeqCst);
-    if PICKER_WINDOW.lock().unwrap().is_none() {
-        return;
-    }
-    // 面板隐藏时只保留模型变化;延迟到下一次显示前统一刷新,避免剪贴板监听占用主线程
-    // 并拖慢应用切换浮窗。
-    // While hidden, keep only the model change and refresh before the next presentation so the
-    // pasteboard observer cannot occupy the main thread and slow the app switcher.
-    if !PICKER_VISIBLE.load(Ordering::SeqCst) {
-        with_clipboard_ui(|ui| ui.rendered_rows = None);
-        return;
-    }
-
-    let filter = *CLIP_FILTER.lock().unwrap();
-    let show_source = show_source_app();
-    let query = with_clipboard_ui(|ui| ui.search_query.clone());
-    let key = picker_rows_key(history_revision(), &query, filter, show_source);
-    let rows_current = with_clipboard_ui(|ui| {
-        ui.rendered_rows
-            .as_ref()
-            .is_some_and(|current| current == &key)
-    });
-    if rows_current {
-        return;
-    }
-
-    unsafe {
-        rebuild_rows();
-    }
-}
-
-/// 搜索输入合并后的主线程刷新:连续按键只在停顿后重建一次可视行。
-/// Main-thread refresh after coalescing search input: consecutive keystrokes rebuild the
-/// visible rows only once after typing pauses.
-extern "C" fn picker_refresh_search_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    PICKER_SEARCH_REFRESH_PENDING.store(false, Ordering::SeqCst);
-    if !PICKER_VISIBLE.load(Ordering::SeqCst)
-        || REBUILDING.load(Ordering::SeqCst)
-        || PICKER_WINDOW.lock().unwrap().is_none()
-    {
-        return;
-    }
-    let filter = *CLIP_FILTER.lock().unwrap();
-    let show_source = show_source_app();
-    let query = with_clipboard_ui(|ui| ui.search_query.clone());
-    let key = picker_rows_key(history_revision(), &query, filter, show_source);
-    let rows_current = with_clipboard_ui(|ui| {
-        ui.rendered_rows
-            .as_ref()
-            .is_some_and(|current| current == &key)
-    });
-    if !rows_current {
-        unsafe {
-            rebuild_rows();
-        }
-    }
-}
-
-/// 合并连续搜索通知,让文本编辑器保持流畅,同时在短暂停顿后更新列表。
-/// Coalesce consecutive search notifications so the editor stays responsive while the list
-/// catches up shortly after typing pauses.
-unsafe fn schedule_picker_search_refresh() {
-    if PICKER_SEARCH_REFRESH_PENDING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let target = observer();
-    let _: () = msg_send![
-        target,
-        performSelector: sel!(refreshPickerSearchRows:),
-        withObject: std::ptr::null::<AnyObject>(),
-        afterDelay: 0.05f64
-    ];
-}
-
-/// 在滚动事件批次结束后补齐可视行,避免每个 bounds-change 都同步拆建整组控件。
-/// Materialize the new viewport after a scroll-event burst instead of tearing down and
-/// rebuilding the whole physical row set for every bounds-change callback.
-extern "C" fn picker_refresh_visible_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    PICKER_VISIBLE_ROWS_REFRESH_PENDING.store(false, Ordering::SeqCst);
-    if !PICKER_VISIBLE.load(Ordering::SeqCst) || REBUILDING.load(Ordering::SeqCst) {
-        return;
-    }
-    unsafe {
-        if picker_materialized_range_changed() {
-            rebuild_rows();
-        }
-    }
-}
-
-/// 合并连续滚动通知,给 AppKit 一个短暂的 run-loop 窗口完成滚动绘制。
-/// Coalesce consecutive scroll notifications, giving AppKit a short run-loop window to finish
-/// scrolling before the visible row set is rebuilt.
-unsafe fn schedule_picker_visible_rows_refresh() {
-    if PICKER_VISIBLE_ROWS_REFRESH_PENDING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let target = observer();
-    let _: () = msg_send![
-        target,
-        performSelector: sel!(refreshPickerVisibleRows:),
-        withObject: std::ptr::null::<AnyObject>(),
-        afterDelay: 0.05f64
-    ];
-}
-
-/// 浮窗可见时把历史变化投递到主线程;隐藏时延迟到下一次呼出前刷新。
-/// Deliver history changes to the main thread while the picker is visible; while hidden, defer
-/// the refresh until the next summon.
-fn schedule_picker_refresh() {
-    if PICKER_WINDOW.lock().unwrap().is_none()
-        || !PICKER_VISIBLE.load(Ordering::SeqCst)
-        || PICKER_REFRESH_PENDING.swap(true, Ordering::SeqCst)
-    {
-        return;
-    }
-    unsafe {
-        let target = observer();
-        let _: () = msg_send![
-            target,
-            performSelectorOnMainThread: sel!(refreshPickerRows:),
-            withObject: std::ptr::null::<AnyObject>(),
-            waitUntilDone: false
-        ];
-    }
-}
-
-/// 剪贴板变化通知回调(任意线程):即时记录当前文本。
-/// Pasteboard-change notification callback (any thread): record the current text immediately.
-extern "C" fn pasteboard_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
-    poll_clipboard();
-}
-
-/// 延迟清空一次性粘贴写回的系统剪贴板;若期间 changeCount 或 marker 变化则放弃。
-/// Delayed cleanup for a one-shot paste write-back; abort if changeCount or our marker changed.
-extern "C" fn clear_system_pasteboard_if_owned(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
-    let Some(note) = (!note.is_null()).then_some(note as *mut AnyObject) else {
-        return;
-    };
-    let scheduled: i64 = unsafe { msg_send![note, longLongValue] };
-    // Each delayed selector carries its own changeCount. An older queued callback must not
-    // consume the token belonging to a newer one-shot paste.
-    // 每个延迟 selector 都携带自己的 changeCount；旧回调不能误消费较新单次粘贴的 token。
-    if *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() != Some(scheduled) {
-        log_debug!("[clip] system pasteboard clear skipped: stale task");
-        return;
-    }
-    if !clear_system_pasteboard_after_paste() {
-        *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
-        log_debug!("[clip] system pasteboard clear skipped: setting disabled");
-        return;
-    }
-    unsafe {
-        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
-        let current: i64 = if pb.is_null() {
-            -1
-        } else {
-            msg_send![pb, changeCount]
-        };
-        let marker_present = !pb.is_null() && pasteboard_has_paste_marker();
-        if pb.is_null() || !marker_present || current != scheduled {
-            *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
-            log_debug!("[clip] system pasteboard clear skipped: ownership changed");
-            return;
-        }
-        let _: isize = msg_send![pb, clearContents];
-    }
-    *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
-    log_debug!("[clip] system pasteboard cleared after one-shot paste");
-}
-
-/// 在主线程安排延迟清空,并记录写回后的 changeCount 作为所有权凭据。
-/// Schedule delayed cleanup on the main thread and record the post-write changeCount as the
-/// ownership proof.
-unsafe fn schedule_system_pasteboard_clear() {
-    let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
-    if pb.is_null() {
-        return;
-    }
-    let cc: i64 = msg_send![pb, changeCount];
-    *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = Some(cc);
-    let target = observer();
-    let token: *mut AnyObject = msg_send![class!(NSNumber), numberWithLongLong: cc];
-    let _: () = msg_send![
-        target,
-        performSelector: sel!(clearSystemPasteboardIfOwned:),
-        withObject: token,
-        afterDelay: SYSTEM_PASTEBOARD_CLEAR_DELAY
-    ];
-}
-
-/// 浮窗失去 key 通知回调(主线程):点击外部等场景自动隐藏。
-/// Picker resign-key notification callback (main thread): auto-hide on outside clicks, etc.
-extern "C" fn window_did_resign_key(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
-    hide_picker();
-}
-
-extern "C" fn clipboard_window_send_event(_self: *mut c_void, _cmd: Sel, event: *mut AnyObject) {
-    unsafe {
-        let window = _self as *mut AnyObject;
-        type SendEvent = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
-        let mut sup = ObjcSuper {
-            receiver: window as *mut c_void,
-            super_class: class!(NSPanel) as *const _ as *mut c_void,
-        };
-        let send_event: SendEvent = std::mem::transmute(objc_msgSendSuper as *const ());
-        send_event(&mut sup, sel!(sendEvent:), event);
-    }
-}
-
-/// 主列表和详情共用同一个自定义指示器类;只通过目标滚动视图区分状态。
-/// The picker and detail share one custom indicator class; only the target scroll view differs.
-unsafe fn scroll_indicator_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| {
-        let name = CString::new("OhMyTabClipboardScrollIndicator").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_mouse = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(mouseDown:),
-            scroll_indicator_mouse_down as *mut c_void,
-            types_mouse.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseDragged:),
-            scroll_indicator_mouse_dragged as *mut c_void,
-            types_mouse.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseUp:),
-            scroll_indicator_mouse_up as *mut c_void,
-            types_mouse.as_ptr(),
-        );
-        let types_accepts_first_mouse = CString::new("B@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(acceptsFirstMouse:),
-            scroll_indicator_accepts_first_mouse as *mut c_void,
-            types_accepts_first_mouse.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
-}
-
-fn scroll_target_for_indicator(indicator: *mut AnyObject) -> Option<ScrollTarget> {
-    if DETAIL_SCROLL_INDICATOR
-        .lock()
-        .unwrap()
-        .is_some_and(|detail| detail.0 == indicator)
-    {
-        return Some(ScrollTarget::Detail);
-    }
-    if DETAIL_HORIZONTAL_SCROLL_INDICATOR
-        .lock()
-        .unwrap()
-        .is_some_and(|detail| detail.0 == indicator)
-    {
-        return Some(ScrollTarget::DetailHorizontal);
-    }
-    if SCROLL_INDICATOR
-        .lock()
-        .unwrap()
-        .is_some_and(|picker| picker.0 == indicator)
-    {
-        Some(ScrollTarget::Picker)
-    } else {
-        None
-    }
-}
-
-unsafe fn scroll_for_target(target: ScrollTarget) -> Option<*mut AnyObject> {
-    match target {
-        ScrollTarget::Picker => SCROLL_VIEW.lock().unwrap().map(|scroll| scroll.0),
-        ScrollTarget::Detail | ScrollTarget::DetailHorizontal => {
-            DETAIL_SCROLL_VIEW.lock().unwrap().map(|scroll| scroll.0)
-        }
-    }
-}
-
-/// 计算指示器的 y/高度;拖拽和绘制必须使用同一套映射,否则拖到轨道底部时会跳动。
-/// Compute the indicator's y/height; dragging and drawing must share this mapping or the
-/// thumb jumps when it reaches the end of the track.
-fn scroll_indicator_geometry(
-    visible: f64,
-    document: f64,
-    offset: f64,
-    corner_reserve: f64,
-) -> Option<(f64, f64)> {
-    let track_start = SCROLL_INDICATOR_EDGE;
-    let track_end = visible - SCROLL_INDICATOR_EDGE - corner_reserve;
-    if track_end <= track_start || document <= visible {
-        return None;
-    }
-    // 轨道末端统一避开右下角安全区;绘制和拖拽必须使用同一轨道映射。
-    // Keep the track end outside the lower-right safe corner; drawing and dragging must use
-    // this same track mapping.
-    let track_len = track_end - track_start;
-    let knob_len = (visible * visible / document)
-        .max(SCROLL_INDICATOR_MIN_LEN)
-        .min(track_len);
-    let max_offset = document - visible;
-    let travel = track_len - knob_len;
-    let progress = if max_offset > 0.0 {
-        (offset / max_offset).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    Some((track_start + progress * travel, knob_len))
-}
-
-/// 在 10pt 透明命中视图中绘制居中的 6pt 可见胶囊;父视图仍负责接收拖拽事件。
-/// Draw a centered 6pt visible capsule inside the 10pt transparent hit view; the parent view
-/// remains responsible for receiving drag events.
-unsafe fn update_scroll_indicator_visual(indicator: *mut AnyObject, length: f64, horizontal: bool) {
-    let _: () = msg_send![indicator, setWantsLayer: true];
-    let parent_layer: *mut AnyObject = msg_send![indicator, layer];
-    let sublayers: *mut AnyObject = msg_send![parent_layer, sublayers];
-    let count: usize = if sublayers.is_null() {
-        0
-    } else {
-        msg_send![sublayers, count]
-    };
-    let visual_layer: *mut AnyObject = if count == 0 {
-        let visual: *mut AnyObject = msg_send![class!(CALayer), layer];
-        let ind_bg: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.35f64];
-        crate::ffi::layer_set_background(visual, crate::ffi::ns_color_to_cg(ind_bg));
-        let _: () = msg_send![visual, setCornerRadius: SCROLL_INDICATOR_R];
-        let _: () = msg_send![parent_layer, addSublayer: visual];
-        visual
-    } else {
-        msg_send![sublayers, objectAtIndex: 0usize]
-    };
-    let frame = if horizontal {
-        NSRect::new(
-            NSPoint::new(0.0, (SCROLL_INDICATOR_HIT_W - SCROLL_INDICATOR_W) / 2.0),
-            NSSize::new(length, SCROLL_INDICATOR_W),
-        )
-    } else {
-        NSRect::new(
-            NSPoint::new((SCROLL_INDICATOR_HIT_W - SCROLL_INDICATOR_W) / 2.0, 0.0),
-            NSSize::new(SCROLL_INDICATOR_W, length),
-        )
-    };
-    let _: () = msg_send![visual_layer, setFrame: frame];
-}
-
-/// 更新滚动指示器的位置/长度:内容溢出时显示(恒显示,不淡出),否则隐藏。
-/// 由 clipView 的 bounds 变化通知回调与 show_picker(首次呼出即显示)调用。
-/// Update the scroll indicator's position/length: shown while the content overflows
-/// (always visible, no fade-out), hidden otherwise. Called by the clip-view bounds-change
-/// notification callback AND by show_picker (visible on the first summon).
-unsafe fn update_scroll_indicator_for(target: ScrollTarget) {
-    let scroll = match scroll_for_target(target) {
-        Some(scroll) => scroll,
-        None => return,
-    };
-    let (indicator, horizontal) = match target {
-        ScrollTarget::Picker => (
-            match *SCROLL_INDICATOR.lock().unwrap() {
-                Some(indicator) => indicator.0,
-                None => return,
-            },
-            false,
-        ),
-        ScrollTarget::Detail => (
-            match *DETAIL_SCROLL_INDICATOR.lock().unwrap() {
-                Some(indicator) => indicator.0,
-                None => return,
-            },
-            false,
-        ),
-        ScrollTarget::DetailHorizontal => (
-            match *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() {
-                Some(indicator) => indicator.0,
-                None => return,
-            },
-            true,
-        ),
-    };
-    let clip: *mut AnyObject = msg_send![scroll, contentView];
-    let clip_bounds: NSRect = msg_send![clip, bounds];
-    let visible = if horizontal {
-        clip_bounds.size.width
-    } else {
-        clip_bounds.size.height
-    };
-    let offset = if horizontal {
-        clip_bounds.origin.x
-    } else {
-        clip_bounds.origin.y
-    };
-    let doc: *mut AnyObject = msg_send![scroll, documentView];
-    let document = if doc.is_null() {
-        0.0
-    } else {
-        let df: NSRect = msg_send![doc, frame];
-        if horizontal {
-            df.size.width
-        } else {
-            df.size.height
-        }
-    };
-
-    let corner_reserve = match target {
-        ScrollTarget::Picker => 0.0,
-        ScrollTarget::Detail | ScrollTarget::DetailHorizontal => SCROLL_INDICATOR_CORNER_RESERVE,
-    };
-    let Some((knob_pos, knob_len)) =
-        scroll_indicator_geometry(visible, document, offset, corner_reserve)
-    else {
-        let _: () = msg_send![indicator, setHidden: true];
-        return;
-    };
-    let frame = if horizontal {
-        NSRect::new(
-            NSPoint::new(
-                knob_pos,
-                clip_bounds.size.height - SCROLL_INDICATOR_HIT_W - 3.0,
-            ),
-            NSSize::new(knob_len, SCROLL_INDICATOR_HIT_W),
-        )
-    } else {
-        NSRect::new(
-            NSPoint::new(
-                clip_bounds.size.width - SCROLL_INDICATOR_HIT_W - 3.0,
-                knob_pos,
-            ),
-            NSSize::new(SCROLL_INDICATOR_HIT_W, knob_len),
-        )
-    };
-    let _: () = msg_send![indicator, setFrame: frame];
-    update_scroll_indicator_visual(indicator, knob_len, horizontal);
-    let _: () = msg_send![indicator, setHidden: false];
-}
-
-fn update_scroll_indicator() {
-    unsafe { update_scroll_indicator_for(ScrollTarget::Picker) }
-}
-
-/// 允许自定义指示器接收第一次鼠标点击;非激活面板也要能直接开始拖拽。
-/// Accept the first mouse click so the nonactivating panel can start dragging immediately.
-extern "C" fn scroll_indicator_accepts_first_mouse(
-    _self: *mut c_void,
-    _cmd: Sel,
-    _event: *mut c_void,
-) -> bool {
-    true
-}
-
-/// 按指示器拖动距离换算文档滚动偏移。系统滚动条已关闭,NSView 不会自动提供这套行为。
-/// Convert thumb movement into document offset. The system scroller is disabled, so NSView
-/// does not provide this behavior automatically.
-extern "C" fn scroll_indicator_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
-        let Some(target) = scroll_target_for_indicator(_self as *mut AnyObject) else {
-            return;
-        };
-        let scroll = match scroll_for_target(target) {
-            Some(scroll) => scroll,
-            None => return,
-        };
-        let clip: *mut AnyObject = msg_send![scroll, contentView];
-        let clip_bounds: NSRect = msg_send![clip, bounds];
-        let doc: *mut AnyObject = msg_send![scroll, documentView];
-        if doc.is_null() {
-            return;
-        }
-        let doc_frame: NSRect = msg_send![doc, frame];
-        let horizontal = matches!(target, ScrollTarget::DetailHorizontal);
-        let visible = if horizontal {
-            clip_bounds.size.width
-        } else {
-            clip_bounds.size.height
-        };
-        let document = if horizontal {
-            doc_frame.size.width
-        } else {
-            doc_frame.size.height
-        };
-        let offset = if horizontal {
-            clip_bounds.origin.x
-        } else {
-            clip_bounds.origin.y
-        };
-        let corner_reserve = match target {
-            ScrollTarget::Picker => 0.0,
-            ScrollTarget::Detail | ScrollTarget::DetailHorizontal => {
-                SCROLL_INDICATOR_CORNER_RESERVE
-            }
-        };
-        let Some((_, knob_len)) =
-            scroll_indicator_geometry(visible, document, offset, corner_reserve)
-        else {
-            return;
-        };
-        let track_len = visible - (SCROLL_INDICATOR_EDGE * 2.0) - corner_reserve;
-        let thumb_travel = track_len - knob_len;
-        if thumb_travel <= 0.0 {
-            return;
-        }
-        let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
-        let point: NSPoint = msg_send![
-            scroll,
-            convertPoint: location,
-            fromView: std::ptr::null::<AnyObject>()
-        ];
-        let max_offset = (document - visible).max(0.0);
-        *SCROLL_DRAG.lock().unwrap() = Some(ScrollDragState {
-            target,
-            start_axis: if horizontal { point.x } else { point.y },
-            start_offset: offset.clamp(0.0, max_offset),
-            max_offset,
-            thumb_travel,
-        });
-    }
-}
-
-extern "C" fn scroll_indicator_mouse_dragged(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
-        let drag = match *SCROLL_DRAG.lock().unwrap() {
-            Some(drag) => drag,
-            None => return,
-        };
-        let scroll = match scroll_for_target(drag.target) {
-            Some(scroll) => scroll,
-            None => return,
-        };
-        let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
-        let point: NSPoint = msg_send![
-            scroll,
-            convertPoint: location,
-            fromView: std::ptr::null::<AnyObject>()
-        ];
-        let horizontal = matches!(drag.target, ScrollTarget::DetailHorizontal);
-        let axis = if horizontal { point.x } else { point.y };
-        let offset = (drag.start_offset
-            + (axis - drag.start_axis) * drag.max_offset / drag.thumb_travel)
-            .clamp(0.0, drag.max_offset);
-        let clip: *mut AnyObject = msg_send![scroll, contentView];
-        let bounds: NSRect = msg_send![clip, bounds];
-        let origin = if horizontal {
-            NSPoint::new(offset, bounds.origin.y)
-        } else {
-            NSPoint::new(bounds.origin.x, offset)
-        };
-        let _: () = msg_send![clip, setBoundsOrigin: origin];
-        let _: () = msg_send![scroll, reflectScrolledClipView: clip];
-    }
-}
-
-extern "C" fn scroll_indicator_mouse_up(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    *SCROLL_DRAG.lock().unwrap() = None;
-}
-
-/// clipView bounds 变化通知回调(滚动发生)→ 更新指示器;详情打开时同步移动详情,
-/// 让它跟着选中行走(否则滚动后详情与行错位)。
-/// Clip-view bounds-change notification callback (scrolling) -> update the indicator; with
-/// the detail open, move it along so it keeps following the selected row (otherwise a
-/// scroll would leave the detail misaligned with its row).
-/// C 回调的 panic 边界:panic 穿不过 extern "C" 帧(会 abort 整个进程),这里统一接住。
-/// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
-/// aborts the process), so it is contained here.
-extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
-    crate::callback_guard::void("scroll_indicator_bounds_changed", || unsafe {
-        scroll_indicator_bounds_changed_inner(_self, _cmd, _note)
-    });
-}
-
-unsafe fn scroll_indicator_bounds_changed_inner(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
-    update_scroll_indicator();
-    if !REBUILDING.load(Ordering::SeqCst) && PICKER_VISIBLE.load(Ordering::SeqCst) {
-        unsafe {
-            if picker_materialized_range_changed() {
-                schedule_picker_visible_rows_refresh();
-            }
-        }
-    }
-    reposition_detail();
-}
-
-/// 判断一行是否与可视区(含 overscan)相交。
-/// Check whether a row intersects the viewport, including overscan.
-fn picker_row_is_drawable(row: NSRect, viewport: NSRect, overscan: f64) -> bool {
-    row.origin.y + row.size.height >= viewport.origin.y - overscan
-        && row.origin.y <= viewport.origin.y + viewport.size.height + overscan
-}
-
-/// 根据完整行高计算需要物化的显示索引范围,保留少量上下缓冲以避免滚动边界闪烁。
-/// Compute the materialized display-index range from all row heights, retaining a small
-/// overscan on both sides to avoid flashing at scroll boundaries.
-fn picker_visible_range(pitches: &[f64], viewport: NSRect, overscan: f64) -> (usize, usize) {
-    if pitches.is_empty() || viewport.size.height <= 0.0 {
-        return (0, 0);
-    }
-    let mut start = None;
-    let mut end = 0;
-    for (index, &height) in pitches.iter().enumerate() {
-        let row = NSRect::new(
-            NSPoint::new(0.0, row_top(index, pitches)),
-            NSSize::new(PICKER_W, height),
-        );
-        if picker_row_is_drawable(row, viewport, overscan) {
-            start.get_or_insert(index);
-            end = index + 1;
-        }
-    }
-    match start {
-        Some(start) => (start, end),
-        None => (0, pitches.len().min(1)),
-    }
-}
-
-/// 取当前列表视口;布局尚未完成时只预热顶部少量行,避免首开一次性创建整表。
-/// Read the current list viewport; before layout completes, warm only a small top slice so
-/// the first presentation never creates the entire list synchronously.
-unsafe fn picker_visible_row_range(pitches: &[f64], row_count: usize) -> (usize, usize) {
-    if row_count == 0 {
-        return (0, 0);
-    }
-    let fallback_end = row_count.min(12);
-    let Some(container) = picker_container_ptr() else {
-        return (0, fallback_end);
-    };
-    let Some(scroll) = *SCROLL_VIEW.lock().unwrap() else {
-        return (0, fallback_end);
-    };
-    let clip: *mut AnyObject = msg_send![scroll.0, contentView];
-    if clip.is_null() {
-        return (0, fallback_end);
-    }
-    let clip_bounds: NSRect = msg_send![clip, bounds];
-    let visible_rect: NSRect = msg_send![
-        container,
-        convertRect: clip_bounds,
-        fromView: clip
-    ];
-    if visible_rect.size.width <= 0.0 || visible_rect.size.height <= 0.0 {
-        return (0, fallback_end);
-    }
-    picker_visible_range(pitches, visible_rect, ROW_H * 1.5)
-}
-
-/// 判断当前物理行槽位是否覆盖视口所需范围。
-/// Check whether the current physical row slots cover the range needed by the viewport.
-unsafe fn picker_materialized_range_changed() -> bool {
-    let pitches = ROW_PITCHES.lock().unwrap().clone();
-    let filtered_len = with_clipboard_ui(|ui| ui.filtered.len());
-    let (start, end) = picker_visible_row_range(&pitches, filtered_len);
-    let indices = ROW_VIEW_INDICES.lock().unwrap();
-    !indices.iter().copied().eq(start..end)
-}
-
-fn row_view_for_display_index(index: usize) -> Option<RowHoverViews> {
-    let indices = ROW_VIEW_INDICES.lock().unwrap();
-    let slot = indices
-        .iter()
-        .position(|&display_index| display_index == index)?;
-    ROW_HOVER_VIEWS.lock().unwrap().get(slot).copied()
-}
-
-/// 返回详情 NSClipView 的实时合法纵向范围。NSTextView 的 textContainerInset 会让
-/// 顶部/底部不一定等于 `0..documentHeight-visibleHeight`,必须交给 AppKit 约束。
-/// Return the detail NSClipView's live legal vertical range. NSTextView's text-container inset
-/// means the endpoints are not necessarily `0..documentHeight-visibleHeight`; AppKit must
-/// constrain them.
-unsafe fn detail_scroll_range(scroll: *mut AnyObject) -> Option<(f64, f64)> {
-    if scroll.is_null() {
-        return None;
-    }
-    let clip: *mut AnyObject = msg_send![scroll, contentView];
-    if clip.is_null() {
-        return None;
-    }
-    let bounds: NSRect = msg_send![clip, bounds];
-    let top_request = NSRect::new(NSPoint::new(bounds.origin.x, -1_000_000_000.0), bounds.size);
-    let bottom_request = NSRect::new(NSPoint::new(bounds.origin.x, 1_000_000_000.0), bounds.size);
-    let top: NSRect = msg_send![clip, constrainBoundsRect: top_request];
-    let bottom: NSRect = msg_send![clip, constrainBoundsRect: bottom_request];
-    Some((
-        top.origin.y.min(bottom.origin.y),
-        top.origin.y.max(bottom.origin.y),
-    ))
-}
-
-/// 无条件滚到 AppKit 计算出的真实顶部,而不是假设顶部 y=0。
-/// Scroll unconditionally to AppKit's actual constrained top instead of assuming y=0.
-unsafe fn scroll_detail_to_top(scroll: *mut AnyObject) {
-    let Some((min_y, _)) = detail_scroll_range(scroll) else {
-        return;
-    };
-    let clip: *mut AnyObject = msg_send![scroll, contentView];
-    let bounds: NSRect = msg_send![clip, bounds];
-    let _: () = msg_send![
-        clip,
-        setBoundsOrigin: NSPoint::new(bounds.origin.x, min_y)
-    ];
-    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
-}
-
-/// 详情原生滚动视图的 bounds 变化 → 只更新自定义滚动条胶囊。端点越界(橡皮筋)
-/// 属于原生 elasticity 的职责,不应在这里改写 clipView bounds——手势进行中的
-/// 同步硬钳会污染 NSScrollView 的动量累加基准,让后续惯性事件从脏基准重新施加
-/// delta,两端反复拉锯直到惯性耗尽,屏幕上就是滚动条"抽搐一下"。橡皮筋期间
-/// 指示器几何把进度 clamp 到 0..1,滑块自然钉在端点,与系统滚动条表现一致。
-/// Bounds changes from the detail's native scroll view -> update the custom capsule
-/// indicators only. Endpoint overscroll (rubber banding) is native elasticity's job and
-/// must never be answered by rewriting the clip-view bounds here -- a synchronous hard
-/// clamp mid-gesture poisons NSScrollView's momentum base, so each following momentum
-/// event reapplies its delta from the stale base and the two systems fight until the decay
-/// ends (the on-screen scrollbar twitch). During rubber banding the indicator geometry
-/// clamps progress to 0..1, so the thumb pins at the endpoint just like a system scroller.
-extern "C" fn detail_scroll_indicator_bounds_changed(
-    _self: *mut c_void,
-    _cmd: Sel,
-    _note: *mut c_void,
-) {
-    // update_scroll_indicator_for 内部自取 DETAIL_SCROLL_VIEW,视图不存在时会静默返回。
-    // update_scroll_indicator_for reads DETAIL_SCROLL_VIEW itself and returns silently
-    // when the view is gone.
-    unsafe {
-        update_scroll_indicator_for(ScrollTarget::Detail);
-        update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
-    }
-}
-fn cancel_clipboard_undo_timer() {
-    unsafe {
-        let target = observer();
-        let _: () = msg_send![
-            class!(NSObject),
-            cancelPreviousPerformRequestsWithTarget: target,
-            selector: sel!(expireClipboardUndo:),
-            object: std::ptr::null::<AnyObject>()
-        ];
-    }
-}
-
-fn discard_deleted_clipboard_entry() {
-    let pending = DELETED_CLIPBOARD_ENTRY.lock().unwrap().take();
-    let Some(pending) = pending else {
-        return;
-    };
-    let history = CLIP_HISTORY.lock().unwrap();
-    cache_delete_for_removed(&history, &pending.entry);
-}
-
-fn schedule_clipboard_undo_expiry() {
-    cancel_clipboard_undo_timer();
-    unsafe {
-        let target = observer();
-        let _: () = msg_send![
-            target,
-            performSelector: sel!(expireClipboardUndo:),
-            withObject: std::ptr::null::<AnyObject>(),
-            afterDelay: CLIPBOARD_UNDO_WINDOW.as_secs_f64()
-        ];
-    }
-}
-
-fn remember_deleted_clipboard_entry(entry: ClipEntry, original_index: usize) {
-    discard_deleted_clipboard_entry();
-    let generation = DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    *DELETED_CLIPBOARD_ENTRY.lock().unwrap() = Some(DeletedClipboardEntry {
-        entry,
-        original_index,
-        expires_at: Instant::now() + CLIPBOARD_UNDO_WINDOW,
-        generation,
-    });
-    schedule_clipboard_undo_expiry();
-}
-
-fn expire_deleted_clipboard_entry() {
-    let generation = DELETED_CLIPBOARD_GENERATION.load(Ordering::Acquire);
-    let expired = DELETED_CLIPBOARD_ENTRY
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|pending| {
-            pending.generation == generation
-                && clipboard_undo_expired(pending.expires_at, Instant::now())
-        });
-    if expired {
-        discard_deleted_clipboard_entry();
-        DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-extern "C" fn expire_clipboard_undo(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    expire_deleted_clipboard_entry();
-}
-
-fn undo_deleted_clipboard_entry() -> Option<ClipEntry> {
-    let pending = DELETED_CLIPBOARD_ENTRY.lock().unwrap().take()?;
-    cancel_clipboard_undo_timer();
-    if clipboard_undo_expired(pending.expires_at, Instant::now()) {
-        let history = CLIP_HISTORY.lock().unwrap();
-        cache_delete_for_removed(&history, &pending.entry);
-        return None;
-    }
-    let restored = pending.entry.clone();
-    let mut history = CLIP_HISTORY.lock().unwrap();
-    let (_, inserted) = restore_entry_at(&mut history, pending.entry, pending.original_index);
-    let max = max_entries();
-    if history.len() > max {
-        let dropped: Vec<ClipEntry> = history.drain(max..).collect();
-        for entry in &dropped {
-            cache_delete_for_removed(&history, entry);
-        }
-    }
-    let restored_h_idx = history
-        .iter()
-        .position(|entry| same_clip_entry_identity(entry, &restored));
-    let present = restored_h_idx.is_some();
-    if let Some(h_idx) = restored_h_idx {
-        let query = with_clipboard_ui(|ui| ui.search_query.clone());
-        let filter = *CLIP_FILTER.lock().unwrap();
-        let filtered = filtered_indices(&history, &query, filter);
-        if let Some(display_idx) = filtered.iter().position(|&idx| idx == h_idx) {
-            set_picker_selection(display_idx);
-        }
-    }
-    drop(history);
-    DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
-    if inserted || present {
-        save_history();
-    }
-    present.then_some(restored)
-}
-
-fn picker_filters_y() -> f64 {
-    TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y
-}
-
-fn clear_history_confirmation_layout(anchor: NSRect) -> (NSRect, [NSRect; 2]) {
-    let labels = [
-        t("clipboard.clear_confirm_unpinned"),
-        t("clipboard.clear_confirm_all"),
-    ];
-    let button_widths = labels.map(|label| {
-        localized_string_width(&label, CLEAR_CONFIRM_BUTTON_FONT_SIZE)
-            + CLEAR_CONFIRM_BUTTON_PAD_X * 2.0
-    });
-    let card_width =
-        CLEAR_CONFIRM_CARD_PAD_X * 2.0 + button_widths.iter().sum::<f64>() + CLEAR_CONFIRM_GAP;
-    let surface = NSRect::new(
-        NSPoint::new(
-            anchor.origin.x + anchor.size.width - card_width,
-            anchor.origin.y,
-        ),
-        NSSize::new(card_width, CLEAR_CONFIRM_CARD_H),
-    );
-    let buttons = std::array::from_fn(|index| {
-        let x = CLEAR_CONFIRM_CARD_PAD_X
-            + button_widths[..index].iter().sum::<f64>()
-            + index as f64 * CLEAR_CONFIRM_GAP;
-        NSRect::new(
-            NSPoint::new(x, CLEAR_CONFIRM_CARD_PAD_Y),
-            NSSize::new(button_widths[index], CLEAR_CONFIRM_BUTTON_H),
-        )
-    });
-    (surface, buttons)
-}
-
-unsafe fn clear_confirmation_reduce_motion() -> bool {
-    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-    !workspace.is_null()
-        && msg_send![workspace, respondsToSelector: sel!(accessibilityDisplayShouldReduceMotion)]
-        && msg_send![workspace, accessibilityDisplayShouldReduceMotion]
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn clear_confirmation_spring_value(
-    layer: *mut AnyObject,
-    key_path: &str,
-    from: *mut AnyObject,
-    to: *mut AnyObject,
-    duration: f64,
-    stiffness: f64,
-    damping: f64,
-    animation_key: &str,
-) {
-    let path = make_nsstring(key_path);
-    let animation: *mut AnyObject =
-        msg_send![class!(CASpringAnimation), animationWithKeyPath: path];
-    CFRelease(path as *const c_void);
-    let _: () = msg_send![animation, setFromValue: from];
-    let _: () = msg_send![animation, setToValue: to];
-    let _: () = msg_send![animation, setMass: 1.0f64];
-    let _: () = msg_send![animation, setStiffness: stiffness];
-    let _: () = msg_send![animation, setDamping: damping];
-    let _: () = msg_send![animation, setInitialVelocity: 0.0f64];
-    let _: () = msg_send![animation, setDuration: duration];
-    let key = make_nsstring(animation_key);
-    let _: () = msg_send![layer, addAnimation: animation, forKey: key];
-    CFRelease(key as *const c_void);
-}
-
-unsafe fn clear_confirmation_spring_frame(view: *mut AnyObject, target: NSRect) {
-    let layer: *mut AnyObject = msg_send![view, layer];
-    if layer.is_null() {
-        let _: () = msg_send![view, setFrame: target];
-        return;
-    }
-    let presentation: *mut AnyObject = msg_send![layer, presentationLayer];
-    let current = if presentation.is_null() {
-        layer
-    } else {
-        presentation
-    };
-    let from_bounds: NSRect = msg_send![current, bounds];
-    let from_position: NSPoint = msg_send![current, position];
-    let _: () = msg_send![class!(CATransaction), begin];
-    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-    let _: () = msg_send![view, setFrame: target];
-    let _: () = msg_send![class!(CATransaction), commit];
-    let to_bounds: NSRect = msg_send![layer, bounds];
-    let to_position: NSPoint = msg_send![layer, position];
-    for (path, from, to, key) in [
-        (
-            "bounds",
-            msg_send![class!(NSValue), valueWithRect: from_bounds],
-            msg_send![class!(NSValue), valueWithRect: to_bounds],
-            "clipboard-clear-shell-bounds",
-        ),
-        (
-            "position",
-            msg_send![class!(NSValue), valueWithPoint: from_position],
-            msg_send![class!(NSValue), valueWithPoint: to_position],
-            "clipboard-clear-shell-position",
-        ),
-    ] {
-        clear_confirmation_spring_value(
-            layer,
-            path,
-            from,
-            to,
-            CLEAR_CONFIRM_SHELL_DURATION,
-            160.0,
-            24.0,
-            key,
-        );
-    }
-}
-
-unsafe fn clear_confirmation_animate_opacity(view: *mut AnyObject, visible: bool) {
-    let layer: *mut AnyObject = msg_send![view, layer];
-    let target = if visible { 1.0 } else { 0.0 };
-    if layer.is_null() {
-        let _: () = msg_send![view, setAlphaValue: target];
-        return;
-    }
-    let presentation: *mut AnyObject = msg_send![layer, presentationLayer];
-    let from: f64 = if presentation.is_null() {
-        msg_send![view, alphaValue]
-    } else {
-        // CALayer opacity is a CGFloat-compatible Objective-C `float`, not an `f64` return.
-        // CALayer 的 opacity 返回类型是 Objective-C `float`，不能按 `f64` 接收。
-        let opacity: f32 = msg_send![presentation, opacity];
-        opacity as f64
-    };
-    let _: () = msg_send![class!(CATransaction), begin];
-    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-    let _: () = msg_send![view, setAlphaValue: target];
-    let _: () = msg_send![class!(CATransaction), commit];
-    let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from];
-    let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: target];
-    clear_confirmation_spring_value(
-        layer,
-        "opacity",
-        from_value,
-        to_value,
-        if visible {
-            CLEAR_CONFIRM_CONTENT_DURATION
-        } else {
-            0.16
-        },
-        if visible { 266.0 } else { 350.0 },
-        if visible { 30.0 } else { 36.0 },
-        "clipboard-clear-opacity",
-    );
-}
-
-unsafe fn clear_confirmation_animate_content_open(button: *mut AnyObject) {
-    clear_confirmation_animate_opacity(button, true);
-    let layer: *mut AnyObject = msg_send![button, layer];
-    if layer.is_null() {
-        return;
-    }
-    // 与设置页一致,内容从轻微上移和缩小的状态弹入展开的外壳。
-    // Match the settings control's content entrance: a small upward offset and scale
-    // settle into the expanding shell.
-    for (path, from, to, key) in [
-        (
-            "transform.translation.y",
-            8.0,
-            0.0,
-            "clipboard-clear-content-y",
-        ),
-        (
-            "transform.scale",
-            0.98,
-            1.0,
-            "clipboard-clear-content-scale",
-        ),
-    ] {
-        let key_path = make_nsstring(path);
-        let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from];
-        let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: to];
-        let _: () = msg_send![class!(CATransaction), begin];
-        let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-        let _: () = msg_send![layer, setValue: to_value, forKeyPath: key_path];
-        let _: () = msg_send![class!(CATransaction), commit];
-        CFRelease(key_path as *const c_void);
-        clear_confirmation_spring_value(
-            layer,
-            path,
-            from_value,
-            to_value,
-            CLEAR_CONFIRM_CONTENT_DURATION,
-            266.0,
-            30.0,
-            key,
-        );
-    }
-}
-
-/// 设置清空确认卡片的展开状态;状态切换只操作已缓存的视图指针,不触发历史变更。
-/// Toggle the clear-history confirmation card; this only changes cached views and never
-/// mutates clipboard history.
-fn set_clear_history_confirmation_expanded(expanded: bool) {
-    if CLEAR_HISTORY_CONFIRMATION_EXPANDED.swap(expanded, Ordering::SeqCst) == expanded {
-        return;
-    }
-    let views = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap();
-    let clear_button = *CLEAR_HISTORY_BUTTON.lock().unwrap();
-    let Some(views) = views else {
-        return;
-    };
-
-    unsafe {
-        let parent: *mut AnyObject = msg_send![views.surface.0, superview];
-        let Some(clear) = clear_button else {
-            return;
-        };
-        let header: *mut AnyObject = msg_send![clear.0, superview];
-        let anchor: NSRect = msg_send![clear.0, frame];
-        let (expanded_in_header, _) = clear_history_confirmation_layout(anchor);
-        let expanded_frame: NSRect =
-            msg_send![header, convertRect: expanded_in_header, toView: parent];
-        let collapsed_frame: NSRect = msg_send![header, convertRect: anchor, toView: parent];
-        let animated = !clear_confirmation_reduce_motion();
-        let target = observer();
-        let _: () = msg_send![
-            class!(NSObject),
-            cancelPreviousPerformRequestsWithTarget: target,
-            selector: sel!(finishClearHistoryCollapse:),
-            object: std::ptr::null::<AnyObject>()
-        ];
-        if expanded {
-            // 卡片与 header 同级,超出 header 的下两行仍能被 AppKit 命中并收到 hover。
-            // Keep the card alongside the header so its lower rows remain hit-testable beyond
-            // the header's bounds. Bring the card above the scroll view when it opens.
-            let _: () = msg_send![
-                parent,
-                addSubview: views.surface.0,
-                positioned: 1isize,
-                relativeTo: std::ptr::null::<AnyObject>()
-            ];
-            let hidden: bool = msg_send![views.surface.0, isHidden];
-            if hidden {
-                let layer: *mut AnyObject = msg_send![views.surface.0, layer];
-                if !layer.is_null() {
-                    let _: () = msg_send![layer, removeAllAnimations];
-                }
-                let _: () = msg_send![class!(CATransaction), begin];
-                let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-                let _: () = msg_send![views.surface.0, setFrame: collapsed_frame];
-                let _: () = msg_send![class!(CATransaction), commit];
-            }
-            let _: () = msg_send![views.surface.0, setHidden: false];
-            let _: () = msg_send![clear.0, setHidden: true];
-        } else {
-            // 收起时让入口和筛选 tab 位于正在缩小的卡片上层,避免透明层吞掉点击。
-            // Keep the trigger and filters above the collapsing card so its fading shell
-            // cannot intercept the next click.
-            let _: () = msg_send![clear.0, setHidden: false];
-            let _: () = msg_send![
-                parent,
-                addSubview: header,
-                positioned: 1isize,
-                relativeTo: std::ptr::null::<AnyObject>()
-            ];
-        }
-        for button in [views.unpinned.0, views.all.0] {
-            let _: () = msg_send![button, setHidden: false];
-            if !animated {
-                let layer: *mut AnyObject = msg_send![button, layer];
-                if !layer.is_null() {
-                    let _: () = msg_send![layer, removeAllAnimations];
-                }
-                let _: () = msg_send![button, setAlphaValue: if expanded { 1.0 } else { 0.0 }];
-            } else if expanded {
-                clear_confirmation_animate_content_open(button);
-            } else {
-                clear_confirmation_animate_opacity(button, false);
-            }
-        }
-        if animated {
-            clear_confirmation_spring_frame(
-                views.surface.0,
-                if expanded {
-                    expanded_frame
-                } else {
-                    collapsed_frame
-                },
-            );
-        } else {
-            let _: () = msg_send![views.surface.0, setFrame: if expanded { expanded_frame } else { collapsed_frame }];
-        }
-        if expanded {
-            let _: () = msg_send![views.surface.0, setAlphaValue: 1.0f64];
-        } else if animated {
-            let _: () = msg_send![
-                target,
-                performSelector: sel!(finishClearHistoryCollapse:),
-                withObject: std::ptr::null::<AnyObject>(),
-                afterDelay: CLEAR_CONFIRM_SHELL_DURATION
-            ];
-        } else {
-            let _: () = msg_send![views.surface.0, setHidden: true];
-        }
-    }
-}
-
-fn clear_history_confirmation_expanded() -> bool {
-    CLEAR_HISTORY_CONFIRMATION_EXPANDED.load(Ordering::SeqCst)
-}
-
-extern "C" fn finish_clear_history_collapse(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    if clear_history_confirmation_expanded() {
-        return;
-    }
-    let views = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap();
-    let Some(views) = views else {
-        return;
-    };
-    unsafe {
-        let _: () = msg_send![views.surface.0, setHidden: true];
-        for button in [views.unpinned.0, views.all.0] {
-            let _: () = msg_send![button, setHidden: true];
-        }
-    }
-}
-
-fn clear_clipboard_history_scope(clear_all: bool) {
-    discard_deleted_clipboard_entry();
-    cancel_clipboard_undo_timer();
-    DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
-    let mut history = CLIP_HISTORY.lock().unwrap();
-    let removed_entries = remove_history_scope(&mut history, clear_all);
-    let removed_hashes: HashSet<u64> = removed_entries
-        .iter()
-        .filter_map(|entry| entry.image.as_ref().map(|image| image.hash))
-        .filter(|hash| *hash != 0)
-        .collect();
-    for hash in removed_hashes {
-        cache_delete_for_hash(&history, hash);
-    }
-    let kept_count = history.len();
-    drop(history);
-    save_history();
-    clear_search();
-    hide_detail();
-    unsafe { rebuild_rows() };
-    log_info!(
-        "Clipboard history cleared by user (clear_all={}, kept_entries={})",
-        clear_all,
-        kept_count
-    );
-}
-
-/// 点击清空入口只展开确认卡片,不改变历史。
-/// Clicking the clear entry point only expands the confirmation card; history is untouched.
-extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    set_clear_history_confirmation_expanded(true);
-}
-
-extern "C" fn clear_clipboard_unpinned(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    set_clear_history_confirmation_expanded(false);
-    clear_clipboard_history_scope(false);
-}
-
-extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    set_clear_history_confirmation_expanded(false);
-    clear_clipboard_history_scope(true);
-}
-
-/// 清空搜索词 + 搜索框文本(不重建;调用方按需 rebuild)。
-/// Clear the search query and the search field's text (no rebuild; callers rebuild as needed).
-unsafe fn set_search_clear_button_visible(visible: bool) {
-    if let Some(button) = *SEARCH_CLEAR_BUTTON.lock().unwrap() {
-        let _: () = msg_send![button.0, setHidden: !visible];
-    }
-}
-
-fn clear_search() {
-    with_clipboard_ui(|ui| ui.search_query.clear());
-    SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
-    unsafe { set_search_clear_button_visible(false) };
-    if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
-        unsafe {
-            let empty_ns = make_nsstring("");
-            let _: () = msg_send![f.0, setStringValue: empty_ns];
-            let _: () = msg_send![f.0, setNeedsDisplay: true];
-            CFRelease(empty_ns as *const c_void);
-        }
-    }
-}
-
-/// 搜索框文本变化通知回调:更新搜索词并重建过滤列表。
-/// Search-field text-change notification callback: update the query and rebuild the filter.
-extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
-    let field: *mut AnyObject = unsafe { msg_send![note as *mut AnyObject, object] };
-    if field.is_null() {
-        return;
-    }
-    let s: *mut AnyObject = unsafe { msg_send![field, stringValue] };
-    let q = unsafe { nsstring_to_rust(s) };
-    let has_query = !q.is_empty();
-    with_clipboard_ui(|ui| ui.search_query = q);
-    if !has_query {
-        SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
-    }
-    unsafe { set_search_clear_button_visible(has_query) };
-    // ⌘F 键帽和右侧 × 都由自绘 cell 根据查询状态定位,文本变化时强制重绘。
-    // The hand-drawn ⌘F keycap and right × are positioned from query state, so force a redraw
-    // whenever text changes.
-    unsafe {
-        let _: () = msg_send![field, setNeedsDisplay: true];
-    }
-    // 不重置选中:编辑期间(焦点在搜索框)保持无选中;回列表时(↓)由
-    // search_field_do_command 重置为首条。
-    // Do NOT reset the selection: while editing (focus in the search field) it stays
-    // "no selection"; returning to the list (↓) resets it to the first entry in
-    // search_field_do_command.
-    unsafe { schedule_picker_search_refresh() };
-}
-
-/// NSSearchField 的 Esc(cancelOperation:):有搜索词 → 清空并恢复全列表(方案 A 第一级);
-/// 无搜索词 → 关闭浮窗(第二级)。
-/// NSSearchField's Esc (cancelOperation:): a query gets cleared and the full list restored
-/// (scheme A, level one); with no query the picker closes (level two).
-extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
-    let has_query = with_clipboard_ui(|ui| !ui.search_query.is_empty());
-    if has_query {
-        clear_search();
-        // 焦点仍在搜索框,保持无选中(高光不恢复)。
-        // Focus stays in the search field: keep "no selection" (no highlight returns).
-        unsafe { rebuild_rows() };
-    } else {
-        hide_picker();
-    }
-}
-
-/// 搜索框右侧清除按钮:不走响应链的 cancelOperation:(它可能被字段编辑器截获),直接
-/// 清空字段和过滤条件。与 Esc 不同,空字段点击不会关闭浮窗。
-/// The search field's right clear button: do not route through responder-chain cancelOperation:
-/// (which the field editor may intercept); clear the field and filter directly. Unlike Esc,
-/// clicking an already-empty field never closes the picker.
-extern "C" fn search_clear_button(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    clear_search();
-    unsafe { rebuild_rows() };
-}
-
-/// 搜索框的自绘 × 命中测试:只在有查询时拦截右侧 18pt,其余鼠标事件照常交给父类。
-/// Hit-tests the custom search ×: intercept only the rightmost 18pt while queried and forward
-/// every other mouse event to the superclass normally.
-/// 鼠标位置是否落在搜索框右侧自绘 × 的命中区域。
-/// Whether a mouse location falls inside the search field's custom right-side × hit area.
-unsafe fn search_clear_contains_event(field: *mut AnyObject, event: *mut c_void) -> bool {
-    if !search_has_query() {
-        return false;
-    }
-    let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
-    let point: NSPoint =
-        msg_send![field, convertPoint: location, fromView: std::ptr::null::<AnyObject>()];
-    let bounds: NSRect = msg_send![field, bounds];
-    point.x >= bounds.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W
-        && point.x <= bounds.size.width - SEARCH_PAD_IN
-        && point.y >= 0.0
-        && point.y <= bounds.size.height
-}
-
-/// 刷新自绘 × 的悬停状态;状态变化时仅重绘搜索框,不触发过滤或列表重建。
-/// Refreshes the custom × hover state; redraws only the search field on changes, never filters
-/// or rebuilds the list.
-unsafe fn update_search_clear_hover(field: *mut AnyObject, event: *mut c_void) {
-    let hovered = search_clear_contains_event(field, event);
-    if SEARCH_CLEAR_HOVERED.swap(hovered, Ordering::SeqCst) != hovered {
-        let _: () = msg_send![field, setNeedsDisplay: true];
-    }
-}
-
-extern "C" fn search_field_mouse_moved(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe { update_search_clear_hover(_self as *mut AnyObject, event) }
-}
-
-extern "C" fn search_field_mouse_entered(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe { update_search_clear_hover(_self as *mut AnyObject, event) }
-}
-
-extern "C" fn search_field_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    if SEARCH_CLEAR_HOVERED.swap(false, Ordering::SeqCst) {
-        unsafe {
-            let field = _self as *mut AnyObject;
-            let _: () = msg_send![field, setNeedsDisplay: true];
-        }
-    }
-}
-
-extern "C" fn search_field_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
-        let field = _self as *mut AnyObject;
-        if search_clear_contains_event(field, event) {
-            search_clear_button(_self, sel!(clearSearch:), event);
-            return;
-        }
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void) -> ();
-        let super_class = class!(NSSearchField) as *const _ as *mut c_void;
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class,
-        };
-        let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        f(&mut sup, sel!(mouseDown:), event);
-    }
-}
-
-/// 搜索框底/描边样式助手(层背景走 raw FFI)。聚焦只加强内描边,保持稳定的磨砂底色。
-/// The search field's fill/ring helper (raw FFI for the layer background). Focus strengthens
-/// only the inner ring and keeps the frosted fill stable.
-unsafe fn style_search_field(field: *mut AnyObject, focused: bool) {
-    let layer: *mut AnyObject = msg_send![field, layer];
-    let palette = clipboard_palette();
-    let background = crate::ffi::hex_to_cg_color(palette.field_bg);
-    crate::ffi::layer_set_background(layer, background);
-    let ring = if focused {
-        palette.accent
-    } else {
-        palette.card_border
-    };
-    crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(ring));
-}
-
-/// 编辑开始:保持默认 4.5% 磨砂底,仅使用 10% 内描边指示焦点,避免输入时突变白色。
-/// Editing begins: keep the default 4.5% frosted fill and use only a 10% inner ring for focus,
-/// avoiding a disruptive white transition while typing.
-extern "C" fn search_focus_began(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
-    unsafe {
-        let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
-        if !field.is_null() {
-            style_search_field(field, true);
-            // 聚焦态切换必须显式重绘 cell:占位提示由 cell 自绘,聚焦即隐(IME 组合
-            // 期间 stringValue 仍为空,若不重绘会与拼音预编辑串叠加)。图层底色变化
-            // 不会触发 cell 重绘。
-            // Focus transitions must explicitly redraw the cell: the placeholder is
-            // cell-drawn and hides on focus (during IME composition stringValue stays
-            // empty, so a stale placeholder would sit under the pre-edit pinyin).
-            // Layer background changes do not trigger cell redraws.
-            let _: () = msg_send![field, setNeedsDisplay: true];
-        }
-    }
-}
-
-/// 编辑结束:还原默认内描边。 / Editing ends: restore the default inner ring.
-extern "C" fn search_focus_ended(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
-    unsafe {
-        let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
-        if !field.is_null() {
-            style_search_field(field, false);
-            // 与 search_focus_began 同理:失焦后恢复占位提示需要立即重绘。
-            // Same as search_focus_began: restoring the placeholder on blur needs an
-            // immediate redraw.
-            let _: () = msg_send![field, setNeedsDisplay: true];
-        }
-    }
-}
-
-/// 搜索框 delegate 的命令拦截:↓(moveDown:) → 焦点切到列表并选中过滤结果第一条,返回
-/// YES 吞掉该命令;其余命令返回 NO 交给字段编辑器正常处理(光标移动/输入等)。
-/// Search-field delegate command interception: ↓ (moveDown:) moves focus into the list and
-/// selects the first filtered entry, returning YES (consumed); any other command returns NO
-/// so the field editor handles it (cursor movement / text input).
-///
-/// 为什么必须走这里:搜索框开始编辑后第一响应者是窗口的字段编辑器(NSTextView),键盘事件
-/// 根本不经过搜索框的 keyDown:;编辑器把 ↓ 翻译成 moveDown: 命令后通过
-/// control:textView:doCommandBySelector: 转发给搜索框的 delegate——这是文本控件拦截按键
-/// 的官方机制。
-/// Why this is necessary: once the search field edits, the FIRST RESPONDER is the window's
-/// field editor (an NSTextView) -- key events never reach the search field's keyDown:. The
-/// editor translates ↓ into a moveDown: command and forwards it to the field's delegate via
-/// control:textView:doCommandBySelector: -- the official way to intercept keys on text controls.
-extern "C" fn search_field_do_command(
-    _self: *mut c_void,
-    _cmd: Sel,
-    _control: *mut c_void,
-    _text_view: *mut c_void,
-    command_selector: Sel,
-) -> bool {
-    if command_selector != sel!(moveDown:) && command_selector != sel!(moveUp:) {
-        return false;
-    }
-    unsafe {
-        // 搜索词/过滤结果保留,仅把焦点与选中交给列表。↓ = 最新一条(首行);
-        // ↑ = 最久远的一条(显示列表末行,随后滚动到可见)。
-        // The query/filter stays; only focus and the selection move to the list.
-        // ↓ = the newest entry (first row); ↑ = the oldest (the display list's tail,
-        // scrolled into view afterwards).
-        let display_len = with_clipboard_ui(|ui| ui.filtered.len());
-        let sel = if command_selector == sel!(moveUp:) {
-            // 空列表:0(无行可选中,无高光;saturating_sub 防下溢)。
-            // Empty list: 0 (no row to select, no highlight; saturating_sub guards).
-            display_len.saturating_sub(1)
-        } else {
-            0
-        };
-        set_picker_selection(sel);
-        rebuild_rows();
-        // ↑ 选中末行时视口还停在顶部:用确定性的偏移计算滚动到选中行可见。
-        // With ↑ the tail is selected while the viewport is still at the top: use the
-        // deterministic offset calculation to bring the selected row into view.
-        if let Some(container) = picker_container_ptr() {
-            scroll_selection_into_view(container, sel);
-        }
-        if let Some(container) = picker_container_ptr() {
-            let window = match *PICKER_WINDOW.lock().unwrap() {
-                Some(w) => w.0,
-                None => return true,
-            };
-            // makeFirstResponder: 返回 BOOL('B')。
-            // makeFirstResponder: returns BOOL ('B').
-            let _: bool = msg_send![window, makeFirstResponder: container];
-        }
-    }
-    true
-}
-
-/// 是否已注册剪贴板变化通知(幂等,防止 start/stop 反复注册导致重复回调)。
-/// Whether the pasteboard-change notification has been registered (idempotent; start/stop
-/// cycles must not double-register and duplicate callbacks).
-static NOTIFICATION_REGISTERED: AtomicBool = AtomicBool::new(false);
-
-/// 注册剪贴板变化通知(仅一次)。/ Register the pasteboard-change notification (once).
-unsafe fn register_pasteboard_observer() {
-    if NOTIFICATION_REGISTERED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
-    let name = make_nsstring("NSPasteboardDidChangeNotification");
-    let _: () = msg_send![
-        center,
-        addObserver: observer(),
-        selector: sel!(clipboardPasteboardChanged:),
-        name: name,
-        object: std::ptr::null::<AnyObject>()
-    ];
-    CFRelease(name as *const c_void);
-    log_debug!("Pasteboard change observer registered.");
-}
-
-/// NSTimer 的 target:NSTimer 会向它发 clipPollTick:。动态注册一个轻量类,方法转发到
-/// clip_poll_tick。类只注册一次,实例每次 start 新建(+1,随 timer 持有)。
-/// The NSTimer target: NSTimer sends clipPollTick: to it. A tiny dynamic class forwards the
-/// method to clip_poll_tick; the class is registered once, and an instance is created per start.
-unsafe fn timer_target() -> *mut AnyObject {
-    static TIMER_CLS: OnceLock<StaticClass> = OnceLock::new();
-    let cls = *TIMER_CLS.get_or_init(|| {
-        let name = CString::new("OhMyTabClipTimerTarget").unwrap();
-        let superclass = class!(NSObject) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(clipPollTick:),
-            clip_poll_tick as *mut c_void,
-            types.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        StaticClass(cls as *const objc2::runtime::AnyClass)
-    });
-    let obj: *mut AnyObject = msg_send![cls.0 as *const AnyObject, new];
-    obj
-}
-
-// ========== 浮窗 / the picker ==========
-
-/// 浮窗相对光标的偏移(右下 16pt;空间不足时翻转到左/上)。
-/// The picker's offset from the cursor (16pt to the bottom-right; flips to the left/top
-/// when there isn't room).
-const PICKER_CURSOR_OFF: f64 = 16.0;
-/// 边缘最小留白 / minimum margin from the screen edge.
-const PICKER_EDGE_MARGIN: f64 = 8.0;
-
-/// 纯逻辑:包含光标的屏幕 frame(找不到返回 None)。
-/// Pure: the screen frame containing the cursor (None when no screen contains it).
-fn screen_containing(cursor: NSPoint, frames: &[NSRect]) -> Option<NSRect> {
-    frames.iter().copied().find(|f| {
-        f.origin.x <= cursor.x
-            && cursor.x < f.origin.x + f.size.width
-            && f.origin.y <= cursor.y
-            && cursor.y < f.origin.y + f.size.height
-    })
-}
-
-/// 纯逻辑:计算浮窗 frame——光标右下偏移,右侧/下方空间不足时翻转到左侧/上方,
-/// 仍不足则贴屏边缘 clamp,避免越出屏幕。
-///
-/// Pure: compute the picker frame -- offset to the cursor's bottom-right; flip to the
-/// left/top when the right/bottom side lacks room; clamp to the screen edge otherwise.
-/// Never placed outside the screen.
-fn picker_frame_for(cursor: NSPoint, screen: NSRect, w: f64, h: f64) -> NSRect {
-    let min_x = screen.origin.x;
-    let max_x = screen.origin.x + screen.size.width;
-    let min_y = screen.origin.y;
-    let max_y = screen.origin.y + screen.size.height;
-
-    // x:优先光标右侧;不足翻转到左侧;再不足贴左右缘。
-    // x: prefer the cursor's right; flip to the left when tight; clamp to the edges.
-    let mut x = cursor.x + PICKER_CURSOR_OFF;
-    if x + w > max_x {
-        x = cursor.x - w - PICKER_CURSOR_OFF;
-    }
-    if x < min_x {
-        x = min_x + PICKER_EDGE_MARGIN;
-    }
-    if x + w > max_x {
-        x = max_x - w - PICKER_EDGE_MARGIN;
-    }
-
-    // y:优先光标下方(面板顶边距光标 16pt);下方不足翻转到上方;再不足贴上下缘。
-    // y: prefer below the cursor (the panel's top edge sits 16pt under it); flip above when
-    // tight; clamp to the edges.
-    let mut y = cursor.y - h - PICKER_CURSOR_OFF;
-    if y < min_y {
-        y = cursor.y + PICKER_CURSOR_OFF;
-    }
-    if y + h > max_y {
-        y = max_y - h - PICKER_EDGE_MARGIN;
-    }
-    if y < min_y {
-        y = min_y + PICKER_EDGE_MARGIN;
-    }
-
-    NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
-}
-
-/// 纯逻辑:详情始终在主浮窗右侧,并在其垂直边界内对齐选中行;因此详情上下边缘
-/// 布局结果会限制在主浮窗范围内。
-///
-/// Pure: keep the detail panel on the picker's right and align it to the selected row within
-/// the picker's vertical bounds, so neither detail edge can exceed the picker.
-fn detail_frame_for(picker: NSRect, align_top_y: f64, screen: NSRect, w: f64, h: f64) -> NSRect {
-    let min_x = screen.origin.x + PICKER_EDGE_MARGIN;
-    let max_x = screen.origin.x + screen.size.width - PICKER_EDGE_MARGIN;
-
-    // x:详情始终从主浮窗右边开始;组合过宽时贴右侧区域,不翻转到左边。
-    // x: keep detail on the picker's right; clamp to the right-side region when the group is wide.
-    let preferred_x = picker.origin.x + picker.size.width + DETAIL_GAP;
-    let x = if w + 2.0 * PICKER_EDGE_MARGIN >= screen.size.width {
-        min_x
-    } else {
-        preferred_x.min(max_x - w).max(min_x)
-    };
-
-    // y:优先与选中行顶部对齐;长详情向上移,但始终 clamp 在主浮窗上下边缘内。
-    // y: prefer aligning to the selected row's top; long details shift upward, but always
-    // clamp within the picker's top and bottom edges.
-    let picker_min_y = picker.origin.y;
-    let picker_max_y = picker.origin.y + picker.size.height;
-    debug_assert!(h <= picker.size.height);
-    let y = (align_top_y - h).max(picker_min_y).min(picker_max_y - h);
-
-    NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
-}
-
-/// 纯逻辑:把主浮窗和详情作为一个整体布局,主浮窗始终在左、详情始终在右。
-/// Pure: lay out the picker and detail as one group, with the picker always left of detail.
-fn detail_group_frames(
-    picker: NSRect,
-    align_top_y: f64,
-    screen: NSRect,
-    detail_w: f64,
-    detail_h: f64,
-    center_on_main: bool,
-    cursor_x: f64,
-) -> (NSRect, NSRect) {
-    let group_w = picker.size.width + DETAIL_GAP + detail_w;
-    let min_x = screen.origin.x + PICKER_EDGE_MARGIN;
-    let max_x = screen.origin.x + screen.size.width - PICKER_EDGE_MARGIN;
-    let mut picker_x = if center_on_main {
-        screen.origin.x + (screen.size.width - group_w) / 2.0
-    } else {
-        cursor_x - group_w / 2.0
-    };
-
-    // 组合放得下时整体 clamp;放不下时主浮窗保留完整,详情仍在右侧区域。
-    // Clamp the whole group when it fits; if it does not, keep the picker whole and leave
-    // detail in the right-side region.
-    if group_w + 2.0 * PICKER_EDGE_MARGIN <= screen.size.width {
-        picker_x = picker_x.max(min_x).min(max_x - group_w);
-    } else {
-        picker_x = min_x;
-    }
-
-    let picker_frame = NSRect::new(NSPoint::new(picker_x, picker.origin.y), picker.size);
-    let detail_frame = detail_frame_for(picker_frame, align_top_y, screen, detail_w, detail_h);
-    (picker_frame, detail_frame)
-}
-
-/// 主浮窗所在屏幕的 frame(跨屏时跟随其所在屏;拿不到时回退主屏)。
-/// The frame of the picker's screen (follows it across screens; falls back to the main
-/// screen when unavailable).
-unsafe fn picker_screen_frame(picker_win: *mut AnyObject) -> NSRect {
-    let sc: *mut AnyObject = msg_send![picker_win, screen];
-    if sc.is_null() {
-        let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-        msg_send![main, visibleFrame]
-    } else {
-        msg_send![sc, visibleFrame]
-    }
-}
-
-/// 选中行的屏幕 y(AppKit 坐标,详情面板顶要对齐的位置):窗口顶 + 头部条 + 行在
-/// 文档内的 flipped y − 当前滚动偏移。锁只取指针即放,不持有跨 msg_send 的锁。
-///
-/// The selected row's screen y (AppKit coords -- where the detail panel's top aligns):
-/// the window top + the header strip + the row's flipped y within the document - the
-/// current scroll offset. Locks are taken only to copy pointers/values, never held
-/// across msg_send calls.
-fn selected_row_screen_y(picker: NSRect) -> Option<f64> {
-    let sel = picker_selection();
-    if sel == NO_SELECTION {
-        return None;
-    }
-    let pitches = ROW_PITCHES.lock().unwrap();
-    if pitches.is_empty() {
-        return None;
-    }
-    let row_idx = sel.min(pitches.len() - 1);
-    // 分组标题属于行距,但不属于记录内容;详情应对齐内容块而不是分组标题顶部。
-    // The group header is part of the row pitch but not the record content; align the detail
-    // with the content block instead of the top of the group header.
-    let group_header_h = {
-        let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
-        let history = CLIP_HISTORY.lock().unwrap();
-        let &history_idx = filtered.get(row_idx)?;
-        let entry = history.get(history_idx)?;
-        let current_group = day_group(entry.copied_at);
-        let previous_group = filtered[..row_idx]
-            .iter()
-            .rev()
-            .find_map(|&idx| history.get(idx).map(|e| day_group(e.copied_at)));
-        if previous_group != Some(current_group) {
-            GROUP_H
-        } else {
-            0.0
-        }
-    };
-    let row_flipped = header_strip_h() + row_top(row_idx, &pitches) + group_header_h;
-    drop(pitches);
-    // 滚动偏移:clip view 的 bounds.origin.y(flipped 坐标)。走 SCROLL_VIEW 而非
-    // PICKER_CONTAINER:键盘驱动的 scrollRectToVisible 期间容器锁仍被 if-let 临时
-    // 守卫持有,从这里再锁就是同线程自死锁(仓库里已有的教训)。
-    // Scroll offset: the clip view's bounds.origin.y (flipped). Read via SCROLL_VIEW,
-    // NOT PICKER_CONTAINER: during key-driven scrollRectToVisible the container lock is
-    // still held by the if-let temporary guard -- locking it here would self-deadlock
-    // (a lesson this repo has already learned the hard way).
-    let scroll_offset = {
-        let sv = SCROLL_VIEW.lock().unwrap();
-        match *sv {
-            Some(s) => unsafe {
-                let clip: *mut AnyObject = msg_send![s.0, contentView];
-                if clip.is_null() {
-                    0.0
-                } else {
-                    let b: NSRect = msg_send![clip, bounds];
-                    b.origin.y
-                }
-            },
-            None => 0.0,
-        }
-    };
-    Some(picker.origin.y + picker.size.height - (row_flipped - scroll_offset))
-}
-
-/// 详情打开时,列表滚动会移动选中行 → 重算对齐位置并 setFrame(只移动,不重建内容)。
-/// 挂在 clipView 的 bounds 变化通知上;rebuild_rows 期间跳过——其末尾的滚动恢复会
-/// 同步触发通知,而那时 ROW_PITCHES 锁仍被持有,同线程非重入锁会自死锁。
-///
-/// Reposition the detail panel while it is open when the list scrolls (the selected row
-/// moves): recompute the alignment y and setFrame only, no content rebuild. Hooked onto
-/// the clip-view bounds-change notification; skipped during rebuild_rows -- its trailing
-/// scroll restore fires the notification synchronously while ROW_PITCHES is still held,
-/// and locking it here would self-deadlock on the same non-reentrant mutex.
-fn reposition_detail() {
-    if !detail_visible() || REBUILDING.load(Ordering::SeqCst) {
-        return;
-    }
-    unsafe {
-        let picker_win = match *PICKER_WINDOW.lock().unwrap() {
-            Some(w) => w.0,
-            None => return,
-        };
-        let detail_win = match *DETAIL_WINDOW.lock().unwrap() {
-            Some(w) => w.0,
-            None => return,
-        };
-        let pf: NSRect = msg_send![picker_win, frame];
-        let Some(align_top_y) = selected_row_screen_y(pf) else {
-            return;
-        };
-        let cf: NSRect = msg_send![detail_win, frame];
-        let sf = picker_screen_frame(picker_win);
-        let frame = detail_frame_for(pf, align_top_y, sf, cf.size.width, cf.size.height);
-        let _: () = msg_send![detail_win, setFrame: frame, display: true];
-    }
-}
-
-/// 取消尚未完成的详情收起回调,保证快速重新打开时旧回调不会隐藏新面板。
-/// Cancel a pending detail-close callback so a quick reopen cannot hide the new panel.
-unsafe fn cancel_detail_close(window: *mut AnyObject) {
-    let _: () = msg_send![
-        class!(NSObject),
-        cancelPreviousPerformRequestsWithTarget: window,
-        selector: sel!(finishDetailClose:),
-        object: std::ptr::null::<AnyObject>()
-    ];
-}
-
-/// 在已有详情内容上播放轻量的横向滑入/滑出,不重建视图或图片。
-/// Animate the existing detail content horizontally without rebuilding views or images.
-unsafe fn animate_detail_content(content: *mut AnyObject, opening: bool) {
-    let _: () = msg_send![content, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![content, layer];
-    if layer.is_null() {
-        return;
-    }
-
-    let transform_key = make_nsstring("transform.translation.x");
-    let opacity_key = make_nsstring("opacity");
-    let transform_animation_key = make_nsstring("clipboard-detail-content-slide");
-    let opacity_animation_key = make_nsstring("clipboard-detail-content-fade");
-    let _: () = msg_send![layer, removeAnimationForKey: transform_animation_key];
-    let _: () = msg_send![layer, removeAnimationForKey: opacity_animation_key];
-
-    let (from_x, to_x, from_opacity, to_opacity) = if opening {
-        (DETAIL_CONTENT_ANIMATION_OFFSET, 0.0, 0.0f32, 1.0f32)
-    } else {
-        (0.0, DETAIL_CONTENT_ANIMATION_OFFSET, 1.0f32, 0.0f32)
-    };
-    let from_x_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from_x];
-    let to_x_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: to_x];
-    let _: () = msg_send![layer, setValue: from_x_value, forKeyPath: transform_key];
-    let _: () = msg_send![layer, setOpacity: from_opacity];
-
-    let transform_animation: *mut AnyObject = msg_send![
-        class!(CABasicAnimation),
-        animationWithKeyPath: transform_key
-    ];
-    let _: () = msg_send![transform_animation, setFromValue: from_x_value];
-    let _: () = msg_send![transform_animation, setToValue: to_x_value];
-    let _: () = msg_send![
-        transform_animation,
-        setDuration: DETAIL_PANEL_ANIMATION_DURATION
-    ];
-
-    let from_opacity_value: *mut AnyObject =
-        msg_send![class!(NSNumber), numberWithFloat: from_opacity];
-    let to_opacity_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithFloat: to_opacity];
-    let opacity_animation: *mut AnyObject = msg_send![
-        class!(CABasicAnimation),
-        animationWithKeyPath: opacity_key
-    ];
-    let _: () = msg_send![opacity_animation, setFromValue: from_opacity_value];
-    let _: () = msg_send![opacity_animation, setToValue: to_opacity_value];
-    let _: () = msg_send![
-        opacity_animation,
-        setDuration: DETAIL_PANEL_ANIMATION_DURATION
-    ];
-
-    // 先提交最终模型值,再挂载显式动画,避免动画结束时图层闪回起点。
-    // Commit final model values before adding explicit animations so the layer does not snap
-    // back to its starting point when Core Animation removes them.
-    let _: () = msg_send![layer, setValue: to_x_value, forKeyPath: transform_key];
-    let _: () = msg_send![layer, setOpacity: to_opacity];
-    let _: () =
-        msg_send![layer, addAnimation: transform_animation, forKey: transform_animation_key];
-    let _: () = msg_send![layer, addAnimation: opacity_animation, forKey: opacity_animation_key];
-
-    CFRelease(transform_key as *const c_void);
-    CFRelease(opacity_key as *const c_void);
-    CFRelease(transform_animation_key as *const c_void);
-    CFRelease(opacity_animation_key as *const c_void);
-}
-
-/// 详情面板打开时从一条窄面板横向展开,主浮窗同步移动到组合布局目标位置。
-/// Open the detail panel by expanding a narrow panel horizontally while the picker moves to
-/// the final combined layout.
-unsafe fn animate_detail_open(
-    picker_window: *mut AnyObject,
-    detail_window: *mut AnyObject,
-    detail_content: *mut AnyObject,
-    target_picker_frame: NSRect,
-    target_detail_frame: NSRect,
-) {
-    let collapsed_frame = NSRect::new(
-        target_detail_frame.origin,
-        NSSize::new(1.0, target_detail_frame.size.height),
-    );
-    let _: () = msg_send![detail_window, setFrame: collapsed_frame, display: false];
-    let _: () = msg_send![detail_window, setAlphaValue: 0.0f64];
-    let _: () = msg_send![detail_window, orderFrontRegardless];
-
-    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
-    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![context, setDuration: DETAIL_PANEL_ANIMATION_DURATION];
-    let timing_name = make_nsstring("easeOut");
-    let timing: *mut AnyObject =
-        msg_send![class!(CAMediaTimingFunction), functionWithName: timing_name];
-    if !timing.is_null() {
-        let _: () = msg_send![context, setTimingFunction: timing];
-    }
-    CFRelease(timing_name as *const c_void);
-
-    let picker_animator: *mut AnyObject = msg_send![picker_window, animator];
-    let _: () = msg_send![picker_animator, setFrame: target_picker_frame, display: true];
-    let detail_animator: *mut AnyObject = msg_send![detail_window, animator];
-    let _: () = msg_send![detail_animator, setFrame: target_detail_frame, display: true];
-    let _: () = msg_send![detail_animator, setAlphaValue: 1.0f64];
-    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
-
-    animate_detail_content(detail_content, true);
-}
-
-/// 详情面板关闭时收窄到一条细线并淡出,完成后再 orderOut。
-/// Close the detail panel by shrinking it to a sliver and fading it out before orderOut.
-unsafe fn animate_detail_close(
-    picker_window: *mut AnyObject,
-    detail_window: *mut AnyObject,
-    detail_content: *mut AnyObject,
-    restored_picker_frame: Option<NSRect>,
-) {
-    let current_detail_frame: NSRect = msg_send![detail_window, frame];
-    let collapsed_frame = NSRect::new(
-        current_detail_frame.origin,
-        NSSize::new(1.0, current_detail_frame.size.height),
-    );
-
-    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
-    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![context, setDuration: DETAIL_PANEL_ANIMATION_DURATION];
-    let timing_name = make_nsstring("easeInEaseOut");
-    let timing: *mut AnyObject =
-        msg_send![class!(CAMediaTimingFunction), functionWithName: timing_name];
-    if !timing.is_null() {
-        let _: () = msg_send![context, setTimingFunction: timing];
-    }
-    CFRelease(timing_name as *const c_void);
-
-    if let Some(frame) = restored_picker_frame {
-        let picker_animator: *mut AnyObject = msg_send![picker_window, animator];
-        let _: () = msg_send![picker_animator, setFrame: frame, display: true];
-    }
-    let detail_animator: *mut AnyObject = msg_send![detail_window, animator];
-    let _: () = msg_send![detail_animator, setFrame: collapsed_frame, display: true];
-    let _: () = msg_send![detail_animator, setAlphaValue: 0.0f64];
-    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
-
-    animate_detail_content(detail_content, false);
-    let _: () = msg_send![
-        detail_window,
-        performSelector: sel!(finishDetailClose:),
-        withObject: std::ptr::null::<AnyObject>(),
-        afterDelay: DETAIL_PANEL_ANIMATION_DURATION
-    ];
-}
-
-/// 收起动画结束后隐藏详情窗口;若期间重新打开,可见标记会阻止旧回调误隐藏新面板。
-/// Hide the detail window after the close animation; reopening during the delay keeps the old
-/// callback from hiding the new panel.
-extern "C" fn detail_finish_close(this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    if detail_visible() {
-        return;
-    }
-    unsafe {
-        let window = this as *mut AnyObject;
-        let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
-        let _: () = msg_send![window, setAlphaValue: 1.0f64];
-    }
-}
-
-/// Toggle the picker on Option+V (called on the main thread by the bridge).
-pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    // 总开关关闭时忽略呼出(设置里关闭后 Option+V 不应再显示浮窗)。
-    // Ignore the summon when the master switch is off (Option+V must not open the picker
-    // after the user disabled the feature in Settings).
-    if !CONFIG.read().unwrap().clipboard.enabled {
-        log_debug!("[clip] toggle ignored: clipboard history disabled");
-        return;
-    }
-    if PICKER_VISIBLE.load(Ordering::SeqCst) {
-        hide_picker();
-        return;
-    }
-    // 历史为空也显示浮窗(空状态提示,见 rebuild_rows 的空分支)。
-    // Show the picker even with an empty history (the empty-state hint lives in
-    // rebuild_rows' empty branch).
-    set_picker_selection(0);
-    show_picker();
-}
-
-/// 显示浮窗(构建一次,复用;窗口高度随可视行数动态调整)。
-/// Show the picker (built once, reused; the window height follows the visible row count).
-fn show_picker() {
-    unsafe {
-        let show_started = Instant::now();
-        // 每次重新呼出都从无悬停开始;旧行已被移除,不能让旧索引污染新列表。
-        // Start each summon without a hovered row; the old rows are gone, so their index must
-        // never leak into the rebuilt list.
-        *HOVER_ROW.lock().unwrap() = NO_SELECTION;
-        // 呼出前清理过期条目(长时间不复制时,历史里的过期条目在此清除;rebuild_rows
-        // 随后按新列表渲染)。置顶条目不参与过期。
-        // Expire before summon (entries that aged out while the user wasn't copying are
-        // removed here; rebuild_rows renders the fresh list). Pinned never expire.
-        {
-            let mut hist = CLIP_HISTORY.lock().unwrap();
-            let removed = expire_entries(&mut hist, now_secs(), ttl_secs());
-            if removed > 0 {
-                log_debug!("[clip] show picker: expired {} entries", removed);
-            }
-        }
-        let ensure_started = Instant::now();
-        ensure_picker_window();
-        let ensure_window_ms = ensure_started.elapsed().as_millis();
-        // 每次呼出重置搜索(干净起点);上次遗留的详情浮窗一并收起。
-        // Reset the search on every summon (a clean slate); a stale detail panel goes too.
-        hide_detail();
-        clear_search();
-        let window = match *PICKER_WINDOW.lock().unwrap() {
-            Some(w) => w.0,
-            None => return,
-        };
-        let filter = *CLIP_FILTER.lock().unwrap();
-        let show_source = show_source_app();
-        let render_key_started = Instant::now();
-        let render_key = picker_rows_key(history_revision(), "", filter, show_source);
-        let render_key_ms = render_key_started.elapsed().as_millis();
-        let rows_ready = with_clipboard_ui(|ui| {
-            ui.rendered_rows
-                .as_ref()
-                .is_some_and(|key| key == &render_key)
-        });
-        let hist_len = CLIP_HISTORY.lock().unwrap().len();
-        log_debug!("[clip] show picker: history={} entries", hist_len);
-
-        let frame_started = Instant::now();
-        // 窗口高度 = 上下留白 + 可视行的行距之和(行距由各条文本的换行行数决定)。
-        // Window height = paddings + the sum of the visible rows' pitches (each pitch follows
-        // the entry's wrapped line count).
-        let pitches = {
-            let hist = CLIP_HISTORY.lock().unwrap();
-            compute_pitches(&hist)
-        };
-        // 先解析定位模式:跟随鼠标(mouse)用光标所在屏,follow;居中(main)用主屏并
-        // 在正中显示(高度上限也按主屏算)。
-        // Resolve the position mode first: "mouse" follows the cursor on its screen;
-        // "main" centers the picker on the main screen (the height cap uses that screen
-        // too).
-        let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-        let picker_pos = CONFIG.read().unwrap().clipboard.picker_position.clone();
-        let center_on_main = picker_pos == "main";
-        let main_screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-        let main_frame: NSRect = msg_send![main_screen, visibleFrame];
-        let screen_frame = if center_on_main {
-            main_frame
-        } else {
-            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-            let count: usize = msg_send![screens, count];
-            let mut frames: Vec<NSRect> = Vec::with_capacity(count);
-            for i in 0..count {
-                // objectAtIndex: 的参数编码是 'q'(signed long),必须传 isize。
-                // objectAtIndex: expects 'q' (signed long); pass isize.
-                let s: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
-                frames.push(msg_send![s, visibleFrame]);
-            }
-            screen_containing(cursor, &frames).unwrap_or(main_frame)
-        };
-
-        // 最大高度:640pt 硬上限,小屏再收缩(留 120pt 给菜单栏/光标偏移/边缘余量)。
-        // Max height: the 640pt hard cap, shrunk on small screens (120pt kept for the menu
-        // bar / cursor offset / edge margins).
-        let max_h = PICKER_MAX_HEIGHT.min(screen_frame.size.height - 120.0);
-        // 可视行数由高度上限倒推,取整行(窗口底部不出现半截行)。
-        // 估算行距用"无分组头的常规行距"(首行带 26pt 分组头,直接用它会低估密度)。
-        // 窗口总高 = 头部条 + 列表 + 底部留白,所以列表高度预算 = max_h - 头部条 - 留白。
-        // The visible row count derives from the height cap, floored to whole rows (no
-        // half-cut row at the window's bottom). The estimate uses the plain (header-less)
-        // row pitch -- the first row carries a 26pt group header, which would undercount.
-        // The window height = the strip + the list + the bottom padding, so the list's
-        // budget = max_h - strip - padding.
-        // 行距统一 61pt(ROW_H);窗口总高 = 头部条 + 列表 + 底部栏 + 留白。
-        // Rows are a uniform 61pt (ROW_H); the window height = the header + the list +
-        // the footer + padding.
-        let visible = if hist_len == 0 {
-            0
-        } else {
-            (((max_h - header_strip_h() - FOOTER_H - PAD_Y) / ROW_H).floor() as usize)
-                .min(hist_len)
-                .max(1)
-        };
-        // 空历史时列表区高度 = 一条提示行的高度。
-        // With an empty history the list area is one hint row tall.
-        let list_h = if hist_len == 0 {
-            40.0
-        } else {
-            pitches.iter().take(visible).sum::<f64>()
-        };
-        // 最小高度统一按三条记录的视觉空间兜底,即使只有一条或没有记录也不变矮。
-        // Use the same three-record visual minimum for every state, including one or zero rows.
-        let h = (header_strip_h() + list_h + FOOTER_H + PAD_Y).max(picker_min_height());
-
-        let frame = if center_on_main {
-            // 始终在主屏幕正中间(设计稿 .window 居中展示);不翻转。
-            // Always centered on the main screen; no flip/clamp.
-            NSRect::new(
-                NSPoint::new(
-                    main_frame.origin.x + (main_frame.size.width - PICKER_W) / 2.0,
-                    main_frame.origin.y + (main_frame.size.height - h) / 2.0,
-                ),
-                NSSize::new(PICKER_W, h),
-            )
-        } else {
-            picker_frame_for(cursor, screen_frame, PICKER_W, h)
-        };
-        log_debug!(
-            "[clip] picker frame: ({:.0},{:.0}) {}x{} on screen ({:.0},{:.0}) mode={}",
-            frame.origin.x,
-            frame.origin.y,
-            frame.size.width,
-            frame.size.height,
-            screen_frame.origin.x,
-            screen_frame.origin.y,
-            center_on_main
-        );
-        let _: () = msg_send![window, setFrame: frame, display: true];
-        let frame_ms = frame_started.elapsed().as_millis();
-
-        let render_summary = if rows_ready {
-            log_debug!("[clip] picker rows reused");
-            let cached = with_clipboard_ui(|ui| ui.last_rebuild_timing);
-            cached.map(|cached| PickerTimingSummary {
-                // 复用行在本次呼出中没有重建;只保留当前缓存视图的数量,不复用上次重建的耗时。
-                // Reused rows were not rebuilt during this summon; retain only the counts of
-                // the currently cached view, not the previous rebuild's timing measurements.
-                elapsed_ms: 0,
-                history_len: cached.history_len,
-                filtered_len: cached.filtered_len,
-                image_rows: cached.image_rows,
-                code_rows: cached.code_rows,
-                empty: cached.empty,
-                ..PickerTimingSummary::default()
-            })
-        } else {
-            // 数据模型可能刚刚在后台监听线程更新;在显示前补齐长驻行树,避免先露出
-            // 旧列表或空白列表。行树已经在启动和每次历史变化后预热,这里只是竞态兜底。
-            // The model may have just changed on the pasteboard-monitor path; finish the
-            // long-lived row tree before showing it, so stale or empty rows never flash.
-            // The tree is warmed at startup and after every history change; this is only a
-            // race fallback.
-            rebuild_rows()
-        };
-        // 每次呼出滚动到顶部(最新条目)。
-        // Scroll to the top on every summon (the newest entry).
-        let display_prep_started = Instant::now();
-        if let Some(container) = picker_container_ptr() {
-            let _: () = msg_send![container, scrollPoint: NSPoint::new(0.0, 0.0)];
-        }
-        // 隐藏期间可能保留了底部视口的物理槽位;回到顶部后补齐顶部可视行。
-        // Hidden refreshes may leave physical slots for the old bottom viewport; materialize
-        // the top viewport after resetting the scroll position.
-        if picker_materialized_range_changed() {
-            rebuild_rows();
-        }
-        // 首次呼出即更新滚动指示器(内容溢出时右侧立即显示,不必等滚动触发)。
-        // Update the scroll indicator right on the first summon (shown immediately when the
-        // content overflows, not only after scrolling).
-        update_scroll_indicator();
-        // 启动时和隐藏期间的行树可能尚未进入 backing store;先在不可见状态完成绘制,避免
-        // orderFrontRegardless 在首次展示时同步承担整棵玻璃视图的绘制成本。
-        // The row tree may not yet be in the backing store after startup or a hidden refresh;
-        // draw it before ordering front so the first presentation does not pay that cost.
-        let _: () = msg_send![window, displayIfNeeded];
-        let display_prep_ms = display_prep_started.elapsed().as_millis();
-        let order_front_started = Instant::now();
-        let order_front_call_started = Instant::now();
-        let _: () = msg_send![window, orderFrontRegardless];
-        let order_front_call_ms = order_front_call_started.elapsed().as_millis();
-        let make_key_window_started = Instant::now();
-        let _: () = msg_send![window, makeKeyWindow];
-        let make_key_window_ms = make_key_window_started.elapsed().as_millis();
-        // 键盘焦点给容器(方向键/Enter/Esc)。
-        // Keyboard focus to the container (arrows / Enter / Esc).
-        let first_responder_lock_started = Instant::now();
-        let container = picker_container_ptr();
-        let first_responder_lock_ms = first_responder_lock_started.elapsed().as_millis();
-        let mut make_first_responder_ms = 0;
-        if let Some(c) = container {
-            // makeFirstResponder: 返回 BOOL('B')。
-            // makeFirstResponder: returns BOOL ('B').
-            let make_first_responder_started = Instant::now();
-            let _: bool = msg_send![window, makeFirstResponder: c];
-            make_first_responder_ms = make_first_responder_started.elapsed().as_millis();
-        }
-        let visible_store_started = Instant::now();
-        PICKER_VISIBLE.store(true, Ordering::SeqCst);
-        let visible_store_ms = visible_store_started.elapsed().as_millis();
-        let order_front_ms = order_front_started.elapsed().as_millis();
-        let order_front_residual_ms = order_front_ms.saturating_sub(
-            order_front_call_ms
-                + make_key_window_ms
-                + first_responder_lock_ms
-                + make_first_responder_ms
-                + visible_store_ms,
-        );
-
-        let elapsed_ms = show_started.elapsed().as_millis();
-        if elapsed_ms >= CLIPBOARD_SLOW_PATH_MS {
-            let filtered_len = with_clipboard_ui(|ui| ui.filtered.len());
-            let summary = render_summary.unwrap_or(PickerTimingSummary {
-                history_len: hist_len,
-                filtered_len,
-                empty: filtered_len == 0,
-                ..PickerTimingSummary::default()
-            });
-            let slowest_row_index = summary
-                .slowest_row_index
-                .map_or_else(|| "none".to_owned(), |index| index.to_string());
-            log_debug!(
-                "[clip] picker_show_slow elapsed_ms={} ensure_window_ms={} render_key_ms={} frame_ms={} rebuild_rows_ms={} display_prep_ms={} order_front_ms={} order_front_call_ms={} make_key_window_ms={} first_responder_lock_ms={} make_first_responder_ms={} visible_store_ms={} order_front_residual_ms={} history_len={} filtered_len={} image_rows={} code_rows={} counts_scope={} reused={} empty={} slowest_row_ms={} slowest_row_index={}",
-                elapsed_ms,
-                ensure_window_ms,
-                render_key_ms,
-                frame_ms,
-                summary.elapsed_ms,
-                display_prep_ms,
-                order_front_ms,
-                order_front_call_ms,
-                make_key_window_ms,
-                first_responder_lock_ms,
-                make_first_responder_ms,
-                visible_store_ms,
-                order_front_residual_ms,
-                summary.history_len,
-                summary.filtered_len,
-                summary.image_rows,
-                summary.code_rows,
-                if rows_ready { "cached_view" } else { "rebuilt_view" },
-                rows_ready,
-                summary.empty,
-                summary.slowest_row_ms,
-                slowest_row_index,
-            );
-        }
-    }
-}
-
-/// 隐藏浮窗。/ Hide the picker.
-fn hide_picker() {
-    PICKER_VISIBLE.store(false, Ordering::SeqCst);
-    set_clear_history_confirmation_expanded(false);
-    *SCROLL_DRAG.lock().unwrap() = None;
-    // 隐藏时不会可靠地为每个子按钮派发 mouseExited;显式清掉行悬停状态。
-    // Hiding does not reliably deliver mouseExited to every child button; clear the row hover
-    // state explicitly.
-    *HOVER_ROW.lock().unwrap() = NO_SELECTION;
-    hide_detail();
-
-    // 锁内只取指针,orderOut 放到锁外:orderOut 会同步触发 NSWindowDidResignKeyNotification,
-    // 回调再进 hide_picker 并锁同一把 Mutex——非重入锁会自死锁(曾导致进程挂起)。
-    // Take the pointer under the lock but orderOut outside it: orderOut synchronously fires
-    // NSWindowDidResignKeyNotification, whose callback re-enters hide_picker and locks the
-    // same non-reentrant Mutex -- a self-deadlock (the process used to hang).
-    let win = *PICKER_WINDOW.lock().unwrap();
-    unsafe {
-        if let Some(w) = win {
-            let _: () = msg_send![w.0, orderOut: std::ptr::null::<AnyObject>()];
-        }
-    }
-}
-
-/// 隐藏详情浮窗(幂等;详情面板从不成为 key,orderOut 不会触发 resign-key 通知,
-/// 但沿用"锁内取指针、锁外 orderOut"的纪律)。/ Hide the detail panel (idempotent; the
-/// panel never becomes key so orderOut fires no resign-key notification, but the
-/// pointer-outside-the-lock discipline is kept anyway).
-fn hide_detail() {
-    if !take_detail_visible() {
-        return;
-    }
-    // 关闭后撤掉对应行的实心详情图标,无需重建整个列表。
-    // Remove the source row's filled detail icon on close without rebuilding the list.
-    refresh_detail_action_visuals();
-    // 详情打开期间主浮窗为了整体布局可能被左移;关闭时恢复原始位置,但保留当前高度。
-    // The picker may have shifted left for the combined layout; restore its original origin
-    // while preserving its current height.
-    let original_origin = DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap().take();
-    // 面板关闭后旧内容视图会被移除,文本视图指针必须一并清空(防 Cmd+C 悬空)。
-    // The content views get removed once the panel hides; clear the text-view pointer so
-    // Cmd+C never dereferences a dangling one.
-    *DETAIL_TEXT_VIEW.lock().unwrap() = None;
-    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = None;
-    *DETAIL_SOURCE_MAP.lock().unwrap() = None;
-    let win = *DETAIL_WINDOW.lock().unwrap();
-    let content = *DETAIL_CONTENT.lock().unwrap();
-    unsafe {
-        if let (Some(w), Some(picker), Some(content)) =
-            (win, *PICKER_WINDOW.lock().unwrap(), content)
-        {
-            // 面板隐藏时若光标仍停在文本上,显式恢复箭头(cursor region 只在鼠标
-            // 移动时重算,这里兜底);光标在别处则不动,避免踩掉搜索框自身的 I-beam。
-            // If the cursor still sits on the text as the panel hides, restore the arrow
-            // explicitly (cursor regions re-evaluate only on mouse movement); skip when
-            // the cursor is elsewhere so the search field's own I-beam is never clobbered.
-            let loc: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-            let f: NSRect = msg_send![w.0, frame];
-            if f.origin.x <= loc.x
-                && loc.x <= f.origin.x + f.size.width
-                && f.origin.y <= loc.y
-                && loc.y <= f.origin.y + f.size.height
-            {
-                let arrow: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
-                let _: () = msg_send![arrow, set];
-            }
-            let current_picker: NSRect = msg_send![picker.0, frame];
-            let restored_picker =
-                original_origin.map(|origin| NSRect::new(origin, current_picker.size));
-            cancel_detail_close(w.0);
-            animate_detail_close(picker.0, w.0, content.0, restored_picker);
-        } else if let Some(w) = win {
-            cancel_detail_close(w.0);
-            let _: () = msg_send![w.0, orderOut: std::ptr::null::<AnyObject>()];
-        }
-    }
-}
-
-/// 构建详情浮窗窗口(一次):Nonactivating NSPanel + 与主浮窗同款玻璃背景。
-/// **关键**:重写 canBecomeKeyWindow = NO,面板不会成为 key——键盘焦点始终留在
-/// 主浮窗容器(↑/↓/←/→/Enter/Esc 全部继续走 container_key_down),详情只是被动展示。
-///
-/// Build the detail panel window (once): a Nonactivating NSPanel with the same glass
-/// backdrop as the picker. KEY: canBecomeKeyWindow is overridden to NO, so the panel never
-/// becomes key -- keyboard focus stays in the picker's container (all keys keep going
-/// through container_key_down); the detail is a passive display only.
-unsafe fn ensure_detail_window() {
-    if DETAIL_WINDOW.lock().unwrap().is_some() {
-        return;
-    }
-    let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-    let screen_frame: NSRect = msg_send![screen, visibleFrame];
-    let w = DETAIL_MAX_W;
-    let h = (screen_frame.size.height - DETAIL_SCREEN_MARGIN * 2.0).max(DETAIL_PANEL_MIN_H);
-    let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
-    let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
-    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
-
-    // 与主浮窗同款:NSWindowStyleMaskNonactivatingPanel(1<<7),不激活所属 app。
-    // Same as the picker: NSWindowStyleMaskNonactivatingPanel (1<<7), no app activation.
-    let style: u64 = 1 << 7;
-
-    let window_cls = {
-        let name = CString::new("OhMyTabClipDetailWindow").unwrap();
-        let superclass = class!(NSPanel) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_bool = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(canBecomeKeyWindow),
-            detail_window_can_not_become_key as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        let types_finish = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(finishDetailClose:),
-            detail_finish_close as *mut c_void,
-            types_finish.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls
-    };
-    let window: *mut AnyObject = msg_send![window_cls, alloc];
-    let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
-    apply_panel_appearance(window);
-    let _: () = msg_send![window, setLevel: 3u64];
-    let _: () = msg_send![window, setOpaque: false];
-    let _: () = msg_send![window, setReleasedWhenClosed: false];
-    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-    let _: () = msg_send![window, setBackgroundColor: clear];
-    let _: () = msg_send![window, setHasShadow: false];
-
-    // --- 玻璃背景(Liquid Glass),与主浮窗同款 ---
-    // Glass backdrop (Liquid Glass), same as the picker.
-    let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
-
-    let content_parent: *mut AnyObject;
-    if is_macos_26 {
-        let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
-        let glass: *mut AnyObject = msg_send![glass_cls, alloc];
-        let glass: *mut AnyObject =
-            msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        // NSGlassEffectView 的圆角会参与玻璃材质着色;必须和主浮窗保持相同值。其
-        // 自身 layer 随后负责硬裁剪,避免模糊越出边缘。
-        // NSGlassEffectView's corner radius participates in the glass-material rendering, so
-        // it must match the picker. Its own layer hard-clips afterward to prevent blur leaks.
-        let _: () = msg_send![glass, setCornerRadius: CORNER_R];
-        let style_i: i64 = match crate::config::effective_glass_style().as_str() {
-            "clear" => 1,
-            _ => 0,
-        };
-        let _: () = msg_send![glass, setStyle: style_i];
-        let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
-        let tint = crate::ffi::hex_to_ns_color(tint_hex);
-        let _: () = msg_send![glass, setTintColor: tint];
-        let _: () = msg_send![glass, setAutoresizingMask: 18u64];
-        // 详情直接采用主浮窗的 contentView 层级;额外的 clip 容器会改变 Liquid
-        // Glass 的合成效果,使其看起来像选中条目的深色背景。
-        // Use the picker's contentView hierarchy directly. An extra clip container changes
-        // Liquid Glass compositing and makes it resemble a selected row's darker backdrop.
-        let _: () = msg_send![window, setContentView: glass];
-        let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let inner: *mut AnyObject =
-            msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        let _: () = msg_send![inner, setAutoresizingMask: 18u64];
-        // 详情面板不能成为 key,系统因而压暗其 Glass。颜色取同一配置 tint,仅提高
-        // alpha 作为底色补偿,而不是借用选中行的深色 tile。
-        // The detail panel cannot become key, so the system darkens its Glass. Reuse the same
-        // configured tint with a higher alpha as base-surface compensation, never the selected
-        // row's dark tile.
-        let fill: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let fill: *mut AnyObject = msg_send![
-            fill,
-            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
-        ];
-        let _: () = msg_send![fill, setWantsLayer: true];
-        let fill_layer: *mut AnyObject = msg_send![fill, layer];
-        let compensation_hex = (tint_hex & 0xFFFF_FF00) | DETAIL_INACTIVE_GLASS_COMPENSATION_A;
-        crate::ffi::layer_set_background(fill_layer, crate::ffi::hex_to_cg_color(compensation_hex));
-        *DETAIL_GLASS_FILL_LAYER.lock().unwrap() = Some(ObjPtr::new(fill_layer));
-        let _: () = msg_send![fill, setAutoresizingMask: 18u64];
-        let _: () = msg_send![inner, addSubview: fill];
-        release_obj(fill);
-        let _: () = msg_send![glass, setContentView: inner];
-        // 与主浮窗完全一致的硬裁剪:玻璃材质本身控制圆角,layer 仅防止模糊越出边缘。
-        // Same hard clipping as the picker: the glass material owns the corner while the
-        // layer only prevents blur from leaking beyond it.
-        let _: () = msg_send![glass, setWantsLayer: true];
-        let glass_layer: *mut AnyObject = msg_send![glass, layer];
-        if !glass_layer.is_null() {
-            let _: () = msg_send![glass_layer, setCornerRadius: CORNER_R];
-            let _: () = msg_send![glass_layer, setMasksToBounds: true];
-        }
-        *DETAIL_GLASS.lock().unwrap() = Some(ObjPtr::new(glass));
-        release_obj(glass);
-        content_parent = inner;
-    } else {
-        let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-        let ve: *mut AnyObject =
-            msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        let _: () = msg_send![ve, setBlendingMode: 1u64]; // WithinWindow
-        let _: () = msg_send![ve, setMaterial: 12u64]; // Dark
-        let _: () = msg_send![ve, setState: 1u64]; // Active
-        let _: () = msg_send![ve, setAutoresizingMask: 18u64];
-        let content: *mut AnyObject = msg_send![window, contentView];
-        let _: () = msg_send![content, addSubview: ve];
-        content_parent = ve;
-    }
-
-    // 内容容器 flipped,内容从顶部排起。详情正文可选中,且图片也不应因一次普通点击
-    // 被关闭;关闭统一交给 Esc/←/→ 或列表操作。
-    // The content container is flipped and top-aligned. Detail text is selectable, and an
-    // ordinary image click must not dismiss the panel either; Esc/←/→ or list actions close it.
-    let content = {
-        let name = CString::new("OhMyTabClipDetailContent").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_v = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(mouseDown:),
-            detail_content_mouse_down as *mut c_void,
-            types_v.as_ptr(),
-        );
-        let types_bool = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(isFlipped),
-            detail_content_is_flipped as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        let content: *mut AnyObject = msg_send![cls, alloc];
-        let content: *mut AnyObject = msg_send![
-            content,
-            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
-        ];
-        let _: () = msg_send![content, setWantsLayer: true];
-        let _: () = msg_send![content, setAutoresizingMask: 18u64];
-        let _: () = msg_send![content_parent, addSubview: content];
-        release_obj(content);
-        content
-    };
-
-    *DETAIL_CONTENT.lock().unwrap() = Some(ObjPtr::new(content));
-    *DETAIL_WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
-}
-
-/// 详情面板不会成为 key(键盘焦点保持留在主浮窗容器)。
-/// The detail panel never becomes key (keyboard focus stays in the picker's container).
-extern "C" fn detail_window_can_not_become_key(_self: *mut c_void, _cmd: Sel) -> bool {
-    false
-}
-
-/// 内容容器 flipped。 / The content container is flipped.
-extern "C" fn detail_content_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
-}
-
-/// 吞掉详情容器的普通点击:文本 NSTextView 本来会消费点击以支持选择,图片则会落到
-/// 容器;两种内容必须保持一致,不能因查看图片而意外关闭详情。
-/// Consume ordinary clicks on the detail container. NSTextView already consumes clicks for
-/// selection, whereas image clicks reach the container; both content kinds must behave alike
-/// and never accidentally dismiss the detail panel.
-extern "C" fn detail_content_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {}
-
-/// 切换代码详情软换行并原位重建;新滚动视图会自然把水平位置复位到左端。
-/// Toggle code-detail soft wrapping and rebuild in place; the new scroll view naturally resets
-/// its horizontal position to the leading edge.
-extern "C" fn toggle_detail_soft_wrap(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
-    DETAIL_SOFT_WRAP_ENABLED.fetch_xor(true, Ordering::SeqCst);
-    unsafe { show_detail_for_sel() };
-}
-
-/// 分享入口的占位 action;按钮当前只提供视觉与悬停反馈。
-/// Placeholder share action; the button currently provides visual and hover feedback only.
-/// UTI → 常见图片扩展名(未知回落 png)。
-/// Map a UTI to a common image file extension (png fallback).
-fn ext_for_image_uti(uti: &str) -> &'static str {
-    let u = uti.to_ascii_lowercase();
-    if u.contains("jpeg") {
-        "jpg"
-    } else if u.contains("gif") {
-        "gif"
-    } else if u.contains("heic") || u.contains("heif") {
-        "heic"
-    } else if u.contains("tiff") {
-        "tif"
-    } else if u.contains("webp") {
-        "webp"
-    } else if u.contains("bmp") {
-        "bmp"
-    } else {
-        "png"
-    }
-}
-
-/// 弹出 NSSavePanel(runModal),返回选中的文件系统路径;取消返回 None。
-unsafe fn run_save_panel(suggested_name: &str) -> Option<String> {
-    // 包一层池子统一回收本次调用产生的临时对象(runModal 嵌套事件循环里的
-    // autoreleased 对象由 AppKit 自己的池子管理,互不干扰)。
-    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-    // Wrap in a pool to reclaim temporaries; objects autoreleased inside runModal's
-    // nested event loop are managed by AppKit's own pools and stay untouched.
-    let panel: *mut AnyObject = msg_send![class!(NSSavePanel), savePanel];
-    let name_ns = make_nsstring(suggested_name);
-    let _: () = msg_send![panel, setNameFieldStringValue: name_ns];
-    CFRelease(name_ns as *const c_void);
-    let resp: isize = msg_send![panel, runModal]; // NSModalResponseOK == 1
-    let result = if resp == 1 {
-        // URL/path 都是属性 getter,按 Cocoa 惯例返回 +0(autoreleased),已挂进上面的
-        // 池子——**不应**再手动 release:提前归零会立即析构,drain 时对悬垂指针再发
-        // release 直接 SIGSEGV(与 stringForType: 处同口径)。
-        // URL/path come from property getters that return +0 (autoreleased) per Cocoa
-        // convention and are registered in the pool above -- NEVER release them manually:
-        // an early zero refcount deallocs the object now, and drain then sends -release
-        // to dangling pointers (SIGSEGV). Same rule as the stringForType: call sites.
-        let url: *mut AnyObject = msg_send![panel, URL];
-        if !url.is_null() {
-            let path_ns: *mut AnyObject = msg_send![url, path];
-            let path = nsstring_to_rust(path_ns);
-            (!path.is_empty()).then_some(path)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let _: () = msg_send![pool, drain];
-    result
-}
-
-/// 另存为落盘:文本条目写 .txt;图片条目按 数据缓存原始字节 → 源文件字节 →
-/// 预览 PNG 兜底 的顺序取内容(扩展名随来源变化)。
-unsafe fn run_detail_save_as(entry: &ClipEntry) {
-    match &entry.image {
-        Some(img) => {
-            // 内容优先级:数据缓存原始字节 > 文件复制条目的源文件 > 预览 PNG。
-            let (bytes, ext): (Vec<u8>, &'static str) =
-                if img.data_path.as_os_str().is_empty() && img.source_path.is_none() {
-                    match cache_read_preview(img.hash) {
-                        Some(preview) => (preview, "png"),
-                        None => {
-                            log_info!("[clip] save-as image failed: no cached bytes");
-                            return;
-                        }
-                    }
-                } else {
-                    let raw = img
-                        .source_path
-                        .as_deref()
-                        .and_then(|p| std::fs::read(p).ok())
-                        .or_else(|| cache_read_image(img.hash));
-                    match raw {
-                        Some(data) => (data, ext_for_image_uti(&img.uti)),
-                        None => match cache_read_preview(img.hash) {
-                            Some(preview) => (preview, "png"),
-                            None => {
-                                log_info!("[clip] save-as image failed: source unreadable");
-                                return;
-                            }
-                        },
-                    }
-                };
-            // 建议文件名带条目的复制时间戳(非保存时刻):"Clipboard Image 2026-08-23 08.31.42.png"。
-            // The suggested filename carries the entry's COPY timestamp (not the save
-            // moment): "Clipboard Image 2026-08-23 08.31.42.png".
-            let stamp = save_stamp_for(entry);
-            let suggested = format!(
-                "{} {stamp}.{ext}",
-                t("clipboard.detail_save_image_name"),
-                ext = ext
-            );
-            let Some(dest) = run_save_panel(&suggested) else {
-                return;
-            };
-            match std::fs::write(&dest, &bytes) {
-                Ok(()) => log_debug!("[clip] image saved to {dest}"),
-                Err(e) => log_info!("[clip] image save to {dest} failed: {e}"),
-            }
-        }
-        None => {
-            let stamp = save_stamp_for(entry);
-            let suggested = format!("{} {stamp}.txt", t("clipboard.detail_save_text_name"));
-            let Some(dest) = run_save_panel(&suggested) else {
-                return;
-            };
-            match std::fs::write(&dest, entry.text.as_bytes()) {
-                Ok(()) => log_debug!("[clip] text saved to {dest}"),
-                Err(e) => log_info!("[clip] text save to {dest} failed: {e}"),
-            }
-        }
-    }
-}
-
-/// 另存为动作:详情跟随主列表选中条目,文本写 txt、图片按来源落盘。
-extern "C" fn detail_save_as_action(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
-    let sel = picker_selection();
-    if sel == NO_SELECTION {
-        return;
-    }
-    let Some(h_idx) = mapped_index(sel) else {
-        return;
-    };
-    let Some(entry) = CLIP_HISTORY.lock().unwrap().get(h_idx).cloned() else {
-        return;
-    };
-    // 本 action 在 NSCell trackMouse 的鼠标追踪会话内被同步调用;runModal 不应
-    // 在这里启动(嵌套模态会让保存面板的文件名框拿不到键盘焦点)。存槽 + 跳下一轮
-    // runloop,追踪结束后由 detail_save_as_deferred 执行。
-    // This action is invoked synchronously inside the button's mouseDown tracking
-    // session; runModal must NOT start here (a nested modal leaves the save panel's
-    // name field without keyboard focus). Stash the entry and hop to the next runloop
-    // turn; detail_save_as_deferred runs once tracking has unwound.
-    *PENDING_SAVE_AS.lock().unwrap() = Some(entry);
-    let target = unsafe { observer() };
-    unsafe {
-        let _: () = msg_send![
-            target,
-            performSelectorOnMainThread: sel!(detailSaveAsDeferred:),
-            withObject: std::ptr::null_mut::<AnyObject>(),
-            waitUntilDone: false
-        ];
-    }
-}
-
-/// 另存为的主线程重入点(经 performSelectorOnMainThread 跳出按钮追踪循环后到达):
-/// 激活应用(accessory 态下保证面板键盘焦点),再执行落盘。
-/// Main-thread re-entry for save-as (arrives after hopping out of the button tracking
-/// loop via performSelectorOnMainThread): activate the app first (reliable panel
-/// keyboard focus in accessory mode), then run the save flow.
-extern "C" fn detail_save_as_deferred(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
-    let Some(entry) = PENDING_SAVE_AS.lock().unwrap().take() else {
-        return;
-    };
-    unsafe {
-        // accessory 应用可能处于未激活态;先激活自身,NSSavePanel 才能可靠建立 key
-        // 窗口与字段编辑器(文件名可编辑的前提)。activateIgnoringOtherApps 已废弃
-        // 但仍有效且无新替代的裸 FFI 等价物。
-        // An accessory app may be inactive; activate ourselves so the NSSavePanel can
-        // reliably establish its key window and field editor (the precondition for an
-        // editable name field). activateIgnoringOtherApps is deprecated yet still
-        // functional with no raw-FFI replacement.
-        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-        let _: () = msg_send![app, activateIgnoringOtherApps: true];
-        run_detail_save_as(&entry);
-    }
-}
-
-/// 详情高清预览生成完成的主线程回调:复核时效(详情可见 + 选中的仍是该条目),
-/// 命中则整面板重建——show_detail_for_sel 会消费 DETAIL_PENDING_HD 槽位直接用上
-/// 高清字节;过期/已关闭则丢弃槽位({hash}.detail 已落盘,下次打开走磁盘快路径)。
-/// Main-thread completion callback for a generated hi-res detail preview: re-validate
-/// freshness (detail visible AND the same entry still selected); on a hit, rebuild the
-//  whole panel -- show_detail_for_sel consumes the DETAIL_PENDING_HD slot directly. On a
-/// miss, drop the slot ({hash}.detail is already cached, so the next open takes the fast
-/// disk path).
-extern "C" fn detail_preview_ready(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
-    let job_hash = match *DETAIL_PENDING_HD.lock().unwrap() {
-        Some((h, _)) => h,
-        None => return,
-    };
-    if !detail_result_still_wanted(detail_visible(), detail_current_hash(), job_hash) {
-        // 过期:释放槽内字节(磁盘缓存已写,后续打开不依赖槽位)。
-        // Stale: release the slot bytes (the disk cache is written; later opens do not
-        // need the slot).
-        *DETAIL_PENDING_HD.lock().unwrap() = None;
-        return;
-    }
-    unsafe { show_detail_for_sel() };
-}
-
-unsafe fn add_detail_separator(content: *mut AnyObject, y: f64, width: f64) {
-    let line: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let line: *mut AnyObject = msg_send![
-        line,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, 1.0))
-    ];
-    let _: () = msg_send![line, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![line, layer];
-    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(0x0000000B));
-    let _: () = msg_send![content, addSubview: line];
-    release_obj(line);
-}
-
-unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
-    let enabled = DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
-    let share_x = width - 42.0;
-    // 详情刷新时优先保留现有开关,只有首次创建时才构造共享组件,避免动画被重建打断。
-    // Reuse the existing switch during detail refreshes and create it only once, so rebuilding
-    // the detail body cannot interrupt its animation.
-    let button = detail_wrap_button(content);
-    let newly_created = button.is_null();
-    let button = if newly_created {
-        crate::settings::make_shared_switch(
-            share_x - 8.0,
-            0.0,
-            DETAIL_TOOLBAR_H,
-            enabled,
-            observer(),
-            sel!(toggleDetailSoftWrap:),
-        )
-    } else {
-        button
-    };
-    let button_frame: NSRect = msg_send![button, frame];
-    let x = button_frame.origin.x;
-    let tooltip_key = if enabled {
-        "clipboard.detail_soft_wrap_on"
-    } else {
-        "clipboard.detail_soft_wrap_off"
-    };
-    let tooltip = make_nsstring(&t(tooltip_key));
-    let _: () = msg_send![button, setToolTip: tooltip];
-    CFRelease(tooltip as *const c_void);
-    if newly_created {
-        let _: () = msg_send![content, addSubview: button];
-        release_obj(button);
-    }
-
-    // 标签置于开关左侧并右对齐;透明度提到 0.5,与开关的从属关系更清楚。
-    // Label sits left of the switch, right-aligned; alpha raised to 0.5 so the
-    // label-to-switch association reads clearly.
-    const LABEL_H: f64 = 16.0;
-    let label_y = (DETAIL_TOOLBAR_H - LABEL_H) / 2.0;
-    let label_ns = make_nsstring(&t("clipboard.detail_soft_wrap"));
-    let label: *mut AnyObject = msg_send![class!(NSTextField), labelWithString: label_ns];
-    CFRelease(label_ns as *const c_void);
-    let _: () = msg_send![label, setFrame: NSRect::new(
-        NSPoint::new(x - 6.0 - 70.0, label_y),
-        NSSize::new(70.0, LABEL_H)
-    )];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.5f64];
-    let _: () = msg_send![label, setFont: font];
-    let _: () = msg_send![label, setTextColor: color];
-    let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight
-    release_obj(font);
-    release_obj(color);
-    let _: () = msg_send![content, addSubview: label];
-}
-
-/// 按 preview (5).html 的三段 SVG path 绘制分享图标,不使用 SF Symbol 的变体。
-/// 绘制"另存为"图标(下载到托盘):向下箭头 + 底部托盘,三段路径与既有按钮
-/// 同款描边参数,不使用 SF Symbol 变体。
-/// Draw the save-as icon (download into a tray): a downward arrow plus a bottom tray,
-/// stroked with the same parameters as the other toolbar buttons -- no SF Symbol variant.
-unsafe fn make_detail_save_icon(alpha: f64) -> *mut AnyObject {
-    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let image: *mut AnyObject = msg_send![image, initWithSize: NSSize::new(18.0, 18.0)];
-    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: alpha];
-    let _: () = msg_send![image, lockFocus];
-    let _: () = msg_send![color, set];
-
-    // AppKit 坐标原点在左下:视觉向下 = y 减小。托盘开口朝上贴底,箭头指向托盘。
-    // AppKit's origin is bottom-left: visual "down" means smaller y. The tray hugs the
-    // bottom with its opening up; the arrow points into it.
-    let tray: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![tray, moveToPoint: NSPoint::new(4.5, 7.5)];
-    let _: () = msg_send![tray, lineToPoint: NSPoint::new(4.5, 4.5)];
-    let _: () = msg_send![tray, lineToPoint: NSPoint::new(13.5, 4.5)];
-    let _: () = msg_send![tray, lineToPoint: NSPoint::new(13.5, 7.5)];
-
-    let stem: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![stem, moveToPoint: NSPoint::new(9.0, 14.5)];
-    let _: () = msg_send![stem, lineToPoint: NSPoint::new(9.0, 7.5)];
-
-    let head: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![head, moveToPoint: NSPoint::new(6.2, 10.2)];
-    let _: () = msg_send![head, lineToPoint: NSPoint::new(9.0, 7.4)];
-    let _: () = msg_send![head, lineToPoint: NSPoint::new(11.8, 10.2)];
-
-    for path in [tray, stem, head] {
-        let _: () = msg_send![path, setLineWidth: 1.45f64];
-        let _: () = msg_send![path, setLineCapStyle: 1isize]; // NSLineCapStyleRound
-        let _: () = msg_send![path, setLineJoinStyle: 1isize]; // NSLineJoinStyleRound
-        let _: () = msg_send![path, stroke];
-    }
-    let _: () = msg_send![image, unlockFocus];
-    let _: () = msg_send![image, setTemplate: false];
-    image
-}
-
-/// 预留分享入口:占位 action 不执行业务,但保留设计稿的悬停反馈。
-/// Reserve the share entry point: its placeholder action performs no business behavior while the
-/// button retains the mockup's hover feedback.
-/// 另存为按钮:文本条目提示"另存为文本文件",图片条目提示"另存为图片文件"。
-/// Save-as button: the tooltip reads "save as text file" for text entries and "save as
-/// image file" for image entries.
-unsafe fn add_detail_save_as_button(content: *mut AnyObject, width: f64, is_image: bool) {
-    let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
-    // y 按工具栏高度推导居中(与软换行开关同款逻辑),不再硬编码——改 DETAIL_TOOLBAR_H
-    // 时不会漏改。
-    // The y offset derives from the toolbar height for vertical centering (same logic as
-    // the soft-wrap switch) instead of a hardcoded value that drifts on resize.
-    let save_y = (DETAIL_TOOLBAR_H - 28.0) / 2.0;
-    let button: *mut AnyObject = msg_send![
-        button,
-        initWithFrame: NSRect::new(
-            NSPoint::new(width - 42.0, save_y),
-            NSSize::new(28.0, 28.0)
-        )
-    ];
-    let empty = make_nsstring("");
-    let _: () = msg_send![button, setTitle: empty];
-    CFRelease(empty as *const c_void);
-    let _: () = msg_send![button, setBordered: false];
-    let _: () = msg_send![button, setTarget: observer()];
-    let _: () = msg_send![button, setAction: sel!(detailSaveAs:)];
-    let _: () = msg_send![button, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![button, layer];
-    let _: () = msg_send![layer, setCornerRadius: 6.0f64];
-    let icon = make_detail_save_icon(0.34);
-    let _: () = msg_send![button, setImage: icon];
-    let _: () = msg_send![button, setImagePosition: 1u64]; // NSImageOnly
-    release_obj(icon);
-    let tooltip_key = if is_image {
-        "clipboard.detail_save_as_image"
-    } else {
-        "clipboard.detail_save_as_text"
-    };
-    let tooltip = make_nsstring(&t(tooltip_key));
-    let _: () = msg_send![button, setToolTip: tooltip];
-    CFRelease(tooltip as *const c_void);
-    add_hover_tracking(button);
-    let _: () = msg_send![content, addSubview: button];
-    release_obj(button);
-}
-
-unsafe fn detail_wrap_button(content: *mut AnyObject) -> *mut AnyObject {
-    let subviews: *mut AnyObject = msg_send![content, subviews];
-    let count: usize = msg_send![subviews, count];
-    for index in 0..count {
-        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
-        if !is_button {
-            continue;
-        }
-        // 软换行控件复用设置页的 HTML 开关,按 action 定位以兼容详情面板重建。
-        // The wrap control reuses the settings page's HTML switch; locate it by action so
-        // this remains valid when the detail panel is rebuilt.
-        let action: Sel = msg_send![view, action];
-        if action == sel!(toggleDetailSoftWrap:) {
-            return view;
-        }
-    }
-    std::ptr::null_mut()
-}
-
-unsafe fn detail_save_as_button(content: *mut AnyObject) -> *mut AnyObject {
-    let subviews: *mut AnyObject = msg_send![content, subviews];
-    let count: usize = msg_send![subviews, count];
-    for index in 0..count {
-        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
-        if is_button {
-            let action: Sel = msg_send![view, action];
-            if action == sel!(detailSaveAs:) {
-                return view;
-            }
-        }
-    }
-    std::ptr::null_mut()
-}
-
-/// 添加固定工具栏和来源/统计栏。没有语言识别,顶部左侧按设计留空。
-/// Add the fixed toolbar and source/statistics footer. Without language detection, the toolbar's
-/// leading side intentionally remains empty.
-unsafe fn add_detail_chrome(
-    content: *mut AnyObject,
-    entry: &ClipEntry,
-    kind: TextKind,
-    width: f64,
-    height: f64,
-) {
-    add_detail_separator(content, DETAIL_TOOLBAR_H - 1.0, width);
-    add_detail_separator(content, height - DETAIL_FOOTER_H, width);
-
-    if kind == TextKind::Code {
-        add_detail_wrap_control(content, width);
-    }
-    // 另存为按钮的 tooltip 按条目类型切换:文本 = 另存为文本文件,图片 = 另存为图片文件。
-    add_detail_save_as_button(content, width, entry.image.is_some());
-
-    let source_attr = make_meta_footer_attributed(entry, true);
-    let source: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let source: *mut AnyObject = msg_send![source, initWithFrame: NSRect::new(
-        NSPoint::new(15.0, height - DETAIL_FOOTER_H + 12.0),
-        NSSize::new(width * 0.55, 18.0)
-    )];
-    let _: () = msg_send![source, setBezeled: false];
-    let _: () = msg_send![source, setEditable: false];
-    let _: () = msg_send![source, setSelectable: false];
-    let _: () = msg_send![source, setDrawsBackground: false];
-    let _: () = msg_send![source, setAttributedStringValue: source_attr];
-    release_obj(source_attr);
-    let _: () = msg_send![content, addSubview: source];
-    release_obj(source);
-
-    if entry.image.is_none() {
-        let line_count = entry.text.split('\n').count().max(1);
-        let char_count = entry.text.chars().count();
-        let lines = t_count("clipboard.detail_lines", line_count);
-        let chars = t_count("clipboard.detail_chars", char_count);
-        let stats_text = format!("{lines}  ·  {chars}");
-        let stats_ns = make_nsstring(&stats_text);
-        let stats: *mut AnyObject = msg_send![
-            class!(NSTextField),
-            labelWithString: stats_ns
-        ];
-        CFRelease(stats_ns as *const c_void);
-        let _: () = msg_send![stats, setFrame: NSRect::new(
-            NSPoint::new(width - 250.0, height - DETAIL_FOOTER_H + 12.0),
-            NSSize::new(235.0, 18.0)
-        )];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-        let color: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
-        let _: () = msg_send![stats, setFont: font];
-        let _: () = msg_send![stats, setTextColor: color];
-        let _: () = msg_send![stats, setAlignment: 2isize]; // NSTextAlignmentRight
-        let _: () = msg_send![content, addSubview: stats];
-    }
-}
-
-/// 打开/刷新详情浮窗:内容跟随选中条目——文本 = 完整未截断;图片 = 详情预览大图
-/// (详情大图 .detail 由后台预生成/兜底生成,见 ensure_detail_preview)。位置在主浮窗右侧,高度及上下位置均
-/// 收在主浮窗内。
-///
-/// Open/refresh the detail panel: content follows the selected entry -- full untruncated
-/// text for text entries; the large detail preview (lazy `.detail`, see ensure_detail_preview)
-/// for images. It has a fixed width to the right of the picker, with its height and vertical
-/// position both contained within the picker.
-unsafe fn show_detail_for_sel() {
-    // 无选中(焦点在搜索框)/ 空列表时不动作。
-    // No-op without a selection (search-field focus) or an empty list.
-    let sel = picker_selection();
-    if sel == NO_SELECTION {
-        return;
-    }
-    let Some(h_idx) = mapped_index(sel) else {
-        return;
-    };
-    let entry = {
-        let hist = CLIP_HISTORY.lock().unwrap();
-        hist.get(h_idx).cloned()
-    };
-    let Some(entry) = entry else {
-        return;
-    };
-    let detail_was_visible = detail_visible();
-    ensure_detail_window();
-    let window = match *DETAIL_WINDOW.lock().unwrap() {
-        Some(w) => w.0,
-        None => return,
-    };
-    let content = match *DETAIL_CONTENT.lock().unwrap() {
-        Some(c) => c.0,
-        None => return,
-    };
-    cancel_detail_close(window);
-    let picker_win = match *PICKER_WINDOW.lock().unwrap() {
-        Some(w) => w.0,
-        None => return,
-    };
-    let screen_frame = picker_screen_frame(picker_win);
-    let picker_frame: NSRect = msg_send![picker_win, frame];
-    let max_detail_h = detail_max_height(picker_frame);
-    let preserved_wrap_button =
-        if entry.image.is_none() && classify_text(&entry.text) == TextKind::Code {
-            detail_wrap_button(content)
-        } else {
-            std::ptr::null_mut()
-        };
-
-    // 清除旧内容:removeFromSuperview 即释放(父视图持有,不应二次 release,
-    // 与 rebuild_rows 同一条纪律)。详情文本视图指针一并清空(防悬空)。
-    // Clear the old content: removeFromSuperview releases it (parent-owned; never released
-    // again -- the same discipline as rebuild_rows). The detail text-view pointer is
-    // cleared too (no dangling pointer).
-    *DETAIL_TEXT_VIEW.lock().unwrap() = None;
-    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = None;
-    *DETAIL_SOURCE_MAP.lock().unwrap() = None;
-    // 详情内容每次重建都会替换滚动视图,先清除旧指针避免滚轮/拖拽触碰已移除的对象。
-    // Detail content rebuilds the scroll view each time, so clear stale pointers before
-    // removing the old views and avoid wheel/drag callbacks touching them.
-    *DETAIL_SCROLL_VIEW.lock().unwrap() = None;
-    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = None;
-    *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() = None;
-    *SCROLL_DRAG.lock().unwrap() = None;
-    let subs: *mut AnyObject = msg_send![content, subviews];
-    let count: usize = msg_send![subs, count];
-    for i in 0..count {
-        let v: *mut AnyObject = msg_send![subs, objectAtIndex: i as isize];
-        // 代码详情切换软换行时保留工具栏开关,让它沿用设置页组件的状态动画。
-        // Preserve the toolbar switch while toggling code wrapping so the settings component
-        // can finish its state animation.
-        if v == preserved_wrap_button {
-            continue;
-        }
-        let _: () = msg_send![v, removeFromSuperview];
-    }
-
-    // 构建内容:三种分支都使用固定宽度,仅计算动态高度并填充容器,统一落到定位代码。
-    // Build the content: every branch uses the fixed width, computes only its dynamic height,
-    // fills the container, and falls through to the shared positioning code below.
-    let (w, h): (f64, f64);
-    if let Some(img) = &entry.image {
-        // --- 图片条目:详情预览大图,等比适配最大框 ---
-        // Image entry: the detail preview, fit proportionally into the max box.
-        if let Some(png) = ensure_detail_preview(img) {
-            let data: *mut AnyObject = msg_send![
-                class!(NSData),
-                dataWithBytes: png.as_ptr() as *const c_void,
-                length: png.len()
-            ];
-            let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-            let image: *mut AnyObject = msg_send![image, initWithData: data];
-            if image.is_null() {
-                return;
-            }
-            let img_size: NSSize = msg_send![image, size];
-            let (iw, ih) = (img_size.width, img_size.height);
-            // 详情始终收在主浮窗高度内:图片内部高度 = 主浮窗高度扣除上下内边距。
-            // Keep the detail inside the picker height: the image's inner height is the
-            // picker's height minus the detail's vertical padding.
-            let max_image_h = (max_detail_h - DETAIL_CHROME_H - DETAIL_PAD * 2.0).max(0.0);
-            let fit_scale = (DETAIL_IMAGE_MAX_W / iw).min(max_image_h / ih).min(1.0);
-            let (fit_w, fit_h) = if iw > 0.0 && ih > 0.0 {
-                (iw * fit_scale, ih * fit_scale)
-            } else {
-                (DETAIL_IMAGE_MAX_W, max_image_h)
-            };
-            // 外框固定宽度,图片只在内部可用区域等比缩放。
-            // Keep the outer panel fixed-width; scale the image inside its usable area.
-            w = DETAIL_MAX_W;
-            h = (fit_h + DETAIL_PAD * 2.0 + DETAIL_CHROME_H)
-                .clamp(DETAIL_PANEL_MIN_H, max_detail_h);
-            let view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-            let view: *mut AnyObject = msg_send![
-                view,
-                initWithFrame: NSRect::new(
-                    NSPoint::new(DETAIL_PAD, DETAIL_TOOLBAR_H + DETAIL_PAD),
-                    NSSize::new(fit_w, fit_h)
-                )
-            ];
-            let _: () = msg_send![view, setImage: image];
-            let _: () = msg_send![view, setImageScaling: 3u64]; // NSImageScaleProportionallyUpOrDown
-            let _: () = msg_send![view, setEditable: false];
-            let _: () = msg_send![content, addSubview: view];
-            release_obj(view);
-            release_obj(image);
-        } else {
-            // 退化条目(无预览无源文件):详情回退文件名文本(与行内兜底一致)。
-            // Degenerate entry (no preview, no source file): the detail falls back to the
-            // filename text (same fallback as the row body).
-            let (tw, th) = detail_text_size(&entry.text, TextKind::Plain, max_detail_h);
-            add_detail_text(content, &entry.text, tw, th, TextKind::Plain, None, false);
-            w = tw;
-            h = th;
-        }
-    } else {
-        // --- 文本条目:完整未截断文本,超出主浮窗高度后在详情内滚动 ---
-        // Text entry: the full untruncated text; scrolls inside detail beyond picker height.
-        let kind = classify_text(&entry.text);
-        // 代码详情的高度和内容视图共享同一个 Arc<PreparedCodeDisplay>;缓存命中只
-        // 增加引用计数,不会复制长文本或原文映射。
-        // Code-detail sizing and content share one Arc<PreparedCodeDisplay>; cache hits only
-        // increment the reference count instead of copying long text or its source map.
-        let code_soft_wrap =
-            kind == TextKind::Code && DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
-        // 代码详情两种模式都走准备管线:软换行 = 结构断点折行 + 中点标记;
-        // 非软换行 = 不折行(横向滚动)+ 同样的中点标记,并携带映射保证复制保真。
-        let prepared_code = if kind == TextKind::Code {
-            Some(if code_soft_wrap {
-                prepare_code_for_soft_wrap(&entry.text, detail_code_max_columns(DETAIL_CODE_MAX_W))
-            } else {
-                prepare_code_no_wrap_display(&entry.text)
-            })
-        } else {
-            None
-        };
-        let (tw, th) = if let Some(prepared) = &prepared_code {
-            detail_prepared_code_size(prepared, max_detail_h)
-        } else if kind == TextKind::Code {
-            detail_unwrapped_code_size(&entry.text, max_detail_h)
-        } else {
-            detail_text_size(&entry.text, kind, max_detail_h)
-        };
-        add_detail_text(
-            content,
-            &entry.text,
-            tw,
-            th,
-            kind,
-            prepared_code.as_deref(),
-            code_soft_wrap,
-        );
-        w = tw;
-        h = th;
-    }
-    let chrome_kind = if entry.image.is_some() {
-        TextKind::Plain
-    } else {
-        classify_text(&entry.text)
-    };
-    add_detail_chrome(content, &entry, chrome_kind, w, h);
-
-    // 定位:主浮窗右侧(与选中行顶部对齐)/ 翻转 / clamp。对齐选中行而非窗口顶:
-    // 窗口顶是搜索/清除头部条,且条目少时窗口被最小高度撑高,对窗口顶会让详情
-    // 悬在行上方错位(用户反馈)。
-    // Position: right of the picker, top-aligned with the SELECTED ROW / flip / clamp.
-    // Row alignment instead of the window top: the top strip holds the search/clear bar
-    // and with few entries the window is floored at the min height, so a window-top
-    // alignment floats the panel above the row (user-reported misalignment).
-    let Some(align_top_y) = selected_row_screen_y(picker_frame) else {
-        return;
-    };
-    if !detail_was_visible {
-        *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(picker_frame.origin);
-    }
-    // 先计算主浮窗 + 详情的整体布局,详情始终在主浮窗右侧并与选中行对齐。
-    // Lay out the picker + detail as one group, keeping detail on the right and aligned to
-    // the selected row.
-    let center_on_main = CONFIG.read().unwrap().clipboard.picker_position == "main";
-    let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-    let (target_picker_frame, target_detail_frame) = detail_group_frames(
-        picker_frame,
-        align_top_y,
-        screen_frame,
-        w,
-        h,
-        center_on_main,
-        cursor.x,
-    );
-    if detail_was_visible {
-        let _: () = msg_send![picker_win, setFrame: target_picker_frame, display: true];
-        let _: () = msg_send![window, setFrame: target_detail_frame, display: true];
-        let _: () = msg_send![window, orderFrontRegardless];
-    } else {
-        animate_detail_open(
-            picker_win,
-            window,
-            content,
-            target_picker_frame,
-            target_detail_frame,
-        );
-    }
-    log_debug!(
-        "[clip] detail group: picker=({:.0},{:.0}) detail=({:.0},{:.0}) {}x{}",
-        target_picker_frame.origin.x,
-        target_picker_frame.origin.y,
-        target_detail_frame.origin.x,
-        target_detail_frame.origin.y,
-        target_detail_frame.size.width,
-        target_detail_frame.size.height
-    );
-    // orderFrontRegardless:不抢 key(面板 canBecomeKeyWindow=NO,主浮窗保持 key)。
-    // orderFrontRegardless: never takes key (canBecomeKeyWindow=NO keeps the picker key).
-    set_detail_visible(true);
-    // 文档完整布局和窗口最终 frame 都已生效后,无条件设置到 AppKit 约束出的真实顶部。
-    // 鼠标详情按钮、键盘 →、以及详情打开后的 ↑/↓ 切换最终都汇聚到这里,行为完全一致。
-    // Once full document layout and the final window frame are both applied, unconditionally
-    // set AppKit's actual constrained top. Mouse detail clicks, keyboard Right, and Up/Down
-    // navigation while detail is open all converge here and therefore behave identically.
-    let detail_scroll = *DETAIL_SCROLL_VIEW.lock().unwrap();
-    if let Some(scroll) = detail_scroll {
-        scroll_detail_to_top(scroll.0);
-        let clip: *mut AnyObject = msg_send![scroll.0, contentView];
-        let bounds: NSRect = msg_send![clip, bounds];
-        if let Some((min_y, max_y)) = detail_scroll_range(scroll.0) {
-            log_debug!(
-                "[clip] detail scroll initialized: y={:.1} range={:.1}..{:.1}",
-                bounds.origin.y,
-                min_y,
-                max_y
-            );
-        }
-    }
-    refresh_detail_action_visuals();
-}
-
-/// 详情高度上限等于主浮窗高度,使详情上下边缘始终包含在主浮窗内。
-/// The detail-height cap equals the picker height, keeping both detail edges inside it.
-fn detail_max_height(picker: NSRect) -> f64 {
-    picker.size.height.max(DETAIL_PANEL_MIN_H)
-}
-
-/// 详情代码区可用宽度映射到软换行高度估算列数,不会向显示文本插入字符。
-/// 预算基于真实容器宽(滚动视图延伸到面板右缘,故容器 = 面板宽 - 左侧内边距),
-/// 步进用实测值 `CODE_ADVANCE_PT`;SAFETY 抵消取整与字体度量的微小波动。
-/// Map the detail code width to soft-wrap sizing columns; no characters are inserted into
-/// the display. The budget uses the REAL container width (the scroll view extends to the
-/// panel's right edge, so container = panel width - left padding) and the measured
-/// `CODE_ADVANCE_PT`; SAFETY absorbs rounding and small font-metric drift.
-fn detail_code_max_columns(width: f64) -> usize {
-    let container = width - DETAIL_PAD;
-    let columns = (container / CODE_ADVANCE_PT).floor().max(0.0) as usize;
-    columns.saturating_sub(DETAIL_CODE_WRAP_SAFETY).max(24)
-}
-
-/// 根据已准备的软换行模型计算尺寸;U+2028 已代表最终视觉折行,不再重复扫描每行宽度。
-/// Size the panel from the prepared soft-wrap model. U+2028 already represents final visual
-/// wraps, so line widths are not scanned again.
-fn detail_prepared_code_size(prepared: &PreparedCodeDisplay, max_height: f64) -> (f64, f64) {
-    let lines = prepared
-        .text
-        .chars()
-        .filter(|ch| matches!(ch, '\n' | '\u{2028}'))
-        .count()
-        + 1;
-    let h =
-        (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H)
-            .clamp(DETAIL_PANEL_MIN_H, max_height);
-    (DETAIL_CODE_MAX_W, h)
-}
-
-/// 不换行代码只按真实换行估算高度;超宽部分交给原生横向滚动条。
-/// Size unwrapped code from hard lines only; native horizontal scrolling handles excess width.
-fn detail_unwrapped_code_size(text: &str, max_height: f64) -> (f64, f64) {
-    let lines = text.split('\n').count().max(1);
-    let h =
-        (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H)
-            .clamp(DETAIL_PANEL_MIN_H, max_height);
-    (DETAIL_CODE_MAX_W, h)
-}
-
-/// 计算详情文本面板尺寸(宽按文本类型;高按视觉行数并限制在主浮窗高度内)。
-/// Compute detail text-panel dimensions (type-specific width, height capped by the picker).
-fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
-    if kind == TextKind::Code {
-        let prepared = prepare_code_for_soft_wrap(text, detail_code_max_columns(DETAIL_CODE_MAX_W));
-        return detail_prepared_code_size(&prepared, max_height);
-    }
-    let w = DETAIL_MAX_W;
-    let avail_w = w - DETAIL_PAD * 2.0;
-    let lines = estimate_lines(text, detail_text_units(avail_w));
-    let h =
-        (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H)
-            .clamp(DETAIL_PANEL_MIN_H, max_height);
-    (w, h)
-}
-
-/// 构建详情文本视图:普通文本自然换行;代码按优先级插入 U+2028 软换行,标记只作为绘制装饰。
-/// 文本**可鼠标选中**;复制走原生右键菜单或主浮窗转发的 Cmd+C。面板不成为 key,
-/// 因而不能依赖系统把 Cmd+C 直接路由到详情。
-/// Build the detail text view: plain text wraps naturally; code inserts prioritized U+2028 soft
-/// wraps, with markers remaining drawing-only decorations. Text remains mouse-selectable; copying
-/// uses the native context menu or Cmd+C forwarded by the picker because the detail never becomes key.
-fn detail_text_view_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabClipDetailTextView").unwrap();
-        let superclass = class!(NSTextView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(copy:),
-            detail_text_view_copy as *mut c_void,
-            types.as_ptr(),
-        );
-        let types_draw = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
-        class_addMethod(
-            cls,
-            sel!(drawRect:),
-            detail_text_view_draw_rect as *mut c_void,
-            types_draw.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
-}
-
-/// 详情文本的原生 Copy 菜单也必须经过原文映射,不能复制格式化后的显示文本。
-/// The native Copy menu must also pass through the source mapping, never copying formatted text.
-extern "C" fn detail_text_view_copy(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
-    copy_detail_selection();
-}
-
-struct SoftWrapGlyphs {
-    end: CallbackTarget,
-    continuation: CallbackTarget,
-    end_size: NSSize,
-    continuation_size: NSSize,
-}
-
-/// 软换行字形只创建一次;drawRect 可能被频繁调用,不能在每次重绘时复制大段文本或构建属性。
-/// Create the soft-wrap glyphs once; drawRect can run frequently, so it must not copy large text
-/// or rebuild attributed strings on every repaint.
-unsafe fn soft_wrap_glyphs() -> &'static SoftWrapGlyphs {
-    static GLYPHS: OnceLock<SoftWrapGlyphs> = OnceLock::new();
-    GLYPHS.get_or_init(|| {
-        let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-        let attrs: *mut AnyObject = msg_send![attrs, init];
-        let font_key = make_nsstring("NSFont");
-        let color_key = make_nsstring("NSColor");
-        let font: *mut AnyObject =
-            msg_send![class!(NSFont), monospacedSystemFontOfSize: 10.0f64, weight: 0.0f64];
-        let color: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.36f64];
-        let _: () = msg_send![attrs, setObject: font, forKey: font_key];
-        let _: () = msg_send![attrs, setObject: color, forKey: color_key];
-        CFRelease(font_key as *const c_void);
-        CFRelease(color_key as *const c_void);
-        let end_ns = make_nsstring("↵");
-        let end: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let end: *mut AnyObject = msg_send![end, initWithString: end_ns, attributes: attrs];
-        CFRelease(end_ns as *const c_void);
-        let continuation_ns = make_nsstring("↪");
-        let continuation: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let continuation: *mut AnyObject = msg_send![
-            continuation,
-            initWithString: continuation_ns,
-            attributes: attrs
-        ];
-        CFRelease(continuation_ns as *const c_void);
-        release_obj(attrs);
-        SoftWrapGlyphs {
-            end: CallbackTarget::new(end),
-            continuation: CallbackTarget::new(continuation),
-            end_size: msg_send![end, size],
-            continuation_size: msg_send![continuation, size],
-        }
-    })
-}
-
-/// 在 NSTextView 绘制完成后叠加软换行标记;只读布局结果,不改 textStorage。
-/// Draw soft-wrap markers after NSTextView finishes, reading layout results without modifying
-/// textStorage.
-extern "C" fn detail_text_view_draw_rect(_self: *mut c_void, _cmd: Sel, rect: NSRect) {
-    unsafe {
-        type Draw = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect);
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class: class!(NSTextView) as *const _ as *mut c_void,
-        };
-        let draw: Draw = std::mem::transmute(objc_msgSendSuper as *const ());
-        draw(&mut sup, sel!(drawRect:), rect);
-
-        let view = _self as *mut AnyObject;
-        let is_code = DETAIL_SOFT_WRAP_TEXT_VIEW
-            .lock()
-            .unwrap()
-            .is_some_and(|code_view| code_view.0 == view);
-        if !is_code {
-            return;
-        }
-        let layout: *mut AnyObject = msg_send![view, layoutManager];
-        let container: *mut AnyObject = msg_send![view, textContainer];
-        let string: *mut AnyObject = msg_send![view, string];
-        let text_len: usize = msg_send![string, length];
-        let glyph_count: usize = msg_send![layout, numberOfGlyphs];
-        if glyph_count == 0 || text_len == 0 {
-            return;
-        }
-        let text_origin: NSPoint = msg_send![view, textContainerOrigin];
-        // 只检查脏矩形覆盖的字形,并额外检查上一行以判断首个可见行是否为软换行续行。
-        // Only inspect glyphs intersecting the invalidated rectangle, plus one preceding line
-        // to recover whether the first visible line is a soft-wrap continuation.
-        let layout_rect = NSRect::new(
-            NSPoint::new(rect.origin.x - text_origin.x, rect.origin.y - text_origin.y),
-            rect.size,
-        );
-        let visible_glyphs: NSRange = msg_send![
-            layout,
-            glyphRangeForBoundingRect: layout_rect,
-            inTextContainer: container
-        ];
-        if visible_glyphs.length == 0 {
-            return;
-        }
-        let mut glyph = visible_glyphs.location;
-        if glyph > 0 {
-            let mut previous = NSRange::new(0, 0);
-            let _: NSRect = msg_send![
-                layout,
-                lineFragmentUsedRectForGlyphAtIndex: glyph - 1,
-                effectiveRange: &mut previous
-            ];
-            glyph = previous.location;
-        }
-        let glyph_end = visible_glyphs
-            .location
-            .saturating_add(visible_glyphs.length)
-            .min(glyph_count);
-        let glyphs = soft_wrap_glyphs();
-        let end_attr = glyphs.end.0;
-        let continuation_attr = glyphs.continuation.0;
-        let mut continuation = false;
-        while glyph < glyph_end {
-            let mut effective = NSRange::new(0, 0);
-            let fragment: NSRect = msg_send![
-                layout,
-                lineFragmentUsedRectForGlyphAtIndex: glyph,
-                effectiveRange: &mut effective
-            ];
-            if effective.length == 0 {
-                glyph += 1;
-                continue;
-            }
-            let character_range: NSRange = msg_send![
-                layout,
-                characterRangeForGlyphRange: effective,
-                actualGlyphRange: std::ptr::null_mut::<NSRange>()
-            ];
-            let char_start = character_range.location;
-            let char_end = character_range
-                .location
-                .saturating_add(character_range.length)
-                .min(text_len);
-            let line = NSRect::new(
-                NSPoint::new(
-                    fragment.origin.x + text_origin.x,
-                    fragment.origin.y + text_origin.y,
-                ),
-                fragment.size,
-            );
-            let visible = line.origin.y + line.size.height >= rect.origin.y
-                && line.origin.y <= rect.origin.y + rect.size.height;
-            if visible && continuation {
-                let x = (line.origin.x - glyphs.continuation_size.width - 2.0).max(0.0);
-                let y = line.origin.y + (line.size.height - glyphs.continuation_size.height) / 2.0;
-                let _: () = msg_send![continuation_attr, drawAtPoint: NSPoint::new(x, y)];
-            }
-
-            // 软换行是视觉行片段边界,断点两侧都没有真实的 '\n'。
-            // A soft wrap is a line-fragment boundary without a hard '\n' at either side.
-            let char_at_end: u16 = if char_end < text_len {
-                msg_send![string, characterAtIndex: char_end]
-            } else {
-                0
-            };
-            let char_before_end: u16 = if char_end > char_start {
-                msg_send![string, characterAtIndex: char_end - 1]
-            } else {
-                0
-            };
-            let hard_break = char_end >= text_len
-                || char_at_end == '\n' as u16
-                || char_before_end == '\n' as u16;
-            let soft_wrap = char_end < text_len && !hard_break;
-            if visible && soft_wrap {
-                // 标记画在行片段右缘之外 2pt 的空白带,不再叠在行尾字符上——旧实现右对齐
-                // 到 usedRect 右缘,半透明箭头会压住行末字形,逗号结尾时轮廓相触最明显。
-                // 折行预算(68 列)刻意小于容器容量(~72 列),每个软换行行尾天然保有
-                // ≥4 列空白,标记既不会越出面板也不会压到任何内容。
-                // Draw the marker just OUTSIDE the fragment's right edge with a 2pt gap instead
-                // of on top of the trailing glyph -- the old right-aligned placement brushed
-                // against the last glyph and was most visible after commas. The wrap budget
-                // (68 columns) is deliberately below container capacity (~72 columns), so every
-                // soft-wrapped line keeps >= 4 spare columns: the marker can neither clip at the
-                // panel edge nor cover any content.
-                let x = line.origin.x + line.size.width + 2.0;
-                let y = line.origin.y + (line.size.height - glyphs.end_size.height) / 2.0;
-                let _: () = msg_send![end_attr, drawAtPoint: NSPoint::new(x, y)];
-            }
-            continuation = soft_wrap;
-            glyph = effective
-                .location
-                .saturating_add(effective.length)
-                .max(glyph.saturating_add(1));
-        }
-    }
-}
-
-// ========== 详情滚动视图 ==========
-
-unsafe fn add_detail_text(
-    content: *mut AnyObject,
-    text: &str,
-    w: f64,
-    h: f64,
-    kind: TextKind,
-    prepared_code: Option<&PreparedCodeDisplay>,
-    code_soft_wrap: bool,
-) {
-    let is_code = kind == TextKind::Code;
-    debug_assert!(!code_soft_wrap || (is_code && prepared_code.is_some()));
-    // 滚动视图向右延伸到面板边缘,文本视图内部保留右侧内边距给原生 overlay scroller。
-    // Extend the scroll view to the panel edge and keep right padding inside the text view for
-    // the native overlay scroller.
-    let scroll_w = w - DETAIL_PAD;
-    let body_h = (h - DETAIL_CHROME_H).max(DETAIL_LINE_H);
-    let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
-    let scroll: *mut AnyObject = msg_send![
-        scroll,
-        initWithFrame: NSRect::new(
-            NSPoint::new(DETAIL_PAD, DETAIL_TOOLBAR_H),
-            NSSize::new(scroll_w, body_h)
-        )
-    ];
-    let _: () = msg_send![scroll, setBorderType: 0u64]; // NSNoBorder
-    let clear_background: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-    let _: () = msg_send![scroll, setBackgroundColor: clear_background];
-    let _: () = msg_send![scroll, setDrawsBackground: false];
-    // 使用 AppKit Overlay 滚动条,不为横纵滚动条预留交叉 corner;滚动端点、拖拽和滚轮
-    // 相位全部交给 NSScrollView。NSClipView 也关闭背景绘制,避免默认白块。
-    // Use AppKit Overlay scrollers, which reserve no horizontal/vertical corner. NSScrollView
-    // owns endpoints, dragging, and wheel phases; NSClipView also stops drawing its background
-    // to avoid the default white corner.
-    let no_wrap = is_code && !code_soft_wrap;
-    // 关闭系统滚动条,避免它在滚动/布局回调中重新出现并与自定义胶囊重叠。
-    // Disable native scrollers so they cannot reappear during scrolling/layout and overlap the
-    // always-visible custom capsules.
-    let _: () = msg_send![scroll, setHasVerticalScroller: false];
-    let _: () = msg_send![scroll, setHasHorizontalScroller: false];
-    let _: () = msg_send![scroll, setAutohidesScrollers: true];
-    let _: () = msg_send![scroll, setScrollerStyle: 1isize]; // NSScrollerStyleOverlay
-    let clip_view: *mut AnyObject = msg_send![scroll, contentView];
-    if !clip_view.is_null() {
-        let _: () = msg_send![clip_view, setDrawsBackground: false];
-    }
-    // 端点橡皮筋完全交给原生 elasticity(Automatic:内容溢出的方向才回弹)。
-    // 千万不要在 bounds 通知里硬钳越界原点来"关闭"它——手势进行中改写 clipView
-    // 会污染 NSScrollView 的动量累加基准,后续惯性事件从脏基准重新施加 delta,
-    // 与硬钳反复拉锯,滚动条就会在端点抽搐(见 detail_scroll_indicator_bounds_changed)。
-    // Endpoint rubber banding is left entirely to native elasticity (Automatic: bounces
-    // only on axes whose content overflows). Never "disable" it by hard-clamping
-    // out-of-range origins inside the bounds notification -- rewriting the clip view
-    // mid-gesture poisons NSScrollView's momentum base, so following momentum events
-    // reapply their deltas from the stale base and fight the clamp, making the scrollbar
-    // twitch at the endpoints (see detail_scroll_indicator_bounds_changed).
-    let _: () = msg_send![scroll, setVerticalScrollElasticity: 0isize]; // NSScrollElasticityAutomatic
-    let _: () = msg_send![scroll, setHorizontalScrollElasticity: 0isize];
-
-    // 软换行关闭时保留原文宽度并启用横向滚动;开启时继续使用 U+2028 显示模型,不显示
-    // 横向滚动条。
-    // With soft wrap off, preserve raw line width and enable horizontal scrolling. When on,
-    // use the U+2028 display model and hide the horizontal scroller.
-    // 详情打开路径已准备软换行模型;这里只借用文本和映射,不复制长文本。
-    // The open path has already prepared the soft-wrap model; borrow its text and mapping here
-    // without copying the long source.
-    let prepared = prepared_code;
-    let display_text = prepared.map(|code| code.text.as_str()).unwrap_or(text);
-    // 自定义软换行只在显示文本中插入行分隔符;共享缓存里的原文映射,复制选区时
-    // 去掉这些显示字符,不复制长原文/边界数组。
-    // Custom soft wrapping inserts line separators only into display text. Share the cached
-    // source map so copied selections omit those display characters without cloning the long
-    // source or boundary array.
-    *DETAIL_SOURCE_MAP.lock().unwrap() = prepared.and_then(|code| code.source_map.clone());
-    let tv: *mut AnyObject = msg_send![detail_text_view_class(), alloc];
-    // 宽度必须等于安装后的真实宽度(scroll_w = clip 宽)。用更窄的 avail_w 构建,
-    // NSClipView 装 doc 时会把它拉伸到 scroll_w,宽度差迫使 TextKit 显示时整体重排,
-    // 并触发把视口拖离顶部的滚动动画(→ 打开后滚动条不在最顶的根因)。
-    // The width must equal the real post-install width (scroll_w = clip width). Building
-    // narrower (avail_w) makes NSClipView stretch the document view on install; the width
-    // delta forces a full TextKit re-layout at display time and spawns the scroll animation
-    // that drags the viewport away from the top (the scrollbar-not-at-top-after-open bug).
-    let tv: *mut AnyObject = msg_send![
-        tv,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(scroll_w, body_h))
-    ];
-    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = code_soft_wrap.then_some(ObjPtr::new(tv));
-    // 详情必须在显示前完成完整布局。非连续/后台布局会在面板出现后分批增大
-    // documentView,NSClipView 为维持旧可见区域会同步改变 bounds.origin.y,这正是
-    // 滚动条打开后向下跳的根因。
-    // Detail must finish layout before display. Non-contiguous/background layout grows the
-    // document view in batches after the panel appears, and NSClipView changes bounds.origin.y
-    // to preserve the old visible region—the root cause of the post-open downward jump.
-    let layout: *mut AnyObject = msg_send![tv, layoutManager];
-    let _: () = msg_send![layout, setAllowsNonContiguousLayout: false];
-    let _: () = msg_send![layout, setBackgroundLayoutEnabled: false];
-
-    let ns_text = make_nsstring(display_text);
-    let _: () = msg_send![tv, setString: ns_text];
-    CFRelease(ns_text as *const c_void);
-
-    // 代码只保留等宽排版和软换行,不再做语法着色;URL 继续沿用列表的蓝色。
-    // Code retains only monospace layout and soft wrapping, with no syntax coloring; URLs keep
-    // the list's blue color.
-    let storage: *mut AnyObject = msg_send![tv, textStorage];
-    // 链接颜色、字体和段落样式会修改 NSTextStorage;外层事务合并 TextKit
-    // 无效化/修复,避免软换行详情在布局前重复处理全文。
-    // Link color, font, and paragraph styles mutate NSTextStorage. An outer transaction coalesces
-    // TextKit invalidation/fix-up instead of repeatedly processing the soft-wrapped detail.
-    let _: () = msg_send![storage, beginEditing];
-    apply_link_color(storage, display_text, kind);
-
-    let _: () = msg_send![tv, setEditable: false];
-    // 可选中(之前禁用了选中,长文本没法复制其中一部分)。非 key 窗口里 NSTextView
-    // 仍支持鼠标拖选(选中显示灰色);复制交给原生路径——右键菜单,以及主浮窗
-    // container_key_down 对 Cmd+C 的转发(见 copy_detail_selection)。
-    // Selectable (it used to be disabled, so a part of a long text could never be
-    // copied). In a non-key window NSTextView still supports mouse-drag selection
-    // (shown gray); copying goes through the native paths -- the right-click menu, and
-    // the Cmd+C forwarding in the picker's container_key_down (see copy_detail_selection).
-    let _: () = msg_send![tv, setSelectable: true];
-    let _: () = msg_send![tv, setDrawsBackground: false];
-    // 普通详情文字使用 14pt;代码使用等宽 14pt,让列宽和断点计算稳定。
-    // Plain detail text uses 14pt; code uses a 14pt monospaced font for stable columns/breaks.
-    let font: *mut AnyObject = if is_code {
-        msg_send![class!(NSFont), monospacedSystemFontOfSize: 14.0f64, weight: 0.0f64]
-    } else {
-        msg_send![class!(NSFont), systemFontOfSize: 14.0f64]
-    };
-    let _: () = msg_send![tv, setFont: font];
-    if code_soft_wrap {
-        apply_code_paragraph_styles(storage, display_text);
-    }
-    // 代码详情两种模式(软换行/非软换行)的段内空格都显示为中点,统一淡色染色,
-    // 与列表行的空格标记观感一致。普通文本/链接无中点,调用无副作用。
-    if is_code {
-        apply_visible_space_markers(storage, display_text);
-    }
-    let _: () = msg_send![storage, endEditing];
-    // 详情窗口外框对齐条目内容块顶部,正文再补上列表的行内顶部留白,避免整体窗口下移。
-    // The detail frame aligns with the row content block; add the list's top padding inside
-    // the text view so the whole detail window does not shift downward.
-    let _: () = msg_send![tv, setTextContainerInset: NSSize::new(0.0, ROW_PAD_TOP)];
-    let text_container: *mut AnyObject = msg_send![tv, textContainer];
-    if is_code {
-        // 去掉 NSTextView 默认的行内留白,让代码内容边界由 DETAIL_PAD 统一控制。
-        // Remove NSTextView's default line padding so DETAIL_PAD controls the code boundary.
-        let _: () = msg_send![text_container, setLineFragmentPadding: 0.0f64];
-    }
-    // 先按最终宽度完成全部 TextKit 布局,再把 documentView 高度固定为完整 usedRect。
-    // 若让 NSTextView 在显示后继续 verticallyResizable,它仍会异步改 frame 并推走顶部。
-    // Complete all TextKit layout at the final width, then freeze documentView height to the
-    // full usedRect. Leaving NSTextView vertically resizable after display would still mutate
-    // its frame asynchronously and push the viewport away from the top.
-    let _: () = msg_send![text_container, setWidthTracksTextView: !no_wrap];
-    // 与安装后的真实宽度保持一致(见上方 initWithFrame 的说明)。
-    // Keep this consistent with the real post-install width (see the initWithFrame note above).
-    let container_w = if no_wrap { 1_000_000_000.0 } else { scroll_w };
-    let _: () = msg_send![
-        text_container,
-        setContainerSize: NSSize::new(container_w, 1_000_000_000.0)
-    ];
-    let _: () = msg_send![tv, setHorizontallyResizable: no_wrap];
-    let _: () = msg_send![tv, setVerticallyResizable: true];
-    let _: () = msg_send![layout, ensureLayoutForTextContainer: text_container];
-    let used: NSRect = msg_send![layout, usedRectForTextContainer: text_container];
-    let document_w = if no_wrap {
-        (used.origin.x + used.size.width + DETAIL_PAD)
-            .ceil()
-            .max(scroll_w)
-    } else {
-        scroll_w
-    };
-    let document_h = (used.origin.y + used.size.height + ROW_PAD_TOP * 2.0)
-        .ceil()
-        .max(body_h);
-    let _: () = msg_send![tv, setFrameSize: NSSize::new(document_w, document_h)];
-    let _: () = msg_send![tv, setVerticallyResizable: false];
-    let _: () = msg_send![tv, setSelectedRange: NSRange::new(0, 0)];
-    let _: () = msg_send![scroll, setDocumentView: tv];
-    release_obj(tv);
-    *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr::new(tv));
-
-    // 详情滚动条由自定义胶囊绘制;bounds 通知只负责刷新胶囊位置,端点橡皮筋由原生
-    // elasticity 处理,这里不改写 bounds(改写会在手势中与动量拉锯,导致抽搐)。
-    // Detail scrollbars are drawn by the custom capsules; the bounds notification only
-    // refreshes capsule positions. Endpoint rubber banding is handled by native
-    // elasticity -- never rewrite bounds here (doing so fights momentum mid-gesture and
-    // causes the endpoint twitch).
-    let clip: *mut AnyObject = msg_send![scroll, contentView];
-    let _: () = msg_send![clip, setPostsBoundsChangedNotifications: true];
-    let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
-    let bounds_name = make_nsstring("NSViewBoundsDidChangeNotification");
-    let _: () = msg_send![
-        center,
-        addObserver: observer(),
-        selector: sel!(detailScrollIndicatorBoundsChanged:),
-        name: bounds_name,
-        object: clip
-    ];
-    CFRelease(bounds_name as *const c_void);
-    *DETAIL_SCROLL_VIEW.lock().unwrap() = Some(ObjPtr::new(scroll));
-
-    // 系统滚动条已完全关闭;实际滚动仍由 NSScrollView/NSClipView 处理,自定义视图只负责视觉
-    // 与拖拽映射,因此不会出现两层滚动条。
-    // Native scrollers are fully disabled; NSScrollView/NSClipView still perform scrolling,
-    // while the custom views handle visuals and thumb dragging, preventing double scrollbars.
-    let vertical_indicator: *mut AnyObject = msg_send![scroll_indicator_class(), alloc];
-    let vertical_indicator: *mut AnyObject = msg_send![
-        vertical_indicator,
-        initWithFrame: NSRect::new(
-            NSPoint::new(
-                scroll_w - SCROLL_INDICATOR_HIT_W - SCROLL_INDICATOR_EDGE,
-                SCROLL_INDICATOR_EDGE,
-            ),
-            NSSize::new(
-                SCROLL_INDICATOR_HIT_W,
-                body_h - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
-            )
-        )
-    ];
-    update_scroll_indicator_visual(
-        vertical_indicator,
-        body_h - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
-        false,
-    );
-    let _: () = msg_send![scroll, addSubview: vertical_indicator];
-    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr::new(vertical_indicator));
-    release_obj(vertical_indicator);
-
-    if no_wrap {
-        let horizontal_indicator: *mut AnyObject = msg_send![scroll_indicator_class(), alloc];
-        let horizontal_indicator: *mut AnyObject = msg_send![
-            horizontal_indicator,
-            initWithFrame: NSRect::new(
-                NSPoint::new(
-                    3.0,
-                    body_h - SCROLL_INDICATOR_HIT_W - 3.0,
-                ),
-                NSSize::new(
-                    scroll_w
-                        - (SCROLL_INDICATOR_EDGE * 2.0)
-                        - SCROLL_INDICATOR_CORNER_RESERVE,
-                    SCROLL_INDICATOR_HIT_W,
-                )
-            )
-        ];
-        update_scroll_indicator_visual(
-            horizontal_indicator,
-            scroll_w - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
-            true,
-        );
-        let _: () = msg_send![scroll, addSubview: horizontal_indicator];
-        *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() =
-            Some(ObjPtr::new(horizontal_indicator));
-        release_obj(horizontal_indicator);
-    } else {
-        *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() = None;
-    }
-    update_scroll_indicator_for(ScrollTarget::Detail);
-    if no_wrap {
-        update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
-    }
-    let _: () = msg_send![content, addSubview: scroll];
-    release_obj(scroll);
-
-    // 详情文本上显示 I-beam 输入光标:非 key 窗口里 cursor rect 不生效(NSTextView
-    // 自带的 I-beam 矩形只在 key 窗口激活,详情面板不会成为 key → 之前一直箭头)。
-    // 用与行悬停同款的 mouseEntered/Exited + ActiveAlways tracking area 手动设置
-    // NSCursor;cursorUpdate 选项明确不支持 ActiveAlways(见 NSTrackingArea.h),
-    // 所以走 enter/exit 路径。tracking area 放在固定大小的滚动视图上——每次打开
-    // 详情都是新视图,rect 不会随文本增长而过期。
-    // Show the I-beam over the detail text: cursor rects apply only to the KEY window
-    // (NSTextView's own I-beam rect never activates in the non-key panel -> it used to be
-    // an arrow). A mouseEntered/Exited + ActiveAlways tracking area (identical to the row
-    // hover) sets NSCursor manually; cursorUpdate is documented as NOT supported with
-    // ActiveAlways (NSTrackingArea.h), so the enter/exit path is used. The area sits on
-    // the fixed-size scroll view -- a fresh view per detail open, so the rect never goes
-    // stale as the text grows.
-    let opts: u64 = 0x01 | 0x80; // MouseEnteredAndExited | ActiveAlways
-    let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-    let bounds: NSRect = msg_send![scroll, bounds];
-    let ta: *mut AnyObject = msg_send![
-        ta,
-        initWithRect: bounds,
-        options: opts,
-        owner: observer(),
-        userInfo: std::ptr::null::<AnyObject>()
-    ];
-    let _: () = msg_send![scroll, addTrackingArea: ta];
-    release_obj(ta);
-}
-
-/// 详情文本光标:进入 → I-beam(输入光标)。非 key 窗口里 cursor rect 只在 key 窗口
-/// 生效,NSTextView 自带的 I-beam 矩形从不激活,鼠标在详情文本上一直显示箭头;
-/// 这里用 ActiveAlways 的 mouseEntered/Exited tracking area(owner = observer,与行
-/// 悬停同款)手动设置 NSCursor。cursorUpdate 选项不支持 ActiveAlways(NSTrackingArea.h
-/// 明确标注),所以不能走 cursorUpdate 路径。
-/// The detail-text cursor: entering -> I-beam. Cursor rects apply only to the key window,
-/// so NSTextView's own I-beam rect never activates in the non-key panel and the mouse
-/// showed an arrow over the text; an ActiveAlways mouseEntered/Exited tracking area
-/// (owner = the observer, same as the row hover) sets NSCursor manually. cursorUpdate is
-/// documented as unsupported with ActiveAlways (NSTrackingArea.h), hence the enter/exit
-/// path.
-extern "C" fn detail_tv_cursor_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    unsafe {
-        let ibeam: *mut AnyObject = msg_send![class!(NSCursor), IBeamCursor];
-        let _: () = msg_send![ibeam, set];
-    }
-}
-
-/// 详情文本光标:离开 → 恢复默认箭头。
-/// The detail-text cursor: leaving -> back to the default arrow.
-extern "C" fn detail_tv_cursor_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    unsafe {
-        let arrow: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
-        let _: () = msg_send![arrow, set];
-    }
-}
-
-/// 在当前筛选结果中找回指定文本条目的显示下标。历史全局按文本去重,因此文本可作为
-/// 详情条目的稳定身份;复制出的片段插入历史后,原详情仍应保持选中并继续显示。
-/// Find a text entry's display index in the current filters. History deduplicates text
-/// globally, so text is a stable detail-entry identity; after a copied excerpt is inserted,
-/// the source detail must stay selected and remain visible.
-/// 空态文档至少覆盖最小列表区,其余情况下恰好等于实时可视区高度,供提示真正居中。
-/// The empty-state document covers at least the minimum list area, otherwise exactly the
-/// live visible height so its hint is truly centered.
-fn empty_state_doc_height(visible_h: f64) -> f64 {
-    visible_h.max(picker_min_height() - header_strip_h() - FOOTER_H)
-}
-
-fn visible_selection_for_text(
-    history: &[ClipEntry],
-    query: &str,
-    filter: ClipFilter,
-    text: &str,
-) -> Option<usize> {
-    let history_idx = history
-        .iter()
-        .position(|entry| entry.image.is_none() && entry.text == text)?;
-    filtered_indices(history, query, filter)
-        .iter()
-        .position(|&idx| idx == history_idx)
-}
-
-/// 悬停样式门禁(纯函数,单测覆盖):指针不在浮窗窗口内时,悬停索引一律按无效
-/// 处理(NO_SELECTION)。HOVER_ROW 只反映最后一次 enter/exited 事件,事件丢失
-/// (REBUILDING 抑制、跨面板穿越、行视图拆除)会让它冻结成残留值——重建时套到
-/// 新行上就是幽灵悬停底。
-/// The hover-style gate (pure; unit-tested): when the pointer is outside the picker
-/// window, the hover index is always treated as invalid (NO_SELECTION). HOVER_ROW only
-/// mirrors the last enter/exited event -- lost events (REBUILDING suppression, cross-panel
-/// transitions, row teardown) can freeze it into a stale value that would paint a phantom
-/// hover fill onto rebuilt rows.
-fn effective_hover_row(pointer_in_window: bool, hover_row: usize) -> usize {
-    if pointer_in_window {
-        hover_row
-    } else {
-        NO_SELECTION
-    }
-}
-
-fn rect_contains_point(rect: NSRect, point: NSPoint) -> bool {
-    point.x >= rect.origin.x
-        && point.x <= rect.origin.x + rect.size.width
-        && point.y >= rect.origin.y
-        && point.y <= rect.origin.y + rect.size.height
-}
-
-/// 指针当前是否位于浮窗窗口内。NSEvent.mouseLocation 与窗口 frame 同为全局屏坐标
-/// (底部原点),可直接包含判定。
-/// Whether the pointer is currently inside the picker window. NSEvent.mouseLocation and
-/// the window frame share global screen coordinates (bottom-left origin), so containment
-/// is a direct comparison.
-unsafe fn pointer_in_picker_window() -> bool {
-    let Some(w) = *PICKER_WINDOW.lock().unwrap() else {
-        return false;
-    };
-    let frame: NSRect = msg_send![w.0, frame];
-    let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-    rect_contains_point(frame, mouse)
-}
-
-/// 详情内复制后立即重建已打开的历史列表。不能等下一次呼出:轮询虽会写入内存,
-/// 但已建好的行视图不会自行读取新历史。重建前恢复源详情的选择,避免新片段插到顶部后
-/// 高亮改指向新条目而右侧仍显示旧详情。
-/// Immediately rebuild the open history list after copying from detail. Polling writes to
-/// memory, but existing row views do not read the new history until the next summon. Restore
-/// the source-detail selection before rebuilding, so a new excerpt at the top does not make
-/// the highlight point at it while the right panel still shows the old detail.
-fn refresh_open_picker_after_detail_copy(source_detail_text: Option<&str>) {
-    if !PICKER_VISIBLE.load(Ordering::SeqCst) {
-        return;
-    }
-    // 本流程指针定义上在详情面板上,列表悬停不可能成立;显式清掉 HOVER_ROW,
-    // 防止重建把残留值套到新插入的顶部条目上(幽灵悬停底)。第二道保险——
-    // rebuild_rows 的指针门禁是主防线。
-    // The pointer is by definition over the detail panel in this flow, so no list hover
-    // can exist; clear HOVER_ROW explicitly so the rebuild never paints a stale value onto
-    // the newly inserted top entry (the phantom hover fill). A second line of defense --
-    // the pointer gate in rebuild_rows is the primary one.
-    *HOVER_ROW.lock().unwrap() = NO_SELECTION;
-    if let Some(text) = source_detail_text {
-        let selection = {
-            let history = CLIP_HISTORY.lock().unwrap();
-            let query = with_clipboard_ui(|ui| ui.search_query.clone());
-            let filter = *CLIP_FILTER.lock().unwrap();
-            visible_selection_for_text(&history, &query, filter, text)
-        };
-        if let Some(selection) = selection {
-            set_picker_selection(selection);
-        }
-    }
-    unsafe { rebuild_rows() };
-    // 新片段插入会让来源行下移;行重建完成、REBUILDING 已解除后只重算详情位置,
-    // 不重建详情文本视图,从而保留用户当前的选中文本。
-    // Inserting the excerpt moves the source row down. Once rebuilding releases REBUILDING,
-    // recompute only the detail position without recreating its text view, preserving the
-    // user's current text selection.
-    reposition_detail();
-}
-
-/// 把详情文本视图的**选中范围**写入剪贴板(无选中则兜底复制全文),Toast 提示,
-/// 详情面板保持打开(可能还要继续复制其他片段)。**不打 paste marker**——这是一次
-/// 真实复制,应当正常进入历史(与粘贴回写的抑制语义相反)。
-/// Copy the detail text view's SELECTION to the pasteboard (full text when nothing is
-/// selected), toast, and keep the detail open (the user may copy more ranges). Does NOT
-/// stamp the paste marker -- this is a genuine copy that should enter the history (the
-/// opposite of the paste-write-back suppression).
-fn copy_detail_selection() {
-    let tv = match *DETAIL_TEXT_VIEW.lock().unwrap() {
-        Some(t) => t.0,
-        None => return,
-    };
-    let source_detail_text = {
-        let sel = picker_selection();
-        mapped_index(sel).and_then(|history_idx| {
-            CLIP_HISTORY
-                .lock()
-                .unwrap()
-                .get(history_idx)
-                .filter(|entry| entry.image.is_none())
-                .map(|entry| entry.text.clone())
-        })
-    };
-    unsafe {
-        let sel_range: NSRange = msg_send![tv, selectedRange];
-        let mapped = {
-            let map = DETAIL_SOURCE_MAP.lock().unwrap();
-            map.as_ref().map(|source_map| {
-                (
-                    source_map.source.clone(),
-                    source_map.source_range(sel_range),
-                )
-            })
-        };
-        let text = if let Some((source, source_range)) = mapped {
-            // 代码详情可能插入了显示换行;按映射从原文提取,避免把格式化字符复制出去。
-            // Code details may contain display-only breaks; extract from the source mapping
-            // so formatting characters are never copied.
-            let source_ns = make_nsstring(&source);
-            let sub: *mut AnyObject = msg_send![source_ns, substringWithRange: source_range];
-            let text = nsstring_to_rust(sub);
-            CFRelease(source_ns as *const c_void);
-            text
-        } else {
-            let full: *mut AnyObject = msg_send![tv, string];
-            if sel_range.length > 0 {
-                let sub: *mut AnyObject = msg_send![full, substringWithRange: sel_range];
-                nsstring_to_rust(sub)
-            } else {
-                nsstring_to_rust(full)
-            }
-        };
-        write_pasteboard_text(&text, false);
-        // 复制是由本应用主动发起的,立刻读回并重建;不能只依赖 0.5s 轮询或通知,
-        // 否则详情保持打开时新片段会延迟到下次呼出才出现。
-        // This copy originates in our app, so read it back and rebuild immediately instead
-        // of relying only on the 0.5s poll/notification; otherwise the new excerpt appears
-        // only after the next picker summon while detail remains open.
-        poll_clipboard();
-        refresh_open_picker_after_detail_copy(source_detail_text.as_deref());
-        show_toast(&t("clipboard.toast_copied"));
-    }
-}
-
-/// 构建浮窗窗口(一次)。/ Build the picker window (once).
-///
-/// 设置页实时预览时只更新玻璃视图和详情补偿层,不重建剪贴板内容。
-/// During the settings live preview, update only the glass views and detail compensation layer;
-/// do not rebuild clipboard content.
-pub(crate) unsafe fn apply_glass_properties() {
-    let style = match crate::config::effective_glass_style().as_str() {
-        "clear" => 1i64,
-        _ => 0i64,
-    };
-    let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
-    let tint = crate::ffi::hex_to_ns_color(tint_hex);
-    if let Some(glass) = *PICKER_GLASS.lock().unwrap() {
-        let _: () = msg_send![glass.0, setStyle: style];
-        let _: () = msg_send![glass.0, setTintColor: tint];
-    }
-    if let Some(glass) = *DETAIL_GLASS.lock().unwrap() {
-        let _: () = msg_send![glass.0, setStyle: style];
-        let _: () = msg_send![glass.0, setTintColor: tint];
-    }
-    if let Some(fill_layer) = *DETAIL_GLASS_FILL_LAYER.lock().unwrap() {
-        let compensation_hex = (tint_hex & 0xFFFF_FF00) | DETAIL_INACTIVE_GLASS_COMPENSATION_A;
-        crate::ffi::layer_set_background(
-            fill_layer.0,
-            crate::ffi::hex_to_cg_color(compensation_hex),
-        );
-    }
-}
-
-/// Apply the active light/dark appearance to already-created clipboard panels.
-/// 将当前浅色/深色外观应用到已经创建的剪贴板面板。
-pub(crate) unsafe fn apply_theme() {
-    if let Some(window) = *PICKER_WINDOW.lock().unwrap() {
-        apply_panel_appearance(window.0);
-    }
-    if let Some(window) = *DETAIL_WINDOW.lock().unwrap() {
-        apply_panel_appearance(window.0);
-    }
-    apply_glass_properties();
-    apply_clear_history_confirmation_theme();
-    if let Some(buttons) = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() {
-        for button in buttons {
-            set_clear_confirmation_button_style(button.0, false);
-        }
-    }
-}
-
-unsafe fn ensure_picker_window() {
-    if PICKER_WINDOW.lock().unwrap().is_some() {
-        return;
-    }
-    let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-    let screen_frame: NSRect = msg_send![screen, frame];
-    let w = PICKER_W;
-    // 初始高度按最大高度(占位;show_picker 每次按实际 pitch 重设)。
-    // Initial height sized for the max height (placeholder; show_picker re-sizes per
-    // summon using the real pitches).
-    let h = PICKER_MAX_HEIGHT;
-    let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
-    let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
-    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
-
-    // NSPanel + NSWindowStyleMaskNonactivatingPanel(1<<7):成为 key 但不激活所属 app,
-    // 与窗口切换浮窗一致,避免抢焦点。
-    // NSPanel + NSWindowStyleMaskNonactivatingPanel (1<<7): becomes key WITHOUT activating
-    // the owning app (same as the switcher overlay), so focus isn't stolen.
-    let style: u64 = 1 << 7;
-
-    let window_cls = {
-        let name = CString::new("OhMyTabClipboardWindow").unwrap();
-        let superclass = class!(NSPanel) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_bool = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(canBecomeKeyWindow),
-            picker_window_can_become_key as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        let types_event = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(sendEvent:),
-            clipboard_window_send_event as *mut c_void,
-            types_event.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls
-    };
-    let window: *mut AnyObject = msg_send![window_cls, alloc];
-    let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
-    apply_panel_appearance(window);
-    // 浮窗级 tracking area 需要持续收到 mouseMoved,才能在正文按钮之外的行内留白
-    // 重新核对悬停行。
-    // The picker-wide tracking area needs mouseMoved continuously so hover can be reconciled
-    // while the pointer is over row padding outside the content buttons.
-    let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
-    let _: () = msg_send![window, setLevel: 3u64];
-    let _: () = msg_send![window, setOpaque: false];
-    let _: () = msg_send![window, setReleasedWhenClosed: false];
-    // 背景与窗口切换浮窗同款:clearColor + 玻璃视图提供视觉效果(见下)。
-    // Same backdrop as the switcher overlay: clearColor + a glass view for the visuals (below).
-    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-    let _: () = msg_send![window, setBackgroundColor: clear];
-    // 玻璃自带深度,窗口阴影是多余的(与窗口切换浮窗一致)。
-    // The glass carries its own depth; the window shadow is redundant (same as the overlay).
-    let _: () = msg_send![window, setHasShadow: false];
-
-    // --- 玻璃背景(Liquid Glass),与窗口切换浮窗同款 ---
-    // macOS 26+  → NSGlassEffectView(新公开 API,自带模糊)
-    // macOS <26 → NSVisualEffectView(withinWindow + Dark material)
-    // Glass backdrop (Liquid Glass), same as the switcher overlay:
-    // macOS 26+ -> NSGlassEffectView (new public API, built-in blur)
-    // macOS <26  -> NSVisualEffectView (withinWindow + Dark material).
-    let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
-    // 容器将被加进的父视图 / the parent view the container is added into.
-    let content_parent: *mut AnyObject;
-
-    if is_macos_26 {
-        let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
-        let glass: *mut AnyObject = msg_send![glass_cls, alloc];
-        let glass: *mut AnyObject =
-            msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        // 小浮窗固定小圆角(不跟随 config 的大圆角)。
-        // Fixed small corner radius for this small panel (not the config's big one).
-        let radius = CORNER_R;
-        let _: () = msg_send![glass, setCornerRadius: radius];
-        let style_i: i64 = match crate::config::effective_glass_style().as_str() {
-            "clear" => 1,
-            _ => 0,
-        };
-        let _: () = msg_send![glass, setStyle: style_i];
-        let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
-        let tint = crate::ffi::hex_to_ns_color(tint_hex);
-        let _: () = msg_send![glass, setTintColor: tint];
-        let _: () = msg_send![glass, setAutoresizingMask: 18u64];
-        let _: () = msg_send![window, setContentView: glass];
-        // NSGlassEffectView.contentView 初始可能为 nil,自建一个内层视图。
-        // NSGlassEffectView.contentView may be nil initially - create our own.
-        let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let inner: *mut AnyObject =
-            msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        let _: () = msg_send![inner, setAutoresizingMask: 18u64];
-        let _: () = msg_send![glass, setContentView: inner];
-        // 硬裁剪背景模糊进圆角(与窗口切换浮窗同款处理)。
-        // Hard-clip the backdrop blur into the corner radius (same trick as the overlay).
-        let _: () = msg_send![glass, setWantsLayer: true];
-        let glass_layer: *mut AnyObject = msg_send![glass, layer];
-        if !glass_layer.is_null() {
-            let _: () = msg_send![glass_layer, setCornerRadius: radius];
-            let _: () = msg_send![glass_layer, setMasksToBounds: true];
-        }
-        *PICKER_GLASS.lock().unwrap() = Some(ObjPtr::new(glass));
-        content_parent = inner;
-    } else {
-        let content: *mut AnyObject = msg_send![window, contentView];
-        let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-        let ve: *mut AnyObject =
-            msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        // withinWindow blending + Dark material(与窗口切换浮窗一致)。
-        // withinWindow blending + Dark material (same as the switcher overlay).
-        let _: () = msg_send![ve, setBlendingMode: 1u64]; // WithinWindow
-        let _: () = msg_send![ve, setMaterial: 12u64]; // Dark
-        let _: () = msg_send![ve, setState: 1u64]; // Active
-        let _: () = msg_send![ve, setAutoresizingMask: 18u64];
-        let _: () = msg_send![content, addSubview: ve];
-        content_parent = ve;
-    }
-
-    *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr::new(content_parent));
-
-    // 容器(接收键盘事件;flipped,行从顶部往下排,最新条目在顶)。
-    // Container (receives key events; flipped so rows stack top-down, newest on top).
-    let container = {
-        let name = CString::new("OhMyTabClipboardContainer").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_key = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(keyDown:),
-            container_key_down as *mut c_void,
-            types_key.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseMoved:),
-            container_mouse_moved as *mut c_void,
-            types_key.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseEntered:),
-            container_mouse_moved as *mut c_void,
-            types_key.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseExited:),
-            container_mouse_exited as *mut c_void,
-            types_key.as_ptr(),
-        );
-        let types_bool = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(acceptsFirstResponder),
-            container_accepts_first_responder as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        // flipped:原点在左上,y 向下增长——行从顶部排起,最新在最上。
-        // Flipped: origin at top-left, y grows downward -- rows stack from the top.
-        class_addMethod(
-            cls,
-            sel!(isFlipped),
-            container_is_flipped as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls
-    };
-    let container: *mut AnyObject = msg_send![container, alloc];
-    let container: *mut AnyObject = msg_send![
-        container,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
-    ];
-    // documentView 的高度由 rebuild_rows 按条目数动态设置,不跟随 scroll view 拉伸。
-    // The document view's height is set dynamically by rebuild_rows; it must NOT stretch
-    // with the scroll view.
-    let _: () = msg_send![container, setAutoresizingMask: 0u64];
-    add_picker_hover_tracking(content_parent, container);
-
-    // 固定头部条:搜索框 + 清除按钮所在行,不随列表滚动(滚动时文字曾从半透明 tile
-    // 底下穿过形成重叠)。flipped 坐标系让搜索框/清除按钮的既有 frame 直接可用。
-    // A fixed header strip holding the search field + the clear button; it does NOT scroll
-    // with the list (scrolling text used to bleed through the translucent tiles). Flipped so
-    // the search/clear frames work unchanged.
-    let header_strip: *mut AnyObject = {
-        let name = CString::new("OhMyTabClipHeaderView").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_bool = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(isFlipped),
-            header_strip_is_flipped as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        let strip: *mut AnyObject = msg_send![cls, alloc];
-        let strip: *mut AnyObject = msg_send![
-            strip,
-            initWithFrame: NSRect::new(
-                NSPoint::new(0.0, h - header_strip_h()),
-                NSSize::new(w, header_strip_h())
-            )
-        ];
-        // NSViewMinYMargin(8):底边距自适应 → 窗口高度变化时始终贴顶。
-        // NSViewMinYMargin (8): the bottom gap adapts -> pinned to the top as the window
-        // resizes.
-        let _: () = msg_send![strip, setAutoresizingMask: 8u64];
-        let _: () = msg_send![content_parent, addSubview: strip];
-        release_obj(strip);
-        strip
-    };
-
-    // NSScrollView:滚轮滚动 + 自定义滚动指示器(去掉系统滚动条,视觉更贴合玻璃)。
-    // 只占头部条以下的区域:列表在自身区域内滚动,避免与搜索行重叠。
-    // NSScrollView: wheel scrolling + a custom scroll indicator (the system scroller is
-    // replaced for a cleaner look on the glass). It only occupies the area below the header
-    // strip: the list scrolls within its own region and can never overlap the search row.
-    let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
-    let scroll: *mut AnyObject = msg_send![
-        scroll,
-        initWithFrame: NSRect::new(
-            NSPoint::new(0.0, FOOTER_H),
-            NSSize::new(w, h - header_strip_h() - FOOTER_H)
-        )
-    ];
-    let _: () = msg_send![scroll, setAutoresizingMask: 18u64];
-    let _: () = msg_send![scroll, setBorderType: 0u64]; // NSNoBorder
-    let _: () = msg_send![scroll, setDrawsBackground: false];
-    let _: () = msg_send![scroll, setHasVerticalScroller: false];
-    let _: () = msg_send![scroll, setHasHorizontalScroller: false];
-    let _: () = msg_send![content_parent, addSubview: scroll];
-    release_obj(scroll);
-    let _: () = msg_send![scroll, setDocumentView: container];
-    release_obj(container);
-
-    // 自定义滚动指示器:右侧 4pt 宽胶囊条,半透明白,滚动时显示、停止 1s 后淡出。
-    // Custom scroll indicator: a 4pt rounded capsule on the right, semi-transparent white;
-    // shown while scrolling and faded out 1s after scrolling stops.
-    //
-    // 这里不能使用普通 NSView:系统滚动条已关闭,普通视图既不会响应拖拽也不会改变
-    // NSScrollView 的 content offset,所以之前只能滚轮/键盘滚动。
-    // A plain NSView is not enough here: with the system scroller disabled it neither handles
-    // thumb dragging nor changes NSScrollView's content offset, which is why only wheel/key
-    // scrolling worked before.
-    let indicator: *mut AnyObject = msg_send![scroll_indicator_class(), alloc];
-    let indicator: *mut AnyObject = msg_send![
-        indicator,
-        initWithFrame: NSRect::new(
-            NSPoint::new(w - SCROLL_INDICATOR_HIT_W - 3.0, 3.0),
-            NSSize::new(
-                SCROLL_INDICATOR_HIT_W,
-                h - header_strip_h() - FOOTER_H - 6.0,
-            )
-        )
-    ];
-    // 透明命中区域比可见胶囊更宽;不要把背景设到父层,否则会把 10pt 全部画出来。
-    // The transparent hit area is wider than the visible capsule; do not paint the parent
-    // layer or all 10pt would become visible.
-    update_scroll_indicator_visual(indicator, h - header_strip_h() - FOOTER_H - 6.0, false);
-    let _: () = msg_send![indicator, setHidden: true];
-    let _: () = msg_send![scroll, addSubview: indicator];
-    release_obj(indicator);
-
-    // 观察 clipView 的 bounds 变化(滚动发生)→ 更新指示器 + 重启淡出计时器。
-    // Observe the clip view's bounds changes (scrolling) -> update the indicator + restart
-    // the fade-out timer.
-    let clip: *mut AnyObject = msg_send![scroll, contentView];
-    let _: () = msg_send![clip, setPostsBoundsChangedNotifications: true];
-    let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
-    let bounds_name = make_nsstring("NSViewBoundsDidChangeNotification");
-    let _: () = msg_send![
-        center,
-        addObserver: observer(),
-        selector: sel!(scrollIndicatorBoundsChanged:),
-        name: bounds_name,
-        object: clip
-    ];
-    CFRelease(bounds_name as *const c_void);
-    *SCROLL_VIEW.lock().unwrap() = Some(ObjPtr::new(scroll));
-    *SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr::new(indicator));
-
-    // 顶部搜索框(NSSearchField 子类):模糊过滤条目。不自动聚焦(用户点击才开始搜索)。
-    // 子类只重写 cancelOperation:(Esc)——编辑期间的按键由字段编辑器处理,↓ 等命令经
-    // delegate 的 control:textView:doCommandBySelector: 拦截(见 search_field_do_command)。
-    // Top search field (an NSSearchField subclass): fuzzy entry filtering. Not auto-focused
-    // (the user clicks it to start searching). The subclass only overrides cancelOperation:
-    // (Esc) -- while editing, keys go to the field editor, and commands like ↓ are intercepted
-    // via the delegate's control:textView:doCommandBySelector: (see search_field_do_command).
-    let search_cls = {
-        let name = CString::new("OhMyTabClipSearchField").unwrap();
-        let superclass = class!(NSSearchField) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_v = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(cancelOperation:),
-            search_field_cancel as *mut c_void,
-            types_v.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(clearSearch:),
-            search_clear_button as *mut c_void,
-            types_v.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseDown:),
-            search_field_mouse_down as *mut c_void,
-            types_v.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseMoved:),
-            search_field_mouse_moved as *mut c_void,
-            types_v.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseEntered:),
-            search_field_mouse_entered as *mut c_void,
-            types_v.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseExited:),
-            search_field_mouse_exited as *mut c_void,
-            types_v.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls
-    };
-    // 搜索框(设计稿 .search):48pt 高、10 圆角、4.5% 黑底 + 1px 内描边,占位左对齐。
-    // The search field (the mockup's .search): 48pt tall, radius 10, a 4.5% black fill
-    // with a 1px inner ring; the placeholder is left-aligned.
-    let search_w = PICKER_W - SEARCH_PAD_X * 2.0;
-    let search: *mut AnyObject = msg_send![search_cls, alloc];
-    let search: *mut AnyObject = msg_send![
-        search,
-        initWithFrame: NSRect::new(
-            NSPoint::new(SEARCH_PAD_X, TOP_PAD_Y),
-            NSSize::new(search_w, SEARCH_H)
-        )
-    ];
-    // 自定义 cell:占位 = "放大镜 SF Symbol + 搜索提示"整体画在字段左侧(见
-    // search_cell_class),⌘F 键帽画在最右侧。
-    // A custom cell: the placeholder = "magnifier SF Symbol + search hint" drawn at the
-    // field's left (see search_cell_class), with the ⌘F keycap at the far right.
-    let cell: *mut AnyObject = msg_send![search_cell_class(), alloc];
-    let empty_ns = make_nsstring("");
-    let cell: *mut AnyObject = msg_send![cell, initTextCell: empty_ns];
-    CFRelease(empty_ns as *const c_void);
-    // NSSearchField 的 field editor 不保证从 control 继承字号;先把 cell 固定为共享
-    // 字号,并在 selectWithFrame: 中再次应用给实际 editor。
-    // NSSearchField's field editor does not reliably inherit the control font; set the cell to
-    // the shared size here and apply it again to the live editor in selectWithFrame:.
-    let search_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: SEARCH_FONT_SIZE];
-    let _: () = msg_send![cell, setFont: search_font];
-    // 占位提示(放大镜 + 文案)独立构建;按设计稿为静态文案(条数显示移到底部栏)。
-    // The placeholder (magnifier + text) is built separately; per the mockup it is a
-    // static string (the entry count moved to the footer).
-    rebuild_search_hint();
-    // 保留原生 search button 的布局宽度,但清除它的图像;所有状态统一由 cell 手绘
-    // 初始的 ⌕，否则输入时 AppKit 会换成不同的 stock magnifier。
-    // Keep the native search button's layout width but clear its image; the cell hand-draws the
-    // original ⌕ in every state, preventing AppKit from substituting a different stock magnifier
-    // while typing.
-    let search_button: *mut AnyObject = msg_send![cell, searchButtonCell];
-    if !search_button.is_null() {
-        let blank_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-        let blank_image: *mut AnyObject =
-            msg_send![blank_image, initWithSize: NSSize::new(22.0, 22.0)];
-        let _: () = msg_send![search_button, setImage: blank_image];
-        release_obj(blank_image);
-    }
-    let _: () = msg_send![search, setCell: cell];
-    // NSSearchFieldCell 默认把 × 的 cancelOperation: 发往响应链,字段编辑器可能吞掉
-    // 它。将 cancel cell 直连到字段的 clearSearch:，确保点击一定同步清空过滤条件。
-    // NSSearchFieldCell normally sends its × cancelOperation: through the responder chain,
-    // where the field editor can consume it. Bind it directly to clearSearch: so a click always
-    // clears the matching filter too.
-    let cancel_cell: *mut AnyObject = msg_send![cell, cancelButtonCell];
-    if !cancel_cell.is_null() {
-        // 透明原生 cancel image 仍保留其布局/事件兼容性;可见的 × 由 cell 按 HTML
-        // 尺寸绘制,因此不会和系统符号混用。
-        // Keep the native cancel image transparent for layout/event compatibility; the cell
-        // draws the visible × at the HTML size so no system symbol is mixed in.
-        let blank_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-        let blank_image: *mut AnyObject =
-            msg_send![blank_image, initWithSize: NSSize::new(SEARCH_CLEAR_W, SEARCH_CLEAR_W)];
-        let _: () = msg_send![cancel_cell, setImage: blank_image];
-        release_obj(blank_image);
-        let _: () = msg_send![cancel_cell, setTarget: search];
-        let _: () = msg_send![cancel_cell, setAction: sel!(clearSearch:)];
-    }
-    release_obj(cell);
-    // 显式置空 placeholder 属性(双保险,任何读取方都拿不到内容)。
-    // Explicitly empty the placeholder property (belt and braces; no reader finds text).
-    let empty_attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-    let empty_attr: *mut AnyObject = msg_send![empty_attr, init];
-    let _: () = msg_send![search, setPlaceholderAttributedString: empty_attr];
-    release_obj(empty_attr);
-    // 修复:initTextCell: 创建的自定义 cell 默认不可编辑(isEditable=false),
-    // NSSearchField 因此 acceptsFirstResponder=false——点击/↑ 都无法进入编辑。
-    // 替换 cell 后必须显式恢复 editable(selectable 一并保证)。
-    // FIX: a custom cell created via initTextCell: is NOT editable by default
-    // (isEditable=false), which makes NSSearchField refuse first responder -- clicks and
-    // the ↑ jump could never start editing. Editable must be restored explicitly after
-    // replacing the cell (selectable too, for good measure).
-    let _: () = msg_send![search, setEditable: true];
-    let _: () = msg_send![search, setSelectable: true];
-    // 聚焦环会在编辑时画一圈方形描边,破坏圆角观感——关闭。
-    // The focus ring draws a square outline while editing, breaking the rounded look --
-    // disabled.
-    let _: () = msg_send![search, setFocusRingType: 1u64]; // NSFocusRingTypeNone
-                                                           // 编辑态文本与占位一致左对齐(设计稿文字靠左)。
-                                                           // Editing text is left-aligned like the placeholder (the mockup's layout).
-    let _: () = msg_send![search, setAlignment: 0u64]; // left
-                                                       // 输入态必须与 ↓ 后手绘的保留查询统一为 14pt,避免焦点切换时字号突变。
-                                                       // Match the 14pt hand-drawn retained query after ↓, avoiding a font-size jump on focus change.
-    let _: () = msg_send![search, setFont: search_font];
-    // 磨砂化:去掉系统描边/bezel,换成共享 field surface + 1px 内描边;保留的系统 ×
-    // 已直连 clearSearch:，不会因响应链而失效。
-    // Frosted: drop the system bezel and use the shared field surface/ring; the remaining
-    // system × is bound directly to clearSearch:, not the responder chain.
-    let _: () = msg_send![search, setBezeled: false];
-    let _: () = msg_send![search, setDrawsBackground: false];
-    let _: () = msg_send![search, setWantsLayer: true];
-    let search_layer: *mut AnyObject = msg_send![search, layer];
-    style_search_field(search, false);
-    let _: () = msg_send![search_layer, setBorderWidth: 1.0f64];
-    let _: () = msg_send![search_layer, setCornerRadius: SEARCH_R];
-    // delegate = observer()(复用通知单例):↓ 命令拦截(字段编辑器转发 moveDown:)。
-    // Delegate = observer() (reusing the notification singleton): intercepts ↓ (the field
-    // editor forwards moveDown:).
-    let _: () = msg_send![search, setDelegate: observer()];
-    // 搜索框挂在固定头部条(不随列表滚动)。
-    // The search field lives in the fixed header strip (it does not scroll with the list).
-    let _: () = msg_send![header_strip, addSubview: search];
-    // 用 tracking area 只追踪搜索框内的 ×;InVisibleRect 让 AppKit 在尺寸变化时自动更新范围。
-    // Track only the search field's × with a tracking area; InVisibleRect lets AppKit update
-    // its range automatically if the field is resized.
-    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-    let tracking: *mut AnyObject = msg_send![
-        tracking,
-        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(search_w, SEARCH_H)),
-        // NSTrackingArea 必须指定一个 active 状态;非激活的浮窗需要 ActiveAlways。
-        // NSTrackingArea requires one active state; this nonactivating panel needs ActiveAlways.
-        options: 0x283u64, // entered/exited + moved + active-always + in-visible-rect
-        owner: search,
-        userInfo: std::ptr::null::<AnyObject>()
-    ];
-    let _: () = msg_send![search, addTrackingArea: tracking];
-    release_obj(tracking);
-    // 自绘 × 没有原生 cell 的点击目标;叠放一个透明 NSButton 确保它先收到 click,
-    // 避免 NSSearchFieldCell 吞掉 mouseDown。文字与悬停底仍由下面的 cell 统一绘制。
-    // The hand-drawn × has no native click target, so overlay a transparent NSButton that gets
-    // the click before NSSearchFieldCell can consume mouseDown. The cell below still draws its
-    // glyph and hover fill consistently.
-    let clear_button: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let clear_button: *mut AnyObject = msg_send![
-        clear_button,
-        initWithFrame: NSRect::new(
-            NSPoint::new(
-                SEARCH_PAD_X + search_w - SEARCH_PAD_IN - SEARCH_CLEAR_W,
-                TOP_PAD_Y + (SEARCH_H - ACTION_H) / 2.0
-            ),
-            NSSize::new(SEARCH_CLEAR_W, ACTION_H)
-        )
-    ];
-    let _: () = msg_send![clear_button, setBordered: false];
-    let empty_title = make_nsstring("");
-    let _: () = msg_send![clear_button, setTitle: empty_title];
-    CFRelease(empty_title as *const c_void);
-    let _: () = msg_send![clear_button, setTarget: search];
-    let _: () = msg_send![clear_button, setAction: sel!(clearSearch:)];
-    let _: () = msg_send![clear_button, setHidden: true];
-    let _: () = msg_send![header_strip, addSubview: clear_button];
-    release_obj(clear_button);
-    *SEARCH_CLEAR_BUTTON.lock().unwrap() = Some(ObjPtr::new(clear_button));
-    release_obj(search);
-    *SEARCH_FIELD.lock().unwrap() = Some(ObjPtr::new(search));
-    // 文本变化(含系统清除按钮/NSSearchField 的 Esc 清空)→ 实时过滤。
-    // Text changes (including the system clear button / NSSearchField's Esc clear) filter live.
-    let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
-    let text_name = make_nsstring("NSControlTextDidChangeNotification");
-    let _: () = msg_send![
-        center,
-        addObserver: observer(),
-        selector: sel!(searchFieldChanged:),
-        name: text_name,
-        object: search
-    ];
-    CFRelease(text_name as *const c_void);
-    // 聚焦样式:保持磨砂底色,仅加深内描边;失焦还原。
-    // Focus style: preserve the frosted fill and strengthen only the inner ring; restore it
-    // on blur.
-    let begin_name = make_nsstring("NSControlTextDidBeginEditingNotification");
-    let _: () = msg_send![
-        center,
-        addObserver: observer(),
-        selector: sel!(searchFocusBegan:),
-        name: begin_name,
-        object: search
-    ];
-    CFRelease(begin_name as *const c_void);
-    let end_name = make_nsstring("NSControlTextDidEndEditingNotification");
-    let _: () = msg_send![
-        center,
-        addObserver: observer(),
-        selector: sel!(searchFocusEnded:),
-        name: end_name,
-        object: search
-    ];
-    CFRelease(end_name as *const c_void);
-
-    // 筛选行(设计稿 .filters):纯文字 12pt,选中项加深 + 底部 16×2 下划线。
-    // The filters row (the mockup's .filters): bare 12pt text; the active one darkens and
-    // gains a 16x2 underline.
-    let filter_labels = localized_filter_labels();
-    let filters_y = picker_filters_y();
-    *FILTER_PILLS.lock().unwrap() = Vec::new();
-    let mut fx = FILTERS_PAD_X;
-    for (i, lab) in filter_labels.iter().enumerate() {
-        // 按钮宽 = 文字宽 + 点击余量;间距按设计稿 17px。
-        // Button width = the text + click slack; gaps per the mockup's 17px.
-        let w = localized_string_width(lab, 12.0) + 12.0;
-        let pill = make_filter_pill(lab, i as isize, fx, filters_y, w);
-        let _: () = msg_send![header_strip, addSubview: pill];
-        release_obj(pill);
-        FILTER_PILLS.lock().unwrap().push(ObjPtr::new(pill));
-        fx += w + FILTER_GAP;
-    }
-    update_filter_pill_style(false);
-
-    // 清空历史:筛选行右侧始终显示两个紧凑文字按钮,不再先展开确认卡片。
-    // Clear history: keep two compact text actions visible beside the filters instead of
-    // expanding a separate confirmation card first.
-    let clear_labels = [
-        t("clipboard.clear_confirm_unpinned"),
-        t("clipboard.clear_confirm_all"),
-    ];
-    let clear_actions = [sel!(clearClipboardUnpinned:), sel!(clearClipboardAll:)];
-    let clear_widths: [f64; 2] =
-        std::array::from_fn(|i| localized_string_width(&clear_labels[i], 12.0) + 8.0);
-    let clear_total_w = clear_widths.iter().sum::<f64>() + CLEAR_CONFIRM_GAP;
-    let mut clear_x = PICKER_W - SEARCH_PAD_X - clear_total_w;
-    let mut clear_buttons = [std::ptr::null_mut(); 2];
-    for i in 0..2 {
-        let frame = NSRect::new(
-            NSPoint::new(clear_x, filters_y + 8.0),
-            NSSize::new(clear_widths[i], 20.0),
-        );
-        let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
-        let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
-        let _: () = msg_send![button, setBordered: false];
-        let _: () = msg_send![button, setWantsLayer: true];
-        let button_layer: *mut AnyObject = msg_send![button, layer];
-        if !button_layer.is_null() {
-            let _: () = msg_send![button_layer, setCornerRadius: 5.0f64];
-        }
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-        let _: () = msg_send![button, setFont: font];
-        let title = make_nsstring(&clear_labels[i]);
-        let _: () = msg_send![button, setTitle: title];
-        CFRelease(title as *const c_void);
-        let _: () = msg_send![button, setTarget: observer()];
-        let _: () = msg_send![button, setAction: clear_actions[i]];
-        set_clear_confirmation_button_style(button, false);
-        add_hover_tracking(button);
-        let _: () = msg_send![header_strip, addSubview: button];
-        release_obj(button);
-        clear_buttons[i] = button;
-        clear_x += clear_widths[i] + CLEAR_CONFIRM_GAP;
-    }
-    *CLEAR_HISTORY_BUTTON.lock().unwrap() = None;
-    *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() =
-        Some([ObjPtr::new(clear_buttons[0]), ObjPtr::new(clear_buttons[1])]);
-
-    // 底部栏(新设计稿 .footer):43pt,顶部分隔线 + 条目数 + 快捷键图例(清空已移到
-    // 筛选行)。/ The footer: a top hairline + the entry count + the shortcut legends
-    // (clear history now lives in the filters row).
-    build_footer(content_parent, w);
-    // toast 标签(新设计稿 .toast):暗底白字圆角胶囊,底部居中,置于 footer 之上。
-    // The toast label (the new mockup's .toast): a dark rounded pill at the bottom center,
-    // above the footer.
-    let toast_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let toast_label: *mut AnyObject = msg_send![
-        toast_label,
-        initWithFrame: NSRect::new(
-            NSPoint::new(200.0, 22.0),
-            NSSize::new(120.0, 26.0)
-        )
-    ];
-    let _: () = msg_send![toast_label, setBezeled: false];
-    let _: () = msg_send![toast_label, setDrawsBackground: false];
-    let _: () = msg_send![toast_label, setEditable: false];
-    let _: () = msg_send![toast_label, setSelectable: false];
-    let _: () = msg_send![toast_label, setAlignment: 1isize]; // Center on arm64
-    let tf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-    let _: () = msg_send![toast_label, setFont: tf];
-    let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
-    let _: () = msg_send![toast_label, setTextColor: white];
-    let _: () = msg_send![toast_label, setWantsLayer: true];
-    let tlayer: *mut AnyObject = msg_send![toast_label, layer];
-    let tbg: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 30.0f64 / 255.0, alpha: 0.86f64];
-    crate::ffi::layer_set_background(tlayer, crate::ffi::ns_color_to_cg(tbg));
-    let _: () = msg_send![tlayer, setCornerRadius: 7.0f64];
-    let _: () = msg_send![toast_label, setHidden: true];
-    let _: () = msg_send![content_parent, addSubview: toast_label];
-    release_obj(toast_label);
-    *TOAST_LABEL.lock().unwrap() = Some(ObjPtr::new(toast_label));
-
-    // 点击外部(浮窗失去 key)→ 自动隐藏。Win+V 同款行为:呼出后点任何地方即消失。
-    // Outside clicks (the picker resigns key) -> auto-hide. Same as Win+V: any click after
-    // summoning dismisses the picker.
-    let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
-    let resign_name = make_nsstring("NSWindowDidResignKeyNotification");
-    let _: () = msg_send![
-        center,
-        addObserver: observer(),
-        selector: sel!(clipboardWindowResigned:),
-        name: resign_name,
-        object: window
-    ];
-    CFRelease(resign_name as *const c_void);
-    *PICKER_CONTAINER.lock().unwrap() = Some(ObjPtr::new(container));
-    *PICKER_WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
-}
-
-/// 根据当前历史重建行按钮(选中行高亮 + 圆角背景块)。
-/// Rebuild the row buttons from history (selected row highlighted with a rounded tile).
-unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
-    let rebuild_started = Instant::now();
-    let hist = CLIP_HISTORY.lock().unwrap();
-    let container = picker_container_ptr()?;
-    // 重建会拆除旧行,期间的 enter/exit 事件会被门控;先丢弃旧索引,避免它落到新行。
-    // Rebuild tears down the old rows and gates enter/exit events; discard the old index first
-    // so it cannot land on an unrelated new row.
-    *HOVER_ROW.lock().unwrap() = NO_SELECTION;
-    // 重建期间忽略 mouseEntered(见 REBUILDING 注释)。
-    // Ignore mouseEntered during the rebuild (see the REBUILDING note).
-    REBUILDING.store(true, Ordering::SeqCst);
-    // 记录当前滚动位置(flipped 坐标下,clipView.bounds.origin.y 即滚动偏移),
-    // 重建后恢复——悬停/方向键 rebuild 不会把视口弹回顶部。
-    // Record the current scroll offset (the clip view's bounds origin y in flipped coords)
-    // and restore it after the rebuild, so hover/arrow rebuilds don't snap the viewport.
-    let scroll_offset = {
-        let clip: *mut AnyObject = msg_send![container, superview];
-        if clip.is_null() {
-            0.0
-        } else {
-            let b: NSRect = msg_send![clip, bounds];
-            b.origin.y
-        }
-    };
-
-    // 移除旧行 / remove old rows.
-    // 注意:按钮 alloc +1 已在 addSubview 后 release(由父视图持有);
-    // removeFromSuperview 会让父视图释放引用(计数归零、对象 dealloc),不应
-    // 再对其 release——否则二次释放 use-after-free(曾导致第二次呼出 segfault)。
-    // Note: the button's alloc +1 was released after addSubview (owned by the parent view);
-    // removeFromSuperview drops the parent's reference (refcount hits zero, object deallocs),
-    // so it must NOT be released again -- a second release was a use-after-free that crashed
-    // on the second summon.
-    let remove_old_started = Instant::now();
-    let mut rows = ROW_BUTTONS.lock().unwrap();
-    for &b in rows.iter() {
-        let _: () = msg_send![b.0, removeFromSuperview];
-    }
-    rows.clear();
-    // 背景块与按钮同生命周期:同样由父视图持有,removeFromSuperview 即释放,不应二次
-    // release(同按钮的 UAF 教训)。
-    // Tiles share the buttons' lifecycle: parent-owned, released by removeFromSuperview,
-    // never released again (same UAF lesson as the buttons).
-    let mut tiles = ROW_TILES.lock().unwrap();
-    for &t in tiles.iter() {
-        let _: () = msg_send![t.0, removeFromSuperview];
-    }
-    tiles.clear();
-    ROW_HOVER_VIEWS.lock().unwrap().clear();
-    ROW_VIEW_INDICES.lock().unwrap().clear();
-    let mut pitches = ROW_PITCHES.lock().unwrap();
-    pitches.clear();
-    let remove_old_ms = remove_old_started.elapsed().as_millis();
-
-    let prepare_started = Instant::now();
-    // 每行的按钮高/行距由文本换行行数决定。
-    // Each row's button height / pitch derives from its wrapped line count.
-    *pitches = compute_pitches(&hist);
-    let total = hist.len();
-    // 底部栏条目数随历史变化刷新(占位提示已改为静态文案)。
-    // The footer's entry count follows the history (the search placeholder is now a
-    // static string).
-    refresh_footer_count(total);
-    // 重建当前显示列表(按搜索词 + 筛选项过滤)。
-    // Rebuild the display list (filtered by the query AND the kind filter).
-    let query = with_clipboard_ui(|ui| ui.search_query.clone());
-    let filter = *CLIP_FILTER.lock().unwrap();
-    let filtered_indices = filtered_indices(&hist, &query, filter);
-    with_clipboard_ui(|ui| ui.filtered = filtered_indices);
-    let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
-    let show_source = show_source_app();
-
-    // 删除/裁剪后把选中索引钳到新显示列表内(越界 → 末条;NO_SELECTION 不动)。
-    // 所有重建路径自愈——修复"删除最后一条后高亮消失"(删除路径此前用删除前的脏
-    // FILTERED 长度/历史长度钳制,删末条后选中越界,无行命中高亮)。
-    // Clamp the selection into the fresh display list (out of range -> the tail;
-    // NO_SELECTION untouched) so every rebuild path self-heals -- fixes the lost highlight
-    // after deleting the last row (the delete paths used to clamp against the stale
-    // pre-delete FILTERED / history lengths, leaving the selection past the new list).
-    {
-        let sel = picker_selection();
-        set_picker_selection(clamp_selection(sel, filtered.len()));
-    }
-
-    // 空态:历史为空 → "暂无历史";有搜索词但无匹配 → "无匹配结果"。共用提示渲染。
-    // Empty state: empty history -> "no history"; a query with no matches -> "no match".
-    // Both share the same hint rendering.
-    let empty_hint = if total == 0 {
-        t("clipboard.empty")
-    } else if filtered.is_empty() {
-        t("clipboard.no_match")
-    } else {
-        String::new()
-    };
-    let prepare_ms = prepare_started.elapsed().as_millis();
-    let build_rows_started = Instant::now();
-    let mut image_rows = 0;
-    let mut code_rows = 0;
-    let mut image_ms = 0;
-    let mut content_attributed_ms = 0;
-    let mut meta_ms = 0;
-    let mut slowest_row_ms = 0;
-    let mut slowest_row_index = None;
-    if !empty_hint.is_empty() {
-        // 容器高度必须取当前 clip view 的实际可视高度,而不是最小窗口高度:筛选后
-        // 虽然没有结果,主窗口仍保留原有的较大高度;若用最小值提示会错误地偏到上方。
-        // The container height must use the clip view's live visible height, not the minimum
-        // window height. Filtering can leave the picker tall with no results; using the
-        // minimum would incorrectly place the hint near the top.
-        let clip: *mut AnyObject = msg_send![container, superview];
-        let visible_h = if clip.is_null() {
-            picker_min_height() - header_strip_h() - FOOTER_H
-        } else {
-            let bounds: NSRect = msg_send![clip, bounds];
-            bounds.size.height
-        };
-        let doc_h = empty_state_doc_height(visible_h);
-        let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
-        // 提示文本:在可视列表区内垂直居中。
-        // The hint: vertically centered within the visible list area.
-        let label_h = 40.0;
-        let label_y = (doc_h - label_h) / 2.0;
-        let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let label: *mut AnyObject = msg_send![
-            label,
-            initWithFrame: NSRect::new(
-                NSPoint::new(PAD_X, label_y),
-                NSSize::new(PICKER_W - PAD_X * 2.0, label_h)
-            )
-        ];
-        // 注意(load-bearing):Apple Silicon 上 TARGET_ABI_USES_IOS_VALUES=1,
-        // NSTextAlignment 走 iOS 值分支——Center=1、Right=2(与传统 Mac 相反)。
-        // 这里必须用 1 才是居中;传 2 会渲染成右对齐(曾因此"修坏"过)。
-        // NOTE (load-bearing): on Apple Silicon TARGET_ABI_USES_IOS_VALUES=1, so
-        // NSTextAlignment uses the iOS values -- Center=1, Right=2 (reversed vs classic
-        // Mac). 1 is required here for centering; 2 renders right-aligned (a past
-        // regression).
-        let _: () = msg_send![label, setAlignment: 1isize]; // Center on arm64
-        let hint_ns = make_nsstring(&empty_hint);
-        let _: () = msg_send![label, setStringValue: hint_ns];
-        CFRelease(hint_ns as *const c_void);
-        let _: () = msg_send![label, setBezeled: false];
-        let _: () = msg_send![label, setDrawsBackground: false];
-        let _: () = msg_send![label, setEditable: false];
-        // 空态样式按新设计稿 .empty-state:12px、30% 黑。
-        // The empty state follows the new mockup's .empty-state: 12px, 30% black.
-        let text_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
-        let _: () = msg_send![label, setTextColor: text_color];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-        let _: () = msg_send![label, setFont: font];
-        let _: () = msg_send![container, addSubview: label];
-        release_obj(label);
-        rows.push(ObjPtr::new(label));
-        let build_rows_ms = build_rows_started.elapsed().as_millis();
-        let finalize_started = Instant::now();
-        let rendered_key = picker_rows_key(history_revision(), &query, filter, show_source);
-        let finalize_ms = finalize_started.elapsed().as_millis();
-        let summary = PickerTimingSummary {
-            elapsed_ms: rebuild_started.elapsed().as_millis(),
-            history_len: total,
-            filtered_len: filtered.len(),
-            remove_old_ms,
-            prepare_ms,
-            build_rows_ms,
-            finalize_ms,
-            empty: true,
-            ..PickerTimingSummary::default()
-        };
-        with_clipboard_ui(|ui| {
-            ui.rendered_rows = Some(rendered_key);
-            ui.last_rebuild_timing = Some(summary);
-        });
-        REBUILDING.store(false, Ordering::SeqCst);
-        if summary.elapsed_ms >= CLIPBOARD_SLOW_PATH_MS {
-            log_debug!(
-                "[clip] picker_rebuild_slow elapsed_ms={} history_len={} filtered_len={} image_rows={} code_rows={} reused=false remove_old_ms={} prepare_ms={} build_rows_ms={} image_ms={} content_attributed_ms={} meta_ms={} finalize_ms={} slowest_row_ms=0 slowest_row_index=none empty=true",
-                summary.elapsed_ms,
-                summary.history_len,
-                summary.filtered_len,
-                summary.image_rows,
-                summary.code_rows,
-                summary.remove_old_ms,
-                summary.prepare_ms,
-                summary.build_rows_ms,
-                summary.image_ms,
-                summary.content_attributed_ms,
-                summary.meta_ms,
-                summary.finalize_ms,
-            );
-        }
-        return Some(summary);
-    }
-
-    // 文档高度 = 全部显示条目(滚动区域),由 NSScrollView 滚动。
-    // 下限 = 可视区高度(窗口减头部条):文档比可视区矮时悬挂在 clip 底部
-    // (clip 不翻转),行会贴底。
-    // Document height covers ALL displayed entries (the scrollable area). Floored at the
-    // visible height (the window minus the header strip): a document shorter than the
-    // visible area hangs off the clip view's bottom (the clip isn't flipped), pushing the
-    // rows against the bottom edge.
-    let doc_h = (rows_top_offset() + pitches.iter().take(filtered.len()).sum::<f64>() + PAD_Y)
-        .max(picker_min_height() - header_strip_h() - FOOTER_H);
-    let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
-    let (visible_start, visible_end) = picker_visible_row_range(&pitches, filtered.len());
-
-    let sel_idx = picker_selection();
-    // 鼠标悬停行(与选中独立:键盘导航时鼠标停在别的行上 → 两态并存)。
-    // The hovered row (independent of the selection: with keyboard navigation the mouse
-    // may park on another row -> both states coexist, like the mockup's :hover/.selected).
-    // 悬停门禁:指针不在浮窗窗口内时悬停必然不成立(enter/exited 事件可能被
-    // REBUILDING 抑制或跨面板穿越吞掉,HOVER_ROW 会冻结成残留值),按 NO_SELECTION
-    // 渲染并把静态值归位自愈——否则重建会把幽灵悬停底套到新行上。
-    // Hover gate: when the pointer is outside the picker window a hover cannot be valid
-    // (enter/exited events may be suppressed by REBUILDING or swallowed across panels,
-    // freezing HOVER_ROW into a stale value) -- render without hover and reset the static
-    // to self-heal, otherwise rebuilds would paint phantom hover fills onto fresh rows.
-    let mut hover_idx = *HOVER_ROW.lock().unwrap();
-    if !unsafe { pointer_in_picker_window() } {
-        hover_idx = effective_hover_row(false, hover_idx);
-        *HOVER_ROW.lock().unwrap() = hover_idx;
-    }
-    let mut prev_group: Option<DayGroup> = visible_start
-        .checked_sub(1)
-        .and_then(|index| filtered.get(index))
-        .map(|&history_index| day_group(hist[history_index].copied_at));
-    for (i, &h_idx) in filtered.iter().enumerate() {
-        if i < visible_start || i >= visible_end {
-            continue;
-        }
-        let row_started = Instant::now();
-        let y = row_top(i, &pitches);
-        let row_w = PICKER_W - PAD_X * 2.0;
-        let entry = &hist[h_idx];
-        let selected = i == sel_idx;
-        let hovered = i == hover_idx;
-        let group = day_group(entry.copied_at);
-        let has_hdr = prev_group.is_none() || prev_group != Some(group);
-        prev_group = Some(group);
-        let hdr_h = if has_hdr { GROUP_H } else { 0.0 };
-        let content_y = y + hdr_h;
-        let row_h = pitches[i] - hdr_h;
-
-        // 分组头:一行 11px medium 小字(新设计稿 .group-title,27px 高,垂直居中,
-        // 左内边距 13)。/ The group header: 11px medium text, 27px tall, centered.
-        let mut row_group_label = None;
-        if has_hdr {
-            let g_label = make_nsstring(&group_label(group));
-            let g: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-            let g: *mut AnyObject = msg_send![
-                g,
-                initWithFrame: NSRect::new(
-                    NSPoint::new(PAD_X + ROW_PAD_L, y + GROUP_LABEL_PAD),
-                    NSSize::new(row_w - PAD_X, GROUP_H - GROUP_LABEL_PAD)
-                )
-            ];
-            let _: () = msg_send![g, setStringValue: g_label];
-            CFRelease(g_label as *const c_void);
-            let _: () = msg_send![g, setBezeled: false];
-            let _: () = msg_send![g, setDrawsBackground: false];
-            let _: () = msg_send![g, setEditable: false];
-            let _: () = msg_send![g, setSelectable: false];
-            let g_font: *mut AnyObject =
-                msg_send![class!(NSFont), systemFontOfSize: 12.0f64, weight: 0.23f64]; // Medium
-            let _: () = msg_send![g, setFont: g_font];
-            let g_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
-            let _: () = msg_send![g, setTextColor: g_color];
-            let _: () = msg_send![container, addSubview: g];
-            release_obj(g);
-            rows.push(ObjPtr::new(g));
-            row_group_label = Some(ObjPtr::new(g));
-        }
-
-        // 行底(两种不同样式):悬停(未选中)= 0.032 黑(**没有**左条);选中 = 0.050 黑 +
-        // 2px 左指示条。按新设计稿 .item:hover vs .item.selected。
-        // The row backdrop (two distinct styles): hovered (not selected) = 0.032 black
-        // with NO bar; selected = 0.050 black + a 2px left bar. The new mockup's
-        // .item:hover vs .item.selected.
-        let palette = clipboard_palette();
-        let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let tile: *mut AnyObject = msg_send![
-            tile,
-            initWithFrame: NSRect::new(NSPoint::new(PAD_X, content_y), NSSize::new(row_w, row_h))
-        ];
-        let _: () = msg_send![tile, setWantsLayer: true];
-        let tile_layer: *mut AnyObject = msg_send![tile, layer];
-        let bg_hex = if selected {
-            palette.selection_bg
-        } else if hovered {
-            palette.hover_bg
-        } else {
-            0x00000000
-        };
-        // layer_set_background 走 raw objc_msgSend:objc2 的 msg_send! 无法编码
-        // CGColor 参数/返回(参数编码 '^{CGColor=}' 与 *mut c_void 的 '^v' 不匹配)。
-        // layer_set_background goes through raw objc_msgSend: objc2's msg_send! can't encode
-        // CGColor args/returns ('^{CGColor=}' vs '^v').
-        crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(bg_hex));
-        let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
-        // 每行都预建左侧 2px 指示条并按选中状态隐藏,这样方向键切换只需切换可见性。
-        // Prebuild the 2px selection bar for every row and hide it when unselected, so arrow
-        // navigation only toggles visibility instead of rebuilding rows.
-        let bar: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let bar: *mut AnyObject = msg_send![
-            bar,
-            initWithFrame: NSRect::new(
-                NSPoint::new(SEL_BAR_X, SEL_BAR_INSET_Y),
-                NSSize::new(SEL_BAR_W, row_h - SEL_BAR_INSET_Y * 2.0)
-            )
-        ];
-        let _: () = msg_send![bar, setWantsLayer: true];
-        let bar_layer: *mut AnyObject = msg_send![bar, layer];
-        crate::ffi::layer_set_background(bar_layer, crate::ffi::hex_to_cg_color(palette.accent));
-        let _: () = msg_send![bar_layer, setCornerRadius: SEL_BAR_W / 2.0];
-        let _: () = msg_send![bar, setHidden: !selected];
-        let _: () = msg_send![tile, addSubview: bar];
-        release_obj(bar);
-        let _: () = msg_send![container, addSubview: tile];
-        release_obj(tile);
-        tiles.push(ObjPtr::new(tile));
-
-        // 内容按钮:占行的上部(61pt),整块可点击(粘贴)+ 悬停;图片行左侧是 72×44
-        // 缩略图画布 + 文件名;文本行是 ≤2 行、按类型着色的内容。无边框、无背景。
-        // The content button: the row's upper zone (61pt), clickable (paste) + hover;
-        // image rows get a 72x44 thumbnail canvas + the filename; text rows show <=2
-        // styled lines. Borderless, backgroundless.
-        let content_x = PAD_X + ROW_PAD_L;
-        let content_w = row_w - ROW_PAD_L - ROW_PAD_R;
-        let content_h = row_h - META_FOOTER_H; // 底部留给 meta 栏 / the meta bar takes the bottom.
-        let content_btn: *mut AnyObject = msg_send![row_button_class(), alloc];
-        let is_image = entry.image.is_some();
-        if is_image {
-            image_rows += 1;
-        }
-        let content_btn: *mut AnyObject = msg_send![
-            content_btn,
-            initWithFrame: NSRect::new(
-                NSPoint::new(content_x, content_y + ROW_PAD_TOP),
-                NSSize::new(content_w, content_h - ROW_PAD_TOP - ROW_PAD_BOT)
-            )
-        ];
-        let _: () = msg_send![content_btn, setBordered: false];
-        let _: () = msg_send![content_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
-        let cell: *mut AnyObject = msg_send![content_btn, cell];
-        let _: () = msg_send![cell, setUsesSingleLineMode: false];
-        let _: () = msg_send![cell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-        if msg_send![cell, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
-            let _: () = msg_send![cell, setMaximumNumberOfLines: 2isize];
-        }
-        let image_started = Instant::now();
-        let row_img = make_row_image(entry);
-        image_ms += image_started.elapsed().as_millis();
-        if !row_img.is_null() {
-            let _: () = msg_send![content_btn, setImage: row_img];
-            let _: () = msg_send![content_btn, setImagePosition: 2isize]; // NSImageLeft
-            release_obj(row_img);
-        }
-        // Keep the full string and let the native cell wrap/truncate using actual font metrics.
-        // Character-count heuristics break on emoji, combining marks, and long unbroken words.
-        // 保留完整字符串，让原生 cell 按实际字体测量换行/截断；字符数启发式会错误处理
-        // emoji、组合字符和无空格长单词。
-        let content = entry.text.as_str();
-        let kind = if is_image {
-            TextKind::Plain
-        } else {
-            classify_text(&entry.text)
-        };
-        if kind == TextKind::Code {
-            code_rows += 1;
-        }
-        let content_attributed_started = Instant::now();
-        let attr = make_content_attributed(content, kind);
-        content_attributed_ms += content_attributed_started.elapsed().as_millis();
-        let _: () = msg_send![content_btn, setAttributedTitle: attr];
-        release_obj(attr);
-        let _: () = msg_send![content_btn, setTag: i as isize];
-        let _: () = msg_send![content_btn, setTarget: row_target()];
-        let _: () = msg_send![content_btn, setAction: sel!(handleClipboardRowClick:)];
-        add_hover_tracking(content_btn);
-        let _: () = msg_send![container, addSubview: content_btn];
-        release_obj(content_btn);
-        rows.push(ObjPtr::new(content_btn));
-
-        // 底部 meta 按钮:17pt 栏,左侧是 [13px 来源图标]·应用名·时间,整块可可点
-        // (点击 = 粘贴)、悬停选中;右侧悬浮着操作按钮。
-        // 位置 = 行底向上留 ROW_PAD_BOT(8pt,对应设计稿 .item 的 padding-bottom 8px)
-        // —— 之前贴行底,meta 栏与删除/详情/收藏按钮离下边框太近。
-        // The bottom meta button: a 17pt bar with [13px source icon] + app · time on the
-        // left; clickable (paste) and hover-tracked; the action buttons float on its right.
-        // Positioned ROW_PAD_BOT (8pt) above the row bottom, matching the mockup's
-        // .item padding-bottom 8px -- it used to sit flush with the bottom edge, leaving
-        // the meta bar and the delete/details/pin buttons too close to the bottom border.
-        let meta_y = content_y + row_h - META_FOOTER_H - ROW_PAD_BOT;
-        let meta_btn: *mut AnyObject = msg_send![row_button_class(), alloc];
-        let meta_w = row_w - ROW_PAD_L - ROW_PAD_R - ACTIONS_W - 4.0;
-        let meta_btn: *mut AnyObject = msg_send![
-            meta_btn,
-            initWithFrame: NSRect::new(
-                NSPoint::new(content_x, meta_y),
-                NSSize::new(meta_w, META_FOOTER_H)
-            )
-        ];
-        let _: () = msg_send![meta_btn, setBordered: false];
-        let _: () = msg_send![meta_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
-        let mcell: *mut AnyObject = msg_send![meta_btn, cell];
-        let _: () = msg_send![mcell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-        let meta_started = Instant::now();
-        let meta_attr = make_meta_footer_attributed(entry, show_source);
-        meta_ms += meta_started.elapsed().as_millis();
-        let _: () = msg_send![meta_btn, setAttributedTitle: meta_attr];
-        release_obj(meta_attr);
-        let _: () = msg_send![meta_btn, setTag: i as isize];
-        let _: () = msg_send![meta_btn, setTarget: row_target()];
-        let _: () = msg_send![meta_btn, setAction: sel!(handleClipboardRowClick:)];
-        add_hover_tracking(meta_btn);
-        let _: () = msg_send![container, addSubview: meta_btn];
-        release_obj(meta_btn);
-        rows.push(ObjPtr::new(meta_btn));
-
-        // 操作按钮(置顶 ☆/★ · 详情 ⓘ · 删除 ⌫):**置顶条目常显**,非置顶条目仅
-        // 悬停/选中时显现(设计稿 .actions opacity 0→1)。独立于内容/meta 按钮,点击
-        // 不触发粘贴。
-        // Action buttons (pin ☆/★ · details ⓘ · delete ⌫): ALWAYS visible on PINNED
-        // entries; on unpinned entries they appear only when the row is hovered or
-        // selected (the mockup's .actions opacity 0->1). Separate from the content/meta
-        // buttons; they never paste.
-        let act_alpha = if entry.pinned || selected || hovered {
-            1.0
-        } else {
-            0.0
-        };
-        let act_y = meta_y + (META_FOOTER_H - ACTION_H) / 2.0;
-        let x_del = PICKER_W - PAD_X - ROW_PAD_R - ACTION_BTN;
-        let x_details = x_del - ACTION_GAP - ACTION_BTN;
-        let x_pin = x_details - ACTION_GAP - ACTION_BTN;
-        let pin_sym = if entry.pinned { "★" } else { "☆" };
-        let pin_btn = make_action_button(
-            pin_sym,
-            sel!(togglePin:),
-            i as isize,
-            x_pin,
-            act_y,
-            act_alpha,
-        );
-        if !pin_btn.is_null() {
-            let _: () = msg_send![container, addSubview: pin_btn];
-            release_obj(pin_btn);
-            rows.push(ObjPtr::new(pin_btn));
-        }
-        let details_btn = make_action_button(
-            "ⓘ",
-            sel!(showItemDetails:),
-            i as isize,
-            x_details,
-            act_y,
-            act_alpha,
-        );
-        // 详情已展开且本行被选中时,详情按钮显示激活图标与独立圆角底。
-        // When detail is open for this selected row, show its active icon and own rounded fill.
-        set_detail_action_style(
-            details_btn,
-            detail_action_is_active(detail_visible(), sel_idx, i),
-            false,
-        );
-        if !details_btn.is_null() {
-            let _: () = msg_send![container, addSubview: details_btn];
-            release_obj(details_btn);
-            rows.push(ObjPtr::new(details_btn));
-        }
-        let del_btn =
-            make_action_button("⌫", sel!(deleteEntry:), i as isize, x_del, act_y, act_alpha);
-        if !del_btn.is_null() {
-            let _: () = msg_send![container, addSubview: del_btn];
-            release_obj(del_btn);
-            rows.push(ObjPtr::new(del_btn));
-        }
-        // 记录本行的悬停相关视图(底块 + 操作按钮),供悬停变化时增量刷新。
-        // Record this row's hover-dependent views (tile + action buttons) for the
-        // incremental hover refresh.
-        ROW_HOVER_VIEWS.lock().unwrap().push(RowHoverViews {
-            group_label: row_group_label,
-            tile: ObjPtr::new(tile),
-            bar: ObjPtr::new(bar),
-            content: ObjPtr::new(content_btn),
-            meta: ObjPtr::new(meta_btn),
-            pin: ObjPtr::new(pin_btn),
-            details: ObjPtr::new(details_btn),
-            del: ObjPtr::new(del_btn),
-        });
-        ROW_VIEW_INDICES.lock().unwrap().push(i);
-        let row_ms = row_started.elapsed().as_millis();
-        if row_ms > slowest_row_ms {
-            slowest_row_ms = row_ms;
-            slowest_row_index = Some(i);
-        }
-    }
-
-    // 恢复滚动位置 / restore the scroll position.
-    if scroll_offset > 0.0 {
-        let _: () = msg_send![container, scrollPoint: NSPoint::new(0.0, scroll_offset)];
-    }
-    let build_rows_ms = build_rows_started.elapsed().as_millis();
-    let finalize_started = Instant::now();
-    let rendered_key = picker_rows_key(history_revision(), &query, filter, show_source);
-    let finalize_ms = finalize_started.elapsed().as_millis();
-    let summary = PickerTimingSummary {
-        elapsed_ms: rebuild_started.elapsed().as_millis(),
-        history_len: total,
-        filtered_len: filtered.len(),
-        image_rows,
-        code_rows,
-        remove_old_ms,
-        prepare_ms,
-        build_rows_ms,
-        image_ms,
-        content_attributed_ms,
-        meta_ms,
-        finalize_ms,
-        slowest_row_ms,
-        slowest_row_index,
-        empty: false,
-    };
-    with_clipboard_ui(|ui| {
-        ui.rendered_rows = Some(rendered_key);
-        ui.last_rebuild_timing = Some(summary);
-    });
-    REBUILDING.store(false, Ordering::SeqCst);
-    if summary.elapsed_ms >= CLIPBOARD_SLOW_PATH_MS {
-        let slowest_row_index = summary
-            .slowest_row_index
-            .map_or_else(|| "none".to_owned(), |index| index.to_string());
-        log_debug!(
-            "[clip] picker_rebuild_slow elapsed_ms={} history_len={} filtered_len={} image_rows={} code_rows={} reused=false remove_old_ms={} prepare_ms={} build_rows_ms={} image_ms={} content_attributed_ms={} meta_ms={} finalize_ms={} slowest_row_ms={} slowest_row_index={} empty=false",
-            summary.elapsed_ms,
-            summary.history_len,
-            summary.filtered_len,
-            summary.image_rows,
-            summary.code_rows,
-            summary.remove_old_ms,
-            summary.prepare_ms,
-            summary.build_rows_ms,
-            summary.image_ms,
-            summary.content_attributed_ms,
-            summary.meta_ms,
-            summary.finalize_ms,
-            summary.slowest_row_ms,
-            slowest_row_index,
-        );
-    }
-    Some(summary)
-}
-
-/// 删除一行时只移除并重排已有视图;日期分组结构变化时交给完整重建处理。
-/// Remove and relayout existing views for a single deletion; fall back to a full rebuild when
-/// the date-group structure changes.
-unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
-    let old_views = ROW_HOVER_VIEWS.lock().unwrap().clone();
-    let Some(_) = old_views.get(idx) else {
-        return false;
-    };
-    let filter = *CLIP_FILTER.lock().unwrap();
-    let query = with_clipboard_ui(|ui| ui.search_query.clone());
-    let show_source = show_source_app();
-    let hist = CLIP_HISTORY.lock().unwrap();
-    let filtered = filtered_indices(&hist, &query, filter);
-    // 虚拟列表只物化视口附近的行;删除时让下一次可见刷新重新绑定槽位,避免把物理槽位
-    // 错当成完整过滤列表索引。小列表仍可走原有的无闪烁增量路径。
-    // A virtualized list materializes only rows near the viewport; let the next visible
-    // refresh rebind its slots instead of treating physical slots as full-list indices.
-    // Small lists can still use the existing no-flash incremental path.
-    let materialized_indices = ROW_VIEW_INDICES.lock().unwrap().clone();
-    if materialized_indices != (0..old_views.len()).collect::<Vec<_>>() {
-        return false;
-    }
-    if filtered.len() + 1 != old_views.len() {
-        return false;
-    }
-
-    let mut previous_group = None;
-    for (new_idx, &history_idx) in filtered.iter().enumerate() {
-        let group = day_group(hist[history_idx].copied_at);
-        let has_header = previous_group.is_none() || previous_group != Some(group);
-        previous_group = Some(group);
-        let old_idx = if new_idx < idx { new_idx } else { new_idx + 1 };
-        if old_views[old_idx].group_label.is_some() != has_header {
-            return false;
-        }
-    }
-
-    REBUILDING.store(true, Ordering::SeqCst);
-    let removed = ROW_HOVER_VIEWS.lock().unwrap().remove(idx);
-    ROW_VIEW_INDICES.lock().unwrap().remove(idx);
-    for view in [
-        removed.group_label,
-        Some(removed.tile),
-        Some(removed.bar),
-        Some(removed.content),
-        Some(removed.meta),
-        Some(removed.pin),
-        Some(removed.details),
-        Some(removed.del),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !view.0.is_null() {
-            let _: () = msg_send![view.0, removeFromSuperview];
-        }
-    }
-
-    let old_hover = *HOVER_ROW.lock().unwrap();
-    let new_hover = if old_hover == idx {
-        NO_SELECTION
-    } else if old_hover > idx && old_hover != NO_SELECTION {
-        old_hover - 1
-    } else {
-        old_hover
-    };
-    *HOVER_ROW.lock().unwrap() = new_hover;
-    with_clipboard_ui(|ui| {
-        ui.filtered = filtered.clone();
-        ui.picker_selection = clamp_selection(ui.picker_selection, filtered.len());
-    });
-
-    let mut pitches = Vec::with_capacity(filtered.len());
-    let mut previous_group = None;
-    for &history_idx in &filtered {
-        let entry = &hist[history_idx];
-        let group = day_group(entry.copied_at);
-        let header = if previous_group.is_none() || previous_group != Some(group) {
-            GROUP_H
-        } else {
-            0.0
-        };
-        previous_group = Some(group);
-        pitches.push(header + row_content_h(entry));
-    }
-    *ROW_PITCHES.lock().unwrap() = pitches.clone();
-    refresh_footer_count(hist.len());
-
-    let views = ROW_HOVER_VIEWS.lock().unwrap().clone();
-    {
-        let mut rows = ROW_BUTTONS.lock().unwrap();
-        rows.clear();
-        let mut tiles = ROW_TILES.lock().unwrap();
-        tiles.clear();
-        for view in &views {
-            if let Some(group_label) = view.group_label {
-                rows.push(group_label);
-            }
-            rows.extend([view.content, view.meta]);
-            for button in [view.pin, view.details, view.del] {
-                if !button.0.is_null() {
-                    rows.push(button);
-                }
-            }
-            tiles.push(view.tile);
-        }
-    }
-
-    let selection = picker_selection();
-    let palette = clipboard_palette();
-    let mut previous_group = None;
-    for (i, (&history_idx, view)) in filtered.iter().zip(views.iter()).enumerate() {
-        let entry = &hist[history_idx];
-        let group = day_group(entry.copied_at);
-        let has_header = previous_group.is_none() || previous_group != Some(group);
-        previous_group = Some(group);
-        let y = row_top(i, &pitches);
-        let row_w = PICKER_W - PAD_X * 2.0;
-        let header_h = if has_header { GROUP_H } else { 0.0 };
-        let content_y = y + header_h;
-        let row_h = pitches[i] - header_h;
-        if let Some(group_label) = view.group_label {
-            let _: () = msg_send![group_label.0, setFrame: NSRect::new(
-                NSPoint::new(PAD_X + ROW_PAD_L, y + GROUP_LABEL_PAD),
-                NSSize::new(row_w - PAD_X, GROUP_H - GROUP_LABEL_PAD)
-            )];
-        }
-        let _: () = msg_send![view.tile.0, setFrame: NSRect::new(
-            NSPoint::new(PAD_X, content_y),
-            NSSize::new(row_w, row_h)
-        )];
-        let _: () = msg_send![view.bar.0, setFrame: NSRect::new(
-            NSPoint::new(SEL_BAR_X, SEL_BAR_INSET_Y),
-            NSSize::new(SEL_BAR_W, row_h - SEL_BAR_INSET_Y * 2.0)
-        )];
-        let content_x = PAD_X + ROW_PAD_L;
-        let content_w = row_w - ROW_PAD_L - ROW_PAD_R;
-        let content_h = row_h - META_FOOTER_H;
-        let _: () = msg_send![view.content.0, setFrame: NSRect::new(
-            NSPoint::new(content_x, content_y + ROW_PAD_TOP),
-            NSSize::new(content_w, content_h - ROW_PAD_TOP - ROW_PAD_BOT)
-        )];
-        let meta_y = content_y + row_h - META_FOOTER_H - ROW_PAD_BOT;
-        let meta_w = row_w - ROW_PAD_L - ROW_PAD_R - ACTIONS_W - 4.0;
-        let _: () = msg_send![view.meta.0, setFrame: NSRect::new(
-            NSPoint::new(content_x, meta_y),
-            NSSize::new(meta_w, META_FOOTER_H)
-        )];
-        let act_y = meta_y + (META_FOOTER_H - ACTION_H) / 2.0;
-        let x_del = PICKER_W - PAD_X - ROW_PAD_R - ACTION_BTN;
-        let x_details = x_del - ACTION_GAP - ACTION_BTN;
-        let x_pin = x_details - ACTION_GAP - ACTION_BTN;
-        for (button, x) in [
-            (view.pin, x_pin),
-            (view.details, x_details),
-            (view.del, x_del),
-        ] {
-            if !button.0.is_null() {
-                let _: () = msg_send![button.0, setFrame: NSRect::new(
-                    NSPoint::new(x, act_y),
-                    NSSize::new(ACTION_BTN, ACTION_H)
-                )];
-                let _: () = msg_send![button.0, setTag: i as isize];
-            }
-        }
-
-        let selected = i == selection;
-        let hovered = i == new_hover;
-        let background = if selected {
-            palette.selection_bg
-        } else if hovered {
-            palette.hover_bg
-        } else {
-            0x00000000
-        };
-        let tile_layer: *mut AnyObject = msg_send![view.tile.0, layer];
-        crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(background));
-        let _: () = msg_send![view.bar.0, setHidden: !selected];
-        if !entry.pinned {
-            let alpha = if selected || hovered { 1.0 } else { 0.0 };
-            for button in [view.pin, view.details, view.del] {
-                if !button.0.is_null() {
-                    let _: () = msg_send![button.0, setAlphaValue: alpha];
-                }
-            }
-        }
-        set_detail_action_style(
-            view.details.0,
-            detail_action_is_active(detail_visible(), selection, i),
-            false,
-        );
-    }
-
-    if let Some(container) = picker_container_ptr() {
-        let document_h = (rows_top_offset() + pitches.iter().sum::<f64>() + PAD_Y)
-            .max(picker_min_height() - header_strip_h() - FOOTER_H);
-        let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, document_h)];
-    }
-    let rendered_key = picker_rows_key(history_revision(), &query, filter, show_source);
-    with_clipboard_ui(|ui| ui.rendered_rows = Some(rendered_key));
-    REBUILDING.store(false, Ordering::SeqCst);
-    true
-}
-
-/// 头部条 flipped:搜索框/清除按钮按顶部坐标布局。
-/// The header strip is flipped: the search/clear frames are top-anchored.
-extern "C" fn header_strip_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
-}
-
-/// 容器 flipped:原点在左上,行从顶部排起(最新在最上)。
-/// Container is flipped: origin at top-left, rows stack from the top (newest first).
-extern "C" fn container_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
-}
-
-/// 按事件坐标解析当前真正位于鼠标下方的可见行。先限制在列表滚动区内,避免头部或
-/// 底部坐标转换后误命中滚动文档中的行。
-/// Resolve the visible row actually under the event. Gate on the list scroll view first so
-/// header/footer coordinates cannot convert into an accidental row hit in the document view.
-unsafe fn hover_row_at_event(event: *mut c_void) -> usize {
-    if event.is_null() {
-        return NO_SELECTION;
-    }
-    let scroll = match *SCROLL_VIEW.lock().unwrap() {
-        Some(scroll) => scroll.0,
-        None => return NO_SELECTION,
-    };
-    let Some(container) = picker_container_ptr() else {
-        return NO_SELECTION;
-    };
-    let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
-    let scroll_point: NSPoint = msg_send![
-        scroll,
-        convertPoint: location,
-        fromView: std::ptr::null::<AnyObject>()
-    ];
-    let scroll_bounds: NSRect = msg_send![scroll, bounds];
-    if !rect_contains_point(scroll_bounds, scroll_point) {
-        return NO_SELECTION;
-    }
-
-    let point: NSPoint = msg_send![
-        container,
-        convertPoint: location,
-        fromView: std::ptr::null::<AnyObject>()
-    ];
-    let indices = ROW_VIEW_INDICES.lock().unwrap().clone();
-    ROW_HOVER_VIEWS
-        .lock()
-        .unwrap()
-        .iter()
-        .position(|row| {
-            if row.tile.0.is_null() {
-                return false;
-            }
-            let frame: NSRect = msg_send![row.tile.0, frame];
-            rect_contains_point(frame, point)
-        })
-        .and_then(|slot| indices.get(slot).copied())
-        .unwrap_or(NO_SELECTION)
-}
-
-/// 浮窗内任意鼠标移动都按整行背景重新核对悬停状态。这样正文按钮退出到行内留白后,
-/// 继续移出浮窗也不会因 tracking owner 缺失而留下幽灵样式。
-/// Reconcile hover against the whole row backdrop on every picker mouse move. This prevents
-/// a stale style when the pointer leaves a content button through row padding and then exits.
-extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    if REBUILDING.load(Ordering::SeqCst) {
-        return;
-    }
-    let row = unsafe { hover_row_at_event(event) };
-    set_hover_row(row);
-}
-
-/// 鼠标离开整个浮窗时兜底清空;此事件由固定父视图的 InVisibleRect tracking area
-/// 提供,不依赖任何行内按钮是否收到 mouseExited。
-/// Clear hover when leaving the whole picker. The fixed parent's InVisibleRect tracking area
-/// supplies this event independently of whether any row button receives mouseExited.
-extern "C" fn container_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    if !REBUILDING.load(Ordering::SeqCst) {
-        set_hover_row(NO_SELECTION);
-    }
-}
-
-/// 行按钮类(NSButton 子类,重写 mouseEntered: 实现悬停选中)。
-/// Row-button class (NSButton subclass; mouseEntered: implements hover selection).
-unsafe fn row_button_class() -> *mut AnyObject {
-    static ROW_BTN_CLS: OnceLock<StaticClass> = OnceLock::new();
-    ROW_BTN_CLS
-        .get_or_init(|| {
-            let name = CString::new("OhMyTabClipboardRowButton").unwrap();
-            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                row_button_mouse_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                row_button_mouse_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            StaticClass(cls as *const objc2::runtime::AnyClass)
-        })
-        .0 as *mut AnyObject
-}
-
-fn update_hover_visuals(prev: usize, new: usize) {
-    let sel = picker_selection();
-    let hist = CLIP_HISTORY.lock().unwrap();
-    let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
-    // 与建行时的样式常量保持一致(选中 0.050 优先于悬停 0.032)。
-    // Keep in sync with the constants at row creation (selected 0.050 beats hovered 0.032).
-    const SEL_BG: f64 = 0.050;
-    const HOVER_BG: f64 = 0.032;
-    unsafe {
-        for i in [prev, new] {
-            if i == NO_SELECTION {
-                continue;
-            }
-            let Some(rv) = row_view_for_display_index(i) else {
-                continue;
-            };
-            let selected = i == sel;
-            let hovered = i == new;
-            let bg_alpha = if selected {
-                SEL_BG
-            } else if hovered {
-                HOVER_BG
-            } else {
-                0.0
-            };
-            let layer: *mut AnyObject = msg_send![rv.tile.0, layer];
-            let bg: *mut AnyObject =
-                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha];
-            crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
-            if !rv.bar.0.is_null() {
-                let _: () = msg_send![rv.bar.0, setHidden: !selected];
-            }
-            // 按钮透明度:置顶条目常显(恒 1.0);非置顶条目 = 悬停/选中才显现。
-            // Button alpha: pinned entries keep them always visible (fixed 1.0); unpinned
-            // entries show them on hover/selection only.
-            let pinned = filtered
-                .get(i)
-                .and_then(|&h| hist.get(h))
-                .map(|e| e.pinned)
-                .unwrap_or(false);
-            if !pinned {
-                let act_alpha: f64 = if selected || hovered { 1.0 } else { 0.0 };
-                for b in [rv.pin, rv.details, rv.del] {
-                    if !b.0.is_null() {
-                        let _: () = msg_send![b.0, setAlphaValue: act_alpha];
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn set_hover_row(new: usize) {
-    let mut hover = HOVER_ROW.lock().unwrap();
-    let prev = *hover;
-    if prev == new {
-        return;
-    }
-    *hover = new;
-    drop(hover);
-    update_hover_visuals(prev, new);
-}
-
-/// 搜索框聚焦时列表没有键盘选中项,但过滤后的条目仍应显示独立的鼠标悬停样式。
-/// With search focus, the list has no keyboard-selected row, but filtered entries must still
-/// show their independent mouse-hover style.
-extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    // 重建期间派发的 enter 忽略(防无限递归,见 REBUILDING 注释)。
-    // Ignore enters dispatched during a rebuild (prevents infinite recursion; see REBUILDING).
-    if REBUILDING.load(Ordering::SeqCst) {
-        return;
-    }
-    let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
-    if idx >= 0 {
-        // 悬停只更新 hover 行(轻底,0.032),**不改选中**——选中(0.050 + 左条)只由
-        // 键盘方向键/点击驱动。两个状态因此能同时可见,对应设计稿里独立的
-        // .item:hover 与 .item.selected(悬停即选中会让悬停行恒为选中样式,
-        // 轻悬停底无法显示,两种状态看着就一样)。
-        // Hovering only sets the hovered row (the light 0.032 fill) and does NOT move the
-        // selection (0.050 + the left bar) -- the selection moves via the keyboard arrows
-        // / clicks only. The two states stay independently visible, matching the mockup's
-        // separate .item:hover and .item.selected rules (auto-select-on-hover would always
-        // render the hovered row as the selected style, making them look identical).
-        // 增量刷新悬停视觉,不重建。
-        // Incremental hover visuals, no rebuild.
-        set_hover_row(idx as usize);
-    }
-}
-
-/// 判断鼠标是否仍在整行区域内,包括右侧独立的操作按钮。
-/// Check whether the pointer is still inside the whole row, including its separate action buttons.
-unsafe fn mouse_inside_row(event: *mut c_void, idx: usize) -> bool {
-    let Some(row) = row_view_for_display_index(idx) else {
-        return false;
-    };
-    if row.tile.0.is_null() {
-        return false;
-    }
-    let Some(container) = picker_container_ptr() else {
-        return false;
-    };
-    // locationInWindow 使用窗口基准坐标;fromView 必须是 NSView,不能误传 NSWindow。
-    // locationInWindow uses the window-base coordinate system; fromView must be an NSView,
-    // never an NSWindow.
-    let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
-    let point: NSPoint = msg_send![
-        container,
-        convertPoint: location,
-        fromView: std::ptr::null::<AnyObject>()
-    ];
-    let frame: NSRect = msg_send![row.tile.0, frame];
-    rect_contains_point(frame, point)
-}
-
-/// 清除指定行的悬停状态,并同步收起该行的 hover 视觉。
-/// Clear a row's hover state and synchronously collapse its hover visuals.
-fn clear_hover_row_if(idx: usize) {
-    let hovered = *HOVER_ROW.lock().unwrap();
-    if hovered == idx {
-        set_hover_row(NO_SELECTION);
-    }
-}
-
-/// 鼠标离开行按钮:仅在真正离开整行时清除悬停,避免移向右下角操作按钮时消失。
-/// Mouse leaves a row button: clear hover only after leaving the whole row, so moving to the
-/// bottom-right action buttons does not hide them mid-transition.
-extern "C" fn row_button_mouse_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    if REBUILDING.load(Ordering::SeqCst) {
-        return;
-    }
-    let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
-    if idx >= 0 {
-        if unsafe { mouse_inside_row(event, idx as usize) } {
-            return;
-        }
-        clear_hover_row_if(idx as usize);
-    }
-}
-
-/// 行点击(按钮 tag = 行索引)→ 粘贴该行;Option+点击(设置开启)= 粘贴并删除。
-/// 修饰键从 currentEvent 读:action 在 mouseUp 时触发,currentEvent 就是这一次点击
-/// (与 keyboard 路径的 Option+Enter 等价;开关关闭时 Option 被忽略,普通粘贴)。
-/// Row click (button tag = row index) -> paste that row; Option+click (when the setting
-/// is on) = paste and delete. The modifiers come from currentEvent: the action fires on
-/// mouseUp, so currentEvent IS this click (equivalent to Option+Enter on the keyboard
-/// path; with the toggle off Option is ignored and the normal paste runs).
-extern "C" fn handle_clipboard_row_click(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    if idx >= 0 {
-        // NSEventModifierFlagOption = 1 << 19(Alternate)= 0x08_0000。currentEvent 是
-        // NSApplication 的**实例**方法,必须先取 sharedApplication——直接发给 Class
-        // 对象会抛 unrecognized selector,异常炸穿 AppKit 事件循环,把浮窗卡死。
-        // NSEventModifierFlagOption (Alternate) = 1 << 19 = 0x08_0000. currentEvent is an
-        // INSTANCE method on NSApplication: go through sharedApplication first. Sending it
-        // to the Class object raises an unrecognized-selector exception that unwinds
-        // through AppKit's event loop and wedges the picker.
-        let option_held = unsafe {
-            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-            let ev: *mut AnyObject = if nsapp.is_null() {
-                std::ptr::null_mut()
-            } else {
-                msg_send![nsapp, currentEvent]
-            };
-            if ev.is_null() {
-                false
-            } else {
-                let flags: u64 = msg_send![ev, modifierFlags];
-                (flags & 0x0008_0000) != 0
-            }
-        };
-        if option_held {
-            paste_at_ex(idx as usize, true);
-        } else {
-            paste_at(idx as usize);
-        }
-    }
-}
-
-/// 图钉按钮回调(tag = 显示行索引)→ 映射历史索引置顶/取消置顶并刷新列表。
-/// Pin-button callback (tag = display row index) -> mapped history index, pin/unpin, refresh.
-extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    if idx < 0 {
-        return;
-    }
-    let Some(h_idx) = mapped_index(idx as usize) else {
-        return;
-    };
-    let mut hist = CLIP_HISTORY.lock().unwrap();
-    let (now_pinned, new_h_idx) = toggle_pin_on(&mut hist, h_idx);
-    drop(hist);
-    save_history();
-    unsafe { rebuild_rows() };
-    // 跟随置顶设置:选中被操作条目(用重排后的新索引)→ 再重建一次刷新高亮。
-    // Follow-pin setting: select the toggled entry (the POST-REORDER index), then rebuild
-    // once more.
-    if selection_after_pin(new_h_idx) {
-        unsafe { rebuild_rows() };
-    }
-    // 置顶会改变条目在列表中的位置;详情面板按选中行重新定位并刷新内容。
-    // Pinning changes the row position; reposition and refresh the detail panel from the
-    // current selection so it follows the reordered row.
-    if detail_visible() {
-        unsafe { show_detail_for_sel() };
-    }
-    let msg = if now_pinned {
-        t("clipboard.toast_pinned")
-    } else {
-        t("clipboard.toast_unpinned")
-    };
-    show_toast(&msg);
-}
-
-/// 置顶/取消置顶后按设置移动选中(`clipboard.pin_follow_selection`):
-/// - 跟随置顶(true,默认):选中移到被操作条目的**新显示位置**(置顶 → 列表顶,
-///   取消置顶 → 非置顶区顶部);
-/// - 保持当前位置(false):不动(rebuild_rows 只做越界钳制,选中指向原下一条,
-///   便于批量置顶)。
-///
-/// 返回是否移动了选中(调用方据此再补一次 rebuild_rows 刷新高亮)。`new_h_idx` 是
-/// 条目**重排后**的历史索引(toggle_pin_on 返回的新索引)——旧索引此时已指向别的
-/// 条目,搜新列表会落在旧位置,等于"保持当前位置"(曾因此"跟随"不生效)。
-/// Move the selection after pin/unpin per `clipboard.pin_follow_selection`:
-/// - Follow (true, default): select the toggled entry's NEW display position (pin -> the
-///   top of the list; unpin -> the top of the unpinned block);
-/// - Keep (false): leave it (rebuild_rows only clamps; the selection points at the next
-///   entry, convenient for batch pinning).
-///
-/// Returns whether the selection moved (the caller then rebuilds once more to refresh the
-/// highlight). `new_h_idx` is the entry's POST-REORDER history index (returned by
-/// toggle_pin_on) -- the OLD index already refers to a different entry, so searching the
-/// fresh list with it would land on the old position, i.e. exactly "keep current" (the
-/// follow mode once failed this way).
-fn selection_after_pin(new_h_idx: usize) -> bool {
-    if !CONFIG.read().unwrap().clipboard.pin_follow_selection {
-        return false;
-    }
-    let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
-    if let Some(pos) = filtered.iter().position(|&h| h == new_h_idx) {
-        set_picker_selection(pos);
-        true
-    } else {
-        false
-    }
-}
-
-/// 删除按钮回调(tag = 显示行索引)→ 映射历史索引删除并刷新列表。
-/// Delete-button callback (tag = display row index) -> mapped history index, remove, refresh.
-/// 详情按钮回调(tag = 显示行索引)→ 选中该行并打开详情面板(与 → 键同路径)。
-/// **toggle**:详情已开且点的正是当前选中行 → 关闭(再点一下取消详情);否则照常
-/// 选中该行并打开/刷新详情(跨行点击时详情跟随新行)。
-/// The details-button callback (tag = display row index) -> select the row and open the
-/// detail panel (the same path as the → key). TOGGLE: with the detail already open and
-/// the click landing on the CURRENTLY selected row, close it (a second click cancels the
-/// detail); otherwise select the row and open/refresh the detail (a different row's click
-/// moves the detail along to the new row).
-extern "C" fn show_item_details_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    if idx < 0 {
-        return;
-    }
-    let previous = picker_selection();
-    // 已打开且点的是当前选中行 → 本次点击是"取消详情"。
-    // Detail already open AND the click is on the selected row -> this click cancels it.
-    let close = detail_visible() && previous == idx as usize;
-    set_picker_selection(idx as usize);
-    unsafe {
-        // 详情按钮点击只需要更新前后两行的视觉状态,无需同步重建整个剪贴板列表。
-        // A detail-button click only needs the incremental visual update for the old and new
-        // selection; rebuilding the entire clipboard list here made mouse opening feel slow.
-        refresh_selection(previous, idx as usize);
-        if close {
-            hide_detail();
-        } else {
-            show_detail_for_sel();
-        }
-    }
-}
-
-extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    if idx < 0 {
-        return;
-    }
-    let Some(h_idx) = mapped_index(idx as usize) else {
-        return;
-    };
-    let mut hist = CLIP_HISTORY.lock().unwrap();
-    let Some(removed_entry) = remove_entry_for_undo(&mut hist, h_idx) else {
-        return;
-    };
-    // 被删行在选中行上方 → 选中下移一格(保持指向同一条);被删行即选中行或在其下方
-    // → 不动(前者指向原下一条)。无选中哨兵(搜索框聚焦)不动。越界钳制统一交给
-    // rebuild_rows 在 FILTERED 重算后处理——此前用 hist.len() 钳制显示索引:无搜索词
-    // 时两者恰好相等才碰巧正确,搜索过滤时维度不匹配,删末条后仍会越界、高亮消失。
-    // A deleted row ABOVE the selection shifts it down one (the same entry stays selected);
-    // deleting the selected row or a row below leaves it alone (the former points at the
-    // next entry). The no-selection sentinel (search-field focus) is untouched. The
-    // out-of-range clamp happens in rebuild_rows after FILTERED is recomputed -- this used
-    // to clamp the display index against hist.len(): correct only by coincidence without a
-    // search query, dimensionally wrong under a filter, and still past the list after
-    // deleting the tail (the lost highlight).
-    let previous = picker_selection();
-    let deleted_selected = previous != NO_SELECTION && previous == idx as usize;
-    if previous != NO_SELECTION && (idx as usize) < previous {
-        set_picker_selection(previous - 1);
-    }
-    drop(hist);
-    remember_deleted_clipboard_entry(removed_entry, h_idx);
-    let incremental = unsafe { try_delete_picker_row_incremental(idx as usize) };
-    save_history();
-    if !incremental {
-        schedule_picker_refresh();
-    }
-    // 详情面板跟随选中条目;若删的正是选中条目则关闭它(避免残留已删内容)。
-    // The detail panel follows the selected entry; when the deleted row WAS the selection,
-    // close the panel (no stale content).
-    if deleted_selected && detail_visible() {
-        hide_detail();
-    }
-}
-
-/// 粘贴指定显示索引的条目(经 FILTERED 映射):关闭浮窗 + 写回剪贴板 + 模拟 Cmd+V。
-/// Paste the entry at display `idx` (mapped through FILTERED): close the picker + write back
-/// to the pasteboard + synthesize Cmd+V.
-fn paste_at(idx: usize) {
-    paste_at_ex(idx, false);
-}
-
-/// paste_at 的焚后变体:粘贴成功后立即从历史中删除该条目(Option+回车/点击,
-/// 一次性粘贴)。删除走 delete_entry(图片缓存文件一并清理),置顶条目同样可焚。
-/// The burn-after-paste variant of paste_at: on a successful paste the entry is removed
-/// from the history right away (Option+Enter/click, one-shot paste). Removal goes through
-/// delete_entry (the image cache file goes too); pinned entries burn all the same.
-fn paste_at_ex(idx: usize, delete_after: bool) {
-    let Some(h_idx) = mapped_index(idx) else {
-        log_debug!("[clip] paste index {} out of range", idx);
-        hide_picker();
-        return;
-    };
-    let entry = {
-        let hist = CLIP_HISTORY.lock().unwrap();
-        hist.get(h_idx).cloned()
-    };
-    let Some(entry) = entry else {
-        log_debug!("[clip] paste index {} out of range", idx);
-        hide_picker();
-        return;
-    };
-    // 实际生效 = 手势 ∧ 设置:开关关闭时 Option 只是普通粘贴(修饰键被忽略)。
-    // Effective = gesture AND setting: with the toggle off, Option falls back to a plain
-    // paste (the modifier is ignored).
-    let burn = delete_after && delete_after_paste();
-    if burn {
-        // 布防必须在写回之前(同步通知重入场景,见布防函数注释)。
-        // Arm BEFORE the write-back (the synchronous-notification re-entry case; see the
-        // arming function's comment).
-        arm_paste_delete_suppression();
-    }
-    hide_picker();
-    unsafe {
-        if let Some(img) = &entry.image {
-            // 文件复制条目:源文件还在 → 恢复文件语义(file-url)粘贴(应用按需读
-            // 原文件);源文件已删除/移动 → 直接跳过(文件条目不存字节,无内容可回退)。
-            // A file-copy entry: if the source file still exists, restore file semantics
-            // (file-url) -- the target app reads the original file on demand; if the source
-            // is deleted/moved, skip the paste (a file entry stores no bytes to fall back
-            // to).
-            let ok = match paste_kind(img) {
-                PasteKind::File(path) => write_pasteboard_file(&path),
-                PasteKind::Image if img.source_path.is_some() => {
-                    log_info!("[clip] paste skipped: source file gone (uti={})", img.uti);
-                    false
-                }
-                PasteKind::Image => write_pasteboard_image(img),
-            };
-            // 写回失败(如缓存缺失)时跳过合成 Cmd+V,避免把旧剪贴板内容粘出去。
-            // On a failed write-back (e.g. cache miss) skip the synthesized Cmd+V, so the
-            // OLD pasteboard content is not pasted.
-            if ok {
-                let pasted = synthesize_paste();
-                if burn && pasted {
-                    delete_burned_entry(&entry);
-                    if clear_system_pasteboard_after_paste() {
-                        schedule_system_pasteboard_clear();
-                    }
-                } else if burn {
-                    log_info!("[clip] paste-and-delete skipped: Cmd+V event creation failed");
-                    disarm_paste_delete_suppression();
-                }
-            } else {
-                // 写回失败 = 没发生写回,撤防抑制,条目保留(不能"没粘上还丢了记录")。
-                // A failed write-back means nothing was written: disarm so the suppression
-                // cannot swallow the next genuine copy, and keep the entry (never lose the
-                // record without a paste).
-                if burn {
-                    disarm_paste_delete_suppression();
-                }
-            }
-        } else {
-            // 粘贴回写:打 marker(轮询跳过,防止粘贴被当成新复制移动条目)。
-            // Paste write-back: stamp the marker (the poll skips it, so a paste is never
-            // re-captured as a fresh copy that reorders the history).
-            let ok = write_pasteboard_text(&entry.text, true);
-            if ok {
-                let pasted = synthesize_paste();
-                if burn && pasted {
-                    delete_burned_entry(&entry);
-                    if clear_system_pasteboard_after_paste() {
-                        schedule_system_pasteboard_clear();
-                    }
-                } else if burn {
-                    log_info!("[clip] paste-and-delete skipped: Cmd+V event creation failed");
-                    disarm_paste_delete_suppression();
-                }
-            } else if burn {
-                log_info!("[clip] paste-and-delete skipped: text write-back failed");
-                disarm_paste_delete_suppression();
-            }
-        }
-    }
-}
-
-/// 焚后粘贴的删除步骤:条目移出历史(图片缓存文件一并删除)并落盘;日志只记类型
-/// 与计数,不记条目内容。
-/// The removal step of burn-after-paste: drop the entry from the history (the image cache
-/// file goes too) and persist; logs record only the kind and count, never the content.
-fn delete_burned_entry(target: &ClipEntry) {
-    let kind = {
-        let mut hist = CLIP_HISTORY.lock().unwrap();
-        let Some(h_idx) = hist
-            .iter()
-            .position(|entry| same_clip_entry_identity(entry, target))
-        else {
-            log_debug!("[clip] paste-and-delete: entry already gone");
-            return;
-        };
-        let kind = match hist.get(h_idx) {
-            Some(e) if e.image.is_some() => "image",
-            Some(_) => "text",
-            None => "gone",
-        };
-        if kind != "gone" {
-            delete_entry(&mut hist, h_idx);
-        }
-        kind
-    };
-    save_history();
-    log_info!(
-        "[clip] pasted and deleted (burn after paste, kind={})",
-        kind
-    );
-}
-
-/// 粘贴内容判定:文件复制条目且源文件仍存在 → 文件粘贴(恢复 file-url);
-/// 其余情况 → 图片数据粘贴(按原始 UTI)。纯函数,便于单测。
-/// Decide the paste kind: a file-copy entry whose source file still exists pastes as a
-/// FILE (restoring the file-url); everything else pastes as image data (original UTI).
-/// Pure, unit-tested.
-#[derive(Debug, Clone, PartialEq)]
-enum PasteKind {
-    File(String),
-    Image,
-}
-
-fn paste_kind(img: &ImageEntry) -> PasteKind {
-    match &img.source_path {
-        Some(path) if std::path::Path::new(path).exists() => PasteKind::File(path.clone()),
-        _ => PasteKind::Image,
-    }
-}
-
-/// 先关闭浮窗后合成 Cmd+V(keyDown + keyUp,post 到 session 层)。
-/// 浮窗是 key window(NonactivatingPanel + makeKeyWindow),此时合成键盘事件会被路由给
-/// 浮窗所属的 app(我们自己),输入框收不到;orderOut 后面板失去 key,系统 key window
-/// 回归原应用,合成事件才能到达用户原来的输入框。
-/// Synthesize Cmd+V (keyDown + keyUp, posted at the session level) AFTER the picker is
-/// closed. The panel is the key window (NonactivatingPanel + makeKeyWindow), so a
-/// synthesized key event would be routed to the panel's app (us) and never reach the input
-/// field; once ordered out, the panel resigns key, the system key window returns to the
-/// previous app, and the synthesized Cmd+V lands in the user's input field.
-unsafe fn synthesize_paste() -> bool {
-    let down = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, true);
-    let Some(down) = (!down.is_null()).then_some(down) else {
-        return false;
-    };
-    CGEventSetFlags(down, K_CG_EVENT_FLAG_MASK_COMMAND);
-    CGEventPost(K_CG_SESSION_EVENT_TAP, down);
-    let up = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, false);
-    if up.is_null() {
-        // 创建失败也必须释放已 post 的 down:CGEventCreate* 返回 +1,post 不接管所有权。
-        // Release the already-posted `down` on this failure path too: CGEventCreate* returns
-        // +1 and posting does not take ownership.
-        CFRelease(down as *const c_void);
-        return false;
-    }
-    CGEventSetFlags(up, K_CG_EVENT_FLAG_MASK_COMMAND);
-    CGEventPost(K_CG_SESSION_EVENT_TAP, up);
-    CFRelease(down as *const c_void);
-    CFRelease(up as *const c_void);
-    true
-}
-
-/// 方向键导航纯逻辑:↑(126)/↓(125) 返回新的选中索引(循环);其它键返回 None。
-/// Pure arrow-key navigation: up (126) / down (125) return the next selection (wrapping);
-/// any other key returns None.
-fn nav_arrow(keycode: u16, sel: usize, hist_len: usize) -> Option<usize> {
-    if hist_len == 0 {
-        return None;
-    }
-    // sel 可能为 NO_SELECTION(usize::MAX,焦点在搜索框时的哨兵)——冒烟直接驱动
-    // handler 会走到这里,必须防溢出并视为"无选中"处理。
-    // sel may be NO_SELECTION (usize::MAX, the sentinel while the search field has focus) --
-    // the smoke drives the handler directly so this must not overflow and treats it as
-    // "no selection".
-    match keycode {
-        126 => Some(if sel == 0 || sel >= hist_len {
-            hist_len - 1
-        } else {
-            sel - 1
-        }),
-        125 => Some(if sel >= hist_len - 1 { 0 } else { sel + 1 }),
-        _ => None,
-    }
-}
-
-/// 删除/裁剪后把选中索引钳制到当前显示列表内(越界 → 末条);
-/// 无选中哨兵(NO_SELECTION)不动。纯函数,供 rebuild_rows 与删除路径共用,单测覆盖。
-/// Clamp a selection index into the current display list after deletions/trims
-/// (out of range -> the tail); the no-selection sentinel (NO_SELECTION) is left untouched.
-/// Pure function shared by rebuild_rows and the delete paths; unit-tested.
-fn clamp_selection(sel: usize, len: usize) -> usize {
-    if sel == NO_SELECTION || len == 0 {
-        return sel;
-    }
-    sel.min(len - 1)
-}
-
-/// 键盘导航:Tab 循环分类,↑/↓ 选择,← 置顶,→ 展开详情(详情打开时 → 关闭详情),
-/// Enter 粘贴,Esc 关闭。
-/// Keyboard navigation: Tab cycles filters; up/down select, left pins, right expands
-/// details (with the detail open, right closes it), Enter pastes, Esc closes.
-/// C 回调的 panic 边界:panic 穿不过 extern "C" 帧(会 abort 整个进程),这里统一接住。
-/// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
-/// aborts the process), so it is contained here.
-extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    crate::callback_guard::void("container_key_down", || unsafe {
-        container_key_down_inner(_self, _cmd, event)
-    });
-}
-
-unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
-        let keycode: u16 = msg_send![event as *mut AnyObject, keyCode];
-        // Cmd+F(键码 3 + Command 修饰 0x100000):聚焦顶部搜索框。搜索框已聚焦时
-        // 按键由字段编辑器消化,不会到达这里——天然无操作。
-        // Cmd+F (keycode 3 + Command modifier 0x100000): focus the top search field.
-        // When the field is already focused, the key goes to the field editor and never
-        // reaches here -- a natural no-op.
-        let mods: u64 = msg_send![event as *mut AnyObject, modifierFlags];
-        // Cmd+Z(键码 6)只由列表容器处理;搜索框的 field editor 会先接收它,保留文本撤销。
-        // Cmd+Z (keycode 6) is handled only by the list container; the search field's field
-        // editor receives it first, preserving native text-editing undo.
-        if is_clipboard_undo_shortcut(keycode, mods) {
-            if undo_deleted_clipboard_entry().is_some() {
-                rebuild_rows();
-                show_toast(&t("clipboard.toast_undo_delete"));
-            }
-            return;
-        }
-        // Cmd+C(键码 8):详情打开时复制选中范围(无选中 = 复制全文)。键盘路径与
-        // 详情底部的"复制所选"按钮等价——详情面板不会成为 key,系统 Cmd+C 路由
-        // 到主浮窗,这里手动转发。搜索框聚焦时按键由字段编辑器消化,天然不冲突。
-        // Cmd+C (keycode 8): with the detail open, copy the selection (full text when
-        // nothing is selected) -- the keyboard twin of the detail's "copy selection"
-        // button. The detail never becomes key, so the system routes Cmd+C to the picker;
-        // we forward it here. With the search field focused the key goes to the field
-        // editor first, so no conflict.
-        if keycode == 8 && (mods & 0x0010_0000) != 0 && detail_visible() {
-            copy_detail_selection();
-            return;
-        }
-        if keycode == 3 && (mods & 0x0010_0000) != 0 {
-            if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
-                let window = match *PICKER_WINDOW.lock().unwrap() {
-                    Some(w) => w.0,
-                    None => return,
-                };
-                // makeFirstResponder: 返回 BOOL('B')。
-                // makeFirstResponder: returns BOOL ('B').
-                let _: bool = msg_send![window, makeFirstResponder: f.0];
-            }
-            return;
-        }
-        // 可选中范围是当前显示列表(搜索过滤后;超出可视部分靠滚动查看)。
-        // The selectable range is the current display list (post-filter; scrolling reveals
-        // the rest).
-        let display_len = with_clipboard_ui(|ui| ui.filtered.len());
-        let sel = picker_selection();
-        match keycode {
-            48 => {
-                // Tab(48):按固定顺序循环筛选分类;详情若已展开则先关闭,避免筛选后
-                // 详情遗留一条不属于当前列表的陈旧内容。
-                // Tab(48): cycle filters in the fixed order. Close an open detail first so
-                // filtering cannot leave stale content that no longer belongs to the list.
-                let next = {
-                    let active = CLIP_FILTER.lock().unwrap();
-                    next_clip_filter(*active)
-                };
-                apply_clip_filter(next);
-            }
-            123 => {
-                // ←(123):无论详情是否打开,都切换当前选中条目的置顶状态。
-                // Left: toggle the selected entry's pinned state whether or not the detail
-                // panel is open.
-                let idx = sel;
-                let Some(h_idx) = mapped_index(idx) else {
-                    return;
-                };
-                let mut hist = CLIP_HISTORY.lock().unwrap();
-                let (now_pinned, new_h_idx) = toggle_pin_on(&mut hist, h_idx);
-                drop(hist);
-                save_history();
-                rebuild_rows();
-                // 跟随置顶设置:选中被操作条目(用重排后的新索引)→ 再重建一次刷新高亮。
-                // Follow-pin setting: select the toggled entry (the POST-REORDER index),
-                // then rebuild once more to refresh the highlight.
-                if selection_after_pin(new_h_idx) {
-                    rebuild_rows();
-                }
-                // 置顶会改变条目在列表中的位置;详情保持打开并跟随新的选中行。
-                // Pinning changes the row position; keep the detail open and follow the new
-                // selected row.
-                if detail_visible() {
-                    show_detail_for_sel();
-                }
-                let msg = if now_pinned {
-                    t("clipboard.toast_pinned")
-                } else {
-                    t("clipboard.toast_unpinned")
-                };
-                show_toast(&msg);
-            }
-            124 => {
-                // →(124):详情打开时关闭详情(与 ← 一致);否则展开选中条目的详情
-                // (完整文本 / 图片大图)。
-                // Right: closes the detail panel when it is open (same as ←); otherwise
-                // expands the selected entry's details (full text / large image).
-                if detail_visible() {
-                    hide_detail();
-                    return;
-                }
-                let idx = sel;
-                if idx == NO_SELECTION {
-                    return;
-                }
-                show_detail_for_sel();
-            }
-            126 | 125 => {
-                // ↑(126):已在列表第一条(或无选中)时跳回搜索框;进入前清除选中,
-                // 高光消失(delegate 的 controlTextDidBeginEditing: 也会清,双保险)。
-                // Up (126): at the first list entry (or no selection), jump focus back to the
-                // search field; clear the selection BEFORE entering so the highlight goes away
-                // (the controlTextDidBeginEditing: delegate also clears - belt and braces).
-                if keycode == 126 && (sel == 0 || sel == NO_SELECTION) {
-                    if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
-                        set_picker_selection(NO_SELECTION);
-                        rebuild_rows();
-                        let window = match *PICKER_WINDOW.lock().unwrap() {
-                            Some(w) => w.0,
-                            None => return,
-                        };
-                        // makeFirstResponder: 返回 BOOL('B')。
-                        // makeFirstResponder: returns BOOL ('B').
-                        let _: bool = msg_send![window, makeFirstResponder: f.0];
-                        return;
-                    }
-                }
-                let previous = sel;
-                let idx = if let Some(next) = nav_arrow(keycode, sel, display_len) {
-                    set_picker_selection(next);
-                    next
-                } else {
-                    sel
-                };
-                refresh_selection(previous, idx);
-                // 滚动到选中行可见 / scroll the selection into view.
-                if let Some(container) = picker_container_ptr() {
-                    scroll_selection_into_view(container, idx);
-                }
-                // 详情打开时跟随选中条目实时刷新(浏览体验,类似 Quick Look)。
-                // The detail panel follows the selection live while open (Quick-Look-style
-                // browsing).
-                if detail_visible() {
-                    show_detail_for_sel();
-                }
-            }
-            36 => {
-                // Enter;Option+Enter(设置开启)= 粘贴并删除(一次性粘贴)。
-                // 修饰掩码沿用本函数顶部的 NSEventModifierFlags 位:Command=0x10_0000,
-                // Option(Alternate)=0x08_0000。
-                // Enter; Option+Enter (when the setting is on) = paste and delete (one-shot
-                // paste). Modifier bits follow NSEventModifierFlags as at the top of this
-                // function: Command=0x10_0000, Option (Alternate)=0x08_0000.
-                let idx = sel;
-                if (mods & 0x0008_0000) != 0 {
-                    paste_at_ex(idx, true);
-                } else {
-                    paste_at(idx);
-                }
-            }
-            51 => {
-                // Backspace(删除键):删除选中条目并刷新。
-                // Backspace (delete): remove the selected entry and refresh.
-                let idx = sel;
-                let Some(h_idx) = mapped_index(idx) else {
-                    return;
-                };
-                let mut hist = CLIP_HISTORY.lock().unwrap();
-                let Some(removed_entry) = remove_entry_for_undo(&mut hist, h_idx) else {
-                    return;
-                };
-                // 删除的是选中行本身 → 选中保持原位(指向原下一条);删末条后越界则由
-                // rebuild_rows 在 FILTERED 重算后钳到新末条——此前用删除前的脏
-                // FILTERED 长度钳制,删末条后选中越界、无行命中高亮,高亮消失。
-                // Deleting the selected row keeps the selection in place (pointing at the
-                // next entry); an out-of-range selection (deleted the tail) is clamped to
-                // the new tail by rebuild_rows after FILTERED is recomputed -- the old code
-                // clamped against the stale pre-delete FILTERED length, so the selection
-                // stayed past the new list, no row matched, and the highlight vanished.
-                drop(hist);
-                remember_deleted_clipboard_entry(removed_entry, h_idx);
-                let incremental = try_delete_picker_row_incremental(idx);
-                save_history();
-                if !incremental {
-                    schedule_picker_refresh();
-                }
-                // 详情面板跟随选中条目,而选中条目刚被删除 → 关闭,避免残留已删内容。
-                // The detail panel follows the selected entry, which was just deleted ->
-                // close it, so no stale content lingers.
-                hide_detail();
-            }
-            53 => {
-                if clear_history_confirmation_expanded() {
-                    set_clear_history_confirmation_expanded(false);
-                    return;
-                }
-                // Esc:详情打开时第一级 = 关闭详情(浮窗与搜索词保持不动)。
-                // Esc: with the detail open, the first press closes the detail (the picker
-                // and the query stay untouched).
-                if detail_visible() {
-                    hide_detail();
-                    return;
-                }
-                // Esc:清空搜索词则恢复全列表,再按才关闭——搜索框聚焦时的第一级由
-                // NSSearchField 子类的 cancelOperation: 处理;这里处理列表聚焦时。
-                // Esc: a query gets cleared first (restoring the full list), a second press
-                // closes. The search-field-focused first level is handled by the
-                // NSSearchField subclass's cancelOperation:; this handles list focus.
-                let had_query = with_clipboard_ui(|ui| {
-                    let had_query = !ui.search_query.is_empty();
-                    ui.search_query.clear();
-                    had_query
-                });
-                if had_query {
-                    rebuild_rows();
-                } else {
-                    hide_picker();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// 根据可视区与选中行位置计算滚动偏移,避免快速按键时 scrollRectToVisible 与重建互相覆盖。
-/// Compute the scroll offset from the viewport and selected-row geometry, avoiding the race-like
-/// interaction between scrollRectToVisible and rapid row rebuilds.
-fn selection_scroll_offset(current: f64, viewport_h: f64, document_h: f64, y: f64, h: f64) -> f64 {
-    let max_offset = (document_h - viewport_h).max(0.0);
-    let target = if y < current {
-        y
-    } else if y + h > current + viewport_h {
-        y + h - viewport_h
-    } else {
-        current
-    };
-    target.max(0.0).min(max_offset)
-}
-
-/// 直接把选中行滚入可视区,不依赖 AppKit 的异步可见性调整。
-/// Scroll the selected row into view directly, without relying on AppKit's asynchronous
-/// visibility adjustment.
-unsafe fn scroll_selection_into_view(container: *mut AnyObject, idx: usize) {
-    let (y, h) = {
-        let pitches = ROW_PITCHES.lock().unwrap();
-        let Some(&h) = pitches.get(idx) else {
-            return;
-        };
-        (row_top(idx, &pitches), h)
-    };
-    let scroll = match *SCROLL_VIEW.lock().unwrap() {
-        Some(s) => s.0,
-        None => return,
-    };
-    let clip: *mut AnyObject = msg_send![scroll, contentView];
-    if clip.is_null() {
-        return;
-    }
-    let bounds: NSRect = msg_send![clip, bounds];
-    let document: NSRect = msg_send![container, frame];
-    let target = selection_scroll_offset(
-        bounds.origin.y,
-        bounds.size.height,
-        document.size.height,
-        y,
-        h,
-    );
-    if (target - bounds.origin.y).abs() > f64::EPSILON {
-        // scrollPoint:使用文档视图坐标;显式 clamp 后不会因快速重复事件被旧位置覆盖。
-        // scrollPoint: uses document-view coordinates; explicit clamping prevents rapid
-        // repeated events from being overwritten by a stale position.
-        let _: () = msg_send![container, scrollPoint: NSPoint::new(0.0, target)];
-    }
-}
-
-/// 更新选中高亮,只刷新前后两行的视觉状态,不重建列表。
-/// Refresh selection highlight by updating only the previous and new rows, without rebuilding.
-fn refresh_selection(previous: usize, current: usize) {
-    update_hover_visuals(previous, current);
-}
-
-extern "C" fn container_accepts_first_responder(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
-}
-
-extern "C" fn picker_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
-}
-
-// ========== 文本/样式 helper ==========
-
-/// 行标题(attributed):选中 = 白字粗体,未选 = labelColor。
-/// Row title (attributed): selected = white bold, unselected = labelColor.
-unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObject {
-    let palette = clipboard_palette();
-    let key = ContentAttributedKey {
-        content: content.to_owned(),
-        kind: match kind {
-            TextKind::Plain => 0,
-            TextKind::Url => 1,
-            TextKind::Code => 2,
-        },
-        primary_text: palette.primary_text,
-        secondary_text: palette.secondary_text,
-        accent: palette.accent,
-    };
-    if let Some(cached) = CONTENT_ATTRIBUTED_CACHE.lock().unwrap().get_mut(&key) {
-        cached.last_used = next_ui_cache_recency();
-        CFRetain(cached.object.0 as *const c_void);
-        return cached.object.0;
-    }
-    let prepared_code = (kind == TextKind::Code).then(|| prepare_code_display(content, usize::MAX));
-    let display_content = prepared_code
-        .as_ref()
-        .map(|code| code.text.as_str())
-        .unwrap_or(content);
-    let pstyle: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
-    let pstyle: *mut AnyObject = msg_send![pstyle, init];
-    let _: () = msg_send![pstyle, setAlignment: -1isize]; // NSTextAlignmentNatural
-    let _: () = msg_send![pstyle, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
-
-    let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-    let attrs: *mut AnyObject = msg_send![attrs, init];
-    let font: *mut AnyObject = match kind {
-        TextKind::Code => {
-            msg_send![class!(NSFont), monospacedSystemFontOfSize: 14.0f64, weight: 0.0f64]
-        }
-        _ => msg_send![class!(NSFont), systemFontOfSize: 14.0f64],
-    };
-    let color = match kind {
-        TextKind::Url => crate::ffi::hex_to_ns_color(palette.accent),
-        TextKind::Code => crate::ffi::hex_to_ns_color(palette.secondary_text),
-        TextKind::Plain => crate::ffi::hex_to_ns_color(palette.primary_text),
-    };
-    let font_key = make_nsstring("NSFont");
-    let color_key = make_nsstring("NSColor");
-    let pstyle_key = make_nsstring("NSParagraphStyle");
-    let _: () = msg_send![attrs, setObject: font, forKey: font_key];
-    let _: () = msg_send![attrs, setObject: color, forKey: color_key];
-    let _: () = msg_send![attrs, setObject: pstyle, forKey: pstyle_key];
-    CFRelease(font_key as *const c_void);
-    CFRelease(color_key as *const c_void);
-    CFRelease(pstyle_key as *const c_void);
-    release_obj(pstyle);
-    let ns = make_nsstring(display_content);
-    let attr: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
-    let attr: *mut AnyObject = msg_send![attr, initWithString: ns, attributes: attrs];
-    CFRelease(ns as *const c_void);
-    release_obj(attrs);
-    if let Some(code) = &prepared_code {
-        apply_visible_space_markers(attr, &code.text);
-    } else {
-        apply_link_color(attr, display_content, kind);
-    }
-    CFRetain(attr as *const c_void);
-    let mut released = Vec::new();
-    {
-        let mut cache = CONTENT_ATTRIBUTED_CACHE.lock().unwrap();
-        if let Some(old) = cache.insert(
-            key,
-            CachedUiObject {
-                object: ObjPtr::new(attr),
-                last_used: next_ui_cache_recency(),
-            },
-        ) {
-            released.push(old.object);
-        }
-        if cache.len() > UI_CACHE_CAPACITY {
-            let evicted_key = cache
-                .iter()
-                .min_by_key(|(_, cached)| cached.last_used)
-                .map(|(key, _)| key.clone());
-            if let Some(evicted_key) = evicted_key {
-                if let Some(evicted) = cache.remove(&evicted_key) {
-                    released.push(evicted.object);
-                }
-            }
-        }
-    }
-    for object in released {
-        release_obj(object.0);
-    }
-    attr
-}
-
-/// meta 段(attributed):13px 来源应用小图标(文本附件)+ "应用 · 时间",10px 30% 黑。
-/// 关闭来源显示或图标不存在时只出时间。新设计稿 meta 行的 .app-icon。
-/// The meta line (attributed): a 13px source-app icon (text attachment) + "app · time",
-/// 10px 30% black. With source display off or no icon, it shows time only.
-unsafe fn make_meta_footer_attributed(entry: &ClipEntry, show_source: bool) -> *mut AnyObject {
-    let total: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
-    let empty_ns = make_nsstring("");
-    let total: *mut AnyObject = msg_send![total, initWithString: empty_ns];
-    CFRelease(empty_ns as *const c_void);
-
-    // 设置关闭时不读取也不附加来源图标,确保图标与来源文字同时隐藏。
-    // With the setting off, neither load nor attach the source icon so it hides together
-    // with the source text.
-    let icon = if should_show_source_icon(show_source, entry) {
-        load_source_icon(entry, META_ICON)
-    } else {
-        std::ptr::null_mut()
-    };
-    if !icon.is_null() {
-        // 13px 图标 → 文本附件,基线对齐后接一个空格。
-        // The 13px icon as a text attachment, baseline-aligned with a trailing space.
-        let attachment: *mut AnyObject = msg_send![class!(NSTextAttachment), alloc];
-        let attachment: *mut AnyObject = msg_send![attachment, init];
-        let _: () = msg_send![attachment, setImage: icon];
-        let _: () = msg_send![attachment, setBounds: NSRect::new(
-            NSPoint::new(0.0, -2.0),
-            NSSize::new(META_ICON, META_ICON)
-        )];
-        // attributedStringWithAttachment: 返回 +0(autoreleased)对象,不应 release
-        // ——额外释放会在池回收时二次释放崩溃(与 rebuild_search_hint 同款纪律)。
-        // attributedStringWithAttachment: returns a +0 (autoreleased) object; releasing it
-        // over-releases and crashes on pool drain (same discipline as rebuild_search_hint).
-        let att_str: *mut AnyObject = msg_send![
-            class!(NSAttributedString),
-            attributedStringWithAttachment: attachment
-        ];
-        release_obj(attachment);
-        let _: () = msg_send![total, appendAttributedString: att_str];
-        let sp = make_nsstring(" ");
-        let sp_attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let sp_attr: *mut AnyObject = msg_send![sp_attr, initWithString: sp];
-        CFRelease(sp as *const c_void);
-        let _: () = msg_send![total, appendAttributedString: sp_attr];
-        release_obj(sp_attr);
-        release_obj(icon);
-    }
-
-    let meta = build_meta_text(entry, show_source);
-    if !meta.is_empty() {
-        let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-        let attrs: *mut AnyObject = msg_send![attrs, init];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-        let color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
-        let font_key = make_nsstring("NSFont");
-        let color_key = make_nsstring("NSColor");
-        let _: () = msg_send![attrs, setObject: font, forKey: font_key];
-        let _: () = msg_send![attrs, setObject: color, forKey: color_key];
-        CFRelease(font_key as *const c_void);
-        CFRelease(color_key as *const c_void);
-        let ns = make_nsstring(&meta);
-        let part: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let part: *mut AnyObject = msg_send![part, initWithString: ns, attributes: attrs];
-        CFRelease(ns as *const c_void);
-        release_obj(attrs);
-        let _: () = msg_send![total, appendAttributedString: part];
-        release_obj(part);
-    }
-    total
-}
-
-/// 加载来源应用的小图标(按 `size` 点尺寸缩放;无缓存返回 null)。
-/// Load the source app's small icon (pre-scaled to `size` in points; null when uncached).
-unsafe fn load_source_icon(entry: &ClipEntry, size: f64) -> *mut AnyObject {
-    if entry.source_key.is_empty() {
-        return std::ptr::null_mut();
-    }
-    let icon_path = crate::icon_cache::small_icon_path_for_key(&entry.source_key);
-    let metadata = match std::fs::metadata(&icon_path) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            let key = (entry.source_key.clone(), size.to_bits());
-            if let Some(cached) = SOURCE_ICON_CACHE.lock().unwrap().remove(&key) {
-                release_obj(cached.image.0);
-            }
-            return std::ptr::null_mut();
-        }
-    };
-    let modified = metadata.modified().ok();
-    if !metadata.is_file() {
-        let key = (entry.source_key.clone(), size.to_bits());
-        if let Some(cached) = SOURCE_ICON_CACHE.lock().unwrap().remove(&key) {
-            release_obj(cached.image.0);
-        }
-        return std::ptr::null_mut();
-    }
-
-    let key = (entry.source_key.clone(), size.to_bits());
-    {
-        let cache = SOURCE_ICON_CACHE.lock().unwrap();
-        if let Some(cached) = cache.get(&key) {
-            if cached.modified == modified {
-                let image = cached.image.0;
-                let _: *mut AnyObject = msg_send![image, retain];
-                return image;
-            }
-        }
-    }
-
-    if let Some(cached) = SOURCE_ICON_CACHE.lock().unwrap().remove(&key) {
-        release_obj(cached.image.0);
-    }
-    let ns_path = make_nsstring(&icon_path);
-    let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let img: *mut AnyObject = msg_send![img, initWithContentsOfFile: ns_path];
-    CFRelease(ns_path as *const c_void);
-    if !img.is_null() {
-        let _: () = msg_send![img, setSize: NSSize::new(size, size)];
-        SOURCE_ICON_CACHE.lock().unwrap().insert(
-            key,
-            CachedSourceIcon {
-                image: ObjPtr::new(img),
-                modified,
-            },
-        );
-        let _: *mut AnyObject = msg_send![img, retain];
-    }
-    img
-}
-
-/// 组装内容按钮左侧画布(NSImage):仅图片行返回 72×44 圆角缩略图盒(浅底 + 内描边,
-/// 新设计稿 .image-preview);文本行返回 null。来源图标不再画进行首——改在 meta 行里
-/// 以小图标形式出现(见 make_meta_footer_attributed)。
-/// Compose the content button's left canvas (NSImage): only image rows get a 72x44
-/// rounded thumbnail box (faint fill + inner ring, the new mockup's .image-preview);
-/// text rows return null. The source icon no longer sits at the row's left -- it appears
-/// as a small glyph in the meta line (see make_meta_footer_attributed).
-unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
-    let Some(img) = &entry.image else {
-        return std::ptr::null_mut();
-    };
-    if img.preview_png.is_empty() {
-        return std::ptr::null_mut();
-    }
-    let palette = clipboard_palette();
-    let key = RowImageKey {
-        image_hash: img.hash,
-        field_bg: palette.field_bg,
-        card_border: palette.card_border,
-    };
-    if let Some(cached) = ROW_IMAGE_CACHE.lock().unwrap().get_mut(&key) {
-        cached.last_used = next_ui_cache_recency();
-        CFRetain(cached.object.0 as *const c_void);
-        return cached.object.0;
-    }
-    let data: *mut AnyObject = msg_send![
-        class!(NSData),
-        dataWithBytes: img.preview_png.as_ptr() as *const c_void,
-        length: img.preview_png.len()
-    ];
-    let im: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let im: *mut AnyObject = msg_send![im, initWithData: data];
-    if im.is_null() {
-        return std::ptr::null_mut();
-    }
-    let s: NSSize = msg_send![im, size];
-    if s.width <= 0.0 || s.height <= 0.0 {
-        release_obj(im);
-        return std::ptr::null_mut();
-    }
-    // 等比 contain 进 72×44 盒 / fit-contain into the 72x44 box.
-    let scale = (THUMB_W / s.width).min(THUMB_H / s.height);
-    let w = s.width * scale;
-    let h = s.height * scale;
-    let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let target: *mut AnyObject = msg_send![target, initWithSize: NSSize::new(THUMB_W, THUMB_H)];
-    let _: () = msg_send![target, lockFocus];
-    // 缩略图盒复用设置页 field surface,避免在浅深色主题中出现不同的灰度体系。
-    // Reuse the settings field surface for thumbnail boxes so light and dark themes share one
-    // grayscale system.
-    let fill = crate::ffi::hex_to_ns_color(palette.field_bg);
-    let _: () = msg_send![fill, set];
-    let box_path: *mut AnyObject = msg_send![
-        class!(NSBezierPath),
-        bezierPathWithRoundedRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(THUMB_W, THUMB_H)),
-        xRadius: THUMB_R,
-        yRadius: THUMB_R
-    ];
-    let _: () = msg_send![box_path, fill];
-    // 圆角裁剪后画图 / clip to the rounded rect, then draw the image.
-    let _: () = msg_send![box_path, addClip];
-    let dst = NSRect::new(
-        NSPoint::new((THUMB_W - w) / 2.0, (THUMB_H - h) / 2.0),
-        NSSize::new(w, h),
-    );
-    let src_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
-    let op: usize = 1; // NSCompositingOperationCopy
-    let _: () = msg_send![im, drawInRect: dst, fromRect: src_rect, operation: op, fraction: 1.0f64];
-    // 内描边(设计稿 inset ring)/ the inset ring.
-    let ring = crate::ffi::hex_to_ns_color(palette.card_border);
-    let _: () = msg_send![ring, set];
-    let _: () = msg_send![box_path, setLineWidth: 1.0f64];
-    let _: () = msg_send![box_path, stroke];
-    let _: () = msg_send![target, unlockFocus];
-    release_obj(im);
-    CFRetain(target as *const c_void);
-    let mut released = Vec::new();
-    {
-        let mut cache = ROW_IMAGE_CACHE.lock().unwrap();
-        if let Some(old) = cache.insert(
-            key,
-            CachedUiObject {
-                object: ObjPtr::new(target),
-                last_used: next_ui_cache_recency(),
-            },
-        ) {
-            released.push(old.object);
-        }
-        if cache.len() > UI_CACHE_CAPACITY {
-            let evicted_key = cache
-                .iter()
-                .min_by_key(|(_, cached)| cached.last_used)
-                .map(|(key, _)| *key);
-            if let Some(evicted_key) = evicted_key {
-                if let Some(evicted) = cache.remove(&evicted_key) {
-                    released.push(evicted.object);
-                }
-            }
-        }
-    }
-    for object in released {
-        release_obj(object.0);
-    }
-    target
-}
-
-/// 详情按钮仅在详情已展开且所属行仍被选中时激活。独立成纯逻辑,让建行、开关详情
-/// 与单测都使用同一条件。
-/// A detail action is active only while detail is open and its owning row remains selected.
-/// Keep this pure so row creation, detail open/close, and tests share one condition.
-fn detail_action_is_active(detail_visible: bool, selected: usize, row: usize) -> bool {
-    detail_visible && selected != NO_SELECTION && selected == row
-}
-
-/// 生成 HTML 设计稿同款详情图标:普通态为深色空心圆 + i;激活态为深色实心圆 +
-/// 白色 i。用预着色 NSImage 而非 Unicode `ⓘ`,以便圆环、点和竖线分别遵循设计稿。
-/// Draw the mockup's detail icon: a dark outlined circle plus i normally, or a dark filled
-/// circle plus white i while active. Use a precolored NSImage instead of Unicode `ⓘ` so the
-/// ring, dot, and stem follow the mockup independently.
-unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject {
-    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let image: *mut AnyObject = msg_send![
-        image,
-        initWithSize: NSSize::new(DETAIL_ACTION_ICON, DETAIL_ACTION_ICON)
-    ];
-    let _: () = msg_send![image, lockFocus];
-    let circle: *mut AnyObject = msg_send![
-        class!(NSBezierPath),
-        bezierPathWithOvalInRect: NSRect::new(
-            // HTML: viewBox 20 × 20, circle cx/cy=10, r=7. 映射到 16pt 画布时,
-            // 圆心为 8、半径为 5.6,不能直接使用原 SVG 的 7pt 半径。
-            // HTML uses a 20 × 20 viewBox with a circle at 10/10 and r=7. On our 16pt
-            // canvas that is center 8 and radius 5.6; do not use the SVG's raw 7pt radius.
-            NSPoint::new(2.4, 2.4),
-            NSSize::new(11.2, 11.2)
-        )
-    ];
-    let circle_alpha = match (active, hovered) {
-        (true, true) => 0.68,
-        (true, false) => 0.58,
-        (false, true) => 0.62,
-        (false, false) => 0.34,
-    };
-    let circle_color: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: circle_alpha];
-    let _: () = msg_send![circle_color, set];
-    // 设计稿的 1.45px 描边同样按 16 / 20 缩放;激活态仍保留同色描边。
-    // Scale the mockup's 1.45px stroke by 16 / 20; the active state retains this same-color stroke.
-    let _: () = msg_send![circle, setLineWidth: 1.16f64];
-    if active {
-        let _: () = msg_send![circle, fill];
-    }
-    let _: () = msg_send![circle, stroke];
-    let glyph_alpha = if active {
-        0.96
-    } else if hovered {
-        0.66
-    } else {
-        0.42
-    };
-    let glyph_color: *mut AnyObject = if active {
-        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: glyph_alpha]
-    } else {
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: glyph_alpha]
-    };
-    let _: () = msg_send![glyph_color, set];
-    // 坐标按 SVG 视图翻转后换算:点在上,竖线从中部延伸到底部。
-    // Coordinates convert the SVG view's flipped axis: the dot is above the stem.
-    let dot: *mut AnyObject = msg_send![
-        class!(NSBezierPath),
-        bezierPathWithOvalInRect: NSRect::new(NSPoint::new(7.2, 10.08), NSSize::new(1.6, 1.6))
-    ];
-    let _: () = msg_send![dot, fill];
-    let stem: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![stem, moveToPoint: NSPoint::new(8.0, 8.56)];
-    let _: () = msg_send![stem, lineToPoint: NSPoint::new(8.0, 4.8)];
-    let _: () = msg_send![stem, setLineWidth: 1.12f64];
-    let _: () = msg_send![stem, setLineCapStyle: 1isize]; // NSLineCapStyleRound
-    let _: () = msg_send![stem, stroke];
-    let _: () = msg_send![image, unlockFocus];
-    let _: () = msg_send![image, setTemplate: false];
-    image
-}
-
-/// 用统一的剪贴板操作按钮状态绘制自身的圆角悬停背景。
-/// Apply the shared clipboard action-button state to its own rounded hover background.
-/// 详情是否展开只影响图标,不改变按钮底色。/ Detail activation changes only the icon,
-/// never the button background.
-fn is_clear_history_destructive_action(action: Sel) -> bool {
-    action == sel!(clearClipboardHistory:)
-        || action == sel!(clearClipboardUnpinned:)
-        || action == sel!(clearClipboardAll:)
-}
-
-fn confirmation_surface_background(palette: crate::theme::UiPalette) -> u32 {
-    // 使用主题卡片色,避免 field_bg 的中性灰在叠加后把确认卡片压得过暗。
-    // Use the theme card color so field_bg's darker neutral gray cannot make the confirmation
-    // surface look muddy after compositing.
-    let alpha = if palette.dark { 0xE0 } else { 0xEC };
-    (palette.card_bg & 0xFFFF_FF00) | alpha
-}
-
-unsafe fn is_clear_confirmation_button(button: *mut AnyObject) -> bool {
-    if button.is_null() {
-        return false;
-    }
-    let Some(confirmation) = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() else {
-        return false;
-    };
-    let parent: *mut AnyObject = msg_send![button, superview];
-    parent == confirmation.surface.0
-}
-
-unsafe fn is_clear_history_action_button(button: *mut AnyObject) -> bool {
-    CLEAR_HISTORY_ACTION_BUTTONS
-        .lock()
-        .unwrap()
-        .map(|buttons| buttons.iter().any(|candidate| candidate.0 == button))
-        .unwrap_or(false)
-}
-
-unsafe fn set_clear_confirmation_button_style(button: *mut AnyObject, hovered: bool) {
-    if button.is_null() {
-        return;
-    }
-    let action: Sel = msg_send![button, action];
-    let palette = clipboard_palette();
-    let background = if hovered {
-        // 只给文字按钮一层很浅的悬停反馈,避免恢复成实心危险按钮。
-        // Give text buttons only a faint hover wash instead of restoring a solid destructive fill.
-        (palette.hover_bg & 0xFFFF_FF00) | if palette.dark { 0x28 } else { 0x18 }
-    } else {
-        0x00000000
-    };
-    let text = if action == sel!(clearClipboardAll:) {
-        palette.destructive
-    } else {
-        palette.secondary_text
-    };
-    let layer: *mut AnyObject = msg_send![button, layer];
-    if !layer.is_null() {
-        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
-        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x00000000));
-    }
-    let _: () = msg_send![button, setContentTintColor: crate::ffi::hex_to_ns_color(text)];
-}
-
-unsafe fn set_action_button_surface(button: *mut AnyObject, hovered: bool) {
-    if button.is_null() {
-        return;
-    }
-    let layer: *mut AnyObject = msg_send![button, layer];
-    if layer.is_null() {
-        return;
-    }
-    let palette = clipboard_palette();
-    let action: Sel = msg_send![button, action];
-    let background = if action == sel!(deleteEntry:) && hovered {
-        (palette.destructive & 0xFFFF_FF00) | 0x18
-    } else if is_clear_history_destructive_action(action) && hovered {
-        (palette.destructive_hover & 0xFFFF_FF00) | 0x18
-    } else if hovered {
-        palette.hover_bg
-    } else {
-        0x00000000
-    };
-    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
-}
-
-/// 用普通/悬停/激活状态替换详情按钮的自绘图标,并复用单按钮的圆角状态样式。
-/// Replace the detail icon for its normal/hover/active state and reuse the single-button
-/// rounded state styling.
-unsafe fn set_detail_action_style(button: *mut AnyObject, active: bool, hovered: bool) {
-    if button.is_null() {
-        return;
-    }
-    let icon = make_detail_action_icon(active, hovered);
-    let empty = make_nsstring("");
-    let _: () = msg_send![button, setTitle: empty];
-    CFRelease(empty as *const c_void);
-    let _: () = msg_send![button, setImage: icon];
-    let _: () = msg_send![button, setImagePosition: 1isize]; // NSImageOnly
-    release_obj(icon);
-    set_action_button_surface(button, hovered);
-}
-
-/// 详情开关不会重建列表,因此单独刷新已有详情按钮的激活态。
-/// Toggling detail does not rebuild the list, so refresh existing detail-action active states.
-fn refresh_detail_action_visuals() {
-    let visible = detail_visible();
-    let selected = picker_selection();
-    let indices = ROW_VIEW_INDICES.lock().unwrap().clone();
-    let views = ROW_HOVER_VIEWS.lock().unwrap().clone();
-    unsafe {
-        for (slot, view) in views.iter().enumerate() {
-            let Some(&row) = indices.get(slot) else {
-                continue;
-            };
-            set_detail_action_style(
-                view.details.0,
-                detail_action_is_active(visible, selected, row),
-                false,
-            );
-        }
-    }
-}
-
-/// 行内操作按钮(置顶/删除):SF Symbol 图标、无边框、透明度由调用方给出
-/// (完全透明待命,行悬停/选中时显现)。
-/// A per-row action button (pin/delete): an SF Symbol icon, borderless, its alpha
-/// supplied by the caller (pinned rows pass 1.0; unpinned rows pass hover/selection).
-/// 悬停感知按钮类(NSButton 子类,覆写 mouseEntered:/mouseExited:):按 action 选择器
-/// 决定悬停样式——置顶 = 深一档 + 浅底;删除/清空 = 红色;筛选 = 仅变深。退出时恢复
-/// (筛选走 update_filter_pill_style 重算,避免与选中态打架)。
-/// A hover-aware button class (an NSButton subclass overriding mouseEntered:/mouseExited:):
-/// the hover style is picked by the action selector -- pin darkens with a faint fill,
-/// delete/clear turn red, filters only darken. On exit the state is restored (filters go
-/// through update_filter_pill_style so the active tint is never clobbered).
-unsafe fn hover_button_class() -> *mut AnyObject {
-    static HOVER_BTN_CLS: OnceLock<StaticClass> = OnceLock::new();
-    HOVER_BTN_CLS
-        .get_or_init(|| {
-            let name = CString::new("OhMyTabClipHoverButton").unwrap();
-            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                hover_button_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                hover_button_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseDown:),
-                hover_button_mouse_down as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            StaticClass(cls as *const objc2::runtime::AnyClass)
-        })
-        .0 as *mut AnyObject
-}
-
-unsafe fn set_detail_share_style(button: *mut AnyObject, tint_alpha: f64, bg_alpha: u32) {
-    // 非 template NSImage 不接受 contentTintColor,每个状态直接替换 18pt 图标。
-    // A non-template NSImage ignores contentTintColor, so replace the 18pt icon for each state.
-    let icon = make_detail_save_icon(tint_alpha);
-    let _: () = msg_send![button, setImage: icon];
-    release_obj(icon);
-    let layer: *mut AnyObject = msg_send![button, layer];
-    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(bg_alpha));
-}
-
-/// 悬停进入:按 action 上色(设计稿 .action:hover / .clear-history:hover / .filter:hover)。
-/// Hover enter: color by action (the mockup's .action:hover / .clear-history:hover /
-/// .filter:hover).
-extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    unsafe {
-        let b = _self as *mut AnyObject;
-        let action: Sel = msg_send![b, action];
-        if is_clear_confirmation_button(b) || is_clear_history_action_button(b) {
-            set_clear_confirmation_button_style(b, true);
-            return;
-        }
-        if action == sel!(detailSaveAs:) {
-            // HTML .icon-button:hover:68% 图标 + 5% 黑底。
-            // HTML .icon-button:hover: 68% icon tint with a 5% black fill.
-            set_detail_share_style(b, 0.68, 0x0000000D);
-            return;
-        }
-        if action == sel!(showItemDetails:) {
-            let tag: isize = msg_send![b, tag];
-            let active = tag >= 0
-                && detail_action_is_active(detail_visible(), picker_selection(), tag as usize);
-            set_detail_action_style(b, active, true);
-            return;
-        }
-        if is_clear_history_destructive_action(action) {
-            let palette = clipboard_palette();
-            let c = crate::ffi::hex_to_ns_color(palette.destructive_hover);
-            let _: () = msg_send![b, setContentTintColor: c];
-            set_action_button_surface(b, true);
-        } else if action == sel!(deleteEntry:) {
-            let palette = clipboard_palette();
-            let c = crate::ffi::hex_to_ns_color(palette.destructive);
-            let _: () = msg_send![b, setContentTintColor: c];
-            set_action_button_surface(b, true);
-        } else if action == sel!(togglePin:) {
-            // 置顶行内悬停(新设计稿 .action:hover):变深 + 浅底。详情改用专属 SVG
-            // 图标的空心/实心状态,已在本函数开头提前处理。
-            // Pin hover darkens with a faint fill. Details use their dedicated SVG-style
-            // outlined/filled states and were handled at this function's start.
-            let palette = clipboard_palette();
-            let c = crate::ffi::hex_to_ns_color(palette.primary_text);
-            let _: () = msg_send![b, setContentTintColor: c];
-            set_action_button_surface(b, true);
-        } else if action == sel!(filterPillClicked:) {
-            let c = crate::ffi::hex_to_ns_color(clipboard_palette().primary_text);
-            let _: () = msg_send![b, setContentTintColor: c];
-        }
-    }
-}
-
-/// 悬停退出:恢复基础色;筛选项只更新自己的文字色,不触碰共享下划线。
-/// Hover exit: restore the base color; a filter only updates its own tint and never touches
-/// the shared underline.
-extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
-        let b = _self as *mut AnyObject;
-        let action: Sel = msg_send![b, action];
-        if is_clear_confirmation_button(b) || is_clear_history_action_button(b) {
-            set_clear_confirmation_button_style(b, false);
-            return;
-        }
-        if (action == sel!(showItemDetails:)
-            || action == sel!(deleteEntry:)
-            || action == sel!(togglePin:))
-            && !REBUILDING.load(Ordering::SeqCst)
-        {
-            // 操作按钮是行的独立兄弟视图,离开它不会触发行按钮的 mouseExited;
-            // 只有确认指针已离开整行时才清除行 hover。
-            // Action buttons are sibling views of the row, so leaving one does not trigger the
-            // row button's mouseExited; clear row hover only after the whole row is left.
-            let tag: isize = msg_send![b, tag];
-            if tag >= 0 && (event.is_null() || !mouse_inside_row(event, tag as usize)) {
-                clear_hover_row_if(tag as usize);
-            }
-        }
-        if action == sel!(detailSaveAs:) {
-            set_detail_share_style(b, 0.34, 0x00000000);
-            return;
-        }
-        if action == sel!(filterPillClicked:) {
-            let tag: isize = msg_send![b, tag];
-            let active_tag = match *CLIP_FILTER.lock().unwrap() {
-                ClipFilter::All => 0isize,
-                ClipFilter::Text => 1,
-                ClipFilter::Image => 2,
-                ClipFilter::Link => 3,
-                ClipFilter::Code => 4,
-            };
-            let palette = clipboard_palette();
-            let tint = if tag == active_tag {
-                palette.primary_text
-            } else {
-                palette.secondary_text
-            };
-            let c = crate::ffi::hex_to_ns_color(tint);
-            let _: () = msg_send![b, setContentTintColor: c];
-            return;
-        }
-        if action == sel!(showItemDetails:) {
-            let tag: isize = msg_send![b, tag];
-            let active = tag >= 0
-                && detail_action_is_active(detail_visible(), picker_selection(), tag as usize);
-            set_detail_action_style(b, active, false);
-            return;
-        }
-        if action == sel!(deleteEntry:)
-            || is_clear_history_destructive_action(action)
-            || action == sel!(togglePin:)
-        {
-            set_action_button_surface(b, false);
-        }
-        let c = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
-        let _: () = msg_send![b, setContentTintColor: c];
-    }
-}
-
-/// 分享按钮按下时使用 HTML 的 7.5% 底色;其它按钮完全沿用 NSButton 原行为。
-/// The share button uses the HTML mockup's 7.5% pressed fill; all other buttons retain native
-/// NSButton behavior.
-/// C 回调的 panic 边界:panic 穿不过 extern "C" 帧(会 abort 整个进程),这里统一接住。
-/// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
-/// aborts the process), so it is contained here.
-extern "C" fn hover_button_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    crate::callback_guard::void("hover_button_mouse_down", || unsafe {
-        hover_button_mouse_down_inner(_self, _cmd, event)
-    });
-}
-
-unsafe fn hover_button_mouse_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
-        let button = _self as *mut AnyObject;
-        let action: Sel = msg_send![button, action];
-        if action == sel!(detailSaveAs:) {
-            set_detail_share_style(button, 0.68, 0x00000013);
-        }
-
-        type MouseDown = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void);
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
-        let call: MouseDown = std::mem::transmute(objc_msgSendSuper as *const ());
-        call(&mut sup, sel!(mouseDown:), event);
-
-        if action == sel!(detailSaveAs:) {
-            set_detail_share_style(button, 0.68, 0x0000000D);
-        }
-    }
-}
-
-unsafe fn make_action_button(
-    title: &str,
-    action: Sel,
-    tag: isize,
-    x: f64,
-    y: f64,
-    alpha: f64,
-) -> *mut AnyObject {
-    let b: *mut AnyObject = msg_send![hover_button_class(), alloc];
-    let b: *mut AnyObject = msg_send![
-        b,
-        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(ACTION_BTN, ACTION_H))
-    ];
-    let _: () = msg_send![b, setBordered: false];
-    // 悬停底色需要 layer + 圆角(新设计稿 .action 圆角 5)。/ hover fill needs a layer.
-    let _: () = msg_send![b, setWantsLayer: true];
-    let blayer: *mut AnyObject = msg_send![b, layer];
-    let _: () = msg_send![blayer, setCornerRadius: 5.0];
-    let title_ns = make_nsstring(title);
-    let _: () = msg_send![b, setTitle: title_ns];
-    CFRelease(title_ns as *const c_void);
-    let _: () = msg_send![b, setTag: tag];
-    let _: () = msg_send![b, setTarget: row_target()];
-    let _: () = msg_send![b, setAction: action];
-    // 着色 = 新设计稿 .action 的 32% 黑;显隐由透明度表达。
-    // Tint = the new mockup's .action 32% black; visibility is carried by alpha.
-    let tint = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
-    let _: () = msg_send![b, setContentTintColor: tint];
-    let _: () = msg_send![b, setAlphaValue: alpha];
-    // 三个按钮都从同一套组件状态初始化,后续由悬停回调只切换自身状态。
-    // Initialize all three buttons through the same component state; hover callbacks then
-    // change only the button under the pointer.
-    set_action_button_surface(b, false);
-    add_hover_tracking(b);
-    b
-}
-
-/// 本地化字符串的显示宽度(pt,按系统字体测量)/ a string's display width in points.
-fn localized_string_width(s: &str, font_size: f64) -> f64 {
-    unsafe {
-        let ns = make_nsstring(s);
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: font_size];
-        let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-        let attrs: *mut AnyObject = msg_send![attrs, init];
-        let font_key = make_nsstring("NSFont");
-        let _: () = msg_send![attrs, setObject: font, forKey: font_key];
-        CFRelease(font_key as *const c_void);
-        let attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let attr: *mut AnyObject = msg_send![attr, initWithString: ns, attributes: attrs];
-        let size: NSSize = msg_send![attr, size];
-        CFRelease(ns as *const c_void);
-        release_obj(attr);
-        release_obj(attrs);
-        size.width
-    }
-}
-
-/// 创建一枚筛选 pill(纯文字;样式由 update_filter_pill_style 统一按选中态刷新)。
-/// Create a filter pill (bare text; its style is refreshed centrally by
-/// update_filter_pill_style according to the active filter).
-unsafe fn make_filter_pill(label: &str, tag: isize, x: f64, y: f64, w: f64) -> *mut AnyObject {
-    let b: *mut AnyObject = msg_send![hover_button_class(), alloc];
-    let b: *mut AnyObject = msg_send![
-        b,
-        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, FILTERS_H))
-    ];
-    let _: () = msg_send![b, setBordered: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-    let _: () = msg_send![b, setFont: font];
-    let label_ns = make_nsstring(label);
-    let _: () = msg_send![b, setTitle: label_ns];
-    CFRelease(label_ns as *const c_void);
-    let _: () = msg_send![b, setTag: tag];
-    let _: () = msg_send![b, setTarget: observer()];
-    let _: () = msg_send![b, setAction: sel!(filterPillClicked:)];
-    // 悬停变深(设计稿 .filter:hover)/ hover darkens (the mockup's .filter:hover).
-    add_hover_tracking(b);
-    b
-}
-
-/// 创建清空历史的确认卡片;与固定 header 同级,展开时覆盖列表。
-/// Build the clear-history confirmation card alongside the fixed header so its lower rows
-/// remain interactive while it overlays the list.
-#[allow(dead_code)]
-unsafe fn build_clear_history_confirmation(header_strip: *mut AnyObject, anchor: NSRect) {
-    let (surface_in_header, button_frames) = clear_history_confirmation_layout(anchor);
-    let parent: *mut AnyObject = msg_send![header_strip, superview];
-    let surface_frame: NSRect =
-        msg_send![header_strip, convertRect: surface_in_header, toView: parent];
-    let surface: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let surface: *mut AnyObject = msg_send![
-        surface,
-        initWithFrame: surface_frame
-    ];
-    let _: () = msg_send![surface, setWantsLayer: true];
-    // 父视图高度随 picker 变化;卡片仍需贴着顶部清空入口。
-    // The picker parent resizes, so keep the card pinned to its top-aligned trigger.
-    let _: () = msg_send![surface, setAutoresizingMask: 8u64];
-    let layer: *mut AnyObject = msg_send![surface, layer];
-    let palette = clipboard_palette();
-    // 使用主题卡片底色,与主界面保持一致。
-    // Use the theme card surface to match the surrounding picker.
-    crate::ffi::layer_set_background(
-        layer,
-        crate::ffi::hex_to_cg_color(confirmation_surface_background(palette)),
-    );
-    crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
-    let _: () = msg_send![layer, setCornerRadius: 8.0f64];
-    let _: () = msg_send![layer, setMasksToBounds: true];
-    let _: () = msg_send![surface, setHidden: true];
-    let _: () = msg_send![surface, setAlphaValue: 0.0f64];
-    let _: () = msg_send![parent, addSubview: surface];
-
-    let labels = [
-        t("clipboard.clear_confirm_unpinned"),
-        t("clipboard.clear_confirm_all"),
-    ];
-    let actions = [sel!(clearClipboardUnpinned:), sel!(clearClipboardAll:)];
-    let mut buttons = [std::ptr::null_mut(); 2];
-    for i in 0..2 {
-        let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
-        let button: *mut AnyObject = msg_send![
-            button,
-            initWithFrame: button_frames[i]
-        ];
-        let _: () = msg_send![button, setBordered: false];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
-        let _: () = msg_send![button, setFont: font];
-        let title = make_nsstring(&labels[i]);
-        let _: () = msg_send![button, setTitle: title];
-        CFRelease(title as *const c_void);
-        let _: () = msg_send![button, setTarget: observer()];
-        let _: () = msg_send![button, setAction: actions[i]];
-        let _: () = msg_send![button, setWantsLayer: true];
-        let button_layer: *mut AnyObject = msg_send![button, layer];
-        if !button_layer.is_null() {
-            crate::ffi::layer_set_border(button_layer, crate::ffi::hex_to_cg_color(0x00000000));
-            let _: () = msg_send![button_layer, setBorderWidth: 0.0f64];
-            let _: () = msg_send![button_layer, setCornerRadius: 5.0f64];
-            let _: () = msg_send![button_layer, setMasksToBounds: true];
-        }
-        if !button_layer.is_null() {
-            crate::ffi::layer_set_background(button_layer, crate::ffi::hex_to_cg_color(0x00000000));
-        }
-        set_clear_confirmation_button_style(button, false);
-        let _: () = msg_send![button, setHidden: true];
-        let _: () = msg_send![button, setAlphaValue: 0.0f64];
-        add_hover_tracking(button);
-        let _: () = msg_send![surface, addSubview: button];
-        release_obj(button);
-        buttons[i] = button;
-    }
-    release_obj(surface);
-    *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() = Some(ClearHistoryConfirmationViews {
-        surface: ObjPtr::new(surface),
-        unpinned: ObjPtr::new(buttons[0]),
-        all: ObjPtr::new(buttons[1]),
-    });
-}
-
-unsafe fn apply_clear_history_confirmation_theme() {
-    let Some(confirmation) = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() else {
-        return;
-    };
-    let layer: *mut AnyObject = msg_send![confirmation.surface.0, layer];
-    if layer.is_null() {
-        return;
-    }
-    let palette = clipboard_palette();
-    crate::ffi::layer_set_background(
-        layer,
-        crate::ffi::hex_to_cg_color(confirmation_surface_background(palette)),
-    );
-    crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
-    for button in [confirmation.unpinned, confirmation.all] {
-        set_clear_confirmation_button_style(button.0, false);
-    }
-}
-
-/// 刷新筛选样式:选中项 78% 黑 + 底部 16×2 下划线;未选中 38% 黑(设计稿 .filter)。
-/// 下划线是一个共享的小视图,按选中按钮的 frame 重新定位(首个样式调用时创建)。
-/// Refresh the filter styling: the active item is 78% black with a 16x2 underline below;
-/// the rest are 38% black (the mockup's .filter). The underline is one shared little view
-/// repositioned under the active button (created on the first style pass).
-unsafe fn animate_filter_underline(underline: *mut AnyObject, target_frame: NSRect) {
-    let layer: *mut AnyObject = msg_send![underline, layer];
-    if layer.is_null() {
-        let _: () = msg_send![underline, setFrame: target_frame];
-        return;
-    }
-
-    // Use the layer's actual anchor point so the animation target matches the view frame even
-    // when AppKit changes the backing-layer geometry.
-    // 使用 layer 的实际锚点,即使 AppKit 改变 backing layer 几何信息,动画目标仍与 view frame 一致。
-    let anchor: NSPoint = msg_send![layer, anchorPoint];
-    let target_position = NSPoint::new(
-        target_frame.origin.x + target_frame.size.width * anchor.x,
-        target_frame.origin.y + target_frame.size.height * anchor.y,
-    );
-
-    // Read the presentation position first so rapid Tab presses continue from the visible
-    // position instead of jumping back to the previous model position.
-    // 先读取 presentation 位置,让快速连续按 Tab 时从当前可见位置继续移动,避免跳回旧位置。
-    let presentation: *mut AnyObject = msg_send![layer, presentationLayer];
-    let from_position: NSPoint = if presentation.is_null() {
-        msg_send![layer, position]
-    } else {
-        msg_send![presentation, position]
-    };
-
-    let animation_key = make_nsstring("clipboard-filter-underline");
-    let _: () = msg_send![layer, removeAnimationForKey: animation_key];
-    if (from_position.x - target_position.x).abs() < 0.1 {
-        let _: () = msg_send![class!(CATransaction), begin];
-        let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-        let _: () = msg_send![layer, setPosition: target_position];
-        let _: () = msg_send![class!(CATransaction), commit];
-        CFRelease(animation_key as *const c_void);
-        return;
-    }
-
-    // Keep the model position and the explicit animation in one transaction. Updating the
-    // NSView frame separately lets AppKit briefly expose a second geometry transition.
-    // 在同一个事务中更新 model position 和显式动画。单独更新 NSView frame 会让 AppKit
-    // 短暂暴露第二条几何过渡,从而产生抽动。
-    let _: () = msg_send![class!(CATransaction), begin];
-    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-    let _: () = msg_send![layer, setPosition: target_position];
-    let _: () = msg_send![class!(CATransaction), commit];
-
-    let key_path = make_nsstring("position.x");
-    let animation: *mut AnyObject =
-        msg_send![class!(CABasicAnimation), animationWithKeyPath: key_path];
-    CFRelease(key_path as *const c_void);
-    let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from_position.x];
-    let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: target_position.x];
-    let _: () = msg_send![animation, setFromValue: from_value];
-    let _: () = msg_send![animation, setToValue: to_value];
-    let _: () = msg_send![animation, setDuration: FILTER_UNDERLINE_ANIMATION_DURATION];
-    let timing_name = make_nsstring("easeInEaseOut");
-    let timing: *mut AnyObject = msg_send![
-        class!(CAMediaTimingFunction),
-        functionWithName: timing_name
-    ];
-    CFRelease(timing_name as *const c_void);
-    if !timing.is_null() {
-        let _: () = msg_send![animation, setTimingFunction: timing];
-    }
-    let _: () = msg_send![layer, addAnimation: animation, forKey: animation_key];
-    CFRelease(animation_key as *const c_void);
-}
-
-fn update_filter_pill_style(animate_underline: bool) {
-    let active = *CLIP_FILTER.lock().unwrap();
-    unsafe {
-        let active_tag = match active {
-            ClipFilter::All => 0isize,
-            ClipFilter::Text => 1,
-            ClipFilter::Image => 2,
-            ClipFilter::Link => 3,
-            ClipFilter::Code => 4,
-        };
-        let mut active_frame: Option<NSRect> = None;
-        let palette = clipboard_palette();
-        let pills = FILTER_PILLS.lock().unwrap();
-        for p in pills.iter() {
-            let tag: isize = msg_send![p.0, tag];
-            let color: *mut AnyObject = if tag == active_tag {
-                active_frame = Some(msg_send![p.0, frame]);
-                crate::ffi::hex_to_ns_color(palette.primary_text)
-            } else {
-                crate::ffi::hex_to_ns_color(palette.secondary_text)
-            };
-            let _: () = msg_send![p.0, setContentTintColor: color];
-        }
-        drop(pills);
-        // 下划线:16×2、2 圆角、45% 黑,位于选中按钮文字下方 9px(设计稿 bottom:-9)。
-        // The underline: 16x2, radius 2, 45% black, 9px under the active item's text.
-        if let Some(frame) = active_frame {
-            let parent: *mut AnyObject = {
-                let p0 = FILTER_PILLS.lock().unwrap()[0];
-                msg_send![p0.0, superview]
-            };
-            let ux = frame.origin.x + (frame.size.width - FILTER_UNDERLINE_W) / 2.0;
-            // flipped 坐标:按钮高 38,文字垂直居中,下划线在文字下方 9px ≈ 行底 -3。
-            // Flipped coords: the button is 38pt tall with centered text; the underline
-            // sits 9px under the text ≈ 3pt above the row's bottom.
-            let uy = frame.origin.y + FILTERS_H - 3.0;
-            let mut guard = FILTER_UNDERLINE.lock().unwrap();
-            if let Some(u) = *guard {
-                let target_frame = NSRect::new(
-                    NSPoint::new(ux, uy),
-                    NSSize::new(FILTER_UNDERLINE_W, FILTER_UNDERLINE_H),
-                );
-                if animate_underline {
-                    animate_filter_underline(u.0, target_frame);
-                } else {
-                    let _: () = msg_send![u.0, setFrame: target_frame];
-                }
-            } else {
-                let u: *mut AnyObject = msg_send![class!(NSView), alloc];
-                let u: *mut AnyObject = msg_send![
-                    u,
-                    initWithFrame: NSRect::new(
-                        NSPoint::new(ux, uy),
-                        NSSize::new(FILTER_UNDERLINE_W, FILTER_UNDERLINE_H)
-                    )
-                ];
-                let _: () = msg_send![u, setWantsLayer: true];
-                let ulayer: *mut AnyObject = msg_send![u, layer];
-                crate::ffi::layer_set_background(
-                    ulayer,
-                    crate::ffi::hex_to_cg_color(palette.secondary_text),
-                );
-                let _: () = msg_send![ulayer, setCornerRadius: 1.0f64];
-                let _: () = msg_send![parent, addSubview: u];
-                release_obj(u);
-                *guard = Some(ObjPtr::new(u));
-            }
-        }
-    }
-}
-
-/// 底部栏条目数标签 / the footer's entry-count label.
-static FOOTER_COUNT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// 底部栏根视图:语言切换时整栏重建,以按新文本宽度重新排版快捷键图例。
-/// The footer root: rebuilt on locale changes so shortcut legends reflow to their new widths.
-static FOOTER_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-
-/// toast 提示标签(新设计稿 .toast)/ the toast label (the new mockup's .toast).
-static TOAST_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// toast 的自动隐藏 timer(取消防抖)/ the toast's auto-hide timer.
-static TOAST_TIMER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// toast owner 单例(实现 dismissToast: 供 NSTimer 回调)。/ the toast timer's target.
-unsafe fn toast_owner() -> *mut AnyObject {
-    static TOAST_OWNER: OnceLock<CallbackTarget> = OnceLock::new();
-    TOAST_OWNER
-        .get_or_init(|| {
-            let name = CString::new("OhMyTabClipToast").unwrap();
-            let superclass = class!(NSObject) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(dismissToast:),
-                toast_dismiss as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            let obj: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-            CallbackTarget::new(obj)
-        })
-        .0
-}
-
-/// 隐藏 toast(NSTimer 回调)/ hide the toast (the NSTimer callback).
-/// **load-bearing**:非重复 timer 触发后会被 runloop 释放,这里必须把 TOAST_TIMER
-/// 清空——否则下次 show_toast 会对悬空指针调 invalidate(内存已被其他对象占用时
-/// objc2 抛 "method not found" panic,实测第二次 ← 取消置顶即崩)。
-/// **load-bearing**: a non-repeating timer is released by the run loop after firing, so
-/// TOAST_TIMER must be cleared here -- otherwise the next show_toast calls invalidate on
-/// a dangling pointer (when the memory now holds some other object, objc2 panics with
-/// "method not found"; reproduced by a second ← press to unpin).
-extern "C" fn toast_dismiss(_self: *mut c_void, _cmd: Sel, _timer: *mut c_void) {
-    *TOAST_TIMER.lock().unwrap() = None;
-    unsafe {
-        if let Some(label) = *TOAST_LABEL.lock().unwrap() {
-            let _: () = msg_send![label.0, setHidden: true];
-        }
-    }
-}
-
-/// 显示一条 toast(新设计稿 .toast):暗底白字圆角胶囊,底部居中,1.4s 后自动隐藏。
-/// Show a toast (the new mockup's .toast): a dark rounded pill at the bottom center,
-/// auto-hidden after ~1.4s.
-fn show_toast(msg: &str) {
-    unsafe {
-        let label = match *TOAST_LABEL.lock().unwrap() {
-            Some(l) => l.0,
-            None => return,
-        };
-        let text = make_nsstring(msg);
-        let _: () = msg_send![label, setStringValue: text];
-        CFRelease(text as *const c_void);
-        // 宽度随文案自适应,水平居中 / width follows the text, horizontally centered.
-        let w = localized_string_width(msg, 11.0) + 24.0;
-        let label_frame: NSRect = msg_send![label, frame];
-        let x = (PICKER_W - w) / 2.0;
-        let _: () = msg_send![label, setFrame: NSRect::new(
-            NSPoint::new(x, label_frame.origin.y),
-            NSSize::new(w, label_frame.size.height)
-        )];
-        let _: () = msg_send![label, setHidden: false];
-        // 取消上一个待隐藏的 timer,重新计时;无论是否有效都清空指针(invalidate
-        // 后/已触发的 timer 指针都不再可用,保留会变成悬空指针)。
-        // Invalidate the previous pending timer and restart; ALWAYS clear the pointer
-        // (an invalidated or already-fired timer's pointer is dead -- keeping it would
-        // leave a dangling pointer for the next invalidate).
-        if let Some(t) = *TOAST_TIMER.lock().unwrap() {
-            let _: () = msg_send![t.0, invalidate];
-        }
-        *TOAST_TIMER.lock().unwrap() = None;
-        let timer: *mut AnyObject = msg_send![
-            class!(NSTimer),
-            scheduledTimerWithTimeInterval: 1.4f64,
-            target: toast_owner(),
-            selector: sel!(dismissToast:),
-            userInfo: std::ptr::null::<AnyObject>(),
-            repeats: false
-        ];
-        *TOAST_TIMER.lock().unwrap() = Some(ObjPtr::new(timer));
-    }
-}
-
-/// 刷新底部栏条目数(rebuild_rows 每次调用;窗口构建后标签已存在)。
-/// Refresh the footer's entry count (called on every rebuild_rows; the label exists once
-/// the window has been built).
-fn refresh_footer_count(total: usize) {
-    unsafe {
-        let label = match *FOOTER_COUNT.lock().unwrap() {
-            Some(l) => l.0,
-            None => return,
-        };
-        let text = t_count("clipboard.footer_count", total);
-        let ns = make_nsstring(&text);
-        let _: () = msg_send![label, setStringValue: ns];
-        CFRelease(ns as *const c_void);
-    }
-}
-
-/// 构建底部栏(设计稿 .footer):顶部分隔线 + 条目数 + 快捷键图例(kbd 键帽)。
-/// 非 flipped 坐标系,y=0 是底部,43pt 高,固定在窗口底边。
-/// Build the footer (the mockup's .footer): a top hairline + the entry count + shortcut
-/// legends (kbd keycaps). Non-flipped coords (y=0 at the bottom), 43pt tall, pinned to the
-/// window's bottom edge.
-unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
-    // 把 footer 收进独立根视图;语言变更时可整体替换,不用保留每个图例的指针。
-    // Put the footer in its own root view so locale changes can replace it as a whole instead
-    // of retaining pointers to every individual legend.
-    let footer: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let footer: *mut AnyObject = msg_send![
-        footer,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, FOOTER_H))
-    ];
-    let _: () = msg_send![parent, addSubview: footer];
-    release_obj(footer);
-    *FOOTER_VIEW.lock().unwrap() = Some(ObjPtr::new(footer));
-    let parent = footer;
-
-    // 顶部分隔线 / the top hairline.
-    let line: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let line: *mut AnyObject = msg_send![
-        line,
-        initWithFrame: NSRect::new(
-            NSPoint::new(0.0, FOOTER_H - 1.0),
-            NSSize::new(w, 1.0)
-        )
-    ];
-    let _: () = msg_send![line, setWantsLayer: true];
-    let llayer: *mut AnyObject = msg_send![line, layer];
-    crate::ffi::layer_set_background(
-        llayer,
-        crate::ffi::hex_to_cg_color(clipboard_palette().separator),
-    );
-    let _: () = msg_send![parent, addSubview: line];
-    release_obj(line);
-
-    // 条目数标签(内容由 refresh_footer_count 更新)/ the entry-count label.
-    let count_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let count_label: *mut AnyObject = msg_send![
-        count_label,
-        initWithFrame: NSRect::new(
-            NSPoint::new(FOOTER_PAD_X, (FOOTER_H - 14.0) / 2.0),
-            NSSize::new(140.0, 14.0)
-        )
-    ];
-    let _: () = msg_send![count_label, setBezeled: false];
-    let _: () = msg_send![count_label, setDrawsBackground: false];
-    let _: () = msg_send![count_label, setEditable: false];
-    let _: () = msg_send![count_label, setSelectable: false];
-    let cf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
-    let _: () = msg_send![count_label, setFont: cf];
-    let cc = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
-    let _: () = msg_send![count_label, setTextColor: cc];
-    let _: () = msg_send![parent, addSubview: count_label];
-    release_obj(count_label);
-    *FOOTER_COUNT.lock().unwrap() = Some(ObjPtr::new(count_label));
-
-    // 快捷键图例(kbd 键帽 + 说明)从右往左排在同一行。
-    // The shortcut legends (kbd keycap + label) are laid out right-to-left on one row.
-    let kbd_keys = ["↵", "⌫", "→", "←", "Tab"];
-    let kbd_labels = [
-        t("clipboard.kbd_paste"),
-        t("clipboard.kbd_delete"),
-        t("clipboard.kbd_detail"),
-        t("clipboard.kbd_pin"),
-        t("clipboard.kbd_filter"),
-    ];
-    let kbd_min_w = 21.0;
-    let kbd_h = 19.0;
-    let mut x = w - FOOTER_PAD_X;
-    for (i, key) in kbd_keys.iter().enumerate() {
-        let kbd_w = if *key == "Tab" { 28.0 } else { kbd_min_w };
-        let label_w = localized_string_width(&kbd_labels[i], 10.0);
-        let group_w = kbd_w + 5.0 + label_w;
-        x -= group_w;
-        // 键帽 / the keycap.
-        let cap: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let cap: *mut AnyObject = msg_send![
-            cap,
-            initWithFrame: NSRect::new(
-                NSPoint::new(x, (FOOTER_H - kbd_h) / 2.0),
-                NSSize::new(kbd_w, kbd_h)
-            )
-        ];
-        let _: () = msg_send![cap, setWantsLayer: true];
-        let clayer: *mut AnyObject = msg_send![cap, layer];
-        let palette = clipboard_palette();
-        crate::ffi::layer_set_background(clayer, crate::ffi::hex_to_cg_color(palette.field_bg));
-        crate::ffi::layer_set_border(clayer, crate::ffi::hex_to_cg_color(palette.card_border));
-        let _: () = msg_send![clayer, setBorderWidth: 1.0f64];
-        let _: () = msg_send![clayer, setCornerRadius: 4.0f64];
-        // 键帽文字 / the keycap's glyph.
-        // NSTextField 是顶对齐,若 frame 撑满 19pt 键帽字就悬在上沿——让 label 恰好
-        // 包裹行高并垂直居中(键帽内容与 ←/→ 等图标居中对齐)。
-        // NSTextField top-aligns its glyph, so a full-height label would float the arrow at
-        // the cap's top; hug the line height and center it inside the 19pt cap instead.
-        let key_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let key_label: *mut AnyObject = msg_send![
-            key_label,
-            initWithFrame: NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(kbd_w, kbd_h)
-            )
-        ];
-        let _: () = msg_send![key_label, setBezeled: false];
-        let _: () = msg_send![key_label, setDrawsBackground: false];
-        let _: () = msg_send![key_label, setEditable: false];
-        let _: () = msg_send![key_label, setSelectable: false];
-        let _: () = msg_send![key_label, setAlignment: 1isize]; // Center on arm64
-        let kf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 9.0f64];
-        let _: () = msg_send![key_label, setFont: kf];
-        // 用 9pt 字体的行高包住文本,垂直居中(替换全高 frame)。
-        // Swallow the text with the 9pt font's line height and center it vertically.
-        let asc: f64 = msg_send![kf, ascender];
-        let desc: f64 = msg_send![kf, descender];
-        let line_h = (asc - desc + 1.0).max(11.0);
-        let _: () = msg_send![key_label, setFrame: NSRect::new(
-            NSPoint::new(0.0, (kbd_h - line_h) / 2.0),
-            NSSize::new(kbd_w, line_h)
-        )];
-        let kc = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
-        let _: () = msg_send![key_label, setTextColor: kc];
-        let key_ns = make_nsstring(key);
-        let _: () = msg_send![key_label, setStringValue: key_ns];
-        CFRelease(key_ns as *const c_void);
-        let _: () = msg_send![cap, addSubview: key_label];
-        release_obj(key_label);
-        let _: () = msg_send![parent, addSubview: cap];
-        release_obj(cap);
-        // 说明文字 / the legend label.
-        // 说明文字宽度加 6pt,避免 cell 内边距吃掉尾字;高度必须用字体真实行高并居中。
-        // 原来固定 16pt 的 NSTextField 会从顶部绘字,相对已经按行高居中的键帽文字
-        // 上浮约一点。
-        // Give the hint 6pt width slack so cell insets do not clip its tail; its height uses
-        // the font's real line height and is centered. The old fixed 16pt NSTextField drew
-        // from its top, making the hint sit slightly above the keycap glyph.
-        let hf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
-        let hint_asc: f64 = msg_send![hf, ascender];
-        let hint_desc: f64 = msg_send![hf, descender];
-        let hint_line_h = (hint_asc - hint_desc + 1.0).max(11.0);
-        let hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let hint: *mut AnyObject = msg_send![
-            hint,
-            initWithFrame: NSRect::new(
-                NSPoint::new(x + kbd_w + 5.0, (FOOTER_H - hint_line_h) / 2.0),
-                NSSize::new(label_w + 6.0, hint_line_h)
-            )
-        ];
-        let _: () = msg_send![hint, setBezeled: false];
-        let _: () = msg_send![hint, setDrawsBackground: false];
-        let _: () = msg_send![hint, setEditable: false];
-        let _: () = msg_send![hint, setSelectable: false];
-        let _: () = msg_send![hint, setFont: hf];
-        let hc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
-        let _: () = msg_send![hint, setTextColor: hc];
-        let hint_ns = make_nsstring(&kbd_labels[i]);
-        let _: () = msg_send![hint, setStringValue: hint_ns];
-        CFRelease(hint_ns as *const c_void);
-        let _: () = msg_send![parent, addSubview: hint];
-        release_obj(hint);
-        // 下一组间距 / spacing before the next group.
-        x -= FOOTER_GROUP_GAP;
-        let _ = i;
-    }
-}
-
-/// 刷新已创建剪贴板浮窗的本地化 UI。菜单/设置会在 locale 改变时重建或重设标题,
-/// 但 picker 是长驻缓存窗口;它的搜索提示、筛选、清空按钮和 footer 必须显式更新。
-/// Refresh localization for an already-created clipboard picker. Menus/settings rebuild or
-/// retitle on locale changes, but the picker is a long-lived cached window, so its search hint,
-/// filters, clear button, and footer must be updated explicitly.
-pub fn refresh_localized_ui() {
-    unsafe {
-        rebuild_search_hint();
-        if let Some(search) = *SEARCH_FIELD.lock().unwrap() {
-            let _: () = msg_send![search.0, setNeedsDisplay: true];
-        }
-        if PICKER_WINDOW.lock().unwrap().is_none() {
-            return;
-        }
-
-        let labels = localized_filter_labels();
-        let pills: Vec<*mut AnyObject> = FILTER_PILLS
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|pill| pill.0)
-            .collect();
-        if pills.len() == labels.len() {
-            let filters_y = TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y;
-            let mut x = FILTERS_PAD_X;
-            for (pill, label) in pills.iter().zip(labels.iter()) {
-                let title = make_nsstring(label);
-                let _: () = msg_send![*pill, setTitle: title];
-                CFRelease(title as *const c_void);
-                let width = localized_string_width(label, 12.0) + 12.0;
-                let _: () = msg_send![
-                    *pill,
-                    setFrame: NSRect::new(
-                        NSPoint::new(x, filters_y),
-                        NSSize::new(width, FILTERS_H)
-                    )
-                ];
-                x += width + FILTER_GAP;
-            }
-            update_filter_pill_style(false);
-
-            if let Some(buttons) = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() {
-                let labels = [
-                    t("clipboard.clear_confirm_unpinned"),
-                    t("clipboard.clear_confirm_all"),
-                ];
-                let widths: [f64; 2] =
-                    std::array::from_fn(|i| localized_string_width(&labels[i], 12.0) + 8.0);
-                let total_width = widths.iter().sum::<f64>() + CLEAR_CONFIRM_GAP;
-                let mut x = PICKER_W - SEARCH_PAD_X - total_width;
-                for (index, button) in buttons.iter().enumerate() {
-                    let label = &labels[index];
-                    let title = make_nsstring(label);
-                    let _: () = msg_send![button.0, setTitle: title];
-                    CFRelease(title as *const c_void);
-                    let frame = NSRect::new(
-                        NSPoint::new(x, filters_y + 8.0),
-                        NSSize::new(widths[index], 20.0),
-                    );
-                    let _: () = msg_send![button.0, setFrame: frame];
-                    x += widths[index] + CLEAR_CONFIRM_GAP;
-                }
-            }
-        }
-
-        // footer 的英文提示宽度与中文不同;整体替换以重走从右向左的图例布局。
-        // English footer legends have different widths; replace the whole footer to rerun its
-        // right-to-left layout.
-        let old_footer = *FOOTER_VIEW.lock().unwrap();
-        if let Some(footer) = old_footer {
-            let _: () = msg_send![footer.0, removeFromSuperview];
-        }
-        *FOOTER_VIEW.lock().unwrap() = None;
-        *FOOTER_COUNT.lock().unwrap() = None;
-        if let Some(parent) = *PICKER_CONTENT_PARENT.lock().unwrap() {
-            build_footer(parent.0, PICKER_W);
-        }
-        rebuild_rows();
-    }
-}
-
-/// 应用新的筛选项并重建列表。展开的详情先关闭,不让它显示筛选结果之外的旧条目。
-/// Apply a new filter and rebuild the list. An open detail closes first so it never displays
-/// a stale entry outside the filtered result.
-fn apply_clip_filter(filter: ClipFilter) {
-    if detail_visible() {
-        hide_detail();
-    }
-    *CLIP_FILTER.lock().unwrap() = filter;
-    update_filter_pill_style(true);
-    unsafe { rebuild_rows() };
-}
-
-/// 筛选 pill 点击回调:切换筛选项并重建列表(选中索引越界由 rebuild_rows 自愈)。
-/// Filter-pill click: switch the filter and rebuild the list (an out-of-range selection
-/// self-heals in rebuild_rows).
-extern "C" fn filter_pill_clicked(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    let f = match tag {
-        0 => ClipFilter::All,
-        1 => ClipFilter::Text,
-        2 => ClipFilter::Image,
-        3 => ClipFilter::Link,
-        4 => ClipFilter::Code,
-        _ => return,
-    };
-    apply_clip_filter(f);
-}
-
-/// 给行内按钮(标题栏/正文)挂悬停跟踪区:悬停 = 选中该行(与窗口切换浮窗一致)。
-/// Attach a hover tracking area to a row button (header/body): hovering selects the row
-/// (same as the switcher overlay).
-unsafe fn add_hover_tracking(view: *mut AnyObject) {
-    // MouseEnteredAndExited(0x01) | ActiveAlways(0x80),矩形 = 视图 bounds,与切换浮窗
-    // 完全同款。两条 load-bearing:
-    // - nonactivating 面板宿主 app 未激活 → ActiveInActiveApp(0x40) 不投递 hover,
-    //   必须 ActiveAlways(曾误用 0x40,悬停不会触发)。
-    // - 不用 InVisibleRect:滚动容器里的可见区计算不可靠,直接给显式 bounds。
-    // MouseEnteredAndExited (0x01) | ActiveAlways (0x80), the rect is the view's bounds --
-    // exactly the switcher overlay's setup. Two load-bearing points: (1) the picker's host
-    // app stays inactive behind the nonactivating panel, and ActiveInActiveApp (0x40)
-    // delivers no hover events -- ActiveAlways is required (it was 0x40, so hover never
-    // fired); (2) no InVisibleRect -- the visible-rect computation inside the scroll
-    // container is unreliable, so an explicit bounds rect is used instead.
-    let opts: u64 = 0x01 | 0x80;
-    let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-    let bounds: NSRect = msg_send![view, bounds];
-    let ta: *mut AnyObject = msg_send![
-        ta,
-        initWithRect: bounds,
-        options: opts,
-        owner: view,
-        userInfo: std::ptr::null::<AnyObject>()
-    ];
-    let _: () = msg_send![view, addTrackingArea: ta];
-    release_obj(ta);
-}
-
-/// 给固定的浮窗内容父视图挂一块自动随可见区域更新的 tracking area,事件交给列表
-/// 容器统一解析整行 hover。父视图不会随滚动文档高度变化,InVisibleRect 在这里可靠。
-/// Attach an auto-resizing tracking area to the fixed picker content parent and deliver its
-/// events to the list container, which resolves whole-row hover. InVisibleRect is reliable
-/// here because this parent does not track the scrolling document height.
-unsafe fn add_picker_hover_tracking(view: *mut AnyObject, owner: *mut AnyObject) {
-    // MouseEnteredAndExited | MouseMoved | ActiveAlways | InVisibleRect.
-    let opts: u64 = 0x01 | 0x02 | 0x80 | 0x200;
-    let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-    let ta: *mut AnyObject = msg_send![
-        ta,
-        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
-        options: opts,
-        owner: owner,
-        userInfo: std::ptr::null::<AnyObject>()
-    ];
-    let _: () = msg_send![view, addTrackingArea: ta];
-    release_obj(ta);
-}
-
-/// 行按钮的 target(响应 handleClipboardRowClick:)。
-/// 单例:NSControl 的 setTarget: 是弱引用(不 retain),每次 rebuild 都 new 新实例会
-/// 永久泄漏;进程内只创建一次,实例存活到进程结束,按钮弱引用它始终有效。
-///
-/// Target for row buttons (responds to handleClipboardRowClick:).
-/// A singleton: NSControl's setTarget: is weak (no retain), so creating a new instance per
-/// rebuild would leak forever; one instance per process lives until exit, and the buttons'
-/// weak reference to it stays valid.
-unsafe fn row_target() -> *mut AnyObject {
-    static ROW_TARGET: OnceLock<CallbackTarget> = OnceLock::new();
-    ROW_TARGET
-        .get_or_init(|| {
-            let name = CString::new("OhMyTabClipboardRowTarget").unwrap();
-            let superclass = class!(NSObject) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(handleClipboardRowClick:),
-                handle_clipboard_row_click as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(togglePin:),
-                toggle_pin as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(deleteEntry:),
-                delete_entry_cb as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(showItemDetails:),
-                show_item_details_cb as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            // 实例 alloc(+1):进程级单例,不释放(与静态生命周期一致)。
-            // Instance alloc (+1): process-level singleton, never released (matches the
-            // static's lifetime).
-            let obj: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-            CallbackTarget::new(obj)
-        })
-        .0
-}
-
 // ========== 单元测试 / unit tests ==========
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -9045,12 +908,10 @@ mod tests {
         SCROLL_INDICATOR_EDGE,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
-
     #[test]
     fn clear_confirmation_buttons_are_compact_and_horizontal() {
         let anchor = NSRect::new(NSPoint::new(420.0, 66.0), NSSize::new(60.0, 20.0));
         let (surface, buttons) = clear_history_confirmation_layout(anchor);
-
         assert!(buttons[0].origin.x < buttons[1].origin.x);
         assert_eq!(buttons[0].origin.y, buttons[1].origin.y);
         assert_eq!(
@@ -9062,13 +923,11 @@ mod tests {
             assert!(button.origin.x + button.size.width <= surface.size.width);
             assert!(button.origin.y + button.size.height <= surface.size.height);
         }
-
         let surface_bottom = surface.origin.y + surface.size.height;
         assert!(surface.origin.x + surface.size.width <= anchor.origin.x + anchor.size.width);
         assert!(surface.origin.y >= anchor.origin.y);
         assert!(surface_bottom > header_strip_h());
     }
-
     #[test]
     fn row_hover_hit_test_includes_edges_and_rejects_padding_outside() {
         let rect = NSRect::new(NSPoint::new(10.0, 20.0), NSSize::new(100.0, 40.0));
@@ -9078,7 +937,6 @@ mod tests {
         assert!(!rect_contains_point(rect, NSPoint::new(9.9, 35.0)));
         assert!(!rect_contains_point(rect, NSPoint::new(55.0, 60.1)));
     }
-
     #[test]
     fn estimated_entry_bytes_counts_capacity_once() {
         let mut text = String::with_capacity(32);
@@ -9096,7 +954,6 @@ mod tests {
             + entry.source_app.capacity() as u64
             + entry.source_key.capacity() as u64;
         assert_eq!(estimated_entry_bytes(&entry), expected);
-
         let image = ImageEntry {
             uti: String::with_capacity(16),
             hash: 1,
@@ -9123,7 +980,6 @@ mod tests {
             + image.source_path.as_ref().unwrap().capacity() as u64;
         assert_eq!(estimated_entry_bytes(&image_entry), expected);
     }
-
     #[test]
     fn detail_scroll_geometry_keeps_a_fixed_lower_right_reserve() {
         let visible = 100.0;
@@ -9140,7 +996,6 @@ mod tests {
         let expected_end = visible - SCROLL_INDICATOR_EDGE - SCROLL_INDICATOR_CORNER_RESERVE;
         assert!((end - expected_end).abs() < f64::EPSILON);
     }
-
     /// 详情高清预览时效判定真值表:详情可见 + 选中条目即任务条目才刷新;其余
     /// (面板已关 / 已切走 / 无选中)一律丢弃。
     //  Truth table for the hi-res detail freshness predicate: swap into the UI only when
@@ -9157,7 +1012,6 @@ mod tests {
         // 面板已关闭(含随主浮窗隐藏)/ panel closed (incl. hidden with the picker).
         assert!(!wanted(false, Some(42), 42));
     }
-
     /// 悬停门禁真值表:指针在窗内 → 原样保留悬停索引(含无选中哨兵);
     /// 指针不在窗内 → 一律归位 NO_SELECTION(幽灵悬停底修复)。
     //  Truth table for the hover gate: pointer inside -> keep the hover index as-is
@@ -9172,11 +1026,9 @@ mod tests {
         assert_eq!(effective_hover_row(false, 7), NO_SELECTION);
         assert_eq!(effective_hover_row(false, NO_SELECTION), NO_SELECTION);
     }
-
     #[test]
     fn picker_row_visibility_keeps_overscan_rows_drawable() {
         use super::picker_row_is_drawable;
-
         let viewport = NSRect::new(NSPoint::new(0.0, 100.0), NSSize::new(560.0, 600.0));
         let overscan = 117.0;
         assert!(picker_row_is_drawable(
@@ -9200,20 +1052,16 @@ mod tests {
             overscan
         ));
     }
-
     #[test]
     fn picker_visible_range_materializes_only_viewport_rows_with_overscan() {
         use super::picker_visible_range;
-
         let pitches = vec![100.0; 10];
         let viewport = NSRect::new(NSPoint::new(0.0, 350.0), NSSize::new(560.0, 100.0));
         assert_eq!(picker_visible_range(&pitches, viewport, 50.0), (2, 5));
     }
-
     #[test]
     fn picker_rows_key_changes_when_rendered_inputs_change() {
         use super::{picker_rows_key, ClipFilter};
-
         let base = picker_rows_key(1, "", ClipFilter::All, false);
         let same = picker_rows_key(1, "", ClipFilter::All, false);
         assert_eq!(
@@ -9223,20 +1071,17 @@ mod tests {
         assert_eq!(base.filter, same.filter);
         assert_eq!(base.query, same.query);
         assert_eq!(base.show_source, same.show_source);
-
         assert_ne!(base, picker_rows_key(2, "", ClipFilter::All, false));
         assert_ne!(base, picker_rows_key(1, "query", ClipFilter::All, false));
         assert_ne!(base, picker_rows_key(1, "", ClipFilter::Text, false));
         assert_ne!(base, picker_rows_key(1, "", ClipFilter::All, true));
     }
-
     /// 测试用的 3 参便捷包装(来源与图标键留空,既有用例不受签名变化影响)。
     /// A 3-arg convenience wrapper for tests (empty source and icon key; existing cases are
     /// unaffected by the signature change).
     fn record_text(h: &mut Vec<ClipEntry>, text: &str, max: usize) -> bool {
         super::record_text(h, text, "", "", max)
     }
-
     fn entry(text: &str) -> ClipEntry {
         ClipEntry {
             text: text.to_string(),
@@ -9247,7 +1092,6 @@ mod tests {
             copied_at: None,
         }
     }
-
     fn entry_with_source(text: &str, source: &str) -> ClipEntry {
         ClipEntry {
             text: text.to_string(),
@@ -9258,7 +1102,6 @@ mod tests {
             copied_at: None,
         }
     }
-
     /// 测试用图片条目:把字节写入**测试缓存目录**并按引用构造(与真实录制路径
     /// 一致;预览与原始字节共用同一份小数据)。无文件来源。
     /// A test image entry: the bytes are written into the TEST cache dir and referenced,
@@ -9278,7 +1121,6 @@ mod tests {
             source_path: None,
         }
     }
-
     /// 测试用**文件复制**条目:字节 → 内容哈希 + 预览(data 兼作预览),data_path 恒空,
     /// 只带来源路径——与真实文件复制路径一致(字节不落盘)。
     /// A test FILE-COPY entry: bytes -> content hash + preview (data doubles as the
@@ -9293,7 +1135,6 @@ mod tests {
             source_path: Some(path.to_string()),
         }
     }
-
     /// 测试用图片条目 / an image entry for tests.
     fn entry_image(png: &[u8]) -> ClipEntry {
         ClipEntry {
@@ -9305,18 +1146,15 @@ mod tests {
             copied_at: None,
         }
     }
-
     fn texts(h: &[ClipEntry]) -> Vec<String> {
         h.iter().map(|e| e.text.clone()).collect()
     }
-
     #[test]
     fn empty_text_is_ignored() {
         let mut h = vec![entry("a")];
         assert!(!record_text(&mut h, "", 50));
         assert_eq!(h.len(), 1);
     }
-
     #[test]
     fn duplicate_is_moved_to_front_not_duplicated() {
         // 全表查重:再次复制历史中已有的文本 → 旧条目提到最前,不新增重复。
@@ -9333,7 +1171,6 @@ mod tests {
         assert_eq!(texts(&h), vec!["a", "b"]);
         assert_eq!(h.len(), 2);
     }
-
     #[test]
     fn dedup_updates_the_source_to_the_latest_copy() {
         // 同一文本从不同应用复制:去重移前时来源更新为最新复制的应用。
@@ -9350,7 +1187,6 @@ mod tests {
         // The dedup move also updates the icon key to the latest source.
         assert_eq!(h[0].source_key, "com.google.Chrome");
     }
-
     #[test]
     fn record_keeps_the_source_and_pin_moves_preserve_it() {
         use super::pin_entry;
@@ -9365,7 +1201,6 @@ mod tests {
         assert_eq!(h[0].source_key, "com.google.Chrome");
         assert_eq!(h[1].source_app, "Safari");
     }
-
     #[test]
     fn fnv1a64_is_stable_and_distinct() {
         use super::fnv1a64;
@@ -9375,7 +1210,6 @@ mod tests {
         assert_ne!(fnv1a64(b"png-a"), fnv1a64(b"png-b"));
         assert_ne!(fnv1a64(b""), fnv1a64(b"x"));
     }
-
     #[test]
     fn is_image_extension_covers_common_formats() {
         use super::is_image_extension;
@@ -9400,7 +1234,6 @@ mod tests {
         assert!(!is_image_extension("/a/b/noext"));
         assert!(!is_image_extension("/a/b/"));
     }
-
     #[test]
     fn ext_to_uti_maps_every_supported_extension() {
         use super::{
@@ -9425,7 +1258,6 @@ mod tests {
         assert_eq!(ext_to_uti("/a/b/doc.pdf"), None);
         assert_eq!(ext_to_uti("/a/b/noext"), None);
     }
-
     #[test]
     fn record_image_dedups_by_bytes_and_updates_source() {
         use super::record_image;
@@ -9474,7 +1306,6 @@ mod tests {
             50
         ));
     }
-
     #[test]
     fn record_image_respects_the_max_cap() {
         use super::record_image;
@@ -9484,7 +1315,6 @@ mod tests {
         }
         assert_eq!(h.len(), 2);
     }
-
     #[test]
     fn image_cache_write_read_delete_roundtrip() {
         use super::{cache_delete_image, cache_read_image, cache_write_image, fnv1a64};
@@ -9499,7 +1329,6 @@ mod tests {
         cache_delete_image(hash);
         assert_eq!(cache_read_image(hash), None);
     }
-
     #[test]
     fn delete_entry_removes_the_image_cache_file() {
         use super::{
@@ -9530,7 +1359,6 @@ mod tests {
         assert_eq!(cache_read_image(img.hash), None);
         assert_eq!(cache_read_detail_preview(img.hash), None);
     }
-
     #[test]
     fn trim_beyond_max_deletes_dropped_image_cache_files() {
         use super::{cache_read_image, record_image};
@@ -9550,7 +1378,6 @@ mod tests {
         assert!(cache_read_image(imgs[1].hash).is_some());
         assert!(cache_read_image(imgs[2].hash).is_some());
     }
-
     #[test]
     fn text_record_trim_deletes_dropped_image_cache_files() {
         use super::{cache_read_image, record_image, record_text};
@@ -9565,7 +1392,6 @@ mod tests {
         assert!(h.iter().all(|e| e.image.is_none()));
         assert_eq!(cache_read_image(img.hash), None);
     }
-
     #[test]
     fn sweep_clip_image_cache_removes_orphans_and_respects_file_refs() {
         use super::{
@@ -9597,7 +1423,6 @@ mod tests {
                 copied_at: None,
             },
         ];
-
         assert!(sweep_clip_image_cache(&history) >= 4);
         assert!(cache_read_image(keep.hash).is_some());
         assert!(cache_read_preview(keep.hash).is_some());
@@ -9613,7 +1438,6 @@ mod tests {
         assert!(clip_image_detail_path(file_img.hash).exists());
         clear_clip_image_cache();
     }
-
     #[test]
     fn clear_clip_image_cache_wipes_the_test_dir_only() {
         use super::{cache_read_image, cache_write_image, clear_clip_image_cache, fnv1a64};
@@ -9626,7 +1450,6 @@ mod tests {
         assert_eq!(cache_read_image(ha), None);
         assert_eq!(cache_read_image(hb), None);
     }
-
     #[test]
     fn cache_preview_roundtrip_and_delete_removes_both() {
         use super::{
@@ -9644,7 +1467,6 @@ mod tests {
         assert_eq!(cache_read_image(hash), None);
         assert_eq!(cache_read_preview(hash), None);
     }
-
     #[test]
     fn history_serialize_parse_roundtrip_skips_runtime_fields() {
         use super::{fnv1a64, parse_history};
@@ -9721,7 +1543,6 @@ mod tests {
         let parsed_ts = parse_history(&super::serialize_history(&[with_ts]).unwrap()).unwrap();
         assert_eq!(parsed_ts[0].copied_at, Some(1755000000));
     }
-
     #[test]
     fn load_history_keeps_distinct_data_images() {
         use super::{
@@ -9768,6 +1589,12 @@ mod tests {
         std::fs::write(&path, serialize_history(&[a, b, c]).unwrap()).unwrap();
         CLIP_HISTORY.lock().unwrap().clear();
         load_history();
+        // load_history 末尾的 save_history 是异步回写:必须等 worker 排空后才能改写
+        // 历史文件,否则第一轮的 3 条快照会延迟覆盖下一轮写入的 dup 文件(flaky 根因)。
+        // The save_history trailing load_history writes back asynchronously: drain the
+        // worker before rewriting the history file, or the first 3-entry snapshot lands
+        // late and clobbers the next round's dup file (the flake's root cause).
+        super::persist::flush_persist_worker_for_tests();
         let hashes: Vec<u64> = CLIP_HISTORY
             .lock()
             .unwrap()
@@ -9785,6 +1612,7 @@ mod tests {
         std::fs::write(&dup_path, serialize_history(&[mk(b"load-keep-a")]).unwrap()).unwrap();
         CLIP_HISTORY.lock().unwrap().clear();
         load_history();
+        super::persist::flush_persist_worker_for_tests();
         let n = CLIP_HISTORY
             .lock()
             .unwrap()
@@ -9797,7 +1625,6 @@ mod tests {
         cfg.clipboard.persist = prev.0;
         cfg.clipboard.auto_expire_days = prev.1;
     }
-
     #[test]
     fn load_history_skips_expired_entries() {
         use super::{expire_entries, now_secs};
@@ -9846,7 +1673,6 @@ mod tests {
         assert_eq!(expire_entries(&mut h, now, None), 0);
         assert_eq!(h.len(), 1);
     }
-
     #[test]
     fn history_parse_rejects_corruption_and_future_versions() {
         use super::parse_history;
@@ -9858,7 +1684,6 @@ mod tests {
         // 当前版本 → 可解析 / the current version parses.
         assert_eq!(parse_history(&entries), Some(vec![]));
     }
-
     #[test]
     fn restore_loaded_entry_recovers_preview_and_drops_broken_data_entries() {
         use super::{cache_write_image, cache_write_preview, fnv1a64, restore_loaded_entry};
@@ -9957,7 +1782,6 @@ mod tests {
         };
         assert_eq!(restore_loaded_entry(degen_entry.clone()), Some(degen_entry));
     }
-
     #[test]
     fn sensitive_marker_list_covers_the_securing_copy_protocol() {
         use super::SENSITIVE_PASTEBOARD_TYPES;
@@ -9968,7 +1792,6 @@ mod tests {
         assert!(SENSITIVE_PASTEBOARD_TYPES.contains(&"org.nspasteboard.AutoGeneratedType"));
         assert!(SENSITIVE_PASTEBOARD_TYPES.contains(&"com.agilebits.onepassword"));
     }
-
     #[test]
     fn paste_writeback_skip_only_when_toggle_off_and_marker_present() {
         use super::should_skip_paste_writeback;
@@ -9982,7 +1805,6 @@ mod tests {
         assert!(should_skip_paste_writeback(false, true));
         assert!(!should_skip_paste_writeback(false, false));
     }
-
     #[test]
     fn paste_delete_suppression_hits_the_armed_count_or_marker() {
         use super::paste_delete_suppression_hit;
@@ -9992,7 +1814,6 @@ mod tests {
         assert!(!paste_delete_suppression_hit(Some(41), 42, false));
         assert!(!paste_delete_suppression_hit(Some(42), 41, false));
     }
-
     #[test]
     fn paste_delete_identity_ignores_reorder_metadata() {
         use super::same_clip_entry_identity;
@@ -10004,7 +1825,6 @@ mod tests {
         assert!(!same_clip_entry_identity(&target, &entry("different")));
         assert!(!same_clip_entry_identity(&target, &entry_image(b"secret")));
     }
-
     #[test]
     fn explicit_delete_restore_preserves_metadata_and_original_position() {
         use super::{remove_entry_for_undo, restore_entry_at};
@@ -10014,7 +1834,6 @@ mod tests {
         removed.copied_at = Some(1234);
         let original = removed.clone();
         let mut history = vec![removed, entry("other")];
-
         let deleted = remove_entry_for_undo(&mut history, 0).expect("entry must be removed");
         assert_eq!(deleted, original);
         let (index, inserted) = restore_entry_at(&mut history, deleted, 0);
@@ -10022,7 +1841,6 @@ mod tests {
         assert_eq!(index, 0);
         assert_eq!(history[0], original);
     }
-
     #[test]
     fn undo_removal_keeps_image_cache_available_for_restore() {
         use super::{cache_read_image, remove_entry_for_undo, restore_entry_at};
@@ -10036,7 +1854,6 @@ mod tests {
         assert_eq!(history, vec![image_entry]);
         assert!(cache_read_image(hash).is_some());
     }
-
     #[test]
     fn restore_respects_pinned_boundary_and_deduplicates() {
         use super::{remove_entry_for_undo, restore_entry_at};
@@ -10047,18 +1864,15 @@ mod tests {
         let (index, inserted) = restore_entry_at(&mut history, unpinned.clone(), 0);
         assert!(inserted);
         assert_eq!(index, 1, "unpinned entries must stay below pinned entries");
-
         let (duplicate_index, duplicate_inserted) = restore_entry_at(&mut history, unpinned, 0);
         assert_eq!(duplicate_index, 1);
         assert!(!duplicate_inserted);
         assert_eq!(history.len(), 2);
-
         let deleted = remove_entry_for_undo(&mut history, 0).unwrap();
         let (pinned_index, pinned_inserted) = restore_entry_at(&mut history, deleted, 99);
         assert!(pinned_inserted);
         assert_eq!(pinned_index, 0);
     }
-
     #[test]
     fn clear_scope_keeps_pinned_only_when_requested() {
         use super::remove_history_scope;
@@ -10068,12 +1882,10 @@ mod tests {
         let removed = remove_history_scope(&mut history, false);
         assert_eq!(texts(&history), vec!["keep"]);
         assert_eq!(texts(&removed), vec!["drop"]);
-
         let removed = remove_history_scope(&mut history, true);
         assert!(history.is_empty());
         assert_eq!(texts(&removed), vec!["keep"]);
     }
-
     #[test]
     fn clipboard_undo_window_and_shortcut_are_strict() {
         use super::{clipboard_undo_expired, is_clipboard_undo_shortcut};
@@ -10087,7 +1899,6 @@ mod tests {
         assert!(!is_clipboard_undo_shortcut(6, 0x0010_0000 | 0x0002_0000));
         assert!(!is_clipboard_undo_shortcut(7, 0x0010_0000));
     }
-
     #[test]
     fn paste_kind_prefers_the_file_when_it_still_exists() {
         use super::{paste_kind, PasteKind};
@@ -10112,7 +1923,6 @@ mod tests {
             PasteKind::File(p.to_str().unwrap().to_string())
         );
     }
-
     #[test]
     fn record_image_file_copies_dedup_by_content_and_keep_the_filename() {
         use super::record_image;
@@ -10187,7 +1997,6 @@ mod tests {
         assert!(!record_image(&mut h, &dead, "Safari", "", 50));
         assert_eq!(h.len(), 3);
     }
-
     #[test]
     fn same_hash_file_and_data_entries_keep_shared_cache_until_both_are_gone() {
         use super::{
@@ -10234,7 +2043,6 @@ mod tests {
         assert_eq!(cache_read_image(hash), None);
         assert_eq!(cache_read_preview(hash), None);
     }
-
     #[test]
     fn trim_keeps_shared_cache_for_the_surviving_same_hash_entry() {
         use super::{
@@ -10278,7 +2086,6 @@ mod tests {
         assert_eq!(cache_read_image(hash), None);
         assert_eq!(cache_read_preview(hash), None);
     }
-
     #[test]
     fn reference_check_honors_pinned_survivors_for_clear_all() {
         use super::hash_referenced_by;
@@ -10312,7 +2119,6 @@ mod tests {
             0xdeadbeef
         ));
     }
-
     #[test]
     fn preferred_uti_picks_the_animated_original_over_static_reencodes() {
         use super::{
@@ -10375,7 +2181,6 @@ mod tests {
         // 什么都不存在 → None / nothing present -> None.
         assert_eq!(preferred_uti(&[]), None);
     }
-
     #[test]
     fn preferred_uti_order_pins_gif_before_static_fallbacks() {
         use super::{
@@ -10398,7 +2203,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn filtered_indices_hides_images_when_querying() {
         use super::{filtered_indices, ClipFilter};
@@ -10420,7 +2224,6 @@ mod tests {
         assert!(filtered_indices(&h, "", ClipFilter::Link).is_empty());
         assert_eq!(filtered_indices(&h, "", ClipFilter::Code), vec![3]);
     }
-
     #[test]
     fn detail_action_is_active_only_for_the_open_selected_row() {
         use super::{detail_action_is_active, NO_SELECTION};
@@ -10429,7 +2232,6 @@ mod tests {
         assert!(!detail_action_is_active(true, 2, 1));
         assert!(!detail_action_is_active(true, NO_SELECTION, 0));
     }
-
     #[test]
     fn empty_state_hint_uses_the_live_viewport_height() {
         use super::{empty_state_doc_height, header_strip_h, picker_min_height, FOOTER_H};
@@ -10445,7 +2247,6 @@ mod tests {
         // must grow with the viewport to stay centered.
         assert_eq!(empty_state_doc_height(480.0), 480.0);
     }
-
     #[test]
     fn detail_copy_refresh_restores_source_selection_in_filtered_list() {
         use super::{visible_selection_for_text, ClipFilter};
@@ -10470,7 +2271,6 @@ mod tests {
             None
         );
     }
-
     #[test]
     fn filtered_indices_link_filter_matches_urls_only() {
         use super::{filtered_indices, ClipFilter};
@@ -10484,7 +2284,6 @@ mod tests {
             Vec::<usize>::new()
         );
     }
-
     #[test]
     fn tab_filter_cycle_visits_every_category_and_wraps() {
         use super::{next_clip_filter, ClipFilter};
@@ -10496,7 +2295,6 @@ mod tests {
         assert_eq!(next_clip_filter(ClipFilter::Link), ClipFilter::Code);
         assert_eq!(next_clip_filter(ClipFilter::Code), ClipFilter::All);
     }
-
     #[test]
     fn compute_pitches_sizes_image_rows_for_the_thumbnail() {
         use super::{compute_pitches, GROUP_H, ROW_H, THUMB_H};
@@ -10512,7 +2310,6 @@ mod tests {
         // The thumbnail box fits inside the row.
         assert!(THUMB_H <= ROW_H);
     }
-
     #[test]
     fn duplicate_pinned_entry_stays_pinned_and_moves_to_pin_top() {
         use super::pin_entry;
@@ -10540,7 +2337,6 @@ mod tests {
         assert_eq!(texts(&h), vec!["B", "A", "D", "C"]);
         assert!(!h[1].pinned);
     }
-
     #[test]
     fn newest_goes_first() {
         let mut h = Vec::new();
@@ -10548,7 +2344,6 @@ mod tests {
         record_text(&mut h, "second", 50);
         assert_eq!(texts(&h), vec!["second", "first"]);
     }
-
     #[test]
     fn overflow_is_trimmed() {
         // 超过上限裁剪最旧条目。
@@ -10561,14 +2356,12 @@ mod tests {
         assert_eq!(h[0].text, "item4");
         assert_eq!(h[2].text, "item2");
     }
-
     #[test]
     fn zero_max_records_nothing() {
         let mut h = Vec::new();
         assert!(!record_text(&mut h, "x", 0));
         assert!(h.is_empty());
     }
-
     #[test]
     fn pinned_entries_stay_on_top_of_new_records() {
         use super::{pin_entry, unpin_entry};
@@ -10591,7 +2384,6 @@ mod tests {
         record_text(&mut h, "D", 50);
         assert_eq!(texts(&h), vec!["D", "B", "C", "A"]);
     }
-
     #[test]
     fn pin_moves_entry_to_top_and_is_idempotent() {
         use super::pin_entry;
@@ -10611,7 +2403,6 @@ mod tests {
         pin_entry(&mut h, 99);
         assert_eq!(h.len(), 3);
     }
-
     #[test]
     fn delete_entry_removes_by_index_and_ignores_out_of_range() {
         use super::delete_entry;
@@ -10629,7 +2420,6 @@ mod tests {
         delete_entry(&mut h, 0);
         assert_eq!(texts(&h), vec!["A"]);
     }
-
     #[test]
     fn delete_pinned_entry_keeps_others_pinned() {
         use super::{delete_entry, pin_entry};
@@ -10647,7 +2437,6 @@ mod tests {
         assert!(h[0].pinned);
         assert!(!h[1].pinned);
     }
-
     #[test]
     fn expire_entries_respects_pin_ttl_and_legacy_entries() {
         use super::expire_entries;
@@ -10689,7 +2478,6 @@ mod tests {
         assert_eq!(expire_entries(&mut h, 100, Some(30)), 0);
         assert_eq!(h.len(), 1);
     }
-
     #[test]
     fn expire_entries_deletes_image_cache_only_when_unreferenced() {
         use super::expire_entries;
@@ -10742,7 +2530,6 @@ mod tests {
             "a pinned survivor keeps the shared cache"
         );
     }
-
     #[test]
     fn filtered_indices_matches_case_insensitively() {
         use super::{filtered_indices, ClipFilter};
@@ -10764,7 +2551,6 @@ mod tests {
         // 前缀/单字符 / prefix and single chars.
         assert_eq!(filtered_indices(&h, "ban", ClipFilter::All), vec![1]);
     }
-
     #[test]
     fn filtered_indices_handles_cjk_emoji_and_combining_input() {
         use super::{filtered_indices, ClipFilter};
@@ -10780,7 +2566,6 @@ mod tests {
         assert_eq!(filtered_indices(&h, "family", ClipFilter::All), vec![1]);
         assert_eq!(filtered_indices(&h, "e\u{301}", ClipFilter::All), vec![2]);
     }
-
     #[test]
     fn mapped_index_goes_through_the_filtered_list() {
         use super::{filtered_indices, mapped_index, ClipFilter};
@@ -10802,7 +2587,6 @@ mod tests {
         assert_eq!(mapped_index(2), Some(3));
         assert_eq!(mapped_index(3), None);
     }
-
     #[test]
     fn estimate_lines_handles_width_and_newlines() {
         use super::estimate_lines;
@@ -10822,7 +2606,6 @@ mod tests {
         assert_eq!(estimate_lines("ab\ncd", 60), 2);
         assert_eq!(estimate_lines("ab\ncd\nef", 60), 3);
     }
-
     #[test]
     fn estimate_lines_keeps_unicode_grapheme_sequences_in_one_fallback_line() {
         use super::estimate_lines;
@@ -10837,7 +2620,6 @@ mod tests {
             2
         );
     }
-
     #[test]
     fn row_pitch_is_fixed_per_kind_with_group_headers() {
         use super::{compute_pitches, GROUP_H, ROW_H};
@@ -10851,7 +2633,6 @@ mod tests {
         assert_eq!(pitches[0], GROUP_H + ROW_H);
         assert_eq!(pitches[1], ROW_H);
     }
-
     #[test]
     fn group_headers_break_into_new_groups() {
         use super::{compute_pitches, GROUP_H, ROW_H};
@@ -10884,7 +2665,6 @@ mod tests {
         // Sanity-check the pitch constant (guards regressions): a uniform 61pt row.
         assert!(ROW_H >= 50.0 && ROW_H < 80.0);
     }
-
     #[test]
     fn classify_text_distinguishes_urls_and_code() {
         use super::{classify_text, TextKind};
@@ -10930,12 +2710,10 @@ mod tests {
         assert_eq!(classify_text(""), TextKind::Plain);
         assert_eq!(classify_text("  "), TextKind::Plain);
     }
-
     #[test]
     fn formatted_code_breaks_at_safe_points_and_maps_back_to_source() {
         use crate::clipboard_highlight::format_code_for_display;
         use objc2_foundation::NSRange;
-
         let source =
             "const result = veryLongObjectName.veryLongMethodName(firstArgument, secondArgument);";
         let formatted = format_code_for_display(source, 32);
@@ -10953,7 +2731,6 @@ mod tests {
             .source_range(NSRange::new(0, display_len));
         assert_eq!(source_range.length, source.encode_utf16().count());
     }
-
     #[test]
     fn source_icon_visibility_follows_the_source_display_toggle() {
         use super::should_show_source_icon;
@@ -10964,7 +2741,6 @@ mod tests {
         e.source_key.clear();
         assert!(!should_show_source_icon(true, &e));
     }
-
     #[test]
     fn build_meta_text_joins_app_and_relative_time() {
         use super::build_meta_text;
@@ -10996,7 +2772,6 @@ mod tests {
             super::t("clipboard.unknown_source")
         );
     }
-
     #[test]
     fn build_meta_text_reports_source_line_count_after_time() {
         use super::build_meta_text;
@@ -11007,12 +2782,10 @@ mod tests {
         let line_label = super::tf("clipboard.meta_lines_other", &[("count", "2")]);
         assert!(m.ends_with(&line_label), "got {m}");
         assert!(m.find(&line_label).unwrap() > m.find(" · ").unwrap());
-
         // Soft wrapping from a long single line is not a source line break.
         let single = entry_with_source(&"长".repeat(200), "Safari");
         assert!(!build_meta_text(&single, true).contains(&line_label));
     }
-
     #[test]
     fn physical_line_count_preserves_trailing_and_empty_lines() {
         use super::physical_line_count;
@@ -11021,7 +2794,6 @@ mod tests {
         assert_eq!(physical_line_count("first\n    "), Some(2));
         assert_eq!(physical_line_count("first\n\n"), Some(3));
     }
-
     #[test]
     fn format_copied_at_is_mm_dd_hh_mm() {
         use super::format_copied_at;
@@ -11040,7 +2812,6 @@ mod tests {
         assert_eq!(digits.len(), 8);
         assert!(digits.iter().all(u8::is_ascii_digit));
     }
-
     #[test]
     fn format_save_stamp_is_yyyy_mm_dd_hh_mm_ss_with_dots() {
         use super::format_save_stamp;
@@ -11066,7 +2837,6 @@ mod tests {
         // 年份字段是 4 位(含前导零)/ the year field is 4 digits wide.
         assert!(s[..=3].bytes().all(|b| b.is_ascii_digit()), "got {s}");
     }
-
     #[test]
     fn nav_arrow_moves_and_wraps() {
         use super::{nav_arrow, NO_SELECTION};
@@ -11086,7 +2856,6 @@ mod tests {
         assert_eq!(nav_arrow(125, NO_SELECTION, 3), Some(0));
         assert_eq!(nav_arrow(126, NO_SELECTION, 3), Some(2));
     }
-
     #[test]
     fn selection_scroll_offset_keeps_the_selected_row_visible() {
         use super::selection_scroll_offset;
@@ -11114,7 +2883,6 @@ mod tests {
             700.0
         );
     }
-
     #[test]
     fn clamp_selection_after_delete_lands_on_the_new_tail() {
         use super::{clamp_selection, NO_SELECTION};
@@ -11136,7 +2904,6 @@ mod tests {
         // Way out of range (accumulated deletions) -> the tail.
         assert_eq!(clamp_selection(5, 2), 1);
     }
-
     #[test]
     fn screen_containing_finds_the_cursor_screen() {
         use super::screen_containing;
@@ -11163,7 +2930,6 @@ mod tests {
             None
         );
     }
-
     #[test]
     fn picker_frame_follows_cursor_with_flips() {
         use super::{picker_frame_for, PICKER_CURSOR_OFF, PICKER_EDGE_MARGIN};
@@ -11192,7 +2958,6 @@ mod tests {
         assert!(f.origin.y >= screen.origin.y + PICKER_EDGE_MARGIN);
         assert!(f.origin.y + h <= screen.origin.y + screen.size.height - PICKER_EDGE_MARGIN);
     }
-
     #[test]
     fn detail_frame_stays_right_of_picker_and_clamps() {
         use super::{detail_frame_for, DETAIL_GAP, PICKER_EDGE_MARGIN};
@@ -11252,7 +3017,6 @@ mod tests {
             picker.origin.y + picker.size.height
         );
     }
-
     #[test]
     fn detail_group_centers_picker_and_keeps_detail_on_the_right() {
         use super::{detail_group_frames, DETAIL_GAP, PICKER_EDGE_MARGIN, PICKER_W};
@@ -11270,7 +3034,6 @@ mod tests {
         assert!(detail_frame.origin.x >= picker_frame.origin.x + PICKER_W);
         assert!(detail_frame.origin.x + detail_frame.size.width <= 1920.0 - PICKER_EDGE_MARGIN);
     }
-
     #[test]
     fn detail_group_clamps_without_flipping_on_a_narrow_screen() {
         use super::{detail_group_frames, PICKER_EDGE_MARGIN, PICKER_W};
@@ -11286,7 +3049,6 @@ mod tests {
                 <= screen.origin.x + screen.size.width - PICKER_EDGE_MARGIN
         );
     }
-
     #[test]
     fn detail_text_units_scales_with_width() {
         use super::detail_text_units;
@@ -11299,7 +3061,6 @@ mod tests {
         // A tiny width floors at 1 unit (never 0).
         assert_eq!(detail_text_units(1.0), 1);
     }
-
     #[test]
     fn detail_text_size_clamps_to_screen_height() {
         use super::{detail_max_height, detail_text_size, TextKind};
@@ -11341,7 +3102,6 @@ mod tests {
         let (_, no_wrap_h) = super::detail_unwrapped_code_size(&long_code, max_height);
         assert_eq!(no_wrap_h, super::DETAIL_PANEL_MIN_H);
     }
-
     #[test]
     fn toggle_pin_on_roundtrips_pinned_state() {
         use super::toggle_pin_on;
@@ -11367,7 +3127,6 @@ mod tests {
         assert_eq!(idx, 99);
         assert_eq!(h.len(), 3);
     }
-
     #[test]
     fn toggle_pin_on_returns_new_index_for_follow_selection() {
         // "跟随置顶"要用条目重排后的新索引定位——旧索引此时已指向别的条目。
@@ -11386,7 +3145,6 @@ mod tests {
         assert_eq!(h[1].text, "u1");
         assert!(!h[1].pinned);
     }
-
     // ========== 冒烟测试(需要真实 GUI 会话,手动运行)==========
     // ========== Smoke test (needs a real GUI session; run manually) ==========
     // 运行:先 cargo build,再 cargo test -- --ignored

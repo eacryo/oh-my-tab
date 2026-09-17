@@ -15,11 +15,53 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
+
+// ========== 浮窗呈现钩子 / overlay presentation hooks ==========
+
+/// 浮窗呈现钩子:window_refresh 只决定「何时」重建/显示卡片面,不再知道「谁」呈现
+/// (原先直接调用 overlay::*,与 overlay→window_refresh 的请求方向构成模块环)。
+/// main() 启动时把 overlay 的实现注入进来,依赖变为单向:overlay → window_refresh。
+///
+/// Overlay presentation hooks: window_refresh decides only WHEN the card surface must
+/// re-render, never WHO renders it (it used to call overlay::* directly, forming a module
+/// cycle against the overlay -> window_refresh request direction). main() injects the
+/// overlay implementations at startup, making the dependency one-way.
+pub(crate) struct OverlayPresenter {
+    /// 关闭卡片收窄过渡是否正在进行(进行中则暂缓应用快照)。
+    /// Whether a card-close reflow transition is running (snapshots defer while it does).
+    pub(crate) card_close_in_progress: fn() -> bool,
+    /// 首帧快照就绪且 Cmd 已提前松开:不显示面板直接落定选择。
+    /// First snapshot ready with Cmd already released: commit the pick without ever showing.
+    pub(crate) commit_first_summon: fn(backward: bool),
+    /// 首帧快照就绪:一次性显示浮窗(一次成图)。
+    /// First snapshot ready: show the overlay once (single-shot render).
+    pub(crate) show_first_summon: fn(backward: bool),
+    /// 取走「显示器配置变化待重排」标志(可见时按新屏幕几何重排)。
+    /// Take the pending display-relayout flag (re-layout to the new screen geometry).
+    pub(crate) take_display_relayout_pending: fn() -> bool,
+    /// 复位缩略图可视区间/滚动/导航锚点(集合级变化后的整树重建前)。
+    /// Reset the thumbnail visible range/scroll/navigation anchor (before a full rebuild).
+    pub(crate) reset_thumbnail_state: fn(),
+    pub(crate) show_overlay: fn(),
+    pub(crate) refresh_highlight: fn(),
+}
+
+static OVERLAY_PRESENTER: OnceLock<OverlayPresenter> = OnceLock::new();
+
+/// 启动时注册浮窗呈现实现;未注册(单测/冒烟)时查询钩子取中性值、动作钩子为空操作。
+/// Register the overlay presentation implementations at startup; when unregistered (unit
+/// tests/smoke runs) query hooks return neutral values and action hooks no-op.
+pub(crate) fn register_overlay_presenter(presenter: OverlayPresenter) {
+    let _ = OVERLAY_PRESENTER.set(presenter);
+}
+
+fn overlay_presenter() -> Option<&'static OverlayPresenter> {
+    OVERLAY_PRESENTER.get()
+}
 use std::thread;
 use std::time::Duration;
 
 use crate::ffi::frontmost_app_info;
-use crate::overlay;
 use crate::performance;
 use crate::thumbnail;
 use crate::window_collector::{
@@ -555,7 +597,7 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
     // covers any panic in this stage. Without it, callback_guard would swallow the panic into a
     // single log line while the flag stayed true forever -- the exact mirror of the bug fixed
     // above.
-    if overlay::card_close_in_progress() {
+    if overlay_presenter().is_some_and(|p| (p.card_close_in_progress)()) {
         // 关闭卡片正在收窄补位时保留快照,避免刷新重建 view 树打断过渡动画。
         // Keep the snapshot pending while close reflow runs, so a refresh cannot rebuild the view tree.
         let generation = WINDOW_REFRESH_RESULT
@@ -724,13 +766,17 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
             // Cmd was released while the first snapshot was pending. Commit the selected target
             // without ever displaying the panel; on_cmd_released cannot do this itself because
             // the panel is intentionally still invisible until the snapshot is ready.
-            overlay::commit_first_summon(backward);
+            if let Some(presenter) = overlay_presenter() {
+                (presenter.commit_first_summon)(backward);
+            }
             log_debug!(
                 "[overlay] summon e2e: first snapshot committed after pending release (backward={})",
                 backward
             );
         } else {
-            overlay::show_first_summon(backward);
+            if let Some(presenter) = overlay_presenter() {
+                (presenter.show_first_summon)(backward);
+            }
             log_debug!(
                 "[overlay] summon e2e: first snapshot shown (backward={})",
                 backward
@@ -746,7 +792,8 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
     // overlay must still re-layout to the new aspects. Scroll position is kept
     // (show_overlay clamps it into the new range) and, with the set unchanged,
     // card indices do not drift, so navigation anchors need no reset.
-    let relayout_for_display_change = was_visible && overlay::take_display_relayout_pending();
+    let relayout_for_display_change =
+        was_visible && overlay_presenter().is_some_and(|p| (p.take_display_relayout_pending)());
     if relayout_for_display_change {
         log_debug!(
             "[display] post-reconfiguration relayout applying refreshed bounds (set_changed={})",
@@ -754,13 +801,15 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
         );
     }
     if set_changed && was_visible {
-        overlay::reset_thumbnail_visible_range();
-        overlay::reset_thumbnail_scroll();
-        overlay::reset_thumbnail_nav_anchor();
+        if let Some(presenter) = overlay_presenter() {
+            (presenter.reset_thumbnail_state)();
+        }
     }
     if was_visible && (set_changed || relayout_for_display_change) {
-        overlay::show_overlay();
-        overlay::refresh_highlight();
+        if let Some(presenter) = overlay_presenter() {
+            (presenter.show_overlay)();
+            (presenter.refresh_highlight)();
+        }
     }
     // WindowServer 监听所有 CG 候选窗口,而不是只监听 AX 确认并显示的卡片。
     // WindowServer observes every CG candidate instead of only AX-confirmed display cards.

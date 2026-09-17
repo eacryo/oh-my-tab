@@ -65,6 +65,10 @@ struct PersistJob {
 static PERSIST_SENDER: OnceLock<Sender<PersistJob>> = OnceLock::new();
 static PERSIST_GENERATION: AtomicU64 = AtomicU64::new(0);
 static PERSIST_IO_LOCK: Mutex<()> = Mutex::new(());
+/// worker 已处理到的代数(含被合并丢弃的中间代):测试用它等待异步回写落定。
+/// The newest generation the worker has processed (coalesced-away jobs count as
+/// processed): tests wait on it so the async writeback settles deterministically.
+static PERSIST_DONE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn persist_sender() -> &'static Sender<PersistJob> {
     PERSIST_SENDER.get_or_init(|| {
@@ -85,7 +89,28 @@ fn persist_worker(receiver: Receiver<PersistJob>) {
         while let Ok(newer) = receiver.try_recv() {
             job = newer;
         }
+        let done_generation = job.generation;
         write_history_snapshot(job);
+        PERSIST_DONE_GENERATION.store(done_generation, Ordering::Release);
+    }
+}
+
+/// 测试辅助:等到 worker 处理完当前代数及之前的全部快照。load_history 末尾的
+/// save_history 是异步的,若不排空,旧快照可能在测试改写历史文件之后才落盘,
+/// 把测试刚写入的新文件覆盖回旧内容(曾经是 flaky 根因:left:3, right:1)。
+/// Test helper: wait until the worker has drained every snapshot up to the current
+/// generation. The save_history at the end of load_history is asynchronous; without
+/// draining, an older snapshot can land AFTER a test rewrites the history file and
+/// clobber it with stale content (the former flake: left:3, right:1).
+#[cfg(test)]
+pub(super) fn flush_persist_worker_for_tests() {
+    let target = PERSIST_GENERATION.load(Ordering::Acquire);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while PERSIST_DONE_GENERATION.load(Ordering::Acquire) < target {
+        if std::time::Instant::now() > deadline {
+            panic!("clipboard persist worker did not drain within 10s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 

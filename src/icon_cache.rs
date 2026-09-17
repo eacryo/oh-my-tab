@@ -13,9 +13,9 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use std::ffi::c_void;
 
+use crate::app_identity::{resolve_app_identity, AppIdentity};
 use crate::ffi::{CFRelease, CFStringCreateWithCString};
 use crate::log_debug;
-use crate::window_collector::{resolve_app_identity, AppIdentity};
 
 fn icon_cache_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());

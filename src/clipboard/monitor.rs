@@ -87,7 +87,7 @@ pub(super) fn poll_clipboard() {
             // only means no icon).
             let (source, pid) = crate::ffi::frontmost_app_info();
             let source_key = if pid > 0 {
-                let id = unsafe { crate::window_collector::resolve_app_identity(pid) };
+                let id = unsafe { crate::app_identity::resolve_app_identity(pid) };
                 let key = id.key.clone();
                 let _ = crate::icon_cache::extract_small_icon(pid);
                 key
@@ -158,7 +158,7 @@ pub(super) fn poll_clipboard() {
             Some(img) => {
                 let (source, pid) = crate::ffi::frontmost_app_info();
                 let source_key = if pid > 0 {
-                    let id = unsafe { crate::window_collector::resolve_app_identity(pid) };
+                    let id = unsafe { crate::app_identity::resolve_app_identity(pid) };
                     let key = id.key.clone();
                     let _ = crate::icon_cache::extract_small_icon(pid);
                     key
