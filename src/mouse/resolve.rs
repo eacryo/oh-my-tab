@@ -22,6 +22,9 @@ pub(crate) struct ResolvedMouse {
     pub scroll_mode: ScrollMode,
     pub line_count: u32,
     pub disable_acceleration: bool,
+    // 指针加速 / 跟踪速度(0..=40);None = 不改动设备现值。
+    // Pointer acceleration / tracking speed (0..=40); None = leave the device value alone.
+    pub acceleration: Option<f64>,
     // 按键映射:按钮号 -> 快捷键描述(逐键合并,后者覆盖)。
     // Button mappings: button number -> shortcut description (per-key merge, later wins).
     pub button_mappings: HashMap<String, String>,
@@ -37,6 +40,7 @@ impl Default for ResolvedMouse {
             scroll_mode: ScrollMode::Default,
             line_count: 3,
             disable_acceleration: false,
+            acceleration: None,
             button_mappings: HashMap::new(),
             button_mappings_enabled: true,
         }
@@ -115,6 +119,7 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
     r.scroll_mode = defaults.scroll_mode;
     r.line_count = defaults.line_count;
     r.disable_acceleration = defaults.disable_acceleration;
+    r.acceleration = defaults.acceleration;
     r.button_mappings = HashMap::new();
     r.button_mappings_enabled = defaults.button_mappings_enabled;
 
@@ -136,6 +141,11 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
         if let Some(ref ptr) = p.pointer {
             if let Some(da) = ptr.disable_acceleration {
                 r.disable_acceleration = da;
+            }
+            // 指针加速 / 跟踪速度:后者覆盖前者(与其它字段一致)。
+            // Pointer acceleration / tracking speed: later wins (same as every other field).
+            if let Some(acc) = ptr.acceleration {
+                r.acceleration = Some(acc);
             }
         }
         // 按键映射:逐键并入(同键后者覆盖)。
@@ -227,6 +237,48 @@ mod tests {
     }
 
     #[test]
+    fn acceleration_merges_across_profiles() {
+        let mut cfg = Config::default();
+        cfg.mouse.profiles.clear();
+        // "所有鼠标"档:设跟踪速度。
+        cfg.mouse.profiles.push(MouseProfile {
+            pointer: Some(PartialPointerSection {
+                acceleration: Some(0.6875),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // 设备档:覆盖为另一个值。
+        cfg.mouse.profiles.push(MouseProfile {
+            device: crate::config::DeviceMatcher {
+                vendor_id: Some(1133),
+                product_id: Some(17492),
+            },
+            pointer: Some(PartialPointerSection {
+                acceleration: Some(2.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        // 匹配设备:设备档覆盖。
+        assert_eq!(
+            resolve_from(&cfg, Some((1133, 17492))).acceleration,
+            Some(2.0)
+        );
+        // 其他设备:用通配档。
+        assert_eq!(resolve_from(&cfg, Some((1, 2))).acceleration, Some(0.6875));
+        // 无设备(归因失败):只用通配档。
+        assert_eq!(resolve_from(&cfg, None).acceleration, Some(0.6875));
+
+        // 全部档都未设 -> None(不改动设备现值)。
+        let mut cfg2 = Config::default();
+        cfg2.mouse.profiles.clear();
+        cfg2.mouse.profiles.push(MouseProfile::default());
+        assert_eq!(resolve_from(&cfg2, None).acceleration, None);
+    }
+
+    #[test]
     fn later_match_wins_on_merge() {
         let mut cfg = Config::default();
         cfg.mouse.profiles.clear();
@@ -256,6 +308,7 @@ mod tests {
             line_count: Some(7),
             pointer: Some(PartialPointerSection {
                 disable_acceleration: Some(true),
+                ..Default::default()
             }),
             ..Default::default()
         });

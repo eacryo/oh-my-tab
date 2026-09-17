@@ -134,6 +134,7 @@ row_line_count = "Lines per tick"
 header_mouse_pointer = "Pointer"
 row_disable_pointer_accel = "Disable pointer acceleration (linear tracking)"
 desc_disable_pointer_accel = "Use linear tracking instead of macOS pointer acceleration."
+row_pointer_tracking_speed = "Tracking speed"
 header_clipboard = "Clipboard"
 header_clipboard_options = "History Options"
 row_clipboard_enabled = "Enable clipboard history"
@@ -313,6 +314,7 @@ mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line'
 clipboard_max_entries_invalid = "clipboard.max_entries: {value} must be 1..=100"
 clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} must be 0..=7 (0 = never)"
 mouse_line_count_invalid = "line_count: {value} must be 1..=10"
+mouse_pointer_acceleration_invalid = "pointer.acceleration: {value} must be 0..=40"
 windows_overlay_position_invalid = 'windows.overlay_position: "{value}" is not one of active_window, main'
 windows_activation_mode_invalid = 'windows.activation_mode: "{value}" is not one of hover, click'
 clipboard_picker_position_invalid = 'clipboard.picker_position: "{value}" is not one of mouse, main'

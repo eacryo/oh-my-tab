@@ -839,10 +839,11 @@ pub(super) unsafe fn make_value_label(
     value: &str,
 ) -> *mut AnyObject {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let label: *mut AnyObject = msg_send![
-        label,
-        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h.max(34.0)))
-    ];
+    // 高度按调用方给的值:滑块读数只有 18pt,满行高的控件由调用方自己决定(不在这里兜底)。
+    // Height is whatever the caller asks for: a slider readout is only 18pt, so no full-control
+    // minimum is enforced here.
+    let label: *mut AnyObject =
+        msg_send![label, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
     set_field(label, value);
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
@@ -2890,6 +2891,43 @@ pub(super) unsafe fn make_slider(
     let _: () = msg_send![slider, setNumberOfTickMarks: (max - min + 1) as isize];
     let _: () = msg_send![slider, setAllowsTickMarkValuesOnly: true];
     let _: () = msg_send![slider, setIntegerValue: value];
+    slider
+}
+
+/// 连续取值的滑块(无刻度吸附),用于指针加速 / 跟踪速度这类小数区间。
+///
+/// 与整数滑块不同,这里刻意**不**连续发送 action:鼠标页的每次配置变更都会走
+/// apply_config_change → pointer::apply(),而后者要重建 event system client 并等
+/// ~30ms 让异步匹配完成。拖动中每个 mouse-dragged 都触发一次会让整个拖动卡死,
+/// 因此数值在松手时(或点击轨道时)一次性生效 —— 对硬件属性来说这也是更合适的时机。
+///
+/// A continuous-value slider (no tick snapping), for fractional ranges such as pointer
+/// acceleration / tracking speed.
+///
+/// Unlike the integer slider this deliberately does NOT send actions continuously: every mouse
+/// config change goes through apply_config_change → pointer::apply(), which rebuilds the event
+/// system client and waits ~30ms for asynchronous matching. Firing that on every mouse-dragged
+/// event would stall the whole drag, so the value applies once on release (or on a track click)
+/// -- which is also the better moment for a hardware property.
+pub(super) unsafe fn make_double_slider(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    min: f64,
+    max: f64,
+    value: f64,
+) -> *mut AnyObject {
+    let slider: *mut AnyObject = msg_send![class!(NSSlider), alloc];
+    let slider: *mut AnyObject =
+        msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
+    let _: () = msg_send![slider, setContinuous: false];
+    let _: () = msg_send![slider, setMinValue: min];
+    let _: () = msg_send![slider, setMaxValue: max];
+    // 不设刻度:NSSlider 默认即为连续取值,设了 allowsTickMarkValuesOnly 反而会吸附到整数。
+    // No tick marks: NSSlider is continuous by default, and allowsTickMarkValuesOnly would
+    // snap it to integers.
+    let _: () = msg_send![slider, setDoubleValue: value];
     slider
 }
 

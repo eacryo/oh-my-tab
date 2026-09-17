@@ -349,6 +349,11 @@ pub struct PointerSection {
     pub disable_acceleration: bool,
 }
 
+/// 指针加速 / 跟踪速度的合法区间(HIDPointerAcceleration 本身的取值范围)。
+/// The valid range for pointer acceleration / tracking speed (HIDPointerAcceleration's own range).
+pub const MOUSE_ACCELERATION_MIN: f64 = 0.0;
+pub const MOUSE_ACCELERATION_MAX: f64 = 40.0;
+
 /// 设备匹配器(None = 通配,即"所有鼠标")。配置按 VID+PID 匹配设备。
 /// Device matcher (None = wildcard, i.e. "All Mice"). Config matches devices by VID+PID.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -368,6 +373,15 @@ pub struct DeviceMatcher {
 #[serde(default)]
 pub struct PartialPointerSection {
     pub disable_acceleration: Option<bool>,
+    // 线性跟踪下的跟踪速度(0..=40),写 HIDPointerAcceleration(IOFixed:值 × 65536)。
+    // 只在 disable_acceleration 打开时生效:线性缩放下该属性就是跟踪速度本身;开关关闭时
+    // 它是 macOS 加速曲线的强度,含义不同,因此不写入。None = 不改动设备现值。
+    // Tracking speed in linear mode (0..=40), written to HIDPointerAcceleration (IOFixed:
+    // value × 65536). Only takes effect while disable_acceleration is on: under linear scaling
+    // that property is the tracking speed itself, whereas with the switch off it is the strength
+    // of macOS's acceleration curve, a different meaning, so it is not written then.
+    // None = leave the device's current value alone.
+    pub acceleration: Option<f64>,
 }
 
 /// 单个配置档。device = None 即"所有鼠标"档(默认层)。
@@ -451,6 +465,7 @@ impl Default for MouseSection {
                 line_count: Some(3),
                 pointer: Some(PartialPointerSection {
                     disable_acceleration: Some(false),
+                    acceleration: None,
                 }),
                 ..Default::default()
             }],
@@ -512,6 +527,7 @@ impl MouseSection {
             line_count: self.line_count.map(|n| if n == 0 { 3 } else { n }),
             pointer: self.pointer.take().map(|p| PartialPointerSection {
                 disable_acceleration: Some(p.disable_acceleration),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -915,6 +931,17 @@ impl Config {
                     errs.push(format!("{prefix}.line_count: {msg}"));
                 }
             }
+            // 指针加速 / 跟踪速度:0..=40(HIDPointerAcceleration 的合法区间)。
+            // Pointer acceleration / tracking speed: 0..=40 (HIDPointerAcceleration's range).
+            if let Some(acc) = p.pointer.as_ref().and_then(|ptr| ptr.acceleration) {
+                if !(MOUSE_ACCELERATION_MIN..=MOUSE_ACCELERATION_MAX).contains(&acc) {
+                    let msg = tf(
+                        "errors.mouse_pointer_acceleration_invalid",
+                        &[("value", &acc.to_string())],
+                    );
+                    errs.push(format!("{prefix}.pointer.acceleration: {msg}"));
+                }
+            }
             // 按键映射:按钮号合法(数字且 >= 2)+ 快捷键可解析。
             // Button mappings: valid button numbers (numeric, >= 2) + parseable shortcuts.
             errs.extend(crate::mouse::shortcut::validate_mappings(
@@ -1144,9 +1171,18 @@ impl Config {
                     merged_p.button_mappings.insert(btn.clone(), desc.clone());
                 }
             }
-            // pointer.disable_acceleration 是 bool,恒有效。
-            // pointer.disable_acceleration is a bool, always valid.
-            merged_p.pointer = p.pointer.clone();
+            // pointer.disable_acceleration 是 bool,恒有效;acceleration 需过范围校验。
+            // pointer.disable_acceleration is a bool (always valid); acceleration must pass
+            // the range check.
+            let accel_ok = !errs
+                .iter()
+                .any(|e| e.starts_with(&format!("{prefix}.pointer.acceleration")));
+            merged_p.pointer = p.pointer.clone().map(|mut ptr| {
+                if !accel_ok {
+                    ptr.acceleration = None;
+                }
+                ptr
+            });
             self.mouse.profiles.push(merged_p);
         }
         // 迁移完后清掉自身的旧字段(防止序列化出冗余)。
@@ -2230,6 +2266,7 @@ mod tests {
                 line_count: Some(5),
                 pointer: Some(PartialPointerSection {
                     disable_acceleration: Some(true),
+                    acceleration: Some(1.25),
                 }),
                 ..Default::default()
             },
@@ -2270,6 +2307,7 @@ mod tests {
             w.pointer.as_ref().and_then(|x| x.disable_acceleration),
             Some(true)
         );
+        assert_eq!(w.pointer.as_ref().and_then(|x| x.acceleration), Some(1.25));
         let d = &loaded.mouse.profiles[1];
         assert_eq!(d.device.vendor_id, Some(1133));
         assert_eq!(d.device.product_id, Some(17492));
@@ -2450,6 +2488,47 @@ reverse_scroll = false
         assert_eq!(cfg.mouse.profiles[1].device.product_id, Some(17492));
         assert_eq!(cfg.mouse.profiles[1].reverse_scroll, Some(false));
         assert_eq!(cfg.mouse.profiles[1].scroll_mode, None);
+    }
+
+    #[test]
+    fn load_out_of_range_pointer_acceleration_is_dropped_per_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[mouse]
+enabled = true
+
+[[mouse.profiles]]
+[mouse.profiles.pointer]
+disable_acceleration = true
+acceleration = 2.5
+
+[[mouse.profiles]]
+device_vendor_id = 1133
+device_product_id = 17492
+[mouse.profiles.pointer]
+acceleration = 41.0
+"#,
+        )
+        .unwrap();
+
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs
+            .iter()
+            .any(|error| error.contains("mouse.profiles[1].pointer.acceleration")));
+        // 合法档保留;越界档只丢 acceleration,disable_acceleration 仍生效。
+        // The valid profile keeps its value; the out-of-range one loses only acceleration,
+        // while disable_acceleration still applies.
+        assert_eq!(
+            cfg.mouse.profiles[0].pointer.as_ref().unwrap().acceleration,
+            Some(2.5)
+        );
+        assert_eq!(
+            cfg.mouse.profiles[1].pointer.as_ref().unwrap().acceleration,
+            None
+        );
     }
 
     #[test]

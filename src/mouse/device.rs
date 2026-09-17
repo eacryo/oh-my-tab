@@ -447,6 +447,30 @@ pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
     reg.devices.iter().map(|d| d.identity.clone()).collect()
 }
 
+/// 读取某个设备当前生效的整数属性(通过注册表里保活的 service client)。
+/// 找不到该 VID/PID 的设备、或属性不存在时返回 None。
+/// 全程持有注册表锁:service client 由 reg.services 保活,设备插拔重建时不会悬空。
+///
+/// Read a device's current integer property (through the service client kept alive by the
+/// registry). None when no device with that VID/PID is present or the property doesn't exist.
+/// The registry lock is held throughout: the service client is kept alive by reg.services, so
+/// a plug/unplug rebuild can never leave it dangling.
+pub(crate) fn device_int_property(key: DeviceKey, property: &str) -> Option<i64> {
+    {
+        let reg = registry().lock().unwrap();
+        if reg.devices.is_empty() {
+            drop(reg);
+            ensure_enumerated();
+        }
+    }
+    let reg = registry().lock().unwrap();
+    let device = reg
+        .devices
+        .iter()
+        .find(|d| (d.identity.vendor_id, d.identity.product_id) == key)?;
+    unsafe { prop_int(device.service_client, property) }
+}
+
 // ========== 设备插拔监听 / device plug/unplug monitoring ==========
 
 /// IOHIDManager 实例(保活:释放后回调即失效)。由 start_plug_monitor 创建,仅一次。

@@ -61,8 +61,6 @@ const LOCALE_VALUES: [&str; 4] = ["auto", "en", "zh-Hans", "zh-Hant"];
 const TEXT_SIZE_MIN: i64 = 13;
 const TEXT_SIZE_MAX: i64 = 20;
 const TEXT_SIZE_DEFAULT: i64 = 15;
-const TEXT_SIZE_VALUE_W: f64 = 40.0;
-const TEXT_SIZE_VALUE_H: f64 = 18.0;
 const CLIPBOARD_AUTO_EXPIRE_MIN: i64 = 0;
 const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
 const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
@@ -225,6 +223,13 @@ pub(super) struct SettingsUi {
     line_count_separator: *mut AnyObject, // NSView: 行数行上方分割线 / separator above line-count row
     line_count_compact: bool, // 是否已移除条件行占位 / whether the conditional row is compacted
     disable_pointer_accel: *mut AnyObject, // NSSwitch: 禁用指针加速 / disable pointer acceleration
+    pointer_accel_slider: *mut AnyObject, // NSSlider: 跟踪速度 0..=40
+    pointer_accel_label: *mut AnyObject, // NSTextField: 该行标题 / the row's label
+    pointer_accel_value_label: *mut AnyObject, // NSTextField: 滑块当前值(只读)/ slider's current value (read-only)
+    pointer_accel_separator: *mut AnyObject,   // NSView: 该行上方分割线 / separator above the row
+    pointer_accel_card: *mut AnyObject,        // NSView: 指针卡片 / the pointer card
+    pointer_accel_shadow: *mut AnyObject,      // NSView: 指针卡片阴影 / the pointer card shadow
+    pointer_accel_compact: bool, // 是否已移除条件行占位 / whether the conditional row is compacted
     // ---- 按键映射区 / button-mappings section ----
     mapping_scroll: *mut AnyObject, // NSScrollView: 绑定列表滚动容器 / the bindings scroll view
     mapping_doc: *mut AnyObject,    // NSView: 滚动容器里的 document view(行堆叠处)/ document view
@@ -512,33 +517,9 @@ fn text_size_slider_value(value: f64) -> i64 {
     }
 }
 
-unsafe fn make_text_size_value_label(
-    parent: *mut AnyObject,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    value: i64,
-) -> *mut AnyObject {
-    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let label: *mut AnyObject = msg_send![
-        label,
-        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
-    ];
-    set_field(label, value);
-    let _: () = msg_send![label, setBezeled: false];
-    let _: () = msg_send![label, setDrawsBackground: false];
-    let _: () = msg_send![label, setEditable: false];
-    let _: () = msg_send![label, setUsesSingleLineMode: true];
-    let _: () = msg_send![label, setAlignment: 1isize]; // NSTextAlignmentCenter
-    let _: () = msg_send![parent, addSubview: label];
-    release_obj(label);
-    label
-}
-
 // ========== 鼠标 profile 读写 helper / mouse profile read/write helpers ==========
 
-use crate::config::{DeviceMatcher, MouseProfile, PartialPointerSection};
+use crate::config::{DeviceMatcher, MouseProfile};
 
 /// 当前在鼠标页选中的设备范围(读 SELECTED_DEVICE;未初始化时默认 None="所有鼠标")。
 /// The currently-selected device scope on the Mouse page (reads SELECTED_DEVICE; defaults to
@@ -1154,6 +1135,7 @@ enum ControlField {
     ScrollMode,
     LineCount,
     DisablePointerAccel,
+    PointerAcceleration,
     MappingEnabled,
     ClipboardEnabled,
     ClipboardPersist,
@@ -1217,6 +1199,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             .or_else(|| m(u.scroll_mode, ControlField::ScrollMode))
             .or_else(|| m(u.line_count, ControlField::LineCount))
             .or_else(|| m(u.disable_pointer_accel, ControlField::DisablePointerAccel))
+            .or_else(|| m(u.pointer_accel_slider, ControlField::PointerAcceleration))
             .or_else(|| m(u.mapping_enabled, ControlField::MappingEnabled))
             .or_else(|| m(u.clipboard_enabled, ControlField::ClipboardEnabled))
             .or_else(|| m(u.clipboard_persist, ControlField::ClipboardPersist))
@@ -1348,6 +1331,12 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
                 } else if ctrl == u.clipboard_auto_expire_days {
                     let val: isize = msg_send![ctrl, integerValue];
                     set_field(u.clipboard_auto_expire_days_value_label, val);
+                } else if ctrl == u.pointer_accel_slider {
+                    // 指针加速 / 跟踪速度:只读数值随拖动实时刷新(2 位小数)。
+                    // Pointer acceleration / tracking speed: the read-only value follows the drag
+                    // in real time (2 decimals).
+                    let val: f64 = msg_send![ctrl, doubleValue];
+                    set_field(u.pointer_accel_value_label, pointer_accel_display(val));
                 }
             }
         });
@@ -1367,6 +1356,16 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
                 }
             });
         }
+        if matches!(field, ControlField::DisablePointerAccel) {
+            // 开关切换:跟踪速度行随之显隐(打开=线性跟踪时才出现)。
+            // The switch flipped: the tracking-speed row follows (it only appears while linear
+            // tracking is on).
+            with_settings_ui(|ui| {
+                if let Some(u) = ui.as_mut() {
+                    update_pointer_accel_visibility(u);
+                }
+            });
+        }
     }
 }
 
@@ -1381,6 +1380,7 @@ fn apply_control_field(field: ControlField) {
         | ControlField::ScrollMode
         | ControlField::LineCount
         | ControlField::DisablePointerAccel
+        | ControlField::PointerAcceleration
         | ControlField::MappingEnabled => {
             unsafe { apply_mouse_profile_field(field) };
             return;
@@ -1495,6 +1495,7 @@ fn apply_control_field(field: ControlField) {
                 | ControlField::ScrollMode
                 | ControlField::LineCount
                 | ControlField::DisablePointerAccel
+                | ControlField::PointerAcceleration
                 | ControlField::MappingEnabled => {
                     // 这些字段已在函数入口分流到 profile 通道。
                     // These fields are routed to the profile channel at the top.
@@ -1668,10 +1669,36 @@ unsafe fn apply_mouse_profile_field(field: ControlField) {
             }
             ControlField::DisablePointerAccel => {
                 let state: isize = msg_send![u.disable_pointer_accel, state];
+                // 只改这一个字段:另一字段(跟踪速度)原样保留,不能被整段覆盖掉。
+                // Change only this field: the other one (tracking speed) must survive untouched
+                // rather than being overwritten by a whole-section replacement.
                 write_selected_profile(&mut cfg, move |p| {
-                    p.pointer = Some(PartialPointerSection {
-                        disable_acceleration: Some(state == 1),
-                    })
+                    let mut ptr = p.pointer.take().unwrap_or_default();
+                    ptr.disable_acceleration = Some(state == 1);
+                    p.pointer = Some(ptr);
+                });
+            }
+            ControlField::PointerAcceleration => {
+                let value: f64 = msg_send![u.pointer_accel_slider, doubleValue];
+                // 非有限值(理论不可达)按兜底值写入,避免把 NaN/Inf 落进配置。
+                // A non-finite value (unreachable in theory) falls back so NaN/Inf never reaches
+                // the config.
+                let value = if value.is_finite() {
+                    value.clamp(
+                        crate::config::MOUSE_ACCELERATION_MIN,
+                        crate::config::MOUSE_ACCELERATION_MAX,
+                    )
+                } else {
+                    crate::mouse::pointer::FALLBACK_ACCELERATION
+                };
+                // 保留 2 位小数(与只读数值 label 的显示一致,避免把浮点噪声写进配置)。
+                // Keep 2 decimals (matching the read-only value label, and keeping floating-point
+                // noise out of the config).
+                let value = (value * 100.0).round() / 100.0;
+                write_selected_profile(&mut cfg, move |p| {
+                    let mut ptr = p.pointer.take().unwrap_or_default();
+                    ptr.acceleration = Some(value);
+                    p.pointer = Some(ptr);
                 });
             }
             ControlField::MappingEnabled => {
@@ -1898,6 +1925,8 @@ unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
         ui.line_count,
         ui.reverse_scroll,
         ui.disable_pointer_accel,
+        ui.pointer_accel_slider,
+        ui.pointer_accel_value_label,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
@@ -1974,6 +2003,95 @@ unsafe fn update_window_control_controls_enabled(ui: &SettingsUi) {
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
+}
+
+/// 滑块数值的显示格式(2 位小数,与只读数值 label 一致)。
+/// The slider value's display format (2 decimals, matching the read-only value label).
+fn pointer_accel_display(value: f64) -> String {
+    format!("{value:.2}")
+}
+
+/// 根据"禁用指针加速(线性跟踪)"开关状态刷新跟踪速度行的条件显隐:
+/// - 开关打开(线性跟踪):显示"跟踪速度"行
+/// - 开关关闭:隐藏该行,下方分组上收
+///
+/// 该行的值只在开关打开时生效:线性跟踪下 HIDPointerAcceleration 才是跟踪速度,开关关闭时
+/// 它是加速曲线的强度,含义不同(见 mouse/pointer.rs 模块注释),所以不共用、也不在关闭时显示。
+///
+/// Refresh the conditional visibility of the tracking-speed row from the disable-acceleration
+/// switch:
+/// - switch on (linear tracking): the "Tracking speed" row is shown
+/// - switch off: the row is hidden and the sections below move up
+///
+/// The value only takes effect while the switch is on: HIDPointerAcceleration is the tracking
+/// speed under linear tracking and the acceleration curve's strength otherwise, a different
+/// meaning (see the module comment in mouse/pointer.rs) -- so it is neither shared nor shown
+/// while off.
+unsafe fn update_pointer_accel_visibility(ui: &mut SettingsUi) {
+    let state: isize = msg_send![ui.disable_pointer_accel, state];
+    let show = state == 1;
+    let compact = !show;
+    if compact != ui.pointer_accel_compact {
+        // 与"行数"条件行同一套机制:该行占指针卡片最后一行位,隐藏时卡片底边上收一行高,
+        // 其下方所有分组同步上移;恢复时反向。
+        // Same mechanism as the line-count conditional row: the row occupies the pointer card's
+        // last row slot, so hiding it raises the card's bottom edge by one row height and shifts
+        // every section below up; reversed when it returns.
+        let removed_section_h = 8.0 + SettingsLayout::SINGLE_LINE_ROW_H;
+        let shift = if compact {
+            removed_section_h
+        } else {
+            -removed_section_h
+        };
+        let card_frame: NSRect = msg_send![ui.pointer_accel_card, frame];
+        let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
+        let subviews: *mut AnyObject = msg_send![document, subviews];
+        let count: usize = msg_send![subviews, count];
+        for i in 0..count {
+            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
+            if view == ui.pointer_accel_slider
+                || view == ui.pointer_accel_label
+                || view == ui.pointer_accel_value_label
+                || view == ui.pointer_accel_card
+                || view == ui.pointer_accel_shadow
+            {
+                continue;
+            }
+            let mut frame: NSRect = msg_send![view, frame];
+            if frame.origin.y < card_frame.origin.y {
+                frame.origin.y += shift;
+                let _: () = msg_send![view, setFrame: frame];
+            }
+        }
+        let mut compact_card_frame = card_frame;
+        compact_card_frame.origin.y += shift;
+        compact_card_frame.size.height -= shift;
+        let _: () = msg_send![ui.pointer_accel_card, setFrame: compact_card_frame];
+        let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
+        let _: () = msg_send![
+            ui.pointer_accel_shadow,
+            setFrame: NSRect::new(
+                NSPoint::new(
+                    compact_card_frame.origin.x - shadow_inset,
+                    compact_card_frame.origin.y - shadow_inset,
+                ),
+                NSSize::new(
+                    compact_card_frame.size.width + shadow_inset * 2.0,
+                    compact_card_frame.size.height + shadow_inset * 2.0,
+                ),
+            )
+        ];
+        // 分割线也跟着藏:只剩"禁用指针加速"一行时,卡片底部不该留一条悬空的线。
+        // The separator hides along with it: with only the disable-acceleration row left, a
+        // dangling line at the card's bottom edge would look wrong.
+        let _: () = msg_send![ui.pointer_accel_separator, setHidden: compact];
+        ui.pointer_accel_compact = compact;
+    }
+    let _: () = msg_send![ui.pointer_accel_label, setHidden: !show];
+    let _: () = msg_send![ui.pointer_accel_slider, setHidden: !show];
+    // 滑块右侧的数值 label 随滑块一起显隐。
+    // The slider's value label hides with the slider.
+    let _: () = msg_send![ui.pointer_accel_value_label, setHidden: !show];
 }
 
 /// 根据当前滚动模式(Default/Line)刷新"行数"行的条件显隐:
@@ -2394,6 +2512,7 @@ pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, se
                 // Keep the user's current enable_mouse state; only recompute freeze + visibility.
                 update_mouse_controls_enabled(u);
                 update_mode_dependent_visibility(u);
+                update_pointer_accel_visibility(u);
                 // 设备切换:映射编辑态换成新设备的专属 mappings 并重渲染。
                 // Device switch: reload the in-edit mappings from the new device's own profile.
                 let dev = current_selected_device();
@@ -3133,6 +3252,9 @@ fn load_settings_from(cfg: &Config) {
             // 根据滚动模式刷新行数行的条件显隐。
             // Refresh the conditional visibility of the lines-per-tick row by mode.
             update_mode_dependent_visibility(ui);
+            // 根据"禁用指针加速"开关刷新跟踪速度行的条件显隐。
+            // Refresh the tracking-speed row's conditional visibility from the switch.
+            update_pointer_accel_visibility(ui);
 
             // ===== 剪贴板历史页:填充全局配置 =====
             // Clipboard page: populate from the global config.
@@ -3254,10 +3376,10 @@ fn load_settings_from(cfg: &Config) {
     }
 }
 
-/// 填充鼠标页的 per-device 控件(反转/禁用加速/模式/行数/平滑预设)。
+/// 填充鼠标页的 per-device 控件(反转/禁用加速/跟踪速度/模式/行数)。
 /// 供 load_settings_from 与 handle_device_changed 共用。
 ///
-/// Fill the mouse page's per-device controls (reverse/disable-accel/mode/line-count/preset).
+/// Fill the mouse page's per-device controls (reverse/disable-accel/tracking-speed/mode/line-count).
 /// Shared by load_settings_from and handle_device_changed.
 unsafe fn fill_mouse_device_controls(
     ui: &SettingsUi,
@@ -3286,6 +3408,30 @@ unsafe fn fill_mouse_device_controls(
     // 映射总开关:用有效值(合并"所有鼠标"档后的生效值)。
     // The mappings master switch: the effective value (merged across profiles).
     let _: () = msg_send![ui.mapping_enabled, setState: if resolved.button_mappings_enabled { 1isize } else { 0isize }];
+    // 指针加速 / 跟踪速度:配置有值就用配置值;未设时显示设备当前生效值(与 LinearMouse
+    // 一致,未设时读设备现值而不是伪造一个默认值);读不到再用兜底值。
+    // 选中"所有鼠标"时没有单一设备可读,退回第一台已连接设备(LinearMouse 同款做法:
+    // 无匹配设备时用 firstMatchedDevice)。
+    //
+    // Pointer acceleration / tracking speed: the configured value wins; when unset, show the
+    // device's live value (same as LinearMouse -- read the device instead of inventing a
+    // default); the fallback applies only when that read fails.
+    // With "All Mice" selected there is no single device to read, so fall back to the first
+    // connected one (LinearMouse does the same via firstMatchedDevice).
+    let source_device = current_selected_device().or_else(|| {
+        crate::mouse::device::connected_devices()
+            .first()
+            .map(|d| (d.vendor_id, d.product_id))
+    });
+    let acceleration = resolved
+        .acceleration
+        .or_else(|| source_device.and_then(crate::mouse::pointer::read_acceleration))
+        .unwrap_or(crate::mouse::pointer::FALLBACK_ACCELERATION);
+    let _: () = msg_send![ui.pointer_accel_slider, setDoubleValue: acceleration];
+    set_field(
+        ui.pointer_accel_value_label,
+        pointer_accel_display(acceleration),
+    );
 }
 
 /// 构建设置窗口(只建一次,存入 SETTINGS_UI,之后复用、隐藏而非销毁)。
@@ -3925,6 +4071,13 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             line_count_separator: std::ptr::null_mut(),
             line_count_compact: false,
             disable_pointer_accel: std::ptr::null_mut(),
+            pointer_accel_slider: std::ptr::null_mut(),
+            pointer_accel_label: std::ptr::null_mut(),
+            pointer_accel_value_label: std::ptr::null_mut(),
+            pointer_accel_separator: std::ptr::null_mut(),
+            pointer_accel_card: std::ptr::null_mut(),
+            pointer_accel_shadow: std::ptr::null_mut(),
+            pointer_accel_compact: false,
             mapping_scroll: std::ptr::null_mut(),
             mapping_doc: std::ptr::null_mut(),
             mapping_card: std::ptr::null_mut(),
@@ -4230,7 +4383,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // SettingsPageHeader's 42pt top padding (18 more than the old 24pt inset).
         let general_doc_h = 1138.0;
         let switcher_doc_h = 1432.0;
-        let mouse_doc_h = 1558.0;
+        let mouse_doc_h = 1620.0;
         let clipboard_doc_h = 978.0;
         // 窗口控制页包含总开关、四个方向开关和四个跨显示器开关。
         // The window-control page contains the master, four direction switches, and four
@@ -4663,7 +4816,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // 前一行“显示最小化窗口”使用统一 described 行高；不能让下一行下拉框的动态高度
         // 改变这一行的游标和分隔线位置。
         y = layout.next_row_cursor(y, described_row_h);
-        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
         ui.thumbnails_enabled = SettingsRow::tall_with_height(
             switcher_view,
             label_x,
@@ -4685,11 +4838,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         y = layout.next_row_cursor(y, display_mode_metrics.row_h);
         // The popup row may be taller than the standard described row in long locales.
         // 下拉行在长文案语言下可能高于标准 described 行，分隔线必须复用实际行高。
-        SettingsRow::separator(
-            switcher_view,
-            y + display_mode_metrics.row_h + 3.0,
-            content_w,
-        );
+        SettingsRow::separator_above_row(switcher_view, y, display_mode_metrics.row_h, content_w);
         ui.focused_thumbnail_prewarm = SettingsRow::described(
             switcher_view,
             label_x,
@@ -4707,7 +4856,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // shows the app name before the window title, separated by " · "; icon-only mode
         // already shows the app name on its own line below the title, so it is unaffected.
         y = layout.next_row_cursor(y, described_row_h);
-        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
         ui.show_app_name_in_cards = SettingsRow::tall(
             switcher_view,
             label_x,
@@ -4719,7 +4868,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         .1;
         bind_control(target, ui.show_app_name_in_cards);
         y = layout.next_row_cursor(y, described_row_h);
-        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
         ui.card_text_size = SettingsRow::described(
             switcher_view,
             label_x,
@@ -4731,25 +4880,18 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsControl::slider(
                 ctrl_x,
                 y + 10.0,
-                ctrl_w - TEXT_SIZE_VALUE_W - 6.0,
+                SettingsRow::slider_width(ctrl_w),
                 row_h,
                 TEXT_SIZE_MIN,
                 TEXT_SIZE_MAX,
                 TEXT_SIZE_DEFAULT,
             ),
         );
-        let text_size_value_y = y + 10.0 + (row_h - TEXT_SIZE_VALUE_H) / 2.0;
-        ui.card_text_size_value_label = make_text_size_value_label(
-            switcher_view,
-            ctrl_x + ctrl_w - TEXT_SIZE_VALUE_W,
-            text_size_value_y,
-            TEXT_SIZE_VALUE_W,
-            TEXT_SIZE_VALUE_H,
-            TEXT_SIZE_DEFAULT,
-        );
+        ui.card_text_size_value_label =
+            SettingsRow::attach_slider_readout(switcher_view, ui.card_text_size, TEXT_SIZE_DEFAULT);
         bind_control(target, ui.card_text_size);
         y = layout.next_row_cursor(y, described_row_h);
-        SettingsRow::separator(switcher_view, y + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
         ui.status_bar_text_size = SettingsRow::described(
             switcher_view,
             label_x,
@@ -4761,20 +4903,16 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsControl::slider(
                 ctrl_x,
                 y + 10.0,
-                ctrl_w - TEXT_SIZE_VALUE_W - 6.0,
+                SettingsRow::slider_width(ctrl_w),
                 row_h,
                 TEXT_SIZE_MIN,
                 TEXT_SIZE_MAX,
                 TEXT_SIZE_DEFAULT,
             ),
         );
-        let text_size_value_y = y + 10.0 + (row_h - TEXT_SIZE_VALUE_H) / 2.0;
-        ui.status_bar_text_size_value_label = make_text_size_value_label(
+        ui.status_bar_text_size_value_label = SettingsRow::attach_slider_readout(
             switcher_view,
-            ctrl_x + ctrl_w - TEXT_SIZE_VALUE_W,
-            text_size_value_y,
-            TEXT_SIZE_VALUE_W,
-            TEXT_SIZE_VALUE_H,
+            ui.status_bar_text_size,
             TEXT_SIZE_DEFAULT,
         );
         bind_control(target, ui.status_bar_text_size);
@@ -4787,7 +4925,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let op_label_refs: Vec<&str> = op_labels.iter().map(|s| s.as_str()).collect();
         let op_metrics = SettingsSelect::metrics(ctrl_w, &op_label_refs, row_h, described_row_h);
         y = layout.next_row_cursor(y, op_metrics.row_h);
-        SettingsRow::separator(switcher_view, y + op_metrics.row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(switcher_view, y, op_metrics.row_h, content_w);
         ui.overlay_position = SettingsRow::tall_with_height(
             switcher_view,
             label_x,
@@ -4818,7 +4956,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let activation_metrics =
             SettingsSelect::metrics(ctrl_w, &activation_label_refs, row_h, described_row_h);
         y = layout.next_row_cursor(y, activation_metrics.row_h);
-        SettingsRow::separator(switcher_view, y + activation_metrics.row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(switcher_view, y, activation_metrics.row_h, content_w);
         ui.activation_mode = SettingsRow::tall_with_height(
             switcher_view,
             label_x,
@@ -4838,7 +4976,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         .1;
         bind_control(target, ui.activation_mode);
         y = layout.next_row_cursor(y, activation_metrics.row_h);
-        SettingsRow::separator(switcher_view, y + activation_metrics.row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(switcher_view, y, activation_metrics.row_h, content_w);
         ui.corner_radius = SettingsRow::tall(
             switcher_view,
             label_x,
@@ -5009,14 +5147,14 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         .1;
         bind_control(target, ui.scroll_mode);
         // The HTML device card contains both rows, with one internal hairline between them.
-        SettingsRow::separator(mouse_view, y + scroll_metrics.row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(mouse_view, y, scroll_metrics.row_h, content_w);
 
         // --- 行数(按行模式) / Line count (line mode) ---
         // Keep this conditional row in the same card as Device and Scroll mode.
         // 将这个条件行放进与 Device、Scroll mode 相同的卡片中。
         y = layout.next_row_cursor(y, scroll_metrics.row_h);
         ui.line_count_separator =
-            SettingsRow::separator(mouse_view, y + described_row_h + 3.0, content_w);
+            SettingsRow::separator_above_row(mouse_view, y, described_row_h, content_w);
         let (line_label, line_ctrl) = SettingsRow::tall(
             mouse_view,
             label_x,
@@ -5024,28 +5162,26 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             label_w,
             &t("settings.row_line_count"),
             // 整数滑块 1..=10(与 config 校验一致;对齐 LinearMouse By Lines 的滑块交互)。
-            // 右侧留 ~40pt 放只读数值 label 显示当前值。
-            // Integer slider 1..=10 (matches config validation; mirrors LinearMouse's
-            // By Lines slider interaction). ~40pt on the right holds a read-only value label.
-            SettingsControl::slider(ctrl_x, y + 10.0, ctrl_w - 40.0, row_h, 1, 10, 3),
+            // 右侧留出读数宽度放只读数值 label 显示当前值(见 SettingsRow::slider_width)。
+            // Leaves the readout's width on the right for the read-only value label (see
+            // SettingsRow::slider_width). Integer slider 1..=10 (matches config validation;
+            // mirrors LinearMouse's By Lines slider interaction).
+            SettingsControl::slider(
+                ctrl_x,
+                y + 10.0,
+                SettingsRow::slider_width(ctrl_w),
+                row_h,
+                1,
+                10,
+                3,
+            ),
         );
         ui.line_count = line_ctrl;
         ui.line_count_label = line_label;
         // 滑块右侧的只读数值 label:显示当前行数,拖动滑块时实时刷新。
         // Read-only value label right of the slider: shows the current line count, refreshed
         // live as the slider moves.
-        let value_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let line_count_value_y = y + 10.0 + (row_h - TEXT_SIZE_VALUE_H) / 2.0;
-        let value_label: *mut AnyObject = msg_send![value_label, initWithFrame: NSRect::new(NSPoint::new(ctrl_x + ctrl_w - 34.0, line_count_value_y), NSSize::new(30.0, TEXT_SIZE_VALUE_H))];
-        set_field(value_label, 3);
-        let _: () = msg_send![value_label, setBezeled: false];
-        let _: () = msg_send![value_label, setDrawsBackground: false];
-        let _: () = msg_send![value_label, setEditable: false];
-        let _: () = msg_send![value_label, setUsesSingleLineMode: true];
-        let _: () = msg_send![value_label, setAlignment: 1isize]; // NSTextAlignmentCenter
-        let _: () = msg_send![mouse_view, addSubview: value_label];
-        release_obj(value_label);
-        ui.line_count_value_label = value_label;
+        ui.line_count_value_label = SettingsRow::attach_slider_readout(mouse_view, line_ctrl, 3);
         bind_control(target, ui.line_count);
         let device_card_parts = SettingsSection::attach(
             mouse_view,
@@ -5113,7 +5249,59 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
         );
         bind_control(target, ui.disable_pointer_accel);
-        SettingsSection::attach(
+
+        // --- 跟踪速度(仅"禁用指针加速(线性跟踪)"打开时显示)---
+        // 线性跟踪下 HIDPointerAcceleration 的语义就是跟踪速度;开关关闭时该属性是加速
+        // 曲线的强度,含义不同,所以这一行只在开关打开时出现(见 mouse/pointer.rs 模块注释)。
+        // 0..=40 连续滑块(无刻度吸附)+ 右侧只读数值。
+        //
+        // Tracking speed (shown only while "Disable pointer acceleration (linear tracking)" is
+        // on). Under linear tracking HIDPointerAcceleration *is* the tracking speed; with the
+        // switch off that property is the acceleration curve's strength, a different meaning, so
+        // this row only appears while the switch is on (see the module comment in
+        // mouse/pointer.rs). A continuous 0..=40 slider (no tick snapping) plus a read-only value
+        // on the right.
+        // 分割线的 y 必须传"线下方那一行"的 y(SettingsRow::separator 把线画在该行顶边上方
+        // 3pt),否则会跑到卡片最顶上——设备卡内部的分割线也是这个写法。
+        // The separator takes the y of the row BELOW the line (SettingsRow::separator draws it
+        // 3pt above that row's top edge); any other y puts it at the card's top, which is what
+        // the device card's internal dividers rely on too.
+        y = layout.next_row_cursor(y, described_row_h);
+        let pointer_accel_separator =
+            SettingsRow::separator_above_row(mouse_view, y, described_row_h, content_w);
+        let (pointer_accel_label, pointer_accel_slider) = SettingsRow::tall_with_height(
+            mouse_view,
+            label_x,
+            y,
+            label_w,
+            described_row_h,
+            &t("settings.row_pointer_tracking_speed"),
+            // 右侧留出读数宽度放只读数值 label(与行数行同一布局,见 SettingsRow::slider_width)。
+            // Leaves the readout's width on the right for the read-only value label (same layout
+            // as the line-count row, see SettingsRow::slider_width).
+            SettingsControl::double_slider(
+                ctrl_x,
+                y + 10.0,
+                SettingsRow::slider_width(ctrl_w),
+                row_h,
+                crate::config::MOUSE_ACCELERATION_MIN,
+                crate::config::MOUSE_ACCELERATION_MAX,
+                crate::mouse::pointer::FALLBACK_ACCELERATION,
+            ),
+        );
+        ui.pointer_accel_label = pointer_accel_label;
+        ui.pointer_accel_slider = pointer_accel_slider;
+        ui.pointer_accel_separator = pointer_accel_separator;
+        // 滑块右侧的只读数值 label:显示释放时的取值(2 位小数)。
+        // Read-only value label right of the slider: shows the value on release (2 decimals).
+        ui.pointer_accel_value_label = SettingsRow::attach_slider_readout(
+            mouse_view,
+            pointer_accel_slider,
+            pointer_accel_display(crate::mouse::pointer::FALLBACK_ACCELERATION),
+        );
+        bind_control(target, ui.pointer_accel_slider);
+
+        let pointer_card_parts = SettingsSection::attach(
             mouse_view,
             NSRect::new(
                 NSPoint::new(6.0, layout.card_bottom(y)),
@@ -5124,6 +5312,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             ),
             &t("settings.header_mouse_pointer"),
         );
+        ui.pointer_accel_card = pointer_card_parts.card;
+        ui.pointer_accel_shadow = pointer_card_parts.shadow;
 
         // --- 按键映射 Button Mappings ---
         // 绑定区:"Enable button mappings" 描述行 + 嵌套表格卡片(圆角子表格 + 添加按钮)。
@@ -5378,7 +5568,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.clipboard_pin_follow);
         cy = layout.next_row_cursor(cy, pin_metrics.row_h);
-        SettingsRow::separator(clipboard_view, cy + pin_metrics.row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(clipboard_view, cy, pin_metrics.row_h, content_w);
         // 保存历史开关(持久化到磁盘,重启不丢;明文落盘,隐私风险见 README)。
         // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
         // privacy implications are documented in the README).
@@ -5402,7 +5592,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.clipboard_persist);
         cy = layout.next_row_cursor(cy, described_row_h);
-        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
         // 显示来源应用 / show the source app.
         ui.clipboard_show_source_app = SettingsRow::plain(
             clipboard_view,
@@ -5415,7 +5605,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.clipboard_show_source_app);
         cy = layout.next_row_cursor(cy, described_row_h);
-        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
         // 使用后移到最前(粘贴是否重排历史;默认开 = 保持现状)。
         // Move used entries to the top (whether pasting reorders the history; on by
         // default = current behavior).
@@ -5435,7 +5625,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.clipboard_move_used_to_top);
         cy = layout.next_row_cursor(cy, described_row_h);
-        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
         // 粘贴后删除(Option+回车/点击 = 一次性粘贴)。默认关——销毁性手势,显式选择
         // 加入。说明副标题已不再渲染(见 add_described_row 的 _subtitle),手势提示
         // 直接并入标签;文本宽度沿用总开关 described 行的全宽,避免长标签截断。
@@ -5456,7 +5646,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.clipboard_delete_after_paste);
         cy = layout.next_row_cursor(cy, described_row_h);
-        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
         ui.clipboard_clear_system_pasteboard_after_paste = SettingsRow::described(
             clipboard_view,
             label_x + 18.0,
@@ -5469,7 +5659,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.clipboard_clear_system_pasteboard_after_paste);
         cy = layout.next_row_cursor(cy, described_row_h);
-        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
         // 最大条数(数字输入)/ max entries (number input).
         ui.clipboard_max_entries = SettingsRow::plain(
             clipboard_view,
@@ -5481,7 +5671,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsControl::text_input(ctrl_x, cy, ctrl_w, row_h, "50"),
         );
         cy = layout.next_row_cursor(cy, described_row_h);
-        SettingsRow::separator(clipboard_view, cy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
         // 自动过期天数滑块:0..=7,0 = 永不过期;右侧显示当前值。
         // Auto-expire days slider: 0..=7, where 0 means never; the current value is shown on
         // the right.
@@ -5494,7 +5684,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsControl::slider(
                 ctrl_x,
                 cy + 10.0,
-                ctrl_w - 40.0,
+                SettingsRow::slider_width(ctrl_w),
                 row_h,
                 CLIPBOARD_AUTO_EXPIRE_MIN,
                 CLIPBOARD_AUTO_EXPIRE_MAX,
@@ -5502,13 +5692,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             ),
         );
         ui.clipboard_auto_expire_days = auto_expire_slider;
-        let auto_expire_value_y = cy + 10.0 + (row_h - TEXT_SIZE_VALUE_H) / 2.0;
-        ui.clipboard_auto_expire_days_value_label = make_text_size_value_label(
+        ui.clipboard_auto_expire_days_value_label = SettingsRow::attach_slider_readout(
             clipboard_view,
-            ctrl_x + ctrl_w - 34.0,
-            auto_expire_value_y,
-            30.0,
-            TEXT_SIZE_VALUE_H,
+            auto_expire_slider,
             CLIPBOARD_AUTO_EXPIRE_DEFAULT,
         );
         bind_control(target, ui.clipboard_auto_expire_days);
@@ -5589,7 +5775,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.window_control_up);
         wy = layout.next_row_cursor(wy, described_row_h);
-        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
         ui.window_control_down = SettingsRow::described(
             window_control_view,
             label_x,
@@ -5602,7 +5788,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.window_control_down);
         wy = layout.next_row_cursor(wy, described_row_h);
-        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
         ui.window_control_left = SettingsRow::described(
             window_control_view,
             label_x,
@@ -5615,7 +5801,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.window_control_left);
         wy = layout.next_row_cursor(wy, described_row_h);
-        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
         ui.window_control_right = SettingsRow::described(
             window_control_view,
             label_x,
@@ -5628,7 +5814,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.window_control_right);
         wy = layout.next_row_cursor(wy, described_row_h);
-        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
         ui.window_control_display_up = SettingsRow::described(
             window_control_view,
             label_x,
@@ -5641,7 +5827,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.window_control_display_up);
         wy = layout.next_row_cursor(wy, described_row_h);
-        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
         ui.window_control_display_down = SettingsRow::described(
             window_control_view,
             label_x,
@@ -5654,7 +5840,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.window_control_display_down);
         wy = layout.next_row_cursor(wy, described_row_h);
-        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
         ui.window_control_display_left = SettingsRow::described(
             window_control_view,
             label_x,
@@ -5667,7 +5853,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.window_control_display_left);
         wy = layout.next_row_cursor(wy, described_row_h);
-        SettingsRow::separator(window_control_view, wy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
         ui.window_control_display_right = SettingsRow::described(
             window_control_view,
             label_x,
@@ -5757,7 +5943,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.quick_actions_open_settings);
         qy = layout.next_row_cursor(qy, described_row_h);
-        SettingsRow::separator(quick_actions_view, qy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
         ui.quick_actions_open_finder = SettingsRow::described(
             quick_actions_view,
             label_x,
@@ -5770,7 +5956,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.quick_actions_open_finder);
         qy = layout.next_row_cursor(qy, described_row_h);
-        SettingsRow::separator(quick_actions_view, qy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
         ui.quick_actions_show_desktop = SettingsRow::described(
             quick_actions_view,
             label_x,
@@ -5783,7 +5969,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.quick_actions_show_desktop);
         qy = layout.next_row_cursor(qy, described_row_h);
-        SettingsRow::separator(quick_actions_view, qy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
         ui.quick_actions_lock_screen = SettingsRow::described(
             quick_actions_view,
             label_x,
@@ -5796,7 +5982,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
         bind_control(target, ui.quick_actions_lock_screen);
         qy = layout.next_row_cursor(qy, described_row_h);
-        SettingsRow::separator(quick_actions_view, qy + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
         ui.quick_actions_locate_pointer = SettingsRow::described(
             quick_actions_view,
             label_x,
@@ -5915,7 +6101,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             ),
         );
         let github_y = website_y - about_row_step;
-        SettingsRow::separator(about_view, github_y + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(about_view, github_y, described_row_h, content_w);
         SettingsRow::plain(
             about_view,
             label_x,
@@ -5933,7 +6119,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             ),
         );
         let version_y = github_y - about_row_step;
-        SettingsRow::separator(about_view, version_y + described_row_h + 3.0, content_w);
+        SettingsRow::separator_above_row(about_view, version_y, described_row_h, content_w);
         SettingsRow::plain(
             about_view,
             label_x,

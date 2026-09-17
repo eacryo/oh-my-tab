@@ -12,9 +12,23 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 
+use crate::ffi::release_obj;
 use crate::i18n::t;
 
 use super::{tooltip::SettingsTooltip, widgets};
+
+/// Right-hand read-only readout of a slider row: its width, the gap before it, and its own
+/// height. The readout hugs the slider's right end and is vertically centred on it, so a slider
+/// in such a row takes the control column's width minus the first two.
+/// 滑块行右侧只读读数的宽度、与滑块之间的间距、以及读数自身的高度。读数贴滑块右端并与滑块
+/// 垂直居中,所以这种行里的滑块宽度 = 控件列宽度扣掉前两项。
+const SLIDER_READOUT_W: f64 = 40.0;
+const SLIDER_READOUT_GAP: f64 = 6.0;
+const SLIDER_READOUT_H: f64 = 18.0;
+
+/// Gap between a card's internal divider and the top edge of the row below it (`separator_above_row`).
+/// 卡片内部分割线与"下方那一行"顶边之间的间距(`separator_above_row`)。
+const SEPARATOR_ABOVE_ROW_GAP: f64 = 3.0;
 
 /// Standard rows keep their label and control as sibling views in the card, so retain the
 /// association here instead of forcing every SettingsUi field to grow a second label pointer.
@@ -340,10 +354,80 @@ impl SettingsRow {
         }
     }
 
-    /// Add the standard grouped-card divider through the same row component API.
-    /// 通过统一的 row 组件 API 添加分组卡片分割线。
+    /// Add a card divider at an absolute y (the low-level primitive).
+    /// 在给定的绝对 y 处画一条卡片分割线(底层原语)。
+    ///
+    /// Most cards want `separator_above_row` instead, which owns the row-relative arithmetic. Use
+    /// this directly only when the y is not derived from a row's position (e.g. the General page's
+    /// contiguous rows sharing an edge, or the About page's runtime-toggled divider).
+    /// 绝大多数地方应该用 `separator_above_row`(它把相对行的算术收进组件)。只有当 y 不是由某一行
+    /// 的位置推出时才直接用这个:例如 General 页相邻两行共用一条边,或 About 页运行时显隐的线。
     pub(super) unsafe fn separator(parent: *mut AnyObject, y: f64, width: f64) -> *mut AnyObject {
         widgets::add_row_separator(parent, 0.0, y, width)
+    }
+
+    /// Draw a grouped card's internal divider just above a row.
+    /// 在某一行顶边上方画分组卡片的内部分割线。
+    ///
+    /// `row_y`/`row_h` are the position and height of the row BELOW the divider -- normally the
+    /// row built right after this call. Passing the row above instead is the easy mistake to
+    /// make, and it fails silently: the line simply lands at the top of the card.
+    /// `row_y`/`row_h` 传的是**线下方那一行**(一般就是紧接着要构建的那一行)的行坐标与行高。
+    /// 传成上面那一行是这个接口最容易犯的错,而且不会报错——线会静默地跑到卡片最顶上。
+    pub(super) unsafe fn separator_above_row(
+        parent: *mut AnyObject,
+        row_y: f64,
+        row_h: f64,
+        width: f64,
+    ) -> *mut AnyObject {
+        Self::separator(parent, row_y + row_h + SEPARATOR_ABOVE_ROW_GAP, width)
+    }
+
+    /// Width to give a slider that sits in a row with a right-hand readout.
+    /// 带右侧读数的滑块行里,滑块该用的宽度。
+    ///
+    /// Pair it with `attach_slider_readout`; the two share `SLIDER_READOUT_*` so the pair can
+    /// never drift apart.
+    /// 与 `attach_slider_readout` 成对使用;两者共用 `SLIDER_READOUT_*`,不会各自漂移。
+    pub(super) fn slider_width(control_w: f64) -> f64 {
+        control_w - SLIDER_READOUT_W - SLIDER_READOUT_GAP
+    }
+
+    /// Attach the right-hand read-only readout of a slider row and return it (for refreshes and
+    /// conditional visibility).
+    /// 给"标题 + 滑块"行补上右侧只读读数,返回该 label(供刷新数值与条件显隐)。
+    ///
+    /// The whole position comes from the slider's own frame -- one gap past its right end,
+    /// vertically centred on it -- so callers compute no coordinates and can never drift from
+    /// where the row builder actually put the slider (row builders re-centre the control).
+    /// The label itself comes from `widgets::make_value_label`, keeping font, text role, and
+    /// truncation shared.
+    ///
+    /// 位置完全由滑块自身的 frame 推出:紧贴滑块右端一个间距、垂直居中。调用方因此不需要算
+    /// 坐标,也不会与行的实际摆放脱节(row builder 会重新给控件居中)。label 本身走
+    /// `widgets::make_value_label`,字体/文本角色/截断保持一致。
+    pub(super) unsafe fn attach_slider_readout(
+        parent: *mut AnyObject,
+        slider: *mut AnyObject,
+        value: impl std::fmt::Display,
+    ) -> *mut AnyObject {
+        let frame: NSRect = objc2::msg_send![slider, frame];
+        let x = frame.origin.x + frame.size.width + SLIDER_READOUT_GAP;
+        let y = frame.origin.y + (frame.size.height - SLIDER_READOUT_H) / 2.0;
+        let label = widgets::make_value_label(
+            x,
+            y,
+            SLIDER_READOUT_W,
+            SLIDER_READOUT_H,
+            &format!("{value}"),
+        );
+        // 读数在滑块右端居中(About 页的版本号是 Natural,两者角色不同)。
+        // The readout centres under the slider's right end (the About page's version value is
+        // Natural; the two play different roles).
+        let _: () = objc2::msg_send![label, setAlignment: 1isize]; // NSTextAlignmentCenter
+        let _: () = objc2::msg_send![parent, addSubview: label];
+        release_obj(label);
+        label
     }
 
     /// Center a native control by its view frame.
@@ -546,6 +630,20 @@ impl SettingsControl {
         value: i64,
     ) -> *mut AnyObject {
         widgets::make_slider(x, y, w, h, min, max, value)
+    }
+
+    /// Build a continuous (fractional) slider.
+    /// 构造连续取值(小数)的滑块。
+    pub(super) unsafe fn double_slider(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        min: f64,
+        max: f64,
+        value: f64,
+    ) -> *mut AnyObject {
+        widgets::make_double_slider(x, y, w, h, min, max, value)
     }
 
     pub(super) unsafe fn text_input(x: f64, y: f64, w: f64, h: f64, value: &str) -> *mut AnyObject {

@@ -135,6 +135,7 @@ row_line_count = "每 tick 行數"
 header_mouse_pointer = "指標"
 row_disable_pointer_accel = "停用指標加速（線性移動）"
 desc_disable_pointer_accel = "使用線性移動取代 macOS 指標加速。"
+row_pointer_tracking_speed = "跟蹤速度"
 header_clipboard = "剪貼板"
 header_clipboard_options = "歷史記錄選項"
 row_clipboard_enabled = "啟用剪貼板歷史"
@@ -314,6 +315,7 @@ mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line 之一
 clipboard_max_entries_invalid = "clipboard.max_entries: {value} 必須 1..=100"
 clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} 必須 0..=7(0 = 永不過期)"
 mouse_line_count_invalid = "line_count: {value} 必須 1..=10"
+mouse_pointer_acceleration_invalid = "pointer.acceleration: {value} 必須 0..=40"
 windows_overlay_position_invalid = 'windows.overlay_position: "{value}" 不是 active_window、main 之一'
 windows_activation_mode_invalid = 'windows.activation_mode: "{value}" 不是 hover、click 之一'
 clipboard_picker_position_invalid = 'clipboard.picker_position: "{value}" 不是 mouse、main 之一'
