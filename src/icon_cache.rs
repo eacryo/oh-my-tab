@@ -143,6 +143,67 @@ fn write_png_to_cache(png: *mut AnyObject, key: &str, suffix: &str) -> Option<St
     }
 }
 
+/// 提取失败标记文件:`{key}{suffix}.missing`,内容与 `.meta` 相同(可执行文件 mtime)。
+/// 指纹变化(应用更新/重装)即失效,所以它不会掩盖「应用换了图标」;同一指纹下不再
+/// 重复尝试——某些进程(如 loginwindow)永远取不到大图标,否则每次 summon 都会把整个
+/// 提取管线白跑一遍,collect 侧也会反复刷 miss 日志。
+/// Negative-cache marker for a failed extraction: `{key}{suffix}.missing`, holding the same
+/// fingerprint as `.meta`. An app update (fingerprint change) invalidates it, so it cannot
+/// hide a changed icon; while it matches, extraction is skipped -- some processes
+/// (loginwindow) never yield a big icon and would otherwise re-run the whole pipeline on
+/// every summon and spam the collect-side miss log.
+fn miss_path_for_key_suffix(key: &str, suffix: &str) -> String {
+    format!("{}/{}{}.missing", icon_cache_dir(), key, suffix)
+}
+
+/// 该身份(同指纹)是否已记录提取失败。大图("")/小图(".small")独立记账。
+/// Whether this identity (same fingerprint) is already known to fail extraction. The big
+/// icon ("") and the clipboard's small one (".small") are tracked independently.
+pub(crate) fn extraction_known_missing(id: &AppIdentity, suffix: &str) -> bool {
+    let Some(fp) = &id.fingerprint else {
+        // 无指纹 -> 标记永远无法失效,宁可每次重试(保守)。
+        // No fingerprint -> the marker could never invalidate; keep retrying.
+        return false;
+    };
+    std::fs::read_to_string(miss_path_for_key_suffix(&id.key, suffix))
+        .is_ok_and(|stored| stored.trim() == fp)
+}
+
+fn mark_extraction_missing(id: &AppIdentity, suffix: &str) {
+    if let Some(fp) = &id.fingerprint {
+        let _ = std::fs::write(miss_path_for_key_suffix(&id.key, suffix), fp);
+    }
+}
+
+fn clear_extraction_missing(key: &str, suffix: &str) {
+    let _ = std::fs::remove_file(miss_path_for_key_suffix(key, suffix));
+}
+
+/// 提取入口(带失败负缓存):同指纹下已知失败直接跳过;提取成功则清掉可能残留的旧标记。
+/// Extraction entry point with negative caching: a same-fingerprint known failure is skipped;
+/// a success clears any stale marker.
+fn extract_icon_to_cache_sized(pid: i32, pt_size: f64, suffix: &str) -> Option<String> {
+    // 身份解析自身也在 autorelease 池里:启动早期(NSApp run 之前)主线程还没有池子,
+    // 它的 autoreleased 对象(app/URL/path)会整体泄漏。
+    // Identity resolution gets its own autorelease pool: before NSApp run the main thread has
+    // no pool and its autoreleased objects (app/URL/path) would leak wholesale.
+    let id = unsafe {
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        let id = resolve_app_identity(pid);
+        let _: () = msg_send![pool, drain];
+        id
+    };
+    if extraction_known_missing(&id, suffix) {
+        return None;
+    }
+    let result = extract_icon_render(pid, pt_size, suffix);
+    match &result {
+        Some(_) => clear_extraction_missing(&id.key, suffix),
+        None => mark_extraction_missing(&id, suffix),
+    }
+    result
+}
+
 /// 提取图标到缓存(按目标 pt 尺寸渲染):切换器大图(128pt)与剪贴板小图(16pt)共用管线。
 /// `suffix`: 文件名后缀("" = {key}.png,".small" = {key}.small.png),大小图共享同一份
 /// {key}.meta 指纹(同一可执行文件 mtime)。
@@ -150,7 +211,7 @@ fn write_png_to_cache(png: *mut AnyObject, key: &str, suffix: &str) -> Option<St
 /// (128pt) and the clipboard's small one (16pt) share this pipeline. `suffix`: the filename
 /// suffix ("" -> {key}.png, ".small" -> {key}.small.png); both sizes share one {key}.meta
 /// fingerprint (the same executable mtime).
-fn extract_icon_to_cache_sized(pid: i32, pt_size: f64, suffix: &str) -> Option<String> {
+fn extract_icon_render(pid: i32, pt_size: f64, suffix: &str) -> Option<String> {
     unsafe {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -404,6 +465,43 @@ mod tests {
         let big = cache_path_for_key_suffix(key, "");
         assert!(big.ends_with(&format!("{}.png", key)), "{}", big);
         assert_eq!(path, format!("{}.small.png", &big[..big.len() - 4]));
+    }
+
+    #[test]
+    fn extraction_miss_marker_is_fingerprint_keyed_and_suffix_scoped() {
+        ensure_icon_cache_dir();
+        let key = "test.extraction.miss";
+        let with_fp = |fp: &str| AppIdentity {
+            key: key.to_string(),
+            fingerprint: Some(fp.to_string()),
+            process_start_time_us: None,
+        };
+        clear_extraction_missing(key, "");
+        assert!(!extraction_known_missing(&with_fp("111"), ""));
+
+        mark_extraction_missing(&with_fp("111"), "");
+        assert!(extraction_known_missing(&with_fp("111"), ""));
+        // 指纹变化(应用更新)-> 标记失效,重新尝试提取。
+        // A fingerprint change (app update) invalidates the marker -> retry.
+        assert!(!extraction_known_missing(&with_fp("222"), ""));
+        // 大图失败不牵连小图(后缀独立记账)。
+        // A big-icon failure must not block the small icon (suffix-scoped).
+        assert!(!extraction_known_missing(&with_fp("111"), ".small"));
+
+        // 无指纹(无法失效)-> 不写标记、不参与负缓存。
+        // No fingerprint (can never invalidate) -> no marker, no negative caching.
+        let unverifiable = AppIdentity {
+            key: key.to_string(),
+            fingerprint: None,
+            process_start_time_us: None,
+        };
+        mark_extraction_missing(&unverifiable, "");
+        assert!(!extraction_known_missing(&unverifiable, ""));
+
+        // 成功提取后的清理路径。
+        // The clear-on-success path.
+        clear_extraction_missing(key, "");
+        assert!(!extraction_known_missing(&with_fp("111"), ""));
     }
 
     #[test]

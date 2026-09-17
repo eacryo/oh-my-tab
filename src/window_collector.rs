@@ -16,7 +16,7 @@ use crate::ffi::{
     K_AX_SUCCESS,
 };
 use crate::hash::fnv1a64_hex;
-use crate::icon_cache::check_cache_for_identity;
+use crate::icon_cache::{check_cache_for_identity, extraction_known_missing};
 use crate::skylight;
 use crate::{log_debug, log_info};
 
@@ -28,6 +28,27 @@ fn log_missing_slps_symbol(logged: &AtomicBool, message: &str) {
     if !logged.swap(true, Ordering::Relaxed) {
         log_info!("{}", message);
     }
+}
+
+/// 已打印过 `[collect] icon miss` 的 (pid, 图标缓存 key) 集合:同一身份每个进程只打一行
+/// (理由见调用点注释)。条目数被「见过的 app 数」限制,不会无限增长。
+/// The set of (pid, icon-cache key) pairs whose `[collect] icon miss` line was already
+/// printed -- one line per identity per process (rationale at the call site). Bounded by the
+/// number of distinct apps seen, so it cannot grow without limit.
+static ICON_MISS_LOGGED: LazyLock<Mutex<HashSet<(i32, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 首见该 (pid, key) 返回 true(限流放行);取不到身份时不做限流,保留可见性。
+/// True on the first sighting of this (pid, key) (rate-limit pass); with no identity
+/// available the line is never limited, keeping it visible.
+fn icon_miss_unlogged(pid: i32, key: Option<&str>) -> bool {
+    let Some(key) = key else {
+        return true;
+    };
+    ICON_MISS_LOGGED
+        .lock()
+        .unwrap()
+        .insert((pid, key.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2770,10 +2791,26 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             insertion_order,
         );
         insertion_order += 1;
-        let icon_path = icon_ids.get(&owner_pid).and_then(check_cache_for_identity);
+        let identity = icon_ids.get(&owner_pid);
+        let icon_path = identity.and_then(check_cache_for_identity);
         // TIMING-DEBUG 图标缓存 miss 标记:排查 summon 卡顿——哪些 app 会触发同步提取。
+        // collect 每次窗口列表刷新都会重新命同一批 app(loginwindow 这类窗口进不了卡片
+        // 列表、永远不会有图标,PeachPic 这类开发中的 app 每次重编译换指纹),所以按
+        // (pid, key) 每个进程只打一行:既保留「谁会触发提取」的首次信号,又不再刷屏
+        // (此前 loginwindow 一天能刷 ~600 行)。已知提取失败的 app 由 icon_cache 直接
+        // 跳过提取,连首行都省掉。
         // TIMING-DEBUG Flag icon-cache misses: which apps trigger the synchronous extract.
-        if icon_path.is_none() {
+        // Every window-list refresh re-hits the same handful of apps (loginwindow's window
+        // never reaches the card list and never gets an icon; an app under development such as
+        // PeachPic changes its fingerprint on every rebuild), so log once per (pid, key) per
+        // process: the first miss keeps the "who will trigger an extract" signal without
+        // flooding the log (loginwindow alone used to print ~600 lines/day). Apps whose
+        // extraction is known to fail are skipped by icon_cache entirely -- not even the first
+        // line is printed for them.
+        if icon_path.is_none()
+            && identity.is_some_and(|id| !extraction_known_missing(id, ""))
+            && icon_miss_unlogged(owner_pid, identity.map(|id| id.key.as_str()))
+        {
             log_debug!(
                 "[collect] icon miss: pid={} app=\"{}\"",
                 owner_pid,
@@ -3041,6 +3078,19 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icon_miss_log_is_rate_limited_per_identity() {
+        // 同一 (pid, key) 只放行一次;不同身份互不影响;取不到身份时不做限流。
+        // One pass per (pid, key); distinct identities are independent; no identity -> never
+        // limited.
+        assert!(icon_miss_unlogged(910001, Some("test.icon.miss.a")));
+        assert!(!icon_miss_unlogged(910001, Some("test.icon.miss.a")));
+        assert!(icon_miss_unlogged(910002, Some("test.icon.miss.a")));
+        assert!(icon_miss_unlogged(910001, Some("test.icon.miss.b")));
+        assert!(icon_miss_unlogged(910003, None));
+        assert!(icon_miss_unlogged(910003, None));
+    }
 
     #[test]
     fn raise_generation_supersedes_older_jobs() {

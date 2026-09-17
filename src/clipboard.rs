@@ -7134,11 +7134,17 @@ unsafe fn synthesize_paste() -> bool {
     CGEventSetFlags(down, K_CG_EVENT_FLAG_MASK_COMMAND);
     CGEventPost(K_CG_SESSION_EVENT_TAP, down);
     let up = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, false);
-    let Some(up) = (!up.is_null()).then_some(up) else {
+    if up.is_null() {
+        // 创建失败也必须释放已 post 的 down:CGEventCreate* 返回 +1,post 不接管所有权。
+        // Release the already-posted `down` on this failure path too: CGEventCreate* returns
+        // +1 and posting does not take ownership.
+        CFRelease(down as *const c_void);
         return false;
-    };
+    }
     CGEventSetFlags(up, K_CG_EVENT_FLAG_MASK_COMMAND);
     CGEventPost(K_CG_SESSION_EVENT_TAP, up);
+    CFRelease(down as *const c_void);
+    CFRelease(up as *const c_void);
     true
 }
 

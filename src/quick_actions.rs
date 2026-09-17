@@ -314,6 +314,15 @@ fn lock_screen() {
         let down = CGEventCreateKeyboardEvent(std::ptr::null(), KEYCODE_Q, true);
         let up = CGEventCreateKeyboardEvent(std::ptr::null(), KEYCODE_Q, false);
         if down.is_null() || up.is_null() {
+            // 创建出的一半也有 +1 所有权:失败路径必须释放非空的那个,否则泄漏。
+            // Whichever half was created still carries +1 ownership: the failure path must
+            // release the non-null one or it leaks.
+            if !down.is_null() {
+                CFRelease(down as *const c_void);
+            }
+            if !up.is_null() {
+                CFRelease(up as *const c_void);
+            }
             log_info!("[quick] lock screen failed: could not create keyboard event");
             return;
         }
