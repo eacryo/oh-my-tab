@@ -1,0 +1,3 @@
+/* English is the development language; standard system panels take their strings from
+   AppKit. This file only anchors the .lproj so the bundle's declared localizations are
+   honored by NSBundle (empty .lproj folders can be ignored). */

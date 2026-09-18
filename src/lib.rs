@@ -1712,6 +1712,12 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handleExportLogs:),
+                handle_export_logs as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleOpenOfficialWebsite:),
                 handle_open_official_website as *mut c_void,
                 types.as_ptr(),

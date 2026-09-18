@@ -66,8 +66,8 @@ use crate::event_tap::{
 };
 use crate::ffi::{
     class_addMethod, localtime_r, make_nsstring, nsstring_to_rust, objc_allocateClassPair,
-    objc_msgSendSuper, objc_registerClassPair, release_obj, CFRelease, CFRetain, CallbackTarget,
-    MainThreadSlot, ObjPtr, ObjcSuper, StaticClass, Tm,
+    objc_msgSendSuper, objc_registerClassPair, release_obj, run_save_panel, CFRelease, CFRetain,
+    CallbackTarget, MainThreadSlot, ObjPtr, ObjcSuper, StaticClass, Tm,
 };
 use crate::hash::fnv1a64;
 use crate::i18n::{t, t_count, tf};

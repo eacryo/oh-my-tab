@@ -102,6 +102,13 @@ fi
 mkdir -p "$APP/Contents/Resources"
 cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 
+# 本地化 .lproj 锚点(与 assets/Info.plist 的 CFBundleLocalizations 配套):缺了它们,
+# 系统面板(NSSavePanel 等)的按钮在中文系统上显示英文。放在 codesign 之前纳入签名。
+# Localized .lproj anchors (paired with CFBundleLocalizations in assets/Info.plist):
+# without them, system panels (NSSavePanel etc.) show English buttons on a Chinese system.
+# Copied before codesign so they are covered by the signature.
+cp -R assets/Resources/. "$APP/Contents/Resources/"
+
 # macOS 26+ Liquid Glass 图标(目录格式):macOS 自动优先使用 .icon,找不到时回落 .icns。
 # macOS 26+ Liquid Glass icon (directory format); macOS auto-prefers .icon, falls back to .icns.
 ICON_DIR="assets/AppIcon.icon"

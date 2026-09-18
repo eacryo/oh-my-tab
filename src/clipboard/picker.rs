@@ -993,41 +993,6 @@ fn ext_for_image_uti(uti: &str) -> &'static str {
     }
 }
 
-/// 弹出 NSSavePanel(runModal),返回选中的文件系统路径;取消返回 None。
-unsafe fn run_save_panel(suggested_name: &str) -> Option<String> {
-    // 包一层池子统一回收本次调用产生的临时对象(runModal 嵌套事件循环里的
-    // autoreleased 对象由 AppKit 自己的池子管理,互不干扰)。
-    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-    // Wrap in a pool to reclaim temporaries; objects autoreleased inside runModal's
-    // nested event loop are managed by AppKit's own pools and stay untouched.
-    let panel: *mut AnyObject = msg_send![class!(NSSavePanel), savePanel];
-    let name_ns = make_nsstring(suggested_name);
-    let _: () = msg_send![panel, setNameFieldStringValue: name_ns];
-    CFRelease(name_ns as *const c_void);
-    let resp: isize = msg_send![panel, runModal]; // NSModalResponseOK == 1
-    let result = if resp == 1 {
-        // URL/path 都是属性 getter,按 Cocoa 惯例返回 +0(autoreleased),已挂进上面的
-        // 池子——**不应**再手动 release:提前归零会立即析构,drain 时对悬垂指针再发
-        // release 直接 SIGSEGV(与 stringForType: 处同口径)。
-        // URL/path come from property getters that return +0 (autoreleased) per Cocoa
-        // convention and are registered in the pool above -- NEVER release them manually:
-        // an early zero refcount deallocs the object now, and drain then sends -release
-        // to dangling pointers (SIGSEGV). Same rule as the stringForType: call sites.
-        let url: *mut AnyObject = msg_send![panel, URL];
-        if !url.is_null() {
-            let path_ns: *mut AnyObject = msg_send![url, path];
-            let path = nsstring_to_rust(path_ns);
-            (!path.is_empty()).then_some(path)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let _: () = msg_send![pool, drain];
-    result
-}
-
 /// 另存为落盘:文本条目写 .txt;图片条目按 数据缓存原始字节 → 源文件字节 →
 /// 预览 PNG 兜底 的顺序取内容(扩展名随来源变化)。
 unsafe fn run_detail_save_as(entry: &ClipEntry) {

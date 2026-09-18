@@ -913,6 +913,30 @@ impl SettingsControl {
         widgets::make_external_link(x, y, w, h, title, tag)
     }
 
+    /// Build an action button usable inside a `SettingsRow` (e.g. "export logs"), so row
+    /// actions share the same geometry/centering path as every other trailing control.
+    /// 构造可放入 `SettingsRow` 的操作按钮(如「导出日志」),让行内动作与其他右侧
+    /// 控件走同一条几何/居中管线。
+    #[allow(clippy::too_many_arguments)] // 与 widgets::make_* 同一参数表。 / same parameter list as widgets::make_*.
+    pub(super) unsafe fn button(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        title: &str,
+        target: *mut AnyObject,
+        action: Sel,
+        role: SettingsButtonRole,
+    ) -> *mut AnyObject {
+        SettingsButton::action(
+            NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)),
+            title,
+            target,
+            action,
+            role,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn sidebar(
         parent: *mut AnyObject,

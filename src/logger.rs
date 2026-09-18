@@ -44,6 +44,16 @@ pub struct LogConfig {
 
 static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
 static LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::Info as usize);
+/// init 时解析出的活动日志文件路径,供「导出日志」等功能读取。
+/// The active log file path resolved at init, for features like "export logs".
+static ACTIVE_LOG_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+/// 当前活动日志文件的绝对路径(None = 本会话没有文件输出,理论上只在 init 前出现)。
+/// The active log file's absolute path (None = no file output this session; in practice
+/// only observable before init).
+pub fn active_log_path() -> Option<std::path::PathBuf> {
+    ACTIVE_LOG_PATH.get().cloned().flatten()
+}
 
 // 有界通道容量:最坏约 100KB,远大于单次召唤的日志突发;仅在落盘严重卡顿时才会丢日志。
 // Bounded channel capacity: ~100KB worst case, far larger than a single summon's burst;
@@ -100,6 +110,9 @@ pub fn init(config: &LogConfig, is_dev: bool) {
     LOG_LEVEL.store(config.level as usize, Ordering::Relaxed);
 
     let file_path = resolve_file_path(config);
+    ACTIVE_LOG_PATH
+        .set(file_path.as_ref().map(|dest| dest.path.clone()))
+        .ok();
     std::thread::Builder::new()
         .name("log-writer".into())
         .spawn(move || {

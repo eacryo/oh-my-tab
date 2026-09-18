@@ -515,7 +515,7 @@ use window::*;
 // consumes them through use settings::*).
 pub(crate) use dispatch::{
     handle_clipboard_enabled_toggle, handle_device_changed, handle_enable_mouse_toggle,
-    handle_quick_actions_enabled_toggle, handle_window_control_enabled_toggle,
+    handle_export_logs, handle_quick_actions_enabled_toggle, handle_window_control_enabled_toggle,
     handle_windows_enabled_toggle, on_control_changed, on_control_text_did_change,
     on_control_text_did_end_editing, on_sidebar_select, refresh_device_popup_if_open,
     refresh_service_controls_from_config, refresh_switcher_controls_from_config,

@@ -84,6 +84,12 @@ mkdir -p "$dev_app/Contents/MacOS" "$dev_app/Contents/Resources"
 cp "$repo_dir/target/debug/oh-my-tab" "$dev_app_binary"
 cp "$repo_dir/assets/Info.plist" "$dev_app/Contents/Info.plist"
 cp "$repo_dir/assets/AppIcon.icns" "$dev_app/Contents/Resources/AppIcon.icns"
+# 声明本地化的 .lproj 锚点:没有它们,系统面板(NSSavePanel 等)的按钮在中文系统上
+# 会显示英文(见 assets/Info.plist 的 CFBundleLocalizations 注释)。放在 codesign 前。
+# Localized .lproj anchors: without them, system panels (NSSavePanel etc.) show English
+# buttons on a Chinese system (see the CFBundleLocalizations note in assets/Info.plist).
+# Copied before codesign so they are covered by the signature.
+cp -R "$repo_dir/assets/Resources/." "$dev_app/Contents/Resources/"
 if [ -d "$repo_dir/assets/AppIcon.icon" ]; then
     cp -R "$repo_dir/assets/AppIcon.icon" "$dev_app/Contents/Resources/AppIcon.icon"
 fi

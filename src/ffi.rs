@@ -745,3 +745,42 @@ pub(crate) unsafe fn layer_set_shadow_color(layer: *mut AnyObject, cg: *mut c_vo
     let f: F = std::mem::transmute(objc_msgSend as *const ());
     f(layer as *mut c_void, sel, cg);
 }
+
+// ========== NSSavePanel(共享) / shared save panel ==========
+
+/// 弹出 NSSavePanel(runModal),返回选中的文件系统路径;取消返回 None。
+/// 由剪贴板「另存为」与设置「导出日志」共用。autoreleased 对象的生命周期注释
+/// 见原实现(被移入此处):URL/path 属性 getter 按 Cocoa 惯例返回 +0,挂在外层
+/// autorelease pool 上,不能手动 release。
+///
+/// Present an NSSavePanel (runModal) and return the chosen filesystem path; None on
+/// cancel. Shared by clipboard "save as" and settings "export logs". See the lifetime
+/// notes carried over from the original implementation: the URL/path property getters
+/// return +0 (autoreleased) per Cocoa convention and sit on the surrounding pool --
+/// never release them manually.
+pub(crate) unsafe fn run_save_panel(suggested_name: &str) -> Option<String> {
+    // 包一层池子统一回收本次调用产生的临时对象(runModal 嵌套事件循环里的
+    // autoreleased 对象由 AppKit 自己的池子管理,互不干扰)。
+    // Wrap in a pool to reclaim temporaries; objects autoreleased inside runModal's
+    // nested event loop are managed by AppKit's own pools and stay untouched.
+    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+    let panel: *mut AnyObject = msg_send![class!(NSSavePanel), savePanel];
+    let name_ns = make_nsstring(suggested_name);
+    let _: () = msg_send![panel, setNameFieldStringValue: name_ns];
+    CFRelease(name_ns as *const c_void);
+    let resp: isize = msg_send![panel, runModal]; // NSModalResponseOK == 1
+    let result = if resp == 1 {
+        let url: *mut AnyObject = msg_send![panel, URL];
+        if !url.is_null() {
+            let path_ns: *mut AnyObject = msg_send![url, path];
+            let path = nsstring_to_rust(path_ns);
+            (!path.is_empty()).then_some(path)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _: () = msg_send![pool, drain];
+    result
+}

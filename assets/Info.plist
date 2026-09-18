@@ -16,6 +16,21 @@
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- 声明支持的本地化:系统面板(NSSavePanel/NSOpenPanel/告警)的按钮文案按
+         「系统语言 ∩ 这份清单」渲染,缺声明就会退回英语(中文系统下保存面板曾显示
+         Cancel/Save)。配套的 .lproj 目录由打包脚本从 assets/Resources/ 拷入。 -->
+    <!-- Declared localizations: system panels (NSSavePanel/NSOpenPanel/alerts) render their
+         button labels from "system language ∩ this list"; without the declaration they fall
+         back to English (a Chinese system used to get Cancel/Save in the save panel). The
+         matching .lproj folders are copied from assets/Resources/ by the bundle scripts. -->
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>en</string>
+        <string>zh-Hans</string>
+        <string>zh-Hant</string>
+    </array>
     <!-- 同一 bundle 交给 LaunchServices 启动时只允许一个进程；应用内进程锁负责跨开发/正式渠道兜底。 -->
     <!-- Allow only one process per bundle through LaunchServices; the in-app lock also covers dev/release channels. -->
     <key>LSMultipleInstancesProhibited</key>

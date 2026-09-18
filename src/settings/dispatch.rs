@@ -1387,3 +1387,64 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
         widgets::prime_sidebar_hover_after_selection(btn);
     }
 }
+
+// ========== 导出日志 / export logs ==========
+
+/// 设置「导出日志」按钮回调:把当前活动日志文件复制到用户经 NSSavePanel 选择的位置。
+/// 读取得到的是此刻的快照,后台 writer 继续往原文件追加,互不影响。
+///
+/// The settings "export logs" button: copy the active log file to a user-chosen
+/// NSSavePanel destination. The read yields a point-in-time snapshot; the background
+/// writer keeps appending to the original file, so the two never interfere.
+pub(crate) extern "C" fn handle_export_logs(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    let Some(source) = crate::logger::active_log_path() else {
+        super::window::show_alert(
+            &t("settings.export_failed_title"),
+            &t("settings.export_failed_no_source"),
+        );
+        return;
+    };
+    // 用户取消保存面板 = 静默无操作 / a cancelled save panel is a silent no-op
+    let destination = match unsafe { run_save_panel(&suggested_export_log_name()) } {
+        Some(dest) => dest,
+        None => return,
+    };
+    let outcome = std::fs::read(&source)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| std::fs::write(&destination, bytes).map_err(|e| e.to_string()));
+    match outcome {
+        Ok(()) => super::window::show_alert(
+            &t("settings.export_done_title"),
+            &tf("settings.export_done_msg", &[("path", &destination)]),
+        ),
+        Err(reason) => super::window::show_alert(
+            &t("settings.export_failed_title"),
+            &tf("settings.export_failed_msg", &[("reason", &reason)]),
+        ),
+    }
+}
+
+/// 导出文件名建议:oh-my-tab-YYYYMMDD-HHMMSS.log。导出的是某一刻的快照,时间戳
+/// 让多次导出不互相覆盖。
+/// Suggested export filename: oh-my-tab-YYYYMMDD-HHMMSS.log. The export is a point-in-time
+/// snapshot; the timestamp keeps repeated exports from clobbering each other.
+fn suggested_export_log_name() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    unsafe {
+        let mut tm: Tm = std::mem::zeroed();
+        let s = secs as i64;
+        localtime_r(&s, &mut tm);
+        format!(
+            "oh-my-tab-{:04}{:02}{:02}-{:02}{:02}{:02}.log",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+        )
+    }
+}

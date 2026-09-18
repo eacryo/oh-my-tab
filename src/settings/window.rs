@@ -1633,6 +1633,37 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             ),
         );
         bind_control(target, ui.log_level);
+        // 导出日志:左标题+说明、右操作按钮(与日志级别同一张卡片;按钮不参与
+        // ControlField 即时生效调度,直接走 target/action)。
+        // Export logs: title+description on the left, action button on the right (same card
+        // as the log level; the button opts out of ControlField live-apply and goes straight
+        // through target/action).
+        y = layout.next_row_cursor(y, described_row_h);
+        // 卡片内部分割线:线下方就是本导出行(separator_above_row 收相对行算术)。
+        // In-card divider: the export row sits right below it (separator_above_row owns the
+        // row-relative math).
+        SettingsRow::separator_above_row(general_view, y, described_row_h, content_w);
+        const EXPORT_BTN_W: f64 = 110.0;
+        let export_btn = SettingsControl::button(
+            ctrl_x + ctrl_w - EXPORT_BTN_W,
+            y,
+            EXPORT_BTN_W,
+            28.0,
+            &t("settings.btn_export_logs"),
+            target,
+            sel!(handleExportLogs:),
+            SettingsButtonRole::Action,
+        );
+        SettingsRow::described(
+            general_view,
+            label_x,
+            y,
+            ctrl_x - label_x - 18.0,
+            described_row_h,
+            &t("settings.row_export_logs"),
+            &t("settings.desc_export_logs"),
+            export_btn,
+        );
         SettingsSection::attach(
             general_view,
             NSRect::new(
