@@ -565,6 +565,19 @@ pub(crate) const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 /// recognize and skip them, preventing infinite loops.
 pub(crate) const K_CG_EVENT_SOURCE_USER_DATA: i32 = 42;
 
+/// eventSourceUnixProcessID 字段(field 41)。非 0 = 事件由该进程用 CGEventPost 注入;0 = 来自
+/// 硬件。用来区分"软件 KVM 注入的虚拟鼠标"(如 Deskflow)和真实设备:注入事件没有 IOHIDEvent
+/// sender(硬件按键事件同样经常拿不到),唯一稳定的判据就是这个字段。
+/// 实测:注入事件 pid = 注入进程,sourceStateID = 0(private);硬件事件 pid = 0,state = 1。
+///
+/// eventSourceUnixProcessID field (field 41). Non-zero = the event was injected via CGEventPost by
+/// that process; 0 = hardware. It tells a software-KVM virtual pointer (e.g. Deskflow) apart from a
+/// real device: injected events carry no IOHIDEvent sender (hardware button events often don't
+/// either), so this field is the only reliable signal.
+/// Measured: injected events carry the injecting process's pid and sourceStateID = 0 (private);
+/// hardware events carry pid = 0 and state = 1.
+pub(crate) const K_CG_EVENT_SOURCE_UNIX_PROCESS_ID: i32 = 41;
+
 /// 合成事件标记魔数(ASCII "OMTSCRL")。写入 eventSourceUserData,我们的 tap 据此跳过。
 /// Synthetic-event marker magic (ASCII "OMTSCRL"). Written to eventSourceUserData so our tap
 /// can recognize and skip our own synthetic events.

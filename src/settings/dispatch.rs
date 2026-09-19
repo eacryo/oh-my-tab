@@ -644,27 +644,9 @@ pub(super) unsafe fn apply_mouse_profile_field(field: ControlField) {
 /// 把选中设备的 profile 交给回调修改(不存在则创建一个)。
 /// Hand the selected device's profile to the callback (creating one when absent).
 fn write_selected_profile(cfg: &mut Config, f: impl FnOnce(&mut MouseProfile)) {
-    let dev = current_selected_device();
-    let idx = find_profile_index(cfg, dev);
-    let idx = match idx {
-        Some(i) => i,
-        None => {
-            // 若 profile 不存在,新建一个并插入。
-            // If the profile doesn't exist, create and insert one.
-            let new_p = MouseProfile {
-                device: match dev {
-                    Some((vid, pid)) => DeviceMatcher {
-                        vendor_id: Some(vid),
-                        product_id: Some(pid),
-                    },
-                    None => DeviceMatcher::default(),
-                },
-                ..Default::default()
-            };
-            cfg.mouse.profiles.push(new_p);
-            cfg.mouse.profiles.len() - 1
-        }
-    };
+    // 无档则创建由 selected_device_profile_index 统一处理(含虚拟指针档)。
+    // Creating a missing profile is handled in one place (including the virtual-pointer case).
+    let idx = super::selected_device_profile_index(cfg);
     f(&mut cfg.mouse.profiles[idx]);
 }
 
@@ -843,6 +825,25 @@ pub(super) unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
         ui.pointer_accel_value_label,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
+    }
+    // 虚拟指针档(软件 KVM 注入的鼠标)没有 HID service client:指针加速 / 跟踪速度无处可写
+    // (pointer::apply 按 VID/PID 找不到设备)。这两个控件在这一档下永远不生效,所以给"不适用"
+    // 提示并置灰,而不是让用户去改一个不会生效的值。滚动/按行/按键映射在这一档都有效,不受影响。
+    //
+    // The virtual-pointer profile (a software KVM's injected mouse) has no HID service client, so
+    // acceleration / tracking speed has nowhere to be written (pointer::apply finds no device by
+    // VID/PID). Those two controls can never take effect in that profile, so they get a "not
+    // applicable" hint and are greyed out instead of inviting an edit that does nothing. Scrolling,
+    // line mode and button mappings all work in that profile and are left alone.
+    if on && current_selected_device() == Some(crate::mouse::device::VIRTUAL_DEVICE_KEY) {
+        let virtual_tooltip = t("settings.tooltip_pointer_virtual_unsupported");
+        for &ctrl in &[
+            ui.disable_pointer_accel,
+            ui.pointer_accel_slider,
+            ui.pointer_accel_value_label,
+        ] {
+            SettingsRow::set_enabled_with_tooltip(ctrl, false, &virtual_tooltip);
+        }
     }
     update_mapping_controls_enabled(ui);
 }
@@ -1268,11 +1269,24 @@ pub(super) unsafe fn rebuild_device_popup(ui: &SettingsUi) {
     let mut items: Vec<String> = Vec::new();
     let mut keys: Vec<crate::mouse::device::DeviceKey> = Vec::new();
     for d in &connected {
-        items.push(format!(
-            "{} ({:#x}:{:#x})",
-            d.name, d.vendor_id, d.product_id
-        ));
-        keys.push((d.vendor_id, d.product_id));
+        let key = (d.vendor_id, d.product_id);
+        if key == crate::mouse::device::VIRTUAL_DEVICE_KEY {
+            // 虚拟指针没有 VID/PID 可展示(打 0xffffffff 没有意义),标签写成
+            // "<注入进程名>（虚拟鼠标）",表明这一档管的是软件 KVM 注入的指针。
+            // The virtual pointer has no VID/PID worth showing (0xffffffff means nothing), so its
+            // label reads "<injector name> (virtual mouse)", marking that this profile governs the
+            // pointer a software KVM injects.
+            items.push(crate::i18n::tf(
+                "settings.virtual_mouse_label",
+                &[("name", d.name.as_str())],
+            ));
+        } else {
+            items.push(format!(
+                "{} ({:#x}:{:#x})",
+                d.name, d.vendor_id, d.product_id
+            ));
+        }
+        keys.push(key);
     }
 
     // 清空旧项,填入新项。

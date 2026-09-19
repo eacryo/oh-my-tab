@@ -209,6 +209,19 @@ pub(crate) static CONTROLLER: Mutex<Option<CallbackTarget>> = Mutex::new(None);
 /// 菜单项与设置按钮共用的 ObjC target 对象（OhMyTabMenuTarget2 实例）。
 /// Shared ObjC target object for menu items and settings buttons.
 pub(crate) static MENU_TARGET: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+
+/// `MENU_TARGET` 的**跨线程派发**副本。录制线程要在后台用 performSelectorOnMainThread 唤醒
+/// 主线程回调,而 MENU_TARGET 是主线程专用槽 —— 后台读它会在 debug 构建触发主线程断言;
+/// 又因为调用点是 extern "C" 的 event tap 回调,panic 无法展开,整个进程会 abort(实测录制
+/// 侧键必崩)。这里存的是同一个进程生命周期的 target 对象,只用于"派发到主线程",不碰任何 UI。
+///
+/// Cross-thread dispatch handle for `MENU_TARGET`. The recording thread wakes the main-thread
+/// callback via performSelectorOnMainThread from the background, but MENU_TARGET is a
+/// main-thread-only slot -- reading it off-main trips the main-thread assertion in debug builds,
+/// and because the caller is an extern "C" event-tap callback the panic cannot unwind, aborting the
+/// process (measured: recording a side button always crashed). This holds the same
+/// process-lifetime target object, used only to dispatch to the main thread, never to touch UI.
+pub(crate) static MENU_TARGET_DISPATCH: Mutex<Option<CallbackTarget>> = Mutex::new(None);
 const GLOBAL_INPUT_CAPACITY: usize = 32;
 
 /// 全局输入 tap 的有界聚合状态。Tab 按键保留顺序，release 单独记账，低价值控制事件
@@ -1865,6 +1878,10 @@ fn setup_status_bar() {
         };
         let menu_target: *mut AnyObject = msg_send![action_cls as *const AnyObject, new];
         *MENU_TARGET.lock().unwrap() = Some(ObjPtr::new(menu_target));
+        // 同一个对象再存一份 Send 安全的句柄,供后台线程派发(见 MENU_TARGET_DISPATCH)。
+        // Keep a Send-safe handle to the same object for background dispatch (see
+        // MENU_TARGET_DISPATCH).
+        *MENU_TARGET_DISPATCH.lock().unwrap() = Some(CallbackTarget(menu_target));
 
         // 设置 item 放在菜单第一项,用于打开设置窗口。
         // Settings item comes first and opens the settings window.

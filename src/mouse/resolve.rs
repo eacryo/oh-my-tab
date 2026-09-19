@@ -63,9 +63,24 @@ pub(crate) fn invalidate_cache() {
 }
 
 /// 匹配器是否匹配给定设备。None 键 = 通配(匹配所有设备,即"所有鼠标"档)。
+/// 设置页查找 profile 也走这里(settings::find_profile_index),避免"解析用一套、UI 查找
+/// 用另一套"而分叉出不一致。
+///
 /// Whether a matcher matches the given device. A None key = wildcard (matches all devices,
-/// i.e. the "All Mice" profile).
-fn matches(profile: &MouseProfile, device: Option<DeviceKey>) -> bool {
+/// i.e. the "All Mice" profile). The settings page finds profiles through this too
+/// (settings::find_profile_index) so resolution and the UI lookup can't drift apart.
+pub(crate) fn matches(profile: &MouseProfile, device: Option<DeviceKey>) -> bool {
+    // 虚拟指针档(injected = true):只匹配注入事件,对任何真实设备都不匹配。
+    // Virtual-pointer profile (injected = true): matches injected events only, never a real device.
+    if profile.device.is_virtual() {
+        return device == Some(crate::mouse::device::VIRTUAL_DEVICE_KEY);
+    }
+    // 注入事件:虚拟档之外只有通配档("所有鼠标")参与合并,作为基础层。
+    // Injected events: apart from the virtual profile only the wildcard ("All Mice") layer merges
+    // in, serving as the base.
+    if device == Some(crate::mouse::device::VIRTUAL_DEVICE_KEY) {
+        return profile.device.vendor_id.is_none() && profile.device.product_id.is_none();
+    }
     let Some((vid, pid)) = device else {
         // 无设备(归因失败回退):只匹配通配档。
         // No device (attribution-failure fallback): match only wildcard profiles.
@@ -177,6 +192,7 @@ mod tests {
             device: crate::config::DeviceMatcher {
                 vendor_id: Some(10007),
                 product_id: Some(12976),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -220,6 +236,7 @@ mod tests {
             device: crate::config::DeviceMatcher {
                 vendor_id: Some(1133),
                 product_id: Some(17492),
+                ..Default::default()
             },
             reverse_scroll: Some(false),
             ..Default::default()
@@ -253,6 +270,7 @@ mod tests {
             device: crate::config::DeviceMatcher {
                 vendor_id: Some(1133),
                 product_id: Some(17492),
+                ..Default::default()
             },
             pointer: Some(PartialPointerSection {
                 acceleration: Some(2.0),
@@ -299,6 +317,67 @@ mod tests {
     }
 
     #[test]
+    fn virtual_profile_matches_only_injected_events() {
+        let mut cfg = Config::default();
+        cfg.mouse.profiles.clear();
+        // "所有鼠标"档:反转滚动开(虚拟指针的基础层)。
+        // "All Mice" layer: reverse scrolling on (the virtual pointer's base layer).
+        cfg.mouse.profiles.push(MouseProfile {
+            reverse_scroll: Some(true),
+            ..Default::default()
+        });
+        // 虚拟指针档:关掉反转(覆盖基础层)并带一条按键映射。
+        // Virtual-pointer profile: reverse off (overriding the base layer) plus one button mapping.
+        cfg.mouse.profiles.push(MouseProfile {
+            device: crate::config::DeviceMatcher {
+                injected: Some(true),
+                ..Default::default()
+            },
+            reverse_scroll: Some(false),
+            button_mappings: [("3".to_string(), "switcher".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+
+        // 注入事件 -> 虚拟档生效(覆盖"所有鼠标"档),映射来自虚拟档。
+        // Injected event -> the virtual profile wins over "All Mice", mapping included.
+        let r = resolve_from(&cfg, Some(crate::mouse::device::VIRTUAL_DEVICE_KEY));
+        assert!(!r.reverse_scroll);
+        assert_eq!(
+            r.button_mappings.get("3").map(String::as_str),
+            Some("switcher")
+        );
+
+        // 真实设备 -> 虚拟档不参与,只用"所有鼠标"档。
+        // A real device -> the virtual profile stays out; only "All Mice" applies.
+        let r = resolve_from(&cfg, Some((10007, 12976)));
+        assert!(r.reverse_scroll);
+        assert!(r.button_mappings.is_empty());
+    }
+
+    #[test]
+    fn virtual_profile_survives_toml_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.mouse.profiles.push(MouseProfile {
+            device: crate::config::DeviceMatcher {
+                injected: Some(true),
+                ..Default::default()
+            },
+            reverse_scroll: Some(true),
+            ..Default::default()
+        });
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        // 标记以扁平键写盘(与 device_vendor_id / device_product_id 同一约定)。
+        // The flag persists as a flat key (same convention as device_vendor_id / product_id).
+        assert!(toml_str.contains("device_injected = true"));
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        let p = parsed.mouse.profiles.last().unwrap();
+        assert!(p.device.is_virtual());
+        assert!(p.device.vendor_id.is_none());
+    }
+
+    #[test]
     fn toml_roundtrip_preserves_profiles() {
         let mut cfg = Config::default();
         cfg.mouse.profiles.clear();
@@ -316,6 +395,7 @@ mod tests {
             device: crate::config::DeviceMatcher {
                 vendor_id: Some(0xC548),
                 product_id: Some(0x4444),
+                ..Default::default()
             },
             reverse_scroll: Some(false),
             ..Default::default()

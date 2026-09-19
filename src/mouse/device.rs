@@ -65,6 +65,160 @@ impl Device {
     }
 }
 
+// ========== 虚拟指针(注入事件)/ virtual pointer (injected events) ==========
+
+/// 虚拟指针的保留键。真实设备取不到这个值(VID/PID 来自设备属性,不会双双是 u32::MAX),
+/// 因此 DeviceKey 保持 (u32, u32) 即可,不必改成 enum 去波及 resolve 缓存、设备下拉与
+/// last_active 的全部调用点。
+///
+/// Reserved key for the virtual pointer. No real device can produce it (VID/PID come from device
+/// properties and never pair up as u32::MAX), so DeviceKey can stay a plain (u32, u32) instead of
+/// becoming an enum and rippling through the resolve cache, the device popup and last_active.
+pub(crate) const VIRTUAL_DEVICE_KEY: DeviceKey = (u32::MAX, u32::MAX);
+
+/// 已检测到的注入进程(软件 KVM 的虚拟鼠标,如 Deskflow)。鼠标线程归因时写入,设置 UI 读它
+/// 决定设备下拉里要不要出现"虚拟鼠标"这一档 —— 注入进程不在时这一档不出现。
+///
+/// The injecting process detected so far (a software KVM's virtual pointer, e.g. Deskflow). Written
+/// by the mouse thread during attribution; the settings UI reads it to decide whether the virtual
+/// mouse entry appears in the device popup -- it is hidden while no injector is around.
+static INJECTOR_PID: Mutex<Option<i32>> = Mutex::new(None);
+
+/// 事件是否由别的进程注入;是则返回注入进程 pid。
+/// 0 = 硬件事件;我们自己的 pid 也排除(自己的合成事件不是虚拟鼠标)。
+///
+/// Whether the event was injected by another process, returning that process's pid.
+/// 0 = hardware; our own pid is excluded too (our own synthetic events are not a virtual mouse).
+pub(crate) fn injected_source_pid(cg_event: crate::event_tap::CGEventRef) -> Option<i32> {
+    let pid = unsafe {
+        crate::event_tap::CGEventGetIntegerValueField(
+            cg_event,
+            crate::event_tap::K_CG_EVENT_SOURCE_UNIX_PROCESS_ID,
+        )
+    } as i32;
+    if pid == 0 || pid == std::process::id() as i32 {
+        None
+    } else {
+        Some(pid)
+    }
+}
+
+// libproc:进程是否存在 + 可执行文件路径。NSRunningApplication 只认识注册到窗口服务器的 GUI
+// 应用(实测命令行进程查不到),而注入器可能是任意进程,所以存活判断走 libproc。
+// libproc: whether a pid exists, and its executable path. NSRunningApplication only knows GUI
+// apps registered with the window server (measured: a command-line process is not found), while an
+// injector can be any process -- so liveness goes through libproc.
+#[link(name = "System", kind = "dylib")]
+extern "C" {
+    fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
+}
+
+/// 进程的可执行文件路径;None = 该进程不存在(存活判断)。
+/// The process's executable path; None = the process does not exist (the liveness check).
+unsafe fn process_path(pid: i32) -> Option<String> {
+    // PROC_PIDPATHINFO_MAXSIZE == 4096。
+    let mut buf = [0u8; 4096];
+    let len = proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32);
+    if len <= 0 {
+        return None;
+    }
+    let bytes = &buf[..len as usize];
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+}
+
+/// 注入进程的展示名:优先 GUI 应用的 localizedName(如 "Deskflow"),否则退回可执行文件名。
+/// None = 该进程已不存在。
+///
+/// The injector's display name: the GUI app's localizedName (e.g. "Deskflow") when available,
+/// otherwise the executable's file name. None = the process no longer exists.
+unsafe fn injector_display_name(pid: i32) -> Option<String> {
+    let path = process_path(pid)?;
+    let friendly = running_app_name(pid).unwrap_or_default();
+    if !friendly.is_empty() {
+        return Some(friendly);
+    }
+    Some(path.rsplit('/').next().unwrap_or(path.as_str()).to_string())
+}
+
+/// GUI 应用的 localizedName;非 GUI 进程(无 bundle)返回空串或 None。
+/// A GUI app's localizedName; a non-GUI process (no bundle) yields an empty string or None.
+unsafe fn running_app_name(pid: i32) -> Option<String> {
+    // NSRunningApplication 与 localizedName 都是 autoreleased,而且归因路径会在鼠标线程调用
+    // (record_injector 打日志时),所以套一层池子及时回收 —— 与图标缓存 / 窗口采集的
+    // "后台线程 + autoreleasepool"先例同款。
+    // NSRunningApplication and localizedName are autoreleased, and attribution reaches this from
+    // the mouse thread (when record_injector logs), so drain them in a pool -- the same
+    // "background thread + autoreleasepool" precedent as icon caching / window collection.
+    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+    let app: *mut AnyObject = msg_send![
+        class!(NSRunningApplication),
+        runningApplicationWithProcessIdentifier: pid
+    ];
+    let name = if app.is_null() {
+        None
+    } else {
+        Some(crate::ffi::ns_running_app_name(app))
+    };
+    let _: () = msg_send![pool, drain];
+    name
+}
+
+/// 记录注入进程。只在**变化时**打日志并通知设置 UI 刷新下拉 —— 归因每个事件都会走到这里,
+/// 不能每次都做(日志会刷屏,通知会跨线程)。
+///
+/// Record the injecting process. Only a **change** logs and notifies the settings UI: attribution
+/// runs for every event, so doing it unconditionally would spam the log and cross thread hops.
+fn record_injector(pid: i32) {
+    {
+        let mut cur = INJECTOR_PID.lock().unwrap();
+        if *cur == Some(pid) {
+            return;
+        }
+        *cur = Some(pid);
+    }
+    let name = unsafe { injector_display_name(pid) }.unwrap_or_default();
+    // 首次检测到:此前"虚拟鼠标"档在设备下拉里不存在,归因会落到 last_active(把注入的按键/
+    // 滚动算给物理鼠标的档)。现在它有独立档,下拉也需要即时出现这一项。
+    // First detection: until now no virtual-mouse entry existed and attribution fell back to
+    // last_active (billing the injected events to the physical mouse's profile). It now has its own
+    // profile, and the popup must show the entry right away.
+    log_debug!(
+        "[device] virtual pointer detected: pid={} name={:?}; device picker now offers its own profile.",
+        pid,
+        name
+    );
+    notify_devices_changed();
+}
+
+/// 虚拟指针的设备身份(注入进程仍存活时才有);顺带清掉已退出的注入进程,让下拉里的该项消失。
+/// 由设置 UI 在主线程调用(打开/刷新时),所以存活判断与取名在这里做最省事。
+///
+/// The virtual pointer's device identity, present only while the injector is alive; a dead
+/// injector is cleared here so the popup entry disappears. Called by the settings UI on the main
+/// thread (on open/refresh), which is the convenient place for the liveness check and the name.
+pub(crate) fn virtual_device_identity() -> Option<DeviceIdentity> {
+    let pid = (*INJECTOR_PID.lock().unwrap())?;
+    match unsafe { injector_display_name(pid) } {
+        Some(name) => Some(DeviceIdentity {
+            vendor_id: VIRTUAL_DEVICE_KEY.0,
+            product_id: VIRTUAL_DEVICE_KEY.1,
+            name,
+            // 注入的指针没有传输层(既非 USB 也非蓝牙),展示用不到。
+            // An injected pointer has no transport (neither USB nor Bluetooth); unused for display.
+            transport: String::new(),
+        }),
+        None => {
+            log_debug!(
+                "[device] virtual pointer gone: injecting pid={} exited; dropping its picker entry.",
+                pid
+            );
+            *INJECTOR_PID.lock().unwrap() = None;
+            None
+        }
+    }
+}
+
 // ========== 全局注册表 / global registry ==========
 
 struct DeviceRegistry {
@@ -443,8 +597,19 @@ pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
             }
         }
     }
-    let reg = registry().lock().unwrap();
-    reg.devices.iter().map(|d| d.identity.clone()).collect()
+    let mut out: Vec<DeviceIdentity> = {
+        let reg = registry().lock().unwrap();
+        reg.devices.iter().map(|d| d.identity.clone()).collect()
+    };
+    // 虚拟指针(注入进程)排在最后:它不是 HID 设备,只在见过注入事件且该进程仍存活时出现,
+    // 所以设备选择器的条目数会随软件 KVM 的启停变化(见 virtual_device_identity)。
+    // The virtual pointer (the injecting process) comes last: it is not a HID device and only
+    // appears after an injected event has been seen while that process is still alive, so the
+    // picker's entry count follows whether a software KVM is running (see virtual_device_identity).
+    if let Some(virtual_pointer) = virtual_device_identity() {
+        out.push(virtual_pointer);
+    }
+    out
 }
 
 /// 读取某个设备当前生效的整数属性(通过注册表里保活的 service client)。
@@ -886,6 +1051,21 @@ unsafe fn lookup_service_index(reg: &DeviceRegistry, sender: u64) -> Option<usiz
 /// On failure, lazily re-enumerate once and retry; if still failing, return last_active
 /// (or None if there is none, in which case the caller uses the "All Mice" profile).
 pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Option<DeviceKey> {
+    // 先判"是不是别的进程注入的"(软件 KVM 的虚拟鼠标):这类事件没有 IOHIDEvent sender,但带
+    // 注入进程 pid,归到独立的虚拟档,而不是落到 last_active —— 否则虚拟鼠标的滚动/按键会被
+    // 算成物理鼠标那一档的设置。(注入事件不进 LAST_ACTIVE_KEY:那是硬件归因失败时的回退目标,
+    // 写进虚拟档会让物理鼠标的按键事件跟着走虚拟档。)
+    //
+    // Injected-by-another-process (a software KVM's virtual pointer) first: such events carry no
+    // IOHIDEvent sender but do carry the injecting pid, so they resolve to the dedicated virtual
+    // profile rather than falling back to last_active -- otherwise the virtual pointer's scroll and
+    // buttons would be billed to the physical mouse's profile. (Injected events never enter
+    // LAST_ACTIVE_KEY: that is the fallback target for failed *hardware* attribution, and writing
+    // the virtual profile there would drag physical button events onto it.)
+    if let Some(pid) = injected_source_pid(cg_event) {
+        record_injector(pid);
+        return Some(VIRTUAL_DEVICE_KEY);
+    }
     unsafe {
         let io = crate::event_tap::CGEventCopyIOHIDEvent(cg_event);
         if io.is_null() {
@@ -984,6 +1164,56 @@ mod tests {
         let mut v = vec![tag, payload.len() as u8];
         v.extend_from_slice(payload);
         v
+    }
+
+    #[test]
+    fn virtual_device_identity_tracks_the_injector_lifecycle() {
+        // 注入进程存活 -> 设备身份带保留键(设置下拉据此出现"虚拟鼠标"这一档)。
+        // A live injector -> an identity carrying the reserved key (the picker shows the
+        // virtual-mouse entry from this).
+        let live_pid = std::process::id() as i32;
+        *INJECTOR_PID.lock().unwrap() = Some(live_pid);
+        let identity = virtual_device_identity().expect("live injector yields an identity");
+        assert_eq!(
+            (identity.vendor_id, identity.product_id),
+            VIRTUAL_DEVICE_KEY
+        );
+
+        // 进程已退出 -> 清掉并返回 None(下拉里的这一档随之消失)。
+        // A dead process -> cleared, and None comes back (the picker entry disappears).
+        // 999999 超出 macOS 的 pid 上限,必定不存在。
+        // 999999 exceeds macOS's pid ceiling, so it can never exist.
+        *INJECTOR_PID.lock().unwrap() = Some(999_999);
+        assert!(virtual_device_identity().is_none());
+        assert!(INJECTOR_PID.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn injected_source_pid_tells_injected_from_hardware() {
+        unsafe {
+            let event =
+                crate::event_tap::CGEventCreateScrollWheelEvent2(std::ptr::null(), 1, 1, 1, 0, 0);
+            // 硬件事件:字段 41 = 0。
+            // Hardware event: field 41 = 0.
+            assert_eq!(injected_source_pid(event), None);
+            // 别的进程注入:返回该进程 pid。
+            // Injected by another process: its pid comes back.
+            crate::event_tap::CGEventSetIntegerValueField(
+                event,
+                crate::event_tap::K_CG_EVENT_SOURCE_UNIX_PROCESS_ID,
+                4242,
+            );
+            assert_eq!(injected_source_pid(event), Some(4242));
+            // 我们自己注入的合成事件不算虚拟指针。
+            // Our own synthetic events are not a virtual pointer.
+            crate::event_tap::CGEventSetIntegerValueField(
+                event,
+                crate::event_tap::K_CG_EVENT_SOURCE_UNIX_PROCESS_ID,
+                std::process::id() as i64,
+            );
+            assert_eq!(injected_source_pid(event), None);
+            crate::ffi::CFRelease(event as *const c_void);
+        }
     }
 
     #[test]

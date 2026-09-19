@@ -265,25 +265,7 @@ fn restore_tab_defaults(tab: usize) {
             // explicit default profile is created when absent, so this page's visible and
             // effective values return to defaults without touching other devices).
             cfg.mouse.enabled = d.mouse.enabled;
-            let dev = current_selected_device();
-            let idx = find_profile_index(&cfg, dev);
-            let idx = match idx {
-                Some(i) => i,
-                None => {
-                    let new_p = MouseProfile {
-                        device: match dev {
-                            Some((vid, pid)) => DeviceMatcher {
-                                vendor_id: Some(vid),
-                                product_id: Some(pid),
-                            },
-                            None => DeviceMatcher::default(),
-                        },
-                        ..Default::default()
-                    };
-                    cfg.mouse.profiles.push(new_p);
-                    cfg.mouse.profiles.len() - 1
-                }
-            };
+            let idx = super::selected_device_profile_index(&mut cfg);
             // 默认配置含一个「所有鼠标」档,字段即默认生效值。
             // The default config has one "All Mice" profile whose fields are the default
             // effective values.

@@ -383,6 +383,24 @@ pub struct DeviceMatcher {
     pub vendor_id: Option<u32>,
     #[serde(rename = "device_product_id", skip_serializing_if = "Option::is_none")]
     pub product_id: Option<u32>,
+    // 虚拟指针档:软件 KVM(如 Deskflow)注入的鼠标。它没有 HID 设备、没有 VID/PID,只能靠
+    // "事件由别的进程注入"(CGEventSourceUnixProcessID 非 0)识别,所以不能复用 VID/PID 匹配。
+    // true = 该档只匹配注入事件;None = 普通设备档(或通配档)。
+    //
+    // Virtual-pointer profile: the pointer a software KVM (e.g. Deskflow) injects. It has no HID
+    // device and no VID/PID, so it can only be identified by "some other process injected this
+    // event" (CGEventSourceUnixProcessID != 0) -- VID/PID matching cannot express it.
+    // true = this profile matches injected events only; None = an ordinary device (or wildcard).
+    #[serde(rename = "device_injected", skip_serializing_if = "Option::is_none")]
+    pub injected: Option<bool>,
+}
+
+impl DeviceMatcher {
+    /// 本档是否为"虚拟指针"档(只匹配注入事件)。
+    /// Whether this matcher is the virtual-pointer one (matches injected events only).
+    pub fn is_virtual(&self) -> bool {
+        self.injected == Some(true)
+    }
 }
 
 /// 指针覆盖(部分字段,None = 继承下层档)。
@@ -2292,6 +2310,7 @@ mod tests {
                 device: DeviceMatcher {
                     vendor_id: Some(1133),
                     product_id: Some(17492),
+                    ..Default::default()
                 },
                 reverse_scroll: Some(false),
                 ..Default::default()

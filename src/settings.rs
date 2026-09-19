@@ -561,19 +561,54 @@ fn find_profile_index(
     cfg: &Config,
     device: Option<crate::mouse::device::DeviceKey>,
 ) -> Option<usize> {
-    cfg.mouse.profiles.iter().position(|p| {
-        let vid_ok = p
-            .device
-            .vendor_id
-            .map(|v| Some(v) == device.map(|(vid, _)| vid))
-            .unwrap_or(device.is_none());
-        let pid_ok = p
-            .device
-            .product_id
-            .map(|p| Some(p) == device.map(|(_, pid)| pid))
-            .unwrap_or(device.is_none());
-        vid_ok && pid_ok
-    })
+    // 匹配规则与运行时解析共用一份(mouse::resolve::matches):虚拟指针档按"注入"匹配,
+    // 普通档按 VID/PID 匹配,通配档两个都不设。
+    // The matching rule is shared with runtime resolution (mouse::resolve::matches): the
+    // virtual-pointer profile matches by "injected", ordinary ones by VID/PID, the wildcard by
+    // neither.
+    cfg.mouse
+        .profiles
+        .iter()
+        .position(|p| crate::mouse::resolve::matches(p, device))
+}
+
+/// 取选中设备的专属档索引,没有就按当前设备新建一个(鼠标页字段写入、按键映射提交、恢复
+/// 默认三处共用)。
+///
+/// 这三处原本各自复制了一段"无档则按 (VID,PID) 建一个"的代码;新增虚拟指针档时那样的写法
+/// 要改三遍,且很容易漏掉一处 —— 匹配仍走 resolve::matches(与运行时解析同源),创建规则
+/// 也只有这一份。
+///
+/// The selected device's own profile index, creating one for the current device when absent
+/// (shared by the mouse-page field writes, mapping commits and restore-defaults). Those three
+/// call sites each carried a copy of the "create by (VID,PID) when missing" block; with the
+/// virtual-pointer profile that would have meant the same edit three times and an easy miss.
+/// Matching still goes through resolve::matches (the same rule runtime resolution uses), and
+/// profile creation lives here only.
+fn selected_device_profile_index(cfg: &mut Config) -> usize {
+    let device = current_selected_device();
+    if let Some(idx) = find_profile_index(cfg, device) {
+        return idx;
+    }
+    let matcher = match device {
+        // 虚拟指针:没有 VID/PID,只以 device_injected 标记自己。
+        // Virtual pointer: no VID/PID; the device_injected flag is what identifies it.
+        Some(key) if key == crate::mouse::device::VIRTUAL_DEVICE_KEY => DeviceMatcher {
+            injected: Some(true),
+            ..Default::default()
+        },
+        Some((vid, pid)) => DeviceMatcher {
+            vendor_id: Some(vid),
+            product_id: Some(pid),
+            ..Default::default()
+        },
+        None => DeviceMatcher::default(),
+    };
+    cfg.mouse.profiles.push(MouseProfile {
+        device: matcher,
+        ..Default::default()
+    });
+    cfg.mouse.profiles.len() - 1
 }
 
 /// 读取当前选中设备的有效值(合并"所有鼠标"档 + 该设备档后的结果),基于给定 Config 解析。

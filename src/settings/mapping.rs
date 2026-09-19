@@ -19,25 +19,7 @@ use super::*;
 pub(super) fn commit_mapping_edits() {
     let edits = MAPPING_EDITS.lock().unwrap().clone();
     let mut cfg = crate::config::CONFIG.read().unwrap().clone();
-    let dev = current_selected_device();
-    let idx = find_profile_index(&cfg, dev);
-    let idx = match idx {
-        Some(i) => i,
-        None => {
-            let new_p = MouseProfile {
-                device: match dev {
-                    Some((vid, pid)) => DeviceMatcher {
-                        vendor_id: Some(vid),
-                        product_id: Some(pid),
-                    },
-                    None => DeviceMatcher::default(),
-                },
-                ..Default::default()
-            };
-            cfg.mouse.profiles.push(new_p);
-            cfg.mouse.profiles.len() - 1
-        }
-    };
+    let idx = super::selected_device_profile_index(&mut cfg);
     cfg.mouse.profiles[idx].button_mappings = edits;
     if let Ok(mut w) = crate::config::CONFIG.write() {
         *w = cfg;
@@ -381,7 +363,16 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
 /// 经 performSelectorOnMainThread 唤醒主线程上的设置回调(无参版本)。
 /// Wake the settings callback on the main thread (argument-less variant).
 pub(super) fn notify_main(sel: Sel) {
-    if let Some(t) = *MENU_TARGET.lock().unwrap() {
+    // 必须读 Send 安全的派发副本,不能读主线程专用的 MENU_TARGET:本函数**在录制线程上被
+    // 调用**(finished/cancelled/stage 三条路径都来自录制 tap 回调),后台读 MENU_TARGET 会
+    // 在 debug 构建触发主线程断言;调用点是 extern "C" 回调,panic 无法展开 → 进程 abort。
+    //
+    // Read the Send-safe dispatch handle, not the main-thread-only MENU_TARGET: this function is
+    // called **on the recording thread** (finished/cancelled/stage all come from the recording tap
+    // callback), and reading MENU_TARGET off-main trips the main-thread assertion in debug builds;
+    // the caller is an extern "C" callback, so that panic cannot unwind and aborts the process.
+    let target = *crate::MENU_TARGET_DISPATCH.lock().unwrap();
+    if let Some(t) = target {
         unsafe {
             let _: () = msg_send![
                 t.0,
@@ -460,6 +451,25 @@ pub(super) unsafe fn finish_recording(success: bool) {
 /// (bare Esc cancels). The combo input is swallowed; flagsChanged passes through while
 /// refreshing the popup's modifier display live.
 pub(super) unsafe extern "C" fn recording_tap_callback(
+    proxy: CGEventTapProxy,
+    event_type: CGEventType,
+    event: CGEventRef,
+    user_info: *mut c_void,
+) -> CGEventRef {
+    // 与其他 event tap 回调同一套 panic 边界:panic 不能穿过 extern "C" 展开,否则整个进程
+    // abort —— 录制回调此前正是这样崩掉的(见 notify_main 的注释)。回退按"原样透传"处理,
+    // 宁可漏吞一次输入,也不让应用死掉。
+    //
+    // The same panic boundary every other event-tap callback uses: a panic cannot unwind through
+    // extern "C" and aborts the whole process -- exactly how the recording callback used to crash
+    // (see the note in notify_main). The fallback passes the input through rather than swallowing
+    // it: missing one swallow beats killing the app.
+    crate::callback_guard::event("recording_tap_callback", event, || unsafe {
+        recording_tap_callback_inner(proxy, event_type, event, user_info)
+    })
+}
+
+unsafe fn recording_tap_callback_inner(
     _proxy: CGEventTapProxy,
     event_type: CGEventType,
     event: CGEventRef,
@@ -1085,4 +1095,31 @@ pub(crate) extern "C" fn handle_recording_cancelled(
     _arg: *mut c_void,
 ) {
     log_debug!("[mouse] button-mapping recording cancelled");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// notify_main 由录制线程调用,必须能在非主线程上安全执行。
+    /// 旧实现读主线程专用的 MENU_TARGET,在 debug 构建下会触发主线程断言 —— 而调用点是
+    /// extern "C" 的 event tap 回调,panic 无法展开,于是整个进程 abort(录制侧键必崩)。
+    /// 这里在后台线程调用一次:断言仍然触发的话,join() 会返回 Err,测试失败。
+    ///
+    /// notify_main runs on the recording thread and must be safe off the main thread. The old
+    /// implementation read the main-thread-only MENU_TARGET, which trips the main-thread assertion
+    /// in debug builds -- and since the caller is an extern "C" event-tap callback, that panic
+    /// cannot unwind and aborts the process (recording a side button always crashed). Calling it
+    /// once from a background thread fails this test (join returns Err) if the assertion comes back.
+    #[test]
+    fn notify_main_is_safe_off_the_main_thread() {
+        // 单元测试里没有设置窗口 target(组装过程不会跑),所以函数会掉进"没有 target"的早退
+        // 分支 —— 但断言发生在读 target **之前**,正是要守住的那一步。
+        // No settings target exists in a unit test (the assembly never runs), so the function takes
+        // the early "no target" path -- but the assertion happened *before* reading it, which is
+        // exactly the step this guards.
+        std::thread::spawn(|| notify_main(sel!(handleRecordingFinished:)))
+            .join()
+            .expect("notify_main must not panic when called off the main thread");
+    }
 }
