@@ -3884,12 +3884,24 @@ pub(super) unsafe fn make_sidebar_button(
     btn
 }
 
+/// 区块小标题标签框的高度:`add_header` 把框的底边放在调用方给的 y 处,向上生长这么高。
+/// 页面顶部节奏需要这个高度来换算游标,所以它由本模块导出,而不是各处再写一遍 20。
+/// Height of the label box a section heading is drawn in: `add_header` places the box's bottom
+/// edge at the caller's y and grows upwards by this much. The page-top rhythm needs the height to
+/// convert cursors, so it is exported here instead of that 20 being written out again elsewhere.
+pub(super) const SECTION_HEADER_H: f64 = 20.0;
+
 /// 区块标题(加粗 label),加入父视图后 release。
 /// Bold section header label; released after being added to the parent.
 pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: f64) {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let label: *mut AnyObject =
-        msg_send![label, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, 20.0))];
+    let label: *mut AnyObject = msg_send![
+        label,
+        initWithFrame: NSRect::new(
+            NSPoint::new(x, y),
+            NSSize::new(w, SECTION_HEADER_H)
+        )
+    ];
     // Keep localized wording intact: uppercase is a hierarchy channel English has but CJK does
     // not. Weight, color, and spacing carry the section level instead.
     // 保留本地化原文：大写是英文拥有而 CJK 没有的层级通道，区块层级由字重、颜色和间距表达。

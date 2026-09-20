@@ -1367,15 +1367,16 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 
         // ===== 通用页内容 general page content =====
         let general_top = general_doc_h - 24.0;
-        let mut y = general_doc_h; // top cursor: bottom edge of the next element
-        let general_title_h = SettingsPageHeader::attach(
+        // 页首整块(大标题 + 首个小标题)由组件给出:调用返回的就是首个小标题的游标。
+        // The whole page-top block (title + first section heading) comes from the component; the
+        // returned cursor is that heading's own cursor.
+        let mut y = SettingsPageHeader::attach(
             general_view,
             &t("settings.sidebar_general"),
             6.0,
             general_doc_h,
             content_w - 12.0,
         );
-        y -= general_title_h + 18.0;
 
         // --- Accessibility 权限警告条(通用页顶部覆盖;仅缺权限时显示,show_settings 里按 setHidden 切换) ---
         // --- Accessibility permission warning banner (floats at the top of General; shown only
@@ -1442,7 +1443,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let _: () = msg_send![banner, setHidden: has_accessibility_permission()];
 
         // --- 外观 Appearance ---
-        y -= 12.0;
         let appearance_header_y = y;
         let theme_items = [
             t("settings.theme_dark"),
@@ -1707,18 +1707,15 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let general_content_bottom = layout.card_bottom(y);
 
         // ===== 应用切换浮窗页内容 switcher overlay page content =====
-        let mut y = switcher_doc_h;
-        let switcher_title_h = SettingsPageHeader::attach(
+        let mut y = SettingsPageHeader::attach(
             switcher_view,
             &t("settings.sidebar_switcher"),
             6.0,
             switcher_doc_h,
             content_w - 12.0,
         );
-        y -= switcher_title_h + 18.0;
 
         // --- 窗口 Window ---
-        y -= 12.0;
         let windows_header_y = y;
         y = layout.next_row_cursor(y, described_row_h);
         // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器接管)。
@@ -2044,29 +2041,26 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         );
 
         // ===== 鼠标页内容 mouse page content =====
-        let mut y = mouse_doc_h;
-        let mouse_title_h = SettingsPageHeader::attach(
+        let mut y = SettingsPageHeader::attach(
             mouse_view,
             &t("settings.sidebar_mouse"),
             6.0,
             mouse_doc_h,
             content_w - 12.0,
         );
-        y -= mouse_title_h + 18.0;
 
         // --- 启用鼠标控制(总开关,置于最顶) / Enable mouse control (topmost) ---
         // 小标题:本页与全 App 的区块都带一个短名词小标题(设备/滚动/指针/按键映射、剪贴板…),
         // 只有这张总开关卡片以前漏了,左上角看起来空一块。用「鼠标」而不是「鼠标控制」:比页面
         // 大标题短一档,复刻剪贴板页(小标题「剪贴板」/大标题「剪贴板历史」)的做法,也不会和
-        // 行标题「启用鼠标控制」重复。
+        // 行标题「启用鼠标控制」重复。与页面大标题的间距由 SettingsPageHeader 统一提供。
         //
         // Header: every section in this app carries a short-noun heading (Device / Scrolling /
         // Pointer / Button Mappings, Clipboard, ...), and this master-switch card was the only one
         // without it, which read as a blank spot at its top-left. "Mouse" rather than "Mouse
         // control": one notch shorter than the page title, the same way the clipboard page pairs
         // its "Clipboard" heading with the "Clipboard History" title, and it never repeats the row's
-        // "Enable mouse control".
-        y = layout.next_section_cursor(y);
+        // "Enable mouse control". Its distance from the page title comes from SettingsPageHeader.
         let mouse_header_y = y;
         y = layout.next_row_cursor(y, described_row_h);
         let enable_mouse_bottom = y;
@@ -2536,20 +2530,15 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // ===== 剪贴板历史页内容 clipboard page content =====
         // 独立布局游标(该页内容与鼠标页互不相关)。
         // Independent layout cursor (this page's content is unrelated to the mouse page).
-        let mut cy = clipboard_doc_h;
-        let clipboard_title_h = SettingsPageHeader::attach(
+        let mut cy = SettingsPageHeader::attach(
             clipboard_view,
             &t("settings.sidebar_clipboard"),
             6.0,
             clipboard_doc_h,
             content_w - 12.0,
         );
-        cy -= clipboard_title_h + 18.0;
-        let clipboard_header_y = cy - 18.0;
-        // header 与首行间距与其他页一致(8 + row_h = 30):此前 16pt 挨得太近。
-        // Header-to-first-row gap matches the other pages (8 + row_h = 30); it used to be
-        // 16pt, too cramped.
-        cy = layout.next_row_cursor_with_extra(cy, described_row_h, 18.0);
+        let clipboard_header_y = cy;
+        cy = layout.next_row_cursor(cy, described_row_h);
         // 启用开关 / master switch.
         // 启用开关 / master switch.
         // 英文 "Enable clipboard history"(实测 146pt)+ cell 内边距在 label_w=150 边缘,
@@ -2782,19 +2771,15 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // ===== 窗口控制页内容 window control page content =====
         // 独立布局游标(该页内容与剪贴板页互不相关)。
         // Independent layout cursor (unrelated to the clipboard page).
-        let mut wy = window_control_doc_h;
-        let window_control_title_h = SettingsPageHeader::attach(
+        let mut wy = SettingsPageHeader::attach(
             window_control_view,
             &t("settings.sidebar_window_control"),
             6.0,
             window_control_doc_h,
             content_w - 12.0,
         );
-        wy -= window_control_title_h + 18.0;
-        let window_control_header_y = wy - 18.0;
-        // header 与首行间距与剪贴板页一致(18 + row_gap)。
-        // Header-to-first-row gap matches the clipboard page (18 + row_gap).
-        wy = layout.next_row_cursor_with_extra(wy, described_row_h, 18.0);
+        let window_control_header_y = wy;
+        wy = layout.next_row_cursor(wy, described_row_h);
         // 启用窗口控制(总开关):Option+方向键的全局拦截默认关闭,由用户显式开启。
         // Enable window control (master switch): the global Option+arrow interception is off
         // by default and must be explicitly opted in.
@@ -2950,19 +2935,15 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // ===== 快捷操作页内容 quick actions page content =====
         // 独立布局游标(该页内容与窗口控制页互不相关)。
         // Independent layout cursor (unrelated to the window-control page).
-        let mut qy = quick_actions_doc_h;
-        let quick_actions_title_h = SettingsPageHeader::attach(
+        let mut qy = SettingsPageHeader::attach(
             quick_actions_view,
             &t("settings.sidebar_quick_actions"),
             6.0,
             quick_actions_doc_h,
             content_w - 12.0,
         );
-        qy -= quick_actions_title_h + 18.0;
-        let quick_actions_header_y = qy - 18.0;
-        // header 与首行间距与窗口控制页一致(18 + row_gap)。
-        // Header-to-first-row gap matches the window-control page (18 + row_gap).
-        qy = layout.next_row_cursor_with_extra(qy, described_row_h, 18.0);
+        let quick_actions_header_y = qy;
+        qy = layout.next_row_cursor(qy, described_row_h);
         // 启用快捷操作(总开关):Option+I/E/D/L 全局拦截默认关闭,由用户显式开启。
         // Enable quick actions (master switch): the global Option+I/E/D/L interception is off
         // by default and must be explicitly opted in.

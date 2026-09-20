@@ -346,10 +346,6 @@ impl SettingsLayout {
         cursor - self.row_gap - row_h
     }
 
-    pub(super) fn next_row_cursor_with_extra(self, cursor: f64, row_h: f64, extra_gap: f64) -> f64 {
-        cursor - extra_gap - self.row_gap - row_h
-    }
-
     pub(super) fn card_bottom(self, row_y: f64) -> f64 {
         row_y - self.card_bottom_inset
     }
@@ -393,12 +389,12 @@ impl SettingsPage {
 }
 
 /// Page header component: the mockup's big page title (`h1 { font-size: 30px }`) plus its
-/// distance from the pane top (`.content { padding: 42px 0 72px }`). Owns both mockup metrics
-/// so pages neither hardcode them nor drift apart; returns the height consumed from the page
-/// document's top edge so callers can keep their cursor arithmetic.
-/// 页头组件:设计稿的大号页标题(`h1 { font-size: 30px }`)及其与面板顶部的距离
-/// (`.content { padding: 42px 0 72px }`)。两处度量都归组件所有,页面不各自硬编码;
-/// 返回自文档顶边起消耗的高度,调用方按原样续接布局游标。
+/// distance from the pane top (`.content { padding: 42px 0 72px }`), plus the gap down to the
+/// first section heading. Owns the whole page-top block so pages neither hardcode its metrics nor
+/// drift apart: one call returns the cursor that first heading hangs from.
+/// 页头组件:设计稿的大号页标题(`h1 { font-size: 30px }`)、它与面板顶部的距离
+/// (`.content { padding: 42px 0 72px }`),以及到首个小标题的间距。整块页面顶部节奏归组件所有,
+/// 页面既不硬编码这些度量,也不会各自漂移:一次调用即返回首个小标题所挂的游标。
 pub(super) struct SettingsPageHeader;
 
 impl SettingsPageHeader {
@@ -406,8 +402,28 @@ impl SettingsPageHeader {
     /// HTML `.content` 的顶部内边距,即标题块与面板顶部的距离。
     const TOP_PADDING: f64 = 42.0;
 
-    /// Build the header and return the height consumed from `doc_top` (padding + title).
-    /// 构建页头,返回自 `doc_top` 起消耗的高度(顶部留白 + 标题)。
+    /// Empty space between the title's frame and the first section heading's frame below it.
+    /// 页面大标题框与其下方首个小标题框之间的空白。
+    ///
+    /// Every page opens with one section (its master switch or first group) whose heading used to
+    /// be placed by hand: General/App Switcher sat 10pt under the title while Mouse/Clipboard/
+    /// Window Control/Quick Actions sat 16pt. This one value now covers all six.
+    /// 每页都以一个区块(总开关或第一组)开头,该小标题以前由各页手写:通用/应用切换距大标题
+    /// 10pt,鼠标/剪贴板/窗口控制/快捷操作 16pt。现在六页统一走这一个值。
+    const FIRST_SECTION_GAP: f64 = 16.0;
+
+    /// Build the page title and return the cursor for the first section heading below it.
+    /// 构建页面大标题,并返回其下方首个小标题的游标。
+    ///
+    /// The cursor is that heading's frame BOTTOM: `widgets::add_header` grows its label upwards
+    /// from there, and `SettingsSection::attach` puts the card top `SETTINGS_SECTION_CARD_GAP`
+    /// below it. Callers hand it to their first `SettingsSection::attach` and advance from it with
+    /// `SettingsLayout::next_row_cursor`, exactly like every later section -- which is what keeps
+    /// the first card's row on the same 4pt inset as all the others.
+    /// 返回的是小标题框的底边:`widgets::add_header` 从该处向上生长标签框,`SettingsSection::attach`
+    /// 的卡片顶边在它下方 `SETTINGS_SECTION_CARD_GAP` 处。调用方把它交给首个
+    /// `SettingsSection::attach`,再用 `SettingsLayout::next_row_cursor` 往后排 —— 与后续区块完全
+    /// 相同,首卡第一行因此和其他卡片一样落在 4pt 的卡片内边距上。
     pub(super) unsafe fn attach(
         parent: *mut AnyObject,
         title: &str,
@@ -437,7 +453,15 @@ impl SettingsPageHeader {
             actual_doc_top - Self::TOP_PADDING - 10.0,
             w,
         );
-        Self::TOP_PADDING + title_h - (actual_doc_top - doc_top)
+        // 标题框底边 → 再往下 FIRST_SECTION_GAP 的空白 → 再减去小标题标签框自身高度,
+        // 得到小标题框底边(即调用方继续排版的游标)。
+        // Title frame bottom, one FIRST_SECTION_GAP further down, then the heading label's own
+        // height up to its bottom edge -- the cursor callers lay the page out from.
+        actual_doc_top
+            - Self::TOP_PADDING
+            - title_h
+            - Self::FIRST_SECTION_GAP
+            - widgets::SECTION_HEADER_H
     }
 }
 
@@ -2557,7 +2581,37 @@ mod tests {
         assert_eq!(layout.row_gap, 8.0);
         assert_eq!(layout.card_bottom(100.0), 90.0);
         assert_eq!(layout.card_top(100.0), 96.0);
-        assert_eq!(layout.next_row_cursor_with_extra(100.0, 54.0, 18.0), 20.0);
+    }
+
+    /// The page-top rhythm -- title, first heading, its card and that card's first row -- is owned
+    /// by `SettingsPageHeader` plus the standard card metrics. Pinning the pieces the six pages
+    /// share makes a reintroduced per-page offset fail here instead of only showing up as an
+    /// uneven gap under one page's title.
+    /// 页面顶部节奏(大标题、首个小标题、其卡片与卡片第一行)由 `SettingsPageHeader` 加标准卡片
+    /// 度量共同决定。把六个页面共享的这几段钉住,任何重新引入的按页偏移会在这里失败,
+    /// 而不是只表现为某一页标题下的间距不齐。
+    #[test]
+    fn page_top_rhythm_keeps_the_first_card_symmetric() {
+        use super::{SettingsPageHeader, SettingsSection};
+
+        // 大标题框与首个小标题框之间只有这一处空白。
+        // The title-to-heading spacing lives in this one value.
+        assert_eq!(SettingsPageHeader::FIRST_SECTION_GAP, 16.0);
+
+        let layout = SettingsLayout::new(600.0);
+        // 小标题框底边(即 SettingsPageHeader::attach 返回的游标)。
+        // The heading's frame bottom -- the cursor SettingsPageHeader::attach returns.
+        let heading_cursor = 100.0;
+        let row_h = SettingsLayout::SINGLE_LINE_ROW_H;
+        let row_bottom = layout.next_row_cursor(heading_cursor, row_h);
+        let row_top = row_bottom + row_h;
+        // 单行卡片:小标题下方 4pt 起行,SettingsSection 把底部多出的 6pt 裁掉后同样剩 4pt。
+        // Single-row card: the row starts 4pt under the heading, and trimming the extra 6pt bottom
+        // inset leaves the same 4pt beneath the row.
+        assert_eq!(layout.card_top(heading_cursor) - row_top, 4.0);
+        let card_visible_bottom =
+            layout.card_bottom(row_bottom) + SettingsSection::EXTRA_BOTTOM_INSET;
+        assert_eq!(row_bottom - card_visible_bottom, 4.0);
     }
 
     #[test]
