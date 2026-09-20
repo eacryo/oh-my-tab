@@ -278,7 +278,7 @@ pub(super) struct SettingsUi {
     // One "Restore Page Defaults" control per page (embedded at the end of each page's
     // scrolling document).
     page_restores: [RestoreDefaultsControl; 7],
-    accessibility_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
+    permission_warning_view: *mut AnyObject, // NSView: 缺权限警告条容器 / permission-warning banner container
     update_auto_check: *mut AnyObject, // NSSwitch: Sparkle 自动检查开关 / Sparkle auto-check switch
     update_auto_download: *mut AnyObject, // NSSwitch: Sparkle 自动下载开关 / Sparkle auto-download switch
     update_check_button: *mut AnyObject, // NSButton: 检查更新按钮(状态随流程变化) / check-updates button

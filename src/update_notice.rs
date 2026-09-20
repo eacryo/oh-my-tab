@@ -317,6 +317,7 @@ unsafe fn add_notification_request(title: &str, body: &str, identifier: &str) {
 // instance announces the update at startup.
 
 const PENDING_MARKER_KEY: &str = "update_notice_pending_from_version";
+const PERMISSION_MIGRATION_SOURCE_VERSION_KEY: &str = "permission_migration_source_version";
 
 unsafe fn defaults_set_string(key: &str, value: &str) {
     let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
@@ -351,6 +352,30 @@ pub(crate) fn mark_install_started(from_version: &str) {
         "[update-notice] install started; pending marker set (from {})",
         from_version
     );
+}
+
+/// Preserve the semantic version that Sparkle is replacing so 0.2.3 can target the TCC
+/// permission-recovery copy to users migrating from the two affected releases.
+/// 保存 Sparkle 即将替换的语义版本，让 0.2.3 只对从两个受影响版本升级的用户显示权限恢复提示。
+pub(crate) fn mark_permission_migration_source(from_version: &str) {
+    unsafe { defaults_set_string(PERMISSION_MIGRATION_SOURCE_VERSION_KEY, from_version) };
+    log_debug!(
+        "[permission-migration] update source version recorded: {}",
+        from_version
+    );
+}
+
+/// Whether this install is 0.2.3 upgraded through Sparkle from 0.2.1 or 0.2.2.
+/// 判断当前是否为通过 Sparkle 从 0.2.1 或 0.2.2 升级到 0.2.3。
+pub(crate) fn needs_permission_migration_copy() -> bool {
+    let current_version = unsafe { bundle_info_string("CFBundleShortVersionString") };
+    if current_version != "0.2.3" {
+        return false;
+    }
+    matches!(
+        unsafe { defaults_get_string(PERMISSION_MIGRATION_SOURCE_VERSION_KEY) }.as_str(),
+        "0.2.1" | "0.2.2"
+    )
 }
 
 /// 新实例启动时检查标记:版本确实变了才发通知,并清掉标记。

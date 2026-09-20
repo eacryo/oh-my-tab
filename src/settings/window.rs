@@ -323,8 +323,14 @@ fn show_settings_inner(
                         msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
                     set_text_input_active(false);
                 }
-                // 按当前权限刷新警告条显隐(有权限就隐藏)/ refresh banner visibility by current permission
-                let _: () = msg_send![u.accessibility_warning_view, setHidden: has_accessibility_permission()];
+                // 迁移提示同时要求两项权限;普通提示仍只跟随辅助功能权限。
+                // The migration copy requires both permissions; the regular copy follows Accessibility only.
+                let is_permission_migration =
+                    crate::update_notice::needs_permission_migration_copy();
+                let has_required_permissions = has_accessibility_permission()
+                    && (!is_permission_migration || crate::thumbnail::capture_allowed());
+                let _: () =
+                    msg_send![u.permission_warning_view, setHidden: has_required_permissions];
             }
         });
     }
@@ -1054,7 +1060,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             device_indicator: std::ptr::null_mut(),
             restore_defaults: RestoreDefaultsControl::empty(),
             page_restores: std::array::from_fn(|_| RestoreDefaultsControl::empty()),
-            accessibility_warning_view: std::ptr::null_mut(),
+            permission_warning_view: std::ptr::null_mut(),
             update_auto_check: std::ptr::null_mut(),
             update_auto_download: std::ptr::null_mut(),
             update_check_button: std::ptr::null_mut(),
@@ -1378,15 +1384,15 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             content_w - 12.0,
         );
 
-        // --- Accessibility 权限警告条(通用页顶部覆盖;仅缺权限时显示,show_settings 里按 setHidden 切换) ---
-        // --- Accessibility permission warning banner (floats at the top of General; shown only
-        //  when permission is missing, toggled via setHidden in show_settings) ---
+        // --- 权限警告条(通用页顶部覆盖;迁移时检查辅助功能和屏幕录制) ---
+        // --- Permission banner (floats over General; migration copy checks Accessibility and Screen Recording) ---
         // banner 不占用布局空间(通用页内容紧贴顶部),而是在内容构建完后作为最后一个
         // subview 添加,覆盖在顶部。frame 固定定位,不随 y 布局游标变化。
         // The banner does not reserve layout space (General content starts at the top); it is
         // added as the last subview after the content, floating over the top. Its frame is fixed
         // and independent of the y layout cursor.
-        let banner_h = 48.0;
+        let is_permission_migration = crate::update_notice::needs_permission_migration_copy();
+        let banner_h = if is_permission_migration { 60.0 } else { 48.0 };
         let banner: *mut AnyObject = msg_send![class!(NSView), alloc];
         let banner: *mut AnyObject = msg_send![
             banner,
@@ -1399,7 +1405,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // 注意:这里不 addSubview;在通用页内容构建完后统一添加(保证在最上层)。
         // Note: not added here; added after the General content build so it stays on top.
         let _: () = msg_send![banner, setAutoresizingMask: 10u64];
-        ui.accessibility_warning_view = banner;
+        ui.permission_warning_view = banner;
 
         // 警告文字:多行换行,系统红色 / warning text: word-wrapped, system red
         let warning_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -1410,7 +1416,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 NSSize::new(content_w - 160.0, banner_h - 12.0)
             )
         ];
-        let wl = make_nsstring(&t("settings.accessibility_warning"));
+        let warning_key = if is_permission_migration {
+            "settings.permission_migration_warning"
+        } else {
+            "settings.accessibility_warning"
+        };
+        let wl = make_nsstring(&t(warning_key));
         let _: () = msg_send![warning_label, setStringValue: wl];
         CFRelease(wl as *const c_void);
         let _: () = msg_send![warning_label, setEditable: false];
@@ -1440,7 +1451,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         release_obj(open_btn);
 
         // 默认按当前权限显隐(有权限就隐藏)/ initial visibility: hidden when permission is already granted
-        let _: () = msg_send![banner, setHidden: has_accessibility_permission()];
+        let has_required_permissions = has_accessibility_permission()
+            && (!is_permission_migration || crate::thumbnail::capture_allowed());
+        let _: () = msg_send![banner, setHidden: has_required_permissions];
 
         // --- 外观 Appearance ---
         let appearance_header_y = y;

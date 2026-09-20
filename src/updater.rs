@@ -2069,6 +2069,9 @@ extern "C" fn show_installing_update(
         // instance announces via update_notice at startup (the Sparkle
         // showUpdateInstalledAndRelaunched callback is unreachable for automatic installs).
         crate::update_notice::mark_install_started(&bundle_info_string("CFBundleVersion"));
+        crate::update_notice::mark_permission_migration_source(&bundle_info_string(
+            "CFBundleShortVersionString",
+        ));
         let app = app_display_name();
         make_custom_download_window(this, std::ptr::null_mut());
         let window_title = tf("settings.update_installing_window_title", &[("app", &app)]);

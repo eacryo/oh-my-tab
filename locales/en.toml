@@ -227,6 +227,7 @@ row_quick_action_locate_pointer = "Enable double-tap Control: show the pointer l
 desc_quick_action_locate_pointer = "Enable double-tap Control to show a focus ring at the pointer."
 btn_restore_page_defaults = "Restore Page Defaults"
 accessibility_warning = "Accessibility permission not granted — the shortcut won't work. Enable Oh My Tab under Privacy & Security → Accessibility."
+permission_migration_warning = "After upgrading from 0.2.1 or 0.2.2, use − to remove the old Oh My Tab entry from both Accessibility and Screen Recording, then use + to add the updated app and enable both permissions. Restart Oh My Tab."
 btn_open_privacy = "Open Privacy & Security..."
 version_label = "Version {version}"
 version_label_with_build = "Version {version} ({build})"
