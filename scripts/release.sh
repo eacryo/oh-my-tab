@@ -1,91 +1,180 @@
-#!/bin/sh
-# Release 打包:先跑 bundle.sh(构建 .app + .dmg + 签名),再生成 Homebrew cask 文件
-# dist/oh-my-tab.rb(算 dmg 的 sha256 + 从 Cargo.toml 读 version 填模板,带 zap 清理)。
-# 只支持 macOS 13+ Apple Silicon(arm64):cask 用 depends_on macos: :ventura + depends_on arch: :arm64
-# 限制,Linux(cask 本身不支持)/ Intel Mac / macOS < 13 装都会报错。
-# 把它拷到你的 homebrew tap 仓库的 Casks/ 目录,push 即可。
-#
-# Release packaging: runs bundle.sh (build .app + .dmg + sign) first, then generates the Homebrew
-# cask file dist/oh-my-tab.rb (sha256 of the dmg + version from Cargo.toml filled into a template,
-# with zap cleanup). macOS 13+ Apple Silicon (arm64) only: the cask uses depends_on macos: :ventura
-# + depends_on arch: :arm64, so Linux / Intel Mac / macOS < 13 are rejected at install.
-# Copy it into your homebrew tap repo's Casks/ directory and push.
-set -e
+#!/bin/bash
+# Production release flow: build and submit for notarization, check its status, then publish.
+# 生产发布分为三步：构建并提交公证、查询公证状态、公证通过后推送。
+set -euo pipefail
 
-PUSH_R2=0
+usage() {
+  cat <<'EOF'
+Usage: scripts/release.sh [--notarize | --check [submission-id] | --push [--dry-run]]
+
+  (no flag)       Build local artifacts and generate the Homebrew cask; never upload to R2.
+  --notarize      Build with Developer ID signing and submit to Apple without waiting.
+  --check [id]    Query the saved notarization submission (or recover with its submission ID).
+  --push          Require Accepted status, staple the app, package it, and publish to R2.
+  --dry-run       With --push, prepare the release and print the R2 upload plan without uploading.
+
+Set CODESIGN_IDENTITY to a Developer ID Application identity for --notarize.
+Set NOTARY_PROFILE to the notarytool Keychain profile (default: oh-my-tab-notary).
+EOF
+}
+
+MODE="build"
 DRY_RUN=0
-for arg in "$@"; do
-  case "$arg" in
-    --push) PUSH_R2=1 ;;
-    --dry-run) DRY_RUN=1 ;;
+CHECK_ID=""
+MODE_SELECTED=0
+
+select_mode() {
+  if [ "$MODE_SELECTED" -ne 0 ]; then
+    echo "error: choose only one of --notarize, --check, or --push" >&2
+    exit 2
+  fi
+  MODE="$1"
+  MODE_SELECTED=1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --notarize)
+      select_mode notarize
+      ;;
+    --check)
+      select_mode check
+      if [ "$#" -gt 1 ]; then
+        case "$2" in
+          -* ) ;;
+          * ) CHECK_ID="$2"; shift ;;
+        esac
+      fi
+      ;;
+    --push)
+      select_mode push
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      ;;
     -h|--help)
-      echo "Usage: sh scripts/release.sh [--push] [--dry-run]"
-      echo "  (no flag)  build locally; never contacts R2"
-      echo "  --push     upload ZIP, DMG, then dist/appcast.xml to R2"
-      echo "  --dry-run  print the R2 upload plan without uploading"
+      usage
       exit 0
       ;;
     *)
-      echo "❌ Unknown argument: $arg" >&2
-      echo "Usage: sh scripts/release.sh [--push] [--dry-run]" >&2
+      echo "error: unknown argument: $1" >&2
+      usage >&2
       exit 2
       ;;
   esac
+  shift
 done
 
-# 脚本在 scripts/ 下,先切到仓库根再引用相对路径。
-# Script lives in scripts/; cd to the repo root before using relative paths.
+if [ "$DRY_RUN" -eq 1 ] && [ "$MODE" != "push" ]; then
+  echo "error: --dry-run can only be used with --push" >&2
+  exit 2
+fi
+if [ -n "$CHECK_ID" ] && [ "$MODE" != "check" ]; then
+  echo "error: a submission ID can only follow --check" >&2
+  exit 2
+fi
+
+# The script lives in scripts/; run all project commands from the repository root.
 cd "$(dirname "$0")/.."
 
 APP="dist/Oh-My-Tab.app"
 DMG="dist/Oh-My-Tab.dmg"
 ZIP="dist/Oh-My-Tab.zip"
 OUT="dist/oh-my-tab.rb"
+NOTARY_ROOT="dist/.notarization"
+PENDING_DIR="$NOTARY_ROOT/pending"
+STAGED_APP="$PENDING_DIR/Oh-My-Tab.app"
+NOTARY_ZIP="$PENDING_DIR/Oh-My-Tab-notarization.zip"
+SUBMISSION_FILE="$PENDING_DIR/submission-id"
+NOTARY_PROFILE="${NOTARY_PROFILE:-oh-my-tab-notary}"
+APPCAST_PATH="${R2_APPCAST_PATH:-dist/appcast.xml}"
 
-# 1. Always build fresh release artifacts. This keeps --push tied to the current source tree and
-# gives every release a new build number before the matching appcast is generated.
-RELEASE_DOC_DIR="release_doc" sh scripts/bundle.sh
+validate_submission_id() {
+  case "$1" in
+    ""|*[!0123456789abcdefABCDEF-]*)
+      echo "error: invalid notarization submission ID: $1" >&2
+      exit 2
+      ;;
+  esac
+}
 
-if [ ! -f "$DMG" ]; then
-  echo "❌ Build failed: $DMG not found" >&2
-  exit 1
-fi
-if [ ! -f "$ZIP" ]; then
-  echo "❌ Build failed: $ZIP not found" >&2
-  exit 1
-fi
+load_submission_id() {
+  local saved_id=""
+  if [ -s "$SUBMISSION_FILE" ]; then
+    saved_id="$(tr -d '\r\n' < "$SUBMISSION_FILE")"
+  fi
 
-# 2. 从 Cargo.toml 读 version(与 bundle.sh 同源)。
-# 2. Read version from Cargo.toml (same source as bundle.sh).
-VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)
-BUILD_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' dist/Oh-My-Tab.app/Contents/Info.plist)
-RELEASE_NOTES="release_doc/${VERSION}.md"
+  if [ -n "$CHECK_ID" ]; then
+    validate_submission_id "$CHECK_ID"
+    if [ -n "$saved_id" ] && [ "$saved_id" != "$CHECK_ID" ]; then
+      echo "error: $CHECK_ID does not match the pending submission $saved_id" >&2
+      exit 2
+    fi
+    saved_id="$CHECK_ID"
+    printf '%s\n' "$saved_id" > "$SUBMISSION_FILE"
+  fi
 
-if [ "$PUSH_R2" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
-  # Generate/update the feed before publishing. The helper reuses a local feed or fetches the
-  # public feed on a clean checkout, then generates URLs matching the R2 object names.
-  R2_RELEASE_PREFIX="${R2_RELEASE_PREFIX:-releases}" \
-  R2_ARTIFACT_BASENAME="${R2_ARTIFACT_BASENAME:-Oh-My-Tab}" \
-  R2_PUBLIC_BASE_URL="${R2_PUBLIC_BASE_URL:-https://download.oh-my-tab.app}" \
-  SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://download.oh-my-tab.app/appcast.xml}" \
-  bash scripts/generate-appcast.sh "${R2_APPCAST_PATH:-dist/appcast.xml}" "$ZIP" "$VERSION" "$BUILD_VERSION" "$RELEASE_NOTES"
-fi
+  if [ -z "$saved_id" ]; then
+    echo "error: no notarization submission ID found in $PENDING_DIR" >&2
+    echo "       Use --check <submission-id> if Apple accepted the submission but the ID was not saved." >&2
+    exit 1
+  fi
+  validate_submission_id "$saved_id"
+  printf '%s\n' "$saved_id"
+}
 
-# 3. 算 dmg sha256。
-# 3. Compute the dmg sha256.
-SHA=$(shasum -a 256 "$DMG" | awk '{print $1}')
+query_notary_status() {
+  local submission_id="$1"
+  local status_file="$PENDING_DIR/status.plist"
+  xcrun notarytool info "$submission_id" \
+    --keychain-profile "$NOTARY_PROFILE" \
+    --output-format plist > "$status_file"
+  /usr/libexec/PlistBuddy -c 'Print :status' "$status_file"
+}
 
-# 4. 生成 cask(带 zap:卸载时清理缓存/日志/配置)。
-#    heredoc 不带引号 -> $VERSION/$SHA 由 shell 展开;#{version} 是 Ruby 插值,shell 不动它。
-# 4. Generate the cask (with zap to clean caches/logs/config on uninstall).
-#    Unquoted heredoc -> $VERSION/$SHA are expanded by the shell; #{version} is Ruby interpolation
-#    and left intact.
-cat > "$OUT" <<EOF
+show_notary_log() {
+  local submission_id="$1"
+  local log_file="$PENDING_DIR/notary-log.json"
+  if xcrun notarytool log "$submission_id" \
+    --keychain-profile "$NOTARY_PROFILE" > "$log_file"; then
+    echo "Notarization log saved to $log_file"
+  else
+    echo "warning: could not fetch the notarization log" >&2
+  fi
+}
+
+require_accepted_submission() {
+  local submission_id="$1"
+  local status=""
+  status="$(query_notary_status "$submission_id")"
+  echo "Notarization status: $status"
+  case "$status" in
+    Accepted)
+      ;;
+    "In Progress"|Submitted|"Waiting for Export Compliance")
+      echo "Notarization is not complete. Check again later with: scripts/release.sh --check" >&2
+      exit 3
+      ;;
+    *)
+      show_notary_log "$submission_id"
+      echo "error: notarization status is '$status'; release will not be pushed" >&2
+      exit 1
+      ;;
+  esac
+}
+
+generate_cask() {
+  local version="$1"
+  local dmg_path="$2"
+  local sha=""
+  sha="$(shasum -a 256 "$dmg_path" | awk '{print $1}')"
+
+  cat > "$OUT" <<EOF
 cask "oh-my-tab" do
   depends_on macos: :ventura
   depends_on arch: :arm64
-  version "$VERSION"
-  sha256 "$SHA"
+  version "$version"
+  sha256 "$sha"
   url "https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg"
   name "Oh-My-Tab"
   desc "macOS window switcher (Cmd+Tab alternative)"
@@ -99,22 +188,159 @@ cask "oh-my-tab" do
   ]
 end
 EOF
+  echo "✅ Generated $OUT (version=$version, sha256=$sha)"
+}
 
-echo "✅ Generated $OUT (version=$VERSION, sha256=$SHA)"
-echo "Copy it to your homebrew tap repo's Casks/ directory, then push."
+case "$MODE" in
+  build)
+    RELEASE_DOC_DIR="release_doc" bash scripts/bundle.sh
+    if [ ! -f "$DMG" ] || [ ! -f "$ZIP" ]; then
+      echo "error: build did not produce $DMG and $ZIP" >&2
+      exit 1
+    fi
+    VERSION="$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)"
+    generate_cask "$VERSION" "$DMG"
+    echo "Copy $OUT to your Homebrew tap's Casks/ directory when ready."
+    echo "ℹ️  R2 upload skipped; use --notarize, then --check, then --push for production."
+    ;;
 
-if [ "$PUSH_R2" -eq 1 ]; then
-  APPCAST_PATH="${R2_APPCAST_PATH:-dist/appcast.xml}"
-  PUBLISH_ARGS="--appcast $APPCAST_PATH --zip $ZIP --dmg $DMG --version $VERSION --build-version $BUILD_VERSION"
-  if [ "$DRY_RUN" -eq 1 ]; then
-    PUBLISH_ARGS="$PUBLISH_ARGS --dry-run"
-  fi
-  # R2 credentials are read only by the isolated publisher from environment variables; they are
-  # never passed as command-line arguments or embedded in the app bundle.
-  R2_LATEST_DMG_KEY="${R2_LATEST_DMG_KEY:-Oh-My-Tab.dmg}" \
-  cargo run --manifest-path tools/r2-publisher/Cargo.toml --release -- $PUBLISH_ARGS
-elif [ "$DRY_RUN" -eq 1 ]; then
-  echo "ℹ️  --dry-run was provided without --push; no R2 action was needed."
-else
-  echo "ℹ️  R2 upload skipped (pass --push to upload)."
-fi
+  notarize)
+    if [ -z "${CODESIGN_IDENTITY:-}" ]; then
+      echo "error: set CODESIGN_IDENTITY to a Developer ID Application identity" >&2
+      exit 1
+    fi
+    if [ -e "$PENDING_DIR" ]; then
+      echo "error: a notarization is already pending at $PENDING_DIR" >&2
+      echo "       Check it with scripts/release.sh --check before starting another release." >&2
+      exit 1
+    fi
+
+    RELEASE_SIGNING=1 RELEASE_DOC_DIR="release_doc" bash scripts/bundle.sh
+    if [ ! -d "$APP" ]; then
+      echo "error: build did not produce $APP" >&2
+      exit 1
+    fi
+
+    mkdir -p "$NOTARY_ROOT"
+    mkdir "$PENDING_DIR"
+    ditto "$APP" "$STAGED_APP"
+    ditto -c -k --keepParent "$STAGED_APP" "$NOTARY_ZIP"
+
+    echo "Submitting $NOTARY_ZIP for notarization (this command does not wait for Apple)."
+    if ! xcrun notarytool submit "$NOTARY_ZIP" \
+      --keychain-profile "$NOTARY_PROFILE" \
+      --output-format plist > "$PENDING_DIR/submission.plist"; then
+      echo "error: notarization submission failed; staged files were kept in $PENDING_DIR" >&2
+      exit 1
+    fi
+    SUBMISSION_ID="$(/usr/libexec/PlistBuddy -c 'Print :id' "$PENDING_DIR/submission.plist")"
+    validate_submission_id "$SUBMISSION_ID"
+    printf '%s\n' "$SUBMISSION_ID" > "$SUBMISSION_FILE"
+    echo "✅ Submitted to Apple: $SUBMISSION_ID"
+    echo "Check later with: scripts/release.sh --check"
+    ;;
+
+  check)
+    if [ ! -d "$PENDING_DIR" ] || [ ! -d "$STAGED_APP" ]; then
+      echo "error: no staged production release found at $PENDING_DIR" >&2
+      echo "       Start one with scripts/release.sh --notarize." >&2
+      exit 1
+    fi
+    SUBMISSION_ID="$(load_submission_id)"
+    STATUS="$(query_notary_status "$SUBMISSION_ID")"
+    echo "Notarization status: $STATUS (submission $SUBMISSION_ID)"
+    case "$STATUS" in
+      Accepted)
+        echo "✅ Apple accepted the app. Nothing was pushed. You can now run: scripts/release.sh --push"
+        ;;
+      "In Progress"|Submitted|"Waiting for Export Compliance")
+        echo "Not finished yet; check again later with: scripts/release.sh --check"
+        ;;
+      *)
+        show_notary_log "$SUBMISSION_ID"
+        echo "error: notarization status is '$STATUS'" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
+  push)
+    if [ ! -d "$PENDING_DIR" ] || [ ! -d "$STAGED_APP" ]; then
+      echo "error: no staged notarized release found at $PENDING_DIR" >&2
+      echo "       Start and submit one with scripts/release.sh --notarize." >&2
+      exit 1
+    fi
+    SUBMISSION_ID="$(load_submission_id)"
+    require_accepted_submission "$SUBMISSION_ID"
+
+    # Staple the accepted ticket before creating the ZIP and DMG that will be published.
+    if codesign --verify --deep --strict "$STAGED_APP"; then
+      if xcrun stapler validate "$STAGED_APP" >/dev/null 2>&1; then
+        echo "The notarization ticket is already stapled."
+      else
+        xcrun stapler staple "$STAGED_APP"
+        xcrun stapler validate "$STAGED_APP"
+      fi
+    else
+      echo "error: staged app signature verification failed" >&2
+      exit 1
+    fi
+
+    VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$STAGED_APP/Contents/Info.plist")"
+    BUILD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$STAGED_APP/Contents/Info.plist")"
+    RELEASE_NOTES="release_doc/${VERSION}.md"
+    if [ ! -s "$RELEASE_NOTES" ]; then
+      echo "error: release notes not found for version $VERSION: $RELEASE_NOTES" >&2
+      exit 1
+    fi
+
+    rm -rf "$APP"
+    ditto "$STAGED_APP" "$APP"
+    rm -f "$ZIP" "$DMG"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+    STAGING="$(mktemp -d "${TMPDIR:-/tmp}/oh-my-tab-release.XXXXXX")"
+    cleanup() {
+      local code=$?
+      if [ -n "${STAGING:-}" ] && [ -d "$STAGING" ]; then
+        rm -rf "$STAGING"
+      fi
+      if [ "$code" -ne 0 ]; then
+        echo "error: release packaging or publishing failed; pending notarization state remains at $PENDING_DIR" >&2
+      fi
+      exit "$code"
+    }
+    trap cleanup EXIT
+    ditto "$APP" "$STAGING/Oh-My-Tab.app"
+    ln -s /Applications "$STAGING/Applications"
+    hdiutil create -volname "Oh-My-Tab" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
+    rm -rf "$STAGING"
+    STAGING=""
+
+    R2_RELEASE_PREFIX="${R2_RELEASE_PREFIX:-releases}" \
+    R2_ARTIFACT_BASENAME="${R2_ARTIFACT_BASENAME:-Oh-My-Tab}" \
+    R2_PUBLIC_BASE_URL="${R2_PUBLIC_BASE_URL:-https://download.oh-my-tab.app}" \
+    SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://download.oh-my-tab.app/appcast.xml}" \
+      bash scripts/generate-appcast.sh "$APPCAST_PATH" "$ZIP" "$VERSION" "$BUILD_VERSION" "$RELEASE_NOTES"
+    generate_cask "$VERSION" "$DMG"
+
+    PUBLISH_ARGS=(--appcast "$APPCAST_PATH" --zip "$ZIP" --dmg "$DMG" \
+      --version "$VERSION" --build-version "$BUILD_VERSION")
+    if [ "$DRY_RUN" -eq 1 ]; then
+      PUBLISH_ARGS+=(--dry-run)
+    fi
+    R2_LATEST_DMG_KEY="${R2_LATEST_DMG_KEY:-Oh-My-Tab.dmg}" \
+      cargo run --manifest-path tools/r2-publisher/Cargo.toml --release -- "${PUBLISH_ARGS[@]}"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "ℹ️  Dry run complete; pending state is kept. Run --push to publish for real."
+    else
+      COMPLETED_DIR="$NOTARY_ROOT/completed/$SUBMISSION_ID"
+      if [ -e "$COMPLETED_DIR" ]; then
+        COMPLETED_DIR="${COMPLETED_DIR}-$(date -u +%Y%m%d%H%M%S)"
+      fi
+      mkdir -p "$(dirname "$COMPLETED_DIR")"
+      mv "$PENDING_DIR" "$COMPLETED_DIR"
+      echo "✅ Published notarized release. Submission record saved at $COMPLETED_DIR"
+    fi
+    ;;
+esac

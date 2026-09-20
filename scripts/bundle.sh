@@ -1,8 +1,8 @@
 #!/bin/bash
-# 打包 release .app 并打成 .dmg:编译 -> 组装 bundle -> ad-hoc 签名 -> DMG。
+# 打包 release .app 并打成 .dmg:编译 -> 组装 bundle -> 签名 -> DMG。
 # 产物输出到 dist/(已 gitignore),放在 target/ 之外以保持 logger 的 is_dev=false(走文件日志)。
 #
-# Build the release .app and package it as .dmg: build -> assemble bundle -> ad-hoc sign -> DMG.
+# Build the release .app and package it as .dmg: build -> assemble bundle -> sign -> DMG.
 # Output goes to dist/ (gitignored), outside target/ so the logger's is_dev stays false (file logging).
 set -e
 
@@ -116,28 +116,37 @@ if [ -d "$ICON_DIR" ]; then
   cp -R "$ICON_DIR" "$APP/Contents/Resources/AppIcon.icon"
 fi
 
-# 签名:优先用自签名证书 "oh-my-tab-sign"(让 TCC 身份稳定,Accessibility 授权不会因 rebuild 失效);
-# 签名失败(证书缺失 / 钥匙串拒绝)时退回 ad-hoc(TCC 授权随 CDHash 变化失效,仅适合临时本机调试)。
-# 注意:security find-identity 对未设信任的自签名证书会漏报(返回 0),所以这里直接试签、失败再回退。
-# 建证书(一次性):钥匙串访问 -> 证书助理 -> 创建证书 ->
-#   名称 "oh-my-tab-sign",身份类型「自签名根」,证书类型「代码签名」。
-# Sign: prefer the self-signed "oh-my-tab-sign" identity so the TCC identity stays stable across
-# rebuilds (Accessibility grants won't break when the CDHash changes); fall back to ad-hoc (grants
-# break on every rebuild - local debugging only) when the cert is absent or signing fails.
-# Note: `security find-identity` under-reports untrusted self-signed certs (returns 0), so we just
-# attempt to sign and fall back on failure.
-# Create the cert (one-time): Keychain Access > Certificate Assistant > Create a Certificate >
-#   name "oh-my-tab-sign", Identity Type "Self Signed Root", Certificate Type "Code Signing".
-SIGN_IDENTITY="oh-my-tab-sign"
-SIGN_ERR="$(mktemp)"
-if codesign --force --sign "$SIGN_IDENTITY" "$APP" 2>"$SIGN_ERR"; then
-  :
+# 正式公证包必须使用 Developer ID、Hardened Runtime 和安全时间戳;签名失败时立即终止。
+# 本机开发打包仍优先使用自签名身份,并保留 ad-hoc 回退。
+# Notarized release packages require Developer ID, Hardened Runtime, and a secure timestamp;
+# fail closed if that signing fails. Local development packages keep the self-signed/ad-hoc path.
+if [ "${RELEASE_SIGNING:-0}" = "1" ]; then
+  if [ -z "${CODESIGN_IDENTITY:-}" ]; then
+    echo "error: set CODESIGN_IDENTITY to a Developer ID Application identity" >&2
+    exit 1
+  fi
+  if ! codesign --force --options runtime --timestamp \
+    --sign "$CODESIGN_IDENTITY" "$APP"; then
+    echo "error: Developer ID signing failed for $APP" >&2
+    exit 1
+  fi
+  if ! codesign --verify --deep --strict "$APP"; then
+    echo "error: release signature verification failed for $APP" >&2
+    exit 1
+  fi
+  echo "signed with $CODESIGN_IDENTITY (Hardened Runtime + secure timestamp)"
 else
-  echo "warning: signing with '$SIGN_IDENTITY' failed; falling back to ad-hoc (TCC grants won't persist):" >&2
-  sed 's/^/         /' "$SIGN_ERR" >&2
-  codesign --force --sign - "$APP"
+  SIGN_IDENTITY="oh-my-tab-sign"
+  SIGN_ERR="$(mktemp)"
+  if codesign --force --sign "$SIGN_IDENTITY" "$APP" 2>"$SIGN_ERR"; then
+    :
+  else
+    echo "warning: signing with '$SIGN_IDENTITY' failed; falling back to ad-hoc (TCC grants won't persist):" >&2
+    sed 's/^/         /' "$SIGN_ERR" >&2
+    codesign --force --sign - "$APP"
+  fi
+  rm -f "$SIGN_ERR"
 fi
-rm -f "$SIGN_ERR"
 
 # Sparkle's preferred archive is a zip containing the complete .app bundle. Keep the DMG for
 # manual installation and publish both artifacts from the release script when requested.
