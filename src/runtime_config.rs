@@ -17,6 +17,7 @@ pub(crate) enum ConfigChangeSource {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ChangeFlags {
     visual: bool,
+    settings_appearance: bool,
     locale: bool,
     modifier: bool,
     startup: bool,
@@ -40,6 +41,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
             || old.layout.card_text_size != new.layout.card_text_size
             || old.colors != new.colors
             || old.fonts != new.fonts,
+        settings_appearance: old.appearance != new.appearance || old.colors != new.colors,
         locale: old.i18n.locale != new.i18n.locale,
         modifier: startup || old.keyboard.modifier != new.keyboard.modifier,
         startup: startup || old.startup.launch_at_login != new.startup.launch_at_login,
@@ -76,6 +78,12 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         // UI refresh must run on the main thread; every caller (settings, menu, reload, startup)
         // enters from the main thread.
         crate::ui_coordinator::apply_theme_and_locale_refresh();
+    }
+
+    if flags.settings_appearance || flags.locale {
+        // 字号变化只影响切换器预览;重建设置页会让拖动中的其他控件跳动。
+        // Font-size changes only affect the switcher preview; rebuilding Settings makes other
+        // controls jump while a slider is being dragged.
         crate::settings::refresh_system_appearance();
     }
 
