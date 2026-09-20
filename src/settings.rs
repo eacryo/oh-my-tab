@@ -1577,7 +1577,11 @@ unsafe fn settings_window_send_event_inner(_self: *mut c_void, _cmd: Sel, event:
             if event_type == NSEVENT_TYPE_LEFT_MOUSE_DOWN {
                 let window = _self as *mut AnyObject;
                 collapse_restore_confirmations_on_external_click(window, event);
-                widgets::settings_select_handle_window_mouse_down(window, event);
+                // 下拉的"点外面收起"不再挂在这里:它现在由 widgets 里的本地事件监视器处理 ——
+                // 下拉有自己的浮层窗口,只拦设置窗口的点击覆盖不到录制面板等其它窗口。
+                // Closing a dropdown on an outside click no longer lives here: it is handled by the
+                // local event monitor in widgets, because the dropdown has its own popup window and
+                // hooking only the settings window misses the recording panel and others.
                 tooltip::SettingsTooltip::handle_mouse_down(window, event);
                 let first_responder: *mut AnyObject = msg_send![window, firstResponder];
                 if !first_responder.is_null() {

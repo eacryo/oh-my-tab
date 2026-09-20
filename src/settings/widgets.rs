@@ -1267,7 +1267,13 @@ struct SettingsSelectState {
     items: Vec<String>,
     item_symbols: Vec<Option<String>>,
     selected: isize,
+    /// 选项面板视图(展开时非 0)。
+    /// The options panel view (non-zero while open).
     panel: usize,
+    /// 承载选项面板的浮层窗口(展开时非 0;见 settings_select_open)。
+    /// The floating window hosting the options panel (non-zero while open; see
+    /// settings_select_open).
+    popup: usize,
     open: bool,
 }
 
@@ -1315,6 +1321,22 @@ static SETTINGS_SELECT_ITEM_CLASS: OnceLock<SettingsSelectItemClass> = OnceLock:
 /// Clear runtime state before the settings window and its controls are destroyed.
 /// 设置窗口及其控件销毁前清理运行时状态。
 pub(super) fn clear_settings_select_registry() {
+    // 先收掉仍开着的浮层窗口:注册表一清就再也找不到它们了(会变成留在屏幕上的孤儿窗口)。
+    // Close any popup windows first: once the registry is cleared they can never be found again and
+    // would linger on screen as orphans.
+    let popups: Vec<usize> = SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|state| state.popup != 0)
+        .map(|state| state.popup)
+        .collect();
+    unsafe {
+        for popup in popups {
+            close_select_popup(popup as *mut AnyObject);
+        }
+    }
+    unsafe { remove_select_monitor() };
     SETTINGS_SELECT_STATES.lock().unwrap().clear();
     SETTINGS_SELECT_LABEL_VIEWS.lock().unwrap().clear();
     SETTINGS_SELECT_ARROW_VIEWS.lock().unwrap().clear();
@@ -1604,14 +1626,55 @@ unsafe fn settings_select_apply_visual(button: *mut AnyObject, open: bool) {
     }
 }
 
-unsafe fn settings_select_cancel_item_reveals(panel: *mut AnyObject) {
+/// 面板里的选项行。选项通常直接挂在面板上;选项多到装不下时会套一层滚动视图
+/// (见 settings_select_open),所以清理路径(取消 reveal 动画、注销 label 登记)必须能
+/// 下钻那一层,否则会把每一行都漏掉。
+///
+/// The option rows inside a panel. They normally sit directly on the panel; when the list does not
+/// fit they are nested one level deeper inside a scroll view (see settings_select_open), so the
+/// cleanup paths (cancelling reveal animations, dropping label registrations) must descend that
+/// level or they miss every row.
+unsafe fn settings_select_item_views(panel: *mut AnyObject) -> Vec<*mut AnyObject> {
+    let mut out = Vec::new();
+    if panel.is_null() {
+        return out;
+    }
     let subviews: *mut AnyObject = msg_send![panel, subviews];
     if subviews.is_null() {
-        return;
+        return out;
     }
     let count: usize = msg_send![subviews, count];
     for index in 0..count {
-        let item: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+        if view.is_null() {
+            continue;
+        }
+        let is_scroll: bool = msg_send![view, isKindOfClass: class!(NSScrollView)];
+        if !is_scroll {
+            out.push(view);
+            continue;
+        }
+        let document: *mut AnyObject = msg_send![view, documentView];
+        if document.is_null() {
+            continue;
+        }
+        let inner: *mut AnyObject = msg_send![document, subviews];
+        if inner.is_null() {
+            continue;
+        }
+        let inner_count: usize = msg_send![inner, count];
+        for inner_index in 0..inner_count {
+            let item: *mut AnyObject = msg_send![inner, objectAtIndex: inner_index];
+            if !item.is_null() {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+unsafe fn settings_select_cancel_item_reveals(panel: *mut AnyObject) {
+    for item in settings_select_item_views(panel) {
         let _: () = msg_send![
             class!(NSObject),
             cancelPreviousPerformRequestsWithTarget: item,
@@ -1686,23 +1749,184 @@ extern "C" fn settings_select_finish_close(this: *mut c_void, _cmd: Sel, panel: 
     unsafe {
         let button = this as *mut AnyObject;
         let panel = panel as *mut AnyObject;
-        let should_remove = SETTINGS_SELECT_STATES
-            .lock()
-            .unwrap()
-            .get_mut(&(button as usize))
-            .is_some_and(|state| {
-                if !state.open && state.panel == panel as usize {
+        let (should_remove, popup) = {
+            let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
+            match states.get_mut(&(button as usize)) {
+                Some(state) if !state.open && state.panel == panel as usize => {
                     state.panel = 0;
-                    true
-                } else {
-                    false
+                    let popup = state.popup as *mut AnyObject;
+                    state.popup = 0;
+                    (true, popup)
                 }
-            });
+                _ => (false, std::ptr::null_mut()),
+            }
+        };
         if should_remove && !panel.is_null() {
             settings_select_remove_item_labels(panel);
             let _: () = msg_send![panel, removeFromSuperview];
         }
+        // 视图摘掉之后还要收掉浮层窗口本身(视图不持有它,是我们 alloc +1 持有的)。
+        // Detaching the view is not enough: the popup window itself must be closed and released too
+        // (no view retains it; we hold its alloc +1).
+        if should_remove {
+            close_select_popup(popup);
+            // 监视器只服务当前打开的下拉:确认没有别的下拉开着再卸掉。
+            // The monitor only serves the open dropdown: drop it once nothing is open.
+            if ACTIVE_SETTINGS_SELECT.lock().unwrap().is_none() {
+                remove_select_monitor();
+            }
+        }
     }
+}
+
+/// 下拉打开期间安装的本地事件监视器:点在"浮层面板 + 触发控件"之外就收起。
+///
+/// 以前只有设置窗口的 `sendEvent` 会收起下拉;下拉搬进自己的浮层窗口之后,点击录制面板等
+/// 其它窗口不再经过那里,于是"点外面收不起来"。本地监视器在事件派发前看到本应用的所有鼠标
+/// 按下事件,是唯一能覆盖所有窗口的时机(全局监视器要额外权限,这里不需要跨应用)。
+///
+/// A local event monitor installed while a dropdown is open: a click outside the popup panel and
+/// the trigger closes it. Only the settings window's `sendEvent` used to close the dropdown; once
+/// the dropdown moved into its own popup window, clicks in other windows (the recording panel) no
+/// longer passed through there, so it stopped closing. The local monitor sees every mouse-down in
+/// this app before dispatch, which is the only place that covers every window (a global monitor
+/// would need extra permissions and we do not need cross-app coverage).
+struct SelectMonitor {
+    monitor: *mut AnyObject,
+    /// 监视器只借用 block 指针,不持有,所以这里要自己保活。
+    /// The monitor borrows the block pointer rather than retaining it, so we keep it alive here.
+    #[allow(dead_code)]
+    handler: block2::RcBlock<dyn Fn(*mut AnyObject) -> *mut AnyObject>,
+}
+
+unsafe impl Send for SelectMonitor {}
+unsafe impl Sync for SelectMonitor {}
+
+static SELECT_MONITOR: Mutex<Option<SelectMonitor>> = Mutex::new(None);
+
+/// 安装"点外面收起"的监视器(已安装则无操作;同一时刻只有一个下拉是打开的)。
+/// Install the click-outside monitor (no-op when already installed; only one dropdown is open at a
+/// time).
+unsafe fn install_select_monitor() {
+    if SELECT_MONITOR.lock().unwrap().is_some() {
+        return;
+    }
+    let handler: block2::RcBlock<dyn Fn(*mut AnyObject) -> *mut AnyObject> =
+        block2::RcBlock::new(|event: *mut AnyObject| -> *mut AnyObject {
+            close_select_on_outside_click(event);
+            event
+        });
+    // LeftMouseDown(1) | RightMouseDown(3) | OtherMouseDown(25),掩码按 NSEventMask 约定取 1 << type。
+    // LeftMouseDown(1) | RightMouseDown(3) | OtherMouseDown(25); the mask is 1 << type.
+    let mask: u64 = (1u64 << 1) | (1u64 << 3) | (1u64 << 25);
+    let monitor: *mut AnyObject = msg_send![
+        class!(NSEvent),
+        addLocalMonitorForEventsMatchingMask: mask,
+        handler: &*handler
+    ];
+    if !monitor.is_null() {
+        *SELECT_MONITOR.lock().unwrap() = Some(SelectMonitor { monitor, handler });
+    }
+}
+
+/// 卸载监视器(下拉关闭后不再需要)。
+/// Remove the monitor (no longer needed once the dropdown is closed).
+unsafe fn remove_select_monitor() {
+    let taken = SELECT_MONITOR.lock().unwrap().take();
+    if let Some(installed) = taken {
+        let _: () = msg_send![class!(NSEvent), removeMonitor: installed.monitor];
+    }
+}
+
+/// 某个 rect 是否包含屏幕坐标点。
+/// Whether a rect contains a point, in screen coordinates.
+fn rect_contains_point(rect: NSRect, point: NSPoint) -> bool {
+    point.x >= rect.origin.x
+        && point.x <= rect.origin.x + rect.size.width
+        && point.y >= rect.origin.y
+        && point.y <= rect.origin.y + rect.size.height
+}
+
+/// 视图中某个 rect 的屏幕矩形(视图不在窗口上时 None)。
+/// A view's rect in screen coordinates (None when the view is not in a window).
+unsafe fn view_rect_on_screen(view: *mut AnyObject, rect: NSRect) -> Option<NSRect> {
+    if view.is_null() {
+        return None;
+    }
+    let window: *mut AnyObject = msg_send![view, window];
+    if window.is_null() {
+        return None;
+    }
+    let in_window: NSRect = msg_send![
+        view,
+        convertRect: rect,
+        toView: std::ptr::null::<AnyObject>()
+    ];
+    Some(msg_send![window, convertRectToScreen: in_window])
+}
+
+/// 鼠标按下事件是否落在下拉之外;是则收起当前选择器。监视器回调,主线程执行。
+/// Whether a mouse-down landed outside the dropdown; if so, close the active select. Monitor
+/// callback, runs on the main thread.
+unsafe fn close_select_on_outside_click(event: *mut AnyObject) {
+    let active = *ACTIVE_SETTINGS_SELECT.lock().unwrap();
+    let Some(active) = active else { return };
+    let button = active as *mut AnyObject;
+    let panel = SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .get(&active)
+        .map(|state| state.panel)
+        .unwrap_or(0) as *mut AnyObject;
+    if button.is_null() {
+        return;
+    }
+    // 点击位置换算到屏幕坐标;拿不到所在窗口(不属于任何窗口的事件)就直接当成"外面"。
+    let event_window: *mut AnyObject = msg_send![event, window];
+    if event_window.is_null() {
+        settings_select_close(button);
+        return;
+    }
+    let in_window: NSPoint = msg_send![event, locationInWindow];
+    let screen_point: NSPoint = msg_send![event_window, convertPointToScreen: in_window];
+
+    // 面板本身(注意用面板的矩形而不是窗口矩形:窗口四周还留了 12pt 阴影留白,点在那圈
+    // 透明留白上应该算"外面")。
+    // The panel itself -- its rect, not the window's: the window keeps 12pt of shadow padding
+    // around it, and a click in that transparent ring counts as outside.
+    if !panel.is_null() {
+        let bounds: NSRect = msg_send![panel, bounds];
+        if let Some(rect) = view_rect_on_screen(panel, bounds) {
+            if rect_contains_point(rect, screen_point) {
+                return;
+            }
+        }
+    }
+    // 触发器:交给按钮自己的 mouseDown 切换,这里不插手(否则会"先关掉再打开")。
+    // The trigger: the button's own mouseDown toggles it, so this must not interfere (otherwise it
+    // would close and immediately reopen).
+    let button_bounds: NSRect = msg_send![button, bounds];
+    if let Some(rect) = view_rect_on_screen(button, button_bounds) {
+        if rect_contains_point(rect, screen_point) {
+            return;
+        }
+    }
+    settings_select_close(button);
+}
+
+/// 关闭并释放一个选项浮层窗口。
+/// Close and release an option popup window.
+unsafe fn close_select_popup(popup: *mut AnyObject) {
+    if popup.is_null() {
+        return;
+    }
+    let parent: *mut AnyObject = msg_send![popup, parentWindow];
+    if !parent.is_null() {
+        let _: () = msg_send![parent, removeChildWindow: popup];
+    }
+    let _: () = msg_send![popup, orderOut: std::ptr::null_mut::<AnyObject>()];
+    let _: () = msg_send![popup, close];
+    release_obj(popup);
 }
 
 /// Paint an option row according to its selected/hovered state.
@@ -1785,19 +2009,23 @@ extern "C" fn settings_select_item_reveal(this: *mut c_void, _cmd: Sel, _object:
 }
 
 unsafe fn settings_select_remove_item_labels(panel: *mut AnyObject) {
-    if panel.is_null() {
-        return;
-    }
-    let subviews: *mut AnyObject = msg_send![panel, subviews];
-    if subviews.is_null() {
-        return;
-    }
-    let count: usize = msg_send![subviews, count];
     let mut labels = SETTINGS_SELECT_ITEM_LABEL_VIEWS.lock().unwrap();
-    for index in 0..count {
-        let item: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+    for item in settings_select_item_views(panel) {
         labels.remove(&(item as usize));
     }
+}
+
+/// 浮层窗口永远不会成为 key window,所以点在它上面算"首次点击":选项行必须接受,否则第一次
+/// 点击会被 AppKit 吞掉(表现为点一下没反应、要点第二下才生效)。
+///
+/// The popup window is never the key window, so a click on it counts as a first mouse: option rows
+/// must accept it, otherwise AppKit swallows the first click (the row appears to need two clicks).
+extern "C" fn settings_select_item_accepts_first_mouse(
+    _this: *mut c_void,
+    _cmd: Sel,
+    _event: *mut c_void,
+) -> bool {
+    true
 }
 
 fn settings_select_item_class() -> *mut AnyObject {
@@ -1824,6 +2052,12 @@ fn settings_select_item_class() -> *mut AnyObject {
                 sel!(reveal),
                 settings_select_item_reveal as *mut c_void,
                 CString::new("v@:").unwrap().as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(acceptsFirstMouse:),
+                settings_select_item_accepts_first_mouse as *mut c_void,
+                CString::new("B@:@").unwrap().as_ptr(),
             );
             objc_registerClassPair(cls);
             SettingsSelectItemClass(cls)
@@ -1965,14 +2199,86 @@ unsafe fn settings_select_make_item(
     release_obj(item);
 }
 
+/// 选项面板的几何结果。
+/// The resolved option-panel geometry.
+#[derive(Debug, PartialEq)]
+struct SettingsSelectPanel {
+    /// 选项全展开需要的高度。
+    /// The height a fully expanded option list needs.
+    natural_h: f64,
+    /// 面板最终高度(已经收在宿主可用高度内)。
+    /// The panel's final height (already capped to the host's available height).
+    panel_h: f64,
+    panel_y: f64,
+    /// 向上展开(供入场动画决定滑入方向)。
+    /// Opens upwards (the entrance animation slides in from that side).
+    opens_above: bool,
+    /// 装不下 -> 选项行需要放进滚动视图。
+    /// Does not fit -> the rows need to go into a scroll view.
+    scrolls: bool,
+}
+
+/// 浮层窗口在面板四周留出的空白,给面板的圆角阴影留位置(窗口会裁剪超出自身的内容)。
+/// Blank space the floating window leaves around the panel, so the panel's rounded shadow has room
+/// (a window clips whatever exceeds its own frame).
+const SELECT_POPUP_SHADOW_PAD: f64 = 12.0;
+
+/// 计算展开中的选项面板几何。纯函数,便于单测(见本模块的测试)。
+///
+/// 坐标空间是**屏幕**:下拉是浮层,尺寸与展开方向只由屏幕可见区域决定。以前它受宿主窗口
+/// (录制编辑面板只有 440×240)限制,选项多时顶边溢出被裁 —— 8 个选项里第一项「默认」就是
+/// 这样消失的。
+///
+/// Resolve the geometry of an opening option panel. Pure, so it can be unit-tested (see this
+/// module's tests).
+///
+/// The coordinate space is the SCREEN: a dropdown is a floating layer, so its size and direction
+/// follow the screen's visible area. It used to be bounded by the host window (the recording panel
+/// is only 440x240), which clipped the top edge when there were many options -- that is how the
+/// first of the eight options disappeared.
+fn settings_select_panel_geometry(
+    trigger: NSRect,
+    bounds: NSRect,
+    item_count: usize,
+    row_h: f64,
+) -> SettingsSelectPanel {
+    const MARGIN: f64 = 4.0;
+    const GAP: f64 = 8.0;
+    let natural_h = item_count as f64 * row_h + 8.0;
+    let bounds_top = bounds.origin.y + bounds.size.height;
+    // 触发控件上下各自真正可用的高度(扣掉间距与内边距)。
+    // How much room the trigger really has above/below (minus the gap and the inset).
+    let below = trigger.origin.y - bounds.origin.y;
+    let above = bounds_top - (trigger.origin.y + trigger.size.height);
+    let room_below = (below - GAP - MARGIN).max(0.0);
+    let room_above = (above - GAP - MARGIN).max(0.0);
+    let opens_above = room_below < natural_h && room_above > room_below;
+    let room = if opens_above { room_above } else { room_below };
+    // 至少留一行的高度,避免宿主极矮时算出退化几何。
+    // Keep at least one row so a pathologically short host cannot produce degenerate geometry.
+    let min_h = row_h + 8.0;
+    let panel_h = natural_h.min(room).max(min_h);
+    let panel_y = if opens_above {
+        trigger.origin.y + trigger.size.height + GAP
+    } else {
+        trigger.origin.y - GAP - panel_h
+    };
+    let panel_y = panel_y.clamp(
+        bounds.origin.y + MARGIN,
+        (bounds_top - panel_h - MARGIN).max(bounds.origin.y + MARGIN),
+    );
+    SettingsSelectPanel {
+        natural_h,
+        panel_h,
+        panel_y,
+        opens_above,
+        scrolls: panel_h + 0.5 < natural_h,
+    }
+}
+
 unsafe fn settings_select_open(button: *mut AnyObject) {
     let window: *mut AnyObject = msg_send![button, window];
-    let content: *mut AnyObject = if window.is_null() {
-        std::ptr::null_mut()
-    } else {
-        msg_send![window, contentView]
-    };
-    if content.is_null() {
+    if window.is_null() {
         return;
     }
 
@@ -1985,17 +2291,19 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
     // A fast reopen can happen while the close fade is still pending. Remove only the stale
     // panel that belongs to this control and cancel its delayed cleanup callback.
     // 快速重新打开可能发生在关闭淡出尚未结束时；这里只清理本控件的旧面板并取消旧回调。
-    let stale_panel = {
+    let (stale_panel, stale_popup) = {
         let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
         states
             .get_mut(&(button as usize))
             .filter(|state| !state.open)
             .map(|state| {
                 let panel = state.panel;
+                let popup = state.popup;
                 state.panel = 0;
-                panel as *mut AnyObject
+                state.popup = 0;
+                (panel as *mut AnyObject, popup as *mut AnyObject)
             })
-            .unwrap_or(std::ptr::null_mut())
+            .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()))
     };
     if !stale_panel.is_null() {
         let _: () = msg_send![
@@ -2007,6 +2315,10 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
         settings_select_remove_item_labels(stale_panel);
         let _: () = msg_send![stale_panel, removeFromSuperview];
     }
+    // 旧的浮层窗口也要收掉:我们取消了 finishClose,它不会再替我们释放那 +1。
+    // The stale popup window must go too: its finishClose was just cancelled, so nothing else will
+    // release that +1.
+    close_select_popup(stale_popup);
 
     let (items, selected) = {
         let states = SETTINGS_SELECT_STATES.lock().unwrap();
@@ -2019,31 +2331,43 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
         (state.items.clone(), state.selected.max(0) as usize)
     };
 
+    // 触发器与可用区域都换算到**屏幕**坐标:下拉是浮层,尺寸与展开方向只由屏幕可见区域
+    // 决定,不再受宿主窗口(录制编辑面板只有 440×240)限制。
+    // Both the trigger and the available area are resolved in SCREEN coordinates: a dropdown is a
+    // floating layer, so only the screen's visible area bounds its size and direction -- not the
+    // host window (the recording panel is only 440x240).
     let bounds: NSRect = msg_send![button, bounds];
-    let trigger: NSRect = msg_send![button, convertRect: bounds, toView: content];
-    let content_bounds: NSRect = msg_send![content, bounds];
+    let trigger_in_window: NSRect = msg_send![
+        button,
+        convertRect: bounds,
+        toView: std::ptr::null_mut::<AnyObject>()
+    ];
+    let trigger: NSRect = msg_send![window, convertRectToScreen: trigger_in_window];
+    let screen: *mut AnyObject = msg_send![window, screen];
+    let screen: *mut AnyObject = if screen.is_null() {
+        msg_send![class!(NSScreen), mainScreen]
+    } else {
+        screen
+    };
+    let screen_visible: NSRect = if screen.is_null() {
+        trigger
+    } else {
+        msg_send![screen, visibleFrame]
+    };
     let panel_w = trigger.size.width.max(120.0);
     let row_h = settings_select_required_option_row_height(panel_w, &items);
-    let panel_h = items.len() as f64 * row_h + 8.0;
-    let below = trigger.origin.y - content_bounds.origin.y;
-    let above = content_bounds.origin.y + content_bounds.size.height
-        - (trigger.origin.y + trigger.size.height);
-    let opens_above = below < panel_h + 8.0 && above > below;
-    let panel_y = if opens_above {
-        trigger.origin.y + trigger.size.height + 8.0
-    } else {
-        trigger.origin.y - panel_h - 8.0
-    };
-    let panel_y = panel_y.clamp(
-        content_bounds.origin.y + 4.0,
-        (content_bounds.origin.y + content_bounds.size.height - panel_h - 4.0)
-            .max(content_bounds.origin.y + 4.0),
-    );
+    let geometry = settings_select_panel_geometry(trigger, screen_visible, items.len(), row_h);
+    let natural_h = geometry.natural_h;
+    let panel_h = geometry.panel_h;
+    let panel_y = geometry.panel_y;
+    // 面板坐标在**自己的浮层窗口**里,四周留出阴影间距;窗口本身放在屏幕上的 (trigger.x, panel_y)。
+    // The panel lives inside its own floating window with the shadow padding around it; the window
+    // itself is placed at (trigger.x, panel_y) on screen.
     let panel: *mut AnyObject = msg_send![class!(NSView), alloc];
     let panel: *mut AnyObject = msg_send![
         panel,
         initWithFrame: NSRect::new(
-            NSPoint::new(trigger.origin.x, panel_y),
+            NSPoint::new(SELECT_POPUP_SHADOW_PAD, SELECT_POPUP_SHADOW_PAD),
             NSSize::new(panel_w, panel_h)
         )
     ];
@@ -2071,11 +2395,52 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
         let _: () = msg_send![panel_layer, setShadowOffset: NSSize::new(0.0, -4.0)];
     }
 
+    // 选项行挂在哪:装得下就直接挂面板,装不下就套一层滚动视图(见上面 panel_h 的注释)。
+    // Where the rows hang: directly on the panel when they fit, otherwise inside a scroll view
+    // (see the note on panel_h above).
+    let list_parent = if geometry.scrolls {
+        let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
+        let scroll: *mut AnyObject = msg_send![
+            scroll,
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(panel_w, panel_h))
+        ];
+        let _: () = msg_send![scroll, setBorderType: 0u64];
+        let _: () = msg_send![scroll, setDrawsBackground: false];
+        let _: () = msg_send![scroll, setHasHorizontalScroller: false];
+        let _: () = msg_send![scroll, setHasVerticalScroller: true];
+        let _: () = msg_send![scroll, setAutohidesScrollers: true];
+        let _: () = msg_send![scroll, setScrollerStyle: 1isize]; // overlay
+        let clip: *mut AnyObject = msg_send![scroll, contentView];
+        let _: () = msg_send![clip, setDrawsBackground: false];
+        let document: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let document: *mut AnyObject = msg_send![
+            document,
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(panel_w, natural_h))
+        ];
+        let _: () = msg_send![scroll, setDocumentView: document];
+        let _: () = msg_send![panel, addSubview: scroll];
+        // 文档不翻转:NSScrollView 的常规坐标系下面板初始停在最底,这里显式滚到顶部,
+        // 让第一个选项可见(与设置页 make_settings_page 同款做法)。
+        // The document is not flipped, so a scroll view starts at its bottom; scroll to the top
+        // explicitly so the first option is visible (same as make_settings_page does for the page).
+        let top_origin = (natural_h - panel_h).max(0.0);
+        let _: () = msg_send![clip, scrollToPoint: NSPoint::new(0.0, top_origin)];
+        let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+        release_obj(document);
+        release_obj(scroll);
+        document
+    } else {
+        panel
+    };
+
     for (index, title) in items.iter().enumerate() {
-        let item_y = panel_h - 4.0 - (index as f64 + 1.0) * row_h;
+        // 行在完整列表里的坐标(未滚动时 natural_h == panel_h,与原来的算式一致)。
+        // The row's position in the full list (natural_h == panel_h when nothing is scrolled, which
+        // matches the previous formula).
+        let item_y = natural_h - 4.0 - (index as f64 + 1.0) * row_h;
         settings_select_make_item(
             button,
-            panel,
+            list_parent,
             index,
             title,
             index == selected,
@@ -2084,17 +2449,65 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
             row_h,
         );
     }
-    let _: () = msg_send![content, addSubview: panel];
+    // 容器:窗口比面板四周各大一圈阴影间距,给面板的圆角阴影留位置(窗口会裁掉超出自身的内容)。
+    // Container: the window is one shadow pad larger than the panel so its rounded shadow has room
+    // (a window clips whatever exceeds its own frame).
+    let padded_w = panel_w + 2.0 * SELECT_POPUP_SHADOW_PAD;
+    let padded_h = panel_h + 2.0 * SELECT_POPUP_SHADOW_PAD;
+    let container: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let container: *mut AnyObject = msg_send![
+        container,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(padded_w, padded_h))
+    ];
+    let _: () = msg_send![container, addSubview: panel];
     release_obj(panel);
+
+    // 无边框 + 非激活面板:浮层不抢焦点(键盘导航仍留在宿主的按钮上),也不激活应用。
+    // Borderless + non-activating panel: the popup never takes focus (keyboard navigation stays on
+    // the host's button) and never activates the app.
+    let popup: *mut AnyObject = msg_send![class!(NSPanel), alloc];
+    let popup: *mut AnyObject = msg_send![
+        popup,
+        initWithContentRect: NSRect::new(
+            NSPoint::new(
+                trigger.origin.x - SELECT_POPUP_SHADOW_PAD,
+                panel_y - SELECT_POPUP_SHADOW_PAD
+            ),
+            NSSize::new(padded_w, padded_h)
+        ),
+        styleMask: 128u64, // NSWindowStyleMaskNonactivatingPanel
+        backing: 2u64,
+        defer: false
+    ];
+    let _: () = msg_send![popup, setOpaque: false];
+    let clear_color: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+    let _: () = msg_send![popup, setBackgroundColor: clear_color];
+    let _: () = msg_send![popup, setHasShadow: false];
+    let _: () = msg_send![popup, setReleasedWhenClosed: false];
+    // 压在宿主之上:宿主本身可能是浮动窗口(录制编辑面板 level = 3)。
+    // Sits above the host, which may itself be a floating window (the recording panel is level 3).
+    let host_level: isize = msg_send![window, level];
+    let _: () = msg_send![popup, setLevel: host_level + 1];
+    let _: () = msg_send![popup, setContentView: container];
+    release_obj(container);
+    // 挂成宿主的子窗口:宿主隐藏或关闭时它一起消失,不会留下孤儿浮层。
+    // Attached as a child of the host, so it disappears with the host instead of lingering.
+    let _: () = msg_send![window, addChildWindow: popup, ordered: 1isize]; // NSWindowAbove
+    let _: () = msg_send![popup, orderFront: std::ptr::null_mut::<AnyObject>()];
     {
         let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
         if let Some(state) = states.get_mut(&(button as usize)) {
             state.panel = panel as usize;
+            state.popup = popup as usize;
             state.open = true;
         }
     }
     *ACTIVE_SETTINGS_SELECT.lock().unwrap() = Some(button as usize);
     settings_select_apply_visual(button, true);
+    // 打开期间拦"点外面收起":下拉在自己的窗口里,宿主窗口的点击通路不再覆盖它。
+    // Catch click-outside while open: the dropdown lives in its own window, so the host window's
+    // click path no longer covers it.
+    install_select_monitor();
 
     if !window.is_null() {
         let _: bool = msg_send![window, makeFirstResponder: button];
@@ -2130,7 +2543,7 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
             animationWithKeyPath: key_path
         ];
         CFRelease(key_path as *const c_void);
-        let from_y = if opens_above { -8.0 } else { 8.0 };
+        let from_y = if geometry.opens_above { -8.0 } else { 8.0 };
         let from: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from_y];
         let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
         let _: () = msg_send![spring, setFromValue: from];
@@ -2205,12 +2618,39 @@ extern "C" fn settings_select_mouse_down(this: *mut c_void, _cmd: Sel, _event: *
         if !msg_send![button, isEnabled] {
             return;
         }
-        let open = SETTINGS_SELECT_STATES
-            .lock()
-            .unwrap()
-            .get(&(button as usize))
-            .is_some_and(|state| state.open);
-        if open {
+        let (open, popup) = {
+            let states = SETTINGS_SELECT_STATES.lock().unwrap();
+            match states.get(&(button as usize)) {
+                Some(state) => (state.open, state.popup as *mut AnyObject),
+                None => (false, std::ptr::null_mut()),
+            }
+        };
+        // 浮层是宿主窗口的子窗口:宿主隐藏/关闭时它一起隐藏,这时状态里的 open 已经不可信 ——
+        // 直接当成已关闭并收干净,让这次点击展开新的;否则第一下只会去关一个看不见的浮层
+        // (表现为要点两下才展开)。
+        //
+        // The popup is a child window of the host: it hides together with the host, and the `open`
+        // flag then goes stale. Treat it as closed and tidy up so this click opens a fresh popup --
+        // otherwise the click is spent closing something invisible (the control would need two
+        // clicks to open).
+        let stale = open && (popup.is_null() || !msg_send![popup, isVisible]);
+        if stale {
+            if let Some(state) = SETTINGS_SELECT_STATES
+                .lock()
+                .unwrap()
+                .get_mut(&(button as usize))
+            {
+                state.open = false;
+                state.panel = 0;
+                state.popup = 0;
+            }
+            if *ACTIVE_SETTINGS_SELECT.lock().unwrap() == Some(button as usize) {
+                *ACTIVE_SETTINGS_SELECT.lock().unwrap() = None;
+            }
+            close_select_popup(popup);
+            settings_select_apply_visual(button, false);
+        }
+        if open && !stale {
             settings_select_close(button);
         } else {
             settings_select_open(button);
@@ -2327,48 +2767,6 @@ extern "C" fn settings_select_add_item(this: *mut c_void, _cmd: Sel, title: *mut
             .get(&(button as usize))
             .is_some_and(|state| state.open);
         settings_select_apply_visual(button, open);
-    }
-}
-
-/// Close the active select when a settings-window click lands outside its trigger or panel.
-/// 设置窗口点击落在触发器和面板之外时关闭当前选择器。
-pub(super) unsafe fn settings_select_handle_window_mouse_down(
-    window: *mut AnyObject,
-    event: *mut AnyObject,
-) {
-    let active = *ACTIVE_SETTINGS_SELECT.lock().unwrap();
-    let Some(active) = active else { return };
-    let button = active as *mut AnyObject;
-    let panel = SETTINGS_SELECT_STATES
-        .lock()
-        .unwrap()
-        .get(&active)
-        .map(|state| state.panel)
-        .unwrap_or(0) as *mut AnyObject;
-    if panel.is_null() || button.is_null() || window.is_null() {
-        return;
-    }
-    let content: *mut AnyObject = msg_send![window, contentView];
-    if content.is_null() {
-        return;
-    }
-    let location: NSPoint = msg_send![event, locationInWindow];
-    let point: NSPoint = msg_send![
-        content,
-        convertPoint: location,
-        fromView: std::ptr::null::<AnyObject>()
-    ];
-    let panel_frame: NSRect = msg_send![panel, frame];
-    let button_bounds: NSRect = msg_send![button, bounds];
-    let button_frame: NSRect = msg_send![button, convertRect: button_bounds, toView: content];
-    let contains = |frame: NSRect| {
-        point.x >= frame.origin.x
-            && point.x <= frame.origin.x + frame.size.width
-            && point.y >= frame.origin.y
-            && point.y <= frame.origin.y + frame.size.height
-    };
-    if !contains(panel_frame) && !contains(button_frame) {
-        settings_select_close(button);
     }
 }
 
@@ -2512,6 +2910,7 @@ pub(super) unsafe fn make_popup(
             item_symbols: vec![None; items.len()],
             selected: selected as isize,
             panel: 0,
+            popup: 0,
             open: false,
         },
     );
@@ -4395,8 +4794,8 @@ pub(super) unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
 mod tests {
     use super::{
         derived_label_width, rect_inside, rects_overlap, required_document_height,
-        settings_select_centered_text_geometry, settings_select_needs_wrap, slider_should_reset,
-        stable_document_height,
+        settings_select_centered_text_geometry, settings_select_needs_wrap,
+        settings_select_panel_geometry, slider_should_reset, stable_document_height,
     };
     // 冒烟测试需要直接发 ObjC 消息(构造 NSEvent、驱动 mouseDown:)。
     // The smoke test sends ObjC messages directly (building an NSEvent, driving mouseDown:).
@@ -4506,6 +4905,66 @@ mod tests {
         assert_eq!(stable_document_height(1_120.0, 840.0), 1_120.0);
         assert_eq!(stable_document_height(700.0, 840.0), 840.0);
         assert_eq!(stable_document_height(0.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn settings_select_panel_is_bounded_by_the_screen_not_the_host_window() {
+        // 真实场景:动作下拉在录制编辑面板(440×240)里,但面板已经是**独立浮层窗口**,所以
+        // 8 个选项(264pt)按屏幕可见区域展开:完整显示、不滚动、不裁 —— 宿主多小都无所谓。
+        // The real case: the action dropdown sits in the recording panel (440x240), but the panel is
+        // now its own floating window, so the eight options (264pt) open within the screen's visible
+        // area: fully shown, no scrolling, no clipping -- however small the host is.
+        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1512.0, 944.0));
+        // 录制面板居中偏下时,触发控件在屏幕上的位置。
+        // The trigger's screen position while the recording panel sits in the lower half.
+        let trigger = NSRect::new(NSPoint::new(600.0, 300.0), NSSize::new(290.0, 26.0));
+        let panel = settings_select_panel_geometry(trigger, screen, 8, 32.0);
+
+        assert!(!panel.scrolls, "264pt fits on a 944pt screen");
+        assert_eq!(panel.panel_h, panel.natural_h);
+        let frame = NSRect::new(
+            NSPoint::new(trigger.origin.x, panel.panel_y),
+            NSSize::new(290.0, panel.panel_h),
+        );
+        assert!(
+            rect_inside(screen, frame, 0.001),
+            "the panel must stay inside the screen: {panel:?}"
+        );
+    }
+
+    #[test]
+    fn settings_select_panel_still_scrolls_when_the_screen_cannot_fit_it() {
+        // 屏幕都装不下(极端情况)时仍然收口到可用高度并改用内部滚动,而不是溢出被裁。
+        // When even the screen cannot fit it (an extreme case), it still caps to the available
+        // height and scrolls internally instead of overflowing and getting clipped.
+        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 300.0));
+        let trigger = NSRect::new(NSPoint::new(40.0, 140.0), NSSize::new(290.0, 26.0));
+        let panel = settings_select_panel_geometry(trigger, screen, 8, 32.0);
+
+        assert!(panel.scrolls);
+        assert!(panel.panel_h < panel.natural_h);
+        assert!(panel.panel_h >= 40.0, "at least one row stays visible");
+        let frame = NSRect::new(
+            NSPoint::new(trigger.origin.x, panel.panel_y),
+            NSSize::new(290.0, panel.panel_h),
+        );
+        assert!(
+            rect_inside(screen, frame, 0.001),
+            "the whole panel must stay inside the screen: {panel:?}"
+        );
+    }
+
+    #[test]
+    fn settings_select_panel_keeps_full_height_when_it_fits() {
+        // 主设置页那种大宿主里装得下:行为不变 —— 不滚动,位置也不动。
+        // In a roomy host (the main settings page) nothing changes: no scrolling, same position.
+        let host = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(660.0, 760.0));
+        let trigger = NSRect::new(NSPoint::new(420.0, 300.0), NSSize::new(200.0, 30.0));
+        let panel = settings_select_panel_geometry(trigger, host, 8, 32.0);
+
+        assert!(!panel.scrolls);
+        assert_eq!(panel.panel_h, 8.0 * 32.0 + 8.0);
+        assert_eq!(panel.panel_y, 300.0 - 8.0 - panel.panel_h);
     }
 
     #[test]
