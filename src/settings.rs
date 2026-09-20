@@ -483,9 +483,9 @@ pub(crate) mod widgets;
 mod window;
 
 use components::{
-    CollapsibleRows, RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard,
-    SettingsControl, SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader,
-    SettingsRow, SettingsSection, SettingsSelect, SettingsSidebar,
+    CollapsibleRows, RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsControl,
+    SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader, SettingsRow,
+    SettingsSection, SettingsSelect, SettingsSidebar,
 };
 use dispatch::*;
 use glass_preview::*;

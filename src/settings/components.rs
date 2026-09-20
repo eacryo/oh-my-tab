@@ -311,9 +311,6 @@ pub(super) struct SettingsLayout {
     /// Gap between a section header and the card top edge.
     /// 区块标题与卡片顶部之间的间距。
     pub card_header_gap: f64,
-    /// Symmetric padding for a standalone card with no section header.
-    /// 没有区块标题的独立卡片使用的对称内边距。
-    pub card_padding: f64,
 }
 
 impl SettingsLayout {
@@ -338,7 +335,6 @@ impl SettingsLayout {
             row_gap: 8.0,
             card_bottom_inset: 10.0,
             card_header_gap: super::SETTINGS_SECTION_CARD_GAP,
-            card_padding: 4.0,
         }
     }
 
@@ -2561,7 +2557,6 @@ mod tests {
         assert_eq!(layout.row_gap, 8.0);
         assert_eq!(layout.card_bottom(100.0), 90.0);
         assert_eq!(layout.card_top(100.0), 96.0);
-        assert_eq!(layout.card_padding, 4.0);
         assert_eq!(layout.next_row_cursor_with_extra(100.0, 54.0, 18.0), 20.0);
     }
 

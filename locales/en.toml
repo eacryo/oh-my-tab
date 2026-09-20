@@ -176,6 +176,7 @@ row_window_control_display_left = "Enable Option + Shift + ←: move to the disp
 desc_window_control_display_left = "Enable Option + Shift + ← to move the window to the display on the left."
 row_window_control_display_right = "Enable Option + Shift + →: move to the display on the right"
 desc_window_control_display_right = "Enable Option + Shift + → to move the window to the display on the right."
+header_mouse = "Mouse"
 header_mouse_device = "Device"
 no_device_detected = "No device detected"
 header_mouse_mappings = "Button Mappings"

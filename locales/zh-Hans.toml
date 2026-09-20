@@ -177,6 +177,7 @@ row_window_control_display_left = "启用 Option + Shift + ← 移动到左侧�
 desc_window_control_display_left = "启用 Option + Shift + ← 将窗口移动到左侧显示器。"
 row_window_control_display_right = "启用 Option + Shift + → 移动到右侧显示器"
 desc_window_control_display_right = "启用 Option + Shift + → 将窗口移动到右侧显示器。"
+header_mouse = "鼠标"
 header_mouse_device = "设备"
 no_device_detected = "未检测到设备"
 header_mouse_mappings = "按键映射"

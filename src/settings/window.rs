@@ -2055,6 +2055,19 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         y -= mouse_title_h + 18.0;
 
         // --- 启用鼠标控制(总开关,置于最顶) / Enable mouse control (topmost) ---
+        // 小标题:本页与全 App 的区块都带一个短名词小标题(设备/滚动/指针/按键映射、剪贴板…),
+        // 只有这张总开关卡片以前漏了,左上角看起来空一块。用「鼠标」而不是「鼠标控制」:比页面
+        // 大标题短一档,复刻剪贴板页(小标题「剪贴板」/大标题「剪贴板历史」)的做法,也不会和
+        // 行标题「启用鼠标控制」重复。
+        //
+        // Header: every section in this app carries a short-noun heading (Device / Scrolling /
+        // Pointer / Button Mappings, Clipboard, ...), and this master-switch card was the only one
+        // without it, which read as a blank spot at its top-left. "Mouse" rather than "Mouse
+        // control": one notch shorter than the page title, the same way the clipboard page pairs
+        // its "Clipboard" heading with the "Clipboard History" title, and it never repeats the row's
+        // "Enable mouse control".
+        y = layout.next_section_cursor(y);
+        let mouse_header_y = y;
         y = layout.next_row_cursor(y, described_row_h);
         let enable_mouse_bottom = y;
         ui.enable_mouse = SettingsRow::described(
@@ -2071,15 +2084,16 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // Update OK button title in real time when the switch toggles (OK vs OK && Restart).
         let _: () = msg_send![ui.enable_mouse, setTarget: target];
         let _: () = msg_send![ui.enable_mouse, setAction: sel!(handleEnableMouseToggle:)];
-        SettingsCard::attach(
+        let _ = SettingsSection::attach(
             mouse_view,
             NSRect::new(
-                NSPoint::new(6.0, enable_mouse_bottom - layout.card_padding),
+                NSPoint::new(6.0, layout.card_bottom(enable_mouse_bottom)),
                 NSSize::new(
                     content_w - 12.0,
-                    described_row_h + layout.card_padding * 2.0,
+                    layout.card_top(mouse_header_y) - layout.card_bottom(enable_mouse_bottom),
                 ),
             ),
+            &t("settings.header_mouse"),
         );
 
         // --- 设备选择器(内嵌下拉框,切换即时刷新其余控件) / Device picker (inline popup) ---
