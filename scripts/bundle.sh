@@ -116,6 +116,74 @@ if [ -d "$ICON_DIR" ]; then
   cp -R "$ICON_DIR" "$APP/Contents/Resources/AppIcon.icon"
 fi
 
+# Sparkle 自带的 XPC/helper 默认可能是 ad-hoc 签名。正式发布时按 Sparkle 的发布流程
+# 从内向外重签；Downloader.xpc 保留 Sparkle 自己的 entitlements，不能把主应用权限套进去。
+# Sparkle's XPC/helper tools may ship ad-hoc signed. Re-sign them inside-out for distribution;
+# preserve Downloader.xpc's own entitlements instead of applying the main app's entitlements.
+sign_release_component() {
+  local path="$1"
+  local preserve_entitlements="${2:-0}"
+  if [ "$preserve_entitlements" = "1" ]; then
+    codesign --force --options runtime --timestamp --preserve-metadata=entitlements \
+      --sign "$CODESIGN_IDENTITY" "$path" || {
+      echo "error: Developer ID signing failed for $path" >&2
+      return 1
+    }
+  else
+    codesign --force --options runtime --timestamp \
+      --sign "$CODESIGN_IDENTITY" "$path" || {
+      echo "error: Developer ID signing failed for $path" >&2
+      return 1
+    }
+  fi
+}
+
+sign_sparkle_for_release() {
+  local framework="$1"
+  local installer="$framework/Versions/B/XPCServices/Installer.xpc"
+  local downloader="$framework/Versions/B/XPCServices/Downloader.xpc"
+  local autoupdate="$framework/Versions/B/Autoupdate"
+  local updater="$framework/Versions/B/Updater.app"
+  local required_path=""
+
+  for required_path in "$installer" "$downloader" "$autoupdate" "$updater"; do
+    if [ ! -e "$required_path" ]; then
+      echo "error: expected Sparkle release component is missing: $required_path" >&2
+      return 1
+    fi
+  done
+
+  sign_release_component "$installer" || return 1
+  sign_release_component "$downloader" 1 || return 1
+  sign_release_component "$autoupdate" || return 1
+  sign_release_component "$updater" || return 1
+  sign_release_component "$framework" || return 1
+}
+
+verify_developer_id_signature() {
+  local path="$1"
+  local expected_team_id="$2"
+  local details=""
+  local team_id=""
+  local timestamp=""
+
+  if ! details="$(codesign --display --verbose=4 "$path" 2>&1)"; then
+    echo "error: could not read code signature for $path" >&2
+    return 1
+  fi
+  team_id="$(printf '%s\n' "$details" | awk -F= '$1 == "TeamIdentifier" { print $2; exit }')"
+  timestamp="$(printf '%s\n' "$details" | awk -F= '$1 == "Timestamp" { print substr($0, index($0, "=") + 1); exit }')"
+
+  if [ "$team_id" != "$expected_team_id" ]; then
+    echo "error: $path has TeamIdentifier '$team_id'; expected '$expected_team_id'" >&2
+    return 1
+  fi
+  if [ -z "$timestamp" ] || [ "$timestamp" = "none" ]; then
+    echo "error: $path is missing a secure code-signing timestamp" >&2
+    return 1
+  fi
+}
+
 # 正式公证包必须使用 Developer ID、Hardened Runtime 和安全时间戳;签名失败时立即终止。
 # 本机开发打包仍优先使用自签名身份,并保留 ad-hoc 回退。
 # Notarized release packages require Developer ID, Hardened Runtime, and a secure timestamp;
@@ -123,6 +191,11 @@ fi
 if [ "${RELEASE_SIGNING:-0}" = "1" ]; then
   if [ -z "${CODESIGN_IDENTITY:-}" ]; then
     echo "error: set CODESIGN_IDENTITY to a Developer ID Application identity" >&2
+    exit 1
+  fi
+  SPARKLE_FRAMEWORK="$APP/Contents/Frameworks/Sparkle.framework"
+  if [ -d "$SPARKLE_FRAMEWORK" ] && ! sign_sparkle_for_release "$SPARKLE_FRAMEWORK"; then
+    echo "error: failed to sign embedded Sparkle code for notarization" >&2
     exit 1
   fi
   if ! codesign --force --options runtime --timestamp \
@@ -133,6 +206,23 @@ if [ "${RELEASE_SIGNING:-0}" = "1" ]; then
   if ! codesign --verify --deep --strict "$APP"; then
     echo "error: release signature verification failed for $APP" >&2
     exit 1
+  fi
+  APP_SIGNATURE="$(codesign --display --verbose=4 "$APP" 2>&1)"
+  APP_TEAM_ID="$(printf '%s\n' "$APP_SIGNATURE" | awk -F= '$1 == "TeamIdentifier" { print $2; exit }')"
+  if [ -z "$APP_TEAM_ID" ] || [ "$APP_TEAM_ID" = "not set" ]; then
+    echo "error: $APP does not have a Developer ID TeamIdentifier" >&2
+    exit 1
+  fi
+  verify_developer_id_signature "$APP" "$APP_TEAM_ID"
+  if [ -d "$SPARKLE_FRAMEWORK" ]; then
+    for path in \
+      "$SPARKLE_FRAMEWORK/Versions/B/XPCServices/Installer.xpc" \
+      "$SPARKLE_FRAMEWORK/Versions/B/XPCServices/Downloader.xpc" \
+      "$SPARKLE_FRAMEWORK/Versions/B/Autoupdate" \
+      "$SPARKLE_FRAMEWORK/Versions/B/Updater.app" \
+      "$SPARKLE_FRAMEWORK"; do
+      verify_developer_id_signature "$path" "$APP_TEAM_ID"
+    done
   fi
   echo "signed with $CODESIGN_IDENTITY (Hardened Runtime + secure timestamp)"
 else

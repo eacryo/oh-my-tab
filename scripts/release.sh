@@ -5,11 +5,12 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/release.sh [--notarize | --check [submission-id] | --push [--dry-run]]
+Usage: scripts/release.sh [--notarize | --check [submission-id] | --archive-failed | --push [--dry-run]]
 
   (no flag)       Build local artifacts and generate the Homebrew cask; never upload to R2.
   --notarize      Build with Developer ID signing and submit to Apple without waiting.
   --check [id]    Query the saved notarization submission (or recover with its submission ID).
+  --archive-failed Archive an Invalid submission under dist/.notarization/failed/.
   --push          Require Accepted status, staple the app, package it, and publish to R2.
   --dry-run       With --push, prepare the release and print the R2 upload plan without uploading.
 
@@ -25,7 +26,7 @@ MODE_SELECTED=0
 
 select_mode() {
   if [ "$MODE_SELECTED" -ne 0 ]; then
-    echo "error: choose only one of --notarize, --check, or --push" >&2
+    echo "error: choose only one release action" >&2
     exit 2
   fi
   MODE="$1"
@@ -45,6 +46,9 @@ while [ "$#" -gt 0 ]; do
           * ) CHECK_ID="$2"; shift ;;
         esac
       fi
+      ;;
+    --archive-failed)
+      select_mode archive-failed
       ;;
     --push)
       select_mode push
@@ -163,6 +167,34 @@ require_accepted_submission() {
   esac
 }
 
+archive_invalid_submission() {
+  if [ ! -d "$PENDING_DIR" ]; then
+    echo "error: no pending notarization submission found at $PENDING_DIR" >&2
+    exit 1
+  fi
+
+  local submission_id=""
+  local status=""
+  local failed_dir=""
+  submission_id="$(load_submission_id)"
+  status="$(query_notary_status "$submission_id")"
+  echo "Notarization status: $status (submission $submission_id)"
+  if [ "$status" != "Invalid" ]; then
+    echo "error: only an Invalid submission can be archived; pending state was left unchanged" >&2
+    exit 1
+  fi
+
+  show_notary_log "$submission_id"
+  failed_dir="$NOTARY_ROOT/failed/$submission_id"
+  if [ -e "$failed_dir" ]; then
+    failed_dir="${failed_dir}-$(date -u +%Y%m%d%H%M%S)"
+  fi
+  mkdir -p "$(dirname "$failed_dir")"
+  mv "$PENDING_DIR" "$failed_dir"
+  echo "Archived failed notarization state at $failed_dir"
+  echo "You can now start a corrected build with: scripts/release.sh --notarize"
+}
+
 generate_cask() {
   local version="$1"
   local dmg_path="$2"
@@ -262,6 +294,10 @@ case "$MODE" in
         exit 1
         ;;
     esac
+    ;;
+
+  archive-failed)
+    archive_invalid_submission
     ;;
 
   push)
