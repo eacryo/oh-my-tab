@@ -368,33 +368,27 @@ unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject
             NSSize::new(11.2, 11.2)
         )
     ];
-    let circle_alpha = match (active, hovered) {
-        (true, true) => 0.68,
-        (true, false) => 0.58,
-        (false, true) => 0.62,
-        (false, false) => 0.34,
+    // 跟置顶/删除按钮共用主题文字色:常态次要色,悬停或激活时主文字色。
+    // Match the pin/delete buttons' theme text colors: secondary normally, primary on hover/active.
+    let palette = clipboard_palette();
+    let icon_color = if active || hovered {
+        palette.primary_text
+    } else {
+        palette.secondary_text
     };
-    let circle_color: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: circle_alpha];
+    let circle_color = crate::ffi::hex_to_ns_color(icon_color);
     let _: () = msg_send![circle_color, set];
-    // 设计稿的 1.45px 描边同样按 16 / 20 缩放;激活态仍保留同色描边。
-    // Scale the mockup's 1.45px stroke by 16 / 20; the active state retains this same-color stroke.
-    let _: () = msg_send![circle, setLineWidth: 1.16f64];
+    // 略加粗外圈,在 16pt 图标画布上与旁边的系统字形更协调。
+    // Slightly strengthen the ring so its optical weight better matches the neighboring system glyphs.
+    let _: () = msg_send![circle, setLineWidth: 1.25f64];
     if active {
         let _: () = msg_send![circle, fill];
     }
     let _: () = msg_send![circle, stroke];
-    let glyph_alpha = if active {
-        0.96
-    } else if hovered {
-        0.66
-    } else {
-        0.42
-    };
     let glyph_color: *mut AnyObject = if active {
-        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: glyph_alpha]
+        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: 0.96f64]
     } else {
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: glyph_alpha]
+        crate::ffi::hex_to_ns_color(icon_color)
     };
     let _: () = msg_send![glyph_color, set];
     // 坐标按 SVG 视图翻转后换算:点在上,竖线从中部延伸到底部。
@@ -407,7 +401,7 @@ unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject
     let stem: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
     let _: () = msg_send![stem, moveToPoint: NSPoint::new(8.0, 8.56)];
     let _: () = msg_send![stem, lineToPoint: NSPoint::new(8.0, 4.8)];
-    let _: () = msg_send![stem, setLineWidth: 1.12f64];
+    let _: () = msg_send![stem, setLineWidth: 1.25f64];
     let _: () = msg_send![stem, setLineCapStyle: 1isize]; // NSLineCapStyleRound
     let _: () = msg_send![stem, stroke];
     let _: () = msg_send![image, unlockFocus];
