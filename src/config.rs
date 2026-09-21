@@ -1467,23 +1467,19 @@ fn sanitize_config_value(
     }
 }
 
-/// 解析并清洗一个配置文件。布尔值表示修复/迁移后的结果是否应写回磁盘;语法错误刻意
-/// 返回 `false`,以保留原文件供诊断。
+/// 解析并清洗一个配置文件。返回的布尔值表示修复/迁移后的结果是否应写回磁盘;
+/// TOML 语法错误或整体反序列化错误会返回 Err,以保留原文件供诊断。
 /// Parse and sanitize one config file. The boolean says whether the repaired/migrated value
-/// should be persisted back to disk; syntax errors deliberately return `false` to preserve the
-/// original file for diagnosis.
-fn parse_config_content(content: &str) -> (Config, Vec<String>, bool) {
+/// should be persisted back to disk; TOML syntax or whole-document deserialization failures
+/// return Err so the original file remains available for diagnosis.
+fn parse_config_content(content: &str) -> Result<(Config, Vec<String>, bool), Vec<String>> {
     let actual = match content.parse::<toml::Value>() {
         Ok(value) => value,
         Err(error) => {
-            return (
-                Config::default(),
-                vec![tf(
-                    "errors.config_read_failed",
-                    &[("error", &error.to_string())],
-                )],
-                false,
-            );
+            return Err(vec![tf(
+                "errors.config_read_failed",
+                &[("error", &error.to_string())],
+            )]);
         }
     };
     let defaults = toml::to_string(&Config::default())
@@ -1504,7 +1500,7 @@ fn parse_config_content(content: &str) -> (Config, Vec<String>, bool) {
                 "errors.config_read_failed",
                 &[("error", &error.to_string())],
             ));
-            return (Config::default(), errors, false);
+            return Err(errors);
         }
     };
 
@@ -1515,9 +1511,9 @@ fn parse_config_content(content: &str) -> (Config, Vec<String>, bool) {
     if !errors.is_empty() {
         let mut merged = Config::default();
         merged.merge_valid(loaded, &errors);
-        (merged, errors, true)
+        Ok((merged, errors, true))
     } else {
-        (loaded, errors, needs_persist)
+        Ok((loaded, errors, needs_persist))
     }
 }
 
@@ -1658,42 +1654,54 @@ impl Config {
     /// 从指定路径加载(纯逻辑,测试注入临时目录)。默认路径为 `~/.config/oh-my-tab/config.toml`。
     /// Load from a given path (pure logic; tests inject a temp dir).
     fn load_or_default_from(path: &std::path::Path) -> (Self, Vec<String>) {
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                let (loaded, errs, needs_persist) = parse_config_content(&content);
-                if needs_persist {
-                    let _ = loaded.save_to(path);
+        Self::load_or_default_from_result(path, std::fs::read_to_string(path))
+    }
+
+    fn load_or_default_from_result(
+        path: &std::path::Path,
+        read_result: std::io::Result<String>,
+    ) -> (Self, Vec<String>) {
+        match read_result {
+            Ok(content) => match parse_config_content(&content) {
+                Ok((loaded, errs, needs_persist)) => {
+                    if needs_persist {
+                        let _ = loaded.save_to(path);
+                    }
+                    (loaded, errs)
                 }
-                (loaded, errs)
-            }
-            Err(_) => {
-                // File doesn't exist — write defaults
+                Err(errs) => (Config::default(), errs),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // 只有文件确实不存在时才写默认值;其他读取错误必须保留原文件。
+                // Write defaults only when the file is genuinely missing; preserve it on all
+                // other read errors.
                 let defaults = Config::default();
                 let _ = defaults.save_to(path);
                 (defaults, Vec::new())
             }
+            Err(error) => (
+                Config::default(),
+                vec![tf(
+                    "errors.config_read_failed",
+                    &[("error", &error.to_string())],
+                )],
+            ),
         }
     }
 
-    pub fn reload() -> (Self, Vec<String>, bool) {
+    pub fn reload() -> Result<(Self, Vec<String>, bool), Vec<String>> {
         let path = config_path();
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let (loaded, errs, needs_persist) = parse_config_content(&content);
-                (loaded, errs, needs_persist)
-            }
-            Err(e) => {
-                let defaults = Config::default();
-                (
-                    defaults,
-                    vec![tf(
-                        "errors.config_read_failed",
-                        &[("error", &e.to_string())],
-                    )],
-                    false,
-                )
-            }
-        }
+        Self::reload_from(&path)
+    }
+
+    fn reload_from(path: &std::path::Path) -> Result<(Self, Vec<String>, bool), Vec<String>> {
+        let content = std::fs::read_to_string(path).map_err(|error| {
+            vec![tf(
+                "errors.config_read_failed",
+                &[("error", &error.to_string())],
+            )]
+        })?;
+        parse_config_content(&content)
     }
 }
 
@@ -1907,7 +1915,10 @@ pub fn flush_config_sync() -> Result<(), String> {
 
 /// Reload config from disk and apply. Returns validation errors (empty = success).
 pub fn reload_config() -> Vec<String> {
-    let (new_cfg, errs, needs_persist) = Config::reload();
+    let (new_cfg, errs, needs_persist) = match Config::reload() {
+        Ok(result) => result,
+        Err(errs) => return errs,
+    };
     let old_cfg = CONFIG.read().unwrap().clone();
     if let Ok(mut cfg) = CONFIG.write() {
         *cfg = new_cfg.clone();
@@ -2426,6 +2437,41 @@ reverse_scroll = false
         assert!(errs.is_empty());
         assert_eq!(cfg.appearance.theme, "auto");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn load_read_error_keeps_existing_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "custom_setting = 'keep me'";
+        std::fs::write(&path, original).unwrap();
+
+        let (cfg, errs) = Config::load_or_default_from_result(
+            &path,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied",
+            )),
+        );
+
+        assert_eq!(cfg.appearance.theme, Config::default().appearance.theme);
+        assert!(!errs.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn reload_fatal_errors_leave_the_file_untouched_and_missing_files_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_path = dir.path().join("invalid.toml");
+        let original = "[appearance\ntheme = 'dark'";
+        std::fs::write(&invalid_path, original).unwrap();
+
+        assert!(Config::reload_from(&invalid_path).is_err());
+        assert_eq!(std::fs::read_to_string(&invalid_path).unwrap(), original);
+
+        let missing_path = dir.path().join("missing.toml");
+        assert!(Config::reload_from(&missing_path).is_err());
+        assert!(!missing_path.exists());
     }
 
     #[test]
