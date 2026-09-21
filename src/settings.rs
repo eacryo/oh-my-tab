@@ -523,9 +523,8 @@ pub(crate) use dispatch::{
     refresh_service_controls_from_config, refresh_switcher_controls_from_config,
 };
 pub(crate) use window::{
-    close_settings_from_switcher, invalidate_settings_window,
-    refresh_permission_status_if_about_visible, refresh_system_appearance,
-    settings_layout_smoke_runner,
+    close_settings_from_switcher, invalidate_settings_window, refresh_permission_ui_if_visible,
+    refresh_system_appearance, settings_layout_smoke_runner,
 };
 
 // ========== 控件构造 helper / control-builder helpers ==========

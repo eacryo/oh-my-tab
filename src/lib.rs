@@ -410,7 +410,7 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
 }
 
 fn on_app_activated_inner(notification: *mut c_void) {
-    settings::refresh_permission_status_if_about_visible();
+    settings::refresh_permission_ui_if_visible();
     unsafe {
         let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
         if user_info.is_null() {

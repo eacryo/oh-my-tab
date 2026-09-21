@@ -400,7 +400,7 @@ pub(super) struct SettingsPageHeader;
 impl SettingsPageHeader {
     /// HTML `.content`'s top padding — the title block's distance from the pane top.
     /// HTML `.content` 的顶部内边距,即标题块与面板顶部的距离。
-    const TOP_PADDING: f64 = 42.0;
+    pub(super) const TOP_PADDING: f64 = 42.0;
 
     /// Empty space between the title's frame and the first section heading's frame below it.
     /// 页面大标题框与其下方首个小标题框之间的空白。

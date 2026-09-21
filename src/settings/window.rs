@@ -3,6 +3,30 @@
 
 use super::*;
 
+/// Show the permission banner in its own top strip and reserve that strip above General.
+/// 将权限提示显示在独立的顶部区域，并从通用页滚动视口中扣除对应高度。
+unsafe fn set_permission_banner_visible(ui: &SettingsUi, visible: bool) {
+    if ui.permission_warning_view.is_null() || ui.general_view.is_null() {
+        return;
+    }
+
+    let hidden: bool = msg_send![ui.permission_warning_view, isHidden];
+    if hidden == !visible {
+        return;
+    }
+
+    let banner_frame: NSRect = msg_send![ui.permission_warning_view, frame];
+    let mut general_frame: NSRect = msg_send![ui.general_view, frame];
+    let height_delta = if visible {
+        -banner_frame.size.height
+    } else {
+        banner_frame.size.height
+    };
+    general_frame.size.height = (general_frame.size.height + height_delta).max(1.0);
+    let _: () = msg_send![ui.general_view, setFrame: general_frame];
+    let _: () = msg_send![ui.permission_warning_view, setHidden: !visible];
+}
+
 /// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换七个内容视图显隐、选中项粗体。
 /// Switch the active settings page: align the highlight to the selected button, toggle the
 /// seven content views' visibility, and bold the selected item's label.
@@ -72,6 +96,16 @@ pub(super) fn select_sidebar(idx: usize) {
             for (i, &v) in views.iter().enumerate() {
                 let _: () = msg_send![v, setHidden: i != idx];
             }
+            let show_permission_banner = if idx == 0 {
+                let is_permission_migration =
+                    crate::update_notice::needs_permission_migration_copy();
+                let has_required_permissions = has_accessibility_permission()
+                    && (!is_permission_migration || crate::thumbnail::capture_allowed());
+                !has_required_permissions
+            } else {
+                false
+            };
+            set_permission_banner_visible(ui, show_permission_banner);
             if idx == 6 {
                 refresh_permission_statuses(ui);
             }
@@ -131,10 +165,11 @@ unsafe fn set_permission_status(label: *mut AnyObject, granted: bool) {
     set_field(label, t(key));
 }
 
-/// Refresh permission statuses when the visible About page regains the app's attention.
-/// 应用重新激活时刷新当前可见的关于页权限状态。
-pub(crate) fn refresh_permission_status_if_about_visible() {
-    if SIDEBAR_SELECTED.load(Ordering::SeqCst) != 6 {
+/// Refresh the visible permission UI when the app regains focus.
+/// 应用重新获得焦点时刷新当前可见页面的授权状态。
+pub(crate) fn refresh_permission_ui_if_visible() {
+    let selected_page = SIDEBAR_SELECTED.load(Ordering::SeqCst);
+    if selected_page != 0 && selected_page != 6 {
         return;
     }
     with_settings_ui(|ui| {
@@ -142,7 +177,15 @@ pub(crate) fn refresh_permission_status_if_about_visible() {
             unsafe {
                 let visible: bool = msg_send![ui.window, isVisible];
                 if visible {
-                    refresh_permission_statuses(ui);
+                    if selected_page == 0 {
+                        let is_permission_migration =
+                            crate::update_notice::needs_permission_migration_copy();
+                        let has_required_permissions = has_accessibility_permission()
+                            && (!is_permission_migration || crate::thumbnail::capture_allowed());
+                        set_permission_banner_visible(ui, !has_required_permissions);
+                    } else {
+                        refresh_permission_statuses(ui);
+                    }
                 }
             }
         }
@@ -383,8 +426,9 @@ fn show_settings_inner(
                     crate::update_notice::needs_permission_migration_copy();
                 let has_required_permissions = has_accessibility_permission()
                     && (!is_permission_migration || crate::thumbnail::capture_allowed());
-                let _: () =
-                    msg_send![u.permission_warning_view, setHidden: has_required_permissions];
+                let show_permission_banner =
+                    SIDEBAR_SELECTED.load(Ordering::SeqCst) == 0 && !has_required_permissions;
+                set_permission_banner_visible(u, show_permission_banner);
             }
         });
     }
@@ -1428,7 +1472,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         ui.about_view = about_root;
 
         // ===== 通用页内容 general page content =====
-        let general_top = general_doc_h - 24.0;
         // 页首整块(大标题 + 首个小标题)由组件给出:调用返回的就是首个小标题的游标。
         // The whole page-top block (title + first section heading) comes from the component; the
         // returned cursor is that heading's own cursor.
@@ -1440,26 +1483,28 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             content_w - 12.0,
         );
 
-        // --- 权限警告条(通用页顶部覆盖;迁移时检查辅助功能和屏幕录制) ---
-        // --- Permission banner (floats over General; migration copy checks Accessibility and Screen Recording) ---
-        // banner 不占用布局空间(通用页内容紧贴顶部),而是在内容构建完后作为最后一个
-        // subview 添加,覆盖在顶部。frame 固定定位,不随 y 布局游标变化。
-        // The banner does not reserve layout space (General content starts at the top); it is
-        // added as the last subview after the content, floating over the top. Its frame is fixed
-        // and independent of the y layout cursor.
+        // --- 权限警告条(通用页顶部独立区域;迁移时检查辅助功能和屏幕录制) ---
+        // --- Permission banner (dedicated top strip; migration copy checks Accessibility and Screen Recording) ---
+        // banner 与滚动页分开放置;显示时预留提示条和下方间距,不覆盖标题或卡片。
+        // The banner is a sibling of the scroll views; its strip and bottom gap are reserved so
+        // it cannot cover the title or cards.
         let is_permission_migration = crate::update_notice::needs_permission_migration_copy();
-        let banner_h = if is_permission_migration { 60.0 } else { 48.0 };
+        let banner_content_h = if is_permission_migration { 60.0 } else { 48.0 };
+        let banner_gap = 12.0;
+        let banner_h = banner_content_h + banner_gap;
         let banner: *mut AnyObject = msg_send![class!(NSView), alloc];
         let banner: *mut AnyObject = msg_send![
             banner,
             initWithFrame: NSRect::new(
-                NSPoint::new(0.0, general_top - banner_h),
+                NSPoint::new(
+                    page_x,
+                    page_viewport_h - SettingsPageHeader::TOP_PADDING - banner_h,
+                ),
                 NSSize::new(content_w, banner_h)
             )
         ];
-        // 自适应:宽度拉伸、顶部锚定(WidthSizable|MinYMargin = 10)。
-        // 注意:这里不 addSubview;在通用页内容构建完后统一添加(保证在最上层)。
-        // Note: not added here; added after the General content build so it stays on top.
+        // 自适应:宽度拉伸并锚定在内容区顶部(WidthSizable|MinYMargin = 10)。
+        // Stretch horizontally and stay pinned to the content top (WidthSizable|MinYMargin = 10).
         let _: () = msg_send![banner, setAutoresizingMask: 10u64];
         ui.permission_warning_view = banner;
 
@@ -1468,8 +1513,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let warning_label: *mut AnyObject = msg_send![
             warning_label,
             initWithFrame: NSRect::new(
-                NSPoint::new(12.0, 6.0),
-                NSSize::new(content_w - 160.0, banner_h - 12.0)
+                NSPoint::new(12.0, banner_gap + 6.0),
+                NSSize::new(content_w - 160.0, banner_content_h - 12.0)
             )
         ];
         let warning_key = if is_permission_migration {
@@ -1495,7 +1540,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // 「打开隐私与安全性」按钮 / "Open Privacy & Security" button
         let open_btn = SettingsButton::action(
             NSRect::new(
-                NSPoint::new(content_w - 150.0, (banner_h - 28.0) / 2.0),
+                NSPoint::new(
+                    content_w - 150.0,
+                    banner_gap + (banner_content_h - 28.0) / 2.0,
+                ),
                 NSSize::new(140.0, 28.0),
             ),
             &t("settings.btn_open_privacy"),
@@ -1506,10 +1554,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let _: () = msg_send![banner, addSubview: open_btn];
         release_obj(open_btn);
 
-        // 默认按当前权限显隐(有权限就隐藏)/ initial visibility: hidden when permission is already granted
-        let has_required_permissions = has_accessibility_permission()
-            && (!is_permission_migration || crate::thumbnail::capture_allowed());
-        let _: () = msg_send![banner, setHidden: has_required_permissions];
+        // 先隐藏;选页时再根据权限状态显示并同步调整 General 视口。
+        // Start hidden; page selection applies the permission state and resizes General's viewport.
+        let _: () = msg_send![banner, setHidden: true];
 
         // --- 外观 Appearance ---
         let appearance_header_y = y;
@@ -3477,10 +3524,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             compact_frame.size.height
         };
 
-        // banner 最后添加:作为 general_view 的最后一个 subview,保证在内容之上(缺权限时覆盖顶部)。
-        // Added last: as general_view's final subview so it floats above the content (when
-        // permission is missing). It occupies no layout space, so no top gap when hidden.
-        let _: () = msg_send![general_view, addSubview: banner];
+        // banner 作为 content 的顶层 sibling;显示时占用滚动区上方的独立空间。
+        // Add the banner as a top-level sibling in content; when visible it occupies a dedicated
+        // strip above the scroll area.
+        let _: () = msg_send![content, addSubview: banner];
         release_obj(banner);
 
         // Let AppKit finish its first layout pass before validating the actual view tree. Do not
