@@ -428,6 +428,14 @@ pub(crate) extern "C" fn handle_open_privacy(_self: *mut c_void, _cmd: Sel, _sen
     crate::open_privacy_accessibility();
 }
 
+pub(crate) extern "C" fn handle_open_screen_recording_privacy(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    crate::open_privacy_screen_recording();
+}
+
 pub(crate) extern "C" fn handle_toggle_shortcut(
     _self: *mut c_void,
     _cmd: Sel,

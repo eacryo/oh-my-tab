@@ -290,6 +290,8 @@ pub(super) struct SettingsUi {
     update_card_compact_h: f64,     // 收起时卡片高度 / collapsed card height
     update_card_expanded: bool,     // 是否已为更新流程展开 / whether expanded for a flow
     update_host_origin_y: f64, // 宿主收起时的原点 y(顶边 - 展开高) / host origin y when collapsed
+    accessibility_permission_status: *mut AnyObject,
+    screen_recording_permission_status: *mut AnyObject,
 }
 
 /// 一行按键映射(只读显示):
@@ -521,7 +523,8 @@ pub(crate) use dispatch::{
     refresh_service_controls_from_config, refresh_switcher_controls_from_config,
 };
 pub(crate) use window::{
-    close_settings_from_switcher, invalidate_settings_window, refresh_system_appearance,
+    close_settings_from_switcher, invalidate_settings_window,
+    refresh_permission_status_if_about_visible, refresh_system_appearance,
     settings_layout_smoke_runner,
 };
 

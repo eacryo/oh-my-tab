@@ -72,6 +72,9 @@ pub(super) fn select_sidebar(idx: usize) {
             for (i, &v) in views.iter().enumerate() {
                 let _: () = msg_send![v, setHidden: i != idx];
             }
+            if idx == 6 {
+                refresh_permission_statuses(ui);
+            }
             // 刚显示的页(如从隐藏切出来)需先排版,clip bounds 才会正确,随后滚到顶部。
             // A just-shown page needs a layout pass first so the clip bounds are correct;
             // then scroll it to the top. layoutIfNeeded lives on the window, not the scroll view.
@@ -93,6 +96,57 @@ pub(super) fn select_sidebar(idx: usize) {
             page.validate(page_names[idx]);
         });
     }
+}
+
+/// Refresh the About page's live TCC status labels without reloading user settings.
+/// 刷新关于页的实时 TCC 授权状态，不重载用户设置。
+unsafe fn refresh_permission_statuses(ui: &SettingsUi) {
+    if !ui.accessibility_permission_status.is_null() {
+        set_permission_status(
+            ui.accessibility_permission_status,
+            has_accessibility_permission(),
+        );
+    }
+    if !ui.screen_recording_permission_status.is_null() {
+        set_permission_status(
+            ui.screen_recording_permission_status,
+            crate::thumbnail::capture_allowed(),
+        );
+    }
+}
+
+unsafe fn set_permission_status(label: *mut AnyObject, granted: bool) {
+    let (key, color): (&str, *mut AnyObject) = if granted {
+        (
+            "settings.permission_status_granted",
+            msg_send![class!(NSColor), systemGreenColor],
+        )
+    } else {
+        (
+            "settings.permission_status_missing",
+            msg_send![class!(NSColor), systemOrangeColor],
+        )
+    };
+    let _: () = msg_send![label, setTextColor: color];
+    set_field(label, t(key));
+}
+
+/// Refresh permission statuses when the visible About page regains the app's attention.
+/// 应用重新激活时刷新当前可见的关于页权限状态。
+pub(crate) fn refresh_permission_status_if_about_visible() {
+    if SIDEBAR_SELECTED.load(Ordering::SeqCst) != 6 {
+        return;
+    }
+    with_settings_ui(|ui| {
+        if let Some(ui) = ui.as_ref() {
+            unsafe {
+                let visible: bool = msg_send![ui.window, isVisible];
+                if visible {
+                    refresh_permission_statuses(ui);
+                }
+            }
+        }
+    });
 }
 
 /// 红绿灯偏移常量:恢复原来的右下偏移位置。
@@ -989,6 +1043,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             quick_actions_view: std::ptr::null_mut(),
             about_view: std::ptr::null_mut(),
             about_subtitle: std::ptr::null_mut(),
+            accessibility_permission_status: std::ptr::null_mut(),
+            screen_recording_permission_status: std::ptr::null_mut(),
             theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             glass_tint: std::ptr::null_mut(),
@@ -3210,10 +3266,100 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             &t("settings.section_app"),
         );
 
-        ay = version_y - 42.0;
-        let updates_label_y = ay - 11.0;
-        ay -= 27.0;
-        let update_row_y = ay - 44.0;
+        let permissions_label_y = version_y - 53.0;
+        let permissions_row_top_y = permissions_label_y - 27.0 - 44.0;
+        let permission_status_w = 80.0;
+        let permission_action_gap = 8.0;
+        let permission_button_w = ctrl_w - permission_status_w - permission_action_gap;
+        let permission_button_h = 28.0;
+        let accessibility_status = SettingsControl::value_label(
+            ctrl_x,
+            permissions_row_top_y,
+            permission_status_w,
+            row_h,
+            &t("settings.permission_status_missing"),
+        );
+        let _: () = msg_send![accessibility_status, setAlignment: 1isize];
+        ui.accessibility_permission_status = SettingsRow::plain(
+            about_view,
+            label_x,
+            permissions_row_top_y,
+            label_w,
+            described_row_h,
+            &t("settings.permission_accessibility_label"),
+            accessibility_status,
+        );
+        let accessibility_button = SettingsButton::action(
+            NSRect::new(
+                NSPoint::new(
+                    ctrl_x + permission_status_w + permission_action_gap,
+                    permissions_row_top_y + (described_row_h - permission_button_h) / 2.0,
+                ),
+                NSSize::new(permission_button_w, permission_button_h),
+            ),
+            &t("settings.btn_open_permission_settings"),
+            target,
+            sel!(handleOpenPrivacy:),
+            SettingsButtonRole::Action,
+        );
+        let _: () = msg_send![about_view, addSubview: accessibility_button];
+        release_obj(accessibility_button);
+
+        let screen_recording_row_y = permissions_row_top_y - about_row_step;
+        SettingsRow::separator_above_row(
+            about_view,
+            screen_recording_row_y,
+            described_row_h,
+            content_w,
+        );
+        let screen_recording_status = SettingsControl::value_label(
+            ctrl_x,
+            screen_recording_row_y,
+            permission_status_w,
+            row_h,
+            &t("settings.permission_status_missing"),
+        );
+        let _: () = msg_send![screen_recording_status, setAlignment: 1isize];
+        ui.screen_recording_permission_status = SettingsRow::plain(
+            about_view,
+            label_x,
+            screen_recording_row_y,
+            label_w,
+            described_row_h,
+            &t("settings.permission_screen_recording_label"),
+            screen_recording_status,
+        );
+        let screen_recording_button = SettingsButton::action(
+            NSRect::new(
+                NSPoint::new(
+                    ctrl_x + permission_status_w + permission_action_gap,
+                    screen_recording_row_y + (described_row_h - permission_button_h) / 2.0,
+                ),
+                NSSize::new(permission_button_w, permission_button_h),
+            ),
+            &t("settings.btn_open_permission_settings"),
+            target,
+            sel!(handleOpenScreenRecordingPrivacy:),
+            SettingsButtonRole::Action,
+        );
+        let _: () = msg_send![about_view, addSubview: screen_recording_button];
+        release_obj(screen_recording_button);
+
+        let permissions_card_bottom = layout.card_bottom(screen_recording_row_y);
+        SettingsSection::attach(
+            about_view,
+            NSRect::new(
+                NSPoint::new(6.0, permissions_card_bottom),
+                NSSize::new(
+                    content_w - 12.0,
+                    layout.card_top(permissions_label_y) - permissions_card_bottom,
+                ),
+            ),
+            &t("settings.section_permissions"),
+        );
+
+        let updates_label_y = permissions_card_bottom - 42.0;
+        let update_row_y = updates_label_y - 27.0 - 44.0;
         ui.update_auto_check = SettingsRow::described(
             about_view,
             label_x,

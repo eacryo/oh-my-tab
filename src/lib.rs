@@ -410,6 +410,7 @@ extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut
 }
 
 fn on_app_activated_inner(notification: *mut c_void) {
+    settings::refresh_permission_status_if_about_visible();
     unsafe {
         let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
         if user_info.is_null() {
@@ -1719,6 +1720,12 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handleOpenScreenRecordingPrivacy:),
+                handle_open_screen_recording_privacy as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleCheckForUpdates:),
                 handle_check_for_updates as *mut c_void,
                 types.as_ptr(),
@@ -2026,6 +2033,22 @@ pub(crate) fn open_privacy_accessibility() {
     unsafe {
         let url_str = make_nsstring(
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        );
+        let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_str];
+        CFRelease(url_str as *const c_void);
+        if !url.is_null() {
+            let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let _: bool = msg_send![ws, openURL: url];
+        }
+    }
+}
+
+/// Open System Settings -> Privacy & Security -> Screen & System Audio Recording.
+/// 打开“系统设置 -> 隐私与安全性 -> 屏幕与系统音频录制”。
+pub(crate) fn open_privacy_screen_recording() {
+    unsafe {
+        let url_str = make_nsstring(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
         );
         let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_str];
         CFRelease(url_str as *const c_void);
