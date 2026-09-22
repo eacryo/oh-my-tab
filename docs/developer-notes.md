@@ -1,10 +1,10 @@
 # 开发环境说明
 
-只影响源码开发（`cargo run` / 调试器）的问题，不影响 Homebrew 安装或打包 `.app` 的用户。README 的开发环境说明指向本文。
+只影响源码开发和调试器启动的裸二进制的问题，不影响 Homebrew 安装或打包 `.app` 的用户。开发期间的常规启动方式是 `scripts/dev-restart.sh`；裸 `cargo run` 仅用于底层诊断。README 的开发环境说明指向本文。
 
 ## 开发模式下图标可能不正确
 
-用 `cargo run` 跑裸二进制时，浮层偶尔会把 oh-my-tab 自己的卡片显示成首字母占位块而不是应用图标，而且可能一直持续到手动清空图标缓存。图标缓存按 bundle id 索引，以可执行文件的 **mtime** 作为失效指纹；开发模式下每次构建都会重新链接二进制、改变 mtime，导致运行中实例的缓存条目失效。打包后的 `.app` 不受影响（安装后二进制 mtime 稳定）。开发中遇到此问题，可从菜单 *Clear Icon Cache* 清空，或删除 `~/Library/Caches/oh-my-tab-icons/`。
+用 `cargo run` 跑裸二进制进行诊断时，浮层偶尔会把 oh-my-tab 自己的卡片显示成首字母占位块而不是应用图标，而且可能一直持续到手动清空图标缓存。图标缓存按 bundle id 索引，以可执行文件的 **mtime** 作为失效指纹；开发模式下每次构建都会重新链接二进制、改变 mtime，导致运行中实例的缓存条目失效。打包后的 `.app` 不受影响（安装后二进制 mtime 稳定）。正常开发运行请使用 `scripts/dev-restart.sh`；如果诊断用裸二进制出现此问题，可从菜单 *Clear Icon Cache* 清空，或删除 `~/Library/Caches/oh-my-tab-icons/`。
 
 ## 调试器启动时鼠标控制可能失效
 

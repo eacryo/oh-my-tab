@@ -4,12 +4,14 @@ This document covers maintainer-only release and packaging details: the Homebrew
 
 ## Homebrew cask release
 
-`scripts/release.sh` is the complete release pipeline. It runs `bundle.sh` to build the `.app`, `.dmg`, Sparkle `.zip`, and signatures, then generates `dist/oh-my-tab.rb`, a Homebrew cask containing the DMG `sha256`, the version read from `Cargo.toml`, and a `zap trash:` block that removes the icon cache, logs, and application data when the cask is uninstalled. Nothing is uploaded by default; R2 is used only when `--push` is explicitly supplied.
+`scripts/release.sh` is the production release pipeline. Without an action flag it builds local artifacts and generates `dist/oh-my-tab.rb`, a Homebrew cask containing the DMG `sha256`, the version read from `Cargo.toml`, and a `zap trash:` block that removes the icon cache, logs, and application data when the cask is uninstalled. Production publishing is a separate notarization flow; R2 is used only after an accepted Apple notarization is available and `--push` is explicitly supplied.
 
 ```sh
-sh scripts/release.sh                    # build locally without R2 access
-sh scripts/release.sh --push             # build, then upload ZIP, DMG, and appcast.xml
-sh scripts/release.sh --push --dry-run   # inspect and print the upload plan
+sh scripts/release.sh                    # build local artifacts and the Homebrew cask
+sh scripts/release.sh --notarize         # build, sign, and submit to Apple
+sh scripts/release.sh --check            # check the pending notarization status
+sh scripts/release.sh --push             # staple the accepted app, then upload artifacts
+sh scripts/release.sh --push --dry-run   # prepare artifacts and print the upload plan
 ```
 
 The development channel uses a separate bundle ID, feed, R2 prefix, and archive prefix, so it cannot mix with production updates:
@@ -22,9 +24,9 @@ sh scripts/release-dev.sh --push --dry-run
 
 `release-dev.sh` still uses an optimized Release build, but enables the `dev-long-text` Cargo feature. The development package therefore includes a `[TEST] English x3` language option for checking long dropdown values, settings rows, and card layouts. The production `release.sh` and direct `bundle.sh` paths do not enable this feature.
 
-With `--push`, the scripts always rebuild the `.app`, ZIP, and DMG from the current source tree before invoking the pinned `vendor/Sparkle/bin/generate_appcast` tool. If a local appcast exists, it is used first; on a clean checkout, the public feed is read to preserve historical entries. If the feed does not exist, a new one is created. The enclosure URL is generated from the final ZIP filename in the temporary directory so it matches the object subsequently uploaded by the R2 publisher.
+For production, `--notarize` builds and stages the signed `.app`, and `--check` queries Apple's notarization service. Only after the status is `Accepted` does `--push` staple the ticket, create the final ZIP and DMG, generate an appcast with the pinned `vendor/Sparkle/bin/generate_appcast` tool, and invoke the R2 publisher. If a local appcast exists, it is used first; on a clean checkout, the public feed is read to preserve historical entries. If the feed does not exist, a new one is created. The enclosure URL is generated from the final ZIP filename in the temporary directory so it matches the object subsequently uploaded by the R2 publisher.
 
-By default, appcast signing reads the Ed25519 private key named `ed25519` from the macOS Keychain. `SPARKLE_ED_KEY_FILE` can point to an external private-key file; never commit that file. `--push --dry-run` only prints the upload plan and does not generate or upload files.
+By default, appcast signing reads the Ed25519 private key named `ed25519` from the macOS Keychain. `SPARKLE_ED_KEY_FILE` can point to an external private-key file; never commit that file. `--push --dry-run` still prepares the ZIP, DMG, appcast, and cask locally, but passes `--dry-run` to the R2 publisher so nothing is uploaded and the pending notarization state is retained.
 
 The cask hard-codes `depends_on macos: :ventura` and `depends_on arch: :arm64`, so it supports macOS 13+ on Apple Silicon only. Its URL points to `https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg`, so the DMG must be uploaded to a GitHub release tagged `v<version>`, matching the version in `Cargo.toml`.
 
@@ -49,7 +51,7 @@ At runtime, the updater loads `Contents/Frameworks/Sparkle.framework`. The frame
 
 The publisher uploads `appcast.xml` and update archives to R2. Appcasts are signed with Sparkle's Ed25519 private key; packaging only injects the corresponding public key through `SPARKLE_PUBLIC_ED_KEY`. Sparkle compares `CFBundleVersion` (the build number); scripts use a UTC timestamp by default, while reproducible tests can set `SPARKLE_BUILD_VERSION`. `CFBundleShortVersionString` remains the user-visible version. Never commit the private key, place it in the app bundle, or upload it to R2.
 
-Release notes must be placed in the version-specific directories: production builds use `release_doc/<version>.md`, and development builds use `release_doc_dev/<version>.md`. For version `0.2.0`, both `release_doc/0.2.0.md` and `release_doc_dev/0.2.0.md` must exist; the corresponding build fails before compilation if either file is missing. The release scripts embed the complete Markdown in the new appcast item.
+Release notes must be placed in the version-specific directories: production builds use `release_doc/<version>.md`, and development builds use `release_doc_dev/<version>.md`. The corresponding version-specific file must exist before that build starts; otherwise the build fails before compilation. The release scripts embed the complete Markdown in the new appcast item.
 
 A single Markdown file may contain multiple language blocks. Start blocks with `<!-- locale: en -->` or `<!-- locale: zh-Hans -->` and close them with `<!-- /locale -->`. The app reads the single Sparkle `<description>` and selects the block matching the current UI locale; if no translation is available, it falls back to English and then to the first block in the file. Older single-language Markdown files remain compatible.
 
