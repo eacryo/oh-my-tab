@@ -1183,6 +1183,352 @@ pub(super) unsafe fn ensure_picker_window() {
     *PICKER_WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
 }
 
+/// 建行期间累计的计时/计数,供慢路径日志使用(与原有统计口径一致)。
+/// Per-row build counters accumulated for the slow-path log (same accounting as before).
+#[derive(Default, Clone, Copy)]
+struct RowCreateStats {
+    image_rows: usize,
+    code_rows: usize,
+    image_ms: u128,
+    content_attributed_ms: u128,
+    meta_ms: u128,
+}
+
+/// 单行的创建参数(把众多行级参数打包,避免 `create_row_views` 参数过多)。
+/// The per-row creation parameters (grouped so `create_row_views` stays readable).
+struct RowSpec<'a> {
+    entry: &'a ClipEntry,
+    display_index: usize,
+    y: f64,
+    row_h: f64,
+    has_header: bool,
+    selected: bool,
+    hovered: bool,
+    show_source: bool,
+    detail_open: bool,
+    sel_idx: usize,
+}
+
+/// 创建单行(可选分组头 + 底块 + 内容/meta 按钮 + 3 个操作按钮),挂到 container 并返回
+/// 其悬停相关视图。自 `rebuild_rows` 抽出:滚动时的增量物化(`sync_visible_rows`)复用它,
+/// 只新建新进入视口的行,不再整组拆建。
+///
+/// Create one row (optional group header + tile + content/meta buttons + 3 action buttons),
+/// attach it to the container, and return its hover-related views. Extracted from
+/// `rebuild_rows` so scroll-time incremental materialization (`sync_visible_rows`) can reuse
+/// it and create only the rows newly entering the viewport instead of tearing down and
+/// rebuilding the whole visible set.
+unsafe fn create_row_views(
+    container: *mut AnyObject,
+    spec: RowSpec<'_>,
+    stats: &mut RowCreateStats,
+) -> RowHoverViews {
+    let RowSpec {
+        entry,
+        display_index,
+        y,
+        row_h,
+        has_header,
+        selected,
+        hovered,
+        show_source,
+        detail_open,
+        sel_idx,
+    } = spec;
+    let i = display_index;
+    let palette = clipboard_palette();
+    let row_w = PICKER_W - PAD_X * 2.0;
+    let hdr_h = if has_header { GROUP_H } else { 0.0 };
+    let content_y = y + hdr_h;
+
+    // 分组头:一行 11px medium 小字(新设计稿 .group-title,27px 高,垂直居中,
+    // 左内边距 13)。/ The group header: 11px medium text, 27px tall, centered.
+    let mut row_group_label = None;
+    if has_header {
+        let g_label = make_nsstring(&group_label(day_group(entry.copied_at)));
+        let g: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let g: *mut AnyObject = msg_send![
+            g,
+            initWithFrame: NSRect::new(
+                NSPoint::new(PAD_X + ROW_PAD_L, y + GROUP_LABEL_PAD),
+                NSSize::new(row_w - PAD_X, GROUP_H - GROUP_LABEL_PAD)
+            )
+        ];
+        let _: () = msg_send![g, setStringValue: g_label];
+        CFRelease(g_label as *const c_void);
+        let _: () = msg_send![g, setBezeled: false];
+        let _: () = msg_send![g, setDrawsBackground: false];
+        let _: () = msg_send![g, setEditable: false];
+        let _: () = msg_send![g, setSelectable: false];
+        let g_font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: 12.0f64, weight: 0.23f64]; // Medium
+        let _: () = msg_send![g, setFont: g_font];
+        let g_color = crate::ffi::hex_to_ns_color(palette.muted_text);
+        let _: () = msg_send![g, setTextColor: g_color];
+        let _: () = msg_send![container, addSubview: g];
+        release_obj(g);
+        row_group_label = Some(ObjPtr::new(g));
+    }
+
+    // 行底(两种不同样式):悬停(未选中)= 0.032 黑(**没有**左条);选中 = 0.050 黑 +
+    // 2px 左指示条。按新设计稿 .item:hover vs .item.selected。
+    // The row backdrop (two distinct styles): hovered (not selected) = 0.032 black
+    // with NO bar; selected = 0.050 black + a 2px left bar. The new mockup's
+    // .item:hover vs .item.selected.
+    let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let tile: *mut AnyObject = msg_send![
+        tile,
+        initWithFrame: NSRect::new(NSPoint::new(PAD_X, content_y), NSSize::new(row_w, row_h))
+    ];
+    let _: () = msg_send![tile, setWantsLayer: true];
+    let tile_layer: *mut AnyObject = msg_send![tile, layer];
+    let bg_hex = if selected {
+        palette.selection_bg
+    } else if hovered {
+        palette.hover_bg
+    } else {
+        0x00000000
+    };
+    // layer_set_background 走 raw objc_msgSend:objc2 的 msg_send! 无法编码
+    // CGColor 参数/返回(参数编码 '^{CGColor=}' 与 *mut c_void 的 '^v' 不匹配)。
+    // layer_set_background goes through raw objc_msgSend: objc2's msg_send! can't encode
+    // CGColor args/returns ('^{CGColor=}' vs '^v').
+    crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(bg_hex));
+    let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
+    // 每行都预建左侧 2px 指示条并按选中状态隐藏,这样方向键切换只需切换可见性。
+    // Prebuild the 2px selection bar for every row and hide it when unselected, so arrow
+    // navigation only toggles visibility instead of rebuilding rows.
+    let bar: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let bar: *mut AnyObject = msg_send![
+        bar,
+        initWithFrame: NSRect::new(
+            NSPoint::new(SEL_BAR_X, SEL_BAR_INSET_Y),
+            NSSize::new(SEL_BAR_W, row_h - SEL_BAR_INSET_Y * 2.0)
+        )
+    ];
+    let _: () = msg_send![bar, setWantsLayer: true];
+    let bar_layer: *mut AnyObject = msg_send![bar, layer];
+    crate::ffi::layer_set_background(bar_layer, crate::ffi::hex_to_cg_color(palette.accent));
+    let _: () = msg_send![bar_layer, setCornerRadius: SEL_BAR_W / 2.0];
+    let _: () = msg_send![bar, setHidden: !selected];
+    let _: () = msg_send![tile, addSubview: bar];
+    release_obj(bar);
+    let _: () = msg_send![container, addSubview: tile];
+    release_obj(tile);
+
+    // 内容按钮:占行的上部(61pt),整块可点击(粘贴)+ 悬停;图片行左侧是 72×44
+    // 缩略图画布 + 文件名;文本行是 ≤2 行、按类型着色的内容。无边框、无背景。
+    // The content button: the row's upper zone (61pt), clickable (paste) + hover;
+    // image rows get a 72x44 thumbnail canvas + the filename; text rows show <=2
+    // styled lines. Borderless, backgroundless.
+    let content_x = PAD_X + ROW_PAD_L;
+    let content_w = row_w - ROW_PAD_L - ROW_PAD_R;
+    let content_h = row_h - META_FOOTER_H; // 底部留给 meta 栏 / the meta bar takes the bottom.
+    let content_btn: *mut AnyObject = msg_send![row_button_class(), alloc];
+    let is_image = entry.image.is_some();
+    if is_image {
+        stats.image_rows += 1;
+    }
+    let content_btn: *mut AnyObject = msg_send![
+        content_btn,
+        initWithFrame: NSRect::new(
+            NSPoint::new(content_x, content_y + ROW_PAD_TOP),
+            NSSize::new(content_w, content_h - ROW_PAD_TOP - ROW_PAD_BOT)
+        )
+    ];
+    let _: () = msg_send![content_btn, setBordered: false];
+    let _: () = msg_send![content_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
+    let cell: *mut AnyObject = msg_send![content_btn, cell];
+    let _: () = msg_send![cell, setUsesSingleLineMode: false];
+    let _: () = msg_send![cell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+    if msg_send![cell, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![cell, setMaximumNumberOfLines: 2isize];
+    }
+    let image_started = Instant::now();
+    let row_img = make_row_image(entry);
+    stats.image_ms += image_started.elapsed().as_millis();
+    if !row_img.is_null() {
+        let _: () = msg_send![content_btn, setImage: row_img];
+        let _: () = msg_send![content_btn, setImagePosition: 2isize]; // NSImageLeft
+        release_obj(row_img);
+    }
+    // Keep the full string and let the native cell wrap/truncate using actual font metrics.
+    // Character-count heuristics break on emoji, combining marks, and long unbroken words.
+    // 保留完整字符串，让原生 cell 按实际字体测量换行/截断；字符数启发式会错误处理
+    // emoji、组合字符和无空格长单词。
+    let content = entry.text.as_str();
+    let kind = if is_image {
+        TextKind::Plain
+    } else {
+        classify_text(&entry.text)
+    };
+    if kind == TextKind::Code {
+        stats.code_rows += 1;
+    }
+    let content_attributed_started = Instant::now();
+    let attr = make_content_attributed(content, kind);
+    stats.content_attributed_ms += content_attributed_started.elapsed().as_millis();
+    let _: () = msg_send![content_btn, setAttributedTitle: attr];
+    release_obj(attr);
+    let _: () = msg_send![content_btn, setTag: i as isize];
+    let _: () = msg_send![content_btn, setTarget: row_target()];
+    let _: () = msg_send![content_btn, setAction: sel!(handleClipboardRowClick:)];
+    add_hover_tracking(content_btn);
+    let _: () = msg_send![container, addSubview: content_btn];
+    release_obj(content_btn);
+
+    // 底部 meta 按钮:17pt 栏,左侧是 [13px 来源图标]·应用名·时间,整块可可点
+    // (点击 = 粘贴)、悬停选中;右侧悬浮着操作按钮。
+    // 位置 = 行底向上留 ROW_PAD_BOT(8pt,对应设计稿 .item 的 padding-bottom 8px)
+    // —— 之前贴行底,meta 栏与删除/详情/收藏按钮离下边框太近。
+    // The bottom meta button: a 17pt bar with [13px source icon] + app · time on the
+    // left; clickable (paste) and hover-tracked; the action buttons float on its right.
+    // Positioned ROW_PAD_BOT (8pt) above the row bottom, matching the mockup's
+    // .item padding-bottom 8px -- it used to sit flush with the bottom edge, leaving
+    // the meta bar and the delete/details/pin buttons too close to the bottom border.
+    let meta_y = content_y + row_h - META_FOOTER_H - ROW_PAD_BOT;
+    let meta_btn: *mut AnyObject = msg_send![row_button_class(), alloc];
+    let meta_w = row_w - ROW_PAD_L - ROW_PAD_R - ACTIONS_W - 4.0;
+    let meta_btn: *mut AnyObject = msg_send![
+        meta_btn,
+        initWithFrame: NSRect::new(
+            NSPoint::new(content_x, meta_y),
+            NSSize::new(meta_w, META_FOOTER_H)
+        )
+    ];
+    let _: () = msg_send![meta_btn, setBordered: false];
+    let _: () = msg_send![meta_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
+    let mcell: *mut AnyObject = msg_send![meta_btn, cell];
+    let _: () = msg_send![mcell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+    let meta_started = Instant::now();
+    let meta_attr = make_meta_footer_attributed(entry, show_source);
+    stats.meta_ms += meta_started.elapsed().as_millis();
+    let _: () = msg_send![meta_btn, setAttributedTitle: meta_attr];
+    release_obj(meta_attr);
+    let _: () = msg_send![meta_btn, setTag: i as isize];
+    let _: () = msg_send![meta_btn, setTarget: row_target()];
+    let _: () = msg_send![meta_btn, setAction: sel!(handleClipboardRowClick:)];
+    add_hover_tracking(meta_btn);
+    let _: () = msg_send![container, addSubview: meta_btn];
+    release_obj(meta_btn);
+
+    // 操作按钮(置顶 ☆/★ · 详情 ⓘ · 删除 ⌫):**置顶条目常显**,非置顶条目仅
+    // 悬停/选中时显现(设计稿 .actions opacity 0→1)。独立于内容/meta 按钮,点击
+    // 不触发粘贴。
+    // Action buttons (pin ☆/★ · details ⓘ · delete ⌫): ALWAYS visible on PINNED
+    // entries; on unpinned entries they appear only when the row is hovered or
+    // selected (the mockup's .actions opacity 0->1). Separate from the content/meta
+    // buttons; they never paste.
+    let act_alpha = if entry.pinned || selected || hovered {
+        1.0
+    } else {
+        0.0
+    };
+    let act_y = meta_y + (META_FOOTER_H - ACTION_H) / 2.0;
+    let x_del = PICKER_W - PAD_X - ROW_PAD_R - ACTION_BTN;
+    let x_details = x_del - ACTION_GAP - ACTION_BTN;
+    let x_pin = x_details - ACTION_GAP - ACTION_BTN;
+    let pin_sym = if entry.pinned { "★" } else { "☆" };
+    let pin_btn = make_action_button(
+        pin_sym,
+        sel!(togglePin:),
+        i as isize,
+        x_pin,
+        act_y,
+        act_alpha,
+    );
+    if !pin_btn.is_null() {
+        let _: () = msg_send![container, addSubview: pin_btn];
+        release_obj(pin_btn);
+    }
+    let details_btn = make_action_button(
+        "ⓘ",
+        sel!(showItemDetails:),
+        i as isize,
+        x_details,
+        act_y,
+        act_alpha,
+    );
+    // 详情已展开且本行被选中时,详情按钮显示激活图标与独立圆角底。
+    // When detail is open for this selected row, show its active icon and own rounded fill.
+    set_detail_action_style(
+        details_btn,
+        detail_action_is_active(detail_open, sel_idx, i),
+        false,
+    );
+    if !details_btn.is_null() {
+        let _: () = msg_send![container, addSubview: details_btn];
+        release_obj(details_btn);
+    }
+    let del_btn = make_action_button("⌫", sel!(deleteEntry:), i as isize, x_del, act_y, act_alpha);
+    if !del_btn.is_null() {
+        let _: () = msg_send![container, addSubview: del_btn];
+        release_obj(del_btn);
+    }
+
+    RowHoverViews {
+        group_label: row_group_label,
+        tile: ObjPtr::new(tile),
+        bar: ObjPtr::new(bar),
+        content: ObjPtr::new(content_btn),
+        meta: ObjPtr::new(meta_btn),
+        pin: ObjPtr::new(pin_btn),
+        details: ObjPtr::new(details_btn),
+        del: ObjPtr::new(del_btn),
+    }
+}
+
+/// 从容器移除一行的全部视图(bar 是 tile 的子视图,随 tile 一起释放)。
+/// Remove one row's views from the container (the bar is a tile subview and goes with it).
+unsafe fn remove_row_views(view: &RowHoverViews) {
+    for v in [
+        view.group_label,
+        Some(view.tile),
+        Some(view.content),
+        Some(view.meta),
+        Some(view.pin),
+        Some(view.details),
+        Some(view.del),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !v.0.is_null() {
+            let _: () = msg_send![v.0, removeFromSuperview];
+        }
+    }
+}
+
+/// 按索引插入已物化的行(ROW_VIEW_INDICES 与 ROW_HOVER_VIEWS 并列且升序)。
+/// 锁顺序与 `row_view_for_display_index` 一致:先 indices,再 views。
+/// Insert a materialized row by index (ROW_VIEW_INDICES and ROW_HOVER_VIEWS stay parallel
+/// and ascending). Lock order matches `row_view_for_display_index`: indices before views.
+fn insert_materialized_row(index: usize, view: RowHoverViews) {
+    let mut indices = ROW_VIEW_INDICES.lock().unwrap();
+    let pos = indices.partition_point(|&i| i < index);
+    if pos < indices.len() && indices[pos] == index {
+        return;
+    }
+    let mut views = ROW_HOVER_VIEWS.lock().unwrap();
+    indices.insert(pos, index);
+    views.insert(pos, view);
+}
+
+/// 移除某个已物化行并释放其视图;不存在时无操作。
+/// Remove a materialized row and release its views; no-op when absent.
+unsafe fn remove_materialized_row(index: usize) {
+    let view = {
+        let mut indices = ROW_VIEW_INDICES.lock().unwrap();
+        let Some(pos) = indices.iter().position(|&i| i == index) else {
+            return;
+        };
+        indices.remove(pos);
+        let mut views = ROW_HOVER_VIEWS.lock().unwrap();
+        views.remove(pos)
+    };
+    remove_row_views(&view);
+}
+
 /// 根据当前历史重建行按钮(选中行高亮 + 圆角背景块)。
 /// Rebuild the row buttons from history (selected row highlighted with a rounded tile).
 pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
@@ -1219,22 +1565,22 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     // so it must NOT be released again -- a second release was a use-after-free that crashed
     // on the second summon.
     let remove_old_started = Instant::now();
-    let mut rows = ROW_BUTTONS.lock().unwrap();
-    for &b in rows.iter() {
-        let _: () = msg_send![b.0, removeFromSuperview];
+    // 行视图由父视图持有,removeFromSuperview 即释放,不应二次 release(曾经的 UAF 教训)。
+    // Row views are parent-owned; removeFromSuperview releases them and they must never be
+    // released again (a past UAF lesson).
+    {
+        let old_views = ROW_HOVER_VIEWS.lock().unwrap().clone();
+        for view in &old_views {
+            remove_row_views(view);
+        }
     }
-    rows.clear();
-    // 背景块与按钮同生命周期:同样由父视图持有,removeFromSuperview 即释放,不应二次
-    // release(同按钮的 UAF 教训)。
-    // Tiles share the buttons' lifecycle: parent-owned, released by removeFromSuperview,
-    // never released again (same UAF lesson as the buttons).
-    let mut tiles = ROW_TILES.lock().unwrap();
-    for &t in tiles.iter() {
-        let _: () = msg_send![t.0, removeFromSuperview];
-    }
-    tiles.clear();
     ROW_HOVER_VIEWS.lock().unwrap().clear();
     ROW_VIEW_INDICES.lock().unwrap().clear();
+    if let Some(empty) = EMPTY_STATE_VIEW.lock().unwrap().take() {
+        if !empty.0.is_null() {
+            let _: () = msg_send![empty.0, removeFromSuperview];
+        }
+    }
     let mut pitches = ROW_PITCHES.lock().unwrap();
     pitches.clear();
     let remove_old_ms = remove_old_started.elapsed().as_millis();
@@ -1281,11 +1627,7 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     };
     let prepare_ms = prepare_started.elapsed().as_millis();
     let build_rows_started = Instant::now();
-    let mut image_rows = 0;
-    let mut code_rows = 0;
-    let mut image_ms = 0;
-    let mut content_attributed_ms = 0;
-    let mut meta_ms = 0;
+    let mut stats = RowCreateStats::default();
     let mut slowest_row_ms = 0;
     let mut slowest_row_index = None;
     if !empty_hint.is_empty() {
@@ -1337,7 +1679,7 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
         let _: () = msg_send![label, setFont: font];
         let _: () = msg_send![container, addSubview: label];
         release_obj(label);
-        rows.push(ObjPtr::new(label));
+        *EMPTY_STATE_VIEW.lock().unwrap() = Some(ObjPtr::new(label));
         let build_rows_ms = build_rows_started.elapsed().as_millis();
         let finalize_started = Instant::now();
         let rendered_key = picker_rows_key(history_revision(), &query, filter, show_source);
@@ -1417,7 +1759,6 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
         }
         let row_started = Instant::now();
         let y = offsets[i];
-        let row_w = PICKER_W - PAD_X * 2.0;
         let entry = &hist[h_idx];
         let selected = i == sel_idx;
         let hovered = i == hover_idx;
@@ -1425,255 +1766,24 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
         let has_hdr = prev_group.is_none() || prev_group != Some(group);
         prev_group = Some(group);
         let hdr_h = if has_hdr { GROUP_H } else { 0.0 };
-        let content_y = y + hdr_h;
         let row_h = pitches[i] - hdr_h;
-
-        // 分组头:一行 11px medium 小字(新设计稿 .group-title,27px 高,垂直居中,
-        // 左内边距 13)。/ The group header: 11px medium text, 27px tall, centered.
-        let mut row_group_label = None;
-        if has_hdr {
-            let g_label = make_nsstring(&group_label(group));
-            let g: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-            let g: *mut AnyObject = msg_send![
-                g,
-                initWithFrame: NSRect::new(
-                    NSPoint::new(PAD_X + ROW_PAD_L, y + GROUP_LABEL_PAD),
-                    NSSize::new(row_w - PAD_X, GROUP_H - GROUP_LABEL_PAD)
-                )
-            ];
-            let _: () = msg_send![g, setStringValue: g_label];
-            CFRelease(g_label as *const c_void);
-            let _: () = msg_send![g, setBezeled: false];
-            let _: () = msg_send![g, setDrawsBackground: false];
-            let _: () = msg_send![g, setEditable: false];
-            let _: () = msg_send![g, setSelectable: false];
-            let g_font: *mut AnyObject =
-                msg_send![class!(NSFont), systemFontOfSize: 12.0f64, weight: 0.23f64]; // Medium
-            let _: () = msg_send![g, setFont: g_font];
-            let g_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
-            let _: () = msg_send![g, setTextColor: g_color];
-            let _: () = msg_send![container, addSubview: g];
-            release_obj(g);
-            rows.push(ObjPtr::new(g));
-            row_group_label = Some(ObjPtr::new(g));
-        }
-
-        // 行底(两种不同样式):悬停(未选中)= 0.032 黑(**没有**左条);选中 = 0.050 黑 +
-        // 2px 左指示条。按新设计稿 .item:hover vs .item.selected。
-        // The row backdrop (two distinct styles): hovered (not selected) = 0.032 black
-        // with NO bar; selected = 0.050 black + a 2px left bar. The new mockup's
-        // .item:hover vs .item.selected.
-        let palette = clipboard_palette();
-        let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let tile: *mut AnyObject = msg_send![
-            tile,
-            initWithFrame: NSRect::new(NSPoint::new(PAD_X, content_y), NSSize::new(row_w, row_h))
-        ];
-        let _: () = msg_send![tile, setWantsLayer: true];
-        let tile_layer: *mut AnyObject = msg_send![tile, layer];
-        let bg_hex = if selected {
-            palette.selection_bg
-        } else if hovered {
-            palette.hover_bg
-        } else {
-            0x00000000
-        };
-        // layer_set_background 走 raw objc_msgSend:objc2 的 msg_send! 无法编码
-        // CGColor 参数/返回(参数编码 '^{CGColor=}' 与 *mut c_void 的 '^v' 不匹配)。
-        // layer_set_background goes through raw objc_msgSend: objc2's msg_send! can't encode
-        // CGColor args/returns ('^{CGColor=}' vs '^v').
-        crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(bg_hex));
-        let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
-        // 每行都预建左侧 2px 指示条并按选中状态隐藏,这样方向键切换只需切换可见性。
-        // Prebuild the 2px selection bar for every row and hide it when unselected, so arrow
-        // navigation only toggles visibility instead of rebuilding rows.
-        let bar: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let bar: *mut AnyObject = msg_send![
-            bar,
-            initWithFrame: NSRect::new(
-                NSPoint::new(SEL_BAR_X, SEL_BAR_INSET_Y),
-                NSSize::new(SEL_BAR_W, row_h - SEL_BAR_INSET_Y * 2.0)
-            )
-        ];
-        let _: () = msg_send![bar, setWantsLayer: true];
-        let bar_layer: *mut AnyObject = msg_send![bar, layer];
-        crate::ffi::layer_set_background(bar_layer, crate::ffi::hex_to_cg_color(palette.accent));
-        let _: () = msg_send![bar_layer, setCornerRadius: SEL_BAR_W / 2.0];
-        let _: () = msg_send![bar, setHidden: !selected];
-        let _: () = msg_send![tile, addSubview: bar];
-        release_obj(bar);
-        let _: () = msg_send![container, addSubview: tile];
-        release_obj(tile);
-        tiles.push(ObjPtr::new(tile));
-
-        // 内容按钮:占行的上部(61pt),整块可点击(粘贴)+ 悬停;图片行左侧是 72×44
-        // 缩略图画布 + 文件名;文本行是 ≤2 行、按类型着色的内容。无边框、无背景。
-        // The content button: the row's upper zone (61pt), clickable (paste) + hover;
-        // image rows get a 72x44 thumbnail canvas + the filename; text rows show <=2
-        // styled lines. Borderless, backgroundless.
-        let content_x = PAD_X + ROW_PAD_L;
-        let content_w = row_w - ROW_PAD_L - ROW_PAD_R;
-        let content_h = row_h - META_FOOTER_H; // 底部留给 meta 栏 / the meta bar takes the bottom.
-        let content_btn: *mut AnyObject = msg_send![row_button_class(), alloc];
-        let is_image = entry.image.is_some();
-        if is_image {
-            image_rows += 1;
-        }
-        let content_btn: *mut AnyObject = msg_send![
-            content_btn,
-            initWithFrame: NSRect::new(
-                NSPoint::new(content_x, content_y + ROW_PAD_TOP),
-                NSSize::new(content_w, content_h - ROW_PAD_TOP - ROW_PAD_BOT)
-            )
-        ];
-        let _: () = msg_send![content_btn, setBordered: false];
-        let _: () = msg_send![content_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
-        let cell: *mut AnyObject = msg_send![content_btn, cell];
-        let _: () = msg_send![cell, setUsesSingleLineMode: false];
-        let _: () = msg_send![cell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-        if msg_send![cell, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
-            let _: () = msg_send![cell, setMaximumNumberOfLines: 2isize];
-        }
-        let image_started = Instant::now();
-        let row_img = make_row_image(entry);
-        image_ms += image_started.elapsed().as_millis();
-        if !row_img.is_null() {
-            let _: () = msg_send![content_btn, setImage: row_img];
-            let _: () = msg_send![content_btn, setImagePosition: 2isize]; // NSImageLeft
-            release_obj(row_img);
-        }
-        // Keep the full string and let the native cell wrap/truncate using actual font metrics.
-        // Character-count heuristics break on emoji, combining marks, and long unbroken words.
-        // 保留完整字符串，让原生 cell 按实际字体测量换行/截断；字符数启发式会错误处理
-        // emoji、组合字符和无空格长单词。
-        let content = entry.text.as_str();
-        let kind = if is_image {
-            TextKind::Plain
-        } else {
-            classify_text(&entry.text)
-        };
-        if kind == TextKind::Code {
-            code_rows += 1;
-        }
-        let content_attributed_started = Instant::now();
-        let attr = make_content_attributed(content, kind);
-        content_attributed_ms += content_attributed_started.elapsed().as_millis();
-        let _: () = msg_send![content_btn, setAttributedTitle: attr];
-        release_obj(attr);
-        let _: () = msg_send![content_btn, setTag: i as isize];
-        let _: () = msg_send![content_btn, setTarget: row_target()];
-        let _: () = msg_send![content_btn, setAction: sel!(handleClipboardRowClick:)];
-        add_hover_tracking(content_btn);
-        let _: () = msg_send![container, addSubview: content_btn];
-        release_obj(content_btn);
-        rows.push(ObjPtr::new(content_btn));
-
-        // 底部 meta 按钮:17pt 栏,左侧是 [13px 来源图标]·应用名·时间,整块可可点
-        // (点击 = 粘贴)、悬停选中;右侧悬浮着操作按钮。
-        // 位置 = 行底向上留 ROW_PAD_BOT(8pt,对应设计稿 .item 的 padding-bottom 8px)
-        // —— 之前贴行底,meta 栏与删除/详情/收藏按钮离下边框太近。
-        // The bottom meta button: a 17pt bar with [13px source icon] + app · time on the
-        // left; clickable (paste) and hover-tracked; the action buttons float on its right.
-        // Positioned ROW_PAD_BOT (8pt) above the row bottom, matching the mockup's
-        // .item padding-bottom 8px -- it used to sit flush with the bottom edge, leaving
-        // the meta bar and the delete/details/pin buttons too close to the bottom border.
-        let meta_y = content_y + row_h - META_FOOTER_H - ROW_PAD_BOT;
-        let meta_btn: *mut AnyObject = msg_send![row_button_class(), alloc];
-        let meta_w = row_w - ROW_PAD_L - ROW_PAD_R - ACTIONS_W - 4.0;
-        let meta_btn: *mut AnyObject = msg_send![
-            meta_btn,
-            initWithFrame: NSRect::new(
-                NSPoint::new(content_x, meta_y),
-                NSSize::new(meta_w, META_FOOTER_H)
-            )
-        ];
-        let _: () = msg_send![meta_btn, setBordered: false];
-        let _: () = msg_send![meta_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
-        let mcell: *mut AnyObject = msg_send![meta_btn, cell];
-        let _: () = msg_send![mcell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-        let meta_started = Instant::now();
-        let meta_attr = make_meta_footer_attributed(entry, show_source);
-        meta_ms += meta_started.elapsed().as_millis();
-        let _: () = msg_send![meta_btn, setAttributedTitle: meta_attr];
-        release_obj(meta_attr);
-        let _: () = msg_send![meta_btn, setTag: i as isize];
-        let _: () = msg_send![meta_btn, setTarget: row_target()];
-        let _: () = msg_send![meta_btn, setAction: sel!(handleClipboardRowClick:)];
-        add_hover_tracking(meta_btn);
-        let _: () = msg_send![container, addSubview: meta_btn];
-        release_obj(meta_btn);
-        rows.push(ObjPtr::new(meta_btn));
-
-        // 操作按钮(置顶 ☆/★ · 详情 ⓘ · 删除 ⌫):**置顶条目常显**,非置顶条目仅
-        // 悬停/选中时显现(设计稿 .actions opacity 0→1)。独立于内容/meta 按钮,点击
-        // 不触发粘贴。
-        // Action buttons (pin ☆/★ · details ⓘ · delete ⌫): ALWAYS visible on PINNED
-        // entries; on unpinned entries they appear only when the row is hovered or
-        // selected (the mockup's .actions opacity 0->1). Separate from the content/meta
-        // buttons; they never paste.
-        let act_alpha = if entry.pinned || selected || hovered {
-            1.0
-        } else {
-            0.0
-        };
-        let act_y = meta_y + (META_FOOTER_H - ACTION_H) / 2.0;
-        let x_del = PICKER_W - PAD_X - ROW_PAD_R - ACTION_BTN;
-        let x_details = x_del - ACTION_GAP - ACTION_BTN;
-        let x_pin = x_details - ACTION_GAP - ACTION_BTN;
-        let pin_sym = if entry.pinned { "★" } else { "☆" };
-        let pin_btn = make_action_button(
-            pin_sym,
-            sel!(togglePin:),
-            i as isize,
-            x_pin,
-            act_y,
-            act_alpha,
+        let view = create_row_views(
+            container,
+            RowSpec {
+                entry,
+                display_index: i,
+                y,
+                row_h,
+                has_header: has_hdr,
+                selected,
+                hovered,
+                show_source,
+                detail_open: detail_visible(),
+                sel_idx,
+            },
+            &mut stats,
         );
-        if !pin_btn.is_null() {
-            let _: () = msg_send![container, addSubview: pin_btn];
-            release_obj(pin_btn);
-            rows.push(ObjPtr::new(pin_btn));
-        }
-        let details_btn = make_action_button(
-            "ⓘ",
-            sel!(showItemDetails:),
-            i as isize,
-            x_details,
-            act_y,
-            act_alpha,
-        );
-        // 详情已展开且本行被选中时,详情按钮显示激活图标与独立圆角底。
-        // When detail is open for this selected row, show its active icon and own rounded fill.
-        set_detail_action_style(
-            details_btn,
-            detail_action_is_active(detail_visible(), sel_idx, i),
-            false,
-        );
-        if !details_btn.is_null() {
-            let _: () = msg_send![container, addSubview: details_btn];
-            release_obj(details_btn);
-            rows.push(ObjPtr::new(details_btn));
-        }
-        let del_btn =
-            make_action_button("⌫", sel!(deleteEntry:), i as isize, x_del, act_y, act_alpha);
-        if !del_btn.is_null() {
-            let _: () = msg_send![container, addSubview: del_btn];
-            release_obj(del_btn);
-            rows.push(ObjPtr::new(del_btn));
-        }
-        // 记录本行的悬停相关视图(底块 + 操作按钮),供悬停变化时增量刷新。
-        // Record this row's hover-dependent views (tile + action buttons) for the
-        // incremental hover refresh.
-        ROW_HOVER_VIEWS.lock().unwrap().push(RowHoverViews {
-            group_label: row_group_label,
-            tile: ObjPtr::new(tile),
-            bar: ObjPtr::new(bar),
-            content: ObjPtr::new(content_btn),
-            meta: ObjPtr::new(meta_btn),
-            pin: ObjPtr::new(pin_btn),
-            details: ObjPtr::new(details_btn),
-            del: ObjPtr::new(del_btn),
-        });
+        ROW_HOVER_VIEWS.lock().unwrap().push(view);
         ROW_VIEW_INDICES.lock().unwrap().push(i);
         let row_ms = row_started.elapsed().as_millis();
         if row_ms > slowest_row_ms {
@@ -1694,14 +1804,14 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
         elapsed_ms: rebuild_started.elapsed().as_millis(),
         history_len: total,
         filtered_len: filtered.len(),
-        image_rows,
-        code_rows,
+        image_rows: stats.image_rows,
+        code_rows: stats.code_rows,
         remove_old_ms,
         prepare_ms,
         build_rows_ms,
-        image_ms,
-        content_attributed_ms,
-        meta_ms,
+        image_ms: stats.image_ms,
+        content_attributed_ms: stats.content_attributed_ms,
+        meta_ms: stats.meta_ms,
         finalize_ms,
         slowest_row_ms,
         slowest_row_index,
@@ -1735,6 +1845,100 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
         );
     }
     Some(summary)
+}
+
+/// 滚动时的增量物化:只补建新进入视口的行、移除离开视口的行,不再整组拆建。
+/// 行按显示索引绝对定位(子视图随 NSScrollView 原生滚动),已在视口内的行无需移动;
+/// 内容/选中/悬停不变,也无需重建。返回是否有增删。
+///
+/// Scroll-time incremental materialization: create only the rows newly entering the viewport
+/// and remove the ones leaving it, instead of tearing down and rebuilding the whole visible
+/// set. Rows are absolutely positioned by display index (subviews scroll natively with the
+/// NSScrollView), so surviving rows need no reposition; content/selection/hover are unchanged,
+/// so they need no rebuild. Returns whether anything changed.
+pub(super) unsafe fn sync_visible_rows() -> bool {
+    let Some(container) = picker_container_ptr() else {
+        return false;
+    };
+    let pitches = ROW_PITCHES.lock().unwrap().clone();
+    let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
+    if pitches.is_empty() || filtered.is_empty() {
+        return false;
+    }
+    let (start, end) = picker_visible_row_range(&pitches, filtered.len());
+    {
+        // 物化区间未变(升序连续)→ 无需增删。
+        // The materialized range is unchanged (ascending contiguous) -> nothing to add/remove.
+        let indices = ROW_VIEW_INDICES.lock().unwrap();
+        if indices.len() == end.saturating_sub(start)
+            && indices.first().copied() == Some(start)
+            && indices.last().map(|&last| last + 1) == Some(end)
+        {
+            return false;
+        }
+    }
+    REBUILDING.store(true, Ordering::SeqCst);
+    // 移除离开视口的行。/ Remove rows that left the viewport.
+    let stale: Vec<usize> = {
+        let indices = ROW_VIEW_INDICES.lock().unwrap();
+        indices
+            .iter()
+            .copied()
+            .filter(|&index| index < start || index >= end)
+            .collect()
+    };
+    for index in stale {
+        remove_materialized_row(index);
+    }
+    // 补建新进入视口的行。/ Create rows newly entering the viewport.
+    let hist = CLIP_HISTORY.lock().unwrap();
+    let offsets = row_offsets(&pitches);
+    let sel_idx = picker_selection();
+    let hover_idx = *HOVER_ROW.lock().unwrap();
+    let show_source = show_source_app();
+    let detail_open = detail_visible();
+    let mut stats = RowCreateStats::default();
+    for i in start..end {
+        if row_view_for_display_index(i).is_some() {
+            continue;
+        }
+        let Some(&h_idx) = filtered.get(i) else {
+            continue;
+        };
+        let entry = &hist[h_idx];
+        let group = day_group(entry.copied_at);
+        // 分组头只依赖显示顺序,与哪些行已物化无关。
+        // The group header depends only on display order, not on which rows are materialized.
+        let previous_group = if i == 0 {
+            None
+        } else {
+            filtered
+                .get(i - 1)
+                .and_then(|&previous| hist.get(previous))
+                .map(|e| day_group(e.copied_at))
+        };
+        let has_hdr = previous_group != Some(group);
+        let hdr_h = if has_hdr { GROUP_H } else { 0.0 };
+        let view = create_row_views(
+            container,
+            RowSpec {
+                entry,
+                display_index: i,
+                y: offsets[i],
+                row_h: pitches[i] - hdr_h,
+                has_header: has_hdr,
+                selected: i == sel_idx,
+                hovered: i == hover_idx,
+                show_source,
+                detail_open,
+                sel_idx,
+            },
+            &mut stats,
+        );
+        insert_materialized_row(i, view);
+    }
+    REBUILDING.store(false, Ordering::SeqCst);
+    true
 }
 
 /// 删除一行时只移除并重排已有视图;日期分组结构变化时交给完整重建处理。
@@ -1777,23 +1981,10 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
     REBUILDING.store(true, Ordering::SeqCst);
     let removed = ROW_HOVER_VIEWS.lock().unwrap().remove(idx);
     ROW_VIEW_INDICES.lock().unwrap().remove(idx);
-    for view in [
-        removed.group_label,
-        Some(removed.tile),
-        Some(removed.bar),
-        Some(removed.content),
-        Some(removed.meta),
-        Some(removed.pin),
-        Some(removed.details),
-        Some(removed.del),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !view.0.is_null() {
-            let _: () = msg_send![view.0, removeFromSuperview];
-        }
-    }
+    // bar 是 tile 的子视图,随 tile 一起释放;不能先删 tile 再删 bar(会 use-after-free)。
+    // The bar is a tile subview and is released with the tile; never remove the tile and
+    // then the bar (use-after-free).
+    remove_row_views(&removed);
 
     let old_hover = *HOVER_ROW.lock().unwrap();
     let new_hover = if old_hover == idx {
@@ -1826,24 +2017,6 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
     refresh_footer_count(hist.len());
 
     let views = ROW_HOVER_VIEWS.lock().unwrap().clone();
-    {
-        let mut rows = ROW_BUTTONS.lock().unwrap();
-        rows.clear();
-        let mut tiles = ROW_TILES.lock().unwrap();
-        tiles.clear();
-        for view in &views {
-            if let Some(group_label) = view.group_label {
-                rows.push(group_label);
-            }
-            rows.extend([view.content, view.meta]);
-            for button in [view.pin, view.details, view.del] {
-                if !button.0.is_null() {
-                    rows.push(button);
-                }
-            }
-            tiles.push(view.tile);
-        }
-    }
 
     let selection = picker_selection();
     let palette = clipboard_palette();
@@ -2721,8 +2894,14 @@ unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_
                 // (the controlTextDidBeginEditing: delegate also clears - belt and braces).
                 if keycode == 126 && (sel == 0 || sel == NO_SELECTION) {
                     if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
+                        // 只清除原选中行的高光(增量),不重建整表。
+                        // Clear only the previously selected row's highlight (incremental);
+                        // do not rebuild the whole list.
                         set_picker_selection(NO_SELECTION);
-                        rebuild_rows();
+                        refresh_selection(sel, NO_SELECTION);
+                        if detail_visible() {
+                            refresh_detail_action_visuals();
+                        }
                         let window = match *PICKER_WINDOW.lock().unwrap() {
                             Some(w) => w.0,
                             None => return,
@@ -2889,7 +3068,7 @@ pub(super) unsafe fn scroll_selection_into_view(container: *mut AnyObject, idx: 
 
 /// 更新选中高亮,只刷新前后两行的视觉状态,不重建列表。
 /// Refresh selection highlight by updating only the previous and new rows, without rebuilding.
-fn refresh_selection(previous: usize, current: usize) {
+pub(super) fn refresh_selection(previous: usize, current: usize) {
     update_hover_visuals(previous, current);
 }
 
