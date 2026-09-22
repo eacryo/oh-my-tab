@@ -230,6 +230,20 @@ pub(super) fn row_top(idx: usize, pitches: &[f64]) -> f64 {
     rows_top_offset() + pitches.iter().take(idx).sum::<f64>()
 }
 
+/// 一次性算出每行顶边偏移(前缀和):逐行调 `row_top` 会让整段布局变成 O(n²),
+/// 行多时在重建/滚动路径上白烧 CPU。
+/// Compute every row's top offset in one pass (prefix sums): calling `row_top` per row
+/// turns a full layout into O(n^2), burning CPU on the rebuild/scroll path as rows grow.
+pub(super) fn row_offsets(pitches: &[f64]) -> Vec<f64> {
+    let mut offsets = Vec::with_capacity(pitches.len());
+    let mut acc = rows_top_offset();
+    for &pitch in pitches {
+        offsets.push(acc);
+        acc += pitch;
+    }
+    offsets
+}
+
 /// u64 以十六进制字符串序列化:TOML 整数是 i64,高位置位的 hash 直接序列化会失败
 /// ("u64 value out of range"),哈希必须走字符串。
 /// u64 serialized as a hex string: TOML integers are i64, so hashes with the high bit
@@ -295,13 +309,16 @@ pub(super) struct ImageEntry {
     pub(super) data_path: std::path::PathBuf,
     /// 降采样 PNG 预览(缩略图绘制用;唯一常驻内存的图片字节,约 100-300KB)。
     /// 序列化时跳过:预览单独落盘为 `{hash}.preview`,加载时读回(缺失则从数据字节
-    /// 或源文件重新生成)。
+    /// 或源文件重新生成)。用 `Arc` 持有:历史快照(持久化派发、详情展示)只需克隆
+    /// 引用计数,避免每次复制都深拷贝整本图片预览。
     /// A downsampled PNG preview (thumbnail drawing; the only image bytes held in memory,
     /// ~100-300KB). Skipped in serialization: the preview lives separately as
     /// `{hash}.preview` and is read back on load (regenerated from the data bytes or the
-    /// source file when missing).
+    /// source file when missing). Held via `Arc`: history snapshots (persistence dispatch,
+    /// detail display) clone only a refcount instead of deep-copying every preview on each
+    /// copy.
     #[serde(skip)]
-    pub(super) preview_png: Vec<u8>,
+    pub(super) preview_png: Arc<Vec<u8>>,
     /// 文件复制的来源路径(None = 数据条目,纯图片复制)。
     /// The source path of a file copy (None = a data entry, a bare image copy).
     pub(super) source_path: Option<String>,
@@ -644,8 +661,15 @@ pub(super) fn record_text(
         return false;
     }
     if let Some(idx) = find_by_text(history, text) {
-        history[idx].source_app = source.to_string();
-        history[idx].source_key = source_key.to_string();
+        // 仅在来源真变化时重建字符串,避免同一来源连续复制时的无谓分配。
+        // Rebuild the strings only when the source actually changed, avoiding pointless
+        // allocations when the same app copies repeatedly.
+        if history[idx].source_app != source {
+            history[idx].source_app = source.to_string();
+        }
+        if history[idx].source_key != source_key {
+            history[idx].source_key = source_key.to_string();
+        }
         // 去重移前 = 最近一次复制:刷新时间戳,过期从“最后一次复制”重新计时。
         // A dedup-move = the latest copy: refresh the timestamp so expiry counts from
         // the most recent copy, not the first one.
@@ -741,8 +765,14 @@ pub(super) fn record_image(
         })
     };
     if let Some(idx) = dedup_hit {
-        history[idx].source_app = source.to_string();
-        history[idx].source_key = source_key.to_string();
+        // 仅在来源真变化时重建字符串(同 record_text)。
+        // Rebuild the strings only when the source actually changed (same as record_text).
+        if history[idx].source_app != source {
+            history[idx].source_app = source.to_string();
+        }
+        if history[idx].source_key != source_key {
+            history[idx].source_key = source_key.to_string();
+        }
         // 去重移前 = 最近一次复制:刷新时间戳(同 record_text)。
         // A dedup-move = the latest copy: refresh the timestamp (same as record_text).
         history[idx].copied_at = Some(now_secs());
@@ -865,7 +895,11 @@ pub(super) enum ClipFilter {
 pub(super) static CLIP_FILTER: Mutex<ClipFilter> = Mutex::new(ClipFilter::All);
 
 #[cfg(not(test))]
-type FilterTextLowerCache = Option<(u64, Vec<String>)>;
+/// 缓存的文本小写副本与分类:搜索/筛选的每个按键都复用,只在历史 revision 变化时重建。
+/// Cached lowercase text and classification: reused across every keystroke/rebuild and
+/// rebuilt only when the history revision changes.
+#[cfg(not(test))]
+type FilterTextLowerCache = Option<(u64, Vec<String>, Vec<TextKind>)>;
 
 #[cfg(not(test))]
 static FILTER_TEXT_LOWER_CACHE: LazyLock<Mutex<FilterTextLowerCache>> =
@@ -883,15 +917,24 @@ pub(super) fn next_clip_filter(filter: ClipFilter) -> ClipFilter {
     }
 }
 
-/// 条目是否命中筛选项 / whether an entry matches the filter.
-pub(super) fn matches_filter(e: &ClipEntry, f: ClipFilter) -> bool {
+/// 条目是否命中筛选项(已缓存分类版本):避免每条都重新 classify_text。
+/// Whether an entry matches the filter (cached-classification variant): avoids re-running
+/// classify_text for every entry on every keystroke.
+fn matches_filter_kind(e: &ClipEntry, kind: TextKind, f: ClipFilter) -> bool {
     match f {
         ClipFilter::All => true,
         ClipFilter::Image => e.image.is_some(),
-        ClipFilter::Text => e.image.is_none() && classify_text(&e.text) == TextKind::Plain,
-        ClipFilter::Link => e.image.is_none() && classify_text(&e.text) == TextKind::Url,
-        ClipFilter::Code => e.image.is_none() && classify_text(&e.text) == TextKind::Code,
+        ClipFilter::Text => e.image.is_none() && kind == TextKind::Plain,
+        ClipFilter::Link => e.image.is_none() && kind == TextKind::Url,
+        ClipFilter::Code => e.image.is_none() && kind == TextKind::Code,
     }
+}
+
+/// 条目是否命中筛选项(未缓存分类的简易版,仅测试使用)。
+/// Whether an entry matches the filter (simple, uncached-classification variant; tests only).
+#[cfg(test)]
+pub(super) fn matches_filter(e: &ClipEntry, f: ClipFilter) -> bool {
+    matches_filter_kind(e, classify_text(&e.text), f)
 }
 
 /// 过滤:返回匹配 query + 筛选项的历史索引列表(空 query + All = 全部;大小写不敏感
@@ -904,37 +947,42 @@ pub(super) fn filtered_indices(
 ) -> Vec<usize> {
     let q = query.to_lowercase();
 
-    if q.is_empty() {
-        return history
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| matches_filter(e, filter))
-            .map(|(i, _)| i)
-            .collect();
+    // 最常见路径(空查询 + 全部)不构建任何缓存。
+    // The most common path (empty query + All) builds no cache at all.
+    if q.is_empty() && filter == ClipFilter::All {
+        return (0..history.len()).collect();
     }
 
     #[cfg(not(test))]
     {
-        // 搜索输入变化时复用按 history revision 构建的小写文本;避免每个按键都为整本
-        // 历史分配并扫描一遍 lowercase 副本。
-        // Reuse lowercase text built for the current history revision so each keystroke
-        // avoids allocating and scanning a lowercase copy for every history entry.
+        // 搜索输入变化时复用按 history revision 构建的小写文本与分类;避免每个按键都为整本
+        // 历史分配/扫描一遍 lowercase 副本并重跑 classify_text。
+        // Reuse the lowercase text and classification built for the current history revision so
+        // each keystroke avoids a fresh lowercase copy and classify_text for every entry.
         let revision = super::history_revision();
         let mut cache = FILTER_TEXT_LOWER_CACHE.lock().unwrap();
-        let rebuild = cache.as_ref().is_none_or(|(cached_revision, texts)| {
-            *cached_revision != revision || texts.len() != history.len()
-        });
+        let rebuild = cache
+            .as_ref()
+            .is_none_or(|(cached_revision, texts, kinds)| {
+                *cached_revision != revision
+                    || texts.len() != history.len()
+                    || kinds.len() != history.len()
+            });
         if rebuild {
             *cache = Some((
                 revision,
                 history.iter().map(|e| e.text.to_lowercase()).collect(),
+                history.iter().map(|e| classify_text(&e.text)).collect(),
             ));
         }
-        let texts = &cache.as_ref().unwrap().1;
+        let (_, texts, kinds) = cache.as_ref().unwrap();
         history
             .iter()
             .enumerate()
-            .filter(|(i, e)| matches_filter(e, filter) && texts[*i].contains(&q))
+            .filter(|(i, e)| {
+                matches_filter_kind(e, kinds[*i], filter)
+                    && (q.is_empty() || texts[*i].contains(&q))
+            })
             .map(|(i, _)| i)
             .collect()
     }

@@ -91,7 +91,7 @@ pub(crate) fn smoke_runner() -> bool {
             uti: NSPASTEBOARD_TYPE_PNG.to_string(),
             hash: tiny_hash,
             data_path: clip_image_path(tiny_hash),
-            preview_png: TINY_PNG.to_vec(),
+            preview_png: Arc::new(TINY_PNG.to_vec()),
             source_path: None,
         };
         record_image(&mut hist, &tiny, "Safari", "com.apple.Safari", 50);

@@ -20,6 +20,17 @@ pub(super) struct HistoryFile {
     entries: Vec<ClipEntry>,
 }
 
+/// 序列化专用的借用视图:避免 `entries.to_vec()` 把整本历史(含图片预览)再深拷一遍
+/// ——预览本身被 `#[serde(skip)]`,那次拷贝纯属浪费。
+/// A borrow-only view for serialization: avoids `entries.to_vec()` deep-copying the entire
+/// history (image previews included) -- the previews are `#[serde(skip)]`, so that copy was
+/// pure waste.
+#[derive(Serialize)]
+struct HistoryFileRef<'a> {
+    version: u32,
+    entries: &'a [ClipEntry],
+}
+
 /// 持久化历史文件路径(与 config.toml 同目录;测试构建走测试目录)。
 /// The persisted-history path (same dir as config.toml; test builds use a test dir).
 pub(super) fn history_file_path() -> std::path::PathBuf {
@@ -46,9 +57,9 @@ pub(super) fn persist_enabled() -> bool {
 
 /// 序列化历史(纯函数,便于单测)。/ Serialize the history (pure, unit-tested).
 pub(super) fn serialize_history(entries: &[ClipEntry]) -> Option<String> {
-    let payload = HistoryFile {
+    let payload = HistoryFileRef {
         version: HISTORY_VERSION,
-        entries: entries.to_vec(),
+        entries,
     };
     toml::to_string(&payload).ok()
 }
@@ -217,7 +228,7 @@ pub(super) fn restore_loaded_entry(entry: ClipEntry) -> Option<ClipEntry> {
                 uti: img.uti.clone(),
                 hash: img.hash,
                 data_path: std::path::PathBuf::new(),
-                preview_png: preview,
+                preview_png: Arc::new(preview),
                 source_path: Some(path.clone()),
             }),
             pinned: entry.pinned,
@@ -236,7 +247,7 @@ pub(super) fn restore_loaded_entry(entry: ClipEntry) -> Option<ClipEntry> {
             uti: img.uti.clone(),
             hash: img.hash,
             data_path: clip_image_path(img.hash),
-            preview_png: preview,
+            preview_png: Arc::new(preview),
             source_path: None,
         }),
         pinned: entry.pinned,

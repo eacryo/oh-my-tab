@@ -193,13 +193,25 @@ fn extract_icon_to_cache_sized(pid: i32, pt_size: f64, suffix: &str) -> Option<S
         let _: () = msg_send![pool, drain];
         id
     };
-    if extraction_known_missing(&id, suffix) {
+    extract_icon_to_cache_resolved(pid, &id, pt_size, suffix)
+}
+
+/// 用**已解析**的 App 身份提取图标:调用方已有身份(如剪贴板录制路径)时避免重复解析。
+/// Extract with an ALREADY-RESOLVED app identity: callers that already have one (e.g. the
+/// clipboard record path) avoid resolving the same PID again.
+fn extract_icon_to_cache_resolved(
+    pid: i32,
+    id: &AppIdentity,
+    pt_size: f64,
+    suffix: &str,
+) -> Option<String> {
+    if extraction_known_missing(id, suffix) {
         return None;
     }
-    let result = extract_icon_render(pid, pt_size, suffix);
+    let result = extract_icon_render(pid, id, pt_size, suffix);
     match &result {
         Some(_) => clear_extraction_missing(&id.key, suffix),
-        None => mark_extraction_missing(&id, suffix),
+        None => mark_extraction_missing(id, suffix),
     }
     result
 }
@@ -211,7 +223,7 @@ fn extract_icon_to_cache_sized(pid: i32, pt_size: f64, suffix: &str) -> Option<S
 /// (128pt) and the clipboard's small one (16pt) share this pipeline. `suffix`: the filename
 /// suffix ("" -> {key}.png, ".small" -> {key}.small.png); both sizes share one {key}.meta
 /// fingerprint (the same executable mtime).
-fn extract_icon_render(pid: i32, pt_size: f64, suffix: &str) -> Option<String> {
+fn extract_icon_render(pid: i32, id: &AppIdentity, pt_size: f64, suffix: &str) -> Option<String> {
     unsafe {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -222,10 +234,9 @@ fn extract_icon_render(pid: i32, pt_size: f64, suffix: &str) -> Option<String> {
         // this runs before NSApp run (no pool yet), so they'd all leak - the ~40MB startup cause.
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
 
-        let id = resolve_app_identity(pid);
         // 命中既有且有效的缓存(含 mtime 校验)-> 跳过提取。
         // Hit an existing valid cache (mtime-verified) -> skip extraction.
-        if let Some(path) = check_cache_for_suffix(&id, suffix) {
+        if let Some(path) = check_cache_for_suffix(id, suffix) {
             let _: () = msg_send![pool, drain];
             return Some(path);
         }
@@ -340,6 +351,14 @@ pub fn extract_icon_to_cache(pid: i32) -> Option<String> {
 /// switcher's big icon, while `{key}.small.png` is a separate file.
 pub fn extract_small_icon(pid: i32) -> Option<String> {
     extract_icon_to_cache_sized(pid, 16.0, ".small")
+}
+
+/// 剪贴板小图提取,使用调用方已解析的 App 身份(先 `resolve_app_identity`,再提取)。
+/// 避免同一 PID 在一次录制里被解析两遍。
+/// Extract the clipboard small icon using a caller-resolved app identity (resolve first,
+/// then extract). Avoids resolving the same PID twice within one recording.
+pub(crate) fn extract_small_icon_for_identity(pid: i32, id: &AppIdentity) -> Option<String> {
+    extract_icon_to_cache_resolved(pid, id, 16.0, ".small")
 }
 
 /// 剪贴板小图的路径(存在性检查用;key = resolve_app_identity 的缓存键)。

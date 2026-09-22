@@ -33,6 +33,12 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(pollClipboardOnMain:),
+                clip_poll_on_main as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(clipboardWindowResigned:),
                 window_did_resign_key as *mut c_void,
                 types.as_ptr(),

@@ -2,6 +2,7 @@
 //! 片
 
 use super::*;
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 
 // ========== 图片磁盘缓存 / image disk cache ==========
 
@@ -140,6 +141,137 @@ pub(super) fn cache_write_detail_preview(hash: u64, png: &[u8]) -> bool {
         let _ = std::fs::remove_file(&tmp);
     }
     ok
+}
+
+// ========== 后台缓存写盘 / background cache writes ==========
+
+/// 单笔图片缓存写盘任务:原始字节落盘(仅数据条目)、预览落盘、可选的详情预生成。
+/// One image-cache write job: persist the original bytes (data entries only), persist the
+/// preview, then optionally pregenerate the detail image.
+struct ImageCacheJob {
+    hash: u64,
+    data: Option<Arc<Vec<u8>>>,
+    preview: Arc<Vec<u8>>,
+    source_path: Option<String>,
+    warm_detail: bool,
+}
+
+static IMAGE_CACHE_SENDER: OnceLock<Option<SyncSender<ImageCacheJob>>> = OnceLock::new();
+
+/// 已录制但尚未落盘的原始字节(hash → bytes)。后台写盘完成前若用户立刻粘贴/另存为,
+/// 缓存读缺失时改用它,保证异步写盘不会让粘贴失效。上限内后写入者覆盖;超出上限时
+/// 同步落盘最旧一项后移除,内存不会无限增长。
+/// Original bytes recorded but not yet on disk (hash -> bytes). If the user pastes / saves
+/// before the background write lands, a cache miss falls back to this map, so the async
+/// write never breaks a paste. Bounded: on overflow the oldest entry is written
+/// synchronously and dropped, so memory cannot grow without limit.
+static PENDING_IMAGE_DATA: LazyLock<Mutex<HashMap<u64, Arc<Vec<u8>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const PENDING_IMAGE_LIMIT: usize = 16;
+
+fn image_cache_sender() -> Option<&'static SyncSender<ImageCacheJob>> {
+    IMAGE_CACHE_SENDER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::sync_channel::<ImageCacheJob>(32);
+            std::thread::Builder::new()
+                .name("clip-image-cache".into())
+                .spawn(move || {
+                    while let Ok(job) = receiver.recv() {
+                        run_image_cache_job(&job);
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+/// 主线程录制路径的入口:把图片缓存写盘(与可选的详情预生成)交给后台线程。
+/// 入队失败(队列满/线程不可用)时在主线程同步兜底,绝不静默丢弃字节。
+/// The main-thread record path's entry point: hand the image-cache writes (and optional
+/// detail pregen) to the background thread. When enqueueing fails (queue full / worker
+/// gone), fall back to a synchronous write on the main thread -- bytes are never
+/// silently dropped.
+pub(super) fn schedule_image_cache_write(
+    hash: u64,
+    data: Option<Arc<Vec<u8>>>,
+    preview: Arc<Vec<u8>>,
+    source_path: Option<String>,
+    warm_detail: bool,
+) {
+    if hash == 0 {
+        return;
+    }
+    if let Some(bytes) = &data {
+        let mut pending = PENDING_IMAGE_DATA.lock().unwrap();
+        if pending.len() >= PENDING_IMAGE_LIMIT {
+            // 极端连发:把最旧一项同步落盘后移除,保证回退表有界。
+            // Extreme burst: flush the oldest entry synchronously before inserting, keeping
+            // the fallback map bounded.
+            if let Some((&old_hash, old_bytes)) = pending.iter().next() {
+                let old_bytes = old_bytes.clone();
+                pending.remove(&old_hash);
+                drop(pending);
+                let _ = cache_write_image(old_hash, &old_bytes);
+                pending = PENDING_IMAGE_DATA.lock().unwrap();
+            }
+        }
+        pending.insert(hash, bytes.clone());
+    }
+    let job = ImageCacheJob {
+        hash,
+        data,
+        preview,
+        source_path,
+        warm_detail,
+    };
+    match image_cache_sender() {
+        Some(sender) => match sender.try_send(job) {
+            Ok(()) => {}
+            // try_send 把任务原样退回,直接同步执行。
+            // try_send hands the job back; run it synchronously.
+            Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
+                run_image_cache_job(&job);
+            }
+        },
+        // 工作线程不可用(极罕):主线程直接执行,绝不丢字节。
+        // Worker unavailable (very rare): run on the main thread, never drop bytes.
+        None => run_image_cache_job(&job),
+    }
+}
+
+/// 后台单次任务:先落原始字节,再落预览,最后按需预生成详情(幂等,已存在则跳过)。
+/// One background job: persist the original bytes, then the preview, then optionally
+/// pregenerate the detail image (idempotent; skipped when already cached).
+fn run_image_cache_job(job: &ImageCacheJob) {
+    if let Some(data) = &job.data {
+        // 成功才从回退表移除;写盘失败则保留,粘贴仍可从内存取到字节。
+        // Remove from the fallback map only on success; on failure it is kept so a paste can
+        // still obtain the bytes from memory.
+        if cache_write_image(job.hash, data) {
+            PENDING_IMAGE_DATA.lock().unwrap().remove(&job.hash);
+        }
+    }
+    if !job.preview.is_empty() {
+        let _ = cache_write_preview(job.hash, &job.preview);
+    }
+    if job.warm_detail && !clip_image_detail_path(job.hash).exists() {
+        unsafe {
+            let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+            let _ = generate_detail_preview_bytes(job.hash, job.source_path.as_deref());
+            let _: () = msg_send![pool, drain];
+        }
+    }
+}
+
+/// 取图片原始字节:优先落盘缓存,未命中时回退到待写盘的内存字节。粘贴/另存为共用。
+/// Fetch an image's original bytes: prefer the on-disk cache, fall back to the in-memory
+/// pending bytes when it misses. Shared by paste and save-as.
+pub(super) fn image_bytes_for_hash(hash: u64) -> Option<Arc<Vec<u8>>> {
+    if let Some(bytes) = cache_read_image(hash) {
+        return Some(Arc::new(bytes));
+    }
+    PENDING_IMAGE_DATA.lock().unwrap().get(&hash).cloned()
 }
 
 /// 详情预览后台任务的时效判定(纯函数,单测覆盖):仅当详情可见**且**当前选中
@@ -346,20 +478,22 @@ pub(super) fn request_detail_preview(img: &ImageEntry, deliver: bool) {
 /// preview right away while enqueueing background generation (deliver=true); completion
 /// triggers a rebuild through detail_preview_ready to upgrade to hi-res. None (no bytes
 //  at all) lets the caller fall back to the filename text.
-pub(super) fn ensure_detail_preview(img: &ImageEntry) -> Option<Vec<u8>> {
+pub(super) fn ensure_detail_preview(img: &ImageEntry) -> Option<Arc<Vec<u8>>> {
     {
         let mut slot = DETAIL_PENDING_HD.lock().unwrap();
         if let Some((h, _)) = slot.as_ref() {
             if *h == img.hash {
-                return slot.take().map(|(_, p)| p);
+                return slot.take().map(|(_, p)| Arc::new(p));
             }
         }
     }
     if let Some(png) = cache_read_detail_preview(img.hash) {
-        return Some(png);
+        return Some(Arc::new(png));
     }
     if !img.preview_png.is_empty() {
         request_detail_preview(img, true);
+        // 内存预览本就是 Arc:直接克隆引用计数,不再深拷整段 PNG。
+        // The in-memory preview is already an Arc: clone the refcount, no deep PNG copy.
         return Some(img.preview_png.clone());
     }
     None

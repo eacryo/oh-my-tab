@@ -8,6 +8,22 @@ use super::*;
 /// 轮询一次:changeCount 变化时读文本入历史。
 /// Poll once: read the text into history when changeCount changed.
 pub(super) fn poll_clipboard() {
+    // 剪贴板通知理论上可能在其他线程投递;轮询里会访问 AppKit 与全局 UI 状态,
+    // 非主线程时先改道主线程再处理,避免后台线程碰 UI。
+    // The pasteboard notification may in principle be delivered on another thread; the poll
+    // touches AppKit and global UI state, so hop back to the main thread first when needed.
+    if !crate::is_main_thread() {
+        unsafe {
+            let target = observer();
+            let _: () = msg_send![
+                target,
+                performSelectorOnMainThread: sel!(pollClipboardOnMain:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
+        return;
+    }
     // 总开关关闭时停止记录(timer 已被 stop() 停掉,但全局通知观察者仍在,
     // 回调必须自行检查——否则关闭后历史还在后台累积)。
     // Stop recording when the master switch is off (stop() kills the timer, but the
@@ -73,45 +89,29 @@ pub(super) fn poll_clipboard() {
     let mut history_changed = false;
     match unsafe { read_pasteboard_text() } {
         Some(text) => {
-            // 来源 = 复制瞬间的前台应用(始终记录;显示与否由 CONFIG 的
-            // clipboard.show_source_app 决定)。轮询间隔(0.5s)内切应用可能记错来源,
-            // 通知路径(changeCount 变化即时回调)则基本精确,第一版接受这个误差。
-            // 图标缓存键 = resolve_app_identity 的 key(与切换器同一套回退);
-            // 顺带提取 16pt 小图标(app 此刻存活,提取最可靠;失败不影响记录)。
-            // Source = the frontmost app at copy time (always recorded; whether it is shown
-            // is gated by CONFIG.clipboard.show_source_app). Switching apps within the 0.5s
-            // poll interval can misattribute; the notification path (immediate callback) is
-            // mostly accurate -- acceptable for v1. The icon-cache key comes from
-            // resolve_app_identity (same fallbacks as the switcher); the 16pt small icon is
-            // extracted here too (the app is alive now -- the most reliable moment; failure
-            // only means no icon).
-            let (source, pid) = crate::ffi::frontmost_app_info();
-            let source_key = if pid > 0 {
-                let id = unsafe { crate::app_identity::resolve_app_identity(pid) };
-                let key = id.key.clone();
-                let _ = crate::icon_cache::extract_small_icon(pid);
-                key
-            } else {
-                String::new()
-            };
-            let mut hist = CLIP_HISTORY.lock().unwrap();
-            // 图片文件复制(Finder 里 Cmd+C 图片文件):识别为文件复制 → 记成图片条目;
-            // 否则按普通文本记录。
-            // An image-FILE copy (Cmd+C on an image file in Finder): recognized as a file
-            // copy -> recorded as an image entry; otherwise recorded as plain text.
             // 剪贴板带文件 URL(文件复制):本应用只支持**单个图片文件**的复制
             // (记成图片条目);其他文件复制——非图片文件、多文件选择——一律跳过,
-            // 否则文件名文本会被当成普通文本记进历史。
+            // 否则文件名文本会被当成普通文本记进历史。先做文件判定,只有确实要记录时
+            // 才解析来源/提取图标,避免非图片文件复制的无用 AppKit 工作。
             // A file-url on the pasteboard means a FILE copy: this app only supports a
             // SINGLE image-file copy (recorded as an image entry); every other file copy
             // -- non-image files, multi-file selections -- is skipped entirely, so the
-            // filename text never leaks into the history as plain text.
+            // filename text never leaks into the history as plain text. Decide the file case
+            // FIRST and resolve the source/icon only when something will actually be
+            // recorded, avoiding pointless AppKit work for non-image file copies.
             let has_file_url = unsafe { pasteboard_has_file_url() };
             let file_img = if has_file_url {
                 unsafe { file_copy_image(&text) }
             } else {
                 None
             };
+            let skip_file_text = has_file_url && file_img.is_none();
+            let (source, source_key) = if skip_file_text {
+                (String::new(), String::new())
+            } else {
+                record_source()
+            };
+            let mut hist = CLIP_HISTORY.lock().unwrap();
             if let Some(img) = &file_img {
                 if record_image(&mut hist, img, &source, &source_key, max_entries()) {
                     history_changed = true;
@@ -125,7 +125,7 @@ pub(super) fn poll_clipboard() {
                 } else {
                     log_debug!("[clip] change skipped: dup file ref, total {}", hist.len());
                 }
-            } else if has_file_url {
+            } else if skip_file_text {
                 // 文件复制但非单个图片文件(非图片文件 / 多文件):跳过,不记录文件名文本。
                 // A file copy that isn't a single image file (non-image / multi-file):
                 // skipped, the filename text is never recorded.
@@ -156,15 +156,7 @@ pub(super) fn poll_clipboard() {
         // No text -> try an image (text wins when both are present; a v1 tradeoff).
         None => match unsafe { read_pasteboard_image() } {
             Some(img) => {
-                let (source, pid) = crate::ffi::frontmost_app_info();
-                let source_key = if pid > 0 {
-                    let id = unsafe { crate::app_identity::resolve_app_identity(pid) };
-                    let key = id.key.clone();
-                    let _ = crate::icon_cache::extract_small_icon(pid);
-                    key
-                } else {
-                    String::new()
-                };
+                let (source, source_key) = record_source();
                 let mut hist = CLIP_HISTORY.lock().unwrap();
                 if record_image(&mut hist, &img, &source, &source_key, max_entries()) {
                     history_changed = true;
@@ -174,15 +166,11 @@ pub(super) fn poll_clipboard() {
                         img.uti,
                         hist.len()
                     );
-                    // 录制即预生成详情大图(后台):刚复制的图最可能马上被查看,
-                    // 提前落 {hash}.detail 让首开直接秒出高清。deliver=false——
-                    // 只为落盘,与选中态无关。
-                    // Pregenerate the hi-res detail preview right after recording
-                    // (background): a freshly copied image is the most likely one to be
-                    // inspected next, so landing {hash}.detail early makes the first
-                    // open instantly sharp. deliver=false -- cache only, selection is
-                    // irrelevant.
-                    request_detail_preview(&img, false);
+                    // 详情大图预生成已随缓存写盘任务在后台安排(见
+                    // image_cache::schedule_image_cache_write),此处不再重复投递。
+                    // Detail-preview pregeneration is already scheduled in the background
+                    // with the cache-write job (see
+                    // image_cache::schedule_image_cache_write); do not enqueue it again here.
                 } else {
                     log_debug!("[clip] change skipped: dup image (hash={:016x})", img.hash);
                 }
@@ -203,10 +191,36 @@ pub(super) fn poll_clipboard() {
     }
 }
 
+/// 解析复制瞬间的前台应用:返回 (应用名, 图标缓存键) 并顺带提取 16pt 小图标。
+/// app 此刻存活,提取最可靠;失败不影响记录。复用已解析的身份,避免图标提取内部
+/// 再次解析同一个 PID(重复的 NSRunningApplication 查询 + 可执行文件 stat)。
+///
+/// Resolve the frontmost app at copy time: returns (app name, icon-cache key) and extracts
+/// the 16pt small icon. The app is alive now (the most reliable moment; failure only means
+/// no icon). Reuses the resolved identity so icon extraction never resolves the same PID
+/// twice (a duplicate NSRunningApplication lookup + executable stat).
+fn record_source() -> (String, String) {
+    let (source, pid) = crate::ffi::frontmost_app_info();
+    if pid <= 0 {
+        return (source, String::new());
+    }
+    let id = unsafe { crate::app_identity::resolve_app_identity(pid) };
+    let key = id.key.clone();
+    let _ = crate::icon_cache::extract_small_icon_for_identity(pid, &id);
+    (source, key)
+}
+
 /// timer tick 回调(主线程):继续轮询。
 /// Timer tick callback (main thread): keep polling.
 pub(super) extern "C" fn clip_poll_tick(_self: *mut c_void, _cmd: Sel, _timer: *mut c_void) {
     crate::callback_guard::void("clip_poll_tick", poll_clipboard);
+}
+
+/// 非主线程收到剪贴板通知时改道主线程的入口(见 poll_clipboard 开头)。
+/// Main-thread re-entry for a pasteboard notification delivered off the main thread (see the
+/// top of poll_clipboard).
+pub(super) extern "C" fn clip_poll_on_main(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
+    crate::callback_guard::void("clip_poll_on_main", poll_clipboard);
 }
 
 /// 启动轮询(幂等):创建主线程 NSTimer,并立刻记录一次当前剪贴板。

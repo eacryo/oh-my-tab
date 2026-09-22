@@ -908,6 +908,7 @@ mod tests {
         SCROLL_INDICATOR_EDGE,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use std::sync::Arc;
     #[test]
     fn clear_confirmation_buttons_are_compact_and_horizontal() {
         let anchor = NSRect::new(NSPoint::new(420.0, 66.0), NSSize::new(60.0, 20.0));
@@ -958,7 +959,7 @@ mod tests {
             uti: String::with_capacity(16),
             hash: 1,
             data_path: std::path::PathBuf::from("/tmp/image"),
-            preview_png: Vec::with_capacity(64),
+            preview_png: Arc::new(Vec::with_capacity(64)),
             source_path: Some(String::with_capacity(32)),
         };
         let image_entry = ClipEntry {
@@ -1117,7 +1118,7 @@ mod tests {
             uti: NSPASTEBOARD_TYPE_PNG.to_string(),
             hash,
             data_path: super::clip_image_path(hash),
-            preview_png: data.to_vec(),
+            preview_png: Arc::new(data.to_vec()),
             source_path: None,
         }
     }
@@ -1131,7 +1132,7 @@ mod tests {
             uti: NSPASTEBOARD_TYPE_PNG.to_string(),
             hash: super::fnv1a64(data),
             data_path: std::path::PathBuf::new(),
-            preview_png: data.to_vec(),
+            preview_png: Arc::new(data.to_vec()),
             source_path: Some(path.to_string()),
         }
     }
@@ -1572,7 +1573,7 @@ mod tests {
                     uti: NSPASTEBOARD_TYPE_PNG.to_string(),
                     hash,
                     data_path: clip_image_path(hash),
-                    preview_png: bytes.to_vec(),
+                    preview_png: Arc::new(bytes.to_vec()),
                     source_path: None,
                 }),
                 pinned: false,
@@ -1699,7 +1700,7 @@ mod tests {
             uti: NSPASTEBOARD_TYPE_PNG.to_string(),
             hash,
             data_path: std::path::PathBuf::new(),
-            preview_png: Vec::new(),
+            preview_png: Arc::new(Vec::new()),
             source_path: None,
         };
         let entry = ClipEntry {
@@ -1712,7 +1713,7 @@ mod tests {
         };
         let restored = restore_loaded_entry(entry.clone()).expect("restore");
         let r_img = restored.image.as_ref().unwrap();
-        assert_eq!(r_img.preview_png, preview);
+        assert_eq!(r_img.preview_png.as_slice(), preview);
         assert_eq!(r_img.data_path, super::clip_image_path(hash));
         assert_eq!(restored.pinned, entry.pinned);
         // 数据字节缺失(缓存被清过)→ 坏条目丢弃 / a missing data file drops the entry.
@@ -1720,7 +1721,7 @@ mod tests {
             uti: NSPASTEBOARD_TYPE_PNG.to_string(),
             hash: fnv1a64(b"ghost"),
             data_path: std::path::PathBuf::new(),
-            preview_png: Vec::new(),
+            preview_png: Arc::new(Vec::new()),
             source_path: None,
         };
         let ghost_entry = ClipEntry {
@@ -1760,7 +1761,7 @@ mod tests {
         };
         let restored_file = restore_loaded_entry(file_entry.clone()).expect("restore file");
         let rf_img = restored_file.image.as_ref().unwrap();
-        assert_eq!(rf_img.preview_png, fpreview);
+        assert_eq!(rf_img.preview_png.as_slice(), fpreview);
         assert!(rf_img.data_path.as_os_str().is_empty());
         assert_eq!(rf_img.source_path.as_deref(), Some("/tmp/exists.gif"));
         // 退化文件条目(hash=0,无预览)→ 原样返回。
@@ -1769,7 +1770,7 @@ mod tests {
             uti: NSPASTEBOARD_TYPE_PNG.to_string(),
             hash: 0,
             data_path: std::path::PathBuf::new(),
-            preview_png: Vec::new(),
+            preview_png: Arc::new(Vec::new()),
             source_path: Some("/tmp/broken.gif".to_string()),
         };
         let degen_entry = ClipEntry {
@@ -1991,7 +1992,7 @@ mod tests {
             uti: super::NSPASTEBOARD_TYPE_PNG.to_string(),
             hash: 0,
             data_path: std::path::PathBuf::new(),
-            preview_png: Vec::new(),
+            preview_png: Arc::new(Vec::new()),
             source_path: None,
         };
         assert!(!record_image(&mut h, &dead, "Safari", "", 50));

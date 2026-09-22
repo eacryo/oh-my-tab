@@ -281,8 +281,7 @@ pub(super) unsafe fn read_pasteboard_image() -> Option<ImageEntry> {
         }
         Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
     };
-    let has_type = |t: &str| -> bool {
-        let types: *mut AnyObject = msg_send![pb, types];
+    let has_type = |types: *mut AnyObject, t: &str| -> bool {
         if types.is_null() {
             return false;
         }
@@ -291,32 +290,41 @@ pub(super) unsafe fn read_pasteboard_image() -> Option<ImageEntry> {
         CFRelease(type_ns as *const c_void);
         present
     };
+    // 剪贴板类型数组只取一次(此前每个候选 UTI 都重新拉一遍 types)。
+    // Fetch the pasteboard's type array ONCE (previously re-fetched for every candidate UTI).
+    let types: *mut AnyObject = msg_send![pb, types];
     // 先收集剪贴板上实际存在的类型(按优先级序),再逐个尝试:优先挑 GIF/WebP 等
     // 原始格式;选中类型解码/落盘失败则试下一个(同图往往还有 TIFF 可解码)。
     // Collect the types actually present (in priority order), then try them one by one:
-    // animation-capable originals win; a type whose data fails to decode or cache is
-    // skipped (the same image is usually also available as TIFF).
+    // animation-capable originals win; a type whose data fails to decode is skipped (the
+    // same image is usually also available as TIFF).
     let mut present: Vec<&str> = PASTEBOARD_IMAGE_UTIS
         .iter()
         .copied()
-        .filter(|uti| has_type(uti))
+        .filter(|uti| has_type(types, uti))
         .collect();
     while let Some(uti) = preferred_uti(&present) {
         present.retain(|u| *u != uti);
-        let data = bytes_for_type(uti).unwrap();
+        // types 声明了某类型但 dataForType: 仍可能返回 nil(lazy/promised 数据),
+        // 此时跳过继续探测下一个候选,绝不 panic。
+        // A type advertised in `types` can still yield nil from dataForType: (lazy/promised
+        // data); skip to the next candidate instead of panicking.
+        let Some(data) = bytes_for_type(uti) else {
+            continue;
+        };
         let Some(preview_png) = any_image_to_preview_png(&data) else {
             continue;
         };
         let hash = fnv1a64(&data);
-        // 缓存写失败则本条目不收(粘贴时将无字节可写回,等于坏条目)。
-        // A failed cache write drops the entry (nothing to paste back later).
-        if !cache_write_image(hash, &data) {
-            continue;
-        }
-        // 预览单独落盘:持久化历史重启加载时直接读回,无需重新解码。
-        // The preview is persisted separately so a persisted history loads without
-        // re-decoding after a restart.
-        let _ = cache_write_preview(hash, &preview_png);
+        let preview_png = Arc::new(preview_png);
+        // 原始字节与预览的**落盘**交给后台线程:大图复制不再让主线程等磁盘 I/O。
+        // 字节在写盘完成前留在 PENDING 表里,粘贴/另存为命中缓存缺失时改用它,保证功能
+        // 不因异步而失效。
+        // Delegate the disk writes (original bytes + preview) to a background thread: copying
+        // a large image no longer blocks the main thread on I/O. The bytes stay in the PENDING
+        // map until written, and paste/save-as fall back to them on a cache miss, so the async
+        // write never breaks functionality.
+        schedule_image_cache_write(hash, Some(Arc::new(data)), preview_png.clone(), None, true);
         return Some(ImageEntry {
             uti: uti.to_string(),
             hash,
@@ -425,13 +433,11 @@ pub(super) unsafe fn file_copy_image(text: &str) -> Option<ImageEntry> {
     // frame becomes the thumbnail.
     let bytes = std::fs::read(&path).ok()?;
     let hash = fnv1a64(&bytes);
-    let preview_png = unsafe { any_image_to_preview_png(&bytes) }.unwrap_or_default();
-    // 预览落盘({hash}.preview):持久化历史重启加载时直接读回,无需重新解码。
-    // The preview is persisted ({hash}.preview) so a persisted history loads without
-    // re-decoding after a restart.
-    if !preview_png.is_empty() {
-        let _ = cache_write_preview(hash, &preview_png);
-    }
+    let preview_png = Arc::new(unsafe { any_image_to_preview_png(&bytes) }.unwrap_or_default());
+    // 预览落盘({hash}.preview)同样交给后台线程(只有预览,原始字节按文件引用语义不落盘)。
+    // The preview is persisted ({hash}.preview) via the same background thread (preview only;
+    // the original bytes stay uncached per the file-reference semantics).
+    schedule_image_cache_write(hash, None, preview_png.clone(), Some(path.clone()), false);
     Some(ImageEntry {
         uti: uti.to_string(),
         hash,
@@ -493,7 +499,11 @@ pub(super) unsafe fn write_pasteboard_text(text: &str, stamp_marker: bool) -> bo
 /// a cache miss returns false and the caller must skip the synthesized Cmd+V so the OLD
 /// pasteboard content is not pasted.
 pub(super) unsafe fn write_pasteboard_image(entry: &ImageEntry) -> bool {
-    let Some(data) = cache_read_image(entry.hash) else {
+    // 先读落盘缓存;写盘尚在后排队时,回退到内存里等待落盘的原始字节——异步缓存写
+    // 不能让「刚复制就粘贴」失效。
+    // Read the on-disk cache first; while the background write is still queued, fall back to
+    // the in-memory pending bytes -- the async cache write must not break paste-right-after-copy.
+    let Some(data) = image_bytes_for_hash(entry.hash) else {
         log_info!(
             "[clip] image cache miss on paste (hash={:016x}, uti={})",
             entry.hash,

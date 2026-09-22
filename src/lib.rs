@@ -191,6 +191,13 @@ pub(crate) fn debug_assert_main_thread() {
     }
 }
 
+/// 运行时主线程判断(非 debug 构建也生效):跨线程回调需要据此改道主线程。
+/// Runtime main-thread check (also active in release builds): cross-thread callbacks use it
+/// to hop back onto the main thread.
+pub(crate) fn is_main_thread() -> bool {
+    unsafe { msg_send![class!(NSThread), isMainThread] }
+}
+
 /// Neutral app-level entry points used to avoid UI-module dependency cycles.
 /// 用于解除 UI 模块循环依赖的中性应用级入口。
 pub(crate) fn close_settings_for_switcher() {

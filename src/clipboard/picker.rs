@@ -1013,7 +1013,7 @@ unsafe fn run_detail_save_as(entry: &ClipEntry) {
                         .source_path
                         .as_deref()
                         .and_then(|p| std::fs::read(p).ok())
-                        .or_else(|| cache_read_image(img.hash));
+                        .or_else(|| image_bytes_for_hash(img.hash).map(|bytes| (*bytes).clone()));
                     match raw {
                         Some(data) => (data, ext_for_image_uti(&img.uti)),
                         None => match cache_read_preview(img.hash) {

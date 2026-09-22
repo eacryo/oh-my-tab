@@ -1410,12 +1410,13 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
         .checked_sub(1)
         .and_then(|index| filtered.get(index))
         .map(|&history_index| day_group(hist[history_index].copied_at));
+    let offsets = row_offsets(&pitches);
     for (i, &h_idx) in filtered.iter().enumerate() {
         if i < visible_start || i >= visible_end {
             continue;
         }
         let row_started = Instant::now();
-        let y = row_top(i, &pitches);
+        let y = offsets[i];
         let row_w = PICKER_W - PAD_X * 2.0;
         let entry = &hist[h_idx];
         let selected = i == sel_idx;
@@ -1847,12 +1848,13 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
     let selection = picker_selection();
     let palette = clipboard_palette();
     let mut previous_group = None;
+    let offsets = row_offsets(&pitches);
     for (i, (&history_idx, view)) in filtered.iter().zip(views.iter()).enumerate() {
         let entry = &hist[history_idx];
         let group = day_group(entry.copied_at);
         let has_header = previous_group.is_none() || previous_group != Some(group);
         previous_group = Some(group);
-        let y = row_top(i, &pitches);
+        let y = offsets[i];
         let row_w = PICKER_W - PAD_X * 2.0;
         let header_h = if has_header { GROUP_H } else { 0.0 };
         let content_y = y + header_h;
