@@ -1059,6 +1059,27 @@ mod tests {
         assert_eq!(picker_visible_range(&pitches, viewport, 50.0), (2, 5));
     }
     #[test]
+    fn oldest_pending_hash_evicts_by_insertion_order_not_map_order() {
+        use super::{oldest_pending_hash, PendingImage};
+        use std::collections::HashMap;
+        assert_eq!(oldest_pending_hash(&HashMap::new()), None);
+        // 插入与 HashMap 桶序无关:序号最小的 3 才是“最旧”,必须被淘汰。
+        // Insertion is unrelated to HashMap bucket order: seq-minimal 3 is the oldest.
+        let mut pending = HashMap::new();
+        for (hash, seq) in [(7u64, 2u64), (3, 1), (9, 3)] {
+            pending.insert(
+                hash,
+                PendingImage {
+                    seq,
+                    bytes: Arc::new(vec![hash as u8]),
+                },
+            );
+        }
+        assert_eq!(oldest_pending_hash(&pending), Some(3));
+        pending.remove(&3);
+        assert_eq!(oldest_pending_hash(&pending), Some(7));
+    }
+    #[test]
     fn picker_rows_key_changes_when_rendered_inputs_change() {
         use super::{picker_rows_key, ClipFilter};
         let base = picker_rows_key(1, "", ClipFilter::All, false);

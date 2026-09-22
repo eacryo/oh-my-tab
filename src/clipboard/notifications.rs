@@ -817,11 +817,17 @@ pub(super) fn picker_visible_range(
     if pitches.is_empty() || viewport.size.height <= 0.0 {
         return (0, 0);
     }
+    // 前缀和一次性算出各行顶边:循环里逐行调 `row_top` 会重新累加前面的行高,
+    // 整段退化成 O(n²)(与 rebuild_rows 同一个坑,见 model::row_offsets)。
+    // One-pass prefix sums give every row top: calling `row_top` per row re-sums the
+    // preceding pitches, degrading the scan to O(n^2) (the same trap rebuild_rows fixed;
+    // see model::row_offsets).
+    let offsets = row_offsets(pitches);
     let mut start = None;
     let mut end = 0;
     for (index, &height) in pitches.iter().enumerate() {
         let row = NSRect::new(
-            NSPoint::new(0.0, row_top(index, pitches)),
+            NSPoint::new(0.0, offsets[index]),
             NSSize::new(PICKER_W, height),
         );
         if picker_row_is_drawable(row, viewport, overscan) {

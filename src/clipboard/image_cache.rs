@@ -158,16 +158,40 @@ struct ImageCacheJob {
 
 static IMAGE_CACHE_SENDER: OnceLock<Option<SyncSender<ImageCacheJob>>> = OnceLock::new();
 
-/// 已录制但尚未落盘的原始字节(hash → bytes)。后台写盘完成前若用户立刻粘贴/另存为,
-/// 缓存读缺失时改用它,保证异步写盘不会让粘贴失效。上限内后写入者覆盖;超出上限时
-/// 同步落盘最旧一项后移除,内存不会无限增长。
-/// Original bytes recorded but not yet on disk (hash -> bytes). If the user pastes / saves
-/// before the background write lands, a cache miss falls back to this map, so the async
-/// write never breaks a paste. Bounded: on overflow the oldest entry is written
+/// 已录制但尚未落盘的原始字节(hash → PendingImage)。后台写盘完成前若用户立刻粘贴/
+/// 另存为,缓存读缺失时改用它,保证异步写盘不会让粘贴失效。上限内后写入者覆盖;
+/// 超出上限时同步落盘最旧一项后移除,内存不会无限增长。
+/// Original bytes recorded but not yet on disk (hash -> PendingImage). If the user pastes /
+/// saves before the background write lands, a cache miss falls back to this map, so the
+/// async write never breaks a paste. Bounded: on overflow the oldest entry is written
 /// synchronously and dropped, so memory cannot grow without limit.
-static PENDING_IMAGE_DATA: LazyLock<Mutex<HashMap<u64, Arc<Vec<u8>>>>> =
+static PENDING_IMAGE_DATA: LazyLock<Mutex<HashMap<u64, PendingImage>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 单调插入序号:HashMap 自身无序,只有显式记录序号才能确定“最旧”。
+/// Monotonic insertion sequence: HashMap order is arbitrary, so "oldest" needs an explicit
+/// sequence number.
+static PENDING_IMAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 const PENDING_IMAGE_LIMIT: usize = 16;
+
+/// 一笔待落盘字节及其插入序号(序号供溢出时按插入顺序淘汰)。
+/// One pending byte payload plus its insertion sequence (used to evict in insertion order on
+/// overflow).
+pub(super) struct PendingImage {
+    pub(super) seq: u64,
+    pub(super) bytes: Arc<Vec<u8>>,
+}
+
+/// 选中最旧的一笔(插入序号最小)。纯函数,单测覆盖:HashMap 的迭代顺序不保证,
+/// 直接 `iter().next()` 淘汰的是任意一项而非最旧一项。
+/// Pick the oldest entry (smallest insertion sequence). Pure and unit-tested: HashMap
+/// iteration order is unspecified, so `iter().next()` evicts an arbitrary entry, not the
+/// oldest one.
+pub(super) fn oldest_pending_hash(pending: &HashMap<u64, PendingImage>) -> Option<u64> {
+    pending
+        .iter()
+        .min_by_key(|(_, image)| image.seq)
+        .map(|(&hash, _)| hash)
+}
 
 fn image_cache_sender() -> Option<&'static SyncSender<ImageCacheJob>> {
     IMAGE_CACHE_SENDER
@@ -208,15 +232,23 @@ pub(super) fn schedule_image_cache_write(
             // 极端连发:把最旧一项同步落盘后移除,保证回退表有界。
             // Extreme burst: flush the oldest entry synchronously before inserting, keeping
             // the fallback map bounded.
-            if let Some((&old_hash, old_bytes)) = pending.iter().next() {
-                let old_bytes = old_bytes.clone();
-                pending.remove(&old_hash);
+            if let Some(old_hash) = oldest_pending_hash(&pending) {
+                let old_bytes = pending.remove(&old_hash).map(|image| image.bytes);
                 drop(pending);
-                let _ = cache_write_image(old_hash, &old_bytes);
+                if let Some(old_bytes) = old_bytes {
+                    let _ = cache_write_image(old_hash, &old_bytes);
+                }
                 pending = PENDING_IMAGE_DATA.lock().unwrap();
             }
         }
-        pending.insert(hash, bytes.clone());
+        let seq = PENDING_IMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+        pending.insert(
+            hash,
+            PendingImage {
+                seq,
+                bytes: bytes.clone(),
+            },
+        );
     }
     let job = ImageCacheJob {
         hash,
@@ -271,7 +303,11 @@ pub(super) fn image_bytes_for_hash(hash: u64) -> Option<Arc<Vec<u8>>> {
     if let Some(bytes) = cache_read_image(hash) {
         return Some(Arc::new(bytes));
     }
-    PENDING_IMAGE_DATA.lock().unwrap().get(&hash).cloned()
+    PENDING_IMAGE_DATA
+        .lock()
+        .unwrap()
+        .get(&hash)
+        .map(|image| image.bytes.clone())
 }
 
 /// 详情预览后台任务的时效判定(纯函数,单测覆盖):仅当详情可见**且**当前选中

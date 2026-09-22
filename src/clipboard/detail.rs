@@ -1894,7 +1894,16 @@ pub(super) unsafe fn sync_visible_rows() -> bool {
     let hist = CLIP_HISTORY.lock().unwrap();
     let offsets = row_offsets(&pitches);
     let sel_idx = picker_selection();
-    let hover_idx = *HOVER_ROW.lock().unwrap();
+    // 与 rebuild_rows 相同的悬停门禁:指针不在浮窗内时残留索引必然无效,按
+    // NO_SELECTION 建行并把静态值归位自愈,否则滚动增量物化会把幽灵悬停底套到新行上。
+    // The same hover gate as rebuild_rows: when the pointer is outside the picker the stale
+    // index cannot be valid -- build without hover and self-heal the static, otherwise
+    // scroll-time materialization would paint a phantom hover fill onto fresh rows.
+    let mut hover_idx = *HOVER_ROW.lock().unwrap();
+    if !unsafe { pointer_in_picker_window() } {
+        hover_idx = effective_hover_row(false, hover_idx);
+        *HOVER_ROW.lock().unwrap() = hover_idx;
+    }
     let show_source = show_source_app();
     let detail_open = detail_visible();
     let mut stats = RowCreateStats::default();
