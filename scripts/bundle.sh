@@ -116,6 +116,15 @@ if [ -d "$ICON_DIR" ]; then
   cp -R "$ICON_DIR" "$APP/Contents/Resources/AppIcon.icon"
 fi
 
+# 可选的产出标记:dev 渠道包装脚本设置 DEV_BUILD_PROFILE=release-dev,便于
+# dev-restart.sh 识别并提示它即将用本地开发包覆盖这个发布渠道包。必须在 codesign 之前写入。
+# Optional provenance marker: the dev-channel wrapper sets DEV_BUILD_PROFILE=release-dev so
+# dev-restart.sh can tell it is about to replace this channel package with a local dev build.
+# Written before codesign so it is covered by the signature.
+if [ -n "${DEV_BUILD_PROFILE:-}" ]; then
+  printf '%s\n' "$DEV_BUILD_PROFILE" > "$APP/Contents/Resources/dev-build-profile.txt"
+fi
+
 # Sparkle 自带的 XPC/helper 默认可能是 ad-hoc 签名。正式发布时按 Sparkle 的发布流程
 # 从内向外重签；Downloader.xpc 保留 Sparkle 自己的 entitlements，不能把主应用权限套进去。
 # Sparkle's XPC/helper tools may ship ad-hoc signed. Re-sign them inside-out for distribution;

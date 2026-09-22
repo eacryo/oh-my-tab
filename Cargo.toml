@@ -20,3 +20,21 @@ toml = "0.8"
 # Dev-only; never linked into the release binary.
 [dev-dependencies]
 tempfile = "3"
+
+# 开发期优化 profile:供 `scripts/dev-restart.sh --opt` 做体感/性能验证。继承 release 的
+# 优化级别,但保留 debug 断言——objc2 的 `msg_send!` 运行时签名校验、
+# `debug_assert_main_thread`、溢出检查与 `dev-long-text` 布局夹具都依赖
+# `debug_assertions`,这样开发期仍能快速失败,运行速度却接近生产。
+#
+# Dev optimization profile, used by `scripts/dev-restart.sh --opt` for feel/perf validation.
+# It inherits release codegen while keeping debug assertions: objc2's runtime `msg_send!`
+# signature verification, `debug_assert_main_thread`, overflow checks, and the
+# `dev-long-text` layout fixture all key off `debug_assertions`, so development still fails
+# fast while runtime speed approaches production. Build with `cargo build --profile dev-opt`
+# (output: target/dev-opt/).
+[profile.dev-opt]
+inherits = "release"
+opt-level = 3
+debug = true
+debug-assertions = true
+overflow-checks = true

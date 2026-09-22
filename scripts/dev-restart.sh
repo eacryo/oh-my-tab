@@ -1,15 +1,43 @@
 #!/bin/bash
 # 开发重启脚本:优雅退出旧进程 → 编译并组装开发版 .app → 启动 .app → 校验存活。
 # 由 agent 在 cargo fmt/check/clippy/test 全绿后执行(见 AGENTS.md 约定)。
+# 默认 debug 构建(迭代快、断言全开);`--opt` 走 dev-opt profile(优化接近 release,
+# 但保留 debug 断言),用于滚动/动画等体感与性能验证。
 # Dev restart script: gracefully quit the old process -> build and assemble the dev .app ->
 # start the .app -> verify it is alive. Run by the agent after the
 # fmt/check/clippy/test gates pass (see the AGENTS.md convention).
+# Default is the fast debug build (full assertions); `--opt` uses the dev-opt profile
+# (optimized close to release while keeping debug assertions) for feel/perf validation.
 
 # Resolve paths from this script, not from the caller's current directory. This
 # keeps both `./scripts/dev-restart.sh` and an absolute-path invocation working.
 # 根据脚本自身位置定位项目根目录,不依赖调用者当前所在的目录。
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_dir="$(dirname -- "$script_dir")"
+
+# 可选参数解析:决定构建 profile 与二进制所在目录。
+# Optional flag parsing: chooses the build profile and the binary's target directory.
+build_profile="debug"
+cargo_profile_args=()
+for arg in "$@"; do
+    case "$arg" in
+        --opt) build_profile="dev-opt" ;;
+        -h|--help)
+            echo "Usage: scripts/dev-restart.sh [--opt]"
+            echo "  (no flag)  debug build: fast iteration, complete debug assertions"
+            echo "  --opt      dev-opt profile: optimized, debug assertions kept (feel/perf)"
+            exit 0
+            ;;
+        *)
+            echo "restart FAILED: unknown argument: $arg"
+            exit 2
+            ;;
+    esac
+done
+if [ "$build_profile" = "dev-opt" ]; then
+    cargo_profile_args=(--profile dev-opt)
+fi
+build_target_dir="$repo_dir/target/$build_profile"
 dev_app="$repo_dir/dist/Oh-My-Tab-Dev.app"
 dev_app_binary="$dev_app/Contents/MacOS/oh-my-tab"
 dev_bundle_id="com.eacryo.oh-my-tab.dev"
@@ -63,8 +91,16 @@ pkill -x 'oh-my-tab' 2>/dev/null
 sleep 0.5
 
 # 每次都删除旧的开发版 .app,避免旧资源或旧 Info.plist 混入新包。
+# 若现有包是 release-dev.sh 产出的发布渠道包,先提示会被本地开发包覆盖(两者共用同一
+# dist/Oh-My-Tab-Dev.app 路径)。
 # Remove the previous dev .app every time so stale resources or Info.plist data cannot leak
-# into the new bundle. The production dist/Oh-My-Tab.app is never touched.
+# into the new bundle. The production dist/Oh-My-Tab.app is never touched. When the existing
+# bundle came from release-dev.sh's channel package, warn first that this local dev build
+# replaces it (both share dist/Oh-My-Tab-Dev.app).
+dev_profile_marker="$dev_app/Contents/Resources/dev-build-profile.txt"
+if [ -s "$dev_profile_marker" ] && [ "$(cat "$dev_profile_marker")" = "release-dev" ]; then
+    echo "note: replacing a release-dev.sh package at $dev_app with a local $build_profile build"
+fi
 if [ -d "$dev_app" ]; then
     rm -rf "$dev_app"
 fi
@@ -72,7 +108,7 @@ fi
 # cargo check/clippy/test 不产出主二进制,必须显式 build,否则启动的是旧版。
 # cargo check/clippy/test do not produce the main binary; build explicitly or the OLD
 # binary would start.
-if ! cargo build --manifest-path "$repo_dir/Cargo.toml" 2>&1; then
+if ! cargo build --manifest-path "$repo_dir/Cargo.toml" "${cargo_profile_args[@]}" 2>&1; then
     echo "restart FAILED: cargo build error (see output above)"
     exit 1
 fi
@@ -81,7 +117,7 @@ fi
 # Assemble a dedicated dev .app so macOS manages Accessibility / Screen Recording grants by
 # the bundle identity.
 mkdir -p "$dev_app/Contents/MacOS" "$dev_app/Contents/Resources"
-cp "$repo_dir/target/debug/oh-my-tab" "$dev_app_binary"
+cp "$build_target_dir/oh-my-tab" "$dev_app_binary"
 cp "$repo_dir/assets/Info.plist" "$dev_app/Contents/Info.plist"
 cp "$repo_dir/assets/AppIcon.icns" "$dev_app/Contents/Resources/AppIcon.icns"
 # 声明本地化的 .lproj 锚点:没有它们,系统面板(NSSavePanel 等)的按钮在中文系统上
@@ -93,6 +129,11 @@ cp -R "$repo_dir/assets/Resources/." "$dev_app/Contents/Resources/"
 if [ -d "$repo_dir/assets/AppIcon.icon" ]; then
     cp -R "$repo_dir/assets/AppIcon.icon" "$dev_app/Contents/Resources/AppIcon.icon"
 fi
+# 记录本包由哪个 profile 产出,供下次 dev-restart 识别是否覆盖了 release-dev 产物。
+# 必须在 codesign 之前写入,否则会被排除在签名之外。
+# Record which profile produced this bundle so the next dev-restart can tell whether it is
+# replacing a release-dev.sh artifact. Written before codesign so it is covered by the signature.
+printf '%s\n' "$build_profile" > "$dev_app/Contents/Resources/dev-build-profile.txt"
 # Optional local Sparkle framework. Keeping this optional lets the app run from a clean checkout;
 # placing Sparkle.framework under vendor/ enables real update checks in the dev bundle.
 sparkle_framework_path="${SPARKLE_FRAMEWORK_PATH:-$repo_dir/vendor/Sparkle.framework}"
@@ -209,6 +250,7 @@ for _ in 1 2 3 4 5; do
             "$dev_app/Contents/Info.plist" 2>/dev/null)"
         echo "restart ok (app pid $app_pid${wrapper_pid:+, wrapper pid $wrapper_pid})"
         echo "build-version: ${build_version:-unknown}"
+        echo "build-profile: $build_profile"
         exit 0
     fi
 done

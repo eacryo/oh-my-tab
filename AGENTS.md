@@ -22,7 +22,9 @@ scripts/dev-restart.sh
 - Documentation, comments, localization, and `AGENTS.md` changes need no Rust tests. Rust changes require `cargo fmt`; behavioral changes require targeted tests, plus `cargo check` when interfaces or compilation are affected.
 - Cross-module, unsafe/FFI, concurrency, configuration, build, or release changes require the full gate above. Before handing off a completed feature, always run the full gate and keep all checks clean.
 - Start the app with `scripts/dev-restart.sh`, never directly with `cargo run`. For runtime changes, run it after the full gate. If it reports `restart FAILED`, inspect the newest log under `~/Library/Logs/oh-my-tab/`, diagnose, and retry.
-- After a successful restart, report the timestamp-based `build-version` printed by the script.
+- `scripts/dev-restart.sh` defaults to a **debug** build (`cargo build`): fast iteration with every debug assertion on (objc2 `msg_send!` signature verification, `debug_assert_main_thread`, overflow checks). Use it for functional iteration and handoff.
+- For feel/perf validation (scrolling, animation, latency), run `scripts/dev-restart.sh --opt`. It uses the `dev-opt` cargo profile (`target/dev-opt/`): optimized like release while keeping `debug-assertions`, so runtime speed is representative but development still fails fast. Neither mode changes the dev bundle identity (`com.eacryo.oh-my-tab.dev`); both write `dist/Oh-My-Tab-Dev.app`, which `scripts/release-dev.sh` also uses for the dev channel.
+- Report the timestamp-based `build-version` printed by the script.
 
 ## Architecture and invariants
 
