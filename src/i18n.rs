@@ -29,7 +29,7 @@ const DEFAULT_LOCALE: &str = "en";
 #[cfg(any(debug_assertions, feature = "dev-long-text"))]
 pub(crate) const TEST_LONG_LOCALE: &str = "__oh_my_tab_test_long_en";
 #[cfg(any(debug_assertions, feature = "dev-long-text"))]
-const PSEUDO_LOCALE_ENV: &str = "OH_MY_TAB_PSEUDO_LOCALE";
+const PSEUDO_LOCALE_FLAG: &str = "pseudo-locale";
 
 // 已支持的 locale -> 内嵌 TOML 文本。新增语言只需加文件 + 在此登记。
 // Supported locale -> embedded TOML text. To add a language, add a file + register here.
@@ -143,16 +143,13 @@ pub fn current_locale() -> String {
 }
 
 /// Enable long-text layout QA without adding a fake production locale. Set
-/// `OH_MY_TAB_PSEUDO_LOCALE=1` before launching the app; placeholders such as `{count}` remain
-/// byte-for-byte intact so `tf` can still interpolate runtime values.
-/// 通过环境变量开启长文本布局 QA，不新增假的正式语言。启动前设置
-/// `OH_MY_TAB_PSEUDO_LOCALE=1`；`{count}` 等占位符保持原样，`tf` 仍可插入运行时值。
+/// `--pseudo-locale` (optionally `=1/true/yes/on`) before launching the app; placeholders such
+/// as `{count}` remain byte-for-byte intact so `tf` can still interpolate runtime values.
+/// 通过启动参数开启长文本布局 QA，不新增假的正式语言。启动时加
+/// `--pseudo-locale`（也可写 `--pseudo-locale=1`）；`{count}` 等占位符保持原样，`tf` 仍可插入运行时值。
 #[cfg(any(debug_assertions, feature = "dev-long-text"))]
 fn pseudo_locale_enabled() -> bool {
-    matches!(
-        std::env::var(PSEUDO_LOCALE_ENV).as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
+    crate::dev_flags::enabled(PSEUDO_LOCALE_FLAG)
 }
 
 /// Repeat English UI strings for the debug-only language-menu layout fixture.

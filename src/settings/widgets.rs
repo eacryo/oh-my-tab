@@ -4712,7 +4712,17 @@ unsafe fn collect_debug_layout(
 /// 开发阶段显式开启时验证真实 AppKit 页面树，捕获纯几何测试看不到的问题：后代控件相交、frame 越出
 /// document，以及因 view/layer 顺序错误而绘制到内容上方的分隔线。
 pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: &str) {
-    if !cfg!(debug_assertions) || std::env::var_os("OH_MY_TAB_LAYOUT_DEBUG").is_none() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    // 开关走 argv:`--layout-debug` 显式开;`--smoke-settings-layout` 冒烟路径自带(它要校验
+    // 的就是这套断言)。以前这里读环境变量、冒烟路径再 set_var 注入,现在两边都只看 argv。
+    // The switch rides argv: `--layout-debug` opts in explicitly, and the `--smoke-settings-layout`
+    // smoke path implies it (these assertions are exactly what it validates). This used to read an
+    // environment variable that the smoke path set with set_var; both sides are argv-only now.
+    if !crate::dev_flags::present("layout-debug")
+        && !crate::dev_flags::present("smoke-settings-layout")
+    {
         return;
     }
     if scroll.is_null() {

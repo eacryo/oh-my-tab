@@ -9,8 +9,8 @@
 //!   权限被撤销、老用户升级都不会落到错误的步骤上。
 //! - **只自动出现一次**:自动展示时立即写 UserDefaults 标记;此后只能从菜单栏"欢迎使用"
 //!   或开发开关再次打开。缺权限的老情况仍由启动告警框兜底,不会因为标记而失联。
-//! - **可验证**:`OH_MY_TAB_FORCE_ONBOARDING=1` / `--force-onboarding` 忽略标记;
-//!   `--onboarding=reset` 先清标记;`OH_MY_TAB_FAKE_PERMISSIONS=ax:0,sr:1`(仅 debug 构建)
+//! - **可验证**:`--force-onboarding` 忽略标记;
+//!   `--onboarding=reset` 先清标记;`--fake-permissions=ax:0,sr:1`(仅 debug 构建)
 //!   伪造*展示用*权限状态,便于在不动 TCC 的前提下走完所有分支。
 //!
 //! First-run onboarding: a small standalone window covering the required permission, the
@@ -25,8 +25,8 @@
 //! reopening, revoking a grant or upgrading cannot land on the wrong step); auto-shown once (the
 //! UserDefaults marker is written as soon as it appears, and the status item's "Welcome" entry or
 //! a development switch reopens it -- a missing permission stays covered by the startup alert);
-//! and verifiable (`OH_MY_TAB_FORCE_ONBOARDING=1` / `--force-onboarding` ignores the marker,
-//! `--onboarding=reset` clears it first, and `OH_MY_TAB_FAKE_PERMISSIONS=ax:0,sr:1` -- debug
+//! and verifiable (`--force-onboarding` ignores the marker,
+//! `--onboarding=reset` clears it first, and `--fake-permissions=ax:0,sr:1` -- debug
 //! builds only -- fakes the DISPLAYED permission state so every branch can be walked without
 //! touching TCC).
 
@@ -47,10 +47,13 @@ use crate::log_debug;
 /// Written once the guide has been auto-shown (a UserDefaults cross-launch marker like the
 /// update-notice ones: "already seen the guide" is UI lifecycle, not a setting the user tunes).
 const COMPLETED_KEY: &str = "oh-my-tab-onboarding-completed";
-const FORCE_ENV: &str = "OH_MY_TAB_FORCE_ONBOARDING";
-const FORCE_ARG: &str = "--force-onboarding";
+/// 开发开关(argv,见 dev_flags):强制展示 / 复位标记 / 抑制展示 / 伪造权限状态。
+/// Development switches (argv, see dev_flags): force the guide, reset the marker, suppress it,
+/// or fake the permission status.
+const FORCE_FLAG: &str = "force-onboarding";
 const RESET_ARG: &str = "--onboarding=reset";
-const FAKE_PERMISSIONS_ENV: &str = "OH_MY_TAB_FAKE_PERMISSIONS";
+const NO_ONBOARDING_FLAG: &str = "no-onboarding";
+const FAKE_PERMISSIONS_FLAG: &str = "fake-permissions";
 
 /// 按钮 tag:窗口里所有按钮共用一个 selector,按 tag 分派。
 /// Button tags: every button in the window shares one selector and dispatches by tag.
@@ -153,12 +156,11 @@ pub(crate) fn should_auto_show(
 /// 引导窗口在开发开关/冒烟模式下是否被抑制。
 /// Whether the guide is suppressed in smoke mode or by an explicit opt-out.
 pub(crate) fn is_suppressed() -> bool {
-    std::env::args().any(|arg| arg.starts_with("--smoke"))
-        || std::env::var_os("OH_MY_TAB_NO_ONBOARDING").is_some()
+    crate::dev_flags::any_prefix("--smoke") || crate::dev_flags::present(NO_ONBOARDING_FLAG)
 }
 
-fn forced_from_env_or_args() -> bool {
-    std::env::var_os(FORCE_ENV).is_some() || std::env::args().any(|arg| arg == FORCE_ARG)
+fn forced_requested() -> bool {
+    crate::dev_flags::present(FORCE_FLAG)
 }
 
 fn reset_requested() -> bool {
@@ -169,7 +171,7 @@ fn fake_permissions() -> PermissionOverride {
     if !cfg!(debug_assertions) {
         return PermissionOverride::default();
     }
-    std::env::var(FAKE_PERMISSIONS_ENV)
+    crate::dev_flags::value(FAKE_PERMISSIONS_FLAG)
         .map(|spec| parse_fake_permissions(&spec))
         .unwrap_or_default()
 }
@@ -259,7 +261,7 @@ fn permission_signature(state: &UiState) -> (bool, bool, bool) {
 /// Called from the launch sequence: shows the guide when the conditions hold and reports whether it
 /// did (the caller then skips the missing-permission alert so the two never pop together).
 pub(crate) fn maybe_show_on_launch() -> bool {
-    let forced = forced_from_env_or_args();
+    let forced = forced_requested();
     if reset_requested() {
         unsafe { defaults_remove(COMPLETED_KEY) };
         log_debug!("[onboarding] marker cleared by {}", RESET_ARG);

@@ -45,6 +45,6 @@ cargo test settings_layout_smoke -- --ignored
 
 ### 本地化与布局 QA
 
-`scripts/dev-restart.sh` 构建的 Debug 版会在语言下拉框中加入 `[TEST] English x3` 选项。选中后会把每一条英文 UI 文案重复三遍，便于在真实设置窗口中检查超长下拉项及其所在行、卡片。`scripts/release-dev.sh` 构建的优化开发包通过 `dev-long-text` Cargo feature 包含同一夹具；正式发布脚本不启用它。旧的 `OH_MY_TAB_PSEUDO_LOCALE=1` 开关仍可用于仅限 debug 的符号膨胀。
+`scripts/dev-restart.sh` 构建的 Debug 版会在语言下拉框中加入 `[TEST] English x3` 选项。选中后会把每一条英文 UI 文案重复三遍，便于在真实设置窗口中检查超长下拉项及其所在行、卡片。`scripts/release-dev.sh` 构建的优化开发包通过 `dev-long-text` Cargo feature 包含同一夹具；正式发布脚本不启用它。旧的 `--pseudo-locale` 开关仍可用于仅限 debug 的符号膨胀。
 
-在 debug 构建中设置 `OH_MY_TAB_LAYOUT_DEBUG=1` 可开启运行时设置页断言；控件重叠、frame 越界、以及图层顺序非法的分隔线会立即失败，并给出页面名和出错的 frame。这些检查用于补充视觉检查，而不是要求每次布局改动都必须人工目视。
+在 debug 构建中用 `--layout-debug` 启动可开启运行时设置页断言；控件重叠、frame 越界、以及图层顺序非法的分隔线会立即失败，并给出页面名和出错的 frame。这些检查用于补充视觉检查，而不是要求每次布局改动都必须人工目视。

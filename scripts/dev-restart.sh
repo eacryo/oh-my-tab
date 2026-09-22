@@ -5,13 +5,13 @@
 # 但保留 debug 断言),用于滚动/动画等体感与性能验证。
 #
 # 传递参数给应用(用于验证只在特定状态下出现的功能,如首次引导/权限分支):
-#   scripts/dev-restart.sh -- --force-onboarding        # `--` 之后的 argv 原样透传给应用
-#   OH_MY_TAB_FORCE_ONBOARDING=1 scripts/dev-restart.sh # 环境变量自动转发(只认 OH_MY_TAB_*)
-# 两者都只在本次启动生效:脚本每次先 pkill 旧实例,不会残留。
-# 安全约定(必须保持):转发是**白名单**——只有 OH_MY_TAB_* 进 launchd 任务;回显只打变量**名**
-# 不打值。不要把过滤改成“全部环境变量”,也不要把值打进输出:调用者 shell 里有云凭证与代理,
-# 泄一次就是事故(2026-09-22 曾因漏写此过滤泄露过整份环境)。新增开发开关请继续用
-# OH_MY_TAB_ 前缀,或走 `--` 后面的 argv。
+#   scripts/dev-restart.sh -- --force-onboarding   # `--` 之后的 argv 原样透传给应用
+#   scripts/dev-restart.sh --force-onboarding      # 脚本不认识的 --* 参数也照样透传
+# 开关只在本次启动生效:脚本每次先 pkill 旧实例,不会残留。
+# 为什么不用环境变量:开发版由 launchd 启动,而 launchd 任务不继承调用者环境;以前靠白名单转发
+# OH_MY_TAB_*,一旦过滤写漏就会把整份环境(云凭证、代理)灌进任务与日志 —— 2026-09-22 出过这次
+# 事故。现在只有 argv 一个通道:本脚本**不读、不转发、不回显任何环境变量**,也不要再加回来;
+# 新增开发开关在应用侧解析 `--` 参数即可,脚本无需改动。
 # Dev restart script: gracefully quit the old process -> build and assemble the dev .app ->
 # start the .app -> verify it is alive. Run by the agent after the
 # fmt/check/clippy/test gates pass (see the AGENTS.md convention).
@@ -20,14 +20,15 @@
 #
 # Passing arguments to the app (for verifying features that only appear in a specific state,
 # e.g. first-run onboarding or permission branches):
-#   scripts/dev-restart.sh -- --force-onboarding        # argv after `--` is forwarded verbatim
-#   OH_MY_TAB_FORCE_ONBOARDING=1 scripts/dev-restart.sh # env vars are forwarded (OH_MY_TAB_* only)
-# Both apply to this launch only: the script pkills old instances first, nothing sticks.
-# Security contract (keep it): forwarding is an ALLOWLIST -- only OH_MY_TAB_* enters the launchd
-# job, and output echoes variable NAMES, never values. Do not widen the filter to "all environment"
-# and do not print a value: the caller's shell holds cloud credentials and proxies, and one leak is
-# an incident (a missing filter leaked the whole environment on 2026-09-22). New development
-# switches keep the OH_MY_TAB_ prefix, or ride the argv after `--`.
+#   scripts/dev-restart.sh -- --force-onboarding   # argv after `--` is forwarded verbatim
+#   scripts/dev-restart.sh --force-onboarding      # any `--*` argument the script does not own
+# Switches apply to this launch only: the script pkills old instances first, nothing sticks.
+# Why no environment variables: the dev build is started by launchd, and a launchd job does not
+# inherit the caller's environment. The allowlist that used to forward OH_MY_TAB_* dumped the whole
+# environment (cloud credentials, proxies) into the job and the logs whenever the filter was wrong --
+# which happened once, on 2026-09-22. Argv is the only channel now: this script reads, forwards and
+# echoes no environment variable at all, and one must not be reintroduced. A new development switch
+# is parsed from a `--` argument on the app side, with no change here.
 
 # Resolve paths from this script, not from the caller's current directory. This
 # keeps both `./scripts/dev-restart.sh` and an absolute-path invocation working.
@@ -41,6 +42,7 @@ build_profile="debug"
 cargo_profile_args=()
 app_args=()
 after_separator=0
+require_stable_signing=0
 for arg in "$@"; do
     if [ "$after_separator" = "1" ]; then
         app_args+=("$arg")
@@ -49,21 +51,30 @@ for arg in "$@"; do
     case "$arg" in
         --) after_separator=1 ;;
         --opt) build_profile="dev-opt" ;;
+        --require-stable-signing) require_stable_signing=1 ;;
         -h|--help)
-            echo "Usage: scripts/dev-restart.sh [--opt] [-- <app args>...]"
+            echo "Usage: scripts/dev-restart.sh [--opt] [--require-stable-signing] [-- <app args>...]"
             echo "  (no flag)  debug build: fast iteration, complete debug assertions"
             echo "  --opt      dev-opt profile: optimized, debug assertions kept (feel/perf)"
-            echo "  -- ARGS    forward ARGS to the app executable, e.g."
-            echo "             scripts/dev-restart.sh -- --force-onboarding"
-            echo "Env: every OH_MY_TAB_* variable in the caller's environment is forwarded to the app,"
-            echo "     e.g. OH_MY_TAB_FORCE_ONBOARDING=1 scripts/dev-restart.sh"
-            echo "     (in use today: OH_MY_TAB_LAYOUT_DEBUG, OH_MY_TAB_PSEUDO_LOCALE,"
-            echo "      OH_MY_TAB_TEST_UPDATE_NOTICE)"
+            echo "  --require-stable-signing  fail instead of falling back to ad-hoc signing"
+            echo "  -- ARGS    forward ARGS to the app executable, verbatim"
+            echo "  --FLAG     every other --flag[=value] is forwarded to the app as well, e.g."
+            echo "             scripts/dev-restart.sh --open-settings=about --force-onboarding"
+            echo "  app switches in use: --open-settings[=<general|about|0..6>], --force-onboarding,"
+            echo "             --onboarding=reset, --no-onboarding, --fake-permissions=ax:0,sr:0,"
+            echo "             --pseudo-locale, --layout-debug, --test-update-notice[=available]"
+            echo "No environment variable is read, forwarded or echoed (see the header)."
             exit 0
+            ;;
+        --*)
+            # 应用自己的开发开关:脚本不认识也照样透传,新增开关不需要改这里。
+            # The app's own development switches: unknown to this script, forwarded anyway, so a
+            # new switch never needs a change here.
+            app_args+=("$arg")
             ;;
         *)
             echo "restart FAILED: unknown argument: $arg"
-            echo "hint: pass app flags after '--' (e.g. scripts/dev-restart.sh -- --force-onboarding)"
+            echo "hint: app switches start with '--' (e.g. scripts/dev-restart.sh --force-onboarding)"
             exit 2
             ;;
     esac
@@ -207,7 +218,6 @@ fi
 # Prefer a stable signing identity so TCC grants survive rebuilds; allow ad-hoc fallback on
 # development machines that do not have the certificate.
 sign_identity="oh-my-tab-sign"
-require_stable_signing="${OH_MY_TAB_REQUIRE_STABLE_SIGNING:-0}"
 if /usr/bin/codesign --deep --force \
     --sign "$sign_identity" \
     --identifier "$dev_bundle_id" \
@@ -233,29 +243,6 @@ if ! /usr/bin/codesign --verify --deep --strict "$dev_app"; then
     exit 1
 fi
 
-# 把调用者环境里的 OH_MY_TAB_* 变量转发进 launchd 任务,这样新增开发开关不必再改本脚本。
-# 今天在用的:OH_MY_TAB_LAYOUT_DEBUG / OH_MY_TAB_PSEUDO_LOCALE / OH_MY_TAB_TEST_UPDATE_NOTICE。
-# 白名单是硬约束,见文件头的安全约定:非 OH_MY_TAB_* 一律不转发。
-# Forward the caller's OH_MY_TAB_* variables into the launchd job so new development switches
-# need no script edit. In use today: OH_MY_TAB_LAYOUT_DEBUG, OH_MY_TAB_PSEUDO_LOCALE,
-# OH_MY_TAB_TEST_UPDATE_NOTICE. The allowlist is a hard constraint (see the security contract at
-# the top of this file): anything that is not OH_MY_TAB_* is never forwarded.
-launch_env_args=()
-while IFS= read -r env_name; do
-    # 只转发本应用自己的开发开关。其余环境变量(代理、云凭证、SSH_AUTH_SOCK 等)一律
-    # 不进 launchd 任务,也不回显——它们与验证无关,泄露一次就是事故。
-    # Forward ONLY the app's own development switches. Every other variable (proxies, cloud
-    # credentials, SSH_AUTH_SOCK, ...) must neither enter the launchd job nor be echoed: they
-    # are irrelevant to verification and leaking one is an incident.
-    case "$env_name" in
-        OH_MY_TAB_*) ;;
-        *) continue ;;
-    esac
-    # 内部哨兵由下面的命令行显式设置,不重复转发。
-    # The internal sentinel is set explicitly on the command line below; do not forward it twice.
-    [ "$env_name" = "OH_MY_TAB_LAUNCHD_WRAPPER" ] && continue
-    launch_env_args+=("$env_name=${!env_name}")
-done < <(compgen -e | sort)
 
 # 应用参数:`--` 之后的 argv 通过 open --args 原样交给应用(open 会把它后面的一切都
 # 当作被启动应用的参数)。
@@ -273,8 +260,7 @@ launch_output_dir="$HOME/Library/Logs/oh-my-tab"
 mkdir -p "$launch_output_dir"
 launch_output="$launch_output_dir/dev-launchd-open.log"
 submit_error="$(launchctl submit -l "$launch_label" -o "$launch_output" -e "$launch_output" -- \
-    /usr/bin/env OH_MY_TAB_LAUNCHD_WRAPPER=1 "${launch_env_args[@]}" \
-    "$repo_dir/scripts/dev-launchd-wrapper.sh" "$launch_label" \
+    "$repo_dir/scripts/dev-launchd-wrapper.sh" --from-launchd "$launch_label" \
     "${open_command[@]}" 2>&1)"
 submit_status=$?
 if [ "$submit_status" -ne 0 ] && ! launchctl print "$launch_target" >/dev/null 2>&1; then
@@ -308,16 +294,12 @@ for _ in 1 2 3 4 5; do
         echo "restart ok (app pid $app_pid${wrapper_pid:+, wrapper pid $wrapper_pid})"
         echo "build-version: ${build_version:-unknown}"
         echo "build-profile: $build_profile"
-        # 把本次透传的 argv / 环境变量名回显出来,便于确认验证开关真的生效了。
-        # 环境变量只打名字、不打值:值是调用者环境里的东西,不该进日志或终端记录。
-        # Echo this launch's forwarded argv / env NAMES so it is obvious the verification switches
-        # actually took effect. Never echo env values: they belong to the caller's environment and
-        # must not land in logs or terminal scrollback.
+        # 把本次透传的 argv 回显出来,便于确认验证开关真的生效了。argv 是调用者自己写下的
+        # 内容,回显它不涉及任何环境变量。
+        # Echo this launch's forwarded argv so it is obvious the verification switches took effect.
+        # The argv is what the caller typed; echoing it involves no environment variable.
         if [ "${#app_args[@]}" -gt 0 ]; then
             echo "app args: ${app_args[*]}"
-        fi
-        if [ "${#launch_env_args[@]}" -gt 0 ]; then
-            echo "app env names: $(printf '%s\n' "${launch_env_args[@]}" | cut -d= -f1 | sort | tr '\n' ' ')"
         fi
         exit 0
     fi

@@ -2526,14 +2526,22 @@ pub(crate) fn initialize(automatically_check: bool) -> bool {
     // 上次会话若完成了安装,这里发"已更新到 X"的系统通知。
     // If the previous session completed an update install, announce it here.
     crate::update_notice::check_pending();
-    // 测试钩子:OH_MY_TAB_TEST_UPDATE_NOTICE=1 时启动即发一条"已更新"通知,
+    // 测试钩子:`--test-update-notice`(可带 `=available`)启动即发一条"已更新"通知,
     // 便于在没有真实 Sparkle 更新的环境里验证通知链路(授权/横幅/i18n 文案)。
-    // Test hook: with OH_MY_TAB_TEST_UPDATE_NOTICE=1, the update notification is posted at
-    // startup so the pipeline (authorization/banner/i18n copy) can be verified without a
-    // real Sparkle update.
-    if let Some(mode) = std::env::var_os("OH_MY_TAB_TEST_UPDATE_NOTICE")
-        .map(|v| v.to_string_lossy().into_owned())
-        .filter(|v| !v.is_empty() && v != "0")
+    // Test hook: `--test-update-notice` (optionally `=available`) posts the update notification
+    // at startup so the pipeline (authorization/banner/i18n copy) can be verified without a real
+    // Sparkle update.
+    if let Some(mode) = crate::dev_flags::value("test-update-notice")
+        // 裸开关等价于 `=1`,与历史环境变量语义一致;`=0` 视为关闭。
+        // A bare switch means `=1` (the historical environment semantics); `=0` disables it.
+        .map(|mode| {
+            if mode.is_empty() {
+                "1".to_string()
+            } else {
+                mode
+            }
+        })
+        .filter(|mode| mode != "0")
     {
         let app = unsafe { app_display_name() };
         let version = unsafe { bundle_info_string("CFBundleShortVersionString") };

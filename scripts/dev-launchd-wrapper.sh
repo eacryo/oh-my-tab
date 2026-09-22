@@ -6,12 +6,15 @@
 set -u
 
 # This helper is an internal launchd entry point. Refuse direct invocation before touching
-# launchd or attempting to execute an empty command.
-# 此脚本只供 launchd 内部调用。直接运行时先退出,避免触碰 launchd 或执行空命令。
-if [ "${OH_MY_TAB_LAUNCHD_WRAPPER:-}" != "1" ]; then
+# launchd or attempting to execute an empty command. The sentinel is an argv rather than an
+# environment variable, so the whole launch chain stays environment-free.
+# 此脚本只供 launchd 内部调用。直接运行时先退出,避免触碰 launchd 或执行空命令。哨兵走 argv
+# 而不是环境变量,整条启动链因此不依赖任何环境变量。
+if [ "${1:-}" != "--from-launchd" ]; then
     echo "error: scripts/dev-launchd-wrapper.sh is an internal helper; run scripts/dev-restart.sh instead" >&2
     exit 64
 fi
+shift
 
 if [ "$#" -lt 2 ] || [ -z "${1:-}" ]; then
     echo "error: dev-launchd-wrapper.sh requires a launchd label and a command" >&2

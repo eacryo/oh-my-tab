@@ -4,6 +4,7 @@ mod callback_guard;
 mod clipboard;
 mod clipboard_highlight;
 mod config;
+mod dev_flags;
 mod event_monitor;
 mod event_tap;
 mod ffi;
@@ -2140,23 +2141,15 @@ fn prompt_accessibility_if_needed() {
     }
 }
 
-/// 开发开关解析:`OH_MY_TAB_OPEN_SETTINGS=<general|about|0..6|1>` 或 `--open-settings[=<page>]`。
-/// 返回要打开的侧栏页索引(0=通用 … 6=关于);未设置或解析失败返回 None(正常启动不受影响)。
-/// Parses the development switch `OH_MY_TAB_OPEN_SETTINGS=<general|about|0..6|1>` or
-/// `--open-settings[=<page>]` into a sidebar page index (0=General .. 6=About); None when unset or
-/// unparsable, so a normal launch is unaffected.
+/// 开发开关解析:`--open-settings[=<general|about|0..6|1>]`,由 `scripts/dev-restart.sh`
+/// 透传(argv 是唯一通道,见 dev_flags 模块说明)。返回要打开的侧栏页索引
+/// (0=通用 … 6=关于);未设置或解析失败返回 None(正常启动不受影响)。
+/// Parses the development switch `--open-settings[=<general|about|0..6|1>]`, forwarded by
+/// `scripts/dev-restart.sh` (argv is the only channel; see the dev_flags module). Returns a
+/// sidebar page index (0=General .. 6=About); None when absent or unparsable, so a normal launch
+/// is unaffected.
 fn open_settings_page_request() -> Option<usize> {
-    let env = std::env::var("OH_MY_TAB_OPEN_SETTINGS").ok();
-    let args: Vec<String> = std::env::args().collect();
-    let arg = args
-        .iter()
-        .find_map(|arg| arg.strip_prefix("--open-settings=").map(str::to_string))
-        .or_else(|| {
-            args.iter()
-                .any(|arg| arg == "--open-settings")
-                .then(String::new)
-        });
-    let spec = env.or(arg)?;
+    let spec = crate::dev_flags::value("open-settings")?;
     match spec.trim().to_ascii_lowercase().as_str() {
         "" | "1" | "true" | "about" | "6" => Some(6),
         "general" | "0" => Some(0),
@@ -2537,7 +2530,10 @@ pub fn run() {
     // GUI session; a panic/non-zero exit reports a failure.
     if std::env::args().any(|a| a == "--smoke-settings-layout") {
         unsafe {
-            std::env::set_var("OH_MY_TAB_LAYOUT_DEBUG", "1");
+            // 布局校验的开关由 widgets::debug_validate_settings_page 自己识别
+            // `--smoke-settings-layout`,不再往环境里注入变量。
+            // The layout validator recognizes `--smoke-settings-layout` on its own; nothing is
+            // injected into the environment any more.
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![nsapp, finishLaunching];
             let ok = settings::settings_layout_smoke_runner();
@@ -2566,7 +2562,7 @@ pub fn run() {
             prompt_accessibility_if_needed();
         }
         // 开发开关:启动即把设置窗口停在某页,便于用脚本/cua 验证界面。
-        // `OH_MY_TAB_OPEN_SETTINGS=<general|about|0..6>` 或 `--open-settings[=<page>]`。
+        // `--open-settings[=<general|about|0..6>]`(由 scripts/dev-restart.sh 透传)。
         // Development switch: park the settings window on a page at launch so the UI can be
         // verified from a script / cua.
         if let Some(page) = open_settings_page_request() {
