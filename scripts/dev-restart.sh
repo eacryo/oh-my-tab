@@ -62,7 +62,8 @@ for arg in "$@"; do
             echo "             scripts/dev-restart.sh --open-settings=about --force-onboarding"
             echo "  app switches in use: --open-settings[=<general|about|0..6>], --force-onboarding,"
             echo "             --onboarding=reset, --no-onboarding, --fake-permissions=ax:0,sr:0,"
-            echo "             --pseudo-locale, --layout-debug, --test-update-notice[=available]"
+            echo "             --pseudo-locale, --layout-debug, --test-update-notice[=available],"
+            echo "             --e2e-state=<path> (JSON state snapshots for scripts/e2e/*.sh)"
             echo "No environment variable is read, forwarded or echoed (see the header)."
             exit 0
             ;;

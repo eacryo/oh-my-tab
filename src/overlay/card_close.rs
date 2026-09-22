@@ -687,6 +687,12 @@ pub(super) fn commit_selected_window(overlay_was_visible: bool) {
     };
     let release_started = Instant::now();
     log_debug!("Switching to '{}' (pid={} cgwid={})", app_name, pid, cgwid);
+    // A2 层 E2E:记录本次抬窗的目标。此刻 `selected` 与 `windows` 都还在,但**可见性已经在上面
+    // 的闭包里置 false 了**,所以这份快照的 visible 是 false(脚本因此不在 commit 帧上断言可见性)。
+    // A2 E2E: records the raise target. `selected` and `windows` are still intact here, but
+    // visibility was already set to false by the closure above, so this snapshot reports
+    // visible: false -- which is why the scripts never assert visibility on a commit frame.
+    crate::e2e_state::record_commit(pid, cgwid, &app_name, selected);
     // 先视觉隐藏(不 orderOut),再激活目标窗口,最后延迟 orderOut。
     // 先 orderOut 会干扰 WindowServer 焦点路由,导致目标窗口的 first-responder 未确立
     // (光标停止闪烁等)。对齐 BetterCmdTab 的 vanish() -> activate() -> dismiss() 时序。

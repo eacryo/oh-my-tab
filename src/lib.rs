@@ -5,6 +5,7 @@ mod clipboard;
 mod clipboard_highlight;
 mod config;
 mod dev_flags;
+mod e2e_state;
 mod event_monitor;
 mod event_tap;
 mod ffi;

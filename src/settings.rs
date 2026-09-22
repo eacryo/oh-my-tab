@@ -708,6 +708,71 @@ fn start_inline_update_check() {
 /// About page, and start an inline check. Once the settings window exists, its host view
 /// is registered, so the "update found" UI renders INLINE in the About page (see
 /// updater::render_target) instead of a standalone window.
+/// A2 层 E2E 用:暴露要断言几何的视图根(名字 → 视图),由 `e2e_state` 递归遍历成 JSON。
+/// 只列"有语义、要断言"的根(侧栏高亮、七个侧栏按钮、七个页容器),不做通用遍历入口。
+/// A2 E2E: exposes the view roots whose geometry must be asserted (name → view); `e2e_state`
+/// walks them into JSON. Only semantic roots (highlight, the seven sidebar buttons, the seven page
+/// containers) are listed -- this is not a generic traversal entry point.
+pub(crate) fn e2e_view_roots() -> Vec<(&'static str, *mut AnyObject)> {
+    const SIDEBAR_NAMES: [&str; 7] = [
+        "sidebar_0_general",
+        "sidebar_1_switcher",
+        "sidebar_2_mouse",
+        "sidebar_3_clipboard",
+        "sidebar_4_window_control",
+        "sidebar_5_quick_actions",
+        "sidebar_6_about",
+    ];
+    const PAGE_NAMES: [&str; 7] = [
+        "page_0_general",
+        "page_1_switcher",
+        "page_2_mouse",
+        "page_3_clipboard",
+        "page_4_window_control",
+        "page_5_quick_actions",
+        "page_6_about",
+    ];
+    with_settings_ui(|ui| match ui {
+        Some(ui) => {
+            let mut roots: Vec<(&'static str, *mut AnyObject)> =
+                vec![("sidebar_highlight", ui.sidebar_highlight)];
+            let buttons = [
+                ui.sidebar_general,
+                ui.sidebar_switcher,
+                ui.sidebar_mouse,
+                ui.sidebar_clipboard,
+                ui.sidebar_window_control,
+                ui.sidebar_quick_actions,
+                ui.sidebar_about,
+            ];
+            let pages = [
+                ui.general_view,
+                ui.switcher_view,
+                ui.mouse_view,
+                ui.clipboard_view,
+                ui.window_control_view,
+                ui.quick_actions_view,
+                ui.about_view,
+            ];
+            for (index, view) in buttons.into_iter().enumerate() {
+                roots.push((SIDEBAR_NAMES[index], view));
+            }
+            for (index, view) in pages.into_iter().enumerate() {
+                roots.push((PAGE_NAMES[index], view));
+            }
+            roots.retain(|(_, view)| !view.is_null());
+            roots
+        }
+        None => Vec::new(),
+    })
+}
+
+/// A2 层 E2E 用:当前侧栏选中页索引。
+/// A2 E2E: the currently selected sidebar page index.
+pub(crate) fn e2e_selected_sidebar() -> usize {
+    SIDEBAR_SELECTED.load(Ordering::SeqCst)
+}
+
 /// 开发开关用:打开设置窗口并切到指定页(0=通用 … 6=关于)。与 `open_about_updates` 不同,
 /// 这里不触发任何更新检查,只做"把设置窗口停在某一页"。
 /// Development-switch helper: open the settings window on a specific page (0=General .. 6=About).

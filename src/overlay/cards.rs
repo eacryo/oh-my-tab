@@ -1100,6 +1100,12 @@ pub(crate) fn show_overlay() {
         // whole summon, so the settings window is never raised (and no stash is needed).
         let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
         let _: bool = msg_send![window, makeFirstResponder: container];
+        // A2 层 E2E:浮窗已上屏且选中态已就位,写一份快照(仅 `--e2e-state=<path>` 时生效)。
+        // 位置在窗口上屏之后、任何 AppState 借用之外,因此可以安全地再借一次读状态。
+        // A2 E2E: the overlay is on screen and the selection is set, so write a snapshot (only with
+        // `--e2e-state=<path>`). Placed after the window is ordered front and outside every AppState
+        // borrow, so it can safely borrow the state once more to read it.
+        crate::e2e_state::record("summon");
         // 启动 hover 轮询:浮窗显示期间每 16ms 读全局鼠标位置命中卡片(侧键按住期间
         // 移动事件无法经 tap/tracking 获取,轮询是唯一可靠来源)。
         // Start the hover poll: while shown, read the global cursor every 16ms to hit-test

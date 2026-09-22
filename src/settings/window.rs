@@ -165,6 +165,12 @@ pub(super) fn select_sidebar(idx: usize) {
             page.validate(page_names[idx]);
         });
     }
+    // A2 层 E2E:选中态与高亮 pill 已归位,写一条几何快照供 scripts/e2e 断言。
+    // 必须放在 with_settings_ui 闭包**之外**:闭包内再借一次会被重入保护静默挡掉。
+    // A2 E2E: the selection and the highlight pill are parked, so write a geometry snapshot for
+    // scripts/e2e. It must sit outside the with_settings_ui closure -- a nested borrow there is
+    // silently swallowed by the reentrancy guard.
+    crate::e2e_state::record("settings");
 }
 
 /// Refresh the About page's live TCC status labels without reloading user settings.
