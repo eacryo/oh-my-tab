@@ -334,6 +334,14 @@ pub(crate) const THUMB_PREVIEW_RATIO: f64 = 1.6;
 /// 少量窗口时的最大卡片放大倍数；1.0 是原有缩略图卡片尺寸。
 /// Maximum card enlargement for small window sets; 1.0 is the original thumbnail size.
 pub(crate) const THUMB_MAX_SCALE: f64 = 1.5;
+/// 窗口较多时的最小缩放下限(相对基准卡宽)。比 1.0 更小是为了让"行数跳变"更容易被跨过:
+/// 同一屏上,0.85 能把可见行从 3 提到 4(见 theme 的布局测试),而 0.9 会因为行距仍差一点点
+/// 而白缩。下限只在窗口数达到 7 及以上时生效;放大档(1.1–1.5)保持不变。
+/// The smallest scale (relative to the base card width) for large window sets. Going below 1.0
+/// makes the row-count jump easier to cross: on a 1470x956 screen 0.85 lifts the visible rows from
+/// 3 to 4 while 0.9 shrinks for nothing. It only applies from seven windows up; the enlargement
+/// steps (1.1-1.5) are unchanged.
+pub(crate) const THUMB_MIN_SCALE: f64 = 0.85;
 /// 卡片区顶部留白。/ Top inset above the thumbnail card area.
 const THUMB_TOP_INSET: f64 = 32.0;
 
@@ -342,7 +350,8 @@ const THUMB_TOP_INSET: f64 = 32.0;
 /// aspect ratios must not feed back into card size.
 pub(crate) fn thumb_scale_for_count(count: usize) -> f64 {
     match count {
-        0 | 7.. => 1.0,
+        0 => 1.0,
+        7.. => THUMB_MIN_SCALE,
         1 | 2 => THUMB_MAX_SCALE,
         3 => 1.4,
         4 => 1.3,
@@ -372,7 +381,7 @@ pub(crate) fn thumb_card_h_fixed() -> f64 {
 /// Scale is based on the base card width; caption and padding stay fixed instead
 /// of mechanically enlarging text and controls.
 pub(crate) fn thumb_card_h_for_scale(scale: f64) -> f64 {
-    thumb_card_h(THUMB_CARD_BASE_W * scale.max(1.0))
+    thumb_card_h(THUMB_CARD_BASE_W * scale.max(THUMB_MIN_SCALE))
 }
 
 /// 预览区高度 = 卡片高 - 上下 padding - 标题行 - 间距(纯函数,可测)。
@@ -1447,8 +1456,40 @@ mod flow_tests {
         assert_eq!(thumb_scale_for_count(4), 1.3);
         assert_eq!(thumb_scale_for_count(5), 1.2);
         assert_eq!(thumb_scale_for_count(6), 1.1);
-        assert_eq!(thumb_scale_for_count(7), 1.0);
-        assert_eq!(thumb_scale_for_count(30), 1.0);
+        assert_eq!(thumb_scale_for_count(7), THUMB_MIN_SCALE);
+        assert_eq!(thumb_scale_for_count(30), THUMB_MIN_SCALE);
+    }
+
+    /// 档位是唯一决定卡片尺寸的输入:这里把下限/上限和几何后果钉住,布局装箱测试则用相对断言,
+    /// 于是"调档位"只会让本测试需要更新,而不会殃及装箱算法测试。
+    /// The ladder is the only input that decides card size: this test pins the floor, the cap and their
+    /// geometric consequences, so a ladder tweak only ever touches this test.
+    #[test]
+    fn the_scale_ladder_keeps_its_floor_and_cap() {
+        assert_eq!(thumb_scale_for_count(0), 1.0);
+        assert_eq!(thumb_scale_for_count(1), THUMB_MAX_SCALE);
+        assert_eq!(thumb_scale_for_count(2), THUMB_MAX_SCALE);
+        for count in 3..=6 {
+            let scale = thumb_scale_for_count(count);
+            assert!(
+                scale > THUMB_MIN_SCALE && scale < THUMB_MAX_SCALE,
+                "count {count} should sit between the floor and the cap, got {scale}"
+            );
+        }
+        for count in 7..40 {
+            assert_eq!(
+                thumb_scale_for_count(count),
+                THUMB_MIN_SCALE,
+                "count {count}"
+            );
+        }
+        // 下限必须真的更小(否则等于白缩),且预览区仍在可辨认的下限之上。
+        // The floor must actually be smaller (otherwise it shrinks for nothing) while the preview area
+        // stays above its legibility floor.
+        assert!(THUMB_MIN_SCALE < 1.0);
+        let floor_card_h = thumb_card_h_for_scale(THUMB_MIN_SCALE);
+        assert!(floor_card_h < thumb_card_h_for_scale(1.0));
+        assert!(thumb_preview_h(floor_card_h) > 40.0);
     }
 
     #[test]
@@ -1471,58 +1512,96 @@ mod flow_tests {
     #[test]
     fn overflow_uses_stable_pages_instead_of_sliding() {
         let aspects = vec![1.6; 8];
-        let base_h = thumb_card_h_fixed();
+        let base_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let two_row_panel_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let initial = plan_thumb_flow_layout(&aspects, 1, 900.0, two_row_panel_h, THUMB_ROW_GAP);
         assert!(initial.overflowed);
-        assert_eq!(initial.scale, 1.0);
-        assert_eq!(initial.visible, 0..4);
-        // 两行各两张卡时，宽度按当前页最宽行收缩，而不是占满 900pt 预算。
-        // With two rows of two cards, width follows the widest actual row instead of
-        // consuming the full 900pt packing budget.
+        // 这里只断言"用的是当前档位",档位取值由 the_scale_ladder_... 专门钉住:
+        // 装箱算法测试不应随档位调整而变红。
+        // Only the use of the current scale is asserted here; the ladder values are pinned by
+        // the_scale_ladder_keeps_its_floor_and_cap so packing tests cannot break on a ladder tweak.
+        assert_eq!(initial.scale, thumb_scale_for_count(aspects.len()));
+        // 一页 = 两行 × 当前每行能放的张数:由布局自身推导,不写死旧尺寸下的 4 张。
+        // A page is two rows of whatever fits per row: derived from the layout instead of hardcoding
+        // the four cards the old size produced.
+        let per_row = initial.row_ranges.first().unwrap().len();
+        assert_eq!(initial.row_ranges.len(), 2);
+        assert!(
+            per_row >= 2,
+            "a row should hold at least two cards, got {per_row}"
+        );
+        assert_eq!(initial.visible, 0..per_row * 2);
+        // 宽度按当前页最宽行收缩，而不是占满 900pt 预算。
+        // Width follows the widest actual row instead of consuming the full 900pt packing budget.
+        let card_w = thumb_card_w_for_aspect(thumb_card_h_for_scale(initial.scale), 1.6);
         assert_eq!(
             initial.panel_w,
-            2.0 * 300.0 + THUMB_ROW_GAP + H_PADDING * 2.0
+            per_row as f64 * card_w + (per_row - 1) as f64 * THUMB_ROW_GAP + H_PADDING * 2.0
         );
 
-        let next = plan_thumb_flow_layout(&aspects, 4, 900.0, two_row_panel_h, THUMB_ROW_GAP);
-        assert_eq!(next.visible, 4..8);
-        assert_eq!(next.page_index, 1);
+        let next =
+            plan_thumb_flow_layout(&aspects, per_row * 2, 900.0, two_row_panel_h, THUMB_ROW_GAP);
+        // 第二页从第一页之后开始,覆盖到末尾(每行张数由档位决定,所以页数不写死)。
+        // The second page starts where the first ends and covers the rest; the per-row count comes
+        // from the ladder, so the page count is not hardcoded.
+        assert_eq!(next.visible, per_row * 2..aspects.len());
+        assert!(next.page_index > initial.page_index);
+        // 8 张卡在两行一页的分页下恒定是 2 页(每行 2 张 → 4 行;每行 3 张 → 3 行),与档位无关。
+        // Eight cards always make two pages of two rows each (two per row -> four rows, three per row
+        // -> three rows), independent of the ladder.
+        assert_eq!(initial.page_count, 2);
         assert_eq!(next.page_count, 2);
-        assert_eq!(next.panel_w, initial.panel_w);
+        assert!(next.panel_w <= initial.panel_w);
         assert_eq!(next.panel_h, initial.panel_h);
         assert_eq!(
             next.placements
                 .iter()
                 .map(|placement| placement.index)
                 .collect::<Vec<_>>(),
-            vec![4, 5, 6, 7]
+            (per_row * 2..aspects.len()).collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn wide_thumbnail_budget_fits_four_columns_without_changing_height() {
         let aspects = vec![1.6; 12];
-        let card_h = thumb_card_h_fixed();
+        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let three_row_panel_h =
             THUMB_TOP_INSET + card_h * 3.0 + THUMB_ROW_GAP * 2.0 + status_h() + 0.1;
+        // 预算由**当前卡宽**算出:窄预算塞得下 3 列(12 张要 4 行 → 溢出),宽预算塞得下 4 列
+        // (12 张正好 3 行 → 一页)。这样断言与档位无关,只表达"横向预算决定列数"这个意图。
+        // Budgets derive from the *current* card width: the narrow one holds three columns (twelve
+        // cards need four rows -> overflow) and the wide one holds four (twelve cards fit three rows ->
+        // one page). The assertions therefore express the intent "horizontal budget decides the column
+        // count" without depending on the ladder.
+        let card_w = thumb_card_w_for_aspect(card_h, 1.6);
+        let inner_for_columns = |columns: f64| columns * card_w + (columns - 1.0) * THUMB_ROW_GAP;
         let capped = plan_thumb_flow_layout(
             &aspects,
             1,
-            1240.0 - H_PADDING * 2.0,
+            inner_for_columns(3.0),
             three_row_panel_h,
             THUMB_ROW_GAP,
         );
-        let wide = plan_thumb_flow_layout(&aspects, 1, 1288.0, three_row_panel_h, THUMB_ROW_GAP);
+        let wide = plan_thumb_flow_layout(
+            &aspects,
+            1,
+            inner_for_columns(4.0),
+            three_row_panel_h,
+            THUMB_ROW_GAP,
+        );
 
         // 旧上限下每行只能放三张；放宽横向预算后四列可用，12 张保持一页。
         // Under the old cap only three cards fit per row; with the wider budget four
         // columns fit and all twelve cards remain on one page.
-        assert_eq!(capped.visible, 0..9);
+        // 断言意图而不是旧尺寸下的具体范围:更宽的横向预算应当放下全部卡片,且高度不变。
+        // Assert intent rather than the ranges the old card size produced: a wider horizontal budget
+        // fits every card, at the same height.
         assert!(capped.overflowed);
-        assert_eq!(wide.visible, 0..12);
         assert!(!wide.overflowed);
         assert_eq!(wide.page_count, 1);
+        assert_eq!(wide.visible, 0..aspects.len());
+        assert!(wide.visible.len() > capped.visible.len());
         // 只改变横向容量，三行高度应保持一致。
         // Only horizontal capacity changes; the three-row height remains identical.
         assert_eq!(wide.panel_h, capped.panel_h);
@@ -1531,7 +1610,7 @@ mod flow_tests {
     #[test]
     fn selecting_any_item_on_a_page_keeps_the_same_page_boundary() {
         let aspects = vec![1.6; 8];
-        let base_h = thumb_card_h_fixed();
+        let base_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let max_h = 32.0 + base_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         for selected in 4..8 {
             let layout = plan_thumb_flow_layout(&aspects, selected, 614.0, max_h, THUMB_ROW_GAP);
@@ -1627,7 +1706,7 @@ mod flow_tests {
     #[test]
     fn scrolling_layout_keeps_rows_and_panel_size_stable() {
         let aspects = vec![1.6; 20];
-        let card_h = thumb_card_h_fixed();
+        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let first = plan_thumb_scroll_layout(
             &aspects,
@@ -1667,7 +1746,7 @@ mod flow_tests {
     #[test]
     fn scrolling_layout_width_follows_the_widest_visible_grid_row() {
         let aspects = vec![1.6; 8];
-        let card_h = thumb_card_h_fixed();
+        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let layout = plan_thumb_scroll_layout(
             &aspects,
@@ -1680,15 +1759,36 @@ mod flow_tests {
         );
 
         assert!(layout.overflowed);
-        assert_eq!(layout.row_ranges, vec![0..2, 2..4, 4..6, 6..8]);
+        // 行/列结构按意图断言:除最后一行外每行等长、连续铺满 8 张(不写死旧尺寸下的行数)。
+        // Row structure is asserted as intent: every row but the last is full, tiling all eight cards
+        // (instead of hardcoding the row count the old card size produced).
+        let per_row = layout.row_ranges.first().unwrap().len();
+        assert!(layout
+            .row_ranges
+            .iter()
+            .take(layout.row_ranges.len() - 1)
+            .all(|row| row.len() == per_row));
+        assert_eq!(layout.row_ranges.first().unwrap().start, 0);
+        assert_eq!(layout.row_ranges.last().unwrap().end, aspects.len());
+        // 宽度跟随"最宽可见行",卡宽由当前档位推导(不再写死基准宽 300)。
+        // The width follows the widest visible row, with the card width derived from the layout's own
+        // scale instead of a hardcoded base width.
+        let card_w = thumb_card_w_for_aspect(thumb_card_h_for_scale(layout.scale), 1.6);
         assert_eq!(
             layout.panel_w,
-            2.0 * 300.0 + THUMB_ROW_GAP + H_PADDING * 2.0 + THUMB_SCROLLBAR_W
+            per_row as f64 * card_w
+                + (per_row - 1) as f64 * THUMB_ROW_GAP
+                + H_PADDING * 2.0
+                + THUMB_SCROLLBAR_W
         );
         let first = layout.document_placements.first().unwrap();
         assert_eq!(first.x, H_PADDING + THUMB_SCROLLBAR_W / 2.0);
+        // 右侧留白 = 面板宽 - (首卡 x + 一整行卡片 + 行内间距),行内卡片数取当前 per_row。
+        // Right padding = panel width - (first card x + a full row of cards + in-row gaps), with the
+        // card count taken from the layout's own per_row instead of a hardcoded two.
         assert_eq!(
-            layout.panel_w - (first.x + first.width * 2.0 + THUMB_ROW_GAP),
+            layout.panel_w
+                - (first.x + first.width * per_row as f64 + (per_row - 1) as f64 * THUMB_ROW_GAP),
             H_PADDING + THUMB_SCROLLBAR_W / 2.0
         );
         assert!(layout.panel_w < 1400.0);
@@ -1697,7 +1797,7 @@ mod flow_tests {
     #[test]
     fn scrolling_overflow_fills_the_initial_viewport_greedily() {
         let aspects = vec![1.6; 13];
-        let card_h = thumb_card_h_fixed();
+        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let max_h = THUMB_TOP_INSET + card_h * 3.0 + THUMB_ROW_GAP * 2.0 + status_h() + 0.1;
         let layout = plan_thumb_scroll_layout(
             &aspects,
@@ -1737,7 +1837,7 @@ mod flow_tests {
     #[test]
     fn scrolling_layout_clamps_to_the_last_row() {
         let aspects = vec![1.6; 20];
-        let card_h = thumb_card_h_fixed();
+        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let layout = plan_thumb_scroll_layout(
             &aspects,
@@ -1755,7 +1855,7 @@ mod flow_tests {
     #[test]
     fn scrolling_layout_keeps_fractional_offset_and_renders_partial_row() {
         let aspects = vec![1.6; 20];
-        let card_h = thumb_card_h_fixed();
+        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let row_pitch = card_h + THUMB_ROW_GAP;
         let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
         let layout = plan_thumb_scroll_layout(
