@@ -708,10 +708,29 @@ fn start_inline_update_check() {
 /// About page, and start an inline check. Once the settings window exists, its host view
 /// is registered, so the "update found" UI renders INLINE in the About page (see
 /// updater::render_target) instead of a standalone window.
+/// 开发开关用:打开设置窗口并切到指定页(0=通用 … 6=关于)。与 `open_about_updates` 不同,
+/// 这里不触发任何更新检查,只做"把设置窗口停在某一页"。
+/// Development-switch helper: open the settings window on a specific page (0=General .. 6=About).
+/// Unlike `open_about_updates` it triggers no update check; it only parks the window on a page.
+pub(crate) fn show_settings_page(page: usize) {
+    show_settings();
+    // 连调两次:第一次带动画(previous_idx != idx),而首次构建时窗口尚未上屏、CA 动画不会提交,
+    // 高亮会停在旧位置;第二次 previous_idx == idx 走无动画分支,直接把 pill 放到目标行。
+    // Select twice: the first call animates (previous_idx != idx) and the spring never commits while
+    // the window is still off-screen, leaving the pill behind; the second call sees previous_idx == idx
+    // and takes the no-animation path, parking the pill on the target row for real.
+    select_sidebar(page.min(6));
+    select_sidebar(page.min(6));
+}
+
 pub(crate) fn open_about_updates() {
     show_settings();
     // show_settings 每次打开都复位到通用页,这里再切到 About(tag=6)。
     // show_settings resets to the General page on every open; switch to About (tag=6) here.
+    // 同 show_settings_page:再调一次走无动画分支,避免"窗口首次构建时高亮不跟随"。
+    // Same as show_settings_page: a second call takes the no-animation path so the highlight cannot
+    // stay behind when the window is being built for the first time.
+    select_sidebar(6);
     select_sidebar(6);
     unsafe {
         with_settings_ui(|ui| {

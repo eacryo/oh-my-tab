@@ -30,6 +30,41 @@ unsafe fn set_permission_banner_visible(ui: &SettingsUi, visible: bool) {
 /// 切换侧边栏选中页:高亮背景对齐到选中按钮、切换七个内容视图显隐、选中项粗体。
 /// Switch the active settings page: align the highlight to the selected button, toggle the
 /// seven content views' visibility, and bold the selected item's label.
+/// 设置页「行内右侧操作按钮」的唯一口径:右对齐到控制列(control column)右缘,
+/// 尺寸 110×28,role 固定 Action。通用设置的「导出日志」是基准样本,关于页的
+///「查看引导」「打开设置」都复用它,避免各页各写一组魔数导致按钮大小/位置漂移。
+/// The single convention for an in-row action button in the settings pages: flush to the right
+/// edge of the control column, 110x28, always SettingsButtonRole::Action. General's "Export
+/// Logs" is the reference; About's "Open" and "Open Settings" reuse it so pages cannot drift
+/// apart with their own magic numbers.
+pub(crate) const ROW_ACTION_BTN_W: f64 = 110.0;
+pub(crate) const ROW_ACTION_BTN_H: f64 = 28.0;
+
+/// 生成一个行内右侧操作按钮(调用方负责 addSubview 与 release_obj,或交给 SettingsRow)。
+/// Builds an in-row action button (the caller owns addSubview/release_obj, or hands it to a
+/// SettingsRow helper).
+fn row_action_button(
+    ctrl_x: f64,
+    ctrl_w: f64,
+    row_y: f64,
+    title: &str,
+    target: *mut AnyObject,
+    action: Sel,
+) -> *mut AnyObject {
+    unsafe {
+        SettingsControl::button(
+            ctrl_x + ctrl_w - ROW_ACTION_BTN_W,
+            row_y,
+            ROW_ACTION_BTN_W,
+            ROW_ACTION_BTN_H,
+            title,
+            target,
+            action,
+            SettingsButtonRole::Action,
+        )
+    }
+}
+
 pub(super) fn select_sidebar(idx: usize) {
     // tag 越界时回退到通用页 / fall back to the General page if the tag is out of range
     let idx = if idx > 6 { 0 } else { idx };
@@ -1793,16 +1828,13 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // In-card divider: the export row sits right below it (separator_above_row owns the
         // row-relative math).
         SettingsRow::separator_above_row(general_view, y, described_row_h, content_w);
-        const EXPORT_BTN_W: f64 = 110.0;
-        let export_btn = SettingsControl::button(
-            ctrl_x + ctrl_w - EXPORT_BTN_W,
+        let export_btn = row_action_button(
+            ctrl_x,
+            ctrl_w,
             y,
-            EXPORT_BTN_W,
-            28.0,
             &t("settings.btn_export_logs"),
             target,
             sel!(handleExportLogs:),
-            SettingsButtonRole::Action,
         );
         SettingsRow::described(
             general_view,
@@ -3269,15 +3301,24 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let _: () = msg_send![about_view, addSubview: about_header_hit];
         release_obj(about_header_hit);
 
-        let mut ay = header_top - 88.0;
+        // 卡片内的行一律由 layout 推导(与其他页同一口径):第一行 = 卡片顶 - 底内缩 - 行高,
+        // 之后逐行 next_row_cursor。原来的 header_top - 88 - 35 - 27 是旧布局的魔法数。
+        // Rows inside a card are derived from the layout, like every other page: the first row is
+        // card top minus the bottom inset minus the row height, then next_row_cursor steps down.
+        // The old header_top - 88 - 35 - 27 was legacy magic arithmetic.
         // Keep the App section title close to its card, matching the spacing used by the
         // other settings pages. The About card holds several rows, so its content cursor is lower
         // than a normal section header; placing the title at the old cursor left a large void.
         // 让 App 分组标题贴近下方卡片,与其他设置页保持一致。About 卡片有多行内容,其内容
         // 游标比普通区块标题更低;沿用旧游标会在标题和卡片之间留下过大的空白。
-        let app_label_y = ay - 35.0;
-        ay -= 27.0;
-        let about_row_step = layout.row_gap + described_row_h;
+        // 页头(图标 + 标题 + 版本副标题)占 header_top 往下 88pt;分组标题必须从页头**底部**
+        // 再按 section_step 落位,否则会压到图标上(实测:直接 next_section_cursor(header_top)
+        // 会让「应用」标题落在图标下半部)。
+        // The page header (icon + title + version subtitle) occupies 88pt below header_top; a
+        // section title must step down from the header's BOTTOM or it lands on the icon (measured:
+        // next_section_cursor(header_top) put the "App" title inside the icon's lower half).
+        const ABOUT_HEADER_BLOCK_H: f64 = 88.0;
+        let app_label_y = layout.next_section_cursor(header_top - ABOUT_HEADER_BLOCK_H);
         // Keep every About row on the same two-column grid: label on the left, value on the right.
         // About 页面所有行统一使用两列网格：左侧标签，右侧值。
         let about_value_x = label_x + 145.0;
@@ -3287,7 +3328,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // "View guide" leads the App card: the guide covers precisely the permissions and usage the
         // rows below describe, and it can be reopened at any time (the button dispatches by
         // selector and leaves the SettingsButton tag alone).
-        let guide_y = ay - about_row_step;
+        // 第一行同样走 layout 的行距约定(和卡片内其它行、以及其它页一致);此前用的是
+        // card_top - card_bottom_inset - described_row_h,比约定多 6pt,这一行因此看着更高。
+        // The first row uses the same layout row-step convention as the rest of the card (and every
+        // other page); it used card_top - card_bottom_inset - described_row_h before, 6pt more than
+        // the convention, which made this row look taller.
+        let guide_y = layout.next_row_cursor(app_label_y, described_row_h);
         SettingsRow::plain(
             about_view,
             label_x,
@@ -3295,18 +3341,25 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             label_w,
             described_row_h,
             &t("settings.row_view_guide"),
-            SettingsControl::button(
-                about_value_x,
-                guide_y + (described_row_h - row_h) / 2.0,
-                96.0,
-                row_h,
+            // 与「导出日志」「打开设置」同一组件、同一口径:贴在控制列右缘,不再跟 App 卡片
+            // 的值列(about_value_x)对齐。单行行高 54,按钮在行内垂直居中。
+            // Same component and convention as "Export Logs" and "Open Settings": flush to the
+            // control column's right edge instead of the App card's value column (about_value_x).
+            // The row is a single 54pt line, so the button centers vertically inside it.
+            row_action_button(
+                ctrl_x,
+                ctrl_w,
+                guide_y + (described_row_h - ROW_ACTION_BTN_H) / 2.0,
                 &t("settings.btn_open"),
                 target,
                 sel!(handleOpenOnboarding:),
-                SettingsButtonRole::Action,
             ),
         );
-        let website_y = guide_y - about_row_step;
+        let website_y = layout.next_row_cursor(guide_y, described_row_h);
+        // 「查看引导」成为卡片第一行后,「网站」行需要自己的分割线(否则它与首行之间没有分隔)。
+        // With "View guide" leading the card, the website row needs its own separator (it used to
+        // be the first row, so it had none).
+        SettingsRow::separator_above_row(about_view, website_y, described_row_h, content_w);
         SettingsRow::plain(
             about_view,
             label_x,
@@ -3323,7 +3376,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 0,
             ),
         );
-        let github_y = website_y - about_row_step;
+        let github_y = layout.next_row_cursor(website_y, described_row_h);
         SettingsRow::separator_above_row(about_view, github_y, described_row_h, content_w);
         SettingsRow::plain(
             about_view,
@@ -3341,7 +3394,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 1,
             ),
         );
-        let version_y = github_y - about_row_step;
+        let version_y = layout.next_row_cursor(github_y, described_row_h);
         SettingsRow::separator_above_row(about_view, version_y, described_row_h, content_w);
         SettingsRow::plain(
             about_view,
@@ -3371,12 +3424,17 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             &t("settings.section_app"),
         );
 
-        let permissions_label_y = version_y - 53.0;
-        let permissions_row_top_y = permissions_label_y - 27.0 - 44.0;
-        let permission_status_w = 120.0;
+        let permissions_label_y = layout.next_section_cursor(app_card_bottom);
+        // 第一行从卡片顶推导,与 card_bottom_inset(10) 对称;原来的 27+44 用了旧行高 44,
+        // 导致该行上方多出约 11pt(实测"第一行比第二行高")。
+        // The first row derives from the card top so it matches card_bottom_inset (10); the old
+        // 27+44 assumed the retired 44pt row height and left ~11pt of extra space above it.
+        let permissions_row_top_y = layout.next_row_cursor(permissions_label_y, described_row_h);
         let permission_action_gap = 8.0;
-        let permission_button_w = ctrl_w - permission_status_w - permission_action_gap;
-        let permission_button_h = 28.0;
+        // 状态列宽由「导出日志」按钮口径反推,保证按钮右缘与行内其它操作按钮重合。
+        // The status column width is derived from the shared action-button convention so the
+        // button's right edge lines up with every other in-row action button.
+        let permission_status_w = ctrl_w - ROW_ACTION_BTN_W - permission_action_gap;
         let accessibility_status = SettingsControl::value_label(
             ctrl_x,
             permissions_row_top_y,
@@ -3394,24 +3452,19 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             &t("settings.permission_accessibility_label"),
             accessibility_status,
         );
-        let accessibility_button = SettingsButton::action(
-            NSRect::new(
-                NSPoint::new(
-                    ctrl_x + permission_status_w + permission_action_gap,
-                    permissions_row_top_y + (described_row_h - permission_button_h) / 2.0,
-                ),
-                NSSize::new(permission_button_w, permission_button_h),
-            ),
+        let accessibility_button = row_action_button(
+            ctrl_x,
+            ctrl_w,
+            permissions_row_top_y + (described_row_h - ROW_ACTION_BTN_H) / 2.0,
             &t("settings.btn_open_permission_settings"),
             target,
             sel!(handleOpenPrivacy:),
-            SettingsButtonRole::Action,
         );
         let _: () = msg_send![about_view, addSubview: accessibility_button];
         ui.accessibility_permission_button = accessibility_button;
         release_obj(accessibility_button);
 
-        let screen_recording_row_y = permissions_row_top_y - about_row_step;
+        let screen_recording_row_y = layout.next_row_cursor(permissions_row_top_y, described_row_h);
         SettingsRow::separator_above_row(
             about_view,
             screen_recording_row_y,
@@ -3435,18 +3488,13 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             &t("settings.permission_screen_recording_label"),
             screen_recording_status,
         );
-        let screen_recording_button = SettingsButton::action(
-            NSRect::new(
-                NSPoint::new(
-                    ctrl_x + permission_status_w + permission_action_gap,
-                    screen_recording_row_y + (described_row_h - permission_button_h) / 2.0,
-                ),
-                NSSize::new(permission_button_w, permission_button_h),
-            ),
+        let screen_recording_button = row_action_button(
+            ctrl_x,
+            ctrl_w,
+            screen_recording_row_y + (described_row_h - ROW_ACTION_BTN_H) / 2.0,
             &t("settings.btn_open_permission_settings"),
             target,
             sel!(handleOpenScreenRecordingPrivacy:),
-            SettingsButtonRole::Action,
         );
         let _: () = msg_send![about_view, addSubview: screen_recording_button];
         release_obj(screen_recording_button);
@@ -3464,8 +3512,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             &t("settings.section_permissions"),
         );
 
-        let updates_label_y = permissions_card_bottom - 42.0;
-        let update_row_y = updates_label_y - 27.0 - 44.0;
+        let updates_label_y = layout.next_section_cursor(permissions_card_bottom);
+        let update_row_y = layout.next_row_cursor(updates_label_y, described_row_h);
         ui.update_auto_check = SettingsRow::described(
             about_view,
             label_x,
@@ -3479,7 +3527,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         bind_control(target, ui.update_auto_check);
         // 自动下载并安装更新开关,位于「自动检查更新」与「检查更新」之间。
         // Automatically-download-and-install switch, between auto-check and the check button.
-        let download_row_y = update_row_y - described_row_h;
+        let download_row_y = layout.next_row_cursor(update_row_y, described_row_h);
         ui.update_auto_download = SettingsRow::described(
             about_view,
             label_x,
@@ -3717,6 +3765,18 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         }
 
         with_settings_ui(|slot| *slot = Some(ui));
+
+        // 窗口是带着"某个已选页"构建的(SIDEBAR_SELECTED ≠ 0,例如启动参数直接打开「关于」、
+        // 或点更新通知进「关于」):页面按它建好了,但侧栏高亮默认停在第 0 项。构建**完全结束后**
+        // 再应用一次选中态。注意必须在 with_settings_ui 闭包之外调用——闭包内再借一次会被
+        // MainThreadSlot 的重入保护挡掉,静默什么都不做(实测高亮不动就是踩了这个)。
+        // The window may be built while a page is already selected (SIDEBAR_SELECTED != 0, e.g.
+        // launched straight onto About, or opened from the update notification): the page is built
+        // accordingly, but the sidebar highlight defaults to item 0. Re-apply the selection once the
+        // build has finished. It must run OUTSIDE the with_settings_ui closure: re-borrowing from
+        // inside hits MainThreadSlot's reentrancy guard and silently does nothing (measured: that is
+        // why the highlight did not move).
+        select_sidebar(SIDEBAR_SELECTED.load(Ordering::SeqCst));
     }
 }
 

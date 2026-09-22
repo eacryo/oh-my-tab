@@ -2140,6 +2140,30 @@ fn prompt_accessibility_if_needed() {
     }
 }
 
+/// 开发开关解析:`OH_MY_TAB_OPEN_SETTINGS=<general|about|0..6|1>` 或 `--open-settings[=<page>]`。
+/// 返回要打开的侧栏页索引(0=通用 … 6=关于);未设置或解析失败返回 None(正常启动不受影响)。
+/// Parses the development switch `OH_MY_TAB_OPEN_SETTINGS=<general|about|0..6|1>` or
+/// `--open-settings[=<page>]` into a sidebar page index (0=General .. 6=About); None when unset or
+/// unparsable, so a normal launch is unaffected.
+fn open_settings_page_request() -> Option<usize> {
+    let env = std::env::var("OH_MY_TAB_OPEN_SETTINGS").ok();
+    let args: Vec<String> = std::env::args().collect();
+    let arg = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--open-settings=").map(str::to_string))
+        .or_else(|| {
+            args.iter()
+                .any(|arg| arg == "--open-settings")
+                .then(String::new)
+        });
+    let spec = env.or(arg)?;
+    match spec.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "true" | "about" | "6" => Some(6),
+        "general" | "0" => Some(0),
+        other => other.parse::<usize>().ok().map(|page| page.min(6)),
+    }
+}
+
 /// App 入口:完整的启动/冒烟/运行循环(由 bin 薄壳调用,lib 化后保持行为不变)。
 /// App entry: the full startup/smoke/run loop (called by the thin bin wrapper; behavior
 /// is unchanged by the lib/bin split).
@@ -2540,6 +2564,13 @@ pub fn run() {
         // Prompt for Accessibility if missing (the event-monitor thread is already retrying in the background).
         if !onboarding_shown {
             prompt_accessibility_if_needed();
+        }
+        // 开发开关:启动即把设置窗口停在某页,便于用脚本/cua 验证界面。
+        // `OH_MY_TAB_OPEN_SETTINGS=<general|about|0..6>` 或 `--open-settings[=<page>]`。
+        // Development switch: park the settings window on a page at launch so the UI can be
+        // verified from a script / cua.
+        if let Some(page) = open_settings_page_request() {
+            settings::show_settings_page(page);
         }
         let _: () = msg_send![nsapp, run];
     }
