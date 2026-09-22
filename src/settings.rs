@@ -502,6 +502,7 @@ mod dispatch;
 pub(crate) mod glass_preview;
 pub(crate) mod mapping;
 pub(crate) mod restore;
+mod select;
 pub(crate) mod tooltip;
 pub(crate) mod widgets;
 mod window;

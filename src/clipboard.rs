@@ -62,7 +62,8 @@ use crate::clipboard_highlight::{
 };
 use crate::config::CONFIG;
 use crate::event_tap::{
-    CGEventCreateKeyboardEvent, CGEventFlags, CGEventPost, CGEventSetFlags, K_CG_SESSION_EVENT_TAP,
+    keyboard, CGEventCreateKeyboardEvent, CGEventFlags, CGEventPost, CGEventSetFlags,
+    K_CG_SESSION_EVENT_TAP,
 };
 use crate::ffi::{
     class_addMethod, localtime_r, make_nsstring, nsstring_to_rust, objc_allocateClassPair,
@@ -156,9 +157,9 @@ const THUMB_H: f64 = 44.0;
 const THUMB_R: f64 = 6.0;
 /// 画布内来源图标与缩略图之间的间隙 / gap between the app icon and the thumb in the canvas.
 /// 模拟粘贴用的 V 键码 / keycode used when synthesizing Cmd+V.
-const VK_V: u16 = 9;
+const VK_V: u16 = keyboard::VK_V;
 /// 模拟粘贴用的 Command 修饰掩码 / Command modifier mask for synthesized paste.
-const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = 0x00100000;
+const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = keyboard::FLAG_COMMAND;
 /// 轮询间隔(秒)/ polling interval (seconds)
 const POLL_INTERVAL: f64 = 0.5;
 /// 浮窗最大高度:单行 61pt 行距 + 头部条(108)+ 底部栏(43),约 8-9 行 + 留白 ≈ 720pt,

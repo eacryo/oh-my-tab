@@ -27,6 +27,31 @@ pub(crate) type CGEventType = u32;
 pub(crate) type CGEventFlags = u64;
 pub(crate) type CGEventMask = u64;
 
+/// 把各个事件 tap 共用的 CoreGraphics 数值集中在叶子模块，避免窗口切换、快捷操作和
+/// 窗口控制各自维护一份容易漂移的副本。模块专属的动作键仍留在对应模块中。
+/// Shared keyboard event types, fields, modifier masks, and common keycodes live in this leaf
+/// module so the window switcher, quick actions, and window control do not maintain drifting
+/// copies. Module-specific action keys remain local.
+pub(crate) mod keyboard {
+    pub(crate) const EVENT_KEY_DOWN: super::CGEventType = 10;
+    pub(crate) const EVENT_KEY_UP: super::CGEventType = 11;
+    pub(crate) const EVENT_FLAGS_CHANGED: super::CGEventType = 12;
+    pub(crate) const FIELD_AUTOREPEAT: i32 = 8;
+    pub(crate) const FIELD_KEYCODE: i32 = 9;
+
+    pub(crate) const FLAG_COMMAND: super::CGEventFlags = 0x0010_0000;
+    pub(crate) const FLAG_OPTION: super::CGEventFlags = 0x0008_0000;
+    pub(crate) const FLAG_CONTROL: super::CGEventFlags = 0x0004_0000;
+    pub(crate) const FLAG_SHIFT: super::CGEventFlags = 0x0002_0000;
+
+    pub(crate) const VK_TAB: u16 = 48;
+    pub(crate) const VK_V: u16 = 9;
+    pub(crate) const VK_LEFT: u16 = 123;
+    pub(crate) const VK_RIGHT: u16 = 124;
+    pub(crate) const VK_DOWN: u16 = 125;
+    pub(crate) const VK_UP: u16 = 126;
+}
+
 /// CGEventTapDisabled pseudo-event values from CoreGraphics' CGEventTypes.h.
 pub(crate) const TAP_DISABLED_BY_TIMEOUT: CGEventType = 0xFFFF_FFFE;
 pub(crate) const TAP_DISABLED_BY_USER_INPUT: CGEventType = 0xFFFF_FFFF;

@@ -15,7 +15,7 @@ use objc2::{class, msg_send};
 
 use crate::event_monitor::GlobalEvent;
 use crate::event_tap::{
-    self, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent,
+    self, keyboard, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent,
     CGEventCreateKeyboardEvent, CGEventFlags, CGEventGetFlags, CGEventGetIntegerValueField,
     CGEventMask, CGEventPost, CGEventRef, CGEventSetFlags, CGEventTapProxy, CGEventType,
     K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
@@ -31,22 +31,19 @@ use std::time::{Duration, Instant};
 // ========== 键盘事件常量 / keyboard event constants ==========
 // 键码来自 Carbon HIToolbox Events.h(kVK_ANSI_I/E/D/L)。
 // Keycodes are from Carbon HIToolbox Events.h (kVK_ANSI_I/E/D/L).
-const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
-const K_CG_EVENT_KEY_UP: CGEventType = 11;
-const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
-const K_CG_KEYBOARD_EVENT_AUTOREPEAT: i32 = 8;
 const K_VK_I: u16 = 34;
 const K_VK_E: u16 = 14;
 const K_VK_D: u16 = 2;
 const K_VK_L: u16 = 37;
-const K_CG_EVENT_FLAGS_CHANGED: CGEventType = 12;
 // 修饰键位掩码:必须恰好是 Option(带其他修饰键的组合透传,与 Option+方向键同规则)。
 // Modifier masks: exactly Option is required; combos with extra modifiers pass through
 // (same rule as Option+arrows).
-const K_FLAG_OPTION: CGEventFlags = 0x00080000;
-const K_FLAG_COMMAND: CGEventFlags = 0x00100000;
-const K_FLAG_SHIFT: CGEventFlags = 0x00020000;
-const K_FLAG_CONTROL: CGEventFlags = 0x00040000;
+use crate::event_tap::keyboard::{
+    EVENT_FLAGS_CHANGED as K_CG_EVENT_FLAGS_CHANGED, EVENT_KEY_DOWN as K_CG_EVENT_KEY_DOWN,
+    EVENT_KEY_UP as K_CG_EVENT_KEY_UP, FIELD_AUTOREPEAT as K_CG_KEYBOARD_EVENT_AUTOREPEAT,
+    FIELD_KEYCODE as K_CG_KEYBOARD_EVENT_KEYCODE, FLAG_COMMAND as K_FLAG_COMMAND,
+    FLAG_CONTROL as K_FLAG_CONTROL, FLAG_OPTION as K_FLAG_OPTION, FLAG_SHIFT as K_FLAG_SHIFT,
+};
 const K_DOUBLE_CONTROL_INTERVAL: Duration = Duration::from_millis(350);
 
 static CONTROL_DOWN: AtomicBool = AtomicBool::new(false);
@@ -477,7 +474,7 @@ unsafe fn post_cmd_n_to_pid(pid: i32) {
     // kVK_ANSI_N = 45(与 shortcut.rs 的 "n" -> 0x2D 一致)。
     // kVK_ANSI_N = 45 (matches shortcut.rs's "n" -> 0x2D).
     const KEY_N: u16 = 0x2D;
-    const K_FLAG_COMMAND: CGEventFlags = 0x00100000;
+    const K_FLAG_COMMAND: CGEventFlags = keyboard::FLAG_COMMAND;
     let down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), KEY_N, true);
     let up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), KEY_N, false);
     CGEventSetFlags(down, K_FLAG_COMMAND);

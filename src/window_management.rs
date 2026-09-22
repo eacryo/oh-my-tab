@@ -19,9 +19,9 @@ use objc2_foundation::NSRect;
 
 use crate::event_monitor::GlobalEvent;
 use crate::event_tap::{
-    self, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent, CGEventFlags,
-    CGEventGetFlags, CGEventGetIntegerValueField, CGEventMask, CGEventRef, CGEventTapProxy,
-    CGEventType, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
+    self, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent, CGEventGetFlags,
+    CGEventGetIntegerValueField, CGEventMask, CGEventRef, CGEventTapProxy, CGEventType,
+    K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
 };
 use crate::ffi::{
     kCFBooleanFalse, kCFBooleanTrue, AXError, AXUIElementCopyAttributeValue,
@@ -40,22 +40,13 @@ use std::time::Instant;
 // ========== 键盘事件常量 / keyboard event constants ==========
 // 见 CGEventTypes.h;键码来自 Carbon HIToolbox Events.h。
 // See CGEventTypes.h; keycodes are from Carbon HIToolbox Events.h.
-const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
-const K_CG_EVENT_KEY_UP: CGEventType = 11;
-const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
-const K_CG_KEYBOARD_EVENT_AUTOREPEAT: i32 = 8;
-// 方向键键码 / arrow keycodes.
-const K_VK_LEFT: u16 = 123;
-const K_VK_RIGHT: u16 = 124;
-const K_VK_DOWN: u16 = 125;
-const K_VK_UP: u16 = 126;
-// 修饰键位掩码:Option 为基础;Shift 用于跨显示器移动,Command/Control 组合透传。
-// Modifier masks: Option is required; Shift selects cross-display movement, while
-// Command/Control combinations pass through.
-const K_FLAG_OPTION: CGEventFlags = 0x00080000;
-const K_FLAG_COMMAND: CGEventFlags = 0x00100000;
-const K_FLAG_SHIFT: CGEventFlags = 0x00020000;
-const K_FLAG_CONTROL: CGEventFlags = 0x00040000;
+use crate::event_tap::keyboard::{
+    EVENT_KEY_DOWN as K_CG_EVENT_KEY_DOWN, EVENT_KEY_UP as K_CG_EVENT_KEY_UP,
+    FIELD_AUTOREPEAT as K_CG_KEYBOARD_EVENT_AUTOREPEAT,
+    FIELD_KEYCODE as K_CG_KEYBOARD_EVENT_KEYCODE, FLAG_COMMAND as K_FLAG_COMMAND,
+    FLAG_CONTROL as K_FLAG_CONTROL, FLAG_OPTION as K_FLAG_OPTION, FLAG_SHIFT as K_FLAG_SHIFT,
+    VK_DOWN as K_VK_DOWN, VK_LEFT as K_VK_LEFT, VK_RIGHT as K_VK_RIGHT, VK_UP as K_VK_UP,
+};
 
 // ========== AX 属性名与常量 / AX attribute names and constants ==========
 const K_AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";

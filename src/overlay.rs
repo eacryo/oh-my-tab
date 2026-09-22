@@ -20,6 +20,7 @@ use std::time::Instant; // TIMING-DEBUG
 
 use crate::config::{self, CONFIG};
 use crate::event_tap;
+use crate::event_tap::keyboard;
 use crate::ffi::*;
 use crate::i18n::t;
 use crate::icon_cache::extract_icon_to_cache;
@@ -37,11 +38,11 @@ use crate::{log_debug, log_info, WINDOW_COUNT};
 
 // ========== 键盘键码 / keyboard key codes ==========
 
-pub(crate) const KEY_TAB: u16 = 48;
-pub(crate) const KEY_LEFT: u16 = 123;
-pub(crate) const KEY_RIGHT: u16 = 124;
-pub(crate) const KEY_DOWN: u16 = 125;
-pub(crate) const KEY_UP: u16 = 126;
+pub(crate) const KEY_TAB: u16 = keyboard::VK_TAB;
+pub(crate) const KEY_LEFT: u16 = keyboard::VK_LEFT;
+pub(crate) const KEY_RIGHT: u16 = keyboard::VK_RIGHT;
+pub(crate) const KEY_DOWN: u16 = keyboard::VK_DOWN;
+pub(crate) const KEY_UP: u16 = keyboard::VK_UP;
 pub(crate) const KEY_ESCAPE: u16 = 53;
 pub(crate) const KEY_RETURN: u16 = 36;
 pub(crate) const KEY_DELETE: u16 = 51; // Backspace

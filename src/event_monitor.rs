@@ -32,19 +32,14 @@ pub enum GlobalEvent {
     QuickAction(u8),
 }
 
-// 窗口切换专用常量 / window-switcher-specific constants
-const K_CG_EVENT_KEY_DOWN: crate::event_tap::CGEventType = 10;
-const K_CG_EVENT_FLAGS_CHANGED: crate::event_tap::CGEventType = 12;
-const K_CG_KEYBOARD_EVENT_AUTOREPEAT: i32 = 8;
-const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
-const K_CG_EVENT_FLAG_MASK_COMMAND: crate::event_tap::CGEventFlags = 0x00100000;
-const K_CG_EVENT_FLAG_MASK_ALTERNATE: crate::event_tap::CGEventFlags = 0x00080000;
-const K_CG_EVENT_FLAG_MASK_CONTROL: crate::event_tap::CGEventFlags = 0x00040000;
-const K_CG_EVENT_FLAG_MASK_SHIFT: crate::event_tap::CGEventFlags = 0x00020000;
-const K_VK_TAB: u16 = 48;
-// 历史剪贴板呼出键:Option+V(V 键码 9)。
-// History-clipboard summon key: Option+V (V keycode 9).
-const K_VK_V: u16 = 9;
+// 窗口切换所需的键盘常量别名 / keyboard constants used by the window switcher
+use crate::event_tap::keyboard::{
+    EVENT_FLAGS_CHANGED as K_CG_EVENT_FLAGS_CHANGED, EVENT_KEY_DOWN as K_CG_EVENT_KEY_DOWN,
+    FIELD_AUTOREPEAT as K_CG_KEYBOARD_EVENT_AUTOREPEAT,
+    FIELD_KEYCODE as K_CG_KEYBOARD_EVENT_KEYCODE, FLAG_COMMAND as K_CG_EVENT_FLAG_MASK_COMMAND,
+    FLAG_CONTROL as K_CG_EVENT_FLAG_MASK_CONTROL, FLAG_OPTION as K_CG_EVENT_FLAG_MASK_ALTERNATE,
+    FLAG_SHIFT as K_CG_EVENT_FLAG_MASK_SHIFT, VK_TAB as K_VK_TAB, VK_V as K_VK_V,
+};
 
 fn switcher_tab_event(flags: crate::event_tap::CGEventFlags) -> GlobalEvent {
     if flags & K_CG_EVENT_FLAG_MASK_SHIFT != 0 {
