@@ -1521,6 +1521,13 @@ fn config_path() -> std::path::PathBuf {
     config_path_in(&std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
 }
 
+/// 配置文件是否已存在。引导用它区分「全新安装」与「老用户升级」(后者不打扰)。
+/// Whether the config file already exists. The guide uses it to tell a fresh install from an
+/// upgrade (which must not be nagged).
+pub(crate) fn config_file_exists() -> bool {
+    config_path().exists()
+}
+
 /// 在给定 home 下计算配置路径(纯函数,测试可注入临时目录)。
 /// Compute the config path under a given home (pure; tests inject a temp dir).
 fn config_path_in(home: &str) -> std::path::PathBuf {

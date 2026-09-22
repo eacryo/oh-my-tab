@@ -15,6 +15,7 @@ mod logger;
 mod mem;
 mod menu;
 mod mouse;
+mod onboarding;
 mod overlay;
 mod performance;
 mod pointer_locator;
@@ -1429,6 +1430,24 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(handleOnboardingAction:),
+            onboarding::on_action as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleOpenOnboarding:),
+            onboarding::on_open_from_settings as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleOnboardingTick:),
+            onboarding::on_tick as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleAppLaunch:),
             on_app_launched as *mut c_void,
             types_v_obj.as_ptr(),
@@ -2504,9 +2523,17 @@ pub fn run() {
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![nsapp, finishLaunching];
+        // 首次运行的引导(只自动弹一次):它已经讲了辅助功能,展示时就不再弹告警框,避免两个
+        // 框同时出现。缺权限且引导已被看过的老情况仍由告警框兜底。
+        // The first-run guide (auto-shown once): it covers Accessibility itself, so the alert is
+        // skipped while it is on screen -- two dialogs at once help nobody. The alert still covers
+        // a missing grant once the guide has already been seen.
+        let onboarding_shown = onboarding::maybe_show_on_launch();
         // 启动后若缺 Accessibility 权限,弹告警框引导授权(事件监听线程已在后台有限次重试)。
         // Prompt for Accessibility if missing (the event-monitor thread is already retrying in the background).
-        prompt_accessibility_if_needed();
+        if !onboarding_shown {
+            prompt_accessibility_if_needed();
+        }
         let _: () = msg_send![nsapp, run];
     }
 }

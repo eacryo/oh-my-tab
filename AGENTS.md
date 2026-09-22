@@ -25,6 +25,8 @@ scripts/dev-restart.sh
 - `scripts/dev-restart.sh` defaults to a **debug** build (`cargo build`): fast iteration with every debug assertion on (objc2 `msg_send!` signature verification, `debug_assert_main_thread`, overflow checks). Use it for functional iteration and handoff.
 - For feel/perf validation (scrolling, animation, latency), run `scripts/dev-restart.sh --opt`. It uses the `dev-opt` cargo profile (`target/dev-opt/`): optimized like release while keeping `debug-assertions`, so runtime speed is representative but development still fails fast. Neither mode changes the dev bundle identity (`com.eacryo.oh-my-tab.dev`); both write `dist/Oh-My-Tab-Dev.app`, which `scripts/release-dev.sh` also uses for the dev channel.
 - Report the timestamp-based `build-version` printed by the script.
+- Pass development switches through the script instead of editing code: `scripts/dev-restart.sh -- <args>` forwards argv to the app, and `OH_MY_TAB_<NAME>=<value> scripts/dev-restart.sh` forwards environment variables (every `OH_MY_TAB_*` name is picked up automatically, so new switches need no script edit). Both apply to that launch only — the script pkills old instances first. Use this to reach states that are otherwise hard to reproduce (first-run onboarding, permission branches, update notices); a feature that only appears in such a state should expose an `OH_MY_TAB_*` (or `--`-passed) switch for verification.
+- **Forwarding is an allowlist, and values are never printed.** The script forwards `OH_MY_TAB_*` only and echoes variable *names*, never values. Do not widen that filter, log the caller's environment, or echo a value: the caller's shell holds cloud credentials and proxies, and one leak is an incident. If you widen it, re-read what you are about to print before running the command.
 
 ## Architecture and invariants
 
@@ -36,7 +38,7 @@ scripts/dev-restart.sh
 - Configuration is loaded per field: invalid values fall back individually without discarding valid settings. Runtime reload must preserve this and refresh affected UI.
 - Mouse profiles match VID/PID; the mouse event tap is separate from the switcher tap, and pointer settings must be reapplied after reconnects.
 - Clipboard history is optional and off by default. Gate recording and Option+V when disabled, never record sensitive pasteboard markers, and persist only when explicitly enabled.
-- Settings UI should reuse `SettingsSection`, `SettingsCard`, `SettingsRow`, `SettingsControl`, and `SettingsButton`; extend shared components when behavior is shared.
+- Settings UI should reuse `SettingsSection`, `SettingsCard`, `SettingsRow`, `SettingsControl`, and `SettingsButton`; extend shared components when behavior is shared. A `SettingsButton`'s `tag` **selects its hover/normal palette** (the hover handlers read it: primary blue, action, compact grey), so never carry an action id in `setTag:` — keep the component's tag and map the sender pointer to an action id instead, or the button's colour gets stuck after the pointer leaves.
 
 For detailed subsystem behavior, inspect the relevant module and `docs/developer-notes-en.md` rather than adding implementation history here.
 

@@ -3271,18 +3271,42 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 
         let mut ay = header_top - 88.0;
         // Keep the App section title close to its card, matching the spacing used by the
-        // other settings pages. The About card has three rows, so its content cursor is lower
+        // other settings pages. The About card holds several rows, so its content cursor is lower
         // than a normal section header; placing the title at the old cursor left a large void.
-        // 让 App 分组标题贴近下方卡片,与其他设置页保持一致。About 卡片有三行内容,其内容
+        // 让 App 分组标题贴近下方卡片,与其他设置页保持一致。About 卡片有多行内容,其内容
         // 游标比普通区块标题更低;沿用旧游标会在标题和卡片之间留下过大的空白。
         let app_label_y = ay - 35.0;
         ay -= 27.0;
         let about_row_step = layout.row_gap + described_row_h;
-        let website_y = ay - about_row_step;
         // Keep every About row on the same two-column grid: label on the left, value on the right.
         // About 页面所有行统一使用两列网格：左侧标签，右侧值。
         let about_value_x = label_x + 145.0;
         let about_value_w = (content_w - 2.0 * label_x - 145.0).max(1.0);
+        // 「查看引导」放在 App 卡片第一行:引导讲的就是权限与用法,与下面 App/权限区块同源,
+        // 点它随时重看首次运行引导(按钮按 selector 派发,不动 SettingsButton 的 tag)。
+        // "View guide" leads the App card: the guide covers precisely the permissions and usage the
+        // rows below describe, and it can be reopened at any time (the button dispatches by
+        // selector and leaves the SettingsButton tag alone).
+        let guide_y = ay - about_row_step;
+        SettingsRow::plain(
+            about_view,
+            label_x,
+            guide_y,
+            label_w,
+            described_row_h,
+            &t("settings.row_view_guide"),
+            SettingsControl::button(
+                about_value_x,
+                guide_y + (described_row_h - row_h) / 2.0,
+                96.0,
+                row_h,
+                &t("settings.btn_open"),
+                target,
+                sel!(handleOpenOnboarding:),
+                SettingsButtonRole::Action,
+            ),
+        );
+        let website_y = guide_y - about_row_step;
         SettingsRow::plain(
             about_view,
             label_x,
