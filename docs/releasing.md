@@ -4,7 +4,9 @@
 
 ## Homebrew cask 发布
 
-`scripts/release.sh` 是正式版发布流水线。不带动作参数时，它会本地构建产物并生成 `dist/oh-my-tab.rb` —— 一个 Homebrew cask 文件，内含 dmg 的 `sha256`、从 `Cargo.toml` 读出的 `version`，以及 `zap trash:` 块（`brew uninstall --cask` 会一并清理图标缓存、日志和配置）。正式发布需要单独经过公证流程；只有已有 Apple 公证通过的暂存包，并显式传入 `--push` 后才会使用 R2。
+`scripts/release.sh` 是正式版发布流水线。不带动作参数时，它会在本地构建产物并生成 `dist/oh-my-tab.rb`。这份 Homebrew cask 包含 DMG 的 `sha256`、`Cargo.toml` 中的版本号，以及卸载时清理图标缓存、日志和应用数据的 `zap trash:` 配置。
+
+正式发布需要另外完成公证流程。Apple 接受公证提交后，再通过 `--push` 发布到 R2。
 
 ```sh
 sh scripts/release.sh                    # 本地构建产物和 Homebrew cask
@@ -14,7 +16,7 @@ sh scripts/release.sh --push             # 对公证通过的应用贴票并上�
 sh scripts/release.sh --push --dry-run   # 准备产物并打印上传计划
 ```
 
-开发通道使用独立的 Bundle ID、Feed、R2 前缀和包名前缀，不会混入生产更新：
+开发通道使用独立的 Bundle ID、Feed、R2 前缀和包名前缀，与生产更新分开：
 
 ```sh
 sh scripts/release-dev.sh                 # 只构建开发包，不访问 R2
@@ -27,16 +29,11 @@ sh scripts/release-dev.sh --push --dry-run
 正式 `release.sh` 以及直接调用 `bundle.sh` 的生产路径不启用该 feature，生产包不会包含这个
 测试选项。
 
-正式发布时，`--notarize` 会构建并暂存签名后的 `.app`，`--check` 查询 Apple 公证服务。
-只有状态变为 `Accepted` 后，`--push` 才会给应用贴上公证票据，生成最终 ZIP 和 DMG，调用仓库内固定版本的
-`vendor/Sparkle/bin/generate_appcast`，并运行 R2 发布工具。
-如果本地已有 appcast，脚本会先使用它；在干净 checkout 中会从公开 Feed 读取旧 appcast，
-以保留历史条目。若 Feed 尚不存在，则创建新的 appcast。工具从临时目录中的最终 ZIP
-文件名生成 enclosure URL，确保它和 R2 publisher 随后上传的对象一致。
+正式发布时，`--notarize` 会构建并暂存签名后的 `.app`，`--check` 用于查询 Apple 公证状态。状态变为 `Accepted` 后，`--push` 会给应用贴上公证票据并生成最终 ZIP 和 DMG，然后调用仓库内固定版本的 `vendor/Sparkle/bin/generate_appcast` 和 R2 发布工具。
 
-appcast 默认从 macOS Keychain 读取名为 `ed25519` 的 Ed25519 私钥。也可以通过
-`SPARKLE_ED_KEY_FILE` 指定外部私钥文件；私钥不得提交到仓库。`--push --dry-run` 仍会在本地准备
-ZIP、DMG、appcast 和 cask，但会把 `--dry-run` 传给 R2 发布工具，因此不会上传，且会保留待处理的公证状态。
+如果本地已有 appcast，生成脚本会从它开始更新。干净 checkout 中则会读取公开 Feed，以保留历史条目；Feed 不存在时会创建新文件。enclosure URL 使用最终 ZIP 文件名，与发布工具上传的对象保持一致。
+
+appcast 默认从 macOS Keychain 读取名为 `ed25519` 的 Ed25519 私钥，也可以通过 `SPARKLE_ED_KEY_FILE` 指定外部私钥文件；私钥不得提交到仓库。`--push --dry-run` 会在本地准备 ZIP、DMG、appcast 和 cask，再让 R2 发布工具打印上传计划而不实际上传。待处理的公证状态会保留。
 
 cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，所以只能安装在 macOS 13+ 的 Apple Silicon 上。它的 `url` 指向 `https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg`，因此 dmg 必须传到一个 tag 为 `v<version>` 的 GitHub release（与 `Cargo.toml` 的 version 一致）。
 
@@ -49,9 +46,11 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 
 第 4 步完成后，`brew install --cask eacryo/tap/oh-my-tab`（或 `brew upgrade --cask`）就能拉到新版本。`brew install --cask` 实际读取的是 tap 仓库里已提交的那份 `Casks/oh-my-tab.rb`；`release.sh` 只是在本地重新生成它，方便拷贝。
 
-`--push` 使用 `tools/r2-publisher`，凭证只从环境变量读取：`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_BUCKET`、`R2_ENDPOINT`（或 `R2_ACCOUNT_ID`）。工具会先上传 ZIP 和 DMG；如果设置了 `R2_LATEST_DMG_KEY`，还会用不可长期缓存的策略覆盖一个最新 DMG 别名，最后上传刚生成的 appcast。生产默认对象路径是 `releases/` + `appcast.xml`，并将根目录 `Oh-My-Tab.dmg` 作为最新 DMG 别名；开发脚本统一放在 `dev_release/`（归档和 `appcast.xml` 都在这里），并使用 `Oh-My-Tab-Dev-...` 归档名前缀；这些值仍可通过环境变量（包括 `R2_RELEASE_PREFIX`、`R2_APPCAST_KEY`、`R2_ARTIFACT_BASENAME`、`R2_LATEST_DMG_KEY`）覆盖。
+`--push` 使用 `tools/r2-publisher`。凭证和目标配置只从环境变量读取：`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_BUCKET`，以及 `R2_ENDPOINT` 或 `R2_ACCOUNT_ID`。发布工具先上传 ZIP 和 DMG，再上传 appcast；设置 `R2_LATEST_DMG_KEY` 后，还会更新一个使用短缓存策略的最新 DMG 别名。
 
-上传目标与下载地址分离：上传始终使用 `R2_ENDPOINT`（或 `R2_ACCOUNT_ID` 推导出的 S3 endpoint）和 `R2_BUCKET`；`https://download.oh-my-tab.app` 只用于客户端访问 appcast 和归档文件。`R2_PUBLIC_BASE_URL` 只影响发布计划中显示的公开 URL。
+生产对象默认放在 `releases/`，appcast 使用 `appcast.xml`，bucket 根目录下的 `Oh-My-Tab.dmg` 作为最新 DMG 别名。开发产物使用 `dev_release/` 和 `Oh-My-Tab-Dev-...` 归档名前缀。`R2_RELEASE_PREFIX`、`R2_APPCAST_KEY`、`R2_ARTIFACT_BASENAME` 和 `R2_LATEST_DMG_KEY` 可覆盖这些值。
+
+上传目标与下载地址相互独立。上传使用 `R2_ENDPOINT`（或由 `R2_ACCOUNT_ID` 推导出的 S3 endpoint）和 `R2_BUCKET`。客户端通过 `https://download.oh-my-tab.app` 访问 appcast 和归档；`R2_PUBLIC_BASE_URL` 用于调整生成的 enclosure URL 和发布计划所使用的公开基础 URL。
 
 ## Sparkle 更新材料
 
@@ -69,7 +68,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 
 `bundle.sh` 优先用自签名身份 **`oh-my-tab-sign`** 签名，证书缺失或签名失败时退回 ad-hoc（`codesign -s -`）。
 
-**原因：** ad-hoc 签名应用的指定要求（designated requirement）只是裸 CDHash，每次 rebuild 都变。macOS TCC 按该 CDHash 记辅助功能（Accessibility）授权，所以每次 rebuild 都会让授权失效（TCC 日志报 `Failed to match existing code requirement` / `errSecCSReqFailed`），旧安装残留的条目还会雪上加霜。自签名证书让指定要求变成证书型（`certificate leaf = H"..."`），rebuild 不变，授权就稳了。
+**原因：** ad-hoc 签名应用使用 CDHash 作为指定要求（designated requirement）。重新构建会改变这个哈希，macOS 可能把它视为新的 TCC 身份，并再次要求辅助功能授权（日志中可见 `Failed to match existing code requirement` / `errSecCSReqFailed`）。自签名证书提供了跨构建保持稳定的证书身份。
 
 一次性创建证书（钥匙串访问）：
 
@@ -83,7 +82,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 tccutil reset Accessibility com.eacryo.oh-my-tab
 ```
 
-**注意：** 自签名证书只稳定 TCC 身份，**不**满足 Gatekeeper 分发——别人装仍是「未识别开发者」，需右键打开。要彻底解决分发得用付费的 Apple **Developer ID Application** 证书；有的话把 `scripts/bundle.sh` 里的 `SIGN_IDENTITY` 改成那个名字。
+**注意：** 自签名证书只稳定 TCC 身份，**不**满足 Gatekeeper 分发——别人安装后仍会看到「未识别开发者」，需要右键打开。若要通过 Gatekeeper 正常分发，需要使用付费的 Apple **Developer ID Application** 证书；有的话把 `scripts/bundle.sh` 里的 `SIGN_IDENTITY` 改成那个名字。
 
 ## 应用图标
 

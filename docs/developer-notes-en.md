@@ -8,7 +8,7 @@ When running the bare binary with `cargo run` for diagnostics, the overlay may o
 
 ## Mouse control may fail when launched from a debugger
 
-When the app is launched in Debug mode through RustRover or another debugger, frequent mouse activity (scrolling/clicking) during startup may cause mouse control features such as scroll reversal and per-device settings to stop working. The app no longer receives mouse events, scrolling returns to the system default, and pointer-acceleration settings stop taking effect until the app is restarted. Launching a packaged `.app` directly or running the binary from a terminal is unaffected. This only occurs with unsigned development builds launched by a debugger, due to macOS 26 restrictions on HID-layer event monitoring for debugger processes.
+When the app is launched in Debug mode through RustRover or another debugger, frequent mouse activity during startup may cause scroll reversal and per-device mouse settings to stop working. In that state, the app stops receiving mouse events, scrolling returns to the system default, and pointer-acceleration changes no longer apply until the app restarts. This issue has been observed with unsigned development builds launched by a debugger and appears related to macOS 26 restrictions on HID-layer event monitoring. Packaged `.app` builds and binaries launched from a terminal have not shown the same behavior.
 
 ## Logging and memory diagnostics
 
@@ -20,13 +20,17 @@ The clipboard ledger separates text, preview, and metadata estimates; original i
 
 ## Device identification details
 
-To determine whether a device is a mouse or trackpad, the app checks whether it conforms to Generic Desktop Pointer (1,1), Mouse (1,2), or Trackpad (1,5) usages. It uses the public `IOHIDServiceClientConformsTo` API against the complete `DeviceUsagePairs`, rather than relying on a single `PrimaryUsage` value. This matters because some real mice report an incorrect primary usage: for example, **ATK A9 SE** (a Nearlink mouse) reports `PrimaryUsage = 6 (Keyboard)` and appears as a keyboard in System Settings, while its `DeviceUsagePairs` also declares Mouse (1,2). `ConformsTo` identifies it correctly. Looking only at `PrimaryUsage` would silently discard such a device and apply its events to the “recently used” profile instead.
+To identify a mouse or trackpad, the app checks whether the device conforms to Generic Desktop Pointer (1,1), Mouse (1,2), or Trackpad (1,5) usages. It calls the public `IOHIDServiceClientConformsTo` API against the complete `DeviceUsagePairs` instead of relying on a single `PrimaryUsage` value.
 
-Bluetooth keyboards are excluded even when their HID descriptors incorrectly advertise pointer usages (for example, Kzzi-i75 declares a complete Mouse collection). The device picker cross-checks the Bluetooth **GAP Appearance** value (`0x03C1` = keyboard), using the cache written by `bluetoothd` to NVRAM and matching the HID service's Bluetooth address. This is the same source used for the macOS Bluetooth panel icon. Devices absent from the NVRAM cache, such as newly paired devices, and non-Bluetooth devices fall back to the HID-only check. The device picker refreshes in real time: unplugged devices disappear immediately and reconnected devices reappear automatically. Plug/unplug events are debounced without being dropped, and delayed rechecks cover fast BLE sleep/wake cycles.
+This matters because some mice report an incorrect primary usage. For example, **ATK A9 SE** (a Nearlink mouse) reports `PrimaryUsage = 6 (Keyboard)` and appears as a keyboard in System Settings, while its `DeviceUsagePairs` also declares Mouse (1,2). Checking the complete usage pairs recognizes the device as a mouse; relying on `PrimaryUsage` alone would send its events to the “recently used” profile.
+
+Bluetooth keyboards are excluded even when their HID descriptors advertise pointer usages; Kzzi-i75, for example, declares a complete Mouse collection. The device picker cross-checks the Bluetooth **GAP Appearance** value (`0x03C1` = keyboard) against the cache written by `bluetoothd` to NVRAM, matching entries by Bluetooth address. macOS uses the same source for the Bluetooth panel icon. Devices that are absent from the cache, such as newly paired devices, and non-Bluetooth devices fall back to the HID-only check.
+
+The device picker refreshes when devices connect or disconnect. These events are debounced, and delayed rechecks cover short BLE sleep and wake cycles.
 
 ## Building and testing
 
-`scripts/dev-restart.sh` is the normal way to run the app during development. It builds and assembles a separately signed development `.app` and launches it through the per-user `launchd` domain, so Accessibility and Screen Recording permissions stay associated with the development bundle and the running process always contains the latest build.
+`scripts/dev-restart.sh` is the normal way to run the app during development. It builds and assembles a separately signed development `.app`, then launches it through the per-user `launchd` domain. This keeps Accessibility and Screen Recording permissions associated with the development bundle and starts the binary produced by that build.
 
 The unit-test suite is headless-safe by default; clipboard image and history fixtures use isolated temporary directories per process and thread. The CG/AX **smoke tests** are marked `#[ignore]` and need a GUI session plus an Accessibility grant:
 

@@ -4,7 +4,9 @@ This document covers maintainer-only release and packaging details: the Homebrew
 
 ## Homebrew cask release
 
-`scripts/release.sh` is the production release pipeline. Without an action flag it builds local artifacts and generates `dist/oh-my-tab.rb`, a Homebrew cask containing the DMG `sha256`, the version read from `Cargo.toml`, and a `zap trash:` block that removes the icon cache, logs, and application data when the cask is uninstalled. Production publishing is a separate notarization flow; R2 is used only after an accepted Apple notarization is available and `--push` is explicitly supplied.
+`scripts/release.sh` is the production release pipeline. Without an action flag, it builds local artifacts and generates `dist/oh-my-tab.rb`. The cask contains the DMG `sha256`, the version from `Cargo.toml`, and a `zap trash:` block for removing the icon cache, logs, and application data on uninstall.
+
+Production publishing uses a separate notarization flow. R2 publishing starts after Apple accepts the notarization submission and `--push` is supplied.
 
 ```sh
 sh scripts/release.sh                    # build local artifacts and the Homebrew cask
@@ -14,7 +16,7 @@ sh scripts/release.sh --push             # staple the accepted app, then upload 
 sh scripts/release.sh --push --dry-run   # prepare artifacts and print the upload plan
 ```
 
-The development channel uses a separate bundle ID, feed, R2 prefix, and archive prefix, so it cannot mix with production updates:
+The development channel uses a separate bundle ID, feed, R2 prefix, and archive prefix to keep its updates separate from production:
 
 ```sh
 sh scripts/release-dev.sh                 # build the development package only
@@ -24,9 +26,11 @@ sh scripts/release-dev.sh --push --dry-run
 
 `release-dev.sh` still uses an optimized Release build, but enables the `dev-long-text` Cargo feature. The development package therefore includes a `[TEST] English x3` language option for checking long dropdown values, settings rows, and card layouts. The production `release.sh` and direct `bundle.sh` paths do not enable this feature.
 
-For production, `--notarize` builds and stages the signed `.app`, and `--check` queries Apple's notarization service. Only after the status is `Accepted` does `--push` staple the ticket, create the final ZIP and DMG, generate an appcast with the pinned `vendor/Sparkle/bin/generate_appcast` tool, and invoke the R2 publisher. If a local appcast exists, it is used first; on a clean checkout, the public feed is read to preserve historical entries. If the feed does not exist, a new one is created. The enclosure URL is generated from the final ZIP filename in the temporary directory so it matches the object subsequently uploaded by the R2 publisher.
+For production, `--notarize` builds and stages the signed `.app`, while `--check` queries Apple's notarization service. After the status becomes `Accepted`, `--push` staples the ticket and creates the final ZIP and DMG. It then generates an appcast with the pinned `vendor/Sparkle/bin/generate_appcast` tool and invokes the R2 publisher.
 
-By default, appcast signing reads the Ed25519 private key named `ed25519` from the macOS Keychain. `SPARKLE_ED_KEY_FILE` can point to an external private-key file; never commit that file. `--push --dry-run` still prepares the ZIP, DMG, appcast, and cask locally, but passes `--dry-run` to the R2 publisher so nothing is uploaded and the pending notarization state is retained.
+Appcast generation starts from a local appcast when one exists. On a clean checkout, it reads the public feed to retain older entries; if the feed does not exist, it creates a new one. The enclosure URL uses the final ZIP filename so it matches the object uploaded by the publisher.
+
+By default, appcast signing reads the Ed25519 private key named `ed25519` from the macOS Keychain. `SPARKLE_ED_KEY_FILE` can point to an external private-key file; never commit that file. `--push --dry-run` prepares the ZIP, DMG, appcast, and cask locally, then asks the R2 publisher to print its plan without uploading. The pending notarization state is retained.
 
 The cask hard-codes `depends_on macos: :ventura` and `depends_on arch: :arm64`, so it supports macOS 13+ on Apple Silicon only. Its URL points to `https://github.com/eacryo/oh-my-tab/releases/download/v#{version}/Oh-My-Tab.dmg`, so the DMG must be uploaded to a GitHub release tagged `v<version>`, matching the version in `Cargo.toml`.
 
@@ -39,9 +43,11 @@ Release a new version as follows:
 
 After step 4, `brew install --cask eacryo/tap/oh-my-tab` (or `brew upgrade --cask`) can install the new version. `brew install --cask` reads the committed cask from the tap repository; `release.sh` only regenerates it locally for copying.
 
-The `--push` flow uses `tools/r2-publisher` and reads credentials only from environment variables: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`, or `R2_ACCOUNT_ID`. It uploads the ZIP and DMG first. If `R2_LATEST_DMG_KEY` is set, it also overwrites a latest-DMG alias with a short-cache policy, then uploads the newly generated appcast. Production objects default to `releases/` plus `appcast.xml`, with the root `Oh-My-Tab.dmg` as the latest-DMG alias. Development artifacts use `dev_release/` and the `Oh-My-Tab-Dev-...` archive prefix. These values can be overridden with environment variables including `R2_RELEASE_PREFIX`, `R2_APPCAST_KEY`, `R2_ARTIFACT_BASENAME`, and `R2_LATEST_DMG_KEY`.
+The `--push` flow uses `tools/r2-publisher`. It reads credentials and target configuration only from environment variables: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, and either `R2_ENDPOINT` or `R2_ACCOUNT_ID`. The publisher uploads the ZIP and DMG before the appcast. If `R2_LATEST_DMG_KEY` is set, it also updates a latest-DMG alias with a short-cache policy.
 
-Upload targets and download URLs are separate. Uploads always use the S3 endpoint from `R2_ENDPOINT` (or the endpoint derived from `R2_ACCOUNT_ID`) and `R2_BUCKET`; `https://download.oh-my-tab.app` is used only by clients to access appcasts and archives. `R2_PUBLIC_BASE_URL` changes only the public URL shown in the release plan.
+Production objects default to `releases/` plus `appcast.xml`, with `Oh-My-Tab.dmg` at the bucket root as the latest-DMG alias. Development artifacts use `dev_release/` and the `Oh-My-Tab-Dev-...` archive prefix. `R2_RELEASE_PREFIX`, `R2_APPCAST_KEY`, `R2_ARTIFACT_BASENAME`, and `R2_LATEST_DMG_KEY` can override these values.
+
+Upload targets and download URLs are separate. Uploads use the S3 endpoint from `R2_ENDPOINT` (or the endpoint derived from `R2_ACCOUNT_ID`) together with `R2_BUCKET`. Clients access appcasts and archives through `https://download.oh-my-tab.app`; `R2_PUBLIC_BASE_URL` changes the public base URL used in generated enclosure URLs and the release plan.
 
 ## Sparkle update materials
 
@@ -59,7 +65,7 @@ A single Markdown file may contain multiple language blocks. Start blocks with `
 
 `bundle.sh` prefers the **`oh-my-tab-sign`** self-signed identity and falls back to ad-hoc signing (`codesign -s -`) if the certificate is missing or signing fails.
 
-**Why:** an ad-hoc signed app's designated requirement is only its raw CDHash, which changes on every rebuild. macOS TCC records Accessibility permission against that CDHash, so every rebuild invalidates the grant. A self-signed certificate makes the designated requirement certificate-based, so it stays stable across rebuilds.
+**Why:** an ad-hoc signed app uses its CDHash as the designated requirement. Rebuilding changes that hash, so macOS may treat the result as a different TCC identity and ask for Accessibility permission again. A self-signed certificate provides a stable certificate-based identity across rebuilds.
 
 Create the certificate once in Keychain Access:
 

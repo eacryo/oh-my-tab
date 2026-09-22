@@ -4,7 +4,7 @@
 
 <br />
 
-<div align="center"><b>——&nbsp;&nbsp;&nbsp;Bring the Windows way to your MacBook: thumbnail window switching, clipboard history &amp; reversed mouse scrolling&nbsp;&nbsp;&nbsp;——</b></div>
+<div align="center"><b>——&nbsp;&nbsp;&nbsp;Native macOS window switching, clipboard history, mouse controls, and quick actions&nbsp;&nbsp;&nbsp;——</b></div>
 
 <br />
 
@@ -26,24 +26,24 @@
 
 <br />
 
-oh-my-tab is a macOS window switcher that complements the system Cmd+Tab: it runs as a **menu-bar accessory** app (no Dock icon), intercepts a global shortcut (**Command+Tab** by default, toggleable to Option+Tab), shows a floating **Liquid Glass** overlay of cards for currently-open windows, and raises the selected window on release (via a private SkyLight API plus AX).
+oh-my-tab is a macOS menu-bar utility centered on window switching. It uses **Command+Tab** by default (or Option+Tab), shows open windows in a floating **Liquid Glass** overlay, and raises the selected window when the modifier is released. Window activation uses a private SkyLight API together with Accessibility APIs.
 
-It is written in pure Rust, calling AppKit / CoreGraphics / ApplicationServices directly through `objc2` FFI — there is no Swift bridge and no Rust UI framework.
+The app is written in Rust and calls AppKit, CoreGraphics, and ApplicationServices directly through `objc2` FFI, without a Swift bridge or Rust UI framework.
 
 - <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names, window titles, one card per window, across multiple displays.
-- <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: caption row above a 16:10 live preview, captured via a private WindowServer API and cached in memory — cached frames render instantly and a background refresh keeps them current; rows are balanced when they fit, and when they overflow the grid fills in MRU order and scrolls continuously. Requires **Screen Recording** permission — without it the switcher falls back to icon-only cards. Turning thumbnails off immediately releases cached window frames from memory.
+- <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: a caption row above a 16:10 window preview captured through a private WindowServer API. Cached frames appear first and refresh in the background; rows are balanced when they fit, while overflowing grids fill in MRU order and scroll continuously. Requires **Screen Recording** permission; without it, the switcher falls back to icon-only cards. Turning thumbnails off releases the cached window frames from memory.
 - <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window keeps the app's other windows in their existing order.
-- <img height="14" src="docs/icons/eye.svg"> **Full window visibility**: every real window, including off-screen and minimized (toggleable).
+- <img height="14" src="docs/icons/eye.svg"> **Off-screen and minimized windows**: optionally include them in the switcher.
 - <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab, Shift+Tab, arrow keys, or mouse after Command/Option; the shortcut can be switched to Option+Tab.
 - <img height="14" src="docs/icons/tools.svg"> **Window control**: maximize, snap to halves or quarters, or minimize with Option+arrow keys, and move windows across displays with Option+Shift+arrow keys.
 - <img height="14" src="docs/icons/zap.svg"> **Quick actions**: Option+I opens Settings, Option+E opens Finder, Option+D shows the desktop, Option+L locks the screen, and double-tapping Control locates the pointer.
 - <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images, file copies — search, pin, delete, expiry, persistence ([Clipboard history](#clipboard-history)).
 - <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration, and **side-button → shortcut mapping**.
 - <img height="14" src="docs/icons/star.svg"> **Appearance**: light, dark, or system theme, plus Liquid Glass styling (`NSGlassEffectView`, with an `NSVisualEffectView` fallback), tint, corner radius, and font size.
-- <img height="14" src="docs/icons/gear.svg"> **Settings**: configure appearance and features from the Settings window, with changes applied immediately.
-- <img height="14" src="docs/icons/globe.svg"> **Zero-dependency i18n**: English / Simplified / Traditional Chinese, following the system language live.
-- <img height="14" src="docs/icons/package.svg"> **Lightweight**: pure Rust with a bounded in-memory thumbnail cache — no Electron/Tauri runtime.
-- <img height="14" src="docs/icons/note.svg"> **Per-launch logs**: 30-day retention ([Logging](#logging)).
+- <img height="14" src="docs/icons/gear.svg"> **Settings**: configure appearance and features from the Settings window; most changes take effect immediately.
+- <img height="14" src="docs/icons/globe.svg"> **Built-in localization**: English, Simplified Chinese, and Traditional Chinese, with automatic system-language selection.
+- <img height="14" src="docs/icons/package.svg"> **Native Rust app**: uses a bounded in-memory thumbnail cache and does not require an Electron or Tauri runtime.
+- <img height="14" src="docs/icons/note.svg"> **Rolling logs**: stale backups and legacy log files are cleaned up after 30 days ([Logging](#logging)).
 
 <br />
 
@@ -74,7 +74,7 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 
 ## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;Clipboard history
 
-Optional (off by default). Summon with **Option+V**, navigate with the arrow keys / Enter / Esc / Backspace, or click; clicking outside closes it. Extra keys: **← pins/unpins** the selected entry; **→ opens a detail panel** beside the picker showing the full untruncated text or a large image preview (it follows ↑/↓ browsing live; Esc, ←, →, or a click on it closes it). The history records **three kinds of entries**:
+Clipboard history is optional and off by default. Press **Option+V** to open it, then use the arrow keys, Enter, Esc, Backspace, or the mouse; clicking outside closes the picker. **← pins or unpins** the selected entry. **→ opens a detail panel** with the full text or a larger image preview; the panel follows ↑/↓ selection changes and closes with Esc, ←, →, or a click. The history records **three kinds of entries**:
 
 | Kind | What is stored | Paste behavior |
 |---|---|---|
@@ -82,19 +82,21 @@ Optional (off by default). Summon with **Option+V**, navigate with the arrow key
 | **Image data** | An image copied inside an app (e.g. right-click → "Copy Image"): the original-format bytes are hashed and kept in a disk cache; only a downsampled thumbnail stays in RAM | The original bytes are written back under their original UTI, preserving the format: JPG remains JPG and animated GIF remains GIF |
 | **Image file** | An image FILE copied in Finder (Cmd+C): read once at copy time for a content hash and a thumbnail, then the bytes are discarded — only the path is kept | `public.file-url` is restored (file semantics, like Windows Win+V / Maccy): Finder duplicates the file, chat apps attach it. If the source file has been deleted, the paste is skipped |
 
-> **Known v1 tradeoffs** — each entry records exactly one kind of content: a copy carrying **both text and an image** (e.g. copying an image from a web page) records only the text; **multiple-file copies and single non-image file copies are omitted from history**. The same picture copied both as an image and as a file stays as two separate entries (they answer different paste semantics). Dedup is per-kind: text by exact content, images by content hash.
+> **Known v1 tradeoffs** — each entry records one kind of content. A copy containing **both text and an image** (for example, an image copied from a web page) records the text. **Multiple-file copies and single non-image file copies are omitted from history.** The same picture copied as image data and as a file remains as two entries because the paste behavior differs. Deduplication is per kind: exact content for text and a content hash for images.
 
-**Using an entry reorders the history by default** (like Maccy): selecting an entry and pressing Enter writes it back to the pasteboard, which the recorder sees as a re-copy and moves to the top. The **"Move used entries to the top"** switch in Settings turns this off (like Windows Win+V). With the optional **"Delete entry after paste"** switch on, holding **Option** while pressing Enter or clicking a row pastes the entry and removes it from the history right away (one-shot paste). Its dependent **"Also delete the corresponding system clipboard item"** switch additionally removes the corresponding clipboard content after a short delay, if no newer copy replaced it. The picker's "Clear history" keeps pinned entries. An optional **"Save clipboard history to disk"** switch persists the history across restarts — see the privacy note below.
+**Using an entry reorders the history by default** (like Maccy). Pressing Enter writes the selected entry back to the pasteboard, and the recorder treats it as a new copy and moves it to the top. The **"Move used entries to the top"** switch turns this behavior off (like Windows Win+V).
 
-> **Clipboard persistence is off by default.** Enabling it writes copied text, filenames, and image data to disk in plain text, so do not enable it if you copy passwords or tokens. See the [official website](https://oh-my-tab.app/) for details.
+With **"Delete entry after paste"** enabled, Option+Enter or Option+click pastes the entry and removes it from history. The dependent **"Also delete the corresponding system clipboard item"** option clears the matching clipboard content after a short delay, unless a newer copy has replaced it. "Clear history" keeps pinned entries. **"Save clipboard history to disk"** preserves the history across restarts; see the privacy note below.
+
+> **Clipboard persistence is off by default.** Enabling it stores copied text, filenames, and image data on disk without encryption. Avoid enabling it if you copy passwords or tokens. See the [official website](https://oh-my-tab.app/) for details.
 
 ## <img height="16" src="docs/icons/alert.svg">&nbsp;&nbsp;Known Issues
 
-**Background-app thumbnails**: blank captures are detected before caching and never overwrite a real thumbnail. A suspended WebView window keeps its last real frame; before its first activation the card shows a placeholder frame instead. Switching to the window, whether across apps or between windows of the same app, refreshes its preview automatically. Light/dark appearance changes re-capture every card, including placeholder frames, so stale-theme images do not linger.
+**Background-app thumbnails**: blank captures are rejected before caching, so an existing valid thumbnail is retained. A suspended WebView window keeps its last valid frame; before its first activation, the card shows a placeholder. Switching to the window refreshes its preview. Appearance changes also refresh placeholder frames to avoid showing an image from the previous theme.
 
 **Telegram's fullscreen image viewer has no separate thumbnail**: Telegram's media viewer is a special high-level floating window above its normal windows. To avoid treating it as a separate switchable window, oh-my-tab excludes it from the window list and thumbnail capture. While the viewer is open, the switcher displays Telegram's main-window thumbnail.
 
-**Some application windows may be unavailable to thumbnail capture**: Certain applications mark editor or other protected windows as non-shareable, or render their content on a protected surface. Even with Screen Recording permission granted, other windows from the same application still capture normally. In this case the window remains switchable, but its thumbnail may stay on the placeholder or last valid frame. This is a limitation of how the application or WindowServer shares window content, not a window-identification bug.
+**Some application windows may be unavailable to thumbnail capture**: Certain applications mark editor or other protected windows as non-shareable, or render their content on a protected surface. The window remains switchable, but its thumbnail may stay on the placeholder or last valid frame.
 
 If windows are already open when the app starts, their initial ordering is seeded from WindowServer's front-to-back order. This provides an initial approximation; live activation events refine the window-level MRU after launch.
 
@@ -120,7 +122,7 @@ Development-only issues and raw-binary debugging notes are collected in [docs/de
 > ./scripts/dev-restart.sh  # build, sign, and launch the development .app
 > ```
 
-`scripts/dev-restart.sh` builds and assembles a separately signed development `.app`, then launches it through the per-user `launchd` domain. This keeps Accessibility and Screen Recording permissions associated with the development bundle and ensures the running process contains the latest build. Layout QA fixtures, the debug-only layout assertions, and the GUI smoke test are documented in [docs/developer-notes-en.md](docs/developer-notes-en.md).
+`scripts/dev-restart.sh` builds and assembles a separately signed development `.app`, then launches it through the per-user `launchd` domain. This keeps Accessibility and Screen Recording permissions associated with the development bundle and starts the binary produced by that build. Layout QA fixtures, debug-only layout assertions, and the GUI smoke test are documented in [docs/developer-notes-en.md](docs/developer-notes-en.md).
 
 ### Release
 
@@ -138,13 +140,13 @@ The full release pipeline (`release.sh` / `release-dev.sh`, including `--push`),
 **Important for upgrades from 0.2.2 or earlier:** After installing the new version, manually remove the old Oh My Tab entry from both **Accessibility** and **Screen & System Audio Recording** (shown as **Screen Recording** on some macOS versions) under *System Settings → Privacy & Security*. In each list, select the old entry and click **−**, then click **+** and add the new `Oh-My-Tab.app` from Applications; turn on both permissions. Toggling the existing switches off and on is not enough. Restart Oh My Tab after re-adding it.
 
 - The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary must be re-granted — unless you sign with a stable identity (see [Code signing](docs/releasing-en.md#code-signing-why-a-self-signed-certificate-stabilizes-permissions)), in which case the grant persists across rebuilds.
-- **Window thumbnails** additionally require the **Screen Recording** permission (System Settings → Privacy & Security → Screen Recording). A private WindowServer capture API is used, same as DockDoor/AltTab. Without it the switcher silently keeps icon-only cards; granting it later resumes thumbnail capture without restarting. Frames are kept **in memory only** — nothing is ever written to disk.
-- If the event tap fails to create, the app prints an error and the shortcut silently does nothing — almost always a missing Accessibility grant.
+- **Window thumbnails** additionally require the **Screen Recording** permission (System Settings → Privacy & Security → Screen Recording). A private WindowServer capture API is used, as in DockDoor and AltTab. Without permission, the switcher falls back to icon-only cards; granting it later resumes thumbnail capture without restarting. Window frames are kept in memory rather than written to disk.
+- If the event tap fails to start, the shortcut does not respond. This usually indicates that Accessibility permission has not been granted.
 - Icon cache: `~/Library/Caches/oh-my-tab-icons/{bundle-id}.png` (keyed by bundle id, with a `.meta` mtime sidecar; clearable from the menu).
 
 ## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;Settings
 
-All options are managed from the in-app Settings window and apply immediately. The window covers appearance, window switching, window control, quick actions, clipboard history, mouse control, startup, and updates.
+Options are managed from the in-app Settings window, and most changes take effect immediately. The window covers appearance, window switching, window control, quick actions, clipboard history, mouse control, startup, and updates.
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 
@@ -156,6 +158,6 @@ All options are managed from the in-app Settings window and apply immediately. T
 
 ## <img height="16" src="docs/icons/heart.svg">&nbsp;&nbsp;Credits
 
-The **mouse control** feature (scroll reversal, scroll modes, per-device configuration, and pointer-acceleration control) is inspired by and references [LinearMouse](https://github.com/linearmouse/linearmouse). We re-implemented its core features from scratch in pure Rust (via `objc2` FFI, no Swift bridge) and integrated them into oh-my-tab's configuration model. Many thanks to the original author and the LinearMouse project for their work.
+The **mouse control** feature (scroll reversal, scroll modes, per-device configuration, and pointer-acceleration control) is inspired by [LinearMouse](https://github.com/linearmouse/linearmouse). The corresponding functionality is implemented in Rust through `objc2` FFI and integrated with oh-my-tab's configuration model. Many thanks to the original author and the LinearMouse project for their work.
 
-The **window switcher** (overlay design, card-based selection, Liquid Glass styling) draws inspiration from [BetterCmdTab](https://github.com/rokartur/BetterCmdTab). We re-implemented the ideas from scratch in pure Rust (via `objc2` FFI, no Swift bridge). Many thanks to the author.
+The **window switcher** (overlay design, card-based selection, and Liquid Glass styling) draws inspiration from [BetterCmdTab](https://github.com/rokartur/BetterCmdTab). Its implementation uses Rust and `objc2` FFI. Many thanks to the author.
