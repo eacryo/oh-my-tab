@@ -137,6 +137,92 @@ unsafe fn walk_views(
     }
 }
 
+/// 设置页滚动几何:页面文档宽度 **不等于** 可视宽度时就是出问题的时刻(legacy 滚动条占位,
+/// clip 变窄而 document 不变 → 右列被裁)。三层都记录,避免假设哪一层是 scroll view。
+/// Settings scroll geometry: the moment the page's document width differs from the visible width is
+/// the failure moment (a legacy scroller takes space, the clip narrows while the document does not,
+/// so the right column gets clipped). All three levels are recorded so nothing assumes which level
+/// is the scroll view. `scroller_style`: 0 = legacy, 1 = overlay, -1 = not a scroll view / unknown.
+struct PageGeometry {
+    root: &'static str,
+    self_frame: NSRect,
+    parent_frame: NSRect,
+    grandparent_frame: NSRect,
+    /// clip(contentView)bounds 宽 = 真正可视的内容宽度。scroll view 若是 legacy 滚动条,它比
+    /// document 窄(scroller 宽度),而 document 仍按窗口宽度排版 → 右列被裁。
+    /// The clip (contentView) bounds width is the truly visible content width. With a legacy
+    /// scroller it is narrower than the document by the scroller width, while the document is still
+    /// laid out to the window width -- which clips the right column.
+    clip_bounds: NSRect,
+    style_self: isize,
+    style_parent: isize,
+    style_grandparent: isize,
+}
+
+fn zero_rect() -> NSRect {
+    NSRect::new(
+        objc2_foundation::NSPoint::new(0.0, 0.0),
+        objc2_foundation::NSSize::new(0.0, 0.0),
+    )
+}
+
+fn collect_pages() -> Vec<PageGeometry> {
+    let mut pages = Vec::new();
+    for (root, view) in crate::settings::e2e_view_roots() {
+        if !root.starts_with("page_") || view.is_null() {
+            continue;
+        }
+        unsafe {
+            let scroller_style = |object: *mut AnyObject| -> isize {
+                if object.is_null() {
+                    return -1;
+                }
+                let responds: bool = msg_send![object, respondsToSelector: sel!(scrollerStyle)];
+                if !responds {
+                    return -1;
+                }
+                msg_send![object, scrollerStyle]
+            };
+            let frame_of = |object: *mut AnyObject| -> NSRect {
+                if object.is_null() {
+                    return zero_rect();
+                }
+                msg_send![object, frame]
+            };
+            let parent: *mut AnyObject = msg_send![view, superview];
+            let grandparent: *mut AnyObject = if parent.is_null() {
+                std::ptr::null_mut()
+            } else {
+                msg_send![parent, superview]
+            };
+            let clip: *mut AnyObject = {
+                let responds: bool = msg_send![view, respondsToSelector: sel!(contentView)];
+                if responds {
+                    msg_send![view, contentView]
+                } else {
+                    std::ptr::null_mut()
+                }
+            };
+            let clip_bounds: NSRect = if clip.is_null() {
+                zero_rect()
+            } else {
+                msg_send![clip, bounds]
+            };
+            pages.push(PageGeometry {
+                root,
+                self_frame: frame_of(view),
+                parent_frame: frame_of(parent),
+                grandparent_frame: frame_of(grandparent),
+                clip_bounds,
+                style_self: scroller_style(view),
+                style_parent: scroller_style(parent),
+                style_grandparent: scroller_style(grandparent),
+            });
+        }
+    }
+    pages
+}
+
 fn collect_views() -> Vec<ViewNode> {
     let mut nodes = Vec::new();
     for (root, view) in crate::settings::e2e_view_roots() {
@@ -240,6 +326,36 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"selected_sidebar\": {},\n",
         crate::settings::e2e_selected_sidebar()
     ));
+    json.push_str("  \"pages\": [");
+    for (index, page) in collect_pages().iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "\n    {{\"root\": {}, \"self\": [{}, {}, {}, {}], \"parent\": [{}, {}, {}, {}], \"grandparent\": [{}, {}, {}, {}], \"clip\": [{}, {}, {}, {}], \"styles\": [{}, {}, {}]}}",
+            json_string(page.root),
+            page.self_frame.origin.x,
+            page.self_frame.origin.y,
+            page.self_frame.size.width,
+            page.self_frame.size.height,
+            page.parent_frame.origin.x,
+            page.parent_frame.origin.y,
+            page.parent_frame.size.width,
+            page.parent_frame.size.height,
+            page.grandparent_frame.origin.x,
+            page.grandparent_frame.origin.y,
+            page.grandparent_frame.size.width,
+            page.grandparent_frame.size.height,
+            page.clip_bounds.origin.x,
+            page.clip_bounds.origin.y,
+            page.clip_bounds.size.width,
+            page.clip_bounds.size.height,
+            page.style_self,
+            page.style_parent,
+            page.style_grandparent
+        ));
+    }
+    json.push_str("\n  ],\n");
     json.push_str("  \"views\": [");
     for (index, node) in collect_views().iter().enumerate() {
         if index > 0 {

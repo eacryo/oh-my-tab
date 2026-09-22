@@ -139,6 +139,42 @@ if pill and about_row and general_row:
         f"pill_cy={p['cy']} first_row_cy={general['cy']}",
     )
 
+# --- 1.5) 滚动条不占位,可伸缩控件没被挤压 --------------------------------
+# 回归来源(2026-09-22 已修):系统把滚动条切成 legacy 时,clip 少 17pt,而按自适应掩码的视图
+# (自绘开关)会跟着被压扁 —— 开关宽 38 → 21。修法是激活时重申 overlay(见 src/scroller.rs);
+# 这里断言"占位为 0"与"开关比例正常",把这条回归钉住。
+# Regression source (fixed 2026-09-22): when the system switches the scroller to legacy, the clip
+# loses 17pt and auto-resizing views (the self-drawn switch) get squeezed -- its width went 38 -> 21.
+# The fix re-asserts overlay on activation (see src/scroller.rs); these checks pin the regression.
+page = next((entry for entry in data.get("pages", []) if entry["root"] == "page_6_about"), None)
+check(page is not None, "the settings page's scroll geometry is in the snapshot")
+if page:
+    footprint = round(page["self"][2] - page["clip"][2], 1)
+    check(
+        page["styles"][0] == 1,
+        "the settings scroll view reports the overlay scroller style",
+        f"style={page['styles'][0]} (0 = legacy)",
+    )
+    check(
+        footprint == 0.0,
+        "the scroller takes no layout width",
+        f"footprint={footprint} scroll_w={page['self'][2]} clip_w={page['clip'][2]}",
+    )
+    switches = [
+        (round(n["frame"][2], 1), round(n["frame"][3], 1))
+        for n in views
+        if n["root"] == "page_6_about" and n["class"] == "OhMyTabHtmlSwitch"
+    ]
+    check(len(switches) >= 2, "found the self-drawn switches", f"found={len(switches)}")
+    # 胶囊比例:被压扁时宽会掉到接近高度(21/22),正常约 1.7。用比例判定,不写死像素。
+    # Capsule aspect: a squeezed switch drops to roughly its height (21/22) while the normal aspect
+    # is about 1.7. Judged by ratio so nothing is pinned to absolute pixels.
+    check(
+        all(width >= 1.5 * height for width, height in switches),
+        "no self-drawn switch is squeezed",
+        f"switch w/h={switches}",
+    )
+
 # --- 2) 行内操作按钮:同一口径 --------------------------------------------
 # 锚点用类名+尺寸:页内又宽又扁的那个按钮(更新区的「检查更新」,宽 512)不属于行内操作按钮。
 # Anchored by class and shape: the page's wide flat button (the update card's action, 512pt wide)

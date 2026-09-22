@@ -708,6 +708,42 @@ fn start_inline_update_check() {
 /// About page, and start an inline check. Once the settings window exists, its host view
 /// is registered, so the "update found" UI renders INLINE in the About page (see
 /// updater::render_target) instead of a standalone window.
+/// 滚动条样式变化后重排:实测当前页 scroll view 的滚动条占位,与构建时用的值不同就重建内容,
+/// 让排版跟着可视宽度走(见 src/scroller.rs 的 A/B 说明)。
+/// After a scroller-style change: measure this page's scroller footprint and rebuild the content
+/// when it differs from the value the layout was built with, so the layout follows the visible
+/// width (see the A/B notes in src/scroller.rs).
+/// 当前设置页 scroll view 实测的滚动条占位(0 = overlay);无窗口时返回 -1。
+/// This settings page's measured scroller footprint (0 = overlay); -1 when there is no window.
+pub(crate) fn page_reserved_now() -> f64 {
+    let scroll = with_settings_ui(|ui| {
+        ui.as_ref()
+            .map(|ui| ui.about_view)
+            .unwrap_or(std::ptr::null_mut())
+    });
+    if scroll.is_null() {
+        return -1.0;
+    }
+    unsafe { crate::scroller::reserved_width(scroll) }
+}
+
+pub(crate) fn resync_page_layout_for_scroller() {
+    let scroll = with_settings_ui(|ui| {
+        ui.as_ref()
+            .map(|ui| ui.about_view)
+            .unwrap_or(std::ptr::null_mut())
+    });
+    if scroll.is_null() {
+        return;
+    }
+    let measured = unsafe { crate::scroller::reserved_width(scroll) };
+    if (measured - crate::scroller::reserved()).abs() < 0.5 {
+        return;
+    }
+    crate::scroller::note_reserved(measured);
+    unsafe { window::rebuild_settings_content_now() };
+}
+
 /// A2 层 E2E 用:暴露要断言几何的视图根(名字 → 视图),由 `e2e_state` 递归遍历成 JSON。
 /// 只列"有语义、要断言"的根(侧栏高亮、七个侧栏按钮、七个页容器),不做通用遍历入口。
 /// A2 E2E: exposes the view roots whose geometry must be asserted (name → view); `e2e_state`

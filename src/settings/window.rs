@@ -970,6 +970,14 @@ fn create_settings_window() {
     create_settings_window_for(None);
 }
 
+/// 重建设置内容(滚动条样式变化后按新的可视宽度重排)。
+/// Rebuilds the settings content (after a scroller-style change, to fit the new visible width).
+pub(crate) unsafe fn rebuild_settings_content_now() {
+    if let Some(window) = with_settings_ui(|ui| ui.as_ref().map(|ui| ui.window)) {
+        rebuild_settings_content(window);
+    }
+}
+
 /// Rebuild the settings content in an existing window without replacing the window itself.
 /// 在现有窗口内重建设置内容,不替换窗口对象本身。
 fn rebuild_settings_content(window: *mut AnyObject) {
@@ -1256,7 +1264,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let detail_w = view_w - content_x;
         let page_inset = 32.0;
         let page_x = content_x + page_inset;
-        let content_w = detail_w - page_inset * 2.0;
+        // A:预留**实测**的滚动条占位(overlay 时为 0)。系统若强行 legacy 且 B 的重申无效,
+        // 这里保证内容按可视宽度排版——只会收窄,不会被裁掉。
+        // A: reserve the *measured* scroller footprint (0 for overlay). If the system forces legacy
+        // and B's re-assert does not stick, this keeps the content laid out to the visible width:
+        // it merely narrows instead of being clipped.
+        let content_w = (detail_w - crate::scroller::reserved() - page_inset * 2.0).max(1.0);
         let layout = SettingsLayout::new(content_w);
         let label_x = layout.label_x;
         let label_w = layout.label_w;
@@ -1543,6 +1556,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         ui.quick_actions_view = quick_actions_root;
         let about_page = SettingsPage::new(content, page_frame, about_doc_h, true);
         let about_root = about_page.scroll;
+        // 记录本页 scroll view 的实测占位(供下一次构建预留;0 = overlay)。
+        // Record this page's measured footprint for the next build (0 = overlay).
+        crate::scroller::note_reserved(crate::scroller::reserved_width(about_root));
         let about_view = about_page.document;
         ui.about_view = about_root;
 

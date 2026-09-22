@@ -4520,7 +4520,15 @@ pub(super) unsafe fn make_settings_page(
             NSSize::new(frame.size.width, document_h),
         )
     ];
-    let _: () = msg_send![document, setAutoresizingMask: 2u64];
+    // 文档**不随宽度自适应**(只用顶部锚定)。以前是 NSViewWidthSizable:系统把滚动条切成占宽的
+    // legacy 时 clip 少 17pt,文档跟着缩,文档内宽度可伸缩的自绘控件(开关 38 → 21、行内按钮右缘
+    // 左移 17pt)就被挤压变形。内容宽度由 scroller 的重排逻辑决定,不由 AppKit 的 tile 决定。
+    // The document is NOT width-sizable (top-anchored only). It used to be NSViewWidthSizable: when the
+    // system switched the scroller to space-taking legacy, the clip lost 17pt, the document shrank with
+    // it, and width-flexible self-drawn controls inside (the switch 38 -> 21, action buttons shifted
+    // 17pt left) got squeezed out of shape. Content width is decided by the scroller resync logic, not
+    // by AppKit's tiling.
+    let _: () = msg_send![document, setAutoresizingMask: 8u64];
     let _: () = msg_send![scroll, setDocumentView: document];
     let _: () = msg_send![parent, addSubview: scroll];
 

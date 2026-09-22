@@ -24,6 +24,7 @@ mod pointer_locator;
 mod quick_actions;
 mod restart;
 mod runtime_config;
+mod scroller;
 mod settings;
 mod single_instance;
 mod skylight;
@@ -779,6 +780,31 @@ extern "C" fn on_locale_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void
     callback_guard::void("on_locale_changed", || on_locale_changed_inner(_self));
 }
 
+/// 滚动条样式变化回调:`NSScrollerPreferredScrollerStyleDidChangeNotification`。
+/// Scroller-style change callback for `NSScrollerPreferredScrollerStyleDidChangeNotification`.
+extern "C" fn on_scroller_style_changed(_self: *mut AnyObject, _cmd: Sel, _note: *mut AnyObject) {
+    unsafe {
+        // 通知投递线程不保证是主线程,而重申样式与重排 UI 都必须在主线程。
+        // Notification delivery thread isn't guaranteed to be main, but both re-asserting the style
+        // and re-laying out UI must run on main.
+        let is_main: bool = msg_send![class!(NSThread), isMainThread];
+        if !is_main {
+            let _: () = msg_send![_self,
+                performSelectorOnMainThread: sel!(handleScrollerStyleChanged:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+            return;
+        }
+    }
+    // 诊断:记录是哪种通知把我们叫醒的。
+    let name: *mut AnyObject = unsafe { msg_send![_note, name] };
+    crate::log_debug!("[scroller] notification arrived: {}", unsafe {
+        crate::ffi::nsstring_to_rust(name)
+    });
+    crate::scroller::on_activation_resync();
+}
+
 fn on_locale_changed_inner(_self: *mut c_void) {
     unsafe {
         // 通知投递线程不保证是主线程,而刷新 UI 必须在主线程;非主线程时转到主线程重入本方法。
@@ -1452,6 +1478,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleLocaleChanged:),
             on_locale_changed as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleScrollerStyleChanged:),
+            on_scroller_style_changed as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -2369,6 +2401,43 @@ pub fn run() {
             object: std::ptr::null::<AnyObject>(),
         ];
         CFRelease(locale_name as *const c_void);
+
+        // 监听滚动条样式变化:运行中偏好/输入设备切换会让 AppKit 把已有 scroll view 重新 tile 成
+        // 占宽的 legacy,右列被裁。这里重申 overlay,必要时按新的可视宽度重排(见 scroller 模块)。
+        // Observe scroller-style changes: a runtime preference/input-device switch makes AppKit
+        // re-tile existing scroll views as space-taking legacy, clipping the right column. Re-assert
+        // overlay here and re-lay out when needed (see the scroller module).
+        let scroller_name = make_nsstring("NSScrollerPreferredScrollerStyleDidChangeNotification");
+        let _: () = msg_send![default_nc,
+            addObserver: controller,
+            selector: sel!(handleScrollerStyleChanged:),
+            name: scroller_name,
+            object: std::ptr::null::<AnyObject>(),
+        ];
+        CFRelease(scroller_name as *const c_void);
+        // 注意:`NSScrollerPreferredScrollerStyleDidChangeNotification` 实测**从不投递**(2026-09-22
+        // 用日志验证过),而窗口成为 key / app 重新激活这两条**会**投递,且正好覆盖"用户插上鼠标或
+        // 改了滚动条偏好之后回到设置窗口"这个真实场景。所以同步逻辑挂在这两条上:每次激活都实测
+        // 滚动条占位,变了就按新的可视宽度重排内容(见 scroller 模块)。
+        // Note: `NSScrollerPreferredScrollerStyleDidChangeNotification` is never delivered (verified
+        // with logging on 2026-09-22), while window-did-become-key and app-did-become-active are, and
+        // those cover the real scenario (the user plugs in a mouse or changes the preference and then
+        // returns to the settings window). The sync therefore hangs off these two: every activation
+        // measures the scroller footprint and re-lays out the content when it changed (see the
+        // scroller module).
+        for probe_name in [
+            "NSWindowDidBecomeKeyNotification",
+            "NSApplicationDidBecomeActiveNotification",
+        ] {
+            let name_ns = make_nsstring(probe_name);
+            let _: () = msg_send![default_nc,
+                addObserver: controller,
+                selector: sel!(handleScrollerStyleChanged:),
+                name: name_ns,
+                object: std::ptr::null::<AnyObject>(),
+            ];
+            CFRelease(name_ns as *const c_void);
+        }
 
         // 监听系统有效外观变化,使 theme=auto 的窗口无需重启即可跟随明暗模式。
         // Observe effective appearance changes so theme=auto follows light/dark mode without
