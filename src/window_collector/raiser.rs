@@ -698,6 +698,88 @@ pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)
     })
 }
 
+/// kAXValueAXErrorType(批量读里“应用没答这个属性”的占位值类型)。
+/// kAXValueAXErrorType: the placeholder type a batch read uses for an attribute the app did
+/// not answer.
+const K_AX_VALUE_AX_ERROR_TYPE: i32 = 5;
+
+/// 取批量读结果里的一个槽位:数组越界、null、错误占位都归为“没答”(None)。
+/// Read one slot of a batch-read result: an out-of-range index, null or an error placeholder all
+/// mean "did not answer" (None).
+unsafe fn ax_slot_value(slots: *const c_void, index: isize) -> Option<AXUIElementRef> {
+    if slots.is_null() || index >= CFArrayGetCount(slots) {
+        return None;
+    }
+    let value = CFArrayGetValueAtIndex(slots, index);
+    if value.is_null() {
+        return None;
+    }
+    // 批量读(未带 stopOnError)对答不出的槽位放一个 kAXValueAXErrorType 的 AXValue;
+    // 不识别它就会把“没答”当成“答了一个对象”。
+    // A batch read without stopOnError puts an kAXValueAXErrorType AXValue in a slot the app could
+    // not answer; not recognising it would read "did not answer" as "answered an object".
+    if CFGetTypeID(value) == AXValueGetTypeID() && AXValueGetType(value) == K_AX_VALUE_AX_ERROR_TYPE
+    {
+        return None;
+    }
+    Some(value)
+}
+
+/// 把三个属性槽位里的窗口元素合并成一份候选列表:`kAXWindows` 的顺序在前,再补 focused、
+/// main;同一个窗口(由元素里的 CGWindowID 识别)只保留首次出现,取不到 id 的按元素本身去重。
+///
+/// 三个属性必须一起读,且**空数组不是“没有窗口”**:AppKit 的 `kAXWindows` 是按“当前 Space”
+/// 过滤出来的(窗口全在别的 Space 时它返回空数组),而 `kAXFocusedWindow`/`kAXMainWindow`
+/// 直接读 NSApplication 的 `_keyWindow`/`_mainWindow` 弱引用,不做 Space 过滤、也不要求
+/// App 处于激活——所以那种 App 仍会交回它的 key/main 窗口。在此处遇到 windows 为空就提前
+/// 返回,恰好会把唯一能救回这些窗口的信息丢掉。
+///
+/// Merges the window elements of the three attribute slots: `kAXWindows` order first, then the
+/// focused and main slots; a window (identified by its CGWindowID) keeps its first occurrence,
+/// while elements without an id are deduplicated by element. The three must be read together, and
+/// **an empty array is not "no windows"**: AppKit's `kAXWindows` is filtered by the CURRENT
+/// Space (it answers with an empty array when every window lives on another Space), whereas
+/// `kAXFocusedWindow`/`kAXMainWindow` read NSApplication's `_keyWindow`/`_mainWindow` weak refs
+/// with no Space filter and no active-state guard, so such an app still hands its key/main window
+/// back. Returning early on an empty `windows` here would throw away exactly the evidence that
+/// recovers those windows.
+pub(super) fn candidate_window_elements<T>(
+    published: &[(u32, T)],
+    focused: Option<(u32, T)>,
+    main: Option<(u32, T)>,
+) -> Vec<(u32, T, bool)>
+where
+    T: Copy + Eq + std::hash::Hash,
+{
+    let mut result = Vec::with_capacity(published.len() + 2);
+    let mut seen_wids = HashSet::new();
+    let mut seen_elements = HashSet::new();
+    // 最后一个分量标记“只来自 key/main 槽位”(见 AxWindowInfo::only_via_key_or_main)。
+    // The last component marks "only from the key/main slots" (see
+    // AxWindowInfo::only_via_key_or_main).
+    let candidates = published
+        .iter()
+        .copied()
+        .map(|entry| (entry, false))
+        .chain(focused.map(|entry| (entry, true)))
+        .chain(main.map(|entry| (entry, true)));
+    for ((wid, element), only_via_key_or_main) in candidates {
+        // 槽位之间会重复同一个窗口(取回的是不同对象),按 id 去重才能省下重复的逐元素属性查询。
+        // The slots repeat the same window as different objects; deduplicating by id saves the
+        // duplicate per-element attribute reads.
+        let duplicate = if wid != 0 {
+            !seen_wids.insert(wid)
+        } else {
+            !seen_elements.insert(element)
+        };
+        if duplicate {
+            continue;
+        }
+        result.push((wid, element, only_via_key_or_main));
+    }
+    result
+}
+
 pub(super) fn get_ax_windows_for_pid_with_identity(
     pid: i32,
     process_start_time_us: Option<u64>,
@@ -719,29 +801,75 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         // and let invisible windows through).
         AXUIElementSetMessagingTimeout(app, 0.05);
 
+        // 一次批量读三个属性(理由与合并规则见 candidate_window_elements)。
+        // One batched read of the three attributes (rationale and merge rules in
+        // candidate_window_elements).
         let windows_key = cf_string_new("AXWindows");
-        let mut windows_array: *const c_void = std::ptr::null();
-        let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
-        CFRelease(windows_key);
+        let focused_window_key = cf_string_new("AXFocusedWindow");
+        let main_window_key = cf_string_new("AXMainWindow");
+        let keys = [windows_key, focused_window_key, main_window_key];
+        // callbacks = null:数组只是本次调用的同步输入,键由 keys 在本函数内保活。
+        // callbacks = null: the array is only a synchronous input to this call; `keys` keeps the
+        // strings alive for its duration.
+        let keys_array = CFArrayCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            keys.len() as isize,
+            std::ptr::null(),
+        );
+        if keys_array.is_null() {
+            for key in keys {
+                CFRelease(key);
+            }
+            CFRelease(app);
+            return None;
+        }
+        let mut slots: *const c_void = std::ptr::null();
+        let err = AXUIElementCopyMultipleAttributeValues(app, keys_array, 0, &mut slots);
+        CFRelease(keys_array);
+        for key in keys {
+            CFRelease(key);
+        }
         CFRelease(app);
-        if err != K_AX_SUCCESS || windows_array.is_null() {
+        if err != K_AX_SUCCESS || slots.is_null() {
             return None;
         }
 
-        let count = CFArrayGetCount(windows_array);
+        // 槽位 0 = kAXWindows(CFArray),1 = kAXFocusedWindow,2 = kAXMainWindow。
+        // Slot 0 = kAXWindows (a CFArray), 1 = kAXFocusedWindow, 2 = kAXMainWindow.
+        let windows_array =
+            ax_slot_value(slots, 0).filter(|value| CFGetTypeID(*value) == CFArrayGetTypeID());
+        let focused_window =
+            ax_slot_value(slots, 1).filter(|value| CFGetTypeID(*value) == AXUIElementGetTypeID());
+        let main_window =
+            ax_slot_value(slots, 2).filter(|value| CFGetTypeID(*value) == AXUIElementGetTypeID());
+
+        let mut published: Vec<(u32, AXUIElementRef)> = Vec::new();
+        if let Some(array) = windows_array {
+            let count = CFArrayGetCount(array);
+            published.reserve(count as usize);
+            for i in 0..count {
+                let element = CFArrayGetValueAtIndex(array, i);
+                if !element.is_null() {
+                    published.push((ax_window_cgwid(element).unwrap_or(0), element));
+                }
+            }
+        }
+        let candidates = candidate_window_elements(
+            &published,
+            focused_window.map(|element| (ax_window_cgwid(element).unwrap_or(0), element)),
+            main_window.map(|element| (ax_window_cgwid(element).unwrap_or(0), element)),
+        );
+
         let title_key = cf_string_new("AXTitle");
         let role_key = cf_string_new("AXRole");
         let subrole_key = cf_string_new("AXSubrole");
         let minimized_key = cf_string_new("AXMinimized");
         let main_key = cf_string_new("AXMain");
         let fullscreen_key = cf_string_new("AXFullScreen");
-        let mut results = Vec::with_capacity(count as usize);
+        let mut results = Vec::with_capacity(candidates.len());
 
-        for i in 0..count {
-            let element = CFArrayGetValueAtIndex(windows_array, i);
-            if element.is_null() {
-                continue;
-            }
+        for (cgwid, element, only_via_key_or_main) in candidates {
             // app 元素上的 50ms 不会传给窗口元素;逐个设超时,否则无响应 App 的窗口查询会
             // 走系统默认值(约 1.5s),把整轮采集拖住。
             // The 50ms on the app element does not carry over to the window elements; set it per
@@ -856,8 +984,9 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                     false
                 }
             };
-            // 取该 AX 窗口的 CGWindowID（私有 API），用于和 CG 窗口精确配对。
-            let cgwid = ax_window_cgwid(element).unwrap_or(0);
+            // cgwid 已在合并候选时取好(私有 API,用于和 CG 窗口精确配对)。
+            // cgwid was resolved while merging the candidates (private API, used to pair with
+            // the CG window).
             // 保留精确元素供激活路径复用,这样正常切换不必再次读取 AXWindows。
             // Retain the exact element for the activation path so normal raises do not need
             // another AXWindows round trip.
@@ -869,6 +998,7 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 is_main,
                 is_fullscreen,
                 is_custom_root: subrole.as_deref() == Some("AXUnknown"),
+                only_via_key_or_main,
             });
         }
         CFRelease(title_key);
@@ -876,10 +1006,25 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         CFRelease(minimized_key);
         CFRelease(main_key);
         CFRelease(fullscreen_key);
-        CFRelease(windows_array);
+        CFRelease(slots);
         cache_ax_snapshot(pid, process_start_time_us, &results);
         Some(results)
     }
+}
+
+/// 该 PID 的进程是否不可激活(NSApplicationActivationPolicyProhibited = 2)。
+/// 这类进程按定义没有可切换的窗口(设置面板宿主、光标浮层服务等)。
+/// Whether the process behind `pid` cannot be activated
+/// (NSApplicationActivationPolicyProhibited = 2). Such a process has no switchable windows by
+/// definition (settings-pane hosts, cursor-overlay services).
+pub(super) unsafe fn process_cannot_be_activated(pid: i32) -> bool {
+    let app: *mut AnyObject =
+        msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+    if app.is_null() {
+        return false;
+    }
+    let policy: i64 = msg_send![app, activationPolicy];
+    policy == 2
 }
 
 /// CFString -> Rust String(None = 转换失败)。窗口控制模块复用。

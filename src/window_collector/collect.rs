@@ -12,7 +12,24 @@ use super::*;
 /// second pass over the CG array and never depends on collection order).
 struct AxPartial {
     icon_ids: HashMap<i32, AppIdentity>,
-    ax_queried_pids: HashSet<i32>,
+    /// AX 查询“成功但一个标准窗口都没有”的 pid。空结果**不是**否定证据:AX 只能看到
+    /// 当前 Space(AppKit 的 kAXWindows 按当前 Space 过滤),原生全屏 Space 激活时,
+    /// 所有后台 App 都会返空——所以这类结果不能直接当“这个 App 没有窗口”处理,而要先
+    /// 看整批是否处于退化状态(见 ax_batch_looks_degraded)。
+    /// Pids whose AX query SUCCEEDED with zero standard windows. An empty result is NOT negative
+    /// evidence: AX only sees the CURRENT Space (AppKit filters kAXWindows by it), so every
+    /// background app answers empty while a native fullscreen Space is active -- the result must
+    /// not be read as "this app has no windows" before checking whether the whole batch is in
+    /// the degraded shape (see ax_batch_looks_degraded).
+    ax_empty_pids: HashSet<i32>,
+    /// 仅由 key/main 槽位恢复出的窗口(不在 kAXWindows 里),按 pid 分开放:它们不做
+    /// Space 过滤,能救回“窗口全在别的 Space”的后台 App,但也会交回辅助进程的浮层,
+    /// 所以只在整批退化时才并入配对(见 ax_batch_looks_degraded)。
+    /// Windows recovered ONLY from the key/main slots (absent from kAXWindows), kept per pid:
+    /// they are not Space-filtered and recover background apps whose windows all live on another
+    /// Space, but they also hand over helper processes' overlays -- so they join the pairing only
+    /// in the degraded batch (see ax_batch_looks_degraded).
+    ax_recovered_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>>,
     ax_failed_pids: Vec<i32>,
     ax_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>>,
     titleless_pids: HashSet<i32>,
@@ -36,7 +53,8 @@ struct AxPartial {
 unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> AxPartial {
     let mut partial = AxPartial {
         icon_ids: HashMap::new(),
-        ax_queried_pids: HashSet::new(),
+        ax_empty_pids: HashSet::new(),
+        ax_recovered_wid_to_info: HashMap::new(),
         ax_failed_pids: Vec::new(),
         ax_wid_to_info: HashMap::new(),
         titleless_pids: HashSet::new(),
@@ -92,23 +110,49 @@ unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> A
         }
         match ax_wins {
             Some(wins) if !wins.is_empty() => {
-                partial.ax_queried_pids.insert(pid);
-                if wins.iter().all(|window| window.title.is_empty()) {
-                    partial.titleless_pids.insert(pid);
-                }
-                let mut wid_map: HashMap<u32, AxWindowInfo> = HashMap::new();
-                for window in wins {
-                    if window.cgwid != 0 {
-                        wid_map.insert(window.cgwid, window);
+                // 按来源拆开:kAXWindows 的答复是权威列表,key/main 槽位恢复出的窗口只能
+                // 在确认“AX 看不到当前 Space 之外”时才用(见 ax_batch_looks_degraded)。
+                // Split by origin: the kAXWindows answer is the authoritative list, while windows
+                // recovered from the key/main slots are usable only once the batch is confirmed to
+                // be in that shape (see ax_batch_looks_degraded).
+                let (recovered, published): (Vec<AxWindowInfo>, Vec<AxWindowInfo>) = wins
+                    .into_iter()
+                    .partition(|window| window.only_via_key_or_main);
+                if !published.is_empty() {
+                    if windows_are_all_untitled(&published) {
+                        partial.titleless_pids.insert(pid);
+                    }
+                    partial.ax_wid_to_info.insert(pid, ax_wid_map(published));
+                } else {
+                    // kAXWindows 在当前 Space 看不到这个 App 的任何窗口。
+                    // kAXWindows cannot see any of this app's windows from the current Space.
+                    partial.ax_empty_pids.insert(pid);
+                    // 恢复出来的窗口同样适用“AX 能看到的窗口全部无标题”这条豁免:自绘标题栏
+                    // 的 App(标题为空)在退化态下只有这些窗口,不豁免它们就会被空标题门
+                    // 全部丢掉,整个 App 从列表里消失。
+                    // The recovered windows get the same all-untitled exemption: an app with a
+                    // custom title bar (empty titles) has only these in the degraded shape, and
+                    // without the exemption the empty-title gate would drop every one and the app
+                    // would vanish from the list.
+                    if windows_are_all_untitled(&recovered) {
+                        partial.titleless_pids.insert(pid);
                     }
                 }
-                partial.ax_wid_to_info.insert(pid, wid_map);
+                if !recovered.is_empty() {
+                    partial
+                        .ax_recovered_wid_to_info
+                        .insert(pid, ax_wid_map(recovered));
+                }
             }
-            // AX 查询成功但无标准窗口:该 App 没有调度中心可见的窗口,后续直接跳过。
-            // AX query succeeded but no standard windows: the app has no Mission-Control-visible
-            // windows; skip all its CG windows in the second pass.
+            // AX 查询成功但无标准窗口:可能是该 App 真的没有调度中心可见的窗口(如
+            // BetterDisplay 的隐形锚点窗口),也可能是 AX 在当前 Space 看不到它们。
+            // 两种情形的区分放在整批收完之后(见 ax_batch_looks_degraded)。
+            // AX answered with no standard windows: either the app genuinely has none that
+            // Mission Control would show (e.g. an invisible anchor window), or AX cannot see
+            // them from the current Space. The two are told apart once the whole batch is in
+            // (see ax_batch_looks_degraded).
             Some(_) => {
-                partial.ax_queried_pids.insert(pid);
+                partial.ax_empty_pids.insert(pid);
             }
             // AX 查询失败(无 AX 数据):保留 CG 回退路径。
             // AX query failed (no AX data): keep the CG fallback path.
@@ -194,11 +238,31 @@ unsafe fn collect_windows_for_pid_inner(
         CFRelease(array);
         return None;
     };
-    let ax_wid_to_info: HashMap<u32, AxWindowInfo> = ax_wins
+    // 定向(单 App)刷新只认 kAXWindows 的答复:key/main 槽位不做 Space 过滤,恢复出来的
+    // 窗口常是辅助进程的浮层/子窗口,不该由这条路径带进列表。如果答复**只有**恢复出来的
+    // 窗口,就当作“没答”(None),让上层保留原有卡片而不是把它们清空。
+    // A directed (single-app) refresh honours only the kAXWindows answer: windows recovered from
+    // the key/main slots are not Space-filtered and are often helper overlays, so they must not
+    // enter the list through this path. When the answer consists solely of recovered windows it
+    // counts as unanswered (None), so the caller keeps the existing cards instead of losing them.
+    let mut published: Vec<AxWindowInfo> = Vec::with_capacity(ax_wins.len());
+    let mut recovered_only = !ax_wins.is_empty();
+    for window in ax_wins {
+        if window.only_via_key_or_main {
+            continue;
+        }
+        recovered_only = false;
+        published.push(window);
+    }
+    if recovered_only {
+        CFRelease(array);
+        return None;
+    }
+    let ax_wid_to_info: HashMap<u32, AxWindowInfo> = published
         .iter()
         .filter_map(|window| (window.cgwid != 0).then_some((window.cgwid, window.clone())))
         .collect();
-    let titleless = !ax_wins.is_empty() && ax_wins.iter().all(|window| window.title.is_empty());
+    let titleless = !published.is_empty() && published.iter().all(|window| window.title.is_empty());
     let icon_path = check_cache_for_identity(&identity);
     let last_activated = LAST_ACTIVATED.lock().unwrap().get(&pid).copied();
     let now = Instant::now();
@@ -397,6 +461,70 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     collect_windows_with_frontmost_bump(mru, true)
 }
 
+/// AX 批量结果里“CG 里确实有像真窗口、但 AX 返空”的 App 达到这个数量,且它们占了本批
+/// 有可切换窗口的 App 的一半及以上时,判定为“AX 看不到当前 Space 之外的窗口”。
+/// This many apps that DO have a real-looking CG window yet answered with no standard windows,
+/// making up at least half of the apps with switchable windows, marks an AX view that cannot see
+/// outside the current Space.
+const AX_EMPTY_DEGRADED_MIN_PIDS: usize = 3;
+
+/// 从 (pid, layer, bounds) 里挑出“AX 返空、但 CG 里确实有像真窗口”的 pid 集合。
+/// 辅助进程(光标浮层/菜单条/锚点)本来就没有 AX 窗口,不能算退化证据(纯函数,单测覆盖)。
+/// Collects the pids that answered empty to AX yet DO have a real-looking CG window. Helper
+/// processes (cursor overlays, menu-bar surfaces, anchors) have no AX windows by nature and are
+/// not evidence of degradation (pure; unit-tested).
+pub(super) fn pids_with_real_window<I>(windows: I, empty_pids: &HashSet<i32>) -> HashSet<i32>
+where
+    I: IntoIterator<Item = (i32, i32, (f64, f64, f64, f64))>,
+{
+    windows
+        .into_iter()
+        .filter(|(pid, layer, bounds)| {
+            *layer == 0 && empty_pids.contains(pid) && custom_window_is_substantial(*bounds)
+        })
+        .map(|(pid, _, _)| pid)
+        .collect()
+}
+
+/// 判定本批 AX 是否处于“看不到当前 Space 之外”的退化形态(纯函数,单测覆盖)。
+/// `empty_pids` = AX 返空且 CG 里确实有像真窗口的 App 数(见 `pids_with_real_window`),
+/// `windowed_pids` = 本批有窗口的 App 数。
+///
+/// 两种情形必须分开:日常个别 App 返空要维持“整 App 跳过”,而**原生全屏 Space 激活时
+/// 成批的后台 App 都会返空**——只有后者才是退化,也只有退化时才允许用 CG 元数据兜底。
+/// Decides whether this batch's AX is in the "cannot see outside the current Space" shape (pure;
+/// unit-tested). `empty_pids` = apps that answered empty while owning a real-looking CG window
+/// (see `pids_with_real_window`), `windowed_pids` = apps that answered with windows.
+///
+/// The two cases must stay apart: an occasional app answering empty day to day keeps the "skip
+/// the app" treatment, whereas **a native fullscreen Space makes background apps answer empty in
+/// bulk** -- only the latter is degradation, and only there may the windows the key/main slots
+/// recovered be used.
+pub(super) fn ax_batch_looks_degraded(empty_pids: usize, windowed_pids: usize) -> bool {
+    empty_pids >= AX_EMPTY_DEGRADED_MIN_PIDS && empty_pids * 2 >= empty_pids + windowed_pids
+}
+
+/// “AX 能看到的窗口全部无标题”这条空标题豁免的判定(纯函数,单测覆盖)。
+/// 要求至少有一个窗口:空集合不能享受豁免(那会让“一个窗口都没看到”变成“无标题窗口”)。
+/// The all-untitled exemption test (pure; unit-tested). At least one window is required: an
+/// empty set must not qualify, or "saw no windows" would read as "untitled windows".
+pub(super) fn windows_are_all_untitled(windows: &[AxWindowInfo]) -> bool {
+    !windows.is_empty() && windows.iter().all(|window| window.title.is_empty())
+}
+
+/// 一批 AX 窗口信息 → CGWindowID 索引(cgwid == 0 的条目没有可配对的窗口 id,丢弃)。
+/// Index a batch of AX window facts by CGWindowID (entries with cgwid == 0 have no window to pair
+/// with and are dropped).
+fn ax_wid_map(windows: Vec<AxWindowInfo>) -> HashMap<u32, AxWindowInfo> {
+    let mut map = HashMap::new();
+    for window in windows {
+        if window.cgwid != 0 {
+            map.insert(window.cgwid, window);
+        }
+    }
+    map
+}
+
 /// 收集窗口快照,可选择是否把当前前台窗口写入 MRU。
 /// 生命周期事件触发的刷新只负责更新窗口集合,不能把自身误当成 summon。
 /// Collect a window snapshot, optionally recording the current frontmost window in MRU.
@@ -509,14 +637,13 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // all PIDs" to "slowest single PID" (apps like WeChat that stall on every AX question
     // used to dominate serial totals; up to 1.5s for one PID in logs).
     let mut ax_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>> = HashMap::new();
-    // AX 查询「成功」的 pid 集合:成功但无标准窗口的 App 应整体跳过(调度中心不显示它),
-    // 只有查询失败(None)才允许走 CG 回退。这是 BetterDisplay 隐形窗口 bug 的根因修复:
-    // AX 成功但 subrole 过滤后为空,不能等同于「无 AX 数据」。
-    // Pids whose AX query SUCCEEDED: an app with a successful query but no standard windows
-    // must be skipped entirely (Mission Control doesn't show it); only a failed query (None)
-    // allows the CG fallback. This fixes the BetterDisplay invisible-window bug: an AX query
-    // that succeeds but yields no standard windows must not be treated as "no AX data".
-    let mut ax_queried_pids: HashSet<i32> = HashSet::new();
+    // key/main 槽位恢复出的窗口(见 AxPartial::ax_recovered_wid_to_info)。
+    // Windows recovered from the key/main slots (see AxPartial::ax_recovered_wid_to_info).
+    let mut ax_recovered_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>> = HashMap::new();
+    // AX 查询“成功但为空”的 pid 集合:单独收集,不在这里定生死。
+    // Pids whose AX query succeeded but yielded nothing: collected separately, never condemned
+    // here.
+    let mut ax_empty_pids: HashSet<i32> = HashSet::new();
     // 每轮聚合 AX 查询失败,保留 CG 回退的诊断证据,同时避免逐应用成功日志刷屏。
     // Aggregate AX query failures once per collection so CG fallback remains diagnosable
     // without restoring noisy per-app success logs.
@@ -560,7 +687,8 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                                 log_info!("[collect] ax exception (chunk) {:?}", exception);
                                 AxPartial {
                                     icon_ids: HashMap::new(),
-                                    ax_queried_pids: HashSet::new(),
+                                    ax_empty_pids: HashSet::new(),
+                                    ax_recovered_wid_to_info: HashMap::new(),
                                     ax_failed_pids: Vec::new(),
                                     ax_wid_to_info: HashMap::new(),
                                     titleless_pids: HashSet::new(),
@@ -582,7 +710,8 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         // one chunk), so merge order cannot affect the outcome.
         for p in partials {
             icon_ids.extend(p.icon_ids);
-            ax_queried_pids.extend(p.ax_queried_pids);
+            ax_empty_pids.extend(p.ax_empty_pids);
+            ax_recovered_wid_to_info.extend(p.ax_recovered_wid_to_info);
             ax_failed_pids.extend(p.ax_failed_pids);
             ax_wid_to_info.extend(p.ax_wid_to_info);
             titleless_pids.extend(p.titleless_pids);
@@ -612,6 +741,47 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // TIMING-DEBUG Wall clock of the parallel AX phase (not the sum of per-PID work;
     // slow queries are logged individually).
     let ax_total_ms = t_ax.elapsed().as_millis();
+    // AX 退化判定(见 ax_batch_looks_degraded):退化时“查询成功但为空”不再等于“这个 App
+    // 没有窗口”,而是“AX 看不到当前 Space 之外”,于是把 key/main 槽位恢复出的窗口并入配对
+    // (仅此一条,不做 CG 整批回退)。判据只数 CG 里确实有像真窗口的 App,否则一屋子本来就
+    // 没有 AX 窗口的辅助进程会把判定撑爆。
+    // AX degradation (see ax_batch_looks_degraded): in that shape an empty answer no longer means
+    // "this app has no windows" but "AX cannot see outside the current Space", so the windows the
+    // key/main slots recovered join the pairing (that alone -- no wholesale CG fallback). Only apps
+    // that DO have a real-looking CG window count, or a houseful of helper processes that never had
+    // AX windows would trip the test.
+    let empty_with_real_window = pids_with_real_window(
+        (0..count).filter_map(|i| {
+            let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
+            if dict.is_null() {
+                return None;
+            }
+            Some((
+                cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1),
+                cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999),
+                cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default(),
+            ))
+        }),
+        &ax_empty_pids,
+    );
+    let ax_degraded = ax_batch_looks_degraded(empty_with_real_window.len(), ax_wid_to_info.len());
+    if ax_degraded {
+        // 恢复窗口只接受可被激活的进程:不可激活的辅助进程(设置面板宿主、光标浮层服务)
+        // 按定义没有切换目标,但它们的 key/main 槽位仍会交回面板/浮层,而尺寸门拦不住
+        // 740x883 那种大面板。
+        // Recovered windows are accepted only from activatable processes: a non-activatable helper
+        // (settings-pane host, cursor-overlay service) has no switch target by definition, yet its
+        // key/main slots still hand the pane/overlay over, and a size gate cannot reject a large
+        // 740x883 pane.
+        let pool: *mut AnyObject = unsafe { msg_send![class!(NSAutoreleasePool), new] };
+        ax_recovered_wid_to_info.retain(|pid, _| unsafe { !process_cannot_be_activated(*pid) });
+        let _: () = unsafe { msg_send![pool, drain] };
+        log_debug!(
+            "[collect] ax degraded: empty_real_pids={} windowed_pids={} -> key/main-recovered windows pair",
+            empty_with_real_window.len(),
+            ax_wid_to_info.len()
+        );
+    }
     remember_non_normal_cg_windows(&cg_window_layers, &icon_ids, &ax_wid_to_info, &parent_ids);
 
     for i in 0..count {
@@ -653,27 +823,40 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         // Pair the AX title by CGWindowID (no more order/string guessing).
         // AX is authoritative: a CG window is kept only if AX has a window with
         // the same CGWindowID.
-        let ax_info = if let Some(wid_map) = ax_wid_to_info.get(&owner_pid) {
-            match wid_map.get(&cgwid) {
-                Some(info) => Some(info),
-                None => {
-                    // 配对失败的 CG 窗口通常是菜单栏/弹出层,属于正常过滤路径,不逐条记录。
-                    // CG windows without an AX pair are usually menu bars/popups and are
-                    // normal filtering, so keep this path silent instead of logging each one.
-                    continue; // CG 窗口在 AX 里没有 -> 弹出面板，跳过 / popup, skip
-                }
-            }
-        } else if ax_queried_pids.contains(&owner_pid) {
-            // AX 查询成功但该 App 无标准窗口(如 BetterDisplay 的隐形锚点窗口):
-            // 调度中心不显示它,这里也整体跳过,不回退到 CG。
-            // AX query succeeded but the app has no standard windows (e.g. BetterDisplay's
-            // invisible anchor window): Mission Control doesn't show it, skip entirely —
-            // no CG fallback.
-            continue;
+        // 配对取数:AXWindows 的答复优先;退化态(AX 看不到当前 Space 之外)下再把 key/main
+        // 槽位恢复出的窗口并进来,但必须过“像真窗口”的尺寸门——这两个槽位不做 Space 过滤,
+        // 也会交回辅助进程的浮层/子窗口。
+        // Pairing: the kAXWindows answer wins; in the degraded shape (AX cannot see outside the
+        // current Space) windows recovered from the key/main slots join in, but must look like real
+        // windows -- those slots are not Space-filtered and also hand over helper overlays.
+        let published_map = ax_wid_to_info.get(&owner_pid);
+        let recovered_map = if ax_degraded && custom_window_is_substantial(bounds) {
+            ax_recovered_wid_to_info.get(&owner_pid)
         } else {
-            // 该 App 无 AX 数据 -> 退回 CG 标题,最小化状态未知按 false。
-            // No AX data -> fall back to CG title; minimized status unknown, assume false.
             None
+        };
+        let ax_info = match published_map.and_then(|wid_map| wid_map.get(&cgwid)) {
+            Some(info) => Some(info),
+            // kAXWindows 认得这个 App,但这个 CG 窗口不在它的列表里 → 菜单栏/弹出层,跳过。
+            // kAXWindows knows this app but not this CG window -> menu bar/popup, skip.
+            None if published_map.is_some() => continue,
+            None => match recovered_map.and_then(|wid_map| wid_map.get(&cgwid)) {
+                Some(info) => Some(info),
+                // AX 对这个 App 有答复(给了窗口列表,或明确答复为空),但都没有这个 CG 窗口
+                // → 它是应用浮层/菜单栏/隐藏表面,跳过。**退化态也一样**:CG 里存在的表面
+                // 不能因为“AX 看不到”就整批当成可切换窗口,否则标签页表面、隐藏窗口、
+                // 其他 Space 的残影会全部摊成卡片(AX 配对正是干这个的)。
+                // AX answered for this app (with a window list, or with nothing at all) and this
+                // CG window is in neither -> it is an app overlay, a menu bar or a hidden surface:
+                // skip. The degraded shape changes nothing here -- CG surfaces must not all count
+                // as windows merely because AX cannot see them, or tab surfaces, hidden windows and
+                // other-Space leftovers would all turn into cards (AX pairing is what prevents
+                // that).
+                None if published_map.is_some() || ax_empty_pids.contains(&owner_pid) => continue,
+                // 无 AX 数据(查询失败) → 退回 CG 标题。
+                // No AX data (the query failed) -> fall back to the CG title.
+                None => None,
+            },
         };
 
         let (window_title, minimized, is_main, is_fullscreen, is_custom_root) = ax_info

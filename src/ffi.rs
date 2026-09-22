@@ -48,6 +48,18 @@ extern "C" {
     ) -> *const c_void;
     pub(crate) fn CFArrayGetCount(array: *const c_void) -> isize;
     pub(crate) fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+    /// CFTypeID 查询:批量读的槽位可能是 AXValue 占位 / CFArray / AXUIElement,只有先核过
+    /// 类型 id 才敢把槽位当成 AXUIElement 用——私有的 `_AXUIElementGetWindow` 不做任何校验。
+    /// CFTypeID queries: a batch-read slot can be an AXValue placeholder, a CFArray or an
+    /// AXUIElement, and only after checking the type id is it safe to treat a slot as an
+    /// AXUIElement -- the private `_AXUIElementGetWindow` validates nothing.
+    pub(crate) fn CFGetTypeID(cf: *const c_void) -> usize;
+    pub(crate) fn CFArrayGetTypeID() -> usize;
+    pub(crate) fn AXUIElementGetTypeID() -> usize;
+    pub(crate) fn AXValueGetTypeID() -> usize;
+    /// AXValue 的实际类型;kAXValueAXErrorType = 5 表示“该槽位是一次错误占位”。
+    /// The AXValue's concrete type; kAXValueAXErrorType = 5 marks an error placeholder slot.
+    pub(crate) fn AXValueGetType(value: *const c_void) -> i32;
     pub(crate) fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
     pub(crate) fn CFNumberCreate(
         alloc: *const c_void,
@@ -126,6 +138,19 @@ extern "C" {
         element: AXUIElementRef,
         attribute: *const c_void,
         value: *mut *const c_void,
+    ) -> AXError;
+    /// 一次 IPC 批量读多个属性(与逐个读同一批属性等价,但只走一次远程消息)。
+    /// options 为空且不带 stopOnError 时**总是**返回数组:应用答不出的槽位放一个
+    /// `kAXValueAXErrorType` 的 AXValue 占位,调用方必须把它读成“没答”而不是“答了”。
+    /// Reads several attributes in one IPC round trip. With empty options and no stopOnError the
+    /// call ALWAYS returns an array: a slot the app could not answer holds an
+    /// `kAXValueAXErrorType` AXValue placeholder, which callers must read as "did not answer"
+    /// rather than "answered".
+    pub(crate) fn AXUIElementCopyMultipleAttributeValues(
+        element: AXUIElementRef,
+        attributes: *const c_void,
+        options: i32,
+        values: *mut *const c_void,
     ) -> AXError;
     pub(crate) fn AXUIElementPerformAction(
         element: AXUIElementRef,

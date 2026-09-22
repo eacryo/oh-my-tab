@@ -9,12 +9,14 @@ use std::time::{Duration, Instant};
 use crate::app_identity::{resolve_app_identity, AppIdentity};
 use crate::config::CONFIG;
 use crate::ffi::{
-    kCFBooleanFalse, AXError, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
+    kCFBooleanFalse, AXError, AXUIElementCopyAttributeValue,
+    AXUIElementCopyMultipleAttributeValues, AXUIElementCreateApplication, AXUIElementGetTypeID,
     AXUIElementPerformAction, AXUIElementRef, AXUIElementSetAttributeValue,
-    AXUIElementSetMessagingTimeout, CFArrayGetCount, CFArrayGetValueAtIndex, CFBooleanGetValue,
-    CFDictionaryGetValue, CFNumberGetValue, CFRelease, CFRetain, CFStringCreateWithCString,
-    CFStringGetCString, CGWindowListCopyWindowInfo, K_AX_CANNOT_COMPLETE, K_AX_INVALID_UI_ELEMENT,
-    K_AX_SUCCESS,
+    AXUIElementSetMessagingTimeout, AXValueGetType, AXValueGetTypeID, CFArrayCreate,
+    CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFBooleanGetValue,
+    CFDictionaryGetValue, CFGetTypeID, CFNumberGetValue, CFRelease, CFRetain,
+    CFStringCreateWithCString, CFStringGetCString, CGWindowListCopyWindowInfo,
+    K_AX_CANNOT_COMPLETE, K_AX_INVALID_UI_ELEMENT, K_AX_SUCCESS,
 };
 #[cfg(test)]
 use crate::hash::fnv1a64_hex;
@@ -459,6 +461,17 @@ struct AxWindowInfo {
     is_main: bool,
     is_fullscreen: bool,
     is_custom_root: bool,
+    /// 该条目是否**只**由 kAXFocusedWindow/kAXMainWindow 槽位交回(不在 kAXWindows 里)。
+    /// 这两个槽位不做 Space 过滤,所以窗口全在别的 Space(原生全屏 Space 下的后台 App)
+    /// 时它们是唯一的线索;但它们同样会交回辅助进程的浮层/子窗口,因此这类条目只在确认
+    /// “AX 看不到当前 Space 之外”时才可用,且要过“像真窗口”的尺寸门。
+    /// Whether this entry came ONLY from the kAXFocusedWindow/kAXMainWindow slots (absent from
+    /// kAXWindows). Those slots are not Space-filtered, so they are the only lead for an app
+    /// whose windows all live on another Space (every background app under a native fullscreen
+    /// Space) -- but they also hand over helper processes' overlays and child surfaces, so such
+    /// entries are usable only once the batch is confirmed to be in that shape, and only when
+    /// the window looks like a real one.
+    only_via_key_or_main: bool,
 }
 
 // 短 TTL 只用于合并快速连续的召唤/生命周期刷新;过期后仍会重新向 AX 请求权威快照。
@@ -655,6 +668,108 @@ mod tests {
             minimized: false,
             bounds: (0.0, 0.0, 0.0, 0.0),
         }
+    }
+
+    #[test]
+    fn candidate_window_elements_keep_published_order_and_append_key_and_main() {
+        // 三个属性槽位合成候选列表:kAXWindows 的顺序在前,后面补 focused / main;
+        // 同一个窗口在后面的槽位里再出现时只保留首次出现(前面的顺序优先),并且不被
+        // 标成“只来自 key/main 槽位”。
+        // The three slots fold into one candidate list: kAXWindows order first, then the focused
+        // and main slots; a window repeated in a later slot keeps its first occurrence and is not
+        // marked as coming only from the key/main slots.
+        let published = [(10u32, 'a'), (11, 'b')];
+        assert_eq!(
+            candidate_window_elements(&published, Some((11, 'B')), Some((12, 'c'))),
+            vec![(10, 'a', false), (11, 'b', false), (12, 'c', true)]
+        );
+    }
+
+    #[test]
+    fn candidate_window_elements_survive_an_empty_published_list() {
+        // 空数组不是“没有窗口”:窗口全在别的 Space 时 kAXWindows 返空,而 focused/main
+        // 仍会交回那个窗口——在这里提前返回,恰好会丢掉唯一能救回它的信息。恢复出来的
+        // 窗口带上标记,好让调用方只在确认退化时才用它们。
+        // An empty array is not "no windows": kAXWindows answers empty when every window lives
+        // on another Space while focused/main still hand the window over, so returning early on
+        // empty would drop exactly the evidence that recovers it. Recovered entries carry a mark
+        // so callers can use them only once degradation is confirmed.
+        assert_eq!(
+            candidate_window_elements(&[], Some((7, 'k')), None),
+            vec![(7, 'k', true)]
+        );
+        // focused/main 通常指向同一个窗口,不能因此变成两张。
+        assert_eq!(
+            candidate_window_elements(&[], Some((7, 'k')), Some((7, 'm'))),
+            vec![(7, 'k', true)]
+        );
+    }
+
+    #[test]
+    fn candidate_window_elements_dedupe_by_window_id_then_by_element() {
+        // 同一个窗口在槽位间是不同对象:按窗口 id 去重,避免重复的逐元素属性查询。
+        let published = [(10u32, 'a'), (10, 'A'), (11, 'b')];
+        assert_eq!(
+            candidate_window_elements(&published, Some((10, 'x')), Some((11, 'y'))),
+            vec![(10, 'a', false), (11, 'b', false)]
+        );
+        // 取不到窗口 id 的元素按元素本身去重。
+        assert_eq!(
+            candidate_window_elements(&[(0u32, 'z')], Some((0, 'z')), None),
+            vec![(0, 'z', false)]
+        );
+        // 三个槽位都没有内容才是真的空。
+        assert!(candidate_window_elements::<char>(&[], None, None).is_empty());
+    }
+
+    #[test]
+    fn untitled_exemption_needs_windows_and_every_title_empty() {
+        fn info(title: &str) -> AxWindowInfo {
+            AxWindowInfo {
+                cgwid: 1,
+                title: title.to_string(),
+                minimized: false,
+                is_main: false,
+                is_fullscreen: false,
+                is_custom_root: false,
+                only_via_key_or_main: false,
+            }
+        }
+        // 全部无标题 → 豁免(自绘标题栏的 App)。
+        assert!(windows_are_all_untitled(&[info(""), info("")]));
+        assert!(!windows_are_all_untitled(&[info(""), info("title")]));
+        // 没看到任何窗口 ≠ 无标题窗口:空集合不能拿豁免。
+        assert!(!windows_are_all_untitled(&[]));
+    }
+
+    #[test]
+    fn ax_degradation_ignores_helper_processes_without_real_windows() {
+        // 只有“CG 里确实有像真窗口”的 App 才算退化证据:辅助进程(光标浮层/菜单条)本来
+        // 就没有 AX 窗口,不能因为它们把退化判定撑爆。
+        // Only apps that DO have a real-looking CG window count as degradation evidence: helper
+        // processes (cursor overlays, bar surfaces) never had AX windows, and must not trip it.
+        let empty: HashSet<i32> = [1, 2, 3, 4].into_iter().collect();
+        let windows = [
+            (1, 0, (0.0, 0.0, 900.0, 600.0)),   // 真窗口 → 计入 / real window
+            (2, 0, (0.0, 0.0, 64.0, 64.0)),     // 光标浮层 → 不计 / cursor overlay
+            (3, 0, (0.0, 0.0, 1470.0, 33.0)),   // 菜单条 → 不计 / bar surface
+            (4, 101, (0.0, 0.0, 900.0, 600.0)), // 非 0 层 → 不计 / non-zero layer
+            (9, 0, (0.0, 0.0, 900.0, 600.0)),   // AX 非空 → 不计 / app that answered
+        ];
+        assert_eq!(pids_with_real_window(windows, &empty), HashSet::from([1]));
+    }
+
+    #[test]
+    fn ax_degradation_needs_several_empty_apps_without_a_windowed_majority() {
+        // 日常:个别 App 返空(隐形锚点窗口那种)不算退化,仍维持“整 App 跳过”。
+        assert!(!ax_batch_looks_degraded(1, 20));
+        assert!(!ax_batch_looks_degraded(2, 2));
+        // 原生全屏 Space:有 CG 窗口的 App 成批返空。
+        assert!(ax_batch_looks_degraded(20, 0));
+        assert!(ax_batch_looks_degraded(3, 3));
+        // 返空的是少数 → 不是退化。
+        assert!(!ax_batch_looks_degraded(3, 10));
+        assert!(!ax_batch_looks_degraded(0, 0));
     }
 
     #[test]
