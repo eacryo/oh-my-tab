@@ -627,12 +627,10 @@ static PICKER_CONTENT_PARENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::n
 /// macOS 26+ 的 picker 玻璃视图,供设置页实时刷新 tint/style。
 /// The macOS 26+ picker glass view, used for live tint/style preview updates.
 static PICKER_GLASS: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// 每行按钮指针(按行索引,供高亮/点击)/ row button pointers by index (highlight / click).
-static ROW_BUTTONS: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
-/// 每行背景块视图(与 ROW_BUTTONS 一一对应、同顺序;选中行不创建)。
-/// Per-row background tiles (one per entry, same order as ROW_BUTTONS; skipped for the
-/// selected row).
-static ROW_TILES: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
+/// 空态提示视图(历史为空 / 无匹配时显示)。与行视图分开跟踪,供下一次重建移除。
+/// The empty-state hint view (shown when the history is empty / nothing matches). Tracked
+/// separately from row views so the next rebuild can remove it.
+static EMPTY_STATE_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// 剪贴板行内来源图标的进程级缓存;避免每次重建都从磁盘重新解码同一张小图。
 /// Process-lifetime cache for clipboard source icons; avoids decoding the same small icon from
 /// disk again on every row rebuild.

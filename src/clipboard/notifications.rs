@@ -290,7 +290,7 @@ extern "C" fn picker_refresh_visible_rows(_self: *mut c_void, _cmd: Sel, _arg: *
     }
     unsafe {
         if picker_materialized_range_changed() {
-            rebuild_rows();
+            sync_visible_rows();
         }
     }
 }
@@ -1626,6 +1626,21 @@ extern "C" fn search_focus_ended(_self: *mut c_void, _cmd: Sel, note: *mut c_voi
     }
 }
 
+/// 当前行视图是否已对应当前历史/查询/筛选(与刷新回调同一判定口径)。
+/// Whether the materialized rows already match the current history/query/filter (the same
+/// predicate used by the refresh callbacks).
+fn picker_rows_are_current() -> bool {
+    let filter = *CLIP_FILTER.lock().unwrap();
+    let show_source = show_source_app();
+    let query = with_clipboard_ui(|ui| ui.search_query.clone());
+    let key = picker_rows_key(history_revision(), &query, filter, show_source);
+    with_clipboard_ui(|ui| {
+        ui.rendered_rows
+            .as_ref()
+            .is_some_and(|current| current == &key)
+    })
+}
+
 /// 搜索框 delegate 的命令拦截:↓(moveDown:) → 焦点切到列表并选中过滤结果第一条,返回
 /// YES 吞掉该命令;其余命令返回 NO 交给字段编辑器正常处理(光标移动/输入等)。
 /// Search-field delegate command interception: ↓ (moveDown:) moves focus into the list and
@@ -1664,8 +1679,23 @@ pub(super) extern "C" fn search_field_do_command(
         } else {
             0
         };
+        let previous = picker_selection();
         set_picker_selection(sel);
-        rebuild_rows();
+        // 列表已对应当前查询时只刷新前后两行高光;查询刚变、去抖刷新未落定时仍需一次
+        // 完整重建,否则会把新列表的索引套到旧行树上。
+        // When the rows already match the query, update only the two rows' highlights; right
+        // after a query change (the debounced refresh has not landed yet) a full rebuild is
+        // still required, otherwise the new list index is applied to stale rows.
+        if picker_rows_are_current() {
+            refresh_selection(previous, sel);
+        } else {
+            rebuild_rows();
+        }
+        // 详情打开时,其详情按钮的实心图标要跟随新的选中行。
+        // With the detail open, its filled action icon must follow the new selection.
+        if detail_visible() {
+            refresh_detail_action_visuals();
+        }
         // ↑ 选中末行时视口还停在顶部:用确定性的偏移计算滚动到选中行可见。
         // With ↑ the tail is selected while the viewport is still at the top: use the
         // deterministic offset calculation to bring the selected row into view.
