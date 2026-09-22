@@ -402,6 +402,13 @@ impl SettingsPageHeader {
     /// HTML `.content` 的顶部内边距,即标题块与面板顶部的距离。
     pub(super) const TOP_PADDING: f64 = 42.0;
 
+    /// HTML `.content`'s bottom padding, i.e. the space the page must keep below its last element.
+    /// Page documents are tightened to it (`widgets::fit_page_document_height`); overshooting it is
+    /// the dead scroll space users see as "the page scrolls far past its content".
+    /// HTML `.content` 的底部内边距,即页面最后一个元素下方必须保留的空白。页面文档按它收紧
+    /// (`widgets::fit_page_document_height`);超出它的部分就是用户看到的"页面能滚过内容很远"。
+    pub(super) const BOTTOM_PADDING: f64 = 72.0;
+
     /// Empty space between the title's frame and the first section heading's frame below it.
     /// 页面大标题框与其下方首个小标题框之间的空白。
     ///

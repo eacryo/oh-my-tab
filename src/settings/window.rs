@@ -370,6 +370,54 @@ fn show_settings_preserving(frame: NSRect, page: usize, scroll_offsets: [NSPoint
     show_settings_inner(Some(frame), page, Some(scroll_offsets), false);
 }
 
+/// 按真实内容重新收紧 7 个页面的文档高度,返回是否有页面真的变了。
+/// Re-tighten the seven page documents to their real content; returns whether any page changed.
+///
+/// 构建时已经收紧过一次,但条件行(跟着开关/权限显隐)和权限横幅是在窗口**显示之后**才真正
+/// 展开的:那一刻页面内容会变高(实测剪贴板页 +62pt,正好一行),不重跑就会把那 62pt 又留成
+/// 内容下方的死空白。
+/// The build tightens once, but conditional rows (their visibility follows switches and permissions)
+/// and the permission banner only expand after the window is *on screen*: the page content then gets
+/// taller (measured: +62pt on the clipboard page, exactly one row), and without a second pass that
+/// 62pt turns back into dead space below the content.
+pub(crate) unsafe fn tighten_page_documents() -> bool {
+    let mut changed = false;
+    with_settings_ui(|ui| {
+        let Some(ui) = ui.as_ref() else {
+            return;
+        };
+        for scroll in [
+            ui.general_view,
+            ui.switcher_view,
+            ui.mouse_view,
+            ui.clipboard_view,
+            ui.window_control_view,
+            ui.quick_actions_view,
+            ui.about_view,
+        ] {
+            if scroll.is_null() {
+                continue;
+            }
+            let document: *mut AnyObject = msg_send![scroll, documentView];
+            let clip: *mut AnyObject = msg_send![scroll, contentView];
+            if document.is_null() || clip.is_null() {
+                continue;
+            }
+            let clip_bounds: NSRect = msg_send![clip, bounds];
+            let before: NSRect = msg_send![document, frame];
+            let after = widgets::fit_page_document_height(
+                document,
+                clip_bounds.size.height,
+                crate::settings::components::SettingsPageHeader::BOTTOM_PADDING,
+            );
+            if (after - before.size.height).abs() > 0.5 {
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
 unsafe fn capture_settings_scroll_offsets(ui: &SettingsUi) -> [NSPoint; 7] {
     let scrolls = [
         ui.general_view,
@@ -505,6 +553,29 @@ fn show_settings_inner(
                 set_permission_banner_visible(u, show_permission_banner);
             }
         });
+    }
+    // 条件行/权限横幅展开后内容高度会变,再收紧一次;高度变了就说明刚才设的滚动偏移已失效,
+    // 把当前页重新贴顶。
+    // Conditional rows / the permission banner change the content height, so tighten once more; if the
+    // height changed, the scroll offset set above is stale, so park the current page back at the top.
+    unsafe {
+        if tighten_page_documents() {
+            let selected = SIDEBAR_SELECTED.load(Ordering::SeqCst).min(6);
+            with_settings_ui(|ui| {
+                if let Some(u) = ui.as_ref() {
+                    let scrolls = [
+                        u.general_view,
+                        u.switcher_view,
+                        u.mouse_view,
+                        u.clipboard_view,
+                        u.window_control_view,
+                        u.quick_actions_view,
+                        u.about_view,
+                    ];
+                    widgets::scroll_page_to_top(scrolls[selected]);
+                }
+            });
+        }
     }
 }
 
@@ -3747,6 +3818,49 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 content_w - 12.0,
             );
         }
+
+        // --- 页面文档高度按真实内容收紧 ---
+        // 上面那些 `*_doc_h` 常量只是"旧排版的上界":内容比它短时,差额会全部堆在内容**下方**
+        // (顶部始终由 42pt 页头内边距定位),于是滚到底只剩空白、滚动条比例也被拉失真。
+        // 内容已经排完(含页尾控件),这里按最低子视图把文档收到"内容 + 底部内边距"。
+        // The `*_doc_h` constants above are only upper bounds from an older layout: when the content
+        // is shorter, the difference piles up *below* it (the top always sits under the 42pt page
+        // header padding), so scrolling to the end shows nothing but blank and the scroller
+        // proportion is distorted. The content (including the page-foot control) is laid out by now,
+        // so tighten each document to "content + bottom padding".
+        let page_names: [&str; 7] = [
+            "general",
+            "switcher",
+            "mouse",
+            "clipboard",
+            "window_control",
+            "quick_actions",
+            "about",
+        ];
+        for (index, root) in page_roots.iter().enumerate() {
+            let document: *mut AnyObject = msg_send![*root, documentView];
+            let _ = widgets::fit_page_document_height(
+                document,
+                page_frame.size.height,
+                crate::settings::components::SettingsPageHeader::BOTTOM_PADDING,
+            );
+            // 收紧后重新校验一次:页尾控件是底部锚定的,文档变矮时它跟着底边走,必须确认没有
+            // 和内容重叠(调试验证器只在 --layout-debug / 冒烟路径真正断言)。
+            // Re-validate after tightening: the page-foot control is bottom-anchored and follows the
+            // bottom edge, so confirm it did not land on top of the content (the debug validator only
+            // asserts on --layout-debug / smoke paths).
+            let page = SettingsPage {
+                scroll: *root,
+                document,
+            };
+            page.validate(page_names[index]);
+        }
+        // update_host 的原始 y 是在收紧之前记下的(第 3713 行附近),内容整体位移后必须重新抓,
+        // 否则更新流程收起时会按旧位置把宿主放回去。
+        // The update host's original y was captured before tightening (around line 3713); the content
+        // moved as a block, so re-capture it or the update flow restores the host to a stale spot.
+        let update_host_frame: NSRect = msg_send![ui.update_host, frame];
+        ui.update_host_origin_y = update_host_frame.origin.y;
 
         // --- 数字文本框通知:输入中防抖应用,失焦/回车立即提交 ---
         // --- Numeric text-field notifications: debounced apply while typing, immediate commit

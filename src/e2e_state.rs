@@ -154,9 +154,52 @@ struct PageGeometry {
     /// scroller it is narrower than the document by the scroller width, while the document is still
     /// laid out to the window width -- which clips the right column.
     clip_bounds: NSRect,
+    /// 页面文档高度与内容上下边界(文档直接子视图的 frame,文档坐标系)。A2 用它断言"内容下方
+    /// 没有死空白 / 内容没被裁":三者都从文档视图自身量出来,不依赖任何高度常量。
+    /// Page document height and the content's top/bottom edges (frames of the document's direct
+    /// subviews, in document coordinates). A2 asserts "no dead space below the content / content is
+    /// not clipped" from these; all three are measured off the document view, never a height
+    /// constant.
+    doc_height: f64,
+    content_top: f64,
+    content_bottom: f64,
     style_self: isize,
     style_parent: isize,
     style_grandparent: isize,
+}
+
+/// 文档高度 + 直接子视图包住的 y 范围(内容顶边 / 底边)。空文档返回 (0, 0, 0)。
+/// Document height plus the y range its direct subviews cover (content top / bottom edges). An empty
+/// document yields (0, 0, 0).
+unsafe fn document_extent(scroll: *mut AnyObject) -> (f64, f64, f64) {
+    let document: *mut AnyObject = msg_send![scroll, documentView];
+    if document.is_null() {
+        return (0.0, 0.0, 0.0);
+    }
+    let frame: NSRect = msg_send![document, frame];
+    let subviews: *mut AnyObject = msg_send![document, subviews];
+    if subviews.is_null() {
+        return (frame.size.height, 0.0, 0.0);
+    }
+    let count: usize = msg_send![subviews, count];
+    let mut top = f64::NEG_INFINITY;
+    let mut bottom = f64::INFINITY;
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        if child.is_null() {
+            continue;
+        }
+        let child_frame: NSRect = msg_send![child, frame];
+        if child_frame.size.width <= 0.0 && child_frame.size.height <= 0.0 {
+            continue;
+        }
+        top = top.max(child_frame.origin.y + child_frame.size.height);
+        bottom = bottom.min(child_frame.origin.y);
+    }
+    if !top.is_finite() || !bottom.is_finite() {
+        return (frame.size.height, 0.0, 0.0);
+    }
+    (frame.size.height, top, bottom)
 }
 
 fn zero_rect() -> NSRect {
@@ -208,12 +251,16 @@ fn collect_pages() -> Vec<PageGeometry> {
             } else {
                 msg_send![clip, bounds]
             };
+            let (doc_height, content_top, content_bottom) = document_extent(view);
             pages.push(PageGeometry {
                 root,
                 self_frame: frame_of(view),
                 parent_frame: frame_of(parent),
                 grandparent_frame: frame_of(grandparent),
                 clip_bounds,
+                doc_height,
+                content_top,
+                content_bottom,
                 style_self: scroller_style(view),
                 style_parent: scroller_style(parent),
                 style_grandparent: scroller_style(grandparent),
@@ -332,7 +379,7 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             json.push(',');
         }
         json.push_str(&format!(
-            "\n    {{\"root\": {}, \"self\": [{}, {}, {}, {}], \"parent\": [{}, {}, {}, {}], \"grandparent\": [{}, {}, {}, {}], \"clip\": [{}, {}, {}, {}], \"styles\": [{}, {}, {}]}}",
+            "\n    {{\"root\": {}, \"self\": [{}, {}, {}, {}], \"parent\": [{}, {}, {}, {}], \"grandparent\": [{}, {}, {}, {}], \"clip\": [{}, {}, {}, {}], \"styles\": [{}, {}, {}], \"doc\": [{}, {}, {}]}}",
             json_string(page.root),
             page.self_frame.origin.x,
             page.self_frame.origin.y,
@@ -352,7 +399,10 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             page.clip_bounds.size.height,
             page.style_self,
             page.style_parent,
-            page.style_grandparent
+            page.style_grandparent,
+            page.doc_height,
+            page.content_top,
+            page.content_bottom
         ));
     }
     json.push_str("\n  ],\n");

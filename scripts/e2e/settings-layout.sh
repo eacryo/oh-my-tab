@@ -4,7 +4,8 @@
 # 覆盖三类曾经只能靠目视发现、因而会静默回归的缺陷:
 #   1. 侧栏高亮 pill 是否跟着选中页(修:窗口构建时高亮停在第一项);
 #   2. 行内操作按钮的尺寸与右缘是否统一(修:同一个共享口径,110×28、贴控制列右缘);
-#   3. 卡片内行距是否统一、行间分隔线是否齐(修:首行漏走 layout 行距约定)。
+#   3. 卡片内行距是否统一、行间分隔线是否齐(修:首行漏走 layout 行距约定);
+#   4. 页面文档高度是否等于"内容 + 上下内边距"(修:手写常量高估导致下方大片死空白)。
 #
 # **与 UI 语言无关**:本场景不用任何界面文案做锚点(旧版本硬编码简体中文,英文 locale 下必挂)。
 # 锚点全是结构性的:视图类名(root = page_6_about / sidebar_highlight / sidebar_N_*)、父子关系,
@@ -261,6 +262,56 @@ if labels:
         not missing,
         "every row-to-row gap has a separator between the two rows",
         f"missing={missing} separators={separators}",
+    )
+
+# --- 页面文档高度:内容下方不能有死空白 ----------------------------------
+# 7 个页面的文档高度曾经是手写常量(通用 1138 / 切换 1432 / 鼠标 1620 / 剪贴板 978 /
+# 窗口控制 1102 / 快捷操作 854 / 关于 1300),与真实排版脱钩:内容比常量短时,差额全部堆在
+# **内容下方**(顶部始终按 42pt 页头内边距定位),于是滚到底只剩空白、滚动条比例也被拉失真
+# (实测多余空白 140–474pt)。现在文档按"内容 + 底部内边距"收紧,这里把这条约定钉住。
+# The seven page documents used to carry hand-written heights (1138 / 1432 / 1620 / 978 / 1102 /
+# 854 / 1300) decoupled from the real layout: when the content was shorter, the difference piled up
+# *below* it (the top always sat under the 42pt page-header padding), so scrolling to the end showed
+# nothing but blank and the scroller proportion was distorted (measured surplus: 140-474pt). The
+# documents are now tightened to "content + bottom padding"; these checks pin that rule.
+TOP_PADDING = 42.0
+BOTTOM_PADDING = 72.0
+DOC_TOL = 1.5
+for page in data.get("pages", []):
+    doc = page.get("doc")
+    if not doc or doc[0] <= 0.0:
+        continue
+    doc_h, content_top, content_bottom = doc
+    clip_h = page["clip"][3]
+    extent = content_top - content_bottom
+    needed = extent + TOP_PADDING + BOTTOM_PADDING
+    check(
+        doc_h + DOC_TOL >= needed or doc_h + DOC_TOL >= clip_h,
+        f"{page['root']}: document is tall enough for its content",
+        f"doc={doc_h:.0f} needed={needed:.0f} extent={extent:.0f}",
+    )
+    # 顶部内边距:内容必须仍在 42pt 页头内边距之下,但不能低得离谱(文档在顶部被吹大)。
+    # 各页页头块高度不同(关于页是 66pt),所以这里给上界而不是等值。
+    # Header padding: the content must still sit below the 42pt page-header padding, but not far
+    # below it (which would mean the document was inflated at the top). Pages have different header
+    # block heights (About is 66pt), so this is a bound, not an equality.
+    header_gap = doc_h - content_top
+    check(
+        TOP_PADDING - DOC_TOL <= header_gap <= TOP_PADDING + 54.0 + DOC_TOL,
+        f"{page['root']}: content sits under the page header padding",
+        f"gap={header_gap:.1f}",
+    )
+    if doc_h > clip_h + DOC_TOL:
+        # 需要滚动的页面:内容底边必须正好落在底部内边距上(这就是"不再有死空白")。
+        # A scrollable page must end exactly on the bottom padding -- that is "no dead space".
+        check(
+            abs(content_bottom - BOTTOM_PADDING) <= DOC_TOL,
+            f"{page['root']}: content ends on the bottom padding",
+            f"bottom={content_bottom:.1f}",
+        )
+    print(
+        f"  info {page['root']}: doc={doc_h:.0f} clip={clip_h:.0f} extent={extent:.0f} "
+        f"tail={content_bottom:.0f}"
     )
 
 print(f"  info pill frame {geom(pill[0]) if pill else None}")

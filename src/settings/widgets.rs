@@ -4594,6 +4594,109 @@ pub(super) unsafe fn fit_settings_document_height(
     final_height
 }
 
+/// 把页面文档收紧到"真实内容 + 底部内边距",回收手写高度常量高估出来的底部死空白。
+/// Tighten a page document to its real content plus the bottom padding, reclaiming the dead space
+/// the hand-written page height constants left at the bottom.
+///
+/// 只改文档自身的高度,绝不手动搬子视图:顶部锚定(MinYMargin)的行会跟着保持贴顶,而底部锚定
+/// 的页尾控件会跟着底边走 —— 两者都自动落到目标位置。手动搬会和 AppKit 的自动重排叠加成二次
+/// 位移(见 `stable_document_height` 的说明)。
+/// Only the document's own height changes; children are never moved by hand. Top-anchored
+/// (MinYMargin) rows keep hugging the top and bottom-anchored page-foot controls follow the bottom,
+/// so both land in place on their own; moving them by hand would stack a second shift on top of
+/// AppKit's autoresize (see `stable_document_height`).
+///
+/// `minimum_height` 保证文档不短于页面视口:document 比 clip 矮时,非翻转的页面会把内容压到
+/// 窗口底部。返回最终高度。
+/// `minimum_height` keeps the document at least as tall as the page viewport: a document shorter
+/// than its clip would push the content to the bottom of the window in a non-flipped page. Returns
+/// the final height.
+pub(super) unsafe fn fit_page_document_height(
+    document: *mut AnyObject,
+    minimum_height: f64,
+    bottom_padding: f64,
+) -> f64 {
+    if document.is_null() {
+        return minimum_height.max(1.0);
+    }
+    let frame: NSRect = msg_send![document, frame];
+    let subviews: *mut AnyObject = msg_send![document, subviews];
+    let count: usize = if subviews.is_null() {
+        0
+    } else {
+        msg_send![subviews, count]
+    };
+    let mut children: Vec<(*mut AnyObject, NSRect, u64)> = Vec::with_capacity(count);
+    let mut lowest = f64::INFINITY;
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        if child.is_null() {
+            continue;
+        }
+        let child_frame: NSRect = msg_send![child, frame];
+        if child_frame.size.width <= 0.0 && child_frame.size.height <= 0.0 {
+            continue;
+        }
+        let mask: u64 = msg_send![child, autoresizingMask];
+        children.push((child, child_frame, mask));
+        lowest = lowest.min(child_frame.origin.y);
+    }
+    if !lowest.is_finite() {
+        return frame.size.height;
+    }
+    // surplus > 0:内容下方有多余空白;surplus < 0:内容比常量高,需要长高。
+    // surplus > 0 means dead space below the content; surplus < 0 means the content outgrew the
+    // constant and the document must grow.
+    let surplus = lowest - bottom_padding;
+    if surplus.abs() <= 0.5 {
+        return frame.size.height;
+    }
+    let target = (frame.size.height - surplus).max(minimum_height);
+    let shift = frame.size.height - target;
+    let _: () = msg_send![document, setFrame: NSRect::new(
+        frame.origin,
+        NSSize::new(frame.size.width, target),
+    )];
+    // 文档变矮时,只有**顶部锚定**(MinYMargin)的子视图会被 AppKit 跟着顶边搬走;页面里的卡片
+    // 和页尾控件是固定帧(mask 0x0 / MaxYMargin),原地不动。对后者补上同一个位移,整页内容才会
+    // 像一块整体挪动;对前者再搬一次就是双重位移(这正是 stable_document_height 警告的坑)。
+    // On shrink, AppKit only moves top-anchored (MinYMargin) subviews with the top edge; the page's
+    // cards and foot controls keep fixed frames (mask 0x0 / MaxYMargin) and stay put. Shifting those
+    // by the same delta moves the page as one block; shifting the top-anchored ones again would be
+    // the double shift `stable_document_height` warns about.
+    for (child, child_frame, mask) in children {
+        if mask & 8 != 0 {
+            continue;
+        }
+        let _: () = msg_send![child, setFrame: NSRect::new(
+            NSPoint::new(child_frame.origin.x, child_frame.origin.y - shift),
+            child_frame.size,
+        )];
+    }
+    let mut lowest_after = f64::INFINITY;
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        if child.is_null() {
+            continue;
+        }
+        let child_frame: NSRect = msg_send![child, frame];
+        if child_frame.size.width <= 0.0 && child_frame.size.height <= 0.0 {
+            continue;
+        }
+        lowest_after = lowest_after.min(child_frame.origin.y);
+    }
+    log_debug!(
+        "[settings] fit_page_document_height: doc_h={:.1} -> {:.1} lowest {:.1} -> {:.1} (bottom_padding={:.1} shift={:.1})",
+        frame.size.height,
+        target,
+        lowest,
+        lowest_after,
+        bottom_padding,
+        shift
+    );
+    target
+}
+
 /// Pure counterpart of the document fitting rule, kept separate so expansion behavior can be
 /// covered without constructing AppKit views in headless tests.
 /// 文档高度拟合规则的纯函数版本，便于在无 AppKit 的测试中覆盖长文本/短文本两种情况。
