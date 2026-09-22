@@ -19,9 +19,9 @@ use objc2_foundation::NSRect;
 
 use crate::event_monitor::GlobalEvent;
 use crate::event_tap::{
-    self, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent, CFRunLoopRef,
-    CGEventFlags, CGEventGetFlags, CGEventGetIntegerValueField, CGEventMask, CGEventRef,
-    CGEventTapProxy, CGEventType, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
+    self, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent, CGEventFlags,
+    CGEventGetFlags, CGEventGetIntegerValueField, CGEventMask, CGEventRef, CGEventTapProxy,
+    CGEventType, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
 };
 use crate::ffi::{
     kCFBooleanFalse, kCFBooleanTrue, AXError, AXUIElementCopyAttributeValue,
@@ -32,8 +32,8 @@ use crate::ffi::{
 use crate::window_collector::{ax_window_cgwid, cf_string_new, cf_to_rust_string};
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -1318,16 +1318,8 @@ fn cocoa_to_ax(r: NSRect, primary_top: f64) -> AxRect {
 // 结构与 mouse/event_tap.rs 相同:专用线程 + RunLoop 引用 + 停止标志。
 // Same shape as mouse/event_tap.rs: dedicated thread + RunLoop reference + stop flag.
 
-struct RunLoopMutex(Mutex<Option<CFRunLoopRef>>);
-unsafe impl Send for RunLoopMutex {}
-unsafe impl Sync for RunLoopMutex {}
-static RUNLOOP: OnceLock<RunLoopMutex> = OnceLock::new();
-static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static TAP_CONTROL: event_tap::TapThreadControl = event_tap::TapThreadControl::new();
 static WC_THREAD: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
-
-fn runloop_static() -> &'static Mutex<Option<CFRunLoopRef>> {
-    &RUNLOOP.get_or_init(|| RunLoopMutex(Mutex::new(None))).0
-}
 
 /// tap 回调:关心 Option+方向键及 Option+Shift+四方向键。启用时吞掉 keyDown/keyUp 并把
 /// 非自动重复的 keyDown 投递给主线程;关闭时全部透传(功能关闭 = 组合键还给系统)。
@@ -1344,6 +1336,12 @@ unsafe extern "C" fn window_control_tap_callback(
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
+    if crate::input_monitor::handle_disabled_event(event_type, "winctl") {
+        return event;
+    }
+    if !crate::input_monitor::taps_allowed() {
+        return event;
+    }
     if event_type != K_CG_EVENT_KEY_DOWN && event_type != K_CG_EVENT_KEY_UP {
         return event;
     }
@@ -1400,10 +1398,17 @@ unsafe extern "C" fn window_control_tap_callback(
 /// Enable window control at runtime (shared by the settings hot-switch and the startup path).
 /// Idempotent.
 pub(crate) fn start() {
+    if !crate::input_monitor::taps_allowed() {
+        return;
+    }
     let mut guard = WC_THREAD.lock().unwrap();
     if guard.as_ref().is_some_and(|h| !h.is_finished()) {
         return;
     }
+    if let Some(finished) = guard.take() {
+        let _ = finished.join();
+    }
+    TAP_CONTROL.prepare_start();
     *guard = Some(spawn_tap_thread());
     log_info!("Window control enabled.");
 }
@@ -1411,13 +1416,7 @@ pub(crate) fn start() {
 /// 运行时停用窗口控制(设置页热切换)。幂等。
 /// Disable window control at runtime (settings hot-switch). Idempotent.
 pub(crate) fn stop() {
-    STOP_REQUESTED.store(true, Ordering::Relaxed);
-    let rl = runloop_static().lock().unwrap().take();
-    if let Some(rl) = rl {
-        unsafe {
-            event_tap::CFRunLoopStop(rl);
-        }
-    }
+    TAP_CONTROL.stop();
     let handle = WC_THREAD.lock().unwrap().take();
     if let Some(h) = handle {
         let _ = h.join();
@@ -1431,9 +1430,6 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
     let mask: CGEventMask = (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_KEY_UP);
     thread::spawn(move || unsafe {
         crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
-        // 新线程首件事:清掉上次运行残留的停止标志。
-        // First thing in the new thread: clear any stale stop flag.
-        STOP_REQUESTED.store(false, Ordering::Relaxed);
         // session 层 tap:与切换器同层,能拦截真实硬件按键;DEFAULT_TAP 才能吞事件。
         // Session-level tap: same layer as the switcher, sees real hardware keys; DEFAULT_TAP
         // is required to swallow events.
@@ -1445,21 +1441,23 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
             Some(window_control_tap_callback),
             std::ptr::null_mut(),
             "winctl",
-            Some(&STOP_REQUESTED),
+            Some(TAP_CONTROL.cancel_flag()),
         );
         let created = match created {
             Some(created) => created,
             None => return,
         };
         let rl = CFRunLoopGetCurrent();
-        // 存入 RunLoop 后复查停止标志,关闭“存入后、run 前置位”的竞态窗口。
-        // Re-check the stop flag after storing the RunLoop to close the store-vs-run race.
-        *runloop_static().lock().unwrap() = Some(rl);
-        if !STOP_REQUESTED.load(Ordering::Relaxed) {
+        TAP_CONTROL.register(created.tap, rl);
+        let watchdog = event_tap::start_tap_watchdog(created.tap, TAP_CONTROL.cancel_flag());
+        if !TAP_CONTROL.cancel_flag().load(Ordering::SeqCst) && crate::input_monitor::taps_allowed()
+        {
             log_debug!("Window control event tap started.");
             event_tap::CFRunLoopRun();
         }
-        *runloop_static().lock().unwrap() = None;
+        event_tap::stop_tap_watchdog(watchdog);
+        event_tap::CGEventTapEnable(created.tap, false);
+        TAP_CONTROL.clear(created.tap);
         event_tap::teardown_event_tap(rl, created);
     })
 }

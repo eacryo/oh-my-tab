@@ -26,6 +26,7 @@ use crate::mouse::scrolling::compute_delta;
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
@@ -54,6 +55,55 @@ const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 3;
 /// SettingsState.shared.recording).
 pub(crate) static RECORDING: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone, Copy)]
+struct ScrollPost {
+    dy: i32,
+    dx: i32,
+    flags: CGEventFlags,
+}
+
+static SCROLL_POSTER: OnceLock<Option<SyncSender<ScrollPost>>> = OnceLock::new();
+static SCROLL_QUEUE_FULL_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn scroll_post_sender() -> Option<&'static SyncSender<ScrollPost>> {
+    SCROLL_POSTER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::sync_channel::<ScrollPost>(128);
+            std::thread::Builder::new()
+                .name("mouse-scroll-event-poster".into())
+                .spawn(move || {
+                    while let Ok(post) = receiver.recv() {
+                        unsafe { post_scroll_event(post.dy, post.dx, post.flags) };
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+fn ensure_scroll_poster() -> bool {
+    scroll_post_sender().is_some()
+}
+
+/// Queue scroll synthesis off the HID event callback. Queue saturation is fail-open: the
+/// original hardware event passes through instead of being swallowed without a replacement.
+fn queue_scroll_post(dy: i32, dx: i32, flags: CGEventFlags) -> bool {
+    let Some(sender) = scroll_post_sender() else {
+        return false;
+    };
+    match sender.try_send(ScrollPost { dy, dx, flags }) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            if !SCROLL_QUEUE_FULL_LOGGED.swap(true, Ordering::Relaxed) {
+                log_info!("[mouse] scroll post queue is full; passing original events through.");
+            }
+            false
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
 /// 合成一个滚轮事件并 post 到 session 层。
 /// 行模式按"行"单位 post;默认模式透传原 delta。
 ///
@@ -72,6 +122,7 @@ unsafe fn post_scroll_event(dy: i32, dx: i32, flags: CGEventFlags) {
     CGEventSetIntegerValueField(synthetic, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
 
     CGEventPost(K_CG_SESSION_EVENT_TAP, synthetic);
+    crate::ffi::CFRelease(synthetic as *const c_void);
 }
 
 unsafe extern "C" fn mouse_event_tap_callback(
@@ -91,6 +142,12 @@ unsafe fn mouse_event_tap_callback_inner(
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
+    if crate::input_monitor::handle_disabled_event(event_type, "mouse") {
+        return event;
+    }
+    if STOP_REQUESTED.load(Ordering::SeqCst) || !crate::input_monitor::taps_allowed() {
+        return event;
+    }
     let flags: CGEventFlags = CGEventGetFlags(event);
 
     if event_type == K_CG_EVENT_SCROLL_WHEEL {
@@ -127,8 +184,11 @@ unsafe fn mouse_event_tap_callback_inner(
         // Default / Line: compute delta (passthrough or line-count normalization + reverse) ->
         // post synthetic event -> drop the original.
         let (ndy, ndx) = compute_delta(dy, dx, &resolved);
-        post_scroll_event(ndy, ndx, flags);
-        std::ptr::null_mut()
+        if queue_scroll_post(ndy, ndx, flags) {
+            std::ptr::null_mut()
+        } else {
+            event
+        }
     } else {
         let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
         // 按键映射:仅中键及侧键(button >= 2)参与;左键(0)/右键(1)不绑定,
@@ -154,12 +214,34 @@ unsafe fn mouse_event_tap_callback_inner(
                 match crate::mouse::shortcut::parse_binding(desc) {
                     Ok(crate::mouse::shortcut::Binding::Key(sc)) => match event_type {
                         K_CG_EVENT_OTHER_MOUSE_DOWN => {
-                            keysim::press_down(sc.keycode, sc.flags, desc);
-                            return std::ptr::null_mut();
+                            if keysim::queue_button_mapping(
+                                button as u32,
+                                true,
+                                sc.keycode,
+                                sc.flags,
+                                desc,
+                            ) {
+                                if STOP_REQUESTED.load(Ordering::SeqCst) {
+                                    keysim::release_all_queued();
+                                }
+                                return std::ptr::null_mut();
+                            }
+                            return event;
                         }
                         K_CG_EVENT_OTHER_MOUSE_UP => {
-                            keysim::release_up(sc.keycode, sc.flags, desc);
-                            return std::ptr::null_mut();
+                            if keysim::queue_button_mapping(
+                                button as u32,
+                                false,
+                                sc.keycode,
+                                sc.flags,
+                                desc,
+                            ) {
+                                if STOP_REQUESTED.load(Ordering::SeqCst) {
+                                    keysim::release_all_queued();
+                                }
+                                return std::ptr::null_mut();
+                            }
+                            return event;
                         }
                         _ => {}
                     },
@@ -167,10 +249,17 @@ unsafe fn mouse_event_tap_callback_inner(
                         // 系统动作按下时触发一次(Dock 通知是 toggle 语义);释放只吞。
                         // System actions fire once on press (Dock notifications toggle);
                         // the release is only swallowed.
-                        if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN {
-                            crate::mouse::system_action::fire(notif);
+                        if keysim::queue_system_action(
+                            button as u32,
+                            event_type == K_CG_EVENT_OTHER_MOUSE_DOWN,
+                            notif,
+                        ) {
+                            if STOP_REQUESTED.load(Ordering::SeqCst) {
+                                keysim::clear_system_button_states();
+                            }
+                            return std::ptr::null_mut();
                         }
-                        return std::ptr::null_mut();
+                        return event;
                     }
                     Ok(crate::mouse::shortcut::Binding::Switcher) => {
                         // 打开切换器(两段式):按下开浮窗,抬起提交切换 —— 与按住 Cmd+Tab
@@ -244,6 +333,10 @@ fn tap_control() -> &'static Mutex<TapControl> {
 /// permission retry window.
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+pub(crate) fn mouse_tap_stopping() -> bool {
+    STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// 运行时停止鼠标事件线程:置位取消标志 + CFRunLoopStop,线程自然结束。
 /// 幂等:未运行时无操作。由 settings.rs 在取消"启用鼠标控制"时调用。
 ///
@@ -254,7 +347,7 @@ pub(crate) fn stop() {
     // 先置位标志再停 RunLoop:重试窗口内线程醒来即可见(不依赖 RunLoop)。
     // Set the flag first, then stop the RunLoop: during the retry window the thread sees the
     // flag on wake-up (no RunLoop involved yet).
-    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
     let control = tap_control().lock().unwrap();
     unsafe {
         // 先同步禁用 HID tap,确保当前点击返回后下一次物理点击不会进入已停止的 RunLoop。
@@ -273,6 +366,14 @@ pub(crate) fn stop() {
 /// Start the mouse event listener thread. Called by main.rs / settings.rs when mouse control
 /// is enabled.
 pub(crate) fn start() -> thread::JoinHandle<()> {
+    // Start the post workers before installing the HID callback, so its first event never
+    // needs to create a thread.
+    let scroll_poster_ready = ensure_scroll_poster();
+    let key_poster_ready = keysim::ensure_key_poster();
+    if !scroll_poster_ready || !key_poster_ready {
+        log_info!("[mouse] failed to start one or more asynchronous event-post workers.");
+    }
+
     // 监听掩码:左/右/其他按键 down/up + 滚轮。暂不含 mouseMoved(日志会爆炸)。
     // Listen mask: left/right/other button down/up + scroll wheel. Excludes mouseMoved.
     let mask: CGEventMask = (1u64 << K_CG_EVENT_LEFT_MOUSE_DOWN)
@@ -286,7 +387,7 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
     // 在线程启动前清掉旧停止标志；之后发生的 stop() 不会被新线程覆盖。
     // Clear the stale stop flag before spawning; a subsequent stop() can no longer be overwritten
     // by the new thread starting late.
-    STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+    STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
 
     thread::spawn(move || unsafe {
         crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
@@ -332,12 +433,16 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             control.tap = Some(created.tap);
             control.run_loop = Some(rl);
         }
-        if !STOP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+        let watchdog = event_tap::start_tap_watchdog(created.tap, &STOP_REQUESTED);
+        if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+            && crate::input_monitor::taps_allowed()
+        {
             log_debug!("Mouse event tap started.");
             // 阻塞运行 RunLoop,直到 stop() 触发 CFRunLoopStop 或线程被终止。
             // Block on the RunLoop until stop() fires CFRunLoopStop or the thread is killed.
             event_tap::CFRunLoopRun();
         }
+        event_tap::stop_tap_watchdog(watchdog);
         // RunLoop 返回后先禁用 tap,再从共享状态移除并释放 CF 对象。
         // Once the RunLoop returns, disable the tap before removing it from shared state and
         // releasing its Core Foundation objects.

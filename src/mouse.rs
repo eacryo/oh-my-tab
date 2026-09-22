@@ -37,6 +37,9 @@ static MOUSE_RUNTIME: std::sync::Mutex<MouseRuntime> = std::sync::Mutex::new(Mou
 /// Idempotent: no-op when already running (the thread may have exited naturally, e.g. tap
 /// creation failed).
 pub(crate) fn start() {
+    if !crate::input_monitor::taps_allowed() {
+        return;
+    }
     let finished = {
         let mut runtime = MOUSE_RUNTIME.lock().unwrap();
         // 停止仍在后台收尾时,由收尾线程根据最新 CONFIG 决定是否启动。
@@ -84,6 +87,9 @@ pub(crate) fn stop() {
         if runtime.stopping {
             return;
         }
+        if runtime.thread.is_none() {
+            return;
+        }
         runtime.stopping = true;
         runtime.thread.take()
     };
@@ -92,6 +98,8 @@ pub(crate) fn stop() {
     // Signal stop on the current thread, but move the potentially blocking join to a background
     // reaper so AppKit's mouse callback never stalls.
     event_tap::stop();
+    keysim::release_all_queued();
+    keysim::clear_system_button_states();
     std::thread::spawn(move || {
         if let Some(handle) = handle {
             let _ = handle.join();

@@ -8,6 +8,8 @@
 use crate::ffi::has_accessibility_permission;
 use crate::log_info;
 use std::ffi::c_void;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,10 @@ pub(crate) type CGEventType = u32;
 pub(crate) type CGEventFlags = u64;
 pub(crate) type CGEventMask = u64;
 
+/// CGEventTapDisabled pseudo-event values from CoreGraphics' CGEventTypes.h.
+pub(crate) const TAP_DISABLED_BY_TIMEOUT: CGEventType = 0xFFFF_FFFE;
+pub(crate) const TAP_DISABLED_BY_USER_INPUT: CGEventType = 0xFFFF_FFFF;
+
 /// 由 CGEventTapCreate 与 CFMachPortCreateRunLoopSource 创建的一对 Core Foundation 对象。
 /// 调用方负责在线程退出前通过 teardown_event_tap() 移除并释放。
 ///
@@ -35,6 +41,76 @@ pub(crate) type CGEventMask = u64;
 pub(crate) struct CreatedEventTap {
     pub(crate) tap: CFMachPortRef,
     pub(crate) source: CFRunLoopSourceRef,
+}
+
+#[derive(Default)]
+struct ActiveTap {
+    tap: Option<CFMachPortRef>,
+    run_loop: Option<CFRunLoopRef>,
+}
+
+struct ActiveTapMutex(Mutex<ActiveTap>);
+unsafe impl Send for ActiveTapMutex {}
+unsafe impl Sync for ActiveTapMutex {}
+
+/// Control handle shared with a tap's owner so shutdown can disable its port immediately,
+/// including while the tap thread is waiting inside CFRunLoopRun.
+pub(crate) struct TapThreadControl {
+    stop_requested: std::sync::atomic::AtomicBool,
+    active: ActiveTapMutex,
+}
+
+impl TapThreadControl {
+    pub(crate) const fn new() -> Self {
+        Self {
+            stop_requested: std::sync::atomic::AtomicBool::new(false),
+            active: ActiveTapMutex(Mutex::new(ActiveTap {
+                tap: None,
+                run_loop: None,
+            })),
+        }
+    }
+
+    pub(crate) fn prepare_start(&self) {
+        self.stop_requested.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn cancel_flag(&'static self) -> &'static std::sync::atomic::AtomicBool {
+        &self.stop_requested
+    }
+
+    pub(crate) fn stop(&self) {
+        self.stop_requested.store(true, Ordering::SeqCst);
+        let active = self.active.0.lock().unwrap();
+        unsafe {
+            if let Some(tap) = active.tap {
+                CGEventTapEnable(tap, false);
+            }
+            if let Some(run_loop) = active.run_loop {
+                CFRunLoopStop(run_loop);
+            }
+        }
+    }
+
+    pub(crate) fn register(&self, tap: CFMachPortRef, run_loop: CFRunLoopRef) {
+        let mut active = self.active.0.lock().unwrap();
+        active.tap = Some(tap);
+        active.run_loop = Some(run_loop);
+        if self.stop_requested.load(Ordering::SeqCst) || !crate::input_monitor::taps_allowed() {
+            unsafe {
+                CGEventTapEnable(tap, false);
+                CFRunLoopStop(run_loop);
+            }
+        }
+    }
+
+    pub(crate) fn clear(&self, tap: CFMachPortRef) {
+        let mut active = self.active.0.lock().unwrap();
+        if active.tap == Some(tap) {
+            active.tap = None;
+            active.run_loop = None;
+        }
+    }
 }
 
 pub(crate) type CGEventTapCallBack = Option<
@@ -253,14 +329,12 @@ extern "C" {
 
 // ========== 通用启动流程 / generic start helper ==========
 
-// 缺 Accessibility 权限时,event tap 创建会失败。每隔 RETRY_INTERVAL 重试一次,最多 RETRY_MAX 次
-// (约 2 分钟),期间用户可在系统设置里授权;超过上限就记日志放弃。
-// 设上限是为了避免无限轮询;用户授权后下次重试即建成,无需重启。
+// 无辅助功能权限时不创建 tap；权限监视器会在授权恢复后按当前配置重新启动各服务。
+// 对“权限仍有效但创建临时失败”的情况，每隔 RETRY_INTERVAL 重试，最多 RETRY_MAX 次。
 //
-// When Accessibility permission is missing, CGEventTapCreate fails. Retry every RETRY_INTERVAL up to
-// RETRY_MAX times (~2 min), during which the user can grant permission in System Settings; once the
-// limit is exhausted, log and give up. The cap avoids infinite polling; once granted, the next retry
-// succeeds - no restart needed.
+// Without Accessibility permission, no tap is created; the permission supervisor restarts services
+// from current configuration after trust is restored. A transient creation failure while permission
+// remains valid is retried every RETRY_INTERVAL, up to RETRY_MAX times.
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const RETRY_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const RETRY_MAX: u32 = 40;
@@ -289,8 +363,7 @@ fn wait_for_retry_or_cancel(cancel: Option<&'static std::sync::atomic::AtomicBoo
 /// 调用方必须在专用线程上调用(后续 CFRunLoopRun 会阻塞该线程)。
 /// Caller must invoke on a dedicated thread (CFRunLoopRun will block it afterwards).
 ///
-/// `cancel` 为可选取消标志:置位时重试循环提前退出(用于运行时停用鼠标 tap,
-/// 避免重试期间 join 阻塞调用线程)。None 表示不取消(如键盘 tap,App 生命周期内常驻)。
+/// `cancel` 为可选取消标志:置位时重试循环提前退出,避免停用 tap 时 join 阻塞调用线程。
 ///
 /// `cancel` is an optional cancellation flag: when set, the retry loop bails out early
 /// (used when stopping the mouse tap at runtime so join() doesn't block the caller during
@@ -307,6 +380,13 @@ pub(crate) unsafe fn create_tap_with_retry(
     log_name: &str,
     cancel: Option<&'static std::sync::atomic::AtomicBool>,
 ) -> Option<CreatedEventTap> {
+    if !crate::input_monitor::watchdog_may_enable_tap() {
+        log_info!(
+            "[{}] Event tap not created because Accessibility input is disabled.",
+            log_name
+        );
+        return None;
+    }
     let mut tap = CGEventTapCreate(location, placement, options, mask, callback, user_info);
 
     // 首次创建失败(通常是缺 Accessibility 权限):有限次重试,给用户时间去系统设置授权。
@@ -325,7 +405,8 @@ pub(crate) unsafe fn create_tap_with_retry(
             // 分片等待并轮询取消请求,避免运行时停用被完整的 3 秒重试间隔拖住。
             // Wait in short slices while polling cancellation so runtime disable is not held up
             // by the full three-second retry interval.
-            if wait_for_retry_or_cancel(cancel) {
+            if wait_for_retry_or_cancel(cancel) || !crate::input_monitor::watchdog_may_enable_tap()
+            {
                 log_info!("[{}] Event tap cancelled by stop request.", log_name);
                 return None;
             }
@@ -344,8 +425,7 @@ pub(crate) unsafe fn create_tap_with_retry(
             );
         } else {
             log_info!(
-                "[{}] Event tap retry exhausted ({}x). Disabled until restart. \
-                 Grant Accessibility in System Settings and relaunch.",
+                "[{}] Event tap retry exhausted ({}x); permission supervisor will retry while the feature is enabled.",
                 log_name,
                 RETRY_MAX
             );
@@ -360,6 +440,12 @@ pub(crate) unsafe fn create_tap_with_retry(
         return None;
     }
     CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+    if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst))
+        || !crate::input_monitor::watchdog_may_enable_tap()
+    {
+        teardown_event_tap(CFRunLoopGetCurrent(), CreatedEventTap { tap, source });
+        return None;
+    }
     CGEventTapEnable(tap, true);
     Some(CreatedEventTap { tap, source })
 }
@@ -394,21 +480,29 @@ pub(crate) struct CFRunLoopTimerContext {
     pub(crate) copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
 }
 
-/// 看门狗回调:周期性检查 tap 是否被系统禁用,禁用则重新启用(自愈)。
-/// macOS 会对「启动期繁忙/调试器附着时未及时服务事件」的 tap 自动禁用 —— 禁用后
-/// tap 线程仍在 runloop 里等待,但事件再也不送达(快捷键静默失效,表现为
-/// "Event monitor started" 打过后按键无任何反应)。每 3s 检查一次,发现被禁用就
-/// CGEventTapEnable 重新启用并打日志,无论禁用机制如何都能恢复。
-///
-/// Watchdog callback: periodically checks whether the system disabled the tap and re-enables it.
-/// macOS auto-disables taps that fail to service events promptly (busy startup / debugger attach);
-/// after that the tap thread keeps waiting in its runloop but events stop arriving (the shortcut
-/// silently dies -- "Event monitor started" was logged yet keys do nothing). Checks every 3s and
-/// re-enables via CGEventTapEnable when disabled, logging the recovery -- self-healing regardless
-/// of what caused the disable.
+struct TapWatchdogContext {
+    tap: CFMachPortRef,
+    stop_requested: &'static std::sync::atomic::AtomicBool,
+}
+
+pub(crate) struct TapWatchdog {
+    timer: CFRunLoopTimerRef,
+    context: *mut TapWatchdogContext,
+}
+
+/// Timeout 禁用允许自愈；显式停止、权限撤销和 UserInput 禁用必须保持终止，不能由看门狗撤销。
+/// Timeout disables are recoverable; explicit stop, permission loss, and UserInput disables are
+/// terminal for the affected tap and must never be undone by this watchdog.
 unsafe extern "C" fn tap_watchdog_callback(_timer: CFRunLoopTimerRef, info: *mut c_void) {
-    let tap = info as CFMachPortRef;
-    if tap.is_null() {
+    if info.is_null() {
+        return;
+    }
+    let context = &*(info as *const TapWatchdogContext);
+    let tap = context.tap;
+    if tap.is_null()
+        || context.stop_requested.load(Ordering::SeqCst)
+        || !crate::input_monitor::watchdog_may_enable_tap()
+    {
         return;
     }
     if !CGEventTapIsEnabled(tap) {
@@ -417,12 +511,18 @@ unsafe extern "C" fn tap_watchdog_callback(_timer: CFRunLoopTimerRef, info: *mut
     }
 }
 
-/// 在 tap 所在线程挂一个 3s 周期的看门狗定时器(info = tap 指针)。
-/// Attach a 3s-period watchdog timer to the tap's thread (info = the tap pointer).
-unsafe fn start_tap_watchdog(tap: CFMachPortRef) -> CFRunLoopTimerRef {
+/// Attach a 3s watchdog to a tap. The context stays alive until stop_tap_watchdog.
+pub(crate) unsafe fn start_tap_watchdog(
+    tap: CFMachPortRef,
+    stop_requested: &'static std::sync::atomic::AtomicBool,
+) -> TapWatchdog {
+    let context = Box::into_raw(Box::new(TapWatchdogContext {
+        tap,
+        stop_requested,
+    }));
     let ctx = CFRunLoopTimerContext {
         version: 0,
-        info: tap,
+        info: context as *mut c_void,
         retain: None,
         release: None,
         copy_description: None,
@@ -439,7 +539,17 @@ unsafe fn start_tap_watchdog(tap: CFMachPortRef) -> CFRunLoopTimerRef {
     if !timer.is_null() {
         CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
     }
-    timer
+    TapWatchdog { timer, context }
+}
+
+pub(crate) unsafe fn stop_tap_watchdog(watchdog: TapWatchdog) {
+    if !watchdog.timer.is_null() {
+        CFRunLoopTimerInvalidate(watchdog.timer);
+        crate::ffi::CFRelease(watchdog.timer as *const c_void);
+    }
+    if !watchdog.context.is_null() {
+        drop(Box::from_raw(watchdog.context));
+    }
 }
 
 /// 在专用线程上启动一个 CGEventTap + CFRunLoop。
@@ -466,8 +576,10 @@ pub(crate) fn start_event_tap_thread(
     callback: CGEventTapCallBack,
     user_info: usize,
     log_name: &'static str,
+    control: &'static TapThreadControl,
     on_started: impl FnOnce() + Send + 'static,
 ) -> thread::JoinHandle<()> {
+    control.prepare_start();
     thread::spawn(move || unsafe {
         crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
         let created = create_tap_with_retry(
@@ -478,26 +590,28 @@ pub(crate) fn start_event_tap_thread(
             callback,
             user_info as *mut c_void,
             log_name,
-            // 键盘 tap 常驻,不取消(App 退出才停)。
-            // Keyboard tap is resident; never cancelled (only app exit stops it).
-            None,
+            Some(control.cancel_flag()),
         );
 
         let Some(created) = created else {
             return;
         };
 
+        let run_loop = CFRunLoopGetCurrent();
+        control.register(created.tap, run_loop);
+
         // 看门狗:系统可能在启动期/调试器下禁用 tap,挂定时器定期检查并自愈。
         // Watchdog: the system may disable the tap during busy startup or under a debugger;
         // attach a periodic check that self-heals it.
-        let watchdog = start_tap_watchdog(created.tap);
+        let watchdog = start_tap_watchdog(created.tap, control.cancel_flag());
         on_started();
-        CFRunLoopRun();
-        if !watchdog.is_null() {
-            CFRunLoopTimerInvalidate(watchdog);
-            crate::ffi::CFRelease(watchdog as *const c_void);
+        if !control.stop_requested.load(Ordering::SeqCst) && crate::input_monitor::taps_allowed() {
+            CFRunLoopRun();
         }
-        teardown_event_tap(CFRunLoopGetCurrent(), created);
+        stop_tap_watchdog(watchdog);
+        CGEventTapEnable(created.tap, false);
+        control.clear(created.tap);
+        teardown_event_tap(run_loop, created);
     })
 }
 

@@ -135,11 +135,10 @@ pub(super) fn select_sidebar(idx: usize) {
 /// Refresh the About page's live TCC status labels without reloading user settings.
 /// 刷新关于页的实时 TCC 授权状态，不重载用户设置。
 unsafe fn refresh_permission_statuses(ui: &SettingsUi) {
-    if !ui.accessibility_permission_status.is_null() {
-        set_permission_status(
-            ui.accessibility_permission_status,
-            has_accessibility_permission(),
-        );
+    if !ui.accessibility_permission_status.is_null()
+        || !ui.accessibility_permission_button.is_null()
+    {
+        refresh_accessibility_permission_action(ui);
     }
     if !ui.screen_recording_permission_status.is_null() {
         set_permission_status(
@@ -163,6 +162,40 @@ unsafe fn set_permission_status(label: *mut AnyObject, granted: bool) {
     };
     let _: () = msg_send![label, setTextColor: color];
     set_field(label, t(key));
+}
+
+unsafe fn refresh_accessibility_permission_action(ui: &SettingsUi) {
+    let granted = has_accessibility_permission();
+    let restart_required = granted && crate::restart::restart_required();
+    if !ui.accessibility_permission_status.is_null() {
+        if restart_required {
+            let color: *mut AnyObject = msg_send![class!(NSColor), systemOrangeColor];
+            let _: () = msg_send![ui.accessibility_permission_status, setTextColor: color];
+            set_field(
+                ui.accessibility_permission_status,
+                t("settings.permission_status_restart_required"),
+            );
+        } else {
+            set_permission_status(ui.accessibility_permission_status, granted);
+        }
+    }
+    if !ui.accessibility_permission_button.is_null() {
+        let (title, action) = if restart_required {
+            (
+                t("settings.btn_restart_to_restore_shortcuts"),
+                sel!(handleRestartForAccessibility:),
+            )
+        } else {
+            (
+                t("settings.btn_open_permission_settings"),
+                sel!(handleOpenPrivacy:),
+            )
+        };
+        let title = make_nsstring(&title);
+        let _: () = msg_send![ui.accessibility_permission_button, setTitle: title];
+        let _: () = msg_send![ui.accessibility_permission_button, setAction: action];
+        CFRelease(title as *const c_void);
+    }
 }
 
 /// Refresh the visible permission UI when the app regains focus.
@@ -1088,6 +1121,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             about_view: std::ptr::null_mut(),
             about_subtitle: std::ptr::null_mut(),
             accessibility_permission_status: std::ptr::null_mut(),
+            accessibility_permission_button: std::ptr::null_mut(),
             screen_recording_permission_status: std::ptr::null_mut(),
             theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
@@ -1401,7 +1435,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         .for_each(|(slot, button)| **slot = button);
         widgets::set_sidebar_update_indicator(
             ui.sidebar_about,
-            UPDATE_AVAILABLE.load(Ordering::SeqCst),
+            UPDATE_AVAILABLE.load(Ordering::SeqCst) || crate::restart::restart_required(),
         );
 
         // HTML `.sidebar-footer`: the complete restore control is one semantic component, with
@@ -3315,7 +3349,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 
         let permissions_label_y = version_y - 53.0;
         let permissions_row_top_y = permissions_label_y - 27.0 - 44.0;
-        let permission_status_w = 80.0;
+        let permission_status_w = 120.0;
         let permission_action_gap = 8.0;
         let permission_button_w = ctrl_w - permission_status_w - permission_action_gap;
         let permission_button_h = 28.0;
@@ -3350,6 +3384,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsButtonRole::Action,
         );
         let _: () = msg_send![about_view, addSubview: accessibility_button];
+        ui.accessibility_permission_button = accessibility_button;
         release_obj(accessibility_button);
 
         let screen_recording_row_y = permissions_row_top_y - about_row_step;

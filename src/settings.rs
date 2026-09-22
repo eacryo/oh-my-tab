@@ -291,6 +291,7 @@ pub(super) struct SettingsUi {
     update_card_expanded: bool,     // 是否已为更新流程展开 / whether expanded for a flow
     update_host_origin_y: f64, // 宿主收起时的原点 y(顶边 - 展开高) / host origin y when collapsed
     accessibility_permission_status: *mut AnyObject,
+    accessibility_permission_button: *mut AnyObject,
     screen_recording_permission_status: *mut AnyObject,
 }
 
@@ -418,10 +419,31 @@ pub(crate) fn set_update_available(available: bool) {
     unsafe {
         with_settings_ui(|ui| {
             if let Some(ui) = ui.as_ref() {
-                widgets::set_sidebar_update_indicator(ui.sidebar_about, available);
+                set_about_sidebar_indicator(ui);
             }
         });
     }
+}
+
+/// Refresh the About-tab marker and permission row after a relaunch becomes necessary.
+/// 应用需要重启时刷新“关于”页标记及权限行。
+pub(crate) fn refresh_permission_restart_state() {
+    crate::debug_assert_main_thread();
+    unsafe {
+        with_settings_ui(|ui| {
+            if let Some(ui) = ui.as_ref() {
+                set_about_sidebar_indicator(ui);
+            }
+        });
+    }
+    refresh_permission_ui_if_visible();
+}
+
+unsafe fn set_about_sidebar_indicator(ui: &SettingsUi) {
+    widgets::set_sidebar_update_indicator(
+        ui.sidebar_about,
+        UPDATE_AVAILABLE.load(Ordering::SeqCst) || crate::restart::restart_required(),
+    );
 }
 
 /// Update the cross-thread text-input hint used by the quick-action event tap.

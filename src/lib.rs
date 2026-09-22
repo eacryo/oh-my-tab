@@ -10,6 +10,7 @@ mod ffi;
 mod hash;
 mod i18n;
 mod icon_cache;
+mod input_monitor;
 mod logger;
 mod mem;
 mod menu;
@@ -18,6 +19,7 @@ mod overlay;
 mod performance;
 mod pointer_locator;
 mod quick_actions;
+mod restart;
 mod runtime_config;
 mod settings;
 mod single_instance;
@@ -1408,6 +1410,18 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(handlePermissionRestartRequired:),
+            restart::on_permission_restart_required as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handlePermissionRestartNow:),
+            restart::on_permission_restart_now as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleAppLaunch:),
             on_app_launched as *mut c_void,
             types_v_obj.as_ptr(),
@@ -1716,6 +1730,12 @@ fn setup_status_bar() {
                 cls,
                 sel!(handleOpenPrivacy:),
                 handle_open_privacy as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleRestartForAccessibility:),
+                restart::on_restart_button as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -2360,8 +2380,10 @@ pub fn run() {
         CFRelease(will_terminate_name as *const c_void);
     }
 
-    // 7. Start event monitor; input is coalesced into one main-thread drain callback.
-    let _monitor = start_event_monitor();
+    // 7. Start runtime permission supervision before any global input tap.
+    input_monitor::start();
+    // Input is coalesced into one main-thread drain callback.
+    start_event_monitor();
 
     // 7b2. hover 轮询定时器在浮窗显示/隐藏时由 overlay 自行启停(show_overlay 调用
     // start_hover_timer),无需在此启动:主线程 runloop 每 16ms 读全局鼠标位置命中
@@ -2480,4 +2502,10 @@ pub fn run() {
         prompt_accessibility_if_needed();
         let _: () = msg_send![nsapp, run];
     }
+}
+
+/// Handle the detached permission-relaunch helper mode before AppKit startup.
+/// 在初始化 AppKit 前处理辅助功能恢复时使用的分离式重启助手参数。
+pub fn run_relaunch_helper_if_requested(args: &[String]) -> bool {
+    restart::run_relaunch_helper_if_requested(args)
 }

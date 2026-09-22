@@ -34,7 +34,11 @@ use crate::event_tap::{
 };
 use crate::mouse::shortcut::{FLAG_ALT, FLAG_CMD, FLAG_CTRL, FLAG_SHIFT};
 use crate::{enqueue_global_event, log_debug};
+use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Mutex, OnceLock};
 
 /// 侧键按下:合成目标组合的 keyDown(修饰位附着),post 到 HID 层。
 /// 回环到我们的切换 tap → CmdTabPressed / ClipboardToggled 等既有检测生效。
@@ -168,6 +172,207 @@ const MOD_KEYS: [(u32, u16); 4] = [
     (FLAG_SHIFT, 56),
 ];
 
+enum KeyJob {
+    Down {
+        keycode: u16,
+        flags: u32,
+        desc: String,
+    },
+    Up {
+        keycode: u16,
+        flags: u32,
+        desc: String,
+    },
+    SystemAction(&'static str),
+}
+
+static KEY_JOBS: OnceLock<Option<SyncSender<KeyJob>>> = OnceLock::new();
+static ACTIVE_BUTTON_BINDINGS: OnceLock<Mutex<HashMap<u32, (u16, u32)>>> = OnceLock::new();
+static ACTIVE_SYSTEM_BUTTONS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+static RELEASE_BACKLOG: OnceLock<Mutex<HashMap<u32, (u16, u32)>>> = OnceLock::new();
+
+fn active_bindings() -> &'static Mutex<HashMap<u32, (u16, u32)>> {
+    ACTIVE_BUTTON_BINDINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn release_backlog() -> &'static Mutex<HashMap<u32, (u16, u32)>> {
+    RELEASE_BACKLOG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn active_system_buttons() -> &'static Mutex<HashSet<u32>> {
+    ACTIVE_SYSTEM_BUTTONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn drain_release_backlog() {
+    let releases: Vec<_> = release_backlog()
+        .lock()
+        .unwrap()
+        .drain()
+        .map(|(_, binding)| binding)
+        .collect();
+    for (keycode, flags) in releases {
+        release_up(keycode, flags, "queued release");
+    }
+}
+
+fn key_job_sender() -> Option<&'static SyncSender<KeyJob>> {
+    KEY_JOBS
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::sync_channel::<KeyJob>(256);
+            std::thread::Builder::new()
+                .name("mouse-key-event-poster".into())
+                .spawn(move || {
+                    while let Ok(job) = receiver.recv() {
+                        match job {
+                            KeyJob::Down {
+                                keycode,
+                                flags,
+                                desc,
+                            } => {
+                                if !crate::mouse::event_tap::mouse_tap_stopping()
+                                    && crate::input_monitor::taps_allowed()
+                                {
+                                    press_down(keycode, flags, &desc);
+                                }
+                            }
+                            KeyJob::Up {
+                                keycode,
+                                flags,
+                                desc,
+                            } => {
+                                release_up(keycode, flags, &desc);
+                            }
+                            KeyJob::SystemAction(notification) => {
+                                if !crate::mouse::event_tap::mouse_tap_stopping()
+                                    && crate::input_monitor::taps_allowed()
+                                {
+                                    crate::mouse::system_action::fire(notification);
+                                }
+                            }
+                        }
+                        drain_release_backlog();
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+pub(crate) fn ensure_key_poster() -> bool {
+    key_job_sender().is_some()
+}
+
+/// Run Dock-backed actions off the HID callback and swallow their matching button-up only when
+/// the down action was accepted into the worker queue.
+pub(crate) fn queue_system_action(button: u32, down: bool, notification: &'static str) -> bool {
+    let Some(sender) = key_job_sender() else {
+        return false;
+    };
+    let mut active = active_system_buttons().lock().unwrap();
+    if down {
+        if active.contains(&button) {
+            return true;
+        }
+        match sender.try_send(KeyJob::SystemAction(notification)) {
+            Ok(()) => {
+                active.insert(button);
+                true
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
+    } else {
+        active.remove(&button)
+    }
+}
+
+pub(crate) fn clear_system_button_states() {
+    active_system_buttons().lock().unwrap().clear();
+}
+
+/// Queue a mapped key action away from the HID callback. The bounded queue preserves memory
+/// limits; when a release cannot fit, a coalesced emergency release is drained by the worker.
+pub(crate) fn queue_button_mapping(
+    button: u32,
+    down: bool,
+    keycode: u16,
+    flags: u32,
+    desc: &str,
+) -> bool {
+    let Some(sender) = key_job_sender() else {
+        return false;
+    };
+    let mut active = active_bindings().lock().unwrap();
+    if down {
+        if release_backlog().lock().unwrap().contains_key(&button) {
+            return false;
+        }
+        let job = KeyJob::Down {
+            keycode,
+            flags,
+            desc: desc.to_owned(),
+        };
+        match sender.try_send(job) {
+            Ok(()) => {
+                active.insert(button, (keycode, flags));
+                true
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
+    } else {
+        let Some((active_keycode, active_flags)) = active.get(&button).copied() else {
+            return false;
+        };
+        let job = KeyJob::Up {
+            keycode: active_keycode,
+            flags: active_flags,
+            desc: desc.to_owned(),
+        };
+        match sender.try_send(job) {
+            Ok(()) => {
+                active.remove(&button);
+                true
+            }
+            Err(TrySendError::Full(_)) => {
+                active.remove(&button);
+                release_backlog()
+                    .lock()
+                    .unwrap()
+                    .insert(button, (active_keycode, active_flags));
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+}
+
+/// Queue releases for every mapped shortcut still held when the mouse tap stops.
+pub(crate) fn release_all_queued() {
+    let mut active = active_bindings().lock().unwrap();
+    if active.is_empty() {
+        return;
+    }
+    let sender = key_job_sender();
+    for (button, (keycode, flags)) in active.drain() {
+        if let Some(sender) = sender {
+            match sender.try_send(KeyJob::Up {
+                keycode,
+                flags,
+                desc: "tap stopped".into(),
+            }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    release_backlog()
+                        .lock()
+                        .unwrap()
+                        .insert(button, (keycode, flags));
+                }
+                Err(TrySendError::Disconnected(_)) => {}
+            }
+        }
+    }
+}
+
 /// 合成一个修饰键的 flagsChanged 事件(flags = 该时刻的累积修饰状态),post 到 session 层。
 /// Synthesize a modifier flagsChanged event (flags = the accumulated modifier state at that
 /// moment), posted to the session level.
@@ -180,6 +385,7 @@ unsafe fn post_modifier_change(vk: u16, flags: u32) {
     CGEventSetFlags(ev, flags as CGEventFlags);
     CGEventSetIntegerValueField(ev, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
     CGEventPost(tap_location::SESSION_EVENT_TAP, ev);
+    crate::ffi::CFRelease(ev as *const c_void);
 }
 
 /// 合成单个键盘事件(keyDown/true 或 keyUp/false),打 userData 标记,post 到 session 层。
@@ -197,4 +403,5 @@ unsafe fn post_key(keycode: u16, flags: u32, key_down: bool) {
     CGEventSetFlags(ev, flags as CGEventFlags);
     CGEventSetIntegerValueField(ev, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
     CGEventPost(tap_location::SESSION_EVENT_TAP, ev);
+    crate::ffi::CFRelease(ev as *const c_void);
 }

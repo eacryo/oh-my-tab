@@ -10,6 +10,7 @@ use crate::event_tap::{self, tap_location, tap_options, tap_placement};
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalEvent {
@@ -62,6 +63,8 @@ fn should_ignore_tab_autorepeat(autorepeat: i64) -> bool {
 // 标记是否已经发送过 CmdTabPressed，防止修饰键变化时误发 CmdReleased
 // Tracks whether CmdTabPressed was sent, to avoid spurious CmdReleased
 static TAB_PRESSED: AtomicBool = AtomicBool::new(false);
+static TAP_CONTROL: event_tap::TapThreadControl = event_tap::TapThreadControl::new();
+static TAP_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 // 当前快捷键模式：true = Command+Tab, false = Option+Tab
 // Shortcut mode: true = Command+Tab, false = Option+Tab
@@ -73,6 +76,13 @@ unsafe extern "C" fn event_tap_callback(
     event: crate::event_tap::CGEventRef,
     _user_info: *mut c_void,
 ) -> crate::event_tap::CGEventRef {
+    if crate::input_monitor::handle_disabled_event(event_type, "kbd") {
+        return event;
+    }
+    if !crate::input_monitor::taps_allowed() {
+        return event;
+    }
+
     match event_type {
         K_CG_EVENT_KEY_DOWN => {
             let keycode =
@@ -210,9 +220,20 @@ fn modifier_key_name(keycode: u16) -> &'static str {
     }
 }
 
-pub fn start() -> std::thread::JoinHandle<()> {
+pub fn start() {
+    if !crate::input_monitor::taps_allowed() {
+        return;
+    }
     let mask: crate::event_tap::CGEventMask =
         (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
+
+    let mut thread = TAP_THREAD.lock().unwrap();
+    if thread.as_ref().is_some_and(|handle| !handle.is_finished()) {
+        return;
+    }
+    if let Some(finished) = thread.take() {
+        let _ = finished.join();
+    }
 
     // 窗口切换 tap 建在 session 层:既能看到真实硬件事件,也能看到鼠标映射软件在 session 层
     // 合成的 Cmd+Tab(HID 层 tap 看不到 session 层注入的合成事件,会导致侧键映射的 Cmd+Tab 漏过)。
@@ -222,7 +243,7 @@ pub fn start() -> std::thread::JoinHandle<()> {
     // Cmd+Tab from mouse-remapper software (a HID-level tap can't see session-posted synthetic events,
     // so a side-button-mapped Cmd+Tab would slip past). options = DEFAULT_TAP: must be able to swallow
     // the Cmd+Tab event (return null), so a mutable tap is required.
-    event_tap::start_event_tap_thread(
+    *thread = Some(event_tap::start_event_tap_thread(
         tap_location::SESSION_EVENT_TAP,
         tap_placement::HEAD_INSERT,
         tap_options::DEFAULT_TAP,
@@ -230,6 +251,7 @@ pub fn start() -> std::thread::JoinHandle<()> {
         Some(event_tap_callback),
         0,
         "kbd",
+        &TAP_CONTROL,
         || {
             // 快捷键可能被菜单/设置切换,按当前 SHORTCUT_IS_CMD 打印实际监听的组合键。
             // The shortcut can be toggled via menu/settings; print the actual combo from SHORTCUT_IS_CMD.
@@ -243,7 +265,11 @@ pub fn start() -> std::thread::JoinHandle<()> {
                 shortcut
             );
         },
-    )
+    ));
+}
+
+pub(crate) fn stop() {
+    TAP_CONTROL.stop();
 }
 
 #[cfg(test)]

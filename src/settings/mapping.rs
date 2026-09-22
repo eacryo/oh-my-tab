@@ -475,6 +475,12 @@ unsafe fn recording_tap_callback_inner(
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
+    if crate::input_monitor::handle_disabled_event(event_type, "rec") {
+        return event;
+    }
+    if !crate::input_monitor::taps_allowed() {
+        return event;
+    }
     match event_type {
         25 => {
             // otherMouseDown; 按钮号在 field 3(与 mouse/event_tap.rs 同)。
@@ -562,8 +568,14 @@ pub(super) unsafe fn recording_thread() {
         return;
     };
     *REC_TAP.0.lock().unwrap() = Some(created.tap);
+    let watchdog = crate::event_tap::start_tap_watchdog(created.tap, &REC_CANCEL);
     log_debug!("[mouse] recording tap started");
-    crate::event_tap::CFRunLoopRun();
+    if !REC_CANCEL.load(std::sync::atomic::Ordering::SeqCst) && crate::input_monitor::taps_allowed()
+    {
+        crate::event_tap::CFRunLoopRun();
+    }
+    crate::event_tap::stop_tap_watchdog(watchdog);
+    crate::event_tap::CGEventTapEnable(created.tap, false);
     *REC_TAP.0.lock().unwrap() = None;
     *REC_RUNLOOP.0.lock().unwrap() = None;
     crate::event_tap::teardown_event_tap(rl, created);

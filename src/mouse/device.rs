@@ -4,7 +4,7 @@
 //!   CGEventCopyIOHIDEvent(cgEvent) -> IOHIDEventRef
 //!   IOHIDEventGetSenderID(ioHIDEvent) -> registry_id (uint64)
 //!   by_registry_id 查表 -> Device
-//! 失败时惰性重枚举一次;仍失败则回退到 last_active(匹配"所有鼠标"档)。
+//! 归因未命中时将完整重枚举排入后台,当前事件回退到 last_active(匹配"所有鼠标"档)。
 //!
 //! Live device registry + CGEvent -> producing-device attribution chain (Phase 0+1).
 //!
@@ -12,7 +12,7 @@
 //!   CGEventCopyIOHIDEvent(cgEvent) -> IOHIDEventRef
 //!   IOHIDEventGetSenderID(ioHIDEvent) -> registry_id (uint64)
 //!   by_registry_id lookup -> Device
-//! On failure, lazily re-enumerate once; if still failing, fall back to last_active
+//! On attribution misses, schedule a full background enumeration and fall back to last_active
 //! (which matches the "All Mice" profile).
 
 use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
@@ -23,6 +23,7 @@ use objc2::{class, msg_send, sel};
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 
 // ========== 设备身份与运行时表示 / device identity & runtime handle ==========
@@ -83,6 +84,33 @@ pub(crate) const VIRTUAL_DEVICE_KEY: DeviceKey = (u32::MAX, u32::MAX);
 /// by the mouse thread during attribution; the settings UI reads it to decide whether the virtual
 /// mouse entry appears in the device popup -- it is hidden while no injector is around.
 static INJECTOR_PID: Mutex<Option<i32>> = Mutex::new(None);
+static INJECTOR_NOTICE_WORKER: OnceLock<Option<Sender<i32>>> = OnceLock::new();
+
+fn injector_notice_sender() -> Option<&'static Sender<i32>> {
+    INJECTOR_NOTICE_WORKER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<i32>();
+            std::thread::Builder::new()
+                .name("mouse-injector-notice".into())
+                .spawn(move || {
+                    while let Ok(pid) = receiver.recv() {
+                        let name = unsafe { injector_display_name(pid) }.unwrap_or_default();
+                        if *INJECTOR_PID.lock().unwrap() != Some(pid) {
+                            continue;
+                        }
+                        log_debug!(
+                            "[device] virtual pointer detected: pid={} name={:?}; device picker now offers its own profile.",
+                            pid,
+                            name
+                        );
+                        notify_devices_changed();
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
 
 /// 事件是否由别的进程注入;是则返回注入进程 pid。
 /// 0 = 硬件事件;我们自己的 pid 也排除(自己的合成事件不是虚拟鼠标)。
@@ -177,18 +205,13 @@ fn record_injector(pid: i32) {
         }
         *cur = Some(pid);
     }
-    let name = unsafe { injector_display_name(pid) }.unwrap_or_default();
-    // 首次检测到:此前"虚拟鼠标"档在设备下拉里不存在,归因会落到 last_active(把注入的按键/
-    // 滚动算给物理鼠标的档)。现在它有独立档,下拉也需要即时出现这一项。
-    // First detection: until now no virtual-mouse entry existed and attribution fell back to
-    // last_active (billing the injected events to the physical mouse's profile). It now has its own
-    // profile, and the popup must show the entry right away.
-    log_debug!(
-        "[device] virtual pointer detected: pid={} name={:?}; device picker now offers its own profile.",
-        pid,
-        name
-    );
-    notify_devices_changed();
+    // 名称查询会进入 NSRunningApplication/libproc；放到工作线程，避免注入事件等待进程查询
+    // 或主线程通知。
+    // Name lookup may cross into NSRunningApplication/libproc; leave it to the worker so injected
+    // events never make the HID callback wait on process discovery or a main-thread notification.
+    if let Some(sender) = injector_notice_sender() {
+        let _ = sender.send(pid);
+    }
 }
 
 /// 虚拟指针的设备身份(注入进程仍存活时才有);顺带清掉已退出的注入进程,让下拉里的该项消失。
@@ -559,6 +582,7 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
 /// 启动时枚举一次(惰性:首次归因失败时也会触发)。
 /// Enumerate once at startup (also lazily triggered on first attribution failure).
 pub(crate) fn ensure_enumerated() {
+    let _ = injector_notice_sender();
     let mut reg = registry().lock().unwrap();
     if reg.client.is_null() || reg.devices.is_empty() {
         unsafe { enumerate_locked(&mut reg, false) };
@@ -1043,12 +1067,12 @@ unsafe fn lookup_service_index(reg: &DeviceRegistry, sender: u64) -> Option<usiz
 /// 从 CGEvent 找到产生它的设备。
 /// 归因链:CGEventCopyIOHIDEvent -> IOHIDEventGetSenderID ->
 /// IOHIDEventSystemClientCopyServiceForRegistryID -> CFEqual 匹配枚举列表。
-/// 失败时惰性重枚举一次再查;仍失败返回 last_active(若无则 None,调用方用"所有鼠标"档)。
+/// 失败时异步安排重建,本次先返回 last_active(若无则 None,调用方用"所有鼠标"档)。
 ///
 /// Find the device that produced a CGEvent.
 /// Chain: CGEventCopyIOHIDEvent -> IOHIDEventGetSenderID ->
 /// IOHIDEventSystemClientCopyServiceForRegistryID -> CFEqual against the enumerated list.
-/// On failure, lazily re-enumerate once and retry; if still failing, return last_active
+/// On failure, asynchronously schedule a registry rebuild and return last_active
 /// (or None if there is none, in which case the caller uses the "All Mice" profile).
 pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Option<DeviceKey> {
     // 先判"是不是别的进程注入的"(软件 KVM 的虚拟鼠标):这类事件没有 IOHIDEvent sender,但带
@@ -1086,43 +1110,12 @@ pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Opt
                 return Some(dev.key());
             }
         }
-        // 未命中:可能新设备插入或蓝牙断连重连后注册表过期。强制重建 client + 重枚举后重查。
-        // 只重枚举不重建 client 是不够的:蓝牙重连后旧 client 的缓存已失效,重枚举拿到的
-        // 仍是过期列表,归因会持续失败(表现为每次事件都重枚举仍不命中)。
-        // Miss: a newly-plugged device or a Bluetooth reconnect may have made the registry stale.
-        // Force-rebuild the client + re-enumerate, then retry. Re-enumerating with the old client
-        // is not enough: after a Bluetooth reconnect the old client's cache is dead, so the
-        // re-enumeration still yields a stale list and attribution keeps failing (observable as a
-        // re-enumeration on every event that still misses).
-        {
-            let mut reg = registry().lock().unwrap();
-            let before: Vec<DeviceKey> = reg.devices.iter().map(|d| d.key()).collect();
-            enumerate_locked(&mut reg, true);
-            let (key, set_changed) = if let Some(idx) = lookup_service_index(&reg, sender) {
-                let dev = &reg.devices[idx];
-                *LAST_ACTIVE_KEY.lock().unwrap() = Some(dev.key());
-                let after: Vec<DeviceKey> = reg.devices.iter().map(|d| d.key()).collect();
-                (Some(dev.key()), before != after)
-            } else {
-                (None, false)
-            };
-            drop(reg);
-            // 注册表在此自愈(重连设备找回):若设备集确实变化,补一次 apply + 设置 UI
-            // 刷新——防抖/延迟重查漏检时的兜底,用户一动鼠标下拉立即恢复。每次恢复
-            // 至多触发一次(后续事件命中首查路径)。此路径罕见(miss 才走)。
-            // The registry self-healed here (reconnected device recovered): if the device set
-            // actually changed, re-apply pointer settings and refresh the settings UI -- the
-            // backstop when the debounce/delayed recheck missed, so the popup recovers as soon
-            // as the user moves the mouse. At most one trigger per recovery (later events hit
-            // the first-lookup path). This path is rare (only runs on a miss).
-            if set_changed {
-                crate::mouse::pointer::apply();
-                notify_devices_changed();
-            }
-            if let Some(k) = key {
-                return Some(k);
-            }
-        }
+        // 未命中可能表示新设备或蓝牙重连。完整枚举会重建 IOHID client，耗时不能放在
+        // HID 回调里；合并调度后台重查，本次暂用 last_active 回退。
+        // A miss may mean a new device or Bluetooth reconnect. Full enumeration rebuilds the
+        // IOHID client and must stay off the HID callback; coalesce a background recheck and use
+        // the last-active device for this event.
+        schedule_recheck(true);
         last_active_key()
     }
 }
