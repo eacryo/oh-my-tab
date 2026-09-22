@@ -1436,12 +1436,6 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
-            sel!(handleOpenOnboarding:),
-            onboarding::on_open_from_settings as *mut c_void,
-            types_v_obj.as_ptr(),
-        );
-        class_addMethod(
-            cls,
             sel!(handleOnboardingTick:),
             onboarding::on_tick as *mut c_void,
             types_v_obj.as_ptr(),
@@ -1756,6 +1750,19 @@ fn setup_status_bar() {
                 cls,
                 sel!(handleOpenPrivacy:),
                 handle_open_privacy as *mut c_void,
+                types.as_ptr(),
+            );
+            // 设置窗口的按钮 target 就是这个 action class(见 settings/window.rs 的 MENU_TARGET),
+            // 「查看引导」必须注册在这里;注册到主控制器 class 上会变成一个没人实现的 selector,
+            // 点了毫无反应(实测)。
+            // The settings window's buttons target THIS action class (MENU_TARGET in
+            // settings/window.rs), so "View guide" must be registered here; registering it on the
+            // main controller class leaves an unimplemented selector and the click does nothing
+            // (measured).
+            class_addMethod(
+                cls,
+                sel!(handleOpenOnboarding:),
+                onboarding::on_open_from_settings as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
