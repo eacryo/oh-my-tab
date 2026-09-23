@@ -91,11 +91,11 @@ pub(crate) unsafe fn focused_window_cgwid(pid: i32) -> Option<u32> {
 /// SkyLight private API _SLPSSetFrontProcessWithOptions -- does NOT raise all
 /// of the app's windows the way activate(AllWindows) does.
 ///
-/// mode 用 0x200(kCPSUserGenerated,yabai kCPS* 定义,AltTab 同款):把这次切换标记为
+/// mode 用 0x200(kCPSUserGenerated,yabai kCPS* 定义):把这次切换标记为
 /// 「用户发起」。macOS 14+ 对非用户发起的程序化前台切换会抑制输入焦点转移(目标窗口
 /// 变灰红绿灯,需要点击才能获得焦点),0x200 是绕过该抑制的关键。旧代码传的 2 不是
 /// 有效标志位,正是灰红绿灯的根因之一。
-/// The mode is 0x200 (kCPSUserGenerated, from yabai's kCPS* constants, same as AltTab):
+/// The mode is 0x200 (kCPSUserGenerated, from yabai's kCPS* constants):
 /// it marks this front-switch as user-initiated. macOS 14+ suppresses input-focus transfer
 /// for non-user-initiated programmatic front-switches (the target window's traffic lights go
 /// grey until a click); 0x200 is what bypasses that suppression. The old code passed 2, which
@@ -152,7 +152,7 @@ unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
 /// userGenerated 前台切换只解决「抬到前面」，key 状态必须靠这个合成点击确立。
 /// 点击点放到窗口右下方很远处，避免命中任何内容或 resize 区域。事件按 CGWindowID 定向投递，
 /// 与坐标无关。
-/// 字节布局来自 AltTab 对 CGSInternal/CGSEvent.h 的反向工程；缓冲必须 ≥0x100 并清零，
+/// 字节布局来自对 CGSInternal/CGSEvent.h 的反向工程；缓冲必须 ≥0x100 并清零，
 /// 否则 macOS 14.7.4+ 的 CGSEncodeEventRecord 会越界读取导致 SIGABRT（paneru#123）。
 ///
 /// Make the window `wid` the key window of its app by posting a synthetic left-mouse-down
@@ -163,7 +163,7 @@ unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
 /// The click is aimed far beyond the window's bottom-right corner, so it hit-tests to no view
 /// or resize edge (nothing is clicked). The event is delivered to the window by CGWindowID,
 /// not by the click point.
-/// layout is AltTab's reverse-engineering of CGSInternal/CGSEvent.h; the buffer must be
+/// The layout follows a reverse-engineering of CGSInternal/CGSEvent.h; the buffer must be
 /// at least 0x100 bytes and zeroed, or CGSEncodeEventRecord reads past it on macOS 14.7.4+
 /// and SIGABRTs (paneru issue 123).
 unsafe fn make_key_window(pid: i32, wid: u32) -> bool {

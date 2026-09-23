@@ -452,6 +452,19 @@ struct CachedAxSnapshot {
 }
 
 /// AX semantic facts needed after pairing with the WindowServer snapshot.
+/// 原生标签栏:同一个窗口组的每个标签都是一个独立窗口,但**只有当前选中的那个**会暴露
+/// 标签栏及其全部标签标题,后台标签窗口不暴露。这个不对称正是识别“一组窗口是同一标签组”
+/// 的依据(见 collect::fold_tab_group)。
+/// A native tab bar: every tab of a window group is its own window, but only the SELECTED one
+/// exposes the tab bar and the full tab-title list; background tab windows do not. That
+/// asymmetry is what identifies "these windows are one tab group" (see collect::fold_tab_group).
+#[derive(Clone, Debug)]
+struct TabGroupInfo {
+    /// 标签标题,顺序与标签栏一致。
+    /// Tab titles, in tab-bar order.
+    titles: Vec<String>,
+}
+
 /// The AX role/subrole answers what a surface is; WindowServer layer and bounds answer where
 /// it is and whether a custom root is substantial enough to be a switch destination.
 #[derive(Clone, Debug)]
@@ -462,6 +475,11 @@ struct AxWindowInfo {
     is_main: bool,
     is_fullscreen: bool,
     is_custom_root: bool,
+    /// 该窗口暴露的原生标签栏(仅当前选中的标签窗口有)。供 collect::fold_tab_group 判定
+    /// 同组窗口。
+    /// The native tab bar this window exposes (only the selected tab's window has one), used by
+    /// collect::fold_tab_group to identify the group's windows.
+    tab_group: Option<TabGroupInfo>,
     /// 该条目是否**只**由 kAXFocusedWindow/kAXMainWindow 槽位交回(不在 kAXWindows 里)。
     /// 这两个槽位不做 Space 过滤,所以窗口全在别的 Space(原生全屏 Space 下的后台 App)
     /// 时它们是唯一的线索;但它们同样会交回辅助进程的浮层/子窗口,因此这类条目只在确认
@@ -645,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_roots_use_alt_tab_substantial_boundary() {
+    fn custom_roots_use_the_substantial_size_boundary() {
         assert!(custom_window_is_substantial((0.0, 0.0, 100.0, 50.0)));
         assert!(!custom_window_is_substantial((0.0, 0.0, 99.0, 50.0)));
         assert!(!custom_window_is_substantial((0.0, 0.0, 100.0, 49.0)));
@@ -735,6 +753,7 @@ mod tests {
                 is_fullscreen: false,
                 is_custom_root: false,
                 only_via_key_or_main: false,
+                tab_group: None,
             }
         }
         // 全部无标题 → 豁免(自绘标题栏的 App)。

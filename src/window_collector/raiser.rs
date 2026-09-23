@@ -598,11 +598,11 @@ pub(super) fn ax_subrole_kept(subrole: Option<&str>, role: Option<&str>, titled:
     }
 }
 
-// Match AltTab's substantial custom-window boundary. Standard windows and titled dialogs do
-// not use this size gate; it only prevents an untitled/unknown custom root from becoming a
-// switch destination when it is merely a tiny auxiliary surface.
-// 与 AltTab 的自定义窗口边界保持一致。标准窗口和有标题的对话框不走此尺寸门槛；仅防止
-// AXUnknown 自定义根元素在很小时被当成可切换窗口。
+// The substantial custom-window boundary. Standard windows and titled dialogs do not use this
+// size gate; it only prevents an untitled/unknown custom root from becoming a switch
+// destination when it is merely a tiny auxiliary surface.
+// 自定义窗口的尺寸边界。标准窗口和有标题的对话框不走此门槛；仅防止 AXUnknown 自定义根
+// 元素在很小时被当成可切换窗口。
 const CUSTOM_WINDOW_MIN_WIDTH: f64 = 100.0;
 const CUSTOM_WINDOW_MIN_HEIGHT: f64 = 50.0;
 
@@ -780,6 +780,124 @@ where
     result
 }
 
+/// 读窗口直接子节点里的原生标签栏(AXTabGroup),返回其中的标签标题。
+/// 只有当前选中的标签窗口会暴露标签栏,后台标签窗口读不到——调用方据此识别标签组。
+/// 结构不认识、没有标签栏、或标签少于两个都返回 None(fail-open)。
+///
+/// Reads the native tab bar (an AXTabGroup among the window's direct children) and returns its
+/// tab titles. Only the selected tab's window exposes one, so a background tab reads as None --
+/// which is how callers identify a tab group. None when the structure is unrecognised, there is
+/// no tab bar, or fewer than two tabs (fail-open).
+unsafe fn read_tab_group_info(element: AXUIElementRef) -> Option<TabGroupInfo> {
+    let children_key = cf_string_new("AXChildren");
+    let role_key = cf_string_new("AXRole");
+    let title_key = cf_string_new("AXTitle");
+    let mut info = None;
+
+    let mut children_value: *const c_void = std::ptr::null();
+    if AXUIElementCopyAttributeValue(element, children_key, &mut children_value) == K_AX_SUCCESS
+        && !children_value.is_null()
+        && CFGetTypeID(children_value) == CFArrayGetTypeID()
+    {
+        let count = CFArrayGetCount(children_value);
+        // 部分 App 直接把标签按钮挂在窗口下,没有 AXTabGroup 包裹;两类结构都收。
+        // Some apps hang the tab buttons directly off the window with no AXTabGroup wrapper, so
+        // both shapes are collected while walking the direct children.
+        let mut group_titles: Option<Vec<String>> = None;
+        let mut bare_titles: Vec<String> = Vec::new();
+        for index in 0..count {
+            let child = CFArrayGetValueAtIndex(children_value, index);
+            if child.is_null() {
+                continue;
+            }
+            let mut role_value: *const c_void = std::ptr::null();
+            let role = if AXUIElementCopyAttributeValue(child, role_key, &mut role_value)
+                == K_AX_SUCCESS
+                && !role_value.is_null()
+            {
+                let role = cf_to_rust_string(role_value);
+                CFRelease(role_value);
+                role
+            } else {
+                None
+            };
+            match role.as_deref() {
+                Some("AXTabGroup") => {
+                    if group_titles.is_none() {
+                        group_titles = read_tab_titles(child, children_key, title_key);
+                    }
+                }
+                // 直接挂着的标签按钮:凑够一组才算数,避免误收单个单选按钮。
+                // Barely-attached tab buttons count only when they really form a group, so a
+                // lone radio button is never mistaken for a tab bar.
+                Some("AXRadioButton") => {
+                    if let Some(title) = read_ax_title(child, title_key) {
+                        bare_titles.push(title);
+                    }
+                }
+                _ => {}
+            }
+        }
+        info = group_titles
+            .or_else(|| (bare_titles.len() >= 2).then_some(bare_titles))
+            .map(|titles| TabGroupInfo { titles });
+    }
+    if !children_value.is_null() {
+        CFRelease(children_value);
+    }
+    CFRelease(children_key);
+    CFRelease(role_key);
+    CFRelease(title_key);
+    info
+}
+
+/// 读一个 AXTabGroup 元素的直接子节点标题(标签按钮);少于两个返回 None。
+/// Reads the titles of an AXTabGroup's direct children (the tab buttons); None under two.
+unsafe fn read_tab_titles(
+    group: AXUIElementRef,
+    children_key: *const c_void,
+    title_key: *const c_void,
+) -> Option<Vec<String>> {
+    let mut tabs_value: *const c_void = std::ptr::null();
+    if AXUIElementCopyAttributeValue(group, children_key, &mut tabs_value) != K_AX_SUCCESS
+        || tabs_value.is_null()
+        || CFGetTypeID(tabs_value) != CFArrayGetTypeID()
+    {
+        if !tabs_value.is_null() {
+            CFRelease(tabs_value);
+        }
+        return None;
+    }
+    let count = CFArrayGetCount(tabs_value);
+    let mut titles = Vec::new();
+    for index in 0..count {
+        let tab = CFArrayGetValueAtIndex(tabs_value, index);
+        if tab.is_null() {
+            continue;
+        }
+        if let Some(title) = read_ax_title(tab, title_key) {
+            titles.push(title);
+        }
+    }
+    CFRelease(tabs_value);
+    (titles.len() >= 2).then_some(titles)
+}
+
+/// 读元素 AXTitle(读不到或为空 → None)。
+/// Reads an element's AXTitle (unreadable or empty -> None).
+unsafe fn read_ax_title(element: AXUIElementRef, title_key: *const c_void) -> Option<String> {
+    let mut value: *const c_void = std::ptr::null();
+    if AXUIElementCopyAttributeValue(element, title_key, &mut value) == K_AX_SUCCESS
+        && !value.is_null()
+    {
+        let title = cf_to_rust_string(value);
+        CFRelease(value);
+        title.filter(|title| !title.is_empty())
+    } else {
+        None
+    }
+}
+
 pub(super) fn get_ax_windows_for_pid_with_identity(
     pid: i32,
     process_start_time_us: Option<u64>,
@@ -861,6 +979,7 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
             main_window.map(|element| (ax_window_cgwid(element).unwrap_or(0), element)),
         );
 
+        let candidate_count = candidates.len();
         let title_key = cf_string_new("AXTitle");
         let role_key = cf_string_new("AXRole");
         let subrole_key = cf_string_new("AXSubrole");
@@ -959,6 +1078,18 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                     false
                 }
             };
+            // 原生标签栏只在“多窗口 + 该窗口最小化”时才读:后台标签只有在最小化时才会
+            // 出现在 AX 列表里(可见/隐藏态 AX 只交回选中的标签),也只有那个状态需要收拢;
+            // 其余情况读它是纯开销。读不到就当作没有标签组(fail-open)。
+            // The native tab bar is read only for a minimized window of a multi-window app:
+            // background tabs only reach the AX list while minimized (the visible/hidden states
+            // hand over the selected tab alone), which is the only state that needs folding;
+            // reading it otherwise is pure cost. A failed read means "no tab group" (fail-open).
+            let tab_group = if candidate_count >= 2 && minimized {
+                read_tab_group_info(element)
+            } else {
+                None
+            };
             let is_main = {
                 let mut main_value: *const c_void = std::ptr::null();
                 if AXUIElementCopyAttributeValue(element, main_key, &mut main_value) == K_AX_SUCCESS
@@ -999,6 +1130,7 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 is_fullscreen,
                 is_custom_root: subrole.as_deref() == Some("AXUnknown"),
                 only_via_key_or_main,
+                tab_group,
             });
         }
         CFRelease(title_key);

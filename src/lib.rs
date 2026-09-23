@@ -92,18 +92,18 @@ pub(crate) struct AppState {
     pub(crate) mru: MruMap,
     pub(crate) focus_key: Option<(i32, u32)>,
     // 召唤瞬间模型已持有的窗口 key 集合。浮窗打开后的刷新,只应把「召唤时就在场」的窗口
-    // 视为用户正在选择的目标;召唤后才出现的新窗口是 newcomer,不参与选中(对齐 alt-tab 的
-    // windowIdsAtSummon)。None = 尚未记录(首帧前)。
+    // 视为用户正在选择的目标;召唤后才出现的新窗口是 newcomer,不参与选中。
+    // None = 尚未记录(首帧前)。
     // Window keys the model already held at summon. Refreshes after the overlay shows only treat
     // windows present at the summon as the user's switching targets; a window appearing after the
-    // summon is a newcomer and does not participate in the pick (mirrors alt-tab's windowIdsAtSummon).
+    // summon is a newcomer and does not participate in the pick.
     // None = not yet recorded (before the first frame).
     pub(crate) summon_keys: Option<HashSet<(i32, u32)>>,
     // 用户是否已主动移动过选中(Tab/方向键/点击)。false=选中仍是首帧默认落点,它应跟随
     // 「召唤时语义」而不是当前 MRU 排序;true=用户已选具体窗口,刷新后需钉住该窗口 key。
     // false = the selection is still the first-frame default and follows the summon semantics,
     // not the live MRU order; true = the user picked a concrete window and the selection must
-    // stay pinned to it across refreshes (mirrors alt-tab's userPickedSelection).
+    // stay pinned to it across refreshes.
     pub(crate) user_picked: bool,
     // 用户当前选中的目标窗口 key。user_picked=true 时它是刷新后必须钉住的窗口;
     // user_picked=false 时它是首帧默认目标,刷新不因 MRU 排序漂移而改选它。

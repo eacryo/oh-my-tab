@@ -143,6 +143,7 @@ unsafe fn ax_collect_chunk(
                 let (recovered, published): (Vec<AxWindowInfo>, Vec<AxWindowInfo>) = wins
                     .into_iter()
                     .partition(|window| window.only_via_key_or_main);
+                let published = fold_tab_group(published);
                 if !published.is_empty() {
                     if windows_are_all_untitled(&published) {
                         partial.titleless_pids.insert(pid);
@@ -288,6 +289,7 @@ unsafe fn collect_windows_for_pid_inner(
         CFRelease(array);
         return None;
     }
+    let published = fold_tab_group(published);
     let ax_wid_to_info: HashMap<u32, AxWindowInfo> = published
         .iter()
         .filter_map(|window| (window.cgwid != 0).then_some((window.cgwid, window.clone())))
@@ -555,6 +557,87 @@ fn ax_wid_map(windows: Vec<AxWindowInfo>) -> HashMap<u32, AxWindowInfo> {
         }
     }
     map
+}
+
+/// 把同一 App 的 AX 窗口里属于一个原生标签组的那些收拢成一张卡片:保留暴露标签栏的那个
+/// 窗口(当前选中的标签),丢掉与它的标签标题一一对应的后台标签窗口;其余窗口(标题对
+/// 不上任何标签)是独立窗口,原样保留。
+///
+/// 为什么需要:原生标签组的每个标签都是独立窗口,但**只有最小化时** AX 才会把它们全部
+/// 交回(可见/隐藏态只给选中的那个)。不收拢的话同一窗口会在最小化后变成多张卡片,与
+/// 可见/隐藏态不一致。
+///
+/// 为什么按“标题一一对应 + 数量上界”,而不是“要求整个 AX 列表恰好就是这组标签”:后者会
+/// 把“标签组和独立窗口同时最小化”这种常见场景整个放弃。安全性来自上界——一个组最多
+/// titles.len()-1 个后台标签,匹配到的窗口超过这个数,就说明列表里有与标签同名的非标签
+/// 窗口,而此刻无法判定哪些才是标签,于是全部保留。独立窗口的标题只要不与某个标签相同
+/// (常见情况),就永远不会被匹配到,也就不会被藏掉。
+///
+/// Folds the AX windows that belong to one native tab group down to a single card: the window
+/// exposing the tab bar (the selected tab) survives, and background-tab windows whose titles map
+/// one-to-one onto its tab titles are dropped; any other window (a title that matches no tab) is
+/// an independent window and is kept.
+///
+/// Why: every tab of a native tab group is its own window, but AX hands them all back ONLY while
+/// the group is minimized (the visible/hidden states hand over the selected tab alone). Without
+/// folding, one window becomes several cards once minimized, disagreeing with the other states.
+///
+/// Why "one title per background tab, bounded by the tab count" rather than "the whole AX list
+/// must equal the tab set": the strict form gives up on the common mixed case (a tab group and a
+/// separate window both minimized), while this one still folds the real tabs. Safety comes from
+/// the bound: a group has at most titles.len()-1 background tabs, so more matches than that mean
+/// the list holds a non-tab window sharing a tab's title, and nothing can say which is which --
+/// keep everything. An independent window whose title matches no tab (the usual case) is never
+/// matched and can never be hidden.
+pub(super) fn fold_tab_group(windows: Vec<AxWindowInfo>) -> Vec<AxWindowInfo> {
+    let hosts: Vec<usize> = windows
+        .iter()
+        .enumerate()
+        .filter(|(_, window)| {
+            window
+                .tab_group
+                .as_ref()
+                .is_some_and(|group| group.titles.len() >= 2)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    // 恰好一个窗口暴露标签栏才是无歧义的组;0 个没得收,≥2 个说明有多组或不一致的读。
+    // Exactly one window exposing a tab bar is an unambiguous group; 0 has nothing to fold and
+    // >=2 means several groups or an inconsistent read.
+    if hosts.len() != 1 {
+        return windows;
+    }
+    let host_index = hosts[0];
+    let Some(titles) = windows[host_index]
+        .tab_group
+        .as_ref()
+        .map(|group| group.titles.clone())
+    else {
+        return windows;
+    };
+    // 给每个非目标窗口在标签标题里找一个未被占用的名额;占上且最小化的窗口才是候选后台
+    // 标签,占不上的都是独立窗口(保留)。
+    let mut remaining: Vec<&str> = titles.iter().map(String::as_str).collect();
+    let mut siblings = HashSet::new();
+    for (index, window) in windows.iter().enumerate() {
+        if index == host_index || !window.minimized {
+            continue;
+        }
+        if let Some(position) = remaining.iter().position(|title| *title == window.title) {
+            remaining.swap_remove(position);
+            siblings.insert(index);
+        }
+    }
+    // 后台标签最多 titles.len()-1 个;匹配到的比这个还多,说明列表里有与标签同名的非标签
+    // 窗口,无法判定哪些才是标签 → 全部保留。
+    if siblings.len() > titles.len() - 1 {
+        return windows;
+    }
+    windows
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, window)| (!siblings.contains(&index)).then_some(window))
+        .collect()
 }
 
 /// 收集窗口快照,可选择是否把当前前台窗口写入 MRU。
@@ -1209,6 +1292,88 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         log_debug!("[windows] pruned {} stale MRU entries", pruned);
     }
 
+    // 临时诊断 Ghostty 隐藏窗口路径:逐项记录 CG 候选、AX 两类窗口集合与最终卡片集合，
+    // 用于区分缺失发生在系统快照、AX 配对还是卡片组装阶段。
+    // Temporary trace for Ghostty's hidden-window path: compare CG candidates, both AX window
+    // sets, and final cards to locate losses in the system snapshot, AX pairing, or assembly.
+    for (&pid, app_name) in pid_names
+        .iter()
+        .filter(|(_, name)| name.as_str() == "Ghostty")
+    {
+        if !bump_frontmost {
+            continue;
+        }
+        let mut cg_rows = Vec::new();
+        for i in 0..count {
+            let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
+            if dict.is_null() || cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1) != pid {
+                continue;
+            }
+            let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+            cg_rows.push(format!(
+                "id={} layer={} alpha={:.2} onscreen={} title={:?} bounds={:?} parent={:?}",
+                cgwid,
+                cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999),
+                cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0),
+                cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false),
+                cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default(),
+                cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default(),
+                parent_ids.get(&cgwid).copied()
+            ));
+        }
+        let format_ax_rows = |map: Option<&HashMap<u32, AxWindowInfo>>| {
+            let mut rows: Vec<_> = map
+                .into_iter()
+                .flat_map(|windows| windows.iter())
+                .map(|(id, info)| {
+                    format!(
+                        "id={} title={:?} minimized={} main={} fullscreen={} custom_root={} recovered={}",
+                        id,
+                        info.title,
+                        info.minimized,
+                        info.is_main,
+                        info.is_fullscreen,
+                        info.is_custom_root,
+                        info.only_via_key_or_main
+                    )
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        let mut final_rows: Vec<_> = windows
+            .iter()
+            .filter(|window| window.pid == pid)
+            .map(|window| {
+                format!(
+                    "id={} title={:?} minimized={} app_hidden={} bounds={:?}",
+                    window.window_id,
+                    window.window_title,
+                    window.minimized,
+                    window.app_hidden,
+                    window.bounds
+                )
+            })
+            .collect();
+        final_rows.sort();
+        log_debug!(
+            "[collect] app trace: pid={} app={:?} bump_frontmost={} show_hidden={} show_minimized={} hidden={} ax_failed={} ax_empty={} degraded={} cg={:?} ax_published={:?} ax_recovered={:?} cards={:?}",
+            pid,
+            app_name,
+            bump_frontmost,
+            show_hidden_app_windows,
+            show_minimized,
+            hidden_app_pids.contains(&pid),
+            ax_failed_pids.contains(&pid),
+            ax_empty_pids.contains(&pid),
+            ax_degraded,
+            cg_rows,
+            format_ax_rows(ax_wid_to_info.get(&pid)),
+            format_ax_rows(ax_recovered_wid_to_info.get(&pid)),
+            final_rows
+        );
+    }
+
     unsafe { CFRelease(array) };
 
     let (front_pid, frontmost, fm_ms): (Option<i32>, Option<(i32, u32)>, u128) = if bump_frontmost {
@@ -1292,5 +1457,96 @@ mod hidden_app_filter_tests {
         assert!(should_filter_hidden_app(false, Some(true)));
         assert!(!should_filter_hidden_app(false, Some(false)));
         assert!(!should_filter_hidden_app(false, None));
+    }
+}
+
+#[cfg(test)]
+mod tab_group_fold_tests {
+    use super::*;
+
+    fn window(cgwid: u32, title: &str, minimized: bool, tabs: Option<&[&str]>) -> AxWindowInfo {
+        AxWindowInfo {
+            cgwid,
+            title: title.to_string(),
+            minimized,
+            is_main: false,
+            is_fullscreen: false,
+            is_custom_root: false,
+            only_via_key_or_main: false,
+            tab_group: tabs.map(|titles| TabGroupInfo {
+                titles: titles.iter().map(|title| title.to_string()).collect(),
+            }),
+        }
+    }
+
+    #[test]
+    fn minimized_tab_group_folds_to_the_selected_tab() {
+        // 选中的标签窗口暴露标签栏,后台标签只报自己的标题。
+        let windows = vec![
+            window(
+                50,
+                "π - oh-my-tab",
+                true,
+                Some(&["~/PycharmProjects", "π - oh-my-tab"]),
+            ),
+            window(48, "~/PycharmProjects", true, None),
+        ];
+        let folded = fold_tab_group(windows);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].cgwid, 50);
+    }
+
+    #[test]
+    fn non_tab_window_is_kept_while_the_group_folds() {
+        // 标签组 + 一个标题不在标签栏里的独立窗口:只收标签,独立窗口保留。
+        let windows = vec![
+            window(50, "A", true, Some(&["A", "B"])),
+            window(48, "B", true, None),
+            window(60, "C", true, None),
+        ];
+        let folded = fold_tab_group(windows);
+        assert_eq!(folded.len(), 2);
+        assert!(folded.iter().any(|window| window.cgwid == 50));
+        assert!(folded.iter().any(|window| window.cgwid == 60));
+        // 未最小化的窗口不是后台标签 → 保留(这里不影响同组的那张)。
+        let windows = vec![
+            window(50, "A", true, Some(&["A", "B"])),
+            window(48, "B", false, None),
+        ];
+        assert_eq!(fold_tab_group(windows).len(), 2);
+    }
+
+    #[test]
+    fn fold_is_refused_when_more_windows_match_than_there_are_tabs() {
+        // 三个窗口都匹配上标签标题,但一个组最多两个后台标签 → 无法判定,全部保留。
+        let windows = vec![
+            window(50, "T", true, Some(&["A", "B", "C"])),
+            window(48, "A", true, None),
+            window(60, "B", true, None),
+            window(70, "C", true, None),
+        ];
+        assert_eq!(fold_tab_group(windows).len(), 4);
+    }
+
+    #[test]
+    fn same_title_windows_without_a_tab_bar_are_never_folded() {
+        // 没有标签栏就没有组:两个真实窗口必须都保留。
+        let windows = vec![
+            window(1, "Downloads", false, None),
+            window(2, "Downloads", false, None),
+        ];
+        assert_eq!(fold_tab_group(windows).len(), 2);
+    }
+
+    #[test]
+    fn duplicate_tab_titles_still_fold() {
+        // 两个标签同名(同一 cwd 的终端标签)也能各自占一个名额。
+        let windows = vec![
+            window(7, "~/code", true, Some(&["~/code", "~/code"])),
+            window(8, "~/code", true, None),
+        ];
+        let folded = fold_tab_group(windows);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].cgwid, 7);
     }
 }

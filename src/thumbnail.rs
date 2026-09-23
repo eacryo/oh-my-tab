@@ -11,7 +11,7 @@
 //!
 //! 6. 空白帧门控:WKWebView(Tauri/Electron 等)的页面由独立 WebContent 进程
 //!    渲染,窗口长时间后台后该进程被挂起、内容表面被 WindowServer 丢弃,截出来
-//!    只剩"标题栏(红绿灯)+纯色白屏"。此类帧按场景分流(AltTab 同策略):
+//!    只剩"标题栏(红绿灯)+纯色白屏"。此类帧按场景分流:
 //!    - 后台 + 缓存有帧:丢弃,保住最后一张有效帧(升级单向,避免回退)
 //!    - 后台 + 缓存为空:入缓存作为占位种子(好过图标卡;激活后自动升级)
 //!    - 前台:如实入缓存(用户眼前的真实画面)
@@ -45,8 +45,7 @@
 //! 6. blank-frame gating: WKWebView-based apps (Tauri/Electron et al.) render in a
 //!    separate WebContent process; once the window stays in the background that process
 //!    is suspended and WindowServer drops the content surface, so a capture degrades to
-//!    "title bar (traffic lights) + solid white". Such frames are routed by scenario
-//!    (AltTab's strategy):
+//!    "title bar (traffic lights) + solid white". Such frames are routed by scenario:
 //!    - background + cached frame: dropped, keeping the last-known-good image (the
 //!      upgrade to a real frame is one-way and never regresses)
 //!    - background + empty cache: stored as a placeholder seed (beats an icon card;

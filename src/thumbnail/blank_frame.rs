@@ -7,8 +7,8 @@ use super::*;
 // WKWebView(Tauri/Electron/wry 等)的页面由独立 WebContent 进程渲染;窗口长时间
 // 后台/被遮挡后 macOS 挂起该进程并丢弃 WindowServer 侧的内容表面,此时截窗口
 // 只剩宿主进程绘制的标题栏(红绿灯),内容区域退化为逐像素一致的纯色(通常白)。
-// macOS 没有任何公开 API 能强制别的进程重渲染,AltTab 的结论是唯一可行策略:
-// 前台时捕获 + 保留最后一张有效帧,避免被空白帧覆盖(alt-tab-macos WindowThumbnails.swift)。
+// macOS 没有任何公开 API 能强制别的进程重渲染,可行策略只有:
+// 前台时捕获 + 保留最后一张有效帧,避免被空白帧覆盖。
 // 本模块在缓存写入前对每帧做空白判定:
 // - 后台窗口 + 已有缓存帧:丢弃,保住最后一张有效帧(升级单向)
 // - 后台窗口 + 缓存为空:入缓存作为占位种子(之后前台补拍自动升级)
@@ -21,9 +21,9 @@ use super::*;
 // process; once the window stays backgrounded/occluded, macOS suspends it and drops
 // the WindowServer-side content surface, so captures degrade to the host-drawn
 // title bar (traffic lights) over a pixel-uniform solid body (usually white). No
-// public API can force another process to redraw; AltTab's proven answer is the
-// one adopted here: capture while frontmost and never let a blank frame overwrite
-// the last-known-good thumbnail (alt-tab-macos WindowThumbnails.swift). Before any
+// public API can force another process to redraw; the answer adopted here is to
+// capture while frontmost and never let a blank frame overwrite the
+// last-known-good thumbnail. Before any
 // cache write each frame is classified:
 // - background + cached frame: dropped, keeping the last-known-good image (one-way)
 // - background + empty cache: stored as a placeholder seed (frontmost captures
