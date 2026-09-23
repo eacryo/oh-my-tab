@@ -1,30 +1,28 @@
-//! 首次运行引导:一个独立小窗口,把"必需权限 / 可选权限 / 怎么用与常用开关"讲清楚。
+//! 首次运行引导:一个独立小窗口,分步说明权限、显示方式和更多功能。
 //!
 //! 为什么需要它:本应用是菜单栏应用(LSUIElement),新装用户打开后只看得到菜单栏图标,
 //! 缺辅助功能时再弹一个告警框——没人告诉他这个应用是干什么的、按哪个键、缺哪个权限。
 //!
 //! 设计要点:
-//! - **不阻塞**:只有辅助功能是必需的,其余步骤都可跳过;不改任何默认值。
-//! - **状态驱动**:每一步的内容由实时权限状态推导(已授权的步骤直接跳过),所以重开、
-//!   权限被撤销、老用户升级都不会落到错误的步骤上。
+//! - **不阻塞**:权限未授予时仍可继续;选项在点下一步后才应用。
+//! - **四步固定**:权限与开机自启、浮窗显示方式、剪贴板历史、更多功能入口。
 //! - **只自动出现一次**:自动展示时立即写 UserDefaults 标记;此后只能从菜单栏"欢迎使用"
 //!   或开发开关再次打开。缺权限的老情况仍由启动告警框兜底,不会因为标记而失联。
 //! - **可验证**:`--force-onboarding` 忽略标记;
 //!   `--onboarding=reset` 先清标记;`--fake-permissions=ax:0,sr:1`(仅 debug 构建)
 //!   伪造*展示用*权限状态,便于在不动 TCC 的前提下走完所有分支。
 //!
-//! First-run onboarding: a small standalone window covering the required permission, the
-//! optional one, and how to use the app plus the common switches.
+//! First-run onboarding: a small standalone window that walks through permissions and login,
+//! overlay display mode, and pointers to the other features.
 //!
 //! Why it exists: this is a menu-bar app (LSUIElement), so a fresh install shows nothing but the
 //! status item (and an alert when Accessibility is missing) and never explains what the app does,
 //! which key to press, or which permission it needs.
 //!
-//! Design: never blocking (only Accessibility is required, every other step can be skipped and no
-//! default changes); state-driven (each step's content comes from live permission state, so
-//! reopening, revoking a grant or upgrading cannot land on the wrong step); auto-shown once (the
-//! UserDefaults marker is written as soon as it appears, and the status item's "Welcome" entry or
-//! a development switch reopens it -- a missing permission stays covered by the startup alert);
+//! Design: never blocking (permissions can be deferred and selections apply on Next); four fixed
+//! steps; auto-shown once (the UserDefaults marker is written as soon as it appears, and the
+//! status item's "Welcome" entry or a development switch reopens it -- a missing permission stays
+//! covered by the startup alert);
 //! and verifiable (`--force-onboarding` ignores the marker,
 //! `--onboarding=reset` clears it first, and `--fake-permissions=ax:0,sr:1` -- debug
 //! builds only -- fakes the DISPLAYED permission state so every branch can be walked without
@@ -57,17 +55,19 @@ const FAKE_PERMISSIONS_FLAG: &str = "fake-permissions";
 
 /// 按钮 tag:窗口里所有按钮共用一个 selector,按 tag 分派。
 /// Button tags: every button in the window shares one selector and dispatches by tag.
-const ACTION_START: isize = 1;
 const ACTION_NEXT: isize = 2;
 const ACTION_OPEN_ACCESSIBILITY: isize = 3;
 const ACTION_RESTART_APP: isize = 4;
 const ACTION_ALLOW_SCREEN: isize = 5;
-const ACTION_SKIP_SCREEN: isize = 6;
 const ACTION_FINISH: isize = 7;
-const ACTION_LATER: isize = 8;
-const ACTION_TOGGLE_LAUNCH_AT_LOGIN: isize = 9;
-const ACTION_TOGGLE_CLIPBOARD: isize = 10;
-const ACTION_TOGGLE_WINDOW_CONTROL: isize = 11;
+const ACTION_SKIP_GUIDE: isize = 12;
+const ACTION_TOGGLE_LAUNCH_DRAFT: isize = 13;
+const ACTION_SELECT_ICONS: isize = 14;
+const ACTION_SELECT_THUMBNAILS: isize = 15;
+const ACTION_OPEN_SETTINGS: isize = 16;
+const ACTION_BACK: isize = 17;
+const ACTION_TOGGLE_CLIPBOARD_DRAFT: isize = 18;
+const ACTION_DISPLAY_MODE: isize = 19;
 
 // ========== 纯逻辑(单测覆盖)/ pure logic (unit-tested) ==========
 
@@ -103,33 +103,23 @@ pub(crate) fn parse_fake_permissions(spec: &str) -> PermissionOverride {
     over
 }
 
-/// 引导步骤。`Usage` 永远在最后,且是唯一不会被跳过的收尾页。
-/// One onboarding step. `Usage` is always last and is the one page that is never skipped.
+/// 固定的四步引导。
+/// The four fixed onboarding steps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Step {
-    Welcome,
-    Accessibility,
-    ScreenRecording,
-    Usage,
+    PermissionsAndStartup,
+    DisplayMode,
+    ClipboardHistory,
+    MoreFeatures,
 }
 
-/// 由实时状态推导步骤序列:已满足的权限步骤直接跳过,`always_welcome`(强制/手动打开)时
-/// 总是先给一页欢迎。
-/// Derives the step list from live state: satisfied permission steps are skipped, and
-/// `always_welcome` (forced or manually reopened) always starts with the welcome page.
-pub(crate) fn steps_for(ax_granted: bool, screen_granted: bool, always_welcome: bool) -> Vec<Step> {
-    let mut steps = Vec::new();
-    if always_welcome || !ax_granted {
-        steps.push(Step::Welcome);
-    }
-    if !ax_granted {
-        steps.push(Step::Accessibility);
-    }
-    if !screen_granted {
-        steps.push(Step::ScreenRecording);
-    }
-    steps.push(Step::Usage);
-    steps
+pub(crate) fn steps_for() -> [Step; 4] {
+    [
+        Step::PermissionsAndStartup,
+        Step::DisplayMode,
+        Step::ClipboardHistory,
+        Step::MoreFeatures,
+    ]
 }
 
 /// 是否该自动弹出。老用户(已授权 + 已有配置文件)静默跳过,避免升级后被引导打扰;
@@ -214,9 +204,12 @@ fn mark_completed() {
 
 #[derive(Clone)]
 struct UiState {
-    steps: Vec<Step>,
+    steps: [Step; 4],
     index: usize,
     overrides: PermissionOverride,
+    launch_at_login: bool,
+    thumbnails_enabled: bool,
+    clipboard_enabled: bool,
 }
 
 static WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -302,7 +295,7 @@ pub(crate) fn maybe_show_on_launch() -> bool {
     if !forced {
         mark_completed();
     }
-    show_internal(overrides, true);
+    show_internal(overrides);
     true
 }
 
@@ -310,19 +303,18 @@ pub(crate) fn maybe_show_on_launch() -> bool {
 /// Manual reopen (the settings window's About page entry): no marker reset, and no forced welcome
 /// page.
 pub(crate) fn show_manually() {
-    show_internal(fake_permissions(), false);
+    show_internal(fake_permissions());
 }
 
-fn show_internal(overrides: PermissionOverride, always_welcome: bool) {
-    let steps = steps_for(
-        override_ax(overrides),
-        override_screen(overrides),
-        always_welcome,
-    );
+fn show_internal(overrides: PermissionOverride) {
+    let config = CONFIG.read().unwrap().clone();
     let state = UiState {
-        steps,
+        steps: steps_for(),
         index: 0,
         overrides,
+        launch_at_login: config.startup.launch_at_login,
+        thumbnails_enabled: config.layout.thumbnails_enabled,
+        clipboard_enabled: config.clipboard.enabled,
     };
     let step_count = state.steps.len();
     *STATE.lock().unwrap() = Some(state);
@@ -332,9 +324,9 @@ fn show_internal(overrides: PermissionOverride, always_welcome: bool) {
     log_debug!("[onboarding] step 1/{} shown", step_count);
 }
 
-/// 1s tick:权限状态变化时重建当前步骤(用户去系统设置授权后不必手动刷新)。
-/// The 1s tick: rebuilds the current step when the permission state changed, so a grant made in
-/// System Settings shows up without any manual refresh.
+/// 1s tick:权限状态变化时重建当前页(用户去系统设置授权后不必手动刷新)。
+/// The 1s tick rebuilds the current page when permission state changes, so a grant made in System
+/// Settings appears without a manual refresh.
 pub(crate) fn tick() {
     let Some(state) = STATE.lock().unwrap().clone() else {
         return;
@@ -347,16 +339,13 @@ pub(crate) fn tick() {
     if *LAST_SIGNATURE.lock().unwrap() == Some(signature) {
         return;
     }
-    // 权限状态变了:按新状态重算步骤,尽量停在语义相同的一页上。
-    // The permission state changed: recompute the steps and stay on the semantically same page
-    // where possible.
+    // 步骤序列固定,保持当前页索引并刷新状态文案/屏幕录制提示。
+    // The step sequence is fixed; keep its current index and refresh permission messaging.
     let current = state.steps.get(state.index).copied();
-    let steps = steps_for(signature.0, signature.1, false);
     let index = current
-        .and_then(|step| steps.iter().position(|candidate| *candidate == step))
+        .and_then(|step| state.steps.iter().position(|candidate| *candidate == step))
         .unwrap_or(0);
     if let Some(state) = STATE.lock().unwrap().as_mut() {
-        state.steps = steps;
         state.index = index;
     }
     render_current_step();
@@ -498,26 +487,6 @@ unsafe fn add_button(
     release_obj(button);
 }
 
-/// 内容块垂直居中:标题/正文(/状态行)作为一个整体在"计数行"与"按钮行"之间居中,
-/// 这样每一步的留白一致,不会出现某页中间一大块空洞(或按钮被挤到窗口外)。
-/// Vertically centers the content block: title, body (and status line) sit as one block between
-/// the step counter and the button row, so every page has the same whitespace instead of a hole in
-/// the middle or buttons pushed outside the window.
-///
-/// 返回 (标题 y, 正文 y, 状态行 y);y 为底原点坐标系。
-/// Returns (title y, body y, status y) in the bottom-origin coordinate system.
-fn block_positions(body_h: f64, has_status: bool, bottom: f64) -> (f64, f64, f64) {
-    let counter_y = WINDOW_H - 30.0;
-    let status_h = if has_status { STATUS_H + 6.0 } else { 0.0 };
-    let block_h = TITLE_H + 8.0 + body_h + status_h;
-    let top = counter_y - 10.0;
-    let start = bottom + ((top - bottom) - block_h).max(0.0) / 2.0;
-    let status_y = start;
-    let body_y = status_y + status_h;
-    let title_y = body_y + body_h + 8.0;
-    (title_y, body_y, status_y)
-}
-
 fn render_current_step() {
     let Some(state) = STATE.lock().unwrap().clone() else {
         return;
@@ -559,11 +528,19 @@ fn render_current_step() {
             COUNTER_STYLE,
         );
         match step {
-            Step::Welcome => render_welcome(content),
-            Step::Accessibility => render_accessibility(content, ax_granted),
-            Step::ScreenRecording => render_screen_recording(content, screen_granted),
-            Step::Usage => render_usage(content),
+            Step::PermissionsAndStartup => render_permissions_and_startup(
+                content,
+                ax_granted,
+                crate::restart::restart_required(),
+                state.launch_at_login,
+            ),
+            Step::DisplayMode => {
+                render_display_mode(content, state.thumbnails_enabled, screen_granted)
+            }
+            Step::ClipboardHistory => render_clipboard_history(content, state.clipboard_enabled),
+            Step::MoreFeatures => render_more_features(content),
         }
+        render_footer(content, state.index);
     }
     *LAST_SIGNATURE.lock().unwrap() = Some(permission_signature(&state));
     // 窗口可能已被关闭:渲染后确保它在前台(accessory 应用要显式激活)。
@@ -578,59 +555,18 @@ fn render_current_step() {
     }
 }
 
-unsafe fn render_welcome(content: *mut AnyObject) {
+unsafe fn render_permissions_and_startup(
+    content: *mut AnyObject,
+    ax_granted: bool,
+    restart_required: bool,
+    launch_at_login: bool,
+) {
     let app = app_display_name();
-    let (title_y, body_y, _) = block_positions(WELCOME_BODY_H, false, BUTTON_Y + BUTTON_H + 18.0);
     add_label(
         content,
-        &tf("onboarding.welcome_title", &[("app", &app)]),
+        &t("onboarding.permissions_title"),
         PAD,
-        title_y,
-        WINDOW_W - PAD * 2.0,
-        TITLE_H,
-        TITLE_STYLE,
-    );
-    add_label(
-        content,
-        &tf(
-            "onboarding.welcome_body",
-            &[("app", &app), ("shortcut", &shortcut_label())],
-        ),
-        PAD,
-        body_y,
-        WINDOW_W - PAD * 2.0,
-        WELCOME_BODY_H,
-        BODY_STYLE,
-    );
-    add_button(
-        content,
-        &t("onboarding.btn_start"),
-        ACTION_START,
-        PAD,
-        BUTTON_Y,
-        BUTTON_W,
-        crate::settings::components::SettingsButtonRole::Primary,
-    );
-    add_button(
-        content,
-        &t("onboarding.btn_later"),
-        ACTION_LATER,
-        PAD + BUTTON_W + GAP,
-        BUTTON_Y,
-        BUTTON_W,
-        crate::settings::components::SettingsButtonRole::Action,
-    );
-}
-
-unsafe fn render_accessibility(content: *mut AnyObject, granted: bool) {
-    let app = app_display_name();
-    let (title_y, body_y, _) =
-        block_positions(ACCESSIBILITY_BODY_H, true, BUTTON_Y + BUTTON_H + 18.0);
-    add_label(
-        content,
-        &t("onboarding.accessibility_title"),
-        PAD,
-        title_y,
+        194.0,
         WINDOW_W - PAD * 2.0,
         TITLE_H,
         TITLE_STYLE,
@@ -642,235 +578,316 @@ unsafe fn render_accessibility(content: *mut AnyObject, granted: bool) {
             &[("app", &app), ("shortcut", &shortcut_label())],
         ),
         PAD,
-        body_y,
+        143.0,
         WINDOW_W - PAD * 2.0,
-        ACCESSIBILITY_BODY_H,
+        46.0,
         BODY_STYLE,
     );
-    let restart_required = crate::restart::restart_required();
-    let (_, _, status_y) = block_positions(ACCESSIBILITY_BODY_H, true, BUTTON_Y + BUTTON_H + 18.0);
     let (status_key, status_color) = if restart_required {
         ("onboarding.status_restart_required", STATUS_WARN)
-    } else if granted {
+    } else if ax_granted {
         ("onboarding.status_granted", STATUS_OK)
     } else {
         ("onboarding.status_missing", STATUS_WARN)
     };
     add_label(
         content,
-        &t(status_key),
+        &t("onboarding.accessibility_label"),
         PAD,
-        status_y,
-        WINDOW_W - PAD * 2.0,
+        105.0,
+        136.0,
+        STATUS_H,
+        status_style(SECONDARY_TEXT),
+    );
+    add_label(
+        content,
+        &t(status_key),
+        PAD + 136.0,
+        105.0,
+        190.0,
         STATUS_H,
         status_style(status_color),
     );
-    if granted && !restart_required {
+    if !ax_granted || restart_required {
+        let primary_action = if restart_required {
+            ACTION_RESTART_APP
+        } else {
+            ACTION_OPEN_ACCESSIBILITY
+        };
+        let primary_title = if restart_required {
+            tf("onboarding.btn_restart", &[("app", &app)])
+        } else {
+            t("onboarding.btn_open_settings")
+        };
         add_button(
             content,
-            &t("onboarding.btn_next"),
-            ACTION_NEXT,
-            PAD,
-            BUTTON_Y,
-            BUTTON_W,
-            crate::settings::components::SettingsButtonRole::Primary,
-        );
-    } else {
-        add_button(
-            content,
-            &t("onboarding.btn_open_settings"),
-            ACTION_OPEN_ACCESSIBILITY,
-            PAD,
-            BUTTON_Y,
-            BUTTON_W,
-            crate::settings::components::SettingsButtonRole::Primary,
-        );
-    }
-    // 未授权时也给一个「下一步」:用户可以先把后面的用法页读完再回来授权,不至于卡在这一页。
-    // A "Next" is offered while ungranted so the user can read the later pages first instead of
-    // being stuck here.
-    if !granted || restart_required {
-        add_button(
-            content,
-            &t("onboarding.btn_next"),
-            ACTION_NEXT,
-            PAD + BUTTON_W + GAP,
-            BUTTON_Y,
+            &primary_title,
+            primary_action,
+            WINDOW_W - PAD - BUTTON_W,
+            99.0,
             BUTTON_W,
             crate::settings::components::SettingsButtonRole::Action,
         );
     }
-    if restart_required {
-        add_button(
-            content,
-            &tf("onboarding.btn_restart", &[("app", &app)]),
-            ACTION_RESTART_APP,
-            PAD + (BUTTON_W + GAP) * 2.0,
-            BUTTON_Y,
-            BUTTON_W,
-            crate::settings::components::SettingsButtonRole::Action,
-        );
-    } else {
-        add_button(
-            content,
-            &t("onboarding.btn_later"),
-            ACTION_LATER,
-            PAD + (BUTTON_W + GAP) * 2.0,
-            BUTTON_Y,
-            BUTTON_W,
-            crate::settings::components::SettingsButtonRole::Action,
-        );
-    }
-}
-
-unsafe fn render_screen_recording(content: *mut AnyObject, granted: bool) {
-    let (title_y, body_y, status_y) =
-        block_positions(SCREEN_BODY_H, true, BUTTON_Y + BUTTON_H + 18.0);
     add_label(
         content,
-        &t("onboarding.screen_title"),
+        &t("onboarding.launch_label"),
         PAD,
-        title_y,
+        62.0,
+        WINDOW_W - PAD * 2.0 - 58.0,
+        28.0,
+        TITLE_STYLE,
+    );
+    add_switch(
+        content,
+        WINDOW_W - PAD,
+        59.0,
+        launch_at_login,
+        ACTION_TOGGLE_LAUNCH_DRAFT,
+    );
+}
+
+unsafe fn render_display_mode(
+    content: *mut AnyObject,
+    thumbnails_enabled: bool,
+    screen_granted: bool,
+) {
+    add_label(
+        content,
+        &t("onboarding.display_title"),
+        PAD,
+        194.0,
         WINDOW_W - PAD * 2.0,
         TITLE_H,
         TITLE_STYLE,
     );
     add_label(
         content,
-        &t("onboarding.screen_body"),
+        &t("onboarding.display_body"),
         PAD,
-        body_y,
+        151.0,
         WINDOW_W - PAD * 2.0,
-        SCREEN_BODY_H,
+        34.0,
         BODY_STYLE,
     );
-    let (status_key, status_color) = if granted {
-        ("onboarding.status_granted", STATUS_OK)
-    } else {
-        ("onboarding.status_missing", STATUS_WARN)
-    };
-    add_label(
-        content,
-        &t(status_key),
-        PAD,
-        status_y,
-        WINDOW_W - PAD * 2.0,
-        STATUS_H,
-        status_style(status_color),
-    );
-    if granted {
-        add_button(
+    add_display_mode_control(content, thumbnails_enabled);
+    let needs_screen_permission = thumbnails_enabled && !screen_granted;
+    if needs_screen_permission {
+        add_label(
             content,
-            &t("onboarding.btn_next"),
-            ACTION_NEXT,
+            &t("onboarding.screen_permission_needed"),
             PAD,
-            BUTTON_Y,
-            BUTTON_W,
-            crate::settings::components::SettingsButtonRole::Primary,
+            59.0,
+            WINDOW_W - PAD * 2.0 - BUTTON_W - GAP,
+            STATUS_H,
+            status_style(STATUS_WARN),
         );
-    } else {
         add_button(
             content,
-            &t("onboarding.btn_allow"),
+            &t("onboarding.btn_open_settings"),
             ACTION_ALLOW_SCREEN,
-            PAD,
-            BUTTON_Y,
-            BUTTON_W,
-            crate::settings::components::SettingsButtonRole::Primary,
-        );
-        add_button(
-            content,
-            &t("onboarding.btn_skip_screen"),
-            ACTION_SKIP_SCREEN,
-            PAD + BUTTON_W + GAP,
-            BUTTON_Y,
+            WINDOW_W - PAD - BUTTON_W,
+            55.0,
             BUTTON_W,
             crate::settings::components::SettingsButtonRole::Action,
         );
     }
+}
+
+unsafe fn render_clipboard_history(content: *mut AnyObject, enabled: bool) {
+    add_label(
+        content,
+        &t("onboarding.clipboard_title"),
+        PAD,
+        194.0,
+        WINDOW_W - PAD * 2.0,
+        TITLE_H,
+        TITLE_STYLE,
+    );
+    add_label(
+        content,
+        &t("onboarding.clipboard_body"),
+        PAD,
+        144.0,
+        WINDOW_W - PAD * 2.0,
+        48.0,
+        BODY_STYLE,
+    );
+    add_label(
+        content,
+        &t("onboarding.clipboard_label"),
+        PAD,
+        91.0,
+        WINDOW_W - PAD * 2.0 - 58.0,
+        28.0,
+        TITLE_STYLE,
+    );
+    add_switch(
+        content,
+        WINDOW_W - PAD,
+        88.0,
+        enabled,
+        ACTION_TOGGLE_CLIPBOARD_DRAFT,
+    );
+}
+
+unsafe fn render_more_features(content: *mut AnyObject) {
+    add_label(
+        content,
+        &t("onboarding.more_title"),
+        PAD,
+        194.0,
+        WINDOW_W - PAD * 2.0,
+        TITLE_H,
+        TITLE_STYLE,
+    );
+    add_label(
+        content,
+        &t("onboarding.more_body"),
+        PAD,
+        132.0,
+        WINDOW_W - PAD * 2.0,
+        46.0,
+        BODY_STYLE,
+    );
     add_button(
         content,
-        &t("onboarding.btn_later"),
-        ACTION_LATER,
-        PAD + (BUTTON_W + GAP) * 2.0,
-        BUTTON_Y,
+        &t("onboarding.btn_open_app_settings"),
+        ACTION_OPEN_SETTINGS,
+        PAD,
+        78.0,
         BUTTON_W,
         crate::settings::components::SettingsButtonRole::Action,
     );
 }
 
-unsafe fn render_usage(content: *mut AnyObject) {
-    let (title_y, body_y, _) = block_positions(USAGE_BODY_H, false, TOGGLE_Y + BUTTON_H + 14.0);
-    add_label(
-        content,
-        &t("onboarding.usage_title"),
-        PAD,
-        title_y,
-        WINDOW_W - PAD * 2.0,
-        TITLE_H,
-        TITLE_STYLE,
-    );
-    add_label(
-        content,
-        &tf("onboarding.usage_body", &[("shortcut", &shortcut_label())]),
-        PAD,
-        body_y,
-        WINDOW_W - PAD * 2.0,
-        USAGE_BODY_H,
-        BODY_STYLE,
-    );
-    let config = CONFIG.read().unwrap().clone();
-    let toggles: [(isize, bool, &str); 3] = [
-        (
-            ACTION_TOGGLE_LAUNCH_AT_LOGIN,
-            config.startup.launch_at_login,
-            "onboarding.opt_launch_at_login",
-        ),
-        (
-            ACTION_TOGGLE_CLIPBOARD,
-            config.clipboard.enabled,
-            "onboarding.opt_clipboard",
-        ),
-        (
-            ACTION_TOGGLE_WINDOW_CONTROL,
-            config.window_control.enabled,
-            "onboarding.opt_window_control",
-        ),
+unsafe fn add_display_mode_control(content: *mut AnyObject, thumbnails_enabled: bool) {
+    let control: *mut AnyObject = msg_send![class!(NSSegmentedControl), alloc];
+    let control: *mut AnyObject = msg_send![
+        control,
+        initWithFrame: NSRect::new(NSPoint::new(PAD, 96.0), NSSize::new(320.0, 34.0))
     ];
-    let mut x = PAD;
-    for (tag, on, key) in toggles {
-        let title = tf(
-            if on {
-                "onboarding.toggle_on"
-            } else {
-                "onboarding.toggle_off"
-            },
-            &[("label", &t(key))],
+    let _: () = msg_send![control, setSegmentCount: 2isize];
+    let icons = make_nsstring(&t("onboarding.display_icons"));
+    let thumbnails = make_nsstring(&t("onboarding.display_thumbnails"));
+    let _: () = msg_send![control, setLabel: icons, forSegment: 0isize];
+    let _: () = msg_send![control, setLabel: thumbnails, forSegment: 1isize];
+    release_obj(icons);
+    release_obj(thumbnails);
+    let _: () =
+        msg_send![control, setSelectedSegment: if thumbnails_enabled { 1isize } else { 0isize }];
+    let Some(target) = crate::CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+        release_obj(control);
+        return;
+    };
+    let _: () = msg_send![control, setTarget: target];
+    let _: () = msg_send![control, setAction: sel!(handleOnboardingAction:)];
+    ACTION_TAGS
+        .lock()
+        .unwrap()
+        .push((control as usize, ACTION_DISPLAY_MODE));
+    let label = make_nsstring(&t("onboarding.display_title"));
+    let _: () = msg_send![control, setAccessibilityLabel: label];
+    release_obj(label);
+    let _: () = msg_send![content, addSubview: control];
+    release_obj(control);
+}
+
+unsafe fn add_switch(
+    content: *mut AnyObject,
+    right_x: f64,
+    y: f64,
+    checked: bool,
+    action_tag: isize,
+) {
+    let switch = crate::settings::components::onboarding_switch(right_x, y, BUTTON_H, checked);
+    if switch.is_null() {
+        return;
+    }
+    let Some(target) = crate::CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+        release_obj(switch);
+        return;
+    };
+    let _: () = msg_send![switch, setTarget: target];
+    let _: () = msg_send![switch, setAction: sel!(handleOnboardingAction:)];
+    ACTION_TAGS
+        .lock()
+        .unwrap()
+        .push((switch as usize, action_tag));
+    let accessibility_label = make_nsstring(&t(if action_tag == ACTION_TOGGLE_LAUNCH_DRAFT {
+        "onboarding.launch_label"
+    } else {
+        "onboarding.clipboard_label"
+    }));
+    let _: () = msg_send![switch, setAccessibilityLabel: accessibility_label];
+    release_obj(accessibility_label);
+    let _: () = msg_send![content, addSubview: switch];
+    release_obj(switch);
+}
+
+unsafe fn render_footer(content: *mut AnyObject, index: usize) {
+    if index + 1 < steps_for().len() {
+        add_text_button(
+            content,
+            &t("onboarding.btn_skip_guide"),
+            ACTION_SKIP_GUIDE,
+            PAD,
         );
+    }
+    let next_x = WINDOW_W - PAD - BUTTON_W;
+    if index > 0 {
         add_button(
             content,
-            &title,
-            tag,
-            x,
-            TOGGLE_Y,
-            TOGGLE_W,
-            if on {
-                crate::settings::components::SettingsButtonRole::Primary
-            } else {
-                crate::settings::components::SettingsButtonRole::Compact
-            },
+            &t("onboarding.btn_previous"),
+            ACTION_BACK,
+            next_x - GAP - BUTTON_W,
+            BUTTON_Y,
+            BUTTON_W,
+            crate::settings::components::SettingsButtonRole::Action,
         );
-        x += TOGGLE_W + GAP;
     }
+    let (title, action) = if index + 1 == steps_for().len() {
+        (t("onboarding.btn_finish"), ACTION_FINISH)
+    } else {
+        (t("onboarding.btn_next"), ACTION_NEXT)
+    };
     add_button(
         content,
-        &t("onboarding.btn_finish"),
-        ACTION_FINISH,
-        PAD,
-        FINISH_Y,
+        &title,
+        action,
+        next_x,
+        BUTTON_Y,
         BUTTON_W,
         crate::settings::components::SettingsButtonRole::Primary,
     );
+}
+
+unsafe fn add_text_button(content: *mut AnyObject, title: &str, action_tag: isize, x: f64) {
+    let Some(target) = crate::CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+        return;
+    };
+    let button: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let button: *mut AnyObject = msg_send![
+        button,
+        initWithFrame: NSRect::new(NSPoint::new(x, BUTTON_Y + 2.0), NSSize::new(100.0, BUTTON_H - 4.0))
+    ];
+    let title_ns = make_nsstring(title);
+    let _: () = msg_send![button, setTitle: title_ns];
+    let _: () = msg_send![button, setAccessibilityLabel: title_ns];
+    release_obj(title_ns);
+    let _: () = msg_send![button, setButtonType: 0isize];
+    let _: () = msg_send![button, setBordered: false];
+    let _: () = msg_send![button, setContentTintColor: hex_to_ns_color(SECONDARY_TEXT)];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+    let _: () = msg_send![button, setFont: font];
+    let _: () = msg_send![button, setTarget: target];
+    let _: () = msg_send![button, setAction: sel!(handleOnboardingAction:)];
+    ACTION_TAGS
+        .lock()
+        .unwrap()
+        .push((button as usize, action_tag));
+    let _: () = msg_send![content, addSubview: button];
+    release_obj(button);
 }
 
 /// 应用显示名(CFBundleDisplayName → CFBundleName → 固定回退)。
@@ -923,6 +940,15 @@ pub(crate) extern "C" fn on_action(_self: *mut c_void, _cmd: Sel, sender: *mut A
             .find(|(pointer, _)| *pointer == key)
             .map(|(_, tag)| *tag)
             .unwrap_or(0);
+        if tag == ACTION_DISPLAY_MODE {
+            let selected: isize = unsafe { msg_send![sender, selectedSegment] };
+            handle_action(if selected == 1 {
+                ACTION_SELECT_THUMBNAILS
+            } else {
+                ACTION_SELECT_ICONS
+            });
+            return;
+        }
         handle_action(tag);
     });
 }
@@ -948,7 +974,8 @@ pub(crate) extern "C" fn on_tick(_self: *mut c_void, _cmd: Sel, _timer: *mut c_v
 
 pub(crate) fn handle_action(tag: isize) {
     match tag {
-        ACTION_START | ACTION_NEXT | ACTION_SKIP_SCREEN => advance(),
+        ACTION_NEXT => advance(),
+        ACTION_BACK => retreat(),
         ACTION_OPEN_ACCESSIBILITY => crate::open_privacy_accessibility(),
         ACTION_RESTART_APP => {
             let Some(target) = crate::CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
@@ -964,32 +991,52 @@ pub(crate) fn handle_action(tag: isize) {
             }
         }
         ACTION_ALLOW_SCREEN => crate::open_privacy_screen_recording(),
+        ACTION_TOGGLE_LAUNCH_DRAFT => {
+            if let Some(state) = STATE.lock().unwrap().as_mut() {
+                state.launch_at_login = !state.launch_at_login;
+            }
+            render_current_step();
+        }
+        ACTION_TOGGLE_CLIPBOARD_DRAFT => {
+            if let Some(state) = STATE.lock().unwrap().as_mut() {
+                state.clipboard_enabled = !state.clipboard_enabled;
+            }
+            render_current_step();
+        }
+        ACTION_SELECT_ICONS | ACTION_SELECT_THUMBNAILS => {
+            if let Some(state) = STATE.lock().unwrap().as_mut() {
+                state.thumbnails_enabled = tag == ACTION_SELECT_THUMBNAILS;
+            }
+            render_current_step();
+        }
+        ACTION_OPEN_SETTINGS => {
+            mark_completed();
+            hide();
+            crate::settings::show_settings_page(0);
+        }
         ACTION_FINISH => {
             mark_completed();
             log_debug!("[onboarding] finished");
             hide();
         }
-        ACTION_LATER => {
-            // 「以后再说」= 本次不再打扰,但也算看过(否则每次启动都弹,反而更像 bug)。
-            // "Later" dismisses for good: counting it as seen avoids nagging on every launch.
+        ACTION_SKIP_GUIDE => {
             mark_completed();
-            log_debug!("[onboarding] dismissed");
+            log_debug!("[onboarding] skipped");
             hide();
-        }
-        ACTION_TOGGLE_LAUNCH_AT_LOGIN => {
-            toggle_config(|cfg| cfg.startup.launch_at_login = !cfg.startup.launch_at_login)
-        }
-        ACTION_TOGGLE_CLIPBOARD => {
-            toggle_config(|cfg| cfg.clipboard.enabled = !cfg.clipboard.enabled)
-        }
-        ACTION_TOGGLE_WINDOW_CONTROL => {
-            toggle_config(|cfg| cfg.window_control.enabled = !cfg.window_control.enabled)
         }
         _ => {}
     }
 }
 
 fn advance() {
+    let current_step = {
+        let slot = STATE.lock().unwrap();
+        let Some(state) = slot.as_ref() else {
+            return;
+        };
+        state.steps[state.index]
+    };
+    commit_step_selection(current_step);
     {
         let mut slot = STATE.lock().unwrap();
         let Some(state) = slot.as_mut() else {
@@ -1003,25 +1050,54 @@ fn advance() {
     render_current_step();
 }
 
-/// 就地改一个配置字段:沿用设置窗口的路径(写 CONFIG → apply_config_change → 防抖落盘),
-/// 这样开机自启同步、模块热切换等副作用与设置页完全一致。
-/// Mutates one config field through the settings window's path (write CONFIG →
-/// apply_config_change → debounced persist) so side effects such as the launch-at-login sync and
-/// module hot-switching match the settings page exactly.
-fn toggle_config(mutate: impl FnOnce(&mut Config)) {
+fn retreat() {
+    let mut slot = STATE.lock().unwrap();
+    let Some(state) = slot.as_mut() else {
+        return;
+    };
+    if state.index == 0 {
+        return;
+    }
+    state.index -= 1;
+    drop(slot);
+    render_current_step();
+}
+
+fn commit_step_selection(step: Step) {
+    let Some(state) = STATE.lock().unwrap().clone() else {
+        return;
+    };
     let old = CONFIG.read().unwrap().clone();
+    let new = config_with_step_selection(&old, &state, step);
+    if new != old {
+        apply_config(&old, &new);
+    }
+}
+
+fn config_with_step_selection(old: &Config, state: &UiState, step: Step) -> Config {
     let mut new = old.clone();
-    mutate(&mut new);
+    match step {
+        Step::PermissionsAndStartup => new.startup.launch_at_login = state.launch_at_login,
+        Step::DisplayMode => new.layout.thumbnails_enabled = state.thumbnails_enabled,
+        Step::ClipboardHistory => new.clipboard.enabled = state.clipboard_enabled,
+        Step::MoreFeatures => {}
+    }
+    new
+}
+
+/// 将已确认的引导选择沿用设置窗口的更新路径,使运行时副作用和持久化与设置页一致。
+/// Apply a confirmed onboarding choice through the settings update path so runtime effects and
+/// persistence match the Settings page.
+fn apply_config(old: &Config, new: &Config) {
     if let Ok(mut slot) = CONFIG.write() {
         *slot = new.clone();
     }
     crate::runtime_config::apply_config_change(
-        &old,
-        &new,
+        old,
+        new,
         crate::runtime_config::ConfigChangeSource::Settings,
     );
     schedule_config_persist();
-    render_current_step();
 }
 
 // ========== 定时器 / timer ==========
@@ -1056,19 +1132,14 @@ fn stop_tick_timer() {
 // ========== 布局常量 / layout constants ==========
 
 const WINDOW_W: f64 = 520.0;
-const WINDOW_H: f64 = 250.0;
+const WINDOW_H: f64 = 280.0;
 const TITLE_H: f64 = 24.0;
 const WINDOW_STYLE_TITLED: u64 = 1;
 const PAD: f64 = 24.0;
 const GAP: f64 = 10.0;
 const BUTTON_H: f64 = 32.0;
 const BUTTON_W: f64 = 132.0;
-const TOGGLE_W: f64 = 148.0;
 const BUTTON_Y: f64 = 20.0;
-/// 收尾页两行按钮:开关行在上,「完成」在下。
-/// The last page stacks two button rows: the switches above, "Done" below.
-const TOGGLE_Y: f64 = 58.0;
-const FINISH_Y: f64 = 18.0;
 /// 引导窗口里只用到三档文本样式 + 一档状态行样式,收成常量避免每次调用重复传参。
 /// The guide only needs three text styles plus one status-line style, kept as constants so each
 /// call site does not repeat the parameters.
@@ -1108,10 +1179,6 @@ fn status_style(color: u32) -> LabelStyle {
 
 /// 正文高度:调用方按该页文案的行数给(中文最长的那一页决定值)。
 /// Body heights, chosen per page from its line count (the longest Chinese page sets the value).
-const WELCOME_BODY_H: f64 = 54.0;
-const ACCESSIBILITY_BODY_H: f64 = 62.0;
-const SCREEN_BODY_H: f64 = 62.0;
-const USAGE_BODY_H: f64 = 72.0;
 const STATUS_H: f64 = 20.0;
 
 const PRIMARY_TEXT: u32 = 0x1D1D1FFF;
@@ -1122,6 +1189,17 @@ const STATUS_WARN: u32 = 0xC2410CFF;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_button_tint_selector_is_supported_by_nsbutton() {
+        let supported: bool = unsafe {
+            msg_send![class!(NSButton), instancesRespondToSelector: sel!(setContentTintColor:)]
+        };
+        assert!(
+            supported,
+            "NSButton must support the onboarding text button tint API"
+        );
+    }
 
     #[test]
     fn fake_permission_spec_parses_known_keys_and_ignores_junk() {
@@ -1138,29 +1216,58 @@ mod tests {
     }
 
     #[test]
-    fn steps_skip_satisfied_permissions_and_always_end_with_usage() {
-        // 全缺:欢迎 → 辅助功能 → 屏幕录制 → 使用说明。
+    fn onboarding_always_has_the_four_setup_steps() {
         assert_eq!(
-            steps_for(false, false, false),
-            vec![
-                Step::Welcome,
-                Step::Accessibility,
-                Step::ScreenRecording,
-                Step::Usage
+            steps_for(),
+            [
+                Step::PermissionsAndStartup,
+                Step::DisplayMode,
+                Step::ClipboardHistory,
+                Step::MoreFeatures
             ]
         );
-        // 辅助功能已授权:直接进屏幕录制(不再讲必需权限)。
+    }
+
+    #[test]
+    fn onboarding_draft_settings_commit_only_for_their_step() {
+        let old = Config::default();
+        let draft = UiState {
+            steps: steps_for(),
+            index: 0,
+            overrides: PermissionOverride::default(),
+            launch_at_login: true,
+            thumbnails_enabled: false,
+            clipboard_enabled: true,
+        };
+
+        let after_permissions =
+            config_with_step_selection(&old, &draft, Step::PermissionsAndStartup);
+        assert!(after_permissions.startup.launch_at_login);
         assert_eq!(
-            steps_for(true, false, false),
-            vec![Step::ScreenRecording, Step::Usage]
+            after_permissions.layout.thumbnails_enabled,
+            old.layout.thumbnails_enabled
         );
-        // 都已授权:只剩收尾页。
-        assert_eq!(steps_for(true, true, false), vec![Step::Usage]);
-        // 强制/手动打开:总先给欢迎页,但已满足的权限步骤仍然跳过。
+
+        let after_display = config_with_step_selection(&old, &draft, Step::DisplayMode);
+        assert!(!after_display.layout.thumbnails_enabled);
         assert_eq!(
-            steps_for(true, true, true),
-            vec![Step::Welcome, Step::Usage]
+            after_display.startup.launch_at_login,
+            old.startup.launch_at_login
         );
+
+        let after_clipboard = config_with_step_selection(&old, &draft, Step::ClipboardHistory);
+        assert!(after_clipboard.clipboard.enabled);
+        assert_eq!(
+            after_clipboard.startup.launch_at_login,
+            old.startup.launch_at_login
+        );
+        assert_eq!(
+            after_clipboard.layout.thumbnails_enabled,
+            old.layout.thumbnails_enabled
+        );
+
+        let after_more = config_with_step_selection(&old, &draft, Step::MoreFeatures);
+        assert_eq!(after_more, old);
     }
 
     #[test]

@@ -45,6 +45,17 @@ pub(crate) unsafe fn row_action_button(
     )
 }
 
+/// Build the shared custom switch for the onboarding flow.
+/// 为首次运行引导复用设置页的自绘开关。
+pub(crate) unsafe fn onboarding_switch(
+    right_x: f64,
+    y: f64,
+    h: f64,
+    checked: bool,
+) -> *mut AnyObject {
+    widgets::make_switch(right_x, y, h, checked)
+}
+
 /// Right-hand read-only readout of a slider row: its width, the gap before it, and its own
 /// height. The readout hugs the slider's right end and is vertically centred on it, so a slider
 /// in such a row takes the control column's width minus the first two.
