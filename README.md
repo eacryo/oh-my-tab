@@ -100,6 +100,8 @@ With **"Delete entry after paste"** enabled, Option+Enter or Option+click pastes
 
 **Some application windows may be unavailable to thumbnail capture**: Certain applications mark editor or other protected windows as non-shareable, or render their content on a protected surface. The window remains switchable, but its thumbnail may stay on the placeholder or last valid frame.
 
+**Windows that snap to a content grid keep a thin strip after maximizing**: an app that rounds its window size to whole content units cannot fill the visible area exactly, so a strip about one unit tall (one text row for terminals) stays on one edge. Terminal is the common example. This is the app's own maximize result -- the green button, Option+clicking it, and double-clicking the title bar all leave the same strip, and neither a slightly larger size request nor the system's window tiling changes it. Apps that do not snap to a grid (Finder, browsers, editors, and most others) maximize exactly.
+
 If windows are already open when the app starts, their initial ordering is seeded from WindowServer's front-to-back order. This provides an initial approximation; live activation events refine the window-level MRU after launch.
 
 

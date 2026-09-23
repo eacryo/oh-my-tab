@@ -968,6 +968,12 @@ extern "C" fn on_display_move_retry(_self: *mut c_void, _cmd: Sel, arg: *mut c_v
     });
 }
 
+/// 动画型 App 的 snap 延迟收尾入口(动画结束后补写尺寸)。
+/// Main-thread entry for the deferred snap settle (write the size after the app's animation).
+extern "C" fn on_snap_verify(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
+    callback_guard::void("on_snap_verify", || window_management::on_snap_verify(arg));
+}
+
 /// 主线程:执行快捷操作(bridge 投递过来的动作编号)。
 /// Main thread: run one quick action (an action id delivered by the bridge).
 extern "C" fn on_quick_action(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
@@ -1418,6 +1424,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleDisplayMoveRetry:),
             on_display_move_retry as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleSnapVerify:),
+            on_snap_verify as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(

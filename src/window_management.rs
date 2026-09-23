@@ -307,6 +307,19 @@ fn fills_visible(a: AxRect, v: AxRect) -> bool {
         && ((a.y + a.h) - (v.y + v.h)).abs() <= SNAP_EPSILON
 }
 
+/// snap 写入的验收规则:最大化按"铺满可视区",其余按网格容差。收尾复核用同一套,避免两处口径漂移。
+/// Acceptance for a snap write: "fills the visible area" for maximize, grid tolerance otherwise.
+/// The follow-up re-check uses the same predicate so the two never drift apart.
+fn snap_accepts(target: AxRect, maximized: bool) -> impl Fn(AxRect) -> bool {
+    move |a| {
+        if maximized {
+            fills_visible(a, target)
+        } else {
+            rect_close_with(a, target, SNAP_EPSILON)
+        }
+    }
+}
+
 /// 按当前 frame 推断 snap 状态;都不匹配即普通窗口(纯函数,单测覆盖)。
 /// Infer the snap state from the current frame; no match means normal (pure; unit-tested).
 pub(crate) fn infer_state(frame: AxRect, visible: AxRect) -> SnapState {
@@ -792,6 +805,400 @@ pub(crate) fn on_display_move_retry(arg: *mut c_void) {
     }
 }
 
+// ========== 动画型 App 的延迟收尾 / deferred settle for animating apps ==========
+// 有的 App 把 frame 变更做成动画(实测 Ghostty/访达/PeachPic 缓动 ≈250ms,Telegram/Edge/
+// ChatGPT/RustRover 则一帧到位)。动画期间 AX setter 照样报成功,但尺寸会按**旧原点**被夹到
+// 屏幕内(宽度恰好是 screen_w - x),位置变更被丢掉——窗口只变高、不归位。
+// 因此"回读不一致"不等于"写入被拒",只有真正报错或窗口完全没动才动缩放按钮;
+// 其余先在动画结束前把位置重写回去,再把尺寸写延迟到动画之后。
+//
+// Some apps animate frame changes (measured ~250ms on Ghostty/Finder/PeachPic; Telegram/Edge/
+// ChatGPT/RustRover land in a single frame). During that animation the AX setters still report
+// success, but the size is clamped against the **old** origin (width lands on screen_w - x) and the
+// position change is dropped, so the window only grows taller and never re-homes. A read-back
+// mismatch therefore does not mean "the write was rejected": only a real error, or a window that
+// did not move at all, justifies the zoom-button fallback. Everything else re-sends the position
+// and postpones the size write until the animation has settled.
+
+/// 一次 frame 写入的结果。
+/// The result of one frame write.
+#[derive(Clone, Copy)]
+struct SnapWrite {
+    /// 写入前的 frame(读不到为 None)。
+    /// Frame before the write (None when unreadable).
+    before: Option<AxRect>,
+    /// 写入后的回读 frame(读不到为 None)。
+    /// Frame read back after the write (None when unreadable).
+    actual: Option<AxRect>,
+    /// 是否至少有一条 AX 写返回非 0(AXValueCreate 失败也算)。
+    /// Whether any AX write returned non-zero (an AXValueCreate failure counts).
+    errored: bool,
+}
+
+impl SnapWrite {
+    fn matched(&self, accept: impl Fn(AxRect) -> bool) -> bool {
+        self.actual.is_some_and(accept)
+    }
+
+    /// 窗口相对写入前有没有任何变化。回读读不到时按"动过"处理:宁可什么也不做,也不要按那个
+    /// toggle 式的缩放按钮。
+    /// Whether the window changed at all. An unreadable frame counts as "moved": doing nothing is
+    /// preferable to pressing the toggle-style zoom button.
+    fn moved(&self) -> bool {
+        match (self.before, self.actual) {
+            (Some(b), Some(a)) => !rect_close(b, a),
+            _ => true,
+        }
+    }
+}
+
+/// 一次 snap 写入之后的收尾动作(纯函数,单测覆盖)。
+/// What to do after a snap write (pure; unit-tested).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SnapFollowUp {
+    /// 已命中目标。
+    /// The target was reached.
+    Done,
+    /// App 把变更做成了动画:位置重写回去,尺寸写入延迟到动画结束。
+    /// The app animates the change: re-send the position and postpone the size write.
+    RetryAfterSettle,
+    /// 写入被明确拒绝("接受 AXPosition 却拒绝 AXSize")或窗口完全没动:换 App 自己的缩放收尾。
+    /// The write was explicitly rejected ("accepts AXPosition but rejects AXSize") or the window
+    /// did not move at all: finish with the app's own zoom action.
+    ZoomFallback,
+    /// 动过但只肯走到这里(网格吸附很宽之类):接受 App 的结果,不要再按 toggle。
+    /// It moved but goes no further (a wide grid snap, say): accept the app's result, never press
+    /// the toggle.
+    GiveUp,
+}
+
+fn snap_follow_up(
+    matched: bool,
+    errored: bool,
+    untouched: bool,
+    settled_retry: bool,
+) -> SnapFollowUp {
+    if matched {
+        return SnapFollowUp::Done;
+    }
+    if errored || untouched {
+        return SnapFollowUp::ZoomFallback;
+    }
+    if settled_retry {
+        return SnapFollowUp::GiveUp;
+    }
+    SnapFollowUp::RetryAfterSettle
+}
+
+/// 延迟收尾的阶段。实测顺序很讲究:位置写会启动 App 的缓动,缓动期间写尺寸会被顶掉;
+/// 而尺寸刚写完就立刻写位置,尺寸又会被回退。所以必须是**位置 → 等停 → 尺寸**,且两段都要
+/// 等缓动真正停下。
+/// Phases of the deferred settle. Measured order matters: a position write starts the app's
+/// animation and a size write during it is overridden, while a position write issued right after a
+/// size write reverts the size. So the sequence must be **position -> wait -> size**, each waiting
+/// for the animation to actually stop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapPhase {
+    /// 等首次写入留下的状态稳定下来,然后补写位置。
+    /// Wait for the state left by the first attempt to settle, then re-send the position.
+    Settle,
+    /// 位置已补写,等它停下再补尺寸。
+    /// The position was re-sent; wait for it to stop, then write the size.
+    Moved,
+    /// 尺寸已补写,再等它稳定后收尾。
+    /// The size was re-sent; wait for it to settle, then finish.
+    Resized,
+}
+
+/// 一次待收尾的 snap 写入。固定延时不够用:实测同一台机器上缓动从 ~250ms 到 ~600ms 都出现过,
+/// 所以改成"轮询到 frame 不再变化"再推进下一步。
+/// A pending snap finish. A fixed delay is not enough -- measured animations ranged from ~250ms to
+/// ~600ms on the same machine -- so this polls until the frame stops changing before advancing.
+#[derive(Clone, Copy)]
+struct PendingSnap {
+    token: u64,
+    pid: i32,
+    cgwid: u32,
+    target: AxRect,
+    /// 目标是"铺满可视区"还是普通 snap 目标。
+    /// Whether the target is the full visible area or an ordinary snap target.
+    maximized: bool,
+    /// 正在逼近的状态:动画期间用它回答状态查询,免得读到中间 frame 误判。
+    /// The state being approached; answers state queries during the animation so a mid-animation
+    /// frame cannot be misread.
+    state: SnapState,
+    /// 首次写入前的 frame("窗口是否完全没动"用的基准)。
+    /// The frame before the first attempt (the baseline for "did the window move at all").
+    before: Option<AxRect>,
+    /// 上一次回读的 frame。
+    /// The previously read frame.
+    last: Option<AxRect>,
+    /// 连续多少次回读一致(≥2 才算缓动停下)。
+    /// How many consecutive read-backs agreed (>=2 counts as settled).
+    stable_rounds: u8,
+    phase: SnapPhase,
+    /// 已轮询的轮数(上限防死循环)。
+    /// Poll rounds so far (bounded against an endless loop).
+    waits: u8,
+    created_at: Instant,
+}
+
+static PENDING_SNAP: LazyLock<Mutex<Option<PendingSnap>>> = LazyLock::new(|| Mutex::new(None));
+static NEXT_SNAP_TOKEN: AtomicU64 = AtomicU64::new(1);
+const SNAP_POLL_DELAY: f64 = 0.12;
+/// 连续两次回读一致才算停下。
+/// Two consecutive matching read-backs count as settled.
+const SNAP_STABLE_ROUNDS: u8 = 2;
+/// ≈2s:足够覆盖实测最长的缓动加上两段等待,又不至于长时间握着过期任务。
+/// ~2s: covers the longest measured animation plus two waits without holding a stale job for long.
+const SNAP_MAX_WAITS: u8 = 17;
+const SNAP_PENDING_TTL: std::time::Duration = std::time::Duration::from_millis(2100);
+
+/// 动画未决期间这个窗口应该被当成哪个状态(与 `pending_display_state` 同一思路)。
+/// Which state the window should be treated as while the animation is pending (same idea as
+/// `pending_display_state`).
+fn pending_snap_state(pid: i32, cgwid: Option<u32>) -> Option<SnapState> {
+    let cgwid = cgwid?;
+    let job = PENDING_SNAP.lock().unwrap().as_ref().copied()?;
+    if job.pid != pid || job.cgwid != cgwid || job.created_at.elapsed() > SNAP_PENDING_TTL {
+        return None;
+    }
+    Some(job.state)
+}
+
+fn cancel_pending_snap(pid: i32, cgwid: Option<u32>) {
+    let Some(cgwid) = cgwid else {
+        return;
+    };
+    let mut pending = PENDING_SNAP.lock().unwrap();
+    if pending
+        .as_ref()
+        .is_some_and(|job| job.pid == pid && job.cgwid == cgwid)
+    {
+        *pending = None;
+    }
+}
+
+fn clear_pending_snap(token: u64) {
+    let mut pending = PENDING_SNAP.lock().unwrap();
+    if pending.as_ref().is_some_and(|job| job.token == token) {
+        *pending = None;
+    }
+}
+
+fn schedule_snap_verify(token: u64, delay: f64) {
+    let Some(ctrl) = crate::CONTROLLER.lock().unwrap().map(|target| target.0) else {
+        clear_pending_snap(token);
+        return;
+    };
+    unsafe {
+        let token: *mut AnyObject = msg_send![
+            class!(NSNumber),
+            numberWithUnsignedLongLong: token
+        ];
+        let _: () = msg_send![
+            ctrl,
+            performSelector: sel!(handleSnapVerify:),
+            withObject: token,
+            afterDelay: delay
+        ];
+    }
+}
+
+/// 安排一次延迟收尾:位置重写已经发出(它在缓动里会被顶掉,但能让窗口立刻朝目标移动),
+/// 之后轮询到 frame 不再变化再补写尺寸。
+/// Arm a deferred finish: the position has already been re-sent (the animation overrides it, but
+/// the window starts heading for the target), then poll until the frame stops changing before
+/// writing the size.
+fn arm_pending_snap(
+    pid: i32,
+    cgwid: u32,
+    target: AxRect,
+    maximized: bool,
+    state: SnapState,
+    before: Option<AxRect>,
+    last: Option<AxRect>,
+) {
+    let token = NEXT_SNAP_TOKEN.fetch_add(1, Ordering::Relaxed);
+    *PENDING_SNAP.lock().unwrap() = Some(PendingSnap {
+        token,
+        pid,
+        cgwid,
+        target,
+        maximized,
+        state,
+        before,
+        last,
+        stable_rounds: 0,
+        phase: SnapPhase::Settle,
+        waits: 0,
+        created_at: Instant::now(),
+    });
+    schedule_snap_verify(token, SNAP_POLL_DELAY);
+}
+
+/// 延迟收尾:轮询到缓动停下 → 补写尺寸 → 再轮询确认。只在主线程执行。
+/// Deferred settle: poll until the animation stops, write the size, then poll once more to confirm.
+/// Main thread only.
+pub(crate) fn on_snap_verify(arg: *mut c_void) {
+    if arg.is_null() {
+        return;
+    }
+    let token: u64 = unsafe { msg_send![arg as *mut AnyObject, unsignedLongLongValue] };
+    let Some(job) = PENDING_SNAP.lock().unwrap().as_ref().copied() else {
+        return;
+    };
+    if job.token != token {
+        return;
+    }
+
+    unsafe {
+        let app = AXUIElementCreateApplication(job.pid);
+        if app.is_null() {
+            clear_pending_snap(token);
+            return;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.3);
+        let win = copy_attribute(app, K_AX_FOCUSED_WINDOW);
+        CFRelease(app);
+        let Some(win) = win else {
+            clear_pending_snap(token);
+            return;
+        };
+        let same_window = ax_window_cgwid(win) == Some(job.cgwid);
+        let is_fullscreen = copy_string(win, K_AX_SUBROLE)
+            .is_some_and(|subrole| subrole == K_AX_SUBROLE_FULL_SCREEN);
+        if !same_window || is_fullscreen {
+            log_debug!(
+                "[winctl] snap settle cancelled: token={} same_window={} fullscreen={}",
+                token,
+                same_window,
+                is_fullscreen
+            );
+            CFRelease(win);
+            clear_pending_snap(token);
+            return;
+        }
+
+        let actual = read_frame(win);
+        if actual.is_some_and(snap_accepts(job.target, job.maximized)) {
+            log_debug!(
+                "[winctl] snap settled: token={} waits={} frame={:?}",
+                token,
+                job.waits,
+                actual
+            );
+            CFRelease(win);
+            clear_pending_snap(token);
+            return;
+        }
+        // 缓动停下的判据:连续 SNAP_STABLE_ROUNDS 次回读一致(只看一次不够:缓动刚开始时
+        // 连着两次读到同一个值很正常)。
+        // Settled when SNAP_STABLE_ROUNDS consecutive read-backs agree; one is not enough, because
+        // right before an animation starts two reads can match.
+        let mut next = job;
+        next.last = actual;
+        next.waits = job.waits.saturating_add(1);
+        next.stable_rounds = if matches!((job.last, actual), (Some(l), Some(a)) if rect_close(l, a))
+        {
+            job.stable_rounds.saturating_add(1)
+        } else {
+            0
+        };
+        let settled = next.stable_rounds >= SNAP_STABLE_ROUNDS;
+        let sz = CgSize {
+            w: job.target.w,
+            h: job.target.h,
+        };
+        let pt = CgPoint {
+            x: job.target.x,
+            y: job.target.y,
+        };
+        match job.phase {
+            SnapPhase::Settle if settled => {
+                // 先位置:启动 App 的缓动。
+                // Position first: it is what starts the app's animation.
+                let err = set_ax_value(
+                    win,
+                    K_AX_POSITION,
+                    K_AX_VALUE_CG_POINT,
+                    &pt as *const CgPoint as *const c_void,
+                );
+                log_debug!(
+                    "[winctl] snap follow-up position: token={} waits={} target={:?} err={}",
+                    token,
+                    next.waits,
+                    job.target,
+                    err
+                );
+                next.phase = SnapPhase::Moved;
+                next.last = None;
+                next.stable_rounds = 0;
+            }
+            SnapPhase::Moved if settled => {
+                // 缓动停下后再写尺寸,此时才不会被顶掉。
+                // Only once the move has settled does the size write stick.
+                let err = set_ax_value(
+                    win,
+                    K_AX_SIZE,
+                    K_AX_VALUE_CG_SIZE,
+                    &sz as *const CgSize as *const c_void,
+                );
+                log_debug!(
+                    "[winctl] snap follow-up size: token={} waits={} target={:?} err={}",
+                    token,
+                    next.waits,
+                    job.target,
+                    err
+                );
+                next.phase = SnapPhase::Resized;
+                next.last = None;
+                next.stable_rounds = 0;
+            }
+            SnapPhase::Resized if settled => {
+                log_debug!(
+                    "[winctl] snap follow-up done: token={} waits={} frame={:?}",
+                    token,
+                    next.waits,
+                    actual
+                );
+                CFRelease(win);
+                clear_pending_snap(token);
+                return;
+            }
+            _ => {}
+        }
+        if next.waits >= SNAP_MAX_WAITS {
+            // 收尾到底:基准是首次写入前的 frame——只要中途动过就说明 App 尽力了,
+            // 不要再按那个 toggle 式的缩放按钮。
+            // Give up gracefully: the baseline is the frame before the first attempt, and any
+            // movement means the app did what it could, so the toggle must not be pressed.
+            let untouched = match (job.before, actual) {
+                (Some(b), Some(a)) => rect_close(b, a),
+                _ => false,
+            };
+            if snap_follow_up(false, false, untouched, true) == SnapFollowUp::ZoomFallback {
+                log_debug!("[winctl] snap settle rejected; trying native zoom fallback");
+                if !press_native_zoom(win) {
+                    log_info!("[winctl] native zoom fallback unavailable");
+                }
+            }
+            log_debug!(
+                "[winctl] snap follow-up abandoned: token={} waits={} frame={:?}",
+                token,
+                next.waits,
+                actual
+            );
+            CFRelease(win);
+            clear_pending_snap(token);
+            return;
+        }
+        *PENDING_SNAP.lock().unwrap() = Some(next);
+        CFRelease(win);
+        schedule_snap_verify(token, SNAP_POLL_DELAY);
+    }
+}
+
 /// 主线程:执行一次窗口控制(bridge 投递过来的方向)。
 /// Main thread: run one window-control step (a direction delivered by the bridge).
 pub(crate) fn apply_direction(dir: Direction) {
@@ -834,7 +1241,12 @@ pub(crate) fn apply_direction(dir: Direction) {
             }
         }
         let cgwid = ax_window_cgwid(win);
+        // 动画未决期间按目标状态作答:此时 frame 还在缓动,直接推断会误判(见 pending_snap_state)。
+        // While a snap animation is pending, answer with the target state: the frame is still easing
+        // and inferring from it would misread the window (see pending_snap_state).
+        let pending_state = pending_snap_state(pid, cgwid);
         cancel_pending_display_move(pid, cgwid);
+        cancel_pending_snap(pid, cgwid);
         let Some(frame) = read_frame(win) else {
             log_debug!("[winctl] failed to read window frame");
             CFRelease(win);
@@ -849,6 +1261,8 @@ pub(crate) fn apply_direction(dir: Direction) {
         let cur_screen = screen_index_for(frame, &screens);
         let state = if minimized {
             SnapState::Minimized
+        } else if let Some(pending) = pending_state {
+            pending
         } else {
             infer_state(frame, screens[cur_screen].visible)
         };
@@ -862,6 +1276,13 @@ pub(crate) fn apply_direction(dir: Direction) {
             other => other,
         };
         let p = plan(effective, dir, cur_screen, &screens);
+        // 本次动作要抵达的状态:目标矩形本身就是某个 snap 目标,回推即可。延迟收尾期间用它作答。
+        // The state this action heads for: the target rect is itself a snap target, so inferring
+        // from it is exact. The deferred finish reports it while the animation is pending.
+        let desired = match p {
+            Plan::Move(r) | Plan::Maximize(r) => infer_state(r, screens[cur_screen].visible),
+            _ => effective,
+        };
         // 诊断:方向、前台 pid、推断状态与最终计划(dev 日志,便于排查个别 App 拒写)。
         // Diagnostics: direction, front pid, inferred state and the final plan (debug log;
         // helps triage per-app write refusals).
@@ -875,7 +1296,7 @@ pub(crate) fn apply_direction(dir: Direction) {
             effective,
             p
         );
-        execute(p, win, dir);
+        execute(p, win, pid, desired, dir);
         CFRelease(win);
     }
 }
@@ -1069,12 +1490,14 @@ pub(crate) fn maximize_focused_window_of_pid(pid: i32) -> bool {
                 let cur = screen_index_for(frame, &screens);
                 if infer_state(frame, screens[cur].visible) != SnapState::Maximized {
                     let target = snap_frames(screens[cur].visible).max;
-                    if !set_frame_maximized(win, target) {
-                        // AX 精确写被拒时退回原生缩放动作(与窗口控制同策略)。
-                        // Fall back to the native zoom action when the exact AX write is
-                        // rejected (same policy as window control).
-                        press_native_zoom(win);
-                    }
+                    finish_snap(
+                        win,
+                        pid,
+                        target,
+                        true,
+                        SnapState::Maximized,
+                        set_frame_with(win, target, snap_accepts(target, true)),
+                    );
                 }
                 handled = true;
             }
@@ -1087,30 +1510,24 @@ pub(crate) fn maximize_focused_window_of_pid(pid: i32) -> bool {
 
 /// 执行主线程动作(AX 调用;错误只记 debug 日志,不打断流程)。
 /// Run a main-thread plan (AX calls; errors are debug-logged and never interrupt the flow).
-unsafe fn execute(plan: Plan, win: AXUIElementRef, dir: Direction) {
+unsafe fn execute(plan: Plan, win: AXUIElementRef, pid: i32, desired: SnapState, dir: Direction) {
     match plan {
-        Plan::Move(r) => {
-            // 吸附写入也容忍 App 网格(见 SNAP_EPSILON):终端半屏目标 461.5,实际回来 464。
-            // 这里只影响验收结论与日志——Move 没有回退动作;跳屏 staging 仍用严格的 set_frame。
-            // Snap writes tolerate the app grid too (see SNAP_EPSILON): Terminal returns 464 where
-            // the half is 461.5. This only affects the verdict and the log (Move has no fallback);
-            // cross-display staging keeps the strict set_frame.
-            let _ = set_frame_with(win, r, |a| rect_close_with(a, r, SNAP_EPSILON));
-        }
-        Plan::Maximize(r) => {
-            if !set_frame_maximized(win, r) {
-                // 某些 App 会接受 AXPosition 却拒绝 AXSize;此时退回原生缩放**动作**。
-                // 该动作是 `AXZoomWindow`(App 自己的缩放),绝不是绿钮的 AXPress——后者自
-                // macOS 10.11 起是"切换全屏",终端等 App 会因此进全屏。
-                // Some apps accept AXPosition but reject AXSize; fall back to the native zoom
-                // action. That action is `AXZoomWindow` (the app's own zoom), never the green
-                // button's AXPress, which toggles fullscreen since macOS 10.11.
-                log_debug!("[winctl] exact maximize frame rejected; trying native zoom fallback");
-                if !press_native_zoom(win) {
-                    log_info!("[winctl] native zoom fallback unavailable");
-                }
-            }
-        }
+        Plan::Move(r) => finish_snap(
+            win,
+            pid,
+            r,
+            false,
+            desired,
+            set_frame_with(win, r, snap_accepts(r, false)),
+        ),
+        Plan::Maximize(r) => finish_snap(
+            win,
+            pid,
+            r,
+            true,
+            desired,
+            set_frame_with(win, r, snap_accepts(r, true)),
+        ),
         Plan::Minimize => set_minimized(win, true),
         Plan::Nothing => {
             log_debug!("[winctl] direction {:?} is a no-op for this state", dir);
@@ -1211,7 +1628,12 @@ unsafe fn set_ax_value(
 /// Set the window frame position-first to avoid transient off-screen overflow while growing;
 /// retry in the reverse order if either AX write is rejected. `accept` decides whether the
 /// read-back counts as success (exact snaps use `rect_close`, maximize uses `fills_visible`).
-unsafe fn set_frame_with(win: AXUIElementRef, r: AxRect, accept: impl Fn(AxRect) -> bool) -> bool {
+unsafe fn set_frame_with(
+    win: AXUIElementRef,
+    r: AxRect,
+    accept: impl Fn(AxRect) -> bool,
+) -> SnapWrite {
+    let before = read_frame(win);
     let sz = CgSize { w: r.w, h: r.h };
     let pt = CgPoint { x: r.x, y: r.y };
     // 先移动再放大,确保扩展后的窗口不会因为暂时越过屏幕边界而被 App 拒绝。
@@ -1263,36 +1685,91 @@ unsafe fn set_frame_with(win: AXUIElementRef, r: AxRect, accept: impl Fn(AxRect)
     if pos_err != K_AX_SUCCESS {
         log_debug!("[winctl] set AXPosition failed: {} target={:?}", pos_err, r);
     }
+    let errored = pos_err != K_AX_SUCCESS || size_err != K_AX_SUCCESS;
     let Some(actual) = read_frame(win) else {
         log_info!(
             "[winctl] unable to verify frame after AX write; target={:?}",
             r
         );
-        return false;
+        return SnapWrite {
+            before,
+            actual: None,
+            errored,
+        };
     };
-    if accept(actual) {
-        return true;
+    if !accept(actual) {
+        log_info!(
+            "[winctl] frame mismatch after AX write: target={:?} actual={:?}",
+            r,
+            actual
+        );
     }
-    log_info!(
-        "[winctl] frame mismatch after AX write: target={:?} actual={:?}",
-        r,
-        actual
-    );
-    false
+    SnapWrite {
+        before,
+        actual: Some(actual),
+        errored,
+    }
 }
 
 /// 精确 set_frame:跳屏 staging(容差 FRAME_EPSILON,验收结果会决定是否走回退重试)。
 /// Exact set_frame for cross-display staging (FRAME_EPSILON tolerance; the verdict decides whether
 /// a fallback retry runs).
 unsafe fn set_frame(win: AXUIElementRef, r: AxRect) -> bool {
-    set_frame_with(win, r, |a| rect_close(a, r))
+    set_frame_with(win, r, |a| rect_close(a, r)).matched(|a| rect_close(a, r))
 }
 
-/// 最大化 set_frame:容忍 App 把尺寸吸附到自己的内部网格(见 SNAP_EPSILON)。
-/// Maximize set_frame: tolerates an app snapping its size to an internal grid (see
-/// SNAP_EPSILON).
-unsafe fn set_frame_maximized(win: AXUIElementRef, r: AxRect) -> bool {
-    set_frame_with(win, r, |a| fills_visible(a, r))
+/// snap 写入的收尾:命中即结束;否则按策略重写位置并把尺寸写入推迟到动画之后,或換 App 自己的
+/// 缩放动作。详见上方"动画型 App 的延迟收尾"一节。
+/// Finish a snap write: a match is final; otherwise re-send the position and postpone the size
+/// write past the app's animation, or fall back to the app's own zoom action.
+unsafe fn finish_snap(
+    win: AXUIElementRef,
+    pid: i32,
+    target: AxRect,
+    maximized: bool,
+    desired: SnapState,
+    write: SnapWrite,
+) {
+    let matched = write.matched(snap_accepts(target, maximized));
+    match snap_follow_up(matched, write.errored, !write.moved(), false) {
+        SnapFollowUp::Done => {}
+        SnapFollowUp::RetryAfterSettle => {
+            let Some(cgwid) = ax_window_cgwid(win) else {
+                log_debug!("[winctl] snap settle skipped: no window id");
+                return;
+            };
+            // 这里**不要**立刻补写任何东西:刚发完尺寸就写位置会把尺寸回退掉,而缓动期间写
+            // 尺寸又会被顶掉(都是实测)。交给延迟收尾按"位置 → 等停 → 尺寸"的顺序来。
+            // Nothing is written here on purpose: a position write right after the size write reverts
+            // the size, and a size write during the animation is overridden (both measured). The
+            // deferred settle runs the "position -> wait -> size" sequence instead.
+            log_debug!(
+                "[winctl] snap settle pending: pid={} target={:?} actual={:?}",
+                pid,
+                target,
+                write.actual
+            );
+            arm_pending_snap(
+                pid,
+                cgwid,
+                target,
+                maximized,
+                desired,
+                write.before,
+                write.actual,
+            );
+        }
+        SnapFollowUp::ZoomFallback => {
+            log_debug!(
+                "[winctl] snap write rejected; trying native zoom fallback: target={:?}",
+                target
+            );
+            if !press_native_zoom(win) {
+                log_info!("[winctl] native zoom fallback unavailable");
+            }
+        }
+        SnapFollowUp::GiveUp => {}
+    }
 }
 
 /// 设置 AXMinimized。
@@ -1556,8 +2033,8 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
 mod tests {
     use super::{
         display_move_staging_frame, display_move_target, fills_visible, infer_state,
-        neighbor_screen, plan, rect_close_with, snap_frames, AxRect, Direction, Plan,
-        ScreenGeometry, SnapState, SNAP_EPSILON,
+        neighbor_screen, plan, rect_close_with, snap_follow_up, snap_frames, AxRect, Direction,
+        Plan, ScreenGeometry, SnapFollowUp, SnapState, SnapWrite, SNAP_EPSILON,
     };
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> AxRect {
@@ -1595,6 +2072,71 @@ mod tests {
         assert_eq!(f.top_left, rect(0.0, 25.0, 960.0, 527.5));
         assert_eq!(f.bottom_right, rect(960.0, 25.0 + 527.5, 960.0, 527.5));
         assert_eq!(f.max, v);
+    }
+
+    #[test]
+    fn snap_follow_up_covers_the_measured_app_classes() {
+        // 一帧到位的 App(Telegram/Edge/ChatGPT/RustRover):命中即结束,不做多余动作。
+        // Apps that land in one frame (Telegram/Edge/ChatGPT/RustRover): a match is final.
+        assert_eq!(
+            snap_follow_up(true, false, false, false),
+            SnapFollowUp::Done
+        );
+        assert_eq!(snap_follow_up(true, true, true, true), SnapFollowUp::Done);
+        // 动画型 App(Ghostty/访达/PeachPic):动过但还没到位 -> 等动画结束再补写尺寸。
+        // Animating apps (Ghostty/Finder/PeachPic): it moved but has not arrived -> postpone the
+        // size write past the animation.
+        assert_eq!(
+            snap_follow_up(false, false, false, false),
+            SnapFollowUp::RetryAfterSettle
+        );
+        // 补写之后仍不到位(网格吸附很宽之类):接受 App 的结果,绝不按那个 toggle。
+        // Still short after the postponed write (a wide grid snap, say): accept the app's result and
+        // never press the toggle.
+        assert_eq!(
+            snap_follow_up(false, false, false, true),
+            SnapFollowUp::GiveUp
+        );
+        // AX 写被明确拒绝("接受 AXPosition 却拒绝 AXSize"):换 App 自己的缩放收尾。
+        // An explicitly rejected write ("accepts AXPosition but rejects AXSize"): finish with the
+        // app's own zoom.
+        assert_eq!(
+            snap_follow_up(false, true, false, false),
+            SnapFollowUp::ZoomFallback
+        );
+        // 窗口完全没动:它无视了 frame 写入,缩放才是有效动作。
+        // The window did not move at all: it ignores frame writes, so the zoom action is the useful
+        // one.
+        assert_eq!(
+            snap_follow_up(false, false, true, false),
+            SnapFollowUp::ZoomFallback
+        );
+    }
+
+    #[test]
+    fn snap_write_reports_movement_conservatively() {
+        let a = rect(0.0, 0.0, 100.0, 100.0);
+        let grown = rect(0.0, 0.0, 100.0, 200.0);
+        assert!(SnapWrite {
+            before: Some(a),
+            actual: Some(grown),
+            errored: false
+        }
+        .moved());
+        assert!(!SnapWrite {
+            before: Some(a),
+            actual: Some(a),
+            errored: false
+        }
+        .moved());
+        // 读不到 frame 时保守地当作"动过":不按 toggle。
+        // An unreadable frame counts as "moved" so the toggle is never pressed.
+        assert!(SnapWrite {
+            before: Some(a),
+            actual: None,
+            errored: false
+        }
+        .moved());
     }
 
     #[test]
