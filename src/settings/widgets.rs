@@ -2988,6 +2988,31 @@ pub(super) unsafe fn fit_page_document_height(
     target
 }
 
+/// Refit one settings page after an inline visibility change and refresh its scroller.
+/// 条件行显隐后重新拟合单页文档高度，并刷新对应滚动条。
+pub(super) unsafe fn refit_settings_page(scroll: *mut AnyObject) -> bool {
+    if scroll.is_null() {
+        return false;
+    }
+    let document: *mut AnyObject = msg_send![scroll, documentView];
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    if document.is_null() || clip.is_null() {
+        return false;
+    }
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    let before: NSRect = msg_send![document, frame];
+    let after = fit_page_document_height(
+        document,
+        clip_bounds.size.height,
+        super::components::SettingsPageHeader::BOTTOM_PADDING,
+    );
+    if (after - before.size.height).abs() <= 0.5 {
+        return false;
+    }
+    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+    true
+}
+
 /// Pure counterpart of the document fitting rule, kept separate so expansion behavior can be
 /// covered without constructing AppKit views in headless tests.
 /// 文档高度拟合规则的纯函数版本，便于在无 AppKit 的测试中覆盖长文本/短文本两种情况。

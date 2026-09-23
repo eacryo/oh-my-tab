@@ -501,16 +501,19 @@ pub(crate) mod components;
 mod dispatch;
 pub(crate) mod glass_preview;
 pub(crate) mod mapping;
+mod page_builder;
 pub(crate) mod restore;
 mod select;
+mod sidebar;
 pub(crate) mod tooltip;
 pub(crate) mod widgets;
 mod window;
 
 use components::{
-    CollapsibleRows, RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsControl,
-    SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader, SettingsRow,
-    SettingsSection, SettingsSelect, SettingsSidebar,
+    row_action_button, CollapsibleRows, RestoreDefaultsControl, SettingsButton, SettingsButtonRole,
+    SettingsControl, SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader,
+    SettingsRow, SettingsSection, SettingsSelect, SettingsSidebar, ROW_ACTION_BTN_H,
+    ROW_ACTION_BTN_W,
 };
 use dispatch::*;
 use glass_preview::*;
@@ -547,7 +550,8 @@ pub(crate) use dispatch::{
 };
 pub(crate) use window::{
     close_settings_from_switcher, invalidate_settings_window, refresh_permission_ui_if_visible,
-    refresh_system_appearance, settings_layout_smoke_runner,
+    refresh_system_appearance, settings_collapsible_row_smoke_runner, settings_layout_smoke_runner,
+    settings_state_sync_smoke_runner,
 };
 
 // ========== 控件构造 helper / control-builder helpers ==========
@@ -1538,6 +1542,10 @@ fn load_settings_from(cfg: &Config) {
                     0isize
                 }
             ];
+            // 配置控件在条件行重算之后才填充,这里必须用保存的配置再应用一次显隐。
+            // The clipboard controls are populated after the initial conditional-row pass, so
+            // apply visibility once more from the saved config here.
+            update_clipboard_delete_dependent_visibility_from_config(ui, cfg);
             set_field(
                 ui.clipboard_max_entries,
                 cfg.clipboard.max_entries.to_string(),
@@ -2009,6 +2017,72 @@ mod tests {
             "settings layout smoke failed (exit {:?})\nstderr:\n{}",
             out.status.code(),
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Rebuilding settings content must not reset controls to their construction defaults.
+    /// 设置页内容重建后不能把控件重置回构造时的默认值。
+    #[test]
+    #[ignore]
+    fn settings_state_sync_after_content_rebuild_smoke() {
+        let exe = std::env::current_exe().expect("current exe");
+        let app = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("oh-my-tab"))
+            .expect("app binary path");
+        assert!(
+            app.exists(),
+            "app binary missing at {}: run `cargo build` first",
+            app.display()
+        );
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-settings-state-sync")
+            .output()
+            .expect("failed to spawn app");
+        assert!(
+            out.status.success(),
+            "settings state-sync smoke failed (exit {:?})\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Hiding a conditional clipboard row must preserve adjacent rows and close the layout gap.
+    /// 隐藏剪贴板条件行后，前后行位置应正确且布局间隙应收起。
+    #[test]
+    #[ignore]
+    fn settings_collapsible_row_geometry_smoke() {
+        let exe = std::env::current_exe().expect("current exe");
+        let app = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("oh-my-tab"))
+            .expect("app binary path");
+        assert!(
+            app.exists(),
+            "app binary missing at {}: run `cargo build` first",
+            app.display()
+        );
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-settings-collapsible-row")
+            .output()
+            .expect("failed to spawn app");
+        let stdout_tail = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            out.status.success(),
+            "settings collapsible-row smoke failed (exit {:?})\nstderr:\n{}\nstdout tail:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr),
+            stdout_tail
         );
     }
 }

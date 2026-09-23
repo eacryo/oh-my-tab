@@ -269,6 +269,7 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
             with_settings_ui(|ui| {
                 if let Some(u) = ui.as_ref() {
                     update_clipboard_delete_dependent_visibility(u);
+                    widgets::refit_settings_page(u.clipboard_view);
                 }
             });
         }
@@ -279,6 +280,7 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
             with_settings_ui(|ui| {
                 if let Some(u) = ui.as_mut() {
                     update_pointer_accel_visibility(u);
+                    widgets::refit_settings_page(u.mouse_view);
                 }
             });
         }
@@ -288,6 +290,7 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
             with_settings_ui(|ui| {
                 if let Some(u) = ui.as_mut() {
                     update_display_mode_dependent_visibility(u);
+                    widgets::refit_settings_page(u.switcher_view);
                 }
             });
         }
@@ -637,6 +640,7 @@ pub(super) unsafe fn apply_mouse_profile_field(field: ControlField) {
             let _: () = msg_send![u.line_count, setIntegerValue: shown as isize];
             set_field(u.line_count_value_label, shown);
             update_mode_dependent_visibility(u);
+            widgets::refit_settings_page(u.mouse_view);
         }
     });
 }
@@ -1006,9 +1010,29 @@ unsafe fn update_display_mode_dependent_visibility(ui: &SettingsUi) {
 /// "同时删除系统剪贴板中对应条目"只在"粘贴后删除条目"打开时出现(它是后者的子项)。
 /// Show the "clear the matching system-pasteboard entry" row only while "delete entry after
 /// paste" is on (it is that switch's child option).
+fn clipboard_delete_dependent_visibility_from_config(cfg: &Config) -> bool {
+    cfg.clipboard.delete_after_paste
+}
+
+unsafe fn set_clipboard_delete_dependent_visibility(ui: &SettingsUi, visible: bool) {
+    ui.clipboard_delete_block.set_visible(visible);
+}
+
 unsafe fn update_clipboard_delete_dependent_visibility(ui: &SettingsUi) {
     let state: isize = msg_send![ui.clipboard_delete_after_paste, state];
-    ui.clipboard_delete_block.set_visible(state == 1);
+    set_clipboard_delete_dependent_visibility(ui, state == 1);
+}
+
+/// Apply the saved clipboard setting after the controls have been populated.
+/// 在控件填充完保存的配置后应用剪贴板条件行显隐。
+pub(super) unsafe fn update_clipboard_delete_dependent_visibility_from_config(
+    ui: &SettingsUi,
+    cfg: &Config,
+) {
+    set_clipboard_delete_dependent_visibility(
+        ui,
+        clipboard_delete_dependent_visibility_from_config(cfg),
+    );
 }
 
 /// 条件行区块一起重算。幂等(状态由实时 frame 推出),可在窗口显示前后各调一次。
@@ -1195,6 +1219,7 @@ pub(crate) fn refresh_switcher_controls_from_config() {
             // 显示模式可能刚变过:仅缩略图的两行跟着重算显隐。
             // The display mode may have just changed: recompute the thumbnail-only pair.
             update_display_mode_dependent_visibility(u);
+            widgets::refit_settings_page(u.switcher_view);
         });
     }
 }
@@ -1371,6 +1396,7 @@ pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, se
                 update_mouse_controls_enabled(u);
                 update_mode_dependent_visibility(u);
                 update_pointer_accel_visibility(u);
+                widgets::refit_settings_page(u.mouse_view);
                 // 设备切换:映射编辑态换成新设备的专属 mappings 并重渲染。
                 // Device switch: reload the in-edit mappings from the new device's own profile.
                 let dev = current_selected_device();
@@ -1460,5 +1486,20 @@ fn suggested_export_log_name() -> String {
             tm.tm_min,
             tm.tm_sec,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clipboard_delete_dependent_visibility_from_config, Config};
+
+    #[test]
+    fn clipboard_delete_dependent_row_matches_initial_config() {
+        let mut cfg = Config::default();
+        cfg.clipboard.clear_system_pasteboard_after_paste = true;
+        assert!(!clipboard_delete_dependent_visibility_from_config(&cfg));
+
+        cfg.clipboard.delete_after_paste = true;
+        assert!(clipboard_delete_dependent_visibility_from_config(&cfg));
     }
 }

@@ -2197,8 +2197,12 @@ pub fn run() {
     // GUI 冒烟入口是测试子进程，允许它们与开发版并行；所有正常启动渠道共用同一把锁。
     // GUI smoke entry points are test subprocesses and may run alongside the development app;
     // every normal launch channel shares one lock.
-    let is_gui_smoke_process =
-        std::env::args().any(|arg| arg == "--smoke-clipboard" || arg == "--smoke-settings-layout");
+    let is_gui_smoke_process = std::env::args().any(|arg| {
+        arg == "--smoke-clipboard"
+            || arg == "--smoke-settings-layout"
+            || arg == "--smoke-settings-state-sync"
+            || arg == "--smoke-settings-collapsible-row"
+    });
     let _instance_guard = if is_gui_smoke_process {
         None
     } else {
@@ -2612,6 +2616,40 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-settings-layout] all pages survived");
+            std::process::exit(0);
+        }
+    }
+
+    // 设置页状态同步冒烟入口:在真实 NSApplication 主线程中重建一次设置内容,检查配置值仍在。
+    // Settings state-sync smoke entry: rebuild settings content once on the real AppKit main
+    // thread and verify that the configured values survive the rebuild.
+    if std::env::args().any(|a| a == "--smoke-settings-state-sync") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            let ok = settings::settings_state_sync_smoke_runner();
+            if !ok {
+                eprintln!("[smoke-settings-state-sync] settings state was not preserved");
+                std::process::exit(1);
+            }
+            log_info!("[smoke-settings-state-sync] settings state survived rebuild");
+            std::process::exit(0);
+        }
+    }
+
+    // 条件行显隐冒烟入口:验证真实 AppKit 设置页在收起剪贴板条件行后相邻布局保持正确。
+    // Conditional-row smoke entry: verify adjacent layout after collapsing a clipboard row in
+    // the real AppKit settings page.
+    if std::env::args().any(|a| a == "--smoke-settings-collapsible-row") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            let ok = settings::settings_collapsible_row_smoke_runner();
+            if !ok {
+                eprintln!("[smoke-settings-collapsible-row] conditional row geometry failed");
+                std::process::exit(1);
+            }
+            log_info!("[smoke-settings-collapsible-row] conditional row geometry is stable");
             std::process::exit(0);
         }
     }

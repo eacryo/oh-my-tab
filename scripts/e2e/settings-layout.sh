@@ -84,7 +84,10 @@ while time.time() < deadline:
             candidate = json.load(handle)
     except (FileNotFoundError, json.JSONDecodeError):
         candidate = None
-    if candidate and candidate.get("views"):
+    # --open-settings=about first opens the ordinary General page, then parks on About. Wait for
+    # the requested final page as well as a stable sequence so the initial General snapshot cannot
+    # satisfy the settle check before the sidebar switch completes.
+    if candidate and candidate.get("views") and candidate.get("selected_sidebar") == 6:
         if candidate.get("seq") == last_seq:
             stable_reads += 1
             if stable_reads >= SETTLE_READS:

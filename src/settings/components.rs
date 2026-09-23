@@ -18,6 +18,33 @@ use crate::log_debug;
 
 use super::{tooltip::SettingsTooltip, widgets};
 
+/// Shared dimensions for in-row action buttons.
+/// 设置行内操作按钮的共享尺寸。
+pub(crate) const ROW_ACTION_BTN_W: f64 = 110.0;
+pub(crate) const ROW_ACTION_BTN_H: f64 = 28.0;
+
+/// Build an in-row action button aligned to the control column's right edge.
+/// 创建一个右对齐到控制列右缘的设置行内操作按钮。
+pub(crate) unsafe fn row_action_button(
+    ctrl_x: f64,
+    ctrl_w: f64,
+    row_y: f64,
+    title: &str,
+    target: *mut AnyObject,
+    action: Sel,
+) -> *mut AnyObject {
+    SettingsControl::button(
+        ctrl_x + ctrl_w - ROW_ACTION_BTN_W,
+        row_y,
+        ROW_ACTION_BTN_W,
+        ROW_ACTION_BTN_H,
+        title,
+        target,
+        action,
+        SettingsButtonRole::Action,
+    )
+}
+
 /// Right-hand read-only readout of a slider row: its width, the gap before it, and its own
 /// height. The readout hugs the slider's right end and is vertically centred on it, so a slider
 /// in such a row takes the control column's width minus the first two.
@@ -55,25 +82,16 @@ pub(super) struct CollapsibleRows {
     /// 整块占用的高度(每行 row_gap + row_h 之和)。
     /// The block's total height (row_gap + row_h summed over its rows).
     height: f64,
-    /// 区块底边(展开时的位置)。区块自己的 view 从不位移,所以它是个稳定基准:低于它的视图
-    /// 才需要补位。
-    /// The block's bottom edge (as built). Its own views never move, so this is a stable
-    /// threshold: only what sits below it needs to close the gap.
-    expanded_bottom: f64,
     /// 构建时的卡片高度。当前是否收起由实时卡片高度反推(只有本组件会改它),不存布尔量:
     /// 万一 AppKit 在窗口显示等时机复位了子视图 frame,下一次调用会自动纠正。
     /// The card height as built. The collapsed state is derived from the live card height (only
     /// this component changes it) instead of a remembered flag, so a layout reset (e.g. AppKit
     /// re-placing subviews when the window is first displayed) self-corrects on the next call.
     expanded_card_height: f64,
-    /// 收起时实际位移过的视图及其**原始** frame。展开时按原始值精确定位回去,而不是按同一个
-    /// 增量反推:期间若有外力改过其中某个 view 的 frame(实测发生过,表现为只还原了一部分、
-    /// 剩下的叠在原位),按原值还原依然准确。
-    /// The views actually shifted while collapsed, with their ORIGINAL frames. Expanding restores
-    /// those exact frames instead of re-deriving from the delta: if something else moved one of
-    /// them in the meantime -- measured in practice, where only part of the layout came back --
-    /// restoring the recorded values still lands correctly.
-    shifted: std::cell::RefCell<Vec<(*mut AnyObject, NSRect)>>,
+    /// 收起时实际位移过的视图。展开时只撤销本区块的位移，保留其他区块期间产生的变化。
+    /// Views actually shifted while collapsed. Expanding reverses only this block's shift and
+    /// preserves changes made by other blocks in the meantime.
+    shifted: std::cell::RefCell<Vec<*mut AnyObject>>,
 }
 
 impl CollapsibleRows {
@@ -86,7 +104,6 @@ impl CollapsibleRows {
             views: Vec::new(),
             separators: Vec::new(),
             height: 0.0,
-            expanded_bottom: 0.0,
             expanded_card_height: 0.0,
             shifted: std::cell::RefCell::new(Vec::new()),
         }
@@ -105,14 +122,16 @@ impl CollapsibleRows {
             views,
             separators,
             height,
-            expanded_bottom: 0.0,
             expanded_card_height: 0.0,
             shifted: std::cell::RefCell::new(Vec::new()),
         };
-        block.expanded_bottom = block.block_bottom().unwrap_or(0.0);
         let card_frame: NSRect = objc2::msg_send![card, frame];
         block.expanded_card_height = card_frame.size.height;
         block
+    }
+
+    pub(super) unsafe fn card_frame(&self) -> NSRect {
+        objc2::msg_send![self.card, frame]
     }
 
     /// 整块显隐。父视图取自卡片的 superview,调用方不需要传坐标。
@@ -138,23 +157,20 @@ impl CollapsibleRows {
             let shift = if visible { -self.height } else { self.height };
             let parent: *mut AnyObject = objc2::msg_send![self.card, superview];
             let moved = if visible {
-                // 展开:按收起时记下的原始 frame 精确还原,不再按增量反推(见 `shifted`)。
-                // Expanding: restore the frames recorded while collapsed (see `shifted`) instead of
-                // re-deriving the delta.
+                // 展开:只撤销本区块加上的位移,保留其他区块期间做出的布局调整。
+                // Expanding: reverse only this block's shift and preserve layout changes made by
+                // other blocks in the meantime.
                 self.restore_shifted()
             } else {
-                // 收起:先把要位移的视图连同原始 frame 记下来,再位移。
-                // Collapsing: record the views to move (with their original frames) before moving
-                // them.
+                // 收起:先记录要位移的视图,展开时只反向撤销本次位移。
+                // Collapsing: record the views to move so expansion can reverse only this shift.
                 let mut recorded = Vec::new();
-                let moved =
-                    self.shift_views_below(self.card, self.expanded_bottom, shift, &mut recorded)
-                        + self.shift_views_below(
-                            parent,
-                            self.expanded_bottom,
-                            shift,
-                            &mut recorded,
-                        );
+                // 页面文档可能在组件创建后整体调整高度；此时构造时缓存的 y 已经过期。
+                // The page document may be shifted after this component is built, so a cached y
+                // coordinate would be stale here.
+                let block_bottom = self.block_bottom().unwrap_or(0.0);
+                let moved = self.shift_views_below(self.card, block_bottom, shift, &mut recorded)
+                    + self.shift_views_below(parent, block_bottom, shift, &mut recorded);
                 self.shifted.replace(recorded);
                 moved
             };
@@ -210,18 +226,18 @@ impl CollapsibleRows {
             })
     }
 
-    /// 把 `parent` 里低于 `threshold` 的 view 整体位移,顺手把它们连同**原始** frame 记进
-    /// `recorded`,返回挪动的个数。区块自己的 view、卡片、阴影都不在位移之列。
+    /// 把 `parent` 里低于 `threshold` 的 view 整体位移,并记录这些 view 以便展开时反向撤销。
+    /// 返回挪动的个数。区块自己的 view、卡片、阴影都不在位移之列。
     ///
-    /// Shift every view in `parent` that sits below `threshold`, recording each with its ORIGINAL
-    /// frame, and return how many moved. The block's own views, the card, and the shadow never
-    /// take part.
+    /// Shift every view in `parent` below `threshold`, recording it so expansion can reverse this
+    /// shift. Return how many moved. The block's own views, the card, and the shadow never take
+    /// part.
     unsafe fn shift_views_below(
         &self,
         parent: *mut AnyObject,
         threshold: f64,
         shift: f64,
-        recorded: &mut Vec<(*mut AnyObject, NSRect)>,
+        recorded: &mut Vec<*mut AnyObject>,
     ) -> usize {
         if parent.is_null() {
             return 0;
@@ -238,7 +254,7 @@ impl CollapsibleRows {
             // A smaller origin.y is lower on screen.
             let mut frame: NSRect = objc2::msg_send![view, frame];
             if frame.origin.y < threshold {
-                recorded.push((view, frame));
+                recorded.push(view);
                 frame.origin.y += shift;
                 let _: () = objc2::msg_send![view, setFrame: frame];
                 moved += 1;
@@ -247,37 +263,18 @@ impl CollapsibleRows {
         moved
     }
 
-    /// 按收起时记下的原始 frame 精确还原。顺手核对"期间有没有别人动过这些 view":
-    /// 实测出现过只还原一部分的情况,这条日志用来定位是谁动的。
-    ///
-    /// Restore the frames recorded while collapsed. It also checks whether anything else moved
-    /// those views in the meantime -- a partly restored layout was measured in practice, and this
-    /// line exists to identify the actor.
+    /// 只撤销本区块收起时加上的 y 位移；其间其他区块可能改了这些 view 的位置或尺寸，不能覆盖。
+    /// Reverse only this block's y shift. Other blocks may have changed these views' positions or
+    /// sizes in the meantime, so restoring an old frame would overwrite their layout.
     unsafe fn restore_shifted(&self) -> usize {
         let recorded = self.shifted.replace(Vec::new());
-        let mut drifted = 0;
-        for &(view, original) in &recorded {
+        for &view in &recorded {
             if view.is_null() {
                 continue;
             }
-            let current: NSRect = objc2::msg_send![view, frame];
-            let expected = original.origin.y + self.height;
-            if (current.origin.y - expected).abs() > 0.5 {
-                drifted += 1;
-                log_debug!(
-                    "[settings] row block: view moved by something else while collapsed: y={:.1} expected={:.1}",
-                    current.origin.y,
-                    expected
-                );
-            }
-            let _: () = objc2::msg_send![view, setFrame: original];
-        }
-        if drifted > 0 {
-            log_debug!(
-                "[settings] row block: {} of {} recorded view(s) drifted while collapsed",
-                drifted,
-                recorded.len()
-            );
+            let mut frame: NSRect = objc2::msg_send![view, frame];
+            frame.origin.y -= self.height;
+            let _: () = objc2::msg_send![view, setFrame: frame];
         }
         recorded.len()
     }
