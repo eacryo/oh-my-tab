@@ -250,7 +250,12 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
             log_debug!("[settings] control change from an unknown sender ignored");
             return;
         };
-        apply_control_field(field);
+        // 几何冒烟只验证控件事件到条件行重排的真实回调链，不修改配置或触发设备副作用。
+        // The geometry smoke exercises the real callback-to-reflow path without changing config
+        // or applying device side effects.
+        if !crate::dev_flags::present("smoke-settings-collapsible-row") {
+            apply_control_field(field);
+        }
         if matches!(
             field,
             ControlField::ClipboardDeleteAfterPaste
@@ -262,39 +267,37 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
                 }
             });
         }
-        if matches!(field, ControlField::ClipboardDeleteAfterPaste) {
-            // "粘贴后删除条目"切换:它的子项(同时删除系统剪贴板条目)随之显隐。
-            // The "delete entry after paste" switch flipped: its child option (clear the matching
-            // system-pasteboard entry) follows.
-            with_settings_ui(|ui| {
-                if let Some(u) = ui.as_ref() {
-                    update_clipboard_delete_dependent_visibility(u);
-                    widgets::refit_settings_page(u.clipboard_view);
-                }
-            });
-        }
-        if matches!(field, ControlField::DisablePointerAccel) {
-            // 开关切换:跟踪速度行随之显隐(打开=线性跟踪时才出现)。
-            // The switch flipped: the tracking-speed row follows (it only appears while linear
-            // tracking is on).
-            with_settings_ui(|ui| {
-                if let Some(u) = ui.as_mut() {
-                    update_pointer_accel_visibility(u);
-                    widgets::refit_settings_page(u.mouse_view);
-                }
-            });
-        }
-        if matches!(field, ControlField::ThumbnailsEnabled) {
-            // 显示模式切换:仅缩略图模式的两行随之显隐。
-            // The display mode flipped: the thumbnail-only pair follows.
-            with_settings_ui(|ui| {
-                if let Some(u) = ui.as_mut() {
-                    update_display_mode_dependent_visibility(u);
-                    widgets::refit_settings_page(u.switcher_view);
-                }
-            });
-        }
+        refresh_dependent_control_visibility(field);
     }
+}
+
+/// Refresh conditional rows and their document geometry after a setting changes.
+/// 设置变化后同步刷新关联行的显隐和文档尺寸。
+unsafe fn refresh_dependent_control_visibility(field: ControlField) {
+    with_settings_ui(|ui| {
+        let Some(ui) = ui.as_ref() else {
+            return;
+        };
+        match field {
+            ControlField::ClipboardDeleteAfterPaste => {
+                update_clipboard_delete_dependent_visibility(ui);
+                widgets::refit_settings_page(ui.clipboard_view);
+            }
+            ControlField::DisablePointerAccel => {
+                update_pointer_accel_visibility(ui);
+                widgets::refit_settings_page(ui.mouse_view);
+            }
+            ControlField::ScrollMode => {
+                update_mode_dependent_visibility(ui);
+                widgets::refit_settings_page(ui.mouse_view);
+            }
+            ControlField::ThumbnailsEnabled => {
+                update_display_mode_dependent_visibility(ui);
+                widgets::refit_settings_page(ui.switcher_view);
+            }
+            _ => {}
+        }
+    });
 }
 
 /// 读取控件值写入内存 CONFIG + 调度防抖落盘 + 即时副作用。

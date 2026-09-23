@@ -144,24 +144,24 @@ if pill and about_row and general_row:
     )
 
 # --- 1.5) 滚动条不占位,可伸缩控件没被挤压 --------------------------------
-# 回归来源(2026-09-22 已修):系统把滚动条切成 legacy 时,clip 少 17pt,而按自适应掩码的视图
-# (自绘开关)会跟着被压扁 —— 开关宽 38 → 21。修法是激活时重申 overlay(见 src/scroller.rs);
-# 这里断言"占位为 0"与"开关比例正常",把这条回归钉住。
-# Regression source (fixed 2026-09-22): when the system switches the scroller to legacy, the clip
-# loses 17pt and auto-resizing views (the self-drawn switch) get squeezed -- its width went 38 -> 21.
-# The fix re-asserts overlay on activation (see src/scroller.rs); these checks pin the regression.
+# 回归来源(2026-09-22 已修):系统把滚动条切成 legacy 时,clip 少 17pt,自绘开关曾从 38pt 被挤到
+# 21pt。设置页现在按滚动条实际占位适配,所以本场景接受 overlay 或 legacy,并断言占位与开关比例正确。
+# Regression source (fixed 2026-09-22): when the system switches to legacy scrollers, the clip loses
+# 17pt and a self-drawn switch was squeezed from 38pt to 21pt. The page now adapts to the measured
+# footprint, so this scenario accepts overlay or legacy and checks the footprint and switch geometry.
 page = next((entry for entry in data.get("pages", []) if entry["root"] == "page_6_about"), None)
 check(page is not None, "the settings page's scroll geometry is in the snapshot")
 if page:
     footprint = round(page["self"][2] - page["clip"][2], 1)
     check(
-        page["styles"][0] == 1,
-        "the settings scroll view reports the overlay scroller style",
-        f"style={page['styles'][0]} (0 = legacy)",
+        page["styles"][0] in (0, 1),
+        "the settings scroll view reports a recognized scroller style",
+        f"style={page['styles'][0]} (-1 = unavailable)",
     )
     check(
-        footprint == 0.0,
-        "the scroller takes no layout width",
+        (page["styles"][0] == 1 and footprint == 0.0)
+        or (page["styles"][0] == 0 and 0.0 < footprint <= 20.0),
+        "the scroller footprint matches its overlay or legacy style",
         f"footprint={footprint} scroll_w={page['self'][2]} clip_w={page['clip'][2]}",
     )
     switches = [
@@ -266,6 +266,8 @@ if labels:
         "every row-to-row gap has a separator between the two rows",
         f"missing={missing} separators={separators}",
     )
+else:
+    check(False, "About page row labels are present")
 
 # --- 页面文档高度:内容下方不能有死空白 ----------------------------------
 # 7 个页面的文档高度曾经是手写常量(通用 1138 / 切换 1432 / 鼠标 1620 / 剪贴板 978 /
@@ -280,9 +282,29 @@ if labels:
 TOP_PADDING = 42.0
 BOTTOM_PADDING = 72.0
 DOC_TOL = 1.5
-for page in data.get("pages", []):
+expected_pages = {
+    "page_0_general",
+    "page_1_switcher",
+    "page_2_mouse",
+    "page_3_clipboard",
+    "page_4_window_control",
+    "page_5_quick_actions",
+    "page_6_about",
+}
+page_entries = data.get("pages", [])
+page_roots = {page.get("root") for page in page_entries}
+check(
+    page_roots == expected_pages,
+    "all seven settings pages have geometry snapshots",
+    f"missing={sorted(expected_pages - page_roots)} extra={sorted(page_roots - expected_pages)}",
+)
+for root in sorted(expected_pages):
+    page = next((entry for entry in page_entries if entry.get("root") == root), None)
+    if page is None:
+        continue
     doc = page.get("doc")
     if not doc or doc[0] <= 0.0:
+        check(False, f"{root}: document geometry is present", f"doc={doc}")
         continue
     doc_h, content_top, content_bottom = doc
     clip_h = page["clip"][3]

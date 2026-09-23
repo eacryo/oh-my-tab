@@ -18,7 +18,7 @@
 # 用法:
 #   scripts/e2e/run-all.sh                  # 只跑不抢焦点的场景
 #   scripts/e2e/run-all.sh --include-focus  # 连抢焦点的场景一起跑(会真的切换前台 app)
-#   scripts/e2e/run-all.sh --include-prefs  # 连会临时改系统偏好的场景一起跑(退出时还原)
+#   scripts/e2e/run-all.sh --include-focus --include-prefs  # 运行抢焦点且改系统偏好的场景
 #   scripts/e2e/run-all.sh --list           # 只看本次会跑哪些场景
 #
 # Exit code: 0 = 所有被选中场景通过;非 0 = 至少一个失败(仍然会跑完剩下的,便于一次看全)。

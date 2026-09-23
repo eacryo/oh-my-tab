@@ -15,6 +15,10 @@
 # 本场景会**临时修改全局偏好** `AppleShowScrollBars`(模拟"插上鼠标/改成始终显示滚动条"),所以
 # 默认被 run-all.sh 跳过,必须显式 --include-prefs;退出时(含失败/中断)一定还原。
 # E2E_CHANGES_PREFS=1
+# 本场景还会注入 Cmd+Tab 来触发快照,会改变前台 app,所以也必须显式 --include-focus。
+# This scenario also injects Cmd+Tab to trigger a snapshot and changes the frontmost app, so it
+# requires --include-focus as well.
+# E2E_STEALS_FOCUS=1
 #
 # Exit code: 0 = 通过;非 0 = 失败(逐条打印原因)。
 
@@ -39,15 +43,25 @@ if original_pref="$(defaults read -g AppleShowScrollBars 2>/dev/null)"; then
 fi
 
 restore_pref() {
+    local test_status=$?
+    trap - EXIT
+    local restore_failed=0
     if [ "$had_pref" = "1" ]; then
-        defaults write -g AppleShowScrollBars "$original_pref"
+        defaults write -g AppleShowScrollBars "$original_pref" || restore_failed=1
     else
-        defaults delete -g AppleShowScrollBars 2>/dev/null || true
+        defaults delete -g AppleShowScrollBars 2>/dev/null || restore_failed=1
     fi
+    if [ "$restore_failed" = "1" ]; then
+        echo "e2e scrollbar-style-flip: FAIL: could not restore AppleShowScrollBars" >&2
+        [ "$test_status" -ne 0 ] || test_status=1
+    fi
+    exit "$test_status"
 }
 # 无论成功失败或中断,都必须把调用者的偏好还原。
 # Restore the caller's preference on any exit path, including failure and interruption.
-trap restore_pref EXIT INT TERM
+trap restore_pref EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 command -v cua-driver >/dev/null 2>&1 || fail "cua-driver CLI not found in PATH"
 cua-driver status >/dev/null 2>&1 || fail "cua-driver daemon is not running"
@@ -64,13 +78,9 @@ echo "$restart_out" | grep -E "^(restart ok|build-version)" || true
 # 热键用于逼 app 写一条新的几何快照(浮窗是 nonactivating 面板,按热键不会激活本 app)。
 # The hotkey forces a fresh geometry snapshot; the overlay is a nonactivating panel, so pressing the
 # hotkey does not activate this app.
-force_frame() {
-    cua-driver call hotkey '{"keys":["cmd","tab"],"scope":"desktop","delivery_mode":"foreground"}' \
-        >/dev/null 2>&1 || true
-}
-
 python3 - "$state_file" "$dev_app" <<'PY'
 import json, subprocess, sys, time
+from pathlib import Path
 
 state_file, dev_app = sys.argv[1], sys.argv[2]
 problems: list[str] = []
@@ -81,8 +91,14 @@ def check(ok: bool, label: str, detail: str = "") -> None:
     (checks if ok else problems).append(f"{label}{(': ' + detail) if detail else ''}")
 
 
-def sh(command: str) -> None:
-    subprocess.run(command, shell=True, capture_output=True, text=True)
+def sh(*command: str) -> subprocess.CompletedProcess:
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise SystemExit(
+            f"command failed ({result.returncode}): {command!r}\n"
+            f"stdout: {result.stdout[-1000:]}\nstderr: {result.stderr[-1000:]}"
+        )
+    return result
 
 
 def frame(deadline: float = 6.0) -> dict:
@@ -103,22 +119,25 @@ def frame(deadline: float = 6.0) -> dict:
 
 
 def observe(label: str) -> dict:
-    """按一次热键拿一帧,并返回本页滚动几何与可伸缩控件的实测值。"""
-    sh("cua-driver call hotkey '{\"keys\":[\"cmd\",\"tab\"],\"scope\":\"desktop\",\"delivery_mode\":\"foreground\"}'")
+    """按一次热键拿一帧,返回本页滚动几何与可伸缩控件的实测值。"""
+    sh("cua-driver", "call", "hotkey", '{"keys":["cmd","tab"],"scope":"desktop","delivery_mode":"foreground"}')
     data = frame()
     if not data:
         raise SystemExit(f"e2e scrollbar-style-flip: FAIL: no geometry frame after {label}")
-    page = next(entry for entry in data["pages"] if entry["root"] == "page_6_about")
-    switches = [
-        (round(n["frame"][2], 1), round(n["frame"][3], 1))
-        for n in data["views"]
-        if n["root"] == "page_6_about" and n["class"] == "OhMyTabHtmlSwitch"
-    ]
+    page = next((entry for entry in data["pages"] if entry["root"] == "page_6_about"), None)
+    if page is None:
+        raise SystemExit(f"e2e scrollbar-style-flip: FAIL: About page missing after {label}")
     return {
         "label": label,
         "style": page["styles"][0],
+        "clip_w": page["clip"][2],
         "footprint": round(page["self"][2] - page["clip"][2], 1),
-        "switches": switches,
+        "switches": [
+            (round(n["frame"][2], 1), round(n["frame"][3], 1))
+            for n in data["views"]
+            if n["root"] == "page_6_about" and n["class"] == "OhMyTabHtmlSwitch"
+        ],
+        "content_right": content_right_edge(data),
     }
 
 
@@ -143,36 +162,23 @@ def content_right_edge(data: dict) -> float:
     return round(max(edges), 1) if edges else 0.0
 
 
-def observe(label: str) -> dict:
-    """按一次热键拿一帧,返回本页滚动几何与可伸缩控件的实测值。"""
-    sh("cua-driver call hotkey '{\"keys\":[\"cmd\",\"tab\"],\"scope\":\"desktop\",\"delivery_mode\":\"foreground\"}'")
-    data = frame()
-    if not data:
-        raise SystemExit(f"e2e scrollbar-style-flip: FAIL: no geometry frame after {label}")
-    page = next(entry for entry in data["pages"] if entry["root"] == "page_6_about")
-    return {
-        "label": label,
-        "style": page["styles"][0],
-        "clip_w": page["clip"][2],
-        "footprint": round(page["self"][2] - page["clip"][2], 1),
-        "switches": [
-            (round(n["frame"][2], 1), round(n["frame"][3], 1))
-            for n in data["views"]
-            if n["root"] == "page_6_about" and n["class"] == "OhMyTabHtmlSwitch"
-        ],
-        "content_right": content_right_edge(data),
-    }
-
+log_path = Path.home() / "Library/Logs/oh-my-tab/oh-my-tab.log"
+try:
+    baseline_log = log_path.read_bytes()
+except OSError:
+    baseline_log = None
 
 baseline = observe("baseline")
 print(f"  info baseline: {baseline}")
+check(len(baseline["switches"]) >= 2, "found settings switches", f"found={len(baseline['switches'])}")
+check(baseline["content_right"] > 0.0, "found right-edge settings content", f"edge={baseline['content_right']}")
 check(
     baseline["style"] == 1 and baseline["footprint"] == 0.0,
     "the app starts with overlay scrollers (no layout width taken)",
     f"{baseline}",
 )
 check(
-    all(width >= 1.5 * height for width, height in baseline["switches"]),
+    bool(baseline["switches"]) and all(width >= 1.5 * height for width, height in baseline["switches"]),
     "baseline self-drawn switches have a normal capsule aspect",
     f"switch w/h={baseline['switches']}",
 )
@@ -180,7 +186,7 @@ check(
 # 把系统切成 legacy(等价于"鼠标成为最后输入设备"),再走一遍真实路径:改完偏好回到设置窗口。
 # Switch the system to legacy (equivalent to a mouse becoming the last input device), then take the
 # real path: change the preference and return to the settings window.
-sh("defaults write -g AppleShowScrollBars Always")
+sh("defaults", "write", "-g", "AppleShowScrollBars", "Always")
 time.sleep(1.2)
 
 # 先量"翻转后、尚未激活"这一刻 —— 这正是用户看到"滚动条变粗、开关被挤变形"的状态。
@@ -191,7 +197,7 @@ time.sleep(1.2)
 flipped = observe("after flip, before activation")
 print(f"  info after flip: {flipped}")
 check(
-    all(width >= 1.5 * height for width, height in flipped["switches"]),
+    bool(flipped["switches"]) and all(width >= 1.5 * height for width, height in flipped["switches"]),
     "no self-drawn switch is squeezed while the system is in legacy mode",
     f"switch w/h={flipped['switches']} (baseline {baseline['switches']}) style={flipped['style']}",
 )
@@ -201,12 +207,12 @@ check(
     f"flipped={flipped['switches']} baseline={baseline['switches']}",
 )
 check(
-    flipped["content_right"] <= flipped["clip_w"],
+    flipped["content_right"] > 0.0 and flipped["content_right"] <= flipped["clip_w"],
     "nothing is clipped while the system is in legacy mode",
     f"content_right={flipped['content_right']} clip_w={flipped['clip_w']}",
 )
 
-sh(f"open -a {dev_app}")
+sh("open", "-a", dev_app)
 time.sleep(2.0)
 after = observe("after activation")
 print(f"  info after activation: {after}")
@@ -217,7 +223,7 @@ check(
     f"footprint={after['footprint']} style={after['style']}",
 )
 check(
-    all(width >= 1.5 * height for width, height in after["switches"]),
+    bool(after["switches"]) and all(width >= 1.5 * height for width, height in after["switches"]),
     "no self-drawn switch is squeezed after the style flip",
     f"switch w/h={after['switches']} (baseline {baseline['switches']})",
 )
@@ -227,17 +233,24 @@ check(
     f"after={after['switches']} baseline={baseline['switches']}",
 )
 check(
-    after["content_right"] <= after["clip_w"],
+    after["content_right"] > 0.0 and after["content_right"] <= after["clip_w"],
     "the right-most content stays inside the visible width (nothing clipped)",
     f"content_right={after['content_right']} clip_w={after['clip_w']}",
 )
 # 机制断言:同步逻辑必须真的跑过(激活通知到达并执行),否则上面几条可能只是"没变化"。
 # Mechanism check: the resync must actually have run, otherwise the checks above could pass simply
 # because nothing happened.
-log_path = subprocess.run("echo ~/Library/Logs/oh-my-tab/oh-my-tab.log", shell=True,
-                          capture_output=True, text=True).stdout.strip()
-log_tail = open(log_path, errors="ignore").read().splitlines()[-400:]
-resync_ran = any("activation resync" in line for line in log_tail)
+try:
+    current_log = log_path.read_bytes()
+except OSError:
+    current_log = b""
+if baseline_log is None:
+    resync_ran = False
+else:
+    new_log = current_log[len(baseline_log):] if current_log.startswith(baseline_log) else current_log
+    resync_ran = any(
+        "activation resync" in line for line in new_log.decode(errors="ignore").splitlines()
+    )
 check(
     resync_ran,
     "the activation resync ran (delivered notification + handler)",

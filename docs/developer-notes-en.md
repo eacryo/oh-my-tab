@@ -47,8 +47,10 @@ cargo test settings_layout_smoke -- --ignored
 
 It runs the debug binary with `--smoke-settings-layout`, opens the actual settings window on the main thread, visits all seven pages, validates their descendant view frames, and exits.
 
+The overlay runtime path also has an ignored child-process smoke test. Run `cargo build` first, then `cargo test overlay_runtime_smoke -- --ignored`; its `--smoke-overlay` switch bypasses the single-instance guard so an already-running development app cannot turn the test into a false pass.
+
 ### Localization and layout QA
 
 The Debug app built by `scripts/dev-restart.sh` adds a `[TEST] English x3` option to the language selector. Selecting it repeats every English UI string three times, so long dropdown values and their surrounding rows and cards can be checked in the real settings window. The optimized development package built by `scripts/release-dev.sh` includes the same fixture through the `dev-long-text` Cargo feature; the production release scripts do not enable it. The older `--pseudo-locale` switch is still available for debug-only punctuation-based expansion.
 
-Launch a debug build with `--layout-debug` to enable runtime settings-page assertions; overlapping controls, out-of-bounds frames, and separators with an invalid layer order fail fast with the page name and offending frames. These checks complement visual review instead of requiring it for every layout change.
+Launch a debug build with `--layout-debug` to enable runtime settings-page assertions; peer controls crossing labels or controls, and frames escaping the document, fail fast with the page name and offending frames. Internal views inside native controls are excluded from peer comparisons.

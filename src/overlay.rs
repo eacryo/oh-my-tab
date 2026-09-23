@@ -1295,6 +1295,34 @@ mod tests {
         assert!(delayed_order_out_should_hide(false));
         assert!(!delayed_order_out_should_hide(true));
     }
+
+    /// Run the real overlay summon path on the AppKit main thread in a child process.
+    /// 在子进程的 AppKit 主线程中运行真实浮窗召唤路径。
+    #[test]
+    #[ignore]
+    fn overlay_runtime_smoke() {
+        let exe = std::env::current_exe().expect("current exe");
+        let app = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("oh-my-tab"))
+            .expect("app binary path");
+        assert!(
+            app.exists(),
+            "app binary missing at {}: run `cargo build` first",
+            app.display()
+        );
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-overlay")
+            .output()
+            .expect("failed to spawn app");
+        assert!(
+            out.status.success(),
+            "overlay runtime smoke failed (exit {:?})\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 // ========== 通用控件 helper / generic control helper ==========

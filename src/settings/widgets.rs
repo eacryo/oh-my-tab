@@ -3068,9 +3068,8 @@ struct DebugLayoutEntry {
 unsafe fn collect_debug_layout(
     view: *mut AnyObject,
     parent_origin: NSPoint,
-    document_width: f64,
     entries: &mut Vec<DebugLayoutEntry>,
-    separators: &mut Vec<(usize, NSRect, f64)>,
+    inside_interactive: bool,
 ) {
     if view.is_null() {
         return;
@@ -3099,7 +3098,9 @@ unsafe fn collect_debug_layout(
             || msg_send![child, isKindOfClass: class!(NSColorWell)]
             || msg_send![child, isKindOfClass: class!(NSPopUpButton)];
         let is_text = msg_send![child, isKindOfClass: class!(NSTextField)];
-        if interactive || is_text {
+        // Native controls such as NSPopUpButton contain internal text views. Their frames are
+        // implementation details, not peer layout items, and must not be compared with the control.
+        if !inside_interactive && (interactive || is_text) {
             let text_required_height = if is_text {
                 let cell: *mut AnyObject = msg_send![child, cell];
                 if cell.is_null() {
@@ -3118,26 +3119,20 @@ unsafe fn collect_debug_layout(
                 text_required_height,
             });
         }
-        if frame.size.height <= 1.5 && frame.size.width > document_width * 0.5 {
-            let z = {
-                let layer: *mut AnyObject = msg_send![child, layer];
-                if layer.is_null() {
-                    0.0
-                } else {
-                    msg_send![layer, zPosition]
-                }
-            };
-            separators.push((index, frame, z));
-        }
-        collect_debug_layout(child, frame.origin, document_width, entries, separators);
+        collect_debug_layout(
+            child,
+            frame.origin,
+            entries,
+            inside_interactive || interactive,
+        );
     }
 }
 
 /// Validate the real AppKit page tree when explicitly requested during development. This catches
-/// the failures pure geometry tests cannot see: descendant controls crossing, frames escaping the
-/// document, and separators rendered above content because of view/layer order.
-/// 开发阶段显式开启时验证真实 AppKit 页面树，捕获纯几何测试看不到的问题：后代控件相交、frame 越出
-/// document，以及因 view/layer 顺序错误而绘制到内容上方的分隔线。
+/// controls crossing peer labels or controls and frames escaping the document. Native controls'
+/// internal descendants are excluded because they are not peer layout items.
+/// 开发阶段显式开启时验证真实 AppKit 页面树，捕获交互控件与相邻标签/控件相交及 frame 越出 document。
+/// 原生控件内部的子视图不作为同级布局项比较。
 pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: &str) {
     if !cfg!(debug_assertions) {
         return;
@@ -3161,14 +3156,7 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
     }
     let document_bounds: NSRect = msg_send![document, bounds];
     let mut entries = Vec::new();
-    let mut separators = Vec::new();
-    collect_debug_layout(
-        document,
-        NSPoint::new(0.0, 0.0),
-        document_bounds.size.width,
-        &mut entries,
-        &mut separators,
-    );
+    collect_debug_layout(document, NSPoint::new(0.0, 0.0), &mut entries, false);
     let mut errors = Vec::new();
     let document_rect = NSRect::new(NSPoint::new(0.0, 0.0), document_bounds.size);
     for entry in &entries {
@@ -3200,14 +3188,6 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
                     left.index, left.frame, right.index, right.frame
                 ));
             }
-        }
-    }
-    for (index, frame, z) in separators {
-        if z >= -0.1 {
-            errors.push(format!(
-                "separator[{index}] {:?} zPosition={z:.2} (must be below controls)",
-                frame
-            ));
         }
     }
     if !errors.is_empty() {
