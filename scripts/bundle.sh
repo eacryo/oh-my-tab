@@ -33,6 +33,24 @@ if [ ! -s "$RELEASE_DOC" ]; then
   exit 1
 fi
 
+SPARKLE_FRAMEWORK_PATH="${SPARKLE_FRAMEWORK_PATH:-vendor/Sparkle.framework}"
+REQUIRE_SPARKLE_UPDATE_SIGNING="${REQUIRE_SPARKLE_UPDATE_SIGNING:-0}"
+if [ "${RELEASE_SIGNING:-0}" = "1" ] || [ "$REQUIRE_SPARKLE_UPDATE_SIGNING" = "1" ]; then
+  if [ ! -d "$SPARKLE_FRAMEWORK_PATH" ]; then
+    echo "error: Sparkle.framework is required for a distributable update build" >&2
+    exit 1
+  fi
+  if [[ ! "${SPARKLE_PUBLIC_ED_KEY:-}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    echo "error: set SPARKLE_PUBLIC_ED_KEY to the Sparkle Ed25519 public key" >&2
+    exit 1
+  fi
+  PUBLIC_KEY_BYTES="$(printf '%s' "$SPARKLE_PUBLIC_ED_KEY" | /usr/bin/base64 -D 2>/dev/null | wc -c | tr -d '[:space:]')"
+  if [ "$PUBLIC_KEY_BYTES" != "32" ]; then
+    echo "error: SPARKLE_PUBLIC_ED_KEY must decode to exactly 32 bytes" >&2
+    exit 1
+  fi
+fi
+
 # release-dev.sh sets CARGO_BUILD_FEATURES=dev-long-text so its optimized package keeps the
 # long-text layout fixture. The production release script leaves this unset.
 # release-dev.sh 设置 CARGO_BUILD_FEATURES=dev-long-text，让优化后的 Dev 包保留长文本夹具；
@@ -60,7 +78,6 @@ BUNDLE_NAME="${BUNDLE_NAME:-$APP_BASENAME}"
 # Sparkle 2 is loaded by the Rust updater at runtime. Keep the framework out of git and copy a
 # locally downloaded release into the bundle when available. Set SPARKLE_FRAMEWORK_PATH to an
 # alternate checkout path; the default is vendor/Sparkle.framework.
-SPARKLE_FRAMEWORK_PATH="${SPARKLE_FRAMEWORK_PATH:-vendor/Sparkle.framework}"
 if [ -d "$SPARKLE_FRAMEWORK_PATH" ]; then
   mkdir -p "$APP/Contents/Frameworks"
   cp -R "$SPARKLE_FRAMEWORK_PATH" "$APP/Contents/Frameworks/Sparkle.framework"
@@ -88,6 +105,13 @@ SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://download.oh-my-tab.app/appcast.xml
 if [ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]; then
   /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" "$APP/Contents/Info.plist" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Set :SUPublicEDKey $SPARKLE_PUBLIC_ED_KEY" "$APP/Contents/Info.plist"
+fi
+if [ "${RELEASE_SIGNING:-0}" = "1" ] || [ "$REQUIRE_SPARKLE_UPDATE_SIGNING" = "1" ]; then
+  PACKAGED_ED_KEY="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$APP/Contents/Info.plist")"
+  if [ "$PACKAGED_ED_KEY" != "$SPARKLE_PUBLIC_ED_KEY" ]; then
+    echo "error: packaged SUPublicEDKey does not match SPARKLE_PUBLIC_ED_KEY" >&2
+    exit 1
+  fi
 fi
 
 # 应用图标:从 assets/AppIcon.icns 拷入 Contents/Resources/(放在 codesign 之前,纳入签名)。

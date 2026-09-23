@@ -103,8 +103,13 @@ fi
 echo "ℹ️  Generating appcast for $ARCHIVE_NAME"
 "$GENERATE_APPCAST" "${APPCAST_ARGS[@]}" "$WORK_DIR"
 EXPECTED_URL="${DOWNLOAD_PREFIX}${ARCHIVE_NAME}"
-if ! grep -Fq "url=\"$EXPECTED_URL\"" "$APPCAST_PATH"; then
+EXPECTED_ENCLOSURE="$(grep -F "url=\"$EXPECTED_URL\"" "$APPCAST_PATH" || true)"
+if [ -z "$EXPECTED_ENCLOSURE" ]; then
   echo "error: generated appcast does not contain the expected enclosure URL: $EXPECTED_URL" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$EXPECTED_ENCLOSURE" | grep -Eq 'sparkle:edSignature="[A-Za-z0-9+/]{86}=="'; then
+  echo "error: generated appcast enclosure is missing a valid-length Ed25519 signature" >&2
   exit 1
 fi
 echo "✅ Generated $APPCAST_PATH"

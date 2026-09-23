@@ -16,6 +16,12 @@ pub(super) struct SettingsPageBuildContext {
     pub(super) target: *mut AnyObject,
 }
 
+pub(super) struct SettingsPageFinalization {
+    pub(super) roots: [*mut AnyObject; 7],
+    pub(super) documents: [*mut AnyObject; 7],
+    pub(super) bottoms: [f64; 7],
+}
+
 /// Build the Switcher page and return its final keyboard-card bottom.
 /// 构建切换器页面，并返回键盘卡片的底边位置。
 pub(super) unsafe fn build_switcher_page(
@@ -362,30 +368,6 @@ pub(super) unsafe fn build_switcher_page(
 
 unsafe impl Send for SettingsPageBuildContext {}
 unsafe impl Sync for SettingsPageBuildContext {}
-
-impl SettingsPageBuildContext {
-    pub(super) fn new(
-        content: *mut AnyObject,
-        content_w: f64,
-        page_x: f64,
-        page_frame: NSRect,
-        page_viewport_h: f64,
-        palette: UiPalette,
-        layout: SettingsLayout,
-        target: *mut AnyObject,
-    ) -> Self {
-        Self {
-            content,
-            content_w,
-            page_x,
-            page_frame,
-            page_viewport_h,
-            palette,
-            layout,
-            target,
-        }
-    }
-}
 
 /// Build the General page and return its final content bottom.
 pub(super) unsafe fn build_general_page(
@@ -2257,11 +2239,14 @@ pub(super) unsafe fn finalize_settings_pages(
     page_frame: NSRect,
     content_w: f64,
     target: *mut AnyObject,
-    page_roots: [*mut AnyObject; 7],
-    page_documents: [*mut AnyObject; 7],
-    page_bottoms: [f64; 7],
+    pages: SettingsPageFinalization,
     ui: &mut SettingsUi,
 ) {
+    let SettingsPageFinalization {
+        roots: page_roots,
+        documents: page_documents,
+        bottoms: page_bottoms,
+    } = pages;
     let _: () = msg_send![content, addSubview: ui.permission_warning_view];
     release_obj(ui.permission_warning_view);
 

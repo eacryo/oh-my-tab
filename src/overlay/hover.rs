@@ -268,6 +268,7 @@ pub(crate) extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _e
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::cg_to_appkit_point;
     use crate::{NSPoint, NSRect, NSSize};

@@ -56,7 +56,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 
 发布前置条件：普通的 `cargo build` / `cargo test` 不需要 Sparkle；仓库已提交固定版本的 Sparkle 2 framework 到 `vendor/Sparkle.framework`，因此默认可构建带更新功能的 `.app`。仓库也包含固定版本 Sparkle 2.9.6 的 `vendor/Sparkle/bin/generate_keys` 和 `vendor/Sparkle/bin/generate_appcast`，用于生成密钥和 appcast；这两个工具是 macOS universal 二进制文件。相关工具许可证见 `vendor/Sparkle/LICENSE`。
 
-更新器代码会在运行时加载 `Contents/Frameworks/Sparkle.framework`。框架已提交在 `vendor/Sparkle.framework`（可用 `SPARKLE_FRAMEWORK_PATH` 覆盖路径），`bundle.sh` / `dev-restart.sh` 会自动拷贝它。生产应用包中的 `SUFeedURL` 默认是 `https://download.oh-my-tab.app/appcast.xml`，开发重启和开发发布脚本默认使用 `https://download.oh-my-tab.app/dev_release/appcast.xml`；也可用 `SPARKLE_FEED_URL` 覆盖。
+更新器只从应用包的 `Contents/Frameworks/Sparkle.framework` 加载 Sparkle。框架已提交在 `vendor/Sparkle.framework`；打包阶段可用 `SPARKLE_FRAMEWORK_PATH` 指定替代来源，`bundle.sh` / `dev-restart.sh` 会将其拷贝进应用包，运行中的应用不会读取该环境变量。生产应用包中的 `SUFeedURL` 默认是 `https://download.oh-my-tab.app/appcast.xml`，开发重启和开发发布脚本默认使用 `https://download.oh-my-tab.app/dev_release/appcast.xml`；也可用 `SPARKLE_FEED_URL` 覆盖。
 
 `appcast.xml` 和更新归档由发布者自行上传到 R2。生成 appcast 时使用 Sparkle 的 Ed25519 私钥；打包时只需把对应公钥通过 `SPARKLE_PUBLIC_ED_KEY` 注入 `SUPublicEDKey`。Sparkle 比较 `CFBundleVersion`（build number），脚本默认用 UTC 时间戳生成它；需要可复现的测试时再设置 `SPARKLE_BUILD_VERSION`。`CFBundleShortVersionString` 仍负责展示给用户的版本。私钥不要提交到仓库、不要放进应用包，也不要上传到 R2。
 

@@ -52,6 +52,7 @@ struct UpdateUiState {
     cancellation: usize,
     acknowledgement: usize,
     update_reply: usize,
+    information_url: String,
     permission_reply: usize,
     retry_termination: usize,
     progress: usize,
@@ -72,6 +73,7 @@ static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
         cancellation: 0,
         acknowledgement: 0,
         update_reply: 0,
+        information_url: String::new(),
         permission_reply: 0,
         retry_termination: 0,
         progress: 0,
@@ -94,6 +96,30 @@ const CHECK_LOADING_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟
 const CHECK_LOADING_CYCLE_SECONDS: f64 = 1.0;
 
 const RELEASE_NOTES_LOCALE_END: &str = "<!-- /locale -->";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdatePromptKind {
+    Available,
+    Downloaded,
+    Installing,
+    InformationOnly,
+}
+
+fn update_prompt_kind(stage: isize, information_only: bool) -> UpdatePromptKind {
+    if information_only {
+        return UpdatePromptKind::InformationOnly;
+    }
+    match stage {
+        1 => UpdatePromptKind::Downloaded,
+        2 => UpdatePromptKind::Installing,
+        _ => UpdatePromptKind::Available,
+    }
+}
+
+fn is_safe_update_info_url(url: &str) -> bool {
+    url.get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
 
 /// The dynamically registered subclass is retained by the Objective-C runtime forever.
 struct CustomDriverClass(*mut AnyObject);
@@ -145,17 +171,6 @@ unsafe fn send_bool_ptr(receiver: *mut AnyObject, selector: Sel, value: *mut c_v
 
 fn framework_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(path) = std::env::var("SPARKLE_FRAMEWORK_PATH") {
-        if !path.trim().is_empty() {
-            let path = PathBuf::from(path);
-            paths.push(if path.extension().is_some_and(|ext| ext == "framework") {
-                path.join("Sparkle")
-            } else {
-                path
-            });
-        }
-    }
-
     if let Ok(executable) = std::env::current_exe() {
         if let Some(contents) = executable.parent().and_then(Path::parent) {
             paths.push(contents.join("Frameworks/Sparkle.framework/Sparkle"));
@@ -328,24 +343,10 @@ unsafe fn log_sparkle_error(context: &str, error: *mut c_void) {
 fn log_update_network_context() {
     let feed_url = unsafe { bundle_feed_url() };
     let bundle_version = unsafe { bundle_info_string("CFBundleVersion") };
-    let proxy_flags = [
-        ("http", "HTTP_PROXY"),
-        ("https", "HTTPS_PROXY"),
-        ("all", "ALL_PROXY"),
-    ]
-    .into_iter()
-    .filter_map(|(label, variable)| std::env::var_os(variable).map(|_| label))
-    .collect::<Vec<_>>();
-    let proxy_summary = if proxy_flags.is_empty() {
-        "none".to_string()
-    } else {
-        proxy_flags.join(",")
-    };
     log_debug!(
-        "Sparkle update request context: feed={}, bundle-version={}, proxy-env={}",
+        "Sparkle update request context: feed={}, bundle-version={}",
         feed_url,
-        bundle_version,
-        proxy_summary
+        bundle_version
     );
 }
 
@@ -505,6 +506,7 @@ unsafe fn close_custom_update_window() {
     ui.acknowledgement = 0;
     release_block(ui.update_reply);
     ui.update_reply = 0;
+    ui.information_url.clear();
     release_block(ui.permission_reply);
     ui.permission_reply = 0;
     release_block(ui.retry_termination);
@@ -1404,6 +1406,8 @@ fn select_release_notes_locale(source: &str, locale: &str) -> String {
 unsafe fn make_custom_update_found_window(
     driver: *mut c_void,
     item: *mut c_void,
+    stage: isize,
+    information_only: bool,
     reply: *mut c_void,
 ) {
     close_custom_update_window();
@@ -1421,11 +1425,28 @@ unsafe fn make_custom_update_found_window(
     } else {
         version
     };
-    let title_text = tf("settings.update_available_title", &[("app", &app)]);
-    let message_text = tf(
-        "settings.update_available_message",
-        &[("app", &app), ("version", &version)],
-    );
+    let prompt_kind = update_prompt_kind(stage, information_only);
+    let title_key = match prompt_kind {
+        UpdatePromptKind::Available => "settings.update_available_title",
+        UpdatePromptKind::Downloaded => "settings.update_downloaded_title",
+        UpdatePromptKind::Installing => "settings.update_installing_title",
+        UpdatePromptKind::InformationOnly => "settings.update_information_title",
+    };
+    let title_text = tf(title_key, &[("app", &app)]);
+    let message_key = match prompt_kind {
+        UpdatePromptKind::Available => "settings.update_available_message",
+        UpdatePromptKind::Downloaded => "settings.update_downloaded_message",
+        UpdatePromptKind::Installing => "settings.update_installing_message",
+        UpdatePromptKind::InformationOnly => "settings.update_information_message",
+    };
+    let message_text = tf(message_key, &[("app", &app), ("version", &version)]);
+    let information_url = if prompt_kind == UpdatePromptKind::InformationOnly {
+        let url: *mut AnyObject = msg_send![item, infoURL];
+        let absolute_string: *mut AnyObject = msg_send![url, absoluteString];
+        nsstring_to_string(absolute_string)
+    } else {
+        String::new()
+    };
 
     let window_w = 640.0;
     let button_y = 14.0;
@@ -1441,19 +1462,36 @@ unsafe fn make_custom_update_found_window(
             (frame.size.width / window_w).max(0.1)
         }
     };
-    let skip_w = 166.0 * layout_scale;
+    let skip_w = if prompt_kind == UpdatePromptKind::InformationOnly {
+        180.0 * layout_scale
+    } else {
+        166.0 * layout_scale
+    };
     let later_w = 166.0 * layout_scale;
-    let install_w = 200.0 * layout_scale;
+    let install_w = if prompt_kind == UpdatePromptKind::InformationOnly {
+        180.0 * layout_scale
+    } else {
+        200.0 * layout_scale
+    };
 
     // Measure all actions through the shared settings button helper. The three buttons stay the
     // same height, so a long localized action cannot make only one control look misaligned.
     // 三个操作按钮统一复用设置页的换行测量逻辑，并取最高值，避免长本地化文案只撑高其中一个按钮。
-    let skip_title = t("settings.btn_skip_version");
+    let skip_title = match prompt_kind {
+        UpdatePromptKind::Installing => t("settings.btn_cancel_update_installation"),
+        UpdatePromptKind::InformationOnly => t("settings.btn_remind_later"),
+        _ => t("settings.btn_skip_version"),
+    };
+    let skip_action = if prompt_kind == UpdatePromptKind::InformationOnly {
+        sel!(dismissCustomUpdate:)
+    } else {
+        sel!(skipCustomUpdate:)
+    };
     let skip = crate::settings::components::SettingsButton::action(
         NSRect::new(NSPoint::new(32.0, button_y), NSSize::new(166.0, 36.0)),
         &skip_title,
         driver as *mut AnyObject,
-        sel!(skipCustomUpdate:),
+        skip_action,
         crate::settings::components::SettingsButtonRole::Action,
     );
     let skip_h = crate::settings::widgets::configure_settings_button_wrapping(skip, skip_w, 3);
@@ -1467,15 +1505,32 @@ unsafe fn make_custom_update_found_window(
         crate::settings::components::SettingsButtonRole::Action,
     );
     let later_h = crate::settings::widgets::configure_settings_button_wrapping(later, later_w, 3);
+    if prompt_kind == UpdatePromptKind::InformationOnly {
+        let _: () = msg_send![later, setHidden: true];
+    }
 
-    let install_title = t("settings.btn_install_update");
+    let install_title = match prompt_kind {
+        UpdatePromptKind::Installing => t("settings.btn_install_relaunch"),
+        UpdatePromptKind::InformationOnly => t("settings.btn_open_update_info"),
+        _ => t("settings.btn_install_update"),
+    };
+    let install_action = if prompt_kind == UpdatePromptKind::InformationOnly {
+        sel!(openInformationUpdate:)
+    } else {
+        sel!(installCustomUpdate:)
+    };
     let install = crate::settings::components::SettingsButton::action(
         NSRect::new(NSPoint::new(408.0, button_y), NSSize::new(200.0, 36.0)),
         &install_title,
         driver as *mut AnyObject,
-        sel!(installCustomUpdate:),
+        install_action,
         crate::settings::components::SettingsButtonRole::Primary,
     );
+    if prompt_kind == UpdatePromptKind::InformationOnly
+        && !is_safe_update_info_url(&information_url)
+    {
+        let _: () = msg_send![install, setEnabled: false];
+    }
     let key_equivalent = make_nsstring("\r");
     let _: () = msg_send![install, setKeyEquivalent: key_equivalent];
     crate::ffi::CFRelease(key_equivalent as *const c_void);
@@ -1581,17 +1636,28 @@ unsafe fn make_custom_update_found_window(
         );
     }
 
-    let skip_frame = NSRect::new(NSPoint::new(32.0, button_y), NSSize::new(166.0, button_h));
+    let (skip_frame, later_frame, install_frame) =
+        if prompt_kind == UpdatePromptKind::InformationOnly {
+            (
+                NSRect::new(NSPoint::new(128.0, button_y), NSSize::new(180.0, button_h)),
+                NSRect::new(NSPoint::new(0.0, button_y), NSSize::new(1.0, button_h)),
+                NSRect::new(NSPoint::new(332.0, button_y), NSSize::new(180.0, button_h)),
+            )
+        } else {
+            (
+                NSRect::new(NSPoint::new(32.0, button_y), NSSize::new(166.0, button_h)),
+                NSRect::new(NSPoint::new(220.0, button_y), NSSize::new(166.0, button_h)),
+                NSRect::new(NSPoint::new(408.0, button_y), NSSize::new(200.0, button_h)),
+            )
+        };
     let _: () = msg_send![skip, setFrame: skip_frame];
     add_control(target, window_w, skip, skip_frame, content);
     crate::settings::widgets::center_settings_button_label(skip, button_h);
 
-    let later_frame = NSRect::new(NSPoint::new(220.0, button_y), NSSize::new(166.0, button_h));
     let _: () = msg_send![later, setFrame: later_frame];
     add_control(target, window_w, later, later_frame, content);
     crate::settings::widgets::center_settings_button_label(later, button_h);
 
-    let install_frame = NSRect::new(NSPoint::new(408.0, button_y), NSSize::new(200.0, button_h));
     let _: () = msg_send![install, setFrame: install_frame];
     add_control(target, window_w, install, install_frame, content);
     crate::settings::widgets::center_settings_button_label(install, button_h);
@@ -1605,6 +1671,7 @@ unsafe fn make_custom_update_found_window(
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
     ui.window = window as usize;
     ui.update_reply = copied_reply;
+    ui.information_url = information_url;
 }
 
 fn format_download_bytes(bytes: u64) -> String {
@@ -1971,6 +2038,31 @@ extern "C" fn install_custom_update(_this: *mut c_void, _cmd: Sel, _sender: *mut
     unsafe { choose_custom_update(1) };
 }
 
+extern "C" fn open_information_update(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    unsafe {
+        let (reply, url) = {
+            let mut ui = UPDATE_UI_STATE.lock().unwrap();
+            (
+                std::mem::take(&mut ui.update_reply),
+                std::mem::take(&mut ui.information_url),
+            )
+        };
+        crate::settings::collapse_update_section();
+        close_custom_update_window();
+        if is_safe_update_info_url(&url) {
+            let url_ns = make_nsstring(&url);
+            let url_obj: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_ns];
+            let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+            if !url_obj.is_null() {
+                let _: bool = msg_send![workspace, openURL: url_obj];
+            }
+            crate::ffi::CFRelease(url_ns as *const c_void);
+        }
+        invoke_choice_reply(reply, 2);
+        release_block(reply);
+    }
+}
+
 extern "C" fn skip_custom_update(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     unsafe { choose_custom_update(0) };
 }
@@ -2224,22 +2316,23 @@ extern "C" fn show_update_found(
     reply: *mut c_void,
 ) {
     unsafe {
-        // Keep the marker for both background and user-initiated checks until the update is
-        // explicitly handled, so opening About does not make an actionable update disappear.
-        // 后台检查和手动检查都保留红点，直到用户明确处理更新，避免打开 About 后提示凭空消失。
-        crate::settings::set_update_available(true);
+        let information_only: bool = msg_send![item as *mut AnyObject, isInformationOnlyUpdate];
+        let stage: isize = msg_send![state as *mut AnyObject, stage];
         // 后台定时检查发现新版本:不打扰式弹窗,改发系统通知,选择 Later(下次检查再提醒);
         // 用户点击通知会跳转设置 About 页,发起一次用户级检查并在那里更新。
         // A scheduled background check that finds an update must not pop a window: post a
         // system notification instead and reply Later (reminded at the next check). Clicking
         // the banner opens Settings > About and starts a user-initiated check there.
         let user_initiated: bool = msg_send![state as *mut AnyObject, userInitiated];
+        // 仅供查看的信息更新没有可安装包，不显示为可安装更新红点。
+        // Informational updates have no installable payload; keep them out of the actionable badge.
+        crate::settings::set_update_available(!information_only);
         let auto_download = crate::config::CONFIG
             .read()
             .unwrap()
             .updates
             .automatically_download;
-        if !user_initiated && !auto_download {
+        if !user_initiated && (!auto_download || information_only) {
             let app = app_display_name();
             let display_version: *mut AnyObject =
                 msg_send![item as *mut AnyObject, displayVersionString];
@@ -2255,7 +2348,7 @@ extern "C" fn show_update_found(
             clear_inline_check();
             reset_check_button();
         }
-        make_custom_update_found_window(this, item, reply);
+        make_custom_update_found_window(this, item, stage, information_only, reply);
     }
 }
 
@@ -2455,6 +2548,12 @@ unsafe fn custom_driver_class() -> *mut AnyObject {
                 cls,
                 sel!(installCustomUpdate:),
                 install_custom_update as *mut c_void,
+                types_one_object.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(openInformationUpdate:),
+                open_information_update as *mut c_void,
                 types_one_object.as_ptr(),
             );
             class_addMethod(
@@ -2740,7 +2839,30 @@ pub(crate) fn check_for_updates() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_release_notes_markdown, select_release_notes_locale};
+    use super::{
+        is_safe_update_info_url, render_release_notes_markdown, select_release_notes_locale,
+        update_prompt_kind, UpdatePromptKind,
+    };
+
+    #[test]
+    fn update_prompt_matches_sparkle_stage_and_information_only_state() {
+        assert_eq!(update_prompt_kind(0, false), UpdatePromptKind::Available);
+        assert_eq!(update_prompt_kind(1, false), UpdatePromptKind::Downloaded);
+        assert_eq!(update_prompt_kind(2, false), UpdatePromptKind::Installing);
+        assert_eq!(update_prompt_kind(99, false), UpdatePromptKind::Available);
+        assert_eq!(
+            update_prompt_kind(2, true),
+            UpdatePromptKind::InformationOnly
+        );
+    }
+
+    #[test]
+    fn information_update_links_only_open_https_urls() {
+        assert!(is_safe_update_info_url("https://example.com/release"));
+        assert!(is_safe_update_info_url("HTTPS://example.com/release"));
+        assert!(!is_safe_update_info_url("http://example.com/release"));
+        assert!(!is_safe_update_info_url("file:///tmp/update"));
+    }
 
     #[test]
     fn renders_release_note_blocks_with_real_line_breaks() {

@@ -2699,7 +2699,7 @@ reverse_scroll = true
         assert_eq!(cfg.mouse.profiles.len(), 1);
         assert_eq!(cfg.mouse.profiles[0].reverse_scroll, Some(true));
         let persisted = std::fs::read_to_string(&path).unwrap();
-        assert!(persisted.contains("device_vendor_id") == false);
+        assert!(!persisted.contains("device_vendor_id"));
         assert!(persisted.contains("reverse_scroll"));
     }
 

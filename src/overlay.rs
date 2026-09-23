@@ -814,6 +814,7 @@ fn card_caption(title: &str, app_name: &str, show_app_name: bool) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::card_caption;
     use super::card_reconcile_action;

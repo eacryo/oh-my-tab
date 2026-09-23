@@ -102,6 +102,28 @@ validate_submission_id() {
   esac
 }
 
+validate_sparkle_update_bundle() {
+  local app_path="$1"
+  local plist="$app_path/Contents/Info.plist"
+  local public_key=""
+  local key_bytes=""
+
+  if [ ! -d "$app_path/Contents/Frameworks/Sparkle.framework" ]; then
+    echo "error: staged release is missing Sparkle.framework" >&2
+    exit 1
+  fi
+  if ! public_key="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" 2>/dev/null)" \
+    || [[ ! "$public_key" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    echo "error: staged release is missing a valid SUPublicEDKey" >&2
+    exit 1
+  fi
+  key_bytes="$(printf '%s' "$public_key" | /usr/bin/base64 -D 2>/dev/null | wc -c | tr -d '[:space:]')"
+  if [ "$key_bytes" != "32" ]; then
+    echo "error: staged SUPublicEDKey must decode to exactly 32 bytes" >&2
+    exit 1
+  fi
+}
+
 load_submission_id() {
   local saved_id=""
   if [ -s "$SUBMISSION_FILE" ]; then
@@ -306,6 +328,7 @@ case "$MODE" in
       echo "       Start and submit one with scripts/release.sh --notarize." >&2
       exit 1
     fi
+    validate_sparkle_update_bundle "$STAGED_APP"
     SUBMISSION_ID="$(load_submission_id)"
     require_accepted_submission "$SUBMISSION_ID"
 

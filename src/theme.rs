@@ -1486,7 +1486,7 @@ mod flow_tests {
         // 下限必须真的更小(否则等于白缩),且预览区仍在可辨认的下限之上。
         // The floor must actually be smaller (otherwise it shrinks for nothing) while the preview area
         // stays above its legibility floor.
-        assert!(THUMB_MIN_SCALE < 1.0);
+        const { assert!(THUMB_MIN_SCALE < 1.0) };
         let floor_card_h = thumb_card_h_for_scale(THUMB_MIN_SCALE);
         assert!(floor_card_h < thumb_card_h_for_scale(1.0));
         assert!(thumb_preview_h(floor_card_h) > 40.0);

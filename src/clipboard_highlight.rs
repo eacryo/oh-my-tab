@@ -1242,8 +1242,8 @@ mod tests {
     /// Map a display UTF-16 range back to a slice of the original source.
     fn utf16_slice(source: &str, range: NSRange) -> String {
         let units: Vec<u16> = source.encode_utf16().collect();
-        let start = range.location as usize;
-        let end = start + range.length as usize;
+        let start = range.location;
+        let end = start + range.length;
         String::from_utf16(&units[start..end]).expect("mapped range must stay on char boundaries")
     }
 

@@ -2133,7 +2133,7 @@ mod tests {
             source_key: String::new(),
             copied_at: None,
         };
-        let all = vec![file_entry, data_entry];
+        let all = [file_entry, data_entry];
         assert!(hash_referenced_by(all.iter().filter(|e| e.pinned), hash));
         assert!(!hash_referenced_by(
             all.iter().filter(|e| e.pinned),
@@ -2329,7 +2329,7 @@ mod tests {
         assert!(pitches[1] < pitches[0]);
         // 缩略图盒高 ≤ 行高(行能放下缩略图)。
         // The thumbnail box fits inside the row.
-        assert!(THUMB_H <= ROW_H);
+        const { assert!(THUMB_H <= ROW_H) };
     }
     #[test]
     fn duplicate_pinned_entry_stays_pinned_and_moves_to_pin_top() {
@@ -2502,7 +2502,7 @@ mod tests {
     #[test]
     fn expire_entries_deletes_image_cache_only_when_unreferenced() {
         use super::expire_entries;
-        let img = image(&b"expire-cache-test-bytes".to_vec());
+        let img = image(b"expire-cache-test-bytes");
         // 图片条目过期 → 缓存文件(数据 + 预览)一并删除。
         // An expired image entry takes its cache files (data + preview) with it.
         let mut h = vec![ClipEntry {
@@ -2524,7 +2524,7 @@ mod tests {
         // A pinned survivor sharing the hash keeps the cache files.
         // 重新写缓存:上一场景已把它删掉(同 hash 的"已删除"证据)。
         // Re-write the cache: the previous scenario deleted it (proof of the sweep).
-        let img = image(&b"expire-cache-test-bytes".to_vec());
+        let img = image(b"expire-cache-test-bytes");
         let mut h = vec![
             ClipEntry {
                 text: String::new(),
@@ -2684,7 +2684,7 @@ mod tests {
         assert_eq!(p2[1], p2[0] - GROUP_H);
         // 行距常量自检(防止意外回归):统一 61pt 行高。
         // Sanity-check the pitch constant (guards regressions): a uniform 61pt row.
-        assert!(ROW_H >= 50.0 && ROW_H < 80.0);
+        const { assert!(ROW_H >= 50.0 && ROW_H < 80.0) };
     }
     #[test]
     fn classify_text_distinguishes_urls_and_code() {

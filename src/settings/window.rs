@@ -763,9 +763,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         rebuild_settings_content_now();
 
         let states = with_settings_ui(|ui| {
-            let Some(ui) = ui.as_ref() else {
-                return None;
-            };
+            let ui = ui.as_ref()?;
             Some((
                 msg_send![ui.windows_enabled, state],
                 msg_send![ui.show_minimized, state],
@@ -1354,11 +1352,13 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 
         sidebar::build_settings_sidebar(
             content,
-            content_h,
-            view_w,
-            card_margin,
-            card_w,
-            card_radius,
+            sidebar::SettingsSidebarGeometry {
+                content_h,
+                view_w,
+                card_margin,
+                card_w,
+                card_radius,
+            },
             palette,
             target,
             &mut ui,
@@ -1372,7 +1372,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             NSPoint::new(page_x, 0.0),
             NSSize::new(detail_w - page_inset, page_viewport_h),
         );
-        let page_context = page_builder::SettingsPageBuildContext::new(
+        let page_context = page_builder::SettingsPageBuildContext {
             content,
             content_w,
             page_x,
@@ -1381,7 +1381,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             palette,
             layout,
             target,
-        );
+        };
         let content = page_context.content;
         let page_frame = page_context.page_frame;
         let _ = page_context.palette;
@@ -1485,33 +1485,35 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             page_frame,
             content_w,
             target,
-            [
-                general_root,
-                switcher_root,
-                mouse_root,
-                clipboard_root,
-                window_control_root,
-                quick_actions_root,
-                about_root,
-            ],
-            [
-                general_view,
-                switcher_view,
-                mouse_view,
-                clipboard_view,
-                window_control_view,
-                quick_actions_view,
-                about_view,
-            ],
-            [
-                general_content_bottom,
-                keyboard_card_bottom,
-                mouse_content_bottom,
-                clipboard_options_card_bottom,
-                window_control_shortcuts_card_bottom,
-                quick_actions_card_bottom,
-                compact_card_bottom,
-            ],
+            page_builder::SettingsPageFinalization {
+                roots: [
+                    general_root,
+                    switcher_root,
+                    mouse_root,
+                    clipboard_root,
+                    window_control_root,
+                    quick_actions_root,
+                    about_root,
+                ],
+                documents: [
+                    general_view,
+                    switcher_view,
+                    mouse_view,
+                    clipboard_view,
+                    window_control_view,
+                    quick_actions_view,
+                    about_view,
+                ],
+                bottoms: [
+                    general_content_bottom,
+                    keyboard_card_bottom,
+                    mouse_content_bottom,
+                    clipboard_options_card_bottom,
+                    window_control_shortcuts_card_bottom,
+                    quick_actions_card_bottom,
+                    compact_card_bottom,
+                ],
+            },
             &mut ui,
         );
 

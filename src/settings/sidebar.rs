@@ -3,17 +3,28 @@
 
 use super::*;
 
+pub(super) struct SettingsSidebarGeometry {
+    pub(super) content_h: f64,
+    pub(super) view_w: f64,
+    pub(super) card_margin: f64,
+    pub(super) card_w: f64,
+    pub(super) card_radius: f64,
+}
+
 pub(super) unsafe fn build_settings_sidebar(
     content: *mut AnyObject,
-    content_h: f64,
-    view_w: f64,
-    card_margin: f64,
-    card_w: f64,
-    card_radius: f64,
+    geometry: SettingsSidebarGeometry,
     palette: UiPalette,
     target: *mut AnyObject,
     ui: &mut SettingsUi,
 ) {
+    let SettingsSidebarGeometry {
+        content_h,
+        view_w,
+        card_margin,
+        card_w,
+        card_radius,
+    } = geometry;
     // --- 侧边栏 sidebar(悬浮玻璃卡片,系统设置同款观感)---
     // macOS 26+ 用 NSGlassEffectView(Liquid Glass,不设 tint 用系统默认);
     // 旧版用 NSVisualEffectView + sidebar 材质(经典磨砂侧边栏)。

@@ -483,6 +483,7 @@ pub(crate) fn drain_main() -> Vec<WindowServerEvent> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
