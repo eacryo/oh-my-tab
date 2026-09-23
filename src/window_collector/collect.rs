@@ -12,6 +12,7 @@ use super::*;
 /// second pass over the CG array and never depends on collection order).
 struct AxPartial {
     icon_ids: HashMap<i32, AppIdentity>,
+    hidden_app_pids: HashSet<i32>,
     /// AX 查询“成功但一个标准窗口都没有”的 pid。空结果**不是**否定证据:AX 只能看到
     /// 当前 Space(AppKit 的 kAXWindows 按当前 Space 过滤),原生全屏 Space 激活时,
     /// 所有后台 App 都会返空——所以这类结果不能直接当“这个 App 没有窗口”处理,而要先
@@ -38,6 +39,18 @@ struct AxPartial {
     ax_work_ms: u128,
 }
 
+fn should_filter_hidden_app(show_hidden_app_windows: bool, is_hidden: Option<bool>) -> bool {
+    !show_hidden_app_windows && is_hidden == Some(true)
+}
+
+unsafe fn application_is_hidden(pid: i32) -> Option<bool> {
+    let app: *mut AnyObject = msg_send![
+        class!(NSRunningApplication),
+        runningApplicationWithProcessIdentifier: pid
+    ];
+    (!app.is_null()).then(|| msg_send![app, isHidden])
+}
+
 /// 处理一段 PID:逐个解析应用身份 + 查询该应用的 AX 窗口列表。AX 远程查询支持
 /// 多线程(messaging timeout 按 element 隔离);resolve_app_identity 只读
 /// NSRunningApplication 属性 + stat。整段包 autoreleasepool 回收 ObjC 临时对象。
@@ -50,9 +63,14 @@ struct AxPartial {
 /// 调用方需保证无并发的 AX/ObjC 环境冲突(与主线程的 AX 使用互不共享元素)。
 /// The caller must ensure no conflicting concurrent use of shared AX/ObjC elements with
 /// the main thread.
-unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> AxPartial {
+unsafe fn ax_collect_chunk(
+    chunk: &[i32],
+    pid_names: &HashMap<i32, String>,
+    show_hidden_app_windows: bool,
+) -> AxPartial {
     let mut partial = AxPartial {
         icon_ids: HashMap::new(),
+        hidden_app_pids: HashSet::new(),
         ax_empty_pids: HashSet::new(),
         ax_recovered_wid_to_info: HashMap::new(),
         ax_failed_pids: Vec::new(),
@@ -65,6 +83,13 @@ unsafe fn ax_collect_chunk(chunk: &[i32], pid_names: &HashMap<i32, String>) -> A
     // as the background icon-extraction thread.
     let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
     for &pid in chunk {
+        let app_hidden = unsafe { application_is_hidden(pid) } == Some(true);
+        if app_hidden {
+            partial.hidden_app_pids.insert(pid);
+        }
+        if should_filter_hidden_app(show_hidden_app_windows, app_hidden.then_some(true)) {
+            continue;
+        }
         let t_pid = Instant::now();
         let identity = unsafe { resolve_app_identity(pid) };
         let process_start_time_us = identity.process_start_time_us;
@@ -227,6 +252,11 @@ unsafe fn collect_windows_for_pid_inner(
     focused_cgwid: u32,
 ) -> Option<Vec<WindowInfo>> {
     let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
+    let show_hidden_app_windows = CONFIG.read().unwrap().windows.show_hidden_app_windows;
+    let app_hidden = unsafe { application_is_hidden(pid) } == Some(true);
+    if should_filter_hidden_app(show_hidden_app_windows, app_hidden.then_some(true)) {
+        return Some(Vec::new());
+    }
     let array = CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ALL, 0);
     if array.is_null() {
         return None;
@@ -359,6 +389,7 @@ unsafe fn collect_windows_for_pid_inner(
             icon_path: icon_path.clone(),
             is_active: false,
             minimized: ax_info.minimized,
+            app_hidden,
             bounds,
         });
         shown.insert(cgwid);
@@ -413,6 +444,7 @@ unsafe fn collect_windows_for_pid_inner(
                 icon_path: icon_path.clone(),
                 is_active: false,
                 minimized: ax_info.minimized,
+                app_hidden,
                 bounds: (0.0, 0.0, 0.0, 0.0),
             });
         }
@@ -534,6 +566,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     bump_frontmost: bool,
 ) -> Vec<WindowInfo> {
     let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
+    let show_hidden_app_windows = CONFIG.read().unwrap().windows.show_hidden_app_windows;
     // 始终用 All 枚举(含离屏窗口)。原因:部分应用(如 JetBrains 系 IDE)在"主窗口被
     // 激活"时会把设置对话框 orderOut(隐藏但保留窗口对象)——它 isOnscreen=false,
     // OnScreenOnly 枚举不到,切换器就会"切到主窗口后设置窗口消失"(BetterCmdTab 用
@@ -644,6 +677,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // Pids whose AX query succeeded but yielded nothing: collected separately, never condemned
     // here.
     let mut ax_empty_pids: HashSet<i32> = HashSet::new();
+    let mut hidden_app_pids: HashSet<i32> = HashSet::new();
     // 每轮聚合 AX 查询失败,保留 CG 回退的诊断证据,同时避免逐应用成功日志刷屏。
     // Aggregate AX query failures once per collection so CG fallback remains diagnosable
     // without restoring noisy per-app success logs.
@@ -681,12 +715,13 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                             // as identity resolution); on an exception the chunk degrades to "no
                             // data" instead of terminating the process.
                             objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
-                                ax_collect_chunk(chunk, &pid_names)
+                                ax_collect_chunk(chunk, &pid_names, show_hidden_app_windows)
                             }))
                             .unwrap_or_else(|exception| {
                                 log_info!("[collect] ax exception (chunk) {:?}", exception);
                                 AxPartial {
                                     icon_ids: HashMap::new(),
+                                    hidden_app_pids: HashSet::new(),
                                     ax_empty_pids: HashSet::new(),
                                     ax_recovered_wid_to_info: HashMap::new(),
                                     ax_failed_pids: Vec::new(),
@@ -710,6 +745,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         // one chunk), so merge order cannot affect the outcome.
         for p in partials {
             icon_ids.extend(p.icon_ids);
+            hidden_app_pids.extend(p.hidden_app_pids);
             ax_empty_pids.extend(p.ax_empty_pids);
             ax_recovered_wid_to_info.extend(p.ax_recovered_wid_to_info);
             ax_failed_pids.extend(p.ax_failed_pids);
@@ -782,6 +818,9 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             ax_wid_to_info.len()
         );
     }
+    if !show_hidden_app_windows && !hidden_app_pids.is_empty() {
+        cg_window_layers.retain(|(pid, _), _| !hidden_app_pids.contains(pid));
+    }
     remember_non_normal_cg_windows(&cg_window_layers, &icon_ids, &ax_wid_to_info, &parent_ids);
 
     for i in 0..count {
@@ -801,6 +840,9 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 
         let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
         if owner_pid <= 0 {
+            continue;
+        }
+        if !show_hidden_app_windows && hidden_app_pids.contains(&owner_pid) {
             continue;
         }
 
@@ -983,6 +1025,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             icon_path,
             is_active: false,
             minimized,
+            app_hidden: hidden_app_pids.contains(&owner_pid),
             bounds,
         });
         shown.insert((owner_pid, cgwid));
@@ -1001,6 +1044,9 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // it stably). Entries are built from AX title/minimized; bounds are unknown
     // (off-screen), callers fall back to the main screen.
     for (&pid, wid_map) in ax_wid_to_info.iter() {
+        if !show_hidden_app_windows && hidden_app_pids.contains(&pid) {
+            continue;
+        }
         // 本应用窗口(设置窗口)走 CG 路径的 isOnscreen 过滤,这里不补:
         // 关闭(orderOut)时不应出现在切换器里。
         // Own windows (the settings window) go through the CG isOnscreen filter; not
@@ -1073,6 +1119,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 icon_path,
                 is_active: false,
                 minimized: ax_info.minimized,
+                app_hidden: hidden_app_pids.contains(&pid),
                 bounds: (0.0, 0.0, 0.0, 0.0),
             });
         }
@@ -1231,4 +1278,19 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         fm_ms
     );
     windows
+}
+
+#[cfg(test)]
+mod hidden_app_filter_tests {
+    use super::should_filter_hidden_app;
+
+    #[test]
+    fn hidden_app_filter_is_independent_and_fails_open_when_state_is_unknown() {
+        assert!(!should_filter_hidden_app(true, Some(true)));
+        assert!(!should_filter_hidden_app(true, Some(false)));
+        assert!(!should_filter_hidden_app(true, None));
+        assert!(should_filter_hidden_app(false, Some(true)));
+        assert!(!should_filter_hidden_app(false, Some(false)));
+        assert!(!should_filter_hidden_app(false, None));
+    }
 }

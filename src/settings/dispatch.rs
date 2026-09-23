@@ -24,6 +24,7 @@ pub(super) enum ControlField {
     LaunchAtLogin,
     WindowsEnabled,
     ShowMinimized,
+    ShowHiddenAppWindows,
     ThumbnailsEnabled,
     FocusedThumbnailPrewarm,
     ShowAppNameInCards,
@@ -83,6 +84,12 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             .or_else(|| m(u.launch_at_login, ControlField::LaunchAtLogin))
             .or_else(|| m(u.windows_enabled, ControlField::WindowsEnabled))
             .or_else(|| m(u.show_minimized, ControlField::ShowMinimized))
+            .or_else(|| {
+                m(
+                    u.show_hidden_app_windows,
+                    ControlField::ShowHiddenAppWindows,
+                )
+            })
             .or_else(|| m(u.thumbnails_enabled, ControlField::ThumbnailsEnabled))
             .or_else(|| {
                 m(
@@ -371,6 +378,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::ShowMinimized => {
                     let state: isize = msg_send![u.show_minimized, state];
                     cfg.windows.show_minimized = state == 1;
+                }
+                ControlField::ShowHiddenAppWindows => {
+                    let state: isize = msg_send![u.show_hidden_app_windows, state];
+                    cfg.windows.show_hidden_app_windows = state == 1;
                 }
                 ControlField::ThumbnailsEnabled => {
                     let idx: isize = msg_send![u.thumbnails_enabled, indexOfSelectedItem];
@@ -863,6 +874,7 @@ pub(super) unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
     let tooltip = t("settings.tooltip_windows_disabled");
     for &ctrl in &[
         ui.show_minimized,
+        ui.show_hidden_app_windows,
         ui.thumbnails_enabled,
         ui.focused_thumbnail_prewarm,
         ui.show_app_name_in_cards,

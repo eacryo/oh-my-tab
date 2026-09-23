@@ -205,6 +205,9 @@ pub struct WindowsSection {
     // Defaults to false (hide minimized windows, matching prior behavior); bool::default() is
     // false, so Default can be derived directly.
     pub show_minimized: bool,
+    // 默认不显示通过 Command+H 隐藏的应用窗口。
+    // Do not show windows belonging to Command+H-hidden apps by default.
+    pub show_hidden_app_windows: bool,
     // 浮窗显示位置:"active_window" = 跟随激活窗口所在屏幕,"main" = 始终显示在主屏幕。
     // 默认跟随激活窗口(多显示器用户开箱即得新体验)。
     // Overlay display position: "active_window" = follow the active window's screen,
@@ -221,6 +224,7 @@ impl Default for WindowsSection {
         Self {
             enabled: true,
             show_minimized: false,
+            show_hidden_app_windows: false,
             overlay_position: "active_window".to_string(),
             activation_mode: "hover".to_string(),
         }
@@ -1103,6 +1107,12 @@ impl Config {
             }
             if !errs
                 .iter()
+                .any(|e| e.starts_with("windows.show_hidden_app_windows"))
+            {
+                self.windows.show_hidden_app_windows = other.windows.show_hidden_app_windows;
+            }
+            if !errs
+                .iter()
                 .any(|e| e.starts_with("windows.overlay_position"))
             {
                 self.windows.overlay_position = other.windows.overlay_position;
@@ -1977,7 +1987,10 @@ mod tests {
 
     #[test]
     fn defaults_validate_clean() {
-        assert_err_count(&Config::default(), 0);
+        let cfg = Config::default();
+        assert_err_count(&cfg, 0);
+        assert!(!cfg.windows.show_minimized);
+        assert!(!cfg.windows.show_hidden_app_windows);
     }
 
     #[test]
@@ -2311,6 +2324,7 @@ mod tests {
         cfg.windows.overlay_position = "main".into();
         cfg.windows.activation_mode = "click".into();
         cfg.windows.show_minimized = true;
+        cfg.windows.show_hidden_app_windows = false;
         cfg.windows.enabled = false; // 非默认值:验证 roundtrip / non-default: verify the roundtrip
         cfg.mouse.enabled = true;
         cfg.mouse.profiles = vec![
@@ -2348,6 +2362,7 @@ mod tests {
         assert_eq!(loaded.windows.overlay_position, "main");
         assert_eq!(loaded.windows.activation_mode, "click");
         assert!(loaded.windows.show_minimized);
+        assert!(!loaded.windows.show_hidden_app_windows);
         assert!(!loaded.windows.enabled);
         // mouse profiles 原样保留(通配档 + per-device 档各一条)。
         // Mouse profiles survive untouched (one wildcard + one per-device).

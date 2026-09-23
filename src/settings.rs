@@ -200,7 +200,8 @@ pub(super) struct SettingsUi {
     modifier: *mut AnyObject,        // NSPopUpButton: option / command
     locale: *mut AnyObject,          // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject,  // NSSwitch: 显示最小化窗口 / show minimized windows
-    thumbnails_enabled: *mut AnyObject, // NSPopUpButton: 窗口显示模式 / window display mode
+    show_hidden_app_windows: *mut AnyObject, // NSSwitch: 显示已隐藏应用窗口 / show hidden-app windows
+    thumbnails_enabled: *mut AnyObject,      // NSPopUpButton: 窗口显示模式 / window display mode
     focused_thumbnail_prewarm: *mut AnyObject, // NSSwitch: 前台窗口缩略图后台预热 / focused thumbnail prewarm
     show_app_name_in_cards: *mut AnyObject, // NSSwitch: 卡片标题显示应用名 / app name in card titles
     card_text_size: *mut AnyObject,         // NSSlider: 卡片文字大小 / card text size
@@ -1379,6 +1380,15 @@ fn load_settings_from(cfg: &Config) {
                 0isize
             };
             let _: () = msg_send![ui.show_minimized, setState: sm_state];
+            let hidden_app_windows_state = if cfg.windows.show_hidden_app_windows {
+                1isize
+            } else {
+                0isize
+            };
+            let _: () = msg_send![
+                ui.show_hidden_app_windows,
+                setState: hidden_app_windows_state
+            ];
             // 窗口显示模式 index 0 = 仅图标, 1 = 图标和缩略图。
             // Window display mode index 0 = icons only, 1 = icons and thumbnails.
             let th_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };

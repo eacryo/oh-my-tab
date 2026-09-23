@@ -752,6 +752,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         let mut cfg = CONFIG.read().unwrap().clone();
         cfg.windows.enabled = true;
         cfg.windows.show_minimized = true;
+        cfg.windows.show_hidden_app_windows = true;
         cfg.layout.thumbnails_enabled = true;
         cfg.layout.focused_thumbnail_prewarm = true;
         cfg.layout.show_app_name_in_cards = true;
@@ -767,6 +768,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
             Some((
                 msg_send![ui.windows_enabled, state],
                 msg_send![ui.show_minimized, state],
+                msg_send![ui.show_hidden_app_windows, state],
                 msg_send![ui.thumbnails_enabled, indexOfSelectedItem],
                 msg_send![ui.focused_thumbnail_prewarm, state],
                 msg_send![ui.show_app_name_in_cards, state],
@@ -774,7 +776,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         });
         hide_settings();
 
-        states == Some((1isize, 1isize, 1isize, 1isize, 1isize))
+        states == Some((1isize, 1isize, 1isize, 1isize, 1isize, 1isize))
     }
 }
 
@@ -1261,6 +1263,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
             show_minimized: std::ptr::null_mut(),
+            show_hidden_app_windows: std::ptr::null_mut(),
             windows_enabled: std::ptr::null_mut(),
             overlay_position: std::ptr::null_mut(),
             activation_mode: std::ptr::null_mut(),

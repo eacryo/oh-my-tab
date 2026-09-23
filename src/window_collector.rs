@@ -86,6 +86,7 @@ pub struct WindowInfo {
     pub icon_path: Option<String>,
     pub is_active: bool,
     pub minimized: bool, // 最小化窗口(show_minimized 打开时才收集)/ minimized (collected only when show_minimized is on)
+    pub app_hidden: bool, // 应用通过 Command+H 隐藏 / app hidden with Command+H
     // CG 窗口 bounds (x, y, w, h),用于确定激活窗口所在屏幕。全 0 表示未获取到。
     // CG window bounds (x, y, w, h), used to locate the active window's screen. All zeros = unavailable.
     pub bounds: (f64, f64, f64, f64),
@@ -666,6 +667,7 @@ mod tests {
             icon_path: None,
             is_active: false,
             minimized: false,
+            app_hidden: false,
             bounds: (0.0, 0.0, 0.0, 0.0),
         }
     }

@@ -778,6 +778,25 @@ impl SettingsRow {
         )
     }
 
+    /// Use the space before a control column for the label instead of imposing a fixed width.
+    /// 按控件列左侧的可用空间自适应标题宽度，避免长标题提前换行或与控件相撞。
+    pub(super) unsafe fn tall_before_control(
+        parent: *mut AnyObject,
+        label_x: f64,
+        y: f64,
+        control_left_x: f64,
+        gap: f64,
+        label_text: &str,
+        control: *mut AnyObject,
+    ) -> (*mut AnyObject, *mut AnyObject) {
+        let label_w = Self::label_width_before_control(label_x, control_left_x, gap);
+        Self::tall(parent, label_x, y, label_w, label_text, control)
+    }
+
+    fn label_width_before_control(label_x: f64, control_left_x: f64, gap: f64) -> f64 {
+        (control_left_x - label_x - gap).max(1.0)
+    }
+
     pub(super) unsafe fn tall_with_height(
         parent: *mut AnyObject,
         label_x: f64,
@@ -2549,7 +2568,9 @@ impl SettingsSidebarTab {
 
 #[cfg(test)]
 mod tests {
-    use super::{sidebar_item_frames, sidebar_tracking_rect, SettingsButtonRole, SettingsLayout};
+    use super::{
+        sidebar_item_frames, sidebar_tracking_rect, SettingsButtonRole, SettingsLayout, SettingsRow,
+    };
     use crate::settings::SETTINGS_CONTROL_TRAILING_INSET;
 
     #[test]
@@ -2585,6 +2606,22 @@ mod tests {
         assert_eq!(layout.row_gap, 8.0);
         assert_eq!(layout.card_bottom(100.0), 90.0);
         assert_eq!(layout.card_top(100.0), 96.0);
+    }
+
+    #[test]
+    fn row_label_width_tracks_the_space_before_the_control_column() {
+        assert_eq!(
+            SettingsRow::label_width_before_control(12.0, 420.0, 18.0),
+            390.0
+        );
+        assert_eq!(
+            SettingsRow::label_width_before_control(12.0, 320.0, 18.0),
+            290.0
+        );
+        assert_eq!(
+            SettingsRow::label_width_before_control(12.0, 20.0, 18.0),
+            1.0
+        );
     }
 
     /// The page-top rhythm -- title, first heading, its card and that card's first row -- is owned

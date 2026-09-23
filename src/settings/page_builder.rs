@@ -85,19 +85,32 @@ pub(super) unsafe fn build_switcher_page(
     let windows_options_header_y = y;
     y = layout.next_row_cursor(y, described_row_h);
     // show_minimized 开关(切换器语义本就只有显/隐两态,用 Toggle 比下拉更直观)。
-    // 英文标签较长,该行标签加宽;开关保留参考页面的右侧内边距。
-    // show_minimized is inherently two-state, so a toggle is clearer than a popup. The long
-    // English label uses a wider label column, while the switch stays aligned to the popups.
-    ui.show_minimized = SettingsRow::tall(
+    // 标题宽度延伸到控件列前,随设置页可用宽度自适应。
+    // Let the label fill the space before the control column, adapting to the available page width.
+    ui.show_minimized = SettingsRow::tall_before_control(
         switcher_view,
         label_x,
         y,
-        220.0,
+        ctrl_x,
+        18.0,
         &t("settings.row_show_minimized"),
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
     )
     .1;
     bind_control(target, ui.show_minimized);
+    y = layout.next_row_cursor(y, described_row_h);
+    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    ui.show_hidden_app_windows = SettingsRow::tall_before_control(
+        switcher_view,
+        label_x,
+        y,
+        ctrl_x,
+        18.0,
+        &t("settings.row_show_hidden_app_windows"),
+        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+    )
+    .1;
+    bind_control(target, ui.show_hidden_app_windows);
     // 窗口显示模式:仅图标或图标和缩略图;配置仍由 thumbnails_enabled 布尔值保存。
     // Window display mode: icons only or icons and thumbnails; the config remains stored as
     // the thumbnails_enabled boolean.

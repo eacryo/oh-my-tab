@@ -169,6 +169,54 @@ unsafe fn add_preview_icon_fallback(
     }
 }
 
+fn needs_visibility_badge(minimized: bool, app_hidden: bool) -> bool {
+    minimized || app_hidden
+}
+
+unsafe fn add_visibility_badge_if_needed(
+    container: *mut AnyObject,
+    preview_width: f64,
+    preview_height: f64,
+    w: &WindowInfo,
+) {
+    if !needs_visibility_badge(w.minimized, w.app_hidden) {
+        return;
+    }
+
+    let symbol_size = 22.0f64.min(preview_width).min(preview_height);
+    let symbol_frame = NSRect::new(
+        NSPoint::new(
+            (preview_width - THUMB_PAD - symbol_size).max(0.0),
+            (preview_height - THUMB_PAD - symbol_size).max(0.0),
+        ),
+        NSSize::new(symbol_size, symbol_size),
+    );
+    let symbol_name = make_nsstring("eye.slash.fill");
+    let symbol: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: symbol_name,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(symbol_name as *const c_void);
+    if !symbol.is_null() {
+        let _: () = msg_send![symbol, setTemplate: true];
+        let _: () = msg_send![symbol, setSize: NSSize::new(symbol_size, symbol_size)];
+        let icon: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+        let icon: *mut AnyObject = msg_send![icon, initWithFrame: symbol_frame];
+        let _: () = msg_send![icon, setWantsLayer: true];
+        let _: () = msg_send![icon, setImage: symbol];
+        let _: () = msg_send![icon, setImageScaling: 3u64];
+        let _: () = msg_send![icon, setContentTintColor: hex_to_ns_color(0xFFFFFFFF)];
+        let icon_layer: *mut AnyObject = msg_send![icon, layer];
+        layer_set_shadow_color(icon_layer, hex_to_cg_color(0x000000B3));
+        let _: () = msg_send![icon_layer, setShadowOpacity: 0.85f32];
+        let _: () = msg_send![icon_layer, setShadowRadius: 2.0f64];
+        let _: () = msg_send![icon_layer, setShadowOffset: NSSize::new(0.0, -1.0)];
+        let _: () = msg_send![container, addSubview: icon];
+        release_obj(icon);
+    }
+}
+
 /// 只替换预览容器内部的图像/图标内容，保留卡片标题、按钮、tracking area、图层和
 /// 选中态。缩略图异步到达时不再销毁重建整张卡片。
 /// Replace only the image/icon content inside a preview container, preserving the
@@ -198,6 +246,7 @@ pub(super) unsafe fn populate_thumbnail_preview(
     };
     let Some((cg, w_px, h_px)) = thumb else {
         add_preview_icon_fallback(container, pw, ph, w, colors);
+        add_visibility_badge_if_needed(container, pw, ph, w);
         return;
     };
 
@@ -206,6 +255,7 @@ pub(super) unsafe fn populate_thumbnail_preview(
     CFRelease(cg); // lookup 给的 +1 已被 NSImage 持有 / NSImage retains its own copy
     if nsimg.is_null() {
         add_preview_icon_fallback(container, pw, ph, w, colors);
+        add_visibility_badge_if_needed(container, pw, ph, w);
         return;
     }
     let shown: *mut AnyObject = if w.minimized {
@@ -228,6 +278,7 @@ pub(super) unsafe fn populate_thumbnail_preview(
     let _: () = msg_send![iv, setImageScaling: 2u64]; // exact size, no additional scaling
     let _: () = msg_send![container, addSubview: iv];
     release_obj(iv);
+    add_visibility_badge_if_needed(container, pw, ph, w);
 }
 
 pub(crate) fn create_card_view(
@@ -1190,5 +1241,18 @@ pub(crate) fn show_overlay() {
             t_icons.elapsed().as_millis(),
             total_ms
         );
+    }
+}
+
+#[cfg(test)]
+mod visibility_badge_tests {
+    use super::needs_visibility_badge;
+
+    #[test]
+    fn hidden_or_minimized_windows_receive_visibility_badge() {
+        assert!(needs_visibility_badge(true, false));
+        assert!(needs_visibility_badge(false, true));
+        assert!(needs_visibility_badge(true, true));
+        assert!(!needs_visibility_badge(false, false));
     }
 }

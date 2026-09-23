@@ -1017,6 +1017,7 @@ mod tests {
                 icon_path: None,
                 is_active: false,
                 minimized: false,
+                app_hidden: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1051,6 +1052,7 @@ mod tests {
                 icon_path: None,
                 is_active: true,
                 minimized: false,
+                app_hidden: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1079,6 +1081,7 @@ mod tests {
                 icon_path: None,
                 is_active: false,
                 minimized: false,
+                app_hidden: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1102,6 +1105,7 @@ mod tests {
                 icon_path: None,
                 is_active: false,
                 minimized: false,
+                app_hidden: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1134,6 +1138,7 @@ mod tests {
                 icon_path: None,
                 is_active: true,
                 minimized: false,
+                app_hidden: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
