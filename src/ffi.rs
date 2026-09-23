@@ -156,6 +156,15 @@ extern "C" {
         element: AXUIElementRef,
         action: *const c_void,
     ) -> AXError;
+    /// 枚举元素支持的动作名(kAXActionNames)。用于探测 AppKit 挂在缩放按钮上的私有动作
+    /// `AXZoomWindow`——公开头文件里只有 `kAXPressAction`,没有它。
+    /// Enumerate an element's supported action names (kAXActionNames). Used to probe for
+    /// `AXZoomWindow`, the private action AppKit attaches to the zoom button; the public headers
+    /// only declare `kAXPressAction`.
+    pub(crate) fn AXUIElementCopyActionNames(
+        element: AXUIElementRef,
+        names: *mut *const c_void,
+    ) -> AXError;
     pub(crate) fn AXUIElementSetAttributeValue(
         element: AXUIElementRef,
         attribute: *const c_void,

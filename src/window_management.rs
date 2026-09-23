@@ -24,10 +24,11 @@ use crate::event_tap::{
     K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
 };
 use crate::ffi::{
-    kCFBooleanFalse, kCFBooleanTrue, AXError, AXUIElementCopyAttributeValue,
-    AXUIElementCreateApplication, AXUIElementPerformAction, AXUIElementRef,
-    AXUIElementSetAttributeValue, AXUIElementSetMessagingTimeout, AXValueCreate, AXValueGetValue,
-    CFBooleanGetValue, CFRelease, K_AX_SUCCESS,
+    kCFBooleanFalse, kCFBooleanTrue, AXError, AXUIElementCopyActionNames,
+    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementPerformAction,
+    AXUIElementRef, AXUIElementSetAttributeValue, AXUIElementSetMessagingTimeout, AXValueCreate,
+    AXValueGetValue, CFArrayGetCount, CFArrayGetValueAtIndex, CFBooleanGetValue, CFRelease,
+    K_AX_SUCCESS,
 };
 use crate::window_collector::{ax_window_cgwid, cf_string_new, cf_to_rust_string};
 use crate::{log_debug, log_info};
@@ -56,6 +57,12 @@ const K_AX_MINIMIZED: &str = "AXMinimized";
 const K_AX_SUBROLE: &str = "AXSubrole";
 const K_AX_ZOOM_BUTTON: &str = "AXZoomButton";
 const K_AX_PRESS: &str = "AXPress";
+// AppKit 挂在缩放按钮上的私有动作名:执行窗口自己的缩放(`performZoom:`),与双击标题栏 /
+// Option+点绿钮等价。公开头文件(AXActionConstants.h)里没有对应常量,只能当字符串用。
+// Private action name AppKit attaches to the zoom button: performs the window's own zoom
+// (`performZoom:`), the same thing double-clicking the title bar or Option-clicking the green
+// button does. No public constant exists in AXActionConstants.h, so it stays a literal.
+const K_AX_ZOOM_WINDOW: &str = "AXZoomWindow";
 // 全屏窗口(AXFullScreen)不参与 snap:原生全屏有独立的空间管理。
 // Fullscreen windows (AXFullScreen) never snap: native fullscreen has its own space management.
 const K_AX_SUBROLE_FULL_SCREEN: &str = "AXFullScreen";
@@ -166,9 +173,9 @@ pub(crate) enum Plan {
     /// 把窗口设置为目标矩形(AX 坐标)。
     /// Set the window frame to the target rect (AX coordinates).
     Move(AxRect),
-    /// 最大化到当前屏幕可视区;AX 精确设置失败时由执行层回退到原生缩放按钮。
+    /// 最大化到当前屏幕可视区;AX 精确设置失败时由执行层回退到原生缩放动作(`AXZoomWindow`)。
     /// Maximize to the current screen's visible area; execution falls back to the native zoom
-    /// button when the AX exact-frame write is rejected.
+    /// action (`AXZoomWindow`) when the AX exact-frame write is rejected.
     Maximize(AxRect),
     /// 最小化(AXMinimized = true)。
     /// Minimize (AXMinimized = true).
@@ -269,27 +276,63 @@ fn rect_close(a: AxRect, b: AxRect) -> bool {
         && (a.h - b.h).abs() <= FRAME_EPSILON
 }
 
+/// 状态推断与最大化验收的容差(点)。App 会把窗口吸附到自己的内部网格——终端按文本行吸附,
+/// 写 visibleFrame 得到 915 而不是 923,半屏目标 461.5 实测回来是 464。
+/// 写入校验(FRAME_EPSILON)仍按精确值走,但**推断**必须容忍这种网格:否则吸附后的窗口会被判成
+/// "普通",于是 ↓ 去最小化、↑ 重新最大化。相邻 snap 目标至少相差 ~230pt,这个容差不会混淆它们。
+/// Tolerance for state inference and maximize acceptance, in points. Apps snap windows to an
+/// internal grid: Terminal snaps to text rows and lands 915 where visibleFrame is 923, and returns
+/// 464 where the half is 461.5. Write *verification* stays exact (FRAME_EPSILON), but *inference*
+/// must tolerate that grid -- otherwise a snapped window reads as "normal", making Down minimize it
+/// and Up re-maximize it. Adjacent snap targets are at least ~230pt apart, so this cannot confuse
+/// them.
+const SNAP_EPSILON: f64 = 16.0;
+
+/// 矩形相似比较:每一对对应值都在 eps 内。
+/// Rectangular closeness: every corresponding pair of values is within eps.
+fn rect_close_with(a: AxRect, b: AxRect, eps: f64) -> bool {
+    (a.x - b.x).abs() <= eps
+        && (a.y - b.y).abs() <= eps
+        && (a.w - b.w).abs() <= eps
+        && (a.h - b.h).abs() <= eps
+}
+
+/// 窗口是否已铺满可视区(四边各自与 visibleFrame 的偏差都在 SNAP_EPSILON 内;纯函数,单测覆盖)。
+/// Whether the window fills the visible area (each of its four edges is within SNAP_EPSILON of
+/// visibleFrame's; pure, unit-tested).
+fn fills_visible(a: AxRect, v: AxRect) -> bool {
+    (a.x - v.x).abs() <= SNAP_EPSILON
+        && (a.y - v.y).abs() <= SNAP_EPSILON
+        && ((a.x + a.w) - (v.x + v.w)).abs() <= SNAP_EPSILON
+        && ((a.y + a.h) - (v.y + v.h)).abs() <= SNAP_EPSILON
+}
+
 /// 按当前 frame 推断 snap 状态;都不匹配即普通窗口(纯函数,单测覆盖)。
 /// Infer the snap state from the current frame; no match means normal (pure; unit-tested).
 pub(crate) fn infer_state(frame: AxRect, visible: AxRect) -> SnapState {
     let f = snap_frames(visible);
-    if rect_close(frame, f.max) {
+    // 最大化先用宽松判定:部分 App(如终端)的"最大化"就是比 visibleFrame 短一行,严格匹配会
+    // 把已最大化的窗口判成普通,于是每次 Option+↑ 都重新触发一遍最大化。
+    // Maximize is matched loosely first: for some apps (Terminal) "maximized" is exactly one row
+    // short of visibleFrame, so a strict match would call it Normal and re-trigger maximize on
+    // every Option+Up.
+    if fills_visible(frame, f.max) {
         SnapState::Maximized
-    } else if rect_close(frame, f.top) {
+    } else if rect_close_with(frame, f.top, SNAP_EPSILON) {
         SnapState::TopHalf
-    } else if rect_close(frame, f.bottom) {
+    } else if rect_close_with(frame, f.bottom, SNAP_EPSILON) {
         SnapState::BottomHalf
-    } else if rect_close(frame, f.left) {
+    } else if rect_close_with(frame, f.left, SNAP_EPSILON) {
         SnapState::LeftHalf
-    } else if rect_close(frame, f.right) {
+    } else if rect_close_with(frame, f.right, SNAP_EPSILON) {
         SnapState::RightHalf
-    } else if rect_close(frame, f.top_left) {
+    } else if rect_close_with(frame, f.top_left, SNAP_EPSILON) {
         SnapState::TopLeft
-    } else if rect_close(frame, f.top_right) {
+    } else if rect_close_with(frame, f.top_right, SNAP_EPSILON) {
         SnapState::TopRight
-    } else if rect_close(frame, f.bottom_left) {
+    } else if rect_close_with(frame, f.bottom_left, SNAP_EPSILON) {
         SnapState::BottomLeft
-    } else if rect_close(frame, f.bottom_right) {
+    } else if rect_close_with(frame, f.bottom_right, SNAP_EPSILON) {
         SnapState::BottomRight
     } else {
         SnapState::Normal
@@ -1026,9 +1069,9 @@ pub(crate) fn maximize_focused_window_of_pid(pid: i32) -> bool {
                 let cur = screen_index_for(frame, &screens);
                 if infer_state(frame, screens[cur].visible) != SnapState::Maximized {
                     let target = snap_frames(screens[cur].visible).max;
-                    if !set_frame(win, target) {
-                        // AX 精确写被拒时退回原生缩放按钮(与窗口控制同策略)。
-                        // Fall back to the native zoom button when the exact AX write is
+                    if !set_frame_maximized(win, target) {
+                        // AX 精确写被拒时退回原生缩放动作(与窗口控制同策略)。
+                        // Fall back to the native zoom action when the exact AX write is
                         // rejected (same policy as window control).
                         press_native_zoom(win);
                     }
@@ -1047,18 +1090,24 @@ pub(crate) fn maximize_focused_window_of_pid(pid: i32) -> bool {
 unsafe fn execute(plan: Plan, win: AXUIElementRef, dir: Direction) {
     match plan {
         Plan::Move(r) => {
-            let _ = set_frame(win, r);
+            // 吸附写入也容忍 App 网格(见 SNAP_EPSILON):终端半屏目标 461.5,实际回来 464。
+            // 这里只影响验收结论与日志——Move 没有回退动作;跳屏 staging 仍用严格的 set_frame。
+            // Snap writes tolerate the app grid too (see SNAP_EPSILON): Terminal returns 464 where
+            // the half is 461.5. This only affects the verdict and the log (Move has no fallback);
+            // cross-display staging keeps the strict set_frame.
+            let _ = set_frame_with(win, r, |a| rect_close_with(a, r, SNAP_EPSILON));
         }
         Plan::Maximize(r) => {
-            if !set_frame(win, r) {
-                // 某些 App 会接受 AXPosition 却拒绝 AXSize;此时原生缩放按钮仍能完成
-                // 系统级最大化,避免出现“窗口只移到顶端、底部没铺满”的半成功状态。
-                // Some apps accept AXPosition but reject AXSize; the native zoom button can
-                // still perform the system-level maximize and avoids a position-only result.
+            if !set_frame_maximized(win, r) {
+                // 某些 App 会接受 AXPosition 却拒绝 AXSize;此时退回原生缩放**动作**。
+                // 该动作是 `AXZoomWindow`(App 自己的缩放),绝不是绿钮的 AXPress——后者自
+                // macOS 10.11 起是"切换全屏",终端等 App 会因此进全屏。
+                // Some apps accept AXPosition but reject AXSize; fall back to the native zoom
+                // action. That action is `AXZoomWindow` (the app's own zoom), never the green
+                // button's AXPress, which toggles fullscreen since macOS 10.11.
                 log_debug!("[winctl] exact maximize frame rejected; trying native zoom fallback");
-                let zoom_err = press_native_zoom(win);
-                if zoom_err != K_AX_SUCCESS {
-                    log_info!("[winctl] native zoom fallback failed: {}", zoom_err);
+                if !press_native_zoom(win) {
+                    log_info!("[winctl] native zoom fallback unavailable");
                 }
             }
         }
@@ -1158,9 +1207,11 @@ unsafe fn set_ax_value(
 }
 
 /// 写窗口 frame:先位置后尺寸,避免放大时暂时越过屏幕边界;失败时再用反向顺序重试。
+/// `accept` 判定回读结果是否算成功(精确 snap 用 `rect_close`,最大化用 `fills_visible`)。
 /// Set the window frame position-first to avoid transient off-screen overflow while growing;
-/// retry in the reverse order if either AX write is rejected.
-unsafe fn set_frame(win: AXUIElementRef, r: AxRect) -> bool {
+/// retry in the reverse order if either AX write is rejected. `accept` decides whether the
+/// read-back counts as success (exact snaps use `rect_close`, maximize uses `fills_visible`).
+unsafe fn set_frame_with(win: AXUIElementRef, r: AxRect, accept: impl Fn(AxRect) -> bool) -> bool {
     let sz = CgSize { w: r.w, h: r.h };
     let pt = CgPoint { x: r.x, y: r.y };
     // 先移动再放大,确保扩展后的窗口不会因为暂时越过屏幕边界而被 App 拒绝。
@@ -1219,15 +1270,29 @@ unsafe fn set_frame(win: AXUIElementRef, r: AxRect) -> bool {
         );
         return false;
     };
-    let matches = rect_close(actual, r);
-    if !matches {
-        log_info!(
-            "[winctl] frame mismatch after AX write: target={:?} actual={:?}",
-            r,
-            actual
-        );
+    if accept(actual) {
+        return true;
     }
-    matches
+    log_info!(
+        "[winctl] frame mismatch after AX write: target={:?} actual={:?}",
+        r,
+        actual
+    );
+    false
+}
+
+/// 精确 set_frame:跳屏 staging(容差 FRAME_EPSILON,验收结果会决定是否走回退重试)。
+/// Exact set_frame for cross-display staging (FRAME_EPSILON tolerance; the verdict decides whether
+/// a fallback retry runs).
+unsafe fn set_frame(win: AXUIElementRef, r: AxRect) -> bool {
+    set_frame_with(win, r, |a| rect_close(a, r))
+}
+
+/// 最大化 set_frame:容忍 App 把尺寸吸附到自己的内部网格(见 SNAP_EPSILON)。
+/// Maximize set_frame: tolerates an app snapping its size to an internal grid (see
+/// SNAP_EPSILON).
+unsafe fn set_frame_maximized(win: AXUIElementRef, r: AxRect) -> bool {
+    set_frame_with(win, r, |a| fills_visible(a, r))
 }
 
 /// 设置 AXMinimized。
@@ -1248,21 +1313,55 @@ unsafe fn set_minimized(win: AXUIElementRef, minimized: bool) {
     CFRelease(key);
 }
 
-/// 按一次原生缩放按钮(无 snap 前记录时的恢复兜底)。
-/// Press the native zoom button once (restore fallback when nothing was recorded pre-snap).
-unsafe fn press_native_zoom(win: AXUIElementRef) -> AXError {
+/// 触发一次原生缩放:优先 `AXZoomWindow`(App 自己的缩放,与双击标题栏 / Option+点绿钮等价),
+/// 缩放按钮上没有该动作时才退回 `AXPress`。
+///
+/// `AXPress` 是绿钮的**点击**动作,自 macOS 10.11 起是"切换全屏"——终端等 App 会因此进全屏,
+/// 所以它只作最后兜底。`AXZoomWindow` 是私有动作名,且**即使生效也返回**
+/// `kAXErrorAttributeUnsupported`(-25205),因此调用方不能拿返回码判断结果,只能按 frame 复核。
+/// 返回是否发出了动作(缩放按钮不存在时为 false)。
+///
+/// Perform one native zoom, preferring `AXZoomWindow` (the app's own zoom, same as double-clicking
+/// the title bar or Option-clicking the green button) and falling back to `AXPress` only when the
+/// button does not expose it.
+///
+/// `AXPress` is the green button's **click** action, which toggles fullscreen since macOS 10.11 --
+/// that is what puts Terminal and similar apps into fullscreen, so it is only the last resort.
+/// `AXZoomWindow` is a private action name and returns `kAXErrorAttributeUnsupported` (-25205)
+/// **even when it works**, so callers must verify via the frame, never the return code. Returns
+/// whether an action was sent (false when the zoom button is missing).
+unsafe fn press_native_zoom(win: AXUIElementRef) -> bool {
     let Some(btn) = copy_attribute(win, K_AX_ZOOM_BUTTON) else {
         log_info!("[winctl] AXZoomButton unavailable");
-        return -1;
+        return false;
     };
-    let action = cf_string_new(K_AX_PRESS);
-    let err = AXUIElementPerformAction(btn, action);
-    CFRelease(action);
+    let action = if has_action(btn, K_AX_ZOOM_WINDOW) {
+        K_AX_ZOOM_WINDOW
+    } else {
+        K_AX_PRESS
+    };
+    let key = cf_string_new(action);
+    let err = AXUIElementPerformAction(btn, key);
+    CFRelease(key);
     CFRelease(btn);
-    if err != K_AX_SUCCESS {
-        log_info!("[winctl] AXPress on zoom button failed: {}", err);
+    log_debug!("[winctl] native zoom {} -> {}", action, err);
+    true
+}
+
+/// 元素是否支持某个动作名(用于探测私有的 `AXZoomWindow`)。
+/// Whether the element supports an action name (probes the private `AXZoomWindow`).
+unsafe fn has_action(element: AXUIElementRef, name: &str) -> bool {
+    let mut names: *const c_void = std::ptr::null();
+    if AXUIElementCopyActionNames(element, &mut names) != K_AX_SUCCESS || names.is_null() {
+        return false;
     }
-    err
+    let count = CFArrayGetCount(names).max(0);
+    let found = (0..count).any(|i| {
+        let item = CFArrayGetValueAtIndex(names, i);
+        !item.is_null() && cf_to_rust_string(item).as_deref() == Some(name)
+    });
+    CFRelease(names);
+    found
 }
 
 /// 枚举屏幕并把 frame/visibleFrame 换算到 AX 坐标(主线程调用:NSScreen 仅主线程安全)。
@@ -1456,8 +1555,9 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_move_staging_frame, display_move_target, infer_state, neighbor_screen, plan,
-        snap_frames, AxRect, Direction, Plan, ScreenGeometry, SnapState,
+        display_move_staging_frame, display_move_target, fills_visible, infer_state,
+        neighbor_screen, plan, rect_close_with, snap_frames, AxRect, Direction, Plan,
+        ScreenGeometry, SnapState, SNAP_EPSILON,
     };
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> AxRect {
@@ -1495,6 +1595,48 @@ mod tests {
         assert_eq!(f.top_left, rect(0.0, 25.0, 960.0, 527.5));
         assert_eq!(f.bottom_right, rect(960.0, 25.0 + 527.5, 960.0, 527.5));
         assert_eq!(f.max, v);
+    }
+
+    #[test]
+    fn maximize_accepts_app_grid_snapping() {
+        // 终端实测:visibleFrame 高 923,它按文本行吸附后只能给 915(短一行 8pt)。
+        // Measured on Terminal: visibleFrame is 923 tall, but its text-row grid only allows 915
+        // (one 8pt row short).
+        let v = rect(0.0, 33.0, 1470.0, 923.0);
+        let terminal = rect(0.0, 33.0, 1472.0, 915.0);
+        assert!(fills_visible(terminal, v));
+        assert_eq!(infer_state(terminal, v), SnapState::Maximized);
+        // 宽松判定不能吞掉半屏/四分屏。
+        // The loose check must not swallow halves or quarters.
+        let f = snap_frames(v);
+        assert!(!fills_visible(f.top, v));
+        assert_eq!(infer_state(f.top, v), SnapState::TopHalf);
+        assert_eq!(infer_state(f.bottom, v), SnapState::BottomHalf);
+        assert_eq!(infer_state(f.left, v), SnapState::LeftHalf);
+        assert_eq!(infer_state(f.top_left, v), SnapState::TopLeft);
+        assert_eq!(infer_state(f.bottom_right, v), SnapState::BottomRight);
+        // 只写进去一半高度不是最大化(真正的写入失败仍要能识别)。
+        // Half the height is not a maximize (a genuinely rejected write must stay detectable).
+        assert!(!fills_visible(rect(0.0, 33.0, 1470.0, 461.5), v));
+        assert_eq!(
+            infer_state(rect(100.0, 100.0, 800.0, 600.0), v),
+            SnapState::Normal
+        );
+        // 半屏同样会被网格吸附:终端实测半屏目标 461.5、实际 464,状态仍须判为上半屏。
+        // Halves snap to the grid too: Terminal returns 464 where the half is 461.5, and the state
+        // must still read as TopHalf.
+        assert!(rect_close_with(
+            rect(0.0, 33.0, 1472.0, 464.0),
+            f.top,
+            SNAP_EPSILON
+        ));
+        assert_eq!(
+            infer_state(rect(0.0, 33.0, 1472.0, 464.0), v),
+            SnapState::TopHalf
+        );
+        // 容差不会把相邻目标混淆:半屏与四等分相差 ~230pt。
+        // The tolerance cannot confuse adjacent targets: half and quarter are ~230pt apart.
+        assert!(!rect_close_with(f.top, f.top_left, SNAP_EPSILON));
     }
 
     #[test]
