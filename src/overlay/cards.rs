@@ -971,20 +971,32 @@ pub(crate) fn show_overlay() {
         // 内容过多时才进入滚动视口。
         // Height uses the target screen's complete visibleFrame; with fewer rows,
         // panel_h still shrinks to the natural row count, and only larger content scrolls.
-        let max_panel_h = (screen_visible.size.height * PANEL_MAX_HEIGHT_RATIO).max(240.0);
+        // 上下各留 PANEL_MARGIN:从高度预算里扣,于是选档规则会落到更小的档位(0.8/0.75),
+        // 而不是把面板顶出菜单栏。左右不扣(面板宽度本来就贴合内容)。
+        // PANEL_MARGIN above and below comes out of the height budget, so step selection lands on a
+        // smaller step (0.8/0.75) instead of the panel crossing the menu bar. The sides keep no
+        // margin: the panel hugs its content width anyway.
+        let max_panel_h =
+            (screen_visible.size.height * PANEL_MAX_HEIGHT_RATIO - 2.0 * PANEL_MARGIN).max(240.0);
         let scroll_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
         let layout = if use_flow {
             // 缩略图按窗口比例平衡分行,纯图标则固定卡片尺寸并自动算列数。
             // Thumbnails balance rows by window aspect; icon-only mode uses fixed cards and auto columns.
-            let screen_inner = (screen_frame.size.width - H_PADDING * 2.0).max(160.0);
+            // 宽度预算同样基于 visibleFrame:侧边 Dock 会占用预留区,用整屏 frame 会让面板
+            // 压在 Dock 上(高度侧一直就是这么做的)。
+            // The width budget also comes from visibleFrame: a side Dock reserves part of the frame,
+            // and using the full frame lets the panel cover it (the height side already did this).
+            let screen_inner = (screen_visible.size.width - H_PADDING * 2.0).max(160.0);
             let max_panel_w =
-                (screen_frame.size.width * PANEL_MAX_WIDTH_RATIO).max(160.0 + H_PADDING * 2.0);
+                (screen_visible.size.width * PANEL_MAX_WIDTH_RATIO).max(160.0 + H_PADDING * 2.0);
             let max_inner = (max_panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W)
                 .min(screen_inner)
                 .max(160.0);
-            let card_h = thumb_card_h_for_scale(thumb_scale_for_count(windows.len()));
-            let max_card_w =
-                thumbnail_max_card_width(&windows, card_h, max_inner, screen_frame, screen_visible);
+            // 卡片档位由可用面板决定(见 theme::thumb_scale_for_panel):不再按窗口数查表,
+            // 所以卡宽上限必须按选定档位现算——这里把换算交给布局闭包。
+            // The card step comes from the available panel (see theme::thumb_scale_for_panel)
+            // instead of a window-count table, so the width cap has to be derived from whichever
+            // step the layout picks; the closure does that conversion.
             let aspects: Vec<f64> = windows
                 .iter()
                 .map(|wi| {
@@ -1004,12 +1016,20 @@ pub(crate) fn show_overlay() {
                 THUMB_ROW_GAP,
                 THUMB_SCROLLBAR_W,
                 scroll_offset,
-                max_card_w,
+                |card_h| {
+                    thumbnail_max_card_width(
+                        &windows,
+                        card_h,
+                        max_inner,
+                        screen_frame,
+                        screen_visible,
+                    )
+                },
             )
         } else {
             plan_icon_scroll_layout(
                 windows.len(),
-                screen_frame.size.width,
+                screen_visible.size.width,
                 max_panel_h,
                 THUMB_SCROLLBAR_W,
                 scroll_offset,
@@ -1029,9 +1049,52 @@ pub(crate) fn show_overlay() {
             };
         let thumb_scroll_metrics =
             Some((layout.overflowed, layout.row_ranges.len(), layout.max_rows));
+        let h = layout.panel_h;
+        let w = layout.panel_w;
+        let card_h_use = layout.card_h;
+        let document_h = layout.document_h;
+        let card_h_outer = card_h_use;
+        // 定位规则(两个轴一致):先在**整屏 frame** 里居中——视觉上到屏幕边缘左右/上下对称;
+        // 再夹进 visibleFrame,保证不越出菜单栏、也不压住可见的 Dock。
+        // 只按 visibleFrame 居中会让面板整体偏移一个“上边预留”(菜单栏 30pt),看起来就是
+        // “顶部空白多、底部空白少”;而底部 Dock 隐藏时 visibleFrame 底部不预留,这一点就全
+        // 落在顶部了(2026-09-24 实测:上 174 / 下 144)。
+        // Placement rule (both axes): center on the **screen frame** first, so the gaps to the screen
+        // edges look symmetric, then clamp into the visible frame so the panel never crosses the menu
+        // bar and never covers a visible Dock. Centering on visibleFrame alone shifts the whole panel
+        // down by the top reservation (the 30pt menu bar): measured 174pt above vs 144pt below when
+        // the Dock is hidden, since a hidden Dock reserves nothing at the bottom.
+        let x = clamp_into_visible(
+            (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x,
+            screen_visible.origin.x,
+            screen_visible.size.width,
+            w,
+        );
+        let y = clamp_into_visible(
+            (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y,
+            // 钳位只用可视区本身:留白已经在上面的高度预算里扣过了,再在钳位里扣一次会把面板
+            // 往一侧顶(面板接近预算时出现 54/36 这种不对称)。预算已保证 h ≤ 可视高 − 2×留白，
+            // 所以整屏居中得到的上下留白必然 ≥ PANEL_MARGIN。
+            // The clamp only uses the visible area: the margin was already subtracted from the height
+            // budget, and subtracting it here too would push the panel to one side (54/36-style
+            // asymmetry when the panel nearly fills the budget). The budget already guarantees
+            // h <= visible - 2*margin, so screen-centering always leaves at least PANEL_MARGIN.
+            screen_visible.origin.y,
+            screen_visible.size.height,
+            h,
+        );
+        // 把面板 frame 打进同一行日志:定位是用户可见行为,A2 可以直接断言上下/左右留白是否对称。
+        // Include the panel frame in the same log line: placement is user-visible, so A2 can assert
+        // the top/bottom and left/right gaps stay symmetric.
         log_debug!(
-            "[overlay] layout mode={} visible={}..{} of {} offset={:.1} row={} rows={} visible_rows={} overflow={}",
+            "[overlay] layout mode={} scale={:.2} card_h={:.0} panel={:.0}x{:.0} at={:.0},{:.0} visible={}..{} of {} offset={:.1} row={} rows={} visible_rows={} overflow={}",
             if use_flow { "thumbnail" } else { "icon" },
+            layout.scale,
+            layout.card_h,
+            layout.panel_w,
+            layout.panel_h,
+            x,
+            y,
             layout.visible.start,
             layout.visible.end,
             windows.len(),
@@ -1050,16 +1113,6 @@ pub(crate) fn show_overlay() {
             .iter()
             .map(|p| (p.index, p.x, p.y, p.width))
             .collect();
-        let h = layout.panel_h;
-        let w = layout.panel_w;
-        let card_h_use = layout.card_h;
-        let document_h = layout.document_h;
-        let card_h_outer = card_h_use;
-        let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
-        // 高度上限基于 visibleFrame,垂直居中也必须使用同一坐标空间。
-        // Otherwise an external display's menu bar/Dock or origin offset leaves
-        // asymmetric empty space and makes the overlay appear not to adapt.
-        let y = (screen_visible.size.height - h) / 2.0 + screen_visible.origin.y;
         let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
         // 截图像素需求必须在流式布局确定卡片实际高度后计算：同一块 2x 屏上，少窗口
         // 从 1.0 放大到 1.5 也会从 512px 升到 640px；屏幕热插拔则由本次实时 scale
@@ -1241,6 +1294,98 @@ pub(crate) fn show_overlay() {
             t_icons.elapsed().as_millis(),
             total_ms
         );
+    }
+}
+
+/// 把“在整屏里居中”的理想坐标夹进可视区:到屏幕边缘的留白对称,同时不越出菜单栏/Dock。
+/// 面板比可视区还大时合法区间会退化(lo > hi),此时贴住可视区起点,不会反向越出菜单栏。
+/// Clamp a "centered on the screen" coordinate into the visible area: the gaps to the screen edges
+/// stay symmetric while the panel cannot cross the menu bar or a visible Dock. When the panel is
+/// larger than the visible area the legal range degenerates (lo > hi); pin it to the visible origin
+/// so it never crosses the menu bar in the other direction either.
+fn clamp_into_visible(ideal: f64, visible_origin: f64, visible_size: f64, size: f64) -> f64 {
+    let lo = visible_origin;
+    let hi = (visible_origin + visible_size - size).max(lo);
+    ideal.clamp(lo, hi)
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::clamp_into_visible;
+    use crate::theme::PANEL_MARGIN;
+
+    #[test]
+    fn panel_margin_keeps_a_gap_above_and_below() {
+        // 用户实测：内建 1470x956（可视 923）。留白来自**高度预算**（H − 2×留白），钳位只用可视区，
+        // 所以面板接近预算时仍然上下对称。
+        // Measured on the built-in display: 1470x956 (923 visible). The margin comes from the height
+        // budget, while the clamp only uses the visible area, so the gaps stay symmetric even when the
+        // panel nearly fills the budget.
+        // 两块屏的「面板恰好等于预算」情形都验证（预算 = 可视高 − 2×留白）。
+        // Both screens are checked at "panel exactly at the budget" (budget = visible - 2*margin).
+        for (frame_h, visible_h, panel_h) in [
+            (956.0, 923.0, 923.0 - 2.0 * PANEL_MARGIN),
+            (1080.0, 1050.0, 1050.0 - 2.0 * PANEL_MARGIN),
+        ] {
+            let y = clamp_into_visible((frame_h - panel_h) / 2.0, 0.0, visible_h, panel_h);
+            let bottom_gap = y;
+            let top_gap = frame_h - (y + panel_h);
+            assert!(
+                bottom_gap >= PANEL_MARGIN - 1e-9,
+                "面板 {panel_h}: 下留白 {bottom_gap} 应不小于 {PANEL_MARGIN}"
+            );
+            assert!(
+                top_gap >= PANEL_MARGIN - 1e-9,
+                "面板 {panel_h}: 上留白 {top_gap} 应不小于 {PANEL_MARGIN}"
+            );
+            assert!(
+                (top_gap - bottom_gap).abs() <= 1.0,
+                "面板 {panel_h}: 上下留白应基本对称（{top_gap} vs {bottom_gap}）"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_centers_on_the_screen_and_stays_inside_the_visible_area() {
+        // 用户实测的 1920x1080 外接屏:菜单栏占 30、Dock 隐藏所以底部预留 0。
+        // The measured 1920x1080 external display: a 30pt menu bar and no bottom reservation
+        // (hidden Dock).
+        let (visible_origin, visible_size, frame_size) = (0.0, 1050.0, 1080.0);
+        // 面板 762 高:整屏居中 -> 上下各 159,不再是一上一下相差 30。
+        // A 762pt panel centered on the screen: 159pt above and below, instead of differing by 30.
+        let y = clamp_into_visible(
+            (frame_size - 762.0) / 2.0,
+            visible_origin,
+            visible_size,
+            762.0,
+        );
+        assert!((y - 159.0).abs() < 1e-9);
+        // 菜单栏仍然不会被压到:面板顶边不超过可视区顶边。
+        // The menu bar is still respected: the panel's top edge never passes the visible top.
+        assert!(y + 762.0 <= visible_origin + visible_size + 1e-9);
+        // 底部可见 Dock(预留 80)且面板能放下时:保持整屏居中,不为 Dock 额外偏移。
+        // With a visible bottom Dock (80pt reserved) and a panel that fits: keep the screen-centered
+        // position instead of shifting it for the Dock.
+        let centered = clamp_into_visible(
+            (frame_size - 762.0) / 2.0,
+            visible_origin + 80.0,
+            visible_size - 80.0,
+            762.0,
+        );
+        assert!((centered - 159.0).abs() < 1e-9);
+        assert!(
+            centered >= visible_origin + 80.0,
+            "must not overlap the Dock"
+        );
+        // 面板放不下时(理想位置落在 Dock 区域里)则被顶到 Dock 上方。
+        // When it cannot fit (the ideal position lands inside the Dock strip) it is pushed above the
+        // Dock instead.
+        let pushed = clamp_into_visible(0.0, visible_origin + 80.0, visible_size - 80.0, 900.0);
+        assert!((pushed - (visible_origin + 80.0)).abs() < 1e-9);
+        // 面板比可视区还高:贴住可视区起点,而不是反向越出菜单栏。
+        // A panel taller than the visible area pins to the visible origin instead of crossing the
+        // menu bar the other way.
+        assert!((clamp_into_visible(0.0, 30.0, 300.0, 900.0) - 30.0).abs() < 1e-9);
     }
 }
 

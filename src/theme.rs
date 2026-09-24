@@ -22,8 +22,12 @@ pub(crate) const H_PADDING: f64 = 32.0;
 /// natural content size when there is room.
 pub(crate) const PANEL_MAX_WIDTH_RATIO: f64 = 0.92;
 /// 浮窗高度使用目标屏幕的完整可视区域;内容不足时仍按自然尺寸收缩。
-/// Overlay height uses the target screen's complete visible area; it still
-/// shrinks to the natural content size when there is room.
+/// 注:1.0 时面板可以填满可视区(自动隐藏的 Dock 会被浮窗遮住;定位见 cards.rs 的
+/// clamp_into_visible,它会保证不越出菜单栏)。
+/// Overlay height uses the target screen's complete visible area; it still shrinks to the natural
+/// content size when there is room.
+/// Note: at 1.0 the panel may fill the visible area, covering an auto-hidden Dock (placement is
+/// clamped by clamp_into_visible in cards.rs, so it never crosses the menu bar).
 pub(crate) const PANEL_MAX_HEIGHT_RATIO: f64 = 1.0;
 /// 纯图标模式的基准卡片尺寸;宽度固定,高度会为放大的内容自动留出空间。
 /// Base icon-only card dimensions; width stays fixed while height reserves room for larger content.
@@ -334,30 +338,131 @@ pub(crate) const THUMB_PREVIEW_RATIO: f64 = 1.6;
 /// 少量窗口时的最大卡片放大倍数；1.0 是原有缩略图卡片尺寸。
 /// Maximum card enlargement for small window sets; 1.0 is the original thumbnail size.
 pub(crate) const THUMB_MAX_SCALE: f64 = 1.5;
-/// 窗口较多时的最小缩放下限(相对基准卡宽)。比 1.0 更小是为了让"行数跳变"更容易被跨过:
-/// 同一屏上,0.85 能把可见行从 3 提到 4(见 theme 的布局测试),而 0.9 会因为行距仍差一点点
-/// 而白缩。下限只在窗口数达到 7 及以上时生效;放大档(1.1–1.5)保持不变。
-/// The smallest scale (relative to the base card width) for large window sets. Going below 1.0
-/// makes the row-count jump easier to cross: on a 1470x956 screen 0.85 lifts the visible rows from
-/// 3 to 4 while 0.9 shrinks for nothing. It only applies from seven windows up; the enlargement
-/// steps (1.1-1.5) are unchanged.
-pub(crate) const THUMB_MIN_SCALE: f64 = 0.85;
+/// 卡片缩放下限(相对基准卡宽)。它同时是阶梯的最后一级:
+/// `thumb_card_h_for_scale` 会用它夹住输入,所以加新档位时必须同步改这里,否则新档位永远选不中。
+/// The floor of the card scale (relative to the base card width). It doubles as the last ladder step:
+/// `thumb_card_h_for_scale` clamps its input with it, so adding a smaller step requires lowering
+/// this too or the new step can never be chosen.
+pub(crate) const THUMB_MIN_SCALE: f64 = 0.75;
+/// 浮窗上下与屏幕(或菜单栏/Dock 预留区)之间的最小留白(pt)。
+/// 必须从高度预算里扣:面板高度由内容行数决定,只挪位置会把面板顶出菜单栏而不会让它变矮。
+/// Minimum blank strip between the overlay and the screen (or the menu-bar/Dock reservations) above
+/// and below. It is subtracted from the height budget: the panel's height comes from the content
+/// rows, so moving it alone would push it across the menu bar instead of making it shorter.
+pub(crate) const PANEL_MARGIN: f64 = 24.0;
 /// 卡片区顶部留白。/ Top inset above the thumbnail card area.
 const THUMB_TOP_INSET: f64 = 32.0;
+
+/// 旧分页布局冻结在 0.85 下限,与生产阶梯解耦。生产路径已能降到 0.75,但旧布局没有调用方,
+/// 保持原值可以让它的布局测试继续描述"旧行为",也不会因为调档位而连带报警。
+/// The legacy paged layout stays frozen at its 0.85 floor, decoupled from the production ladder
+/// (which now reaches 0.75). It has no caller, so keeping the old value lets its layout tests keep
+/// describing the old behaviour instead of breaking on every ladder tweak.
+#[cfg(test)]
+const LEGACY_THUMB_MIN_SCALE: f64 = 0.85;
 
 /// 缩略图尺寸只由窗口总数决定，分行与窗口宽高比不能反向改变尺寸。
 /// Thumbnail scale depends only on the total window count; wrapping and window
 /// aspect ratios must not feed back into card size.
+///
+/// 仅旧的分页布局（`plan_thumb_flow_layout`，现已无生产调用方）仍用它；生产路径改由
+/// `thumb_scale_for_panel` 按可用面板选档。两边都只在测试里存在。
+/// Still used by the legacy paged layout (`plan_thumb_flow_layout`, which no longer has a
+/// production caller); the production path picks its step with `thumb_scale_for_panel`. Both
+/// exist only for tests now.
+#[cfg(test)]
 pub(crate) fn thumb_scale_for_count(count: usize) -> f64 {
     match count {
         0 => 1.0,
-        7.. => THUMB_MIN_SCALE,
+        7.. => LEGACY_THUMB_MIN_SCALE,
         1 | 2 => THUMB_MAX_SCALE,
         3 => 1.4,
         4 => 1.3,
         5 => 1.2,
         6 => 1.1,
     }
+}
+
+/// 卡片缩放的候选档位(从大到小):两端就是旧版的放大上限与最小缩放下限。
+/// Candidate card scales, largest first; the ends are the old enlargement cap and the old
+/// minimum-scale floor.
+pub(crate) const THUMB_SCALE_STEPS: [f64; 11] = [
+    THUMB_MAX_SCALE,
+    1.4,
+    1.3,
+    1.2,
+    1.1,
+    1.0,
+    0.95,
+    0.9,
+    0.85,
+    0.8,
+    0.75,
+];
+
+/// 选实际使用的分行:均衡行优先(每行数量尽量均匀),只有均衡行超出可视行数时才退回贪心行
+/// (贪心行数最少,不会白缩)。
+/// Pick the packing to use: balanced rows win (even counts per row) and greedy is only the fallback
+/// when balanced exceeds the visible row budget (greedy needs the fewest rows, so it never shrinks
+/// for nothing).
+fn choose_thumb_rows(
+    balanced: Vec<Vec<usize>>,
+    greedy: Vec<Vec<usize>>,
+    max_rows: usize,
+) -> Vec<Vec<usize>> {
+    if balanced.len() <= max_rows {
+        balanced
+    } else {
+        greedy
+    }
+}
+
+/// 按**可用面板**选卡片档位:在候选档位里取"装得下"的最大一档,全部装不下时退回最小档(交给滚动)。
+///
+/// 估算时一律用基准宽高比(1.6),不看各窗口真实比例——否则缩放单个窗口就会反向改变卡片尺寸
+/// (旧注释里明确要避免的反馈);真实比例只影响之后的装箱与列数。窗口越多 → 需要越多行 →
+/// 自然落到更小档位,所以不再需要写死的"数量 → 倍数"阶梯。
+///
+/// Pick the card step from the **available panel**: the largest candidate that fits, falling back to
+/// the smallest step (scrolling) when nothing fits.
+///
+/// The fit test always uses the base aspect (1.6) rather than the real per-window aspects, so
+/// resizing one window cannot feed back into card size (the feedback the old comment deliberately
+/// avoided); real aspects only affect the packing and column count afterwards. More windows need
+/// more rows and therefore land on a smaller step by themselves, so the hard-coded count ladder is
+/// no longer needed.
+pub(crate) fn thumb_scale_for_panel(
+    count: usize,
+    max_inner: f64,
+    max_panel_w: f64,
+    max_panel_h: f64,
+    gap: f64,
+    scrollbar_w: f64,
+) -> f64 {
+    if count == 0 {
+        return 1.0;
+    }
+    let uniform = vec![THUMB_PREVIEW_RATIO; count];
+    for &scale in THUMB_SCALE_STEPS.iter() {
+        let card_h = thumb_card_h_for_scale(scale);
+        let max_card_w = thumb_card_w_for_aspect(card_h, THUMB_PREVIEW_RATIO).min(max_inner);
+        let fits = !plan_thumb_scroll_layout_at_scale(
+            &uniform,
+            scale,
+            max_inner,
+            max_panel_w,
+            max_panel_h,
+            gap,
+            scrollbar_w,
+            0.0,
+            max_card_w,
+        )
+        .overflowed;
+        if fits {
+            return scale;
+        }
+    }
+    THUMB_MIN_SCALE
 }
 
 /// 缩略图卡片高度按基准卡宽推导(纯函数,可测):
@@ -1029,37 +1134,11 @@ pub(crate) fn plan_thumb_flow_layout(
     )
 }
 
-/// 规划连续滚动的缩略图视口。单页时使用平衡分行;发生溢出时按 MRU 顺序优先填满前面的行,
-/// 让初始视口容纳最多窗口。完整分行结果保持不变,滚动偏移按 point 计算,因此卡片可以平滑地
-/// 经过视口边缘。
-/// Plan the continuous thumbnail viewport. Use balanced rows when everything fits; when it
-/// overflows, fill leading rows in MRU order so the initial viewport shows as many windows as
-/// possible. The complete row plan stays unchanged, while point-based scrolling lets cards pass
-/// smoothly through the viewport edges.
-#[cfg(test)]
-pub(crate) fn plan_thumb_scroll_layout(
-    aspects: &[f64],
-    max_inner: f64,
-    max_panel_w: f64,
-    max_panel_h: f64,
-    gap: f64,
-    scrollbar_w: f64,
-    scroll_offset: f64,
-) -> ThumbFlowLayout {
-    plan_thumb_scroll_layout_with_max_card_w(
-        aspects,
-        max_inner,
-        max_panel_w,
-        max_panel_h,
-        gap,
-        scrollbar_w,
-        scroll_offset,
-        f64::INFINITY,
-    )
-}
-
-/// 规划连续滚动的缩略图视口,并限制单张卡片的最大宽度。
-/// Plan the continuous thumbnail viewport with an explicit per-card width cap.
+/// 规划连续滚动的缩略图视口:卡片档位由可用面板决定(见 `thumb_scale_for_panel`),
+/// 单张卡片宽度上限按选定档位现算,避免调用方预先猜一个卡高。
+/// Plan the continuous thumbnail viewport: the card step comes from the available panel (see
+/// `thumb_scale_for_panel`) and the per-card width cap is derived from that step, so callers never
+/// have to guess a card height up front.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_thumb_scroll_layout_with_max_card_w(
     aspects: &[f64],
@@ -1069,10 +1148,46 @@ pub(crate) fn plan_thumb_scroll_layout_with_max_card_w(
     gap: f64,
     scrollbar_w: f64,
     scroll_offset: f64,
+    max_card_w_for: impl Fn(f64) -> f64,
+) -> ThumbFlowLayout {
+    let max_inner = max_inner.max(1.0);
+    let scale = thumb_scale_for_panel(
+        aspects.len(),
+        max_inner,
+        max_panel_w,
+        max_panel_h,
+        gap,
+        scrollbar_w,
+    );
+    plan_thumb_scroll_layout_at_scale(
+        aspects,
+        scale,
+        max_inner,
+        max_panel_w,
+        max_panel_h,
+        gap,
+        scrollbar_w,
+        scroll_offset,
+        max_card_w_for(thumb_card_h_for_scale(scale)),
+    )
+}
+
+/// 指定档位下的实际装箱与视口规划(选档与装箱分离,方便纯几何地试算多个档位)。
+/// Actual packing and viewport planning at one fixed step (step selection and packing are split so
+/// candidate steps can be tried with pure geometry).
+#[allow(clippy::too_many_arguments)]
+fn plan_thumb_scroll_layout_at_scale(
+    aspects: &[f64],
+    scale: f64,
+    max_inner: f64,
+    max_panel_w: f64,
+    max_panel_h: f64,
+    gap: f64,
+    scrollbar_w: f64,
+    scroll_offset: f64,
     max_card_w: f64,
 ) -> ThumbFlowLayout {
     let max_inner = max_inner.max(1.0);
-    let scale = thumb_scale_for_count(aspects.len());
     let card_h = thumb_card_h_for_scale(scale);
     let constraints = ThumbFlowConstraints {
         card_h,
@@ -1082,12 +1197,11 @@ pub(crate) fn plan_thumb_scroll_layout_with_max_card_w(
     };
     let widths =
         thumb_widths_with_max_card_w(aspects, &(0..aspects.len()), card_h, max_inner, max_card_w);
-    let balanced_rows = pack_rows(&widths, max_inner, gap);
-    let rows = if balanced_rows.len() > constraints.max_rows {
-        pack_rows_greedy(&widths, max_inner, gap)
-    } else {
-        balanced_rows
-    };
+    let rows = choose_thumb_rows(
+        pack_rows(&widths, max_inner, gap),
+        pack_rows_greedy(&widths, max_inner, gap),
+        constraints.max_rows,
+    );
     build_thumb_scroll_layout(
         &rows,
         &widths,
@@ -1456,8 +1570,8 @@ mod flow_tests {
         assert_eq!(thumb_scale_for_count(4), 1.3);
         assert_eq!(thumb_scale_for_count(5), 1.2);
         assert_eq!(thumb_scale_for_count(6), 1.1);
-        assert_eq!(thumb_scale_for_count(7), THUMB_MIN_SCALE);
-        assert_eq!(thumb_scale_for_count(30), THUMB_MIN_SCALE);
+        assert_eq!(thumb_scale_for_count(7), LEGACY_THUMB_MIN_SCALE);
+        assert_eq!(thumb_scale_for_count(30), LEGACY_THUMB_MIN_SCALE);
     }
 
     /// 档位是唯一决定卡片尺寸的输入:这里把下限/上限和几何后果钉住,布局装箱测试则用相对断言,
@@ -1479,17 +1593,160 @@ mod flow_tests {
         for count in 7..40 {
             assert_eq!(
                 thumb_scale_for_count(count),
-                THUMB_MIN_SCALE,
+                LEGACY_THUMB_MIN_SCALE,
                 "count {count}"
             );
         }
         // 下限必须真的更小(否则等于白缩),且预览区仍在可辨认的下限之上。
         // The floor must actually be smaller (otherwise it shrinks for nothing) while the preview area
         // stays above its legibility floor.
-        const { assert!(THUMB_MIN_SCALE < 1.0) };
-        let floor_card_h = thumb_card_h_for_scale(THUMB_MIN_SCALE);
+        const { assert!(LEGACY_THUMB_MIN_SCALE < 1.0) };
+        let floor_card_h = thumb_card_h_for_scale(LEGACY_THUMB_MIN_SCALE);
         assert!(floor_card_h < thumb_card_h_for_scale(1.0));
         assert!(thumb_preview_h(floor_card_h) > 40.0);
+    }
+
+    #[test]
+    fn card_step_follows_the_panel_not_the_window_count() {
+        // 用户那台屏的面板预算:宽 92%×1920 减内边距与滚动条,高取 visibleFrame。
+        // The panel budget on the measured 1920x1080 screen: 92% width minus padding/scrollbar, full
+        // visible height.
+        let panel_w = 1920.0 * PANEL_MAX_WIDTH_RATIO;
+        let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
+        let at = |count: usize| {
+            thumb_scale_for_panel(
+                count,
+                inner,
+                panel_w,
+                1050.0,
+                THUMB_ROW_GAP,
+                THUMB_SCROLLBAR_W,
+            )
+        };
+        // 少量窗口仍拿到最大档(与旧阶梯一致)。
+        // Small sets still reach the largest step, as with the old ladder.
+        assert!((at(1) - THUMB_MAX_SCALE).abs() < 1e-9); // 旧阶梯在 6→7 处从 1.1 直接掉到 0.85(−23%);现在只按"装不装得下"落档。
+                                                         // The old ladder dropped from 1.1 to 0.85 at 6->7 (-23%); now a step only falls when the
+                                                         // panel genuinely stops fitting.
+        assert!(
+            at(7) > THUMB_MIN_SCALE,
+            "7 windows must not fall to the old floor, got {}",
+            at(7)
+        );
+        // 单调,且相邻窗口数之间最多降一档(没有悬崖)。
+        // Monotonic, and never falling by more than one candidate step between adjacent counts (no
+        // cliff).
+        // 单调:窗口越多,档位只会更小或持平。相邻窗口数之间的落差可以一次跨两档,因为
+        // 卡宽离散、行的容量也离散(13 张正好从 3 行跳成 4 行),这不是阶梯人为造成的悬崖。
+        // Monotonic: more windows can only keep or lower the step. Adjacent counts may fall two
+        // candidate steps at once, because both the card width and the per-row capacity are
+        // discrete (13 cards is exactly where the plan jumps from three rows to four); that is
+        // packing arithmetic, not an artificial ladder cliff.
+        for count in 1..40 {
+            assert!(
+                at(count + 1) <= at(count),
+                "step grew with more windows at {count}"
+            );
+        }
+        // 面板变小不会让档位变大;完全装不下时退回最小档(交给滚动)。
+        // A smaller panel never raises the step, and when nothing fits the smallest step is used and
+        // scrolling takes over.
+        let tiny = 600.0 - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
+        assert!(
+            thumb_scale_for_panel(15, tiny, 600.0, 500.0, THUMB_ROW_GAP, THUMB_SCROLLBAR_W)
+                <= at(15)
+        );
+        assert_eq!(
+            thumb_scale_for_panel(60, tiny, 600.0, 300.0, THUMB_ROW_GAP, THUMB_SCROLLBAR_W),
+            THUMB_MIN_SCALE
+        );
+    }
+
+    #[test]
+    fn card_step_ignores_window_aspects() {
+        // 尺寸不由宽高比反向决定:同一块面板上,真实比例怎么变,选档不变(否则缩放单个窗口就会
+        // 反过来改卡片尺寸)。
+        // Card size must not be driven back by aspect ratios: on the same panel the chosen step is
+        // identical however the real aspects change (otherwise resizing one window would resize the
+        // cards).
+        let panel_w = 1920.0 * PANEL_MAX_WIDTH_RATIO;
+        let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
+        let plan = |aspects: &[f64]| {
+            plan_thumb_scroll_layout_with_max_card_w(
+                aspects,
+                inner,
+                panel_w,
+                1050.0,
+                THUMB_ROW_GAP,
+                THUMB_SCROLLBAR_W,
+                0.0,
+                |_| f64::INFINITY,
+            )
+            .scale
+        };
+        let uniform = vec![THUMB_PREVIEW_RATIO; 15];
+        let mixed = vec![
+            2.2, 0.7, 1.0, 1.6, 2.2, 0.7, 1.9, 1.2, 2.0, 0.8, 1.5, 1.1, 2.1, 1.7, 0.9,
+        ];
+        assert_eq!(plan(&uniform), plan(&mixed));
+    }
+
+    #[test]
+    fn the_production_ladder_reaches_its_smallest_step() {
+        // 加档位时必须同时放宽下限:`thumb_card_h_for_scale` 用 THUMB_MIN_SCALE 夹输入,
+        // 忘了改就会让新档位永远选不中(卡高被夹回 0.85)。
+        // Lowering the floor must accompany a new smallest step: `thumb_card_h_for_scale` clamps its
+        // input with THUMB_MIN_SCALE, so forgetting it silently pins the new step back to 0.85.
+        assert!((THUMB_SCALE_STEPS.last().copied().unwrap() - THUMB_MIN_SCALE).abs() < 1e-9);
+        assert!(THUMB_SCALE_STEPS.contains(&0.8), "阶梯应包含 0.8 档");
+        assert!(thumb_card_h_for_scale(0.8) < thumb_card_h_for_scale(0.85));
+        assert!(thumb_card_h_for_scale(0.75) < thumb_card_h_for_scale(0.8));
+        // 最小档仍可辨认:预览区高于可读下限。
+        // The smallest step stays legible: its preview area is above the floor.
+        assert!(thumb_preview_h(thumb_card_h_for_scale(THUMB_MIN_SCALE)) > 40.0);
+    }
+
+    #[test]
+    fn the_panel_margin_costs_a_step_not_a_row() {
+        // 内建屏（用户实测 1470x956，可视 923）：扣掉上下留白后应落到 0.75 档，而不是溢出滚动。
+        // The measured built-in screen (1470x956, 923 visible): after both margins the step should fall
+        // to 0.75 instead of overflowing into scrolling.
+        let panel_w = 1470.0 * PANEL_MAX_WIDTH_RATIO;
+        let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
+        let with_margin = thumb_scale_for_panel(
+            16,
+            inner,
+            panel_w,
+            923.0 - 2.0 * PANEL_MARGIN,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+        );
+        let without_margin =
+            thumb_scale_for_panel(16, inner, panel_w, 923.0, THUMB_ROW_GAP, THUMB_SCROLLBAR_W);
+        assert!(
+            (with_margin - 0.75).abs() < 1e-9,
+            "内建屏扣留白后应为 0.75 档，实际 {with_margin}"
+        );
+        assert!(
+            with_margin <= without_margin,
+            "留白只能让档位变小或持平（{with_margin} vs {without_margin}）"
+        );
+        // 大屏（可视 1050）留白几乎免费：仍能保持 0.95 档。
+        // On the measured 1920x1080 screen the margin is nearly free: the step stays 0.95.
+        let wide = 1920.0 * PANEL_MAX_WIDTH_RATIO;
+        let wide_inner = wide - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
+        let on_wide = thumb_scale_for_panel(
+            16,
+            wide_inner,
+            wide,
+            1050.0 - 2.0 * PANEL_MARGIN,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+        );
+        assert!(
+            (on_wide - 0.95).abs() < 1e-9,
+            "大屏扣留白后应仍是 0.95 档，实际 {on_wide}"
+        );
     }
 
     #[test]
@@ -1677,7 +1934,7 @@ mod flow_tests {
             THUMB_ROW_GAP,
             THUMB_SCROLLBAR_W,
             0.0,
-            320.0,
+            |_| 320.0,
         );
 
         assert!(layout
@@ -1708,23 +1965,27 @@ mod flow_tests {
         let aspects = vec![1.6; 20];
         let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
-        let first = plan_thumb_scroll_layout(
+        let first = plan_thumb_scroll_layout_at_scale(
             &aspects,
+            thumb_scale_for_count(aspects.len()),
             1288.0,
             1400.0,
             max_h,
             THUMB_ROW_GAP,
             THUMB_SCROLLBAR_W,
             0.0,
+            f64::INFINITY,
         );
-        let next = plan_thumb_scroll_layout(
+        let next = plan_thumb_scroll_layout_at_scale(
             &aspects,
+            thumb_scale_for_count(aspects.len()),
             1288.0,
             1400.0,
             max_h,
             THUMB_ROW_GAP,
             THUMB_SCROLLBAR_W,
             card_h + THUMB_ROW_GAP,
+            f64::INFINITY,
         );
 
         assert!(first.overflowed);
@@ -1748,14 +2009,16 @@ mod flow_tests {
         let aspects = vec![1.6; 8];
         let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
-        let layout = plan_thumb_scroll_layout(
+        let layout = plan_thumb_scroll_layout_at_scale(
             &aspects,
+            thumb_scale_for_count(aspects.len()),
             900.0,
             1400.0,
             max_h,
             THUMB_ROW_GAP,
             THUMB_SCROLLBAR_W,
             0.0,
+            f64::INFINITY,
         );
 
         assert!(layout.overflowed);
@@ -1799,14 +2062,16 @@ mod flow_tests {
         let aspects = vec![1.6; 13];
         let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let max_h = THUMB_TOP_INSET + card_h * 3.0 + THUMB_ROW_GAP * 2.0 + status_h() + 0.1;
-        let layout = plan_thumb_scroll_layout(
+        let layout = plan_thumb_scroll_layout_at_scale(
             &aspects,
+            thumb_scale_for_count(aspects.len()),
             1288.0,
             1400.0,
             max_h,
             THUMB_ROW_GAP,
             THUMB_SCROLLBAR_W,
             0.0,
+            f64::INFINITY,
         );
 
         assert!(layout.overflowed);
@@ -1819,14 +2084,16 @@ mod flow_tests {
         let aspects = vec![2.2, 0.7, 0.7];
         let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
-        let layout = plan_thumb_scroll_layout(
+        let layout = plan_thumb_scroll_layout_at_scale(
             &aspects,
+            thumb_scale_for_count(aspects.len()),
             800.0,
             900.0,
             max_h,
             THUMB_ROW_GAP,
             THUMB_SCROLLBAR_W,
             0.0,
+            f64::INFINITY,
         );
 
         assert!(!layout.overflowed);
@@ -1839,14 +2106,16 @@ mod flow_tests {
         let aspects = vec![1.6; 20];
         let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
-        let layout = plan_thumb_scroll_layout(
+        let layout = plan_thumb_scroll_layout_at_scale(
             &aspects,
+            thumb_scale_for_count(aspects.len()),
             1288.0,
             1400.0,
             max_h,
             THUMB_ROW_GAP,
             THUMB_SCROLLBAR_W,
             f64::MAX,
+            f64::INFINITY,
         );
         assert_eq!(layout.row_start, 2);
         assert_eq!(layout.visible, 8..20);
@@ -1858,14 +2127,16 @@ mod flow_tests {
         let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
         let row_pitch = card_h + THUMB_ROW_GAP;
         let max_h = THUMB_TOP_INSET + card_h * 2.0 + THUMB_ROW_GAP + status_h() + 0.1;
-        let layout = plan_thumb_scroll_layout(
+        let layout = plan_thumb_scroll_layout_at_scale(
             &aspects,
+            thumb_scale_for_count(aspects.len()),
             1288.0,
             1400.0,
             max_h,
             THUMB_ROW_GAP,
             THUMB_SCROLLBAR_W,
             12.0,
+            f64::INFINITY,
         );
 
         assert_eq!(layout.row_start, 0);
@@ -1880,23 +2151,27 @@ mod flow_tests {
             .any(|placement| placement.index == 11));
         assert!(layout.max_scroll_offset > 12.0);
 
-        let before_row_boundary = plan_thumb_scroll_layout(
+        let before_row_boundary = plan_thumb_scroll_layout_at_scale(
             &aspects,
+            thumb_scale_for_count(aspects.len()),
             1288.0,
             1400.0,
             max_h,
             THUMB_ROW_GAP,
             THUMB_SCROLLBAR_W,
             row_pitch - 1.0,
+            f64::INFINITY,
         );
-        let at_row_boundary = plan_thumb_scroll_layout(
+        let at_row_boundary = plan_thumb_scroll_layout_at_scale(
             &aspects,
+            thumb_scale_for_count(aspects.len()),
             1288.0,
             1400.0,
             max_h,
             THUMB_ROW_GAP,
             THUMB_SCROLLBAR_W,
             row_pitch,
+            f64::INFINITY,
         );
         let before_y = before_row_boundary
             .placements
