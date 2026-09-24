@@ -19,18 +19,20 @@ scripts/dev-restart.sh
 ```
 
 - The normal `cargo test` suite is headless-safe; GUI/permission-dependent smoke tests are marked `#[ignore]`.
-- Documentation, comments, localization, and `AGENTS.md` changes need no Rust tests. Rust changes require `cargo fmt`; behavioral changes require targeted tests, plus `cargo check` when interfaces or compilation are affected.
+- Docs, comments, localization, and `AGENTS.md` changes need no Rust tests. Rust changes require `cargo fmt` (plus `cargo check` when interfaces or compilation are affected) and targeted tests when behavior changes.
 - Cross-module, unsafe/FFI, concurrency, configuration, build, or release changes require the full gate above. Before handing off a completed feature, always run the full gate and keep all checks clean.
 - Start the app with `scripts/dev-restart.sh`, never directly with `cargo run`. For runtime changes, run it after the full gate. If it reports `restart FAILED`, inspect the newest log under `~/Library/Logs/oh-my-tab/`, diagnose, and retry.
-- `scripts/dev-restart.sh` defaults to a **debug** build (`cargo build`): fast iteration with every debug assertion on (objc2 `msg_send!` signature verification, `debug_assert_main_thread`, overflow checks). Use it for functional iteration and handoff.
-- For feel/perf validation (scrolling, animation, latency), run `scripts/dev-restart.sh --opt`. It uses the `dev-opt` cargo profile (`target/dev-opt/`): optimized like release while keeping `debug-assertions`, so runtime speed is representative but development still fails fast. Neither mode changes the dev bundle identity (`com.eacryo.oh-my-tab.dev`); both write `dist/Oh-My-Tab-Dev.app`, which `scripts/release-dev.sh` also uses for the dev channel.
+- `scripts/dev-restart.sh` defaults to a **debug** build (`cargo build`): fast iteration with every debug assertion on. Use it for functional iteration and handoff.
+- For feel/perf validation (scrolling, animation, latency), run `scripts/dev-restart.sh --opt`. It uses the `dev-opt` cargo profile (`target/dev-opt/`): optimized like release while keeping `debug-assertions`, so runtime speed is representative and development still fails fast.
+- `release_doc_dev/<Cargo.toml version>.md` must exist and be non-empty: `scripts/dev-restart.sh` aborts before building otherwise, and a dev build embeds that file as its release notes.
 - Report the timestamp-based `build-version` printed by the script.
-- Pass development switches through the script instead of editing code: any `--flag[=value]` argument the script does not own is forwarded to the app (and `scripts/dev-restart.sh -- <args>` forwards argv verbatim), so a new switch needs no script edit. Switches apply to that launch only — the script pkills old instances first. Use this to reach states that are otherwise hard to reproduce (first-run onboarding, permission branches, update notices); a feature that only appears in such a state should expose a `--`-style switch for verification, and it is parsed through `crate::dev_flags`.
-- **The running app must not read or receive environment variables as configuration.** Pass development switches as argv through `scripts/dev-restart.sh`; `crate::dev_flags` and the script's argv passthrough are the only runtime configuration channels. Build and release scripts may read explicitly named packaging inputs, but must not forward the caller's environment to the launched app, dump it, or print sensitive values. The caller's shell may contain cloud credentials and proxies; a missing forward filter leaked the whole environment once, on 2026-09-22.
+- Pass development switches as argv through `scripts/dev-restart.sh` instead of editing code: any `--flag[=value]` it does not own is forwarded to the app (`-- <args>` forwards argv verbatim), and a switch applies to that launch only.
+- Reach otherwise hard-to-reproduce states (first-run onboarding, permission branches, update notices) with such a switch; a feature that only appears in one of them should expose a `--`-style flag parsed through `crate::dev_flags`.
+- **The running app must not read or receive environment variables as configuration.** `crate::dev_flags` and the script's argv passthrough are the only runtime configuration channels. Build and release scripts may read explicitly named packaging inputs, but must not forward the caller's environment to the launched app, dump it, or print sensitive values — the caller's shell may hold cloud credentials.
 
 ## Testing tiers
 
-Three layers, split by **who decides pass/fail** — not by which transport drives them (`cua-driver call` and the MCP tools are the same tool set on the same daemon; the CLI is the scriptable face, MCP the agent-facing one).
+Three layers, split by **who decides pass/fail** — not by which transport drives them.
 
 | Tier | Decides | How | Repeatable | Gate |
 | --- | --- | --- | --- | --- |
@@ -38,8 +40,8 @@ Three layers, split by **who decides pass/fail** — not by which transport driv
 | A2 | script | `scripts/e2e/*.sh`, run through `scripts/e2e/run-all.sh` (the entry point; scenarios that steal focus are skipped unless `--include-focus`), driven by the `cua-driver` CLI and asserting app-written JSON state (`--e2e-state=<path>`) plus real WindowServer state | yes | before handoff/release |
 | B | agent or person | MCP tools plus screenshots: taste, first-pass UI review, failure triage, bug investigation | no | never |
 
-- Anything assertable belongs in A. Big problems usually are (state and OS facts), small ones often are not (visual taste) — severity is not the split, assertability is.
-- A2 covers what only real input reaches: the global hotkey → summon → raise path, permission branches, cross-app behavior. `--e2e-state` exists because AX cannot express CALayer content (the sidebar highlight pill) or internal state (the selected card index), so the app states those facts itself instead of the test guessing from pixels. A quick hotkey press-release legitimately skips the display path; display and layout assertions belong to A1 smoke runners.
+- Anything assertable belongs in A: severity is not the split, assertability is.
+- A2 covers what only real input reaches: the global hotkey → summon → raise path, permission branches, cross-app behavior. `--e2e-state` exists because AX cannot express CALayer content or internal state, so the app states those facts itself instead of the test guessing from pixels. A quick hotkey press-release legitimately skips the display path; display and layout assertions belong to A1 smoke runners.
 - **Promotion rule: every bug found in tier B must land an assertion in tier A** — or, when it cannot be asserted yet, a state field that makes it assertable. Otherwise the same regression returns unnoticed.
 - A2 hotkey scenarios press through the system event stream and therefore steal focus: run them only with the user's consent, never in a background loop.
 
@@ -53,7 +55,7 @@ Three layers, split by **who decides pass/fail** — not by which transport driv
 - Configuration is loaded per field: invalid values fall back individually without discarding valid settings. Runtime reload must preserve this and refresh affected UI.
 - Mouse profiles match VID/PID; the mouse event tap is separate from the switcher tap, and pointer settings must be reapplied after reconnects.
 - Clipboard history is optional and off by default. Gate recording and Option+V when disabled, never record sensitive pasteboard markers, and persist only when explicitly enabled.
-- Settings UI should reuse `SettingsSection`, `SettingsCard`, `SettingsRow`, `SettingsControl`, and `SettingsButton`; extend shared components when behavior is shared. A `SettingsButton`'s `tag` **selects its hover/normal palette** (the hover handlers read it: primary blue, action, compact grey), so never carry an action id in `setTag:` — keep the component's tag and map the sender pointer to an action id instead, or the button's colour gets stuck after the pointer leaves.
+- Settings UI should reuse `SettingsSection`, `SettingsCard`, `SettingsRow`, `SettingsControl`, and `SettingsButton`; extend shared components when behavior is shared. A `SettingsButton`'s `tag` **selects its hover/normal palette**, so never carry an action id in `setTag:` — keep the component's tag and map the sender pointer to an action id instead, or the colour gets stuck after the pointer leaves.
 
 For detailed subsystem behavior, inspect the relevant module and `docs/developer-notes-en.md` rather than adding implementation history here.
 
@@ -61,16 +63,14 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 
 - Accessibility permission is required for the global event tap and AX operations. Screen Recording is additionally required for thumbnails; both failures must degrade or report clearly rather than break switching.
 - Runtime configuration is `~/.config/oh-my-tab/config.toml`.
-- Logs default to `~/Library/Logs/oh-my-tab/oh-my-tab.log`; the active file rotates at 10 MB through `.1`–`.5`, writes a launch marker, and prunes legacy/stale backups older than 30 days. A non-empty `logging.file_path` is appended verbatim without rotation or cleanup.
+- Logs default to `~/Library/Logs/oh-my-tab/oh-my-tab.log`; rotation and retention belong to the logger (`src/logger.rs`). A non-empty `logging.file_path` is appended verbatim without rotation or cleanup.
 
 ## Editing and localization
 
 - Preserve unrelated user changes and avoid destructive Git commands unless explicitly requested.
-- Comments are English only. Write one only when removing it would let someone write the code wrong: FFI/Objective-C and lifetime subtleties, thread/lock/ordering invariants, measured platform facts and workarounds (keep the measurement), non-obvious design trade-offs, and cross-module contracts.
-- Delete every other comment class: restating the next line or the item's name, section banners (`// ===== X =====`), and relocation history ("used to live in", "previously duplicated"). History belongs in the commit message and in `release_doc*`; behaviour that can be asserted belongs in a test name or assertion message, and reasons that explain *why* the code is like this stay.
-- Before adding a comment, ask what breaks if it is deleted. `python3 scripts/check-comment-style.py` enforces the mechanical part (English-only comments, no banners); `--strict` also rejects relocation history.
+- Write comments in English only, and only where they explain something the code cannot: FFI/Objective-C subtleties, thread/lock/ordering invariants, measured platform facts, non-obvious trade-offs. Do not restate the code and do not keep its history; both belong in commit messages, release notes, or tests.
 - Keep user-visible strings in `t()`/`tf()`/`t_count()` and add keys to every supported locale; use `t_count()` for singular/plural counts. Developer logs stay in English; dynamic titles are data, not UI chrome.
-- Prefer `apply_patch`/native file editors. Use scripts only for genuinely programmatic changes; back up targets, assert all anchors, fail loudly, and inspect `git diff` afterward.
+- Prefer native file editors. Use scripts only for genuinely programmatic changes; back up targets, assert all anchors, fail loudly, and inspect `git diff` afterward.
 
 ## Git and commits
 
