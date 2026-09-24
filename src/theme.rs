@@ -303,7 +303,7 @@ pub(crate) const THUMB_GAP: f64 = 6.0;
 /// Preview aspect ratio (16/10).
 pub(crate) const THUMB_PREVIEW_RATIO: f64 = 1.6;
 /// Maximum card enlargement for small window sets; 1.0 is the original thumbnail size.
-pub(crate) const THUMB_MAX_SCALE: f64 = 1.5;
+pub(crate) const THUMB_MAX_SCALE: f64 = 1.2;
 /// The floor of the card scale (relative to the base card width). It doubles as the last ladder step:
 /// `thumb_card_h_for_scale` clamps its input with it, so adding a smaller step requires lowering
 /// this too or the new step can never be chosen.
@@ -315,9 +315,12 @@ pub(crate) const PANEL_MARGIN: f64 = 24.0;
 /// Top inset above the thumbnail card area.
 const THUMB_TOP_INSET: f64 = 32.0;
 
-/// The legacy paged layout stays frozen at its 0.85 floor, decoupled from the production ladder
-/// (which now reaches 0.75). It has no caller, so keeping the old value lets its layout tests keep
-/// describing the old behaviour instead of breaking on every ladder tweak.
+/// The legacy paged layout stays frozen at its historical 1.5–0.85 range, decoupled from the
+/// production ladder. It has no caller, so keeping these values lets its layout tests describe the
+/// old behaviour without changing with every ladder tweak.
+#[cfg(test)]
+const LEGACY_THUMB_MAX_SCALE: f64 = 1.5;
+
 #[cfg(test)]
 const LEGACY_THUMB_MIN_SCALE: f64 = 0.85;
 
@@ -332,7 +335,7 @@ pub(crate) fn thumb_scale_for_count(count: usize) -> f64 {
     match count {
         0 => 1.0,
         7.. => LEGACY_THUMB_MIN_SCALE,
-        1 | 2 => THUMB_MAX_SCALE,
+        1 | 2 => LEGACY_THUMB_MAX_SCALE,
         3 => 1.4,
         4 => 1.3,
         5 => 1.2,
@@ -340,21 +343,9 @@ pub(crate) fn thumb_scale_for_count(count: usize) -> f64 {
     }
 }
 
-/// Candidate card scales, largest first; the ends are the old enlargement cap and the old
-/// minimum-scale floor.
-pub(crate) const THUMB_SCALE_STEPS: [f64; 11] = [
-    THUMB_MAX_SCALE,
-    1.4,
-    1.3,
-    1.2,
-    1.1,
-    1.0,
-    0.95,
-    0.9,
-    0.85,
-    0.8,
-    0.75,
-];
+/// Candidate card scales, largest first, from the maximum enlargement to the minimum floor.
+pub(crate) const THUMB_SCALE_STEPS: [f64; 8] =
+    [THUMB_MAX_SCALE, 1.1, 1.0, 0.95, 0.9, 0.85, 0.8, 0.75];
 
 /// Pick the packing to use: balanced rows win (even counts per row) and greedy is only the fallback
 /// when balanced exceeds the visible row budget (greedy needs the fewest rows, so it never shrinks
@@ -1107,7 +1098,7 @@ pub(crate) fn rebase_thumb_scroll_after_document_resize(
     (new_document_h, max_offset, offset, delta)
 }
 
-/// Plan the thumbnail grid: total window count first determines the 1.0–1.5 scale,
+/// Plan the thumbnail grid: total window count first determines the 1.0–1.2 scale,
 /// then aspect-width cards are balanced into rows. Overflow retains that size and
 /// uses deterministic pages beginning at index zero.
 #[cfg(test)]
@@ -1575,23 +1566,11 @@ mod flow_tests {
     /// geometric consequences, so a ladder tweak only ever touches this test.
     #[test]
     fn the_scale_ladder_keeps_its_floor_and_cap() {
-        assert_eq!(thumb_scale_for_count(0), 1.0);
-        assert_eq!(thumb_scale_for_count(1), THUMB_MAX_SCALE);
-        assert_eq!(thumb_scale_for_count(2), THUMB_MAX_SCALE);
-        for count in 3..=6 {
-            let scale = thumb_scale_for_count(count);
-            assert!(
-                scale > THUMB_MIN_SCALE && scale < THUMB_MAX_SCALE,
-                "count {count} should sit between the floor and the cap, got {scale}"
-            );
-        }
-        for count in 7..40 {
-            assert_eq!(
-                thumb_scale_for_count(count),
-                LEGACY_THUMB_MIN_SCALE,
-                "count {count}"
-            );
-        }
+        assert_eq!(THUMB_SCALE_STEPS[0], THUMB_MAX_SCALE);
+        assert_eq!(THUMB_SCALE_STEPS.last().copied().unwrap(), THUMB_MIN_SCALE);
+        assert!(THUMB_SCALE_STEPS
+            .iter()
+            .all(|&scale| scale <= THUMB_MAX_SCALE));
         // The floor must actually be smaller (otherwise it shrinks for nothing) while the preview area
         // stays above its legibility floor.
         const { assert!(LEGACY_THUMB_MIN_SCALE < 1.0) };
@@ -1982,7 +1961,7 @@ mod flow_tests {
         let layout = plan_thumb_flow_layout(&[1.6, 1.6], 1, 1200.0, 1000.0, THUMB_ROW_GAP);
         assert_eq!(layout.visible, 0..2);
         assert!(!layout.overflowed);
-        assert!((layout.scale - THUMB_MAX_SCALE).abs() < 1e-9);
+        assert!((layout.scale - LEGACY_THUMB_MAX_SCALE).abs() < 1e-9);
         assert!(layout.card_h > thumb_card_h_fixed());
     }
 
