@@ -10,11 +10,6 @@ use std::time::{Duration, SystemTime};
 
 use crate::ffi::{localtime_r, Tm};
 
-// ========== 日志级别 / log level ==========
-
-/// 只有两档:Debug(调试细节)/ Info(常规运行信息)。
-/// 错误/警告统一走 log_info!(内容保留,不再单独分级)。
-///
 /// Only two levels: Debug (diagnostic detail) / Info (normal runtime info).
 /// Errors/warnings all go through log_info! (content preserved, no separate tiers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -33,38 +28,28 @@ impl LogLevel {
     }
 }
 
-// ========== 配置 / config ==========
-
 pub struct LogConfig {
     pub level: LogLevel,
-    pub file_path: String, // 空=默认滚动路径 / empty = default rolling path
+    pub file_path: String, // empty = default rolling path
 }
-
-// ========== 全局状态 / global state ==========
 
 static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
 static LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::Info as usize);
-/// init 时解析出的活动日志文件路径,供「导出日志」等功能读取。
 /// The active log file path resolved at init, for features like "export logs".
 static ACTIVE_LOG_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
 
-/// 当前活动日志文件的绝对路径(None = 本会话没有文件输出,理论上只在 init 前出现)。
 /// The active log file's absolute path (None = no file output this session; in practice
 /// only observable before init).
 pub fn active_log_path() -> Option<std::path::PathBuf> {
     ACTIVE_LOG_PATH.get().cloned().flatten()
 }
 
-// 有界通道容量:最坏约 100KB,远大于单次召唤的日志突发;仅在落盘严重卡顿时才会丢日志。
 // Bounded channel capacity: ~100KB worst case, far larger than a single summon's burst;
 // logs are dropped only when disk writes stall severely.
 const LOG_CHANNEL_CAPACITY: usize = 512;
 const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const LOG_BACKUP_COUNT: usize = 5;
 
-// ========== 宏（调用侧接口） / macros (caller API) ==========
-
-/// 调试细节(每次事件/枚举/排序等),仅 Debug 档输出。
 /// Diagnostic detail (per-event / enumeration / sorting), emitted only at the Debug tier.
 #[macro_export]
 macro_rules! log_debug {
@@ -72,7 +57,6 @@ macro_rules! log_debug {
         $crate::logger::_log($crate::logger::LogLevel::Debug, format_args!($($arg)*))
     };
 }
-/// 常规运行信息(启动/开关/菜单/错误提示等),Debug 与 Info 档均输出。
 /// Normal runtime info (startup / toggles / menu / error notices), emitted at both tiers.
 #[macro_export]
 macro_rules! log_info {
@@ -81,7 +65,6 @@ macro_rules! log_info {
     };
 }
 
-/// 被宏调用的核心函数：阈值过滤 + 拼时间戳 + 发送到 channel。
 /// Core function called by macros: threshold filter + timestamp + send to channel.
 pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
     let threshold =
@@ -92,18 +75,13 @@ pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
     if let Some(tx) = LOG_TX.get() {
         let ts = now_timestamp();
         let msg = format!("{} {} {}\n", ts, level.as_str(), args);
-        // 有界通道:满时丢弃最新日志,调用线程不在这里等待(日志不应拖慢 UI/事件循环)。
         // Bounded channel: drop the newest entry when full; never block the caller
         // (logging must not stall the UI / event loop).
         let _ = tx.try_send(msg);
     }
 }
 
-// ========== 生命周期 / lifecycle ==========
-
-/// 在主线程早期调用，启动后台 writer 线程。
 /// Call early on the main thread to start the background writer thread.
-/// `is_dev`: cargo run → stdout; 打包 .app → 文件 / packaged .app → file.
 pub fn init(config: &LogConfig, is_dev: bool) {
     let (tx, rx) = flume::bounded::<String>(LOG_CHANNEL_CAPACITY);
     LOG_TX.set(tx).ok();
@@ -120,26 +98,20 @@ pub fn init(config: &LogConfig, is_dev: bool) {
             writer_loop(rx, is_dev, file_path);
         })
         .expect("spawn log-writer thread");
-    // stderr 重定向到日志管线:NSLog/AppKit 警告(如 Menu_Tracking 内部消息)、
-    // panic 等系统输出都走 stderr,不捕获就会漏掉(只出现在终端/统一日志里)。
     // Redirect stderr into the log pipeline: system output like NSLog/AppKit warnings
     // (e.g. Menu_Tracking internals) and panics go through stderr; without capture they
     // are invisible in our log (only the terminal / unified log sees them).
     capture_stderr();
 }
 
-/// 运行时调整日志级别（reload_config 触发）。
 /// Runtime log level adjustment (triggered by reload_config).
 pub fn reconfigure(level: LogLevel) {
     LOG_LEVEL.store(level as usize, Ordering::Relaxed);
 }
 
-// ========== 内部实现 / internals ==========
-
 fn writer_loop(rx: Receiver<String>, is_dev: bool, file_path: Option<LogDestination>) {
     let mut file = file_path.and_then(RollingLogFile::open);
 
-    // 每次进程启动写一条边界标记,固定日志文件也能清楚区分不同运行会话。
     // Write a session boundary marker on every launch so a stable log file still separates runs.
     let startup = format!("{} INFO  [logger] session started\n", now_timestamp());
     if is_dev {
@@ -151,7 +123,7 @@ fn writer_loop(rx: Receiver<String>, is_dev: bool, file_path: Option<LogDestinat
 
     while let Ok(msg) = rx.recv() {
         if is_dev {
-            print!("{}", msg); // stdout,msg 已含 \n / msg already contains \n
+            print!("{}", msg); // msg already contains \n
         }
         if let Some(ref mut f) = file {
             f.write_line(&msg);
@@ -190,7 +162,7 @@ impl RollingLogFile {
             .append(true)
             .open(&destination.path)
             .map_err(|e| {
-                // writer 线程自身出问题时降级到 stderr / fallback to stderr on writer thread failure
+                // fallback to stderr on writer thread failure
                 eprintln!(
                     "[logger] cannot open log file {}: {}",
                     destination.path.display(),
@@ -223,7 +195,7 @@ impl RollingLogFile {
         if self.writer.write_all(msg.as_bytes()).is_ok() {
             self.bytes_written = self.bytes_written.saturating_add(msg_len);
         }
-        // 每条 flush:崩溃时最多丢 1 条,文件不损坏 / flush each line: at most 1 msg lost on crash
+        // flush each line: at most 1 msg lost on crash
         let _ = self.writer.flush();
     }
 
@@ -256,8 +228,6 @@ fn backup_path(path: &Path, index: usize) -> PathBuf {
     PathBuf::from(value)
 }
 
-// ========== stderr 捕获(NSLog/AppKit 系统输出) / stderr capture ==========
-
 extern "C" {
     fn pipe(fds: *mut c_int) -> c_int;
     fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
@@ -265,11 +235,6 @@ extern "C" {
     fn close(fd: c_int) -> c_int;
 }
 
-/// 把进程的 stderr(fd 2)重定向到管道,读线程按行转交给日志管线(Info 级)。
-/// NSLog 的可见输出、AppKit 内部警告、Rust panic 都写 stderr;重定向后这些消息
-/// 带 `[stderr]` 前缀进入正常日志格式(时间戳 + INFO),与自家宏统一,不再只
-/// 出现在终端。dev 模式下 writer_loop 仍会打到 stdout,终端照常可见。
-///
 /// Redirect the process's stderr (fd 2) to a pipe; a reader thread hands each line to
 /// the log pipeline at Info level. NSLog's visible output, AppKit internal warnings and
 /// Rust panics all write to stderr; after redirection they appear in the normal log
@@ -301,9 +266,6 @@ fn capture_stderr() {
     }
 }
 
-/// 读线程:阻塞读管道,按 \n 切行(半行缓冲),每行去尾 \r 后以 Info 级输出。
-/// 管道写满时线程阻塞在 read,writer 线程持续排空,不会撑爆内存。
-///
 /// Reader thread: blocks on the pipe, splits lines on \n (buffering partial lines),
 /// strips trailing \r, and emits each line at Info level. If the pipe fills, this
 /// thread blocks in read while the writer thread keeps draining; memory stays bounded.
@@ -328,7 +290,6 @@ fn stderr_reader(fd: c_int) {
             pending.extend_from_slice(&buf[start..n as usize]);
         }
     }
-    // EOF(进程退出前理论上到不了):冲刷残留的半行。
     // EOF (unreachable before process exit in practice): flush any trailing partial line.
     if !pending.is_empty() {
         emit_stderr_line(&pending);
@@ -339,7 +300,6 @@ fn stderr_reader(fd: c_int) {
 }
 
 fn emit_stderr_line(line: &[u8]) {
-    // NSLog 行尾可能是 \r(老式行尾),只去掉 \r,保留其余内容。
     // NSLog lines can end with \r (legacy line ending); strip only the \r.
     let trimmed = if line.last() == Some(&b'\r') {
         &line[..line.len() - 1]
@@ -351,13 +311,9 @@ fn emit_stderr_line(line: &[u8]) {
 }
 
 fn resolve_file_path(config: &LogConfig) -> Option<LogDestination> {
-    // dev 模式也写文件:writer_loop 在 is_dev 时同时输出到 stdout 与文件,
-    // 便于开发时日志持久化(终端关闭不丢)。30 天清理同样作用于 dev 日志。
     // Dev mode also writes to a file: writer_loop prints to stdout AND the file when is_dev,
     // so dev logs persist (not lost when the terminal closes). The 30-day cleanup applies
     // to dev logs too.
-    // 用户自定义路径:原样使用(append 模式,不轮转、不做清理,由用户自行管理)。
-    // 我们不会往用户指定的位置写入额外文件,也不会删除其中的任何文件。
     // User-supplied path: use verbatim (append mode, no rotation, no cleanup - the user
     // manages rotation themselves). We never write extra files into, or delete files from,
     // a user-specified location.
@@ -370,7 +326,6 @@ fn resolve_file_path(config: &LogConfig) -> Option<LogDestination> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = format!("{}/Library/Logs/oh-my-tab", home);
     let _ = std::fs::create_dir_all(&dir);
-    // 启动时清理 30 天前的旧日志(仅默认目录、本应用日志);当前文件不删除。
     // Prune logs older than 30 days at startup (default dir and app-owned logs only); never delete the active file.
     cleanup_old_logs(Path::new(&dir));
     Some(LogDestination {
@@ -379,10 +334,6 @@ fn resolve_file_path(config: &LogConfig) -> Option<LogDestination> {
     })
 }
 
-/// 删除日志目录中修改时间超过 30 天的本应用日志和滚动备份。
-/// 仅按 mtime 判断;正在写入的当前文件 mtime 持续更新,不会被误删。
-/// 仅作用于默认日志目录,不会触碰用户自定义路径所在的目录。
-///
 /// Delete app-owned log files and rolling backups in the log dir whose mtime is older than 30 days.
 /// Judged by mtime only; the current file's mtime keeps updating as we write, so it's never pruned.
 /// Only the default log dir is touched - never the directory of a user-supplied path.
@@ -398,7 +349,6 @@ fn cleanup_old_logs(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // 当前滚动文件保留;历史备份和旧版按启动生成的日志才参与 30 天清理。
         // Keep the active rolling file; prune backups and legacy per-launch logs by age.
         let is_backup = name
             .strip_prefix("oh-my-tab.log.")
@@ -417,10 +367,8 @@ fn cleanup_old_logs(dir: &Path) {
     }
 }
 
-// ========== 时间戳 / timestamp ==========
-// Tm 与 localtime_r 已统一到 ffi.rs / Tm and localtime_r live in ffi.rs now
+// Tm and localtime_r live in ffi.rs now
 
-/// 零依赖 ISO-8601 时间戳，精确到毫秒。格式："2025-07-25T17:08:30.123"
 /// Zero-dep ISO-8601 timestamp with milliseconds.
 fn now_timestamp() -> String {
     let now = SystemTime::now()
@@ -458,7 +406,6 @@ mod tests {
 
     #[test]
     fn timestamps_are_well_formed() {
-        // 时间戳格式:带 T 分隔与毫秒。
         // Timestamp format: ISO-ish with T and milliseconds.
         let ts = now_timestamp();
         assert_eq!(ts.len(), 23); // "YYYY-MM-DDTHH:MM:SS.mmm"
@@ -479,11 +426,11 @@ mod tests {
             f.set_modified(mtime).unwrap();
             p
         };
-        // 过期本应用日志:应被删 / stale own log: removed.
+        // stale own log: removed.
         let stale = make("oh-my-tab-2020-01-01_00-00-00.log", old);
-        // 新本应用日志:保留 / fresh own log: kept.
+        // fresh own log: kept.
         let fresh_log = make("oh-my-tab-2099-01-01_00-00-00.log", fresh);
-        // 过期但非本应用的日志:跳过删除 / stale but unrelated: skipped during cleanup.
+        // stale but unrelated: skipped during cleanup.
         let foreign = make("something-else.log", old);
         cleanup_old_logs(dir.path());
         assert!(!stale.exists());

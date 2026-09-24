@@ -1,21 +1,15 @@
-//! 快捷键描述解析与显示。
-//! 配置里按钮映射的值为 "cmd+shift+v" 这类字符串:修饰键名 + '+' + 键名。
-//! 解析结果 = (虚拟键码, CGEventFlags 修饰位),供键盘模拟器合成事件。
-//!
 //! Shortcut-description parsing and display.
 //! Button-mapping config values look like "cmd+shift+v": modifier names joined by '+' then a
 //! key name. Parsing yields (virtual keycode, CGEventFlags modifier bits) for the key simulator.
 
 use std::collections::HashMap;
 
-/// CGEventFlags 修饰位(kCGEventFlagMask* 与 event_tap.rs 的常量一致)。
 /// CGEventFlags modifier bits (kCGEventFlagMask*, matching event_tap.rs constants).
 pub(crate) const FLAG_CMD: u32 = 0x0010_0000;
 pub(crate) const FLAG_ALT: u32 = 0x0008_0000;
 pub(crate) const FLAG_CTRL: u32 = 0x0004_0000;
 pub(crate) const FLAG_SHIFT: u32 = 0x0002_0000;
 
-/// 解析后的快捷键:(虚拟键码, 修饰位)。
 /// A parsed shortcut: (virtual keycode, modifier bits).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Shortcut {
@@ -23,7 +17,6 @@ pub(crate) struct Shortcut {
     pub(crate) flags: u32,
 }
 
-/// 单个字母/数字键名 -> 键码(ANSI 布局,键位序非字母序)。
 /// Single letter/digit key name -> keycode (ANSI layout; physical order, not alphabetical).
 fn ansi_keycode(name: &str) -> Option<u16> {
     let b = name.as_bytes();
@@ -32,7 +25,6 @@ fn ansi_keycode(name: &str) -> Option<u16> {
     }
     let c = b[0];
     match c {
-        // QWERTY 键位序(ANSI):A=0x00 S=0x01 D=0x02 F=0x03 H=0x04 G=0x05 Z=0x06 X=0x07
         // C=0x08 V=0x09 B=0x0B Q=0x0C W=0x0D E=0x0E R=0x0F Y=0x10 T=0x11 U=0x20 I=0x22
         // O=0x1F P=0x23 L=0x25 J=0x26 K=0x28 N=0x2D M=0x2E
         b'a' => Some(0x00),
@@ -78,7 +70,6 @@ fn ansi_keycode(name: &str) -> Option<u16> {
     }
 }
 
-/// 特殊键名 -> 键码。
 /// Special key names -> keycode.
 fn special_keycode(name: &str) -> Option<u16> {
     Some(match name {
@@ -119,15 +110,11 @@ fn special_keycode(name: &str) -> Option<u16> {
     })
 }
 
-/// 把键名解析为键码(字母/数字/特殊键)。
 /// Resolve a key name to a keycode (letter/digit/special).
 fn keycode_for(name: &str) -> Option<u16> {
     ansi_keycode(name).or_else(|| special_keycode(name))
 }
 
-/// 解析 "cmd+shift+v" 这类描述。修饰键顺序任意、可省略;主键必须且只能一个。
-/// 返回 Err(英文原因,供校验转成 i18n 消息)。
-///
 /// Parse a "cmd+shift+v"-style description. Modifiers may be in any order and are optional;
 /// exactly one main key is required. Err carries an English reason for validation to wrap in
 /// an i18n message.
@@ -169,27 +156,21 @@ pub(crate) fn parse_shortcut(desc: &str) -> Result<Shortcut, String> {
     }
 }
 
-/// 一个绑定的解析结果:自定义按键 / 系统动作 / 打开切换器 / 显式禁用。
 /// A parsed binding: a custom key press, a system action, opening the switcher, or none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Binding {
     Key(Shortcut),
-    /// 系统动作(按下时经 CoreDockSendNotification 触发,值为 Dock 通知字符串)。
     /// A system action (fired via CoreDockSendNotification on press; value = the Dock
     /// notification string).
     System(&'static str),
-    /// 打开应用切换浮窗:按下发 CmdTabPressed(浮窗开),抬起发 CmdReleased(提交切换)。
-    /// 与 Key Press 绑定 Cmd+Tab 的内部派发同一条路径,但不受快捷键模式影响。
     /// Open the app switcher: press sends CmdTabPressed (overlay opens), release sends
     /// CmdReleased (commits the switch). Same path as the internal dispatch of a
     /// Cmd+Tab Key Press binding, but independent of the shortcut mode.
     Switcher,
-    /// 显式禁用:吞掉按键事件但不产生任何动作(按钮完全失效)。
     /// Explicit none: swallow the button events without any action (the button is dead).
     None,
 }
 
-/// 系统动作名 -> Dock 通知字符串(LinearMouse DockKit 同款私有通知)。
 /// System action name -> Dock notification string (the same private notifications as
 /// LinearMouse's DockKit).
 pub(crate) fn system_action_notification(name: &str) -> Option<&'static str> {
@@ -202,14 +183,10 @@ pub(crate) fn system_action_notification(name: &str) -> Option<&'static str> {
     }
 }
 
-/// 系统动作的显示/配置名(与 UI 下拉和配置值一致)。
 /// System actions' display/config names (consistent with the UI popup and config values).
 pub(crate) const SYSTEM_ACTIONS: [&str; 4] =
     ["missioncontrol", "launchpad", "showdesktop", "appexpose"];
 
-/// 解析一个绑定描述:先试系统动作/显式禁用,再退到快捷键解析。
-/// 值可能是 "none"、系统动作名(如 "missioncontrol"),或 "cmd+shift+v" 这类快捷键。
-///
 /// Parse a binding description: try system actions / explicit none first, then fall back to
 /// shortcut parsing. Values are "none", a system-action name (e.g. "missioncontrol"), or a
 /// shortcut like "cmd+shift+v".
@@ -218,7 +195,6 @@ pub(crate) fn parse_binding(desc: &str) -> Result<Binding, String> {
     if lower == "none" {
         return Ok(Binding::None);
     }
-    // 打开切换器(内部动作,非 Dock 通知)。
     // Open the switcher (an internal action, not a Dock notification).
     if lower == "switcher" {
         return Ok(Binding::Switcher);
@@ -229,7 +205,6 @@ pub(crate) fn parse_binding(desc: &str) -> Result<Binding, String> {
     parse_shortcut(desc).map(Binding::Key)
 }
 
-/// 键码 -> 显示名(字母大写/数字/特殊键名)。
 /// Keycode -> display name (capitalized letter/digit/special name).
 fn key_name(keycode: u16) -> String {
     for (name, kc) in [
@@ -264,7 +239,6 @@ fn key_name(keycode: u16) -> String {
             return name.to_uppercase();
         }
     }
-    // 数字键的键码不连续,查表反向。
     // Digit keycodes are non-contiguous; reverse lookup.
     for (name, kc) in [
         ("0", 0x1D),
@@ -313,7 +287,6 @@ fn key_name(keycode: u16) -> String {
     }
 }
 
-/// 修饰位 -> 显示符号(⌘⇧⌥⌃,顺序固定 cmd shift alt ctrl)。
 /// Modifier bits -> display symbols (⌘⇧⌥⌃, fixed order cmd shift alt ctrl).
 pub(crate) fn modifier_display(flags: u32) -> String {
     let mut s = String::new();
@@ -332,9 +305,6 @@ pub(crate) fn modifier_display(flags: u32) -> String {
     s
 }
 
-/// 把配置里的快捷键描述解析并格式化成键帽样式(如 "cmd+shift+v" -> "⌘⇧V")。
-/// 解析失败时原样返回(UI 里由校验报错,这里不 panic)。
-///
 /// Format a config shortcut description as keycap style ("cmd+shift+v" -> "⌘⇧V").
 /// Returns the input untouched on parse failure (validation reports the error; no panic here).
 pub(crate) fn display_shortcut(desc: &str) -> String {
@@ -344,9 +314,6 @@ pub(crate) fn display_shortcut(desc: &str) -> String {
     }
 }
 
-/// 键码 + 修饰位 -> 描述字符串(供录制后序列化进配置,如 ⌘⇧V 的事件 -> "cmd+shift+v")。
-/// 修饰键按 cmd,shift,alt,ctrl 顺序输出。
-///
 /// Keycode + modifier bits -> description string (for serializing a recorded combo into the
 /// config, e.g. a ⌘⇧V event -> "cmd+shift+v"). Modifiers serialize in cmd,shift,alt,ctrl order.
 pub(crate) fn describe_shortcut(keycode: u16, flags: u32) -> String {
@@ -364,12 +331,10 @@ pub(crate) fn describe_shortcut(keycode: u16, flags: u32) -> String {
         parts.push("ctrl");
     }
     let key = key_name(keycode).to_ascii_lowercase();
-    // 特殊键名小写后与解析表一致;单字符键直接小写。
     // Special-key names lowercase to match the parser; single chars just lowercase.
     let key = match key.as_str() {
         "return" | "tab" | "space" | "delete" | "esc" | "home" | "end" | "page up"
         | "page down" | "←" | "→" | "↓" | "↑" => {
-            // 方向键等保持原样(描述表用小写英文名)。
             // Arrows etc. keep their own form; the parser table uses lowercase English names.
             match key.as_str() {
                 "return" => "return",
@@ -389,7 +354,6 @@ pub(crate) fn describe_shortcut(keycode: u16, flags: u32) -> String {
             }
         }
         k if k.starts_with('f') && k.len() > 1 && k[1..].chars().all(|c| c.is_ascii_digit()) => {
-            // F 键:key_name 返回 "fN"(已小写)。
             // F keys: key_name already returns "fN" lowercased.
             k
         }
@@ -399,7 +363,6 @@ pub(crate) fn describe_shortcut(keycode: u16, flags: u32) -> String {
     parts.join("+")
 }
 
-/// 按钮号显示名(1-based 转 0-based 后映射到常见名字)。
 /// Button-number display name (maps the 1-based number to a common name after 0-basing).
 pub(crate) fn button_name(button: u32) -> String {
     match button {
@@ -410,9 +373,6 @@ pub(crate) fn button_name(button: u32) -> String {
     }
 }
 
-/// 校验按钮映射表:按钮号 >= 2 且是数字,快捷键可解析。
-/// 返回错误列表(英文,调用方转 i18n)。
-///
 /// Validate a button-mapping table: button numbers are numeric and >= 2, shortcuts parse.
 /// Returns a list of errors (English; the caller wraps them in i18n messages).
 pub(crate) fn validate_mappings(mappings: &HashMap<String, String>, prefix: &str) -> Vec<String> {
@@ -424,7 +384,6 @@ pub(crate) fn validate_mappings(mappings: &HashMap<String, String>, prefix: &str
                 "{prefix}.button_mappings[{btn}]: invalid button number"
             )),
         }
-        // 用 parse_binding:接受 "none" / 系统动作名 / 快捷键,其余报错。
         // parse_binding accepts "none" / system-action names / shortcuts; anything else errors.
         if let Err(e) = parse_binding(desc) {
             errs.push(format!("{prefix}.button_mappings[{btn}]: {e}"));
@@ -484,8 +443,8 @@ mod tests {
     fn validate_buttons() {
         let mut m = HashMap::new();
         m.insert("3".into(), "cmd+c".into());
-        m.insert("1".into(), "cmd+v".into()); // 左键不允许
-        m.insert("4".into(), "badkey".into()); // 快捷键非法
+        m.insert("1".into(), "cmd+v".into()); // the left button is not allowed
+        m.insert("4".into(), "badkey".into()); // invalid shortcut
         let errs = validate_mappings(&m, "mouse.profiles[0]");
         assert_eq!(errs.len(), 2);
     }

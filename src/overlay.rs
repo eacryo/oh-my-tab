@@ -1,7 +1,3 @@
-//! 切换器浮窗与卡片 UI:浮窗/容器/状态栏的 static、卡片↔索引映射、键盘/鼠标回调,
-//! 以及浮窗的显示/隐藏/刷新/卡片构建/主题应用等渲染逻辑。activate_and_raise 负责
-//! 抬起目标窗口。KEY_* 为键盘导航键码。
-//!
 //! Switcher overlay & card UI: statics for the overlay/container/status bar, the card<->index
 //! map, keyboard/mouse callbacks, and the overlay's show/hide/refresh/card-build/theme-apply
 //! rendering. activate_and_raise raises the target window. KEY_* are keyboard-navigation key
@@ -30,13 +26,11 @@ use crate::window_collector::{
     WindowInfo,
 };
 use crate::window_server;
-// 跨模块共享状态(由 main.rs 持有,这里读写)/ cross-module shared state (owned by main.rs)
+// cross-module shared state (owned by main.rs)
 use crate::window_refresh::request_window_refresh;
 use crate::with_tab_state;
 use crate::AppState;
 use crate::{log_debug, log_info, WINDOW_COUNT};
-
-// ========== 键盘键码 / keyboard key codes ==========
 
 pub(crate) const KEY_TAB: u16 = keyboard::VK_TAB;
 pub(crate) const KEY_LEFT: u16 = keyboard::VK_LEFT;
@@ -46,69 +40,48 @@ pub(crate) const KEY_UP: u16 = keyboard::VK_UP;
 pub(crate) const KEY_ESCAPE: u16 = 53;
 pub(crate) const KEY_RETURN: u16 = 36;
 pub(crate) const KEY_DELETE: u16 = 51; // Backspace
-/// NSEventModifierFlagShift，与 CGEvent 的 Shift 位一致。
 /// NSEventModifierFlagShift; it shares the Shift bit with CGEvent flags.
 const NSEVENT_MODIFIER_FLAG_SHIFT: u64 = 0x0002_0000;
 const NSEVENT_MODIFIER_FLAG_OPTION: u64 = 0x0008_0000;
 const NSEVENT_MODIFIER_FLAG_COMMAND: u64 = 0x0010_0000;
-/// 卡片右上角关闭按钮的 tag(hover 显隐查找用;卡片 index 不存 tag)。
 /// The close-button tag on a card (used to find it for hover show/hide; the card
 /// index is NOT stored in the tag).
 pub(crate) const CLOSE_BTN_TAG: isize = 0xE7F1;
-/// 选中态位移用的图标视图 tag,避免依赖动态 ObjC 类的属性访问。
 /// Tag used to find the icon view for the selected-state nudge without relying on
 /// property accessors on the dynamically registered ObjC card class.
 pub(crate) const ICON_VIEW_TAG: isize = 0xE7F2;
-/// 缩略图模式预览区容器的 tag(选中描边与整卡上浮模式识别用)。
 /// Tag for the thumbnail-mode preview container (used for its selected border and
 /// to identify cards that receive the whole-card lift).
 const THUMB_PREVIEW_TAG: isize = 0xE7F3;
-/// 缩略图模式选中态的 2pt 外圈视图 tag。
 /// Tag for the thumbnail-mode selected-state 2pt outer ring.
 const THUMB_SELECTION_RING_TAG: isize = 0xE7F4;
-/// Liquid Glass 会稀释设计稿 16% 的 accent-soft，提升到 38% 让选中态更明显。
 /// Liquid Glass washes out the mockup's 16% accent-soft; use 38% for a clearer selection.
 const SELECTION_RING_ALPHA: u8 = 0x61;
-/// 外圈附加的零偏移柔光；与卡片自身的深色向下投影分层。
 /// Zero-offset glow around the ring, layered separately from the card's dark drop shadow.
 const SELECTION_GLOW_OPACITY: f32 = 0.35;
 const SELECTION_GLOW_RADIUS: f64 = 4.0;
-/// 设计稿选中预览描边 = rgba(...,.34),换算为 8 位 alpha。
 /// Mockup selected-preview border = rgba(...,.34), converted to 8-bit alpha.
-/// 旧版纯图标模式选中时仅图标上移的距离。
 /// Distance that only the icon moves upward in legacy icon-only mode.
 const SELECTED_CONTENT_NUDGE: f64 = 2.0;
-/// 设计稿 `.item.selected { transform: translateY(-1px) }`：AppKit y 轴向上为正，
-/// 因此缩略图卡片根层使用 +1pt，标题、预览和卡片表面作为整体上浮。
 /// The mockup's `.item.selected { transform: translateY(-1px) }`: AppKit's y axis is
 /// positive upward, so the thumbnail card root uses +1pt and lifts its caption, preview,
 /// and surface as one unit.
 const SELECTED_CARD_LIFT: f64 = 1.0;
-/// 卡片收窄并补位的动画时长;整个过程保持在一次 AppKit 动画事务内。
 /// Duration of the slot-collapse/reflow animation; the whole transition stays in one AppKit transaction.
 const CARD_CLOSE_ANIMATION_DURATION: f64 = 0.16;
 
-// ========== 浮窗相关全局状态 / overlay global state ==========
-
 pub(crate) static OVERLAY_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 pub(crate) static CONTAINER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// 持久的卡片 document view;滚动时只移动 CONTAINER 的 bounds,不重建卡片树。
 /// Persistent card document view; scrolling moves CONTAINER bounds instead of rebuilding cards.
 pub(crate) static CARD_DOCUMENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 pub(crate) static STATUS_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// 缩略图溢出时显示的原生竖向滚动条。
 /// Native vertical scroller shown when the thumbnail rows overflow the viewport.
 pub(crate) static THUMB_SCROLLER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// macOS 26+ 的 NSGlassEffectView 指针(用于设置热重载时重新应用玻璃属性)。
 /// Pointer to the NSGlassEffectView on macOS 26+ (used to re-apply glass properties on hot reload).
 pub(crate) static GLASS_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 pub(crate) static CARD_CLASS: Mutex<Option<StaticClass>> = Mutex::new(None);
 
 /// Copy a main-thread UI pointer out of its slot before calling AppKit.
-///
-/// 在调用 AppKit 前先把主线程 UI 指针复制出来并结束槽位借用。AppKit 的部分方法会同步
-/// 触发 Objective-C 通知回调；如果回调再次访问同一个 `MainThreadSlot`，持有 `RefMut`
-/// 就会触发 `BorrowMutError`。
 ///
 /// Copy the main-thread UI pointer out of its slot before calling AppKit. Some AppKit methods
 /// synchronously deliver Objective-C notifications; keeping the `RefMut` alive across such a
@@ -129,9 +102,7 @@ pub(super) fn overlay_container_ptr() -> Option<*mut AnyObject> {
         .map(|container| container.0)
 }
 
-/// 注册 OhMyTabCardView 卡片类(此前在 main.rs 注册、本模块使用,归属已收回)。
-/// Register the OhMyTabCardView class (registration used to live in main.rs while
-/// the class is owned/used here; ownership is now local).
+/// Register the OhMyTabCardView class; ownership lives in this module.
 pub(crate) fn register_card_class() {
     unsafe {
         let name = CString::new("OhMyTabCardView").unwrap();
@@ -167,53 +138,37 @@ static CARD_KEY_MAP: LazyLock<Mutex<HashMap<usize, WindowKey>>> =
 /// only that card.
 static CARD_SIGNATURES: LazyLock<Mutex<HashMap<usize, CardSignature>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// 缩略图模式当前实际渲染的全局窗口索引区间；窗口列表本身从不截断。
 /// Global window-index range currently rendered in thumbnail mode; the authoritative
 /// window list is never truncated.
 static THUMB_VISIBLE_RANGE: Mutex<Option<Range<usize>>> = Mutex::new(None);
-/// 完整流式布局的稳定行范围,用于按行滚动和把选中项带回视口。
 /// Stable row ranges for the complete flow layout, used for row scrolling and keeping selection visible.
 static THUMB_ROW_RANGES: Mutex<Option<Vec<Range<usize>>>> = Mutex::new(None);
-/// 当前面板一次能显示的最大行数。
 /// Maximum number of rows visible in the current panel.
 static THUMB_MAX_ROWS: Mutex<usize> = Mutex::new(1);
-/// 当前布局的卡片顶部内边距(含"撑到预算"多出来的部分):关闭重排必须用同一个值,
-/// 否则卡片会跳位。 / The current layout's content inset (including the fill padding); the
 /// post-close reflow must reuse it or the cards jump.
 static THUMB_CONTENT_INSET: Mutex<f64> = Mutex::new(0.0);
-/// 当前布局的高度预算:关闭重排用它重算面板高(同一套"由卡片决定 + 不超上限"规则)。
-/// 默认无穷表示"还没有布局",避免关闭重排把面板夹成 0。
 /// The current layout's height budget; the post-close reflow reuses it so both paths follow the same
 /// "decided by the cards, capped by the budget" rule. The infinite default means "no layout yet", so
 /// the reflow cannot clamp the panel down to zero.
 static THUMB_PANEL_MAX_H: Mutex<f64> = Mutex::new(f64::INFINITY);
-/// 当前布局下 teaser 是否能不牺牲一整行地放进预算(关闭重排沿用同一判定)。
 /// Whether the teaser fits the budget without costing a whole row in the current layout; the
 /// post-close reflow reuses the same verdict.
 static THUMB_TEASER_FITS: Mutex<bool> = Mutex::new(false);
-/// 当前滚动视口的首行,0 表示从 MRU 列表顶部开始。
 /// First row of the scrolling viewport; zero starts at the top of the MRU list.
 static THUMB_SCROLL_ROW: Mutex<usize> = Mutex::new(0);
-/// 当前滚动视口相对内容顶部的 point 偏移,支持卡片在边界处部分可见。
 /// Point offset from the top of the scrolling content, allowing cards to cross viewport edges smoothly.
 static THUMB_SCROLL_OFFSET: Mutex<f64> = Mutex::new(0.0);
-/// 当前完整布局允许的最大 point 偏移。
 /// Maximum point offset allowed by the current complete layout.
 static THUMB_SCROLL_MAX_OFFSET: Mutex<f64> = Mutex::new(0.0);
-/// 当前缩略图 document 的高度(不含状态栏),用于设置 NSClipView 的合法滚动范围。
 /// Current thumbnail document height excluding the status bar, used for the clip-view range.
 static THUMB_DOCUMENT_HEIGHT: Mutex<f64> = Mutex::new(0.0);
-/// 当前卡片预览所需的像素高度,滚动进入新行时复用同一捕获规格。
 /// Current preview pixel demand, reused when scrolling into a new row.
 static THUMB_CAPTURE_TARGET_PX_H: Mutex<u32> = Mutex::new(512);
 /// Last resolved palette used by `apply_theme`; prevents unrelated config changes from forcing
 /// a full thumbnail recapture when the effective light/dark appearance is unchanged.
-/// `apply_theme` 使用的上一次最终调色板;有效明暗未变化时,普通配置热重载不应触发全量重拍。
 static LAST_APPLIED_THEME_DARK: Mutex<Option<bool>> = Mutex::new(None);
-/// 当前完整布局的行间距(卡片高度 + 行间距),供键盘整行导航复用。
 /// Current full-layout row pitch (card height + row gap), reused by whole-row keyboard navigation.
 static THUMB_SCROLL_ROW_PITCH: Mutex<f64> = Mutex::new(1.0);
-/// 自定义滚动条当前的显式拖拽状态。
 /// Explicit drag state for the custom scrollbar.
 #[derive(Clone, Copy)]
 struct ThumbnailScrollDrag {
@@ -225,7 +180,6 @@ struct ThumbnailScrollDrag {
 
 static THUMB_SCROLL_DRAG: Mutex<Option<ThumbnailScrollDrag>> = Mutex::new(None);
 
-/// 滚动条的悬停状态:视口悬停时提高滑块可见度,直接悬停滑块时再提高一级。
 /// Scrollbar hover state: increase thumb visibility over the viewport, then one more level over the thumb.
 #[derive(Clone, Copy, Default, PartialEq)]
 struct ThumbnailScrollerHover {
@@ -238,7 +192,6 @@ static THUMB_SCROLLER_HOVER: Mutex<ThumbnailScrollerHover> = Mutex::new(Thumbnai
     knob: false,
 });
 
-/// 正在播放退出动画的窗口;使用稳定窗口身份,不依赖动画期间可能失效的数组索引。
 /// Window currently playing its exit animation; uses stable identity instead of a transient index.
 struct PendingCardClose {
     pid: i32,
@@ -265,7 +218,6 @@ struct PendingCardClose {
 
 type WindowKey = (i32, u32);
 static PENDING_CARD_CLOSE: Mutex<Option<PendingCardClose>> = Mutex::new(None);
-/// 后台 AX 关闭结果的单槽值类型消息;worker 不直接修改主线程动画状态。
 /// Single-slot value result from the background AX close; the worker never mutates the
 /// main-thread animation state directly.
 static CARD_CLOSE_AX_RESULT: Mutex<Option<(WindowKey, bool)>> = Mutex::new(None);
@@ -277,19 +229,16 @@ struct CardSignature {
     icon_path: Option<String>,
     minimized: bool,
     /// Resolved light/dark state used when the card's text and layers were painted.
-    /// 卡片文字和图层绘制时采用的最终明暗状态。
     theme_dark: bool,
     card_width_bits: u64,
     card_height_bits: u64,
     thumbnail_layout: bool,
-    /// 卡片标题行是否包含应用名;开关变化必须走 Replace,否则复用会让旧标题留存。
     /// Whether the caption includes the app name; a toggle must force Replace, or reuse
     /// would keep the old caption.
     show_app_name_in_cards: bool,
     thumbnail_capture_allowed: bool,
     /// Cached-thumbnail version the card was painted with; a bump means the frame
     /// changed since and the card must be rebuilt instead of reused.
-    /// 卡片绘制时所用的缓存帧版本;版本前进意味着帧已更换,必须重建而非复用。
     thumb_epoch: u64,
 }
 
@@ -328,8 +277,6 @@ fn card_signature(
         thumbnail_layout,
         show_app_name_in_cards: crate::theme::show_app_name_in_cards(),
         thumbnail_capture_allowed,
-        // 帧版本入签名:种子→真实、激活补拍、外观重拍等任何一次换帧都会让下一次
-        // 召唤的签名失配走 Replace,杜绝复用路径冻结旧图(图标模式下恒为 0,无扰动)。
         // The frame version joins the signature: any frame replacement (seed ->
         // real, activation refresh, appearance recapture) mismatches the next
         // summon's signature and forces a Replace, so reuse can never freeze a
@@ -341,7 +288,6 @@ fn card_signature(
 fn clear_thumbnail_scroll_drag() {
     *THUMB_SCROLL_DRAG.lock().unwrap() = None;
 }
-/// 连续上下导航保持的水平中心；水平切换、鼠标选择和新召唤时重置。
 /// Preferred horizontal center retained across consecutive vertical moves; reset
 /// by horizontal navigation, mouse selection, and a fresh summon.
 static THUMB_NAV_ANCHOR_X: Mutex<Option<f64>> = Mutex::new(None);
@@ -350,7 +296,6 @@ type CardPlacementFrame = (usize, f64, f64, f64);
 /// opens. Reset on a fresh summon and flipped to true on the first mouse move.
 pub(crate) static MOUSE_MOVED: AtomicBool = AtomicBool::new(false);
 
-/// 当前浮窗的鼠标激活方式是否为悬停。
 /// Whether the overlay currently activates windows on hover.
 pub(crate) fn activates_on_hover() -> bool {
     crate::config::CONFIG
@@ -380,7 +325,6 @@ pub(crate) use card_close::{
 };
 use hover::*;
 pub(crate) use hover::{container_mouse_moved, on_deferred_scroll_hover};
-// 对 crate 其他模块暴露的入口(内部子模块实现)。
 // Entry points exposed to the rest of the crate (implemented in the child modules).
 pub(crate) use callbacks::{
     commit_first_summon, container_accepts_first_responder, container_key_down,
@@ -397,13 +341,10 @@ pub(crate) use cancel::{
     refresh_thumbnail_previews, vanish_overlay,
 };
 pub(crate) use cards::{create_card_view, show_overlay};
-// 仅缩略图单测经 crate::overlay::nsimage_from_cgimage 使用(cards.rs 内部另有调用点)。
 // Only the thumbnail unit tests use crate::overlay::nsimage_from_cgimage (cards.rs
 // also calls it internally).
 #[cfg(test)]
 pub(crate) use cards::nsimage_from_cgimage;
-
-// ========== 卡片 ↔ 索引映射 / card <-> index map ==========
 
 /// Read the card index from the card index map (keyed by view pointer).
 /// This avoids msg_send! encoding issues with property accessors on
@@ -454,8 +395,6 @@ fn card_signature_for(view: *mut AnyObject) -> Option<CardSignature> {
         .cloned()
 }
 
-/// 原位刷新预览后,把已展示帧的版本号同步进签名,避免下一次召唤做多余的
-/// Replace 重建(期间若又有新帧入库,签名只会偏旧一版,至多多重建一次,自愈)。
 /// After an in-place preview refresh, sync the displayed frame's version into the
 /// signature so the next summon skips a redundant Replace rebuild (a newer frame
 /// landing in between leaves the signature one version behind -- at most one extra
@@ -481,7 +420,7 @@ pub(crate) fn clear_card_indices() {
     CARD_SIGNATURES.lock().unwrap().clear();
 }
 
-/// 缩略图捕获调度读取的可见区间快照。/ Visible-range snapshot for thumbnail scheduling.
+/// Visible-range snapshot for thumbnail scheduling.
 pub(crate) fn thumbnail_visible_range() -> Option<Range<usize>> {
     THUMB_VISIBLE_RANGE.lock().unwrap().clone()
 }
@@ -501,9 +440,6 @@ pub(crate) fn reset_thumbnail_scroll() {
     set_thumbnail_scroller_hover(false, false);
 }
 
-/// 集合级变化(窗口增删)整树重建前的一次性复位:可视区间 + 滚动 + 导航锚点。
-/// window_refresh 经 OverlayPresenter 钩子调用(单向触发,不反向依赖本模块)。
-///
 /// One-shot reset before a set-level (window added/removed) full rebuild: visible
 /// range + scroll + navigation anchor. Called by window_refresh through the
 /// OverlayPresenter hook (one-way triggering; it does not depend on this module).
@@ -594,7 +530,6 @@ unsafe fn apply_thumbnail_clip_offset() {
         requested_max
     };
     let offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
-    // AppKit 的 y 轴向上:逻辑 offset=0 对应 document 顶部,所以 bounds 从最大值开始。
     // AppKit's y axis grows upward: logical offset=0 is the document top, so bounds starts at max.
     let origin_y = (max_offset - offset).clamp(0.0, max_offset.max(0.0));
     let _: () = msg_send![
@@ -610,13 +545,11 @@ fn apply_thumbnail_scroll_offset() {
     unsafe {
         apply_thumbnail_clip_offset();
     }
-    // 内容和滑块必须在同一个 offset 更新中失效,否则滚轮只移动内容而滑块停在旧位置。
     // Invalidate the content and thumb in the same offset update, otherwise wheel scrolling moves
     // only the content while the thumb stays at its old position.
     invalidate_thumbnail_scroller();
 }
 
-/// 让选中项所在行进入视口;已在视口时不改变用户通过滚轮选择的滚动位置。
 /// Bring the selected item into view; leave a user-scrolled viewport alone when it already contains it.
 fn ensure_thumbnail_selection_visible(selected: usize) -> bool {
     let rows = THUMB_ROW_RANGES.lock().unwrap().clone();
@@ -639,7 +572,6 @@ fn ensure_thumbnail_selection_visible(selected: usize) -> bool {
     changed
 }
 
-/// 选择项越过当前视口边缘时只移动一行,保留上一视口的重叠行。
 /// Move only one row when selection crosses a viewport edge, preserving one overlapping row.
 fn scroll_start_for_selection(current: usize, selected_row: usize, max_rows: usize) -> usize {
     let max_rows = max_rows.max(1);
@@ -652,7 +584,6 @@ fn scroll_start_for_selection(current: usize, selected_row: usize, max_rows: usi
     }
 }
 
-/// 以 point 偏移移动缩略图视口,滚轮和触控板都通过此路径获得连续滚动。
 /// Move the thumbnail viewport by a point offset; both mouse wheels and trackpads use this path
 /// for continuous scrolling.
 fn scroll_thumbnail_by_offset(delta: f64) {
@@ -681,7 +612,6 @@ pub(crate) fn set_thumbnail_scroll_offset(next: f64, max_offset: f64) {
         let target_px_h = *THUMB_CAPTURE_TARGET_PX_H.lock().unwrap();
         crate::thumbnail::refresh_for_summon(target_px_h);
     }
-    // 滚动停止约 50ms 后再命中固定指针,避免滚动途中高光随经过的卡片反复跳动。
     // Re-hit-test the stationary pointer about 50ms after scrolling stops, avoiding highlight
     // churn while cards pass under the cursor during a gesture.
     schedule_deferred_scroll_hover();
@@ -700,9 +630,6 @@ pub(crate) fn reset_thumbnail_nav_anchor() {
     *THUMB_NAV_ANCHOR_X.lock().unwrap() = None;
 }
 
-// ========== 文本 helper / text helpers ==========
-
-/// 保留 RRGGBB,只替换 RRGGBBAA 的 alpha。
 /// Preserve RRGGBB and replace only the alpha in RRGGBBAA.
 fn color_with_alpha(color: u32, alpha: u8) -> u32 {
     (color & 0xFFFF_FF00) | u32::from(alpha)
@@ -728,10 +655,6 @@ fn horizontal_nav_index(selected: usize, len: usize, backward: bool) -> usize {
     }
 }
 
-/// 首次召唤前先把缓存数组同步到最新 MRU,并用前台 PID 找到当前窗口代理。
-/// 若前台窗口因 AX 暂时漏报而没有卡片,正向切换从第 0 项开始,避免把旧的同 App 卡片
-/// 当成“下一个窗口”。
-/// 如果有上次精确焦点 key,优先按 `(pid,cgwid)` 匹配;精确窗口缺失时不再拿同 App 的其他窗口冒充当前窗口。
 /// Sort the cached array by the latest MRU and use the exact `(pid,cgwid)` focus key when available.
 /// If AX temporarily omitted that exact window, forward navigation starts at index 0 instead of
 /// treating a stale same-app card as the current window.
@@ -743,9 +666,6 @@ fn prepare_first_summon(
     focus_key: Option<(i32, u32)>,
     now: Instant,
 ) -> usize {
-    // 首帧先把当前前台窗口写回 MRU,使首帧顺序与随后后台刷新(summon-bump 也会
-    // 写回前台窗口)一致,消除「旧序 → 重排」的翻转那一下。只对前台 pid 精确匹配
-    // 的 focus_key 写回;窗口缺失时回退到前台 pid 的代表窗口。
     // Bump the frontmost window into MRU before the first frame so the initial ordering
     // matches the subsequent background refresh (whose summon-bump also writes the frontmost
     // window back) -- removing the visible re-order flank. Only write back when the exact
@@ -774,12 +694,10 @@ fn prepare_first_summon(
         None => frontmost_pid.and_then(|pid| windows.iter().position(|w| w.pid == pid)),
     };
     if let Some(index) = frontmost_index {
-        // 有精确 key 时只把同一张窗口置首,避免同 App 的错误兄弟窗口成为当前窗口代理。
         // With an exact key, move only that window first so a wrong same-app sibling cannot act as the proxy.
         windows.swap(0, index);
         windows[0].is_active = true;
     } else if frontmost_pid.is_none() {
-        // 无法取得前台 PID 时保留排序后的首项作为屏幕定位代理。
         // If the frontmost PID is unavailable, retain the sorted first item as the screen proxy.
         if let Some(first) = windows.first_mut() {
             first.is_active = true;
@@ -797,9 +715,6 @@ fn prepare_first_summon(
     }
 }
 
-/// 窗口没有标题时(如 Microsoft To Do,AXTitle 为空)回退显示应用名。
-/// 注意:仅用于显示。内部 `window_title` 仍保持空串,这样 raise_ax_window 仍能
-/// 按空标题匹配到对应的 AX 窗口并聚焦。
 /// Fall back to the app name for windows that expose no title (e.g. Microsoft
 /// To Do, whose custom title bar yields an empty AXTitle). Display-only: the
 /// internal `window_title` stays empty so raise_ax_window can still match the
@@ -812,9 +727,6 @@ fn display_title<'a>(title: &'a str, app_name: &'a str) -> &'a str {
     }
 }
 
-/// 缩略图卡片的标题行文本:开启「卡片显示应用名」后,应用名前置并以 " · " 与窗口标题分隔
-/// (与底部状态栏同一分隔符)。窗口无标题、或标题与应用名文本完全相同(如访达的窗口)时
-/// 只显示一份,不出现 "App · App"。
 /// The thumbnail card's caption text: with "show app name in cards" enabled the app name
 /// precedes the window title, separated by " · " (the footer's separator). A titleless window,
 /// or one whose title is textually identical to the app name (e.g. a Finder window), renders a
@@ -851,7 +763,6 @@ mod tests {
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::time::Instant;
 
-    /// 构造一行卡片的 rects:y 固定,x 依次排开(宽 100 间距 10)。
     /// Build one row of rects: fixed y, sequential x (width 100, gap 10).
     fn row(indices: &[usize], y: f64) -> Vec<(usize, f64, f64, f64)> {
         indices
@@ -896,8 +807,6 @@ mod tests {
 
     #[test]
     fn card_reconcile_action_replaces_when_only_the_frame_epoch_advanced() {
-        // 缓存帧在浮窗关闭期间被替换(种子→真实/激活补拍/外观重拍):其余字段全同,
-        // 仅帧版本前进,也必须 Replace 重建,否则复用路径会持续展示旧图。
         // The cached frame was replaced while the overlay was closed (seed -> real /
         // activation refresh / appearance recapture): with every other field equal,
         // the frame version alone must still force a Replace, or the reuse path
@@ -915,7 +824,6 @@ mod tests {
             card_reconcile_action(Some(&painted), &current),
             CardReconcileAction::Replace
         );
-        // 缓存被清空(LRU 驱逐/关闭缩略图):版本回落到 0 同样触发重建。
         // Cache emptied (LRU eviction / thumbnails off): the version falling back
         // to 0 must rebuild as well.
         current.thumb_epoch = 0;
@@ -939,8 +847,6 @@ mod tests {
 
     #[test]
     fn cg_window_center_converts_to_appkit_space_for_offset_display() {
-        // 主屏较高、副屏底部对齐时,副屏的 AppKit y 原点高于主屏;直接比较 CG y
-        // 会把副屏上方窗口误判为主屏或触发主屏回退。
         // When a shorter secondary display is bottom-aligned with a taller primary display,
         // its AppKit y origin is above the primary's; comparing CG y directly would misroute
         // an upper secondary window to the primary or trigger the primary fallback.
@@ -1164,8 +1070,6 @@ mod tests {
         let selected =
             prepare_first_summon(&mut windows, &mut mru, false, Some(1), Some((1, 999)), now);
 
-        // focus_key=(1,999) 不在列表,回退到前台 pid(1) 的代表窗口 (1,100):置首、标记 active,
-        // 选中跳到下一张。没有「精确窗口缺失就停在 0 无高亮」的僵死态。
         // focus_key=(1,999) is missing, so we fall back to the frontmost pid's (1) representative
         // window (1,100): moved to the front and marked active, selection advances to the next
         // card. This removes the "exact window missing -> stuck at index 0 with no highlight"
@@ -1188,25 +1092,19 @@ mod tests {
 
     #[test]
     fn vertical_nav_picks_closest_center_in_adjacent_row() {
-        // 首行 3 张(0,1,2),次行 4 张(3,4,5,6),第三行 2 张(7,8)——流式典型形态。
         // Rows of 3 / 4 / 2 -- the typical flow shape.
         let mut rects = row(&[0, 1, 2], 200.0);
         rects.extend(row(&[3, 4, 5, 6], 100.0));
         rects.extend(row(&[7, 8], 0.0));
 
-        // 从 1(中心 160)下移:次行中心 110/220/330/440,最近 = 4(220)。
         // From 1 (center 160) down: row-2 centers 110/220/330/440 -> nearest is 4.
         assert_eq!(vertical_nav_index(&rects, 1, false, 160.0), Some(4));
-        // 从 4(中心 220)上移:回到 1(160 比 110/330 更近)。
         // From 4 (center 220) up: back to 1 (160 beats 110/330).
         assert_eq!(vertical_nav_index(&rects, 4, true, 160.0), Some(1));
-        // 从 0(中心 50)下移:最近 = 3(110)。
         // From 0 (center 50) down: nearest is 3 (110).
         assert_eq!(vertical_nav_index(&rects, 0, false, 50.0), Some(3));
-        // 从 6(中心 440)下移:第三行中心 50/160,最近 = 8(160)。
         // From 6 (center 440) down: nearest in the last row is 8 (160).
         assert_eq!(vertical_nav_index(&rects, 6, false, 380.0), Some(8));
-        // 保留 6 的水平锚点 380 后从 8 上移，会回到 6，而不是跟随 8 的当前中心漂到 4。
         // Retaining card 6's x anchor (380) makes 8 -> up return to 6 instead of
         // drifting toward card 4 from card 8's current center.
         assert_eq!(vertical_nav_index(&rects, 8, true, 380.0), Some(6));
@@ -1216,14 +1114,11 @@ mod tests {
     fn vertical_nav_no_adjacent_row_is_no_op() {
         let mut rects = row(&[0, 1], 100.0);
         rects.extend(row(&[2, 3], 0.0));
-        // 已在最上行:再往上无行 -> None(到边不动)。
         // Already on the top row: no row above -> None (edge = no-op).
         assert_eq!(vertical_nav_index(&rects, 0, true, 50.0), None);
         assert_eq!(vertical_nav_index(&rects, 1, true, 160.0), None);
-        // 已在最下行:再往下无行 -> None。
         // Already on the bottom row: no row below -> None.
         assert_eq!(vertical_nav_index(&rects, 2, false, 50.0), None);
-        // 单行场景上下都是 None。
         // A single row yields None both ways.
         let single = row(&[0, 1, 2], 100.0);
         assert_eq!(vertical_nav_index(&single, 1, true, 160.0), None);
@@ -1232,7 +1127,6 @@ mod tests {
 
     #[test]
     fn vertical_nav_unknown_current_is_no_op() {
-        // 当前 index 不在 rects 里(理论不发生,防御) -> None。
         // A current index absent from rects (defensive) -> None.
         let rects = row(&[0, 1], 100.0);
         assert_eq!(vertical_nav_index(&rects, 99, true, 0.0), None);
@@ -1248,29 +1142,24 @@ mod tests {
 
     #[test]
     fn empty_title_gets_app_name() {
-        // 空标题只影响显示层;内部 title 不动(见函数注释,raise_ax_window 靠空标题匹配)。
         // Empty titles only affect display; the stored title is untouched (see the fn doc:
         // raise_ax_window matches by the empty title).
         assert_eq!(display_title("", "Microsoft To Do"), "Microsoft To Do");
-        assert_eq!(display_title("   ", "Notes"), "   "); // 空白串不是空串 / whitespace is not empty
+        assert_eq!(display_title("   ", "Notes"), "   "); // whitespace is not empty
     }
 
     #[test]
     fn remove_window_adjust_selection_keeps_a_sane_selection() {
         use super::remove_window_adjust_selection;
-        // 关的是选中项之后 → 选中不动。
         // Closing something after the selection leaves it.
         assert_eq!(remove_window_adjust_selection(1, 3, 4), 1);
-        // 关的是选中项之前 → 前移一格(保持指向同一张窗口)。
         // Closing something before it shifts back one (same window stays selected).
         assert_eq!(remove_window_adjust_selection(3, 1, 4), 2);
-        // 关的正是选中项 → 指向下一张(原位置就是新列表的同位)。
         // Closing the selection itself -> the next window (the same slot).
         assert_eq!(remove_window_adjust_selection(1, 1, 4), 1);
-        // 关的是末张且选中末张 → 钳到新末张。
         // Closing the tail while it is selected -> clamps to the new tail.
         assert_eq!(remove_window_adjust_selection(4, 4, 4), 3);
-        // 空列表 → 0。
+        // Empty list -> 0.
         assert_eq!(remove_window_adjust_selection(0, 0, 0), 0);
     }
 
@@ -1284,11 +1173,9 @@ mod tests {
     fn caption_prepends_app_name_only_when_enabled() {
         assert_eq!(card_caption("Inbox", "Mail", false), "Inbox");
         assert_eq!(card_caption("Inbox", "Mail", true), "Mail · Inbox");
-        // 无标题窗口不重复显示应用名(避免 "Mail · Mail")。
         // A titleless window never repeats the app name ("Mail · Mail").
         assert_eq!(card_caption("", "Mail", true), "Mail");
         assert_eq!(card_caption("", "Mail", false), "Mail");
-        // 标题与应用名文本相同时同样只显示一份,且不带分隔点(如访达的窗口)。
         // An identical title and app name also render a single copy, with no separator
         // (e.g. a Finder window).
         assert_eq!(card_caption("Finder", "Finder", true), "Finder");
@@ -1297,7 +1184,6 @@ mod tests {
 
     #[test]
     fn card_reconcile_action_replaces_when_the_caption_flag_changes() {
-        // 开关变化必须重建卡片:复用路径不会重绘标题行,旧标题会一直留存。
         // A toggle must rebuild the card: reuse never repaints the caption, so the old
         // title would linger.
         let mut painted = signature("same");
@@ -1317,7 +1203,6 @@ mod tests {
     }
 
     /// Run the real overlay summon path on the AppKit main thread in a child process.
-    /// 在子进程的 AppKit 主线程中运行真实浮窗召唤路径。
     #[test]
     #[ignore]
     fn overlay_runtime_smoke() {
@@ -1345,11 +1230,6 @@ mod tests {
     }
 }
 
-// ========== 通用控件 helper / generic control helper ==========
-
-/// 创建一个简单(非 attributed)NSTextField 标签,固定在 container_width 内水平居中,
-/// 并按字体真实行高在给定区域内垂直居中。固定宽度很重要:长文本必须由 NSTextField
-/// 在这个边界内尾部截断,不能用 sizeToFit 让它越过卡片边缘侵入相邻卡片。
 /// Create a simple (non-attributed) NSTextField label, constrained to `container_width`,
 /// centered horizontally, and vertically centered using the font's real line height. The fixed
 /// width is important: long text must be tail-truncated inside the card instead of sizeToFit
@@ -1378,7 +1258,6 @@ pub(crate) unsafe fn make_centered_label(
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
     // Keep the label inside its container and truncate at the trailing edge when needed.
-    // 保持标签不越过容器,超宽时从尾部截断。
     let _: () = msg_send![label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
     let ascender: f64 = msg_send![font, ascender];
     let descender: f64 = msg_send![font, descender];
@@ -1391,16 +1270,10 @@ pub(crate) unsafe fn make_centered_label(
     label
 }
 
-// ========== 窗口激活 / window activation ==========
-
-/// 立即完成可见的快速抬窗,再把 AX 焦点兜底交给后台序列。
 /// Complete the visible fast raise immediately, then enqueue the AX focus backstop.
 pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
     let activation_started = Instant::now();
     window_server::note_own_focus(pid, cgwid);
-    // 同应用窗口切换不会有 App 激活通知,808 又被 own-focus 静音,这里直接调度
-    // 缩略图到达补拍;跨应用切换在函数内部因前台前提不成立而短路,仍走激活通知
-    // 驱动的补拍链。
     // A same-app window switch produces no app-activation notification and its 808
     // is silenced as an own-focus echo, so schedule the thumbnail arrival refresh
     // right here; cross-app switches short-circuit inside (frontmost precondition
@@ -1435,8 +1308,6 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
     );
 }
 
-// ========== 浮窗渲染 / overlay rendering ==========
-
 pub(crate) fn update_status_label() {
     unsafe {
         let status_label = match *STATUS_LABEL.lock().unwrap() {
@@ -1446,8 +1317,6 @@ pub(crate) fn update_status_label() {
         let Some(status_text) = with_tab_state(|state_opt| {
             let state = state_opt.as_ref()?;
             let selected = state.selected;
-            // status_text 是窗口下面那一行长的应用名称;窗口列表为空时显示"没有可切换的窗口"提示
-            // (召唤空窗口态,见 show_overlay)。
             // status_text is the long app/window title line below the cards; with an empty window
             // list it shows the "no windows to switch" hint (the empty-overlay state).
             Some(if state.windows.is_empty() {
@@ -1490,8 +1359,6 @@ pub(crate) fn update_status_label() {
         // Keep a fixed visual frame so native tail truncation is based on the actual font and
         // available width. Manual ASCII/CJK width estimates made long titles overflow or cut
         // Unicode grapheme clusters.
-        // 使用固定可视 frame，让原生控件依据实际字体和可用宽度尾部截断。手工 ASCII/CJK
-        // 宽度估算会导致长标题越界或切断 Unicode 组合字符。
         let _: () = msg_send![status_label, setUsesSingleLineMode: true];
         let _: () = msg_send![status_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
         let stat_w = (container_w - H_PADDING * 2.0).max(1.0);
@@ -1511,7 +1378,6 @@ pub(crate) fn hide_overlay() {
     clear_thumbnail_scroll_drag();
     set_thumbnail_scroller_hover(false, false);
     // Drop the slot borrow before orderOut: AppKit can synchronously deliver resign-key here.
-    // 在 orderOut 前结束槽位借用:AppKit 可能在这里同步派发 resign-key 通知。
     let window = overlay_window_ptr();
     unsafe {
         if let Some(window) = window {
@@ -1521,15 +1387,11 @@ pub(crate) fn hide_overlay() {
     crate::performance::end_switcher_activity();
     crate::thumbnail::wake_capture_worker();
     crate::thumbnail::log_capture_metrics("dismiss");
-    // 设置窗口从不被 stash/restore:nonactivating 面板不激活 app,设置窗口全程留在
-    // 原位(z-order 不受召唤影响),切换器只负责收它作卡片与抬起目标窗口。
     // The settings window is never stashed/restored: the nonactivating panel never activates
     // the app, so the settings window stays at its natural z-order throughout the summon;
     // the switcher only collects it as a card and raises the target window.
 }
 
-/// 关闭窗口切换开关时调用:收起浮窗(orderOut)并复位 TAB_STATE.visible,
-/// 避免残留状态导致下次开启后误触发。
 /// Called when the switcher master switch is turned off: dismiss the overlay (orderOut)
 /// and reset TAB_STATE.visible, so no stale state trips the next re-enable.
 pub(crate) fn reset_switcher() {
@@ -1543,24 +1405,17 @@ pub(crate) fn reset_switcher() {
     });
 }
 
-// ========== 显示器配置变化 / display reconfiguration ==========
-
-/// 显示器配置变化后延迟处理的去抖窗口:等窗口迁移/缩放动画收敛并合并连续通知
-/// (一次模式切换可能连发多条),再执行一次完整刷新。
 /// Debounce window before handling a display reconfiguration: let window
 /// migration/scaling animations settle and coalesce notification bursts (one mode
 /// switch may post several), then run a single full refresh.
 const DISPLAY_RECONFIG_DELAY: f64 = 0.45;
-/// 已调度去抖刷新的标记;刷新触发时清除,期间重复通知直接合并。
 /// Marks a debounced refresh as already scheduled; cleared when it fires, so
 /// repeated notifications within the window coalesce into one pass.
 static DISPLAY_RECONFIG_REFRESH_SCHEDULED: AtomicBool = AtomicBool::new(false);
-/// 窗口 bounds 后台快照落地后需要按新几何重排浮窗的标记(见 handle_display_reconfiguration)。
 /// Set when the next background window-snapshot apply should re-lay out the overlay
 /// against the new display geometry (see handle_display_reconfiguration).
 static DISPLAY_RECONFIG_RELAYOUT_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// 通知入口(main 线程):去抖调度一次显示器配置变化后的完整刷新。
 /// Notification entry point (main thread): schedule one debounced full refresh
 /// after a display reconfiguration.
 pub(crate) fn schedule_display_reconfiguration_refresh() {
@@ -1586,7 +1441,6 @@ pub(crate) fn schedule_display_reconfiguration_refresh() {
     }
 }
 
-/// 去抖定时器到期(main 线程):执行显示器配置变化后的完整刷新。
 /// Debounce timer fired (main thread): run the full post-reconfiguration refresh.
 pub(crate) extern "C" fn on_display_reconfiguration(
     _self: *mut c_void,
@@ -1597,14 +1451,6 @@ pub(crate) extern "C" fn on_display_reconfiguration(
     handle_display_reconfiguration();
 }
 
-/// 显示器配置变化(外接/内建切换、分辨率调整)后的统一刷新入口:
-/// 1. 发起一次后台窗口快照,让 TAB_STATE 拿到变化后的窗口 bounds(宽高比/所属屏
-///    会变);浮窗可见时标记快照落地后重排,卡片宽度按新比例精修。
-/// 2. 浮窗可见时立即 show_overlay 重排:面板宽高与居中全部按实时屏幕几何重算
-///    (拔掉显示器后面板可能悬在旧位置),滚动偏移在内部 clamp 到新范围。
-/// 3. 强制重拍全部已知窗口缩略图:缓存帧是旧配置下的比例与像素高度,重拍后由
-///    thumbnailReady 原位换卡。
-///
 /// Single refresh entry after a display reconfiguration (external/built-in
 /// switch or resolution change):
 /// 1. Kick a background window snapshot so TAB_STATE receives post-change
@@ -1630,16 +1476,12 @@ pub(crate) fn handle_display_reconfiguration() {
             count
         }
     );
-    // 必须在不持有 TAB_STATE 时发起快照(request_window_refresh 内部会再锁它)。
     // The snapshot request must run WITHOUT holding TAB_STATE (the refresh locks it again).
     request_window_refresh();
     if overlay_visible {
-        // 先精修 bounds 再重排:快照落地时消费该标记,即使用户窗口集合未变也重排。
         // Refine bounds first: the snapshot apply consumes this flag and re-lays
         // out even when the window set itself is unchanged.
         DISPLAY_RECONFIG_RELAYOUT_PENDING.store(true, Ordering::SeqCst);
-        // 立即按实时屏幕几何重排(bounds 仍是旧值,但面板尺寸/位置/捕获像素需求
-        // 已经正确);落地后的第二次重排修正卡片比例。
         // Re-layout against live screen geometry right away (bounds are stale but
         // panel size/position and capture pixel demand are already correct); the
         // post-snapshot second pass corrects card aspects.
@@ -1649,7 +1491,6 @@ pub(crate) fn handle_display_reconfiguration() {
     crate::thumbnail::refresh_for_display_change(target_px_h);
 }
 
-/// 快照落地路径消费:显示器配置变化后即使窗口集合未变也要重排一次浮窗。
 /// Consumed by the snapshot-apply path: after a display reconfiguration the overlay
 /// must re-layout once even when the window set is unchanged.
 pub(crate) fn take_display_relayout_pending() -> bool {

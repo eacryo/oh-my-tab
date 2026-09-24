@@ -1,12 +1,7 @@
-//! 缩略图 · capture:捕获管线(flume 队列 + 单 worker 串行限流)、聚焦预热与几何重试。
 //! Capture pipeline (flume queue + single serial-rate-limited worker), focused prewarm, and geometry retries.
 
 use super::*;
 
-// ========== 捕获管线(flume 队列 + 单 worker 串行限流) ==========
-
-/// 捕获优先级。值越大越先执行；同优先级保持首次入队 FIFO。启动预热可被
-/// 后续召唤的选中/可见请求原地提升，不需要复制第二份任务。
 /// Capture priority. Higher values run first; equal priorities retain initial FIFO
 /// order. Startup prewarm work can be promoted in place by later selected/visible
 /// requests without duplicating the job.
@@ -49,8 +44,6 @@ pub(super) struct FocusedPrewarmTarget {
 /// The hidden-overlay prewarm has one resident utility thread and one latest target;
 /// it never creates a thread per capture and stale PID generations are rejected by the
 /// normal capture-state gate.
-/// 浮窗关闭时的预热只保留一个常驻 utility 线程和一个最新目标；每次捕获不会新建线程,
-/// 旧 PID generation 仍由现有捕获状态门控拒绝。
 pub(super) static FOCUSED_PREWARM_TARGET: LazyLock<Mutex<Option<FocusedPrewarmTarget>>> =
     LazyLock::new(|| Mutex::new(None));
 static FOCUSED_PREWARM_TARGET_REVISION: AtomicU64 = AtomicU64::new(0);
@@ -136,8 +129,6 @@ pub(super) fn focused_prewarm_exit_action(
     if prewarm_enabled && target_present && worker_epoch != current_epoch {
         // A changed epoch means stop/re-enable raced with cleanup. Panic exits are deliberately
         // fail-stop: a poisoned mutex must not trigger an automatic restart loop.
-        // 代际变化表示停止/重新启用与清理发生竞态。panic 则故意安全停机，避免中毒的互斥锁
-        // 触发自动重启循环。
         return FocusedPrewarmExitAction::Restart;
     }
     FocusedPrewarmExitAction::Stopped
@@ -162,7 +153,6 @@ pub(super) fn release_focused_prewarm_worker(worker_generation: u64) -> bool {
         .is_err()
     {
         // A different generation owns the worker slot; an old worker must not clear it.
-        // 新代际已经接管 worker 槽位，旧 worker 不能清掉新代际的状态。
         return false;
     }
     FOCUSED_PREWARM_WORKER_STARTED
@@ -177,8 +167,6 @@ fn finish_focused_prewarm_worker(worker_generation: u64, panicked: bool) {
     if panicked {
         // Do not touch any mutex after a worker panic: the panic may have poisoned the lock that
         // caused it. A later activation can create a fresh target and explicitly retry.
-        // worker panic 后不再访问任何互斥锁：触发 panic 的锁可能已经中毒。后续激活会创建新
-        // 目标并显式重试。
         log_info!("[thumb] focused prewarm worker panicked; automatic restart disabled");
         return;
     }
@@ -209,13 +197,10 @@ pub(super) struct PendingCapture {
     pub(super) geometry_retry_attempts: u8,
     pub(super) geometry_retry_started_at: Option<Instant>,
     focused_target_revision: Option<u64>,
-    /// 外观(明暗主题)切换触发的重拍:允许空白帧覆盖已有帧——旧帧是旧外观像素,
-    /// 与其他卡片不一致比暂时空白更刺眼。合并请求时按"或"传播。
     /// Appearance (light/dark) transition recapture: blank frames MAY overwrite the
     /// cached frame -- a stale-appearance frame clashes with every other card worse
     /// than a temporary blank. Merging requests propagates the flag with OR.
     pub(super) appearance_refresh: bool,
-    /// 空白重试名额归属于该任务；任务以非入库终止时由 worker 释放。
     /// The task owns a blank-retry slot; the worker releases it when the task terminates
     /// without reaching the normal cache-store path.
     pub(super) blank_retry: bool,
@@ -272,7 +257,6 @@ impl PartialEq for GeometryRetryDeadline {
 }
 
 // `attempt` is diagnostic metadata only; equality and ordering identify a wake by
-// deadline and sequence. `attempt` 仅用于诊断,不参与 deadline 的身份和排序。
 
 impl Ord for GeometryRetryDeadline {
     fn cmp(&self, other: &Self) -> CmpOrdering {
@@ -296,9 +280,6 @@ pub(super) enum GeometryDeferResult {
     Stale,
 }
 
-/// 同时记录 queued/in-flight 请求的最高目标、最高优先级和生命周期 token。
-/// worker 每次被 channel 信号唤醒后从这里选最高优先级任务，因此 channel 自身
-/// 只负责计数/唤醒，不再决定执行顺序。
 /// Tracks the highest target, priority, and lifecycle token for queued/in-flight
 /// requests. The channel is only a count/wakeup mechanism; on each wake the worker
 /// selects the highest-priority job here instead of inheriting channel FIFO order.
@@ -412,9 +393,6 @@ impl CaptureState {
             false,
         );
         if let Some(pending) = self.desired.get_mut(&key) {
-            // 同一激活 token 的重复调度(外部激活时 808 路径与 backstop 路径先后
-            // 到达)不得推进新鲜度:否则会为正在执行的任务追加一次多余的 follow-up
-            // 重拍。真正的新激活(不同 token)照常推进。
             // Duplicate scheduling of the SAME activation token (the 808 path and
             // the backstop path arriving within one external activation) must not
             // advance freshness: it would append a redundant follow-up capture to
@@ -510,7 +488,6 @@ impl CaptureState {
         if !pending.running {
             return GeometryDeferResult::Stale;
         }
-        // 几何过渡期间只恢复同一个有效任务；token/generation 任一失配都不能复活旧任务。
         // Restore only the same live job during a geometry transition; a token or generation
         // mismatch must never resurrect stale or cancelled work.
         let started_at = *pending.geometry_retry_started_at.get_or_insert(now);
@@ -543,8 +520,6 @@ impl CaptureState {
         if pending.target_px_h > job.target_px_h
             || pending.priority > job.priority
             || pending.freshness_sequence > job.freshness_sequence
-            // 外观刷新合入正在执行的任务时不改变分辨率/优先级/新鲜度,必须单列,
-            // 否则主题重拍会被 finish 静默吞掉,该窗口残留旧主题帧。
             // An appearance refresh merging into a running job changes none of the
             // three fields above, so it needs its own check -- otherwise finish()
             // silently swallows the theme recapture and the window keeps a
@@ -667,10 +642,6 @@ pub(super) struct GeometryAnomaly {
     pub(super) heavily_clipped: bool,
 }
 
-/// 将 CGS presentation bounds 的原点归一化到公开 CG window bounds 的坐标空间。
-/// CGSGetOnscreenWindowBounds 在当前 macOS 上返回与 kCGWindowBounds 相反的原点，
-/// 因此不能直接比较两个矩形的中心；宽高仍直接使用 presentation bounds 的值。
-///
 /// Normalize the CGS presentation bounds into the public CG window-bounds space.
 /// On current macOS, CGSGetOnscreenWindowBounds returns the opposite origin from
 /// kCGWindowBounds, so their centers must not be compared directly; presentation
@@ -682,7 +653,6 @@ fn normalized_presentation_center(presentation_bounds: CGRect) -> (f64, f64) {
     )
 }
 
-/// 返回归一化 presentation center 相对公开 bounds center 的残差。
 /// Return the residual between the normalized presentation center and public center.
 pub(super) fn normalized_center_residual(
     public_bounds: (f64, f64, f64, f64),
@@ -737,13 +707,11 @@ pub(super) fn geometry_capture_should_defer(
     snapshot: &GeometryProbeSnapshot,
     window_id: u32,
 ) -> bool {
-    // 全局过渡期间保护所有窗口;退出 hysteresis 后只保护本轮仍异常的目标窗口。
     // During a global transition guard every window; after hysteresis exits, guard only
     // the target window still abnormal in this sample.
     snapshot.active || snapshot.abnormal_windows.contains(&window_id)
 }
 
-/// 基于当前 Space 的窗口变换判断 WindowServer geometry transition 阶段。
 /// The detector is intentionally heuristic: private CGS geometry is sampled together
 /// with the public current-Space window set. A Space change clears only the old window
 /// set's evidence; the current set may still activate on its own sample.
@@ -763,7 +731,6 @@ pub(super) fn update_geometry_probe_state(
     abnormal_count: usize,
 ) -> GeometryProbeTransition {
     if state.space_signature != signature {
-        // Space 变化会清除旧窗口集合的证据;当前新集合若本次异常数达到阈值仍可独立激活。
         // A Space change clears evidence for the old window set; the current new set may
         // still activate independently if this sample reaches the abnormality threshold.
         state.space_signature = signature.to_vec();
@@ -792,7 +759,6 @@ pub(super) fn update_geometry_probe_state(
     GeometryProbeTransition::None
 }
 
-/// 在当前 Space 里取最多三个普通窗口，判断它们是否同时发生了明显的异常变换。
 /// Sample up to three ordinary windows in the current Space and detect simultaneous
 /// abnormal transforms. Two consecutive samples below the abnormal threshold are required
 /// to leave the state; a Space change clears only the old set's evidence.
@@ -898,7 +864,6 @@ pub(super) fn geometry_reject_reason(
     }
 }
 
-/// 拒绝 WindowServer 在动画中返回的细长/裁剪源帧，并按原因分别统计。
 /// Reject thin or clipped source frames and keep independent counters per reason.
 fn capture_geometry_reject_reason(
     key: ThumbKey,
@@ -1004,13 +969,10 @@ pub(super) fn run_geometry_retry_scheduler(
                     due = true;
                 }
                 if due {
-                    // 调度器只负责唤醒；是否仍然有效由 CaptureState 的 token、generation
-                    // 和 retry_not_before 决定，过期 deadline 的额外 wake 是安全的。
                     // The scheduler only wakes the worker; CaptureState remains authoritative
                     // for token, generation, and retry_not_before, so stale deadlines are safe.
                     // `Full` means a wake is already queued. The worker drains CaptureState
                     // and rereads Instant::now() every round, so coalescing this wake is safe.
-                    // `Full` 表示已有 wake;worker 每轮 drain 都重读 Instant,合并唤醒是安全的。
                     match job_tx.try_send(()) {
                         Ok(()) | Err(flume::TrySendError::Full(_)) => {}
                         Err(flume::TrySendError::Disconnected(_)) => return,
@@ -1085,22 +1047,18 @@ pub(crate) fn log_capture_metrics(context: &str) {
 /// resume without waiting for another thumbnail request.
 pub(crate) fn wake_capture_worker() {
     if let Some(tx) = JOB_TX.get() {
-        // 单个 wake 足以让 worker 持续从 CaptureState 取任务；不按 pending 数量复制
-        // 唤醒令牌，避免交互结束时一次性灌入大量过期 wake。
         // One wake is enough: the worker drains CaptureState itself. Do not enqueue one token
         // per pending job, which would replay a burst of stale wakes after interaction ends.
         let _ = tx.try_send(());
     }
 }
 
-/// 尝试安排一次捕获；返回 false 表示相同窗口已 pending/in-flight，或 worker 已退出。
 /// Try to schedule one capture; false means the same window is already pending/in-flight,
 /// or the worker has exited.
 pub(super) fn enqueue_job(pid: i32, wid: u32, target_px_h: u32, priority: CapturePriority) -> bool {
     enqueue_job_inner(pid, wid, target_px_h, priority, None, false, None)
 }
 
-/// 外观(明暗主题)切换的重拍:空白帧允许覆盖已有帧(旧外观像素比暂时空白更刺眼)。
 /// Appearance (light/dark) transition recapture: blank frames may overwrite the
 /// cached frame (stale-appearance pixels clash harder than a temporary blank).
 pub(super) fn enqueue_appearance_job(
@@ -1112,8 +1070,6 @@ pub(super) fn enqueue_appearance_job(
     enqueue_job_inner(pid, wid, target_px_h, priority, None, true, None)
 }
 
-/// 仅当 PID 仍处于生产者观察到的 generation 时入队，阻止终止前的延迟任务污染
-/// PID 复用后的新进程。
 /// Enqueue only while the PID remains in the generation observed by the producer,
 /// preventing delayed work from an old process from contaminating a reused PID.
 pub(super) fn enqueue_job_for_generation(
@@ -1154,14 +1110,12 @@ fn current_frontmost_pid() -> Option<i32> {
     (pid > 0).then_some(pid)
 }
 
-/// 记录当前前台 App 的 PID/焦点窗口提示，并启动唯一的预热线程。
 /// Record the frontmost PID/focused-window hint and start the single prewarm worker.
 pub(crate) fn schedule_focused_prewarm(pid: i32, wid: u32) {
     if !focused_prewarm_enabled() {
         return;
     }
 
-    // 激活回调可能运行在主线程；这里只记录轻量提示，窗口解析和可捕获性校验交给 worker。
     // Activation callbacks may run on the main thread; record only a cheap hint here and let
     // the worker resolve switchability and captureability off the main thread.
     let frontmost_pid = current_frontmost_pid().unwrap_or(pid);
@@ -1189,7 +1143,6 @@ pub(crate) fn schedule_focused_prewarm(pid: i32, wid: u32) {
     start_focused_prewarm_worker();
 }
 
-/// 启动后台预热线程(目标由最近一次激活记录);设置开关运行时开启时也可调用。
 /// Start the prewarm worker for the most recently recorded target; this is also used when the
 /// setting is enabled at runtime.
 pub(crate) fn start_focused_prewarm_worker() {
@@ -1216,13 +1169,10 @@ pub(crate) fn start_focused_prewarm_worker() {
 }
 
 /// Stop promptly and leave the target intact so enabling the setting can restart the worker.
-/// 及时停止 worker，但保留目标；重新开启设置后可以无须等待新的激活事件而重启。
 pub(crate) fn stop_focused_prewarm_worker() {
     FOCUSED_PREWARM_EPOCH.fetch_add(1, Ordering::AcqRel);
     // Keep the started bit reserved until the worker observes the epoch. If the setting is
     // re-enabled immediately, that same worker adopts the new epoch; two workers cannot overlap.
-    // 保留 started 标记直到 worker 观察到 epoch；若立即重新开启，由同一个 worker 接管新 epoch，
-    // 从而不会出现两个并发 worker。
     FOCUSED_PREWARM_WAKE.1.notify_all();
 }
 
@@ -1248,7 +1198,6 @@ fn note_focused_prewarm_failure(key: ThumbKey, reason: &str) {
     target.consecutive_failures = target.consecutive_failures.saturating_add(1);
     // The failure counter is one-based; the third consecutive failure reaches the convergence
     // limit and clears the target immediately.
-    // 失败计数从 1 开始；第三次连续失败立即达到收敛上限并清理目标。
     let Some(backoff) = focused_prewarm_failure_backoff(target.consecutive_failures) else {
         let consecutive_failures = target.consecutive_failures;
         drop(target_guard);
@@ -1346,8 +1295,6 @@ fn run_focused_prewarm(epoch: u64) {
             // Leave STARTED owned until finish_focused_prewarm_worker performs the generation-checked
             // handoff. Clearing it here would let immediate re-enable race with this exit and
             // strand the enabled target without a worker.
-            // 在 finish_focused_prewarm_worker 做完代际检查和交接前保留 STARTED；此处清除会让
-            // 立即重新开启与退出竞态，导致已开启目标没有 worker。
             return;
         }
         if crate::performance::switcher_interaction_active() || !capture_allowed() {
@@ -1374,8 +1321,6 @@ fn run_focused_prewarm(epoch: u64) {
         let now = Instant::now();
         if !target.needs_resolution && !focused_prewarm_due(now, last_capture, target.next_attempt)
         {
-            // 捕获在独立 worker 上异步完成，完成时间通常比本线程上次入队晚几十毫秒；
-            // 下一轮按真实截止时间补等这段差值，避免固定 5 秒轮询错过后整轮变成 10 秒。
             // Capture finishes asynchronously a few milliseconds after this thread enqueues it.
             // Wait only until the exact freshness deadline so a near miss does not turn a
             // five-second interval into ten seconds.
@@ -1387,8 +1332,6 @@ fn run_focused_prewarm(epoch: u64) {
         // Re-enumerate the switchable AX windows and current CG geometry. This rejects a
         // disappeared/thin helper surface and follows an in-app window change without trusting
         // the stale focus-tracking id alone.
-        // 重新枚举 AX 切换窗口和当前 CG 几何；淘汰消失或过细的辅助窗口，并跟随应用内窗口
-        // 切换，不再单独信任可能过期的焦点跟踪 id。
         let Some(window) =
             crate::window_collector::switchable_capture_window_for_pid(frontmost_pid, target.wid)
         else {
@@ -1410,13 +1353,11 @@ fn run_focused_prewarm(epoch: u64) {
         };
         // Recheck the revision immediately before enqueueing. The target mutex is released
         // before entering CAPTURE_STATE to preserve the existing lock order.
-        // 入队前再次检查 revision；进入 CAPTURE_STATE 前释放目标锁，保持现有锁顺序。
         if !focused_prewarm_revision_is_current(Some(target.target_revision)) {
             continue;
         }
         // Hidden prewarm deliberately stays at the baseline thumbnail height; summon/activation
         // paths separately request the larger display-specific target when the user needs it.
-        // 隐藏状态预热固定使用基准缩略图高度；召唤/激活路径在用户需要时再请求显示器对应的高清尺寸。
         let target_px_h = cached_target_px_height(target.pid, target.wid).min(BASE_TARGET_PX_H);
         let _ = enqueue_focused_prewarm_job(&target, target_px_h);
     }
@@ -1453,8 +1394,6 @@ pub(super) fn enqueue_activation_job(
 /// Enqueue a delayed blank-frame retry only while its slot still belongs to this window.
 /// The lifecycle lock is acquired before the retry-slot lock so window destruction can race
 /// safely with the sleeper: either the retry is queued and then invalidated, or it is skipped.
-/// 只有重试名额仍属于该窗口时才入队；先拿生命周期锁再拿名额锁，和销毁清理保持一致，
-/// 这样延迟线程与窗口销毁并发时，要么入队后被失效，要么直接跳过。
 pub(super) fn enqueue_blank_retry_job(
     key: ThumbKey,
     target_px_h: u32,
@@ -1473,8 +1412,6 @@ pub(super) fn enqueue_blank_retry_job(
     }
     let merged_running = matches!(request, ActivationRequestResult::Merged { running: true });
     if merged_running {
-        // 运行中的任务已经拿走了自己的 CaptureJob，无法再接管 blank_retry 标记；
-        // 让它继续完成，但当前延迟重试名额必须立即归还。
         // A running task already owns its copied CaptureJob and cannot take over the
         // blank_retry marker; let it finish, but release this delayed slot now.
         PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
@@ -1513,8 +1450,6 @@ fn enqueue_job_inner(
     let tx = ensure_capture_worker();
     let accepted = {
         let mut state = CAPTURE_STATE.lock().unwrap();
-        // 无预期 generation 时按当前值解析(等价于原 request();terminated 判定仍在
-        // request_for_generation 内生效)。
         // Without an expected generation, resolve the current one (equivalent to the
         // old request(); the terminated check still applies inside
         // request_for_generation).
@@ -1555,9 +1490,6 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                     let interaction_active = crate::performance::switcher_interaction_active();
                     let drain_started = Instant::now();
                     let mut drained_jobs = 0usize;
-                    // 一个 wake 令牌只负责启动一次 drain;bounded channel 会合并后续
-                    // wake,因此必须在同一轮持续消费 CaptureState,否则启动预热只会处理
-                    // 前一两项,其余任务虽仍在 desired 中却再也收不到令牌。
                     // One wake token starts a drain. Because the bounded channel coalesces
                     // later wakes, keep consuming CaptureState in this round; otherwise
                     // startup prewarm processes only the first couple of jobs while the rest
@@ -1596,7 +1528,6 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                         };
                         // Measure only the time spent waiting until this attempt became ready;
                         // capture execution time is recorded separately by run_capture_job.
-                        // 只统计任务 ready 后到 worker 取出的等待时间,捕获耗时单独统计。
                         record_thumb_queue_wait(
                             Instant::now()
                                 .saturating_duration_since(job.ready_since)
@@ -1619,8 +1550,6 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                                 let _ = state.finish(job);
                                 // The delayed retry owns the slot now; clear the marker on the
                                 // completed job so a merged follow-up cannot release that slot.
-                                // 延迟重试已接管名额;清掉已完成任务的标记,避免合入的后续任务
-                                // 误释放仍属于延迟重试的名额。
                                 state.clear_blank_retry_marker(job);
                             }
                             CaptureJobResult::GeometryDeferred => {
@@ -1747,14 +1676,11 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         // The live target was selected from the AX switchable set plus current geometry. Do not
         // require AXFocusedWindow to remain equal here: browsers can report a thin helper as
         // focused while their real content window is the capture target.
-        // 目标已由 AX 可切换集合和当前几何共同选出；这里不能要求 AXFocusedWindow 仍完全相等，
-        // 因为浏览器可能把细条辅助窗口报告为焦点，而真正内容窗口才是捕获目标。
         if !pid_is_frontmost(key.pid) {
             clear_focused_prewarm_if(key, "app-no-longer-frontmost");
             return CaptureJobResult::Finished;
         }
     }
-    // 在真正捕获前再次探测，覆盖任务取出后到调用 WindowServer 之间的动画竞态。
     // Probe again immediately before capture to cover the race between job selection
     // and the WindowServer call when the animation starts.
     let geometry = window_server_geometry_transition_snapshot();
@@ -1779,7 +1705,6 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         );
         return CaptureJobResult::GeometryDeferred;
     }
-    // 每个任务前重新 preflight:未授权时静默跳过(运行中授权后自动恢复)。
     // Re-preflight per job: silently skip while unauthorized (auto-resumes once
     // granted mid-run).
     let allowed = capture_allowed();
@@ -1862,9 +1787,6 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         return CaptureJobResult::Finished;
     }
     record_thumb_capture(job_started.elapsed().as_millis() as u64);
-    // 空白帧门控:后台挂起的 WKWebView(Tauri/Electron 等)截出来只剩"标题栏+
-    // 纯色内容",这样的帧不应覆盖缓存里的最后一张有效帧;前台窗口的空白是
-    // 用户眼前的真实画面,如实保留。
     // Blank-frame gating: a background-suspended WKWebView (Tauri/Electron et al.)
     // captures as title bar + solid content only; such a frame must never clobber
     // the cached last-known-good image. A blank frontmost window is real and is
@@ -1932,8 +1854,6 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
             }
         }
     }
-    // 生命周期校验与缓存写入共用 CAPTURE_STATE 锁。终止路径按同一锁序取消任务并
-    // 清缓存，因此结果不可能在 Remove 之后重新插入。
     // Validate lifecycle and write the cache while holding CAPTURE_STATE. Termination
     // takes the same lock before cancellation/cache eviction, so a result cannot be
     // inserted again after removal.
@@ -1950,7 +1870,6 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         );
         return CaptureJobResult::Finished;
     }
-    // 只有真正携带 blank_retry 归属标记的任务才能释放名额;普通激活任务不能误删别人的名额。
     // Only a task carrying the explicit blank_retry ownership marker may release the slot;
     // an ordinary activation task must not clear another task's slot.
     if job.blank_retry {
@@ -1962,26 +1881,20 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         note_focused_prewarm_success(key);
     }
     drop(state);
-    // 不再按任务来源预先决定是否投递：启动预热也可能在浮窗打开后才完成。
     // Do not decide delivery from the request source: startup pre-generation may
     // also finish after the overlay has opened.
-    // 结果统一交给主线程做可见性和卡片存在性校验。捕获 worker 不再读取 TAB_STATE，
-    // 避免后台线程直接观察主线程运行时状态；隐藏浮窗时主线程会快速丢弃这批通知。
     // Let the main thread validate visibility and card membership. The capture worker no longer
     // reads TAB_STATE, and the main-thread handler quickly drops notifications while hidden.
     enqueue_ready_delivery(key);
     CaptureJobResult::Finished
 }
 
-/// 激活补拍的有效性:激活 token 未过时,且该 App 此刻仍是系统前台。
 /// Activation refresh validity: the activation token is current AND the app is
 /// still the system-frontmost one right now.
 pub(super) fn activation_capture_is_valid_now(pid: i32, activated_at: Instant) -> bool {
     crate::window_collector::app_activation_is_current(pid, activated_at) && pid_is_frontmost(pid)
 }
 
-/// 查询 NSWorkspace 当前前台 App 是否就是指定 PID。捕获 worker 与延迟补拍线程
-/// 都会调用;NSWorkspace 的这类只读消息发送线程安全,不依赖 AppKit 主线程。
 /// Whether NSWorkspace currently reports the given PID as the frontmost app.
 /// Called from the capture worker and delayed refresh threads; these read-only
 /// NSWorkspace messages are thread-safe and do not require the AppKit main thread.
@@ -2001,8 +1914,6 @@ pub(super) fn pid_is_frontmost(pid: i32) -> bool {
     }
 }
 
-/// 主线程回调入口(controller 的 thumbnailReady:):清空待投递队列,逐键校验后
-/// 就地重建对应卡片。生成期间用户可能已 ↑↓ 或关浮窗,每键都要重新校验。
 /// Main-thread callback entry (the controller's thumbnailReady:): drains the
 /// pending queue, re-verifies each key, and rebuilds the affected cards in place.
 /// The user may have arrowed away or closed the overlay mid-generation, so every
@@ -2013,8 +1924,6 @@ pub(crate) fn handle_ready_main() {
         READY_DELIVERY_SCHEDULED.store(false, Ordering::Release);
         return;
     }
-    // scheduled=false 与 drain 必须在同一队列锁内完成：否则 worker 可能在两步之间
-    // 看到旧的 true、放入新 key 却不再安排回调。
     // Clear scheduled and drain under the same queue lock. Otherwise a worker can
     // observe the old true between those steps, append a key, and leave it without
     // a future callback.
@@ -2065,7 +1974,6 @@ pub(crate) fn handle_ready_main() {
 pub(super) static READY_QUEUE: Mutex<Vec<ThumbKey>> = Mutex::new(Vec::new());
 pub(super) static READY_DELIVERY_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
-/// 多个 worker 完成通知共享一个主线程 selector；handler 一次清空当前 key 批次。
 /// Multiple worker completions share one outstanding main-thread selector; the
 /// handler drains the current key batch in one pass.
 fn enqueue_ready_delivery(key: ThumbKey) {
@@ -2090,8 +1998,6 @@ fn enqueue_ready_delivery(key: ThumbKey) {
     }
 }
 
-/// 截取一个窗口:CGSHWCaptureWindowList(count=1)→ 取首张 CGImage →
-/// 等比缩到目标像素高(降内存:Retina 原生帧可达数十 MB)。
 /// Capture one window: CGSHWCCaptureWindowList (count=1) -> first CGImage ->
 /// proportionally downscale to the target pixel height (native retina frames can
 /// reach tens of MB).
@@ -2103,15 +2009,12 @@ pub(super) struct CapturedWindow {
 
 pub(super) unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CapturedWindow> {
     let cap = *CGS_CAPTURE_LIST.as_ref()?;
-    // 连接 ID 进程内恒定,缓存一次;0 = 获取失败(私有符号缺失)。
     // The connection ID is process-wide constant; cache it once (0 = unavailable).
     let cid = *CONNECTION_ID.get_or_init(|| skylight::cgs_main_connection().unwrap_or(0));
     if cid == 0 {
         return None;
     }
     let wids = [wid];
-    // 显式请求 Retina 原生像素；nominalResolution 只给逻辑点尺寸，小窗口在 4K/5K
-    // 屏上放大后仍会发糊，即使后续目标高度提高也无法补回源细节。
     // Explicitly request native Retina pixels. nominalResolution only returns point-sized
     // content, so small windows stay blurry on 4K/5K displays even with a larger target later.
     let opts = CGS_CAPTURE_BEST_RESOLUTION | CGS_CAPTURE_IGNORE_GLOBAL_CLIP_SHAPE;
@@ -2129,7 +2032,7 @@ pub(super) unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<Captur
         CFRelease(arr);
         return None;
     }
-    CFRetain(raw); // 数组即将释放,自留一份 / the array goes away; keep our own ref
+    CFRetain(raw); // the array goes away; keep our own ref
     CFRelease(arr);
     let src_w = CGImageGetWidth(raw) as u32;
     let src_h = CGImageGetHeight(raw) as u32;
@@ -2157,14 +2060,12 @@ pub(super) unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<Captur
             h_px: th,
             captured_for_px_h: target_px_h,
             captured: Instant::now(),
-            // 占位值;实际版本号由 cache_store 统一分配。
             // Placeholder; the real version is assigned centrally in cache_store.
             epoch: 0,
         },
     })
 }
 
-/// CGBitmapContext 重绘降采样(纯 CoreGraphics,线程安全;方向与原图一致)。
 /// Downscale by redrawing through a CGBitmapContext (pure CoreGraphics,
 /// thread-safe; orientation matches the source).
 unsafe fn downscale_cgimage(src: *const c_void, tw: u32, th: u32) -> *const c_void {

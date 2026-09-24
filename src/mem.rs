@@ -1,7 +1,3 @@
-//! 内存采样器:后台线程定期把本进程内存占用(system 指标 + 业务账本)打进日志,
-//! 为泄漏排查与内存优化留下长期数据。Info 级、5 分钟一拍、启动后 ~60s 先打一条基线。
-//! 纯只读采样:不碰 AppKit,锁都是瞬时获取。
-//!
 //! Memory sampler: a background thread periodically logs this process's memory usage
 //! (system metrics + app-side ledgers) so leaks and regressions leave a data trail.
 //! Info level, one sample every 5 minutes, with a ~60s-after-launch baseline. Purely
@@ -15,24 +11,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// 采样周期。慢到 100KB/5min 的泄漏(≈28MB/天)也能从趋势中识别,更密只稀释信号。
 /// Sampling interval. Even a leak as slow as 100KB/5min (~28MB/day) is visible in the
 /// trend; sampling denser only dilutes the signal.
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// 首条基线的延迟:给启动阶段的图标预热、缩略图预生成等工作留出缓冲时间,
-/// 以便大致区分「启动即分配」与「运行期增长」;它不是严格的预热完成屏障。
 /// Delay before the baseline sample: leave startup work such as icon prewarming and
 /// thumbnail generation time to settle, giving an approximate split between "allocated at
 /// startup" and "growth during runtime". This is not a strict prewarming-complete barrier.
 const BASELINE_DELAY: Duration = Duration::from_secs(60);
 
-// 采样器自己维护从线程启动开始的 footprint 峰值;系统 kernel 另外维护 RSS 峰值。
-// 采样间隙的 footprint 尖峰无法捕捉,这是采样粒度的固有边界。
 // The sampler tracks the footprint peak from thread startup; the kernel separately tracks
 // the RSS peak. Footprint spikes between samples remain invisible by design.
 static PEAK_FOOTPRINT: AtomicU64 = AtomicU64::new(0);
 
-/// 格式化字节数:M/G 两位小数;小于 1MB 的记为 KB,避免 "0.0M" 掩盖小数值。
 /// Format bytes: M/G with two decimals; sub-MB values print as KB so "0.0M" can't hide
 /// small numbers.
 fn fmt_bytes(bytes: u64) -> String {
@@ -48,14 +38,10 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-/// 线程数:本代码库大量按需 spawn 线程(window-refresh / activation focus / thumbnail
-/// observer / ax-raiser),线程泄漏比内存泄漏更可能发生且先暴露,和 footprint 并列监控。
 /// Thread count: this codebase spawns threads on demand (window-refresh / activation focus /
 /// thumbnail observer / ax-raiser); a thread leak is likelier than a memory leak and shows
 /// up earlier, so it is tracked alongside the footprint.
 fn thread_count() -> u64 {
-    // /proc 不存在于 macOS;libproc 的 proc_listallpids 可数,但按进程名过滤本进程
-    // 不可靠。最轻量的可靠口径:mach 的 task_threads 计数——直接 FFI,返回线程数组大小。
     // /proc doesn't exist on macOS; counting via libproc needs name matching. The lightest
     // reliable source is the mach task_threads array length -- direct FFI below.
     extern "C" {
@@ -70,7 +56,6 @@ fn thread_count() -> u64 {
             return 0;
         }
         if !threads.is_null() && count > 0 {
-            // 数组由调用方负责释放(mach port 数组,按 count 个 mach_port_t 计)。
             // The array is caller-owned and must be deallocated (count mach_port_t entries).
             vm_deallocate(
                 mach_task_self(),
@@ -82,8 +67,6 @@ fn thread_count() -> u64 {
     }
 }
 
-/// 业务账本读数:三个大结构(缩略图 LRU / 剪贴板历史 / 窗口列表)的条目数与字节。
-/// 系统指标只能说明「涨了」,账本才能说明「是谁涨的」;两者同行打印就是为了对照。
 /// App-side ledger readings: item counts and bytes for the three big structures (thumbnail
 /// LRU / clipboard history / window list). System metrics say "it grew"; ledgers say "who
 /// grew" -- both print on one line for direct comparison.
@@ -114,7 +97,6 @@ fn read_ledgers() -> Ledger {
     }
 }
 
-/// 只记录影响内存画像的功能开关,不记录用户内容。
 /// Record only feature switches that affect the memory profile; never record user content.
 fn runtime_profile() -> String {
     let config = CONFIG.read().unwrap();
@@ -137,7 +119,6 @@ fn runtime_profile() -> String {
     )
 }
 
-/// 采样并打一行日志。vminfo 读取失败(kernel 接口变化)只跳过本拍,不中断循环。
 /// Sample once and log one line. A failed vminfo read (kernel interface change) only skips
 /// this tick; the loop continues.
 fn sample_once(started_at: Instant) {
@@ -173,7 +154,6 @@ fn sample_once(started_at: Instant) {
     );
 }
 
-/// 事件型内存快照:只在缩略图批次/缓存清理边界调用,避免提高常规采样频率。
 /// Event memory snapshot: called only at thumbnail-batch/cache-clear boundaries so the
 /// normal sampler frequency stays unchanged.
 pub(crate) fn log_debug_snapshot(context: &str) {
@@ -238,7 +218,6 @@ fn fmt_uptime(elapsed: Duration) -> String {
     }
 }
 
-/// 启动采样线程(main 里一次性调用)。
 /// Start the sampler thread (called once from main).
 pub(crate) fn start() {
     thread::Builder::new()
@@ -284,7 +263,6 @@ mod tests {
     fn peak_tracking_is_monotonic() {
         PEAK_FOOTPRINT.store(0, Ordering::Relaxed);
         assert_eq!(track_peak(&TaskVmInfo::with_footprint(100)), 100);
-        // footprint 回落不拉低峰值。
         // A falling footprint must not lower the peak.
         assert_eq!(track_peak(&TaskVmInfo::with_footprint(50)), 100);
         assert_eq!(track_peak(&TaskVmInfo::with_footprint(300)), 300);
@@ -292,7 +270,6 @@ mod tests {
 
     #[test]
     fn task_vm_info_reads_real_process() {
-        // 冒烟:真实读一次本进程,关键字段应为非零、量级合理(≥1MB)。
         // Smoke: one real read of this process; key fields should be non-zero and sane
         // (at least 1MB).
         let vm = task_vm_info().expect("task_vm_info should succeed for self");

@@ -1,8 +1,3 @@
-//! 配置解析引擎:把"所有鼠标"档 + per-device 档合并成具体生效配置(Phase 3)。
-//!
-//! 合并语义:遍历 CONFIG.mouse.profiles,对每个匹配的档(无 device = 通配,有 device =
-//! VID+PID 相等)把 Some 字段并入结果,后者优先。"所有鼠标"档通常在前,per-device 档在后。
-//!
 //! Config resolution: merge the "All Mice" profile + per-device profiles into the effective
 //! config (Phase 3). Merge semantics: iterate CONFIG.mouse.profiles; for each matching profile
 //! (no device = wildcard, device = VID+PID equality) fold its Some fields into the result,
@@ -14,7 +9,6 @@ use crate::mouse::scrolling::ScrollMode;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// 解析后的具体生效配置(非 Option,所有字段已定)。
 /// Resolved effective config (non-Option; all fields are concrete).
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMouse {
@@ -22,13 +16,10 @@ pub(crate) struct ResolvedMouse {
     pub scroll_mode: ScrollMode,
     pub line_count: u32,
     pub disable_acceleration: bool,
-    // 指针加速 / 跟踪速度(0..=40);None = 不改动设备现值。
     // Pointer acceleration / tracking speed (0..=40); None = leave the device value alone.
     pub acceleration: Option<f64>,
-    // 按键映射:按钮号 -> 快捷键描述(逐键合并,后者覆盖)。
     // Button mappings: button number -> shortcut description (per-key merge, later wins).
     pub button_mappings: HashMap<String, String>,
-    // 按键映射总开关(per-device 档独立;false 时映射不执行)。
     // The button-mappings master switch (independent per device; mappings skipped when off).
     pub button_mappings_enabled: bool,
 }
@@ -47,14 +38,12 @@ impl Default for ResolvedMouse {
     }
 }
 
-/// 解析缓存:key = (VID,PID),None 键 = "无设备/所有鼠标"。在 reload_config / 设备变更时失效。
 /// Resolve cache: key = (VID, PID); the None key = "no device / All Mice". Invalidated on
 /// reload_config and device changes.
 static CACHE: std::sync::LazyLock<
     Mutex<std::collections::HashMap<Option<DeviceKey>, ResolvedMouse>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// 使缓存失效(配置重载或设备变更时调用)。
 /// Invalidate the cache (called on config reload or device changes).
 pub(crate) fn invalidate_cache() {
     if let Ok(mut c) = CACHE.lock() {
@@ -62,27 +51,20 @@ pub(crate) fn invalidate_cache() {
     }
 }
 
-/// 匹配器是否匹配给定设备。None 键 = 通配(匹配所有设备,即"所有鼠标"档)。
-/// 设置页查找 profile 也走这里(settings::find_profile_index),避免"解析用一套、UI 查找
-/// 用另一套"而分叉出不一致。
-///
 /// Whether a matcher matches the given device. A None key = wildcard (matches all devices,
 /// i.e. the "All Mice" profile). The settings page finds profiles through this too
 /// (settings::find_profile_index) so resolution and the UI lookup can't drift apart.
 pub(crate) fn matches(profile: &MouseProfile, device: Option<DeviceKey>) -> bool {
-    // 虚拟指针档(injected = true):只匹配注入事件,对任何真实设备都不匹配。
     // Virtual-pointer profile (injected = true): matches injected events only, never a real device.
     if profile.device.is_virtual() {
         return device == Some(crate::mouse::device::VIRTUAL_DEVICE_KEY);
     }
-    // 注入事件:虚拟档之外只有通配档("所有鼠标")参与合并,作为基础层。
     // Injected events: apart from the virtual profile only the wildcard ("All Mice") layer merges
     // in, serving as the base.
     if device == Some(crate::mouse::device::VIRTUAL_DEVICE_KEY) {
         return profile.device.vendor_id.is_none() && profile.device.product_id.is_none();
     }
     let Some((vid, pid)) = device else {
-        // 无设备(归因失败回退):只匹配通配档。
         // No device (attribution-failure fallback): match only wildcard profiles.
         return profile.device.vendor_id.is_none() && profile.device.product_id.is_none();
     };
@@ -91,11 +73,9 @@ pub(crate) fn matches(profile: &MouseProfile, device: Option<DeviceKey>) -> bool
     vid_ok && pid_ok
 }
 
-/// 解析某设备的生效配置。device = None 表示归因失败,只用"所有鼠标"档。
 /// Resolve the effective config for a device. device = None means attribution failed; only the
 /// "All Mice" profile applies.
 pub(crate) fn resolve(device: Option<DeviceKey>) -> ResolvedMouse {
-    // 查缓存。
     // Check the cache.
     if let Ok(c) = CACHE.lock() {
         if let Some(r) = c.get(&device) {
@@ -112,7 +92,6 @@ pub(crate) fn resolve(device: Option<DeviceKey>) -> ResolvedMouse {
     r
 }
 
-/// 从给定 Config 解析某设备的生效配置(供设置预览等非 CONFIG 场景)。
 /// Resolve a device's effective config from a given Config (for non-CONFIG contexts like the
 /// restore-defaults preview).
 pub(crate) fn resolve_from_config(
@@ -122,12 +101,10 @@ pub(crate) fn resolve_from_config(
     resolve_from(cfg, device)
 }
 
-/// 从给定 Config 解析(供测试与无 CONFIG 的场景)。
 /// Resolve from a given Config (for tests and CONFIG-free scenarios).
 fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
     let mut r = ResolvedMouse::default();
 
-    // 先用代码默认值兜底(确保所有字段有值)。
     // Start from code defaults so every field is concrete.
     let defaults = ResolvedMouse::default();
     r.reverse_scroll = defaults.reverse_scroll;
@@ -138,7 +115,6 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
     r.button_mappings = HashMap::new();
     r.button_mappings_enabled = defaults.button_mappings_enabled;
 
-    // 遍历 profiles,合并所有匹配档(后者优先)。
     // Iterate profiles, merging all matching ones (later wins).
     for p in &cfg.mouse.profiles {
         if !matches(p, device) {
@@ -157,13 +133,11 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
             if let Some(da) = ptr.disable_acceleration {
                 r.disable_acceleration = da;
             }
-            // 指针加速 / 跟踪速度:后者覆盖前者(与其它字段一致)。
             // Pointer acceleration / tracking speed: later wins (same as every other field).
             if let Some(acc) = ptr.acceleration {
                 r.acceleration = Some(acc);
             }
         }
-        // 按键映射:逐键并入(同键后者覆盖)。
         // Button mappings: fold in per key (same key: later wins).
         for (btn, desc) in &p.button_mappings {
             r.button_mappings.insert(btn.clone(), desc.clone());
@@ -183,10 +157,8 @@ mod tests {
     #[test]
     fn merges_button_mappings_enabled_per_device() {
         let mut cfg = crate::config::Config::default();
-        // 默认档(所有鼠标):enabled 不设(继承 true)。
         // Default layer: enabled unset (inherits true).
         cfg.mouse.profiles[0].button_mappings_enabled = None;
-        // 设备档:G3 V2 关闭。
         // Device profile: G3 V2 turns it off.
         let mut dev = crate::config::MouseProfile {
             device: crate::config::DeviceMatcher {
@@ -198,13 +170,10 @@ mod tests {
         };
         dev.button_mappings_enabled = Some(false);
         cfg.mouse.profiles.push(dev);
-        // 默认档合并:无设备 -> true。
         // All-Mice resolve: true.
         assert!(resolve_from(&cfg, None).button_mappings_enabled);
-        // G3 V2 -> false。
         // G3 V2 -> false.
         assert!(!resolve_from(&cfg, Some((10007, 12976))).button_mappings_enabled);
-        // 其他设备 -> true。
         // Another device -> true.
         assert!(resolve_from(&cfg, Some((1, 2))).button_mappings_enabled);
     }
@@ -214,7 +183,7 @@ mod tests {
     #[test]
     fn wildcard_only_falls_back_to_defaults() {
         let mut cfg = Config::default();
-        // 默认配置含一个"所有鼠标"档,值为默认。
+        // The default config has one "all mice" profile holding the defaults.
         let r = resolve_from(&cfg, None);
         assert!(!r.reverse_scroll);
         let r2 = resolve_from(&cfg, Some((1133, 17492)));
@@ -226,12 +195,12 @@ mod tests {
     fn per_device_overrides_wildcard() {
         let mut cfg = Config::default();
         cfg.mouse.profiles.clear();
-        // "所有鼠标"档:反转滚动开。
+        // "All mice" profile: reverse scrolling on.
         cfg.mouse.profiles.push(MouseProfile {
             reverse_scroll: Some(true),
             ..Default::default()
         });
-        // 某设备档:反转滚动关。
+        // Device profile: reverse scrolling off.
         cfg.mouse.profiles.push(MouseProfile {
             device: crate::config::DeviceMatcher {
                 vendor_id: Some(1133),
@@ -242,13 +211,13 @@ mod tests {
             ..Default::default()
         });
 
-        // 匹配的设备:后者优先 -> 关。
+        // Matching device: the later profile wins -> off.
         let r = resolve_from(&cfg, Some((1133, 17492)));
         assert!(!r.reverse_scroll);
-        // 其他设备:只用通配档 -> 开。
+        // Other device: only the wildcard profile applies -> on.
         let r2 = resolve_from(&cfg, Some((1, 2)));
         assert!(r2.reverse_scroll);
-        // 无设备(回退):只用通配档 -> 开。
+        // No device (fallback): only the wildcard profile applies -> on.
         let r3 = resolve_from(&cfg, None);
         assert!(r3.reverse_scroll);
     }
@@ -257,7 +226,7 @@ mod tests {
     fn acceleration_merges_across_profiles() {
         let mut cfg = Config::default();
         cfg.mouse.profiles.clear();
-        // "所有鼠标"档:设跟踪速度。
+        // "All mice" profile: set pointer acceleration.
         cfg.mouse.profiles.push(MouseProfile {
             pointer: Some(PartialPointerSection {
                 acceleration: Some(0.6875),
@@ -265,7 +234,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        // 设备档:覆盖为另一个值。
+        // Device profile: override with a different value.
         cfg.mouse.profiles.push(MouseProfile {
             device: crate::config::DeviceMatcher {
                 vendor_id: Some(1133),
@@ -279,17 +248,17 @@ mod tests {
             ..Default::default()
         });
 
-        // 匹配设备:设备档覆盖。
+        // Matching device: the device profile wins.
         assert_eq!(
             resolve_from(&cfg, Some((1133, 17492))).acceleration,
             Some(2.0)
         );
-        // 其他设备:用通配档。
+        // Other device: the wildcard profile applies.
         assert_eq!(resolve_from(&cfg, Some((1, 2))).acceleration, Some(0.6875));
-        // 无设备(归因失败):只用通配档。
+        // No device (attribution failed): only the wildcard profile applies.
         assert_eq!(resolve_from(&cfg, None).acceleration, Some(0.6875));
 
-        // 全部档都未设 -> None(不改动设备现值)。
+        // No profile sets it -> None (leave the device's current value alone).
         let mut cfg2 = Config::default();
         cfg2.mouse.profiles.clear();
         cfg2.mouse.profiles.push(MouseProfile::default());
@@ -300,7 +269,7 @@ mod tests {
     fn later_match_wins_on_merge() {
         let mut cfg = Config::default();
         cfg.mouse.profiles.clear();
-        // 两条通配档:后者覆盖前者。
+        // Two wildcard profiles: the later one overrides the earlier.
         cfg.mouse.profiles.push(MouseProfile {
             reverse_scroll: Some(true),
             line_count: Some(5),
@@ -311,8 +280,8 @@ mod tests {
             ..Default::default()
         });
         let r = resolve_from(&cfg, None);
-        assert!(!r.reverse_scroll); // 后者胜
-        assert_eq!(r.line_count, 5); // 前者字段保留(后者未设)
+        assert!(!r.reverse_scroll); // the later profile wins
+        assert_eq!(r.line_count, 5); // the earlier field is kept (the later profile does not set it)
         let _ = &mut cfg;
     }
 
@@ -320,13 +289,11 @@ mod tests {
     fn virtual_profile_matches_only_injected_events() {
         let mut cfg = Config::default();
         cfg.mouse.profiles.clear();
-        // "所有鼠标"档:反转滚动开(虚拟指针的基础层)。
         // "All Mice" layer: reverse scrolling on (the virtual pointer's base layer).
         cfg.mouse.profiles.push(MouseProfile {
             reverse_scroll: Some(true),
             ..Default::default()
         });
-        // 虚拟指针档:关掉反转(覆盖基础层)并带一条按键映射。
         // Virtual-pointer profile: reverse off (overriding the base layer) plus one button mapping.
         cfg.mouse.profiles.push(MouseProfile {
             device: crate::config::DeviceMatcher {
@@ -340,7 +307,6 @@ mod tests {
             ..Default::default()
         });
 
-        // 注入事件 -> 虚拟档生效(覆盖"所有鼠标"档),映射来自虚拟档。
         // Injected event -> the virtual profile wins over "All Mice", mapping included.
         let r = resolve_from(&cfg, Some(crate::mouse::device::VIRTUAL_DEVICE_KEY));
         assert!(!r.reverse_scroll);
@@ -349,7 +315,6 @@ mod tests {
             Some("switcher")
         );
 
-        // 真实设备 -> 虚拟档不参与,只用"所有鼠标"档。
         // A real device -> the virtual profile stays out; only "All Mice" applies.
         let r = resolve_from(&cfg, Some((10007, 12976)));
         assert!(r.reverse_scroll);
@@ -368,7 +333,6 @@ mod tests {
             ..Default::default()
         });
         let toml_str = toml::to_string_pretty(&cfg).unwrap();
-        // 标记以扁平键写盘(与 device_vendor_id / device_product_id 同一约定)。
         // The flag persists as a flat key (same convention as device_vendor_id / product_id).
         assert!(toml_str.contains("device_injected = true"));
         let parsed: Config = toml::from_str(&toml_str).unwrap();
@@ -401,19 +365,17 @@ mod tests {
             ..Default::default()
         });
         let toml_str = toml::to_string_pretty(&cfg).unwrap();
-        // 反序列化后应保留两条档。
         // After deserialization, both profiles should survive.
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.mouse.profiles.len(), 2);
         assert!(parsed.mouse.profiles[0].device.vendor_id.is_none());
         assert_eq!(parsed.mouse.profiles[1].device.vendor_id, Some(0xC548));
         assert_eq!(parsed.mouse.profiles[1].reverse_scroll, Some(false));
-        // 解析结果应与原配置一致。
         // Resolution should match the original.
         let r = resolve_from(&parsed, Some((0xC548, 0x4444)));
-        assert!(!r.reverse_scroll); // 设备档覆盖通配档
-        assert_eq!(r.line_count, 7); // 来自通配档(line_count)
-        assert!(r.disable_acceleration); // 来自通配档
+        assert!(!r.reverse_scroll); // the device profile overrides the wildcard one
+        assert_eq!(r.line_count, 7); // comes from the wildcard profile (line_count)
+        assert!(r.disable_acceleration); // comes from the wildcard profile
     }
 
     #[test]
@@ -429,7 +391,6 @@ disable_acceleration = true
 "#;
         let mut parsed: Config = toml::from_str(toml_str).unwrap();
         parsed.mouse.migrate_legacy();
-        // 迁移后应有一个"所有鼠标"档,字段从旧值搬入。
         // After migration there should be one "All Mice" profile carrying the legacy values.
         assert_eq!(parsed.mouse.profiles.len(), 1);
         let p = &parsed.mouse.profiles[0];
@@ -440,7 +401,6 @@ disable_acceleration = true
             p.pointer.as_ref().and_then(|x| x.disable_acceleration),
             Some(true)
         );
-        // 旧字段应被清空(防止序列化出冗余)。
         // Legacy fields should be cleared (avoid serializing cruft).
         assert!(parsed.mouse.reverse_scroll.is_none());
         assert!(parsed.mouse.scroll_mode.is_none());

@@ -1,13 +1,3 @@
-//! 开发/验证开关的唯一入口:只认 argv,不读环境变量。
-//!
-//! 为什么不走环境变量:开发版由 `launchctl submit` 交给 launchd 启动,而 launchd 任务
-//! **不继承调用者的 shell 环境**。历史上我们用白名单把 `OH_MY_TAB_*` 转发进任务,但那条路
-//! 有两个问题:一是白名单一旦写漏就把整份环境(云凭证、代理)灌进任务和日志,2026-09-22 出过
-//! 一次事故;二是开关散落在环境变量里,验证时看不见、说不清。现在统一走 argv:
-//! `scripts/dev-restart.sh --flag[=value]`,脚本对不认识的 `--*` 参数原样透传给应用。
-//!
-//! 认识两种写法:`--name`(裸开关,值按空串处理)与 `--name=value`。
-//!
 //! The single entry point for development/verification switches: argv only, never the
 //! environment. The development build is started by launchd via `launchctl submit`, and a launchd
 //! job does not inherit the caller's shell environment. An allowlist used to forward `OH_MY_TAB_*`
@@ -19,7 +9,6 @@
 
 use std::sync::OnceLock;
 
-/// 应用参数(argv[0] 之后),只读一次。解析本身是纯函数,便于单测。
 /// The app's arguments (after argv[0]), read once. Parsing is a pure function so it stays unit
 /// testable.
 fn args() -> &'static [String] {
@@ -27,7 +16,6 @@ fn args() -> &'static [String] {
     ARGS.get_or_init(|| std::env::args().skip(1).collect())
 }
 
-/// 在给定参数里取 `--name=value`:裸 `--name` 返回 `Some("")`,未出现返回 `None`。
 /// Reads `--name=value` from the given arguments: a bare `--name` yields `Some("")`, absence
 /// yields `None`.
 fn value_in(args: &[String], name: &str) -> Option<String> {
@@ -36,7 +24,6 @@ fn value_in(args: &[String], name: &str) -> Option<String> {
         if arg == &flag {
             return Some(String::new());
         }
-        // 只认 `--name=` 这种精确分界,`--namefoo` 不会被误判成 `--name`。
         // Only the exact `--name=` boundary counts, so `--namefoo` is not mistaken for `--name`.
         if let Some(rest) = arg.strip_prefix(&flag) {
             if let Some(value) = rest.strip_prefix('=') {
@@ -47,19 +34,16 @@ fn value_in(args: &[String], name: &str) -> Option<String> {
     None
 }
 
-/// `--name` / `--name=value` 是否出现(值不重要时用这个)。
 /// Whether `--name` / `--name=value` appears (use when the value does not matter).
 pub(crate) fn present(name: &str) -> bool {
     value(name).is_some()
 }
 
-/// 取 `--name=value` 的值(裸 `--name` 为 `Some("")`)。
 /// The value of `--name=value` (a bare `--name` gives `Some("")`).
 pub(crate) fn value(name: &str) -> Option<String> {
     value_in(args(), name)
 }
 
-/// 布尔开关:裸 `--name`,或 `--name=1/true/yes/on`。
 /// A boolean switch: bare `--name`, or `--name=1/true/yes/on`.
 fn enabled_in(args: &[String], name: &str) -> bool {
     match value_in(args, name) {
@@ -71,13 +55,11 @@ fn enabled_in(args: &[String], name: &str) -> bool {
     }
 }
 
-/// 读取真实启动参数里的布尔开关。
 /// Reads a boolean switch from the real launch arguments.
 pub(crate) fn enabled(name: &str) -> bool {
     enabled_in(args(), name)
 }
 
-/// 是否有参数以给定前缀开头(用于 `--smoke*` 这类一族开关)。
 /// Whether any argument starts with the given prefix (for families such as `--smoke*`).
 pub(crate) fn any_prefix(prefix: &str) -> bool {
     args().iter().any(|arg| arg.starts_with(prefix))
@@ -105,7 +87,6 @@ mod tests {
             value_in(&args, "fake-permissions"),
             Some("ax:0,sr:0".to_string())
         );
-        // `--open-settings=` 是显式空值,与裸 `--open-settings` 等价。
         // `--open-settings=` is an explicit empty value, equivalent to a bare flag.
         assert_eq!(value_in(&args, "open-settings"), Some(String::new()));
     }
@@ -113,7 +94,6 @@ mod tests {
     #[test]
     fn similar_names_do_not_collide() {
         let args = argv(&["--open-settings-extra=1", "--open-settings"]);
-        // 前缀更长的那一个不会被当成 `open-settings`。
         // The longer-prefixed argument is not treated as `open-settings`.
         assert_eq!(value_in(&args, "open-settings"), Some(String::new()));
         assert_eq!(value_in(&args, "open"), None);

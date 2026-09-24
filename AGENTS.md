@@ -66,7 +66,9 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 ## Editing and localization
 
 - Preserve unrelated user changes and avoid destructive Git commands unless explicitly requested.
-- Use bilingual comments (Chinese first, English second) only for non-obvious logic, design decisions, FFI/Objective-C subtleties, and workarounds.
+- Comments are English only. Write one only when removing it would let someone write the code wrong: FFI/Objective-C and lifetime subtleties, thread/lock/ordering invariants, measured platform facts and workarounds (keep the measurement), non-obvious design trade-offs, and cross-module contracts.
+- Delete every other comment class: restating the next line or the item's name, section banners (`// ===== X =====`), and relocation history ("used to live in", "previously duplicated"). History belongs in the commit message and in `release_doc*`; behaviour that can be asserted belongs in a test name or assertion message, and reasons that explain *why* the code is like this stay.
+- Before adding a comment, ask what breaks if it is deleted. `python3 scripts/check-comment-style.py` enforces the mechanical part (English-only comments, no banners); `--strict` also rejects relocation history.
 - Keep user-visible strings in `t()`/`tf()`/`t_count()` and add keys to every supported locale; use `t_count()` for singular/plural counts. Developer logs stay in English; dynamic titles are data, not UI chrome.
 - Prefer `apply_patch`/native file editors. Use scripts only for genuinely programmatic changes; back up targets, assert all anchors, fail loudly, and inspect `git diff` afterward.
 

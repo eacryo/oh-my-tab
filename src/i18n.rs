@@ -1,13 +1,6 @@
-// i18n 模块:手搓的 TOML 国际化体系,与 config.rs 同构。
-// 零新依赖(toml/serde 已有),翻译文件编译期内嵌,locale 由 config 驱动、可热重载。
-//
 // i18n module: a handcrafted TOML-based localization system, isomorphic to config.rs.
 // Zero new deps (toml/serde already present); locale files are embedded at compile time;
 // the active locale is config-driven and hot-reloadable.
-//
-// 循环依赖说明:本模块不读取 CONFIG,只读系统语言(NSLocale)。这样 CONFIG 的
-// LazyLock 初始化期间若调用 validate() -> t() -> I18N 初始化,不会形成死锁。
-// config.rs 在 CONFIG 初始化与 reload 后单向调用 apply_config_locale() 应用配置覆盖。
 //
 // No cycle: this module NEVER reads CONFIG, only the system locale (NSLocale). So when
 // CONFIG's LazyLock init calls validate() -> t() -> I18N init, there is no deadlock.
@@ -20,7 +13,6 @@ use std::collections::HashMap;
 use std::ffi::c_char;
 use std::sync::{LazyLock, RwLock};
 
-// 翻译文件编译期内嵌,避免运行时缺文件 / 读取失败。
 // Locale files embedded at compile time to avoid runtime file-missing / read failures.
 const EN_TOML: &str = include_str!("../locales/en.toml");
 const ZH_TOML: &str = include_str!("../locales/zh-Hans.toml");
@@ -31,7 +23,6 @@ pub(crate) const TEST_LONG_LOCALE: &str = "__oh_my_tab_test_long_en";
 #[cfg(any(debug_assertions, feature = "dev-long-text"))]
 const PSEUDO_LOCALE_FLAG: &str = "pseudo-locale";
 
-// 已支持的 locale -> 内嵌 TOML 文本。新增语言只需加文件 + 在此登记。
 // Supported locale -> embedded TOML text. To add a language, add a file + register here.
 fn locale_raw(locale: &str) -> Option<&'static str> {
     match locale {
@@ -53,7 +44,6 @@ fn is_supported(locale: &str) -> bool {
     false
 }
 
-// 把嵌套 TOML 表扁平化成 "section.key" -> value 的映射,只收字符串叶节点。
 // Flatten nested TOML tables into a "section.key" -> value map, collecting only string leaves.
 fn flatten(value: &toml::Value, prefix: &str, out: &mut HashMap<String, String>) {
     if let toml::Value::Table(t) = value {
@@ -68,7 +58,7 @@ fn flatten(value: &toml::Value, prefix: &str, out: &mut HashMap<String, String>)
                     out.insert(key, s.clone());
                 }
                 toml::Value::Table(_) => flatten(v, &key, out),
-                _ => {} // 忽略非字符串叶节点 / ignore non-string leaves
+                _ => {} // ignore non-string leaves
             }
         }
     }
@@ -92,16 +82,14 @@ fn load_messages(locale: &str) -> HashMap<String, String> {
     }
 }
 
-// en 是兜底 locale,常量,只解析一次。
 // en is the fallback locale; constant, parsed only once.
 static EN_MESSAGES: LazyLock<HashMap<String, String>> = LazyLock::new(|| load_messages("en"));
 
 struct I18nState {
-    locale: String,                    // 已解析的实际 locale,如 "zh-Hans"
-    messages: HashMap<String, String>, // 当前 locale 的扁平 key->string(locale=="en" 时与 EN_MESSAGES 相同)
+    locale: String,                    // resolved locale, e.g. "zh-Hans"
+    messages: HashMap<String, String>, // flat key->string map for the current locale (identical to EN_MESSAGES when locale == "en")
 }
 
-// 初始化只读系统语言,不读 CONFIG(见文件头循环依赖说明)。
 // Init reads only the system locale, NOT CONFIG (see cycle note at file top).
 static I18N: LazyLock<RwLock<I18nState>> = LazyLock::new(|| {
     let locale = resolve_locale(None);
@@ -111,7 +99,6 @@ static I18N: LazyLock<RwLock<I18nState>> = LazyLock::new(|| {
     })
 });
 
-/// 简单查表:当前 locale -> en 兜底 -> key 本身。
 /// Simple lookup: current locale -> en fallback -> the key itself.
 pub fn t(key: &str) -> String {
     let g = I18N.read().unwrap();
@@ -137,7 +124,6 @@ pub fn t(key: &str) -> String {
 }
 
 /// Return the resolved locale currently used for localized UI strings.
-/// 返回当前 UI 使用的最终 locale。
 pub fn current_locale() -> String {
     I18N.read().unwrap().locale.clone()
 }
@@ -145,22 +131,18 @@ pub fn current_locale() -> String {
 /// Enable long-text layout QA without adding a fake production locale. Set
 /// `--pseudo-locale` (optionally `=1/true/yes/on`) before launching the app; placeholders such
 /// as `{count}` remain byte-for-byte intact so `tf` can still interpolate runtime values.
-/// 通过启动参数开启长文本布局 QA，不新增假的正式语言。启动时加
-/// `--pseudo-locale`（也可写 `--pseudo-locale=1`）；`{count}` 等占位符保持原样，`tf` 仍可插入运行时值。
 #[cfg(any(debug_assertions, feature = "dev-long-text"))]
 fn pseudo_locale_enabled() -> bool {
     crate::dev_flags::enabled(PSEUDO_LOCALE_FLAG)
 }
 
 /// Repeat English UI strings for the debug-only language-menu layout fixture.
-/// 为语言菜单中的 debug-only 布局夹具把英文 UI 文案重复三遍。
 #[cfg(any(debug_assertions, feature = "dev-long-text"))]
 fn long_test_localize_text(s: &str) -> String {
     format!("{s} {s} {s}")
 }
 
 /// Keep the punctuation-based QA helper out of production builds.
-/// 将符号膨胀 QA 辅助函数排除在生产构建之外。
 #[cfg(any(debug_assertions, feature = "dev-long-text"))]
 fn pseudo_localize_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2 + 4);
@@ -186,7 +168,6 @@ fn pseudo_localize_text(s: &str) -> String {
     out
 }
 
-/// 带插值的查表:把模板里的 {name} 替换为 args 提供的值。
 /// Lookup with interpolation: replace {name} placeholders in the template with args.
 pub fn tf(key: &str, args: &[(&str, &str)]) -> String {
     let mut s = t(key);
@@ -196,10 +177,6 @@ pub fn tf(key: &str, args: &[(&str, &str)]) -> String {
     s
 }
 
-/// 带数量的查表:count == 1 用 "{key}_one",否则用 "{key}_other",并插入 {count}。
-/// 英文单复数为区分形式,中文等其他语言两份值相同也在 locale 文件里各写一条,
-/// 这样 `all_locales_share_identical_key_sets` 的 key 一致性检查仍能覆盖它们。
-///
 /// Count-aware lookup: count == 1 selects "{key}_one", otherwise "{key}_other", and
 /// interpolates {count}. Languages without a plural distinction (e.g. Chinese) still declare
 /// both keys with the same value so the locale key-parity test keeps covering them.
@@ -208,9 +185,6 @@ pub fn t_count(key: &str, count: usize) -> String {
     tf(&format!("{key}{suffix}"), &[("count", &count.to_string())])
 }
 
-/// 应用 config 里的 locale 配置(由 config.rs 在 CONFIG 初始化与 reload 后调用)。
-/// locale_cfg 为 "auto" 表示跟随系统语言;其它值须在支持列表内,否则回退 auto。
-///
 /// Apply the locale from config (called by config.rs after CONFIG init and after reload).
 /// locale_cfg "auto" means follow the system language; other values must be in the
 /// supported list, otherwise fall back to auto.
@@ -218,21 +192,18 @@ pub fn apply_config_locale(locale_cfg: &str) {
     let resolved = resolve_locale(Some(locale_cfg));
     let mut g = I18N.write().unwrap();
     if g.locale == resolved {
-        return; // 未变,避免无谓重算 / unchanged, skip recompute
+        return; // unchanged, skip recompute
     }
     g.locale = resolved.clone();
     g.messages = load_messages(&resolved);
 }
 
-/// 解析最终 locale。优先级:locale_cfg(非 auto 且在支持列表) > 系统偏好语言列表中首个
-/// 能映射到已支持 locale 的项 > DEFAULT_LOCALE。
 /// Resolve the final locale. Priority: locale_cfg (non-auto & supported) > first system
 /// preferred language that maps to a supported locale > DEFAULT_LOCALE.
 fn resolve_locale(locale_cfg: Option<&str>) -> String {
     resolve_locale_from(locale_cfg, &system_locales())
 }
 
-/// 从配置值与注入的系统语言列表解析最终 locale(纯函数,测试可直接喂列表)。
 /// Resolve the final locale from a config value and an injected system-language list
 /// (pure; tests feed their own lists instead of the real NSLocale).
 fn resolve_locale_from(locale_cfg: Option<&str>, system: &[String]) -> String {
@@ -241,9 +212,6 @@ fn resolve_locale_from(locale_cfg: Option<&str>, system: &[String]) -> String {
             return cfg.to_string();
         }
     }
-    // 按顺序遍历系统偏好语言,返回第一个能映射到已支持 locale 的项。
-    // 遍历(而非只取首项)确保用户次优偏好里的已支持语言被选中,而不是直接回退默认:
-    // 例如偏好顺序为 [ja, zh-Hans, en] 时,选中 zh-Hans 而非 en。
     // Iterate the system preferred-language list in order; return the first that maps to a
     // supported locale. Iterating (instead of taking only the first) ensures a supported
     // language lower in the user's preference is chosen over the default fallback: e.g. for
@@ -256,9 +224,6 @@ fn resolve_locale_from(locale_cfg: Option<&str>, system: &[String]) -> String {
     DEFAULT_LOCALE.to_string()
 }
 
-/// 把单个系统语言标签映射到已支持的 locale,未匹配返回 None。
-/// 中文区分简体/繁体:含 Hant 或区域为 TW/HK/MO 视为繁体;其余(含 Hans、CN、SG、纯 zh)为简体。
-///
 /// Map a single system language tag to a supported locale, or None if unsupported.
 /// Chinese splits into Simplified/Traditional: Hant script or region TW/HK/MO -> Traditional;
 /// everything else (Hans, CN, SG, bare zh) -> Simplified.
@@ -281,10 +246,6 @@ fn map_tag_to_supported(tag: &str) -> Option<&'static str> {
     }
 }
 
-/// 取系统偏好语言列表(NSLocale preferredLanguages,有序,首项最优先)。NSLocale 是
-/// Foundation 类,无需 NSApplication 运行即可用,因此 I18N 在 CONFIG 初始化期间被触发也安全。
-/// preferredLanguages / objectAtIndex: 遵循 Get 规则(+0 autoreleased),无需 release。
-///
 /// Read the system's preferred-language list (NSLocale preferredLanguages, ordered, first is
 /// most preferred). NSLocale is a Foundation class usable without NSApplication running, so
 /// triggering I18N during CONFIG init is safe. preferredLanguages / objectAtIndex: follow the
@@ -326,7 +287,6 @@ mod tests {
         tags.iter().map(|s| s.to_string()).collect()
     }
 
-    // 提取字符串里所有 {name} 占位符的名字。
     // Extract the names of all {name} placeholders in a string.
     fn placeholders(s: &str) -> std::collections::HashSet<&str> {
         let mut set = std::collections::HashSet::new();
@@ -340,7 +300,6 @@ mod tests {
 
     #[test]
     fn explicit_config_wins_over_system() {
-        // 显式配置(受支持)优先于系统语言。
         // An explicit supported config locale beats the system list.
         let sys = list(&["ja", "zh-Hans", "en"]);
         assert_eq!(resolve_locale_from(Some("en"), &sys), "en");
@@ -349,7 +308,6 @@ mod tests {
 
     #[test]
     fn auto_or_unsupported_falls_back_to_system() {
-        // auto 与不支持的配置值都走系统语言。
         // "auto" and unsupported config values fall back to the system list.
         let sys = list(&["ja", "zh-Hans", "en"]);
         assert_eq!(resolve_locale_from(Some("auto"), &sys), "zh-Hans");
@@ -359,7 +317,6 @@ mod tests {
 
     #[test]
     fn lower_preference_supported_locale_wins_over_default() {
-        // 支持的语言排在偏好列表靠后时仍应被选中,而不是直接回退 en。
         // A supported language lower in the preference list is still chosen over en.
         assert_eq!(
             resolve_locale_from(Some("auto"), &list(&["ja", "zh-Hant", "en"])),
@@ -375,7 +332,6 @@ mod tests {
 
     #[test]
     fn map_tag_covers_chinese_variants() {
-        // 简/繁拆分:区域与脚本都影响结果。
         // Script/region both decide Simplified vs Traditional.
         assert_eq!(map_tag_to_supported("zh"), Some("zh-Hans"));
         assert_eq!(map_tag_to_supported("zh-CN"), Some("zh-Hans"));
@@ -414,19 +370,16 @@ number = 42
             Some("Settings")
         );
         assert_eq!(out.get("menu.sub.nested").map(String::as_str), Some("x"));
-        // 非字符串叶节点被忽略。
         // Non-string leaves are ignored.
         assert!(!out.contains_key("menu.sub.number"));
     }
 
     #[test]
     fn tf_replaces_all_placeholders() {
-        // 模板插值:所有 {name} 都被替换。
         // All {name} placeholders are replaced.
         let s = tf("settings.version_label", &[("version", "0.1.4")]);
         assert!(!s.contains('{'));
         assert!(s.contains("0.1.4"));
-        // 缺失参数保持原样(占位符不消失)。
         // A missing argument leaves the placeholder untouched.
         let s2 = tf("settings.version_label", &[]);
         assert!(s2.contains('{'));
@@ -434,7 +387,6 @@ number = 42
 
     #[test]
     fn count_keys_exist_with_distinct_singular_and_plural_forms() {
-        // 单复数必须是两条不同的英文文案,否则 "1 items" 这类错误会悄悄回归。
         // Singular and plural must be distinct English strings, otherwise a "1 items"
         // regression would slip through unnoticed.
         for key in [
@@ -459,7 +411,6 @@ number = 42
 
     #[test]
     fn t_count_interpolates_the_count_placeholder() {
-        // 不依赖当前 locale:两种形式都必须把 {count} 替换掉(中文两份值相同也成立)。
         // Locale-independent: both forms must resolve {count} (true even where they are equal).
         for count in [0usize, 1, 2] {
             let s = t_count("clipboard.detail_lines", count);
@@ -473,7 +424,6 @@ number = 42
 
     #[test]
     fn all_locales_share_identical_key_sets() {
-        // 三份 locale 文件的 key 集合必须完全一致,防止漏翻译/多翻译。
         // All locale files must expose the exact same key set (no missing/extra keys).
         let keys = |raw: &str| {
             let parsed: toml::Value = toml::from_str(raw).unwrap();
@@ -490,7 +440,6 @@ number = 42
         let hant_set: std::collections::HashSet<&String> = zh_hant.keys().collect();
         assert_eq!(en_set, zh_set, "zh-Hans keys differ from en");
         assert_eq!(zh_set, hant_set, "zh-Hant keys differ from zh-Hans");
-        // 每个 key 在 zh 里都有非空值(不做空翻译)。
         // Every key has a non-empty value in zh (no empty translations).
         for (k, v) in &zh {
             assert!(!v.is_empty(), "empty translation for key {}", k);
@@ -499,8 +448,6 @@ number = 42
 
     #[test]
     fn placeholder_parity_across_locales() {
-        // 同一 key 的 {name} 占位符必须跨语言一致:某语言漏写占位符会静默把
-        // 用户数据(如版本号)硬编码成翻译的一部分,key 集合测试抓不到这种错。
         // Placeholders ({name}) must match across locales for every key: a translation
         // missing a placeholder would silently bake user data (e.g. a version number)
         // into the text -- the key-set test cannot catch that.
@@ -538,8 +485,6 @@ number = 42
     fn pseudo_localization_expands_strings_without_corrupting_placeholders() {
         // Exercise every English UI string with expansion and placeholder preservation so future
         // layout changes have a deterministic long-text fixture without shipping a fake locale.
-        // 对全部英文 UI 文案做膨胀和占位符保留检查，为布局回归提供稳定的长文本夹具，且不把
-        // 伪语言暴露给正式用户。
         let mut expanded = 0usize;
         for (key, value) in EN_MESSAGES.iter() {
             let pseudo = pseudo_localize_text(value);

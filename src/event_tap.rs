@@ -1,6 +1,3 @@
-//! CGEventTap 公共基础设施:类型别名、FFI extern 声明、语义常量、通用启动流程。
-//! 被窗口切换(event_monitor)与鼠标增强(mouse::event_tap)两个模块共用,是叶子层。
-//!
 //! Common CGEventTap infrastructure: type aliases, FFI extern declarations, semantic
 //! constants, and a generic start helper. Shared by the window switcher (event_monitor)
 //! and the mouse enhancement (mouse::event_tap) modules. A leaf module.
@@ -12,8 +9,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
-
-// ========== 类型别名 / type aliases ==========
 
 pub(crate) type CGEventRef = *mut c_void;
 pub(crate) type CGEventTapProxy = *mut c_void;
@@ -27,8 +22,6 @@ pub(crate) type CGEventType = u32;
 pub(crate) type CGEventFlags = u64;
 pub(crate) type CGEventMask = u64;
 
-/// 把各个事件 tap 共用的 CoreGraphics 数值集中在叶子模块，避免窗口切换、快捷操作和
-/// 窗口控制各自维护一份容易漂移的副本。模块专属的动作键仍留在对应模块中。
 /// Shared keyboard event types, fields, modifier masks, and common keycodes live in this leaf
 /// module so the window switcher, quick actions, and window control do not maintain drifting
 /// copies. Module-specific action keys remain local.
@@ -56,9 +49,6 @@ pub(crate) mod keyboard {
 pub(crate) const TAP_DISABLED_BY_TIMEOUT: CGEventType = 0xFFFF_FFFE;
 pub(crate) const TAP_DISABLED_BY_USER_INPUT: CGEventType = 0xFFFF_FFFF;
 
-/// 由 CGEventTapCreate 与 CFMachPortCreateRunLoopSource 创建的一对 Core Foundation 对象。
-/// 调用方负责在线程退出前通过 teardown_event_tap() 移除并释放。
-///
 /// The Core Foundation objects created by CGEventTapCreate and
 /// CFMachPortCreateRunLoopSource. The caller must remove and release them through
 /// teardown_event_tap() before its thread exits.
@@ -147,56 +137,41 @@ pub(crate) type CGEventTapCallBack = Option<
     ) -> CGEventRef,
 >;
 
-/// CFRunLoopTimer 回调:参数为 (timer, info)。
 /// CFRunLoopTimer callout: (timer, info).
 pub(crate) type CFRunLoopTimerCallBack =
     Option<unsafe extern "C" fn(CFRunLoopTimerRef, *mut c_void)>;
 
-// ========== CGEventTap 语义常量 / semantic constants ==========
-// 用语义化枚举替代裸数字,降低各调用方硬编码出错概率。
 // Semantic enums in place of raw magic numbers, reducing per-caller hardcoding errors.
 
-/// CGEventTapCreate 的 tap location 参数。
 /// Tap location for CGEventTapCreate.
 #[allow(dead_code)]
 pub(crate) mod tap_location {
-    /// HID 层:最底层,能看到所有硬件事件(含 session 层合成的)。
     /// HID level: lowest, sees all hardware events (including session-synthesized ones).
     pub(crate) const HID_EVENT_TAP: i32 = 0;
-    /// Session 层:能看到真实硬件事件 + session 层合成的 Cmd+Tab(鼠标映射软件注入)。
     /// Session level: sees real hardware events + session-synthesized Cmd+Tab (mouse-remapper injected).
     pub(crate) const SESSION_EVENT_TAP: i32 = 1;
     #[allow(dead_code)]
     pub(crate) const ANNOTATED_SESSION_EVENT_TAP: i32 = 2;
 }
 
-/// CGEventTapCreate 的 placement 参数。
 /// Placement for CGEventTapCreate.
 #[allow(dead_code)]
 pub(crate) mod tap_placement {
-    /// 队首插入:最先看到事件。
     /// Head insert: sees events first.
     pub(crate) const HEAD_INSERT: i32 = 0;
-    /// 队尾插入:最后看到事件。
     /// Tail insert: sees events last.
     pub(crate) const TAIL_INSERT: i32 = 1;
 }
 
-/// CGEventTapCreate 的 options 参数。
-/// 注意:枚举值与直觉相反(见 CGEventTypes.h),Default=0 可改事件,ListenOnly=1 只读。
 /// Options for CGEventTapCreate. Note the counterintuitive values (see CGEventTypes.h):
 /// Default=0 is mutable, ListenOnly=1 is read-only.
 #[allow(dead_code)]
 pub(crate) mod tap_options {
-    /// 默认 tap:可修改/丢弃事件(需要 AX 权限)。用于要改写事件的场景(transformer 链)。
     /// Default tap: may modify/drop events (requires AX permission). Used when rewriting events.
     pub(crate) const DEFAULT_TAP: u32 = 0;
-    /// 只听不改:不能修改事件。用于纯观察/日志验证阶段,调试安全(callback bug 不会吞事件)。
     /// Listen only: cannot modify events. For observation/logging; debug-safe (callback bugs won't swallow events).
     pub(crate) const LISTEN_ONLY: u32 = 1;
 }
-
-// ========== FFI extern 声明 / FFI extern declarations ==========
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -210,7 +185,6 @@ extern "C" {
     ) -> CFMachPortRef;
 
     pub(crate) fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
-    // 查询 tap 是否被系统启用(看门狗用)。
     // Query whether the tap is enabled system-side (used by the watchdog).
     pub(crate) fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
     pub(crate) fn CGEventGetIntegerValueField(event: CGEventRef, field: i32) -> i64;
@@ -221,24 +195,18 @@ extern "C" {
     pub(crate) fn CGEventSetDoubleValueField(event: CGEventRef, field: i32, value: f64);
     pub(crate) fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
     pub(crate) fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
-    // 查询组合会话当前的真实修饰键状态,用于诊断事件自身 flags 与系统状态是否不一致。
     // Query the combined session's current modifier state so diagnostics can compare an
     // event's flags with the system-wide state.
     pub(crate) fn CGEventSourceFlagsState(state_id: i32) -> CGEventFlags;
-    // 修改事件的类型(如把键盘事件改成 flagsChanged,用于合成修饰键状态变化)。
-    // 当前无调用方(按键合成不再发 flagsChanged);保留供未来合成修饰键状态用。
     // Change an event's type (e.g. turn a keyboard event into flagsChanged, for synthesizing
     // modifier-key state transitions). No caller today (key synthesis no longer emits
     // flagsChanged); kept for future modifier-state synthesis.
     #[allow(dead_code)]
     pub(crate) fn CGEventSetType(event: CGEventRef, t: CGEventType);
-    // 从 CGEvent 提取底层 IOHIDEvent(公开 API);用于事件归因(按设备匹配配置)。
     // Extract the underlying IOHIDEvent from a CGEvent (public API); used for event attribution
     // (matching events to the producing device for per-device config).
     pub(crate) fn CGEventCopyIOHIDEvent(event: CGEventRef) -> *mut c_void;
 
-    // 合成全新的滚轮事件。
-    // source 传 null 表示用默认 source;wheelCount 通常为 2(wheel1=垂直,wheel2=水平)。
     // Create a brand-new scroll wheel event.
     // source=null for default source; wheelCount typically 2 (wheel1=vertical, wheel2=horizontal).
     pub(crate) fn CGEventCreateScrollWheelEvent2(
@@ -250,13 +218,10 @@ extern "C" {
         wheel3: i32,
     ) -> CGEventRef;
 
-    // 将事件投递到指定 tap 层级。kCGSessionEventTap=1 投递到 session 层,
-    // 不经过 HID 层 tap,绕过系统自然滚动的 HID 层覆盖。
     // Post an event to a tap level. kCGSessionEventTap=1 posts to the session level,
     // bypassing HID-level taps and thus the system's natural-scroll override at the HID layer.
     pub(crate) fn CGEventPost(tap: i32, event: CGEventRef);
 
-    // 创建键盘事件(keyDown=1 / keyUp=0),供历史剪贴板模拟 Cmd+V 粘贴使用。
     // Create a keyboard event (keyDown=1 / keyUp=0), used by the history clipboard to
     // synthesize Cmd+V for pasting.
     pub(crate) fn CGEventCreateKeyboardEvent(
@@ -265,14 +230,10 @@ extern "C" {
         key_down: bool,
     ) -> CGEventRef;
 
-    // 查询事件的全局屏幕坐标(左下原点,点单位)。用于 hover 轮询读取当前鼠标位置。
     // Query an event's global screen point (bottom-left origin, points). Used by the hover
     // poll to read the current cursor position.
     pub(crate) fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
 
-    // 创建一个事件(source 传 null 用默认源):不带事件源的事件,其位置 = 当前鼠标位置。
-    // 用于 hover 轮询读全局鼠标位置——不依赖 mouseMoved 事件流(侧键按住期间系统不产生
-    // mouseMoved,NSEvent.mouseLocation 会冻结,实测)。
     // Create an event (null source = default source): a source-less event carries the
     // current mouse location. Used by the hover poll to read the global cursor without
     // depending on the mouseMoved stream (while a side button is held the system emits no
@@ -280,14 +241,12 @@ extern "C" {
     pub(crate) fn CGEventCreate(source: *const c_void) -> CGEventRef;
 }
 
-/// kCGEventSourceStateCombinedSessionState。集中封装裸枚举值,避免诊断调用方重复硬编码。
 /// kCGEventSourceStateCombinedSessionState. Keep the raw enum value in one place rather than
 /// duplicating it across diagnostic callers.
 pub(crate) fn combined_session_flags() -> CGEventFlags {
     unsafe { CGEventSourceFlagsState(0) }
 }
 
-/// CGPoint 的 Rust 表示(与 CoreGraphics 的 CGPoint 同布局)。
 /// Rust representation of CGPoint (same layout as CoreGraphics').
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -296,22 +255,17 @@ pub(crate) struct CGPoint {
     pub y: f64,
 }
 
-// IOKit 私有 API:读写 IOHIDEvent 的浮点字段。
-// 当前合成事件方案未使用(保留以备用)。
 // IOKit private API: read/write float fields of an IOHIDEvent.
 // Unused by the current synthetic-event approach (kept for potential future use).
 #[allow(dead_code)]
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
-    /// 读 IOHIDEvent 的浮点字段。
     /// Read a float field from an IOHIDEvent.
     pub(crate) fn IOHIDEventGetFloatValue(event: *mut c_void, field: u32) -> f64;
-    /// 写 IOHIDEvent 的浮点字段。
     /// Write a float field to an IOHIDEvent.
     pub(crate) fn IOHIDEventSetFloatValue(event: *mut c_void, field: u32, value: f64);
 }
 
-// CFRunLoop 相关函数 + 定时器,链接 CoreFoundation。
 // CFRunLoop functions + timer, linking CoreFoundation.
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
@@ -332,9 +286,6 @@ extern "C" {
     pub(crate) fn CFRunLoopStop(rl: CFRunLoopRef);
     pub(crate) fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
 
-    // 定时器(看门狗用)。fireDate 传 0 表示下一个 runloop 周期立即触发一次,interval 为周期(秒)。
-    // 注意 context 参数是指向 CFRunLoopTimerContext 结构体的指针,Create 会拷贝其内容,
-    // info 字段在回调时原样传回 —— 这里 info 就是 tap 指针。
     // Timer (for the watchdog). fireDate=0 fires on the next runloop pass, interval is the period
     // in seconds. The context argument points to a CFRunLoopTimerContext struct which Create copies;
     // its info field is passed back to the callback -- here info is the tap pointer.
@@ -352,11 +303,6 @@ extern "C" {
     pub(crate) static kCFRunLoopDefaultMode: CFStringRef;
 }
 
-// ========== 通用启动流程 / generic start helper ==========
-
-// 无辅助功能权限时不创建 tap；权限监视器会在授权恢复后按当前配置重新启动各服务。
-// 对“权限仍有效但创建临时失败”的情况，每隔 RETRY_INTERVAL 重试，最多 RETRY_MAX 次。
-//
 // Without Accessibility permission, no tap is created; the permission supervisor restarts services
 // from current configuration after trust is restored. A transient creation failure while permission
 // remains valid is retried every RETRY_INTERVAL, up to RETRY_MAX times.
@@ -378,17 +324,11 @@ fn wait_for_retry_or_cancel(cancel: Option<&'static std::sync::atomic::AtomicBoo
     }
 }
 
-/// 创建 event tap 并加入当前线程的 CFRunLoop。失败时按 RETRY_INTERVAL/RETRY_MAX 重试。
-/// 返回创建好的 tap(或 None 表示重试耗尽)。
-///
 /// Create an event tap and add it to the current thread's CFRunLoop. Retries on failure
 /// per RETRY_INTERVAL/RETRY_MAX. Returns the created tap (or None if retries exhausted).
 ///
 /// # Safety
-/// 调用方必须在专用线程上调用(后续 CFRunLoopRun 会阻塞该线程)。
 /// Caller must invoke on a dedicated thread (CFRunLoopRun will block it afterwards).
-///
-/// `cancel` 为可选取消标志:置位时重试循环提前退出,避免停用 tap 时 join 阻塞调用线程。
 ///
 /// `cancel` is an optional cancellation flag: when set, the retry loop bails out early
 /// (used when stopping the mouse tap at runtime so join() doesn't block the caller during
@@ -414,7 +354,6 @@ pub(crate) unsafe fn create_tap_with_retry(
     }
     let mut tap = CGEventTapCreate(location, placement, options, mask, callback, user_info);
 
-    // 首次创建失败(通常是缺 Accessibility 权限):有限次重试,给用户时间去系统设置授权。
     // First creation failed (usually missing Accessibility): retry a bounded number of times
     // to give the user time to grant permission in System Settings.
     if tap.is_null() {
@@ -427,7 +366,6 @@ pub(crate) unsafe fn create_tap_with_retry(
         );
         let mut granted = false;
         for _ in 0..RETRY_MAX {
-            // 分片等待并轮询取消请求,避免运行时停用被完整的 3 秒重试间隔拖住。
             // Wait in short slices while polling cancellation so runtime disable is not held up
             // by the full three-second retry interval.
             if wait_for_retry_or_cancel(cancel) || !crate::input_monitor::watchdog_may_enable_tap()
@@ -475,11 +413,9 @@ pub(crate) unsafe fn create_tap_with_retry(
     Some(CreatedEventTap { tap, source })
 }
 
-/// 同步禁用并释放一个 event tap 及其 RunLoop Source。
 /// Disable and release an event tap and its RunLoop source synchronously.
 ///
 /// # Safety
-/// `created` 必须仍由 `run_loop` 持有且只能清理一次。
 /// `created` must still belong to `run_loop` and may be torn down only once.
 pub(crate) unsafe fn teardown_event_tap(run_loop: CFRunLoopRef, created: CreatedEventTap) {
     CGEventTapEnable(created.tap, false);
@@ -492,9 +428,6 @@ pub(crate) unsafe fn teardown_event_tap(run_loop: CFRunLoopRef, created: Created
     crate::ffi::CFRelease(created.tap as *const c_void);
 }
 
-// ========== tap 看门狗 / tap watchdog ==========
-
-/// CFRunLoopTimerCreate 的 context 结构体(version=0,info 在回调时原样传回)。
 /// Context struct for CFRunLoopTimerCreate (version=0; info is passed back to the callback).
 #[repr(C)]
 pub(crate) struct CFRunLoopTimerContext {
@@ -515,7 +448,6 @@ pub(crate) struct TapWatchdog {
     context: *mut TapWatchdogContext,
 }
 
-/// Timeout 禁用允许自愈；显式停止、权限撤销和 UserInput 禁用必须保持终止，不能由看门狗撤销。
 /// Timeout disables are recoverable; explicit stop, permission loss, and UserInput disables are
 /// terminal for the affected tap and must never be undone by this watchdog.
 unsafe extern "C" fn tap_watchdog_callback(_timer: CFRunLoopTimerRef, info: *mut c_void) {
@@ -554,8 +486,8 @@ pub(crate) unsafe fn start_tap_watchdog(
     };
     let timer = CFRunLoopTimerCreate(
         std::ptr::null_mut(),
-        0.0, // 下一个 runloop 周期立即检查一次 / fire on the next runloop pass
-        3.0, // 之后每 3s / then every 3s
+        0.0, // fire on the next runloop pass
+        3.0, // then every 3s
         0,
         0,
         Some(tap_watchdog_callback),
@@ -577,21 +509,8 @@ pub(crate) unsafe fn stop_tap_watchdog(watchdog: TapWatchdog) {
     }
 }
 
-/// 在专用线程上启动一个 CGEventTap + CFRunLoop。
-/// 封装通用的"起线程 -> 建 tap(带重试) -> 加 RunLoop source -> 阻塞"流程。
-///
 /// Start a CGEventTap + CFRunLoop on a dedicated thread.
 /// Wraps the common "spawn thread -> create tap (with retry) -> add runloop source -> block" flow.
-///
-/// - `location` / `placement` / `options`:见 tap_location / tap_placement / tap_options 模块。
-/// - `mask`:要监听的事件类型掩码(1u64 << event_type 的或)。
-/// - `callback`:事件回调。
-/// - `user_info`:传给 callback 的上下文指针(以 usize 承载以跨线程;0 = 不传)。
-///   调用方负责所指对象的生命周期。
-/// - `log_name`:日志标识(如 "kbd" / "mouse"),用于区分不同 tap 的日志。
-/// - `on_started`:tap 成功创建后、CFRunLoopRun 之前的回调(用于打印 tap 专属的启动日志)。
-///
-/// 返回 JoinHandle。线程在 CFRunLoopRun 内阻塞,直到 tap 被移除或线程被杀。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_event_tap_thread(
     location: i32,
@@ -625,7 +544,6 @@ pub(crate) fn start_event_tap_thread(
         let run_loop = CFRunLoopGetCurrent();
         control.register(created.tap, run_loop);
 
-        // 看门狗:系统可能在启动期/调试器下禁用 tap,挂定时器定期检查并自愈。
         // Watchdog: the system may disable the tap during busy startup or under a debugger;
         // attach a periodic check that self-heals it.
         let watchdog = start_tap_watchdog(created.tap, control.cancel_flag());
@@ -640,75 +558,51 @@ pub(crate) fn start_event_tap_thread(
     })
 }
 
-// ========== 滚轮事件字段常量 / scroll wheel event field constants ==========
-// 见 CGEventTypes.h。反转滚轮需要翻转 4 组字段,覆盖所有类型的消费者。
 // See CGEventTypes.h. Scroll reversal flips 4 field groups to cover all consumer types.
 
-/// 垂直滚动量(整数,行级)。field 11。
 /// Vertical scroll delta (integer, line-level). field 11.
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1: i32 = 11;
-/// 水平滚动量(整数,行级)。field 12。
 /// Horizontal scroll delta (integer, line-level). field 12.
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2: i32 = 12;
 
-/// 垂直滚动量(定点浮点,16.16 格式)。field 93。
 /// Vertical scroll delta (fixed-point, 16.16 format). field 93.
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1: i32 = 93;
-/// 水平滚动量(定点浮点,16.16 格式)。field 94。
 /// Horizontal scroll delta (fixed-point, 16.16 format). field 94.
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2: i32 = 94;
 
-/// 垂直滚动量(像素级)。field 96。
 /// Vertical scroll delta (pixel-level). field 96.
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1: i32 = 96;
-/// 水平滚动量(像素级)。field 97。
 /// Horizontal scroll delta (pixel-level). field 97.
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2: i32 = 97;
 
-/// 是否为连续(像素级)滚动事件。field 88。0=离散(行级),1=连续(触控板式)。
 /// Whether the event is continuous (pixel-level) scroll. field 88. 0=discrete (line), 1=continuous (trackpad).
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS: i32 = 88;
 
-// IOHIDEvent 层的滚轮字段(私有 API)。kIOHIDEventTypeScroll=6,字段 = (type<<16)|offset。
-// X(offset 0)= 393216, Y(offset 1)= 393217。
 // IOHIDEvent-level scroll fields (private API). kIOHIDEventTypeScroll=6, field = (type<<16)|offset.
-/// IOHIDEvent 垂直滚动字段。
 /// IOHIDEvent vertical scroll field.
 #[allow(dead_code)]
 pub(crate) const K_IOHID_EVENT_FIELD_SCROLL_X: u32 = 6 << 16;
-/// IOHIDEvent 水平滚动字段。
 /// IOHIDEvent horizontal scroll field.
 #[allow(dead_code)]
 pub(crate) const K_IOHID_EVENT_FIELD_SCROLL_Y: u32 = (6 << 16) | 1;
 
-// ========== 事件合成相关常量 / synthetic event constants ==========
-
-/// CGEventPost 的 tap location:kCGSessionEventTap=1。
-/// 合成事件 post 到 session 层,不经过 HID 层 tap,绕过系统自然滚动覆盖。
 /// CGEventPost tap location: kCGSessionEventTap=1.
 /// Synthetic events posted at session level bypass HID-level taps, avoiding the system's
 /// natural-scroll override at the HID layer.
 pub(crate) const K_CG_SESSION_EVENT_TAP: i32 = 1;
 
-/// CGEventCreateScrollWheelEvent2 的 units:kCGScrollEventUnitLine=1(行级,离散滚动)。
 /// CGEventCreateScrollWheelEvent2 units: kCGScrollEventUnitLine=1 (line-level, discrete scroll).
 pub(crate) const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 
-/// eventSourceUserData 字段(field 42)。用于在合成事件上打标记,防止自己的 tap 无限循环。
 /// eventSourceUserData field (field 42). Used to tag synthetic events so our own tap can
 /// recognize and skip them, preventing infinite loops.
 pub(crate) const K_CG_EVENT_SOURCE_USER_DATA: i32 = 42;
 
-/// eventSourceUnixProcessID 字段(field 41)。非 0 = 事件由该进程用 CGEventPost 注入;0 = 来自
-/// 硬件。用来区分"软件 KVM 注入的虚拟鼠标"(如 Deskflow)和真实设备:注入事件没有 IOHIDEvent
-/// sender(硬件按键事件同样经常拿不到),唯一稳定的判据就是这个字段。
-/// 实测:注入事件 pid = 注入进程,sourceStateID = 0(private);硬件事件 pid = 0,state = 1。
-///
 /// eventSourceUnixProcessID field (field 41). Non-zero = the event was injected via CGEventPost by
 /// that process; 0 = hardware. It tells a software-KVM virtual pointer (e.g. Deskflow) apart from a
 /// real device: injected events carry no IOHIDEvent sender (hardware button events often don't
@@ -717,7 +611,6 @@ pub(crate) const K_CG_EVENT_SOURCE_USER_DATA: i32 = 42;
 /// hardware events carry pid = 0 and state = 1.
 pub(crate) const K_CG_EVENT_SOURCE_UNIX_PROCESS_ID: i32 = 41;
 
-/// 合成事件标记魔数(ASCII "OMTSCRL")。写入 eventSourceUserData,我们的 tap 据此跳过。
 /// Synthetic-event marker magic (ASCII "OMTSCRL"). Written to eventSourceUserData so our tap
 /// can recognize and skip our own synthetic events.
 #[allow(clippy::unusual_byte_groupings)]

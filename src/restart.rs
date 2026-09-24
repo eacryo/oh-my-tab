@@ -1,7 +1,4 @@
 //! Controlled app relaunch after Accessibility is restored while an event tap is terminally disabled.
-//!
-//! 辅助功能恢复后若 tap 已收到终止性禁用事件，通过独立助手等当前进程退出再启动同一 `.app`。
-//! 助手在旧进程释放单实例锁后才调用 LaunchServices，避免旧 tap 被重新启用或新旧实例重叠。
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
@@ -23,7 +20,6 @@ pub(crate) fn restart_required() -> bool {
 }
 
 /// Called only after the supervisor observed Accessibility transition from untrusted to trusted.
-/// 仅在监视器确认辅助功能从未授权恢复为已授权后调用。
 pub(crate) fn accessibility_restored_after_terminal_tap() {
     if RESTART_REQUIRED.swap(true, Ordering::SeqCst) {
         return;
@@ -155,7 +151,6 @@ fn begin_relaunch(reason: &str) {
     }
 
     // The existing termination observer restores system pointer values before the old process exits.
-    // 现有退出通知会在旧进程结束前恢复系统指针设置。
     unsafe {
         let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![app, terminate: std::ptr::null::<AnyObject>()];
@@ -174,7 +169,6 @@ fn enclosing_app_bundle(executable: &Path) -> Option<PathBuf> {
 }
 
 /// Consume the private helper mode before normal AppKit startup. Returns true when handled.
-/// 在正常 AppKit 启动前处理内部助手模式；返回 true 表示参数已被消费。
 pub fn run_relaunch_helper_if_requested(args: &[String]) -> bool {
     if args.get(1).map(String::as_str) != Some(HELPER_ARGUMENT) {
         return false;
@@ -227,7 +221,6 @@ extern "C" {
 
 fn process_is_running(pid: i32) -> Result<bool, String> {
     // Signal zero checks process existence without delivering a signal.
-    // 信号 0 只检查进程是否存在，不会向进程发送实际信号。
     if unsafe { kill(pid, 0) } == 0 {
         return Ok(true);
     }

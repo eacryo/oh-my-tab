@@ -1,8 +1,3 @@
-//! 快捷操作模块:Option+I 打开设置、Option+E 打开访达、Option+D 显示桌面、Option+L 锁屏、双击 Control 显示鼠标位置。
-//! 独立 session 层 event tap(专用线程)拦截 Option+字母,事件经既有 bridge
-//! (GlobalEvent -> performSelectorOnMainThread)投递到主线程执行动作。
-//! 结构与 window_management.rs 相同:专用线程 + RunLoop 引用 + 停止标志。
-//!
 //! Quick-actions module: Option+I opens Settings, Option+E opens Finder, Option+D shows the
 //! desktop, Option+L locks the screen, and double-Control locates the pointer. A dedicated
 //! session-level event tap (own thread) intercepts Option+letters and Control transitions; events
@@ -28,14 +23,11 @@ use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-// ========== 键盘事件常量 / keyboard event constants ==========
-// 键码来自 Carbon HIToolbox Events.h(kVK_ANSI_I/E/D/L)。
 // Keycodes are from Carbon HIToolbox Events.h (kVK_ANSI_I/E/D/L).
 const K_VK_I: u16 = 34;
 const K_VK_E: u16 = 14;
 const K_VK_D: u16 = 2;
 const K_VK_L: u16 = 37;
-// 修饰键位掩码:必须恰好是 Option(带其他修饰键的组合透传,与 Option+方向键同规则)。
 // Modifier masks: exactly Option is required; combos with extra modifiers pass through
 // (same rule as Option+arrows).
 use crate::event_tap::keyboard::{
@@ -49,7 +41,6 @@ const K_DOUBLE_CONTROL_INTERVAL: Duration = Duration::from_millis(350);
 static CONTROL_DOWN: AtomicBool = AtomicBool::new(false);
 static LAST_CONTROL_PRESS: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 
-/// 快捷动作。数值顺序经 NSNumber 跨线程传递(bridge -> 主线程),只能追加不能重排。
 /// Quick actions. The numeric order crosses threads via NSNumber (bridge -> main thread);
 /// append-only, never reorder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +53,6 @@ pub(crate) enum QuickAction {
 }
 
 impl QuickAction {
-    /// 从 bridge 传来的整数还原动作(未知值静默丢弃)。
     /// Rebuild an action from the bridge integer (unknown values are dropped).
     pub(crate) fn from_isize(v: isize) -> Option<Self> {
         match v {
@@ -86,7 +76,6 @@ impl QuickAction {
     }
 }
 
-/// 动作是否被配置启用(总开关 + 该动作的独立开关)。
 /// Whether an action is enabled by config (master switch + the action's own switch).
 fn action_enabled(action: QuickAction) -> bool {
     crate::config::CONFIG
@@ -104,10 +93,6 @@ fn action_enabled(action: QuickAction) -> bool {
         .unwrap_or(false)
 }
 
-/// tap 回调:处理 Option+I/E/D/L 与双击 Control。Option 组合启用时吞掉 keyDown/keyUp
-/// 并把非自动重复的 keyDown 投递给主线程;Control flagsChanged 始终透传给系统。
-/// 自己是前台 App 时,仅在设置文本框正在编辑时透传,避免把整个设置窗口误判为输入场景。
-///
 /// The tap callback handles Option+I/E/D/L and double-Control. Enabled Option combos are
 /// swallowed and non-autorepeat keyDowns are forwarded to the main thread; Control
 /// flagsChanged events always pass through to the system. When our app is frontmost, it passes
@@ -162,8 +147,6 @@ unsafe extern "C" fn quick_actions_tap_callback(
     if flags & K_FLAG_OPTION == 0 || flags & (K_FLAG_COMMAND | K_FLAG_SHIFT | K_FLAG_CONTROL) != 0 {
         return event;
     }
-    // 本应用合成的组合键(鼠标映射 Key Press post 到 HID 层后会回到 session tap):
-    // 必须透传,否则映射了 Option+字母的侧键会被这里劫持。
     // Our own synthesized combos (mouse Key Press mappings post at HID level and loop back
     // into session taps) must pass through, or a side button mapped to Option+letter gets
     // hijacked here.
@@ -178,7 +161,6 @@ unsafe extern "C" fn quick_actions_tap_callback(
         return event;
     }
     if event_type == K_CG_EVENT_KEY_DOWN {
-        // 忽略系统自动重复:动作是幂等的一次性触发,按住不放只应触发一次。
         // Ignore system autorepeat: the actions are idempotent one-shots; holding the key
         // should fire once.
         let autorepeat = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT);
@@ -187,12 +169,10 @@ unsafe extern "C" fn quick_actions_tap_callback(
             crate::enqueue_global_event(GlobalEvent::QuickAction(action as u8));
         }
     }
-    // 吞掉匹配的 keyDown/keyUp(含自动重复),应用看不到这组组合键。
     // Swallow matching keyDown/keyUp (autorepeat included); apps never see the combo.
     std::ptr::null_mut()
 }
 
-/// 运行时启用快捷操作(设置页热切换 / 启动路径共用)。幂等。
 /// Enable quick actions at runtime (shared by the settings hot-switch and the startup path).
 /// Idempotent.
 pub(crate) fn start() {
@@ -213,7 +193,6 @@ pub(crate) fn start() {
     log_info!("Quick actions enabled.");
 }
 
-/// 运行时停用快捷操作(设置页热切换)。幂等。
 /// Disable quick actions at runtime (settings hot-switch). Idempotent.
 pub(crate) fn stop() {
     TAP_CONTROL.stop();
@@ -228,14 +207,12 @@ static TAP_CONTROL: event_tap::TapThreadControl = event_tap::TapThreadControl::n
 static QA_THREAD: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
 
 fn spawn_tap_thread() -> thread::JoinHandle<()> {
-    // 监听掩码:keyDown + keyUp + flagsChanged(Control 双击边沿)。
     // Listen mask: keyDown + keyUp + flagsChanged (the double-Control edge).
     let mask: CGEventMask = (1u64 << K_CG_EVENT_KEY_DOWN)
         | (1u64 << K_CG_EVENT_KEY_UP)
         | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
     thread::spawn(move || unsafe {
         crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
-        // session 层 tap:与切换器同层,能拦截真实硬件按键;DEFAULT_TAP 才能吞事件。
         // Session-level tap: same layer as the switcher, sees real hardware keys; DEFAULT_TAP
         // is required to swallow events.
         let created = event_tap::create_tap_with_retry(
@@ -267,18 +244,14 @@ fn spawn_tap_thread() -> thread::JoinHandle<()> {
     })
 }
 
-/// 主线程:执行一个快捷动作(bridge 投递过来)。
 /// Main thread: run one quick action (delivered by the bridge).
 pub(crate) fn apply_action(action: QuickAction) {
-    // 事件可能排队到功能关闭之后才被主线程执行,先复核开关。
     // The event may land on the main thread after the feature was switched off; re-check.
     if !action_enabled(action) {
         return;
     }
     match action {
         QuickAction::OpenSettings => {
-            // 打开系统设置(x-apple.systempreferences: URL scheme 由系统设置注册,
-            // openURL: 会拉起/置前系统设置)。「打开设置」指系统设置,不是本应用的设置窗口。
             // Open System Settings (the x-apple.systempreferences: URL scheme is registered by
             // System Settings; openURL: launches or raises it). "Open Settings" refers to the
             // system's settings, not this app's window.
@@ -288,7 +261,6 @@ pub(crate) fn apply_action(action: QuickAction) {
             unsafe { open_new_finder_window() };
         }
         QuickAction::ShowDesktop => {
-            // 与鼠标系统动作同路径:Dock 通知触发系统「显示桌面」。
             // Same path as the mouse system action: the Dock notification triggers the
             // system's Show Desktop.
             crate::mouse::system_action::fire("com.apple.showdesktop.awake");
@@ -298,10 +270,8 @@ pub(crate) fn apply_action(action: QuickAction) {
     }
 }
 
-/// 合成系统的 Control+Command+Q 锁屏快捷键并立即返回,避免阻塞主线程。
 /// Synthesize macOS's Control+Command+Q lock-screen shortcut without blocking the main thread.
 fn lock_screen() {
-    // macOS 26 已移除旧版 CGSession 命令路径,使用公开 CoreGraphics 事件接口触发系统快捷键。
     // macOS 26 removed the legacy CGSession path, so use the public CoreGraphics event API.
     const KEYCODE_Q: u16 = 12;
     const K_FLAG_COMMAND_CONTROL: CGEventFlags = K_FLAG_COMMAND | K_FLAG_CONTROL;
@@ -309,7 +279,6 @@ fn lock_screen() {
         let down = CGEventCreateKeyboardEvent(std::ptr::null(), KEYCODE_Q, true);
         let up = CGEventCreateKeyboardEvent(std::ptr::null(), KEYCODE_Q, false);
         if down.is_null() || up.is_null() {
-            // 创建出的一半也有 +1 所有权:失败路径必须释放非空的那个,否则泄漏。
             // Whichever half was created still carries +1 ownership: the failure path must
             // release the non-null one or it leaks.
             if !down.is_null() {
@@ -331,30 +300,19 @@ fn lock_screen() {
     log_debug!("[quick] lock screen requested");
 }
 
-/// 打开系统设置:x-apple.systempreferences: URL scheme,LaunchServices 拉起/置前系统设置。
 /// Open System Settings via the x-apple.systempreferences: URL scheme; LaunchServices
 /// launches or raises System Settings.
 unsafe fn open_system_settings() {
     let url_str = make_nsstring("x-apple.systempreferences:");
-    // URLWithString: 返回自动释放的 NSURL(+0),不归调用者所有,不要 CFRelease。
     // URLWithString: returns an autoreleased NSURL (+0) we do not own; never CFRelease it.
     let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_str];
     CFRelease(url_str as *const c_void);
     let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-    // openURL: 返回 BOOL;objc2 在 debug 下校验返回类型编码,必须用 bool 接收。
     // openURL: returns BOOL; objc2 validates the return encoding, so receive it as bool.
     let opened: bool = msg_send![workspace, openURL: url];
     log_debug!("[quick] System Settings opened: {}", opened);
 }
 
-/// 打开一个「新的」访达窗口并最大化(Win+E 语义:每次都新开,而非把旧窗口调到前台)。
-/// openURL: 对已在访达中显示的文件夹会去重、只置前旧窗口,不满足需求。
-/// 做法:先激活访达(带 IgnoreOtherApps),再用 CGEventPostToPid 向访达进程定向投递一次
-/// Cmd+N——pid 定向投递不依赖激活时序,事件一定由访达自己处理并新建窗口。
-/// 新窗口由访达异步创建:记录 Cmd+N 前的焦点窗口 ID,轮询等焦点窗口变成「另一个 ID」
-/// (即新窗口出现)后立即最大化(等效绿色缩放按钮,非全屏)。AX 调用需主线程,本函数
-/// 经 bridge 已在主线程。
-/// 应用本身持有辅助功能权限(事件 tap 依赖),合成按键与 AX 操作合法。
 /// Open a NEW, maximized Finder window every time (Win+E semantics; openURL: dedupes and
 /// only raises an existing window showing the folder). Activate Finder first
 /// (IgnoreOtherApps), then post one Cmd+N straight to Finder's process via CGEventPostToPid
@@ -368,20 +326,16 @@ unsafe fn open_system_settings() {
 unsafe fn open_new_finder_window() {
     let mut finder_app = find_finder_app();
     if finder_app.is_null() {
-        // 访达未运行:openURL: 走 LaunchServices 拉起访达并打开个人文件夹(带窗口),
-        // 等它启动后同样把窗口最大化。
         // Finder not running: openURL: launches it via LaunchServices with the home folder;
         // wait for the launch, then maximize the window the same way.
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
         let path = make_nsstring(&home);
-        // fileURLWithPath: 返回自动释放的 NSURL(+0),不归调用者所有,不要 CFRelease。
         // fileURLWithPath: returns an autoreleased NSURL (+0) we do not own; never release.
         let url: *mut AnyObject = msg_send![class!(NSURL), fileURLWithPath: path];
         CFRelease(path as *const c_void);
         let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         let opened: bool = msg_send![workspace, openURL: url];
         log_debug!("[quick] Finder launched with home folder: {}", opened);
-        // 冷启动可能要数秒:最多等 ~4s。
         // Cold start can take seconds: wait up to ~4s.
         for _ in 0..20 {
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -395,7 +349,6 @@ unsafe fn open_new_finder_window() {
             return;
         }
         let pid: i32 = msg_send![finder_app, processIdentifier];
-        // 启动参数打开的文件夹窗口即新窗口;等它注册到 AX 后最大化。
         // The launch-opened folder window IS the new window; maximize once it shows in AX.
         for _ in 0..12 {
             std::thread::sleep(std::time::Duration::from_millis(150));
@@ -409,11 +362,8 @@ unsafe fn open_new_finder_window() {
     }
 
     let pid: i32 = msg_send![finder_app, processIdentifier];
-    // Cmd+N 前的焦点窗口:轮询时用它区分「新窗口出现」与「旧窗口仍在」。
     // The focused window before Cmd+N: lets the poll tell the new window from the old one.
     let prev_cgwid = crate::window_management::focused_cgwid_of_pid(pid);
-    // NSApplicationActivateIgnoringOtherApps = 1 << 1;activateWithOptions: 返回 BOOL,
-    // 必须用 bool 接收(objc2 debug 下校验返回类型编码)。
     // NSApplicationActivateIgnoringOtherApps = 1 << 1; activateWithOptions: returns BOOL and
     // must be received as bool (objc2 validates return encodings in debug builds).
     let activated: bool = msg_send![finder_app, activateWithOptions: 2isize];
@@ -433,7 +383,6 @@ unsafe fn open_new_finder_window() {
     log_debug!("[quick] new Finder window did not appear in time");
 }
 
-/// 在运行应用列表里找访达(返回 NSRunningApplication,+0 引用,不归调用者所有)。
 /// Find Finder in the running applications (returns an NSRunningApplication, a +0 reference
 /// we do not own).
 unsafe fn find_finder_app() -> *mut AnyObject {
@@ -444,8 +393,6 @@ unsafe fn find_finder_app() -> *mut AnyObject {
     let mut found: *mut AnyObject = std::ptr::null_mut();
     for i in 0..count {
         let app: *mut AnyObject = msg_send![apps, objectAtIndex: i as isize];
-        // bundleIdentifier 是 copy 属性的 getter,返回 +0 引用(不归调用者所有),
-        // 不应 CFRelease(提前释放会在池排空时二次释放,段错误)。
         // bundleIdentifier is a copy-property getter returning a +0 reference we do NOT own;
         // never CFRelease it (early release double-frees when the pool drains).
         let bundle: *mut AnyObject = msg_send![app, bundleIdentifier];
@@ -462,8 +409,6 @@ unsafe fn find_finder_app() -> *mut AnyObject {
     found
 }
 
-/// 向指定进程定向投递一次 Cmd+N(按下 + 抬起)。事件进入该进程自己的队列,由它处理,
-/// 因此不受其他应用焦点切换影响。
 /// Post one Cmd+N (down + up) targeted at the given process. The event enters that process's
 /// own queue and is handled by it, so focus changes in other apps cannot steal it.
 unsafe fn post_cmd_n_to_pid(pid: i32) {
@@ -471,7 +416,6 @@ unsafe fn post_cmd_n_to_pid(pid: i32) {
     extern "C" {
         fn CGEventPostToPid(pid: i32, event: CGEventRef);
     }
-    // kVK_ANSI_N = 45(与 shortcut.rs 的 "n" -> 0x2D 一致)。
     // kVK_ANSI_N = 45 (matches shortcut.rs's "n" -> 0x2D).
     const KEY_N: u16 = 0x2D;
     const K_FLAG_COMMAND: CGEventFlags = keyboard::FLAG_COMMAND;
@@ -482,7 +426,6 @@ unsafe fn post_cmd_n_to_pid(pid: i32) {
     CGEventPostToPid(pid, down);
     std::thread::sleep(std::time::Duration::from_millis(30));
     CGEventPostToPid(pid, up);
-    // CGEventCreateKeyboardEvent 返回 +1,用完释放。
     // CGEventCreateKeyboardEvent returns +1; release after use.
     CFRelease(down as *const c_void);
     CFRelease(up as *const c_void);

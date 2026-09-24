@@ -1,7 +1,5 @@
-//! WindowServer 生命周期通知的最小适配层。
 //! Minimal adapter for WindowServer lifecycle notifications.
 //!
-//! 这里只负责注册生命周期/聚焦通知和转发事件；窗口数据仍由现有快照收集器确认。
 //! This layer only registers lifecycle/focus notifications and forwards events; the existing
 //! snapshot collector remains authoritative for window data.
 
@@ -72,7 +70,6 @@ static ACTIVATIONS: LazyLock<Mutex<HashMap<i32, ActivationState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static OWN_FOCUS_INTENT: LazyLock<Mutex<Option<OwnFocusIntent>>> =
     LazyLock::new(|| Mutex::new(None));
-// 监听索引与显示列表分离:CG 里暂时未被 AX 展示的窗口仍需能反查 owner PID。
 // Keep the observation index separate from the display list so CG windows temporarily omitted
 // by AX can still be resolved back to their owner PID.
 #[derive(Default)]
@@ -105,7 +102,6 @@ fn registry_from_subscriptions(subscriptions: &[(u32, i32)]) -> WindowRegistry {
     registry
 }
 
-// 连接 ID 由 skylight.rs 统一加载并缓存;本模块按接口签名需要 i32。
 // The connection ID is loaded and cached centrally in skylight.rs; this module's
 // interface signatures want it as i32.
 static MAIN_CONNECTION: LazyLock<Option<i32>> =
@@ -150,7 +146,6 @@ unsafe fn window_server_callback_inner(
     if let Some(sender) = EVENT_TX.get() {
         // WindowServer callbacks must never wait for the bridge thread. Lifecycle refreshes
         // provide a later authoritative snapshot if a low-value duplicate is dropped.
-        // WindowServer 回调绝不能等待桥接线程；后续生命周期刷新会补齐被丢弃的低价值重复事件。
         if let Err(flume::TrySendError::Full(_)) = sender.try_send(event) {
             let dropped = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped == 1 || dropped.is_multiple_of(64) {
@@ -218,14 +213,12 @@ pub(crate) fn start() {
         })
         .expect("spawn window-server event bridge");
 
-    // 保留函数指针的读取，确保缺少订阅符号时不会在运行中静默退化。
     // Keep the function pointer read explicit so a missing subscription symbol cannot silently
     // degrade after registration succeeds.
     let _ = request;
     log_debug!("WindowServer lifecycle notifications started");
 }
 
-/// 将 WindowServer 事件合并到有界主线程队列。
 /// Coalesce WindowServer events into a bounded main-thread queue.
 fn enqueue_main_event(event: WindowServerEvent) {
     let mut events = MAIN_EVENTS.lock().unwrap();
@@ -275,7 +268,6 @@ fn enqueue_main_event(event: WindowServerEvent) {
     events.push_back(event);
 }
 
-/// 记录一次由切换器发起的目标窗口聚焦，避免后续 808 被误判成外部激活。
 /// Record a switcher-initiated target focus so its following 808 is not mistaken for
 /// an external activation.
 pub(crate) fn note_own_focus(pid: i32, window_id: u32) {
@@ -286,7 +278,6 @@ pub(crate) fn note_own_focus(pid: i32, window_id: u32) {
     });
 }
 
-/// 为一次 App 激活建立焦点状态；激活产生的第一个 808 是真实焦点，后续快照内窗口视为 raise 尾部。
 /// Start activation focus state: the first 808 is the real focus and later windows in the
 /// activation snapshot are treated as the raise tail.
 pub(crate) fn begin_activation(pid: i32, window_ids: &[u32], activated_at: Instant) {
@@ -327,7 +318,6 @@ pub(crate) fn activation_token(pid: i32) -> Option<Instant> {
         .map(|state| state.activated_at)
 }
 
-/// 判断 WindowServer 的 808 是否应提升 MRU；这是主线程上的状态转移入口。
 /// Decide whether a WindowServer 808 should bump MRU; this is the main-thread state transition.
 pub(crate) fn focus_should_bump(pid: i32, window_id: u32) -> bool {
     let now = Instant::now();
@@ -365,7 +355,6 @@ pub(crate) fn focus_should_bump(pid: i32, window_id: u32) -> bool {
     true
 }
 
-/// AX focused-window 查询只在 808 尚未到达时作为 backstop。
 /// The AX focused-window query is a backstop only until a real 808 arrives.
 pub(crate) fn ax_focus_backstop_allowed(pid: i32) -> bool {
     let now = Instant::now();
@@ -385,7 +374,6 @@ pub(crate) fn ax_focus_backstop_allowed(pid: i32) -> bool {
     }
 }
 
-/// 更新 WindowServer 的监听集合，同时保存 PID -> 多窗口和 CGWindowID -> PID 索引。
 /// Update WindowServer subscriptions and retain both PID -> many windows and CGWindowID -> PID
 /// indexes.
 pub(crate) fn update_subscriptions(subscriptions: &[(u32, i32)]) {
@@ -436,7 +424,6 @@ pub(crate) fn owner_for_window(window_id: u32) -> Option<i32> {
 }
 
 /// Resolve a destroyed window from the live subscription index or its short-lived history.
-/// 销毁通知可能晚于一次订阅刷新到达,所以在短 TTL 内保留最近 owner,不凭 CG 反查猜 PID。
 /// Resolve a destroyed window from the live subscription index or its short-lived history.
 /// Destruction can arrive after a subscription refresh, so retain the recent owner briefly
 /// instead of guessing a PID from a post-destruction CG lookup.

@@ -1,12 +1,7 @@
-//! 剪贴板子系统 · model:数
-//! 据
+//! Clipboard subsystem · model: captured entries, grouping, and filters.
 
 use super::*;
 
-// ========== 纯逻辑(可测)/ pure logic (testable) ==========
-
-/// 详情文档高度的保守回退估算：显式换行符单独成行，字符单位只用于无 AppKit 测量时的
-/// 预估，不参与列表正文的实际截断。
 /// Conservative fallback for detail document height: explicit newlines start a new line. The
 /// character units are only used when AppKit measurement is unavailable and never truncate list content.
 pub(super) fn estimate_lines(text: &str, max_units: usize) -> usize {
@@ -29,8 +24,6 @@ pub(super) fn estimate_lines(text: &str, max_units: usize) -> usize {
     lines
 }
 
-/// 详情面板可用宽 → 每行可容纳的显示宽度单位,与行按钮同一估算口径
-/// (50 单位 ≈ 行内容宽 ≈ 346pt)。
 /// Detail-panel content width -> per-line width units, using the same estimate as the row
 /// buttons (50 units fit the row content width ≈ 346pt).
 pub(super) fn detail_text_units(width: f64) -> usize {
@@ -38,30 +31,24 @@ pub(super) fn detail_text_units(width: f64) -> usize {
     ((width * units_per_pt).floor() as usize).max(1)
 }
 
-/// 行内容可用宽度:窗口宽 - 两翼留白 - 来源图标 - 图标间隙 - 操作按钮条。
 /// The row content's usable width: window - both paddings - icon - icon gap - actions.
 pub(super) fn content_width() -> f64 {
-    // 内容按钮宽:窗口 - 列表边距 - 行内左右内边距(新设计稿 padding 13/11)。
     // The content button's width: window - list margins - the row's L/R padding.
     PICKER_W - PAD_X * 2.0 - ROW_PAD_L - ROW_PAD_R
 }
 
-/// 是否显示来源应用(读 CONFIG;记录始终进行,开关同时控制行内副信息的名称和图标)。
 /// Whether the source app is shown (reads CONFIG; recording is always on, the toggle gates
 /// both the name and icon in the row's meta line).
 pub(super) fn show_source_app() -> bool {
     CONFIG.read().unwrap().clipboard.show_source_app
 }
 
-/// 来源图标和来源名称属于同一个显示开关;缺少图标缓存键时也无需尝试读取文件。
 /// The source icon and name share one display switch; without an icon-cache key there is no
 /// file to load either.
 pub(super) fn should_show_source_icon(show_source: bool, entry: &ClipEntry) -> bool {
     show_source && !entry.source_key.is_empty()
 }
 
-/// 行内副信息(应用名 · 相对时间 · 行数):正文下方的小字,按设计稿 10px 浅灰。
-/// 类型提示改由正文本身的着色/字体表达(URL 蓝、代码等宽),副信息不再挂角标。
 /// The row's meta line (app · relative time · line count): the small text below the content,
 /// 10px light gray per the mockup. The kind cue moved INTO the content itself (blue URLs,
 /// monospaced code); the meta line carries no badge.
@@ -77,7 +64,6 @@ pub(super) fn build_meta_text(entry: &ClipEntry, show_source: bool) -> String {
     if let Some(ts) = entry.copied_at {
         parts.push(relative_time_label(ts, now_secs()));
     }
-    // 只报告原文的真实换行,不把列表控件的自动折行误报成多行。
     // Report only source line breaks; never mistake the list cell's soft wrapping for them.
     if entry.image.is_none() {
         if let Some(count) = physical_line_count(&entry.text) {
@@ -94,7 +80,6 @@ pub(super) fn build_meta_text(entry: &ClipEntry, show_source: bool) -> String {
     parts.join(" · ")
 }
 
-/// 含真实换行时返回物理行数;单行文本返回 None,以免污染普通条目的 meta 行。
 /// Return physical line count when source newlines exist; omit it for ordinary single-line text.
 pub(super) fn physical_line_count(text: &str) -> Option<usize> {
     if text.contains('\n') {
@@ -104,7 +89,6 @@ pub(super) fn physical_line_count(text: &str) -> Option<usize> {
     }
 }
 
-/// 相对时间:刚刚 / 今天 HH:mm / 昨天 HH:mm / 更早 MM-dd HH:mm(本地时区)。
 /// Relative time: Just now / Today HH:mm / Yesterday HH:mm / older MM-dd HH:mm (local tz).
 pub(super) fn relative_time_label(ts: u64, now: u64) -> String {
     if now.saturating_sub(ts) < 60 {
@@ -119,7 +103,6 @@ pub(super) fn relative_time_label(ts: u64, now: u64) -> String {
     }
 }
 
-/// 本地日期序号(年 × 366 + 年内第几天):同一天相减 = 0,昨天 = 1(与 DST 无关)。
 /// The local day ordinal (year*366 + yday): same-day diff = 0, yesterday = 1 (DST-proof).
 pub(super) fn day_no(unix_secs: u64) -> i64 {
     unsafe {
@@ -130,7 +113,7 @@ pub(super) fn day_no(unix_secs: u64) -> i64 {
     }
 }
 
-/// 时间戳 → 本地 HH:mm / timestamp -> local HH:mm.
+/// timestamp -> local HH:mm.
 pub(super) fn local_hhmm(unix_secs: u64) -> String {
     unsafe {
         let mut tm: Tm = std::mem::zeroed();
@@ -140,7 +123,6 @@ pub(super) fn local_hhmm(unix_secs: u64) -> String {
     }
 }
 
-/// 时间分组:今天 / 昨天 / 更早(按本地日序号)。无时间戳的旧条目归入更早。
 /// Time group: Today / Yesterday / Earlier (by the local day ordinal). Legacy entries
 /// without a timestamp join Earlier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +143,7 @@ pub(super) fn day_group(ts: Option<u64>) -> DayGroup {
     }
 }
 
-/// 分组头文字(轻量分隔)/ the group header's label.
+/// the group header's label.
 pub(super) fn group_label(g: DayGroup) -> String {
     match g {
         DayGroup::Today => t("clipboard.group_today"),
@@ -170,15 +152,12 @@ pub(super) fn group_label(g: DayGroup) -> String {
     }
 }
 
-/// 行内容高度:统一固定 61pt(设计稿 min-height 61px,内容垂直居中)。
 /// The row content height: uniformly 61pt (the mockup's min-height 61px, content
 /// vertically centered).
 pub(super) fn row_content_h(_entry: &ClipEntry) -> f64 {
     ROW_H
 }
 
-/// 计算一批条目的每行行距。**每条目标定同一行距** = 内容高 + 行距;分组边界
-/// 前插入分组头高度(列表筛完后的显示顺序下,时间跨组必然正确)。
 /// Compute the per-row pitches. **Every entry keeps ONE fixed pitch** = content + row gap;
 /// a group-header height is inserted before the first row of each group (computed on the
 /// FILTERED display order, so time boundaries stay correct under filtering).
@@ -199,24 +178,19 @@ pub(super) fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
         .collect()
 }
 
-/// 固定头部条高度:顶部留白 + 搜索框/筛选/清除按钮行 + 与列表的间距。
 /// The fixed header strip's height: top padding + the search/filter/clear row + the gap
 /// to the list.
-/// 固定头部条高度:搜索栏区(14 + 48 + 8)+ 筛选行(38),镜像设计稿。
 /// The fixed header strip: the search zone (14 + 48 + 8) + the filters row (38).
 pub(super) fn header_strip_h() -> f64 {
     TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y + FILTERS_H
 }
 
-/// 浮窗最小高度按三条同组记录的完整布局计算,所有状态共用,避免布局调整后出现漂移。
 /// Calculate the picker minimum from three same-group records and use it for every state, so it
 /// stays aligned when row or surrounding-region dimensions change.
 pub(super) fn picker_min_height() -> f64 {
     (header_strip_h() + GROUP_H + ROW_H * 3.0 + FOOTER_H + PAD_Y).max(PICKER_MIN_HEIGHT)
 }
 
-/// 文档内行列表的顶部偏移:仅保留与头部条的间距(头部条已不在滚动区内,
-/// 不再需要为它让位 38pt——那会留下"第一条与搜索框之间的奇怪空白")。
 /// The row list's top offset INSIDE the document: just the gap to the header strip (the
 /// strip is no longer inside the scroll area, so no 38pt clearance is needed -- that left
 /// the odd blank band between the first row and the search field).
@@ -224,14 +198,11 @@ pub(super) fn rows_top_offset() -> f64 {
     CLEAR_BTN_GAP
 }
 
-/// 第 idx 行的顶部 y(flipped 坐标):rows_top_offset + 前 idx 行行距之和。
 /// The top y of row `idx` (flipped coords): rows_top_offset + the pitches before it.
 pub(super) fn row_top(idx: usize, pitches: &[f64]) -> f64 {
     rows_top_offset() + pitches.iter().take(idx).sum::<f64>()
 }
 
-/// 一次性算出每行顶边偏移(前缀和):逐行调 `row_top` 会让整段布局变成 O(n²),
-/// 行多时在重建/滚动路径上白烧 CPU。
 /// Compute every row's top offset in one pass (prefix sums): calling `row_top` per row
 /// turns a full layout into O(n^2), burning CPU on the rebuild/scroll path as rows grow.
 pub(super) fn row_offsets(pitches: &[f64]) -> Vec<f64> {
@@ -244,8 +215,6 @@ pub(super) fn row_offsets(pitches: &[f64]) -> Vec<f64> {
     offsets
 }
 
-/// u64 以十六进制字符串序列化:TOML 整数是 i64,高位置位的 hash 直接序列化会失败
-/// ("u64 value out of range"),哈希必须走字符串。
 /// u64 serialized as a hex string: TOML integers are i64, so hashes with the high bit
 /// set would fail to serialize ("u64 value out of range"); hashes must go as strings.
 pub(super) mod u64_hex {
@@ -261,17 +230,6 @@ pub(super) mod u64_hex {
     }
 }
 
-/// 图片条目,两种形态:
-/// - **数据条目**(图片数据复制):原始格式字节的**磁盘引用** + UTI + 降采样 PNG
-///   预览。原始字节不驻内存:录制时算 hash 写入缓存文件,粘贴时按需读回、按 `uti`
-///   原样写回(JPG 粘回 JPG、GIF 动图粘回动图);预览只供缩略图(动图取第一帧)。
-/// - **文件复制条目**(Finder 复制图片文件):复制时读一次文件内容(瞬时)算内容
-///   hash + 生成缩略图预览,字节丢弃(data_path 恒空,无影子副本)。hash 用于同内容
-///   去重(原文件与访达副本只留一条);`source_path` 记录来源。粘贴时恢复
-///   `public.file-url`,把"文件"而不是"图片数据"交回给目标应用(Finder 复制原文件、
-///   聊天应用附加文件,GIF 动画因此完整保留;若把图片数据当纯图片粘贴,Finder 会
-///   直接忽略,部分应用还会重编码成 PNG);源文件被删/移动后该条目粘贴即失效。
-///
 /// An image entry, in two forms:
 /// - a DATA entry (image-data copy): a DISK reference to the original-format bytes + its
 ///   UTI + a downsampled PNG preview. The original bytes never stay in memory: hashed and
@@ -288,29 +246,19 @@ pub(super) mod u64_hex {
 ///   PNG by some apps); a deleted/moved source makes the entry unpastable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct ImageEntry {
-    /// 原始格式的 UTI(public.png / public.jpeg / com.compuserve.gif ...)。
     /// The original format's UTI (public.png / public.jpeg / com.compuserve.gif ...).
     pub(super) uti: String,
-    /// 原始字节的内容哈希(FNV-1a):数据条目 = 缓存文件名 + 查重键;文件复制条目 =
-    /// 同内容去重键 + 预览文件名。解码失败的退化文件条目为 0。序列化为十六进制
-    /// 字符串(TOML 整数放不下 64 位无符号)。
     /// The original bytes' content hash (FNV-1a): the cache filename + dedup key for data
     /// entries; the content-dedup key + preview filename for file-copy entries. 0 for a
     /// degenerate file entry whose decode failed. Serialized as a hex string (TOML
     /// integers can't hold 64-bit unsigned values).
     #[serde(with = "u64_hex")]
     pub(super) hash: u64,
-    /// 原始格式字节的缓存文件路径(仅数据条目;文件复制条目恒空——粘贴走 file-url)。
-    /// 序列化时跳过:加载时由 hash 重建。
     /// The cache file holding the original-format bytes (data entries only; always empty
     /// for file-copy entries -- pasting goes through the file-url). Skipped in
     /// serialization: rebuilt from the hash on load.
     #[serde(skip)]
     pub(super) data_path: std::path::PathBuf,
-    /// 降采样 PNG 预览(缩略图绘制用;唯一常驻内存的图片字节,约 100-300KB)。
-    /// 序列化时跳过:预览单独落盘为 `{hash}.preview`,加载时读回(缺失则从数据字节
-    /// 或源文件重新生成)。用 `Arc` 持有:历史快照(持久化派发、详情展示)只需克隆
-    /// 引用计数,避免每次复制都深拷贝整本图片预览。
     /// A downsampled PNG preview (thumbnail drawing; the only image bytes held in memory,
     /// ~100-300KB). Skipped in serialization: the preview lives separately as
     /// `{hash}.preview` and is read back on load (regenerated from the data bytes or the
@@ -319,35 +267,26 @@ pub(super) struct ImageEntry {
     /// copy.
     #[serde(skip)]
     pub(super) preview_png: Arc<Vec<u8>>,
-    /// 文件复制的来源路径(None = 数据条目,纯图片复制)。
     /// The source path of a file copy (None = a data entry, a bare image copy).
     pub(super) source_path: Option<String>,
 }
 
-/// 历史条目:文本 + 置顶标记 + 来源应用名 + 来源图标缓存键。置顶条目恒在列表顶部。
 /// A history entry: text + a pinned flag + the source app name + the source icon-cache key.
 /// Pinned entries stay at the top.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct ClipEntry {
     pub(super) text: String,
-    /// 图片条目(原始格式 + 预览;文本条目为 None)。图文同存时文本优先,
-    /// 图片仅在剪贴板无文本时记录。
     /// An image entry (original format + preview; None for text entries). When both text
     /// and an image are on the pasteboard, text wins -- images are only recorded when
     /// there is no text.
     pub(super) image: Option<ImageEntry>,
     pub(super) pinned: bool,
-    /// 复制该文本时的前台应用名(空 = 未知,如旧条目/取不到前台应用)。
     /// The frontmost app name when the text was copied (empty = unknown, e.g. legacy entries
     /// or an unavailable frontmost app).
     pub(super) source_app: String,
-    /// 来源应用的图标缓存键(resolve_app_identity: bundle id > exec 路径哈希 > pid)。
-    /// 空 = 取不到身份(旧条目等),标题栏不显示图标。
     /// The source app's icon-cache key (resolve_app_identity: bundle id > exec-path hash >
     /// pid). Empty = no identity (e.g. legacy entries) -> no icon in the header.
     pub(super) source_key: String,
-    /// 复制时间戳(unix 秒):自动过期的依据,去重移前时刷新为最近一次复制时间。
-    /// None = 旧版本条目(无时间戳),不参与过期——保守迁移,避免误删。
     /// The copy timestamp (unix seconds): the basis of auto-expiry; refreshed to the
     /// latest copy time on dedup-move-to-front. None = a legacy entry (no timestamp),
     /// exempt from expiry -- a conservative migration, never wrongly deleted.
@@ -355,7 +294,7 @@ pub(super) struct ClipEntry {
     pub(super) copied_at: Option<u64>,
 }
 
-/// 当前 unix 秒。/ The current unix seconds.
+/// The current unix seconds.
 pub(super) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -363,11 +302,8 @@ pub(super) fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-// localtime_r 与 Tm 已统一到 ffi.rs(与 logger 同一份声明)。
 // localtime_r and Tm now live in ffi.rs (one declaration shared with the logger).
 
-/// 复制时间戳 → "MM-dd HH:mm"(本地时区;标题栏空间有限,省略年份)。
-/// 纯函数,单测覆盖格式。
 /// Copy timestamp -> "MM-dd HH:mm" (local time; the header bar is narrow, so the year is
 /// dropped). Pure function; the format is unit-tested.
 pub(super) fn format_copied_at(unix_secs: u64) -> String {
@@ -385,9 +321,6 @@ pub(super) fn format_copied_at(unix_secs: u64) -> String {
     }
 }
 
-/// 复制时间戳 → "YYYY-MM-DD HH.MM.SS"(本地时区,另存为的建议文件名后缀)。
-/// 时间部分刻意用点号而非冒号——冒号在 HFS+/Finder 里是非法/保留字符(macOS 截图
-/// 同款命名风格)。纯函数,单测覆盖格式。
 /// Copy timestamp -> "YYYY-MM-DD HH.MM.SS" (local time; the save-as suggested-filename
 /// suffix). The time part deliberately uses dots instead of colons -- colons are
 /// illegal/reserved in HFS+/Finder names (macOS screenshot naming style). Pure function;
@@ -409,8 +342,6 @@ pub(super) fn format_save_stamp(unix_secs: u64) -> String {
     }
 }
 
-/// 另存为建议文件名的时间戳:取条目的复制时间(copied_at);旧版本条目无时间戳,
-/// 退化为保存时刻(有总比无强,且旧条目会随过期策略淘汰)。
 /// The save-as suggested-filename stamp: the entry's copy time (copied_at); legacy
 /// entries without a timestamp degrade to the save moment (better than nothing, and
 /// legacy entries age out via expiry anyway).
@@ -418,7 +349,6 @@ pub(super) fn save_stamp_for(entry: &ClipEntry) -> String {
     format_save_stamp(entry.copied_at.unwrap_or_else(now_secs))
 }
 
-/// 自动过期 TTL(秒):0 天 = 永不过期 → None。从 CONFIG 实时读(设置热重载即生效)。
 /// The auto-expiry TTL in seconds: 0 days = never -> None. Read live from CONFIG (a hot
 /// reload takes effect immediately).
 pub(super) fn ttl_secs() -> Option<u64> {
@@ -433,10 +363,6 @@ pub(super) fn ttl_secs() -> Option<u64> {
     }
 }
 
-/// 清理过期条目(纯函数,同步):非置顶且 copied_at 存在且 `now - copied_at >= ttl`
-/// → 删除;置顶条目不参与过期;无时间戳(旧条目)不过期。图片缓存按引用规则同步清理
-/// (与 delete/truncate 一致:hash 仍被幸存条目引用则保留)。ttl_secs = None 表示
-/// 关闭,直接返回 0。返回删除条数。
 /// Expire entries (pure, synchronous): unpinned entries with a timestamp whose
 /// `now - copied_at >= ttl` are removed; pinned entries never expire; legacy entries
 /// without a timestamp never expire. Image cache files follow the reference rules
@@ -453,7 +379,6 @@ pub(super) fn expire_entries(
     let mut dropped = 0;
     let mut dropped_image_hashes = Vec::new();
     history.retain(|e| {
-        // 时间回拨(now < copied_at):saturating_sub 为 0,未到 ttl,天然安全。
         // Clock rollback (now < copied_at): saturating_sub yields 0, under ttl, safe.
         let expired = !e.pinned
             && e.copied_at
@@ -480,17 +405,10 @@ pub(super) fn expire_entries(
     dropped
 }
 
-// 图片去重哈希已在 crate::hash 统一实现;下方注释块为第二阶段(内容哈希)预案。
 // The dedup hash itself now lives in crate::hash; the block below is the phase-2
 // (content hash) plan.
 
 /*
-【第二阶段】图片内容哈希:解码 PNG → 画成 16x16 缩略图 → 对 TIFF 字节做 FNV-1a。
-同一张图即使被应用重新编码(字节不同)也得到相同哈希;解码失败回退原始字节哈希。
-第一阶段暂不使用(去重只按原始字节哈希,同图不同编码的去重留待后续启用)。
-启用时:去掉本块注释,并在 record_image 里恢复 image_content_hash 调用与
-ClipEntry.image_hash 字段(结构体、record_text、record_image、测试 helper 同步补回)。
-
 [PHASE 2] Image CONTENT hash: decode the PNG -> draw a 16x16 thumbnail -> FNV-1a over
 its TIFF bytes. Re-encoded copies of the same image (different bytes) hash identically;
 decoding failures fall back to the raw-byte hash. Deferred: phase 1 dedups by the raw
@@ -529,20 +447,16 @@ pub(super) unsafe fn image_content_hash(png: &[u8]) -> u64 {
 }
 */
 
-/// 新条目(非置顶)应插入的位置:置顶区之后(第一个非置顶条目的下标)。
 /// The insertion index for a new (unpinned) entry: right after the pinned block.
 pub(super) fn insert_position(history: &[ClipEntry]) -> usize {
     history.iter().take_while(|e| e.pinned).count()
 }
 
-/// 按文本查找条目下标;找不到返回 None。
 /// Find an entry's index by text; None when absent.
 pub(super) fn find_by_text(history: &[ClipEntry], text: &str) -> Option<usize> {
     history.iter().position(|e| e.text == text)
 }
 
-/// 把已存在的条目提到最前:保留其置顶状态——置顶条目移到置顶区顶部,
-/// 未置顶条目移到非置顶区顶部(即"最新位置")。列表因此保持唯一。
 /// Move an existing entry to the front, KEEPING its pinned state: pinned entries go to the
 /// top of the pinned block, unpinned ones to the top of the unpinned block (the newest
 /// slot). The list therefore never holds duplicates.
@@ -559,7 +473,6 @@ pub(super) fn move_entry_to_front(history: &mut Vec<ClipEntry>, idx: usize) {
     history.insert(pos, e);
 }
 
-/// 判断两条历史记录是否代表同一个可恢复条目(忽略来源与时间等展示元数据)。
 /// Identify whether two history entries represent the same restorable item, ignoring
 /// presentation metadata such as source and timestamp.
 pub(super) fn same_clip_entry_identity(a: &ClipEntry, b: &ClipEntry) -> bool {
@@ -579,7 +492,6 @@ pub(super) fn same_clip_entry_identity(a: &ClipEntry, b: &ClipEntry) -> bool {
     }
 }
 
-/// 从历史移除条目但暂不删除图片缓存,供短时撤销使用。
 /// Remove an entry without deleting its image cache, so a short-lived undo can restore it.
 pub(super) fn remove_entry_for_undo(history: &mut Vec<ClipEntry>, idx: usize) -> Option<ClipEntry> {
     let removed = history.get(idx).cloned()?;
@@ -588,7 +500,6 @@ pub(super) fn remove_entry_for_undo(history: &mut Vec<ClipEntry>, idx: usize) ->
     Some(removed)
 }
 
-/// 在遵守置顶区边界的前提下恢复条目;已存在同一条目时不重复插入。
 /// Restore an entry while respecting the pinned boundary; never insert a duplicate.
 pub(super) fn restore_entry_at(
     history: &mut Vec<ClipEntry>,
@@ -612,7 +523,6 @@ pub(super) fn restore_entry_at(
     (pos, true)
 }
 
-/// 按用户确认的范围移除历史;返回被移除条目供缓存引用检查使用。
 /// Remove the confirmed history scope and return dropped entries for cache-reference checks.
 pub(super) fn remove_history_scope(
     history: &mut Vec<ClipEntry>,
@@ -634,14 +544,6 @@ pub(super) fn remove_history_scope(
     removed
 }
 
-/// 把新文本记入历史。规则:
-/// - 空文本忽略
-/// - 全表查重:文本已存在 → 把旧条目提到最前(保留置顶状态,见 move_entry_to_front),
-///   并把来源(名称 + 图标键)更新为本次复制的来源(它是"最新一次复制"的来源)
-/// - 未命中 → 新条目插到置顶区之后;超出 max 裁剪最旧条目
-///
-/// 返回是否真正写入。
-///
 /// Record a new text into the history:
 /// - empty text is ignored
 /// - full-list dedup: an existing text is moved to the front (pinned state kept, see
@@ -661,7 +563,6 @@ pub(super) fn record_text(
         return false;
     }
     if let Some(idx) = find_by_text(history, text) {
-        // 仅在来源真变化时重建字符串,避免同一来源连续复制时的无谓分配。
         // Rebuild the strings only when the source actually changed, avoiding pointless
         // allocations when the same app copies repeatedly.
         if history[idx].source_app != source {
@@ -670,7 +571,6 @@ pub(super) fn record_text(
         if history[idx].source_key != source_key {
             history[idx].source_key = source_key.to_string();
         }
-        // 去重移前 = 最近一次复制:刷新时间戳,过期从“最后一次复制”重新计时。
         // A dedup-move = the latest copy: refresh the timestamp so expiry counts from
         // the most recent copy, not the first one.
         history[idx].copied_at = Some(now_secs());
@@ -691,8 +591,6 @@ pub(super) fn record_text(
         },
     );
     if history.len() > max {
-        // 超上限裁剪时,被裁图片条目的缓存文件一并删除——但仅当其 hash 不再被
-        // 幸存条目引用(同 hash 的文件/数据条目可能共存,共享缓存)。
         // When trimming beyond the cap, drop the trimmed image entries' cache files too --
         // but only when the hash is no longer referenced by a survivor (same-hash
         // file/data entries may coexist and share the cache).
@@ -705,19 +603,6 @@ pub(super) fn record_text(
     true
 }
 
-/// 把一张图片记入历史(两种条目,**各自按类去重,不跨类**):
-/// - **数据条目**(image-data copies,字节已由调用方落盘):查重按内容哈希
-/// - **文件复制条目**(file copies,只读一次内容算哈希 + 缩略图,字节不落盘):
-///   查重按内容哈希——原文件与它在访达里的副本(不同路径、同样字节)只保留一条;
-///   解码失败的退化条目(hash=0)按来源路径查重
-///
-/// 规则与 record_text 一致:
-/// - 空预览且无来源路径(录制失败)忽略
-/// - 已存在(同哈希 / 同路径)→ 旧条目提到最前(保留置顶),来源更新为本次复制来源;
-///   文件条目的来源路径一并更新为最新一次复制
-/// - 未命中 → 新条目插到置顶区之后;超出 max 裁剪
-///   同图不同编码的去重留待第二阶段(见被注释的 image_content_hash)。
-///
 /// Record an image into the history (two kinds, EACH deduped within its own class):
 /// - a DATA entry (image-data copy, bytes already cached by the caller): dedup by content
 ///   hash
@@ -742,8 +627,6 @@ pub(super) fn record_image(
     if (image.preview_png.is_empty() && image.source_path.is_none()) || max == 0 {
         return false;
     }
-    // 文件条目按内容哈希在文件条目内查重;退化条目(hash=0)按来源路径查重;
-    // 数据条目按内容哈希在数据条目内查重。三类互不跨类。
     // File entries dedup by content hash among file entries (degenerate hash=0 entries by
     // path); data entries dedup by content hash among data entries. Never across classes.
     let dedup_hit = if image.source_path.is_some() {
@@ -765,7 +648,6 @@ pub(super) fn record_image(
         })
     };
     if let Some(idx) = dedup_hit {
-        // 仅在来源真变化时重建字符串(同 record_text)。
         // Rebuild the strings only when the source actually changed (same as record_text).
         if history[idx].source_app != source {
             history[idx].source_app = source.to_string();
@@ -773,10 +655,8 @@ pub(super) fn record_image(
         if history[idx].source_key != source_key {
             history[idx].source_key = source_key.to_string();
         }
-        // 去重移前 = 最近一次复制:刷新时间戳(同 record_text)。
         // A dedup-move = the latest copy: refresh the timestamp (same as record_text).
         history[idx].copied_at = Some(now_secs());
-        // 文件条目去重命中:来源路径更新为最新一次复制(粘贴恢复最新文件)。
         // A file-entry dedup hit: the source path updates to the latest copy (pasting
         // restores the newest file).
         if image.source_path.is_some() {
@@ -790,8 +670,6 @@ pub(super) fn record_image(
     history.insert(
         pos,
         ClipEntry {
-            // 文件引用条目把文件名放进 text:行内显示 + 可被搜索(粘贴走 image 分支,
-            // text 不会参与粘贴)。数据条目保持空 text。
             // File-reference entries keep the filename in text: the row shows it and it is
             // searchable (paste goes through the image branch; text never gets pasted).
             // Data entries keep an empty text.
@@ -808,8 +686,6 @@ pub(super) fn record_image(
         },
     );
     if history.len() > max {
-        // 超上限裁剪时,被裁图片条目的缓存文件一并删除——但仅当其 hash 不再被
-        // 幸存条目引用(同 hash 的文件/数据条目可能共存,共享缓存)。
         // When trimming beyond the cap, drop the trimmed image entries' cache files too --
         // but only when the hash is no longer referenced by a survivor (same-hash
         // file/data entries may coexist and share the cache).
@@ -822,7 +698,6 @@ pub(super) fn record_image(
     true
 }
 
-/// 置顶第 idx 条:移到置顶区顶部(最上)。返回条目的**新历史索引**(恒为 0)。
 /// Pin entry `idx`: move it to the top of the pinned block. Returns the entry's NEW
 /// history index (always 0).
 pub(super) fn pin_entry(history: &mut Vec<ClipEntry>, idx: usize) -> usize {
@@ -836,8 +711,6 @@ pub(super) fn pin_entry(history: &mut Vec<ClipEntry>, idx: usize) -> usize {
     0
 }
 
-/// 取消第 idx 条的置顶:移到非置顶区顶部(最新位置)。返回条目的**新历史索引**(= 插
-/// 入位置,紧随最后一个置顶条目)。
 /// Unpin entry `idx`: move it to the top of the unpinned block (the newest slot). Returns
 /// the entry's NEW history index (the insert position, right after the last pinned entry).
 pub(super) fn unpin_entry(history: &mut Vec<ClipEntry>, idx: usize) -> usize {
@@ -852,9 +725,6 @@ pub(super) fn unpin_entry(history: &mut Vec<ClipEntry>, idx: usize) -> usize {
     pos
 }
 
-/// 切换第 idx 条的置顶状态;返回 (切换后的状态, 条目的新历史索引)。纯函数,图钉
-/// 按钮回调与 ← 键盘快捷键共用,单测覆盖。新索引供"跟随置顶"选中定位——旧索引在
-/// 重排后会指向别的条目,不能用。
 /// Toggle the pinned state of entry `idx`; returns (the new state, the entry's NEW history
 /// index). Pure function shared by the pin-button callback and the ← shortcut; unit-tested.
 /// The new index feeds "follow-pin" selection -- the OLD index points at a different entry
@@ -872,7 +742,6 @@ pub(super) fn toggle_pin_on(history: &mut Vec<ClipEntry>, idx: usize) -> (bool, 
     (!pinned, new_idx)
 }
 
-/// 删除第 idx 条(越界忽略),图片条目的缓存文件一并删除。
 /// Delete entry `idx` (out of range is ignored); an image entry's cache file goes too.
 pub(super) fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     if let Some(removed) = remove_entry_for_undo(history, idx) {
@@ -880,7 +749,6 @@ pub(super) fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     }
 }
 
-/// 条目筛选:全部 / 文本 / 图片 / 链接 / 代码片段。
 /// Picker filters: All / Text / Image / Link / Code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClipFilter {
@@ -891,11 +759,10 @@ pub(super) enum ClipFilter {
     Code,
 }
 
-/// 当前生效的筛选项 / the active filter.
+/// the active filter.
 pub(super) static CLIP_FILTER: Mutex<ClipFilter> = Mutex::new(ClipFilter::All);
 
 #[cfg(not(test))]
-/// 缓存的文本小写副本与分类:搜索/筛选的每个按键都复用,只在历史 revision 变化时重建。
 /// Cached lowercase text and classification: reused across every keystroke/rebuild and
 /// rebuilt only when the history revision changes.
 #[cfg(not(test))]
@@ -905,7 +772,6 @@ type FilterTextLowerCache = Option<(u64, Vec<String>, Vec<TextKind>)>;
 static FILTER_TEXT_LOWER_CACHE: LazyLock<Mutex<FilterTextLowerCache>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// Tab 键的分类循环顺序:全部 → 文本 → 图片 → 链接 → 代码 → 全部。
 /// The Tab filter cycle: All -> Text -> Image -> Link -> Code -> All.
 pub(super) fn next_clip_filter(filter: ClipFilter) -> ClipFilter {
     match filter {
@@ -917,7 +783,6 @@ pub(super) fn next_clip_filter(filter: ClipFilter) -> ClipFilter {
     }
 }
 
-/// 条目是否命中筛选项(已缓存分类版本):避免每条都重新 classify_text。
 /// Whether an entry matches the filter (cached-classification variant): avoids re-running
 /// classify_text for every entry on every keystroke.
 fn matches_filter_kind(e: &ClipEntry, kind: TextKind, f: ClipFilter) -> bool {
@@ -930,15 +795,12 @@ fn matches_filter_kind(e: &ClipEntry, kind: TextKind, f: ClipFilter) -> bool {
     }
 }
 
-/// 条目是否命中筛选项(未缓存分类的简易版,仅测试使用)。
 /// Whether an entry matches the filter (simple, uncached-classification variant; tests only).
 #[cfg(test)]
 pub(super) fn matches_filter(e: &ClipEntry, f: ClipFilter) -> bool {
     matches_filter_kind(e, classify_text(&e.text), f)
 }
 
-/// 过滤:返回匹配 query + 筛选项的历史索引列表(空 query + All = 全部;大小写不敏感
-/// 子串匹配)。/ Filter: indices of entries matching the query AND the filter (empty query
 /// + All = every entry; case-insensitive substring match).
 pub(super) fn filtered_indices(
     history: &[ClipEntry],
@@ -947,7 +809,6 @@ pub(super) fn filtered_indices(
 ) -> Vec<usize> {
     let q = query.to_lowercase();
 
-    // 最常见路径(空查询 + 全部)不构建任何缓存。
     // The most common path (empty query + All) builds no cache at all.
     if q.is_empty() && filter == ClipFilter::All {
         return (0..history.len()).collect();
@@ -955,8 +816,6 @@ pub(super) fn filtered_indices(
 
     #[cfg(not(test))]
     {
-        // 搜索输入变化时复用按 history revision 构建的小写文本与分类;避免每个按键都为整本
-        // 历史分配/扫描一遍 lowercase 副本并重跑 classify_text。
         // Reuse the lowercase text and classification built for the current history revision so
         // each keystroke avoids a fresh lowercase copy and classify_text for every entry.
         let revision = super::history_revision();
@@ -998,13 +857,11 @@ pub(super) fn filtered_indices(
         .collect()
 }
 
-/// 显示索引 → 历史索引(经当前过滤列表映射;越界返回 None)。
 /// Display index -> history index (via the current filtered list; None when out of range).
 pub(super) fn mapped_index(display_idx: usize) -> Option<usize> {
     super::with_clipboard_ui(|ui| ui.filtered.get(display_idx).copied())
 }
 
-/// 当前生效的最大条数(从 CONFIG 读,设置保存后下次轮询生效)。
 /// The effective max entry count (read from CONFIG; takes effect on the next poll).
 pub(super) fn max_entries() -> usize {
     CONFIG

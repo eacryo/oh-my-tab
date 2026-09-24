@@ -1,16 +1,7 @@
-//! 剪贴板子系统 · observer:全
-//! 程粘贴板通知观察者
+//! Clipboard subsystem · notifications: pasteboard notification observers.
 
 use super::*;
 
-// ========== 通知观察者 / notification observer ==========
-
-/// 通知观察者单例,承载两个回调:
-/// - NSPasteboardDidChangeNotification:剪贴板每次变化即时记录——轮询只在 0.5s 间隔
-///   采样一次"当前值",两次采样间的快速连续复制会被跳过(历史只剩最近一条);
-///   通知在每次变化时都回调,事件不丢。
-/// - NSWindowDidResignKeyNotification:浮窗失去 key(点击了外部)→ 自动隐藏。
-///
 /// A singleton notification observer carrying two callbacks:
 /// - NSPasteboardDidChangeNotification: record on every pasteboard change. Polling samples
 ///   the current value once per 0.5s interval, so rapid consecutive copies between samples
@@ -73,8 +64,6 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
                 detail_save_as_action as *mut c_void,
                 types.as_ptr(),
             );
-            // 另存为的主线程重入点:动作在按钮追踪循环内只存槽 + 跳转,真正弹
-            // NSSavePanel 在这里(见 PENDING_SAVE_AS 注释)。
             // Main-thread re-entry for save-as: the action only stashes and hops from
             // inside the button tracking loop; the NSSavePanel is presented here (see
             // the PENDING_SAVE_AS comment).
@@ -84,8 +73,6 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
                 detail_save_as_deferred as *mut c_void,
                 types.as_ptr(),
             );
-            // 详情高清预览生成完成(后台线程 → performSelectorOnMainThread):时效
-            // 复核后重建详情面板升级为高清图。
             // Detail hi-res preview finished (worker -> performSelectorOnMainThread):
             // re-validate freshness, then rebuild the detail panel to upgrade to hi-res.
             class_addMethod(
@@ -154,8 +141,6 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
                 filter_pill_clicked as *mut c_void,
                 types.as_ptr(),
             );
-            // 详情文本光标(owner = observer 的 tracking area 投递):进入 = I-beam,
-            // 离开 = 箭头。见 detail_tv_cursor_entered 注释。
             // The detail-text cursor (delivered by the tracking area owned by this
             // observer): enter -> I-beam, exit -> arrow. See detail_tv_cursor_entered.
             class_addMethod(
@@ -182,7 +167,6 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
                 search_focus_ended as *mut c_void,
                 types.as_ptr(),
             );
-            // 搜索框 delegate:拦截字段编辑器翻译出的命令(如 ↓ → moveDown:)。
             // Search-field delegate: intercepts commands the field editor translates
             // (e.g. ↓ -> moveDown:).
             let types_cmd = CString::new("B@:@@:").unwrap();
@@ -193,7 +177,6 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
                 types_cmd.as_ptr(),
             );
             objc_registerClassPair(cls);
-            // 实例 alloc(+1):进程级单例,不释放(与静态生命周期一致)。
             // Instance alloc (+1): process-level singleton, never released (matches the
             // static's lifetime).
             let obj: *mut AnyObject = msg_send![cls as *const AnyObject, new];
@@ -202,7 +185,6 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
         .0
 }
 
-/// 在主线程维护长驻的列表视图;剪贴板监听线程只排队一次刷新。
 /// Keep the long-lived row view tree current on the main thread; the pasteboard observer only
 /// queues one coalesced refresh.
 extern "C" fn picker_refresh_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -210,8 +192,6 @@ extern "C" fn picker_refresh_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_vo
     if PICKER_WINDOW.lock().unwrap().is_none() {
         return;
     }
-    // 面板隐藏时只保留模型变化;延迟到下一次显示前统一刷新,避免剪贴板监听占用主线程
-    // 并拖慢应用切换浮窗。
     // While hidden, keep only the model change and refresh before the next presentation so the
     // pasteboard observer cannot occupy the main thread and slow the app switcher.
     if !PICKER_VISIBLE.load(Ordering::SeqCst) {
@@ -237,7 +217,6 @@ extern "C" fn picker_refresh_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_vo
     }
 }
 
-/// 搜索输入合并后的主线程刷新:连续按键只在停顿后重建一次可视行。
 /// Main-thread refresh after coalescing search input: consecutive keystrokes rebuild the
 /// visible rows only once after typing pauses.
 extern "C" fn picker_refresh_search_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -264,7 +243,6 @@ extern "C" fn picker_refresh_search_rows(_self: *mut c_void, _cmd: Sel, _arg: *m
     }
 }
 
-/// 合并连续搜索通知,让文本编辑器保持流畅,同时在短暂停顿后更新列表。
 /// Coalesce consecutive search notifications so the editor stays responsive while the list
 /// catches up shortly after typing pauses.
 unsafe fn schedule_picker_search_refresh() {
@@ -280,7 +258,6 @@ unsafe fn schedule_picker_search_refresh() {
     ];
 }
 
-/// 在滚动事件批次结束后补齐可视行,避免每个 bounds-change 都同步拆建整组控件。
 /// Materialize the new viewport after a scroll-event burst instead of tearing down and
 /// rebuilding the whole physical row set for every bounds-change callback.
 extern "C" fn picker_refresh_visible_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -295,7 +272,6 @@ extern "C" fn picker_refresh_visible_rows(_self: *mut c_void, _cmd: Sel, _arg: *
     }
 }
 
-/// 合并连续滚动通知,给 AppKit 一个短暂的 run-loop 窗口完成滚动绘制。
 /// Coalesce consecutive scroll notifications, giving AppKit a short run-loop window to finish
 /// scrolling before the visible row set is rebuilt.
 unsafe fn schedule_picker_visible_rows_refresh() {
@@ -311,7 +287,6 @@ unsafe fn schedule_picker_visible_rows_refresh() {
     ];
 }
 
-/// 浮窗可见时把历史变化投递到主线程;隐藏时延迟到下一次呼出前刷新。
 /// Deliver history changes to the main thread while the picker is visible; while hidden, defer
 /// the refresh until the next summon.
 pub(super) fn schedule_picker_refresh() {
@@ -332,13 +307,11 @@ pub(super) fn schedule_picker_refresh() {
     }
 }
 
-/// 剪贴板变化通知回调(任意线程):即时记录当前文本。
 /// Pasteboard-change notification callback (any thread): record the current text immediately.
 extern "C" fn pasteboard_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
     poll_clipboard();
 }
 
-/// 延迟清空一次性粘贴写回的系统剪贴板;若期间 changeCount 或 marker 变化则放弃。
 /// Delayed cleanup for a one-shot paste write-back; abort if changeCount or our marker changed.
 extern "C" fn clear_system_pasteboard_if_owned(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
     let Some(note) = (!note.is_null()).then_some(note as *mut AnyObject) else {
@@ -347,7 +320,6 @@ extern "C" fn clear_system_pasteboard_if_owned(_self: *mut c_void, _cmd: Sel, no
     let scheduled: i64 = unsafe { msg_send![note, longLongValue] };
     // Each delayed selector carries its own changeCount. An older queued callback must not
     // consume the token belonging to a newer one-shot paste.
-    // 每个延迟 selector 都携带自己的 changeCount；旧回调不能误消费较新单次粘贴的 token。
     if *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() != Some(scheduled) {
         log_debug!("[clip] system pasteboard clear skipped: stale task");
         return;
@@ -376,7 +348,6 @@ extern "C" fn clear_system_pasteboard_if_owned(_self: *mut c_void, _cmd: Sel, no
     log_debug!("[clip] system pasteboard cleared after one-shot paste");
 }
 
-/// 在主线程安排延迟清空,并记录写回后的 changeCount 作为所有权凭据。
 /// Schedule delayed cleanup on the main thread and record the post-write changeCount as the
 /// ownership proof.
 pub(super) unsafe fn schedule_system_pasteboard_clear() {
@@ -396,7 +367,6 @@ pub(super) unsafe fn schedule_system_pasteboard_clear() {
     ];
 }
 
-/// 浮窗失去 key 通知回调(主线程):点击外部等场景自动隐藏。
 /// Picker resign-key notification callback (main thread): auto-hide on outside clicks, etc.
 extern "C" fn window_did_resign_key(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
     hide_picker();
@@ -419,7 +389,6 @@ pub(super) extern "C" fn clipboard_window_send_event(
     }
 }
 
-/// 主列表和详情共用同一个自定义指示器类;只通过目标滚动视图区分状态。
 /// The picker and detail share one custom indicator class; only the target scroll view differs.
 pub(super) unsafe fn scroll_indicator_class() -> *mut AnyObject {
     static CLASS: OnceLock<usize> = OnceLock::new();
@@ -493,7 +462,6 @@ unsafe fn scroll_for_target(target: ScrollTarget) -> Option<*mut AnyObject> {
     }
 }
 
-/// 计算指示器的 y/高度;拖拽和绘制必须使用同一套映射,否则拖到轨道底部时会跳动。
 /// Compute the indicator's y/height; dragging and drawing must share this mapping or the
 /// thumb jumps when it reaches the end of the track.
 pub(super) fn scroll_indicator_geometry(
@@ -507,7 +475,6 @@ pub(super) fn scroll_indicator_geometry(
     if track_end <= track_start || document <= visible {
         return None;
     }
-    // 轨道末端统一避开右下角安全区;绘制和拖拽必须使用同一轨道映射。
     // Keep the track end outside the lower-right safe corner; drawing and dragging must use
     // this same track mapping.
     let track_len = track_end - track_start;
@@ -524,7 +491,6 @@ pub(super) fn scroll_indicator_geometry(
     Some((track_start + progress * travel, knob_len))
 }
 
-/// 在 10pt 透明命中视图中绘制居中的 6pt 可见胶囊;父视图仍负责接收拖拽事件。
 /// Draw a centered 6pt visible capsule inside the 10pt transparent hit view; the parent view
 /// remains responsible for receiving drag events.
 pub(super) unsafe fn update_scroll_indicator_visual(
@@ -565,8 +531,6 @@ pub(super) unsafe fn update_scroll_indicator_visual(
     let _: () = msg_send![visual_layer, setFrame: frame];
 }
 
-/// 更新滚动指示器的位置/长度:内容溢出时显示(恒显示,不淡出),否则隐藏。
-/// 由 clipView 的 bounds 变化通知回调与 show_picker(首次呼出即显示)调用。
 /// Update the scroll indicator's position/length: shown while the content overflows
 /// (always visible, no fade-out), hidden otherwise. Called by the clip-view bounds-change
 /// notification callback AND by show_picker (visible on the first summon).
@@ -658,7 +622,6 @@ pub(super) fn update_scroll_indicator() {
     unsafe { update_scroll_indicator_for(ScrollTarget::Picker) }
 }
 
-/// 允许自定义指示器接收第一次鼠标点击;非激活面板也要能直接开始拖拽。
 /// Accept the first mouse click so the nonactivating panel can start dragging immediately.
 extern "C" fn scroll_indicator_accepts_first_mouse(
     _self: *mut c_void,
@@ -668,7 +631,6 @@ extern "C" fn scroll_indicator_accepts_first_mouse(
     true
 }
 
-/// 按指示器拖动距离换算文档滚动偏移。系统滚动条已关闭,NSView 不会自动提供这套行为。
 /// Convert thumb movement into document offset. The system scroller is disabled, so NSView
 /// does not provide this behavior automatically.
 extern "C" fn scroll_indicator_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
@@ -773,12 +735,9 @@ extern "C" fn scroll_indicator_mouse_up(_self: *mut c_void, _cmd: Sel, _event: *
     *SCROLL_DRAG.lock().unwrap() = None;
 }
 
-/// clipView bounds 变化通知回调(滚动发生)→ 更新指示器;详情打开时同步移动详情,
-/// 让它跟着选中行走(否则滚动后详情与行错位)。
 /// Clip-view bounds-change notification callback (scrolling) -> update the indicator; with
 /// the detail open, move it along so it keeps following the selected row (otherwise a
 /// scroll would leave the detail misaligned with its row).
-/// C 回调的 panic 边界:panic 穿不过 extern "C" 帧(会 abort 整个进程),这里统一接住。
 /// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
 /// aborts the process), so it is contained here.
 extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
@@ -799,14 +758,12 @@ unsafe fn scroll_indicator_bounds_changed_inner(_self: *mut c_void, _cmd: Sel, _
     reposition_detail();
 }
 
-/// 判断一行是否与可视区(含 overscan)相交。
 /// Check whether a row intersects the viewport, including overscan.
 pub(super) fn picker_row_is_drawable(row: NSRect, viewport: NSRect, overscan: f64) -> bool {
     row.origin.y + row.size.height >= viewport.origin.y - overscan
         && row.origin.y <= viewport.origin.y + viewport.size.height + overscan
 }
 
-/// 根据完整行高计算需要物化的显示索引范围,保留少量上下缓冲以避免滚动边界闪烁。
 /// Compute the materialized display-index range from all row heights, retaining a small
 /// overscan on both sides to avoid flashing at scroll boundaries.
 pub(super) fn picker_visible_range(
@@ -817,8 +774,6 @@ pub(super) fn picker_visible_range(
     if pitches.is_empty() || viewport.size.height <= 0.0 {
         return (0, 0);
     }
-    // 前缀和一次性算出各行顶边:循环里逐行调 `row_top` 会重新累加前面的行高,
-    // 整段退化成 O(n²)(与 rebuild_rows 同一个坑,见 model::row_offsets)。
     // One-pass prefix sums give every row top: calling `row_top` per row re-sums the
     // preceding pitches, degrading the scan to O(n^2) (the same trap rebuild_rows fixed;
     // see model::row_offsets).
@@ -841,7 +796,6 @@ pub(super) fn picker_visible_range(
     }
 }
 
-/// 取当前列表视口;布局尚未完成时只预热顶部少量行,避免首开一次性创建整表。
 /// Read the current list viewport; before layout completes, warm only a small top slice so
 /// the first presentation never creates the entire list synchronously.
 pub(super) unsafe fn picker_visible_row_range(pitches: &[f64], row_count: usize) -> (usize, usize) {
@@ -871,7 +825,6 @@ pub(super) unsafe fn picker_visible_row_range(pitches: &[f64], row_count: usize)
     picker_visible_range(pitches, visible_rect, ROW_H * 1.5)
 }
 
-/// 判断当前物理行槽位是否覆盖视口所需范围。
 /// Check whether the current physical row slots cover the range needed by the viewport.
 pub(super) unsafe fn picker_materialized_range_changed() -> bool {
     let pitches = ROW_PITCHES.lock().unwrap().clone();
@@ -889,8 +842,6 @@ pub(super) fn row_view_for_display_index(index: usize) -> Option<RowHoverViews> 
     ROW_HOVER_VIEWS.lock().unwrap().get(slot).copied()
 }
 
-/// 返回详情 NSClipView 的实时合法纵向范围。NSTextView 的 textContainerInset 会让
-/// 顶部/底部不一定等于 `0..documentHeight-visibleHeight`,必须交给 AppKit 约束。
 /// Return the detail NSClipView's live legal vertical range. NSTextView's text-container inset
 /// means the endpoints are not necessarily `0..documentHeight-visibleHeight`; AppKit must
 /// constrain them.
@@ -913,7 +864,6 @@ pub(super) unsafe fn detail_scroll_range(scroll: *mut AnyObject) -> Option<(f64,
     ))
 }
 
-/// 无条件滚到 AppKit 计算出的真实顶部,而不是假设顶部 y=0。
 /// Scroll unconditionally to AppKit's actual constrained top instead of assuming y=0.
 pub(super) unsafe fn scroll_detail_to_top(scroll: *mut AnyObject) {
     let Some((min_y, _)) = detail_scroll_range(scroll) else {
@@ -928,11 +878,6 @@ pub(super) unsafe fn scroll_detail_to_top(scroll: *mut AnyObject) {
     let _: () = msg_send![scroll, reflectScrolledClipView: clip];
 }
 
-/// 详情原生滚动视图的 bounds 变化 → 只更新自定义滚动条胶囊。端点越界(橡皮筋)
-/// 属于原生 elasticity 的职责,不应在这里改写 clipView bounds——手势进行中的
-/// 同步硬钳会污染 NSScrollView 的动量累加基准,让后续惯性事件从脏基准重新施加
-/// delta,两端反复拉锯直到惯性耗尽,屏幕上就是滚动条"抽搐一下"。橡皮筋期间
-/// 指示器几何把进度 clamp 到 0..1,滑块自然钉在端点,与系统滚动条表现一致。
 /// Bounds changes from the detail's native scroll view -> update the custom capsule
 /// indicators only. Endpoint overscroll (rubber banding) is native elasticity's job and
 /// must never be answered by rewriting the clip-view bounds here -- a synchronous hard
@@ -945,7 +890,6 @@ pub(super) extern "C" fn detail_scroll_indicator_bounds_changed(
     _cmd: Sel,
     _note: *mut c_void,
 ) {
-    // update_scroll_indicator_for 内部自取 DETAIL_SCROLL_VIEW,视图不存在时会静默返回。
     // update_scroll_indicator_for reads DETAIL_SCROLL_VIEW itself and returns silently
     // when the view is gone.
     unsafe {
@@ -1184,7 +1128,6 @@ unsafe fn clear_confirmation_animate_opacity(view: *mut AnyObject, visible: bool
         msg_send![view, alphaValue]
     } else {
         // CALayer opacity is a CGFloat-compatible Objective-C `float`, not an `f64` return.
-        // CALayer 的 opacity 返回类型是 Objective-C `float`，不能按 `f64` 接收。
         let opacity: f32 = msg_send![presentation, opacity];
         opacity as f64
     };
@@ -1216,7 +1159,6 @@ unsafe fn clear_confirmation_animate_content_open(button: *mut AnyObject) {
     if layer.is_null() {
         return;
     }
-    // 与设置页一致,内容从轻微上移和缩小的状态弹入展开的外壳。
     // Match the settings control's content entrance: a small upward offset and scale
     // settle into the expanding shell.
     for (path, from, to, key) in [
@@ -1254,7 +1196,6 @@ unsafe fn clear_confirmation_animate_content_open(button: *mut AnyObject) {
     }
 }
 
-/// 设置清空确认卡片的展开状态;状态切换只操作已缓存的视图指针,不触发历史变更。
 /// Toggle the clear-history confirmation card; this only changes cached views and never
 /// mutates clipboard history.
 pub(super) fn set_clear_history_confirmation_expanded(expanded: bool) {
@@ -1287,7 +1228,6 @@ pub(super) fn set_clear_history_confirmation_expanded(expanded: bool) {
             object: std::ptr::null::<AnyObject>()
         ];
         if expanded {
-            // 卡片与 header 同级,超出 header 的下两行仍能被 AppKit 命中并收到 hover。
             // Keep the card alongside the header so its lower rows remain hit-testable beyond
             // the header's bounds. Bring the card above the scroll view when it opens.
             let _: () = msg_send![
@@ -1310,7 +1250,6 @@ pub(super) fn set_clear_history_confirmation_expanded(expanded: bool) {
             let _: () = msg_send![views.surface.0, setHidden: false];
             let _: () = msg_send![clear.0, setHidden: true];
         } else {
-            // 收起时让入口和筛选 tab 位于正在缩小的卡片上层,避免透明层吞掉点击。
             // Keep the trigger and filters above the collapsing card so its fading shell
             // cannot intercept the next click.
             let _: () = msg_send![clear.0, setHidden: false];
@@ -1409,7 +1348,6 @@ fn clear_clipboard_history_scope(clear_all: bool) {
     );
 }
 
-/// 点击清空入口只展开确认卡片,不改变历史。
 /// Clicking the clear entry point only expands the confirmation card; history is untouched.
 extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     set_clear_history_confirmation_expanded(true);
@@ -1425,7 +1363,6 @@ extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c
     clear_clipboard_history_scope(true);
 }
 
-/// 清空搜索词 + 搜索框文本(不重建;调用方按需 rebuild)。
 /// Clear the search query and the search field's text (no rebuild; callers rebuild as needed).
 unsafe fn set_search_clear_button_visible(visible: bool) {
     if let Some(button) = *SEARCH_CLEAR_BUTTON.lock().unwrap() {
@@ -1447,7 +1384,6 @@ pub(super) fn clear_search() {
     }
 }
 
-/// 搜索框文本变化通知回调:更新搜索词并重建过滤列表。
 /// Search-field text-change notification callback: update the query and rebuild the filter.
 extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
     let field: *mut AnyObject = unsafe { msg_send![note as *mut AnyObject, object] };
@@ -1462,29 +1398,23 @@ extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_v
         SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
     }
     unsafe { set_search_clear_button_visible(has_query) };
-    // ⌘F 键帽和右侧 × 都由自绘 cell 根据查询状态定位,文本变化时强制重绘。
     // The hand-drawn ⌘F keycap and right × are positioned from query state, so force a redraw
     // whenever text changes.
     unsafe {
         let _: () = msg_send![field, setNeedsDisplay: true];
     }
-    // 不重置选中:编辑期间(焦点在搜索框)保持无选中;回列表时(↓)由
-    // search_field_do_command 重置为首条。
     // Do NOT reset the selection: while editing (focus in the search field) it stays
     // "no selection"; returning to the list (↓) resets it to the first entry in
     // search_field_do_command.
     unsafe { schedule_picker_search_refresh() };
 }
 
-/// NSSearchField 的 Esc(cancelOperation:):有搜索词 → 清空并恢复全列表(方案 A 第一级);
-/// 无搜索词 → 关闭浮窗(第二级)。
 /// NSSearchField's Esc (cancelOperation:): a query gets cleared and the full list restored
 /// (scheme A, level one); with no query the picker closes (level two).
 pub(super) extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
     let has_query = with_clipboard_ui(|ui| !ui.search_query.is_empty());
     if has_query {
         clear_search();
-        // 焦点仍在搜索框,保持无选中(高光不恢复)。
         // Focus stays in the search field: keep "no selection" (no highlight returns).
         unsafe { rebuild_rows() };
     } else {
@@ -1492,8 +1422,6 @@ pub(super) extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
     }
 }
 
-/// 搜索框右侧清除按钮:不走响应链的 cancelOperation:(它可能被字段编辑器截获),直接
-/// 清空字段和过滤条件。与 Esc 不同,空字段点击不会关闭浮窗。
 /// The search field's right clear button: do not route through responder-chain cancelOperation:
 /// (which the field editor may intercept); clear the field and filter directly. Unlike Esc,
 /// clicking an already-empty field never closes the picker.
@@ -1502,10 +1430,8 @@ pub(super) extern "C" fn search_clear_button(_self: *mut c_void, _cmd: Sel, _sen
     unsafe { rebuild_rows() };
 }
 
-/// 搜索框的自绘 × 命中测试:只在有查询时拦截右侧 18pt,其余鼠标事件照常交给父类。
 /// Hit-tests the custom search ×: intercept only the rightmost 18pt while queried and forward
 /// every other mouse event to the superclass normally.
-/// 鼠标位置是否落在搜索框右侧自绘 × 的命中区域。
 /// Whether a mouse location falls inside the search field's custom right-side × hit area.
 unsafe fn search_clear_contains_event(field: *mut AnyObject, event: *mut c_void) -> bool {
     if !search_has_query() {
@@ -1521,7 +1447,6 @@ unsafe fn search_clear_contains_event(field: *mut AnyObject, event: *mut c_void)
         && point.y <= bounds.size.height
 }
 
-/// 刷新自绘 × 的悬停状态;状态变化时仅重绘搜索框,不触发过滤或列表重建。
 /// Refreshes the custom × hover state; redraws only the search field on changes, never filters
 /// or rebuilds the list.
 unsafe fn update_search_clear_hover(field: *mut AnyObject, event: *mut c_void) {
@@ -1582,7 +1507,6 @@ pub(super) extern "C" fn search_field_mouse_down(
     }
 }
 
-/// 搜索框底/描边样式助手(层背景走 raw FFI)。聚焦只加强内描边,保持稳定的磨砂底色。
 /// The search field's fill/ring helper (raw FFI for the layer background). Focus strengthens
 /// only the inner ring and keeps the frosted fill stable.
 pub(super) unsafe fn style_search_field(field: *mut AnyObject, focused: bool) {
@@ -1598,7 +1522,6 @@ pub(super) unsafe fn style_search_field(field: *mut AnyObject, focused: bool) {
     crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(ring));
 }
 
-/// 编辑开始:保持默认 4.5% 磨砂底,仅使用 10% 内描边指示焦点,避免输入时突变白色。
 /// Editing begins: keep the default 4.5% frosted fill and use only a 10% inner ring for focus,
 /// avoiding a disruptive white transition while typing.
 extern "C" fn search_focus_began(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
@@ -1606,9 +1529,6 @@ extern "C" fn search_focus_began(_self: *mut c_void, _cmd: Sel, note: *mut c_voi
         let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
         if !field.is_null() {
             style_search_field(field, true);
-            // 聚焦态切换必须显式重绘 cell:占位提示由 cell 自绘,聚焦即隐(IME 组合
-            // 期间 stringValue 仍为空,若不重绘会与拼音预编辑串叠加)。图层底色变化
-            // 不会触发 cell 重绘。
             // Focus transitions must explicitly redraw the cell: the placeholder is
             // cell-drawn and hides on focus (during IME composition stringValue stays
             // empty, so a stale placeholder would sit under the pre-edit pinyin).
@@ -1618,13 +1538,12 @@ extern "C" fn search_focus_began(_self: *mut c_void, _cmd: Sel, note: *mut c_voi
     }
 }
 
-/// 编辑结束:还原默认内描边。 / Editing ends: restore the default inner ring.
+/// Editing ends: restore the default inner ring.
 extern "C" fn search_focus_ended(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
     unsafe {
         let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
         if !field.is_null() {
             style_search_field(field, false);
-            // 与 search_focus_began 同理:失焦后恢复占位提示需要立即重绘。
             // Same as search_focus_began: restoring the placeholder on blur needs an
             // immediate redraw.
             let _: () = msg_send![field, setNeedsDisplay: true];
@@ -1632,7 +1551,6 @@ extern "C" fn search_focus_ended(_self: *mut c_void, _cmd: Sel, note: *mut c_voi
     }
 }
 
-/// 当前行视图是否已对应当前历史/查询/筛选(与刷新回调同一判定口径)。
 /// Whether the materialized rows already match the current history/query/filter (the same
 /// predicate used by the refresh callbacks).
 fn picker_rows_are_current() -> bool {
@@ -1647,16 +1565,10 @@ fn picker_rows_are_current() -> bool {
     })
 }
 
-/// 搜索框 delegate 的命令拦截:↓(moveDown:) → 焦点切到列表并选中过滤结果第一条,返回
-/// YES 吞掉该命令;其余命令返回 NO 交给字段编辑器正常处理(光标移动/输入等)。
 /// Search-field delegate command interception: ↓ (moveDown:) moves focus into the list and
 /// selects the first filtered entry, returning YES (consumed); any other command returns NO
 /// so the field editor handles it (cursor movement / text input).
 ///
-/// 为什么必须走这里:搜索框开始编辑后第一响应者是窗口的字段编辑器(NSTextView),键盘事件
-/// 根本不经过搜索框的 keyDown:;编辑器把 ↓ 翻译成 moveDown: 命令后通过
-/// control:textView:doCommandBySelector: 转发给搜索框的 delegate——这是文本控件拦截按键
-/// 的官方机制。
 /// Why this is necessary: once the search field edits, the FIRST RESPONDER is the window's
 /// field editor (an NSTextView) -- key events never reach the search field's keyDown:. The
 /// editor translates ↓ into a moveDown: command and forwards it to the field's delegate via
@@ -1672,14 +1584,11 @@ pub(super) extern "C" fn search_field_do_command(
         return false;
     }
     unsafe {
-        // 搜索词/过滤结果保留,仅把焦点与选中交给列表。↓ = 最新一条(首行);
-        // ↑ = 最久远的一条(显示列表末行,随后滚动到可见)。
         // The query/filter stays; only focus and the selection move to the list.
         // ↓ = the newest entry (first row); ↑ = the oldest (the display list's tail,
         // scrolled into view afterwards).
         let display_len = with_clipboard_ui(|ui| ui.filtered.len());
         let sel = if command_selector == sel!(moveUp:) {
-            // 空列表:0(无行可选中,无高光;saturating_sub 防下溢)。
             // Empty list: 0 (no row to select, no highlight; saturating_sub guards).
             display_len.saturating_sub(1)
         } else {
@@ -1687,8 +1596,6 @@ pub(super) extern "C" fn search_field_do_command(
         };
         let previous = picker_selection();
         set_picker_selection(sel);
-        // 列表已对应当前查询时只刷新前后两行高光;查询刚变、去抖刷新未落定时仍需一次
-        // 完整重建,否则会把新列表的索引套到旧行树上。
         // When the rows already match the query, update only the two rows' highlights; right
         // after a query change (the debounced refresh has not landed yet) a full rebuild is
         // still required, otherwise the new list index is applied to stale rows.
@@ -1697,12 +1604,10 @@ pub(super) extern "C" fn search_field_do_command(
         } else {
             rebuild_rows();
         }
-        // 详情打开时,其详情按钮的实心图标要跟随新的选中行。
         // With the detail open, its filled action icon must follow the new selection.
         if detail_visible() {
             refresh_detail_action_visuals();
         }
-        // ↑ 选中末行时视口还停在顶部:用确定性的偏移计算滚动到选中行可见。
         // With ↑ the tail is selected while the viewport is still at the top: use the
         // deterministic offset calculation to bring the selected row into view.
         if let Some(container) = picker_container_ptr() {
@@ -1713,7 +1618,6 @@ pub(super) extern "C" fn search_field_do_command(
                 Some(w) => w.0,
                 None => return true,
             };
-            // makeFirstResponder: 返回 BOOL('B')。
             // makeFirstResponder: returns BOOL ('B').
             let _: bool = msg_send![window, makeFirstResponder: container];
         }
@@ -1721,12 +1625,11 @@ pub(super) extern "C" fn search_field_do_command(
     true
 }
 
-/// 是否已注册剪贴板变化通知(幂等,防止 start/stop 反复注册导致重复回调)。
 /// Whether the pasteboard-change notification has been registered (idempotent; start/stop
 /// cycles must not double-register and duplicate callbacks).
 static NOTIFICATION_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-/// 注册剪贴板变化通知(仅一次)。/ Register the pasteboard-change notification (once).
+/// Register the pasteboard-change notification (once).
 pub(super) unsafe fn register_pasteboard_observer() {
     if NOTIFICATION_REGISTERED.swap(true, Ordering::SeqCst) {
         return;
@@ -1744,8 +1647,6 @@ pub(super) unsafe fn register_pasteboard_observer() {
     log_debug!("Pasteboard change observer registered.");
 }
 
-/// NSTimer 的 target:NSTimer 会向它发 clipPollTick:。动态注册一个轻量类,方法转发到
-/// clip_poll_tick。类只注册一次,实例每次 start 新建(+1,随 timer 持有)。
 /// The NSTimer target: NSTimer sends clipPollTick: to it. A tiny dynamic class forwards the
 /// method to clip_poll_tick; the class is registered once, and an instance is created per start.
 pub(super) unsafe fn timer_target() -> *mut AnyObject {

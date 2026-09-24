@@ -1,4 +1,3 @@
-//! 设置窗口 · 玻璃色调实时预览:取色器、预览面板与预览视图同步。
 //! Live glass-tint preview: the color well, preview panel, and preview-view syncing.
 
 use super::*;
@@ -17,7 +16,6 @@ pub(super) fn rgba_hex_from_components(red: f64, green: f64, blue: f64, alpha: f
     )
 }
 
-/// 将任意 NSColor 转换到 sRGB 后编码为配置使用的 RRGGBBAA。
 /// Convert any NSColor to sRGB and encode it as the RRGGBBAA format used by the config.
 pub(super) unsafe fn ns_color_to_hex(color: *mut AnyObject) -> Option<String> {
     if color.is_null() {
@@ -35,7 +33,6 @@ pub(super) unsafe fn ns_color_to_hex(color: *mut AnyObject) -> Option<String> {
     Some(rgba_hex_from_components(red, green, blue, alpha))
 }
 
-/// 原生取色器色块,固定为右侧小色块而不是拉伸成文本框宽度。
 /// Native color well, kept as a compact right-side swatch instead of stretching like a text field.
 pub(super) unsafe fn make_color_well(
     x: f64,
@@ -65,7 +62,6 @@ pub(super) unsafe fn make_color_well(
     well
 }
 
-/// 纯逻辑:水平居中设置窗口+颜色面板的整体,面板在设置窗口右侧并垂直居中。
 /// Pure: center the settings window + color panel as one horizontal group, with the panel on
 /// the right and vertically centered against the settings window.
 pub(super) fn glass_tint_group_frames(
@@ -105,7 +101,6 @@ pub(super) fn glass_tint_group_frames(
     )
 }
 
-/// 取设置窗口所在屏幕的可见区域;窗口尚未绑定屏幕时回退到主屏。
 /// Get the visible frame of the settings window's screen, falling back to the main screen before
 /// AppKit has assigned one.
 pub(super) unsafe fn glass_tint_screen_frame(window: *mut AnyObject) -> NSRect {
@@ -118,7 +113,6 @@ pub(super) unsafe fn glass_tint_screen_frame(window: *mut AnyObject) -> NSRect {
     }
 }
 
-/// 打开取色器前把设置窗口向左移,让两个窗口作为一个整体居中。
 /// Move the settings window left before opening the color panel so the two windows are centered
 /// as one group.
 pub(super) unsafe fn position_glass_tint_group(save_original: bool) {
@@ -144,7 +138,6 @@ pub(super) unsafe fn position_glass_tint_group(save_original: bool) {
     let _: () = msg_send![panel, setFrameOrigin: panel_frame.origin];
 }
 
-/// 颜色面板关闭后恢复设置窗口打开前的位置;重复调用必须安全。
 /// Restore the settings window's pre-panel position after the color panel closes; repeated calls
 /// are intentionally harmless.
 pub(crate) fn restore_glass_tint_group() {
@@ -158,7 +151,6 @@ pub(crate) fn restore_glass_tint_group() {
     }
 }
 
-/// 自定义 NSColorWell 在 AppKit 显示共享颜色面板前先调整窗口位置,避免左下角闪现。
 /// Custom NSColorWell positioning before AppKit displays the shared color panel, avoiding a
 /// flash in the screen's lower-left corner.
 pub(super) extern "C" fn glass_tint_well_activate(this: *mut c_void, _cmd: Sel, exclusive: bool) {
@@ -169,7 +161,6 @@ pub(super) extern "C" fn glass_tint_well_activate(this: *mut c_void, _cmd: Sel, 
             super(this as *mut AnyObject, superclass),
             activate: exclusive
         ];
-        // AppKit 可能在 activate:期间恢复面板记忆位置,因此 super 返回后再应用一次整体布局。
         // AppKit may restore the panel's remembered frame during activate:; apply the grouped
         // position once more after super so the final visible frame is deterministic.
         position_glass_tint_group(false);
@@ -195,7 +186,6 @@ pub(super) fn glass_tint_well_class() -> *mut AnyObject {
         .0
 }
 
-/// 创建设置页内的玻璃预览块,内容只使用抽象形状,不暴露真实窗口或剪贴板数据。
 /// Create an in-settings glass preview using abstract shapes only, never real windows or clipboard data.
 pub(super) unsafe fn make_glass_preview(
     parent: *mut AnyObject,
@@ -361,7 +351,6 @@ pub(super) unsafe fn configure_glass_tint_panel(target: *mut AnyObject) {
         GLASS_TINT_PANEL_OBSERVER_INSTALLED.store(true, Ordering::SeqCst);
     }
 
-    // accessory 宽度必须匹配颜色面板本身;NSColorPanel 不会因 accessory 超宽而自动扩窗。
     // The accessory width must match the color panel; NSColorPanel does not widen itself for an
     // oversized accessory view.
     let panel_frame: NSRect = msg_send![panel, frame];
@@ -382,7 +371,6 @@ pub(super) unsafe fn configure_glass_tint_panel(target: *mut AnyObject) {
         sel!(handleGlassTintReset:),
         SettingsButtonRole::Action,
     );
-    // 按本地化标题使用原生固有宽度,避免全宽按钮让系统圆角比例失真。
     // Use the native fitting width for the localized title so a full-width button does not distort
     // the system bezel's corner proportions.
     let fitting: NSSize = msg_send![reset, fittingSize];
@@ -405,16 +393,12 @@ pub(super) unsafe fn configure_glass_tint_panel(target: *mut AnyObject) {
     release_obj(accessory);
 }
 
-/// 关闭并解绑系统取色面板,避免设置窗口销毁后面板继续改动悬空的 color well。
 /// Close and detach the system color panel so it cannot mutate a dangling color well after the
 /// settings window is destroyed.
 pub(super) unsafe fn close_glass_tint_panel(well: *mut AnyObject) {
     // NSColorPanel.sharedColorPanel is independent from the settings window, and AppKit can
     // report the color well as inactive while the shared panel is still visible. Always hide the
     // panel; `isActive` only decides whether the well needs an additional deactivate call.
-    //
-    // NSColorPanel.sharedColorPanel 独立于设置窗口,而且 AppKit 可能在共享面板仍可见时把
-    // color well 报告为非 active。必须无条件隐藏面板;`isActive` 只能决定是否额外停用色块。
     if !well.is_null() {
         let active: bool = msg_send![well, isActive];
         if active {
@@ -456,7 +440,6 @@ pub(super) unsafe fn update_settings_preview_views() {
     });
 }
 
-/// 应用临时玻璃预览到真实浮窗和设置页内的两个模拟浮窗。
 /// Apply the temporary glass preview to the real overlays and the two in-settings mock overlays.
 pub(crate) fn apply_glass_preview() {
     unsafe {
@@ -466,8 +449,6 @@ pub(crate) fn apply_glass_preview() {
     }
 }
 
-/// 取色器/颜色面板的统一写入路径:把新颜色写进 CONFIG 并调度防抖落盘,
-/// 随后把预览应用到真实浮窗与设置页内的两个模拟浮窗。
 /// The shared write path for the color well/panel: store the new color in CONFIG, schedule a
 /// debounced persist, then apply it to the real overlays and the two in-settings mock
 /// overlays.
@@ -531,7 +512,6 @@ pub(crate) extern "C" fn on_glass_tint_reset(_self: *mut c_void, _cmd: Sel, _sen
         let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
         let _: () = msg_send![panel, setColor: color];
         GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
-        // 重置 = 立即写回 CONFIG 默认值(与即时生效语义一致)。
         // Reset = write the default straight back to CONFIG (matching live-apply semantics).
         if let Ok(mut w) = crate::config::CONFIG.write() {
             w.appearance.glass_tint = default_hex;

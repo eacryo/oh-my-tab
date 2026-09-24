@@ -1,18 +1,13 @@
-//! 剪贴板子系统 · persist:历
-//! 史
+//! Clipboard subsystem · persist: history persistence (write, prune, load).
 
 use super::*;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-// ========== 历史持久化 / history persistence ==========
-
-/// 历史文件格式版本(结构变更时递增;加载遇到更高版本时放弃,按空历史启动)。
 /// The history file format version (bump on structural changes; a higher version is
 /// ignored on load and the app starts with an empty history).
 pub(super) const HISTORY_VERSION: u32 = 1;
 
-/// 历史文件包装结构(带版本号,方便将来演进)。
 /// The history file wrapper (versioned, for future evolution).
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct HistoryFile {
@@ -20,8 +15,6 @@ pub(super) struct HistoryFile {
     entries: Vec<ClipEntry>,
 }
 
-/// 序列化专用的借用视图:避免 `entries.to_vec()` 把整本历史(含图片预览)再深拷一遍
-/// ——预览本身被 `#[serde(skip)]`,那次拷贝纯属浪费。
 /// A borrow-only view for serialization: avoids `entries.to_vec()` deep-copying the entire
 /// history (image previews included) -- the previews are `#[serde(skip)]`, so that copy was
 /// pure waste.
@@ -31,12 +24,9 @@ struct HistoryFileRef<'a> {
     entries: &'a [ClipEntry],
 }
 
-/// 持久化历史文件路径(与 config.toml 同目录;测试构建走测试目录)。
 /// The persisted-history path (same dir as config.toml; test builds use a test dir).
 pub(super) fn history_file_path() -> std::path::PathBuf {
     if SMOKE_MODE.load(Ordering::SeqCst) || cfg!(test) {
-        // 测试/冒烟历史与图片缓存必须共用同一临时根目录;从 HOME 移出是因为 Codex
-        // 沙箱对 $HOME/Library/Caches 的写入受限,而持久化测试会直接创建该目录。
         // Test/smoke history must share the same temp root as the image cache. It is moved
         // out of HOME because the Codex sandbox restricts writes to $HOME/Library/Caches,
         // and persistence tests create this directory directly.
@@ -49,13 +39,12 @@ pub(super) fn history_file_path() -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}/.config/oh-my-tab/clipboard-history.toml", home))
 }
 
-/// 当前是否开启历史持久化(从 CONFIG 读)。
 /// Whether history persistence is enabled (read from CONFIG).
 pub(super) fn persist_enabled() -> bool {
     CONFIG.read().map(|c| c.clipboard.persist).unwrap_or(false)
 }
 
-/// 序列化历史(纯函数,便于单测)。/ Serialize the history (pure, unit-tested).
+/// Serialize the history (pure, unit-tested).
 pub(super) fn serialize_history(entries: &[ClipEntry]) -> Option<String> {
     let payload = HistoryFileRef {
         version: HISTORY_VERSION,
@@ -70,13 +59,11 @@ struct PersistJob {
     entries: Vec<ClipEntry>,
 }
 
-/// 单一后台写线程把连续的快照合并为最后一个,避免复制时阻塞主线程。
 /// One serial worker coalesces consecutive snapshots to the newest one, keeping copy events
 /// from blocking the main thread on TOML serialization and filesystem I/O.
 static PERSIST_SENDER: OnceLock<Sender<PersistJob>> = OnceLock::new();
 static PERSIST_GENERATION: AtomicU64 = AtomicU64::new(0);
 static PERSIST_IO_LOCK: Mutex<()> = Mutex::new(());
-/// worker 已处理到的代数(含被合并丢弃的中间代):测试用它等待异步回写落定。
 /// The newest generation the worker has processed (coalesced-away jobs count as
 /// processed): tests wait on it so the async writeback settles deterministically.
 static PERSIST_DONE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -94,7 +81,6 @@ fn persist_sender() -> &'static Sender<PersistJob> {
 
 fn persist_worker(receiver: Receiver<PersistJob>) {
     while let Ok(mut job) = receiver.recv() {
-        // 连续复制可能在队列里留下多个完整快照,只保留最新快照降低序列化和写盘次数。
         // A burst of copies can queue several full snapshots; keep only the newest to reduce
         // serialization and filesystem work.
         while let Ok(newer) = receiver.try_recv() {
@@ -106,9 +92,6 @@ fn persist_worker(receiver: Receiver<PersistJob>) {
     }
 }
 
-/// 测试辅助:等到 worker 处理完当前代数及之前的全部快照。load_history 末尾的
-/// save_history 是异步的,若不排空,旧快照可能在测试改写历史文件之后才落盘,
-/// 把测试刚写入的新文件覆盖回旧内容(曾经是 flaky 根因:left:3, right:1)。
 /// Test helper: wait until the worker has drained every snapshot up to the current
 /// generation. The save_history at the end of load_history is asynchronous; without
 /// draining, an older snapshot can land AFTER a test rewrites the history file and
@@ -134,7 +117,6 @@ fn write_history_snapshot(job: PersistJob) {
         return;
     };
 
-    // 与关闭 persist 共用同一把 I/O 锁:关闭操作拿锁后删除文件,不会被旧快照写回。
     // Share the I/O lock with the persist-off path so disabling persistence deletes the file
     // after any in-progress write and prevents an older snapshot from being restored.
     let _io = PERSIST_IO_LOCK.lock().unwrap();
@@ -152,12 +134,10 @@ fn write_history_snapshot(job: PersistJob) {
     ));
     let ok = std::fs::write(&tmp, text.as_bytes()).is_ok();
     if ok {
-        // 权限 600:仅当前用户可读写。
         // Mode 600: owner-only access.
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
-    // 再次检查代数,丢弃排队期间已经过时的快照,避免旧内容覆盖新内容。
     // Check the generation again before rename so a snapshot invalidated while preparing the
     // file is discarded instead of replacing newer history.
     let current = persist_enabled() && PERSIST_GENERATION.load(Ordering::Acquire) == job.generation;
@@ -176,7 +156,6 @@ fn write_history_snapshot(job: PersistJob) {
     );
 }
 
-/// 解析历史文件文本:损坏或版本不匹配 → None(调用方按空历史处理)。
 /// Parse the history text: corruption or a version mismatch -> None (the caller treats it
 /// as an empty history).
 pub(super) fn parse_history(text: &str) -> Option<Vec<ClipEntry>> {
@@ -187,13 +166,6 @@ pub(super) fn parse_history(text: &str) -> Option<Vec<ClipEntry>> {
     Some(file.entries)
 }
 
-/// 加载时恢复条目的运行态字段(data_path/preview_png):
-/// - 数据条目:数据字节缺失(缓存被清过)→ None(坏条目丢弃);预览缺失 → 从数据
-///   字节重新生成并落盘
-/// - 文件复制条目:预览从 `{hash}.preview` 读回(缺失 → 从源文件重新生成并落盘,
-///   源文件也不在 → 空预览,行内显示文件名);data_path 恒为空(粘贴走 file-url)
-/// - 文本条目:原样返回
-///
 /// Restore a loaded entry's runtime fields (data_path/preview_png) on load:
 /// - data entries: a missing data file (the cache was swept) -> None (the broken entry is
 ///   dropped); a missing preview is regenerated from the data bytes and re-persisted
@@ -204,13 +176,12 @@ pub(super) fn parse_history(text: &str) -> Option<Vec<ClipEntry>> {
 /// - text entries: returned as-is
 pub(super) fn restore_loaded_entry(entry: ClipEntry) -> Option<ClipEntry> {
     let Some(img) = &entry.image else {
-        return Some(entry); // 文本条目 / a text entry
+        return Some(entry); // a text entry
     };
     if img.hash == 0 {
-        return Some(entry); // 解码失败的退化文件条目(无预览) / a degenerate file entry
+        return Some(entry); // a degenerate file entry
     }
     if let Some(path) = &img.source_path {
-        // 文件复制条目:预览优先读落盘的 {hash}.preview;缺失则从源文件重生。
         // File-copy entries: the preview comes from the persisted {hash}.preview; when
         // missing it is regenerated from the source file.
         let preview = cache_read_preview(img.hash).unwrap_or_else(|| {
@@ -257,8 +228,6 @@ pub(super) fn restore_loaded_entry(entry: ClipEntry) -> Option<ClipEntry> {
     })
 }
 
-/// 把当前历史保存到磁盘(仅 persist 开启时;临时文件 + rename 原子写,权限 600)。
-/// 内容为明文,隐私风险见 README。
 /// Save the current history to disk (only when persist is on; atomic temp+rename, mode
 /// 600). Plaintext -- the privacy implications are documented in the README.
 pub(super) fn save_history() {
@@ -266,7 +235,6 @@ pub(super) fn save_history() {
         return;
     }
     let mut hist = CLIP_HISTORY.lock().unwrap();
-    // 写盘前清理过期条目:同步减少磁盘文件中的过期条目(内存与持久化同步过期)。
     // Expire before writing: the disk file never keeps expired entries (expiry applies
     // to memory and persistence alike).
     expire_entries(&mut hist, now_secs(), ttl_secs());
@@ -283,9 +251,6 @@ pub(super) fn save_history() {
     }
 }
 
-/// 从磁盘加载历史并**合并**进当前内存(去重规则复用;置顶条目进置顶区,其余按
-/// 文件顺序(旧→新)追加到列表尾部,再按 max_entries 裁剪)。文件缺失/损坏/版本
-/// 不匹配 → 记日志,按空历史处理(与 config 同款弹性)。
 /// Load the persisted history and MERGE it into the in-memory history (reusing the dedup
 /// rules; pinned entries join the pinned block, the rest append in file order (old ->
 /// new) at the tail, then trim to max_entries). A missing/corrupt/version-mismatched file
@@ -300,7 +265,7 @@ pub(super) fn load_history() {
         if removed > 0 {
             log_debug!("[clip] swept {} orphan image cache files", removed);
         }
-        return; // 文件不存在 = 首次使用 / a missing file = first run
+        return; // a missing file = first run
     };
     let Some(entries) = parse_history(&text) else {
         log_info!(
@@ -316,7 +281,6 @@ pub(super) fn load_history() {
     let mut hist = CLIP_HISTORY.lock().unwrap();
     let max = max_entries();
     let mut history_changed = false;
-    // 过期条目直接跳过:不进入内存(磁盘文件随后由 save_history 回写清理)。
     // Expired entries are skipped outright: they never reach memory (the disk file is
     // cleaned up afterwards by the save_history rewrite).
     let ttl = ttl_secs();
@@ -330,16 +294,11 @@ pub(super) fn load_history() {
         }) {
             continue;
         }
-        // 数据条目:数据字节缺失(被清过缓存)→ 丢弃坏条目;预览缺失 → 重新解码。
         // Data entries: a missing data file (cache was swept) drops the broken entry; a
         // missing preview is regenerated from the data bytes.
         let Some(entry) = restore_loaded_entry(entry) else {
             continue;
         };
-        // 去重与 record_image 同规则:**按条目类型区分**。数据条目(source_path 恒为
-        // None)按内容 hash 判重——此前对所有图片统一按 source_path 比较,数据条目
-        // 之间 None==None 互相判重,重启加载时除第一条外全部被丢(缓存残留为证)。
-        // 文件条目按内容 hash 判重,退化条目(hash=0)按来源路径。
         // Dedup follows record_image, **split by entry kind**: data entries (source_path
         // is ALWAYS None) dedup by content hash -- comparing every image by source_path
         // used to make data entries dedup against each other (None==None), dropping all
@@ -368,7 +327,6 @@ pub(super) fn load_history() {
         if dup {
             continue;
         }
-        // 置顶条目进置顶区顶部(最新置顶在前),其余追加到列表尾部(旧→新)。
         // Pinned entries join the top of the pinned block (newest first); the rest append
         // at the tail (old -> new).
         if entry.pinned {
@@ -379,7 +337,6 @@ pub(super) fn load_history() {
         history_changed = true;
     }
     if hist.len() > max {
-        // 被裁条目的缓存文件一并删除——但仅当其 hash 不再被幸存条目引用。
         // Dropped entries' cache files go too -- but only when the hash is no longer
         // referenced by a survivor.
         for dropped in &hist[max..] {
@@ -398,16 +355,11 @@ pub(super) fn load_history() {
         log_debug!("[clip] swept {} orphan image cache files", swept);
     }
     log_info!("Clipboard history loaded ({} entries).", total);
-    // 加载后立刻回写:合并/裁剪/补预览的结果落盘,保证磁盘与内存一致。
     // Rewrite right after loading so the merge/trim/preview-fill result is on disk,
     // keeping disk and memory in sync.
     save_history();
 }
 
-/// persist 开关在设置页热切换时的应用规则:
-/// - 开启:从磁盘加载并合并进当前内存历史(load_history)
-/// - 关闭:删除磁盘历史文件(内存历史保留到本次退出)
-///
 /// Applied when the persist toggle changes in Settings:
 /// - ON: load and merge the persisted history into memory (load_history)
 /// - OFF: delete the history file (the in-memory history stays until this session ends)

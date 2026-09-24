@@ -40,19 +40,14 @@ mod window_server;
 
 use config::CONFIG;
 use i18n::t;
-// FFI 基础工具(make_nsstring/release_obj/CFRelease/ObjPtr/颜色图层 helper 等)集中在 ffi.rs
 // FFI primitives (make_nsstring/release_obj/CFRelease/ObjPtr/color+layer helpers) live in ffi.rs
 use ffi::*;
-// 主题与布局(Colors/配色/卡片窗口尺寸访问器/STATUS_H/H_PADDING)集中在 theme.rs
 // Theme and layout (Colors/colors/card+window size accessors/STATUS_H/H_PADDING) live in theme.rs
 use theme::*;
-// 切换器浮窗与卡片 UI(浮窗状态/卡片索引/回调/渲染/激活)集中在 overlay.rs
 // Switcher overlay & card UI (overlay state/card index/callbacks/rendering/activation) live in overlay.rs
 use overlay::*;
-// 状态栏菜单(菜单项状态/动作回调/标题刷新)集中在 menu.rs
 // Status bar menu (menu-item state/action callbacks/title refresh) live in menu.rs
 use menu::*;
-// 设置窗口(控件构造/窗口构建显示收集/校验告警/配置热应用)集中在 settings.rs
 // Settings window (control builders/window build-show-collect/validation alerts/hot config apply) live in settings.rs
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
@@ -75,14 +70,10 @@ use window_collector::{
     note_app_activated, note_app_terminated, remove_pid_mru, MruMap, WindowInfo,
 };
 
-// FFI 声明与 ObjC 桥接基础工具已移至 `ffi.rs` / FFI declarations and ObjC bridging primitives moved to `ffi.rs`
+// FFI declarations and ObjC bridging primitives moved to `ffi.rs`
 
-// 布局常量 STATUS_H / H_PADDING 已移至 `theme.rs` / layout constants moved to `theme.rs`
+// layout constants moved to `theme.rs`
 
-// ========== Types ==========
-
-// 跨模块共享的应用状态(overlay/menu/settings 均会访问,故 pub(crate))。
-// AppState 与 TAB_STATE 留在 main.rs,避免 overlay↔menu 互相依赖形成环。
 // Cross-module shared app state (pub(crate) so overlay/menu/settings can access).
 // AppState + TAB_STATE stay in main.rs to avoid an overlay<->menu dependency cycle.
 pub(crate) struct AppState {
@@ -91,33 +82,23 @@ pub(crate) struct AppState {
     pub(crate) visible: bool,
     pub(crate) mru: MruMap,
     pub(crate) focus_key: Option<(i32, u32)>,
-    // 召唤瞬间模型已持有的窗口 key 集合。浮窗打开后的刷新,只应把「召唤时就在场」的窗口
-    // 视为用户正在选择的目标;召唤后才出现的新窗口是 newcomer,不参与选中。
-    // None = 尚未记录(首帧前)。
     // Window keys the model already held at summon. Refreshes after the overlay shows only treat
     // windows present at the summon as the user's switching targets; a window appearing after the
     // summon is a newcomer and does not participate in the pick.
     // None = not yet recorded (before the first frame).
     pub(crate) summon_keys: Option<HashSet<(i32, u32)>>,
-    // 用户是否已主动移动过选中(Tab/方向键/点击)。false=选中仍是首帧默认落点,它应跟随
-    // 「召唤时语义」而不是当前 MRU 排序;true=用户已选具体窗口,刷新后需钉住该窗口 key。
     // false = the selection is still the first-frame default and follows the summon semantics,
     // not the live MRU order; true = the user picked a concrete window and the selection must
     // stay pinned to it across refreshes.
     pub(crate) user_picked: bool,
-    // 用户当前选中的目标窗口 key。user_picked=true 时它是刷新后必须钉住的窗口;
-    // user_picked=false 时它是首帧默认目标,刷新不因 MRU 排序漂移而改选它。
     // The user's current selection target key. When user_picked=true it is the window the pick
     // must stay pinned to after a refresh; when false it is the first-frame default target and a
     // refresh must not re-pick just because the MRU order shifted.
     pub(crate) selected_target_key: Option<(i32, u32)>,
-    // 首帧「待显示」标记:true 表示本次召唤已发起刷新、但浮窗尚未显示,等待 apply_window_refresh
-    // 拿到首帧快照后一次性显示(一次成图,避免「先显示旧快照再重排」的跳变)。
     // pending_first_show: true once this summon has kicked off a refresh but the overlay has not
     // been shown yet; apply_window_refresh consumes it to show once the first snapshot is ready
     // (single-shot render, avoiding the "show stale snapshot then reorder" jump).
     pub(crate) pending_first_show: bool,
-    // 首帧待显示时记录用户是按了正向还是反向 Tab,apply_window_refresh 用它在显示时定首选。
     // backward flag captured while the first frame is pending, so apply_window_refresh can decide
     // the initial pick direction when it finally shows.
     pub(crate) pending_first_backward: bool,
@@ -128,8 +109,6 @@ pub(crate) struct AppState {
 
 impl AppState {
     pub(crate) fn new() -> Self {
-        // 启动时用系统窗口前→后顺序预种 MRU:重启后初始顺序与原生 Cmd+Tab 的
-        // 应用级顺序一致(见 window_collector::seed_mru_from_system_order)。
         // Seed the MRU from the system's front-to-back window order at startup, so the
         // initial ordering after a restart matches the native app-level Cmd+Tab order.
         let mut mru = window_collector::seed_mru_from_system_order();
@@ -159,14 +138,11 @@ impl AppState {
     }
 }
 
-// Colors 结构已移至 `theme.rs` / moved to `theme.rs`
+// moved to `theme.rs`
 
-// ObjPtr / StaticClass 已移至 `ffi.rs` / moved to `ffi.rs`
-
-// ========== Main-thread runtime ==========
+// moved to `ffi.rs`
 
 /// Runtime state owned exclusively by the AppKit main thread.
-/// 只由 AppKit 主线程独占的运行时状态容器。
 pub(crate) struct AppRuntime {
     pub(crate) switcher: Option<AppState>,
 }
@@ -176,14 +152,12 @@ thread_local! {
 }
 
 /// Borrow the main-thread runtime for one short, synchronous state transition.
-/// 借用主线程 runtime 执行一次短生命周期、同步完成的状态迁移。
 pub(crate) fn with_tab_state<R>(f: impl FnOnce(&mut Option<AppState>) -> R) -> R {
     debug_assert_main_thread();
     APP_RUNTIME.with(|runtime| f(&mut runtime.borrow_mut().switcher))
 }
 
 /// UI runtime must never be accessed from a worker thread.
-/// UI runtime 不得从后台线程访问。
 pub(crate) fn debug_assert_main_thread() {
     #[cfg(debug_assertions)]
     unsafe {
@@ -195,7 +169,6 @@ pub(crate) fn debug_assert_main_thread() {
     }
 }
 
-/// 运行时主线程判断(非 debug 构建也生效):跨线程回调需要据此改道主线程。
 /// Runtime main-thread check (also active in release builds): cross-thread callbacks use it
 /// to hop back onto the main thread.
 pub(crate) fn is_main_thread() -> bool {
@@ -203,7 +176,6 @@ pub(crate) fn is_main_thread() -> bool {
 }
 
 /// Neutral app-level entry points used to avoid UI-module dependency cycles.
-/// 用于解除 UI 模块循环依赖的中性应用级入口。
 pub(crate) fn close_settings_for_switcher() {
     settings::close_settings_from_switcher();
 }
@@ -216,18 +188,11 @@ pub(crate) fn quit_from_settings() {
 /// instead of touching the switcher runtime.
 pub(crate) static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Cross-thread callback target used only to schedule work back onto AppKit's main thread.
-/// 跨线程回调 target 仅用于把工作投递回 AppKit 主线程，不暴露 UI 状态访问能力。
 pub(crate) static CONTROLLER: Mutex<Option<CallbackTarget>> = Mutex::new(None);
 
-/// 菜单项与设置按钮共用的 ObjC target 对象（OhMyTabMenuTarget2 实例）。
 /// Shared ObjC target object for menu items and settings buttons.
 pub(crate) static MENU_TARGET: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
-/// `MENU_TARGET` 的**跨线程派发**副本。录制线程要在后台用 performSelectorOnMainThread 唤醒
-/// 主线程回调,而 MENU_TARGET 是主线程专用槽 —— 后台读它会在 debug 构建触发主线程断言;
-/// 又因为调用点是 extern "C" 的 event tap 回调,panic 无法展开,整个进程会 abort(实测录制
-/// 侧键必崩)。这里存的是同一个进程生命周期的 target 对象,只用于"派发到主线程",不碰任何 UI。
-///
 /// Cross-thread dispatch handle for `MENU_TARGET`. The recording thread wakes the main-thread
 /// callback via performSelectorOnMainThread from the background, but MENU_TARGET is a
 /// main-thread-only slot -- reading it off-main trips the main-thread assertion in debug builds,
@@ -237,8 +202,6 @@ pub(crate) static MENU_TARGET: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::
 pub(crate) static MENU_TARGET_DISPATCH: Mutex<Option<CallbackTarget>> = Mutex::new(None);
 const GLOBAL_INPUT_CAPACITY: usize = 32;
 
-/// 全局输入 tap 的有界聚合状态。Tab 按键保留顺序，release 单独记账，低价值控制事件
-/// 只保留有限队列，避免主线程阻塞时 CGEventTap 无限堆积。
 /// Bounded aggregate for global input events. Tab presses keep order, release is latched
 /// separately, and low-value control events use a finite queue so a blocked main thread cannot
 /// cause the CGEventTap backlog to grow without bound.
@@ -261,7 +224,6 @@ impl PendingGlobalInput {
                 self.tab_steps.push_back(backward);
             }
             GlobalEvent::CmdReleased => {
-                // release 不能丢；即使对应的按下事件被合并，主线程也必须看到释放。
                 // Release must not be dropped: even when presses are coalesced, the main thread
                 // must observe the modifier release.
                 self.release_pending = true;
@@ -286,7 +248,6 @@ static PENDING_GLOBAL_INPUT: OnceLock<Mutex<PendingGlobalInput>> = OnceLock::new
 static GLOBAL_INPUT_DRAIN_SCHEDULED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// 从 event tap 线程非阻塞地聚合输入，并只安排一个主线程 drain 回调。
 /// Non-blockingly aggregate input on the event-tap thread and schedule at most one main-thread
 /// drain callback.
 pub(crate) fn enqueue_global_event(event: GlobalEvent) {
@@ -320,7 +281,6 @@ fn schedule_global_input_drain() {
     }
 }
 
-/// 主线程一次消费当前输入批次；release 在最后执行，保证快速 Tab 后的提交语义不变。
 /// Main-thread consumer for one input batch; release is applied last so rapid Tab presses retain
 /// their existing commit semantics.
 extern "C" fn on_global_input_drain(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -405,18 +365,11 @@ fn on_global_input_drain_inner() {
     schedule_global_input_drain();
 }
 
-// ========== Helper Functions ==========
-// make_nsstring / release_obj / has_accessibility_permission / hex_to_*color / layer_set_* 已移至 `ffi.rs`
 // make_nsstring / release_obj / has_accessibility_permission / hex_to_*color / layer_set_* moved to `ffi.rs`
 
 // colors_from_config / system_dark_mode / current_colors / card_* / icon_px / letter_px /
-// window_height / window_width 已移至 `theme.rs`
 // colors_from_config / system_dark_mode / current_colors / card_* / icon_px / letter_px /
 // window_height / window_width moved to `theme.rs`
-
-// ========== ObjC Method Implementations ==========
-
-// --- Controller ---
 
 extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
     callback_guard::void("on_app_activated", || on_app_activated_inner(notification));
@@ -435,8 +388,6 @@ fn on_app_activated_inner(notification: *mut c_void) {
         if app.is_null() {
             return;
         }
-        // 非常规策略 = 后台/辅助进程(如嵌套 helper):无窗口、图标多为通用占位图,
-        // 提取会以相同 bundle id 污染主应用的图标缓存;缩略图观察者也不需要。
         // Non-regular policy = background/helper processes: no windows, icons are
         // usually the generic placeholder, and extracting would poison the main
         // app's shared cache key; the thumbnail observer doesn't need them either.
@@ -445,18 +396,12 @@ fn on_app_activated_inner(notification: *mut c_void) {
             return;
         }
         let pid: i32 = msg_send![app, processIdentifier];
-        // 记录本次 App 激活 token：新窗口首次进入 MRU 表时用它作初始时间，异步查询
-        // 也用它识别迟到结果；已有窗口不会因这个 App 级时间被整体更新。
         // Record this app activation's token: newly discovered windows use it as their initial
         // MRU, and async queries use it to reject stale results. Existing windows are never
         // updated together from this app-level timestamp.
         let activated_at = note_app_activated(pid);
         let window_ids = window_server::window_ids_for_pid(pid);
         window_server::begin_activation(pid, &window_ids, activated_at);
-        // 后台线程解析焦点窗口的 CGWindowID 并 bump 窗口级 MRU。
-        // 系统 Cmd+Tab / Dock 点击等外部焦点切换通过此路径反馈到窗口排序中。
-        // kAXFocusedWindow 的 AX 查询可能阻塞最高 50ms（目标 App 无响应时），
-        // 必须放到后台线程避免卡住主线程 UI。
         // Resolve the focused window's CGWindowID off-main and bump window MRU.
         // External focus switches (system Cmd+Tab, Dock clicks) feed into window
         // ordering through this path. The kAXFocusedWindow AX query can block up
@@ -472,7 +417,6 @@ struct ActivationFocusTask {
 
 static ACTIVATION_FOCUS_TX: OnceLock<flume::Sender<ActivationFocusTask>> = OnceLock::new();
 
-/// 后台 AX 查询完成后只把值类型结果投递回主线程；窗口 MRU/焦点状态不再由工作线程修改。
 /// Value-only result delivered back to the main thread after the background AX query; worker
 /// threads never mutate window MRU/focus state directly.
 #[derive(Clone, Copy)]
@@ -487,7 +431,6 @@ static ACTIVATION_FOCUS_RESULTS: OnceLock<Mutex<Vec<ActivationFocusResult>>> = O
 static ACTIVATION_FOCUS_RESULT_SCHEDULED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// 启动固定大小的 AX 焦点查询队列，避免连续 App 激活创建无限短命线程。
 /// Start a fixed-size AX focus queue so repeated app activations cannot create an
 /// unbounded number of short-lived threads.
 fn start_activation_focus_scheduler() {
@@ -508,7 +451,6 @@ fn start_activation_focus_scheduler() {
     }
 }
 
-/// 安排一次主线程回调来消费激活焦点结果；多个 worker 结果合并到同一批次。
 /// Schedule one main-thread callback to consume activation-focus results; results from
 /// multiple workers are coalesced into one batch.
 fn schedule_activation_focus_result(result: ActivationFocusResult) {
@@ -533,7 +475,6 @@ fn schedule_activation_focus_result(result: ActivationFocusResult) {
     }
 }
 
-/// 主线程消费后台焦点查询结果，统一更新 AppState 并启动缩略图激活补拍。
 /// Main-thread consumer for background focus-query results. It updates AppState and starts
 /// the activation thumbnail refresh from one serialized state transition.
 extern "C" fn on_activation_focus_result(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -560,7 +501,6 @@ extern "C" fn on_activation_focus_result(_self: *mut c_void, _cmd: Sel, _arg: *m
         });
         thumbnail::refresh_after_activation(result.pid, result.cgwid, result.activated_at);
     }
-    // 结果可能恰好在 take 后到达，检查并补发下一批，避免 flag 清零窗口丢通知。
     // A result may arrive just after take; check and schedule another batch so the flag
     // transition cannot strand a notification.
     if results.lock().unwrap().is_empty() {
@@ -597,7 +537,6 @@ fn schedule_activation_focus(pid: i32, activated_at: std::time::Instant) {
 fn resolve_activation_focus(task: ActivationFocusTask) {
     unsafe {
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-        // 日志用于诊断 MRU 是否被正确 bump:成功打印 pid+cgwid;失败只进行有限重试。
         // Log to diagnose MRU bumping: failures are handled with bounded retries only.
         let retry_delays_ms = [0_u64, 50, 150, 300, 700, 1_000];
         let mut bumped = false;
@@ -619,10 +558,6 @@ fn resolve_activation_focus(task: ActivationFocusTask) {
             }
             if let Some(cgwid) = focused_window_cgwid(task.pid) {
                 if !window_server::ax_focus_backstop_allowed(task.pid) {
-                    // 该分支 = 焦点槽位已被占用:多数是切换器自己 raise 引起的回声
-                    // (MRU 已由 commit 提交,backstop 不得重复 bump),也可能是外部
-                    // 激活的 808 先到。两条路的缩略图激活补拍此前都被这里静默吞掉,
-                    // 导致"切换器切过去"后缩略图不刷新;MRU 静音照旧,只放行补拍。
                     // This branch = the focus slot is already consumed: usually the
                     // echo of our own switcher raise (MRU was committed by the commit
                     // path; the backstop must not bump again), sometimes an external
@@ -687,8 +622,6 @@ fn on_app_launched_inner(notification: *mut c_void) {
             match extract_icon_to_cache(pid) {
                 Some(_) => log_debug!("app-launch icon cached: pid={}", pid),
                 None => {
-                    // 刚启动瞬间 AppKit 的 icon 可能尚未就绪(app.icon 返回 nil),导致
-                    // 提取失败且无缓存留下——之后浮窗显示字母占位。延迟 ~1s 重试一次。
                     // The icon may not be ready the instant the app launches (app.icon nil),
                     // silently failing the extract and leaving the letter placeholder in the
                     // switcher. Retry once after ~1s.
@@ -703,15 +636,10 @@ fn on_app_launched_inner(notification: *mut c_void) {
             let _: () = msg_send![pool, drain];
         })
         .expect("spawn app-launch-icon thread");
-    // 缩略图:给新启动的 App 安装 AXObserver 并预生成其既有窗口。
     // Thumbnails: install the new app's AXObserver and pre-generate its windows.
     thumbnail::app_launched(pid);
 }
 
-/// NSApplicationWillTerminateNotification 转发点(main 线程):退出前把指针加速/跟踪速度
-/// 恢复成 macOS 系统值,对齐 LinearMouse 的 applicationWillTerminate 行为——否则设备上会
-/// 一直留着线性开关与我们的速度值(Cmd+Q、注销、关机都会走这里;菜单退出路径另有等价调用)。
-///
 /// Forwarding point for NSApplicationWillTerminateNotification (main thread): restore the macOS
 /// system pointer values before quitting, matching LinearMouse's applicationWillTerminate --
 /// otherwise the linear switch and our tracking speed stay on the device (Cmd+Q, logout and
@@ -722,8 +650,6 @@ extern "C" fn on_will_terminate(_self: *mut c_void, _cmd: Sel, _notification: *m
     });
 }
 
-/// NSWorkspaceDidTerminateApplicationNotification 转发点(main 线程):
-/// 通知缩略图模块取消捕获、清缓存并卸载该 App 的 observer。
 /// Forwarding point for NSWorkspaceDidTerminateApplicationNotification (main
 /// thread): tells the thumbnail module to cancel captures, clear cached frames,
 /// and uninstall that app's observer.
@@ -748,8 +674,6 @@ fn on_app_terminated_inner(notification: *mut c_void) {
         msg_send![app, processIdentifier]
     };
     if pid > 0 {
-        // 退出即清掉激活 token 与该 PID 的窗口 MRU，既会使未结束的重试失效，也避免
-        // PID/CGWindowID 复用继承旧进程的时间戳。
         // Termination clears the activation token and this PID's window MRUs immediately,
         // invalidating in-flight retries and preventing PID/CGWindowID reuse contamination.
         note_app_terminated(pid);
@@ -780,11 +704,9 @@ extern "C" fn on_locale_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void
     callback_guard::void("on_locale_changed", || on_locale_changed_inner(_self));
 }
 
-/// 滚动条样式变化回调:`NSScrollerPreferredScrollerStyleDidChangeNotification`。
 /// Scroller-style change callback for `NSScrollerPreferredScrollerStyleDidChangeNotification`.
 extern "C" fn on_scroller_style_changed(_self: *mut AnyObject, _cmd: Sel, _note: *mut AnyObject) {
     unsafe {
-        // 通知投递线程不保证是主线程,而重申样式与重排 UI 都必须在主线程。
         // Notification delivery thread isn't guaranteed to be main, but both re-asserting the style
         // and re-laying out UI must run on main.
         let is_main: bool = msg_send![class!(NSThread), isMainThread];
@@ -797,7 +719,7 @@ extern "C" fn on_scroller_style_changed(_self: *mut AnyObject, _cmd: Sel, _note:
             return;
         }
     }
-    // 诊断:记录是哪种通知把我们叫醒的。
+    // Diagnostic: log which notification woke us up.
     let name: *mut AnyObject = unsafe { msg_send![_note, name] };
     crate::log_debug!("[scroller] notification arrived: {}", unsafe {
         crate::ffi::nsstring_to_rust(name)
@@ -807,7 +729,6 @@ extern "C" fn on_scroller_style_changed(_self: *mut AnyObject, _cmd: Sel, _note:
 
 fn on_locale_changed_inner(_self: *mut c_void) {
     unsafe {
-        // 通知投递线程不保证是主线程,而刷新 UI 必须在主线程;非主线程时转到主线程重入本方法。
         // Notification delivery thread isn't guaranteed to be main, but UI refresh must run on
         // main; when off main, hop to main and re-enter this method.
         let is_main: bool = msg_send![class!(NSThread), isMainThread];
@@ -820,9 +741,6 @@ fn on_locale_changed_inner(_self: *mut c_void) {
             return;
         }
     }
-    // 系统语言变更(NSLocaleCurrentLocaleDidChangeNotification)。
-    // 仅当 locale 为 auto(系统派生)时 apply_config_locale 会真正改变解析结果;显式 locale 下短路。
-    // 重新解析后刷新菜单标题、作废设置窗口待下次按新 locale 重建。
     // System language changed (NSLocaleCurrentLocaleDidChangeNotification).
     // apply_config_locale only re-resolves when locale is auto (system-derived); it short-circuits
     // for an explicit locale. After re-resolving, refresh menu titles and invalidate the settings
@@ -834,7 +752,6 @@ fn on_locale_changed_inner(_self: *mut c_void) {
     clipboard::refresh_localized_ui();
 }
 
-/// 系统有效外观变化回调。仅在主题配置为 auto 时跟随系统,并把刷新切回主线程。
 /// Callback for effective-appearance changes. Follow the system only when theme is `auto`,
 /// and marshal all AppKit/UI work back to the main thread.
 extern "C" fn on_appearance_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -871,9 +788,6 @@ fn on_appearance_changed_inner(_self: *mut c_void) {
     overlay::apply_theme();
 }
 
-/// 屏幕参数变化回调(NSApplicationDidChangeScreenParametersNotification:外接/内建
-/// 显示器插拔、分辨率或缩放调整)。缓存缩略图携带旧配置下的窗口比例与像素高度,
-/// 浮窗面板宽高也随屏幕几何变化;统一交给 overlay 的去抖入口处理。
 /// Callback for screen-parameter changes (NSApplicationDidChangeScreenParametersNotification:
 /// external/built-in display plug/unplug, resolution or scaling adjustments). Cached
 /// thumbnails carry the old configuration's window aspect and pixel height, and the
@@ -887,7 +801,6 @@ extern "C" fn on_screen_parameters_changed(_self: *mut c_void, _cmd: Sel, _arg: 
 
 fn on_screen_parameters_changed_inner(_self: *mut c_void) {
     unsafe {
-        // 该通知由 NSApplication 在主线程投递,但沿用既有防御:非主线程时跳回主线程。
         // NSApplication posts this on the main thread; keep the existing defensive
         // hop anyway -- marshal back to main when delivered elsewhere.
         let is_main: bool = msg_send![class!(NSThread), isMainThread];
@@ -904,8 +817,6 @@ fn on_screen_parameters_changed_inner(_self: *mut c_void) {
     overlay::schedule_display_reconfiguration_refresh();
 }
 
-/// 鼠标插拔回调(在鼠标线程执行)经 performSelectorOnMainThread 转到主线程后的重入点:
-/// 设置窗口开着时即时刷新设备下拉框(重连后立即显示,无需点确定/重开)。
 /// Re-entry point after the mouse-thread plug/unplug callback hops to the main thread via
 /// performSelectorOnMainThread: refresh the settings device popup live (a reconnect shows
 /// immediately, no OK/reopen needed).
@@ -928,8 +839,6 @@ fn on_devices_changed_inner(_self: *mut c_void) {
     crate::settings::refresh_device_popup_if_open();
 }
 
-/// 缩略图捕获完成(worker 线程经 performSelectorOnMainThread 跳来):清空待投递
-/// 队列并原位重建受影响卡片。
 /// Thumbnail capture finished (hopped from the worker thread via
 /// performSelectorOnMainThread): drains the pending queue and rebuilds the
 /// affected cards in place.
@@ -943,7 +852,6 @@ extern "C" fn on_ax_raise(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     callback_guard::void("on_ax_raise", window_collector::handle_ax_raise_main);
 }
 
-/// 窗口控制(Option+方向键)主线程入口:arg 是 bridge 打包方向的 NSNumber。
 /// Window-control (Option+arrows) main-thread entry: arg is the bridge's NSNumber carrying
 /// the direction.
 extern "C" fn on_window_control(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
@@ -960,7 +868,6 @@ fn on_window_control_inner(arg: *mut c_void) {
     }
 }
 
-/// 跨屏窗口移动的延迟 frame 校验入口。
 /// Main-thread entry for deferred cross-display frame verification.
 extern "C" fn on_display_move_retry(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
     callback_guard::void("on_display_move_retry", || {
@@ -968,13 +875,11 @@ extern "C" fn on_display_move_retry(_self: *mut c_void, _cmd: Sel, arg: *mut c_v
     });
 }
 
-/// 动画型 App 的 snap 延迟收尾入口(动画结束后补写尺寸)。
 /// Main-thread entry for the deferred snap settle (write the size after the app's animation).
 extern "C" fn on_snap_verify(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
     callback_guard::void("on_snap_verify", || window_management::on_snap_verify(arg));
 }
 
-/// 主线程:执行快捷操作(bridge 投递过来的动作编号)。
 /// Main thread: run one quick action (an action id delivered by the bridge).
 extern "C" fn on_quick_action(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
     callback_guard::void("on_quick_action", || on_quick_action_inner(arg));
@@ -990,8 +895,6 @@ fn on_quick_action_inner(arg: *mut c_void) {
     }
 }
 
-// ========== Class Registration ==========
-
 fn create_overlay_window() -> *mut AnyObject {
     unsafe {
         let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
@@ -1003,16 +906,6 @@ fn create_overlay_window() -> *mut AnyObject {
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
         let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
 
-        // Borderless 窗口(styleMask = 0):无标题栏 -> 窗口可见形状 = 玻璃的圆角 alpha,
-        // 消除"圆角玻璃 + 方角窗口"在四角留下的透明突出,且四角对称。
-        // borderless 默认不能成为 key 窗口(收不到键盘),所以用自定义 NSPanel 子类
-        // 重写 canBecomeKeyWindow -> YES。原先用 titled + 透明标题栏绕开此子类,代价就是
-        // 四角不对称的透明突出(Regular 下尤为明显)。
-        //
-        // 关键:NSPanel + NSWindowStyleMaskNonactivatingPanel(1<<7) —— 面板成为 key 窗口时
-        // **不激活所属 app**(BetterCmdTab 面板同款)。召唤时 app 保持非激活,设置窗口就不会
-        // 被抬到活动 App 前面,切换器因此不再需要 stash/orderBack 机制。
-        //
         // Borderless window (styleMask = 0): no title bar -> the window's visible shape equals
         // the glass's rounded alpha, eliminating the transparent protrusions left at the corners by
         // a rounded glass inside a square window, and keeping all four corners symmetric. A borderless
@@ -1027,8 +920,6 @@ fn create_overlay_window() -> *mut AnyObject {
         // the switcher no longer needs the stash/orderBack machinery.
         let style: u64 = 1 << 7; // NSWindowStyleMaskBorderless(0) | NSWindowStyleMaskNonactivatingPanel
 
-        // 注册自定义窗口子类 OhMyTabOverlayWindow : NSPanel(仅重写 canBecomeKeyWindow)。
-        // 仿 OhMyTabContainerView 的 inline 注册;create_overlay_window 只调用一次,无重复注册风险。
         // Register the custom window subclass OhMyTabOverlayWindow : NSPanel (only overrides
         // canBecomeKeyWindow). Inline, like OhMyTabContainerView; create_overlay_window is called
         // once, so no double-registration.
@@ -1055,19 +946,11 @@ fn create_overlay_window() -> *mut AnyObject {
         // overlay level instead (currently 102): it is the smallest standard level that puts
         // this short-lived switcher above app-owned overlays without resorting to screen-saver
         // level or a Telegram-specific exception.
-        //
-        // Telegram 的全屏媒体查看器使用 popup-menu 层级(101),旧的 NSFloatingWindowLevel(3)
-        // 会被 WindowServer 合成在图片下面。改用 CoreGraphics 公开的 overlay 层级(当前为
-        // 102):这是能盖过应用浮层的最小标准层级,不会像 screen-saver 层级那样过高,也不需要
-        // 为 Telegram 写特例。
         let _: () = msg_send![window, setLevel: cg_overlay_window_level()];
 
         // Keep the switcher in the active app's fullscreen Space and out of normal window
         // cycling/Expose. CanJoinAllApplications is available on the project's macOS 13+
         // minimum and is specifically intended for floating system-style overlays.
-        //
-        // 允许切换器进入当前应用的全屏 Space,同时不参与普通窗口循环/Expose。项目最低支持
-        // macOS 13,因此可以使用专为跨应用系统浮层提供的 CanJoinAllApplications。
         let collection_behavior: usize = (1 << 0)  // NSWindowCollectionBehaviorCanJoinAllSpaces
             | (1 << 3) // NSWindowCollectionBehaviorTransient
             | (1 << 6) // NSWindowCollectionBehaviorIgnoresCycle
@@ -1075,22 +958,13 @@ fn create_overlay_window() -> *mut AnyObject {
             | (1 << 18); // NSWindowCollectionBehaviorCanJoinAllApplications (macOS 13+)
         let _: () = msg_send![window, setCollectionBehavior: collection_behavior];
 
-        // ========== Window transparency / Liquid Glass settings ==========
-        //
         // (1) Window must be non-opaque so the compositor allows content
         //     behind the window to show through.
         let _: () = msg_send![window, setOpaque: false];
-        //
         // (2) Window background must be clear, otherwise NSThemeFrame draws
         //     a solid color that blocks everything behind it.
         let clear_color: *mut AnyObject = msg_send![class!(NSColor), clearColor];
         let _: () = msg_send![window, setBackgroundColor: clear_color];
-        //
-        // (3) 关闭窗口阴影:NSGlassEffectView 自带 Liquid Glass 深度,窗口阴影是多余的。
-        //     其强度随内容 alpha 变化(Regular 玻璃不透明 -> 强阴影圈;Clear 近透明 -> 无),
-        //     会在 Regular 下沿玻璃边缘形成一圈多余暗环;且投影向下偏移,底角与顶角不一致
-        //     (这正是 borderless 后"边上还有一圈、底角形状不同"的来源)。关掉后只留玻璃自身
-        //     深度,边缘干净、四角一致。
         // (3) Disable the window shadow: NSGlassEffectView already provides Liquid Glass depth, so
         //     the window shadow is redundant. Its strength scales with content alpha (Regular's
         //     opaque glass -> a strong shadow ring; Clear's near-transparent glass -> none), which
@@ -1099,13 +973,11 @@ fn create_overlay_window() -> *mut AnyObject {
         //     still on the edge, bottom corners shaped differently" seen after going borderless).
         //     With it off, only the glass's own depth remains -- clean edges, symmetric corners.
         let _: () = msg_send![window, setHasShadow: false];
-        // =================================================================
 
         let _: () = msg_send![window, setReleasedWhenClosed: false];
         // Don't let the window hide on deactivate (we manage show/hide)
         let _: () = msg_send![window, setHidesOnDeactivate: false];
 
-        // --- Liquid Glass ---
         // macOS 26+  → NSGlassEffectView  (new public API, built-in blur)
         // macOS <26 → NSVisualEffectView  (withinWindow + Dark material)
         let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
@@ -1119,7 +991,7 @@ fn create_overlay_window() -> *mut AnyObject {
             let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
             let glass: *mut AnyObject = msg_send![glass_cls, alloc];
             let glass: *mut AnyObject = msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-            *GLASS_VIEW.lock().unwrap() = Some(ObjPtr::new(glass)); // 保存指针，供热重载重新应用 / save for hot reload
+            *GLASS_VIEW.lock().unwrap() = Some(ObjPtr::new(glass)); // save for hot reload
                                                                     // (4) Corner radius — native NSGlassEffectView property, from config.
             let _: () =
                 msg_send![glass, setCornerRadius: CONFIG.read().unwrap().appearance.corner_radius];
@@ -1141,11 +1013,6 @@ fn create_overlay_window() -> *mut AnyObject {
             let inner: *mut AnyObject = msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
             let _: () = msg_send![inner, setAutoresizingMask: 18u64];
             let _: () = msg_send![glass, setContentView: inner];
-            // (6.5) 硬裁剪背景模糊:NSGlassEffectView 的 cornerRadius 属性只圆了着色/外观,背景模糊
-            //       仍填满方角。给 layer 设 masksToBounds + cornerRadius 把模糊也裁进圆角(对
-            //       NSVisualEffectView 是公认有效的做法,NSGlassEffectView 待验证)。
-            //       放在 setContentView 之后 + 显式 setWantsLayer,确保 layer 已落实(非 nil),
-            //       masksToBounds 真正生效;并打日志确认。
             // (6.5) Hard-clip the backdrop blur: NSGlassEffectView's cornerRadius property only rounds
             //       the tint/appearance, not the backdrop blur. Setting masksToBounds + cornerRadius on
             //       the layer clips the blur into the round (the standard trick for NSVisualEffectView;
@@ -1173,7 +1040,6 @@ fn create_overlay_window() -> *mut AnyObject {
             content_parent = ve;
         }
 
-        // --- Container view for cards ---
         // Register OhMyTabContainerView : NSClipView
         let container_cls = {
             let name = CString::new("OhMyTabContainerView").unwrap();
@@ -1227,7 +1093,6 @@ fn create_overlay_window() -> *mut AnyObject {
             cls
         };
 
-        // 自定义滚动条由 NSView 显式处理拖拽,避免非激活面板中的 NSScroller 原生 tracking 失效。
         // The custom scrollbar handles dragging explicitly, avoiding native NSScroller tracking
         // failures inside the nonactivating panel.
         let scroller_cls = {
@@ -1290,7 +1155,6 @@ fn create_overlay_window() -> *mut AnyObject {
         };
 
         let container: *mut AnyObject = msg_send![container_cls, alloc];
-        // 卡片容器只覆盖状态栏以上的区域,NSClipView 会裁掉连续滚动时越过边界的卡片。
         // The card container covers only the area above the status footer; NSClipView clips cards
         // as they move continuously across the viewport edges.
         let container: *mut AnyObject = msg_send![container, initWithFrame: NSRect::new(
@@ -1302,7 +1166,6 @@ fn create_overlay_window() -> *mut AnyObject {
         let _: () = msg_send![content_parent, addSubview: container];
         *CONTAINER.lock().unwrap() = Some(ObjPtr::new(container));
 
-        // NSClipView 只负责可视窗口;卡片全部挂在持久 document view 上,滚动时只移动 bounds。
         // NSClipView is only the viewport; all cards live in a persistent document view and
         // scrolling moves the bounds instead of rebuilding the card hierarchy.
         let document: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -1319,7 +1182,6 @@ fn create_overlay_window() -> *mut AnyObject {
         *CARD_DOCUMENT.lock().unwrap() = Some(ObjPtr::new(document));
         release_obj(document);
 
-        // --- Status label at bottom (standard coords: y=0 is bottom) ---
         let status_font: *mut AnyObject = {
             let status_bar_weight = CONFIG.read().unwrap().fonts.status_bar_weight;
             msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(), weight: status_bar_weight]
@@ -1329,7 +1191,6 @@ fn create_overlay_window() -> *mut AnyObject {
         let _: () = msg_send![content_parent, addSubview: status_label];
         *STATUS_LABEL.lock().unwrap() = Some(ObjPtr::new(status_label));
 
-        // 指示器放在卡片容器外层,卡片重建不会改变它的 z-order 或中断显式拖拽。
         // Keep the indicator above the card container; rebuilding cards cannot change its z-order
         // or interrupt explicit dragging.
         let scroller: *mut AnyObject = msg_send![scroller_cls, alloc];
@@ -1522,7 +1383,6 @@ fn create_controller() -> *mut AnyObject {
             on_delayed_order_out as *mut c_void,
             types_v_obj.as_ptr(),
         );
-        // 延迟一拍的切换抬升:释放/点击/回车先让 vanish 提交上屏,下一拍再激活+抬升。
         // Deferred switch raise: release/click/Enter commit the vanish to the screen first,
         // then activate+raise on the next runloop turn.
         class_addMethod(
@@ -1597,7 +1457,6 @@ fn create_controller() -> *mut AnyObject {
 }
 
 /// Load the canonical app icon directly from the PNG bundled into the binary.
-/// 从二进制内嵌的 PNG 直接加载应用的统一图标。
 pub(crate) unsafe fn load_embedded_app_icon() -> *mut AnyObject {
     let png_bytes: &[u8] = include_bytes!("../assets/Icon-512x512.png");
     let data: *mut AnyObject = msg_send![
@@ -1617,9 +1476,6 @@ fn init_app() {
     }
 }
 
-/// 切换应用激活策略。设置窗口打开时切 .regular(进 Dock / 系统 Cmd+Tab / 调度中心图标),
-/// 关闭时切回 .accessory(纯菜单栏)。LSUIElement 默认 .accessory,设置窗口需要 .regular
-/// 才能正常激活抬升(打开设置时从别的 App 顶部弹出来)。
 /// Switch the app activation policy: .regular while the settings window is open (so it can
 /// activate normally and raise itself above the active app when opened), .accessory when
 /// closed (pure menu-bar). LSUIElement defaults to .accessory.
@@ -1635,9 +1491,6 @@ pub(crate) fn set_settings_activation_policy(regular: bool) {
 fn setup_status_bar() {
     unsafe {
         let status_bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
-        // NSVariableStatusItemLength = -1.0:槽位按 button 内容自适应,sizeToFit 后贴合图标,
-        // 不留多余边距。固定长度(曾经的 30.0)不会被 sizeToFit 缩小,槽位恒为 30pt,而图标只有
-        // ~17pt,居中/靠左后两侧留空,看着和邻居图标之间有很大间距。
         // NSVariableStatusItemLength = -1.0: the slot auto-sizes to the button's content, so after
         // sizeToFit it hugs the icon with no extra padding. A fixed length (the former 30.0) is not
         // shrunk by sizeToFit, so the slot stays 30pt while the icon is ~17pt, leaving visible gaps
@@ -1647,8 +1500,6 @@ fn setup_status_bar() {
 
         let button: *mut AnyObject = msg_send![status_item, button];
 
-        // Status bar icon: 单色 template PNG(两个矩形叠放,assets/statusbar-icon.png 嵌入二进制)。
-        // setTemplate:YES 让系统按菜单栏前景色渲染(浅/深色 menu bar 都清晰);sizeToFit 让 button 贴合 image。
         // Status bar icon: monochrome template PNG (two overlapped rects, assets/statusbar-icon.png embedded
         // in the binary). setTemplate:YES makes the system render it in the menu bar foreground color
         // (clear on both light/dark menu bars); sizeToFit hugs the image.
@@ -1661,15 +1512,12 @@ fn setup_status_bar() {
         let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
         let image: *mut AnyObject = msg_send![image, initWithData: nsdata];
         if !image.is_null() {
-            // statusbar-icon.png 是 162x128(横向留白更宽,让图标与邻居间距更舒展)。
-            // 设高度为 status bar 厚度、宽度按 PNG 纵横比等比缩放,保持图形像素大小不变、
-            // 只放大左右空隙。强制方形(icon_size x icon_size)会压扁非方形 PNG。
             // statusbar-icon.png is 162x128 (wider horizontal margins so the icon sits looser
             // from its neighbors). Set the height to the status-bar thickness and scale the width
             // by the PNG aspect ratio, keeping the glyph pixel size while widening the gaps.
             // Forcing a square (icon_size x icon_size) would squash the non-square PNG.
             let icon_size: f64 = msg_send![status_bar, thickness];
-            let aspect: f64 = 162.0 / 128.0; // statusbar-icon.png 纵横比 / PNG aspect ratio
+            let aspect: f64 = 162.0 / 128.0; // PNG aspect ratio
             let _: () = msg_send![image, setSize: NSSize::new(icon_size * aspect, icon_size)];
             let is_template: bool = true;
             let _: () = msg_send![image, setTemplate: is_template];
@@ -1798,9 +1646,6 @@ fn setup_status_bar() {
                 handle_open_privacy as *mut c_void,
                 types.as_ptr(),
             );
-            // 设置窗口的按钮 target 就是这个 action class(见 settings/window.rs 的 MENU_TARGET),
-            // 「查看引导」必须注册在这里;注册到主控制器 class 上会变成一个没人实现的 selector,
-            // 点了毫无反应(实测)。
             // The settings window's buttons target THIS action class (MENU_TARGET in
             // settings/window.rs), so "View guide" must be registered here; registering it on the
             // main controller class leaves an unimplemented selector and the click does nothing
@@ -1984,12 +1829,10 @@ fn setup_status_bar() {
         };
         let menu_target: *mut AnyObject = msg_send![action_cls as *const AnyObject, new];
         *MENU_TARGET.lock().unwrap() = Some(ObjPtr::new(menu_target));
-        // 同一个对象再存一份 Send 安全的句柄,供后台线程派发(见 MENU_TARGET_DISPATCH)。
         // Keep a Send-safe handle to the same object for background dispatch (see
         // MENU_TARGET_DISPATCH).
         *MENU_TARGET_DISPATCH.lock().unwrap() = Some(CallbackTarget(menu_target));
 
-        // 设置 item 放在菜单第一项,用于打开设置窗口。
         // Settings item comes first and opens the settings window.
         let settings_title = make_nsstring(&t("menu.settings"));
         let settings_key = make_nsstring("");
@@ -2000,12 +1843,10 @@ fn setup_status_bar() {
         let _: () = msg_send![settings_item, setTarget: menu_target];
         set_menu_item_title(settings_item, &t("menu.settings"));
         let _: () = msg_send![menu, addItem: settings_item];
-        // 设置与下方操作项之间的分隔线,样式与退出项上方一致。
         // Separate Settings from the action items below, matching the separator above Quit.
         let settings_separator: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![menu, addItem: settings_separator];
 
-        // 五个功能大类开关,紧跟设置项并位于快捷键模式切换之前；图标沿用设置侧栏语义图标。
         // Five top-level service toggles, between Settings and shortcut-mode switching; icons
         // reuse the semantic symbols from the settings sidebar.
         let service_separator: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
@@ -2030,7 +1871,6 @@ fn setup_status_bar() {
             });
         });
 
-        // 缩略图/纯图标模式切换项,紧跟快捷键模式切换项。
         // Thumbnail/icon-only mode toggle, placed immediately below the shortcut toggle.
         let thumbnail_title_key = if CONFIG.read().unwrap().layout.thumbnails_enabled {
             "menu.toggle_thumbnail_mode.to_icons"
@@ -2080,8 +1920,6 @@ fn setup_status_bar() {
 
         // Quit item
         let quit_title = make_nsstring(&t("menu.quit"));
-        // 绑定 Cmd+Q:仅在本 app 为前台(如设置窗口打开)时生效——菜单栏常驻 app
-        // 在后台时 Cmd+Q 由当前前台 app 处理,这是 macOS 语义。
         // Bind Cmd+Q: only effective while this app is frontmost (e.g. settings window open) --
         // when it's a background menu-bar app, Cmd+Q goes to the frontmost app per macOS semantics.
         let quit_key = make_nsstring("q");
@@ -2093,7 +1931,7 @@ fn setup_status_bar() {
         set_menu_item_title(quit_item, &t("menu.quit"));
         let _: () = msg_send![menu, addItem: quit_item];
 
-        // 登记固定标题项,供热重载 locale 时批量重设标题 / register fixed-title items for locale hot-reload
+        // register fixed-title items for locale hot-reload
         with_menu_ui(|ui| {
             ui.fixed = Some(FixedMenuItems {
                 settings: settings_item,
@@ -2105,9 +1943,6 @@ fn setup_status_bar() {
 
         let _: () = msg_send![status_item, setMenu: menu];
 
-        // 同时设为 mainMenu:让 AppKit 的 Cmd+Q keyEquivalent 分发能找到 Quit 项
-        // (accessory app 的 mainMenu 不会显示在菜单栏最左侧——那里只显示 regular app
-        // 的菜单,但快捷键路由仍生效,同 LinearMouse 的 storyboard mainMenu 机制)。
         // Also set as mainMenu so AppKit's Cmd+Q keyEquivalent dispatch can find the Quit item.
         // An accessory app's mainMenu is NOT shown in the menu bar's app area (that only shows
         // regular apps' menus), but key-equivalent routing still works -- same mechanism as
@@ -2122,10 +1957,6 @@ fn setup_status_bar() {
     }
 }
 
-// ========== Main ==========
-
-/// 打开「系统设置 -> 隐私与安全性 -> 辅助功能」面板(深链)。
-/// 供启动告警框与设置里的警告条按钮共用。
 /// Open System Settings -> Privacy & Security -> Accessibility (deep link).
 /// Shared by the startup alert and the settings warning banner's button.
 pub(crate) fn open_privacy_accessibility() {
@@ -2143,7 +1974,6 @@ pub(crate) fn open_privacy_accessibility() {
 }
 
 /// Open System Settings -> Privacy & Security -> Screen & System Audio Recording.
-/// 打开“系统设置 -> 隐私与安全性 -> 屏幕与系统音频录制”。
 pub(crate) fn open_privacy_screen_recording() {
     unsafe {
         let url_str = make_nsstring(
@@ -2158,8 +1988,6 @@ pub(crate) fn open_privacy_screen_recording() {
     }
 }
 
-/// 启动时若缺 Accessibility 权限,弹自定义告警框引导用户去授权。
-/// 事件监听线程已在后台有限次重试,用户授权后 tap 会自动建成,无需重启。
 /// Prompts the user with a custom alert at launch if Accessibility permission is missing.
 /// The event-monitor thread is already retrying in the background; once the user grants
 /// permission the tap is created automatically - no restart needed.
@@ -2167,9 +1995,7 @@ fn prompt_accessibility_if_needed() {
     if has_accessibility_permission() {
         return;
     }
-    // AppState::new 已记过 "No accessibility permission." 日志,这里只负责弹框,不重复记。
     // AppState::new already logged "No accessibility permission."; this only shows the alert.
-    // 辅助应用无 Dock 图标,主动激活以免告警框被其它窗口遮挡。
     // Accessory apps have no Dock icon; activate so the alert isn't hidden behind other windows.
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
@@ -2186,9 +2012,6 @@ fn prompt_accessibility_if_needed() {
     }
 }
 
-/// 开发开关解析:`--open-settings[=<general|about|0..6|1>]`,由 `scripts/dev-restart.sh`
-/// 透传(argv 是唯一通道,见 dev_flags 模块说明)。返回要打开的侧栏页索引
-/// (0=通用 … 6=关于);未设置或解析失败返回 None(正常启动不受影响)。
 /// Parses the development switch `--open-settings[=<general|about|0..6|1>]`, forwarded by
 /// `scripts/dev-restart.sh` (argv is the only channel; see the dev_flags module). Returns a
 /// sidebar page index (0=General .. 6=About); None when absent or unparsable, so a normal launch
@@ -2202,11 +2025,9 @@ fn open_settings_page_request() -> Option<usize> {
     }
 }
 
-/// App 入口:完整的启动/冒烟/运行循环(由 bin 薄壳调用,lib 化后保持行为不变)。
 /// App entry: the full startup/smoke/run loop (called by the thin bin wrapper; behavior
 /// is unchanged by the lib/bin split).
 pub fn run() {
-    // GUI 冒烟入口是测试子进程，允许它们与开发版并行；所有正常启动渠道共用同一把锁。
     // GUI smoke entry points are test subprocesses and may run alongside the development app;
     // every normal launch channel shares one lock.
     let is_gui_smoke_process = std::env::args().any(|arg| {
@@ -2228,9 +2049,6 @@ pub fn run() {
         }
     };
 
-    // 冒烟测试入口(--smoke-clipboard):在真实主线程 + NSApplication 环境里两次显示
-    // 剪贴板浮窗(覆盖 rebuild_rows 行清理路径),成功 exit(0)。由 clipboard 模块的
-    // #[ignore] 测试以子进程方式调用——测试 harness 的工作线程会被 AppKit 主线程限制拦下。
     // Smoke-test entry (--smoke-clipboard): show the clipboard picker twice on the real main
     // thread inside a real NSApplication (exercising rebuild_rows' row cleanup), exit(0) on
     // success. Invoked as a subprocess by the #[ignore] test in clipboard.rs -- the test
@@ -2239,11 +2057,10 @@ pub fn run() {
         unsafe {
             let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
             init_app();
-            // 冒烟模式:历史/缓存隔离到专用目录,避免写入用户的真实数据。
             // Smoke mode: isolate the history/cache into a dedicated directory so the
             // injected entries can never touch the user's real data.
             clipboard::set_smoke_mode();
-            drop(CONFIG.read().unwrap()); // 触发 CONFIG 初始化,与正常启动一致
+            drop(CONFIG.read().unwrap()); // force CONFIG initialization, matching a normal launch
             let ok = clipboard::smoke_runner();
             let _: () = msg_send![pool, drain];
             if !ok {
@@ -2257,10 +2074,9 @@ pub fn run() {
     // 1. Init NSApplication as accessory (no dock icon)
     init_app();
 
-    // 1b. 初始化 logger:早于一切,从 CONFIG 读日志级别,根据 cargo run / .app 决定输出目标。
     //     Init logger: before everything else, read log level from CONFIG, auto-detect dev/prod.
     {
-        let cfg = CONFIG.read().unwrap(); // 触发 LazyLock 初始化和 config 加载 / triggers LazyLock init + config load
+        let cfg = CONFIG.read().unwrap(); // triggers LazyLock init + config load
         let level = match cfg.logging.level.as_str() {
             "debug" => logger::LogLevel::Debug,
             _ => logger::LogLevel::Info,
@@ -2280,8 +2096,6 @@ pub fn run() {
     // 2. Register custom ObjC classes
     overlay::register_card_class();
 
-    // 2b. 强制 CONFIG 初始化(顺带应用 i18n locale),保证菜单按配置 locale 构建。
-    //     CONFIG 的 LazyLock 初始化会调用 i18n::apply_config_locale,无循环依赖。
     // Force CONFIG init (also applies i18n locale) so the menu is built with the configured
     // locale. CONFIG's LazyLock init calls i18n::apply_config_locale; no cycle (see i18n.rs).
     drop(CONFIG.read().unwrap());
@@ -2291,12 +2105,10 @@ pub fn run() {
 
     // 4. Initialize state
     ensure_icon_cache_dir();
-    // 一次性清理旧版按 PID 命名的缓存文件(纯数字 stem 的 .png),它们对新版无用、只会占地方。
     // One-shot cleanup of legacy PID-named cache files (purely-numeric-stem .png); useless to
     // the new version and just take up space.
     migrate_legacy_cache();
     cache_running_app_icons(); // pre-warm icon cache for all running apps
-                               // 剪贴板标题栏小图标预热:仅当剪贴板功能开启时才生成,否则跳过(避免无谓的提取)。
                                // Pre-warm the clipboard header's small icons: only when the clipboard feature is enabled,
                                // otherwise skip (no point extracting for a disabled feature).
     if CONFIG.read().unwrap().clipboard.enabled {
@@ -2329,7 +2141,6 @@ pub fn run() {
     *OVERLAY_WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
     // Hide initially
     hide_overlay();
-    // 点击浮窗外部 → 取消切换(面板失去 key 时收起,同 Esc 语义)。
     // A click outside the overlay cancels the switch (dismissed when the panel loses key).
     install_click_to_cancel();
 
@@ -2343,15 +2154,12 @@ pub fn run() {
     // the framework is not present yet.
     updater::initialize(CONFIG.read().unwrap().updates.automatically_check);
 
-    // 固定 worker 承接 App 激活后的 AX 聚焦查询，避免通知风暴时创建大量线程。
     // Start bounded workers for post-activation AX focus queries so notification bursts do not
     // create large numbers of threads.
     start_activation_focus_scheduler();
     window_server::start();
     let initial_subscriptions = window_collector::window_server_candidates();
     window_server::update_subscriptions(&initial_subscriptions);
-    // 注册浮窗呈现钩子:window_refresh 只保留 overlay → window_refresh 的单向触发,
-    // 反向的显示/重建动作经此缝隙在启动时注入(见 window_refresh::OverlayPresenter)。
     // Register the overlay presentation hooks: window_refresh keeps only the one-way
     // overlay -> window_refresh trigger direction; the reverse show/rebuild actions are
     // injected here at startup (see window_refresh::OverlayPresenter).
@@ -2392,7 +2200,6 @@ pub fn run() {
         ];
         CFRelease(launch_name as *const c_void);
 
-        // App 退出通知:缩略图模块据此取消待处理捕获并清理 observer/缓存。
         // App-terminate notice: the thumbnail module cancels pending captures and
         // removes the app's observer/cache entries.
         let term_name = make_nsstring("NSWorkspaceDidTerminateApplicationNotification");
@@ -2404,8 +2211,6 @@ pub fn run() {
         ];
         CFRelease(term_name as *const c_void);
 
-        // 监听系统语言变更,locale 为 auto 时实时跟随。NSLocaleCurrentLocaleDidChangeNotification
-        // 投递在默认通知中心(不是 workspace 中心),故用 NSNotificationCenter defaultCenter。
         // Listen for system language changes to live-follow when locale is auto.
         // NSLocaleCurrentLocaleDidChangeNotification is posted to the default notification center
         // (not the workspace center), so use NSNotificationCenter defaultCenter.
@@ -2419,8 +2224,6 @@ pub fn run() {
         ];
         CFRelease(locale_name as *const c_void);
 
-        // 监听滚动条样式变化:运行中偏好/输入设备切换会让 AppKit 把已有 scroll view 重新 tile 成
-        // 占宽的 legacy,右列被裁。这里重申 overlay,必要时按新的可视宽度重排(见 scroller 模块)。
         // Observe scroller-style changes: a runtime preference/input-device switch makes AppKit
         // re-tile existing scroll views as space-taking legacy, clipping the right column. Re-assert
         // overlay here and re-lay out when needed (see the scroller module).
@@ -2432,10 +2235,6 @@ pub fn run() {
             object: std::ptr::null::<AnyObject>(),
         ];
         CFRelease(scroller_name as *const c_void);
-        // 注意:`NSScrollerPreferredScrollerStyleDidChangeNotification` 实测**从不投递**(2026-09-22
-        // 用日志验证过),而窗口成为 key / app 重新激活这两条**会**投递,且正好覆盖"用户插上鼠标或
-        // 改了滚动条偏好之后回到设置窗口"这个真实场景。所以同步逻辑挂在这两条上:每次激活都实测
-        // 滚动条占位,变了就按新的可视宽度重排内容(见 scroller 模块)。
         // Note: `NSScrollerPreferredScrollerStyleDidChangeNotification` is never delivered (verified
         // with logging on 2026-09-22), while window-did-become-key and app-did-become-active are, and
         // those cover the real scenario (the user plugs in a mouse or changes the preference and then
@@ -2456,7 +2255,6 @@ pub fn run() {
             CFRelease(name_ns as *const c_void);
         }
 
-        // 监听系统有效外观变化,使 theme=auto 的窗口无需重启即可跟随明暗模式。
         // Observe effective appearance changes so theme=auto follows light/dark mode without
         // requiring a restart.
         let appearance_name =
@@ -2469,8 +2267,6 @@ pub fn run() {
         ];
         CFRelease(appearance_name as *const c_void);
 
-        // 窗口显式设置 Aqua/DarkAqua 后,应用自身的 effectiveAppearance 可能不会变化;
-        // macOS 会通过分布式通知广播系统级主题切换,因此同时监听该通知。
         // Once a window explicitly sets Aqua/DarkAqua, the app's effectiveAppearance may stay
         // unchanged. macOS broadcasts the system-level theme switch through the distributed
         // notification center, so observe that notification as well.
@@ -2485,8 +2281,6 @@ pub fn run() {
         ];
         CFRelease(distributed_theme_name as *const c_void);
 
-        // 监听屏幕参数变化(外接/内建显示器插拔、分辨率调整):缩略图缓存与浮窗布局
-        // 都依赖屏幕几何,变化后经 overlay 的去抖入口强制刷新一次。
         // Observe screen-parameter changes (display plug/unplug, resolution changes):
         // both the thumbnail cache and the overlay layout depend on screen geometry;
         // a change forces one debounced refresh through overlay's entry point.
@@ -2500,9 +2294,6 @@ pub fn run() {
         ];
         CFRelease(screen_params_name as *const c_void);
 
-        // 本进程即将退出:把指针加速/跟踪速度恢复成系统值(对齐 LinearMouse 的
-        // applicationWillTerminate)。Cmd+Q / 注销 / 关机都会投递这个通知;崩溃(SIGABRT)
-        // 不会,那种情况由下次启动时"未配置即写回系统值"的逻辑自愈。
         // This process is about to quit: restore the system pointer values (same as LinearMouse's
         // applicationWillTerminate). Cmd+Q / logout / shutdown post this; a crash (SIGABRT) does
         // not -- that case self-heals on the next launch through the "unset writes the system
@@ -2522,15 +2313,11 @@ pub fn run() {
     // Input is coalesced into one main-thread drain callback.
     start_event_monitor();
 
-    // 7b2. hover 轮询定时器在浮窗显示/隐藏时由 overlay 自行启停(show_overlay 调用
-    // start_hover_timer),无需在此启动:主线程 runloop 每 16ms 读全局鼠标位置命中
-    // 卡片,不依赖事件投递(侧键按住期间移动事件无法通过任何 tap/trapping 获取,实测)。
     // The hover poll timer is started/stopped by the overlay itself (start_hover_timer
     // from show_overlay): the main-thread runloop reads the global cursor position every
     // 16ms and hit-tests the cards, independent of event delivery (moves while a side
     // button is held can't be obtained via any tap/tracking, verified).
 
-    // 7b. 统一应用启动配置及所有可选运行时服务。
     // Apply startup configuration and every optional runtime service through one entry point.
     let startup_cfg = CONFIG.read().unwrap().clone();
     runtime_config::apply_config_change(
@@ -2539,17 +2326,12 @@ pub fn run() {
         runtime_config::ConfigChangeSource::Startup,
     );
 
-    // 内存采样线程放在可选模块启动之后,这样 60s 基线对应完整的功能画像。
     // Start memory sampling after optional modules so the 60s baseline represents the
     // complete feature profile.
     mem::start();
 
     // Global input is drained by handleGlobalInputDrain:; no bridge thread is needed.
 
-    // 冒烟测试入口(--smoke-overlay):完整初始化后直接驱动召唤路径，再遍历并循环
-    // 一次窗口列表并反向一步，覆盖超量布局的连续滚动/双向回绕；随后泵 2 秒主 runloop 让异步
-    // 缩略图投递(thumbnailReady)落地，无崩溃 exit(0)。用于无头验证 Cmd+Tab
-    // 链路(合成按键到不了 CGEventTap，无法从外部触发)。
     // Smoke-test entry (--smoke-overlay): after full init, drive a summon directly,
     // then traverse, wrap, and step backward once to cover continuous scrolling and bidirectional navigation. Pump
     // the main runloop for 2s so async thumbnail deliveries (thumbnailReady) land,
@@ -2595,7 +2377,6 @@ pub fn run() {
                 sel!(handleCmdShiftTabPressed:),
                 std::ptr::null_mut(),
             );
-            // 直接驱动同一套绝对偏移换算,覆盖小数位置与底部钳制;真实拖拽和滚轮也复用该路径。
             // Drive the same absolute-offset path to cover fractional positions and bottom
             // clamping; real dragging and wheel scrolling use this path too.
             for fraction in [0.35f64, 1.0f64] {
@@ -2610,15 +2391,11 @@ pub fn run() {
         }
     }
 
-    // 设置页冒烟测试入口:在真实 NSApplication 主线程中打开并遍历七个页面,让 runtime
-    // layout validator 检查最终 AppKit view tree。需要 GUI 会话,失败时由 panic/exit code 表示。
     // Settings layout smoke entry: open and traverse all seven pages on the real NSApplication
     // main thread so the runtime layout validator checks the final AppKit view tree. Requires a
     // GUI session; a panic/non-zero exit reports a failure.
     if std::env::args().any(|a| a == "--smoke-settings-layout") {
         unsafe {
-            // 布局校验的开关由 widgets::debug_validate_settings_page 自己识别
-            // `--smoke-settings-layout`,不再往环境里注入变量。
             // The layout validator recognizes `--smoke-settings-layout` on its own; nothing is
             // injected into the environment any more.
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
@@ -2633,7 +2410,6 @@ pub fn run() {
         }
     }
 
-    // 设置页状态同步冒烟入口:在真实 NSApplication 主线程中重建一次设置内容,检查配置值仍在。
     // Settings state-sync smoke entry: rebuild settings content once on the real AppKit main
     // thread and verify that the configured values survive the rebuild.
     if std::env::args().any(|a| a == "--smoke-settings-state-sync") {
@@ -2650,7 +2426,6 @@ pub fn run() {
         }
     }
 
-    // 条件行显隐冒烟入口:验证真实 AppKit 设置页在收起剪贴板条件行后相邻布局保持正确。
     // Conditional-row smoke entry: verify adjacent layout after collapsing a clipboard row in
     // the real AppKit settings page.
     if std::env::args().any(|a| a == "--smoke-settings-collapsible-row") {
@@ -2671,19 +2446,14 @@ pub fn run() {
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![nsapp, finishLaunching];
-        // 首次运行的引导(只自动弹一次):它已经讲了辅助功能,展示时就不再弹告警框,避免两个
-        // 框同时出现。缺权限且引导已被看过的老情况仍由告警框兜底。
         // The first-run guide (auto-shown once): it covers Accessibility itself, so the alert is
         // skipped while it is on screen -- two dialogs at once help nobody. The alert still covers
         // a missing grant once the guide has already been seen.
         let onboarding_shown = onboarding::maybe_show_on_launch();
-        // 启动后若缺 Accessibility 权限,弹告警框引导授权(事件监听线程已在后台有限次重试)。
         // Prompt for Accessibility if missing (the event-monitor thread is already retrying in the background).
         if !onboarding_shown {
             prompt_accessibility_if_needed();
         }
-        // 开发开关:启动即把设置窗口停在某页,便于用脚本/cua 验证界面。
-        // `--open-settings[=<general|about|0..6>]`(由 scripts/dev-restart.sh 透传)。
         // Development switch: park the settings window on a page at launch so the UI can be
         // verified from a script / cua.
         if let Some(page) = open_settings_page_request() {
@@ -2694,7 +2464,6 @@ pub fn run() {
 }
 
 /// Handle the detached permission-relaunch helper mode before AppKit startup.
-/// 在初始化 AppKit 前处理辅助功能恢复时使用的分离式重启助手参数。
 pub fn run_relaunch_helper_if_requested(args: &[String]) -> bool {
     restart::run_relaunch_helper_if_requested(args)
 }

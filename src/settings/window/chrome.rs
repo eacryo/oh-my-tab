@@ -1,5 +1,4 @@
 //! Native window classes and appearance surfaces for the settings window.
-//! 设置窗口的原生窗口类与外观表面。
 
 use super::*;
 
@@ -9,7 +8,6 @@ unsafe impl Sync for SettingsWindowClass {}
 
 /// Root view used by the settings window so AppKit can resolve macOS 27's container-relative
 /// corner radii while the layer still clips every custom child into the same surface.
-/// 设置窗口根视图：让 AppKit 在 macOS 27 上解析相对于窗口的圆角，同时由同一图层裁切所有自绘子视图。
 struct SettingsRootViewClass(*mut AnyObject);
 unsafe impl Send for SettingsRootViewClass {}
 unsafe impl Sync for SettingsRootViewClass {}
@@ -131,7 +129,6 @@ unsafe fn settings_root_view_for_window(window: *mut AnyObject) -> *mut AnyObjec
 }
 
 /// Reapply the dynamic corner result after AppKit lays out a resized window.
-/// 窗口 resize 后重新应用 AppKit 计算出的动态圆角。
 pub(in crate::settings) unsafe fn refresh_settings_root_corner(window: *mut AnyObject) {
     if AnyClass::get(c"NSViewCornerConfiguration").is_none()
         || AnyClass::get(c"NSViewCornerRadius").is_none()
@@ -224,7 +221,6 @@ pub(in crate::settings) fn settings_window_class() -> *mut AnyObject {
 }
 
 /// Apply the resolved appearance to the settings window and its semantic AppKit controls.
-/// 将解析后的主题应用到设置窗口及其依赖语义颜色的 AppKit 控件。
 pub(in crate::settings) unsafe fn apply_settings_window_appearance(window: *mut AnyObject) {
     let name = make_nsstring(if resolved_is_dark() {
         "NSAppearanceNameDarkAqua"

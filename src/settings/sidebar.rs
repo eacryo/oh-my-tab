@@ -1,4 +1,3 @@
-//! 设置窗口侧边栏和双栏背景构建。
 //! Settings sidebar and two-pane background construction.
 
 use super::*;
@@ -25,10 +24,6 @@ pub(super) unsafe fn build_settings_sidebar(
         card_w,
         card_radius,
     } = geometry;
-    // --- 侧边栏 sidebar(悬浮玻璃卡片,系统设置同款观感)---
-    // macOS 26+ 用 NSGlassEffectView(Liquid Glass,不设 tint 用系统默认);
-    // 旧版用 NSVisualEffectView + sidebar 材质(经典磨砂侧边栏)。
-    // --- Sidebar: a flat navigation column, matching the reference layout ---
     // macOS 26+ uses NSGlassEffectView (Liquid Glass, system default tint);
     // older macOS uses NSVisualEffectView with the sidebar material (classic frosted look).
     // The glass material supplies the subtle separation from the content pane.
@@ -41,7 +36,6 @@ pub(super) unsafe fn build_settings_sidebar(
         let _: () = msg_send![g, setStyle: 0i64]; // NSGlassEffectViewStyleRegular
         let _: () = msg_send![g, setCornerRadius: card_radius];
         // AppKit only guarantees Liquid Glass composition for the assigned contentView.
-        // NSGlassEffectView 的玻璃合成只保证作用于显式设置的 contentView。
         let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
         let inner: *mut AnyObject = msg_send![
             inner,
@@ -79,7 +73,6 @@ pub(super) unsafe fn build_settings_sidebar(
             crate::ffi::hex_to_cg_color(palette.sidebar_bg),
         );
     }
-    // 自适应:左侧锚定、高度随窗口拉伸(HeightSizable|MaxXMargin = 16|4 = 20)。
     // Adaptive: left-anchored, height stretches with the window.
     let _: () = msg_send![sidebar_view, setAutoresizingMask: 20u64];
     let _: () = msg_send![content, addSubview: sidebar_view];
@@ -108,8 +101,6 @@ pub(super) unsafe fn build_settings_sidebar(
 
     // The right detail pane has its own white surface, directly beside the gray sidebar.
     // The custom class adds the HTML `.main` radial highlight (82% 0%) over the flat fill.
-    // 右侧详情区自有浅色表面,紧邻灰色侧栏。自定义类在纯色填充之上叠加
-    // HTML `.main` 的径向高光(82% 0%)。
     let main_background: *mut AnyObject =
         msg_send![widgets::settings_pane_highlight_view_class(), alloc];
     let main_background: *mut AnyObject = msg_send![
@@ -155,7 +146,6 @@ pub(super) unsafe fn build_settings_sidebar(
     let _: () = msg_send![app_title, setFont: app_title_font];
     let app_title_color = settings_text_color(SettingsTextRole::Primary);
     let _: () = msg_send![app_title, setTextColor: app_title_color];
-    // 贴顶、贴左:窗口高度可调,身份区必须跟随红绿灯条带而不是漂向底部。
     // Top- and left-anchored: the window height is adjustable, so the identity block must
     // follow the traffic-light strip instead of drifting downward.
     let _: () = msg_send![app_title, setAutoresizingMask: 12u64];
@@ -181,11 +171,8 @@ pub(super) unsafe fn build_settings_sidebar(
     let _: () = msg_send![sidebar_content, addSubview: app_subtitle];
     release_obj(app_subtitle);
 
-    // 侧边栏选中行的高亮背景(layer-backed NSView,theme 感知色),先于按钮加入以便按钮文字叠在上层。
     // Highlight background for the selected sidebar row (layer-backed NSView, theme-aware color);
     // added before the buttons so button titles draw on top of it.
-    // 卡片内布局:内边距 12;按钮顶边按完整侧边栏高度定位,靠近红绿灯
-    // (btn_y0 为卡片坐标系)。
     // Card-local layout: 12pt inner margins. The buttons stay close to the traffic lights;
     // btn_y0 is anchored to the full sidebar height rather than the toolbar-inset height.
     let btn_w = card_w - 28.0;
@@ -195,12 +182,10 @@ pub(super) unsafe fn build_settings_sidebar(
     let btn_y0 = content_h - card_margin - 112.0 - btn_h;
     let highlight: *mut AnyObject = msg_send![class!(NSView), alloc];
     let highlight: *mut AnyObject = msg_send![highlight, initWithFrame: NSRect::new(NSPoint::new(14.0, btn_y0), NSSize::new(btn_w, btn_h))];
-    let _: () = msg_send![highlight, setAutoresizingMask: 12u64]; // 贴顶、贴左 / top- and left-anchored
+    let _: () = msg_send![highlight, setAutoresizingMask: 12u64]; // top- and left-anchored
     let _: () = msg_send![highlight, setWantsLayer: true];
     let hl_layer: *mut AnyObject = msg_send![highlight, layer];
     let _: () = msg_send![hl_layer, setCornerRadius: 10.0f64];
-    // 选中高亮用系统强调色(controlAccentColor),与 NSSwitch 开启的蓝色一致
-    // (LinearMouse 侧边栏选中高亮同款)。
     // Selection highlight uses the system accent color (controlAccentColor), matching the
     // NSSwitch's on-state blue (same as LinearMouse's sidebar selection highlight).
     // The redesign uses a soft accent wash for the active row rather than a solid blue fill.
@@ -231,6 +216,5 @@ pub(super) unsafe fn build_settings_sidebar(
 
     // HTML `.sidebar-footer`: the complete restore control is one semantic component, with
     // its separator and morphing confirm/cancel rows owned together.
-    // HTML `.sidebar-footer`:整个恢复控件作为一个语义组件，统一管理分割线和 morph 确认/取消行。
     ui.restore_defaults = RestoreDefaultsControl::build(sidebar_content, target, card_w);
 }

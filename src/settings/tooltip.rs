@@ -1,4 +1,3 @@
-//! 设置项禁用提示组件：Tooltip、禁止操作指针与悬停 tracking。
 //! Disabled-setting hint component: tooltips, the not-allowed cursor, and hover tracking.
 
 use objc2::runtime::{AnyObject, Sel};
@@ -9,27 +8,21 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 /// Disabled rows own their tracking areas through the corresponding AppKit view. Store only
 /// addresses so the registry never carries raw pointers across a thread boundary.
-/// 禁用 row 的 tracking area 由对应 AppKit view 持有；这里只存地址，避免静态注册表跨线程
-/// 携带裸指针。
 static DISABLED_TRACKING_AREAS: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Tooltip text is kept separately so a click can resolve the disabled view to its hint.
-/// 单独保存 Tooltip 文案，点击时通过禁用 view 找到对应提示。
 static DISABLED_TOOLTIPS: LazyLock<Mutex<HashMap<usize, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// At most one custom bubble is visible in the settings window at a time.
-/// 设置窗口同一时间最多显示一个自绘气泡。
 static ACTIVE_BUBBLE: Mutex<Option<usize>> = Mutex::new(None);
 
 /// The current dismissal timer; a new click replaces the old timer instead of racing it.
-/// 当前自动消失定时器；新的点击会替换旧定时器，避免旧定时器误关新提示。
 static ACTIVE_TIMER: Mutex<Option<usize>> = Mutex::new(None);
 
 /// The bubble is a passive overlay; keeping hit testing disabled ensures it never blocks the
 /// controls underneath it while it is visible.
-/// 气泡是被动提示层；关闭命中测试，确保显示期间也不会挡住下面的设置控件。
 fn tooltip_bubble_view_class() -> *mut AnyObject {
     static CLASS: OnceLock<usize> = OnceLock::new();
     *CLASS.get_or_init(|| unsafe {
@@ -111,7 +104,6 @@ extern "C" fn tooltip_timeout(_self: *mut c_void, _cmd: Sel, timer: *mut c_void)
 }
 
 /// Remove a bubble after its exit animation has finished.
-/// 在退出动画结束后移除气泡。
 extern "C" fn tooltip_remove_bubble(_self: *mut c_void, _cmd: Sel, timer: *mut c_void) {
     unsafe {
         let timer = timer as *mut AnyObject;
@@ -163,7 +155,6 @@ fn disabled_cursor_target() -> *mut AnyObject {
 }
 
 /// Shared disabled-setting hint behavior.
-/// 统一的设置项禁用提示行为。
 pub(super) struct SettingsTooltip;
 
 impl SettingsTooltip {
@@ -222,7 +213,6 @@ impl SettingsTooltip {
     }
 
     /// Hide and remove the current bubble atomically so dismissal cannot flash a stale frame.
-    /// 原子地隐藏并移除当前气泡，避免消失时闪回旧的可见帧。
     unsafe fn dismiss_bubble() {
         let active = ACTIVE_BUBBLE.lock().unwrap().take();
         let Some(bubble) = active else {
@@ -274,7 +264,6 @@ impl SettingsTooltip {
             selector: objc2::sel!(removeTooltipBubble:),
             // Retain the bubble through the timer so a rapid replacement or window rebuild
             // cannot leave the exit callback with a dangling pointer.
-            // 让 timer 持有 bubble，避免快速替换或重建窗口后退出回调访问悬空指针。
             userInfo: bubble,
             repeats: false
         ];
@@ -328,7 +317,6 @@ impl SettingsTooltip {
         let _: () = objc2::msg_send![animation, setToValue: to_value];
         let _: () = objc2::msg_send![animation, setDuration: duration];
         // Match the reference toast's fast-out, gentle-settle cubic curve.
-        // 匹配参考 Toast 的快速出场、柔和落位三次贝塞尔曲线。
         extern "C" {
             fn objc_msgSend();
         }
@@ -374,7 +362,6 @@ impl SettingsTooltip {
     }
 
     /// Show a transient success message in the settings window.
-    /// 在设置窗口中显示短暂的成功提示。
     pub(super) unsafe fn show_success_bubble(window: *mut AnyObject, text: &str) {
         Self::show_bubble_in_window(window, text, true);
     }
@@ -396,11 +383,9 @@ impl SettingsTooltip {
 
         // Center the bubble across the entire settings window and keep it near the lower edge,
         // matching the toast placement in the reference while staying above the footer area.
-        // 气泡相对于整个设置窗口水平居中并靠近底部，匹配参考 Toast 的位置，同时避开 footer 区域。
         let content_bounds: NSRect = objc2::msg_send![content, bounds];
         let palette = crate::theme::ui_palette();
         // The example toast is 360x82; use roughly 80% of that footprint for this window.
-        // 示例 Toast 尺寸约为 360×82，这里取其约 80% 的占地。
         let bubble_width = 288.0;
         let bubble_size = NSSize::new(bubble_width, 66.0);
         let horizontal_padding = 28.0;
@@ -423,7 +408,6 @@ impl SettingsTooltip {
         ];
         // Keep the centered bubble anchored to the bottom when the resizable settings window
         // changes height or width.
-        // 窗口尺寸变化时保持气泡水平居中并贴住 footer 上方的位置。
         let _: () = objc2::msg_send![bubble, setAutoresizingMask: 1u64 | 4u64 | 32u64];
         let _: () = objc2::msg_send![bubble, setOpaque: false];
         let _: () = objc2::msg_send![bubble, setAlphaValue: 1.0f64];
@@ -432,8 +416,6 @@ impl SettingsTooltip {
         if !layer.is_null() {
             // Explicitly anchor the transform at the bubble's bottom center so scale grows
             // upward from the footer instead of depending on the backing layer's default anchor.
-            // 明确将变换原点设为气泡底部中心，让缩放从 footer 正上方向上展开，不依赖 backing
-            // layer 的默认锚点。更新锚点时补偿 position，避免改变最终 frame 位置。
             let bounds: NSRect = objc2::msg_send![layer, bounds];
             let old_anchor: NSPoint = objc2::msg_send![layer, anchorPoint];
             let old_position: NSPoint = objc2::msg_send![layer, position];
@@ -451,7 +433,6 @@ impl SettingsTooltip {
             let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
             // Match the reference card: a near-opaque surface, large radius, and a soft
             // downward shadow that remains visible outside the bubble bounds.
-            // 匹配参考卡片：接近不透明的表面、较大圆角，以及向下延伸到气泡边界外的柔和阴影。
             let background = if palette.dark { 0x3A3A3FF2 } else { 0xF8F8F8F2 };
             crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
             let _: () = objc2::msg_send![layer, setCornerRadius: 16.0f64];
@@ -563,7 +544,6 @@ impl SettingsTooltip {
 
         // Center the icon and the measured text as one group, keeping their gap stable for every
         // localized message instead of centering the text in the remaining bubble width.
-        // 将图标和按实际宽度测量出的文本作为整体居中，避免不同语言下文本在剩余宽度中单独居中。
         let cell: *mut AnyObject = objc2::msg_send![label, cell];
         let measured: NSSize = if cell.is_null() {
             NSSize::new(0.0, 0.0)
@@ -603,7 +583,6 @@ impl SettingsTooltip {
         *ACTIVE_BUBBLE.lock().unwrap() = Some(bubble as usize);
 
         // Enter from below with the same scale/offset profile as the reference toast.
-        // 从下方以与参考 Toast 一致的缩放和位移轮廓进入。
         let layer: *mut AnyObject = objc2::msg_send![bubble, layer];
         if !layer.is_null() {
             Self::set_layer_model(layer, "opacity", 1.0);
@@ -649,7 +628,6 @@ impl SettingsTooltip {
     }
 
     /// Apply disabled-state hover behavior and remember the click hint.
-    /// 应用禁用状态的悬停行为并保存点击提示。
     pub(super) unsafe fn apply(view: *mut AnyObject, enabled: bool, tooltip: Option<&str>) {
         if view.is_null() {
             return;
@@ -674,28 +652,22 @@ impl SettingsTooltip {
     /// Both registries are keyed by the view's raw address and hold no ownership, so a view that
     /// is torn down without this call leaves a dangling key behind: the next mouse-down in the
     /// settings window (`handle_mouse_down`) then messages the freed object and traps.
-    /// 销毁 view 前必须先清掉它在禁用提示与 tracking 注册表里的条目。两张注册表都以裸地址为键、
-    /// 不持有所有权，漏清理会留下悬垂键：设置窗口的下一次鼠标按下会走到 handle_mouse_down，
-    /// 对已释放对象发消息并触发 EXC_BREAKPOINT。
     pub(super) unsafe fn forget(view: *mut AnyObject) {
         if view.is_null() {
             return;
         }
         DISABLED_TOOLTIPS.lock().unwrap().remove(&(view as usize));
-        // 还需在 view 存活时移除 tracking area(否则它会随 view 一起消失,但注册表仍留着键)。
         // The tracking area must also be removed while the view is alive, or the registry keeps
         // a key for it after the view goes away.
         Self::set_disabled_tracking(view, false);
     }
 
     /// Dismiss the current hint when navigation changes the visible settings page.
-    /// 切换当前可见设置页时关闭已有提示，避免上一页的气泡残留。
     pub(super) unsafe fn dismiss() {
         Self::hide_bubble();
     }
 
     /// Show the hint when a click lands on a disabled settings view; any other click hides it.
-    /// 点击禁用设置项时显示提示，点击其它位置时隐藏提示。
     pub(super) unsafe fn handle_mouse_down(window: *mut AnyObject, event: *mut AnyObject) {
         if window.is_null() || event.is_null() {
             return;
@@ -720,8 +692,6 @@ impl SettingsTooltip {
         // Resolve the actual AppKit hit view before checking candidates. Comparing the click
         // point with every disabled label's converted frame is too broad: a label can span most
         // of a row and overlap an unrelated action button (for example, Restore Defaults).
-        // 先通过 AppKit 命中测试得到真实点击 view，再检查候选项。逐一比较所有禁用 label 的
-        // 转换 frame 范围过于宽泛：label 可能覆盖整行，从而误判旁边的恢复默认按钮。
         let hit_view: *mut AnyObject = objc2::msg_send![content, hitTest: content_point];
         for (view_address, text) in candidates {
             let view = view_address as *mut AnyObject;
@@ -733,8 +703,6 @@ impl SettingsTooltip {
             // All settings pages share the same window and are hidden rather than destroyed.
             // Skip controls whose page is hidden, otherwise a hidden page can win this manual
             // coordinate lookup because its frame overlaps the visible page.
-            // 所有设置页共用同一个窗口，只通过隐藏切页。跳过隐藏页面中的控件，否则隐藏页的
-            // frame 可能与当前页面重叠并在手动坐标命中时抢先匹配。
             let hidden: bool = objc2::msg_send![view, isHiddenOrHasHiddenAncestor];
             if hidden {
                 continue;
@@ -742,8 +710,6 @@ impl SettingsTooltip {
 
             // A row label or a wrapped button title may be a child of the registered control,
             // so walk up from the hit view instead of requiring pointer equality.
-            // 行 label 或换行按钮标题可能是已注册控件的子 view，因此从命中 view 向上遍历，
-            // 不要求指针必须完全相等。
             let mut ancestor = hit_view;
             while !ancestor.is_null() {
                 if ancestor == view {
@@ -766,7 +732,6 @@ impl SettingsTooltip {
     }
 
     /// Drop tracking state before settings views are deallocated.
-    /// 设置 view 释放前清理 tracking 状态。
     pub(super) fn clear_runtime_registries() {
         unsafe {
             Self::cancel_timer();

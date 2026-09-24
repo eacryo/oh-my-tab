@@ -1,11 +1,7 @@
-//! 切换器浮窗 · 悬停机制:命中检测、悬停计时器与延迟滚动悬停。
 //! Hover machinery: hit-testing, the hover tick timer, and deferred scroll hover.
 
 use super::*;
 
-/// 按浮窗窗口坐标命中卡片并更新选中(主线程调用)。
-/// 鼠标来源有两种:container 的 tracking area(mouseMoved:)与鼠标事件 tap(经
-/// performSelectorOnMainThread 跳转)——两者都收敛到这里,坐标已转成浮窗窗口坐标。
 /// Select the card under a point in the overlay's window space (main thread).
 /// Two mouse sources converge here: the container's tracking area (mouseMoved:) and the
 /// mouse event tap (hopped here via performSelectorOnMainThread), both with the point
@@ -17,9 +13,6 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
     if !activates_on_hover() {
         return;
     }
-    // 移动本身即"开门"信号,同时按鼠标当前位置补选中。
-    // 为什么要补:浮窗打开瞬间鼠标可能已在卡片下,那次 mouseEntered 被门控吞掉且不会
-    // 重发(已 inside)——若只靠 mouseEntered,侧键召唤场景 hover 无法选中(实测)。
     // A move is itself the "gate open" signal; also select the card under the cursor.
     // Why: the overlay may open with the cursor already over a card -- that mouseEntered
     // gets swallowed by the gate and never re-fires (already inside), so side-button
@@ -30,7 +23,6 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
             Some(document) => document,
             None => return,
         };
-        // 交给 AppKit 转换,自动包含 clip bounds 的滚动偏移,不再手工减 container frame。
         // Let AppKit convert the point so clip bounds scrolling is included automatically.
         let document_point: NSPoint = msg_send![
             document,
@@ -71,15 +63,11 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
     }
 }
 
-/// 上次上报的鼠标屏幕坐标(hover 轮询 tick 用):位置未变化不重复命中(保持"移动才选中"
-/// 的门控语义,浮窗打开瞬间鼠标下的卡片不会被误选)。
 /// Last reported cursor screen point (hover poll tick): unchanged positions don't re-run the
 /// hit test (keeping the "select only after a move" gate, so the card under the cursor at
 /// summon time isn't auto-selected).
 pub(super) static HOVER_TICK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
-/// 将 CG 全局坐标转换为 AppKit 全局坐标。CG 的原点固定在主屏左上角，AppKit 的原点在
-/// 主屏左下角；副屏的位置和高度已经编码在全局 y 中，因此只能用主屏顶部作为翻转基准。
 /// Convert a global CG point to a global AppKit point. CG's origin is fixed at the primary
 /// display's top-left while AppKit's origin is at its bottom-left; secondary-display placement
 /// and height are already encoded in the global y coordinate, so the primary display's top is
@@ -91,7 +79,6 @@ fn cg_to_appkit_point(point: NSPoint, primary_frame: NSRect) -> NSPoint {
     )
 }
 
-/// 读取真正的主显示器 frame。不要使用 NSScreen.mainScreen，它会随 key window 跟随副屏。
 /// Read the actual primary display frame. Do not use NSScreen.mainScreen, which follows the key
 /// window and can move to a secondary display.
 unsafe fn primary_screen_frame() -> Option<NSRect> {
@@ -110,16 +97,11 @@ unsafe fn primary_screen_frame() -> Option<NSRect> {
     Some(msg_send![primary, frame])
 }
 
-/// hover 轮询定时器(主线程 runloop)。浮窗显示期间每 16ms 读一次 NSEvent.mouseLocation
-/// 命中卡片——不依赖任何事件投递(侧键按住期间移动事件是 OtherMouseDragged 且投递给
-/// 非浮窗目标,所有 tap/tracking 方案都收不到,实测;轮询直接查全局鼠标位置,与按钮
-/// 状态、事件流完全无关)。
 /// Hover poll timer (main-thread runloop). While the overlay is shown, NSEvent.mouseLocation
 /// is read every 16ms to hit-test the cards -- independent of event delivery (moves while a
 /// side button is held are OtherMouseDragged delivered to a non-overlay target; every
 /// tap/tracking approach failed to see them, verified; polling reads the global cursor
 /// directly, unrelated to button state or event routing).
-// Send+Sync 包装(与 device.rs 的 ManagerMutex 同模式):static Mutex 需要 Send+Sync。
 // Send+Sync wrapper (same pattern as device.rs's ManagerMutex): statics need Send+Sync.
 pub(super) struct TimerMutex(Mutex<Option<event_tap::CFRunLoopTimerRef>>);
 unsafe impl Send for TimerMutex {}
@@ -127,14 +109,11 @@ unsafe impl Sync for TimerMutex {}
 
 pub(super) static HOVER_TIMER: TimerMutex = TimerMutex(Mutex::new(None));
 
-/// hover 轮询 tick(主线程):读全局鼠标位置,位置变化时按卡片选中。
 /// Hover poll tick (main thread): reads the global cursor; on movement, selects the card.
 pub(super) unsafe extern "C" fn hover_tick_callback(
     _timer: event_tap::CFRunLoopTimerRef,
     _info: *mut c_void,
 ) {
-    // 用 CGEventCreate 读当前鼠标位置:不依赖 mouseMoved 事件流(侧键按住期间系统
-    // 不产生 mouseMoved,NSEvent.mouseLocation 冻结;CGEventCreate 直接查系统状态)。
     // Read the cursor via CGEventCreate: independent of the mouseMoved stream (while a side
     // button is held the system emits no mouseMoved, freezing NSEvent.mouseLocation;
     // CGEventCreate queries the system state directly).
@@ -144,9 +123,6 @@ pub(super) unsafe extern "C" fn hover_tick_callback(
     }
     let pos = event_tap::CGEventGetLocation(ev);
     CFRelease(ev as *const c_void);
-    // CGEventGetLocation 是 CG 坐标系(主屏左上原点),浮窗 frame 是 AppKit 坐标系
-    // (主屏左下原点)。必须使用 NSScreen.screens[0] 的顶部翻转 y，不能使用会随 key
-    // window 漂移的 NSScreen.mainScreen；否则切到副屏后两个 hover 来源会命中不同卡片。
     // CGEventGetLocation uses the CG coordinate space (primary-display top-left origin),
     // while window frames use AppKit's primary-display bottom-left origin. Flip y around the
     // top of NSScreen.screens[0], never NSScreen.mainScreen (which follows the key window);
@@ -166,9 +142,6 @@ pub(super) unsafe extern "C" fn hover_tick_callback(
     update_thumbnail_pointer_state(loc);
     let mut last = HOVER_TICK_POS.lock().unwrap();
     match *last {
-        // 首次 tick:last 还没基准,只记录位置不选中(保持"移动后才选中"的门控
-        // 语义,浮窗打开瞬间鼠标下的卡片不被误选)。原实现用 map_or(pos) 计算 dx,
-        // None 时 dx=dy=0 会被 <4.0 挡掉,last 无法更新、选中也无法触发(实测)。
         // First tick: no baseline yet -- record the position without selecting (keeping
         // the "select only after a move" gate; the card under the cursor at summon time
         // isn't auto-selected). The old code computed dx via map_or(pos), which made
@@ -191,12 +164,10 @@ pub(super) unsafe extern "C" fn hover_tick_callback(
     handle_hover_at(loc);
 }
 
-/// 浮窗显示期间启动 hover 轮询定时器(先清旧的)。由 show_overlay 调用。
 /// Start the hover poll timer while the overlay is shown (invalidating any stale one first).
 /// Called from show_overlay.
 pub(crate) fn start_hover_timer() {
     unsafe {
-        // 先停掉上次可能残留的定时器,避免重复 tick。
         // Invalidate any stale timer from a previous summon first.
         let old = HOVER_TIMER.0.lock().unwrap().take();
         if let Some(t) = old {
@@ -211,8 +182,8 @@ pub(crate) fn start_hover_timer() {
         };
         let timer = event_tap::CFRunLoopTimerCreate(
             std::ptr::null_mut(),
-            0.0,   // 立即触发一次(浮窗打开时若有移动立即选中)/ fire immediately
-            0.032, // 之后每 ~32ms(≈30fps,足够 hover 且不给主线程加负载)/
+            0.0,   // fire immediately
+            0.032, // then every ~32ms (about 30fps: enough for hover without loading the main thread)
             // then every ~32ms (~30fps; enough for hover without main-thread load)
             0,
             0,
@@ -230,7 +201,6 @@ pub(crate) fn start_hover_timer() {
     }
 }
 
-/// 浮窗消失时停止 hover 轮询。由 vanish_overlay / hide_overlay 调用。
 /// Stop the hover poll when the overlay disappears. Called from vanish_overlay / hide_overlay.
 pub(crate) fn stop_hover_timer() {
     unsafe {
@@ -242,9 +212,6 @@ pub(crate) fn stop_hover_timer() {
 }
 
 pub(crate) extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    // locationInWindow 相对事件源窗口 —— nonactivating 面板下 mouseMoved 事件可能
-    // 挂在下方 app 的窗口上,坐标不可靠(实测 loc 不随鼠标移动变化)。改用屏幕坐标
-    // (NSEvent.mouseLocation,左下原点)转浮窗窗口坐标,与卡片 frame 同基准。
     // locationInWindow is relative to the event's source window -- with the
     // nonactivating panel the mouseMoved event may attach to the app window below, so
     // the coordinate is unreliable (verified: loc never changed while moving). Use the
@@ -296,7 +263,6 @@ mod tests {
     fn cg_to_appkit_preserves_horizontal_secondary_display_position() {
         let primary = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0));
 
-        // 左侧显示器的全局 x 为负数；x 不能被镜像或额外偏移。
         // A display to the left has a negative global x; x must not be mirrored or offset.
         assert_point_eq(
             cg_to_appkit_point(NSPoint::new(-1280.0, 300.0), primary),
@@ -308,8 +274,6 @@ mod tests {
     fn cg_to_appkit_handles_vertical_displays_with_different_heights() {
         let primary = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(2560.0, 1440.0));
 
-        // 主屏上方 900 点显示器占 AppKit y=1440..2340，对应 Quartz y=-900..0；主屏下方
-        // 1200 点显示器占 AppKit y=-1200..0。
         // A 900-point display above the primary occupies AppKit y=1440..2340, which is
         // Quartz y=-900..0. A 1200-point display below occupies AppKit y=-1200..0.
         assert_point_eq(

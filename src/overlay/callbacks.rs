@@ -1,13 +1,7 @@
-//! 浮窗 · callbacks:Cmd+Tab 键盘/释放回调与首帧召唤状态机。
 //! Cmd+Tab keyboard/release callbacks and the first-summon state machine.
 
 use super::*;
 
-// ========== ObjC 回调实现 / ObjC callback implementations ==========
-
-/// 首帧一次性显示:用当前(已刷新的)窗口列表做首次选中并弹出浮窗。
-/// 由 apply_window_refresh 在消费 pending_first_show 时调用,保证「一次成图」——
-/// 显示的就是刷新后的最终排序,不存在「先显示旧快照、再重排」的两段跳变。
 /// First-frame single-shot show: pick the initial selection over the (refreshed) window list and
 /// pop the overlay. Called by apply_window_refresh when it consumes pending_first_show so the
 /// render is single-shot — the shown order is already the final one, no "stale then reorder" jump.
@@ -15,14 +9,11 @@ pub(crate) fn show_first_summon(backward: bool) {
     prepare_first_summon_state(backward);
     let t_show = Instant::now();
     show_overlay();
-    // TIMING-DEBUG 端到端:tap 回调 → 收集完成 → show_overlay。
+    // TIMING-DEBUG end to end: tap callback -> collection done -> show_overlay.
     log_debug!("[overlay] summon e2e={}ms", t_show.elapsed().as_millis());
 }
 
 /// Prepare the first summon selection without deciding whether the panel should be displayed.
-///
-/// 首帧选中状态的准备与显示分开,这样在等待快照时收到 CmdReleased 可以直接提交目标,
-/// 而不必先短暂显示再隐藏浮窗。
 fn prepare_first_summon_state(backward: bool) {
     cancel_scheduled_order_out();
     with_tab_state(|state_opt| {
@@ -41,9 +32,11 @@ fn prepare_first_summon_state(backward: bool) {
             focus_key,
             Instant::now(),
         );
-        // 记录召唤瞬间的窗口 key 集合:浮窗打开后的刷新只知道哪些窗口「召唤时就在场」。
+        // Snapshot the window keys present at summon time: refreshes after the overlay opens can only tell
+        // which windows were already there when it appeared.
         state.summon_keys = Some(state.windows.iter().map(|w| (w.pid, w.window_id)).collect());
-        // 首帧默认选中:锁定到「召唤时选中的目标窗口」,刷新不因 MRU 排序变化改选。
+        // First-frame default selection: pinned to the target window chosen at summon, so a refresh cannot
+        // re-pick it just because the MRU order moved.
         state.user_picked = false;
         state.selected_target_key = state
             .windows
@@ -81,8 +74,6 @@ fn step_switcher(backward: bool) {
     });
 
     if pending {
-        // 首帧快照仍在后台收集:本次浮窗尚未显示,重复 Tab 无法基于旧快照定位,先忽略,
-        // 等 apply_window_refresh 一次性显示后再由用户续按。
         // The first snapshot is still being collected: the overlay isn't shown yet, so another Tab
         // can't be positioned over the stale list — ignore it; let the user continue once the
         // single-shot show lands.
@@ -91,9 +82,6 @@ fn step_switcher(backward: bool) {
     }
 
     if first_show {
-        // 首帧:不再先显示旧快照,而是发起后台刷新并标记「待显示」,等 apply_window_refresh
-        // 拿到首帧快照后一次性显示(一次成图)。注意:发起刷新必须释放 TAB_STATE 锁,否则
-        // request_window_refresh 内部同样要锁 TAB_STATE,造成自死锁(主线程发生阻塞)。
         // First frame: don't show the stale startup snapshot first. Kick off a background refresh
         // and mark pending_first_show; apply_window_refresh consumes it and shows once the first
         // snapshot is ready (single-shot render). NB: the refresh must be kicked off AFTER dropping
@@ -108,10 +96,9 @@ fn step_switcher(backward: bool) {
             state.pending_first_release = false;
         });
         schedule_first_summon_timeout();
-        // TIMING-DEBUG 端到端:tap 回调 → 收集完成 → show_first_summon。
+        // TIMING-DEBUG end to end: tap callback -> collection done -> show_first_summon.
         log_debug!("[overlay] first summon pending (awaiting snapshot)");
     } else {
-        // 用户主动导航(重复按 Tab):选中不再是首帧默认落点,标记 user_picked 并钉住当前目标。
         // User-initiated navigation (repeated Tab): the pick is no longer the first-frame default;
         // mark user_picked and pin to the current target.
         with_tab_state(|state_opt| {
@@ -170,8 +157,6 @@ pub(crate) extern "C" fn on_first_summon_timeout(_self: *mut c_void, _cmd: Sel, 
     }
 }
 
-/// 用户主动改变了选中(导航/点击/悬停):标记 user_picked 并钉住当前选中窗口 key。
-/// 此后刷新将按该目标窗口恢复选中,再也不随列表重排漂移。调用方须已持有 TAB_STATE。
 /// User actively changed the selection (nav/click/hover): mark user_picked and pin to the newly
 /// selected window key. Subsequent refreshes restore the pick to that target instead of drifting
 /// with a reorder. Caller must already hold TAB_STATE.
@@ -195,7 +180,6 @@ pub(crate) extern "C" fn on_cmd_shift_tab_pressed(
     step_switcher(true);
 }
 
-/// 选中项越过当前视口时只移动 clip bounds,不重建卡片树;两种布局共用。
 /// Move clip bounds when selection leaves the viewport; both layouts share this path and never
 /// rebuild the card tree.
 fn refresh_after_selection_change(backfill_icons: bool) {
@@ -221,7 +205,6 @@ fn refresh_after_selection_change(backfill_icons: bool) {
     }
 }
 
-/// 从浮窗容器收集每张卡片的 (index, x, y, width)(按实际 frame,跳过状态栏标签)。
 /// Collect (index, x, y, width) for every card from the live container subviews
 /// (actual frames; the status-bar labels are skipped).
 unsafe fn collect_card_rects() -> Vec<(usize, f64, f64, f64)> {
@@ -240,11 +223,6 @@ unsafe fn collect_card_rects() -> Vec<(usize, f64, f64, f64)> {
     out
 }
 
-/// 几何感知的垂直导航(纯函数,可单测):跳到相邻行中水平中心最接近固定锚点的
-/// 那一张。锚点在连续上下移动期间不变，因此下再上可以回到原列附近。
-/// 返回 None 表示该方向没有相邻行(保持"到边不动"的语义)。
-/// 行聚类按 y 值 + 1.0pt 容差(同一行的卡片 y 完全相同,容差只防浮点漂移)。
-///
 /// Geometry-aware vertical navigation (pure, unit-testable): jump to the card in
 /// the adjacent row whose horizontal center is closest to a stable anchor.
 /// Flow rows hold different card counts, so a fixed step misaligns or runs off
@@ -261,7 +239,6 @@ pub(super) fn vertical_nav_index(
     let (_, _, cy, _) = rects.iter().find(|(i, ..)| *i == current)?;
     let cur_y = cy;
 
-    // 相邻行:同方向里 y 最接近当前行的那个。
     // The adjacent row: nearest y in the requested direction.
     let mut best_row_y: Option<f64> = None;
     for (_, _, y, _) in rects {
@@ -278,7 +255,6 @@ pub(super) fn vertical_nav_index(
     }
     let target_y = best_row_y?;
 
-    // 目标行内取水平中心最近者(平分取先出现者)。
     // Within the target row, pick the closest horizontal center (ties -> first).
     rects
         .iter()
@@ -321,7 +297,6 @@ pub(super) fn edge_row_nav_index(
         .map(|(index, ..)| *index)
 }
 
-/// 两种布局的上下导航:完整 document 中按固定水平锚点移动,越过视口时只移动 clip bounds。
 /// Vertical navigation for both layouts uses the complete document and a stable horizontal
 /// anchor; crossing the viewport only moves clip bounds.
 unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool) {
@@ -349,14 +324,9 @@ unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool
     }
 }
 
-// layer_set_shadow_color 的本地副本已删除:与 ffi::layer_set_shadow_color 逐行等价,
-// 拆分后 cancel.rs 的调用经 use super::* → ffi 的 pub(crate) 版本解析。
 // The local layer_set_shadow_color copy is removed: it is line-for-line identical to
 // ffi::layer_set_shadow_color, which cancel.rs now resolves to via use super::* -> ffi.
 
-/// 用 CALayer 的 KVC 子键设置二维平移，避免把 CATransform3D 结构体传进 objc2
-/// `msg_send!` 的运行时编码校验。父层变换会携带背景、描边、阴影与全部子视图，
-/// 同时不改 NSView frame，因此导航几何和原位卡片重建仍使用稳定基准。
 /// Set 2D translation through CALayer's KVC sub-key, avoiding CATransform3D in objc2's
 /// runtime-checked `msg_send!`. Transforming the parent carries its background, border,
 /// shadow, and all subviews without changing the NSView frame, so navigation geometry and
@@ -375,7 +345,6 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
         let shift_pressed = modifier_flags & NSEVENT_MODIFIER_FLAG_SHIFT != 0;
         // Collect navigation frames before borrowing runtime; reentrant AppKit calls happen
         // only after the state borrow has been released.
-        // 几何导航的 frame 收集先于借用 runtime；可能同步重入 AppKit 的调用均在释放借用后执行。
         let nav_rects = collect_card_rects();
         enum KeyAction {
             None,
@@ -435,7 +404,6 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
             }
             KeyAction::Vertical(up) => navigate_thumbnail_vertical(&nav_rects, up),
             KeyAction::Close(idx) => {
-                // Backspace:关闭选中卡片对应的窗口,浮窗保持打开。
                 // Backspace: close the selected card's window; the overlay stays open.
                 let card = card_document().and_then(|document| {
                     card_views(document)
@@ -454,7 +422,6 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 minimized,
             } => {
                 vanish_overlay();
-                // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释);抬升延迟一拍执行。
                 // Same as on_cmd_released: no settings-window handling needed (see comment
                 // there); the raise is deferred by one runloop turn so the vanish commits first.
                 schedule_deferred_raise(pid, cgwid, minimized);
@@ -470,7 +437,6 @@ pub(crate) extern "C" fn container_accepts_first_responder(_self: *mut c_void, _
     crate::callback_guard::bool("container_accepts_first_responder", false, || true)
 }
 
-/// 两种布局都接收鼠标滚轮和触控板滚动,保留 point 级增量而不是量化为整行。
 /// Both layouts handle mouse-wheel and trackpad scrolling, preserving point-level deltas instead
 /// of quantizing them to whole rows.
 pub(crate) extern "C" fn container_scroll_wheel(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
@@ -483,7 +449,6 @@ pub(crate) extern "C" fn container_scroll_wheel(_self: *mut c_void, _cmd: Sel, e
         if precise {
             scroll_thumbnail_by_offset(-delta_y);
         } else {
-            // 离散鼠标滚轮仍按一个小的 point 步长前进,而不是直接跳到下一行。
             // Discrete mouse wheels still advance by a small point step instead of jumping to the
             // next row immediately.
             const DISCRETE_SCROLL_STEP: f64 = 40.0;
@@ -543,10 +508,8 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_exited(
     }
 }
 
-/// HTML 参考稿的可见滑块宽度;命中区域仍由外层 14pt 视图提供。
 /// Visible thumb width from the HTML reference; the outer 14pt view remains the hit area.
 const THUMB_SCROLLBAR_VISIBLE_W: f64 = 5.0;
-/// HTML 参考稿的上下留白在原生浮窗中放大到 6pt,避免胶囊视觉上贴住边缘。
 /// Increase the HTML reference's edge inset to 6pt in the native panel so the capsule never looks flush with the viewport.
 const THUMB_SCROLLBAR_EDGE: f64 = 22.0;
 const THUMB_SCROLLBAR_MIN_KNOB_H: f64 = 24.0;
@@ -558,7 +521,6 @@ pub(crate) struct ThumbnailScrollerGeometry {
     pub(crate) thumb_travel: f64,
 }
 
-/// 用完整滚动范围计算胶囊位置;绘制和拖拽必须共享这套几何。
 /// Compute the capsule from the complete scroll range; drawing and dragging must share it.
 pub(crate) fn thumbnail_scroller_geometry(
     track_h: f64,
@@ -578,7 +540,6 @@ pub(crate) fn thumbnail_scroller_geometry(
     let progress = (offset / max_offset).clamp(0.0, 1.0);
     Some(ThumbnailScrollerGeometry {
         // AppKit coordinates grow upward: offset 0 is the visual top of the content.
-        // AppKit 坐标向上增长:offset 0 对应内容视觉上的顶部。
         knob_y: THUMB_SCROLLBAR_EDGE + (1.0 - progress) * thumb_travel,
         knob_h,
         thumb_travel,
@@ -637,7 +598,6 @@ pub(super) fn thumbnail_scroll_offset_for_drag(
     (start_offset + (start_y - current_y) * max_offset / thumb_travel).clamp(0.0, max_offset)
 }
 
-/// 只绘制滚动条胶囊;透明的整个指示器视图负责命中和显式拖拽。
 /// Draw only the scrollbar capsule; the transparent indicator view owns hit testing and explicit dragging.
 pub(crate) extern "C" fn thumbnail_scroller_draw_rect(
     scroller: *mut c_void,
@@ -686,7 +646,6 @@ pub(crate) extern "C" fn thumbnail_scroller_draw_rect(
     }
 }
 
-/// 非激活浮窗第一次点击也必须交给滚动条,否则按住 Command 时首个拖拽按下会被窗口层丢弃。
 /// A nonactivating panel must deliver the first click to the scroller, otherwise the initial
 /// drag press is discarded while Command is held.
 pub(crate) extern "C" fn thumbnail_scroller_accepts_first_mouse(
@@ -697,7 +656,6 @@ pub(crate) extern "C" fn thumbnail_scroller_accepts_first_mouse(
     true
 }
 
-/// 在非激活面板中显式开始拖拽,不依赖 NSScroller 的原生 tracking。
 /// Start dragging explicitly inside the nonactivating panel instead of relying on NSScroller tracking.
 pub(crate) extern "C" fn thumbnail_scroller_mouse_down(
     _self: *mut c_void,
@@ -784,7 +742,6 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_up(
     invalidate_thumbnail_scroller();
 }
 
-/// 更新滚动条的轨道、滑块比例和当前位置;无溢出时完全隐藏。
 /// Update the scroller track, knob proportion, and position; hide it when there is no overflow.
 pub(super) unsafe fn update_thumbnail_scroller(
     panel_w: f64,
@@ -808,7 +765,6 @@ pub(super) unsafe fn update_thumbnail_scroller(
         ),
         NSSize::new(THUMB_SCROLLBAR_W, (panel_h - footer_h).max(1.0)),
     );
-    // 拖拽期间保持命中视图的 frame 不变;卡片重建只刷新胶囊绘制。
     // Keep the hit view's frame stable during dragging; card rebuilds only refresh the capsule.
     if THUMB_SCROLL_DRAG.lock().unwrap().is_none() {
         let _: () = msg_send![scroller.0, setFrame: frame];
@@ -817,7 +773,6 @@ pub(super) unsafe fn update_thumbnail_scroller(
     let _: () = msg_send![scroller.0, setNeedsDisplay: true];
 }
 
-/// borderless 浮窗重写:允许成为 key 窗口(否则收不到键盘事件)。
 /// Override for the borderless overlay window: allow it to become key (otherwise it
 /// receives no keyboard events).
 pub(crate) extern "C" fn overlay_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> bool {

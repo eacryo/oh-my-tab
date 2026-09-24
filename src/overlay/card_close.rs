@@ -1,4 +1,3 @@
-//! 切换器浮窗 · 卡片关闭管线:关闭按钮类、关闭动画/补位重排、异步 AX 关闭与提交。
 //! Card-close pipeline: close button class, close animation/reflow, async AX close, and commit.
 
 use block2::RcBlock;
@@ -17,7 +16,6 @@ pub(super) unsafe fn card_views_by_key(
         .collect()
 }
 
-/// 在一个 AppKit 动画事务中让关闭卡片横向收窄,并让其余卡片直接移动到新槽位。
 /// In one AppKit animation transaction, collapse the closing card horizontally while moving
 /// every surviving card directly into its new slot.
 pub(super) unsafe fn animate_card_close_reflow(
@@ -35,7 +33,6 @@ pub(super) unsafe fn animate_card_close_reflow(
     }
     CFRelease(timing_name as *const c_void);
 
-    // 动画阶段直接使用提交后的 document 坐标,并同步调整父级视口和 document。
     // Use post-commit document coordinates during the animation and animate the containing
     // viewport and document alongside the cards.
     let document_delta = pending.final_document_h - pending.original_document_h;
@@ -55,7 +52,6 @@ pub(super) unsafe fn animate_card_close_reflow(
         };
         let animator: *mut AnyObject = msg_send![card, animator];
         if key == (pending.pid, pending.cgwid) {
-            // 用 frame 宽度收窄,而不是 transform.scale;这样后面的卡片可以无缝填入空出的槽位。
             // Collapse the frame width instead of using transform.scale, so following cards can
             // occupy the released slot without a visual gap.
             let layer: *mut AnyObject = msg_send![card, layer];
@@ -81,7 +77,6 @@ pub(super) unsafe fn animate_card_close_reflow(
     let completion: RcBlock<dyn Fn()> = RcBlock::new(|| {
         // NSAnimationContext completion handlers run on the main thread, so invoke the
         // registered Rust callback directly instead of sending performSelector:withObject:.
-        // 这里已经在主线程,直接调用 Rust 回调,避免把 Objective-C 的 id 返回值误判为 void。
         on_card_close_finished(
             std::ptr::null_mut(),
             sel!(handleCardCloseFinished:),
@@ -92,7 +87,6 @@ pub(super) unsafe fn animate_card_close_reflow(
     let _: () = msg_send![class!(NSAnimationContext), endGrouping];
 }
 
-/// AX 关闭失败时反向播放同一组 frame 动画,让卡片回到关闭前的位置。
 /// If AX rejects the close, reverse the same frame animation to restore every card.
 pub(super) unsafe fn restore_card_close_reflow(pending: &PendingCardClose) {
     let windows = with_tab_state(|state_opt| {
@@ -146,7 +140,6 @@ pub(super) unsafe fn restore_card_close_reflow(pending: &PendingCardClose) {
     refresh_highlight();
 }
 
-/// 卡片右上角关闭按钮的 action(sender = 关闭按钮):先播放退出动画,再关闭窗口。
 /// Action of the card's top-right close button: animate the card first, then close the window.
 pub(crate) extern "C" fn on_close_card(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     let card: *mut AnyObject = unsafe { msg_send![sender as *mut AnyObject, superview] };
@@ -159,13 +152,11 @@ pub(crate) extern "C" fn on_close_card(_self: *mut c_void, _cmd: Sel, sender: *m
     begin_close_window_at(idx, card);
 }
 
-/// 关闭动画是否正在进行;窗口刷新和缩略图回调在此期间必须暂缓结构性更新。
 /// Whether a close transition is active; structural refreshes must wait until it commits.
 pub(crate) fn card_close_in_progress() -> bool {
     PENDING_CARD_CLOSE.lock().unwrap().is_some()
 }
 
-/// 开始卡片收窄与补位动画;真正的 AX 关闭在后台线程执行。
 /// Start the slot-collapse/reflow animation; the actual AX close runs on a worker thread.
 pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
     if card_close_in_progress() {
@@ -266,11 +257,8 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
                 overflowed,
                 max_rows,
             );
-        // 面板高度必须走与正常布局同一个函数:否则关掉一个窗口时面板会突然变高(用户实测 901 > 875)。
         // The panel height must come from the same function the normal layout uses, or closing a card
         // makes the panel jump taller (measured 901 > 875).
-        // 面板高度只在 `thumb_close_panel_metrics` 里算,它复用正常布局的 `thumb_panel_metrics`;
-        // 这里自己拼公式会重演"关窗口时面板变高"(用户实测 901 > 875)。
         // The panel height is only computed in `thumb_close_panel_metrics`, which reuses the normal
         // layout's `thumb_panel_metrics`; building the formula here again is what re-introduced the
         // "panel grows while closing" bug (measured 901 > 875).
@@ -379,15 +367,11 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
     }
 }
 
-/// 将 AX 关闭放到后台线程,不让可见的卡片动画等待 AX 查询和消息超时。
 /// Run the AX close off the main thread so visible animation frames never wait on AX queries.
 pub(super) fn start_async_ax_close(key: WindowKey) {
     // The settings window belongs to this process. Do not invoke its AX close action from the
     // worker thread: the custom close callback performs AppKit work and must stay on the main
     // thread. The pending card-close animation will consume this successful result normally.
-    //
-    // 本进程的设置窗口不能在 worker 线程执行 AXPress:自定义关闭回调包含 AppKit 操作,必须
-    // 留在主线程。这里直接关闭设置窗口,后续仍由原有动画流程消费成功结果。
     if key.0 == std::process::id() as i32 {
         crate::settings::close_settings_from_switcher();
         let mut closing = PENDING_CARD_CLOSE.lock().unwrap();
@@ -401,7 +385,6 @@ pub(super) fn start_async_ax_close(key: WindowKey) {
     }
     std::thread::spawn(move || {
         let result = crate::window_collector::close_ax_window(key.0, key.1);
-        // 只发布值类型结果;主线程回调负责校验 key 并合并到动画状态。
         // Publish only a value result; the main-thread callback validates the key and merges it
         // into the animation state.
         *CARD_CLOSE_AX_RESULT.lock().unwrap() = Some((key, result));
@@ -419,7 +402,6 @@ pub(super) fn start_async_ax_close(key: WindowKey) {
     });
 }
 
-/// 动画与 AX 结果都完成后,按稳定窗口身份提交列表更新和重排。
 /// Commit the list update and reflow only after both the animation and AX result are ready.
 pub(super) fn finish_pending_card_close() {
     let pending = {
@@ -441,7 +423,6 @@ pub(super) fn finish_pending_card_close() {
     commit_pending_card_close(pending);
 }
 
-/// 退出动画结束回调;AX 可能已完成,也可能仍在后台执行。
 /// Exit-animation completion callback; AX may already be done or still be running in the worker.
 pub(crate) extern "C" fn on_card_close_finished(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     if let Some(pending) = PENDING_CARD_CLOSE.lock().unwrap().as_mut() {
@@ -450,7 +431,6 @@ pub(crate) extern "C" fn on_card_close_finished(_self: *mut c_void, _cmd: Sel, _
     finish_pending_card_close();
 }
 
-/// AX 关闭后台结果回调;与动画回调汇合后再触发 UI 重排。
 /// AX worker result callback; joins the animation callback before triggering UI reflow.
 pub(crate) extern "C" fn on_card_close_ax_result(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     let Some((key, result)) = CARD_CLOSE_AX_RESULT.lock().unwrap().take() else {
@@ -464,7 +444,6 @@ pub(crate) extern "C" fn on_card_close_ax_result(_self: *mut c_void, _cmd: Sel, 
     finish_pending_card_close();
 }
 
-/// 提交关闭结果时只移除一张 view,其余 view 保持不变并重新绑定新索引。
 /// Commit a successful close by removing one view only; surviving views are reused and rebound
 /// to their new indices.
 pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
@@ -504,7 +483,6 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
     };
 
     let views = unsafe { card_views_by_key(&old_windows) };
-    // 提交时把卡片与 document 一起平移;二者使用同一个 delta,所以用户看到的内容不会跳变。
     // Rebase cards and the document together at commit; sharing one delta keeps visible content
     // stationary instead of making the page jump while the scrollbar stays at its old position.
     let document_h = pending.final_document_h;
@@ -564,7 +542,6 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
         return;
     }
 
-    // 关闭动画期间同步缩放面板;提交时原子同步 document 和滚动元数据,避免跳变。
     // Animate the panel resize together with the close transition; atomically sync the document
     // and scroll metadata at commit so the content cannot jump independently of the scrollbar.
     let max_rows = (*THUMB_MAX_ROWS.lock().unwrap()).max(1);
@@ -630,7 +607,6 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
 
 const CMD_RELEASE_DIAGNOSTIC_DELAY: f64 = 0.03;
 
-/// 释放事件离开 session tap 后延迟采样修饰键状态。只延迟日志,不延迟提交行为。
 /// Sample the modifier state after the release event has cleared the session tap. Only the
 /// diagnostic is delayed; committing the selected window remains immediate.
 fn schedule_cmd_release_diagnostic() {
@@ -712,15 +688,10 @@ pub(super) fn commit_selected_window(overlay_was_visible: bool) {
     };
     let release_started = Instant::now();
     log_debug!("Switching to '{}' (pid={} cgwid={})", app_name, pid, cgwid);
-    // A2 层 E2E:记录本次抬窗的目标。此刻 `selected` 与 `windows` 都还在,但**可见性已经在上面
-    // 的闭包里置 false 了**,所以这份快照的 visible 是 false(脚本因此不在 commit 帧上断言可见性)。
     // A2 E2E: records the raise target. `selected` and `windows` are still intact here, but
     // visibility was already set to false by the closure above, so this snapshot reports
     // visible: false -- which is why the scripts never assert visibility on a commit frame.
     crate::e2e_state::record_commit(pid, cgwid, &app_name, selected);
-    // 先视觉隐藏(不 orderOut),再激活目标窗口,最后延迟 orderOut。
-    // 先 orderOut 会干扰 WindowServer 焦点路由,导致目标窗口的 first-responder 未确立
-    // (光标停止闪烁等)。对齐 BetterCmdTab 的 vanish() -> activate() -> dismiss() 时序。
     // Vanish first (no orderOut), then activate the target, then delay orderOut.
     // Ordering out first disrupts WindowServer focus routing, leaving the target's
     // first-responder unset (caret stops blinking, etc.). Mirrors BetterCmdTab's
@@ -728,7 +699,6 @@ pub(super) fn commit_selected_window(overlay_was_visible: bool) {
     if overlay_was_visible {
         vanish_overlay();
     }
-    // 设置窗口无需特殊处理:浮窗是 nonactivating 面板,设置窗口从未被抬升,切走后留在原位。
     // No settings-window handling is needed: this nonactivating panel never raises the settings
     // window, which remains in place after switching.
     activate_and_raise(pid, cgwid, minimized);
@@ -751,9 +721,6 @@ pub(super) fn commit_selected_window(overlay_was_visible: bool) {
     crate::performance::end_switcher_activity();
 }
 
-// --- Card View ---
-
-/// 设置关闭按钮的基础/悬停颜色与背景。
 /// Apply the close button's base or hover tint and background.
 pub(super) unsafe fn set_close_button_hover_style(button: *mut AnyObject, hovered: bool) {
     let tint = if hovered {
@@ -774,7 +741,6 @@ pub(super) unsafe fn set_close_button_hover_style(button: *mut AnyObject, hovere
     }
 }
 
-/// 关闭按钮的动态 ObjC 子类,用于实现 HTML 参考中的悬停红色反馈。
 /// Dynamic ObjC subclass for the close button, providing the HTML reference's red hover feedback.
 pub(super) fn close_button_class() -> *mut AnyObject {
     static CLOSE_BUTTON_CLASS: OnceLock<StaticClass> = OnceLock::new();
@@ -843,13 +809,11 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
     });
     if let Some((pid, cgwid, minimized)) = action {
         vanish_overlay();
-        // 同 on_cmd_released:设置窗口无需特殊处理(见该处注释);抬升延迟一拍执行。
         // Same as on_cmd_released: no settings-window handling needed (see comment there);
         // the raise is deferred by one runloop turn so the vanish commits first.
         schedule_deferred_raise(pid, cgwid, minimized);
         schedule_delayed_order_out();
     } else {
-        // 空窗口时无卡片可点,理论上不可达;防御性收起浮窗(与 on_cmd_released 一致)。
         // Unreachable in practice (no cards when the list is empty); defensive dismiss,
         // same as on_cmd_released.
         hide_overlay();

@@ -1,4 +1,3 @@
-//! 鼠标位置提示:用遮罩突出当前鼠标位置，移动鼠标后自动消失。
 //! Pointer locator: dim the desktop around the current cursor and disappear when it moves.
 
 use objc2::runtime::{AnyObject, Sel};
@@ -23,7 +22,6 @@ static LOCATOR: OnceLock<Locator> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static SPOTLIGHT_CENTER: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 
-/// 在当前鼠标位置显示遮罩，鼠标发生移动后隐藏。调用方已经位于 AppKit 主线程。
 /// Show the mask at the current cursor position and hide it when the cursor moves. The caller
 /// is already on AppKit's main thread.
 pub(crate) fn show() {
@@ -46,7 +44,6 @@ pub(crate) fn show() {
 }
 
 /// Polling avoids installing another global event tap solely for this short-lived visual cue.
-/// 通过短周期轮询避免仅为这个临时视觉提示再安装一个全局事件 tap。
 unsafe extern "C" fn check_pointer(this: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     if !ACTIVE.load(Ordering::Acquire) {
         return;
@@ -73,7 +70,6 @@ unsafe fn schedule_pointer_check(window: *mut AnyObject) {
 }
 
 /// Draw the dimming mask and punch a transparent hole around the cursor.
-/// 绘制半透明遮罩，并在鼠标位置挖出透明圆孔。
 unsafe extern "C" fn draw_mask(this: *mut c_void, _cmd: Sel, _dirty_rect: NSRect) {
     let view = this as *mut AnyObject;
     let bounds: NSRect = msg_send![view, bounds];
@@ -92,7 +88,6 @@ unsafe extern "C" fn draw_mask(this: *mut c_void, _cmd: Sel, _dirty_rect: NSRect
     let _: () = msg_send![mask_color, set];
 
     // Use an even-odd path so the spotlight is transparent in the same draw operation.
-    // 使用偶奇填充路径，让聚光圆孔在同一次绘制中保持透明，避免事后擦除造成残留变暗。
     let path: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
     let _: () = msg_send![path, appendBezierPathWithRect: bounds];
     let _: () = msg_send![path, appendBezierPathWithOvalInRect: hole];

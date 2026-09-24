@@ -4,8 +4,6 @@ use std::sync::{mpsc, RwLock};
 
 use crate::i18n::{self, tf};
 
-// ========== Structs ==========
-
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 #[derive(Default)]
@@ -29,13 +27,10 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct QuickActionsSection {
-    // 快捷操作总开关(Option+I/E/D/L 与双击 Control 全局热键)。默认 false:全局拦截会覆盖其他应用的
-    // Option+字母组合(部分布局下是死键/特殊字符),必须由用户显式开启。
     // Quick-actions master switch (Option+I/E/D/L and double-Control global hotkeys). Default false: the global
     // interception overrides other apps' Option+letters (dead keys / special chars on some
     // layouts), so it must be explicitly opted in.
     pub enabled: bool,
-    // 子开关默认 true,保证旧配置仅有 enabled=true 时行为不变。
     // Sub-switches default to true so existing configs with only enabled=true keep working.
     #[serde(default = "default_quick_action_enabled")]
     pub open_settings: bool,
@@ -69,13 +64,10 @@ impl Default for QuickActionsSection {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct WindowControlSection {
-    // 窗口控制总开关(Option+方向键)。默认 false:组合键全局拦截会覆盖其他应用的
-    // Option+方向键(如文本按词移动),必须由用户显式开启。
     // Window-control master switch (Option + arrow keys). Default false: the global
     // interception overrides other apps' Option+arrows (e.g. move-by-word in text), so it
     // must be explicitly opted in.
     pub enabled: bool,
-    // 方向开关默认 true,保证旧配置仅有 enabled=true 时行为不变。
     // Direction switches default to true so existing configs with only enabled=true keep working.
     #[serde(default = "default_window_control_direction_enabled")]
     pub up: bool,
@@ -85,7 +77,6 @@ pub struct WindowControlSection {
     pub left: bool,
     #[serde(default = "default_window_control_direction_enabled")]
     pub right: bool,
-    // 跨显示器快捷键默认开启,与方向快捷键保持一致。
     // Cross-display shortcuts default to enabled, matching the direction shortcuts.
     #[serde(default = "default_window_control_direction_enabled")]
     pub display_up: bool,
@@ -129,23 +120,17 @@ pub struct Appearance {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Layout {
-    // 窗口缩略图总开关:关闭后浮窗保持纯图标渲染,缩略图服务不启动。默认开;
-    // 无屏幕录制权限时自动休眠(见 thumbnail 模块)。
     // Window-thumbnail master switch: off = the overlay keeps icon-only rendering
     // and the thumbnail service never starts. Default on; auto-sleeps without the
     // Screen Recording permission (see the thumbnail module).
     pub thumbnails_enabled: bool,
-    // 前台窗口缩略图后台预热:开启后在浮窗隐藏时低频刷新当前前台窗口;默认关以控制后台开销。
     // Focused-window thumbnail prewarm: when enabled, refresh the frontmost window at a low rate
     // while the overlay is hidden. Default off to keep background work bounded.
     pub focused_thumbnail_prewarm: bool,
-    // 卡片标题中的应用名:开启后在缩略图卡片的标题行显示应用名,与窗口标题以 " · " 分隔;
-    // 窗口无标题、或标题与应用名文本相同时只显示一份。默认关(仅窗口标题)。
     // App name in card titles: when enabled the thumbnail card's caption shows the app name
     // before the window title, separated by " · "; a titleless window, or one whose title equals
     // the app name, shows a single copy. Default off (window title only).
     pub show_app_name_in_cards: bool,
-    // 卡片文字大小(点):窗口标题和应用名按比例缩放;纯图标模式的大图标不受影响。
     // Card text size (points): the window title and app name scale proportionally; the large
     // icon in icon-only mode is unaffected.
     pub card_text_size: f64,
@@ -196,24 +181,17 @@ pub struct I18nSection {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct WindowsSection {
-    // 窗口切换总开关:关闭后 Cmd+Tab 透传给系统(原生切换器恢复),tap 不再拦截。
-    // 默认 true(保持历史行为)。
     // Master switch for the app switcher: when off, Cmd+Tab passes through to the system
     // (the native switcher takes over) and the tap stops intercepting. Defaults to true.
     pub enabled: bool,
-    // 默认 false(不显示最小化窗口,与历史行为一致);bool::default() 即 false,故 Default 可直接派生。
     // Defaults to false (hide minimized windows, matching prior behavior); bool::default() is
     // false, so Default can be derived directly.
     pub show_minimized: bool,
-    // 默认不显示通过 Command+H 隐藏的应用窗口。
     // Do not show windows belonging to Command+H-hidden apps by default.
     pub show_hidden_app_windows: bool,
-    // 浮窗显示位置:"active_window" = 跟随激活窗口所在屏幕,"main" = 始终显示在主屏幕。
-    // 默认跟随激活窗口(多显示器用户开箱即得新体验)。
     // Overlay display position: "active_window" = follow the active window's screen,
     // "main" = always on the main screen. Defaults to following the active window.
     pub overlay_position: String,
-    // 窗口激活方式:"hover" = 鼠标悬停时激活,"click" = 点击窗口时激活。默认悬停。
     // Window activation mode: "hover" activates on hover; "click" activates on click.
     // Defaults to hover.
     pub activation_mode: String,
@@ -234,10 +212,8 @@ impl Default for WindowsSection {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct LoggingSection {
-    // 日志级别:"debug","info";默认 "info"(常规档,不刷屏;debug 输出全量调试细节)。
     // Log level: "debug" | "info"; default "info" (normal tier, no spam; debug emits all detail).
     pub level: String,
-    // 日志文件路径;空=使用默认滚动文件 ~/Library/Logs/oh-my-tab/oh-my-tab.log。
     // Log file path; empty = use the default rolling file under ~/Library/Logs/oh-my-tab/.
     pub file_path: String,
 }
@@ -245,20 +221,16 @@ pub struct LoggingSection {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct StartupSection {
-    // 开机自启;默认 false,bool::default() 即 false,故 Default 可直接派生。
     // Launch at login; defaults to false (bool::default() is false, so Default derives directly).
     pub launch_at_login: bool,
 }
 
-/// Sparkle 更新设置。
 /// Sparkle update settings.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct UpdatesSection {
-    /// 是否允许 Sparkle 后台自动检查更新。
     /// Whether Sparkle may check for updates in the background.
     pub automatically_check: bool,
-    /// 是否自动下载并安装更新。
     /// Whether Sparkle automatically downloads and installs updates.
     pub automatically_download: bool,
 }
@@ -275,53 +247,36 @@ impl Default for UpdatesSection {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ClipboardSection {
-    // 历史剪贴板总开关;默认 false(不启动剪贴板轮询)。
     // History-clipboard master switch; defaults to false (no pasteboard polling).
     pub enabled: bool,
-    // 历史最大条数(1..=100,默认 50)。
     // Max history entries (1..=100, default 50).
     pub max_entries: u32,
-    // 显示来源应用:复制时始终记录来源(ClipEntry.source_app),此开关只控制是否在
-    // 条目里显示应用名。默认 false。
     // Show the source app: the source is ALWAYS recorded at copy time (ClipEntry.source_app);
     // this switch only controls whether the row displays the app name. Default false.
     pub show_source_app: bool,
-    // 持久化历史:开启后把文本/图片(含文件引用)历史保存到
-    // ~/.config/oh-my-tab/clipboard-history.toml,重启不丢。默认 false——明文落盘
-    // 有隐私风险(同用户的其他应用可读),README 有明确警示。
     // Persist the history: when on, text/images (incl. file references) are saved to
     // ~/.config/oh-my-tab/clipboard-history.toml and survive restarts. Default false --
     // plaintext on disk has privacy implications (any same-user app can read it); the
     // README carries an explicit warning.
     pub persist: bool,
-    // 使用后移到最前:粘贴(选中回车)会把条目提到列表最前(副作用:写回被轮询
-    // 当成再次复制)。关闭后粘贴不重排历史(与 Windows Win+V 一致)。默认 true。
     // Move used entries to the top: pasting (select + Enter) brings the entry to the
     // front (a side effect: the write-back is re-captured by the poll as another copy).
     // When off, pasting does not reorder the history (like Windows Win+V). Default true.
     pub move_used_to_top: bool,
-    // 粘贴后删除:开启后,按住 Option 点按或回车 = 粘贴该条目并立即从历史中删除
-    // (一次性粘贴)。默认 false——销毁性手势,显式选择加入。
     // Delete after paste: when on, Option+click or Option+Enter pastes the entry and
     // removes it from the history right away (one-shot paste). Default false -- a
     // destructive gesture, strictly opt-in.
     pub delete_after_paste: bool,
-    // 粘贴后清空当前系统剪贴板:仅在 delete_after_paste 同时开启时生效。默认 false。
     // Clear the current system pasteboard after pasting: effective only when
     // delete_after_paste is also enabled. Default false.
     pub clear_system_pasteboard_after_paste: bool,
-    // 自动过期天数:非置顶条目超过 N 天自动从历史(内存与持久化)清除,置顶条目
-    // 不参与过期。范围 0..=7,0 = 永不过期。默认 3 天。
     // Auto-expire days: unpinned entries older than N days are removed from the history
     // (memory AND persistence); pinned entries never expire. Range 0..=7; 0 = never.
     // Default 3 days.
     pub auto_expire_days: u32,
-    // 剪贴板浮窗位置:"mouse" = 跟随鼠标,"main" = 主屏幕居中。默认主屏幕居中。
     // The clipboard picker position: "mouse" = follows the cursor, "main" = centered on
     // the main screen. Defaults to the center of the main screen.
     pub picker_position: String,
-    // 置顶后选中项位置:true = 跟随置顶(选中移到被置顶/取消置顶条目的新位置),false
-    // = 保持当前位置(指向原下一条,便于批量置顶)。默认跟随。
     // Where the selection lands after pin/unpin: true = follow the toggled entry to its
     // new position; false = keep the current display position (pointing at the next
     // entry, convenient for batch pinning). Defaults to follow.
@@ -348,21 +303,10 @@ impl Default for ClipboardSection {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct PointerSection {
-    // 禁用系统鼠标加速,光标 1:1 线性跟踪。默认 false。
     // Disable system pointer acceleration for 1:1 linear cursor tracking. Default false.
     pub disable_acceleration: bool,
 }
 
-/// 指针加速 / 跟踪速度的合法区间:**0..=10**。
-///
-/// 平台属性本身的取值域是 [0, 40] ∪ {-1},但**可用区间只有约 0.3~3**(macOS 给鼠标键的默认是
-/// 1.00,给触控板/指针键的是 0.6875;实测 10 已经快到难以使用),10 以上的行程纯属浪费、还让
-/// 线性滑杆失去精度。因此这里把产品接受范围收窄到 0..=10;若将来有低 DPI 设备确实需要更大的
-/// 乘数,再放宽这一处即可。语义提醒:-1 是平台的"禁用加速与灵敏度"哨兵(旧系统回退路径用),
-/// 但本产品不接受该值(不在 UI 暴露),0 是正常区间的最低端(最慢,真实生效);只有"未设置"
-/// (None)表示不改动设备现值;默认值(未配置时的兜底/双击恢复)是 1.00,即 macOS 给鼠标键的出厂
-/// 默认。
-///
 /// The valid range for pointer acceleration / tracking speed: **0..=10**.
 ///
 /// The platform property's own domain is [0, 40] ∪ {-1}, but the usable band is only ~0.3-3
@@ -376,21 +320,15 @@ pub struct PointerSection {
 pub const MOUSE_ACCELERATION_MIN: f64 = 0.0;
 pub const MOUSE_ACCELERATION_MAX: f64 = 10.0;
 
-/// 设备匹配器(None = 通配,即"所有鼠标")。配置按 VID+PID 匹配设备。
 /// Device matcher (None = wildcard, i.e. "All Mice"). Config matches devices by VID+PID.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct DeviceMatcher {
-    // 扁平序列化为 device_vendor_id / device_product_id(顶层标量,便于手写 TOML)。
     // Flattened as device_vendor_id / device_product_id (top-level scalars for hand-written TOML).
     #[serde(rename = "device_vendor_id", skip_serializing_if = "Option::is_none")]
     pub vendor_id: Option<u32>,
     #[serde(rename = "device_product_id", skip_serializing_if = "Option::is_none")]
     pub product_id: Option<u32>,
-    // 虚拟指针档:软件 KVM(如 Deskflow)注入的鼠标。它没有 HID 设备、没有 VID/PID,只能靠
-    // "事件由别的进程注入"(CGEventSourceUnixProcessID 非 0)识别,所以不能复用 VID/PID 匹配。
-    // true = 该档只匹配注入事件;None = 普通设备档(或通配档)。
-    //
     // Virtual-pointer profile: the pointer a software KVM (e.g. Deskflow) injects. It has no HID
     // device and no VID/PID, so it can only be identified by "some other process injected this
     // event" (CGEventSourceUnixProcessID != 0) -- VID/PID matching cannot express it.
@@ -400,22 +338,17 @@ pub struct DeviceMatcher {
 }
 
 impl DeviceMatcher {
-    /// 本档是否为"虚拟指针"档(只匹配注入事件)。
     /// Whether this matcher is the virtual-pointer one (matches injected events only).
     pub fn is_virtual(&self) -> bool {
         self.injected == Some(true)
     }
 }
 
-/// 指针覆盖(部分字段,None = 继承下层档)。
 /// Pointer override (partial; None = inherit from the lower layer).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct PartialPointerSection {
     pub disable_acceleration: Option<bool>,
-    // 线性跟踪下的跟踪速度(0..=40),写 HIDPointerAcceleration(IOFixed:值 × 65536)。
-    // 只在 disable_acceleration 打开时生效:线性缩放下该属性就是跟踪速度本身;开关关闭时
-    // 它是 macOS 加速曲线的强度,含义不同,因此不写入。None = 不改动设备现值。
     // Tracking speed in linear mode (0..=40), written to HIDPointerAcceleration (IOFixed:
     // value × 65536). Only takes effect while disable_acceleration is on: under linear scaling
     // that property is the tracking speed itself, whereas with the switch off it is the strength
@@ -424,35 +357,26 @@ pub struct PartialPointerSection {
     pub acceleration: Option<f64>,
 }
 
-/// 单个配置档。device = None 即"所有鼠标"档(默认层)。
 /// A single profile. device = None is the "All Mice" profile (the default layer).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct MouseProfile {
-    /// 设备匹配器;None = 匹配所有鼠标(作为默认层)。
     /// Device matcher; None = matches all mice (serves as the default layer).
     #[serde(flatten)]
     pub device: DeviceMatcher,
-    // 反转滚动方向。true = 相对系统当前方向取反(与 LinearMouse 一致,不读自然滚动设置:
-    // HID tap 事件已含系统自然滚动翻转,合成事件不再被翻转,见 scrolling.rs 的 should_flip)。
     // Reverse scroll direction. true = flip relative to the system's current direction (same as
     // LinearMouse; no natural-scroll setting is read: HID-tap events already carry the system
     // natural-scroll flip and synthetic events aren't flipped again, see should_flip in scrolling.rs).
     pub reverse_scroll: Option<bool>,
     pub scroll_mode: Option<String>,
-    // Line 模式每格行数(1..=10)。
     // Line mode lines per notch (1..=10).
     pub line_count: Option<u32>,
     pub pointer: Option<PartialPointerSection>,
-    // 按键映射:按钮号(字符串,>=2)-> 快捷键描述(如 "cmd+shift+v")。
-    // 左键(0)/右键(1)不允许绑定,避免用户把自己锁死(无法点击任何界面)。
     // Button mappings: button number (string, >= 2) -> shortcut description (e.g. "cmd+shift+v").
     // Left (0) and right (1) buttons cannot be bound, so the user can never lock themselves
     // out of clicking.
     #[serde(default)]
     pub button_mappings: std::collections::HashMap<String, String>,
-    // 该档按键映射的总开关(None = 继承下层档;默认 true,绑定即生效)。
-    // 每个设备档独立 —— 不同鼠标可以有不同值。关闭时该设备的映射不执行(事件透传)。
     // Per-profile master switch for button mappings (None = inherit the lower layer;
     // defaults to true, so bindings take effect as soon as they exist). Independent per
     // device -- different mice can differ. When off, the device's mappings are skipped
@@ -464,21 +388,13 @@ pub struct MouseProfile {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct MouseSection {
-    // 启用鼠标控制功能(总开关)。默认 false(不启用,不创建 event tap)。
     // Enable mouse control features (master switch). Default false.
     pub enabled: bool,
-    // 配置档列表:第一个无 device 字段的档是"所有鼠标"默认层;其后可加 per-device 档,
-    // 后者覆盖前者。合并语义:遍历所有匹配档,后者优先。
     // Profile list: the first profile without a device field is the "All Mice" default layer;
     // subsequent per-device profiles override it. Merge semantics: all matching profiles are
     // traversed, later ones win.
     pub profiles: Vec<MouseProfile>,
 
-    // ---- 旧字段(仅用于迁移读取,序列化时跳过)----
-    // 用 Option 承载:旧版本配置文件显式写出的扁平字段反序列化后才有 Some 值;
-    // 新版本序列化跳过这些字段,重载后必为 None —— 从根上杜绝"serde 兜底值误判
-    // 含旧字段"导致的覆盖 bug(见 docs/test-review.md)。
-    // ---- Legacy fields (read for migration only, skipped on serialize) ----
     // Option-typed on purpose: only old-format files that explicitly wrote these flat keys
     // deserialize to Some; new-format files skip them on serialize, so they always reload as
     // None -- eliminating the "serde-default masquerades as legacy content" overwrite bug
@@ -497,7 +413,6 @@ impl Default for MouseSection {
     fn default() -> Self {
         Self {
             enabled: false,
-            // 默认含一个"所有鼠标"档,与旧默认值一致(reverse_scroll=false, default 模式, 3 行)。
             // Default includes an "All Mice" profile matching the old defaults.
             profiles: vec![MouseProfile {
                 reverse_scroll: Some(false),
@@ -518,18 +433,11 @@ impl Default for MouseSection {
 }
 
 impl MouseSection {
-    /// 若旧字段被填充(旧版本配置文件写出的扁平字段),把旧字段迁移成一个"所有鼠标"档。
-    /// 迁移是幂等的:已迁移的配置(无旧字段、有默认档)不会重复迁移。
-    /// 返回是否有改动(迁移了旧字段,或补插了默认档)——调用方据此决定是否写回磁盘。
-    ///
     /// Migrate legacy flat fields into an "All Mice" profile. Idempotent: an already-migrated
     /// config (no legacy fields, has a default profile) is left untouched. Returns whether
     /// anything changed (legacy fields migrated, or a default profile inserted) -- the caller
     /// uses it to decide whether to rewrite the file.
     pub(crate) fn migrate_legacy(&mut self) -> bool {
-        // 旧字段是 Option:只有旧版本文件显式写出的键才有 Some 值。新版本序列化跳过
-        // 这些字段,重载后必为 None,不会因 serde 兜底值(曾填 "default")误判含旧字段
-        // 而覆盖用户在新格式 profiles 里的配置。
         // Legacy fields are Option-typed: only keys explicitly written by old-format files are
         // Some. New-format files skip them on serialize, so they reload as None and no longer
         // trigger a migration that would clobber user profiles (serde used to backfill
@@ -540,7 +448,6 @@ impl MouseSection {
             || self.pointer.is_some();
 
         if !has_legacy {
-            // 无旧字段(全新配置或已迁移):确保至少有一个默认"所有鼠标"档。
             // No legacy content (fresh or already migrated): ensure a default "All Mice" profile exists.
             let has_default = self
                 .profiles
@@ -553,7 +460,6 @@ impl MouseSection {
             return false;
         }
 
-        // 有旧字段:把它们并入(或新建)一个"所有鼠标"档。
         // Legacy fields present: fold them into (or create) an "All Mice" profile.
         let legacy_profile = MouseProfile {
             reverse_scroll: self.reverse_scroll,
@@ -572,7 +478,6 @@ impl MouseSection {
             ..Default::default()
         };
 
-        // 若已有"所有鼠标"档,用旧字段值覆盖其字段(旧字段是用户真实意图)。
         // If an "All Mice" profile already exists, overwrite its fields with the legacy values
         // (the legacy fields are the user's true intent).
         if let Some(idx) = self
@@ -582,12 +487,10 @@ impl MouseSection {
         {
             self.profiles[idx] = legacy_profile;
         } else {
-            // 无"所有鼠标"档:在队首插入(确保默认档在前,per-device 档在后)。
             // No "All Mice" profile: insert at the front (default first, per-device after).
             self.profiles.insert(0, legacy_profile);
         }
 
-        // 清掉旧字段(防止下次再迁移;序列化本就跳过它们)。
         // Clear legacy fields (prevents re-migration; serialization skips them anyway).
         self.reverse_scroll = None;
         self.scroll_mode = None;
@@ -597,17 +500,13 @@ impl MouseSection {
     }
 }
 
-// ========== Default implementations (hard-coded fallback values) ==========
-
 impl Default for Appearance {
     fn default() -> Self {
         Appearance {
             // Follow the system by default while preserving explicit user choices from existing
             // config files.
-            // 默认跟随系统,已有配置中的显式主题选择保持不变。
             theme: "auto".into(),
             glass_style: "regular".into(),
-            // 默认玻璃浮窗 tint 颜色(RRGGBBAA);设置页可用取色器选择其他颜色。
             // Default Liquid Glass overlay tint (RRGGBBAA); the settings page lets users pick another color.
             glass_tint: "eeeeee66".into(),
             corner_radius: 32.0,
@@ -643,9 +542,6 @@ impl Default for ThemeColors {
 
 impl ThemeColors {
     fn dark_default() -> Self {
-        // 卡片文字色对齐 HTML 参考:主行(窗口标题)rgba(0,0,0,.82) → 暗色主题取
-        // 白色同透明度;次行(应用名)rgba(0,0,0,.34)。alpha = 0.82/0.34 × 255 ≈
-        // D1/57。
         // Card text colors follow the HTML reference: primary (window title)
         // rgba(0,0,0,.82) -> same alpha in white for the dark theme; secondary (app
         // name) rgba(0,0,0,.34). alpha = 0.82/0.34 x 255 ~= D1/57.
@@ -663,24 +559,17 @@ impl ThemeColors {
     fn light_default() -> Self {
         ThemeColors {
             status_bar_text: "333333ff".into(),
-            // rgba(0,0,0,.82) / rgba(0,0,0,.34),见 dark_default 注释。
             // rgba(0,0,0,.82) / rgba(0,0,0,.34); see the dark_default comment.
             app_name: "00000057".into(),
             win_title: "000000D1".into(),
-            // 设计稿(preview (7).html)预览区底色 #f6f7f9:近乎白的中性色,让预览区
-            // 与卡片读作同一张表面。
             // The mockup's preview background #f6f7f9: a near-white neutral so the
             // preview reads as the same surface as the card.
             icon_inner_bg: "F6F7F9FF".into(),
             icon_text: "666688ff".into(),
-            // 设计稿 .item.selected 背景 rgba(255,255,255,.88):一张明显的浅色表面
-            // 托起标题行与预览区(淡 accent 底在玻璃面板上几乎不可见,实测反馈)。
             // The mockup's .item.selected background rgba(255,255,255,.88): a clearly
             // visible light surface carrying the caption and preview (the faint accent
             // tint was invisible on the glass panel -- user-reported).
             card_bg_sel: "FFFFFFE0".into(),
-            // 设计稿 .item.selected 的 1.5px 清晰描边 rgba(75,123,236,.78)——白底上
-            // 唯一可见的轮廓线(2px 柔色圈在白底上不可见,见 refresh_highlight 注释)。
             // The mockup's crisp 1.5px selected border rgba(75,123,236,.78) -- the only
             // outline visible against the white surface (a 2px soft ring disappears
             // on white; see the refresh_highlight comment).
@@ -691,9 +580,6 @@ impl ThemeColors {
 
 impl Default for Fonts {
     fn default() -> Self {
-        // 卡片两行文字对齐 HTML 参考(preview (1).html):主行 = 窗口标题 12px /
-        // weight 500(CSS 500 ≈ NSFont medium 0.23,不加粗);次行 = 应用名 10px /
-        // regular(CSS 未写 font-weight = 400 ≈ NSFontWeightRegular 0.0)。
         // The two card text lines follow the HTML reference (preview (1).html):
         // primary = window title at 12px / weight 500 (CSS 500 ~= NSFont medium 0.23,
         // not bold); secondary = app name at 10px / regular (CSS omits font-weight =
@@ -712,7 +598,6 @@ impl Default for Fonts {
 impl Default for Keyboard {
     fn default() -> Self {
         Keyboard {
-            // 默认 Cmd+Tab;用户可在设置里切回 Option+Tab。
             // Default Cmd+Tab; users can switch back to Option+Tab in Settings.
             modifier: "command".into(),
         }
@@ -722,7 +607,7 @@ impl Default for Keyboard {
 impl Default for I18nSection {
     fn default() -> Self {
         I18nSection {
-            locale: "auto".into(), // 跟随系统语言 / follow system language
+            locale: "auto".into(), // follow system language
         }
     }
 }
@@ -736,8 +621,6 @@ impl Default for LoggingSection {
     }
 }
 
-// ========== Validation ==========
-
 fn is_hex8(s: &str) -> bool {
     s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -746,7 +629,6 @@ impl Config {
     pub fn validate(&self) -> Vec<String> {
         let mut errs: Vec<String> = Vec::new();
 
-        // --- appearance ---
         if !["dark", "light", "auto"].contains(&self.appearance.theme.as_str()) {
             errs.push(tf(
                 "errors.appearance_theme_invalid",
@@ -772,7 +654,6 @@ impl Config {
             ));
         }
 
-        // --- colors ---
         for (theme, colors) in [("dark", &self.colors.dark), ("light", &self.colors.light)] {
             let prefix = format!("colors.{theme}");
             if !is_hex8(&colors.status_bar_text) {
@@ -819,7 +700,6 @@ impl Config {
             }
         }
 
-        // --- layout ---
         if !self.layout.card_text_size.is_finite()
             || !(13.0..=20.0).contains(&self.layout.card_text_size)
         {
@@ -829,7 +709,6 @@ impl Config {
             ));
         }
 
-        // --- fonts ---
         if !self.fonts.status_bar_size.is_finite()
             || !(13.0..=20.0).contains(&self.fonts.status_bar_size)
         {
@@ -887,7 +766,6 @@ impl Config {
             ));
         }
 
-        // --- keyboard ---
         if !["option", "command"].contains(&self.keyboard.modifier.as_str()) {
             errs.push(tf(
                 "errors.keyboard_modifier_invalid",
@@ -895,7 +773,6 @@ impl Config {
             ));
         }
 
-        // --- i18n ---
         let locale_valid =
             ["auto", "en", "zh-Hans", "zh-Hant"].contains(&self.i18n.locale.as_str());
         #[cfg(any(debug_assertions, feature = "dev-long-text"))]
@@ -907,7 +784,6 @@ impl Config {
             ));
         }
 
-        // --- logging ---
         if !["debug", "info"].contains(&self.logging.level.as_str()) {
             errs.push(tf(
                 "errors.logging_level_invalid",
@@ -915,7 +791,6 @@ impl Config {
             ));
         }
 
-        // --- windows ---
         if !["active_window", "main"].contains(&self.windows.overlay_position.as_str()) {
             errs.push(tf(
                 "errors.windows_overlay_position_invalid",
@@ -929,7 +804,6 @@ impl Config {
             ));
         }
 
-        // --- clipboard ---
         if !(1..=100).contains(&self.clipboard.max_entries) {
             errs.push(tf(
                 "errors.clipboard_max_entries_invalid",
@@ -949,13 +823,11 @@ impl Config {
             ));
         }
 
-        // --- mouse profiles ---
         for (i, p) in self.mouse.profiles.iter().enumerate() {
             let prefix = format!("mouse.profiles[{i}]");
             if let Some(ref mode) = p.scroll_mode {
                 if !["default", "line"].contains(&mode.as_str()) {
                     errs.push(tf("errors.mouse_scroll_mode_invalid", &[("value", mode)]));
-                    // 用 prefix 区分哪个档出错,便于定位。
                     // Use the prefix to indicate which profile failed.
                     if let Some(last) = errs.last_mut() {
                         *last = format!("{prefix}.scroll_mode: {last}");
@@ -971,7 +843,6 @@ impl Config {
                     errs.push(format!("{prefix}.line_count: {msg}"));
                 }
             }
-            // 指针加速 / 跟踪速度:0..=10(见 MOUSE_ACCELERATION_MAX 的说明)。
             // Pointer acceleration / tracking speed: 0..=10 (see MOUSE_ACCELERATION_MAX).
             if let Some(acc) = p.pointer.as_ref().and_then(|ptr| ptr.acceleration) {
                 if !(MOUSE_ACCELERATION_MIN..=MOUSE_ACCELERATION_MAX).contains(&acc) {
@@ -982,7 +853,6 @@ impl Config {
                     errs.push(format!("{prefix}.pointer.acceleration: {msg}"));
                 }
             }
-            // 按键映射:按钮号合法(数字且 >= 2)+ 快捷键可解析。
             // Button mappings: valid button numbers (numeric, >= 2) + parseable shortcuts.
             errs.extend(crate::mouse::shortcut::validate_mappings(
                 &p.button_mappings,
@@ -1029,7 +899,6 @@ impl Config {
         if !has_error("layout.") {
             self.layout = other.layout;
         } else {
-            // 布尔字段恒有效,无条件采纳加载值(与其他布尔开关同约定)。
             // Booleans are always valid; adopt the loaded value unconditionally
             // (same convention as the other boolean switches).
             self.layout.thumbnails_enabled = other.layout.thumbnails_enabled;
@@ -1132,22 +1001,19 @@ impl Config {
             if !errs.iter().any(|e| e.starts_with("logging.level")) {
                 self.logging.level = other.logging.level;
             }
-            // file_path 无校验,恒有效 / file_path has no validation, always valid
+            // file_path has no validation, always valid
             self.logging.file_path = other.logging.file_path;
         }
 
-        // startup (bool 字段无需校验,恒有效)
         // startup (bool field needs no validation, always valid)
         self.startup = other.startup;
 
         // updates (bool field needs no validation; Sparkle applies it at runtime).
         self.updates = other.updates;
 
-        // clipboard (enabled 恒有效;max_entries 有校验)
         // clipboard (enabled always valid; max_entries is validated)
         self.clipboard.enabled = other.clipboard.enabled;
         // show_source_app / persist / move_used_to_top / delete_after_paste /
-        // clear_system_pasteboard_after_paste 是布尔,恒有效。
         // show_source_app / persist / move_used_to_top / delete_after_paste /
         // clear_system_pasteboard_after_paste are bools, always valid.
         self.clipboard.show_source_app = other.clipboard.show_source_app;
@@ -1171,17 +1037,13 @@ impl Config {
         {
             self.clipboard.picker_position = other.clipboard.picker_position.clone();
         }
-        // pin_follow_selection 是布尔,恒有效。
         // pin_follow_selection is a bool, always valid.
         self.clipboard.pin_follow_selection = other.clipboard.pin_follow_selection;
 
-        // mouse:profiles 逐档逐字段合并(沿用 per-field resilient 模式)。
-        // enabled 与 bool 字段恒有效;profiles 的每个档按字段校验结果保留或丢弃。
         // mouse: per-profile, per-field merge (continuing the per-field resilient pattern).
         // enabled and bool fields are always valid; each profile's fields are kept or dropped
         // based on per-field validation results.
         self.mouse.enabled = other.mouse.enabled;
-        // 先迁移 other 的旧字段(若有),再合并。
         // Migrate other's legacy fields (if any) before merging.
         let mut other_mouse = other.mouse;
         other_mouse.migrate_legacy();
@@ -1192,7 +1054,6 @@ impl Config {
                 device: p.device.clone(),
                 ..Default::default()
             };
-            // bool 字段恒有效。
             // Bool fields are always valid.
             merged_p.reverse_scroll = p.reverse_scroll;
             if p.scroll_mode.is_some()
@@ -1209,7 +1070,6 @@ impl Config {
             {
                 merged_p.line_count = p.line_count;
             }
-            // 按键映射:逐键校验,只保留合法项(非法按钮号/快捷键丢弃)。
             // Button mappings: per-entry validation; only valid entries survive.
             for (btn, desc) in &p.button_mappings {
                 let ep = format!("{prefix}.button_mappings[{btn}]");
@@ -1217,7 +1077,6 @@ impl Config {
                     merged_p.button_mappings.insert(btn.clone(), desc.clone());
                 }
             }
-            // pointer.disable_acceleration 是 bool,恒有效;acceleration 需过范围校验。
             // pointer.disable_acceleration is a bool (always valid); acceleration must pass
             // the range check.
             let accel_ok = !errs
@@ -1231,7 +1090,6 @@ impl Config {
             });
             self.mouse.profiles.push(merged_p);
         }
-        // 迁移完后清掉自身的旧字段(防止序列化出冗余)。
         // After merge, clear our own legacy fields (avoid serializing cruft).
         self.mouse.reverse_scroll = None;
         self.mouse.scroll_mode = None;
@@ -1283,14 +1141,8 @@ impl Config {
     }
 }
 
-// ========== Load / Save ==========
-
-/// 返回覆盖所有配置字段类型形状的 TOML 值。
 /// Return a TOML value containing the expected type shape for every configuration field.
 ///
-/// `serde(default)` 可处理缺失字段,但单个字段类型错误会让 Serde 拒绝整个结构体。
-/// 此 schema 允许加载器逐字段检查。可选字段只填入 schema(不填入兜底值),这样类型错误
-/// 会回落到 `None`,与运行时“未配置”语义一致。
 /// `serde(default)` handles missing fields, but Serde rejects a whole struct when one field
 /// has the wrong TOML type. The schema below lets the loader inspect fields independently.
 /// Optional fields are populated only in the schema (not in the fallback value), so a type
@@ -1312,7 +1164,6 @@ fn config_type_schema() -> toml::Value {
         .parse::<toml::Value>()
         .expect("serialized default config must parse as TOML");
 
-    // 旧版鼠标字段序列化时刻意跳过,但读取旧文件时仍需接受,所以必须加入类型 schema。
     // Legacy mouse fields are intentionally skipped during serialization, but they are still
     // accepted while reading old files and therefore need to be present in the type schema.
     if let Some(mouse) = value
@@ -1371,11 +1222,8 @@ fn type_error(path: &str, actual: &toml::Value, expected: &toml::Value) -> Strin
     )
 }
 
-/// 按预期类型形状清洗一个 TOML 值,同时保留同级的合法字段。
 /// Sanitize one TOML value against the expected type shape while preserving valid siblings.
 ///
-/// 返回 `None` 表示错误的可选字段应被移除,让 Serde 应用正常默认值。未知字段原样保留,
-/// 由 Serde 忽略。
 /// The return value is `None` when a malformed optional field should be omitted so Serde can
 /// apply its normal default. Unknown fields remain untouched and are ignored by Serde.
 fn sanitize_config_value(
@@ -1385,8 +1233,6 @@ fn sanitize_config_value(
     path: &str,
     errors: &mut Vec<String>,
 ) -> Option<toml::Value> {
-    // `button_mappings` 是动态字符串 map,空的默认表无法描述 value 类型,因此逐项校验,
-    // 不添加虚假的 schema key。
     // `button_mappings` is a dynamic string map, so an empty default table cannot describe its
     // value type. Validate each value explicitly instead of adding a fake schema key.
     if path.ends_with(".button_mappings") {
@@ -1442,8 +1288,6 @@ fn sanitize_config_value(
             for (index, actual_item) in actual_array.iter().enumerate() {
                 let item_path = toml_path_index(path, index);
                 let item_fallback = if path == "mouse.profiles" && index > 0 {
-                    // 只有第一个 profile 是显式通配默认档。设备档中的错误可选字段必须省略,
-                    // 不能意外继承通配档的具体值。
                     // Only the first profile is the explicit wildcard default. A malformed
                     // optional field in a per-device profile must fall back to omission, not
                     // accidentally inherit the wildcard profile's concrete value.
@@ -1477,8 +1321,6 @@ fn sanitize_config_value(
     }
 }
 
-/// 解析并清洗一个配置文件。返回的布尔值表示修复/迁移后的结果是否应写回磁盘;
-/// TOML 语法错误或整体反序列化错误会返回 Err,以保留原文件供诊断。
 /// Parse and sanitize one config file. The boolean says whether the repaired/migrated value
 /// should be persisted back to disk; TOML syntax or whole-document deserialization failures
 /// return Err so the original file remains available for diagnosis.
@@ -1503,7 +1345,6 @@ fn parse_config_content(content: &str) -> Result<(Config, Vec<String>, bool), Ve
     let mut loaded: Config = match sanitized.try_into() {
         Ok(config) => config,
         Err(error) => {
-            // 防御未来新增字段导致 schema 不匹配;正常路径应保证每个字段都可独立反序列化。
             // This is a defensive guard for a schema mismatch introduced by a future field.
             // The normal path above should make every field independently deserializable.
             errors.push(tf(
@@ -1531,14 +1372,12 @@ fn config_path() -> std::path::PathBuf {
     config_path_in(&std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
 }
 
-/// 配置文件是否已存在。引导用它区分「全新安装」与「老用户升级」(后者不打扰)。
 /// Whether the config file already exists. The guide uses it to tell a fresh install from an
 /// upgrade (which must not be nagged).
 pub(crate) fn config_file_exists() -> bool {
     config_path().exists()
 }
 
-/// 在给定 home 下计算配置路径(纯函数,测试可注入临时目录)。
 /// Compute the config path under a given home (pure; tests inject a temp dir).
 fn config_path_in(home: &str) -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(home).join(".config/oh-my-tab");
@@ -1553,7 +1392,6 @@ pub fn parse_hex8(s: &str) -> u32 {
 
 static ATOMIC_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// 使用同目录临时文件 + fsync + rename 原子替换配置,避免半写文件或跨线程覆盖。
 /// Write through a same-directory temp file, fsync, and atomically rename it into place so a
 /// reader never observes a partial file and stale writers cannot truncate a newer file.
 fn atomic_write(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
@@ -1601,7 +1439,6 @@ fn atomic_write(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
 }
 
 impl Config {
-    /// 序列化到指定路径(纯逻辑,测试注入临时目录)。
     /// Serialize to a given path (pure logic; tests inject a temp dir).
     fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
         let toml_str =
@@ -1614,12 +1451,6 @@ impl Config {
         Self::load_or_default_from(&path)
     }
 
-    /// 卡片文字样式一次性迁移:内容互换后(窗口标题为主行、应用名为次行),旧默认
-    /// 组合(title 11/0.23 + app_name 13/0.5,以及旧配色对)在新层级下会颠倒主次
-    /// (次行比主行还大)。仅当**全部四个字体值**与旧默认完全一致时才改写为新默认;
-    /// 配色同理按"成对精确匹配旧暗色/旧亮色默认"改写——用户自定义过任意一项则
-    /// 整体跳过(保守迁移,避免覆盖定制值)。幂等:新默认组合不匹配旧值,再次调用
-    /// 无操作。返回是否有改动。
     /// One-time migration for the card text style: after the content swap (window title
     /// as primary line, app name as secondary), the OLD default combo (title 11/0.23 +
     /// app_name 13/0.5, plus the old color pairs) inverts the hierarchy under the new
@@ -1631,7 +1462,6 @@ impl Config {
     /// Returns whether anything changed.
     pub(crate) fn migrate_card_text_style(&mut self) -> bool {
         let mut changed = false;
-        // 旧字体默认:title_size 11 / weight 0.23,app_name_size 13 / weight 0.5。
         // Old font defaults: title_size 11 / weight 0.23, app_name_size 13 / weight 0.5.
         let f = &mut self.fonts;
         if f.title_size == 11.0
@@ -1639,13 +1469,11 @@ impl Config {
             && f.app_name_size == 13.0
             && f.app_name_weight == 0.5
         {
-            f.title_size = 12.0; // HTML 参考:标题 12px medium / reference: title 12px medium
-            f.app_name_size = 10.0; // 应用名 10px regular / app name 10px regular
+            f.title_size = 12.0; // reference: title 12px medium
+            f.app_name_size = 10.0; // app name 10px regular
             f.app_name_weight = 0.0;
             changed = true;
         }
-        // 配色按主题节分别迁移:每节的配色对独立精确匹配旧暗色(dddddd/888888)
-        // 或旧亮色(1a1a1a/333333)默认,才改写为同族新对(D1/57 透明度)。
         // Colors migrate per theme section: each section's pair independently and
         // exactly matches the old dark (dddddd/888888) or old light (1a1a1a/333333)
         // defaults before being rewritten to its new same-family pair (D1/57 alpha).
@@ -1668,7 +1496,6 @@ impl Config {
         changed
     }
 
-    /// 从指定路径加载(纯逻辑,测试注入临时目录)。默认路径为 `~/.config/oh-my-tab/config.toml`。
     /// Load from a given path (pure logic; tests inject a temp dir).
     fn load_or_default_from(path: &std::path::Path) -> (Self, Vec<String>) {
         Self::load_or_default_from_result(path, std::fs::read_to_string(path))
@@ -1689,7 +1516,6 @@ impl Config {
                 Err(errs) => (Config::default(), errs),
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // 只有文件确实不存在时才写默认值;其他读取错误必须保留原文件。
                 // Write defaults only when the file is genuinely missing; preserve it on all
                 // other read errors.
                 let defaults = Config::default();
@@ -1722,39 +1548,29 @@ impl Config {
     }
 }
 
-// ========== Global singleton ==========
-
 pub static CONFIG: std::sync::LazyLock<RwLock<Config>> = std::sync::LazyLock::new(|| {
     let (cfg, _errs) = Config::load_or_default();
-    // 应用 config 里的 locale 覆盖(I18N 初始化时只用了系统语言)。
-    // 无循环:I18N 不读 CONFIG,见 i18n.rs 文件头说明。
     // Apply the locale from config (I18N init only used the system locale).
     // No cycle: I18N does not read CONFIG; see the note at the top of i18n.rs.
     i18n::apply_config_locale(&cfg.i18n.locale);
     RwLock::new(cfg)
 });
 
-/// 返回当前生效的玻璃样式。
 /// Return the effective glass style.
 pub fn effective_glass_style() -> String {
     CONFIG.read().unwrap().appearance.glass_style.clone()
 }
 
-/// 返回当前生效的玻璃颜色。
 /// Return the effective glass tint.
 pub fn effective_glass_tint() -> String {
     CONFIG.read().unwrap().appearance.glass_tint.clone()
 }
 
-/// 返回是否启用前台窗口缩略图后台预热。
 /// Return whether focused-window thumbnail prewarming is enabled.
 pub(crate) fn focused_thumbnail_prewarm_enabled() -> bool {
     CONFIG.read().unwrap().layout.focused_thumbnail_prewarm
 }
 
-// ========== 配置落盘防抖调度器 / debounced config persistence scheduler ==========
-
-/// 落盘防抖窗口:连续修改(拖动滑块、连续输入)只在该静默期结束后写一次磁盘。
 /// Persistence debounce window: bursts of changes (slider drags, fast typing) coalesce into
 /// one disk write after this quiet period.
 const PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
@@ -1773,11 +1589,9 @@ enum PersistMsg {
 
 static CONFIG_REVISION: AtomicU64 = AtomicU64::new(0);
 
-/// 后台落盘线程的消息通道(懒启动;主线程控制回调与恢复默认都会发消息)。
 /// The background persistence thread's channel (lazy; control callbacks and restores send).
 static PERSIST_TX: LazySender = LazySender::new();
 
-/// std::sync::mpsc::Sender 的懒初始化包装(线程随通道一起创建)。
 /// A lazy wrapper for the mpsc Sender (the thread spawns with the channel).
 struct LazySender(std::sync::Mutex<Option<std::sync::mpsc::Sender<PersistMsg>>>);
 
@@ -1796,7 +1610,6 @@ impl LazySender {
                 .expect("spawn config-persist thread");
             *guard = Some(tx);
         }
-        // 发送失败仅意味着线程已退出(接收端关闭),丢消息比 panic 安全。
         // A send failure only means the thread exited (receiver dropped); dropping the
         // message is safer than panicking.
         guard
@@ -1807,8 +1620,6 @@ impl LazySender {
     }
 }
 
-/// 落盘线程主体:Schedule 进入防抖窗口(静默 400ms 后写一次);Flush 立即写一次。
-/// 读取的是最新 CONFIG 快照,重复消息天然合并成一次写。
 /// The persistence thread: Schedule opens a debounce window (write once after 400ms of
 /// quiet); Flush writes immediately. It always snapshots the newest CONFIG, so bursts
 /// naturally coalesce into a single write.
@@ -1853,7 +1664,6 @@ fn persist_thread(rx: std::sync::mpsc::Receiver<PersistMsg>) {
                             }
                             break;
                         }
-                        // 超时 = 静默期结束,落盘一次。
                         // Timeout = quiet period elapsed; write once.
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             let _ = persist_if_newer(
@@ -1892,7 +1702,6 @@ fn snapshot_with_revision() -> (Config, u64) {
     (snapshot, revision)
 }
 
-/// 设置修改后调用:调度一次防抖落盘(立即生效与磁盘写入分离,避免拖动/连打时大量 IO)。
 /// Call after a setting change: schedule one debounced disk write (immediate effect and disk
 /// persistence are decoupled to avoid burst IO while dragging/typing).
 pub fn schedule_config_persist() {
@@ -1902,7 +1711,6 @@ pub fn schedule_config_persist() {
     }
 }
 
-/// 将一次立即写请求送入 writer(恢复默认 / 失焦提交等需要尽快落盘的路径)。
 /// Queue an immediate write request for the writer (restore-default / blur-commit paths).
 pub fn persist_config_now() {
     let (snapshot, revision) = snapshot_with_revision();
@@ -1915,7 +1723,6 @@ pub fn persist_config_now() {
     }
 }
 
-/// 同步等待最新配置写入完成,用于退出前保证防抖队列已落盘。
 /// Synchronously wait until the newest configuration snapshot is durable, used before quitting.
 pub fn flush_config_sync() -> Result<(), String> {
     let (snapshot, revision) = snapshot_with_revision();
@@ -1946,7 +1753,6 @@ pub fn reload_config() -> Vec<String> {
         crate::runtime_config::ConfigChangeSource::Reload,
     );
     if needs_persist {
-        // Reload 回调不直接写磁盘;修复/迁移后的快照进入统一 writer。
         // Reload callbacks never write synchronously; repaired/migrated snapshots go through
         // the single writer.
         persist_config_now();
@@ -1958,8 +1764,6 @@ pub fn reload_config() -> Vec<String> {
 mod tests {
     use super::*;
 
-    // ========== parse_hex8 ==========
-
     #[test]
     fn parse_hex8_parses_valid_rgb_alpha() {
         assert_eq!(parse_hex8("999999ff"), 0x999999ff);
@@ -1970,15 +1774,12 @@ mod tests {
 
     #[test]
     fn parse_hex8_invalid_inputs_fall_back_to_zero() {
-        // 非法/空串/超长统一回退 0,避免 panic。
         // Invalid/empty/overlong inputs all fall back to 0, never panic.
         assert_eq!(parse_hex8(""), 0);
         assert_eq!(parse_hex8("xyz"), 0);
-        assert_eq!(parse_hex8("999999999"), 0); // 9 位溢出 / 9 chars overflows u32
+        assert_eq!(parse_hex8("999999999"), 0); // 9 chars overflows u32
         assert_eq!(parse_hex8("gggggggg"), 0);
     }
-
-    // ========== validate ==========
 
     fn assert_err_count(cfg: &Config, expected: usize) {
         let errs = cfg.validate();
@@ -2024,7 +1825,6 @@ mod tests {
 
     #[test]
     fn retired_icon_layout_fields_are_ignored() {
-        // 旧实验性布局字段不再属于配置模型,加载时忽略且不产生校验错误。
         // Retired experimental layout fields are ignored when loading and do not cause errors.
         let cfg: Config = toml::from_str(
             "[layout]\ncards_per_row = 10\ncard_width = 300.0\ncard_height = 400.0\ncard_gap = 8.0\nicon_size = 200.0\n",
@@ -2085,11 +1885,8 @@ mod tests {
         assert_err_count(&cfg, 2);
     }
 
-    // ========== merge_valid ==========
-
     #[test]
     fn merge_valid_keeps_healthy_sections_wholesale() {
-        // 无错误的配置:整体并入,所有自定义值保留(曾用默认值合并默认值,断言恒真)。
         // A fully valid config is merged wholesale with all custom values kept (the old test
         // merged defaults into defaults, making the assertions vacuous).
         let mut other = Config::default();
@@ -2123,7 +1920,6 @@ mod tests {
 
     #[test]
     fn validate_rejects_out_of_range_clipboard_max_entries() {
-        // 剪贴板最大条数必须在 1..=100 内。
         // Clipboard max entries must be within 1..=100.
         let mut cfg = Config::default();
         cfg.clipboard.max_entries = 0;
@@ -2136,7 +1932,6 @@ mod tests {
 
     #[test]
     fn retired_clipboard_highlight_limits_are_ignored() {
-        // 旧配置里的高亮限制已失效,但 serde 必须忽略它们,避免升级后整份配置加载失败。
         // Highlight limits in old configs are retired, but serde must ignore them so upgrades do
         // not make the entire config fail to load.
         let cfg: Config = toml::from_str(
@@ -2148,7 +1943,6 @@ mod tests {
 
     #[test]
     fn validate_rejects_unknown_clipboard_picker_position() {
-        // 悬浮窗位置只允许 mouse / main。
         // The picker position only accepts mouse / main.
         let mut cfg = Config::default();
         assert_eq!(cfg.clipboard.picker_position, "main");
@@ -2162,7 +1956,6 @@ mod tests {
 
     #[test]
     fn validate_accepts_auto_expire_days_0_to_7() {
-        // 自动过期天数:0(永不过期)与 7 合法,8 非法。
         // Auto-expire days: 0 (never) and 7 are valid, 8 is rejected.
         let mut cfg = Config::default();
         assert_eq!(cfg.clipboard.auto_expire_days, 3, "default is 3 days");
@@ -2178,12 +1971,12 @@ mod tests {
     #[test]
     fn merge_valid_resets_only_invalid_fields() {
         let mut other = Config::default();
-        // 合法字段:全部自定义。
+        // Valid field: everything customized.
         other.appearance.theme = "dark".into();
         other.appearance.glass_style = "regular".into();
         other.appearance.glass_tint = "11223344".into();
         other.appearance.corner_radius = 12.0;
-        // 非法字段:corner_radius < 0。
+        // Invalid field: corner_radius < 0.
         let mut cfg = other.clone();
         cfg.appearance.corner_radius = -5.0;
         let errs = cfg.validate();
@@ -2191,7 +1984,6 @@ mod tests {
 
         let mut merged = Config::default();
         merged.merge_valid(cfg, &errs);
-        // 合法字段保留,非法字段回落默认。
         // Valid fields survive; the invalid one falls back to the default.
         assert_eq!(merged.appearance.theme, "dark");
         assert_eq!(merged.appearance.glass_tint, "11223344");
@@ -2201,15 +1993,12 @@ mod tests {
         );
     }
 
-    // ========== mouse migration ==========
-
     #[test]
     fn migrate_legacy_is_idempotent() {
         let mut cfg = Config::default();
         let before = cfg.mouse.clone();
         cfg.mouse.migrate_legacy();
         cfg.mouse.migrate_legacy();
-        // 二次迁移不应改变任何内容。
         // A second migration must not change anything.
         assert_eq!(cfg.mouse.profiles.len(), before.profiles.len());
         assert!(cfg.mouse.reverse_scroll.is_none());
@@ -2218,7 +2007,6 @@ mod tests {
     #[test]
     fn card_text_style_migration_rewrites_old_defaults() {
         let mut cfg = Config::default();
-        // 注入旧默认组合(内容互换前的字体与配色):字体 + 暗色节旧暗对 + 亮色节旧亮对。
         // Inject the old-default combo (pre-swap fonts and colors): fonts + the old dark
         // pair in the dark section + the old light pair in the light section.
         cfg.fonts.title_size = 11.0;
@@ -2235,12 +2023,11 @@ mod tests {
         assert_eq!(cfg.fonts.title_weight, 0.23);
         assert_eq!(cfg.fonts.app_name_size, 10.0);
         assert_eq!(cfg.fonts.app_name_weight, 0.0);
-        // 各节迁移到同族新对 / each section migrates to its same-family new pair.
+        // each section migrates to its same-family new pair.
         assert_eq!(cfg.colors.dark.app_name, "FFFFFF57");
         assert_eq!(cfg.colors.dark.win_title, "FFFFFFD1");
         assert_eq!(cfg.colors.light.app_name, "00000057");
         assert_eq!(cfg.colors.light.win_title, "000000D1");
-        // 幂等:新默认组合不再命中旧值,二次调用无操作。
         // Idempotent: the new defaults no longer match the old values; a second call is a no-op.
         assert!(!cfg.migrate_card_text_style());
     }
@@ -2248,17 +2035,15 @@ mod tests {
     #[test]
     fn card_text_style_migration_skips_customized_values() {
         let mut cfg = Config::default();
-        // 仅一个字体值被自定义 → 整组跳过(保守迁移;配色此时为新默认也不触发)。
         // A single customized font value -> the whole group is skipped (conservative;
         // colors are at the new defaults here and do not trigger either).
         cfg.fonts.title_size = 11.0;
         cfg.fonts.title_weight = 0.23;
         cfg.fonts.app_name_size = 13.0;
-        cfg.fonts.app_name_weight = 0.4; // 自定义 / customized
+        cfg.fonts.app_name_weight = 0.4; // customized
         assert!(!cfg.migrate_card_text_style());
         assert_eq!(cfg.fonts.app_name_weight, 0.4);
 
-        // 配色同理:两节都不成对匹配旧默认则不动。
         // Colors likewise: with NEITHER section pairing up against an old default, nothing moves.
         cfg.colors.dark.app_name = "custom01ff".into();
         cfg.colors.light.app_name = "custom01ff".into();
@@ -2270,7 +2055,7 @@ mod tests {
     #[test]
     fn card_text_style_migration_handles_dark_color_pair() {
         let mut cfg = Config::default();
-        cfg.fonts.title_size = 12.0; // 字体已是新默认,不触发字体分支 / fonts already new
+        cfg.fonts.title_size = 12.0; // fonts already new
         cfg.colors.dark.app_name = "ddddddff".into();
         cfg.colors.dark.win_title = "888888ff".into();
         assert!(cfg.migrate_card_text_style());
@@ -2290,7 +2075,6 @@ mod tests {
         });
         let changed = cfg.mouse.migrate_legacy();
         assert!(changed);
-        // 合并进"所有鼠标"档,旧字段清空。
         // Folded into the "All Mice" profile; legacy fields cleared.
         assert_eq!(cfg.mouse.profiles.len(), 1);
         let p = &cfg.mouse.profiles[0];
@@ -2305,15 +2089,11 @@ mod tests {
         assert!(cfg.mouse.scroll_mode.is_none());
     }
 
-    // ========== save / load roundtrip ==========
-
     #[test]
     fn save_and_load_roundtrip_preserves_custom_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut cfg = Config::default();
-        // 全部使用非默认自定义值——曾用默认值 roundtrip 掩盖了 migrate_legacy
-        // 覆盖新格式 profiles 的 bug(见 docs/test-review.md),这里做回归防护。
         // All fields set to non-default values -- the old default-value roundtrip masked the
         // migrate_legacy overwrite bug (see docs/test-review.md); this is the regression guard.
         cfg.appearance.theme = "dark".into();
@@ -2325,7 +2105,7 @@ mod tests {
         cfg.windows.activation_mode = "click".into();
         cfg.windows.show_minimized = true;
         cfg.windows.show_hidden_app_windows = false;
-        cfg.windows.enabled = false; // 非默认值:验证 roundtrip / non-default: verify the roundtrip
+        cfg.windows.enabled = false; // non-default: verify the roundtrip
         cfg.mouse.enabled = true;
         cfg.mouse.profiles = vec![
             MouseProfile {
@@ -2352,7 +2132,6 @@ mod tests {
 
         let (loaded, errs) = Config::load_or_default_from(&path);
         assert!(errs.is_empty());
-        // 非 mouse 字段 roundtrip。
         // Non-mouse fields survive the roundtrip.
         assert_eq!(loaded.appearance.theme, "dark");
         assert_eq!(loaded.appearance.glass_tint, "11223344");
@@ -2364,7 +2143,6 @@ mod tests {
         assert!(loaded.windows.show_minimized);
         assert!(!loaded.windows.show_hidden_app_windows);
         assert!(!loaded.windows.enabled);
-        // mouse profiles 原样保留(通配档 + per-device 档各一条)。
         // Mouse profiles survive untouched (one wildcard + one per-device).
         assert!(loaded.mouse.enabled);
         assert_eq!(loaded.mouse.profiles.len(), 2);
@@ -2401,8 +2179,6 @@ mod tests {
 
     #[test]
     fn load_new_format_config_leaves_profiles_untouched() {
-        // 反向约束:新格式配置(只有 profiles、无旧扁平字段)加载后必须原样保留,
-        // 不能被 migrate_legacy 当作"含旧字段"覆盖(曾经的 bug)。
         // Negative constraint: a new-format config (profiles only, no legacy flat fields) must
         // load untouched -- migrate_legacy must not mistake it for legacy content (the old bug).
         let dir = tempfile::tempdir().unwrap();
@@ -2431,7 +2207,6 @@ reverse_scroll = false
         let (cfg, errs) = Config::load_or_default_from(&path);
         assert!(errs.is_empty());
         assert_eq!(cfg.mouse.profiles.len(), 2);
-        // 通配档:自定义值保留。
         // Wildcard profile: custom values preserved.
         let w = &cfg.mouse.profiles[0];
         assert_eq!(w.reverse_scroll, Some(true));
@@ -2441,7 +2216,6 @@ reverse_scroll = false
             w.pointer.as_ref().and_then(|x| x.disable_acceleration),
             Some(true)
         );
-        // per-device 档:保留。
         // Per-device profile preserved.
         let d = &cfg.mouse.profiles[1];
         assert_eq!(d.device.vendor_id, Some(1133));
@@ -2454,7 +2228,6 @@ reverse_scroll = false
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.toml");
         let (cfg, errs) = Config::load_or_default_from(&path);
-        // 不存在的文件:写默认配置并返回之,无错误。
         // Missing file: defaults written and returned, no errors.
         assert!(errs.is_empty());
         assert_eq!(cfg.appearance.theme, "auto");
@@ -2511,7 +2284,6 @@ glass_tint = "zzzzzzzz"
         .unwrap();
         let (cfg, errs) = Config::load_or_default_from(&path);
         assert!(!errs.is_empty());
-        // 合法字段(theme)保留,非法字段(glass_tint)回落默认;旧布局字段被忽略。
         // Valid fields survive; the invalid color falls back to default; retired layout fields are ignored.
         assert_eq!(cfg.appearance.theme, "dark");
         assert_eq!(
@@ -2623,7 +2395,6 @@ acceleration = 41.0
         assert!(errs
             .iter()
             .any(|error| error.contains("mouse.profiles[1].pointer.acceleration")));
-        // 合法档保留;越界档只丢 acceleration,disable_acceleration 仍生效。
         // The valid profile keeps its value; the out-of-range one loses only acceleration,
         // while disable_acceleration still applies.
         assert_eq!(
@@ -2709,7 +2480,6 @@ reverse_scroll = true
         .unwrap();
         let (cfg, errs) = Config::load_or_default_from(&path);
         assert!(errs.is_empty());
-        // 旧字段被迁移成"所有鼠标"档并写回磁盘。
         // Legacy fields migrated into an "All Mice" profile and persisted.
         assert_eq!(cfg.mouse.profiles.len(), 1);
         assert_eq!(cfg.mouse.profiles[0].reverse_scroll, Some(true));
@@ -2722,7 +2492,6 @@ reverse_scroll = true
     fn config_path_in_uses_home_and_creates_dir() {
         let dir = tempfile::tempdir().unwrap();
         let p = config_path_in(dir.path().to_str().unwrap());
-        // 路径:home/.config/oh-my-tab/config.toml,目录自动创建。
         // Path: home/.config/oh-my-tab/config.toml with the dir auto-created.
         assert_eq!(p, dir.path().join(".config/oh-my-tab/config.toml"));
         assert!(p.parent().unwrap().exists());

@@ -1,12 +1,3 @@
-//! 更新完成后的系统通知:Sparkle 安装更新并重启后,经 user driver 的
-//! `showUpdateInstalledAndRelaunched` 回调走到这里,用 UNUserNotificationCenter
-//! 发一条本地通知(标题/正文走 i18n)。
-//!
-//! 授权与回调:首次使用需 requestAuthorization;completion handler 是 ObjC block,
-//! 本模块用"无捕获全局 block"的最小手工构造(isa/flags/invoke/descriptor),
-//! 不引入 block2 依赖。重 Sparkle 重启后本应用大概率在前台,系统默认会压住横幅,
-//! 因此实现 willPresent delegate 让横幅在前台同样弹出。
-//!
 //! Post-install system notification. Sparkle invokes the user driver's
 //! `showUpdateInstalledAndRelaunched` on the freshly relaunched instance; this module
 //! turns that into a UNUserNotificationCenter local notification (localized title/body).
@@ -16,9 +7,6 @@
 //! it, and macOS suppresses banners for the active app, so a willPresent delegate makes
 //! the banner show anyway.
 
-// UserNotifications.framework 必须显式链接:objc2 的 class! 是运行时按名字查类,
-// 没有这条链接指令,框架不会被 dyld 加载,类表里查不到 UNUserNotificationCenter,
-// msg_send! 的发送前断言会 panic(实测 "method not found")。
 // UserNotifications.framework must be force-linked: objc2's class! resolves classes by
 // name at runtime, and without this link hint dyld never loads the framework, so the
 // class is missing and msg_send!'s pre-send assertion panics ("method not found").
@@ -36,7 +24,6 @@ use crate::ffi::{
 use crate::i18n::tf;
 use crate::log_debug;
 
-// block ABI:全局 block(无捕获)只需要 isa/flags/reserved/invoke/descriptor。
 // Block ABI: a no-capture global block needs only isa/flags/reserved/invoke/descriptor.
 #[repr(C)]
 struct BlockDescriptor {
@@ -44,7 +31,6 @@ struct BlockDescriptor {
     size: usize,
 }
 
-// BLOCK_IS_GLOBAL(1 << 28):不进堆,实例为静态常量。
 // BLOCK_IS_GLOBAL (1 << 28): statically allocated, never copied to the heap.
 const BLOCK_IS_GLOBAL: i32 = 1 << 28;
 
@@ -70,7 +56,6 @@ struct AddCompletionBlock {
     descriptor: *const BlockDescriptor,
 }
 
-// 全局 block 实例是只读静态(字段全为裸指针,仅声明 Sync 供 static 存放)。
 // Global block instances are read-only statics (raw pointers; Sync is declared only so
 // they can live in statics).
 unsafe impl Sync for AuthCompletionBlock {}
@@ -85,12 +70,10 @@ static ADD_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
     size: std::mem::size_of::<AddCompletionBlock>(),
 };
 
-// 待投递的 (标题, 正文, 标识符):授权完成回调里取用(全局 block 无法捕获,状态只能走静态槽)。
 // Pending (title, body, identifier) consumed by the authorization completion (a global
 // block cannot capture, so the handoff goes through this slot).
 static PENDING_NOTICE: Mutex<Option<(String, String, String)>> = Mutex::new(None);
 
-// 两类通知各自使用固定标识符:同 ID 重投会替换历史里的旧未读通知,不堆积。
 // Two fixed identifiers: re-posting the same ID replaces the previous unread notice
 // instead of stacking up.
 const ID_UPDATE_INSTALLED: &str = "oh-my-tab-update-installed";
@@ -98,7 +81,6 @@ const ID_UPDATE_AVAILABLE: &str = "oh-my-tab-update-available";
 
 static DELEGATE_REGISTERED: Once = Once::new();
 
-/// 授权完成:granted 才投递;结果只进日志。
 /// Authorization finished: deliver only when granted; the outcome is logged.
 unsafe extern "C" fn auth_completion(
     _block: *const AuthCompletionBlock,
@@ -119,7 +101,6 @@ unsafe extern "C" fn auth_completion(
     add_notification_request(&title, &body, &identifier);
 }
 
-/// add 的完成回调:仅用于把失败写进日志。
 /// add completion: only logs failures.
 unsafe extern "C" fn add_completion(_block: *const AddCompletionBlock, error: *mut c_void) {
     if !error.is_null() {
@@ -143,11 +124,9 @@ static ADD_BLOCK: AddCompletionBlock = AddCompletionBlock {
     descriptor: std::ptr::addr_of!(ADD_DESCRIPTOR),
 };
 
-/// willPresent 的呈现选项:banner | sound。前台也弹横幅。
 /// willPresent presentation options: banner | sound, so the banner shows even frontmost.
 const PRESENT_BANNER_SOUND: usize = (1 << 2) | (1 << 1);
 
-/// didReceive:点击横幅 → 匹配"新版本可用"标识符 → 跳主线程打开设置 About 更新页。
 /// didReceive: a banner click on the "update available" notification hops to the main
 /// thread and opens the About update section in Settings.
 unsafe extern "C" fn did_receive_notification_response(
@@ -171,7 +150,6 @@ unsafe extern "C" fn did_receive_notification_response(
         ];
     }
     if !completion.is_null() {
-        // 0 参数 block:直接调用其 invoke 槽。
         // A zero-argument block: call its invoke slot directly.
         let invoke = *(completion as *const *const c_void).add(2);
         let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(invoke);
@@ -179,12 +157,9 @@ unsafe extern "C" fn did_receive_notification_response(
     }
 }
 
-/// 通知点击(主线程):激活应用并在设置 About 页做一次用户级检查。
 /// Notification click (main thread): activate the app and run a user-initiated check in
 /// the Settings About page.
 unsafe extern "C" fn handle_update_available_click(_this: *mut c_void, _cmd: Sel) {
-    // 打开设置窗口的 About 页并内联检查;激活与置前由 show_settings 处理
-    // (NSApplication 的 activateIgnoringOtherApps: 在 macOS 26 仍然可用)。
     // Open the settings window's About page with an inline check; show_settings handles
     // activation and raising (NSApplication's activateIgnoringOtherApps: still works on
     // macOS 26, unlike the NSRunningApplication variants).
@@ -192,7 +167,6 @@ unsafe extern "C" fn handle_update_available_click(_this: *mut c_void, _cmd: Sel
 }
 
 /// UNUserNotificationCenterDelegate.willPresentNotification:withCompletionHandler:.
-/// 直接调用传入的 completion block(invoke 位于 block 头部第 3 个指针位)。
 /// Delegate callback: invokes the passed completion block (invoke sits at the third
 /// pointer slot of the block header).
 unsafe extern "C" fn will_present_notification(
@@ -210,7 +184,6 @@ unsafe extern "C" fn will_present_notification(
     invoke(completion, PRESENT_BANNER_SOUND);
 }
 
-/// 注册一次 delegate 类与实例(center.delegate 是 weak,实例必须常驻)。
 /// Register the delegate class/instance once (center.delegate is weak, so the instance
 /// must outlive the call).
 unsafe fn ensure_delegate_registered() -> *mut AnyObject {
@@ -219,11 +192,8 @@ unsafe fn ensure_delegate_registered() -> *mut AnyObject {
         let name = std::ffi::CString::new("OhMyTabUpdateNoticeDelegate").unwrap();
         let superclass = class!(NSObject) as *const _ as *mut AnyObject;
         let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        // block 参数在方法签名里按对象类型编码('@')。
         // Block parameters are encoded as objects ('@') in method signatures.
         let will_present_types = std::ffi::CString::new("v@:@@@").unwrap();
-        // 注意 delegate 方法的完整选择器带 "userNotificationCenter:" 前缀,
-        // 写漏了运行时会查不到,前台横幅会被静默压掉(实测踩坑)。
         // The delegate selector must include the "userNotificationCenter:" prefix; a
         // missing prefix silently never fires and the frontmost banner is suppressed.
         crate::ffi::class_addMethod(
@@ -239,10 +209,7 @@ unsafe fn ensure_delegate_registered() -> *mut AnyObject {
             did_receive_notification_response as *mut c_void,
             did_receive_types.as_ptr(),
         );
-        // 点击通知的主线程跳板(后台队列不能直接驱动 Sparkle)。
         // Main-thread trampoline for notification clicks (Sparkle is main-thread only).
-        // 这是无参数 selector; `performSelectorOnMainThread:withObject:` 传入的
-        // withObject 只对应 performSelector API,不会成为目标 selector 的参数。
         // This selector takes no arguments; the `withObject:` belongs to the
         // performSelector API and is not an argument to the target selector.
         let click_types = std::ffi::CString::new("v@:").unwrap();
@@ -259,7 +226,6 @@ unsafe fn ensure_delegate_registered() -> *mut AnyObject {
     DELEGATE.get().map(|p| p.0).unwrap_or(std::ptr::null_mut())
 }
 
-/// 构建 content + request 并投递(在授权 granted 之后调用)。
 /// Build content + request and deliver (called once authorization is granted).
 unsafe fn add_notification_request(title: &str, body: &str, identifier: &str) {
     let center: *mut AnyObject =
@@ -284,8 +250,6 @@ unsafe fn add_notification_request(title: &str, body: &str, identifier: &str) {
         content: content,
         trigger: std::ptr::null::<AnyObject>()
     ];
-    // block 参数走手工 objc_msgSend:objc2 的发送前断言要求 block 参数带 '@?' 编码,
-    // 裸指针会被拒绝;用具体签名的 msgSend 绕开检查(全局 block 本身符合 block ABI)。
     // Block-taking sends go through a hand-transmuted objc_msgSend: objc2's pre-send
     // assertion demands the '@?' encoding for block args and rejects raw pointers; the
     // global block itself is a valid block, so the concrete-signature call is safe.
@@ -306,11 +270,6 @@ unsafe fn add_notification_request(title: &str, body: &str, identifier: &str) {
     log_debug!("[update-notice] notification delivered: {}", identifier);
 }
 
-// ---------- 跨启动标记(NSUserDefaults) / cross-launch marker (NSUserDefaults) ----------
-//
-// Sparkle 的 showUpdateInstalledAndRelaunched 回调在「更新器进程仍存活」时才会被调用,
-// 而自动安装流程里旧实例早已退出——所以"安装完成"的通知不能挂在它上面。改为:
-// 安装开始时(旧实例)写标记,新实例启动时读标记发通知。
 // Sparkle only invokes showUpdateInstalledAndRelaunched while the updater process is
 // still alive -- the old instance is long gone during automatic installs. So instead of
 // that callback, the old instance writes a marker when installation starts and the new
@@ -343,7 +302,6 @@ unsafe fn defaults_remove(key: &str) {
     release_obj(key_ns);
 }
 
-/// 安装开始时(旧实例,showInstallingUpdate 回调)记录"当前版本"。
 /// Announce-prep: the old instance records its CURRENT build version when installation
 /// starts.
 pub(crate) fn mark_install_started(from_version: &str) {
@@ -356,7 +314,6 @@ pub(crate) fn mark_install_started(from_version: &str) {
 
 /// Preserve the semantic version that Sparkle is replacing so 0.2.3 can target the TCC
 /// permission-recovery copy to users migrating from the two affected releases.
-/// 保存 Sparkle 即将替换的语义版本，让 0.2.3 只对从两个受影响版本升级的用户显示权限恢复提示。
 pub(crate) fn mark_permission_migration_source(from_version: &str) {
     unsafe { defaults_set_string(PERMISSION_MIGRATION_SOURCE_VERSION_KEY, from_version) };
     log_debug!(
@@ -366,7 +323,6 @@ pub(crate) fn mark_permission_migration_source(from_version: &str) {
 }
 
 /// Whether this install is 0.2.3 upgraded through Sparkle from 0.2.1 or 0.2.2.
-/// 判断当前是否为通过 Sparkle 从 0.2.1 或 0.2.2 升级到 0.2.3。
 pub(crate) fn needs_permission_migration_copy() -> bool {
     let current_version = unsafe { bundle_info_string("CFBundleShortVersionString") };
     if current_version != "0.2.3" {
@@ -378,7 +334,6 @@ pub(crate) fn needs_permission_migration_copy() -> bool {
     )
 }
 
-/// 新实例启动时检查标记:版本确实变了才发通知,并清掉标记。
 /// At startup, announce the update when the marker exists AND the build version changed;
 /// the marker is always consumed.
 pub(crate) fn check_pending() {
@@ -391,13 +346,10 @@ pub(crate) fn check_pending() {
         return;
     }
     unsafe { defaults_remove(PENDING_MARKER_KEY) };
-    // CFBundleVersion(时间戳 build)只用于判定「确实换上了新构建」;
-    // 展示给用户的版本要读 CFBundleShortVersionString(如 0.1.9),否则通知里会冒出时间戳。
     // The timestamped CFBundleVersion only proves a new build actually arrived; the version
     // shown to the user comes from CFBundleShortVersionString (e.g. 0.1.9) instead of the build.
     let current_build = unsafe { bundle_info_string("CFBundleVersion") };
     if current_build.is_empty() || current_build == from_version {
-        // 安装未完成/版本未变(异常路径):只清标记,不打扰。
         // Install aborted or version unchanged: consume the marker quietly.
         log_debug!("[update-notice] pending marker consumed without version change");
         return;
@@ -427,10 +379,8 @@ pub(crate) fn check_pending() {
     post_update_installed(&app, &shown_version);
 }
 
-/// 更新安装并重启后发一条系统通知(仅 bundled app;未授权时由系统弹一次性授权框)。
 /// Post the "updated" notification (bundled apps only; the first run shows the one-time
 /// system authorization prompt).
-/// 定时(后台)检查发现新版本时通知用户;点击横幅由 delegate 跳转打开更新窗口。
 /// Notify the user when a scheduled background check finds a new version; clicking the
 /// banner opens the update window via the delegate.
 pub(crate) fn post_update_available(app: &str, version: &str) {
@@ -472,11 +422,9 @@ pub(crate) fn post_update_available(app: &str, version: &str) {
     }
 }
 
-/// 更新安装并重启后发一条系统通知(仅 bundled app;未授权时由系统弹一次性授权框)。
 /// Post the "updated" notification (bundled apps only; the first run shows the one-time
 /// system authorization prompt).
 pub(crate) fn post_update_installed(app: &str, version: &str) {
-    // 无 bundle id(裸 cargo run)时 UNUserNotificationCenter 会抛异常,先守卫。
     // UNUserNotificationCenter raises when the bundle id is missing (raw cargo run);
     // guard before touching it.
     let bundle_id = unsafe { bundle_info_string("CFBundleIdentifier") };
@@ -484,7 +432,6 @@ pub(crate) fn post_update_installed(app: &str, version: &str) {
         log_debug!("[update-notice] no bundle id; skipping update notification");
         return;
     }
-    // 框架守卫:类不在类表(框架未加载)时 objc2 的断言会 panic,先安全降级。
     // Framework guard: objc2's assertion panics when the class is absent (framework not
     // loaded); degrade gracefully instead.
     let uncenter_cname = std::ffi::CString::new("UNUserNotificationCenter").unwrap();
@@ -513,9 +460,7 @@ pub(crate) fn post_update_installed(app: &str, version: &str) {
             let _: () = msg_send![center, setDelegate: delegate];
         }
         *PENDING_NOTICE.lock().unwrap() = Some((title, body, ID_UPDATE_INSTALLED.to_string()));
-        // alert|sound;系统只在第一次弹授权框,之后直接走回调。
         // alert|sound; the system prompts once, then the callback runs immediately.
-        // (block 参数同上,走手工 msgSend。/ the block arg goes through the raw send too.)
         type RequestAuthFn =
             unsafe extern "C" fn(*mut AnyObject, Sel, usize, *const AuthCompletionBlock);
         let send: RequestAuthFn = std::mem::transmute(objc_msgSend as *const ());

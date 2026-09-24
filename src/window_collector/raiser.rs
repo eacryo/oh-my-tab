@@ -1,12 +1,7 @@
-//! 窗口收集 · raiser:AX 阶段后台化(专职 raiser 线程)与抬升代数防乱序回跳。
 //! Background AX phase (dedicated raiser thread) with generation-guarded ordering.
 
 use super::*;
 
-// ========== AX 阶段后台化(专职 raiser 线程) / background AX phase (dedicated raiser) ==========
-
-// 最新抬升意图代号:每次提交切换自增;后台任务在应用 AX 变更前重查,已被更新的切换
-// 取代就中止——快速连续切换时,避免旧任务把旧窗口又抬回新窗口上面(乱序回跳)。
 // Generation of the latest raise intent: bumped on every committed switch. Background jobs
 // re-check before applying AX mutations and abort once a newer switch supersedes them --
 // during rapid consecutive switches, a stale job must never re-raise an old window over the
@@ -79,9 +74,6 @@ pub(crate) fn handle_ax_raise_main() {
             let raise_started = Instant::now();
             let raise_first_err = AXUIElementPerformAction(job.element, job.raise_key);
             let raise_first_us = raise_started.elapsed().as_micros();
-            // 对端超时(-25204)时不再做 focus 兜底与重试:这两次调用同样只会再各等一个超时,
-            // 实测 first/set_focused/retry 三次全是 -25204,主线程被占住约 4.5s。快速路径的 SLPS
-            // 抬窗已经生效,这里直接放弃 AX 兜底,把这 3 段超时压成 1 段。
             // Drop the focus backstop and its retry once the target times out (-25204): both calls
             // would only wait out another timeout each -- the log shows first/set_focused/retry all
             // returning -25204 with the main thread blocked for ~4.5s. The SLPS fast raise already
@@ -164,7 +156,6 @@ unsafe fn enqueue_main_thread_ax_raise(
         });
         old
     };
-    // 主线程尚未消费时只保留最新 generation，旧任务的 retained AX 对象立即释放。
     // Keep only the newest generation while the main thread is busy; release retained AX
     // objects from superseded jobs immediately.
     for old in pending {
@@ -191,8 +182,6 @@ unsafe fn enqueue_main_thread_ax_raise(
     }
 }
 
-// 单一专职 raiser 线程:串行 FIFO 消费任务,保证两次切换的 AX 阶段不并发、
-// 完成顺序与提交顺序一致(配合 supersede 检查,最终状态保持为最后一次切换)。
 // A single dedicated raiser thread consumes jobs serially, so AX phases of consecutive
 // switches never overlap and completion order equals commit order (combined with the
 // supersede check, the final state is always the last switch).
@@ -215,10 +204,8 @@ static RAISE_QUEUE: std::sync::LazyLock<RaiseQueue> = std::sync::LazyLock::new(|
     RaiseQueue { tx, rx }
 });
 
-/// 提交后台 AX 精确抬升任务。普通窗口只执行 cached AXRaise;已知最小化窗口先还原。
 /// Enqueue the serialized AX backstop. Normal windows only perform cached AXRaise; known
 /// minimized windows are restored first.
-/// AX 枚举对无响应 App 可能阻塞几十至上百毫秒,应放在后台线程执行。
 ///
 /// AX enumeration can block tens to hundreds of milliseconds on an unresponsive app; it must
 /// stay off the main thread.
@@ -243,7 +230,6 @@ pub(crate) fn raise_window_ax_async(
     match RAISE_QUEUE.tx.try_send(job) {
         Ok(()) => {}
         Err(flume::TrySendError::Full(job)) => {
-            // 队列满表示旧任务尚未开始；移除它并保留最新 generation。
             // A full slot means the old job has not started; replace it with the latest
             // generation instead of letting stale raises accumulate.
             let _ = RAISE_QUEUE.rx.try_recv();
@@ -276,7 +262,6 @@ fn run_raise_ax_job(job: RaiseJob) {
         job.generation,
         job.enqueued_at.elapsed().as_millis()
     );
-    // 后台线程一律包 autorelease pool:当前只用 CF 对象,包一层防将来引入 ObjC 调用后泄漏。
     // Always wrap background work in an autorelease pool: this path only touches CF objects
     // today; the pool guards against leaks if ObjC calls are ever added.
     unsafe {
@@ -338,8 +323,6 @@ unsafe fn retry_failed_fast_path(job: &RaiseJob) -> bool {
     false
 }
 
-/// AX 阶段本体:缓存命中时普通窗口只执行 AXRaise;已知最小化窗口先还原并补跑快速路径。
-/// 缓存失效才枚举 AXWindows,按 CGWindowID 重新配对并刷新缓存。
 /// AX phase: on a cache hit, normal windows only perform AXRaise; known minimized windows are
 /// restored first and then run the fast path. Only a stale/missing cache enumerates AXWindows,
 /// pairs by CGWindowID, and refreshes the cache.
@@ -352,8 +335,6 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
     }
     let process_start_time_us = resolve_app_identity(job.pid).process_start_time_us;
     let app_create_us = app_started.elapsed().as_micros();
-    // 抬窗路径的 AX 全部按 AX_RAISE_MESSAGING_TIMEOUT 限时:窗口元素在 raise_ax_element 里
-    // 单独设置,app 元素在这里设置(它不传递给子元素)。
     // Every AX call on the raise path is bounded by AX_RAISE_MESSAGING_TIMEOUT: the window element
     // is set inside raise_ax_element, the app element here (it is not inherited by children).
     AXUIElementSetMessagingTimeout(app, AX_RAISE_MESSAGING_TIMEOUT);
@@ -362,8 +343,6 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
     let focused_key = cf_string_new("AXFocusedWindow");
     let minimized_key = job.minimized.then(|| cf_string_new("AXMinimized"));
 
-    // collect_windows 已经为当前窗口保留了 AX 元素。正常切换直接复用它，避免每次都做
-    // 一次 AXWindows IPC；只有元素失效时才回退到下面的实时枚举。
     // collect_windows retains the AX element for the current window. Reuse it for normal
     // switches to avoid an AXWindows IPC round trip; only stale elements use the live scan below.
     if let Some(element) = cached_ax_window_element(job.pid, process_start_time_us, job.cgwid) {
@@ -452,15 +431,11 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
         if element.is_null() {
             continue;
         }
-        // 同采集路径:窗口元素不继承 app 元素超时,逐个设,否则匹配遍历会在无响应 App 上
-        // 每次读属性都等满系统默认超时。
         // Same as the collection path: window elements do not inherit the app element's timeout,
         // so set it per element or the match loop waits out the system default on each attribute
         // read against an unresponsive app.
         AXUIElementSetMessagingTimeout(element, AX_RAISE_MESSAGING_TIMEOUT);
         if ax_window_cgwid(element) == Some(job.cgwid) {
-            // 应用变更前的最后一道 supersede 闸:枚举期间若来了更新的切换,本任务整体
-            // 放弃(枚举结果作废),由新任务重新执行。
             // Final supersede gate right before applying: if a newer switch arrived during
             // enumeration, drop this job entirely (stale match) and let the new one run.
             if !raise_intent_current(job.generation) {
@@ -473,7 +448,6 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
                 );
                 break;
             }
-            // 找到实时元素后更新缓存,下一次切换就不必重新枚举。
             // Refresh the cache with the live element so the next switch skips enumeration.
             cache_ax_window_element(job.pid, process_start_time_us, job.cgwid, element);
             // Unminimize is an AX mutation and is performed by the main-thread queue below.
@@ -526,8 +500,6 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
     CFRelease(app);
 }
 
-/// 普通路径只执行一次 AXRaise。仅当它明确失败且不是 stale element 时,才设置
-/// AXFocusedWindow 并重试;成功路径不再支付额外 AX IPC。
 /// The normal path performs one AXRaise. Only an explicit non-stale failure sets
 /// AXFocusedWindow and retries; a successful raise pays no extra AX IPC.
 #[allow(clippy::too_many_arguments)]
@@ -548,8 +520,6 @@ unsafe fn raise_ax_element(
         cgwid,
         force_focus
     );
-    // AXRaise 打的是窗口元素,而 app 元素上的超时不会传给它(见 AX_WINDOW_MESSAGING_TIMEOUT 注释)。
-    // 下面这些 AX 调用都在主线程执行,漏设超时就会按系统默认值(约 1.5s)冻结界面。
     // AXRaise targets the window element, which does not inherit the app element's timeout
     // (see the AX_WINDOW_MESSAGING_TIMEOUT note). Every AX call below runs on the main thread, so
     // a missing timeout freezes the UI for the system default (~1.5s).
@@ -569,18 +539,10 @@ unsafe fn raise_ax_element(
     (K_AX_SUCCESS, None, None)
 }
 
-/// 查一个 PID 的 AX 标准窗口列表。
-/// 返回 None = AX 查询失败(该 App 无 AX 数据,可走 CG 回退);
-/// Some(vec) = 查询成功,subrole 过滤后可能为空(无标准窗口 = 调度中心不显示它,直接跳过)。
-///
 /// Query an app's AX standard-window list.
 /// None = AX query failed (app has no AX data; CG fallback allowed);
 /// Some(vec) = query succeeded, possibly empty after subrole filtering (no standard windows =
 /// Mission Control won't show it; skip entirely).
-/// AX 窗口角色白名单:标准窗口(AXStandardWindow)任意;对话框(AXDialog——
-/// JetBrains 系 IDE 的主窗口角色)必须有非空标题;部分 App(如 Xcode)的普通窗口
-/// 报告 AXUnknown,只有同时具备 AXWindow role 和非空标题才放行;其余角色(弹窗/面板/
-/// 隐形窗口)一律过滤;无 subrole 视为标准窗口。纯函数,单测覆盖。
 /// AX-window subrole keep-rule: standard windows always pass; AXDialog (the subrole
 /// JetBrains IDEs use for their MAIN windows) only when titled; some apps (such as Xcode)
 /// report ordinary windows as AXUnknown, so allow that only with AXWindow role and a non-empty
@@ -592,7 +554,6 @@ pub(super) fn ax_subrole_kept(subrole: Option<&str>, role: Option<&str>, titled:
         Some("AXDialog") => titled,
         Some("AXUnknown") => role == Some("AXWindow") && titled,
         Some(_) => false,
-        // 无 subrole → 视为标准窗口(部分 App 不设置此属性)。
         // A missing subrole counts as standard (some apps don't set it).
         None => true,
     }
@@ -601,8 +562,6 @@ pub(super) fn ax_subrole_kept(subrole: Option<&str>, role: Option<&str>, titled:
 // The substantial custom-window boundary. Standard windows and titled dialogs do not use this
 // size gate; it only prevents an untitled/unknown custom root from becoming a switch
 // destination when it is merely a tiny auxiliary surface.
-// 自定义窗口的尺寸边界。标准窗口和有标题的对话框不走此门槛；仅防止 AXUnknown 自定义根
-// 元素在很小时被当成可切换窗口。
 const CUSTOM_WINDOW_MIN_WIDTH: f64 = 100.0;
 const CUSTOM_WINDOW_MIN_HEIGHT: f64 = 50.0;
 
@@ -621,9 +580,6 @@ pub(super) fn is_attached_surface(parent_id: Option<u32>) -> bool {
 /// Decide whether an AX-only window may be backfilled into the switcher.
 /// A missing CG entry means an orderOut'd window, which AX can legitimately recover; a known
 /// non-zero CG layer means an app-owned overlay/menu and must stay out of the window switcher.
-///
-/// 判断 AX-only 窗口是否可以补回切换器。CG 中完全没有对应项表示 orderOut 的窗口,AX
-/// 仍可能合法地补回;但如果 CG 已知该窗口处于非 0 层,它就是应用浮层/菜单,不能进入切换器。
 pub(super) fn should_backfill_ax_window(cg_layer: Option<i32>) -> bool {
     match cg_layer {
         Some(layer) => layer == 0,
@@ -684,8 +640,6 @@ pub(super) fn remember_non_normal_cg_windows_for_process(
     }
 }
 
-/// 查某 PID 的全部标准 AX 窗口:(cgwid, 标题, 是否最小化)。collect_windows 与
-/// 缩略图模块的启动预生成共用。
 /// All standard AX windows for a PID: (cgwid, title, minimized). Shared between
 /// collect_windows and the thumbnail module's startup pre-generation.
 pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)>> {
@@ -698,12 +652,10 @@ pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)
     })
 }
 
-/// kAXValueAXErrorType(批量读里“应用没答这个属性”的占位值类型)。
 /// kAXValueAXErrorType: the placeholder type a batch read uses for an attribute the app did
 /// not answer.
 const K_AX_VALUE_AX_ERROR_TYPE: i32 = 5;
 
-/// 取批量读结果里的一个槽位:数组越界、null、错误占位都归为“没答”(None)。
 /// Read one slot of a batch-read result: an out-of-range index, null or an error placeholder all
 /// mean "did not answer" (None).
 unsafe fn ax_slot_value(slots: *const c_void, index: isize) -> Option<AXUIElementRef> {
@@ -714,8 +666,6 @@ unsafe fn ax_slot_value(slots: *const c_void, index: isize) -> Option<AXUIElemen
     if value.is_null() {
         return None;
     }
-    // 批量读(未带 stopOnError)对答不出的槽位放一个 kAXValueAXErrorType 的 AXValue;
-    // 不识别它就会把“没答”当成“答了一个对象”。
     // A batch read without stopOnError puts an kAXValueAXErrorType AXValue in a slot the app could
     // not answer; not recognising it would read "did not answer" as "answered an object".
     if CFGetTypeID(value) == AXValueGetTypeID() && AXValueGetType(value) == K_AX_VALUE_AX_ERROR_TYPE
@@ -725,15 +675,6 @@ unsafe fn ax_slot_value(slots: *const c_void, index: isize) -> Option<AXUIElemen
     Some(value)
 }
 
-/// 把三个属性槽位里的窗口元素合并成一份候选列表:`kAXWindows` 的顺序在前,再补 focused、
-/// main;同一个窗口(由元素里的 CGWindowID 识别)只保留首次出现,取不到 id 的按元素本身去重。
-///
-/// 三个属性必须一起读,且**空数组不是“没有窗口”**:AppKit 的 `kAXWindows` 是按“当前 Space”
-/// 过滤出来的(窗口全在别的 Space 时它返回空数组),而 `kAXFocusedWindow`/`kAXMainWindow`
-/// 直接读 NSApplication 的 `_keyWindow`/`_mainWindow` 弱引用,不做 Space 过滤、也不要求
-/// App 处于激活——所以那种 App 仍会交回它的 key/main 窗口。在此处遇到 windows 为空就提前
-/// 返回,恰好会把唯一能救回这些窗口的信息丢掉。
-///
 /// Merges the window elements of the three attribute slots: `kAXWindows` order first, then the
 /// focused and main slots; a window (identified by its CGWindowID) keeps its first occurrence,
 /// while elements without an id are deduplicated by element. The three must be read together, and
@@ -754,7 +695,6 @@ where
     let mut result = Vec::with_capacity(published.len() + 2);
     let mut seen_wids = HashSet::new();
     let mut seen_elements = HashSet::new();
-    // 最后一个分量标记“只来自 key/main 槽位”(见 AxWindowInfo::only_via_key_or_main)。
     // The last component marks "only from the key/main slots" (see
     // AxWindowInfo::only_via_key_or_main).
     let candidates = published
@@ -764,7 +704,6 @@ where
         .chain(focused.map(|entry| (entry, true)))
         .chain(main.map(|entry| (entry, true)));
     for ((wid, element), only_via_key_or_main) in candidates {
-        // 槽位之间会重复同一个窗口(取回的是不同对象),按 id 去重才能省下重复的逐元素属性查询。
         // The slots repeat the same window as different objects; deduplicating by id saves the
         // duplicate per-element attribute reads.
         let duplicate = if wid != 0 {
@@ -780,10 +719,6 @@ where
     result
 }
 
-/// 读窗口直接子节点里的原生标签栏(AXTabGroup),返回其中的标签标题。
-/// 只有当前选中的标签窗口会暴露标签栏,后台标签窗口读不到——调用方据此识别标签组。
-/// 结构不认识、没有标签栏、或标签少于两个都返回 None(fail-open)。
-///
 /// Reads the native tab bar (an AXTabGroup among the window's direct children) and returns its
 /// tab titles. Only the selected tab's window exposes one, so a background tab reads as None --
 /// which is how callers identify a tab group. None when the structure is unrecognised, there is
@@ -800,7 +735,6 @@ unsafe fn read_tab_group_info(element: AXUIElementRef) -> Option<TabGroupInfo> {
         && CFGetTypeID(children_value) == CFArrayGetTypeID()
     {
         let count = CFArrayGetCount(children_value);
-        // 部分 App 直接把标签按钮挂在窗口下,没有 AXTabGroup 包裹;两类结构都收。
         // Some apps hang the tab buttons directly off the window with no AXTabGroup wrapper, so
         // both shapes are collected while walking the direct children.
         let mut group_titles: Option<Vec<String>> = None;
@@ -827,7 +761,6 @@ unsafe fn read_tab_group_info(element: AXUIElementRef) -> Option<TabGroupInfo> {
                         group_titles = read_tab_titles(child, children_key, title_key);
                     }
                 }
-                // 直接挂着的标签按钮:凑够一组才算数,避免误收单个单选按钮。
                 // Barely-attached tab buttons count only when they really form a group, so a
                 // lone radio button is never mistaken for a tab bar.
                 Some("AXRadioButton") => {
@@ -851,7 +784,6 @@ unsafe fn read_tab_group_info(element: AXUIElementRef) -> Option<TabGroupInfo> {
     info
 }
 
-/// 读一个 AXTabGroup 元素的直接子节点标题(标签按钮);少于两个返回 None。
 /// Reads the titles of an AXTabGroup's direct children (the tab buttons); None under two.
 unsafe fn read_tab_titles(
     group: AXUIElementRef,
@@ -883,7 +815,6 @@ unsafe fn read_tab_titles(
     (titles.len() >= 2).then_some(titles)
 }
 
-/// 读元素 AXTitle(读不到或为空 → None)。
 /// Reads an element's AXTitle (unreadable or empty -> None).
 unsafe fn read_ax_title(element: AXUIElementRef, title_key: *const c_void) -> Option<String> {
     let mut value: *const c_void = std::ptr::null();
@@ -912,21 +843,17 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
             return None;
         }
 
-        // 设 50ms 消息超时:慢/无响应 App 的 AX 查询会快速失败,而不是卡默认 10s 超时
-        // (后者会让该 App 整体走 CG 回退,混入隐形窗口)。
         // Set a 50ms messaging timeout: AX queries on slow/unresponsive apps fail fast instead
         // of hitting the default 10s timeout (which would push the app to the CG fallback path
         // and let invisible windows through).
         AXUIElementSetMessagingTimeout(app, 0.05);
 
-        // 一次批量读三个属性(理由与合并规则见 candidate_window_elements)。
         // One batched read of the three attributes (rationale and merge rules in
         // candidate_window_elements).
         let windows_key = cf_string_new("AXWindows");
         let focused_window_key = cf_string_new("AXFocusedWindow");
         let main_window_key = cf_string_new("AXMainWindow");
         let keys = [windows_key, focused_window_key, main_window_key];
-        // callbacks = null:数组只是本次调用的同步输入,键由 keys 在本函数内保活。
         // callbacks = null: the array is only a synchronous input to this call; `keys` keeps the
         // strings alive for its duration.
         let keys_array = CFArrayCreate(
@@ -953,7 +880,6 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
             return None;
         }
 
-        // 槽位 0 = kAXWindows(CFArray),1 = kAXFocusedWindow,2 = kAXMainWindow。
         // Slot 0 = kAXWindows (a CFArray), 1 = kAXFocusedWindow, 2 = kAXMainWindow.
         let windows_array =
             ax_slot_value(slots, 0).filter(|value| CFGetTypeID(*value) == CFArrayGetTypeID());
@@ -989,15 +915,11 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         let mut results = Vec::with_capacity(candidates.len());
 
         for (cgwid, element, only_via_key_or_main) in candidates {
-            // app 元素上的 50ms 不会传给窗口元素;逐个设超时,否则无响应 App 的窗口查询会
-            // 走系统默认值(约 1.5s),把整轮采集拖住。
             // The 50ms on the app element does not carry over to the window elements; set it per
             // element, or an unresponsive app's window queries fall back to the system default
             // (~1.5s) and stall the whole collection pass.
             AXUIElementSetMessagingTimeout(element, AX_WINDOW_MESSAGING_TIMEOUT);
 
-            // 只保留标准窗口/有标题的对话框,以及 role=AXWindow 且有标题的 AXUnknown
-            // 普通窗口(如 Xcode);过滤弹出面板/下拉菜单等非标准窗口。
             // Keep standard windows, titled dialogs, and titled AXUnknown elements whose
             // role is AXWindow (ordinary windows in apps such as Xcode); filter popups,
             // panels, and other non-standard elements.
@@ -1024,7 +946,6 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 } else {
                     None
                 };
-                // AXDialog/AXUnknown 需额外判断标题;无标题元素按弹出/隐形窗口过滤。
                 // AXDialog/AXUnknown require a non-empty title; untitled elements stay
                 // filtered as popups/invisible windows.
                 let titled = if matches!(subrole.as_deref(), Some("AXDialog") | Some("AXUnknown")) {
@@ -1044,7 +965,6 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 };
                 ax_subrole_kept(subrole.as_deref(), role.as_deref(), titled)
             } else {
-                // 无 subrole → 视为标准窗口(部分 App 不设置此属性)。
                 // No subrole means standard window for apps that don't set it.
                 true
             };
@@ -1063,7 +983,6 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
             } else {
                 String::new()
             };
-            // AXMinimized:窗口是否最小化。无此属性(部分 App)按 false 处理。
             // AXMinimized: whether the window is minimized. Absent attribute (some apps) -> false.
             let minimized = {
                 let mut min_value: *const c_void = std::ptr::null();
@@ -1078,9 +997,6 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                     false
                 }
             };
-            // 原生标签栏只在“多窗口 + 该窗口最小化”时才读:后台标签只有在最小化时才会
-            // 出现在 AX 列表里(可见/隐藏态 AX 只交回选中的标签),也只有那个状态需要收拢;
-            // 其余情况读它是纯开销。读不到就当作没有标签组(fail-open)。
             // The native tab bar is read only for a minimized window of a multi-window app:
             // background tabs only reach the AX list while minimized (the visible/hidden states
             // hand over the selected tab alone), which is the only state that needs folding;
@@ -1115,10 +1031,8 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                     false
                 }
             };
-            // cgwid 已在合并候选时取好(私有 API,用于和 CG 窗口精确配对)。
             // cgwid was resolved while merging the candidates (private API, used to pair with
             // the CG window).
-            // 保留精确元素供激活路径复用,这样正常切换不必再次读取 AXWindows。
             // Retain the exact element for the activation path so normal raises do not need
             // another AXWindows round trip.
             cache_ax_window_element(pid, process_start_time_us, cgwid, element);
@@ -1144,8 +1058,6 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
     }
 }
 
-/// 该 PID 的进程是否不可激活(NSApplicationActivationPolicyProhibited = 2)。
-/// 这类进程按定义没有可切换的窗口(设置面板宿主、光标浮层服务等)。
 /// Whether the process behind `pid` cannot be activated
 /// (NSApplicationActivationPolicyProhibited = 2). Such a process has no switchable windows by
 /// definition (settings-pane hosts, cursor-overlay services).
@@ -1159,7 +1071,6 @@ pub(super) unsafe fn process_cannot_be_activated(pid: i32) -> bool {
     policy == 2
 }
 
-/// CFString -> Rust String(None = 转换失败)。窗口控制模块复用。
 /// CFString -> Rust String (None = conversion failed). Reused by window control.
 pub(crate) fn cf_to_rust_string(cf_string: *const c_void) -> Option<String> {
     let mut buf = vec![0u8; 1024];

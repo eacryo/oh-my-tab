@@ -1,11 +1,8 @@
-//! 设置窗口的语义组件层：页面、卡片、行和控件布局指标。
 //! Semantic components for the Settings window: pages, cards, rows, and layout metrics.
 //!
 //! These components intentionally remain thin wrappers around the existing AppKit builders.
 //! Keeping ownership of raw Objective-C pointers in `settings.rs` avoids changing callback and
 //! configuration lifetimes while giving every page one place for shared geometry rules.
-//! 这里的组件刻意保持轻量，底层仍复用现有 AppKit builder。裸 Objective-C 指针的所有权继续由
-//! settings.rs 管理，避免改变回调/配置生命周期，同时让所有页面共享同一套几何规则。
 
 use objc2::runtime::{AnyObject, Sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -19,12 +16,10 @@ use crate::log_debug;
 use super::{tooltip::SettingsTooltip, widgets};
 
 /// Shared dimensions for in-row action buttons.
-/// 设置行内操作按钮的共享尺寸。
 pub(crate) const ROW_ACTION_BTN_W: f64 = 110.0;
 pub(crate) const ROW_ACTION_BTN_H: f64 = 28.0;
 
 /// Build an in-row action button aligned to the control column's right edge.
-/// 创建一个右对齐到控制列右缘的设置行内操作按钮。
 pub(crate) unsafe fn row_action_button(
     ctrl_x: f64,
     ctrl_w: f64,
@@ -46,7 +41,6 @@ pub(crate) unsafe fn row_action_button(
 }
 
 /// Build the shared custom switch for the onboarding flow.
-/// 为首次运行引导复用设置页的自绘开关。
 pub(crate) unsafe fn onboarding_switch(
     right_x: f64,
     y: f64,
@@ -59,54 +53,39 @@ pub(crate) unsafe fn onboarding_switch(
 /// Right-hand read-only readout of a slider row: its width, the gap before it, and its own
 /// height. The readout hugs the slider's right end and is vertically centred on it, so a slider
 /// in such a row takes the control column's width minus the first two.
-/// 滑块行右侧只读读数的宽度、与滑块之间的间距、以及读数自身的高度。读数贴滑块右端并与滑块
-/// 垂直居中,所以这种行里的滑块宽度 = 控件列宽度扣掉前两项。
 const SLIDER_READOUT_W: f64 = 40.0;
 const SLIDER_READOUT_GAP: f64 = 6.0;
 const SLIDER_READOUT_H: f64 = 18.0;
 
 /// Gap between a card's internal divider and the top edge of the row below it (`separator_above_row`).
-/// 卡片内部分割线与"下方那一行"顶边之间的间距(`separator_above_row`)。
 const SEPARATOR_ABOVE_ROW_GAP: f64 = 3.0;
 
 /// A block of rows inside a card that appears and disappears as a unit.
-/// 卡片里"整块出现/消失"的条件行区块。
 ///
 /// Hiding a block is not just `setHidden`: the card's bottom edge must rise by the block's height,
 /// its shadow must follow, every section below the card must move up by the same amount, and any
 /// dividers inside the block must go with it. Showing it reverses all of that. Keeping the
 /// bookkeeping here means a call site is one line and can never get the arithmetic (or the "does
 /// this view belong to the block?" question) wrong.
-///
-/// 隐藏一块行不能只 `setHidden`:卡片底边要上收整块高度、阴影要跟着、卡片下方所有分组要同步上移,
-/// 区块内的分割线也要一起藏;显示时反向。把这套账收在这里,调用点就是一行,也不会再算错高度或
-/// 搞混"这个 view 属不属于本区块"。
 pub(super) struct CollapsibleRows {
     card: *mut AnyObject,
     shadow: *mut AnyObject,
-    /// 区块自己的 view(行标题/控件/读数):隐藏它们,但不参与位移。
     /// The block's own views (labels/controls/readouts): hidden, never shifted.
     views: Vec<*mut AnyObject>,
-    /// 区块上方的分割线:随区块一起藏。
     /// Dividers above the block: hidden along with it.
     separators: Vec<*mut AnyObject>,
-    /// 整块占用的高度(每行 row_gap + row_h 之和)。
     /// The block's total height (row_gap + row_h summed over its rows).
     height: f64,
-    /// 构建时的卡片高度。当前是否收起由实时卡片高度反推(只有本组件会改它),不存布尔量:
-    /// 万一 AppKit 在窗口显示等时机复位了子视图 frame,下一次调用会自动纠正。
     /// The card height as built. The collapsed state is derived from the live card height (only
     /// this component changes it) instead of a remembered flag, so a layout reset (e.g. AppKit
     /// re-placing subviews when the window is first displayed) self-corrects on the next call.
     expanded_card_height: f64,
-    /// 收起时实际位移过的视图。展开时只撤销本区块的位移，保留其他区块期间产生的变化。
     /// Views actually shifted while collapsed. Expanding reverses only this block's shift and
     /// preserves changes made by other blocks in the meantime.
     shifted: std::cell::RefCell<Vec<*mut AnyObject>>,
 }
 
 impl CollapsibleRows {
-    /// 尚未绑定到任何卡片的空区块(构建设置窗口之前)。
     /// An unbound block (before the settings window is built).
     pub(super) const fn empty() -> Self {
         Self {
@@ -145,7 +124,6 @@ impl CollapsibleRows {
         objc2::msg_send![self.card, frame]
     }
 
-    /// 整块显隐。父视图取自卡片的 superview,调用方不需要传坐标。
     /// Show or hide the whole block. The parent comes from the card's superview, so callers pass
     /// no coordinates.
     pub(super) unsafe fn set_visible(&self, visible: bool) {
@@ -153,14 +131,11 @@ impl CollapsibleRows {
             return;
         }
         let card_frame: NSRect = objc2::msg_send![self.card, frame];
-        // 当前是不是收起态,由实时卡片高度反推(见 expanded_card_height)。
         // Whether the layout is currently collapsed comes from the live card height (see
         // expanded_card_height).
         let currently_compacted =
             card_frame.size.height < self.expanded_card_height - self.height / 2.0;
         if currently_compacted != !visible {
-            // 判定基准是**区块自身的底边**,不是卡片底边:区块可能位于卡片中间(下面还有别的行),
-            // 那些行同样要补位。低于该基准的视图分两级都要挪——卡片内的兄弟行、卡片外的后续分组。
             // The threshold is the BLOCK's own bottom edge, not the card's: a block can sit in the
             // middle of a card, and the rows after it must close the gap too. Views below that
             // threshold move at both levels -- sibling rows inside the card and the sections
@@ -168,15 +143,12 @@ impl CollapsibleRows {
             let shift = if visible { -self.height } else { self.height };
             let parent: *mut AnyObject = objc2::msg_send![self.card, superview];
             let moved = if visible {
-                // 展开:只撤销本区块加上的位移,保留其他区块期间做出的布局调整。
                 // Expanding: reverse only this block's shift and preserve layout changes made by
                 // other blocks in the meantime.
                 self.restore_shifted()
             } else {
-                // 收起:先记录要位移的视图,展开时只反向撤销本次位移。
                 // Collapsing: record the views to move so expansion can reverse only this shift.
                 let mut recorded = Vec::new();
-                // 页面文档可能在组件创建后整体调整高度；此时构造时缓存的 y 已经过期。
                 // The page document may be shifted after this component is built, so a cached y
                 // coordinate would be stale here.
                 let block_bottom = self.block_bottom().unwrap_or(0.0);
@@ -185,7 +157,6 @@ impl CollapsibleRows {
                 self.shifted.replace(recorded);
                 moved
             };
-            // 卡片顶边不动,只让底边收放。
             // The card's top edge stays put; only its bottom edge moves.
             let mut compact_frame = card_frame;
             compact_frame.origin.y += shift;
@@ -221,7 +192,6 @@ impl CollapsibleRows {
         }
     }
 
-    /// 区块自身底边(区块内最低那个 view 的 origin.y),作为"需要补位"的判定基准。
     /// The block's own bottom edge (the lowest origin.y among its views), used as the threshold
     /// for what needs to close the gap.
     unsafe fn block_bottom(&self) -> Option<f64> {
@@ -237,9 +207,6 @@ impl CollapsibleRows {
             })
     }
 
-    /// 把 `parent` 里低于 `threshold` 的 view 整体位移,并记录这些 view 以便展开时反向撤销。
-    /// 返回挪动的个数。区块自己的 view、卡片、阴影都不在位移之列。
-    ///
     /// Shift every view in `parent` below `threshold`, recording it so expansion can reverse this
     /// shift. Return how many moved. The block's own views, the card, and the shadow never take
     /// part.
@@ -261,7 +228,6 @@ impl CollapsibleRows {
             if view == self.card || view == self.shadow || self.views.contains(&view) {
                 continue;
             }
-            // origin.y 更小的视图在屏幕上更低。
             // A smaller origin.y is lower on screen.
             let mut frame: NSRect = objc2::msg_send![view, frame];
             if frame.origin.y < threshold {
@@ -274,7 +240,6 @@ impl CollapsibleRows {
         moved
     }
 
-    /// 只撤销本区块收起时加上的 y 位移；其间其他区块可能改了这些 view 的位置或尺寸，不能覆盖。
     /// Reverse only this block's y shift. Other blocks may have changed these views' positions or
     /// sizes in the meantime, so restoring an old frame would overwrite their layout.
     unsafe fn restore_shifted(&self) -> usize {
@@ -293,12 +258,9 @@ impl CollapsibleRows {
 
 /// Standard rows keep their label and control as sibling views in the card, so retain the
 /// association here instead of forcing every SettingsUi field to grow a second label pointer.
-/// 标准 row 的标题和控件是卡片里的兄弟 view；在组件层记录关联，避免 SettingsUi 为每个控件
-/// 再增加一个 label 指针。
 static ROW_LABELS: LazyLock<Mutex<Vec<(usize, usize)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Shared horizontal and vertical metrics for all settings pages.
-/// 所有设置页共享的水平/垂直布局指标。
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SettingsLayout {
     pub label_x: f64,
@@ -308,22 +270,17 @@ pub(super) struct SettingsLayout {
     pub row_h: f64,
     pub described_row_h: f64,
     /// Distance from one section cursor to the next section header cursor.
-    /// 相邻区块标题游标之间的距离。
     pub section_step: f64,
     /// Vertical gap between rows inside a grouped card.
-    /// 分组卡片内部行与行之间的垂直间距。
     pub row_gap: f64,
     /// Legacy page frame inset below the last row; normalized by SettingsSection.
-    /// 页面 frame 在最后一行下方的原始内缩；由 SettingsSection 统一归一化。
     pub card_bottom_inset: f64,
     /// Gap between a section header and the card top edge.
-    /// 区块标题与卡片顶部之间的间距。
     pub card_header_gap: f64,
 }
 
 impl SettingsLayout {
     /// Standard visual height of one settings row; controls remain shorter and center inside it.
-    /// 设置行的标准视觉高度；控件保持更矮并在其中居中。
     pub(super) const SINGLE_LINE_ROW_H: f64 = 54.0;
     pub(super) const CONTROL_H: f64 = 34.0;
 
@@ -337,7 +294,6 @@ impl SettingsLayout {
             row_h: Self::CONTROL_H,
             // Detailed subtitles are no longer rendered; described rows use the same compact
             // height as every other single-line row.
-            // 详细说明已不再渲染；described 行与其他单行 row 统一使用紧凑高度。
             described_row_h: Self::SINGLE_LINE_ROW_H,
             section_step: super::SETTINGS_SECTION_HEADER_GAP + 24.0,
             row_gap: 8.0,
@@ -364,7 +320,6 @@ impl SettingsLayout {
 }
 
 /// Ownership-neutral page parts returned by the AppKit page builder.
-/// AppKit 页面 builder 返回的、不负责释放对象的页面部件。
 #[derive(Clone, Copy)]
 pub(super) struct SettingsPage {
     pub(super) scroll: *mut AnyObject,
@@ -400,45 +355,31 @@ impl SettingsPage {
 /// distance from the pane top (`.content { padding: 42px 0 72px }`), plus the gap down to the
 /// first section heading. Owns the whole page-top block so pages neither hardcode its metrics nor
 /// drift apart: one call returns the cursor that first heading hangs from.
-/// 页头组件:设计稿的大号页标题(`h1 { font-size: 30px }`)、它与面板顶部的距离
-/// (`.content { padding: 42px 0 72px }`),以及到首个小标题的间距。整块页面顶部节奏归组件所有,
-/// 页面既不硬编码这些度量,也不会各自漂移:一次调用即返回首个小标题所挂的游标。
 pub(super) struct SettingsPageHeader;
 
 impl SettingsPageHeader {
     /// HTML `.content`'s top padding — the title block's distance from the pane top.
-    /// HTML `.content` 的顶部内边距,即标题块与面板顶部的距离。
     pub(super) const TOP_PADDING: f64 = 42.0;
 
     /// HTML `.content`'s bottom padding, i.e. the space the page must keep below its last element.
     /// Page documents are tightened to it (`widgets::fit_page_document_height`); overshooting it is
     /// the dead scroll space users see as "the page scrolls far past its content".
-    /// HTML `.content` 的底部内边距,即页面最后一个元素下方必须保留的空白。页面文档按它收紧
-    /// (`widgets::fit_page_document_height`);超出它的部分就是用户看到的"页面能滚过内容很远"。
     pub(super) const BOTTOM_PADDING: f64 = 72.0;
 
     /// Empty space between the title's frame and the first section heading's frame below it.
-    /// 页面大标题框与其下方首个小标题框之间的空白。
     ///
     /// Every page opens with one section (its master switch or first group) whose heading used to
     /// be placed by hand: General/App Switcher sat 10pt under the title while Mouse/Clipboard/
     /// Window Control/Quick Actions sat 16pt. This one value now covers all six.
-    /// 每页都以一个区块(总开关或第一组)开头,该小标题以前由各页手写:通用/应用切换距大标题
-    /// 10pt,鼠标/剪贴板/窗口控制/快捷操作 16pt。现在六页统一走这一个值。
     const FIRST_SECTION_GAP: f64 = 16.0;
 
     /// Build the page title and return the cursor for the first section heading below it.
-    /// 构建页面大标题,并返回其下方首个小标题的游标。
     ///
     /// The cursor is that heading's frame BOTTOM: `widgets::add_header` grows its label upwards
     /// from there, and `SettingsSection::attach` puts the card top `SETTINGS_SECTION_CARD_GAP`
     /// below it. Callers hand it to their first `SettingsSection::attach` and advance from it with
     /// `SettingsLayout::next_row_cursor`, exactly like every later section -- which is what keeps
     /// the first card's row on the same 4pt inset as all the others.
-    /// 返回的是小标题框的底边:`widgets::add_header` 从该处向上生长标签框,`SettingsSection::attach`
-    /// 的卡片顶边在它下方 `SETTINGS_SECTION_CARD_GAP` 处。调用方把它交给首个
-    /// `SettingsSection::attach`,再用 `SettingsLayout::next_row_cursor` 往后排 —— 与后续区块完全
-    /// 相同,首卡第一行因此和其他卡片一样落在 4pt 的卡片内边距上。
     pub(super) unsafe fn attach(
         parent: *mut AnyObject,
         title: &str,
@@ -446,9 +387,6 @@ impl SettingsPageHeader {
         doc_top: f64,
         w: f64,
     ) -> f64 {
-        // 页面文档可能被 make_settings_page 按视口高度撑大；布局调用方传入的预设高度
-        // 此时不再是文档顶边。以实际 frame 高度锚定标题，并把高度差折算进返回值，
-        // 让后续区块继续从同一个真实顶边计算。
         // make_settings_page may grow the document to the viewport height, so the caller's
         // provisional height is no longer the document's top edge. Anchor the title to the
         // actual frame height and fold the delta into the returned consumption so following
@@ -460,7 +398,6 @@ impl SettingsPageHeader {
             doc_top
         };
         // widgets::add_page_title places the title's top edge at cursor + 10.
-        // widgets::add_page_title 将标题顶边放在 cursor + 10 处。
         let title_h = widgets::add_page_title(
             parent,
             title,
@@ -468,8 +405,6 @@ impl SettingsPageHeader {
             actual_doc_top - Self::TOP_PADDING - 10.0,
             w,
         );
-        // 标题框底边 → 再往下 FIRST_SECTION_GAP 的空白 → 再减去小标题标签框自身高度,
-        // 得到小标题框底边(即调用方继续排版的游标)。
         // Title frame bottom, one FIRST_SECTION_GAP further down, then the heading label's own
         // height up to its bottom edge -- the cursor callers lay the page out from.
         actual_doc_top
@@ -482,7 +417,6 @@ impl SettingsPageHeader {
 
 /// Card component. Rows remain siblings of the card background so native controls keep their
 /// normal hit-testing and z-order; the component owns only the card/shadow pair.
-/// 卡片组件。行仍作为卡片背景的 sibling，保证原生控件的命中和层级正常；组件只拥有卡片/阴影对。
 #[derive(Clone, Copy)]
 pub(super) struct SettingsCard {
     pub(super) card: *mut AnyObject,
@@ -500,15 +434,12 @@ impl SettingsCard {
 }
 
 /// A titled settings section: the small explanatory heading and its rounded card are one unit.
-/// 带标题的设置区块：左上角说明性小标题与圆角卡片作为一个组件单元。
 pub(super) struct SettingsSection;
 
 impl SettingsSection {
     // Existing page coordinates reserve 4pt above a section card and 10pt below its last row.
     // Trim the extra bottom inset here so the row content is centered in the card's visible area
     // without requiring every page to carry a separate y-offset correction.
-    // 现有页面坐标在区块卡片上方预留 4pt、最后一行下方预留 10pt。组件统一裁掉多出的底部
-    // 6pt，让行内容在卡片可见区域内居中，页面调用方无需各自修正 y 坐标。
     const EXTRA_BOTTOM_INSET: f64 = 6.0;
 
     pub(super) unsafe fn attach(
@@ -527,8 +458,6 @@ impl SettingsSection {
 
 /// Semantic row entry points. Every row centers its leading text and trailing control internally;
 /// described rows retain their legacy subtitle parameter only for call-site compatibility.
-/// 语义化 row 入口。每行内部统一居中左侧文字和右侧控件；described 行保留旧 subtitle 参数，
-/// 仅用于兼容现有调用点，不再渲染详细说明。
 pub(super) struct SettingsRow;
 
 impl SettingsRow {
@@ -543,13 +472,11 @@ impl SettingsRow {
     }
 
     /// Drop row label associations before the settings views are deallocated.
-    /// 设置 view 释放前清理 row 标题关联。
     pub(super) fn clear_runtime_registry() {
         ROW_LABELS.lock().unwrap().clear();
     }
 
     /// Apply enabled state, disabled appearance, cursor, and optional tooltip to one view.
-    /// 对单个 view 同时应用启用状态、禁用外观、指针和可选 Tooltip。
     pub(super) unsafe fn set_view_enabled_with_tooltip(
         view: *mut AnyObject,
         enabled: bool,
@@ -575,7 +502,6 @@ impl SettingsRow {
         {
             // NSImageView and other decorative views have no enabled property; dim them through
             // alpha so custom rows still communicate that they are unavailable.
-            // NSImageView 等装饰 view 没有 enabled 属性；通过透明度置灰自定义行。
             let _: () = objc2::msg_send![view, setAlphaValue: if enabled { 1.0 } else { 0.45 }];
         }
         SettingsTooltip::apply(view, enabled, (!enabled).then_some(tooltip).flatten());
@@ -585,14 +511,11 @@ impl SettingsRow {
     /// Call this before `removeFromSuperview`, never after: the registry lookups are keyed by
     /// the view's address, so a stale entry turns the next settings click into a message to
     /// freed memory.
-    /// 注销一个即将从视图层级移除并释放的 view。必须在 removeFromSuperview 之前调用：注册表
-    /// 以 view 地址为键，残留条目会让设置窗口的下一次点击给已释放内存发消息。
     pub(super) unsafe fn forget(view: *mut AnyObject) {
         SettingsTooltip::forget(view);
     }
 
     /// Enable/disable a row and show a native AppKit bubble while it is unavailable.
-    /// 启用/禁用 row；不可用时显示 AppKit 原生小气泡提示。
     pub(super) unsafe fn set_enabled_with_tooltip(
         control: *mut AnyObject,
         enabled: bool,
@@ -614,31 +537,24 @@ impl SettingsRow {
     }
 
     /// Enable/disable a standard row as one semantic component, including its leading label.
-    /// 以语义组件为单位启用/禁用标准 row，同时处理左侧标题。
     pub(super) unsafe fn set_enabled(control: *mut AnyObject, enabled: bool) {
         Self::set_enabled_with_tooltip(control, enabled, "");
     }
 
     /// Add a card divider at an absolute y (the low-level primitive).
-    /// 在给定的绝对 y 处画一条卡片分割线(底层原语)。
     ///
     /// Most cards want `separator_above_row` instead, which owns the row-relative arithmetic. Use
     /// this directly only when the y is not derived from a row's position (e.g. the General page's
     /// contiguous rows sharing an edge, or the About page's runtime-toggled divider).
-    /// 绝大多数地方应该用 `separator_above_row`(它把相对行的算术收进组件)。只有当 y 不是由某一行
-    /// 的位置推出时才直接用这个:例如 General 页相邻两行共用一条边,或 About 页运行时显隐的线。
     pub(super) unsafe fn separator(parent: *mut AnyObject, y: f64, width: f64) -> *mut AnyObject {
         widgets::add_row_separator(parent, 0.0, y, width)
     }
 
     /// Draw a grouped card's internal divider just above a row.
-    /// 在某一行顶边上方画分组卡片的内部分割线。
     ///
     /// `row_y`/`row_h` are the position and height of the row BELOW the divider -- normally the
     /// row built right after this call. Passing the row above instead is the easy mistake to
     /// make, and it fails silently: the line simply lands at the top of the card.
-    /// `row_y`/`row_h` 传的是**线下方那一行**(一般就是紧接着要构建的那一行)的行坐标与行高。
-    /// 传成上面那一行是这个接口最容易犯的错,而且不会报错——线会静默地跑到卡片最顶上。
     pub(super) unsafe fn separator_above_row(
         parent: *mut AnyObject,
         row_y: f64,
@@ -649,28 +565,21 @@ impl SettingsRow {
     }
 
     /// Width to give a slider that sits in a row with a right-hand readout.
-    /// 带右侧读数的滑块行里,滑块该用的宽度。
     ///
     /// Pair it with `attach_slider_readout`; the two share `SLIDER_READOUT_*` so the pair can
     /// never drift apart.
-    /// 与 `attach_slider_readout` 成对使用;两者共用 `SLIDER_READOUT_*`,不会各自漂移。
     pub(super) fn slider_width(control_w: f64) -> f64 {
         control_w - SLIDER_READOUT_W - SLIDER_READOUT_GAP
     }
 
     /// Attach the right-hand read-only readout of a slider row and return it (for refreshes and
     /// conditional visibility).
-    /// 给"标题 + 滑块"行补上右侧只读读数,返回该 label(供刷新数值与条件显隐)。
     ///
     /// The whole position comes from the slider's own frame -- one gap past its right end,
     /// vertically centred on it -- so callers compute no coordinates and can never drift from
     /// where the row builder actually put the slider (row builders re-centre the control).
     /// The label itself comes from `widgets::make_value_label`, keeping font, text role, and
     /// truncation shared.
-    ///
-    /// 位置完全由滑块自身的 frame 推出:紧贴滑块右端一个间距、垂直居中。调用方因此不需要算
-    /// 坐标,也不会与行的实际摆放脱节(row builder 会重新给控件居中)。label 本身走
-    /// `widgets::make_value_label`,字体/文本角色/截断保持一致。
     pub(super) unsafe fn attach_slider_readout(
         parent: *mut AnyObject,
         slider: *mut AnyObject,
@@ -686,7 +595,6 @@ impl SettingsRow {
             SLIDER_READOUT_H,
             &format!("{value}"),
         );
-        // 读数在滑块右端居中(About 页的版本号是 Natural,两者角色不同)。
         // The readout centres under the slider's right end (the About page's version value is
         // Natural; the two play different roles).
         let _: () = objc2::msg_send![label, setAlignment: 1isize]; // NSTextAlignmentCenter
@@ -696,7 +604,6 @@ impl SettingsRow {
     }
 
     /// Center a native control by its view frame.
-    /// 按控件 view frame 在 row 内垂直居中。
     unsafe fn center_control(child: *mut AnyObject, y: f64, row_h: f64) {
         if child.is_null() {
             return;
@@ -709,8 +616,6 @@ impl SettingsRow {
     /// NSTextField's glyphs are top-biased when its frame is taller than the measured cell.
     /// Fit the frame to the cell's measured height before centering it, so the glyph baseline
     /// shares the same center line as the trailing control.
-    /// NSTextField 在较高 frame 中会把字形偏上绘制。先收紧到 cell 实际高度，再居中 frame，
-    /// 让字形基线与右侧控件共享同一条中心线。
     unsafe fn center_label(child: *mut AnyObject, y: f64, row_h: f64) {
         if child.is_null() {
             return;
@@ -721,7 +626,6 @@ impl SettingsRow {
         }
         // Measure against the full row height; a previous centering pass may have already
         // shrunk the label frame to one line, which would otherwise hide later wrapped text.
-        // 使用完整 row 高度测量；之前的居中可能已把 label frame 收紧为单行，否则后续换行文本会被隐藏。
         let mut bounds: NSRect = objc2::msg_send![child, bounds];
         bounds.size.height = row_h.max(1.0);
         let measured: objc2_foundation::NSSize = objc2::msg_send![cell, cellSizeForBounds: bounds];
@@ -735,7 +639,6 @@ impl SettingsRow {
     }
 
     /// Center a read-only text control without changing editable field geometry.
-    /// 只对只读文本控件收紧字形 frame；可编辑输入框保留完整控件高度。
     unsafe fn center_readonly_text_control(child: *mut AnyObject, y: f64, row_h: f64) {
         if child.is_null() {
             return;
@@ -790,7 +693,6 @@ impl SettingsRow {
     }
 
     /// Use the space before a control column for the label instead of imposing a fixed width.
-    /// 按控件列左侧的可用空间自适应标题宽度，避免长标题提前换行或与控件相撞。
     pub(super) unsafe fn tall_before_control(
         parent: *mut AnyObject,
         label_x: f64,
@@ -846,11 +748,9 @@ impl SettingsRow {
 }
 
 /// Native controls shared by settings rows and the window chrome.
-/// 设置行和窗口 chrome 共用的原生控件组件入口。
 pub(super) struct SettingsControl;
 
 /// Animated select component shared by settings rows and auxiliary edit panels.
-/// 设置行和辅助编辑面板共用的动画选择器组件。
 pub(super) struct SettingsSelect;
 
 #[derive(Clone, Copy, Debug)]
@@ -861,7 +761,6 @@ pub(super) struct SettingsSelectMetrics {
 
 impl SettingsSelect {
     /// Reserve enough row space for the longest candidate without changing height on selection.
-    /// 按最长候选值预留行高，避免切换选项时控件突然覆盖相邻内容。
     pub(super) unsafe fn metrics(
         width: f64,
         items: &[&str],
@@ -904,9 +803,8 @@ impl SettingsControl {
         widgets::make_switch(right_x, y, h, checked)
     }
 
-    /// `default_value`: 双击恢复的默认值(None = 不接管双击)。
     /// `default_value`: the value a double-click restores (None = double-click untouched).
-    #[allow(clippy::too_many_arguments)] // 与 widgets::make_* 同一参数表。 / same parameter list as widgets::make_*.
+    #[allow(clippy::too_many_arguments)] // same parameter list as widgets::make_*.
     pub(super) unsafe fn slider(
         x: f64,
         y: f64,
@@ -921,10 +819,8 @@ impl SettingsControl {
     }
 
     /// Build a continuous (fractional) slider.
-    /// 构造连续取值(小数)的滑块。
-    /// `default_value`: 双击恢复的默认值(None = 不接管双击)。
     /// `default_value`: the value a double-click restores (None = double-click untouched).
-    #[allow(clippy::too_many_arguments)] // 与 widgets::make_* 同一参数表。 / same parameter list as widgets::make_*.
+    #[allow(clippy::too_many_arguments)] // same parameter list as widgets::make_*.
     pub(super) unsafe fn double_slider(
         x: f64,
         y: f64,
@@ -943,7 +839,6 @@ impl SettingsControl {
     }
 
     /// Build a non-editable value label that can be placed in a `SettingsRow`.
-    /// 构造可放入 `SettingsRow` 的只读值文本。
     pub(super) unsafe fn value_label(
         x: f64,
         y: f64,
@@ -955,7 +850,6 @@ impl SettingsControl {
     }
 
     /// Build an external-link value control with the shared link hover/cursor behavior.
-    /// 构造复用统一链接悬停/光标行为的外部链接值控件。
     pub(super) unsafe fn external_link(
         x: f64,
         y: f64,
@@ -969,9 +863,7 @@ impl SettingsControl {
 
     /// Build an action button usable inside a `SettingsRow` (e.g. "export logs"), so row
     /// actions share the same geometry/centering path as every other trailing control.
-    /// 构造可放入 `SettingsRow` 的操作按钮(如「导出日志」),让行内动作与其他右侧
-    /// 控件走同一条几何/居中管线。
-    #[allow(clippy::too_many_arguments)] // 与 widgets::make_* 同一参数表。 / same parameter list as widgets::make_*.
+    #[allow(clippy::too_many_arguments)] // same parameter list as widgets::make_*.
     pub(super) unsafe fn button(
         x: f64,
         y: f64,
@@ -1022,14 +914,11 @@ impl SettingsControl {
 }
 
 /// Shared action icon component for the action popup and mapping-list rows.
-/// 动作下拉与按键映射列表共用的动作图标组件。
 pub(super) struct SettingsMappingActionIcon;
 
 impl SettingsMappingActionIcon {
     /// NSPopUpButton menu cells and standalone image views apply different optical scaling.
     /// `row_size` compensates the latter so both render at the same visible size.
-    /// NSPopUpButton 菜单 cell 与独立 image view 的 optical scaling 不同；`row_size` 对后者
-    /// 做补偿，使两处最终视觉尺寸一致。
     pub(super) const ROW_SIZE: f64 = 18.0;
 
     pub(super) fn symbol_name(action_index: usize) -> Option<&'static str> {
@@ -1053,8 +942,6 @@ impl SettingsMappingActionIcon {
 /// Semantic roles for clickable settings buttons. The low-level builder owns AppKit tracking;
 /// this role selects the normal surface, text color, and hover behavior without leaking raw color
 /// literals into page construction code.
-/// 设置页可点击按钮的语义角色。底层 builder 负责 AppKit tracking；这里的 role 统一选择常态
-/// 背景、文字颜色和 hover 行为，页面代码不再散落原始颜色值。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingsButtonRole {
     Action,
@@ -1080,8 +967,6 @@ impl SettingsButtonRole {
 
 /// Shared semantic button component for settings actions. Specialized controls such as toggles,
 /// sidebar tabs, clipboard actions, and the overlay close button keep their own interaction model.
-/// 设置页操作按钮的统一语义组件。开关、侧边栏 tab、剪贴板操作和浮窗关闭按钮拥有独立交互，
-/// 继续使用各自的专用组件。
 pub(crate) struct SettingsButton;
 
 impl SettingsButton {
@@ -1100,13 +985,10 @@ impl SettingsButton {
 }
 
 /// Restore-defaults footer control: one compact trigger that morphs into confirm/cancel rows.
-/// 恢复默认设置 footer 控件：单个紧凑触发按钮 morph 成确认/取消两行。
 ///
 /// The control owns the view graph and animation geometry; settings.rs only coordinates the
 /// business action and keeps this component in SettingsUi. This keeps the raw-pointer lifetime
 /// with the settings window while making the whole lower-left control one semantic component.
-/// 控件统一管理 view 层级和动画几何；settings.rs 只负责业务动作并将组件存入 SettingsUi。
-/// 裸指针生命周期仍归设置窗口所有，同时让左下角控件成为一个完整语义组件。
 #[derive(Clone, Copy)]
 pub(super) struct RestoreDefaultsControl {
     pub(super) trigger: *mut AnyObject,
@@ -1115,8 +997,6 @@ pub(super) struct RestoreDefaultsControl {
     pub(super) surface: *mut AnyObject,
     pub(super) container: *mut AnyObject,
     pub(super) separator: *mut AnyObject,
-    // 展开几何(侧边栏与 footer 变体尺寸不同,构建时确定):
-    // confirm_y = 展开态确认按钮的 y;collapsed/expanded_h = 容器收起/展开高度。
     // Expanded geometry (sidebar vs footer variants differ; fixed at build time):
     // confirm_y = the expanded confirm row's y inside the container; collapsed/expanded_h = the
     // container's collapsed/expanded height.
@@ -1130,7 +1010,6 @@ unsafe impl Send for RestoreDefaultsControl {}
 unsafe impl Sync for RestoreDefaultsControl {}
 
 impl RestoreDefaultsControl {
-    // 与参考组件一致的两条时间轴:外壳负责尺寸 morph,内容负责进入/退出。
     // Two timelines matching the reference component: the shell morphs its size, while the
     // content handles its own enter/exit motion.
     const SHELL_DURATION: f64 = 0.58;
@@ -1231,8 +1110,6 @@ impl RestoreDefaultsControl {
         // The expanded card is a separate surface behind the buttons. Keeping it outside the
         // button container lets the compact trigger retain its original look while the card
         // fades/grows in as one rounded surface.
-        // 展开卡片是位于按钮后方的独立表面。将它与按钮容器分开，收起时保留原按钮外观，
-        // 展开时再让圆角卡片作为整体淡入并长大。
         let surface: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         let surface: *mut AnyObject = objc2::msg_send![
             surface,
@@ -1264,8 +1141,6 @@ impl RestoreDefaultsControl {
         // own hairline border composites with the trigger's border into a muddy double ring
         // (most visible on hover when the trigger fill turns translucent). It is revealed only
         // while expanding.
-        // 收起态外壳完全隐藏：它与触发按钮同框，自身描边会和按钮描边叠成浊环（悬停时按钮
-        // 变半透明灰后最明显），只在展开时才显示。
         let _: () = objc2::msg_send![surface, setHidden: true];
         let _: () = objc2::msg_send![surface, setAlphaValue: 0.0f64];
         let _: () = objc2::msg_send![parent, addSubview: surface];
@@ -1284,7 +1159,6 @@ impl RestoreDefaultsControl {
         if !container_layer.is_null() {
             // Match the reference root's `overflow-hidden`: the upper row is revealed only as
             // the shell grows past it.
-            // 对齐参考根节点的 `overflow-hidden`：上排按钮只会在外壳长到对应高度后显现。
             let _: () = objc2::msg_send![container_layer, setMasksToBounds: true];
             let _: () = objc2::msg_send![container_layer, setCornerRadius: 14.0f64];
         }
@@ -1324,13 +1198,9 @@ impl RestoreDefaultsControl {
         }
     }
 
-    /// 页面变体:内嵌到某页文档内容末尾的「恢复本页默认设置」控件(无分割线)。
     /// Page variant: a "Restore Page Defaults" control embedded at the end of one page's
     /// scrolling document (no separator).
     ///
-    /// `(x, y_bottom)` 是可用区域左下角在文档坐标系中的位置(y 向上),`width` 为可用区域
-    /// 宽度。按钮及其展开容器固定贴在该区域右侧；展开卡片向上生长,盖在页面内容之上
-    /// (控件是文档的最后子视图)。
     /// `(x, y_bottom)` is the available area's bottom-left corner in document coordinates (y up),
     /// and `width` is its available width. The button and its expanding container are pinned to
     /// the area's trailing edge; the expanded card grows upward over the page content (the
@@ -1389,24 +1259,20 @@ impl RestoreDefaultsControl {
             objc2_foundation::NSSize::new(container_w, collapsed_h),
         );
         let container: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
-        // initWithFrame: 返回对象本身;objc2 在 debug 下校验返回类型编码,必须绑定返回值。
         // initWithFrame: returns the object; objc2 validates the return type encoding in debug
         // builds, so the return value must be bound.
         let container: *mut AnyObject = objc2::msg_send![container, initWithFrame: container_frame];
-        // 文档宽度固定,不留自适应掩码;随内容一起滚动。
         // The document width is fixed: no autoresizing mask; it simply scrolls with the content.
         let _: () = objc2::msg_send![container, setAutoresizingMask: 0u64];
         let _: () = objc2::msg_send![container, setWantsLayer: true];
         let container_layer: *mut AnyObject = objc2::msg_send![container, layer];
         if !container_layer.is_null() {
-            // 对齐参考根节点的 `overflow-hidden`:上排按钮只会在外壳长到对应高度后显现。
             // Match the reference root's `overflow-hidden`: the upper row is revealed only as
             // the shell grows past it.
             let _: () = objc2::msg_send![container_layer, setMasksToBounds: true];
             let _: () = objc2::msg_send![container_layer, setCornerRadius: 14.0f64];
         }
 
-        // 触发按钮保持紧凑尺寸并贴在页面内容右下角；展开时确认/取消按钮复用该宽度。
         // Keep the trigger compact and pinned to the page content's bottom-right; the expanded
         // confirm/cancel rows reuse the same width.
         for button in [trigger, confirm, cancel] {
@@ -1417,10 +1283,8 @@ impl RestoreDefaultsControl {
             widgets::refresh_settings_button_tracking(button);
         }
 
-        // 展开卡片是位于按钮后方的独立表面,展开时作为整体淡入并向上生长。
         // The expanded card is a separate surface behind the buttons that fades in and grows
         // upward as one rounded unit.
-        // 收起态外壳完全隐藏(避免与按钮描边叠成浊环,见侧边栏变体说明)。
         // Collapsed shell stays hidden (same double-ring reason as the sidebar variant).
         let surface: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         let surface: *mut AnyObject = objc2::msg_send![surface, initWithFrame: NSRect::new(
@@ -1452,7 +1316,6 @@ impl RestoreDefaultsControl {
             let _: () = objc2::msg_send![surface_layer, setShadowOffset: NSSize::new(0.0, -1.0)];
         }
         let _: () = objc2::msg_send![parent, addSubview: surface];
-        // container(含按钮)必须加到 surface 之上，否则按钮会被外壳盖住。
         // The container (with the buttons) must join the hierarchy ABOVE the surface.
         let _: () = objc2::msg_send![parent, addSubview: container];
 
@@ -1479,7 +1342,6 @@ impl RestoreDefaultsControl {
             surface,
             container,
             separator: std::ptr::null_mut(),
-            // 取消行与触发按钮同位(y=6),两行之间保留 14pt;顶部再留 12pt 余量。
             // The cancel row shares the trigger's position (y=6); the rows keep a 14pt gap
             // with 12pt of top padding above Confirm.
             confirm_y,
@@ -1490,7 +1352,6 @@ impl RestoreDefaultsControl {
     }
 
     pub(super) fn is_ready(self) -> bool {
-        // separator 仅侧边栏变体存在(footer 变体为空),不参与就绪判定。
         // The separator only exists in the sidebar variant (null for footer); it is not part
         // of the readiness check.
         !self.trigger.is_null()
@@ -1501,7 +1362,6 @@ impl RestoreDefaultsControl {
     }
 
     /// Test whether a hit-tested settings view belongs to the expanded restore card.
-    /// 判断设置窗口命中的 view 是否属于当前展开的恢复卡片。
     pub(super) unsafe fn contains_hit_view(self, hit_view: *mut AnyObject) -> bool {
         if !self.is_ready() || !self.expanded || hit_view.is_null() {
             return false;
@@ -1517,7 +1377,6 @@ impl RestoreDefaultsControl {
     }
 
     /// Toggle the component as one animated unit; the bottom row remains anchored in place.
-    /// 将整个控件作为一个动画单元切换；底部一行始终保持锚定。
     pub(super) unsafe fn set_expanded(&mut self, expanded: bool, animated: bool) {
         if !self.is_ready() || self.expanded == expanded {
             return;
@@ -1530,13 +1389,10 @@ impl RestoreDefaultsControl {
         // The card is only slightly wider than the original trigger; both expanded rows keep the
         // trigger's original width and horizontal inset. The top padding is intentionally compact
         // so the card does not leave a large empty panel above Confirm.
-        // 卡片只比原触发按钮略宽；展开后的两行继续使用原按钮宽度和水平内边距。顶部留白
-        // 有意收紧，避免 Confirm 上方出现大块空白区域。
         let expanded_row_width = trigger_frame.size.width;
         let cancel_frame = NSRect::new(
             // Keep Cancel exactly where the collapsed trigger lives. The card grows upward
             // around this fixed bottom anchor.
-            // 取消按钮始终与收起态的触发按钮完全同位；卡片围绕这个固定底部锚点向上展开。
             trigger_frame.origin,
             objc2_foundation::NSSize::new(expanded_row_width, trigger_frame.size.height),
         );
@@ -1547,8 +1403,6 @@ impl RestoreDefaultsControl {
         // The reference keeps panel content attached to the shell's moving top edge. In an
         // AppKit layer animation, subview layout does not reflow from the presentation bounds, so
         // explicitly animate Confirm from the collapsed top position to its expanded position.
-        // 参考组件的内容始终贴着外壳移动的顶部。AppKit 的 layer 动画不会根据 presentation
-        // bounds 重新布局子视图，因此显式让确认按钮从收起态顶部位置移动到展开位置。
         let confirm_collapsed_frame = NSRect::new(
             NSPoint::new(
                 trigger_frame.origin.x,
@@ -1556,7 +1410,6 @@ impl RestoreDefaultsControl {
             ),
             objc2_foundation::NSSize::new(expanded_row_width, trigger_frame.size.height),
         );
-        // footer 变体没有分割线(separator 为空),跳过分割线动画。
         // The footer variant has no separator (null); skip the separator animation.
         let separator_frame: NSRect = if self.separator.is_null() {
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
@@ -1589,8 +1442,6 @@ impl RestoreDefaultsControl {
         );
         // The shell starts exactly behind the trigger and grows outward by 8pt on each side,
         // while its bottom edge stays fixed. This also keeps the compact outline fully covered.
-        // 外壳从触发按钮正后方开始，左右各向外长 8pt，同时底边保持固定；收起时轮廓会
-        // 被按钮完整遮住。
         let collapsed_surface = NSRect::new(
             NSPoint::new(
                 container_frame.origin.x + trigger_frame.origin.x,
@@ -1607,26 +1458,21 @@ impl RestoreDefaultsControl {
         if expanded {
             // Reveal the shell for the expanded card (it stays hidden while collapsed; see the
             // build sites).
-            // 展开时先显示外壳（收起态保持隐藏，见构建处）。
             let _: () = objc2::msg_send![self.surface, setHidden: false];
             let _: () = objc2::msg_send![self.trigger, setHidden: false];
             let _: () = objc2::msg_send![self.cancel, setHidden: false];
             let _: () = objc2::msg_send![self.confirm, setHidden: false];
-            // 参考组件的外壳在整个 morph 过程中持续存在;这里只同步显示状态,不再叠加
-            // 一条独立的淡入时间轴,避免背景比尺寸动画晚出现。
             // The reference shell remains present for the whole morph; synchronize its visible
             // state without adding a separate fade timeline that would lag the size animation.
             Self::set_opacity_model(self.surface, 1.0);
             // Start the panel content below the collapsed shell and let it rise with the shell,
             // matching the reference's top-docked content reveal.
-            // 让面板内容从收起外壳下方开始，随着外壳向上展开，匹配参考组件贴顶内容的显现。
             let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
             let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
             let _: () = objc2::msg_send![self.confirm, setFrame: confirm_collapsed_frame];
             let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
             let _: () = objc2::msg_send![self.cancel, setFrame: cancel_frame];
             // Cancel takes the fixed dock slot while Restore Defaults fades beneath it.
-            // 取消按钮占据固定 dock 位置，恢复默认按钮在其下方淡出。
             let _: () = objc2::msg_send![
                 self.container,
                 addSubview: self.cancel,
@@ -1660,7 +1506,6 @@ impl RestoreDefaultsControl {
             let _: () = objc2::msg_send![self.confirm, setHidden: false];
             // Reorder the trigger above the transparent closing controls so repeated Cancel/open
             // cycles cannot leave an invisible button swallowing clicks.
-            // 将触发按钮移到正在淡出的透明控件之上，避免重复取消/展开后被不可见按钮吞掉点击。
             let _: () = objc2::msg_send![
                 self.container,
                 addSubview: self.trigger,
@@ -1685,7 +1530,6 @@ impl RestoreDefaultsControl {
                 );
                 // Fade the shell with the shrink so it never ends up painting behind the
                 // trigger in the collapsed state.
-                // 外壳随收缩淡出，避免收起态结束时仍画在按钮后面。
                 Self::animate_basic_opacity(
                     self.surface,
                     0.0,
@@ -1693,8 +1537,6 @@ impl RestoreDefaultsControl {
                     "restore-shell-hide",
                 );
             } else {
-                // 确认操作会走无动画收起路径；先取消仍在运行的展开动画，避免旧的
-                // presentation layer 继续显示“取消”并遮住已恢复的触发按钮。
                 // Confirmation collapses without animation. Cancel any in-flight opening
                 // animations first so their presentation layers cannot keep Cancel visible over
                 // the restored trigger.
@@ -1715,7 +1557,6 @@ impl RestoreDefaultsControl {
         if animated {
             // Exact beUI timing: shell spring 0.58s with a restrained 0.06 bounce. The native
             // stiffness/damping pair is calibrated to that low-bounce duration.
-            // 严格采用 beUI 的外壳时长：0.58 秒、0.06 低回弹；原生刚度/阻尼按该曲线校准。
             Self::spring_view_frame(
                 self.surface,
                 target_surface,
@@ -1968,8 +1809,6 @@ impl RestoreDefaultsControl {
         }
         let fallback: f64 = objc2::msg_send![view, alphaValue];
         let from = Self::presentation_scalar(layer, "opacity", fallback);
-        // AppKit 不会可靠地把直接写入 CALayer 的 opacity 回写到 alphaValue。两边都更新，
-        // 才能保证后续动画/无动画状态切换从同一个模型值开始。
         // AppKit does not reliably mirror direct CALayer opacity writes back to alphaValue.
         // Update both so later animated and immediate transitions share one model value.
         let _: () = objc2::msg_send![view, setAlphaValue: target];
@@ -2041,8 +1880,6 @@ impl RestoreDefaultsControl {
         let _: () = objc2::msg_send![animation, setDuration: duration];
         // `functionWithControlPoints::::` has unlabeled selector segments that `msg_send!`
         // cannot express, so call it through the typed Objective-C entry point.
-        // `functionWithControlPoints::::` 包含无标签 selector 段，`msg_send!` 无法表达，
-        // 因此通过带类型的 Objective-C 入口调用。
         extern "C" {
             fn objc_msgSend();
         }
@@ -2088,8 +1925,6 @@ impl RestoreDefaultsControl {
         Self::set_content_model(view, 1.0, 0.0, 1.0);
         // Exact CONTENT_VARIANTS + CONTENT_SPRING mapping from the reference. AppKit's positive
         // Y points upward, so CSS y:-8 maps to native y:+8.
-        // 严格映射参考组件的 CONTENT_VARIANTS 与 CONTENT_SPRING。AppKit 正 Y 向上，
-        // 因此 CSS y:-8 对应原生 y:+8。
         Self::animate_spring_scalar(
             layer,
             "opacity",
@@ -2160,11 +1995,9 @@ impl RestoreDefaultsControl {
 }
 
 /// Sidebar navigation component backed by the shared borderless button builder.
-/// 侧栏导航组件，统一复用无边框按钮 builder。
 pub(super) struct SettingsSidebar;
 
 /// The icon is part of the sidebar item's semantic data, not inferred from a page tag.
-/// 图标属于侧栏条目的语义数据，不再由页面 tag 隐式推断。
 #[derive(Clone, Copy, Debug)]
 pub(super) enum SettingsSidebarIcon {
     General,
@@ -2184,13 +2017,10 @@ impl SettingsSidebarIcon {
             Self::Mouse => "computermouse",
             // `doc.on.clipboard` has a dark overlapping foreground layer in the system glyph;
             // use the clean document outline so the sidebar stays visually balanced.
-            // `doc.on.clipboard` 自带深色叠放前景层；改用干净的文档线框保持侧栏一致。
             Self::Clipboard => "doc.text",
-            // 左右对分的矩形呼应“半屏/四分屏”的窗口控制语义。
             // A rectangle split into left/right halves mirrors the window-control
             // half-screen/quarter-snapping semantics.
             Self::WindowControl => "rectangle.split.2x2",
-            // 闪电符号呼应“一键直达”的快捷操作语义。
             // A bolt mirrors the quick-actions "jump straight there" semantics.
             Self::QuickActions => "bolt.circle",
             Self::About => "info.circle",
@@ -2213,10 +2043,6 @@ fn sidebar_item_frames(w: f64, row_h: f64) -> (NSRect, NSRect) {
     (icon_frame, label_frame)
 }
 
-/// 整条侧栏 hover tracker 的矩形:从首行顶边铺到末行底边。行数由调用方传入并与
-/// 按钮创建共用同一来源(entries.len()),新增侧栏条目时自动跟随——此前硬编码
-/// 6 行,加入第 7 个条目后末行落在 tracker 之外,从末行底部离开侧栏时没有退出
-/// 事件来隐藏共享悬停胶囊,胶囊卡在末行不消失。
 /// Rect of the whole-sidebar hover tracker: from the first row's top edge down to
 /// the last row's bottom edge. The row count comes from the caller and shares its
 /// source with button creation (entries.len()), so adding a sidebar entry keeps the
@@ -2234,7 +2060,6 @@ fn sidebar_tracking_rect(x: f64, y_top: f64, w: f64, row_h: f64, row_count: usiz
 
 impl SettingsSidebar {
     /// Measure one shared row height for every localized sidebar title.
-    /// 为所有本地化侧栏标题测量一套统一的行高。
     pub(super) unsafe fn row_height(w: f64) -> f64 {
         let titles = [
             t("settings.sidebar_general"),
@@ -2249,7 +2074,6 @@ impl SettingsSidebar {
     }
 
     /// Set a view frame without allowing AppKit's implicit layer action to race the explicit motion.
-    /// 设置 view frame 时关闭 AppKit 隐式 layer 动画，避免与显式动效争抢控制权。
     unsafe fn set_frame_without_implicit_animation(view: *mut AnyObject, frame: NSRect) {
         let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
         let _: () = objc2::msg_send![
@@ -2261,7 +2085,6 @@ impl SettingsSidebar {
     }
 
     /// Move a layer-backed view's center along the sidebar using one layer position animation.
-    /// 使用单个 layer position 动画移动 layer-backed view 在侧栏中的中心位置。
     unsafe fn spring_move_view(
         view: *mut AnyObject,
         frame: NSRect,
@@ -2276,7 +2099,6 @@ impl SettingsSidebar {
         }
         // NSView backing layers are not guaranteed to use a centered anchor point. Derive the
         // target from the layer's actual anchor so `position` remains equivalent to this frame.
-        // NSView backing layer 不保证使用中心锚点；根据实际 anchor 计算目标，让 position 与 frame 等价。
         let anchor: NSPoint = objc2::msg_send![layer, anchorPoint];
         let target_x = frame.origin.x + frame.size.width * anchor.x;
         let target_y = frame.origin.y + frame.size.height * anchor.y;
@@ -2322,7 +2144,6 @@ impl SettingsSidebar {
     }
 
     /// Fade a sidebar background layer from its current presentation opacity to the target.
-    /// 将侧栏背景图层从当前 presentation opacity 淡入或淡出到目标值。
     unsafe fn fade_view(view: *mut AnyObject, target_opacity: f32, animation_key_name: &str) {
         let layer: *mut AnyObject = objc2::msg_send![view, layer];
         if layer.is_null() {
@@ -2362,7 +2183,6 @@ impl SettingsSidebar {
     }
 
     /// Move the active-row background with beUI's shared-layout spring.
-    /// 使用 beUI 共享布局背景同款的 spring 移动选中行高亮。
     pub(super) unsafe fn move_highlight(highlight: *mut AnyObject, frame: NSRect, animated: bool) {
         if highlight.is_null() {
             return;
@@ -2381,7 +2201,6 @@ impl SettingsSidebar {
     }
 
     /// Move the shared hover pill using the normal sidebar spring.
-    /// 使用侧栏常规 spring 移动共享悬浮气泡。
     unsafe fn move_hover_highlight_with_spring(
         hover: *mut AnyObject,
         frame: NSRect,
@@ -2407,13 +2226,11 @@ impl SettingsSidebar {
     }
 
     /// Move the shared hover pill with the faster re-entry spring.
-    /// 使用更快的重新进入 spring 移动共享悬浮气泡。
     pub(super) unsafe fn move_hover_highlight(hover: *mut AnyObject, frame: NSRect) {
         Self::move_hover_highlight_with_spring(hover, frame, 360.0, 32.0);
     }
 
     /// Prime the hover pill at the clicked row while keeping it invisible until the next row.
-    /// 将悬停层预置到点击行并保持不可见，等待下一行进入时再播放移动动画。
     pub(super) unsafe fn prime_hover_highlight(hover: *mut AnyObject, frame: NSRect) {
         if hover.is_null() {
             return;
@@ -2435,7 +2252,6 @@ impl SettingsSidebar {
     }
 
     /// Move the primed hover pill from the clicked row and reveal it at the next row.
-    /// 将预置在点击行的悬停层移动到下一行并同步淡入。
     pub(super) unsafe fn move_hover_highlight_after_selection(
         hover: *mut AnyObject,
         frame: NSRect,
@@ -2449,13 +2265,11 @@ impl SettingsSidebar {
 
     /// Re-entry (pointer returning to the sidebar from the detail pane / window edges) keeps the
     /// pre-refinement tuning used before the tracker change.
-    /// 重入(指针从详情区/窗口边缘回到侧栏)恢复 tracker 调整前使用的速度参数。
     pub(super) unsafe fn move_hover_highlight_on_reentry(hover: *mut AnyObject, frame: NSRect) {
         Self::move_hover_highlight_with_spring(hover, frame, 500.0, 30.0);
     }
 
     /// Hide the shared hover pill after the pointer leaves the whole menu.
-    /// 指针离开整个菜单后隐藏共享悬浮气泡。
     pub(super) unsafe fn hide_hover_highlight(hover: *mut AnyObject) {
         if hover.is_null() {
             return;
@@ -2466,7 +2280,6 @@ impl SettingsSidebar {
     }
 
     /// Remove the hover surface immediately when a click promotes that row to selected.
-    /// 点击将条目提升为选中态时立即移除悬浮层，避免与选中背景短暂重叠。
     pub(super) unsafe fn hide_hover_highlight_immediately(hover: *mut AnyObject) {
         if hover.is_null() {
             return;
@@ -2498,8 +2311,6 @@ impl SettingsSidebar {
         row_h: f64,
     ) -> [*mut AnyObject; 7] {
         // Add new sidebar entries here: the component owns title keys, icons, tags, and spacing.
-        // 新增侧栏入口只需在这里添加标题 key、图标和 tag；间距与对齐由组件统一处理。
-        // 快捷操作位于窗口控制与关于之间。
         // Quick actions sits between Window control and About.
         let entries = [
             ("settings.sidebar_general", SettingsSidebarIcon::General),
@@ -2540,7 +2351,6 @@ impl SettingsSidebar {
 }
 
 /// One independently aligned icon-and-label tab inside the sidebar.
-/// 侧栏中一个独立对齐的图标 + 文本 tab。
 pub(super) struct SettingsSidebarTab;
 
 impl SettingsSidebarTab {
@@ -2558,8 +2368,6 @@ impl SettingsSidebarTab {
     ) -> *mut AnyObject {
         // Keep the icon and title on one explicit center line. NSTextField's cell can otherwise
         // place glyphs near the top of a 28pt frame while SF Symbols use their own optical box.
-        // 用同一条明确的中心线放置图标和文字；否则 NSTextField cell 可能把字形放在 28pt
-        // frame 的偏上位置，而 SF Symbols 又使用自己的 optical box，最终视觉上不对齐。
         let (icon_frame, label_frame) = sidebar_item_frames(w, row_h);
         SettingsControl::sidebar(
             parent,
@@ -2590,12 +2398,10 @@ mod tests {
         let row_step = row_h + 4.0;
         let y0 = 300.0;
         let rect = sidebar_tracking_rect(0.0, y0, 240.0, row_h, 7);
-        // 顶边 = 首行顶边;底边 = 第 7 行(索引 6)的底边,末行不再漏出 tracker。
         // Top edge = row 0's top; bottom edge = row 6's bottom -- the last row is covered.
         assert_eq!(rect.origin.y + rect.size.height, y0 + row_h);
         assert_eq!(rect.origin.y, y0 - 6.0 * row_step);
         assert_eq!(rect.size.width, 240.0);
-        // 单行侧栏只覆盖自身,不越过首行。
         // A one-row sidebar covers exactly that row.
         let single = sidebar_tracking_rect(0.0, y0, 240.0, row_h, 1);
         assert_eq!(single.origin.y, y0);
@@ -2639,25 +2445,19 @@ mod tests {
     /// by `SettingsPageHeader` plus the standard card metrics. Pinning the pieces the six pages
     /// share makes a reintroduced per-page offset fail here instead of only showing up as an
     /// uneven gap under one page's title.
-    /// 页面顶部节奏(大标题、首个小标题、其卡片与卡片第一行)由 `SettingsPageHeader` 加标准卡片
-    /// 度量共同决定。把六个页面共享的这几段钉住,任何重新引入的按页偏移会在这里失败,
-    /// 而不是只表现为某一页标题下的间距不齐。
     #[test]
     fn page_top_rhythm_keeps_the_first_card_symmetric() {
         use super::{SettingsPageHeader, SettingsSection};
 
-        // 大标题框与首个小标题框之间只有这一处空白。
         // The title-to-heading spacing lives in this one value.
         assert_eq!(SettingsPageHeader::FIRST_SECTION_GAP, 16.0);
 
         let layout = SettingsLayout::new(600.0);
-        // 小标题框底边(即 SettingsPageHeader::attach 返回的游标)。
         // The heading's frame bottom -- the cursor SettingsPageHeader::attach returns.
         let heading_cursor = 100.0;
         let row_h = SettingsLayout::SINGLE_LINE_ROW_H;
         let row_bottom = layout.next_row_cursor(heading_cursor, row_h);
         let row_top = row_bottom + row_h;
-        // 单行卡片:小标题下方 4pt 起行,SettingsSection 把底部多出的 6pt 裁掉后同样剩 4pt。
         // Single-row card: the row starts 4pt under the heading, and trimming the extra 6pt bottom
         // inset leaves the same 4pt beneath the row.
         assert_eq!(layout.card_top(heading_cursor) - row_top, 4.0);

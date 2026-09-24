@@ -1,7 +1,3 @@
-//! 状态栏菜单:菜单项状态(SHORTCUT_ITEM / FIXED_MENU_ITEMS)、菜单动作回调
-//! (handle_quit / toggle_shortcut / toggle_theme / reload_config)、以及快捷键模式切换
-//! 与菜单标题刷新。setup_status_bar 仍留在 main.rs(装配代码)。
-//!
 //! Status bar menu: menu-item state (SHORTCUT_ITEM / FIXED_MENU_ITEMS), menu action
 //! callbacks (handle_quit / toggle_shortcut / toggle_theme / reload_config), shortcut-mode
 //! switching, and menu-title refresh. setup_status_bar stays in main.rs (setup wiring).
@@ -19,11 +15,9 @@ use crate::ffi::*;
 use crate::i18n::t;
 use crate::icon_cache::clear_icon_cache;
 use crate::overlay::extract_uncached_icons;
-// 跨模块共享状态(由 main.rs 持有)/ cross-module shared state (owned by main.rs)
+// cross-module shared state (owned by main.rs)
 use crate::log_info;
 use crate::with_tab_state;
-
-// ========== 菜单项状态 / menu-item state ==========
 
 pub(crate) struct ShortcutState {
     pub(crate) item: *mut AnyObject,
@@ -37,7 +31,6 @@ pub(crate) struct ServiceMenuState {
     pub(crate) items: [*mut AnyObject; 5],
 }
 
-// 固定标题的菜单项(settings / reload / clear_caches / quit)。locale 变更时由 refresh_menu_titles 批量重设标题。
 // Fixed-title menu items (settings / reload / clear_caches / quit); re-titled in bulk by refresh_menu_titles on locale change.
 pub(crate) struct FixedMenuItems {
     pub(crate) settings: *mut AnyObject,
@@ -47,7 +40,6 @@ pub(crate) struct FixedMenuItems {
 }
 
 /// Menu controls are AppKit objects and therefore belong to the main-thread runtime.
-/// 菜单控件是 AppKit 对象，只归属主线程 runtime。
 pub(crate) struct MenuUi {
     pub(crate) shortcut: Option<ShortcutState>,
     pub(crate) thumbnail: Option<ThumbnailState>,
@@ -83,7 +75,6 @@ fn capped_menu_title_width(natural_width: f64) -> f64 {
 }
 
 /// Measure a title using the native menu font without attaching a custom view to the item.
-/// 使用原生菜单字体测量标题,但不向菜单项附加自定义 view。
 unsafe fn menu_title_width(title: &str) -> f64 {
     let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let field: *mut AnyObject = msg_send![
@@ -110,7 +101,6 @@ unsafe fn menu_title_width(title: &str) -> f64 {
 }
 
 /// Keep menu titles compact while retaining the full title in the item's tooltip.
-/// 保持菜单标题紧凑,同时把完整标题保存在菜单项 tooltip 中。
 fn compact_menu_title(title: &str) -> String {
     if capped_menu_title_width(unsafe { menu_title_width(title) }) <= MENU_TITLE_MAX_WIDTH {
         return title.to_string();
@@ -140,7 +130,6 @@ fn compact_menu_title(title: &str) -> String {
 }
 
 /// Set a menu item's native title, truncating only oversized localized text.
-/// 设置菜单项的原生标题,只截断超出宽度的本地化文本。
 pub(crate) unsafe fn set_menu_item_title(item: *mut AnyObject, title: &str) {
     if item.is_null() {
         return;
@@ -160,9 +149,6 @@ pub(crate) unsafe fn set_menu_item_title(item: *mut AnyObject, title: &str) {
     }
 }
 
-// ========== 菜单动作 / menu actions ==========
-
-/// 设置快捷键模式(Cmd / Opt),同步运行时状态 SHORTCUT_IS_CMD 与菜单标签。
 /// Set shortcut mode (Cmd / Opt), syncing runtime SHORTCUT_IS_CMD and the menu label.
 pub(crate) fn set_shortcut_mode(is_cmd: bool) {
     SHORTCUT_IS_CMD.store(is_cmd, Ordering::SeqCst);
@@ -179,7 +165,6 @@ pub(crate) fn set_shortcut_mode(is_cmd: bool) {
     }
 }
 
-/// 设置缩略图菜单项标题,标题表示点击后将切换到的模式。
 /// Set the thumbnail menu item's title; the title describes the mode activated by the click.
 pub(crate) fn set_thumbnail_mode(thumbnails_enabled: bool) {
     let key = if thumbnails_enabled {
@@ -291,7 +276,6 @@ unsafe fn make_menu_item(
 }
 
 /// Build the directly expanded service-toggle section between Settings and shortcut mode.
-/// 构建位于“设置”和快捷键模式之间、直接展开的五个大类开关。
 pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyObject) {
     let items: [*mut AnyObject; 5] = std::array::from_fn(|index| {
         let item = make_menu_item(
@@ -301,7 +285,6 @@ pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyOb
             index as isize,
             Some(SERVICE_MENU_SYMBOLS[index]),
         );
-        // 使用原生 NSMenuItem image/title/state，交由 AppKit 统一处理列对齐、悬停和点击。
         // Use native NSMenuItem image/title/state so AppKit owns column alignment, hover, and clicks.
         let _: () = msg_send![item, setState: 0isize];
         let _: () = msg_send![menu, addItem: item];
@@ -364,7 +347,6 @@ pub(crate) extern "C" fn handle_toggle_service(_self: *mut c_void, _cmd: Sel, se
     );
 }
 
-/// 用当前 locale 与状态重设全部菜单项标题。用于 locale 变更(reload)与启动时修正初始标签。
 /// Re-title all menu items from the current locale and state. Used on locale change (reload)
 /// and at startup to fix the initial labels.
 pub(crate) fn refresh_menu_titles() {
@@ -382,7 +364,7 @@ pub(crate) fn refresh_menu_titles() {
         if let Some(item) = shortcut {
             set_menu_item_title(item, &t(sc_key));
         }
-        // 固定标题项 / fixed-title items
+        // fixed-title items
         let fixed = with_menu_ui(|ui| {
             ui.fixed
                 .as_ref()
@@ -407,12 +389,10 @@ pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mu
 }
 
 /// Flush state, restore system pointer settings, and terminate the accessory application.
-/// Flush 状态、恢复系统指针设置并退出辅助应用。
 pub(crate) fn quit_application() {
     if let Err(e) = flush_config_sync() {
         log_info!("Config flush before quit failed: {}", e);
     }
-    // 退出前恢复指针加速设置(否则系统鼠标保持线性,直到用户手动重置)。
     // Restore pointer acceleration settings before quitting (otherwise the mouse stays
     // linear until the user resets it manually).
     crate::mouse::pointer::restore();
@@ -422,7 +402,6 @@ pub(crate) fn quit_application() {
     }
 }
 
-// 设置里「缺权限」警告条的「打开隐私与安全性」按钮回调。
 // Handler for the "Open Privacy & Security" button on the settings permission-warning banner.
 pub(crate) extern "C" fn handle_open_privacy(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     crate::open_privacy_accessibility();
@@ -442,7 +421,6 @@ pub(crate) extern "C" fn handle_toggle_shortcut(
     _sender: *mut c_void,
 ) {
     let is_cmd = !SHORTCUT_IS_CMD.load(Ordering::SeqCst);
-    // 持久化到 config(与主题切换一致,重启后保留用户选择)。
     // Persist to config (matches theme toggle, so the choice survives restart).
     let old_cfg = CONFIG.read().unwrap().clone();
     let new_cfg = {
@@ -482,7 +460,6 @@ pub(crate) extern "C" fn handle_toggle_thumbnail(
         cfg
     };
     persist_config_now();
-    // 模式改变后丢弃当前卡片布局,下次召唤按新模式重建;关闭时同时释放内存截图。
     // Drop the current card layout so the next summon rebuilds in the new mode; disabling
     // thumbnails also releases the in-memory window images.
     crate::runtime_config::apply_config_change(
@@ -512,14 +489,11 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
     }
 }
 
-/// 清空图标与缩略图缓存:删除图标磁盘缓存并清掉窗口缩略图内存缓存,然后重新提取当前窗口图标。
 /// Clear icon and thumbnail caches: remove disk icons, clear in-memory window thumbnails, then
 /// re-extract icons for currently collected windows.
-///
 pub(crate) extern "C" fn handle_clear_caches(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     clear_icon_cache();
     crate::thumbnail::clear_runtime_cache();
-    // 内存里的 icon_path 仍指向已删除的文件,置 None 让卡片重新走提取流程。
     // in-memory icon_path still points at deleted files; reset to None so cards re-extract.
     with_tab_state(|state_opt| {
         if let Some(state) = state_opt.as_mut() {
@@ -528,7 +502,6 @@ pub(crate) extern "C" fn handle_clear_caches(_self: *mut c_void, _cmd: Sel, _sen
             }
         }
     });
-    // 立即重新提取当前窗口的图标(仅当前已收集的窗口,非全部运行中 App)。
     // Re-extract icons for currently-collected windows only (not all running apps).
     extract_uncached_icons();
     log_info!("Icon and thumbnail caches cleared.");

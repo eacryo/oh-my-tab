@@ -12,7 +12,6 @@ extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
 }
 
-/// 由打开的文件描述符持有跨渠道实例锁；字段关闭时内核自动释放锁。
 /// Holds the cross-channel instance lock through an open file descriptor; the kernel releases
 /// it automatically when the descriptor closes.
 pub(crate) struct InstanceGuard {
@@ -60,7 +59,6 @@ fn acquire_at(path: &Path) -> Result<InstanceGuard, AcquireError> {
         .open(path)
         .map_err(AcquireError::Io)?;
 
-    // flock 锁与打开的文件描述符绑定，不会像仅创建锁文件那样在崩溃后留下陈旧状态。
     // flock is tied to the open file descriptor, so a crash cannot leave the stale state caused
     // by using file existence alone as the lock.
     if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {

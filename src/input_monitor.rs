@@ -1,9 +1,5 @@
 //! Runtime Accessibility permission supervision for every global input tap.
 //!
-//! 所有全局输入 tap 共用一份运行时权限状态。撤权时先关闭创建入口，再通知各 tap
-//! 禁用自身并退出；恢复授权后按当前配置重新启动。UserInput 禁用按本次进程生命周期
-//! 的终止信号处理，避免看门狗与系统反复争抢 tap。
-//!
 //! All global input taps share one runtime permission state. Revocation closes the creation
 //! gate before asking each tap to disable itself and exit. Restored permission restarts services
 //! from current configuration. UserInput disable is terminal for this process so the watchdog
@@ -92,7 +88,6 @@ fn supervise() {
             if USER_INPUT_DISABLED.load(Ordering::SeqCst) {
                 // Never re-enable the disabled tap. A fresh process clears this terminal latch
                 // and creates new taps only after the OS reports Accessibility as trusted.
-                // 不重新启用已被系统禁用的 tap。通过新进程清除此终止标记，并在系统确认授权后创建新 tap。
                 crate::restart::accessibility_restored_after_terminal_tap();
             } else {
                 crate::log_info!(
@@ -105,7 +100,6 @@ fn supervise() {
             && !USER_INPUT_DISABLED.load(Ordering::SeqCst)
             && Instant::now() >= next_reconcile
         {
-            // 定期重试可覆盖旧 tap 线程仍在收尾或创建临时失败的情况。
             // Periodic reconciliation retries services whose old tap thread was still unwinding
             // or whose tap creation failed transiently.
             start_configured_services();

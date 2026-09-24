@@ -1,10 +1,5 @@
-//! 实时设备注册表 + CGEvent -> 产生事件的设备的归因链(对应 Phase 0+1)。
-//!
-//! 归因链(私有 SPI,沿用 LinearMouse 的做法):
 //!   CGEventCopyIOHIDEvent(cgEvent) -> IOHIDEventRef
 //!   IOHIDEventGetSenderID(ioHIDEvent) -> registry_id (uint64)
-//!   by_registry_id 查表 -> Device
-//! 归因未命中时将完整重枚举排入后台,当前事件回退到 last_active(匹配"所有鼠标"档)。
 //!
 //! Live device registry + CGEvent -> producing-device attribution chain (Phase 0+1).
 //!
@@ -26,9 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 
-// ========== 设备身份与运行时表示 / device identity & runtime handle ==========
-
-/// 设备硬件身份(配置按 VID+PID 匹配;name/transport 仅展示用)。
 /// Device hardware identity (config matches on VID+PID; name/transport for display only).
 #[derive(Debug, Clone)]
 pub(crate) struct DeviceIdentity {
@@ -39,15 +31,11 @@ pub(crate) struct DeviceIdentity {
     pub(crate) transport: String,
 }
 
-/// 运行时设备句柄。硬件身份只在 DeviceIdentity 里;枚举时的 service_client 指针由
-/// services 数组保活(归因时做 CFEqual 比对)。
-///
 /// Runtime device handle. Hardware identity lives only in DeviceIdentity; the service_client
 /// pointer from enumeration is kept alive by the services array (used for CFEqual during
 /// attribution).
 pub(crate) struct Device {
     pub(crate) identity: DeviceIdentity,
-    /// 枚举时的 IOHIDServiceClient 指针(由 services 数组保活;用于归因时的 CFEqual 比对)。
     /// The IOHIDServiceClient pointer from enumeration (kept alive by the services array;
     /// used for CFEqual comparison during attribution).
     service_client: *mut c_void,
@@ -56,7 +44,6 @@ pub(crate) struct Device {
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
-/// (VID, PID) 组合,用作解析缓存与 per-device 状态的键。
 /// (VID, PID) pair, used as the key for the resolve cache and per-device state.
 pub(crate) type DeviceKey = (u32, u32);
 
@@ -66,20 +53,11 @@ impl Device {
     }
 }
 
-// ========== 虚拟指针(注入事件)/ virtual pointer (injected events) ==========
-
-/// 虚拟指针的保留键。真实设备取不到这个值(VID/PID 来自设备属性,不会双双是 u32::MAX),
-/// 因此 DeviceKey 保持 (u32, u32) 即可,不必改成 enum 去波及 resolve 缓存、设备下拉与
-/// last_active 的全部调用点。
-///
 /// Reserved key for the virtual pointer. No real device can produce it (VID/PID come from device
 /// properties and never pair up as u32::MAX), so DeviceKey can stay a plain (u32, u32) instead of
 /// becoming an enum and rippling through the resolve cache, the device popup and last_active.
 pub(crate) const VIRTUAL_DEVICE_KEY: DeviceKey = (u32::MAX, u32::MAX);
 
-/// 已检测到的注入进程(软件 KVM 的虚拟鼠标,如 Deskflow)。鼠标线程归因时写入,设置 UI 读它
-/// 决定设备下拉里要不要出现"虚拟鼠标"这一档 —— 注入进程不在时这一档不出现。
-///
 /// The injecting process detected so far (a software KVM's virtual pointer, e.g. Deskflow). Written
 /// by the mouse thread during attribution; the settings UI reads it to decide whether the virtual
 /// mouse entry appears in the device popup -- it is hidden while no injector is around.
@@ -112,9 +90,6 @@ fn injector_notice_sender() -> Option<&'static Sender<i32>> {
         .as_ref()
 }
 
-/// 事件是否由别的进程注入;是则返回注入进程 pid。
-/// 0 = 硬件事件;我们自己的 pid 也排除(自己的合成事件不是虚拟鼠标)。
-///
 /// Whether the event was injected by another process, returning that process's pid.
 /// 0 = hardware; our own pid is excluded too (our own synthetic events are not a virtual mouse).
 pub(crate) fn injected_source_pid(cg_event: crate::event_tap::CGEventRef) -> Option<i32> {
@@ -131,8 +106,6 @@ pub(crate) fn injected_source_pid(cg_event: crate::event_tap::CGEventRef) -> Opt
     }
 }
 
-// libproc:进程是否存在 + 可执行文件路径。NSRunningApplication 只认识注册到窗口服务器的 GUI
-// 应用(实测命令行进程查不到),而注入器可能是任意进程,所以存活判断走 libproc。
 // libproc: whether a pid exists, and its executable path. NSRunningApplication only knows GUI
 // apps registered with the window server (measured: a command-line process is not found), while an
 // injector can be any process -- so liveness goes through libproc.
@@ -141,10 +114,9 @@ extern "C" {
     fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
 }
 
-/// 进程的可执行文件路径;None = 该进程不存在(存活判断)。
 /// The process's executable path; None = the process does not exist (the liveness check).
 unsafe fn process_path(pid: i32) -> Option<String> {
-    // PROC_PIDPATHINFO_MAXSIZE == 4096。
+    // PROC_PIDPATHINFO_MAXSIZE == 4096.
     let mut buf = [0u8; 4096];
     let len = proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32);
     if len <= 0 {
@@ -155,9 +127,6 @@ unsafe fn process_path(pid: i32) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
-/// 注入进程的展示名:优先 GUI 应用的 localizedName(如 "Deskflow"),否则退回可执行文件名。
-/// None = 该进程已不存在。
-///
 /// The injector's display name: the GUI app's localizedName (e.g. "Deskflow") when available,
 /// otherwise the executable's file name. None = the process no longer exists.
 unsafe fn injector_display_name(pid: i32) -> Option<String> {
@@ -169,12 +138,8 @@ unsafe fn injector_display_name(pid: i32) -> Option<String> {
     Some(path.rsplit('/').next().unwrap_or(path.as_str()).to_string())
 }
 
-/// GUI 应用的 localizedName;非 GUI 进程(无 bundle)返回空串或 None。
 /// A GUI app's localizedName; a non-GUI process (no bundle) yields an empty string or None.
 unsafe fn running_app_name(pid: i32) -> Option<String> {
-    // NSRunningApplication 与 localizedName 都是 autoreleased,而且归因路径会在鼠标线程调用
-    // (record_injector 打日志时),所以套一层池子及时回收 —— 与图标缓存 / 窗口采集的
-    // "后台线程 + autoreleasepool"先例同款。
     // NSRunningApplication and localizedName are autoreleased, and attribution reaches this from
     // the mouse thread (when record_injector logs), so drain them in a pool -- the same
     // "background thread + autoreleasepool" precedent as icon caching / window collection.
@@ -192,9 +157,6 @@ unsafe fn running_app_name(pid: i32) -> Option<String> {
     name
 }
 
-/// 记录注入进程。只在**变化时**打日志并通知设置 UI 刷新下拉 —— 归因每个事件都会走到这里,
-/// 不能每次都做(日志会刷屏,通知会跨线程)。
-///
 /// Record the injecting process. Only a **change** logs and notifies the settings UI: attribution
 /// runs for every event, so doing it unconditionally would spam the log and cross thread hops.
 fn record_injector(pid: i32) {
@@ -205,8 +167,6 @@ fn record_injector(pid: i32) {
         }
         *cur = Some(pid);
     }
-    // 名称查询会进入 NSRunningApplication/libproc；放到工作线程，避免注入事件等待进程查询
-    // 或主线程通知。
     // Name lookup may cross into NSRunningApplication/libproc; leave it to the worker so injected
     // events never make the HID callback wait on process discovery or a main-thread notification.
     if let Some(sender) = injector_notice_sender() {
@@ -214,9 +174,6 @@ fn record_injector(pid: i32) {
     }
 }
 
-/// 虚拟指针的设备身份(注入进程仍存活时才有);顺带清掉已退出的注入进程,让下拉里的该项消失。
-/// 由设置 UI 在主线程调用(打开/刷新时),所以存活判断与取名在这里做最省事。
-///
 /// The virtual pointer's device identity, present only while the injector is alive; a dead
 /// injector is cleared here so the popup entry disappears. Called by the settings UI on the main
 /// thread (on open/refresh), which is the convenient place for the liveness check and the name.
@@ -227,7 +184,6 @@ pub(crate) fn virtual_device_identity() -> Option<DeviceIdentity> {
             vendor_id: VIRTUAL_DEVICE_KEY.0,
             product_id: VIRTUAL_DEVICE_KEY.1,
             name,
-            // 注入的指针没有传输层(既非 USB 也非蓝牙),展示用不到。
             // An injected pointer has no transport (neither USB nor Bluetooth); unused for display.
             transport: String::new(),
         }),
@@ -242,13 +198,9 @@ pub(crate) fn virtual_device_identity() -> Option<DeviceIdentity> {
     }
 }
 
-// ========== 全局注册表 / global registry ==========
-
 struct DeviceRegistry {
-    /// 持有 event system client(保活 service client)。
     /// Holds the event system client (keeps service clients alive).
     client: *mut c_void,
-    /// 持有 services CFArray(保活其中的 IOHIDServiceClient)。
     /// Holds the services CFArray (keeping its IOHIDServiceClients alive).
     services: *mut c_void,
     devices: Vec<Device>,
@@ -259,9 +211,6 @@ unsafe impl Sync for DeviceRegistry {}
 
 static REGISTRY: OnceLock<Mutex<DeviceRegistry>> = OnceLock::new();
 
-/// 鼠标线程的 CFRunLoop(由 start_plug_monitor 记录)。注册表 client 要调度到这个
-/// runloop 匹配才会常驻(见 enumerate_locked);enumeration 可能先于插拔监听执行,
-/// 故用运行时读取而非启动时一次性传入。裸指针用 Send+Sync 包装(与 ManagerMutex 同款)。
 /// The mouse thread's CFRunLoop (recorded by start_plug_monitor). The registry client must be
 /// scheduled on it for matching to stay live (see enumerate_locked); enumeration can run before
 /// the plug monitor starts, so the value is read at runtime, not passed in once at startup.
@@ -278,10 +227,6 @@ fn mouse_runloop_static() -> &'static Mutex<Option<crate::event_tap::CFRunLoopRe
         .0
 }
 
-/// last_active 的设备 (VID, PID)(归因失败时的回退)。由 event_tap 回调在每次成功归因后更新。
-/// 存硬件身份而非进程内 id:设备重枚举后 id 会漂移(NEXT_ID 单调递增),而 VID/PID 稳定
-/// (蓝牙断连重连后不变),按硬件身份兜底才可靠。
-///
 /// Last-active device's (VID, PID) (fallback when attribution fails). Updated by the event_tap
 /// callback after each successful attribution. Stored by hardware identity, not the process-local
 /// id: the id drifts on re-enumeration (NEXT_ID is monotonic), while VID/PID are stable across a
@@ -298,10 +243,8 @@ fn registry() -> &'static Mutex<DeviceRegistry> {
     })
 }
 
-// ========== 属性读取 helper / property-read helpers ==========
-// 复用 pointer.rs 的模式;这里只读不写,故更简单。
+// Mirrors the pointer.rs pattern; read-only here, so it stays simpler.
 
-/// 读取 IOHIDServiceClient 的整数属性(CFNumber)。
 /// Read an integer property from an IOHIDServiceClient (CFNumber).
 unsafe fn prop_int(service: *mut c_void, key: &str) -> Option<i64> {
     let k = make_nsstring(key);
@@ -315,7 +258,6 @@ unsafe fn prop_int(service: *mut c_void, key: &str) -> Option<i64> {
     Some(i)
 }
 
-/// 读取 IOHIDServiceClient 的字符串属性(NSString)。
 /// Read a string property from an IOHIDServiceClient (NSString).
 unsafe fn prop_string(service: *mut c_void, key: &str) -> String {
     let k = make_nsstring(key);
@@ -329,14 +271,6 @@ unsafe fn prop_string(service: *mut c_void, key: &str) -> String {
     s
 }
 
-// ========== 蓝牙设备分类:GAP Appearance(NVRAM 缓存)/ Bluetooth classification ==========
-
-/// 读取 NVRAM 中 bluetoothd 写入的蓝牙设备缓存(BluetoothInfo),解析出
-/// 地址 -> GAP Appearance 映射。Appearance 是设备在蓝牙广播里自报的类别
-/// (0x03C1 = 键盘 / 0x03C2 = 鼠标),与 macOS 蓝牙面板的图标同源。HID 描述符
-/// 不可靠(部分键盘固件虚报鼠标用途,如 KZI I75),用这张表做精确分类。
-/// 解析失败/缓存缺失时返回空表,调用方回退到纯 HID 判定。
-///
 /// Read bluetoothd's BluetoothInfo cache from NVRAM, parsing an address -> GAP Appearance
 /// map. Appearance is the device's self-reported class in its Bluetooth advertisement
 /// (0x03C1 keyboard / 0x03C2 mouse), the same source macOS's Bluetooth pane icons use.
@@ -346,7 +280,6 @@ unsafe fn prop_string(service: *mut c_void, key: &str) -> String {
 fn bluetooth_appearance_map() -> HashMap<String, u16> {
     let mut map = HashMap::new();
     unsafe {
-        // IORegistryEntryFromPath 返回 +1,用完 IOObjectRelease。
         // IORegistryEntryFromPath returns +1; IOObjectRelease when done.
         let path = match CString::new(IOSERVICE_OPTIONS_PATH) {
             Ok(p) => p,
@@ -371,7 +304,6 @@ fn bluetooth_appearance_map() -> HashMap<String, u16> {
         }
         let len = CFDataGetLength(data) as usize;
         let ptr = CFDataGetBytePtr(data);
-        // 在 props 释放前完成解析(CFDataGetBytePtr 借用 props 持有的数据)。
         // Parse before releasing props (CFDataGetBytePtr borrows data owned by props).
         if !ptr.is_null() && len > 0 {
             parse_bluetooth_info(std::slice::from_raw_parts(ptr, len), &mut map);
@@ -381,12 +313,6 @@ fn bluetooth_appearance_map() -> HashMap<String, u16> {
     map
 }
 
-/// 解析 BluetoothInfo TLV 流(bluetoothd 私有格式,按实测稳定结构解析):
-/// tag 0x02 = 设备名(记录起点),0x0e = 蓝牙地址(7 字节:1 字节标记 + 6 字节地址),
-/// 0x11 = GAP Appearance(2 字节小端,实测:键盘存 c1 03,鼠标存 c2 03)。
-/// 地址与 Appearance 按记录内顺序配对:0x0e 暂存地址,0x11 出现时写入 map。
-/// 未知 tag 按 length 跳过,异常数据即停。
-///
 /// Parse the BluetoothInfo TLV stream (bluetoothd private format; stable structure verified
 /// empirically): tag 0x02 = device name (record start), 0x0e = BT address (7 bytes: 1 flag
 /// byte + 6 address bytes), 0x11 = GAP Appearance (2 bytes little-endian; measured: keyboard
@@ -424,26 +350,17 @@ fn parse_bluetooth_info(bytes: &[u8], map: &mut HashMap<String, u16>) {
     }
 }
 
-// ========== 枚举 / enumeration ==========
-
-/// 枚举当前已连接的鼠标/触控板设备,填充注册表。
-/// 调用方持有 REGISTRY 锁。rebuild_client = true 时强制重建 IOHIDEventSystemClient
-/// (蓝牙设备休眠断连重连后,旧 client 的注册表缓存过期,导致归因链失效——见
-/// device_from_cgevent 的失败路径)。
-///
 /// Enumerate currently-connected mouse/trackpad devices and populate the registry.
 /// Caller holds the REGISTRY lock. With rebuild_client = true, the IOHIDEventSystemClient is
 /// forcibly recreated (after a Bluetooth disconnect/reconnect the old client's registry cache is
 /// stale, breaking the attribution chain -- see the failure path in device_from_cgevent).
 unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
-    // 释放旧的 services 数组(若有)。
     // Release the previous services array (if any).
     if !reg.services.is_null() {
         CFRelease(reg.services as *const c_void);
         reg.services = std::ptr::null_mut();
     }
     if rebuild_client {
-        // 蓝牙断连重连后旧 client 已失效:释放并置 null,强制重建。
         // After a Bluetooth reconnect the old client is stale: release and null it so it's
         // recreated below.
         if !reg.client.is_null() {
@@ -457,7 +374,6 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
             log_info!("[device] failed to create IOHIDEventSystemClient");
             return;
         }
-        // 匹配 Generic Desktop 页(后续按 usage 过滤)。
         // Match the Generic Desktop page (filtered by usage below).
         let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
         let page_val: *mut AnyObject =
@@ -467,18 +383,11 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
         let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
         IOHIDEventSystemClientSetMatchingMultiple(reg.client, arr as *const c_void);
         CFRelease(page_key as *const c_void);
-        // IOHIDEventSystemClient 的匹配是异步的:刚创建/重建后立刻 CopyServices 可能拿到
-        // 空列表(实测枚举结果在 0/1 间摇摆)。等 ~30ms 让匹配完成,枚举才可靠。
-        // 该竞态只在新建 client 的路径出现,复用旧 client 的热路径(事件归因)不受影响。
         // Matching on IOHIDEventSystemClient is asynchronous: CopyServices right after
         // creation/rebuild can return an empty list (measured 0/1 flapping). Waiting ~30ms
         // lets matching settle; only the fresh-client path has this race, so the hot
         // attribution path (reusing an old client) is unaffected.
         std::thread::sleep(std::time::Duration::from_millis(30));
-        // 调度到鼠标线程 runloop:未调度的 client 的 registry-ID 映射不完整,归因用的
-        // CopyServiceForRegistryID 会持续返回 nil(实测),滚动事件归因失败后回退到
-        // "所有鼠标"档 —— per-device 设置(如反转滚动)在启动后不生效,直到重新枚举
-        // 出可用的 client。调度后匹配常驻,归因可靠(LinearMouse 同款做法)。
         // Schedule the client on the mouse thread's runloop: an unscheduled client's
         // registry-ID map is incomplete and CopyServiceForRegistryID keeps returning nil
         // (measured), so scroll attribution fails and falls back to the "All Mice" profile --
@@ -504,8 +413,6 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
 
     reg.devices.clear();
 
-    // 蓝牙设备分类表(NVRAM 里 bluetoothd 的 BluetoothInfo 缓存)。解析失败时为空表,
-    // 蓝牙设备全部回退 HID 判定,不影响原有行为。
     // Bluetooth classification table (bluetoothd's BluetoothInfo cache in NVRAM). On parse
     // failure it is empty and every Bluetooth device falls back to HID-only classification,
     // preserving the previous behavior.
@@ -514,14 +421,6 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
     let count = CFArrayGetCount(services);
     for i in 0..count {
         let service = CFArrayGetValueAtIndex(services, i) as *mut c_void;
-        // 用 ConformsTo 判断是否指针/鼠标/触控板,不读 PrimaryUsage 单值。
-        // 原因:有些真实鼠标(如 ATK A9 SE 这类 Nearlink/星闪设备)的 PrimaryUsage 被
-        // 系统报成 Keyboard(6),白名单 {1,2,5} 会把它剔除;ConformsTo 检查整个
-        // DeviceUsagePairs,能识别它声明过的 Mouse(1,2)/Pointer(1,1)/Trackpad(1,5)。
-        // 副作用:少数键盘也声明了多余的 Mouse 用途(如 KZI I75),会一并纳入——
-        // 蓝牙键盘随后由下方的 GAP Appearance 判定排除;归因靠 senderID 精确匹配,
-        // 不影响功能正确性。
-        //
         // Determine pointer/mouse/trackpad via ConformsTo instead of the PrimaryUsage scalar.
         // Some real mice (e.g. ATK A9 SE Nearlink devices) report PrimaryUsage = Keyboard(6),
         // and a {1,2,5} whitelist would drop them; ConformsTo inspects the full DeviceUsagePairs
@@ -540,10 +439,6 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
         let name = prop_string(service, KEY_PRODUCT);
         let transport = prop_string(service, KEY_TRANSPORT);
 
-        // 蓝牙设备按 GAP Appearance 排除键盘:一些键盘固件在 HID 描述符里虚报鼠标用途
-        // (如 KZI I75),ConformsTo 判定会误收;Appearance 是设备在蓝牙广播里自报的类别,
-        // 与 macOS 蓝牙面板同源(0x03C1 = 键盘)。DeviceAddress 只在蓝牙传输设备上存在;
-        // 不在 NVRAM 缓存里的设备(如新配对尚未缓存)回退 HID 判定,不会误杀。
         // Exclude Bluetooth keyboards by GAP Appearance: some keyboard firmware fakes mouse
         // usages in the HID descriptor (e.g. KZI I75), fooling the ConformsTo filter;
         // Appearance is the self-reported class in the Bluetooth advertisement, the same
@@ -579,7 +474,6 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
     );
 }
 
-/// 启动时枚举一次(惰性:首次归因失败时也会触发)。
 /// Enumerate once at startup (also lazily triggered on first attribution failure).
 pub(crate) fn ensure_enumerated() {
     let _ = injector_notice_sender();
@@ -589,9 +483,6 @@ pub(crate) fn ensure_enumerated() {
     }
 }
 
-/// 当前已连接设备列表的快照(VID/PID/名称),供设置 UI 的设备选择器使用。
-/// 若 registry 为空,先触发一次枚举(即使 mouse.enabled=false 也能拿到设备列表)。
-///
 /// Snapshot of currently-connected devices (VID/PID/name) for the settings device picker.
 /// Triggers enumeration if the registry is empty (works even when mouse.enabled=false).
 pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
@@ -605,8 +496,6 @@ pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
     {
         let reg = registry().lock().unwrap();
         if reg.devices.is_empty() {
-            // 枚举返回 0 但设备可能在场(陈旧 client / 异步匹配竞态):重建 client 重试,
-            // 重建路径自带 30ms settle(见 enumerate_locked)。重试仍为空才认作真无设备。
             // Enumeration came back empty while devices may be present (stale client or the
             // async-matching race): retry with a rebuilt client (which carries the 30ms settle
             // in enumerate_locked). Only give up after the retries still return empty.
@@ -625,8 +514,6 @@ pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
         let reg = registry().lock().unwrap();
         reg.devices.iter().map(|d| d.identity.clone()).collect()
     };
-    // 虚拟指针(注入进程)排在最后:它不是 HID 设备,只在见过注入事件且该进程仍存活时出现,
-    // 所以设备选择器的条目数会随软件 KVM 的启停变化(见 virtual_device_identity)。
     // The virtual pointer (the injecting process) comes last: it is not a HID device and only
     // appears after an injected event has been seen while that process is still alive, so the
     // picker's entry count follows whether a software KVM is running (see virtual_device_identity).
@@ -636,10 +523,6 @@ pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
     out
 }
 
-/// 读取某个设备当前生效的整数属性(通过注册表里保活的 service client)。
-/// 找不到该 VID/PID 的设备、或属性不存在时返回 None。
-/// 全程持有注册表锁:service client 由 reg.services 保活,设备插拔重建时不会悬空。
-///
 /// Read a device's current integer property (through the service client kept alive by the
 /// registry). None when no device with that VID/PID is present or the property doesn't exist.
 /// The registry lock is held throughout: the service client is kept alive by reg.services, so
@@ -660,9 +543,6 @@ pub(crate) fn device_int_property(key: DeviceKey, property: &str) -> Option<i64>
     unsafe { prop_int(device.service_client, property) }
 }
 
-/// 读取某个设备当前生效的字符串属性(与 `device_int_property` 同一套保活/加锁约定);
-/// 空字符串与非字符串属性都返回 None。
-///
 /// Read a device's current string property (same keep-alive/locking rules as
 /// `device_int_property`); empty strings and non-string properties both yield None.
 pub(crate) fn device_string_property(key: DeviceKey, property: &str) -> Option<String> {
@@ -686,10 +566,6 @@ pub(crate) fn device_string_property(key: DeviceKey, property: &str) -> Option<S
     }
 }
 
-// ========== 设备插拔监听 / device plug/unplug monitoring ==========
-
-/// IOHIDManager 实例(保活:释放后回调即失效)。由 start_plug_monitor 创建,仅一次。
-/// 用 Send+Sync 包装的 Mutex(与 DeviceRegistry 同模式,static 需要 Send+Sync)。
 /// IOHIDManager instance (kept alive: releasing it would invalidate the callbacks). Created by
 /// start_plug_monitor, once. Wrapped Mutex with Send+Sync (same pattern as DeviceRegistry;
 /// statics need Send+Sync).
@@ -705,13 +581,6 @@ fn manager_static() -> &'static Mutex<*mut c_void> {
         .0
 }
 
-/// 插拔回调防抖:启动时 IOHIDManager 会对在场设备触发一连串 matching 回调,而每次处理
-/// (重建 client + 指针重应用)又会反向触发下一次回调,形成 6-7 连发的反馈循环 —— 既
-/// 刷日志噪音,又拉长启动繁忙窗口(macOS 对繁忙期未及时服务的 tap 会自动禁用,见
-/// event_tap.rs 的看门狗)。500ms 内只处理第一次;被跳过的回调不会直接丢弃,而是
-/// 调度一次延迟重查(schedule_recheck),保证 BLE 快速休眠-唤醒(断连与重连的间隔
-/// 常常小于 500ms)不会被永久吞掉——设备移除能及时反映,重连却丢了就是这个问题。
-///
 /// Plug-callback debounce: at startup IOHIDManager fires a burst of matching callbacks for
 /// on-screen devices, and each handling (client rebuild + pointer re-apply) triggers the next
 /// callback -- a 6-7 round feedback loop that spams the log and lengthens the busy startup
@@ -724,31 +593,21 @@ fn manager_static() -> &'static Mutex<*mut c_void> {
 static LAST_PLUG_HANDLE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 const PLUG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// 最近一次已处理的插拔事件是否为 removal。removal 后紧跟的 matching 事件是 BLE
-/// 休眠重连的典型模式:此时旧 client 的缓存已随连接失效(见 device_from_cgevent 的
-/// 失败路径),便宜 diff 不可靠,必须强制完整重建。
 /// Whether the last processed plug event was a removal. A matching event right after a
 /// removal is the typical BLE sleep-wake pattern: the old client's cache is dead by then
 /// (see the failure path in device_from_cgevent), so the cheap diff is unreliable and a
 /// full rebuild must be forced.
 static LAST_PROCESSED_REMOVAL: Mutex<bool> = Mutex::new(false);
 
-/// 延迟重查的一次性调度状态:至多一个重查线程在途;force 标记"removal 后紧跟
-/// matching"事件被防抖吞掉时强制完整重建(见 run_recheck)。
 /// One-shot scheduling state for the delayed recheck: at most one recheck thread in flight;
 /// the force flag demands a full rebuild when a removal-followed-by-matching pair was
 /// swallowed by the debounce (see run_recheck).
 static DEFERRED_RECHECK_PENDING: AtomicBool = AtomicBool::new(false);
 static DEFERRED_RECHECK_FORCE: AtomicBool = AtomicBool::new(false);
-/// 延迟窗口:被防抖吞掉的事件在 700ms 后复查,此时 BLE HID 服务通常已完成重注册。
 /// Delayed window: debounced events are re-checked after 700ms, by which time the BLE HID
 /// service has usually finished re-registering.
 const RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
 
-/// 通知设置界面刷新设备下拉:经 controller 的 handleDevicesChanged: 转到主线程执行
-/// (见 main.rs 的 on_devices_changed)。插拔回调、延迟重查、归因自愈三处共用。
-/// 窗口未打开时该通知是 no-op(下次打开时 load_settings_values 仍会重建)。
-///
 /// Notify the settings UI to refresh the device popup: hop to the main thread via the
 /// controller's handleDevicesChanged: (see on_devices_changed in main.rs). Shared by the
 /// plug callback, the delayed recheck, and the attribution self-heal. No-op when the
@@ -765,9 +624,6 @@ fn notify_devices_changed() {
     }
 }
 
-/// 调度延迟重查:合并防抖窗口内的多次事件,至多一个重查线程在途。
-/// force_rebuild = true 时,即使便宜 diff 显示设备集未变也强制完整重建。
-///
 /// Schedule the delayed recheck: coalesce multiple events inside the debounce window, at
 /// most one recheck thread in flight. With force_rebuild = true the recheck rebuilds fully
 /// even if the cheap diff shows an unchanged device set.
@@ -785,10 +641,6 @@ fn schedule_recheck(force_rebuild: bool) {
     }
 }
 
-/// 用现有 client 廉价枚举当前设备集(不重建、不等待匹配),仅供重查 diff 使用。
-/// 不做蓝牙键盘排除(NVRAM 读取成本高,且 diff 只关心集合是否变化——键盘重连
-/// 触发一次重建是安全的,enumerate_locked 仍会把它排除)。
-///
 /// Cheaply enumerate the current device set with the existing client (no rebuild, no
 /// matching wait); used only by the recheck diff. Bluetooth keyboard exclusion is skipped
 /// (NVRAM read is costly, and the diff only cares whether the set changed -- a keyboard
@@ -819,11 +671,6 @@ unsafe fn enumerate_keys(client: *mut c_void) -> Vec<DeviceKey> {
     keys
 }
 
-/// 延迟重查:防抖窗口内被跳过的插拔事件在这里补处理。先用现有 client 做便宜 diff,
-/// 只有设备集真变化(或 force)才重建 client + 重应用指针设置 + 刷新设置 UI。
-/// 启动时连发回调的 700ms 后复查会因设备集无变化而安静结束,不会重蹈反馈循环;
-/// BLE 重连场景则在此刻设备已完成 HID 注册,重建能拿到完整列表。
-///
 /// Delayed recheck: plug events skipped by the debounce window are handled here. A cheap
 /// diff with the existing client runs first; only a real device-set change (or force)
 /// triggers a client rebuild + pointer re-apply + settings-UI refresh. At startup the
@@ -854,20 +701,12 @@ fn run_recheck(force_rebuild: bool) {
             reg.devices.len()
         );
     }
-    // 释放 REGISTRY 锁后再 apply(pointer::apply 自建 client、不锁 REGISTRY;幂等可重复调用)。
     // Drop the REGISTRY lock before applying (pointer::apply creates its own client and never
     // locks REGISTRY; idempotent, safe to call repeatedly).
     crate::mouse::pointer::apply();
     notify_devices_changed();
 }
 
-/// IOHIDManager 回调:设备接入/移除时,强制重建注册表(重建 IOHIDEventSystemClient)。
-/// 蓝牙鼠标休眠断连重连正是走这里——重连触发 removal+matching 回调,重建后归因链恢复,
-/// 不必等下一次归因失败才自愈。重建后还要重新应用指针加速设置:加速度属性写在旧的
-/// IOHIDServiceClient 实例上,断连后随实例消失,新实例恢复默认(加速度重新生效),必须
-/// 在重连时重新 apply,否则"禁用指针加速"失效,只能靠用户进设置手动点一次恢复。
-/// 被防抖吞掉的回调调度延迟重查兜底(见 LAST_PLUG_HANDLE 注释)。
-///
 /// IOHIDManager callback: on device attach/detach, force-rebuild the registry (recreate the
 /// IOHIDEventSystemClient). A Bluetooth disconnect/reconnect fires these callbacks; the rebuild
 /// restores the attribution chain without waiting for the next failed attribution. Pointer
@@ -895,7 +734,6 @@ unsafe fn device_change_callback_inner(
     _callback: *mut c_void,
     is_removal: bool,
 ) {
-    // 防抖(见 LAST_PLUG_HANDLE 注释):500ms 内的重复插拔回调只处理第一次。
     // Debounce (see LAST_PLUG_HANDLE): only the first plug callback within 500ms is handled.
     let debounced = {
         let mut last = LAST_PLUG_HANDLE.lock().unwrap();
@@ -907,8 +745,6 @@ unsafe fn device_change_callback_inner(
         }
     };
     if debounced {
-        // 被防抖吞掉:调度延迟重查。removal 后紧跟 matching = BLE 重连,旧 client
-        // 缓存已失效,标记强制重建(便宜 diff 不可靠)。
         // Swallowed by the debounce: schedule a delayed recheck. A matching event right
         // after a removal is a BLE reconnect; the old client's cache is dead, so force a
         // full rebuild (the cheap diff would be unreliable).
@@ -925,21 +761,14 @@ unsafe fn device_change_callback_inner(
             reg.devices.len()
         );
     }
-    // 释放 REGISTRY 锁后再 apply(pointer::apply 自建 client、不锁 REGISTRY,但避免
-    // 持锁期间做重活)。apply 内部检查 mouse.enabled,未启用时自动跳过;幂等可重复调用。
     // Drop the REGISTRY lock before applying (pointer::apply creates its own client and never
     // locks REGISTRY, but avoid doing heavy work while holding the lock). apply checks
     // mouse.enabled internally and skips when disabled; idempotent, safe to call repeatedly.
     crate::mouse::pointer::apply();
-    // 设置窗口开着时即时刷新设备下拉:回调在鼠标线程,经 controller 的
-    // handleDevicesChanged: 转到主线程执行(见 main.rs 的 on_devices_changed)。
     // Refresh the settings device popup live when the window is open: this callback runs on
     // the mouse thread, so hop to main via the controller's handleDevicesChanged:
     // (see on_devices_changed in main.rs).
     notify_devices_changed();
-    // 已处理的事件也调度一次延迟重查:重建后 30ms settle 可能漏掉刚重连的设备
-    // (异步匹配竞态,见 enumerate_locked),700ms 后设备已完成注册,diff 检出变化即
-    // 补齐。启动连发场景下 diff 无变化,安静结束,不会重启反馈循环。
     // Also schedule a delayed recheck after processed events: the 30ms settle after a
     // rebuild can miss a just-reconnected device (async-matching race, see enumerate_locked);
     // by 700ms the device has registered, and the diff picks up the change. In the startup
@@ -947,7 +776,6 @@ unsafe fn device_change_callback_inner(
     schedule_recheck(false);
 }
 
-/// IOHIDManager 接入(matching)回调包装:带方向标记进入统一处理。
 /// Wrapper for IOHIDManager matching (attach) callbacks, entering the shared handler with
 /// the direction flag.
 unsafe extern "C" fn device_matching_callback(
@@ -959,7 +787,6 @@ unsafe extern "C" fn device_matching_callback(
     device_change_callback(context, result, sender, callback, false);
 }
 
-/// IOHIDManager 移除(removal)回调包装:带方向标记进入统一处理。
 /// Wrapper for IOHIDManager removal (detach) callbacks, entering the shared handler with
 /// the direction flag.
 unsafe extern "C" fn device_removal_callback(
@@ -971,10 +798,6 @@ unsafe extern "C" fn device_removal_callback(
     device_change_callback(context, result, sender, callback, true);
 }
 
-/// 启动设备插拔监听:创建 IOHIDManager,注册接入/移除回调,挂到指定 RunLoop。
-/// 由鼠标线程调用(传该线程的 CFRunLoop),回调即在那个线程执行,与 event tap 同线程,
-/// 对 REGISTRY 加锁安全。matching 与枚举一致:Generic Desktop 页的指针/鼠标/触控板。
-///
 /// Start device plug/unplug monitoring: create an IOHIDManager, register attach/detach callbacks,
 /// and schedule it on the given RunLoop (the mouse thread's). Callbacks then run on that thread,
 /// same as the event tap, so locking REGISTRY is safe. Matching mirrors enumeration: pointer/mouse/
@@ -985,7 +808,6 @@ pub(crate) unsafe fn start_plug_monitor(runloop: crate::event_tap::CFRunLoopRef)
     if !m.is_null() {
         return;
     }
-    // 记录鼠标线程 runloop,供 enumerate_locked 调度注册表 client(归因可靠性)。
     // Record the mouse thread's runloop for enumerate_locked to schedule the registry client
     // (attribution reliability).
     *mouse_runloop_static().lock().unwrap() = Some(runloop);
@@ -994,8 +816,6 @@ pub(crate) unsafe fn start_plug_monitor(runloop: crate::event_tap::CFRunLoopRef)
         log_info!("[device] failed to create IOHIDManager");
         return;
     }
-    // matching:PrimaryUsagePage=Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad}。
-    // 与 enumerate_locked 的过滤一致。
     // Matching: PrimaryUsagePage = Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad},
     // mirroring enumerate_locked's filter.
     let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
@@ -1007,8 +827,6 @@ pub(crate) unsafe fn start_plug_monitor(runloop: crate::event_tap::CFRunLoopRef)
     IOHIDManagerSetDeviceMatchingMultiple(manager_obj, arr as *const c_void);
     CFRelease(page_key as *const c_void);
 
-    // 接入与移除分开注册,以区分事件方向(removal 后紧跟 matching = BLE 重连,
-    // 防抖吞掉时触发强制重建,见 LAST_PROCESSED_REMOVAL 与 schedule_recheck)。
     // Register attach and removal separately so the event direction is known (a matching
     // event right after a removal is a BLE reconnect; if debounced it forces a full
     // rebuild, see LAST_PROCESSED_REMOVAL and schedule_recheck).
@@ -1031,13 +849,6 @@ pub(crate) unsafe fn start_plug_monitor(runloop: crate::event_tap::CFRunLoopRef)
     log_debug!("[device] plug/unplug monitor started.");
 }
 
-// ========== 归因 / attribution ==========
-
-/// 用 senderID 反查设备索引。
-/// 链路:IOHIDEventSystemClientCopyServiceForRegistryID(client, senderID) 得到 IOHIDServiceClient,
-/// 再用 CFEqual 与枚举列表逐项比对(Swift 字典对 CF key 也用 CFEqual,而非裸指针地址——
-/// Copy 返回的对象与枚举出的可能不是同一实例地址)。
-///
 /// Look up the device index by sender ID. The chain:
 /// IOHIDEventSystemClientCopyServiceForRegistryID(client, senderID) yields an IOHIDServiceClient,
 /// then CFEqual matches it against the enumerated list (Swift dictionaries also compare CF keys
@@ -1051,35 +862,23 @@ unsafe fn lookup_service_index(reg: &DeviceRegistry, sender: u64) -> Option<usiz
     if svc.is_null() {
         return None;
     }
-    // 设备数极少(鼠标/触控板几个),线性 CFEqual 遍历足够快。
     // Device count is tiny (a few mice/trackpads); a linear CFEqual scan is fast enough.
     let idx = reg
         .devices
         .iter()
         .position(|d| crate::ffi::CFEqual(d.service_client, svc));
-    // Copy 返回 +1,立即释放(索引已取出,设备由 services 数组保活)。
     // Copy returns +1; release immediately (the index is already taken; devices are kept
     // alive by the services array).
     CFRelease(svc as *const c_void);
     idx
 }
 
-/// 从 CGEvent 找到产生它的设备。
-/// 归因链:CGEventCopyIOHIDEvent -> IOHIDEventGetSenderID ->
-/// IOHIDEventSystemClientCopyServiceForRegistryID -> CFEqual 匹配枚举列表。
-/// 失败时异步安排重建,本次先返回 last_active(若无则 None,调用方用"所有鼠标"档)。
-///
 /// Find the device that produced a CGEvent.
 /// Chain: CGEventCopyIOHIDEvent -> IOHIDEventGetSenderID ->
 /// IOHIDEventSystemClientCopyServiceForRegistryID -> CFEqual against the enumerated list.
 /// On failure, asynchronously schedule a registry rebuild and return last_active
 /// (or None if there is none, in which case the caller uses the "All Mice" profile).
 pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Option<DeviceKey> {
-    // 先判"是不是别的进程注入的"(软件 KVM 的虚拟鼠标):这类事件没有 IOHIDEvent sender,但带
-    // 注入进程 pid,归到独立的虚拟档,而不是落到 last_active —— 否则虚拟鼠标的滚动/按键会被
-    // 算成物理鼠标那一档的设置。(注入事件不进 LAST_ACTIVE_KEY:那是硬件归因失败时的回退目标,
-    // 写进虚拟档会让物理鼠标的按键事件跟着走虚拟档。)
-    //
     // Injected-by-another-process (a software KVM's virtual pointer) first: such events carry no
     // IOHIDEvent sender but do carry the injecting pid, so they resolve to the dedicated virtual
     // profile rather than falling back to last_active -- otherwise the virtual pointer's scroll and
@@ -1100,7 +899,6 @@ pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Opt
         if sender == 0 {
             return last_active_key();
         }
-        // 第一次查表。
         // First lookup.
         {
             let reg = registry().lock().unwrap();
@@ -1110,8 +908,6 @@ pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Opt
                 return Some(dev.key());
             }
         }
-        // 未命中可能表示新设备或蓝牙重连。完整枚举会重建 IOHID client，耗时不能放在
-        // HID 回调里；合并调度后台重查，本次暂用 last_active 回退。
         // A miss may mean a new device or Bluetooth reconnect. Full enumeration rebuilds the
         // IOHID client and must stay off the HID callback; coalesce a background recheck and use
         // the last-active device for this event.
@@ -1120,11 +916,6 @@ pub(crate) fn device_from_cgevent(cg_event: crate::event_tap::CGEventRef) -> Opt
     }
 }
 
-/// 回退:取 last_active 设备的 (VID,PID)。按硬件身份匹配,不受重枚举 id 漂移影响。
-/// 鼠标**按键**事件的 CGEvent 经常拿不到 IOHIDEvent sender(滚动事件可以),归因会走到
-/// 这里;若本进程还没成功归因过(LAST_ACTIVE_KEY 为 None),注册表里只有一台设备时
-/// 直接用它 —— 一台鼠标的场景按键绑定因此可靠工作。
-///
 /// Fallback: return the last-active device's (VID, PID), matched by hardware identity so
 /// re-enumeration id drift doesn't break it. Mouse BUTTON events frequently carry no
 /// IOHIDEvent sender (scroll events do), so attribution lands here; when the process hasn't
@@ -1138,7 +929,6 @@ fn last_active_key() -> Option<DeviceKey> {
             return Some(d.key());
         }
     }
-    // 唯一设备兜底(注册表只含鼠标/触控板,蓝牙键盘已被排除)。
     // Single-device fallback (the registry holds only mice/trackpads; Bluetooth keyboards
     // are already excluded).
     if reg.devices.len() == 1 {
@@ -1151,7 +941,6 @@ fn last_active_key() -> Option<DeviceKey> {
 mod tests {
     use super::*;
 
-    // TLV 构造: tag, len, payload。
     // TLV helper: tag, len, payload.
     fn tlv(tag: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![tag, payload.len() as u8];
@@ -1161,7 +950,6 @@ mod tests {
 
     #[test]
     fn virtual_device_identity_tracks_the_injector_lifecycle() {
-        // 注入进程存活 -> 设备身份带保留键(设置下拉据此出现"虚拟鼠标"这一档)。
         // A live injector -> an identity carrying the reserved key (the picker shows the
         // virtual-mouse entry from this).
         let live_pid = std::process::id() as i32;
@@ -1172,9 +960,7 @@ mod tests {
             VIRTUAL_DEVICE_KEY
         );
 
-        // 进程已退出 -> 清掉并返回 None(下拉里的这一档随之消失)。
         // A dead process -> cleared, and None comes back (the picker entry disappears).
-        // 999999 超出 macOS 的 pid 上限,必定不存在。
         // 999999 exceeds macOS's pid ceiling, so it can never exist.
         *INJECTOR_PID.lock().unwrap() = Some(999_999);
         assert!(virtual_device_identity().is_none());
@@ -1186,10 +972,8 @@ mod tests {
         unsafe {
             let event =
                 crate::event_tap::CGEventCreateScrollWheelEvent2(std::ptr::null(), 1, 1, 1, 0, 0);
-            // 硬件事件:字段 41 = 0。
             // Hardware event: field 41 = 0.
             assert_eq!(injected_source_pid(event), None);
-            // 别的进程注入:返回该进程 pid。
             // Injected by another process: its pid comes back.
             crate::event_tap::CGEventSetIntegerValueField(
                 event,
@@ -1197,7 +981,6 @@ mod tests {
                 4242,
             );
             assert_eq!(injected_source_pid(event), Some(4242));
-            // 我们自己注入的合成事件不算虚拟指针。
             // Our own synthetic events are not a virtual pointer.
             crate::event_tap::CGEventSetIntegerValueField(
                 event,
@@ -1211,22 +994,19 @@ mod tests {
 
     #[test]
     fn bt_info_pairs_address_with_appearance() {
-        // 实测格式:0x0e 7 字节(1 标记 + 6 地址),0x11 2 字节小端 appearance。
         // Measured layout: 0x0e 7 bytes (1 flag + 6 address), 0x11 2 bytes LE appearance.
         let mut bytes = Vec::new();
         bytes.extend(tlv(0x02, b"Mouse"));
         bytes.extend(tlv(0x0e, &[0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
-        bytes.extend(tlv(0x11, &[0xC2, 0x03])); // 鼠标 / mouse appearance
+        bytes.extend(tlv(0x11, &[0xC2, 0x03])); // mouse appearance
         let mut map = HashMap::new();
         parse_bluetooth_info(&bytes, &mut map);
-        // 地址格式化为大写冒号分隔,appearance 小端解析。
         // Address formatted dashed-uppercase; appearance parsed little-endian.
         assert_eq!(map.get("AA-BB-CC-DD-EE-FF"), Some(&0x03C2));
     }
 
     #[test]
     fn bt_info_keyboard_appearance_is_distinguishable() {
-        // 键盘 appearance 0x03C1,与鼠标 0x03C2 可区分——这是排除虚报键盘的依据。
         // Keyboard appearance 0x03C1 vs mouse 0x03C2 — the basis for keyboard exclusion.
         let mut bytes = Vec::new();
         bytes.extend(tlv(0x0e, &[0x01, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]));
@@ -1238,7 +1018,6 @@ mod tests {
 
     #[test]
     fn bt_info_appearance_without_address_is_dropped() {
-        // 无待配对地址的 0x11 被忽略,不产生孤儿条目。
         // A 0x11 without a pending address is ignored — no orphan entries.
         let mut bytes = Vec::new();
         bytes.extend(tlv(0x11, &[0xC1, 0x03]));
@@ -1249,11 +1028,10 @@ mod tests {
 
     #[test]
     fn bt_info_unknown_tags_are_skipped_by_length() {
-        // 未知 tag 按 len 跳过,后续记录仍被解析。
         // Unknown tags skipped by length; later records still parse.
         let mut bytes = Vec::new();
         bytes.extend(tlv(0x02, b"Device"));
-        bytes.extend(tlv(0x99, &[0x00, 0x01, 0x02])); // 未知 3 字节 / unknown 3 bytes
+        bytes.extend(tlv(0x99, &[0x00, 0x01, 0x02])); // unknown 3 bytes
         bytes.extend(tlv(0x0e, &[0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
         bytes.extend(tlv(0x11, &[0xC2, 0x03]));
         let mut map = HashMap::new();
@@ -1264,14 +1042,12 @@ mod tests {
 
     #[test]
     fn bt_info_truncated_data_stops_cleanly() {
-        // 截断/异常长度不会 panic,只解析到有效处为止。
         // Truncated/malformed data never panics; parsing stops at the first bad record.
         let mut map = HashMap::new();
         parse_bluetooth_info(&[], &mut map);
-        parse_bluetooth_info(&[0x0e], &mut map); // 只有 tag 没有 len / tag only
-        parse_bluetooth_info(&[0x0e, 0x07, 0x01], &mut map); // len 超过剩余 / len past end
+        parse_bluetooth_info(&[0x0e], &mut map); // tag only
+        parse_bluetooth_info(&[0x0e, 0x07, 0x01], &mut map); // len past end
         assert!(map.is_empty());
-        // 截断的 0x11(1 字节)不产生条目。
         // A truncated 0x11 (1 byte) produces no entry.
         let mut bytes = Vec::new();
         bytes.extend(tlv(0x0e, &[0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
@@ -1282,7 +1058,6 @@ mod tests {
 
     #[test]
     fn bt_info_later_appearance_replaces_earlier() {
-        // 同一地址的后续 appearance 覆盖前值(最后一条生效)。
         // A later appearance for the same address overwrites the earlier one (last wins).
         let mut bytes = Vec::new();
         bytes.extend(tlv(0x0e, &[0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));

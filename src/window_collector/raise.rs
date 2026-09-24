@@ -1,11 +1,8 @@
-//! 窗口收集 · raise:SLPS 私有 API 按窗口精确抬升。
 //! Exact per-window raising through the SLPS private APIs.
 
 use super::*;
 
-// ========== 私有 API（统一经 skylight.rs 的 dlopen/dlsym 加载）==========
 // Private APIs (loaded via skylight.rs's shared dlopen/dlsym helpers).
-// 用来按 CGWindowID 精确配对 AX/CG 窗口、并在 WindowServer 层只抬起一个窗口。
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -21,31 +18,26 @@ type SlpsPostEventRecordFn = unsafe extern "C" fn(*mut ProcessSerialNumber, *mut
 
 static AX_GET_WINDOW: std::sync::LazyLock<Option<AxGetWindowFn>> =
     std::sync::LazyLock::new(|| unsafe {
-        // _AXUIElementGetWindow 是 HIServices 里的私有符号，dlopen 后 dlsym。
+        // _AXUIElementGetWindow is a private HIServices symbol: dlopen, then dlsym.
         skylight::load_private_symbol(skylight::HISERVICES_PATH, "_AXUIElementGetWindow")
     });
 static GET_PROCESS_FOR_PID: std::sync::LazyLock<Option<GetProcessForPIDFn>> =
     std::sync::LazyLock::new(|| unsafe {
-        // GetProcessForPID 也在 HIServices，dlopen 后 dlsym。
+        // GetProcessForPID also lives in HIServices: dlopen, then dlsym.
         skylight::load_private_symbol(skylight::HISERVICES_PATH, "GetProcessForPID")
     });
 static SLP_SET_FRONT: std::sync::LazyLock<Option<SlpSetFrontFn>> =
     std::sync::LazyLock::new(|| unsafe {
-        // SkyLight 是私有框架，必须先 dlopen 才能查到符号。
+        // SkyLight is a private framework, so its symbols only resolve after dlopen.
         skylight::load_private_symbol(skylight::SKYLIGHT_PATH, "_SLPSSetFrontProcessWithOptions")
     });
 static SLPS_POST_EVENT_RECORD: std::sync::LazyLock<Option<SlpsPostEventRecordFn>> =
     std::sync::LazyLock::new(|| unsafe {
-        // make_key_window 的合成鼠标事件也走 SkyLight 的 SLPSPostEventRecordTo。
         // Synthetic mouse events for make_key_window go through SkyLight's
         // SLPSPostEventRecordTo as well.
         skylight::load_private_symbol(skylight::SKYLIGHT_PATH, "SLPSPostEventRecordTo")
     });
 
-/// 取一个 AX 窗口的 CGWindowID（私有 API _AXUIElementGetWindow）。
-/// 用它把 AX 窗口和 CG 窗口按 CGWindowID 精确配对，不再靠顺序/标题猜
-/// （Edge 等 CG 无窗口名的 App 之前会配错，导致 mru/raise 跟错窗口）。
-/// 缩略图模块的 AXObserver 回调也用它解析新创建窗口的 cgwid。
 /// Get a CGWindowID for an AX window (private API _AXUIElementGetWindow).
 /// Used to pair AX windows with CG windows by CGWindowID instead of guessing
 /// by order/title (apps like Edge with no CG window name used to mismatch,
@@ -61,8 +53,6 @@ pub(crate) unsafe fn ax_window_cgwid(element: AXUIElementRef) -> Option<u32> {
     }
 }
 
-/// 查某 App 当前聚焦窗口的 CGWindowID（kAXFocusedWindow -> _AXUIElementGetWindow）。
-/// 比 AX[0] 可靠：AX 窗口数组顺序不一定是最前在前，但 kAXFocusedWindow 是明确聚焦的窗口。
 /// Get the CGWindowID of an app's currently focused window (kAXFocusedWindow ->
 /// _AXUIElementGetWindow). More reliable than AX[0]: the AX window array order
 /// isn't always frontmost-first, but kAXFocusedWindow is the explicitly focused window.
@@ -71,7 +61,7 @@ pub(crate) unsafe fn focused_window_cgwid(pid: i32) -> Option<u32> {
     if app.is_null() {
         return None;
     }
-    AXUIElementSetMessagingTimeout(app, 0.05); // 50ms 超时，避免卡死在无响应的 App 上。
+    AXUIElementSetMessagingTimeout(app, 0.05); // 50ms timeout so a hung app cannot block us.
     let focused_key = cf_string_new("AXFocusedWindow");
     let mut focused: *const c_void = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(app, focused_key, &mut focused);
@@ -85,16 +75,10 @@ pub(crate) unsafe fn focused_window_cgwid(pid: i32) -> Option<u32> {
     wid
 }
 
-/// 用 SkyLight 私有 API _SLPSSetFrontProcessWithOptions 在 WindowServer 层
-/// 只抬起指定 CGWindowID 的那一个窗口（不抬该 App 的所有窗口）。
 /// Raise only one window (by CGWindowID) at the WindowServer level via the
 /// SkyLight private API _SLPSSetFrontProcessWithOptions -- does NOT raise all
 /// of the app's windows the way activate(AllWindows) does.
 ///
-/// mode 用 0x200(kCPSUserGenerated,yabai kCPS* 定义):把这次切换标记为
-/// 「用户发起」。macOS 14+ 对非用户发起的程序化前台切换会抑制输入焦点转移(目标窗口
-/// 变灰红绿灯,需要点击才能获得焦点),0x200 是绕过该抑制的关键。旧代码传的 2 不是
-/// 有效标志位,正是灰红绿灯的根因之一。
 /// The mode is 0x200 (kCPSUserGenerated, from yabai's kCPS* constants):
 /// it marks this front-switch as user-initiated. macOS 14+ suppresses input-focus transfer
 /// for non-user-initiated programmatic front-switches (the target window's traffic lights go
@@ -146,15 +130,6 @@ unsafe fn raise_window_slps(pid: i32, wid: u32) -> bool {
     status == 0
 }
 
-/// 用 SkyLight 私有 API SLPSPostEventRecordTo 向目标窗口投递一次合成鼠标按下事件，
-/// 使该窗口成为其 App 的 key window（红绿灯变彩色）。macOS 14+ 把 NSRunningApplication
-/// activate 降级为「建议性请求」，跨 App 转移 key 焦点只剩这条可靠路径；0x200 的
-/// userGenerated 前台切换只解决「抬到前面」，key 状态必须靠这个合成点击确立。
-/// 点击点放到窗口右下方很远处，避免命中任何内容或 resize 区域。事件按 CGWindowID 定向投递，
-/// 与坐标无关。
-/// 字节布局来自对 CGSInternal/CGSEvent.h 的反向工程；缓冲必须 ≥0x100 并清零，
-/// 否则 macOS 14.7.4+ 的 CGSEncodeEventRecord 会越界读取导致 SIGABRT（paneru#123）。
-///
 /// Make the window `wid` the key window of its app by posting a synthetic left-mouse-down
 /// to the WindowServer via the SkyLight private API SLPSPostEventRecordTo.
 /// macOS 14+ downgraded NSRunningApplication.activate to an advisory "request"; posting
@@ -200,18 +175,17 @@ unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
         );
         return false;
     }
-    // 0x100 字节清零缓冲:记录本身声明长度 0xf8(offset 0x04),多分配防止越界读崩溃。
     // Zeroed 0x100-byte buffer: the record declares 0xf8 (offset 0x04); the extra space
     // prevents the out-of-bounds read crash.
     let mut bytes = vec![0u8; 0x100];
-    bytes[0x04] = 0xf8; // 记录长度 / record length
-    bytes[0x3a] = 0x10; // 未公开标志(yabai/Hammerspoon 同款)/ undocumented flag (as yabai/Hammerspoon)
-                        // 目标 CGWindowID @ 0x3c(4 字节,小端)/ target CGWindowID @ 0x3c (4 bytes, LE)
+    bytes[0x04] = 0xf8; // record length
+    bytes[0x3a] = 0x10; // undocumented flag (as yabai/Hammerspoon)
+                        // target CGWindowID @ 0x3c (4 bytes, LE)
     bytes[0x3c..0x40].copy_from_slice(&wid.to_le_bytes());
-    // 窗口相对点击点 @ 0x20(16 字节 = CGPoint 两个 f64),远离内容和 resize 区域。
+    // Window-relative click point at 0x20 (16 bytes = a CGPoint of two f64), far away from the content
+    // and the resize areas.
     bytes[0x20..0x28].copy_from_slice(&(300_000.0f64).to_le_bytes());
     bytes[0x28..0x30].copy_from_slice(&(300_000.0f64).to_le_bytes());
-    // 0x08 = CGSEventType:一次左键按下即可让目标窗口变 key。
     // 0x08 = CGSEventType: one left-mouse-down makes the target window key.
     bytes[0x08] = 0x01;
     let status = post(&mut psn, bytes.as_mut_ptr());
@@ -247,7 +221,6 @@ pub(crate) fn activate_pid(pid: i32) -> bool {
     }
 }
 
-/// 由 &str 构造 CFString(+1 引用,调用方 CFRelease)。窗口控制模块复用。
 /// Build a CFString from &str (+1 reference; caller CFReleases). Reused by window control.
 pub(crate) fn cf_string_new(s: &str) -> *const c_void {
     let c_str = std::ffi::CString::new(s).unwrap();
@@ -417,8 +390,6 @@ pub(super) fn cf_dict_get_u32(dict: *const c_void, key: &str) -> Option<u32> {
     }
 }
 
-/// 读 CG dict 里的 CFNumber double(如 kCGWindowAlpha)。CFNumberGetValue type 13 =
-/// kCFNumberDoubleType。
 /// Read a CFNumber double from a CG dict (e.g. kCGWindowAlpha). CFNumberGetValue type 13 =
 /// kCFNumberDoubleType.
 pub(super) fn cf_dict_get_f64(dict: *const c_void, key: &str) -> Option<f64> {
@@ -437,7 +408,7 @@ pub(super) fn cf_dict_get_f64(dict: *const c_void, key: &str) -> Option<f64> {
     }
 }
 
-// 读 CG dict 里的 CFBoolean(如 kCGWindowIsOnscreen)。/ Read a CFBoolean from a CG dict (e.g. kCGWindowIsOnscreen).
+// Read a CFBoolean from a CG dict (e.g. kCGWindowIsOnscreen).
 pub(super) fn cf_dict_get_bool(dict: *const c_void, key: &str) -> Option<bool> {
     let cf_key = cf_string_new(key);
     let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
@@ -448,9 +419,6 @@ pub(super) fn cf_dict_get_bool(dict: *const c_void, key: &str) -> Option<bool> {
     Some(unsafe { CFBooleanGetValue(value) })
 }
 
-/// 读 CG dict 里的 kCGWindowBounds(嵌套 dict:X/Y/Width/Height),返回 (x, y, w, h)。
-/// 用于确定激活窗口所在屏幕(overlay 的"跟随激活窗口"定位)。
-///
 /// Read kCGWindowBounds (a nested dict: X/Y/Width/Height) from a CG dict, returning (x, y, w, h).
 /// Used to determine the active window's screen (the overlay's "follow active window" placement).
 pub(super) fn cf_dict_get_bounds(dict: *const c_void, key: &str) -> Option<(f64, f64, f64, f64)> {
@@ -467,8 +435,6 @@ pub(super) fn cf_dict_get_bounds(dict: *const c_void, key: &str) -> Option<(f64,
     Some((x, y, w, h))
 }
 
-// AppIdentity / resolve_app_identity 已下沉到 crate::app_identity(消除与
-// icon_cache 的模块环);本模块经上方 use 引入继续使用。
 // AppIdentity / resolve_app_identity now live in crate::app_identity (breaking the
 // module cycle with icon_cache); this module imports them above.
 
@@ -519,10 +485,6 @@ pub(crate) fn forget_non_normal_window(cgwid: u32) {
         .retain(|entry| entry.cgwid != cgwid);
 }
 
-/// AX 关闭窗口(等效点击窗口的关闭按钮):遍历 pid 的 AXWindows 匹配 cgwid,
-/// 主方案 = 取窗口的 AXCloseButton 元素并执行 AXPress;兜底 = 窗口级 AXClose
-/// action(macOS 26 上多数 app 不再暴露,故以按钮方案为主)。最小化窗口同样适用。
-/// 返回是否找到并成功发起关闭;失败 → false。
 /// Close a window via AX (equivalent to clicking its close button): scan the pid's
 /// AXWindows for cgwid; the PRIMARY path grabs the window's AXCloseButton and presses it;
 /// the fallback is the window-level AXClose action (most apps no longer expose it on
@@ -556,7 +518,6 @@ pub(crate) fn close_ax_window(pid: i32, cgwid: u32) -> bool {
             if ax_window_cgwid(element) != Some(cgwid) {
                 continue;
             }
-            // 主方案:关闭按钮 + AXPress(标准窗口通用,系统设置/Chrome 实测可用)。
             // Primary: the close button + AXPress (works on any standard window; verified
             // on System Settings and Chrome).
             let mut close_btn: *const c_void = std::ptr::null();
@@ -567,7 +528,6 @@ pub(crate) fn close_ax_window(pid: i32, cgwid: u32) -> bool {
                 CFRelease(close_btn);
                 break;
             }
-            // 兜底:窗口级 AXClose。
             // Fallback: the window-level AXClose action.
             ok = AXUIElementPerformAction(element, close_key) == K_AX_SUCCESS;
             break;
@@ -580,9 +540,6 @@ pub(crate) fn close_ax_window(pid: i32, cgwid: u32) -> bool {
     }
 }
 
-/// 抬升前半段:WindowServer 层抬窗(SLPS)+ 合成点击确立 key window。
-/// 普通窗口在提交时调用;最小化窗口由后台 raiser 在解除最小化后调用。
-///
 /// First half of the raise: WindowServer-level raise (SLPS) plus the synthetic click that
 /// establishes the key window. Normal windows call it at commit time; minimized windows call it
 /// from the background raiser after being restored.
@@ -591,8 +548,6 @@ pub(crate) fn raise_window_fast(pid: i32, cgwid: u32) -> (bool, bool) {
         return (false, false);
     }
     unsafe {
-        // 1. WindowServer 层只抬这一个窗口（SkyLight 私有 API _SLPSSetFrontProcessWithOptions，
-        //    mode=0x200 userGenerated），避免 activate(AllWindows) 把该 App 的所有窗口都抬到前面。
         //    Raise only this one window at the WindowServer level (SkyLight private API,
         //    mode=0x200 userGenerated), avoiding activate(AllWindows) raising every window.
         let fast_started = Instant::now();
@@ -600,8 +555,6 @@ pub(crate) fn raise_window_fast(pid: i32, cgwid: u32) -> (bool, bool) {
         let slps_ok = raise_window_slps(pid, cgwid);
         let slps_elapsed = slps_started.elapsed().as_micros();
 
-        // 1.5 合成鼠标点击确立 key window：SLPS 只负责「抬到前面 + 设为前台进程」，key 状态
-        //    必须由这个合成点击授予（macOS 14+ 无公开 API 可跨 App 转移 key 焦点）。
         //    The synthetic click establishes the key window: SLPS only fronts the window and
         //    process; the key state is granted by this click (macOS 14+ has no public API to
         //    move key focus across apps).

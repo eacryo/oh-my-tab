@@ -1,6 +1,3 @@
-//! FFI 与 ObjC 桥接的基础工具:CF/CG 函数声明、裸指针的 Send/Sync 包装、
-//! NSString 转换、颜色/图层 helper。被所有 UI 模块依赖,是叶子层。
-//!
 //! FFI and ObjC-bridging primitives: CF/CG function declarations, Send/Sync wrappers for raw
 //! pointers, NSString conversion, and color/layer helpers. A leaf module depended on by all UI modules.
 
@@ -12,8 +9,6 @@ use std::ffi::{c_char, c_void, CString};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-// ========== FFI 外部函数声明 / FFI extern declarations ==========
-
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     pub(crate) fn CFStringCreateWithCString(
@@ -23,9 +18,6 @@ extern "C" {
     ) -> *const c_void;
     pub(crate) fn CFRelease(cf: *const c_void);
     pub(crate) fn CFRetain(cf: *const c_void);
-    // CFEqual:比较两个 CF 对象是否"相等"。IOHIDServiceClient 的相等语义由系统定义
-    // (通常按底层对象身份),而非裸指针地址——CopyServiceForRegistryID 返回的对象与
-    // CopyServices 枚举出的可能不是同一实例地址,必须用 CFEqual 判断。
     // CFEqual: compares two CF objects for equality. IOHIDServiceClient equality is defined
     // by the system (typically by underlying object identity), not by raw pointer address --
     // the object returned by CopyServiceForRegistryID may not be the same instance as the one
@@ -38,8 +30,6 @@ extern "C" {
     ) -> i32;
     pub(crate) static kCFRunLoopDefaultMode: *mut c_void;
 
-    // ---- CF 容器与字符串(此前分散在 window_collector / thumbnail) ----
-    // ---- CF containers & strings (previously scattered across window_collector / thumbnail) ----
     pub(crate) fn CFArrayCreate(
         alloc: *const c_void,
         values: *const *const c_void,
@@ -48,8 +38,6 @@ extern "C" {
     ) -> *const c_void;
     pub(crate) fn CFArrayGetCount(array: *const c_void) -> isize;
     pub(crate) fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
-    /// CFTypeID 查询:批量读的槽位可能是 AXValue 占位 / CFArray / AXUIElement,只有先核过
-    /// 类型 id 才敢把槽位当成 AXUIElement 用——私有的 `_AXUIElementGetWindow` 不做任何校验。
     /// CFTypeID queries: a batch-read slot can be an AXValue placeholder, a CFArray or an
     /// AXUIElement, and only after checking the type id is it safe to treat a slot as an
     /// AXUIElement -- the private `_AXUIElementGetWindow` validates nothing.
@@ -57,7 +45,6 @@ extern "C" {
     pub(crate) fn CFArrayGetTypeID() -> usize;
     pub(crate) fn AXUIElementGetTypeID() -> usize;
     pub(crate) fn AXValueGetTypeID() -> usize;
-    /// AXValue 的实际类型;kAXValueAXErrorType = 5 表示“该槽位是一次错误占位”。
     /// The AXValue's concrete type; kAXValueAXErrorType = 5 marks an error placeholder slot.
     pub(crate) fn AXValueGetType(value: *const c_void) -> i32;
     pub(crate) fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
@@ -78,14 +65,11 @@ extern "C" {
         buffer_size: isize,
         encoding: u32,
     ) -> bool;
-    /// CFString 值比较:相等返回 0(kCFCompareEqualTo)。
     /// CFString value comparison: 0 when equal (kCFCompareEqualTo).
     pub(crate) fn CFStringCompare(a: *const c_void, b: *const c_void, options: usize) -> isize;
     pub(crate) static kCFBooleanFalse: *const c_void;
     pub(crate) static kCFBooleanTrue: *const c_void;
 
-    // ---- CFRunLoop 源(此前在 thumbnail/pregen) ----
-    // ---- CFRunLoop sources (previously in thumbnail/pregen) ----
     pub(crate) fn CFRunLoopSourceCreate(
         alloc: *const c_void,
         order: isize,
@@ -96,7 +80,6 @@ extern "C" {
     pub(crate) fn CFRunLoopWakeUp(rl: *mut c_void);
 }
 
-/// CFRunLoopSource 的 perform 回调上下文(只用 perform 字段)。
 /// CFRunLoopSource context (only the perform field is used).
 #[repr(C)]
 pub(crate) struct CFRunLoopSourceContext {
@@ -112,18 +95,12 @@ pub(crate) struct CFRunLoopSourceContext {
     pub(crate) perform: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
-// ========== Accessibility(AX) / Accessibility (AX) ==========
-
-/// AX API 的元素句柄与错误码(此前在 window_collector / thumbnail/pregen 各自定义)。
-/// AX element handle and error codes (previously redefined in window_collector and
-/// thumbnail/pregen).
+/// AX element handle and error codes, shared by every caller.
 pub(crate) type AXUIElementRef = *const c_void;
 pub(crate) type AxObserverRef = *mut c_void;
 pub(crate) type AXError = i32;
 pub(crate) const K_AX_SUCCESS: AXError = 0;
 pub(crate) const K_AX_INVALID_UI_ELEMENT: AXError = -25205;
-/// kAXErrorCannotComplete:目标 App 未在消息超时内应答。无响应 App 的 AX 调用返回的就是这个码
-/// (实测 2026-09-16:PeachPic 每次 AX 查询都等满超时后返回 -25204)。
 /// kAXErrorCannotComplete: the target app did not answer within the messaging timeout. This is
 /// the code an unresponsive app returns (measured 2026-09-16: every AX query against PeachPic
 /// burned the full timeout and came back -25204).
@@ -139,9 +116,6 @@ extern "C" {
         attribute: *const c_void,
         value: *mut *const c_void,
     ) -> AXError;
-    /// 一次 IPC 批量读多个属性(与逐个读同一批属性等价,但只走一次远程消息)。
-    /// options 为空且不带 stopOnError 时**总是**返回数组:应用答不出的槽位放一个
-    /// `kAXValueAXErrorType` 的 AXValue 占位,调用方必须把它读成“没答”而不是“答了”。
     /// Reads several attributes in one IPC round trip. With empty options and no stopOnError the
     /// call ALWAYS returns an array: a slot the app could not answer holds an
     /// `kAXValueAXErrorType` AXValue placeholder, which callers must read as "did not answer"
@@ -156,8 +130,6 @@ extern "C" {
         element: AXUIElementRef,
         action: *const c_void,
     ) -> AXError;
-    /// 枚举元素支持的动作名(kAXActionNames)。用于探测 AppKit 挂在缩放按钮上的私有动作
-    /// `AXZoomWindow`——公开头文件里只有 `kAXPressAction`,没有它。
     /// Enumerate an element's supported action names (kAXActionNames). Used to probe for
     /// `AXZoomWindow`, the private action AppKit attaches to the zoom button; the public headers
     /// only declare `kAXPressAction`.
@@ -171,10 +143,8 @@ extern "C" {
         value: *const c_void,
     ) -> AXError;
     pub(crate) fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: f64) -> AXError;
-    // AXValue:几何值的包装类型(CGPoint/CGSize)。窗口控制读写 AXPosition/AXSize 用。
     // AXValue: wrapper type for geometry values (CGPoint/CGSize); used to read/write
     // AXPosition/AXSize for window control.
-    // kAXValueCGPointType = 1, kAXValueCGSizeType = 2(HIServices 头文件)。
     pub(crate) fn AXValueCreate(value_type: i32, value_ptr: *const c_void) -> *const c_void;
     pub(crate) fn AXValueGetValue(
         value: *const c_void,
@@ -201,8 +171,6 @@ extern "C" {
     pub(crate) fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32)
         -> *const c_void;
 
-    // ---- 屏幕录制 TCC 与位图重采样(此前在 thumbnail) ----
-    // ---- Screen-recording TCC and bitmap resampling (previously in thumbnail) ----
     pub(crate) fn CGPreflightScreenCaptureAccess() -> bool;
     pub(crate) fn CGRequestScreenCaptureAccess() -> bool;
     pub(crate) fn CGImageGetWidth(image: *const c_void) -> usize;
@@ -221,8 +189,6 @@ extern "C" {
     pub(crate) fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *const c_void;
     pub(crate) fn CGBitmapContextGetData(ctx: *mut c_void) -> *mut c_void;
 
-    // ---- 径向渐变(设置主区的径向高光) ----
-    // ---- Radial gradients (the settings pane's radial highlight) ----
     pub(crate) fn CGGradientCreateWithColorComponents(
         space: *const c_void,
         components: *const f64,
@@ -241,7 +207,6 @@ extern "C" {
     );
 }
 
-/// CoreGraphics 的 CGPoint(与 CGRect 同源的平铺双 f64 布局)。
 /// CoreGraphics CGPoint (flat two-f64 layout matching CGRect's convention).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -250,8 +215,6 @@ pub(crate) struct CGPoint {
     pub(crate) y: f64,
 }
 
-/// CoreGraphics 的 CGRect(C ABI:{origin:(x,y), size:(w,h)} 即 4 个连续 f64;
-/// 平铺字段与 C 布局逐字节一致)。
 /// CoreGraphics CGRect (C ABI: {origin:(x,y), size:(w,h)} -- four contiguous f64;
 /// the flat fields are byte-identical to the C layout).
 #[repr(C)]
@@ -266,19 +229,11 @@ pub(crate) struct CGRect {
 /// Return Apple's overlay window level rather than baking in its current numeric value.
 /// `kCGOverlayWindowLevelKey` is the public CoreGraphics level intended for system-style
 /// overlays. On the current macOS it is 102, just above Telegram's media viewer (101).
-///
-/// 返回系统公开的 overlay 窗口层级,不直接硬编码当前数值。`kCGOverlayWindowLevelKey`
-/// 是 CoreGraphics 为系统浮层提供的公开层级;当前 macOS 为 102,刚好高于 Telegram
-/// 媒体查看器的 101。
 pub(crate) fn cg_overlay_window_level() -> isize {
     // CGWindowLevelKey::kCGOverlayWindowLevelKey has the numeric enum value 15.
     unsafe { CGWindowLevelForKey(15) as isize }
 }
 
-// ========== libc:localtime_r(此前在 logger / clipboard 各自定义 Tm) ==========
-// ========== libc: localtime_r (Tm was previously redefined in logger and clipboard) ==========
-
-/// libc `struct tm` 的布局(logger 时间戳与剪贴板"复制于"格式化共用;两者原定义逐字段一致)。
 /// libc `struct tm` layout (shared by the logger's timestamps and the clipboard's
 /// "copied at" formatting; the two previous definitions were field-identical).
 #[repr(C)]
@@ -300,11 +255,6 @@ extern "C" {
     pub(crate) fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
 }
 
-// ========== 本进程内存指标(task_info) / own-process memory stats (task_info) ==========
-
-/// kernel `task_vm_info` 的 C 数据布局是 372 字节(93 个 u32 word)。Rust 的 `repr(C)`
-/// 会在末尾按自身 8 字节对齐补 4 字节,所以不能从 `size_of::<TaskVmInfo>()` 推导 count;
-/// Mach count 必须按 C 布局明确写成 93。缓冲区保留额外尾部空间,避免写越界。
 /// The kernel `task_vm_info` C data layout is 372 bytes (93 u32 words). Rust's `repr(C)`
 /// adds 4 bytes of trailing 8-byte alignment padding, so the Mach count must be based on
 /// the C layout rather than `size_of::<TaskVmInfo>()`. The buffer has extra tail space and
@@ -313,10 +263,7 @@ const TASK_VM_INFO_DATA_BYTES: usize = 372;
 pub(crate) const TASK_VM_INFO_COUNT: u32 =
     (TASK_VM_INFO_DATA_BYTES / std::mem::size_of::<u32>()) as u32;
 
-/// 偏移已用 C 编译器对照 mach/task_info.h 实测:
 ///   resident_size=16, resident_size_peak=24, internal=48, compressed=120,
-///   phys_footprint=144(header 后第一组是 32 位的 basic_info 字段,不是 64 位)。
-/// 布局必须与系统头一致;新增字段只能追加,不能重排。
 /// Offsets verified against mach/task_info.h with a C compiler:
 ///   resident_size=16, resident_size_peak=24, internal=48, compressed=120,
 ///   phys_footprint=144 (the first group after the header holds the 32-bit basic_info
@@ -324,35 +271,25 @@ pub(crate) const TASK_VM_INFO_COUNT: u32 =
 /// only be appended, never reordered.
 #[repr(C)]
 pub(crate) struct TaskVmInfo {
-    // offset 0-15: mach_msg_type_number_t header × 4(bold/virtual_size 低半/... 32 位组)。
     // offset 0-15: four u32 header words (the 32-bit basic_info group).
     header: [u32; 4],
-    /// 驻留物理页总字节(RSS)。offset 16。
     /// Total resident bytes (RSS). Offset 16.
     pub(crate) resident_size: u64,
-    /// RSS 峰值(kernel 维护)。offset 24。
     /// Peak RSS (kernel-maintained). Offset 24.
     pub(crate) resident_size_peak: u64,
-    // offset 32-47: region_count 等 32 位计数字段组。
     // offset 32-47: the 32-bit counter group (region_count etc.).
     _counters: [u32; 4],
-    /// 匿名内存(我们的堆:Rust + malloc zone),字节。offset 48。
     /// Anonymous memory (our heap: Rust + malloc zones). Offset 48.
     pub(crate) internal: u64,
-    // offset 56-119: internal 之后的 64 位字段组(purgeable/alternate...)。
     // offset 56-119: the 64-bit group after internal (purgeable/alternate/...).
     _middle: [u64; 8],
-    /// 已被压缩器收编的内存,字节。offset 120。
     /// Memory absorbed by the compressor. Offset 120.
     pub(crate) compressed: u64,
-    // offset 128-143: compressed 之后的 64 位字段组。
     // offset 128-143: the 64-bit group after compressed.
     _late: [u64; 2],
-    /// 物理足迹 = 活动监视器「内存」列的口径(含压缩与 IOKit 映射)。字节。offset 144。
     /// Physical footprint = Activity Monitor's "Memory" column (compressed + IOKit included).
     /// Offset 144.
     pub(crate) phys_footprint: u64,
-    // offset 152-371: 尾部未读字段。补齐 C 数据布局,防止 task_info 越界写缓冲区。
     // offset 152-371: trailing unread fields. Pads the C data layout so task_info
     // cannot write past the buffer.
     _tail: [u8; TASK_VM_INFO_DATA_BYTES - 152],
@@ -360,7 +297,6 @@ pub(crate) struct TaskVmInfo {
 
 const _: () = assert!(std::mem::size_of::<TaskVmInfo>() >= TASK_VM_INFO_DATA_BYTES);
 
-// [u8; 220] 超出 derive(Default) 支持的数组长度(≤32),手写。
 // [u8; 220] exceeds the array length derive(Default) supports (<=32); hand-written.
 impl Default for TaskVmInfo {
     fn default() -> Self {
@@ -379,7 +315,6 @@ impl Default for TaskVmInfo {
     }
 }
 
-/// 读当前进程的 task_vm_info。失败(理论上仅发生在 kernel 接口变化时)返回 None,调用方跳过本次采样。
 /// Read the current process's task_vm_info. Returns None on failure (only plausible if the
 /// kernel interface changes); the caller just skips that sample.
 pub(crate) fn task_vm_info() -> Option<TaskVmInfo> {
@@ -394,7 +329,6 @@ pub(crate) fn task_vm_info() -> Option<TaskVmInfo> {
 
 #[cfg(test)]
 impl TaskVmInfo {
-    /// 测试用构造:占位字段保持默认,只设关心的指标(私有字段无法从模块外构造)。
     /// Test-only constructor: padding stays default, only the metrics of interest are set
     /// (private fields can't be constructed from outside the module).
     pub(crate) fn with_footprint(phys_footprint: u64) -> Self {
@@ -419,7 +353,7 @@ fn task_info(info: *mut TaskVmInfo, count: &mut u32) -> i32 {
     unsafe { task_info(mach_task_self(), TASK_VM_INFO_FLAVOR, info, count) }
 }
 
-// AppKit 框架链接占位 / AppKit framework link placeholder
+// AppKit framework link placeholder
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
 
@@ -437,8 +371,6 @@ extern "C" {
         imp: *mut c_void,
         types: *const c_char,
     ) -> bool;
-    /// 注册类之前给动态子类加实例变量(设置滑杆用它挂"双击恢复的默认值")。
-    /// `alignment` 是 2 的对数(f64 → 3);`types` 用 ObjC 编码("d" = double)。
     /// Add an instance variable to a dynamic subclass BEFORE registering the class (the settings
     /// slider uses it to carry its double-click default). `alignment` is log2 (f64 -> 3) and
     /// `types` is the ObjC encoding ("d" = double).
@@ -449,11 +381,6 @@ extern "C" {
         alignment: u8,
         types: *const c_char,
     ) -> bool;
-    /// 取 ivar 句柄与它在实例内的字节偏移,供调用方按类型直接读写。
-    ///
-    /// 刻意不用已废弃的 `object_set/getInstanceVariable`:那两个函数把 ivar 当成 `id`
-    /// (存/取的是**指针**而不是按声明类型拷贝值),对标量 ivar 会把栈地址写进去
-    /// (实测:double ivar 读出 3e-314 这种反常态值)。
     /// Ivar lookup + its byte offset inside the instance, for typed direct access.
     ///
     /// The deprecated `object_set/getInstanceVariable` pair is deliberately avoided: it treats the
@@ -466,10 +393,6 @@ extern "C" {
     ) -> *mut c_void;
     pub(crate) fn ivar_getOffset(ivar: *mut c_void) -> isize;
     pub(crate) fn objc_getClass(name: *const c_char) -> *mut AnyObject;
-    // ---- 原始 msgSend(此前散落在 autostart/updater/overlay/clipboard 等处的内联声明) ----
-    // ---- Raw msgSend (previously declared inline across autostart/updater/overlay/clipboard) ----
-    // objc2 的 msg_send! 无法表达全部签名;这些场景由调用方把无类型符号 transmute 成
-    // 具体函数指针后调用。全项目唯一声明处,禁止再在调用方内联 extern。
     // objc2's msg_send! cannot express every signature; callers transmute the untyped symbol
     // into a concrete function pointer. This is the single declaration site -- do not inline
     // new externs at call sites.
@@ -477,7 +400,6 @@ extern "C" {
     pub(crate) fn objc_msgSendSuper();
 }
 
-/// objc_msgSendSuper 的 receiver 结构(objc_super;C ABI 两个指针)。
 /// The objc_msgSendSuper receiver struct (objc_super; two pointers in the C ABI).
 #[repr(C)]
 pub(crate) struct ObjcSuper {
@@ -485,10 +407,6 @@ pub(crate) struct ObjcSuper {
     pub(crate) super_class: *mut c_void,
 }
 
-// ========== 裸指针的线程亲和包装 / Thread-affine wrappers for raw ObjC pointers ==========
-
-/// 只允许主线程持有和使用的 ObjC 对象指针。
-///
 /// `Rc` marker deliberately makes this type neither `Send` nor `Sync`; putting it in a
 /// [`MainThreadSlot`] keeps the ownership boundary explicit without claiming that an
 /// arbitrary Objective-C object is thread-safe.
@@ -496,7 +414,6 @@ pub(crate) struct ObjcSuper {
 /// Main-thread-only Objective-C object pointer. The `Rc` marker deliberately makes this type
 /// neither `Send` nor `Sync`; storing it in [`MainThreadSlot`] keeps the ownership boundary
 /// explicit without claiming that an arbitrary Objective-C object is thread-safe.
-///
 #[derive(Clone, Copy)]
 pub(crate) struct ObjPtr(pub(crate) *mut AnyObject, PhantomData<Rc<()>>);
 
@@ -509,8 +426,6 @@ impl ObjPtr {
 /// A process-lifetime Objective-C class pointer. Dynamic classes are registered once and are
 /// retained by the Objective-C runtime for the life of the process, so the class identity itself
 /// is safe to share across threads; instances created from it remain main-thread objects.
-/// 进程生命周期内的 Objective-C Class 指针。动态类注册后由运行时持有到进程结束，类身份可跨线程共享；
-/// 由其创建的实例仍然只能在主线程使用。
 #[derive(Clone, Copy)]
 pub(crate) struct StaticClass(pub(crate) *const objc2::runtime::AnyClass);
 unsafe impl Send for StaticClass {}
@@ -518,9 +433,6 @@ unsafe impl Sync for StaticClass {}
 
 /// Main-thread slot for UI objects that must remain in a `static` registry for callback lookup.
 /// The slot is synchronized by the main-thread invariant, not by a cross-thread mutex.
-///
-/// 主线程 UI 对象的静态槽。它依赖主线程所有权保证，而不是跨线程 Mutex；`lock` 保留原有调用
-/// 形状，便于逐步迁移旧的指针注册表，同时在运行时检测重入借用。
 pub(crate) struct MainThreadSlot<T> {
     value: RefCell<T>,
 }
@@ -541,18 +453,15 @@ impl<T> MainThreadSlot<T> {
 // The wrapper is only reachable through main-thread callbacks; the contained value is never
 // moved out to a worker thread. This is the one narrowly-scoped synchronization boundary for
 // legacy static UI registries, instead of marking every raw pointer as Send/Sync.
-// 该包装器只能通过主线程回调访问，内部值不会被移交后台线程；这是旧 UI 静态注册表唯一且收窄的同步边界。
 unsafe impl<T> Sync for MainThreadSlot<T> {}
 // The slot itself is a process-global registry cell and is never moved after initialization;
 // only its borrow guard is exposed. This permits `LazyLock`/`OnceLock` initialization while the
 // contained UI object remains non-Send.
-// 槽本身在初始化后不会再移动，只暴露借用 guard；因此可用于 LazyLock/OnceLock 初始化，而内部 UI 对象仍不可 Send。
 unsafe impl<T> Send for MainThreadSlot<T> {}
 
 /// A retained Objective-C callback target whose identity is handed to AppKit APIs such as
 /// `NSTimer`/`NSNotificationCenter`. The runtime owns the object for the process lifetime;
 /// callbacks themselves are still required to marshal UI work to the main thread.
-/// 跨 API 边界传递的常驻 Objective-C 回调 target。对象由运行时持有到进程结束，回调中的 UI 工作仍必须回到主线程。
 #[derive(Clone, Copy)]
 pub(crate) struct CallbackTarget(pub(crate) *mut AnyObject);
 unsafe impl Send for CallbackTarget {}
@@ -566,7 +475,6 @@ impl CallbackTarget {
 
 /// Ownership-bearing Core Foundation reference. The constructor is only for APIs documented to
 /// return a +1 object; `Drop` balances that retain exactly once.
-/// 带所有权语义的 Core Foundation 引用。构造函数仅用于文档明确返回 +1 的 API，Drop 恰好释放一次 retain。
 pub(crate) struct RetainedCf<T> {
     pub(crate) ptr: *const T,
     _marker: PhantomData<T>,
@@ -574,7 +482,6 @@ pub(crate) struct RetainedCf<T> {
 
 /// Marker implemented only for CF object categories whose APIs are documented as immutable and
 /// thread-safe in this project. Add a new implementation only after auditing that category.
-/// 仅为项目中已确认不可变且可跨线程使用的 CF 类型实现此 marker；新增类型前必须单独审计。
 pub(crate) trait ThreadSafeCf {}
 impl ThreadSafeCf for c_void {}
 
@@ -600,7 +507,6 @@ impl<T> Drop for RetainedCf<T> {
 
 /// Cross-thread handle for a CFRunLoop. Other threads may only signal/wake it; dereferencing
 /// and source management remain confined to the owning run-loop thread.
-/// CFRunLoop 的跨线程句柄。其他线程只能 signal/wake，解引用和 source 管理由所属线程完成。
 #[derive(Clone, Copy)]
 pub(crate) struct RunLoopHandle(pub(crate) *mut c_void);
 unsafe impl Send for RunLoopHandle {}
@@ -608,7 +514,6 @@ unsafe impl Sync for RunLoopHandle {}
 
 /// Cross-thread handle for a CFRunLoopSource. Other threads may signal it, while source
 /// installation/removal remains on the observer thread.
-/// CFRunLoopSource 的跨线程句柄。其他线程只能 signal，安装和移除仍由观察者线程完成。
 #[derive(Clone, Copy)]
 pub(crate) struct RunLoopSourceHandle(pub(crate) *mut c_void);
 unsafe impl Send for RunLoopSourceHandle {}
@@ -616,17 +521,12 @@ unsafe impl Sync for RunLoopSourceHandle {}
 
 /// Handle for an AXObserver retained by the observer run-loop thread. It is only moved through
 /// the observer registry; AX messages and release remain on that owning thread.
-/// 由观察者 run-loop 线程持有的 AXObserver 句柄。仅在观察者注册表中移动，AX 调用和释放仍在所属线程完成。
 #[derive(Clone, Copy)]
 pub(crate) struct AxObserverHandle(pub(crate) *mut c_void);
 unsafe impl Send for AxObserverHandle {}
 unsafe impl Sync for AxObserverHandle {}
 
-// ========== NSString / 对象生命周期 helper ==========
-
-/// 读取当前运行应用 bundle 的 Info.plist 字符串值(此前 updater 与 settings 各有一份)。
-/// Read a string value from the running app bundle's Info.plist (previously duplicated in
-/// updater and settings).
+/// Read a string value from the running app bundle's Info.plist.
 pub(crate) unsafe fn bundle_info_string(key: &str) -> String {
     let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
     let key_ns = make_nsstring(key);
@@ -635,7 +535,6 @@ pub(crate) unsafe fn bundle_info_string(key: &str) -> String {
     nsstring_to_rust(value)
 }
 
-/// 用 Rust &str 构造一个 NSString(CFStringCreateWithCString 返回 +1,调用方负责 release)。
 /// Build an NSString from a Rust &str (CFStringCreateWithCString returns +1; caller must release).
 pub(crate) fn make_nsstring(s: &str) -> *mut AnyObject {
     unsafe {
@@ -648,9 +547,6 @@ pub(crate) fn make_nsstring(s: &str) -> *mut AnyObject {
     }
 }
 
-/// 释放 alloc 出来的 +1 对象。objc2 的 msg_send! 是裸 MRC(无 ARC):
-/// alloc/init 返回 +1,必须手动 release;addSubview:/setImage:/addTrackingArea:
-/// 只是再加自己的 retain,不会抵消 alloc 的那 +1。交给父视图/子视图持有后即可 release。
 /// Release a +1 object obtained via alloc. objc2's msg_send! is raw MRC (no ARC):
 /// alloc/init return +1 and must be released; addSubview:/setImage:/addTrackingArea:
 /// only add their own retain and don't balance the alloc +1. Once the owning view
@@ -661,13 +557,11 @@ pub(crate) unsafe fn release_obj(obj: *mut AnyObject) {
     }
 }
 
-/// 当前进程是否拥有辅助功能(AX)权限。
 /// Whether the current process has Accessibility permission.
 pub(crate) fn has_accessibility_permission() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
-/// 把 NSString 转成 Rust String。
 /// Convert an NSString to a Rust String.
 pub(crate) unsafe fn nsstring_to_rust(ns: *mut AnyObject) -> String {
     if ns.is_null() {
@@ -682,10 +576,6 @@ pub(crate) unsafe fn nsstring_to_rust(ns: *mut AnyObject) -> String {
         .into_owned()
 }
 
-// ========== 应用名 / app names ==========
-
-/// 取 NSRunningApplication 的 localizedName(UTF-8 规范化,空 = 失败)。
-/// 窗口切换(图标缓存)与剪贴板(来源应用)共用,避免各自手写 UTF8String 转换。
 /// The NSRunningApplication's localizedName (canonical UTF-8; empty = failure). Shared by the
 /// window switcher (icon cache) and the clipboard (source app), so the UTF8String conversion
 /// isn't hand-rolled twice.
@@ -697,8 +587,6 @@ pub(crate) unsafe fn ns_running_app_name(app: *mut AnyObject) -> String {
     nsstring_to_rust(name)
 }
 
-/// 当前前台应用的 (名称, pid)。剪贴板记录来源时一次拿全:名称用于标题栏文字,
-/// pid 用于解析图标缓存身份(resolve_app_identity)并提取小图标。
 /// The frontmost app as (name, pid). The clipboard grabs both in one lookup at record time:
 /// the name feeds the header text, the pid resolves the icon-cache identity
 /// (resolve_app_identity) and extracts the small icon.
@@ -716,9 +604,6 @@ pub(crate) fn frontmost_app_info() -> (String, i32) {
     }
 }
 
-// ========== 颜色 / 图层 helper ==========
-
-/// hex u32 -> NSColor。
 /// hex u32 -> NSColor.
 pub(crate) fn hex_to_ns_color(hex: u32) -> *mut AnyObject {
     let r = ((hex >> 24) & 0xFF) as f64 / 255.0;
@@ -728,7 +613,6 @@ pub(crate) fn hex_to_ns_color(hex: u32) -> *mut AnyObject {
     unsafe { msg_send![class!(NSColor), colorWithRed: r, green: g, blue: b, alpha: a] }
 }
 
-/// NSColor* -> CGColorRef。用 raw objc_msgSend,因为 objc2 的 msg_send! 无法编码 CF/CG 类型。
 /// NSColor* -> CGColorRef. Uses raw objc_msgSend because objc2's msg_send! can't encode CF/CG types.
 pub(crate) unsafe fn ns_color_to_cg(ns: *mut AnyObject) -> *mut c_void {
     let sel = sel!(CGColor);
@@ -769,7 +653,6 @@ pub(crate) unsafe fn layer_set_border(layer: *mut AnyObject, cg: *mut c_void) {
 }
 
 /// Set CALayer.shadowColor using raw objc_msgSend (CGColorRef, not NSColor*).
-/// 使用裸 objc_msgSend 设置 CALayer.shadowColor（参数是 CGColorRef，不是 NSColor*）。
 pub(crate) unsafe fn layer_set_shadow_color(layer: *mut AnyObject, cg: *mut c_void) {
     let sel = sel!(setShadowColor:);
     extern "C" {
@@ -780,21 +663,12 @@ pub(crate) unsafe fn layer_set_shadow_color(layer: *mut AnyObject, cg: *mut c_vo
     f(layer as *mut c_void, sel, cg);
 }
 
-// ========== NSSavePanel(共享) / shared save panel ==========
-
-/// 弹出 NSSavePanel(runModal),返回选中的文件系统路径;取消返回 None。
-/// 由剪贴板「另存为」与设置「导出日志」共用。autoreleased 对象的生命周期注释
-/// 见原实现(被移入此处):URL/path 属性 getter 按 Cocoa 惯例返回 +0,挂在外层
-/// autorelease pool 上,不能手动 release。
-///
 /// Present an NSSavePanel (runModal) and return the chosen filesystem path; None on
 /// cancel. Shared by clipboard "save as" and settings "export logs". See the lifetime
 /// notes carried over from the original implementation: the URL/path property getters
 /// return +0 (autoreleased) per Cocoa convention and sit on the surrounding pool --
 /// never release them manually.
 pub(crate) unsafe fn run_save_panel(suggested_name: &str) -> Option<String> {
-    // 包一层池子统一回收本次调用产生的临时对象(runModal 嵌套事件循环里的
-    // autoreleased 对象由 AppKit 自己的池子管理,互不干扰)。
     // Wrap in a pool to reclaim temporaries; objects autoreleased inside runModal's
     // nested event loop are managed by AppKit's own pools and stay untouched.
     let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];

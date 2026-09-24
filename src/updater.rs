@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-// objc_msgSend / objc_msgSendSuper / dlopen 已统一到 ffi.rs 与 skylight.rs。
 // objc_msgSend / objc_msgSendSuper / dlopen now live in ffi.rs and skylight.rs.
 
 /// Sparkle keeps the updater and its user driver alive for the lifetime of the process. The
@@ -84,7 +83,6 @@ static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
     })
 });
 
-/// 最近一次内联「检查中」的开始时间;用于超时兜底,防止 Sparkle 无回调时按钮持续卡住。
 /// When the last inline "checking" phase began, for a timeout fallback so the button never gets
 /// stuck if Sparkle never calls back.
 static CHECK_TIMER: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
@@ -288,8 +286,6 @@ unsafe fn set_string_value(object: *mut AnyObject, value: &str) {
     crate::ffi::CFRelease(value_ns as *const c_void);
 }
 
-/// 读取当前 bundle Info.plist 的 SUFeedURL；缺失时返回空串。日志用它反映 Sparkle 实际使用的
-/// feed（而非常量,避免误导)——Sparkle 通过 host bundle 的这个键取 feed。
 /// Read the current bundle's SUFeedURL from Info.plist; empty when absent. The log uses this so it
 /// reflects the feed Sparkle actually reads from the host bundle instead of a misleading constant.
 unsafe fn bundle_feed_url() -> String {
@@ -303,9 +299,8 @@ unsafe fn bundle_feed_url() -> String {
     nsstring_to_string(value)
 }
 
-// bundle_info_string 已统一到 ffi.rs / bundle_info_string now lives in ffi.rs
+// bundle_info_string now lives in ffi.rs
 
-/// 记录 NSError 的关键字段,避免网络失败只能看到一个笼统的「Network Error」。
 /// Record the useful NSError fields so network failures are not reduced to a generic label.
 unsafe fn log_sparkle_error(context: &str, error: *mut c_void) {
     if error.is_null() {
@@ -338,7 +333,6 @@ unsafe fn log_sparkle_error(context: &str, error: *mut c_void) {
     );
 }
 
-/// 记录 Sparkle 请求所处的 bundle 与代理环境,但不记录代理地址或潜在凭据。
 /// Record the bundle and proxy environment used by Sparkle without logging proxy URLs or secrets.
 fn log_update_network_context() {
     let feed_url = unsafe { bundle_feed_url() };
@@ -367,32 +361,24 @@ unsafe fn app_display_name() -> String {
     "Oh My Tab".to_string()
 }
 
-/// 渲染目标:内联时用 About 页宿主视图,否则用独立窗口。
 /// Render target: the About page host view when inline, else a standalone window.
 #[derive(Clone, Copy)]
 struct RenderTarget {
-    /// 内联时指向宿主视图,否则为 null。
     /// Points at the host view when inline, null otherwise.
     host: *mut AnyObject,
-    /// 添加到子视图的父视图(宿主或窗口 contentView)。
     /// The parent view receiving subviews (host or window contentView).
     parent: *mut AnyObject,
-    /// 内联宿主宽度;独立窗口时为 0(用窗口原始坐标)。
     /// Inline host width; 0 for standalone windows (use the window's native coordinates).
     width: f64,
 }
 
-/// 决定当前渲染目标:有宿主则内联,否则回退独立窗口。内联时把宿主高度设为该屏幕所需高度,
-/// 保持顶边固定在按钮行下方,使顶向下翻转紧凑无空白。
 /// Decide the render target: inline when a host is registered, else fall back to a window. Inline
 /// sizes the host to the screen's required height, keeping its top fixed below the check button
 /// row so the top-down flip is compact without extra blank.
 unsafe fn render_target(window_h: f64) -> RenderTarget {
     let ui = UPDATE_UI_STATE.lock().unwrap();
     if ui.host_view != 0 {
-        // Host 坐标从 (0,0) 开始,宽度取宿主帧宽,便于内联排布。
         // Host coordinates start at (0,0); width is the host frame width, so inline layout fits.
-        // 有宿主(About 页内联)时展开卡片到该屏幕高度,并把宿主设为同高、顶边固定。
         // When hosted inline, expand the card to this screen's height and size the host to match,
         // keeping the host top fixed so the top-down flip is exact.
         crate::settings::expand_update_section(window_h);
@@ -411,7 +397,6 @@ unsafe fn render_target(window_h: f64) -> RenderTarget {
     }
 }
 
-/// 把独立窗口的一个 frame 内联映射到宿主宽度(按比例缩放 x 与宽)。
 /// Map a standalone-window frame onto the host width, scaling x and width proportionally.
 fn scale_frame(target: RenderTarget, window_w: f64, frame: NSRect) -> NSRect {
     if target.host.is_null() || window_w <= 0.0 {
@@ -424,8 +409,6 @@ fn scale_frame(target: RenderTarget, window_w: f64, frame: NSRect) -> NSRect {
     )
 }
 
-/// 把一个控件加入渲染目标;内联时按宿主宽度缩放坐标、把宿主高度设为该屏幕高度,并把窗口自底向
-/// 上的 y 翻转为宿主顶向下,使标题贴近宿主顶部、按钮贴近宿主底部,内容从按钮行正下方紧凑排布。
 /// Add a control to the render target; inline scales its frame to the host width, sizes the host to
 /// this screen's height, and flips the window's bottom-up y to the host's top-down so titles sit
 /// near the host top and buttons near the bottom, compactly starting below the check button row.
@@ -441,7 +424,6 @@ unsafe fn add_control(
         let scaled = scale_frame(target, window_w, frame);
         let host_frame: NSRect = msg_send![target.host, frame];
         let host_h = host_frame.size.height;
-        // 把窗口自底向上的 y 翻转为宿主顶向下:标题贴近顶部、按钮贴近底部,内容从按钮行下方排布。
         // Flip the window's bottom-up y to the host's top-down: titles near the top, buttons near
         // the bottom, content flowing below the check-button row.
         let flipped = NSRect::new(
@@ -456,7 +438,6 @@ unsafe fn add_control(
     let _: () = msg_send![parent, addSubview: control];
 }
 
-/// 清除宿主视图内的更新控件(不释放宿主本身,宿主归 About 页父视图所有)。
 /// Clear the update controls inside the host view (the host itself stays owned by the About page).
 unsafe fn clear_host_subviews(host: *mut AnyObject) {
     if host.is_null() {
@@ -483,13 +464,11 @@ unsafe fn close_custom_update_window() {
     stop_check_loading_indicator(check_button);
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
     if ui.host_view != 0 {
-        // 内联模式:清除宿主内控件,不改动设置窗口。
         // Inline mode: clear the host's controls, leave the settings window untouched.
         clear_host_subviews(ui.host_view as *mut AnyObject);
         ui.window = 0;
     } else if ui.window != 0 {
         let window = ui.window as *mut AnyObject;
-        // 关闭窗口前先解除父视图对控件的引用，再释放 alloc 所有权，避免 AppKit 过度释放。
         // Remove subviews before releasing their alloc ownership to avoid AppKit over-release.
         let content: *mut AnyObject = msg_send![window, contentView];
         if !content.is_null() {
@@ -520,7 +499,6 @@ unsafe fn close_custom_update_window() {
     ui.received_length = 0;
 }
 
-/// 设置 About 页的 update host 宿主视图与检查按钮(内联渲染入口)。
 /// Register the About page's host view and check-updates button so update steps render inline and
 /// the button can report its state (checking / up to date).
 pub(crate) fn set_update_host(
@@ -534,7 +512,6 @@ pub(crate) fn set_update_host(
     ui.check_button = check_button as usize;
 }
 
-/// 作废 update host 与检查按钮引用;在设置窗口销毁前调用,避免写已释放视图。
 /// Clear the update host and check-button references; called before the settings window is
 /// destroyed so the updater never writes to a deallocated view.
 pub(crate) fn clear_update_host() {
@@ -547,7 +524,6 @@ pub(crate) fn clear_update_host() {
     ui.check_loading_frame = 0;
 }
 
-/// 停止检查更新按钮上的 Braille 字符动画。
 /// Stop the Braille glyph animation on the check-updates button.
 unsafe fn stop_check_loading_indicator(button: *mut AnyObject) {
     if button.is_null() {
@@ -578,8 +554,6 @@ unsafe fn set_check_loading_frame(button: *mut AnyObject, frame: usize) {
     let _: () = msg_send![button, setTitle: title];
     crate::ffi::CFRelease(title as *const c_void);
 
-    // Braille 字符与中文会落到不同字体；复用按钮生成的富文本属性，仅把首字符换成稍大的
-    // 等宽字形并上移 1pt，校正视觉中心而不改变整组标题的水平居中。
     // Braille and CJK resolve to different fonts. Preserve the button-generated attributes, then
     // give only the first glyph a slightly larger monospaced font and a 1pt upward optical shift.
     let attributed: *mut AnyObject = msg_send![button, attributedTitle];
@@ -627,7 +601,6 @@ extern "C" fn advance_check_loading_frame(_this: *mut c_void, _cmd: Sel, _timer:
     unsafe { set_check_loading_frame(button, frame) };
 }
 
-/// 用于在主运行循环中轮换按钮 Braille 字符的 NSTimer target。
 /// NSTimer target used to cycle the button's Braille glyph on the main run loop.
 unsafe fn check_loading_timer_target() -> *mut AnyObject {
     CHECK_LOADING_TIMER_TARGET
@@ -656,7 +629,6 @@ unsafe fn check_loading_timer_target() -> *mut AnyObject {
         .0
 }
 
-/// 启动检查更新按钮上的 ASCII Braille 动画,字符与本地化状态文案一起居中。
 /// Start the ASCII Braille animation centered together with the localized status label.
 unsafe fn start_check_loading_indicator(button: *mut AnyObject) {
     if button.is_null() {
@@ -689,7 +661,6 @@ unsafe fn start_check_loading_indicator(button: *mut AnyObject) {
     UPDATE_UI_STATE.lock().unwrap().check_loading_timer = timer as usize;
 }
 
-/// 更新 About 页「检查更新」按钮的文案与可用态。
 /// Update the About page check-updates button title and enabled state.
 pub(crate) fn set_check_button_status(title: &str, enabled: bool) {
     let button = UPDATE_UI_STATE.lock().unwrap().check_button;
@@ -709,18 +680,15 @@ pub(crate) fn set_check_button_status(title: &str, enabled: bool) {
     }
 }
 
-/// 恢复 About 页检查按钮为默认「检查更新…」文案并可用。
 /// Restore the About check button to its default "Check for Updates…" title and enabled state.
 fn reset_check_button() {
     clear_inline_check();
     set_check_button_status(&t("settings.btn_check_for_updates"), true);
 }
 
-/// 进入内联「检查中」:把按钮切到该文案并禁用,记录开始时间并启动超时守卫线程。
 /// Enter the inline checking phase: set the button to that label and disable it, record the start
 /// time, and arm a timeout guard thread so the button cannot get stuck if Sparkle is silent.
 pub(crate) fn begin_inline_check() {
-    // 非内联(无 About 检查按钮)时无需计时兜底。
     // No inline check button means there is nothing to guard.
     if UPDATE_UI_STATE.lock().unwrap().check_button == 0 {
         return;
@@ -728,7 +696,6 @@ pub(crate) fn begin_inline_check() {
 
     // Arm the guard before touching AppKit so a stuck UI update cannot prevent the fallback from
     // ever being scheduled.
-    // 先启动守卫再操作 AppKit，避免 UI 更新卡住时连兜底线程都无法创建。
     *CHECK_TIMER.lock().unwrap() = Some(Instant::now());
     let timeout_target = unsafe { check_loading_timer_target() } as usize;
     std::thread::spawn(move || {
@@ -762,14 +729,12 @@ pub(crate) fn begin_inline_check() {
     set_check_button_status(&t("settings.update_checking"), false);
     let check_button = UPDATE_UI_STATE.lock().unwrap().check_button as *mut AnyObject;
     unsafe {
-        // 先结束上一条语句,确保取指针时的 MutexGuard 在进入动画函数前已经释放。
         // End the previous statement so the MutexGuard is released before entering the animator.
         start_check_loading_indicator(check_button)
     };
 }
 
 /// Recover the inline check on the main thread after Sparkle stays silent.
-/// Sparkle 长时间无回调时，在主线程恢复内联检查按钮。
 extern "C" fn handle_update_check_timeout(_this: *mut c_void, _cmd: Sel) {
     if CHECK_TIMER.lock().unwrap().is_none() {
         return;
@@ -778,7 +743,6 @@ extern "C" fn handle_update_check_timeout(_this: *mut c_void, _cmd: Sel) {
     set_check_button_status(&t("settings.btn_retry_update_check"), true);
 }
 
-/// 清除内联「检查中」计时,表示已得到结果(无论成功/失败/无更新)。
 /// Clear the inline checking timer to mark that a result has arrived.
 fn clear_inline_check() {
     *CHECK_TIMER.lock().unwrap() = None;
@@ -874,7 +838,6 @@ unsafe fn make_custom_update_window(driver: *mut c_void, cancellation: *mut c_vo
 
     let copied_cancellation = copy_block(cancellation) as usize;
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
-    // 内联时 window 为 null,ui.window 保持 0(宿主由 host_view 记录);聚焦/标题走 host_window。
     // Inline: window is null so ui.window stays 0 (the host is tracked via host_view); focus and
     // title use host_window.
     ui.window = window as usize;
@@ -986,7 +949,6 @@ unsafe fn make_custom_result_window(
     ui.acknowledgement = copied_acknowledgement;
 }
 
-/// 创建首次运行的更新权限窗口，避免 Sparkle 的标准权限界面带出应用图标。
 /// Build the first-run update permission window without Sparkle's standard icon-bearing UI.
 unsafe fn make_custom_permission_window(driver: *mut c_void, reply: *mut c_void) {
     close_custom_update_window();
@@ -1150,7 +1112,6 @@ extern "C" fn defer_automatic_update(_this: *mut c_void, _cmd: Sel, _sender: *mu
 }
 
 /// Build the custom update window's release-notes view from Sparkle's appcast item description.
-/// 从 Sparkle appcast item 的 description 构建自定义更新窗口的更新日志视图。
 unsafe fn make_release_notes_view(
     item: *mut AnyObject,
     width: f64,
@@ -1242,7 +1203,6 @@ unsafe fn make_release_notes_view(
     let _: () = msg_send![text_view, setVerticallyResizable: true];
     // NSTextView receives rich text through its text storage; it has no setAttributedString:
     // selector of its own.
-    // NSTextView 的富文本必须设置到 textStorage；NSTextView 本身没有 setAttributedString: 消息。
     let text_storage: *mut AnyObject = msg_send![text_view, textStorage];
     let _: () = msg_send![text_storage, setAttributedString: attributed];
     release_obj(attributed);
@@ -1286,13 +1246,10 @@ struct ReleaseNotesHeadingRange {
 }
 
 /// Render the block-level Markdown used by release notes with explicit line breaks and styles.
-/// 将更新日志使用的块级 Markdown 渲染为带真实换行和标题范围的文本。
 ///
 /// Foundation's Markdown initializer stores headings and lists as presentation-intent
 /// attributes. A plain NSTextView does not consistently lay those attributes out, so the
 /// release-note subset is normalized here before it enters TextKit.
-/// Foundation 的 Markdown 初始化器会把标题和列表保存为 presentation-intent 属性；普通
-/// NSTextView 不一定能正确布局这些属性，因此在交给 TextKit 前显式整理更新日志子集。
 fn render_release_notes_markdown(source: &str) -> ReleaseNotesDocument {
     let mut text = String::new();
     let mut heading_ranges = Vec::new();
@@ -1346,7 +1303,6 @@ fn markdown_list_item(line: &str) -> (&str, bool) {
 }
 
 /// Select one locale section from a combined release-notes Markdown document.
-/// 从合并的多语言 Markdown 更新日志中选择一个 locale 区块。
 ///
 /// Sections use HTML comments so the complete document can be embedded in Sparkle's single
 /// `<description>` element without adding visible marker text to the rendered Markdown:
@@ -1384,7 +1340,6 @@ fn select_release_notes_locale(source: &str, locale: &str) -> String {
     }
 
     // A legacy single-language document remains valid and is displayed as-is.
-    // 兼容旧的单语言文档，未检测到区块标记时原样显示。
     if sections.is_empty() {
         return source.to_string();
     }
@@ -1401,7 +1356,6 @@ fn select_release_notes_locale(source: &str, locale: &str) -> String {
         .unwrap_or_default()
 }
 
-/// 创建自定义更新提示，完全绕过 Sparkle 默认会显示应用图标的弹窗。
 /// Build the update-available prompt without using Sparkle's standard alert.
 unsafe fn make_custom_update_found_window(
     driver: *mut c_void,
@@ -1476,7 +1430,6 @@ unsafe fn make_custom_update_found_window(
 
     // Measure all actions through the shared settings button helper. The three buttons stay the
     // same height, so a long localized action cannot make only one control look misaligned.
-    // 三个操作按钮统一复用设置页的换行测量逻辑，并取最高值，避免长本地化文案只撑高其中一个按钮。
     let skip_title = match prompt_kind {
         UpdatePromptKind::Installing => t("settings.btn_cancel_update_installation"),
         UpdatePromptKind::InformationOnly => t("settings.btn_remind_later"),
@@ -1585,7 +1538,7 @@ unsafe fn make_custom_update_found_window(
     let _: () = msg_send![title, setDrawsBackground: false];
     let _: () = msg_send![title, setEditable: false];
     let _: () = msg_send![title, setSelectable: false];
-    let _: () = msg_send![title, setAlignment: 1isize]; // 居中 / centered
+    let _: () = msg_send![title, setAlignment: 1isize]; // centered
     let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 22.0f64];
     let _: () = msg_send![title, setFont: title_font];
     add_control(
@@ -1608,7 +1561,7 @@ unsafe fn make_custom_update_found_window(
     let _: () = msg_send![message, setDrawsBackground: false];
     let _: () = msg_send![message, setEditable: false];
     let _: () = msg_send![message, setSelectable: false];
-    let _: () = msg_send![message, setAlignment: 1isize]; // 居中 / centered
+    let _: () = msg_send![message, setAlignment: 1isize]; // centered
     let message_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 16.0f64];
     let _: () = msg_send![message, setFont: message_font];
     let _: () = msg_send![message, setLineBreakMode: 0u64];
@@ -1717,7 +1670,6 @@ unsafe fn update_download_progress_ui() {
     }
 }
 
-/// 创建下载/解压进度窗口，不使用 Sparkle 标准窗口，因此不会显示应用图标。
 /// Build the download/extraction window without Sparkle's standard icon-bearing window.
 unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_void) {
     close_custom_update_window();
@@ -1881,7 +1833,6 @@ unsafe fn clear_download_cancellation() {
 
 unsafe fn set_custom_window_title(text: &str) {
     let ui = UPDATE_UI_STATE.lock().unwrap();
-    // 内联时宿主无窗口标题,直接跳过。
     // Inline mode has no window title bar, so this is a no-op.
     if ui.window != 0 {
         let title_ns = make_nsstring(text);
@@ -1890,7 +1841,6 @@ unsafe fn set_custom_window_title(text: &str) {
     }
 }
 
-/// 创建准备安装的选择窗口，保留 Sparkle 的三个选择语义但不使用标准 UI。
 /// Build the ready-to-install choice window while preserving Sparkle's three choices.
 unsafe fn make_custom_choice_window(
     driver: *mut c_void,
@@ -1899,7 +1849,6 @@ unsafe fn make_custom_choice_window(
     message_text: &str,
 ) {
     close_custom_update_window();
-    // 与下载阶段共用 560pt 设计宽度,让内联缩放后的内容宽度保持稳定。
     // Use the same 560pt design width as the download phase so inline content keeps a stable width.
     let window_w = 560.0;
     let layout_scale = {
@@ -1928,7 +1877,6 @@ unsafe fn make_custom_choice_window(
     let title_y = message_y + message_h + 10.0;
     // Keep a small top inset after the title instead of reserving the old empty check-button
     // area above the ready-to-install content.
-    // 标题上方只保留少量内边距，不再为旧的检查按钮区域预留空白。
     let window_h = title_y + title_h + 8.0;
     let target = render_target(window_h);
     let (content, window) = if target.host.is_null() {
@@ -1994,7 +1942,6 @@ unsafe fn make_custom_choice_window(
         content,
     );
 
-    // 更新已下载完成,此时只保留安装操作;按钮加长并居中。
     // The update is already downloaded, so keep only the centered, wider install action.
     let install = button;
     let install_frame = NSRect::new(NSPoint::new(130.0, button_y), NSSize::new(300.0, button_h));
@@ -2022,10 +1969,8 @@ unsafe fn choose_custom_update(choice: isize) {
         reply
     };
     // An explicit choice acknowledges the update marker even while the About page remains open.
-    // 用户明确选择后即视为已处理更新提示，即使 About 页面仍保持打开也清除红点。
     crate::settings::set_update_available(false);
     close_custom_update_window();
-    // skip(0) / dismiss(2) 会结束更新流程,收起 About 页;install(1) 继续下载,保持展开。
     // skip(0)/dismiss(2) end the flow and collapse the About page; install(1) continues downloading.
     if choice != 1 {
         crate::settings::collapse_update_section();
@@ -2155,8 +2100,6 @@ extern "C" fn show_installing_update(
     retry_terminating_application: *mut c_void,
 ) {
     unsafe {
-        // 安装从此刻开始:记下当前版本作为"待通知"标记,新实例启动时据此发系统通知
-        // (showUpdateInstalledAndRelaunched 在自动安装流程里不可达,见 update_notice.rs)。
         // Installation starts: record the current version as the pending marker; the new
         // instance announces via update_notice at startup (the Sparkle
         // showUpdateInstalledAndRelaunched callback is unreachable for automatic installs).
@@ -2204,8 +2147,6 @@ extern "C" fn show_update_installed(
     unsafe {
         log_debug!("[update-notice] driver callback showUpdateInstalledAndRelaunched fired (relaunched={})", _relaunched);
         crate::settings::set_update_available(false);
-        // Sparkle 在「安装完成并重启」后的新实例里回调本方法;除应用内结果窗口外,
-        // 再发一条系统通知,让菜单栏应用在后台完成更新后也能被用户感知。
         // Sparkle calls this on the freshly relaunched instance after an install; besides
         // the in-app result window, post a system notification so a menu-bar app that
         // updated in the background is still visible to the user.
@@ -2234,7 +2175,6 @@ extern "C" fn show_update_release_notes_failed(_this: *mut c_void, _cmd: Sel, _e
 extern "C" fn show_update_in_focus(_this: *mut c_void, _cmd: Sel) {
     unsafe {
         let ui = UPDATE_UI_STATE.lock().unwrap();
-        // 内联时聚焦宿主所属的设置窗口,否则聚焦更新弹窗。
         // Inline mode focuses the host's settings window; otherwise the update popup.
         let window = if ui.host_view != 0 {
             ui.host_window
@@ -2275,7 +2215,6 @@ extern "C" fn show_user_initiated_update_check(
     unsafe {
         log_debug!("Sparkle update check started");
         log_update_network_context();
-        // 内联(About 页)时只把按钮切到「检查中…」并禁用,不弹窗、不加其他信息。
         // When inline, just switch the button to "Checking…" and disable it; no popup or extras.
         if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
             begin_inline_check();
@@ -2318,13 +2257,10 @@ extern "C" fn show_update_found(
     unsafe {
         let information_only: bool = msg_send![item as *mut AnyObject, isInformationOnlyUpdate];
         let stage: isize = msg_send![state as *mut AnyObject, stage];
-        // 后台定时检查发现新版本:不打扰式弹窗,改发系统通知,选择 Later(下次检查再提醒);
-        // 用户点击通知会跳转设置 About 页,发起一次用户级检查并在那里更新。
         // A scheduled background check that finds an update must not pop a window: post a
         // system notification instead and reply Later (reminded at the next check). Clicking
         // the banner opens Settings > About and starts a user-initiated check there.
         let user_initiated: bool = msg_send![state as *mut AnyObject, userInitiated];
-        // 仅供查看的信息更新没有可安装包，不显示为可安装更新红点。
         // Informational updates have no installable payload; keep them out of the actionable badge.
         crate::settings::set_update_available(!information_only);
         let auto_download = crate::config::CONFIG
@@ -2338,10 +2274,9 @@ extern "C" fn show_update_found(
                 msg_send![item as *mut AnyObject, displayVersionString];
             let display_version = nsstring_to_string(display_version);
             crate::update_notice::post_update_available(&app, &display_version);
-            invoke_choice_reply(reply as usize, 2); // Later / 稍后提醒
+            invoke_choice_reply(reply as usize, 2); // Later / remind me later
             return;
         }
-        // 内联(About 页)发现可用更新:结束「检查中」并恢复按钮默认,后续更新控件仍渲染在 About 页。
         // Inline found an update: end the checking phase and restore the button default; the
         // update controls remain rendered in the About page.
         if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
@@ -2361,12 +2296,10 @@ extern "C" fn show_update_not_found(
     unsafe {
         log_sparkle_error("showUpdateNotFoundWithError", _error);
         crate::settings::set_update_available(false);
-        // 内联(About 页)时把按钮切到「已是最新版本」并恢复可用,不弹窗。
         // When inline, switch the button to "You're up to date" and re-enable it; no popup.
         if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
             clear_inline_check();
             set_check_button_status(&t("settings.btn_up_to_date"), true);
-            // 内联结果已经展示完毕,必须确认 Sparkle 的 session,否则后续检查会被忽略。
             // Acknowledge the inline result so Sparkle can finish its session and accept later checks.
             invoke_block(acknowledgement as usize);
             crate::settings::collapse_update_section();
@@ -2389,12 +2322,10 @@ extern "C" fn show_updater_error(
 ) {
     unsafe {
         log_sparkle_error("showUpdaterError", _error);
-        // 内联(About 页)时把按钮切到「重试检查」并可用,不弹窗。
         // When inline, offer a retry on the button and re-enable it; no popup is shown.
         if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
             clear_inline_check();
             set_check_button_status(&t("settings.btn_retry_update_check"), true);
-            // 内联错误已经展示完毕,必须确认 Sparkle 的 session,否则后续检查会被忽略。
             // Acknowledge the inline error so Sparkle can finish its session and accept retries.
             invoke_block(acknowledgement as usize);
             crate::settings::collapse_update_section();
@@ -2622,16 +2553,12 @@ unsafe fn custom_driver_class() -> *mut AnyObject {
 /// a raw `cargo run` or a dev bundle built before the framework was copied), not that the app
 /// itself failed to start.
 pub(crate) fn initialize(automatically_check: bool) -> bool {
-    // 上次会话若完成了安装,这里发"已更新到 X"的系统通知。
     // If the previous session completed an update install, announce it here.
     crate::update_notice::check_pending();
-    // 测试钩子:`--test-update-notice`(可带 `=available`)启动即发一条"已更新"通知,
-    // 便于在没有真实 Sparkle 更新的环境里验证通知链路(授权/横幅/i18n 文案)。
     // Test hook: `--test-update-notice` (optionally `=available`) posts the update notification
     // at startup so the pipeline (authorization/banner/i18n copy) can be verified without a real
     // Sparkle update.
     if let Some(mode) = crate::dev_flags::value("test-update-notice")
-        // 裸开关等价于 `=1`,与历史环境变量语义一致;`=0` 视为关闭。
         // A bare switch means `=1` (the historical environment semantics); `=0` disables it.
         .map(|mode| {
             if mode.is_empty() {
@@ -2644,7 +2571,6 @@ pub(crate) fn initialize(automatically_check: bool) -> bool {
     {
         let app = unsafe { app_display_name() };
         let version = unsafe { bundle_info_string("CFBundleShortVersionString") };
-        // =available:验证「发现新版本」通知(点击横幅会打开更新窗口);其余值:验证安装完成通知。
         // =available exercises the update-AVAILABLE notice (clicking it opens the update
         // window); any other value exercises the update-INSTALLED notice.
         if mode == "available" {
@@ -2733,7 +2659,6 @@ pub(crate) fn initialize(automatically_check: bool) -> bool {
             sel!(setAutomaticallyChecksForUpdates:),
             automatically_check,
         );
-        // 应用「自动下载并安装更新」设置。
         // Apply the "automatically download and install" preference.
         let automatically_download = crate::config::CONFIG
             .read()
@@ -2755,7 +2680,6 @@ pub(crate) fn initialize(automatically_check: bool) -> bool {
         _framework_handle: framework_handle,
         updater,
     });
-    // Sparkle 实际通过 host bundle 的 SUFeedURL 取 feed；日志读取它,避免打印误导性的常量。
     // Sparkle reads the feed from the host bundle's SUFeedURL; log that actual value instead of a
     // misleading constant.
     let feed_url = unsafe { bundle_feed_url() };
@@ -2800,7 +2724,6 @@ pub(crate) fn set_automatic_downloads(enabled: bool) {
 }
 
 /// Ask Sparkle to check for updates; the custom user driver presents the update UI.
-/// 请求 Sparkle 检查更新，由自定义 user driver 负责显示更新界面。
 pub(crate) fn check_for_updates() -> bool {
     // Be defensive for smoke tests or an unusual launch path that invokes the About action
     // before the normal startup sequence has reached updater initialization.
@@ -2823,8 +2746,6 @@ pub(crate) fn check_for_updates() -> bool {
     };
     // Do not invoke Sparkle synchronously from the button action. A feed/network stall must not
     // keep the AppKit event handler on the stack; Sparkle still receives the call on main.
-    // 不要在按钮 action 中同步调用 Sparkle；feed/网络卡住时不能阻塞 AppKit 事件处理器，
-    // 但仍保证 Sparkle 在主线程收到调用。
     log_debug!("Sparkle checkForUpdates selector scheduled");
     unsafe {
         let _: () = msg_send![

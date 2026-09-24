@@ -1,7 +1,3 @@
-//! 窗口切换专用的事件监听:CGEventTap 拦截 Cmd/Opt+Tab 全局快捷键。
-//! 通用 CGEventTap 基础设施(类型/FFI/启动流程)已抽至 `event_tap.rs`,本模块只保留
-//! 键盘快捷键的匹配逻辑与 GlobalEvent 枚举。
-//!
 //! Window-switcher-specific event monitoring: CGEventTap intercepts the Cmd/Opt+Tab global shortcut.
 //! Common CGEventTap infrastructure (types/FFI/start helper) has been extracted to `event_tap.rs`;
 //! this module keeps only the keyboard-shortcut matching logic and the GlobalEvent enum.
@@ -18,21 +14,18 @@ pub enum GlobalEvent {
     CmdShiftTabPressed,
     CmdReleased,
     ClipboardToggled,
-    // 窗口控制:Option+方向键(方向经有界输入聚合器传到主线程)。
     // Window control: Option+arrow (the direction crosses to the main thread via the bounded
     // input aggregator).
     WindowControl(crate::window_management::Direction),
-    // 显示器移动:Option+Shift+四方向键(方向经有界输入聚合器传到主线程)。
     // Display move: Option+Shift+arrow keys (the direction crosses to the main thread via the
     // bounded input aggregator).
     WindowDisplayMove(crate::window_management::Direction),
-    // 快捷操作:Option+I/E/D/L(动作编号经有界输入聚合器传到主线程)。
     // Quick actions: Option+I/E/D/L (the action id crosses to the main thread via the bounded
     // input aggregator).
     QuickAction(u8),
 }
 
-// 窗口切换所需的键盘常量别名 / keyboard constants used by the window switcher
+// keyboard constants used by the window switcher
 use crate::event_tap::keyboard::{
     EVENT_FLAGS_CHANGED as K_CG_EVENT_FLAGS_CHANGED, EVENT_KEY_DOWN as K_CG_EVENT_KEY_DOWN,
     FIELD_AUTOREPEAT as K_CG_KEYBOARD_EVENT_AUTOREPEAT,
@@ -49,19 +42,16 @@ fn switcher_tab_event(flags: crate::event_tap::CGEventFlags) -> GlobalEvent {
     }
 }
 
-/// 只忽略系统对同一次 Tab 按住产生的重复事件;独立的实体按键仍可连续导航。
 /// Ignore only the system-generated repeat for one held Tab; separate physical presses still navigate continuously.
 fn should_ignore_tab_autorepeat(autorepeat: i64) -> bool {
     autorepeat != 0
 }
 
-// 标记是否已经发送过 CmdTabPressed，防止修饰键变化时误发 CmdReleased
 // Tracks whether CmdTabPressed was sent, to avoid spurious CmdReleased
 static TAB_PRESSED: AtomicBool = AtomicBool::new(false);
 static TAP_CONTROL: event_tap::TapThreadControl = event_tap::TapThreadControl::new();
 static TAP_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
-// 当前快捷键模式：true = Command+Tab, false = Option+Tab
 // Shortcut mode: true = Command+Tab, false = Option+Tab
 pub static SHORTCUT_IS_CMD: AtomicBool = AtomicBool::new(false);
 
@@ -85,10 +75,6 @@ unsafe extern "C" fn event_tap_callback(
                     as u16;
             let flags = crate::event_tap::CGEventGetFlags(event);
 
-            // 隐私:debug 日志不记录用户的按键内容——除 Tab / Command / Option 外的
-            // 按键一律只打 "Other"(不记键码、不记修饰位),密码、正文等输入不会泄漏
-            // 到日志文件。其余行仍承担原诊断职责:有 keyDown 行 = tap 存活;有召唤行
-            // 但没反应 = 下游(bridge/主线程)问题。
             // Privacy: debug logs never record the user's keystrokes -- any key other than
             // Tab / Command / Option is logged as plain "Other" (no keycode, no flags), so
             // passwords and typed text never leak into the log. The remaining lines keep the
@@ -102,8 +88,6 @@ unsafe extern "C" fn event_tap_callback(
                     K_CG_EVENT_FLAG_MASK_ALTERNATE
                 };
                 if (flags & mod_mask) != 0 {
-                    // 窗口切换总开关:关闭时透传给系统(原生 Cmd+Tab 接管),不吞、不发。
-                    // 与 Option+V 的 passthrough 同哲学:功能关闭 = 把组合键还给系统/其他应用。
                     // Master switch: when off, pass the event through (the native Cmd+Tab
                     // takes over) -- no swallow, no event. Same philosophy as the Option+V
                     // passthrough: a disabled feature returns the combo to the system.
@@ -120,12 +104,10 @@ unsafe extern "C" fn event_tap_callback(
                         K_CG_KEYBOARD_EVENT_AUTOREPEAT,
                     );
                     if should_ignore_tab_autorepeat(autorepeat) {
-                        // 重复事件必须吞掉而不是透传,否则系统原生 Cmd+Tab 会与本应用同时响应。
                         // Repeat events must be swallowed rather than passed through, or the system's native Cmd+Tab responds alongside us.
                         log_debug!("[kbd] summon autorepeat ignored");
                         return std::ptr::null_mut();
                     }
-                    // 召唤组合:只打组合名(不敏感),不打键码/修饰位细节。
                     // The summon combo: log only the combo name (not sensitive), never raw keycode/flags.
                     let combo = if is_cmd { "Tab+Command" } else { "Tab+Option" };
                     log_debug!("[kbd] summon keyDown {}", combo);
@@ -134,15 +116,10 @@ unsafe extern "C" fn event_tap_callback(
                     return std::ptr::null_mut();
                 }
             } else if keycode == K_VK_V && (flags & K_CG_EVENT_FLAG_MASK_ALTERNATE) != 0 {
-                // 历史剪贴板呼出:Option+V(始终走 Option 修饰,不随快捷键模式切换)。
-                // 吞掉事件,与 Win+V 行为一致。只打组合名(隐私约定)。
                 // History-clipboard summon: Option+V (always Option, independent of the
                 // shortcut mode). The event is swallowed, mirroring Win+V. Only the combo
                 // name is logged (privacy convention).
                 //
-                // 必须精确匹配:flags 是当前所有按下的修饰键的位掩码,只要"含 Option"
-                // 就把 Cmd+Option+V(粘贴并匹配样式)等组合误认为呼出并吞掉,系统
-                // 快捷键随之失效。带上其他修饰键的组合一律透传。
                 // Precise match is required: flags is the bitmask of ALL currently held
                 // modifiers, so a bare "contains Option" check would swallow combos like
                 // Cmd+Option+V (paste-and-match-style) and break the system shortcut.
@@ -152,11 +129,9 @@ unsafe extern "C" fn event_tap_callback(
                         | K_CG_EVENT_FLAG_MASK_SHIFT
                         | K_CG_EVENT_FLAG_MASK_CONTROL);
                 if other_mods != 0 {
-                    // 带其他修饰键(如 Cmd+Option+V):透传,让系统/应用处理。
                     // Combos with extra modifiers (e.g. Cmd+Option+V) pass through.
                     log_debug!("[kbd] Option+V passthrough (extra modifiers)");
                 } else if !crate::config::CONFIG.read().unwrap().clipboard.enabled {
-                    // 功能关闭时不拦截:其他应用可能需要 Option+V 组合键,必须透传。
                     // When the feature is disabled, do NOT swallow Option+V -- other apps may
                     // need the combo, so it passes through untouched.
                     log_debug!("[kbd] Option+V passthrough (clipboard disabled)");
@@ -176,8 +151,6 @@ unsafe extern "C" fn event_tap_callback(
                 K_CG_EVENT_FLAG_MASK_ALTERNATE
             };
             if (flags & mod_mask) == 0 && TAB_PRESSED.swap(false, Ordering::SeqCst) {
-                // 只记录修饰键类别,不记录普通按键。事件通过 session tap 后的稳定状态由
-                // on_cmd_release_diagnostic 延迟采样;这里立即读系统 flags 会得到变化前的旧值。
                 // Record only the modifier category, never ordinary keys. The stable state after
                 // the event clears the session tap is sampled later by on_cmd_release_diagnostic;
                 // reading system flags here would observe the pre-change value.
@@ -200,7 +173,6 @@ unsafe extern "C" fn event_tap_callback(
     event
 }
 
-/// flagsChanged 只会携带修饰键;使用类别名而不是裸键码,既便于诊断也不扩大按键日志范围。
 /// flagsChanged carries modifier keys only; category names make diagnostics useful without
 /// widening keystroke logging to raw key codes.
 fn modifier_key_name(keycode: u16) -> &'static str {
@@ -230,10 +202,6 @@ pub fn start() {
         let _ = finished.join();
     }
 
-    // 窗口切换 tap 建在 session 层:既能看到真实硬件事件,也能看到鼠标映射软件在 session 层
-    // 合成的 Cmd+Tab(HID 层 tap 看不到 session 层注入的合成事件,会导致侧键映射的 Cmd+Tab 漏过)。
-    // options 传 DEFAULT_TAP:需要能吞掉 Cmd+Tab 事件(返回 null),所以必须可改。
-    //
     // The switcher tap sits at the session level: sees real hardware events AND session-synthesized
     // Cmd+Tab from mouse-remapper software (a HID-level tap can't see session-posted synthetic events,
     // so a side-button-mapped Cmd+Tab would slip past). options = DEFAULT_TAP: must be able to swallow
@@ -248,7 +216,6 @@ pub fn start() {
         "kbd",
         &TAP_CONTROL,
         || {
-            // 快捷键可能被菜单/设置切换,按当前 SHORTCUT_IS_CMD 打印实际监听的组合键。
             // The shortcut can be toggled via menu/settings; print the actual combo from SHORTCUT_IS_CMD.
             let shortcut = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
                 "Command+Tab"

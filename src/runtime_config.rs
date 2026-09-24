@@ -1,9 +1,7 @@
-//! 配置变更的统一运行时应用入口。
 //! Central runtime application for configuration changes.
 
 use crate::config::Config;
 
-/// 配置变更来源,用于区分启动时的首次应用与运行中的增量变更。
 /// Configuration change source, distinguishing initial startup from runtime deltas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigChangeSource {
@@ -64,7 +62,6 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
     }
 }
 
-/// 将一份新配置的运行时副作用一次性应用完毕。
 /// Apply all runtime side effects for a new configuration in one pass.
 pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChangeSource) {
     let flags = change_flags(old, new, source);
@@ -74,14 +71,12 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     }
 
     if flags.visual || flags.locale {
-        // UI 刷新必须在主线程调用;所有入口(设置、菜单、Reload、启动)都在主线程。
         // UI refresh must run on the main thread; every caller (settings, menu, reload, startup)
         // enters from the main thread.
         crate::ui_coordinator::apply_theme_and_locale_refresh();
     }
 
     if flags.settings_appearance || flags.locale {
-        // 字号变化只影响切换器预览;重建设置页会让拖动中的其他控件跳动。
         // Font-size changes only affect the switcher preview; rebuilding Settings makes other
         // controls jump while a slider is being dragged.
         crate::settings::refresh_system_appearance();
@@ -124,14 +119,12 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     }
 
     if flags.show_app_name_in_cards {
-        // 卡片标题格式变了:收起当前浮窗,下次召唤按新签名重建卡片(旧卡片复用会保留旧标题)。
         // The caption format changed: dismiss the overlay so the next summon rebuilds the
         // cards from the new signature (reusing them would keep the old captions).
         crate::overlay::reset_switcher();
     }
 
     if flags.modifier || flags.thumbnails || flags.focused_thumbnail_prewarm {
-        // 菜单或设置页修改后,原位同步已打开的设置窗口,不激活应用也不重建窗口。
         // Keep an already-open settings window in sync in place, without activating the app or
         // rebuilding the window.
         crate::settings::refresh_switcher_controls_from_config();
@@ -180,7 +173,6 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     }
 
     // Keep the status-bar service toggles current for changes made in Settings or by reload.
-    // 保证设置页或重新加载配置后，状态栏中的功能大类开关立即同步。
     crate::menu::refresh_service_menu();
 }
 

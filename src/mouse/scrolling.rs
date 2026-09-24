@@ -1,9 +1,3 @@
-//! 滚轮滚动模式:默认(透传+可反转)/按行(固定行数)。
-//!
-//! 方向语义:HID 层 event tap 看到的事件已包含系统"自然滚动"的翻转(自然滚动在 HID 事件
-//! 生成时已应用),合成事件 post 到 session 层后不会再被系统翻转。因此方向处理只需按
-//! 用户反转开关取反即可(见 should_flip),与 LinearMouse 一致——不读自然滚动设置。
-//!
 //! Scroll modes: Default (passthrough + optional reverse) / Line (fixed line count).
 //!
 //! Direction semantics: events seen by the HID-level tap already include the system's natural-scroll
@@ -11,13 +5,6 @@
 //! are not flipped again by the system. Direction handling therefore only needs the user's reverse
 //! toggle (see should_flip), matching LinearMouse -- no natural-scroll setting is read.
 
-// ========== 方向处理 / direction handling ==========
-
-/// 是否应对滚动 delta 取反:直接取用户反转开关。
-/// HID tap 看到的事件已含系统自然滚动翻转,合成事件不再被翻转,所以:
-/// - 反转关 -> 不取反(透传系统方向,含自然滚动)
-/// - 反转开 -> 取反(相对系统的反转)
-///
 /// Whether to flip the scroll delta: directly the user's reverse toggle.
 /// HID-tap events already carry the system natural-scroll flip and synthetic events aren't flipped
 /// again, so:
@@ -26,8 +13,6 @@
 pub(crate) fn should_flip(user_reverse: bool) -> bool {
     user_reverse
 }
-
-// ========== 滚动模式 / Scroll mode ==========
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ScrollMode {
@@ -53,7 +38,6 @@ impl ScrollMode {
 
     #[allow(dead_code)]
     pub(crate) fn current() -> Self {
-        // 兼容旧路径(无设备上下文):用"所有鼠标"解析。
         // Legacy path (no device context): resolve with the "All Mice" profile.
         let r = crate::mouse::resolve::resolve(None);
         r.scroll_mode
@@ -65,9 +49,6 @@ impl ScrollMode {
     }
 }
 
-/// 根据解析后的配置计算要 post 的滚动 delta。
-/// 处理反转 + 行模式的行数归一化。结果形参供 post_scroll_event 使用。
-///
 /// Compute the scroll delta to post from the resolved config.
 /// Handles reversal + line-mode normalization.
 pub(crate) fn compute_delta(
@@ -103,9 +84,9 @@ mod tests {
 
     #[test]
     fn flip_equals_user_reverse() {
-        // 反转关 -> 不取反(透传系统方向,含自然滚动)。
+        // Flip off -> pass the system direction through (including natural scrolling).
         assert!(!should_flip(false));
-        // 反转开 -> 取反(相对系统的反转)。
+        // Flip on -> invert relative to the system.
         assert!(should_flip(true));
     }
 
@@ -123,7 +104,6 @@ mod tests {
 
     #[test]
     fn default_mode_passes_delta_through() {
-        // 透传模式:原样返回(方向由 reverse 决定)。
         // Passthrough mode: delta returned verbatim (direction handled by reverse).
         let r = resolved(ScrollMode::Default, false, 3);
         assert_eq!(compute_delta(10, -5, &r), (10, -5));
@@ -138,7 +118,6 @@ mod tests {
 
     #[test]
     fn line_mode_normalizes_by_sign() {
-        // 行模式:任何幅度都归一化为 ±line_count,0 保持 0。
         // Line mode: any magnitude normalizes to ±line_count; zero stays zero.
         let r = resolved(ScrollMode::Line, false, 3);
         assert_eq!(compute_delta(1000, -1, &r), (3, -3));
@@ -147,7 +126,6 @@ mod tests {
 
     #[test]
     fn line_mode_line_count_is_clamped() {
-        // 行数被 clamp 到 1..=10(配置层已校验,这里兜底)。
         // Line count clamps to 1..=10 (validated at the config layer; belt-and-braces here).
         let r = resolved(ScrollMode::Line, false, 0);
         assert_eq!(compute_delta(5, 0, &r), (1, 0));
@@ -163,7 +141,6 @@ mod tests {
 
     #[test]
     fn scroll_mode_from_str_falls_back_to_default() {
-        // 未知字符串回退 Default(配置校验后不应出现)。
         // Unknown strings fall back to Default (shouldn't happen after config validation).
         assert_eq!(ScrollMode::from_str("line"), ScrollMode::Line);
         assert_eq!(ScrollMode::from_str("default"), ScrollMode::Default);

@@ -2,10 +2,6 @@
 //!
 //! A panic cannot unwind through an `extern "C"` callback. These small helpers keep the
 //! boundary explicit and provide conservative fallbacks for each callback return shape.
-//!
-//! C/Objective-C runtime 调用 Rust callback 时的 panic 边界。
-//!
-//! panic 不能穿过 `extern "C"` 回调展开；这些 helper 统一限制边界，并为不同返回值提供保守回退。
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
