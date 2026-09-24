@@ -252,18 +252,43 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
         }
         let document_h = (*THUMB_DOCUMENT_HEIGHT.lock().unwrap()).max(1.0);
         let max_rows = (*THUMB_MAX_ROWS.lock().unwrap()).max(1);
+        let content_inset = *THUMB_CONTENT_INSET.lock().unwrap();
+        let max_panel_h = *THUMB_PANEL_MAX_H.lock().unwrap();
+        let teaser_fits = *THUMB_TEASER_FITS.lock().unwrap();
         let (placements, final_row_ranges, final_panel_w, final_overflowed) =
             plan_thumb_close_reflow(
-                &widths, card_h, max_inner, gap, document_h, overflowed, max_rows,
+                &widths,
+                card_h,
+                max_inner,
+                gap,
+                document_h,
+                content_inset,
+                overflowed,
+                max_rows,
             );
-        let final_panel_h = thumb_panel_height_for_rows(
+        // 面板高度必须走与正常布局同一个函数:否则关掉一个窗口时面板会突然变高(用户实测 901 > 875)。
+        // The panel height must come from the same function the normal layout uses, or closing a card
+        // makes the panel jump taller (measured 901 > 875).
+        // 面板高度只在 `thumb_close_panel_metrics` 里算,它复用正常布局的 `thumb_panel_metrics`;
+        // 这里自己拼公式会重演"关窗口时面板变高"(用户实测 901 > 875)。
+        // The panel height is only computed in `thumb_close_panel_metrics`, which reuses the normal
+        // layout's `thumb_panel_metrics`; building the formula here again is what re-introduced the
+        // "panel grows while closing" bug (measured 901 > 875).
+        let (final_panel_h, final_content_inset) = thumb_close_panel_metrics(
             final_row_ranges.len(),
-            max_rows,
+            final_overflowed,
             card_h,
             gap,
-            final_overflowed,
+            teaser_fits,
+            max_rows,
+            max_panel_h,
         );
-        let content_h = thumb_document_height_for_rows(final_row_ranges.len(), card_h, gap);
+        let content_h = thumb_document_height_for_rows(
+            final_row_ranges.len(),
+            card_h,
+            gap,
+            final_content_inset,
+        );
         let final_viewport_h = (final_panel_h - status_h()).max(1.0);
         let final_document_h = content_h.max(final_viewport_h).max(1.0);
         let old_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();

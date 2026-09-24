@@ -1038,6 +1038,20 @@ pub(crate) fn show_overlay() {
         *THUMB_VISIBLE_RANGE.lock().unwrap() = Some(layout.visible.clone());
         *THUMB_ROW_RANGES.lock().unwrap() = Some(layout.row_ranges.clone());
         *THUMB_MAX_ROWS.lock().unwrap() = layout.max_rows.max(1);
+        // 关闭重排要用同一套内边距/预算/teaser 判定,否则关窗口时面板会变高(用户实测)。
+        // The post-close reflow reuses the same inset/budget/teaser verdict, or closing a card makes
+        // the panel taller (measured).
+        *THUMB_CONTENT_INSET.lock().unwrap() = layout.content_inset;
+        *THUMB_PANEL_MAX_H.lock().unwrap() = max_panel_h;
+        *THUMB_TEASER_FITS.lock().unwrap() = crate::theme::thumb_teaser_fits(
+            layout.card_h,
+            max_panel_h,
+            if use_flow {
+                THUMB_ROW_GAP
+            } else {
+                ICON_CARD_GAP
+            },
+        );
         *THUMB_SCROLL_ROW.lock().unwrap() = layout.row_start;
         *THUMB_SCROLL_OFFSET.lock().unwrap() = scroll_offset.clamp(0.0, layout.max_scroll_offset);
         *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = layout.max_scroll_offset;
@@ -1087,10 +1101,11 @@ pub(crate) fn show_overlay() {
         // Include the panel frame in the same log line: placement is user-visible, so A2 can assert
         // the top/bottom and left/right gaps stay symmetric.
         log_debug!(
-            "[overlay] layout mode={} scale={:.2} card_h={:.0} panel={:.0}x{:.0} at={:.0},{:.0} visible={}..{} of {} offset={:.1} row={} rows={} visible_rows={} overflow={}",
+            "[overlay] layout mode={} scale={:.2} card_h={:.0} inset={:.0} panel={:.0}x{:.0} at={:.0},{:.0} visible={}..{} of {} offset={:.1} row={} rows={} visible_rows={} overflow={}",
             if use_flow { "thumbnail" } else { "icon" },
             layout.scale,
             layout.card_h,
+            layout.content_inset,
             layout.panel_w,
             layout.panel_h,
             x,

@@ -177,6 +177,20 @@ static THUMB_ROW_RANGES: Mutex<Option<Vec<Range<usize>>>> = Mutex::new(None);
 /// 当前面板一次能显示的最大行数。
 /// Maximum number of rows visible in the current panel.
 static THUMB_MAX_ROWS: Mutex<usize> = Mutex::new(1);
+/// 当前布局的卡片顶部内边距(含"撑到预算"多出来的部分):关闭重排必须用同一个值,
+/// 否则卡片会跳位。 / The current layout's content inset (including the fill padding); the
+/// post-close reflow must reuse it or the cards jump.
+static THUMB_CONTENT_INSET: Mutex<f64> = Mutex::new(0.0);
+/// 当前布局的高度预算:关闭重排用它重算面板高(同一套"由卡片决定 + 不超上限"规则)。
+/// 默认无穷表示"还没有布局",避免关闭重排把面板夹成 0。
+/// The current layout's height budget; the post-close reflow reuses it so both paths follow the same
+/// "decided by the cards, capped by the budget" rule. The infinite default means "no layout yet", so
+/// the reflow cannot clamp the panel down to zero.
+static THUMB_PANEL_MAX_H: Mutex<f64> = Mutex::new(f64::INFINITY);
+/// 当前布局下 teaser 是否能不牺牲一整行地放进预算(关闭重排沿用同一判定)。
+/// Whether the teaser fits the budget without costing a whole row in the current layout; the
+/// post-close reflow reuses the same verdict.
+static THUMB_TEASER_FITS: Mutex<bool> = Mutex::new(false);
 /// 当前滚动视口的首行,0 表示从 MRU 列表顶部开始。
 /// First row of the scrolling viewport; zero starts at the top of the MRU list.
 static THUMB_SCROLL_ROW: Mutex<usize> = Mutex::new(0);
