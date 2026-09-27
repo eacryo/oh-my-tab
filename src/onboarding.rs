@@ -398,6 +398,104 @@ unsafe fn add_label(
     release_obj(field);
 }
 
+unsafe fn add_menu_icon_label(
+    content: *mut AnyObject,
+    text: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    style: LabelStyle,
+) {
+    let Some((before_icon, after_icon)) = text.split_once("{icon}") else {
+        add_label(content, text, x, y, w, h, style);
+        return;
+    };
+
+    let png_bytes: &[u8] = include_bytes!("../assets/statusbar-icon.png");
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: png_bytes.as_ptr() as *const c_void,
+        length: png_bytes.len()
+    ];
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject = msg_send![image, initWithData: data];
+    if image.is_null() {
+        let fallback = text.replace("{icon}", &t("onboarding.app_fallback_name"));
+        add_label(content, &fallback, x, y, w, h, style);
+        return;
+    }
+
+    let is_template = true;
+    let _: () = msg_send![image, setTemplate: is_template];
+    let attachment: *mut AnyObject = msg_send![class!(NSTextAttachment), alloc];
+    let attachment: *mut AnyObject = msg_send![attachment, init];
+    let _: () = msg_send![attachment, setImage: image];
+    let _: () = msg_send![
+        attachment,
+        setBounds: NSRect::new(NSPoint::new(0.0, -2.0), NSSize::new(17.0, 14.0))
+    ];
+    let icon_text: *mut AnyObject = msg_send![
+        class!(NSAttributedString),
+        attributedStringWithAttachment: attachment
+    ];
+    release_obj(attachment);
+    release_obj(image);
+
+    let attributed: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+    let empty = make_nsstring("");
+    let attributed: *mut AnyObject = msg_send![attributed, initWithString: empty];
+    release_obj(empty);
+
+    for part in [before_icon, " "] {
+        if !part.is_empty() {
+            let value = make_nsstring(part);
+            let attributed_part: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+            let attributed_part: *mut AnyObject = msg_send![attributed_part, initWithString: value];
+            release_obj(value);
+            let _: () = msg_send![attributed, appendAttributedString: attributed_part];
+            release_obj(attributed_part);
+        }
+    }
+    let _: () = msg_send![attributed, appendAttributedString: icon_text];
+    if !after_icon.is_empty() {
+        let value = make_nsstring(after_icon);
+        let attributed_part: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+        let attributed_part: *mut AnyObject = msg_send![attributed_part, initWithString: value];
+        release_obj(value);
+        let _: () = msg_send![attributed, appendAttributedString: attributed_part];
+        release_obj(attributed_part);
+    }
+
+    let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let field: *mut AnyObject = msg_send![
+        field,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    ];
+    let _: () = msg_send![field, setAttributedStringValue: attributed];
+    release_obj(attributed);
+    let _: () = msg_send![field, setBezeled: false];
+    let _: () = msg_send![field, setDrawsBackground: false];
+    let _: () = msg_send![field, setEditable: false];
+    let _: () = msg_send![field, setSelectable: false];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: style.size, weight: style.weight];
+    let _: () = msg_send![field, setFont: font];
+    let _: () = msg_send![field, setTextColor: hex_to_ns_color(style.color)];
+    if style.wrap {
+        let cell: *mut AnyObject = msg_send![field, cell];
+        let _: () = msg_send![cell, setWraps: true];
+        let _: () = msg_send![cell, setUsesSingleLineMode: false];
+        let _: () = msg_send![field, setUsesSingleLineMode: false];
+        let _: () = msg_send![field, setLineBreakMode: 0isize];
+    } else {
+        let _: () = msg_send![field, setUsesSingleLineMode: true];
+        let _: () = msg_send![field, setLineBreakMode: 4isize];
+    }
+    let _: () = msg_send![content, addSubview: field];
+    release_obj(field);
+}
+
 unsafe fn add_button(
     content: *mut AnyObject,
     title: &str,
@@ -685,7 +783,7 @@ unsafe fn render_more_features(content: *mut AnyObject) {
         TITLE_H,
         TITLE_STYLE,
     );
-    add_label(
+    add_menu_icon_label(
         content,
         &t("onboarding.more_body"),
         PAD,
