@@ -1,6 +1,7 @@
 //! Clipboard subsystem · picker: the history overlay (window, rows, keyboard navigation).
 
 use super::*;
+use crate::overlay::reset_close_button_hover;
 
 /// The picker's offset from the cursor (16pt to the bottom-right; flips to the left/top
 /// when there isn't room).
@@ -632,8 +633,11 @@ pub(super) fn hide_picker() {
     set_clear_history_confirmation_expanded(false);
     *SCROLL_DRAG.lock().unwrap() = None;
     // Hiding does not reliably deliver mouseExited to every child button; clear the row hover
-    // state explicitly.
+    // state explicitly (the persistent corner × would otherwise come back red).
     *HOVER_ROW.lock().unwrap() = NO_SELECTION;
+    if let Some(button) = *PICKER_CLOSE_BUTTON.lock().unwrap() {
+        unsafe { reset_close_button_hover(button.0) };
+    }
     hide_detail();
 
     // Take the pointer under the lock but orderOut outside it: orderOut synchronously fires

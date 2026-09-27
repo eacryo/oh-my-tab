@@ -320,8 +320,8 @@ use cards::*;
 use card_close::*;
 pub(crate) use card_close::{
     begin_close_window_at, card_close_in_progress, card_mouse_down, card_mouse_entered,
-    on_card_close_ax_result, on_card_close_finished, on_close_card, on_cmd_release_diagnostic,
-    on_cmd_released,
+    make_close_button, on_card_close_ax_result, on_card_close_finished, on_close_card,
+    on_cmd_release_diagnostic, on_cmd_released, reset_close_button_hover,
 };
 use hover::*;
 pub(crate) use hover::{container_mouse_moved, on_deferred_scroll_hover};

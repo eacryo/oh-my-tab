@@ -721,8 +721,54 @@ pub(super) fn commit_selected_window(overlay_was_visible: bool) {
     crate::performance::end_switcher_activity();
 }
 
+/// Restores a persistent close button's base palette (a window hidden while the pointer was over it
+/// never receives `mouseExited:`).
+pub(crate) unsafe fn reset_close_button_hover(button: *mut AnyObject) {
+    set_close_button_hover_style(button, false);
+}
+
+/// Builds the shared "×" close button (the switcher card's palette and hover feedback) so any
+/// surface can reuse it: title, font, rounded layer, base tint, and the tracking area that drives
+/// `mouseEntered:`/`mouseExited:`. Callers own the returned +1 reference, set their own
+/// target/action, and must release it after adding it to a superview.
+pub(crate) unsafe fn make_close_button(
+    frame: NSRect,
+    font_size: f64,
+    radius: f64,
+) -> *mut AnyObject {
+    let button: *mut AnyObject = msg_send![close_button_class(), alloc];
+    let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
+    let _: () = msg_send![button, setBordered: false];
+    let title_ns = make_nsstring("×");
+    let _: () = msg_send![button, setTitle: title_ns];
+    CFRelease(title_ns as *const c_void);
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: font_size, weight: 0.0f64];
+    let _: () = msg_send![button, setFont: font];
+    let _: () = msg_send![button, setAlignment: 1isize]; // NSTextAlignmentCenter on arm64
+    let _: () = msg_send![button, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    let _: () = msg_send![layer, setCornerRadius: radius];
+    let _: () = msg_send![layer, setMasksToBounds: true];
+    set_close_button_hover_style(button, false);
+    // The red hover feedback only applies while the pointer is over the ×, so the button needs
+    // its own tracking area (the surface below it must not trigger it).
+    let opts: u64 = 0x01 | 0x80; // NSTrackingMouseEnteredAndExited | ActiveAlways
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
+        options: opts,
+        owner: button,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![button, addTrackingArea: tracking];
+    release_obj(tracking);
+    button
+}
+
 /// Apply the close button's base or hover tint and background.
-pub(super) unsafe fn set_close_button_hover_style(button: *mut AnyObject, hovered: bool) {
+unsafe fn set_close_button_hover_style(button: *mut AnyObject, hovered: bool) {
     let tint = if hovered {
         // HTML .close:hover: rgba(195, 40, 35, .86)
         hex_to_ns_color(0xC32823DB)

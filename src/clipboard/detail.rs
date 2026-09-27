@@ -779,16 +779,12 @@ pub(super) unsafe fn ensure_picker_window() {
         cls
     };
     // The search field (the mockup's .search): 48pt tall, radius 10, a 4.5% black fill
-    // with a 1px inner ring; the placeholder is left-aligned.
-    let search_w = PICKER_W - SEARCH_PAD_X * 2.0;
+    // with a 1px inner ring; the placeholder is left-aligned. The corner close button shares the
+    // row, so the shared geometry gives the field the remaining width.
+    let (search_frame, close_frame) = picker_header_frames();
+    let search_w = search_frame.size.width;
     let search: *mut AnyObject = msg_send![search_cls, alloc];
-    let search: *mut AnyObject = msg_send![
-        search,
-        initWithFrame: NSRect::new(
-            NSPoint::new(SEARCH_PAD_X, TOP_PAD_Y),
-            NSSize::new(search_w, SEARCH_H)
-        )
-    ];
+    let search: *mut AnyObject = msg_send![search, initWithFrame: search_frame];
     // A custom cell: the placeholder = "magnifier SF Symbol + search hint" drawn at the
     // field's left (see search_cell_class), with the ⌘F keycap at the far right.
     let cell: *mut AnyObject = msg_send![search_cell_class(), alloc];
@@ -899,6 +895,18 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![header_strip, addSubview: clear_button];
     release_obj(clear_button);
     *SEARCH_CLEAR_BUTTON.lock().unwrap() = Some(ObjPtr::new(clear_button));
+    // The header's corner close button: the switcher overlay's × (same class, palette and hover
+    // feedback) as a persistent second way out beside the outside-click / Esc dismissal.
+    let close_button =
+        crate::overlay::make_close_button(close_frame, PICKER_CLOSE_BTN_FONT, PICKER_CLOSE_BTN_R);
+    let _: () = msg_send![close_button, setTarget: observer()];
+    let _: () = msg_send![close_button, setAction: sel!(pickerClose:)];
+    let close_label = make_nsstring(&t("clipboard.close"));
+    let _: () = msg_send![close_button, setAccessibilityLabel: close_label];
+    CFRelease(close_label as *const c_void);
+    let _: () = msg_send![header_strip, addSubview: close_button];
+    release_obj(close_button);
+    *PICKER_CLOSE_BUTTON.lock().unwrap() = Some(ObjPtr::new(close_button));
     release_obj(search);
     *SEARCH_FIELD.lock().unwrap() = Some(ObjPtr::new(search));
     // Text changes (including the system clear button / NSSearchField's Esc clear) filter live.

@@ -4,6 +4,7 @@
 
 [clipboard]
 clear_all = "Clear history"
+close = "Close"
 clear_confirm_unpinned = "Clear unpinned"
 clear_confirm_all = "Clear all"
 toast_undo_delete = "Deletion undone"
@@ -374,6 +375,7 @@ display_thumbnails = "Icons and thumbnails"
 screen_permission_needed = "Screen Recording permission is not granted; thumbnails are unavailable."
 clipboard_title = "Enable clipboard history"
 clipboard_body = "When enabled, clipboard history is recorded. Press Option+V to open the clipboard history overlay anytime."
+clipboard_body_enabled = "Clipboard history is on. Try pressing Option+V to open the history overlay."
 clipboard_label = "Enable clipboard history"
 more_title = "There's more to explore"
 more_body = "Configure clipboard history, mouse and window controls, and quick actions in Settings. To reopen it later, click {icon} in the menu bar and choose Settings at the top."

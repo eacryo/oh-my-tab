@@ -612,37 +612,11 @@ pub(crate) fn create_card_view(
                 12.0f64,
             )
         };
-        let btn: *mut AnyObject = msg_send![close_button_class(), alloc];
-        let btn: *mut AnyObject = msg_send![btn, initWithFrame: btn_frame];
-        let _: () = msg_send![btn, setBordered: false];
-        let title_ns = make_nsstring("×");
-        let _: () = msg_send![btn, setTitle: title_ns];
-        CFRelease(title_ns as *const c_void);
-        let close_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: btn_font_sz, weight: 0.0f64];
-        let _: () = msg_send![btn, setFont: close_font];
-        let _: () = msg_send![btn, setAlignment: 1isize]; // NSTextAlignmentCenter on arm64
-                                                          // The HTML .close base state uses a transparent background and translucent black text.
-        let _: () = msg_send![btn, setWantsLayer: true];
-        let bl: *mut AnyObject = msg_send![btn, layer];
-        let _: () = msg_send![bl, setCornerRadius: btn_radius];
-        let _: () = msg_send![bl, setMasksToBounds: true];
-        set_close_button_hover_style(btn, false);
+        let btn = make_close_button(btn_frame, btn_font_sz, btn_radius);
         let _: () = msg_send![btn, setTag: CLOSE_BTN_TAG];
         let _: () = msg_send![btn, setTarget: crate::CONTROLLER.lock().unwrap().unwrap().0];
         let _: () = msg_send![btn, setAction: sel!(closeCard:)];
         let _: () = msg_send![btn, setHidden: true];
-
-        // Add a tracking area to the button itself so the red hover style only applies while
-        // the pointer is over the × button.
-        let opts: u64 = 0x01 | 0x80; // NSTrackingMouseEnteredAndExited | ActiveAlways
-        let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        let ta: *mut AnyObject = msg_send![ta, initWithRect: NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(20.0, 20.0)
-        ), options: opts, owner: btn, userInfo: std::ptr::null::<AnyObject>()];
-        let _: () = msg_send![btn, addTrackingArea: ta];
-        release_obj(ta);
 
         let _: () = msg_send![view, addSubview: btn];
         release_obj(btn); // view owns the button; drop our alloc +1

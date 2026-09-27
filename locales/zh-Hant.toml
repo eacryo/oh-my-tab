@@ -5,6 +5,7 @@
 
 [clipboard]
 clear_all = "清空歷史"
+close = "關閉"
 clear_confirm_unpinned = "清除未置頂"
 clear_confirm_all = "全部清除"
 toast_undo_delete = "已撤銷刪除"
@@ -375,6 +376,7 @@ display_thumbnails = "顯示圖示和縮圖"
 screen_permission_needed = "尚未授予螢幕錄製權限，暫時無法顯示縮圖。"
 clipboard_title = "啟用剪貼簿歷史"
 clipboard_body = "啟用後會記錄剪貼簿歷史。按下 Option+V 即可隨時打開剪貼簿歷史浮層。"
+clipboard_body_enabled = "剪貼簿歷史已開啟。試著按下 Option+V 打開剪貼簿歷史浮層。"
 clipboard_label = "啟用剪貼簿歷史"
 more_title = "還有更多功能"
 more_body = "剪貼簿歷史、滑鼠和視窗控制及快捷操作都可在設定中配置。之後點擊選單列中的 {icon}，再選最上方的「設定」即可開啟。"

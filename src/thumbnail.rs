@@ -37,7 +37,8 @@
 //!
 //! Without the Screen Recording TCC permission the whole module sleeps and the
 //! overlay keeps rendering icons only; granting permission mid-run resumes
-//! automatically (the worker re-preflights before every capture).
+//! automatically (the worker re-preflights before every capture) and re-runs the
+//! startup prewarm batch, which the first pass had to skip while unauthorized.
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
@@ -68,7 +69,7 @@ use blank_frame::*;
 use cache::*;
 use capture::*;
 // The parent no longer calls summon directly (overlay does); the glob is test-only.
-pub(crate) use pregen::{app_launched, app_terminated, start};
+pub(crate) use pregen::{app_launched, app_terminated, backfill_after_permission_grant, start};
 #[cfg(test)]
 use summon::*;
 // Entry points exposed to the rest of the crate (implemented in the child modules).
@@ -122,17 +123,56 @@ static CGS_CAPTURE_LIST: LazyLock<Option<CgsCaptureListFn>> = LazyLock::new(|| u
 const BITMAP_PREMULTIPLIED_LAST: u32 = 1;
 
 static PERMISSION_PROMPTED: AtomicBool = AtomicBool::new(false);
-static LAST_CAPTURE_PERMISSION: AtomicU8 = AtomicU8::new(0);
+/// Never checked / denied / granted: the denied -> granted transition mid-run needs the startup
+/// prewarm re-run, the other transitions need nothing.
+const PERMISSION_UNKNOWN: u8 = 0;
+const PERMISSION_DENIED: u8 = 1;
+const PERMISSION_ALLOWED: u8 = 2;
+static LAST_CAPTURE_PERMISSION: AtomicU8 = AtomicU8::new(PERMISSION_UNKNOWN);
+
+/// Whether an observation is a real denied -> granted flip. Permission already granted on the first
+/// observation is not a flip (the startup batch runs with it in place), and a revocation has
+/// nothing to warm.
+fn is_permission_grant_transition(previous: u8, allowed: bool) -> bool {
+    allowed && previous == PERMISSION_DENIED
+}
 
 fn report_capture_permission(allowed: bool) {
-    let state = if allowed { 2 } else { 1 };
-    if LAST_CAPTURE_PERMISSION.swap(state, Ordering::Relaxed) == state {
+    let state = if allowed {
+        PERMISSION_ALLOWED
+    } else {
+        PERMISSION_DENIED
+    };
+    let previous = LAST_CAPTURE_PERMISSION.swap(state, Ordering::Relaxed);
+    if previous == state {
         return;
     }
     if allowed {
         log_info!("[thumb] Screen Recording permission available; thumbnail capture enabled");
+        if is_permission_grant_transition(previous, allowed) {
+            schedule_permission_backfill();
+        }
     } else {
         log_info!("[thumb] Screen Recording permission unavailable; using icon-only presentation");
+    }
+}
+
+/// Ask the main thread to re-run the startup prewarm batch: granting Screen Recording mid-run used
+/// to leave the cache empty until each frame was requested at summon time. `capture_allowed()` is
+/// called from the capture worker, the observer thread and main-thread ticks alike, and the batch
+/// reads TAB_STATE's MRU snapshot, so it must run on the main thread. Always deferred, so it never
+/// runs inside the capture preflight that observed the flip.
+fn schedule_permission_backfill() {
+    let Some(controller) = crate::CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![
+            controller,
+            performSelectorOnMainThread: sel!(thumbnailPermissionGranted:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
     }
 }
 
@@ -322,6 +362,18 @@ mod tests {
 
     static FOCUSED_PREWARM_LIFECYCLE_TEST_LOCK: LazyLock<Mutex<()>> =
         LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn only_a_denied_to_granted_flip_triggers_the_backfill() {
+        // Granting after a denial is the case the startup batch could not cover.
+        assert!(is_permission_grant_transition(PERMISSION_DENIED, true));
+        // First observation already granted: the startup batch runs with it in place.
+        assert!(!is_permission_grant_transition(PERMISSION_UNKNOWN, true));
+        // Repeated observations and a revocation warm nothing.
+        assert!(!is_permission_grant_transition(PERMISSION_ALLOWED, true));
+        assert!(!is_permission_grant_transition(PERMISSION_ALLOWED, false));
+        assert!(!is_permission_grant_transition(PERMISSION_DENIED, false));
+    }
 
     #[test]
     fn focused_prewarm_failures_back_off_and_converge() {

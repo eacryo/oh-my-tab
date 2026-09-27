@@ -82,29 +82,7 @@ pub(crate) fn start() {
     }
     // start() is called from the main-thread runtime configuration path. Capture the initial
     // window keys here, before spawning the observer thread, so the worker never reads TAB_STATE.
-    let startup_jobs = crate::with_tab_state(|state_opt| match state_opt.as_ref() {
-        Some(state) => {
-            let capture_state = CAPTURE_STATE.lock().unwrap();
-            state
-                .windows
-                .iter()
-                .filter(|window| {
-                    !window.minimized
-                        && window.window_id != 0
-                        && window.bounds.2 > 0.0
-                        && window.bounds.3 > 0.0
-                })
-                .map(|window| {
-                    (
-                        window.pid,
-                        window.window_id,
-                        capture_state.pid_generation(window.pid),
-                    )
-                })
-                .collect::<Vec<_>>()
-        }
-        None => Vec::new(),
-    });
+    let startup_jobs = current_prewarm_jobs();
     // Lifecycle commands are low-volume but still bounded; the runloop source drains them
     // promptly, and this capacity absorbs startup bursts without unbounded retention.
     let (tx, rx) = flume::bounded::<ObsCmd>(64);
@@ -155,7 +133,7 @@ pub(crate) fn start() {
                 pids.len(),
                 capture_allowed()
             );
-            pregen_startup_windows(startup_jobs);
+            pregen_startup_windows(startup_jobs, "startup");
             if !STOP_REQUESTED.load(Ordering::SeqCst) {
                 CFRunLoopRun();
             }
@@ -332,12 +310,51 @@ unsafe fn install_observer_for_pid(pid: i32) {
         .insert(pid, (AxObserverHandle(obs), RunLoopSourceHandle(src)));
 }
 
-/// Startup prewarming reuses AppState's already AX-paired MRU snapshot instead of
-/// repeating one AX query per PID. It takes only the first STARTUP_PREWARM_MAX
-/// non-minimized windows with usable bounds.
-unsafe fn pregen_startup_windows(startup_jobs: Vec<(i32, u32, u64)>) {
+/// The prewarm candidates: AppState's already AX-paired MRU snapshot instead of one AX query per
+/// PID. Main thread only -- TAB_STATE's snapshot is owned there.
+fn current_prewarm_jobs() -> Vec<(i32, u32, u64)> {
+    crate::with_tab_state(|state_opt| match state_opt.as_ref() {
+        Some(state) => {
+            let capture_state = CAPTURE_STATE.lock().unwrap();
+            state
+                .windows
+                .iter()
+                .filter(|window| {
+                    !window.minimized
+                        && window.window_id != 0
+                        && window.bounds.2 > 0.0
+                        && window.bounds.3 > 0.0
+                })
+                .map(|window| {
+                    (
+                        window.pid,
+                        window.window_id,
+                        capture_state.pid_generation(window.pid),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+        None => Vec::new(),
+    })
+}
+
+/// Main thread: Screen Recording flipped from denied to granted mid-run, so re-run the batch the
+/// startup path had to skip (it gives up for the whole process once it finds no permission). Same
+/// MRU order, bound and target as the startup batch; the observer thread only handles new windows
+/// and never this backlog.
+pub(crate) fn backfill_after_permission_grant() {
+    let jobs = current_prewarm_jobs();
+    unsafe {
+        pregen_startup_windows(jobs, "permission-grant");
+    }
+}
+
+/// Pre-generate a prewarm batch. The batch is bounded and the source is only used for logging:
+/// "startup" from the observer thread's first pass, "permission-grant" from the denied -> granted
+/// backfill.
+unsafe fn pregen_startup_windows(startup_jobs: Vec<(i32, u32, u64)>, source: &str) {
     if !crate::theme::thumbnails_enabled() || !capture_allowed() {
-        log_debug!("[thumb] startup prewarm skipped (disabled or unauthorized)");
+        log_debug!("[thumb] prewarm skipped (source={source}: disabled or unauthorized)");
         return;
     }
     let eligible = startup_jobs.len();
@@ -356,7 +373,7 @@ unsafe fn pregen_startup_windows(startup_jobs: Vec<(i32, u32, u64)>) {
         ));
     }
     log_debug!(
-        "[thumb] startup prewarm: eligible={} bounded={} queued={}",
+        "[thumb] prewarm (source={source}): eligible={} bounded={} queued={}",
         eligible,
         jobs.len(),
         queued

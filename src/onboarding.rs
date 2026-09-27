@@ -5,10 +5,11 @@
 //! status item (and an alert when Accessibility is missing) and never explains what the app does,
 //! which key to press, or which permission it needs.
 //!
-//! Design: never blocking (permissions can be deferred and selections apply on Next); four fixed
-//! steps; auto-shown once (the UserDefaults marker is written as soon as it appears, and the
-//! status item's "Welcome" entry or a development switch reopens it -- a missing permission stays
-//! covered by the startup alert);
+//! Design: never blocking (permissions can be deferred, the display-mode and clipboard-history
+//! choices take effect the moment they are picked because the switcher and the Option+V hotkey read
+//! the live config, and launch at login applies on Next); four fixed steps; auto-shown once (the
+//! UserDefaults marker is written as soon as it appears, and the status item's "Welcome" entry or a
+//! development switch reopens it -- a missing permission stays covered by the startup alert);
 //! and verifiable (`--force-onboarding` ignores the marker,
 //! `--onboarding=reset` clears it first, and `--fake-permissions=ax:0,sr:1` -- debug
 //! builds only -- fakes the DISPLAYED permission state so every branch can be walked without
@@ -23,6 +24,7 @@ use crate::config::{schedule_config_persist, Config, CONFIG};
 use crate::ffi::{hex_to_ns_color, make_nsstring, release_obj, MainThreadSlot, ObjPtr};
 use crate::i18n::{t, tf};
 use crate::log_debug;
+use crate::log_info;
 
 /// Written once the guide has been auto-shown (a UserDefaults cross-launch marker like the
 /// update-notice ones: "already seen the guide" is UI lifecycle, not a setting the user tunes).
@@ -748,7 +750,11 @@ unsafe fn render_clipboard_history(content: *mut AnyObject, enabled: bool) {
     );
     add_label(
         content,
-        &t("onboarding.clipboard_body"),
+        &t(if enabled {
+            "onboarding.clipboard_body_enabled"
+        } else {
+            "onboarding.clipboard_body"
+        }),
         PAD,
         144.0,
         WINDOW_W - PAD * 2.0,
@@ -1031,16 +1037,14 @@ pub(crate) fn handle_action(tag: isize) {
             render_current_step();
         }
         ACTION_TOGGLE_CLIPBOARD_DRAFT => {
-            if let Some(state) = STATE.lock().unwrap().as_mut() {
+            apply_choice_now(Step::ClipboardHistory, |state| {
                 state.clipboard_enabled = !state.clipboard_enabled;
-            }
-            render_current_step();
+            });
         }
         ACTION_SELECT_ICONS | ACTION_SELECT_THUMBNAILS => {
-            if let Some(state) = STATE.lock().unwrap().as_mut() {
+            apply_choice_now(Step::DisplayMode, |state| {
                 state.thumbnails_enabled = tag == ACTION_SELECT_THUMBNAILS;
-            }
-            render_current_step();
+            });
         }
         ACTION_OPEN_SETTINGS => {
             mark_completed();
@@ -1093,6 +1097,22 @@ fn retreat() {
     }
     state.index -= 1;
     drop(slot);
+    render_current_step();
+}
+
+/// Applies a guide choice immediately instead of waiting for Next: the switcher (display mode) and
+/// the Option+V hotkey (clipboard history) both read the live `CONFIG`, so a deferred draft would
+/// make the step's own instructions do nothing. The draft is updated first so the re-render keeps
+/// the selection; `commit_step_selection` no-ops when the value already matches.
+fn apply_choice_now(step: Step, update: impl FnOnce(&mut UiState)) {
+    {
+        let mut slot = STATE.lock().unwrap();
+        let Some(state) = slot.as_mut() else {
+            return;
+        };
+        update(state);
+    }
+    commit_step_selection(step);
     render_current_step();
 }
 
@@ -1158,6 +1178,88 @@ fn stop_tick_timer() {
     if let Some(timer) = TIMER.lock().unwrap().take() {
         let _: () = unsafe { msg_send![timer.0, invalidate] };
     }
+}
+
+/// Dispatches the first control carrying the given action tag through the production selector
+/// exactly as a click does: look the control up by its tag instead of keeping a second pointer.
+unsafe fn dispatch_action_with_tag(tag: isize) -> Option<*mut AnyObject> {
+    ACTION_TAGS
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(_, candidate)| *candidate == tag)
+        .map(|(pointer, _)| *pointer as *mut AnyObject)
+}
+
+/// Drives the display-mode segmented control: select the segment, then send the action.
+unsafe fn dispatch_display_mode_segment(segment: isize) -> bool {
+    let Some(control) = dispatch_action_with_tag(ACTION_DISPLAY_MODE) else {
+        return false;
+    };
+    let _: () = msg_send![control, setSelectedSegment: segment];
+    on_action(std::ptr::null_mut(), sel!(handleOnboardingAction:), control);
+    true
+}
+
+/// GUI smoke runner (`--smoke-onboarding-live-apply`): show the guide, drive the real display-mode
+/// segment and clipboard switch, and require both choices to reach the live config without a Next
+/// click. Runs as a subprocess on the real AppKit main thread (see the ignored test below).
+pub(crate) fn live_apply_smoke_runner() -> bool {
+    let before_thumbnails = CONFIG.read().unwrap().layout.thumbnails_enabled;
+    show_internal(PermissionOverride::default());
+    // Step 1 -> 2. Committing step 1 is a no-op here: its draft mirrors the loaded config.
+    advance();
+    // Segment 0 = icons only, segment 1 = icons and thumbnails; pick the one that flips the value.
+    let segment = if before_thumbnails { 0isize } else { 1isize };
+    let expected_thumbnails = segment == 1;
+    let segment_dispatched = unsafe { dispatch_display_mode_segment(segment) };
+    let thumbnails_applied =
+        CONFIG.read().unwrap().layout.thumbnails_enabled == expected_thumbnails;
+    let thumbnails_draft = STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|state| state.thumbnails_enabled);
+
+    // Step 2 -> 3, then flip the clipboard switch (the draft is off by default on a fresh config).
+    advance();
+    let before_clipboard = CONFIG.read().unwrap().clipboard.enabled;
+    let switch_dispatched = unsafe {
+        match dispatch_action_with_tag(ACTION_TOGGLE_CLIPBOARD_DRAFT) {
+            Some(control) => {
+                let _: () = msg_send![control, setState: isize::from(!before_clipboard)];
+                on_action(std::ptr::null_mut(), sel!(handleOnboardingAction:), control);
+                true
+            }
+            None => false,
+        }
+    };
+    let clipboard_applied = CONFIG.read().unwrap().clipboard.enabled != before_clipboard;
+    let clipboard_draft = STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|state| state.clipboard_enabled);
+    let window_shown = is_visible();
+    hide();
+    log_info!(
+        "[smoke-onboarding-live-apply] segment_dispatched={} thumbnails_applied={} thumbnails_draft={:?} switch_dispatched={} clipboard_applied={} clipboard_draft={:?} window={}",
+        segment_dispatched,
+        thumbnails_applied,
+        thumbnails_draft,
+        switch_dispatched,
+        clipboard_applied,
+        clipboard_draft,
+        window_shown
+    );
+    segment_dispatched
+        && thumbnails_applied
+        && thumbnails_draft == Some(expected_thumbnails)
+        && switch_dispatched
+        && clipboard_applied
+        && clipboard_draft == Some(!before_clipboard)
+        && window_shown
 }
 
 const WINDOW_W: f64 = 520.0;
@@ -1310,5 +1412,41 @@ mod tests {
         assert!(!should_auto_show(false, false, true, true, false));
         // Permission granted but no config file (freshly cleared, say) still needs the guide.
         assert!(should_auto_show(false, false, true, false, false));
+    }
+
+    /// Picking a display mode or enabling clipboard history in the guide must reach the live
+    /// config on the click, not on Next: a user who tested with the hotkey right after picking it
+    /// used to keep the old mode, and the step's "try Option+V" hint would do nothing. The runner
+    /// commits through the real apply path, which persists, so it gets a throwaway HOME.
+    #[test]
+    #[ignore]
+    fn onboarding_live_apply_smoke() {
+        let exe = std::env::current_exe().expect("current exe");
+        let app = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("oh-my-tab"))
+            .expect("app binary path");
+        assert!(
+            app.exists(),
+            "app binary missing at {}: run `cargo build` first",
+            app.display()
+        );
+        let home =
+            std::env::temp_dir().join(format!("oh-my-tab-onboarding-smoke-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&home);
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-onboarding-live-apply")
+            .env("HOME", &home)
+            .output()
+            .expect("failed to spawn app");
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            out.status.success(),
+            "onboarding live-apply smoke failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

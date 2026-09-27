@@ -5,6 +5,7 @@
 
 [clipboard]
 clear_all = "清空历史"
+close = "关闭"
 clear_confirm_unpinned = "清除未置顶"
 clear_confirm_all = "全部清除"
 toast_undo_delete = "已撤销删除"
@@ -375,6 +376,7 @@ display_thumbnails = "显示图标和缩略图"
 screen_permission_needed = "尚未授予屏幕录制权限，缩略图暂不可用。"
 clipboard_title = "开启历史剪贴板"
 clipboard_body = "开启后会记录剪贴板历史。按 Option+V 可随时打开历史剪贴板浮窗。"
+clipboard_body_enabled = "剪贴板历史已开启。试着按 Option+V 打开历史剪贴板浮窗。"
 clipboard_label = "启用历史剪贴板"
 more_title = "还有更多功能"
 more_body = "历史剪贴板、鼠标和窗口控制及快捷操作都可在设置中配置。之后点击菜单栏中的 {icon}，再选最上方的“设置”即可打开。"

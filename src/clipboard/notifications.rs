@@ -89,6 +89,12 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(pickerClose:),
+                picker_close as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(clearClipboardUnpinned:),
                 clear_clipboard_unpinned as *mut c_void,
                 types.as_ptr(),
@@ -1346,6 +1352,11 @@ fn clear_clipboard_history_scope(clear_all: bool) {
         clear_all,
         kept_count
     );
+}
+
+/// The header's corner close button: the same dismissal as Esc with no query / an outside click.
+extern "C" fn picker_close(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    hide_picker();
 }
 
 /// Clicking the clear entry point only expands the confirmation card; history is untouched.

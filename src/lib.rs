@@ -846,6 +846,15 @@ extern "C" fn on_thumbnail_ready(_self: *mut c_void, _cmd: Sel, _arg: *mut c_voi
     callback_guard::void("on_thumbnail_ready", thumbnail::handle_ready_main);
 }
 
+/// Screen Recording was granted mid-run (hopped from whichever thread observed the flip): re-run
+/// the startup prewarm batch, which had to be skipped while unauthorized.
+extern "C" fn on_thumbnail_permission_granted(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    callback_guard::void(
+        "on_thumbnail_permission_granted",
+        thumbnail::backfill_after_permission_grant,
+    );
+}
+
 /// AX raise mutations are queued by the background raiser and applied here on AppKit's main
 /// thread.  Some AX actions synchronously enter AppKit, which traps when called off-main.
 extern "C" fn on_ax_raise(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
@@ -1407,6 +1416,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(thumbnailReady:),
             on_thumbnail_ready as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(thumbnailPermissionGranted:),
+            on_thumbnail_permission_granted as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -2036,6 +2051,7 @@ pub fn run() {
             || arg == "--smoke-settings-layout"
             || arg == "--smoke-settings-state-sync"
             || arg == "--smoke-settings-collapsible-row"
+            || arg == "--smoke-onboarding-live-apply"
     });
     let _instance_guard = if is_gui_smoke_process {
         None
@@ -2438,6 +2454,24 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-settings-collapsible-row] conditional row geometry is stable");
+            std::process::exit(0);
+        }
+    }
+
+    // Onboarding live-apply smoke entry: drive the guide's real display-mode segment and
+    // clipboard switch, and verify both choices reach the live config without pressing Next.
+    if std::env::args().any(|a| a == "--smoke-onboarding-live-apply") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            let ok = onboarding::live_apply_smoke_runner();
+            if !ok {
+                eprintln!(
+                    "[smoke-onboarding-live-apply] a guide choice did not apply on selection"
+                );
+                std::process::exit(1);
+            }
+            log_info!("[smoke-onboarding-live-apply] guide choices applied without Next");
             std::process::exit(0);
         }
     }

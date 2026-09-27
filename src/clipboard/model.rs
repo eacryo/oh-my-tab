@@ -185,6 +185,27 @@ pub(super) fn header_strip_h() -> f64 {
     TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y + FILTERS_H
 }
 
+/// The search field and the corner close button side by side in the header strip (flipped
+/// coordinates, measured from the strip's top-left). One source of truth so the two can never
+/// overlap: the field gives up the button's size plus the gap on the right.
+pub(super) fn picker_header_frames() -> (NSRect, NSRect) {
+    let close = NSRect::new(
+        NSPoint::new(
+            PICKER_W - SEARCH_PAD_X - PICKER_CLOSE_BTN_SIZE,
+            TOP_PAD_Y + (SEARCH_H - PICKER_CLOSE_BTN_SIZE) / 2.0,
+        ),
+        NSSize::new(PICKER_CLOSE_BTN_SIZE, PICKER_CLOSE_BTN_SIZE),
+    );
+    let search = NSRect::new(
+        NSPoint::new(SEARCH_PAD_X, TOP_PAD_Y),
+        NSSize::new(
+            PICKER_W - SEARCH_PAD_X * 2.0 - PICKER_CLOSE_BTN_SIZE - PICKER_CLOSE_BTN_GAP,
+            SEARCH_H,
+        ),
+    );
+    (search, close)
+}
+
 /// Calculate the picker minimum from three same-group records and use it for every state, so it
 /// stays aligned when row or surrounding-region dimensions change.
 pub(super) fn picker_min_height() -> f64 {

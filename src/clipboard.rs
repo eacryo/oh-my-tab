@@ -187,6 +187,12 @@ const SEARCH_H: f64 = 40.0;
 const SEARCH_PAD_X: f64 = 14.0;
 /// the search bar's corner radius (the new mockup's 9px).
 const SEARCH_R: f64 = 9.0;
+/// Corner close button on the picker's header: the switcher card's × (20pt, radius 6, 12pt glyph).
+const PICKER_CLOSE_BTN_SIZE: f64 = 20.0;
+const PICKER_CLOSE_BTN_R: f64 = 6.0;
+const PICKER_CLOSE_BTN_FONT: f64 = 12.0;
+/// Gap between the search field's right edge and the corner close button.
+const PICKER_CLOSE_BTN_GAP: f64 = 8.0;
 /// the gap under the search bar (the new mockup's 6px).
 const SEARCH_GAP_Y: f64 = 6.0;
 /// the filters row's height (the new mockup's 36px).
@@ -608,6 +614,8 @@ static SEARCH_FIELD: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static SEARCH_CLEAR_HOVERED: AtomicBool = AtomicBool::new(false);
 /// The real click button over the hand-drawn ×; rendering remains in the cell.
 static SEARCH_CLEAR_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The header's corner close button (persistent: the picker window is reused across summons).
+static PICKER_CLOSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The centered "magnifier + search hint" attributed string (hand-drawn; the field itself
 /// carries NO placeholder property, so the field editor never draws the placeholder
 /// left-aligned on a focused-but-empty field).
@@ -761,12 +769,27 @@ static REBUILDING: AtomicBool = AtomicBool::new(false);
 mod tests {
     use super::{
         clear_history_confirmation_layout, effective_hover_row, estimated_entry_bytes,
-        header_strip_h, rect_contains_point, scroll_indicator_geometry, ClipEntry, ImageEntry,
-        NO_SELECTION, NSPASTEBOARD_TYPE_PNG, SCROLL_INDICATOR_CORNER_RESERVE,
-        SCROLL_INDICATOR_EDGE,
+        header_strip_h, picker_header_frames, rect_contains_point, scroll_indicator_geometry,
+        ClipEntry, ImageEntry, NO_SELECTION, NSPASTEBOARD_TYPE_PNG, PICKER_W,
+        SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE, SEARCH_PAD_X, TOP_PAD_Y,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::sync::Arc;
+    #[test]
+    fn picker_header_separates_the_search_field_and_the_close_button() {
+        let (search, close) = picker_header_frames();
+        // The pair is inset symmetrically from the strip's edges and the button is square.
+        assert_eq!(search.origin.x, SEARCH_PAD_X);
+        assert_eq!(search.origin.y, TOP_PAD_Y);
+        assert_eq!(close.origin.x + close.size.width, PICKER_W - SEARCH_PAD_X);
+        assert_eq!(close.size.width, close.size.height);
+        // The field must end before the button: the × is never drawn over the query/⌘F keycap.
+        assert!(search.origin.x + search.size.width < close.origin.x);
+        // Both stay inside the fixed strip (never over the filters row or the list).
+        let strip_bottom = header_strip_h();
+        assert!(search.origin.y + search.size.height <= strip_bottom);
+        assert!(close.origin.y + close.size.height <= strip_bottom);
+    }
     #[test]
     fn clear_confirmation_buttons_are_compact_and_horizontal() {
         let anchor = NSRect::new(NSPoint::new(420.0, 66.0), NSSize::new(60.0, 20.0));
