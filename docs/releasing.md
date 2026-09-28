@@ -12,6 +12,7 @@
 sh scripts/release.sh                    # 本地构建产物和 Homebrew cask
 sh scripts/release.sh --notarize         # 构建、签名并提交 Apple 公证
 sh scripts/release.sh --check            # 查询待处理的公证状态
+sh scripts/release.sh --archive          # 归档已通过或失败的提交，以便开始另一轮公证
 sh scripts/release.sh --push             # 对公证通过的应用贴票并上传产物
 sh scripts/release.sh --push --dry-run   # 准备产物并打印上传计划
 ```
@@ -30,6 +31,8 @@ sh scripts/release-dev.sh --push --dry-run
 测试选项。
 
 正式发布时，`--notarize` 会构建并暂存签名后的 `.app`，`--check` 用于查询 Apple 公证状态。状态变为 `Accepted` 后，`--push` 会给应用贴上公证票据并生成最终 ZIP 和 DMG，然后调用仓库内固定版本的 `vendor/Sparkle/bin/generate_appcast` 和 R2 发布工具。
+
+如果公证已通过但暂时不打算发布，或准备修改代码后重新构建，运行 `--archive` 会将已结束的 `Accepted` 或 `Invalid` 提交从 `dist/.notarization/pending` 移到 `dist/.notarization/archived/` 或 `dist/.notarization/failed/`，保留记录并释放待处理位置。公证仍在进行时不能归档；请等 `--check` 显示最终状态后再操作。归档后即可为修改后的版本运行 `--notarize`。原有的 `--archive-failed` 仍可单独归档 `Invalid` 提交。
 
 如果本地已有 appcast，生成脚本会从它开始更新。干净 checkout 中则会读取公开 Feed，以保留历史条目；Feed 不存在时会创建新文件。enclosure URL 使用最终 ZIP 文件名，与发布工具上传的对象保持一致。
 

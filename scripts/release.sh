@@ -1,15 +1,16 @@
 #!/bin/bash
-# Production release flow: build and submit for notarization, check its status, then publish.
-# 生产发布分为三步：构建并提交公证、查询公证状态、公证通过后推送。
+# Production release flow: build and submit for notarization, check its status, then publish or archive.
+# 生产发布流程：构建并提交公证、查询公证状态，然后推送或归档。
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/release.sh [--notarize | --check [submission-id] | --archive-failed | --push [--dry-run]]
+Usage: scripts/release.sh [--notarize | --check [submission-id] | --archive | --archive-failed | --push [--dry-run]]
 
   (no flag)       Build local artifacts and generate the Homebrew cask; never upload to R2.
   --notarize      Build with Developer ID signing and submit to Apple without waiting.
   --check [id]    Query the saved notarization submission (or recover with its submission ID).
+  --archive       Archive a completed Accepted or Invalid submission so another can be started.
   --archive-failed Archive an Invalid submission under dist/.notarization/failed/.
   --push          Require Accepted status, staple the app, package it, and publish to R2.
   --dry-run       With --push, prepare the release and print the R2 upload plan without uploading.
@@ -49,6 +50,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --archive-failed)
       select_mode archive-failed
+      ;;
+    --archive)
+      select_mode archive
       ;;
     --push)
       select_mode push
@@ -217,6 +221,46 @@ archive_invalid_submission() {
   echo "You can now start a corrected build with: scripts/release.sh --notarize"
 }
 
+archive_submission() {
+  if [ ! -d "$PENDING_DIR" ]; then
+    echo "error: no pending notarization submission found at $PENDING_DIR" >&2
+    exit 1
+  fi
+
+  local submission_id=""
+  local status=""
+  local archive_dir=""
+  submission_id="$(load_submission_id)"
+  status="$(query_notary_status "$submission_id")"
+  echo "Notarization status: $status (submission $submission_id)"
+
+  case "$status" in
+    Accepted)
+      archive_dir="$NOTARY_ROOT/archived/$submission_id"
+      ;;
+    Invalid)
+      show_notary_log "$submission_id"
+      archive_dir="$NOTARY_ROOT/failed/$submission_id"
+      ;;
+    "In Progress"|Submitted|"Waiting for Export Compliance")
+      echo "error: notarization is still in progress; pending state was left unchanged" >&2
+      exit 1
+      ;;
+    *)
+      echo "error: only an Accepted or Invalid submission can be archived; pending state was left unchanged" >&2
+      exit 1
+      ;;
+  esac
+
+  if [ -e "$archive_dir" ]; then
+    archive_dir="${archive_dir}-$(date -u +%Y%m%d%H%M%S)"
+  fi
+  mkdir -p "$(dirname "$archive_dir")"
+  mv "$PENDING_DIR" "$archive_dir"
+  echo "Archived notarization state at $archive_dir"
+  echo "You can now start another submission with: scripts/release.sh --notarize"
+}
+
 generate_cask() {
   local version="$1"
   local dmg_path="$2"
@@ -320,6 +364,10 @@ case "$MODE" in
 
   archive-failed)
     archive_invalid_submission
+    ;;
+
+  archive)
+    archive_submission
     ;;
 
   push)
