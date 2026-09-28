@@ -2098,7 +2098,8 @@ pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f
     let _: () = msg_send![label, setFont: font];
     apply_settings_text_role(label, SettingsTextRole::Secondary);
     // Adaptive: stretch width with the parent, stay top-anchored (MinYMargin).
-    let _: () = msg_send![label, setAutoresizingMask: 10u64];
+    // Vertical placement belongs to the page layout owner (no MinYMargin).
+    let _: () = msg_send![label, setAutoresizingMask: 2u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
 }
@@ -2153,7 +2154,8 @@ pub(super) unsafe fn add_page_title(
         )
     ];
     apply_settings_text_role(label, SettingsTextRole::Primary);
-    let _: () = msg_send![label, setAutoresizingMask: 10u64];
+    // Vertical placement belongs to the page layout owner (no MinYMargin).
+    let _: () = msg_send![label, setAutoresizingMask: 2u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
     title_height
@@ -2418,6 +2420,18 @@ pub(super) unsafe fn add_settings_card(
     (card, shadow)
 }
 
+/// The rect a section frame turns into: a card trimmed by the extra bottom inset, shared with the
+/// page layout owner so a re-flow derives exactly the frame the builder created.
+pub(super) fn settings_card_rect(frame: NSRect) -> NSRect {
+    /// Existing page coordinates reserve 4pt above a section card and 10pt below its last row;
+    /// trimming the extra inset here centers the row content in the card's visible area.
+    const EXTRA_BOTTOM_INSET: f64 = 6.0;
+    let mut card_frame = frame;
+    card_frame.origin.y += EXTRA_BOTTOM_INSET;
+    card_frame.size.height = (card_frame.size.height - EXTRA_BOTTOM_INSET).max(1.0);
+    card_frame
+}
+
 /// Draw the HTML `.row + .row` hairline inside a grouped card.
 pub(super) unsafe fn add_row_separator(
     parent: *mut AnyObject,
@@ -2492,11 +2506,13 @@ pub(super) unsafe fn add_row_with_label(
         let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
     }
     // Adaptive: label keeps fixed width, stays top- and left-anchored.
-    let _: () = msg_send![label, setAutoresizingMask: 12u64];
+    // Vertical placement belongs to the page layout owner (no MinYMargin).
+    let _: () = msg_send![label, setAutoresizingMask: 4u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
     // Adaptive: control stretches its width with the parent, stays top-anchored.
-    let _: () = msg_send![control, setAutoresizingMask: 10u64];
+    // Vertical placement belongs to the page layout owner (no MinYMargin).
+    let _: () = msg_send![control, setAutoresizingMask: 2u64];
     let _: () = msg_send![parent, addSubview: control];
     release_obj(control);
     (label, control)
@@ -2548,7 +2564,8 @@ pub(super) unsafe fn add_described_row(
     let _: () = msg_send![parent, addSubview: title_label];
     release_obj(title_label);
 
-    let _: () = msg_send![control, setAutoresizingMask: 10u64];
+    // Vertical placement belongs to the page layout owner (no MinYMargin).
+    let _: () = msg_send![control, setAutoresizingMask: 2u64];
     let _: () = msg_send![parent, addSubview: control];
     release_obj(control);
     (title_label, control)
@@ -2584,10 +2601,12 @@ pub(super) unsafe fn add_tall_row(
     if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
         let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
     }
-    let _: () = msg_send![label, setAutoresizingMask: 12u64];
+    // Vertical placement belongs to the page layout owner (no MinYMargin).
+    let _: () = msg_send![label, setAutoresizingMask: 4u64];
     let _: () = msg_send![parent, addSubview: label];
     release_obj(label);
-    let _: () = msg_send![control, setAutoresizingMask: 10u64];
+    // Vertical placement belongs to the page layout owner (no MinYMargin).
+    let _: () = msg_send![control, setAutoresizingMask: 2u64];
     let _: () = msg_send![parent, addSubview: control];
     release_obj(control);
     (label, control)
@@ -2681,188 +2700,6 @@ pub(super) unsafe fn make_settings_page(
     (scroll, document)
 }
 
-/// Grow a provisionally-sized page when content exceeds it, without moving existing children.
-///
-/// This keeps translated rows from being clipped while avoiding a second, conflicting layout
-/// pass with AppKit's top-anchored autoresizing masks. The helper is also safe to call after an
-/// inline update expands a card.
-pub(super) unsafe fn fit_settings_document_height(
-    document: *mut AnyObject,
-    minimum_height: f64,
-    top_padding: f64,
-    bottom_padding: f64,
-) -> f64 {
-    if document.is_null() {
-        return minimum_height.max(1.0);
-    }
-    let subviews: *mut AnyObject = msg_send![document, subviews];
-    let count: usize = if subviews.is_null() {
-        0
-    } else {
-        msg_send![subviews, count]
-    };
-    let mut max_y = 0.0f64;
-    for index in 0..count {
-        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        if child.is_null() {
-            continue;
-        }
-        let frame: NSRect = msg_send![child, frame];
-        max_y = max_y.max(frame.origin.y + frame.size.height);
-    }
-    let required_height =
-        required_document_height(max_y, minimum_height, top_padding, bottom_padding);
-    let current_frame: NSRect = msg_send![document, frame];
-    // Do not mutate child frames here. Children use MinYMargin autoresizing masks, so changing
-    // the document frame already gives AppKit an opportunity to reposition them; manually doing
-    // the same shift caused the title and rows to move twice after the first layout pass.
-    let final_height = stable_document_height(current_frame.size.height, required_height);
-    let final_frame = NSRect::new(
-        current_frame.origin,
-        NSSize::new(current_frame.size.width, final_height),
-    );
-    if (final_height - current_frame.size.height).abs() > 0.5 {
-        let _: () = msg_send![document, setFrame: final_frame];
-    }
-    final_height
-}
-
-/// Tighten a page document to its real content plus the bottom padding, reclaiming the dead space
-/// the hand-written page height constants left at the bottom.
-///
-/// Only the document's own height changes; children are never moved by hand. Top-anchored
-/// (MinYMargin) rows keep hugging the top and bottom-anchored page-foot controls follow the bottom,
-/// so both land in place on their own; moving them by hand would stack a second shift on top of
-/// AppKit's autoresize (see `stable_document_height`).
-///
-/// `minimum_height` keeps the document at least as tall as the page viewport: a document shorter
-/// than its clip would push the content to the bottom of the window in a non-flipped page. Returns
-/// the final height.
-pub(super) unsafe fn fit_page_document_height(
-    document: *mut AnyObject,
-    minimum_height: f64,
-    bottom_padding: f64,
-) -> f64 {
-    if document.is_null() {
-        return minimum_height.max(1.0);
-    }
-    let frame: NSRect = msg_send![document, frame];
-    let subviews: *mut AnyObject = msg_send![document, subviews];
-    let count: usize = if subviews.is_null() {
-        0
-    } else {
-        msg_send![subviews, count]
-    };
-    let mut children: Vec<(*mut AnyObject, NSRect, u64)> = Vec::with_capacity(count);
-    let mut lowest = f64::INFINITY;
-    for index in 0..count {
-        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        if child.is_null() {
-            continue;
-        }
-        let child_frame: NSRect = msg_send![child, frame];
-        if child_frame.size.width <= 0.0 && child_frame.size.height <= 0.0 {
-            continue;
-        }
-        let mask: u64 = msg_send![child, autoresizingMask];
-        children.push((child, child_frame, mask));
-        lowest = lowest.min(child_frame.origin.y);
-    }
-    if !lowest.is_finite() {
-        return frame.size.height;
-    }
-    // surplus > 0 means dead space below the content; surplus < 0 means the content outgrew the
-    // constant and the document must grow.
-    let surplus = lowest - bottom_padding;
-    if surplus.abs() <= 0.5 {
-        return frame.size.height;
-    }
-    let target = (frame.size.height - surplus).max(minimum_height);
-    let shift = frame.size.height - target;
-    let _: () = msg_send![document, setFrame: NSRect::new(
-        frame.origin,
-        NSSize::new(frame.size.width, target),
-    )];
-    // On shrink, AppKit only moves top-anchored (MinYMargin) subviews with the top edge; the page's
-    // cards and foot controls keep fixed frames (mask 0x0 / MaxYMargin) and stay put. Shifting those
-    // by the same delta moves the page as one block; shifting the top-anchored ones again would be
-    // the double shift `stable_document_height` warns about.
-    for (child, child_frame, mask) in children {
-        if mask & 8 != 0 {
-            continue;
-        }
-        let _: () = msg_send![child, setFrame: NSRect::new(
-            NSPoint::new(child_frame.origin.x, child_frame.origin.y - shift),
-            child_frame.size,
-        )];
-    }
-    let mut lowest_after = f64::INFINITY;
-    for index in 0..count {
-        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        if child.is_null() {
-            continue;
-        }
-        let child_frame: NSRect = msg_send![child, frame];
-        if child_frame.size.width <= 0.0 && child_frame.size.height <= 0.0 {
-            continue;
-        }
-        lowest_after = lowest_after.min(child_frame.origin.y);
-    }
-    log_debug!(
-        "[settings] fit_page_document_height: doc_h={:.1} -> {:.1} lowest {:.1} -> {:.1} (bottom_padding={:.1} shift={:.1})",
-        frame.size.height,
-        target,
-        lowest,
-        lowest_after,
-        bottom_padding,
-        shift
-    );
-    target
-}
-
-/// Refit one settings page after an inline visibility change and refresh its scroller.
-pub(super) unsafe fn refit_settings_page(scroll: *mut AnyObject) -> bool {
-    if scroll.is_null() {
-        return false;
-    }
-    let document: *mut AnyObject = msg_send![scroll, documentView];
-    let clip: *mut AnyObject = msg_send![scroll, contentView];
-    if document.is_null() || clip.is_null() {
-        return false;
-    }
-    let clip_bounds: NSRect = msg_send![clip, bounds];
-    let before: NSRect = msg_send![document, frame];
-    let after = fit_page_document_height(
-        document,
-        clip_bounds.size.height,
-        super::components::SettingsPageHeader::BOTTOM_PADDING,
-    );
-    if (after - before.size.height).abs() <= 0.5 {
-        return false;
-    }
-    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
-    true
-}
-
-/// Pure counterpart of the document fitting rule, kept separate so expansion behavior can be
-/// covered without constructing AppKit views in headless tests.
-pub(super) fn required_document_height(
-    content_max_y: f64,
-    minimum_height: f64,
-    top_padding: f64,
-    bottom_padding: f64,
-) -> f64 {
-    (content_max_y + bottom_padding)
-        .max(minimum_height)
-        .max(top_padding + bottom_padding + 1.0)
-}
-
-/// Keep an already-laid-out document stable unless content requires growth. Shrinking is unsafe
-/// for top-anchored manual frames because AppKit may apply the autoresizing delta to children.
-pub(super) fn stable_document_height(current_height: f64, required_height: f64) -> f64 {
-    current_height.max(required_height).max(1.0)
-}
-
 /// Pure rectangle predicates shared by the debug validator and headless layout tests.
 pub(super) fn rects_overlap(a: NSRect, b: NSRect, epsilon: f64) -> bool {
     let left = a.origin.x.max(b.origin.x);
@@ -2887,13 +2724,15 @@ struct DebugLayoutEntry {
     text_required_height: Option<f64>,
 }
 
-/// Collect descendant frames in document coordinates. Manual settings layout uses several
-/// nested AppKit views, so comparing each child's local frame against the document directly is
-/// incorrect; accumulating the parent origins mirrors `convertRect:toView:` without introducing
-/// another FFI conversion in the debug-only path.
+/// Collect descendant frames in document coordinates.
+///
+/// Manual settings layout uses several nested AppKit views, and some of them are flipped (the Mouse
+/// page's binding table, the About page's update host), so accumulating local origins would report
+/// a flipped container's children at nonsense positions. Asking the document to convert each frame
+/// handles flips, offsets and future nesting in one call.
 unsafe fn collect_debug_layout(
+    document: *mut AnyObject,
     view: *mut AnyObject,
-    parent_origin: NSPoint,
     entries: &mut Vec<DebugLayoutEntry>,
     inside_interactive: bool,
 ) {
@@ -2912,13 +2751,14 @@ unsafe fn collect_debug_layout(
             continue;
         }
         let local: NSRect = msg_send![child, frame];
-        let frame = NSRect::new(
-            NSPoint::new(
-                parent_origin.x + local.origin.x,
-                parent_origin.y + local.origin.y,
-            ),
-            local.size,
-        );
+        // `frame` is expressed in the superview's coordinates, so convert from there (AppKit's
+        // conversion also accounts for a flipped container, which a naive sum cannot).
+        let superview: *mut AnyObject = msg_send![child, superview];
+        let frame: NSRect = if superview.is_null() {
+            local
+        } else {
+            msg_send![document, convertRect: local, fromView: superview]
+        };
         let interactive = msg_send![child, isKindOfClass: class!(NSButton)]
             || msg_send![child, isKindOfClass: class!(NSSlider)]
             || msg_send![child, isKindOfClass: class!(NSColorWell)]
@@ -2945,12 +2785,7 @@ unsafe fn collect_debug_layout(
                 text_required_height,
             });
         }
-        collect_debug_layout(
-            child,
-            frame.origin,
-            entries,
-            inside_interactive || interactive,
-        );
+        collect_debug_layout(document, child, entries, inside_interactive || interactive);
     }
 }
 
@@ -2978,7 +2813,7 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
     }
     let document_bounds: NSRect = msg_send![document, bounds];
     let mut entries = Vec::new();
-    collect_debug_layout(document, NSPoint::new(0.0, 0.0), &mut entries, false);
+    collect_debug_layout(document, document, &mut entries, false);
     let mut errors = Vec::new();
     let document_rect = NSRect::new(NSPoint::new(0.0, 0.0), document_bounds.size);
     for entry in &entries {
@@ -3012,6 +2847,11 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
         }
     }
     if !errors.is_empty() {
+        // Log the details before panicking: the panic message itself is a single multi-line write
+        // that the logger's stderr capture does not keep intact.
+        for error in &errors {
+            crate::log_info!("[settings-layout] {name}: {error}");
+        }
         panic!("[settings-layout] {name}:\n{}", errors.join("\n"));
     }
 }
@@ -3042,10 +2882,7 @@ pub(super) unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        derived_label_width, rect_inside, rects_overlap, required_document_height,
-        slider_should_reset, stable_document_height,
-    };
+    use super::{derived_label_width, rect_inside, rects_overlap, slider_should_reset};
     // The smoke test sends ObjC messages directly (building an NSEvent, driving mouseDown:).
     use crate::ffi::release_obj;
     use objc2::runtime::AnyObject;
@@ -3115,20 +2952,6 @@ mod tests {
     fn label_width_follows_control_leading_edge() {
         assert_eq!(derived_label_width(319.0, 12.0, 18.0), 289.0);
         assert_eq!(derived_label_width(20.0, 12.0, 18.0), 1.0);
-    }
-
-    #[test]
-    fn document_height_tracks_content_without_dropping_below_viewport() {
-        assert_eq!(required_document_height(840.0, 600.0, 24.0, 24.0), 864.0);
-        assert_eq!(required_document_height(420.0, 600.0, 24.0, 24.0), 600.0);
-        assert_eq!(required_document_height(0.0, 0.0, 24.0, 24.0), 49.0);
-    }
-
-    #[test]
-    fn stable_document_height_never_shrinks_after_children_are_laid_out() {
-        assert_eq!(stable_document_height(1_120.0, 840.0), 1_120.0);
-        assert_eq!(stable_document_height(700.0, 840.0), 840.0);
-        assert_eq!(stable_document_height(0.0, 0.0), 1.0);
     }
 
     #[test]

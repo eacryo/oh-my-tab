@@ -321,7 +321,7 @@ pub(crate) unsafe fn tighten_page_documents() -> bool {
         let Some(ui) = ui.as_ref() else {
             return;
         };
-        for scroll in [
+        for (index, scroll) in [
             ui.general_view,
             ui.switcher_view,
             ui.mouse_view,
@@ -329,23 +329,26 @@ pub(crate) unsafe fn tighten_page_documents() -> bool {
             ui.window_control_view,
             ui.quick_actions_view,
             ui.about_view,
-        ] {
-            if scroll.is_null() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if scroll.is_null() || !ui.page_canvases[index].is_bound() {
                 continue;
             }
+            // Each page's layout owner sizes it from its own row list; the only thing that can
+            // change behind its back is the viewport (the permission banner resizes General's
+            // clip), so hand over the new clip height and let it re-flow if that matters.
             let document: *mut AnyObject = msg_send![scroll, documentView];
-            let clip: *mut AnyObject = msg_send![scroll, contentView];
-            if document.is_null() || clip.is_null() {
+            if document.is_null() {
                 continue;
             }
+            let clip: *mut AnyObject = msg_send![scroll, contentView];
             let clip_bounds: NSRect = msg_send![clip, bounds];
             let before: NSRect = msg_send![document, frame];
-            let after = widgets::fit_page_document_height(
-                document,
-                clip_bounds.size.height,
-                crate::settings::components::SettingsPageHeader::BOTTOM_PADDING,
-            );
-            if (after - before.size.height).abs() > 0.5 {
+            ui.page_canvases[index].set_viewport(clip_bounds.size.height);
+            let after: NSRect = msg_send![document, frame];
+            if (after.size.height - before.size.height).abs() > 0.5 {
                 changed = true;
             }
         }
@@ -574,6 +577,127 @@ pub(crate) fn refresh_system_appearance() {
     }
 }
 
+/// The About page's document height plus every child's top edge, in child order. The inline update
+/// flow must move the page as one block and a collapse must put everything back, so the checks
+/// compare these snapshots instead of trusting a single view.
+struct AboutPanelSnapshot {
+    document_height: f64,
+    child_tops: Vec<f64>,
+}
+
+unsafe fn about_panel_snapshot() -> Option<AboutPanelSnapshot> {
+    with_settings_ui(|ui| {
+        let ui = ui.as_ref()?;
+        let document: *mut AnyObject = msg_send![ui.about_view, documentView];
+        if document.is_null() {
+            return None;
+        }
+        let doc_frame: NSRect = msg_send![document, frame];
+        let subviews: *mut AnyObject = msg_send![document, subviews];
+        let count: usize = msg_send![subviews, count];
+        let mut child_tops = Vec::with_capacity(count);
+        for index in 0..count {
+            let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+            if child.is_null() {
+                return None;
+            }
+            // Every child is kept, including the zero-height compact update host, so the indices
+            // line up across snapshots (the expand/collapse only resize views, never add or remove).
+            let frame: NSRect = msg_send![child, frame];
+            child_tops.push(frame.origin.y + frame.size.height);
+        }
+        Some(AboutPanelSnapshot {
+            document_height: doc_frame.size.height,
+            child_tops,
+        })
+    })
+}
+
+/// Whether a collapse restored a snapshot exactly: same document height, every child back in place.
+fn page_restored(before: &AboutPanelSnapshot, after: &AboutPanelSnapshot) -> bool {
+    if before.child_tops.len() != after.child_tops.len() {
+        return false;
+    }
+    (after.document_height - before.document_height).abs() <= 1.0
+        && before
+            .child_tops
+            .iter()
+            .zip(after.child_tops.iter())
+            .all(|(before, after)| (after - before).abs() <= 1.0)
+}
+
+/// Whether the expanded update card and its host sit inside the page document with the page's bottom
+/// padding, and the document covers the card's top edge (i.e. the whole card can be scrolled to).
+unsafe fn update_card_inside_document() -> bool {
+    with_settings_ui(|ui| {
+        let Some(ui) = ui.as_ref() else {
+            return false;
+        };
+        let document: *mut AnyObject = msg_send![ui.about_view, documentView];
+        if document.is_null() {
+            return false;
+        }
+        let doc_frame: NSRect = msg_send![document, frame];
+        let card: NSRect = msg_send![ui.update_card, frame];
+        let host: NSRect = msg_send![ui.update_host, frame];
+        let ok = card.origin.y >= super::UPDATE_CARD_BOTTOM_PADDING - 0.5
+            && host.origin.y >= super::UPDATE_CARD_BOTTOM_PADDING - 0.5
+            && doc_frame.size.height + 0.5 >= card.origin.y + card.size.height;
+        if !ok {
+            log_info!(
+                "[smoke-settings-layout] update card outside the page: doc={:.1} card={:?} host={:?} padding={}",
+                doc_frame.size.height, card, host, super::UPDATE_CARD_BOTTOM_PADDING
+            );
+        }
+        ok
+    })
+}
+
+/// The inline update flow's ownership state as the layout leaves it: what the flow itself hid,
+/// where its divider sits relative to the row above it, and how the card hugs the host.
+#[derive(Debug)]
+struct UpdateFlowState {
+    document_height: f64,
+    button_hidden: bool,
+    host_hidden: bool,
+    divider_from_row_above: f64,
+    card_rect_bottom_from_host_bottom: f64,
+    /// The restore surface's offset from its container: the two are document siblings, so a re-flow
+    /// has to move them together or the surface drifts out from under the control.
+    restore_surface_from_container: f64,
+    /// The restore control's own expanded state, which a re-flow must not disturb either.
+    restore_expanded: bool,
+}
+
+unsafe fn update_flow_state() -> Option<UpdateFlowState> {
+    with_settings_ui(|ui| {
+        let ui = ui.as_ref()?;
+        if ui.update_card.is_null() || ui.update_host.is_null() || ui.update_divider.is_null() {
+            return None;
+        }
+        let document: *mut AnyObject = msg_send![ui.about_view, documentView];
+        let doc_frame: NSRect = msg_send![document, frame];
+        // The canvas sets a card's frame to its visible rect, so `origin.y` is the card's bottom.
+        let card: NSRect = msg_send![ui.update_card, frame];
+        let host: NSRect = msg_send![ui.update_host, frame];
+        let divider: NSRect = msg_send![ui.update_divider, frame];
+        let row_above: NSRect = msg_send![ui.update_auto_download, frame];
+        let button_hidden: bool = msg_send![ui.update_check_button, isHidden];
+        let host_hidden: bool = msg_send![ui.update_host, isHidden];
+        let container_frame: NSRect = msg_send![ui.page_restores[6].container, frame];
+        let surface_frame: NSRect = msg_send![ui.page_restores[6].surface, frame];
+        Some(UpdateFlowState {
+            document_height: doc_frame.size.height,
+            button_hidden,
+            host_hidden,
+            divider_from_row_above: divider.origin.y - row_above.origin.y,
+            card_rect_bottom_from_host_bottom: card.origin.y - host.origin.y,
+            restore_surface_from_container: surface_frame.origin.y - container_frame.origin.y,
+            restore_expanded: ui.page_restores[6].expanded,
+        })
+    })
+}
+
 /// Run every settings page through the real AppKit layout path and debug validator, then exit.
 /// This is used by the ignored macOS smoke test; it deliberately exercises the same window
 /// builder as the interactive app instead of constructing a simplified test-only hierarchy.
@@ -707,6 +831,189 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             scroll_page_to_top(*page);
             debug_validate_settings_page(*page, names[index]);
         }
+        // Inline update content (release notes) expands the About page's Updates card. The page
+        // document must grow with the card, otherwise the bottom of the notes is cut off and cannot
+        // be scrolled to; the shared validator checks the expanded page against its document.
+        // Inline update flow: the About page's Updates card grows *below* the check-button row, i.e.
+        // below this page's document origin, so the document must grow with it (otherwise the release
+        // notes below the origin are outside the scroll range) and the whole page must travel as one
+        // block. Two cycles are checked: a normal one, and one after enlarging the window (it is
+        // user-resizable). The window clamps at the display height, so a viewport taller than the
+        // compact page -- where the fit is limited by the viewport instead of the content -- is not
+        // reachable here; that arithmetic is covered by
+        // `settings::tests::inline_update_room_follows_the_real_document_change`.
+        select_sidebar(6);
+        let compact_state = update_flow_state();
+        let compact = about_panel_snapshot();
+        crate::settings::expand_update_section(600.0);
+        let _: () = msg_send![window, layoutIfNeeded];
+        let expanded_state = update_flow_state();
+        let expanded = about_panel_snapshot();
+        let first_inside = update_card_inside_document();
+        debug_validate_settings_page(pages[6], "about-expanded");
+        crate::settings::collapse_update_section();
+        let _: () = msg_send![window, layoutIfNeeded];
+        let collapsed_state = update_flow_state();
+        let collapsed = about_panel_snapshot();
+        let frame: NSRect = msg_send![window, frame];
+        let taller = NSRect::new(
+            frame.origin,
+            NSSize::new(frame.size.width, frame.size.height + 220.0),
+        );
+        let _: () = msg_send![window, setFrame: taller, display: true];
+        let _: () = msg_send![window, layoutIfNeeded];
+        let tall_compact = about_panel_snapshot();
+        crate::settings::expand_update_section(600.0);
+        let _: () = msg_send![window, layoutIfNeeded];
+        let tall_expanded = about_panel_snapshot();
+        let second_inside = update_card_inside_document();
+        crate::settings::collapse_update_section();
+        let _: () = msg_send![window, layoutIfNeeded];
+        let tall_collapsed = about_panel_snapshot();
+
+        // Reopening Settings hands every page's layout owner the current viewport
+        // (`tighten_page_documents` -> `set_viewport`); the running flow's page must come back
+        // unchanged, and the collapse must still land on the compact page.
+        let offsets =
+            with_settings_ui(|ui| ui.as_ref().map(|ui| capture_settings_scroll_offsets(ui)))
+                .unwrap_or([NSPoint::new(0.0, 0.0); 7]);
+        crate::settings::expand_update_section(600.0);
+        let _: () = msg_send![window, layoutIfNeeded];
+        let reopened_before = about_panel_snapshot();
+        show_settings_preserving(frame, 6, offsets);
+        let reopened = about_panel_snapshot();
+        let third_inside = update_card_inside_document();
+        crate::settings::collapse_update_section();
+        let _: () = msg_send![window, layoutIfNeeded];
+        let reopened_collapsed = about_panel_snapshot();
+
+        let (
+            Some(compact),
+            Some(expanded),
+            Some(collapsed),
+            Some(tall_compact),
+            Some(tall_expanded),
+            Some(tall_collapsed),
+            Some(reopened_before),
+            Some(reopened),
+            Some(reopened_collapsed),
+            Some(compact_state),
+            Some(expanded_state),
+            Some(collapsed_state),
+        ) = (
+            compact,
+            expanded,
+            collapsed,
+            tall_compact,
+            tall_expanded,
+            tall_collapsed,
+            reopened_before,
+            reopened,
+            reopened_collapsed,
+            compact_state,
+            expanded_state,
+            collapsed_state,
+        )
+        else {
+            log_info!("[smoke-settings-layout] inline update snapshots unavailable");
+            hide_settings();
+            return false;
+        };
+        // The page layout owner grows only the card and the space below it, so the checks are about
+        // the document, the card and the views inside -- not about the whole page travelling.
+        let inline_checks: [(&str, bool); 14] = [
+            ("inside", first_inside && second_inside && third_inside),
+            (
+                "expand_grows",
+                expanded.document_height > compact.document_height + 500.0,
+            ),
+            ("collapse_restored", page_restored(&compact, &collapsed)),
+            (
+                "tall_expand_grows",
+                tall_expanded.document_height > tall_compact.document_height + 500.0,
+            ),
+            (
+                "tall_collapse_restored",
+                page_restored(&tall_compact, &tall_collapsed),
+            ),
+            // The running flow's page has to survive the re-open untouched.
+            (
+                "reopen_stable",
+                page_restored(&reopened_before, &reopened)
+                    && page_restored(&compact, &reopened_collapsed),
+            ),
+            // Collapsing must land on the compact document exactly: the host row's consumption
+            // returns to zero, not to a 1pt floor.
+            (
+                "collapse_exact",
+                (collapsed_state.document_height - compact_state.document_height).abs() <= 0.5,
+            ),
+            // The card follows the host's bottom edge with the shared card inset (10pt), exactly
+            // like every other card follows its last row.
+            (
+                "card_hugs_host",
+                (expanded_state.card_rect_bottom_from_host_bottom + 4.0).abs() <= 0.5
+                    && (collapsed_state.card_rect_bottom_from_host_bottom + 4.0).abs() <= 0.5,
+            ),
+            // The Update divider belongs to the check-button row (the boundary above the button), so
+            // it keeps its distance to the row above it in every state: the switch sits 16pt above it.
+            (
+                "divider_glued_to_row_above",
+                [&compact_state, &expanded_state, &collapsed_state]
+                    .iter()
+                    .all(|state| (state.divider_from_row_above + 16.0).abs() <= 0.5),
+            ),
+            // Visibility belongs to the owners: the collapsed page shows the check button and hides
+            // the update host, the running flow replaces the button with the host, and collapsing
+            // restores exactly that (a re-flow must never reveal a view its owner hid).
+            (
+                "visibility_compact",
+                !compact_state.button_hidden && compact_state.host_hidden,
+            ),
+            (
+                "visibility_expanded",
+                expanded_state.button_hidden && !expanded_state.host_hidden,
+            ),
+            (
+                "visibility_collapsed",
+                !collapsed_state.button_hidden && collapsed_state.host_hidden,
+            ),
+            // The restore control's surface is a document sibling of its container: every re-flow has
+            // to carry it along, and the control's own collapsed state must survive the flow.
+            (
+                "restore_surface_glued",
+                (compact_state.restore_surface_from_container
+                    - expanded_state.restore_surface_from_container)
+                    .abs()
+                    <= 0.5
+                    && (compact_state.restore_surface_from_container
+                        - collapsed_state.restore_surface_from_container)
+                        .abs()
+                        <= 0.5,
+            ),
+            (
+                "restore_state_stable",
+                !compact_state.restore_expanded
+                    && !expanded_state.restore_expanded
+                    && !collapsed_state.restore_expanded,
+            ),
+        ];
+        let failed: Vec<&str> = inline_checks
+            .iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(name, _)| *name)
+            .collect();
+        if !failed.is_empty() {
+            log_info!(
+                "[smoke-settings-layout] inline update layout failed: {:?} (docs {:.1} {:.1} {:.1}) (flow {compact_state:?} {expanded_state:?} {collapsed_state:?})",
+                failed,
+                compact.document_height,
+                expanded.document_height,
+                collapsed.document_height,
+            );
+            hide_settings();
+            return false;
+        }
         hide_settings();
         true
     }
@@ -746,17 +1053,6 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
     }
 }
 
-/// Dispatch a registered settings control through the production target/action callback.
-unsafe fn dispatch_smoke_control(sender: *mut AnyObject) {
-    if !sender.is_null() {
-        on_control_changed(
-            std::ptr::null_mut(),
-            sel!(handleControlChanged:),
-            sender as *mut c_void,
-        );
-    }
-}
-
 /// Verify that collapsing the clipboard child row leaves adjacent controls correctly laid out.
 pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
     unsafe {
@@ -778,9 +1074,11 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
             let previous: NSRect = msg_send![ui.clipboard_delete_after_paste, frame];
             let next: NSRect = msg_send![ui.clipboard_max_entries, frame];
             let auto_expire: NSRect = msg_send![ui.clipboard_auto_expire_days, frame];
-            Some((previous, next, auto_expire))
+            let document: *mut AnyObject = msg_send![ui.clipboard_view, documentView];
+            let document_height: NSRect = msg_send![document, frame];
+            Some((previous, next, auto_expire, document_height.size.height))
         });
-        let Some((previous_before, next_before, auto_before)) = before else {
+        let Some((previous_before, next_before, auto_before, document_before)) = before else {
             hide_settings();
             return false;
         };
@@ -809,9 +1107,19 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
                 msg_send![ui.clipboard_clear_system_pasteboard_after_paste, isHidden];
             let next: NSRect = msg_send![ui.clipboard_max_entries, frame];
             let auto_expire: NSRect = msg_send![ui.clipboard_auto_expire_days, frame];
-            Some((previous, child_hidden, next, auto_expire))
+            let document: *mut AnyObject = msg_send![ui.clipboard_view, documentView];
+            let document_height: NSRect = msg_send![document, frame];
+            Some((
+                previous,
+                child_hidden,
+                next,
+                auto_expire,
+                document_height.size.height,
+            ))
         });
-        let Some((previous_after, child_hidden, next_after, auto_after)) = collapsed else {
+        let Some((previous_after, child_hidden, next_after, auto_after, document_after)) =
+            collapsed
+        else {
             hide_settings();
             return false;
         };
@@ -819,22 +1127,29 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
         let moved_by = next_after.origin.y - next_before.origin.y;
         let auto_moved_by = auto_after.origin.y - auto_before.origin.y;
         let expected_shift = SettingsLayout::new(400.0).row_gap + SettingsLayout::SINGLE_LINE_ROW_H;
+        // The page layout owner anchors the page to the document's top edge, so hiding the row
+        // shortens the document and everything above the group moves down by that amount in
+        // document coordinates; the rows below keep their y (the gap still closes on screen).
+        let document_shrank = document_before - document_after;
+        let previous_moved_by = previous_after.origin.y - previous_before.origin.y;
         let stable_previous = previous_before.origin.x == previous_after.origin.x
-            && previous_before.origin.y == previous_after.origin.y
             && previous_before.size.width == previous_after.size.width
-            && previous_before.size.height == previous_after.size.height;
+            && previous_before.size.height == previous_after.size.height
+            && (previous_moved_by + expected_shift).abs() < 1.0;
         let collapsed_ok = child_hidden
             && stable_previous
-            && moved_by.abs() > 1.0
-            && (moved_by.abs() - expected_shift).abs() < 1.0
-            && (auto_moved_by - moved_by).abs() < 1.0;
+            && (document_shrank - expected_shift).abs() < 1.0
+            && moved_by.abs() < 1.0
+            && auto_moved_by.abs() < 1.0;
         if !collapsed_ok {
             eprintln!(
-                "[smoke-settings-collapsible-row] hidden={child_hidden} previous_stable={stable_previous} previous_y={:.1}->{:.1} next_y={:.1}->{:.1} move={moved_by:.1} auto_move={auto_moved_by:.1} expected_shift={expected_shift:.1}",
+                "[smoke-settings-collapsible-row] hidden={child_hidden} previous_stable={stable_previous} previous_y={:.1}->{:.1} next_y={:.1}->{:.1} move={moved_by:.1} auto_move={auto_moved_by:.1} document={:.1}->{:.1} expected_shift={expected_shift:.1}",
                 previous_before.origin.y,
                 previous_after.origin.y,
                 next_before.origin.y,
                 next_after.origin.y,
+                document_before,
+                document_after,
             );
         }
 
@@ -859,107 +1174,109 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
             let auto_expire: NSRect = msg_send![ui.clipboard_auto_expire_days, frame];
             Some((previous, next, auto_expire))
         });
-        let fit_shift = previous_after_fit.origin.y - previous_before.origin.y;
+        // The Clipboard page owns its layout, so the page pass has nothing left to fit, and
+        // expanding the row again restores the baseline exactly (document height and every row).
         let restored = expanded.is_some_and(|(previous, next, auto_expire)| {
-            fitted_after_collapse
-                && (previous.origin.y - previous_after_fit.origin.y).abs() < 1.0
-                && (next.origin.y - (next_before.origin.y + fit_shift)).abs() < 1.0
-                && (auto_expire.origin.y - (auto_before.origin.y + fit_shift)).abs() < 1.0
-                && (next_after_fit.origin.y - (next_before.origin.y + expected_shift + fit_shift))
-                    .abs()
-                    < 1.0
-                && (auto_after_fit.origin.y - (auto_before.origin.y + expected_shift + fit_shift))
-                    .abs()
-                    < 1.0
+            !fitted_after_collapse
+                && (previous_after_fit.origin.y - previous_after.origin.y).abs() < 1.0
+                && (next_after_fit.origin.y - next_after.origin.y).abs() < 1.0
+                && (auto_after_fit.origin.y - auto_after.origin.y).abs() < 1.0
+                && (previous.origin.y - previous_before.origin.y).abs() < 1.0
+                && (next.origin.y - next_before.origin.y).abs() < 1.0
+                && (auto_expire.origin.y - auto_before.origin.y).abs() < 1.0
         });
         if !restored {
             eprintln!(
-                "[smoke-settings-collapsible-row] reopen after page fit failed: fit={fitted_after_collapse} fit_shift={fit_shift:.1}"
+                "[smoke-settings-collapsible-row] reopen after the row came back failed: fitted={fitted_after_collapse}"
             );
         }
 
-        // Two conditional blocks share the Mouse page. Collapsing both and reopening only the
-        // upper block must not restore the lower card's old expanded frame.
+        // The Mouse page owns two row groups in two cards. Collapsing both and reopening only the
+        // upper one must leave the lower one hidden and size the document for exactly the rows that
+        // are visible.
         select_sidebar(2);
         let mouse_before = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
             let document_frame: NSRect = msg_send![document, frame];
             Some((
-                ui.pointer_accel_block.card_frame(),
                 document_frame.size.height,
+                ui.scroll_mode,
+                ui.disable_pointer_accel,
             ))
         });
-        let Some((pointer_expanded_frame, mouse_document_height)) = mouse_before else {
+        let Some((mouse_document_full, _, _)) = mouse_before else {
             hide_settings();
             return false;
         };
+        // Collapse both groups. They are driven through the layout owner directly: this guard covers
+        // the geometry (which rows move, how far the document shrinks), while the switches' own
+        // state sync belongs to the settings state-sync smoke.
         with_settings_ui(|ui| {
             if let Some(ui) = ui.as_ref() {
-                let _: () = msg_send![ui.scroll_mode, selectItemAtIndex: 0isize];
+                ui.page_canvases[2].set_group_visible(RowGroup::LineCount, false);
+                ui.page_canvases[2].set_group_visible(RowGroup::PointerAccel, false);
             }
         });
-        let mouse_controls = with_settings_ui(|ui| {
-            ui.as_ref()
-                .map(|ui| (ui.scroll_mode, ui.disable_pointer_accel))
-        });
-        if let Some((scroll_mode, disable_pointer_accel)) = mouse_controls {
-            dispatch_smoke_control(scroll_mode);
-            let _: () =
-                msg_send![disable_pointer_accel, performClick: std::ptr::null::<AnyObject>()];
-        }
-        let pointer_collapsed_height = with_settings_ui(|ui| {
-            ui.as_ref()
-                .map(|ui| ui.pointer_accel_block.card_frame().size.height)
-        });
-        with_settings_ui(|ui| {
-            if let Some(ui) = ui.as_ref() {
-                let _: () = msg_send![ui.scroll_mode, selectItemAtIndex: 1isize];
-            }
-        });
-        if let Some((scroll_mode, _)) = mouse_controls {
-            dispatch_smoke_control(scroll_mode);
-        }
-        let pointer_after_upper_expansion = with_settings_ui(|ui| {
+        let mouse_collapsed = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
             let document_frame: NSRect = msg_send![document, frame];
-            Some((
-                ui.pointer_accel_block.card_frame(),
-                msg_send![ui.pointer_accel_label, isHidden],
-                document_frame.size.height,
-            ))
+            let line_hidden: bool = msg_send![ui.line_count, isHidden];
+            let pointer_hidden: bool = msg_send![ui.pointer_accel_slider, isHidden];
+            Some((document_frame.size.height, line_hidden, pointer_hidden))
         });
-        let mouse_interleaving_ok = match (pointer_collapsed_height, pointer_after_upper_expansion)
-        {
-            (Some(collapsed_height), Some((after_upper, pointer_hidden, _))) => {
-                let row_height = pointer_expanded_frame.size.height - collapsed_height;
-                (after_upper.size.height - collapsed_height).abs() < 1.0
+        // Reopen only the upper group.
+        with_settings_ui(|ui| {
+            if let Some(ui) = ui.as_ref() {
+                ui.page_canvases[2].set_group_visible(RowGroup::LineCount, true);
+            }
+        });
+        let mouse_after_upper = with_settings_ui(|ui| {
+            let ui = ui.as_ref()?;
+            let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
+            let document_frame: NSRect = msg_send![document, frame];
+            let line_hidden: bool = msg_send![ui.line_count, isHidden];
+            let pointer_hidden: bool = msg_send![ui.pointer_accel_slider, isHidden];
+            Some((document_frame.size.height, line_hidden, pointer_hidden))
+        });
+        let mouse_interleaving_ok = match (mouse_collapsed, mouse_after_upper) {
+            (
+                Some((collapsed_document, line_hidden, pointer_hidden)),
+                Some((upper_document, line_visible_again, pointer_hidden_again)),
+            ) => {
+                let group = SettingsLayout::new(400.0).row_gap + SettingsLayout::SINGLE_LINE_ROW_H;
+                (mouse_document_full - collapsed_document - 2.0 * group).abs() < 1.0
+                    && line_hidden
                     && pointer_hidden
-                    && (after_upper.origin.y - (pointer_expanded_frame.origin.y + row_height)).abs()
-                        < 1.0
+                    && (upper_document - (collapsed_document + group)).abs() < 1.0
+                    && !line_visible_again
+                    && pointer_hidden_again
             }
             _ => false,
         };
-        if let Some((_, disable_pointer_accel)) = mouse_controls {
-            let _: () =
-                msg_send![disable_pointer_accel, performClick: std::ptr::null::<AnyObject>()];
-        }
+        // Bring the tracking-speed row back: both groups visible again, and the document back to
+        // the height it started with.
+        with_settings_ui(|ui| {
+            if let Some(ui) = ui.as_ref() {
+                ui.page_canvases[2].set_group_visible(RowGroup::PointerAccel, true);
+            }
+        });
         let mouse_document_restored = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
             let document_frame: NSRect = msg_send![document, frame];
+            let line_hidden: bool = msg_send![ui.line_count, isHidden];
+            let pointer_hidden: bool = msg_send![ui.pointer_accel_slider, isHidden];
             Some(
-                (document_frame.size.height - mouse_document_height).abs() < 1.0
-                    && (ui.pointer_accel_block.card_frame().size.height
-                        - pointer_expanded_frame.size.height)
-                        .abs()
-                        < 1.0,
+                (document_frame.size.height - mouse_document_full).abs() < 1.0
+                    && !line_hidden
+                    && !pointer_hidden,
             )
         });
         if !mouse_interleaving_ok || mouse_document_restored != Some(true) {
             eprintln!(
-                "[smoke-settings-collapsible-row] mouse interleaving failed: interleaving={mouse_interleaving_ok} document_restored={mouse_document_restored:?}"
+                "[smoke-settings-collapsible-row] mouse interleaving failed: full={mouse_document_full:.1} collapsed={mouse_collapsed:?} upper={mouse_after_upper:?} restored={mouse_document_restored:?}"
             );
         }
         hide_settings();
@@ -1206,13 +1523,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             line_count: std::ptr::null_mut(),
             line_count_label: std::ptr::null_mut(),
             line_count_value_label: std::ptr::null_mut(),
-            line_count_block: CollapsibleRows::empty(),
             disable_pointer_accel: std::ptr::null_mut(),
             pointer_accel_slider: std::ptr::null_mut(),
             pointer_accel_label: std::ptr::null_mut(),
             pointer_accel_value_label: std::ptr::null_mut(),
-            pointer_accel_block: CollapsibleRows::empty(),
-            thumbnail_only_block: CollapsibleRows::empty(),
+            mapping_layout_row: 0,
+            update_host_row: 0,
             mapping_scroll: std::ptr::null_mut(),
             mapping_doc: std::ptr::null_mut(),
             mapping_card: std::ptr::null_mut(),
@@ -1238,7 +1554,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             clipboard_move_used_to_top: std::ptr::null_mut(),
             clipboard_delete_after_paste: std::ptr::null_mut(),
             clipboard_clear_system_pasteboard_after_paste: std::ptr::null_mut(),
-            clipboard_delete_block: CollapsibleRows::empty(),
             clipboard_max_entries: std::ptr::null_mut(),
             clipboard_auto_expire_days: std::ptr::null_mut(),
             clipboard_auto_expire_days_value_label: std::ptr::null_mut(),
@@ -1250,6 +1565,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             device_indicator: std::ptr::null_mut(),
             restore_defaults: RestoreDefaultsControl::empty(),
             page_restores: std::array::from_fn(|_| RestoreDefaultsControl::empty()),
+            page_canvases: std::array::from_fn(|_| PageCanvas::empty()),
             permission_warning_view: std::ptr::null_mut(),
             update_auto_check: std::ptr::null_mut(),
             update_auto_download: std::ptr::null_mut(),
@@ -1259,9 +1575,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             update_card: std::ptr::null_mut(),
             update_card_shadow: std::ptr::null_mut(),
             update_divider: std::ptr::null_mut(),
-            update_card_compact_h: 0.0,
             update_card_expanded: false,
-            update_host_origin_y: 0.0,
         };
 
         // The sidebar and detail pane meet directly at the original sidebar boundary; their

@@ -11,7 +11,6 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::ffi::release_obj;
 use crate::i18n::t;
-use crate::log_debug;
 
 use super::{tooltip::SettingsTooltip, widgets};
 
@@ -60,202 +59,6 @@ const SLIDER_READOUT_H: f64 = 18.0;
 /// Gap between a card's internal divider and the top edge of the row below it (`separator_above_row`).
 const SEPARATOR_ABOVE_ROW_GAP: f64 = 3.0;
 
-/// A block of rows inside a card that appears and disappears as a unit.
-///
-/// Hiding a block is not just `setHidden`: the card's bottom edge must rise by the block's height,
-/// its shadow must follow, every section below the card must move up by the same amount, and any
-/// dividers inside the block must go with it. Showing it reverses all of that. Keeping the
-/// bookkeeping here means a call site is one line and can never get the arithmetic (or the "does
-/// this view belong to the block?" question) wrong.
-pub(super) struct CollapsibleRows {
-    card: *mut AnyObject,
-    shadow: *mut AnyObject,
-    /// The block's own views (labels/controls/readouts): hidden, never shifted.
-    views: Vec<*mut AnyObject>,
-    /// Dividers above the block: hidden along with it.
-    separators: Vec<*mut AnyObject>,
-    /// The block's total height (row_gap + row_h summed over its rows).
-    height: f64,
-    /// The card height as built. The collapsed state is derived from the live card height (only
-    /// this component changes it) instead of a remembered flag, so a layout reset (e.g. AppKit
-    /// re-placing subviews when the window is first displayed) self-corrects on the next call.
-    expanded_card_height: f64,
-    /// Views actually shifted while collapsed. Expanding reverses only this block's shift and
-    /// preserves changes made by other blocks in the meantime.
-    shifted: std::cell::RefCell<Vec<*mut AnyObject>>,
-}
-
-impl CollapsibleRows {
-    /// An unbound block (before the settings window is built).
-    pub(super) const fn empty() -> Self {
-        Self {
-            card: std::ptr::null_mut(),
-            shadow: std::ptr::null_mut(),
-            views: Vec::new(),
-            separators: Vec::new(),
-            height: 0.0,
-            expanded_card_height: 0.0,
-            shifted: std::cell::RefCell::new(Vec::new()),
-        }
-    }
-
-    pub(super) unsafe fn new(
-        card: *mut AnyObject,
-        shadow: *mut AnyObject,
-        views: Vec<*mut AnyObject>,
-        separators: Vec<*mut AnyObject>,
-        height: f64,
-    ) -> Self {
-        let mut block = Self {
-            card,
-            shadow,
-            views,
-            separators,
-            height,
-            expanded_card_height: 0.0,
-            shifted: std::cell::RefCell::new(Vec::new()),
-        };
-        let card_frame: NSRect = objc2::msg_send![card, frame];
-        block.expanded_card_height = card_frame.size.height;
-        block
-    }
-
-    pub(super) unsafe fn card_frame(&self) -> NSRect {
-        objc2::msg_send![self.card, frame]
-    }
-
-    /// Show or hide the whole block. The parent comes from the card's superview, so callers pass
-    /// no coordinates.
-    pub(super) unsafe fn set_visible(&self, visible: bool) {
-        if self.card.is_null() || self.views.is_empty() {
-            return;
-        }
-        let card_frame: NSRect = objc2::msg_send![self.card, frame];
-        // Whether the layout is currently collapsed comes from the live card height (see
-        // expanded_card_height).
-        let currently_compacted =
-            card_frame.size.height < self.expanded_card_height - self.height / 2.0;
-        if currently_compacted != !visible {
-            // The threshold is the BLOCK's own bottom edge, not the card's: a block can sit in the
-            // middle of a card, and the rows after it must close the gap too. Views below that
-            // threshold move at both levels -- sibling rows inside the card and the sections
-            // outside it.
-            let shift = if visible { -self.height } else { self.height };
-            let parent: *mut AnyObject = objc2::msg_send![self.card, superview];
-            let moved = if visible {
-                // Expanding: reverse only this block's shift and preserve layout changes made by
-                // other blocks in the meantime.
-                self.restore_shifted()
-            } else {
-                // Collapsing: record the views to move so expansion can reverse only this shift.
-                let mut recorded = Vec::new();
-                // The page document may be shifted after this component is built, so a cached y
-                // coordinate would be stale here.
-                let block_bottom = self.block_bottom().unwrap_or(0.0);
-                let moved = self.shift_views_below(self.card, block_bottom, shift, &mut recorded)
-                    + self.shift_views_below(parent, block_bottom, shift, &mut recorded);
-                self.shifted.replace(recorded);
-                moved
-            };
-            // The card's top edge stays put; only its bottom edge moves.
-            let mut compact_frame = card_frame;
-            compact_frame.origin.y += shift;
-            compact_frame.size.height -= shift;
-            let _: () = objc2::msg_send![self.card, setFrame: compact_frame];
-            let inset = widgets::SETTINGS_CARD_SHADOW_INSET;
-            let _: () = objc2::msg_send![
-                self.shadow,
-                setFrame: NSRect::new(
-                    NSPoint::new(
-                        compact_frame.origin.x - inset,
-                        compact_frame.origin.y - inset,
-                    ),
-                    NSSize::new(
-                        compact_frame.size.width + inset * 2.0,
-                        compact_frame.size.height + inset * 2.0,
-                    ),
-                )
-            ];
-            for &separator in &self.separators {
-                let _: () = objc2::msg_send![separator, setHidden: !visible];
-            }
-            log_debug!(
-                "[settings] row block: visible={} shift={:.1} moved={} card_h={:.1}",
-                visible,
-                shift,
-                moved,
-                compact_frame.size.height
-            );
-        }
-        for &view in &self.views {
-            let _: () = objc2::msg_send![view, setHidden: !visible];
-        }
-    }
-
-    /// The block's own bottom edge (the lowest origin.y among its views), used as the threshold
-    /// for what needs to close the gap.
-    unsafe fn block_bottom(&self) -> Option<f64> {
-        self.views
-            .iter()
-            .filter(|view| !view.is_null())
-            .map(|&view| {
-                let frame: NSRect = objc2::msg_send![view, frame];
-                frame.origin.y
-            })
-            .fold(None, |lowest: Option<f64>, y| {
-                Some(lowest.map_or(y, |low| low.min(y)))
-            })
-    }
-
-    /// Shift every view in `parent` below `threshold`, recording it so expansion can reverse this
-    /// shift. Return how many moved. The block's own views, the card, and the shadow never take
-    /// part.
-    unsafe fn shift_views_below(
-        &self,
-        parent: *mut AnyObject,
-        threshold: f64,
-        shift: f64,
-        recorded: &mut Vec<*mut AnyObject>,
-    ) -> usize {
-        if parent.is_null() {
-            return 0;
-        }
-        let subviews: *mut AnyObject = objc2::msg_send![parent, subviews];
-        let count: usize = objc2::msg_send![subviews, count];
-        let mut moved = 0;
-        for index in 0..count {
-            let view: *mut AnyObject = objc2::msg_send![subviews, objectAtIndex: index];
-            if view == self.card || view == self.shadow || self.views.contains(&view) {
-                continue;
-            }
-            // A smaller origin.y is lower on screen.
-            let mut frame: NSRect = objc2::msg_send![view, frame];
-            if frame.origin.y < threshold {
-                recorded.push(view);
-                frame.origin.y += shift;
-                let _: () = objc2::msg_send![view, setFrame: frame];
-                moved += 1;
-            }
-        }
-        moved
-    }
-
-    /// Reverse only this block's y shift. Other blocks may have changed these views' positions or
-    /// sizes in the meantime, so restoring an old frame would overwrite their layout.
-    unsafe fn restore_shifted(&self) -> usize {
-        let recorded = self.shifted.replace(Vec::new());
-        for &view in &recorded {
-            if view.is_null() {
-                continue;
-            }
-            let mut frame: NSRect = objc2::msg_send![view, frame];
-            frame.origin.y -= self.height;
-            let _: () = objc2::msg_send![view, setFrame: frame];
-        }
-        recorded.len()
-    }
-}
-
 /// Standard rows keep their label and control as sibling views in the card, so retain the
 /// association here instead of forcing every SettingsUi field to grow a second label pointer.
 static ROW_LABELS: LazyLock<Mutex<Vec<(usize, usize)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -302,18 +105,6 @@ impl SettingsLayout {
         }
     }
 
-    pub(super) fn next_section_cursor(self, cursor: f64) -> f64 {
-        cursor - self.section_step
-    }
-
-    pub(super) fn next_row_cursor(self, cursor: f64, row_h: f64) -> f64 {
-        cursor - self.row_gap - row_h
-    }
-
-    pub(super) fn card_bottom(self, row_y: f64) -> f64 {
-        row_y - self.card_bottom_inset
-    }
-
     pub(super) fn card_top(self, header_y: f64) -> f64 {
         header_y - self.card_header_gap
     }
@@ -358,20 +149,22 @@ impl SettingsPage {
 pub(super) struct SettingsPageHeader;
 
 impl SettingsPageHeader {
-    /// HTML `.content`'s top padding — the title block's distance from the pane top.
-    pub(super) const TOP_PADDING: f64 = 42.0;
+    /// Distance from the pane top to the title's frame. The HTML mockup's `.content` padding is
+    /// 42px, but the 30pt title's frame is taller than its ink, so the visible gap was tighter than
+    /// the mockup's; 50 keeps `TOP_PADDING + FIRST_SECTION_GAP` unchanged (everything below the
+    /// title stays where it was) while giving the title the intended breathing room.
+    pub(super) const TOP_PADDING: f64 = 50.0;
 
     /// HTML `.content`'s bottom padding, i.e. the space the page must keep below its last element.
-    /// Page documents are tightened to it (`widgets::fit_page_document_height`); overshooting it is
-    /// the dead scroll space users see as "the page scrolls far past its content".
+    /// Page documents keep this much space below their lowest content; overshooting it is the dead
+    /// scroll space users see as "the page scrolls far past its content".
     pub(super) const BOTTOM_PADDING: f64 = 72.0;
 
-    /// Empty space between the title's frame and the first section heading's frame below it.
+    /// Empty space between the title's frame and the first section heading's box below it.
     ///
-    /// Every page opens with one section (its master switch or first group) whose heading used to
-    /// be placed by hand: General/App Switcher sat 10pt under the title while Mouse/Clipboard/
-    /// Window Control/Quick Actions sat 16pt. This one value now covers all six.
-    const FIRST_SECTION_GAP: f64 = 16.0;
+    /// Paired with `TOP_PADDING` so their sum stays constant: the title's frame is taller than its
+    /// ink, so this value is really "what is left of the title-to-card rhythm after the frame".
+    const FIRST_SECTION_GAP: f64 = 8.0;
 
     /// Build the page title and return the cursor for the first section heading below it.
     ///
@@ -437,11 +230,6 @@ impl SettingsCard {
 pub(super) struct SettingsSection;
 
 impl SettingsSection {
-    // Existing page coordinates reserve 4pt above a section card and 10pt below its last row.
-    // Trim the extra bottom inset here so the row content is centered in the card's visible area
-    // without requiring every page to carry a separate y-offset correction.
-    const EXTRA_BOTTOM_INSET: f64 = 6.0;
-
     pub(super) unsafe fn attach(
         parent: *mut AnyObject,
         frame: NSRect,
@@ -449,10 +237,7 @@ impl SettingsSection {
     ) -> SettingsCard {
         let header_y = frame.origin.y + frame.size.height + super::SETTINGS_SECTION_CARD_GAP;
         widgets::add_header(parent, title, 6.0, header_y, frame.size.width);
-        let mut card_frame = frame;
-        card_frame.origin.y += Self::EXTRA_BOTTOM_INSET;
-        card_frame.size.height = (card_frame.size.height - Self::EXTRA_BOTTOM_INSET).max(1.0);
-        SettingsCard::attach(parent, card_frame)
+        SettingsCard::attach(parent, widgets::settings_card_rect(frame))
     }
 }
 
@@ -2421,8 +2206,7 @@ mod tests {
         assert_eq!(SettingsLayout::SINGLE_LINE_ROW_H, 54.0);
         assert_eq!(layout.section_step, 48.0);
         assert_eq!(layout.row_gap, 8.0);
-        assert_eq!(layout.card_bottom(100.0), 90.0);
-        assert_eq!(layout.card_top(100.0), 96.0);
+        // `card_top`/`card_bottom` moved into the page layout owner (`settings::page_canvas`).
     }
 
     #[test]
@@ -2447,22 +2231,36 @@ mod tests {
     /// uneven gap under one page's title.
     #[test]
     fn page_top_rhythm_keeps_the_first_card_symmetric() {
-        use super::{SettingsPageHeader, SettingsSection};
+        use super::SettingsPageHeader;
 
-        // The title-to-heading spacing lives in this one value.
-        assert_eq!(SettingsPageHeader::FIRST_SECTION_GAP, 16.0);
+        // What positions every page below the title is the *sum* of the top padding and the gap
+        // under the title, not either value alone: the title's frame is taller than its ink, so
+        // moving the title down must shrink the gap by the same amount and leave this constant
+        // (`PageCanvas` re-places the title at `doc_height - TOP_PADDING - title_height`).
+        assert_eq!(
+            SettingsPageHeader::TOP_PADDING + SettingsPageHeader::FIRST_SECTION_GAP,
+            58.0
+        );
+        // The title sits clearly below the pane top and clearly above the first card's heading.
+        assert_eq!(SettingsPageHeader::TOP_PADDING, 50.0);
+        assert_eq!(SettingsPageHeader::FIRST_SECTION_GAP, 8.0);
 
         let layout = SettingsLayout::new(600.0);
-        // The heading's frame bottom -- the cursor SettingsPageHeader::attach returns.
+        // The heading's frame bottom -- the cursor `PageCanvas` starts a page from.
         let heading_cursor = 100.0;
         let row_h = SettingsLayout::SINGLE_LINE_ROW_H;
-        let row_bottom = layout.next_row_cursor(heading_cursor, row_h);
+        let row_bottom = heading_cursor - layout.row_gap - row_h;
         let row_top = row_bottom + row_h;
         // Single-row card: the row starts 4pt under the heading, and trimming the extra 6pt bottom
         // inset leaves the same 4pt beneath the row.
-        assert_eq!(layout.card_top(heading_cursor) - row_top, 4.0);
-        let card_visible_bottom =
-            layout.card_bottom(row_bottom) + SettingsSection::EXTRA_BOTTOM_INSET;
+        let card_top = heading_cursor - layout.card_header_gap;
+        assert_eq!(card_top - row_top, 4.0);
+        let card_visible_bottom = super::widgets::settings_card_rect(super::NSRect::new(
+            super::NSPoint::new(0.0, row_bottom - layout.card_bottom_inset),
+            super::NSSize::new(1.0, 1.0),
+        ))
+        .origin
+        .y;
         assert_eq!(row_bottom - card_visible_bottom, 4.0);
     }
 

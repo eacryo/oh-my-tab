@@ -274,20 +274,20 @@ unsafe fn refresh_dependent_control_visibility(field: ControlField) {
         };
         match field {
             ControlField::ClipboardDeleteAfterPaste => {
+                // The Clipboard page's layout owner shows/hides the row and settles the document
+                // height in one walk, so no call-site refit is involved.
                 update_clipboard_delete_dependent_visibility(ui);
-                widgets::refit_settings_page(ui.clipboard_view);
             }
             ControlField::DisablePointerAccel => {
+                // The Mouse page's layout owner shows/hides the row and settles the page.
                 update_pointer_accel_visibility(ui);
-                widgets::refit_settings_page(ui.mouse_view);
             }
             ControlField::ScrollMode => {
                 update_mode_dependent_visibility(ui);
-                widgets::refit_settings_page(ui.mouse_view);
             }
             ControlField::ThumbnailsEnabled => {
+                // The App Switcher page's layout owner shows/hides the pair and settles the page.
                 update_display_mode_dependent_visibility(ui);
-                widgets::refit_settings_page(ui.switcher_view);
             }
             _ => {}
         }
@@ -630,7 +630,6 @@ pub(super) unsafe fn apply_mouse_profile_field(field: ControlField) {
             let _: () = msg_send![u.line_count, setIntegerValue: shown as isize];
             set_field(u.line_count_value_label, shown);
             update_mode_dependent_visibility(u);
-            widgets::refit_settings_page(u.mouse_view);
         }
     });
 }
@@ -921,8 +920,7 @@ pub(super) fn pointer_accel_from_slider(value: f64) -> f64 {
 /// while off.
 unsafe fn update_pointer_accel_visibility(ui: &SettingsUi) {
     let state: isize = msg_send![ui.disable_pointer_accel, state];
-    // CollapsibleRows owns the whole collapse (card bottom edge, sections below, divider).
-    ui.pointer_accel_block.set_visible(state == 1);
+    ui.page_canvases[2].set_group_visible(RowGroup::PointerAccel, state == 1);
 }
 
 /// Refresh the conditional visibility of the "lines per tick" row based on the current scroll mode
@@ -937,9 +935,9 @@ unsafe fn update_mode_dependent_visibility(ui: &SettingsUi) {
         .get(idx as usize)
         .copied()
         .unwrap_or("default");
-    // Only Line mode shows the line-count slider (hidden on Default); CollapsibleRows owns the
-    // collapse (card bottom edge, sections below, divider).
-    ui.line_count_block.set_visible(mode == "line");
+    // Only Line mode shows the line-count slider (hidden on Default): the page layout owner skips
+    // the row and re-flows the page.
+    ui.page_canvases[2].set_group_visible(RowGroup::LineCount, mode == "line");
 }
 
 /// Refresh the visibility of the thumbnail-only pair from the window display mode:
@@ -949,7 +947,7 @@ unsafe fn update_display_mode_dependent_visibility(ui: &SettingsUi) {
     let idx: isize = msg_send![ui.thumbnails_enabled, indexOfSelectedItem];
     // Popup index 0 = icons only, 1 = icons and thumbnails (same as the layout.thumbnails_enabled
     // boolean).
-    ui.thumbnail_only_block.set_visible(idx == 1);
+    ui.page_canvases[1].set_group_visible(RowGroup::ThumbnailOnly, idx == 1);
 }
 
 /// Show the "clear the matching system-pasteboard entry" row only while "delete entry after
@@ -959,7 +957,7 @@ fn clipboard_delete_dependent_visibility_from_config(cfg: &Config) -> bool {
 }
 
 unsafe fn set_clipboard_delete_dependent_visibility(ui: &SettingsUi, visible: bool) {
-    ui.clipboard_delete_block.set_visible(visible);
+    ui.page_canvases[3].set_group_visible(RowGroup::ClipboardDeleteChild, visible);
 }
 
 unsafe fn update_clipboard_delete_dependent_visibility(ui: &SettingsUi) {
@@ -1148,7 +1146,6 @@ pub(crate) fn refresh_switcher_controls_from_config() {
             let _: () = msg_send![u.focused_thumbnail_prewarm, setState: prewarm_state];
             // The display mode may have just changed: recompute the thumbnail-only pair.
             update_display_mode_dependent_visibility(u);
-            widgets::refit_settings_page(u.switcher_view);
         });
     }
 }
@@ -1289,7 +1286,6 @@ pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, se
                 update_mouse_controls_enabled(u);
                 update_mode_dependent_visibility(u);
                 update_pointer_accel_visibility(u);
-                widgets::refit_settings_page(u.mouse_view);
                 // Device switch: reload the in-edit mappings from the new device's own profile.
                 let dev = current_selected_device();
                 let prof_idx = find_profile_index(&cfg, dev);

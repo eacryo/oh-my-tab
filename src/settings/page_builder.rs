@@ -36,18 +36,17 @@ pub(super) unsafe fn build_switcher_page(
     let ctrl_x = layout.control_x;
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
-    let mut y = SettingsPageHeader::attach(
+    // The page's layout owner: rows, cards, the title and the document height all follow from it.
+    let mut canvas = PageCanvas::new(
         switcher_view,
-        &t("settings.sidebar_switcher"),
-        6.0,
-        switcher_doc_h,
         content_w - 12.0,
+        layout,
+        &t("settings.sidebar_switcher"),
+        switcher_doc_h,
+        context.page_frame.size.height,
     );
-
-    let windows_header_y = y;
-    y = layout.next_row_cursor(y, described_row_h);
+    let y = canvas.next_row(described_row_h);
     // App-switcher master switch: off = Cmd+Tab passes through to the system.
-    let windows_master_row_y = y;
     ui.windows_enabled = SettingsRow::described(
         switcher_view,
         label_x,
@@ -63,21 +62,10 @@ pub(super) unsafe fn build_switcher_page(
         ui.windows_enabled,
         setAction: sel!(handleWindowsEnabledToggle:)
     ];
-    SettingsSection::attach(
-        switcher_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(windows_master_row_y)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(windows_header_y) - layout.card_bottom(windows_master_row_y),
-            ),
-        ),
-        &t("settings.header_windows"),
-    );
+    canvas.card(&t("settings.header_windows"));
     // The remaining window settings form a second card with its own section title.
-    y = layout.next_section_cursor(y);
-    let windows_options_header_y = y;
-    y = layout.next_row_cursor(y, described_row_h);
+    canvas.next_section();
+    let y = canvas.next_row(described_row_h);
     // Let the label fill the space before the control column, adapting to the available page width.
     ui.show_minimized = SettingsRow::tall_before_control(
         switcher_view,
@@ -90,7 +78,7 @@ pub(super) unsafe fn build_switcher_page(
     )
     .1;
     bind_control(target, ui.show_minimized);
-    y = layout.next_row_cursor(y, described_row_h);
+    let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
     ui.show_hidden_app_windows = SettingsRow::tall_before_control(
         switcher_view,
@@ -116,7 +104,7 @@ pub(super) unsafe fn build_switcher_page(
     let display_mode_metrics =
         SettingsSelect::metrics(ctrl_w, &window_display_mode_refs, row_h, described_row_h);
     // Reserve the popup's measured row height so wrapped options cannot overlap the preceding row.
-    y = layout.next_row_cursor(y, display_mode_metrics.row_h);
+    let y = canvas.next_row(display_mode_metrics.row_h);
     SettingsRow::separator_above_row(switcher_view, y, display_mode_metrics.row_h, content_w);
     ui.thumbnails_enabled = SettingsRow::tall_with_height(
         switcher_view,
@@ -136,13 +124,14 @@ pub(super) unsafe fn build_switcher_page(
     )
     .1;
     bind_control(target, ui.thumbnails_enabled);
-    y = layout.next_row_cursor(y, described_row_h);
-    let prewarm_separator =
-        SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    // These two rows only mean something in icons-and-thumbnails mode: there is no thumbnail
-    // to prewarm in icon-only mode, and the app name already gets its own line there (see
-    // below), so the whole block follows the display mode.
-    let (prewarm_label, prewarm_switch) = SettingsRow::tall_with_height(
+    // These two rows only mean something in icons-and-thumbnails mode: there is no thumbnail to
+    // prewarm in icon-only mode, and the app name already gets its own line there (see below), so
+    // they are one row group the page layout owner skips (both rows and their dividers go away and
+    // the sections below close the gap).
+    canvas.group_begin(RowGroup::ThumbnailOnly);
+    let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    let (_, prewarm_switch) = SettingsRow::tall_with_height(
         switcher_view,
         label_x,
         y,
@@ -156,10 +145,9 @@ pub(super) unsafe fn build_switcher_page(
     // App name in card titles: the switch controls whether the thumbnail card's caption
     // shows the app name before the window title, separated by " · "; icon-only mode
     // already shows the app name on its own line below the title, so it is unaffected.
-    y = layout.next_row_cursor(y, described_row_h);
-    let app_name_separator =
-        SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    let (app_name_label, app_name_switch) = SettingsRow::tall(
+    let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    let (_, app_name_switch) = SettingsRow::tall(
         switcher_view,
         label_x,
         y,
@@ -169,7 +157,8 @@ pub(super) unsafe fn build_switcher_page(
     );
     ui.show_app_name_in_cards = app_name_switch;
     bind_control(target, ui.show_app_name_in_cards);
-    y = layout.next_row_cursor(y, described_row_h);
+    canvas.group_end();
+    let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
     ui.card_text_size = SettingsRow::described(
         switcher_view,
@@ -194,7 +183,7 @@ pub(super) unsafe fn build_switcher_page(
     ui.card_text_size_value_label =
         SettingsRow::attach_slider_readout(switcher_view, ui.card_text_size, TEXT_SIZE_DEFAULT);
     bind_control(target, ui.card_text_size);
-    y = layout.next_row_cursor(y, described_row_h);
+    let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
     ui.status_bar_text_size = SettingsRow::described(
         switcher_view,
@@ -229,7 +218,7 @@ pub(super) unsafe fn build_switcher_page(
     ];
     let op_label_refs: Vec<&str> = op_labels.iter().map(|s| s.as_str()).collect();
     let op_metrics = SettingsSelect::metrics(ctrl_w, &op_label_refs, row_h, described_row_h);
-    y = layout.next_row_cursor(y, op_metrics.row_h);
+    let y = canvas.next_row(op_metrics.row_h);
     SettingsRow::separator_above_row(switcher_view, y, op_metrics.row_h, content_w);
     ui.overlay_position = SettingsRow::tall_with_height(
         switcher_view,
@@ -258,7 +247,7 @@ pub(super) unsafe fn build_switcher_page(
     let activation_label_refs: Vec<&str> = activation_labels.iter().map(|s| s.as_str()).collect();
     let activation_metrics =
         SettingsSelect::metrics(ctrl_w, &activation_label_refs, row_h, described_row_h);
-    y = layout.next_row_cursor(y, activation_metrics.row_h);
+    let y = canvas.next_row(activation_metrics.row_h);
     SettingsRow::separator_above_row(switcher_view, y, activation_metrics.row_h, content_w);
     ui.activation_mode = SettingsRow::tall_with_height(
         switcher_view,
@@ -278,7 +267,7 @@ pub(super) unsafe fn build_switcher_page(
     )
     .1;
     bind_control(target, ui.activation_mode);
-    y = layout.next_row_cursor(y, described_row_h);
+    let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
     ui.corner_radius = SettingsRow::tall(
         switcher_view,
@@ -289,34 +278,8 @@ pub(super) unsafe fn build_switcher_page(
         SettingsControl::text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "64"),
     )
     .1;
-    let options_card_parts = SettingsSection::attach(
-        switcher_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(y)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(windows_options_header_y) - layout.card_bottom(y),
-            ),
-        ),
-        &t("settings.header_window_options"),
-    );
-    // The thumbnail-only pair: a block two rows tall (row_gap + described_row_h each), with
-    // each row's own divider going along with it.
-    ui.thumbnail_only_block = CollapsibleRows::new(
-        options_card_parts.card,
-        options_card_parts.shadow,
-        vec![
-            prewarm_label,
-            prewarm_switch,
-            app_name_label,
-            app_name_switch,
-        ],
-        vec![prewarm_separator, app_name_separator],
-        2.0 * (layout.row_gap + SettingsLayout::SINGLE_LINE_ROW_H),
-    );
-
-    y = layout.next_section_cursor(y);
-    let keyboard_header_y = y;
+    canvas.card(&t("settings.header_window_options"));
+    canvas.next_section();
     // Modifier popup shows Option+Tab / Command+Tab; the index maps to option/command.
     let mod_labels = [
         t("settings.modifier_option"),
@@ -324,9 +287,7 @@ pub(super) unsafe fn build_switcher_page(
     ];
     let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
     let mod_metrics = SettingsSelect::metrics(ctrl_w, &mod_label_refs, row_h, described_row_h);
-    y = layout.next_row_cursor(y, mod_metrics.row_h);
-    let keyboard_card_bottom = layout.card_bottom(y);
-    let keyboard_card_top = layout.card_top(keyboard_header_y);
+    let y = canvas.next_row(mod_metrics.row_h);
     ui.modifier = SettingsRow::tall_with_height(
         switcher_view,
         label_x,
@@ -345,16 +306,11 @@ pub(super) unsafe fn build_switcher_page(
     )
     .1;
     bind_control(target, ui.modifier);
-    SettingsSection::attach(
-        switcher_view,
-        NSRect::new(
-            NSPoint::new(6.0, keyboard_card_bottom),
-            NSSize::new(content_w - 12.0, keyboard_card_top - keyboard_card_bottom),
-        ),
-        &t("settings.header_keyboard"),
-    );
+    canvas.card(&t("settings.header_keyboard"));
 
-    keyboard_card_bottom
+    let content_bottom = canvas.finish();
+    ui.page_canvases[1] = canvas;
+    content_bottom
 }
 
 unsafe impl Send for SettingsPageBuildContext {}
@@ -380,12 +336,14 @@ pub(super) unsafe fn build_general_page(
     let described_row_h = layout.described_row_h;
     // The whole page-top block (title + first section heading) comes from the component; the
     // returned cursor is that heading's own cursor.
-    let mut y = SettingsPageHeader::attach(
+    // The page's layout owner: rows, cards, the title and the document height all follow from it.
+    let mut canvas = PageCanvas::new(
         general_view,
-        &t("settings.sidebar_general"),
-        6.0,
-        general_doc_h,
         content_w - 12.0,
+        layout,
+        &t("settings.sidebar_general"),
+        general_doc_h,
+        context.page_frame.size.height,
     );
 
     // The banner is a sibling of the scroll views; its strip and bottom gap are reserved so
@@ -457,8 +415,6 @@ pub(super) unsafe fn build_general_page(
 
     // Start hidden; page selection applies the permission state and resizes General's viewport.
     let _: () = msg_send![banner, setHidden: true];
-
-    let appearance_header_y = y;
     let theme_items = [
         t("settings.theme_dark"),
         t("settings.theme_light"),
@@ -466,7 +422,7 @@ pub(super) unsafe fn build_general_page(
     ];
     let theme_item_refs: Vec<&str> = theme_items.iter().map(String::as_str).collect();
     let theme_metrics = SettingsSelect::metrics(ctrl_w, &theme_item_refs, row_h, described_row_h);
-    y = layout.next_row_cursor(y, theme_metrics.row_h);
+    let y = canvas.next_row(theme_metrics.row_h);
     ui.theme = SettingsRow::described(
         general_view,
         label_x,
@@ -487,7 +443,7 @@ pub(super) unsafe fn build_general_page(
     bind_control(target, ui.theme);
     let glass_style_metrics =
         SettingsSelect::metrics(ctrl_w, &["Regular", "Clear"], row_h, described_row_h);
-    y -= glass_style_metrics.row_h;
+    let y = canvas.next_block(glass_style_metrics.row_h);
     SettingsRow::separator(general_view, y + glass_style_metrics.row_h, content_w);
     ui.glass_style = SettingsRow::described(
         general_view,
@@ -507,7 +463,7 @@ pub(super) unsafe fn build_general_page(
         ),
     );
     bind_control(target, ui.glass_style);
-    y -= described_row_h;
+    let y = canvas.next_block(described_row_h);
     SettingsRow::separator(general_view, y + described_row_h, content_w);
     ui.glass_tint = SettingsRow::described(
         general_view,
@@ -527,25 +483,13 @@ pub(super) unsafe fn build_general_page(
         ),
     );
     configure_glass_tint_panel(target);
-    let appearance_card_bottom = layout.card_bottom(y);
-    let appearance_card_top = layout.card_top(appearance_header_y);
-    SettingsSection::attach(
-        general_view,
-        NSRect::new(
-            NSPoint::new(6.0, appearance_card_bottom),
-            NSSize::new(
-                content_w - 12.0,
-                appearance_card_top - appearance_card_bottom,
-            ),
-        ),
-        &t("settings.header_appearance"),
-    );
+    canvas.card(&t("settings.header_appearance"));
 
-    y = layout.next_section_cursor(y);
-    let preview_header_y = y;
-    y = layout.next_row_cursor(y, row_h);
+    canvas.next_section();
+    // The preview pair is content the page lays out itself, so it is one block: the row cursor, the
+    // 90pt preview area and the captions above it, all owned by `preview_y`.
     let preview_h = 90.0;
-    let preview_y = y - preview_h;
+    let preview_y = canvas.next_block(layout.row_gap + row_h + preview_h);
     let preview_w = (content_w - 2.0 * label_x - 12.0) / 2.0;
     let right_preview_x = label_x + preview_w + 12.0;
     add_preview_caption(
@@ -572,25 +516,11 @@ pub(super) unsafe fn build_general_page(
         preview_h,
         false,
     );
-    y = preview_y;
-    SettingsSection::attach(
-        general_view,
-        NSRect::new(
-            NSPoint::new(6.0, preview_y - 12.0),
-            NSSize::new(
-                content_w - 12.0,
-                (preview_header_y - layout.card_header_gap) - (preview_y - 12.0),
-            ),
-        ),
-        &t("settings.header_preview"),
-    );
+    canvas.card_with_bottom_offset(&t("settings.header_preview"), -12.0);
 
-    y = layout.next_section_cursor(y);
-    let language_header_y = y;
+    canvas.next_section();
     let locale_metrics = SettingsSelect::metrics(ctrl_w, &LOCALE_LABELS, row_h, described_row_h);
-    y = layout.next_row_cursor(y, locale_metrics.row_h);
-    let language_card_bottom = layout.card_bottom(y);
-    let language_card_top = layout.card_top(language_header_y);
+    let y = canvas.next_row(locale_metrics.row_h);
     ui.locale = SettingsRow::plain(
         general_view,
         label_x,
@@ -608,21 +538,13 @@ pub(super) unsafe fn build_general_page(
         ),
     );
     bind_control(target, ui.locale);
-    SettingsSection::attach(
-        general_view,
-        NSRect::new(
-            NSPoint::new(6.0, language_card_bottom),
-            NSSize::new(content_w - 12.0, language_card_top - language_card_bottom),
-        ),
-        &t("settings.header_language"),
-    );
+    canvas.card(&t("settings.header_language"));
 
-    y = layout.next_section_cursor(y);
-    let logging_header_y = y;
+    canvas.next_section();
     // Log level popup: items = [debug, info]; default index 1 (info).
     let log_levels: [&str; 2] = ["Debug", "Info"];
     let log_level_metrics = SettingsSelect::metrics(ctrl_w, &log_levels, row_h, described_row_h);
-    y = layout.next_row_cursor(y, log_level_metrics.row_h);
+    let y = canvas.next_row(log_level_metrics.row_h);
     ui.log_level = SettingsRow::described(
         general_view,
         label_x,
@@ -644,7 +566,7 @@ pub(super) unsafe fn build_general_page(
     // Export logs: title+description on the left, action button on the right (same card
     // as the log level; the button opts out of ControlField live-apply and goes straight
     // through target/action).
-    y = layout.next_row_cursor(y, described_row_h);
+    let y = canvas.next_row(described_row_h);
     // In-card divider: the export row sits right below it (separator_above_row owns the
     // row-relative math).
     SettingsRow::separator_above_row(general_view, y, described_row_h, content_w);
@@ -666,21 +588,10 @@ pub(super) unsafe fn build_general_page(
         &t("settings.desc_export_logs"),
         export_btn,
     );
-    SettingsSection::attach(
-        general_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(y)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(logging_header_y) - layout.card_bottom(y),
-            ),
-        ),
-        &t("settings.header_logging"),
-    );
+    canvas.card(&t("settings.header_logging"));
 
-    y = layout.next_section_cursor(y);
-    let startup_header_y = y;
-    y = layout.next_row_cursor(y, described_row_h);
+    canvas.next_section();
+    let y = canvas.next_row(described_row_h);
     // Launch-at-login switch: no title (the row label on the left already describes it).
     ui.launch_at_login = SettingsRow::described(
         general_view,
@@ -693,19 +604,11 @@ pub(super) unsafe fn build_general_page(
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
     );
     bind_control(target, ui.launch_at_login);
-    SettingsSection::attach(
-        general_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(y)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(startup_header_y) - layout.card_bottom(y),
-            ),
-        ),
-        &t("settings.header_startup"),
-    );
+    canvas.card(&t("settings.header_startup"));
 
-    layout.card_bottom(y)
+    let content_bottom = canvas.finish();
+    ui.page_canvases[0] = canvas;
+    content_bottom
 }
 
 /// Build the Mouse page and return its final content bottom.
@@ -724,12 +627,14 @@ pub(super) unsafe fn build_mouse_page(
     let ctrl_x = layout.control_x;
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
-    let mut y = SettingsPageHeader::attach(
+    // The page's layout owner: rows, cards, the title and the document height all follow from it.
+    let mut canvas = PageCanvas::new(
         mouse_view,
-        &t("settings.sidebar_mouse"),
-        6.0,
-        mouse_doc_h,
         content_w - 12.0,
+        layout,
+        &t("settings.sidebar_mouse"),
+        mouse_doc_h,
+        context.page_frame.size.height,
     );
 
     // Header: every section in this app carries a short-noun heading (Device / Scrolling /
@@ -738,9 +643,7 @@ pub(super) unsafe fn build_mouse_page(
     // control": one notch shorter than the page title, the same way the clipboard page pairs
     // its "Clipboard" heading with the "Clipboard History" title, and it never repeats the row's
     // "Enable mouse control". Its distance from the page title comes from SettingsPageHeader.
-    let mouse_header_y = y;
-    y = layout.next_row_cursor(y, described_row_h);
-    let enable_mouse_bottom = y;
+    let y = canvas.next_row(described_row_h);
     ui.enable_mouse = SettingsRow::described(
         mouse_view,
         label_x,
@@ -754,20 +657,9 @@ pub(super) unsafe fn build_mouse_page(
     // Update OK button title in real time when the switch toggles (OK vs OK && Restart).
     let _: () = msg_send![ui.enable_mouse, setTarget: target];
     let _: () = msg_send![ui.enable_mouse, setAction: sel!(handleEnableMouseToggle:)];
-    let _ = SettingsSection::attach(
-        mouse_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(enable_mouse_bottom)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(mouse_header_y) - layout.card_bottom(enable_mouse_bottom),
-            ),
-        ),
-        &t("settings.header_mouse"),
-    );
+    canvas.card(&t("settings.header_mouse"));
 
-    y = layout.next_section_cursor(y);
-    let device_header_y = y;
+    canvas.next_section();
     // Popup: items are rebuilt dynamically in load_settings_values (device list is mutable).
     // A placeholder is inserted here; the real items are filled by rebuild_device_popup.
     let device_labels: Vec<String> = crate::mouse::device::connected_devices()
@@ -781,7 +673,7 @@ pub(super) unsafe fn build_mouse_page(
     };
     let device_metrics =
         SettingsSelect::metrics(ctrl_w, &device_label_refs, row_h, described_row_h);
-    y = layout.next_row_cursor(y, device_metrics.row_h);
+    let y = canvas.next_row(device_metrics.row_h);
     let dev_popup = SettingsControl::popup(
         ctrl_x,
         y + (device_metrics.row_h - device_metrics.control_h) / 2.0,
@@ -808,7 +700,7 @@ pub(super) unsafe fn build_mouse_page(
 
     let scroll_metrics =
         SettingsSelect::metrics(ctrl_w, &SCROLL_MODE_LABELS, row_h, described_row_h);
-    y = layout.next_row_cursor(y, scroll_metrics.row_h);
+    let y = canvas.next_row(scroll_metrics.row_h);
     let scroll_popup = SettingsControl::popup(
         ctrl_x,
         y + (scroll_metrics.row_h - scroll_metrics.control_h) / 2.0,
@@ -833,9 +725,11 @@ pub(super) unsafe fn build_mouse_page(
     SettingsRow::separator_above_row(mouse_view, y, scroll_metrics.row_h, content_w);
 
     // Keep this conditional row in the same card as Device and Scroll mode.
-    y = layout.next_row_cursor(y, described_row_h);
-    let line_count_separator =
-        SettingsRow::separator_above_row(mouse_view, y, described_row_h, content_w);
+    // The line-count row only appears in Line scroll mode: one row group the page layout owner
+    // skips (its divider goes with it and the shared device card's bottom edge closes the gap).
+    canvas.group_begin(RowGroup::LineCount);
+    let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(mouse_view, y, described_row_h, content_w);
     let (line_label, line_ctrl) = SettingsRow::tall(
         mouse_view,
         label_x,
@@ -863,36 +757,11 @@ pub(super) unsafe fn build_mouse_page(
     // live as the slider moves.
     ui.line_count_value_label = SettingsRow::attach_slider_readout(mouse_view, line_ctrl, 3);
     bind_control(target, ui.line_count);
-    let device_card_parts = SettingsSection::attach(
-        mouse_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(y)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(device_header_y) - layout.card_bottom(y),
-            ),
-        ),
-        &t("settings.header_mouse_device"),
-    );
-    let device_card = device_card_parts.card;
-    let device_shadow = device_card_parts.shadow;
-    // The line-count row is conditional (Line mode only): the card is the shared device card,
-    // whose bottom edge rises when the row goes away.
-    ui.line_count_block = CollapsibleRows::new(
-        device_card,
-        device_shadow,
-        vec![
-            ui.line_count,
-            ui.line_count_label,
-            ui.line_count_value_label,
-        ],
-        vec![line_count_separator],
-        layout.row_gap + SettingsLayout::SINGLE_LINE_ROW_H,
-    );
+    canvas.group_end();
+    canvas.card(&t("settings.header_mouse_device"));
 
-    y = layout.next_section_cursor(y);
-    let scrolling_header_y = y;
-    y = layout.next_row_cursor(y, described_row_h);
+    canvas.next_section();
+    let y = canvas.next_row(described_row_h);
     // reverse_scroll switch: title + subtitle describe the scroll inversion; the switch
     // keeps the reference page's trailing inset.
     ui.reverse_scroll = SettingsRow::described(
@@ -906,21 +775,10 @@ pub(super) unsafe fn build_mouse_page(
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
     );
     bind_control(target, ui.reverse_scroll);
-    SettingsSection::attach(
-        mouse_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(y)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(scrolling_header_y) - layout.card_bottom(y),
-            ),
-        ),
-        &t("settings.header_mouse_scrolling"),
-    );
+    canvas.card(&t("settings.header_mouse_scrolling"));
 
-    y = layout.next_section_cursor(y);
-    let pointer_header_y = y;
-    y = layout.next_row_cursor(y, described_row_h);
+    canvas.next_section();
+    let y = canvas.next_row(described_row_h);
     // disable_pointer_accel switch: disable system pointer acceleration for 1:1 linear
     // cursor tracking. The subtitle explains linear tracking; the switch keeps the same
     // trailing inset as every other switch row.
@@ -945,9 +803,11 @@ pub(super) unsafe fn build_mouse_page(
     // The separator takes the y of the row BELOW the line (SettingsRow::separator draws it
     // 3pt above that row's top edge); any other y puts it at the card's top, which is what
     // the device card's internal dividers rely on too.
-    y = layout.next_row_cursor(y, described_row_h);
-    let pointer_accel_separator =
-        SettingsRow::separator_above_row(mouse_view, y, described_row_h, content_w);
+    // The tracking-speed row only appears while pointer acceleration is off: one row group the page
+    // layout owner skips.
+    canvas.group_begin(RowGroup::PointerAccel);
+    let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(mouse_view, y, described_row_h, content_w);
     let (pointer_accel_label, pointer_accel_slider) = SettingsRow::tall_with_height(
         mouse_view,
         label_x,
@@ -979,39 +839,16 @@ pub(super) unsafe fn build_mouse_page(
         pointer_accel_display(crate::mouse::pointer::FALLBACK_ACCELERATION),
     );
     bind_control(target, ui.pointer_accel_slider);
+    canvas.group_end();
 
-    let pointer_card_parts = SettingsSection::attach(
-        mouse_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(y)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(pointer_header_y) - layout.card_bottom(y),
-            ),
-        ),
-        &t("settings.header_mouse_pointer"),
-    );
-    // The tracking-speed row is conditional: hand the card, its shadow, the row's three views,
-    // and the divider above it to the component.
-    ui.pointer_accel_block = CollapsibleRows::new(
-        pointer_card_parts.card,
-        pointer_card_parts.shadow,
-        vec![
-            ui.pointer_accel_label,
-            ui.pointer_accel_slider,
-            ui.pointer_accel_value_label,
-        ],
-        vec![pointer_accel_separator],
-        layout.row_gap + SettingsLayout::SINGLE_LINE_ROW_H,
-    );
+    canvas.card(&t("settings.header_mouse_pointer"));
 
     // Button mappings: an "Enable button mappings" described row + a nested table card
     // (rounded sub-table + the add-mapping button).
-    y = layout.next_section_cursor(y);
-    let mappings_header_y = y;
+    canvas.next_section();
     // "Enable button mappings" described row (HTML card top), replacing the old switch
     // that sat on the section-header row's right edge.
-    y = layout.next_row_cursor(y, described_row_h);
+    let y = canvas.next_row(described_row_h);
     ui.mapping_enabled = SettingsRow::described(
         mouse_view,
         label_x,
@@ -1024,27 +861,20 @@ pub(super) unsafe fn build_mouse_page(
     );
     let _: () = msg_send![ui.mapping_enabled, setTarget: target];
     let _: () = msg_send![ui.mapping_enabled, setAction: sel!(handleMappingEnabledChanged:)];
-    SettingsSection::attach(
-        mouse_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(y)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(mappings_header_y) - layout.card_bottom(y),
-            ),
-        ),
-        &t("settings.header_mouse_mappings"),
-    );
+    canvas.card(&t("settings.header_mouse_mappings"));
 
-    y -= 24.0;
-    let card_top = y;
+    // A 24pt gap under the section card, then the binding table itself: a block the canvas owns
+    // (the mapping list resizes it as its rows change, see `render_mapping_rows_locked`). The
+    // block's origin is the card's bottom edge, so its top stays on the gap and it grows downward.
+    canvas.next_block(24.0);
     let card_w = content_w - 12.0;
     let card_h = MAPPING_PANEL_TOP
         + (MAPPING_HEADER_H + MAPPING_ROW_H * 3.0)
         + MAPPING_ACTION_TOP
         + MAPPING_ACTION_H
         + MAPPING_CARD_PAD_BOT;
-    let card_bottom = card_top - card_h;
+    let card_bottom = canvas.next_block(card_h);
+    ui.mapping_layout_row = canvas.last_row();
     // The outer card is a white settings card (same as every other card); only the nested
     // table and the add button carry the gray "dark" treatment from the HTML reference.
     let card_bg: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -1154,11 +984,14 @@ pub(super) unsafe fn build_mouse_page(
     ui.mapping_card = card_bg;
     ui.mapping_scroll = std::ptr::null_mut();
     ui.mapping_doc = card_bg;
-    let mouse_content_bottom = card_bottom;
+    // Settle the page and publish it before the mapping rows render: the table's block has to be
+    // part of the layout for `render_mapping_rows` to hand over its height.
+    let content_bottom = canvas.finish();
+    ui.page_canvases[2] = canvas;
     // Render the current device's mappings initially.
     render_mapping_rows();
 
-    mouse_content_bottom
+    content_bottom
 }
 
 /// Build the Clipboard page and return its final options-card bottom.
@@ -1177,19 +1010,18 @@ pub(super) unsafe fn build_clipboard_page(
     let ctrl_x = layout.control_x;
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
-    // Independent layout cursor (this page's content is unrelated to the mouse page).
-    let mut cy = SettingsPageHeader::attach(
+    // The page's layout owner: rows, cards, the title and the document height all follow from it.
+    let mut canvas = PageCanvas::new(
         clipboard_view,
-        &t("settings.sidebar_clipboard"),
-        6.0,
-        clipboard_doc_h,
         content_w - 12.0,
+        layout,
+        &t("settings.sidebar_clipboard"),
+        clipboard_doc_h,
+        context.page_frame.size.height,
     );
-    let clipboard_header_y = cy;
-    cy = layout.next_row_cursor(cy, described_row_h);
+    let cy = canvas.next_row(described_row_h);
     // English "Enable clipboard history" (measured 146pt) plus cell padding sits on
     // the label_w=150 edge; widen to 225 along with the persist/move_used_to_top rows.
-    let clipboard_master_row_y = cy;
     ui.clipboard_enabled = SettingsRow::described(
         clipboard_view,
         label_x,
@@ -1205,20 +1037,9 @@ pub(super) unsafe fn build_clipboard_page(
         ui.clipboard_enabled,
         setAction: sel!(handleClipboardEnabledToggle:)
     ];
-    SettingsSection::attach(
-        clipboard_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(clipboard_master_row_y)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(clipboard_header_y) - layout.card_bottom(clipboard_master_row_y),
-            ),
-        ),
-        &t("settings.header_clipboard"),
-    );
+    canvas.card(&t("settings.header_clipboard"));
     // Keep the history controls in a second titled card, matching the switcher layout.
-    cy = layout.next_section_cursor(cy);
-    let clipboard_options_header_y = cy;
+    canvas.next_section();
     // Pin-selection popup: items = [Follow the Pinned Entry, Keep Current Position];
     // default index 0 (follow); the real value is set by load_settings_from.
     let pin_labels = [
@@ -1227,7 +1048,7 @@ pub(super) unsafe fn build_clipboard_page(
     ];
     let pin_label_refs: Vec<&str> = pin_labels.iter().map(|s| s.as_str()).collect();
     let pin_metrics = SettingsSelect::metrics(ctrl_w, &pin_label_refs, row_h, described_row_h);
-    cy = layout.next_row_cursor(cy, pin_metrics.row_h);
+    let cy = canvas.next_row(pin_metrics.row_h);
     ui.clipboard_pin_follow = SettingsRow::plain(
         clipboard_view,
         label_x,
@@ -1245,7 +1066,7 @@ pub(super) unsafe fn build_clipboard_page(
         ),
     );
     bind_control(target, ui.clipboard_pin_follow);
-    cy = layout.next_row_cursor(cy, described_row_h);
+    let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
     // privacy implications are documented in the README).
@@ -1264,7 +1085,7 @@ pub(super) unsafe fn build_clipboard_page(
         SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
     );
     bind_control(target, ui.clipboard_persist);
-    cy = layout.next_row_cursor(cy, described_row_h);
+    let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // show the source app.
     ui.clipboard_show_source_app = SettingsRow::plain(
@@ -1277,7 +1098,7 @@ pub(super) unsafe fn build_clipboard_page(
         SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
     );
     bind_control(target, ui.clipboard_show_source_app);
-    cy = layout.next_row_cursor(cy, described_row_h);
+    let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // Move used entries to the top (whether pasting reorders the history; on by
     // default = current behavior).
@@ -1294,7 +1115,7 @@ pub(super) unsafe fn build_clipboard_page(
         SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
     );
     bind_control(target, ui.clipboard_move_used_to_top);
-    cy = layout.next_row_cursor(cy, described_row_h);
+    let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // Delete after paste (Option+Enter/click = one-shot paste). Off by default -- a
     // destructive gesture, strictly opt-in. Row subtitles are no longer rendered (see
@@ -1312,13 +1133,14 @@ pub(super) unsafe fn build_clipboard_page(
         SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
     );
     bind_control(target, ui.clipboard_delete_after_paste);
-    cy = layout.next_row_cursor(cy, described_row_h);
-    let clear_pasteboard_separator =
-        SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // This row is a child of the switch above (indented label): it only appears while "delete
-    // entry after paste" is on, so it goes through the conditional-row component (whole row
-    // shown/hidden, sections below closing the gap) rather than being greyed out.
-    let (clear_pasteboard_label, clear_pasteboard_switch) = SettingsRow::tall_with_height(
+    // entry after paste" is on, so it belongs to a row group the page layout owner skips (the row
+    // disappears and the rows below close its gap) rather than being greyed out. The group opens
+    // before the row is placed: `next_row` records the group its row belongs to.
+    canvas.group_begin(RowGroup::ClipboardDeleteChild);
+    let cy = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
+    let (_, clear_pasteboard_switch) = SettingsRow::tall_with_height(
         clipboard_view,
         label_x + 18.0,
         cy,
@@ -1329,7 +1151,8 @@ pub(super) unsafe fn build_clipboard_page(
     );
     ui.clipboard_clear_system_pasteboard_after_paste = clear_pasteboard_switch;
     bind_control(target, ui.clipboard_clear_system_pasteboard_after_paste);
-    cy = layout.next_row_cursor(cy, described_row_h);
+    canvas.group_end();
+    let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // max entries (number input).
     ui.clipboard_max_entries = SettingsRow::plain(
@@ -1341,7 +1164,7 @@ pub(super) unsafe fn build_clipboard_page(
         &t("settings.row_clipboard_max_entries"),
         SettingsControl::text_input(ctrl_x, cy, ctrl_w, row_h, "50"),
     );
-    cy = layout.next_row_cursor(cy, described_row_h);
+    let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // Auto-expire days slider: 0..=7, where 0 means never; the current value is shown on
     // the right.
@@ -1370,29 +1193,11 @@ pub(super) unsafe fn build_clipboard_page(
         CLIPBOARD_AUTO_EXPIRE_DEFAULT,
     );
     bind_control(target, ui.clipboard_auto_expire_days);
-    let clipboard_options_card_bottom = layout.card_bottom(cy);
-    let clipboard_options_card_parts = SettingsSection::attach(
-        clipboard_view,
-        NSRect::new(
-            NSPoint::new(6.0, clipboard_options_card_bottom),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(clipboard_options_header_y) - clipboard_options_card_bottom,
-            ),
-        ),
-        &t("settings.header_clipboard_options"),
-    );
-    // The "clear the matching system-pasteboard entry" row follows "delete entry after paste"
-    // (one row tall).
-    ui.clipboard_delete_block = CollapsibleRows::new(
-        clipboard_options_card_parts.card,
-        clipboard_options_card_parts.shadow,
-        vec![clear_pasteboard_label, clear_pasteboard_switch],
-        vec![clear_pasteboard_separator],
-        layout.row_gap + SettingsLayout::SINGLE_LINE_ROW_H,
-    );
+    canvas.card(&t("settings.header_clipboard_options"));
 
-    clipboard_options_card_bottom
+    let content_bottom = canvas.finish();
+    ui.page_canvases[3] = canvas;
+    content_bottom
 }
 
 /// Build the Window Control page and return its shortcuts-card bottom.
@@ -1410,16 +1215,16 @@ pub(super) unsafe fn build_window_control_page(
     let ctrl_x = layout.control_x;
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
-    // Independent layout cursor (unrelated to the clipboard page).
-    let mut wy = SettingsPageHeader::attach(
+    // The page's layout owner: rows, cards, the title and the document height all follow from it.
+    let mut canvas = PageCanvas::new(
         window_control_view,
-        &t("settings.sidebar_window_control"),
-        6.0,
-        window_control_doc_h,
         content_w - 12.0,
+        layout,
+        &t("settings.sidebar_window_control"),
+        window_control_doc_h,
+        context.page_frame.size.height,
     );
-    let window_control_header_y = wy;
-    wy = layout.next_row_cursor(wy, described_row_h);
+    let wy = canvas.next_row(described_row_h);
     // Enable window control (master switch): the global Option+arrow interception is off
     // by default and must be explicitly opted in.
     ui.window_control_enabled = SettingsRow::described(
@@ -1437,23 +1242,12 @@ pub(super) unsafe fn build_window_control_page(
         ui.window_control_enabled,
         setAction: sel!(handleWindowControlEnabledToggle:)
     ];
-    SettingsSection::attach(
-        window_control_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(wy)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(window_control_header_y) - layout.card_bottom(wy),
-            ),
-        ),
-        &t("settings.header_window_control"),
-    );
+    canvas.card(&t("settings.header_window_control"));
 
     // Put the direction shortcuts in their own card so the master switch is separate from
     // the per-direction settings.
-    wy = layout.next_section_cursor(wy);
-    let window_control_shortcuts_header_y = wy;
-    wy = layout.next_row_cursor(wy, described_row_h);
+    canvas.next_section();
+    let wy = canvas.next_row(described_row_h);
     ui.window_control_up = SettingsRow::described(
         window_control_view,
         label_x,
@@ -1465,7 +1259,7 @@ pub(super) unsafe fn build_window_control_page(
         SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
     );
     bind_control(target, ui.window_control_up);
-    wy = layout.next_row_cursor(wy, described_row_h);
+    let wy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
     ui.window_control_down = SettingsRow::described(
         window_control_view,
@@ -1478,7 +1272,7 @@ pub(super) unsafe fn build_window_control_page(
         SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
     );
     bind_control(target, ui.window_control_down);
-    wy = layout.next_row_cursor(wy, described_row_h);
+    let wy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
     ui.window_control_left = SettingsRow::described(
         window_control_view,
@@ -1491,7 +1285,7 @@ pub(super) unsafe fn build_window_control_page(
         SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
     );
     bind_control(target, ui.window_control_left);
-    wy = layout.next_row_cursor(wy, described_row_h);
+    let wy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
     ui.window_control_right = SettingsRow::described(
         window_control_view,
@@ -1504,7 +1298,7 @@ pub(super) unsafe fn build_window_control_page(
         SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
     );
     bind_control(target, ui.window_control_right);
-    wy = layout.next_row_cursor(wy, described_row_h);
+    let wy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
     ui.window_control_display_up = SettingsRow::described(
         window_control_view,
@@ -1517,7 +1311,7 @@ pub(super) unsafe fn build_window_control_page(
         SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
     );
     bind_control(target, ui.window_control_display_up);
-    wy = layout.next_row_cursor(wy, described_row_h);
+    let wy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
     ui.window_control_display_down = SettingsRow::described(
         window_control_view,
@@ -1530,7 +1324,7 @@ pub(super) unsafe fn build_window_control_page(
         SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
     );
     bind_control(target, ui.window_control_display_down);
-    wy = layout.next_row_cursor(wy, described_row_h);
+    let wy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
     ui.window_control_display_left = SettingsRow::described(
         window_control_view,
@@ -1543,7 +1337,7 @@ pub(super) unsafe fn build_window_control_page(
         SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
     );
     bind_control(target, ui.window_control_display_left);
-    wy = layout.next_row_cursor(wy, described_row_h);
+    let wy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
     ui.window_control_display_right = SettingsRow::described(
         window_control_view,
@@ -1556,21 +1350,11 @@ pub(super) unsafe fn build_window_control_page(
         SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
     );
     bind_control(target, ui.window_control_display_right);
-    let window_control_shortcuts_card_bottom = layout.card_bottom(wy);
-    SettingsSection::attach(
-        window_control_view,
-        NSRect::new(
-            NSPoint::new(6.0, window_control_shortcuts_card_bottom),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(window_control_shortcuts_header_y)
-                    - window_control_shortcuts_card_bottom,
-            ),
-        ),
-        &t("settings.header_window_control_shortcuts"),
-    );
+    canvas.card(&t("settings.header_window_control_shortcuts"));
 
-    window_control_shortcuts_card_bottom
+    let content_bottom = canvas.finish();
+    ui.page_canvases[4] = canvas;
+    content_bottom
 }
 
 /// Build the Quick Actions page and return its shortcuts-card bottom.
@@ -1589,15 +1373,16 @@ pub(super) unsafe fn build_quick_actions_page(
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
     // Independent layout cursor (unrelated to the window-control page).
-    let mut qy = SettingsPageHeader::attach(
+    // The page's layout owner: rows, cards, the title and the document height all follow from it.
+    let mut canvas = PageCanvas::new(
         quick_actions_view,
-        &t("settings.sidebar_quick_actions"),
-        6.0,
-        quick_actions_doc_h,
         content_w - 12.0,
+        layout,
+        &t("settings.sidebar_quick_actions"),
+        quick_actions_doc_h,
+        context.page_frame.size.height,
     );
-    let quick_actions_header_y = qy;
-    qy = layout.next_row_cursor(qy, described_row_h);
+    let qy = canvas.next_row(described_row_h);
     // Enable quick actions (master switch): the global Option+I/E/D/L interception is off
     // by default and must be explicitly opted in.
     ui.quick_actions_enabled = SettingsRow::described(
@@ -1615,23 +1400,12 @@ pub(super) unsafe fn build_quick_actions_page(
         ui.quick_actions_enabled,
         setAction: sel!(handleQuickActionsEnabledToggle:)
     ];
-    SettingsSection::attach(
-        quick_actions_view,
-        NSRect::new(
-            NSPoint::new(6.0, layout.card_bottom(qy)),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(quick_actions_header_y) - layout.card_bottom(qy),
-            ),
-        ),
-        &t("settings.header_quick_actions"),
-    );
+    canvas.card(&t("settings.header_quick_actions"));
 
     // Put the four action switches in their own card so the master switch stays separate
     // from the per-action settings (matching the window-control page).
-    qy = layout.next_section_cursor(qy);
-    let quick_actions_shortcuts_header_y = qy;
-    qy = layout.next_row_cursor(qy, described_row_h);
+    canvas.next_section();
+    let qy = canvas.next_row(described_row_h);
     ui.quick_actions_open_settings = SettingsRow::described(
         quick_actions_view,
         label_x,
@@ -1643,7 +1417,7 @@ pub(super) unsafe fn build_quick_actions_page(
         SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
     );
     bind_control(target, ui.quick_actions_open_settings);
-    qy = layout.next_row_cursor(qy, described_row_h);
+    let qy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
     ui.quick_actions_open_finder = SettingsRow::described(
         quick_actions_view,
@@ -1656,7 +1430,7 @@ pub(super) unsafe fn build_quick_actions_page(
         SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
     );
     bind_control(target, ui.quick_actions_open_finder);
-    qy = layout.next_row_cursor(qy, described_row_h);
+    let qy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
     ui.quick_actions_show_desktop = SettingsRow::described(
         quick_actions_view,
@@ -1669,7 +1443,7 @@ pub(super) unsafe fn build_quick_actions_page(
         SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
     );
     bind_control(target, ui.quick_actions_show_desktop);
-    qy = layout.next_row_cursor(qy, described_row_h);
+    let qy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
     ui.quick_actions_lock_screen = SettingsRow::described(
         quick_actions_view,
@@ -1682,7 +1456,7 @@ pub(super) unsafe fn build_quick_actions_page(
         SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
     );
     bind_control(target, ui.quick_actions_lock_screen);
-    qy = layout.next_row_cursor(qy, described_row_h);
+    let qy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
     ui.quick_actions_locate_pointer = SettingsRow::described(
         quick_actions_view,
@@ -1695,20 +1469,11 @@ pub(super) unsafe fn build_quick_actions_page(
         SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
     );
     bind_control(target, ui.quick_actions_locate_pointer);
-    let quick_actions_card_bottom = layout.card_bottom(qy);
-    SettingsSection::attach(
-        quick_actions_view,
-        NSRect::new(
-            NSPoint::new(6.0, quick_actions_card_bottom),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(quick_actions_shortcuts_header_y) - quick_actions_card_bottom,
-            ),
-        ),
-        &t("settings.header_quick_actions_shortcuts"),
-    );
+    canvas.card(&t("settings.header_quick_actions_shortcuts"));
 
-    quick_actions_card_bottom
+    let content_bottom = canvas.finish();
+    ui.page_canvases[5] = canvas;
+    content_bottom
 }
 
 /// Build the About page and return its compact update-card bottom.
@@ -1728,7 +1493,25 @@ pub(super) unsafe fn build_about_page(
     let ctrl_x = layout.control_x;
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
-    let header_top = about_doc_h - 68.0;
+    // The About page's header keeps the same rhythm as the shared page header: its block starts
+    // `PageHeader`-style below the top edge and the first section steps from the block's bottom.
+    // `ABOUT_HEADER_TOP` is the header block's own top offset; the block height below is what keeps
+    // the first section cursor at `ABOUT_HEADER_TOP + ABOUT_HEADER_BLOCK_H + section_step`.
+    const ABOUT_HEADER_TOP: f64 = 76.0;
+    const ABOUT_HEADER_BLOCK_H: f64 = 80.0;
+    let header_top = about_doc_h - ABOUT_HEADER_TOP;
+    // The About page draws its own header, so it hands the canvas the distance from the document's
+    // top edge down to the first section cursor and pins the header views it creates below.
+    let header_offset = ABOUT_HEADER_TOP + ABOUT_HEADER_BLOCK_H + layout.section_step;
+    let mut canvas = PageCanvas::new_at(
+        about_view,
+        content_w - 12.0,
+        layout,
+        header_offset,
+        about_doc_h,
+        context.page_frame.size.height,
+    );
+    let header_mark = canvas.view_mark();
     add_about_app_icon(about_view, label_x, header_top - 58.0);
 
     let about_title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -1786,6 +1569,7 @@ pub(super) unsafe fn build_about_page(
     ];
     let _: () = msg_send![about_view, addSubview: about_header_hit];
     release_obj(about_header_hit);
+    canvas.pin_from_mark(header_mark);
 
     // Rows inside a card are derived from the layout, like every other page: the first row is
     // card top minus the bottom inset minus the row height, then next_row_cursor steps down.
@@ -1796,8 +1580,6 @@ pub(super) unsafe fn build_about_page(
     // The page header (icon + title + version subtitle) occupies 88pt below header_top; a
     // section title must step down from the header's BOTTOM or it lands on the icon (measured:
     // next_section_cursor(header_top) put the "App" title inside the icon's lower half).
-    const ABOUT_HEADER_BLOCK_H: f64 = 88.0;
-    let app_label_y = layout.next_section_cursor(header_top - ABOUT_HEADER_BLOCK_H);
     // Keep every About row on the same two-column grid: label on the left, value on the right.
     let about_value_x = label_x + 145.0;
     let about_value_w = (content_w - 2.0 * label_x - 145.0).max(1.0);
@@ -1807,7 +1589,7 @@ pub(super) unsafe fn build_about_page(
     // The first row uses the same layout row-step convention as the rest of the card (and every
     // other page); it used card_top - card_bottom_inset - described_row_h before, 6pt more than
     // the convention, which made this row look taller.
-    let guide_y = layout.next_row_cursor(app_label_y, described_row_h);
+    let guide_y = canvas.next_row(described_row_h);
     SettingsRow::plain(
         about_view,
         label_x,
@@ -1827,7 +1609,7 @@ pub(super) unsafe fn build_about_page(
             sel!(handleOpenOnboarding:),
         ),
     );
-    let website_y = layout.next_row_cursor(guide_y, described_row_h);
+    let website_y = canvas.next_row(described_row_h);
     // With "View guide" leading the card, the website row needs its own separator (it used to
     // be the first row, so it had none).
     SettingsRow::separator_above_row(about_view, website_y, described_row_h, content_w);
@@ -1847,7 +1629,7 @@ pub(super) unsafe fn build_about_page(
             0,
         ),
     );
-    let github_y = layout.next_row_cursor(website_y, described_row_h);
+    let github_y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(about_view, github_y, described_row_h, content_w);
     SettingsRow::plain(
         about_view,
@@ -1865,7 +1647,7 @@ pub(super) unsafe fn build_about_page(
             1,
         ),
     );
-    let version_y = layout.next_row_cursor(github_y, described_row_h);
+    let version_y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(about_view, version_y, described_row_h, content_w);
     SettingsRow::plain(
         about_view,
@@ -1882,23 +1664,12 @@ pub(super) unsafe fn build_about_page(
             env!("CARGO_PKG_VERSION"),
         ),
     );
-    let app_card_bottom = layout.card_bottom(version_y);
-    SettingsSection::attach(
-        about_view,
-        NSRect::new(
-            NSPoint::new(6.0, app_card_bottom),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(app_label_y) - app_card_bottom,
-            ),
-        ),
-        &t("settings.section_app"),
-    );
+    canvas.card(&t("settings.section_app"));
 
-    let permissions_label_y = layout.next_section_cursor(app_card_bottom);
+    canvas.next_section_with_offset(layout.card_bottom_inset);
     // The first row derives from the card top so it matches card_bottom_inset (10); the old
     // 27+44 assumed the retired 44pt row height and left ~11pt of extra space above it.
-    let permissions_row_top_y = layout.next_row_cursor(permissions_label_y, described_row_h);
+    let permissions_row_top_y = canvas.next_row(described_row_h);
     let permission_action_gap = 8.0;
     // The status column width is derived from the shared action-button convention so the
     // button's right edge lines up with every other in-row action button.
@@ -1932,7 +1703,7 @@ pub(super) unsafe fn build_about_page(
     ui.accessibility_permission_button = accessibility_button;
     release_obj(accessibility_button);
 
-    let screen_recording_row_y = layout.next_row_cursor(permissions_row_top_y, described_row_h);
+    let screen_recording_row_y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(
         about_view,
         screen_recording_row_y,
@@ -1966,22 +1737,10 @@ pub(super) unsafe fn build_about_page(
     );
     let _: () = msg_send![about_view, addSubview: screen_recording_button];
     release_obj(screen_recording_button);
+    canvas.card(&t("settings.section_permissions"));
 
-    let permissions_card_bottom = layout.card_bottom(screen_recording_row_y);
-    SettingsSection::attach(
-        about_view,
-        NSRect::new(
-            NSPoint::new(6.0, permissions_card_bottom),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(permissions_label_y) - permissions_card_bottom,
-            ),
-        ),
-        &t("settings.section_permissions"),
-    );
-
-    let updates_label_y = layout.next_section_cursor(permissions_card_bottom);
-    let update_row_y = layout.next_row_cursor(updates_label_y, described_row_h);
+    canvas.next_section_with_offset(layout.card_bottom_inset);
+    let update_row_y = canvas.next_row(described_row_h);
     ui.update_auto_check = SettingsRow::described(
         about_view,
         label_x,
@@ -1994,7 +1753,7 @@ pub(super) unsafe fn build_about_page(
     );
     bind_control(target, ui.update_auto_check);
     // Automatically-download-and-install switch, between auto-check and the check button.
-    let download_row_y = layout.next_row_cursor(update_row_y, described_row_h);
+    let download_row_y = canvas.next_row(described_row_h);
     ui.update_auto_download = SettingsRow::described(
         about_view,
         label_x,
@@ -2010,12 +1769,19 @@ pub(super) unsafe fn build_about_page(
     // multi-row cards. The rows are contiguous here, so the divider sits at their shared edge.
     SettingsRow::separator(about_view, update_row_y, content_w);
     // Check for updates: a taller full-width button whose title switches between
-    // "Check for Updates…", "Checking…", and "You're up to date".
+    // "Check for Updates…", "Checking…", and "You're up to date". It sits contiguous with the row
+    // above (no shared gap), so it is a block rather than a row -- and the Updates card's bottom
+    // edge then derives from its position like every other card.
     let check_button_h = 38.0;
-    // Keep the check button directly below the second toggle. When the inline update host
-    // replaces it, the result content can then start directly at the divider without retaining
-    // the old button's vertical slot or its extra 14pt spacer.
-    let check_button_y = download_row_y - check_button_h;
+    let check_button_y = canvas.next_block(check_button_h);
+    // Reuse the same full-width card divider as the boundary between grouped settings rows. It is
+    // created inside this block's capture -- the boundary above the button belongs to this row -- so
+    // the layout owner moves it together with the row it separates. It stays hidden while compact and
+    // is revealed only when the inline update result replaces the check button area, so the collapsed
+    // About page does not gain an empty separator.
+    let update_divider = SettingsRow::separator(about_view, download_row_y, content_w);
+    let _: () = msg_send![update_divider, setHidden: true];
+    ui.update_divider = update_divider;
     let check_button = SettingsButton::action(
         NSRect::new(
             NSPoint::new(label_x, check_button_y),
@@ -2038,17 +1804,17 @@ pub(super) unsafe fn build_about_page(
     ui.update_check_button = check_button;
     release_obj(check_button);
     // Inline update-flow host container: update status/progress/buttons render here instead of
-    // a separate NSWindow. Empty and hidden by default, so the About page stays compact; an
-    // active flow expands the card + host via expand_update_section.
-    // The host occupies the check button's position; its top-down content replaces the button
-    // instead of being appended below it. With an initial height of 0, origin.y is the top.
+    // a separate NSWindow. Empty and hidden by default, so the About page stays compact; the flow
+    // hands its height to the layout owner (`set_row_consume`), which keeps the host's top edge on
+    // the check button and grows it downward.
     let compact_host_h = 0.0;
-    let host_origin_y = check_button_y;
+    let host_top_y = canvas.next_block(compact_host_h);
+    ui.update_host_row = canvas.last_row();
     let update_host: *mut AnyObject = msg_send![widgets::flipped_settings_view_class(), alloc];
     let update_host: *mut AnyObject = msg_send![
         update_host,
         initWithFrame: NSRect::new(
-            NSPoint::new(label_x, host_origin_y),
+            NSPoint::new(label_x, host_top_y),
             NSSize::new(content_w - 2.0 * label_x, compact_host_h),
         )
     ];
@@ -2056,46 +1822,25 @@ pub(super) unsafe fn build_about_page(
     let _: () = msg_send![about_view, addSubview: update_host];
     release_obj(update_host);
     ui.update_host = update_host;
-    ui.update_host_origin_y = host_origin_y;
     ui.update_host_window = window;
     crate::updater::set_update_host(update_host, window, check_button);
     // The collapsed card bottom hugs the check button with a 10pt inset; the inline area is
     // not reserved by default, avoiding a large blank.
-    let compact_card_bottom = check_button_y - 10.0;
-    let update_card_parts = SettingsSection::attach(
-        about_view,
-        NSRect::new(
-            NSPoint::new(6.0, compact_card_bottom),
-            NSSize::new(
-                content_w - 12.0,
-                layout.card_top(updates_label_y) - compact_card_bottom,
-            ),
-        ),
-        &t("settings.section_updates"),
-    );
+    let update_card_parts = canvas.card(&t("settings.section_updates"));
     let update_card = update_card_parts.card;
     let update_card_shadow = update_card_parts.shadow;
     ui.update_card = update_card;
     ui.update_card_shadow = update_card_shadow;
-    // Reuse the same full-width card divider as the boundary between grouped settings rows.
-    // It is hidden while compact and revealed only when the inline update result replaces the
-    // check button area, so the collapsed About page does not gain an empty separator.
-    let update_divider = SettingsRow::separator(about_view, download_row_y, content_w);
-    let _: () = msg_send![update_divider, setHidden: true];
-    ui.update_divider = update_divider;
-    ui.update_card_compact_h = {
-        let compact_frame: NSRect = msg_send![update_card, frame];
-        compact_frame.size.height
-    };
-
-    compact_card_bottom
+    let content_bottom = canvas.finish();
+    ui.page_canvases[6] = canvas;
+    content_bottom
 }
 
 /// Finish page registration, restore-default controls, and document validation.
 pub(super) unsafe fn finalize_settings_pages(
     content: *mut AnyObject,
     window: *mut AnyObject,
-    page_frame: NSRect,
+    _page_frame: NSRect,
     content_w: f64,
     target: *mut AnyObject,
     pages: SettingsPageFinalization,
@@ -2110,19 +1855,6 @@ pub(super) unsafe fn finalize_settings_pages(
     release_obj(ui.permission_warning_view);
 
     let _: () = msg_send![window, layoutIfNeeded];
-    for (name, (scroll, document)) in [
-        ("general", (page_roots[0], page_documents[0])),
-        ("switcher", (page_roots[1], page_documents[1])),
-        ("mouse", (page_roots[2], page_documents[2])),
-        ("clipboard", (page_roots[3], page_documents[3])),
-        ("quick-actions", (page_roots[5], page_documents[5])),
-        ("about", (page_roots[6], page_documents[6])),
-    ] {
-        SettingsPage { scroll, document }.validate(name);
-    }
-    let update_host_frame: NSRect = msg_send![ui.update_host, frame];
-    ui.update_host_origin_y = update_host_frame.origin.y;
-
     for (index, document) in page_documents.iter().enumerate() {
         ui.page_restores[index] = RestoreDefaultsControl::build_for_page(
             *document,
@@ -2143,10 +1875,12 @@ pub(super) unsafe fn finalize_settings_pages(
         "about",
     ];
     for (index, (root, document)) in page_roots.iter().zip(page_documents.iter()).enumerate() {
-        let _ = widgets::fit_page_document_height(
-            *document,
-            page_frame.size.height,
-            SettingsPageHeader::BOTTOM_PADDING,
+        // Settle the page *before* validating it: the restore control is part of the page content
+        // (it hangs below the last card) and therefore decides the document height. Every page is
+        // owned by its layout owner now (see `settings::page_canvas`).
+        ui.page_canvases[index].attach_restore(
+            ui.page_restores[index].container,
+            ui.page_restores[index].surface,
         );
         SettingsPage {
             scroll: *root,
@@ -2154,6 +1888,4 @@ pub(super) unsafe fn finalize_settings_pages(
         }
         .validate(page_names[index]);
     }
-    let update_host_frame: NSRect = msg_send![ui.update_host, frame];
-    ui.update_host_origin_y = update_host_frame.origin.y;
 }

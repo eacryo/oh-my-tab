@@ -303,11 +303,12 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
                 + MAPPING_ACTION_TOP
                 + MAPPING_ACTION_H
                 + MAPPING_CARD_PAD_BOT;
-            let card_top = card_frame.origin.y + card_frame.size.height;
-            let card_bottom = card_top - card_h;
-            // The panel keeps its top-left anchor; its height tracks the rows.
+            // The page's layout owner places the card: its top edge stays put and it grows
+            // downward, so the height is handed over for the page geometry and applied to the card
+            // itself without touching the origin the canvas just set.
             let _: () = msg_send![u.mapping_panel, setFrameSize: NSSize::new(card_w - 2.0 * MAPPING_PANEL_X, panel_h)];
-            let _: () = msg_send![doc, setFrame: NSRect::new(NSPoint::new(card_frame.origin.x, card_bottom), NSSize::new(card_w, card_h))];
+            u.page_canvases[2].set_row_consume(u.mapping_layout_row, card_h);
+            let _: () = msg_send![doc, setFrameSize: NSSize::new(card_w, card_h)];
             // The add button sits in the action row at the card bottom.
             let _: () = msg_send![u.add_mapping_button, setFrame: NSRect::new(NSPoint::new(MAPPING_PANEL_X, MAPPING_PANEL_TOP + panel_h + MAPPING_ACTION_TOP), NSSize::new(card_w - 2.0 * MAPPING_PANEL_X, MAPPING_ACTION_H))];
         }

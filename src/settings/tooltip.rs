@@ -667,6 +667,34 @@ impl SettingsTooltip {
         Self::hide_bubble();
     }
 
+    /// Every view address reachable from `root`, so a registry key can be checked for liveness
+    /// before it is messaged.
+    unsafe fn live_view_addresses(root: *mut AnyObject) -> std::collections::HashSet<usize> {
+        let mut live = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(view) = stack.pop() {
+            if view.is_null() {
+                continue;
+            }
+            if !live.insert(view as usize) {
+                continue;
+            }
+            let subviews: *mut AnyObject = objc2::msg_send![view, subviews];
+            if subviews.is_null() {
+                continue;
+            }
+            let count: usize = objc2::msg_send![subviews, count];
+            for index in 0..count {
+                let child: *mut AnyObject =
+                    objc2::msg_send![subviews, objectAtIndex: index as isize];
+                if !child.is_null() {
+                    stack.push(child);
+                }
+            }
+        }
+        live
+    }
+
     /// Show the hint when a click lands on a disabled settings view; any other click hides it.
     pub(super) unsafe fn handle_mouse_down(window: *mut AnyObject, event: *mut AnyObject) {
         if window.is_null() || event.is_null() {
@@ -683,12 +711,24 @@ impl SettingsTooltip {
             convertPoint: window_point,
             fromView: std::ptr::null::<AnyObject>()
         ];
-        let candidates: Vec<(usize, String)> = DISABLED_TOOLTIPS
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(view, text)| (*view, text.clone()))
-            .collect();
+        // The registry is keyed by raw view addresses and holds no ownership. A view that was torn
+        // down without `forget` (the binding rows are rebuilt as the mapping list changes) would
+        // leave a dangling key, and messaging it below used to trap with EXC_BREAKPOINT (SIGTRAP)
+        // in `object_getClass` -- the 2026-09-28 crash report. Only views that are still in the
+        // window's hierarchy may be messaged, and a key that is gone is dropped here.
+        let live = Self::live_view_addresses(content);
+        let mut candidates: Vec<(usize, String)> = Vec::new();
+        {
+            let mut registry = DISABLED_TOOLTIPS.lock().unwrap();
+            registry.retain(|view, text| {
+                if live.contains(view) {
+                    candidates.push((*view, text.clone()));
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         // Resolve the actual AppKit hit view before checking candidates. Comparing the click
         // point with every disabled label's converted frame is too broad: a label can span most
         // of a row and overlap an unrelated action button (for example, Restore Defaults).

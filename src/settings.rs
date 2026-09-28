@@ -184,18 +184,14 @@ pub(super) struct SettingsUi {
     line_count: *mut AnyObject,        // NSSlider: line count slider
     line_count_label: *mut AnyObject,  // the row's label
     line_count_value_label: *mut AnyObject, // slider's current value (read-only)
-    // The line-count row is conditional: CollapsibleRows owns the show/hide (card, shadow, and
-    // divider included).
-    line_count_block: CollapsibleRows,
     disable_pointer_accel: *mut AnyObject, // disable pointer acceleration
-    pointer_accel_slider: *mut AnyObject,  // NSSlider: pointer acceleration, 0..=40
-    pointer_accel_label: *mut AnyObject,   // the row's label
+    pointer_accel_slider: *mut AnyObject, // NSSlider: pointer acceleration, 0..=40
+    pointer_accel_label: *mut AnyObject, // the row's label
     pointer_accel_value_label: *mut AnyObject, // slider's current value (read-only)
-    // The tracking-speed row is conditional: same deal, the component owns show/hide.
-    pointer_accel_block: CollapsibleRows,
-    // The two rows that only apply in icons-and-thumbnails mode (focused prewarm + app name on
-    // thumbnails), shown/hidden as one block.
-    thumbnail_only_block: CollapsibleRows,
+    /// The Mouse page row the binding table occupies (it grows with the number of bindings).
+    mapping_layout_row: usize,
+    /// The About page row the inline update host occupies (its height follows the flow).
+    update_host_row: usize,
     mapping_scroll: *mut AnyObject,    // the bindings scroll view
     mapping_doc: *mut AnyObject,       // document view
     mapping_card: *mut AnyObject,      // the mappings outer card
@@ -206,14 +202,11 @@ pub(super) struct SettingsUi {
     clipboard_move_used_to_top: *mut AnyObject, // move used entries to top
     clipboard_delete_after_paste: *mut AnyObject, // delete entry after paste
     clipboard_clear_system_pasteboard_after_paste: *mut AnyObject, // clear system pasteboard after paste
-    // "Clear the matching system-pasteboard entry" is a child of "delete entry after paste": it
-    // only appears while the latter is on.
-    clipboard_delete_block: CollapsibleRows,
-    clipboard_max_entries: *mut AnyObject, // max history entries
-    clipboard_auto_expire_days: *mut AnyObject, // auto-expire days (0 = never)
-    clipboard_auto_expire_days_value_label: *mut AnyObject, // auto-expire value
-    clipboard_show_source_app: *mut AnyObject, // show the source app
-    clipboard_pin_follow: *mut AnyObject,  // selection after pin
+    clipboard_max_entries: *mut AnyObject,                         // max history entries
+    clipboard_auto_expire_days: *mut AnyObject,                    // auto-expire days (0 = never)
+    clipboard_auto_expire_days_value_label: *mut AnyObject,        // auto-expire value
+    clipboard_show_source_app: *mut AnyObject,                     // show the source app
+    clipboard_pin_follow: *mut AnyObject,                          // selection after pin
     // (follow the pinned entry / keep current position)
     window_control_enabled: *mut AnyObject, // enable window control
     window_control_up: *mut AnyObject,      // enable Option+Up
@@ -238,6 +231,9 @@ pub(super) struct SettingsUi {
     // One "Restore Page Defaults" control per page (embedded at the end of each page's
     // scrolling document).
     page_restores: [RestoreDefaultsControl; 7],
+    /// One layout owner per page (index order matches `page_restores`): rows, cards, the page
+    /// title, the restore control and the document height all follow from its row list.
+    page_canvases: [PageCanvas; 7],
     permission_warning_view: *mut AnyObject, // permission-warning banner container
     update_auto_check: *mut AnyObject,       // Sparkle auto-check switch
     update_auto_download: *mut AnyObject,    // Sparkle auto-download switch
@@ -247,9 +243,7 @@ pub(super) struct SettingsUi {
     update_card: *mut AnyObject,             // Updates card (grows when expanded)
     update_card_shadow: *mut AnyObject,      // Updates card shadow
     update_divider: *mut AnyObject,          // divider between update settings and result
-    update_card_compact_h: f64,              // collapsed card height
     update_card_expanded: bool,              // whether expanded for a flow
-    update_host_origin_y: f64,               // host origin y when collapsed
     accessibility_permission_status: *mut AnyObject,
     accessibility_permission_button: *mut AnyObject,
     screen_recording_permission_status: *mut AnyObject,
@@ -442,6 +436,7 @@ mod dispatch;
 pub(crate) mod glass_preview;
 pub(crate) mod mapping;
 mod page_builder;
+pub(crate) mod page_canvas;
 pub(crate) mod restore;
 mod select;
 mod sidebar;
@@ -450,7 +445,7 @@ pub(crate) mod widgets;
 mod window;
 
 use components::{
-    row_action_button, CollapsibleRows, RestoreDefaultsControl, SettingsButton, SettingsButtonRole,
+    row_action_button, RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard,
     SettingsControl, SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader,
     SettingsRow, SettingsSection, SettingsSelect, SettingsSidebar, ROW_ACTION_BTN_H,
     ROW_ACTION_BTN_W,
@@ -468,6 +463,7 @@ pub(crate) use mapping::{
     handle_panel_action_changed, handle_panel_record_combo, handle_panel_record_trigger,
     handle_recording_cancelled, handle_recording_finished,
 };
+use page_canvas::*;
 pub(super) use restore::{
     collapse_restore_confirmations, collapse_restore_confirmations_on_external_click,
 };
@@ -745,53 +741,44 @@ pub(crate) fn open_about_updates() {
     start_inline_update_check();
 }
 
-/// Expand the About page Updates card and document at the start of a flow so inline update
+/// Bottom gap kept below the expanded inline update card, matching the padding the compact About
+/// page was fitted with.
+const UPDATE_CARD_BOTTOM_PADDING: f64 = 32.0;
+
+/// Expand the About page Updates card at the start of a flow so inline update
 /// status/progress/buttons fit within the following space.
+///
+/// The page's layout owner places the host row, the card and the document: the flow only hands over
+/// the host's height (its row consumption) and the tighter bottom padding the expanded card keeps
+/// below it. The card follows the host's bottom edge on its own, exactly like every other card
+/// follows its last row, so no card geometry is computed here.
 pub(crate) fn expand_update_section(window_h: f64) {
     with_settings_ui(|ui_guard| {
         let Some(ui) = ui_guard.as_mut() else {
             return;
         };
-        if ui.update_card.is_null() || ui.update_host.is_null() {
+        if ui.update_card.is_null() || ui.update_host.is_null() || !ui.page_canvases[6].is_bound() {
             return;
         }
         unsafe {
-            // Grow the card to the current screen's required height (the host's dynamic height) while
-            // keeping the host top fixed below the hint; the card matches the host so there's no large
-            // blank below the buttons.
-            let host_frame: NSRect = msg_send![ui.update_host, frame];
-            let host_top = host_frame.origin.y + host_frame.size.height;
-            let height_delta = window_h - host_frame.size.height;
-            let _: () = msg_send![ui.update_host, setFrame: NSRect::new(NSPoint::new(host_frame.origin.x, host_top - window_h), NSSize::new(host_frame.size.width, window_h))];
+            // The flow owns these two views' visibility: the layout owner remembers the state it
+            // finds and never reveals them on its own (the update content replaces the button).
             let _: () = msg_send![ui.update_host, setHidden: false];
             let _: () = msg_send![ui.update_divider, setHidden: false];
-            // Each Sparkle phase may need a different height; resize by the delta so later controls are
-            // flipped against the current host height instead of the previous phase's height.
-            let card_frame: NSRect = msg_send![ui.update_card, frame];
-            let new_card = NSRect::new(
-                NSPoint::new(card_frame.origin.x, card_frame.origin.y - height_delta),
-                NSSize::new(card_frame.size.width, card_frame.size.height + height_delta),
-            );
-            let _: () = msg_send![ui.update_card, setFrame: new_card];
-            let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
-            let _: () = msg_send![
-                ui.update_card_shadow,
-                setFrame: NSRect::new(
-                    NSPoint::new(new_card.origin.x - shadow_inset, new_card.origin.y - shadow_inset),
-                    NSSize::new(new_card.size.width + shadow_inset * 2.0, new_card.size.height + shadow_inset * 2.0),
-                )
-            ];
-            // The update content replaces the check-button area instead of being appended below it.
             let _: () = msg_send![ui.update_check_button, setHidden: true];
             ui.update_card_expanded = true;
             set_about_restore_control_visible_for_ui(ui, false);
 
-            // The compact document was fitted during construction; an expanded Sparkle host may
-            // extend beyond that height, so re-measure the About page after changing the card.
-            let clip: *mut AnyObject = msg_send![ui.about_view, contentView];
-            let clip_bounds: NSRect = msg_send![clip, bounds];
-            let document: *mut AnyObject = msg_send![ui.about_view, documentView];
-            fit_settings_document_height(document, clip_bounds.size.height, 24.0, 32.0);
+            let canvas = &ui.page_canvases[6];
+            canvas.set_bottom_padding(UPDATE_CARD_BOTTOM_PADDING);
+            // Each Sparkle phase may need a different height: the host grows downward from the
+            // check-button row, and the page re-flows around it.
+            canvas.set_row_consume(ui.update_host_row, window_h);
+            let host_frame: NSRect = msg_send![ui.update_host, frame];
+            let _: () = msg_send![
+                ui.update_host,
+                setFrameSize: NSSize::new(host_frame.size.width, window_h)
+            ];
             let _: () = msg_send![ui.window, layoutIfNeeded];
             debug_validate_settings_page(ui.about_view, "about-expanded");
         }
@@ -817,40 +804,26 @@ pub(crate) fn collapse_update_section() {
             return;
         }
         unsafe {
-            let compact_h = ui.update_card_compact_h;
-            // Restore the card and shadow to their compact height.
-            let card_frame: NSRect = msg_send![ui.update_card, frame];
-            let new_card = NSRect::new(
-                NSPoint::new(
-                    card_frame.origin.x,
-                    card_frame.origin.y + (card_frame.size.height - compact_h),
-                ),
-                NSSize::new(card_frame.size.width, compact_h),
-            );
-            let _: () = msg_send![ui.update_card, setFrame: new_card];
-            let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
-            let _: () = msg_send![
-                ui.update_card_shadow,
-                setFrame: NSRect::new(
-                    NSPoint::new(new_card.origin.x - shadow_inset, new_card.origin.y - shadow_inset),
-                    NSSize::new(new_card.size.width + shadow_inset * 2.0, new_card.size.height + shadow_inset * 2.0),
-                )
-            ];
-            // Zero the host height, hide it, and restore its origin so the next expand keeps the top
-            // fixed below the check button row.
+            // Restore the compact UI first (the restore control becomes visible again), so the
+            // layout owner's re-flow accounts for it and lands on the compact document height.
             let host_frame: NSRect = msg_send![ui.update_host, frame];
             let _: () = msg_send![
                 ui.update_host,
-                setFrame: NSRect::new(
-                    NSPoint::new(host_frame.origin.x, ui.update_host_origin_y),
-                    NSSize::new(host_frame.size.width, 0.0)
-                )
+                setFrameSize: NSSize::new(host_frame.size.width, 0.0)
             ];
             let _: () = msg_send![ui.update_host, setHidden: true];
             let _: () = msg_send![ui.update_divider, setHidden: true];
             let _: () = msg_send![ui.update_check_button, setHidden: false];
             ui.update_card_expanded = false;
             set_about_restore_control_visible_for_ui(ui, true);
+            if ui.page_canvases[6].is_bound() {
+                let canvas = &ui.page_canvases[6];
+                // Undo the flow's geometry: the host row shrinks back to nothing, the card returns
+                // to its derived height and the page keeps its usual bottom padding.
+                canvas.set_row_consume(ui.update_host_row, 0.0);
+                canvas.set_bottom_padding(SettingsPageHeader::BOTTOM_PADDING);
+            }
+            let _: () = msg_send![ui.window, layoutIfNeeded];
         }
     });
 }

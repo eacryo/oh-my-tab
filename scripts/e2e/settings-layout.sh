@@ -233,7 +233,7 @@ if labels:
         43.0: ("a section header to its first row", 3),
         62.0: ("row to row (54pt row + 8pt gap)", 5),
         77.0: ("a card to the next section header", 2),
-        83.0: ("the app subtitle to the first section header", 1),
+        75.0: ("the app subtitle to the first section header", 1),
     }
     unexpected = [d for d in deltas if not any(abs(d - v) <= 1.5 for v in allowed)]
     check(
@@ -272,14 +272,14 @@ else:
 # --- 页面文档高度:内容下方不能有死空白 ----------------------------------
 # 7 个页面的文档高度曾经是手写常量(通用 1138 / 切换 1432 / 鼠标 1620 / 剪贴板 978 /
 # 窗口控制 1102 / 快捷操作 854 / 关于 1300),与真实排版脱钩:内容比常量短时,差额全部堆在
-# **内容下方**(顶部始终按 42pt 页头内边距定位),于是滚到底只剩空白、滚动条比例也被拉失真
+# **内容下方**(顶部始终按页头内边距定位),于是滚到底只剩空白、滚动条比例也被拉失真
 # (实测多余空白 140–474pt)。现在文档按"内容 + 底部内边距"收紧,这里把这条约定钉住。
 # The seven page documents used to carry hand-written heights (1138 / 1432 / 1620 / 978 / 1102 /
 # 854 / 1300) decoupled from the real layout: when the content was shorter, the difference piled up
-# *below* it (the top always sat under the 42pt page-header padding), so scrolling to the end showed
+# *below* it (the top always sat under the page-header padding), so scrolling to the end showed
 # nothing but blank and the scroller proportion was distorted (measured surplus: 140-474pt). The
 # documents are now tightened to "content + bottom padding"; these checks pin that rule.
-TOP_PADDING = 42.0
+TOP_PADDING = 50.0
 BOTTOM_PADDING = 72.0
 DOC_TOL = 1.5
 expected_pages = {
@@ -315,9 +315,9 @@ for root in sorted(expected_pages):
         f"{page['root']}: document is tall enough for its content",
         f"doc={doc_h:.0f} needed={needed:.0f} extent={extent:.0f}",
     )
-    # 顶部内边距:内容必须仍在 42pt 页头内边距之下,但不能低得离谱(文档在顶部被吹大)。
+    # 顶部内边距:内容必须仍在页头内边距之下,但不能低得离谱(文档在顶部被吹大)。
     # 各页页头块高度不同(关于页是 66pt),所以这里给上界而不是等值。
-    # Header padding: the content must still sit below the 42pt page-header padding, but not far
+    # Header padding: the content must still sit below the page-header padding, but not far
     # below it (which would mean the document was inflated at the top). Pages have different header
     # block heights (About is 66pt), so this is a bound, not an equality.
     header_gap = doc_h - content_top
