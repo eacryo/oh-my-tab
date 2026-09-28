@@ -580,6 +580,23 @@ pub(crate) fn refresh_system_appearance() {
 pub(crate) fn settings_layout_smoke_runner() -> bool {
     unsafe {
         show_settings();
+        // Regression guard for the guide's "Open App Settings" crash (2026-09-28): the settings
+        // window becoming key delivers the scroller notification synchronously from inside
+        // `with_settings_ui`, and the resync re-entered the borrow ("RefCell already borrowed" ->
+        // abort). Driving the real handler with an active borrow must defer, not panic; without the
+        // guard this kills the smoke process and the test fails.
+        {
+            let controller = crate::CONTROLLER.lock().unwrap().map(|target| target.0);
+            if let Some(controller) = controller {
+                with_settings_ui(|_| {
+                    crate::on_scroller_style_changed(
+                        controller,
+                        sel!(handleScrollerStyleChanged:),
+                        std::ptr::null_mut(),
+                    );
+                });
+            }
+        }
         let Some((window, pages)) = with_settings_ui(|ui| {
             ui.as_ref().map(|ui| {
                 (

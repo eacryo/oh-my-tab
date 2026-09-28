@@ -707,13 +707,25 @@ extern "C" fn on_locale_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void
     callback_guard::void("on_locale_changed", || on_locale_changed_inner(_self));
 }
 
-/// Scroller-style change callback for `NSScrollerPreferredScrollerStyleDidChangeNotification`.
-extern "C" fn on_scroller_style_changed(_self: *mut AnyObject, _cmd: Sel, _note: *mut AnyObject) {
+/// Scroller-style change callback for `NSScrollerPreferredScrollerStyleDidChangeNotification` (also
+/// registered for window-did-become-key / app-did-become-active, which are the ones that actually
+/// fire -- see the registration site).
+pub(crate) extern "C" fn on_scroller_style_changed(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+    _note: *mut AnyObject,
+) {
     unsafe {
         // Notification delivery thread isn't guaranteed to be main, but both re-asserting the style
         // and re-laying out UI must run on main.
         let is_main: bool = msg_send![class!(NSThread), isMainThread];
-        if !is_main {
+        // Defer when a settings build is already in progress on this thread: the settings window
+        // becoming key (or the app activating) *inside* `with_settings_ui` delivers these
+        // notifications synchronously, and the resync below reads the settings UI. Re-entering that
+        // borrow panics, and a panic in an `extern "C"` callback aborts the process -- which is how
+        // the guide's final-step "Open App Settings" used to crash (2026-09-28, "RefCell already
+        // borrowed"). Deferring runs the resync right after the borrow is released.
+        if !is_main || crate::settings::settings_ui_borrowed() {
             let _: () = msg_send![_self,
                 performSelectorOnMainThread: sel!(handleScrollerStyleChanged:),
                 withObject: std::ptr::null::<AnyObject>(),

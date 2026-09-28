@@ -347,6 +347,16 @@ pub(super) fn with_settings_ui<R>(f: impl FnOnce(&mut Option<SettingsUi>) -> R) 
     crate::debug_assert_main_thread();
     SETTINGS_UI.with(|ui| f(&mut ui.borrow_mut()))
 }
+
+/// Whether the settings UI is already borrowed on this thread. An Objective-C notification callback
+/// can be delivered *synchronously from inside* `with_settings_ui` (making the settings window key
+/// or activating the app posts the window/app notifications right there), and any callback that
+/// reads the settings UI would then re-enter `borrow_mut` -- which panics, and a panic inside an
+/// `extern "C"` callback aborts the app (that is how the guide's "Open App Settings" crashed on
+/// 2026-09-28). Such callbacks ask this first and defer to the next runloop turn instead.
+pub(super) fn settings_ui_borrowed() -> bool {
+    SETTINGS_UI.with(|ui| ui.try_borrow_mut().is_err())
+}
 /// Whether a background update check found a version the user has not opened yet.
 static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
 /// Whether an editable settings text field currently owns keyboard input.
@@ -1682,6 +1692,17 @@ unsafe fn grow_short_page_documents() {
 
 #[cfg(test)]
 mod tests {
+    use super::{settings_ui_borrowed, with_settings_ui};
+
+    #[test]
+    fn borrow_probe_sees_an_active_settings_ui_borrow() {
+        // The notification handlers defer on this probe instead of re-entering `with_settings_ui`
+        // (a nested borrow panics inside an `extern "C"` callback, which aborts the app).
+        assert!(!settings_ui_borrowed());
+        with_settings_ui(|_| assert!(settings_ui_borrowed()));
+        assert!(!settings_ui_borrowed());
+    }
+
     #[test]
     fn pointer_accel_slider_clamps_and_rounds() {
         assert_eq!(pointer_accel_from_slider(0.0), 0.0);
