@@ -496,6 +496,26 @@ pub(crate) fn smoke_runner() -> bool {
             }
         }
     }
+    // Empty-state placement: the hint's vertical center and the document height are derived from
+    // the live viewport, but the row cache key carries no geometry and the clear actions rebuild in
+    // place without resizing the panel. Reproduces the reported "empty picker with no hint and a
+    // phantom scrollbar": drop the fixtures while the panel is still tall, then summon (which
+    // shrinks it to the minimal height) and require the hint to be re-centered inside the viewport.
+    unsafe {
+        {
+            let mut hist = CLIP_HISTORY.lock().unwrap();
+            remove_history_scope(&mut hist, true);
+        }
+        clear_search();
+        *CLIP_FILTER.lock().unwrap() = ClipFilter::All;
+        rebuild_rows();
+        hide_picker();
+        show_picker();
+        assert!(
+            empty_state_layout_is_sane(),
+            "the empty-state hint must be re-centered inside the summoned viewport"
+        );
+    }
     hide_picker();
     true
 }

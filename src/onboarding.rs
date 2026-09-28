@@ -29,6 +29,15 @@ use crate::log_info;
 /// Written once the guide has been auto-shown (a UserDefaults cross-launch marker like the
 /// update-notice ones: "already seen the guide" is UI lifecycle, not a setting the user tunes).
 const COMPLETED_KEY: &str = "oh-my-tab-onboarding-completed";
+/// Written when the app goes away with the guide still on screen (a permission restart: macOS may
+/// quit us forcibly, and the screen-recording grant is often followed by "Quit & Reopen"). Holds
+/// the step index + 1; 0/absent means nothing pending. Unlike the completion marker this is an
+/// explicit "the user is mid-setup" intent, so the next launch reopens the guide there.
+const RESUME_KEY: &str = "oh-my-tab-onboarding-resume";
+/// The `CFBundleVersion` of the installation that last ran. A difference means the app was
+/// (re-)installed rather than merely relaunched — the guide is a setup flow, so every install walks
+/// it again, while a plain relaunch of the same build does not.
+const BUILD_KEY: &str = "oh-my-tab-onboarding-build";
 /// Development switches (argv, see dev_flags): force the guide, reset the marker, suppress it,
 /// or fake the permission status.
 const FORCE_FLAG: &str = "force-onboarding";
@@ -99,23 +108,50 @@ pub(crate) fn steps_for() -> [Step; 4] {
     ]
 }
 
-/// Whether the guide may auto-show. Existing users (granted AND a config file already present) are
-/// skipped silently so an upgrade does not nag them; smoke mode and an already-shown marker (when
-/// not forced) also suppress it.
-pub(crate) fn should_auto_show(
-    completed: bool,
-    forced: bool,
-    ax_granted: bool,
-    config_exists: bool,
-    suppressed: bool,
-) -> bool {
-    if forced {
+/// Everything the launch decision depends on, grouped so the booleans cannot be mixed up.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LaunchState {
+    /// The guide's completion marker for this installation.
+    pub(crate) completed: bool,
+    /// `--force-onboarding`.
+    pub(crate) forced: bool,
+    /// A restart interrupted the guide and it should resume on its old step.
+    pub(crate) resume: bool,
+    /// This launch continues a Sparkle in-place update.
+    pub(crate) sparkle_update: bool,
+    /// No build recorded yet, or the recorded build differs: the app was installed, not relaunched.
+    pub(crate) new_install: bool,
+    pub(crate) ax_granted: bool,
+    pub(crate) config_exists: bool,
+    /// Smoke mode or `--no-onboarding`.
+    pub(crate) suppressed: bool,
+}
+
+/// Whether the launch sequence opens the guide.
+///
+/// Manual installs are the point: a fresh or re-installed build always walks the guide again, while
+/// an in-place Sparkle update does not (updating is not installing, and nagging right after an
+/// update is exactly what the user did not ask for). A restart mid-guide resumes it, suppression
+/// wins, and `--force-onboarding` always shows.
+pub(crate) fn should_show_on_launch(state: LaunchState) -> bool {
+    if state.forced {
         return true;
     }
-    if suppressed || completed {
+    if state.suppressed {
         return false;
     }
-    !(ax_granted && config_exists)
+    if state.resume {
+        return true;
+    }
+    if state.sparkle_update {
+        return false;
+    }
+    if state.new_install {
+        return true;
+    }
+    // Same installation: the guide was already offered once, and an existing user (permission
+    // granted plus a config file) is not nagged again.
+    !state.completed && !(state.ax_granted && state.config_exists)
 }
 
 /// Whether the guide is suppressed in smoke mode or by an explicit opt-out.
@@ -171,6 +207,69 @@ fn mark_completed() {
     unsafe { defaults_set_bool(COMPLETED_KEY, true) };
 }
 
+unsafe fn defaults_set_int(key: &str, value: isize) {
+    let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
+    let key_ns = make_nsstring(key);
+    let _: () = msg_send![defaults, setInteger: value, forKey: key_ns];
+    release_obj(key_ns);
+}
+
+unsafe fn defaults_get_int(key: &str) -> isize {
+    let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
+    let key_ns = make_nsstring(key);
+    let value: isize = msg_send![defaults, integerForKey: key_ns];
+    release_obj(key_ns);
+    value
+}
+
+/// Remembers the guide's current step so a restart resumes there instead of treating the guide as
+/// "already seen". Called from the termination hook and from a Screen Recording grant (both are
+/// moments where the user is about to be interrupted by a restart).
+pub(crate) fn note_resume_if_visible() {
+    if !is_visible() {
+        return;
+    }
+    let step = STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|state| state.index)
+        .unwrap_or(0);
+    unsafe { defaults_set_int(RESUME_KEY, step as isize + 1) };
+    log_debug!(
+        "[onboarding] resume marker written (step {}/{})",
+        step + 1,
+        steps_for().len()
+    );
+}
+
+/// The pending resume step, without consuming it (a suppressed run must not eat the marker).
+fn peeking_resume_step() -> Option<usize> {
+    let stored = unsafe { defaults_get_int(RESUME_KEY) };
+    (stored > 0).then(|| (stored - 1) as usize)
+}
+
+fn clear_resume() {
+    unsafe { defaults_remove(RESUME_KEY) };
+}
+
+unsafe fn defaults_set_string(key: &str, value: &str) {
+    let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
+    let key_ns = make_nsstring(key);
+    let value_ns = make_nsstring(value);
+    let _: () = msg_send![defaults, setObject: value_ns, forKey: key_ns];
+    release_obj(value_ns);
+    release_obj(key_ns);
+}
+
+unsafe fn defaults_get_string(key: &str) -> String {
+    let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
+    let key_ns = make_nsstring(key);
+    let value: *mut AnyObject = msg_send![defaults, stringForKey: key_ns];
+    release_obj(key_ns);
+    crate::ffi::nsstring_to_rust(value)
+}
+
 #[derive(Clone)]
 struct UiState {
     steps: [Step; 4],
@@ -218,42 +317,64 @@ pub(crate) fn maybe_show_on_launch() -> bool {
     let forced = forced_requested();
     if reset_requested() {
         unsafe { defaults_remove(COMPLETED_KEY) };
-        log_debug!("[onboarding] marker cleared by {}", RESET_ARG);
+        unsafe { defaults_remove(BUILD_KEY) };
+        clear_resume();
+        log_debug!("[onboarding] markers cleared by {}", RESET_ARG);
     }
+    let resume_step = peeking_resume_step();
     let config_exists = crate::config::config_file_exists();
     let overrides = fake_permissions();
     let ax_granted = override_ax(overrides);
-    if !should_auto_show(
-        completed(),
+    // A differing build means the app was installed rather than relaunched. The recorded value is
+    // refreshed on every launch so the next one compares against this build.
+    let build = unsafe { crate::ffi::bundle_info_string("CFBundleVersion") };
+    let new_install = !build.is_empty() && unsafe { defaults_get_string(BUILD_KEY) } != build;
+    if !build.is_empty() {
+        unsafe { defaults_set_string(BUILD_KEY, &build) };
+    }
+    let state = LaunchState {
+        completed: completed(),
         forced,
+        resume: resume_step.is_some(),
+        sparkle_update: crate::update_notice::just_updated_via_sparkle(),
+        new_install,
         ax_granted,
         config_exists,
-        is_suppressed(),
-    ) {
+        suppressed: is_suppressed(),
+    };
+    if !should_show_on_launch(state) {
         log_debug!(
-            "[onboarding] skipped (completed={} forced={} ax={} config={} suppressed={})",
-            completed(),
-            forced,
-            ax_granted,
-            config_exists,
-            is_suppressed()
+            "[onboarding] skipped (completed={} forced={} resume={} sparkle_update={} new_install={} ax={} config={} suppressed={} build={})",
+            state.completed,
+            state.forced,
+            state.resume,
+            state.sparkle_update,
+            state.new_install,
+            state.ax_granted,
+            state.config_exists,
+            state.suppressed,
+            build
         );
         return false;
     }
     log_debug!(
-        "[onboarding] showing (forced={} ax={} screen={} config={})",
+        "[onboarding] showing (forced={} resume={:?} sparkle_update={} new_install={} ax={} screen={} config={})",
         forced,
+        resume_step,
+        state.sparkle_update,
+        state.new_install,
         ax_granted,
         override_screen(overrides),
         config_exists
     );
-    // Mark as shown: no further automatic nagging, while the status item's entry and the
-    // development switches reopen it at will and the startup alert still covers a missing grant.
-    // Forced/development runs do not write the marker so the flow stays repeatable.
+    // Mark as shown: no further nagging for this installation (a new build starts fresh because the
+    // recorded build differs). Forced/development runs do not write the completion marker so the
+    // flow stays repeatable.
     if !forced {
         mark_completed();
     }
-    show_internal(overrides);
+    clear_resume();
+    show_internal_at(overrides, resume_step.unwrap_or(0));
     true
 }
 
@@ -264,21 +385,29 @@ pub(crate) fn show_manually() {
 }
 
 fn show_internal(overrides: PermissionOverride) {
+    show_internal_at(overrides, 0);
+}
+
+/// Shows the guide at a step (0 = the first): a resumed launch reopens where the permission restart
+/// interrupted the user instead of starting over.
+fn show_internal_at(overrides: PermissionOverride, start_index: usize) {
     let config = CONFIG.read().unwrap().clone();
+    let steps = steps_for();
+    let index = start_index.min(steps.len().saturating_sub(1));
     let state = UiState {
-        steps: steps_for(),
-        index: 0,
+        steps,
+        index,
         overrides,
         launch_at_login: config.startup.launch_at_login,
         thumbnails_enabled: config.layout.thumbnails_enabled,
         clipboard_enabled: config.clipboard.enabled,
     };
-    let step_count = state.steps.len();
+    let (step_number, step_count) = (state.index + 1, state.steps.len());
     *STATE.lock().unwrap() = Some(state);
     unsafe { ensure_window() };
     render_current_step();
     start_tick_timer();
-    log_debug!("[onboarding] step 1/{} shown", step_count);
+    log_debug!("[onboarding] step {}/{} shown", step_number, step_count);
 }
 
 /// The 1s tick rebuilds the current page when permission state changes, so a grant made in System
@@ -314,9 +443,11 @@ pub(crate) fn is_visible() -> bool {
     visible
 }
 
-/// Hides the guide window (reused by tests and teardown paths).
+/// Hides the guide window (reused by tests and teardown paths). Finishing, skipping, or opening
+/// Settings ends the flow, so a pending resume is dropped: a later launch must not reopen it.
 pub(crate) fn hide() {
     stop_tick_timer();
+    clear_resume();
     if let Some(window) = *WINDOW.lock().unwrap() {
         let _: () = unsafe { msg_send![window.0, orderOut: std::ptr::null::<AnyObject>()] };
     }
@@ -1029,7 +1160,16 @@ pub(crate) fn handle_action(tag: isize) {
                 ];
             }
         }
-        ACTION_ALLOW_SCREEN => crate::open_privacy_screen_recording(),
+        ACTION_ALLOW_SCREEN => {
+            // Ask the system first: that request is what registers the app in the Screen Recording
+            // list and shows the one-time prompt, so the Settings pane no longer needs a manual
+            // "+". The pane stays the fallback for a user who already declined the prompt (or
+            // toggles the switch manually).
+            request_screen_recording_from_guide();
+            if !crate::thumbnail::capture_allowed() {
+                crate::open_privacy_screen_recording();
+            }
+        }
         ACTION_TOGGLE_LAUNCH_DRAFT => {
             if let Some(state) = STATE.lock().unwrap().as_mut() {
                 state.launch_at_login = !state.launch_at_login;
@@ -1042,9 +1182,16 @@ pub(crate) fn handle_action(tag: isize) {
             });
         }
         ACTION_SELECT_ICONS | ACTION_SELECT_THUMBNAILS => {
+            let thumbnails_enabled = tag == ACTION_SELECT_THUMBNAILS;
             apply_choice_now(Step::DisplayMode, |state| {
-                state.thumbnails_enabled = tag == ACTION_SELECT_THUMBNAILS;
+                state.thumbnails_enabled = thumbnails_enabled;
             });
+            if thumbnails_enabled {
+                // Picking thumbnails is the contextual moment to ask for Screen Recording: the
+                // system prompt (and the list entry it creates) then follows the user's own choice
+                // instead of surprising them at launch or arriving only on the first summon.
+                request_screen_recording_from_guide();
+            }
         }
         ACTION_OPEN_SETTINGS => {
             mark_completed();
@@ -1098,6 +1245,17 @@ fn retreat() {
     state.index -= 1;
     drop(slot);
     render_current_step();
+}
+
+/// Asks for Screen Recording after the user picked thumbnails or pressed the grant button. Never
+/// while the DISPLAYED permission is faked: `--fake-permissions` walks the guide's branches without
+/// touching TCC. `apply_choice_now` has already re-rendered (which activates the window), so the
+/// system prompt is not left behind other windows.
+fn request_screen_recording_from_guide() {
+    if fake_permissions().screen.is_some() {
+        return;
+    }
+    crate::thumbnail::request_screen_recording_from_guide();
 }
 
 /// Applies a guide choice immediately instead of waiting for Next: the switcher (display mode) and
@@ -1204,7 +1362,9 @@ unsafe fn dispatch_display_mode_segment(segment: isize) -> bool {
 
 /// GUI smoke runner (`--smoke-onboarding-live-apply`): show the guide, drive the real display-mode
 /// segment and clipboard switch, and require both choices to reach the live config without a Next
-/// click. Runs as a subprocess on the real AppKit main thread (see the ignored test below).
+/// click. Also asserts that the smoke run never asked for Screen Recording (a real run asks when
+/// thumbnails are picked). Runs as a subprocess on the real AppKit main thread (see the ignored
+/// test below).
 pub(crate) fn live_apply_smoke_runner() -> bool {
     let before_thumbnails = CONFIG.read().unwrap().layout.thumbnails_enabled;
     show_internal(PermissionOverride::default());
@@ -1241,16 +1401,20 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
         .unwrap()
         .as_ref()
         .map(|state| state.clipboard_enabled);
+    // Picking thumbnails asks the system for Screen Recording in a real run; a smoke run must not
+    // have asked (see the `--smoke` guard in thumbnail::request_permission_once).
+    let permission_untouched = !crate::thumbnail::permission_prompted();
     let window_shown = is_visible();
     hide();
     log_info!(
-        "[smoke-onboarding-live-apply] segment_dispatched={} thumbnails_applied={} thumbnails_draft={:?} switch_dispatched={} clipboard_applied={} clipboard_draft={:?} window={}",
+        "[smoke-onboarding-live-apply] segment_dispatched={} thumbnails_applied={} thumbnails_draft={:?} switch_dispatched={} clipboard_applied={} clipboard_draft={:?} permission_untouched={} window={}",
         segment_dispatched,
         thumbnails_applied,
         thumbnails_draft,
         switch_dispatched,
         clipboard_applied,
         clipboard_draft,
+        permission_untouched,
         window_shown
     );
     segment_dispatched
@@ -1259,6 +1423,7 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
         && switch_dispatched
         && clipboard_applied
         && clipboard_draft == Some(!before_clipboard)
+        && permission_untouched
         && window_shown
 }
 
@@ -1399,19 +1564,67 @@ mod tests {
         assert_eq!(after_more, old);
     }
 
+    /// Builds one launch situation; each test names only the fields its story is about so the
+    /// remaining ones stay at their "nothing recorded / not forced" defaults.
+    fn launch(completed: bool, new_install: bool, sparkle_update: bool) -> LaunchState {
+        LaunchState {
+            completed,
+            new_install,
+            sparkle_update,
+            ..LaunchState::default()
+        }
+    }
+
     #[test]
-    fn auto_show_is_forced_once_suppressed_or_for_existing_users() {
-        // Fresh install that has not seen it: show.
-        assert!(should_auto_show(false, false, false, false, false));
-        // Dev switch forces it: show even when already seen or suppressed.
-        assert!(should_auto_show(true, true, true, true, true));
-        // Already seen, or suppressed in smoke mode: do not show (unless forced).
-        assert!(!should_auto_show(true, false, false, false, false));
-        assert!(!should_auto_show(false, false, false, false, true));
-        // Existing users (permission granted and config present) skip silently, so an upgrade is not interrupted.
-        assert!(!should_auto_show(false, false, true, true, false));
+    fn every_install_walks_the_guide_but_a_sparkle_update_does_not() {
+        // Fresh install: nothing recorded yet.
+        assert!(should_show_on_launch(launch(false, true, false)));
+        // Manual re-install over a completed guide: the build changed, so the guide comes back.
+        assert!(should_show_on_launch(launch(true, true, false)));
+        // Existing user (AX granted + config present) reinstalling manually still sees it.
+        assert!(should_show_on_launch(LaunchState {
+            ax_granted: true,
+            config_exists: true,
+            ..launch(true, true, false)
+        }));
+        // Sparkle in-place update: updating is not installing, so no nagging.
+        assert!(!should_show_on_launch(launch(true, true, true)));
+        // Relaunching the same installation after it was shown: no repetition.
+        assert!(!should_show_on_launch(launch(true, false, false)));
+        // Same installation, guide never completed, but an existing user with a config: still silent.
+        assert!(!should_show_on_launch(LaunchState {
+            ax_granted: true,
+            config_exists: true,
+            ..LaunchState::default()
+        }));
         // Permission granted but no config file (freshly cleared, say) still needs the guide.
-        assert!(should_auto_show(false, false, true, false, false));
+        assert!(should_show_on_launch(LaunchState {
+            ax_granted: true,
+            ..LaunchState::default()
+        }));
+    }
+
+    #[test]
+    fn a_restart_resumes_the_guide_and_suppression_wins_over_everything_but_force() {
+        // Restarted mid-guide for a permission: the resume beats completed + existing user.
+        assert!(should_show_on_launch(LaunchState {
+            resume: true,
+            ax_granted: true,
+            config_exists: true,
+            ..launch(true, false, false)
+        }));
+        // Suppression (smoke / --no-onboarding) beats a resume and a new install.
+        assert!(!should_show_on_launch(LaunchState {
+            suppressed: true,
+            resume: true,
+            ..launch(false, true, false)
+        }));
+        // --force-onboarding still shows regardless.
+        assert!(should_show_on_launch(LaunchState {
+            forced: true,
+            suppressed: true,
+            ..launch(true, false, false)
+        }));
     }
 
     /// Picking a display mode or enabling clipboard history in the guide must reach the live

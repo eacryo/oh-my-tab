@@ -186,12 +186,36 @@ pub(crate) fn capture_allowed() -> bool {
 /// Active request when unauthorized: the system prompt fires at most once per
 /// launch; afterwards the module sleeps silently.
 fn request_permission_once() {
+    // GUI smoke runners drive real controls with nobody watching: never touch TCC there (the
+    // onboarding smoke asserts this via `permission_prompted`).
+    if crate::dev_flags::any_prefix("--smoke") {
+        return;
+    }
     if PERMISSION_PROMPTED.swap(true, Ordering::Relaxed) {
         return;
     }
     unsafe {
         CGRequestScreenCaptureAccess();
     }
+}
+
+/// Whether this process already asked the system for Screen Recording (the once-per-process guard
+/// above). Read by the guide smoke test to assert that a test run never touches TCC.
+pub(crate) fn permission_prompted() -> bool {
+    PERMISSION_PROMPTED.load(Ordering::Relaxed)
+}
+
+/// Ask for Screen Recording because the user just asked for it: they picked thumbnail mode in the
+/// guide, or pressed its grant button. Unlike the summon path this is not a background surprise,
+/// and the request is what registers the app in System Settings' Screen Recording list (that list
+/// otherwise stays empty until something asks, leaving the user to add the app by hand). The OS
+/// throttles the actual dialog; this only bypasses our own once-per-process guard.
+pub(crate) fn request_screen_recording_from_guide() {
+    if capture_allowed() {
+        return;
+    }
+    PERMISSION_PROMPTED.store(false, Ordering::Relaxed);
+    request_permission_once();
 }
 
 /// Whether a cached frame is still fresh: within the TTL it is served as-is at

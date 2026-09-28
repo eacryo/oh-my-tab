@@ -550,6 +550,11 @@ pub(super) fn show_picker() {
         if picker_materialized_range_changed() {
             rebuild_rows();
         }
+        // An empty list has a fixed minimal height, while a reused row tree may have been laid out
+        // at another height (the rows key carries no geometry) and the clear actions rebuild in
+        // place without resizing the panel. Re-derive the hint's position for the frame this summon
+        // just applied, before the indicator geometry reads the document height.
+        refresh_empty_state_layout();
         // Update the scroll indicator right on the first summon (shown immediately when the
         // content overflows, not only after scrolling).
         update_scroll_indicator();

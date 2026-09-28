@@ -791,6 +791,20 @@ mod tests {
         assert!(close.origin.y + close.size.height <= strip_bottom);
     }
     #[test]
+    fn incremental_row_delete_declines_an_empty_result() {
+        use super::detail::incremental_row_delete_applies;
+        // The normal one-row case: every row materialized, one row left.
+        assert!(incremental_row_delete_applies(true, 1, 2));
+        // Deleting the last row must fall back to a full rebuild: that is where the empty-state
+        // hint and the minimal document height come from (a blank list with no hint was the bug).
+        assert!(!incremental_row_delete_applies(true, 0, 1));
+        // Partially materialized (virtualized) lists keep using the full rebuild path.
+        assert!(!incremental_row_delete_applies(false, 1, 2));
+        // A deletion that is not exactly one row is never incremental.
+        assert!(!incremental_row_delete_applies(true, 5, 2));
+    }
+
+    #[test]
     fn clear_confirmation_buttons_are_compact_and_horizontal() {
         let anchor = NSRect::new(NSPoint::new(420.0, 66.0), NSSize::new(60.0, 20.0));
         let (surface, buttons) = clear_history_confirmation_layout(anchor);

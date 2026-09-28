@@ -16,6 +16,7 @@ extern "C" {}
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 
 use crate::ffi::{
@@ -334,6 +335,16 @@ pub(crate) fn needs_permission_migration_copy() -> bool {
     )
 }
 
+/// Whether this launch continues a completed Sparkle in-place update: set by `check_pending` when
+/// the pending marker matched a changed build. The first-run guide asks for it, because an update
+/// is not an install and must not re-open the guide.
+static JUST_UPDATED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the running build is the result of a Sparkle update (see `JUST_UPDATED`).
+pub(crate) fn just_updated_via_sparkle() -> bool {
+    JUST_UPDATED.load(Ordering::Relaxed)
+}
+
 /// At startup, announce the update when the marker exists AND the build version changed;
 /// the marker is always consumed.
 pub(crate) fn check_pending() {
@@ -376,6 +387,7 @@ pub(crate) fn check_pending() {
         shown_version,
         current_build
     );
+    JUST_UPDATED.store(true, Ordering::Relaxed);
     post_update_installed(&app, &shown_version);
 }
 

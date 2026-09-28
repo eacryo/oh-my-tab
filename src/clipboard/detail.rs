@@ -1368,6 +1368,129 @@ unsafe fn remove_materialized_row(index: usize) {
 }
 
 /// Rebuild the row buttons from history (selected row highlighted with a rounded tile).
+/// The empty-state hint text for the current model: an empty history, or a query/filter with no
+/// matches. Empty when there are rows to show. Locks the history, so callers already holding that
+/// lock (`rebuild_rows`) pass their own text to `layout_empty_state` instead.
+fn empty_state_hint() -> String {
+    let total = CLIP_HISTORY.lock().unwrap().len();
+    if total == 0 {
+        t("clipboard.empty")
+    } else if with_clipboard_ui(|ui| ui.filtered.is_empty()) {
+        t("clipboard.no_match")
+    } else {
+        String::new()
+    }
+}
+
+/// (Re)lays out the empty-state hint against the live viewport: creates the label when missing,
+/// otherwise re-centers it and refreshes its text (which flips between "no history" and "no
+/// matches").
+///
+/// The vertical center depends on the visible height, and that height only settles once the summon
+/// has applied the final window frame. `show_picker` may reuse a cached row tree when its key
+/// matches -- and the key carries no geometry -- while a rebuild can also run at a different height
+/// (the clear actions rebuild in place, before the summon shrinks the panel). So the position must
+/// be re-derived per presentation instead of being frozen at rebuild time: measured symptom of
+/// freezing it was an empty picker whose hint sat just below the 273pt viewport of the minimal
+/// panel, with a phantom scroll indicator for a document 583pt tall.
+pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
+    if hint.is_empty() {
+        return false;
+    }
+    let Some(container) = picker_container_ptr() else {
+        return false;
+    };
+    // Use the clip view's live visible height, not the minimum window height: filtering can leave
+    // the picker tall with no results, and the hint should stay centered in what is on screen.
+    let clip: *mut AnyObject = msg_send![container, superview];
+    let visible_h = if clip.is_null() {
+        picker_min_height() - header_strip_h() - FOOTER_H
+    } else {
+        let bounds: NSRect = msg_send![clip, bounds];
+        bounds.size.height
+    };
+    let doc_h = empty_state_doc_height(visible_h);
+    let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
+    // The hint: vertically centered within the visible list area.
+    let label_h = 40.0;
+    let label_y = (doc_h - label_h) / 2.0;
+    let frame = NSRect::new(
+        NSPoint::new(PAD_X, label_y),
+        NSSize::new(PICKER_W - PAD_X * 2.0, label_h),
+    );
+    let hint_ns = make_nsstring(hint);
+    let existing = *EMPTY_STATE_VIEW.lock().unwrap();
+    if let Some(label) = existing {
+        if !label.0.is_null() {
+            let _: () = msg_send![label.0, setFrame: frame];
+            let _: () = msg_send![label.0, setStringValue: hint_ns];
+            CFRelease(hint_ns as *const c_void);
+            return true;
+        }
+    }
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: frame];
+    // NOTE (load-bearing): on Apple Silicon TARGET_ABI_USES_IOS_VALUES=1, so
+    // NSTextAlignment uses the iOS values -- Center=1, Right=2 (reversed vs classic
+    // Mac). 1 is required here for centering; 2 renders right-aligned (a past
+    // regression).
+    let _: () = msg_send![label, setAlignment: 1isize]; // Center on arm64
+    let _: () = msg_send![label, setStringValue: hint_ns];
+    CFRelease(hint_ns as *const c_void);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    // The empty state follows the new mockup's .empty-state: 12px, 30% black.
+    let text_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
+    let _: () = msg_send![label, setTextColor: text_color];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![container, addSubview: label];
+    release_obj(label);
+    *EMPTY_STATE_VIEW.lock().unwrap() = Some(ObjPtr::new(label));
+    true
+}
+
+/// Summon-time entry point: re-derive the empty-state layout for the viewport the summon just
+/// applied. No-op when the display list has rows.
+pub(super) unsafe fn refresh_empty_state_layout() {
+    layout_empty_state(&empty_state_hint());
+}
+
+/// Smoke assertion: the empty-state hint exists and sits inside the visible list area, and the
+/// document is not taller than the viewport (nothing to scroll in an empty list).
+pub(super) unsafe fn empty_state_layout_is_sane() -> bool {
+    let Some(label) = *EMPTY_STATE_VIEW.lock().unwrap() else {
+        return false;
+    };
+    let Some(container) = picker_container_ptr() else {
+        return false;
+    };
+    let clip: *mut AnyObject = msg_send![container, superview];
+    if clip.is_null() || label.0.is_null() {
+        return false;
+    }
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    let frame: NSRect = msg_send![label.0, frame];
+    let doc: NSRect = msg_send![container, frame];
+    let visible_top = clip_bounds.origin.y;
+    let visible_bottom = visible_top + clip_bounds.size.height;
+    let inside = frame.origin.y >= visible_top - 0.5
+        && frame.origin.y + frame.size.height <= visible_bottom + 0.5;
+    let no_phantom_overflow = doc.size.height <= clip_bounds.size.height + 0.5;
+    log_debug!(
+        "[clip] empty-state: label_y={:.1} h={:.1} visible=[{:.1},{:.1}] doc_h={:.1} inside={} no_overflow={}",
+        frame.origin.y,
+        frame.size.height,
+        visible_top,
+        visible_bottom,
+        doc.size.height,
+        inside,
+        no_phantom_overflow
+    );
+    inside && no_phantom_overflow
+}
+
 pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     let rebuild_started = Instant::now();
     let hist = CLIP_HISTORY.lock().unwrap();
@@ -1452,48 +1575,7 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     let mut slowest_row_ms = 0;
     let mut slowest_row_index = None;
     if !empty_hint.is_empty() {
-        // The container height must use the clip view's live visible height, not the minimum
-        // window height. Filtering can leave the picker tall with no results; using the
-        // minimum would incorrectly place the hint near the top.
-        let clip: *mut AnyObject = msg_send![container, superview];
-        let visible_h = if clip.is_null() {
-            picker_min_height() - header_strip_h() - FOOTER_H
-        } else {
-            let bounds: NSRect = msg_send![clip, bounds];
-            bounds.size.height
-        };
-        let doc_h = empty_state_doc_height(visible_h);
-        let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
-        // The hint: vertically centered within the visible list area.
-        let label_h = 40.0;
-        let label_y = (doc_h - label_h) / 2.0;
-        let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let label: *mut AnyObject = msg_send![
-            label,
-            initWithFrame: NSRect::new(
-                NSPoint::new(PAD_X, label_y),
-                NSSize::new(PICKER_W - PAD_X * 2.0, label_h)
-            )
-        ];
-        // NOTE (load-bearing): on Apple Silicon TARGET_ABI_USES_IOS_VALUES=1, so
-        // NSTextAlignment uses the iOS values -- Center=1, Right=2 (reversed vs classic
-        // Mac). 1 is required here for centering; 2 renders right-aligned (a past
-        // regression).
-        let _: () = msg_send![label, setAlignment: 1isize]; // Center on arm64
-        let hint_ns = make_nsstring(&empty_hint);
-        let _: () = msg_send![label, setStringValue: hint_ns];
-        CFRelease(hint_ns as *const c_void);
-        let _: () = msg_send![label, setBezeled: false];
-        let _: () = msg_send![label, setDrawsBackground: false];
-        let _: () = msg_send![label, setEditable: false];
-        // The empty state follows the new mockup's .empty-state: 12px, 30% black.
-        let text_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
-        let _: () = msg_send![label, setTextColor: text_color];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-        let _: () = msg_send![label, setFont: font];
-        let _: () = msg_send![container, addSubview: label];
-        release_obj(label);
-        *EMPTY_STATE_VIEW.lock().unwrap() = Some(ObjPtr::new(label));
+        layout_empty_state(&empty_hint);
         let build_rows_ms = build_rows_started.elapsed().as_millis();
         let finalize_started = Instant::now();
         let rendered_key = picker_rows_key(history_revision(), &query, filter, show_source);
@@ -1749,6 +1831,21 @@ pub(super) unsafe fn sync_visible_rows() -> bool {
     true
 }
 
+/// Whether `try_delete_picker_row_incremental` may handle a one-row deletion: every row must be
+/// materialized in display order, and a row must remain afterwards. An empty list has no rows to
+/// relayout, and its empty-state hint (plus the minimal document height) only exists in
+/// `rebuild_rows` -- so the delete must fall back to a full rebuild instead of leaving a blank
+/// list with no hint.
+pub(super) fn incremental_row_delete_applies(
+    all_materialized_in_order: bool,
+    remaining_after_delete: usize,
+    materialized_before: usize,
+) -> bool {
+    all_materialized_in_order
+        && remaining_after_delete > 0
+        && remaining_after_delete + 1 == materialized_before
+}
+
 /// Remove and relayout existing views for a single deletion; fall back to a full rebuild when
 /// the date-group structure changes.
 unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
@@ -1761,14 +1858,13 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
     let show_source = show_source_app();
     let hist = CLIP_HISTORY.lock().unwrap();
     let filtered = filtered_indices(&hist, &query, filter);
-    // A virtualized list materializes only rows near the viewport; let the next visible
-    // refresh rebind its slots instead of treating physical slots as full-list indices.
-    // Small lists can still use the existing no-flash incremental path.
+    // A virtualized list materializes only rows near the viewport; let the next visible refresh
+    // rebind its slots instead of treating physical slots as full-list indices. Small lists can
+    // still use the existing no-flash incremental path.
     let materialized_indices = ROW_VIEW_INDICES.lock().unwrap().clone();
-    if materialized_indices != (0..old_views.len()).collect::<Vec<_>>() {
-        return false;
-    }
-    if filtered.len() + 1 != old_views.len() {
+    let all_materialized_in_order =
+        materialized_indices == (0..old_views.len()).collect::<Vec<_>>();
+    if !incremental_row_delete_applies(all_materialized_in_order, filtered.len(), old_views.len()) {
         return false;
     }
 
