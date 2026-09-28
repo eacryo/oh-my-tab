@@ -222,9 +222,14 @@ unsafe fn defaults_get_int(key: &str) -> isize {
     value
 }
 
-/// Remembers the guide's current step so a restart resumes there instead of treating the guide as
-/// "already seen". Called from the termination hook and from a Screen Recording grant (both are
-/// moments where the user is about to be interrupted by a restart).
+/// Remembers the guide's current step so an interrupted flow resumes there instead of being treated
+/// as "already seen".
+///
+/// Called whenever the guide is shown and whenever its step changes, so the marker is already on
+/// disk for as long as the guide is on screen. That is the point: an unexpected exit (crash, force
+/// quit, power loss) never delivers the termination notification, and the completion marker written
+/// when the guide appears would otherwise make the guide disappear for good. Do not move this back
+/// into the quit/notification paths.
 pub(crate) fn note_resume_if_visible() {
     if !is_visible() {
         return;
@@ -406,6 +411,8 @@ fn show_internal_at(overrides: PermissionOverride, start_index: usize) {
     *STATE.lock().unwrap() = Some(state);
     unsafe { ensure_window() };
     render_current_step();
+    // The guide is on screen now: record the step before anything can take the process down.
+    note_resume_if_visible();
     start_tick_timer();
     log_debug!("[onboarding] step {}/{} shown", step_number, step_count);
 }
@@ -1098,7 +1105,6 @@ fn shortcut_label() -> String {
 }
 
 /// Button dispatch (called by the `handleOnboardingAction:` selector registered in lib.rs).
-/// Button dispatch (called by the `handleOnboardingAction:` selector registered in lib.rs).
 pub(crate) extern "C" fn on_action(_self: *mut c_void, _cmd: Sel, sender: *mut AnyObject) {
     crate::callback_guard::void("onboarding_action", || {
         if sender.is_null() {
@@ -1232,6 +1238,7 @@ fn advance() {
         state.index += 1;
     }
     render_current_step();
+    note_resume_if_visible();
 }
 
 fn retreat() {
@@ -1245,6 +1252,7 @@ fn retreat() {
     state.index -= 1;
     drop(slot);
     render_current_step();
+    note_resume_if_visible();
 }
 
 /// Asks for Screen Recording after the user picked thumbnails or pressed the grant button. Never
@@ -1368,8 +1376,13 @@ unsafe fn dispatch_display_mode_segment(segment: isize) -> bool {
 pub(crate) fn live_apply_smoke_runner() -> bool {
     let before_thumbnails = CONFIG.read().unwrap().layout.thumbnails_enabled;
     show_internal(PermissionOverride::default());
+    // The resume marker must exist while the guide is on screen (an unexpected exit never delivers
+    // the termination notification, and the completion marker alone would swallow the guide for
+    // good), and it must follow the step.
+    let resume_after_show = peeking_resume_step() == Some(0);
     // Step 1 -> 2. Committing step 1 is a no-op here: its draft mirrors the loaded config.
     advance();
+    let resume_after_advance = peeking_resume_step() == Some(1);
     // Segment 0 = icons only, segment 1 = icons and thumbnails; pick the one that flips the value.
     let segment = if before_thumbnails { 0isize } else { 1isize };
     let expected_thumbnails = segment == 1;
@@ -1406,8 +1419,10 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
     let permission_untouched = !crate::thumbnail::permission_prompted();
     let window_shown = is_visible();
     hide();
+    // Finishing/skipping ends the flow: no pending resume may survive it.
+    let resume_cleared = peeking_resume_step().is_none();
     log_info!(
-        "[smoke-onboarding-live-apply] segment_dispatched={} thumbnails_applied={} thumbnails_draft={:?} switch_dispatched={} clipboard_applied={} clipboard_draft={:?} permission_untouched={} window={}",
+        "[smoke-onboarding-live-apply] segment_dispatched={} thumbnails_applied={} thumbnails_draft={:?} switch_dispatched={} clipboard_applied={} clipboard_draft={:?} permission_untouched={} resume_after_show={} resume_after_advance={} resume_cleared={} window={}",
         segment_dispatched,
         thumbnails_applied,
         thumbnails_draft,
@@ -1415,6 +1430,9 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
         clipboard_applied,
         clipboard_draft,
         permission_untouched,
+        resume_after_show,
+        resume_after_advance,
+        resume_cleared,
         window_shown
     );
     segment_dispatched
@@ -1424,6 +1442,9 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
         && clipboard_applied
         && clipboard_draft == Some(!before_clipboard)
         && permission_untouched
+        && resume_after_show
+        && resume_after_advance
+        && resume_cleared
         && window_shown
 }
 

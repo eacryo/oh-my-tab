@@ -646,9 +646,6 @@ fn on_app_launched_inner(notification: *mut c_void) {
 /// shutdown all land here; the menu-quit path has an equivalent call of its own).
 extern "C" fn on_will_terminate(_self: *mut c_void, _cmd: Sel, _notification: *mut c_void) {
     callback_guard::void("on_will_terminate", || {
-        // The app is going away: if the guide is on screen the user is mid-setup (its own restart
-        // button, or macOS' "Quit & Reopen"), so remember the step to resume on the next launch.
-        crate::onboarding::note_resume_if_visible();
         crate::mouse::pointer::restore();
     });
 }
@@ -865,9 +862,8 @@ extern "C" fn on_thumbnail_ready(_self: *mut c_void, _cmd: Sel, _arg: *mut c_voi
 /// the startup prewarm batch, which had to be skipped while unauthorized.
 extern "C" fn on_thumbnail_permission_granted(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     callback_guard::void("on_thumbnail_permission_granted", || {
-        // Screen Recording usually needs a quit & reopen before it takes effect, and macOS may
-        // quit us forcibly: write the resume marker now, while the guide is still on screen.
-        crate::onboarding::note_resume_if_visible();
+        // The guide's resume marker is already written while it is on screen, so it survives even a
+        // forced quit & reopen; this only has to warm the frames the grant unlocked.
         thumbnail::backfill_after_permission_grant();
     });
 }
