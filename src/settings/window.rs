@@ -588,6 +588,8 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         {
             let controller = crate::CONTROLLER.lock().unwrap().map(|target| target.0);
             if let Some(controller) = controller {
+                // A notification delivered synchronously from inside the borrow must defer (a
+                // nested settings borrow used to abort the process).
                 with_settings_ui(|_| {
                     crate::on_scroller_style_changed(
                         controller,
@@ -595,6 +597,14 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                         std::ptr::null_mut(),
                     );
                 });
+                // The deferred call arrives with no notification object, exactly like this direct
+                // one: messaging that nil note (the diagnostic) used to panic inside an `extern "C"`
+                // callback and abort. Both paths must survive.
+                crate::on_scroller_style_changed(
+                    controller,
+                    sel!(handleScrollerStyleChanged:),
+                    std::ptr::null_mut(),
+                );
             }
         }
         let Some((window, pages)) = with_settings_ui(|ui| {

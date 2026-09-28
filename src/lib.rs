@@ -731,11 +731,16 @@ pub(crate) extern "C" fn on_scroller_style_changed(
             return;
         }
     }
-    // Diagnostic: log which notification woke us up.
-    let name: *mut AnyObject = unsafe { msg_send![_note, name] };
-    crate::log_debug!("[scroller] notification arrived: {}", unsafe {
-        crate::ffi::nsstring_to_rust(name)
-    });
+    // Diagnostic: log which notification woke us up. A delivery that came through this handler's
+    // own performSelectorOnMainThread hop carries no notification object, and messaging nil panics
+    // inside an `extern "C"` callback (that aborted the app on 2026-09-28), so the note is
+    // optional here.
+    if !_note.is_null() {
+        let name: *mut AnyObject = unsafe { msg_send![_note, name] };
+        crate::log_debug!("[scroller] notification arrived: {}", unsafe {
+            crate::ffi::nsstring_to_rust(name)
+        });
+    }
     crate::scroller::on_activation_resync();
 }
 
