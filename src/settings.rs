@@ -58,6 +58,9 @@ const TEXT_SIZE_DEFAULT: i64 = 15;
 const CLIPBOARD_AUTO_EXPIRE_MIN: i64 = 0;
 const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
 const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
+pub(super) const SETTINGS_PAGE_COUNT: usize = 8;
+pub(super) const SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX: usize = 6;
+pub(super) const SETTINGS_ABOUT_PAGE_INDEX: usize = 7;
 
 /// Fixed width of the settings navigation pane, shared by layout and transient feedback.
 pub(crate) const SETTINGS_SIDEBAR_WIDTH: f64 = 220.0;
@@ -146,7 +149,8 @@ pub(super) struct SettingsUi {
     sidebar_clipboard: *mut AnyObject,          // Clipboard history (tag=3)
     sidebar_window_control: *mut AnyObject,     // Window control (tag=4)
     sidebar_quick_actions: *mut AnyObject,      // Quick actions (tag=5)
-    sidebar_about: *mut AnyObject,              // About (tag=6)
+    sidebar_keystroke_display: *mut AnyObject,  // Keystroke display (tag=6)
+    sidebar_about: *mut AnyObject,              // About (tag=7)
     sidebar_highlight: *mut AnyObject, // NSView: selected-row highlight background (layer-backed)
     general_view: *mut AnyObject,      // General page container
     switcher_view: *mut AnyObject,     // App switcher page container
@@ -154,6 +158,7 @@ pub(super) struct SettingsUi {
     clipboard_view: *mut AnyObject,    // Clipboard page container
     window_control_view: *mut AnyObject, // Window-control page container
     quick_actions_view: *mut AnyObject, // Quick-actions page container
+    keystroke_display_view: *mut AnyObject, // Keystroke-display page container
     about_view: *mut AnyObject,        // About page container
     about_subtitle: *mut AnyObject,    // About-page version label
     theme: *mut AnyObject,             // NSPopUpButton: auto / light / dark
@@ -176,13 +181,17 @@ pub(super) struct SettingsUi {
     windows_enabled: *mut AnyObject,   // app-switcher master switch
     overlay_position: *mut AnyObject,  // overlay position (follow active window / main screen)
     activation_mode: *mut AnyObject,   // activation mode (hover / click)
-    log_level: *mut AnyObject,         // NSPopUpButton: trace / debug / info / warn / error
-    launch_at_login: *mut AnyObject,   // launch at login
-    reverse_scroll: *mut AnyObject,    // reverse scrolling
-    enable_mouse: *mut AnyObject,      // enable mouse control
-    scroll_mode: *mut AnyObject,       // NSPopUpButton: default/line
-    line_count: *mut AnyObject,        // NSSlider: line count slider
-    line_count_label: *mut AnyObject,  // the row's label
+    keystroke_display_enabled: *mut AnyObject,
+    keystroke_display_mode: *mut AnyObject,
+    keystroke_display_tap_level: *mut AnyObject,
+    keystroke_display_follow_screen: *mut AnyObject,
+    log_level: *mut AnyObject, // NSPopUpButton: trace / debug / info / warn / error
+    launch_at_login: *mut AnyObject, // launch at login
+    reverse_scroll: *mut AnyObject, // reverse scrolling
+    enable_mouse: *mut AnyObject, // enable mouse control
+    scroll_mode: *mut AnyObject, // NSPopUpButton: default/line
+    line_count: *mut AnyObject, // NSSlider: line count slider
+    line_count_label: *mut AnyObject, // the row's label
     line_count_value_label: *mut AnyObject, // slider's current value (read-only)
     disable_pointer_accel: *mut AnyObject, // disable pointer acceleration
     pointer_accel_slider: *mut AnyObject, // NSSlider: pointer acceleration, 0..=40
@@ -230,10 +239,10 @@ pub(super) struct SettingsUi {
     restore_defaults: RestoreDefaultsControl, // restore-defaults control
     // One "Restore Page Defaults" control per page (embedded at the end of each page's
     // scrolling document).
-    page_restores: [RestoreDefaultsControl; 7],
+    page_restores: [RestoreDefaultsControl; SETTINGS_PAGE_COUNT],
     /// One layout owner per page (index order matches `page_restores`): rows, cards, the page
     /// title, the restore control and the document height all follow from its row list.
-    page_canvases: [PageCanvas; 7],
+    page_canvases: [PageCanvas; SETTINGS_PAGE_COUNT],
     permission_warning_view: *mut AnyObject, // permission-warning banner container
     update_auto_check: *mut AnyObject,       // Sparkle auto-check switch
     update_auto_download: *mut AnyObject,    // Sparkle auto-download switch
@@ -481,7 +490,8 @@ pub(crate) use dispatch::{
     handle_export_logs, handle_quick_actions_enabled_toggle, handle_window_control_enabled_toggle,
     handle_windows_enabled_toggle, on_control_changed, on_control_text_did_change,
     on_control_text_did_end_editing, on_sidebar_select, refresh_device_popup_if_open,
-    refresh_service_controls_from_config, refresh_switcher_controls_from_config,
+    refresh_service_controls_from_config,
+    refresh_switcher_and_keystroke_display_controls_from_config,
 };
 pub(crate) use window::{
     close_settings_from_switcher, invalidate_settings_window, refresh_permission_ui_if_visible,
@@ -652,26 +662,28 @@ pub(crate) fn resync_page_layout_for_scroller() {
 }
 
 /// A2 E2E: exposes the view roots whose geometry must be asserted (name → view); `e2e_state`
-/// walks them into JSON. Only semantic roots (highlight, the seven sidebar buttons, the seven page
-/// containers) are listed -- this is not a generic traversal entry point.
+/// walks them into JSON. Only semantic roots (highlight, the sidebar buttons, the page containers)
+/// are listed -- this is not a generic traversal entry point.
 pub(crate) fn e2e_view_roots() -> Vec<(&'static str, *mut AnyObject)> {
-    const SIDEBAR_NAMES: [&str; 7] = [
+    const SIDEBAR_NAMES: [&str; SETTINGS_PAGE_COUNT] = [
         "sidebar_0_general",
         "sidebar_1_switcher",
         "sidebar_2_mouse",
         "sidebar_3_clipboard",
         "sidebar_4_window_control",
         "sidebar_5_quick_actions",
-        "sidebar_6_about",
+        "sidebar_6_keystroke_display",
+        "sidebar_7_about",
     ];
-    const PAGE_NAMES: [&str; 7] = [
+    const PAGE_NAMES: [&str; SETTINGS_PAGE_COUNT] = [
         "page_0_general",
         "page_1_switcher",
         "page_2_mouse",
         "page_3_clipboard",
         "page_4_window_control",
         "page_5_quick_actions",
-        "page_6_about",
+        "page_6_keystroke_display",
+        "page_7_about",
     ];
     with_settings_ui(|ui| match ui {
         Some(ui) => {
@@ -684,6 +696,7 @@ pub(crate) fn e2e_view_roots() -> Vec<(&'static str, *mut AnyObject)> {
                 ui.sidebar_clipboard,
                 ui.sidebar_window_control,
                 ui.sidebar_quick_actions,
+                ui.sidebar_keystroke_display,
                 ui.sidebar_about,
             ];
             let pages = [
@@ -693,6 +706,7 @@ pub(crate) fn e2e_view_roots() -> Vec<(&'static str, *mut AnyObject)> {
                 ui.clipboard_view,
                 ui.window_control_view,
                 ui.quick_actions_view,
+                ui.keystroke_display_view,
                 ui.about_view,
             ];
             for (index, view) in buttons.into_iter().enumerate() {
@@ -713,24 +727,24 @@ pub(crate) fn e2e_selected_sidebar() -> usize {
     SIDEBAR_SELECTED.load(Ordering::SeqCst)
 }
 
-/// Development-switch helper: open the settings window on a specific page (0=General .. 6=About).
+/// Development-switch helper: open the settings window on a specific page (0=General .. 7=About).
 /// Unlike `open_about_updates` it triggers no update check; it only parks the window on a page.
 pub(crate) fn show_settings_page(page: usize) {
     show_settings();
     // Select twice: the first call animates (previous_idx != idx) and the spring never commits while
     // the window is still off-screen, leaving the pill behind; the second call sees previous_idx == idx
     // and takes the no-animation path, parking the pill on the target row for real.
-    select_sidebar(page.min(6));
-    select_sidebar(page.min(6));
+    select_sidebar(page.min(SETTINGS_PAGE_COUNT - 1));
+    select_sidebar(page.min(SETTINGS_PAGE_COUNT - 1));
 }
 
 pub(crate) fn open_about_updates() {
     show_settings();
-    // show_settings resets to the General page on every open; switch to About (tag=6) here.
+    // show_settings resets to the General page on every open; switch to About here.
     // Same as show_settings_page: a second call takes the no-animation path so the highlight cannot
     // stay behind when the window is being built for the first time.
-    select_sidebar(6);
-    select_sidebar(6);
+    select_sidebar(SETTINGS_ABOUT_PAGE_INDEX);
+    select_sidebar(SETTINGS_ABOUT_PAGE_INDEX);
     unsafe {
         with_settings_ui(|ui| {
             if let Some(u) = ui.as_ref() {
@@ -757,7 +771,10 @@ pub(crate) fn expand_update_section(window_h: f64) {
         let Some(ui) = ui_guard.as_mut() else {
             return;
         };
-        if ui.update_card.is_null() || ui.update_host.is_null() || !ui.page_canvases[6].is_bound() {
+        if ui.update_card.is_null()
+            || ui.update_host.is_null()
+            || !ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX].is_bound()
+        {
             return;
         }
         unsafe {
@@ -769,7 +786,7 @@ pub(crate) fn expand_update_section(window_h: f64) {
             ui.update_card_expanded = true;
             set_about_restore_control_visible_for_ui(ui, false);
 
-            let canvas = &ui.page_canvases[6];
+            let canvas = &ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX];
             canvas.set_bottom_padding(UPDATE_CARD_BOTTOM_PADDING);
             // Each Sparkle phase may need a different height: the host grows downward from the
             // check-button row, and the page re-flows around it.
@@ -790,7 +807,7 @@ pub(crate) fn expand_update_section(window_h: f64) {
 /// the grown card and the control don't overlap at the page bottom.
 /// Update the About restore control while the caller already owns the settings UI guard.
 unsafe fn set_about_restore_control_visible_for_ui(ui: &mut SettingsUi, visible: bool) {
-    let control = &mut ui.page_restores[6];
+    let control = &mut ui.page_restores[SETTINGS_ABOUT_PAGE_INDEX];
     let _: () = msg_send![control.container, setHidden: !visible];
     let _: () = msg_send![control.surface, setHidden: !visible];
 }
@@ -816,8 +833,8 @@ pub(crate) fn collapse_update_section() {
             let _: () = msg_send![ui.update_check_button, setHidden: false];
             ui.update_card_expanded = false;
             set_about_restore_control_visible_for_ui(ui, true);
-            if ui.page_canvases[6].is_bound() {
-                let canvas = &ui.page_canvases[6];
+            if ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX].is_bound() {
+                let canvas = &ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX];
                 // Undo the flow's geometry: the host row shrinks back to nothing, the card returns
                 // to its derived height and the page keeps its usual bottom padding.
                 canvas.set_row_consume(ui.update_host_row, 0.0);
@@ -997,6 +1014,26 @@ fn log_config_changes(old: &Config, new: &Config) {
         "keyboard.modifier",
         old.keyboard.modifier,
         new.keyboard.modifier
+    );
+    changed!(
+        "keystroke_display.enabled",
+        old.keystroke_display.enabled,
+        new.keystroke_display.enabled
+    );
+    changed!(
+        "keystroke_display.mode",
+        old.keystroke_display.mode,
+        new.keystroke_display.mode
+    );
+    changed!(
+        "keystroke_display.tap_level",
+        old.keystroke_display.tap_level,
+        new.keystroke_display.tap_level
+    );
+    changed!(
+        "keystroke_display.follow_frontmost_screen",
+        old.keystroke_display.follow_frontmost_screen,
+        new.keystroke_display.follow_frontmost_screen
     );
     changed!("i18n.locale", old.i18n.locale, new.i18n.locale);
     changed!("windows.enabled", old.windows.enabled, new.windows.enabled);
@@ -1210,6 +1247,30 @@ fn load_settings_from(cfg: &Config) {
             set_field(ui.status_bar_text_size_value_label, status_bar_text_size);
             let mod_idx: isize = if is_cmd { 1 } else { 0 };
             let _: () = msg_send![ui.modifier, selectItemAtIndex: mod_idx];
+            let _: () = msg_send![
+                ui.keystroke_display_enabled,
+                setState: if cfg.keystroke_display.enabled { 1isize } else { 0isize }
+            ];
+            let mode_idx: isize = match cfg.keystroke_display.mode.as_str() {
+                "shortcuts" => 1,
+                "commands" => 2,
+                _ => 0,
+            };
+            let _: () = msg_send![ui.keystroke_display_mode, selectItemAtIndex: mode_idx];
+            let tap_idx: isize = if cfg.keystroke_display.tap_level == "hid" {
+                1
+            } else {
+                0
+            };
+            let _: () = msg_send![ui.keystroke_display_tap_level, selectItemAtIndex: tap_idx];
+            let _: () = msg_send![
+                ui.keystroke_display_follow_screen,
+                setState: if cfg.keystroke_display.follow_frontmost_screen {
+                    1isize
+                } else {
+                    0isize
+                }
+            ];
             // locale: select the item matching CONFIG.i18n.locale; fall back to index 0 (auto).
             let loc_idx: isize = LOCALE_VALUES
                 .iter()
@@ -1633,6 +1694,7 @@ unsafe fn grow_short_page_documents() {
             ui.clipboard_view,
             ui.window_control_view,
             ui.quick_actions_view,
+            ui.keystroke_display_view,
             ui.about_view,
         ];
         let selected = widgets::SIDEBAR_SELECTED.load(Ordering::SeqCst);
@@ -1666,6 +1728,42 @@ unsafe fn grow_short_page_documents() {
 #[cfg(test)]
 mod tests {
     use super::{settings_ui_borrowed, with_settings_ui};
+
+    fn settings_smoke_app_binary() -> std::path::PathBuf {
+        let exe = std::env::current_exe().expect("current exe");
+        let profile_dir = exe
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("test binary profile directory");
+        let app = profile_dir.join(env!("CARGO_PKG_NAME"));
+        let profile = profile_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("Cargo profile directory name");
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let mut build = std::process::Command::new(cargo);
+        build
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .arg("build")
+            .arg("--bin")
+            .arg(env!("CARGO_PKG_NAME"));
+        if profile == "release" {
+            build.arg("--release");
+        } else if profile != "debug" {
+            build.arg("--profile").arg(profile);
+        }
+        let status = build.status().expect("failed to build app smoke binary");
+        assert!(
+            status.success(),
+            "building app smoke binary failed: {status}"
+        );
+        assert!(
+            app.is_file(),
+            "app binary missing after build at {}",
+            app.display()
+        );
+        app
+    }
 
     #[test]
     fn borrow_probe_sees_an_active_settings_ui_borrow() {
@@ -1798,17 +1896,7 @@ mod tests {
     #[test]
     #[ignore]
     fn settings_layout_smoke() {
-        let exe = std::env::current_exe().expect("current exe");
-        let app = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("oh-my-tab"))
-            .expect("app binary path");
-        assert!(
-            app.exists(),
-            "app binary missing at {}: run `cargo build` first",
-            app.display()
-        );
+        let app = settings_smoke_app_binary();
         let out = std::process::Command::new(&app)
             .arg("--smoke-settings-layout")
             .output()
@@ -1825,17 +1913,7 @@ mod tests {
     #[test]
     #[ignore]
     fn settings_state_sync_after_content_rebuild_smoke() {
-        let exe = std::env::current_exe().expect("current exe");
-        let app = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("oh-my-tab"))
-            .expect("app binary path");
-        assert!(
-            app.exists(),
-            "app binary missing at {}: run `cargo build` first",
-            app.display()
-        );
+        let app = settings_smoke_app_binary();
         let out = std::process::Command::new(&app)
             .arg("--smoke-settings-state-sync")
             .output()
@@ -1852,17 +1930,7 @@ mod tests {
     #[test]
     #[ignore]
     fn settings_collapsible_row_geometry_smoke() {
-        let exe = std::env::current_exe().expect("current exe");
-        let app = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("oh-my-tab"))
-            .expect("app binary path");
-        assert!(
-            app.exists(),
-            "app binary missing at {}: run `cargo build` first",
-            app.display()
-        );
+        let app = settings_smoke_app_binary();
         let out = std::process::Command::new(&app)
             .arg("--smoke-settings-collapsible-row")
             .output()

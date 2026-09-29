@@ -22,6 +22,27 @@ pub struct Config {
     pub mouse: MouseSection,
     pub window_control: WindowControlSection,
     pub quick_actions: QuickActionsSection,
+    pub keystroke_display: KeystrokeDisplaySection,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct KeystrokeDisplaySection {
+    pub enabled: bool,
+    pub mode: String,
+    pub tap_level: String,
+    pub follow_frontmost_screen: bool,
+}
+
+impl Default for KeystrokeDisplaySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "all".into(),
+            tap_level: "session".into(),
+            follow_frontmost_screen: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -804,6 +825,19 @@ impl Config {
             ));
         }
 
+        if !["all", "shortcuts", "commands"].contains(&self.keystroke_display.mode.as_str()) {
+            errs.push(tf(
+                "errors.keystroke_display_mode_invalid",
+                &[("value", &self.keystroke_display.mode)],
+            ));
+        }
+        if !["session", "hid"].contains(&self.keystroke_display.tap_level.as_str()) {
+            errs.push(tf(
+                "errors.keystroke_display_tap_level_invalid",
+                &[("value", &self.keystroke_display.tap_level)],
+            ));
+        }
+
         if !(1..=100).contains(&self.clipboard.max_entries) {
             errs.push(tf(
                 "errors.clipboard_max_entries_invalid",
@@ -1003,6 +1037,24 @@ impl Config {
             }
             // file_path has no validation, always valid
             self.logging.file_path = other.logging.file_path;
+        }
+
+        // keystroke display
+        if !has_error("keystroke_display.") {
+            self.keystroke_display = other.keystroke_display;
+        } else {
+            self.keystroke_display.enabled = other.keystroke_display.enabled;
+            self.keystroke_display.follow_frontmost_screen =
+                other.keystroke_display.follow_frontmost_screen;
+            if !errs.iter().any(|e| e.starts_with("keystroke_display.mode")) {
+                self.keystroke_display.mode = other.keystroke_display.mode;
+            }
+            if !errs
+                .iter()
+                .any(|e| e.starts_with("keystroke_display.tap_level"))
+            {
+                self.keystroke_display.tap_level = other.keystroke_display.tap_level;
+            }
         }
 
         // startup (bool field needs no validation, always valid)
@@ -1991,6 +2043,31 @@ mod tests {
             merged.appearance.corner_radius,
             Config::default().appearance.corner_radius
         );
+    }
+
+    #[test]
+    fn keystroke_display_defaults_and_invalid_enum_fallbacks_are_per_field() {
+        let defaults = Config::default();
+        assert!(!defaults.keystroke_display.enabled);
+        assert_eq!(defaults.keystroke_display.mode, "all");
+        assert_eq!(defaults.keystroke_display.tap_level, "session");
+        assert!(defaults.keystroke_display.follow_frontmost_screen);
+
+        let mut loaded = defaults.clone();
+        loaded.keystroke_display.enabled = true;
+        loaded.keystroke_display.follow_frontmost_screen = false;
+        loaded.keystroke_display.mode = "shortcuts".into();
+        loaded.keystroke_display.tap_level = "invalid".into();
+        let errors = loaded.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("keystroke_display.tap_level"));
+
+        let mut merged = defaults.clone();
+        merged.merge_valid(loaded, &errors);
+        assert!(merged.keystroke_display.enabled);
+        assert!(!merged.keystroke_display.follow_frontmost_screen);
+        assert_eq!(merged.keystroke_display.mode, "shortcuts");
+        assert_eq!(merged.keystroke_display.tap_level, "session");
     }
 
     #[test]

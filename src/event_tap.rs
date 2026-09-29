@@ -36,8 +36,13 @@ pub(crate) mod keyboard {
     pub(crate) const FLAG_OPTION: super::CGEventFlags = 0x0008_0000;
     pub(crate) const FLAG_CONTROL: super::CGEventFlags = 0x0004_0000;
     pub(crate) const FLAG_SHIFT: super::CGEventFlags = 0x0002_0000;
+    pub(crate) const FLAG_CAPS_LOCK: super::CGEventFlags = 0x0001_0000;
+    pub(crate) const FLAG_FN: super::CGEventFlags = 0x0080_0000;
 
     pub(crate) const VK_TAB: u16 = 48;
+    pub(crate) const VK_Q: u16 = 12;
+    pub(crate) const VK_SPACE: u16 = 49;
+    pub(crate) const VK_CAPS_LOCK: u16 = 57;
     pub(crate) const VK_V: u16 = 9;
     pub(crate) const VK_LEFT: u16 = 123;
     pub(crate) const VK_RIGHT: u16 = 124;
@@ -146,9 +151,9 @@ pub(crate) type CFRunLoopTimerCallBack =
 /// Tap location for CGEventTapCreate.
 #[allow(dead_code)]
 pub(crate) mod tap_location {
-    /// HID level: lowest, sees all hardware events (including session-synthesized ones).
+    /// HID level: observes hardware events before session-posted synthetic events are added.
     pub(crate) const HID_EVENT_TAP: i32 = 0;
-    /// Session level: sees real hardware events + session-synthesized Cmd+Tab (mouse-remapper injected).
+    /// Session level: observes hardware events and session-posted events from remappers.
     pub(crate) const SESSION_EVENT_TAP: i32 = 1;
     #[allow(dead_code)]
     pub(crate) const ANNOTATED_SESSION_EVENT_TAP: i32 = 2;
@@ -194,6 +199,12 @@ extern "C" {
     #[allow(dead_code)]
     pub(crate) fn CGEventSetDoubleValueField(event: CGEventRef, field: i32, value: f64);
     pub(crate) fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
+    pub(crate) fn CGEventKeyboardGetUnicodeString(
+        event: CGEventRef,
+        max_string_length: u32,
+        actual_string_length: *mut u32,
+        unicode_string: *mut u16,
+    );
     pub(crate) fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
     // Query the combined session's current modifier state so diagnostics can compare an
     // event's flags with the system-wide state.

@@ -1,9 +1,6 @@
-//! Key simulator: synthesizes the mapped shortcut as keyboard events posted to the HID level.
-//! Posting to the HID level re-injects the event into the HID stream, where **our own event
-//! taps see it again**, so:
-//!   - binding Cmd+Tab opens OUR overlay (not the system switcher);
-//!   - binding Option+V opens the clipboard picker;
-//!   - binding an ordinary shortcut (Cmd+C) passes through the taps to the frontmost app.
+//! Key simulator: synthesizes the mapped shortcut as keyboard events posted at the session level.
+//! The frontmost app receives ordinary shortcuts; global shortcuts owned by this app dispatch
+//! internally, while session taps can observe events posted by other remappers.
 //!
 //! Modeled on LinearMouse's KeySimulator: modifiers ride on each event as flags; synthetic
 //! events carry a userData marker so the tap can recognize its own output.
@@ -26,9 +23,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 
-/// Side button pressed: post the mapped keyDown (modifiers attached) to the HID level.
-/// It loops back through our switcher tap, where the existing CmdTabPressed /
-/// ClipboardToggled detection kicks in.
+/// Side button pressed: post the mapped keyDown (modifiers attached) to the session level.
 pub(crate) fn press_down(keycode: u16, flags: u32, desc: &str) {
     // Binding our own global shortcuts (switcher/clipboard) dispatches internally instead
     // of synthesizing: session-level posts can't loop back to our tap, and HID-level
@@ -352,11 +347,8 @@ unsafe fn post_modifier_change(vk: u16, flags: u32) {
     crate::ffi::CFRelease(ev as *const c_void);
 }
 
-/// Synthesize a single keyboard event (keyDown/true or keyUp/false), tagged with userData,
-/// posted to the session level. (The session level is the clipboard-paste-proven path;
-/// HID-level keyboard posts get dropped by the system.)
-/// Synthesize a single keyboard event (keyDown/true or keyUp/false), tagged with userData,
-/// and post it to the HID level.
+/// Synthesize a single keyboard event (keyDown/true or keyUp/false), tagged with userData and
+/// posted to the session level. HID-level keyboard posts are dropped by the system.
 unsafe fn post_key(keycode: u16, flags: u32, key_down: bool) {
     let ev = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, key_down);
     if ev.is_null() {

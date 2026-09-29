@@ -23,6 +23,7 @@ pub enum GlobalEvent {
     // Quick actions: Option+I/E/D/L (the action id crosses to the main thread via the bounded
     // input aggregator).
     QuickAction(u8),
+    KeystrokeDisplayWake,
 }
 
 // keyboard constants used by the window switcher
@@ -51,6 +52,7 @@ fn should_ignore_tab_autorepeat(autorepeat: i64) -> bool {
 static TAB_PRESSED: AtomicBool = AtomicBool::new(false);
 static TAP_CONTROL: event_tap::TapThreadControl = event_tap::TapThreadControl::new();
 static TAP_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+static TAP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // Shortcut mode: true = Command+Tab, false = Option+Tab
 pub static SHORTCUT_IS_CMD: AtomicBool = AtomicBool::new(false);
@@ -216,6 +218,7 @@ pub fn start() {
         "kbd",
         &TAP_CONTROL,
         || {
+            TAP_ACTIVE.store(true, Ordering::SeqCst);
             // The shortcut can be toggled via menu/settings; print the actual combo from SHORTCUT_IS_CMD.
             let shortcut = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
                 "Command+Tab"
@@ -226,11 +229,19 @@ pub fn start() {
                 "Event monitor started. Listening for {} globally.",
                 shortcut
             );
+            // Starting after this session tap and using HEAD_INSERT keeps the display tap first
+            // in the same-level chain, before the switcher can swallow Cmd+Tab.
+            crate::keystroke_display::switcher_tap_started();
         },
     ));
 }
 
+pub(crate) fn tap_is_active() -> bool {
+    TAP_ACTIVE.load(Ordering::SeqCst)
+}
+
 pub(crate) fn stop() {
+    TAP_ACTIVE.store(false, Ordering::SeqCst);
     TAP_CONTROL.stop();
 }
 

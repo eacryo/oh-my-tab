@@ -15,9 +15,9 @@ pub(super) struct SettingsPageBuildContext {
 }
 
 pub(super) struct SettingsPageFinalization {
-    pub(super) roots: [*mut AnyObject; 7],
-    pub(super) documents: [*mut AnyObject; 7],
-    pub(super) bottoms: [f64; 7],
+    pub(super) roots: [*mut AnyObject; SETTINGS_PAGE_COUNT],
+    pub(super) documents: [*mut AnyObject; SETTINGS_PAGE_COUNT],
+    pub(super) bottoms: [f64; SETTINGS_PAGE_COUNT],
 }
 
 /// Build the Switcher page and return its final keyboard-card bottom.
@@ -310,6 +310,119 @@ pub(super) unsafe fn build_switcher_page(
 
     let content_bottom = canvas.finish();
     ui.page_canvases[1] = canvas;
+    content_bottom
+}
+
+/// Build the Keystroke Display page and return its card bottom.
+pub(super) unsafe fn build_keystroke_display_page(
+    context: &SettingsPageBuildContext,
+    keystroke_display_view: *mut AnyObject,
+    keystroke_display_doc_h: f64,
+    ui: &mut SettingsUi,
+) -> f64 {
+    let content_w = context.content_w;
+    let layout = context.layout;
+    let target = context.target;
+    let label_x = layout.label_x;
+    let label_w = layout.label_w;
+    let ctrl_w = layout.control_w;
+    let ctrl_x = layout.control_x;
+    let row_h = layout.row_h;
+    let described_row_h = layout.described_row_h;
+    let mut canvas = PageCanvas::new(
+        keystroke_display_view,
+        content_w - 12.0,
+        layout,
+        &t("settings.sidebar_keystroke_display"),
+        keystroke_display_doc_h,
+        context.page_frame.size.height,
+    );
+
+    let y = canvas.next_row(described_row_h);
+    ui.keystroke_display_enabled = SettingsRow::described(
+        keystroke_display_view,
+        label_x,
+        y,
+        ctrl_x - label_x - 18.0,
+        described_row_h,
+        &t("settings.row_keystroke_display_enabled"),
+        &t("settings.desc_keystroke_display_enabled"),
+        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+    );
+    bind_control(target, ui.keystroke_display_enabled);
+
+    let mode_labels = [
+        t("settings.keystroke_display_mode_all"),
+        t("settings.keystroke_display_mode_shortcuts"),
+        t("settings.keystroke_display_mode_commands"),
+    ];
+    let mode_refs: Vec<&str> = mode_labels.iter().map(|s| s.as_str()).collect();
+    let mode_metrics = SettingsSelect::metrics(ctrl_w, &mode_refs, row_h, described_row_h);
+    let y = canvas.next_row(mode_metrics.row_h);
+    SettingsRow::separator_above_row(keystroke_display_view, y, mode_metrics.row_h, content_w);
+    ui.keystroke_display_mode = SettingsRow::tall_with_height(
+        keystroke_display_view,
+        label_x,
+        y,
+        label_w,
+        mode_metrics.row_h,
+        &t("settings.row_keystroke_display_mode"),
+        SettingsControl::popup(
+            ctrl_x,
+            y + (mode_metrics.row_h - mode_metrics.control_h) / 2.0,
+            ctrl_w,
+            mode_metrics.control_h,
+            &mode_refs,
+            0,
+        ),
+    )
+    .1;
+    bind_control(target, ui.keystroke_display_mode);
+
+    let tap_labels = [
+        t("settings.keystroke_display_tap_session"),
+        t("settings.keystroke_display_tap_hid"),
+    ];
+    let tap_refs: Vec<&str> = tap_labels.iter().map(|s| s.as_str()).collect();
+    let tap_metrics = SettingsSelect::metrics(ctrl_w, &tap_refs, row_h, described_row_h);
+    let y = canvas.next_row(tap_metrics.row_h);
+    SettingsRow::separator_above_row(keystroke_display_view, y, tap_metrics.row_h, content_w);
+    ui.keystroke_display_tap_level = SettingsRow::tall_with_height(
+        keystroke_display_view,
+        label_x,
+        y,
+        label_w,
+        tap_metrics.row_h,
+        &t("settings.row_keystroke_display_tap_level"),
+        SettingsControl::popup(
+            ctrl_x,
+            y + (tap_metrics.row_h - tap_metrics.control_h) / 2.0,
+            ctrl_w,
+            tap_metrics.control_h,
+            &tap_refs,
+            0,
+        ),
+    )
+    .1;
+    bind_control(target, ui.keystroke_display_tap_level);
+
+    let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(keystroke_display_view, y, described_row_h, content_w);
+    ui.keystroke_display_follow_screen = SettingsRow::tall_before_control(
+        keystroke_display_view,
+        label_x,
+        y,
+        ctrl_x,
+        18.0,
+        &t("settings.row_keystroke_display_follow_screen"),
+        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+    )
+    .1;
+    bind_control(target, ui.keystroke_display_follow_screen);
+    canvas.card(&t("settings.header_keystroke_display"));
+
+    let content_bottom = canvas.finish();
+    ui.page_canvases[SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX] = canvas;
     content_bottom
 }
 
@@ -1832,7 +1945,7 @@ pub(super) unsafe fn build_about_page(
     ui.update_card = update_card;
     ui.update_card_shadow = update_card_shadow;
     let content_bottom = canvas.finish();
-    ui.page_canvases[6] = canvas;
+    ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX] = canvas;
     content_bottom
 }
 
@@ -1865,13 +1978,14 @@ pub(super) unsafe fn finalize_settings_pages(
         );
     }
 
-    let page_names: [&str; 7] = [
+    let page_names: [&str; SETTINGS_PAGE_COUNT] = [
         "general",
         "switcher",
         "mouse",
         "clipboard",
         "window_control",
         "quick_actions",
+        "keystroke_display",
         "about",
     ];
     for (index, (root, document)) in page_roots.iter().zip(page_documents.iter()).enumerate() {

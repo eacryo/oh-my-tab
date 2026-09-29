@@ -13,6 +13,7 @@ mod hash;
 mod i18n;
 mod icon_cache;
 mod input_monitor;
+mod keystroke_display;
 mod logger;
 mod mem;
 mod menu;
@@ -209,6 +210,7 @@ struct PendingGlobalInput {
     tab_steps: VecDeque<bool>,
     release_pending: bool,
     clipboard_pending: bool,
+    keystroke_display_pending: bool,
     other: VecDeque<GlobalEvent>,
 }
 
@@ -230,6 +232,9 @@ impl PendingGlobalInput {
             }
             GlobalEvent::ClipboardToggled => {
                 self.clipboard_pending = true;
+            }
+            GlobalEvent::KeystrokeDisplayWake => {
+                self.keystroke_display_pending = true;
             }
             GlobalEvent::WindowControl(_)
             | GlobalEvent::WindowDisplayMove(_)
@@ -256,6 +261,7 @@ pub(crate) fn enqueue_global_event(event: GlobalEvent) {
             tab_steps: VecDeque::new(),
             release_pending: false,
             clipboard_pending: false,
+            keystroke_display_pending: false,
             other: VecDeque::new(),
         })
     });
@@ -293,16 +299,24 @@ fn on_global_input_drain_inner() {
     let Some(pending) = PENDING_GLOBAL_INPUT.get() else {
         return;
     };
-    let (tab_steps, clipboard_pending, other, release_pending) = {
+    let (tab_steps, clipboard_pending, keystroke_display_pending, other, release_pending) = {
         let mut state = pending.lock().unwrap();
         let tab_steps = std::mem::take(&mut state.tab_steps);
         let clipboard_pending = state.clipboard_pending;
         state.clipboard_pending = false;
+        let keystroke_display_pending = state.keystroke_display_pending;
+        state.keystroke_display_pending = false;
         let other = std::mem::take(&mut state.other);
         let release_pending = state.release_pending;
         state.release_pending = false;
         GLOBAL_INPUT_DRAIN_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
-        (tab_steps, clipboard_pending, other, release_pending)
+        (
+            tab_steps,
+            clipboard_pending,
+            keystroke_display_pending,
+            other,
+            release_pending,
+        )
     };
 
     for backward in tab_steps {
@@ -327,6 +341,9 @@ fn on_global_input_drain_inner() {
             std::ptr::null_mut(),
         );
     }
+    if keystroke_display_pending {
+        keystroke_display::wake();
+    }
     for event in other {
         match event {
             GlobalEvent::WindowControl(direction) => window_management::apply_direction(direction),
@@ -341,7 +358,8 @@ fn on_global_input_drain_inner() {
             GlobalEvent::CmdTabPressed
             | GlobalEvent::CmdShiftTabPressed
             | GlobalEvent::CmdReleased
-            | GlobalEvent::ClipboardToggled => {}
+            | GlobalEvent::ClipboardToggled
+            | GlobalEvent::KeystrokeDisplayWake => {}
         }
     }
     if release_pending {
@@ -356,6 +374,7 @@ fn on_global_input_drain_inner() {
         let state = pending.lock().unwrap();
         !state.tab_steps.is_empty()
             || state.clipboard_pending
+            || state.keystroke_display_pending
             || !state.other.is_empty()
             || state.release_pending
     };
@@ -767,6 +786,23 @@ fn on_locale_changed_inner(_self: *mut c_void) {
     refresh_menu_titles();
     invalidate_settings_window();
     clipboard::refresh_localized_ui();
+}
+
+extern "C" fn on_keyboard_layout_changed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    callback_guard::void("on_keyboard_layout_changed", || {
+        unsafe {
+            let is_main: bool = msg_send![class!(NSThread), isMainThread];
+            if !is_main {
+                let _: () = msg_send![_self as *mut AnyObject,
+                    performSelectorOnMainThread: sel!(handleKeyboardLayoutChanged:),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    waitUntilDone: false
+                ];
+                return;
+            }
+        }
+        keystroke_display::mapping::refresh_layout_cache();
+    });
 }
 
 /// Callback for effective-appearance changes. Follow the system only when theme is `auto`,
@@ -1378,6 +1414,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleLocaleChanged:),
             on_locale_changed as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleKeyboardLayoutChanged:),
+            on_keyboard_layout_changed as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -2045,22 +2087,26 @@ fn prompt_accessibility_if_needed() {
     }
 }
 
-/// Parses the development switch `--open-settings[=<general|about|0..6|1>]`, forwarded by
+/// Parses the development switch `--open-settings[=<general|about|0..7|1>]`, forwarded by
 /// `scripts/dev-restart.sh` (argv is the only channel; see the dev_flags module). Returns a
-/// sidebar page index (0=General .. 6=About); None when absent or unparsable, so a normal launch
+/// sidebar page index (0=General .. 7=About); None when absent or unparsable, so a normal launch
 /// is unaffected.
 fn open_settings_page_request() -> Option<usize> {
     let spec = crate::dev_flags::value("open-settings")?;
     match spec.trim().to_ascii_lowercase().as_str() {
-        "" | "1" | "true" | "about" | "6" => Some(6),
+        "" | "1" | "true" | "about" | "7" => Some(crate::settings::SETTINGS_ABOUT_PAGE_INDEX),
         "general" | "0" => Some(0),
-        other => other.parse::<usize>().ok().map(|page| page.min(6)),
+        other => other
+            .parse::<usize>()
+            .ok()
+            .map(|page| page.min(crate::settings::SETTINGS_PAGE_COUNT - 1)),
     }
 }
 
 /// App entry: the full startup/smoke/run loop (called by the thin bin wrapper; behavior
 /// is unchanged by the lib/bin split).
 pub fn run() {
+    let is_smoke_process = std::env::args().any(|arg| arg.starts_with("--smoke-"));
     // GUI smoke entry points are test subprocesses and may run alongside the development app;
     // every normal launch channel shares one lock.
     let is_gui_smoke_process = std::env::args().any(|arg| {
@@ -2078,6 +2124,9 @@ pub fn run() {
             Ok(guard) => Some(guard),
             Err(error) => {
                 eprintln!("[single-instance] startup refused: {error}");
+                if is_smoke_process {
+                    std::process::exit(1);
+                }
                 return;
             }
         }
@@ -2306,6 +2355,14 @@ pub fn run() {
         // notification center, so observe that notification as well.
         let distributed_nc: *mut AnyObject =
             msg_send![class!(NSDistributedNotificationCenter), defaultCenter];
+        let layout_changed = keystroke_display::mapping::layout_changed_notification();
+        let _: () = msg_send![distributed_nc,
+            addObserver: controller,
+            selector: sel!(handleKeyboardLayoutChanged:),
+            name: layout_changed as *mut AnyObject,
+            object: std::ptr::null::<AnyObject>(),
+        ];
+        keystroke_display::mapping::refresh_layout_cache();
         let distributed_theme_name = make_nsstring("AppleInterfaceThemeChangedNotification");
         let _: () = msg_send![distributed_nc,
             addObserver: controller,
@@ -2425,7 +2482,7 @@ pub fn run() {
         }
     }
 
-    // Settings layout smoke entry: open and traverse all seven pages on the real NSApplication
+    // Settings layout smoke entry: open and traverse all eight pages on the real NSApplication
     // main thread so the runtime layout validator checks the final AppKit view tree. Requires a
     // GUI session; a panic/non-zero exit reports a failure.
     if std::env::args().any(|a| a == "--smoke-settings-layout") {
@@ -2440,6 +2497,20 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-settings-layout] all pages survived");
+            std::process::exit(0);
+        }
+    }
+
+    if std::env::args().any(|a| a == "--smoke-keystroke-display-panel") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            let ok = keystroke_display::smoke_panel_runner();
+            if !ok {
+                eprintln!("[smoke-keystroke-display-panel] panel creation or sizing failed");
+                std::process::exit(1);
+            }
+            log_info!("[smoke-keystroke-display-panel] panel creation and sizing passed");
             std::process::exit(0);
         }
     }

@@ -26,6 +26,10 @@ fn state_path() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
+pub(crate) fn is_enabled() -> bool {
+    state_path().is_some()
+}
+
 /// Records one snapshot. Main thread only (it borrows AppState internally).
 pub(crate) fn record(event: &str) {
     write(event, None);
@@ -427,7 +431,28 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             card.bounds.3
         ));
     }
-    json.push_str("\n  ]\n}\n");
+    json.push_str("\n  ],\n");
+    let keystroke = crate::keystroke_display::e2e_snapshot();
+    json.push_str(&format!(
+        "  \"keystroke_display\": {{\"visible\": {}, \"badges\": [",
+        keystroke.visible
+    ));
+    for (index, badge) in keystroke.badges.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "{{\"text\": {}, \"kind\": {}, \"repeats\": {}}}",
+            json_string(&badge.text),
+            json_string(badge.kind),
+            badge.repeats
+        ));
+    }
+    json.push_str(&format!(
+        "], \"secure_paused\": {}, \"tap_level\": {}}}\n}}\n",
+        keystroke.secure_paused,
+        json_string(&keystroke.tap_level)
+    ));
 
     write_atomically(path, &json);
 }

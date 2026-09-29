@@ -51,7 +51,7 @@ pub(crate) struct Colors {
 
 /// Settings and auxiliary panels use custom layer-backed surfaces, so they need a complete
 /// palette instead of relying on AppKit semantic colors for only part of the hierarchy.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UiPalette {
     pub(crate) dark: bool,
     pub(crate) window_bg: u32,

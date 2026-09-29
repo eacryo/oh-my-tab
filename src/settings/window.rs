@@ -26,10 +26,10 @@ unsafe fn set_permission_banner_visible(ui: &SettingsUi, visible: bool) {
 }
 
 /// Switch the active settings page: align the highlight to the selected button, toggle the
-/// seven content views' visibility, and bold the selected item's label.
+/// eight content views' visibility, and bold the selected item's label.
 pub(super) fn select_sidebar(idx: usize) {
     // fall back to the General page if the tag is out of range
-    let idx = if idx > 6 { 0 } else { idx };
+    let idx = if idx >= SETTINGS_PAGE_COUNT { 0 } else { idx };
     // Dismiss the previous page's disabled hint so the bubble cannot remain across tabs.
     unsafe { tooltip::SettingsTooltip::dismiss() };
     let previous_idx = SIDEBAR_SELECTED.swap(idx, Ordering::SeqCst);
@@ -46,6 +46,7 @@ pub(super) fn select_sidebar(idx: usize) {
                 ui.sidebar_clipboard,
                 ui.sidebar_window_control,
                 ui.sidebar_quick_actions,
+                ui.sidebar_keystroke_display,
                 ui.sidebar_about,
             ];
             let views = [
@@ -55,6 +56,7 @@ pub(super) fn select_sidebar(idx: usize) {
                 ui.clipboard_view,
                 ui.window_control_view,
                 ui.quick_actions_view,
+                ui.keystroke_display_view,
                 ui.about_view,
             ];
             // align the highlight to the selected button's frame
@@ -76,6 +78,7 @@ pub(super) fn select_sidebar(idx: usize) {
                 t("settings.sidebar_clipboard"),
                 t("settings.sidebar_window_control"),
                 t("settings.sidebar_quick_actions"),
+                t("settings.sidebar_keystroke_display"),
                 t("settings.sidebar_about"),
             ];
             for (i, &b) in buttons.iter().enumerate() {
@@ -85,7 +88,7 @@ pub(super) fn select_sidebar(idx: usize) {
                 }
                 set_sidebar_title(b, &titles[i], i == idx);
             }
-            // toggle the seven pages' visibility
+            // Toggle every page's visibility.
             for (i, &v) in views.iter().enumerate() {
                 let _: () = msg_send![v, setHidden: i != idx];
             }
@@ -99,7 +102,7 @@ pub(super) fn select_sidebar(idx: usize) {
                 false
             };
             set_permission_banner_visible(ui, show_permission_banner);
-            if idx == 6 {
+            if idx == SETTINGS_ABOUT_PAGE_INDEX {
                 refresh_permission_statuses(ui);
             }
             // A just-shown page needs a layout pass first so the clip bounds are correct;
@@ -110,13 +113,14 @@ pub(super) fn select_sidebar(idx: usize) {
                 document: msg_send![views[idx], documentView],
             };
             page.scroll_to_top();
-            let page_names = [
+            let page_names: [&str; SETTINGS_PAGE_COUNT] = [
                 "general",
                 "switcher",
                 "mouse",
                 "clipboard",
                 "window-control",
                 "quick-actions",
+                "keystroke-display",
                 "about",
             ];
             page.validate(page_names[idx]);
@@ -196,7 +200,7 @@ unsafe fn refresh_accessibility_permission_action(ui: &SettingsUi) {
 /// Refresh the visible permission UI when the app regains focus.
 pub(crate) fn refresh_permission_ui_if_visible() {
     let selected_page = SIDEBAR_SELECTED.load(Ordering::SeqCst);
-    if selected_page != 0 && selected_page != 6 {
+    if selected_page != 0 && selected_page != SETTINGS_ABOUT_PAGE_INDEX {
         return;
     }
     with_settings_ui(|ui| {
@@ -305,11 +309,15 @@ pub(super) fn show_settings() {
 }
 
 /// Show the settings window, optionally preserving its frame and selected page.
-fn show_settings_preserving(frame: NSRect, page: usize, scroll_offsets: [NSPoint; 7]) {
+fn show_settings_preserving(
+    frame: NSRect,
+    page: usize,
+    scroll_offsets: [NSPoint; SETTINGS_PAGE_COUNT],
+) {
     show_settings_inner(Some(frame), page, Some(scroll_offsets), false);
 }
 
-/// Re-tighten the seven page documents to their real content; returns whether any page changed.
+/// Re-tighten each page document to its real content; returns whether any page changed.
 ///
 /// The build tightens once, but conditional rows (their visibility follows switches and permissions)
 /// and the permission banner only expand after the window is *on screen*: the page content then gets
@@ -328,6 +336,7 @@ pub(crate) unsafe fn tighten_page_documents() -> bool {
             ui.clipboard_view,
             ui.window_control_view,
             ui.quick_actions_view,
+            ui.keystroke_display_view,
             ui.about_view,
         ]
         .into_iter()
@@ -356,7 +365,7 @@ pub(crate) unsafe fn tighten_page_documents() -> bool {
     changed
 }
 
-unsafe fn capture_settings_scroll_offsets(ui: &SettingsUi) -> [NSPoint; 7] {
+unsafe fn capture_settings_scroll_offsets(ui: &SettingsUi) -> [NSPoint; SETTINGS_PAGE_COUNT] {
     let scrolls = [
         ui.general_view,
         ui.switcher_view,
@@ -364,6 +373,7 @@ unsafe fn capture_settings_scroll_offsets(ui: &SettingsUi) -> [NSPoint; 7] {
         ui.clipboard_view,
         ui.window_control_view,
         ui.quick_actions_view,
+        ui.keystroke_display_view,
         ui.about_view,
     ];
     scrolls.map(|scroll| {
@@ -394,7 +404,7 @@ unsafe fn restore_settings_scroll_offset(scroll: *mut AnyObject, origin: NSPoint
 fn show_settings_inner(
     preserved_frame: Option<NSRect>,
     page: usize,
-    preserved_scroll_offsets: Option<[NSPoint; 7]>,
+    preserved_scroll_offsets: Option<[NSPoint; SETTINGS_PAGE_COUNT]>,
     present_window: bool,
 ) {
     unsafe {
@@ -452,6 +462,7 @@ fn show_settings_inner(
                         u.clipboard_view,
                         u.window_control_view,
                         u.quick_actions_view,
+                        u.keystroke_display_view,
                         u.about_view,
                     ];
                     for (scroll, origin) in scrolls.into_iter().zip(offsets) {
@@ -483,7 +494,9 @@ fn show_settings_inner(
     // height changed, the scroll offset set above is stale, so park the current page back at the top.
     unsafe {
         if tighten_page_documents() {
-            let selected = SIDEBAR_SELECTED.load(Ordering::SeqCst).min(6);
+            let selected = SIDEBAR_SELECTED
+                .load(Ordering::SeqCst)
+                .min(SETTINGS_PAGE_COUNT - 1);
             with_settings_ui(|ui| {
                 if let Some(u) = ui.as_ref() {
                     let scrolls = [
@@ -493,6 +506,7 @@ fn show_settings_inner(
                         u.clipboard_view,
                         u.window_control_view,
                         u.quick_actions_view,
+                        u.keystroke_display_view,
                         u.about_view,
                     ];
                     widgets::scroll_page_to_top(scrolls[selected]);
@@ -557,7 +571,7 @@ pub(crate) fn refresh_system_appearance() {
             ui.as_ref()
                 .map(|ui| unsafe { capture_settings_scroll_offsets(ui) })
         })
-        .unwrap_or([NSPoint::new(0.0, 0.0); 7]);
+        .unwrap_or([NSPoint::new(0.0, 0.0); SETTINGS_PAGE_COUNT]);
         (page, frame, scroll_offsets)
     };
 
@@ -684,8 +698,10 @@ unsafe fn update_flow_state() -> Option<UpdateFlowState> {
         let row_above: NSRect = msg_send![ui.update_auto_download, frame];
         let button_hidden: bool = msg_send![ui.update_check_button, isHidden];
         let host_hidden: bool = msg_send![ui.update_host, isHidden];
-        let container_frame: NSRect = msg_send![ui.page_restores[6].container, frame];
-        let surface_frame: NSRect = msg_send![ui.page_restores[6].surface, frame];
+        let container_frame: NSRect =
+            msg_send![ui.page_restores[SETTINGS_ABOUT_PAGE_INDEX].container, frame];
+        let surface_frame: NSRect =
+            msg_send![ui.page_restores[SETTINGS_ABOUT_PAGE_INDEX].surface, frame];
         Some(UpdateFlowState {
             document_height: doc_frame.size.height,
             button_hidden,
@@ -693,7 +709,7 @@ unsafe fn update_flow_state() -> Option<UpdateFlowState> {
             divider_from_row_above: divider.origin.y - row_above.origin.y,
             card_rect_bottom_from_host_bottom: card.origin.y - host.origin.y,
             restore_surface_from_container: surface_frame.origin.y - container_frame.origin.y,
-            restore_expanded: ui.page_restores[6].expanded,
+            restore_expanded: ui.page_restores[SETTINGS_ABOUT_PAGE_INDEX].expanded,
         })
     })
 }
@@ -742,6 +758,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                         ui.clipboard_view,
                         ui.window_control_view,
                         ui.quick_actions_view,
+                        ui.keystroke_display_view,
                         ui.about_view,
                     ],
                 )
@@ -749,6 +766,63 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         }) else {
             return false;
         };
+        let sidebar_layout_ok = with_settings_ui(|ui| {
+            let ui = ui.as_ref()?;
+            let buttons = [
+                ui.sidebar_general,
+                ui.sidebar_switcher,
+                ui.sidebar_mouse,
+                ui.sidebar_clipboard,
+                ui.sidebar_window_control,
+                ui.sidebar_quick_actions,
+                ui.sidebar_keystroke_display,
+                ui.sidebar_about,
+            ];
+            if buttons.iter().any(|button| button.is_null()) {
+                return Some(false);
+            }
+            let parent: *mut AnyObject = msg_send![buttons[0], superview];
+            if parent.is_null() {
+                return Some(false);
+            }
+            let bounds: NSRect = msg_send![parent, bounds];
+            let mut previous: Option<NSRect> = None;
+            for button in buttons {
+                let button_parent: *mut AnyObject = msg_send![button, superview];
+                let frame: NSRect = msg_send![button, frame];
+                if button_parent != parent
+                    || frame.size.width <= 0.0
+                    || frame.size.height <= 0.0
+                    || frame.origin.x < bounds.origin.x
+                    || frame.origin.y < bounds.origin.y
+                    || frame.origin.x + frame.size.width > bounds.origin.x + bounds.size.width
+                    || frame.origin.y + frame.size.height > bounds.origin.y + bounds.size.height
+                {
+                    return Some(false);
+                }
+                if let Some(previous_frame) = previous {
+                    let step = previous_frame.origin.y - frame.origin.y;
+                    if (step - (previous_frame.size.height + 4.0)).abs() > 0.5 {
+                        return Some(false);
+                    }
+                }
+                previous = Some(frame);
+            }
+            let lowest_button = previous?;
+            let restore_separator: NSRect = msg_send![ui.restore_defaults.separator, frame];
+            Some(
+                restore_separator.origin.y + restore_separator.size.height
+                    <= lowest_button.origin.y,
+            )
+        })
+        .unwrap_or(false);
+        if !sidebar_layout_ok {
+            log_info!(
+                "[smoke-settings-layout] eight sidebar rows do not fit above the restore footer"
+            );
+            hide_settings();
+            return false;
+        }
         let _: () = msg_send![window, layoutIfNeeded];
         let opaque: bool = msg_send![window, isOpaque];
         if opaque {
@@ -823,6 +897,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             "clipboard",
             "window-control",
             "quick-actions",
+            "keystroke-display",
             "about",
         ];
         for (index, page) in pages.iter().enumerate() {
@@ -842,7 +917,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         // compact page -- where the fit is limited by the viewport instead of the content -- is not
         // reachable here; that arithmetic is covered by
         // `settings::tests::inline_update_room_follows_the_real_document_change`.
-        select_sidebar(6);
+        select_sidebar(SETTINGS_ABOUT_PAGE_INDEX);
         let compact_state = update_flow_state();
         let compact = about_panel_snapshot();
         crate::settings::expand_update_section(600.0);
@@ -850,7 +925,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         let expanded_state = update_flow_state();
         let expanded = about_panel_snapshot();
         let first_inside = update_card_inside_document();
-        debug_validate_settings_page(pages[6], "about-expanded");
+        debug_validate_settings_page(pages[SETTINGS_ABOUT_PAGE_INDEX], "about-expanded");
         crate::settings::collapse_update_section();
         let _: () = msg_send![window, layoutIfNeeded];
         let collapsed_state = update_flow_state();
@@ -876,11 +951,11 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         // unchanged, and the collapse must still land on the compact page.
         let offsets =
             with_settings_ui(|ui| ui.as_ref().map(|ui| capture_settings_scroll_offsets(ui)))
-                .unwrap_or([NSPoint::new(0.0, 0.0); 7]);
+                .unwrap_or([NSPoint::new(0.0, 0.0); SETTINGS_PAGE_COUNT]);
         crate::settings::expand_update_section(600.0);
         let _: () = msg_send![window, layoutIfNeeded];
         let reopened_before = about_panel_snapshot();
-        show_settings_preserving(frame, 6, offsets);
+        show_settings_preserving(frame, SETTINGS_ABOUT_PAGE_INDEX, offsets);
         let reopened = about_panel_snapshot();
         let third_inside = update_card_inside_document();
         crate::settings::collapse_update_section();
@@ -1019,7 +1094,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
     }
 }
 
-/// Rebuild settings content and verify that configured switcher values survive the rebuild.
+/// Rebuild settings content and verify switcher and Keystroke Display values survive the rebuild.
 pub(crate) fn settings_state_sync_smoke_runner() -> bool {
     unsafe {
         let mut cfg = CONFIG.read().unwrap().clone();
@@ -1029,15 +1104,36 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         cfg.layout.thumbnails_enabled = true;
         cfg.layout.focused_thumbnail_prewarm = true;
         cfg.layout.show_app_name_in_cards = true;
+        cfg.keystroke_display.enabled = true;
+        cfg.keystroke_display.mode = "commands".into();
+        cfg.keystroke_display.tap_level = "hid".into();
+        cfg.keystroke_display.follow_frontmost_screen = true;
         if let Ok(mut current) = CONFIG.write() {
             *current = cfg.clone();
         }
 
         show_settings();
         rebuild_settings_content_now();
+        select_sidebar(SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX);
 
         let states = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
+            let keystroke_page_document: *mut AnyObject =
+                msg_send![ui.keystroke_display_view, documentView];
+            let controls_on_keystroke_page = [
+                ui.keystroke_display_enabled,
+                ui.keystroke_display_mode,
+                ui.keystroke_display_tap_level,
+                ui.keystroke_display_follow_screen,
+            ]
+            .into_iter()
+            .all(|control| {
+                if control.is_null() {
+                    return false;
+                }
+                let parent: *mut AnyObject = msg_send![control, superview];
+                parent == keystroke_page_document
+            });
             Some((
                 msg_send![ui.windows_enabled, state],
                 msg_send![ui.show_minimized, state],
@@ -1045,11 +1141,40 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 msg_send![ui.thumbnails_enabled, indexOfSelectedItem],
                 msg_send![ui.focused_thumbnail_prewarm, state],
                 msg_send![ui.show_app_name_in_cards, state],
+                msg_send![ui.keystroke_display_enabled, state],
+                msg_send![ui.keystroke_display_mode, indexOfSelectedItem],
+                msg_send![ui.keystroke_display_tap_level, indexOfSelectedItem],
+                msg_send![ui.keystroke_display_follow_screen, state],
+                controls_on_keystroke_page,
+            ))
+        });
+
+        let mut refreshed_cfg = cfg;
+        refreshed_cfg.keystroke_display.enabled = false;
+        refreshed_cfg.keystroke_display.mode = "shortcuts".into();
+        refreshed_cfg.keystroke_display.tap_level = "session".into();
+        refreshed_cfg.keystroke_display.follow_frontmost_screen = false;
+        if let Ok(mut current) = CONFIG.write() {
+            *current = refreshed_cfg;
+        }
+        refresh_switcher_and_keystroke_display_controls_from_config();
+        let refreshed = with_settings_ui(|ui| {
+            let ui = ui.as_ref()?;
+            Some((
+                msg_send![ui.keystroke_display_enabled, state],
+                msg_send![ui.keystroke_display_mode, indexOfSelectedItem],
+                msg_send![ui.keystroke_display_tap_level, indexOfSelectedItem],
+                msg_send![ui.keystroke_display_follow_screen, state],
             ))
         });
         hide_settings();
 
-        states == Some((1isize, 1isize, 1isize, 1isize, 1isize, 1isize))
+        states
+            == Some((
+                1isize, 1isize, 1isize, 1isize, 1isize, 1isize, 1isize, 2isize, 1isize, 1isize,
+                true,
+            ))
+            && refreshed == Some((0isize, 1isize, 0isize, 0isize))
     }
 }
 
@@ -1482,6 +1607,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             sidebar_clipboard: std::ptr::null_mut(),
             sidebar_window_control: std::ptr::null_mut(),
             sidebar_quick_actions: std::ptr::null_mut(),
+            sidebar_keystroke_display: std::ptr::null_mut(),
             sidebar_about: std::ptr::null_mut(),
             sidebar_highlight: std::ptr::null_mut(),
             general_view: std::ptr::null_mut(),
@@ -1490,6 +1616,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             clipboard_view: std::ptr::null_mut(),
             window_control_view: std::ptr::null_mut(),
             quick_actions_view: std::ptr::null_mut(),
+            keystroke_display_view: std::ptr::null_mut(),
             about_view: std::ptr::null_mut(),
             about_subtitle: std::ptr::null_mut(),
             accessibility_permission_status: std::ptr::null_mut(),
@@ -1515,6 +1642,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             windows_enabled: std::ptr::null_mut(),
             overlay_position: std::ptr::null_mut(),
             activation_mode: std::ptr::null_mut(),
+            keystroke_display_enabled: std::ptr::null_mut(),
+            keystroke_display_mode: std::ptr::null_mut(),
+            keystroke_display_tap_level: std::ptr::null_mut(),
+            keystroke_display_follow_screen: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
@@ -1648,6 +1779,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // Quick-actions page: master plus five action switches, mirroring the window-control
         // page.
         let quick_actions_doc_h = 854.0;
+        let keystroke_display_doc_h = 650.0;
         let about_doc_h = 1300.0;
 
         let general_page = SettingsPage::new(content, page_frame, general_doc_h, false);
@@ -1675,6 +1807,11 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let quick_actions_root = quick_actions_page.scroll;
         let quick_actions_view = quick_actions_page.document;
         ui.quick_actions_view = quick_actions_root;
+        let keystroke_display_page =
+            SettingsPage::new(content, page_frame, keystroke_display_doc_h, true);
+        let keystroke_display_root = keystroke_display_page.scroll;
+        let keystroke_display_view = keystroke_display_page.document;
+        ui.keystroke_display_view = keystroke_display_root;
         let about_page = SettingsPage::new(content, page_frame, about_doc_h, true);
         let about_root = about_page.scroll;
         ui.about_view = about_root;
@@ -1684,7 +1821,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let general_content_bottom =
             page_builder::build_general_page(&page_context, general_view, general_doc_h, &mut ui);
 
-        let keyboard_card_bottom = page_builder::build_switcher_page(
+        let switcher_content_bottom = page_builder::build_switcher_page(
             &page_context,
             switcher_view,
             switcher_doc_h,
@@ -1715,6 +1852,13 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             &mut ui,
         );
 
+        let keystroke_display_card_bottom = page_builder::build_keystroke_display_page(
+            &page_context,
+            keystroke_display_view,
+            keystroke_display_doc_h,
+            &mut ui,
+        );
+
         let compact_card_bottom =
             page_builder::build_about_page(&page_context, about_view, about_doc_h, window, &mut ui);
 
@@ -1732,6 +1876,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                     clipboard_root,
                     window_control_root,
                     quick_actions_root,
+                    keystroke_display_root,
                     about_root,
                 ],
                 documents: [
@@ -1741,15 +1886,17 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                     clipboard_view,
                     window_control_view,
                     quick_actions_view,
+                    keystroke_display_view,
                     about_view,
                 ],
                 bottoms: [
                     general_content_bottom,
-                    keyboard_card_bottom,
+                    switcher_content_bottom,
                     mouse_content_bottom,
                     clipboard_options_card_bottom,
                     window_control_shortcuts_card_bottom,
                     quick_actions_card_bottom,
+                    keystroke_display_card_bottom,
                     compact_card_bottom,
                 ],
             },

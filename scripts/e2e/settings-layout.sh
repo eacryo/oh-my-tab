@@ -8,7 +8,7 @@
 #   4. 页面文档高度是否等于"内容 + 上下内边距"(修:手写常量高估导致下方大片死空白)。
 #
 # **与 UI 语言无关**:本场景不用任何界面文案做锚点(旧版本硬编码简体中文,英文 locale 下必挂)。
-# 锚点全是结构性的:视图类名(root = page_6_about / sidebar_highlight / sidebar_N_*)、父子关系,
+# 锚点全是结构性的:视图类名(root = page_7_about / sidebar_highlight / sidebar_N_*)、父子关系,
 # 以及**布局步长约定**(0 = 同行标签+值,20 = 页头区块,43 = 分区标题→首行,62 = 行→行)。因此
 # 切系统语言、改文案都不会让本场景变红;但**结构或布局约定改动会让它明确失败**(这是设计意图:
 # 这种改动需要人工确认)。
@@ -87,7 +87,7 @@ while time.time() < deadline:
     # --open-settings=about first opens the ordinary General page, then parks on About. Wait for
     # the requested final page as well as a stable sequence so the initial General snapshot cannot
     # satisfy the settle check before the sidebar switch completes.
-    if candidate and candidate.get("views") and candidate.get("selected_sidebar") == 6:
+    if candidate and candidate.get("views") and candidate.get("selected_sidebar") == 7:
         if candidate.get("seq") == last_seq:
             stable_reads += 1
             if stable_reads >= SETTLE_READS:
@@ -117,14 +117,18 @@ def roots(name: str) -> list[dict]:
 
 # --- 1) 侧栏高亮跟着选中页 ------------------------------------------------
 check(
-    data["selected_sidebar"] == 6,
+    data["selected_sidebar"] == 7,
     "the selected sidebar page is About",
     f"selected_sidebar={data['selected_sidebar']}",
 )
 pill = roots("sidebar_highlight")
-about_row = roots("sidebar_6_about")
+about_row = roots("sidebar_7_about")
+keystroke_display_row = roots("sidebar_6_keystroke_display")
 general_row = roots("sidebar_0_general")
-check(bool(pill) and bool(about_row) and bool(general_row), "sidebar views are in the snapshot")
+check(
+    bool(pill) and bool(about_row) and bool(keystroke_display_row) and bool(general_row),
+    "all sidebar views are in the snapshot",
+)
 if pill and about_row and general_row:
     p, about, general = geom(pill[0]), geom(about_row[0]), geom(general_row[0])
     check(
@@ -149,7 +153,7 @@ if pill and about_row and general_row:
 # Regression source (fixed 2026-09-22): when the system switches to legacy scrollers, the clip loses
 # 17pt and a self-drawn switch was squeezed from 38pt to 21pt. The page now adapts to the measured
 # footprint, so this scenario accepts overlay or legacy and checks the footprint and switch geometry.
-page = next((entry for entry in data.get("pages", []) if entry["root"] == "page_6_about"), None)
+page = next((entry for entry in data.get("pages", []) if entry["root"] == "page_7_about"), None)
 check(page is not None, "the settings page's scroll geometry is in the snapshot")
 if page:
     footprint = round(page["self"][2] - page["clip"][2], 1)
@@ -167,7 +171,7 @@ if page:
     switches = [
         (round(n["frame"][2], 1), round(n["frame"][3], 1))
         for n in views
-        if n["root"] == "page_6_about" and n["class"] == "OhMyTabHtmlSwitch"
+        if n["root"] == "page_7_about" and n["class"] == "OhMyTabHtmlSwitch"
     ]
     check(len(switches) >= 2, "found the self-drawn switches", f"found={len(switches)}")
     # 胶囊比例:被压扁时宽会掉到接近高度(21/22),正常约 1.7。用比例判定,不写死像素。
@@ -186,7 +190,7 @@ if page:
 buttons = [
     geom(views[n["parent"]])
     for n in views
-    if n["root"] == "page_6_about"
+    if n["root"] == "page_7_about"
     and n["class"] == "NSButtonTextField"
     and views[n["parent"]]["class"] == "OhMyTabHtmlActionButton"
     and views[n["parent"]]["frame"][2] <= 140.0
@@ -211,7 +215,7 @@ if len(buttons) == 3:
     print(f"  info action buttons widths={sorted(widths)} right_edges={sorted(right_edges)}")
 
 # --- 3) 行距与分隔线(结构性、与文案无关) --------------------------------
-labels = [n for n in views if n["root"] == "page_6_about" and n["class"] == "NSTextField"]
+labels = [n for n in views if n["root"] == "page_7_about" and n["class"] == "NSTextField"]
 if labels:
     # 行标签共用同一个父视图(且它是标签最多的那个父视图);按 y 从高到低排。
     # Row labels share one parent, which is the parent holding the most labels.
@@ -253,7 +257,7 @@ if labels:
     separators = sorted(
         round(n["frame"][1], 1)
         for n in views
-        if n["root"] == "page_6_about" and n["frame"][3] <= 1.5 and n["frame"][2] > 300
+        if n["root"] == "page_7_about" and n["frame"][3] <= 1.5 and n["frame"][2] > 300
     )
     missing = []
     for i, delta in enumerate(deltas):
@@ -270,12 +274,11 @@ else:
     check(False, "About page row labels are present")
 
 # --- 页面文档高度:内容下方不能有死空白 ----------------------------------
-# 7 个页面的文档高度曾经是手写常量(通用 1138 / 切换 1432 / 鼠标 1620 / 剪贴板 978 /
-# 窗口控制 1102 / 快捷操作 854 / 关于 1300),与真实排版脱钩:内容比常量短时,差额全部堆在
+# 现有页面的文档高度曾经是手写常量,与真实排版脱钩:内容比常量短时,差额全部堆在
 # **内容下方**(顶部始终按页头内边距定位),于是滚到底只剩空白、滚动条比例也被拉失真
 # (实测多余空白 140–474pt)。现在文档按"内容 + 底部内边距"收紧,这里把这条约定钉住。
-# The seven page documents used to carry hand-written heights (1138 / 1432 / 1620 / 978 / 1102 /
-# 854 / 1300) decoupled from the real layout: when the content was shorter, the difference piled up
+# The page documents used to carry hand-written heights, decoupled from the real layout: when the
+# content was shorter, the difference piled up
 # *below* it (the top always sat under the page-header padding), so scrolling to the end showed
 # nothing but blank and the scroller proportion was distorted (measured surplus: 140-474pt). The
 # documents are now tightened to "content + bottom padding"; these checks pin that rule.
@@ -289,13 +292,14 @@ expected_pages = {
     "page_3_clipboard",
     "page_4_window_control",
     "page_5_quick_actions",
-    "page_6_about",
+    "page_6_keystroke_display",
+    "page_7_about",
 }
 page_entries = data.get("pages", [])
 page_roots = {page.get("root") for page in page_entries}
 check(
     page_roots == expected_pages,
-    "all seven settings pages have geometry snapshots",
+    "all eight settings pages have geometry snapshots",
     f"missing={sorted(expected_pages - page_roots)} extra={sorted(page_roots - expected_pages)}",
 )
 for root in sorted(expected_pages):

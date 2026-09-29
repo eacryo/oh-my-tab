@@ -29,6 +29,7 @@ struct ChangeFlags {
     clipboard_persist: bool,
     window_control: bool,
     quick_actions: bool,
+    keystroke_display: bool,
     updates: bool,
 }
 
@@ -56,6 +57,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         clipboard_persist: old.clipboard.persist != new.clipboard.persist,
         window_control: startup || old.window_control.enabled != new.window_control.enabled,
         quick_actions: startup || old.quick_actions.enabled != new.quick_actions.enabled,
+        keystroke_display: startup || old.keystroke_display != new.keystroke_display,
         updates: startup
             || old.updates.automatically_check != new.updates.automatically_check
             || old.updates.automatically_download != new.updates.automatically_download,
@@ -124,10 +126,14 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         crate::overlay::reset_switcher();
     }
 
-    if flags.modifier || flags.thumbnails || flags.focused_thumbnail_prewarm {
+    if flags.modifier
+        || flags.thumbnails
+        || flags.focused_thumbnail_prewarm
+        || flags.keystroke_display
+    {
         // Keep an already-open settings window in sync in place, without activating the app or
         // rebuilding the window.
-        crate::settings::refresh_switcher_controls_from_config();
+        crate::settings::refresh_switcher_and_keystroke_display_controls_from_config();
     }
 
     if flags.mouse {
@@ -167,6 +173,9 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
             crate::quick_actions::stop();
         }
     }
+    if flags.keystroke_display {
+        crate::keystroke_display::apply_config_change(old, new);
+    }
     if flags.updates {
         crate::updater::set_automatic_checks(new.updates.automatically_check);
         crate::updater::set_automatic_downloads(new.updates.automatically_download);
@@ -201,5 +210,15 @@ mod tests {
         assert!(
             flags.mouse && flags.clipboard_enabled && flags.window_control && flags.quick_actions
         );
+    }
+
+    #[test]
+    fn keystroke_display_changes_are_detected_without_enabling_other_services() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.keystroke_display.enabled = true;
+        let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+        assert!(flags.keystroke_display);
+        assert!(!flags.mouse && !flags.clipboard_enabled && !flags.window_control);
     }
 }

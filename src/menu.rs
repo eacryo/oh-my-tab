@@ -28,7 +28,7 @@ pub(crate) struct ThumbnailState {
 }
 
 pub(crate) struct ServiceMenuState {
-    pub(crate) items: [*mut AnyObject; 5],
+    pub(crate) items: [*mut AnyObject; 6],
 }
 
 // Fixed-title menu items (settings / reload / clear_caches / quit); re-titled in bulk by refresh_menu_titles on locale change.
@@ -180,20 +180,22 @@ pub(crate) fn set_thumbnail_mode(thumbnails_enabled: bool) {
     }
 }
 
-const SERVICE_MENU_TITLE_KEYS: [&str; 5] = [
+const SERVICE_MENU_TITLE_KEYS: [&str; 6] = [
     "menu.service_windows",
     "menu.service_mouse",
     "menu.service_clipboard",
     "menu.service_window_control",
     "menu.service_quick_actions",
+    "menu.service_keystroke_display",
 ];
 
-const SERVICE_MENU_SYMBOLS: [&str; 5] = [
+const SERVICE_MENU_SYMBOLS: [&str; 6] = [
     "rectangle.on.rectangle",
     "computermouse",
     "doc.text",
     "rectangle.split.2x2",
     "bolt.circle",
+    "keyboard",
 ];
 
 #[derive(Clone, Copy)]
@@ -203,6 +205,7 @@ enum ServiceToggle {
     Clipboard,
     WindowControl,
     QuickActions,
+    KeystrokeDisplay,
 }
 
 impl ServiceToggle {
@@ -213,6 +216,7 @@ impl ServiceToggle {
             2 => Some(Self::Clipboard),
             3 => Some(Self::WindowControl),
             4 => Some(Self::QuickActions),
+            5 => Some(Self::KeystrokeDisplay),
             _ => None,
         }
     }
@@ -224,6 +228,7 @@ impl ServiceToggle {
             Self::Clipboard => cfg.clipboard.enabled,
             Self::WindowControl => cfg.window_control.enabled,
             Self::QuickActions => cfg.quick_actions.enabled,
+            Self::KeystrokeDisplay => cfg.keystroke_display.enabled,
         }
     }
 
@@ -234,6 +239,7 @@ impl ServiceToggle {
             Self::Clipboard => cfg.clipboard.enabled = enabled,
             Self::WindowControl => cfg.window_control.enabled = enabled,
             Self::QuickActions => cfg.quick_actions.enabled = enabled,
+            Self::KeystrokeDisplay => cfg.keystroke_display.enabled = enabled,
         }
     }
 }
@@ -277,7 +283,7 @@ unsafe fn make_menu_item(
 
 /// Build the directly expanded service-toggle section between Settings and shortcut mode.
 pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyObject) {
-    let items: [*mut AnyObject; 5] = std::array::from_fn(|index| {
+    let items: [*mut AnyObject; 6] = std::array::from_fn(|index| {
         let item = make_menu_item(
             target,
             &t(SERVICE_MENU_TITLE_KEYS[index]),
@@ -297,7 +303,7 @@ pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyOb
 }
 
 pub(crate) fn refresh_service_menu() {
-    let enabled: [bool; 5] = {
+    let enabled: [bool; 6] = {
         let cfg = CONFIG.read().unwrap();
         std::array::from_fn(|index| {
             ServiceToggle::from_tag(index as isize)

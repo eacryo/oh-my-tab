@@ -255,9 +255,13 @@ fn restore_tab_defaults(tab: usize) {
         5 => {
             cfg.quick_actions = d.quick_actions;
         }
-        _ => {
+        SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX => {
+            cfg.keystroke_display = d.keystroke_display;
+        }
+        SETTINGS_ABOUT_PAGE_INDEX => {
             cfg.updates = d.updates;
         }
+        _ => {}
     }
     if let Ok(mut w) = CONFIG.write() {
         *w = cfg.clone();

@@ -59,12 +59,22 @@ service_mouse = "Mouse Control"
 service_clipboard = "Clipboard History"
 service_window_control = "Window Control"
 service_quick_actions = "Quick Actions"
+service_keystroke_display = "Keystroke Display"
 reload_config = "Reload Config"
 clear_caches = "Clear Icon and Thumbnail Cache"
 quit = "Quit"
 
 [overlay]
 no_windows = "No windows to switch"
+
+[keystroke_display]
+paused = "Paused · Secure Input"
+key_space = "Space"
+key_clear = "Clear"
+key_home = "Home"
+key_end = "End"
+key_page_up = "Page Up"
+key_page_down = "Page Down"
 
 [settings]
 window_title = "Settings"
@@ -75,6 +85,17 @@ header_windows = "App Switcher Overlay"
 header_window_options = "Window Options"
 row_windows_enabled = "Enable app switcher"
 desc_windows_enabled = "Use the configured shortcut to open the app switcher."
+header_keystroke_display = "Keystroke Display"
+row_keystroke_display_enabled = "Show pressed keys"
+desc_keystroke_display_enabled = "Display recent key presses in a small floating panel. Secure input is hidden."
+row_keystroke_display_mode = "Display scope"
+keystroke_display_mode_all = "All keys"
+keystroke_display_mode_shortcuts = "Shortcuts"
+keystroke_display_mode_commands = "Command shortcuts"
+row_keystroke_display_tap_level = "Input source"
+keystroke_display_tap_session = "Session (includes remapped keys)"
+keystroke_display_tap_hid = "Hardware (physical keys)"
+row_keystroke_display_follow_screen = "Follow the frontmost window's screen"
 tooltip_windows_disabled = "Enable the app switcher first."
 header_logging = "Logging"
 row_theme = "Theme"
@@ -210,6 +231,7 @@ btn_cancel = "Cancel"
 btn_confirm = "Confirm"
 btn_restore_defaults = "Restore Defaults"
 sidebar_quick_actions = "Quick Actions"
+sidebar_keystroke_display = "Keystroke Display"
 header_quick_actions = "Quick Actions"
 header_quick_actions_shortcuts = "Shortcuts"
 row_quick_actions_enabled = "Enable quick actions"
@@ -349,6 +371,8 @@ mouse_pointer_acceleration_invalid = "pointer.acceleration: {value} must be 0..=
 windows_overlay_position_invalid = 'windows.overlay_position: "{value}" is not one of active_window, main'
 windows_activation_mode_invalid = 'windows.activation_mode: "{value}" is not one of hover, click'
 clipboard_picker_position_invalid = 'clipboard.picker_position: "{value}" is not one of mouse, main'
+keystroke_display_mode_invalid = 'keystroke_display.mode: "{value}" is not one of all, shortcuts, commands'
+keystroke_display_tap_level_invalid = 'keystroke_display.tap_level: "{value}" is not one of session, hid'
 
 [onboarding]
 window_title = "Welcome"

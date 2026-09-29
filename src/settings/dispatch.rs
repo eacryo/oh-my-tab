@@ -28,6 +28,10 @@ pub(super) enum ControlField {
     ActivationMode,
     CornerRadius,
     Modifier,
+    KeystrokeDisplayEnabled,
+    KeystrokeDisplayMode,
+    KeystrokeDisplayTapLevel,
+    KeystrokeDisplayFollowScreen,
     MouseEnabled,
     ReverseScroll,
     ScrollMode,
@@ -97,6 +101,25 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             .or_else(|| m(u.activation_mode, ControlField::ActivationMode))
             .or_else(|| m(u.corner_radius, ControlField::CornerRadius))
             .or_else(|| m(u.modifier, ControlField::Modifier))
+            .or_else(|| {
+                m(
+                    u.keystroke_display_enabled,
+                    ControlField::KeystrokeDisplayEnabled,
+                )
+            })
+            .or_else(|| m(u.keystroke_display_mode, ControlField::KeystrokeDisplayMode))
+            .or_else(|| {
+                m(
+                    u.keystroke_display_tap_level,
+                    ControlField::KeystrokeDisplayTapLevel,
+                )
+            })
+            .or_else(|| {
+                m(
+                    u.keystroke_display_follow_screen,
+                    ControlField::KeystrokeDisplayFollowScreen,
+                )
+            })
             .or_else(|| m(u.enable_mouse, ControlField::MouseEnabled))
             .or_else(|| m(u.reverse_scroll, ControlField::ReverseScroll))
             .or_else(|| m(u.scroll_mode, ControlField::ScrollMode))
@@ -412,6 +435,28 @@ fn apply_control_field(field: ControlField) {
                 ControlField::Modifier => {
                     let idx: isize = msg_send![u.modifier, indexOfSelectedItem];
                     cfg.keyboard.modifier = if idx == 1 { "command" } else { "option" }.into();
+                }
+                ControlField::KeystrokeDisplayEnabled => {
+                    let state: isize = msg_send![u.keystroke_display_enabled, state];
+                    cfg.keystroke_display.enabled = state == 1;
+                }
+                ControlField::KeystrokeDisplayMode => {
+                    let idx: isize = msg_send![u.keystroke_display_mode, indexOfSelectedItem];
+                    cfg.keystroke_display.mode = match idx {
+                        1 => "shortcuts",
+                        2 => "commands",
+                        _ => "all",
+                    }
+                    .into();
+                }
+                ControlField::KeystrokeDisplayTapLevel => {
+                    let idx: isize = msg_send![u.keystroke_display_tap_level, indexOfSelectedItem];
+                    cfg.keystroke_display.tap_level =
+                        if idx == 1 { "hid" } else { "session" }.into();
+                }
+                ControlField::KeystrokeDisplayFollowScreen => {
+                    let state: isize = msg_send![u.keystroke_display_follow_screen, state];
+                    cfg.keystroke_display.follow_frontmost_screen = state == 1;
                 }
                 ControlField::MouseEnabled => {
                     let state: isize = msg_send![u.enable_mouse, state];
@@ -1100,6 +1145,7 @@ pub(crate) fn refresh_service_controls_from_config() {
                 (u.clipboard_enabled, cfg.clipboard.enabled),
                 (u.window_control_enabled, cfg.window_control.enabled),
                 (u.quick_actions_enabled, cfg.quick_actions.enabled),
+                (u.keystroke_display_enabled, cfg.keystroke_display.enabled),
             ] {
                 let _: () = msg_send![ctrl, setState: if value { 1isize } else { 0isize }];
             }
@@ -1112,12 +1158,12 @@ pub(crate) fn refresh_service_controls_from_config() {
     }
 }
 
-/// Refresh the switcher controls when an external surface changes them.
+/// Refresh switcher and Keystroke Display controls after an external config change.
 ///
 /// This intentionally updates the existing controls in place instead of rebuilding the settings
 /// window. That preserves unsaved text edits and, like the appearance refresh path, never brings
 /// a hidden settings window to the foreground.
-pub(crate) fn refresh_switcher_controls_from_config() {
+pub(crate) fn refresh_switcher_and_keystroke_display_controls_from_config() {
     let cfg = CONFIG.read().unwrap().clone();
     unsafe {
         with_settings_ui(|ui| {
@@ -1135,6 +1181,31 @@ pub(crate) fn refresh_switcher_controls_from_config() {
                 0
             };
             let _: () = msg_send![u.modifier, selectItemAtIndex: modifier_idx];
+
+            let _: () = msg_send![
+                u.keystroke_display_enabled,
+                setState: if cfg.keystroke_display.enabled { 1isize } else { 0isize }
+            ];
+            let mode_idx: isize = match cfg.keystroke_display.mode.as_str() {
+                "shortcuts" => 1,
+                "commands" => 2,
+                _ => 0,
+            };
+            let _: () = msg_send![u.keystroke_display_mode, selectItemAtIndex: mode_idx];
+            let tap_idx: isize = if cfg.keystroke_display.tap_level == "hid" {
+                1
+            } else {
+                0
+            };
+            let _: () = msg_send![u.keystroke_display_tap_level, selectItemAtIndex: tap_idx];
+            let _: () = msg_send![
+                u.keystroke_display_follow_screen,
+                setState: if cfg.keystroke_display.follow_frontmost_screen {
+                    1isize
+                } else {
+                    0isize
+                }
+            ];
 
             let thumbnail_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };
             let _: () = msg_send![u.thumbnails_enabled, selectItemAtIndex: thumbnail_idx];

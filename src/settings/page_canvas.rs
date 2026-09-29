@@ -352,7 +352,8 @@ impl PageCanvas {
         clip_height: f64,
     ) -> Self {
         let mark = subview_count(document);
-        let cursor = SettingsPageHeader::attach(document, title, 6.0, doc_h, content_w);
+        let (actual_doc_top, cursor) =
+            SettingsPageHeader::attach(document, title, 6.0, doc_h, content_w);
         let title_view = views_added_since(document, mark)
             .first()
             .copied()
@@ -365,7 +366,10 @@ impl PageCanvas {
         };
         // `SettingsPageHeader::attach` consumes the top padding, the measured title height, the
         // gap to the first section and the section heading box: that is the whole offset.
-        let header_offset = doc_h - cursor;
+        // `attach` positions the title and cursor from the document's actual height. When the
+        // viewport is taller than the provisional page height, using `doc_h` here shifts the
+        // reflowed rows upward into the pinned title.
+        let header_offset = actual_doc_top - cursor;
         Self {
             document,
             content_w,

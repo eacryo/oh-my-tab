@@ -194,7 +194,7 @@ pub(super) unsafe fn build_settings_sidebar(
     release_obj(highlight);
     ui.sidebar_highlight = highlight;
 
-    // Seven sidebar buttons (borderless, tags 0..6; click triggers handleSettingsSidebar:).
+    // Sidebar buttons are created in page-index order; each tag selects the matching content view.
     let sidebar_buttons =
         SettingsSidebar::build(sidebar_content, target, 14.0, btn_y0, btn_w, btn_h);
     [
@@ -204,6 +204,7 @@ pub(super) unsafe fn build_settings_sidebar(
         &mut ui.sidebar_clipboard,
         &mut ui.sidebar_window_control,
         &mut ui.sidebar_quick_actions,
+        &mut ui.sidebar_keystroke_display,
         &mut ui.sidebar_about,
     ]
     .iter_mut()

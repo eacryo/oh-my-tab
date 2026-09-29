@@ -113,6 +113,7 @@ fn supervise() {
 fn stop_services() {
     // Store the global gate before this function is called, so callbacks already in flight
     // immediately become pass-through while each module disables its Mach port.
+    crate::keystroke_display::stop();
     crate::event_monitor::stop();
     crate::mouse::stop();
     crate::window_management::stop();
@@ -122,6 +123,7 @@ fn stop_services() {
 
 fn start_configured_services() {
     crate::event_monitor::start();
+    crate::keystroke_display::start();
     let config = match crate::config::CONFIG.read() {
         Ok(config) => config.clone(),
         Err(_) => return,

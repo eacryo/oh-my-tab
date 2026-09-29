@@ -12,7 +12,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::ffi::release_obj;
 use crate::i18n::t;
 
-use super::{tooltip::SettingsTooltip, widgets};
+use super::{tooltip::SettingsTooltip, widgets, SETTINGS_PAGE_COUNT};
 
 /// Shared dimensions for in-row action buttons.
 pub(crate) const ROW_ACTION_BTN_W: f64 = 110.0;
@@ -166,7 +166,7 @@ impl SettingsPageHeader {
     /// ink, so this value is really "what is left of the title-to-card rhythm after the frame".
     const FIRST_SECTION_GAP: f64 = 8.0;
 
-    /// Build the page title and return the cursor for the first section heading below it.
+    /// Build the page title and return its document top plus the first section cursor below it.
     ///
     /// The cursor is that heading's frame BOTTOM: `widgets::add_header` grows its label upwards
     /// from there, and `SettingsSection::attach` puts the card top `SETTINGS_SECTION_CARD_GAP`
@@ -179,7 +179,7 @@ impl SettingsPageHeader {
         x: f64,
         doc_top: f64,
         w: f64,
-    ) -> f64 {
+    ) -> (f64, f64) {
         // make_settings_page may grow the document to the viewport height, so the caller's
         // provisional height is no longer the document's top edge. Anchor the title to the
         // actual frame height and fold the delta into the returned consumption so following
@@ -200,11 +200,14 @@ impl SettingsPageHeader {
         );
         // Title frame bottom, one FIRST_SECTION_GAP further down, then the heading label's own
         // height up to its bottom edge -- the cursor callers lay the page out from.
-        actual_doc_top
-            - Self::TOP_PADDING
-            - title_h
-            - Self::FIRST_SECTION_GAP
-            - widgets::SECTION_HEADER_H
+        (
+            actual_doc_top,
+            actual_doc_top
+                - Self::TOP_PADDING
+                - title_h
+                - Self::FIRST_SECTION_GAP
+                - widgets::SECTION_HEADER_H,
+        )
     }
 }
 
@@ -1791,6 +1794,7 @@ pub(super) enum SettingsSidebarIcon {
     Clipboard,
     WindowControl,
     QuickActions,
+    KeystrokeDisplay,
     About,
 }
 
@@ -1808,6 +1812,7 @@ impl SettingsSidebarIcon {
             Self::WindowControl => "rectangle.split.2x2",
             // A bolt mirrors the quick-actions "jump straight there" semantics.
             Self::QuickActions => "bolt.circle",
+            Self::KeystrokeDisplay => "keyboard",
             Self::About => "info.circle",
         }
     }
@@ -1853,6 +1858,7 @@ impl SettingsSidebar {
             t("settings.sidebar_clipboard"),
             t("settings.sidebar_window_control"),
             t("settings.sidebar_quick_actions"),
+            t("settings.sidebar_keystroke_display"),
             t("settings.sidebar_about"),
         ];
         widgets::settings_sidebar_required_row_height(w, &titles)
@@ -2094,9 +2100,9 @@ impl SettingsSidebar {
         y0: f64,
         w: f64,
         row_h: f64,
-    ) -> [*mut AnyObject; 7] {
+    ) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
         // Add new sidebar entries here: the component owns title keys, icons, tags, and spacing.
-        // Quick actions sits between Window control and About.
+        // Keystroke Display follows Quick Actions; About remains last.
         let entries = [
             ("settings.sidebar_general", SettingsSidebarIcon::General),
             ("settings.sidebar_switcher", SettingsSidebarIcon::Switcher),
@@ -2109,6 +2115,10 @@ impl SettingsSidebar {
             (
                 "settings.sidebar_quick_actions",
                 SettingsSidebarIcon::QuickActions,
+            ),
+            (
+                "settings.sidebar_keystroke_display",
+                SettingsSidebarIcon::KeystrokeDisplay,
             ),
             ("settings.sidebar_about", SettingsSidebarIcon::About),
         ];
@@ -2173,7 +2183,8 @@ impl SettingsSidebarTab {
 #[cfg(test)]
 mod tests {
     use super::{
-        sidebar_item_frames, sidebar_tracking_rect, SettingsButtonRole, SettingsLayout, SettingsRow,
+        sidebar_item_frames, sidebar_tracking_rect, SettingsButtonRole, SettingsLayout,
+        SettingsRow, SETTINGS_PAGE_COUNT,
     };
     use crate::settings::SETTINGS_CONTROL_TRAILING_INSET;
 
@@ -2182,10 +2193,13 @@ mod tests {
         let row_h = 38.0;
         let row_step = row_h + 4.0;
         let y0 = 300.0;
-        let rect = sidebar_tracking_rect(0.0, y0, 240.0, row_h, 7);
-        // Top edge = row 0's top; bottom edge = row 6's bottom -- the last row is covered.
+        let rect = sidebar_tracking_rect(0.0, y0, 240.0, row_h, SETTINGS_PAGE_COUNT);
+        // Top edge = row 0's top; bottom edge = the last row's bottom.
         assert_eq!(rect.origin.y + rect.size.height, y0 + row_h);
-        assert_eq!(rect.origin.y, y0 - 6.0 * row_step);
+        assert_eq!(
+            rect.origin.y,
+            y0 - (SETTINGS_PAGE_COUNT - 1) as f64 * row_step
+        );
         assert_eq!(rect.size.width, 240.0);
         // A one-row sidebar covers exactly that row.
         let single = sidebar_tracking_rect(0.0, y0, 240.0, row_h, 1);
