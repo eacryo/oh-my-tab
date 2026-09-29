@@ -6,14 +6,15 @@
 
 `scripts/release.sh` 是正式版发布流水线。不带动作参数时，它会在本地构建产物并生成 `dist/oh-my-tab.rb`。这份 Homebrew cask 包含 DMG 的 `sha256`、`Cargo.toml` 中的版本号，以及卸载时清理图标缓存、日志和应用数据的 `zap trash:` 配置。
 
-正式发布需要另外完成公证流程。Apple 接受公证提交后，再通过 `--push` 发布到 R2。
+正式发布需要另外完成公证流程。Apple 接受公证提交后，再通过 `--push` 发布到 R2；如果希望在发布前先确认票据已贴上，可单独运行 `--staple`。
 
 ```sh
 sh scripts/release.sh                    # 本地构建产物和 Homebrew cask
 sh scripts/release.sh --notarize         # 构建、签名并提交 Apple 公证
 sh scripts/release.sh --check            # 查询待处理的公证状态
+sh scripts/release.sh --staple           # 将已通过的票据贴入暂存的 .app
 sh scripts/release.sh --archive          # 归档已通过或失败的提交，以便开始另一轮公证
-sh scripts/release.sh --push             # 对公证通过的应用贴票并上传产物
+sh scripts/release.sh --push             # 需要时先贴票，再打包并上传产物
 sh scripts/release.sh --push --dry-run   # 准备产物并打印上传计划
 ```
 
@@ -30,7 +31,7 @@ sh scripts/release-dev.sh --push --dry-run
 正式 `release.sh` 以及直接调用 `bundle.sh` 的生产路径不启用该 feature，生产包不会包含这个
 测试选项。
 
-正式发布时，`--notarize` 会构建并暂存签名后的 `.app`，`--check` 用于查询 Apple 公证状态。状态变为 `Accepted` 后，`--push` 会给应用贴上公证票据并生成最终 ZIP 和 DMG，然后调用仓库内固定版本的 `vendor/Sparkle/bin/generate_appcast` 和 R2 发布工具。
+正式发布时，`--notarize` 会构建并暂存签名后的 `.app`，`--check` 用于查询 Apple 公证状态。状态变为 `Accepted` 后，`--staple` 会把票据写入暂存的 `.app`（幂等；已贴票时为无操作），`--push` 则在需要时先贴票，再生成最终 ZIP 和 DMG，然后调用仓库内固定版本的 `vendor/Sparkle/bin/generate_appcast` 和 R2 发布工具。
 
 如果公证已通过但暂时不打算发布，或准备修改代码后重新构建，运行 `--archive` 会将已结束的 `Accepted` 或 `Invalid` 提交从 `dist/.notarization/pending` 移到 `dist/.notarization/archived/` 或 `dist/.notarization/failed/`，保留记录并释放待处理位置。公证仍在进行时不能归档；请等 `--check` 显示最终状态后再操作。归档后即可为修改后的版本运行 `--notarize`。原有的 `--archive-failed` 仍可单独归档 `Invalid` 提交。
 

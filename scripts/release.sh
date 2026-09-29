@@ -5,18 +5,20 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/release.sh [--notarize | --check [submission-id] | --archive | --archive-failed | --push [--dry-run]]
+Usage: scripts/release.sh [--notarize | --check [submission-id] | --staple | --archive | --archive-failed | --push [--dry-run]]
 
   (no flag)       Build local artifacts and generate the Homebrew cask; never upload to R2.
   --notarize      Build with Developer ID signing and submit to Apple without waiting.
   --check [id]    Query the saved notarization submission (or recover with its submission ID).
+  --staple        Require Accepted status and staple the ticket into the staged app (no upload).
   --archive       Archive a completed Accepted or Invalid submission so another can be started.
   --archive-failed Archive an Invalid submission under dist/.notarization/failed/.
-  --push          Require Accepted status, staple the app, package it, and publish to R2.
+  --push          Require Accepted status, staple if needed, package it, and publish to R2.
   --dry-run       With --push, prepare the release and print the R2 upload plan without uploading.
 
 Set CODESIGN_IDENTITY to a Developer ID Application identity for --notarize.
 Set NOTARY_PROFILE to the notarytool Keychain profile (default: oh-my-tab-notary).
+A submission that fails on the network keeps its staged archive; re-running --notarize retries it.
 EOF
 }
 
@@ -53,6 +55,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --archive)
       select_mode archive
+      ;;
+    --staple)
+      select_mode staple
       ;;
     --push)
       select_mode push
@@ -153,6 +158,37 @@ load_submission_id() {
   printf '%s\n' "$saved_id"
 }
 
+# Submit the staged archive, retrying the transient network failures Apple's notary service returns
+# (HTTPClientError.connectTimeout and friends). Writes notarytool's plist to $PENDING_DIR/submission.plist
+# and clears it between attempts so a stale id can never be read. Returns non-zero after the last
+# attempt, printing the real error.
+submit_notarization_zip() {
+  local attempt=0
+  local max_attempts=3
+  local delay=5
+  local error_file=""
+  error_file="$(mktemp)"
+  while :; do
+    attempt=$((attempt + 1))
+    if xcrun notarytool submit "$NOTARY_ZIP" \
+      --keychain-profile "$NOTARY_PROFILE" \
+      --output-format plist > "$PENDING_DIR/submission.plist" 2> "$error_file"; then
+      rm -f "$error_file"
+      return 0
+    fi
+    rm -f "$PENDING_DIR/submission.plist"
+    echo "warning: notarization submission attempt $attempt failed:" >&2
+    sed 's/^/         /' "$error_file" >&2
+    if [ "$attempt" -ge "$max_attempts" ]; then
+      rm -f "$error_file"
+      return 1
+    fi
+    echo "         retrying in ${delay}s..." >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+}
+
 query_notary_status() {
   local submission_id="$1"
   local status_file="$PENDING_DIR/status.plist"
@@ -191,6 +227,22 @@ require_accepted_submission() {
       exit 1
       ;;
   esac
+}
+
+# Staple the accepted ticket into the staged app. Idempotent: a ticket already stapled by an
+# earlier --staple (or --push) is left alone. --staple and --push share this so they cannot
+# disagree about what "stapled" means.
+staple_staged_app() {
+  if ! codesign --verify --deep --strict "$STAGED_APP"; then
+    echo "error: staged app signature verification failed" >&2
+    exit 1
+  fi
+  if xcrun stapler validate "$STAGED_APP" >/dev/null 2>&1; then
+    echo "The notarization ticket is already stapled."
+    return
+  fi
+  xcrun stapler staple "$STAGED_APP"
+  xcrun stapler validate "$STAGED_APP"
 }
 
 archive_invalid_submission() {
@@ -307,28 +359,39 @@ case "$MODE" in
       echo "error: set CODESIGN_IDENTITY to a Developer ID Application identity" >&2
       exit 1
     fi
-    if [ -e "$PENDING_DIR" ]; then
+    if [ -s "$SUBMISSION_FILE" ]; then
       echo "error: a notarization is already pending at $PENDING_DIR" >&2
       echo "       Check it with scripts/release.sh --check before starting another release." >&2
       exit 1
     fi
+    if [ -e "$PENDING_DIR" ]; then
+      # A previous submit timed out before Apple returned an id, leaving the staged app behind with
+      # no submission record. Re-submit that same archive instead of rebuilding, so a transient
+      # network failure cannot brick the pipeline. Delete $PENDING_DIR to force a fresh build.
+      if [ ! -f "$NOTARY_ZIP" ]; then
+        echo "error: $PENDING_DIR is incomplete (no submission id and no staged archive)" >&2
+        echo "       Remove it and start over: rm -rf $PENDING_DIR && scripts/release.sh --notarize" >&2
+        exit 1
+      fi
+      echo "A previous submission did not return an id; re-submitting the staged archive."
+      echo "Delete $PENDING_DIR before re-running if the code changed since then."
+    else
+      RELEASE_SIGNING=1 RELEASE_DOC_DIR="release_doc" bash scripts/bundle.sh
+      if [ ! -d "$APP" ]; then
+        echo "error: build did not produce $APP" >&2
+        exit 1
+      fi
 
-    RELEASE_SIGNING=1 RELEASE_DOC_DIR="release_doc" bash scripts/bundle.sh
-    if [ ! -d "$APP" ]; then
-      echo "error: build did not produce $APP" >&2
-      exit 1
+      mkdir -p "$NOTARY_ROOT"
+      mkdir "$PENDING_DIR"
+      ditto "$APP" "$STAGED_APP"
+      ditto -c -k --keepParent "$STAGED_APP" "$NOTARY_ZIP"
     fi
 
-    mkdir -p "$NOTARY_ROOT"
-    mkdir "$PENDING_DIR"
-    ditto "$APP" "$STAGED_APP"
-    ditto -c -k --keepParent "$STAGED_APP" "$NOTARY_ZIP"
-
     echo "Submitting $NOTARY_ZIP for notarization (this command does not wait for Apple)."
-    if ! xcrun notarytool submit "$NOTARY_ZIP" \
-      --keychain-profile "$NOTARY_PROFILE" \
-      --output-format plist > "$PENDING_DIR/submission.plist"; then
+    if ! submit_notarization_zip; then
       echo "error: notarization submission failed; staged files were kept in $PENDING_DIR" >&2
+      echo "       Transient timeouts are common; re-run scripts/release.sh --notarize to retry." >&2
       exit 1
     fi
     SUBMISSION_ID="$(/usr/libexec/PlistBuddy -c 'Print :id' "$PENDING_DIR/submission.plist")"
@@ -349,7 +412,7 @@ case "$MODE" in
     echo "Notarization status: $STATUS (submission $SUBMISSION_ID)"
     case "$STATUS" in
       Accepted)
-        echo "✅ Apple accepted the app. Nothing was pushed. You can now run: scripts/release.sh --push"
+        echo "✅ Apple accepted the app. Nothing was pushed. You can now run: scripts/release.sh --staple (or --push)"
         ;;
       "In Progress"|Submitted|"Waiting for Export Compliance")
         echo "Not finished yet; check again later with: scripts/release.sh --check"
@@ -370,6 +433,18 @@ case "$MODE" in
     archive_submission
     ;;
 
+  staple)
+    if [ ! -d "$PENDING_DIR" ] || [ ! -d "$STAGED_APP" ]; then
+      echo "error: no staged notarized release found at $PENDING_DIR" >&2
+      echo "       Start and submit one with scripts/release.sh --notarize." >&2
+      exit 1
+    fi
+    SUBMISSION_ID="$(load_submission_id)"
+    require_accepted_submission "$SUBMISSION_ID"
+    staple_staged_app
+    echo "✅ Ticket stapled into $STAGED_APP. Run scripts/release.sh --push to package and publish."
+    ;;
+
   push)
     if [ ! -d "$PENDING_DIR" ] || [ ! -d "$STAGED_APP" ]; then
       echo "error: no staged notarized release found at $PENDING_DIR" >&2
@@ -380,18 +455,9 @@ case "$MODE" in
     SUBMISSION_ID="$(load_submission_id)"
     require_accepted_submission "$SUBMISSION_ID"
 
-    # Staple the accepted ticket before creating the ZIP and DMG that will be published.
-    if codesign --verify --deep --strict "$STAGED_APP"; then
-      if xcrun stapler validate "$STAGED_APP" >/dev/null 2>&1; then
-        echo "The notarization ticket is already stapled."
-      else
-        xcrun stapler staple "$STAGED_APP"
-        xcrun stapler validate "$STAGED_APP"
-      fi
-    else
-      echo "error: staged app signature verification failed" >&2
-      exit 1
-    fi
+    # Staple the accepted ticket before creating the ZIP and DMG that will be published. This is the
+    # same function the standalone --staple stage runs, so a push after --staple is a no-op here.
+    staple_staged_app
 
     VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$STAGED_APP/Contents/Info.plist")"
     BUILD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$STAGED_APP/Contents/Info.plist")"

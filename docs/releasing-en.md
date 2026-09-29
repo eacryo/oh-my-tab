@@ -6,14 +6,15 @@ This document covers maintainer-only release and packaging details: the Homebrew
 
 `scripts/release.sh` is the production release pipeline. Without an action flag, it builds local artifacts and generates `dist/oh-my-tab.rb`. The cask contains the DMG `sha256`, the version from `Cargo.toml`, and a `zap trash:` block for removing the icon cache, logs, and application data on uninstall.
 
-Production publishing uses a separate notarization flow. R2 publishing starts after Apple accepts the notarization submission and `--push` is supplied.
+Production publishing uses a separate notarization flow. R2 publishing starts after Apple accepts the notarization submission and `--push` is supplied; `--staple` attaches the accepted ticket to the staged app as its own step when you want to verify it before publishing.
 
 ```sh
 sh scripts/release.sh                    # build local artifacts and the Homebrew cask
 sh scripts/release.sh --notarize         # build, sign, and submit to Apple
 sh scripts/release.sh --check            # check the pending notarization status
+sh scripts/release.sh --staple           # staple the accepted ticket into the staged app
 sh scripts/release.sh --archive          # archive a completed submission before starting another
-sh scripts/release.sh --push             # staple the accepted app, then upload artifacts
+sh scripts/release.sh --push             # staple if needed, then package and upload artifacts
 sh scripts/release.sh --push --dry-run   # prepare artifacts and print the upload plan
 ```
 
@@ -27,7 +28,7 @@ sh scripts/release-dev.sh --push --dry-run
 
 `release-dev.sh` still uses an optimized Release build, but enables the `dev-long-text` Cargo feature. The development package therefore includes a `[TEST] English x3` language option for checking long dropdown values, settings rows, and card layouts. The production `release.sh` and direct `bundle.sh` paths do not enable this feature.
 
-For production, `--notarize` builds and stages the signed `.app`, while `--check` queries Apple's notarization service. After the status becomes `Accepted`, `--push` staples the ticket and creates the final ZIP and DMG. It then generates an appcast with the pinned `vendor/Sparkle/bin/generate_appcast` tool and invokes the R2 publisher.
+For production, `--notarize` builds and stages the signed `.app`, while `--check` queries Apple's notarization service. After the status becomes `Accepted`, `--staple` writes the ticket into the staged app (idempotent; a no-op if it is already stapled), and `--push` staples if needed, then creates the final ZIP and DMG. It then generates an appcast with the pinned `vendor/Sparkle/bin/generate_appcast` tool and invokes the R2 publisher.
 
 If an accepted release should be held back, or the code will be changed before another notarization, run `--archive`. It moves a completed `Accepted` or `Invalid` submission out of `dist/.notarization/pending` into `dist/.notarization/archived/` or `dist/.notarization/failed/`, preserving its record and freeing the pending slot. Submissions still in progress cannot be archived; wait until `--check` reports a final status. You can then run `--notarize` for the updated build. The existing `--archive-failed` command remains available for archiving an `Invalid` submission.
 
