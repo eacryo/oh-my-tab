@@ -59,6 +59,7 @@ const ACTION_OPEN_SETTINGS: isize = 16;
 const ACTION_BACK: isize = 17;
 const ACTION_TOGGLE_CLIPBOARD_DRAFT: isize = 18;
 const ACTION_DISPLAY_MODE: isize = 19;
+const ACTION_TOGGLE_CLIPBOARD_PERSIST: isize = 20;
 
 /// DISPLAY-only permission override. It affects the guide's decisions and copy and never reaches
 /// the event tap or the permission supervisor.
@@ -283,6 +284,7 @@ struct UiState {
     launch_at_login: bool,
     thumbnails_enabled: bool,
     clipboard_enabled: bool,
+    clipboard_persist: bool,
 }
 
 static WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -406,6 +408,7 @@ fn show_internal_at(overrides: PermissionOverride, start_index: usize) {
         launch_at_login: config.startup.launch_at_login,
         thumbnails_enabled: config.layout.thumbnails_enabled,
         clipboard_enabled: config.clipboard.enabled,
+        clipboard_persist: config.clipboard.persist,
     };
     let (step_number, step_count) = (state.index + 1, state.steps.len());
     *STATE.lock().unwrap() = Some(state);
@@ -720,7 +723,9 @@ fn render_current_step() {
             Step::DisplayMode => {
                 render_display_mode(content, state.thumbnails_enabled, screen_granted)
             }
-            Step::ClipboardHistory => render_clipboard_history(content, state.clipboard_enabled),
+            Step::ClipboardHistory => {
+                render_clipboard_history(content, state.clipboard_enabled, state.clipboard_persist)
+            }
             Step::MoreFeatures => render_more_features(content),
         }
         render_footer(content, state.index);
@@ -826,6 +831,7 @@ unsafe fn render_permissions_and_startup(
         59.0,
         launch_at_login,
         ACTION_TOGGLE_LAUNCH_DRAFT,
+        "onboarding.launch_label",
     );
 }
 
@@ -876,12 +882,43 @@ unsafe fn render_display_mode(
     }
 }
 
-unsafe fn render_clipboard_history(content: *mut AnyObject, enabled: bool) {
+/// Clipboard-history step geometry (bottom-up, like the window's non-flipped content view). The
+/// persist row and its hint keep this place whether or not history is enabled, so toggling the
+/// master switch never moves the rows above it; they are only added to the view tree while history
+/// is on.
+struct ClipboardStepLayout {
+    title_y: f64,
+    body_y: f64,
+    body_h: f64,
+    enabled_row_y: f64,
+    persist_row_y: f64,
+    persist_hint_y: f64,
+    persist_hint_h: f64,
+}
+
+const CLIPBOARD_STEP: ClipboardStepLayout = ClipboardStepLayout {
+    // The title keeps the same y as the other steps so moving between steps does not shift it.
+    title_y: 194.0,
+    body_y: 150.0,
+    // 40pt holds the two wrapped lines of the longest body copy (en/zh); 48 used to leave a gap
+    // above the now-taller switch stack.
+    body_h: 40.0,
+    enabled_row_y: 116.0,
+    persist_row_y: 78.0,
+    persist_hint_y: 56.0,
+    persist_hint_h: 16.0,
+};
+
+/// Switch-row label height, and the width the label leaves for the switch on the trailing edge.
+const SWITCH_ROW_LABEL_H: f64 = 28.0;
+const SWITCH_ROW_LABEL_TRAILING: f64 = 58.0;
+
+unsafe fn render_clipboard_history(content: *mut AnyObject, enabled: bool, persist: bool) {
     add_label(
         content,
         &t("onboarding.clipboard_title"),
         PAD,
-        194.0,
+        CLIPBOARD_STEP.title_y,
         WINDOW_W - PAD * 2.0,
         TITLE_H,
         TITLE_STYLE,
@@ -894,27 +931,38 @@ unsafe fn render_clipboard_history(content: *mut AnyObject, enabled: bool) {
             "onboarding.clipboard_body"
         }),
         PAD,
-        144.0,
+        CLIPBOARD_STEP.body_y,
         WINDOW_W - PAD * 2.0,
-        48.0,
+        CLIPBOARD_STEP.body_h,
         BODY_STYLE,
     );
-    add_label(
+    add_switch_row(
         content,
-        &t("onboarding.clipboard_label"),
-        PAD,
-        91.0,
-        WINDOW_W - PAD * 2.0 - 58.0,
-        28.0,
-        TITLE_STYLE,
-    );
-    add_switch(
-        content,
-        WINDOW_W - PAD,
-        88.0,
+        CLIPBOARD_STEP.enabled_row_y,
         enabled,
         ACTION_TOGGLE_CLIPBOARD_DRAFT,
+        "onboarding.clipboard_label",
     );
+    // The persist options exist only while history is on. The draft keeps its value while the row
+    // is hidden, so turning history back on restores the previous choice instead of resetting it.
+    if enabled {
+        add_switch_row(
+            content,
+            CLIPBOARD_STEP.persist_row_y,
+            persist,
+            ACTION_TOGGLE_CLIPBOARD_PERSIST,
+            "onboarding.clipboard_persist_label",
+        );
+        add_label(
+            content,
+            &t("onboarding.clipboard_persist_body"),
+            PAD,
+            CLIPBOARD_STEP.persist_hint_y,
+            WINDOW_W - PAD * 2.0,
+            CLIPBOARD_STEP.persist_hint_h,
+            HINT_STYLE,
+        );
+    }
 }
 
 unsafe fn render_more_features(content: *mut AnyObject) {
@@ -985,6 +1033,7 @@ unsafe fn add_switch(
     y: f64,
     checked: bool,
     action_tag: isize,
+    label_key: &str,
 ) {
     let switch = crate::settings::components::onboarding_switch(right_x, y, BUTTON_H, checked);
     if switch.is_null() {
@@ -1000,15 +1049,39 @@ unsafe fn add_switch(
         .lock()
         .unwrap()
         .push((switch as usize, action_tag));
-    let accessibility_label = make_nsstring(&t(if action_tag == ACTION_TOGGLE_LAUNCH_DRAFT {
-        "onboarding.launch_label"
-    } else {
-        "onboarding.clipboard_label"
-    }));
+    let accessibility_label = make_nsstring(&t(label_key));
     let _: () = msg_send![switch, setAccessibilityLabel: accessibility_label];
     release_obj(accessibility_label);
     let _: () = msg_send![content, addSubview: switch];
     release_obj(switch);
+}
+
+/// One switch row: the label on the leading edge and the switch on the trailing edge, both placed
+/// from the row's bottom edge so the caller positions rows on one shared grid.
+unsafe fn add_switch_row(
+    content: *mut AnyObject,
+    row_y: f64,
+    checked: bool,
+    action_tag: isize,
+    label_key: &str,
+) {
+    add_label(
+        content,
+        &t(label_key),
+        PAD,
+        row_y + (BUTTON_H - SWITCH_ROW_LABEL_H) / 2.0,
+        WINDOW_W - PAD * 2.0 - SWITCH_ROW_LABEL_TRAILING,
+        SWITCH_ROW_LABEL_H,
+        TITLE_STYLE,
+    );
+    add_switch(
+        content,
+        WINDOW_W - PAD,
+        row_y,
+        checked,
+        action_tag,
+        label_key,
+    );
 }
 
 unsafe fn render_footer(content: *mut AnyObject, index: usize) {
@@ -1183,8 +1256,13 @@ pub(crate) fn handle_action(tag: isize) {
             render_current_step();
         }
         ACTION_TOGGLE_CLIPBOARD_DRAFT => {
-            apply_choice_now(Step::ClipboardHistory, |state| {
+            apply_clipboard_choice(tag, |state| {
                 state.clipboard_enabled = !state.clipboard_enabled;
+            });
+        }
+        ACTION_TOGGLE_CLIPBOARD_PERSIST => {
+            apply_clipboard_choice(tag, |state| {
+                state.clipboard_persist = !state.clipboard_persist;
             });
         }
         ACTION_SELECT_ICONS | ACTION_SELECT_THUMBNAILS => {
@@ -1268,9 +1346,31 @@ fn request_screen_recording_from_guide() {
 
 /// Applies a guide choice immediately instead of waiting for Next: the switcher (display mode) and
 /// the Option+V hotkey (clipboard history) both read the live `CONFIG`, so a deferred draft would
-/// make the step's own instructions do nothing. The draft is updated first so the re-render keeps
-/// the selection; `commit_step_selection` no-ops when the value already matches.
+/// make the step's own instructions do nothing. The draft is updated first so a re-render keeps the
+/// selection; `commit_step_selection` no-ops when the value already matches.
 fn apply_choice_now(step: Step, update: impl FnOnce(&mut UiState)) {
+    update_draft_and_commit(step, update);
+    render_current_step();
+}
+
+/// Whether a clipboard-step choice changes the page's visible structure and therefore needs the
+/// page rebuilt. The master switch shows/hides the persist row; the persist switch only changes its
+/// own value, which `html_switch_mouse_down:` has already animated, so rebuilding would recreate
+/// every switch and replay the checked master switch's off-to-on spring (the reported twitch).
+fn clipboard_choice_rebuilds_page(action_tag: isize) -> bool {
+    !matches!(action_tag, ACTION_TOGGLE_CLIPBOARD_PERSIST)
+}
+
+/// Applies a clipboard-step choice, rebuilding the page only when the choice changes what is on it.
+fn apply_clipboard_choice(action_tag: isize, update: impl FnOnce(&mut UiState)) {
+    update_draft_and_commit(Step::ClipboardHistory, update);
+    if clipboard_choice_rebuilds_page(action_tag) {
+        render_current_step();
+    }
+}
+
+/// Updates the draft and commits it to the live config; callers decide whether the page is redrawn.
+fn update_draft_and_commit(step: Step, update: impl FnOnce(&mut UiState)) {
     {
         let mut slot = STATE.lock().unwrap();
         let Some(state) = slot.as_mut() else {
@@ -1279,7 +1379,6 @@ fn apply_choice_now(step: Step, update: impl FnOnce(&mut UiState)) {
         update(state);
     }
     commit_step_selection(step);
-    render_current_step();
 }
 
 fn commit_step_selection(step: Step) {
@@ -1298,7 +1397,10 @@ fn config_with_step_selection(old: &Config, state: &UiState, step: Step) -> Conf
     match step {
         Step::PermissionsAndStartup => new.startup.launch_at_login = state.launch_at_login,
         Step::DisplayMode => new.layout.thumbnails_enabled = state.thumbnails_enabled,
-        Step::ClipboardHistory => new.clipboard.enabled = state.clipboard_enabled,
+        Step::ClipboardHistory => {
+            new.clipboard.enabled = state.clipboard_enabled;
+            new.clipboard.persist = state.clipboard_persist;
+        }
         Step::MoreFeatures => {}
     }
     new
@@ -1369,10 +1471,10 @@ unsafe fn dispatch_display_mode_segment(segment: isize) -> bool {
 }
 
 /// GUI smoke runner (`--smoke-onboarding-live-apply`): show the guide, drive the real display-mode
-/// segment and clipboard switch, and require both choices to reach the live config without a Next
-/// click. Also asserts that the smoke run never asked for Screen Recording (a real run asks when
-/// thumbnails are picked). Runs as a subprocess on the real AppKit main thread (see the ignored
-/// test below).
+/// segment and the clipboard switches (master + persist), and require every choice to reach the
+/// live config without a Next click. Also asserts that the persist row only exists while history is
+/// on and that the smoke run never asked for Screen Recording (a real run asks when thumbnails are
+/// picked). Runs as a subprocess on the real AppKit main thread (see the ignored test below).
 pub(crate) fn live_apply_smoke_runner() -> bool {
     let before_thumbnails = CONFIG.read().unwrap().layout.thumbnails_enabled;
     show_internal(PermissionOverride::default());
@@ -1395,25 +1497,79 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
         .as_ref()
         .map(|state| state.thumbnails_enabled);
 
-    // Step 2 -> 3, then flip the clipboard switch (the draft is off by default on a fresh config).
+    // Step 2 -> 3. The persist row only exists while history is on, so bring the master switch to a
+    // known ON state first: the loaded config may start either way (the ignored test runs both), and
+    // a blind toggle from ON would turn it off and remove the very row this checks.
     advance();
     let before_clipboard = CONFIG.read().unwrap().clipboard.enabled;
-    let switch_dispatched = unsafe {
-        match dispatch_action_with_tag(ACTION_TOGGLE_CLIPBOARD_DRAFT) {
+    let master_switch_present =
+        unsafe { dispatch_action_with_tag(ACTION_TOGGLE_CLIPBOARD_DRAFT).is_some() };
+    let switch_dispatched = if before_clipboard {
+        // Already on: the switch rendered checked from the draft, so there is nothing to drive.
+        master_switch_present
+    } else {
+        unsafe {
+            match dispatch_action_with_tag(ACTION_TOGGLE_CLIPBOARD_DRAFT) {
+                Some(control) => {
+                    let _: () = msg_send![control, setState: 1isize];
+                    on_action(std::ptr::null_mut(), sel!(handleOnboardingAction:), control);
+                    true
+                }
+                None => false,
+            }
+        }
+    };
+    let master_on = CONFIG.read().unwrap().clipboard.enabled;
+    let clipboard_draft = STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|state| state.clipboard_enabled);
+    // With history on, the persist row exists: flipping it must reach the live config and the draft,
+    // and its accessibility label is the only per-row identity (all switches share one action), so
+    // it must be the persist label.
+    let before_persist = CONFIG.read().unwrap().clipboard.persist;
+    let mut persist_ax_ok = false;
+    let persist_dispatched = unsafe {
+        match dispatch_action_with_tag(ACTION_TOGGLE_CLIPBOARD_PERSIST) {
             Some(control) => {
-                let _: () = msg_send![control, setState: isize::from(!before_clipboard)];
+                let label: *mut AnyObject = msg_send![control, accessibilityLabel];
+                persist_ax_ok =
+                    crate::ffi::nsstring_to_rust(label) == t("onboarding.clipboard_persist_label");
+                let _: () = msg_send![control, setState: isize::from(!before_persist)];
                 on_action(std::ptr::null_mut(), sel!(handleOnboardingAction:), control);
                 true
             }
             None => false,
         }
     };
-    let clipboard_applied = CONFIG.read().unwrap().clipboard.enabled != before_clipboard;
-    let clipboard_draft = STATE
+    let persist_expected = !before_persist;
+    let persist_applied = CONFIG.read().unwrap().clipboard.persist == persist_expected;
+    let persist_draft = STATE
         .lock()
         .unwrap()
         .as_ref()
-        .map(|state| state.clipboard_enabled);
+        .map(|state| state.clipboard_persist);
+    // Turning history off must remove the persist row from the action map while the draft keeps the
+    // choice, so re-enabling restores it.
+    let disable_dispatched = unsafe {
+        match dispatch_action_with_tag(ACTION_TOGGLE_CLIPBOARD_DRAFT) {
+            Some(control) => {
+                let _: () = msg_send![control, setState: 0isize];
+                on_action(std::ptr::null_mut(), sel!(handleOnboardingAction:), control);
+                true
+            }
+            None => false,
+        }
+    };
+    let master_off = !CONFIG.read().unwrap().clipboard.enabled;
+    let persist_hidden_when_disabled =
+        unsafe { dispatch_action_with_tag(ACTION_TOGGLE_CLIPBOARD_PERSIST).is_none() };
+    let persist_draft_retained = STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|state| state.clipboard_persist);
     // Picking thumbnails asks the system for Screen Recording in a real run; a smoke run must not
     // have asked (see the `--smoke` guard in thumbnail::request_permission_once).
     let permission_untouched = !crate::thumbnail::permission_prompted();
@@ -1422,13 +1578,22 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
     // Finishing/skipping ends the flow: no pending resume may survive it.
     let resume_cleared = peeking_resume_step().is_none();
     log_info!(
-        "[smoke-onboarding-live-apply] segment_dispatched={} thumbnails_applied={} thumbnails_draft={:?} switch_dispatched={} clipboard_applied={} clipboard_draft={:?} permission_untouched={} resume_after_show={} resume_after_advance={} resume_cleared={} window={}",
+        "[smoke-onboarding-live-apply] segment_dispatched={} thumbnails_applied={} thumbnails_draft={:?} master_switch_present={} switch_dispatched={} master_on={} clipboard_draft={:?} persist_dispatched={} persist_applied={} persist_draft={:?} persist_ax_ok={} disable_dispatched={} master_off={} persist_hidden_when_disabled={} persist_draft_retained={:?} permission_untouched={} resume_after_show={} resume_after_advance={} resume_cleared={} window={}",
         segment_dispatched,
         thumbnails_applied,
         thumbnails_draft,
+        master_switch_present,
         switch_dispatched,
-        clipboard_applied,
+        master_on,
         clipboard_draft,
+        persist_dispatched,
+        persist_applied,
+        persist_draft,
+        persist_ax_ok,
+        disable_dispatched,
+        master_off,
+        persist_hidden_when_disabled,
+        persist_draft_retained,
         permission_untouched,
         resume_after_show,
         resume_after_advance,
@@ -1438,9 +1603,18 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
     segment_dispatched
         && thumbnails_applied
         && thumbnails_draft == Some(expected_thumbnails)
+        && master_switch_present
         && switch_dispatched
-        && clipboard_applied
-        && clipboard_draft == Some(!before_clipboard)
+        && master_on
+        && clipboard_draft == Some(true)
+        && persist_dispatched
+        && persist_applied
+        && persist_draft == Some(persist_expected)
+        && persist_ax_ok
+        && disable_dispatched
+        && master_off
+        && persist_hidden_when_disabled
+        && persist_draft_retained == Some(persist_expected)
         && permission_untouched
         && resume_after_show
         && resume_after_advance
@@ -1483,6 +1657,13 @@ const COUNTER_STYLE: LabelStyle = LabelStyle {
     weight: 0.23,
     color: 0x8E8E93FF,
     wrap: false,
+};
+/// Small muted explanatory text under an option (e.g. the clipboard persist warning).
+const HINT_STYLE: LabelStyle = LabelStyle {
+    size: 11.5,
+    weight: 0.0,
+    color: 0x8E8E93FF,
+    wrap: true,
 };
 fn status_style(color: u32) -> LabelStyle {
     LabelStyle {
@@ -1553,6 +1734,7 @@ mod tests {
             launch_at_login: true,
             thumbnails_enabled: false,
             clipboard_enabled: true,
+            clipboard_persist: true,
         };
 
         let after_permissions =
@@ -1572,6 +1754,7 @@ mod tests {
 
         let after_clipboard = config_with_step_selection(&old, &draft, Step::ClipboardHistory);
         assert!(after_clipboard.clipboard.enabled);
+        assert!(after_clipboard.clipboard.persist);
         assert_eq!(
             after_clipboard.startup.launch_at_login,
             old.startup.launch_at_login
@@ -1583,6 +1766,68 @@ mod tests {
 
         let after_more = config_with_step_selection(&old, &draft, Step::MoreFeatures);
         assert_eq!(after_more, old);
+    }
+
+    /// The persist switch mirrors `config.clipboard.persist`: the clipboard step commits it, other
+    /// steps leave it alone, and a disabled master switch keeps the draft so re-enabling history
+    /// restores the previous choice instead of resetting it.
+    #[test]
+    fn onboarding_clipboard_step_commits_persist_and_keeps_it_while_disabled() {
+        let old = Config::default();
+        assert!(!old.clipboard.persist);
+        let draft = UiState {
+            steps: steps_for(),
+            index: 0,
+            overrides: PermissionOverride::default(),
+            launch_at_login: false,
+            thumbnails_enabled: false,
+            clipboard_enabled: false,
+            clipboard_persist: true,
+        };
+        let disabled = config_with_step_selection(&old, &draft, Step::ClipboardHistory);
+        assert!(!disabled.clipboard.enabled);
+        assert!(
+            disabled.clipboard.persist,
+            "the persist draft must survive a master switch that is off"
+        );
+        // A step that owns no clipboard field must not leak the draft into the config.
+        let display = config_with_step_selection(&old, &draft, Step::DisplayMode);
+        assert_eq!(display.clipboard.persist, old.clipboard.persist);
+        assert_eq!(display.clipboard.enabled, old.clipboard.enabled);
+    }
+
+    /// The clipboard page's rows must not overlap: the persist hint clears the footer buttons, the
+    /// persist row sits above the hint, the master row above the persist row, and the body above
+    /// the master row. Kept as a pure check so a layout edit fails without a GUI.
+    #[test]
+    fn clipboard_step_rows_stay_ordered_and_clear_the_footer() {
+        let step = CLIPBOARD_STEP;
+        assert!(
+            step.persist_hint_y > BUTTON_Y + BUTTON_H,
+            "the persist hint must clear the footer buttons"
+        );
+        assert!(step.persist_row_y >= step.persist_hint_y + step.persist_hint_h);
+        assert!(step.enabled_row_y >= step.persist_row_y + BUTTON_H);
+        assert!(step.body_y >= step.enabled_row_y + BUTTON_H);
+        assert!(step.title_y >= step.body_y + step.body_h);
+        assert!(
+            step.title_y + TITLE_H <= WINDOW_H - 34.0,
+            "the title must clear the step counter pinned near the top edge"
+        );
+    }
+
+    /// Toggling clipboard persistence must not rebuild the page: the clicked switch has already
+    /// animated its own knob, and a rebuild recreates the master switch, whose `setState:` runs the
+    /// off-to-on spring on a fresh button (the reported twitch). The master switch still rebuilds so
+    /// the persist row appears/disappears with it.
+    #[test]
+    fn clipboard_choices_only_rebuild_the_page_when_their_structure_changes() {
+        assert!(clipboard_choice_rebuilds_page(
+            ACTION_TOGGLE_CLIPBOARD_DRAFT
+        ));
+        assert!(!clipboard_choice_rebuilds_page(
+            ACTION_TOGGLE_CLIPBOARD_PERSIST
+        ));
     }
 
     /// Builds one launch situation; each test names only the fields its story is about so the
@@ -1651,7 +1896,9 @@ mod tests {
     /// Picking a display mode or enabling clipboard history in the guide must reach the live
     /// config on the click, not on Next: a user who tested with the hotkey right after picking it
     /// used to keep the old mode, and the step's "try Option+V" hint would do nothing. The runner
-    /// commits through the real apply path, which persists, so it gets a throwaway HOME.
+    /// commits through the real apply path, which persists, so it gets a throwaway HOME. It is run
+    /// once with clipboard history off and once with it on, because the persist row only exists
+    /// while history is on and the runner must not assume the loaded config starts off.
     #[test]
     #[ignore]
     fn onboarding_live_apply_smoke() {
@@ -1666,21 +1913,32 @@ mod tests {
             "app binary missing at {}: run `cargo build` first",
             app.display()
         );
-        let home =
-            std::env::temp_dir().join(format!("oh-my-tab-onboarding-smoke-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&home);
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-onboarding-live-apply")
-            .env("HOME", &home)
-            .output()
-            .expect("failed to spawn app");
-        let _ = std::fs::remove_dir_all(&home);
-        assert!(
-            out.status.success(),
-            "onboarding live-apply smoke failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        for clipboard_enabled in [false, true] {
+            let home = std::env::temp_dir().join(format!(
+                "oh-my-tab-onboarding-smoke-{}-{clipboard_enabled}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            let config_dir = home.join(".config/oh-my-tab");
+            std::fs::create_dir_all(&config_dir).expect("create smoke config dir");
+            std::fs::write(
+                config_dir.join("config.toml"),
+                format!("[clipboard]\nenabled = {clipboard_enabled}\n"),
+            )
+            .expect("write smoke config");
+            let out = std::process::Command::new(&app)
+                .arg("--smoke-onboarding-live-apply")
+                .env("HOME", &home)
+                .output()
+                .expect("failed to spawn app");
+            let _ = std::fs::remove_dir_all(&home);
+            assert!(
+                out.status.success(),
+                "onboarding live-apply smoke failed with clipboard.enabled={clipboard_enabled} (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }
