@@ -765,9 +765,9 @@ unsafe fn render_permissions_and_startup(
             &[("app", &app), ("shortcut", &shortcut_label())],
         ),
         PAD,
-        143.0,
+        PERMISSIONS_BODY_Y,
         WINDOW_W - PAD * 2.0,
-        46.0,
+        PERMISSIONS_BODY_H,
         BODY_STYLE,
     );
     let (status_key, status_color) = if restart_required {
@@ -781,17 +781,17 @@ unsafe fn render_permissions_and_startup(
         content,
         &t("onboarding.accessibility_label"),
         PAD,
-        105.0,
-        136.0,
+        STATUS_ROW_Y,
+        STATUS_LABEL_W,
         STATUS_H,
         status_style(SECONDARY_TEXT),
     );
     add_label(
         content,
         &t(status_key),
-        PAD + 136.0,
-        105.0,
-        190.0,
+        PAD + STATUS_LABEL_W + STATUS_COLUMN_GAP,
+        STATUS_ROW_Y,
+        STATUS_COLUMN_W,
         STATUS_H,
         status_style(status_color),
     );
@@ -853,9 +853,9 @@ unsafe fn render_display_mode(
         content,
         &t("onboarding.display_body"),
         PAD,
-        151.0,
+        DISPLAY_BODY_Y,
         WINDOW_W - PAD * 2.0,
-        34.0,
+        DISPLAY_BODY_H,
         BODY_STYLE,
     );
     add_display_mode_control(content, thumbnails_enabled);
@@ -979,9 +979,9 @@ unsafe fn render_more_features(content: *mut AnyObject) {
         content,
         &t("onboarding.more_body"),
         PAD,
-        132.0,
+        MORE_BODY_Y,
         WINDOW_W - PAD * 2.0,
-        46.0,
+        MORE_BODY_H,
         BODY_STYLE,
     );
     add_button(
@@ -990,7 +990,7 @@ unsafe fn render_more_features(content: *mut AnyObject) {
         ACTION_OPEN_SETTINGS,
         PAD,
         78.0,
-        BUTTON_W,
+        WIDE_BUTTON_W,
         crate::settings::components::SettingsButtonRole::Action,
     );
 }
@@ -1630,7 +1630,26 @@ const PAD: f64 = 24.0;
 const GAP: f64 = 10.0;
 const BUTTON_H: f64 = 32.0;
 const BUTTON_W: f64 = 132.0;
+/// The wide action button ("Open App Settings"): 132pt wraps it to two lines and clips the second,
+/// so this keeps the label on one line (measured) with room for the CJK locales.
+const WIDE_BUTTON_W: f64 = 176.0;
 const BUTTON_Y: f64 = 20.0;
+/// Permissions-step status row: the label and the status share the width left of the action button.
+/// English needs ~155pt for both the label ("Accessibility permission") and the longest status
+/// ("Restart the app to apply"); the old 136pt label column truncated the label.
+const STATUS_ROW_Y: f64 = 105.0;
+const STATUS_LABEL_W: f64 = 160.0;
+const STATUS_COLUMN_GAP: f64 = 6.0;
+const STATUS_COLUMN_W: f64 = 160.0;
+/// Wrapped body copy keeps at least three lines at `BODY_LINE_H`; the previous 46pt frames clipped
+/// the English text (the screenshots ended mid-sentence).
+const BODY_LINE_H: f64 = 16.0;
+const PERMISSIONS_BODY_Y: f64 = 140.0;
+const PERMISSIONS_BODY_H: f64 = 3.0 * BODY_LINE_H + 4.0;
+const DISPLAY_BODY_Y: f64 = 143.0;
+const DISPLAY_BODY_H: f64 = 3.0 * BODY_LINE_H;
+const MORE_BODY_Y: f64 = 130.0;
+const MORE_BODY_H: f64 = 3.0 * BODY_LINE_H + 12.0;
 /// The guide only needs three text styles plus one status-line style, kept as constants so each
 /// call site does not repeat the parameters.
 #[derive(Clone, Copy)]
@@ -1695,6 +1714,106 @@ mod tests {
             supported,
             "NSButton must support the onboarding text button tint API"
         );
+    }
+
+    /// Embedded locale sources for the layout checks below; the assertions run over all three
+    /// locales so a future translation is covered.
+    const LOCALE_SOURCES: [(&str, &str); 3] = [
+        ("en", include_str!("../locales/en.toml")),
+        ("zh-Hans", include_str!("../locales/zh-Hans.toml")),
+        ("zh-Hant", include_str!("../locales/zh-Hant.toml")),
+    ];
+
+    fn locale_onboarding_string(raw: &str, key: &str) -> String {
+        let parsed: toml::Value = toml::from_str(raw).expect("locale parses");
+        parsed["onboarding"][key]
+            .as_str()
+            .unwrap_or_else(|| panic!("onboarding.{key} missing"))
+            .to_string()
+    }
+
+    /// Measured single-line widths (AppKit 13.5pt system font, taken once on the main thread) that
+    /// the status row must cover: "Accessibility permission" ~154.1pt and "Restart the app to
+    /// apply" ~154.3pt. The old 136pt label column truncated the English label
+    /// ("Accessibility permi... Granted"). Kept as constants: AppKit text measurement hangs when it
+    /// runs off the test thread, so a live measurement cannot be part of the headless gate.
+    const STATUS_LABEL_MIN_W: f64 = 155.0;
+    const STATUS_COLUMN_MIN_W: f64 = 155.0;
+
+    /// The permissions step's label/status columns must cover the measured widths and clear the
+    /// action button that shares the row.
+    #[test]
+    fn onboarding_status_columns_fit_measured_label_widths() {
+        const {
+            assert!(STATUS_LABEL_W >= STATUS_LABEL_MIN_W);
+            assert!(STATUS_COLUMN_W >= STATUS_COLUMN_MIN_W);
+            assert!(
+                PAD + STATUS_LABEL_W + STATUS_COLUMN_GAP + STATUS_COLUMN_W
+                    <= WINDOW_W - PAD - BUTTON_W
+            );
+        };
+        // Every locale must still define the strings the row renders.
+        for (locale, raw) in LOCALE_SOURCES {
+            for key in [
+                "accessibility_label",
+                "status_granted",
+                "status_missing",
+                "status_restart_required",
+            ] {
+                assert!(
+                    !locale_onboarding_string(raw, key).is_empty(),
+                    "{locale}: onboarding.{key} is empty"
+                );
+            }
+        }
+    }
+
+    /// The wide "Open App Settings" button must keep at least the measured single-line label width.
+    /// Measured: 132pt (116pt label budget) wrapped the English label to two lines and clipped the
+    /// second; 150pt (134pt budget) already fit on one line, so the wide width is the safe margin.
+    const BUTTON_LABEL_INSET: f64 = 16.0;
+    const OPEN_APP_SETTINGS_MIN_LABEL_W: f64 = 134.0;
+
+    #[test]
+    fn onboarding_wide_button_keeps_open_app_settings_on_one_line() {
+        const {
+            assert!(BUTTON_W - BUTTON_LABEL_INSET < OPEN_APP_SETTINGS_MIN_LABEL_W);
+            assert!(WIDE_BUTTON_W - BUTTON_LABEL_INSET >= OPEN_APP_SETTINGS_MIN_LABEL_W);
+        };
+        for (locale, raw) in LOCALE_SOURCES {
+            let title = locale_onboarding_string(raw, "btn_open_app_settings");
+            assert!(
+                !title.is_empty(),
+                "{locale}: onboarding.btn_open_app_settings is empty"
+            );
+        }
+    }
+
+    /// Each body frame must hold at least three wrapped lines and must not collide with the rows
+    /// around it (pure geometry). The English screenshots showed the 46pt frames ending
+    /// mid-sentence, so the height check is the regression guard.
+    #[test]
+    fn onboarding_body_frames_leave_room_for_three_lines() {
+        for (name, body_y, body_h) in [
+            ("permissions", PERMISSIONS_BODY_Y, PERMISSIONS_BODY_H),
+            ("display", DISPLAY_BODY_Y, DISPLAY_BODY_H),
+            ("more features", MORE_BODY_Y, MORE_BODY_H),
+        ] {
+            assert!(
+                body_h >= 3.0 * BODY_LINE_H,
+                "{name} body {body_h}pt holds fewer than three lines"
+            );
+            assert!(body_y > 0.0, "{name} body sits below the window");
+            assert!(
+                body_y + body_h <= 194.0,
+                "{name} body overlaps the shared 194pt title row"
+            );
+        }
+        // The permissions status row and the two action buttons sit below their bodies.
+        const {
+            assert!(PERMISSIONS_BODY_Y > STATUS_ROW_Y + STATUS_H);
+            assert!(MORE_BODY_Y > 78.0 + BUTTON_H);
+        };
     }
 
     #[test]
