@@ -320,6 +320,10 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
     json.push_str(&format!("  \"seq\": {seq},\n"));
     json.push_str(&format!("  \"event\": {},\n", json_string(event)));
     json.push_str(&format!("  \"visible\": {},\n", snapshot.visible));
+    json.push_str(&format!(
+        "  \"settings_window_visible\": {},\n",
+        crate::settings::settings_window_is_visible()
+    ));
     json.push_str(&format!("  \"selected_index\": {},\n", snapshot.selected));
     json.push_str(&format!("  \"cards_count\": {},\n", snapshot.windows.len()));
     let selected_key = snapshot.windows.get(snapshot.selected);

@@ -1290,6 +1290,19 @@ fn create_controller() -> *mut AnyObject {
         let superclass = class!(NSObject) as *const _ as *mut AnyObject;
         let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
         let types_v_obj = CString::new("v@:@").unwrap();
+        let app_reopen_types = CString::new(APP_REOPEN_METHOD_ENCODING).unwrap();
+        class_addMethod(
+            cls,
+            sel!(applicationShouldHandleReopen:hasVisibleWindows:),
+            on_application_should_handle_reopen as *mut c_void,
+            app_reopen_types.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleAppReopenOnMainThread:),
+            on_app_reopen_on_main_thread as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
         class_addMethod(
             cls,
             sel!(handleCmdTabPressed:),
@@ -2103,6 +2116,109 @@ fn open_settings_page_request() -> Option<usize> {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+type AppKitBool = bool;
+#[cfg(target_arch = "x86_64")]
+type AppKitBool = i8;
+
+// BOOL is `_Bool` on arm64 and signed char on Intel macOS; class_addMethod needs the matching
+// runtime encoding as well as the matching callback ABI.
+#[cfg(target_arch = "aarch64")]
+const APP_REOPEN_METHOD_ENCODING: &str = "B@:@B";
+#[cfg(target_arch = "x86_64")]
+const APP_REOPEN_METHOD_ENCODING: &str = "c@:@c";
+
+#[cfg(target_arch = "aarch64")]
+fn appkit_bool(value: bool) -> AppKitBool {
+    value
+}
+
+#[cfg(target_arch = "x86_64")]
+fn appkit_bool(value: bool) -> AppKitBool {
+    value as i8
+}
+
+#[cfg(target_arch = "aarch64")]
+fn appkit_bool_value(value: AppKitBool) -> bool {
+    value
+}
+
+#[cfg(target_arch = "x86_64")]
+fn appkit_bool_value(value: AppKitBool) -> bool {
+    value != 0
+}
+
+extern "C" fn on_application_should_handle_reopen(
+    this: *mut c_void,
+    _cmd: Sel,
+    _application: *mut c_void,
+    _has_visible_windows: AppKitBool,
+) -> AppKitBool {
+    callback_guard::void("application_should_handle_reopen", || {
+        if is_main_thread() {
+            open_settings_for_reopen();
+        } else {
+            unsafe {
+                let _: () = msg_send![
+                    this as *mut AnyObject,
+                    performSelectorOnMainThread: sel!(handleAppReopenOnMainThread:),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    waitUntilDone: false
+                ];
+            }
+        }
+    });
+    // The callback performs the custom reopen action; NO suppresses AppKit's generic behavior.
+    appkit_bool(false)
+}
+
+extern "C" fn on_app_reopen_on_main_thread(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    callback_guard::void("app_reopen_on_main_thread", open_settings_for_reopen);
+}
+
+fn open_settings_for_reopen() {
+    debug_assert_main_thread();
+    if onboarding::is_visible() {
+        onboarding::finish_for_settings();
+    }
+    settings::reopen_for_app_activation(updater::wait_for_quit_active());
+}
+
+fn application_reopen_smoke() -> bool {
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let delegate: *mut AnyObject = msg_send![app, delegate];
+        if delegate.is_null() {
+            return false;
+        }
+        let responds: bool = msg_send![
+            delegate,
+            respondsToSelector: sel!(applicationShouldHandleReopen:hasVisibleWindows:)
+        ];
+        if !responds {
+            return false;
+        }
+        let handled: AppKitBool = msg_send![
+            delegate,
+            applicationShouldHandleReopen: app,
+            hasVisibleWindows: appkit_bool(false)
+        ];
+        if appkit_bool_value(handled) || !settings::settings_window_is_visible() {
+            return false;
+        }
+
+        settings::show_settings_page(settings::SETTINGS_ABOUT_PAGE_INDEX);
+        let handled: AppKitBool = msg_send![
+            delegate,
+            applicationShouldHandleReopen: app,
+            hasVisibleWindows: appkit_bool(true)
+        ];
+        !appkit_bool_value(handled)
+            && settings::settings_window_is_visible()
+            && settings::e2e_selected_sidebar() == settings::SETTINGS_ABOUT_PAGE_INDEX
+    }
+}
+
 /// App entry: the full startup/smoke/run loop (called by the thin bin wrapper; behavior
 /// is unchanged by the lib/bin split).
 pub fn run() {
@@ -2115,6 +2231,7 @@ pub fn run() {
             || arg == "--smoke-settings-layout"
             || arg == "--smoke-settings-state-sync"
             || arg == "--smoke-settings-collapsible-row"
+            || arg == "--smoke-app-reopen"
             || arg == "--smoke-onboarding-live-apply"
     });
     let _instance_guard = if is_gui_smoke_process {
@@ -2230,6 +2347,12 @@ pub fn run() {
     // 6. Create controller object
     let controller = create_controller();
     *CONTROLLER.lock().unwrap() = Some(CallbackTarget::new(controller));
+    // This process-lifetime controller already owns input and notification callbacks; install the
+    // same object as NSApplication's delegate before finishLaunching and the main event loop.
+    unsafe {
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![nsapp, setDelegate: controller];
+    }
 
     // Sparkle is loaded dynamically so a source checkout can still run without the native
     // framework. Release/dev bundles that contain Contents/Frameworks/Sparkle.framework get the
@@ -2501,6 +2624,21 @@ pub fn run() {
         }
     }
 
+    // Invoke the registered application delegate selector on AppKit's main thread and assert
+    // that custom handling returns NO after presenting the Settings window.
+    if std::env::args().any(|a| a == "--smoke-app-reopen") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            if !application_reopen_smoke() {
+                eprintln!("[smoke-app-reopen] delegate handling or Settings visibility failed");
+                std::process::exit(1);
+            }
+            log_info!("[smoke-app-reopen] delegate returned NO and Settings is visible");
+            std::process::exit(0);
+        }
+    }
+
     if std::env::args().any(|a| a == "--smoke-keystroke-display-panel") {
         unsafe {
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
@@ -2582,6 +2720,7 @@ pub fn run() {
         if let Some(page) = open_settings_page_request() {
             settings::show_settings_page(page);
         }
+        e2e_state::record("launch");
         let _: () = msg_send![nsapp, run];
     }
 }

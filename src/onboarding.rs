@@ -453,6 +453,12 @@ pub(crate) fn is_visible() -> bool {
     visible
 }
 
+/// Complete the guide and dismiss it before handing the user to Settings.
+pub(crate) fn finish_for_settings() {
+    mark_completed();
+    hide();
+}
+
 /// Hides the guide window (reused by tests and teardown paths). Finishing, skipping, or opening
 /// Settings ends the flow, so a pending resume is dropped: a later launch must not reopen it.
 pub(crate) fn hide() {
@@ -1278,8 +1284,7 @@ pub(crate) fn handle_action(tag: isize) {
             }
         }
         ACTION_OPEN_SETTINGS => {
-            mark_completed();
-            hide();
+            finish_for_settings();
             crate::settings::show_settings_page(0);
         }
         ACTION_FINISH => {

@@ -308,6 +308,52 @@ pub(super) fn show_settings() {
     show_settings_inner(None, 0, None, true);
 }
 
+/// Reopen Settings from an application-level activation. A visible Settings window keeps its
+/// current page; an active Sparkle wait-for-quit flow also retains the existing About surface.
+pub(crate) fn reopen_for_app_activation(update_waiting_for_quit: bool) {
+    let current_window = with_settings_ui(|ui| {
+        ui.as_ref().map(|ui| unsafe {
+            let visible: bool = msg_send![ui.window, isVisible];
+            let frame: NSRect = msg_send![ui.window, frame];
+            (visible, frame, capture_settings_scroll_offsets(ui))
+        })
+    });
+
+    let preserve_page = update_waiting_for_quit
+        || current_window
+            .as_ref()
+            .is_some_and(|(visible, _, _)| *visible);
+    if !preserve_page {
+        show_settings();
+        return;
+    }
+
+    let page = SIDEBAR_SELECTED
+        .load(Ordering::SeqCst)
+        .min(SETTINGS_PAGE_COUNT - 1);
+    if let Some((_, frame, scroll_offsets)) = current_window {
+        show_settings_inner(Some(frame), page, Some(scroll_offsets), true);
+    } else {
+        // An updater wait-for-quit window can exist without a Settings window; About is where
+        // the retry action and update status live when Sparkle used the inline host.
+        let page = if update_waiting_for_quit {
+            SETTINGS_ABOUT_PAGE_INDEX
+        } else {
+            page
+        };
+        show_settings_inner(None, page, None, true);
+    }
+}
+
+pub(crate) fn settings_window_is_visible() -> bool {
+    with_settings_ui(|ui| {
+        ui.as_ref().is_some_and(|ui| unsafe {
+            let visible: bool = msg_send![ui.window, isVisible];
+            visible
+        })
+    })
+}
+
 /// Show the settings window, optionally preserving its frame and selected page.
 fn show_settings_preserving(
     frame: NSRect,

@@ -495,8 +495,8 @@ pub(crate) use dispatch::{
 };
 pub(crate) use window::{
     close_settings_from_switcher, invalidate_settings_window, refresh_permission_ui_if_visible,
-    refresh_system_appearance, settings_collapsible_row_smoke_runner, settings_layout_smoke_runner,
-    settings_state_sync_smoke_runner,
+    refresh_system_appearance, reopen_for_app_activation, settings_collapsible_row_smoke_runner,
+    settings_layout_smoke_runner, settings_state_sync_smoke_runner, settings_window_is_visible,
 };
 
 fn parse_f64(s: &str) -> Result<f64, ()> {
@@ -1905,6 +1905,24 @@ mod tests {
             out.status.success(),
             "settings layout smoke failed (exit {:?})\nstderr:\n{}",
             out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Call the registered NSApplication reopen delegate and verify custom handling opens Settings.
+    #[test]
+    #[ignore]
+    fn application_reopen_delegate_opens_settings_smoke() {
+        let app = settings_smoke_app_binary();
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-app-reopen")
+            .output()
+            .expect("failed to spawn app");
+        assert!(
+            out.status.success(),
+            "application reopen smoke failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
     }

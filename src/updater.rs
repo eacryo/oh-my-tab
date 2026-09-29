@@ -54,6 +54,7 @@ struct UpdateUiState {
     information_url: String,
     permission_reply: usize,
     retry_termination: usize,
+    waiting_for_quit: bool,
     progress: usize,
     status_label: usize,
     cancel_button: usize,
@@ -75,6 +76,7 @@ static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
         information_url: String::new(),
         permission_reply: 0,
         retry_termination: 0,
+        waiting_for_quit: false,
         progress: 0,
         status_label: 0,
         cancel_button: 0,
@@ -528,6 +530,7 @@ unsafe fn close_custom_update_window() {
     ui.permission_reply = 0;
     release_block(ui.retry_termination);
     ui.retry_termination = 0;
+    ui.waiting_for_quit = false;
     ui.progress = 0;
     ui.status_label = 0;
     ui.cancel_button = 0;
@@ -560,6 +563,10 @@ pub(crate) fn clear_update_host() {
     ui.check_button = 0;
     ui.check_loading_timer = 0;
     ui.check_loading_frame = 0;
+}
+
+pub(crate) fn wait_for_quit_active() -> bool {
+    UPDATE_UI_STATE.lock().unwrap().waiting_for_quit
 }
 
 /// Stop the Braille glyph animation on the check-updates button.
@@ -2165,6 +2172,7 @@ extern "C" fn show_installing_update(
         let (cancel_button, retry) = {
             let mut ui = UPDATE_UI_STATE.lock().unwrap();
             ui.retry_termination = copy_block(retry_terminating_application) as usize;
+            ui.waiting_for_quit = application_terminated == 0;
             (ui.cancel_button, ui.retry_termination)
         };
         if cancel_button != 0 {
