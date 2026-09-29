@@ -90,6 +90,10 @@ static CHECK_TIMER: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::n
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 const INLINE_UPDATE_HEIGHT: f64 = 140.0;
 const UPDATE_RELEASE_NOTES_MAX_HEIGHT: f64 = 180.0;
+/// Layout width of the release-notes document in the standalone window's coordinate space. The
+/// inline host scales this to the width it installs the view at, and the text view is built and
+/// measured at that scaled width (see [`release_notes_measured_width`]).
+const RELEASE_NOTES_LAYOUT_WIDTH: f64 = 576.0;
 const CHECK_LOADING_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const CHECK_LOADING_CYCLE_SECONDS: f64 = 1.0;
 
@@ -397,12 +401,46 @@ unsafe fn render_target(window_h: f64) -> RenderTarget {
     }
 }
 
+/// Ratio from the standalone window's layout width to the inline host width. Inline frames are
+/// authored at `window_w` and every width that has to agree with the installed geometry derives its
+/// scale from here, so `add_control` and the release-notes measurement cannot drift apart.
+fn inline_layout_scale(host_width: f64, window_w: f64) -> f64 {
+    if host_width <= 0.0 || window_w <= 0.0 {
+        1.0
+    } else {
+        (host_width / window_w).max(0.1)
+    }
+}
+
+/// Width the release-notes text view and its container are built and measured at.
+///
+/// [`release_notes_measured_width`] is its only constructor, so `make_release_notes_view` cannot be
+/// handed the unscaled layout width: `add_control` installs the frame scaled by the host/window
+/// ratio, and building at the layout width lays the document out for a container wider than the
+/// host's clip view.
+#[derive(Clone, Copy)]
+struct ReleaseNotesMeasuredWidth(f64);
+
+impl ReleaseNotesMeasuredWidth {
+    fn points(self) -> f64 {
+        self.0
+    }
+}
+
+/// The width the inline host installs the release-notes view at. Measuring at
+/// [`RELEASE_NOTES_LAYOUT_WIDTH`] instead lays the document out for a container wider than the host's
+/// clip view; whether AppKit then clips the document or reflows it into the frozen frame height has
+/// not been confirmed at runtime, so this keeps the document and its viewport the same width.
+fn release_notes_measured_width(layout_scale: f64) -> ReleaseNotesMeasuredWidth {
+    ReleaseNotesMeasuredWidth(RELEASE_NOTES_LAYOUT_WIDTH * layout_scale)
+}
+
 /// Map a standalone-window frame onto the host width, scaling x and width proportionally.
 fn scale_frame(target: RenderTarget, window_w: f64, frame: NSRect) -> NSRect {
     if target.host.is_null() || window_w <= 0.0 {
         return frame;
     }
-    let scale = target.width / window_w;
+    let scale = inline_layout_scale(target.width, window_w);
     NSRect::new(
         NSPoint::new(frame.origin.x * scale, frame.origin.y),
         NSSize::new(frame.size.width * scale, frame.size.height),
@@ -1114,8 +1152,12 @@ extern "C" fn defer_automatic_update(_this: *mut c_void, _cmd: Sel, _sender: *mu
 /// Build the custom update window's release-notes view from Sparkle's appcast item description.
 unsafe fn make_release_notes_view(
     item: *mut AnyObject,
-    width: f64,
+    measured_width: ReleaseNotesMeasuredWidth,
 ) -> Option<(*mut AnyObject, f64)> {
+    // The frame `add_control` receives stays at `RELEASE_NOTES_LAYOUT_WIDTH` and is scaled by the
+    // same host/window factor, so building at this measured width keeps the document and its clip
+    // view the same size instead of depending on a display-time reflow.
+    let width = measured_width.points();
     if item.is_null() {
         return None;
     }
@@ -1413,7 +1455,7 @@ unsafe fn make_custom_update_found_window(
             1.0
         } else {
             let frame: NSRect = msg_send![ui.host_view as *mut AnyObject, frame];
-            (frame.size.width / window_w).max(0.1)
+            inline_layout_scale(frame.size.width, window_w)
         }
     };
     let skip_w = if prompt_kind == UpdatePromptKind::InformationOnly {
@@ -1493,7 +1535,9 @@ unsafe fn make_custom_update_found_window(
     let button_h = [skip_h, later_h, install_h]
         .into_iter()
         .fold(36.0f64, f64::max);
-    let release_notes = make_release_notes_view(item, 576.0);
+    // The builder derives the measured width from `layout_scale`; the standalone frame below stays
+    // in layout coordinates and `add_control` scales it to that same width.
+    let release_notes = make_release_notes_view(item, release_notes_measured_width(layout_scale));
     let release_notes_h = release_notes.map_or(0.0, |(_, height)| height);
     let release_notes_y = button_y + button_h + button_gap;
     let message_y = if release_notes_h > 0.0 {
@@ -1577,7 +1621,7 @@ unsafe fn make_custom_update_found_window(
     if let Some((release_notes, release_notes_h)) = release_notes {
         let release_notes_frame = NSRect::new(
             NSPoint::new(32.0, release_notes_y),
-            NSSize::new(576.0, release_notes_h),
+            NSSize::new(RELEASE_NOTES_LAYOUT_WIDTH, release_notes_h),
         );
         let _: () = msg_send![release_notes, setFrame: release_notes_frame];
         add_control(
@@ -1857,7 +1901,7 @@ unsafe fn make_custom_choice_window(
             1.0
         } else {
             let frame: NSRect = msg_send![ui.host_view as *mut AnyObject, frame];
-            (frame.size.width / window_w).max(0.1)
+            inline_layout_scale(frame.size.width, window_w)
         }
     };
     let button_y = 14.0;
@@ -2761,9 +2805,59 @@ pub(crate) fn check_for_updates() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_safe_update_info_url, render_release_notes_markdown, select_release_notes_locale,
-        update_prompt_kind, UpdatePromptKind,
+        inline_layout_scale, is_safe_update_info_url, release_notes_measured_width,
+        render_release_notes_markdown, scale_frame, select_release_notes_locale,
+        update_prompt_kind, RenderTarget, UpdatePromptKind, RELEASE_NOTES_LAYOUT_WIDTH,
     };
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    /// Regression guard for the inline About-page release notes. `add_control` scales the layout
+    /// frame by the host/window ratio, so `make_release_notes_view` must build and measure the text
+    /// view at that installed width rather than at `RELEASE_NOTES_LAYOUT_WIDTH`. The assertions bind
+    /// the builder's width helper to `scale_frame`'s result, so reverting the helper to the fixed
+    /// layout width fails here.
+    #[test]
+    fn release_notes_are_measured_at_the_width_the_inline_host_installs() {
+        const WINDOW_W: f64 = 640.0;
+        let layout_frame = NSRect::new(
+            NSPoint::new(32.0, 0.0),
+            NSSize::new(RELEASE_NOTES_LAYOUT_WIDTH, 180.0),
+        );
+        let installed_for = |host_w: f64| {
+            let target = RenderTarget {
+                host: std::ptr::NonNull::<AnyObject>::dangling().as_ptr(),
+                parent: std::ptr::null_mut(),
+                width: host_w,
+            };
+            scale_frame(target, WINDOW_W, layout_frame).size.width
+        };
+        // 512 is the real About-page host width at the default settings size; the others cover a
+        // narrower/wider host and the wide case where the host is not the constraint.
+        for host_w in [300.0, 512.0, 536.0, 640.0, 800.0] {
+            assert_eq!(
+                release_notes_measured_width(inline_layout_scale(host_w, WINDOW_W)).points(),
+                installed_for(host_w),
+                "release notes measured at a width the host does not install (host {host_w})"
+            );
+        }
+        // The original defect: measuring at the fixed layout width while the default host installs a
+        // narrower one. Reverting the helper to the constant makes this fail.
+        let default_installed = installed_for(512.0);
+        assert!(
+            default_installed < RELEASE_NOTES_LAYOUT_WIDTH,
+            "the default host must be narrower than the layout width"
+        );
+        assert_ne!(
+            release_notes_measured_width(inline_layout_scale(512.0, WINDOW_W)).points(),
+            RELEASE_NOTES_LAYOUT_WIDTH
+        );
+        // Standalone update windows have no host and are never scaled.
+        assert_eq!(
+            release_notes_measured_width(1.0).points(),
+            RELEASE_NOTES_LAYOUT_WIDTH
+        );
+    }
 
     #[test]
     fn update_prompt_matches_sparkle_stage_and_information_only_state() {
