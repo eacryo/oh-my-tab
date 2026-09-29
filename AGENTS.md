@@ -22,6 +22,7 @@ scripts/dev-restart.sh
 - Docs, comments, localization, and `AGENTS.md` changes need no Rust tests. Rust changes require `cargo fmt` (plus `cargo check` when interfaces or compilation are affected) and targeted tests when behavior changes.
 - Cross-module, unsafe/FFI, concurrency, configuration, build, or release changes require the full gate above. Before handing off a completed feature, always run the full gate and keep all checks clean.
 - Start the app with `scripts/dev-restart.sh`, never directly with `cargo run`. For runtime changes, run it after the full gate. If it reports `restart FAILED`, inspect the newest log under `~/Library/Logs/oh-my-tab/`, diagnose, and retry.
+- When the onboarding guide does not need verification, launch with `--no-onboarding` (for example, `scripts/dev-restart.sh --no-onboarding`) so it does not appear; only run without it when testing onboarding flows.
 - `scripts/dev-restart.sh` defaults to a **debug** build (`cargo build`): fast iteration with every debug assertion on. Use it for functional iteration and handoff.
 - For feel/perf validation (scrolling, animation, latency), run `scripts/dev-restart.sh --opt`. It uses the `dev-opt` cargo profile (`target/dev-opt/`): optimized like release while keeping `debug-assertions`, so runtime speed is representative and development still fails fast.
 - `release_doc_dev/<Cargo.toml version>.md` must exist and be non-empty: `scripts/dev-restart.sh` aborts before building otherwise, and a dev build embeds that file as its release notes.

@@ -7,11 +7,12 @@
 # 传递参数给应用(用于验证只在特定状态下出现的功能,如首次引导/权限分支):
 #   scripts/dev-restart.sh -- --force-onboarding   # `--` 之后的 argv 原样透传给应用
 #   scripts/dev-restart.sh --force-onboarding      # 脚本不认识的 --* 参数也照样透传
+#   scripts/dev-restart.sh --no-onboarding         # 跳过本次启动的引导
 # 开关只在本次启动生效:脚本每次先 pkill 旧实例,不会残留。
 # 为什么不用环境变量:开发版由 launchd 启动,而 launchd 任务不继承调用者环境;以前靠白名单转发
 # OH_MY_TAB_*,一旦过滤写漏就会把整份环境(云凭证、代理)灌进任务与日志 —— 2026-09-22 出过这次
 # 事故。现在只有 argv 一个通道:本脚本**不读、不转发、不回显任何环境变量**,也不要再加回来;
-# 新增开发开关在应用侧解析 `--` 参数即可,脚本无需改动。
+# 其它开发开关在应用侧解析 `--` 参数即可,通用透传逻辑会负责转发。
 # Dev restart script: gracefully quit the old process -> build and assemble the dev .app ->
 # start the .app -> verify it is alive. Run by the agent after the
 # fmt/check/clippy/test gates pass (see the AGENTS.md convention).
@@ -22,13 +23,14 @@
 # e.g. first-run onboarding or permission branches):
 #   scripts/dev-restart.sh -- --force-onboarding   # argv after `--` is forwarded verbatim
 #   scripts/dev-restart.sh --force-onboarding      # any `--*` argument the script does not own
+#   scripts/dev-restart.sh --no-onboarding         # suppress the guide for this launch
 # Switches apply to this launch only: the script pkills old instances first, nothing sticks.
 # Why no environment variables: the dev build is started by launchd, and a launchd job does not
 # inherit the caller's environment. The allowlist that used to forward OH_MY_TAB_* dumped the whole
 # environment (cloud credentials, proxies) into the job and the logs whenever the filter was wrong --
 # which happened once, on 2026-09-22. Argv is the only channel now: this script reads, forwards and
-# echoes no environment variable at all, and one must not be reintroduced. A new development switch
-# is parsed from a `--` argument on the app side, with no change here.
+# echoes no environment variable at all, and one must not be reintroduced. Other development
+# switches are parsed from `--` arguments on the app side and use the generic passthrough below.
 
 # Resolve paths from this script, not from the caller's current directory. This
 # keeps both `./scripts/dev-restart.sh` and an absolute-path invocation working.
@@ -52,11 +54,13 @@ for arg in "$@"; do
         --) after_separator=1 ;;
         --opt) build_profile="dev-opt" ;;
         --require-stable-signing) require_stable_signing=1 ;;
+        --no-onboarding) app_args+=("$arg") ;;
         -h|--help)
-            echo "Usage: scripts/dev-restart.sh [--opt] [--require-stable-signing] [-- <app args>...]"
+            echo "Usage: scripts/dev-restart.sh [--opt] [--require-stable-signing] [--no-onboarding] [-- <app args>...]"
             echo "  (no flag)  debug build: fast iteration, complete debug assertions"
             echo "  --opt      dev-opt profile: optimized, debug assertions kept (feel/perf)"
             echo "  --require-stable-signing  fail instead of falling back to ad-hoc signing"
+            echo "  --no-onboarding  forward to the app and suppress the guide for this launch"
             echo "  -- ARGS    forward ARGS to the app executable, verbatim"
             echo "  --FLAG     every other --flag[=value] is forwarded to the app as well, e.g."
             echo "             scripts/dev-restart.sh --open-settings=about --force-onboarding"
