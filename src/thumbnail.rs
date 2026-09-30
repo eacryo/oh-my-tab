@@ -655,6 +655,27 @@ mod tests {
     }
 
     #[test]
+    fn capture_state_retries_a_space_transition_job_at_the_settle_deadline() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 10, wid: 20 };
+        let now = Instant::now();
+        let settle_deadline = now + Duration::from_millis(400);
+
+        assert!(state.request(key, 640, CapturePriority::Visible));
+        let job = state.take_next_for_at(false, now).unwrap();
+        let retry_deadline = match state.defer_space_transition(job, now, settle_deadline) {
+            GeometryDeferResult::Deferred(deadline) => deadline.deadline,
+            result => panic!("unexpected defer result: {result:?}"),
+        };
+        assert_eq!(retry_deadline, settle_deadline);
+        assert!(state
+            .take_next_for_at(false, settle_deadline - Duration::from_millis(1))
+            .is_none());
+        let retry = state.take_next_for_at(false, settle_deadline).unwrap();
+        assert_eq!(retry.token, job.token);
+    }
+
+    #[test]
     fn capture_state_does_not_revive_stale_or_cancelled_geometry_job() {
         let key = ThumbKey { pid: 10, wid: 20 };
 

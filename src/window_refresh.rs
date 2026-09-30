@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Overlay presentation hooks: window_refresh decides only WHEN the card surface must
 /// re-render, never WHO renders it (it used to call overlay::* directly, forming a module
@@ -42,7 +43,6 @@ fn overlay_presenter() -> Option<&'static OverlayPresenter> {
     OVERLAY_PRESENTER.get()
 }
 use std::thread;
-use std::time::Duration;
 
 use crate::ffi::frontmost_app_info;
 use crate::performance;
@@ -92,6 +92,7 @@ enum WindowRefreshRequest {
 
 struct WindowRefreshResult {
     generation: u64,
+    space_transition_generation: u64,
     windows: Vec<WindowInfo>,
     mru: MruMap,
     replace_pid: Option<i32>,
@@ -182,6 +183,69 @@ pub(crate) fn start_lifecycle_backstop() {
 
 pub(crate) extern "C" fn on_lifecycle_backstop(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     crate::callback_guard::void("on_lifecycle_backstop", request_lifecycle_window_refresh);
+}
+
+/// Record an explicit Workspace notification or a fullscreen-scoped onscreen-window flip.
+/// Requests merge through the ordinary queue, then one post-settle refresh publishes a clean set.
+pub(crate) fn note_space_transition(explicit_notification: bool) {
+    let transition_at = Instant::now();
+    if explicit_notification {
+        crate::space_transition::note_explicit_transition(transition_at);
+    }
+    let snapshot = crate::space_transition::record_transition_at(transition_at);
+    crate::e2e_state::set_space_transition(true, snapshot.deadline_unix_ms);
+    queue_refresh_request(WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle));
+    let controller = CONTROLLER.lock().unwrap().map(|ptr| ptr.0);
+    if let Some(controller) = controller {
+        unsafe {
+            let _: () = msg_send![controller,
+                performSelectorOnMainThread: sel!(handleSpaceTransitionSettle:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
+    }
+}
+
+pub(crate) extern "C" fn on_space_transition_settle(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _arg: *mut c_void,
+) {
+    crate::callback_guard::void("on_space_transition_settle", finish_space_transition_settle);
+}
+
+fn finish_space_transition_settle() {
+    if crate::space_transition::settle_if_due() {
+        crate::e2e_state::set_space_transition(false, 0);
+        crate::e2e_state::record("space_transition_settled");
+        crate::thumbnail::wake_capture_worker();
+        let request = take_pending_refresh_request()
+            .unwrap_or(WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle));
+        request_window_refresh_request(request);
+        return;
+    }
+    let snapshot = crate::space_transition::snapshot();
+    if snapshot.active {
+        crate::e2e_state::set_space_transition(true, snapshot.deadline_unix_ms);
+        crate::e2e_state::record("space_transition_started");
+        if let (Some(controller), Some(deadline)) = (
+            CONTROLLER.lock().unwrap().map(|ptr| ptr.0),
+            snapshot.deadline,
+        ) {
+            let delay = deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64()
+                .max(0.001);
+            unsafe {
+                let _: () = msg_send![controller,
+                    performSelector: sel!(handleSpaceTransitionSettle:),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    afterDelay: delay
+                ];
+            }
+        }
+    }
 }
 
 fn schedule_deferred_refresh_watchdog(generation: u64) -> bool {
@@ -306,14 +370,26 @@ fn request_window_refresh_for(reason: WindowRefreshReason) {
 }
 
 fn request_window_refresh_request(request: WindowRefreshRequest) {
+    if crate::space_transition::snapshot().active {
+        queue_refresh_request(request);
+        return;
+    }
     if WINDOW_REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         queue_refresh_request(request);
         return;
     }
 
+    let in_flight = InFlightGuard::new();
+    let space_transition_generation = crate::space_transition::snapshot().generation;
+    if crate::space_transition::snapshot().active {
+        queue_refresh_request(request);
+        drop(in_flight);
+        return;
+    }
+
     // The flag is now set and owned by the guard, which resets it on any exit that never
     // reaches the main-thread apply stage.
-    start_window_refresh(request, InFlightGuard::new());
+    start_window_refresh(request, in_flight, space_transition_generation);
 }
 
 /// Prefer the exact focus key from the current summon snapshot over a cached key.  Both keys
@@ -334,7 +410,11 @@ fn select_summon_focus_key(
         .or_else(|| cached.filter(|key| is_present(*key)))
 }
 
-fn start_window_refresh(request: WindowRefreshRequest, in_flight: InFlightGuard) {
+fn start_window_refresh(
+    request: WindowRefreshRequest,
+    in_flight: InFlightGuard,
+    space_transition_generation: u64,
+) {
     // Return without state: the guard resets the flag on Drop instead of leaving it stuck.
     let Some((generation, mru)) = with_tab_state(|state_opt| {
         let state = state_opt.as_ref()?;
@@ -409,6 +489,7 @@ fn start_window_refresh(request: WindowRefreshRequest, in_flight: InFlightGuard)
             };
             *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
                 generation,
+                space_transition_generation,
                 windows,
                 mru,
                 replace_pid,
@@ -572,10 +653,17 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
         }
         return;
     };
-    if result.generation != WINDOW_REFRESH_GENERATION.load(Ordering::Acquire) {
+    let transition = crate::space_transition::snapshot();
+    if result.generation != WINDOW_REFRESH_GENERATION.load(Ordering::Acquire)
+        || transition.active
+        || result.space_transition_generation != transition.generation
+    {
+        queue_refresh_request(WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle));
         drop(in_flight);
-        if let Some(pending_request) = take_pending_refresh_request() {
-            request_window_refresh_request(pending_request);
+        if !transition.active {
+            if let Some(pending_request) = take_pending_refresh_request() {
+                request_window_refresh_request(pending_request);
+            }
         }
         return;
     }
@@ -583,80 +671,95 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
     let summon_focus_key = result.summon_focus_key;
     let subscriptions = window_server_candidates();
 
-    let Some((was_visible, set_changed)) = with_tab_state(|state_opt| {
-        // Nothing to apply into: the guard resets the flag when the else branch returns.
-        let state = state_opt.as_mut()?;
-        let selected_key = state
-            .windows
-            .get(state.selected)
-            .map(|window| (window.pid, window.window_id));
-        let mut mru = state.mru.clone();
-        for (key, timestamp) in result.mru {
-            if mru.get(&key).is_none_or(|current| *current < timestamp) {
-                mru.insert(key, timestamp);
+    let applied = crate::space_transition::while_stable(result.space_transition_generation, || {
+        with_tab_state(|state_opt| {
+            // Nothing to apply into: the guard resets the flag when the else branch returns.
+            let state = state_opt.as_mut()?;
+            let selected_key = state
+                .windows
+                .get(state.selected)
+                .map(|window| (window.pid, window.window_id));
+            let mut mru = state.mru.clone();
+            for (key, timestamp) in result.mru {
+                if mru.get(&key).is_none_or(|current| *current < timestamp) {
+                    mru.insert(key, timestamp);
+                }
             }
+            let replace_pid = result.replace_pid;
+            let active_key = result.active_key;
+            // A directed refresh replaces only the target PID; cards and ordering memory for every
+            // other application remain intact.
+            let mut sorted_windows =
+                merge_refreshed_windows(&state.windows, replace_pid, result.windows);
+            sort_windows_by_mru(&mut sorted_windows, &mru, std::time::Instant::now());
+            if replace_pid.is_none() {
+                // Re-establish one frontmost representative after a full merge so an old snapshot
+                // cannot leave multiple stale is_active flags behind.
+                for window in &mut sorted_windows {
+                    window.is_active = false;
+                }
+                if let Some(first) = sorted_windows.first_mut() {
+                    first.is_active = true;
+                }
+            } else if let Some(active_key) = active_key {
+                for window in &mut sorted_windows {
+                    window.is_active = (window.pid, window.window_id) == active_key;
+                }
+            }
+            let set_changed = replace_pid.is_some() || {
+                let old: HashSet<(i32, u32)> =
+                    state.windows.iter().map(|w| (w.pid, w.window_id)).collect();
+                let new: HashSet<(i32, u32)> = sorted_windows
+                    .iter()
+                    .map(|w| (w.pid, w.window_id))
+                    .collect();
+                old != new
+            };
+            let was_visible = state.visible;
+            let windows = if was_visible && !set_changed {
+                preserve_existing_window_order(&state.windows, sorted_windows)
+            } else {
+                sorted_windows
+            };
+            // Selection follows the target window, not the live list index:
+            // - user_picked=true (user navigated): pin to selected_target_key; reorders cannot move it.
+            // - user_picked=false (still the first-frame default): lock to the summon-time target so a
+            //   refresh doesn't re-pick just because the MRU order was bumped by the frontmost window.
+            let selected = select_index_after_refresh(
+                state.user_picked,
+                state.selected_target_key,
+                selected_key,
+                state.selected,
+                &windows,
+            );
+            // Set-level change (windows added/removed): only this needs a full overlay rebuild. A pure
+            // reorder (MRU bumped by the frontmost, surface flip) only updates data without rebuilding
+            // the list — otherwise the overlay "keeps jumping after it opened". A directed refresh
+            // (replace_pid) swapping a PID's cards also counts as a set change.
+            state.windows = windows;
+            WINDOW_COUNT.store(state.windows.len(), std::sync::atomic::Ordering::Release);
+            state.selected = selected;
+            state.mru = mru;
+            if state.windows.is_empty() {
+                state.visible = false;
+            }
+            Some((was_visible, set_changed))
+        })
+    });
+    let (was_visible, set_changed) = match applied {
+        Some(Some(applied)) => applied,
+        Some(None) => return,
+        None => {
+            let transition = crate::space_transition::snapshot();
+            queue_refresh_request(WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle));
+            drop(in_flight);
+            if !transition.active {
+                if let Some(pending_request) = take_pending_refresh_request() {
+                    request_window_refresh_request(pending_request);
+                }
+            }
+            return;
         }
-        let replace_pid = result.replace_pid;
-        let active_key = result.active_key;
-        // A directed refresh replaces only the target PID; cards and ordering memory for every
-        // other application remain intact.
-        let mut sorted_windows =
-            merge_refreshed_windows(&state.windows, replace_pid, result.windows);
-        sort_windows_by_mru(&mut sorted_windows, &mru, std::time::Instant::now());
-        if replace_pid.is_none() {
-            // Re-establish one frontmost representative after a full merge so an old snapshot
-            // cannot leave multiple stale is_active flags behind.
-            for window in &mut sorted_windows {
-                window.is_active = false;
-            }
-            if let Some(first) = sorted_windows.first_mut() {
-                first.is_active = true;
-            }
-        } else if let Some(active_key) = active_key {
-            for window in &mut sorted_windows {
-                window.is_active = (window.pid, window.window_id) == active_key;
-            }
-        }
-        let set_changed = replace_pid.is_some() || {
-            let old: HashSet<(i32, u32)> =
-                state.windows.iter().map(|w| (w.pid, w.window_id)).collect();
-            let new: HashSet<(i32, u32)> = sorted_windows
-                .iter()
-                .map(|w| (w.pid, w.window_id))
-                .collect();
-            old != new
-        };
-        let was_visible = state.visible;
-        let windows = if was_visible && !set_changed {
-            preserve_existing_window_order(&state.windows, sorted_windows)
-        } else {
-            sorted_windows
-        };
-        // Selection follows the target window, not the live list index:
-        // - user_picked=true (user navigated): pin to selected_target_key; reorders cannot move it.
-        // - user_picked=false (still the first-frame default): lock to the summon-time target so a
-        //   refresh doesn't re-pick just because the MRU order was bumped by the frontmost window.
-        let selected = select_index_after_refresh(
-            state.user_picked,
-            state.selected_target_key,
-            selected_key,
-            state.selected,
-            &windows,
-        );
-        // Set-level change (windows added/removed): only this needs a full overlay rebuild. A pure
-        // reorder (MRU bumped by the frontmost, surface flip) only updates data without rebuilding
-        // the list — otherwise the overlay "keeps jumping after it opened". A directed refresh
-        // (replace_pid) swapping a PID's cards also counts as a set change.
-        state.windows = windows;
-        WINDOW_COUNT.store(state.windows.len(), std::sync::atomic::Ordering::Release);
-        state.selected = selected;
-        state.mru = mru;
-        if state.windows.is_empty() {
-            state.visible = false;
-        }
-        Some((was_visible, set_changed))
-    }) else {
-        return;
     };
     // The snapshot is applied, so the flag can go: a panic in the rebuild/subscription steps
     // below can no longer wedge the pipeline.
@@ -932,6 +1035,7 @@ mod tests {
         WINDOW_REFRESH_IN_FLIGHT.store(true, Ordering::Release);
         *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
             generation,
+            space_transition_generation: 0,
             windows: Vec::new(),
             mru: HashMap::new(),
             replace_pid: None,
@@ -946,6 +1050,7 @@ mod tests {
         WINDOW_REFRESH_IN_FLIGHT.store(true, Ordering::Release);
         *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
             generation,
+            space_transition_generation: 0,
             windows: Vec::new(),
             mru: HashMap::new(),
             replace_pid: None,

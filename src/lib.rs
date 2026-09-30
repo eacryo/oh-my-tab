@@ -30,6 +30,7 @@ mod scroller;
 mod settings;
 mod single_instance;
 mod skylight;
+mod space_transition;
 mod theme;
 mod thumbnail;
 mod ui_coordinator;
@@ -424,6 +425,12 @@ fn on_global_input_drain_inner() {
 
 extern "C" fn on_app_activated(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
     callback_guard::void("on_app_activated", || on_app_activated_inner(notification));
+}
+
+extern "C" fn on_active_space_changed(_self: *mut c_void, _cmd: Sel, _notification: *mut c_void) {
+    callback_guard::void("on_active_space_changed", || {
+        window_refresh::note_space_transition(true)
+    });
 }
 
 fn on_app_activated_inner(notification: *mut c_void) {
@@ -1411,6 +1418,18 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleAppActivation:),
             on_app_activated as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleSpaceTransitionSettle:),
+            window_refresh::on_space_transition_settle as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleActiveSpaceChanged:),
+            on_active_space_changed as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -2456,6 +2475,18 @@ pub fn run() {
             object: std::ptr::null::<AnyObject>(),
         ];
         CFRelease(term_name as *const c_void);
+
+        // Space-change notifications use NSWorkspace's notification center. Collection adds a
+        // fullscreen-scoped onscreen-window flip fallback for setups where fullscreen enters omit
+        // this notification (see space_transition::SpaceFlipDetector).
+        let space_name = make_nsstring("NSWorkspaceActiveSpaceDidChangeNotification");
+        let _: () = msg_send![nc,
+            addObserver: controller,
+            selector: sel!(handleActiveSpaceChanged:),
+            name: space_name,
+            object: ws,
+        ];
+        CFRelease(space_name as *const c_void);
 
         // Listen for system language changes to live-follow when locale is auto.
         // NSLocaleCurrentLocaleDidChangeNotification is posted to the default notification center

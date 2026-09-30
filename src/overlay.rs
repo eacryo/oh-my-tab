@@ -1280,6 +1280,9 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
     // fails) and keep using the notification-driven refresh chain.
     crate::thumbnail::refresh_after_same_app_switch(pid, cgwid);
 
+    // Native-fullscreen cards have minimized=false, so they use the exact-CGWindowID SLPS raise
+    // and AXRaise backstop below. WindowServer activates the Space containing that target; only
+    // AXMinimized=true takes the restore path and skips the immediate raise.
     let fast_path_ok = if minimized {
         false
     } else {

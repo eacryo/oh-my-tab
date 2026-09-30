@@ -12,7 +12,7 @@ use objc2::sel;
 use objc2_foundation::NSRect;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 
 use crate::log_debug;
@@ -20,6 +20,13 @@ use crate::log_debug;
 static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static SMOOTH_TICKS: AtomicU64 = AtomicU64::new(0);
+static SPACE_RECOVERED_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static SPACE_GATE_REJECTED: AtomicU64 = AtomicU64::new(0);
+static SPACE_FULLSCREEN_EXEMPT: AtomicU64 = AtomicU64::new(0);
+static CURRENT_SPACE_IS_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+static SPACE_MEMBERSHIP_SOURCE: AtomicU8 = AtomicU8::new(0);
+static SPACE_IN_TRANSITION: AtomicBool = AtomicBool::new(false);
+static SPACE_TRANSITION_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 static SMOOTH_PHASES: [AtomicU64; 6] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -58,6 +65,43 @@ pub(crate) fn smooth_scroll_phase(phase: crate::mouse::smooth::engine::Phase) {
         crate::mouse::smooth::engine::Phase::MomentumEnded => 5,
     };
     SMOOTH_PHASES[index].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn space_recovered_accepted() {
+    if is_enabled() {
+        SPACE_RECOVERED_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn space_gate_rejected() {
+    if is_enabled() {
+        SPACE_GATE_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn space_fullscreen_exempt() {
+    if is_enabled() {
+        SPACE_FULLSCREEN_EXEMPT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn set_space_membership_source(skylight: bool) {
+    if is_enabled() {
+        SPACE_MEMBERSHIP_SOURCE.store(u8::from(skylight), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn set_current_space_is_fullscreen(value: bool) {
+    if is_enabled() {
+        CURRENT_SPACE_IS_FULLSCREEN.store(value, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn set_space_transition(in_transition: bool, deadline_unix_ms: u64) {
+    if is_enabled() {
+        SPACE_TRANSITION_DEADLINE_MS.store(deadline_unix_ms, Ordering::Relaxed);
+        SPACE_IN_TRANSITION.store(in_transition, Ordering::Relaxed);
+    }
 }
 
 /// Records one snapshot. Main thread only (it borrows AppState internally).
@@ -363,6 +407,29 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         SMOOTH_PHASES[3].load(Ordering::Relaxed),
         SMOOTH_PHASES[4].load(Ordering::Relaxed),
         SMOOTH_PHASES[5].load(Ordering::Relaxed),
+    ));
+    json.push_str(&format!(
+        "  \"space_filter\": {{\"recovered_accepted\": {}, \"gate_rejected\": {}, \"fullscreen_exempt\": {}}},\n",
+        SPACE_RECOVERED_ACCEPTED.load(Ordering::Relaxed),
+        SPACE_GATE_REJECTED.load(Ordering::Relaxed),
+        SPACE_FULLSCREEN_EXEMPT.load(Ordering::Relaxed),
+    ));
+    json.push_str(&format!(
+        "  \"current_space_is_fullscreen\": {},\n",
+        CURRENT_SPACE_IS_FULLSCREEN.load(Ordering::Relaxed)
+    ));
+    json.push_str(&format!(
+        "  \"membership_source\": \"{}\",\n",
+        if SPACE_MEMBERSHIP_SOURCE.load(Ordering::Relaxed) == 1 {
+            "skylight"
+        } else {
+            "legacy"
+        }
+    ));
+    json.push_str(&format!(
+        "  \"space_transition\": {{\"in_transition\": {}, \"deadline_ms\": {}}},\n",
+        SPACE_IN_TRANSITION.load(Ordering::Relaxed),
+        SPACE_TRANSITION_DEADLINE_MS.load(Ordering::Relaxed),
     ));
     json.push_str(&format!("  \"selected_index\": {},\n", snapshot.selected));
     json.push_str(&format!("  \"cards_count\": {},\n", snapshot.windows.len()));

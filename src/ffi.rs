@@ -43,11 +43,20 @@ extern "C" {
     /// AXUIElement -- the private `_AXUIElementGetWindow` validates nothing.
     pub(crate) fn CFGetTypeID(cf: *const c_void) -> usize;
     pub(crate) fn CFArrayGetTypeID() -> usize;
+    pub(crate) fn CFDictionaryGetTypeID() -> usize;
+    pub(crate) fn CFDictionaryGetCount(dict: *const c_void) -> isize;
+    pub(crate) fn CFNumberGetTypeID() -> usize;
+    pub(crate) fn CFStringGetTypeID() -> usize;
     pub(crate) fn AXUIElementGetTypeID() -> usize;
     pub(crate) fn AXValueGetTypeID() -> usize;
     /// The AXValue's concrete type; kAXValueAXErrorType = 5 marks an error placeholder slot.
     pub(crate) fn AXValueGetType(value: *const c_void) -> i32;
     pub(crate) fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    pub(crate) fn CFDictionaryGetKeysAndValues(
+        dict: *const c_void,
+        keys: *mut *const c_void,
+        values: *mut *const c_void,
+    );
     pub(crate) fn CFNumberCreate(
         alloc: *const c_void,
         number_type: isize,
@@ -67,6 +76,7 @@ extern "C" {
     ) -> bool;
     /// CFString value comparison: 0 when equal (kCFCompareEqualTo).
     pub(crate) fn CFStringCompare(a: *const c_void, b: *const c_void, options: usize) -> isize;
+    pub(crate) fn CFUUIDCreateString(alloc: *const c_void, uuid: *const c_void) -> *const c_void;
     pub(crate) static kCFBooleanFalse: *const c_void;
     pub(crate) static kCFBooleanTrue: *const c_void;
 
@@ -170,6 +180,14 @@ extern "C" {
     fn CGWindowLevelForKey(key: i32) -> i32;
     pub(crate) fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32)
         -> *const c_void;
+    pub(crate) fn CGGetActiveDisplayList(
+        max_displays: u32,
+        active_displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
+    pub(crate) fn CGDisplayBounds(display: u32) -> CGRect;
+    pub(crate) fn CGMainDisplayID() -> u32;
+    pub(crate) fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> *const c_void;
 
     pub(crate) fn CGPreflightScreenCaptureAccess() -> bool;
     pub(crate) fn CGRequestScreenCaptureAccess() -> bool;

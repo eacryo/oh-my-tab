@@ -15,8 +15,8 @@ use crate::ffi::{
     AXUIElementSetMessagingTimeout, AXValueGetType, AXValueGetTypeID, CFArrayCreate,
     CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFBooleanGetValue,
     CFDictionaryGetValue, CFGetTypeID, CFNumberGetValue, CFRelease, CFRetain,
-    CFStringCreateWithCString, CFStringGetCString, CGWindowListCopyWindowInfo,
-    K_AX_CANNOT_COMPLETE, K_AX_INVALID_UI_ELEMENT, K_AX_SUCCESS,
+    CFStringCreateWithCString, CFStringGetCString, CGDisplayBounds, CGGetActiveDisplayList,
+    CGWindowListCopyWindowInfo, K_AX_CANNOT_COMPLETE, K_AX_INVALID_UI_ELEMENT, K_AX_SUCCESS,
 };
 #[cfg(test)]
 use crate::hash::fnv1a64_hex;
@@ -27,6 +27,8 @@ use crate::{log_debug, log_info};
 mod collect;
 mod raise;
 mod raiser;
+#[path = "window_collector/skylight.rs"]
+mod space_membership;
 // The parent no longer calls collect directly; the glob is test-only.
 #[cfg(test)]
 use collect::*;
@@ -411,17 +413,16 @@ struct AxWindowInfo {
     title: String,
     minimized: bool,
     is_main: bool,
-    is_fullscreen: bool,
+    /// Positive AXSubrole/AXFullScreen evidence; false or unavailable still permits the CG bounds fallback.
+    is_fullscreen: Option<bool>,
     is_custom_root: bool,
     /// The native tab bar this window exposes (only the selected tab's window has one), used by
     /// collect::fold_tab_group to identify the group's windows.
     tab_group: Option<TabGroupInfo>,
     /// Whether this entry came ONLY from the kAXFocusedWindow/kAXMainWindow slots (absent from
-    /// kAXWindows). Those slots are not Space-filtered, so they are the only lead for an app
-    /// whose windows all live on another Space (every background app under a native fullscreen
-    /// Space) -- but they also hand over helper processes' overlays and child surfaces, so such
-    /// entries are usable only once the batch is confirmed to be in that shape, and only when
-    /// the window looks like a real one.
+    /// kAXWindows). Those slots can discover an app window even when its window list is empty;
+    /// normal identity, size, activatable-process, and Space-membership filters decide whether it
+    /// is published because the slots can also hand over helper overlays and child surfaces.
     only_via_key_or_main: bool,
 }
 
@@ -537,6 +538,11 @@ mod tests {
             false
         ));
         assert!(ax_subrole_kept(
+            Some("AXFullScreen"),
+            Some("AXWindow"),
+            false
+        ));
+        assert!(ax_subrole_kept(
             Some("AXStandardWindow"),
             Some("AXWindow"),
             true
@@ -553,6 +559,32 @@ mod tests {
         assert!(!ax_subrole_kept(Some("AXDrawer"), Some("AXWindow"), true));
         // Missing subrole (some apps don't set it) -> standard.
         assert!(ax_subrole_kept(None, None, false));
+    }
+
+    #[test]
+    fn ax_fullscreen_detection_preserves_unknown_state_for_bounds_fallback() {
+        use super::ax_fullscreen_from_attributes;
+        assert_eq!(
+            ax_fullscreen_from_attributes(Some("AXFullScreen"), None),
+            Some(true)
+        );
+        assert_eq!(
+            ax_fullscreen_from_attributes(Some("AXStandardWindow"), None),
+            Some(false)
+        );
+        assert_eq!(ax_fullscreen_from_attributes(None, None), None);
+        assert_eq!(
+            ax_fullscreen_from_attributes(Some("AXStandardWindow"), Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            ax_fullscreen_from_attributes(Some("AXFullScreen"), Some(false)),
+            Some(true)
+        );
+        assert_eq!(
+            ax_fullscreen_from_attributes(Some("AXStandardWindow"), Some(false)),
+            Some(false)
+        );
     }
 
     #[test]
@@ -619,8 +651,8 @@ mod tests {
     fn candidate_window_elements_survive_an_empty_published_list() {
         // An empty array is not "no windows": kAXWindows answers empty when every window lives
         // on another Space while focused/main still hand the window over, so returning early on
-        // empty would drop exactly the evidence that recovers it. Recovered entries carry a mark
-        // so callers can use them only once degradation is confirmed.
+        // empty would drop exactly the evidence that discovers it. Recovered entries carry a mark
+        // so callers can apply the normal discovery and Space-membership filters before publish.
         assert_eq!(
             candidate_window_elements(&[], Some((7, 'k')), None),
             vec![(7, 'k', true)]
@@ -658,7 +690,7 @@ mod tests {
                 title: title.to_string(),
                 minimized: false,
                 is_main: false,
-                is_fullscreen: false,
+                is_fullscreen: Some(false),
                 is_custom_root: false,
                 only_via_key_or_main: false,
                 tab_group: None,
@@ -669,35 +701,6 @@ mod tests {
         assert!(!windows_are_all_untitled(&[info(""), info("title")]));
         // Seeing no windows is not the same as untitled windows: an empty set gets no exemption.
         assert!(!windows_are_all_untitled(&[]));
-    }
-
-    #[test]
-    fn ax_degradation_ignores_helper_processes_without_real_windows() {
-        // Only apps that DO have a real-looking CG window count as degradation evidence: helper
-        // processes (cursor overlays, bar surfaces) never had AX windows, and must not trip it.
-        let empty: HashSet<i32> = [1, 2, 3, 4].into_iter().collect();
-        let windows = [
-            (1, 0, (0.0, 0.0, 900.0, 600.0)),   // real window
-            (2, 0, (0.0, 0.0, 64.0, 64.0)),     // cursor overlay
-            (3, 0, (0.0, 0.0, 1470.0, 33.0)),   // bar surface
-            (4, 101, (0.0, 0.0, 900.0, 600.0)), // non-zero layer
-            (9, 0, (0.0, 0.0, 900.0, 600.0)),   // app that answered
-        ];
-        assert_eq!(pids_with_real_window(windows, &empty), HashSet::from([1]));
-    }
-
-    #[test]
-    fn ax_degradation_needs_several_empty_apps_without_a_windowed_majority() {
-        // Everyday case: a few apps returning nothing (invisible anchor windows) is not degradation, so
-        // "skip the whole app" still stands.
-        assert!(!ax_batch_looks_degraded(1, 20));
-        assert!(!ax_batch_looks_degraded(2, 2));
-        // Native fullscreen Space: apps that do have CG windows return nothing in bulk.
-        assert!(ax_batch_looks_degraded(20, 0));
-        assert!(ax_batch_looks_degraded(3, 3));
-        // Only a minority returned nothing -> not degradation.
-        assert!(!ax_batch_looks_degraded(3, 10));
-        assert!(!ax_batch_looks_degraded(0, 0));
     }
 
     #[test]

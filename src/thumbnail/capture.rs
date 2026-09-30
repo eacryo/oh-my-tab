@@ -227,6 +227,7 @@ enum CaptureJobResult {
     Finished,
     BlankRetryScheduled,
     GeometryDeferred,
+    SpaceTransitionDeferred(Instant),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -479,6 +480,39 @@ impl CaptureState {
         job: CaptureJob,
         now: Instant,
     ) -> GeometryDeferResult {
+        let started_at = self
+            .desired
+            .get(&job.key)
+            .and_then(|pending| pending.geometry_retry_started_at)
+            .unwrap_or(now);
+        let attempt = self
+            .desired
+            .get(&job.key)
+            .map_or(0, |pending| pending.geometry_retry_attempts);
+        self.defer_transition_until(job, now, now + geometry_retry_delay(attempt), started_at)
+    }
+
+    pub(super) fn defer_space_transition(
+        &mut self,
+        job: CaptureJob,
+        now: Instant,
+        deadline: Instant,
+    ) -> GeometryDeferResult {
+        let started_at = self
+            .desired
+            .get(&job.key)
+            .and_then(|pending| pending.geometry_retry_started_at)
+            .unwrap_or(now);
+        self.defer_transition_until(job, now, deadline.max(now), started_at)
+    }
+
+    fn defer_transition_until(
+        &mut self,
+        job: CaptureJob,
+        now: Instant,
+        deadline: Instant,
+        started_at: Instant,
+    ) -> GeometryDeferResult {
         if !self.is_current(job) {
             return GeometryDeferResult::Stale;
         }
@@ -490,7 +524,7 @@ impl CaptureState {
         }
         // Restore only the same live job during a geometry transition; a token or generation
         // mismatch must never resurrect stale or cancelled work.
-        let started_at = *pending.geometry_retry_started_at.get_or_insert(now);
+        pending.geometry_retry_started_at.get_or_insert(started_at);
         if pending.geometry_retry_attempts >= GEOMETRY_RETRY_MAX_ATTEMPTS
             || now.duration_since(started_at) >= GEOMETRY_RETRY_BUDGET
         {
@@ -499,7 +533,6 @@ impl CaptureState {
         }
         let attempt = pending.geometry_retry_attempts;
         pending.geometry_retry_attempts += 1;
-        let deadline = now + geometry_retry_delay(attempt);
         pending.running = false;
         pending.geometry_retry_not_before = Some(deadline);
         pending.ready_since = deadline;
@@ -599,7 +632,7 @@ pub(super) static CAPTURE_STATE: LazyLock<Mutex<CaptureState>> =
 static JOB_TX: OnceLock<flume::Sender<()>> = OnceLock::new();
 static THUMB_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static THUMB_INTERACTION_DEFERRED: AtomicU64 = AtomicU64::new(0);
-static THUMB_GEOMETRY_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static THUMB_TRANSITION_DEFERRED: AtomicU64 = AtomicU64::new(0);
 static THUMB_GEOMETRY_RETRY_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 static THUMB_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static THUMB_CAPTURE_FAILED: AtomicU64 = AtomicU64::new(0);
@@ -1023,7 +1056,7 @@ pub(crate) fn log_capture_metrics(context: &str) {
     let avg_queue_ms = queue_total.checked_div(queue_samples.max(1)).unwrap_or(0);
     let avg_capture_ms = capture_total.checked_div(completed.max(1)).unwrap_or(0);
     log_debug!(
-        "[perf] thumbnail metrics context={} enqueued={} completed={} failed={} geometry_rejected={} geometry_too_small={} geometry_source_aspect={} geometry_expected_aspect={} queue_samples={} interaction_deferred={} geometry_deferred={} geometry_retry_exhausted={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
+        "[perf] thumbnail metrics context={} enqueued={} completed={} failed={} geometry_rejected={} geometry_too_small={} geometry_source_aspect={} geometry_expected_aspect={} queue_samples={} interaction_deferred={} transition_deferred={} transition_retry_exhausted={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
         context,
         enqueued,
         completed,
@@ -1034,7 +1067,7 @@ pub(crate) fn log_capture_metrics(context: &str) {
         THUMB_GEOMETRY_EXPECTED_ASPECT.load(Ordering::Relaxed),
         queue_samples,
         THUMB_INTERACTION_DEFERRED.load(Ordering::Relaxed),
-        THUMB_GEOMETRY_DEFERRED.load(Ordering::Relaxed),
+        THUMB_TRANSITION_DEFERRED.load(Ordering::Relaxed),
         THUMB_GEOMETRY_RETRY_EXHAUSTED.load(Ordering::Relaxed),
         avg_queue_ms,
         THUMB_QUEUE_MAX_MS.load(Ordering::Relaxed),
@@ -1552,19 +1585,34 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                                 // completed job so a merged follow-up cannot release that slot.
                                 state.clear_blank_retry_marker(job);
                             }
-                            CaptureJobResult::GeometryDeferred => {
-                                let result = CAPTURE_STATE.lock().unwrap().defer_geometry_transition(
-                                    job,
-                                    Instant::now(),
+                            deferred @ (CaptureJobResult::GeometryDeferred
+                            | CaptureJobResult::SpaceTransitionDeferred(_)) => {
+                                let space_transition_deferred = matches!(
+                                    deferred,
+                                    CaptureJobResult::SpaceTransitionDeferred(_)
                                 );
+                                let now = Instant::now();
+                                let result = {
+                                    let mut state = CAPTURE_STATE.lock().unwrap();
+                                    match deferred {
+                                        CaptureJobResult::SpaceTransitionDeferred(deadline) => {
+                                            state.defer_space_transition(job, now, deadline)
+                                        }
+                                        CaptureJobResult::GeometryDeferred => {
+                                            state.defer_geometry_transition(job, now)
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                };
                                 match result {
                                     GeometryDeferResult::Deferred(deadline) => {
-                                        let deferred = THUMB_GEOMETRY_DEFERRED
+                                        let deferred = THUMB_TRANSITION_DEFERRED
                                             .fetch_add(1, Ordering::Relaxed)
                                             + 1;
                                         if deferred == 1 || deferred.is_multiple_of(16) {
                                             log_debug!(
-                                                "[geometry-transition] thumbnail capture deferred during WindowServer geometry transition count={} retry_attempt={}",
+                                                "[capture-transition] thumbnail capture deferred reason={} count={} retry_attempt={}",
+                                                if space_transition_deferred { "space-settle" } else { "window-server-geometry" },
                                                 deferred,
                                                 deadline.attempt
                                             );
@@ -1578,7 +1626,7 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                                                 PENDING_BLANK_RETRIES.lock().unwrap().remove(&job.key);
                                             }
                                             log_debug!(
-                                                "[geometry-transition] retry scheduling failed pid={} wid={} deferred_job_removed={}",
+                                                "[capture-transition] retry scheduling failed pid={} wid={} deferred_job_removed={}",
                                                 job.key.pid,
                                                 job.key.wid,
                                                 removed
@@ -1598,7 +1646,7 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                                             .fetch_add(1, Ordering::Relaxed)
                                             + 1;
                                         log_debug!(
-                                            "[geometry-transition] thumbnail capture retry budget exhausted pid={} wid={} elapsed_ms={} count={}",
+                                            "[capture-transition] thumbnail capture retry budget exhausted pid={} wid={} elapsed_ms={} count={}",
                                             job.key.pid,
                                             job.key.wid,
                                             job.enqueued_at.elapsed().as_millis(),
@@ -1615,7 +1663,7 @@ fn ensure_capture_worker() -> &'static flume::Sender<()> {
                                             PENDING_BLANK_RETRIES.lock().unwrap().remove(&job.key);
                                         }
                                         log_debug!(
-                                            "[geometry-transition] stale deferred thumbnail job dropped pid={} wid={}",
+                                            "[capture-transition] stale deferred thumbnail job dropped pid={} wid={}",
                                             job.key.pid,
                                             job.key.wid
                                         );
@@ -1681,6 +1729,14 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
             return CaptureJobResult::Finished;
         }
     }
+    let space_transition_at_start = crate::space_transition::snapshot();
+    if space_transition_at_start.active {
+        return CaptureJobResult::SpaceTransitionDeferred(
+            space_transition_at_start
+                .deadline
+                .unwrap_or_else(|| Instant::now() + Duration::from_millis(20)),
+        );
+    }
     // Probe again immediately before capture to cover the race between job selection
     // and the WindowServer call when the animation starts.
     let geometry = window_server_geometry_transition_snapshot();
@@ -1742,6 +1798,19 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         );
         return CaptureJobResult::Finished;
     };
+    let space_transition_after_capture = crate::space_transition::snapshot();
+    if space_transition_after_capture.active
+        || space_transition_after_capture.generation != space_transition_at_start.generation
+    {
+        unsafe {
+            CFRelease(captured.thumb.img);
+        }
+        return CaptureJobResult::SpaceTransitionDeferred(
+            space_transition_after_capture
+                .deadline
+                .unwrap_or_else(|| Instant::now() + Duration::from_millis(20)),
+        );
+    }
     log_debug!(
         "[thumb] capture result pid={} wid={} source={}x{} cached={}x{} target_h={} priority={}",
         key.pid,
@@ -1857,30 +1926,61 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
     // Validate lifecycle and write the cache while holding CAPTURE_STATE. Termination
     // takes the same lock before cancellation/cache eviction, so a result cannot be
     // inserted again after removal.
-    let mut state = CAPTURE_STATE.lock().unwrap();
-    if !state.is_current(job) {
-        unsafe {
-            CFRelease(captured.thumb.img);
+    let mut thumb_to_store = Some(captured.thumb);
+    let stored =
+        crate::space_transition::while_stable(space_transition_at_start.generation, || {
+            let mut state = CAPTURE_STATE.lock().unwrap();
+            if !state.is_current(job) {
+                return false;
+            }
+            // Only a task carrying the explicit blank_retry ownership marker may release the slot;
+            // an ordinary activation task must not clear another task's slot.
+            if job.blank_retry {
+                PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
+                state.clear_blank_retry_marker(job);
+            }
+            cache_store(
+                key.pid,
+                key.wid,
+                thumb_to_store
+                    .take()
+                    .expect("captured thumbnail is stored once"),
+            );
+            if job.priority == CapturePriority::FocusedPrewarm {
+                note_focused_prewarm_success(key);
+            }
+            true
+        });
+    match stored {
+        None => {
+            if let Some(thumb) = thumb_to_store.take() {
+                unsafe {
+                    CFRelease(thumb.img);
+                }
+            }
+            let transition = crate::space_transition::snapshot();
+            return CaptureJobResult::SpaceTransitionDeferred(
+                transition
+                    .deadline
+                    .unwrap_or_else(|| Instant::now() + Duration::from_millis(20)),
+            );
         }
-        log_debug!(
-            "[thumb] captured result discarded stale pid={} wid={} priority={}",
-            key.pid,
-            key.wid,
-            job.priority.label()
-        );
-        return CaptureJobResult::Finished;
+        Some(false) => {
+            if let Some(thumb) = thumb_to_store.take() {
+                unsafe {
+                    CFRelease(thumb.img);
+                }
+            }
+            log_debug!(
+                "[thumb] captured result discarded stale pid={} wid={} priority={}",
+                key.pid,
+                key.wid,
+                job.priority.label()
+            );
+            return CaptureJobResult::Finished;
+        }
+        Some(true) => {}
     }
-    // Only a task carrying the explicit blank_retry ownership marker may release the slot;
-    // an ordinary activation task must not clear another task's slot.
-    if job.blank_retry {
-        PENDING_BLANK_RETRIES.lock().unwrap().remove(&key);
-        state.clear_blank_retry_marker(job);
-    }
-    cache_store(key.pid, key.wid, captured.thumb);
-    if job.priority == CapturePriority::FocusedPrewarm {
-        note_focused_prewarm_success(key);
-    }
-    drop(state);
     // Do not decide delivery from the request source: startup pre-generation may
     // also finish after the overlay has opened.
     // Let the main thread validate visibility and card membership. The capture worker no longer

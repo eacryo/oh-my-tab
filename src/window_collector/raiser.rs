@@ -403,55 +403,174 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
         CFRelease(element);
     }
 
-    let windows_key = cf_string_new("AXWindows");
-    let mut windows_array: *const c_void = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
-    CFRelease(windows_key);
-    if err != K_AX_SUCCESS || windows_array.is_null() {
-        CFRelease(raise_key);
-        CFRelease(focused_key);
-        if let Some(minimized_key) = minimized_key {
-            CFRelease(minimized_key);
+    // Read the same three app-level slots as collection: AXWindows is Space-filtered, while
+    // AXFocusedWindow and AXMainWindow can still identify a window on another Space.
+    let lookup_keys = [
+        cf_string_new("AXWindows"),
+        cf_string_new("AXFocusedWindow"),
+        cf_string_new("AXMainWindow"),
+    ];
+    let lookup_keys_array = CFArrayCreate(
+        std::ptr::null(),
+        lookup_keys.as_ptr(),
+        lookup_keys.len() as isize,
+        std::ptr::null(),
+    );
+    let mut lookup_slots: *const c_void = std::ptr::null();
+    let ax_query_err = if lookup_keys_array.is_null() {
+        -1
+    } else {
+        let result =
+            AXUIElementCopyMultipleAttributeValues(app, lookup_keys_array, 0, &mut lookup_slots);
+        CFRelease(lookup_keys_array);
+        result
+    };
+    for key in lookup_keys {
+        if !key.is_null() {
+            CFRelease(key);
         }
-        CFRelease(app);
-        log_info!(
-            "[raise] ax NO MATCH: pid={} cgwid={} ax_query_err={} waited={}ms",
-            job.pid,
-            job.cgwid,
-            err,
-            job.enqueued_at.elapsed().as_millis()
-        );
-        return;
     }
-    let count = CFArrayGetCount(windows_array);
-    let mut matched = false;
-    let mut superseded = false;
-    for i in 0..count {
-        let element = CFArrayGetValueAtIndex(windows_array, i);
-        if element.is_null() {
-            continue;
-        }
-        // Same as the collection path: window elements do not inherit the app element's timeout,
-        // so set it per element or the match loop waits out the system default on each attribute
-        // read against an unresponsive app.
-        AXUIElementSetMessagingTimeout(element, AX_RAISE_MESSAGING_TIMEOUT);
-        if ax_window_cgwid(element) == Some(job.cgwid) {
-            // Final supersede gate right before applying: if a newer switch arrived during
-            // enumeration, drop this job entirely (stale match) and let the new one run.
-            if !raise_intent_current(job.generation) {
-                superseded = true;
-                log_debug!(
-                    "[raise] ax superseded before apply: pid={} cgwid={} gen={}",
-                    job.pid,
-                    job.cgwid,
-                    job.generation
-                );
-                break;
+
+    let windows_array = if ax_query_err == K_AX_SUCCESS {
+        ax_slot_value(lookup_slots, 0).filter(|value| CFGetTypeID(*value) == CFArrayGetTypeID())
+    } else {
+        None
+    };
+    let ax_window_count = if ax_query_err == K_AX_SUCCESS {
+        windows_array.map_or(0, |array| CFArrayGetCount(array))
+    } else {
+        -1
+    };
+    let mut published = Vec::new();
+    if let Some(array) = windows_array {
+        for index in 0..CFArrayGetCount(array) {
+            let element = CFArrayGetValueAtIndex(array, index);
+            if !element.is_null() {
+                published.push((ax_window_cgwid(element).unwrap_or(0), element));
             }
-            // Refresh the cache with the live element so the next switch skips enumeration.
+        }
+    }
+    let focused_window = ax_slot_value(lookup_slots, 1)
+        .filter(|element| CFGetTypeID(*element) == AXUIElementGetTypeID())
+        .map(|element| (ax_window_cgwid(element).unwrap_or(0), element));
+    let main_window = ax_slot_value(lookup_slots, 2)
+        .filter(|element| CFGetTypeID(*element) == AXUIElementGetTypeID())
+        .map(|element| (ax_window_cgwid(element).unwrap_or(0), element));
+    let candidates = candidate_window_elements(&published, focused_window, main_window);
+    let ax_window_ids = candidates
+        .iter()
+        .filter_map(|(cgwid, _, only_from_slots)| (!only_from_slots).then_some(*cgwid))
+        .collect::<Vec<_>>();
+    let key_main_ids = candidates
+        .iter()
+        .filter_map(|(cgwid, _, only_from_slots)| (*only_from_slots).then_some(*cgwid))
+        .collect::<Vec<_>>();
+
+    let mut fullscreen_candidates = Vec::new();
+    let mut fullscreen_elements = Vec::new();
+    let mut selected_source = raise_match_source(
+        job.cgwid,
+        &ax_window_ids,
+        &key_main_ids,
+        &fullscreen_candidates,
+    );
+    let mut selected_element = selected_source.and_then(|source| {
+        candidates
+            .iter()
+            .find(|(cgwid, _, only_from_slots)| {
+                *cgwid == job.cgwid
+                    && match source {
+                        RaiseMatchSource::AxWindows => !only_from_slots,
+                        RaiseMatchSource::KeyMainSlot => *only_from_slots,
+                        RaiseMatchSource::FullscreenSubrole => false,
+                    }
+            })
+            .map(|(_, element, _)| *element)
+    });
+
+    // If neither app list nor key/main names the target, inspect app children for fullscreen
+    // window candidates before reporting that no AX element can be matched.
+    let mut children_array: *const c_void = std::ptr::null();
+    let mut children_key = std::ptr::null();
+    if selected_element.is_none() {
+        children_key = cf_string_new("AXChildren");
+        if !children_key.is_null()
+            && AXUIElementCopyAttributeValue(app, children_key, &mut children_array) == K_AX_SUCCESS
+            && !children_array.is_null()
+            && CFGetTypeID(children_array) == CFArrayGetTypeID()
+        {
+            let subrole_key = cf_string_new("AXSubrole");
+            if !subrole_key.is_null() {
+                for index in 0..CFArrayGetCount(children_array) {
+                    let element = CFArrayGetValueAtIndex(children_array, index);
+                    if element.is_null() || CFGetTypeID(element) != AXUIElementGetTypeID() {
+                        continue;
+                    }
+                    AXUIElementSetMessagingTimeout(element, AX_RAISE_MESSAGING_TIMEOUT);
+                    let subrole = read_ax_subrole(element, subrole_key);
+                    if ax_fullscreen_from_attributes(subrole.as_deref(), None) != Some(true) {
+                        continue;
+                    }
+                    if let Some(cgwid) = ax_window_cgwid(element) {
+                        fullscreen_candidates.push(cgwid);
+                        fullscreen_elements.push((cgwid, element));
+                    }
+                }
+                CFRelease(subrole_key);
+            }
+            selected_source = raise_match_source(
+                job.cgwid,
+                &ax_window_ids,
+                &key_main_ids,
+                &fullscreen_candidates,
+            );
+            if selected_source == Some(RaiseMatchSource::FullscreenSubrole) {
+                selected_element = fullscreen_elements
+                    .iter()
+                    .find_map(|(cgwid, element)| (*cgwid == job.cgwid).then_some(*element));
+            }
+        }
+    }
+    if !children_key.is_null() {
+        CFRelease(children_key);
+    }
+
+    let mut superseded = false;
+    if let (Some(source), Some(element)) = (selected_source, selected_element) {
+        // Final supersede gate right before applying: if a newer switch arrived during
+        // enumeration, drop this job entirely (stale match) and let the new one run.
+        if !raise_intent_current(job.generation) {
+            superseded = true;
+            log_debug!(
+                "[raise] ax superseded before apply: pid={} cgwid={} gen={}",
+                job.pid,
+                job.cgwid,
+                job.generation
+            );
+        } else {
+            let matched_subrole_key = cf_string_new("AXSubrole");
+            let matched_is_fullscreen = if matched_subrole_key.is_null() {
+                false
+            } else {
+                AXUIElementSetMessagingTimeout(element, AX_RAISE_MESSAGING_TIMEOUT);
+                let subrole = read_ax_subrole(element, matched_subrole_key);
+                CFRelease(matched_subrole_key);
+                ax_fullscreen_from_attributes(subrole.as_deref(), None) == Some(true)
+            };
+            match source {
+                RaiseMatchSource::AxWindows => {}
+                RaiseMatchSource::KeyMainSlot => log_debug!(
+                    "[raise] ax matched via key/main slot: pid={} cgwid={}",
+                    job.pid,
+                    job.cgwid
+                ),
+                RaiseMatchSource::FullscreenSubrole => log_debug!(
+                    "[raise] ax matched via fullscreen subrole: pid={} cgwid={}",
+                    job.pid,
+                    job.cgwid
+                ),
+            }
             cache_ax_window_element(job.pid, process_start_time_us, job.cgwid, element);
-            // Unminimize is an AX mutation and is performed by the main-thread queue below.
-            let minimized_set_err: Option<AXError> = None;
             let (raise_first_err, focused_set_err, raise_retry_err) = raise_ax_element(
                 job.pid,
                 job.cgwid,
@@ -463,14 +582,14 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
                 force_ax_focus,
                 job.generation,
             );
-            matched = true;
             log_debug!(
-                "[raise] ax raised refreshed: pid={} cgwid={} ax_windows={} known_minimized={} set_minimized={:?} raise_first={} set_focused={:?} raise_retry={:?} app_create_us={} waited={}ms total={}ms",
+                "[raise] ax raised refreshed: pid={} cgwid={} source={:?} fullscreen_subrole={} ax_windows={} known_minimized={} raise_first={} set_focused={:?} raise_retry={:?} app_create_us={} waited={}ms total={}ms",
                 job.pid,
                 job.cgwid,
-                count,
+                source,
+                matched_is_fullscreen,
+                ax_window_count,
                 job.minimized,
-                minimized_set_err,
                 raise_first_err,
                 focused_set_err,
                 raise_retry_err,
@@ -478,25 +597,32 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
                 job.enqueued_at.elapsed().as_millis(),
                 started.elapsed().as_millis()
             );
-            break;
         }
     }
-    if !matched && !superseded {
+    if selected_element.is_none() && !superseded {
         log_info!(
-            "[raise] ax NO MATCH: pid={} cgwid={} ax_windows={} waited={}ms total={}ms",
+            "[raise] ax NO MATCH: pid={} cgwid={} ax_windows={} ax_query_err={} waited={}ms total={}ms",
             job.pid,
             job.cgwid,
-            count,
+            ax_window_count,
+            ax_query_err,
             job.enqueued_at.elapsed().as_millis(),
             started.elapsed().as_millis()
         );
+    }
+    if !lookup_slots.is_null() {
+        CFRelease(lookup_slots);
+    }
+    // The matched AXUIElement may be borrowed from this array; keep it alive until the cache
+    // and queued main-thread raise have taken their own retains.
+    if !children_array.is_null() {
+        CFRelease(children_array);
     }
     CFRelease(raise_key);
     CFRelease(focused_key);
     if let Some(minimized_key) = minimized_key {
         CFRelease(minimized_key);
     }
-    CFRelease(windows_array);
     CFRelease(app);
 }
 
@@ -551,12 +677,78 @@ unsafe fn raise_ax_element(
 pub(super) fn ax_subrole_kept(subrole: Option<&str>, role: Option<&str>, titled: bool) -> bool {
     match subrole {
         Some("AXStandardWindow") => true,
+        Some("AXFullScreen") => true,
         Some("AXDialog") => titled,
         Some("AXUnknown") => role == Some("AXWindow") && titled,
         Some(_) => false,
         // A missing subrole counts as standard (some apps don't set it).
         None => true,
     }
+}
+
+/// Either AX signal may be affirmative; retain unknown only when both signals are unavailable.
+pub(super) fn ax_fullscreen_from_attributes(
+    subrole: Option<&str>,
+    fullscreen_attribute: Option<bool>,
+) -> Option<bool> {
+    if subrole == Some("AXFullScreen") || fullscreen_attribute == Some(true) {
+        Some(true)
+    } else if subrole.is_some() || fullscreen_attribute.is_some() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RaiseMatchSource {
+    AxWindows,
+    KeyMainSlot,
+    FullscreenSubrole,
+}
+
+fn raise_match_source(
+    target_cgwid: u32,
+    ax_windows: &[u32],
+    key_main_slots: &[u32],
+    fullscreen_candidates: &[u32],
+) -> Option<RaiseMatchSource> {
+    if ax_windows.contains(&target_cgwid) {
+        Some(RaiseMatchSource::AxWindows)
+    } else if key_main_slots.contains(&target_cgwid) {
+        Some(RaiseMatchSource::KeyMainSlot)
+    } else if fullscreen_candidates.contains(&target_cgwid) {
+        Some(RaiseMatchSource::FullscreenSubrole)
+    } else {
+        None
+    }
+}
+
+unsafe fn read_ax_subrole(element: AXUIElementRef, subrole_key: *const c_void) -> Option<String> {
+    let mut value: *const c_void = std::ptr::null();
+    if AXUIElementCopyAttributeValue(element, subrole_key, &mut value) == K_AX_SUCCESS
+        && !value.is_null()
+    {
+        let subrole = cf_to_rust_string(value);
+        CFRelease(value);
+        subrole
+    } else {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        None
+    }
+}
+
+unsafe fn ax_boolean_attribute(element: AXUIElementRef, key: *const c_void) -> Option<bool> {
+    let mut value: *const c_void = std::ptr::null();
+    let result = AXUIElementCopyAttributeValue(element, key, &mut value);
+    if value.is_null() {
+        return None;
+    }
+    let boolean = (result == K_AX_SUCCESS).then(|| CFBooleanGetValue(value));
+    CFRelease(value);
+    boolean
 }
 
 // The substantial custom-window boundary. Standard windows and titled dialogs do not use this
@@ -601,6 +793,7 @@ pub(super) fn remember_non_normal_cg_windows(
     cg_window_layers: &HashMap<(i32, u32), i32>,
     identities: &HashMap<i32, AppIdentity>,
     ax_windows: &HashMap<i32, HashMap<u32, AxWindowInfo>>,
+    native_fullscreen_windows: &HashSet<(i32, u32)>,
     parent_ids: &HashMap<u32, u32>,
 ) {
     for (&(pid, cgwid), &layer) in cg_window_layers {
@@ -610,7 +803,8 @@ pub(super) fn remember_non_normal_cg_windows(
         let is_main_or_fullscreen = ax_windows
             .get(&pid)
             .and_then(|windows| windows.get(&cgwid))
-            .is_some_and(|window| window.is_main || window.is_fullscreen);
+            .is_some_and(|window| window.is_main || window.is_fullscreen == Some(true))
+            || native_fullscreen_windows.contains(&(pid, cgwid));
         if layer != 0 && !is_main_or_fullscreen {
             let process_start_time_us = identities
                 .get(&pid)
@@ -625,6 +819,7 @@ pub(super) fn remember_non_normal_cg_windows_for_process(
     process_start_time_us: Option<u64>,
     cg_window_layers: &HashMap<u32, i32>,
     ax_windows: &HashMap<u32, AxWindowInfo>,
+    native_fullscreen_windows: &HashSet<u32>,
     parent_ids: &HashMap<u32, u32>,
 ) {
     for (&cgwid, &layer) in cg_window_layers {
@@ -633,7 +828,8 @@ pub(super) fn remember_non_normal_cg_windows_for_process(
         }
         let is_main_or_fullscreen = ax_windows
             .get(&cgwid)
-            .is_some_and(|window| window.is_main || window.is_fullscreen);
+            .is_some_and(|window| window.is_main || window.is_fullscreen == Some(true))
+            || native_fullscreen_windows.contains(&cgwid);
         if layer != 0 && !is_main_or_fullscreen {
             remember_non_normal_window(pid, process_start_time_us, cgwid);
         }
@@ -910,8 +1106,8 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         let role_key = cf_string_new("AXRole");
         let subrole_key = cf_string_new("AXSubrole");
         let minimized_key = cf_string_new("AXMinimized");
-        let main_key = cf_string_new("AXMain");
         let fullscreen_key = cf_string_new("AXFullScreen");
+        let main_key = cf_string_new("AXMain");
         let mut results = Vec::with_capacity(candidates.len());
 
         for (cgwid, element, only_via_key_or_main) in candidates {
@@ -1018,19 +1214,9 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                     false
                 }
             };
-            let is_fullscreen = {
-                let mut fullscreen_value: *const c_void = std::ptr::null();
-                if AXUIElementCopyAttributeValue(element, fullscreen_key, &mut fullscreen_value)
-                    == K_AX_SUCCESS
-                    && !fullscreen_value.is_null()
-                {
-                    let value = CFBooleanGetValue(fullscreen_value);
-                    CFRelease(fullscreen_value);
-                    value
-                } else {
-                    false
-                }
-            };
+            let fullscreen_attribute = ax_boolean_attribute(element, fullscreen_key);
+            let is_fullscreen =
+                ax_fullscreen_from_attributes(subrole.as_deref(), fullscreen_attribute);
             // cgwid was resolved while merging the candidates (private API, used to pair with
             // the CG window).
             // Retain the exact element for the activation path so normal raises do not need
@@ -1050,8 +1236,8 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         CFRelease(title_key);
         CFRelease(subrole_key);
         CFRelease(minimized_key);
-        CFRelease(main_key);
         CFRelease(fullscreen_key);
+        CFRelease(main_key);
         CFRelease(slots);
         cache_ax_snapshot(pid, process_start_time_us, &results);
         Some(results)
@@ -1087,5 +1273,39 @@ pub(crate) fn cf_to_rust_string(cf_string: *const c_void) -> Option<String> {
         Some(String::from_utf8_lossy(&buf[..end]).to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod raise_match_tests {
+    use super::{raise_match_source, RaiseMatchSource};
+
+    #[test]
+    fn target_in_ax_windows_uses_the_normal_match() {
+        assert_eq!(
+            raise_match_source(6865, &[61, 6865], &[6865], &[6865]),
+            Some(RaiseMatchSource::AxWindows)
+        );
+    }
+
+    #[test]
+    fn target_missing_from_ax_windows_uses_key_or_main_slot() {
+        assert_eq!(
+            raise_match_source(6865, &[61], &[6865], &[]),
+            Some(RaiseMatchSource::KeyMainSlot)
+        );
+    }
+
+    #[test]
+    fn target_missing_from_lists_uses_fullscreen_subrole_candidate() {
+        assert_eq!(
+            raise_match_source(6865, &[61], &[], &[6865]),
+            Some(RaiseMatchSource::FullscreenSubrole)
+        );
+    }
+
+    #[test]
+    fn target_missing_from_every_candidate_set_has_no_match() {
+        assert_eq!(raise_match_source(6865, &[61], &[], &[62]), None);
     }
 }

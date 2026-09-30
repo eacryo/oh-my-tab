@@ -1,5 +1,8 @@
 //! Parallelizable per-PID AX collection and result merging.
 
+use super::space_membership::{
+    query_with_provider, MembershipSnapshot, SkyLightMembershipProvider,
+};
 use super::*;
 
 /// One worker thread's partial result set for its PID chunk; merged by key afterwards --
@@ -8,16 +11,13 @@ use super::*;
 struct AxPartial {
     icon_ids: HashMap<i32, AppIdentity>,
     hidden_app_pids: HashSet<i32>,
-    /// Pids whose AX query SUCCEEDED with zero standard windows. An empty result is NOT negative
-    /// evidence: AX only sees the CURRENT Space (AppKit filters kAXWindows by it), so every
-    /// background app answers empty while a native fullscreen Space is active -- the result must
-    /// not be read as "this app has no windows" before checking whether the whole batch is in
-    /// the degraded shape (see ax_batch_looks_degraded).
+    /// Pids whose AX query succeeded with zero standard windows. This distinguishes an empty
+    /// answer from a failed query during discovery; SkyLight membership decides which Space owns
+    /// any key/main recovery.
     ax_empty_pids: HashSet<i32>,
     /// Windows recovered ONLY from the key/main slots (absent from kAXWindows), kept per pid:
-    /// they are not Space-filtered and recover background apps whose windows all live on another
-    /// Space, but they also hand over helper processes' overlays -- so they join the pairing only
-    /// in the degraded batch (see ax_batch_looks_degraded).
+    /// they can recover windows AX omits on another Space; activatable-process, size, and exact
+    /// Space-membership filters are applied before publication.
     ax_recovered_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>>,
     ax_failed_pids: Vec<i32>,
     ax_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>>,
@@ -111,9 +111,8 @@ unsafe fn ax_collect_chunk(
         }
         match ax_wins {
             Some(wins) if !wins.is_empty() => {
-                // Split by origin: the kAXWindows answer is the authoritative list, while windows
-                // recovered from the key/main slots are usable only once the batch is confirmed to
-                // be in that shape (see ax_batch_looks_degraded).
+                // Split by origin so key/main recovery remains explicit; exact SkyLight
+                // membership and normal-window filters are applied after CG/AX pairing.
                 let (recovered, published): (Vec<AxWindowInfo>, Vec<AxWindowInfo>) = wins
                     .into_iter()
                     .partition(|window| window.only_via_key_or_main);
@@ -127,7 +126,7 @@ unsafe fn ax_collect_chunk(
                     // kAXWindows cannot see any of this app's windows from the current Space.
                     partial.ax_empty_pids.insert(pid);
                     // The recovered windows get the same all-untitled exemption: an app with a
-                    // custom title bar (empty titles) has only these in the degraded shape, and
+                    // custom title bar (empty titles) may expose only these, and
                     // without the exemption the empty-title gate would drop every one and the app
                     // would vanish from the list.
                     if windows_are_all_untitled(&recovered) {
@@ -141,9 +140,8 @@ unsafe fn ax_collect_chunk(
                 }
             }
             // AX answered with no standard windows: either the app genuinely has none that
-            // Mission Control would show (e.g. an invisible anchor window), or AX cannot see
-            // them from the current Space. The two are told apart once the whole batch is in
-            // (see ax_batch_looks_degraded).
+            // Mission Control would show (e.g. an invisible anchor window), or its key/main
+            // windows are the only discovery path available.
             Some(_) => {
                 partial.ax_empty_pids.insert(pid);
             }
@@ -156,7 +154,7 @@ unsafe fn ax_collect_chunk(
 }
 
 /// Rediscover one PID's windows after WindowServer reports an undisplayed focused window.
-/// AX remains authoritative for display; CG only supplies current geometry and candidates.
+/// AX supplies window identity; SkyLight membership and CG geometry constrain the result.
 pub(crate) fn collect_windows_for_pid(
     mru: &mut MruMap,
     pid: i32,
@@ -223,6 +221,7 @@ unsafe fn collect_windows_for_pid_inner(
     if array.is_null() {
         return None;
     }
+    let display_bounds = active_display_bounds();
 
     let identity = resolve_app_identity(pid);
     let Some(ax_wins) = get_ax_windows_for_pid_with_identity(pid, identity.process_start_time_us)
@@ -261,6 +260,7 @@ unsafe fn collect_windows_for_pid_inner(
     let mut app_name = String::new();
     let mut shown = HashSet::new();
     let mut current_cg_ids = HashSet::new();
+    let mut fullscreen_cgwids = HashSet::new();
     let mut cg_window_layers: HashMap<u32, i32> = HashMap::new();
     let mut windows = Vec::new();
     let count = CFArrayGetCount(array);
@@ -275,6 +275,12 @@ unsafe fn collect_windows_for_pid_inner(
             }
         }
     }
+    let mut membership_window_ids = cg_window_ids.clone();
+    membership_window_ids.extend(ax_wid_to_info.keys().copied());
+    membership_window_ids.sort_unstable();
+    membership_window_ids.dedup();
+    let (membership_source, membership_snapshot) = query_space_membership(&membership_window_ids);
+    let current_space_fullscreen = last_current_space_is_fullscreen();
     let parent_ids: HashMap<u32, u32> = skylight::window_parent_ids(&cg_window_ids);
     let focused_cgwid = parent_ids
         .get(&focused_cgwid)
@@ -313,7 +319,12 @@ unsafe fn collect_windows_for_pid_inner(
         let Some(ax_info) = ax_wid_to_info.get(&cgwid) else {
             continue;
         };
-        if !admissible_window_placement(layer, ax_info.is_main, ax_info.is_fullscreen) {
+        let native_fullscreen =
+            native_fullscreen_state(ax_info.is_fullscreen, bounds, &display_bounds);
+        if native_fullscreen {
+            fullscreen_cgwids.insert(cgwid);
+        }
+        if !admissible_window_placement(layer, ax_info.is_main, native_fullscreen) {
             continue;
         }
         if ax_info.is_custom_root && !custom_window_is_substantial(bounds) && !ax_info.is_main {
@@ -324,10 +335,25 @@ unsafe fn collect_windows_for_pid_inner(
         {
             continue;
         }
-        if !show_minimized && ax_info.minimized {
+        if ax_info.title.is_empty() && !titleless {
             continue;
         }
-        if ax_info.title.is_empty() && !titleless {
+        let native_fullscreen =
+            native_fullscreen_state(ax_info.is_fullscreen, bounds, &display_bounds);
+        if !passes_space_policy(
+            membership_source,
+            membership_snapshot.as_ref(),
+            WindowPairingSource::PublishedAx,
+            cgwid,
+            cf_dict_get_bool(dict, "kCGWindowIsOnscreen"),
+            WindowSpacePolicy {
+                minimized: ax_info.minimized,
+                show_minimized,
+                native_fullscreen,
+                current_space_fullscreen,
+            },
+        ) {
+            crate::e2e_state::space_gate_rejected();
             continue;
         }
 
@@ -359,6 +385,7 @@ unsafe fn collect_windows_for_pid_inner(
         identity.process_start_time_us,
         &cg_window_layers,
         &ax_wid_to_info,
+        &fullscreen_cgwids,
         &parent_ids,
     );
     CFRelease(array);
@@ -366,7 +393,7 @@ unsafe fn collect_windows_for_pid_inner(
     // AX-only windows remain valid, for example orderOut'd settings dialogs absent from CG.
     if pid != std::process::id() as i32 {
         for (&cgwid, ax_info) in &ax_wid_to_info {
-            if shown.contains(&cgwid) || (!show_minimized && ax_info.minimized) {
+            if shown.contains(&cgwid) {
                 continue;
             }
             if is_attached_surface(parent_ids.get(&cgwid).copied()) {
@@ -384,6 +411,23 @@ unsafe fn collect_windows_for_pid_inner(
                 continue;
             }
             if ax_info.title.is_empty() && !titleless {
+                continue;
+            }
+            let native_fullscreen = ax_info.is_fullscreen == Some(true);
+            if !passes_space_policy(
+                membership_source,
+                membership_snapshot.as_ref(),
+                WindowPairingSource::PublishedAx,
+                cgwid,
+                None,
+                WindowSpacePolicy {
+                    minimized: ax_info.minimized,
+                    show_minimized,
+                    native_fullscreen,
+                    current_space_fullscreen,
+                },
+            ) {
+                crate::e2e_state::space_gate_rejected();
                 continue;
             }
             initialize_window_mru(
@@ -450,37 +494,153 @@ pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
     collect_windows_with_frontmost_bump(mru, true)
 }
 
-/// This many apps that DO have a real-looking CG window yet answered with no standard windows,
-/// making up at least half of the apps with switchable windows, marks an AX view that cannot see
-/// outside the current Space.
-const AX_EMPTY_DEGRADED_MIN_PIDS: usize = 3;
+// Same 16pt edge tolerance used by window_management snap-state inference.
+const FULL_DISPLAY_BOUNDS_EPSILON: f64 = 16.0;
 
-/// Collects the pids that answered empty to AX yet DO have a real-looking CG window. Helper
-/// processes (cursor overlays, menu-bar surfaces, anchors) have no AX windows by nature and are
-/// not evidence of degradation (pure; unit-tested).
-pub(super) fn pids_with_real_window<I>(windows: I, empty_pids: &HashSet<i32>) -> HashSet<i32>
-where
-    I: IntoIterator<Item = (i32, i32, (f64, f64, f64, f64))>,
-{
-    windows
-        .into_iter()
-        .filter(|(pid, layer, bounds)| {
-            *layer == 0 && empty_pids.contains(pid) && custom_window_is_substantial(*bounds)
+fn active_display_bounds() -> Vec<(f64, f64, f64, f64)> {
+    unsafe {
+        let mut count = 0;
+        if CGGetActiveDisplayList(0, std::ptr::null_mut(), &mut count) != 0 || count == 0 {
+            return Vec::new();
+        }
+        let mut displays = vec![0u32; count as usize];
+        let mut returned_count = count;
+        if CGGetActiveDisplayList(count, displays.as_mut_ptr(), &mut returned_count) != 0 {
+            return Vec::new();
+        }
+        let returned_count = returned_count.min(displays.len() as u32) as usize;
+        displays.truncate(returned_count);
+        displays
+            .into_iter()
+            .map(|display| {
+                let bounds = CGDisplayBounds(display);
+                (bounds.x, bounds.y, bounds.w, bounds.h)
+            })
+            .collect()
+    }
+}
+
+fn bounds_match_full_display(window: (f64, f64, f64, f64), display: (f64, f64, f64, f64)) -> bool {
+    let (x, y, width, height) = window;
+    let (display_x, display_y, display_width, display_height) = display;
+    [
+        x,
+        y,
+        width,
+        height,
+        display_x,
+        display_y,
+        display_width,
+        display_height,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+        && width > 0.0
+        && height > 0.0
+        && display_width > 0.0
+        && display_height > 0.0
+        && (x - display_x).abs() <= FULL_DISPLAY_BOUNDS_EPSILON
+        && (y - display_y).abs() <= FULL_DISPLAY_BOUNDS_EPSILON
+        && (x + width - (display_x + display_width)).abs() <= FULL_DISPLAY_BOUNDS_EPSILON
+        && (y + height - (display_y + display_height)).abs() <= FULL_DISPLAY_BOUNDS_EPSILON
+}
+
+fn cg_bounds_identify_native_fullscreen(
+    bounds: (f64, f64, f64, f64),
+    displays: &[(f64, f64, f64, f64)],
+) -> bool {
+    let (x, y, width, height) = bounds;
+    if ![x, y, width, height].iter().all(|value| value.is_finite()) || width <= 0.0 || height <= 0.0
+    {
+        return false;
+    }
+    let center_x = x + width / 2.0;
+    let center_y = y + height / 2.0;
+    displays.iter().copied().any(|display| {
+        let (display_x, display_y, display_width, display_height) = display;
+        center_x >= display_x
+            && center_x <= display_x + display_width
+            && center_y >= display_y
+            && center_y <= display_y + display_height
+            && bounds_match_full_display(bounds, display)
+    })
+}
+
+fn native_fullscreen_state(
+    ax_fullscreen_from_ax: Option<bool>,
+    bounds: (f64, f64, f64, f64),
+    displays: &[(f64, f64, f64, f64)],
+) -> bool {
+    ax_fullscreen_from_ax == Some(true) || cg_bounds_identify_native_fullscreen(bounds, displays)
+}
+
+fn native_fullscreen_cg_window_ids(
+    cg_bounds: &HashMap<(i32, u32), (f64, f64, f64, f64)>,
+    published: &HashMap<i32, HashMap<u32, AxWindowInfo>>,
+    recovered: &HashMap<i32, HashMap<u32, AxWindowInfo>>,
+    displays: &[(f64, f64, f64, f64)],
+) -> HashSet<(i32, u32)> {
+    cg_bounds
+        .iter()
+        .filter_map(|(&(pid, cgwid), &bounds)| {
+            let ax_info = published
+                .get(&pid)
+                .and_then(|windows| windows.get(&cgwid))
+                .or_else(|| recovered.get(&pid).and_then(|windows| windows.get(&cgwid)))?;
+            native_fullscreen_state(ax_info.is_fullscreen, bounds, displays).then_some((pid, cgwid))
         })
-        .map(|(pid, _, _)| pid)
         .collect()
 }
 
-/// Decides whether this batch's AX is in the "cannot see outside the current Space" shape (pure;
-/// unit-tested). `empty_pids` = apps that answered empty while owning a real-looking CG window
-/// (see `pids_with_real_window`), `windowed_pids` = apps that answered with windows.
-///
-/// The two cases must stay apart: an occasional app answering empty day to day keeps the "skip
-/// the app" treatment, whereas **a native fullscreen Space makes background apps answer empty in
-/// bulk** -- only the latter is degradation, and only there may the windows the key/main slots
-/// recovered be used.
-pub(super) fn ax_batch_looks_degraded(empty_pids: usize, windowed_pids: usize) -> bool {
-    empty_pids >= AX_EMPTY_DEGRADED_MIN_PIDS && empty_pids * 2 >= empty_pids + windowed_pids
+fn recovered_window_passes_size_filter(bounds: (f64, f64, f64, f64)) -> bool {
+    custom_window_is_substantial(bounds)
+}
+
+#[derive(Clone, Copy)]
+struct CurrentSpaceWindowEvidence {
+    cgwid: u32,
+    layer: i32,
+    is_onscreen: Option<bool>,
+    admissible: bool,
+    native_fullscreen: bool,
+    ax_fullscreen: Option<bool>,
+}
+
+fn legacy_current_space_is_fullscreen(
+    evidence: impl IntoIterator<Item = CurrentSpaceWindowEvidence>,
+) -> bool {
+    let (mut onscreen_count, mut fullscreen_count) = (0, 0);
+    for window in evidence {
+        if window.layer == 0 && window.is_onscreen == Some(true) && window.admissible {
+            onscreen_count += 1;
+            if window.native_fullscreen {
+                fullscreen_count += 1;
+            }
+        }
+    }
+    onscreen_count > 0 && onscreen_count == fullscreen_count
+}
+
+fn skylight_current_space_is_fullscreen(
+    snapshot: &MembershipSnapshot,
+    evidence: impl IntoIterator<Item = CurrentSpaceWindowEvidence>,
+) -> bool {
+    let members: Vec<_> = evidence
+        .into_iter()
+        .filter(|window| {
+            window.layer == 0
+                && window.admissible
+                && snapshot.window_is_in_current_space(window.cgwid)
+        })
+        .collect();
+    !members.is_empty()
+        && members
+            .iter()
+            .all(|window| window.ax_fullscreen == Some(true))
+}
+
+fn minimized_window_is_visible(show_minimized: bool, minimized: bool) -> bool {
+    show_minimized || !minimized
 }
 
 /// The all-untitled exemption test (pure; unit-tested). At least one window is required: an
@@ -499,6 +659,147 @@ fn ax_wid_map(windows: Vec<AxWindowInfo>) -> HashMap<u32, AxWindowInfo> {
         }
     }
     map
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowPairingSource {
+    PublishedAx,
+    RecoveredAx,
+    AxUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MembershipSource {
+    SkyLight,
+    Legacy,
+}
+
+static SKYLIGHT_MEMBERSHIP_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+static LAST_CURRENT_SPACE_IS_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+
+fn select_membership_source(
+    force_legacy: bool,
+    skylight_query_succeeded: bool,
+) -> MembershipSource {
+    if force_legacy || !skylight_query_succeeded {
+        MembershipSource::Legacy
+    } else {
+        MembershipSource::SkyLight
+    }
+}
+
+fn query_space_membership(window_ids: &[u32]) -> (MembershipSource, Option<MembershipSnapshot>) {
+    let force_legacy = crate::dev_flags::enabled("--space-membership-legacy");
+    let started = Instant::now();
+    let result = if force_legacy {
+        None
+    } else {
+        Some(query_with_provider(&SkyLightMembershipProvider, window_ids))
+    };
+    let snapshot = result.as_ref().and_then(|result| result.as_ref().ok());
+    let source = select_membership_source(force_legacy, snapshot.is_some());
+    crate::e2e_state::set_space_membership_source(source == MembershipSource::SkyLight);
+    if let Some(snapshot) = snapshot {
+        log_debug!(
+            "[collect] skylight membership: windows={} current_spaces={} elapsed_ms={}",
+            window_ids.len(),
+            snapshot.current_space_ids.len(),
+            started.elapsed().as_millis()
+        );
+    } else if !force_legacy {
+        if let Some(Err(error)) = result.as_ref() {
+            if !SKYLIGHT_MEMBERSHIP_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                log_info!(
+                    "SkyLight window Space membership unavailable ({:?}); using legacy Space filter",
+                    error
+                );
+            }
+        }
+    }
+    (source, snapshot.cloned())
+}
+
+fn record_current_space_is_fullscreen(value: bool) {
+    LAST_CURRENT_SPACE_IS_FULLSCREEN.store(value, Ordering::Release);
+    crate::e2e_state::set_current_space_is_fullscreen(value);
+}
+
+fn last_current_space_is_fullscreen() -> bool {
+    LAST_CURRENT_SPACE_IS_FULLSCREEN.load(Ordering::Acquire)
+}
+
+fn passes_membership_gate(
+    snapshot: &MembershipSnapshot,
+    cgwid: u32,
+    native_fullscreen: bool,
+    current_space_fullscreen: bool,
+) -> bool {
+    current_space_fullscreen || native_fullscreen || snapshot.window_is_in_current_space(cgwid)
+}
+
+#[derive(Clone, Copy)]
+struct WindowSpacePolicy {
+    minimized: bool,
+    show_minimized: bool,
+    native_fullscreen: bool,
+    current_space_fullscreen: bool,
+}
+
+fn passes_space_policy(
+    source: MembershipSource,
+    snapshot: Option<&MembershipSnapshot>,
+    pairing_source: WindowPairingSource,
+    cgwid: u32,
+    is_onscreen: Option<bool>,
+    policy: WindowSpacePolicy,
+) -> bool {
+    // Minimized windows have no Space membership; preserve their explicit user policy first.
+    if policy.minimized {
+        return policy.show_minimized;
+    }
+    match source {
+        MembershipSource::SkyLight => passes_membership_gate(
+            snapshot.expect("SkyLight source requires a membership snapshot"),
+            cgwid,
+            policy.native_fullscreen,
+            policy.current_space_fullscreen,
+        ),
+        MembershipSource::Legacy => passes_legacy_space_gate(
+            pairing_source,
+            is_onscreen,
+            Some(policy.minimized),
+            policy.show_minimized,
+            policy.native_fullscreen,
+            policy.current_space_fullscreen,
+        ),
+    }
+}
+
+/// Legacy Space policy retained for OS updates where SkyLight membership cannot be queried.
+fn passes_legacy_space_gate(
+    source: WindowPairingSource,
+    is_onscreen: Option<bool>,
+    ax_minimized: Option<bool>,
+    show_minimized: bool,
+    native_fullscreen: bool,
+    current_space_fullscreen: bool,
+) -> bool {
+    if current_space_fullscreen {
+        return true;
+    }
+    if source == WindowPairingSource::PublishedAx {
+        return true;
+    }
+    if source == WindowPairingSource::AxUnavailable {
+        return is_onscreen == Some(true);
+    }
+    if native_fullscreen {
+        return true;
+    }
+    if ax_minimized == Some(true) {
+        return show_minimized;
+    }
+    is_onscreen == Some(true)
 }
 
 /// Folds the AX windows that belong to one native tab group down to a single card: the window
@@ -574,19 +875,16 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     mru: &mut MruMap,
     bump_frontmost: bool,
 ) -> Vec<WindowInfo> {
+    let collection_started_at = Instant::now();
     let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
     let show_hidden_app_windows = CONFIG.read().unwrap().windows.show_hidden_app_windows;
-    // Always enumerate with All (off-screen windows included). Some apps (JetBrains IDEs)
-    // orderOut their settings dialog when the main window is activated -- it then has
-    // isOnscreen=false, invisible to OnScreenOnly, so the switcher would lose it after
-    // switching to the main window (BetterCmdTab uses All; no such issue). Whether an
-    // off-screen window shows is now decided by AX semantics (see the filter below): a
-    // window AX still reports is a legitimate switchable window (Mission Control and the
-    // system Cmd+Tab agree); hidden helper surfaces AX never reports are dropped by the
-    // subrole/empty-title filters.
+    crate::e2e_state::set_space_membership_source(false);
+    // Enumerate all CG windows. SkyLight membership, not transient onscreen state, decides which
+    // Space's switchable windows are candidates; AX remains authoritative for window identity.
     let cg_option = K_C_G_WINDOW_LIST_OPTION_ALL;
     let array = unsafe { CGWindowListCopyWindowInfo(cg_option, 0) };
     if array.is_null() {
+        record_current_space_is_fullscreen(false);
         return vec![];
     }
 
@@ -594,7 +892,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // excluding it would make it unswitchable while open. The overlay itself needs no PID
     // exclusion -- it uses a non-zero overlay level and no AXMain/fullscreen semantics, so the
     // admission gate below drops it. The settings window, when
-    // closed, is orderOut'd (off-screen) and excluded by the own-PID isOnscreen filter
+    // closed, is orderOut'd and excluded by the own-PID onscreen check
     // below, so "open -> shown as a card, closed -> hidden" still holds.
     let mut windows: Vec<WindowInfo> = Vec::new();
     // Windows already shown by the CG loop: skipped by the AX backfill (no duplicate rows).
@@ -603,6 +901,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // per-PID AX queries / the frontmost lookup. Remove together with the [collect] logs.
     let t0 = Instant::now();
     let count = unsafe { CFArrayGetCount(array) };
+    let display_bounds = active_display_bounds();
     let now = Instant::now();
     let ancient_base = now.checked_sub(Duration::from_secs(86_400)).unwrap_or(now);
     // One collection uses one activation snapshot so concurrent notifications cannot give
@@ -616,6 +915,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // Snapshot every CG window's layer so AX backfill can distinguish orderOut'd windows from
     // app-owned overlays that were intentionally filtered by the normal layer-0 pass.
     let mut cg_window_layers: HashMap<(i32, u32), i32> = HashMap::new();
+    let mut cg_window_bounds: HashMap<(i32, u32), (f64, f64, f64, f64)> = HashMap::new();
     // pid -> app name (for the slow-AX log).
     let mut pid_names: HashMap<i32, String> = HashMap::new();
     let mut cg_window_ids = Vec::new();
@@ -632,6 +932,10 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
         if cgwid != 0 {
             cg_window_layers.insert((owner_pid, cgwid), layer);
+            cg_window_bounds.insert(
+                (owner_pid, cgwid),
+                cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default(),
+            );
             cg_window_ids.push(cgwid);
         }
         let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
@@ -752,44 +1056,159 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // TIMING-DEBUG Wall clock of the parallel AX phase (not the sum of per-PID work;
     // slow queries are logged individually).
     let ax_total_ms = t_ax.elapsed().as_millis();
-    // AX degradation (see ax_batch_looks_degraded): in that shape an empty answer no longer means
-    // "this app has no windows" but "AX cannot see outside the current Space", so the windows the
-    // key/main slots recovered join the pairing (that alone -- no wholesale CG fallback). Only apps
-    // that DO have a real-looking CG window count, or a houseful of helper processes that never had
-    // AX windows would trip the test.
-    let empty_with_real_window = pids_with_real_window(
-        (0..count).filter_map(|i| {
-            let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
-            if dict.is_null() {
-                return None;
-            }
-            Some((
-                cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1),
-                cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999),
-                cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default(),
-            ))
-        }),
-        &ax_empty_pids,
-    );
-    let ax_degraded = ax_batch_looks_degraded(empty_with_real_window.len(), ax_wid_to_info.len());
-    if ax_degraded {
-        // Recovered windows are accepted only from activatable processes: a non-activatable helper
-        // (settings-pane host, cursor-overlay service) has no switch target by definition, yet its
-        // key/main slots still hand the pane/overlay over, and a size gate cannot reject a large
-        // 740x883 pane.
-        let pool: *mut AnyObject = unsafe { msg_send![class!(NSAutoreleasePool), new] };
-        ax_recovered_wid_to_info.retain(|pid, _| unsafe { !process_cannot_be_activated(*pid) });
-        let _: () = unsafe { msg_send![pool, drain] };
-        log_debug!(
-            "[collect] ax degraded: empty_real_pids={} windowed_pids={} -> key/main-recovered windows pair",
-            empty_with_real_window.len(),
-            ax_wid_to_info.len()
-        );
-    }
     if !show_hidden_app_windows && !hidden_app_pids.is_empty() {
         cg_window_layers.retain(|(pid, _), _| !hidden_app_pids.contains(pid));
+        cg_window_bounds.retain(|(pid, _), _| !hidden_app_pids.contains(pid));
     }
-    remember_non_normal_cg_windows(&cg_window_layers, &icon_ids, &ax_wid_to_info, &parent_ids);
+    // Recovery is discovery only. Keep its original activatable-process filter; the CG pairing
+    // below applies the existing placement, size, and title rules before SkyLight membership.
+    let pool: *mut AnyObject = unsafe { msg_send![class!(NSAutoreleasePool), new] };
+    ax_recovered_wid_to_info.retain(|pid, _| unsafe { !process_cannot_be_activated(*pid) });
+    let _: () = unsafe { msg_send![pool, drain] };
+
+    let mut membership_window_ids = cg_window_ids.clone();
+    membership_window_ids.extend(
+        ax_wid_to_info
+            .values()
+            .chain(ax_recovered_wid_to_info.values())
+            .flat_map(|windows| windows.keys().copied()),
+    );
+    membership_window_ids.retain(|window_id| *window_id != 0);
+    membership_window_ids.sort_unstable();
+    membership_window_ids.dedup();
+    let (membership_source, membership_snapshot) = query_space_membership(&membership_window_ids);
+
+    let fullscreen_cg_window_ids = native_fullscreen_cg_window_ids(
+        &cg_window_bounds,
+        &ax_wid_to_info,
+        &ax_recovered_wid_to_info,
+        &display_bounds,
+    );
+    // Preserve the onscreen flip observer as a transition signal for thumbnail settling only.
+    // Window visibility itself now comes from CGS Space membership.
+
+    // Gather per-window facts once: the legacy lift still uses its prior onscreen heuristic only
+    // when forced or when the SkyLight query fails; the normal path derives the lift from exact
+    // current-Space membership and AX fullscreen attributes.
+    let mut current_space_evidence = Vec::new();
+    for i in 0..count {
+        let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
+        if dict.is_null()
+            || cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0
+            || cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0) <= 0.0
+        {
+            continue;
+        }
+        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+        if owner_pid <= 0 || (!show_hidden_app_windows && hidden_app_pids.contains(&owner_pid)) {
+            continue;
+        }
+        let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
+        if owner_name.is_empty() || owner_name == "Dock" {
+            continue;
+        }
+        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        if cgwid == 0 || is_attached_surface(parent_ids.get(&cgwid).copied()) {
+            continue;
+        }
+        let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default();
+        let published_map = ax_wid_to_info.get(&owner_pid);
+        let recovered_info = ax_recovered_wid_to_info
+            .get(&owner_pid)
+            .and_then(|windows| windows.get(&cgwid));
+        let ax_info = match published_map.and_then(|windows| windows.get(&cgwid)) {
+            Some(info) => Some(info),
+            None if recovered_info.is_some_and(|_| recovered_window_passes_size_filter(bounds)) => {
+                recovered_info
+            }
+            None if published_map.is_some() || ax_empty_pids.contains(&owner_pid) => continue,
+            None => None,
+        };
+        let cg_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
+        let titleless_allowed = titleless_pids.contains(&owner_pid);
+        let has_title = ax_info.map_or_else(
+            || !cg_title.is_empty(),
+            |info| !info.title.is_empty() || titleless_allowed,
+        );
+        if !has_title {
+            continue;
+        }
+        let minimized = ax_info.is_some_and(|info| info.minimized);
+        if !minimized_window_is_visible(show_minimized, minimized) {
+            continue;
+        }
+        let is_main = ax_info.is_some_and(|info| info.is_main);
+        let native_fullscreen = ax_info.is_some_and(|info| {
+            native_fullscreen_state(info.is_fullscreen, bounds, &display_bounds)
+        });
+        if !admissible_window_placement(0, is_main, native_fullscreen)
+            || ax_info.is_some_and(|info| {
+                info.is_custom_root && !custom_window_is_substantial(bounds) && !info.is_main
+            })
+            || is_known_non_normal_window(
+                owner_pid,
+                icon_ids
+                    .get(&owner_pid)
+                    .and_then(|identity| identity.process_start_time_us),
+                cgwid,
+            ) && !is_main
+        {
+            continue;
+        }
+        current_space_evidence.push(CurrentSpaceWindowEvidence {
+            cgwid,
+            layer: 0,
+            is_onscreen: cf_dict_get_bool(dict, "kCGWindowIsOnscreen"),
+            admissible: true,
+            native_fullscreen,
+            ax_fullscreen: ax_info.and_then(|info| info.is_fullscreen),
+        });
+    }
+    let legacy_current_space_fullscreen =
+        legacy_current_space_is_fullscreen(current_space_evidence.iter().copied());
+    let current_space_fullscreen = match membership_source {
+        MembershipSource::SkyLight => skylight_current_space_is_fullscreen(
+            membership_snapshot
+                .as_ref()
+                .expect("SkyLight source requires a membership snapshot"),
+            current_space_evidence.iter().copied(),
+        ),
+        MembershipSource::Legacy => legacy_current_space_fullscreen,
+    };
+    record_current_space_is_fullscreen(current_space_fullscreen);
+    let mut onscreen_ids = HashSet::new();
+    for i in 0..count {
+        let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
+        if dict.is_null()
+            || cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0
+            || cf_dict_get_bool(dict, "kCGWindowIsOnscreen") != Some(true)
+            || cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0) <= 0.0
+        {
+            continue;
+        }
+        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        if cgwid != 0 && !is_attached_surface(parent_ids.get(&cgwid).copied()) {
+            onscreen_ids.insert(cgwid);
+        }
+    }
+    let fullscreen_onscreen_ids = fullscreen_cg_window_ids
+        .iter()
+        .filter_map(|(_, cgwid)| onscreen_ids.contains(cgwid).then_some(*cgwid))
+        .collect();
+    if crate::space_transition::observe_window_snapshot(
+        onscreen_ids,
+        fullscreen_onscreen_ids,
+        collection_started_at,
+    ) {
+        crate::window_refresh::note_space_transition(false);
+    }
+    remember_non_normal_cg_windows(
+        &cg_window_layers,
+        &icon_ids,
+        &ax_wid_to_info,
+        &fullscreen_cg_window_ids,
+        &parent_ids,
+    );
 
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
@@ -829,34 +1248,27 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         // Pair the AX title by CGWindowID (no more order/string guessing).
         // AX is authoritative: a CG window is kept only if AX has a window with
         // the same CGWindowID.
-        // Pairing: the kAXWindows answer wins; in the degraded shape (AX cannot see outside the
-        // current Space) windows recovered from the key/main slots join in, but must look like real
-        // windows -- those slots are not Space-filtered and also hand over helper overlays.
+        // Pairing: the kAXWindows answer wins; key/main recovery is discovery only and is
+        // published through the same normal-window filters and exact membership gate.
         let published_map = ax_wid_to_info.get(&owner_pid);
-        let recovered_map = if ax_degraded && custom_window_is_substantial(bounds) {
-            ax_recovered_wid_to_info.get(&owner_pid)
-        } else {
-            None
-        };
-        let ax_info = match published_map.and_then(|wid_map| wid_map.get(&cgwid)) {
-            Some(info) => Some(info),
-            // kAXWindows knows this app but not this CG window -> menu bar/popup, skip.
-            None if published_map.is_some() => continue,
-            None => match recovered_map.and_then(|wid_map| wid_map.get(&cgwid)) {
-                Some(info) => Some(info),
+        let recovered_map = ax_recovered_wid_to_info.get(&owner_pid);
+        let (ax_info, pairing_source) = match published_map.and_then(|wid_map| wid_map.get(&cgwid))
+        {
+            Some(info) => (Some(info), WindowPairingSource::PublishedAx),
+            None => match recovered_map
+                .and_then(|wid_map| wid_map.get(&cgwid))
+                .filter(|_| recovered_window_passes_size_filter(bounds))
+            {
+                Some(info) => (Some(info), WindowPairingSource::RecoveredAx),
                 // AX answered for this app (with a window list, or with nothing at all) and this
-                // CG window is in neither -> it is an app overlay, a menu bar or a hidden surface:
-                // skip. The degraded shape changes nothing here -- CG surfaces must not all count
-                // as windows merely because AX cannot see them, or tab surfaces, hidden windows and
-                // other-Space leftovers would all turn into cards (AX pairing is what prevents
-                // that).
+                // CG window is in neither -> it is an app overlay, menu bar or hidden surface.
                 None if published_map.is_some() || ax_empty_pids.contains(&owner_pid) => continue,
                 // No AX data (the query failed) -> fall back to the CG title.
-                None => None,
+                None => (None, WindowPairingSource::AxUnavailable),
             },
         };
 
-        let (window_title, minimized, is_main, is_fullscreen, is_custom_root) = ax_info
+        let (window_title, minimized, is_main, ax_fullscreen, is_custom_root) = ax_info
             .map(|info| {
                 (
                     info.title.clone(),
@@ -866,9 +1278,11 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                     info.is_custom_root,
                 )
             })
-            .unwrap_or((cg_title, false, false, false, false));
+            .unwrap_or((cg_title, false, false, None, false));
+        let native_fullscreen =
+            ax_info.is_some() && native_fullscreen_state(ax_fullscreen, bounds, &display_bounds);
 
-        if !admissible_window_placement(layer, is_main, is_fullscreen) {
+        if !admissible_window_placement(layer, is_main, native_fullscreen) {
             continue;
         }
         if is_custom_root && !custom_window_is_substantial(bounds) && !is_main {
@@ -898,18 +1312,39 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         //   open -> shown, closed -> hidden, preserving the original behavior (other apps'
         //   orderOut'd windows can't use this rule; they may be JetBrains-style hidden-but-
         //   legitimate settings dialogs).
-        // - other apps' windows: every AX-paired window shows -- an orderOut'd window AX
-        //   still reports (JetBrains hiding its settings dialog on main-window activation)
-        //   is a legitimate switchable window and must show; minimized windows are gated
-        //   by the "show minimized windows" switch (the AX minimized flag -- unrelated to
-        //   isOnscreen: a minimized window is isOnscreen=false but minimized=true).
-        if owner_pid == std::process::id() as i32 {
-            let is_onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false);
-            if !is_onscreen {
-                continue;
-            }
-        } else if !show_minimized && minimized {
+        // - AX windows reported after orderOut remain eligible if SkyLight still assigns them to
+        //   a current Space; minimized windows follow the setting before any membership check.
+        // - every discovered source uses the same membership rule, with native-fullscreen and
+        //   current-fullscreen policy exceptions applied on top.
+        let cg_is_onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen");
+        if owner_pid == std::process::id() as i32 && cg_is_onscreen != Some(true) {
             continue;
+        }
+        let in_current_space = membership_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.window_is_in_current_space(cgwid));
+        let passes_space_policy = passes_space_policy(
+            membership_source,
+            membership_snapshot.as_ref(),
+            pairing_source,
+            cgwid,
+            cg_is_onscreen,
+            WindowSpacePolicy {
+                minimized,
+                show_minimized,
+                native_fullscreen,
+                current_space_fullscreen,
+            },
+        );
+        if !passes_space_policy {
+            crate::e2e_state::space_gate_rejected();
+            continue;
+        }
+        if pairing_source == WindowPairingSource::RecoveredAx {
+            crate::e2e_state::space_recovered_accepted();
+            if native_fullscreen && !in_current_space {
+                crate::e2e_state::space_fullscreen_exempt();
+            }
         }
 
         // Titleless windows are kept only for apps AX confirmed as all-untitled
@@ -968,7 +1403,8 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 
     // AX backfill: windows AX reports but the CG enumeration lacks. E.g. JetBrains IDEs
     // orderOut their settings dialog when the main window is activated -- an orderOut'd
-    // window is NOT in CGWindowList (optionAll only covers on-screen windows), so a
+    // window is NOT in CGWindowList (the all-Spaces enumeration can still omit orderOut'd
+    // windows), so a
     // CG-driven loop can never see it; AX still reports it and it is a legitimate
     // switchable window (BetterCmdTab uses the AX list as its primary source and shows
     // it stably). Entries are built from AX title/minimized; bounds are unknown
@@ -1013,13 +1449,27 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             }
             // Same filters as the CG path: minimized gated by the switch; empty titles
             // (not titleless) are meaningless.
-            if !show_minimized && ax_info.minimized {
-                continue;
-            }
             if ax_info.is_custom_root && !ax_info.is_main {
                 continue;
             }
             if ax_info.title.is_empty() && !titleless_pids.contains(&pid) {
+                continue;
+            }
+            let native_fullscreen = ax_info.is_fullscreen == Some(true);
+            if !passes_space_policy(
+                membership_source,
+                membership_snapshot.as_ref(),
+                WindowPairingSource::PublishedAx,
+                cgwid,
+                None,
+                WindowSpacePolicy {
+                    minimized: ax_info.minimized,
+                    show_minimized,
+                    native_fullscreen,
+                    current_space_fullscreen,
+                },
+            ) {
+                crate::e2e_state::space_gate_rejected();
                 continue;
             }
             initialize_window_mru(
@@ -1087,7 +1537,8 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 let is_main_or_fullscreen = ax_wid_to_info
                     .get(&pid)
                     .and_then(|windows| windows.get(&cgwid))
-                    .is_some_and(|window| window.is_main || window.is_fullscreen);
+                    .is_some_and(|window| window.is_main || window.is_fullscreen == Some(true))
+                    || fullscreen_cg_window_ids.contains(&(pid, cgwid));
                 if layer != 0 && !is_main_or_fullscreen {
                     continue;
                 }
@@ -1158,7 +1609,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 .flat_map(|windows| windows.iter())
                 .map(|(id, info)| {
                     format!(
-                        "id={} title={:?} minimized={} main={} fullscreen={} custom_root={} recovered={}",
+                        "id={} title={:?} minimized={} main={} fullscreen={:?} custom_root={} recovered={}",
                         id,
                         info.title,
                         info.minimized,
@@ -1188,7 +1639,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             .collect();
         final_rows.sort();
         log_debug!(
-            "[collect] app trace: pid={} app={:?} bump_frontmost={} show_hidden={} show_minimized={} hidden={} ax_failed={} ax_empty={} degraded={} cg={:?} ax_published={:?} ax_recovered={:?} cards={:?}",
+            "[collect] app trace: pid={} app={:?} bump_frontmost={} show_hidden={} show_minimized={} hidden={} ax_failed={} ax_empty={} cg={:?} ax_published={:?} ax_recovered={:?} cards={:?}",
             pid,
             app_name,
             bump_frontmost,
@@ -1197,7 +1648,6 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             hidden_app_pids.contains(&pid),
             ax_failed_pids.contains(&pid),
             ax_empty_pids.contains(&pid),
-            ax_degraded,
             cg_rows,
             format_ax_rows(ax_wid_to_info.get(&pid)),
             format_ax_rows(ax_recovered_wid_to_info.get(&pid)),
@@ -1294,7 +1744,7 @@ mod tab_group_fold_tests {
             title: title.to_string(),
             minimized,
             is_main: false,
-            is_fullscreen: false,
+            is_fullscreen: Some(false),
             is_custom_root: false,
             only_via_key_or_main: false,
             tab_group: tabs.map(|titles| TabGroupInfo {
@@ -1374,5 +1824,243 @@ mod tab_group_fold_tests {
         let folded = fold_tab_group(windows);
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].cgwid, 7);
+    }
+}
+
+#[cfg(test)]
+mod space_gate_tests {
+    use super::*;
+
+    fn window_policy(
+        minimized: bool,
+        show_minimized: bool,
+        native_fullscreen: bool,
+        current_space_fullscreen: bool,
+    ) -> WindowSpacePolicy {
+        WindowSpacePolicy {
+            minimized,
+            show_minimized,
+            native_fullscreen,
+            current_space_fullscreen,
+        }
+    }
+
+    fn membership(current: &[u64], windows: &[(u32, &[u64])]) -> MembershipSnapshot {
+        MembershipSnapshot {
+            current_space_ids: current.iter().copied().collect(),
+            window_space_ids: windows
+                .iter()
+                .map(|(window_id, spaces)| (*window_id, spaces.to_vec()))
+                .collect(),
+        }
+    }
+
+    fn evidence(
+        cgwid: u32,
+        is_onscreen: Option<bool>,
+        ax_fullscreen: Option<bool>,
+    ) -> CurrentSpaceWindowEvidence {
+        CurrentSpaceWindowEvidence {
+            cgwid,
+            layer: 0,
+            is_onscreen,
+            admissible: true,
+            native_fullscreen: ax_fullscreen == Some(true),
+            ax_fullscreen,
+        }
+    }
+
+    #[test]
+    fn current_space_membership_intersection_controls_visibility() {
+        let snapshot = membership(&[10], &[(7, &[10]), (8, &[20]), (9, &[])]);
+        assert!(passes_membership_gate(&snapshot, 7, false, false));
+        assert!(!passes_membership_gate(&snapshot, 8, false, false));
+        assert!(!passes_membership_gate(&snapshot, 9, false, false));
+        assert!(!passes_membership_gate(&snapshot, 99, false, false));
+    }
+
+    #[test]
+    fn membership_unions_current_spaces_across_displays() {
+        let snapshot = membership(&[10, 20], &[(7, &[10]), (8, &[20]), (9, &[30])]);
+        assert!(passes_membership_gate(&snapshot, 7, false, false));
+        assert!(passes_membership_gate(&snapshot, 8, false, false));
+        assert!(!passes_membership_gate(&snapshot, 9, false, false));
+    }
+
+    #[test]
+    fn native_fullscreen_and_current_fullscreen_policy_are_applied_over_membership() {
+        let snapshot = membership(&[10], &[(7, &[10]), (8, &[20])]);
+        assert!(passes_membership_gate(&snapshot, 8, true, false));
+        assert!(passes_membership_gate(&snapshot, 8, false, true));
+        assert!(!passes_membership_gate(&snapshot, 8, false, false));
+    }
+
+    #[test]
+    fn minimized_policy_precedes_membership_even_when_the_space_has_no_membership() {
+        let snapshot = membership(&[10], &[(7, &[20])]);
+        assert!(!passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            WindowPairingSource::RecoveredAx,
+            7,
+            None,
+            window_policy(true, false, false, false),
+        ));
+        assert!(passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            WindowPairingSource::RecoveredAx,
+            7,
+            None,
+            window_policy(true, true, false, false),
+        ));
+    }
+
+    #[test]
+    fn recovered_key_main_discovery_is_independent_of_batch_shape() {
+        let bounds = (100.0, 80.0, 800.0, 600.0);
+        assert!(recovered_window_passes_size_filter(bounds));
+        assert!(!recovered_window_passes_size_filter((0.0, 0.0, 20.0, 20.0)));
+
+        let on_other_space = membership(&[10], &[(42, &[20])]);
+        assert!(!passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&on_other_space),
+            WindowPairingSource::RecoveredAx,
+            42,
+            None,
+            window_policy(false, false, false, false),
+        ));
+        let on_current_space = membership(&[10], &[(42, &[10])]);
+        assert!(passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&on_current_space),
+            WindowPairingSource::RecoveredAx,
+            42,
+            None,
+            window_policy(false, false, false, false),
+        ));
+    }
+
+    #[test]
+    fn current_space_fullscreen_uses_only_current_members_and_ax_fullscreen_facts() {
+        let snapshot = membership(&[10, 20], &[(1, &[10]), (2, &[20]), (3, &[30])]);
+        assert!(skylight_current_space_is_fullscreen(
+            &snapshot,
+            [
+                evidence(1, None, Some(true)),
+                evidence(2, None, Some(true)),
+                evidence(3, None, Some(false))
+            ]
+        ));
+        assert!(!skylight_current_space_is_fullscreen(
+            &snapshot,
+            [
+                evidence(1, None, Some(true)),
+                evidence(2, None, Some(false))
+            ]
+        ));
+        assert!(!skylight_current_space_is_fullscreen(
+            &snapshot,
+            [evidence(1, None, None)]
+        ));
+        assert!(!skylight_current_space_is_fullscreen(&snapshot, []));
+    }
+
+    #[test]
+    fn legacy_fallback_keeps_onscreen_and_legacy_fullscreen_semantics() {
+        assert_eq!(
+            select_membership_source(true, true),
+            MembershipSource::Legacy
+        );
+        assert_eq!(
+            select_membership_source(false, false),
+            MembershipSource::Legacy
+        );
+        assert_eq!(
+            select_membership_source(false, true),
+            MembershipSource::SkyLight
+        );
+
+        assert!(!passes_space_policy(
+            MembershipSource::Legacy,
+            None,
+            WindowPairingSource::RecoveredAx,
+            42,
+            Some(false),
+            window_policy(false, false, false, false),
+        ));
+        assert!(passes_space_policy(
+            MembershipSource::Legacy,
+            None,
+            WindowPairingSource::RecoveredAx,
+            42,
+            Some(true),
+            window_policy(false, false, false, false),
+        ));
+        assert!(passes_space_policy(
+            MembershipSource::Legacy,
+            None,
+            WindowPairingSource::AxUnavailable,
+            42,
+            None,
+            window_policy(false, false, false, true),
+        ));
+    }
+
+    #[test]
+    fn legacy_fullscreen_lift_still_requires_nonempty_onscreen_evidence() {
+        assert!(!legacy_current_space_is_fullscreen([]));
+        assert!(legacy_current_space_is_fullscreen([
+            CurrentSpaceWindowEvidence {
+                native_fullscreen: true,
+                ..evidence(7, Some(true), Some(true))
+            }
+        ]));
+        assert!(!legacy_current_space_is_fullscreen([evidence(
+            7,
+            Some(true),
+            Some(false)
+        )]));
+        assert!(!legacy_current_space_is_fullscreen([evidence(
+            7,
+            None,
+            Some(true)
+        )]));
+    }
+
+    #[test]
+    fn fullscreen_bounds_fallback_still_rejects_frame_maximized_windows() {
+        const DISPLAY: (f64, f64, f64, f64) = (0.0, 0.0, 1000.0, 800.0);
+        assert!(cg_bounds_identify_native_fullscreen(DISPLAY, &[DISPLAY]));
+        let visible_frame_maximized = (0.0, 24.0, 1000.0, 776.0);
+        assert!(!cg_bounds_identify_native_fullscreen(
+            visible_frame_maximized,
+            &[DISPLAY]
+        ));
+    }
+
+    #[test]
+    fn fullscreen_window_ids_include_recovered_ax_metadata() {
+        const DISPLAY: (f64, f64, f64, f64) = (0.0, 0.0, 1000.0, 800.0);
+        let cg_bounds = HashMap::from([((7, 42), DISPLAY)]);
+        let recovered = HashMap::from([(7, HashMap::from([(42, ax_window(42, Some(true)))]))]);
+        let published = HashMap::new();
+        let fullscreen_ids =
+            native_fullscreen_cg_window_ids(&cg_bounds, &published, &recovered, &[DISPLAY]);
+        assert!(fullscreen_ids.contains(&(7, 42)));
+    }
+
+    fn ax_window(cgwid: u32, is_fullscreen: Option<bool>) -> AxWindowInfo {
+        AxWindowInfo {
+            cgwid,
+            title: "window".to_string(),
+            minimized: false,
+            is_main: false,
+            is_fullscreen,
+            is_custom_root: false,
+            only_via_key_or_main: true,
+            tab_group: None,
+        }
     }
 }

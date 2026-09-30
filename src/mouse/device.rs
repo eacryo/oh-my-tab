@@ -355,6 +355,13 @@ fn parse_bluetooth_info(bytes: &[u8], map: &mut HashMap<String, u16>) {
 /// forcibly recreated (after a Bluetooth disconnect/reconnect the old client's registry cache is
 /// stale, breaking the attribution chain -- see the failure path in device_from_cgevent).
 unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
+    if skip_device_enumeration_in_smoke() {
+        // Short-lived GUI smokes manipulate settings state directly and do not test physical
+        // devices. Avoid a scheduled IOHIDEventSystemClient whose exit-time release can race its
+        // run-loop unschedule (observed as a CoreFoundation PAC trap).
+        reg.devices.clear();
+        return;
+    }
     // Release the previous services array (if any).
     if !reg.services.is_null() {
         CFRelease(reg.services as *const c_void);
@@ -486,6 +493,9 @@ pub(crate) fn ensure_enumerated() {
 /// Snapshot of currently-connected devices (VID/PID/name) for the settings device picker.
 /// Triggers enumeration if the registry is empty (works even when mouse.enabled=false).
 pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
+    if skip_device_enumeration_in_smoke() {
+        return Vec::new();
+    }
     {
         let reg = registry().lock().unwrap();
         if reg.client.is_null() || reg.devices.is_empty() {
@@ -521,6 +531,11 @@ pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
         out.push(virtual_pointer);
     }
     out
+}
+
+/// Keep every device-enumeration entry point on the same argv-only smoke policy.
+fn skip_device_enumeration_in_smoke() -> bool {
+    crate::dev_flags::any_prefix("--smoke")
 }
 
 /// Read a device's current integer property (through the service client kept alive by the
