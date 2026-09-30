@@ -256,6 +256,71 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
     })
 }
 
+pub(super) unsafe fn set_clipboard_shortcut_capture_state(
+    ui: &SettingsUi,
+    current: &str,
+    recording: bool,
+    error: Option<&str>,
+) {
+    if ui.clipboard_shortcut.is_null() {
+        return;
+    }
+    let title = if recording {
+        t("settings.clipboard_shortcut_record_prompt")
+    } else {
+        crate::mouse::shortcut::display_shortcut(current)
+    };
+    set_control_title(ui.clipboard_shortcut, &title);
+    let mut button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
+    let Some(row_label) = SettingsRow::label_for(ui.clipboard_shortcut) else {
+        return;
+    };
+    let row_label_frame: NSRect = msg_send![row_label, frame];
+    let row_center = row_label_frame.origin.y + row_label_frame.size.height / 2.0;
+    if error.is_some() && !ui.clipboard_shortcut_error.is_null() {
+        let mut error_frame: NSRect = msg_send![ui.clipboard_shortcut_error, frame];
+        let row_origin = row_center - ui.clipboard_shortcut_row_height / 2.0;
+        error_frame.origin.y = row_origin + 2.0;
+        let _: () = msg_send![ui.clipboard_shortcut_error, setFrame: error_frame];
+        button_frame.origin.y = error_frame.origin.y + error_frame.size.height + 2.0;
+    } else {
+        button_frame.origin.y = row_center - button_frame.size.height / 2.0;
+    }
+    let _: () = msg_send![ui.clipboard_shortcut, setFrame: button_frame];
+    if !ui.clipboard_shortcut_error.is_null() {
+        set_field(ui.clipboard_shortcut_error, error.unwrap_or_default());
+        let _: () = msg_send![ui.clipboard_shortcut_error, setHidden: error.is_none()];
+    }
+}
+
+pub(super) fn set_clipboard_shortcut_recording_ui(recording: bool, error: Option<&str>) {
+    let current = CONFIG.read().unwrap().clipboard.shortcut.clone();
+    with_settings_ui(|slot| {
+        let Some(ui) = slot.as_ref() else { return };
+        let visible: bool = unsafe { msg_send![ui.window, isVisible] };
+        if visible {
+            unsafe { set_clipboard_shortcut_capture_state(ui, &current, recording, error) };
+        }
+    });
+}
+
+pub(super) fn refresh_clipboard_shortcut_record_control() {
+    let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
+        && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
+    set_clipboard_shortcut_recording_ui(recording, None);
+}
+
+pub(super) fn apply_recorded_clipboard_shortcut(shortcut: &str) {
+    let old = CONFIG.read().unwrap().clone();
+    let mut updated = old.clone();
+    updated.clipboard.shortcut = shortcut.to_string();
+    if let Ok(mut config) = CONFIG.write() {
+        *config = updated.clone();
+    }
+    schedule_config_persist();
+    apply_config_change(&old, &updated, ConfigChangeSource::Settings);
+}
+
 /// Bind a control to the unified change callback (switches/popups/sliders).
 pub(super) unsafe fn bind_control(target: *mut AnyObject, ctrl: *mut AnyObject) {
     let _: () = msg_send![ctrl, setTarget: target];
@@ -1022,6 +1087,7 @@ pub(super) unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
     // greys it out (whether it shows at all is decided by "delete entry after paste", see
     // update_clipboard_delete_dependent_visibility), so it no longer stacks a second condition.
     for &ctrl in &[
+        ui.clipboard_shortcut,
         ui.clipboard_pin_follow,
         ui.clipboard_persist,
         ui.clipboard_show_source_app,
@@ -1324,6 +1390,10 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             if !visible {
                 return;
             }
+
+            let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
+                && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
+            set_clipboard_shortcut_capture_state(u, &cfg.clipboard.shortcut, recording, None);
 
             ensure_selected_device();
             let resolved = resolve_selected_from(&cfg);

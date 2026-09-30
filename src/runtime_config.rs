@@ -26,6 +26,7 @@ struct ChangeFlags {
     show_app_name_in_cards: bool,
     mouse: bool,
     clipboard_enabled: bool,
+    clipboard_shortcut: bool,
     clipboard_persist: bool,
     window_control: bool,
     quick_actions: bool,
@@ -54,6 +55,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
             != new.layout.show_app_name_in_cards,
         mouse: startup || old.mouse != new.mouse,
         clipboard_enabled: startup || old.clipboard.enabled != new.clipboard.enabled,
+        clipboard_shortcut: startup || old.clipboard.shortcut != new.clipboard.shortcut,
         clipboard_persist: old.clipboard.persist != new.clipboard.persist,
         window_control: startup || old.window_control.enabled != new.window_control.enabled,
         quick_actions: startup || old.quick_actions.enabled != new.quick_actions.enabled,
@@ -96,6 +98,11 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
             _ => crate::logger::LogLevel::Info,
         };
         crate::logger::reconfigure(level);
+    }
+    if flags.clipboard_shortcut {
+        crate::event_monitor::set_clipboard_shortcut(&new.clipboard.shortcut);
+        crate::settings::refresh_clipboard_shortcut_control_from_config();
+        crate::onboarding::refresh_clipboard_shortcut(&new.clipboard.shortcut);
     }
     if flags.windows_disabled {
         crate::overlay::reset_switcher();
@@ -211,6 +218,16 @@ mod tests {
         assert!(
             flags.mouse && flags.clipboard_enabled && flags.window_control && flags.quick_actions
         );
+    }
+
+    #[test]
+    fn clipboard_shortcut_changes_are_detected_independently_of_the_master_switch() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.clipboard.shortcut = "cmd+shift+v".into();
+        let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+        assert!(flags.clipboard_shortcut);
+        assert!(!flags.clipboard_enabled);
     }
 
     #[test]

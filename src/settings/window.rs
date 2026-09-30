@@ -869,6 +869,63 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
+        let clipboard_shortcut_layout_ok = with_settings_ui(|ui| {
+            let ui = ui.as_ref()?;
+            if ui.clipboard_shortcut.is_null()
+                || ui.clipboard_shortcut_error.is_null()
+                || ui.clipboard_pin_follow.is_null()
+            {
+                return Some(false);
+            }
+            let button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
+            let pin_frame: NSRect = msg_send![ui.clipboard_pin_follow, frame];
+            let error_hidden: bool = msg_send![ui.clipboard_shortcut_error, isHidden];
+            let button_is_native: bool =
+                msg_send![ui.clipboard_shortcut, isKindOfClass: class!(NSButton)];
+            let button_center = button_frame.origin.y + button_frame.size.height / 2.0;
+            let button_label = SettingsRow::label_for(ui.clipboard_shortcut)?;
+            let label_frame: NSRect = msg_send![button_label, frame];
+            let label_center = label_frame.origin.y + label_frame.size.height / 2.0;
+            let controls_center_gap = ((button_frame.origin.y + button_frame.size.height / 2.0)
+                - (pin_frame.origin.y + pin_frame.size.height / 2.0))
+                .abs();
+            let expected_center_gap =
+                (ui.clipboard_shortcut_row_height + ui.clipboard_pin_follow_row_height) / 2.0
+                    + ui.clipboard_row_gap;
+            let default_layout_ok = button_is_native
+                && (button_frame.size.width - ROW_ACTION_BTN_W).abs() <= 0.5
+                && (button_frame.size.height - ROW_ACTION_BTN_H).abs() <= 0.5
+                && error_hidden
+                && (button_center - label_center).abs() <= 1.0
+                && (controls_center_gap - expected_center_gap).abs() <= 1.0;
+
+            let current_shortcut = crate::config::CONFIG
+                .read()
+                .unwrap()
+                .clipboard
+                .shortcut
+                .clone();
+            dispatch::set_clipboard_shortcut_capture_state(
+                ui,
+                &current_shortcut,
+                false,
+                Some("layout smoke"),
+            );
+            let error_button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
+            let error_frame: NSRect = msg_send![ui.clipboard_shortcut_error, frame];
+            let error_hidden: bool = msg_send![ui.clipboard_shortcut_error, isHidden];
+            let error_layout_ok = !error_hidden
+                && error_button_frame.origin.y >= error_frame.origin.y + error_frame.size.height;
+            dispatch::set_clipboard_shortcut_capture_state(ui, &current_shortcut, false, None);
+
+            Some(default_layout_ok && error_layout_ok)
+        })
+        .unwrap_or(false);
+        if !clipboard_shortcut_layout_ok {
+            log_info!("[smoke-settings-layout] clipboard shortcut control has a blank row or invalid capture layout");
+            hide_settings();
+            return false;
+        }
         let _: () = msg_send![window, layoutIfNeeded];
         let opaque: bool = msg_send![window, isOpaque];
         if opaque {
@@ -1845,6 +1902,11 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             mapping_panel: std::ptr::null_mut(),
             mapping_rows: Vec::new(),
             clipboard_enabled: std::ptr::null_mut(),
+            clipboard_shortcut: std::ptr::null_mut(),
+            clipboard_shortcut_error: std::ptr::null_mut(),
+            clipboard_shortcut_row_height: 0.0,
+            clipboard_pin_follow_row_height: 0.0,
+            clipboard_row_gap: 0.0,
             window_control_enabled: std::ptr::null_mut(),
             window_control_up: std::ptr::null_mut(),
             window_control_down: std::ptr::null_mut(),

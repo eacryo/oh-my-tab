@@ -6,7 +6,7 @@
 //! which key to press, or which permission it needs.
 //!
 //! Design: never blocking (permissions can be deferred, the display-mode and clipboard-history
-//! choices take effect the moment they are picked because the switcher and the Option+V hotkey read
+//! choices take effect the moment they are picked because the switcher and clipboard hotkey read
 //! the live config, and launch at login applies on Next); four fixed steps; auto-shown once (the
 //! UserDefaults marker is written as soon as it appears, and the status item's "Welcome" entry or a
 //! development switch reopens it -- a missing permission stays covered by the startup alert);
@@ -285,6 +285,7 @@ struct UiState {
     thumbnails_enabled: bool,
     clipboard_enabled: bool,
     clipboard_persist: bool,
+    clipboard_shortcut: String,
 }
 
 static WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -409,6 +410,7 @@ fn show_internal_at(overrides: PermissionOverride, start_index: usize) {
         thumbnails_enabled: config.layout.thumbnails_enabled,
         clipboard_enabled: config.clipboard.enabled,
         clipboard_persist: config.clipboard.persist,
+        clipboard_shortcut: config.clipboard.shortcut.clone(),
     };
     let (step_number, step_count) = (state.index + 1, state.steps.len());
     *STATE.lock().unwrap() = Some(state);
@@ -443,6 +445,23 @@ pub(crate) fn tick() {
         state.index = index;
     }
     render_current_step();
+}
+
+/// Keep the visible clipboard step's displayed binding in sync with config reloads without
+/// exposing a setting choice in onboarding.
+pub(crate) fn refresh_clipboard_shortcut(shortcut: &str) {
+    crate::debug_assert_main_thread();
+    let should_render = {
+        let mut state = STATE.lock().unwrap();
+        let Some(state) = state.as_mut() else {
+            return;
+        };
+        state.clipboard_shortcut = shortcut.to_string();
+        state.steps.get(state.index) == Some(&Step::ClipboardHistory)
+    };
+    if should_render && is_visible() {
+        render_current_step();
+    }
 }
 
 pub(crate) fn is_visible() -> bool {
@@ -729,9 +748,12 @@ fn render_current_step() {
             Step::DisplayMode => {
                 render_display_mode(content, state.thumbnails_enabled, screen_granted)
             }
-            Step::ClipboardHistory => {
-                render_clipboard_history(content, state.clipboard_enabled, state.clipboard_persist)
-            }
+            Step::ClipboardHistory => render_clipboard_history(
+                content,
+                state.clipboard_enabled,
+                state.clipboard_persist,
+                &state.clipboard_shortcut,
+            ),
             Step::MoreFeatures => render_more_features(content),
         }
         render_footer(content, state.index);
@@ -896,6 +918,8 @@ struct ClipboardStepLayout {
     title_y: f64,
     body_y: f64,
     body_h: f64,
+    shortcut_hint_y: f64,
+    shortcut_hint_h: f64,
     enabled_row_y: f64,
     persist_row_y: f64,
     persist_hint_y: f64,
@@ -905,11 +929,11 @@ struct ClipboardStepLayout {
 const CLIPBOARD_STEP: ClipboardStepLayout = ClipboardStepLayout {
     // The title keeps the same y as the other steps so moving between steps does not shift it.
     title_y: 194.0,
-    body_y: 150.0,
-    // 40pt holds the two wrapped lines of the longest body copy (en/zh); 48 used to leave a gap
-    // above the now-taller switch stack.
-    body_h: 40.0,
-    enabled_row_y: 116.0,
+    body_y: 156.0,
+    body_h: 34.0,
+    shortcut_hint_y: 142.0,
+    shortcut_hint_h: 14.0,
+    enabled_row_y: 110.0,
     persist_row_y: 78.0,
     persist_hint_y: 56.0,
     persist_hint_h: 16.0,
@@ -919,7 +943,12 @@ const CLIPBOARD_STEP: ClipboardStepLayout = ClipboardStepLayout {
 const SWITCH_ROW_LABEL_H: f64 = 28.0;
 const SWITCH_ROW_LABEL_TRAILING: f64 = 58.0;
 
-unsafe fn render_clipboard_history(content: *mut AnyObject, enabled: bool, persist: bool) {
+unsafe fn render_clipboard_history(
+    content: *mut AnyObject,
+    enabled: bool,
+    persist: bool,
+    shortcut: &str,
+) {
     add_label(
         content,
         &t("onboarding.clipboard_title"),
@@ -931,16 +960,21 @@ unsafe fn render_clipboard_history(content: *mut AnyObject, enabled: bool, persi
     );
     add_label(
         content,
-        &t(if enabled {
-            "onboarding.clipboard_body_enabled"
-        } else {
-            "onboarding.clipboard_body"
-        }),
+        &clipboard_shortcut_body(shortcut, enabled),
         PAD,
         CLIPBOARD_STEP.body_y,
         WINDOW_W - PAD * 2.0,
         CLIPBOARD_STEP.body_h,
         BODY_STYLE,
+    );
+    add_label(
+        content,
+        &t("onboarding.clipboard_shortcut_hint"),
+        PAD,
+        CLIPBOARD_STEP.shortcut_hint_y,
+        WINDOW_W - PAD * 2.0,
+        CLIPBOARD_STEP.shortcut_hint_h,
+        HINT_STYLE,
     );
     add_switch_row(
         content,
@@ -969,6 +1003,18 @@ unsafe fn render_clipboard_history(content: *mut AnyObject, enabled: bool, persi
             HINT_STYLE,
         );
     }
+}
+
+fn clipboard_shortcut_body(shortcut: &str, enabled: bool) -> String {
+    let formatted = crate::mouse::shortcut::display_shortcut(shortcut);
+    tf(
+        if enabled {
+            "onboarding.clipboard_body_enabled"
+        } else {
+            "onboarding.clipboard_body"
+        },
+        &[("shortcut", formatted.as_str())],
+    )
 }
 
 unsafe fn render_more_features(content: *mut AnyObject) {
@@ -1350,7 +1396,7 @@ fn request_screen_recording_from_guide() {
 }
 
 /// Applies a guide choice immediately instead of waiting for Next: the switcher (display mode) and
-/// the Option+V hotkey (clipboard history) both read the live `CONFIG`, so a deferred draft would
+/// the configured clipboard hotkey both read the live `CONFIG`, so a deferred draft would
 /// make the step's own instructions do nothing. The draft is updated first so a re-render keeps the
 /// selection; `commit_step_selection` no-ops when the value already matches.
 fn apply_choice_now(step: Step, update: impl FnOnce(&mut UiState)) {
@@ -1849,6 +1895,17 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_onboarding_body_displays_the_configured_custom_chord() {
+        let mut config = Config::default();
+        config.clipboard.shortcut = "cmd+shift+v".into();
+        for enabled in [false, true] {
+            let body = clipboard_shortcut_body(&config.clipboard.shortcut, enabled);
+            assert!(body.contains("⌘⇧V"), "{body}");
+            assert!(!body.contains("Option+V"), "{body}");
+        }
+    }
+
+    #[test]
     fn onboarding_draft_settings_commit_only_for_their_step() {
         let old = Config::default();
         let draft = UiState {
@@ -1859,6 +1916,7 @@ mod tests {
             thumbnails_enabled: false,
             clipboard_enabled: true,
             clipboard_persist: true,
+            clipboard_shortcut: "option+v".into(),
         };
 
         let after_permissions =
@@ -1907,6 +1965,7 @@ mod tests {
             thumbnails_enabled: false,
             clipboard_enabled: false,
             clipboard_persist: true,
+            clipboard_shortcut: "option+v".into(),
         };
         let disabled = config_with_step_selection(&old, &draft, Step::ClipboardHistory);
         assert!(!disabled.clipboard.enabled);
@@ -1921,8 +1980,8 @@ mod tests {
     }
 
     /// The clipboard page's rows must not overlap: the persist hint clears the footer buttons, the
-    /// persist row sits above the hint, the master row above the persist row, and the body above
-    /// the master row. Kept as a pure check so a layout edit fails without a GUI.
+    /// persist row sits above the hint, the master row above the persist row, and the shortcut hint
+    /// and body sit above the master row. Kept as a pure check so layout edits fail without a GUI.
     #[test]
     fn clipboard_step_rows_stay_ordered_and_clear_the_footer() {
         let step = CLIPBOARD_STEP;
@@ -1932,12 +1991,25 @@ mod tests {
         );
         assert!(step.persist_row_y >= step.persist_hint_y + step.persist_hint_h);
         assert!(step.enabled_row_y >= step.persist_row_y + BUTTON_H);
-        assert!(step.body_y >= step.enabled_row_y + BUTTON_H);
+        assert!(step.shortcut_hint_y >= step.enabled_row_y + BUTTON_H);
+        assert!(step.body_y >= step.shortcut_hint_y + step.shortcut_hint_h);
         assert!(step.title_y >= step.body_y + step.body_h);
         assert!(
             step.title_y + TITLE_H <= WINDOW_H - 34.0,
             "the title must clear the step counter pinned near the top edge"
         );
+        for (locale, raw) in LOCALE_SOURCES {
+            for key in ["clipboard_body", "clipboard_body_enabled"] {
+                assert!(
+                    locale_onboarding_string(raw, key).contains("{shortcut}"),
+                    "{locale}: onboarding.{key} must interpolate the effective binding"
+                );
+            }
+            assert!(
+                !locale_onboarding_string(raw, "clipboard_shortcut_hint").is_empty(),
+                "{locale}: shortcut-change hint is missing"
+            );
+        }
     }
 
     /// Toggling clipboard persistence must not rebuild the page: the clicked switch has already
@@ -2019,7 +2091,7 @@ mod tests {
 
     /// Picking a display mode or enabling clipboard history in the guide must reach the live
     /// config on the click, not on Next: a user who tested with the hotkey right after picking it
-    /// used to keep the old mode, and the step's "try Option+V" hint would do nothing. The runner
+    /// used to keep the old mode, and the step's displayed shortcut would do nothing. The runner
     /// commits through the real apply path, which persists, so it gets a throwaway HOME. It is run
     /// once with clipboard history off and once with it on, because the persist row only exists
     /// while history is on and the runner must not assume the loaded config starts off.

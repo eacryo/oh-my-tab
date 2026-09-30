@@ -46,6 +46,7 @@ pub(super) enum SettingsTextRole {
     Disabled,
     Accent,
     AccentHover,
+    Destructive,
 }
 
 /// Resolve one text role from the active light/dark palette.
@@ -59,6 +60,7 @@ pub(super) fn settings_text_color(role: SettingsTextRole) -> *mut AnyObject {
         SettingsTextRole::Disabled => palette.disabled_text,
         SettingsTextRole::Accent => palette.accent,
         SettingsTextRole::AccentHover => palette.accent_hover,
+        SettingsTextRole::Destructive => palette.destructive,
     };
     crate::ffi::hex_to_ns_color(color)
 }

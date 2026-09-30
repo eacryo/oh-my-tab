@@ -347,6 +347,7 @@ pub(crate) fn cancel_recording_from_main() {
         *REC_STAGE.lock().unwrap() = RecStage::Idle;
         *REC_MODS.lock().unwrap() = 0;
         REC_DESC.lock().unwrap().clear();
+        REC_COMPLETED_DESC.lock().unwrap().clear();
         REC_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
         crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
         disable_rec_tap();
@@ -369,9 +370,14 @@ pub(super) fn disable_rec_tap() {
 }
 
 pub(super) unsafe fn finish_recording(success: bool) {
-    *REC_STAGE.lock().unwrap() = RecStage::Idle;
-    // Clear the intermediates on finish/cancel, so nothing leaks into the next session.
+    *REC_STAGE.lock().unwrap() = RecStage::Completing;
+    // Keep a completed chord separate until its main-thread callback consumes it.
     *REC_MODS.lock().unwrap() = 0;
+    *REC_COMPLETED_DESC.lock().unwrap() = if success {
+        REC_DESC.lock().unwrap().clone()
+    } else {
+        String::new()
+    };
     REC_DESC.lock().unwrap().clear();
     REC_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
@@ -487,7 +493,8 @@ pub(super) unsafe fn recording_thread() {
     );
     let Some(created) = created else {
         // Tap creation failed (missing permission etc.): reset state, notify cancel.
-        *REC_STAGE.lock().unwrap() = RecStage::Idle;
+        *REC_STAGE.lock().unwrap() = RecStage::Completing;
+        REC_COMPLETED_DESC.lock().unwrap().clear();
         crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
         *REC_RUNLOOP.0.lock().unwrap() = None;
         notify_main(sel!(handleRecordingCancelled:));
@@ -955,7 +962,9 @@ pub(crate) extern "C" fn handle_recording_finished(
     _arg: *mut c_void,
 ) {
     let btn = *REC_BUTTON.lock().unwrap();
-    match *REC_MODE.lock().unwrap() {
+    let mode = *REC_MODE.lock().unwrap();
+    let desc = REC_COMPLETED_DESC.lock().unwrap().clone();
+    match mode {
         // The panel recorded the trigger: update the panel.
         RecMode::PanelTrigger => {
             *EDIT_BUTTON.lock().unwrap() = Some(btn);
@@ -966,14 +975,34 @@ pub(crate) extern "C" fn handle_recording_finished(
         }
         // The panel recorded the combo: update the panel (Key Press action).
         RecMode::PanelCombo => {
-            let desc = REC_DESC.lock().unwrap().clone();
             *EDIT_COMBO.lock().unwrap() = desc.clone();
             unsafe {
                 update_mapping_panel();
             }
-            log_debug!("[mouse] panel combo recorded: {}", desc);
+            log_debug!("[mouse] panel combo recorded");
+        }
+        RecMode::ClipboardShortcut => {
+            let error = match crate::mouse::shortcut::validate_clipboard_shortcut(&desc) {
+                Ok(_) => {
+                    super::apply_recorded_clipboard_shortcut(&desc);
+                    None
+                }
+                Err(crate::mouse::shortcut::ClipboardShortcutError::Invalid) => Some(tf(
+                    "errors.clipboard_shortcut_invalid",
+                    &[(
+                        "value",
+                        crate::mouse::shortcut::display_shortcut(&desc).as_str(),
+                    )],
+                )),
+                Err(crate::mouse::shortcut::ClipboardShortcutError::Conflict) => {
+                    Some(t("errors.clipboard_shortcut_conflict"))
+                }
+            };
+            super::set_clipboard_shortcut_recording_ui(false, error.as_deref());
         }
     }
+    *REC_COMPLETED_DESC.lock().unwrap() = String::new();
+    *REC_STAGE.lock().unwrap() = RecStage::Idle;
 }
 
 /// Main-thread callback: recording cancelled/failed.
@@ -982,7 +1011,34 @@ pub(crate) extern "C" fn handle_recording_cancelled(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
+    if *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut {
+        super::set_clipboard_shortcut_recording_ui(false, None);
+    }
+    REC_COMPLETED_DESC.lock().unwrap().clear();
+    *REC_STAGE.lock().unwrap() = RecStage::Idle;
     log_debug!("[mouse] button-mapping recording cancelled");
+}
+
+/// The clipboard settings action records one chord through the same HID tap used by mouse
+/// mappings, so both features share Esc handling and tap teardown.
+pub(crate) extern "C" fn handle_clipboard_shortcut_record(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    if *REC_STAGE.lock().unwrap() != RecStage::Idle {
+        return;
+    }
+    REC_DESC.lock().unwrap().clear();
+    REC_COMPLETED_DESC.lock().unwrap().clear();
+    *REC_MODS.lock().unwrap() = 0;
+    *REC_MODE.lock().unwrap() = RecMode::ClipboardShortcut;
+    *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
+    REC_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
+    super::set_clipboard_shortcut_recording_ui(true, None);
+    log_debug!("[settings] clipboard shortcut recording started");
+    *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
 }
 
 #[cfg(test)]

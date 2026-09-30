@@ -1851,6 +1851,12 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handleClipboardShortcutRecord:),
+                settings::handle_clipboard_shortcut_record as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleWindowControlEnabledToggle:),
                 handle_window_control_enabled_toggle as *mut c_void,
                 types.as_ptr(),

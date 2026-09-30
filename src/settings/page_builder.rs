@@ -1258,6 +1258,40 @@ pub(super) unsafe fn build_clipboard_page(
     canvas.card(&t("settings.header_clipboard"));
     // Keep the history controls in a second titled card, matching the switcher layout.
     canvas.next_section();
+    let active_shortcut = crate::config::CONFIG
+        .read()
+        .unwrap()
+        .clipboard
+        .shortcut
+        .clone();
+    let shortcut_row_h = (row_h + 22.0).max(60.0);
+    let cy = canvas.next_row(shortcut_row_h);
+    ui.clipboard_shortcut_row_height = shortcut_row_h;
+    ui.clipboard_shortcut = SettingsRow::plain(
+        clipboard_view,
+        label_x,
+        cy,
+        220.0,
+        shortcut_row_h,
+        &t("settings.row_clipboard_shortcut"),
+        row_action_button(
+            ctrl_x,
+            ctrl_w,
+            cy + (shortcut_row_h - ROW_ACTION_BTN_H) / 2.0,
+            &crate::mouse::shortcut::display_shortcut(&active_shortcut),
+            target,
+            sel!(handleClipboardShortcutRecord:),
+        ),
+    );
+    ui.clipboard_shortcut_error =
+        make_value_label(label_x, cy + 2.0, content_w - label_x - 12.0, 18.0, "");
+    apply_settings_text_role(ui.clipboard_shortcut_error, SettingsTextRole::Destructive);
+    let _: () = msg_send![ui.clipboard_shortcut_error, setHidden: true];
+    let _: () = msg_send![clipboard_view, addSubview: ui.clipboard_shortcut_error];
+    release_obj(ui.clipboard_shortcut_error);
+    let shortcut_tooltip = make_nsstring(&t("settings.desc_clipboard_shortcut"));
+    let _: () = msg_send![ui.clipboard_shortcut, setToolTip: shortcut_tooltip];
+    release_obj(shortcut_tooltip);
     // Pin-selection popup: items = [Follow the Pinned Entry, Keep Current Position];
     // default index 0 (follow); the real value is set by load_settings_from.
     let pin_labels = [
@@ -1266,7 +1300,10 @@ pub(super) unsafe fn build_clipboard_page(
     ];
     let pin_label_refs: Vec<&str> = pin_labels.iter().map(|s| s.as_str()).collect();
     let pin_metrics = SettingsSelect::metrics(ctrl_w, &pin_label_refs, row_h, described_row_h);
+    ui.clipboard_pin_follow_row_height = pin_metrics.row_h;
+    ui.clipboard_row_gap = layout.row_gap;
     let cy = canvas.next_row(pin_metrics.row_h);
+    SettingsRow::separator_above_row(clipboard_view, cy, pin_metrics.row_h, content_w);
     ui.clipboard_pin_follow = SettingsRow::plain(
         clipboard_view,
         label_x,

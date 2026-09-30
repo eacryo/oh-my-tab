@@ -110,7 +110,8 @@ fn internal_dispatch(keycode: u16, flags: u32, down: bool) -> bool {
         }
         return true;
     }
-    // Clipboard summon: Option+V (only while enabled; toggles on press, nothing on release).
+    // Option+V remains an internal fast path for the default binding. Other configured clipboard
+    // chords are posted normally and the session-level event monitor catches the loop-back.
     if keycode == 9 && flags == FLAG_ALT && down {
         let enabled = crate::config::CONFIG
             .read()

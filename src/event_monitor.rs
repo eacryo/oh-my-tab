@@ -5,7 +5,7 @@
 use crate::event_tap::{self, tap_location, tap_options, tap_placement};
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,9 +31,35 @@ use crate::event_tap::keyboard::{
     EVENT_FLAGS_CHANGED as K_CG_EVENT_FLAGS_CHANGED, EVENT_KEY_DOWN as K_CG_EVENT_KEY_DOWN,
     FIELD_AUTOREPEAT as K_CG_KEYBOARD_EVENT_AUTOREPEAT,
     FIELD_KEYCODE as K_CG_KEYBOARD_EVENT_KEYCODE, FLAG_COMMAND as K_CG_EVENT_FLAG_MASK_COMMAND,
-    FLAG_CONTROL as K_CG_EVENT_FLAG_MASK_CONTROL, FLAG_OPTION as K_CG_EVENT_FLAG_MASK_ALTERNATE,
-    FLAG_SHIFT as K_CG_EVENT_FLAG_MASK_SHIFT, VK_TAB as K_VK_TAB, VK_V as K_VK_V,
+    FLAG_OPTION as K_CG_EVENT_FLAG_MASK_ALTERNATE, FLAG_SHIFT as K_CG_EVENT_FLAG_MASK_SHIFT,
+    VK_TAB as K_VK_TAB, VK_V as K_VK_V,
 };
+
+const DEFAULT_CLIPBOARD_SHORTCUT: crate::mouse::shortcut::Shortcut =
+    crate::mouse::shortcut::Shortcut {
+        keycode: K_VK_V,
+        flags: crate::mouse::shortcut::FLAG_ALT,
+    };
+const DEFAULT_CLIPBOARD_SHORTCUT_PACKED: u64 =
+    ((DEFAULT_CLIPBOARD_SHORTCUT.flags as u64) << 16) | DEFAULT_CLIPBOARD_SHORTCUT.keycode as u64;
+static CLIPBOARD_SHORTCUT_PACKED: AtomicU64 = AtomicU64::new(DEFAULT_CLIPBOARD_SHORTCUT_PACKED);
+
+/// Replace the event-tap's cached binding atomically so a key event never observes half an update.
+pub(crate) fn set_clipboard_shortcut(desc: &str) {
+    let shortcut = crate::mouse::shortcut::validate_clipboard_shortcut(desc)
+        .unwrap_or(DEFAULT_CLIPBOARD_SHORTCUT);
+    let packed = ((shortcut.flags as u64) << 16) | shortcut.keycode as u64;
+    CLIPBOARD_SHORTCUT_PACKED.store(packed, Ordering::Release);
+}
+
+fn clipboard_shortcut_matches(keycode: u16, flags: u64) -> bool {
+    let packed = CLIPBOARD_SHORTCUT_PACKED.load(Ordering::Acquire);
+    let shortcut = crate::mouse::shortcut::Shortcut {
+        keycode: (packed & 0xffff) as u16,
+        flags: (packed >> 16) as u32,
+    };
+    crate::mouse::shortcut::matches_shortcut(shortcut, keycode, flags)
+}
 
 fn switcher_tab_event(flags: crate::event_tap::CGEventFlags) -> GlobalEvent {
     if flags & K_CG_EVENT_FLAG_MASK_SHIFT != 0 {
@@ -91,7 +117,7 @@ unsafe extern "C" fn event_tap_callback(
                 };
                 if (flags & mod_mask) != 0 {
                     // Master switch: when off, pass the event through (the native Cmd+Tab
-                    // takes over) -- no swallow, no event. Same philosophy as the Option+V
+                    // takes over) -- no swallow, no event. Same philosophy as the clipboard
                     // passthrough: a disabled feature returns the combo to the system.
                     if !crate::config::CONFIG
                         .read()
@@ -117,28 +143,15 @@ unsafe extern "C" fn event_tap_callback(
                     crate::enqueue_global_event(switcher_tab_event(flags));
                     return std::ptr::null_mut();
                 }
-            } else if keycode == K_VK_V && (flags & K_CG_EVENT_FLAG_MASK_ALTERNATE) != 0 {
-                // History-clipboard summon: Option+V (always Option, independent of the
-                // shortcut mode). The event is swallowed, mirroring Win+V. Only the combo
-                // name is logged (privacy convention).
-                //
-                // Precise match is required: flags is the bitmask of ALL currently held
-                // modifiers, so a bare "contains Option" check would swallow combos like
-                // Cmd+Option+V (paste-and-match-style) and break the system shortcut.
-                // Combos carrying any other modifier pass through untouched.
-                let other_mods = flags
-                    & (K_CG_EVENT_FLAG_MASK_COMMAND
-                        | K_CG_EVENT_FLAG_MASK_SHIFT
-                        | K_CG_EVENT_FLAG_MASK_CONTROL);
-                if other_mods != 0 {
-                    // Combos with extra modifiers (e.g. Cmd+Option+V) pass through.
-                    log_debug!("[kbd] Option+V passthrough (extra modifiers)");
-                } else if !crate::config::CONFIG.read().unwrap().clipboard.enabled {
-                    // When the feature is disabled, do NOT swallow Option+V -- other apps may
-                    // need the combo, so it passes through untouched.
-                    log_debug!("[kbd] Option+V passthrough (clipboard disabled)");
+            }
+            if clipboard_shortcut_matches(keycode, flags) {
+                // Side-button mappings that synthesize this chord intentionally loop back through
+                // the session tap and can open clipboard history as well.
+                if !crate::config::CONFIG.read().unwrap().clipboard.enabled {
+                    // Preserve the configured chord for other apps while clipboard history is off.
+                    log_debug!("[kbd] clipboard shortcut passthrough (clipboard disabled)");
                 } else {
-                    log_debug!("[kbd] summon keyDown V+Option (clipboard)");
+                    log_debug!("[kbd] clipboard shortcut pressed");
                     crate::enqueue_global_event(GlobalEvent::ClipboardToggled);
                     return std::ptr::null_mut();
                 }

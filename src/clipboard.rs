@@ -3,8 +3,8 @@
 //! Architecture:
 //! - A main-thread NSTimer polls NSPasteboard's changeCount every 0.5s; when it changes,
 //!   the text/image is read into the history (duplicates are skipped, overflow trimmed).
-//! - Option+V is detected by the event_monitor tap and marshalled to the main thread via the
-//!   bridge (on_clipboard_toggle), showing/hiding the picker. Tab cycles filters; arrow keys
+//! - The configured history shortcut is detected by the event_monitor tap and marshalled to the
+//!   main thread via the bridge (on_clipboard_toggle), showing/hiding the picker. Tab cycles filters; arrow keys
 //!   / Enter / Esc / clicks navigate: up/down select, left pins (also while the detail panel
 //!   is open), right expands a detail panel (full text / large image; it follows ↑/↓ browsing
 //!   live; pressing → again closes it), Enter or a click = write back to the
@@ -1981,7 +1981,7 @@ mod tests {
             NSPASTEBOARD_TYPE_WEBP,
         };
         // Core regression: when an animated GIF coexists with static PNG/TIFF, GIF must
-        // win (otherwise the history holds a static frame and Option+V stops animating --
+        // win (otherwise the history holds a static frame and its summon shortcut stops animating --
         // the exact bug where Cmd+V pasted a GIF but ours pasted a static image).
         assert_eq!(
             preferred_uti(&[NSPASTEBOARD_TYPE_PNG, NSPASTEBOARD_TYPE_GIF]),

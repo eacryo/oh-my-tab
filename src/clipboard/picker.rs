@@ -382,10 +382,11 @@ extern "C" fn detail_finish_close(this: *mut c_void, _cmd: Sel, _sender: *mut c_
     }
 }
 
-/// Toggle the picker on Option+V (called on the main thread by the bridge).
+/// Toggle the picker on the configured global history shortcut (called on the main thread by the
+/// bridge).
 pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    // Ignore the summon when the master switch is off (Option+V must not open the picker
-    // after the user disabled the feature in Settings).
+    // Ignore the summon when the master switch is off (the configured shortcut must not open the
+    // picker after the user disabled the feature in Settings).
     if !CONFIG.read().unwrap().clipboard.enabled {
         log_debug!("[clip] toggle ignored: clipboard history disabled");
         return;

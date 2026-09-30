@@ -76,6 +76,7 @@ enum RecStage {
     Idle,
     WaitingButton,
     WaitingCombo,
+    Completing,
 }
 
 /// Recording stage (read/written on the main thread; the recording thread advances it via
@@ -86,6 +87,8 @@ static REC_BUTTON: Mutex<u32> = Mutex::new(0);
 /// The shortcut description captured while recording (written by the recording thread on
 /// completion, read by the main-thread callback).
 static REC_DESC: Mutex<String> = Mutex::new(String::new());
+/// Completed combo payload handed off to the main-thread selector callback.
+static REC_COMPLETED_DESC: Mutex<String> = Mutex::new(String::new());
 /// The selected device's in-edit mappings (in-memory until OK; rebuilt from config when the
 /// device changes).
 static MAPPING_EDITS: LazyLock<Mutex<HashMap<String, String>>> =
@@ -108,6 +111,7 @@ static REC_MODS: Mutex<u32> = Mutex::new(0);
 enum RecMode {
     PanelTrigger,
     PanelCombo,
+    ClipboardShortcut,
 }
 
 /// The current recording mode (main-thread; handle_recording_finished finishes per mode).
@@ -215,12 +219,17 @@ pub(super) struct SettingsUi {
     mapping_layout_row: usize,
     /// The About page row the inline update host occupies (its height follows the flow).
     update_host_row: usize,
-    mapping_scroll: *mut AnyObject,    // the bindings scroll view
-    mapping_doc: *mut AnyObject,       // document view
-    mapping_card: *mut AnyObject,      // the mappings outer card
-    mapping_panel: *mut AnyObject,     // the nested rounded table panel
-    mapping_rows: Vec<MappingRow>,     // live binding rows
-    clipboard_enabled: *mut AnyObject, // enable clipboard history
+    mapping_scroll: *mut AnyObject,     // the bindings scroll view
+    mapping_doc: *mut AnyObject,        // document view
+    mapping_card: *mut AnyObject,       // the mappings outer card
+    mapping_panel: *mut AnyObject,      // the nested rounded table panel
+    mapping_rows: Vec<MappingRow>,      // live binding rows
+    clipboard_enabled: *mut AnyObject,  // enable clipboard history
+    clipboard_shortcut: *mut AnyObject, // action button that records the global history chord
+    clipboard_shortcut_error: *mut AnyObject, // inline validation error under the capture button
+    clipboard_shortcut_row_height: f64,
+    clipboard_pin_follow_row_height: f64,
+    clipboard_row_gap: f64,
     clipboard_persist: *mut AnyObject, // persist clipboard history
     clipboard_move_used_to_top: *mut AnyObject, // move used entries to top
     clipboard_delete_after_paste: *mut AnyObject, // delete entry after paste
@@ -365,6 +374,19 @@ pub(super) fn with_settings_ui<R>(f: impl FnOnce(&mut Option<SettingsUi>) -> R) 
     SETTINGS_UI.with(|ui| f(&mut ui.borrow_mut()))
 }
 
+/// Refresh just the clipboard shortcut recorder after a config reload without rebuilding Settings.
+pub(crate) fn refresh_clipboard_shortcut_control_from_config() {
+    dispatch::refresh_clipboard_shortcut_record_control();
+}
+
+pub(crate) fn set_clipboard_shortcut_recording_ui(recording: bool, error: Option<&str>) {
+    dispatch::set_clipboard_shortcut_recording_ui(recording, error);
+}
+
+pub(crate) fn apply_recorded_clipboard_shortcut(shortcut: &str) {
+    dispatch::apply_recorded_clipboard_shortcut(shortcut);
+}
+
 /// Whether the settings UI is already borrowed on this thread. An Objective-C notification callback
 /// can be delivered *synchronously from inside* `with_settings_ui` (making the settings window key
 /// or activating the app posts the window/app notifications right there), and any callback that
@@ -481,10 +503,10 @@ pub(crate) use glass_preview::{
 };
 use mapping::*;
 pub(crate) use mapping::{
-    cancel_recording_from_main, handle_add_mapping, handle_delete_mapping, handle_mapping_cancel,
-    handle_mapping_confirm, handle_mapping_edit, handle_mapping_enabled_changed,
-    handle_panel_action_changed, handle_panel_record_combo, handle_panel_record_trigger,
-    handle_recording_cancelled, handle_recording_finished,
+    cancel_recording_from_main, handle_add_mapping, handle_clipboard_shortcut_record,
+    handle_delete_mapping, handle_mapping_cancel, handle_mapping_confirm, handle_mapping_edit,
+    handle_mapping_enabled_changed, handle_panel_action_changed, handle_panel_record_combo,
+    handle_panel_record_trigger, handle_recording_cancelled, handle_recording_finished,
 };
 use page_canvas::*;
 pub(super) use restore::{
@@ -1390,7 +1412,15 @@ fn load_settings_from(cfg: &Config) {
             // thumbnail-only pair) from their own conditions.
             update_conditional_rows(ui);
 
-            // Clipboard page: populate from the global config.
+            // Clipboard page: populate the recorded chord from the global config.
+            let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
+                && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
+            dispatch::set_clipboard_shortcut_capture_state(
+                ui,
+                &cfg.clipboard.shortcut,
+                recording,
+                None,
+            );
             let _: () = msg_send![
                 ui.clipboard_enabled,
                 setState: if cfg.clipboard.enabled { 1isize } else { 0isize }

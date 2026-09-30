@@ -17,6 +17,14 @@ pub(crate) struct Shortcut {
     pub(crate) flags: u32,
 }
 
+const SHORTCUT_MODIFIER_MASK: u32 = FLAG_CMD | FLAG_ALT | FLAG_CTRL | FLAG_SHIFT;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClipboardShortcutError {
+    Invalid,
+    Conflict,
+}
+
 /// Single letter/digit key name -> keycode (ANSI layout; physical order, not alphabetical).
 fn ansi_keycode(name: &str) -> Option<u16> {
     let b = name.as_bytes();
@@ -154,6 +162,45 @@ pub(crate) fn parse_shortcut(desc: &str) -> Result<Shortcut, String> {
     } else {
         Err("no main key".into())
     }
+}
+
+/// Validate a clipboard binding against the app's fixed global shortcuts. The switcher accepts
+/// either Tab modifier with extra modifiers present, and window display-moves accept Option+Shift;
+/// reserve those actual matches too, even when the owning feature is disabled.
+pub(crate) fn validate_clipboard_shortcut(desc: &str) -> Result<Shortcut, ClipboardShortcutError> {
+    let shortcut = parse_shortcut(desc).map_err(|_| ClipboardShortcutError::Invalid)?;
+    let modifiers = shortcut.flags & SHORTCUT_MODIFIER_MASK;
+    let tab = special_keycode("tab").expect("Tab is a supported shortcut key");
+    let conflicts_switcher = shortcut.keycode == tab && modifiers & (FLAG_CMD | FLAG_ALT) != 0;
+    let conflicts_quick_action = ["option+i", "option+e", "option+d", "option+l"]
+        .iter()
+        .filter_map(|chord| parse_shortcut(chord).ok())
+        .any(|reserved| shortcut.keycode == reserved.keycode && modifiers == reserved.flags);
+    let conflicts_window_control = [
+        "option+left",
+        "option+right",
+        "option+up",
+        "option+down",
+        "option+shift+left",
+        "option+shift+right",
+        "option+shift+up",
+        "option+shift+down",
+    ]
+    .iter()
+    .filter_map(|chord| parse_shortcut(chord).ok())
+    .any(|reserved| shortcut.keycode == reserved.keycode && modifiers == reserved.flags);
+    if conflicts_switcher || conflicts_quick_action || conflicts_window_control {
+        Err(ClipboardShortcutError::Conflict)
+    } else {
+        Ok(shortcut)
+    }
+}
+
+/// Event flags contain unrelated state such as Caps Lock and Fn; only the chord grammar's four
+/// modifier bits participate in exact matching.
+pub(crate) fn matches_shortcut(shortcut: Shortcut, keycode: u16, flags: u64) -> bool {
+    keycode == shortcut.keycode
+        && (flags as u32 & SHORTCUT_MODIFIER_MASK) == (shortcut.flags & SHORTCUT_MODIFIER_MASK)
 }
 
 /// A parsed binding: a custom key press, a system action, opening the switcher, or none.
@@ -430,6 +477,67 @@ mod tests {
         let desc = describe_shortcut(0x09, FLAG_CMD | FLAG_SHIFT);
         assert_eq!(desc, "cmd+shift+v");
         assert_eq!(display_shortcut(&desc), "⌘⇧V");
+        assert_eq!(parse_shortcut(&desc), parse_shortcut("shift+command+V"));
+        let captured = describe_shortcut(0x31, FLAG_ALT | FLAG_CTRL);
+        assert_eq!(
+            parse_shortcut(&captured),
+            parse_shortcut("control+option+space")
+        );
+    }
+
+    #[test]
+    fn clipboard_validation_rejects_each_reserved_shortcut_class() {
+        for chord in ["cmd+tab", "option+tab"] {
+            assert_eq!(
+                validate_clipboard_shortcut(chord),
+                Err(ClipboardShortcutError::Conflict),
+                "{chord}"
+            );
+        }
+        assert_eq!(
+            validate_clipboard_shortcut("cmd+ctrl+tab"),
+            Err(ClipboardShortcutError::Conflict)
+        );
+        for chord in ["option+i", "option+e", "option+d", "option+l"] {
+            assert_eq!(
+                validate_clipboard_shortcut(chord),
+                Err(ClipboardShortcutError::Conflict),
+                "{chord}"
+            );
+        }
+        for chord in ["option+left", "option+right", "option+up", "option+down"] {
+            assert_eq!(
+                validate_clipboard_shortcut(chord),
+                Err(ClipboardShortcutError::Conflict),
+                "{chord}"
+            );
+        }
+        assert_eq!(
+            validate_clipboard_shortcut("option+shift+left"),
+            Err(ClipboardShortcutError::Conflict)
+        );
+        assert!(validate_clipboard_shortcut("cmd+shift+v").is_ok());
+    }
+
+    #[test]
+    fn clipboard_matcher_uses_the_configured_chord_and_exact_modifier_set() {
+        let shortcut = parse_shortcut("cmd+shift+v").unwrap();
+        assert!(matches_shortcut(
+            shortcut,
+            0x09,
+            (FLAG_CMD | FLAG_SHIFT) as u64
+        ));
+        assert!(!matches_shortcut(shortcut, 0x09, FLAG_CMD as u64));
+        assert!(!matches_shortcut(
+            shortcut,
+            0x09,
+            (FLAG_CMD | FLAG_SHIFT | FLAG_ALT) as u64
+        ));
+        assert!(matches_shortcut(
+            shortcut,
+            0x09,
+            (FLAG_CMD | FLAG_SHIFT | 0x0001_0000) as u64
+        ));
     }
 
     #[test]

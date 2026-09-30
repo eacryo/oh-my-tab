@@ -259,6 +259,15 @@ impl SettingsRow {
         labels.push((control, label as usize));
     }
 
+    pub(super) fn label_for(control: *mut AnyObject) -> Option<*mut AnyObject> {
+        ROW_LABELS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(registered_control, _)| *registered_control == control as usize)
+            .map(|(_, label)| *label as *mut AnyObject)
+    }
+
     /// Drop row label associations before the settings views are deallocated.
     pub(super) fn clear_runtime_registry() {
         ROW_LABELS.lock().unwrap().clear();
@@ -313,12 +322,7 @@ impl SettingsRow {
         if control.is_null() {
             return;
         }
-        let label = ROW_LABELS
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(registered_control, _)| *registered_control == control as usize)
-            .map(|(_, label)| *label as *mut AnyObject);
+        let label = Self::label_for(control);
         if let Some(label) = label {
             Self::set_view_enabled_with_tooltip(label, enabled, Some(tooltip));
         }

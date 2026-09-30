@@ -285,6 +285,8 @@ impl Default for UpdatesSection {
 pub struct ClipboardSection {
     // History-clipboard master switch; defaults to false (no pasteboard polling).
     pub enabled: bool,
+    // Global key chord that opens history. Uses the mouse button-mapping shortcut grammar.
+    pub shortcut: String,
     // Max history entries (1..=100, default 50).
     pub max_entries: u32,
     // Show the source app: the source is ALWAYS recorded at copy time (ClipEntry.source_app);
@@ -323,6 +325,7 @@ impl Default for ClipboardSection {
     fn default() -> Self {
         Self {
             enabled: false,
+            shortcut: "option+v".to_string(),
             max_entries: 50,
             show_source_app: false,
             persist: false,
@@ -934,6 +937,20 @@ impl Config {
                 &[("value", &self.clipboard.picker_position)],
             ));
         }
+        match crate::mouse::shortcut::validate_clipboard_shortcut(&self.clipboard.shortcut) {
+            Ok(_) => {}
+            Err(crate::mouse::shortcut::ClipboardShortcutError::Invalid) => errs.push(format!(
+                "clipboard.shortcut: {}",
+                tf(
+                    "errors.clipboard_shortcut_invalid",
+                    &[("value", &self.clipboard.shortcut)]
+                )
+            )),
+            Err(crate::mouse::shortcut::ClipboardShortcutError::Conflict) => errs.push(format!(
+                "clipboard.shortcut: {}",
+                i18n::t("errors.clipboard_shortcut_conflict")
+            )),
+        }
 
         for (i, p) in self.mouse.profiles.iter().enumerate() {
             let prefix = format!("mouse.profiles[{i}]");
@@ -1203,6 +1220,9 @@ impl Config {
             .any(|e| e.starts_with("clipboard.picker_position"))
         {
             self.clipboard.picker_position = other.clipboard.picker_position.clone();
+        }
+        if !errs.iter().any(|e| e.starts_with("clipboard.shortcut")) {
+            self.clipboard.shortcut = other.clipboard.shortcut.clone();
         }
         // pin_follow_selection is a bool, always valid.
         self.clipboard.pin_follow_selection = other.clipboard.pin_follow_selection;
@@ -1997,9 +2017,17 @@ mod tests {
     #[test]
     fn defaults_validate_clean() {
         let cfg = Config::default();
+        assert_eq!(cfg.clipboard.shortcut, "option+v");
         assert_err_count(&cfg, 0);
         assert!(!cfg.windows.show_minimized);
         assert!(!cfg.windows.show_hidden_app_windows);
+    }
+
+    #[test]
+    fn old_clipboard_config_without_shortcut_keeps_the_option_v_default() {
+        let cfg: Config = toml::from_str("[clipboard]\nenabled = true\n").unwrap();
+        assert!(cfg.clipboard.enabled);
+        assert_eq!(cfg.clipboard.shortcut, "option+v");
     }
 
     #[test]
@@ -2133,6 +2161,7 @@ mod tests {
         other.i18n.locale = "zh-Hant".into();
         other.mouse.enabled = true;
         other.clipboard.enabled = true;
+        other.clipboard.shortcut = "cmd+shift+v".into();
         other.clipboard.max_entries = 30;
         other.clipboard.persist = true;
         other.clipboard.move_used_to_top = false;
@@ -2147,6 +2176,7 @@ mod tests {
         assert_eq!(merged.i18n.locale, "zh-Hant");
         assert!(merged.mouse.enabled);
         assert!(merged.clipboard.enabled);
+        assert_eq!(merged.clipboard.shortcut, "cmd+shift+v");
         assert_eq!(merged.clipboard.max_entries, 30);
         assert!(merged.clipboard.persist);
         assert!(!merged.clipboard.move_used_to_top);
@@ -2166,6 +2196,38 @@ mod tests {
         assert_err_count(&cfg, 1);
         cfg.clipboard.max_entries = 50;
         assert_err_count(&cfg, 0);
+    }
+
+    #[test]
+    fn clipboard_shortcut_invalid_value_falls_back_per_field() {
+        let mut loaded = Config::default();
+        loaded.clipboard.enabled = true;
+        loaded.clipboard.shortcut = "cmd+not-a-key".into();
+        loaded.clipboard.max_entries = 42;
+        let errors = loaded.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("clipboard.shortcut:"));
+
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        assert_eq!(merged.clipboard.shortcut, "option+v");
+        assert!(merged.clipboard.enabled);
+        assert_eq!(merged.clipboard.max_entries, 42);
+    }
+
+    #[test]
+    fn clipboard_shortcut_conflict_falls_back_per_field() {
+        let mut loaded = Config::default();
+        loaded.clipboard.shortcut = "option+left".into();
+        loaded.clipboard.persist = true;
+        let errors = loaded.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("clipboard.shortcut:"));
+
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        assert_eq!(merged.clipboard.shortcut, "option+v");
+        assert!(merged.clipboard.persist);
     }
 
     #[test]

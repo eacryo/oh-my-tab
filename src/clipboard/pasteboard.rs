@@ -95,7 +95,7 @@ pub(super) unsafe fn any_image_to_preview_png(bytes: &[u8]) -> Option<Vec<u8>> {
 /// **animation-capable originals (GIF/WebP) first** -- when an app copies an animated
 /// GIF, the pasteboard usually carries BOTH the original animated bytes AND a static
 /// re-encode (PNG/JPEG/TIFF); we must take the animated original, otherwise the history
-/// holds a static frame and our Option+V paste stops animating (while the system Cmd+V
+/// holds a static frame and the history-picker summon stops animating (while the system Cmd+V
 /// still pastes the animation from the untouched pasteboard). Static formats follow in
 /// fidelity order: PNG (lossless) > JPEG (lossy) > HEIC > BMP; TIFF is last -- it is the
 /// generic static fallback almost every macOS app carries (NSImagePboardType). A type
