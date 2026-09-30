@@ -1,4 +1,4 @@
-//! Scroll modes: Default (passthrough + optional reverse) / Line (fixed line count).
+//! Scroll modes: Default (passthrough + optional reverse), Line (fixed line count), or Smooth.
 //!
 //! Direction semantics: events seen by the HID-level tap already include the system's natural-scroll
 //! flip (applied when HID events are generated), and synthetic events posted to the session layer
@@ -18,12 +18,14 @@ pub(crate) fn should_flip(user_reverse: bool) -> bool {
 pub(crate) enum ScrollMode {
     Default,
     Line,
+    Smooth,
 }
 
 impl ScrollMode {
     pub(crate) fn from_str(s: &str) -> Self {
         match s {
             "line" => Self::Line,
+            "smooth" => Self::Smooth,
             _ => Self::Default,
         }
     }
@@ -33,6 +35,7 @@ impl ScrollMode {
         match self {
             Self::Default => "default",
             Self::Line => "line",
+            Self::Smooth => "smooth",
         }
     }
 
@@ -45,7 +48,7 @@ impl ScrollMode {
 
     #[allow(dead_code)]
     pub(crate) fn all_labels() -> &'static [&'static str] {
-        &["default", "line"]
+        &["default", "line", "smooth"]
     }
 }
 
@@ -60,7 +63,7 @@ pub(crate) fn compute_delta(
     let flip = should_flip(r.reverse_scroll);
 
     let (mut ndy, mut ndx) = match mode {
-        ScrollMode::Default => (dy as i32, dx as i32),
+        ScrollMode::Default | ScrollMode::Smooth => (dy as i32, dx as i32),
         ScrollMode::Line => {
             let line_count = r.line_count.clamp(1, 10) as i64;
             let sign_y = if dy != 0 { dy.signum() } else { 0 };
@@ -144,10 +147,12 @@ mod tests {
     fn scroll_mode_from_str_falls_back_to_default() {
         // Unknown strings fall back to Default (shouldn't happen after config validation).
         assert_eq!(ScrollMode::from_str("line"), ScrollMode::Line);
+        assert_eq!(ScrollMode::from_str("smooth"), ScrollMode::Smooth);
         assert_eq!(ScrollMode::from_str("default"), ScrollMode::Default);
         assert_eq!(ScrollMode::from_str("turbo"), ScrollMode::Default);
         assert_eq!(ScrollMode::from_str(""), ScrollMode::Default);
         assert_eq!(ScrollMode::as_str(&ScrollMode::Line), "line");
+        assert_eq!(ScrollMode::as_str(&ScrollMode::Smooth), "smooth");
         assert_eq!(ScrollMode::as_str(&ScrollMode::Default), "default");
     }
 }

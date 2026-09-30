@@ -383,6 +383,9 @@ pub struct PartialPointerSection {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct SmoothPartial {
+    // Read only so old configs can be migrated to MouseProfile::scroll_mode. The migration clears
+    // this field before any resolved runtime config is built; it is never written back.
+    #[serde(skip_serializing)]
     pub enabled: Option<bool>,
     pub preset: Option<String>,
     pub response: Option<f64>,
@@ -402,6 +405,7 @@ pub struct MouseProfile {
     // LinearMouse; no natural-scroll setting is read: HID-tap events already carry the system
     // natural-scroll flip and synthetic events aren't flipped again, see should_flip in scrolling.rs).
     pub reverse_scroll: Option<bool>,
+    // The active wheel path: passthrough, line normalization, or timed smooth pixels.
     pub scroll_mode: Option<String>,
     // Line mode lines per notch (1..=10).
     pub line_count: Option<u32>,
@@ -458,7 +462,7 @@ impl Default for MouseSection {
                     acceleration: None,
                 }),
                 smooth_scrolling: Some(SmoothPartial {
-                    enabled: Some(false),
+                    enabled: None,
                     preset: Some("ease_in_out".into()),
                     response: Some(0.68),
                     speed: Some(1.02),
@@ -476,10 +480,8 @@ impl Default for MouseSection {
 }
 
 impl MouseSection {
-    /// Migrate legacy flat fields into an "All Mice" profile. Idempotent: an already-migrated
-    /// config (no legacy fields, has a default profile) is left untouched. Returns whether
-    /// anything changed (legacy fields migrated, or a default profile inserted) -- the caller
-    /// uses it to decide whether to rewrite the file.
+    /// Migrate legacy flat fields into an "All Mice" profile and the legacy smooth-enabled flag
+    /// into the single scroll mode. Returns whether the caller should rewrite the config.
     pub(crate) fn migrate_legacy(&mut self) -> bool {
         // Legacy fields are Option-typed: only keys explicitly written by old-format files are
         // Some. New-format files skip them on serialize, so they reload as None and no longer
@@ -490,56 +492,82 @@ impl MouseSection {
             || self.line_count.is_some()
             || self.pointer.is_some();
 
-        if !has_legacy {
-            // No legacy content (fresh or already migrated): ensure a default "All Mice" profile exists.
-            let has_default = self
+        let mut changed = false;
+        if has_legacy {
+            // Legacy fields present: fold them into (or create) an "All Mice" profile.
+            let legacy_profile = MouseProfile {
+                reverse_scroll: self.reverse_scroll,
+                scroll_mode: self.scroll_mode.clone().map(|m| {
+                    if m.is_empty() {
+                        "default".into()
+                    } else {
+                        m
+                    }
+                }),
+                line_count: self.line_count.map(|n| if n == 0 { 3 } else { n }),
+                pointer: self.pointer.take().map(|p| PartialPointerSection {
+                    disable_acceleration: Some(p.disable_acceleration),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            // Preserve profile fields that have no corresponding legacy flat key, including
+            // smooth tuning. Explicit legacy values still replace their profile counterparts.
+            if let Some(idx) = self
                 .profiles
                 .iter()
-                .any(|p| p.device.vendor_id.is_none() && p.device.product_id.is_none());
-            if !has_default {
-                self.profiles.insert(0, Self::default().profiles[0].clone());
-                return true;
+                .position(|p| p.device.vendor_id.is_none() && p.device.product_id.is_none())
+            {
+                let profile = &mut self.profiles[idx];
+                if legacy_profile.reverse_scroll.is_some() {
+                    profile.reverse_scroll = legacy_profile.reverse_scroll;
+                }
+                if legacy_profile.scroll_mode.is_some() {
+                    profile.scroll_mode = legacy_profile.scroll_mode;
+                }
+                if legacy_profile.line_count.is_some() {
+                    profile.line_count = legacy_profile.line_count;
+                }
+                if legacy_profile.pointer.is_some() {
+                    profile.pointer = legacy_profile.pointer;
+                }
+            } else {
+                // No "All Mice" profile: insert at the front (default first, per-device after).
+                self.profiles.insert(0, legacy_profile);
             }
-            return false;
+
+            // Clear legacy fields (prevents re-migration; serialization skips them anyway).
+            self.reverse_scroll = None;
+            self.scroll_mode = None;
+            self.line_count = None;
+            self.pointer = None;
+            changed = true;
         }
 
-        // Legacy fields present: fold them into (or create) an "All Mice" profile.
-        let legacy_profile = MouseProfile {
-            reverse_scroll: self.reverse_scroll,
-            scroll_mode: self.scroll_mode.clone().map(|m| {
-                if m.is_empty() {
-                    "default".into()
-                } else {
-                    m
+        // The old runtime let enabled=true win over either Default or Line. Convert that choice
+        // independently in every profile before layering, then discard the non-serialized flag.
+        for profile in &mut self.profiles {
+            if let Some(smooth) = profile.smooth_scrolling.as_mut() {
+                if smooth.enabled == Some(true) {
+                    profile.scroll_mode = Some("smooth".into());
                 }
-            }),
-            line_count: self.line_count.map(|n| if n == 0 { 3 } else { n }),
-            pointer: self.pointer.take().map(|p| PartialPointerSection {
-                disable_acceleration: Some(p.disable_acceleration),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+                if smooth.enabled.take().is_some() {
+                    changed = true;
+                }
+            }
+        }
 
-        // If an "All Mice" profile already exists, overwrite its fields with the legacy values
-        // (the legacy fields are the user's true intent).
-        if let Some(idx) = self
+        // Fresh and already-migrated files still need an "All Mice" base profile.
+        let has_default = self
             .profiles
             .iter()
-            .position(|p| p.device.vendor_id.is_none() && p.device.product_id.is_none())
-        {
-            self.profiles[idx] = legacy_profile;
-        } else {
-            // No "All Mice" profile: insert at the front (default first, per-device after).
-            self.profiles.insert(0, legacy_profile);
+            .any(|p| p.device.vendor_id.is_none() && p.device.product_id.is_none());
+        if !has_default {
+            self.profiles.insert(0, Self::default().profiles[0].clone());
+            changed = true;
         }
-
-        // Clear legacy fields (prevents re-migration; serialization skips them anyway).
-        self.reverse_scroll = None;
-        self.scroll_mode = None;
-        self.line_count = None;
-        self.pointer = None;
-        true
+        changed
     }
 }
 
@@ -882,7 +910,7 @@ impl Config {
         for (i, p) in self.mouse.profiles.iter().enumerate() {
             let prefix = format!("mouse.profiles[{i}]");
             if let Some(ref mode) = p.scroll_mode {
-                if !["default", "line"].contains(&mode.as_str()) {
+                if !["default", "line", "smooth"].contains(&mode.as_str()) {
                     errs.push(tf("errors.mouse_scroll_mode_invalid", &[("value", mode)]));
                     // Use the prefix to indicate which profile failed.
                     if let Some(last) = errs.last_mut() {
@@ -1194,19 +1222,11 @@ impl Config {
                 ptr
             });
             merged_p.smooth_scrolling = p.smooth_scrolling.clone().map(|mut smooth| {
-                for field in [
-                    "enabled",
-                    "preset",
-                    "response",
-                    "speed",
-                    "acceleration",
-                    "inertia",
-                ] {
+                for field in ["preset", "response", "speed", "acceleration", "inertia"] {
                     if errs.iter().any(|error| {
                         error.starts_with(&format!("{prefix}.smooth_scrolling.{field}"))
                     }) {
                         match field {
-                            "enabled" => smooth.enabled = None,
                             "preset" => smooth.preset = None,
                             "response" => smooth.response = None,
                             "speed" => smooth.speed = None,
@@ -1301,6 +1321,22 @@ fn config_type_schema() -> toml::Value {
         .expect("default config must serialize")
         .parse::<toml::Value>()
         .expect("serialized default config must parse as TOML");
+
+    // smooth_scrolling.enabled is deserialize-only: retain its legacy bool shape in the read
+    // schema even though serde intentionally omits it from the serialized config defaults.
+    if let Some(profile) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("mouse"))
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|mouse| mouse.get_mut("profiles"))
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|profiles| profiles.first_mut())
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|profile| profile.get_mut("smooth_scrolling"))
+        .and_then(toml::Value::as_table_mut)
+    {
+        profile.insert("enabled".into(), toml::Value::Boolean(false));
+    }
 
     // Legacy mouse fields are intentionally skipped during serialization, but they are still
     // accepted while reading old files and therefore need to be present in the type schema.
@@ -2026,6 +2062,7 @@ mod tests {
     #[test]
     fn smooth_mouse_fields_validate_and_fall_back_independently() {
         let mut loaded = Config::default();
+        loaded.mouse.profiles[0].scroll_mode = Some("line".into());
         let smooth = loaded.mouse.profiles[0].smooth_scrolling.as_mut().unwrap();
         smooth.enabled = Some(true);
         smooth.preset = Some("unknown".into());
@@ -2042,7 +2079,11 @@ mod tests {
         let mut merged = Config::default();
         merged.merge_valid(loaded, &errors);
         let smooth = merged.mouse.profiles[0].smooth_scrolling.as_ref().unwrap();
-        assert_eq!(smooth.enabled, Some(true));
+        assert_eq!(
+            merged.mouse.profiles[0].scroll_mode.as_deref(),
+            Some("smooth")
+        );
+        assert_eq!(smooth.enabled, None);
         assert_eq!(smooth.preset, None);
         assert_eq!(smooth.response, None);
         assert_eq!(smooth.speed, Some(2.4));
@@ -2275,6 +2316,192 @@ mod tests {
         );
         assert!(cfg.mouse.reverse_scroll.is_none());
         assert!(cfg.mouse.scroll_mode.is_none());
+    }
+
+    #[test]
+    fn legacy_smooth_enabled_migrates_each_profile_without_changing_tuning() {
+        let mut cfg = Config::default();
+        cfg.mouse.profiles = vec![
+            MouseProfile {
+                scroll_mode: Some("line".into()),
+                line_count: Some(6),
+                smooth_scrolling: Some(SmoothPartial {
+                    enabled: Some(true),
+                    preset: Some("custom".into()),
+                    response: Some(1.4),
+                    speed: Some(2.1),
+                    acceleration: Some(3.2),
+                    inertia: Some(4.3),
+                }),
+                ..Default::default()
+            },
+            MouseProfile {
+                device: DeviceMatcher {
+                    vendor_id: Some(7),
+                    product_id: Some(9),
+                    ..Default::default()
+                },
+                scroll_mode: Some("default".into()),
+                line_count: Some(5),
+                smooth_scrolling: Some(SmoothPartial {
+                    enabled: Some(true),
+                    response: Some(1.2),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            MouseProfile {
+                device: DeviceMatcher {
+                    vendor_id: Some(8),
+                    product_id: Some(10),
+                    ..Default::default()
+                },
+                scroll_mode: Some("line".into()),
+                smooth_scrolling: Some(SmoothPartial {
+                    enabled: Some(false),
+                    speed: Some(2.7),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            MouseProfile {
+                device: DeviceMatcher {
+                    vendor_id: Some(8),
+                    product_id: Some(11),
+                    ..Default::default()
+                },
+                scroll_mode: Some("default".into()),
+                smooth_scrolling: Some(SmoothPartial {
+                    enabled: Some(false),
+                    acceleration: Some(1.8),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ];
+
+        assert!(cfg.mouse.migrate_legacy());
+        let wildcard = &cfg.mouse.profiles[0];
+        assert_eq!(wildcard.scroll_mode.as_deref(), Some("smooth"));
+        assert_eq!(wildcard.line_count, Some(6));
+        let tuning = wildcard.smooth_scrolling.as_ref().unwrap();
+        assert_eq!(tuning.enabled, None);
+        assert_eq!(tuning.preset.as_deref(), Some("custom"));
+        assert_eq!(tuning.response, Some(1.4));
+        assert_eq!(tuning.speed, Some(2.1));
+        assert_eq!(tuning.acceleration, Some(3.2));
+        assert_eq!(tuning.inertia, Some(4.3));
+
+        let device_smooth = &cfg.mouse.profiles[1];
+        assert_eq!(device_smooth.scroll_mode.as_deref(), Some("smooth"));
+        assert_eq!(device_smooth.line_count, Some(5));
+        assert_eq!(
+            device_smooth.smooth_scrolling.as_ref().unwrap().enabled,
+            None
+        );
+        for (profile, expected) in [
+            (&cfg.mouse.profiles[2], "line"),
+            (&cfg.mouse.profiles[3], "default"),
+        ] {
+            assert_eq!(profile.scroll_mode.as_deref(), Some(expected));
+            assert_eq!(profile.smooth_scrolling.as_ref().unwrap().enabled, None);
+        }
+        let saved: toml::Value = toml::to_string(&cfg).unwrap().parse().unwrap();
+        let profiles = saved["mouse"]["profiles"].as_array().unwrap();
+        assert!(profiles.iter().all(|profile| {
+            profile
+                .get("smooth_scrolling")
+                .and_then(|smooth| smooth.get("enabled"))
+                .is_none()
+        }));
+        assert!(!cfg.mouse.migrate_legacy());
+    }
+
+    #[test]
+    fn config_loader_accepts_and_migrates_legacy_smooth_enabled_in_device_layers() {
+        let content = r#"
+[mouse]
+enabled = true
+
+[[mouse.profiles]]
+scroll_mode = "line"
+line_count = 6
+
+[mouse.profiles.smooth_scrolling]
+enabled = true
+response = 1.35
+
+[[mouse.profiles]]
+device_vendor_id = 7
+device_product_id = 9
+scroll_mode = "default"
+
+[mouse.profiles.smooth_scrolling]
+enabled = true
+speed = 2.6
+"#;
+        let (loaded, errors, needs_persist) = parse_config_content(content).unwrap();
+        assert!(errors.is_empty());
+        assert!(needs_persist);
+        assert_eq!(
+            loaded.mouse.profiles[0].scroll_mode.as_deref(),
+            Some("smooth")
+        );
+        assert_eq!(loaded.mouse.profiles[0].line_count, Some(6));
+        assert_eq!(
+            loaded.mouse.profiles[0]
+                .smooth_scrolling
+                .as_ref()
+                .unwrap()
+                .response,
+            Some(1.35)
+        );
+        assert_eq!(
+            loaded.mouse.profiles[1].scroll_mode.as_deref(),
+            Some("smooth")
+        );
+        assert_eq!(
+            loaded.mouse.profiles[1]
+                .smooth_scrolling
+                .as_ref()
+                .unwrap()
+                .speed,
+            Some(2.6)
+        );
+        assert!(loaded.mouse.profiles.iter().all(|profile| profile
+            .smooth_scrolling
+            .as_ref()
+            .map(|smooth| smooth.enabled.is_none())
+            .unwrap_or(true)));
+    }
+
+    #[test]
+    fn unknown_scroll_mode_falls_back_without_discarding_other_profile_fields() {
+        let mut loaded = Config::default();
+        loaded.mouse.profiles[0].scroll_mode = Some("turbo".into());
+        loaded.mouse.profiles[0].line_count = Some(8);
+        loaded.mouse.profiles[0]
+            .smooth_scrolling
+            .as_mut()
+            .unwrap()
+            .speed = Some(2.4);
+        let errors = loaded.validate();
+        assert!(errors
+            .iter()
+            .any(|error| { error.starts_with("mouse.profiles[0].scroll_mode") }));
+
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        assert_eq!(merged.mouse.profiles[0].scroll_mode, None);
+        assert_eq!(merged.mouse.profiles[0].line_count, Some(8));
+        assert_eq!(
+            merged.mouse.profiles[0]
+                .smooth_scrolling
+                .as_ref()
+                .unwrap()
+                .speed,
+            Some(2.4)
+        );
     }
 
     #[test]

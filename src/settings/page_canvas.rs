@@ -23,6 +23,8 @@ use std::cell::RefCell;
 pub(super) enum RowGroup {
     /// "Lines per tick" on the Mouse page (Line scroll mode only).
     LineCount,
+    /// Smooth tuning controls and their section card (Smooth scroll mode only).
+    SmoothScrolling,
     /// Pointer acceleration on the Mouse page (only while acceleration is off).
     PointerAccel,
     /// Focused prewarm + "app name on thumbnails" on the App Switcher page.
@@ -879,12 +881,23 @@ impl PageCanvas {
             ];
         }
 
-        // Cards: from their section's cursor down past their last *visible* row (a row the page
-        // registered itself counts as one); a card with no visible row collapses onto its top edge.
+        // Cards: from their section's cursor down past their last *visible* row. A section whose
+        // rows are all conditional hides its card and heading as well as collapsing its space.
         for (index, card) in self.cards.iter().enumerate() {
             if card.card.is_null() {
                 continue;
             }
+            let visible_bottom = card_bottom_rel.get(index).copied().flatten();
+            let visible = visible_bottom.is_some();
+            let header = self.sections[card.section].header;
+            for view in [card.card, card.shadow, header] {
+                if !view.is_null() {
+                    let _: () = msg_send![view, setHidden: !visible];
+                }
+            }
+            let Some(bottom_rel) = visible_bottom else {
+                continue;
+            };
             let frame: NSRect = msg_send![card.card, frame];
             let top = base
                 + relative
@@ -893,12 +906,7 @@ impl PageCanvas {
                     .copied()
                     .unwrap_or(self.sections[card.section].rel)
                 - layout.card_header_gap;
-            let bottom = match card_bottom_rel.get(index).copied().flatten() {
-                Some(rel) => base + rel,
-                // Every row of this card is hidden: it collapses onto its own top edge, and the
-                // section heading stays.
-                None => top,
-            };
+            let bottom = base + bottom_rel;
             let rect = widgets::settings_card_rect(NSRect::new(
                 NSPoint::new(frame.origin.x, bottom),
                 NSSize::new(frame.size.width, (top - bottom).max(1.0)),

@@ -53,9 +53,6 @@ impl SmoothTransformer {
         delta_y_lines: f64,
         flags: CGEventFlags,
     ) -> bool {
-        if !settings.enabled {
-            return false;
-        }
         if self.settings != Some(settings) {
             self.stop_timer();
             self.engine = SmoothEngine::new(settings);

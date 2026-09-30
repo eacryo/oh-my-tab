@@ -811,15 +811,17 @@ pub(super) unsafe fn build_mouse_page(
     )
     .1;
 
+    let scroll_mode_labels: Vec<String> = SCROLL_MODE_LABEL_KEYS.iter().map(|key| t(key)).collect();
+    let scroll_mode_label_refs: Vec<&str> = scroll_mode_labels.iter().map(String::as_str).collect();
     let scroll_metrics =
-        SettingsSelect::metrics(ctrl_w, &SCROLL_MODE_LABELS, row_h, described_row_h);
+        SettingsSelect::metrics(ctrl_w, &scroll_mode_label_refs, row_h, described_row_h);
     let y = canvas.next_row(scroll_metrics.row_h);
     let scroll_popup = SettingsControl::popup(
         ctrl_x,
         y + (scroll_metrics.row_h - scroll_metrics.control_h) / 2.0,
         ctrl_w,
         scroll_metrics.control_h,
-        &SCROLL_MODE_LABELS,
+        &scroll_mode_label_refs,
         0,
     );
     style_flat_popup(scroll_popup);
@@ -891,18 +893,7 @@ pub(super) unsafe fn build_mouse_page(
     canvas.card(&t("settings.header_mouse_scrolling"));
 
     canvas.next_section();
-    let smooth_enabled_y = canvas.next_row(described_row_h);
-    ui.smooth_scrolling_enabled = SettingsRow::described(
-        mouse_view,
-        label_x,
-        smooth_enabled_y,
-        ctrl_x - label_x - 18.0,
-        described_row_h,
-        &t("settings.row_mouse_smooth_enabled"),
-        &t("settings.desc_mouse_smooth_enabled"),
-        SettingsControl::switch(ctrl_x + ctrl_w, smooth_enabled_y + 10.0, row_h, false),
-    );
-    bind_control(target, ui.smooth_scrolling_enabled);
+    canvas.group_begin(RowGroup::SmoothScrolling);
     let preset_labels: Vec<String> = crate::mouse::smooth::presets::SmoothPreset::ALL
         .into_iter()
         .map(|preset| t(preset.label_key()))
@@ -1001,6 +992,7 @@ pub(super) unsafe fn build_mouse_page(
     ui.smooth_scrolling_acceleration_value = smooth_controls[2].1;
     ui.smooth_scrolling_inertia = smooth_controls[3].0;
     ui.smooth_scrolling_inertia_value = smooth_controls[3].1;
+    canvas.group_end();
     canvas.card(&t("settings.header_mouse_smooth_scrolling"));
 
     canvas.next_section();

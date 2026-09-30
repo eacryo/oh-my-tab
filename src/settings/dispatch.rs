@@ -38,7 +38,6 @@ pub(super) enum ControlField {
     LineCount,
     DisablePointerAccel,
     PointerAcceleration,
-    SmoothScrollingEnabled,
     SmoothScrollingPreset,
     SmoothScrollingResponse,
     SmoothScrollingSpeed,
@@ -132,12 +131,6 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             .or_else(|| m(u.line_count, ControlField::LineCount))
             .or_else(|| m(u.disable_pointer_accel, ControlField::DisablePointerAccel))
             .or_else(|| m(u.pointer_accel_slider, ControlField::PointerAcceleration))
-            .or_else(|| {
-                m(
-                    u.smooth_scrolling_enabled,
-                    ControlField::SmoothScrollingEnabled,
-                )
-            })
             .or_else(|| {
                 m(
                     u.smooth_scrolling_preset,
@@ -348,14 +341,6 @@ unsafe fn refresh_dependent_control_visibility(field: ControlField) {
             ControlField::ScrollMode => {
                 update_mode_dependent_visibility(ui);
             }
-            ControlField::SmoothScrollingEnabled
-            | ControlField::SmoothScrollingPreset
-            | ControlField::SmoothScrollingResponse
-            | ControlField::SmoothScrollingSpeed
-            | ControlField::SmoothScrollingAcceleration
-            | ControlField::SmoothScrollingInertia => {
-                update_smooth_controls_enabled(ui);
-            }
             ControlField::ThumbnailsEnabled => {
                 // The App Switcher page's layout owner shows/hides the pair and settles the page.
                 update_display_mode_dependent_visibility(ui);
@@ -375,7 +360,6 @@ fn apply_control_field(field: ControlField) {
         | ControlField::LineCount
         | ControlField::DisablePointerAccel
         | ControlField::PointerAcceleration
-        | ControlField::SmoothScrollingEnabled
         | ControlField::SmoothScrollingPreset
         | ControlField::SmoothScrollingResponse
         | ControlField::SmoothScrollingSpeed
@@ -521,7 +505,6 @@ fn apply_control_field(field: ControlField) {
                 | ControlField::LineCount
                 | ControlField::DisablePointerAccel
                 | ControlField::PointerAcceleration
-                | ControlField::SmoothScrollingEnabled
                 | ControlField::SmoothScrollingPreset
                 | ControlField::SmoothScrollingResponse
                 | ControlField::SmoothScrollingSpeed
@@ -670,19 +653,10 @@ pub(super) unsafe fn apply_mouse_profile_field(field: ControlField) {
                     .get(idx as usize)
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "default".into());
-                let is_line = mode == "line";
-                // Read the slider only in Line mode; Default keeps the existing line count.
-                let lc: Option<isize> = if is_line {
-                    Some(msg_send![u.line_count, integerValue])
-                } else {
-                    None
-                };
+                // Unlike LinearMouse, mode selection retains both line count and smooth tuning;
+                // only the active path changes so switching back restores each side's values.
                 write_selected_profile(&mut cfg, move |p| {
                     p.scroll_mode = Some(mode);
-                    // Write the line count only in Line mode; Default keeps the existing value.
-                    if let Some(lc) = lc {
-                        p.line_count = Some(lc.clamp(1, 10) as u32);
-                    }
                 });
             }
             ControlField::LineCount => {
@@ -712,14 +686,6 @@ pub(super) unsafe fn apply_mouse_profile_field(field: ControlField) {
                     p.pointer = Some(ptr);
                 });
             }
-            ControlField::SmoothScrollingEnabled => {
-                let state: isize = msg_send![u.smooth_scrolling_enabled, state];
-                write_selected_profile(&mut cfg, move |p| {
-                    let mut smooth = p.smooth_scrolling.take().unwrap_or_default();
-                    smooth.enabled = Some(state == 1);
-                    p.smooth_scrolling = Some(smooth);
-                });
-            }
             ControlField::SmoothScrollingPreset => {
                 let index: isize = msg_send![u.smooth_scrolling_preset, indexOfSelectedItem];
                 let preset = crate::mouse::smooth::presets::SmoothPreset::ALL
@@ -729,7 +695,6 @@ pub(super) unsafe fn apply_mouse_profile_field(field: ControlField) {
                 let (response, speed, acceleration, inertia) = preset.default_settings();
                 write_selected_profile(&mut cfg, move |p| {
                     let mut smooth = p.smooth_scrolling.take().unwrap_or_default();
-                    smooth.enabled = Some(true);
                     smooth.preset = Some(preset.as_str().to_string());
                     if preset != crate::mouse::smooth::presets::SmoothPreset::Custom {
                         smooth.response = Some(response);
@@ -779,13 +744,6 @@ pub(super) unsafe fn apply_mouse_profile_field(field: ControlField) {
                 });
             }
             _ => {}
-        }
-        if field == ControlField::ScrollMode {
-            // Resolve from the pending snapshot; runtime refresh below must run after this UI borrow.
-            let shown = resolve_selected_from(&cfg).line_count;
-            let _: () = msg_send![u.line_count, setIntegerValue: shown as isize];
-            set_field(u.line_count_value_label, shown);
-            update_mode_dependent_visibility(u);
         }
         Some((old_cfg, cfg))
     });
@@ -966,14 +924,17 @@ pub(super) unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
     }
     for &ctrl in &[
         ui.scroll_mode,
-        ui.line_count,
         ui.reverse_scroll,
         ui.disable_pointer_accel,
         ui.pointer_accel_slider,
         ui.pointer_accel_value_label,
-        ui.smooth_scrolling_enabled,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
+    }
+    if on {
+        SettingsRow::set_enabled(ui.line_count, selected_scroll_mode(ui) == ScrollMode::Line);
+    } else {
+        SettingsRow::set_enabled_with_tooltip(ui.line_count, false, &tooltip);
     }
     update_smooth_controls_enabled(ui);
     // The virtual-pointer profile (a software KVM's injected mouse) has no HID service client, so
@@ -996,14 +957,8 @@ pub(super) unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
 
 unsafe fn update_smooth_controls_enabled(ui: &SettingsUi) {
     let mouse_state: isize = msg_send![ui.enable_mouse, state];
-    let smooth_state: isize = msg_send![ui.smooth_scrolling_enabled, state];
-    let enabled = mouse_state == 1 && smooth_state == 1;
-    let tooltip = if mouse_state != 1 {
-        t("settings.tooltip_mouse_disabled")
-    } else {
-        t("settings.tooltip_smooth_scrolling_disabled")
-    };
-    for &control in &[
+    let enabled = mouse_state == 1 && selected_scroll_mode(ui) == ScrollMode::Smooth;
+    let controls = [
         ui.smooth_scrolling_preset,
         ui.smooth_scrolling_response,
         ui.smooth_scrolling_response_value,
@@ -1013,9 +968,25 @@ unsafe fn update_smooth_controls_enabled(ui: &SettingsUi) {
         ui.smooth_scrolling_acceleration_value,
         ui.smooth_scrolling_inertia,
         ui.smooth_scrolling_inertia_value,
-    ] {
-        SettingsRow::set_enabled_with_tooltip(control, enabled, &tooltip);
+    ];
+    if mouse_state == 1 {
+        for control in controls {
+            SettingsRow::set_enabled(control, enabled);
+        }
+    } else {
+        let tooltip = t("settings.tooltip_mouse_disabled");
+        for control in controls {
+            SettingsRow::set_enabled_with_tooltip(control, false, &tooltip);
+        }
     }
+}
+
+unsafe fn selected_scroll_mode(ui: &SettingsUi) -> ScrollMode {
+    let idx: isize = msg_send![ui.scroll_mode, indexOfSelectedItem];
+    SCROLL_MODE_VALUES
+        .get(idx as usize)
+        .map(|value| ScrollMode::from_str(value))
+        .unwrap_or(ScrollMode::Default)
 }
 
 /// Freeze the window and keyboard options below the app-switcher master switch.
@@ -1152,21 +1123,16 @@ unsafe fn update_pointer_accel_visibility(ui: &SettingsUi) {
     ui.page_canvases[2].set_group_visible(RowGroup::PointerAccel, state == 1);
 }
 
-/// Refresh the conditional visibility of the "lines per tick" row based on the current scroll mode
-/// (Default/Line):
-/// - Line: the "lines per tick" row is shown
-/// - Default: hidden
-///
-/// Called by load_settings_values and handle_scroll_mode_changed.
+/// Refresh the conditional line and smooth controls from the selected mode.
 unsafe fn update_mode_dependent_visibility(ui: &SettingsUi) {
-    let idx: isize = msg_send![ui.scroll_mode, indexOfSelectedItem];
-    let mode = SCROLL_MODE_VALUES
-        .get(idx as usize)
-        .copied()
-        .unwrap_or("default");
-    // Only Line mode shows the line-count slider (hidden on Default): the page layout owner skips
-    // the row and re-flows the page.
-    ui.page_canvases[2].set_group_visible(RowGroup::LineCount, mode == "line");
+    let mode = selected_scroll_mode(ui);
+    ui.page_canvases[2].set_group_visible(RowGroup::LineCount, mode == ScrollMode::Line);
+    ui.page_canvases[2].set_group_visible(RowGroup::SmoothScrolling, mode == ScrollMode::Smooth);
+    let mouse_enabled: isize = msg_send![ui.enable_mouse, state];
+    if mouse_enabled == 1 {
+        SettingsRow::set_enabled(ui.line_count, mode == ScrollMode::Line);
+    }
+    update_smooth_controls_enabled(ui);
 }
 
 /// Refresh the visibility of the thumbnail-only pair from the window display mode:

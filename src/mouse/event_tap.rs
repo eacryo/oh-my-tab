@@ -162,7 +162,7 @@ unsafe fn mouse_event_tap_callback_inner(
         // Smooth mode consumes discrete wheel lines and emits its own timed pixel stream. It
         // takes precedence over Line mode; the configured reverse direction is applied before
         // feeding the pure engine.
-        if resolved.smooth_scrolling.enabled {
+        if resolved.scroll_mode == crate::mouse::scrolling::ScrollMode::Smooth {
             if !user_info.is_null() {
                 let sign = if resolved.reverse_scroll { -1.0 } else { 1.0 };
                 let fed = (&mut *(user_info

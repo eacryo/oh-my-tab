@@ -21,6 +21,7 @@ use crate::event_tap::{
 };
 use crate::ffi::*;
 use crate::i18n::{t, tf};
+use crate::mouse::scrolling::ScrollMode;
 use crate::mouse::shortcut::{button_name, describe_shortcut, display_shortcut};
 use crate::runtime_config::{apply_config_change, ConfigChangeSource};
 use crate::theme::{resolved_is_dark, ui_palette, UiPalette};
@@ -40,8 +41,12 @@ const LOCALE_LABELS: [&str; 5] = [
 ];
 #[cfg(not(any(debug_assertions, feature = "dev-long-text")))]
 const LOCALE_LABELS: [&str; 4] = ["Auto", "English", "简体中文", "繁體中文"];
-const SCROLL_MODE_LABELS: [&str; 2] = ["Default", "Line"];
-const SCROLL_MODE_VALUES: [&str; 2] = ["default", "line"];
+const SCROLL_MODE_LABEL_KEYS: [&str; 3] = [
+    "settings.scroll_mode_default",
+    "settings.scroll_mode_line",
+    "settings.scroll_mode_smooth",
+];
+const SCROLL_MODE_VALUES: [&str; 3] = ["default", "line", "smooth"];
 #[cfg(any(debug_assertions, feature = "dev-long-text"))]
 const LOCALE_VALUES: [&str; 5] = [
     "auto",
@@ -197,7 +202,6 @@ pub(super) struct SettingsUi {
     pointer_accel_slider: *mut AnyObject, // NSSlider: pointer acceleration, 0..=40
     pointer_accel_label: *mut AnyObject, // the row's label
     pointer_accel_value_label: *mut AnyObject, // slider's current value (read-only)
-    smooth_scrolling_enabled: *mut AnyObject,
     smooth_scrolling_preset: *mut AnyObject,
     smooth_scrolling_response: *mut AnyObject,
     smooth_scrolling_response_value: *mut AnyObject,
@@ -1555,10 +1559,6 @@ unsafe fn fill_mouse_device_controls(
     );
 
     let smooth = resolved.smooth_scrolling;
-    let _: () = msg_send![
-        ui.smooth_scrolling_enabled,
-        setState: if smooth.enabled { 1isize } else { 0isize }
-    ];
     let preset_index = crate::mouse::smooth::presets::SmoothPreset::ALL
         .iter()
         .position(|preset| *preset == smooth.preset)

@@ -31,7 +31,6 @@ pub(crate) struct PresetProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SmoothSettings {
-    pub enabled: bool,
     pub preset: SmoothPreset,
     pub response: f64,
     pub speed: f64,
@@ -42,7 +41,6 @@ pub(crate) struct SmoothSettings {
 impl Default for SmoothSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
             preset: SmoothPreset::EaseInOut,
             response: 0.68,
             speed: 1.02,

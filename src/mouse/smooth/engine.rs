@@ -187,6 +187,7 @@ impl AxisTuning {
 
 #[derive(Debug, Clone, Copy)]
 enum AxisBehavior {
+    #[cfg(test)]
     Passthrough,
     Smoothed(AxisTuning),
 }
@@ -213,11 +214,7 @@ pub(crate) struct SmoothEngine {
 
 impl SmoothEngine {
     pub(crate) fn new(settings: SmoothSettings) -> Self {
-        let behavior = if settings.enabled {
-            AxisBehavior::Smoothed(AxisTuning::new(settings))
-        } else {
-            AxisBehavior::Passthrough
-        };
+        let behavior = AxisBehavior::Smoothed(AxisTuning::new(settings));
         Self {
             horizontal_behavior: behavior,
             vertical_behavior: behavior,
@@ -496,6 +493,7 @@ fn cancel_opposing(
         return;
     }
     *output_delta = match behavior {
+        #[cfg(test)]
         AxisBehavior::Passthrough => delta,
         AxisBehavior::Smoothed(tuning) => {
             tuning.residual_input_after_cancelling_momentum(delta, *velocity)
@@ -522,6 +520,7 @@ fn advance_axis(
     tick: AxisTick,
 ) -> f64 {
     match behavior {
+        #[cfg(test)]
         AxisBehavior::Passthrough => {
             let output = *pending_input;
             *pending_input = 0.0;
@@ -657,7 +656,6 @@ mod tests {
     fn settings(preset: SmoothPreset) -> SmoothSettings {
         let (response, speed, acceleration, inertia) = preset.default_settings();
         SmoothSettings {
-            enabled: true,
             preset,
             response,
             speed,

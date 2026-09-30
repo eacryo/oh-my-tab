@@ -88,7 +88,7 @@ pub(crate) fn resolve(device: Option<DeviceKey>) -> ResolvedMouse {
 
     let cfg = CONFIG.read().unwrap().clone();
     let mut r = resolve_from(&cfg, device);
-    apply_smooth_dev_flags(&mut r.smooth_scrolling);
+    apply_smooth_dev_flags(&mut r.scroll_mode, &mut r.smooth_scrolling);
 
     if let Ok(mut c) = CACHE.lock() {
         c.insert(device, r.clone());
@@ -151,9 +151,6 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
             r.button_mappings_enabled = en;
         }
         if let Some(ref smooth) = p.smooth_scrolling {
-            if let Some(enabled) = smooth.enabled {
-                r.smooth_scrolling.enabled = enabled;
-            }
             if let Some(preset) = smooth.preset.as_deref().and_then(SmoothPreset::from_str) {
                 r.smooth_scrolling.preset = preset;
             }
@@ -175,30 +172,48 @@ fn resolve_from(cfg: &Config, device: Option<DeviceKey>) -> ResolvedMouse {
     r
 }
 
-fn apply_smooth_dev_flags(settings: &mut SmoothSettings) {
-    if crate::dev_flags::present("smooth-scroll-force-on") {
-        settings.enabled = true;
-    }
-    if let Some(preset) = crate::dev_flags::value("smooth-scroll-preset")
-        .and_then(|value| SmoothPreset::from_str(value.trim()))
-    {
-        settings.preset = preset;
-    }
-    for (flag, target, min, max) in [
-        ("smooth-scroll-response", &mut settings.response, 0.0, 2.0),
-        ("smooth-scroll-speed", &mut settings.speed, 0.0, 8.0),
-        (
-            "smooth-scroll-acceleration",
-            &mut settings.acceleration,
-            0.0,
-            8.0,
-        ),
-        ("smooth-scroll-inertia", &mut settings.inertia, 0.0, 8.0),
-    ] {
-        if let Some(value) = crate::dev_flags::value(flag)
+fn apply_smooth_dev_flags(mode: &mut ScrollMode, settings: &mut SmoothSettings) {
+    let preset = crate::dev_flags::value("smooth-scroll-preset");
+    let values = [
+        ("smooth-scroll-response", 0.0, 2.0),
+        ("smooth-scroll-speed", 0.0, 8.0),
+        ("smooth-scroll-acceleration", 0.0, 8.0),
+        ("smooth-scroll-inertia", 0.0, 8.0),
+    ]
+    .map(|(flag, _, _)| {
+        crate::dev_flags::value(flag)
             .and_then(|value| value.parse::<f64>().ok())
             .filter(|value| value.is_finite())
-        {
+    });
+    apply_smooth_dev_overrides(
+        mode,
+        settings,
+        crate::dev_flags::present("smooth-scroll-force-on"),
+        preset.as_deref(),
+        values,
+    );
+}
+
+fn apply_smooth_dev_overrides(
+    mode: &mut ScrollMode,
+    settings: &mut SmoothSettings,
+    force_on: bool,
+    preset: Option<&str>,
+    values: [Option<f64>; 4],
+) {
+    if force_on {
+        *mode = ScrollMode::Smooth;
+    }
+    if let Some(preset) = preset.and_then(|value| SmoothPreset::from_str(value.trim())) {
+        settings.preset = preset;
+    }
+    for (value, target, min, max) in [
+        (values[0], &mut settings.response, 0.0, 2.0),
+        (values[1], &mut settings.speed, 0.0, 8.0),
+        (values[2], &mut settings.acceleration, 0.0, 8.0),
+        (values[3], &mut settings.inertia, 0.0, 8.0),
+    ] {
+        if let Some(value) = value {
             *target = value.clamp(min, max);
         }
     }
@@ -240,7 +255,7 @@ mod tests {
         // The default config has one "all mice" profile holding the defaults.
         let r = resolve_from(&cfg, None);
         assert!(!r.reverse_scroll);
-        assert!(!r.smooth_scrolling.enabled);
+        assert_eq!(r.scroll_mode, ScrollMode::Default);
         assert_eq!(r.smooth_scrolling.preset, SmoothPreset::EaseInOut);
         let r2 = resolve_from(&cfg, Some((1133, 17492)));
         assert!(!r2.reverse_scroll);
@@ -252,8 +267,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.mouse.profiles.clear();
         cfg.mouse.profiles.push(MouseProfile {
+            scroll_mode: Some("smooth".into()),
             smooth_scrolling: Some(crate::config::SmoothPartial {
-                enabled: Some(true),
                 response: Some(1.2),
                 ..Default::default()
             }),
@@ -272,15 +287,39 @@ mod tests {
             }),
             ..Default::default()
         });
-        let resolved = resolve_from(&cfg, Some((7, 9))).smooth_scrolling;
-        assert!(resolved.enabled);
-        assert_eq!(resolved.preset, SmoothPreset::Custom);
-        assert_eq!(resolved.response, 1.2);
-        assert_eq!(resolved.speed, 3.4);
-        let other = resolve_from(&cfg, Some((1, 2))).smooth_scrolling;
-        assert!(other.enabled);
-        assert_eq!(other.response, 1.2);
-        assert_eq!(other.speed, SmoothSettings::default().speed);
+        let resolved = resolve_from(&cfg, Some((7, 9)));
+        assert_eq!(resolved.scroll_mode, ScrollMode::Smooth);
+        assert_eq!(resolved.smooth_scrolling.preset, SmoothPreset::Custom);
+        assert_eq!(resolved.smooth_scrolling.response, 1.2);
+        assert_eq!(resolved.smooth_scrolling.speed, 3.4);
+        let other = resolve_from(&cfg, Some((1, 2)));
+        assert_eq!(other.scroll_mode, ScrollMode::Smooth);
+        assert_eq!(other.smooth_scrolling.response, 1.2);
+        assert_eq!(
+            other.smooth_scrolling.speed,
+            SmoothSettings::default().speed
+        );
+    }
+
+    #[test]
+    fn resolves_default_line_and_smooth_modes_as_one_field() {
+        let mut cfg = Config::default();
+        cfg.mouse.profiles[0].scroll_mode = Some("default".into());
+        assert_eq!(resolve_from(&cfg, None).scroll_mode, ScrollMode::Default);
+        cfg.mouse.profiles[0].scroll_mode = Some("line".into());
+        assert_eq!(resolve_from(&cfg, None).scroll_mode, ScrollMode::Line);
+        cfg.mouse.profiles[0].scroll_mode = Some("smooth".into());
+        assert_eq!(resolve_from(&cfg, None).scroll_mode, ScrollMode::Smooth);
+    }
+
+    #[test]
+    fn smooth_force_on_flag_overrides_the_resolved_scroll_mode() {
+        for initial in [ScrollMode::Default, ScrollMode::Line] {
+            let mut mode = initial;
+            let mut settings = SmoothSettings::default();
+            apply_smooth_dev_overrides(&mut mode, &mut settings, true, None, [None; 4]);
+            assert_eq!(mode, ScrollMode::Smooth);
+        }
     }
 
     #[test]
