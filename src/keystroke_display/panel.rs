@@ -484,9 +484,12 @@ pub(super) fn render(
             let panel_w = desired.min(max_width).max(max_width.min(64.0));
             let size = NSSize::new(panel_w, PANEL_H);
             let frame = unsafe {
-                if !reopened || state.drag.is_some() {
+                if state.drag.is_some() {
                     let current: NSRect = msg_send![panel, frame];
                     NSRect::new(current.origin, size)
+                } else if !reopened {
+                    let current: NSRect = msg_send![panel, frame];
+                    resize_frame_preserving_center(current, size, geometry.visible_frame)
                 } else {
                     resolve_panel_frame(position, &[geometry], 0, size).1
                 }
@@ -1323,6 +1326,15 @@ fn default_bottom_center_frame(visible: NSRect, size: NSSize) -> NSRect {
     NSRect::new(clamp_origin_to_visible(origin, size, visible), size)
 }
 
+fn resize_frame_preserving_center(frame: NSRect, size: NSSize, visible: NSRect) -> NSRect {
+    let center = NSPoint::new(
+        frame.origin.x + frame.size.width / 2.0,
+        frame.origin.y + frame.size.height / 2.0,
+    );
+    let origin = NSPoint::new(center.x - size.width / 2.0, center.y - size.height / 2.0);
+    NSRect::new(clamp_origin_to_visible(origin, size, visible), size)
+}
+
 fn resolve_panel_frame(
     position: Option<KeystrokeDisplayPosition>,
     screens: &[ScreenGeometry],
@@ -1372,7 +1384,10 @@ fn contains(frame: NSRect, point: NSPoint) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{keycap_fill, resolve_panel_frame, ScreenGeometry, KEYCAP_FILL_ALPHA};
+    use super::{
+        keycap_fill, resize_frame_preserving_center, resolve_panel_frame, ScreenGeometry,
+        KEYCAP_FILL_ALPHA,
+    };
     use crate::config::KeystrokeDisplayPosition;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -1435,5 +1450,28 @@ mod tests {
             resolve_panel_frame(None, &virtual_screens(), 1, NSSize::new(300.0, 54.0));
         assert_eq!(screen_index, 1);
         assert_eq!(frame.origin, NSPoint::new(-790.0, 38.0));
+    }
+
+    #[test]
+    fn growing_badge_stream_keeps_panel_centered_and_inside_visible_frame() {
+        let visible = virtual_screens()[0].visible_frame;
+        let initial = NSRect::new(NSPoint::new(468.0, 38.0), NSSize::new(64.0, 54.0));
+        let expanded = resize_frame_preserving_center(initial, NSSize::new(300.0, 54.0), visible);
+
+        assert_eq!(expanded.origin, NSPoint::new(350.0, 38.0));
+        assert_eq!(
+            expanded.origin.x + expanded.size.width / 2.0,
+            initial.origin.x + initial.size.width / 2.0
+        );
+    }
+
+    #[test]
+    fn centered_resize_clamps_when_panel_grows_near_screen_edge() {
+        let visible = virtual_screens()[0].visible_frame;
+        let initial = NSRect::new(NSPoint::new(900.0, 38.0), NSSize::new(64.0, 54.0));
+        let expanded = resize_frame_preserving_center(initial, NSSize::new(300.0, 54.0), visible);
+
+        assert_eq!(expanded.origin, NSPoint::new(700.0, 38.0));
+        assert!(expanded.origin.x + expanded.size.width <= visible.origin.x + visible.size.width);
     }
 }
