@@ -378,6 +378,19 @@ pub struct PartialPointerSection {
     pub acceleration: Option<f64>,
 }
 
+/// Per-device smooth-scroll overrides. Every field is optional so matching mouse profiles merge
+/// independently, with later profiles overriding only fields they specify.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct SmoothPartial {
+    pub enabled: Option<bool>,
+    pub preset: Option<String>,
+    pub response: Option<f64>,
+    pub speed: Option<f64>,
+    pub acceleration: Option<f64>,
+    pub inertia: Option<f64>,
+}
+
 /// A single profile. device = None is the "All Mice" profile (the default layer).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -393,6 +406,7 @@ pub struct MouseProfile {
     // Line mode lines per notch (1..=10).
     pub line_count: Option<u32>,
     pub pointer: Option<PartialPointerSection>,
+    pub smooth_scrolling: Option<SmoothPartial>,
     // Button mappings: button number (string, >= 2) -> shortcut description (e.g. "cmd+shift+v").
     // Left (0) and right (1) buttons cannot be bound, so the user can never lock themselves
     // out of clicking.
@@ -442,6 +456,14 @@ impl Default for MouseSection {
                 pointer: Some(PartialPointerSection {
                     disable_acceleration: Some(false),
                     acceleration: None,
+                }),
+                smooth_scrolling: Some(SmoothPartial {
+                    enabled: Some(false),
+                    preset: Some("ease_in_out".into()),
+                    response: Some(0.68),
+                    speed: Some(1.02),
+                    acceleration: Some(1.10),
+                    inertia: Some(0.74),
                 }),
                 ..Default::default()
             }],
@@ -877,6 +899,37 @@ impl Config {
                     errs.push(format!("{prefix}.line_count: {msg}"));
                 }
             }
+            if let Some(smooth) = &p.smooth_scrolling {
+                if let Some(preset) = &smooth.preset {
+                    if crate::mouse::smooth::presets::SmoothPreset::from_str(preset).is_none() {
+                        errs.push(format!(
+                            "{prefix}.smooth_scrolling.preset: {}",
+                            tf(
+                                "errors.mouse_smooth_field_invalid",
+                                &[("field", "preset"), ("value", preset)]
+                            )
+                        ));
+                    }
+                }
+                for (field, value, min, max) in [
+                    ("response", smooth.response, 0.0, 2.0),
+                    ("speed", smooth.speed, 0.0, 8.0),
+                    ("acceleration", smooth.acceleration, 0.0, 8.0),
+                    ("inertia", smooth.inertia, 0.0, 8.0),
+                ] {
+                    if let Some(value) = value {
+                        if !value.is_finite() || !(min..=max).contains(&value) {
+                            errs.push(format!(
+                                "{prefix}.smooth_scrolling.{field}: {}",
+                                tf(
+                                    "errors.mouse_smooth_field_invalid",
+                                    &[("field", field), ("value", &value.to_string())]
+                                )
+                            ));
+                        }
+                    }
+                }
+            }
             // Pointer acceleration / tracking speed: 0..=10 (see MOUSE_ACCELERATION_MAX).
             if let Some(acc) = p.pointer.as_ref().and_then(|ptr| ptr.acceleration) {
                 if !(MOUSE_ACCELERATION_MIN..=MOUSE_ACCELERATION_MAX).contains(&acc) {
@@ -1140,6 +1193,31 @@ impl Config {
                 }
                 ptr
             });
+            merged_p.smooth_scrolling = p.smooth_scrolling.clone().map(|mut smooth| {
+                for field in [
+                    "enabled",
+                    "preset",
+                    "response",
+                    "speed",
+                    "acceleration",
+                    "inertia",
+                ] {
+                    if errs.iter().any(|error| {
+                        error.starts_with(&format!("{prefix}.smooth_scrolling.{field}"))
+                    }) {
+                        match field {
+                            "enabled" => smooth.enabled = None,
+                            "preset" => smooth.preset = None,
+                            "response" => smooth.response = None,
+                            "speed" => smooth.speed = None,
+                            "acceleration" => smooth.acceleration = None,
+                            "inertia" => smooth.inertia = None,
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                smooth
+            });
             self.mouse.profiles.push(merged_p);
         }
         // After merge, clear our own legacy fields (avoid serializing cruft).
@@ -1205,6 +1283,14 @@ fn config_type_schema() -> toml::Value {
         profile.device.vendor_id = Some(0);
         profile.device.product_id = Some(0);
         profile.button_mappings_enabled = Some(true);
+        profile.smooth_scrolling = Some(SmoothPartial {
+            enabled: Some(false),
+            preset: Some("ease_in_out".to_string()),
+            response: Some(0.68),
+            speed: Some(1.02),
+            acceleration: Some(1.10),
+            inertia: Some(0.74),
+        });
     }
     schema.mouse.reverse_scroll = Some(false);
     schema.mouse.scroll_mode = Some("default".to_string());
@@ -1935,6 +2021,31 @@ mod tests {
             ..Default::default()
         });
         assert_err_count(&cfg, 2);
+    }
+
+    #[test]
+    fn smooth_mouse_fields_validate_and_fall_back_independently() {
+        let mut loaded = Config::default();
+        let smooth = loaded.mouse.profiles[0].smooth_scrolling.as_mut().unwrap();
+        smooth.enabled = Some(true);
+        smooth.preset = Some("unknown".into());
+        smooth.response = Some(3.0);
+        smooth.speed = Some(2.4);
+        let errors = loaded.validate();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("smooth_scrolling.preset")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("smooth_scrolling.response")));
+
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        let smooth = merged.mouse.profiles[0].smooth_scrolling.as_ref().unwrap();
+        assert_eq!(smooth.enabled, Some(true));
+        assert_eq!(smooth.preset, None);
+        assert_eq!(smooth.response, None);
+        assert_eq!(smooth.speed, Some(2.4));
     }
 
     #[test]

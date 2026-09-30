@@ -242,6 +242,7 @@ fn restore_tab_defaults(tab: usize) {
                 prof.scroll_mode = dp.scroll_mode;
                 prof.line_count = dp.line_count;
                 prof.pointer = dp.pointer;
+                prof.smooth_scrolling = dp.smooth_scrolling;
                 prof.button_mappings = Default::default();
                 prof.button_mappings_enabled = dp.button_mappings_enabled;
             }

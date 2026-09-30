@@ -128,7 +128,7 @@ fn start_configured_services() {
         Ok(config) => config.clone(),
         Err(_) => return,
     };
-    if config.mouse.enabled {
+    if config.mouse.enabled || crate::dev_flags::present("smooth-scroll-force-on") {
         crate::mouse::start();
     }
     if config.window_control.enabled {

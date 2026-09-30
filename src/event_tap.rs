@@ -591,6 +591,10 @@ pub(crate) const K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1: i32 = 96;
 #[allow(dead_code)]
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2: i32 = 97;
 
+/// Scroll phase fields from CoreGraphics' CGEventTypes.h (99 and 123).
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_SCROLL_PHASE: i32 = 99;
+pub(crate) const K_CG_SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: i32 = 123;
+
 /// Whether the event is continuous (pixel-level) scroll. field 88. 0=discrete (line), 1=continuous (trackpad).
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS: i32 = 88;
 
@@ -609,6 +613,9 @@ pub(crate) const K_CG_SESSION_EVENT_TAP: i32 = 1;
 
 /// CGEventCreateScrollWheelEvent2 units: kCGScrollEventUnitLine=1 (line-level, discrete scroll).
 pub(crate) const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
+
+/// kCGScrollEventUnitPixel from CoreGraphics' CGEventTypes.h.
+pub(crate) const K_CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
 
 /// eventSourceUserData field (field 42). Used to tag synthetic events so our own tap can
 /// recognize and skip them, preventing infinite loops.

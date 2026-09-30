@@ -38,6 +38,12 @@ pub(super) enum ControlField {
     LineCount,
     DisablePointerAccel,
     PointerAcceleration,
+    SmoothScrollingEnabled,
+    SmoothScrollingPreset,
+    SmoothScrollingResponse,
+    SmoothScrollingSpeed,
+    SmoothScrollingAcceleration,
+    SmoothScrollingInertia,
     MappingEnabled,
     ClipboardEnabled,
     ClipboardPersist,
@@ -126,6 +132,37 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             .or_else(|| m(u.line_count, ControlField::LineCount))
             .or_else(|| m(u.disable_pointer_accel, ControlField::DisablePointerAccel))
             .or_else(|| m(u.pointer_accel_slider, ControlField::PointerAcceleration))
+            .or_else(|| {
+                m(
+                    u.smooth_scrolling_enabled,
+                    ControlField::SmoothScrollingEnabled,
+                )
+            })
+            .or_else(|| {
+                m(
+                    u.smooth_scrolling_preset,
+                    ControlField::SmoothScrollingPreset,
+                )
+            })
+            .or_else(|| {
+                m(
+                    u.smooth_scrolling_response,
+                    ControlField::SmoothScrollingResponse,
+                )
+            })
+            .or_else(|| m(u.smooth_scrolling_speed, ControlField::SmoothScrollingSpeed))
+            .or_else(|| {
+                m(
+                    u.smooth_scrolling_acceleration,
+                    ControlField::SmoothScrollingAcceleration,
+                )
+            })
+            .or_else(|| {
+                m(
+                    u.smooth_scrolling_inertia,
+                    ControlField::SmoothScrollingInertia,
+                )
+            })
             .or_else(|| m(u.mapping_enabled, ControlField::MappingEnabled))
             .or_else(|| m(u.clipboard_enabled, ControlField::ClipboardEnabled))
             .or_else(|| m(u.clipboard_persist, ControlField::ClipboardPersist))
@@ -262,6 +299,9 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
                         u.pointer_accel_value_label,
                         pointer_accel_display(pointer_accel_from_slider(val)),
                     );
+                } else if let Some((minimum, maximum, label)) = smooth_slider_spec(u, ctrl) {
+                    let val: f64 = msg_send![ctrl, doubleValue];
+                    set_field(label, smooth_slider_display(val, minimum, maximum));
                 }
             }
         });
@@ -308,6 +348,14 @@ unsafe fn refresh_dependent_control_visibility(field: ControlField) {
             ControlField::ScrollMode => {
                 update_mode_dependent_visibility(ui);
             }
+            ControlField::SmoothScrollingEnabled
+            | ControlField::SmoothScrollingPreset
+            | ControlField::SmoothScrollingResponse
+            | ControlField::SmoothScrollingSpeed
+            | ControlField::SmoothScrollingAcceleration
+            | ControlField::SmoothScrollingInertia => {
+                update_smooth_controls_enabled(ui);
+            }
             ControlField::ThumbnailsEnabled => {
                 // The App Switcher page's layout owner shows/hides the pair and settles the page.
                 update_display_mode_dependent_visibility(ui);
@@ -327,6 +375,12 @@ fn apply_control_field(field: ControlField) {
         | ControlField::LineCount
         | ControlField::DisablePointerAccel
         | ControlField::PointerAcceleration
+        | ControlField::SmoothScrollingEnabled
+        | ControlField::SmoothScrollingPreset
+        | ControlField::SmoothScrollingResponse
+        | ControlField::SmoothScrollingSpeed
+        | ControlField::SmoothScrollingAcceleration
+        | ControlField::SmoothScrollingInertia
         | ControlField::MappingEnabled => {
             unsafe { apply_mouse_profile_field(field) };
             return;
@@ -467,6 +521,12 @@ fn apply_control_field(field: ControlField) {
                 | ControlField::LineCount
                 | ControlField::DisablePointerAccel
                 | ControlField::PointerAcceleration
+                | ControlField::SmoothScrollingEnabled
+                | ControlField::SmoothScrollingPreset
+                | ControlField::SmoothScrollingResponse
+                | ControlField::SmoothScrollingSpeed
+                | ControlField::SmoothScrollingAcceleration
+                | ControlField::SmoothScrollingInertia
                 | ControlField::MappingEnabled => {
                     // These fields are routed to the profile channel at the top.
                     log_debug!("[settings] mouse field via unexpected action path ignored");
@@ -595,10 +655,8 @@ fn apply_control_field(field: ControlField) {
 /// Mouse-page per-device fields: read the control → write the selected device's profile
 /// (created if absent) → persist + side effects.
 pub(super) unsafe fn apply_mouse_profile_field(field: ControlField) {
-    with_settings_ui(|ui| {
-        let Some(u) = ui.as_mut() else {
-            return;
-        };
+    let update = with_settings_ui(|ui| {
+        let u = ui.as_mut()?;
         let old_cfg = CONFIG.read().unwrap().clone();
         let mut cfg = old_cfg.clone();
         match field {
@@ -654,6 +712,66 @@ pub(super) unsafe fn apply_mouse_profile_field(field: ControlField) {
                     p.pointer = Some(ptr);
                 });
             }
+            ControlField::SmoothScrollingEnabled => {
+                let state: isize = msg_send![u.smooth_scrolling_enabled, state];
+                write_selected_profile(&mut cfg, move |p| {
+                    let mut smooth = p.smooth_scrolling.take().unwrap_or_default();
+                    smooth.enabled = Some(state == 1);
+                    p.smooth_scrolling = Some(smooth);
+                });
+            }
+            ControlField::SmoothScrollingPreset => {
+                let index: isize = msg_send![u.smooth_scrolling_preset, indexOfSelectedItem];
+                let preset = crate::mouse::smooth::presets::SmoothPreset::ALL
+                    .get(index.max(0) as usize)
+                    .copied()
+                    .unwrap_or(crate::mouse::smooth::presets::SmoothPreset::EaseInOut);
+                let (response, speed, acceleration, inertia) = preset.default_settings();
+                write_selected_profile(&mut cfg, move |p| {
+                    let mut smooth = p.smooth_scrolling.take().unwrap_or_default();
+                    smooth.enabled = Some(true);
+                    smooth.preset = Some(preset.as_str().to_string());
+                    if preset != crate::mouse::smooth::presets::SmoothPreset::Custom {
+                        smooth.response = Some(response);
+                        smooth.speed = Some(speed);
+                        smooth.acceleration = Some(acceleration);
+                        smooth.inertia = Some(inertia);
+                    }
+                    p.smooth_scrolling = Some(smooth);
+                });
+            }
+            ControlField::SmoothScrollingResponse
+            | ControlField::SmoothScrollingSpeed
+            | ControlField::SmoothScrollingAcceleration
+            | ControlField::SmoothScrollingInertia => {
+                let (slider, minimum, maximum) = match field {
+                    ControlField::SmoothScrollingResponse => {
+                        (u.smooth_scrolling_response, 0.0, 2.0)
+                    }
+                    ControlField::SmoothScrollingSpeed => (u.smooth_scrolling_speed, 0.0, 8.0),
+                    ControlField::SmoothScrollingAcceleration => {
+                        (u.smooth_scrolling_acceleration, 0.0, 8.0)
+                    }
+                    ControlField::SmoothScrollingInertia => (u.smooth_scrolling_inertia, 0.0, 8.0),
+                    _ => unreachable!(),
+                };
+                let raw: f64 = msg_send![slider, doubleValue];
+                let value = smooth_slider_value(raw, minimum, maximum);
+                write_selected_profile(&mut cfg, move |p| {
+                    let mut smooth = p.smooth_scrolling.take().unwrap_or_default();
+                    smooth.preset = Some("custom".into());
+                    match field {
+                        ControlField::SmoothScrollingResponse => smooth.response = Some(value),
+                        ControlField::SmoothScrollingSpeed => smooth.speed = Some(value),
+                        ControlField::SmoothScrollingAcceleration => {
+                            smooth.acceleration = Some(value)
+                        }
+                        ControlField::SmoothScrollingInertia => smooth.inertia = Some(value),
+                        _ => unreachable!(),
+                    }
+                    p.smooth_scrolling = Some(smooth);
+                });
+            }
             ControlField::MappingEnabled => {
                 let state: isize = msg_send![u.mapping_enabled, state];
                 write_selected_profile(&mut cfg, move |p| {
@@ -662,21 +780,27 @@ pub(super) unsafe fn apply_mouse_profile_field(field: ControlField) {
             }
             _ => {}
         }
-        if let Ok(mut w) = CONFIG.write() {
-            *w = cfg.clone();
-        }
-        schedule_config_persist();
-        apply_config_change(&old_cfg, &cfg, ConfigChangeSource::Settings);
         if field == ControlField::ScrollMode {
-            // After a mode switch the line-count slider shows the effective value and the
-            // conditional row visibility refreshes.
-            let cfg_now = CONFIG.read().unwrap().clone();
-            let shown = resolve_selected_from(&cfg_now).line_count;
+            // Resolve from the pending snapshot; runtime refresh below must run after this UI borrow.
+            let shown = resolve_selected_from(&cfg).line_count;
             let _: () = msg_send![u.line_count, setIntegerValue: shown as isize];
             set_field(u.line_count_value_label, shown);
             update_mode_dependent_visibility(u);
         }
+        Some((old_cfg, cfg))
     });
+    let Some((old_cfg, cfg)) = update else {
+        return;
+    };
+    if let Ok(mut w) = CONFIG.write() {
+        *w = cfg.clone();
+    }
+    if !crate::dev_flags::present("smoke-settings-mouse-profile-callback") {
+        schedule_config_persist();
+    }
+    // Applying the config refreshes the visible controls synchronously, so do it after the
+    // SettingsUi RefCell borrow has been released.
+    apply_config_change(&old_cfg, &cfg, ConfigChangeSource::Settings);
 }
 
 /// Hand the selected device's profile to the callback (creating one when absent).
@@ -847,9 +971,11 @@ pub(super) unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
         ui.disable_pointer_accel,
         ui.pointer_accel_slider,
         ui.pointer_accel_value_label,
+        ui.smooth_scrolling_enabled,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
+    update_smooth_controls_enabled(ui);
     // The virtual-pointer profile (a software KVM's injected mouse) has no HID service client, so
     // acceleration / tracking speed has nowhere to be written (pointer::apply finds no device by
     // VID/PID). Those two controls can never take effect in that profile, so they get a "not
@@ -866,6 +992,30 @@ pub(super) unsafe fn update_mouse_controls_enabled(ui: &SettingsUi) {
         }
     }
     update_mapping_controls_enabled(ui);
+}
+
+unsafe fn update_smooth_controls_enabled(ui: &SettingsUi) {
+    let mouse_state: isize = msg_send![ui.enable_mouse, state];
+    let smooth_state: isize = msg_send![ui.smooth_scrolling_enabled, state];
+    let enabled = mouse_state == 1 && smooth_state == 1;
+    let tooltip = if mouse_state != 1 {
+        t("settings.tooltip_mouse_disabled")
+    } else {
+        t("settings.tooltip_smooth_scrolling_disabled")
+    };
+    for &control in &[
+        ui.smooth_scrolling_preset,
+        ui.smooth_scrolling_response,
+        ui.smooth_scrolling_response_value,
+        ui.smooth_scrolling_speed,
+        ui.smooth_scrolling_speed_value,
+        ui.smooth_scrolling_acceleration,
+        ui.smooth_scrolling_acceleration_value,
+        ui.smooth_scrolling_inertia,
+        ui.smooth_scrolling_inertia_value,
+    ] {
+        SettingsRow::set_enabled_with_tooltip(control, enabled, &tooltip);
+    }
 }
 
 /// Freeze the window and keyboard options below the app-switcher master switch.
@@ -952,6 +1102,40 @@ pub(super) fn pointer_accel_from_slider(value: f64) -> f64 {
     // Keep 2 decimals (matching the read-only value label, and keeping floating-point noise out
     // of the config).
     (clamped * 100.0).round() / 100.0
+}
+
+unsafe fn smooth_slider_spec(
+    ui: &SettingsUi,
+    slider: *mut AnyObject,
+) -> Option<(f64, f64, *mut AnyObject)> {
+    if slider == ui.smooth_scrolling_response {
+        Some((0.0, 2.0, ui.smooth_scrolling_response_value))
+    } else if slider == ui.smooth_scrolling_speed {
+        Some((0.0, 8.0, ui.smooth_scrolling_speed_value))
+    } else if slider == ui.smooth_scrolling_acceleration {
+        Some((0.0, 8.0, ui.smooth_scrolling_acceleration_value))
+    } else if slider == ui.smooth_scrolling_inertia {
+        Some((0.0, 8.0, ui.smooth_scrolling_inertia_value))
+    } else {
+        None
+    }
+}
+
+fn smooth_slider_display(value: f64, minimum: f64, maximum: f64) -> String {
+    let value = if value.is_finite() {
+        value.clamp(minimum, maximum)
+    } else {
+        minimum
+    };
+    format!("{:.1}", (value * 10.0).round() / 10.0)
+}
+
+fn smooth_slider_value(value: f64, minimum: f64, maximum: f64) -> f64 {
+    if value.is_finite() {
+        (value.clamp(minimum, maximum) * 10.0).round() / 10.0
+    } else {
+        minimum
+    }
 }
 
 /// Refresh the conditional visibility of the tracking-speed row from the disable-acceleration
@@ -1163,7 +1347,7 @@ pub(crate) fn refresh_service_controls_from_config() {
 /// This intentionally updates the existing controls in place instead of rebuilding the settings
 /// window. That preserves unsaved text edits and, like the appearance refresh path, never brings
 /// a hidden settings window to the foreground.
-pub(crate) fn refresh_switcher_and_keystroke_display_controls_from_config() {
+pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
     let cfg = CONFIG.read().unwrap().clone();
     unsafe {
         with_settings_ui(|ui| {
@@ -1174,6 +1358,16 @@ pub(crate) fn refresh_switcher_and_keystroke_display_controls_from_config() {
             if !visible {
                 return;
             }
+
+            ensure_selected_device();
+            let resolved = resolve_selected_from(&cfg);
+            let _: () = msg_send![
+                u.enable_mouse,
+                setState: if cfg.mouse.enabled { 1isize } else { 0isize }
+            ];
+            fill_mouse_device_controls(u, &resolved);
+            update_mouse_controls_enabled(u);
+            update_conditional_rows(u);
 
             let modifier_idx: isize = if cfg.keyboard.modifier == "command" {
                 1
@@ -1440,7 +1634,10 @@ fn suggested_export_log_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clipboard_delete_dependent_visibility_from_config, Config};
+    use super::{
+        clipboard_delete_dependent_visibility_from_config, smooth_slider_display,
+        smooth_slider_value, Config,
+    };
 
     #[test]
     fn clipboard_delete_dependent_row_matches_initial_config() {
@@ -1450,5 +1647,13 @@ mod tests {
 
         cfg.clipboard.delete_after_paste = true;
         assert!(clipboard_delete_dependent_visibility_from_config(&cfg));
+    }
+
+    #[test]
+    fn smooth_scroll_slider_rounds_to_one_decimal_and_clamps() {
+        assert_eq!(smooth_slider_value(1.26, 0.0, 2.0), 1.3);
+        assert_eq!(smooth_slider_value(-1.0, 0.0, 2.0), 0.0);
+        assert_eq!(smooth_slider_display(8.04, 0.0, 8.0), "8.0");
+        assert_eq!(smooth_slider_display(f64::NAN, 0.0, 2.0), "0.0");
     }
 }

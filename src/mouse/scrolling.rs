@@ -99,6 +99,7 @@ mod tests {
             acceleration: None,
             button_mappings: std::collections::HashMap::new(),
             button_mappings_enabled: true,
+            smooth_scrolling: crate::mouse::smooth::presets::SmoothSettings::default(),
         }
     }
 

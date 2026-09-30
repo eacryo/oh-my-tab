@@ -190,6 +190,8 @@ pub(crate) fn quit_from_settings() {
 pub(crate) static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Cross-thread callback target used only to schedule work back onto AppKit's main thread.
 pub(crate) static CONTROLLER: Mutex<Option<CallbackTarget>> = Mutex::new(None);
+static SMOOTH_E2E_RECORD_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Shared ObjC target object for menu items and settings buttons.
 pub(crate) static MENU_TARGET: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -285,6 +287,35 @@ fn schedule_global_input_drain() {
             waitUntilDone: false
         ];
     }
+}
+
+/// Ask the controller to write smooth-scroll e2e counters from the main thread. The tap timer
+/// updates only atomics; the snapshot borrows AppState and must remain on AppKit's thread.
+pub(crate) fn schedule_smooth_scroll_e2e_record() {
+    if !e2e_state::is_enabled()
+        || SMOOTH_E2E_RECORD_SCHEDULED.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    let Some(controller) = CONTROLLER.lock().unwrap().map(|target| target.0) else {
+        SMOOTH_E2E_RECORD_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![
+            controller,
+            performSelectorOnMainThread: sel!(handleSmoothScrollE2eRecord:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
+
+extern "C" fn on_smooth_scroll_e2e_record(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    callback_guard::void("on_smooth_scroll_e2e_record", || {
+        SMOOTH_E2E_RECORD_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+        e2e_state::record("smooth_scroll_complete");
+    });
 }
 
 /// Main-thread consumer for one input batch; release is applied last so rapid Tab presses retain
@@ -1395,6 +1426,12 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(handleSmoothScrollE2eRecord:),
+            on_smooth_scroll_e2e_record as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handlePermissionRestartRequired:),
             restart::on_permission_restart_required as *mut c_void,
             types_v_obj.as_ptr(),
@@ -2231,8 +2268,10 @@ pub fn run() {
             || arg == "--smoke-settings-layout"
             || arg == "--smoke-settings-state-sync"
             || arg == "--smoke-settings-collapsible-row"
+            || arg == "--smoke-settings-mouse-profile-callback"
             || arg == "--smoke-app-reopen"
             || arg == "--smoke-onboarding-live-apply"
+            || arg == "--smoke-smooth-scroll-event"
     });
     let _instance_guard = if is_gui_smoke_process {
         None
@@ -2624,6 +2663,17 @@ pub fn run() {
         }
     }
 
+    if std::env::args().any(|a| a == "--smoke-smooth-scroll-event") {
+        unsafe {
+            if !mouse::smooth::transformer::smoke_event_fields() {
+                eprintln!("[smoke-smooth-scroll-event] synthetic event fields did not round-trip");
+                std::process::exit(1);
+            }
+            log_info!("[smoke-smooth-scroll-event] synthetic event fields passed");
+            std::process::exit(0);
+        }
+    }
+
     // Invoke the registered application delegate selector on AppKit's main thread and assert
     // that custom handling returns NO after presenting the Settings window.
     if std::env::args().any(|a| a == "--smoke-app-reopen") {
@@ -2681,6 +2731,22 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-settings-collapsible-row] conditional row geometry is stable");
+            std::process::exit(0);
+        }
+    }
+
+    // Mouse-profile callback smoke: drive real AppKit target/action controls through the
+    // extern callback and verify config plus dependent-control refresh without persisting.
+    if std::env::args().any(|a| a == "--smoke-settings-mouse-profile-callback") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            let ok = settings::settings_mouse_profile_callback_smoke_runner();
+            if !ok {
+                eprintln!("[smoke-settings-mouse-profile-callback] callback state did not apply");
+                std::process::exit(1);
+            }
+            log_info!("[smoke-settings-mouse-profile-callback] mouse controls applied safely");
             std::process::exit(0);
         }
     }

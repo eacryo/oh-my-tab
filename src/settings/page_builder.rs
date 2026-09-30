@@ -891,6 +891,119 @@ pub(super) unsafe fn build_mouse_page(
     canvas.card(&t("settings.header_mouse_scrolling"));
 
     canvas.next_section();
+    let smooth_enabled_y = canvas.next_row(described_row_h);
+    ui.smooth_scrolling_enabled = SettingsRow::described(
+        mouse_view,
+        label_x,
+        smooth_enabled_y,
+        ctrl_x - label_x - 18.0,
+        described_row_h,
+        &t("settings.row_mouse_smooth_enabled"),
+        &t("settings.desc_mouse_smooth_enabled"),
+        SettingsControl::switch(ctrl_x + ctrl_w, smooth_enabled_y + 10.0, row_h, false),
+    );
+    bind_control(target, ui.smooth_scrolling_enabled);
+    let preset_labels: Vec<String> = crate::mouse::smooth::presets::SmoothPreset::ALL
+        .into_iter()
+        .map(|preset| t(preset.label_key()))
+        .collect();
+    let preset_label_refs: Vec<&str> = preset_labels.iter().map(String::as_str).collect();
+    let preset_metrics =
+        SettingsSelect::metrics(ctrl_w, &preset_label_refs, row_h, described_row_h);
+    let preset_y = canvas.next_row(preset_metrics.row_h);
+    let preset_popup = SettingsControl::popup(
+        ctrl_x,
+        preset_y + (preset_metrics.row_h - preset_metrics.control_h) / 2.0,
+        ctrl_w,
+        preset_metrics.control_h,
+        &preset_label_refs,
+        0,
+    );
+    style_flat_popup(preset_popup);
+    let (_, preset_control) = SettingsRow::tall_with_height(
+        mouse_view,
+        label_x,
+        preset_y,
+        label_w,
+        preset_metrics.row_h,
+        &t("settings.row_mouse_smooth_preset"),
+        preset_popup,
+    );
+    ui.smooth_scrolling_preset = preset_control;
+    bind_control(target, preset_control);
+    SettingsRow::separator_above_row(mouse_view, preset_y, preset_metrics.row_h, content_w);
+
+    let smooth_defaults = crate::mouse::smooth::presets::SmoothPreset::EaseInOut.default_settings();
+    let slider_specs = [
+        (
+            "settings.row_mouse_smooth_response",
+            0.0,
+            2.0,
+            smooth_defaults.0,
+        ),
+        (
+            "settings.row_mouse_smooth_speed",
+            0.0,
+            8.0,
+            smooth_defaults.1,
+        ),
+        (
+            "settings.row_mouse_smooth_acceleration",
+            0.0,
+            8.0,
+            smooth_defaults.2,
+        ),
+        (
+            "settings.row_mouse_smooth_inertia",
+            0.0,
+            8.0,
+            smooth_defaults.3,
+        ),
+    ];
+    let mut smooth_controls = Vec::with_capacity(4);
+    for (key, minimum, maximum, default_value) in slider_specs {
+        let y = canvas.next_row(SettingsLayout::SINGLE_LINE_ROW_H);
+        SettingsRow::separator_above_row(
+            mouse_view,
+            y,
+            SettingsLayout::SINGLE_LINE_ROW_H,
+            content_w,
+        );
+        let slider = SettingsControl::double_slider(
+            ctrl_x,
+            y + 10.0,
+            SettingsRow::slider_width(ctrl_w),
+            row_h,
+            minimum,
+            maximum,
+            default_value,
+            Some(default_value),
+        );
+        let (_, slider) = SettingsRow::tall_with_height(
+            mouse_view,
+            label_x,
+            y,
+            label_w,
+            SettingsLayout::SINGLE_LINE_ROW_H,
+            &t(key),
+            slider,
+        );
+        let value_label =
+            SettingsRow::attach_slider_readout(mouse_view, slider, format!("{default_value:.1}"));
+        bind_control(target, slider);
+        smooth_controls.push((slider, value_label));
+    }
+    ui.smooth_scrolling_response = smooth_controls[0].0;
+    ui.smooth_scrolling_response_value = smooth_controls[0].1;
+    ui.smooth_scrolling_speed = smooth_controls[1].0;
+    ui.smooth_scrolling_speed_value = smooth_controls[1].1;
+    ui.smooth_scrolling_acceleration = smooth_controls[2].0;
+    ui.smooth_scrolling_acceleration_value = smooth_controls[2].1;
+    ui.smooth_scrolling_inertia = smooth_controls[3].0;
+    ui.smooth_scrolling_inertia_value = smooth_controls[3].1;
+    canvas.card(&t("settings.header_mouse_smooth_scrolling"));
+
+    canvas.next_section();
     let y = canvas.next_row(described_row_h);
     // disable_pointer_accel switch: disable system pointer acceleration for 1:1 linear
     // cursor tracking. The subtitle explains linear tracking; the switch keeps the same

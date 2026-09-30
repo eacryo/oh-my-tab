@@ -197,6 +197,16 @@ pub(super) struct SettingsUi {
     pointer_accel_slider: *mut AnyObject, // NSSlider: pointer acceleration, 0..=40
     pointer_accel_label: *mut AnyObject, // the row's label
     pointer_accel_value_label: *mut AnyObject, // slider's current value (read-only)
+    smooth_scrolling_enabled: *mut AnyObject,
+    smooth_scrolling_preset: *mut AnyObject,
+    smooth_scrolling_response: *mut AnyObject,
+    smooth_scrolling_response_value: *mut AnyObject,
+    smooth_scrolling_speed: *mut AnyObject,
+    smooth_scrolling_speed_value: *mut AnyObject,
+    smooth_scrolling_acceleration: *mut AnyObject,
+    smooth_scrolling_acceleration_value: *mut AnyObject,
+    smooth_scrolling_inertia: *mut AnyObject,
+    smooth_scrolling_inertia_value: *mut AnyObject,
     /// The Mouse page row the binding table occupies (it grows with the number of bindings).
     mapping_layout_row: usize,
     /// The About page row the inline update host occupies (its height follows the flow).
@@ -491,12 +501,13 @@ pub(crate) use dispatch::{
     handle_windows_enabled_toggle, on_control_changed, on_control_text_did_change,
     on_control_text_did_end_editing, on_sidebar_select, refresh_device_popup_if_open,
     refresh_service_controls_from_config,
-    refresh_switcher_and_keystroke_display_controls_from_config,
+    refresh_switcher_keystroke_and_mouse_controls_from_config,
 };
 pub(crate) use window::{
     close_settings_from_switcher, invalidate_settings_window, refresh_permission_ui_if_visible,
     refresh_system_appearance, reopen_for_app_activation, settings_collapsible_row_smoke_runner,
-    settings_layout_smoke_runner, settings_state_sync_smoke_runner, settings_window_is_visible,
+    settings_layout_smoke_runner, settings_mouse_profile_callback_smoke_runner,
+    settings_state_sync_smoke_runner, settings_window_is_visible,
 };
 
 fn parse_f64(s: &str) -> Result<f64, ()> {
@@ -1542,6 +1553,42 @@ unsafe fn fill_mouse_device_controls(
         ui.pointer_accel_value_label,
         pointer_accel_display(acceleration),
     );
+
+    let smooth = resolved.smooth_scrolling;
+    let _: () = msg_send![
+        ui.smooth_scrolling_enabled,
+        setState: if smooth.enabled { 1isize } else { 0isize }
+    ];
+    let preset_index = crate::mouse::smooth::presets::SmoothPreset::ALL
+        .iter()
+        .position(|preset| *preset == smooth.preset)
+        .unwrap_or(0) as isize;
+    let _: () = msg_send![ui.smooth_scrolling_preset, selectItemAtIndex: preset_index];
+    for (slider, value, label) in [
+        (
+            ui.smooth_scrolling_response,
+            smooth.response.clamp(0.0, 2.0),
+            ui.smooth_scrolling_response_value,
+        ),
+        (
+            ui.smooth_scrolling_speed,
+            smooth.speed.clamp(0.0, 8.0),
+            ui.smooth_scrolling_speed_value,
+        ),
+        (
+            ui.smooth_scrolling_acceleration,
+            smooth.acceleration.clamp(0.0, 8.0),
+            ui.smooth_scrolling_acceleration_value,
+        ),
+        (
+            ui.smooth_scrolling_inertia,
+            smooth.inertia.clamp(0.0, 8.0),
+            ui.smooth_scrolling_inertia_value,
+        ),
+    ] {
+        let _: () = msg_send![slider, setDoubleValue: value];
+        set_field(label, format!("{value:.1}"));
+    }
 }
 
 /// Build the settings window once, store it in SETTINGS_UI, then reuse (hide, not destroy).
@@ -1968,6 +2015,42 @@ mod tests {
             out.status.code(),
             String::from_utf8_lossy(&out.stderr),
             stdout_tail
+        );
+    }
+
+    /// Mouse profile edits must leave the RefCell borrow before runtime refresh re-enters settings.
+    #[test]
+    #[ignore]
+    fn settings_mouse_profile_callback_smoke() {
+        let app = settings_smoke_app_binary();
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-settings-mouse-profile-callback")
+            .output()
+            .expect("failed to spawn app");
+        assert!(
+            out.status.success(),
+            "settings mouse profile callback smoke failed (exit {:?})\nstderr:\n{}\nstdout:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// Create a pixel-based continuous CGEvent and round-trip every field used by smooth scroll.
+    #[test]
+    #[ignore]
+    fn smooth_scroll_synthetic_event_fields_smoke() {
+        let app = settings_smoke_app_binary();
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-smooth-scroll-event")
+            .output()
+            .expect("failed to spawn app");
+        assert!(
+            out.status.success(),
+            "smooth-scroll event smoke failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }

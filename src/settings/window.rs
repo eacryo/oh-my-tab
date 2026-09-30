@@ -1203,7 +1203,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         if let Ok(mut current) = CONFIG.write() {
             *current = refreshed_cfg;
         }
-        refresh_switcher_and_keystroke_display_controls_from_config();
+        refresh_switcher_keystroke_and_mouse_controls_from_config();
         let refreshed = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             Some((
@@ -1221,6 +1221,103 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 true,
             ))
             && refreshed == Some((0isize, 1isize, 0isize, 0isize))
+    }
+}
+
+/// Exercise mouse profile controls through their real AppKit target/action callbacks.
+pub(crate) fn settings_mouse_profile_callback_smoke_runner() -> bool {
+    unsafe {
+        let original_cfg = CONFIG.read().unwrap().clone();
+        let mut smoke_cfg = original_cfg.clone();
+        // Keep the dependent smooth-scroll controls actionable even when the user's mouse master
+        // switch is off; this is an in-memory smoke snapshot and is never persisted.
+        smoke_cfg.mouse.enabled = true;
+        if let Ok(mut current) = CONFIG.write() {
+            *current = smoke_cfg;
+        }
+
+        show_settings();
+        select_sidebar(2);
+        let controls = with_settings_ui(|ui| {
+            let ui = ui.as_ref()?;
+            Some((
+                ui.smooth_scrolling_enabled,
+                ui.reverse_scroll,
+                msg_send![ui.smooth_scrolling_enabled, state],
+                msg_send![ui.reverse_scroll, state],
+            ))
+        });
+
+        let passed = (|| {
+            let Some((smooth_switch, reverse_switch, initial_smooth, initial_reverse)) = controls
+            else {
+                return false;
+            };
+
+            // Do not hold SETTINGS_UI while dispatching: performClick synchronously invokes the
+            // registered on_control_changed extern callback.
+            let _: () = msg_send![smooth_switch, performClick: std::ptr::null::<AnyObject>()];
+            let toggled = with_settings_ui(|ui| {
+                let ui = ui.as_ref()?;
+                let state: isize = msg_send![ui.smooth_scrolling_enabled, state];
+                let enabled = [
+                    ui.smooth_scrolling_preset,
+                    ui.smooth_scrolling_response,
+                    ui.smooth_scrolling_speed,
+                    ui.smooth_scrolling_acceleration,
+                    ui.smooth_scrolling_inertia,
+                ]
+                .into_iter()
+                .all(|control| {
+                    let enabled: bool = msg_send![control, isEnabled];
+                    enabled == (state == 1)
+                });
+                Some((state, enabled))
+            });
+            let config_enabled = {
+                let cfg = CONFIG.read().unwrap();
+                resolve_selected_from(&cfg).smooth_scrolling.enabled
+            };
+            let Some((toggled_state, dependent_controls_enabled)) = toggled else {
+                return false;
+            };
+            let toggle_applied = toggled_state != initial_smooth
+                && config_enabled == (toggled_state == 1)
+                && dependent_controls_enabled;
+
+            let _: () = msg_send![smooth_switch, performClick: std::ptr::null::<AnyObject>()];
+            let restored_smooth = {
+                let cfg = CONFIG.read().unwrap();
+                resolve_selected_from(&cfg).smooth_scrolling.enabled
+            };
+            let smooth_round_trip = restored_smooth == (initial_smooth == 1);
+
+            let _: () = msg_send![reverse_switch, performClick: std::ptr::null::<AnyObject>()];
+            let toggled_reverse = {
+                let cfg = CONFIG.read().unwrap();
+                resolve_selected_from(&cfg).reverse_scroll
+            };
+            let reverse_state: isize = msg_send![reverse_switch, state];
+            let reverse_toggle_applied =
+                reverse_state != initial_reverse && toggled_reverse == (reverse_state == 1);
+            let _: () = msg_send![reverse_switch, performClick: std::ptr::null::<AnyObject>()];
+            let restored_reverse = {
+                let cfg = CONFIG.read().unwrap();
+                resolve_selected_from(&cfg).reverse_scroll
+            };
+
+            toggle_applied
+                && smooth_round_trip
+                && reverse_toggle_applied
+                && restored_reverse == (initial_reverse == 1)
+        })();
+
+        if let Ok(mut current) = CONFIG.write() {
+            *current = original_cfg;
+        }
+        refresh_switcher_keystroke_and_mouse_controls_from_config();
+        hide_settings();
+        passed
     }
 }
 
@@ -1704,6 +1801,16 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             pointer_accel_slider: std::ptr::null_mut(),
             pointer_accel_label: std::ptr::null_mut(),
             pointer_accel_value_label: std::ptr::null_mut(),
+            smooth_scrolling_enabled: std::ptr::null_mut(),
+            smooth_scrolling_preset: std::ptr::null_mut(),
+            smooth_scrolling_response: std::ptr::null_mut(),
+            smooth_scrolling_response_value: std::ptr::null_mut(),
+            smooth_scrolling_speed: std::ptr::null_mut(),
+            smooth_scrolling_speed_value: std::ptr::null_mut(),
+            smooth_scrolling_acceleration: std::ptr::null_mut(),
+            smooth_scrolling_acceleration_value: std::ptr::null_mut(),
+            smooth_scrolling_inertia: std::ptr::null_mut(),
+            smooth_scrolling_inertia_value: std::ptr::null_mut(),
             mapping_layout_row: 0,
             update_host_row: 0,
             mapping_scroll: std::ptr::null_mut(),

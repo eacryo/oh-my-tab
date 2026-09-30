@@ -130,17 +130,18 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         || flags.thumbnails
         || flags.focused_thumbnail_prewarm
         || flags.keystroke_display
+        || flags.mouse
     {
         // Keep an already-open settings window in sync in place, without activating the app or
         // rebuilding the window.
-        crate::settings::refresh_switcher_and_keystroke_display_controls_from_config();
+        crate::settings::refresh_switcher_keystroke_and_mouse_controls_from_config();
     }
 
     if flags.mouse {
         crate::mouse::resolve::invalidate_cache();
         crate::mouse::pointer::apply();
         if old.mouse.enabled != new.mouse.enabled || matches!(source, ConfigChangeSource::Startup) {
-            if new.mouse.enabled {
+            if crate::mouse::effective_enabled() {
                 crate::mouse::start();
             } else if !matches!(source, ConfigChangeSource::Startup) {
                 crate::mouse::stop();

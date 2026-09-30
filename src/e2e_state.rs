@@ -19,6 +19,15 @@ use crate::log_debug;
 
 static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static SEQ: AtomicU64 = AtomicU64::new(0);
+static SMOOTH_TICKS: AtomicU64 = AtomicU64::new(0);
+static SMOOTH_PHASES: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
 /// Resolves `--e2e-state=<path>` once, then serves it from cache.
 fn state_path() -> Option<&'static PathBuf> {
@@ -28,6 +37,27 @@ fn state_path() -> Option<&'static PathBuf> {
 
 pub(crate) fn is_enabled() -> bool {
     state_path().is_some()
+}
+
+pub(crate) fn smooth_scroll_tick() {
+    if is_enabled() {
+        SMOOTH_TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn smooth_scroll_phase(phase: crate::mouse::smooth::engine::Phase) {
+    if !is_enabled() {
+        return;
+    }
+    let index = match phase {
+        crate::mouse::smooth::engine::Phase::TouchBegan => 0,
+        crate::mouse::smooth::engine::Phase::TouchChanged => 1,
+        crate::mouse::smooth::engine::Phase::TouchEnded => 2,
+        crate::mouse::smooth::engine::Phase::MomentumBegan => 3,
+        crate::mouse::smooth::engine::Phase::MomentumChanged => 4,
+        crate::mouse::smooth::engine::Phase::MomentumEnded => 5,
+    };
+    SMOOTH_PHASES[index].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Records one snapshot. Main thread only (it borrows AppState internally).
@@ -323,6 +353,16 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
     json.push_str(&format!(
         "  \"settings_window_visible\": {},\n",
         crate::settings::settings_window_is_visible()
+    ));
+    json.push_str(&format!(
+        "  \"smooth_scroll\": {{\"ticks\": {}, \"touch_began\": {}, \"touch_changed\": {}, \"touch_ended\": {}, \"momentum_began\": {}, \"momentum_changed\": {}, \"momentum_ended\": {}}},\n",
+        SMOOTH_TICKS.load(Ordering::Relaxed),
+        SMOOTH_PHASES[0].load(Ordering::Relaxed),
+        SMOOTH_PHASES[1].load(Ordering::Relaxed),
+        SMOOTH_PHASES[2].load(Ordering::Relaxed),
+        SMOOTH_PHASES[3].load(Ordering::Relaxed),
+        SMOOTH_PHASES[4].load(Ordering::Relaxed),
+        SMOOTH_PHASES[5].load(Ordering::Relaxed),
     ));
     json.push_str(&format!("  \"selected_index\": {},\n", snapshot.selected));
     json.push_str(&format!("  \"cards_count\": {},\n", snapshot.windows.len()));

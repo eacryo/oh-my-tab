@@ -125,7 +125,7 @@ unsafe fn mouse_event_tap_callback_inner(
     _proxy: CGEventTapProxy,
     event_type: CGEventType,
     event: CGEventRef,
-    _user_info: *mut c_void,
+    user_info: *mut c_void,
 ) -> CGEventRef {
     if crate::input_monitor::handle_disabled_event(event_type, "mouse") {
         return event;
@@ -158,6 +158,27 @@ unsafe fn mouse_event_tap_callback_inner(
         let dev_key = device::device_from_cgevent(event);
         // Resolve the effective config for this device (merging "All Mice" + per-device profiles).
         let resolved = resolve::resolve(dev_key);
+
+        // Smooth mode consumes discrete wheel lines and emits its own timed pixel stream. It
+        // takes precedence over Line mode; the configured reverse direction is applied before
+        // feeding the pure engine.
+        if resolved.smooth_scrolling.enabled {
+            if !user_info.is_null() {
+                let sign = if resolved.reverse_scroll { -1.0 } else { 1.0 };
+                let fed = (&mut *(user_info
+                    as *mut crate::mouse::smooth::transformer::SmoothTransformer))
+                    .feed(
+                        resolved.smooth_scrolling,
+                        dx as f64 * sign,
+                        dy as f64 * sign,
+                        flags,
+                    );
+                if fed {
+                    return std::ptr::null_mut();
+                }
+            }
+            return event;
+        }
 
         // Default / Line: compute delta (passthrough or line-count normalization + reverse) ->
         // post synthetic event -> drop the original.
@@ -344,6 +365,11 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
 
     thread::spawn(move || unsafe {
         crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
+        let mut smooth_transformer =
+            Box::new(crate::mouse::smooth::transformer::SmoothTransformer::new());
+        let smooth_transformer_ptr = (&mut *smooth_transformer
+            as *mut crate::mouse::smooth::transformer::SmoothTransformer)
+            as *mut c_void;
         // Enumerate connected devices once at startup (also lazily re-done on attribution failure).
         device::ensure_enumerated();
         // Create event tap (HID level, mutable). Pass the cancel flag: bails out early on a
@@ -354,7 +380,7 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             tap_options::DEFAULT_TAP,
             mask,
             Some(mouse_event_tap_callback),
-            std::ptr::null_mut(),
+            smooth_transformer_ptr,
             "mouse",
             Some(&STOP_REQUESTED),
         );
@@ -388,6 +414,7 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             event_tap::CFRunLoopRun();
         }
         event_tap::stop_tap_watchdog(watchdog);
+        smooth_transformer.shutdown();
         // Once the RunLoop returns, disable the tap before removing it from shared state and
         // releasing its Core Foundation objects.
         event_tap::CGEventTapEnable(created.tap, false);

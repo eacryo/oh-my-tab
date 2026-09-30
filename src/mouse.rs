@@ -10,7 +10,18 @@ pub(crate) mod pointer;
 pub(crate) mod resolve;
 pub(crate) mod scrolling;
 pub(crate) mod shortcut;
+pub(crate) mod smooth;
 pub(crate) mod system_action;
+
+/// The development force-on flag starts the mouse tap so smooth scroll can be exercised without
+/// changing the persisted mouse master switch.
+pub(crate) fn effective_enabled() -> bool {
+    crate::config::CONFIG
+        .read()
+        .map(|config| config.mouse.enabled)
+        .unwrap_or(false)
+        || crate::dev_flags::present("smooth-scroll-force-on")
+}
 
 use crate::log_info;
 
@@ -97,10 +108,7 @@ pub(crate) fn stop() {
         }
         // If the user re-enabled the feature before stopping finished, restart from the latest
         // config only after the old thread has fully exited.
-        let should_restart = crate::config::CONFIG
-            .read()
-            .map(|cfg| cfg.mouse.enabled)
-            .unwrap_or(false);
+        let should_restart = effective_enabled();
         if should_restart {
             start();
         }
